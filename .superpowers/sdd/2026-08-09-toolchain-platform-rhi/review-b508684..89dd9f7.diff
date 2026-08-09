@@ -1,0 +1,274 @@
+# Review package: b5086842664090181fd56028685016d4f76fdc75..89dd9f7754781ee9fa73969495de54ef9afafd92
+
+## Commits
+89dd9f7 Add rx_platform: SDL3 window wrapper
+
+## Files changed
+ CMakeLists.txt                               |  1 +
+ cmake/toolchains/linux-native.cmake          |  9 ++++
+ src/rx_platform/CMakeLists.txt               | 20 +++++++
+ src/rx_platform/include/rx_platform/window.h | 30 +++++++++++
+ src/rx_platform/src/window.cpp               | 78 ++++++++++++++++++++++++++++
+ src/rx_platform/tests/window_test.cpp        | 28 ++++++++++
+ third_party/CMakeLists.txt                   | 22 ++++++++
+ 7 files changed, 188 insertions(+)
+
+## Diff
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 635737e..6138066 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2,12 +2,13 @@ cmake_minimum_required(VERSION 3.21)
+ project(renderer_x LANGUAGES C CXX)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+ 
+ enable_testing()
+ 
+ add_subdirectory(third_party)
+ add_subdirectory(src/rx_core)
++add_subdirectory(src/rx_platform)
+ add_subdirectory(tools/dep_cache_smoketest)
+ add_subdirectory(tools/toolchain_check)
+diff --git a/cmake/toolchains/linux-native.cmake b/cmake/toolchains/linux-native.cmake
+index 3aff048..d9f8d38 100644
+--- a/cmake/toolchains/linux-native.cmake
++++ b/cmake/toolchains/linux-native.cmake
+@@ -1,9 +1,18 @@
+ set(CMAKE_SYSTEM_NAME Linux)
+ set(CMAKE_SYSTEM_PROCESSOR x86_64)
+ 
+ get_filename_component(RX_REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+ 
+ set(CMAKE_C_COMPILER   "${RX_REPO_ROOT}/cmake/zig-wrappers/zig-cc-linux"  CACHE FILEPATH "C compiler" FORCE)
+ set(CMAKE_CXX_COMPILER "${RX_REPO_ROOT}/cmake/zig-wrappers/zig-cxx-linux" CACHE FILEPATH "C++ compiler" FORCE)
+ 
+ set(RX_TARGET_TRIPLE "x86_64-linux-gnu" CACHE STRING "Target triple, used as a dependency-cache key component")
++
++# zig cc's `-v` diagnostic output isn't in the format CMake's compiler-ABI
++# detection expects from gcc/clang, so CMAKE_<LANG>_IMPLICIT_LINK_DIRECTORIES
++# and CMAKE_LIBRARY_ARCHITECTURE come back empty. That silently drops the
++# Debian/Ubuntu multiarch directory (/usr/lib/x86_64-linux-gnu) from every
++# find_library()/find_package() search -- e.g. FindVulkan.cmake's
++# find_library(Vulkan_LIBRARY) and SDL3's own FindX11-based video-driver
++# detection both live there. Add it back explicitly.
++list(APPEND CMAKE_SYSTEM_LIBRARY_PATH "/usr/lib/${RX_TARGET_TRIPLE}")
+diff --git a/src/rx_platform/CMakeLists.txt b/src/rx_platform/CMakeLists.txt
+new file mode 100644
+index 0000000..e79067a
+--- /dev/null
++++ b/src/rx_platform/CMakeLists.txt
+@@ -0,0 +1,20 @@
++find_package(Vulkan REQUIRED)
++
++add_library(rx_platform STATIC
++    src/window.cpp
++)
++target_include_directories(rx_platform PUBLIC include)
++# SDL3::SDL3 is an ALIAS (to SDL3::SDL3-static, since third_party builds
++# SDL3 static-only) created inside third_party/CMakeLists.txt's directory
++# scope. Promoting the real underlying imported target to IMPORTED_GLOBAL
++# (done in third_party/CMakeLists.txt) does not make the ALIAS name itself
++# resolvable from this sibling directory -- CMake ALIAS targets are not
++# global just because the target they point to is. Link the real global
++# target name directly instead.
++target_link_libraries(rx_platform PUBLIC SDL3::SDL3-static Vulkan::Headers rx_core)
++
++add_executable(rx_platform_tests
++    tests/window_test.cpp
++)
++target_link_libraries(rx_platform_tests PRIVATE rx_platform doctest::doctest)
++add_test(NAME rx_platform_tests COMMAND rx_platform_tests)
+diff --git a/src/rx_platform/include/rx_platform/window.h b/src/rx_platform/include/rx_platform/window.h
+new file mode 100644
+index 0000000..2f0a35b
+--- /dev/null
++++ b/src/rx_platform/include/rx_platform/window.h
+@@ -0,0 +1,30 @@
++#pragma once
++#include <SDL3/SDL.h>
++#include <vulkan/vulkan.h>
++#include <optional>
++#include <vector>
++
++namespace rx::platform {
++
++class Window {
++public:
++    Window(Window&&) noexcept;
++    Window& operator=(Window&&) noexcept;
++    Window(const Window&) = delete;
++    Window& operator=(const Window&) = delete;
++    ~Window();
++
++    static std::optional<Window> create(const char* title, int width, int height, bool visible);
++
++    SDL_Window* sdlWindow() const { return window_; }
++    void pumpEvents();
++
++    std::vector<const char*> requiredVulkanInstanceExtensions() const;
++    VkSurfaceKHR createVulkanSurface(VkInstance instance) const;
++
++private:
++    explicit Window(SDL_Window* window) : window_(window) {}
++    SDL_Window* window_ = nullptr;
++};
++
++}  // namespace rx::platform
+diff --git a/src/rx_platform/src/window.cpp b/src/rx_platform/src/window.cpp
+new file mode 100644
+index 0000000..d8873d1
+--- /dev/null
++++ b/src/rx_platform/src/window.cpp
+@@ -0,0 +1,78 @@
++#include <rx_platform/window.h>
++#include <rx_core/log.h>
++// SDL3/SDL.h does not pull in the Vulkan-interop declarations
++// (SDL_Vulkan_GetInstanceExtensions, SDL_Vulkan_CreateSurface); SDL3 keeps
++// those in their own header.
++#include <SDL3/SDL_vulkan.h>
++
++namespace rx::platform {
++
++std::optional<Window> Window::create(const char* title, int width, int height, bool visible) {
++    if (!SDL_WasInit(SDL_INIT_VIDEO)) {
++        if (!SDL_Init(SDL_INIT_VIDEO)) {
++            RX_LOG_WARN("SDL_Init(SDL_INIT_VIDEO) failed: {}", SDL_GetError());
++            return std::nullopt;
++        }
++    }
++
++    SDL_WindowFlags flags = SDL_WINDOW_VULKAN;
++    if (!visible) {
++        flags |= SDL_WINDOW_HIDDEN;
++    }
++
++    SDL_Window* window = SDL_CreateWindow(title, width, height, flags);
++    if (!window) {
++        RX_LOG_WARN("SDL_CreateWindow failed: {}", SDL_GetError());
++        return std::nullopt;
++    }
++    return Window(window);
++}
++
++Window::Window(Window&& other) noexcept : window_(other.window_) {
++    other.window_ = nullptr;
++}
++
++Window& Window::operator=(Window&& other) noexcept {
++    if (this != &other) {
++        if (window_) {
++            SDL_DestroyWindow(window_);
++        }
++        window_ = other.window_;
++        other.window_ = nullptr;
++    }
++    return *this;
++}
++
++Window::~Window() {
++    if (window_) {
++        SDL_DestroyWindow(window_);
++    }
++}
++
++void Window::pumpEvents() {
++    SDL_Event event;
++    while (SDL_PollEvent(&event)) {
++        // Intentionally empty for now: rx_platform only exposes the pump,
++        // event handling policy belongs to whatever embeds this window.
++    }
++}
++
++std::vector<const char*> Window::requiredVulkanInstanceExtensions() const {
++    Uint32 count = 0;
++    char const* const* names = SDL_Vulkan_GetInstanceExtensions(&count);
++    if (!names) {
++        return {};
++    }
++    return std::vector<const char*>(names, names + count);
++}
++
++VkSurfaceKHR Window::createVulkanSurface(VkInstance instance) const {
++    VkSurfaceKHR surface = VK_NULL_HANDLE;
++    if (!SDL_Vulkan_CreateSurface(window_, instance, nullptr, &surface)) {
++        RX_LOG_WARN("SDL_Vulkan_CreateSurface failed: {}", SDL_GetError());
++        return VK_NULL_HANDLE;
++    }
++    return surface;
++}
++
++}  // namespace rx::platform
+diff --git a/src/rx_platform/tests/window_test.cpp b/src/rx_platform/tests/window_test.cpp
+new file mode 100644
+index 0000000..1f57580
+--- /dev/null
++++ b/src/rx_platform/tests/window_test.cpp
+@@ -0,0 +1,28 @@
++// This is the only test translation unit in rx_platform_tests (unlike
++// rx_core_tests, which shares a separate tests/doctest_main.cpp across
++// several test files), so it both implements doctest's runtime and
++// provides main() directly.
++#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
++#include <doctest/doctest.h>
++#include <rx_platform/window.h>
++
++TEST_CASE("Window::create/destroy lifecycle succeeds under any video driver") {
++    auto window = rx::platform::Window::create("rx_platform_test", 64, 64, /*visible=*/false);
++    REQUIRE(window.has_value());
++    CHECK(window->sdlWindow() != nullptr);
++    window->pumpEvents();
++}
++
++TEST_CASE("Window reports Vulkan instance extensions when a real display backend is present") {
++    auto window = rx::platform::Window::create("rx_platform_vk_test", 64, 64, /*visible=*/false);
++    if (!window.has_value()) {
++        MESSAGE("no display backend available, skipping Vulkan-extension check");
++        return;
++    }
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        MESSAGE("video driver reports no Vulkan surface extensions (e.g. dummy driver), skipping");
++        return;
++    }
++    CHECK(extensions.size() > 0);
++}
+diff --git a/third_party/CMakeLists.txt b/third_party/CMakeLists.txt
+index 85f9d39..74f7d4c 100644
+--- a/third_party/CMakeLists.txt
++++ b/third_party/CMakeLists.txt
+@@ -24,10 +24,32 @@ FetchContent_Declare(doctest
+   GIT_TAG ${RX_DOCTEST_TAG}
+   GIT_SHALLOW TRUE)
+ FetchContent_MakeAvailable(doctest)
+ 
+ set(RX_GLM_TAG "1.0.3")
+ FetchContent_Declare(glm
+   GIT_REPOSITORY https://github.com/g-truc/glm.git
+   GIT_TAG ${RX_GLM_TAG}
+   GIT_SHALLOW TRUE)
+ FetchContent_MakeAvailable(glm)
++
++set(RX_SDL3_TAG "release-3.4.14")
++rx_add_cached_dependency(
++  NAME SDL3
++  REPO https://github.com/libsdl-org/SDL.git
++  TAG ${RX_SDL3_TAG}
++  CMAKE_ARGS -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST_LIBRARY=OFF
++)
++find_package(SDL3 REQUIRED PATHS "${SDL3_CACHE_DIR}" NO_DEFAULT_PATH)
++
++# Same CMake 3.22 limitation as spdlog above. Unlike spdlog::spdlog, SDL3's
++# own config makes "SDL3::SDL3" an ALIAS (to SDL3::SDL3-static here, since
++# we build static-only) rather than a real imported target, and
++# set_target_properties() cannot be applied to an ALIAS target directly.
++# Worse, an ALIAS is scoped to the directory it was created in regardless of
++# whether the target it points to is global, so "SDL3::SDL3" itself stays
++# invisible outside this directory even after the fix below. Promote the
++# real underlying imported targets to global scope instead, and have
++# consumers (src/rx_platform) link against "SDL3::SDL3-static" directly
++# rather than the alias.
++set_target_properties(SDL3::SDL3-static PROPERTIES IMPORTED_GLOBAL TRUE)
++set_target_properties(SDL3::Headers PROPERTIES IMPORTED_GLOBAL TRUE)

@@ -1,0 +1,65 @@
+# Review package: 4c6ba3eecd0dc35b86b031c9e492473f140e18dc..0444ab56f2b01ca0848baf221738d60f8555c471
+
+## Commits
+0444ab5 Fix windows-cross-zig: set CMAKE_RC_COMPILER to a zig rc wrapper
+
+## Files changed
+ cmake/toolchains/windows-cross-zig.cmake | 20 ++++++++++++++++++++
+ cmake/zig-wrappers/zig-rc-windows        |  5 +++++
+ 2 files changed, 25 insertions(+)
+
+## Diff
+diff --git a/cmake/toolchains/windows-cross-zig.cmake b/cmake/toolchains/windows-cross-zig.cmake
+index fbc8cb2..26fa963 100644
+--- a/cmake/toolchains/windows-cross-zig.cmake
++++ b/cmake/toolchains/windows-cross-zig.cmake
+@@ -1,18 +1,38 @@
+ set(CMAKE_SYSTEM_NAME Windows)
+ set(CMAKE_SYSTEM_PROCESSOR x86_64)
+ 
+ get_filename_component(RX_REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+ 
+ set(CMAKE_C_COMPILER   "${RX_REPO_ROOT}/cmake/zig-wrappers/zig-cc-windows"  CACHE FILEPATH "C compiler" FORCE)
+ set(CMAKE_CXX_COMPILER "${RX_REPO_ROOT}/cmake/zig-wrappers/zig-cxx-windows" CACHE FILEPATH "C++ compiler" FORCE)
+ 
++# CMake's Windows-GNU platform module (Platform/Windows-GNU.cmake) enables the
++# RC language unconditionally as part of enabling C/CXX for any GNU-ABI-like
++# compiler on CMAKE_SYSTEM_NAME=Windows -- regardless of whether any target
++# actually compiles a .rc file. Left to its own auto-detection, CMake infers a
++# GNU cross-toolchain prefix from the C compiler's filename
++# ("zig-cc-windows" matches the "<prefix->cc" pattern with prefix "zig-") and
++# guesses the RC compiler is "zig-windres", which does not exist. That fails
++# `enable_language(RC)` and aborts configure the first time it's triggered --
++# in practice, inside the first CMake-based third-party dependency's subbuild
++# (e.g. spdlog via rx_add_cached_dependency), since nothing in this project's
++# own CMakeLists.txt compiles a .rc file itself.
++#
++# Zig ships `zig rc`, a drop-in-compatible resource compiler (verified
++# directly: it accepts the same /fo, -D, -I flags CMake's default
++# CMAKE_RC_COMPILE_OBJECT rule passes and produces a valid .res). Point
++# CMAKE_RC_COMPILER at a wrapper around it, mirroring the existing
++# zig-cc-windows/zig-cxx-windows pattern, so CMake never reaches its broken
++# auto-detection.
++set(CMAKE_RC_COMPILER  "${RX_REPO_ROOT}/cmake/zig-wrappers/zig-rc-windows"  CACHE FILEPATH "RC compiler" FORCE)
++
+ # Cross-compiling: CMake cannot execute the resulting binaries to probe the
+ # compiler, so tell it the compiler works rather than test-executing it.
+ set(CMAKE_C_COMPILER_WORKS TRUE)
+ set(CMAKE_CXX_COMPILER_WORKS TRUE)
+ set(CMAKE_CROSSCOMPILING TRUE)
+ 
+ set(RX_TARGET_TRIPLE "x86_64-windows-gnu" CACHE STRING "Target triple, used as a dependency-cache key component")
+ 
+ # If wine is present, ctest can run cross-compiled test binaries transparently.
+ find_program(RX_WINE_EXECUTABLE wine)
+diff --git a/cmake/zig-wrappers/zig-rc-windows b/cmake/zig-wrappers/zig-rc-windows
+new file mode 100755
+index 0000000..5ac3572
+--- /dev/null
++++ b/cmake/zig-wrappers/zig-rc-windows
+@@ -0,0 +1,5 @@
++#!/usr/bin/env bash
++set -euo pipefail
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
++exec "$REPO_ROOT/toolchain/zig/zig" rc /:target x86_64 "$@"

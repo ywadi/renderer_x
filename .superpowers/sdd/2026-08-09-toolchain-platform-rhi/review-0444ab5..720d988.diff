@@ -1,0 +1,82 @@
+# Review package: 0444ab56f2b01ca0848baf221738d60f8555c471..720d98854fccad8fdd57389bc3d896cb375f62c3
+
+## Commits
+720d988 Fetch Vulkan-Headers directly instead of find_package(Vulkan)
+
+## Files changed
+ src/rx_platform/CMakeLists.txt | 10 +++++++++-
+ third_party/CMakeLists.txt     | 21 +++++++++++++++++++++
+ 2 files changed, 30 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/src/rx_platform/CMakeLists.txt b/src/rx_platform/CMakeLists.txt
+index e79067a..5281b4a 100644
+--- a/src/rx_platform/CMakeLists.txt
++++ b/src/rx_platform/CMakeLists.txt
+@@ -1,11 +1,19 @@
+-find_package(Vulkan REQUIRED)
++# Vulkan::Headers comes from third_party/CMakeLists.txt's plain FetchContent
++# of KhronosGroup/Vulkan-Headers (a regular, non-imported CMake target, so
++# -- unlike the imported targets from find_package()/dependency-cache
++# installs elsewhere in this project -- it is already visible here without
++# any IMPORTED_GLOBAL promotion). Deliberately NOT find_package(Vulkan):
++# that would additionally require locating the platform's Vulkan loader
++# import library, which this project never links against (see comment in
++# third_party/CMakeLists.txt) and which does not exist when cross-compiling
++# to Windows on a Linux host.
+ 
+ add_library(rx_platform STATIC
+     src/window.cpp
+ )
+ target_include_directories(rx_platform PUBLIC include)
+ # SDL3::SDL3 is an ALIAS (to SDL3::SDL3-static, since third_party builds
+ # SDL3 static-only) created inside third_party/CMakeLists.txt's directory
+ # scope. Promoting the real underlying imported target to IMPORTED_GLOBAL
+ # (done in third_party/CMakeLists.txt) does not make the ALIAS name itself
+ # resolvable from this sibling directory -- CMake ALIAS targets are not
+diff --git a/third_party/CMakeLists.txt b/third_party/CMakeLists.txt
+index 74f7d4c..84a9538 100644
+--- a/third_party/CMakeLists.txt
++++ b/third_party/CMakeLists.txt
+@@ -25,20 +25,41 @@ FetchContent_Declare(doctest
+   GIT_SHALLOW TRUE)
+ FetchContent_MakeAvailable(doctest)
+ 
+ set(RX_GLM_TAG "1.0.3")
+ FetchContent_Declare(glm
+   GIT_REPOSITORY https://github.com/g-truc/glm.git
+   GIT_TAG ${RX_GLM_TAG}
+   GIT_SHALLOW TRUE)
+ FetchContent_MakeAvailable(glm)
+ 
++# Vulkan-Headers: header-only (provides the Vulkan::Headers INTERFACE target
++# via its own CMakeLists.txt, no loader library involved), fetched directly
++# like GLM/doctest rather than through find_package(Vulkan). find_package's
++# bundled FindVulkan.cmake (CMake 3.22 here) gates Vulkan_FOUND -- and
++# therefore Vulkan::Headers existing at all -- behind ALSO locating the
++# platform's Vulkan *loader* import library (vulkan-1.lib on Windows), which
++# does not exist anywhere when cross-compiling to Windows on this Linux host.
++# Nothing in this project links the loader at compile/link time: the RHI
++# layer (Task 6+) loads Vulkan entry points dynamically at runtime via volk,
++# so only the headers (types/constants/signatures) are ever needed. Pinned
++# to vulkan-sdk-1.3.280.0, whose vulkan_core.h reports
++# VK_HEADER_VERSION_COMPLETE == 1.3.280, an exact match for this project's
++# Vulkan 1.3 baseline (this machine's driver reports Instance Version
++# 1.3.280 via `vulkaninfo --summary`).
++set(RX_VULKAN_HEADERS_TAG "vulkan-sdk-1.3.280.0")
++FetchContent_Declare(Vulkan-Headers
++  GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
++  GIT_TAG ${RX_VULKAN_HEADERS_TAG}
++  GIT_SHALLOW TRUE)
++FetchContent_MakeAvailable(Vulkan-Headers)
++
+ set(RX_SDL3_TAG "release-3.4.14")
+ rx_add_cached_dependency(
+   NAME SDL3
+   REPO https://github.com/libsdl-org/SDL.git
+   TAG ${RX_SDL3_TAG}
+   CMAKE_ARGS -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST_LIBRARY=OFF
+ )
+ find_package(SDL3 REQUIRED PATHS "${SDL3_CACHE_DIR}" NO_DEFAULT_PATH)
+ 
+ # Same CMake 3.22 limitation as spdlog above. Unlike spdlog::spdlog, SDL3's
