@@ -4,3 +4,4 @@ third_party/slang-prebuilt/
 build/
 build-*/
 .cache/
+.superpowers/
