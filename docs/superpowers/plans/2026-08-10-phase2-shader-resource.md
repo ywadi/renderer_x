@@ -13,6 +13,7 @@
 - Push-constant usage in any shader/sample stays within 128 bytes total [R:B2].
 - `NonUniformResourceIndex()` only where an index varies within a draw; never on per-draw push-constant indices. Any shader using it gets `spirv-val` run on its SPIR-V in that task [R:B3, R:E4].
 - Slang API calls follow the verified shapes in [R:A2]/[R:A3] — if the shipped `slang.h` disagrees with the research file, the header wins; note the discrepancy in the report.
+- **vk-bootstrap landmine (verified in Phase 1 Task 1's review):** the pinned vk-bootstrap caches instance-level Vulkan function pointers process-wide from the FIRST `vkb::Instance` built in a process and never refreshes them — building a headless/narrow-extension instance before a windowed/broader one poisons later physical-device selection (SIGSEGV). Any NEW test binary in this phase that constructs Vulkan devices (rx_shader tests, sample headless gates) must either (a) warm the cache at binary startup by building-and-destroying a Context with the broadest extension set the binary will ever use (the pattern `src/rx_rhi_vk/tests/doctest_main.cpp` establishes — copy it), or (b) keep headless-only and windowed instance construction in separate test executables. See the doc comment on `Context::create`.
 
 ---
 

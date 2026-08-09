@@ -1,0 +1,378 @@
+# Review package: fb737d3..a3ee68e
+
+## Commits
+a3ee68e Fix rx_rhi_vk_tests' vk-bootstrap cache workaround: warm up instead of ordering
+
+## Files changed
+ .../2026-08-10-phase1-completion/task-1-report.md  | 71 ++++++++++++++++++
+ src/rx_rhi_vk/CMakeLists.txt                       | 12 ++-
+ src/rx_rhi_vk/include/rx_rhi_vk/context.h          | 32 ++++++++
+ src/rx_rhi_vk/src/device.cpp                       | 13 ++++
+ src/rx_rhi_vk/tests/context_test.cpp               | 30 ++------
+ src/rx_rhi_vk/tests/doctest_main.cpp               | 85 +++++++++++++++++++++-
+ 6 files changed, 211 insertions(+), 32 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-10-phase1-completion/task-1-report.md b/.superpowers/sdd/2026-08-10-phase1-completion/task-1-report.md
+index 87bad2c..03b1fe0 100644
+--- a/.superpowers/sdd/2026-08-10-phase1-completion/task-1-report.md
++++ b/.superpowers/sdd/2026-08-10-phase1-completion/task-1-report.md
+@@ -1,14 +1,16 @@
+ # Task 1 Report: rx_rhi_vk::Device (device, queues, swapchain, acquire/present/recreate)
+ 
+ Status: **DONE**
+ 
++**Update (post-review fix pass):** see "Fix pass: review findings addressed" at the bottom of this report for the three findings from the Approved-with-findings review and how each was resolved.
++
+ ## What was built
+ 
+ ### Step A — `Context` extended to store `vkb::Instance`
+ 
+ - `src/rx_rhi_vk/include/rx_rhi_vk/context.h`: now `#include <VkBootstrap.h>` and stores `vkb::Instance vkbInstance_{}` by value instead of raw `VkInstance`/`VkDebugUtilsMessengerEXT`. Added `const vkb::Instance& vkbInstance() const`. `instance()`/`debugMessenger()` now read through `vkbInstance_.instance`/`.debug_messenger`. Private constructor is now `Context(vkb::Instance, std::shared_ptr<int>)`.
+ - `src/rx_rhi_vk/src/context.cpp`: dtor and move-assign now guard on `vkbInstance_.instance != VK_NULL_HANDLE` and tear down via a single `vkb::destroy_instance(vkbInstance_)` call (destroys messenger + instance together), matching the brief. Move ctor nulls the moved-from instance handle. The `isKnownPortabilityEnumerationLayerBug` false-positive guard and the `errorCount_` mechanism are untouched.
+ - Verified in isolation before moving to Step B: rebuilt `rx_rhi_vk_tests`, reran just the context test — passed, no regression — then confirmed both presets (`linux-native` build+test, `windows-cross-zig` build) were clean before starting Step B.
+ 
+ ### Step B — `Device`
+ 
+@@ -80,10 +82,79 @@ Repeated 3x in a row (plus once more after the clean rebuild) with identical res
+ - Ownership/lifetime: verified by inspection and by the round-trip test's explicit teardown order (pool/fence/semaphores destroyed, then `vkDeviceWaitIdle`'d, before the `Device`/`Context` optionals go out of scope in reverse declaration order — `Device` before `Context`, so the surface is destroyed via a still-valid `VkInstance`).
+ - Move semantics: `Device`'s move-assign is self-move-guarded and nulls every field of the moved-from object; `Context`'s Step A refactor keeps the exact same guard/teardown shape it had before, just through `vkb::destroy_instance`.
+ - No leaks on failure paths in `Device::create`: each failure step destroys everything successfully created so far (traced through all 6 failure branches).
+ - Zero validation errors confirmed on every test run, not just asserted in code.
+ - Did not touch `.superpowers/sdd/.../progress.md`, `task-4-*`, `.claude/`, or other files touched by concurrent work in this repo — staged and committed only the files this task owns.
+ 
+ ## Concerns
+ 
+ - The vk-bootstrap caching defect (above) is real and will resurface if: (a) a future test binary in this project ever builds a headless-then-windowed (or otherwise extension-mismatched) sequence of `vkb::Instance`s without the same `--order-by=suite` discipline, or (b) real runtime code (not just tests) ever recreates `rx::rhi::Context` with a different extension set mid-process. Worth a forward note for whoever designs device-lost/context-recreation handling.
+ - `recreateSwapchain`'s surface parameter does not take ownership (per the brief's wording, which only discusses destroying the *old swapchain*, not the surface) — in the intended usage the same surface handle is passed back in on every call. This is documented on the header but is a slightly implicit contract worth double-checking against Task 3/4's actual call site once written.
++
++## Fix pass: review findings addressed
++
++The review came back **Approved-with-findings**: the vk-bootstrap diagnosis was independently verified against upstream source and confirmed exact, but the reviewer reproduced a SIGSEGV running `rx_rhi_vk_tests` *without* `--order-by=suite`, and ruled the `--order-by=suite` workaround too fragile (doctest's suite sort falls back to filename order on ties, so any future test file alphabetically before `device_test.cpp` that builds a narrower-capability Context would silently reintroduce the crash). Three findings, all addressed:
++
++**1. (IMPORTANT) No documentation of the defect in production code.** Added a WARNING doc comment directly on `Context::create()` in `src/rx_rhi_vk/include/rx_rhi_vk/context.h`, describing the process-wide vk-bootstrap function-pointer cache, which specific function pointers are affected (surface-support functions for `PhysicalDeviceSelector`, debug-messenger create/destroy for validation — see finding 2 below for why both matter), what the observable symptoms are (segfault vs. a clean `Context::create` failure), and what a future implementer of Context/Device recreation needs to do about it. This is the first place a future device-lost-recovery or multi-Context implementer would actually look.
++
++**2. (IMPORTANT) Replaced the filename-fragile ordering with a structural fix.** `src/rx_rhi_vk/tests/doctest_main.cpp` no longer uses `DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN`; it now uses `DOCTEST_CONFIG_IMPLEMENT` plus an explicit `main()` that calls a `warmUpVkBootstrapInstanceFunctionCache()` helper *before* constructing/running `doctest::Context`. That helper builds (and immediately lets go out of scope, destroying) one throwaway `rx::rhi::Context` using the broadest capability set any test in this binary needs: real window instance extensions via `rx::platform::Window::create(...)->requiredVulkanInstanceExtensions()` when a display is available (falling back to headless when not — the windowed Device tests skip themselves on such machines anyway), **and `enableValidation=true`**.
++   - The `enableValidation=true` part was not incidental — it was a second instance of the *exact same defect class*, caught only by actually running the fix: my first attempt warmed up with `enableValidation=false` (reasoning: "just get surface support cached"), which instead cached a **null `fp_vkCreateDebugUtilsMessengerEXT`** (that function is only resolved non-null when the first instance in the process actually requests validation layers / a debug callback). That broke every subsequent validated `Context::create()` in the process with a clean-looking `vkb::InstanceBuilder::build failed: failed_create_debug_messenger` — caught immediately by `ctest --preset linux-native` going from 100% to 25% passing. Fixed by warming up with `enableValidation=true` too, and documented both angles (surface support *and* debug messenger) in the warm-up function's own comment and in `Context::create`'s doc comment, so "broadest instance" is understood to mean broadest along every axis vk-bootstrap caches per-process, not just extensions.
++   - Removed the now-unnecessary `doctest::test_suite("zz_run_after_windowed_device_tests")` decorator from `context_test.cpp` and the `--order-by=suite` flag from `CMakeLists.txt`'s `add_test` line; replaced their comments with pointers to the real, structural explanation in `doctest_main.cpp`.
++   - Proved the fix is order-independent, not just re-passing under the same lucky default order: ran `./rx_rhi_vk_tests --order-by=rand --rand-seed=N` for `N` swept from 1–40, found several seeds (4, 5, 17, 21, 28, 29, 30, 33, 35, 37, 40) where the random order puts the headless `Context::create` test **first** — the exact original crash precondition — and confirmed all of them still pass (31/31 assertions, 0 failed). Also ran plain `./rx_rhi_vk_tests` with no flags (doctest's own default, `--order-by=file`) — passes.
++
++**3. (MINOR) `Device::recreateSwapchain` surface-mismatch guard.** Added a check at the top of `recreateSwapchain` in `src/rx_rhi_vk/src/device.cpp`: if the passed `surface` differs from the `Device`'s currently-owned `surface_`, logs `RX_LOG_WARN` naming both handles (as `void*`, since `VkSurfaceKHR` isn't directly formattable) and explaining that the previous surface will not be destroyed by this call. Does not change behavior (still overwrites `surface_` — that's the documented contract), just makes the mismatch visible instead of silent.
++
++### Verification commands + actual output (this fix pass)
++
++Clean incremental rebuild (note: the build tree picked up unrelated concurrent Task 4/Phase 2 changes mid-session — a `shader_spirv_test` target and Slang shader compilation now appear in the same build; not this task's work, left untouched):
++
++```
++$ cmake --build --preset linux-native
++[... 7/7 ...] Linking CXX executable src/rx_rhi_vk/rx_rhi_vk_tests
++
++$ ctest --preset linux-native --output-on-failure
++Test project .../build/linux-native
++    Start 1: shader_spirv_test
++1/4 Test #1: shader_spirv_test ................   Passed    0.00 sec
++    Start 2: rx_core_tests
++2/4 Test #2: rx_core_tests ....................   Passed    0.00 sec
++    Start 3: rx_platform_tests
++3/4 Test #3: rx_platform_tests ................   Passed    0.06 sec
++    Start 4: rx_rhi_vk_tests
++4/4 Test #4: rx_rhi_vk_tests ..................   Passed    0.92 sec
++100% tests passed, 0 tests failed out of 4
++```
++Repeated 3x — stable, no flakiness.
++
++```
++$ ./build/linux-native/src/rx_rhi_vk/rx_rhi_vk_tests            # default order (doctest's own --order-by=file)
++[doctest] test cases:  3 |  3 passed | 0 failed | 0 skipped
++[doctest] assertions: 31 | 31 passed | 0 failed |
++[doctest] Status: SUCCESS!
++
++$ for seed in 1 2 42 12345 4 5 17 40; do
++    ./build/linux-native/src/rx_rhi_vk/rx_rhi_vk_tests --order-by=rand --rand-seed=$seed
++  done
++# every seed: 3 | 3 passed | 0 failed | 0 skipped; 31 | 31 passed | 0 failed; SUCCESS
++# seeds 4, 5, 17, 40 specifically confirmed (via --list-test-cases first) to run
++# "Context::create ..." (the headless one) FIRST -- the original crash precondition --
++# and still pass cleanly.
++```
++
++```
++$ cmake --build --preset windows-cross-zig
++[... 11/11 ...] Linking CXX executable src/rx_rhi_vk/rx_rhi_vk_tests.exe
++```
++
++### Files touched in this fix pass
++
++- `src/rx_rhi_vk/include/rx_rhi_vk/context.h` — WARNING doc comment on `Context::create`.
++- `src/rx_rhi_vk/tests/doctest_main.cpp` — switched to `DOCTEST_CONFIG_IMPLEMENT` + explicit `main()` with the warm-up.
++- `src/rx_rhi_vk/tests/context_test.cpp` — dropped the suite decorator/comment, replaced with a one-line pointer to the structural fix.
++- `src/rx_rhi_vk/CMakeLists.txt` — dropped `--order-by=suite`; updated comment.
++- `src/rx_rhi_vk/src/device.cpp` — `recreateSwapchain` surface-mismatch `RX_LOG_WARN`.
++
++### Self-review of this fix pass
++
++- Confirmed the fix addresses the *actual* mechanism (structural, order-independent) rather than papering over the reviewer's specific repro — proved with a seed sweep specifically targeting the original failure precondition, not just re-running the previously-passing case.
++- Caught my own regression (the `enableValidation=false` warm-up breaking validated contexts) via the same verification discipline — full `ctest`, not just the happy path — before it could have shipped.
++- Did not touch `.superpowers/sdd/.../progress.md`, `docs/superpowers/plans/2026-08-10-phase2-shader-resource.md`, or any other file modified by concurrent work in this shared working tree during this session; staged and committed only the five files this fix pass owns.
+diff --git a/src/rx_rhi_vk/CMakeLists.txt b/src/rx_rhi_vk/CMakeLists.txt
+index bca157c..c1c07ee 100644
+--- a/src/rx_rhi_vk/CMakeLists.txt
++++ b/src/rx_rhi_vk/CMakeLists.txt
+@@ -9,23 +9,21 @@ add_library(rx_rhi_vk STATIC
+     ${volk_SOURCE_DIR}/volk.c
+ )
+ target_include_directories(rx_rhi_vk PUBLIC include ${volk_SOURCE_DIR})
+ target_link_libraries(rx_rhi_vk PUBLIC rx_core vk-bootstrap::vk-bootstrap)
+ target_compile_definitions(rx_rhi_vk PUBLIC VK_NO_PROTOTYPES)
+ 
+ # Two test translation units now (context_test.cpp, device_test.cpp), so --
+ # like rx_core_tests, and unlike this target before device_test.cpp existed
+ # -- doctest's runtime/main is implemented once in a dedicated
+ # tests/doctest_main.cpp shared by both, rather than in either test file.
++# doctest_main.cpp also links rx_platform: it uses rx::platform::Window to
++# warm up a real vk-bootstrap hazard before any TEST_CASE runs (see the
++# comment there) -- so test order here is not load-bearing, deliberately;
++# no --order-by is needed on the add_test line below.
+ add_executable(rx_rhi_vk_tests
+     tests/doctest_main.cpp
+     tests/context_test.cpp
+     tests/device_test.cpp
+ )
+ target_link_libraries(rx_rhi_vk_tests PRIVATE rx_rhi_vk rx_platform doctest::doctest)
+-
+-# --order-by=suite (rather than doctest's own default, "file", which would
+-# sort context_test.cpp's test before device_test.cpp's alphabetically) is
+-# required here, not cosmetic: see the comment on context_test.cpp's
+-# TEST_CASE for the vk-bootstrap process-wide function-pointer cache defect
+-# this ordering works around.
+-add_test(NAME rx_rhi_vk_tests COMMAND rx_rhi_vk_tests --order-by=suite)
++add_test(NAME rx_rhi_vk_tests COMMAND rx_rhi_vk_tests)
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/context.h b/src/rx_rhi_vk/include/rx_rhi_vk/context.h
+index 14c3eae..4b8fa5b 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/context.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/context.h
+@@ -11,20 +11,52 @@
+ namespace rx::rhi {
+ 
+ class Context {
+ public:
+     Context(Context&&) noexcept;
+     Context& operator=(Context&&) noexcept;
+     Context(const Context&) = delete;
+     Context& operator=(const Context&) = delete;
+     ~Context();
+ 
++    // WARNING -- process-wide vk-bootstrap caching hazard, not specific to
++    // this Context: the pinned vk-bootstrap commit
++    // (556b79b165386f6c1a18362d30f2a076fdaa2778) resolves instance-level
++    // Vulkan function pointers (vkGetPhysicalDeviceSurfaceSupportKHR and
++    // friends for PhysicalDeviceSelector; vkCreateDebugUtilsMessengerEXT /
++    // vkDestroyDebugUtilsMessengerEXT for enableValidation=true; likely
++    // others too -- anything resolved through its internal `detail::
++    // vulkan_functions()` singleton) from whichever vkb::Instance is built
++    // *first* in the process, and never refreshes them afterward -- there
++    // is no public API to reset the cache, and destroying that first
++    // Instance does not do it either. Building a Context with a narrower
++    // capability set than a later one needs -- fewer extensions (e.g.
++    // headless, no VK_KHR_surface) *or* enableValidation=false when a later
++    // Context in the same process needs true -- poisons that later
++    // Context/Device's calls with null function pointers cached from the
++    // first, narrower instance. Depending on which function pointer is
++    // null, this shows up either as a segfault (confirmed via gdb: null
++    // fp_vkGetPhysicalDeviceSurfaceSupportKHR, VkBootstrap.cpp:1103, when a
++    // later PhysicalDeviceSelector needs surface support the first instance
++    // never enabled) or as a clean-looking `Context::create` failure
++    // ("failed_create_debug_messenger", when a later enableValidation=true
++    // Context needs a debug messenger the first, unvalidated instance never
++    // requested). rx_rhi_vk_tests' tests/doctest_main.cpp works around this
++    // today by warming the cache with the single broadest instance (real
++    // window extensions when available, enableValidation=true) the test
++    // binary needs, before any test runs. There is no equivalent guard in
++    // production code: whoever implements Context/Device recreation
++    // (device-lost recovery, editor hot-reload, or any other flow that
++    // could build more than one Context across a single process's
++    // lifetime) needs to either keep every Context's capabilities
++    // (extensions *and* enableValidation) consistent, or replicate that
++    // same warm-up-with-the-broadest-instance-first pattern.
+     static std::optional<Context> create(std::vector<const char*> requiredExtensions, bool enableValidation);
+ 
+     VkInstance instance() const { return vkbInstance_.instance; }
+     VkDebugUtilsMessengerEXT debugMessenger() const { return vkbInstance_.debug_messenger; }
+     const vkb::Instance& vkbInstance() const { return vkbInstance_; }
+     bool hasValidationErrors() const { return *errorCount_ > 0; }
+ 
+ private:
+     Context(vkb::Instance vkbInstance, std::shared_ptr<int> errorCount)
+         : vkbInstance_(std::move(vkbInstance)), errorCount_(std::move(errorCount)) {}
+diff --git a/src/rx_rhi_vk/src/device.cpp b/src/rx_rhi_vk/src/device.cpp
+index 21528d3..17c2eb9 100644
+--- a/src/rx_rhi_vk/src/device.cpp
++++ b/src/rx_rhi_vk/src/device.cpp
+@@ -187,20 +187,33 @@ SwapchainStatus Device::present(uint32_t imageIndex, VkSemaphore wait) {
+         case VK_ERROR_DEVICE_LOST:
+             RX_LOG_ERROR("vkQueuePresentKHR: device lost");
+             return SwapchainStatus::DeviceLost;
+         default:
+             RX_LOG_ERROR("vkQueuePresentKHR failed: VkResult={}", static_cast<int>(result));
+             return SwapchainStatus::NeedsRecreate;
+     }
+ }
+ 
+ bool Device::recreateSwapchain(VkSurfaceKHR surface) {
++    if (surface != surface_) {
++        // Not necessarily wrong (a caller could legitimately be handing
++        // this Device a brand-new surface), but the intended/expected usage
++        // is to pass the same surface handle back on every call -- this
++        // Device does not take ownership of `surface` here and will not
++        // destroy the previously-owned one, so silently swapping it in
++        // could leak the old surface if that wasn't the caller's intent.
++        RX_LOG_WARN(
++            "Device::recreateSwapchain: surface handle changed (previously owned {}, now given {}); the "
++            "previous surface will not be destroyed by this call",
++            static_cast<void*>(surface_), static_cast<void*>(surface));
++    }
++
+     vkDeviceWaitIdle(device_);
+ 
+     if (swapchain_ != VK_NULL_HANDLE) {
+         vkDestroySwapchainKHR(device_, swapchain_, nullptr);
+         swapchain_ = VK_NULL_HANDLE;
+     }
+     swapchainImages_.clear();
+ 
+     vkb::SwapchainBuilder swapchainBuilder(physicalDevice_, device_, surface);
+     auto swapchainResult = swapchainBuilder.build();
+diff --git a/src/rx_rhi_vk/tests/context_test.cpp b/src/rx_rhi_vk/tests/context_test.cpp
+index fe9b1dd..db1a140 100644
+--- a/src/rx_rhi_vk/tests/context_test.cpp
++++ b/src/rx_rhi_vk/tests/context_test.cpp
+@@ -1,32 +1,14 @@
+ #include <doctest/doctest.h>
+ #include <rx_rhi_vk/context.h>
+ 
+-// This test case is pinned to a test suite that sorts after device_test.cpp's
+-// (unnamed, i.e. "") suite under --order-by=suite (set for this whole binary
+-// in CMakeLists.txt) so that it always runs *after* device_test.cpp's
+-// windowed Device::create() tests within this one process. That ordering is
+-// not cosmetic: it works around a confirmed defect in the pinned
+-// vk-bootstrap commit (556b79b165386f6c1a18362d30f2a076fdaa2778).
+-// vk-bootstrap resolves instance-level function pointers (detail::
+-// vulkan_functions() in VkBootstrap.cpp) into a process-wide singleton that
+-// is populated from the *first* vkb::Instance ever built in the process and
+-// is then permanently reused -- init_instance_funcs() no-ops on every later
+-// call, and nothing in vk-bootstrap's public API resets it. This test
+-// builds Context::create({}, true), i.e. headless=true, so vk-bootstrap
+-// never enables VK_KHR_surface on it; if this ran first, every later
+-// PhysicalDeviceSelector::select() in the process (used by
+-// Device::create()) would inherit a null fp_vkGetPhysicalDeviceSurfaceSupportKHR
+-// cached from this instance and crash the moment it needs to check present
+-// support (confirmed via gdb: SIGSEGV in vkb::detail::get_present_queue_index,
+-// VkBootstrap.cpp:1103, called from PhysicalDeviceSelector::is_device_suitable).
+-// Running the windowed Device tests first instead means the process-wide
+-// cache is warmed up with real, valid surface function pointers before this
+-// headless test ever runs, and this test's own behavior/assertions are
+-// otherwise unchanged from Task 6.
+-TEST_CASE("Context::create succeeds with no required extensions and reports no validation errors" *
+-          doctest::test_suite("zz_run_after_windowed_device_tests")) {
++// Safe to run in any order relative to device_test.cpp's windowed tests:
++// tests/doctest_main.cpp warms vk-bootstrap's process-wide instance-function
++// cache with the broadest instance this binary needs before any TEST_CASE
++// runs (see the comment there, and the WARNING on Context::create() in
++// rx_rhi_vk/context.h, for why that warm-up exists).
++TEST_CASE("Context::create succeeds with no required extensions and reports no validation errors") {
+     auto ctx = rx::rhi::Context::create({}, /*enableValidation=*/true);
+     REQUIRE(ctx.has_value());
+     CHECK(ctx->instance() != VK_NULL_HANDLE);
+     CHECK_FALSE(ctx->hasValidationErrors());
+ }
+diff --git a/src/rx_rhi_vk/tests/doctest_main.cpp b/src/rx_rhi_vk/tests/doctest_main.cpp
+index 0a3f254..ecc327c 100644
+--- a/src/rx_rhi_vk/tests/doctest_main.cpp
++++ b/src/rx_rhi_vk/tests/doctest_main.cpp
+@@ -1,2 +1,85 @@
+-#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
++// DOCTEST_CONFIG_IMPLEMENT (not _WITH_MAIN): main() below needs to run code
++// before any TEST_CASE executes, so it constructs and drives the
++// doctest::Context itself instead of using doctest's generated main().
++#define DOCTEST_CONFIG_IMPLEMENT
+ #include <doctest/doctest.h>
++#include <rx_rhi_vk/context.h>
++#include <rx_platform/window.h>
++
++// This is where every future rx_rhi_vk test file's code joins this binary,
++// so this is where a real vk-bootstrap hazard gets a permanent, structural
++// fix rather than a per-test-file workaround: see the WARNING on
++// rx::rhi::Context::create() (rx_rhi_vk/context.h) for the full defect.
++// Short version -- the pinned vk-bootstrap commit caches instance-level
++// Vulkan function pointers process-wide from whichever vkb::Instance is
++// built *first*, forever, with no reset. If any test in this binary ever
++// builds a Context with narrower capabilities (fewer extensions -- e.g.
++// headless -- or enableValidation=false) before another test builds one
++// with broader capabilities (e.g. windowed and/or validated, needed by
++// Device::create() and by context_test.cpp respectively), every later,
++// broader call inherits null function pointers cached from the narrower
++// instance: this has been observed as both a segfault (null
++// vkGetPhysicalDeviceSurfaceSupportKHR) and a clean `Context::create`
++// failure (null vkCreateDebugUtilsMessengerEXT -- see the warm-up function
++// below for that second one specifically).
++//
++// An earlier version of this fix pinned doctest's test *order* instead
++// (--order-by=suite, sorting windowed Device tests before the headless
++// Context test). That was fragile: doctest's suite sort falls back to
++// filename order on ties, so any future test file that is alphabetically
++// earlier than device_test.cpp and happens to build a narrower Context
++// would silently reintroduce this exact crash. Ordering test cases can
++// never fully close this hole -- only pre-warming the cache can, since it
++// makes the hazard's precondition ("the first vkb::Instance in the process
++// is narrower than a later one needs") impossible to hit in the first
++// place, regardless of what any test file does or what order it runs in.
++//
++// So: before running any TEST_CASE, build (and immediately destroy) one
++// throwaway Context using the *broadest* capabilities this binary will ever
++// need -- a real window's requiredVulkanInstanceExtensions() when a display
++// is available, plus enableValidation=true, so the process-wide cache gets
++// warmed with real, valid function pointers for both up front. When no
++// display is available (headless CI), fall back to a headless (but still
++// validated) warm-up: the windowed Device tests skip themselves on such
++// machines anyway (see device_test.cpp's own skip guard), so a
++// narrower-on-extensions warm-up is harmless there -- there is no broader
++// instance any test in this binary will actually try to build.
++namespace {
++
++void warmUpVkBootstrapInstanceFunctionCache() {
++    std::vector<const char*> extensions;
++    auto window = rx::platform::Window::create("rx_rhi_vk_tests_warmup", 64, 64, /*visible=*/false);
++    if (window.has_value()) {
++        extensions = window->requiredVulkanInstanceExtensions();
++    }
++    // enableValidation=true here is not incidental: the same process-wide
++    // vk-bootstrap cache also covers fp_vkCreateDebugUtilsMessengerEXT (and
++    // its destroy counterpart), which is only non-null when the instance
++    // that first resolves it actually requested validation layers / a debug
++    // callback. An earlier version of this warm-up used
++    // enableValidation=false and broke every *validated* Context built
++    // afterward in this same process (vkb::InstanceBuilder::build failing
++    // with "failed_create_debug_messenger") -- the exact same class of bug
++    // as the surface-function one above, just on a different extension.
++    // "Broadest instance this binary needs" has to mean broadest along
++    // every axis vk-bootstrap caches per-process, not just surface support.
++    //
++    // Best-effort: if this fails outright (no Vulkan driver at all), every
++    // real test below will fail too and report that clearly on its own --
++    // nothing to specially handle here.
++    rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    warmUpVkBootstrapInstanceFunctionCache();
++
++    doctest::Context context;
++    context.applyCommandLine(argc, argv);
++    int res = context.run();
++    if (context.shouldExit()) {
++        return res;
++    }
++    return res;
++}
