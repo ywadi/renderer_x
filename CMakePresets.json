@@ -1,0 +1,23 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "linux-native",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-native",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-native.cmake",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "linux-native", "configurePreset": "linux-native" }
+  ],
+  "testPresets": [
+    {
+      "name": "linux-native",
+      "configurePreset": "linux-native",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}
