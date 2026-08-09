@@ -31,3 +31,25 @@ FetchContent_Declare(glm
   GIT_TAG ${RX_GLM_TAG}
   GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(glm)
+
+set(RX_SDL3_TAG "release-3.4.14")
+rx_add_cached_dependency(
+  NAME SDL3
+  REPO https://github.com/libsdl-org/SDL.git
+  TAG ${RX_SDL3_TAG}
+  CMAKE_ARGS -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST_LIBRARY=OFF
+)
+find_package(SDL3 REQUIRED PATHS "${SDL3_CACHE_DIR}" NO_DEFAULT_PATH)
+
+# Same CMake 3.22 limitation as spdlog above. Unlike spdlog::spdlog, SDL3's
+# own config makes "SDL3::SDL3" an ALIAS (to SDL3::SDL3-static here, since
+# we build static-only) rather than a real imported target, and
+# set_target_properties() cannot be applied to an ALIAS target directly.
+# Worse, an ALIAS is scoped to the directory it was created in regardless of
+# whether the target it points to is global, so "SDL3::SDL3" itself stays
+# invisible outside this directory even after the fix below. Promote the
+# real underlying imported targets to global scope instead, and have
+# consumers (src/rx_platform) link against "SDL3::SDL3-static" directly
+# rather than the alias.
+set_target_properties(SDL3::SDL3-static PROPERTIES IMPORTED_GLOBAL TRUE)
+set_target_properties(SDL3::Headers PROPERTIES IMPORTED_GLOBAL TRUE)
