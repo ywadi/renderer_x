@@ -8,5 +8,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 enable_testing()
 
 add_subdirectory(third_party)
+add_subdirectory(src/rx_core)
 add_subdirectory(tools/dep_cache_smoketest)
 add_subdirectory(tools/toolchain_check)

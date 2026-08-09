@@ -15,3 +15,19 @@ find_package(spdlog REQUIRED PATHS "${spdlog_CACHE_DIR}" NO_DEFAULT_PATH)
 # add_subdirectory() calls (e.g. tools/dep_cache_smoketest) that need to
 # link against it. Promote it to global scope explicitly instead.
 set_target_properties(spdlog::spdlog PROPERTIES IMPORTED_GLOBAL TRUE)
+
+include(FetchContent)
+
+set(RX_DOCTEST_TAG "v2.5.3")
+FetchContent_Declare(doctest
+  GIT_REPOSITORY https://github.com/doctest/doctest.git
+  GIT_TAG ${RX_DOCTEST_TAG}
+  GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(doctest)
+
+set(RX_GLM_TAG "1.0.3")
+FetchContent_Declare(glm
+  GIT_REPOSITORY https://github.com/g-truc/glm.git
+  GIT_TAG ${RX_GLM_TAG}
+  GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(glm)
