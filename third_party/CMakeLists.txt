@@ -151,6 +151,41 @@ if(NOT volk_POPULATED)
 endif()
 set(volk_SOURCE_DIR "${volk_SOURCE_DIR}" PARENT_SCOPE)
 
+# VMA (Vulkan Memory Allocator): a single-header-style library whose actual
+# implementation only gets compiled wherever some translation unit defines
+# VMA_IMPLEMENTATION before including vk_mem_alloc.h -- that TU is
+# src/rx_rhi_vk/src/vma_impl.cpp (see its own comment for why it must be the
+# *only* one). Every other consumer (src/rx_rhi_vk/src/buffer.cpp, this
+# library's public headers) just #includes vk_mem_alloc.h for declarations.
+# VMA's own CMakeLists.txt is deliberately never added via
+# add_subdirectory(): it exists to build VMA's sample application (which
+# pulls in GLFW and other dependencies this project has no use for and does
+# not want to fetch), not a library target this project would link against
+# -- there is nothing to compile as a separate target; the implementation is
+# a single TU already covered by rx_rhi_vk's own sources. So, exactly like
+# volk above: fetch the source only, via FetchContent_Populate, and
+# deliberately skip FetchContent_MakeAvailable's implicit add_subdirectory
+# (and therefore VMA's CMakeLists.txt) entirely.
+#
+# Same CMake 3.22 sibling-scope reason as volk above: FetchContent_Populate()
+# is a function, so it sets vma_SOURCE_DIR as a normal variable scoped only
+# to this directory. src/rx_rhi_vk, which needs vma_SOURCE_DIR to locate
+# include/vk_mem_alloc.h, is a *sibling* of this directory under the root
+# CMakeLists.txt, not a descendant of it -- so without an explicit
+# PARENT_SCOPE propagation here too, vma_SOURCE_DIR would be empty there.
+# Propagate it up to the root scope, which src/rx_rhi_vk (added later from
+# the root CMakeLists.txt) inherits.
+set(RX_VMA_TAG "v3.4.0")
+FetchContent_Declare(vma
+  GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
+  GIT_TAG ${RX_VMA_TAG}
+  GIT_SHALLOW TRUE)
+FetchContent_GetProperties(vma)
+if(NOT vma_POPULATED)
+  FetchContent_Populate(vma)
+endif()
+set(vma_SOURCE_DIR "${vma_SOURCE_DIR}" PARENT_SCOPE)
+
 # vk-bootstrap: instance/device/swapchain setup helper, a real compiled
 # library, so (unlike volk/GLM/doctest) it goes through the dependency cache
 # rather than plain FetchContent.
