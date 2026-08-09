@@ -96,38 +96,31 @@ std::optional<Context> Context::create(std::vector<const char*> requiredExtensio
     vkb::Instance vkbInstance = result.value();
     volkLoadInstance(vkbInstance.instance);
 
-    return Context(vkbInstance.instance, vkbInstance.debug_messenger, errorCount);
+    return Context(std::move(vkbInstance), errorCount);
 }
 
 Context::Context(Context&& other) noexcept
-    : instance_(other.instance_), debugMessenger_(other.debugMessenger_), errorCount_(std::move(other.errorCount_)) {
-    other.instance_ = VK_NULL_HANDLE;
-    other.debugMessenger_ = VK_NULL_HANDLE;
+    : vkbInstance_(std::move(other.vkbInstance_)), errorCount_(std::move(other.errorCount_)) {
+    other.vkbInstance_.instance = VK_NULL_HANDLE;
 }
 
 Context& Context::operator=(Context&& other) noexcept {
     if (this != &other) {
-        if (instance_ != VK_NULL_HANDLE) {
-            if (debugMessenger_ != VK_NULL_HANDLE) {
-                vkb::destroy_debug_utils_messenger(instance_, debugMessenger_);
-            }
-            vkDestroyInstance(instance_, nullptr);
+        if (vkbInstance_.instance != VK_NULL_HANDLE) {
+            // destroy_instance() tears down both the debug messenger (if
+            // any) and the instance itself, in that order.
+            vkb::destroy_instance(vkbInstance_);
         }
-        instance_ = other.instance_;
-        debugMessenger_ = other.debugMessenger_;
+        vkbInstance_ = std::move(other.vkbInstance_);
         errorCount_ = std::move(other.errorCount_);
-        other.instance_ = VK_NULL_HANDLE;
-        other.debugMessenger_ = VK_NULL_HANDLE;
+        other.vkbInstance_.instance = VK_NULL_HANDLE;
     }
     return *this;
 }
 
 Context::~Context() {
-    if (instance_ != VK_NULL_HANDLE) {
-        if (debugMessenger_ != VK_NULL_HANDLE) {
-            vkb::destroy_debug_utils_messenger(instance_, debugMessenger_);
-        }
-        vkDestroyInstance(instance_, nullptr);
+    if (vkbInstance_.instance != VK_NULL_HANDLE) {
+        vkb::destroy_instance(vkbInstance_);
     }
 }
 
