@@ -12,3 +12,6 @@ Task 1: fix round 1/5 (3 addressed, 0 open — context.h landmine doc, structura
 Task 1: complete (commits 3cdcef6..a3ee68e incl. fix round, review clean)
 Task 2: complete (commits 5c641c7..fb5df51, review Approved; all three historical VMA defects verified avoided against the fetched VMA 3.4.0 source; live re-run reproduced 41/41 assertions)
 Task 2: minor (deferred to final fix wave): buffer.cpp:17-19/buffer.h:4-6 comment misattributes vkGetDeviceProcAddr population to volkLoadDevice (actually volkLoadInstance per volk.c:253); buffer.h:11 stale "allocator.cpp" filename in comment.
+Task 3: complete (commits 7d463e7..49ec5f6, review Approved; both deviations independently verified — defer_surface_initialization drop is the CORRECT headless selection per pinned vk-bootstrap source, coherence guard is logically airtight per VMA 3.4.0 source)
+Task 3: TRACKED for Phase 2 Task 4 (now written into the Phase 2 plan): Allocator/Buffer expose no flush/invalidate surface (VmaAllocation private) — Buffer::flush/invalidate must be added when the Uploader lands; Phase 1's readback tests guard on device-wide host-coherence as a proxy.
+Task 3: minor (deferred): runOnce returns void and swallows submit-path failures (logged only; caught downstream by pixel assertions) — a bool/VkResult return would be more explicit.

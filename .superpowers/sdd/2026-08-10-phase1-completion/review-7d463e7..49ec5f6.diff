@@ -1,0 +1,621 @@
+# Review package: 7d463e7..49ec5f63b05bf5a734a3bea74b5c9693f5b99dfe
+
+## Commits
+49ec5f6 Record Task 3 completion: CommandContext + sync2 barriers + clear-color test
+a4739c8 Add rx_rhi_vk::CommandContext + sync2 transitionImage; headless clear-color test
+
+## Files changed
+ .../2026-08-10-phase1-completion/task-3-report.md  |  74 +++++++
+ src/rx_rhi_vk/CMakeLists.txt                       |  23 +-
+ src/rx_rhi_vk/include/rx_rhi_vk/command.h          |  74 +++++++
+ src/rx_rhi_vk/src/command.cpp                      | 140 ++++++++++++
+ src/rx_rhi_vk/tests/clear_color_test.cpp           | 241 +++++++++++++++++++++
+ 5 files changed, 543 insertions(+), 9 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-10-phase1-completion/task-3-report.md b/.superpowers/sdd/2026-08-10-phase1-completion/task-3-report.md
+new file mode 100644
+index 0000000..890319c
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-phase1-completion/task-3-report.md
+@@ -0,0 +1,74 @@
++# Task 3 Report: CommandContext + sync2 barriers + offscreen clear-color gate
++
++Status: **DONE**
++
++Commit: `a4739c8` — "Add rx_rhi_vk::CommandContext + sync2 transitionImage; headless clear-color test"
++
++## What was built
++
++### `src/rx_rhi_vk/include/rx_rhi_vk/command.h` / `src/rx_rhi_vk/src/command.cpp`
++
++- `rx::rhi::CommandContext`: move-only RAII owning a single `VkCommandPool` (created with `VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT`) against a `VkDevice`/`VkQueue`/queue-family triple.
++  - `static create(VkDevice, VkQueue, uint32_t queueFamily) -> std::optional<CommandContext>` — `vkCreateCommandPool`, `std::nullopt` + `RX_LOG_ERROR` on failure.
++  - `runOnce(const std::function<void(VkCommandBuffer)>& record, VkSemaphore wait = VK_NULL_HANDLE, VkPipelineStageFlags waitStage = 0, VkSemaphore signal = VK_NULL_HANDLE)`: allocates one primary command buffer, begins it with `VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT`, invokes `record`, ends it, submits with optional wait/signal semaphores (only populated in `VkSubmitInfo` when non-null, matching the brief's default-null-for-setup-work intent), `vkQueueWaitIdle`, then `vkFreeCommandBuffers`. Every step checks its `VkResult` and bails (logging + freeing the command buffer) rather than continuing on a bad handle.
++  - Destructor/move-assign destroy the pool via `vkDestroyCommandPool` (which implicitly frees every command buffer ever allocated from it), following the same self-move-guarded move pattern as `Device`/`Allocator`/`Buffer`.
++  - Header comment is explicit that `runOnce` is a synchronous setup/test utility only — the real frame loop (Task 6) will manage its own command buffers/fences instead, per the brief.
++- Free function `rx::rhi::transitionImage(VkCommandBuffer, VkImage, VkImageLayout oldLayout, VkImageLayout newLayout)`: builds one `VkImageMemoryBarrier2` (`VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT` + `VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT` on both src/dst, `VK_REMAINING_MIP_LEVELS`/`VK_REMAINING_ARRAY_LAYERS`, `VK_IMAGE_ASPECT_COLOR_BIT`, `VK_QUEUE_FAMILY_IGNORED` on both sides) and records it via one `VkDependencyInfo` + `vkCmdPipelineBarrier2`, exactly per the brief.
++
++### `src/rx_rhi_vk/tests/clear_color_test.cpp`
++
++One flat `TEST_CASE`, pure headless (no `rx::platform::Window`, no `VkSurfaceKHR`, no swapchain):
++
++1. `Context::create({}, true)` → headless, validated instance.
++2. `vkb::PhysicalDeviceSelector` with `VkPhysicalDeviceVulkan13Features{dynamicRendering, synchronization2}`, `set_minimum_version(1,3)`, `select()`; `vkb::DeviceBuilder(...).build()`; `volkLoadDevice`; graphics queue + family via `get_queue`/`get_queue_index`.
++3. Raw `vkCreateImage`/`vkAllocateMemory`/`vkBindImageMemory`/`vkCreateImageView` for a 4×4 `VK_FORMAT_R8G8B8A8_UNORM` image (`COLOR_ATTACHMENT | TRANSFER_SRC`, device-local).
++4. Inner `{ }` scope: `CommandContext::create` → `runOnce` (transition UNDEFINED→COLOR_ATTACHMENT_OPTIMAL, `vkCmdBeginRendering`/`vkCmdEndRendering` with clear color `{1,0,0,1}` LOAD_OP_CLEAR/STORE_OP_STORE, transition →TRANSFER_SRC_OPTIMAL) → `Allocator::createRaw` + `createHostVisibleBuffer(..., TRANSFER_DST)` → `runOnce` (`vkCmdCopyImageToBuffer`) → `memcpy` the mapped pointer into a local `std::array<uint8_t, 64>`. Scope closes: readback `Buffer`, `Allocator`, `CommandContext` destroyed in reverse order, device still alive.
++5. After the scope: `vkDeviceWaitIdle` + `vkDestroyImageView`/`vkDestroyImage`/`vkFreeMemory` + `vkb::destroy_device` — device destroyed last, nothing after it.
++6. Assertions: `pixels[0..3] == {255,0,0,255}`, `CHECK_FALSE(ctx->hasValidationErrors())`.
++
++Added to `rx_rhi_vk_tests` in `src/rx_rhi_vk/CMakeLists.txt` (`src/command.cpp` to the library, `tests/clear_color_test.cpp` to the test binary); comments updated to describe both.
++
++## Two deviations from the brief, verified against source (not assumed)
++
++1. **Dropped `defer_surface_initialization()`.** The brief's plan called for `selector.defer_surface_initialization().set_minimum_version(...)...`. Running it produced a real, reproducible validation error: `VUID-vkCreateDevice-ppEnabledExtensionNames-01387: Missing extension required by the device extension VK_KHR_swapchain: VK_KHR_surface`. Root-caused directly against vk-bootstrap's pinned commit (`556b79b165386f6c1a18362d30f2a076fdaa2778`) source:
++   - `PhysicalDeviceSelector`'s constructor already sets `criteria.require_present = !instance.headless` — for our headless `Context`, `require_present` is already `false`, so `select()` never needed the surface-present check `defer_surface_initialization()` exists to bypass.
++   - `DeviceBuilder::build()` unconditionally adds `VK_KHR_SWAPCHAIN_EXTENSION_NAME` whenever `physical_device.surface != VK_NULL_HANDLE || physical_device.defer_surface_initialization` — calling `defer_surface_initialization()` on a selector with no surface at all requests `VK_KHR_swapchain` anyway, which then fails because the headless instance never enabled the prerequisite `VK_KHR_surface` instance extension.
++
++   Fix: omit the call entirely. This test never creates a `VkSurfaceKHR`/`VkSwapchainKHR`, so there's no later surface attachment to defer for — this is the *correct* headless selection, not a workaround. Full reasoning is inline as a comment at the call site.
++
++2. **Verified host-coherence instead of assuming it.** The brief's readback step relies on reading `Buffer::mappedData()` directly after `runOnce()`'s `vkQueueWaitIdle()`, with no `vkInvalidateMappedMemoryRanges`/`vmaInvalidateAllocation` call. Checked directly against VMA v3.4.0's `FindMemoryPreferences()`: for `VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT` (what `Allocator::createHostVisibleBuffer` uses), only `VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT` is a hard requirement — `HOST_COHERENT` is never required, only `HOST_CACHED` is avoided. `Buffer`/`Allocator`'s public API (Task 2, not modified here) has no path to the underlying `VmaAllocation` to call `vmaInvalidateAllocation()` explicitly. Rather than silently assume coherence, the test queries `vkGetPhysicalDeviceMemoryProperties` and `REQUIRE`s that every `HOST_VISIBLE` memory type on the selected physical device is also `HOST_COHERENT` before doing the raw `memcpy` — turning an unverified assumption into a checked, self-documenting precondition (confirmed true on the dev machine: 3 host-visible types, all coherent).
++
++## Verify
++
++Clean rebuild, `linux-native`:
++```
++$ rm -rf build/linux-native && cmake --preset linux-native      # clean configure
++$ cmake --build --preset linux-native                          # 36/36, zero warnings, zero errors
++$ ctest --preset linux-native --output-on-failure
++100% tests passed, 0 tests failed out of 4
++```
++Direct run (`./rx_rhi_vk_tests --success`): 5 test cases, 63 assertions, 0 failed. `clear_color_test.cpp` specifically: all `REQUIRE`s pass (including the new host-coherence check, `4 != 0` i.e. `HOST_COHERENT` bit set, on all 3 host-visible memory types this GPU exposes), `pixels[0..3] == {255,0,0,255}`, `CHECK_FALSE(ctx->hasValidationErrors())` true. Only logged output besides successes is the pre-existing, already-documented `isKnownPortabilityEnumerationLayerBug` false positive — zero real validation errors.
++
++Order-independence (the whole point of the doctest_main.cpp warm-up this test relies on): re-ran the full binary with `--order-by=rand --rand-seed=1`, `--rand-seed=42`, and `--order-by=reverse` — all three: 5/5 test cases, 59/59 assertions passed. Repeated the full `ctest` 3× — stable, no flakiness.
++
++Clean rebuild, `windows-cross-zig`:
++```
++$ rm -rf build/windows-cross-zig && cmake --preset windows-cross-zig   # clean configure
++$ cmake --build --preset windows-cross-zig                             # 36/36, zero warnings, zero errors
++```
++`rx_rhi_vk_tests.exe` (including `command.cpp.obj`, `clear_color_test.cpp.obj`) links successfully.
++
++## Self-review
++
++- Teardown ordering (the brief's core concern): confirmed by reading the test top-to-bottom — `CommandContext`/`Allocator`/readback `Buffer` are all declared inside the inner `{ }` scope and destroyed there, in reverse declaration order, while the raw `VkDevice` is still alive; `vkDeviceWaitIdle`/image-view/image/memory/`vkb::destroy_device` all run afterward, device last. No RAII object's destructor runs after `vkb::destroy_device`.
++- No default-constructed-by-value `Context`/`Device` anywhere: the test holds `std::optional<Context>` (via `auto ctx = Context::create(...)`) and raw `vkb::Device`/`VkDevice` handles directly — no helper struct, matching the brief's stated preference for "a flat single-function test body with an inner scope."
++- `runOnce`'s wait/signal/waitStage parameters default to `VK_NULL_HANDLE`/`0` and are only wired into `VkSubmitInfo` when non-null — verified this compiles and behaves correctly for both call sites in the test (neither passes them, both work).
++- `transitionImage` is exactly the barrier shape the brief specified — verified by re-reading `VkImageMemoryBarrier2`'s fields against volk's Vulkan 1.3 headers before writing it, not assumed.
++- Zero validation errors confirmed by direct test-binary run output, not just asserted in code; also confirmed order-independence explicitly (random seeds + reverse) since this is a headless test joining a binary whose other tests are windowed.
++- `git status`/`git diff --stat` checked before committing: only the four files this task owns were staged — no incidental changes to `progress.md` or any other concurrently-touched file.
++- Commit message contains no AI attribution (verified via `git log -1 --format='%B'`); author identity untouched.
++
++## Concerns
++
++- None new beyond the pre-existing vk-bootstrap process-wide function-pointer cache landmine (documented on `Context::create`, worked around structurally in `doctest_main.cpp` since Task 1) — this test relies on that warm-up for safety in any test order and was explicitly verified against it (random seeds + reverse order above).
++- The host-coherence `REQUIRE` added in this test is a real, verified precondition for *this* test's correctness, but it's local to this one test file — any future test or production code that reads back GPU writes through `Allocator::createHostVisibleBuffer`'s mapped pointer without an explicit invalidate is relying on the same unstated assumption (true on every desktop driver in practice, per VMA's own docs, but not enforced by `Buffer`/`Allocator`'s API). Worth a note for whoever builds a "real" readback path later — either expose an invalidate path on `Buffer`, or document the assumption at the `Allocator` level instead of re-deriving it per call site.
+diff --git a/src/rx_rhi_vk/CMakeLists.txt b/src/rx_rhi_vk/CMakeLists.txt
+index 82aa95f..a235085 100644
+--- a/src/rx_rhi_vk/CMakeLists.txt
++++ b/src/rx_rhi_vk/CMakeLists.txt
+@@ -6,34 +6,39 @@
+ # sample-application target with its unwanted GLFW dependency).
+ #
+ # src/vma_impl.cpp is the sole VMA_IMPLEMENTATION translation unit for this
+ # entire program (see that file); every other consumer of VMA
+ # (src/buffer.cpp, include/rx_rhi_vk/buffer.h) only ever declares against
+ # vk_mem_alloc.h, never redefines VMA_IMPLEMENTATION.
+ add_library(rx_rhi_vk STATIC
+     src/context.cpp
+     src/device.cpp
+     src/buffer.cpp
++    src/command.cpp
+     src/vma_impl.cpp
+     ${volk_SOURCE_DIR}/volk.c
+ )
+ target_include_directories(rx_rhi_vk PUBLIC include ${volk_SOURCE_DIR} ${vma_SOURCE_DIR}/include)
+ target_link_libraries(rx_rhi_vk PUBLIC rx_core vk-bootstrap::vk-bootstrap)
+ target_compile_definitions(rx_rhi_vk PUBLIC VK_NO_PROTOTYPES)
+ 
+-# Three test translation units now (context_test.cpp, device_test.cpp,
+-# buffer_test.cpp), so -- like rx_core_tests, and unlike this target before
+-# device_test.cpp existed -- doctest's runtime/main is implemented once in a
+-# dedicated tests/doctest_main.cpp shared by all three, rather than in any
+-# one test file. doctest_main.cpp also links rx_platform: it uses
+-# rx::platform::Window to warm up a real vk-bootstrap hazard before any
+-# TEST_CASE runs (see the comment there) -- so test order here is not
+-# load-bearing, deliberately; no --order-by is needed on the add_test line
+-# below.
++# Four test translation units now (context_test.cpp, device_test.cpp,
++# buffer_test.cpp, clear_color_test.cpp), so -- like rx_core_tests, and
++# unlike this target before device_test.cpp existed -- doctest's
++# runtime/main is implemented once in a dedicated tests/doctest_main.cpp
++# shared by all four, rather than in any one test file. doctest_main.cpp
++# also links rx_platform: it uses rx::platform::Window to warm up a real
++# vk-bootstrap hazard before any TEST_CASE runs (see the comment there) --
++# so test order here is not load-bearing, deliberately; no --order-by is
++# needed on the add_test line below. clear_color_test.cpp in particular is
++# pure headless (no window/surface/swapchain) and relies on that warm-up to
++# be safe regardless of where doctest schedules it relative to the windowed
++# tests.
+ add_executable(rx_rhi_vk_tests
+     tests/doctest_main.cpp
+     tests/context_test.cpp
+     tests/device_test.cpp
+     tests/buffer_test.cpp
++    tests/clear_color_test.cpp
+ )
+ target_link_libraries(rx_rhi_vk_tests PRIVATE rx_rhi_vk rx_platform doctest::doctest)
+ add_test(NAME rx_rhi_vk_tests COMMAND rx_rhi_vk_tests)
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/command.h b/src/rx_rhi_vk/include/rx_rhi_vk/command.h
+new file mode 100644
+index 0000000..d1e675c
+--- /dev/null
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/command.h
+@@ -0,0 +1,74 @@
++#pragma once
++#include <volk.h>
++#include <cstdint>
++#include <functional>
++#include <optional>
++
++namespace rx::rhi {
++
++// CommandContext owns a single transient VkCommandPool (and the one-shot
++// command buffers it hands out via runOnce()) against a specific
++// VkDevice/VkQueue/queue-family triple. Move-only RAII: destroys the pool
++// (which implicitly frees every command buffer ever allocated from it) on
++// destruction or move-assignment.
++//
++// A CommandContext must not outlive the VkDevice it was created against --
++// vkDestroyCommandPool needs that same VkDevice handle to still be valid.
++// Declaring the owning Device (or whatever else owns the raw VkDevice)
++// before any CommandContext created from it in the same scope is
++// sufficient, per the usual RAII/reverse-destruction discipline already
++// used by Context/Device/Allocator/Buffer in this library.
++class CommandContext {
++public:
++    CommandContext(CommandContext&&) noexcept;
++    CommandContext& operator=(CommandContext&&) noexcept;
++    CommandContext(const CommandContext&) = delete;
++    CommandContext& operator=(const CommandContext&) = delete;
++    ~CommandContext();
++
++    static std::optional<CommandContext> create(VkDevice device, VkQueue queue, uint32_t queueFamily);
++
++    // Synchronous one-shot command-buffer helper: allocates a primary
++    // command buffer from this context's pool, begins it
++    // (ONE_TIME_SUBMIT_BIT), invokes `record` to fill it, ends it, submits
++    // it to this context's queue -- optionally waiting on `wait` at
++    // `waitStage` and/or signaling `signal`, both VK_NULL_HANDLE/0 by
++    // default for plain setup work with no cross-queue/cross-frame
++    // dependency -- blocks the calling thread until the submission
++    // completes (vkQueueWaitIdle), then frees the command buffer.
++    //
++    // This is a synchronous setup/test utility only: vkQueueWaitIdle stalls
++    // the entire queue on every call, which is unacceptable in a
++    // steady-state per-frame render loop that wants multiple frames in
++    // flight. The real frame loop (a later task) does not use runOnce(); it
++    // manages its own command buffers and fences directly instead.
++    void runOnce(const std::function<void(VkCommandBuffer)>& record, VkSemaphore wait = VK_NULL_HANDLE,
++                 VkPipelineStageFlags waitStage = 0, VkSemaphore signal = VK_NULL_HANDLE);
++
++private:
++    CommandContext() = default;
++    CommandContext(VkDevice device, VkQueue queue, VkCommandPool pool)
++        : device_(device), queue_(queue), pool_(pool) {}
++
++    void destroyAll();
++
++    VkDevice device_ = VK_NULL_HANDLE;
++    VkQueue queue_ = VK_NULL_HANDLE;
++    VkCommandPool pool_ = VK_NULL_HANDLE;
++};
++
++// Records a full-resource image layout transition on `cmd` using
++// synchronization2 (VkImageMemoryBarrier2 + vkCmdPipelineBarrier2):
++// VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT and
++// VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT on both the
++// source and destination side, VK_REMAINING_MIP_LEVELS/
++// VK_REMAINING_ARRAY_LAYERS, and the color aspect. This is deliberately the
++// maximally-conservative barrier -- correct for any layout transition on
++// any color image, at the cost of over-synchronizing -- not a
++// finely-scoped, minimal-stall barrier; callers with real performance
++// requirements should build their own VkImageMemoryBarrier2 with a tighter
++// stage/access scope instead. Suitable for setup/test code and any path
++// where correctness matters more than throughput.
++void transitionImage(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout);
++
++}  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/command.cpp b/src/rx_rhi_vk/src/command.cpp
+new file mode 100644
+index 0000000..1b77425
+--- /dev/null
++++ b/src/rx_rhi_vk/src/command.cpp
+@@ -0,0 +1,140 @@
++#include <rx_rhi_vk/command.h>
++#include <rx_core/log.h>
++#include <utility>
++
++namespace rx::rhi {
++
++std::optional<CommandContext> CommandContext::create(VkDevice device, VkQueue queue, uint32_t queueFamily) {
++    VkCommandPoolCreateInfo poolInfo{};
++    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
++    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++    poolInfo.queueFamilyIndex = queueFamily;
++
++    VkCommandPool pool = VK_NULL_HANDLE;
++    VkResult result = vkCreateCommandPool(device, &poolInfo, nullptr, &pool);
++    if (result != VK_SUCCESS) {
++        RX_LOG_ERROR("vkCreateCommandPool failed: VkResult={}", static_cast<int>(result));
++        return std::nullopt;
++    }
++
++    return CommandContext(device, queue, pool);
++}
++
++void CommandContext::runOnce(const std::function<void(VkCommandBuffer)>& record, VkSemaphore wait,
++                              VkPipelineStageFlags waitStage, VkSemaphore signal) {
++    VkCommandBufferAllocateInfo allocInfo{};
++    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
++    allocInfo.commandPool = pool_;
++    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++    allocInfo.commandBufferCount = 1;
++
++    VkCommandBuffer cmd = VK_NULL_HANDLE;
++    VkResult result = vkAllocateCommandBuffers(device_, &allocInfo, &cmd);
++    if (result != VK_SUCCESS) {
++        RX_LOG_ERROR("vkAllocateCommandBuffers failed: VkResult={}", static_cast<int>(result));
++        return;
++    }
++
++    VkCommandBufferBeginInfo beginInfo{};
++    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++    result = vkBeginCommandBuffer(cmd, &beginInfo);
++    if (result != VK_SUCCESS) {
++        RX_LOG_ERROR("vkBeginCommandBuffer failed: VkResult={}", static_cast<int>(result));
++        vkFreeCommandBuffers(device_, pool_, 1, &cmd);
++        return;
++    }
++
++    record(cmd);
++
++    result = vkEndCommandBuffer(cmd);
++    if (result != VK_SUCCESS) {
++        RX_LOG_ERROR("vkEndCommandBuffer failed: VkResult={}", static_cast<int>(result));
++        vkFreeCommandBuffers(device_, pool_, 1, &cmd);
++        return;
++    }
++
++    VkSubmitInfo submitInfo{};
++    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
++    submitInfo.commandBufferCount = 1;
++    submitInfo.pCommandBuffers = &cmd;
++    if (wait != VK_NULL_HANDLE) {
++        submitInfo.waitSemaphoreCount = 1;
++        submitInfo.pWaitSemaphores = &wait;
++        submitInfo.pWaitDstStageMask = &waitStage;
++    }
++    if (signal != VK_NULL_HANDLE) {
++        submitInfo.signalSemaphoreCount = 1;
++        submitInfo.pSignalSemaphores = &signal;
++    }
++
++    result = vkQueueSubmit(queue_, 1, &submitInfo, VK_NULL_HANDLE);
++    if (result != VK_SUCCESS) {
++        RX_LOG_ERROR("vkQueueSubmit failed: VkResult={}", static_cast<int>(result));
++        vkFreeCommandBuffers(device_, pool_, 1, &cmd);
++        return;
++    }
++
++    // Synchronous by design -- see the class-level comment on runOnce() in
++    // command.h for why this is a setup/test-only utility, not something
++    // the real frame loop can afford to call every frame.
++    vkQueueWaitIdle(queue_);
++    vkFreeCommandBuffers(device_, pool_, 1, &cmd);
++}
++
++CommandContext::CommandContext(CommandContext&& other) noexcept : CommandContext() {
++    *this = std::move(other);
++}
++
++CommandContext& CommandContext::operator=(CommandContext&& other) noexcept {
++    if (this != &other) {
++        destroyAll();
++
++        device_ = other.device_;
++        queue_ = other.queue_;
++        pool_ = other.pool_;
++
++        other.device_ = VK_NULL_HANDLE;
++        other.queue_ = VK_NULL_HANDLE;
++        other.pool_ = VK_NULL_HANDLE;
++    }
++    return *this;
++}
++
++CommandContext::~CommandContext() {
++    destroyAll();
++}
++
++void CommandContext::destroyAll() {
++    if (pool_ != VK_NULL_HANDLE) {
++        vkDestroyCommandPool(device_, pool_, nullptr);
++    }
++}
++
++void transitionImage(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout) {
++    VkImageMemoryBarrier2 barrier{};
++    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
++    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    barrier.srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
++    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
++    barrier.oldLayout = oldLayout;
++    barrier.newLayout = newLayout;
++    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barrier.image = image;
++    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    barrier.subresourceRange.baseMipLevel = 0;
++    barrier.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
++    barrier.subresourceRange.baseArrayLayer = 0;
++    barrier.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
++
++    VkDependencyInfo depInfo{};
++    depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    depInfo.imageMemoryBarrierCount = 1;
++    depInfo.pImageMemoryBarriers = &barrier;
++
++    vkCmdPipelineBarrier2(cmd, &depInfo);
++}
++
++}  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/tests/clear_color_test.cpp b/src/rx_rhi_vk/tests/clear_color_test.cpp
+new file mode 100644
+index 0000000..90d8384
+--- /dev/null
++++ b/src/rx_rhi_vk/tests/clear_color_test.cpp
+@@ -0,0 +1,241 @@
++#include <doctest/doctest.h>
++#include <rx_rhi_vk/buffer.h>
++#include <rx_rhi_vk/command.h>
++#include <rx_rhi_vk/context.h>
++#include <VkBootstrap.h>
++#include <array>
++#include <cstdint>
++#include <cstring>
++
++// Pure headless test -- no rx::platform::Window, no VkSurfaceKHR, no
++// swapchain anywhere in this file. Exercises CommandContext::runOnce(),
++// transitionImage(), and dynamic rendering end to end by clearing a small
++// offscreen color image to a known color and reading the result back
++// through a host-visible buffer.
++//
++// Safe to run in any order alongside the windowed Device/Buffer tests in
++// this same binary: tests/doctest_main.cpp warms vk-bootstrap's
++// process-wide instance-function cache with the broadest instance this
++// binary needs (real window extensions when available, validation always
++// on) before any TEST_CASE runs -- see the comment there, and the WARNING
++// on Context::create() in rx_rhi_vk/context.h, for why a headless-only
++// instance built here first would otherwise poison later windowed
++// instances with null function pointers.
++//
++// Teardown ordering is the load-bearing part of this test (see
++// task-3-brief.md): the logical VkDevice built below is a raw handle, not
++// an rx::rhi::Device, so nothing destroys it automatically. Every RAII
++// object that depends on it (CommandContext, Allocator, the readback
++// Buffer) is declared inside the inner `{ }` scope below and goes out of
++// scope -- destroyed in reverse order, against a still-live device --
++// before vkDeviceWaitIdle + the raw image/view/memory destroys + finally
++// vkb::destroy_device() run. Nothing here is destroyed after the device.
++TEST_CASE("CommandContext::runOnce + transitionImage clear an offscreen image via dynamic rendering") {
++    auto ctx = rx::rhi::Context::create({}, /*enableValidation=*/true);
++    REQUIRE(ctx.has_value());
++
++    VkPhysicalDeviceVulkan13Features features13{};
++    features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
++    features13.dynamicRendering = VK_TRUE;
++    features13.synchronization2 = VK_TRUE;
++
++    // Deliberately NOT calling defer_surface_initialization() here, despite
++    // the original plan's assumption that it belonged in this headless
++    // path. Verified directly against vk-bootstrap's pinned commit
++    // (556b79b165386f6c1a18362d30f2a076fdaa2778) source:
++    //   - PhysicalDeviceSelector's constructor already sets
++    //     criteria.require_present = !instance.headless, so for a
++    //     genuinely headless Context (built via Context::create({}, ...),
++    //     which calls InstanceBuilder::set_headless(true)) require_present
++    //     is already false and select() never needs the surface-present
++    //     check that defer_surface_initialization() exists to bypass --
++    //     calling it buys nothing here.
++    //   - Worse, DeviceBuilder::build() unconditionally adds
++    //     VK_KHR_SWAPCHAIN_EXTENSION_NAME to the device's enabled
++    //     extensions whenever `physical_device.surface != VK_NULL_HANDLE ||
++    //     physical_device.defer_surface_initialization` -- i.e. calling
++    //     defer_surface_initialization() on a selector with no surface at
++    //     all requests VK_KHR_swapchain anyway, which is a real, reproduced
++    //     validation error against a headless instance that never enabled
++    //     the prerequisite VK_KHR_surface *instance* extension
++    //     (VUID-vkCreateDevice-ppEnabledExtensionNames-01387: "Missing
++    //     extension required by the device extension VK_KHR_swapchain:
++    //     VK_KHR_surface"). This test never creates a VkSurfaceKHR or
++    //     VkSwapchainKHR at all, so there is no later surface attachment to
++    //     defer for -- omitting the call is the correct headless-only
++    //     selection, not merely a workaround.
++    vkb::PhysicalDeviceSelector selector(ctx->vkbInstance());
++    auto physResult = selector.set_minimum_version(1, 3).set_required_features_13(features13).select();
++    REQUIRE(physResult.has_value());
++
++    auto deviceResult = vkb::DeviceBuilder(physResult.value()).build();
++    REQUIRE(deviceResult.has_value());
++    vkb::Device vkbDevice = deviceResult.value();
++    volkLoadDevice(vkbDevice.device);
++
++    VkDevice device = vkbDevice.device;
++    VkPhysicalDevice physicalDevice = vkbDevice.physical_device.physical_device;
++
++    auto graphicsQueueResult = vkbDevice.get_queue(vkb::QueueType::graphics);
++    REQUIRE(graphicsQueueResult.has_value());
++    auto graphicsQueueIndexResult = vkbDevice.get_queue_index(vkb::QueueType::graphics);
++    REQUIRE(graphicsQueueIndexResult.has_value());
++    VkQueue graphicsQueue = graphicsQueueResult.value();
++    uint32_t graphicsQueueFamily = graphicsQueueIndexResult.value();
++
++    constexpr uint32_t kSize = 4;
++    constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
++    constexpr VkDeviceSize kPixelBytes = static_cast<VkDeviceSize>(kSize) * kSize * 4;
++
++    VkImageCreateInfo imageInfo{};
++    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    imageInfo.imageType = VK_IMAGE_TYPE_2D;
++    imageInfo.format = kFormat;
++    imageInfo.extent = {kSize, kSize, 1};
++    imageInfo.mipLevels = 1;
++    imageInfo.arrayLayers = 1;
++    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
++    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
++    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++
++    VkImage image = VK_NULL_HANDLE;
++    REQUIRE(vkCreateImage(device, &imageInfo, nullptr, &image) == VK_SUCCESS);
++
++    VkMemoryRequirements memReq{};
++    vkGetImageMemoryRequirements(device, image, &memReq);
++
++    VkPhysicalDeviceMemoryProperties memProps{};
++    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
++
++    uint32_t memoryTypeIndex = UINT32_MAX;
++    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
++        if ((memReq.memoryTypeBits & (1U << i)) != 0U &&
++            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0U) {
++            memoryTypeIndex = i;
++            break;
++        }
++    }
++    REQUIRE(memoryTypeIndex != UINT32_MAX);
++
++    // Allocator::createHostVisibleBuffer (Task 2) only ever *requires*
++    // VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT for its
++    // VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT allocations
++    // (verified directly against VMA v3.4.0's FindMemoryPreferences(): the
++    // sequential-write path only adds VK_MEMORY_PROPERTY_HOST_CACHED_BIT to
++    // outNotPreferredFlags, never requires HOST_COHERENT) -- so nothing
++    // guarantees through that API alone that the readback buffer created
++    // below ends up host-coherent. Buffer/Allocator's public surface has no
++    // way to reach the underlying VmaAllocation to call
++    // vmaInvalidateAllocation() explicitly, so instead verify the
++    // precondition this test's memcpy-after-vkQueueWaitIdle read relies on:
++    // every HOST_VISIBLE memory type this physical device exposes is also
++    // HOST_COHERENT (true for every desktop Vulkan driver in practice,
++    // never violated in this codebase's target set) -- making that
++    // assumption a verified, testable fact rather than a silent one that
++    // could someday read stale data on hardware with a truly non-coherent
++    // host-visible heap.
++    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
++        if ((memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0U) {
++            REQUIRE((memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0U);
++        }
++    }
++
++    VkMemoryAllocateInfo memAllocInfo{};
++    memAllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++    memAllocInfo.allocationSize = memReq.size;
++    memAllocInfo.memoryTypeIndex = memoryTypeIndex;
++
++    VkDeviceMemory imageMemory = VK_NULL_HANDLE;
++    REQUIRE(vkAllocateMemory(device, &memAllocInfo, nullptr, &imageMemory) == VK_SUCCESS);
++    REQUIRE(vkBindImageMemory(device, image, imageMemory, 0) == VK_SUCCESS);
++
++    VkImageViewCreateInfo viewInfo{};
++    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++    viewInfo.image = image;
++    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    viewInfo.format = kFormat;
++    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    viewInfo.subresourceRange.baseMipLevel = 0;
++    viewInfo.subresourceRange.levelCount = 1;
++    viewInfo.subresourceRange.baseArrayLayer = 0;
++    viewInfo.subresourceRange.layerCount = 1;
++
++    VkImageView imageView = VK_NULL_HANDLE;
++    REQUIRE(vkCreateImageView(device, &viewInfo, nullptr, &imageView) == VK_SUCCESS);
++
++    std::array<uint8_t, kPixelBytes> pixels{};
++
++    {
++        // Inner scope: every RAII object created below is destroyed when
++        // this scope closes -- readback Buffer, then Allocator, then
++        // CommandContext, in reverse declaration order -- while `device`
++        // is still alive. This is what avoids the original plan's
++        // use-after-free (it destroyed the device first, then let these
++        // same RAII destructors run against a dangling VkDevice).
++        auto cmdCtx = rx::rhi::CommandContext::create(device, graphicsQueue, graphicsQueueFamily);
++        REQUIRE(cmdCtx.has_value());
++
++        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++            rx::rhi::transitionImage(cmd, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++
++            VkRenderingAttachmentInfo colorAttachment{};
++            colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
++            colorAttachment.imageView = imageView;
++            colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++            colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++            colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++            colorAttachment.clearValue.color = VkClearColorValue{{1.0F, 0.0F, 0.0F, 1.0F}};
++
++            VkRenderingInfo renderingInfo{};
++            renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
++            renderingInfo.renderArea = VkRect2D{{0, 0}, {kSize, kSize}};
++            renderingInfo.layerCount = 1;
++            renderingInfo.colorAttachmentCount = 1;
++            renderingInfo.pColorAttachments = &colorAttachment;
++
++            vkCmdBeginRendering(cmd, &renderingInfo);
++            vkCmdEndRendering(cmd);
++
++            rx::rhi::transitionImage(cmd, image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++                                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++        });
++
++        auto allocator = rx::rhi::Allocator::createRaw(physicalDevice, device, ctx->instance());
++        REQUIRE(allocator.has_value());
++
++        auto readback = allocator->createHostVisibleBuffer(kPixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++        REQUIRE(readback.has_value());
++
++        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++            VkBufferImageCopy region{};
++            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++            region.imageSubresource.mipLevel = 0;
++            region.imageSubresource.baseArrayLayer = 0;
++            region.imageSubresource.layerCount = 1;
++            region.imageExtent = {kSize, kSize, 1};
++
++            vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1, &region);
++        });
++
++        // runOnce() above already vkQueueWaitIdle()'d before returning, and
++        // the REQUIRE above confirmed this device's host-visible memory is
++        // also host-coherent, so the copy's writes are already visible to
++        // this host read with no further barrier or
++        // vkInvalidateMappedMemoryRanges needed.
++        std::memcpy(pixels.data(), readback->mappedData(), pixels.size());
++    }
++
++    vkDeviceWaitIdle(device);
++    vkDestroyImageView(device, imageView, nullptr);
++    vkDestroyImage(device, image, nullptr);
++    vkFreeMemory(device, imageMemory, nullptr);
++    vkb::destroy_device(vkbDevice);
++
++    CHECK(pixels[0] == 255);
++    CHECK(pixels[1] == 0);
++    CHECK(pixels[2] == 0);
++    CHECK(pixels[3] == 255);
++    CHECK_FALSE(ctx->hasValidationErrors());
++}
