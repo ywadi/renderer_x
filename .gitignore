@@ -1,0 +1,6 @@
+toolchain/
+.deps-cache/
+third_party/slang-prebuilt/
+build/
+build-*/
+.cache/
