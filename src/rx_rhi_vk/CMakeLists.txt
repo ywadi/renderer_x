@@ -16,16 +16,14 @@ target_compile_definitions(rx_rhi_vk PUBLIC VK_NO_PROTOTYPES)
 # like rx_core_tests, and unlike this target before device_test.cpp existed
 # -- doctest's runtime/main is implemented once in a dedicated
 # tests/doctest_main.cpp shared by both, rather than in either test file.
+# doctest_main.cpp also links rx_platform: it uses rx::platform::Window to
+# warm up a real vk-bootstrap hazard before any TEST_CASE runs (see the
+# comment there) -- so test order here is not load-bearing, deliberately;
+# no --order-by is needed on the add_test line below.
 add_executable(rx_rhi_vk_tests
     tests/doctest_main.cpp
     tests/context_test.cpp
     tests/device_test.cpp
 )
 target_link_libraries(rx_rhi_vk_tests PRIVATE rx_rhi_vk rx_platform doctest::doctest)
-
-# --order-by=suite (rather than doctest's own default, "file", which would
-# sort context_test.cpp's test before device_test.cpp's alphabetically) is
-# required here, not cosmetic: see the comment on context_test.cpp's
-# TEST_CASE for the vk-bootstrap process-wide function-pointer cache defect
-# this ordering works around.
-add_test(NAME rx_rhi_vk_tests COMMAND rx_rhi_vk_tests --order-by=suite)
+add_test(NAME rx_rhi_vk_tests COMMAND rx_rhi_vk_tests)

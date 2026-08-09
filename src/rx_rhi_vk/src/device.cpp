@@ -194,6 +194,19 @@ SwapchainStatus Device::present(uint32_t imageIndex, VkSemaphore wait) {
 }
 
 bool Device::recreateSwapchain(VkSurfaceKHR surface) {
+    if (surface != surface_) {
+        // Not necessarily wrong (a caller could legitimately be handing
+        // this Device a brand-new surface), but the intended/expected usage
+        // is to pass the same surface handle back on every call -- this
+        // Device does not take ownership of `surface` here and will not
+        // destroy the previously-owned one, so silently swapping it in
+        // could leak the old surface if that wasn't the caller's intent.
+        RX_LOG_WARN(
+            "Device::recreateSwapchain: surface handle changed (previously owned {}, now given {}); the "
+            "previous surface will not be destroyed by this call",
+            static_cast<void*>(surface_), static_cast<void*>(surface));
+    }
+
     vkDeviceWaitIdle(device_);
 
     if (swapchain_ != VK_NULL_HANDLE) {

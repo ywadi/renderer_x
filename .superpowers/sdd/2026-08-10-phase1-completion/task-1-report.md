@@ -2,6 +2,8 @@
 
 Status: **DONE**
 
+**Update (post-review fix pass):** see "Fix pass: review findings addressed" at the bottom of this report for the three findings from the Approved-with-findings review and how each was resolved.
+
 ## What was built
 
 ### Step A — `Context` extended to store `vkb::Instance`
@@ -87,3 +89,72 @@ Repeated 3x in a row (plus once more after the clean rebuild) with identical res
 
 - The vk-bootstrap caching defect (above) is real and will resurface if: (a) a future test binary in this project ever builds a headless-then-windowed (or otherwise extension-mismatched) sequence of `vkb::Instance`s without the same `--order-by=suite` discipline, or (b) real runtime code (not just tests) ever recreates `rx::rhi::Context` with a different extension set mid-process. Worth a forward note for whoever designs device-lost/context-recreation handling.
 - `recreateSwapchain`'s surface parameter does not take ownership (per the brief's wording, which only discusses destroying the *old swapchain*, not the surface) — in the intended usage the same surface handle is passed back in on every call. This is documented on the header but is a slightly implicit contract worth double-checking against Task 3/4's actual call site once written.
+
+## Fix pass: review findings addressed
+
+The review came back **Approved-with-findings**: the vk-bootstrap diagnosis was independently verified against upstream source and confirmed exact, but the reviewer reproduced a SIGSEGV running `rx_rhi_vk_tests` *without* `--order-by=suite`, and ruled the `--order-by=suite` workaround too fragile (doctest's suite sort falls back to filename order on ties, so any future test file alphabetically before `device_test.cpp` that builds a narrower-capability Context would silently reintroduce the crash). Three findings, all addressed:
+
+**1. (IMPORTANT) No documentation of the defect in production code.** Added a WARNING doc comment directly on `Context::create()` in `src/rx_rhi_vk/include/rx_rhi_vk/context.h`, describing the process-wide vk-bootstrap function-pointer cache, which specific function pointers are affected (surface-support functions for `PhysicalDeviceSelector`, debug-messenger create/destroy for validation — see finding 2 below for why both matter), what the observable symptoms are (segfault vs. a clean `Context::create` failure), and what a future implementer of Context/Device recreation needs to do about it. This is the first place a future device-lost-recovery or multi-Context implementer would actually look.
+
+**2. (IMPORTANT) Replaced the filename-fragile ordering with a structural fix.** `src/rx_rhi_vk/tests/doctest_main.cpp` no longer uses `DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN`; it now uses `DOCTEST_CONFIG_IMPLEMENT` plus an explicit `main()` that calls a `warmUpVkBootstrapInstanceFunctionCache()` helper *before* constructing/running `doctest::Context`. That helper builds (and immediately lets go out of scope, destroying) one throwaway `rx::rhi::Context` using the broadest capability set any test in this binary needs: real window instance extensions via `rx::platform::Window::create(...)->requiredVulkanInstanceExtensions()` when a display is available (falling back to headless when not — the windowed Device tests skip themselves on such machines anyway), **and `enableValidation=true`**.
+   - The `enableValidation=true` part was not incidental — it was a second instance of the *exact same defect class*, caught only by actually running the fix: my first attempt warmed up with `enableValidation=false` (reasoning: "just get surface support cached"), which instead cached a **null `fp_vkCreateDebugUtilsMessengerEXT`** (that function is only resolved non-null when the first instance in the process actually requests validation layers / a debug callback). That broke every subsequent validated `Context::create()` in the process with a clean-looking `vkb::InstanceBuilder::build failed: failed_create_debug_messenger` — caught immediately by `ctest --preset linux-native` going from 100% to 25% passing. Fixed by warming up with `enableValidation=true` too, and documented both angles (surface support *and* debug messenger) in the warm-up function's own comment and in `Context::create`'s doc comment, so "broadest instance" is understood to mean broadest along every axis vk-bootstrap caches per-process, not just extensions.
+   - Removed the now-unnecessary `doctest::test_suite("zz_run_after_windowed_device_tests")` decorator from `context_test.cpp` and the `--order-by=suite` flag from `CMakeLists.txt`'s `add_test` line; replaced their comments with pointers to the real, structural explanation in `doctest_main.cpp`.
+   - Proved the fix is order-independent, not just re-passing under the same lucky default order: ran `./rx_rhi_vk_tests --order-by=rand --rand-seed=N` for `N` swept from 1–40, found several seeds (4, 5, 17, 21, 28, 29, 30, 33, 35, 37, 40) where the random order puts the headless `Context::create` test **first** — the exact original crash precondition — and confirmed all of them still pass (31/31 assertions, 0 failed). Also ran plain `./rx_rhi_vk_tests` with no flags (doctest's own default, `--order-by=file`) — passes.
+
+**3. (MINOR) `Device::recreateSwapchain` surface-mismatch guard.** Added a check at the top of `recreateSwapchain` in `src/rx_rhi_vk/src/device.cpp`: if the passed `surface` differs from the `Device`'s currently-owned `surface_`, logs `RX_LOG_WARN` naming both handles (as `void*`, since `VkSurfaceKHR` isn't directly formattable) and explaining that the previous surface will not be destroyed by this call. Does not change behavior (still overwrites `surface_` — that's the documented contract), just makes the mismatch visible instead of silent.
+
+### Verification commands + actual output (this fix pass)
+
+Clean incremental rebuild (note: the build tree picked up unrelated concurrent Task 4/Phase 2 changes mid-session — a `shader_spirv_test` target and Slang shader compilation now appear in the same build; not this task's work, left untouched):
+
+```
+$ cmake --build --preset linux-native
+[... 7/7 ...] Linking CXX executable src/rx_rhi_vk/rx_rhi_vk_tests
+
+$ ctest --preset linux-native --output-on-failure
+Test project .../build/linux-native
+    Start 1: shader_spirv_test
+1/4 Test #1: shader_spirv_test ................   Passed    0.00 sec
+    Start 2: rx_core_tests
+2/4 Test #2: rx_core_tests ....................   Passed    0.00 sec
+    Start 3: rx_platform_tests
+3/4 Test #3: rx_platform_tests ................   Passed    0.06 sec
+    Start 4: rx_rhi_vk_tests
+4/4 Test #4: rx_rhi_vk_tests ..................   Passed    0.92 sec
+100% tests passed, 0 tests failed out of 4
+```
+Repeated 3x — stable, no flakiness.
+
+```
+$ ./build/linux-native/src/rx_rhi_vk/rx_rhi_vk_tests            # default order (doctest's own --order-by=file)
+[doctest] test cases:  3 |  3 passed | 0 failed | 0 skipped
+[doctest] assertions: 31 | 31 passed | 0 failed |
+[doctest] Status: SUCCESS!
+
+$ for seed in 1 2 42 12345 4 5 17 40; do
+    ./build/linux-native/src/rx_rhi_vk/rx_rhi_vk_tests --order-by=rand --rand-seed=$seed
+  done
+# every seed: 3 | 3 passed | 0 failed | 0 skipped; 31 | 31 passed | 0 failed; SUCCESS
+# seeds 4, 5, 17, 40 specifically confirmed (via --list-test-cases first) to run
+# "Context::create ..." (the headless one) FIRST -- the original crash precondition --
+# and still pass cleanly.
+```
+
+```
+$ cmake --build --preset windows-cross-zig
+[... 11/11 ...] Linking CXX executable src/rx_rhi_vk/rx_rhi_vk_tests.exe
+```
+
+### Files touched in this fix pass
+
+- `src/rx_rhi_vk/include/rx_rhi_vk/context.h` — WARNING doc comment on `Context::create`.
+- `src/rx_rhi_vk/tests/doctest_main.cpp` — switched to `DOCTEST_CONFIG_IMPLEMENT` + explicit `main()` with the warm-up.
+- `src/rx_rhi_vk/tests/context_test.cpp` — dropped the suite decorator/comment, replaced with a one-line pointer to the structural fix.
+- `src/rx_rhi_vk/CMakeLists.txt` — dropped `--order-by=suite`; updated comment.
+- `src/rx_rhi_vk/src/device.cpp` — `recreateSwapchain` surface-mismatch `RX_LOG_WARN`.
+
+### Self-review of this fix pass
+
+- Confirmed the fix addresses the *actual* mechanism (structural, order-independent) rather than papering over the reviewer's specific repro — proved with a seed sweep specifically targeting the original failure precondition, not just re-running the previously-passing case.
+- Caught my own regression (the `enableValidation=false` warm-up breaking validated contexts) via the same verification discipline — full `ctest`, not just the happy path — before it could have shipped.
+- Did not touch `.superpowers/sdd/.../progress.md`, `docs/superpowers/plans/2026-08-10-phase2-shader-resource.md`, or any other file modified by concurrent work in this shared working tree during this session; staged and committed only the five files this fix pass owns.
