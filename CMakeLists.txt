@@ -8,6 +8,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 enable_testing()
 
 add_subdirectory(third_party)
+
+include(tools/fetch_slang.cmake)
+add_subdirectory(shaders)
+
 add_subdirectory(src/rx_core)
 add_subdirectory(src/rx_platform)
 add_subdirectory(src/rx_rhi_vk)
