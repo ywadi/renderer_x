@@ -1,0 +1,149 @@
+# Review package: 337b204088c20352e9612fb1cceca42b5dfb7afd..5f2b375157763115ce21dd6e1b6fe9416ec6995a
+
+## Commits
+5f2b375 Add content-hashed dependency cache, proven with spdlog
+
+## Files changed
+ CMakeLists.txt                           |  2 +
+ cmake/DepCache.cmake                     | 69 ++++++++++++++++++++++++++++++++
+ third_party/CMakeLists.txt               | 17 ++++++++
+ tools/dep_cache_smoketest/CMakeLists.txt |  2 +
+ tools/dep_cache_smoketest/main.cpp       |  6 +++
+ 5 files changed, 96 insertions(+)
+
+## Diff
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8a525ff..9ef6df8 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,10 +1,12 @@
+ cmake_minimum_required(VERSION 3.21)
+ project(renderer_x LANGUAGES C CXX)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+ 
+ enable_testing()
+ 
++add_subdirectory(third_party)
++add_subdirectory(tools/dep_cache_smoketest)
+ add_subdirectory(tools/toolchain_check)
+diff --git a/cmake/DepCache.cmake b/cmake/DepCache.cmake
+new file mode 100644
+index 0000000..76be311
+--- /dev/null
++++ b/cmake/DepCache.cmake
+@@ -0,0 +1,69 @@
++# Builds a CMake-based dependency exactly once per (name, pin, target
++# triple, zig version) and reuses the cached install on every later
++# configure. A cache hit costs zero compilation.
++
++function(rx_dep_cache_key OUT_VAR NAME TAG)
++  execute_process(
++    COMMAND "${CMAKE_SOURCE_DIR}/toolchain/zig/zig" version
++    OUTPUT_VARIABLE _zig_version
++    OUTPUT_STRIP_TRAILING_WHITESPACE)
++  string(SHA256 _hash "${NAME}|${TAG}|${RX_TARGET_TRIPLE}|${_zig_version}")
++  string(SUBSTRING "${_hash}" 0 16 _hash)
++  set(${OUT_VAR} "${NAME}-${_hash}" PARENT_SCOPE)
++endfunction()
++
++function(rx_add_cached_dependency)
++  set(oneValueArgs NAME REPO TAG)
++  set(multiValueArgs CMAKE_ARGS)
++  cmake_parse_arguments(DEP "" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
++
++  rx_dep_cache_key(_key ${DEP_NAME} ${DEP_TAG})
++  set(_cache_dir "${CMAKE_SOURCE_DIR}/.deps-cache/${_key}")
++  set(_marker "${_cache_dir}/.rx-built")
++
++  if(NOT EXISTS "${_marker}")
++    message(STATUS "[dep-cache] MISS for ${DEP_NAME} (key=${_key}) - building once")
++
++    set(_src_dir "${CMAKE_BINARY_DIR}/_deps-src/${DEP_NAME}")
++    if(NOT EXISTS "${_src_dir}/.git")
++      execute_process(COMMAND git clone --quiet "${DEP_REPO}" "${_src_dir}" RESULT_VARIABLE _rv)
++      if(NOT _rv EQUAL 0)
++        message(FATAL_ERROR "[dep-cache] git clone failed for ${DEP_NAME} (${DEP_REPO})")
++      endif()
++    endif()
++
++    execute_process(COMMAND git -C "${_src_dir}" fetch --quiet --depth 1 origin "${DEP_TAG}" RESULT_VARIABLE _rv)
++    if(NOT _rv EQUAL 0)
++      message(FATAL_ERROR "[dep-cache] git fetch of pin '${DEP_TAG}' failed for ${DEP_NAME}")
++    endif()
++
++    execute_process(COMMAND git -C "${_src_dir}" checkout --quiet FETCH_HEAD RESULT_VARIABLE _rv)
++    if(NOT _rv EQUAL 0)
++      message(FATAL_ERROR "[dep-cache] git checkout of pin '${DEP_TAG}' failed for ${DEP_NAME}")
++    endif()
++
++    set(_build_dir "${CMAKE_BINARY_DIR}/_deps-build/${DEP_NAME}")
++    execute_process(
++      COMMAND "${CMAKE_COMMAND}" -S "${_src_dir}" -B "${_build_dir}" -G "${CMAKE_GENERATOR}"
++              "-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
++              "-DCMAKE_INSTALL_PREFIX=${_cache_dir}"
++              "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
++              ${DEP_CMAKE_ARGS}
++      RESULT_VARIABLE _rv)
++    if(NOT _rv EQUAL 0)
++      message(FATAL_ERROR "[dep-cache] configure failed for ${DEP_NAME} - see output above")
++    endif()
++
++    execute_process(COMMAND "${CMAKE_COMMAND}" --build "${_build_dir}" --target install RESULT_VARIABLE _rv)
++    if(NOT _rv EQUAL 0)
++      message(FATAL_ERROR "[dep-cache] build/install failed for ${DEP_NAME} - see output above")
++    endif()
++
++    file(WRITE "${_marker}" "${DEP_TAG}\n")
++  else()
++    message(STATUS "[dep-cache] HIT for ${DEP_NAME} (key=${_key}) - reusing cached install, no compilation")
++  endif()
++
++  set(${DEP_NAME}_CACHE_DIR "${_cache_dir}" PARENT_SCOPE)
++  set(CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH};${_cache_dir}" PARENT_SCOPE)
++endfunction()
+diff --git a/third_party/CMakeLists.txt b/third_party/CMakeLists.txt
+new file mode 100644
+index 0000000..6926f52
+--- /dev/null
++++ b/third_party/CMakeLists.txt
+@@ -0,0 +1,17 @@
++include("${CMAKE_SOURCE_DIR}/cmake/DepCache.cmake")
++
++set(RX_SPDLOG_TAG "v1.17.0")
++rx_add_cached_dependency(
++  NAME spdlog
++  REPO https://github.com/gabime/spdlog.git
++  TAG ${RX_SPDLOG_TAG}
++  CMAKE_ARGS -DSPDLOG_BUILD_EXAMPLE=OFF -DSPDLOG_BUILD_TESTS=OFF -DBUILD_SHARED_LIBS=OFF
++)
++find_package(spdlog REQUIRED PATHS "${spdlog_CACHE_DIR}" NO_DEFAULT_PATH)
++
++# CMake 3.22 has no find_package(... GLOBAL) (that arrived in 3.24), and
++# imported targets are directory-scoped by default: without this, the
++# spdlog::spdlog target created here would be invisible to sibling
++# add_subdirectory() calls (e.g. tools/dep_cache_smoketest) that need to
++# link against it. Promote it to global scope explicitly instead.
++set_target_properties(spdlog::spdlog PROPERTIES IMPORTED_GLOBAL TRUE)
+diff --git a/tools/dep_cache_smoketest/CMakeLists.txt b/tools/dep_cache_smoketest/CMakeLists.txt
+new file mode 100644
+index 0000000..f5ad2a4
+--- /dev/null
++++ b/tools/dep_cache_smoketest/CMakeLists.txt
+@@ -0,0 +1,2 @@
++add_executable(dep_cache_smoketest main.cpp)
++target_link_libraries(dep_cache_smoketest PRIVATE spdlog::spdlog)
+diff --git a/tools/dep_cache_smoketest/main.cpp b/tools/dep_cache_smoketest/main.cpp
+new file mode 100644
+index 0000000..a94319e
+--- /dev/null
++++ b/tools/dep_cache_smoketest/main.cpp
+@@ -0,0 +1,6 @@
++#include <spdlog/spdlog.h>
++
++int main() {
++    spdlog::info("hello from cached spdlog");
++    return 0;
++}

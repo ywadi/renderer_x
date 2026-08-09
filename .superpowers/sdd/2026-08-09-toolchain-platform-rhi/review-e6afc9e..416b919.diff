@@ -1,0 +1,123 @@
+# Review package: e6afc9e42c5d175417ff985b2c542bdde8f74f25..416b919f43a800efd4d7d7d6d134f5875ee95d48
+
+## Commits
+416b919 Add native build scaffolding via zig toolchain
+
+## Files changed
+ CMakeLists.txt                       | 10 ++++++++++
+ CMakePresets.json                    | 23 +++++++++++++++++++++++
+ cmake/toolchains/linux-native.cmake  |  9 +++++++++
+ cmake/zig-wrappers/zig-cc-linux      |  5 +++++
+ cmake/zig-wrappers/zig-cxx-linux     |  5 +++++
+ tools/toolchain_check/CMakeLists.txt |  1 +
+ tools/toolchain_check/main.cpp       | 12 ++++++++++++
+ 7 files changed, 65 insertions(+)
+
+## Diff
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+new file mode 100644
+index 0000000..8a525ff
+--- /dev/null
++++ b/CMakeLists.txt
+@@ -0,0 +1,10 @@
++cmake_minimum_required(VERSION 3.21)
++project(renderer_x LANGUAGES C CXX)
++
++set(CMAKE_CXX_STANDARD 20)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
++
++enable_testing()
++
++add_subdirectory(tools/toolchain_check)
+diff --git a/CMakePresets.json b/CMakePresets.json
+new file mode 100644
+index 0000000..5842b89
+--- /dev/null
++++ b/CMakePresets.json
+@@ -0,0 +1,23 @@
++{
++  "version": 3,
++  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
++  "configurePresets": [
++    {
++      "name": "linux-native",
++      "generator": "Ninja",
++      "binaryDir": "${sourceDir}/build/linux-native",
++      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-native.cmake",
++      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
++    }
++  ],
++  "buildPresets": [
++    { "name": "linux-native", "configurePreset": "linux-native" }
++  ],
++  "testPresets": [
++    {
++      "name": "linux-native",
++      "configurePreset": "linux-native",
++      "output": { "outputOnFailure": true }
++    }
++  ]
++}
+diff --git a/cmake/toolchains/linux-native.cmake b/cmake/toolchains/linux-native.cmake
+new file mode 100644
+index 0000000..3aff048
+--- /dev/null
++++ b/cmake/toolchains/linux-native.cmake
+@@ -0,0 +1,9 @@
++set(CMAKE_SYSTEM_NAME Linux)
++set(CMAKE_SYSTEM_PROCESSOR x86_64)
++
++get_filename_component(RX_REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
++
++set(CMAKE_C_COMPILER   "${RX_REPO_ROOT}/cmake/zig-wrappers/zig-cc-linux"  CACHE FILEPATH "C compiler" FORCE)
++set(CMAKE_CXX_COMPILER "${RX_REPO_ROOT}/cmake/zig-wrappers/zig-cxx-linux" CACHE FILEPATH "C++ compiler" FORCE)
++
++set(RX_TARGET_TRIPLE "x86_64-linux-gnu" CACHE STRING "Target triple, used as a dependency-cache key component")
+diff --git a/cmake/zig-wrappers/zig-cc-linux b/cmake/zig-wrappers/zig-cc-linux
+new file mode 100755
+index 0000000..d4859be
+--- /dev/null
++++ b/cmake/zig-wrappers/zig-cc-linux
+@@ -0,0 +1,5 @@
++#!/usr/bin/env bash
++set -euo pipefail
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
++exec "$REPO_ROOT/toolchain/zig/zig" cc -target x86_64-linux-gnu -Wno-nullability-completeness "$@"
+diff --git a/cmake/zig-wrappers/zig-cxx-linux b/cmake/zig-wrappers/zig-cxx-linux
+new file mode 100755
+index 0000000..7cde017
+--- /dev/null
++++ b/cmake/zig-wrappers/zig-cxx-linux
+@@ -0,0 +1,5 @@
++#!/usr/bin/env bash
++set -euo pipefail
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
++exec "$REPO_ROOT/toolchain/zig/zig" c++ -target x86_64-linux-gnu -Wno-nullability-completeness "$@"
+diff --git a/tools/toolchain_check/CMakeLists.txt b/tools/toolchain_check/CMakeLists.txt
+new file mode 100644
+index 0000000..f09eb41
+--- /dev/null
++++ b/tools/toolchain_check/CMakeLists.txt
+@@ -0,0 +1 @@
++add_executable(toolchain_check main.cpp)
+diff --git a/tools/toolchain_check/main.cpp b/tools/toolchain_check/main.cpp
+new file mode 100644
+index 0000000..0fc0e55
+--- /dev/null
++++ b/tools/toolchain_check/main.cpp
+@@ -0,0 +1,12 @@
++#include <cstdio>
++
++int main() {
++#if defined(_WIN32)
++    std::puts("renderer_x toolchain_check: target=windows");
++#elif defined(__linux__)
++    std::puts("renderer_x toolchain_check: target=linux");
++#else
++    std::puts("renderer_x toolchain_check: target=unknown");
++#endif
++    return 0;
++}

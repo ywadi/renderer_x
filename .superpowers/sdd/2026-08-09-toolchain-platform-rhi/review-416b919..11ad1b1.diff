@@ -1,0 +1,104 @@
+# Review package: 416b919f43a800efd4d7d7d6d134f5875ee95d48..11ad1b1f97317e8e16844bc214751ebf3434926a
+
+## Commits
+11ad1b1 Add Windows cross-compile toolchain via zig
+
+## Files changed
+ CMakePresets.json                        | 15 ++++++++++++++-
+ cmake/toolchains/windows-cross-zig.cmake | 21 +++++++++++++++++++++
+ cmake/zig-wrappers/zig-cc-windows        |  5 +++++
+ cmake/zig-wrappers/zig-cxx-windows       |  5 +++++
+ 4 files changed, 45 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/CMakePresets.json b/CMakePresets.json
+index 5842b89..a044b63 100644
+--- a/CMakePresets.json
++++ b/CMakePresets.json
+@@ -1,23 +1,36 @@
+ {
+   "version": 3,
+   "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+   "configurePresets": [
+     {
+       "name": "linux-native",
+       "generator": "Ninja",
+       "binaryDir": "${sourceDir}/build/linux-native",
+       "toolchainFile": "${sourceDir}/cmake/toolchains/linux-native.cmake",
+       "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
++    },
++    {
++      "name": "windows-cross-zig",
++      "generator": "Ninja",
++      "binaryDir": "${sourceDir}/build/windows-cross-zig",
++      "toolchainFile": "${sourceDir}/cmake/toolchains/windows-cross-zig.cmake",
++      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+     }
+   ],
+   "buildPresets": [
+-    { "name": "linux-native", "configurePreset": "linux-native" }
++    { "name": "linux-native", "configurePreset": "linux-native" },
++    { "name": "windows-cross-zig", "configurePreset": "windows-cross-zig" }
+   ],
+   "testPresets": [
+     {
+       "name": "linux-native",
+       "configurePreset": "linux-native",
+       "output": { "outputOnFailure": true }
++    },
++    {
++      "name": "windows-cross-zig",
++      "configurePreset": "windows-cross-zig",
++      "output": { "outputOnFailure": true }
+     }
+   ]
+ }
+diff --git a/cmake/toolchains/windows-cross-zig.cmake b/cmake/toolchains/windows-cross-zig.cmake
+new file mode 100644
+index 0000000..fbc8cb2
+--- /dev/null
++++ b/cmake/toolchains/windows-cross-zig.cmake
+@@ -0,0 +1,21 @@
++set(CMAKE_SYSTEM_NAME Windows)
++set(CMAKE_SYSTEM_PROCESSOR x86_64)
++
++get_filename_component(RX_REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
++
++set(CMAKE_C_COMPILER   "${RX_REPO_ROOT}/cmake/zig-wrappers/zig-cc-windows"  CACHE FILEPATH "C compiler" FORCE)
++set(CMAKE_CXX_COMPILER "${RX_REPO_ROOT}/cmake/zig-wrappers/zig-cxx-windows" CACHE FILEPATH "C++ compiler" FORCE)
++
++# Cross-compiling: CMake cannot execute the resulting binaries to probe the
++# compiler, so tell it the compiler works rather than test-executing it.
++set(CMAKE_C_COMPILER_WORKS TRUE)
++set(CMAKE_CXX_COMPILER_WORKS TRUE)
++set(CMAKE_CROSSCOMPILING TRUE)
++
++set(RX_TARGET_TRIPLE "x86_64-windows-gnu" CACHE STRING "Target triple, used as a dependency-cache key component")
++
++# If wine is present, ctest can run cross-compiled test binaries transparently.
++find_program(RX_WINE_EXECUTABLE wine)
++if(RX_WINE_EXECUTABLE)
++  set(CMAKE_CROSSCOMPILING_EMULATOR "${RX_WINE_EXECUTABLE}" CACHE STRING "Emulator used to run cross-compiled test binaries" FORCE)
++endif()
+diff --git a/cmake/zig-wrappers/zig-cc-windows b/cmake/zig-wrappers/zig-cc-windows
+new file mode 100755
+index 0000000..e5508fb
+--- /dev/null
++++ b/cmake/zig-wrappers/zig-cc-windows
+@@ -0,0 +1,5 @@
++#!/usr/bin/env bash
++set -euo pipefail
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
++exec "$REPO_ROOT/toolchain/zig/zig" cc -target x86_64-windows-gnu -Wno-nullability-completeness "$@"
+diff --git a/cmake/zig-wrappers/zig-cxx-windows b/cmake/zig-wrappers/zig-cxx-windows
+new file mode 100755
+index 0000000..68cf1c3
+--- /dev/null
++++ b/cmake/zig-wrappers/zig-cxx-windows
+@@ -0,0 +1,5 @@
++#!/usr/bin/env bash
++set -euo pipefail
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
++exec "$REPO_ROOT/toolchain/zig/zig" c++ -target x86_64-windows-gnu -Wno-nullability-completeness "$@"
