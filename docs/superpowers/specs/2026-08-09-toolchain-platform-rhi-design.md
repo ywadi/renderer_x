@@ -134,12 +134,28 @@ Vulkan RHI that can render a hardcoded triangle through dynamic rendering.
   dependency bootstrap). Every subsequent build with unchanged dependency
   pins finishes in **under 1 minute** on the reference dev machine.
 
-## Explicitly out of scope for this spec
+## Deferred to later sub-project specs (not dropped)
+
+Everything below is still planned and will get its own design spec later —
+it is out of scope for *this* spec only, not out of scope for the project:
 
 - Slang runtime compilation/reflection (layer 4)
 - Descriptor/resource management beyond the bindless-friendly baseline
   (layer 5)
 - Render graph, materials, scene submission, techniques, asset import,
-  public SDK surface, tooling (layers 6–12)
+  public SDK surface, tooling (layers 6–12) — including, explicitly, these
+  subsystems so they aren't lost before those layers get specced:
+  - **Geometry processing** (layer 8, scene submission): meshlet
+    generation, virtual geometry, LOD management, skeletal mesh skinning,
+    morph targets.
+  - **Lighting infrastructure & spatial queries** (layer 9, techniques):
+    acceleration structures (BVH for ray tracing), clustered/deferred
+    lighting grids, shadow cascades, global illumination probes.
+  - **Post-processing & image reconstruction** (layer 9, techniques): tone
+    mapping, color grading, temporal anti-aliasing, hardware upscaling
+    wrappers (DLSS, FSR, XeSS).
+  - **Profiling & debug instrumentation** (layer 12, tooling): GPU markers
+    (PIX/RenderDoc integration), debug line drawing, memory leak tracking,
+    performance counters.
 - macOS/MoltenVK support
 - DLL ABI-stability strategy for the public interface
