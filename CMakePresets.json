@@ -8,15 +8,28 @@
       "binaryDir": "${sourceDir}/build/linux-native",
       "toolchainFile": "${sourceDir}/cmake/toolchains/linux-native.cmake",
       "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    },
+    {
+      "name": "windows-cross-zig",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-cross-zig",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/windows-cross-zig.cmake",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
     }
   ],
   "buildPresets": [
-    { "name": "linux-native", "configurePreset": "linux-native" }
+    { "name": "linux-native", "configurePreset": "linux-native" },
+    { "name": "windows-cross-zig", "configurePreset": "windows-cross-zig" }
   ],
   "testPresets": [
     {
       "name": "linux-native",
       "configurePreset": "linux-native",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "windows-cross-zig",
+      "configurePreset": "windows-cross-zig",
       "output": { "outputOnFailure": true }
     }
   ]
