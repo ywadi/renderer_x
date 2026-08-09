@@ -14,6 +14,26 @@ void destroySurface(const Context& context, VkSurfaceKHR surface) {
 }  // namespace
 
 std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
+    // shaderDrawParameters (promoted from VK_KHR_shader_draw_parameters to
+    // Vulkan 1.1 core) is required by any HLSL/Slang vertex shader that
+    // reads SV_VertexID: to reproduce HLSL's zero-based SV_VertexID exactly
+    // (unaffected by a nonzero firstVertex/vkCmdDraw base), Slang's SPIR-V
+    // backend emits `gl_VertexIndex - gl_BaseVertex`, which declares
+    // OpCapability DrawParameters and a BaseVertex BuiltIn input -- verified
+    // directly via `spirv-dis` on samples/01_triangle's compiled
+    // triangle.vert.spv. Without this feature enabled, vkCreateShaderModule
+    // on any such shader is a validation error
+    // (VUID-VkShaderModuleCreateInfo-pCode-01091: "capability was declared,
+    // but none of the requirements were met") even though several drivers
+    // silently tolerate it -- exactly the "driver-tolerated but not
+    // spec-valid" gap this task's triangle gate exists to close. Universally
+    // available (core since Vulkan 1.1, no extension string needed here
+    // since set_minimum_version is already >= 1.1), so requiring it costs
+    // nothing on any target this project cares about.
+    VkPhysicalDeviceVulkan11Features features11{};
+    features11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    features11.shaderDrawParameters = VK_TRUE;
+
     VkPhysicalDeviceVulkan13Features features13{};
     features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     features13.dynamicRendering = VK_TRUE;
@@ -22,6 +42,7 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
     vkb::PhysicalDeviceSelector selector(context.vkbInstance());
     auto physResult = selector.set_surface(surface)
                           .set_minimum_version(1, 3)
+                          .set_required_features_11(features11)
                           .set_required_features_13(features13)
                           .select();
     if (!physResult) {

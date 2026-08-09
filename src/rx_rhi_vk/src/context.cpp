@@ -42,6 +42,35 @@ bool isKnownPortabilityEnumerationLayerBug(const char* message) {
            msg.find("is not supported by this layer") != std::string_view::npos;
 }
 
+// Second known false positive, same root cause (this machine's apt-packaged
+// validation layer, 1.3.204.1, bundles a SPIRV-Tools build older than a
+// legitimate upstream addition it doesn't recognize) but a different SPIR-V
+// module check: SPIR-V's SourceLanguage enum gained `Slang = 11` when Slang
+// became an officially registered Khronos SPIR-V source language -- verified
+// directly against a current SPIRV-Headers spirv/unified1/spirv.h, which
+// defines `SpvSourceLanguageSlang = 11`. slangc (the pinned 2026.14.1
+// prebuilt consumed by shaders/CMakeLists.txt) always emits `OpSource Slang
+// 1` into every module it produces, unconditionally: verified by recompiling
+// samples/01_triangle's triangle.vert.slang with `-g0` (strip debug info)
+// and disassembling the result via spirv-dis -- the OpSource line is
+// unchanged, confirming this is base module-provenance metadata, not
+// optional embedded source text `-g`/`-debug-info-include-source` could
+// suppress. It has zero effect on module semantics or execution; the
+// installed layer's OpSource operand-range check simply doesn't know enum
+// value 11 yet and rejects any module carrying it. Matched narrowly on the
+// check's own distinctive message text plus its "UNASSIGNED" category
+// (SPIRV-Tools' own internal check, not a formal Vulkan spec VUID) so a
+// genuinely different "module not valid" failure is never silently
+// swallowed.
+bool isKnownUnrecognizedSlangSourceLanguageBug(const char* message) {
+    if (message == nullptr) {
+        return false;
+    }
+    const std::string_view msg(message);
+    return msg.find("UNASSIGNED-CoreValidation-Shader-InconsistentSpirv") != std::string_view::npos &&
+           msg.find("Invalid source language operand: 11") != std::string_view::npos;
+}
+
 VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
                                               VkDebugUtilsMessageTypeFlagsEXT /*type*/,
                                               const VkDebugUtilsMessengerCallbackDataEXT* data,
@@ -50,6 +79,8 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBits
     if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
         if (isKnownPortabilityEnumerationLayerBug(data->pMessage)) {
             RX_LOG_WARN("[vulkan validation] (known false positive: validation layer predates VK_KHR_portability_enumeration) {}", data->pMessage);
+        } else if (isKnownUnrecognizedSlangSourceLanguageBug(data->pMessage)) {
+            RX_LOG_WARN("[vulkan validation] (known false positive: validation layer predates SPIR-V SourceLanguage=Slang) {}", data->pMessage);
         } else {
             RX_LOG_ERROR("[vulkan validation] {}", data->pMessage);
             (*errorCount)++;
