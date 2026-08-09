@@ -1176,7 +1176,23 @@ git commit -m "Add rx_rhi_vk::Context: Vulkan instance and validation layers"
 
 ---
 
-### Task 7: rx_rhi_vk::Device (physical+logical device, queues, swapchain)
+## ⛔ SUPERSEDED FROM THIS POINT ON
+
+**Tasks 7-15 below are superseded by
+`docs/superpowers/plans/2026-08-10-phase1-completion.md` and must NOT be
+executed from this file.** A direct audit (2026-08-10) found real defects in
+them: Task 12 renders into a never-acquired swapchain image (Vulkan spec
+violation), Task 13 destroys per-frame semaphores immediately after present
+(race/UB) and serializes every frame with vkQueueWaitIdle, Task 8's VMA
+integration is missing the API-1.3-required *2 function pointers, any
+`VMA_IMPLEMENTATION` TU, and the sibling-scope `PARENT_SCOPE` propagation,
+Task 9's test has use-after-free teardown ordering and a non-compiling
+helper struct, and Task 14's budget check times a no-op build. The
+superseding plan fixes all of these, folds Task 15 into its Task 6, and adds
+the samples/deployment deliverable. Tasks 1-6 above remain the accurate
+historical record of what was built.
+
+### Task 7 (SUPERSEDED): rx_rhi_vk::Device (physical+logical device, queues, swapchain)
 
 **Files:**
 - Create: `src/rx_rhi_vk/include/rx_rhi_vk/device.h`, `src/rx_rhi_vk/src/device.cpp`
