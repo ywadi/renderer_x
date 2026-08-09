@@ -32,6 +32,27 @@ FetchContent_Declare(glm
   GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(glm)
 
+# Vulkan-Headers: header-only (provides the Vulkan::Headers INTERFACE target
+# via its own CMakeLists.txt, no loader library involved), fetched directly
+# like GLM/doctest rather than through find_package(Vulkan). find_package's
+# bundled FindVulkan.cmake (CMake 3.22 here) gates Vulkan_FOUND -- and
+# therefore Vulkan::Headers existing at all -- behind ALSO locating the
+# platform's Vulkan *loader* import library (vulkan-1.lib on Windows), which
+# does not exist anywhere when cross-compiling to Windows on this Linux host.
+# Nothing in this project links the loader at compile/link time: the RHI
+# layer (Task 6+) loads Vulkan entry points dynamically at runtime via volk,
+# so only the headers (types/constants/signatures) are ever needed. Pinned
+# to vulkan-sdk-1.3.280.0, whose vulkan_core.h reports
+# VK_HEADER_VERSION_COMPLETE == 1.3.280, an exact match for this project's
+# Vulkan 1.3 baseline (this machine's driver reports Instance Version
+# 1.3.280 via `vulkaninfo --summary`).
+set(RX_VULKAN_HEADERS_TAG "vulkan-sdk-1.3.280.0")
+FetchContent_Declare(Vulkan-Headers
+  GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+  GIT_TAG ${RX_VULKAN_HEADERS_TAG}
+  GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(Vulkan-Headers)
+
 set(RX_SDL3_TAG "release-3.4.14")
 rx_add_cached_dependency(
   NAME SDL3
