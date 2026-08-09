@@ -18,6 +18,7 @@
 - Once the dependency cache is warm, `cmake --build` for this project's own code must complete in under 1 minute on the reference dev machine (this machine).
 - No AI attribution in any commit, anywhere, ever (per `/media/ywadi/second/renderer_x/CLAUDE.md`) — every commit step in this plan must produce a commit message with no such attribution, and must not alter the configured git author identity.
 - No placeholder/TODO code. Every task's deliverable must be real and independently testable.
+- **Do not reinvent the wheel.** Every task in this plan is built on ready-made libraries or ported implementations (SDL3, vk-bootstrap, VMA, volk, GLM, spdlog, doctest, Slang) rather than from-scratch code, per `/media/ywadi/second/renderer_x/CLAUDE.md`'s repository policy. If a task's implementer finds themselves about to hand-write something a well-established library already solves, they should stop and check for a ready-made option first.
 
 ---
 
