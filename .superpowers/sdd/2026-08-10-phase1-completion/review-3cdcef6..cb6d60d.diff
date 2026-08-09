@@ -1,0 +1,862 @@
+# Review package: 3cdcef6..cb6d60d
+
+## Commits
+cb6d60d Add rx_rhi_vk::Device: physical/logical device, queues, swapchain, acquire/present/recreate
+
+## Files changed
+ .../2026-08-10-phase1-completion/task-1-brief.md   |  42 ++++
+ .../2026-08-10-phase1-completion/task-1-report.md  |  89 ++++++++
+ src/rx_rhi_vk/CMakeLists.txt                       |  17 +-
+ src/rx_rhi_vk/include/rx_rhi_vk/context.h          |  16 +-
+ src/rx_rhi_vk/include/rx_rhi_vk/device.h           |  87 ++++++++
+ src/rx_rhi_vk/src/context.cpp                      |  29 +--
+ src/rx_rhi_vk/src/device.cpp                       | 228 +++++++++++++++++++++
+ src/rx_rhi_vk/tests/context_test.cpp               |  30 ++-
+ src/rx_rhi_vk/tests/device_test.cpp                | 169 +++++++++++++++
+ src/rx_rhi_vk/tests/doctest_main.cpp               |   2 +
+ 10 files changed, 677 insertions(+), 32 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-10-phase1-completion/task-1-brief.md b/.superpowers/sdd/2026-08-10-phase1-completion/task-1-brief.md
+new file mode 100644
+index 0000000..94a5135
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-phase1-completion/task-1-brief.md
+@@ -0,0 +1,42 @@
++### Task 1: Complete rx_rhi_vk::Device (device, queues, swapchain, acquire/present/recreate)
++
++**Files:**
++- Modify: `src/rx_rhi_vk/include/rx_rhi_vk/context.h`, `src/rx_rhi_vk/src/context.cpp` (store `vkb::Instance`)
++- Create: `src/rx_rhi_vk/include/rx_rhi_vk/device.h`, `src/rx_rhi_vk/src/device.cpp`
++- Create: `src/rx_rhi_vk/tests/device_test.cpp`
++- Modify: `src/rx_rhi_vk/CMakeLists.txt` (add device.cpp; add device_test.cpp; tests link `rx_platform`)
++
++**Interfaces:**
++- Consumes: `rx::platform::Window` (surface creation), `rx::rhi::Context`.
++- Produces (later tasks rely on these exact names):
++  - `Context::vkbInstance() const -> const vkb::Instance&`
++  - `rx::rhi::SwapchainStatus` enum: `Ok, NeedsRecreate, DeviceLost`
++  - `rx::rhi::AcquireResult { SwapchainStatus status; uint32_t imageIndex; }`
++  - `rx::rhi::Device` with: `static create(Context&, VkSurfaceKHR) -> std::optional<Device>`, `physicalDevice()`, `device()`, `graphicsQueue()`, `graphicsQueueFamily() -> uint32_t`, `presentQueue()`, `swapchain()`, `swapchainImages() -> const std::vector<VkImage>&`, `swapchainFormat() -> VkFormat`, `swapchainExtent() -> VkExtent2D`, `acquireNextImage(VkSemaphore signal) -> AcquireResult`, `present(uint32_t imageIndex, VkSemaphore wait) -> SwapchainStatus`, `recreateSwapchain(VkSurfaceKHR) -> bool`.
++
++**Step A — extend Context (do this first, it unblocks everything):** store the `vkb::Instance` by value (`#include <VkBootstrap.h>` in the header; forward declaration is not possible for a by-value member). Constructor takes `(vkb::Instance, std::shared_ptr<int>)`; `instance()`/`debugMessenger()` read through `vkbInstance_.instance` / `.debug_messenger`; destructor and move-assignment tear down via `vkb::destroy_instance(vkbInstance_)` (it destroys the messenger and instance together) guarded by `vkbInstance_.instance != VK_NULL_HANDLE`; moved-from objects null the handle. Preserve the false-positive guard and error-count mechanism untouched. Re-run `rx_rhi_vk_tests` (context test) before proceeding — this refactor must not break Task 6's shipped behavior.
++
++**Step B — Device.** `Device::create`:
++- Build `VkPhysicalDeviceVulkan13Features features13{}` with `.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES`, `.dynamicRendering = VK_TRUE`, `.synchronization2 = VK_TRUE`.
++- `vkb::PhysicalDeviceSelector selector(context.vkbInstance()); selector.set_surface(surface).set_minimum_version(1, 3).set_required_features_13(features13).select();`
++- `vkb::DeviceBuilder(physResult.value()).build()`; `volkLoadDevice(vkbDevice.device)`.
++- Queues: `get_queue(vkb::QueueType::graphics)`, `get_queue_index(vkb::QueueType::graphics)`, `get_queue(vkb::QueueType::present)` — all checked, all stored.
++- Swapchain: `vkb::SwapchainBuilder swapchainBuilder(vkbDevice, surface); swapchainBuilder.build()`; store `swapchain`, `get_images()`, `image_format`, `extent`.
++- Every failure path: `RX_LOG_ERROR` with the vkb error message, return `std::nullopt`.
++- Ownership: Device owns and destroys, in dtor/move-assign order: swapchain → device → surface. Document in the header that `Device::create` takes ownership of the surface. Move-only, moved-from handles nulled; move ctor may delegate to move-assign only because all members have `VK_NULL_HANDLE`/zero default initializers — keep those initializers.
++
++`acquireNextImage(VkSemaphore signal)`: `vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, signal, VK_NULL_HANDLE, &idx)`; `VK_SUCCESS`/`VK_SUBOPTIMAL_KHR` → `{Ok, idx}` (suboptimal still owns the image — render then let present report NeedsRecreate); `VK_ERROR_OUT_OF_DATE_KHR` → `{NeedsRecreate, 0}`; `VK_ERROR_DEVICE_LOST` → log + `{DeviceLost, 0}`; anything else → log the VkResult + `{NeedsRecreate, 0}`.
++
++`present(uint32_t imageIndex, VkSemaphore wait)`: standard `VkPresentInfoKHR` (wait semaphore only if non-null); `VK_SUCCESS` → Ok; `VK_ERROR_OUT_OF_DATE_KHR`/`VK_SUBOPTIMAL_KHR` → NeedsRecreate; `VK_ERROR_DEVICE_LOST` → log + DeviceLost; else log + NeedsRecreate.
++
++`recreateSwapchain(VkSurfaceKHR surface)`: `vkDeviceWaitIdle` first; destroy old swapchain; rebuild via `vkb::SwapchainBuilder(physicalDevice_, device_, surface)` (raw-handle ctor — if this pinned vk-bootstrap commit's ctor signature differs, check `VkBootstrap.h` and adapt; there is also an overload taking explicit queue indices); refresh images/format/extent; false on failure with `RX_LOG_ERROR`.
++
++**Step C — tests** (`device_test.cpp`, follows the existing window-based test pattern: skip gracefully with `MESSAGE` if `requiredVulkanInstanceExtensions()` is empty, but on this machine it must actually run — a silent skip is a failure to investigate):
++1. Create window (hidden) → extensions → `Context::create(extensions, true)` → surface → `Device::create`. Assert: device/queues non-null, `swapchainImages().size() > 0`, `swapchainFormat() != VK_FORMAT_UNDEFINED`, extent non-zero, `!ctx->hasValidationErrors()`.
++2. Acquire/present round-trip: create one `VkSemaphore`; `acquireNextImage(sem)` must return `Ok`; transition the acquired image `UNDEFINED → PRESENT_SRC_KHR` and submit with a raw `vkQueueSubmit` that waits on the semaphore at `VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT` and signals a second semaphore + a fence; wait the fence; `present(imageIndex, renderFinishedSem)` must return `Ok` or `NeedsRecreate` (hidden-window presentation is implementation-defined), never `DeviceLost`; `vkDeviceWaitIdle` before destroying the semaphores/fence. (Record commands with a throwaway `VkCommandPool` created/destroyed locally — the shared CommandContext arrives in Task 3; keep this test self-contained.) The fence-wait before semaphore destruction is the point: never destroy a semaphore the presentation engine might still consume without an idle/fence guarantee — `vkDeviceWaitIdle` before teardown.
++3. Both existing test cases (context) still pass; zero validation errors throughout.
++
++**Verify:** `cmake --build --preset linux-native && ctest --preset linux-native --output-on-failure` all green; `cmake --build --preset windows-cross-zig` clean. Commit (no AI attribution — verify `git log -1 --format='%B'`).
++
++---
++
+diff --git a/.superpowers/sdd/2026-08-10-phase1-completion/task-1-report.md b/.superpowers/sdd/2026-08-10-phase1-completion/task-1-report.md
+new file mode 100644
+index 0000000..87bad2c
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-phase1-completion/task-1-report.md
+@@ -0,0 +1,89 @@
++# Task 1 Report: rx_rhi_vk::Device (device, queues, swapchain, acquire/present/recreate)
++
++Status: **DONE**
++
++## What was built
++
++### Step A — `Context` extended to store `vkb::Instance`
++
++- `src/rx_rhi_vk/include/rx_rhi_vk/context.h`: now `#include <VkBootstrap.h>` and stores `vkb::Instance vkbInstance_{}` by value instead of raw `VkInstance`/`VkDebugUtilsMessengerEXT`. Added `const vkb::Instance& vkbInstance() const`. `instance()`/`debugMessenger()` now read through `vkbInstance_.instance`/`.debug_messenger`. Private constructor is now `Context(vkb::Instance, std::shared_ptr<int>)`.
++- `src/rx_rhi_vk/src/context.cpp`: dtor and move-assign now guard on `vkbInstance_.instance != VK_NULL_HANDLE` and tear down via a single `vkb::destroy_instance(vkbInstance_)` call (destroys messenger + instance together), matching the brief. Move ctor nulls the moved-from instance handle. The `isKnownPortabilityEnumerationLayerBug` false-positive guard and the `errorCount_` mechanism are untouched.
++- Verified in isolation before moving to Step B: rebuilt `rx_rhi_vk_tests`, reran just the context test — passed, no regression — then confirmed both presets (`linux-native` build+test, `windows-cross-zig` build) were clean before starting Step B.
++
++### Step B — `Device`
++
++- `src/rx_rhi_vk/include/rx_rhi_vk/device.h` / `src/rx_rhi_vk/src/device.cpp` (new).
++- `SwapchainStatus{Ok, NeedsRecreate, DeviceLost}` and `AcquireResult{status, imageIndex}` as specified.
++- `Device::create(Context&, VkSurfaceKHR)`: `VkPhysicalDeviceVulkan13Features` (dynamicRendering + synchronization2) → `vkb::PhysicalDeviceSelector` (surface, min version 1.3, features13) → `vkb::DeviceBuilder(...).build()` → `volkLoadDevice` → `get_queue`/`get_queue_index` for graphics, `get_queue` for present → `vkb::SwapchainBuilder(vkbDevice, surface).build()` → `get_images()`. Every failure path logs the vkb error message via `RX_LOG_ERROR` and unwinds everything already created (swapchain → device → surface, using `vkb::destroy_swapchain`/`vkb::destroy_device`/`vkb::destroy_surface` while the vkb wrapper objects are still in scope) before returning `std::nullopt`.
++- Ownership: `Device::create` takes ownership of the surface unconditionally — on success the returned `Device` owns and destroys swapchain → device → surface (in that order, via raw `vkDestroySwapchainKHR`/`vkDestroyDevice`/`vkDestroySurfaceKHR`, since `Device` stores raw handles, not vkb wrapper types, per the required accessor signatures); on failure `Device::create` destroys the surface itself. Documented on the class in `device.h`.
++- Move-only: private default ctor relies on the members' default initializers (`VK_NULL_HANDLE`/`0`/`VK_FORMAT_UNDEFINED`/`{0,0}`); move ctor delegates to move-assign (`: Device() { *this = std::move(other); }`); move-assign destroys its own current resources, takes over `other`'s state, then nulls `other`.
++- `acquireNextImage`/`present`/`recreateSwapchain` implemented exactly per the brief's status-mapping table (`VK_SUBOPTIMAL_KHR` on acquire → `Ok`, on present → `NeedsRecreate`; `VK_ERROR_DEVICE_LOST` → logged + `DeviceLost`; anything else → logged + `NeedsRecreate`/`false`).
++- `recreateSwapchain`: `vkDeviceWaitIdle` → destroy old swapchain → `vkb::SwapchainBuilder(physicalDevice_, device_, surface)` (raw-handle ctor, confirmed to match the brief exactly against the pinned commit's `VkBootstrap.h`) → refresh images/format/extent/surface. On `get_images()` failure after a successful rebuild, the just-built swapchain is destroyed via `vkb::destroy_swapchain` before returning `false`, to avoid leaking it.
++
++### Step C — tests
++
++- `src/rx_rhi_vk/tests/device_test.cpp` (new): a shared `makeFixture()` helper (hidden window → extensions → validated `Context::create` → `createVulkanSurface`) used by both cases, with the same skip-guard pattern as `rx_platform`'s tests (but it does not skip on this machine — see Verify below).
++  1. `Device::create` test: asserts device/queues/swapchain non-null, `swapchainImages().size() > 0`, format != `VK_FORMAT_UNDEFINED`, extent non-zero, `!hasValidationErrors()`.
++  2. Acquire/present round-trip: one throwaway `VkCommandPool`/buffer, `acquireNextImage` → `vkCmdPipelineBarrier` (`UNDEFINED → PRESENT_SRC_KHR`, classic sync1 barrier, `VK_QUEUE_FAMILY_IGNORED` on both sides since the swapchain's sharing mode already covers cross-queue-family use if graphics/present differ) → `vkQueueSubmit` waiting on the acquire semaphore at `COLOR_ATTACHMENT_OUTPUT`, signaling a second semaphore + a fence → `vkWaitForFences` → `present()` (asserted `!= DeviceLost`) → `vkDeviceWaitIdle` **before** destroying the semaphores/fence/pool (the fence only covers the submit, not the present itself, so the extra idle-wait is what actually guarantees the presentation engine is done with the semaphore before it's destroyed).
++- `src/rx_rhi_vk/tests/doctest_main.cpp` (new) + `context_test.cpp` trimmed to drop `DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN`: with two test files now, `rx_rhi_vk_tests` follows the same shared-`doctest_main.cpp` pattern as `rx_core_tests`.
++- `src/rx_rhi_vk/CMakeLists.txt`: added `src/device.cpp` to the library; `rx_rhi_vk_tests` now built from `doctest_main.cpp` + `context_test.cpp` + `device_test.cpp`, linking `rx_platform` in addition to `rx_rhi_vk`/`doctest::doctest`.
++
++## A real bug found and worked around: vk-bootstrap's process-wide function-pointer cache
++
++While bringing up the two new test cases, `Device::create`'s very first `PhysicalDeviceSelector::select()` call **segfaulted** whenever it ran after `context_test.cpp`'s existing headless `Context::create({}, true)` test had already run in the same process. Root-caused with gdb (not guessed):
++
++```
++#0  0x0000000000000000 in ?? ()
++#1  vkb::detail::get_present_queue_index (...) at VkBootstrap.cpp:1103
++#2  vkb::PhysicalDeviceSelector::is_device_suitable (...) at VkBootstrap.cpp:1187
++#3  vkb::PhysicalDeviceSelector::select_devices (...) at VkBootstrap.cpp:1342
++#4  vkb::PhysicalDeviceSelector::select (...) at VkBootstrap.cpp:1372
++#5  rx::rhi::Device::create (...) at device.cpp:26
++```
++
++`VkBootstrap.cpp:1103` calls `detail::vulkan_functions().fp_vkGetPhysicalDeviceSurfaceSupportKHR(...)` — a **null** function pointer. Read through `VkBootstrap.cpp`: `detail::vulkan_functions()` is a function-local `static` singleton, and `VulkanFunctions::init_instance_funcs(VkInstance inst)` is guarded by `if (instance_functions_initialized) return;` — it resolves every instance-level function pointer (via `vkGetInstanceProcAddr(instance, name)`) exactly once per process, from whichever `vkb::Instance` happens to be built first, and never refreshes them. `vkb::destroy_instance` does not reset this cache either (there is a `deinit_all()` that would, but nothing in vk-bootstrap's public API calls it). Since `context_test.cpp`'s Context is headless (`Context::create({}, true)` → `requiredExtensions.empty()` → `set_headless(true)`), it never enables `VK_KHR_surface`, so `vkGetInstanceProcAddr` on that instance legitimately returns null for `vkGetPhysicalDeviceSurfaceSupportKHR` — and that null gets cached **permanently for the whole process**, poisoning every later, fully-windowed `PhysicalDeviceSelector`/`DeviceBuilder`/`SwapchainBuilder` call, regardless of what extensions *they* enable. Confirmed empirically: running only the two Device tests (no headless Context ever built first) passes cleanly every time; interleaving the headless Context test before them reliably segfaults; doctest's default test order is `--order-by=file`, which sorts purely by `__FILE__` string (`context_test.cpp` < `device_test.cpp`), independent of link order — so this wasn't something reordering `CMakeLists.txt`'s source list could have fixed.
++
++This is a genuine defect/limitation of the pinned vk-bootstrap commit (`556b79b165386f6c1a18362d30f2a076fdaa2778`), not something fixable from our side without patching vk-bootstrap itself. The fix applied is a deliberate, self-documenting test-ordering constraint, not a silent hack:
++- `context_test.cpp`'s existing `TEST_CASE` (assertions unchanged) is decorated with `* doctest::test_suite("zz_run_after_windowed_device_tests")`; `device_test.cpp`'s two cases stay in the default (`""`) suite, which always sorts first under `--order-by=suite`.
++- `src/rx_rhi_vk/CMakeLists.txt`'s `add_test` now passes `--order-by=suite` explicitly, so `ctest` reliably builds a fully-extensioned windowed `Context`/`Device` first, warming the process-wide cache with valid pointers, before the headless test ever runs.
++- Both files carry comments pointing at this report's root cause (file/line in `VkBootstrap.cpp`, the exact null function pointer) so a future maintainer hitting something similar doesn't have to re-derive it.
++
++This is a real constraint worth flagging forward: **any process that builds more than one `vkb::Instance` across its lifetime, where an earlier one enables a narrower extension set than a later one needs, will hit this.** It's not just a test artifact — a real application recreating `rx::rhi::Context` (e.g. device-lost recovery, or a tool that legitimately runs headless before going windowed) could hit the identical null-function-pointer crash. Flagging for whoever picks up later device-loss/recreation work.
++
++## Verify
++
++`cmake --build --preset linux-native` (clean, from a removed `build/linux-native`) — all targets built without errors or warnings-as-issues.
++
++`ctest --preset linux-native --output-on-failure`:
++```
++Test project /media/ywadi/second/renderer_x/build/linux-native
++    Start 1: rx_core_tests
++1/3 Test #1: rx_core_tests ....................   Passed    0.00 sec
++    Start 2: rx_platform_tests
++2/3 Test #2: rx_platform_tests ................   Passed    0.06 sec
++    Start 3: rx_rhi_vk_tests
++3/3 Test #3: rx_rhi_vk_tests ..................   Passed    0.86 sec
++
++100% tests passed, 0 tests failed out of 3
++```
++Repeated 3x in a row (plus once more after the clean rebuild) with identical results — no flakiness observed. Direct run of `rx_rhi_vk_tests --order-by=suite --success` shows all 3 cases passing with 31/31 assertions, including `swapchainImages().size() == 4`, `swapchainFormat() == 50` (`VK_FORMAT_B8G8R8A8_SRGB`), `64x64` extent, and `!hasValidationErrors()` in every case. The only validation-layer output throughout is the pre-existing, documented `isKnownPortabilityEnumerationLayerBug` false positive (logged as a warning, not counted as an error) — confirmed this machine is genuinely running against a real display (`DISPLAY=:1`) and a real Vulkan 1.4 NVIDIA RTX 2080 driver (`vulkaninfo` confirms `apiVersion 1.4.312`, `DRIVER_ID_NVIDIA_PROPRIETARY`), not skipping.
++
++`cmake --build --preset windows-cross-zig` (clean, from a removed `build/windows-cross-zig`) — configures and builds all targets (including `rx_rhi_vk_tests.exe`) without errors.
++
++## Deviations from the brief, and why
++
++1. **vk-bootstrap process-wide function-pointer cache workaround** (see above) — not mentioned in the brief because the brief couldn't have anticipated a latent defect in the pinned dependency; discovered only by actually running the two new tests together with the pre-existing one. Addressed via explicit, documented test-suite ordering rather than any change to `Context`/`Device`'s production logic.
++2. Everything else matches the brief's assumed vk-bootstrap API exactly as checked against `VkBootstrap.h` at the pinned commit (`556b79b165386f6c1a18362d30f2a076fdaa2778`): the raw-handle `SwapchainBuilder(VkPhysicalDevice, VkDevice, VkSurfaceKHR, uint32_t = QUEUE_INDEX_MAX_VALUE, uint32_t = QUEUE_INDEX_MAX_VALUE)` constructor exists verbatim, `Device::get_queue`/`get_queue_index`, `Swapchain::get_images()`, `destroy_surface`/`destroy_device`/`destroy_swapchain`/`destroy_instance` all match what the brief assumed — no other adaptation was needed.
++
++## Self-review
++
++- Ownership/lifetime: verified by inspection and by the round-trip test's explicit teardown order (pool/fence/semaphores destroyed, then `vkDeviceWaitIdle`'d, before the `Device`/`Context` optionals go out of scope in reverse declaration order — `Device` before `Context`, so the surface is destroyed via a still-valid `VkInstance`).
++- Move semantics: `Device`'s move-assign is self-move-guarded and nulls every field of the moved-from object; `Context`'s Step A refactor keeps the exact same guard/teardown shape it had before, just through `vkb::destroy_instance`.
++- No leaks on failure paths in `Device::create`: each failure step destroys everything successfully created so far (traced through all 6 failure branches).
++- Zero validation errors confirmed on every test run, not just asserted in code.
++- Did not touch `.superpowers/sdd/.../progress.md`, `task-4-*`, `.claude/`, or other files touched by concurrent work in this repo — staged and committed only the files this task owns.
++
++## Concerns
++
++- The vk-bootstrap caching defect (above) is real and will resurface if: (a) a future test binary in this project ever builds a headless-then-windowed (or otherwise extension-mismatched) sequence of `vkb::Instance`s without the same `--order-by=suite` discipline, or (b) real runtime code (not just tests) ever recreates `rx::rhi::Context` with a different extension set mid-process. Worth a forward note for whoever designs device-lost/context-recreation handling.
++- `recreateSwapchain`'s surface parameter does not take ownership (per the brief's wording, which only discusses destroying the *old swapchain*, not the surface) — in the intended usage the same surface handle is passed back in on every call. This is documented on the header but is a slightly implicit contract worth double-checking against Task 3/4's actual call site once written.
+diff --git a/src/rx_rhi_vk/CMakeLists.txt b/src/rx_rhi_vk/CMakeLists.txt
+index d79cac6..bca157c 100644
+--- a/src/rx_rhi_vk/CMakeLists.txt
++++ b/src/rx_rhi_vk/CMakeLists.txt
+@@ -1,18 +1,31 @@
+ # volk_SOURCE_DIR is populated (and PARENT_SCOPE-propagated up to the root)
+ # by third_party/CMakeLists.txt's FetchContent_Populate(volk) call -- see the
+ # comment there for why it's Populate (source only) rather than
+ # MakeAvailable (which would also add_subdirectory volk's own CMakeLists.txt
+ # and its problematic `volk` target).
+ add_library(rx_rhi_vk STATIC
+     src/context.cpp
++    src/device.cpp
+     ${volk_SOURCE_DIR}/volk.c
+ )
+ target_include_directories(rx_rhi_vk PUBLIC include ${volk_SOURCE_DIR})
+ target_link_libraries(rx_rhi_vk PUBLIC rx_core vk-bootstrap::vk-bootstrap)
+ target_compile_definitions(rx_rhi_vk PUBLIC VK_NO_PROTOTYPES)
+ 
++# Two test translation units now (context_test.cpp, device_test.cpp), so --
++# like rx_core_tests, and unlike this target before device_test.cpp existed
++# -- doctest's runtime/main is implemented once in a dedicated
++# tests/doctest_main.cpp shared by both, rather than in either test file.
+ add_executable(rx_rhi_vk_tests
++    tests/doctest_main.cpp
+     tests/context_test.cpp
++    tests/device_test.cpp
+ )
+-target_link_libraries(rx_rhi_vk_tests PRIVATE rx_rhi_vk doctest::doctest)
+-add_test(NAME rx_rhi_vk_tests COMMAND rx_rhi_vk_tests)
++target_link_libraries(rx_rhi_vk_tests PRIVATE rx_rhi_vk rx_platform doctest::doctest)
++
++# --order-by=suite (rather than doctest's own default, "file", which would
++# sort context_test.cpp's test before device_test.cpp's alphabetically) is
++# required here, not cosmetic: see the comment on context_test.cpp's
++# TEST_CASE for the vk-bootstrap process-wide function-pointer cache defect
++# this ordering works around.
++add_test(NAME rx_rhi_vk_tests COMMAND rx_rhi_vk_tests --order-by=suite)
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/context.h b/src/rx_rhi_vk/include/rx_rhi_vk/context.h
+index ebbc7cf..14c3eae 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/context.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/context.h
+@@ -1,32 +1,36 @@
+ #pragma once
+ #include <volk.h>
++// vkb::Instance is stored by value below, so its full definition is
++// required here -- a forward declaration is not possible for a by-value
++// member.
++#include <VkBootstrap.h>
+ #include <memory>
+ #include <optional>
+ #include <vector>
+ 
+ namespace rx::rhi {
+ 
+ class Context {
+ public:
+     Context(Context&&) noexcept;
+     Context& operator=(Context&&) noexcept;
+     Context(const Context&) = delete;
+     Context& operator=(const Context&) = delete;
+     ~Context();
+ 
+     static std::optional<Context> create(std::vector<const char*> requiredExtensions, bool enableValidation);
+ 
+-    VkInstance instance() const { return instance_; }
+-    VkDebugUtilsMessengerEXT debugMessenger() const { return debugMessenger_; }
++    VkInstance instance() const { return vkbInstance_.instance; }
++    VkDebugUtilsMessengerEXT debugMessenger() const { return vkbInstance_.debug_messenger; }
++    const vkb::Instance& vkbInstance() const { return vkbInstance_; }
+     bool hasValidationErrors() const { return *errorCount_ > 0; }
+ 
+ private:
+-    Context(VkInstance instance, VkDebugUtilsMessengerEXT messenger, std::shared_ptr<int> errorCount)
+-        : instance_(instance), debugMessenger_(messenger), errorCount_(std::move(errorCount)) {}
++    Context(vkb::Instance vkbInstance, std::shared_ptr<int> errorCount)
++        : vkbInstance_(std::move(vkbInstance)), errorCount_(std::move(errorCount)) {}
+ 
+-    VkInstance instance_ = VK_NULL_HANDLE;
+-    VkDebugUtilsMessengerEXT debugMessenger_ = VK_NULL_HANDLE;
++    vkb::Instance vkbInstance_{};
+     std::shared_ptr<int> errorCount_;
+ };
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/device.h b/src/rx_rhi_vk/include/rx_rhi_vk/device.h
+new file mode 100644
+index 0000000..e31dd85
+--- /dev/null
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/device.h
+@@ -0,0 +1,87 @@
++#pragma once
++#include <rx_rhi_vk/context.h>
++#include <cstdint>
++#include <optional>
++#include <vector>
++
++namespace rx::rhi {
++
++enum class SwapchainStatus {
++    Ok,
++    NeedsRecreate,
++    DeviceLost,
++};
++
++struct AcquireResult {
++    SwapchainStatus status;
++    uint32_t imageIndex;
++};
++
++// Device owns the logical VkDevice selected/built against a Context's
++// vkb::Instance, its graphics and present queues, and a VkSwapchainKHR built
++// against a caller-provided VkSurfaceKHR.
++//
++// Device::create() takes ownership of the VkSurfaceKHR passed to it,
++// unconditionally: on success the returned Device owns and destroys it
++// (together with the swapchain and device) on destruction or move-assign;
++// on failure Device::create destroys the surface itself before returning
++// std::nullopt. Either way, the caller must not destroy that surface handle
++// itself once create() has been called with it.
++class Device {
++public:
++    Device(Device&&) noexcept;
++    Device& operator=(Device&&) noexcept;
++    Device(const Device&) = delete;
++    Device& operator=(const Device&) = delete;
++    ~Device();
++
++    static std::optional<Device> create(Context& context, VkSurfaceKHR surface);
++
++    VkPhysicalDevice physicalDevice() const { return physicalDevice_; }
++    VkDevice device() const { return device_; }
++    VkQueue graphicsQueue() const { return graphicsQueue_; }
++    uint32_t graphicsQueueFamily() const { return graphicsQueueFamily_; }
++    VkQueue presentQueue() const { return presentQueue_; }
++    VkSwapchainKHR swapchain() const { return swapchain_; }
++    const std::vector<VkImage>& swapchainImages() const { return swapchainImages_; }
++    VkFormat swapchainFormat() const { return swapchainFormat_; }
++    VkExtent2D swapchainExtent() const { return swapchainExtent_; }
++
++    // Acquires the next available swapchain image, signaling `signal` once
++    // it is safe to render into it. VK_SUBOPTIMAL_KHR is treated as success
++    // here: the image is still valid to render into and present, so
++    // recreation is deferred to present()'s return value instead.
++    AcquireResult acquireNextImage(VkSemaphore signal);
++
++    // Presents `imageIndex`, waiting on `wait` first unless it is
++    // VK_NULL_HANDLE.
++    SwapchainStatus present(uint32_t imageIndex, VkSemaphore wait);
++
++    // Waits for the device to go idle, destroys the current swapchain, and
++    // rebuilds it against `surface` (refreshing images/format/extent).
++    // Does not take ownership of `surface` and does not touch the surface
++    // this Device already owns; in the expected usage the same surface
++    // handle is passed again on every call.
++    bool recreateSwapchain(VkSurfaceKHR surface);
++
++private:
++    Device() = default;
++
++    void destroyAll();
++
++    VkInstance instance_ = VK_NULL_HANDLE;
++    VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
++    VkDevice device_ = VK_NULL_HANDLE;
++    VkSurfaceKHR surface_ = VK_NULL_HANDLE;
++
++    VkQueue graphicsQueue_ = VK_NULL_HANDLE;
++    uint32_t graphicsQueueFamily_ = 0;
++    VkQueue presentQueue_ = VK_NULL_HANDLE;
++
++    VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
++    std::vector<VkImage> swapchainImages_;
++    VkFormat swapchainFormat_ = VK_FORMAT_UNDEFINED;
++    VkExtent2D swapchainExtent_{0, 0};
++};
++
++}  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/context.cpp b/src/rx_rhi_vk/src/context.cpp
+index 79f88a9..dcf5b28 100644
+--- a/src/rx_rhi_vk/src/context.cpp
++++ b/src/rx_rhi_vk/src/context.cpp
+@@ -89,46 +89,39 @@ std::optional<Context> Context::create(std::vector<const char*> requiredExtensio
+ 
+     auto result = builder.build();
+     if (!result) {
+         RX_LOG_ERROR("vkb::InstanceBuilder::build failed: {}", result.error().message());
+         return std::nullopt;
+     }
+ 
+     vkb::Instance vkbInstance = result.value();
+     volkLoadInstance(vkbInstance.instance);
+ 
+-    return Context(vkbInstance.instance, vkbInstance.debug_messenger, errorCount);
++    return Context(std::move(vkbInstance), errorCount);
+ }
+ 
+ Context::Context(Context&& other) noexcept
+-    : instance_(other.instance_), debugMessenger_(other.debugMessenger_), errorCount_(std::move(other.errorCount_)) {
+-    other.instance_ = VK_NULL_HANDLE;
+-    other.debugMessenger_ = VK_NULL_HANDLE;
++    : vkbInstance_(std::move(other.vkbInstance_)), errorCount_(std::move(other.errorCount_)) {
++    other.vkbInstance_.instance = VK_NULL_HANDLE;
+ }
+ 
+ Context& Context::operator=(Context&& other) noexcept {
+     if (this != &other) {
+-        if (instance_ != VK_NULL_HANDLE) {
+-            if (debugMessenger_ != VK_NULL_HANDLE) {
+-                vkb::destroy_debug_utils_messenger(instance_, debugMessenger_);
+-            }
+-            vkDestroyInstance(instance_, nullptr);
++        if (vkbInstance_.instance != VK_NULL_HANDLE) {
++            // destroy_instance() tears down both the debug messenger (if
++            // any) and the instance itself, in that order.
++            vkb::destroy_instance(vkbInstance_);
+         }
+-        instance_ = other.instance_;
+-        debugMessenger_ = other.debugMessenger_;
++        vkbInstance_ = std::move(other.vkbInstance_);
+         errorCount_ = std::move(other.errorCount_);
+-        other.instance_ = VK_NULL_HANDLE;
+-        other.debugMessenger_ = VK_NULL_HANDLE;
++        other.vkbInstance_.instance = VK_NULL_HANDLE;
+     }
+     return *this;
+ }
+ 
+ Context::~Context() {
+-    if (instance_ != VK_NULL_HANDLE) {
+-        if (debugMessenger_ != VK_NULL_HANDLE) {
+-            vkb::destroy_debug_utils_messenger(instance_, debugMessenger_);
+-        }
+-        vkDestroyInstance(instance_, nullptr);
++    if (vkbInstance_.instance != VK_NULL_HANDLE) {
++        vkb::destroy_instance(vkbInstance_);
+     }
+ }
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/device.cpp b/src/rx_rhi_vk/src/device.cpp
+new file mode 100644
+index 0000000..21528d3
+--- /dev/null
++++ b/src/rx_rhi_vk/src/device.cpp
+@@ -0,0 +1,228 @@
++#include <rx_rhi_vk/device.h>
++#include <rx_core/log.h>
++#include <VkBootstrap.h>
++#include <utility>
++
++namespace rx::rhi {
++
++namespace {
++
++void destroySurface(const Context& context, VkSurfaceKHR surface) {
++    vkb::destroy_surface(context.vkbInstance(), surface);
++}
++
++}  // namespace
++
++std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
++    VkPhysicalDeviceVulkan13Features features13{};
++    features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
++    features13.dynamicRendering = VK_TRUE;
++    features13.synchronization2 = VK_TRUE;
++
++    vkb::PhysicalDeviceSelector selector(context.vkbInstance());
++    auto physResult = selector.set_surface(surface)
++                          .set_minimum_version(1, 3)
++                          .set_required_features_13(features13)
++                          .select();
++    if (!physResult) {
++        RX_LOG_ERROR("vkb::PhysicalDeviceSelector::select failed: {}", physResult.error().message());
++        destroySurface(context, surface);
++        return std::nullopt;
++    }
++
++    auto deviceResult = vkb::DeviceBuilder(physResult.value()).build();
++    if (!deviceResult) {
++        RX_LOG_ERROR("vkb::DeviceBuilder::build failed: {}", deviceResult.error().message());
++        destroySurface(context, surface);
++        return std::nullopt;
++    }
++    vkb::Device vkbDevice = deviceResult.value();
++    volkLoadDevice(vkbDevice.device);
++
++    auto graphicsQueueResult = vkbDevice.get_queue(vkb::QueueType::graphics);
++    if (!graphicsQueueResult) {
++        RX_LOG_ERROR("vkb::Device::get_queue(graphics) failed: {}", graphicsQueueResult.error().message());
++        vkb::destroy_device(vkbDevice);
++        destroySurface(context, surface);
++        return std::nullopt;
++    }
++
++    auto graphicsQueueIndexResult = vkbDevice.get_queue_index(vkb::QueueType::graphics);
++    if (!graphicsQueueIndexResult) {
++        RX_LOG_ERROR("vkb::Device::get_queue_index(graphics) failed: {}", graphicsQueueIndexResult.error().message());
++        vkb::destroy_device(vkbDevice);
++        destroySurface(context, surface);
++        return std::nullopt;
++    }
++
++    auto presentQueueResult = vkbDevice.get_queue(vkb::QueueType::present);
++    if (!presentQueueResult) {
++        RX_LOG_ERROR("vkb::Device::get_queue(present) failed: {}", presentQueueResult.error().message());
++        vkb::destroy_device(vkbDevice);
++        destroySurface(context, surface);
++        return std::nullopt;
++    }
++
++    vkb::SwapchainBuilder swapchainBuilder(vkbDevice, surface);
++    auto swapchainResult = swapchainBuilder.build();
++    if (!swapchainResult) {
++        RX_LOG_ERROR("vkb::SwapchainBuilder::build failed: {}", swapchainResult.error().message());
++        vkb::destroy_device(vkbDevice);
++        destroySurface(context, surface);
++        return std::nullopt;
++    }
++    vkb::Swapchain vkbSwapchain = swapchainResult.value();
++
++    auto imagesResult = vkbSwapchain.get_images();
++    if (!imagesResult) {
++        RX_LOG_ERROR("vkb::Swapchain::get_images failed: {}", imagesResult.error().message());
++        vkb::destroy_swapchain(vkbSwapchain);
++        vkb::destroy_device(vkbDevice);
++        destroySurface(context, surface);
++        return std::nullopt;
++    }
++
++    Device dev;
++    dev.instance_ = context.instance();
++    dev.physicalDevice_ = vkbDevice.physical_device.physical_device;
++    dev.device_ = vkbDevice.device;
++    dev.surface_ = surface;
++    dev.graphicsQueue_ = graphicsQueueResult.value();
++    dev.graphicsQueueFamily_ = graphicsQueueIndexResult.value();
++    dev.presentQueue_ = presentQueueResult.value();
++    dev.swapchain_ = vkbSwapchain.swapchain;
++    dev.swapchainImages_ = imagesResult.value();
++    dev.swapchainFormat_ = vkbSwapchain.image_format;
++    dev.swapchainExtent_ = vkbSwapchain.extent;
++    return dev;
++}
++
++Device::Device(Device&& other) noexcept : Device() {
++    *this = std::move(other);
++}
++
++Device& Device::operator=(Device&& other) noexcept {
++    if (this != &other) {
++        destroyAll();
++
++        instance_ = other.instance_;
++        physicalDevice_ = other.physicalDevice_;
++        device_ = other.device_;
++        surface_ = other.surface_;
++        graphicsQueue_ = other.graphicsQueue_;
++        graphicsQueueFamily_ = other.graphicsQueueFamily_;
++        presentQueue_ = other.presentQueue_;
++        swapchain_ = other.swapchain_;
++        swapchainImages_ = std::move(other.swapchainImages_);
++        swapchainFormat_ = other.swapchainFormat_;
++        swapchainExtent_ = other.swapchainExtent_;
++
++        other.instance_ = VK_NULL_HANDLE;
++        other.physicalDevice_ = VK_NULL_HANDLE;
++        other.device_ = VK_NULL_HANDLE;
++        other.surface_ = VK_NULL_HANDLE;
++        other.graphicsQueue_ = VK_NULL_HANDLE;
++        other.graphicsQueueFamily_ = 0;
++        other.presentQueue_ = VK_NULL_HANDLE;
++        other.swapchain_ = VK_NULL_HANDLE;
++        other.swapchainImages_.clear();
++        other.swapchainFormat_ = VK_FORMAT_UNDEFINED;
++        other.swapchainExtent_ = VkExtent2D{0, 0};
++    }
++    return *this;
++}
++
++Device::~Device() {
++    destroyAll();
++}
++
++void Device::destroyAll() {
++    if (swapchain_ != VK_NULL_HANDLE) {
++        vkDestroySwapchainKHR(device_, swapchain_, nullptr);
++    }
++    if (device_ != VK_NULL_HANDLE) {
++        vkDestroyDevice(device_, nullptr);
++    }
++    if (surface_ != VK_NULL_HANDLE) {
++        vkDestroySurfaceKHR(instance_, surface_, nullptr);
++    }
++}
++
++AcquireResult Device::acquireNextImage(VkSemaphore signal) {
++    uint32_t imageIndex = 0;
++    VkResult result = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, signal, VK_NULL_HANDLE, &imageIndex);
++    switch (result) {
++        case VK_SUCCESS:
++        case VK_SUBOPTIMAL_KHR:
++            return AcquireResult{SwapchainStatus::Ok, imageIndex};
++        case VK_ERROR_OUT_OF_DATE_KHR:
++            return AcquireResult{SwapchainStatus::NeedsRecreate, 0};
++        case VK_ERROR_DEVICE_LOST:
++            RX_LOG_ERROR("vkAcquireNextImageKHR: device lost");
++            return AcquireResult{SwapchainStatus::DeviceLost, 0};
++        default:
++            RX_LOG_ERROR("vkAcquireNextImageKHR failed: VkResult={}", static_cast<int>(result));
++            return AcquireResult{SwapchainStatus::NeedsRecreate, 0};
++    }
++}
++
++SwapchainStatus Device::present(uint32_t imageIndex, VkSemaphore wait) {
++    VkPresentInfoKHR presentInfo{};
++    presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
++    if (wait != VK_NULL_HANDLE) {
++        presentInfo.waitSemaphoreCount = 1;
++        presentInfo.pWaitSemaphores = &wait;
++    }
++    presentInfo.swapchainCount = 1;
++    presentInfo.pSwapchains = &swapchain_;
++    presentInfo.pImageIndices = &imageIndex;
++
++    VkResult result = vkQueuePresentKHR(presentQueue_, &presentInfo);
++    switch (result) {
++        case VK_SUCCESS:
++            return SwapchainStatus::Ok;
++        case VK_ERROR_OUT_OF_DATE_KHR:
++        case VK_SUBOPTIMAL_KHR:
++            return SwapchainStatus::NeedsRecreate;
++        case VK_ERROR_DEVICE_LOST:
++            RX_LOG_ERROR("vkQueuePresentKHR: device lost");
++            return SwapchainStatus::DeviceLost;
++        default:
++            RX_LOG_ERROR("vkQueuePresentKHR failed: VkResult={}", static_cast<int>(result));
++            return SwapchainStatus::NeedsRecreate;
++    }
++}
++
++bool Device::recreateSwapchain(VkSurfaceKHR surface) {
++    vkDeviceWaitIdle(device_);
++
++    if (swapchain_ != VK_NULL_HANDLE) {
++        vkDestroySwapchainKHR(device_, swapchain_, nullptr);
++        swapchain_ = VK_NULL_HANDLE;
++    }
++    swapchainImages_.clear();
++
++    vkb::SwapchainBuilder swapchainBuilder(physicalDevice_, device_, surface);
++    auto swapchainResult = swapchainBuilder.build();
++    if (!swapchainResult) {
++        RX_LOG_ERROR("vkb::SwapchainBuilder::build failed during recreate: {}", swapchainResult.error().message());
++        return false;
++    }
++    vkb::Swapchain vkbSwapchain = swapchainResult.value();
++
++    auto imagesResult = vkbSwapchain.get_images();
++    if (!imagesResult) {
++        RX_LOG_ERROR("vkb::Swapchain::get_images failed during recreate: {}", imagesResult.error().message());
++        vkb::destroy_swapchain(vkbSwapchain);
++        return false;
++    }
++
++    swapchain_ = vkbSwapchain.swapchain;
++    swapchainImages_ = imagesResult.value();
++    swapchainFormat_ = vkbSwapchain.image_format;
++    swapchainExtent_ = vkbSwapchain.extent;
++    surface_ = surface;
++    return true;
++}
++
++}  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/tests/context_test.cpp b/src/rx_rhi_vk/tests/context_test.cpp
+index 6a09649..fe9b1dd 100644
+--- a/src/rx_rhi_vk/tests/context_test.cpp
++++ b/src/rx_rhi_vk/tests/context_test.cpp
+@@ -1,14 +1,32 @@
+-// This is the only test translation unit in rx_rhi_vk_tests (unlike
+-// rx_core_tests, which shares a separate tests/doctest_main.cpp across
+-// several test files), so it both implements doctest's runtime and
+-// provides main() directly.
+-#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+ #include <doctest/doctest.h>
+ #include <rx_rhi_vk/context.h>
+ 
+-TEST_CASE("Context::create succeeds with no required extensions and reports no validation errors") {
++// This test case is pinned to a test suite that sorts after device_test.cpp's
++// (unnamed, i.e. "") suite under --order-by=suite (set for this whole binary
++// in CMakeLists.txt) so that it always runs *after* device_test.cpp's
++// windowed Device::create() tests within this one process. That ordering is
++// not cosmetic: it works around a confirmed defect in the pinned
++// vk-bootstrap commit (556b79b165386f6c1a18362d30f2a076fdaa2778).
++// vk-bootstrap resolves instance-level function pointers (detail::
++// vulkan_functions() in VkBootstrap.cpp) into a process-wide singleton that
++// is populated from the *first* vkb::Instance ever built in the process and
++// is then permanently reused -- init_instance_funcs() no-ops on every later
++// call, and nothing in vk-bootstrap's public API resets it. This test
++// builds Context::create({}, true), i.e. headless=true, so vk-bootstrap
++// never enables VK_KHR_surface on it; if this ran first, every later
++// PhysicalDeviceSelector::select() in the process (used by
++// Device::create()) would inherit a null fp_vkGetPhysicalDeviceSurfaceSupportKHR
++// cached from this instance and crash the moment it needs to check present
++// support (confirmed via gdb: SIGSEGV in vkb::detail::get_present_queue_index,
++// VkBootstrap.cpp:1103, called from PhysicalDeviceSelector::is_device_suitable).
++// Running the windowed Device tests first instead means the process-wide
++// cache is warmed up with real, valid surface function pointers before this
++// headless test ever runs, and this test's own behavior/assertions are
++// otherwise unchanged from Task 6.
++TEST_CASE("Context::create succeeds with no required extensions and reports no validation errors" *
++          doctest::test_suite("zz_run_after_windowed_device_tests")) {
+     auto ctx = rx::rhi::Context::create({}, /*enableValidation=*/true);
+     REQUIRE(ctx.has_value());
+     CHECK(ctx->instance() != VK_NULL_HANDLE);
+     CHECK_FALSE(ctx->hasValidationErrors());
+ }
+diff --git a/src/rx_rhi_vk/tests/device_test.cpp b/src/rx_rhi_vk/tests/device_test.cpp
+new file mode 100644
+index 0000000..e5e71f7
+--- /dev/null
++++ b/src/rx_rhi_vk/tests/device_test.cpp
+@@ -0,0 +1,169 @@
++#include <doctest/doctest.h>
++#include <rx_rhi_vk/device.h>
++#include <rx_platform/window.h>
++#include <cstdint>
++#include <optional>
++#include <utility>
++
++namespace {
++
++// Shared setup for both test cases below: a hidden window, a validated
++// Context built from that window's required instance extensions, and the
++// VkSurfaceKHR to hand to Device::create(). Returns an empty optional (with
++// a MESSAGE explaining why) if this machine's video/Vulkan backend can't
++// support it -- mirroring rx_platform's own window_test.cpp skip-guard
++// pattern -- but on a machine with a real display and driver this must
++// actually produce a value, never silently skip.
++struct DeviceTestFixture {
++    rx::platform::Window window;
++    rx::rhi::Context context;
++    VkSurfaceKHR surface;
++};
++
++std::optional<DeviceTestFixture> makeFixture(const char* title) {
++    auto window = rx::platform::Window::create(title, 64, 64, /*visible=*/false);
++    if (!window.has_value()) {
++        MESSAGE("no display backend available, skipping Device test");
++        return std::nullopt;
++    }
++
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        MESSAGE("video driver reports no Vulkan surface extensions (e.g. dummy driver), skipping Device test");
++        return std::nullopt;
++    }
++
++    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++
++    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
++    REQUIRE(surface != VK_NULL_HANDLE);
++
++    return DeviceTestFixture{std::move(*window), std::move(*context), surface};
++}
++
++}  // namespace
++
++TEST_CASE("Device::create builds device, queues, and swapchain against a real surface") {
++    auto fixture = makeFixture("rx_rhi_vk_device_test_create");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto device = rx::rhi::Device::create(fixture->context, fixture->surface);
++    REQUIRE(device.has_value());
++
++    CHECK(device->physicalDevice() != VK_NULL_HANDLE);
++    CHECK(device->device() != VK_NULL_HANDLE);
++    CHECK(device->graphicsQueue() != VK_NULL_HANDLE);
++    CHECK(device->presentQueue() != VK_NULL_HANDLE);
++    CHECK(device->swapchain() != VK_NULL_HANDLE);
++    CHECK(device->swapchainImages().size() > 0);
++    CHECK(device->swapchainFormat() != VK_FORMAT_UNDEFINED);
++    CHECK(device->swapchainExtent().width > 0);
++    CHECK(device->swapchainExtent().height > 0);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("Device acquire/present round-trip succeeds without device loss") {
++    auto fixture = makeFixture("rx_rhi_vk_device_test_roundtrip");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto device = rx::rhi::Device::create(fixture->context, fixture->surface);
++    REQUIRE(device.has_value());
++
++    VkDevice vkDevice = device->device();
++
++    VkSemaphoreCreateInfo semaphoreInfo{};
++    semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
++    VkSemaphore acquireSemaphore = VK_NULL_HANDLE;
++    VkSemaphore renderFinishedSemaphore = VK_NULL_HANDLE;
++    REQUIRE(vkCreateSemaphore(vkDevice, &semaphoreInfo, nullptr, &acquireSemaphore) == VK_SUCCESS);
++    REQUIRE(vkCreateSemaphore(vkDevice, &semaphoreInfo, nullptr, &renderFinishedSemaphore) == VK_SUCCESS);
++
++    VkFenceCreateInfo fenceInfo{};
++    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
++    VkFence submitFence = VK_NULL_HANDLE;
++    REQUIRE(vkCreateFence(vkDevice, &fenceInfo, nullptr, &submitFence) == VK_SUCCESS);
++
++    // Throwaway command pool/buffer, local to this test: the shared
++    // CommandContext arrives in a later task, and this test is meant to
++    // stay self-contained until then.
++    VkCommandPoolCreateInfo poolInfo{};
++    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
++    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
++    poolInfo.queueFamilyIndex = device->graphicsQueueFamily();
++    VkCommandPool commandPool = VK_NULL_HANDLE;
++    REQUIRE(vkCreateCommandPool(vkDevice, &poolInfo, nullptr, &commandPool) == VK_SUCCESS);
++
++    VkCommandBufferAllocateInfo cmdAllocInfo{};
++    cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
++    cmdAllocInfo.commandPool = commandPool;
++    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++    cmdAllocInfo.commandBufferCount = 1;
++    VkCommandBuffer cmd = VK_NULL_HANDLE;
++    REQUIRE(vkAllocateCommandBuffers(vkDevice, &cmdAllocInfo, &cmd) == VK_SUCCESS);
++
++    auto acquire = device->acquireNextImage(acquireSemaphore);
++    REQUIRE(acquire.status == rx::rhi::SwapchainStatus::Ok);
++
++    VkCommandBufferBeginInfo beginInfo{};
++    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++    REQUIRE(vkBeginCommandBuffer(cmd, &beginInfo) == VK_SUCCESS);
++
++    // No rendering happens in this test -- just the mandatory
++    // UNDEFINED -> PRESENT_SRC_KHR layout transition every acquired image
++    // needs before it can be presented.
++    VkImageMemoryBarrier barrier{};
++    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++    barrier.srcAccessMask = 0;
++    barrier.dstAccessMask = 0;
++    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
++    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barrier.image = device->swapchainImages()[acquire.imageIndex];
++    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    barrier.subresourceRange.baseMipLevel = 0;
++    barrier.subresourceRange.levelCount = 1;
++    barrier.subresourceRange.baseArrayLayer = 0;
++    barrier.subresourceRange.layerCount = 1;
++
++    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
++                         nullptr, 0, nullptr, 1, &barrier);
++
++    REQUIRE(vkEndCommandBuffer(cmd) == VK_SUCCESS);
++
++    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++    VkSubmitInfo submitInfo{};
++    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
++    submitInfo.waitSemaphoreCount = 1;
++    submitInfo.pWaitSemaphores = &acquireSemaphore;
++    submitInfo.pWaitDstStageMask = &waitStage;
++    submitInfo.commandBufferCount = 1;
++    submitInfo.pCommandBuffers = &cmd;
++    submitInfo.signalSemaphoreCount = 1;
++    submitInfo.pSignalSemaphores = &renderFinishedSemaphore;
++
++    REQUIRE(vkQueueSubmit(device->graphicsQueue(), 1, &submitInfo, submitFence) == VK_SUCCESS);
++    REQUIRE(vkWaitForFences(vkDevice, 1, &submitFence, VK_TRUE, UINT64_MAX) == VK_SUCCESS);
++
++    auto presentStatus = device->present(acquire.imageIndex, renderFinishedSemaphore);
++    CHECK(presentStatus != rx::rhi::SwapchainStatus::DeviceLost);
++
++    // Never destroy a semaphore the presentation engine might still be
++    // consuming without an idle/fence guarantee first: the fence wait above
++    // only covers the submit, not the present, so wait for the device to go
++    // fully idle before tearing down.
++    vkDeviceWaitIdle(vkDevice);
++
++    vkDestroyCommandPool(vkDevice, commandPool, nullptr);
++    vkDestroyFence(vkDevice, submitFence, nullptr);
++    vkDestroySemaphore(vkDevice, renderFinishedSemaphore, nullptr);
++    vkDestroySemaphore(vkDevice, acquireSemaphore, nullptr);
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/src/rx_rhi_vk/tests/doctest_main.cpp b/src/rx_rhi_vk/tests/doctest_main.cpp
+new file mode 100644
+index 0000000..0a3f254
+--- /dev/null
++++ b/src/rx_rhi_vk/tests/doctest_main.cpp
+@@ -0,0 +1,2 @@
++#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
++#include <doctest/doctest.h>
