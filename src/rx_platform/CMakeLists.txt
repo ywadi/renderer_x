@@ -1,12 +1,10 @@
-# Vulkan::Headers comes from third_party/CMakeLists.txt's plain FetchContent
-# of KhronosGroup/Vulkan-Headers (a regular, non-imported CMake target, so
-# -- unlike the imported targets from find_package()/dependency-cache
-# installs elsewhere in this project -- it is already visible here without
-# any IMPORTED_GLOBAL promotion). Deliberately NOT find_package(Vulkan):
-# that would additionally require locating the platform's Vulkan loader
-# import library, which this project never links against (see comment in
-# third_party/CMakeLists.txt) and which does not exist when cross-compiling
-# to Windows on a Linux host.
+# Vulkan::Headers comes from third_party/CMakeLists.txt's dependency-cache
+# install of KhronosGroup/Vulkan-Headers, found via find_package(VulkanHeaders
+# CONFIG ...) and promoted to IMPORTED_GLOBAL there so it's visible here.
+# Deliberately NOT found via find_package(Vulkan): that would additionally
+# require locating the platform's Vulkan loader import library, which this
+# project never links against (see comment in third_party/CMakeLists.txt)
+# and which does not exist when cross-compiling to Windows on a Linux host.
 
 add_library(rx_platform STATIC
     src/window.cpp
