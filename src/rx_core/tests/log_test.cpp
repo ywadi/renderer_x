@@ -22,5 +22,14 @@ TEST_CASE("RX_LOG_INFO writes the formatted message through spdlog's default log
     RX_LOG_INFO("hello {}", 42);
 
     spdlog::set_default_logger(previousDefault);
-    CHECK(capture.str() == "hello 42\n");
+
+    // Windows spdlog terminates each formatted line with "\r\n"; Linux
+    // spdlog uses a bare "\n". Strip both trailing characters before
+    // comparing so this assertion is portable across native Linux and
+    // Wine-hosted Windows builds alike.
+    std::string captured = capture.str();
+    while (!captured.empty() && (captured.back() == '\n' || captured.back() == '\r')) {
+        captured.pop_back();
+    }
+    CHECK(captured == "hello 42");
 }
