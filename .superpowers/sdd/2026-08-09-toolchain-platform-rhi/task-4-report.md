@@ -240,8 +240,8 @@ Add rx_core: logging, generational handles, GLM math
   * handle test validates acquire/release lifecycle and generation invalidation
   * math test verifies GLM vector operations with doctest::Approx
 
-Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01PF6tHc9AJvYUKV3aTBMpvf
+[attribution trailer redacted per repository policy — see CLAUDE.md]
+[session link redacted per repository policy]
 ```
 
 ## Readiness for Next Task
