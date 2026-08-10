@@ -24,6 +24,7 @@ add_library(rx_rhi_vk STATIC
     src/deletion_queue.cpp
     src/texture.cpp
     src/mesh_buffers.cpp
+    src/descriptor_arena.cpp
     src/vma_impl.cpp
     src/stb_impl.cpp
     ${volk_SOURCE_DIR}/volk.c
@@ -39,25 +40,26 @@ target_include_directories(rx_rhi_vk PUBLIC include ${volk_SOURCE_DIR} ${vma_SOU
 target_link_libraries(rx_rhi_vk PUBLIC rx_core vk-bootstrap::vk-bootstrap rx_shader_layout_types)
 target_compile_definitions(rx_rhi_vk PUBLIC VK_NO_PROTOTYPES)
 
-# Ten test translation units now (context_test.cpp, device_test.cpp,
+# Eleven test translation units now (context_test.cpp, device_test.cpp,
 # buffer_test.cpp, clear_color_test.cpp, frame_sync_test.cpp,
 # pipeline_layout_test.cpp, bindless_test.cpp, upload_test.cpp,
-# deletion_queue_test.cpp, texture_test.cpp), so -- like rx_core_tests,
-# and unlike this target before device_test.cpp existed -- doctest's
-# runtime/main is implemented once in a dedicated tests/doctest_main.cpp
-# shared by all ten, rather than in any one test file. doctest_main.cpp
-# also links rx_platform: it uses rx::platform::Window to warm up a real
-# vk-bootstrap hazard before any TEST_CASE runs (see the comment there) --
-# so test order here is not load-bearing, deliberately; no --order-by is
-# needed on the add_test line below. clear_color_test.cpp,
-# pipeline_layout_test.cpp, bindless_test.cpp, and deletion_queue_test.cpp
-# in particular are pure headless (no window/surface/swapchain) and rely
-# on that warm-up to be safe regardless of where doctest schedules them
-# relative to the windowed tests -- see the Phase 2 plan's Global
-# Constraints on the vk-bootstrap landmine: pipeline_layout_test.cpp,
-# bindless_test.cpp, and deletion_queue_test.cpp each build their own
-# headless device, and joining THIS binary rather than a new one is what
-# keeps them protected by the warm-up above instead of needing to
+# deletion_queue_test.cpp, texture_test.cpp, descriptor_arena_test.cpp), so
+# -- like rx_core_tests, and unlike this target before device_test.cpp
+# existed -- doctest's runtime/main is implemented once in a dedicated
+# tests/doctest_main.cpp shared by all eleven, rather than in any one test
+# file. doctest_main.cpp also links rx_platform: it uses rx::platform::Window
+# to warm up a real vk-bootstrap hazard before any TEST_CASE runs (see the
+# comment there) -- so test order here is not load-bearing, deliberately; no
+# --order-by is needed on the add_test line below. clear_color_test.cpp,
+# pipeline_layout_test.cpp, bindless_test.cpp, deletion_queue_test.cpp, and
+# descriptor_arena_test.cpp in particular are pure headless (no window/
+# surface/swapchain) and rely on that warm-up to be safe regardless of where
+# doctest schedules them relative to the windowed tests -- see the Phase 2
+# plan's Global Constraints on the vk-bootstrap landmine:
+# pipeline_layout_test.cpp, bindless_test.cpp, deletion_queue_test.cpp, and
+# descriptor_arena_test.cpp each build their own headless device, and joining
+# THIS binary rather than a new one is what keeps them protected by the
+# warm-up above instead of needing to
 # reimplement it. upload_test.cpp/texture_test.cpp are windowed (Uploader::
 # create() needs a real rx::rhi::Device&), skip-guarded exactly like
 # buffer_test.cpp/device_test.cpp on a display-less machine.
@@ -73,6 +75,7 @@ add_executable(rx_rhi_vk_tests
     tests/upload_test.cpp
     tests/deletion_queue_test.cpp
     tests/texture_test.cpp
+    tests/descriptor_arena_test.cpp
 )
 target_link_libraries(rx_rhi_vk_tests PRIVATE rx_rhi_vk rx_platform doctest::doctest)
 add_test(NAME rx_rhi_vk_tests COMMAND rx_rhi_vk_tests)

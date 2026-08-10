@@ -18,6 +18,9 @@ static_assert(sizeof(RxGuid) == 16, "rx_api.h's own pinned RxGuid size -- re-che
                                      "TU actually exercises the type, not just names it");
 static_assert(sizeof(RxMaterialSystemDesc) == sizeof(void*),
               "rx_api.h's own pinned RxMaterialSystemDesc size -- re-checked here for the same reason");
+// [Task 7] RxTextureDesc's own pinned size -- same re-check discipline.
+static_assert(sizeof(RxTextureDesc) == 32, "rx_api.h's own pinned RxTextureDesc size -- re-checked here for the "
+                                            "same reason");
 
 namespace {
 
@@ -41,5 +44,15 @@ using MaterialSystemPtr = IRxMaterialSystem*;
 
 using FactoryFn = RxResult (*)(const RxMaterialSystemDesc*, IRxMaterialSystem**);
 [[maybe_unused]] constexpr FactoryFn kFactory = &rxCreateMaterialSystem;
+
+// [Task 7] RxTextureDesc/RxFormat/IRxMaterialSystem::createTexture2D --
+// named here too, for the identical "cannot be quietly defeated by an
+// otherwise-unreferenced declaration" reason this file's own header
+// comment states.
+[[maybe_unused]] RxTextureDesc kUnusedTextureDesc{};
+[[maybe_unused]] constexpr RxFormat kUnormFormat = RX_FORMAT_RGBA8_UNORM;
+[[maybe_unused]] constexpr RxFormat kSrgbFormat = RX_FORMAT_RGBA8_SRGB;
+using CreateTexture2DFn = RxResult (IRxMaterialSystem::*)(const RxTextureDesc*, IRxTexture**);
+[[maybe_unused]] constexpr CreateTexture2DFn kCreateTexture2D = &IRxMaterialSystem::createTexture2D;
 
 }  // namespace

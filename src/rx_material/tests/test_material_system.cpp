@@ -2,14 +2,24 @@
 #include <rx_material/material_system.h>
 #include <rx_platform/window.h>
 #include <rx_rhi_vk/bindless.h>
+#include <rx_rhi_vk/command.h>
 #include <rx_rhi_vk/context.h>
 #include <rx_rhi_vk/device.h>
 
+#include <rx_graph/executor.h>
+#include <rx_graph/render_graph.h>
+
+#include <array>
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 // RX_MATERIAL_TEST_DATA_DIR (src/rx_material/tests/CMakeLists.txt) is the
 // absolute, checked-out-repo-relative path to this directory's own data/
@@ -98,6 +108,196 @@ rx::graph::PassSignature makeColorOnlySignature() {
     sig.depthFormat = VK_FORMAT_UNDEFINED;
     sig.samples = VK_SAMPLE_COUNT_1_BIT;
     return sig;
+}
+
+// --- Hot-reload test fixtures [Task 7, mandatory 3-version regression] --
+// Same shape as test_unlit.slang (a single `float4 tint` at set 1, binding
+// 0), so the reflected parameter shape never changes across v1/v2/v3 --
+// only the tint MATH differs (v1 vs v2), which is exactly what changes the
+// module's content hash without changing anything reload needs to
+// re-validate. v3 is a deliberate syntax error (missing semicolon, the
+// exact same fixture shape test_bad_syntax.slang already uses) -- the
+// "syntactically broken" half of the mandatory regression test.
+constexpr const char* kReloadV1 = R"(
+import material;
+
+struct UnlitParams {
+    float4 tint;
+};
+
+[[vk::binding(0, 1)]]
+ParameterBlock<UnlitParams> gParams;
+
+struct Unlit : IMaterialShader {
+    float4 evaluate(MaterialVertex v) {
+        float4 tint = gParams.tint;
+        tint.x += v.worldPos.x * 1e-4;
+        tint.y += v.normal.y * 1e-4;
+        tint.z += v.uv.x * 1e-4;
+        return tint;
+    }
+};
+
+export struct MaterialImpl : IMaterialShader = Unlit;
+)";
+
+constexpr const char* kReloadV2 = R"(
+import material;
+
+struct UnlitParams {
+    float4 tint;
+};
+
+[[vk::binding(0, 1)]]
+ParameterBlock<UnlitParams> gParams;
+
+struct Unlit : IMaterialShader {
+    float4 evaluate(MaterialVertex v) {
+        float4 tint = gParams.tint * 0.5;
+        tint.x += v.worldPos.x * 1e-4;
+        tint.y += v.normal.y * 1e-4;
+        tint.z += v.uv.x * 1e-4;
+        return tint;
+    }
+};
+
+export struct MaterialImpl : IMaterialShader = Unlit;
+)";
+
+constexpr const char* kReloadV3Broken = R"(
+import material;
+
+struct UnlitParams {
+    float4 tint
+};
+
+[[vk::binding(0, 1)]]
+ParameterBlock<UnlitParams> gParams;
+
+struct Unlit : IMaterialShader {
+    float4 evaluate(MaterialVertex v) {
+        return gParams.tint;
+    }
+};
+
+export struct MaterialImpl : IMaterialShader = Unlit;
+)";
+
+// Writes `content` to `path` and forces its mtime to `mtime` -- explicit,
+// rather than relying on real wall-clock time between two writes, so this
+// test is not at the mercy of a filesystem's mtime resolution (some
+// filesystems only resolve to whole seconds -- two writes issued back to
+// back from a single test process can otherwise land on the identical
+// timestamp, which would make MaterialSystem::reloadChanged() see no
+// change at all).
+void writeFileWithMtime(const std::filesystem::path& path, const char* content,
+                         std::filesystem::file_time_type mtime) {
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(out));
+        out << content;
+    }
+    std::error_code ec;
+    std::filesystem::last_write_time(path, mtime, ec);
+    REQUIRE_FALSE(ec);
+}
+
+// --- bindInstance() end-to-end fixture [Task 7 coordinator addition 3] --
+// A minimal real rx::graph::RenderGraph + Executor rig -- the only
+// legitimate way to obtain a real rx::graph::PassContext&
+// (MaterialSystem::bindInstance()'s own second parameter), since
+// PassContext's constructor is private and friend-gated to Executor alone
+// [pass.h/executor.h's own "Fix round 1" comment]. One pass, one color
+// attachment, no actual draw call recorded (proving the pipeline bind +
+// descriptor-set allocate/write/bind sequence itself is validation-clean
+// is this test's entire point -- exactly mirroring rx_graph's own
+// test_execute_gpu.cpp "draw" pass, which similarly never issues a draw).
+struct OffscreenColorImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+};
+
+std::optional<OffscreenColorImage> createOffscreenColorImage(VkDevice device, VkPhysicalDevice physicalDevice,
+                                                               VkFormat format, VkExtent2D extent) {
+    OffscreenColorImage result;
+
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = format;
+    imageInfo.extent = {extent.width, extent.height, 1};
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(device, &imageInfo, nullptr, &result.image) != VK_SUCCESS) {
+        return std::nullopt;
+    }
+
+    VkMemoryRequirements memReq{};
+    vkGetImageMemoryRequirements(device, result.image, &memReq);
+    VkPhysicalDeviceMemoryProperties memProps{};
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
+
+    uint32_t memoryTypeIndex = UINT32_MAX;
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+        if ((memReq.memoryTypeBits & (1U << i)) != 0U &&
+            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0U) {
+            memoryTypeIndex = i;
+            break;
+        }
+    }
+    if (memoryTypeIndex == UINT32_MAX) {
+        vkDestroyImage(device, result.image, nullptr);
+        return std::nullopt;
+    }
+
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memReq.size;
+    allocInfo.memoryTypeIndex = memoryTypeIndex;
+    if (vkAllocateMemory(device, &allocInfo, nullptr, &result.memory) != VK_SUCCESS) {
+        vkDestroyImage(device, result.image, nullptr);
+        return std::nullopt;
+    }
+    if (vkBindImageMemory(device, result.image, result.memory, 0) != VK_SUCCESS) {
+        vkFreeMemory(device, result.memory, nullptr);
+        vkDestroyImage(device, result.image, nullptr);
+        return std::nullopt;
+    }
+
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = result.image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = format;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(device, &viewInfo, nullptr, &result.view) != VK_SUCCESS) {
+        vkFreeMemory(device, result.memory, nullptr);
+        vkDestroyImage(device, result.image, nullptr);
+        return std::nullopt;
+    }
+
+    return result;
+}
+
+void destroyOffscreenColorImage(VkDevice device, OffscreenColorImage& img) {
+    if (img.view != VK_NULL_HANDLE) {
+        vkDestroyImageView(device, img.view, nullptr);
+    }
+    if (img.image != VK_NULL_HANDLE) {
+        vkDestroyImage(device, img.image, nullptr);
+    }
+    if (img.memory != VK_NULL_HANDLE) {
+        vkFreeMemory(device, img.memory, nullptr);
+    }
+    img = OffscreenColorImage{};
 }
 
 }  // namespace
@@ -286,5 +486,344 @@ TEST_CASE("MaterialSystem persists its VkPipelineCache to disk across instances"
     // are what this test can assert without capturing log output).
     auto secondSystem = rx::material::MaterialSystem::create(fixture->device, fixture->bindless, cachePath);
     REQUIRE(secondSystem != nullptr);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// ===== Task 7 =============================================================
+
+TEST_CASE("MaterialSystem::materialParams/paramBlockSize reflect real per-field name/kind/offset/size, computed "
+          "once from the already-linked program") {
+    auto fixture = makeFixture("rx_material_params_reflect");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto system =
+        rx::material::MaterialSystem::create(fixture->device, fixture->bindless, freshCachePath("params_reflect"));
+    REQUIRE(system != nullptr);
+
+    rx::material::MaterialHandle unlit = system->loadMaterial(testDataPath("test_unlit.slang"));
+    const std::vector<rx::material::MaterialParamInfo>& unlitParams = system->materialParams(unlit);
+    REQUIRE(unlitParams.size() == 1);
+    CHECK(unlitParams[0].name == "tint");
+    CHECK(unlitParams[0].kind == rx::material::MaterialParamKind::Float4);
+    CHECK(unlitParams[0].offset == 0);
+    CHECK(unlitParams[0].size == sizeof(float) * 4);
+    CHECK(system->paramBlockSize(unlit) >= unlitParams[0].offset + unlitParams[0].size);
+
+    rx::material::MaterialHandle textured = system->loadMaterial(testDataPath("test_textured.slang"));
+    const std::vector<rx::material::MaterialParamInfo>& texturedParams = system->materialParams(textured);
+    REQUIRE(texturedParams.size() == 1);
+    CHECK(texturedParams[0].name == "albedoIndex");
+    CHECK(texturedParams[0].kind == rx::material::MaterialParamKind::TextureIndex);
+    CHECK(texturedParams[0].offset == 0);
+    CHECK(texturedParams[0].size == sizeof(uint32_t));
+    CHECK(system->paramBlockSize(textured) >= texturedParams[0].offset + texturedParams[0].size);
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("MaterialSystem::materialParams/paramBlockSize throw std::out_of_range for an invalid handle") {
+    auto fixture = makeFixture("rx_material_params_invalid_handle");
+    if (!fixture.has_value()) {
+        return;
+    }
+    auto system = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+                                                          freshCachePath("params_invalid_handle"));
+    REQUIRE(system != nullptr);
+
+    rx::material::MaterialHandle bogus;
+    CHECK_THROWS_AS(static_cast<void>(system->materialParams(bogus)), std::out_of_range);
+    CHECK_THROWS_AS(static_cast<void>(system->paramBlockSize(bogus)), std::out_of_range);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// --- Mandatory 3-version hot-reload regression [Task 7 brief step 1] -----
+TEST_CASE("MaterialSystem::reloadChanged recompiles a changed module (v1->v2), invalidates its stale pipeline-cache "
+          "entries, and keeps the last-good pipeline when a later edit (v3) is syntactically broken") {
+    auto fixture = makeFixture("rx_material_reload");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto system = rx::material::MaterialSystem::create(fixture->device, fixture->bindless, freshCachePath("reload"));
+    REQUIRE(system != nullptr);
+
+    std::filesystem::path modulePath = std::filesystem::temp_directory_path() / "rx_material_reload_test.slang";
+    auto baseTime = std::filesystem::file_time_type::clock::now();
+    writeFileWithMtime(modulePath, kReloadV1, baseTime);
+
+    rx::material::MaterialHandle handle = system->loadMaterial(modulePath);
+    uint64_t hashV1 = system->moduleHash(handle);
+
+    rx::material::PipelineRequest request;
+    request.material = handle;
+    request.pass = makeColorOnlySignature();
+
+    VkPipeline p1 = system->getPipeline(request);
+    REQUIRE(p1 != VK_NULL_HANDLE);
+
+    // A reloadChanged() call before anything on disk changes must be a
+    // complete no-op: same hash, same cached pipeline.
+    system->reloadChanged();
+    CHECK(system->moduleHash(handle) == hashV1);
+    CHECK(system->getPipeline(request) == p1);
+
+    // --- v1 -> v2: different tint math, IDENTICAL reflected shape --
+    // content hash must change, and getPipeline() for the SAME request
+    // must now build a genuinely different VkPipeline (P2 != P1) [D9].
+    writeFileWithMtime(modulePath, kReloadV2, baseTime + std::chrono::seconds(1));
+    system->reloadChanged();
+    uint64_t hashV2 = system->moduleHash(handle);
+    CHECK(hashV2 != hashV1);
+
+    VkPipeline p2 = system->getPipeline(request);
+    REQUIRE(p2 != VK_NULL_HANDLE);
+    CHECK(p2 != p1);
+
+    // The reflected parameter shape survives the reload unchanged -- v2
+    // declares the identical `float4 tint` field, so a caller's existing
+    // instance blob offsets stay valid across a reload.
+    const std::vector<rx::material::MaterialParamInfo>& paramsAfterV2 = system->materialParams(handle);
+    REQUIRE(paramsAfterV2.size() == 1);
+    CHECK(paramsAfterV2[0].name == "tint");
+    CHECK(paramsAfterV2[0].kind == rx::material::MaterialParamKind::Float4);
+
+    // --- v2 -> v3: a syntax error -- reloadChanged() must log a warning
+    // and leave v2's last-good compiled state completely untouched: same
+    // module hash, and getPipeline() for the SAME request still returns
+    // P2, not a new/broken pipeline [D9: "keep-last-good on compile
+    // failure"].
+    writeFileWithMtime(modulePath, kReloadV3Broken, baseTime + std::chrono::seconds(2));
+    system->reloadChanged();
+    CHECK(system->moduleHash(handle) == hashV2);
+    CHECK(system->getPipeline(request) == p2);
+
+    // Retired (v1-hash-keyed) pipelines are pending in the internal
+    // DeletionQueue until onFrameCompleted() confirms their frame is
+    // done -- exercise that path too, proving it does not crash or
+    // double-destroy anything already-current.
+    system->beginFrame(0, 7);
+    system->onFrameCompleted(7);
+
+    std::error_code ec;
+    std::filesystem::remove(modulePath, ec);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// --- bindInstance(): the actual "connect the CPU blob to GPU binding" -----
+// mechanism [Task 7 coordinator addition 3], exercised end to end against
+// a real rx::graph::RenderGraph + Executor (the only legitimate source of
+// a real PassContext& -- see this file's own createOffscreenColorImage()
+// comment above).
+TEST_CASE("MaterialSystem::bindInstance binds a real pipeline + set-1 UBO descriptor set with zero validation "
+          "errors") {
+    auto fixture = makeFixture("rx_material_bind_instance");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto system =
+        rx::material::MaterialSystem::create(fixture->device, fixture->bindless, freshCachePath("bind_instance"));
+    REQUIRE(system != nullptr);
+
+    rx::material::MaterialHandle handle = system->loadMaterial(testDataPath("test_unlit.slang"));
+    uint32_t blockSize = system->paramBlockSize(handle);
+    REQUIRE(blockSize > 0);
+    std::vector<uint8_t> blob(blockSize, 0);
+    const std::vector<rx::material::MaterialParamInfo>& params = system->materialParams(handle);
+    REQUIRE(params.size() == 1);
+    float tint[4] = {0.25F, 0.5F, 0.75F, 1.0F};
+    std::memcpy(blob.data() + params[0].offset, tint, sizeof(tint));
+
+    auto executor = rx::graph::Executor::create(fixture->device);
+    REQUIRE(executor != nullptr);
+
+    constexpr VkExtent2D kExtent{64, 64};
+    constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+
+    rx::graph::RenderGraph graph;
+    rx::graph::Pass& pass = graph.addPass("material_bind_test");
+    rx::graph::AttachmentDesc colorDesc;
+    colorDesc.format = kColorFormat;
+    pass.addColorOutput("color", colorDesc);
+    graph.setBackbufferSource("color");
+
+    rx::material::InstanceBinding binding{handle, blob.data(), blob.size()};
+    bool bound = false;
+    pass.setExecute([&](rx::graph::PassContext& ctx) {
+        system->beginFrame(/*frameInFlightIndex=*/0, /*frameNumber=*/0);
+        system->bindInstance(ctx.cmd, ctx, binding);
+        bound = true;
+    });
+
+    rx::graph::CompileInfo compileInfo;
+    compileInfo.swapchainWidth = kExtent.width;
+    compileInfo.swapchainHeight = kExtent.height;
+    compileInfo.swapchainFormat = kColorFormat;
+    compileInfo.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    graph.compile(compileInfo);
+    executor->realize(graph);
+
+    auto offscreen =
+        createOffscreenColorImage(fixture->device.device(), fixture->device.physicalDevice(), kColorFormat, kExtent);
+    REQUIRE(offscreen.has_value());
+
+    {
+        auto cmdCtx = rx::rhi::CommandContext::create(fixture->device.device(), fixture->device.graphicsQueue(),
+                                                        fixture->device.graphicsQueueFamily());
+        REQUIRE(cmdCtx.has_value());
+        cmdCtx->runOnce(
+            [&](VkCommandBuffer cmd) { executor->execute(graph, cmd, offscreen->image, offscreen->view, kExtent); });
+    }
+    CHECK(bound);
+
+    destroyOffscreenColorImage(fixture->device.device(), *offscreen);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("MaterialSystem::bindInstance rejects a paramSize that does not match the material's paramBlockSize") {
+    auto fixture = makeFixture("rx_material_bind_instance_mismatch");
+    if (!fixture.has_value()) {
+        return;
+    }
+    auto system = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+                                                          freshCachePath("bind_instance_mismatch"));
+    REQUIRE(system != nullptr);
+
+    rx::material::MaterialHandle handle = system->loadMaterial(testDataPath("test_unlit.slang"));
+
+    auto executor = rx::graph::Executor::create(fixture->device);
+    REQUIRE(executor != nullptr);
+
+    constexpr VkExtent2D kExtent{64, 64};
+    constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+
+    rx::graph::RenderGraph graph;
+    rx::graph::Pass& pass = graph.addPass("material_bind_mismatch_test");
+    rx::graph::AttachmentDesc colorDesc;
+    colorDesc.format = kColorFormat;
+    pass.addColorOutput("color", colorDesc);
+    graph.setBackbufferSource("color");
+
+    std::array<uint8_t, 1> tooSmall{0};
+    rx::material::InstanceBinding badBinding{handle, tooSmall.data(), tooSmall.size()};
+    bool threw = false;
+    pass.setExecute([&](rx::graph::PassContext& ctx) {
+        system->beginFrame(0, 0);
+        try {
+            system->bindInstance(ctx.cmd, ctx, badBinding);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+    });
+
+    rx::graph::CompileInfo compileInfo;
+    compileInfo.swapchainWidth = kExtent.width;
+    compileInfo.swapchainHeight = kExtent.height;
+    compileInfo.swapchainFormat = kColorFormat;
+    compileInfo.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    graph.compile(compileInfo);
+    executor->realize(graph);
+
+    auto offscreen =
+        createOffscreenColorImage(fixture->device.device(), fixture->device.physicalDevice(), kColorFormat, kExtent);
+    REQUIRE(offscreen.has_value());
+    {
+        auto cmdCtx = rx::rhi::CommandContext::create(fixture->device.device(), fixture->device.graphicsQueue(),
+                                                        fixture->device.graphicsQueueFamily());
+        REQUIRE(cmdCtx.has_value());
+        cmdCtx->runOnce(
+            [&](VkCommandBuffer cmd) { executor->execute(graph, cmd, offscreen->image, offscreen->view, kExtent); });
+    }
+    CHECK(threw);
+
+    destroyOffscreenColorImage(fixture->device.device(), *offscreen);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// --- createTexture2D()/textureBindlessIndex()/releaseTexture() -----------
+// [Task 7 coordinator addition 4].
+TEST_CASE("MaterialSystem::createTexture2D registers a real bindless-indexed texture; releaseTexture defers real "
+          "teardown until onFrameCompleted") {
+    auto fixture = makeFixture("rx_material_create_texture");
+    if (!fixture.has_value()) {
+        return;
+    }
+    auto system = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+                                                          freshCachePath("create_texture"));
+    REQUIRE(system != nullptr);
+
+    constexpr uint32_t kWidth = 4;
+    constexpr uint32_t kHeight = 4;
+    std::vector<uint8_t> pixels(static_cast<size_t>(kWidth) * kHeight * 4, 0);
+    for (size_t i = 0; i < pixels.size(); ++i) {
+        pixels[i] = static_cast<uint8_t>(i % 256);
+    }
+
+    rx::material::TextureCreateInfo info;
+    info.width = kWidth;
+    info.height = kHeight;
+    info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    info.generateMips = false;
+    info.pixels = pixels.data();
+    info.pixelBytes = pixels.size();
+
+    rx::material::TextureHandle handle = system->createTexture2D(info);
+    CHECK(handle.isValid());
+    uint32_t index = system->textureBindlessIndex(handle);
+
+    rx::material::TextureHandle handle2 = system->createTexture2D(info);
+    CHECK(handle2.isValid());
+    uint32_t index2 = system->textureBindlessIndex(handle2);
+    CHECK(index2 != index);  // a fresh registration, not a reused/aliased slot.
+
+    system->beginFrame(/*frameInFlightIndex=*/0, /*frameNumber=*/5);
+    system->releaseTexture(handle);
+    // Releasing an already-released handle a second time is documented as
+    // a logged no-op, never a crash.
+    system->releaseTexture(handle);
+
+    // Not yet actually destroyed -- confirming an EARLIER frame number
+    // must not run this retirement.
+    system->onFrameCompleted(4);
+    // Now genuinely safe.
+    system->onFrameCompleted(5);
+
+    system->releaseTexture(handle2);
+    system->onFrameCompleted(5);
+
+    // An invalid/unknown handle throws, matching every other accessor's
+    // contract.
+    CHECK_THROWS_AS(static_cast<void>(system->textureBindlessIndex(handle)), std::out_of_range);
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("MaterialSystem::createTexture2D rejects zero width/height and null/empty pixel data") {
+    auto fixture = makeFixture("rx_material_create_texture_invalid");
+    if (!fixture.has_value()) {
+        return;
+    }
+    auto system = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+                                                          freshCachePath("create_texture_invalid"));
+    REQUIRE(system != nullptr);
+
+    std::vector<uint8_t> pixels(16, 0);
+
+    rx::material::TextureCreateInfo zeroWidth;
+    zeroWidth.width = 0;
+    zeroWidth.height = 4;
+    zeroWidth.pixels = pixels.data();
+    zeroWidth.pixelBytes = pixels.size();
+    CHECK_THROWS_AS(static_cast<void>(system->createTexture2D(zeroWidth)), std::invalid_argument);
+
+    rx::material::TextureCreateInfo nullPixels;
+    nullPixels.width = 4;
+    nullPixels.height = 4;
+    nullPixels.pixels = nullptr;
+    nullPixels.pixelBytes = 0;
+    CHECK_THROWS_AS(static_cast<void>(system->createTexture2D(nullPixels)), std::invalid_argument);
+
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }

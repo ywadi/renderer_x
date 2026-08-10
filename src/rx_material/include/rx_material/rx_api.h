@@ -101,11 +101,44 @@ static constexpr RxGuid kIID_IRxUnknown = {0x780faed9, 0xc2e3, 0x4fcc, {0xae, 0x
 // No methods beyond IRxUnknown in Phase 3 -- it exists purely so
 // IRxMaterialInstance::setTexture() below has a real interface-typed
 // parameter to bind against. It always wraps a renderer-owned
-// rhi::Texture2D + bindless-table handle; nothing in Task 6's surface
-// creates one (no rxCreateTexture factory yet) -- a future task adds the
-// creation path once texture loading has its own public surface.
+// rhi::Texture2D + bindless-table handle, created via
+// IRxMaterialSystem::createTexture2D() below [Task 7] and released through
+// the renderer's own DeletionQueue once its refcount reaches zero (see
+// api_impl.cpp's TextureImpl and rx::material::MaterialSystem::
+// releaseTexture()'s own comment for the bindless.h release-safety
+// contract this follows).
 struct IRxTexture : IRxUnknown {};
 static constexpr RxGuid kIID_IRxTexture = {0x927ce6e7, 0x3fcd, 0x47e8, {0x8b, 0x20, 0xef, 0xdd, 0xc5, 0x32, 0x26, 0xde}};
+
+// --- RxTextureDesc: input to IRxMaterialSystem::createTexture2D() -------
+// Every field is fixed-width/POD, no STL, matching this header's own ABI
+// rules. `pixels`/`pixelBytes` describe a tightly-packed RGBA8 buffer of
+// exactly `width * height * 4` bytes (checked, not trusted, by the
+// implementation) -- read synchronously during createTexture2D(), never
+// retained past that call. `generateMips` is a plain int32_t flag (0/1),
+// not `bool` -- this header uses only fixed-width integer types throughout
+// (no `bool` appears anywhere else in it either), so a flag crossing this
+// boundary follows that same convention rather than relying on `bool`'s
+// (in-practice-but-not-standard-guaranteed) 1-byte size on every ABI a
+// future consumer might build against.
+typedef int32_t RxFormat;
+enum : RxFormat {
+    RX_FORMAT_RGBA8_UNORM = 0,
+    RX_FORMAT_RGBA8_SRGB = 1,
+};
+
+struct RxTextureDesc {
+    const void* pixels;
+    uint64_t pixelBytes;
+    uint32_t width;
+    uint32_t height;
+    RxFormat format;
+    int32_t generateMips;
+};
+static_assert(sizeof(RxTextureDesc) == 32,
+              "RxTextureDesc must stay exactly 32 bytes (pixels:8 + pixelBytes:8 + width:4 + height:4 + format:4 + "
+              "generateMips:4, no padding on any ABI this project targets) -- pinned so a caller can construct it "
+              "as a plain aggregate on either side of the boundary.");
 
 // --- IRxMaterialInstance: one material's bound-parameter set -----------
 // setFloat/setFloat4/setTexture validate `name` against the owning
@@ -117,11 +150,14 @@ static constexpr RxGuid kIID_IRxTexture = {0x927ce6e7, 0x3fcd, 0x47e8, {0x8b, 0x
 //   RX_E_INVALIDARG    -- `name`/`value`/`texture` is null, OR `name` is
 //                         a real reflected parameter of a DIFFERENT type
 //                         than this setter binds.
-// Task 6 stores validated values into a CPU-side blob owned by the
-// instance object (never touching a live GPU descriptor); a future task
-// connects that blob to the actual per-instance descriptor set/uniform
-// buffer this parameter block needs at draw time -- see api_impl.cpp's
-// own header comment for the exact handoff.
+// Values are stored into a CPU-side blob owned by the instance object, laid
+// out byte-for-byte at the material's own reflected field offsets [Task 7]
+// -- draw-time binding of that blob into a real per-instance descriptor
+// set/uniform buffer (rx::material::MaterialSystem::bindInstance()) is an
+// INTERNAL API, not part of this ABI surface this phase (draw submission
+// is not public in Phase 3 -- D5/D11); see api_impl.cpp's own header
+// comment and rx_api_detail.h's bridge accessors for the exact handoff a
+// caller holding the internal rx::material::MaterialSystem* uses.
 struct IRxMaterialInstance : IRxUnknown {
     virtual RxResult RX_CALL setFloat(const char* name, float value) = 0;
     virtual RxResult RX_CALL setFloat4(const char* name, const float value[4]) = 0;
@@ -153,17 +189,50 @@ struct IRxMaterialSystem : IRxUnknown {
     // logged via spdlog on the renderer side, never thrown across this
     // boundary) if the module fails to load/compile/link/reflect.
     virtual RxResult RX_CALL loadMaterial(const char* slangModulePath, IRxMaterial** outMaterial) = 0;
-    // Declared now for GUID/vtable stability; Task 7 wires the actual
-    // hot-reload behavior (watch loaded modules' source files, re-
-    // compile/re-link changed ones, invalidate affected pipeline-cache
-    // entries). Task 6's implementation is a documented no-op that
-    // always returns RX_OK -- see api_impl.cpp's own comment on this
-    // method for why that is this task's explicit, planned sequencing
-    // rather than a stub left unfinished by oversight.
+    // [Task 7] Wired to the real internal rx::material::MaterialSystem::
+    // reloadChanged() (D9): watches every module path loadMaterial() has
+    // been called with on this instance, re-compiles/re-links changed ones
+    // against a fresh Slang session, invalidates exactly the affected
+    // pipeline-cache entries (retired through the renderer's own
+    // DeletionQueue), and keeps the last-good compiled state on any
+    // failure (logged via spdlog on the renderer side, never surfaced as
+    // an error to this call's own caller -- a reload failure is not this
+    // call's caller's error). Always returns RX_OK -- even on a
+    // device-free/QI-only instance (internal_ == nullptr), where this is a
+    // documented no-op, matching every other method's "does not require a
+    // real internal system" carve-out on that state.
     virtual RxResult RX_CALL reloadChanged() = 0;
+    // [Task 7] Creates a real, renderer-owned texture from `desc`'s raw
+    // pixel data (uploaded via the internal rx::rhi::Uploader and
+    // registered into the renderer's bindless table -- see
+    // rx::material::MaterialSystem::createTexture2D()'s own comment for the
+    // exact mechanism), whose bindless index feeds directly into
+    // IRxMaterialInstance::setTexture()'s bound parameter. RX_E_INVALIDARG
+    // if `desc`/`outTexture` is null, or if `desc->width`/`desc->height` is
+    // 0, or if `desc->pixels` is null/`desc->pixelBytes` is 0, or if
+    // `desc->format` is not one of the documented RxFormat values;
+    // RX_E_FAIL if texture creation/upload/bindless-registration fails
+    // (diagnostics logged via spdlog on the renderer side) or if called on
+    // a device-free/QI-only instance (internal_ == nullptr).
+    virtual RxResult RX_CALL createTexture2D(const RxTextureDesc* desc, IRxTexture** outTexture) = 0;
 };
+// [Task 7] REGENERATED -- adding createTexture2D() above changes this
+// interface's real C++ vtable shape (a new pure-virtual slot), which is
+// exactly the situation COM discipline requires a NEW IID for: an existing
+// binary compiled against the OLD three-method vtable must never be handed
+// an object whose vtable actually has four slots under the SAME IID (it
+// would call through the wrong slot the moment it invoked whatever used to
+// be at the old vtable's end, or worse). Regenerating in place (not
+// appending a "V2" interface) is the correct call specifically because
+// nothing has shipped yet -- there is no existing binary anywhere that
+// could be holding the OLD GUID's contract, so there is no compatibility
+// promise to preserve by versioning instead. Every future PRE-RELEASE
+// change to this (or any other) interface's shape in this repo should
+// regenerate its GUID the same way; POST-release, the correct move
+// becomes a new versioned interface (IRxMaterialSystem2) instead, per the
+// same COM discipline this whole header follows [D5].
 static constexpr RxGuid kIID_IRxMaterialSystem = {
-    0x8739717f, 0xea0e, 0x4484, {0x82, 0x9e, 0x68, 0x9c, 0x07, 0x06, 0x1b, 0xbc}};
+    0x131dbf6a, 0xe874, 0x43bc, {0x8e, 0xb5, 0x45, 0xab, 0x6b, 0x99, 0xe2, 0x18}};
 
 // --- Factory: the in-process bridge into an existing internal system ----
 // The standalone DLL artifact is deferred (D5) -- Phase 3 proves the ABI

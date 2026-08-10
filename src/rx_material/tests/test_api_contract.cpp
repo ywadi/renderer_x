@@ -158,7 +158,14 @@ TEST_CASE("loadMaterial rejects null slangModulePath/outMaterial with RX_E_INVAL
     system->release();
 }
 
-TEST_CASE("reloadChanged is a documented Task 6 no-op that always returns RX_OK (Task 7 wires the real behavior)") {
+TEST_CASE("reloadChanged on a device-free (null-internal) instance stays a safe no-op that always returns RX_OK") {
+    // [Task 7] reloadChanged() now forwards to the real internal
+    // MaterialSystem::reloadChanged() (D9) when internal_ is non-null --
+    // see test_api_factory.cpp's own device-backed reload test for that
+    // behavior. This device-free case is unchanged from Task 6: internal_
+    // is null here, so this method never touches it at all and always
+    // returns RX_OK, exactly like every other method that does not
+    // require a real internal system.
     IRxMaterialSystem* system = makeDeviceFreeSystem();
     CHECK(system->reloadChanged() == RX_OK);
     system->release();

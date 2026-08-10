@@ -5,16 +5,11 @@
 
 #include <rx_core/log.h>
 
-#include <slang-com-ptr.h>
-#include <slang.h>
-
 #include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <optional>
-#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -25,36 +20,35 @@
 // here (the extern "C" factory, and every virtual method reachable from
 // a caller holding only an IRx*-typed pointer) follows the same
 // exception-boundary contract: internal C++ exceptions (thrown by
-// rx::material::MaterialSystem, by Slang's own C++ wrapper on OOM, or by
-// `new`) are caught HERE and mapped to an RxResult -- never allowed to
-// propagate across the ABI [R:M§1.3 point 2]. Diagnostics that would be
-// useful to a developer (Slang's own compile/link error text) are logged
-// via spdlog on this side, matching the brief's "no strings across the
-// ABI in Phase 3" decision.
+// rx::material::MaterialSystem, or by `new`) are caught HERE and mapped to
+// an RxResult -- never allowed to propagate across the ABI [R:M§1.3 point
+// 2]. Diagnostics that would be useful to a developer (Slang's own
+// compile/link error text) are logged via spdlog on this side, matching
+// the brief's "no strings across the ABI in Phase 3" decision.
 //
-// This file also implements IRxMaterialInstance's parameter-name/type
-// validation using a SECOND, independent, reflection-only Slang session
-// (see reflectMaterialParams() below) -- not because MaterialSystem
-// (material_system.h) is missing this by oversight, but because Task 5's
-// scope for that class stopped at binding-level reflection (one
-// UNIFORM_BUFFER binding for the whole `ParameterBlock<TParams> gParams`,
-// no per-field name/type breakdown -- see material_system.cpp's own
-// reflectMaterialLayout()) and Task 6's Modify list does not include
-// material_system.h/.cpp. Rather than fabricate a name/type table or
-// hand-parse Slang source text (this project's own policy: prefer an
-// already-integrated library's real API over reinventing a parser), this
-// runs Slang's OWN reflection API a second time, scoped to exactly the
-// question this ABI layer needs answered ("what are gParams's field
-// names and shapes"), stopping before codegen/linking (composite->
-// getLayout() works on an unlinked IComponentType -- verified directly
-// against this project's shipped Slang build before writing this, same
-// as every other empirical Slang behavior this codebase documents rather
-// than assumes). This is real, measurable duplicate work (a second Slang
-// session per loadMaterial() call, on top of MaterialSystem's own) --
-// flagged explicitly in task-6-report.md as something Task 7 should
-// collapse by having MaterialSystem itself expose a per-field parameter
-// table computed from the ALREADY-linked program it retains, once that
-// task is touching material_system.h anyway for GPU-binding.
+// [Task 7] This file no longer drives Slang directly at all -- Task 6's
+// SECOND, throwaway reflection-only Slang session (reflectMaterialParams(),
+// classifyFieldType(), a private slang::IGlobalSession member on
+// MaterialSystemImpl) is gone. Name/type/offset/size validation now reads
+// straight from rx::material::MaterialSystem::materialParams()/
+// paramBlockSize() -- the SAME already-linked program that produced the
+// material's real SPIR-V (material_system.cpp's reflectMaterialLayout()),
+// computed once at loadMaterial()/reloadChanged() time, not re-derived
+// here. This closes the exact duplicate-session seam task-6-report.md
+// flagged under "What Task 7 must pick up," item 2.
+//
+// setFloat/setFloat4/setTexture now write directly into a real, correctly
+// laid-out CPU-side byte blob (MaterialInstanceImpl::blob_, sized to
+// paramBlockSize() at construction) at each field's reflected byte offset,
+// rather than a name-keyed map of tagged unions -- that blob is exactly
+// what rx::material::MaterialSystem::bindInstance() (an internal, non-ABI
+// API -- see material_system.h's own comment; draw submission is not part
+// of the public surface this phase, D5/D11) copies into a real GPU-visible
+// uniform buffer at record time. rx_api_detail.h's materialHandle()/
+// materialInstanceBlobData()/materialInstanceBlobSize() are the bridge a
+// caller already holding the internal rx::material::MaterialSystem* uses
+// to reach that draw-time API from an ABI-obtained IRxMaterial*/
+// IRxMaterialInstance* (sample 06, Task 8).
 namespace rx::material {
 
 namespace {
@@ -65,232 +59,62 @@ namespace {
 // own technique (Win32 COM) and correct here for the same reason.
 bool guidEquals(const RxGuid& a, const RxGuid& b) { return std::memcmp(&a, &b, sizeof(RxGuid)) == 0; }
 
-// --- Reflected material parameter shapes ---------------------------------
-// The only shapes IRxMaterialInstance's three setters can ever bind:
-// Float (setFloat), Float4 (setFloat4), TextureIndex (setTexture -- a
-// plain `uint` field per this engine's own D8 convention: bindless
-// texture indices are plain data inside TParams, never a resource-typed
-// field -- see material_system.cpp's own comment on gParams for the
-// exact citation). Unsupported covers every other real field shape
-// (float3, matrices, ints, ...) this ABI has no setter for yet: a lookup
-// that finds an Unsupported field is a real, named parameter with the
-// WRONG type for whichever setter was called (RX_E_INVALIDARG), not an
-// unknown one (RX_E_NOTFOUND).
-enum class ParamKind : uint8_t { Float, Float4, TextureIndex, Unsupported };
-
-struct ReflectedParam {
-    std::string name;
-    ParamKind kind;
+// --- Private, ABI-invisible internal texture bridge ----------------------
+// Never declared in rx_api.h, never crosses the ABI as a documented
+// capability -- TextureImpl (below) is the only class that ever answers to
+// this GUID via queryInterface(). Exists purely so
+// MaterialInstanceImpl::setTexture() can recover a real, engine-created
+// texture's bindless-table index from a bare IRxTexture* argument using
+// the SAME queryInterface()+GUID mechanism this whole ABI already relies
+// on for identity/casting [D5 rule: "identity/casting is queryInterface()
+// + GUID comparison"], rather than reaching for RTTI (dynamic_cast/typeid)
+// -- which D5 explicitly forbids anywhere on this boundary's own object
+// model -- to distinguish "a real TextureImpl" from "some other IRxTexture
+// implementation" (e.g. a test-only double). A texture that does not
+// answer to this GUID (anything not created via
+// IRxMaterialSystem::createTexture2D()) has no real bindless registration
+// to report at all -- setTexture() falls back to writing bindless index 0
+// for it (see that method's own comment) rather than failing the whole
+// call; this is exactly what keeps test_api_factory.cpp's existing
+// FakeTexture-based refcount/lifecycle tests (Task 6) passing unchanged.
+//
+// Deliberately NOT IRxUnknown-rooted (no addRef/release of its own): this
+// is a same-lifetime "peek" at data TextureImpl itself already owns, never
+// a separately refcounted sub-object, so there is nothing for a caller to
+// release. TextureImpl::queryInterface() below does NOT addRef() when
+// answering THIS ONE GUID specifically (documented there too) -- the one
+// deliberate exception to this file's otherwise-universal "every
+// successful queryInterface() addRefs" rule, safe because the returned
+// pointer's use is confined to the single expression that calls
+// bindlessIndex() and is never stored or released.
+struct IInternalTextureBridge {
+    virtual uint32_t bindlessIndex() = 0;
 };
-
-std::optional<std::string> readFileBytes(const std::filesystem::path& path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
-        return std::nullopt;
-    }
-    std::ostringstream contents;
-    contents << file.rdbuf();
-    if (!file.good() && !file.eof()) {
-        return std::nullopt;
-    }
-    return contents.str();
-}
-
-ParamKind classifyFieldType(slang::TypeLayoutReflection* typeLayout) {
-    if (typeLayout == nullptr) {
-        return ParamKind::Unsupported;
-    }
-    switch (typeLayout->getKind()) {
-        case slang::TypeReflection::Kind::Scalar: {
-            switch (typeLayout->getScalarType()) {
-                case slang::TypeReflection::ScalarType::Float32:
-                    return ParamKind::Float;
-                case slang::TypeReflection::ScalarType::UInt32:
-                    return ParamKind::TextureIndex;
-                default:
-                    return ParamKind::Unsupported;
-            }
-        }
-        case slang::TypeReflection::Kind::Vector: {
-            slang::TypeLayoutReflection* elementLayout = typeLayout->getElementTypeLayout();
-            if (elementLayout == nullptr || typeLayout->getElementCount() != 4) {
-                return ParamKind::Unsupported;
-            }
-            if (elementLayout->getScalarType() == slang::TypeReflection::ScalarType::Float32) {
-                return ParamKind::Float4;
-            }
-            return ParamKind::Unsupported;
-        }
-        default:
-            return ParamKind::Unsupported;
-    }
-}
-
-// Reflection-only pass over `materialPath`'s top-level `gParams`
-// ParameterBlock (see this file's own header comment for why this exists
-// as a SECOND Slang session rather than extending material_system.h).
-// `globalSession` is owned by the caller (MaterialSystemImpl keeps one
-// alive for as long as the wrapping IRxMaterialSystem lives, paying
-// Slang's real fixed cost -- its standard-library load -- once, not once
-// per loadMaterial() call, mirroring MaterialSystem::Impl's own globalSession
-// field for the identical reason). Returns an empty vector and leaves
-// `error` empty for a material with a valid (possibly field-less)
-// ParameterBlock; returns an empty vector with `error` set on any real
-// reflection failure (session/module/layout construction failed) -- the
-// caller treats the two cases differently (RX_OK with zero known params
-// vs. RX_E_COMPILE).
-std::vector<ReflectedParam> reflectMaterialParams(slang::IGlobalSession* globalSession,
-                                                     const std::filesystem::path& materialPath, std::string& error) {
-    slang::TargetDesc targetDesc{};
-    targetDesc.format = SLANG_SPIRV;
-    targetDesc.profile = globalSession->findProfile("sm_6_0");
-
-    // [Fix round 1, task-6-review.md F3] Mirrors MaterialSystem::create()'s
-    // own target setup (material_system.cpp) EXACTLY, field for field --
-    // the authoritative session that will eventually govern GPU binding
-    // (Task 7) and this reflection-only session must agree on every
-    // TargetDesc/SessionDesc knob, not just format/profile/searchPaths,
-    // so there is no configuration-driven risk of the two ever
-    // classifying a field's shape differently. After this, the only
-    // remaining difference between the two sessions is that they are
-    // necessarily separate `slang::ISession`/`slang::IGlobalSession`
-    // instances (this file cannot reach into MaterialSystem::Impl's
-    // private session at all -- see this file's own top comment) --
-    // structural, already-disclosed, and not a configuration divergence.
-    slang::CompilerOptionEntry capabilityEntry{};
-    SlangCapabilityID spirvFloor = globalSession->findCapability("spirv_1_3");
-    if (spirvFloor != SLANG_CAPABILITY_UNKNOWN) {
-        capabilityEntry.name = slang::CompilerOptionName::Capability;
-        capabilityEntry.value.kind = slang::CompilerOptionValueKind::Int;
-        capabilityEntry.value.intValue0 = static_cast<int32_t>(spirvFloor);
-        targetDesc.compilerOptionEntries = &capabilityEntry;
-        targetDesc.compilerOptionEntryCount = 1;
-    } else {
-        RX_LOG_WARN("rx_material: rx_api: Slang capability 'spirv_1_3' not found by this Slang build; reflecting "
-                    "material parameters without an explicit SPIR-V version floor");
-    }
-
-    const std::string shaderDir = RX_MATERIAL_SHADER_DIR;
-    const char* searchPath = shaderDir.c_str();
-
-    slang::SessionDesc sessionDesc{};
-    sessionDesc.targets = &targetDesc;
-    sessionDesc.targetCount = 1;
-    sessionDesc.searchPaths = &searchPath;
-    sessionDesc.searchPathCount = 1;
-
-    Slang::ComPtr<slang::ISession> session;
-    if (SLANG_FAILED(globalSession->createSession(sessionDesc, session.writeRef())) || session.get() == nullptr) {
-        error = "rx_material: rx_api: failed to create a reflection-only Slang session for '" +
-                materialPath.string() + "'";
-        return {};
-    }
-
-    auto source = readFileBytes(materialPath);
-    if (!source.has_value()) {
-        error = "rx_material: rx_api: could not read material module '" + materialPath.string() +
-                "' for parameter reflection";
-        return {};
-    }
-
-    std::string moduleName = materialPath.stem().string();
-    if (moduleName.empty()) {
-        moduleName = "material";
-    }
-
-    Slang::ComPtr<slang::IBlob> sourceBlob(Slang::INIT_ATTACH, slang_createBlob(source->data(), source->size()));
-    Slang::ComPtr<slang::IBlob> loadDiag;
-    slang::IModule* materialModule = session->loadModuleFromSource(moduleName.c_str(), materialPath.string().c_str(),
-                                                                      sourceBlob, loadDiag.writeRef());
-    if (materialModule == nullptr) {
-        error = "rx_material: rx_api: failed to load material module '" + materialPath.string() +
-                "' for parameter reflection";
-        return {};
-    }
-
-    std::vector<slang::IComponentType*> parts{materialModule};
-    Slang::ComPtr<slang::IComponentType> composite;
-    Slang::ComPtr<slang::IBlob> composeDiag;
-    if (SLANG_FAILED(session->createCompositeComponentType(parts.data(), static_cast<SlangInt>(parts.size()),
-                                                              composite.writeRef(), composeDiag.writeRef())) ||
-        composite.get() == nullptr) {
-        error = "rx_material: rx_api: failed to compose material module '" + materialPath.string() +
-                "' for parameter reflection";
-        return {};
-    }
-
-    // Deliberately composite->getLayout(), never composite->link(): this
-    // pass only ever reads global-parameter TYPE/NAME information, which
-    // Slang resolves during type-checking/layout assignment at composite
-    // construction, not at link time -- no codegen, no entry points, no
-    // forward_entry.slang involvement needed at all.
-    Slang::ComPtr<slang::IBlob> layoutDiag;
-    slang::ProgramLayout* layout = composite->getLayout(0, layoutDiag.writeRef());
-    if (layout == nullptr) {
-        error = "rx_material: rx_api: IComponentType::getLayout failed for '" + materialPath.string() +
-                "' during parameter reflection";
-        return {};
-    }
-
-    std::vector<ReflectedParam> params;
-    unsigned paramCount = layout->getParameterCount();
-    for (unsigned i = 0; i < paramCount; ++i) {
-        slang::VariableLayoutReflection* param = layout->getParameterByIndex(i);
-        if (param == nullptr) {
-            continue;
-        }
-        slang::TypeLayoutReflection* paramTypeLayout = param->getTypeLayout();
-        bool isParamBlock = param->getCategory() == slang::ParameterCategory::SubElementRegisterSpace &&
-                             paramTypeLayout != nullptr &&
-                             paramTypeLayout->getKind() == slang::TypeReflection::Kind::ParameterBlock;
-        if (!isParamBlock) {
-            // Not this engine's gParams -- material_system.cpp's own
-            // reflectMaterialLayout() already rejects any material whose
-            // top-level globals don't match this exact shape at
-            // internal->loadMaterial() time, so by construction there is
-            // nothing else to classify here.
-            continue;
-        }
-
-        slang::TypeLayoutReflection* elementLayout = paramTypeLayout->getElementTypeLayout();
-        if (elementLayout == nullptr) {
-            continue;
-        }
-        unsigned fieldCount = elementLayout->getFieldCount();
-        for (unsigned f = 0; f < fieldCount; ++f) {
-            slang::VariableLayoutReflection* field = elementLayout->getFieldByIndex(f);
-            if (field == nullptr) {
-                continue;
-            }
-            const char* rawName = field->getName();
-            if (rawName == nullptr) {
-                continue;
-            }
-            params.push_back(ReflectedParam{std::string(rawName), classifyFieldType(field->getTypeLayout())});
-        }
-        break;  // exactly one ParameterBlock per Phase 3 material (D8) -- first match is authoritative.
-    }
-    return params;
-}
+constexpr RxGuid kIID_InternalTextureBridge = {
+    0x4d4b392c, 0xc3ee, 0x4272, {0xb1, 0x24, 0x4f, 0x45, 0x47, 0xb4, 0x0a, 0x94}};
 
 // --- Live-object bookkeeping (test seam) ----------------------------------
 std::atomic<uint64_t> g_liveApiObjectCount{0};
 
 // --- COM-lite root plumbing shared by every concrete object below --------
 // CRTP, not a virtual base: `Interface` (IRxMaterialSystem, IRxMaterial,
-// IRxMaterialInstance) is the ONE class each concrete type below publicly,
-// singly inherits -- RxUnknownBase sits between them in the C++ class
-// hierarchy purely to share addRef()/release()'s identical bodies, which
-// does not change the ABI-facing vtable's slot order/count at all (the
-// consumer only ever holds an Interface*-typed pointer and only ever
-// calls through the slots ITS OWN pure-virtual declarations specify,
-// which RxUnknownBase overrides in place, adding none). No class in this
-// entire hierarchy declares a virtual destructor (see release() below:
-// it always deletes through the exact static Derived* type, so virtual
-// dispatch to a destructor is never needed) -- consistent with the "no
-// virtual destructor" ABI rule [R:M§1.3 point 1] applying transitively to
-// every object that could ever be reached only through an interface
-// pointer.
+// IRxMaterialInstance, IRxTexture) is the ONE IRxUnknown-rooted interface
+// each concrete type below publicly, singly inherits -- RxUnknownBase sits
+// between them in the C++ class hierarchy purely to share addRef()/
+// release()'s identical bodies, which does not change the ABI-facing
+// vtable's slot order/count at all (the consumer only ever holds an
+// Interface*-typed pointer and only ever calls through the slots ITS OWN
+// pure-virtual declarations specify, which RxUnknownBase overrides in
+// place, adding none). No class in this entire hierarchy declares a
+// virtual destructor (see release() below: it always deletes through the
+// exact static Derived* type, so virtual dispatch to a destructor is
+// never needed) -- consistent with the "no virtual destructor" ABI rule
+// [R:M§1.3 point 1] applying transitively to every object that could ever
+// be reached only through an interface pointer. TextureImpl additionally,
+// separately inherits IInternalTextureBridge (above) -- a second,
+// disjoint-vtable base with no virtual-function-name overlap with
+// IRxUnknown at all, so this stays ordinary, unambiguous multiple
+// inheritance with no diamond/refcount-sharing complexity to resolve.
 template <typename Derived, typename Interface>
 class RxUnknownBase : public Interface {
 public:
@@ -315,26 +139,19 @@ protected:
     std::atomic<uint32_t> refCount_{1};
 };
 
-// Forward declarations -- MaterialInstanceImpl/MaterialImpl/
-// MaterialSystemImpl reference each other's pointers before each is
-// fully declared (a real mutual dependency: instances own a ref to their
-// material, materials own a ref to their system, and the system
-// constructs materials, which construct instances). Every method whose
-// body needs another one of these three types COMPLETE (constructors/
-// destructors that addRef()/release() each other, setters that call
-// MaterialImpl::paramKind()) is declared here and DEFINED out-of-line,
-// after all three classes are fully declared below.
+// Forward declarations -- these four reference each other's pointers
+// before each is fully declared (a real mutual dependency: instances own a
+// ref to their material, materials own a ref to their system, textures own
+// a ref to their system, and the system constructs materials/textures,
+// which construct instances). Every method whose body needs another one of
+// these types COMPLETE is declared here and DEFINED out-of-line, after all
+// four classes are fully declared below.
 class MaterialSystemImpl;
 class MaterialImpl;
 class MaterialInstanceImpl;
+class TextureImpl;
 
 // --- IRxMaterialInstance -----------------------------------------------
-struct StoredParam {
-    ParamKind kind = ParamKind::Unsupported;
-    float floats[4] = {0.0F, 0.0F, 0.0F, 0.0F};
-    IRxTexture* texture = nullptr;  // addRef'd while stored here.
-};
-
 class MaterialInstanceImpl final : public RxUnknownBase<MaterialInstanceImpl, IRxMaterialInstance> {
 public:
     explicit MaterialInstanceImpl(MaterialImpl* material);
@@ -345,34 +162,64 @@ public:
     RxResult RX_CALL setFloat4(const char* name, const float value[4]) override;
     RxResult RX_CALL setTexture(const char* name, IRxTexture* texture) override;
 
-private:
-    void releaseStoredTextureIfAny(const std::string& paramName);
+    // Internal (non-ABI) accessors -- see rx_api_detail.h's own comment on
+    // exactly who consumes these and why (the draw-time bindInstance()
+    // bridge, not a test-only seam).
+    [[nodiscard]] const std::vector<uint8_t>& blob() const { return blob_; }
 
+private:
     MaterialImpl* material_;
-    std::unordered_map<std::string, StoredParam> params_;
+    std::vector<uint8_t> blob_;
+    // Bindless-index (TextureIndex) fields' IRxTexture references, keyed
+    // by param name -- addRef'd while stored here, released on overwrite
+    // and on this instance's own destruction. The BYTES this engine
+    // actually binds to the GPU live in `blob_` (the texture's own
+    // bindless index, a plain u32, per D8); this map exists purely for
+    // COM refcount lifecycle bookkeeping, not for GPU binding.
+    std::unordered_map<std::string, IRxTexture*> textures_;
 };
 
 // --- IRxMaterial ----------------------------------------------------------
 class MaterialImpl final : public RxUnknownBase<MaterialImpl, IRxMaterial> {
 public:
-    MaterialImpl(MaterialSystemImpl* system, rx::material::MaterialHandle handle, std::string name,
-                 std::unordered_map<std::string, ParamKind> params);
+    MaterialImpl(MaterialSystemImpl* system, rx::material::MaterialSystem* internalSystem,
+                 rx::material::MaterialHandle handle, std::string name);
     ~MaterialImpl();
 
     RxResult RX_CALL queryInterface(const RxGuid& iid, void** outObject) override;
     RxResult RX_CALL createInstance(IRxMaterialInstance** outInstance) override;
     const char* RX_CALL name() override;
 
-    // Internal accessor (not part of the ABI -- only MaterialInstanceImpl
-    // calls this): the reflected shape of parameter `paramName`, or
-    // nullopt if this material has no such reflected parameter at all.
-    [[nodiscard]] std::optional<ParamKind> paramKind(const std::string& paramName) const;
+    // Internal accessors (not part of the ABI): the reflected shape of
+    // parameter `paramName` (nullopt if this material has no such
+    // reflected parameter at all), and the raw internal system/handle a
+    // MaterialInstanceImpl (and rx_api_detail.h's bridge) need to size a
+    // blob / drive bindInstance().
+    [[nodiscard]] std::optional<rx::material::MaterialParamInfo> paramInfo(const std::string& paramName) const;
+    [[nodiscard]] rx::material::MaterialSystem* internalSystem() const { return internalSystem_; }
+    [[nodiscard]] rx::material::MaterialHandle handle() const { return handle_; }
 
 private:
     MaterialSystemImpl* system_;
+    rx::material::MaterialSystem* internalSystem_;
     rx::material::MaterialHandle handle_;
     std::string name_;
-    std::unordered_map<std::string, ParamKind> params_;
+};
+
+// --- IRxTexture ------------------------------------------------------------
+class TextureImpl final : public RxUnknownBase<TextureImpl, IRxTexture>, public IInternalTextureBridge {
+public:
+    TextureImpl(MaterialSystemImpl* system, rx::material::MaterialSystem* internalSystem,
+                rx::material::TextureHandle handle);
+    ~TextureImpl();
+
+    RxResult RX_CALL queryInterface(const RxGuid& iid, void** outObject) override;
+    uint32_t bindlessIndex() override;
+
+private:
+    MaterialSystemImpl* system_;
+    rx::material::MaterialSystem* internalSystem_;
+    rx::material::TextureHandle handle_;
 };
 
 // --- IRxMaterialSystem ------------------------------------------------
@@ -383,25 +230,33 @@ public:
     RxResult RX_CALL queryInterface(const RxGuid& iid, void** outObject) override;
     RxResult RX_CALL loadMaterial(const char* slangModulePath, IRxMaterial** outMaterial) override;
     RxResult RX_CALL reloadChanged() override;
+    RxResult RX_CALL createTexture2D(const RxTextureDesc* desc, IRxTexture** outTexture) override;
 
 private:
-    bool ensureReflectionGlobalSession();
-
     rx::material::MaterialSystem* internal_;  // non-owning; may be null (see rx_api.h's own comment on
-                                                // RxMaterialSystemDesc for why that is a legal, documented state).
-    Slang::ComPtr<slang::IGlobalSession> reflectionGlobalSession_;
+                                               // RxMaterialSystemDesc for why that is a legal, documented state).
 };
 
 // ===== Out-of-line definitions (every referenced type is complete now) ====
 
 // --- MaterialInstanceImpl -------------------------------------------------
-MaterialInstanceImpl::MaterialInstanceImpl(MaterialImpl* material) : material_(material) { material_->addRef(); }
+MaterialInstanceImpl::MaterialInstanceImpl(MaterialImpl* material) : material_(material) {
+    material_->addRef();
+    // Sized once, here, to the material's own fixed paramBlockSize() --
+    // never resized afterward (every setFloat/setFloat4/setTexture call
+    // below writes IN PLACE at a fixed reflected offset, it never grows
+    // this vector). Zero-initialized: an instance that never calls a
+    // setter for a given field still has well-defined (all-zero) bytes at
+    // that field's offset when bindInstance() eventually copies this blob
+    // to the GPU.
+    blob_.assign(material_->internalSystem()->paramBlockSize(material_->handle()), 0);
+}
 
 MaterialInstanceImpl::~MaterialInstanceImpl() {
-    for (auto& [paramName, param] : params_) {
+    for (auto& [paramName, texture] : textures_) {
         (void)paramName;
-        if (param.kind == ParamKind::TextureIndex && param.texture != nullptr) {
-            param.texture->release();
+        if (texture != nullptr) {
+            texture->release();
         }
     }
     material_->release();
@@ -420,37 +275,26 @@ RxResult RX_CALL MaterialInstanceImpl::queryInterface(const RxGuid& iid, void** 
     return RX_E_NOINTERFACE;
 }
 
-void MaterialInstanceImpl::releaseStoredTextureIfAny(const std::string& paramName) {
-    auto it = params_.find(paramName);
-    if (it != params_.end() && it->second.kind == ParamKind::TextureIndex && it->second.texture != nullptr) {
-        it->second.texture->release();
-    }
-}
-
 RxResult RX_CALL MaterialInstanceImpl::setFloat(const char* name, float value) {
     if (name == nullptr) {
         return RX_E_INVALIDARG;
     }
-    // [Fix round 1, task-6-review.md F1] The `const char*` -> std::string
-    // conversion inside paramKind()'s lookup, and the `unordered_map`
-    // insertion below (which can rehash/allocate), can both throw
-    // std::bad_alloc -- exactly the cross-ABI-exception failure mode D5
-    // forbids. Every other public entry point in this file already
-    // catches at its own boundary; this setter (and setFloat4/setTexture
-    // below) previously did not -- see the review finding this fixes.
     try {
-        std::optional<ParamKind> kind = material_->paramKind(name);
-        if (!kind.has_value()) {
+        std::optional<rx::material::MaterialParamInfo> info = material_->paramInfo(name);
+        if (!info.has_value()) {
             return RX_E_NOTFOUND;
         }
-        if (*kind != ParamKind::Float) {
+        if (info->kind != rx::material::MaterialParamKind::Float) {
             return RX_E_INVALIDARG;
         }
-        releaseStoredTextureIfAny(name);
-        StoredParam param;
-        param.kind = ParamKind::Float;
-        param.floats[0] = value;
-        params_[name] = param;
+        if (static_cast<size_t>(info->offset) + sizeof(float) > blob_.size()) {
+            RX_LOG_ERROR(
+                "rx_material: rx_api: MaterialInstanceImpl::setFloat('{}'): reflected offset {} + {} bytes "
+                "exceeds this instance's blob size {} -- refusing to write out of bounds",
+                name, info->offset, sizeof(float), blob_.size());
+            return RX_E_FAIL;
+        }
+        std::memcpy(blob_.data() + info->offset, &value, sizeof(float));
         return RX_OK;
     } catch (const std::exception& e) {
         RX_LOG_ERROR("rx_material: rx_api: MaterialInstanceImpl::setFloat('{}') failed: {}", name, e.what());
@@ -463,21 +307,21 @@ RxResult RX_CALL MaterialInstanceImpl::setFloat4(const char* name, const float v
         return RX_E_INVALIDARG;
     }
     try {
-        std::optional<ParamKind> kind = material_->paramKind(name);
-        if (!kind.has_value()) {
+        std::optional<rx::material::MaterialParamInfo> info = material_->paramInfo(name);
+        if (!info.has_value()) {
             return RX_E_NOTFOUND;
         }
-        if (*kind != ParamKind::Float4) {
+        if (info->kind != rx::material::MaterialParamKind::Float4) {
             return RX_E_INVALIDARG;
         }
-        releaseStoredTextureIfAny(name);
-        StoredParam param;
-        param.kind = ParamKind::Float4;
-        param.floats[0] = value[0];
-        param.floats[1] = value[1];
-        param.floats[2] = value[2];
-        param.floats[3] = value[3];
-        params_[name] = param;
+        if (static_cast<size_t>(info->offset) + sizeof(float) * 4 > blob_.size()) {
+            RX_LOG_ERROR(
+                "rx_material: rx_api: MaterialInstanceImpl::setFloat4('{}'): reflected offset {} + {} bytes "
+                "exceeds this instance's blob size {} -- refusing to write out of bounds",
+                name, info->offset, sizeof(float) * 4, blob_.size());
+            return RX_E_FAIL;
+        }
+        std::memcpy(blob_.data() + info->offset, value, sizeof(float) * 4);
         return RX_OK;
     } catch (const std::exception& e) {
         RX_LOG_ERROR("rx_material: rx_api: MaterialInstanceImpl::setFloat4('{}') failed: {}", name, e.what());
@@ -490,32 +334,46 @@ RxResult RX_CALL MaterialInstanceImpl::setTexture(const char* name, IRxTexture* 
         return RX_E_INVALIDARG;
     }
     try {
-        std::optional<ParamKind> kind = material_->paramKind(name);
-        if (!kind.has_value()) {
+        std::optional<rx::material::MaterialParamInfo> info = material_->paramInfo(name);
+        if (!info.has_value()) {
             return RX_E_NOTFOUND;
         }
-        if (*kind != ParamKind::TextureIndex) {
+        if (info->kind != rx::material::MaterialParamKind::TextureIndex) {
             return RX_E_INVALIDARG;
         }
-
-        // Ordering matters here beyond just the try/catch: capture
-        // whatever this name previously held, but do not touch ANY
-        // refcount until AFTER the (possibly-throwing) map mutation has
-        // already succeeded. If `params_[name] = newParam` throws
-        // (bad_alloc during a rehash), nothing has been addRef()'d or
-        // release()'d yet, so this call leaves every refcount exactly as
-        // it was on entry -- no leaked reference on `texture`, no
-        // double-release of whatever was previously stored.
-        IRxTexture* previousTexture = nullptr;
-        auto it = params_.find(name);
-        if (it != params_.end() && it->second.kind == ParamKind::TextureIndex) {
-            previousTexture = it->second.texture;
+        if (static_cast<size_t>(info->offset) + sizeof(uint32_t) > blob_.size()) {
+            RX_LOG_ERROR(
+                "rx_material: rx_api: MaterialInstanceImpl::setTexture('{}'): reflected offset {} + {} bytes "
+                "exceeds this instance's blob size {} -- refusing to write out of bounds",
+                name, info->offset, sizeof(uint32_t), blob_.size());
+            return RX_E_FAIL;
         }
 
-        StoredParam newParam;
-        newParam.kind = ParamKind::TextureIndex;
-        newParam.texture = texture;
-        params_[name] = newParam;
+        // Recovers a REAL bindless index for an engine-created texture via
+        // the private queryInterface bridge (see kIID_InternalTextureBridge's
+        // own comment); falls back to 0 for anything else (a test-only
+        // IRxTexture double has no real bindless registration to report).
+        uint32_t bindlessIndex = 0;
+        void* bridgeOut = nullptr;
+        if (texture->queryInterface(kIID_InternalTextureBridge, &bridgeOut) == RX_OK && bridgeOut != nullptr) {
+            bindlessIndex = static_cast<IInternalTextureBridge*>(bridgeOut)->bindlessIndex();
+        }
+
+        // [Fix round 1, task-6-review.md F1 -- ordering preserved] capture
+        // whatever this name previously held, perform the (possibly-
+        // throwing) map write FIRST, and only THEN touch the blob bytes
+        // (which cannot throw) and refcounts. If `textures_[name] = texture`
+        // throws (bad_alloc during a rehash), nothing else has been
+        // mutated yet -- no leaked reference, no partially-written blob.
+        IRxTexture* previousTexture = nullptr;
+        auto it = textures_.find(name);
+        if (it != textures_.end()) {
+            previousTexture = it->second;
+        }
+
+        textures_[name] = texture;
+
+        std::memcpy(blob_.data() + info->offset, &bindlessIndex, sizeof(uint32_t));
 
         texture->addRef();
         if (previousTexture != nullptr) {
@@ -529,9 +387,9 @@ RxResult RX_CALL MaterialInstanceImpl::setTexture(const char* name, IRxTexture* 
 }
 
 // --- MaterialImpl ----------------------------------------------------------
-MaterialImpl::MaterialImpl(MaterialSystemImpl* system, rx::material::MaterialHandle handle, std::string name,
-                             std::unordered_map<std::string, ParamKind> params)
-    : system_(system), handle_(handle), name_(std::move(name)), params_(std::move(params)) {
+MaterialImpl::MaterialImpl(MaterialSystemImpl* system, rx::material::MaterialSystem* internalSystem,
+                             rx::material::MaterialHandle handle, std::string name)
+    : system_(system), internalSystem_(internalSystem), handle_(handle), name_(std::move(name)) {
     system_->addRef();
 }
 
@@ -567,13 +425,54 @@ RxResult RX_CALL MaterialImpl::createInstance(IRxMaterialInstance** outInstance)
 
 const char* RX_CALL MaterialImpl::name() { return name_.c_str(); }
 
-std::optional<ParamKind> MaterialImpl::paramKind(const std::string& paramName) const {
-    auto it = params_.find(paramName);
-    if (it == params_.end()) {
-        return std::nullopt;
+std::optional<rx::material::MaterialParamInfo> MaterialImpl::paramInfo(const std::string& paramName) const {
+    const std::vector<rx::material::MaterialParamInfo>& params = internalSystem_->materialParams(handle_);
+    for (const rx::material::MaterialParamInfo& param : params) {
+        if (param.name == paramName) {
+            return param;
+        }
     }
-    return it->second;
+    return std::nullopt;
 }
+
+// --- TextureImpl -----------------------------------------------------------
+TextureImpl::TextureImpl(MaterialSystemImpl* system, rx::material::MaterialSystem* internalSystem,
+                          rx::material::TextureHandle handle)
+    : system_(system), internalSystem_(internalSystem), handle_(handle) {
+    system_->addRef();
+}
+
+TextureImpl::~TextureImpl() {
+    // Per bindless.h's own release-safety contract and
+    // MaterialSystem::releaseTexture()'s own comment: this only defers the
+    // real GPU-object teardown (through this MaterialSystem's internal
+    // DeletionQueue) -- never throws, never blocks.
+    internalSystem_->releaseTexture(handle_);
+    system_->release();
+}
+
+RxResult RX_CALL TextureImpl::queryInterface(const RxGuid& iid, void** outObject) {
+    if (outObject == nullptr) {
+        return RX_E_INVALIDARG;
+    }
+    if (guidEquals(iid, kIID_IRxUnknown) || guidEquals(iid, kIID_IRxTexture)) {
+        addRef();
+        *outObject = static_cast<IRxTexture*>(this);
+        return RX_OK;
+    }
+    if (guidEquals(iid, kIID_InternalTextureBridge)) {
+        // Deliberately NO addRef() -- see kIID_InternalTextureBridge's own
+        // comment for why this one GUID is the sole exception to this
+        // file's otherwise-universal "every successful queryInterface()
+        // addRefs" rule.
+        *outObject = static_cast<IInternalTextureBridge*>(this);
+        return RX_OK;
+    }
+    *outObject = nullptr;
+    return RX_E_NOINTERFACE;
+}
+
+uint32_t TextureImpl::bindlessIndex() { return internalSystem_->textureBindlessIndex(handle_); }
 
 // --- MaterialSystemImpl ------------------------------------------------
 RxResult RX_CALL MaterialSystemImpl::queryInterface(const RxGuid& iid, void** outObject) {
@@ -587,18 +486,6 @@ RxResult RX_CALL MaterialSystemImpl::queryInterface(const RxGuid& iid, void** ou
     }
     *outObject = nullptr;
     return RX_E_NOINTERFACE;
-}
-
-bool MaterialSystemImpl::ensureReflectionGlobalSession() {
-    if (reflectionGlobalSession_.get() != nullptr) {
-        return true;
-    }
-    if (SLANG_FAILED(slang::createGlobalSession(reflectionGlobalSession_.writeRef())) ||
-        reflectionGlobalSession_.get() == nullptr) {
-        RX_LOG_ERROR("rx_material: rx_api: slang::createGlobalSession failed (parameter reflection)");
-        return false;
-    }
-    return true;
 }
 
 RxResult RX_CALL MaterialSystemImpl::loadMaterial(const char* slangModulePath, IRxMaterial** outMaterial) {
@@ -619,48 +506,15 @@ RxResult RX_CALL MaterialSystemImpl::loadMaterial(const char* slangModulePath, I
 
     std::filesystem::path path(slangModulePath);
     try {
-        // [Fix round 1, task-6-review.md F2] The reflection-only pass
-        // runs FIRST, before ever touching `internal_` -- deliberately
-        // reordered from the original submission, which called
-        // `internal_->loadMaterial()` (expensive and STATEFUL: it
-        // creates a real VkDescriptorSetLayout/VkPipelineLayout and
-        // registers a MaterialRecord inside `internal_`) before this
-        // side-effect-free validation step. That ordering meant a
-        // reflection failure AFTER a successful internal load
-        // permanently orphaned the just-created internal record (Task
-        // 5's MaterialSystem exposes no unload/release path). Running
-        // reflection first means: if it fails, `internal_` is never
-        // touched at all, so there is nothing to orphan; if it succeeds,
-        // `internal_->loadMaterial()` runs exactly once, same as before.
-        // (Reflection succeeding does not GUARANTEE internal_'s own,
-        // stricter shape checks also pass -- reflectMaterialParams()
-        // only takes the first ParameterBlock it finds and silently
-        // ignores any OTHER top-level global, while internal_'s own
-        // reflectMaterialLayout() rejects those outright -- but if
-        // internal_->loadMaterial() throws in THAT direction, it is
-        // Task 5's own already-correct exception safety: a throwing
-        // loadMaterial() never registers a MaterialRecord in the first
-        // place, so there is still nothing orphaned either way.)
-        if (!ensureReflectionGlobalSession()) {
-            return RX_E_COMPILE;
-        }
-        std::string reflectError;
-        std::vector<ReflectedParam> reflected =
-            reflectMaterialParams(reflectionGlobalSession_.get(), path, reflectError);
-        if (!reflectError.empty()) {
-            RX_LOG_ERROR("rx_material: rx_api: {}", reflectError);
-            return RX_E_COMPILE;
-        }
-
+        // [Task 7] No more separate reflection-only pass to run first --
+        // MaterialSystem::loadMaterial() itself now computes every field's
+        // name/kind/offset/size from the SAME already-linked program that
+        // produces its real SPIR-V, and (per Task 5's own already-correct
+        // exception safety, unchanged here) never registers a
+        // MaterialRecord at all if it throws -- so there is nothing this
+        // layer could orphan by calling it directly.
         rx::material::MaterialHandle handle = internal_->loadMaterial(path);
-
-        std::unordered_map<std::string, ParamKind> params;
-        params.reserve(reflected.size());
-        for (auto& param : reflected) {
-            params.emplace(std::move(param.name), param.kind);
-        }
-
-        auto* material = new MaterialImpl(this, handle, path.stem().string(), std::move(params));
+        auto* material = new MaterialImpl(this, internal_, handle, path.stem().string());
         *outMaterial = material;
         return RX_OK;
     } catch (const std::exception& e) {
@@ -670,18 +524,72 @@ RxResult RX_CALL MaterialSystemImpl::loadMaterial(const char* slangModulePath, I
 }
 
 RxResult RX_CALL MaterialSystemImpl::reloadChanged() {
-    // Documented no-op for Task 6 -- declared in rx_api.h now purely for
-    // GUID/vtable stability. Task 7 wires the real behavior: watch every
-    // module path `loadMaterial()` has been called with on this instance,
-    // re-load/re-link the ones whose file content changed (reusing
-    // `internal_`'s own MaterialSystem::loadMaterial() -- which already
-    // hashes module content -- against a fresh MaterialSystem/session
-    // per material_system.cpp's own documented same-module-name reload
-    // caveat), and invalidate exactly the pipeline-cache entries derived
-    // from a changed module's content hash. Deliberately does not read
-    // `internal_` at all, so this stays valid to call even on a
-    // device-free/QI-only instance (internal_ == nullptr).
+    // [Task 7] Wired to the real internal MaterialSystem::reloadChanged()
+    // (D9) -- see rx_api.h's own updated comment on this method. Never
+    // touches `internal_` when it is null, so this stays valid to call on
+    // a device-free/QI-only instance. reloadChanged() itself keeps-last-
+    // good on any per-material failure (logged there, not surfaced here)
+    // and cannot throw for that reason; the try/catch below is defensive
+    // only, for a genuine allocation failure or similar -- this method's
+    // own documented contract is "always returns RX_OK".
+    if (internal_ != nullptr) {
+        try {
+            internal_->reloadChanged();
+        } catch (const std::exception& e) {
+            RX_LOG_ERROR("rx_material: rx_api: reloadChanged failed unexpectedly: {}", e.what());
+        }
+    }
     return RX_OK;
+}
+
+RxResult RX_CALL MaterialSystemImpl::createTexture2D(const RxTextureDesc* desc, IRxTexture** outTexture) {
+    if (outTexture == nullptr) {
+        return RX_E_INVALIDARG;
+    }
+    *outTexture = nullptr;
+    if (desc == nullptr) {
+        return RX_E_INVALIDARG;
+    }
+    if (desc->width == 0 || desc->height == 0) {
+        return RX_E_INVALIDARG;
+    }
+    if (desc->pixels == nullptr || desc->pixelBytes == 0) {
+        return RX_E_INVALIDARG;
+    }
+
+    VkFormat vkFormat;
+    if (desc->format == RX_FORMAT_RGBA8_UNORM) {
+        vkFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    } else if (desc->format == RX_FORMAT_RGBA8_SRGB) {
+        vkFormat = VK_FORMAT_R8G8B8A8_SRGB;
+    } else {
+        return RX_E_INVALIDARG;
+    }
+
+    if (internal_ == nullptr) {
+        RX_LOG_ERROR(
+            "rx_material: rx_api: createTexture2D called on an IRxMaterialSystem created with a null "
+            "internalMaterialSystem (a device-free/QI-only instance)");
+        return RX_E_FAIL;
+    }
+
+    try {
+        rx::material::TextureCreateInfo info;
+        info.width = desc->width;
+        info.height = desc->height;
+        info.format = vkFormat;
+        info.generateMips = desc->generateMips != 0;
+        info.pixels = desc->pixels;
+        info.pixelBytes = static_cast<size_t>(desc->pixelBytes);
+
+        rx::material::TextureHandle handle = internal_->createTexture2D(info);
+        auto* texture = new TextureImpl(this, internal_, handle);
+        *outTexture = texture;
+        return RX_OK;
+    } catch (const std::exception& e) {
+        RX_LOG_ERROR("rx_material: rx_api: createTexture2D failed: {}", e.what());
+        return RX_E_FAIL;
+    }
 }
 
 }  // namespace
@@ -689,6 +597,18 @@ RxResult RX_CALL MaterialSystemImpl::reloadChanged() {
 namespace detail {
 
 uint64_t debugLiveApiObjectCount() { return g_liveApiObjectCount.load(std::memory_order_relaxed); }
+
+rx::material::MaterialHandle materialHandle(IRxMaterial* material) {
+    return static_cast<MaterialImpl*>(material)->handle();
+}
+
+const void* materialInstanceBlobData(IRxMaterialInstance* instance) {
+    return static_cast<MaterialInstanceImpl*>(instance)->blob().data();
+}
+
+size_t materialInstanceBlobSize(IRxMaterialInstance* instance) {
+    return static_cast<MaterialInstanceImpl*>(instance)->blob().size();
+}
 
 }  // namespace detail
 

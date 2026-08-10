@@ -23,6 +23,7 @@
 # outside its public class -- only material_system.h's public surface.
 add_library(rx_material STATIC
     material_system.cpp
+    instance.cpp
     api_impl.cpp
 )
 target_include_directories(rx_material PUBLIC include)

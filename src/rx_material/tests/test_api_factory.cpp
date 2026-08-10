@@ -19,11 +19,15 @@
 #include <rx_rhi_vk/device.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 // RX_MATERIAL_TEST_DATA_DIR -- see test_material_system.cpp's own
 // comment; identical convention, this file's own copy of the same tiny
@@ -367,4 +371,274 @@ TEST_CASE("entry-point audit: IRxMaterialInstance's three setters return a docum
     material->release();
     system->release();
     CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// ===== Task 7 =============================================================
+// [coordinator addition 2] The setters below no longer validate against a
+// second, throwaway Slang reflection session (Task 6's own
+// reflectMaterialParams(), now deleted) -- they read straight from
+// rx::material::MaterialSystem::materialParams()/paramBlockSize(), and
+// write directly into MaterialInstanceImpl's own real CPU-side blob at
+// each field's reflected byte offset. These tests observe that blob
+// directly through rx_api_detail.h's bridge accessors (the same accessors
+// a future sample's draw-time bindInstance() call would use) -- this is
+// the mandatory "instance param write->readback of arena blob at
+// reflected offsets (exact bytes)" case from the Task 7 brief's test list,
+// exercised at the ABI layer (test_material_system.cpp covers the
+// identical claim at the internal MaterialSystem layer already).
+TEST_CASE("IRxMaterialInstance's setters write byte-exact values into the internal blob at the material's own "
+          "reflected offsets") {
+    auto fixture = makeFixture("rx_api_factory_blob_bytes");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto internal =
+        rx::material::MaterialSystem::create(fixture->device, fixture->bindless, freshCachePath("blob_bytes"));
+    REQUIRE(internal != nullptr);
+
+    RxMaterialSystemDesc desc{internal.get()};
+    IRxMaterialSystem* system = nullptr;
+    REQUIRE(rxCreateMaterialSystem(&desc, &system) == RX_OK);
+
+    IRxMaterial* material = nullptr;
+    std::string unlitPath = testDataPath("test_unlit.slang").string();
+    REQUIRE(system->loadMaterial(unlitPath.c_str(), &material) == RX_OK);
+
+    IRxMaterialInstance* instance = nullptr;
+    REQUIRE(material->createInstance(&instance) == RX_OK);
+
+    rx::material::MaterialHandle handle = rx::material::detail::materialHandle(material);
+    const std::vector<rx::material::MaterialParamInfo>& params = internal->materialParams(handle);
+    REQUIRE(params.size() == 1);
+    CHECK(params[0].name == "tint");
+    CHECK(params[0].offset == 0);
+
+    // Fresh instance: blob is zero-initialized at every reflected byte.
+    const void* blobBefore = rx::material::detail::materialInstanceBlobData(instance);
+    size_t blobSize = rx::material::detail::materialInstanceBlobSize(instance);
+    REQUIRE(blobSize == internal->paramBlockSize(handle));
+    REQUIRE(blobSize >= params[0].offset + params[0].size);
+    std::vector<uint8_t> zeros(blobSize, 0);
+    CHECK(std::memcmp(blobBefore, zeros.data(), blobSize) == 0);
+
+    float tint[4] = {0.125F, 0.25F, 0.5F, 1.0F};
+    REQUIRE(instance->setFloat4("tint", tint) == RX_OK);
+
+    const void* blobAfter = rx::material::detail::materialInstanceBlobData(instance);
+    CHECK(std::memcmp(static_cast<const uint8_t*>(blobAfter) + params[0].offset, tint, sizeof(tint)) == 0);
+
+    instance->release();
+    material->release();
+    system->release();
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// [coordinator addition 4] createTexture2D() through the public ABI, and
+// setTexture()'s real (not FakeTexture-double) bindless-index write path.
+TEST_CASE("IRxMaterialSystem::createTexture2D creates a real texture; setTexture writes its REAL bindless index "
+          "into the instance blob") {
+    auto fixture = makeFixture("rx_api_factory_create_texture");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto internal = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+                                                            freshCachePath("api_create_texture"));
+    REQUIRE(internal != nullptr);
+
+    RxMaterialSystemDesc desc{internal.get()};
+    IRxMaterialSystem* system = nullptr;
+    REQUIRE(rxCreateMaterialSystem(&desc, &system) == RX_OK);
+
+    constexpr uint32_t kWidth = 2;
+    constexpr uint32_t kHeight = 2;
+    std::vector<uint8_t> pixels(static_cast<size_t>(kWidth) * kHeight * 4, 0x7F);
+
+    RxTextureDesc textureDesc{};
+    textureDesc.pixels = pixels.data();
+    textureDesc.pixelBytes = pixels.size();
+    textureDesc.width = kWidth;
+    textureDesc.height = kHeight;
+    textureDesc.format = RX_FORMAT_RGBA8_UNORM;
+    textureDesc.generateMips = 0;
+
+    IRxTexture* texture = nullptr;
+    REQUIRE(system->createTexture2D(&textureDesc, &texture) == RX_OK);
+    REQUIRE(texture != nullptr);
+
+    IRxMaterial* material = nullptr;
+    std::string texturedPath = testDataPath("test_textured.slang").string();
+    REQUIRE(system->loadMaterial(texturedPath.c_str(), &material) == RX_OK);
+
+    IRxMaterialInstance* instance = nullptr;
+    REQUIRE(material->createInstance(&instance) == RX_OK);
+
+    rx::material::MaterialHandle materialHandle = rx::material::detail::materialHandle(material);
+    const std::vector<rx::material::MaterialParamInfo>& params = internal->materialParams(materialHandle);
+    REQUIRE(params.size() == 1);
+    CHECK(params[0].name == "albedoIndex");
+
+    REQUIRE(instance->setTexture("albedoIndex", texture) == RX_OK);
+
+    // The blob must contain the texture's REAL bindless index -- this
+    // fixture builds a fresh rx::rhi::BindlessTable per test, and this is
+    // the very first sampled-image registration against it, so the real
+    // index is deterministically 0 (bindless.cpp registers sequentially
+    // from index 0).
+    const void* blob = rx::material::detail::materialInstanceBlobData(instance);
+    uint32_t writtenIndex = 0;
+    std::memcpy(&writtenIndex, static_cast<const uint8_t*>(blob) + params[0].offset, sizeof(uint32_t));
+    CHECK(writtenIndex == 0);
+
+    instance->release();
+    material->release();
+    texture->release();
+    system->release();
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("IRxMaterialSystem::createTexture2D validates desc/outTexture and rejects malformed input") {
+    auto fixture = makeFixture("rx_api_factory_create_texture_invalid");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto internal = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+                                                            freshCachePath("api_create_texture_invalid"));
+    REQUIRE(internal != nullptr);
+
+    RxMaterialSystemDesc desc{internal.get()};
+    IRxMaterialSystem* system = nullptr;
+    REQUIRE(rxCreateMaterialSystem(&desc, &system) == RX_OK);
+
+    IRxTexture* texture = reinterpret_cast<IRxTexture*>(static_cast<uintptr_t>(0x1));  // poisoned
+    CHECK(system->createTexture2D(nullptr, &texture) == RX_E_INVALIDARG);
+    CHECK(texture == nullptr);
+
+    std::vector<uint8_t> pixels(16, 0);
+    RxTextureDesc validDesc{};
+    validDesc.pixels = pixels.data();
+    validDesc.pixelBytes = pixels.size();
+    validDesc.width = 2;
+    validDesc.height = 2;
+    validDesc.format = RX_FORMAT_RGBA8_UNORM;
+    CHECK(system->createTexture2D(&validDesc, nullptr) == RX_E_INVALIDARG);
+
+    RxTextureDesc zeroWidth = validDesc;
+    zeroWidth.width = 0;
+    texture = nullptr;
+    CHECK(system->createTexture2D(&zeroWidth, &texture) == RX_E_INVALIDARG);
+    CHECK(texture == nullptr);
+
+    RxTextureDesc noPixels = validDesc;
+    noPixels.pixels = nullptr;
+    noPixels.pixelBytes = 0;
+    CHECK(system->createTexture2D(&noPixels, &texture) == RX_E_INVALIDARG);
+
+    RxTextureDesc badFormat = validDesc;
+    badFormat.format = 999;
+    CHECK(system->createTexture2D(&badFormat, &texture) == RX_E_INVALIDARG);
+
+    system->release();
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// [coordinator addition 1] reloadChanged() forwards to the real internal
+// MaterialSystem::reloadChanged() (D9) rather than the Task 6 documented
+// no-op -- verified by actually editing the loaded module on disk and
+// confirming (via the SAME internal rx::material::MaterialSystem* this
+// test already holds, per RxMaterialSystemDesc's own bridge contract) that
+// the pipeline this material builds genuinely changes.
+TEST_CASE("IRxMaterialSystem::reloadChanged forwards to the real internal MaterialSystem and actually reloads a "
+          "changed module") {
+    auto fixture = makeFixture("rx_api_factory_reload");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto internal =
+        rx::material::MaterialSystem::create(fixture->device, fixture->bindless, freshCachePath("api_reload"));
+    REQUIRE(internal != nullptr);
+
+    RxMaterialSystemDesc desc{internal.get()};
+    IRxMaterialSystem* system = nullptr;
+    REQUIRE(rxCreateMaterialSystem(&desc, &system) == RX_OK);
+
+    std::filesystem::path modulePath = std::filesystem::temp_directory_path() / "rx_api_factory_reload_test.slang";
+    auto baseTime = std::filesystem::file_time_type::clock::now();
+    {
+        std::ofstream out(modulePath, std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(out));
+        out << R"(
+import material;
+struct UnlitParams { float4 tint; };
+[[vk::binding(0, 1)]] ParameterBlock<UnlitParams> gParams;
+struct Unlit : IMaterialShader {
+    float4 evaluate(MaterialVertex v) {
+        float4 tint = gParams.tint;
+        tint.x += v.worldPos.x * 1e-4;
+        tint.y += v.normal.y * 1e-4;
+        tint.z += v.uv.x * 1e-4;
+        return tint;
+    }
+};
+export struct MaterialImpl : IMaterialShader = Unlit;
+)";
+    }
+    std::error_code ec;
+    std::filesystem::last_write_time(modulePath, baseTime, ec);
+    REQUIRE_FALSE(ec);
+
+    IRxMaterial* material = nullptr;
+    std::string modulePathStr = modulePath.string();
+    REQUIRE(system->loadMaterial(modulePathStr.c_str(), &material) == RX_OK);
+    rx::material::MaterialHandle handle = rx::material::detail::materialHandle(material);
+    uint64_t hashBefore = internal->moduleHash(handle);
+
+    // A reloadChanged() call before any edit must return RX_OK and change
+    // nothing.
+    CHECK(system->reloadChanged() == RX_OK);
+    CHECK(internal->moduleHash(handle) == hashBefore);
+
+    {
+        std::ofstream out(modulePath, std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(out));
+        out << R"(
+import material;
+struct UnlitParams { float4 tint; };
+[[vk::binding(0, 1)]] ParameterBlock<UnlitParams> gParams;
+struct Unlit : IMaterialShader {
+    float4 evaluate(MaterialVertex v) {
+        float4 tint = gParams.tint * 0.5;
+        tint.x += v.worldPos.x * 1e-4;
+        tint.y += v.normal.y * 1e-4;
+        tint.z += v.uv.x * 1e-4;
+        return tint;
+    }
+};
+export struct MaterialImpl : IMaterialShader = Unlit;
+)";
+    }
+    std::filesystem::last_write_time(modulePath, baseTime + std::chrono::seconds(1), ec);
+    REQUIRE_FALSE(ec);
+
+    CHECK(system->reloadChanged() == RX_OK);
+    CHECK(internal->moduleHash(handle) != hashBefore);
+
+    material->release();
+    system->release();
+    std::filesystem::remove(modulePath, ec);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// reloadChanged() on a device-free (internal_ == nullptr) instance stays a
+// safe, documented no-op -- Task 6's own contract, unchanged: this method
+// never touches `internal_` when null.
+TEST_CASE("IRxMaterialSystem::reloadChanged is a safe no-op on a device-free instance") {
+    RxMaterialSystemDesc desc{nullptr};
+    IRxMaterialSystem* system = nullptr;
+    REQUIRE(rxCreateMaterialSystem(&desc, &system) == RX_OK);
+    CHECK(system->reloadChanged() == RX_OK);
+    system->release();
 }

@@ -2,8 +2,11 @@
 
 #include <rx_core/handle.h>
 #include <rx_core/log.h>
+#include <rx_rhi_vk/deletion_queue.h>
 #include <rx_rhi_vk/device.h>
 #include <rx_rhi_vk/pipeline_layout.h>
+#include <rx_rhi_vk/texture.h>
+#include <rx_rhi_vk/upload.h>
 
 #include <slang-com-ptr.h>
 #include <slang.h>
@@ -14,6 +17,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -34,6 +38,16 @@
 // target-desc construction, diagnostics-blob capture regardless of
 // success/failure, the SAME-MODULE-NAME-per-session caveat) -- rather than
 // inventing a parallel, differently-shaped Slang wrapper [Task 5 brief].
+//
+// Task 7 additionally makes this class the SOLE Slang reflection authority
+// for a loaded material: reflectMaterialLayout() below now also walks
+// gParams's own fields (name/kind/offset/size -- rx_material::
+// MaterialParamInfo, instance.h) from the SAME already-linked
+// slang::IComponentType every material's real SPIR-V comes from. Task 6's
+// api_impl.cpp used to run a SECOND, throwaway reflection-only Slang
+// session for this (see that file's OLD header comment, since rewritten);
+// that duplicate session is gone -- api_impl.cpp now calls
+// MaterialSystem::materialParams()/paramBlockSize() directly.
 namespace rx::material {
 
 namespace {
@@ -177,6 +191,45 @@ std::optional<std::string> readFileBytes(const std::filesystem::path& path) {
     return contents.str();
 }
 
+// --- Per-field parameter classification [Task 7 coordinator addition 2] -
+// The only shapes IRxMaterialInstance's setFloat/setFloat4/setTexture
+// (rx_api.h) can ever bind: Float (setFloat), Float4 (setFloat4),
+// TextureIndex (setTexture -- a plain `uint` field per this engine's own
+// D8 convention: bindless texture indices are plain data inside TParams,
+// never a resource-typed field). Ported verbatim from Task 6's own
+// api_impl.cpp classifyFieldType() (that copy is now deleted -- see this
+// file's own header comment) -- identical logic, now run once here against
+// the authoritative already-linked program instead of a second session.
+MaterialParamKind classifyFieldKind(slang::TypeLayoutReflection* typeLayout) {
+    if (typeLayout == nullptr) {
+        return MaterialParamKind::Unsupported;
+    }
+    switch (typeLayout->getKind()) {
+        case slang::TypeReflection::Kind::Scalar: {
+            switch (typeLayout->getScalarType()) {
+                case slang::TypeReflection::ScalarType::Float32:
+                    return MaterialParamKind::Float;
+                case slang::TypeReflection::ScalarType::UInt32:
+                    return MaterialParamKind::TextureIndex;
+                default:
+                    return MaterialParamKind::Unsupported;
+            }
+        }
+        case slang::TypeReflection::Kind::Vector: {
+            slang::TypeLayoutReflection* elementLayout = typeLayout->getElementTypeLayout();
+            if (elementLayout == nullptr || typeLayout->getElementCount() != 4) {
+                return MaterialParamKind::Unsupported;
+            }
+            if (elementLayout->getScalarType() == slang::TypeReflection::ScalarType::Float32) {
+                return MaterialParamKind::Float4;
+            }
+            return MaterialParamKind::Unsupported;
+        }
+        default:
+            return MaterialParamKind::Unsupported;
+    }
+}
+
 // --- Material-specific reflection ---------------------------------------
 // rx_shader::reflect() (reflection.h) deliberately does not handle
 // `ParameterBlock<T>` at all ("Slang's ParameterBlock<T>/nested-parameter-
@@ -223,10 +276,25 @@ std::optional<std::string> readFileBytes(const std::filesystem::path& path) {
 // kind of unverified, speculative code this project's engineering
 // discipline argues against -- so it is called out here, explicitly, as
 // future work rather than shipped half-tested.
-std::optional<rx::shader::ShaderLayoutInfo> reflectMaterialLayout(slang::ProgramLayout* layout,
-                                                                    const std::string& moduleLabel,
-                                                                    std::string& error) {
-    rx::shader::ShaderLayoutInfo info;
+//
+// [Task 7] Also walks gParams's element type's own FIELDS -- name, kind
+// (classifyFieldKind() above), and byte offset/size within the block's own
+// Uniform parameter category (`VariableLayoutReflection::getOffset()`/
+// `TypeLayoutReflection::getSize()`, both defaulting to
+// `slang::ParameterCategory::Uniform` -- exactly the category a
+// ParameterBlock's own CPU-visible backing buffer uses) -- into
+// `MaterialReflection::params`/`paramBlockSize`, the data
+// MaterialSystem::materialParams()/paramBlockSize() expose and
+// MaterialSystem::bindInstance() needs to lay out/size a real UBO.
+struct MaterialReflection {
+    rx::shader::ShaderLayoutInfo shaderLayout;
+    std::vector<MaterialParamInfo> params;
+    uint32_t paramBlockSize = 0;
+};
+
+std::optional<MaterialReflection> reflectMaterialLayout(slang::ProgramLayout* layout, const std::string& moduleLabel,
+                                                         std::string& error) {
+    MaterialReflection result;
     bool foundParamBlock = false;
 
     unsigned paramCount = layout->getParameterCount();
@@ -268,8 +336,37 @@ std::optional<rx::shader::ShaderLayoutInfo> reflectMaterialLayout(slang::Program
         binding.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         binding.stages = kMaterialStageFlags;
         binding.unboundedArray = false;
-        info.bindings.push_back(binding);
+        result.shaderLayout.bindings.push_back(binding);
         foundParamBlock = true;
+
+        // [Task 7] Field-level walk -- see this function's own header
+        // comment for exactly what/why.
+        slang::TypeLayoutReflection* blockTypeLayout = param->getTypeLayout();
+        slang::TypeLayoutReflection* elementLayout =
+            blockTypeLayout != nullptr ? blockTypeLayout->getElementTypeLayout() : nullptr;
+        if (elementLayout != nullptr) {
+            result.paramBlockSize = static_cast<uint32_t>(elementLayout->getSize(slang::ParameterCategory::Uniform));
+            unsigned fieldCount = elementLayout->getFieldCount();
+            for (unsigned f = 0; f < fieldCount; ++f) {
+                slang::VariableLayoutReflection* field = elementLayout->getFieldByIndex(f);
+                if (field == nullptr) {
+                    continue;
+                }
+                const char* fieldRawName = field->getName();
+                if (fieldRawName == nullptr) {
+                    continue;
+                }
+                slang::TypeLayoutReflection* fieldTypeLayout = field->getTypeLayout();
+                MaterialParamInfo fieldInfo;
+                fieldInfo.name = fieldRawName;
+                fieldInfo.kind = classifyFieldKind(fieldTypeLayout);
+                fieldInfo.offset = static_cast<uint32_t>(field->getOffset(slang::ParameterCategory::Uniform));
+                fieldInfo.size = fieldTypeLayout != nullptr
+                                     ? static_cast<uint32_t>(fieldTypeLayout->getSize(slang::ParameterCategory::Uniform))
+                                     : 0;
+                result.params.push_back(std::move(fieldInfo));
+            }
+        }
     }
 
     if (!foundParamBlock) {
@@ -279,7 +376,7 @@ std::optional<rx::shader::ShaderLayoutInfo> reflectMaterialLayout(slang::Program
                 std::to_string(kMaterialParamBlockSet) + ")";
         return std::nullopt;
     }
-    return info;
+    return result;
 }
 
 // --- Pipeline variant cache key ------------------------------------------
@@ -304,22 +401,56 @@ struct PipelineKeyHash {
 }  // namespace
 
 // One loaded material: its retained linked Slang program (needed for
-// getEntryPointCode() -- called once, right here, never again), reflected
-// layout, built pipeline layout, and the two VkShaderModules every
-// getPipeline() call for this material reuses verbatim.
+// getEntryPointCode() -- called once, right here, never again -- AND, as
+// of Task 7, for future re-reflection: materialParams()/paramBlockSize()
+// read straight from the SAME MaterialReflection computed at load/reload
+// time, so linkedProgram itself is not re-queried after this record is
+// built; it stays retained purely as a lifetime anchor and because a
+// future task may need it), reflected layout, built pipeline layout, and
+// the two VkShaderModules every getPipeline() call for this material
+// reuses verbatim.
 struct MaterialRecord {
     std::filesystem::path path;
     uint64_t contentHash = 0;
 
+    // [Task 7] Best-effort mtime baseline for reloadChanged()'s change
+    // detection -- std::nullopt until the first successful stat (set at
+    // load time below, and opportunistically by reloadChanged() itself if
+    // load-time stat failed). A module reloadChanged() cannot currently
+    // stat is skipped that call, not treated as "changed".
+    std::optional<std::filesystem::file_time_type> lastKnownMtime;
+
+    // [Task 7] Kept alive explicitly (belt-and-suspenders alongside
+    // whatever internal reference `linkedProgram` itself may hold on its
+    // owning session) so a reload's FRESH session -- necessarily a
+    // DIFFERENT slang::ISession than the one `impl.session` still uses for
+    // every OTHER material -- stays valid for exactly as long as this
+    // record's own linkedProgram does. Every record's ownerSession is
+    // independent; a reload never touches any OTHER material's session.
+    Slang::ComPtr<slang::ISession> ownerSession;
     Slang::ComPtr<slang::IComponentType> linkedProgram;
     rx::shader::ShaderLayoutInfo layoutInfo;
+    std::vector<MaterialParamInfo> params;  // [Task 7]
+    uint32_t paramBlockSize = 0;            // [Task 7]
     rx::rhi::PipelineLayoutBundle layoutBundle;
 
     VkShaderModule vertexModule = VK_NULL_HANDLE;
     VkShaderModule fragmentModule = VK_NULL_HANDLE;
 };
 
+// [Task 7 coordinator addition 4] One created texture: the real owned
+// rx::rhi::Texture2D plus the BindlessTable slot its view was registered
+// into. destroyAll()-equivalent teardown is handled entirely by RAII
+// (Texture2D's own destructor) once ~MaterialSystem()'s vkDeviceWaitIdle()
+// has already run, or by releaseTexture()'s own DeletionQueue-retired
+// closure for a texture released mid-run.
+struct TextureRecord {
+    rx::rhi::Texture2D texture;
+    rx::rhi::BindlessHandle bindlessHandle;
+};
+
 struct MaterialSystem::Impl {
+    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
     rx::rhi::BindlessTable* bindless = nullptr;
     std::filesystem::path pipelineCachePath;
@@ -367,13 +498,47 @@ struct MaterialSystem::Impl {
     // avoids this correctly by re-fetching its own pointer fresh on every
     // call; this vector of handles (not pointers) is what lets the
     // destructor -- which only ever runs after every loadMaterial() call
-    // this instance will ever make -- do the same.
+    // this instance will ever make -- do the same. reloadChanged() (Task 7)
+    // follows the identical discipline: it walks this vector and re-fetches
+    // each MaterialRecord* fresh via materials.get() every call, never
+    // caching one across iterations.
     std::vector<MaterialHandle> materialHandles;
 
     std::unordered_map<PipelineKey, VkPipeline, PipelineKeyHash> pipelines;
 
+    // [Task 7 coordinator addition 4] Texture registry -- same
+    // handle-not-pointer discipline as materialHandles above, for the
+    // identical HandlePool-reallocation reason.
+    rx::core::HandlePool<TextureTag, TextureRecord> textures;
+    std::vector<TextureHandle> textureHandles;
+
+    // [Task 7] GPU-bound instance state: this MaterialSystem's own internal
+    // Allocator/Uploader (built once here, from `device`'s own
+    // VkPhysicalDevice/VkDevice/VkInstance -- no separate Allocator&
+    // parameter needed on create() itself) back both createTexture2D()'s
+    // upload path and paramArena's per-frame host-visible buffers.
+    // std::optional<...>, not a plain member: Allocator/Uploader/ParamArena
+    // each have a private default constructor (their own create() factory
+    // is the only way to build a real one -- see buffer.h/upload.h/
+    // instance.h's own comments on why), so Impl (a different class) has
+    // no accessible default to construct them with directly; std::optional
+    // sidesteps that exactly like every GPU test fixture in this codebase
+    // already does for the identical reason.
+    std::optional<rx::rhi::Allocator> allocator;
+    std::optional<rx::rhi::Uploader> uploader;
+    std::optional<rx::material::ParamArena> paramArena;
+
+    // Fence-gated deferred destruction for VkPipeline (reloadChanged()'s
+    // own retirements) and rx::rhi::Texture2D (releaseTexture()'s own) --
+    // [D9, bindless.h's release-safety contract]. `currentFrameNumber` is
+    // the monotonic tag beginFrame() most recently stashed; every retire()
+    // call in this file uses it.
+    rx::rhi::DeletionQueue deletionQueue;
+    uint64_t currentFrameNumber = 0;
+
     // Test-only seam -- see detail::debugCompileCount()'s own comment
-    // (material_system.h).
+    // (material_system.h). [Task 7] reloadChanged()'s own composite+link
+    // attempts increment this too -- see that method's own comment.
     uint64_t compileCount = 0;
 };
 
@@ -418,6 +583,75 @@ slang::IModule* loadSharedModule(slang::ISession* session, const std::filesystem
     return module;
 }
 
+// [Task 7] Factored out of what used to be inlined twice (create()'s
+// own session setup, and reloadChanged()'s "fresh Compiler per reload"
+// path) -- identical target/session configuration either way, which is
+// exactly what task-6-report.md's Fix round 1 (F3) flagged as a real risk
+// class when two independently-typed-out copies of this same setup drift:
+// a single function makes drift structurally impossible rather than
+// relying on two comments staying in sync by hand.
+bool createMaterialSession(slang::IGlobalSession* globalSession, Slang::ComPtr<slang::ISession>& outSession) {
+    slang::TargetDesc targetDesc{};
+    targetDesc.format = SLANG_SPIRV;
+    targetDesc.profile = globalSession->findProfile("sm_6_0");
+
+    slang::CompilerOptionEntry capabilityEntry{};
+    SlangCapabilityID spirvFloor = globalSession->findCapability("spirv_1_3");
+    if (spirvFloor != SLANG_CAPABILITY_UNKNOWN) {
+        capabilityEntry.name = slang::CompilerOptionName::Capability;
+        capabilityEntry.value.kind = slang::CompilerOptionValueKind::Int;
+        capabilityEntry.value.intValue0 = static_cast<int32_t>(spirvFloor);
+        targetDesc.compilerOptionEntries = &capabilityEntry;
+        targetDesc.compilerOptionEntryCount = 1;
+    } else {
+        RX_LOG_WARN("rx_material: Slang capability 'spirv_1_3' not found by this Slang build; "
+                    "compiling without an explicit SPIR-V version floor");
+    }
+
+    const std::string shaderDir = RX_MATERIAL_SHADER_DIR;
+    const char* searchPath = shaderDir.c_str();
+
+    slang::SessionDesc sessionDesc{};
+    sessionDesc.targets = &targetDesc;
+    sessionDesc.targetCount = 1;
+    sessionDesc.searchPaths = &searchPath;
+    sessionDesc.searchPathCount = 1;
+
+    if (SLANG_FAILED(globalSession->createSession(sessionDesc, outSession.writeRef())) || outSession.get() == nullptr) {
+        RX_LOG_ERROR("rx_material: IGlobalSession::createSession failed");
+        return false;
+    }
+    return true;
+}
+
+// [Task 7] Also factored out for the identical create()/reloadChanged()
+// reuse reason as createMaterialSession() above.
+struct ForwardEntryBundle {
+    slang::IModule* module = nullptr;  // owned by `session`, not this bundle.
+    Slang::ComPtr<slang::IEntryPoint> vertexEntryPoint;
+    Slang::ComPtr<slang::IEntryPoint> fragmentEntryPoint;
+};
+
+std::optional<ForwardEntryBundle> loadForwardEntry(slang::ISession* session, const std::filesystem::path& shaderDir,
+                                                    std::string& diagnostics) {
+    ForwardEntryBundle bundle;
+    bundle.module = loadSharedModule(session, shaderDir, "forward_entry.slang", diagnostics);
+    if (bundle.module == nullptr) {
+        return std::nullopt;
+    }
+    if (SLANG_FAILED(bundle.module->findEntryPointByName("vertexMain", bundle.vertexEntryPoint.writeRef())) ||
+        bundle.vertexEntryPoint.get() == nullptr) {
+        RX_LOG_ERROR("rx_material: forward_entry.slang has no 'vertexMain' entry point");
+        return std::nullopt;
+    }
+    if (SLANG_FAILED(bundle.module->findEntryPointByName("fragmentMain", bundle.fragmentEntryPoint.writeRef())) ||
+        bundle.fragmentEntryPoint.get() == nullptr) {
+        RX_LOG_ERROR("rx_material: forward_entry.slang has no 'fragmentMain' entry point");
+        return std::nullopt;
+    }
+    return bundle;
+}
+
 void destroyMaterialRecord(VkDevice device, MaterialRecord& record) {
     if (record.vertexModule != VK_NULL_HANDLE) {
         vkDestroyShaderModule(device, record.vertexModule, nullptr);
@@ -430,6 +664,183 @@ void destroyMaterialRecord(VkDevice device, MaterialRecord& record) {
     // record.layoutBundle destroys its own VkDescriptorSetLayout(s)/
     // VkPipelineLayout on destruction (PipelineLayoutBundle's own
     // destructor, pipeline_layout.h) -- nothing further to do here.
+}
+
+// --- Shared compile core [Task 7] ---------------------------------------
+// The composite/link/reflect/build/codegen/shader-module core BOTH
+// loadMaterial() (against `impl.session`, reused across every material
+// this MaterialSystem ever loads) and reloadChanged() (against a FRESH
+// per-reload session -- see that method's own comment) now share, so the
+// two paths cannot silently drift apart the way task-6-report.md's Fix
+// round 1 (F3) found the old create()/reflectMaterialParams() duplication
+// already had. Takes ownership of `session` (stored in the returned
+// CompiledMaterial as its own lifetime anchor) -- callers on the
+// persistent-session path pass a COPY of `impl.session` (Slang::ComPtr's
+// own addRef-on-copy, cheap), never the original, so this never disturbs
+// impl.session's own refcount/lifetime.
+struct CompiledMaterial {
+    Slang::ComPtr<slang::ISession> session;
+    Slang::ComPtr<slang::IComponentType> linkedProgram;
+    uint64_t contentHash = 0;
+    rx::shader::ShaderLayoutInfo layoutInfo;
+    std::vector<MaterialParamInfo> params;
+    uint32_t paramBlockSize = 0;
+    rx::rhi::PipelineLayoutBundle layoutBundle;
+    VkShaderModule vertexModule = VK_NULL_HANDLE;
+    VkShaderModule fragmentModule = VK_NULL_HANDLE;
+};
+
+void destroyCompiledMaterialGpuObjects(VkDevice device, CompiledMaterial& compiled) {
+    if (compiled.vertexModule != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, compiled.vertexModule, nullptr);
+        compiled.vertexModule = VK_NULL_HANDLE;
+    }
+    if (compiled.fragmentModule != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, compiled.fragmentModule, nullptr);
+        compiled.fragmentModule = VK_NULL_HANDLE;
+    }
+    compiled.layoutBundle = rx::rhi::PipelineLayoutBundle{};
+}
+
+std::optional<CompiledMaterial> compileMaterial(VkDevice device, rx::rhi::BindlessTable& bindless,
+                                                 Slang::ComPtr<slang::ISession> session,
+                                                 slang::IModule* forwardEntryModule,
+                                                 slang::IEntryPoint* vertexEntryPoint,
+                                                 slang::IEntryPoint* fragmentEntryPoint,
+                                                 const std::filesystem::path& slangModulePath,
+                                                 std::string& diagnostics) {
+    auto source = readFileBytes(slangModulePath);
+    if (!source.has_value()) {
+        diagnostics += "could not read material module '" + slangModulePath.string() + "'\n";
+        return std::nullopt;
+    }
+    uint64_t contentHash = fnv1aBytes(source->data(), source->size());
+
+    // Loaded via loadModuleFromSource() + a self-read ifstream, exactly
+    // like rx_shader::Compiler::compileFromFile() -- not
+    // session->loadModule(slangModulePath), which resolves purely through
+    // Slang's own search-path-based file lookup and would make a
+    // material's own path (as opposed to the two fixed, shared,
+    // search-path-resolved files) subject to that same lookup for no
+    // benefit. `moduleName` is the file's stem, so this inherits
+    // compiler.h's own documented SAME-MODULE-NAME CAVEAT verbatim:
+    // reloading the SAME path through the SAME session fails with Slang's
+    // own "already loaded with different source" diagnostic -- exactly why
+    // reloadChanged() below always calls this with a FRESH `session`
+    // rather than `impl.session`.
+    std::string moduleName = slangModulePath.stem().string();
+    if (moduleName.empty()) {
+        moduleName = "material";
+    }
+
+    Slang::ComPtr<slang::IBlob> sourceBlob(Slang::INIT_ATTACH, slang_createBlob(source->data(), source->size()));
+    Slang::ComPtr<slang::IBlob> loadDiag;
+    slang::IModule* materialModule = session->loadModuleFromSource(
+        moduleName.c_str(), slangModulePath.string().c_str(), sourceBlob, loadDiag.writeRef());
+    appendDiagnostics(diagnostics, "load", loadDiag);
+    if (materialModule == nullptr) {
+        return std::nullopt;
+    }
+
+    std::vector<slang::IComponentType*> parts;
+    parts.push_back(forwardEntryModule);
+    parts.push_back(vertexEntryPoint);
+    parts.push_back(fragmentEntryPoint);
+    parts.push_back(materialModule);
+
+    Slang::ComPtr<slang::IComponentType> composite;
+    Slang::ComPtr<slang::IBlob> composeDiag;
+    SlangResult composeResult = session->createCompositeComponentType(
+        parts.data(), static_cast<SlangInt>(parts.size()), composite.writeRef(), composeDiag.writeRef());
+    appendDiagnostics(diagnostics, "compose", composeDiag);
+    if (SLANG_FAILED(composeResult) || composite.get() == nullptr) {
+        return std::nullopt;
+    }
+
+    Slang::ComPtr<slang::IComponentType> linked;
+    Slang::ComPtr<slang::IBlob> linkDiag;
+    SlangResult linkResult = composite->link(linked.writeRef(), linkDiag.writeRef());
+    appendDiagnostics(diagnostics, "link", linkDiag);
+    if (SLANG_FAILED(linkResult) || linked.get() == nullptr) {
+        return std::nullopt;
+    }
+
+    Slang::ComPtr<slang::IBlob> layoutDiag;
+    slang::ProgramLayout* progLayout = linked->getLayout(0, layoutDiag.writeRef());
+    appendDiagnostics(diagnostics, "layout", layoutDiag);
+    if (progLayout == nullptr) {
+        return std::nullopt;
+    }
+
+    std::string reflectError;
+    auto reflection = reflectMaterialLayout(progLayout, slangModulePath.string(), reflectError);
+    if (!reflection.has_value()) {
+        diagnostics += reflectError;
+        diagnostics.push_back('\n');
+        return std::nullopt;
+    }
+
+    auto layoutBundle =
+        rx::rhi::PipelineLayoutBuilder::build(device, reflection->shaderLayout, bindless.descriptorSetLayout());
+    if (!layoutBundle.has_value()) {
+        diagnostics += "PipelineLayoutBuilder::build failed for material '" + slangModulePath.string() + "'\n";
+        return std::nullopt;
+    }
+
+    CompiledMaterial result;
+    result.session = std::move(session);
+    result.linkedProgram = linked;
+    result.contentHash = contentHash;
+    result.layoutInfo = std::move(reflection->shaderLayout);
+    result.params = std::move(reflection->params);
+    result.paramBlockSize = reflection->paramBlockSize;
+    result.layoutBundle = std::move(*layoutBundle);
+
+    // Entry point order in the composite above is fixed
+    // (forwardEntryModule, vertexEntryPoint, fragmentEntryPoint,
+    // materialModule) -- vertex is always index 0, fragment always index 1,
+    // matching compiler.cpp's own "entry points contribute in exactly the
+    // order pushed" contract.
+    Slang::ComPtr<slang::IBlob> vertexCodeDiag;
+    Slang::ComPtr<slang::IBlob> vertexCode;
+    SlangResult vertexCodeResult = linked->getEntryPointCode(0, 0, vertexCode.writeRef(), vertexCodeDiag.writeRef());
+    appendDiagnostics(diagnostics, "codegen(vertex)", vertexCodeDiag);
+    if (SLANG_FAILED(vertexCodeResult) || vertexCode.get() == nullptr) {
+        destroyCompiledMaterialGpuObjects(device, result);
+        return std::nullopt;
+    }
+
+    Slang::ComPtr<slang::IBlob> fragmentCodeDiag;
+    Slang::ComPtr<slang::IBlob> fragmentCode;
+    SlangResult fragmentCodeResult =
+        linked->getEntryPointCode(1, 0, fragmentCode.writeRef(), fragmentCodeDiag.writeRef());
+    appendDiagnostics(diagnostics, "codegen(fragment)", fragmentCodeDiag);
+    if (SLANG_FAILED(fragmentCodeResult) || fragmentCode.get() == nullptr) {
+        destroyCompiledMaterialGpuObjects(device, result);
+        return std::nullopt;
+    }
+
+    VkShaderModuleCreateInfo vertexModuleInfo{};
+    vertexModuleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    vertexModuleInfo.codeSize = vertexCode->getBufferSize();
+    vertexModuleInfo.pCode = static_cast<const uint32_t*>(vertexCode->getBufferPointer());
+    if (vkCreateShaderModule(device, &vertexModuleInfo, nullptr, &result.vertexModule) != VK_SUCCESS) {
+        diagnostics += "vkCreateShaderModule (vertex) failed for material '" + slangModulePath.string() + "'\n";
+        destroyCompiledMaterialGpuObjects(device, result);
+        return std::nullopt;
+    }
+
+    VkShaderModuleCreateInfo fragmentModuleInfo{};
+    fragmentModuleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    fragmentModuleInfo.codeSize = fragmentCode->getBufferSize();
+    fragmentModuleInfo.pCode = static_cast<const uint32_t*>(fragmentCode->getBufferPointer());
+    if (vkCreateShaderModule(device, &fragmentModuleInfo, nullptr, &result.fragmentModule) != VK_SUCCESS) {
+        diagnostics += "vkCreateShaderModule (fragment) failed for material '" + slangModulePath.string() + "'\n";
+        destroyCompiledMaterialGpuObjects(device, result);
+        return std::nullopt;
+    }
+
+    return result;
 }
 
 }  // namespace
@@ -448,6 +859,13 @@ MaterialSystem::~MaterialSystem() {
     // destructor is about to destroy.
     vkDeviceWaitIdle(impl.device);
 
+    // [Task 7] Runs every still-pending VkPipeline/Texture2D retirement
+    // unconditionally now that the device is confirmed idle -- avoids
+    // DeletionQueue's own destructor logging a spurious "never flushed"
+    // error, and ensures a reload/texture-release that happened just
+    // before shutdown does not leak its retired resource.
+    impl.deletionQueue.flushAll();
+
     for (auto& [key, pipeline] : impl.pipelines) {
         if (pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(impl.device, pipeline, nullptr);
@@ -464,6 +882,14 @@ MaterialSystem::~MaterialSystem() {
             destroyMaterialRecord(impl.device, *record);
         }
     }
+
+    // [Task 7] Any still-live TextureRecord's rx::rhi::Texture2D is torn
+    // down by plain RAII when `impl_` itself is destroyed just after this
+    // function returns -- safe specifically because vkDeviceWaitIdle()
+    // above already ran first, so no in-flight command buffer can still
+    // reference one. Nothing further to do here (unlike materials/
+    // pipelines, a Texture2D owns no raw handle this destructor needs to
+    // vkDestroy by hand).
 
     // Best-effort save -- never fatal, matching create()'s equally
     // best-effort LOAD of this same file [Task 5 ambiguity resolution].
@@ -516,56 +942,17 @@ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device, 
     // resolve): this is what lets `import material;` inside
     // forward_entry.slang and every material module resolve to
     // RX_MATERIAL_SHADER_DIR/material.slang without this class needing to
-    // pre-load it explicitly.
-    slang::TargetDesc targetDesc{};
-    targetDesc.format = SLANG_SPIRV;
-    targetDesc.profile = globalSession->findProfile("sm_6_0");
-
-    slang::CompilerOptionEntry capabilityEntry{};
-    SlangCapabilityID spirvFloor = globalSession->findCapability("spirv_1_3");
-    if (spirvFloor != SLANG_CAPABILITY_UNKNOWN) {
-        capabilityEntry.name = slang::CompilerOptionName::Capability;
-        capabilityEntry.value.kind = slang::CompilerOptionValueKind::Int;
-        capabilityEntry.value.intValue0 = static_cast<int32_t>(spirvFloor);
-        targetDesc.compilerOptionEntries = &capabilityEntry;
-        targetDesc.compilerOptionEntryCount = 1;
-    } else {
-        RX_LOG_WARN("rx_material: Slang capability 'spirv_1_3' not found by this Slang build; "
-                    "compiling without an explicit SPIR-V version floor");
+    // pre-load it explicitly. [Task 7] Factored into createMaterialSession()
+    // so reloadChanged()'s fresh-session path cannot drift from this one.
+    Slang::ComPtr<slang::ISession> session;
+    if (!createMaterialSession(globalSession.get(), session)) {
+        return nullptr;
     }
 
     const std::string shaderDir = RX_MATERIAL_SHADER_DIR;
-    const char* searchPath = shaderDir.c_str();
-
-    slang::SessionDesc sessionDesc{};
-    sessionDesc.targets = &targetDesc;
-    sessionDesc.targetCount = 1;
-    sessionDesc.searchPaths = &searchPath;
-    sessionDesc.searchPathCount = 1;
-
-    Slang::ComPtr<slang::ISession> session;
-    if (SLANG_FAILED(globalSession->createSession(sessionDesc, session.writeRef())) || session.get() == nullptr) {
-        RX_LOG_ERROR("rx_material: IGlobalSession::createSession failed");
-        return nullptr;
-    }
-
     std::string diagnostics;
-    slang::IModule* forwardEntryModule =
-        loadSharedModule(session, shaderDir, "forward_entry.slang", diagnostics);
-    if (forwardEntryModule == nullptr) {
-        return nullptr;
-    }
-
-    Slang::ComPtr<slang::IEntryPoint> vertexEntryPoint;
-    if (SLANG_FAILED(forwardEntryModule->findEntryPointByName("vertexMain", vertexEntryPoint.writeRef())) ||
-        vertexEntryPoint.get() == nullptr) {
-        RX_LOG_ERROR("rx_material: forward_entry.slang has no 'vertexMain' entry point");
-        return nullptr;
-    }
-    Slang::ComPtr<slang::IEntryPoint> fragmentEntryPoint;
-    if (SLANG_FAILED(forwardEntryModule->findEntryPointByName("fragmentMain", fragmentEntryPoint.writeRef())) ||
-        fragmentEntryPoint.get() == nullptr) {
-        RX_LOG_ERROR("rx_material: forward_entry.slang has no 'fragmentMain' entry point");
+    auto forwardEntry = loadForwardEntry(session, shaderDir, diagnostics);
+    if (!forwardEntry.has_value()) {
         return nullptr;
     }
 
@@ -615,16 +1002,46 @@ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device, 
         return nullptr;
     }
 
+    // [Task 7] This MaterialSystem's own Allocator/Uploader -- built
+    // straight from `device`'s own already-stored handles (no new create()
+    // parameter needed: Device already exposes physicalDevice()/device()/
+    // instance(), exactly like rx::graph::Executor::create(Device&) already
+    // does for its own internal Allocator, per that class's own comment on
+    // Device::instance()).
+    auto allocator =
+        rx::rhi::Allocator::createRaw(device.physicalDevice(), device.device(), device.instance());
+    if (!allocator.has_value()) {
+        RX_LOG_ERROR("rx_material: rx::rhi::Allocator::createRaw failed");
+        vkDestroyPipelineCache(device.device(), pipelineCache, nullptr);
+        return nullptr;
+    }
+    auto uploader = rx::rhi::Uploader::create(*allocator, device);
+    if (!uploader.has_value()) {
+        RX_LOG_ERROR("rx_material: rx::rhi::Uploader::create failed");
+        vkDestroyPipelineCache(device.device(), pipelineCache, nullptr);
+        return nullptr;
+    }
+    auto paramArena = rx::material::ParamArena::create(device.device(), *allocator, MaterialSystem::kFramesInFlight);
+    if (!paramArena.has_value()) {
+        RX_LOG_ERROR("rx_material: rx::material::ParamArena::create failed");
+        vkDestroyPipelineCache(device.device(), pipelineCache, nullptr);
+        return nullptr;
+    }
+
     auto impl = std::make_unique<Impl>();
+    impl->physicalDevice = device.physicalDevice();
     impl->device = device.device();
     impl->bindless = &bindless;
     impl->pipelineCachePath = pipelineCachePath;
     impl->pipelineCache = pipelineCache;
     impl->globalSession = std::move(globalSession);
     impl->session = std::move(session);
-    impl->forwardEntryModule = forwardEntryModule;
-    impl->vertexEntryPoint = std::move(vertexEntryPoint);
-    impl->fragmentEntryPoint = std::move(fragmentEntryPoint);
+    impl->forwardEntryModule = forwardEntry->module;
+    impl->vertexEntryPoint = std::move(forwardEntry->vertexEntryPoint);
+    impl->fragmentEntryPoint = std::move(forwardEntry->fragmentEntryPoint);
+    impl->allocator = std::move(allocator);
+    impl->uploader = std::move(uploader);
+    impl->paramArena = std::move(paramArena);
 
     return std::unique_ptr<MaterialSystem>(new MaterialSystem(std::move(impl)));
 }
@@ -632,167 +1049,40 @@ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device, 
 MaterialHandle MaterialSystem::loadMaterial(const std::filesystem::path& slangModulePath) {
     Impl& impl = *impl_;
 
-    auto source = readFileBytes(slangModulePath);
-    if (!source.has_value()) {
-        RX_LOG_ERROR("rx_material: could not read material module '{}'", slangModulePath.string());
-        throw std::runtime_error("rx_material: could not read material module '" + slangModulePath.string() + "'");
-    }
-    uint64_t contentHash = fnv1aBytes(source->data(), source->size());
-
-    // Loaded via loadModuleFromSource() + a self-read ifstream, exactly
-    // like rx_shader::Compiler::compileFromFile() -- not
-    // session->loadModule(slangModulePath), which resolves purely through
-    // Slang's own search-path-based file lookup and would make a
-    // material's own path (as opposed to the two fixed, shared,
-    // search-path-resolved files) subject to that same lookup for no
-    // benefit. `moduleName` is the file's stem, so this inherits
-    // compiler.h's own documented SAME-MODULE-NAME CAVEAT verbatim:
-    // reloading a DIFFERENT file that happens to share a stem already
-    // loaded once this session -- or the SAME path with changed content --
-    // through this SAME MaterialSystem instance fails with Slang's
-    // "already loaded with different source" diagnostic. Not exercised by
-    // this task's own test list (no reload test), and out of scope for
-    // Task 5's brief; a future hot-reload path needs a fresh
-    // MaterialSystem (fresh session) per reload, mirroring
-    // samples/02_hotreload's own established fix for the identical
-    // constraint on rx_shader::Compiler.
-    std::string moduleName = slangModulePath.stem().string();
-    if (moduleName.empty()) {
-        moduleName = "material";
-    }
-
-    std::string diagnostics;
-    Slang::ComPtr<slang::IBlob> sourceBlob(Slang::INIT_ATTACH, slang_createBlob(source->data(), source->size()));
-    Slang::ComPtr<slang::IBlob> loadDiag;
-    slang::IModule* materialModule = impl.session->loadModuleFromSource(
-        moduleName.c_str(), slangModulePath.string().c_str(), sourceBlob, loadDiag.writeRef());
-    appendDiagnostics(diagnostics, "load", loadDiag);
-    if (materialModule == nullptr) {
-        RX_LOG_ERROR("rx_material: failed to load material module '{}':\n{}", slangModulePath.string(), diagnostics);
-        throw std::runtime_error("rx_material: failed to load material module '" + slangModulePath.string() +
-                                  "':\n" + diagnostics);
-    }
-
-    std::vector<slang::IComponentType*> parts;
-    parts.push_back(impl.forwardEntryModule);
-    parts.push_back(impl.vertexEntryPoint.get());
-    parts.push_back(impl.fragmentEntryPoint.get());
-    parts.push_back(materialModule);
-
-    Slang::ComPtr<slang::IComponentType> composite;
-    Slang::ComPtr<slang::IBlob> composeDiag;
-    SlangResult composeResult = impl.session->createCompositeComponentType(
-        parts.data(), static_cast<SlangInt>(parts.size()), composite.writeRef(), composeDiag.writeRef());
-    appendDiagnostics(diagnostics, "compose", composeDiag);
-    if (SLANG_FAILED(composeResult) || composite.get() == nullptr) {
-        RX_LOG_ERROR("rx_material: failed to compose material '{}':\n{}", slangModulePath.string(), diagnostics);
-        throw std::runtime_error("rx_material: failed to compose material '" + slangModulePath.string() + "':\n" +
-                                  diagnostics);
-    }
-
-    Slang::ComPtr<slang::IComponentType> linked;
-    Slang::ComPtr<slang::IBlob> linkDiag;
-    // Every composite+link attempt is counted here, success or failure --
-    // see detail::debugCompileCount()'s own comment (material_system.h):
-    // this is the ONLY place MaterialSystem ever invokes Slang's front-end
-    // beyond the one-time forward_entry.slang load in create().
+    // Copies impl.session (Slang::ComPtr addRef, cheap) rather than moving
+    // it -- this MaterialSystem keeps using impl.session for every FUTURE
+    // loadMaterial() call too. See compileMaterial()'s own header comment.
     ++impl.compileCount;
-    SlangResult linkResult = composite->link(linked.writeRef(), linkDiag.writeRef());
-    appendDiagnostics(diagnostics, "link", linkDiag);
-    if (SLANG_FAILED(linkResult) || linked.get() == nullptr) {
-        RX_LOG_ERROR("rx_material: failed to link material '{}':\n{}", slangModulePath.string(), diagnostics);
-        throw std::runtime_error("rx_material: failed to link material '" + slangModulePath.string() + "':\n" +
+    std::string diagnostics;
+    auto compiled = compileMaterial(impl.device, *impl.bindless, Slang::ComPtr<slang::ISession>(impl.session),
+                                     impl.forwardEntryModule, impl.vertexEntryPoint.get(),
+                                     impl.fragmentEntryPoint.get(), slangModulePath, diagnostics);
+    if (!compiled.has_value()) {
+        RX_LOG_ERROR("rx_material: failed to load material '{}':\n{}", slangModulePath.string(), diagnostics);
+        throw std::runtime_error("rx_material: failed to load material '" + slangModulePath.string() + "':\n" +
                                   diagnostics);
     }
-
-    Slang::ComPtr<slang::IBlob> layoutDiag;
-    slang::ProgramLayout* layout = linked->getLayout(0, layoutDiag.writeRef());
-    appendDiagnostics(diagnostics, "layout", layoutDiag);
-    if (layout == nullptr) {
-        RX_LOG_ERROR("rx_material: IComponentType::getLayout failed for material '{}':\n{}",
-                     slangModulePath.string(), diagnostics);
-        throw std::runtime_error("rx_material: IComponentType::getLayout failed for material '" +
-                                  slangModulePath.string() + "':\n" + diagnostics);
-    }
-
-    std::string reflectError;
-    auto layoutInfo = reflectMaterialLayout(layout, slangModulePath.string(), reflectError);
-    if (!layoutInfo.has_value()) {
-        RX_LOG_ERROR("rx_material: {}", reflectError);
-        throw std::runtime_error("rx_material: " + reflectError);
-    }
-
-    auto layoutBundle =
-        rx::rhi::PipelineLayoutBuilder::build(impl.device, *layoutInfo, impl.bindless->descriptorSetLayout());
-    if (!layoutBundle.has_value()) {
-        RX_LOG_ERROR("rx_material: PipelineLayoutBuilder::build failed for material '{}'", slangModulePath.string());
-        throw std::runtime_error("rx_material: PipelineLayoutBuilder::build failed for material '" +
-                                  slangModulePath.string() + "'");
-    }
-
-    // Entry point order in the composite above is fixed
-    // (forwardEntryModule, vertexEntryPoint, fragmentEntryPoint,
-    // materialModule) -- vertex is always index 0, fragment always index 1,
-    // matching compiler.cpp's own "entry points contribute in exactly the
-    // order pushed" contract. No per-entry-point stage lookup needed (this
-    // is always exactly these two, in this order, for every material).
-    Slang::ComPtr<slang::IBlob> vertexCodeDiag;
-    Slang::ComPtr<slang::IBlob> vertexCode;
-    SlangResult vertexCodeResult = linked->getEntryPointCode(0, 0, vertexCode.writeRef(), vertexCodeDiag.writeRef());
-    appendDiagnostics(diagnostics, "codegen(vertex)", vertexCodeDiag);
-    if (SLANG_FAILED(vertexCodeResult) || vertexCode.get() == nullptr) {
-        RX_LOG_ERROR("rx_material: vertex code generation failed for material '{}':\n{}", slangModulePath.string(),
+    if (!diagnostics.empty()) {
+        RX_LOG_WARN("rx_material: diagnostics while loading material '{}':\n{}", slangModulePath.string(),
                      diagnostics);
-        throw std::runtime_error("rx_material: vertex code generation failed for material '" +
-                                  slangModulePath.string() + "':\n" + diagnostics);
-    }
-
-    Slang::ComPtr<slang::IBlob> fragmentCodeDiag;
-    Slang::ComPtr<slang::IBlob> fragmentCode;
-    SlangResult fragmentCodeResult =
-        linked->getEntryPointCode(1, 0, fragmentCode.writeRef(), fragmentCodeDiag.writeRef());
-    appendDiagnostics(diagnostics, "codegen(fragment)", fragmentCodeDiag);
-    if (SLANG_FAILED(fragmentCodeResult) || fragmentCode.get() == nullptr) {
-        RX_LOG_ERROR("rx_material: fragment code generation failed for material '{}':\n{}", slangModulePath.string(),
-                     diagnostics);
-        throw std::runtime_error("rx_material: fragment code generation failed for material '" +
-                                  slangModulePath.string() + "':\n" + diagnostics);
     }
 
     MaterialRecord record;
     record.path = slangModulePath;
-    record.contentHash = contentHash;
-    record.linkedProgram = linked;
-    record.layoutInfo = std::move(*layoutInfo);
-    record.layoutBundle = std::move(*layoutBundle);
+    record.contentHash = compiled->contentHash;
+    record.ownerSession = std::move(compiled->session);
+    record.linkedProgram = std::move(compiled->linkedProgram);
+    record.layoutInfo = std::move(compiled->layoutInfo);
+    record.params = std::move(compiled->params);
+    record.paramBlockSize = compiled->paramBlockSize;
+    record.layoutBundle = std::move(compiled->layoutBundle);
+    record.vertexModule = compiled->vertexModule;
+    record.fragmentModule = compiled->fragmentModule;
 
-    VkShaderModuleCreateInfo vertexModuleInfo{};
-    vertexModuleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    vertexModuleInfo.codeSize = vertexCode->getBufferSize();
-    vertexModuleInfo.pCode = static_cast<const uint32_t*>(vertexCode->getBufferPointer());
-    if (vkCreateShaderModule(impl.device, &vertexModuleInfo, nullptr, &record.vertexModule) != VK_SUCCESS) {
-        RX_LOG_ERROR("rx_material: vkCreateShaderModule (vertex) failed for material '{}'",
-                     slangModulePath.string());
-        destroyMaterialRecord(impl.device, record);
-        throw std::runtime_error("rx_material: vkCreateShaderModule (vertex) failed for material '" +
-                                  slangModulePath.string() + "'");
-    }
-
-    VkShaderModuleCreateInfo fragmentModuleInfo{};
-    fragmentModuleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    fragmentModuleInfo.codeSize = fragmentCode->getBufferSize();
-    fragmentModuleInfo.pCode = static_cast<const uint32_t*>(fragmentCode->getBufferPointer());
-    if (vkCreateShaderModule(impl.device, &fragmentModuleInfo, nullptr, &record.fragmentModule) != VK_SUCCESS) {
-        RX_LOG_ERROR("rx_material: vkCreateShaderModule (fragment) failed for material '{}'",
-                     slangModulePath.string());
-        destroyMaterialRecord(impl.device, record);
-        throw std::runtime_error("rx_material: vkCreateShaderModule (fragment) failed for material '" +
-                                  slangModulePath.string() + "'");
-    }
-
-    if (!diagnostics.empty()) {
-        RX_LOG_WARN("rx_material: diagnostics while loading material '{}':\n{}", slangModulePath.string(),
-                     diagnostics);
+    std::error_code mtimeError;
+    auto mtime = std::filesystem::last_write_time(slangModulePath, mtimeError);
+    if (!mtimeError) {
+        record.lastKnownMtime = mtime;
     }
 
     MaterialHandle handle = impl.materials.acquire(std::move(record));
@@ -822,6 +1112,210 @@ const rx::shader::ShaderLayoutInfo& MaterialSystem::layoutInfo(MaterialHandle ha
         throw std::out_of_range("rx_material: MaterialSystem::layoutInfo: invalid or stale MaterialHandle");
     }
     return record->layoutInfo;
+}
+
+const std::vector<MaterialParamInfo>& MaterialSystem::materialParams(MaterialHandle handle) const {
+    MaterialRecord* record = impl_->materials.get(handle);
+    if (record == nullptr) {
+        throw std::out_of_range("rx_material: MaterialSystem::materialParams: invalid or stale MaterialHandle");
+    }
+    return record->params;
+}
+
+uint32_t MaterialSystem::paramBlockSize(MaterialHandle handle) const {
+    MaterialRecord* record = impl_->materials.get(handle);
+    if (record == nullptr) {
+        throw std::out_of_range("rx_material: MaterialSystem::paramBlockSize: invalid or stale MaterialHandle");
+    }
+    return record->paramBlockSize;
+}
+
+void MaterialSystem::beginFrame(uint32_t frameInFlightIndex, uint64_t frameNumber) {
+    Impl& impl = *impl_;
+    impl.paramArena->beginFrame(frameInFlightIndex);
+    impl.currentFrameNumber = frameNumber;
+}
+
+void MaterialSystem::onFrameCompleted(uint64_t completedFrameNumber) {
+    impl_->deletionQueue.onFrameFenceSignaled(completedFrameNumber);
+}
+
+void MaterialSystem::bindInstance(VkCommandBuffer cmd, const rx::graph::PassContext& passContext,
+                                   const InstanceBinding& binding) {
+    Impl& impl = *impl_;
+
+    MaterialRecord* record = impl.materials.get(binding.material);
+    if (record == nullptr) {
+        throw std::out_of_range("rx_material: MaterialSystem::bindInstance: invalid or stale MaterialHandle");
+    }
+    if (binding.paramData == nullptr) {
+        throw std::invalid_argument("rx_material: MaterialSystem::bindInstance: binding.paramData must be non-null");
+    }
+    if (binding.paramSize != record->paramBlockSize) {
+        throw std::invalid_argument(
+            "rx_material: MaterialSystem::bindInstance: binding.paramSize (" + std::to_string(binding.paramSize) +
+            ") does not match this material's reflected paramBlockSize (" +
+            std::to_string(record->paramBlockSize) + ")");
+    }
+
+    PipelineRequest req{binding.material, passContext.passSignature(), /*specializationBits=*/0};
+    VkPipeline pipeline = getPipeline(req);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+
+    if (record->layoutBundle.setLayouts.size() <= kMaterialParamBlockSet) {
+        throw std::runtime_error(
+            "rx_material: MaterialSystem::bindInstance: material '" + record->path.string() +
+            "' has no set-1 parameter-block descriptor set layout");
+    }
+    VkDescriptorSetLayout setLayout = record->layoutBundle.setLayouts[kMaterialParamBlockSet];
+
+    VkDescriptorSet set = impl.paramArena->writeAndAllocate(setLayout, binding.paramData, binding.paramSize);
+    if (set == VK_NULL_HANDLE) {
+        throw std::runtime_error(
+            "rx_material: MaterialSystem::bindInstance: parameter arena exhausted for the current frame");
+    }
+
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, record->layoutBundle.layout,
+                             /*firstSet=*/kMaterialParamBlockSet, 1, &set, 0, nullptr);
+}
+
+void MaterialSystem::reloadChanged() {
+    Impl& impl = *impl_;
+    const std::string shaderDir = RX_MATERIAL_SHADER_DIR;
+
+    for (MaterialHandle handle : impl.materialHandles) {
+        // Re-fetched fresh every iteration -- see Impl::materialHandles'
+        // own comment for why a cached pointer across iterations would be
+        // unsafe (a HandlePool reallocation from an unrelated
+        // loadMaterial() call elsewhere could invalidate it; reloadChanged()
+        // itself never calls loadMaterial(), but the discipline is kept
+        // uniform with every other accessor in this file regardless).
+        MaterialRecord* record = impl.materials.get(handle);
+        if (record == nullptr) {
+            continue;  // released/stale -- nothing to reload.
+        }
+
+        std::error_code statError;
+        auto mtime = std::filesystem::last_write_time(record->path, statError);
+        if (statError) {
+            // File momentarily missing/unreadable (e.g. an editor
+            // mid-save) -- try again next call, not fatal [same "02
+            // pattern" as samples/02_hotreload's own pollAndReloadIfChanged()].
+            continue;
+        }
+        if (!record->lastKnownMtime.has_value()) {
+            // No baseline yet (load-time stat failed, or this is the
+            // first reloadChanged() call) -- establish one now without
+            // treating "never observed before" as "changed".
+            record->lastKnownMtime = mtime;
+            continue;
+        }
+        if (mtime == *record->lastKnownMtime) {
+            continue;  // unchanged since the last call.
+        }
+        record->lastKnownMtime = mtime;
+
+        // --- Fresh Compiler per reload [D9; compiler.h's same-module-name
+        // caveat] -- MaterialSystem's own analogue is a fresh
+        // slang::ISession (this class drives raw Slang, not
+        // rx_shader::Compiler, but the identical caveat applies: reloading
+        // the SAME path -- SAME module name, by construction -- through
+        // impl.session a second time fails with Slang's own "already
+        // loaded with different source" diagnostic). The process's real
+        // fixed cost, `impl.globalSession`'s stdlib load, is reused
+        // unchanged -- only a new, cheap ISession is created here, mirroring
+        // compiler.h's own documented "a fresh Compiler::create() call only
+        // ever pays for a new, cheap ISession, never a new IGlobalSession"
+        // cost model.
+        Slang::ComPtr<slang::ISession> freshSession;
+        if (!createMaterialSession(impl.globalSession.get(), freshSession)) {
+            RX_LOG_WARN("rx_material: reloadChanged: failed to create a fresh Slang session for '{}'; keeping "
+                        "last-good",
+                        record->path.string());
+            continue;
+        }
+
+        std::string forwardEntryDiag;
+        auto freshForwardEntry = loadForwardEntry(freshSession, shaderDir, forwardEntryDiag);
+        if (!freshForwardEntry.has_value()) {
+            RX_LOG_WARN("rx_material: reloadChanged: failed to reload forward_entry.slang while reloading '{}'; "
+                        "keeping last-good:\n{}",
+                        record->path.string(), forwardEntryDiag);
+            continue;
+        }
+
+        ++impl.compileCount;
+        std::string diagnostics;
+        auto compiled = compileMaterial(impl.device, *impl.bindless, freshSession, freshForwardEntry->module,
+                                         freshForwardEntry->vertexEntryPoint.get(),
+                                         freshForwardEntry->fragmentEntryPoint.get(), record->path, diagnostics);
+        if (!compiled.has_value()) {
+            // Keep-last-good: `record` has not been touched at all past
+            // `lastKnownMtime` above -- reload failure is not a caller
+            // error [D9, brief].
+            RX_LOG_WARN("rx_material: hot-reload of '{}' failed, keeping last-good pipeline(s):\n{}",
+                        record->path.string(), diagnostics);
+            continue;
+        }
+        if (!diagnostics.empty()) {
+            RX_LOG_WARN("rx_material: diagnostics while hot-reloading '{}':\n{}", record->path.string(),
+                        diagnostics);
+        }
+
+        uint64_t oldHash = record->contentHash;
+
+        // --- Erase + retire every pipeline-cache entry derived from the
+        // OLD module hash [D9: "a changed hash invalidates exactly the
+        // (material, pass) cache entries derived from that module"].
+        std::vector<PipelineKey> staleKeys;
+        for (const auto& [key, pipeline] : impl.pipelines) {
+            if (key.moduleHash == oldHash) {
+                staleKeys.push_back(key);
+            }
+        }
+        for (const PipelineKey& key : staleKeys) {
+            VkPipeline stalePipeline = impl.pipelines.at(key);
+            impl.pipelines.erase(key);
+            impl.deletionQueue.retire(
+                [device = impl.device, stalePipeline]() { vkDestroyPipeline(device, stalePipeline, nullptr); },
+                impl.currentFrameNumber);
+        }
+
+        // --- Destroy the OLD VkShaderModules immediately -- unlike
+        // VkPipeline, a shader module (and, per the identical Vulkan
+        // spec note, a pipeline layout/descriptor set layout) needs to
+        // remain valid only through vkCreate*Pipelines/command-buffer
+        // RECORDING that uses it, never through GPU EXECUTION -- so there
+        // is no in-flight-command-buffer hazard here to defer against,
+        // unlike VkPipeline itself (which command execution genuinely
+        // does reference for its duration). record->layoutBundle's own
+        // old VkPipelineLayout/VkDescriptorSetLayouts are destroyed by the
+        // move-assignment below (PipelineLayoutBundle::operator= destroys
+        // whatever it's overwriting FIRST -- see that struct's own header
+        // comment, and samples/02_hotreload's destroyReloadablePipeline()
+        // for the identical established pattern).
+        if (record->vertexModule != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(impl.device, record->vertexModule, nullptr);
+        }
+        if (record->fragmentModule != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(impl.device, record->fragmentModule, nullptr);
+        }
+
+        // --- Swap in the new compiled material, preserving path/
+        // lastKnownMtime (already updated above).
+        record->contentHash = compiled->contentHash;
+        record->ownerSession = std::move(compiled->session);
+        record->linkedProgram = std::move(compiled->linkedProgram);
+        record->layoutInfo = std::move(compiled->layoutInfo);
+        record->params = std::move(compiled->params);
+        record->paramBlockSize = compiled->paramBlockSize;
+        record->layoutBundle = std::move(compiled->layoutBundle);
+        record->vertexModule = compiled->vertexModule;
+        record->fragmentModule = compiled->fragmentModule;
+
+        RX_LOG_INFO("rx_material: hot-reload of '{}' succeeded (module hash {:#x} -> {:#x})", record->path.string(),
+                    oldHash, record->contentHash);
+    }
 }
 
 VkPipeline MaterialSystem::getPipeline(const PipelineRequest& req) {
@@ -952,6 +1446,82 @@ VkPipeline MaterialSystem::getPipeline(const PipelineRequest& req) {
 
     impl.pipelines.emplace(key, pipeline);
     return pipeline;
+}
+
+TextureHandle MaterialSystem::createTexture2D(const TextureCreateInfo& info) {
+    Impl& impl = *impl_;
+
+    if (info.width == 0 || info.height == 0) {
+        throw std::invalid_argument(
+            "rx_material: MaterialSystem::createTexture2D: width/height must both be > 0");
+    }
+    if (info.pixels == nullptr || info.pixelBytes == 0) {
+        throw std::invalid_argument(
+            "rx_material: MaterialSystem::createTexture2D: pixels/pixelBytes must be non-null/non-zero");
+    }
+
+    // Texture2D::create() ORs in TRANSFER_DST_BIT (and TRANSFER_SRC_BIT
+    // when mip-chaining) itself -- callers pass only the "real" usage this
+    // texture needs at sample time, per that function's own comment.
+    auto texture = rx::rhi::Texture2D::create(impl.physicalDevice, impl.device, *impl.allocator,
+                                               VkExtent2D{info.width, info.height}, info.format,
+                                               VK_IMAGE_USAGE_SAMPLED_BIT,
+                                               /*requestedMipLevels=*/info.generateMips ? 0 : 1);
+    if (!texture.has_value()) {
+        throw std::runtime_error("rx_material: MaterialSystem::createTexture2D: rx::rhi::Texture2D::create failed");
+    }
+
+    if (!impl.uploader->uploadToImage(*texture, info.pixels, static_cast<VkDeviceSize>(info.pixelBytes),
+                                       info.generateMips)) {
+        throw std::runtime_error("rx_material: MaterialSystem::createTexture2D: Uploader::uploadToImage failed");
+    }
+    impl.uploader->flush();
+
+    rx::rhi::BindlessHandle bindlessHandle =
+        impl.bindless->registerSampledImage(texture->view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (!bindlessHandle.isValid()) {
+        throw std::runtime_error(
+            "rx_material: MaterialSystem::createTexture2D: BindlessTable::registerSampledImage failed (capacity "
+            "exhausted)");
+    }
+
+    TextureRecord record{std::move(*texture), bindlessHandle};
+    TextureHandle handle = impl.textures.acquire(std::move(record));
+    impl.textureHandles.push_back(handle);
+    return handle;
+}
+
+uint32_t MaterialSystem::textureBindlessIndex(TextureHandle handle) const {
+    TextureRecord* record = impl_->textures.get(handle);
+    if (record == nullptr) {
+        throw std::out_of_range("rx_material: MaterialSystem::textureBindlessIndex: invalid or stale TextureHandle");
+    }
+    return record->bindlessHandle.index();
+}
+
+void MaterialSystem::releaseTexture(TextureHandle handle) {
+    Impl& impl = *impl_;
+    TextureRecord* record = impl.textures.get(handle);
+    if (record == nullptr) {
+        RX_LOG_WARN("rx_material: MaterialSystem::releaseTexture: invalid or already-released TextureHandle; "
+                    "ignoring");
+        return;
+    }
+
+    // Per bindless.h's own RELEASE-SAFETY CONTRACT: returning the slot to
+    // the free list now is safe (it never rewrites/destroys anything a
+    // pending command buffer might still read); the real Texture2D/VkImage/
+    // VkImageView teardown is what must wait for the GPU, deferred below.
+    impl.bindless->release(record->bindlessHandle);
+
+    // DeletionQueue's own std::function-copy-constructibility requirement
+    // (deletion_queue.h's own header comment): wrap the moved-out,
+    // move-only Texture2D in a shared_ptr so the retired closure is itself
+    // copy-constructible.
+    auto texturePtr = std::make_shared<rx::rhi::Texture2D>(std::move(record->texture));
+    impl.textures.release(handle);
+    impl.deletionQueue.retire([texturePtr]() { /* dropping the last shared_ptr ref destroys the Texture2D. */ },
+                               impl.currentFrameNumber);
 }
 
 }  // namespace rx::material

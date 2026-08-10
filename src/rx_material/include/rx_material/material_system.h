@@ -7,10 +7,13 @@
 #include <volk.h>
 
 #include <rx_core/handle.h>
+#include <rx_graph/executor.h>
 #include <rx_graph/pass_signature.h>
+#include <rx_material/instance.h>
 #include <rx_rhi_vk/bindless.h>
 #include <rx_shader/shader_layout_info.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -55,6 +58,31 @@ struct PipelineRequest {
     // always 0 in Phase 3's material core, but already part of the cache
     // key so a future axis doesn't need an ABI/cache-format break.
     uint32_t specializationBits = 0;
+};
+
+// A generational handle into MaterialSystem's own internal texture
+// registry [Task 7 coordinator addition 4] -- the same
+// `rx::core::Handle<Tag>` idiom MaterialHandle above and BindlessHandle
+// (rx_rhi_vk/bindless.h) both already use, here for the "one real,
+// renderer-owned rx::rhi::Texture2D + BindlessTable registration" this
+// engine's IRxTexture (rx_api.h) always wraps.
+using TextureHandle = rx::core::Handle<struct TextureTag>;
+
+// Input to MaterialSystem::createTexture2D() -- `format`/`generateMips`
+// mirror rx_api.h's own RxTextureDesc one field at a time (that ABI struct
+// converts its RxFormat enum to a real VkFormat and its int32_t flag to a
+// real bool before calling down to this internal type; see api_impl.cpp's
+// MaterialSystemImpl::createTexture2D()). `pixels`/`pixelBytes` are read
+// synchronously during createTexture2D() (uploaded via this
+// MaterialSystem's own internal rx::rhi::Uploader, flushed before that call
+// returns) -- never retained past it.
+struct TextureCreateInfo {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+    bool generateMips = false;
+    const void* pixels = nullptr;
+    size_t pixelBytes = 0;
 };
 
 class MaterialSystem;
@@ -228,6 +256,161 @@ public:
     // ParameterBlock needs -- IMaterialInstance's job, not this task's).
     // Throws std::out_of_range for an invalid/unknown `handle`.
     [[nodiscard]] const rx::shader::ShaderLayoutInfo& layoutInfo(MaterialHandle handle) const;
+
+    // `handle`'s reflected `TParams` fields -- name, kind, and BYTE
+    // OFFSET/SIZE within the parameter block (rx_material/instance.h's
+    // MaterialParamInfo) [Task 7 coordinator addition 2]: this is the
+    // authoritative reflection api_impl.cpp's IRxMaterialInstance setters
+    // now validate against directly (name lookup -> RX_E_NOTFOUND, kind
+    // mismatch -> RX_E_INVALIDARG) instead of Task 6's own second,
+    // throwaway Slang reflection session -- computed once, here, from the
+    // SAME already-linked `slang::IComponentType` (MaterialRecord::
+    // linkedProgram) that produced this material's real SPIR-V, not a
+    // separately-composed duplicate. Throws std::out_of_range for an
+    // invalid/unknown `handle`.
+    [[nodiscard]] const std::vector<MaterialParamInfo>& materialParams(MaterialHandle handle) const;
+
+    // `handle`'s whole `TParams` struct size, in bytes (the Slang Uniform
+    // parameter category's own size for the ParameterBlock's element type)
+    // -- exactly how many bytes a caller's instance blob (rx_api.h's
+    // IRxMaterialInstance, or any other InstanceBinding producer) must
+    // supply to bindInstance() below. Throws std::out_of_range for an
+    // invalid/unknown `handle`.
+    [[nodiscard]] uint32_t paramBlockSize(MaterialHandle handle) const;
+
+    // Frames-in-flight this MaterialSystem's own per-frame GPU-facing state
+    // (the parameter arena below) is sized for -- fixed at 2, mirroring
+    // rx::rhi::FrameSync::kFramesInFlight (frame_sync.h). Not literally the
+    // same constant (this header does not include frame_sync.h purely for
+    // one value) but documented here as required to match it: every real
+    // caller of beginFrame() below drives this MaterialSystem from the same
+    // frame-in-flight loop that already uses FrameSync.
+    static constexpr uint32_t kFramesInFlight = 2;
+
+    // Advances this MaterialSystem's own per-frame GPU-facing state to a
+    // new frame [binding global constraint: frames-in-flight discipline].
+    // `frameInFlightIndex` (0..kFramesInFlight()-1) selects which parameter-
+    // arena/descriptor-pool slot bindInstance() below writes into next --
+    // same SAFETY CONTRACT as rx::rhi::DescriptorArena::beginFrame() (only
+    // call once the caller has confirmed, via its own fence wait, that this
+    // slot's prior GPU work is complete). `frameNumber` is a monotonically
+    // increasing counter that never repeats for this MaterialSystem's
+    // lifetime (mirroring rx::rhi::FrameSync::frameNumber(), NOT
+    // frameInFlightIndex, which cycles) -- stashed so reloadChanged()'s
+    // VkPipeline retirements and releaseTexture()'s Texture2D retirements
+    // (both routed through this MaterialSystem's own internal DeletionQueue)
+    // are tagged with the frame they actually happened in. Callers are
+    // expected to pass the SAME monotonic source they already feed their
+    // own direct rx::rhi::DeletionQueue::retire() calls (e.g.
+    // rx::rhi::FrameSync::frameNumber()) so this MaterialSystem's own
+    // retirements become due at exactly the point the caller's own are.
+    void beginFrame(uint32_t frameInFlightIndex, uint64_t frameNumber);
+
+    // Runs (and permanently removes) every VkPipeline/Texture2D retirement
+    // this MaterialSystem's internal rx::rhi::DeletionQueue has queued with
+    // a frame number <= `completedFrameNumber` -- call once per real frame,
+    // after the caller has confirmed (via its own fence wait) that frame
+    // `completedFrameNumber`'s GPU work is done. Mirrors DeletionQueue's own
+    // documented "typical frame-loop usage" pattern (deletion_queue.h)
+    // exactly, just routed through this MaterialSystem's own internal
+    // queue rather than one the caller owns directly.
+    void onFrameCompleted(uint64_t completedFrameNumber);
+
+    // Record-time material-instance binding [Task 7 coordinator addition 3;
+    // brief: "MaterialSystem::bindInstance(cmd, PassContext&, instance) --
+    // new internal API consumed by sample 06"] -- NOT on the ABI surface
+    // this phase (draw submission is not public in Phase 3, per spec
+    // D5/D11). Resolves `binding.material`'s VkPipeline for
+    // `passContext.passSignature()` (getPipeline() above -- lazily compiles
+    // it on first use, exactly as that method already documents) and binds
+    // it, then copies `binding.paramData` (exactly `paramBlockSize(binding.
+    // material)` bytes, laid out per materialParams()' own offsets) into
+    // this MaterialSystem's own per-frame parameter arena, allocates a
+    // set-1 VkDescriptorSet from it, writes the UBO descriptor, and binds
+    // that set at set index 1. Sampling stays bindless set-0 [D8] -- this
+    // method never touches set 0; the caller binds the owning
+    // rx::rhi::BindlessTable's own descriptor set once per frame/pass,
+    // exactly the established pattern (samples/03_bindless_mesh).
+    //
+    // Throws std::out_of_range for an invalid/unknown `binding.material`.
+    // Throws std::invalid_argument if `binding.paramData` is null or
+    // `binding.paramSize` does not equal `paramBlockSize(binding.material)`
+    // exactly -- every real caller already has that size from
+    // paramBlockSize() itself, so a mismatch here is a caller bug, not a
+    // recoverable runtime condition. Throws std::runtime_error if the
+    // per-frame parameter arena is exhausted (kFramesInFlight-many
+    // beginFrame() calls without an intervening onFrameCompleted() growing
+    // unbounded is a caller bug, not this method's to silently paper over)
+    // or if the underlying getPipeline()/vkCreateGraphicsPipelines call
+    // fails (same as getPipeline() itself).
+    void bindInstance(VkCommandBuffer cmd, const rx::graph::PassContext& passContext, const InstanceBinding& binding);
+
+    // Restates the module-path list `loadMaterial()` has been called with
+    // on this instance, stats each one's current on-disk mtime (the same
+    // ~4 Hz-poll-friendly `std::filesystem::last_write_time` mechanism
+    // samples/02_hotreload/main.cpp establishes -- this method does the
+    // stat, not the polling cadence, which stays the caller's job), and for
+    // every module whose mtime changed since the last call: recompiles it
+    // against a FRESH `slang::ISession` (this class's own analogue of
+    // compiler.h's "fresh Compiler per reload" same-module-name caveat --
+    // reusing `handle`'s already-loaded session/module name would fail with
+    // Slang's own "already loaded with different source" diagnostic) [D9].
+    //
+    // On a successful recompile: erases every getPipeline()-cached
+    // VkPipeline keyed by the module's OLD content hash and retires them
+    // through this MaterialSystem's own internal DeletionQueue (tagged with
+    // the frame number most recently passed to beginFrame() -- actually
+    // destroyed only once onFrameCompleted() confirms that frame is done);
+    // subsequent getPipeline() calls for this material re-link lazily
+    // against the NEW hash, exactly like a first-time cache miss. The
+    // material's old VkShaderModules/VkPipelineLayout/VkDescriptorSetLayouts
+    // are destroyed immediately (safe without deferring, unlike VkPipeline
+    // itself -- see material_system.cpp's own comment on exactly why), and
+    // `layoutInfo()`/`pipelineLayout()`/`materialParams()`/`paramBlockSize()`
+    // all reflect the NEW module from the moment this call returns.
+    //
+    // On a failed recompile (syntax error, reflection rejection, ...): logs
+    // Slang's diagnostic text and every other failure detail via
+    // RX_LOG_WARN and leaves the material's existing (last-good) compiled
+    // state completely untouched -- a reload failure is not this method's
+    // caller's error, so this never throws for that reason (it can still
+    // throw std::bad_alloc etc. on genuine allocation failure, like every
+    // other method here). A module this instance cannot currently stat
+    // (e.g. momentarily missing mid-save) is treated the same way: logged,
+    // skipped this call, retried on the next call.
+    void reloadChanged();
+
+    // Creates a real, renderer-owned rx::rhi::Texture2D from `info` (via
+    // this MaterialSystem's own internal rx::rhi::Allocator/Uploader),
+    // registers its view into the SAME rx::rhi::BindlessTable passed to
+    // create() as a sampled image, and returns a handle whose
+    // textureBindlessIndex() below is exactly the u32 a material instance's
+    // setTexture()-bound blob field stores [D8; Task 7 coordinator addition
+    // 4]. Throws std::invalid_argument if `info.width`/`info.height` is 0
+    // or `info.pixels`/`info.pixelBytes` is null/0. Throws
+    // std::runtime_error if Texture2D creation, the upload, or the
+    // BindlessTable registration (capacity exhausted) fails.
+    [[nodiscard]] TextureHandle createTexture2D(const TextureCreateInfo& info);
+
+    // `handle`'s bindless sampled-image index (rx::rhi::BindlessHandle::
+    // index()) -- the value setTexture()'s blob field stores. Throws
+    // std::out_of_range for an invalid/unknown `handle`.
+    [[nodiscard]] uint32_t textureBindlessIndex(TextureHandle handle) const;
+
+    // Releases `handle`'s BindlessTable slot immediately (safe per
+    // bindless.h's own RELEASE-SAFETY CONTRACT: it only returns the slot to
+    // the free list, never rewrites or destroys anything a pending command
+    // buffer might still read) and retires the underlying rx::rhi::Texture2D
+    // through this MaterialSystem's own internal DeletionQueue, tagged with
+    // the frame number most recently passed to beginFrame() -- actually
+    // destroyed only once onFrameCompleted() confirms that frame's GPU work
+    // is done [bindless.h's own release-safety contract; Task 7 coordinator
+    // addition 4]. A no-op (logs a warning, never throws or crashes) for an
+    // invalid or already-released `handle` -- this is the release() path a
+    // COM-lite IRxTexture::release() (api_impl.cpp) calls unconditionally
+    // once its own refcount reaches zero, and D5 forbids anything reachable
+    // from that boundary from ever throwing.
+    void releaseTexture(TextureHandle handle);
 
     // Forward-declared publicly, defined only in material_system.cpp --
     // the exact same "nameable but not constructible/reachable outside
