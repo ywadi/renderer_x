@@ -3,10 +3,10 @@
 # later configure. A cache hit costs zero compilation.
 #
 # Cache key format: SHA256(name|tag|triple|zig-version|length-prefixed CMAKE_ARGS)
-# CMAKE_ARGS are encoded as "<len>:<arg>" per element (lengths prevent collisions
-# when args contain ";" or "|"), concatenated without separator. Truncated to 16
-# hex chars, then prefixed with name: "name-<hash>". Changing CMAKE_ARGS
-# invalidates the key and forces a rebuild.
+# CMAKE_ARGS are encoded as "<len>:<arg>" per element (length-prefixing ensures
+# distinct keys for distinct argument lists, regardless of delimiter characters).
+# Truncated to 16 hex chars, then prefixed with name: "name-<hash>". Changing
+# CMAKE_ARGS invalidates the key and forces a rebuild.
 
 function(rx_dep_cache_key OUT_VAR NAME TAG CMAKE_ARGS_LIST)
   execute_process(
