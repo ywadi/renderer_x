@@ -1,13 +1,18 @@
 # Builds a CMake-based dependency exactly once per (name, pin, target
-# triple, zig version) and reuses the cached install on every later
-# configure. A cache hit costs zero compilation.
+# triple, zig version, CMAKE_ARGS) and reuses the cached install on every
+# later configure. A cache hit costs zero compilation.
+#
+# Cache key format: SHA256(name|tag|triple|zig-version|CMAKE_ARGS joined)
+# truncated to 16 hex chars, then prefixed with name: "name-<hash>".
+# Changing CMAKE_ARGS invalidates the key and forces a rebuild.
 
-function(rx_dep_cache_key OUT_VAR NAME TAG)
+function(rx_dep_cache_key OUT_VAR NAME TAG CMAKE_ARGS_LIST)
   execute_process(
     COMMAND "${CMAKE_SOURCE_DIR}/toolchain/zig/zig" version
     OUTPUT_VARIABLE _zig_version
     OUTPUT_STRIP_TRAILING_WHITESPACE)
-  string(SHA256 _hash "${NAME}|${TAG}|${RX_TARGET_TRIPLE}|${_zig_version}")
+  string(JOIN "|" _cmake_args_str ${CMAKE_ARGS_LIST})
+  string(SHA256 _hash "${NAME}|${TAG}|${RX_TARGET_TRIPLE}|${_zig_version}|${_cmake_args_str}")
   string(SUBSTRING "${_hash}" 0 16 _hash)
   set(${OUT_VAR} "${NAME}-${_hash}" PARENT_SCOPE)
 endfunction()
@@ -17,7 +22,7 @@ function(rx_add_cached_dependency)
   set(multiValueArgs CMAKE_ARGS)
   cmake_parse_arguments(DEP "" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
-  rx_dep_cache_key(_key ${DEP_NAME} ${DEP_TAG})
+  rx_dep_cache_key(_key ${DEP_NAME} ${DEP_TAG} "${DEP_CMAKE_ARGS}")
   set(_cache_dir "${CMAKE_SOURCE_DIR}/.deps-cache/${_key}")
   set(_marker "${_cache_dir}/.rx-built")
 

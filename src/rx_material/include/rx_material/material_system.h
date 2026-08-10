@@ -254,12 +254,13 @@ public:
     // specializationBits) key [D7]; a repeated call with an
     // already-cached key returns the same handle immediately. Every
     // VkPipeline this creates uses fixed rasterization/multisample/
-    // blend/depth-stencil state (opaque, no culling, depth test+write
-    // enabled iff `req.pass.depthFormat != VK_FORMAT_UNDEFINED`) and the
-    // fixed position/normal/uv vertex-input layout
-    // forward_entry.slang's own header comment documents -- there are no
-    // other fixed-function axes for a Phase 3 material pipeline to vary
-    // on, so none of that state is itself part of the cache key.
+    // blend/depth-stencil state (opaque, back-face culling with
+    // counter-clockwise front-face, depth test+write enabled iff
+    // `req.pass.depthFormat != VK_FORMAT_UNDEFINED`) and the fixed
+    // position/normal/uv vertex-input layout forward_entry.slang's own
+    // header comment documents -- there are no other fixed-function axes
+    // for a Phase 3 material pipeline to vary on, so none of that state is
+    // itself part of the cache key.
     //
     // Throws std::out_of_range for an invalid/unknown `req.material`.
     // Throws std::runtime_error if `req.pass` declares neither a color nor

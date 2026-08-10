@@ -29,8 +29,8 @@ The full system decomposes into these layers, bottom to top:
 | 3 | RHI — Vulkan Backend | Device/queue/swapchain, command buffers, pipelines, sync |
 | 4 | Shader Compilation & Reflection | Slang → SPIR-V, reflection-driven layouts |
 | 5 | Resource Management | Buffer/texture lifetime, staging, bindless tables |
-| 6 | Render Graph | Declarative passes/resources, auto barriers, transient aliasing |
-| 7 | Material / Shading Abstraction | `IMaterial`, `IShaderModule`, `ITexture`, `IMesh` |
+| 6 | Render Graph | Declarative passes/resources, auto barriers, transient aliasing (delivered: Phase 3) |
+| 7 | Material / Shading Abstraction | `IMaterial`, `IShaderModule`, `ITexture`, `IMesh` (delivered: Phase 3) |
 | 8 | Scene Submission | Render items, transforms, cameras, lights; culling/LOD |
 | 9 | Rendering Techniques | Shadows, lighting, post stack, upscaling |
 | 10 | Asset Import (offline) | Mesh/texture import & baking tooling |
