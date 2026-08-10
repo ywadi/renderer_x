@@ -2,17 +2,23 @@
 # triple, zig version, CMAKE_ARGS) and reuses the cached install on every
 # later configure. A cache hit costs zero compilation.
 #
-# Cache key format: SHA256(name|tag|triple|zig-version|CMAKE_ARGS joined)
-# truncated to 16 hex chars, then prefixed with name: "name-<hash>".
-# Changing CMAKE_ARGS invalidates the key and forces a rebuild.
+# Cache key format: SHA256(name|tag|triple|zig-version|length-prefixed CMAKE_ARGS)
+# CMAKE_ARGS are encoded as "<len>:<arg>" per element (lengths prevent collisions
+# when args contain ";" or "|"), concatenated without separator. Truncated to 16
+# hex chars, then prefixed with name: "name-<hash>". Changing CMAKE_ARGS
+# invalidates the key and forces a rebuild.
 
 function(rx_dep_cache_key OUT_VAR NAME TAG CMAKE_ARGS_LIST)
   execute_process(
     COMMAND "${CMAKE_SOURCE_DIR}/toolchain/zig/zig" version
     OUTPUT_VARIABLE _zig_version
     OUTPUT_STRIP_TRAILING_WHITESPACE)
-  string(JOIN "|" _cmake_args_str ${CMAKE_ARGS_LIST})
-  string(SHA256 _hash "${NAME}|${TAG}|${RX_TARGET_TRIPLE}|${_zig_version}|${_cmake_args_str}")
+  set(_cmake_args_encoded "")
+  foreach(_arg ${CMAKE_ARGS_LIST})
+    string(LENGTH "${_arg}" _arg_len)
+    string(APPEND _cmake_args_encoded "${_arg_len}:${_arg}")
+  endforeach()
+  string(SHA256 _hash "${NAME}|${TAG}|${RX_TARGET_TRIPLE}|${_zig_version}|${_cmake_args_encoded}")
   string(SUBSTRING "${_hash}" 0 16 _hash)
   set(${OUT_VAR} "${NAME}-${_hash}" PARENT_SCOPE)
 endfunction()
