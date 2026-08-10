@@ -2,6 +2,15 @@
 
 This repository is pushed to a public remote: `git@github.com:ywadi/renderer_x.git`.
 
+**Project board:** https://github.com/users/ywadi/projects/2 ("RendererX
+Roadmap") tracks phase work as issue cards (labels: `phase-N`, `carried`).
+The board MIRRORS the repo's plan/spec documents and SDD ledgers — those
+remain the source of truth; on any conflict the repo documents win. The
+coordinator maintains the board (creating issues, moving card status as
+tasks progress, closing issues on delivery); implementer/reviewer agents do
+not need to touch it. Issue text follows the same policy as everything else
+remote-visible: factual, professional, and no AI attribution of any kind.
+
 **No AI attribution of any kind in this repo's history or remote-visible content.**
 
 - Never add "Co-Authored-By: Claude" (or any AI attribution) to commit messages.
