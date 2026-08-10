@@ -92,6 +92,17 @@ public:
     // currently reads from; advanced by advanceFrame().
     uint32_t currentFrameIndex() const { return currentFrame_; }
 
+    // Monotonically increasing count of completed advanceFrame() calls
+    // since create() -- NOT the same value as currentFrameIndex(), which
+    // cycles mod kFramesInFlight (0, 1, 0, 1, ...) and therefore cannot
+    // disambiguate "frame 5" from "frame 7" once both land on the same
+    // frame-in-flight slot. rx::rhi::DeletionQueue (Task 4) keys its
+    // retire()/onFrameFenceSignaled() calls on THIS counter instead,
+    // specifically because it needs a value that never repeats for the
+    // lifetime of this FrameSync -- the minimal hook this class needed
+    // for that integration, per the Phase 2 plan's Task 4 brief.
+    uint64_t frameNumber() const { return frameNumber_; }
+
     // Current frame-in-flight slot's fence. Created VK_FENCE_CREATE_SIGNALED_BIT
     // so the loop's very first wait on any slot returns immediately. The
     // loop's contract with this fence: wait on it before touching this
@@ -132,8 +143,12 @@ public:
     // Call exactly once per loop iteration that completes a full
     // acquire/record/submit/present cycle -- not on an iteration that bails
     // out early via NeedsRecreate's `continue` path, since that iteration
-    // never submitted anything against the current slot.
-    void advanceFrame() { currentFrame_ = (currentFrame_ + 1) % kFramesInFlight; }
+    // never submitted anything against the current slot. Also increments
+    // frameNumber() -- the two counters advance together, by construction.
+    void advanceFrame() {
+        currentFrame_ = (currentFrame_ + 1) % kFramesInFlight;
+        ++frameNumber_;
+    }
 
     // Rebuilds the per-swapchain-image renderFinished semaphores for a new
     // image count after Device::recreateSwapchain() -- the per-frame-in-
@@ -165,6 +180,7 @@ private:
     std::vector<VkSemaphore> renderFinished_;
 
     uint32_t currentFrame_ = 0;
+    uint64_t frameNumber_ = 0;
 };
 
 }  // namespace rx::rhi

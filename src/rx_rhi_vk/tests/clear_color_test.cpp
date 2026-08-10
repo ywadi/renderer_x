@@ -119,29 +119,6 @@ TEST_CASE("CommandContext::runOnce + transitionImage clear an offscreen image vi
     }
     REQUIRE(memoryTypeIndex != UINT32_MAX);
 
-    // Allocator::createHostVisibleBuffer (Task 2) only ever *requires*
-    // VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT for its
-    // VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT allocations
-    // (verified directly against VMA v3.4.0's FindMemoryPreferences(): the
-    // sequential-write path only adds VK_MEMORY_PROPERTY_HOST_CACHED_BIT to
-    // outNotPreferredFlags, never requires HOST_COHERENT) -- so nothing
-    // guarantees through that API alone that the readback buffer created
-    // below ends up host-coherent. Buffer/Allocator's public surface has no
-    // way to reach the underlying VmaAllocation to call
-    // vmaInvalidateAllocation() explicitly, so instead verify the
-    // precondition this test's memcpy-after-vkQueueWaitIdle read relies on:
-    // every HOST_VISIBLE memory type this physical device exposes is also
-    // HOST_COHERENT (true for every desktop Vulkan driver in practice,
-    // never violated in this codebase's target set) -- making that
-    // assumption a verified, testable fact rather than a silent one that
-    // could someday read stale data on hardware with a truly non-coherent
-    // host-visible heap.
-    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
-        if ((memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0U) {
-            REQUIRE((memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0U);
-        }
-    }
-
     VkMemoryAllocateInfo memAllocInfo{};
     memAllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     memAllocInfo.allocationSize = memReq.size;
@@ -219,11 +196,30 @@ TEST_CASE("CommandContext::runOnce + transitionImage clear an offscreen image vi
             vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1, &region);
         });
 
-        // runOnce() above already vkQueueWaitIdle()'d before returning, and
-        // the REQUIRE above confirmed this device's host-visible memory is
-        // also host-coherent, so the copy's writes are already visible to
-        // this host read with no further barrier or
-        // vkInvalidateMappedMemoryRanges needed.
+        // runOnce() above already vkQueueWaitIdle()'d before returning, so
+        // the copy is complete on the GPU side -- but Allocator::
+        // createHostVisibleBuffer only ever *requires*
+        // VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT (verified directly against
+        // VMA v3.4.0's FindMemoryPreferences(): the sequential-write path
+        // only adds VK_MEMORY_PROPERTY_HOST_CACHED_BIT to
+        // outNotPreferredFlags, never requires HOST_COHERENT), so nothing
+        // guarantees the GPU's writes are visible to a plain memcpy from
+        // this mapped pointer without an explicit invalidate first. An
+        // earlier version of this test worked around that gap by
+        // `REQUIRE`ing every HOST_VISIBLE memory type on this physical
+        // device was also HOST_COHERENT as a proxy precondition, because
+        // Buffer/Allocator's public surface had no way to reach the
+        // underlying VmaAllocation to call vmaInvalidateAllocation()
+        // directly. Buffer::invalidate() (added this task, closing that
+        // exact gap from Phase 1 Task 3's review) replaces the proxy
+        // check entirely: it is correct to call unconditionally regardless
+        // of whether this memory type actually is coherent -- VMA's own
+        // implementation skips the real vkInvalidateMappedMemoryRanges
+        // call when the memory type doesn't need it -- so this now works
+        // correctly even on a hypothetical non-coherent host-visible heap,
+        // not just the coherent-in-practice hardware this test happens to
+        // run on today.
+        readback->invalidate();
         std::memcpy(pixels.data(), readback->mappedData(), pixels.size());
     }
 

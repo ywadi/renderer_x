@@ -186,6 +186,36 @@ if(NOT vma_POPULATED)
 endif()
 set(vma_SOURCE_DIR "${vma_SOURCE_DIR}" PARENT_SCOPE)
 
+# stb (stb_image.h): header-only image decoder, used by rx_rhi_vk's texture
+# upload path (Task 4, rx::rhi::Texture2D/Uploader) to decode PNG/JPG/etc.
+# pixel data from disk into raw RGBA8 bytes -- the spec's Fixed decision
+# #10: "stb_image ... Public upload surface is 'pixels + format + extent
+# in -> bindless handle out' so a libktx backend can slot in later without
+# touching descriptor code" [R:C3]. Exactly like volk/VMA above: stb's repo
+# has no CMakeLists.txt at all (it's a loose collection of public-domain
+# single-header libraries, not a buildable project) and no version tags
+# (all releases are untagged commits on `master`), so this fetches the
+# source only via FetchContent_Populate (never FetchContent_MakeAvailable,
+# which would have nothing to add_subdirectory anyway) and PARENT_SCOPE-
+# propagates stb_SOURCE_DIR up to the root scope for src/rx_rhi_vk (a
+# sibling directory under the root CMakeLists.txt, not a descendant of this
+# one) to consume -- same CMake 3.22 sibling-scope reason documented above
+# volk/VMA. The implementation itself is compiled exactly once, in
+# src/rx_rhi_vk/src/stb_impl.cpp (STB_IMAGE_IMPLEMENTATION defined there
+# only), mirroring vma_impl.cpp's own single-TU-implementation discipline:
+# defining STB_IMAGE_IMPLEMENTATION in more than one TU is a
+# duplicate-symbol link error.
+set(RX_STB_TAG "2c980bb59875b0d32144a71867fbdebb2f77cd20") # nothings/stb has no version tags; pinned commit, master as of this task's date
+FetchContent_Declare(stb
+  GIT_REPOSITORY https://github.com/nothings/stb.git
+  GIT_TAG ${RX_STB_TAG}
+  GIT_SHALLOW TRUE)
+FetchContent_GetProperties(stb)
+if(NOT stb_POPULATED)
+  FetchContent_Populate(stb)
+endif()
+set(stb_SOURCE_DIR "${stb_SOURCE_DIR}" PARENT_SCOPE)
+
 # vk-bootstrap: instance/device/swapchain setup helper, a real compiled
 # library, so (unlike volk/GLM/doctest) it goes through the dependency cache
 # rather than plain FetchContent.

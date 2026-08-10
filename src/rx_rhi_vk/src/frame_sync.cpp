@@ -108,6 +108,7 @@ FrameSync& FrameSync::operator=(FrameSync&& other) noexcept {
         commandBuffers_ = other.commandBuffers_;
         renderFinished_ = std::move(other.renderFinished_);
         currentFrame_ = other.currentFrame_;
+        frameNumber_ = other.frameNumber_;
 
         other.device_ = VK_NULL_HANDLE;
         other.fences_.fill(VK_NULL_HANDLE);
@@ -116,6 +117,7 @@ FrameSync& FrameSync::operator=(FrameSync&& other) noexcept {
         other.commandBuffers_.fill(VK_NULL_HANDLE);
         other.renderFinished_.clear();
         other.currentFrame_ = 0;
+        other.frameNumber_ = 0;
     }
     return *this;
 }
