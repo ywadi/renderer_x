@@ -173,6 +173,15 @@ it is out of scope for *this* spec only, not out of scope for the project:
     performance counters.
 - macOS/MoltenVK support
 - DLL ABI-stability strategy for the public interface
+- **Multi-language bindings** (committed 2026-08-10, SDK phase): the public
+  API ships C-ABI-first — a single IDL source generates the C header, the
+  C++ COM-lite header, and the DLL shim (bgfx precedent; kills header
+  drift) — and each language binds the C header via its own native tool
+  (Rust bindgen, Zig translate-c, C# P/Invoke generators, Python cffi,
+  Lua FFI). SWIG is the recorded fallback if a broad scripting-language
+  sweep is ever wanted directly from C++, but C-first is the strategy.
+  The COM-lite surface discipline (PODs, no STL/exceptions, error codes)
+  already satisfies every generator's input constraints by construction.
 - **Main-loop ownership** (decided 2026-08-10, binds the SDK-phase spec):
   RendererX is library-model — the consuming game/engine owns `main()` and
   the frame loop and calls an explicit frame API (begin-frame → declare
