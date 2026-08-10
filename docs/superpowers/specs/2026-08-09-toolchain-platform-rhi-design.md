@@ -173,3 +173,12 @@ it is out of scope for *this* spec only, not out of scope for the project:
     performance counters.
 - macOS/MoltenVK support
 - DLL ABI-stability strategy for the public interface
+- **Main-loop ownership** (decided 2026-08-10, binds the SDK-phase spec):
+  RendererX is library-model — the consuming game/engine owns `main()` and
+  the frame loop and calls an explicit frame API (begin-frame → declare
+  passes/submit → end-frame), never the reverse. No required init/frame
+  callbacks, no engine-owned loop: the audience is custom-engine
+  developers who own their own loops (bgfx/PhysX/FMOD precedent). An
+  optional thin "runner" convenience (window + per-frame callback, e.g.
+  over SDL3's callback mode) may ship later for quick starts, built ON the
+  library API and never required by it.
