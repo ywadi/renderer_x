@@ -42,6 +42,23 @@ std::optional<MeshBuffers> MeshBuffers::create(Allocator& allocator, Uploader& u
         RX_LOG_ERROR("MeshBuffers::create: vertex upload failed");
         return std::nullopt;
     }
+    // REAL BUG FIX: flush immediately after the vertex upload succeeds,
+    // rather than deferring to a single flush() call at the very end
+    // after both uploads. If the vertex upload took the staging path, it
+    // only RECORDED a copy into Uploader's command buffer -- nothing
+    // touches the GPU until flush() submits it. Without this early
+    // flush(), a subsequent index-upload failure below hits `return
+    // std::nullopt` before flush() ever runs, so `vertexBuffer`'s RAII
+    // destructor fires (destroying its VkBuffer) while that copy is still
+    // only recorded, never submitted -- and once flush() eventually runs
+    // on some *later* Uploader use, it would submit a copy command
+    // referencing an already-destroyed buffer. Flushing here makes the
+    // vertex copy submitted and (per Uploader::flush()'s synchronous
+    // contract) complete before vertexBuffer can ever be destroyed,
+    // independent of whether the index upload below succeeds. flush() is
+    // a safe no-op if the vertex upload took the direct (non-staging)
+    // path instead (nothing was recorded, so there is nothing to submit).
+    uploader.flush();
     if (!uploader.uploadToBuffer(*indexBuffer, 0, indexData, indexBytes)) {
         RX_LOG_ERROR("MeshBuffers::create: index upload failed");
         return std::nullopt;

@@ -15,8 +15,12 @@ std::optional<Allocator> Allocator::createRaw(VkPhysicalDevice physicalDevice, V
     // requires (see buffer.h's comment above the VMA_STATIC_VULKAN_FUNCTIONS
     // / VMA_DYNAMIC_VULKAN_FUNCTIONS defines for why nothing else is
     // hand-filled here). volk exposes both as real global function pointers
-    // once volkInitialize()/volkLoadInstance() (Context::create) and
-    // volkLoadDevice() (Device::create) have run.
+    // once volkInitialize()/volkLoadInstance() (Context::create) have run --
+    // volkLoadInstance() is what populates vkGetDeviceProcAddr too (verified
+    // against volk.c:253; see buffer.h's comment for the exact call chain).
+    // Device::create()'s volkLoadDevice() call populates a separate
+    // per-device function table and is not what this global pointer relies
+    // on.
     VmaVulkanFunctions vulkanFunctions{};
     vulkanFunctions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
     vulkanFunctions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;

@@ -1,6 +1,6 @@
 # RendererX
 
-A from-scratch Vulkan 1.3 renderer for custom game engines. RendererX establishes a baseline of dynamic rendering and synchronization2 support, targets Steam Deck as the hardware floor, and cross-compiles from Linux to Windows via a vendored zig toolchain. Shaders are authored in Slang. Phase 1 status: foundation layers complete (toolchain → platform → RHI → first triangle sample).
+A from-scratch Vulkan 1.3 renderer for custom game engines. RendererX establishes a baseline of dynamic rendering and synchronization2 support, targets Steam Deck as the hardware floor, and cross-compiles from Linux to Windows via a vendored zig toolchain. Shaders are authored in Slang. Phase 2 status: Phase 1's foundation layers plus runtime Slang compilation and reflection, bindless resource management, and four samples (triangle, shader hot-reload, bindless mesh, texture streaming) are complete.
 
 [![CI](https://github.com/ywadi/renderer_x/actions/workflows/ci.yml/badge.svg)](https://github.com/ywadi/renderer_x/actions/workflows/ci.yml)
 
@@ -66,8 +66,12 @@ For detailed build and run instructions per platform, including Steam Deck and m
 - **src/rx_core/** — Foundation library: math (GLM), logging (spdlog), memory, containers, handles
 - **src/rx_platform/** — Platform abstraction: window (SDL3), input, events, threads
 - **src/rx_rhi_vk/** — Vulkan 1.3 RHI: device/queue/swapchain, command buffers, pipelines, synchronization
+- **src/rx_shader/** — Runtime Slang-to-SPIR-V compilation and shader reflection (descriptor/push-constant layout)
 - **shaders/** — Shader source files (Slang)
 - **samples/01_triangle/** — Hardcoded white triangle via dynamic rendering, headless and present modes
+- **samples/02_hotreload/** — Fullscreen triangle with a runtime-compiled (Slang, not offline slangc) fragment shader and a reflection-driven pipeline layout; live shader hot-reload in present mode
+- **samples/03_bindless_mesh/** — Procedural meshes and textures driven entirely through one bindless descriptor table and a reflection-derived pipeline layout
+- **samples/04_streaming/** — Texture streaming into a fixed bindless residency budget, exercising deferred eviction/re-registration safety while frames are in flight
 - **tools/** — Utilities: dependency cache, Slang prebuilt fetch, build-budget checker
 - **third_party/** — Vendored dependencies (volk, vk-bootstrap, VMA, SDL3, GLM, spdlog)
 
@@ -75,9 +79,9 @@ For detailed build and run instructions per platform, including Steam Deck and m
 
 **Phase 1 (complete):** Toolchain, platform abstraction, core library, RHI foundation, first triangle sample with both headless and present-mode rendering.
 
-**Phase 2 (in progress):** Runtime Slang compilation and shader reflection; bindless descriptor design; additional samples and test coverage.
+**Phase 2 (complete):** Runtime Slang compilation and shader reflection (`src/rx_shader/`); bindless descriptor management (`rx::rhi::BindlessTable`); reflection-driven pipeline layouts; three new samples (02_hotreload, 03_bindless_mesh, 04_streaming) plus expanded test coverage; CI + packaging for all four samples.
 
-**Phase 3 and beyond:** Render graph (declarative passes, automatic barriers); material system (IMaterial, IShaderModule, ITexture, IMesh); asset pipeline (mesh/texture import); scene submission (cameras, lights, culling); rendering techniques (shadows, post-processing, upscaling); tooling (GPU markers, profiling, validation). See [`docs/superpowers/specs/`](docs/superpowers/specs/) for design documents.
+**Phase 3 (in progress) and beyond:** Render graph (declarative passes, automatic barriers); material system (IMaterial, IShaderModule, ITexture, IMesh); asset pipeline (mesh/texture import); scene submission (cameras, lights, culling); rendering techniques (shadows, post-processing, upscaling); tooling (GPU markers, profiling, validation). See [`docs/superpowers/specs/`](docs/superpowers/specs/) for design documents.
 
 ## Testing
 

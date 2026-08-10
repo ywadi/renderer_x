@@ -55,6 +55,27 @@ struct CompileResult {
 // (cheap; "session per target config" [spec Fixed decision #2]), created
 // once in `create()` and reused for every subsequent compile call on that
 // instance -- this is the "session reuse" a hot-reload loop relies on.
+//
+// SAME-MODULE-NAME CAVEAT -- read before building any reload/recompile
+// loop: an `ISession` appears to cache loaded modules by name, so calling
+// compileFromSource()/compileFromFile() a SECOND time with the SAME
+// `moduleName` (compileFromFile() always derives this from the file's
+// stem, so this is exactly "reload the same path twice") but DIFFERENT
+// source, through the SAME Compiler instance, fails with Slang's own
+// "module already loaded with different source" diagnostic -- this is a
+// real, verified finding, not a hypothetical: see
+// `samples/02_hotreload/main.cpp`'s `buildPipelineFromFile()` and its own
+// doc comment for exactly this failure and the load-bearing fix. The safe
+// pattern is what that sample does: build a FRESH `Compiler` (and,
+// underneath it, a fresh `ISession`) for every reload, rather than
+// reusing one `Compiler` across repeated compiles of a changing file/
+// module name. This does not reintroduce the cost this class exists to
+// amortize -- the process-lifetime global session above (the genuinely
+// expensive part, Slang's stdlib load) is shared process-wide regardless
+// of how many `Compiler`/`ISession` instances are created, per this
+// class's own design described above; a fresh `Compiler::create()` call
+// only ever pays for a new, cheap `ISession`, never a new
+// `IGlobalSession`.
 class Compiler {
 public:
     // Slang::ComPtr already handles move/release correctly on its own, so
@@ -117,6 +138,12 @@ public:
     // like compileFromSource, using the file's stem as the module name so
     // diagnostics reference the real path on disk (useful for hot-reload:
     // error messages point at the file the user is actually editing).
+    //
+    // Calling this a second time on the SAME `path` through THIS SAME
+    // Compiler after the file's content on disk has changed fails -- see
+    // this header's class-level "SAME-MODULE-NAME CAVEAT" comment above
+    // for why and for the safe pattern (a fresh Compiler per reload, as
+    // `samples/02_hotreload/main.cpp`'s `buildPipelineFromFile()` does).
     CompileResult compileFromFile(const std::string& path, const std::vector<std::string>& entryPointNames);
 
 private:

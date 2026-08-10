@@ -2,13 +2,18 @@
 
 // VMA function-loading mode: hand VMA only the two entry points volk exposes
 // as real global function pointers (vkGetInstanceProcAddr/
-// vkGetDeviceProcAddr, populated by volkInitialize()/volkLoadInstance()/
-// volkLoadDevice() -- see rx_rhi_vk/context.h and device.h) and let VMA's
+// vkGetDeviceProcAddr, both populated by volkInitialize()/volkLoadInstance()
+// -- NOT volkLoadDevice(), verified directly against the vendored volk.c:
+// volkLoadInstance() calls volkGenLoadInstance(), which is what assigns the
+// global `vkGetDeviceProcAddr` pointer (volk.c:253); volkLoadDevice() only
+// populates a per-device VolkDeviceTable, never touching that global. See
+// rx_rhi_vk/context.h (volkInitialize()/volkLoadInstance()) and device.h
+// (volkLoadDevice(), irrelevant to this global) -- and let VMA's
 // own dynamic-loading path (VMA_DYNAMIC_VULKAN_FUNCTIONS) resolve every
 // other Vulkan entry point itself via those two. Do NOT hand-fill a partial
 // VmaVulkanFunctions table instead (the classic copy-pasted Vulkan-1.0-era
 // sample): with VmaAllocatorCreateInfo::vulkanApiVersion ==
-// VK_API_VERSION_1_3 (see allocator.cpp), VMA additionally needs the `*2`
+// VK_API_VERSION_1_3 (see buffer.cpp), VMA additionally needs the `*2`
 // variants -- vkGetBufferMemoryRequirements2, vkBindBufferMemory2,
 // vkGetPhysicalDeviceMemoryProperties2, vkGetDeviceBufferMemoryRequirements,
 // etc. -- which a hand-filled 1.0-only table omits; VMA's internal

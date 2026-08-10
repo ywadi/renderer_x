@@ -933,8 +933,29 @@ bool evictOldestAndStreamInNext(VkPhysicalDevice physicalDevice, VkDevice device
             auto handle = scenePtr->bindlessTable.registerSampledImage(incomingTexture->view(),
                                                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             if (!handle.isValid()) {
+                // DOCUMENTED ACCEPTANCE: this is effectively unreachable,
+                // not merely rare. createScene() sizes
+                // BindlessTable::Capacities::sampledImages at 16 (see its
+                // own comment below), while this sample's steady state
+                // only ever needs kResidentBudget=8 resident slots PLUS,
+                // at most, the one in-flight registration this very
+                // callback is attempting -- 9 of 16 slots occupied at
+                // once, with 7 slots of permanent headroom the eviction
+                // loop never approaches. There is no static assert tying
+                // BindlessTable's runtime capacity to kResidentBudget,
+                // though, so "effectively unreachable" is not "provably
+                // impossible" -- handle it for real rather than silently
+                // dropping `incoming` out of rotation forever. Resetting
+                // nextToLoad back to `incoming` puts it at the front of
+                // the streaming rotation again, so the very next eviction
+                // cycle retries loading this same logical texture instead
+                // of permanently losing one slot of residency budget
+                // (residencyOrder would otherwise stay one entry short of
+                // kResidentBudget until, if ever, nextToLoad wraps all the
+                // way back around to `incoming` on its own).
                 RX_LOG_ERROR("sample_04_streaming: deferred registerSampledImage failed for logical texture {}",
                              incoming);
+                scenePtr->nextToLoad = incoming;
                 return;
             }
             scenePtr->textures[incoming].texture = incomingTexture;

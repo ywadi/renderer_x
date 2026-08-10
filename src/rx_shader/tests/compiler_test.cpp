@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 #include <rx_shader/compiler.h>
+#include <rx_shader/reflection.h>
 
 #include <chrono>
 #include <cstdio>
@@ -49,6 +50,37 @@ const char* kBadSource = R"(
 float4 fsMain(float4 color : COLOR0) : SV_Target
 {
     return colorTypoNotDefined;
+}
+)";
+
+// "Source A" for the same-module-name regression test below: a fragment
+// module with zero push-constant globals.
+const char* kSameModuleReloadSourceA = R"(
+[shader("fragment")]
+float4 fsMain() : SV_Target
+{
+    return float4(1.0, 0.0, 0.0, 1.0);
+}
+)";
+
+// "Source B": the exact same module name as source A will be compiled
+// under, but with a `[[vk::push_constant]]` global source A never
+// declared -- a real, reflectable difference (pushRanges.size() 0 -> 1,
+// see reflection_test.cpp for this same [[vk::push_constant]] pattern)
+// this regression test asserts on to prove the second compile actually
+// reflects source B, not a stale/cached source A.
+const char* kSameModuleReloadSourceB = R"(
+struct PushConstants {
+    float4 tint;
+};
+
+[[vk::push_constant]]
+ConstantBuffer<PushConstants> gPush;
+
+[shader("fragment")]
+float4 fsMain() : SV_Target
+{
+    return gPush.tint;
 }
 )";
 
@@ -183,4 +215,55 @@ TEST_CASE("compileFromFile on a nonexistent path fails cleanly with diagnostics"
     rx::shader::CompileResult result = compiler->compileFromFile("/nonexistent/path/does_not_exist.slang", {"main"});
     CHECK_FALSE(result.ok);
     REQUIRE_FALSE(result.diagnostics.empty());
+}
+
+// Regression test for compiler.h's "SAME-MODULE-NAME CAVEAT": recompiling
+// the same module name with different source, through a FRESH Compiler
+// each time (the documented safe pattern -- what
+// samples/02_hotreload/main.cpp's buildPipelineFromFile() does for real
+// reloads), must actually reflect the new source rather than silently
+// reusing something cached under the old one.
+TEST_CASE(
+    "recompiling the same module name with different source through a fresh Compiler each time reflects the new "
+    "source") {
+    auto compilerA = rx::shader::Compiler::create();
+    REQUIRE(compilerA.has_value());
+    rx::shader::CompileResult resultA =
+        compilerA->compileFromSource("SameModuleReloadCaveat", kSameModuleReloadSourceA, {"fsMain"});
+    INFO("resultA diagnostics: " << resultA.diagnostics);
+    REQUIRE(resultA.ok);
+    REQUIRE(resultA.entryPointCode.size() == 1);
+    auto layoutA = rx::shader::reflect(resultA);
+    REQUIRE(layoutA.has_value());
+    CHECK(layoutA->pushRanges.empty());
+
+    // Same module name as above ("SameModuleReloadCaveat"), different
+    // source -- through a BRAND-NEW Compiler/ISession, never `compilerA`.
+    // Reusing `compilerA` here would be the exact bug this caveat
+    // documents: Slang's own "module already loaded with different
+    // source" diagnostic, verified directly against this project's
+    // pinned Slang build (see compiler.h's class-level comment).
+    auto compilerB = rx::shader::Compiler::create();
+    REQUIRE(compilerB.has_value());
+    rx::shader::CompileResult resultB =
+        compilerB->compileFromSource("SameModuleReloadCaveat", kSameModuleReloadSourceB, {"fsMain"});
+    INFO("resultB diagnostics: " << resultB.diagnostics);
+    REQUIRE(resultB.ok);
+    REQUIRE(resultB.entryPointCode.size() == 1);
+    auto layoutB = rx::shader::reflect(resultB);
+    REQUIRE(layoutB.has_value());
+
+    // The actual regression assertion: source B's compile reflects
+    // source B's shape (one push-constant range, one float4 = 16 bytes),
+    // not source A's (zero push-constant ranges) -- a real structural
+    // difference, not a coincidental one.
+    REQUIRE(layoutB->pushRanges.size() == 1);
+    CHECK(layoutB->pushRanges[0].size == 16);
+    CHECK(layoutA->pushRanges.size() != layoutB->pushRanges.size());
+
+    // Belt-and-suspenders: the compiled SPIR-V words themselves differ
+    // too (source B's push-constant load vs. source A's hardcoded
+    // constant), confirming this is a genuinely different compiled
+    // module, not a stale cached result silently reused.
+    CHECK(resultA.entryPointCode[0].code != resultB.entryPointCode[0].code);
 }

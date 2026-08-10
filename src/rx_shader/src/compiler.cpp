@@ -251,6 +251,14 @@ CompileResult compileImpl(slang::ISession* session,
 Compiler::Compiler(Slang::ComPtr<slang::ISession> session) : session_(std::move(session)) {}
 
 std::optional<Compiler> Compiler::create() {
+    // Deliberately called before this function's own mutex lock below --
+    // that used to be a real race (two threads both first-creating a
+    // Compiler concurrently could race inside log::init() itself, since it
+    // used to guard its one-time setup with a bare, non-atomic `static
+    // bool`). Fixed at the source: rx::core::log::init() (src/rx_core/src/
+    // log.cpp) now uses std::call_once, so it is safe to call from any
+    // number of concurrent threads with no lock of this function's own
+    // needed around it.
     rx::core::log::init();
 
     std::lock_guard<std::mutex> lock(detail::globalSessionMutex());
