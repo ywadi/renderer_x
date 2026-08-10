@@ -92,6 +92,20 @@ and visible culling statistics.
    than waiting for one; profiling validates the win, it does not gate
    starting.
 
+9. **Performance posture (user-directed 2026-08-10, from a plan audit):**
+   (a) **Tracy profiler adopted in Phase 4** (ready-made, per repo
+   policy) — CPU zones + GPU timestamp integration, so every subsequent
+   performance claim is measured, not asserted. (b) **Performance is a
+   phase exit criterion from Phase 4 onward**: each phase publishes
+   benchmark numbers (desktop + Steam Deck) for its stress/exit samples,
+   and CI carries regression gates on those numbers alongside the
+   correctness gates. (c) **Scene submission is designed around
+   instancing/batching and a global geometry buffer** (single pooled
+   vertex/index storage, per-mesh offsets — the layout GPU-driven
+   drawing requires) from day one; per-object buffer binding is not the
+   design. The Phase 4 spec must carry a dedicated "performance posture"
+   section addressing all of the above explicitly.
+
 ## Carried process notes
 
 - Research pass before spec (library selection for glTF/KTX2 with
