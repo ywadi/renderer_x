@@ -171,8 +171,15 @@ it is out of scope for *this* spec only, not out of scope for the project:
     (RT pass = compute-class pass + acceleration-structure resource type),
     VMA (AS allocation).
   - **Post-processing & image reconstruction** (layer 9, techniques): tone
-    mapping, color grading, temporal anti-aliasing, hardware upscaling
-    wrappers (DLSS, FSR, XeSS).
+    mapping, color grading, temporal anti-aliasing, motion blur, hardware
+    upscaling wrappers (DLSS, FSR, XeSS). Shared infrastructure to build
+    ONCE for this cluster (recorded 2026-08-10): per-pixel velocity/motion
+    vectors (requires previous-frame transforms plumbed from scene
+    submission — Phase 4's transform pools keep last-frame copies cheap)
+    and render-graph HISTORY resources (persistent named images with
+    load-instead-of-discard semantics — a deliberate extension of the
+    graph's discard-per-frame transient model). TAA, temporal upscalers,
+    and motion blur all consume the same two pieces.
   - **Profiling & debug instrumentation** (layer 12, tooling): GPU markers
     (PIX/RenderDoc integration), debug line drawing, memory leak tracking,
     performance counters.
