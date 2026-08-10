@@ -14,8 +14,16 @@
 # single-module-composition-shaped, per compiler.h/reflection.h's own
 # scope, and this library's multi-module (entry-point module + material
 # module) composition needs the raw slang::ISession API those wrap).
+#
+# api_impl.cpp [Task 6, spec Phase 3 design D5]: the COM-lite public ABI
+# surface's implementation (rx_api.h's factory + IRxMaterialSystem/
+# IRxMaterial/IRxMaterialInstance). Lives in this same static library
+# (there is no separate rx.dll yet -- D5 defers the standalone-DLL
+# artifact) but never includes material_system.cpp's own internals
+# outside its public class -- only material_system.h's public surface.
 add_library(rx_material STATIC
     material_system.cpp
+    api_impl.cpp
 )
 target_include_directories(rx_material PUBLIC include)
 target_link_libraries(rx_material PUBLIC rx_core rx_graph rx_rhi_vk rx_shader_layout_types slang::slang)
