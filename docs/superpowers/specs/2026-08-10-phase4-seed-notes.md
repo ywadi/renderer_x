@@ -72,16 +72,22 @@ and visible culling statistics.
    meshlet generation (meshopt_buildMeshlets) and LOD chains
    (meshopt_simplify) — see the master design doc's deferred registry.
 
-8. **Task/job system adopted in Phase 4 (user-confirmed 2026-08-10):**
-   Phase 4's asset work (async IO, KTX2/zstd decode, meshoptimizer
-   post-processing) is the natural adoption point for a ready-made
-   work-stealing task scheduler (candidates: enkiTS, Taskflow — research
-   pass decides with citations; ad-hoc std::thread pools are not
-   acceptable per the production bar). Parallel command-buffer recording
-   (per-thread command pools, one render-graph pass callback per worker)
-   is the later, profiling-gated milestone the render graph's
-   independent-pass design already enables — do not build it before draw
-   counts justify it.
+8. **Task/job system adopted in Phase 4; multithreaded rendering committed
+   for the phase after (user-directed 2026-08-10):** Phase 4 adopts a
+   ready-made work-stealing scheduler (candidates: enkiTS, Taskflow —
+   research pass decides with citations; ad-hoc std::thread pools barred)
+   for asset IO/decode/meshoptimizer work, AND designs scene submission
+   thread-aware from day one (draw-list building, culling, transform
+   updates parallelizable by construction — no later retrofit). The phase
+   immediately after Phase 4 ships **parallel command recording** as a
+   committed deliverable: per-thread command pools, render-graph pass
+   callbacks recorded on workers, submissions stitched in graph order —
+   proven by a dedicated synthetic stress sample (tens of thousands of
+   draws) with published before/after numbers on desktop and Deck, kept
+   as a permanent CI regression benchmark. Rationale: RendererX is
+   middleware — customers' games are the real workload, so the engine
+   builds its own stress case rather than waiting for one; profiling
+   validates the win, it does not gate starting.
 
 ## Carried process notes
 
