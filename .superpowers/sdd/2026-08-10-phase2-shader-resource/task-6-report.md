@@ -1,6 +1,7 @@
 # Task 6 Report: sample_03_bindless_mesh (reflection + bindless + upload integration proof)
 
-Commit: `4f9aa12` on `main`.
+Commits: `4f9aa12` (implementation), `9e46726` (this report), `bb5fe15`
+(fix round, below) on `main`.
 
 ## Summary
 
@@ -261,3 +262,72 @@ perspective foreshortening on the plane.
 - `samples/README.md` — new "03_bindless_mesh" section + updated
   build/run/test instructions.
 - `CMakeLists.txt` (root) — `add_subdirectory(samples/03_bindless_mesh)`.
+
+## Fix round (commit `bb5fe15`)
+
+Review came back **Approved** (30/30 cases, 732/732 assertions live;
+5/5 probe gate; both bug diagnoses independently re-verified — the
+matrix-layout fix confirmed the only correctly-scoped option, the depth
+twin's masks confirmed correct at all 4 sites). Two Important debt items
+were flagged to close immediately (Task 7 dispatches right after this
+task and would otherwise inherit both), plus two minors. All four closed
+in this fix round, verified, and committed before handoff:
+
+1. **Engine-level matrix-layout doc (Important).** Added a doc paragraph
+   on `Compiler::create()` (`src/rx_shader/include/rx_shader/compiler.h`):
+   sessions built through this C++ API leave `SessionDesc::
+   defaultMatrixLayoutMode` at its own default — **row-major** — a
+   different default than `slangc`'s own legacy CLI default
+   (column-major). A `float4x4` read out of a buffer via a
+   Compiler-built session is therefore row-major; a column-major host
+   producer (GLM's `mat4`, already an `rx_core` dependency) must
+   transpose at the host/device boundary or the shader reads a
+   transposed transform. Points at `samples/03_bindless_mesh`'s
+   `updateTransforms()` as the worked example, and names the empirical
+   (rendered-and-inspected, not just reasoned-about) discovery method.
+   Added a one-line cross-reference near `ShaderLayoutInfo`
+   (`shader_layout_info.h`) noting that struct carries no matrix-layout
+   information of its own and pointing back at this same paragraph. No
+   code changes to `Compiler` itself, as directed.
+2. **Parameterized `transitionImage` instead of a twin (Important).**
+   `rx::rhi::transitionImage` (`command.h`/`command.cpp`) gained an
+   optional trailing `VkImageAspectFlags aspectMask =
+   VK_IMAGE_ASPECT_COLOR_BIT` parameter — fully backward compatible, zero
+   existing call sites needed a change. Deleted
+   `samples/03_bindless_mesh`'s local `transitionDepthImage` twin
+   entirely and switched its 4 call sites to
+   `rx::rhi::transitionImage(..., VK_IMAGE_ASPECT_DEPTH_BIT)`. Barrier
+   shape (stage/access masks, `VK_REMAINING_MIP_LEVELS`/
+   `VK_REMAINING_ARRAY_LAYERS`) unchanged.
+3. **Minor: "CACHE-INTERNAL" → CACHE PATH.** `RX_SLANG_TARGET_ROOT` is a
+   `CACHE PATH` variable (set in `tools/fetch_slang.cmake`), not
+   `CACHE INTERNAL` — fixed the mischaracterization in both
+   `src/rx_shader/CMakeLists.txt` and
+   `samples/02_hotreload/CMakeLists.txt`'s comments (no behavior change;
+   comment-only).
+4. **Minor: third rejection test.** Added
+   "rejects a bounded set-0 binding count exceeding this builder's generic
+   capacity ceiling" to `pipeline_layout_test.cpp`, same pattern as the
+   two existing shape-rejection tests (binding number/type match
+   `BindlessTable`'s real sampled-image slot; `unboundedArray=false` with
+   `count = kUnboundedArrayDescriptorCapacity + 1`).
+
+**Verification after the fix round:**
+- `ctest --preset linux-native`: **8/8 green**; `rx_rhi_vk_tests` now
+  **31 cases / 738 assertions** (up from 30/732).
+- `cmake --build --preset windows-cross-zig`: clean, zero warnings.
+- `ctest --preset windows-cross-zig` (Wine): **8/8 green**.
+- `samples/03_bindless_mesh --present` re-run on the same real hardware
+  (RTX 2080) after the `transitionImage` change: screenshot-identical
+  rendering to the pre-fix-round screenshot, zero unexpected validation
+  errors.
+- `git log --format='%B'` grepped for AI-attribution strings on the fix
+  commit: no matches.
+
+No further deviations. `progress.md` and the review diff
+(`review-b9fda92..4f9aa12.diff`) were included in the fix-round commit —
+both are coordinator-owned artifacts that were already present in the
+working tree from the review process; left untouched in content, just
+committed alongside the fixes they describe (matching this ledger
+directory's own established precedent of committing review diffs
+per-task).
