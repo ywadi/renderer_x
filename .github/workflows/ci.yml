@@ -37,26 +37,32 @@ jobs:
       # SDL3 still requires *some* video driver backend to initialize.
       #
       # libx11-dev/libxext-dev/libxrandr-dev/libxcursor-dev/libxi-dev/
-      # libxfixes-dev/libxss-dev: discovered missing on the first real run
-      # of this workflow -- SDL3's own build (third_party/CMakeLists.txt,
-      # built from source through the dep-cache) hard-fails its CMake
-      # configure with "SDL could not find X11 or Wayland development
-      # libraries" when none of these are present, which this codebase's
-      # own development machine never surfaced (it already had a full
-      # desktop environment's dev packages installed). libx11-dev + Xext.h
-      # (libxext-dev) are what SDL3's own CheckX11 macro actually requires
-      # for HAVE_VIDEO_X11; the rest are the optional X11 extensions SDL3
-      # also probes for (randr/cursor/xinput2/xfixes/scrnsaver) and are
-      # included so the X11 backend this project's Window/resize handling
-      # actually exercises (see samples/01_triangle's --present mode) is
-      # complete, not the bare minimum that happens to satisfy one check.
+      # libxfixes-dev/libxss-dev/libxtst-dev/libxkbcommon-dev: discovered
+      # missing across the first two real runs of this workflow -- SDL3's
+      # own build (third_party/CMakeLists.txt, built from source through
+      # the dep-cache) hard-fails its CMake configure without X11
+      # development libraries present at all ("SDL could not find X11 or
+      # Wayland development libraries"), which this codebase's own
+      # development machine never surfaced (it already had a full desktop
+      # environment's dev packages installed). The first run only
+      # surfaced the top-level "no X11 at all" failure; fixing that with
+      # just libx11-dev+libxext-dev revealed a second, more specific fatal
+      # check ("Couldn't find dependency package for XTEST") one level
+      # deeper in the same CheckX11 macro, since CMake configure stops at
+      # the first fatal error and never reaches later checks. Cross-checked
+      # directly against SDL3's own cmake/sdlchecks.cmake CheckX11 macro
+      # (release-3.4.14) for every *other* SDL_missing_dependency() call it
+      # can still reach (XCURSOR/XINPUT/XFIXES/XRANDR/XSCRNSAVER/XTEST all
+      # require a real library; XDBE/XSHAPE/XSYNC only need headers already
+      # covered by libx11-dev/libxext-dev) so this is the complete set, not
+      # another one-check-at-a-time guess.
       - name: Install system packages
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             ninja-build mesa-vulkan-drivers vulkan-tools libvulkan-dev xvfb \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
-            libxfixes-dev libxss-dev
+            libxfixes-dev libxss-dev libxtst-dev libxkbcommon-dev
 
       - name: Install pinned zig toolchain (checksum-verified)
         run: |
