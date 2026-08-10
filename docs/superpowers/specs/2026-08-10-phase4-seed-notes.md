@@ -63,6 +63,15 @@ and visible culling statistics.
    full chain (SDL3 events → swapchain recreation → graph re-realization)
    exists and is regression-tested as of Phase 3.
 
+7. **meshoptimizer at import time (user-confirmed 2026-08-10):** imported
+   meshes are post-processed with meshoptimizer (index/vertex-cache
+   optimization, overdraw reduction, vertex-fetch reordering) before
+   upload — the canonical glTF-pipeline pairing; no credible alternative
+   exists and hand-rolling is barred by repo policy. The same vendored
+   library later serves the geometry-processing layer's committed
+   meshlet generation (meshopt_buildMeshlets) and LOD chains
+   (meshopt_simplify) — see the master design doc's deferred registry.
+
 ## Carried process notes
 
 - Research pass before spec (library selection for glTF/KTX2 with
