@@ -78,16 +78,19 @@ and visible culling statistics.
    research pass decides with citations; ad-hoc std::thread pools barred)
    for asset IO/decode/meshoptimizer work, AND designs scene submission
    thread-aware from day one (draw-list building, culling, transform
-   updates parallelizable by construction — no later retrofit). The phase
-   immediately after Phase 4 ships **parallel command recording** as a
-   committed deliverable: per-thread command pools, render-graph pass
-   callbacks recorded on workers, submissions stitched in graph order —
-   proven by a dedicated synthetic stress sample (tens of thousands of
-   draws) with published before/after numbers on desktop and Deck, kept
-   as a permanent CI regression benchmark. Rationale: RendererX is
-   middleware — customers' games are the real workload, so the engine
-   builds its own stress case rather than waiting for one; profiling
-   validates the win, it does not gate starting.
+   updates parallelizable by construction — no later retrofit).
+   **Parallel command recording ships IN Phase 4** (user-directed
+   2026-08-10: it is renderer core and rides the same scheduler):
+   per-thread command pools, render-graph pass callbacks recorded on
+   workers, submissions stitched in graph order — sequenced late in the
+   phase, after the scheduler is in and scene content exists. Proven by a
+   dedicated synthetic stress sample (tens of thousands of draws — itself
+   a natural scene-submission exit sample) with published before/after
+   numbers on desktop and Deck, kept as a permanent CI regression
+   benchmark. Rationale: RendererX is middleware — customers' games are
+   the real workload, so the engine builds its own stress case rather
+   than waiting for one; profiling validates the win, it does not gate
+   starting.
 
 ## Carried process notes
 
