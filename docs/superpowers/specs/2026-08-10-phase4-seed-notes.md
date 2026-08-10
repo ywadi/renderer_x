@@ -112,3 +112,10 @@ and visible culling statistics.
   citations), spec + plan authored by the coordinator, SDD execution with
   per-task review, exit via deployed samples + tagged release — same cycle
   as Phases 1-3.
+
+10. **First task of Phase 4's material work (carried from Phase 3 Task 8
+    review):** wire bindless texture sampling into the material shader
+    interface — `material.slang`/`forward_entry.slang` declarations +
+    `reflectMaterialLayout()`'s allow-list + a GPU test where a
+    `createTexture2D`-created texture visibly changes a rendered pixel.
+    Bounded task, precedes/accompanies StandardPBR (which requires it).
