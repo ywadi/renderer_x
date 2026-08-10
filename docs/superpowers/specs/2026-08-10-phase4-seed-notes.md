@@ -150,6 +150,21 @@ and visible culling statistics.
     work (rides item 10's public-surface touch); samples install it to
     prove the path.
 
+14. **Skinning data preserved at import (user-raised 2026-08-10):** the
+    Phase 4 glTF importer must parse and PRESERVE skinning data
+    (JOINTS_0/WEIGHTS_0 attributes, skin joint hierarchies, inverse bind
+    matrices) in the mesh/asset representation even though skinning
+    executes in the later geometry-processing phase — an importer that
+    drops skin data forces importer rework and asset re-processing one
+    phase later. Skinning execution (registry, layer 8) is planned as
+    compute pre-skinning through the render graph (skin once per frame
+    into a transient vertex buffer; shadow/forward passes consume plain
+    vertices; morph targets ride the same pass; pre-skinned output later
+    feeds meshlet culling and RT BLAS refits). Animation playback
+    (sampling/blending) stays consumer-side or adopts ozz-animation when
+    scheduled — the renderer's contract is a joint-matrix palette per
+    skinned mesh per frame.
+
 ## Carried process notes
 
 - Research pass before spec (library selection for glTF/KTX2 with
