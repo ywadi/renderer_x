@@ -547,9 +547,44 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
             vkCmdBeginRendering(cmd, &renderingInfo);
         }
 
+        // Task 5 (rx_material): mirror this pass's own attachment shape
+        // into a device-free PassSignature -- the exact same
+        // colorPhysIdx/depthPhysIdx classification isGraphicsPass above
+        // already computed, just re-expressed as formats/sample-count
+        // instead of physical-resource indices. Left default-constructed
+        // (colorCount == 0, depthFormat == VK_FORMAT_UNDEFINED) for a bare
+        // pass (isGraphicsPass == false) -- there is no attachment shape
+        // to report, matching PassContext::passSignature()'s own doc
+        // comment. Sample count is read off PhysicalResource::attachment
+        // (compile()'s own resolved copy, per resources.h), not
+        // ResolvedResource (which carries no sample-count field at all,
+        // since it exists to answer "what real image/buffer backs this
+        // resource", not "what shape did the pass declare it as") --
+        // taken from whichever attachment this pass actually has (color
+        // preferred, matching the renderArea fallback logic just above);
+        // every attachment in one dynamic-rendering scope shares one
+        // sample count in practice, so any single one is representative.
+        PassSignature signature;
+        if (isGraphicsPass) {
+            signature.colorCount =
+                static_cast<uint32_t>(std::min(colorPhysIdx.size(), signature.colorFormats.size()));
+            for (uint32_t i = 0; i < signature.colorCount; ++i) {
+                signature.colorFormats[i] = impl.resources.at(colorPhysIdx[i]).format;
+            }
+            if (depthPhysIdx.has_value()) {
+                signature.depthFormat = impl.resources.at(*depthPhysIdx).format;
+            }
+            if (!colorPhysIdx.empty()) {
+                signature.samples = compiled.resources()[colorPhysIdx[0]].attachment.samples;
+            } else if (depthPhysIdx.has_value()) {
+                signature.samples = compiled.resources()[*depthPhysIdx].attachment.samples;
+            }
+        }
+
         PassContext ctx(*this);
         ctx.cmd = cmd;
         ctx.renderArea = renderArea;
+        ctx.passSignature_ = signature;
         pass.invokeExecute(ctx);
 
         if (isGraphicsPass) {

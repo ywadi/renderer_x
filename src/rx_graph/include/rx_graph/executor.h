@@ -11,6 +11,7 @@
 // "touches a real device" happens in executor.cpp/transient_pool.cpp, not
 // in this public header: volk usage (and every raw vkFoo call) stays out
 // of every rx_graph header, matching this task's own binding constraint.
+#include <rx_graph/pass_signature.h>
 #include <rx_graph/render_graph.h>
 
 #include <cstdint>
@@ -111,12 +112,36 @@ public:
     [[nodiscard]] VkBuffer buffer(std::string_view name) const;
     [[nodiscard]] VkFormat imageFormat(std::string_view name) const;
 
+    // Task 5 (rx_material): this pass's own attachment shape, exactly as
+    // Executor::execute() classified it this call (colorAttachments/
+    // depthPhysIdx/sample count -- see that function's own
+    // isGraphicsPass/colorPhysIdx/depthPhysIdx locals, which this mirrors
+    // into the device-free rx::graph::PassSignature value a material's
+    // pipeline-variant cache key needs). Default-constructed
+    // (colorCount == 0, depthFormat == VK_FORMAT_UNDEFINED,
+    // samples == VK_SAMPLE_COUNT_1_BIT) for a pass with no attachment
+    // output at all (a "bare" pass, per Executor::execute()'s own
+    // graphics-vs-bare classification) -- there is no attachment shape to
+    // report, and rx_material's MaterialSystem::getPipeline() rejects that
+    // degenerate signature outright rather than trying to build a graphics
+    // pipeline from it [Task 5 ambiguity resolution]. Returned by value
+    // (not reference): PassSignature is a small, trivially-copyable value
+    // type (see pass_signature.h), and every real caller (getPipeline()'s
+    // request struct) needs its own copy to key a cache lookup with
+    // anyway.
+    [[nodiscard]] PassSignature passSignature() const { return passSignature_; }
+
 private:
     friend class Executor;
 
     explicit PassContext(const Executor& executor) : executor_(&executor) {}
 
     const Executor* executor_;
+
+    // Set directly by Executor::execute() (a friend) immediately after
+    // constructing this PassContext, alongside cmd/renderArea above -- see
+    // that function's own comment for exactly where and how it is derived.
+    PassSignature passSignature_;
 };
 
 // Owns every physical resource backing a compiled rx::graph::RenderGraph on

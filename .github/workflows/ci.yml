@@ -257,15 +257,18 @@ jobs:
 
       # rx_rhi_vk (GPU-backed), rx_graph_gpu_tests (Task 3's Executor GPU
       # tests -- same GPU-backed reason as rx_rhi_vk_tests, added when that
-      # target was introduced), and every sample_*_headless gate are
-      # excluded: Wine in CI has no real Vulkan device to hand them, and
-      # that is a real, documented environment limitation -- not a silent
-      # pass. rx_core, rx_platform, shader_spirv_test, AND rx_shader_tests all run
-      # for real under Wine and are NOT excluded here -- rx_shader_tests
-      # does real in-process Slang compilation (slang::createGlobalSession
-      # etc.) via the MSVC-built slang-compiler.dll cross-linked through
-      # zig/LLD [R:A6/D2], which needs no GPU at all (SPIR-V codegen is pure
-      # CPU work), and this was investigated rather than assumed: Task 1
+      # target was introduced), rx_material_gpu_tests (Task 5's
+      # MaterialSystem tests -- every one of them builds a real
+      # VkGraphicsPipeline, same GPU-backed reason), and every
+      # sample_*_headless gate are excluded: Wine in CI has no real Vulkan
+      # device to hand them, and that is a real, documented environment
+      # limitation -- not a silent pass. rx_core, rx_platform,
+      # shader_spirv_test, AND rx_shader_tests all run for real under Wine
+      # and are NOT excluded here -- rx_shader_tests does real in-process
+      # Slang compilation (slang::createGlobalSession etc.) via the
+      # MSVC-built slang-compiler.dll cross-linked through zig/LLD
+      # [R:A6/D2], which needs no GPU at all (SPIR-V codegen is pure CPU
+      # work), and this was investigated rather than assumed: Task 1
       # verified directly that Slang's Windows DLLs (slang-compiler.dll +
       # its slang-glslang/slang-glsl-module/slang-rt plugins) load correctly
       # under Wine and the full compiler test suite passes there -- this CI
@@ -276,7 +279,7 @@ jobs:
       # extensions, exactly as they do on any other display-less machine.
       - name: Test under wine (xvfb; GPU tests excluded -- no Vulkan under Wine)
         run: >-
-          xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|sample' --output-on-failure
+          xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample' --output-on-failure
           --output-junit ${{ github.workspace }}/ctest-results-windows-cross-zig.xml
 
       - name: Build budget check

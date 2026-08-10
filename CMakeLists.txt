@@ -28,6 +28,12 @@ add_subdirectory(src/rx_rhi_vk)
 # src/rx_graph/CMakeLists.txt's own comment for why that dependency is
 # deferred to the tasks that actually need a VkDevice.
 add_subdirectory(src/rx_graph)
+# Materials as Slang modules, pass signatures, and the lazy content-hash-
+# keyed pipeline cache [spec Phase 3 design, D6-D8] -- depends on rx_graph
+# (PassSignature), rx_shader (ShaderLayoutInfo's slang-free layout-types
+# target only), and rx_rhi_vk (PipelineLayoutBuilder/BindlessTable/Device),
+# so it is add_subdirectory'd after all three.
+add_subdirectory(src/rx_material)
 add_subdirectory(tools/dep_cache_smoketest)
 add_subdirectory(tools/toolchain_check)
 add_subdirectory(samples/01_triangle)
