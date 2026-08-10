@@ -110,3 +110,92 @@ but that has not yet been confirmed on an actual Deck. Fill in the
 checkboxes and record the SteamOS version/RADV (Mesa) driver version above
 the first time this is actually run on a Deck, before the next release that
 claims Steam Deck support.
+
+## 05_multipass (`--present` mode)
+
+`sample_05_multipass` needs the Slang runtime libraries (+ its six on-disk
+shader sources) deployed next to it — see `samples/README.md`'s own
+"Redistribution" section for the full manifest; it is not statically linked
+like 01_triangle.
+
+### What "pass" means, every platform
+
+- The window opens and shows a reddish cube and a bluish sphere on a
+  grayish floor, lit from a fixed-elevation directional light whose azimuth
+  continuously orbits — the cube's shadow visibly sweeps across the floor
+  as the light turns (see `samples/README.md`'s "Expected output" section).
+- Closing the window exits promptly, with no crash/hang, and logs
+  `--present: window closed cleanly`.
+- On Linux, run with `--validate` and confirm no `[error]`-level validation
+  output beyond this codebase's two documented false-positive guards (see
+  the "What 'pass' means" section above for the exact mechanism).
+
+### Linux (native, `linux-native` preset)
+
+- [ ] Build: `cmake --preset linux-native && cmake --build --preset linux-native`
+- [ ] Run: `./build/linux-native/samples/05_multipass/sample_05_multipass --present --validate`
+- [ ] Shadow/light/cube/sphere render correctly and the shadow sweeps as
+      the light orbits, with zero unexpected validation errors
+- [ ] Closes cleanly; headless mode still exits 0
+
+**Last run:** not yet performed as a real, human-observed run on this or
+any platform (this checklist row is new as of Task 8; sample 05 itself
+predates it). Functionally exercised end to end during this project's own
+development, though not as a substitute for the human-observed check this
+file otherwise requires: `sample_05_multipass_headless`'s own analytic
+pixel assertions pass under `ctest` on every CI run (`.github/workflows/
+ci.yml`), which is the automated half of this sample's correctness story.
+Fill in the checkboxes and hardware/driver details above the first time
+`--present` is actually watched running on real hardware.
+
+## 06_materials (`--present` mode)
+
+`sample_06_materials` needs the Slang runtime libraries + its own
+`materials/`/`material_shaders/` subdirectories deployed next to it — see
+`samples/README.md`'s own "Redistribution" section for the full manifest.
+
+### What "pass" means, every platform
+
+- The window opens and shows an orange checkerboard cube (top-left), a teal
+  checkerboard cube (top-right), a magenta rim-lit sphere (bottom-left),
+  and a golden-yellow rim-lit sphere (bottom-right), with the camera
+  orbiting continuously (see `samples/README.md`'s "Expected output"
+  section).
+- Editing and saving the deployed `materials/checker.slang` or
+  `materials/rim.slang` (next to the running binary) changes that
+  material's rendering within about a second, with a console log line
+  confirming the reload; a syntactically broken edit keeps the last-good
+  material rendering rather than crashing the window.
+- Closing the window exits promptly, with no crash/hang, and logs
+  `--present: window closed cleanly`.
+- On Linux, run with `--validate` and confirm no `[error]`-level validation
+  output beyond this codebase's two documented false-positive guards.
+
+### Linux (native, `linux-native` preset)
+
+- [ ] Build: `cmake --preset linux-native && cmake --build --preset linux-native`
+- [ ] Run: `./build/linux-native/samples/06_materials/sample_06_materials --present --validate`
+- [ ] All 4 objects render correctly and the camera orbits smoothly, with
+      zero unexpected validation errors
+- [ ] Editing `materials/checker.slang`/`materials/rim.slang` (the deployed
+      copies) live-updates the running window within ~1s, and a
+      syntactically broken edit keeps the last-good material instead of
+      crashing
+- [ ] Closes cleanly; headless mode still exits 0
+
+**Last run:** not yet performed as a real, human-observed run on real
+display hardware. Functionally verified during this task's own development
+via an offscreen X server (Xvfb, no human watching a real display): the
+window opens, all 4 objects render at their analytically expected colors
+(cross-checked against the same headless-gate math), the camera orbits,
+editing the deployed `checker.slang`/`rim.slang` while running triggers a
+logged `hot-reload of '...' succeeded` and visibly changes that material
+(confirmed across 3 consecutive edit/reload cycles touching both files),
+and the process exits cleanly (`--present: window closed cleanly`, exit
+code 0) on `SIGTERM` on both the `linux-native` build and the
+`windows-cross-zig` build run under Wine, from the packaged (unzipped,
+outside the build tree) layout in both cases. This is real functional
+verification, not a placeholder — but it is not the human-observed-on-real-
+hardware check this file otherwise tracks. Fill in the checkboxes and
+hardware/driver details above the first time `--present` is actually
+watched running on a real display.

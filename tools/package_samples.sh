@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Packages this project's five sample binaries into a single per-platform
+# Packages this project's six sample binaries into a single per-platform
 # .zip laid out exactly as a user would unzip-and-run it: one subdirectory
 # per sample, containing that sample's binary plus everything IT needs to
 # run standalone -- nothing more, nothing missing [R:D2].
@@ -34,6 +34,17 @@
 #                     LICENSE (no other external asset -- every texture
 #                     this sample uses is a graph-pooled transient, never
 #                     an on-disk file)
+#   06_materials      binary + materials/checker.slang + materials/rim.slang
+#                     (this sample's OWN two materials) + material_shaders/
+#                     material.slang + material_shaders/forward_entry.slang
+#                     (rx_material's two SHARED shader files, deployed
+#                     alongside this sample rather than referenced via
+#                     RX_MATERIAL_SHADER_DIR's build-tree-only compile-time
+#                     path [Task 8 ledger item carried from Task 5] -- see
+#                     src/rx_material/include/rx_material/material_system.h's
+#                     MaterialSystem::create() `sharedShaderDir` parameter
+#                     and samples/06_materials/main.cpp's
+#                     basePathDirectory()) + Slang runtime libs + LICENSE
 #
 # This script does NOT build anything -- it assumes `cmake --build
 # --preset <preset>` already ran and each sample's build-output directory
@@ -120,13 +131,13 @@ copy_required "$SAMPLE_DIR" \
   "$SAMPLES_BUILD_DIR/01_triangle/triangle.vert.spv" \
   "$SAMPLES_BUILD_DIR/01_triangle/triangle.frag.spv"
 
-# --- 02_hotreload / 03_bindless_mesh / 04_streaming / 05_multipass: real
-# in-process Slang compilation -- each needs the Slang runtime libs +
-# LICENSE deployed next to it. Globbed rather than hardcoded to the pinned
-# version string, same posture as rx_shader_deploy_runtime_libs() in
-# src/rx_shader/CMakeLists.txt: Linux filenames embed the Slang version,
-# Windows filenames don't [R:A1/A6/D2].
-for RX_SAMPLE in 02_hotreload 03_bindless_mesh 04_streaming 05_multipass; do
+# --- 02_hotreload / 03_bindless_mesh / 04_streaming / 05_multipass /
+# 06_materials: real in-process Slang compilation -- each needs the Slang
+# runtime libs + LICENSE deployed next to it. Globbed rather than hardcoded
+# to the pinned version string, same posture as
+# rx_shader_deploy_runtime_libs() in src/rx_shader/CMakeLists.txt: Linux
+# filenames embed the Slang version, Windows filenames don't [R:A1/A6/D2].
+for RX_SAMPLE in 02_hotreload 03_bindless_mesh 04_streaming 05_multipass 06_materials; do
   SAMPLE_DIR="$STAGE_DIR/$RX_SAMPLE"
   mkdir -p "$SAMPLE_DIR"
   copy_required "$SAMPLE_DIR" "$SAMPLES_BUILD_DIR/$RX_SAMPLE/sample_${RX_SAMPLE}${RX_EXE_SUFFIX}"
@@ -155,7 +166,12 @@ done
 # "multipass/" subdirectory in the deployed layout) -- scene_types.slang
 # [fix round 1] included: it is concatenated ahead of shadow.vert.slang/
 # lit.vert.slang at compile time, so a packaged run needs it on disk next
-# to the binary exactly like the other five.
+# to the binary exactly like the other five. 06 ships its OWN materials/
+# subdirectory (checker.slang/rim.slang) PLUS a sibling material_shaders/
+# subdirectory carrying rx_material's two shared files (material.slang/
+# forward_entry.slang) -- see samples/06_materials/CMakeLists.txt's own
+# POST_BUILD deploy steps for why two separate subdirectories, not a flat
+# layout like 05's.
 copy_required "$STAGE_DIR/02_hotreload" "$SAMPLES_BUILD_DIR/02_hotreload/hotreload.slang"
 copy_required "$STAGE_DIR/03_bindless_mesh" "$SAMPLES_BUILD_DIR/03_bindless_mesh/texture.png"
 copy_required "$STAGE_DIR/05_multipass" \
@@ -165,13 +181,20 @@ copy_required "$STAGE_DIR/05_multipass" \
   "$SAMPLES_BUILD_DIR/05_multipass/lit.frag.slang" \
   "$SAMPLES_BUILD_DIR/05_multipass/tonemap.vert.slang" \
   "$SAMPLES_BUILD_DIR/05_multipass/tonemap.frag.slang"
+mkdir -p "$STAGE_DIR/06_materials/materials" "$STAGE_DIR/06_materials/material_shaders"
+copy_required "$STAGE_DIR/06_materials/materials" \
+  "$SAMPLES_BUILD_DIR/06_materials/materials/checker.slang" \
+  "$SAMPLES_BUILD_DIR/06_materials/materials/rim.slang"
+copy_required "$STAGE_DIR/06_materials/material_shaders" \
+  "$SAMPLES_BUILD_DIR/06_materials/material_shaders/material.slang" \
+  "$SAMPLES_BUILD_DIR/06_materials/material_shaders/forward_entry.slang"
 
 mkdir -p "$(dirname "$RX_OUT_ZIP")"
 RX_OUT_ZIP_ABS="$(cd "$(dirname "$RX_OUT_ZIP")" && pwd)/$(basename "$RX_OUT_ZIP")"
 rm -f "$RX_OUT_ZIP_ABS"
 
 echo "package_samples: zipping into '$RX_OUT_ZIP_ABS' ..."
-(cd "$STAGE_DIR" && zip -r -X -q "$RX_OUT_ZIP_ABS" 01_triangle 02_hotreload 03_bindless_mesh 04_streaming 05_multipass)
+(cd "$STAGE_DIR" && zip -r -X -q "$RX_OUT_ZIP_ABS" 01_triangle 02_hotreload 03_bindless_mesh 04_streaming 05_multipass 06_materials)
 
 echo "package_samples: done. Contents:"
 unzip -l "$RX_OUT_ZIP_ABS"

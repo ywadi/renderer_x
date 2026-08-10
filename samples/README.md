@@ -33,12 +33,19 @@ step involved:
   sample_05_multipass[.exe]        # + shaders/multipass/*.slang (6 files),
                                     #   the Slang runtime libs below, and
                                     #   LICENSE
+06_materials/
+  sample_06_materials[.exe]        # + materials/checker.slang,
+                                    #   materials/rim.slang, +
+                                    #   material_shaders/material.slang,
+                                    #   material_shaders/forward_entry.slang
+                                    #   (rx_material's own shared files), the
+                                    #   Slang runtime libs below, and LICENSE
 ```
 
 `01_triangle` is the one exception to "needs the Slang runtime libs": its
 shaders are precompiled offline by `slangc` at build time, so it ships only
 its two `.spv` files and nothing Slang-related at all [D2] — see its own
-"Redistribution" section below. The other four do real in-process Slang
+"Redistribution" section below. The other five do real in-process Slang
 compilation at startup, so each of their directories additionally carries
 `libslang-compiler.so*`/`slang-compiler.dll` plus the `slang-glslang`/
 `slang-glsl-module`/`slang-rt` plugins it dlopens on demand, and the Slang
@@ -468,6 +475,128 @@ redistributed copy of just this sample's build-output directory (binary +
 those six `.slang` files + the Slang runtime libraries) runs identically
 outside the build tree.
 
+## 06_materials
+
+`samples/06_materials/main.cpp` — the Phase 3 showcase for `rx_material`'s
+**public** COM-lite API (`rx_api.h`): every material creation, instance
+creation, per-instance parameter override, texture creation, and hot-reload
+call in this sample goes through `IRxMaterialSystem`/`IRxMaterial`/
+`IRxMaterialInstance`/`IRxTexture` — never an internal `rx::material::` type,
+except inside one clearly marked bridge section in `main.cpp` (system
+creation, and the draw-time `bindInstance()`/`getPipeline()`/
+`pipelineLayout()` calls, which have no public equivalent in Phase 3 by
+design — draw submission itself is not part of the ABI surface this phase).
+
+**Scene**: 4 procedural objects (2 cubes, 2 spheres — generators adapted from
+03_bindless_mesh's own position+uv convention, extended with a per-vertex
+normal like 05_multipass's) drawn through a single `rx_graph` forward pass.
+Two materials, `materials/checker.slang` (a procedural UV checkerboard times
+a `tint` parameter) and `materials/rim.slang` (a view-dependent rim-light
+term times a `rimColor` parameter), each instanced TWICE with different
+parameter values — cube A/B get `checker` (warm orange / cool teal), sphere
+A/B get `rim` (magenta / golden yellow). `checker.slang` also takes a
+bindless texture-index parameter, bound to a real, procedurally generated
+checker texture created through the public `IRxMaterialSystem::
+createTexture2D()` and `IRxMaterialInstance::setTexture()` — exercising that
+public path end to end (see that file's own header comment for why its
+content never actually reaches the rendered pixels yet — Phase 3 materials
+cannot sample a bindless texture from inside their own shading function).
+
+**No camera transform in the shared material pipeline**: `shaders/material/
+forward_entry.slang`'s shared vertex stage has no model/view/projection
+transform at all — clip position and world position are the literal same
+vertex attribute. This sample resolves that gap by pre-transforming every
+vertex's position into clip space and every vertex's normal into view space
+**on the CPU**, using its own camera matrices, before uploading — possible
+without precision loss specifically because the camera is *orthographic*
+(its projection matrix's `w` is always exactly `1.0`, matching
+`forward_entry.slang`'s own hardcoded assumption). See `main.cpp`'s own
+header comment for the full mechanism and the exact analytic pixel
+derivations this makes possible.
+
+- **Headless (default, no flags)** — the `ctest` correctness gate. Fixed
+  orthographic camera, 3 frames through the graph, readback, and 4 analytic
+  pixel assertions (one per object, channel-order-exact, accounting for
+  this project's known SRGB-swapchain-encoding caveat — see
+  `samples/04_streaming`'s own finding). Validation is off by default (see
+  01_triangle's `--validate` section above); `ctest` registers this case as
+  `sample_06_materials_headless` with `--validate` passed explicitly.
+- **`--present`** — opens a real window showing the same 4 objects with the
+  camera continuously orbiting (azimuth-only), polling `materials/
+  checker.slang` and `materials/rim.slang` for on-disk changes roughly once
+  a second and calling the public `IRxMaterialSystem::reloadChanged()` —
+  02_hotreload's own keep-last-good UX, applied here to materials. Not part
+  of `ctest` — see `MANUAL_VERIFICATION.md`.
+
+### Expected output
+
+**Headless mode**:
+
+```
+[info] object 0 (checker) world=(-2.0,1.3,0.0) pixel=(50,77) channels=(...) expected_linear=(255,140,38) matched=true
+[info] object 1 (checker) world=(2.0,1.3,0.0) pixel=(205,77) channels=(...) expected_linear=(38,217,230) matched=true
+[info] object 2 (rim) world=(-2.0,-1.3,0.0) pixel=(50,178) channels=(...) expected_linear=(152,50,139) matched=true
+[info] object 3 (rim) world=(2.0,-1.3,0.0) pixel=(205,178) channels=(...) expected_linear=(152,139,43) matched=true
+[info] materials headless gate PASSED
+```
+
+**`--present` mode** opens a 900x700 window titled `rx_materials_sample
+(--present)` showing an orange checkerboard cube (top-left), a teal
+checkerboard cube (top-right), a magenta rim-lit sphere (bottom-left), and a
+golden-yellow rim-lit sphere (bottom-right), with the camera orbiting
+continuously around the vertical axis. Editing and saving either
+`checker.slang` or `rim.slang` (the copies deployed next to the running
+binary, not the ones in the source tree) changes that material's rendering
+within about a second, with a console log line confirming the reload
+(`hot-reload of '...' succeeded`); a syntactically broken edit keeps the
+last-good material rendering instead of crashing. Closing the window exits
+with status 0 and logs:
+
+```
+[info] --present: window closed cleanly
+```
+
+### Editing a material live
+
+With `--present` running, open the deployed `materials/checker.slang` or
+`materials/rim.slang` (next to the running binary) in any editor and change
+its `evaluate()` body — e.g. checker.slang's cell count:
+
+```hlsl
+const float kCellsPerAxis = 6.0; // was 3.0 -- a finer checkerboard
+```
+
+Save the file — the affected cubes/spheres update within about a second.
+This sample's hot-reload support covers edits that change a material's
+*math*, matching `test_material_system.cpp`'s own reload-fixture convention
+— NOT edits that add/remove/retype a `gParams` field (that changes the
+parameter block's byte layout out from under this sample's already-created
+`IRxMaterialInstance` objects); `recordDraws()` in `main.cpp` catches that
+case defensively (logs it, skips that one object's draw for the frame)
+rather than letting it crash the session.
+
+### Redistribution
+
+Same Slang-runtime-lib mechanism as every in-process-compiling sample, plus
+a ledger item this sample resolves for `rx_material` itself: the two shared
+files every material composes against (`shaders/material/material.slang`,
+`shaders/material/forward_entry.slang`) used to be locatable only via
+`RX_MATERIAL_SHADER_DIR`, a compile-time absolute path anchored at this
+repository's own checkout — meaningless for a redistributed binary.
+`MaterialSystem::create()` (`src/rx_material/include/rx_material/
+material_system.h`) now takes an optional `sharedShaderDir` parameter;
+`RX_MATERIAL_SHADER_DIR` stays the default for every other caller
+(`rx_material`'s own unit/GPU tests), unchanged. This sample resolves a real
+runtime directory (`SDL_GetBasePath()`-relative, exactly like
+02_hotreload's own `resolveShaderPath()`) and passes it explicitly — so a
+redistributed copy of this sample's build-output directory (binary +
+`materials/` + `material_shaders/` + the Slang runtime libraries) runs
+identically outside the build tree, with no reference to this repository's
+checkout at all. Verified directly: this sample's packaged `.zip` output,
+unzipped to a directory outside the build tree entirely, passes its own
+headless gate unmodified on both `linux-native` and (via Wine)
+`windows-cross-zig`.
+
 ## Building and running
 
 Both sample modes and both build presets work identically on Linux and
@@ -528,6 +657,17 @@ cmake --build --preset linux-native
 ./build/linux-native/samples/05_multipass/sample_05_multipass --present
 ```
 
+```sh
+# Headless, end-user default -- validation off, no Vulkan SDK required.
+# ctest (see below) runs this same headless mode but adds --validate:
+./build/linux-native/samples/06_materials/sample_06_materials
+
+# Interactive present-mode window, camera orbiting, material hot-reload --
+# edit build/linux-native/samples/06_materials/materials/checker.slang or
+# rim.slang while this runs:
+./build/linux-native/samples/06_materials/sample_06_materials --present
+```
+
 Steam Deck Desktop Mode: open Konsole (or any terminal) from the Desktop
 Mode taskbar and run the exact same commands above — the Deck's SteamOS is
 Linux with a Vulkan driver (AMD Mesa RADV), so `linux-native` is the correct
@@ -546,8 +686,9 @@ cmake --build --preset windows-cross-zig
 This produces `build/windows-cross-zig/samples/01_triangle/sample_01_triangle.exe`,
 `build/windows-cross-zig/samples/02_hotreload/sample_02_hotreload.exe`,
 `build/windows-cross-zig/samples/03_bindless_mesh/sample_03_bindless_mesh.exe`,
-`build/windows-cross-zig/samples/04_streaming/sample_04_streaming.exe`, and
-`build/windows-cross-zig/samples/05_multipass/sample_05_multipass.exe`.
+`build/windows-cross-zig/samples/04_streaming/sample_04_streaming.exe`,
+`build/windows-cross-zig/samples/05_multipass/sample_05_multipass.exe`, and
+`build/windows-cross-zig/samples/06_materials/sample_06_materials.exe`.
 01_triangle's binary is statically linked and needs no Slang DLLs (its
 shaders are precompiled offline by `slangc` at build time — see its own
 "Redistribution" section above) — but it does still need the two `.spv`
@@ -614,6 +755,21 @@ sample_05_multipass.exe            REM headless correctness gate
 sample_05_multipass.exe --present  REM interactive present-mode window, light orbiting
 ```
 
+06_materials is the same shape as 02_hotreload for redistribution purposes
+(real in-process Slang compilation, so it needs the same 4 Slang DLLs
+deployed next to it), plus its own `materials/` subdirectory
+(`checker.slang`, `rim.slang`) and a sibling `material_shaders/`
+subdirectory carrying `rx_material`'s two shared files (`material.slang`,
+`forward_entry.slang` — see this sample's own README section above for why
+two separate subdirectories rather than one flat layout). Copy the entire
+`build/windows-cross-zig/samples/06_materials/` directory (minus the
+`CMakeFiles`/`.pdb`/`.cmake` build bookkeeping) to run it elsewhere:
+
+```
+sample_06_materials.exe            REM headless correctness gate
+sample_06_materials.exe --present  REM interactive present-mode window, camera orbiting
+```
+
 See `MANUAL_VERIFICATION.md` at the repo root for the actual per-platform
 run checklist (what to record, what "pass" looks like on real hardware).
 
@@ -624,14 +780,15 @@ ctest --preset linux-native --output-on-failure
 ```
 
 This runs `sample_01_triangle_headless`, `sample_02_hotreload_headless`,
-`sample_03_bindless_mesh_headless`, `sample_04_streaming_headless`, and
-`sample_05_multipass_headless` alongside every other project test
-(`rx_core_tests`, `rx_platform_tests`, `rx_shader_tests`, `rx_rhi_vk_tests`,
-`rx_graph_tests`, `rx_graph_gpu_tests`, `shader_spirv_test`) — `--present`
-mode is intentionally excluded from `ctest` (it blocks on a real window
-and user/OS interaction) and is exercised manually instead.
+`sample_03_bindless_mesh_headless`, `sample_04_streaming_headless`,
+`sample_05_multipass_headless`, and `sample_06_materials_headless` alongside
+every other project test (`rx_core_tests`, `rx_platform_tests`,
+`rx_shader_tests`, `rx_rhi_vk_tests`, `rx_graph_tests`, `rx_graph_gpu_tests`,
+`rx_material_tests`, `rx_material_gpu_tests`, `shader_spirv_test`) —
+`--present` mode is intentionally excluded from `ctest` (it blocks on a
+real window and user/OS interaction) and is exercised manually instead.
 
-Each of the five `*_headless` `ctest` cases passes `--validate` (see each
+Each of the six `*_headless` `ctest` cases passes `--validate` (see each
 sample's own section above) — a developer/CI flag that turns on the Vulkan
 validation layers, requiring the Vulkan SDK (or an equivalent
 `VK_LAYER_KHRONOS_validation` install) to be present on the machine running

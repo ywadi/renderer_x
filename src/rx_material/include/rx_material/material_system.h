@@ -166,8 +166,38 @@ public:
     // per-material one -- these two files are fixed and shared across
     // every material this MaterialSystem will ever load), or if any
     // underlying Vulkan object creation fails.
+    //
+    // `sharedShaderDir` [Task 8 ledger item carried from Task 5, resolved
+    // here]: the directory `material.slang`/`forward_entry.slang` are read
+    // from, AND the Slang session search path `import material;` (every
+    // material module's own first line) resolves against -- both were
+    // previously hardcoded to RX_MATERIAL_SHADER_DIR, a compile-time
+    // absolute path baked in by src/rx_material/CMakeLists.txt, anchored at
+    // this checked-out repository's own CMAKE_SOURCE_DIR. That is exactly
+    // right for a build-tree run (dev builds, ctest, CI -- Task 5 through
+    // Task 7's own tests all rely on it, unchanged, via the default below)
+    // but is meaningless for a REDISTRIBUTED binary, which has no
+    // CMAKE_SOURCE_DIR at all: samples/06_materials is the first caller
+    // that ships as a standalone package (binary + its own materials/ dir +
+    // these two shared files, deployed flat next to it -- see that
+    // sample's own CMakeLists.txt/README), so it needs a real, runtime-
+    // resolved directory (typically SDL_GetBasePath()-relative) instead of
+    // this compile-time one.
+    //
+    // Defaults to an empty path, which means "use RX_MATERIAL_SHADER_DIR"
+    // (this method's ORIGINAL, unchanged behavior) -- every existing
+    // caller (test_material_system.cpp, test_api_factory.cpp,
+    // test_api_contract.cpp, api_impl.cpp) keeps compiling and behaving
+    // identically without passing this parameter at all. A non-empty path
+    // is used verbatim (not validated against RX_MATERIAL_SHADER_DIR in any
+    // way) as both the shared-module read directory and the session search
+    // path; a caller passing one that does not actually contain
+    // material.slang/forward_entry.slang gets the exact same "file could
+    // not be read" nullptr-and-RX_LOG_ERROR failure this method already
+    // documents for that case.
     static std::unique_ptr<MaterialSystem> create(rx::rhi::Device& device, rx::rhi::BindlessTable& bindless,
-                                                    const std::filesystem::path& pipelineCachePath);
+                                                    const std::filesystem::path& pipelineCachePath,
+                                                    const std::filesystem::path& sharedShaderDir = {});
 
     // Loads the Slang module at `slangModulePath` as a material: reads its
     // bytes (moduleHash() below), compiles+composes+links it against the

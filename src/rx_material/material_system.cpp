@@ -456,6 +456,17 @@ struct MaterialSystem::Impl {
     std::filesystem::path pipelineCachePath;
     VkPipelineCache pipelineCache = VK_NULL_HANDLE;
 
+    // [Task 8] The RESOLVED shared-shader directory this instance was
+    // actually built with -- create()'s own `sharedShaderDir` parameter if
+    // non-empty, else RX_MATERIAL_SHADER_DIR (see create()'s header comment
+    // in material_system.h). Stashed here so reloadChanged()'s own fresh-
+    // session path (which must recreate a session against the SAME shared
+    // modules this instance loaded every OTHER material against) reads it
+    // back rather than re-deriving it -- there is exactly one resolution
+    // point (create()), matching every other "resolved once, reused" Impl
+    // field in this struct.
+    std::filesystem::path sharedShaderDir;
+
     // One process session per MaterialSystem instance -- NOT the
     // process-wide shared IGlobalSession rx_shader::Compiler keeps behind
     // a private, non-exported static (compiler.cpp's sharedGlobalSession())
@@ -550,9 +561,11 @@ uint64_t debugCompileCount(const MaterialSystem& system) { return system.impl_->
 
 namespace {
 
-// Loads `filename` (one of the two fixed, shared files under
-// RX_MATERIAL_SHADER_DIR -- material.slang/forward_entry.slang) as a
-// module named after its own stem, exactly like rx_shader::Compiler's
+// Loads `filename` (one of the two fixed, shared files under `dir` --
+// material.slang/forward_entry.slang; `dir` is MaterialSystem::create()'s
+// own resolved effectiveShaderDir [Task 8] -- RX_MATERIAL_SHADER_DIR by
+// default, or a caller-supplied runtime directory) as a module named after
+// its own stem, exactly like rx_shader::Compiler's
 // compileFromFile() reads a file itself and calls loadModuleFromSource()
 // rather than session->loadModule() -- see MaterialSystem::create()'s own
 // comment for why this project's established idiom is followed here too,
@@ -590,7 +603,8 @@ slang::IModule* loadSharedModule(slang::ISession* session, const std::filesystem
 // class when two independently-typed-out copies of this same setup drift:
 // a single function makes drift structurally impossible rather than
 // relying on two comments staying in sync by hand.
-bool createMaterialSession(slang::IGlobalSession* globalSession, Slang::ComPtr<slang::ISession>& outSession) {
+bool createMaterialSession(slang::IGlobalSession* globalSession, const std::filesystem::path& shaderDir,
+                            Slang::ComPtr<slang::ISession>& outSession) {
     slang::TargetDesc targetDesc{};
     targetDesc.format = SLANG_SPIRV;
     targetDesc.profile = globalSession->findProfile("sm_6_0");
@@ -608,8 +622,13 @@ bool createMaterialSession(slang::IGlobalSession* globalSession, Slang::ComPtr<s
                     "compiling without an explicit SPIR-V version floor");
     }
 
-    const std::string shaderDir = RX_MATERIAL_SHADER_DIR;
-    const char* searchPath = shaderDir.c_str();
+    // [Task 8] `shaderDir` is the CALLER-resolved shared-shader directory
+    // (MaterialSystem::create()'s own `sharedShaderDir` parameter, already
+    // defaulted to RX_MATERIAL_SHADER_DIR by that method if the caller
+    // passed none) -- this function itself no longer reads the macro
+    // directly, so it cannot drift from create()'s own resolution.
+    const std::string shaderDirStr = shaderDir.string();
+    const char* searchPath = shaderDirStr.c_str();
 
     slang::SessionDesc sessionDesc{};
     sessionDesc.targets = &targetDesc;
@@ -926,8 +945,18 @@ MaterialSystem::~MaterialSystem() {
 }
 
 std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device, rx::rhi::BindlessTable& bindless,
-                                                         const std::filesystem::path& pipelineCachePath) {
+                                                         const std::filesystem::path& pipelineCachePath,
+                                                         const std::filesystem::path& sharedShaderDir) {
     rx::core::log::init();
+
+    // [Task 8] Resolve ONCE, here: `sharedShaderDir` if the caller passed a
+    // real one, else the original compile-time RX_MATERIAL_SHADER_DIR
+    // default -- see this method's own header comment (material_system.h)
+    // for the redistribution problem this solves. Every use of "the shared-
+    // shader directory" below and in reloadChanged() (via
+    // impl->sharedShaderDir) flows from this one resolution.
+    const std::filesystem::path effectiveShaderDir =
+        !sharedShaderDir.empty() ? sharedShaderDir : std::filesystem::path(RX_MATERIAL_SHADER_DIR);
 
     Slang::ComPtr<slang::IGlobalSession> globalSession;
     if (SLANG_FAILED(slang::createGlobalSession(globalSession.writeRef())) || globalSession.get() == nullptr) {
@@ -941,17 +970,16 @@ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device, 
     // Compiler's own sessions never set (it has no multi-file import to
     // resolve): this is what lets `import material;` inside
     // forward_entry.slang and every material module resolve to
-    // RX_MATERIAL_SHADER_DIR/material.slang without this class needing to
+    // effectiveShaderDir/material.slang without this class needing to
     // pre-load it explicitly. [Task 7] Factored into createMaterialSession()
     // so reloadChanged()'s fresh-session path cannot drift from this one.
     Slang::ComPtr<slang::ISession> session;
-    if (!createMaterialSession(globalSession.get(), session)) {
+    if (!createMaterialSession(globalSession.get(), effectiveShaderDir, session)) {
         return nullptr;
     }
 
-    const std::string shaderDir = RX_MATERIAL_SHADER_DIR;
     std::string diagnostics;
-    auto forwardEntry = loadForwardEntry(session, shaderDir, diagnostics);
+    auto forwardEntry = loadForwardEntry(session, effectiveShaderDir, diagnostics);
     if (!forwardEntry.has_value()) {
         return nullptr;
     }
@@ -1034,6 +1062,7 @@ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device, 
     impl->bindless = &bindless;
     impl->pipelineCachePath = pipelineCachePath;
     impl->pipelineCache = pipelineCache;
+    impl->sharedShaderDir = effectiveShaderDir;
     impl->globalSession = std::move(globalSession);
     impl->session = std::move(session);
     impl->forwardEntryModule = forwardEntry->module;
@@ -1181,7 +1210,12 @@ void MaterialSystem::bindInstance(VkCommandBuffer cmd, const rx::graph::PassCont
 
 void MaterialSystem::reloadChanged() {
     Impl& impl = *impl_;
-    const std::string shaderDir = RX_MATERIAL_SHADER_DIR;
+    // [Task 8] The SAME resolved directory create() built this instance
+    // with (impl.sharedShaderDir) -- never re-reads RX_MATERIAL_SHADER_DIR
+    // directly, so a MaterialSystem built against a caller-supplied
+    // sharedShaderDir keeps reloading against that same directory, not the
+    // compile-time default.
+    const std::filesystem::path& shaderDir = impl.sharedShaderDir;
 
     for (MaterialHandle handle : impl.materialHandles) {
         // Re-fetched fresh every iteration -- see Impl::materialHandles'
@@ -1228,7 +1262,7 @@ void MaterialSystem::reloadChanged() {
         // ever pays for a new, cheap ISession, never a new IGlobalSession"
         // cost model.
         Slang::ComPtr<slang::ISession> freshSession;
-        if (!createMaterialSession(impl.globalSession.get(), freshSession)) {
+        if (!createMaterialSession(impl.globalSession.get(), shaderDir, freshSession)) {
             RX_LOG_WARN("rx_material: reloadChanged: failed to create a fresh Slang session for '{}'; keeping "
                         "last-good",
                         record->path.string());

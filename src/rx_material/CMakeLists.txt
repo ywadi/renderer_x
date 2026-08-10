@@ -35,14 +35,15 @@ target_link_libraries(rx_material PUBLIC rx_core rx_graph rx_rhi_vk rx_shader_la
 # RX_TRIANGLE_VERT_SPV/RX_TRIANGLE_FRAG_SPV into shader_spirv_test: an
 # absolute path anchored at CMAKE_SOURCE_DIR, valid for any build of THIS
 # checked-out repository (dev builds, ctest, CI) but not a relocated/
-# packaged binary -- a deliberate, explicitly-scoped-out concern for this
-# task (Task 5 is the core material system + its own unit/GPU tests, run
-# straight from the build tree against the checked-out source, exactly
-# like rx_shader_tests/rx_graph_tests already do; a later sample that ships
-# a redistributable package is expected to revisit this the same way
-# samples/02_hotreload's own build-relative shader deployment does for its
-# single hotreload.slang file) -- see material_system.h's own comment on
-# MaterialSystem::create() for the full rationale.
+# packaged binary. This remains the DEFAULT MaterialSystem::create() uses
+# when its `sharedShaderDir` parameter is left empty (Task 5 through Task 7's
+# own unit/GPU tests all rely on exactly that default, unchanged, and keep
+# doing so) -- Task 5 deliberately scoped the redistribution case out;
+# [Task 8] samples/06_materials is the redistributable-package caller that
+# revisits it, passing a runtime-resolved (SDL_GetBasePath()-relative)
+# directory instead so its packaged binary needs no reference to this build
+# tree at all -- see material_system.h's own comment on
+# MaterialSystem::create() for the full parameter contract.
 target_compile_definitions(rx_material PRIVATE
   RX_MATERIAL_SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders/material"
 )
