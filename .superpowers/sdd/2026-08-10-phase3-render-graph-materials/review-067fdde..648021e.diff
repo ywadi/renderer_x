@@ -1,0 +1,913 @@
+# Review package: 067fdde..648021e
+
+## Commits
+648021e fix: reject non-engine IRxTexture in setTexture, add standalone ParamArena tests
+dd7e33f docs: commit C-ABI-first multi-language binding strategy for the SDK phase
+be42787 docs: record library-model main-loop ownership decision for the SDK surface
+52fe6c2 docs: add input expansion (mouse capture, gamepad) to phase 4 seed notes
+
+## Files changed
+ .../task-7-report.md                               | 178 +++++++++++++++++
+ .../2026-08-09-toolchain-platform-rhi-design.md    |  18 ++
+ .../specs/2026-08-10-phase4-seed-notes.md          |   9 +
+ src/rx_material/api_impl.cpp                       |  46 +++--
+ src/rx_material/include/rx_material/instance.h     |  21 ++
+ src/rx_material/include/rx_material/rx_api.h       |  14 +-
+ src/rx_material/instance.cpp                       |  12 ++
+ src/rx_material/tests/CMakeLists.txt               |   5 +
+ src/rx_material/tests/test_api_factory.cpp         |  96 ++++++++-
+ src/rx_material/tests/test_param_arena.cpp         | 216 +++++++++++++++++++++
+ 10 files changed, 593 insertions(+), 22 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-10-phase3-render-graph-materials/task-7-report.md b/.superpowers/sdd/2026-08-10-phase3-render-graph-materials/task-7-report.md
+index 6c915c8..7e97df0 100644
+--- a/.superpowers/sdd/2026-08-10-phase3-render-graph-materials/task-7-report.md
++++ b/.superpowers/sdd/2026-08-10-phase3-render-graph-materials/task-7-report.md
+@@ -380,10 +380,188 @@ section 3" above.
+   charter asked for it.
+ - **Pipeline-layout/descriptor-set-layout immediate destruction during
+   reload** (not deferred through `DeletionQueue`, unlike `VkPipeline`
+   itself) relies on the general Vulkan spec behavior that such objects
+   need only remain valid through pipeline creation/command-buffer
+   recording, never through GPU execution — the same behavior this
+   codebase's own `PipelineLayoutBundle`/shader-module teardown already
+   relies on elsewhere (and D9's own text scopes the DeletionQueue
+   requirement to "pipeline destruction" specifically). Recorded here
+   explicitly as a reviewed, deliberate design choice, not an oversight.
++
++---
++
++## Fix round 1 (review: `task-7-review.md`, commit `067fdde`)
++
++Review verdict: spec ❌ on "production grade" (1 High: F1) plus 1 Medium
++(F2). Both addressed below.
++
++### F1 (High) — `setTexture()` silently bound bindless index 0 for a non-engine `IRxTexture`
++
++**Root cause.** `MaterialInstanceImpl::setTexture()` already used the
++correct, RTTI-free detection mechanism (a private
++`kIID_InternalTextureBridge` `queryInterface` check to distinguish a real,
++`createTexture2D()`-backed `TextureImpl` from anything else), but applied
++the wrong *policy* on a QI failure: `bindlessIndex` stayed `0` (a real,
++arbitrary bindless slot) and the call still returned `RX_OK`. A caller
++passing any non-engine `IRxTexture` got silently wrong rendering with zero
++diagnostic signal — the review correctly identified this as inconsistent
++with `rx_api.h`'s own documented `IRxTexture` invariant ("always wraps a
++renderer-owned... texture, created via `IRxMaterialSystem::
++createTexture2D()`"), and with the reason originally given for keeping
++the fallback (preserving Task 6's `FakeTexture` refcount tests) as not
++holding up: the bridge GUID is anonymous-namespace-private, so no test
++double could ever legitimately answer it regardless of policy.
++
++**Fix applied** (`api_impl.cpp`): the QI-failure branch now returns
++`RX_E_INVALIDARG` immediately (logged) instead of defaulting
++`bindlessIndex` to `0` and proceeding. The real bindless index is only
++ever read once the QI has already succeeded. `kIID_InternalTextureBridge`'s
++own header comment updated to describe the reject-not-fallback behavior.
++`rx_api.h`'s `IRxMaterialInstance`/`setTexture` doc comment now states the
++invariant explicitly at the call site itself, not only on `IRxTexture`'s
++own comment: `texture` must be engine-created (via `createTexture2D()`,
++directly or through a `queryInterface()` chain on one); any other
++implementation is rejected with `RX_E_INVALIDARG`.
++
++**Test changes** (`test_api_factory.cpp`) — adapted, not deleted, per the
++coordinator's instruction:
++- The old "`IRxMaterialInstance::setTexture` validates a real
++  bindless-index (uint) parameter and manages the `IRxTexture` reference
++  it stores" test (which asserted `RX_OK` for a `FakeTexture`) is now
++  "`IRxMaterialInstance::setTexture` rejects a non-engine-created
++  `IRxTexture`... with `RX_E_INVALIDARG`" — same `FakeTexture` double,
++  same fixture, now asserting the rejection, plus a new assertion that the
++  rejection happens *before* any refcount mutation (`fake->refCount()`
++  unchanged across the rejected call — proving the QI check runs ahead of
++  any addRef()).
++- A NEW test, "`IRxMaterialInstance::setTexture` manages the `IRxTexture`
++  reference it stores across overwrite and instance destruction (real
++  engine-created textures)", preserves the exact addRef/release lifecycle
++  coverage the old `FakeTexture`-based assertions provided — same
++  overwrite/destroy sequence, same three checkpoints (store, overwrite,
++  instance destruction) — but against two REAL `IRxTexture`s obtained via
++  `IRxMaterialSystem::createTexture2D()`, since a rejected texture never
++  reaches the refcount-mutating code path at all. `TextureImpl` exposes no
++  `refCount()` accessor of its own (unlike the test-only `FakeTexture`), so
++  this test reads a live texture's current refcount via a new
++  side-effect-free `probeRefCount()` helper (one `addRef()` immediately
++  undone by one `release()`, net zero) rather than adding a debug-only
++  accessor to the ABI-facing `IRxTexture`/`TextureImpl` itself.
++- Every OTHER pre-existing `FakeTexture`-based `setTexture` call in this
++  file (the "happy path" test's `wrongTypeTexture`/`notFoundTexture`, the
++  "entry-point audit" test's `texture`) is unaffected by this fix: each of
++  those hits a name-not-found or field-kind mismatch before the
++  engine-texture check would ever run, so their expected results are
++  unchanged — verified by re-running, not just reasoned about.
++
++### F2 (Medium) — no standalone `ParamArena` test; every delivered exercise used `frameInFlightIndex == 0` only
++
++**Root cause.** `instance.h`'s own header comment claimed `ParamArena`
++"[l]ives at namespace scope... so it can be unit-tested on its own," but
++no test actually did so — every exercise went through
++`MaterialSystem::bindInstance()`, and both of `test_material_system.cpp`'s
++`bindInstance()` cases called `beginFrame(0, ...)` exclusively. Nothing
++confirmed slot isolation at the `ParamArena`-composed layer (as opposed to
++`DescriptorArena` alone, which already had this coverage) or confirmed the
++documented exhaustion/failure path is reachable in practice at a non-zero
++frame-in-flight index.
++
++**Fix applied:** new `src/rx_material/tests/test_param_arena.cpp` (added
++to `rx_material_gpu_tests`), exercising `ParamArena` directly against a
++bare `VkDevice` + `rx::rhi::Allocator` — no `MaterialSystem`,
++`BindlessTable`, or `RenderGraph`/`Executor` involved, mirroring
++`rx_rhi_vk/tests/descriptor_arena_test.cpp`'s own minimal headless fixture
++(`Context::create({}, true)` + a bare `vkb::PhysicalDeviceSelector`/
++`DeviceBuilder`, no descriptor-indexing or dynamic-rendering features
++needed). A new test-only seam, `rx::material::detail::
++debugFrameBufferData(const ParamArena&, uint32_t frameIndex)`
++(`instance.h`/`.cpp`, `friend`-gated into `ParamArena`, mirroring this
++codebase's own `detail::debugCompileCount()`/`detail::
++debugLastFrameFinalStages()` carve-out convention), reads back the raw
++bytes a given frame-in-flight slot's own host-visible buffer actually
++holds — `writeAndAllocate()` itself returns only an opaque
++`VkDescriptorSet` by design, so there was no other way to observe this
++from outside `ParamArena`'s own implementation.
++
++Two new test cases, both exercising `frameInFlightIndex` values other
++than (and in addition to) `0`, per the coordinator's explicit instruction:
++- **Frame isolation + reset-not-fresh-arena**: `beginFrame(0)` writes blob
++  A; `beginFrame(1)` writes blob B; asserts slot 0 still holds exactly
++  blob A's bytes (untouched by slot 1's own bump allocation) and slot 1
++  holds exactly blob B's. Then `beginFrame(2)` (wraps back to slot 0) —
++  writes blob C and asserts it landed at slot 0's buffer offset 0 again
++  (proving the reset, not merely a coincidentally-still-empty arena, is
++  what reclaimed the capacity) while slot 1 still holds blob B untouched.
++- **Exhaustion, at `frameInFlightIndex == 1`**: (a) a single
++  `writeAndAllocate()` request larger than `kBytesPerFrame` fails cleanly
++  (`VK_NULL_HANDLE`, logged), and a normal-sized write immediately after
++  it still succeeds with byte-exact content — proving the failed oversized
++  request did not corrupt the slot; (b) a fresh `beginFrame(1)`, then
++  `kMaxInstancesPerFrame` (512) successful `writeAndAllocate()` calls
++  followed by one more that must fail cleanly — proving the descriptor-
++  pool ceiling is reached at exactly the documented number and the
++  overflow attempt fails without corrupting the 512 already-written
++  blobs (re-checked byte-exact after the failed 513th call).
++
++Both new cases pass, zero validation errors — confirmed the real Vulkan
++error paths fire as designed (`rx::material::ParamArena::writeAndAllocate:
++frame slot 1 exhausted...` and `rx::rhi::DescriptorArena::allocate:
++vkAllocateDescriptorSets failed for frame slot 1...` both observed in the
++log during this run, not merely asserted blind).
++
++**Not fixed, noted for the record:** `writeAndAllocate()`'s byte-arena
++cursor advances (memcpy + `cursor = end`) *before* attempting the
++`DescriptorArena::allocate()` call; if that later allocation fails (pool
++exhausted), the cursor has still moved, wasting some byte-arena space on
++the failed call. This does not corrupt any already-written data (the
++bounds check for the *next* write is still against the real, moved-forward
++cursor, so no overlap can occur) and was not something the review's F2
++finding asked to be fixed (it asked for a *test*, not a behavior change,
++and no test assertion here depends on the cursor staying put after a
++failed allocation) — flagged here explicitly rather than silently
++patched, since a coordinator revisiting this later may want the cursor
++rolled back on that specific failure path for byte-arena efficiency.
++
++### Re-verification after both fixes
++
++- `ctest --preset linux-native --output-on-failure`: **14/14 passed**
++  (full repo regression).
++- `rx_material_gpu_tests --validate`: **25 test cases / 344 assertions**
++  (up from 22/296 — net +1 test case from splitting the F1 test into two,
++  +2 new `ParamArena` cases), all passing, zero validation errors.
++- `rx_material_tests`: **10 test cases / 50 assertions**, unchanged —
++  confirms zero regression on the device-free ABI contract surface.
++- `rx_rhi_vk_tests`: unaffected by this round's changes, re-run for
++  completeness — unchanged pass count.
++- Both presets rebuilt clean: `cmake --build build/linux-native` and
++  `cmake --build build/windows-cross-zig` — zero errors, every
++  touched/new target (`rx_rhi_vk`, `rx_material`, `rx_material_gpu_tests`,
++  `rx_material_tests`) relinked successfully.
++- Manual warning re-check (same method as the original submission —
++  extracted each changed/new file's real `compile_commands.json`
++  invocation, ran it with `-Wall -Wextra -Wpedantic -Wshadow` appended):
++  zero warnings/errors originating in `api_impl.cpp`, `instance.cpp`,
++  `test_api_factory.cpp`, `test_param_arena.cpp`.
++- AI-attribution grep on every file touched this round: zero matches.
++
++### Files touched this round
++
++- `src/rx_material/api_impl.cpp` (F1: `setTexture()` now rejects a
++  QI-bridge failure with `RX_E_INVALIDARG`; updated
++  `kIID_InternalTextureBridge`'s own header comment).
++- `src/rx_material/include/rx_material/rx_api.h` (F1: documented the
++  engine-created-texture-only invariant directly at `IRxMaterialInstance`/
++  `setTexture`'s own doc comment).
++- `src/rx_material/include/rx_material/instance.h` (F2: new
++  `detail::debugFrameBufferData()` test-only seam, `friend`-declared into
++  `ParamArena`).
++- `src/rx_material/instance.cpp` (F2: `debugFrameBufferData()`
++  implementation).
++- `src/rx_material/tests/test_api_factory.cpp` (F1: split/adapted the
++  `FakeTexture`-based `setTexture` test into a rejection test + a new
++  real-texture refcount-lifecycle test with a `probeRefCount()` helper).
++- `src/rx_material/tests/test_param_arena.cpp` (F2: new standalone
++  `ParamArena` test file — frame isolation/reset, exhaustion).
++- `src/rx_material/tests/CMakeLists.txt` (F2: registers
++  `test_param_arena.cpp` on `rx_material_gpu_tests`).
++- This report (`task-7-report.md`) — this Fix round 1 section.
+diff --git a/docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md b/docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md
+index 92b2412..91c0ae0 100644
+--- a/docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md
++++ b/docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md
+@@ -166,10 +166,28 @@ it is out of scope for *this* spec only, not out of scope for the project:
+     (RT pass = compute-class pass + acceleration-structure resource type),
+     VMA (AS allocation).
+   - **Post-processing & image reconstruction** (layer 9, techniques): tone
+     mapping, color grading, temporal anti-aliasing, hardware upscaling
+     wrappers (DLSS, FSR, XeSS).
+   - **Profiling & debug instrumentation** (layer 12, tooling): GPU markers
+     (PIX/RenderDoc integration), debug line drawing, memory leak tracking,
+     performance counters.
+ - macOS/MoltenVK support
+ - DLL ABI-stability strategy for the public interface
++- **Multi-language bindings** (committed 2026-08-10, SDK phase): the public
++  API ships C-ABI-first — a single IDL source generates the C header, the
++  C++ COM-lite header, and the DLL shim (bgfx precedent; kills header
++  drift) — and each language binds the C header via its own native tool
++  (Rust bindgen, Zig translate-c, C# P/Invoke generators, Python cffi,
++  Lua FFI). SWIG is the recorded fallback if a broad scripting-language
++  sweep is ever wanted directly from C++, but C-first is the strategy.
++  The COM-lite surface discipline (PODs, no STL/exceptions, error codes)
++  already satisfies every generator's input constraints by construction.
++- **Main-loop ownership** (decided 2026-08-10, binds the SDK-phase spec):
++  RendererX is library-model — the consuming game/engine owns `main()` and
++  the frame loop and calls an explicit frame API (begin-frame → declare
++  passes/submit → end-frame), never the reverse. No required init/frame
++  callbacks, no engine-owned loop: the audience is custom-engine
++  developers who own their own loops (bgfx/PhysX/FMOD precedent). An
++  optional thin "runner" convenience (window + per-frame callback, e.g.
++  over SDL3's callback mode) may ship later for quick starts, built ON the
++  library API and never required by it.
+diff --git a/docs/superpowers/specs/2026-08-10-phase4-seed-notes.md b/docs/superpowers/specs/2026-08-10-phase4-seed-notes.md
+index 54dc6c5..5bc83cd 100644
+--- a/docs/superpowers/specs/2026-08-10-phase4-seed-notes.md
++++ b/docs/superpowers/specs/2026-08-10-phase4-seed-notes.md
+@@ -47,16 +47,25 @@ and visible culling statistics.
+ 
+ 5. **Layer/mask system in scene submission (user-requested 2026-08-10):**
+    per-renderable layer bitmask; per-camera cull mask (a camera draws only
+    matching layers); per-light channel mask (a light illuminates only
+    matching objects AND only matching casters render into its shadow
+    passes). Applied at draw-list building time — no render-graph changes
+    required. Follow the established engine conventions (Unity layers /
+    Unreal lighting channels / Godot cull masks) rather than inventing new
+    semantics; pick mask widths and defaults in the Phase 4 spec.
+ 
++6. **Input expansion in rx_platform (user-raised 2026-08-10):** the Phase 4
++   fly-through camera requires relative mouse capture (raw deltas, cursor
++   show/hide) and gamepad support (Steam Deck is the hardware floor — the
++   fly-through must be drivable by pad, not only mouse). SDL3 provides
++   both natively; the work is exposing them through rx_platform's existing
++   event/input surface. Window-resize handling needs no Phase 4 work — the
++   full chain (SDL3 events → swapchain recreation → graph re-realization)
++   exists and is regression-tested as of Phase 3.
++
+ ## Carried process notes
+ 
+ - Research pass before spec (library selection for glTF/KTX2 with
+   citations), spec + plan authored by the coordinator, SDD execution with
+   per-task review, exit via deployed samples + tagged release — same cycle
+   as Phases 1-3.
+diff --git a/src/rx_material/api_impl.cpp b/src/rx_material/api_impl.cpp
+index 269f608..2fe8759 100644
+--- a/src/rx_material/api_impl.cpp
++++ b/src/rx_material/api_impl.cpp
+@@ -66,24 +66,36 @@ bool guidEquals(const RxGuid& a, const RxGuid& b) { return std::memcmp(&a, &b, s
+ // MaterialInstanceImpl::setTexture() can recover a real, engine-created
+ // texture's bindless-table index from a bare IRxTexture* argument using
+ // the SAME queryInterface()+GUID mechanism this whole ABI already relies
+ // on for identity/casting [D5 rule: "identity/casting is queryInterface()
+ // + GUID comparison"], rather than reaching for RTTI (dynamic_cast/typeid)
+ // -- which D5 explicitly forbids anywhere on this boundary's own object
+ // model -- to distinguish "a real TextureImpl" from "some other IRxTexture
+ // implementation" (e.g. a test-only double). A texture that does not
+ // answer to this GUID (anything not created via
+ // IRxMaterialSystem::createTexture2D()) has no real bindless registration
+-// to report at all -- setTexture() falls back to writing bindless index 0
+-// for it (see that method's own comment) rather than failing the whole
+-// call; this is exactly what keeps test_api_factory.cpp's existing
+-// FakeTexture-based refcount/lifecycle tests (Task 6) passing unchanged.
++// to report at all -- setTexture() REJECTS it outright with
++// RX_E_INVALIDARG (see that method's own comment) [Fix round 1,
++// task-7-review.md F1: an earlier version of this file instead fell back
++// to writing bindless index 0 for it, a real, arbitrary slot -- silent
++// wrong-texture binding with zero diagnostic signal, on exactly the axis
++// ("errors are RxResult codes, never silent wrong behavior") this
++// codebase otherwise holds to rigorously. rx_api.h's own IRxTexture doc
++// comment already documents that a valid IRxTexture "always" wraps an
++// engine-created texture, so rejecting anything that fails this check
++// enforces a contract the header already claims, not a new restriction].
++// test_api_factory.cpp's Task 6 FakeTexture-based tests were adapted
++// (not deleted) to assert this rejection directly; the refcount/lifecycle
++// coverage those tests used to provide via FakeTexture now lives in a
++// dedicated real-texture (IRxMaterialSystem::createTexture2D()-backed)
++// test instead, since a rejected texture never reaches the refcount-
++// mutating code path at all.
+ //
+ // Deliberately NOT IRxUnknown-rooted (no addRef/release of its own): this
+ // is a same-lifetime "peek" at data TextureImpl itself already owns, never
+ // a separately refcounted sub-object, so there is nothing for a caller to
+ // release. TextureImpl::queryInterface() below does NOT addRef() when
+ // answering THIS ONE GUID specifically (documented there too) -- the one
+ // deliberate exception to this file's otherwise-universal "every
+ // successful queryInterface() addRefs" rule, safe because the returned
+ // pointer's use is confined to the single expression that calls
+ // bindlessIndex() and is never stored or released.
+@@ -342,29 +354,41 @@ RxResult RX_CALL MaterialInstanceImpl::setTexture(const char* name, IRxTexture*
+             return RX_E_INVALIDARG;
+         }
+         if (static_cast<size_t>(info->offset) + sizeof(uint32_t) > blob_.size()) {
+             RX_LOG_ERROR(
+                 "rx_material: rx_api: MaterialInstanceImpl::setTexture('{}'): reflected offset {} + {} bytes "
+                 "exceeds this instance's blob size {} -- refusing to write out of bounds",
+                 name, info->offset, sizeof(uint32_t), blob_.size());
+             return RX_E_FAIL;
+         }
+ 
+-        // Recovers a REAL bindless index for an engine-created texture via
+-        // the private queryInterface bridge (see kIID_InternalTextureBridge's
+-        // own comment); falls back to 0 for anything else (a test-only
+-        // IRxTexture double has no real bindless registration to report).
+-        uint32_t bindlessIndex = 0;
++        // [Fix round 1, task-7-review.md F1] `texture` must be a real,
++        // engine-created texture (IRxMaterialSystem::createTexture2D()) --
++        // recovered via the private queryInterface bridge (see
++        // kIID_InternalTextureBridge's own comment). Anything that fails
++        // this QI (a hand-rolled test double, a hypothetical third-party
++        // IRxTexture implementation, ...) is REJECTED outright: there is
++        // no real bindless index to report for it, and silently binding
++        // index 0 -- a real, arbitrary slot -- would be a debugging-
++        // nightmare failure mode with zero diagnostic signal. This
++        // enforces the invariant rx_api.h's own IRxTexture/setTexture doc
++        // comments already document: a valid `texture` argument always
++        // wraps an engine-created resource.
+         void* bridgeOut = nullptr;
+-        if (texture->queryInterface(kIID_InternalTextureBridge, &bridgeOut) == RX_OK && bridgeOut != nullptr) {
+-            bindlessIndex = static_cast<IInternalTextureBridge*>(bridgeOut)->bindlessIndex();
++        if (texture->queryInterface(kIID_InternalTextureBridge, &bridgeOut) != RX_OK || bridgeOut == nullptr) {
++            RX_LOG_ERROR(
++                "rx_material: rx_api: MaterialInstanceImpl::setTexture('{}'): `texture` was not created via "
++                "IRxMaterialSystem::createTexture2D() (failed the internal engine-texture check) -- rejecting",
++                name);
++            return RX_E_INVALIDARG;
+         }
++        uint32_t bindlessIndex = static_cast<IInternalTextureBridge*>(bridgeOut)->bindlessIndex();
+ 
+         // [Fix round 1, task-6-review.md F1 -- ordering preserved] capture
+         // whatever this name previously held, perform the (possibly-
+         // throwing) map write FIRST, and only THEN touch the blob bytes
+         // (which cannot throw) and refcounts. If `textures_[name] = texture`
+         // throws (bad_alloc during a rehash), nothing else has been
+         // mutated yet -- no leaked reference, no partially-written blob.
+         IRxTexture* previousTexture = nullptr;
+         auto it = textures_.find(name);
+         if (it != textures_.end()) {
+diff --git a/src/rx_material/include/rx_material/instance.h b/src/rx_material/include/rx_material/instance.h
+index 36e3599..7bd1ed9 100644
+--- a/src/rx_material/include/rx_material/instance.h
++++ b/src/rx_material/include/rx_material/instance.h
+@@ -76,20 +76,39 @@ struct MaterialParamInfo {
+ // rx_api_detail.h's materialInstanceBlob()) or a future direct internal
+ // consumer. `paramData`/`paramSize` are never retained past the
+ // bindInstance() call that receives them -- the bytes are copied into the
+ // per-frame arena immediately.
+ struct InstanceBinding {
+     MaterialHandle material;
+     const void* paramData = nullptr;
+     size_t paramSize = 0;
+ };
+ 
++class ParamArena;
++
++namespace detail {
++
++// Test-only seam -- NOT part of the stable internal contract, mirroring
++// rx_graph's own `detail::debugLastFrameFinalStages()` and this same
++// library's own `detail::debugCompileCount()` carve-out convention:
++// exposed purely so a standalone ParamArena test [Fix round 1,
++// task-7-review.md F2] can read back the raw bytes writeAndAllocate()
++// wrote into a given frame-in-flight slot's own host-visible buffer, to
++// prove cross-frame isolation and reset behavior directly -- there is no
++// other way to observe this from outside ParamArena's own implementation
++// (writeAndAllocate() returns only an opaque VkDescriptorSet, by design;
++// see that method's own comment). Returns nullptr if `arena` has no
++// buffers at all (never true for a successfully create()'d ParamArena).
++[[nodiscard]] const void* debugFrameBufferData(const ParamArena& arena, uint32_t frameIndex);
++
++}  // namespace detail
++
+ // ParamArena -- the GPU-visible half of "material instance" [Task 7
+ // brief]: a per-frames-in-flight, host-visible, persistently-mapped,
+ // bump-allocated uniform-buffer arena (the CPU-writable byte storage) paired
+ // with an rx::rhi::DescriptorArena (the VkDescriptorSet-allocation half).
+ // Together this is exactly the brief's "per-frame host-visible arena
+ // buffer... allocate set-1 from DescriptorArena, write UBO descriptor"
+ // mechanism. Lives at namespace scope (not nested inside
+ // MaterialSystem::Impl) so it can be unit-tested on its own
+ // (test_material_system.cpp), mirroring rx_rhi_vk's own convention of
+ // giving each reusable piece (DescriptorArena, BindlessTable, FrameSync)
+@@ -165,20 +184,22 @@ public:
+     // pointing at exactly the bytes just written. Returns VK_NULL_HANDLE
+     // (logged) if `size` is 0, if the current frame's byte arena cannot fit
+     // `size` more bytes, or if the DescriptorArena allocation itself fails
+     // (e.g. kMaxInstancesPerFrame already exhausted this frame) -- callers
+     // must not bind/draw with a VK_NULL_HANDLE result.
+     [[nodiscard]] VkDescriptorSet writeAndAllocate(VkDescriptorSetLayout setLayout, const void* data, size_t size);
+ 
+     [[nodiscard]] uint32_t framesInFlight() const { return static_cast<uint32_t>(buffers_.size()); }
+ 
+ private:
++    friend const void* detail::debugFrameBufferData(const ParamArena& arena, uint32_t frameIndex);
++
+     ParamArena() = default;
+ 
+     // std::optional, not a plain member: rx::rhi::DescriptorArena's own
+     // default constructor is private (create() is the only way to build a
+     // real one -- see descriptor_arena.h's own comment), so ParamArena (a
+     // different class) has no accessible default to construct it with
+     // directly -- the same reason Impl (material_system.cpp) wraps its own
+     // Allocator/Uploader/ParamArena members in std::optional too.
+     VkDevice device_ = VK_NULL_HANDLE;
+     std::optional<rx::rhi::DescriptorArena> descriptorArena_;
+diff --git a/src/rx_material/include/rx_material/rx_api.h b/src/rx_material/include/rx_material/rx_api.h
+index 9f0bb27..9a69e17 100644
+--- a/src/rx_material/include/rx_material/rx_api.h
++++ b/src/rx_material/include/rx_material/rx_api.h
+@@ -142,21 +142,33 @@ static_assert(sizeof(RxTextureDesc) == 32,
+ 
+ // --- IRxMaterialInstance: one material's bound-parameter set -----------
+ // setFloat/setFloat4/setTexture validate `name` against the owning
+ // IRxMaterial's reflected parameter set and the value's shape against
+ // that parameter's reflected type:
+ //   RX_OK             -- name known, type matches; value stored.
+ //   RX_E_NOTFOUND      -- no reflected parameter named `name` on this
+ //                         material.
+ //   RX_E_INVALIDARG    -- `name`/`value`/`texture` is null, OR `name` is
+ //                         a real reflected parameter of a DIFFERENT type
+-//                         than this setter binds.
++//                         than this setter binds, OR (setTexture only,
++//                         see below) `texture` is not an engine-created
++//                         IRxTexture.
++// setTexture()'s own invariant [Fix round 1, task-7-review.md F1]:
++// `texture` must be an IRxTexture obtained from
++// IRxMaterialSystem::createTexture2D() (directly, or via a chain of
++// queryInterface() calls on one) -- exactly what IRxTexture's own doc
++// comment above already documents every valid instance as being. Any
++// OTHER IRxTexture implementation (a hand-rolled third-party one, a test
++// double, ...) is REJECTED with RX_E_INVALIDARG, never silently bound: a
++// foreign texture has no real bindless-table registration this engine
++// can report, so binding it anyway would mean writing an arbitrary, real
++// slot's index into the parameter blob with no diagnostic signal at all.
+ // Values are stored into a CPU-side blob owned by the instance object, laid
+ // out byte-for-byte at the material's own reflected field offsets [Task 7]
+ // -- draw-time binding of that blob into a real per-instance descriptor
+ // set/uniform buffer (rx::material::MaterialSystem::bindInstance()) is an
+ // INTERNAL API, not part of this ABI surface this phase (draw submission
+ // is not public in Phase 3 -- D5/D11); see api_impl.cpp's own header
+ // comment and rx_api_detail.h's bridge accessors for the exact handoff a
+ // caller holding the internal rx::material::MaterialSystem* uses.
+ struct IRxMaterialInstance : IRxUnknown {
+     virtual RxResult RX_CALL setFloat(const char* name, float value) = 0;
+diff --git a/src/rx_material/instance.cpp b/src/rx_material/instance.cpp
+index ca0ebf7..df985b4 100644
+--- a/src/rx_material/instance.cpp
++++ b/src/rx_material/instance.cpp
+@@ -81,11 +81,23 @@ VkDescriptorSet ParamArena::writeAndAllocate(VkDescriptorSetLayout setLayout, co
+     write.dstBinding = 0;  // this engine's own fixed binding-0-within-set-1 convention [D6/D8] -- see
+                             // material_system.cpp's kMaterialParamBlockBinding comment for the citation.
+     write.descriptorCount = 1;
+     write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+     write.pBufferInfo = &bufferInfo;
+     vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+ 
+     return set;
+ }
+ 
++namespace detail {
++
++const void* debugFrameBufferData(const ParamArena& arena, uint32_t frameIndex) {
++    if (arena.buffers_.empty()) {
++        return nullptr;
++    }
++    uint32_t slot = frameIndex % static_cast<uint32_t>(arena.buffers_.size());
++    return arena.buffers_[slot].mappedData();
++}
++
++}  // namespace detail
++
+ }  // namespace rx::material
+diff --git a/src/rx_material/tests/CMakeLists.txt b/src/rx_material/tests/CMakeLists.txt
+index 92cbc0e..d0c31a3 100644
+--- a/src/rx_material/tests/CMakeLists.txt
++++ b/src/rx_material/tests/CMakeLists.txt
+@@ -19,20 +19,25 @@
+ # whichever vkb::Instance is built FIRST, forever).
+ add_executable(rx_material_gpu_tests
+     doctest_main.cpp
+     test_material_system.cpp
+     # Task 6: rxCreateMaterialSystem + IRxMaterialSystem::loadMaterial's
+     # happy path against a real VkDevice-backed internal MaterialSystem
+     # (test_unlit.slang/test_textured.slang) -- the ABI's device-free
+     # contract lives in rx_material_tests below; this is the ONE case
+     # this task's tests need a real device for.
+     test_api_factory.cpp
++    # Task 7 fix round 1 (F2): standalone ParamArena tests against a bare
++    # VkDevice + rx::rhi::Allocator -- no MaterialSystem/BindlessTable/
++    # RenderGraph needed, matching rx_rhi_vk/tests/descriptor_arena_test.cpp's
++    # own minimal headless fixture pattern.
++    test_param_arena.cpp
+ )
+ target_link_libraries(rx_material_gpu_tests PRIVATE rx_material rx_rhi_vk rx_platform doctest::doctest)
+ rx_shader_deploy_runtime_libs(rx_material_gpu_tests)
+ 
+ target_compile_definitions(rx_material_gpu_tests PRIVATE
+   RX_MATERIAL_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
+ )
+ 
+ # --validate: same developer/CI-gate opt-in every other GPU-backed test
+ # binary's own ctest registration already documents (rx_graph/tests/
+diff --git a/src/rx_material/tests/test_api_factory.cpp b/src/rx_material/tests/test_api_factory.cpp
+index 76f0940..a52d9fc 100644
+--- a/src/rx_material/tests/test_api_factory.cpp
++++ b/src/rx_material/tests/test_api_factory.cpp
+@@ -218,22 +218,33 @@ TEST_CASE("rxCreateMaterialSystem + loadMaterial: happy path against a real devi
+     CHECK(instanceAsUnknown == instanceAsInstance);
+     static_cast<IRxUnknown*>(instanceAsUnknown)->release();
+     static_cast<IRxUnknown*>(instanceAsInstance)->release();
+ 
+     instance->release();
+     material->release();
+     system->release();
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
+-TEST_CASE("IRxMaterialInstance::setTexture validates a real bindless-index (uint) parameter and manages the "
+-          "IRxTexture reference it stores") {
++// [Fix round 1, task-7-review.md F1] `FakeTexture` is a hand-rolled,
++// non-engine `IRxTexture` implementation -- it fails the internal
++// `kIID_InternalTextureBridge` queryInterface check (anonymous-namespace-
++// private to api_impl.cpp; no test double could ever answer it), so
++// `setTexture()` must REJECT it with RX_E_INVALIDARG rather than silently
++// binding bindless index 0. This test previously (Task 6/7's original
++// submission) asserted RX_OK here and used `FakeTexture` to exercise
++// setTexture()'s addRef()/release() lifecycle management -- that
++// lifecycle coverage now lives in the REAL-texture test right below this
++// one (a rejected call never reaches the refcount-mutating code path at
++// all, so `FakeTexture` genuinely cannot exercise it anymore).
++TEST_CASE("IRxMaterialInstance::setTexture rejects a non-engine-created IRxTexture (e.g. a hand-rolled test "
++          "double) with RX_E_INVALIDARG") {
+     auto fixture = makeFixture("rx_api_factory_texture_param");
+     if (!fixture.has_value()) {
+         return;
+     }
+ 
+     auto internal = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+                                                             freshCachePath("api_texture_param"));
+     REQUIRE(internal != nullptr);
+ 
+     RxMaterialSystemDesc desc{internal.get()};
+@@ -242,41 +253,106 @@ TEST_CASE("IRxMaterialInstance::setTexture validates a real bindless-index (uint
+ 
+     IRxMaterial* material = nullptr;
+     std::string texturedPath = testDataPath("test_textured.slang").string();
+     REQUIRE(system->loadMaterial(texturedPath.c_str(), &material) == RX_OK);
+     REQUIRE(material != nullptr);
+ 
+     IRxMaterialInstance* instance = nullptr;
+     REQUIRE(material->createInstance(&instance) == RX_OK);
+ 
+     // Wrong setter for a real uint (bindless-index) field -- type
+-    // mismatch.
++    // mismatch, checked (and unaffected by F1's fix) before the
++    // engine-texture check ever runs.
+     CHECK(instance->setFloat("albedoIndex", 1.0F) == RX_E_INVALIDARG);
+ 
+-    auto* first = new FakeTexture();
+-    CHECK(first->refCount() == 1);
++    auto* fake = new FakeTexture();
++    CHECK(fake->refCount() == 1);
++    CHECK(instance->setTexture("albedoIndex", fake) == RX_E_INVALIDARG);
++    // Rejection happens before any refcount mutation at all -- `fake`'s
++    // count is completely untouched by the rejected call.
++    CHECK(fake->refCount() == 1);
++    fake->release();
++
++    instance->release();
++    material->release();
++    system->release();
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++// The addRef()/release() lifecycle coverage the old FakeTexture-based test
++// used to provide, preserved here against REAL engine-created textures
++// (the only kind setTexture() accepts as of F1's fix) -- probeRefCount()
++// below reads a live IRxTexture's current refcount side-effect-free (one
++// addRef() immediately undone by one release(), net zero) since, unlike
++// the test-only FakeTexture double, the real TextureImpl exposes no
++// refCount() accessor of its own.
++namespace {
++uint32_t probeRefCount(IRxTexture* texture) {
++    uint32_t afterAddRef = texture->addRef();
++    uint32_t afterRelease = texture->release();
++    (void)afterRelease;
++    return afterAddRef - 1;
++}
++}  // namespace
++
++TEST_CASE("IRxMaterialInstance::setTexture manages the IRxTexture reference it stores across overwrite and "
++          "instance destruction (real engine-created textures)") {
++    auto fixture = makeFixture("rx_api_factory_texture_refcount");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto internal = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
++                                                            freshCachePath("api_texture_refcount"));
++    REQUIRE(internal != nullptr);
++
++    RxMaterialSystemDesc desc{internal.get()};
++    IRxMaterialSystem* system = nullptr;
++    REQUIRE(rxCreateMaterialSystem(&desc, &system) == RX_OK);
++
++    IRxMaterial* material = nullptr;
++    std::string texturedPath = testDataPath("test_textured.slang").string();
++    REQUIRE(system->loadMaterial(texturedPath.c_str(), &material) == RX_OK);
++
++    IRxMaterialInstance* instance = nullptr;
++    REQUIRE(material->createInstance(&instance) == RX_OK);
++
++    std::vector<uint8_t> pixels(static_cast<size_t>(2) * 2 * 4, 0x40);
++    RxTextureDesc td{};
++    td.pixels = pixels.data();
++    td.pixelBytes = pixels.size();
++    td.width = 2;
++    td.height = 2;
++    td.format = RX_FORMAT_RGBA8_UNORM;
++    td.generateMips = 0;
++
++    IRxTexture* first = nullptr;
++    REQUIRE(system->createTexture2D(&td, &first) == RX_OK);
++    CHECK(probeRefCount(first) == 1);
++
+     REQUIRE(instance->setTexture("albedoIndex", first) == RX_OK);
+-    CHECK(first->refCount() == 2);  // instance now holds its own reference too
++    CHECK(probeRefCount(first) == 2);  // instance now holds its own reference too
+ 
+     // Overwriting the same parameter releases the previously stored
+     // texture and addRef()s the new one.
+-    auto* second = new FakeTexture();
++    IRxTexture* second = nullptr;
++    REQUIRE(system->createTexture2D(&td, &second) == RX_OK);
+     REQUIRE(instance->setTexture("albedoIndex", second) == RX_OK);
+-    CHECK(first->refCount() == 1);   // instance's reference on `first` was released
+-    CHECK(second->refCount() == 2);  // instance now holds a reference on `second`
++    CHECK(probeRefCount(first) == 1);   // instance's reference on `first` was released
++    CHECK(probeRefCount(second) == 2);  // instance now holds a reference on `second`
+ 
+     first->release();  // drop the caller's own ref -- `first` is fully destroyed now.
+ 
+     // Destroying the instance releases whatever it still holds
+     // (`second`) exactly once.
+     instance->release();
+-    CHECK(second->refCount() == 1);  // only the caller's own ref remains
++    CHECK(probeRefCount(second) == 1);  // only the caller's own ref remains
+     second->release();
+ 
+     material->release();
+     system->release();
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
+ TEST_CASE("loadMaterial maps a real Slang compile failure to RX_E_COMPILE, never throws across the boundary, and "
+           "leaves no orphaned live API object behind") {
+     auto fixture = makeFixture("rx_api_factory_bad_module");
+diff --git a/src/rx_material/tests/test_param_arena.cpp b/src/rx_material/tests/test_param_arena.cpp
+new file mode 100644
+index 0000000..2303c57
+--- /dev/null
++++ b/src/rx_material/tests/test_param_arena.cpp
+@@ -0,0 +1,216 @@
++// Standalone ParamArena tests [Fix round 1, task-7-review.md F2]:
++// instance.h's own header comment claims ParamArena "[l]ives at namespace
++// scope... so it can be unit-tested on its own" -- this file is that test,
++// exercising ParamArena directly (no MaterialSystem, no BindlessTable,
++// no RenderGraph/Executor) against a bare VkDevice + rx::rhi::Allocator,
++// mirroring rx_rhi_vk/tests/descriptor_arena_test.cpp's own headless
++// fixture pattern for the identical reason: ParamArena needs neither
++// descriptor-indexing nor dynamic-rendering/sync2 device features, so this
++// is deliberately the most minimal fixture that can build one.
++//
++// Every case here specifically exercises MORE THAN frameInFlightIndex == 0
++// -- the exact gap the review flagged (every existing bindInstance()-level
++// test only ever called `beginFrame(0, ...)`).
++#include <doctest/doctest.h>
++#include <rx_material/instance.h>
++#include <rx_rhi_vk/buffer.h>
++#include <rx_rhi_vk/context.h>
++#include <VkBootstrap.h>
++
++#include <array>
++#include <cstring>
++#include <utility>
++#include <vector>
++
++namespace {
++
++struct HeadlessParamArenaFixture {
++    rx::rhi::Context context;
++    vkb::Device vkbDevice;
++    VkDevice device;
++    VkPhysicalDevice physicalDevice;
++};
++
++HeadlessParamArenaFixture makeFixture() {
++    auto context = rx::rhi::Context::create({}, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++
++    vkb::PhysicalDeviceSelector selector(context->vkbInstance());
++    auto physResult = selector.set_minimum_version(1, 3).select();
++    REQUIRE(physResult.has_value());
++
++    auto deviceResult = vkb::DeviceBuilder(physResult.value()).build();
++    REQUIRE(deviceResult.has_value());
++    vkb::Device vkbDevice = deviceResult.value();
++    volkLoadDevice(vkbDevice.device);
++
++    return HeadlessParamArenaFixture{std::move(*context), vkbDevice, vkbDevice.device,
++                                      vkbDevice.physical_device.physical_device};
++}
++
++// One VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER binding at binding 0 -- exactly the
++// shape ParamArena::writeAndAllocate() allocates against (instance.cpp).
++VkDescriptorSetLayout makeUboSetLayout(VkDevice device) {
++    VkDescriptorSetLayoutBinding binding{};
++    binding.binding = 0;
++    binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
++    binding.descriptorCount = 1;
++    binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
++
++    VkDescriptorSetLayoutCreateInfo info{};
++    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
++    info.bindingCount = 1;
++    info.pBindings = &binding;
++
++    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
++    REQUIRE(vkCreateDescriptorSetLayout(device, &info, nullptr, &layout) == VK_SUCCESS);
++    return layout;
++}
++
++}  // namespace
++
++TEST_CASE("ParamArena: writes into different frame-in-flight slots are isolated, and beginFrame()'s reset (not "
++          "merely a fresh arena) is what reclaims a slot's capacity on wraparound") {
++    HeadlessParamArenaFixture fixture = makeFixture();
++
++    {
++        auto allocator =
++            rx::rhi::Allocator::createRaw(fixture.physicalDevice, fixture.device, fixture.context.instance());
++        REQUIRE(allocator.has_value());
++
++        auto arena = rx::material::ParamArena::create(fixture.device, *allocator, /*framesInFlight=*/2);
++        REQUIRE(arena.has_value());
++        CHECK(arena->framesInFlight() == 2);
++
++        VkDescriptorSetLayout layout = makeUboSetLayout(fixture.device);
++
++        std::array<uint8_t, 16> blobA{};
++        blobA.fill(0xAA);
++        std::array<uint8_t, 16> blobB{};
++        blobB.fill(0xBB);
++
++        // --- Frame 0 (slot 0): write blob A.
++        arena->beginFrame(0);
++        VkDescriptorSet setA = arena->writeAndAllocate(layout, blobA.data(), blobA.size());
++        REQUIRE(setA != VK_NULL_HANDLE);
++
++        // --- Frame 1 (slot 1, a DIFFERENT frame-in-flight index than any
++        // other case in this task's test suite exercises): write blob B.
++        arena->beginFrame(1);
++        VkDescriptorSet setB = arena->writeAndAllocate(layout, blobB.data(), blobB.size());
++        REQUIRE(setB != VK_NULL_HANDLE);
++
++        // Slot 0's bytes must be completely untouched by slot 1's own bump
++        // allocation -- the two frame-in-flight slots are backed by
++        // entirely separate host-visible buffers, never a shared one.
++        const void* slot0Data = rx::material::detail::debugFrameBufferData(*arena, 0);
++        REQUIRE(slot0Data != nullptr);
++        CHECK(std::memcmp(slot0Data, blobA.data(), blobA.size()) == 0);
++
++        const void* slot1Data = rx::material::detail::debugFrameBufferData(*arena, 1);
++        REQUIRE(slot1Data != nullptr);
++        CHECK(std::memcmp(slot1Data, blobB.data(), blobB.size()) == 0);
++
++        // --- Frame 2 (frameIndex % 2 == 0 -- wraps back to slot 0):
++        // beginFrame() must RESET slot 0's cursor -- write a third blob and
++        // confirm it lands at the START of slot 0's buffer again (byte-
++        // exact at offset 0), proving the reset actually happened rather
++        // than this just being a fresh, still-empty arena coincidentally
++        // agreeing.
++        arena->beginFrame(2);
++        std::array<uint8_t, 16> blobC{};
++        blobC.fill(0xCC);
++        VkDescriptorSet setC = arena->writeAndAllocate(layout, blobC.data(), blobC.size());
++        REQUIRE(setC != VK_NULL_HANDLE);
++
++        const void* slot0DataAfterWrap = rx::material::detail::debugFrameBufferData(*arena, 0);
++        REQUIRE(slot0DataAfterWrap != nullptr);
++        CHECK(std::memcmp(slot0DataAfterWrap, blobC.data(), blobC.size()) == 0);
++
++        // Slot 1 (frame 1's own blob B) must remain completely untouched by
++        // frame 2's write into slot 0 -- confirms isolation holds across a
++        // wraparound too, not just on the first pass through each slot.
++        const void* slot1DataStillB = rx::material::detail::debugFrameBufferData(*arena, 1);
++        REQUIRE(slot1DataStillB != nullptr);
++        CHECK(std::memcmp(slot1DataStillB, blobB.data(), blobB.size()) == 0);
++
++        vkDestroyDescriptorSetLayout(fixture.device, layout, nullptr);
++        // `allocator`/`arena` (RAII) go out of scope at the end of this
++        // block, before the device itself is destroyed below.
++    }
++
++    vkDeviceWaitIdle(fixture.device);
++    vkb::destroy_device(fixture.vkbDevice);
++    CHECK_FALSE(fixture.context.hasValidationErrors());
++}
++
++TEST_CASE("ParamArena: byte-arena exhaustion and descriptor-pool exhaustion at a non-zero frame-in-flight index "
++          "fail cleanly (VK_NULL_HANDLE), never corrupting an already-written blob") {
++    HeadlessParamArenaFixture fixture = makeFixture();
++
++    {
++        auto allocator =
++            rx::rhi::Allocator::createRaw(fixture.physicalDevice, fixture.device, fixture.context.instance());
++        REQUIRE(allocator.has_value());
++
++        auto arena = rx::material::ParamArena::create(fixture.device, *allocator, /*framesInFlight=*/2);
++        REQUIRE(arena.has_value());
++
++        VkDescriptorSetLayout layout = makeUboSetLayout(fixture.device);
++
++        // --- Byte-arena exhaustion, at frameInFlightIndex == 1 (not 0) ---
++        // A single request larger than the whole frame's documented byte
++        // budget must fail cleanly.
++        arena->beginFrame(1);
++        std::vector<uint8_t> tooBig(static_cast<size_t>(rx::material::ParamArena::kBytesPerFrame) + 1, 0x11);
++        CHECK(arena->writeAndAllocate(layout, tooBig.data(), tooBig.size()) == VK_NULL_HANDLE);
++
++        // The failed oversized request must not have corrupted this slot:
++        // a normal-sized write right after it still succeeds and lands
++        // with byte-exact content at the start of the (still-empty) slot.
++        std::array<uint8_t, 16> blob{};
++        blob.fill(0x22);
++        VkDescriptorSet normalSet = arena->writeAndAllocate(layout, blob.data(), blob.size());
++        REQUIRE(normalSet != VK_NULL_HANDLE);
++        const void* slot1Data = rx::material::detail::debugFrameBufferData(*arena, 1);
++        REQUIRE(slot1Data != nullptr);
++        CHECK(std::memcmp(slot1Data, blob.data(), blob.size()) == 0);
++
++        // --- Descriptor-pool exhaustion, at the SAME non-zero slot -------
++        // A fresh beginFrame(1) resets both the byte cursor and the paired
++        // DescriptorArena's pool, so this sub-case starts from a clean
++        // slate independent of the byte-arena sub-case above.
++        arena->beginFrame(1);
++        uint32_t successfulAllocations = 0;
++        for (; successfulAllocations < rx::material::ParamArena::kMaxInstancesPerFrame; ++successfulAllocations) {
++            VkDescriptorSet s = arena->writeAndAllocate(layout, blob.data(), blob.size());
++            if (s == VK_NULL_HANDLE) {
++                break;
++            }
++        }
++        // Every one of the documented kMaxInstancesPerFrame allocations
++        // must have succeeded -- the byte arena (1 MiB, ~256+16 bytes per
++        // aligned allocation) has ample headroom for this many small
++        // writes, so descriptor-pool capacity is what this loop actually
++        // measures.
++        CHECK(successfulAllocations == rx::material::ParamArena::kMaxInstancesPerFrame);
++
++        // One more allocation past the documented ceiling must fail
++        // cleanly -- the exact "documented failure mode fires" case F2
++        // asks for.
++        CHECK(arena->writeAndAllocate(layout, blob.data(), blob.size()) == VK_NULL_HANDLE);
++
++        // Nothing already written was corrupted by driving the pool to
++        // (and past) exhaustion -- re-check slot 1's very first byte
++        // range from this beginFrame(1) cycle.
++        const void* slot1DataAfterExhaustion = rx::material::detail::debugFrameBufferData(*arena, 1);
++        REQUIRE(slot1DataAfterExhaustion != nullptr);
++        CHECK(std::memcmp(slot1DataAfterExhaustion, blob.data(), blob.size()) == 0);
++
++        vkDestroyDescriptorSetLayout(fixture.device, layout, nullptr);
++    }
++
++    vkDeviceWaitIdle(fixture.device);
++    vkb::destroy_device(fixture.vkbDevice);
++    CHECK_FALSE(fixture.context.hasValidationErrors());
++}

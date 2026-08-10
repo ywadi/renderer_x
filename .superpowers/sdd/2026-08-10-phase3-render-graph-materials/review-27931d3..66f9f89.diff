@@ -1,0 +1,725 @@
+# Review package: 27931d3..66f9f89
+
+## Commits
+66f9f89 fix: extract shared ObjectTransform into scene_types.slang, add drift guards
+
+## Files changed
+ .../task-4-report.md                               | 37 ++++++++++
+ samples/05_multipass/CMakeLists.txt                | 10 ++-
+ samples/05_multipass/main.cpp                      | 86 +++++++++++++++++++++-
+ samples/README.md                                  | 32 ++++----
+ shaders/multipass/lit.vert.slang                   | 30 ++++----
+ shaders/multipass/scene_types.slang                | 75 +++++++++++++++++++
+ shaders/multipass/shadow.vert.slang                | 42 ++++-------
+ tools/package_samples.sh                           | 22 ++++--
+ 8 files changed, 265 insertions(+), 69 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-10-phase3-render-graph-materials/task-4-report.md b/.superpowers/sdd/2026-08-10-phase3-render-graph-materials/task-4-report.md
+index c82b367..9e420b2 100644
+--- a/.superpowers/sdd/2026-08-10-phase3-render-graph-materials/task-4-report.md
++++ b/.superpowers/sdd/2026-08-10-phase3-render-graph-materials/task-4-report.md
+@@ -104,10 +104,47 @@ Modified:
+ ## Commit
+ 
+ One commit on this worktree's branch (`worktree-agent-a0257a83d60b1accb`), on top of the fast-forward merge described above.
+ 
+ ## Concerns / things the coordinator should know
+ 
+ 1. **Worktree base-point gap** (see "Setup note" above) — fixed locally via fast-forward, but worth checking whether other in-progress worktrees for this phase have the same gap.
+ 2. **Sync validation false positives are specific to this machine's old apt-packaged validation layer (1.3.204.1)** — this is the third such guard in `context.cpp`, all attributable to the same stale-layer root cause the file's own comments already document for the first two. If CI's `ubuntu-latest` runner has a newer `vulkan-validationlayers` package than this dev machine, these hazards may simply never fire there at all (harmless either way — the guard only ever *documents and downgrades to a warning* an error this specific old layer version emits; it does not suppress a differently-worded real error). If a future validation-layer upgrade on this dev machine ever stops reproducing these, that's expected and the guard becomes dead code, not a rot risk (it would simply never match again).
+ 3. **The brief's file list said `samples/CMakeLists.txt`**; no such file exists in this repo — I modified the root `CMakeLists.txt`'s `add_subdirectory(...)` list instead, which is where every other sample is wired in. Flagging in case this naming was intentional and I'm missing context, though I'm confident this is simply how the repo is actually laid out (verified directly, not assumed).
+ 4. No existing-code sync bugs needed fixing — the one real bug found (shadow.vert.slang's stale struct) was in **this task's own new code**, not pre-existing rx_graph/rx_rhi_vk code, so it's a normal implementation fix, not a "BLOCKED, needs coordinator call" situation.
++
++## Fix round 1 (post-review)
++
++Coordinator review approved with one required finding: `ObjectTransform` was declared three times (`main.cpp`, `lit.vert.slang`, `shadow.vert.slang`) with only comments guarding drift — exactly the bug class the original implementation had already hit once (see "Real bug found and fixed" above). Addressed as follows.
++
++### 1. Shader side: single source of truth
++
++Created `shaders/multipass/scene_types.slang`, containing the one canonical `ObjectTransform` struct declaration. Removed the duplicated declarations from `lit.vert.slang` and `shadow.vert.slang`.
++
++**Mechanism chosen: neither `import` nor `__include` — host-side textual concatenation, extending this sample's existing multi-file-compile mechanism.** Investigated both of the coordinator's suggested options concretely before deciding:
++
++- **`import scene_types;`** (the coordinator's stated preference, matching `shaders/material/`'s `import material;` on `main`): verified directly against both `src/rx_material/material_system.cpp` (which sets `slang::SessionDesc::searchPaths` to `RX_MATERIAL_SHADER_DIR` before calling `import`) and `src/rx_shader/src/compiler.cpp` (`rx::shader::Compiler::create()`'s `slang::SessionDesc` has **zero** search paths configured — confirmed by reading the actual session-construction code, not assumed). This sample compiles exclusively through `rx::shader::Compiler` (never the raw Slang API `rx_material` uses), so a real `import` here needs either extending `Compiler` to accept search paths (explicitly forbidden this round: "do NOT extend rx_shader in this task") or reimplementing this sample's whole compile+reflect pipeline against the raw Slang API just to share one struct — disproportionate.
++- **`__include "scene_types.slang"`**: reduces to the identical requirement. With no session search path, `__include` needs either a search path (same gap as `import`) or a literal, runtime-resolved absolute path baked into the compiled source text at the point of the directive — which on Windows means threading a backslash-bearing path through a Slang string-literal escape sequence, a mechanism with zero existing test coverage in this codebase.
++- **What I actually did**: this sample's `compileAndReflect()` (present before this fix round, for pairing each pass's vertex+fragment files into one Slang translation unit) already reads named files from disk and concatenates their text into one combined source string before it ever reaches Slang. I added `scene_types.slang` as the first filename in both `buildShadowPipeline()`'s and `buildLitPipeline()`'s file lists — Slang never sees a directive, never needs a search path, and there is no path-string-escaping surface on any platform. Functionally and textually equivalent to `__include`, implemented with a mechanism this file already had and already shipped correctly (verified: `tonemap.vert.slang`+`tonemap.frag.slang` pairing worked identically before this fix round). Documented at length in `scene_types.slang`'s own header comment, `kSceneTypesFilename`'s comment in `main.cpp`, and at both call sites.
++
++Packaging updated to ship the new file: `samples/05_multipass/CMakeLists.txt`'s `RX_MULTIPASS_SHADERS` list, `tools/package_samples.sh`'s per-sample asset list (now 6 files, was 5), `samples/README.md`'s three shader-file-count mentions (5→6, listing `scene_types.slang`).
++
++### 2. Host side: strongest drift guard + position assertion
++
++- Added `constexpr size_t kObjectTransformShaderStrideBytes = 64 + 64 + 16 + 16;` (hand-computed from `scene_types.slang`'s field list: two `float4x4` + two `float4`) and `static_assert(sizeof(ObjectTransform) == kObjectTransformShaderStrideBytes, ...)` immediately after the C++ `ObjectTransform` struct, with a comment pointing at `scene_types.slang` and explicitly noting why a `reflect()`-driven check isn't available (see item 3 below). This fails the **build**, not a runtime probe, the moment either side drifts in field count/size.
++- Added headless-gate assertion (d): probes object index 1 (the cube, not index 0 — the floor's row starts at byte offset 0 under any stride assumption, which is exactly why the original bug went unnoticed at index 0) at its analytically-expected screen position (`worldToPixel(kCubePosition.xz, ...)`, the same fixed top-down camera every other probe uses) and asserts the pixel is clearly red-dominant (the cube's albedo direction, `(0.75, 0.25, 0.2)`), channel-order-agnostic (checks both an RGBA-shaped and a BGRA-shaped dominance condition, accepting either). This distinguishes the cube's expected pixel from the floor's near-neutral gray and the sphere's blue-leaning albedo — a stride/offset drift severe enough to substitute a neighboring row's data, or an `mvp`/`lightMvp` drift severe enough to move the cube off its footprint, would both make this probe land on non-red data instead.
++
++### 3. rx_shader scope note
++
++Per the coordinator's explicit instruction, did **not** extend `rx_shader` in this task. `rx::shader::ShaderLayoutInfo` (`shader_layout_info.h`) reports set/binding/type/count/stage/push-range shape only — it has no notion of a `StructuredBuffer` element's internal stride/size, so `reflect()`-based verification of `ObjectTransform`'s real GPU-side stride is not possible today. This is now noted directly in `main.cpp`'s comment next to the `static_assert`, and the coordinator is already ledgering it as an `rx_shader` enhancement candidate — no code change made here.
++
++### Re-verification after the fix
++
++- `sample_05_multipass --validate` (headless): `PASSED`, all four assertions (a)-(d) hold; sync validation active, zero unguarded validation errors (same three documented false-positive guards as before, nothing new).
++- `grep -r vkCmdPipelineBarrier2 samples/05_multipass/` → still empty.
++- `ctest --preset linux-native --output-on-failure`: **12/12 passed** (fresh run, post-fix).
++- `windows-cross-zig`: builds cleanly (fresh full rebuild); `ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|sample'` under Wine: **5/5 passed**.
++- Both presets repackaged via `tools/package_samples.sh`: Linux zip now 48 files (was 47 — `scene_types.slang` added), Windows zip now 40 files (was 39). Unzipped `05_multipass/` alone into a fresh scratch directory for **both** platforms and ran the binary directly (Linux natively; Windows via `wine` + `xvfb-run`, same bonus verification as the original implementation) — both exit 0, both `PASSED`, confirming `scene_types.slang` deploys and resolves correctly in a genuinely standalone layout on both platforms.
++
++### Commit
++
++New commit on this worktree's branch, on top of the original task-4 commit — see the STATUS reply for the hash.
+diff --git a/samples/05_multipass/CMakeLists.txt b/samples/05_multipass/CMakeLists.txt
+index 45bd115..65f42f5 100644
+--- a/samples/05_multipass/CMakeLists.txt
++++ b/samples/05_multipass/CMakeLists.txt
+@@ -5,28 +5,34 @@
+ 
+ add_executable(sample_05_multipass main.cpp)
+ target_link_libraries(sample_05_multipass PRIVATE rx_graph rx_rhi_vk rx_platform rx_shader)
+ 
+ # This sample does real in-process Slang compilation at startup (both
+ # modes -- see main.cpp's compileAndReflect()/createScene()), same as
+ # 02_hotreload/03_bindless_mesh/04_streaming -- needs the Slang runtime
+ # libs deployed next to it.
+ rx_shader_deploy_runtime_libs(sample_05_multipass)
+ 
+-# Deploys every one of this pass's five on-disk shader sources next to the
++# Deploys every one of this pass's six on-disk shader sources next to the
+ # binary at build time, flat (no "multipass/" subdirectory in the deployed
+ # layout -- same flat-next-to-the-binary convention 02_hotreload's
+ # hotreload.slang deployment already established), so main.cpp's
+ # resolveAssetPath() (SDL_GetBasePath() + filename) finds them identically
+ # whether run from the build tree or a redistributed copy of just this
+-# directory's build output.
++# directory's build output. scene_types.slang [fix round 1] is the single
++# source of truth for ObjectTransform, concatenated ahead of both
++# shadow.vert.slang and lit.vert.slang at compile time (main.cpp's
++# compileAndReflect() call sites) -- it ships here for the identical
++# reason every other file in this list does: it must be readable from disk
++# at runtime, next to the binary, for either build-tree or packaged runs.
+ set(RX_MULTIPASS_SHADERS
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/scene_types.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/shadow.vert.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/lit.vert.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/lit.frag.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/tonemap.vert.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/tonemap.frag.slang"
+ )
+ add_custom_command(TARGET sample_05_multipass POST_BUILD
+   COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_MULTIPASS_SHADERS} "$<TARGET_FILE_DIR:sample_05_multipass>/"
+   COMMENT "sample_05_multipass: deploying shaders/multipass/*.slang next to the binary"
+   VERBATIM
+diff --git a/samples/05_multipass/main.cpp b/samples/05_multipass/main.cpp
+index e257936..1c9ff6f 100644
+--- a/samples/05_multipass/main.cpp
++++ b/samples/05_multipass/main.cpp
+@@ -176,20 +176,25 @@ constexpr VkDeviceSize kHeadlessPixelBytes = static_cast<VkDeviceSize>(kHeadless
+ constexpr uint32_t kHeadlessFrameCount = 3;
+ 
+ constexpr uint32_t kPresentWidth = 900;
+ constexpr uint32_t kPresentHeight = 700;
+ constexpr float kLightOrbitRadPerSec = 0.3F;
+ 
+ constexpr uint32_t kShadowMapSize = 1024;
+ constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
+ constexpr VkFormat kHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+ 
++// [fix round 1] the single source of truth for ObjectTransform, shared by
++// the shadow and lit passes -- concatenated ahead of each pass's own
++// file(s) below, never Slang `import`ed/`__include`d; see that file's own
++// header comment for why.
++constexpr const char* kSceneTypesFilename = "scene_types.slang";
+ constexpr const char* kShadowVertFilename = "shadow.vert.slang";
+ constexpr const char* kLitVertFilename = "lit.vert.slang";
+ constexpr const char* kLitFragFilename = "lit.frag.slang";
+ constexpr const char* kTonemapVertFilename = "tonemap.vert.slang";
+ constexpr const char* kTonemapFragFilename = "tonemap.frag.slang";
+ 
+ // --- Scene layout -------------------------------------------------------
+ 
+ constexpr float kGroundHalfSize = 6.0F;
+ constexpr float kCubeHalfExtent = 1.0F;
+@@ -438,26 +443,56 @@ constexpr uint32_t kObjectCount = static_cast<uint32_t>(kObjects.size());
+ // --- GPU-side per-object transforms: one bindless storage buffer, one row
+ // per (frame-in-flight slot, object) -- exactly samples/03_bindless_mesh's
+ // double-buffered-by-row convention, extended to carry BOTH matrices this
+ // sample's two shadow-casting/receiving passes need per object. See
+ // shaders/multipass/shadow.vert.slang and lit.vert.slang's own header
+ // comments for which half each shader reads. -----------------------------
+ // `albedo`/`lightDirWorld` are float4 (unused 4th component) rather than
+ // float3 -- see lit.vert.slang's own header comment for why this sample
+ // keeps every vector value in this bindless row instead of a push
+ // constant, and every push-constant field below a plain scalar `uint`.
++//
++// Byte-for-byte mirror of shaders/multipass/scene_types.slang's
++// ObjectTransform -- THE single source of truth on the shader side since
++// fix round 1 (both shadow.vert.slang and lit.vert.slang now consume that
++// one file instead of each declaring their own copy; see that file's own
++// header comment for the real drift bug this closes). This struct is the
++// other half of that single-source-of-truth story: the strongest drift
++// guard expressible today is the static_assert immediately below, which
++// fails the BUILD (not a runtime probe) the moment this struct's size
++// stops matching the hand-computed shader-side stride. A stronger,
++// reflect()-driven check (asking Slang itself what stride it actually
++// used for this StructuredBuffer element) is NOT possible today --
++// rx::shader::ShaderLayoutInfo (shader_layout_info.h) reports set/binding/
++// type/count/stage/push-range shape only, nothing about a StructuredBuffer
++// element's internal layout -- ledgered as an rx_shader enhancement
++// candidate by the coordinator, explicitly out of this task's scope.
+ struct ObjectTransform {
+     glm::mat4 mvp;
+     glm::mat4 lightMvp;
+     glm::vec4 albedo;
+     glm::vec4 lightDirWorld;
+ };
++// Hand-computed from scene_types.slang's own field list, in order: two
++// float4x4 (64 bytes each -- GLM's mat4 is 16 packed floats, matching
++// Slang's own float4x4 StructuredBuffer element size with no interior
++// padding possible, since 64 is already a 16-byte multiple) plus two
++// float4 (16 bytes each). If a future edit to scene_types.slang adds,
++// removes, or reorders a field without updating this constant AND the
++// struct above to match, this assert fails at compile time -- exactly the
++// class of drift a mismatched hand-written copy used to hide until a
++// runtime probe caught it (see scene_types.slang's header for that
++// postmortem).
++constexpr size_t kObjectTransformShaderStrideBytes = 64 + 64 + 16 + 16;
++static_assert(sizeof(ObjectTransform) == kObjectTransformShaderStrideBytes,
++              "ObjectTransform must match shaders/multipass/scene_types.slang's ObjectTransform stride exactly -- "
++              "update kObjectTransformShaderStrideBytes (and this struct) together with that file");
+ 
+ // --- Push-constant layouts -- byte-for-byte mirrors of each shader's own
+ // [[vk::push_constant]] struct (see the .slang files). EMPIRICALLY
+ // VERIFIED (not assumed) against the shipped Slang build: a push-constant
+ // block made ENTIRELY of scalar `uint` fields reflects at exactly
+ // 4*fieldCount bytes, no padding/rounding at all -- see lit.vert.slang's
+ // header comment for the finding this superseded (samples/04_streaming's
+ // own struct, which contained a float4x4, is not evidence this applies
+ // generally). Each buildXPipeline() function below still asserts the
+ // REFLECTED size against sizeof() at runtime -- the shipped slang.h/
+@@ -686,22 +721,25 @@ bool assignShaderModules(VkDevice device, const rx::shader::CompileResult& compi
+     }
+     return true;
+ }
+ 
+ // --- Pipeline builders ---------------------------------------------------
+ 
+ bool buildShadowPipeline(VkDevice device, rx::shader::Compiler& compiler, VkDescriptorSetLayout bindlessSetLayout,
+                           Scene& scene) {
+     destroyCompiledPass(device, scene.shadowPass);
+ 
+-    auto reflected =
+-        compileAndReflect(compiler, "MultipassShadowModule", {kShadowVertFilename}, {"vsMain"});
++    // scene_types.slang listed first: see that file's own header comment
++    // and kSceneTypesFilename's comment for why ObjectTransform is shared
++    // this way rather than via Slang's own import/__include [fix round 1].
++    auto reflected = compileAndReflect(compiler, "MultipassShadowModule",
++                                        {kSceneTypesFilename, kShadowVertFilename}, {"vsMain"});
+     if (!reflected.has_value()) {
+         return false;
+     }
+     if (reflected->layoutInfo.pushRanges.size() != 1 ||
+         reflected->layoutInfo.pushRanges[0].size != sizeof(ShadowPushConstants)) {
+         RX_LOG_ERROR(
+             "sample_05_multipass: shadow shader reflects an unexpected push-constant shape ({} range(s), size={} "
+             "vs. sizeof(ShadowPushConstants)={})",
+             reflected->layoutInfo.pushRanges.size(),
+             reflected->layoutInfo.pushRanges.empty() ? 0 : reflected->layoutInfo.pushRanges[0].size,
+@@ -817,21 +855,24 @@ bool buildShadowPipeline(VkDevice device, rx::shader::Compiler& compiler, VkDesc
+         destroyCompiledPass(device, scene.shadowPass);
+         return false;
+     }
+     return true;
+ }
+ 
+ bool buildLitPipeline(VkDevice device, rx::shader::Compiler& compiler, VkDescriptorSetLayout bindlessSetLayout,
+                       Scene& scene) {
+     destroyCompiledPass(device, scene.litPass);
+ 
+-    auto reflected = compileAndReflect(compiler, "MultipassLitModule", {kLitVertFilename, kLitFragFilename},
++    // scene_types.slang listed first -- see buildShadowPipeline()'s
++    // identical comment [fix round 1].
++    auto reflected = compileAndReflect(compiler, "MultipassLitModule",
++                                        {kSceneTypesFilename, kLitVertFilename, kLitFragFilename},
+                                         {"vsMain", "fsMain"});
+     if (!reflected.has_value()) {
+         return false;
+     }
+     if (reflected->layoutInfo.pushRanges.size() != 1 ||
+         reflected->layoutInfo.pushRanges[0].size != sizeof(LitPushConstants)) {
+         RX_LOG_ERROR(
+             "sample_05_multipass: lit shader reflects an unexpected push-constant shape ({} range(s), size={} vs. "
+             "sizeof(LitPushConstants)={})",
+             reflected->layoutInfo.pushRanges.size(),
+@@ -1636,20 +1677,59 @@ int runHeadless(bool enableValidation) {
+     // would still satisfy "<= 255" for a plain byte, so this is a weak but
+     // real check, not a substitute for (a)/(b) above).
+     for (size_t i = 0; i < pixels.size(); ++i) {
+         if (pixels[i] > 255) {  // unreachable for a uint8_t -- documents the literal brief requirement above.
+             RX_LOG_ERROR("readback byte {} = {} exceeds 1.0 (255) -- not tonemapped", i, pixels[i]);
+             pass = false;
+             break;
+         }
+     }
+ 
++    // (d) [fix round 1] object index 1 (the cube -- see kObjects) renders
++    // at its ANALYTICALLY EXPECTED screen position, not just "some shadow
++    // exists somewhere". Deliberately index 1, not index 0 (the floor):
++    // this is exactly the row a stride/offset drift between the C++ writer
++    // and either shader's ObjectTransform struct would corrupt while
++    // leaving row 0 looking fine (row 0 starts at byte offset 0 under any
++    // stride assumption -- see scene_types.slang's header comment for the
++    // real bug this class of check would have caught immediately). Probes
++    // the cube's own world XZ center (worldToPixel() -- the same fixed
++    // top-down camera every other probe in this file uses) and checks for
++    // its distinctly RED-leaning albedo (0.75, 0.25, 0.2) against the
++    // floor's near-neutral gray (0.55, 0.55, 0.6) and the sphere's
++    // blue-leaning albedo (0.2, 0.45, 0.8) -- channel-order-agnostic (see
++    // isReddish() below): a mvp/lightMvp drift severe enough to move the
++    // cube off its expected footprint, or a struct-offset drift severe
++    // enough to substitute a neighboring row's data, would both make this
++    // probe land on the floor (near-neutral, fails) rather than the cube
++    // (clearly red-dominant, passes).
++    const PixelCoord cubePixel =
++        worldToPixel(glm::vec2(kCubePosition.x, kCubePosition.z), kHeadlessWidth, kHeadlessHeight);
++    const uint8_t* cubePx = pixelAt(cubePixel.x, cubePixel.y);
++    auto isReddish = [](const uint8_t* p) {
++        constexpr int kMargin = 15;
++        const bool asRgba = p[0] > p[1] + kMargin && p[0] > p[2] + kMargin;  // R=p[0] dominant
++        const bool asBgra = p[2] > p[1] + kMargin && p[2] > p[0] + kMargin;  // R=p[2] dominant
++        return asRgba || asBgra;
++    };
++    RX_LOG_INFO("cube probe world=({:.1f},{:.1f}) pixel=({},{}) channels=({},{},{},{})", kCubePosition.x,
++                kCubePosition.z, cubePixel.x, cubePixel.y, cubePx[0], cubePx[1], cubePx[2], cubePx[3]);
++    if (!isReddish(cubePx)) {
++        RX_LOG_ERROR(
++            "cube probe (object index 1) at pixel ({},{}) channels=({},{},{}) is not clearly red-dominant -- "
++            "the cube is not rendering at its analytically expected position (ObjectTransform stride/offset "
++            "drift between the C++ writer and a shader-side copy is exactly the bug class this check exists "
++            "to catch -- see scene_types.slang)",
++            cubePixel.x, cubePixel.y, cubePx[0], cubePx[1], cubePx[2]);
++        pass = false;
++    }
++
+     if (enableValidation && context->hasValidationErrors()) {
+         RX_LOG_ERROR("Vulkan validation layer reported errors during this run");
+         pass = false;
+     }
+ 
+     if (pass) {
+         RX_LOG_INFO("multipass headless gate PASSED");
+         return 0;
+     }
+     RX_LOG_ERROR("multipass headless gate FAILED");
+diff --git a/samples/README.md b/samples/README.md
+index cf462e8..ce0e365 100644
+--- a/samples/README.md
++++ b/samples/README.md
+@@ -23,21 +23,21 @@ step involved:
+ 02_hotreload/
+   sample_02_hotreload[.exe]        # + hotreload.slang, the Slang runtime
+                                     #   libs below, and LICENSE
+ 03_bindless_mesh/
+   sample_03_bindless_mesh[.exe]    # + texture.png, the Slang runtime libs
+                                     #   below, and LICENSE
+ 04_streaming/
+   sample_04_streaming[.exe]        # + the Slang runtime libs below, and
+                                     #   LICENSE (no other external asset)
+ 05_multipass/
+-  sample_05_multipass[.exe]        # + shaders/multipass/*.slang (5 files),
++  sample_05_multipass[.exe]        # + shaders/multipass/*.slang (6 files),
+                                     #   the Slang runtime libs below, and
+                                     #   LICENSE
+ ```
+ 
+ `01_triangle` is the one exception to "needs the Slang runtime libs": its
+ shaders are precompiled offline by `slangc` at build time, so it ships only
+ its two `.spv` files and nothing Slang-related at all [D2] — see its own
+ "Redistribution" section below. The other four do real in-process Slang
+ compilation at startup, so each of their directories additionally carries
+ `libslang-compiler.so*`/`slang-compiler.dll` plus the `slang-glslang`/
+@@ -448,28 +448,32 @@ mirroring `04_streaming`'s own `cellProbePixel()` derivation.
+ (--present)` showing a reddish cube and a bluish sphere on a grayish floor,
+ lit from a fixed-elevation directional light whose azimuth continuously
+ orbits — the cube's shadow visibly sweeps across the floor as the light
+ turns. Closing the window exits with status 0.
+ 
+ ### Redistribution
+ 
+ Same mechanism as 02_hotreload/03_bindless_mesh/04_streaming: this sample
+ compiles its shaders at runtime, so it needs the Slang runtime libs
+ deployed next to it (`rx_shader_deploy_runtime_libs()`). Unlike any earlier
+-sample, it ships **five** on-disk shader sources instead of one
+-(`shadow.vert.slang`, `lit.vert.slang`, `lit.frag.slang`,
+-`tonemap.vert.slang`, `tonemap.frag.slang`) — one file per shader stage,
+-concatenated in pairs at compile time (vertex file first, fragment file
+-second) so `rx::shader::reflect()` sees one linked program per pass; see
+-`lit.vert.slang`'s own header comment for why. A redistributed copy of just
+-this sample's build-output directory (binary + those five `.slang` files +
+-the Slang runtime libraries) runs identically outside the build tree.
++sample, it ships **six** on-disk shader sources instead of one
++(`scene_types.slang`, `shadow.vert.slang`, `lit.vert.slang`,
++`lit.frag.slang`, `tonemap.vert.slang`, `tonemap.frag.slang`) — one file
++per shader stage, plus `scene_types.slang` (the single source of truth for
++the `ObjectTransform` bindless-row layout both `shadow.vert.slang` and
++`lit.vert.slang` read), concatenated in the right order at compile time so
++`rx::shader::reflect()` sees one linked program per pass; see
++`scene_types.slang`'s own header comment for why this is done via textual
++concatenation rather than a real Slang `import`/`__include`. A
++redistributed copy of just this sample's build-output directory (binary +
++those six `.slang` files + the Slang runtime libraries) runs identically
++outside the build tree.
+ 
+ ## Building and running
+ 
+ Both sample modes and both build presets work identically on Linux and
+ Steam Deck (Desktop Mode is just Linux) — Windows only differs in how you
+ run the already-cross-compiled binary. There is no `samples`-specific
+ configure step; building the preset builds every sample.
+ 
+ ### Linux (native) — including Steam Deck Desktop Mode
+ 
+@@ -591,25 +595,25 @@ code. Copy the entire `build/windows-cross-zig/samples/04_streaming/`
+ directory (minus the `CMakeFiles`/`.pdb`/`.cmake` build bookkeeping) to run
+ it elsewhere:
+ 
+ ```
+ sample_04_streaming.exe            REM headless correctness gate
+ sample_04_streaming.exe --present  REM interactive present-mode window, cycling grid
+ ```
+ 
+ 05_multipass is the same shape as 02_hotreload for redistribution purposes
+ (real in-process Slang compilation, so it needs the same 4 Slang DLLs
+-deployed next to it), plus its own five on-disk shader sources
+-(`shadow.vert.slang`, `lit.vert.slang`, `lit.frag.slang`,
+-`tonemap.vert.slang`, `tonemap.frag.slang` — see this sample's own README
+-section above for why five files, not one). Copy the entire
+-`build/windows-cross-zig/samples/05_multipass/` directory (minus the
++deployed next to it), plus its own six on-disk shader sources
++(`scene_types.slang`, `shadow.vert.slang`, `lit.vert.slang`,
++`lit.frag.slang`, `tonemap.vert.slang`, `tonemap.frag.slang` — see this
++sample's own README section above for why six files, not one). Copy the
++entire `build/windows-cross-zig/samples/05_multipass/` directory (minus the
+ `CMakeFiles`/`.pdb`/`.cmake` build bookkeeping) to run it elsewhere:
+ 
+ ```
+ sample_05_multipass.exe            REM headless correctness gate
+ sample_05_multipass.exe --present  REM interactive present-mode window, light orbiting
+ ```
+ 
+ See `MANUAL_VERIFICATION.md` at the repo root for the actual per-platform
+ run checklist (what to record, what "pass" looks like on real hardware).
+ 
+diff --git a/shaders/multipass/lit.vert.slang b/shaders/multipass/lit.vert.slang
+index bd0f996..f6c4ae8 100644
+--- a/shaders/multipass/lit.vert.slang
++++ b/shaders/multipass/lit.vert.slang
+@@ -1,25 +1,26 @@
+ // Sample 05_multipass: forward-pass vertex shader.
+ //
+ // COMPILATION NOTE -- read before editing either file: rx::shader::Compiler
+ // compiles exactly one module (one source string) per call, and
+ // rx::shader::reflect() needs every entry point of a pass in ONE linked
+ // program to produce a single, correctly-merged descriptor-set/push-
+ // constant layout (the same reason 02_hotreload/03_bindless_mesh/
+ // 04_streaming each embed their vertex+fragment source together as one
+-// string). samples/05_multipass/main.cpp's loadPassModule() reproduces that
+-// same shape for THIS pass's two on-disk files by reading and concatenating
+-// them (this file first, lit.frag.slang second) into one Slang translation
+-// unit before compiling -- so every `[[vk::binding(...)]]`/
+-// `[[vk::push_constant]]` global declared below is visible to lit.frag.slang's
+-// fsMain too, exactly as if they had been written in one file. Do not
+-// re-declare any of these globals in lit.frag.slang.
++// string). samples/05_multipass/main.cpp's compileAndReflect() reproduces
++// that same shape for THIS pass's on-disk files by reading and
++// concatenating them (scene_types.slang first, this file second,
++// lit.frag.slang third) into one Slang translation unit before compiling
++// -- so every `[[vk::binding(...)]]`/`[[vk::push_constant]]` global
++// declared below, and `ObjectTransform` (scene_types.slang), are visible
++// to lit.frag.slang's fsMain too, exactly as if they had all been written
++// in one file. Do not re-declare any of these globals in lit.frag.slang.
+ //
+ // SHADOW SAMPLING: manual single-tap depth comparison in lit.frag.slang, no
+ // VkSampler compare mode [coordinator ambiguity resolution] -- this file's
+ // job is only to compute and pass through `lightSpacePosition`, an
+ // unmodified light-clip-space position lit.frag.slang projects itself.
+ //
+ // OBJECT TRANSFORMS: one bindless storage buffer holds BOTH matrices this
+ // sample ever needs per object -- `.mvp` (camera clip-space, used here) and
+ // `.lightMvp` (light clip-space, passed through as a varying for
+ // lit.frag.slang's shadow lookup) -- addressed via a push-constant
+@@ -29,45 +30,46 @@
+ // `.lightMvp` half.
+ //
+ // NO PER-OBJECT ROTATION -- see samples/05_multipass/main.cpp's header
+ // comment for why this sample's scene objects only ever translate, never
+ // rotate: under a translation-only model matrix, a direction vector
+ // (a vertex normal) transforms identically in object space and world
+ // space, so this shader passes `input.normal` straight through with no
+ // normal-matrix multiply at all. Reintroducing per-object rotation without
+ // also reintroducing a normal-matrix transform here would silently break
+ // lit.frag.slang's Lambert term.
++// `ObjectTransform` itself now lives in scene_types.slang (concatenated
++// ahead of this file at compile time -- see the COMPILATION NOTE above
++// and that file's own header comment for the full "why not import/
++// __include" rationale) [fix round 1: this struct used to be declared
++// here directly, and separately again in shadow.vert.slang, with only a
++// comment guarding the two copies from drifting -- they drifted; see
++// scene_types.slang's header for the postmortem].
++//
+ // `albedo`/`lightDirWorld` live in the SAME bindless row as the two
+ // matrices (as float4 -- the 4th component unused padding, sidestepping
+ // any float3-packing ambiguity) rather than in push constants: EMPIRICALLY
+ // VERIFIED against the shipped Slang build (reflect()'s own reported
+ // push-constant range size, checked directly during this sample's
+ // development) that a push-constant block's real size is NOT rounded up
+ // to any fixed multiple the way samples/04_streaming's own struct
+ // (which contained a float4x4) suggested -- a lone `uint` reflects at
+ // exactly 4 bytes, not 16. Rather than reverse-engineer Slang's exact
+ // float3/vec-alignment rule inside a push-constant block from scratch,
+ // this sample keeps every push-constant field a plain scalar `uint`
+ // (empirically confirmed to pack with zero padding, consecutive 4-byte
+ // fields) and puts every vector value in the storage buffer instead, whose
+ // StructuredBuffer element layout this codebase already has a proven-
+ // correct convention for (samples/03_bindless_mesh/04_streaming's own
+ // mat4 rows). `lightDirWorld` is the same value on every object's row
+ // each frame (a per-pass, not per-object, constant) -- redundant across
+ // rows, but simpler than a second one-row bindless buffer just for it.
+-struct ObjectTransform {
+-    float4x4 mvp;
+-    float4x4 lightMvp;
+-    float4 albedo;
+-    float4 lightDirWorld;
+-};
+-
+ struct PushConstants {
+     uint transformIndex;
+     uint shadowTextureIndex;
+     uint shadowSamplerIndex;
+ };
+ 
+ [[vk::push_constant]]
+ ConstantBuffer<PushConstants> gPush;
+ 
+ [[vk::binding(0, 0)]]
+diff --git a/shaders/multipass/scene_types.slang b/shaders/multipass/scene_types.slang
+new file mode 100644
+index 0000000..6cba5e9
+--- /dev/null
++++ b/shaders/multipass/scene_types.slang
+@@ -0,0 +1,75 @@
++// Sample 05_multipass: shared scene-data types.
++//
++// SINGLE SOURCE OF TRUTH for `ObjectTransform` -- the bindless storage-
++// buffer row layout `shadow.vert.slang` and `lit.vert.slang`/
++// `lit.frag.slang` both read via `gTransforms[0][gPush.transformIndex]`.
++// Declared exactly ONCE, here, specifically to close a real bug class
++// found during this sample's own development [fix round 1]: `shadow.vert.
++// slang` used to declare its OWN separate copy of this struct (it is
++// compiled as its own Slang module -- see below for why -- never
++// concatenated with the lit files), and that copy silently drifted out of
++// sync with `lit.vert.slang`'s when the latter grew two more fields
++// (`albedo`, `lightDirWorld`). Every index-0 row (the floor) still read
++// correctly regardless of which struct's stride was used (both agree at
++// byte offset 0), which is exactly why the drift went unnoticed until a
++// probe at a NON-zero row (the cube) read a garbled mix of two adjacent
++// rows. Two hand-written copies with only a comment enforcing agreement
++// is not a real guard against that recurring -- this file, and every
++// consumer's mechanical inclusion of it (see below), is.
++//
++// WHY THIS FILE IS TEXTUALLY CONCATENATED, NOT `import`ed OR `__include`d
++// -- read before reaching for either Slang mechanism on this file:
++//   - `import scene_types;` (Slang's own module system -- the mechanism
++//     shaders/material/forward_entry.slang uses for `import material;`,
++//     and the one this task's own coordinator review named as preferred)
++//     needs the compiling `slang::ISession` to have a search path
++//     covering this file's real on-disk directory
++//     (`slang::SessionDesc::searchPaths`) -- exactly what
++//     `src/rx_material/material_system.cpp`'s own session setup adds
++//     (`RX_MATERIAL_SHADER_DIR`), and exactly what `rx::shader::Compiler`
++//     (`src/rx_shader/src/compiler.cpp`) does NOT: its `slang::SessionDesc`
++//     is default-constructed with zero search paths, by design --
++//     `material_system.cpp`'s own header comment on this exact point:
++//     "Compiler's own sessions never set [search paths] (it has no
++//     multi-file import to resolve)". samples/05_multipass/main.cpp
++//     compiles every pass through THIS Compiler (not the raw Slang API
++//     rx_material uses directly), so a real `import` here would need
++//     either extending `rx::shader::Compiler` to accept search paths
++//     (explicitly out of scope for this task per the coordinator's fix-
++//     round instructions) or reimplementing this sample's entire compile-
++//     +-reflect pipeline against the raw Slang API just to get one struct
++//     shared -- disproportionate to the actual problem.
++//   - `__include "scene_types.slang"` (Slang's textual-inclusion
++//     directive, the coordinator's own stated fallback) reduces to
++//     exactly the same requirement: with no session search path
++//     configured, resolving even `__include`'s path needs either a
++//     search path (same gap as `import`) or a literal, runtime-resolved
++//     absolute path baked into the compiled source text at the point of
++//     the directive -- which on Windows means a backslash-bearing path
++//     string threaded through a Slang string-literal escape sequence with
++//     no existing test coverage of that behavior in this codebase.
++//   - This sample's `main.cpp` already established (before this fix
++//     round, for pairing each pass's vertex+fragment source into one
++//     Slang translation unit -- see lit.vert.slang's own "COMPILATION
++//     NOTE") the exact mechanism this problem actually needs: read this
++//     file's real, `SDL_GetBasePath()`-resolved bytes from disk and
++//     concatenate them into the combined source string BEFORE any of it
++//     reaches Slang at all -- Slang itself never sees a directive, never
++//     needs a search path, and there is no path-string-escaping surface
++//     to get wrong on any platform. `compileAndReflect()`'s callers now
++//     list this file first for both the shadow and lit passes (see
++//     buildShadowPipeline()/buildLitPipeline()) -- textually and
++//     functionally equivalent to `__include`, implemented with a
++//     mechanism this file already had and already ships correctly.
++//
++// `albedo`/`lightDirWorld` are float4 (unused 4th component) rather than
++// float3 -- sidesteps any float3-in-a-StructuredBuffer packing ambiguity;
++// see the (former) home of this struct, lit.vert.slang, for the sibling
++// finding on push-constant scalar packing this same investigation
++// produced.
++struct ObjectTransform {
++    float4x4 mvp;
++    float4x4 lightMvp;
++    float4 albedo;
++    float4 lightDirWorld;
++};
+diff --git a/shaders/multipass/shadow.vert.slang b/shaders/multipass/shadow.vert.slang
+index 8771b52..d8cd86d 100644
+--- a/shaders/multipass/shadow.vert.slang
++++ b/shaders/multipass/shadow.vert.slang
+@@ -1,53 +1,37 @@
+ // Sample 05_multipass: shadow pass vertex shader.
+ //
+ // Depth-only pass -- there is deliberately no shadow.frag.slang at all:
+ // with no color attachments and rasterizerDiscardEnable = VK_FALSE, Vulkan
+ // needs no fragment shader stage to write depth at all (the depth test/
+ // write consumes SV_Position.z's interpolated value); samples/05_multipass/
+ // main.cpp's shadow pipeline has exactly one shader stage (VERTEX) because
+ // of this, not by omission.
+ //
+ // Reads the SAME bindless object-transform storage buffer
+-// lit.vert.slang/lit.frag.slang read (row layout must match byte-for-byte
+-// -- see lit.vert.slang's own header comment) via
+-// rx::rhi::BindlessTable's fixed binding 2 (kStorageBufferBinding), but
+-// only ever consumes `.lightMvp` here: this pass renders the scene from
+-// the light's own point of view, so a caster's CAMERA-space MVP is
++// lit.vert.slang/lit.frag.slang read (row layout must match byte-for-byte)
++// via rx::rhi::BindlessTable's fixed binding 2 (kStorageBufferBinding),
++// but only ever consumes `.lightMvp` here: this pass renders the scene
++// from the light's own point of view, so a caster's CAMERA-space MVP is
+ // irrelevant to it. `transformIndex` (a push constant, uniform across the
+ // whole draw call) selects which object's row to read -- never wrapped in
+ // NonUniformResourceIndex() [spec Fixed decision #6, matching every other
+ // sample's push-constant-indexed bindless read].
+-// MUST stay byte-for-byte identical (same fields, same order, same size)
+-// to lit.vert.slang's OWN ObjectTransform struct -- this is a SEPARATE
+-// Slang compilation module (see this file's header comment: no
+-// lit.vert.slang concatenation here), so Slang computes THIS struct's own
+-// stride/size independently when indexing `gTransforms[0][transformIndex]`.
+-// A real, found-during-development bug this comment now documents: an
+-// earlier revision of this file only had the first two fields (mvp,
+-// lightMvp) after lit.vert.slang's own struct grew two more (albedo,
+-// lightDirWorld) -- every index-0 read (the floor, whose row happens to
+-// start at byte 0 under EITHER stride) still worked, but every index 1+
+-// read (cube, sphere) silently computed the wrong byte offset into the
+-// SAME real buffer (128-byte stride here vs. the real 160-byte stride the
+-// C++ writer and lit.vert.slang both use), reading a garbled mix of the
+-// previous row's tail and the current row's head -- a plausible-looking
+-// but WRONG matrix, not a crash or an obviously-garbage value. This is
+-// exactly the class of bug this sample's own headless gate (shadow-vs-lit
+-// probe brightness) is designed to catch.
+-struct ObjectTransform {
+-    float4x4 mvp;
+-    float4x4 lightMvp;
+-    float4 albedo;
+-    float4 lightDirWorld;
+-};
+-
++//
++// `ObjectTransform` is concatenated ahead of this file at compile time
++// from scene_types.slang -- see samples/05_multipass/main.cpp's
++// buildShadowPipeline() and scene_types.slang's own header comment for
++// why (and for the postmortem of the real bug this fixes: this file used
++// to declare its OWN separate copy of this struct, since it is compiled
++// as its own Slang module -- never concatenated with the lit files -- and
++// that copy silently drifted out of sync with lit.vert.slang's when the
++// latter grew two more fields). [fix round 1]
+ struct PushConstants {
+     uint transformIndex;
+ };
+ 
+ [[vk::push_constant]]
+ ConstantBuffer<PushConstants> gPush;
+ 
+ [[vk::binding(2, 0)]]
+ StructuredBuffer<ObjectTransform> gTransforms[];
+ 
+diff --git a/tools/package_samples.sh b/tools/package_samples.sh
+index 02ba6e7..919d5af 100755
+--- a/tools/package_samples.sh
++++ b/tools/package_samples.sh
+@@ -19,24 +19,28 @@
+ # Per-sample contents [R:D2, spec Fixed decision #11]:
+ #   01_triangle       binary + triangle.vert.spv + triangle.frag.spv
+ #                     (precompiled offline by slangc at build time -- NO
+ #                     Slang runtime libraries needed; this sample never
+ #                     compiles a shader in-process. Keep this distinction
+ #                     sharp: it's the one sample that doesn't need Slang.)
+ #   02_hotreload      binary + hotreload.slang + Slang runtime libs + LICENSE
+ #   03_bindless_mesh  binary + texture.png + Slang runtime libs + LICENSE
+ #   04_streaming      binary + Slang runtime libs + LICENSE
+ #                     (no external asset -- every texture is procedural)
+-#   05_multipass      binary + shaders/multipass/*.slang (5 files) + Slang
+-#                     runtime libs + LICENSE (no other external asset --
+-#                     every texture this sample uses is a graph-pooled
+-#                     transient, never an on-disk file)
++#   05_multipass      binary + shaders/multipass/*.slang (6 files, incl.
++#                     scene_types.slang [fix round 1] -- the single source
++#                     of truth for ObjectTransform, concatenated ahead of
++#                     both shadow.vert.slang and lit.vert.slang at compile
++#                     time, so it must ship too) + Slang runtime libs +
++#                     LICENSE (no other external asset -- every texture
++#                     this sample uses is a graph-pooled transient, never
++#                     an on-disk file)
+ #
+ # This script does NOT build anything -- it assumes `cmake --build
+ # --preset <preset>` already ran and each sample's build-output directory
+ # already has its runtime libs/assets deployed next to its binary (that
+ # deployment is CMake's job: rx_shader_deploy_runtime_libs() in
+ # src/rx_shader/CMakeLists.txt for the Slang libs, and each sample's own
+ # POST_BUILD copy step for its on-disk asset). This script's only job is to
+ # select, per sample, the subset of that build-output directory a
+ # redistributed copy actually needs -- leaving out CMake/Ninja build
+ # bookkeeping (CMakeFiles/, cmake_install.cmake, CTestTestfile.cmake, *.pdb,
+@@ -139,26 +143,30 @@ for RX_SAMPLE in 02_hotreload 03_bindless_mesh 04_streaming 05_multipass; do
+       "$SAMPLES_BUILD_DIR/$RX_SAMPLE"/libslang-compiler.so* \
+       "$SAMPLES_BUILD_DIR/$RX_SAMPLE"/libslang-glslang-*.so \
+       "$SAMPLES_BUILD_DIR/$RX_SAMPLE"/libslang-glsl-module-*.so \
+       "$SAMPLES_BUILD_DIR/$RX_SAMPLE"/libslang-rt.so*
+   fi
+ done
+ 
+ # 02_hotreload additionally ships the live-reloadable shader source; 03
+ # additionally ships its one real-PNG texture. 04 has no external asset
+ # (every texture is procedurally generated) -- nothing extra for it. 05
+-# ships its own five on-disk shader sources (see samples/05_multipass/
+-# CMakeLists.txt's own POST_BUILD deploy step for why these five, flat,
+-# no "multipass/" subdirectory in the deployed layout).
++# ships its own six on-disk shader sources (see samples/05_multipass/
++# CMakeLists.txt's own POST_BUILD deploy step for why these six, flat, no
++# "multipass/" subdirectory in the deployed layout) -- scene_types.slang
++# [fix round 1] included: it is concatenated ahead of shadow.vert.slang/
++# lit.vert.slang at compile time, so a packaged run needs it on disk next
++# to the binary exactly like the other five.
+ copy_required "$STAGE_DIR/02_hotreload" "$SAMPLES_BUILD_DIR/02_hotreload/hotreload.slang"
+ copy_required "$STAGE_DIR/03_bindless_mesh" "$SAMPLES_BUILD_DIR/03_bindless_mesh/texture.png"
+ copy_required "$STAGE_DIR/05_multipass" \
++  "$SAMPLES_BUILD_DIR/05_multipass/scene_types.slang" \
+   "$SAMPLES_BUILD_DIR/05_multipass/shadow.vert.slang" \
+   "$SAMPLES_BUILD_DIR/05_multipass/lit.vert.slang" \
+   "$SAMPLES_BUILD_DIR/05_multipass/lit.frag.slang" \
+   "$SAMPLES_BUILD_DIR/05_multipass/tonemap.vert.slang" \
+   "$SAMPLES_BUILD_DIR/05_multipass/tonemap.frag.slang"
+ 
+ mkdir -p "$(dirname "$RX_OUT_ZIP")"
+ RX_OUT_ZIP_ABS="$(cd "$(dirname "$RX_OUT_ZIP")" && pwd)/$(basename "$RX_OUT_ZIP")"
+ rm -f "$RX_OUT_ZIP_ABS"
+ 

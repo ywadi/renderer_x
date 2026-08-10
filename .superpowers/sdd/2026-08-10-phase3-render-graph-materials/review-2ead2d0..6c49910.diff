@@ -1,0 +1,1771 @@
+# Review package: 2ead2d0..6c49910
+
+## Commits
+6c49910 feat: add COM-lite public material API surface
+
+## Files changed
+ .../task-6-report.md                               | 234 ++++++++
+ src/rx_material/CMakeLists.txt                     |   8 +
+ src/rx_material/api_impl.cpp                       | 626 +++++++++++++++++++++
+ src/rx_material/include/rx_material/rx_api.h       | 193 +++++++
+ .../include/rx_material/rx_api_detail.h            |  24 +
+ src/rx_material/tests/CMakeLists.txt               |  45 +-
+ src/rx_material/tests/data/test_textured.slang     |  37 ++
+ src/rx_material/tests/doctest_main_plain.cpp       |   9 +
+ src/rx_material/tests/test_api_contract.cpp        | 140 +++++
+ src/rx_material/tests/test_api_factory.cpp         | 277 +++++++++
+ .../tests/test_api_header_self_contained.cpp       |  45 ++
+ 11 files changed, 1630 insertions(+), 8 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-10-phase3-render-graph-materials/task-6-report.md b/.superpowers/sdd/2026-08-10-phase3-render-graph-materials/task-6-report.md
+new file mode 100644
+index 0000000..378d6c2
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-phase3-render-graph-materials/task-6-report.md
+@@ -0,0 +1,234 @@
++# Task 6 report: COM-lite public surface (rx_api.h)
++
++**Branch:** `main` (worked directly, no worktree)
++**Commit:** see final commit hash reported alongside this report.
++
++## What was built
++
++- `src/rx_material/include/rx_material/rx_api.h` (new): the ABI boundary header.
++  Self-contained (`<cstdint>` only, no rx_*/STL/Vulkan/Slang include). Exactly the
++  verbatim shape from the task brief: `RxResult`/error codes, `RxGuid`,
++  `IRxUnknown`/`IRxTexture`/`IRxMaterialInstance`/`IRxMaterial`/`IRxMaterialSystem`,
++  `RxMaterialSystemDesc`, `extern "C" rxCreateMaterialSystem`. Top-of-file doc
++  comment cites design doc D5 for the ABI rules. GUIDs generated with `uuidgen`
++  (five real UUIDs, converted to `RxGuid` literals with a small one-off Python
++  script — not hand-transcribed hex). `static_assert(sizeof(RxGuid) == 16)`,
++  `static_assert(alignof(RxGuid) == 4)`, and
++  `static_assert(sizeof(RxMaterialSystemDesc) == sizeof(void*))` are pinned in the
++  header itself, not just in tests.
++- `src/rx_material/include/rx_material/rx_api_detail.h` (new, not in the brief's
++  literal file list): declares `rx::material::detail::debugLiveApiObjectCount()`
++  — a test-only seam (mirrors `material_system.h`'s own
++  `detail::debugCompileCount()` carve-out) so the refcount-round-trip contract
++  test can observe "destroyed exactly once" from outside `api_impl.cpp`'s
++  translation unit. Never included by `rx_api.h`; not part of the ABI.
++- `src/rx_material/api_impl.cpp` (new): the implementation. `MaterialSystemImpl`,
++  `MaterialImpl`, `MaterialInstanceImpl` each single-inherit (via a CRTP
++  `RxUnknownBase<Derived, Interface>` helper that supplies `addRef()`/`release()`
++  once) their one public interface, marked `final`. `release()` always
++  `delete static_cast<Derived*>(this)` — no virtual destructor anywhere in the
++  hierarchy. `queryInterface` does a `memcmp`-based GUID compare (RxGuid has no
++  padding, matching `IsEqualGUID`'s own technique) and returns the identical
++  object pointer for `IRxUnknown` and the object's own interface (COM identity,
++  automatic from single inheritance). Every public entry point (factory,
++  `loadMaterial`, `createInstance`) wraps internal work in `try/catch
++  (const std::exception&)` and maps to an `RxResult`, logging diagnostics via
++  `RX_LOG_ERROR` — nothing ever throws across the boundary.
++- `src/rx_material/CMakeLists.txt` (modified): added `api_impl.cpp` to
++  `add_library(rx_material STATIC ...)`.
++- `src/rx_material/tests/CMakeLists.txt` (modified): added a new device-free
++  target `rx_material_tests` (contract tests) alongside the existing
++  `rx_material_gpu_tests`, and added `test_api_factory.cpp` to the latter.
++- Tests: `test_api_contract.cpp`, `test_api_header_self_contained.cpp`,
++  `doctest_main_plain.cpp` (device-free target `rx_material_tests`);
++  `test_api_factory.cpp` (added to `rx_material_gpu_tests`); a new fixture
++  `tests/data/test_textured.slang` (see below).
++
++## Interface layout decisions
++
++- **No namespace wrapper.** `rx_api.h`'s types live at global scope, matching
++  Slang's own `slang.h`: `SlangUUID`/`ISlangUnknown`/`SLANG_COM_INTERFACE` are all
++  declared *before* `namespace slang { ... }` opens — confirmed by reading the
++  file directly rather than assuming. The `Rx`/`IRx` prefix is the de facto
++  namespacing, exactly like D3D's global `ID3D11Device`/`HRESULT`.
++- **GUID constants as free `static constexpr RxGuid kIID_...`**, not a nested
++  static function (Slang's `getTypeGuid()` pattern) or a data member — the brief's
++  literal text asked for "one static constexpr RxGuid kIID_IRx... per interface,"
++  and a namespace-scope constant has zero object-layout impact (no vtable slot,
++  no per-instance storage), so it can't violate the "no data members" rule even
++  though the name (`kIID_...`) reads like a member.
++- **`RxUnknownBase<Derived, Interface>` CRTP helper** in `api_impl.cpp` (never
++  exposed to consumers) shares `addRef()`/`release()`'s identical bodies and the
++  live-object counter across all three concrete classes. This adds intermediate
++  C++ classes to the *implementation*-side inheritance chain, but never changes
++  the ABI-facing vtable slot order/count a consumer sees through an
++  `IRx*`-typed pointer — the rule under research is "single inheritance, no
++  data members" for the *interface* declarations in `rx_api.h`, which this
++  doesn't touch. All three concrete classes are marked `final`, which also
++  resolved a real `-Wdelete-non-abstract-non-virtual-dtor` warning caught during
++  a manual `-Wall -Wextra -Wpedantic -Wshadow` pass (this repo's CMake sets no
++  warning flags anywhere, so `ninja` alone would not have caught this — I
++  extracted the real compile command from `compile_commands.json` and reran it
++  with warnings enabled for every new file before considering the task done).
++- **`RxMaterialSystemDesc.internalMaterialSystem` is allowed to be null.** The
++  factory only rejects null `desc`/`outSystem` with `RX_E_INVALIDARG`; a null
++  internal pointer is a documented, legal "device-free" instance on which
++  `queryInterface`/`addRef`/`release`/`reloadChanged` all work normally (none
++  touch the internal pointer) but `loadMaterial()` returns `RX_E_FAIL` instead of
++  crashing. This is what makes the device-free contract tests possible without
++  fabricating a fake non-null pointer that nothing would ever validate — a real,
++  useful `IRxMaterialSystem` object backs every one of those tests, not a mock.
++- **IRxMaterialInstance's name/type validation uses a SECOND, independent,
++  reflection-only Slang session** (`reflectMaterialParams()` in `api_impl.cpp`),
++  not an extension of `material_system.h`. Task 6's Modify list for this task
++  named only `CMakeLists.txt`; `MaterialSystem`'s own reflection
++  (`reflectMaterialLayout()`, Task 5) only produces one whole-`ParameterBlock`
++  binding descriptor — no per-field name/type breakdown — so there is no way to
++  answer "does parameter X exist, and what type is it" from what
++  `material_system.h` exposes today. Rather than fabricate a name/type table or
++  hand-parse Slang source text (this project's standing "prefer a ready-made
++  library" rule explicitly calls out parsers as something to reuse, not
++  reinvent), `api_impl.cpp` composes just the material module (no
++  `forward_entry.slang`, no entry points) and calls
++  `IComponentType::getLayout()` on the **unlinked** composite — verified
++  directly against this project's shipped Slang v2026.14.1 build (see Test
++  results below) rather than assumed from documentation. Field kinds are
++  classified using this engine's own already-established D8 convention: a
++  `float` field is `Float`, a 4-wide `float` vector is `Float4`, and a plain
++  `uint` field is `TextureIndex` (bindless-table index — D8 says a material never
++  puts a resource-typed field inside `TParams`, only plain data, and a bindless
++  index is exactly that). Anything else reflects as `Unsupported` — a real,
++  named field with no matching setter, so calling any setter on it correctly
++  returns `RX_E_INVALIDARG`, not `RX_E_NOTFOUND`.
++  - **Cost, named explicitly:** this is a second Slang session per
++    `loadMaterial()` call, on top of `MaterialSystem`'s own — real, measurable
++    duplicate work. The `slang::IGlobalSession` (the expensive part — stdlib
++    load) is shared across every `loadMaterial()` call on one
++    `IRxMaterialSystem` instance (created lazily, once), mirroring
++    `MaterialSystem::Impl`'s own reasoning for the identical tradeoff, but the
++    per-call `ISession`/composite/layout work is genuinely duplicated. **Task 7
++    should collapse this** by having `MaterialSystem` itself expose a per-field
++    parameter table computed from the program it already links (it already
++    retains `MaterialRecord::linkedProgram`), once that task is touching
++    `material_system.h` anyway for GPU-binding.
++- **`test_textured.slang`** (new fixture, not in the brief's literal Create
++  list): `test_unlit.slang`/`test_solid.slang` only declare a `float4` field, so
++  neither can exercise `setTexture()`'s success path or its `IRxTexture`
++  addRef/release lifecycle at all. Added one more tiny fixture (`uint
++  albedoIndex`, same D8 convention) specifically so that code path has a real,
++  passing, non-mocked-material test rather than being provably-untested dead
++  code. `test_api_factory.cpp` also defines a minimal test-only `FakeTexture :
++  IRxTexture` double (there is no `rxCreateTexture` factory yet in this task's
++  surface) to drive it.
++
++## What Task 7 must pick up
++
++1. **`reloadChanged()`** is a documented no-op returning `RX_OK` (declared now
++   purely for GUID/vtable stability). Task 7 wires real behavior: watch every
++   module path `loadMaterial()` was called with, re-load/re-link changed ones
++   (against a fresh `MaterialSystem`/session per `material_system.cpp`'s own
++   documented same-module-name reload caveat), invalidate the affected
++   pipeline-cache entries.
++2. **Collapse the duplicate Slang reflection pass** described above:
++   `MaterialSystem` should expose a per-field parameter name/type table (set,
++   scalar/vector kind) computed once from its own already-linked program,
++   removing `api_impl.cpp`'s second session entirely. This also removes the
++   current "params computed from a SEPARATE session than the one that produced
++   the actual SPIR-V" duplication risk (low today — same source bytes, same
++   session config — but a real seam to close).
++3. **Connect `IRxMaterialInstance`'s CPU-side blob to actual GPU binding.** Task
++   6 validates and stores `setFloat`/`setFloat4`/`setTexture` values in a plain
++   `std::unordered_map<std::string, StoredParam>` inside `MaterialInstanceImpl` —
++   nothing currently reads this blob to populate a real descriptor set/uniform
++   buffer for `gParams`. Task 7 needs: (a) a way to get the reflected field
++   *offsets* (not just names/kinds — `reflectMaterialParams()` doesn't compute
++   byte offsets today, since Task 6 never needed them), (b) per-instance
++   descriptor-set/buffer allocation, (c) a write path that walks the stored
++   blob and pushes it to the GPU-visible buffer before draw.
++4. **`IRxTexture`'s own creation path.** Nothing in Task 6 creates a real
++   `IRxTexture` (no `rxCreateTexture` factory) — it only exists as a parameter
++   type for `setTexture()`. The `setTexture` success-path test in
++   `test_api_factory.cpp` uses a hand-rolled test-only double
++   (`FakeTexture`), not a real renderer-backed texture. A real texture-loading
++   public surface is future work.
++5. Consider whether `RxMaterialSystemDesc.internalMaterialSystem == nullptr`
++   being *legal* (vs. rejected with `RX_E_INVALIDARG`) is still the right call
++   once a real standalone consumer exists outside this repo's own tests — it
++   was a deliberate, documented choice made specifically to make device-free
++   ABI contract testing possible without a fake non-null pointer; a future task
++   could tighten this if the device-free testing need goes away (e.g. a
++   dedicated test-only factory overload).
++
++## Test results
++
++- `ctest --preset linux-native -R rx_material --output-on-failure`: **2/2
++  passed** (`rx_material_gpu_tests`, `rx_material_tests`).
++  - `rx_material_tests` (new, device-free): 9 test cases / 40 assertions, all
++    passing — `rxCreateMaterialSystem` null-arg rejection, null-internal
++    "device-free" construction, `queryInterface` null-out-param rejection,
++    `queryInterface` unknown-IID → `RX_E_NOINTERFACE` + null out-param,
++    `queryInterface` identity (`IRxUnknown` and the object's own interface
++    resolve to the same pointer), refcount round-trip (`addRef`→2,
++    `release`→1 still alive, `release`→0 destroyed exactly once, verified via
++    `debugLiveApiObjectCount()`), `loadMaterial` on a null-internal instance →
++    `RX_E_FAIL` never crashes, `loadMaterial` null-arg rejection,
++    `reloadChanged` no-op.
++  - `rx_material_gpu_tests`: 9 test cases, including this task's 3 new ones —
++    factory + `loadMaterial` happy path against a real `VkDevice`-backed
++    internal `MaterialSystem` with `test_unlit.slang` (validates the real
++    reflected `tint : float4` field: `setFloat4("tint", ...)` → `RX_OK`,
++    `setFloat("tint", ...)` → `RX_E_INVALIDARG`, `setTexture("tint", ...)` →
++    `RX_E_INVALIDARG`, unknown name → `RX_E_NOTFOUND` on all three setters, null
++    args → `RX_E_INVALIDARG`, QI identity on the instance); `setTexture`
++    validation + `IRxTexture` refcount lifecycle against `test_textured.slang`'s
++    real `albedoIndex : uint` field (addRef on store, release on overwrite,
++    release on instance destruction — all verified via the `FakeTexture`
++    double's own refcount, not just "it didn't crash"); a real Slang syntax
++    error (`test_bad_syntax.slang`) mapped to `RX_E_COMPILE` with the
++    diagnostic logged, not thrown.
++  - Full repo regression: `ctest --preset linux-native --output-on-failure` —
++    **14/14 passed**, nothing else regressed.
++- Both presets build clean: `cmake --build build/linux-native` and
++  `cmake --build build/windows-cross-zig`, targets `rx_material`,
++  `rx_material_tests`, `rx_material_gpu_tests` — zero errors on either.
++- Manual warning check (this repo's CMake sets no `-Wall`/`-Wextra` anywhere, on
++  any target, so `ninja` alone would not surface this): extracted each new
++  file's real compile command from `compile_commands.json` and reran it with
++  `-Wall -Wextra -Wpedantic -Wshadow` appended. Caught and fixed one real issue
++  (`-Wdelete-non-abstract-non-virtual-dtor` on all three impl classes plus the
++  test-only `FakeTexture` — fixed by marking all four `final`). Zero warnings
++  after the fix.
++- Empirically verified (not assumed from Slang's docs) before relying on it:
++  `slang::IComponentType::getLayout()` returns a complete, correct
++  `ProgramLayout` — with the `gParams` field walk finding real names/types —
++  when called on a **composite that was never linked** (no
++  `forward_entry.slang`, no entry points in the composite at all). Confirmed by
++  the `test_api_factory.cpp` happy-path test actually validating `tint`/
++  `albedoIndex` by NAME against real reflected data, not a hand-maintained
++  table.
++
++## Files
++
++- `src/rx_material/include/rx_material/rx_api.h` (new)
++- `src/rx_material/include/rx_material/rx_api_detail.h` (new)
++- `src/rx_material/api_impl.cpp` (new)
++- `src/rx_material/CMakeLists.txt` (modified)
++- `src/rx_material/tests/CMakeLists.txt` (modified)
++- `src/rx_material/tests/test_api_contract.cpp` (new)
++- `src/rx_material/tests/test_api_header_self_contained.cpp` (new)
++- `src/rx_material/tests/doctest_main_plain.cpp` (new)
++- `src/rx_material/tests/test_api_factory.cpp` (new)
++- `src/rx_material/tests/data/test_textured.slang` (new)
++
++## Concerns
++
++- The second Slang reflection session (item 2 under "What Task 7 must pick
++  up") is real, measurable duplicate work per `loadMaterial()` call. It is
++  bounded (reflection only, no codegen/linking) and the expensive
++  `IGlobalSession` is shared, but it is still a genuine seam a reviewer should
++  weigh against extending `material_system.h` directly in a follow-up rather
++  than living with the duplication long-term.
++- `RxMaterialSystemDesc.internalMaterialSystem == nullptr` being accepted by
++  the factory (rather than rejected) is a real API design choice, not a
++  neutral default — flagged above (item 5) for explicit reconsideration once
++  there's a real external consumer.
+diff --git a/src/rx_material/CMakeLists.txt b/src/rx_material/CMakeLists.txt
+index fcddcd9..e3f635a 100644
+--- a/src/rx_material/CMakeLists.txt
++++ b/src/rx_material/CMakeLists.txt
+@@ -7,22 +7,30 @@
+ # link-time-specialization composition this library needs), and rx_rhi_vk
+ # (PipelineLayoutBuilder, BindlessTable, Device) -- matching this task's
+ # architecture diagram [spec Phase 3 design, Architecture].
+ #
+ # Links slang::slang directly (like rx_shader does), NOT rx_shader itself --
+ # there is no rx_shader type anywhere in this library's own headers or
+ # implementation (rx_shader::Compiler/CompileResult/reflect() are all
+ # single-module-composition-shaped, per compiler.h/reflection.h's own
+ # scope, and this library's multi-module (entry-point module + material
+ # module) composition needs the raw slang::ISession API those wrap).
++#
++# api_impl.cpp [Task 6, spec Phase 3 design D5]: the COM-lite public ABI
++# surface's implementation (rx_api.h's factory + IRxMaterialSystem/
++# IRxMaterial/IRxMaterialInstance). Lives in this same static library
++# (there is no separate rx.dll yet -- D5 defers the standalone-DLL
++# artifact) but never includes material_system.cpp's own internals
++# outside its public class -- only material_system.h's public surface.
+ add_library(rx_material STATIC
+     material_system.cpp
++    api_impl.cpp
+ )
+ target_include_directories(rx_material PUBLIC include)
+ target_link_libraries(rx_material PUBLIC rx_core rx_graph rx_rhi_vk rx_shader_layout_types slang::slang)
+ 
+ # RX_MATERIAL_SHADER_DIR -- the fixed, checked-out-repo-relative location of
+ # shaders/material/material.slang + forward_entry.slang, baked in at compile
+ # time exactly like shaders/CMakeLists.txt already bakes
+ # RX_TRIANGLE_VERT_SPV/RX_TRIANGLE_FRAG_SPV into shader_spirv_test: an
+ # absolute path anchored at CMAKE_SOURCE_DIR, valid for any build of THIS
+ # checked-out repository (dev builds, ctest, CI) but not a relocated/
+diff --git a/src/rx_material/api_impl.cpp b/src/rx_material/api_impl.cpp
+new file mode 100644
+index 0000000..f05876a
+--- /dev/null
++++ b/src/rx_material/api_impl.cpp
+@@ -0,0 +1,626 @@
++#include <rx_material/rx_api.h>
++
++#include <rx_material/material_system.h>
++#include <rx_material/rx_api_detail.h>
++
++#include <rx_core/log.h>
++
++#include <slang-com-ptr.h>
++#include <slang.h>
++
++#include <atomic>
++#include <cstdint>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <optional>
++#include <sstream>
++#include <string>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++// api_impl.cpp -- the renderer-side implementation behind rx_api.h's
++// COM-lite interfaces [spec Phase 3 design, D5]. Every public entry point
++// here (the extern "C" factory, and every virtual method reachable from
++// a caller holding only an IRx*-typed pointer) follows the same
++// exception-boundary contract: internal C++ exceptions (thrown by
++// rx::material::MaterialSystem, by Slang's own C++ wrapper on OOM, or by
++// `new`) are caught HERE and mapped to an RxResult -- never allowed to
++// propagate across the ABI [R:M§1.3 point 2]. Diagnostics that would be
++// useful to a developer (Slang's own compile/link error text) are logged
++// via spdlog on this side, matching the brief's "no strings across the
++// ABI in Phase 3" decision.
++//
++// This file also implements IRxMaterialInstance's parameter-name/type
++// validation using a SECOND, independent, reflection-only Slang session
++// (see reflectMaterialParams() below) -- not because MaterialSystem
++// (material_system.h) is missing this by oversight, but because Task 5's
++// scope for that class stopped at binding-level reflection (one
++// UNIFORM_BUFFER binding for the whole `ParameterBlock<TParams> gParams`,
++// no per-field name/type breakdown -- see material_system.cpp's own
++// reflectMaterialLayout()) and Task 6's Modify list does not include
++// material_system.h/.cpp. Rather than fabricate a name/type table or
++// hand-parse Slang source text (this project's own policy: prefer an
++// already-integrated library's real API over reinventing a parser), this
++// runs Slang's OWN reflection API a second time, scoped to exactly the
++// question this ABI layer needs answered ("what are gParams's field
++// names and shapes"), stopping before codegen/linking (composite->
++// getLayout() works on an unlinked IComponentType -- verified directly
++// against this project's shipped Slang build before writing this, same
++// as every other empirical Slang behavior this codebase documents rather
++// than assumes). This is real, measurable duplicate work (a second Slang
++// session per loadMaterial() call, on top of MaterialSystem's own) --
++// flagged explicitly in task-6-report.md as something Task 7 should
++// collapse by having MaterialSystem itself expose a per-field parameter
++// table computed from the ALREADY-linked program it retains, once that
++// task is touching material_system.h anyway for GPU-binding.
++namespace rx::material {
++
++namespace {
++
++// --- GUID comparison -----------------------------------------------------
++// RxGuid has no padding (16 contiguous bytes: rx_api.h's own static_assert
++// pins this) -- a plain memcmp of the whole struct is exactly IsEqualGUID's
++// own technique (Win32 COM) and correct here for the same reason.
++bool guidEquals(const RxGuid& a, const RxGuid& b) { return std::memcmp(&a, &b, sizeof(RxGuid)) == 0; }
++
++// --- Reflected material parameter shapes ---------------------------------
++// The only shapes IRxMaterialInstance's three setters can ever bind:
++// Float (setFloat), Float4 (setFloat4), TextureIndex (setTexture -- a
++// plain `uint` field per this engine's own D8 convention: bindless
++// texture indices are plain data inside TParams, never a resource-typed
++// field -- see material_system.cpp's own comment on gParams for the
++// exact citation). Unsupported covers every other real field shape
++// (float3, matrices, ints, ...) this ABI has no setter for yet: a lookup
++// that finds an Unsupported field is a real, named parameter with the
++// WRONG type for whichever setter was called (RX_E_INVALIDARG), not an
++// unknown one (RX_E_NOTFOUND).
++enum class ParamKind : uint8_t { Float, Float4, TextureIndex, Unsupported };
++
++struct ReflectedParam {
++    std::string name;
++    ParamKind kind;
++};
++
++std::optional<std::string> readFileBytes(const std::filesystem::path& path) {
++    std::ifstream file(path, std::ios::binary);
++    if (!file) {
++        return std::nullopt;
++    }
++    std::ostringstream contents;
++    contents << file.rdbuf();
++    if (!file.good() && !file.eof()) {
++        return std::nullopt;
++    }
++    return contents.str();
++}
++
++ParamKind classifyFieldType(slang::TypeLayoutReflection* typeLayout) {
++    if (typeLayout == nullptr) {
++        return ParamKind::Unsupported;
++    }
++    switch (typeLayout->getKind()) {
++        case slang::TypeReflection::Kind::Scalar: {
++            switch (typeLayout->getScalarType()) {
++                case slang::TypeReflection::ScalarType::Float32:
++                    return ParamKind::Float;
++                case slang::TypeReflection::ScalarType::UInt32:
++                    return ParamKind::TextureIndex;
++                default:
++                    return ParamKind::Unsupported;
++            }
++        }
++        case slang::TypeReflection::Kind::Vector: {
++            slang::TypeLayoutReflection* elementLayout = typeLayout->getElementTypeLayout();
++            if (elementLayout == nullptr || typeLayout->getElementCount() != 4) {
++                return ParamKind::Unsupported;
++            }
++            if (elementLayout->getScalarType() == slang::TypeReflection::ScalarType::Float32) {
++                return ParamKind::Float4;
++            }
++            return ParamKind::Unsupported;
++        }
++        default:
++            return ParamKind::Unsupported;
++    }
++}
++
++// Reflection-only pass over `materialPath`'s top-level `gParams`
++// ParameterBlock (see this file's own header comment for why this exists
++// as a SECOND Slang session rather than extending material_system.h).
++// `globalSession` is owned by the caller (MaterialSystemImpl keeps one
++// alive for as long as the wrapping IRxMaterialSystem lives, paying
++// Slang's real fixed cost -- its standard-library load -- once, not once
++// per loadMaterial() call, mirroring MaterialSystem::Impl's own globalSession
++// field for the identical reason). Returns an empty vector and leaves
++// `error` empty for a material with a valid (possibly field-less)
++// ParameterBlock; returns an empty vector with `error` set on any real
++// reflection failure (session/module/layout construction failed) -- the
++// caller treats the two cases differently (RX_OK with zero known params
++// vs. RX_E_COMPILE).
++std::vector<ReflectedParam> reflectMaterialParams(slang::IGlobalSession* globalSession,
++                                                     const std::filesystem::path& materialPath, std::string& error) {
++    slang::TargetDesc targetDesc{};
++    targetDesc.format = SLANG_SPIRV;
++    targetDesc.profile = globalSession->findProfile("sm_6_0");
++
++    const std::string shaderDir = RX_MATERIAL_SHADER_DIR;
++    const char* searchPath = shaderDir.c_str();
++
++    slang::SessionDesc sessionDesc{};
++    sessionDesc.targets = &targetDesc;
++    sessionDesc.targetCount = 1;
++    sessionDesc.searchPaths = &searchPath;
++    sessionDesc.searchPathCount = 1;
++
++    Slang::ComPtr<slang::ISession> session;
++    if (SLANG_FAILED(globalSession->createSession(sessionDesc, session.writeRef())) || session.get() == nullptr) {
++        error = "rx_material: rx_api: failed to create a reflection-only Slang session for '" +
++                materialPath.string() + "'";
++        return {};
++    }
++
++    auto source = readFileBytes(materialPath);
++    if (!source.has_value()) {
++        error = "rx_material: rx_api: could not read material module '" + materialPath.string() +
++                "' for parameter reflection";
++        return {};
++    }
++
++    std::string moduleName = materialPath.stem().string();
++    if (moduleName.empty()) {
++        moduleName = "material";
++    }
++
++    Slang::ComPtr<slang::IBlob> sourceBlob(Slang::INIT_ATTACH, slang_createBlob(source->data(), source->size()));
++    Slang::ComPtr<slang::IBlob> loadDiag;
++    slang::IModule* materialModule = session->loadModuleFromSource(moduleName.c_str(), materialPath.string().c_str(),
++                                                                      sourceBlob, loadDiag.writeRef());
++    if (materialModule == nullptr) {
++        error = "rx_material: rx_api: failed to load material module '" + materialPath.string() +
++                "' for parameter reflection";
++        return {};
++    }
++
++    std::vector<slang::IComponentType*> parts{materialModule};
++    Slang::ComPtr<slang::IComponentType> composite;
++    Slang::ComPtr<slang::IBlob> composeDiag;
++    if (SLANG_FAILED(session->createCompositeComponentType(parts.data(), static_cast<SlangInt>(parts.size()),
++                                                              composite.writeRef(), composeDiag.writeRef())) ||
++        composite.get() == nullptr) {
++        error = "rx_material: rx_api: failed to compose material module '" + materialPath.string() +
++                "' for parameter reflection";
++        return {};
++    }
++
++    // Deliberately composite->getLayout(), never composite->link(): this
++    // pass only ever reads global-parameter TYPE/NAME information, which
++    // Slang resolves during type-checking/layout assignment at composite
++    // construction, not at link time -- no codegen, no entry points, no
++    // forward_entry.slang involvement needed at all.
++    Slang::ComPtr<slang::IBlob> layoutDiag;
++    slang::ProgramLayout* layout = composite->getLayout(0, layoutDiag.writeRef());
++    if (layout == nullptr) {
++        error = "rx_material: rx_api: IComponentType::getLayout failed for '" + materialPath.string() +
++                "' during parameter reflection";
++        return {};
++    }
++
++    std::vector<ReflectedParam> params;
++    unsigned paramCount = layout->getParameterCount();
++    for (unsigned i = 0; i < paramCount; ++i) {
++        slang::VariableLayoutReflection* param = layout->getParameterByIndex(i);
++        if (param == nullptr) {
++            continue;
++        }
++        slang::TypeLayoutReflection* paramTypeLayout = param->getTypeLayout();
++        bool isParamBlock = param->getCategory() == slang::ParameterCategory::SubElementRegisterSpace &&
++                             paramTypeLayout != nullptr &&
++                             paramTypeLayout->getKind() == slang::TypeReflection::Kind::ParameterBlock;
++        if (!isParamBlock) {
++            // Not this engine's gParams -- material_system.cpp's own
++            // reflectMaterialLayout() already rejects any material whose
++            // top-level globals don't match this exact shape at
++            // internal->loadMaterial() time, so by construction there is
++            // nothing else to classify here.
++            continue;
++        }
++
++        slang::TypeLayoutReflection* elementLayout = paramTypeLayout->getElementTypeLayout();
++        if (elementLayout == nullptr) {
++            continue;
++        }
++        unsigned fieldCount = elementLayout->getFieldCount();
++        for (unsigned f = 0; f < fieldCount; ++f) {
++            slang::VariableLayoutReflection* field = elementLayout->getFieldByIndex(f);
++            if (field == nullptr) {
++                continue;
++            }
++            const char* rawName = field->getName();
++            if (rawName == nullptr) {
++                continue;
++            }
++            params.push_back(ReflectedParam{std::string(rawName), classifyFieldType(field->getTypeLayout())});
++        }
++        break;  // exactly one ParameterBlock per Phase 3 material (D8) -- first match is authoritative.
++    }
++    return params;
++}
++
++// --- Live-object bookkeeping (test seam) ----------------------------------
++std::atomic<uint64_t> g_liveApiObjectCount{0};
++
++// --- COM-lite root plumbing shared by every concrete object below --------
++// CRTP, not a virtual base: `Interface` (IRxMaterialSystem, IRxMaterial,
++// IRxMaterialInstance) is the ONE class each concrete type below publicly,
++// singly inherits -- RxUnknownBase sits between them in the C++ class
++// hierarchy purely to share addRef()/release()'s identical bodies, which
++// does not change the ABI-facing vtable's slot order/count at all (the
++// consumer only ever holds an Interface*-typed pointer and only ever
++// calls through the slots ITS OWN pure-virtual declarations specify,
++// which RxUnknownBase overrides in place, adding none). No class in this
++// entire hierarchy declares a virtual destructor (see release() below:
++// it always deletes through the exact static Derived* type, so virtual
++// dispatch to a destructor is never needed) -- consistent with the "no
++// virtual destructor" ABI rule [R:M§1.3 point 1] applying transitively to
++// every object that could ever be reached only through an interface
++// pointer.
++template <typename Derived, typename Interface>
++class RxUnknownBase : public Interface {
++public:
++    RxUnknownBase() { g_liveApiObjectCount.fetch_add(1, std::memory_order_relaxed); }
++
++    uint32_t RX_CALL addRef() override { return refCount_.fetch_add(1, std::memory_order_relaxed) + 1; }
++
++    uint32_t RX_CALL release() override {
++        uint32_t remaining = refCount_.fetch_sub(1, std::memory_order_acq_rel) - 1;
++        if (remaining == 0) {
++            delete static_cast<Derived*>(this);
++        }
++        return remaining;
++    }
++
++protected:
++    ~RxUnknownBase() { g_liveApiObjectCount.fetch_sub(1, std::memory_order_relaxed); }
++
++    // COM convention: a freshly constructed object's first reference is
++    // already owned by whoever received the pointer (a factory/
++    // createInstance/queryInterface out-param) -- starts at 1, not 0.
++    std::atomic<uint32_t> refCount_{1};
++};
++
++// Forward declarations -- MaterialInstanceImpl/MaterialImpl/
++// MaterialSystemImpl reference each other's pointers before each is
++// fully declared (a real mutual dependency: instances own a ref to their
++// material, materials own a ref to their system, and the system
++// constructs materials, which construct instances). Every method whose
++// body needs another one of these three types COMPLETE (constructors/
++// destructors that addRef()/release() each other, setters that call
++// MaterialImpl::paramKind()) is declared here and DEFINED out-of-line,
++// after all three classes are fully declared below.
++class MaterialSystemImpl;
++class MaterialImpl;
++class MaterialInstanceImpl;
++
++// --- IRxMaterialInstance -----------------------------------------------
++struct StoredParam {
++    ParamKind kind = ParamKind::Unsupported;
++    float floats[4] = {0.0F, 0.0F, 0.0F, 0.0F};
++    IRxTexture* texture = nullptr;  // addRef'd while stored here.
++};
++
++class MaterialInstanceImpl final : public RxUnknownBase<MaterialInstanceImpl, IRxMaterialInstance> {
++public:
++    explicit MaterialInstanceImpl(MaterialImpl* material);
++    ~MaterialInstanceImpl();
++
++    RxResult RX_CALL queryInterface(const RxGuid& iid, void** outObject) override;
++    RxResult RX_CALL setFloat(const char* name, float value) override;
++    RxResult RX_CALL setFloat4(const char* name, const float value[4]) override;
++    RxResult RX_CALL setTexture(const char* name, IRxTexture* texture) override;
++
++private:
++    void releaseStoredTextureIfAny(const std::string& paramName);
++
++    MaterialImpl* material_;
++    std::unordered_map<std::string, StoredParam> params_;
++};
++
++// --- IRxMaterial ----------------------------------------------------------
++class MaterialImpl final : public RxUnknownBase<MaterialImpl, IRxMaterial> {
++public:
++    MaterialImpl(MaterialSystemImpl* system, rx::material::MaterialHandle handle, std::string name,
++                 std::unordered_map<std::string, ParamKind> params);
++    ~MaterialImpl();
++
++    RxResult RX_CALL queryInterface(const RxGuid& iid, void** outObject) override;
++    RxResult RX_CALL createInstance(IRxMaterialInstance** outInstance) override;
++    const char* RX_CALL name() override;
++
++    // Internal accessor (not part of the ABI -- only MaterialInstanceImpl
++    // calls this): the reflected shape of parameter `paramName`, or
++    // nullopt if this material has no such reflected parameter at all.
++    [[nodiscard]] std::optional<ParamKind> paramKind(const std::string& paramName) const;
++
++private:
++    MaterialSystemImpl* system_;
++    rx::material::MaterialHandle handle_;
++    std::string name_;
++    std::unordered_map<std::string, ParamKind> params_;
++};
++
++// --- IRxMaterialSystem ------------------------------------------------
++class MaterialSystemImpl final : public RxUnknownBase<MaterialSystemImpl, IRxMaterialSystem> {
++public:
++    explicit MaterialSystemImpl(rx::material::MaterialSystem* internalSystem) : internal_(internalSystem) {}
++
++    RxResult RX_CALL queryInterface(const RxGuid& iid, void** outObject) override;
++    RxResult RX_CALL loadMaterial(const char* slangModulePath, IRxMaterial** outMaterial) override;
++    RxResult RX_CALL reloadChanged() override;
++
++private:
++    bool ensureReflectionGlobalSession();
++
++    rx::material::MaterialSystem* internal_;  // non-owning; may be null (see rx_api.h's own comment on
++                                                // RxMaterialSystemDesc for why that is a legal, documented state).
++    Slang::ComPtr<slang::IGlobalSession> reflectionGlobalSession_;
++};
++
++// ===== Out-of-line definitions (every referenced type is complete now) ====
++
++// --- MaterialInstanceImpl -------------------------------------------------
++MaterialInstanceImpl::MaterialInstanceImpl(MaterialImpl* material) : material_(material) { material_->addRef(); }
++
++MaterialInstanceImpl::~MaterialInstanceImpl() {
++    for (auto& [paramName, param] : params_) {
++        (void)paramName;
++        if (param.kind == ParamKind::TextureIndex && param.texture != nullptr) {
++            param.texture->release();
++        }
++    }
++    material_->release();
++}
++
++RxResult RX_CALL MaterialInstanceImpl::queryInterface(const RxGuid& iid, void** outObject) {
++    if (outObject == nullptr) {
++        return RX_E_INVALIDARG;
++    }
++    if (guidEquals(iid, kIID_IRxUnknown) || guidEquals(iid, kIID_IRxMaterialInstance)) {
++        addRef();
++        *outObject = static_cast<IRxMaterialInstance*>(this);
++        return RX_OK;
++    }
++    *outObject = nullptr;
++    return RX_E_NOINTERFACE;
++}
++
++void MaterialInstanceImpl::releaseStoredTextureIfAny(const std::string& paramName) {
++    auto it = params_.find(paramName);
++    if (it != params_.end() && it->second.kind == ParamKind::TextureIndex && it->second.texture != nullptr) {
++        it->second.texture->release();
++    }
++}
++
++RxResult RX_CALL MaterialInstanceImpl::setFloat(const char* name, float value) {
++    if (name == nullptr) {
++        return RX_E_INVALIDARG;
++    }
++    std::optional<ParamKind> kind = material_->paramKind(name);
++    if (!kind.has_value()) {
++        return RX_E_NOTFOUND;
++    }
++    if (*kind != ParamKind::Float) {
++        return RX_E_INVALIDARG;
++    }
++    releaseStoredTextureIfAny(name);
++    StoredParam param;
++    param.kind = ParamKind::Float;
++    param.floats[0] = value;
++    params_[name] = param;
++    return RX_OK;
++}
++
++RxResult RX_CALL MaterialInstanceImpl::setFloat4(const char* name, const float value[4]) {
++    if (name == nullptr || value == nullptr) {
++        return RX_E_INVALIDARG;
++    }
++    std::optional<ParamKind> kind = material_->paramKind(name);
++    if (!kind.has_value()) {
++        return RX_E_NOTFOUND;
++    }
++    if (*kind != ParamKind::Float4) {
++        return RX_E_INVALIDARG;
++    }
++    releaseStoredTextureIfAny(name);
++    StoredParam param;
++    param.kind = ParamKind::Float4;
++    param.floats[0] = value[0];
++    param.floats[1] = value[1];
++    param.floats[2] = value[2];
++    param.floats[3] = value[3];
++    params_[name] = param;
++    return RX_OK;
++}
++
++RxResult RX_CALL MaterialInstanceImpl::setTexture(const char* name, IRxTexture* texture) {
++    if (name == nullptr || texture == nullptr) {
++        return RX_E_INVALIDARG;
++    }
++    std::optional<ParamKind> kind = material_->paramKind(name);
++    if (!kind.has_value()) {
++        return RX_E_NOTFOUND;
++    }
++    if (*kind != ParamKind::TextureIndex) {
++        return RX_E_INVALIDARG;
++    }
++    releaseStoredTextureIfAny(name);
++    texture->addRef();
++    StoredParam param;
++    param.kind = ParamKind::TextureIndex;
++    param.texture = texture;
++    params_[name] = param;
++    return RX_OK;
++}
++
++// --- MaterialImpl ----------------------------------------------------------
++MaterialImpl::MaterialImpl(MaterialSystemImpl* system, rx::material::MaterialHandle handle, std::string name,
++                             std::unordered_map<std::string, ParamKind> params)
++    : system_(system), handle_(handle), name_(std::move(name)), params_(std::move(params)) {
++    system_->addRef();
++}
++
++MaterialImpl::~MaterialImpl() { system_->release(); }
++
++RxResult RX_CALL MaterialImpl::queryInterface(const RxGuid& iid, void** outObject) {
++    if (outObject == nullptr) {
++        return RX_E_INVALIDARG;
++    }
++    if (guidEquals(iid, kIID_IRxUnknown) || guidEquals(iid, kIID_IRxMaterial)) {
++        addRef();
++        *outObject = static_cast<IRxMaterial*>(this);
++        return RX_OK;
++    }
++    *outObject = nullptr;
++    return RX_E_NOINTERFACE;
++}
++
++RxResult RX_CALL MaterialImpl::createInstance(IRxMaterialInstance** outInstance) {
++    if (outInstance == nullptr) {
++        return RX_E_INVALIDARG;
++    }
++    *outInstance = nullptr;
++    try {
++        auto* instance = new MaterialInstanceImpl(this);
++        *outInstance = instance;
++        return RX_OK;
++    } catch (const std::exception& e) {
++        RX_LOG_ERROR("rx_material: rx_api: MaterialImpl::createInstance failed: {}", e.what());
++        return RX_E_FAIL;
++    }
++}
++
++const char* RX_CALL MaterialImpl::name() { return name_.c_str(); }
++
++std::optional<ParamKind> MaterialImpl::paramKind(const std::string& paramName) const {
++    auto it = params_.find(paramName);
++    if (it == params_.end()) {
++        return std::nullopt;
++    }
++    return it->second;
++}
++
++// --- MaterialSystemImpl ------------------------------------------------
++RxResult RX_CALL MaterialSystemImpl::queryInterface(const RxGuid& iid, void** outObject) {
++    if (outObject == nullptr) {
++        return RX_E_INVALIDARG;
++    }
++    if (guidEquals(iid, kIID_IRxUnknown) || guidEquals(iid, kIID_IRxMaterialSystem)) {
++        addRef();
++        *outObject = static_cast<IRxMaterialSystem*>(this);
++        return RX_OK;
++    }
++    *outObject = nullptr;
++    return RX_E_NOINTERFACE;
++}
++
++bool MaterialSystemImpl::ensureReflectionGlobalSession() {
++    if (reflectionGlobalSession_.get() != nullptr) {
++        return true;
++    }
++    if (SLANG_FAILED(slang::createGlobalSession(reflectionGlobalSession_.writeRef())) ||
++        reflectionGlobalSession_.get() == nullptr) {
++        RX_LOG_ERROR("rx_material: rx_api: slang::createGlobalSession failed (parameter reflection)");
++        return false;
++    }
++    return true;
++}
++
++RxResult RX_CALL MaterialSystemImpl::loadMaterial(const char* slangModulePath, IRxMaterial** outMaterial) {
++    if (outMaterial == nullptr) {
++        return RX_E_INVALIDARG;
++    }
++    *outMaterial = nullptr;
++    if (slangModulePath == nullptr) {
++        return RX_E_INVALIDARG;
++    }
++    if (internal_ == nullptr) {
++        RX_LOG_ERROR(
++            "rx_material: rx_api: loadMaterial called on an IRxMaterialSystem created with a null "
++            "internalMaterialSystem (a device-free/QI-only instance -- see rx_api.h's own comment on "
++            "RxMaterialSystemDesc)");
++        return RX_E_FAIL;
++    }
++
++    std::filesystem::path path(slangModulePath);
++    try {
++        rx::material::MaterialHandle handle = internal_->loadMaterial(path);
++
++        if (!ensureReflectionGlobalSession()) {
++            return RX_E_COMPILE;
++        }
++        std::string reflectError;
++        std::vector<ReflectedParam> reflected =
++            reflectMaterialParams(reflectionGlobalSession_.get(), path, reflectError);
++        if (!reflectError.empty()) {
++            RX_LOG_ERROR("rx_material: rx_api: {}", reflectError);
++            return RX_E_COMPILE;
++        }
++
++        std::unordered_map<std::string, ParamKind> params;
++        params.reserve(reflected.size());
++        for (auto& param : reflected) {
++            params.emplace(std::move(param.name), param.kind);
++        }
++
++        auto* material = new MaterialImpl(this, handle, path.stem().string(), std::move(params));
++        *outMaterial = material;
++        return RX_OK;
++    } catch (const std::exception& e) {
++        RX_LOG_ERROR("rx_material: rx_api: loadMaterial('{}') failed: {}", path.string(), e.what());
++        return RX_E_COMPILE;
++    }
++}
++
++RxResult RX_CALL MaterialSystemImpl::reloadChanged() {
++    // Documented no-op for Task 6 -- declared in rx_api.h now purely for
++    // GUID/vtable stability. Task 7 wires the real behavior: watch every
++    // module path `loadMaterial()` has been called with on this instance,
++    // re-load/re-link the ones whose file content changed (reusing
++    // `internal_`'s own MaterialSystem::loadMaterial() -- which already
++    // hashes module content -- against a fresh MaterialSystem/session
++    // per material_system.cpp's own documented same-module-name reload
++    // caveat), and invalidate exactly the pipeline-cache entries derived
++    // from a changed module's content hash. Deliberately does not read
++    // `internal_` at all, so this stays valid to call even on a
++    // device-free/QI-only instance (internal_ == nullptr).
++    return RX_OK;
++}
++
++}  // namespace
++
++namespace detail {
++
++uint64_t debugLiveApiObjectCount() { return g_liveApiObjectCount.load(std::memory_order_relaxed); }
++
++}  // namespace detail
++
++extern "C" RxResult rxCreateMaterialSystem(const RxMaterialSystemDesc* desc, IRxMaterialSystem** outSystem) {
++    if (outSystem == nullptr) {
++        return RX_E_INVALIDARG;
++    }
++    *outSystem = nullptr;
++    if (desc == nullptr) {
++        return RX_E_INVALIDARG;
++    }
++    try {
++        auto* internal = static_cast<rx::material::MaterialSystem*>(desc->internalMaterialSystem);
++        *outSystem = new MaterialSystemImpl(internal);
++        return RX_OK;
++    } catch (const std::exception& e) {
++        RX_LOG_ERROR("rx_material: rx_api: rxCreateMaterialSystem failed: {}", e.what());
++        return RX_E_FAIL;
++    }
++}
++
++}  // namespace rx::material
+diff --git a/src/rx_material/include/rx_material/rx_api.h b/src/rx_material/include/rx_material/rx_api.h
+new file mode 100644
+index 0000000..1541561
+--- /dev/null
++++ b/src/rx_material/include/rx_material/rx_api.h
+@@ -0,0 +1,193 @@
++#pragma once
++
++// rx_api.h -- RendererX's public COM-lite ABI surface for rx_material
++// (the first public boundary this codebase ships) [spec Phase 3 design,
++// docs/superpowers/specs/2026-08-10-phase3-render-graph-materials-design.md,
++// D5]. This header is THE boundary: it is self-contained (only <cstdint>),
++// pulls in no rx_*/STL/Vulkan/Slang type, and every symbol below follows
++// the ABI rules D5 derives from the research survey of COM/ISlangUnknown/
++// Diligent/chadaustin.me [R:M§1.3]:
++//   - every interface is 100% pure virtual, single inheritance from
++//     IRxUnknown only (no multiple/virtual inheritance, no data members,
++//     no overloaded method names, no virtual destructor -- release()
++//     plays that role instead);
++//   - no exceptions, no RTTI (dynamic_cast/typeid), no STL type anywhere
++//     in a signature -- errors are RxResult codes, identity/casting is
++//     queryInterface() + GUID comparison;
++//   - allocation and deallocation of anything crossing this boundary
++//     happen on the renderer side only (release() is how a caller gives
++//     memory back, never `delete`/`free`);
++//   - every interface carries its own explicit GUID (kIID_IRx...,
++//     generated with uuidgen, embedded as a literal below);
++//   - every POD struct crossing the boundary is static_assert-pinned
++//     immediately after its definition.
++// This shape mirrors Slang's own `ISlangUnknown` (third_party/slang-
++// prebuilt's include/slang.h) -- the direct in-repo precedent [R:M§1.5] --
++// rather than inventing a new one: same three-method root
++// (queryInterface/addRef/release), same GUID layout (RxGuid below is
++// byte-for-byte SlangUUID's/COM's own GUID shape), same "no COM runtime
++// required" property (queryInterface is a plain virtual call, nothing
++// platform-specific).
++
++#include <cstdint>
++
++// Empty on x64 (the only architecture this project ships:
++// zig-cc-cross-compiled *-windows-gnu and native Linux, both x86_64) --
++// kept as an explicit, named marker on every boundary-crossing virtual
++// method so the calling-convention decision is documented at each call
++// site rather than assumed [R:M§1.3 point 7]. x64 has exactly one ABI-
++// mandated calling convention (Microsoft's own x64 calling convention
++// reference, cited in the design doc's research), so there is nothing
++// for this macro to expand to.
++#define RX_CALL /* empty on x64; kept for documentation of the boundary */
++
++// Status codes crossing the ABI -- never an exception (rule 2 above).
++// Internal C++ exceptions (std::runtime_error, std::out_of_range, ...)
++// thrown by rx_material's internal MaterialSystem are caught at this
++// boundary (api_impl.cpp) and mapped to one of these; RX_E_COMPILE is
++// specifically a material compile/link/reflect failure, with the actual
++// Slang diagnostic text logged via spdlog on the renderer side rather
++// than carried across the boundary as a string (no STL string in a
++// signature -- Phase 3 does not need structured diagnostics on the
++// caller side, per the design doc).
++typedef int32_t RxResult;
++enum : RxResult {
++    RX_OK = 0,
++    RX_E_FAIL = -1,
++    RX_E_INVALIDARG = -2,
++    RX_E_NOTFOUND = -3,
++    RX_E_COMPILE = -4,
++    RX_E_NOINTERFACE = -5,
++};
++
++// Byte-for-byte the same layout as SlangUUID/Win32 GUID (uint32 + uint16
++// + uint16 + 8 bytes) -- deliberate, not incidental: this is the exact
++// shape every COM-lite precedent surveyed for D5 uses, and matching it
++// means this type's bytes are meaningful if ever compared against a
++// real COM/Slang GUID. No padding between members on any ABI this
++// project targets (MSVC, Itanium/GCC/Clang, all agree on this exact
++// field layout at natural alignment) -- pinned below regardless.
++struct RxGuid {
++    uint32_t data1;
++    uint16_t data2;
++    uint16_t data3;
++    uint8_t data4[8];
++};
++static_assert(sizeof(RxGuid) == 16, "RxGuid must stay pinned at 16 bytes -- every consumer on both sides of the "
++                                     "ABI boundary depends on this exact size (D5).");
++static_assert(alignof(RxGuid) == 4, "RxGuid's alignment must stay pinned -- a change here could shift its size via "
++                                     "padding on some ABI.");
++
++// --- IRxUnknown: the COM-lite root every interface below inherits ------
++// Exactly ISlangUnknown's/IUnknown's three-method shape [R:M§1.5]. Every
++// concrete object addRef()'d to 1 at construction (the COM convention:
++// whoever gets the pointer back -- a factory's out-param, or
++// queryInterface()'s out-param -- owns exactly one reference and must
++// release() it). queryInterface() returns the SAME pointer (as
++// IRxUnknown*, or as any other interface pointer this object supports)
++// for every IID a given object answers to -- the COM identity rule --
++// which single inheritance (never multiple) makes automatic: there is
++// only ever one base-IRxUnknown sub-object per concrete instance, so no
++// vtable-thunk pointer adjustment can ever make two queries for the same
++// object disagree.
++struct IRxUnknown {
++    virtual RxResult RX_CALL queryInterface(const RxGuid& iid, void** outObject) = 0;
++    virtual uint32_t RX_CALL addRef() = 0;
++    virtual uint32_t RX_CALL release() = 0;
++};
++static constexpr RxGuid kIID_IRxUnknown = {0x780faed9, 0xc2e3, 0x4fcc, {0xae, 0xe3, 0x79, 0x4a, 0xa4, 0x5d, 0xca, 0xf4}};
++
++// --- IRxTexture: opaque handle wrapping an internal renderer resource --
++// No methods beyond IRxUnknown in Phase 3 -- it exists purely so
++// IRxMaterialInstance::setTexture() below has a real interface-typed
++// parameter to bind against. It always wraps a renderer-owned
++// rhi::Texture2D + bindless-table handle; nothing in Task 6's surface
++// creates one (no rxCreateTexture factory yet) -- a future task adds the
++// creation path once texture loading has its own public surface.
++struct IRxTexture : IRxUnknown {};
++static constexpr RxGuid kIID_IRxTexture = {0x927ce6e7, 0x3fcd, 0x47e8, {0x8b, 0x20, 0xef, 0xdd, 0xc5, 0x32, 0x26, 0xde}};
++
++// --- IRxMaterialInstance: one material's bound-parameter set -----------
++// setFloat/setFloat4/setTexture validate `name` against the owning
++// IRxMaterial's reflected parameter set and the value's shape against
++// that parameter's reflected type:
++//   RX_OK             -- name known, type matches; value stored.
++//   RX_E_NOTFOUND      -- no reflected parameter named `name` on this
++//                         material.
++//   RX_E_INVALIDARG    -- `name`/`value`/`texture` is null, OR `name` is
++//                         a real reflected parameter of a DIFFERENT type
++//                         than this setter binds.
++// Task 6 stores validated values into a CPU-side blob owned by the
++// instance object (never touching a live GPU descriptor); a future task
++// connects that blob to the actual per-instance descriptor set/uniform
++// buffer this parameter block needs at draw time -- see api_impl.cpp's
++// own header comment for the exact handoff.
++struct IRxMaterialInstance : IRxUnknown {
++    virtual RxResult RX_CALL setFloat(const char* name, float value) = 0;
++    virtual RxResult RX_CALL setFloat4(const char* name, const float value[4]) = 0;
++    virtual RxResult RX_CALL setTexture(const char* name, IRxTexture* texture) = 0;
++};
++static constexpr RxGuid kIID_IRxMaterialInstance = {
++    0x36957adc, 0x1777, 0x4093, {0xaa, 0x97, 0x0c, 0x30, 0xc0, 0xb9, 0xc5, 0x75}};
++
++// --- IRxMaterial: one loaded Slang material module ----------------------
++struct IRxMaterial : IRxUnknown {
++    // Allocates a new IRxMaterialInstance bound to this material (renderer-
++    // side allocation, per the boundary rules -- the caller releases it
++    // like any other IRxUnknown). RX_E_INVALIDARG if outInstance is null.
++    virtual RxResult RX_CALL createInstance(IRxMaterialInstance** outInstance) = 0;
++    // The material's own name (its Slang module's file stem). Valid for
++    // this IRxMaterial's own lifetime -- never freed/reallocated out from
++    // under a caller that only holds the returned pointer, no separate
++    // release needed for the string itself.
++    virtual const char* RX_CALL name() = 0;
++};
++static constexpr RxGuid kIID_IRxMaterial = {0xfeed2ffc, 0xac13, 0x40cc, {0x9c, 0x4c, 0x26, 0x90, 0xcb, 0x6a, 0x59, 0xf6}};
++
++// --- IRxMaterialSystem: the entry point into rx_material ----------------
++struct IRxMaterialSystem : IRxUnknown {
++    // Loads the Slang module at `slangModulePath` as a material (see the
++    // internal rx::material::MaterialSystem::loadMaterial() this forwards
++    // to for the full compile/reflect contract). RX_E_INVALIDARG if
++    // `slangModulePath`/`outMaterial` is null; RX_E_COMPILE (diagnostics
++    // logged via spdlog on the renderer side, never thrown across this
++    // boundary) if the module fails to load/compile/link/reflect.
++    virtual RxResult RX_CALL loadMaterial(const char* slangModulePath, IRxMaterial** outMaterial) = 0;
++    // Declared now for GUID/vtable stability; Task 7 wires the actual
++    // hot-reload behavior (watch loaded modules' source files, re-
++    // compile/re-link changed ones, invalidate affected pipeline-cache
++    // entries). Task 6's implementation is a documented no-op that
++    // always returns RX_OK -- see api_impl.cpp's own comment on this
++    // method for why that is this task's explicit, planned sequencing
++    // rather than a stub left unfinished by oversight.
++    virtual RxResult RX_CALL reloadChanged() = 0;
++};
++static constexpr RxGuid kIID_IRxMaterialSystem = {
++    0x8739717f, 0xea0e, 0x4484, {0x82, 0x9e, 0x68, 0x9c, 0x07, 0x06, 0x1b, 0xbc}};
++
++// --- Factory: the in-process bridge into an existing internal system ----
++// The standalone DLL artifact is deferred (D5) -- Phase 3 proves the ABI
++// shape inside the normal static-library build rather than shipping a
++// real rx.dll yet. `internalMaterialSystem` is a bridge pointer to an
++// already-constructed `rx::material::MaterialSystem*`: this boundary
++// treats it as opaque (a `void*`, exactly like the ABI rules require --
++// no rx_material internal type name may appear in this header), and does
++// NOT require it to be non-null. An instance created with a null
++// `internalMaterialSystem` answers queryInterface/addRef/release/
++// reloadChanged normally (none of those touch the internal system) but
++// loadMaterial() on it returns RX_E_FAIL -- a deliberate, defensive
++// design choice that keeps this factory usable for device-free ABI
++// contract testing (queryInterface identity, refcount round-trips) with
++// no real rx::rhi::Device anywhere nearby, never a null-pointer crash.
++struct RxMaterialSystemDesc {
++    void* internalMaterialSystem;  // rx::material::MaterialSystem*, or null (see above)
++};
++static_assert(sizeof(RxMaterialSystemDesc) == sizeof(void*),
++              "RxMaterialSystemDesc must stay exactly one pointer wide -- it is passed by pointer across the ABI "
++              "and a caller may construct it as a plain aggregate on either side.");
++
++// RX_E_INVALIDARG if `desc` or `outSystem` is null. On success,
++// `*outSystem` is a new IRxMaterialSystem with refcount 1 (the caller
++// owns that reference and must release() it); on failure `*outSystem` is
++// set to null.
++extern "C" RxResult rxCreateMaterialSystem(const RxMaterialSystemDesc* desc, IRxMaterialSystem** outSystem);
+diff --git a/src/rx_material/include/rx_material/rx_api_detail.h b/src/rx_material/include/rx_material/rx_api_detail.h
+new file mode 100644
+index 0000000..4691893
+--- /dev/null
++++ b/src/rx_material/include/rx_material/rx_api_detail.h
+@@ -0,0 +1,24 @@
++#pragma once
++// Test-only seam for rx_api.h's COM-lite implementation objects
++// (api_impl.cpp) -- explicitly NOT part of the ABI surface: never
++// included by rx_api.h itself, never crosses the boundary, and names no
++// rx_api.h type. Mirrors material_system.h's own
++// `detail::debugCompileCount()` carve-out (see that header's comment for
++// the same rationale): exposed purely so test_api_contract.cpp's
++// refcount-round-trip case can assert that a COM-lite object is
++// destroyed exactly once when its refcount reaches zero -- there is no
++// other way to observe object lifetime from outside api_impl.cpp's own
++// translation unit (queryInterface/addRef/release only ever report
++// refcounts, never "was delete actually called").
++#include <cstdint>
++
++namespace rx::material::detail {
++
++// Number of live IRxUnknown-rooted API objects (MaterialSystemImpl,
++// MaterialImpl, MaterialInstanceImpl) this process has constructed but
++// not yet destroyed. Incremented in RxUnknownBase's constructor,
++// decremented in its destructor -- i.e. this tracks construction/
++// destruction pairs, not refcounts themselves.
++[[nodiscard]] uint64_t debugLiveApiObjectCount();
++
++}  // namespace rx::material::detail
+diff --git a/src/rx_material/tests/CMakeLists.txt b/src/rx_material/tests/CMakeLists.txt
+index 0e7fbc3..92cbc0e 100644
+--- a/src/rx_material/tests/CMakeLists.txt
++++ b/src/rx_material/tests/CMakeLists.txt
+@@ -1,35 +1,64 @@
+ # Every test_material_system.cpp case builds a real VkDevice-backed
+ # MaterialSystem and ends up calling vkCreateGraphicsPipelines at least
+-# once (getPipeline()) -- there is no device-free half of this library
+-# worth a separate plain-doctest_main target the way rx_graph's Tasks 1-2
+-# compile()/barrier logic had. So, unlike rx_graph's rx_graph_tests/
+-# rx_graph_gpu_tests split, this is the ONE test binary for rx_material,
+-# named rx_material_gpu_tests to both match rx_graph_gpu_tests' own naming
+-# convention and give CI's windows-cross-zig job (no real Vulkan device
+-# under Wine -- .github/workflows/ci.yml) an unambiguous substring to
+-# exclude on, exactly like it already does for rx_rhi_vk*/rx_graph_gpu*.
++# once (getPipeline()) -- there is no device-free half of THAT library's
++# tests worth a separate plain-doctest_main target the way rx_graph's
++# Tasks 1-2 compile()/barrier logic had. So, unlike rx_graph's
++# rx_graph_tests/rx_graph_gpu_tests split, this remained the ONE test
++# binary for rx_material through Task 5, named rx_material_gpu_tests to
++# both match rx_graph_gpu_tests' own naming convention and give CI's
++# windows-cross-zig job (no real Vulkan device under Wine --
++# .github/workflows/ci.yml) an unambiguous substring to exclude on,
++# exactly like it already does for rx_rhi_vk*/rx_graph_gpu*.
+ #
+ # doctest_main.cpp here is the SAME vk-bootstrap-instance-function-cache
+ # warm-up pattern src/rx_rhi_vk/tests/doctest_main.cpp and
+ # src/rx_graph/tests/doctest_main_gpu.cpp both already establish (copied,
+ # not shared, matching those two files' own precedent -- see either one's
+ # header comment for the full defect this avoids: the pinned vk-bootstrap
+ # commit caches instance-level Vulkan function pointers process-wide from
+ # whichever vkb::Instance is built FIRST, forever).
+ add_executable(rx_material_gpu_tests
+     doctest_main.cpp
+     test_material_system.cpp
++    # Task 6: rxCreateMaterialSystem + IRxMaterialSystem::loadMaterial's
++    # happy path against a real VkDevice-backed internal MaterialSystem
++    # (test_unlit.slang/test_textured.slang) -- the ABI's device-free
++    # contract lives in rx_material_tests below; this is the ONE case
++    # this task's tests need a real device for.
++    test_api_factory.cpp
+ )
+ target_link_libraries(rx_material_gpu_tests PRIVATE rx_material rx_rhi_vk rx_platform doctest::doctest)
+ rx_shader_deploy_runtime_libs(rx_material_gpu_tests)
+ 
+ target_compile_definitions(rx_material_gpu_tests PRIVATE
+   RX_MATERIAL_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
+ )
+ 
+ # --validate: same developer/CI-gate opt-in every other GPU-backed test
+ # binary's own ctest registration already documents (rx_graph/tests/
+ # CMakeLists.txt, rx_rhi_vk/tests -- via each TEST_CASE's own
+ # CHECK_FALSE(context.hasValidationErrors())); this binary's own fixtures
+ # build every rx::rhi::Context with enableValidation=true unconditionally.
+ add_test(NAME rx_material_gpu_tests COMMAND rx_material_gpu_tests --validate)
++
++# Task 6 [spec Phase 3 design D5]: rx_api.h's COM-lite ABI contract is the
++# first genuinely device-free surface this library has (queryInterface
++# identity, refcount round-trips, error codes on bad input, header self-
++# containment) -- none of it touches a VkDevice, so this is a plain
++# DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN binary, matching rx_graph_tests' own
++# doctest_main.cpp precedent (src/rx_graph/tests/CMakeLists.txt) rather
++# than rx_material_gpu_tests' vk-bootstrap warm-up main above. Still
++# links (transitively) slang::slang through rx_material -- see
++# CMakeLists.txt one level up for why -- so it still needs
++# rx_shader_deploy_runtime_libs() even though none of its own test cases
++# call into Slang (a device-free IRxMaterialSystem's loadMaterial() fails
++# fast on its null internal pointer before ever touching Slang -- see
++# api_impl.cpp's own loadMaterial()).
++add_executable(rx_material_tests
++    doctest_main_plain.cpp
++    test_api_contract.cpp
++    test_api_header_self_contained.cpp
++)
++target_link_libraries(rx_material_tests PRIVATE rx_material doctest::doctest)
++rx_shader_deploy_runtime_libs(rx_material_tests)
++add_test(NAME rx_material_tests COMMAND rx_material_tests)
+diff --git a/src/rx_material/tests/data/test_textured.slang b/src/rx_material/tests/data/test_textured.slang
+new file mode 100644
+index 0000000..40adad0
+--- /dev/null
++++ b/src/rx_material/tests/data/test_textured.slang
+@@ -0,0 +1,37 @@
++// Third test fixture, added for Task 6's IRxMaterialInstance::setTexture()
++// contract test (test_api_factory.cpp): test_unlit.slang/test_solid.slang
++// only declare a float4 field, so neither can exercise setTexture()'s
++// success path or its IRxTexture addRef()/release() lifetime handling.
++// This module declares a single `uint albedoIndex` field -- this
++// engine's own D8 convention for a bindless texture parameter (a plain
++// data index into the bindless table, never a resource-typed field
++// inside TParams itself -- see material_system.cpp's own comment on
++// gParams). Same shape as test_unlit.slang otherwise (see that file's
++// own header comment for the full per-part rationale, not repeated
++// here).
++import material;
++
++struct TexturedParams {
++    uint albedoIndex;
++};
++
++[[vk::binding(0, 1)]]
++ParameterBlock<TexturedParams> gParams;
++
++struct Textured : IMaterialShader {
++    float4 evaluate(MaterialVertex v) {
++        // Same dead-code-elimination-avoidance rationale as
++        // test_unlit.slang's own Unlit::evaluate() -- every
++        // MaterialVertex field genuinely (if negligibly) read, plus a
++        // non-constant-foldable read of `gParams.albedoIndex` so this
++        // field is not itself optimized away as unused.
++        float4 color = float4(0.0, 0.0, 0.0, 1.0);
++        color.x += v.worldPos.x * 1e-4;
++        color.y += v.normal.y * 1e-4;
++        color.z += v.uv.x * 1e-4;
++        color.w += float(gParams.albedoIndex) * 1e-4;
++        return color;
++    }
++};
++
++export struct MaterialImpl : IMaterialShader = Textured;
+diff --git a/src/rx_material/tests/doctest_main_plain.cpp b/src/rx_material/tests/doctest_main_plain.cpp
+new file mode 100644
+index 0000000..c2195d1
+--- /dev/null
++++ b/src/rx_material/tests/doctest_main_plain.cpp
+@@ -0,0 +1,9 @@
++// Device-free -- no rx::platform::Window, no VkSurfaceKHR, no vk-bootstrap
++// instance -- unlike rx_material_gpu_tests' doctest_main.cpp, this binary
++// needs no warm-up before its first TEST_CASE runs, so this is the plain
++// DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN translation unit rx_graph_tests'
++// own doctest_main.cpp establishes (copied, not shared, matching that
++// file's own precedent). Task 6's rx_api.h ABI contract tests
++// (test_api_contract.cpp, test_api_header_self_contained.cpp) only.
++#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
++#include <doctest/doctest.h>
+diff --git a/src/rx_material/tests/test_api_contract.cpp b/src/rx_material/tests/test_api_contract.cpp
+new file mode 100644
+index 0000000..fe91417
+--- /dev/null
++++ b/src/rx_material/tests/test_api_contract.cpp
+@@ -0,0 +1,140 @@
++// Device-free COM-lite ABI contract tests for rx_api.h [Task 6, spec
++// Phase 3 design D5]. None of these touch a VkDevice: every case here
++// exercises queryInterface/addRef/release/reloadChanged on an
++// IRxMaterialSystem created via rxCreateMaterialSystem with a
++// deliberately null `internalMaterialSystem` -- a legal, documented
++// state per rx_api.h's own comment on RxMaterialSystemDesc, since none
++// of those four methods ever touch the internal pointer. Only
++// loadMaterial() needs a real internal MaterialSystem (a real VkDevice),
++// which is exactly why its happy path lives in test_api_factory.cpp
++// (rx_material_gpu_tests) instead -- this file only checks that calling
++// it on a device-free instance fails safely (RX_E_FAIL), never crashes.
++#include <doctest/doctest.h>
++#include <rx_material/rx_api.h>
++#include <rx_material/rx_api_detail.h>
++
++#include <cstdint>
++
++// Re-pinned here (not just in rx_api.h) so this contract test file
++// itself exercises the exact sizes a real consumer would depend on --
++// mirrors test_api_header_self_contained.cpp's identical pair, kept
++// here too per this task's own test-list wording.
++static_assert(sizeof(RxGuid) == 16);
++static_assert(sizeof(RxMaterialSystemDesc) == sizeof(void*));
++
++namespace {
++
++// A fresh, device-free IRxMaterialSystem -- `internalMaterialSystem`
++// is deliberately null; see this file's own header comment for why
++// that is a legal state for every method these contract tests call.
++IRxMaterialSystem* makeDeviceFreeSystem() {
++    RxMaterialSystemDesc desc{nullptr};
++    IRxMaterialSystem* system = nullptr;
++    REQUIRE(rxCreateMaterialSystem(&desc, &system) == RX_OK);
++    REQUIRE(system != nullptr);
++    return system;
++}
++
++}  // namespace
++
++TEST_CASE("rxCreateMaterialSystem rejects null desc/outSystem with RX_E_INVALIDARG") {
++    IRxMaterialSystem* system = nullptr;
++    CHECK(rxCreateMaterialSystem(nullptr, &system) == RX_E_INVALIDARG);
++    CHECK(system == nullptr);
++
++    RxMaterialSystemDesc desc{nullptr};
++    CHECK(rxCreateMaterialSystem(&desc, nullptr) == RX_E_INVALIDARG);
++
++    CHECK(rxCreateMaterialSystem(nullptr, nullptr) == RX_E_INVALIDARG);
++}
++
++TEST_CASE("rxCreateMaterialSystem with a null internalMaterialSystem still succeeds (device-free instance)") {
++    IRxMaterialSystem* system = makeDeviceFreeSystem();
++    system->release();
++}
++
++TEST_CASE("queryInterface null out-param returns RX_E_INVALIDARG") {
++    IRxMaterialSystem* system = makeDeviceFreeSystem();
++    CHECK(system->queryInterface(kIID_IRxUnknown, nullptr) == RX_E_INVALIDARG);
++    system->release();
++}
++
++TEST_CASE("queryInterface with an unrelated IID returns RX_E_NOINTERFACE and nulls the out-param") {
++    IRxMaterialSystem* system = makeDeviceFreeSystem();
++
++    // Poisoned before the call -- queryInterface must overwrite it to
++    // null on the RX_E_NOINTERFACE path, not leave it untouched.
++    void* out = reinterpret_cast<void*>(static_cast<uintptr_t>(0x1));
++    RxResult result = system->queryInterface(kIID_IRxMaterial, &out);
++    CHECK(result == RX_E_NOINTERFACE);
++    CHECK(out == nullptr);
++
++    system->release();
++}
++
++TEST_CASE("queryInterface identity: IRxUnknown and the object's own interface resolve to the SAME pointer") {
++    IRxMaterialSystem* system = makeDeviceFreeSystem();
++
++    void* asUnknown = nullptr;
++    REQUIRE(system->queryInterface(kIID_IRxUnknown, &asUnknown) == RX_OK);
++    REQUIRE(asUnknown != nullptr);
++
++    void* asMaterialSystem = nullptr;
++    REQUIRE(system->queryInterface(kIID_IRxMaterialSystem, &asMaterialSystem) == RX_OK);
++    REQUIRE(asMaterialSystem != nullptr);
++
++    // The COM identity rule [R:M§1.5]: the SAME object answers both
++    // queries with the SAME pointer value, regardless of which IID was
++    // asked for -- guaranteed here by single inheritance (there is only
++    // ever one IRxUnknown sub-object per concrete instance).
++    CHECK(asUnknown == asMaterialSystem);
++
++    static_cast<IRxUnknown*>(asUnknown)->release();
++    static_cast<IRxUnknown*>(asMaterialSystem)->release();
++    system->release();
++}
++
++TEST_CASE("refcount round-trip: addRef/release destroys the object exactly once, verified via the live-object "
++          "counter") {
++    uint64_t before = rx::material::detail::debugLiveApiObjectCount();
++
++    IRxMaterialSystem* system = makeDeviceFreeSystem();
++    CHECK(rx::material::detail::debugLiveApiObjectCount() == before + 1);
++
++    CHECK(system->addRef() == 2);
++    CHECK(rx::material::detail::debugLiveApiObjectCount() == before + 1);  // addRef never constructs a new object
++
++    CHECK(system->release() == 1);
++    CHECK(rx::material::detail::debugLiveApiObjectCount() == before + 1);  // still alive: one ref remains
++
++    CHECK(system->release() == 0);
++    CHECK(rx::material::detail::debugLiveApiObjectCount() == before);  // destroyed exactly once
++}
++
++TEST_CASE("loadMaterial on a device-free IRxMaterialSystem fails safely (RX_E_FAIL), never crashes") {
++    IRxMaterialSystem* system = makeDeviceFreeSystem();
++
++    IRxMaterial* material = reinterpret_cast<IRxMaterial*>(static_cast<uintptr_t>(0x1));  // poisoned
++    RxResult result = system->loadMaterial("does/not/matter.slang", &material);
++    CHECK(result == RX_E_FAIL);
++    CHECK(material == nullptr);
++
++    system->release();
++}
++
++TEST_CASE("loadMaterial rejects null slangModulePath/outMaterial with RX_E_INVALIDARG before touching internal "
++          "state") {
++    IRxMaterialSystem* system = makeDeviceFreeSystem();
++
++    IRxMaterial* material = nullptr;
++    CHECK(system->loadMaterial(nullptr, &material) == RX_E_INVALIDARG);
++    CHECK(system->loadMaterial("does/not/matter.slang", nullptr) == RX_E_INVALIDARG);
++
++    system->release();
++}
++
++TEST_CASE("reloadChanged is a documented Task 6 no-op that always returns RX_OK (Task 7 wires the real behavior)") {
++    IRxMaterialSystem* system = makeDeviceFreeSystem();
++    CHECK(system->reloadChanged() == RX_OK);
++    system->release();
++}
+diff --git a/src/rx_material/tests/test_api_factory.cpp b/src/rx_material/tests/test_api_factory.cpp
+new file mode 100644
+index 0000000..db275d2
+--- /dev/null
++++ b/src/rx_material/tests/test_api_factory.cpp
+@@ -0,0 +1,277 @@
++// Task 6, spec Phase 3 design D5: rxCreateMaterialSystem() +
++// IRxMaterialSystem::loadMaterial()'s happy path against a REAL VkDevice-
++// backed internal rx::material::MaterialSystem, plus
++// IRxMaterialInstance::setFloat/setFloat4/setTexture's validation
++// contract (name exists in the material's reflected parameters, type
++// matches) exercised against real reflected data from test_unlit.slang
++// (a `float4 tint`) and test_textured.slang (a `uint albedoIndex` --
++// this engine's D8 bindless-index convention). The device-free half of
++// this ABI's contract (queryInterface identity, refcount round-trips,
++// error codes on malformed input) lives in test_api_contract.cpp
++// (rx_material_tests) instead -- see that file's own header comment.
++#include <doctest/doctest.h>
++#include <rx_material/material_system.h>
++#include <rx_material/rx_api.h>
++#include <rx_platform/window.h>
++#include <rx_rhi_vk/bindless.h>
++#include <rx_rhi_vk/context.h>
++#include <rx_rhi_vk/device.h>
++
++#include <algorithm>
++#include <cstdint>
++#include <filesystem>
++#include <optional>
++#include <string>
++#include <utility>
++
++// RX_MATERIAL_TEST_DATA_DIR -- see test_material_system.cpp's own
++// comment; identical convention, this file's own copy of the same tiny
++// helper (matching that file's own precedent of not sharing private
++// per-test-binary helpers across translation units).
++
++namespace {
++
++std::filesystem::path testDataPath(const char* filename) {
++    return std::filesystem::path(RX_MATERIAL_TEST_DATA_DIR) / filename;
++}
++
++// Identical fixture shape to test_material_system.cpp's own
++// MaterialTestFixture/makeFixture() -- duplicated, not shared, matching
++// that file's own precedent (see its comment) rather than reaching into
++// another test binary's private helpers.
++struct ApiTestFixture {
++    rx::platform::Window window;
++    rx::rhi::Context context;
++    VkSurfaceKHR surface = VK_NULL_HANDLE;
++    rx::rhi::Device device;
++    rx::rhi::BindlessTable bindless;
++};
++
++std::optional<ApiTestFixture> makeFixture(const char* title) {
++    auto window = rx::platform::Window::create(title, 64, 64, /*visible=*/false);
++    if (!window.has_value()) {
++        MESSAGE("no display backend available, skipping rx_api test");
++        return std::nullopt;
++    }
++
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        MESSAGE("video driver reports no Vulkan surface extensions (e.g. dummy driver), skipping rx_api test");
++        return std::nullopt;
++    }
++
++    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++
++    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
++    REQUIRE(surface != VK_NULL_HANDLE);
++
++    auto device = rx::rhi::Device::create(*context, surface);
++    REQUIRE(device.has_value());
++
++    rx::rhi::BindlessTable::Capacities capacities;
++    capacities.sampledImages = 4;
++    capacities.samplers = 2;
++    capacities.storageBuffers = 1;
++    auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
++    REQUIRE(bindless.has_value());
++
++    return ApiTestFixture{std::move(*window), std::move(*context), surface, std::move(*device),
++                            std::move(*bindless)};
++}
++
++std::filesystem::path freshCachePath(const char* name) {
++    std::filesystem::path path =
++        std::filesystem::temp_directory_path() / (std::string("rx_material_api_test_") + name + ".cache");
++    std::error_code ec;
++    std::filesystem::remove(path, ec);
++    return path;
++}
++
++// Minimal IRxTexture test double [Task 6] -- proves
++// IRxMaterialInstance::setTexture()'s addRef()/release() lifetime
++// handling (it stores the pointer with one added reference, releases
++// any previously stored one on overwrite, and releases whatever is
++// still stored when the instance itself is destroyed) without needing a
++// real renderer-owned texture: nothing in Task 6's own surface creates a
++// real IRxTexture yet (no rxCreateTexture factory -- see rx_api.h's own
++// comment on IRxTexture), so a hand-rolled double is the only way to
++// exercise this path at all before that exists. This is a TEST-ONLY
++// implementation of a COM-lite interface from outside api_impl.cpp --
++// legal per the ABI shape itself (any binary can implement a pure-
++// virtual interface), but not a claim that third-party IRxTexture
++// implementations are a supported Task 6 use case.
++class FakeTexture final : public IRxTexture {
++public:
++    RxResult queryInterface(const RxGuid& iid, void** outObject) override {
++        if (outObject == nullptr) {
++            return RX_E_INVALIDARG;
++        }
++        if (guidEquals(iid, kIID_IRxUnknown) || guidEquals(iid, kIID_IRxTexture)) {
++            addRef();
++            *outObject = static_cast<IRxTexture*>(this);
++            return RX_OK;
++        }
++        *outObject = nullptr;
++        return RX_E_NOINTERFACE;
++    }
++    uint32_t addRef() override { return ++refCount_; }
++    uint32_t release() override {
++        uint32_t remaining = --refCount_;
++        if (remaining == 0) {
++            delete this;
++        }
++        return remaining;
++    }
++
++    [[nodiscard]] uint32_t refCount() const { return refCount_; }
++
++private:
++    static bool guidEquals(const RxGuid& a, const RxGuid& b) {
++        return a.data1 == b.data1 && a.data2 == b.data2 && a.data3 == b.data3 &&
++               std::equal(std::begin(a.data4), std::end(a.data4), std::begin(b.data4));
++    }
++
++    uint32_t refCount_ = 1;
++};
++
++}  // namespace
++
++TEST_CASE("rxCreateMaterialSystem + loadMaterial: happy path against a real device, IRxMaterialInstance validates "
++          "reflected float4 params") {
++    auto fixture = makeFixture("rx_api_factory_happy_path");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto internal =
++        rx::material::MaterialSystem::create(fixture->device, fixture->bindless, freshCachePath("api_happy_path"));
++    REQUIRE(internal != nullptr);
++
++    RxMaterialSystemDesc desc{internal.get()};
++    IRxMaterialSystem* system = nullptr;
++    REQUIRE(rxCreateMaterialSystem(&desc, &system) == RX_OK);
++    REQUIRE(system != nullptr);
++
++    IRxMaterial* material = nullptr;
++    std::string unlitPath = testDataPath("test_unlit.slang").string();
++    REQUIRE(system->loadMaterial(unlitPath.c_str(), &material) == RX_OK);
++    REQUIRE(material != nullptr);
++    CHECK(std::string(material->name()) == "test_unlit");
++
++    IRxMaterialInstance* instance = nullptr;
++    REQUIRE(material->createInstance(&instance) == RX_OK);
++    REQUIRE(instance != nullptr);
++
++    // Real reflected field: `tint` is a `float4` in test_unlit.slang.
++    float tint[4] = {1.0F, 0.5F, 0.25F, 1.0F};
++    CHECK(instance->setFloat4("tint", tint) == RX_OK);
++
++    // Same real field, wrong setter -- type mismatch, not "unknown".
++    CHECK(instance->setFloat("tint", 1.0F) == RX_E_INVALIDARG);
++    FakeTexture* wrongTypeTexture = new FakeTexture();
++    CHECK(instance->setTexture("tint", wrongTypeTexture) == RX_E_INVALIDARG);
++    wrongTypeTexture->release();
++
++    // No such parameter on this material at all.
++    CHECK(instance->setFloat("nonexistent", 1.0F) == RX_E_NOTFOUND);
++    float bogus[4] = {0, 0, 0, 0};
++    CHECK(instance->setFloat4("nonexistent", bogus) == RX_E_NOTFOUND);
++    FakeTexture* notFoundTexture = new FakeTexture();
++    CHECK(instance->setTexture("nonexistent", notFoundTexture) == RX_E_NOTFOUND);
++    notFoundTexture->release();
++
++    // Null-argument validation.
++    CHECK(instance->setFloat(nullptr, 1.0F) == RX_E_INVALIDARG);
++    CHECK(instance->setFloat4("tint", nullptr) == RX_E_INVALIDARG);
++    CHECK(instance->setTexture("tint", nullptr) == RX_E_INVALIDARG);
++
++    // queryInterface identity, one level down the object graph too.
++    void* instanceAsUnknown = nullptr;
++    REQUIRE(instance->queryInterface(kIID_IRxUnknown, &instanceAsUnknown) == RX_OK);
++    void* instanceAsInstance = nullptr;
++    REQUIRE(instance->queryInterface(kIID_IRxMaterialInstance, &instanceAsInstance) == RX_OK);
++    CHECK(instanceAsUnknown == instanceAsInstance);
++    static_cast<IRxUnknown*>(instanceAsUnknown)->release();
++    static_cast<IRxUnknown*>(instanceAsInstance)->release();
++
++    instance->release();
++    material->release();
++    system->release();
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("IRxMaterialInstance::setTexture validates a real bindless-index (uint) parameter and manages the "
++          "IRxTexture reference it stores") {
++    auto fixture = makeFixture("rx_api_factory_texture_param");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto internal = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
++                                                            freshCachePath("api_texture_param"));
++    REQUIRE(internal != nullptr);
++
++    RxMaterialSystemDesc desc{internal.get()};
++    IRxMaterialSystem* system = nullptr;
++    REQUIRE(rxCreateMaterialSystem(&desc, &system) == RX_OK);
++
++    IRxMaterial* material = nullptr;
++    std::string texturedPath = testDataPath("test_textured.slang").string();
++    REQUIRE(system->loadMaterial(texturedPath.c_str(), &material) == RX_OK);
++    REQUIRE(material != nullptr);
++
++    IRxMaterialInstance* instance = nullptr;
++    REQUIRE(material->createInstance(&instance) == RX_OK);
++
++    // Wrong setter for a real uint (bindless-index) field -- type
++    // mismatch.
++    CHECK(instance->setFloat("albedoIndex", 1.0F) == RX_E_INVALIDARG);
++
++    auto* first = new FakeTexture();
++    CHECK(first->refCount() == 1);
++    REQUIRE(instance->setTexture("albedoIndex", first) == RX_OK);
++    CHECK(first->refCount() == 2);  // instance now holds its own reference too
++
++    // Overwriting the same parameter releases the previously stored
++    // texture and addRef()s the new one.
++    auto* second = new FakeTexture();
++    REQUIRE(instance->setTexture("albedoIndex", second) == RX_OK);
++    CHECK(first->refCount() == 1);   // instance's reference on `first` was released
++    CHECK(second->refCount() == 2);  // instance now holds a reference on `second`
++
++    first->release();  // drop the caller's own ref -- `first` is fully destroyed now.
++
++    // Destroying the instance releases whatever it still holds
++    // (`second`) exactly once.
++    instance->release();
++    CHECK(second->refCount() == 1);  // only the caller's own ref remains
++    second->release();
++
++    material->release();
++    system->release();
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("loadMaterial maps a real Slang compile failure to RX_E_COMPILE, never throws across the boundary") {
++    auto fixture = makeFixture("rx_api_factory_bad_module");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto internal = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
++                                                            freshCachePath("api_bad_module"));
++    REQUIRE(internal != nullptr);
++
++    RxMaterialSystemDesc desc{internal.get()};
++    IRxMaterialSystem* system = nullptr;
++    REQUIRE(rxCreateMaterialSystem(&desc, &system) == RX_OK);
++
++    IRxMaterial* material = reinterpret_cast<IRxMaterial*>(static_cast<uintptr_t>(0x1));  // poisoned
++    std::string badPath = testDataPath("test_bad_syntax.slang").string();
++    CHECK(system->loadMaterial(badPath.c_str(), &material) == RX_E_COMPILE);
++    CHECK(material == nullptr);
++
++    system->release();
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/src/rx_material/tests/test_api_header_self_contained.cpp b/src/rx_material/tests/test_api_header_self_contained.cpp
+new file mode 100644
+index 0000000..b28bb4d
+--- /dev/null
++++ b/src/rx_material/tests/test_api_header_self_contained.cpp
+@@ -0,0 +1,45 @@
++// rx_api.h self-containment proof [Task 6, spec Phase 3 design D5, R:M
++// §1.3 point 4]: this translation unit includes NOTHING else -- not
++// <doctest/doctest.h>, not any rx_*/STL/Vulkan/Slang header. See rx_api.h's
++// own top comment for the ABI rule this pins: the boundary header must be
++// usable by a consumer that links against nothing this codebase itself
++// depends on. A bug that made rx_api.h implicitly rely on some OTHER
++// header having been included first (a std:: type used without the
++// header that declares it, say) would fail to compile HERE even though
++// it might accidentally keep compiling in every other .cpp in this test
++// binary (which all include <doctest/doctest.h> and other headers
++// first, silently supplying whatever was missing). Successful
++// compilation of this one file into an object IS the test; there is
++// nothing further to assert at runtime, so it deliberately contributes
++// no TEST_CASE and needs no doctest include of its own.
++#include <rx_material/rx_api.h>
++
++static_assert(sizeof(RxGuid) == 16, "rx_api.h's own pinned RxGuid size -- re-checked here so this self-containment "
++                                     "TU actually exercises the type, not just names it");
++static_assert(sizeof(RxMaterialSystemDesc) == sizeof(void*),
++              "rx_api.h's own pinned RxMaterialSystemDesc size -- re-checked here for the same reason");
++
++namespace {
++
++// Naming every declared symbol once (interfaces, GUIDs, the struct, the
++// factory) so this file's only job -- proving the header ALONE is
++// sufficient to name everything it declares -- cannot be quietly
++// defeated by an otherwise-unreferenced declaration being subtly wrong
++// in a way only a real consumer would ever hit (e.g. a typo'd type in a
++// method no test elsewhere calls).
++using UnknownPtr = IRxUnknown*;
++using TexturePtr = IRxTexture*;
++using MaterialInstancePtr = IRxMaterialInstance*;
++using MaterialPtr = IRxMaterial*;
++using MaterialSystemPtr = IRxMaterialSystem*;
++
++[[maybe_unused]] const RxGuid& kUnknownGuidRef = kIID_IRxUnknown;
++[[maybe_unused]] const RxGuid& kTextureGuidRef = kIID_IRxTexture;
++[[maybe_unused]] const RxGuid& kMaterialInstanceGuidRef = kIID_IRxMaterialInstance;
++[[maybe_unused]] const RxGuid& kMaterialGuidRef = kIID_IRxMaterial;
++[[maybe_unused]] const RxGuid& kMaterialSystemGuidRef = kIID_IRxMaterialSystem;
++
++using FactoryFn = RxResult (*)(const RxMaterialSystemDesc*, IRxMaterialSystem**);
++[[maybe_unused]] constexpr FactoryFn kFactory = &rxCreateMaterialSystem;
++
++}  // namespace

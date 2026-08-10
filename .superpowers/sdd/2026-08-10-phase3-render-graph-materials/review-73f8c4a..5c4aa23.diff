@@ -1,0 +1,690 @@
+# Review package: 73f8c4a..5c4aa23
+
+## Commits
+5c4aa23 fix: throw on wrong-kind resource names in remaining PassContext resolvers
+980031f fix: union cross-frame stage tracking, harden PassContext, exclude rx_graph_gpu_tests from windows-cross CI
+
+## Files changed
+ .github/workflows/ci.yml                 |  12 ++--
+ src/rx_graph/executor.cpp                |  79 +++++++++++++++++++++--
+ src/rx_graph/include/rx_graph/executor.h |  50 ++++++++++++++-
+ src/rx_graph/include/rx_graph/pass.h     |  32 ++++++++--
+ src/rx_graph/tests/test_execute_gpu.cpp  | 106 ++++++++++++++++++++++++++++++-
+ src/rx_graph/transient_pool.cpp          |  18 +++++-
+ src/rx_graph/transient_pool.h            |  10 ++-
+ 7 files changed, 281 insertions(+), 26 deletions(-)
+
+## Diff
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index bbdb6fb..1a23201 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -248,40 +248,42 @@ jobs:
+ 
+       - name: Configure
+         run: cmake --preset windows-cross-zig
+ 
+       - name: Build
+         run: cmake --build --preset windows-cross-zig
+ 
+       - name: Wine toolchain smoke check
+         run: wine build/windows-cross-zig/tools/toolchain_check/toolchain_check.exe
+ 
+-      # rx_rhi_vk (GPU-backed) and every sample_*_headless gate are excluded:
+-      # Wine in CI has no real Vulkan device to hand them, and that is a
+-      # real, documented environment limitation -- not a silent pass.
+-      # rx_core, rx_platform, shader_spirv_test, AND rx_shader_tests all run
++      # rx_rhi_vk (GPU-backed), rx_graph_gpu_tests (Task 3's Executor GPU
++      # tests -- same GPU-backed reason as rx_rhi_vk_tests, added when that
++      # target was introduced), and every sample_*_headless gate are
++      # excluded: Wine in CI has no real Vulkan device to hand them, and
++      # that is a real, documented environment limitation -- not a silent
++      # pass. rx_core, rx_platform, shader_spirv_test, AND rx_shader_tests all run
+       # for real under Wine and are NOT excluded here -- rx_shader_tests
+       # does real in-process Slang compilation (slang::createGlobalSession
+       # etc.) via the MSVC-built slang-compiler.dll cross-linked through
+       # zig/LLD [R:A6/D2], which needs no GPU at all (SPIR-V codegen is pure
+       # CPU work), and this was investigated rather than assumed: Task 1
+       # verified directly that Slang's Windows DLLs (slang-compiler.dll +
+       # its slang-glslang/slang-glsl-module/slang-rt plugins) load correctly
+       # under Wine and the full compiler test suite passes there -- this CI
+       # run is what proves that holds on the actual GitHub Actions runner,
+       # not just the development machine that first checked it.
+       # rx_platform's window tests hit their own existing skip guards
+       # gracefully when Wine's video backend can't produce Vulkan surface
+       # extensions, exactly as they do on any other display-less machine.
+       - name: Test under wine (xvfb; GPU tests excluded -- no Vulkan under Wine)
+         run: >-
+-          xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|sample' --output-on-failure
++          xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|sample' --output-on-failure
+           --output-junit ${{ github.workspace }}/ctest-results-windows-cross-zig.xml
+ 
+       - name: Build budget check
+         run: tools/check_build_budget.sh windows-cross-zig 60
+ 
+       # Same packaging mechanism as the linux-native job -- see
+       # tools/package_samples.sh and that job's identically-worded comment
+       # above its own packaging step for the full per-sample manifest.
+       - name: Package samples for redistribution
+         run: tools/package_samples.sh windows-cross-zig windows-x86_64 rendererx-samples-windows-x86_64.zip
+diff --git a/src/rx_graph/executor.cpp b/src/rx_graph/executor.cpp
+index 1bbf1b0..866e762 100644
+--- a/src/rx_graph/executor.cpp
++++ b/src/rx_graph/executor.cpp
+@@ -540,35 +540,55 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
+             VkRenderingInfo renderingInfo{};
+             renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+             renderingInfo.renderArea = VkRect2D{{0, 0}, renderArea};
+             renderingInfo.layerCount = 1;
+             renderingInfo.colorAttachmentCount = static_cast<uint32_t>(colorAttachments.size());
+             renderingInfo.pColorAttachments = colorAttachments.empty() ? nullptr : colorAttachments.data();
+             renderingInfo.pDepthAttachment = depthPhysIdx.has_value() ? &depthAttachment : nullptr;
+             vkCmdBeginRendering(cmd, &renderingInfo);
+         }
+ 
+-        PassContext ctx;
++        PassContext ctx(*this);
+         ctx.cmd = cmd;
+         ctx.renderArea = renderArea;
+-        ctx.executor_ = this;
+         pass.invokeExecute(ctx);
+ 
+         if (isGraphicsPass) {
+             vkCmdEndRendering(cmd);
+         }
+ 
+         endDebugLabel(impl, cmd);
+ 
++        // [Fix round 1, Critical finding]: UNION every pass's stage into
++        // this resource's running total for the whole execute() call --
++        // NOT an overwrite. PhysicalResource::lastUsePass names only the
++        // single highest-position touching pass, but a resource can
++        // legitimately have several passes tied for "last" in the sense
++        // that matters here: several readers of the same write, at
++        // different pipeline stages, with no intervening write between
++        // any of them (e.g. a shadow map sampled by both a lighting pass
++        // and a debug-overlay pass). Every one of those readers' work must
++        // still be waited on by next call's first-use-of-frame override
++        // (see applyBarriers()) -- an overwrite silently drops every
++        // reader but the last one processed, which reproduced as a real,
++        // empirically-verified write-after-read hazard (see
++        // task-3-review.md's Critical finding and task-3-report.md's fix-
++        // round section). Carrying the union forward is always safe (only
++        // ever adds extra, conservative wait scope) -- a subsequent WRITE
++        // within the SAME execute() call already correctly waits on every
++        // reader via Task 2's own invalidatedStagesUnion-based WAR barrier,
++        // so there is no case where accumulating instead of resetting on a
++        // write causes an actual over-synchronization problem worth
++        // special-casing.
+         for (const auto& [physIdx, combined] : combineAccessesByResource(accesses)) {
+             if (!impl.resources.at(physIdx).isBackbuffer) {
+-                finalStageThisExecute[physIdx] = combined.stages;
++                finalStageThisExecute[physIdx] |= combined.stages;
+             }
+         }
+     }
+ 
+     applyBarriers(impl, compiled, cmd, compiled.finalBarriers(), firstBarrierSeen);
+ 
+     // Task 3 ambiguity resolution #2: record what stage each pooled
+     // resource this call actually touched was left at, so the NEXT
+     // execute() call's first-use-of-frame override (applyBarriers() above)
+     // chains off the real value instead of staying pinned at
+@@ -588,34 +608,79 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
+ namespace {
+ 
+ uint32_t lookupResolvedIndex(const Executor::Impl& impl, std::string_view name) {
+     auto it = impl.nameToIndex.find(std::string(name));
+     if (it == impl.nameToIndex.end()) {
+         throw std::out_of_range("rx_graph: PassContext: no realized resource named '" + std::string(name) + "'");
+     }
+     return it->second;
+ }
+ 
++// [Fix round 1, Minor finding + its supplemental follow-up]: a resolved
++// resource's image-only fields (view/image/format) are never set to
++// anything but their defaults (VK_NULL_HANDLE/VK_FORMAT_UNDEFINED) for a
++// buffer resource, and vice versa for `buffer` on an image resource --
++// returning one of those silently for a legitimately-registered but
++// wrong-kind name is a meaningless value, not an error a caller could ever
++// act on correctly. Every one of PassContext's four resolvers throws the
++// same way every other "not resolvable" case documented on that class
++// does (naming both the resource and its actual kind) rather than
++// special-casing any one path to succeed with garbage.
++void requireKind(std::string_view name, const ResolvedResource& resolved, bool expectBuffer,
++                  std::string_view resolverName) {
++    if (resolved.isBuffer != expectBuffer) {
++        throw std::out_of_range("rx_graph: PassContext::" + std::string(resolverName) + "(): '" + std::string(name) +
++                                 "' is a " + (resolved.isBuffer ? "buffer" : "image") + " resource, not " +
++                                 (expectBuffer ? "a buffer" : "an image"));
++    }
++}
++
+ }  // namespace
+ 
+ VkImageView Executor::resolveImageView(std::string_view name) const {
+-    return impl_->resources.at(lookupResolvedIndex(*impl_, name)).view;
++    const uint32_t idx = lookupResolvedIndex(*impl_, name);
++    const ResolvedResource& resolved = impl_->resources.at(idx);
++    requireKind(name, resolved, /*expectBuffer=*/false, "imageView");
++    return resolved.view;
+ }
+ 
+ VkImage Executor::resolveImage(std::string_view name) const {
+-    return impl_->resources.at(lookupResolvedIndex(*impl_, name)).image;
++    const uint32_t idx = lookupResolvedIndex(*impl_, name);
++    const ResolvedResource& resolved = impl_->resources.at(idx);
++    requireKind(name, resolved, /*expectBuffer=*/false, "image");
++    return resolved.image;
+ }
+ 
+ VkBuffer Executor::resolveBuffer(std::string_view name) const {
+-    return impl_->resources.at(lookupResolvedIndex(*impl_, name)).buffer;
++    const uint32_t idx = lookupResolvedIndex(*impl_, name);
++    const ResolvedResource& resolved = impl_->resources.at(idx);
++    requireKind(name, resolved, /*expectBuffer=*/true, "buffer");
++    return resolved.buffer;
+ }
+ 
+ VkFormat Executor::resolveImageFormat(std::string_view name) const {
+-    return impl_->resources.at(lookupResolvedIndex(*impl_, name)).format;
++    const uint32_t idx = lookupResolvedIndex(*impl_, name);
++    const ResolvedResource& resolved = impl_->resources.at(idx);
++    requireKind(name, resolved, /*expectBuffer=*/false, "imageFormat");
++    return resolved.format;
+ }
+ 
+ VkImageView PassContext::imageView(std::string_view name) const { return executor_->resolveImageView(name); }
+ VkImage PassContext::image(std::string_view name) const { return executor_->resolveImage(name); }
+ VkBuffer PassContext::buffer(std::string_view name) const { return executor_->resolveBuffer(name); }
+ VkFormat PassContext::imageFormat(std::string_view name) const { return executor_->resolveImageFormat(name); }
+ 
++namespace detail {
++
++VkPipelineStageFlags2 debugLastFrameFinalStages(const Executor& executor, std::string_view name) {
++    const Executor::Impl& impl = *executor.impl_;
++    const uint32_t idx = lookupResolvedIndex(impl, name);
++    const ResolvedResource& resolved = impl.resources.at(idx);
++    if (resolved.isBuffer) {
++        return impl.pool.buffer(resolved.poolIndex).lastFrameFinalStages;
++    }
++    return impl.pool.image(resolved.poolIndex).lastFrameFinalStages;
++}
++
++}  // namespace detail
++
+ }  // namespace rx::graph
+diff --git a/src/rx_graph/include/rx_graph/executor.h b/src/rx_graph/include/rx_graph/executor.h
+index 2980219..b672b5d 100644
+--- a/src/rx_graph/include/rx_graph/executor.h
++++ b/src/rx_graph/include/rx_graph/executor.h
+@@ -18,20 +18,39 @@
+ #include <string_view>
+ 
+ namespace rx::rhi {
+ class Device;
+ }  // namespace rx::rhi
+ 
+ namespace rx::graph {
+ 
+ class Executor;
+ 
++namespace detail {
++
++// Test/debug-only seam -- NOT part of the stable public contract, exactly
++// the same carve-out convention barriers.h's own `detail::` namespace
++// already establishes ("exposed only so barriers.cpp's own unit tests and
++// Task 3's executor can drive the per-resource state machine directly").
++// Returns whatever `executor` currently has tracked as `name`'s pooled
++// entry's lastFrameFinalStages (Task 3 ambiguity resolution #2's cross-
++// frame carry-forward value -- see transient_pool.h's PooledImage/
++// PooledBuffer::lastFrameFinalStages) -- added [Fix round 1, Critical
++// finding] because this codebase enables no Vulkan synchronization
++// validation anywhere (see rx_rhi_vk/context.cpp), so no --validate run
++// could ever catch a wrong value here on its own; a test needs to observe
++// it directly instead. Throws std::out_of_range under the same conditions
++// PassContext's own resolvers do (see that class's comment).
++[[nodiscard]] VkPipelineStageFlags2 debugLastFrameFinalStages(const Executor& executor, std::string_view name);
++
++}  // namespace detail
++
+ // The device-side handle Executor::execute() hands to a pass's recorded
+ // execute() callback (pass.h's Pass::setExecute), once that pass's turn
+ // comes up in CompiledGraph::executionOrder(). This is the complete
+ // definition pass.h's own forward declaration anticipates -- see that
+ // header's comment on class PassContext.
+ //
+ // `cmd`/`renderArea` are plain public data (not accessors) because every
+ // pass callback needs both unconditionally and there is nothing to
+ // validate or compute on read -- Executor::execute() fills them in fresh
+ // immediately before invoking Pass::invokeExecute() for each pass, and
+@@ -41,44 +60,70 @@ class Executor;
+ // Executor::realize() most recently bound that name to (a pooled transient
+ // resource, or -- for RenderGraph::setBackbufferSource()'s named resource
+ // -- the external image Executor::execute() was called with this frame;
+ // see executor.cpp's own comment on why the backbuffer is never pooled).
+ // `name` must be one of CompiledGraph::resources()' own names (i.e. a name
+ // some surviving pass in the currently-realized graph actually reads or
+ // writes) -- passing anything else throws std::out_of_range, matching
+ // CompiledGraph::passAccesses()'s own out-of-range contract for a raw pass
+ // index. Calling any of these before the owning Executor's first
+ // realize() (or with a graph reset() since) throws for the same reason:
+-// there is nothing bound to look up yet.
++// there is nothing bound to look up yet. Passing a valid name of the WRONG
++// kind also throws std::out_of_range -- imageView()/image()/imageFormat()
++// on a buffer-typed name, or buffer() on an image-typed one -- naming both
++// the resource and its actual kind, rather than silently returning a
++// meaningless VK_NULL_HANDLE/VK_FORMAT_UNDEFINED [Fix round 1 + its
++// supplemental follow-up].
+ //
+ // Task 5 adds passSignature() here (material/pipeline binding metadata);
+ // not part of Task 3's scope.
++//
++// Not default-constructible, and constructible only by Executor [Fix
++// round 1, Important finding]: an earlier revision left the implicit
++// default constructor public, leaving `executor_` at its default
++// (nullptr) -- combined with Pass::invokeExecute() also being public at
++// the time, any code holding only a const RenderGraph& could construct a
++// blank PassContext and invoke a pass's callback with it, crashing (null-
++// pointer dereference through executor_) the moment that callback called
++// any of the four resolvers below. Both halves of that gap are closed
++// together: invokeExecute() is now private + friend-gated to Executor
++// (pass.h), and this class's only constructor is private + friend-gated
++// to Executor too, so a PassContext can never exist at all without a real,
++// non-null Executor behind it.
+ class PassContext {
+ public:
+     VkCommandBuffer cmd = VK_NULL_HANDLE;
+ 
+     // Extent of this pass's own color/depth attachment(s), in real pixels
+     // -- meaningless (left at {0, 0}) for a pass that declares neither: see
+     // Executor::execute()'s own comment on graphics- vs bare-pass
+     // classification (a pass with no attachment output gets no dynamic-
+     // rendering scope at all, and therefore has no "render area" to speak
+     // of).
+     VkExtent2D renderArea{0, 0};
+ 
++    PassContext(const PassContext&) = delete;
++    PassContext& operator=(const PassContext&) = delete;
++    PassContext(PassContext&&) = delete;
++    PassContext& operator=(PassContext&&) = delete;
++
+     [[nodiscard]] VkImageView imageView(std::string_view name) const;
+     [[nodiscard]] VkImage image(std::string_view name) const;
+     [[nodiscard]] VkBuffer buffer(std::string_view name) const;
+     [[nodiscard]] VkFormat imageFormat(std::string_view name) const;
+ 
+ private:
+     friend class Executor;
+-    const Executor* executor_ = nullptr;
++
++    explicit PassContext(const Executor& executor) : executor_(&executor) {}
++
++    const Executor* executor_;
+ };
+ 
+ // Owns every physical resource backing a compiled rx::graph::RenderGraph on
+ // a real device -- a pooled transient allocation per non-backbuffer image/
+ // buffer resource (transient_pool.h/.cpp, this library's private
+ // implementation detail, not a public rx_graph header) -- plus the sync2
+ // barrier emission and dynamic-rendering scoping that turn
+ // CompiledGraph::passBarriers()/passAccesses()/finalBarriers() into real
+ // vkCmdPipelineBarrier2/vkCmdBeginRendering calls. The RenderGraph/
+ // CompiledGraph types themselves stay exactly as device-free as Tasks 1-2
+@@ -170,20 +215,21 @@ public:
+     // its out-of-line member definitions), so `Impl` itself must be
+     // nameable from outside Executor's member functions for that pattern
+     // to compile; nothing about making the mere NAME public exposes any
+     // actual state -- create()/the constructor/impl_ below stay private,
+     // so no caller can ever construct, copy, or reach a real Impl through
+     // Executor's own public surface.
+     struct Impl;
+ 
+ private:
+     friend class PassContext;
++    friend VkPipelineStageFlags2 detail::debugLastFrameFinalStages(const Executor&, std::string_view);
+ 
+     explicit Executor(std::unique_ptr<Impl> impl);
+ 
+     [[nodiscard]] VkImageView resolveImageView(std::string_view name) const;
+     [[nodiscard]] VkImage resolveImage(std::string_view name) const;
+     [[nodiscard]] VkBuffer resolveBuffer(std::string_view name) const;
+     [[nodiscard]] VkFormat resolveImageFormat(std::string_view name) const;
+ 
+     std::unique_ptr<Impl> impl_;
+ };
+diff --git a/src/rx_graph/include/rx_graph/pass.h b/src/rx_graph/include/rx_graph/pass.h
+index 32dc94f..fce130f 100644
+--- a/src/rx_graph/include/rx_graph/pass.h
++++ b/src/rx_graph/include/rx_graph/pass.h
+@@ -15,20 +15,31 @@ namespace rx::graph {
+ // VkCommandBuffer, no volk, no rx_rhi_vk -- see render_graph.h's own
+ // header-hygiene comment), so only a forward declaration lives here.
+ // Pass::setExecute only stores the callback; Pass::invokeExecute() below
+ // is what actually calls it, once Executor::execute() has a real
+ // PassContext to hand it -- neither this header nor render_graph.cpp ever
+ // needs PassContext's complete definition themselves, since a
+ // std::function<void(PassContext&)> can be stored and invoked through a
+ // reference to an incomplete type.
+ class PassContext;
+ 
++// Forward-declared purely to name it in Pass's `friend class Executor;`
++// grant below -- pass.h itself never needs Executor's complete definition
++// (executor.h), only the ability to say which class may call the private
++// invokeExecute() a real PassContext requires. [Fix round 1, Important
++// finding: without this, any code holding a const RenderGraph& could reach
++// a Pass via RenderGraph::passAt() and call invokeExecute() with a
++// default-constructed (executor_ == nullptr) PassContext -- see
++// PassContext's own comment in executor.h for the matching half of this
++// fix.]
++class Executor;
++
+ class RenderGraph;
+ 
+ // A declarative description of one graph pass's resource reads/writes,
+ // queue hint, and (from Task 3 on) its recorded work. Constructed
+ // exclusively by RenderGraph::addPass() -- there is no public constructor
+ // -- and returned by reference so declarations chain fluently:
+ //
+ //   graph.addPass("forward")
+ //       .addTextureInput("shadow_map")
+ //       .addColorOutput("hdr", hdrDesc);
+@@ -71,33 +82,42 @@ public:
+     // Stores the callback Task 3's executor will invoke with a real
+     // PassContext once this pass's turn comes in CompiledGraph::
+     // executionOrder(). Task 1 only stores it -- nothing here or in
+     // RenderGraph::compile() calls it; PassContext is forward-declared
+     // above precisely because no complete definition exists yet.
+     Pass& setExecute(std::function<void(PassContext&)> fn);
+ 
+     [[nodiscard]] std::string_view name() const;
+     [[nodiscard]] QueueClass queueClass() const;
+ 
++private:
++    friend class RenderGraph;
++    friend class Executor;
++
+     // Task 3: invokes this pass's recorded execute() callback (setExecute()
+     // above) with a real PassContext, if one was ever stored -- a no-op
+     // for a pass that never called setExecute() (e.g. a pass whose only
+     // job is the sync Executor already emits from CompiledGraph::
+     // passBarriers()/the dynamic-rendering clear it triggers, with nothing
+-    // further to record). Declared here (not free-standing in
+-    // executor.cpp) because execute_ is a private member; implemented in
+-    // render_graph.cpp alongside Pass's other methods.
++    // further to record). Implemented in render_graph.cpp alongside Pass's
++    // other methods.
++    //
++    // Private + friend-gated to Executor alone [Fix round 1, Important
++    // finding]: a real PassContext is only ever safely constructible by
++    // Executor (see executor.h's matching fix), so nothing outside this
++    // library's own Executor should be able to invoke a pass's callback at
++    // all -- a caller holding only a const RenderGraph& (RenderGraph::
++    // passAt() is public and returns const Pass&) must not be able to
++    // reach this. Declared here rather than free-standing in executor.cpp
++    // because execute_ is itself a private member.
+     void invokeExecute(PassContext& ctx) const;
+ 
+-private:
+-    friend class RenderGraph;
+-
+     // Which builder method produced one Declaration -- drives both the
+     // stage/access/layout resolution in RenderGraph::compile() (Task 1
+     // brief, compile algorithm step 1) and the imageUsage union stored on
+     // the resource's PhysicalResource entry.
+     enum class AccessKind : uint8_t {
+         ColorOutput,
+         DepthStencilOutput,
+         TextureInput,
+         StorageBufferOutput,
+         StorageBufferInput,
+diff --git a/src/rx_graph/tests/test_execute_gpu.cpp b/src/rx_graph/tests/test_execute_gpu.cpp
+index 075052a..27773c9 100644
+--- a/src/rx_graph/tests/test_execute_gpu.cpp
++++ b/src/rx_graph/tests/test_execute_gpu.cpp
+@@ -36,20 +36,21 @@
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/pipeline_layout.h>
+ #include <rx_shader/compiler.h>
+ #include <rx_shader/reflection.h>
+ 
+ #include <array>
+ #include <cstdint>
+ #include <cstring>
+ #include <memory>
+ #include <optional>
++#include <stdexcept>
+ #include <string>
+ #include <utility>
+ #include <vector>
+ 
+ using namespace rx::graph;
+ 
+ namespace {
+ 
+ constexpr uint32_t kExtent = 256;
+ constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
+@@ -679,21 +680,40 @@ TEST_CASE(
+     BufferDesc dataDesc;
+     dataDesc.size = 256;
+     dataDesc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+ 
+     RenderGraph graph;
+     // Compute-class (no attachment output) -- its storage-buffer output
+     // resolves to COMPUTE_SHADER_BIT per pass.h's Pass::resolveAccess
+     // table. No execute() callback: this test only needs the barrier
+     // machinery to run correctly, not any real compute dispatch.
+     graph.addPass("produce", QueueClass::AsyncCompute).addStorageBufferOutput("data", dataDesc).setSideEffect();
+-    graph.addPass("consume").addStorageBufferInput("data").addColorOutput("bb", absoluteColorDesc(kExtent, kExtent));
++    graph.addPass("consume")
++        .addStorageBufferInput("data")
++        .addColorOutput("bb", absoluteColorDesc(kExtent, kExtent))
++        .setExecute([&](PassContext& ctx) {
++            // [Fix round 1, Minor finding, plus its supplemental follow-up
++            // covering the remaining three resolvers]: every PassContext
++            // resolver must throw std::out_of_range on a legitimately-
++            // registered but wrong-kind name, matching the documented
++            // "throws on anything not resolvable" contract's own spirit --
++            // never silently return a meaningless VK_NULL_HANDLE/
++            // VK_FORMAT_UNDEFINED. Exercised here against the real "data"
++            // storage buffer resource (image()/imageView()/imageFormat(),
++            // each expecting an image) and the real "bb" backbuffer image
++            // resource (buffer(), expecting a buffer), through the real
++            // Executor, inside a real pass callback.
++            CHECK_THROWS_AS(static_cast<void>(ctx.imageFormat("data")), std::out_of_range);
++            CHECK_THROWS_AS(static_cast<void>(ctx.image("data")), std::out_of_range);
++            CHECK_THROWS_AS(static_cast<void>(ctx.imageView("data")), std::out_of_range);
++            CHECK_THROWS_AS(static_cast<void>(ctx.buffer("bb")), std::out_of_range);
++        });
+     graph.setBackbufferSource("bb");
+ 
+     CompileInfo info;
+     info.swapchainWidth = kExtent;
+     info.swapchainHeight = kExtent;
+     info.swapchainFormat = kFormat;
+     info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+     graph.compile(info);
+ 
+     fixture->executor->realize(graph);
+@@ -715,10 +735,94 @@ TEST_CASE(
+         cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+             fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
+         });
+     }
+ 
+     vkDeviceWaitIdle(device);
+     destroyOffscreenImage(device, *offscreen);
+ 
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
++
++TEST_CASE(
++    "Executor::execute unions every final-touching pass's stage into a pooled resource's cross-frame carry-forward "
++    "-- not just the topologically-last one") {
++    // Fix round 1, Critical finding regression test. The reviewer's own
++    // probe (task-3-review.md) reproduced this exact shape: a resource
++    // written once, then read by two independent passes with no
++    // intervening write -- "readGraphics" (a Graphics-class pass, since it
++    // also declares a color output; its texture-input read resolves to
++    // VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT per pass.h's resolveAccess
++    // table) and "readCompute" (Compute-class; resolves to
++    // VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT). Both are "shared"'s final
++    // touching passes this execute() call -- an overwrite (the pre-fix
++    // behavior) would keep only whichever of the two runs topologically
++    // last, silently dropping the other's stage from the NEXT execute()
++    // call's first-use-of-frame srcStage override and reproducing a real,
++    // unsynchronized write-after-read hazard this codebase's validation
++    // setup cannot detect on its own (no VK_VALIDATION_FEATURE_ENABLE_
++    // SYNCHRONIZATION_VALIDATION_EXT anywhere in context.cpp) -- this test
++    // asserts on the real tracked value directly via
++    // detail::debugLastFrameFinalStages(), a test/debug-only seam (see
++    // executor.h's own comment on it, mirroring barriers.h's identical
++    // detail:: carve-out), rather than relying on --validate to ever be
++    // able to catch a wrong value here.
++    auto fixture = makeFixture("rx_graph_gpu_stage_union");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    const VkDevice device = fixture->device.device();
++
++    BufferDesc outBDesc;
++    outBDesc.size = 256;
++    outBDesc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
++
++    RenderGraph graph;
++    graph.addPass("write").addColorOutput("shared", absoluteColorDesc(kExtent, kExtent));
++    graph.addPass("readGraphics")
++        .addTextureInput("shared")
++        .addColorOutput("bb", absoluteColorDesc(kExtent, kExtent));
++    graph.addPass("readCompute", QueueClass::AsyncCompute)
++        .addTextureInput("shared")
++        .addStorageBufferOutput("outB", outBDesc)
++        .setSideEffect();
++    graph.setBackbufferSource("bb");
++
++    CompileInfo info;
++    info.swapchainWidth = kExtent;
++    info.swapchainHeight = kExtent;
++    info.swapchainFormat = kFormat;
++    info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    graph.compile(info);
++
++    fixture->executor->realize(graph);
++
++    auto offscreen = createOffscreenImage(device, fixture->device.physicalDevice(), kFormat,
++                                            VkExtent2D{kExtent, kExtent});
++    REQUIRE(offscreen.has_value());
++
++    auto cmdCtx =
++        rx::rhi::CommandContext::create(device, fixture->device.graphicsQueue(), fixture->device.graphicsQueueFamily());
++    REQUIRE(cmdCtx.has_value());
++
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
++    });
++
++    const VkPipelineStageFlags2 tracked = detail::debugLastFrameFinalStages(*fixture->executor, "shared");
++    CHECK((tracked & VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT) != 0);
++    CHECK((tracked & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) != 0);
++
++    // A second execute() call actually consumes that unioned value as the
++    // next frame's first-use override -- proving the fix's output feeds
++    // back into the real barrier path end to end, not just that the
++    // tracked value looks right in isolation.
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
++    });
++
++    vkDeviceWaitIdle(device);
++    destroyOffscreenImage(device, *offscreen);
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/src/rx_graph/transient_pool.cpp b/src/rx_graph/transient_pool.cpp
+index c4eb6ca..5570609 100644
+--- a/src/rx_graph/transient_pool.cpp
++++ b/src/rx_graph/transient_pool.cpp
+@@ -93,31 +93,45 @@ void TransientPool::touchImage(uint32_t index, uint64_t currentFrame) {
+ 
+ void TransientPool::touchBuffer(uint32_t index, uint64_t currentFrame) {
+     buffers_.at(index).lastUsedFrame = currentFrame;
+ }
+ 
+ void TransientPool::sweepStale(uint64_t currentFrame, rx::rhi::DeletionQueue& deletionQueue) {
+     for (PooledImage& entry : images_) {
+         if (!entry.texture.has_value()) {
+             continue;
+         }
+-        if (currentFrame - entry.lastUsedFrame > kStaleAfterExecutes) {
++        // [Fix round 1, Minor finding]: >= , not > -- an entry last
++        // touched at frame F is idle during calls F+1..F+kStaleAfterExecutes
++        // (kStaleAfterExecutes idle calls, matching the ruling's literal
++        // "unused for kFramesInFlight+1 consecutive executes" threshold
++        // exactly); `currentFrame - lastUsedFrame == kStaleAfterExecutes`
++        // at the last of those calls, so retirement must trigger there,
++        // not one call later.
++        if (currentFrame - entry.lastUsedFrame >= kStaleAfterExecutes) {
+             auto keepAlive = std::make_shared<rx::rhi::Texture2D>(std::move(*entry.texture));
+             entry.texture.reset();
+             deletionQueue.retire([keepAlive] {}, entry.lastUsedFrame);
+         }
+     }
+     for (PooledBuffer& entry : buffers_) {
+         if (!entry.buffer.has_value()) {
+             continue;
+         }
+-        if (currentFrame - entry.lastUsedFrame > kStaleAfterExecutes) {
++        // [Fix round 1, Minor finding]: >= , not > -- an entry last
++        // touched at frame F is idle during calls F+1..F+kStaleAfterExecutes
++        // (kStaleAfterExecutes idle calls, matching the ruling's literal
++        // "unused for kFramesInFlight+1 consecutive executes" threshold
++        // exactly); `currentFrame - lastUsedFrame == kStaleAfterExecutes`
++        // at the last of those calls, so retirement must trigger there,
++        // not one call later.
++        if (currentFrame - entry.lastUsedFrame >= kStaleAfterExecutes) {
+             auto keepAlive = std::make_shared<rx::rhi::Buffer>(std::move(*entry.buffer));
+             entry.buffer.reset();
+             deletionQueue.retire([keepAlive] {}, entry.lastUsedFrame);
+         }
+     }
+ }
+ 
+ void TransientPool::retireAll(uint64_t currentFrame, rx::rhi::DeletionQueue& deletionQueue) {
+     for (PooledImage& entry : images_) {
+         if (!entry.texture.has_value()) {
+diff --git a/src/rx_graph/transient_pool.h b/src/rx_graph/transient_pool.h
+index b924cd3..5224655 100644
+--- a/src/rx_graph/transient_pool.h
++++ b/src/rx_graph/transient_pool.h
+@@ -153,23 +153,27 @@ public:
+     // acquired entry -- called once per execute() call, for every pooled
+     // entry that call's realize()-established mapping actually references
+     // (see executor.cpp), so an entry realize() bound once and execute()
+     // keeps reusing every frame never looks "unused" to sweepStale() below.
+     void touchImage(uint32_t index, uint64_t currentFrame);
+     void touchBuffer(uint32_t index, uint64_t currentFrame);
+ 
+     // Retires (via `deletionQueue`, tagged with each entry's own
+     // lastUsedFrame -- already provably safe to destroy once that frame
+     // number's submission has completed, per this same frames-in-flight
+-    // bound) every entry whose `currentFrame - lastUsedFrame >
+-    // kStaleAfterExecutes`. Called once per execute() call, before that
+-    // call's own barrier/rendering work -- see executor.cpp.
++    // bound) every entry whose `currentFrame - lastUsedFrame >=
++    // kStaleAfterExecutes` (exactly "unused for kStaleAfterExecutes
++    // consecutive execute() calls" [Fix round 1, Minor finding -- an
++    // earlier revision used `>`, which held an idle entry alive one call
++    // longer than the ruling's literal wording]). Called once per
++    // execute() call, before that call's own barrier/rendering work -- see
++    // executor.cpp.
+     void sweepStale(uint64_t currentFrame, rx::rhi::DeletionQueue& deletionQueue);
+ 
+     // Shutdown path: retires EVERY still-live entry into `deletionQueue`
+     // unconditionally, regardless of lastUsedFrame -- called from
+     // Executor's destructor, immediately after it has already brought the
+     // device to a real idle point (see executor.cpp), so `deletionQueue`'s
+     // own flushAll() immediately after this call is safe to run
+     // unconditionally too.
+     void retireAll(uint64_t currentFrame, rx::rhi::DeletionQueue& deletionQueue);
+ 

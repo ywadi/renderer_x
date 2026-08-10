@@ -1,0 +1,3168 @@
+# Review package: 648021e..62611b5
+
+## Commits
+62611b5 feat: add sample 06_materials on the public material API
+16a871e docs: make performance an exit criterion in repository policy
+81ac8c7 docs: add performance posture commitments from plan audit
+df3ca29 docs: move parallel command recording into phase 4 proper
+e28c585 docs: commit multithreaded recording as a deliverable with synthetic stress benchmark
+aa20fa5 docs: commit task system adoption in phase 4 and profiling-gated parallel recording
+8009eda docs: drop GPU decompression, name meshoptimizer as committed geometry library
+be007d2 docs: record mesh shaders, GPU-driven pipelines, and GPU decompression roadmap positions
+ee7d5be docs: commit meshoptimizer for import-time optimization and future meshlet/LOD work
+
+## Files changed
+ .github/workflows/ci.yml                           |   22 +-
+ CLAUDE.md                                          |   26 +
+ CMakeLists.txt                                     |    1 +
+ MANUAL_VERIFICATION.md                             |   89 +
+ .../2026-08-09-toolchain-platform-rhi-design.md    |   22 +-
+ .../specs/2026-08-10-phase4-seed-notes.md          |   43 +
+ samples/06_materials/CMakeLists.txt                |   61 +
+ samples/06_materials/main.cpp                      | 1742 ++++++++++++++++++++
+ samples/06_materials/materials/checker.slang       |   92 ++
+ samples/06_materials/materials/rim.slang           |   73 +
+ samples/README.md                                  |  179 +-
+ src/rx_material/CMakeLists.txt                     |   17 +-
+ .../include/rx_material/material_system.h          |   32 +-
+ src/rx_material/material_system.cpp                |   60 +-
+ tools/package_samples.sh                           |   43 +-
+ 15 files changed, 2448 insertions(+), 54 deletions(-)
+
+## Diff
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 740987c..71616a1 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -113,26 +113,27 @@ jobs:
+ 
+       - name: Configure
+         run: cmake --preset linux-native
+ 
+       - name: Build
+         run: cmake --build --preset linux-native
+ 
+       # lavapipe provides the Vulkan device; Xvfb provides the display SDL3
+       # needs to initialize a (hidden) window. This is not a soft/best-effort
+       # run: verified locally (forcing VK_ICD_FILENAMES to lavapipe only, and
+-      # running the whole suite under xvfb-run) that all 12 tests -- including
++      # running the whole suite under xvfb-run) that all 15 tests -- including
+       # rx_rhi_vk_tests, rx_shader_tests, rx_graph_tests/rx_graph_gpu_tests,
+-      # and all five sample_*_headless gates (01_triangle, 02_hotreload,
+-      # 03_bindless_mesh, 04_streaming, 05_multipass) -- genuinely execute
+-      # their real assertions against lavapipe rather than hitting a skip
+-      # guard -- lavapipe is a real, if software, Vulkan 1.3+ implementation.
++      # rx_material_tests/rx_material_gpu_tests, and all six
++      # sample_*_headless gates (01_triangle, 02_hotreload, 03_bindless_mesh,
++      # 04_streaming, 05_multipass, 06_materials) -- genuinely execute their
++      # real assertions against lavapipe rather than hitting a skip guard --
++      # lavapipe is a real, if software, Vulkan 1.3+ implementation.
+       # The sample gates fail closed
+       # (a crash or a wrong-pixel assertion is a real ctest FAILED, not a
+       # silent skip), so ctest's own per-test "... Passed" line for each of
+       # them, printed unconditionally below regardless of
+       # --output-on-failure, IS the proof they ran -- kept visible in the
+       # raw log rather than only inside the junit file.
+       #
+       # --output-junit also writes a self-verifying, structured report (one
+       # <testcase> per test, each with the full captured stdout/stderr as
+       # <system-out> -- e.g. every sample's own "... headless gate PASSED"
+@@ -143,28 +144,29 @@ jobs:
+       - name: Test (xvfb + lavapipe)
+         run: >-
+           xvfb-run -a ctest --preset linux-native --output-on-failure
+           --output-junit ${{ github.workspace }}/ctest-results-linux-native.xml
+ 
+       # Real incremental-rebuild timing, not a no-op: tools/check_build_budget.sh
+       # touches src/rx_core/src/log.cpp itself before timing.
+       - name: Build budget check
+         run: tools/check_build_budget.sh linux-native 60
+ 
+-      # Packages all five samples into the exact unzip-and-run layout a user
++      # Packages all six samples into the exact unzip-and-run layout a user
+       # gets [R:D2]: one subdirectory per sample with that sample's binary
+       # plus everything IT needs (01_triangle: just its two precompiled
+-      # .spv files, no Slang libs; 02/03/04/05: the Slang runtime libs +
++      # .spv files, no Slang libs; 02/03/04/05/06: the Slang runtime libs +
+       # LICENSE deployed next to each at build time, plus 02's
+-      # hotreload.slang / 03's texture.png / 05's five on-disk shader
+-      # sources). See tools/package_samples.sh for the full per-sample
+-      # manifest and why each file is there.
++      # hotreload.slang / 03's texture.png / 05's six on-disk shader
++      # sources / 06's materials/+material_shaders/ subdirectories). See
++      # tools/package_samples.sh for the full per-sample manifest and why
++      # each file is there.
+       - name: Package samples for redistribution
+         run: tools/package_samples.sh linux-native linux-x86_64 rendererx-samples-linux-x86_64.zip
+ 
+       - name: Upload sample artifact bundle
+         uses: actions/upload-artifact@v7
+         with:
+           name: rendererx-samples-linux-x86_64
+           path: rendererx-samples-linux-x86_64.zip
+           if-no-files-found: error
+ 
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 90bb9d0..5f47cea 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -19,10 +19,36 @@ This overrides the default commit-message template used elsewhere.
+ This project's standing engineering rule: **prefer ready-made libraries or
+ ported implementations over writing subsystems from scratch.** Before
+ implementing any nontrivial piece of logic (parsers, allocators, math,
+ loaders, compilers, protocol handling, etc.), check whether a well-established
+ library already solves it, or whether a known open implementation can be
+ ported. Only write it from scratch when no reasonable ready-made option
+ exists, and say so explicitly when that's the call being made. This applies
+ to every task, every subagent, and every layer of the renderer — not just
+ the RHI/toolchain layers that already lean on SDL3, vk-bootstrap, VMA,
+ volk, GLM, spdlog, doctest, and Slang.
++
++## Performance is an exit criterion
++
++RendererX is middleware: its consumers' games are the real workload, so the
++engine **leads on performance instead of waiting for evidence from its own
++small samples** — it builds its own stress cases (synthetic high-draw-count
++benchmark scenes) and proves scalability proactively.
++
++- From Phase 4 onward, **every phase exits with published benchmark numbers**
++  (desktop AND Steam Deck — the hardware floor) for its stress/exit samples,
++  and CI carries **performance regression gates** on those numbers alongside
++  the correctness gates. A performance regression blocks a phase exit the
++  same way a failing test does.
++- Design the fast path as the default path: instanced/batched submission,
++  pooled global geometry buffers, bindless access, minimal derived barriers.
++  Per-object state churn and retrofit-later designs are rejected at review.
++- Features above the Vulkan 1.3 baseline (mesh shaders, hardware RT, etc.)
++  are **optional capabilities with a fallback**, never baseline requirements
++  — but the fallback path is engineered to the same performance bar.
++- Profiling instrumentation (Tracy) is part of the toolchain from Phase 4:
++  performance claims in reports must be measured, not asserted.
++
++This binds every task, every implementer, and every reviewer, like the rules
++above. See `docs/superpowers/specs/2026-08-10-phase4-seed-notes.md` and the
++deferred-registry entries in
++`docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md`.
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 28abd66..95c7071 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -34,10 +34,11 @@ add_subdirectory(src/rx_graph)
+ # target only), and rx_rhi_vk (PipelineLayoutBuilder/BindlessTable/Device),
+ # so it is add_subdirectory'd after all three.
+ add_subdirectory(src/rx_material)
+ add_subdirectory(tools/dep_cache_smoketest)
+ add_subdirectory(tools/toolchain_check)
+ add_subdirectory(samples/01_triangle)
+ add_subdirectory(samples/02_hotreload)
+ add_subdirectory(samples/03_bindless_mesh)
+ add_subdirectory(samples/04_streaming)
+ add_subdirectory(samples/05_multipass)
++add_subdirectory(samples/06_materials)
+diff --git a/MANUAL_VERIFICATION.md b/MANUAL_VERIFICATION.md
+index 0a3124a..4990d25 100644
+--- a/MANUAL_VERIFICATION.md
++++ b/MANUAL_VERIFICATION.md
+@@ -103,10 +103,99 @@ other Linux machine.
+ **Last run:** not yet performed on real Steam Deck hardware — this
+ repository was developed and verified on a Linux desktop only. The
+ `linux-native` preset (same one the Deck would use) is confirmed green on
+ that desktop machine's own AMD/NVIDIA-equivalent Vulkan/validation stack;
+ nothing in this codebase depends on desktop-only APIs (SDL3 + Vulkan 1.3
+ dynamic rendering/synchronization2 both run under SteamOS's RADV driver),
+ but that has not yet been confirmed on an actual Deck. Fill in the
+ checkboxes and record the SteamOS version/RADV (Mesa) driver version above
+ the first time this is actually run on a Deck, before the next release that
+ claims Steam Deck support.
++
++## 05_multipass (`--present` mode)
++
++`sample_05_multipass` needs the Slang runtime libraries (+ its six on-disk
++shader sources) deployed next to it — see `samples/README.md`'s own
++"Redistribution" section for the full manifest; it is not statically linked
++like 01_triangle.
++
++### What "pass" means, every platform
++
++- The window opens and shows a reddish cube and a bluish sphere on a
++  grayish floor, lit from a fixed-elevation directional light whose azimuth
++  continuously orbits — the cube's shadow visibly sweeps across the floor
++  as the light turns (see `samples/README.md`'s "Expected output" section).
++- Closing the window exits promptly, with no crash/hang, and logs
++  `--present: window closed cleanly`.
++- On Linux, run with `--validate` and confirm no `[error]`-level validation
++  output beyond this codebase's two documented false-positive guards (see
++  the "What 'pass' means" section above for the exact mechanism).
++
++### Linux (native, `linux-native` preset)
++
++- [ ] Build: `cmake --preset linux-native && cmake --build --preset linux-native`
++- [ ] Run: `./build/linux-native/samples/05_multipass/sample_05_multipass --present --validate`
++- [ ] Shadow/light/cube/sphere render correctly and the shadow sweeps as
++      the light orbits, with zero unexpected validation errors
++- [ ] Closes cleanly; headless mode still exits 0
++
++**Last run:** not yet performed as a real, human-observed run on this or
++any platform (this checklist row is new as of Task 8; sample 05 itself
++predates it). Functionally exercised end to end during this project's own
++development, though not as a substitute for the human-observed check this
++file otherwise requires: `sample_05_multipass_headless`'s own analytic
++pixel assertions pass under `ctest` on every CI run (`.github/workflows/
++ci.yml`), which is the automated half of this sample's correctness story.
++Fill in the checkboxes and hardware/driver details above the first time
++`--present` is actually watched running on real hardware.
++
++## 06_materials (`--present` mode)
++
++`sample_06_materials` needs the Slang runtime libraries + its own
++`materials/`/`material_shaders/` subdirectories deployed next to it — see
++`samples/README.md`'s own "Redistribution" section for the full manifest.
++
++### What "pass" means, every platform
++
++- The window opens and shows an orange checkerboard cube (top-left), a teal
++  checkerboard cube (top-right), a magenta rim-lit sphere (bottom-left),
++  and a golden-yellow rim-lit sphere (bottom-right), with the camera
++  orbiting continuously (see `samples/README.md`'s "Expected output"
++  section).
++- Editing and saving the deployed `materials/checker.slang` or
++  `materials/rim.slang` (next to the running binary) changes that
++  material's rendering within about a second, with a console log line
++  confirming the reload; a syntactically broken edit keeps the last-good
++  material rendering rather than crashing the window.
++- Closing the window exits promptly, with no crash/hang, and logs
++  `--present: window closed cleanly`.
++- On Linux, run with `--validate` and confirm no `[error]`-level validation
++  output beyond this codebase's two documented false-positive guards.
++
++### Linux (native, `linux-native` preset)
++
++- [ ] Build: `cmake --preset linux-native && cmake --build --preset linux-native`
++- [ ] Run: `./build/linux-native/samples/06_materials/sample_06_materials --present --validate`
++- [ ] All 4 objects render correctly and the camera orbits smoothly, with
++      zero unexpected validation errors
++- [ ] Editing `materials/checker.slang`/`materials/rim.slang` (the deployed
++      copies) live-updates the running window within ~1s, and a
++      syntactically broken edit keeps the last-good material instead of
++      crashing
++- [ ] Closes cleanly; headless mode still exits 0
++
++**Last run:** not yet performed as a real, human-observed run on real
++display hardware. Functionally verified during this task's own development
++via an offscreen X server (Xvfb, no human watching a real display): the
++window opens, all 4 objects render at their analytically expected colors
++(cross-checked against the same headless-gate math), the camera orbits,
++editing the deployed `checker.slang`/`rim.slang` while running triggers a
++logged `hot-reload of '...' succeeded` and visibly changes that material
++(confirmed across 3 consecutive edit/reload cycles touching both files),
++and the process exits cleanly (`--present: window closed cleanly`, exit
++code 0) on `SIGTERM` on both the `linux-native` build and the
++`windows-cross-zig` build run under Wine, from the packaged (unzipped,
++outside the build tree) layout in both cases. This is real functional
++verification, not a placeholder — but it is not the human-observed-on-real-
++hardware check this file otherwise tracks. Fill in the checkboxes and
++hardware/driver details above the first time `--present` is actually
++watched running on a real display.
+diff --git a/docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md b/docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md
+index 91c0ae0..cfae20c 100644
+--- a/docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md
++++ b/docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md
+@@ -140,21 +140,26 @@ Everything below is still planned and will get its own design spec later —
+ it is out of scope for *this* spec only, not out of scope for the project:
+ 
+ - Slang runtime compilation/reflection (layer 4)
+ - Descriptor/resource management beyond the bindless-friendly baseline
+   (layer 5)
+ - Render graph, materials, scene submission, techniques, asset import,
+   public SDK surface, tooling (layers 6–12) — including, explicitly, these
+   subsystems so they aren't lost before those layers get specced:
+   - **Geometry processing** (layer 8, scene submission): meshlet
+     generation, virtual geometry, LOD management, skeletal mesh skinning,
+-    morph targets.
++    morph targets. **meshoptimizer is the committed library** for
++    import-time optimization (Phase 4), meshlet building, and LOD
++    simplification (decided 2026-08-10; see also the Phase 4 seed notes).
++    Asset decompression stays CPU-side (KTX2+zstd on worker threads) —
++    GPU decompression was evaluated and dropped 2026-08-10 (D3D12-bound
++    ecosystem; no expected win on the Deck floor).
+   - **Lighting infrastructure & spatial queries** (layer 9, techniques):
+     acceleration structures (BVH for ray tracing), clustered/deferred
+     lighting grids, shadow cascades, global illumination probes.
+   - **Hardware ray tracing** (layer 9, techniques; committed 2026-08-10):
+     an OPTIONAL device capability, never baseline — Steam Deck (the
+     hardware floor) exposes VK_KHR_ray_query/ray_tracing_pipeline via RADV
+     but with minimal RT hardware, so every RT feature ships behind a
+     startup capability query with a raster fallback (RT shadows → shadow
+     maps, RT reflections → screen-space/cubemap). Optionality-with-
+     fallback is the engine-wide principle for any feature above the
+@@ -166,20 +171,35 @@ it is out of scope for *this* spec only, not out of scope for the project:
+     (RT pass = compute-class pass + acceleration-structure resource type),
+     VMA (AS allocation).
+   - **Post-processing & image reconstruction** (layer 9, techniques): tone
+     mapping, color grading, temporal anti-aliasing, hardware upscaling
+     wrappers (DLSS, FSR, XeSS).
+   - **Profiling & debug instrumentation** (layer 12, tooling): GPU markers
+     (PIX/RenderDoc integration), debug line drawing, memory leak tracking,
+     performance counters.
+ - macOS/MoltenVK support
+ - DLL ABI-stability strategy for the public interface
++- **Task/mesh shaders** (committed 2026-08-10, geometry phase): optional
++  fast path per the optionality principle — RADV exposes
++  VK_EXT_mesh_shader on the Deck floor but RDNA2 task-stage throughput is
++  weak and older GPUs lack it. The meshlet pipeline (meshoptimizer data)
++  ships with a compute-culling + classic-vertex-pipeline baseline; mesh
++  shaders are the capability-queried consumer of the same meshlet data.
++- **GPU-driven pipelines / visibility buffers** (committed 2026-08-10):
++  GPU-driven culling with indirect draw lists needs only core-1.3
++  features (drawIndirectCount, device address, bindless) — no gating;
++  sequenced with/after the geometry phase's meshlets and the HiZ
++  occlusion milestone. Visibility-buffer shading (triangle-ID raster +
++  deferred material resolve) is a techniques-phase decision AFTER
++  meshlets exist; it requires a shade-from-ID path through the material
++  system's specialization model — design work to scope in that phase's
++  spec, not assumed.
+ - **Multi-language bindings** (committed 2026-08-10, SDK phase): the public
+   API ships C-ABI-first — a single IDL source generates the C header, the
+   C++ COM-lite header, and the DLL shim (bgfx precedent; kills header
+   drift) — and each language binds the C header via its own native tool
+   (Rust bindgen, Zig translate-c, C# P/Invoke generators, Python cffi,
+   Lua FFI). SWIG is the recorded fallback if a broad scripting-language
+   sweep is ever wanted directly from C++, but C-first is the strategy.
+   The COM-lite surface discipline (PODs, no STL/exceptions, error codes)
+   already satisfies every generator's input constraints by construction.
+ - **Main-loop ownership** (decided 2026-08-10, binds the SDK-phase spec):
+diff --git a/docs/superpowers/specs/2026-08-10-phase4-seed-notes.md b/docs/superpowers/specs/2026-08-10-phase4-seed-notes.md
+index 5bc83cd..7b0f6fd 100644
+--- a/docs/superpowers/specs/2026-08-10-phase4-seed-notes.md
++++ b/docs/superpowers/specs/2026-08-10-phase4-seed-notes.md
+@@ -56,16 +56,59 @@ and visible culling statistics.
+ 
+ 6. **Input expansion in rx_platform (user-raised 2026-08-10):** the Phase 4
+    fly-through camera requires relative mouse capture (raw deltas, cursor
+    show/hide) and gamepad support (Steam Deck is the hardware floor — the
+    fly-through must be drivable by pad, not only mouse). SDL3 provides
+    both natively; the work is exposing them through rx_platform's existing
+    event/input surface. Window-resize handling needs no Phase 4 work — the
+    full chain (SDL3 events → swapchain recreation → graph re-realization)
+    exists and is regression-tested as of Phase 3.
+ 
++7. **meshoptimizer at import time (user-confirmed 2026-08-10):** imported
++   meshes are post-processed with meshoptimizer (index/vertex-cache
++   optimization, overdraw reduction, vertex-fetch reordering) before
++   upload — the canonical glTF-pipeline pairing; no credible alternative
++   exists and hand-rolling is barred by repo policy. The same vendored
++   library later serves the geometry-processing layer's committed
++   meshlet generation (meshopt_buildMeshlets) and LOD chains
++   (meshopt_simplify) — see the master design doc's deferred registry.
++
++8. **Task/job system adopted in Phase 4; multithreaded rendering committed
++   for the phase after (user-directed 2026-08-10):** Phase 4 adopts a
++   ready-made work-stealing scheduler (candidates: enkiTS, Taskflow —
++   research pass decides with citations; ad-hoc std::thread pools barred)
++   for asset IO/decode/meshoptimizer work, AND designs scene submission
++   thread-aware from day one (draw-list building, culling, transform
++   updates parallelizable by construction — no later retrofit).
++   **Parallel command recording ships IN Phase 4** (user-directed
++   2026-08-10: it is renderer core and rides the same scheduler):
++   per-thread command pools, render-graph pass callbacks recorded on
++   workers, submissions stitched in graph order — sequenced late in the
++   phase, after the scheduler is in and scene content exists. Proven by a
++   dedicated synthetic stress sample (tens of thousands of draws — itself
++   a natural scene-submission exit sample) with published before/after
++   numbers on desktop and Deck, kept as a permanent CI regression
++   benchmark. Rationale: RendererX is middleware — customers' games are
++   the real workload, so the engine builds its own stress case rather
++   than waiting for one; profiling validates the win, it does not gate
++   starting.
++
++9. **Performance posture (user-directed 2026-08-10, from a plan audit):**
++   (a) **Tracy profiler adopted in Phase 4** (ready-made, per repo
++   policy) — CPU zones + GPU timestamp integration, so every subsequent
++   performance claim is measured, not asserted. (b) **Performance is a
++   phase exit criterion from Phase 4 onward**: each phase publishes
++   benchmark numbers (desktop + Steam Deck) for its stress/exit samples,
++   and CI carries regression gates on those numbers alongside the
++   correctness gates. (c) **Scene submission is designed around
++   instancing/batching and a global geometry buffer** (single pooled
++   vertex/index storage, per-mesh offsets — the layout GPU-driven
++   drawing requires) from day one; per-object buffer binding is not the
++   design. The Phase 4 spec must carry a dedicated "performance posture"
++   section addressing all of the above explicitly.
++
+ ## Carried process notes
+ 
+ - Research pass before spec (library selection for glTF/KTX2 with
+   citations), spec + plan authored by the coordinator, SDD execution with
+   per-task review, exit via deployed samples + tagged release — same cycle
+   as Phases 1-3.
+diff --git a/samples/06_materials/CMakeLists.txt b/samples/06_materials/CMakeLists.txt
+new file mode 100644
+index 0000000..577ce08
+--- /dev/null
++++ b/samples/06_materials/CMakeLists.txt
+@@ -0,0 +1,61 @@
++# rx_shader_deploy_runtime_libs() is defined in src/rx_shader/CMakeLists.txt
++# (add_subdirectory'd before src/rx_material and this directory from the
++# root CMakeLists.txt) -- same cross-directory function-name visibility
++# every other sample's own CMakeLists.txt already relies on.
++
++add_executable(sample_06_materials main.cpp)
++target_link_libraries(sample_06_materials PRIVATE rx_graph rx_rhi_vk rx_platform rx_material)
++
++# This sample links rx_material, which links slang::slang and does real
++# in-process Slang compilation at startup (loadMaterial() for both
++# checker.slang/rim.slang, plus the shared material.slang/forward_entry.slang
++# every material composes against) -- needs the Slang runtime libs deployed
++# next to it, same as 02_hotreload/03_bindless_mesh/04_streaming/05_multipass.
++rx_shader_deploy_runtime_libs(sample_06_materials)
++
++# Deploys this sample's OWN materials -- checker.slang/rim.slang -- into a
++# materials/ subdirectory next to the binary, mirroring this source
++# directory's own layout, so main.cpp's SDL_GetBasePath()-relative
++# loadMaterial() calls find them identically in the build tree and in a
++# redistributed copy of this directory.
++add_custom_command(TARGET sample_06_materials POST_BUILD
++  COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sample_06_materials>/materials"
++  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
++          "${CMAKE_CURRENT_SOURCE_DIR}/materials/checker.slang"
++          "${CMAKE_CURRENT_SOURCE_DIR}/materials/rim.slang"
++          "$<TARGET_FILE_DIR:sample_06_materials>/materials/"
++  COMMENT "sample_06_materials: deploying materials/*.slang next to the binary"
++  VERBATIM
++)
++
++# Deploys the SHARED rx_material shaders (shaders/material/material.slang +
++# forward_entry.slang) into a SIBLING material_shaders/ directory next to
++# the binary [Task 8 ledger item carried from Task 5]: rx_material's own
++# MaterialSystem::create() previously located these two files exclusively
++# via RX_MATERIAL_SHADER_DIR, a compile-time absolute path anchored at this
++# checked-out repository's own CMAKE_SOURCE_DIR -- correct for a build-tree
++# run but meaningless for a redistributed binary, which has no
++# CMAKE_SOURCE_DIR at all. main.cpp resolves this material_shaders/
++# directory at runtime (SDL_GetBasePath()-relative, same mechanism as its
++# own materials/ directory above) and passes it as
++# MaterialSystem::create()'s new `sharedShaderDir` parameter
++# (src/rx_material/include/rx_material/material_system.h) -- RX_MATERIAL_
++# SHADER_DIR stays the default for every OTHER caller (rx_material's own
++# unit/GPU tests), unchanged.
++add_custom_command(TARGET sample_06_materials POST_BUILD
++  COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sample_06_materials>/material_shaders"
++  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
++          "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/material.slang"
++          "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/forward_entry.slang"
++          "$<TARGET_FILE_DIR:sample_06_materials>/material_shaders/"
++  COMMENT "sample_06_materials: deploying the shared rx_material shaders next to the binary"
++  VERBATIM
++)
++
++# Runs the binary in headless mode with --validate: ctest is the developer/CI
++# gate, so it explicitly opts into the Vulkan validation layers on top of the
++# default end-user behavior (headless with validation OFF). The binary also
++# supports --present mode for interactive windowed rendering with an
++# orbiting camera and material hot-reload polling (see main.cpp /
++# samples/README.md).
++add_test(NAME sample_06_materials_headless COMMAND sample_06_materials --validate)
+diff --git a/samples/06_materials/main.cpp b/samples/06_materials/main.cpp
+new file mode 100644
+index 0000000..63a5ba0
+--- /dev/null
++++ b/samples/06_materials/main.cpp
+@@ -0,0 +1,1742 @@
++// Sample 06: materials -- the Phase 3 showcase for rx_material's PUBLIC
++// COM-lite API (rx_api.h), driven end to end: material loading, instance
++// creation, per-instance parameter overrides, texture creation, and
++// hot-reload polling ALL go through IRxMaterialSystem/IRxMaterial/
++// IRxMaterialInstance/IRxTexture -- never an internal rx::material:: type,
++// except inside the one clearly marked bridge section below (system
++// creation, and the draw-time bindInstance()/getPipeline()/pipelineLayout()
++// calls, which have no public equivalent in Phase 3 by design -- draw
++// submission is not part of the ABI surface this phase, spec D5/D11).
++//
++// SCENE: 4 procedural objects (2 cubes, 2 spheres -- generators adapted from
++// samples/03_bindless_mesh's own position+uv convention, extended with a
++// per-vertex normal like samples/05_multipass's), drawn through a SINGLE
++// rx_graph forward pass (one color + one depth attachment, no shadow/
++// tonemap passes -- unlike 05_multipass, this sample's whole point is the
++// material API, not the render graph). Two materials, `materials/
++// checker.slang` (UV checker x `tint`) and `materials/rim.slang` (rim-light
++// x `rimColor`), each instanced TWICE with different parameter values:
++//   cube A   -- checker, tint   = warm orange (1.00, 0.55, 0.15)
++//   cube B   -- checker, tint   = cool teal   (0.15, 0.85, 0.90)
++//   sphere A -- rim,     rimColor = magenta    (0.95, 0.15, 0.85)
++//   sphere B -- rim,     rimColor = golden yellow (0.95, 0.85, 0.10)
++// checker.slang also takes a bindless texture-index parameter
++// (`checkerTexIndex`), bound via a real, procedurally generated checker
++// texture created through the PUBLIC IRxMaterialSystem::createTexture2D()
++// and IRxMaterialInstance::setTexture() -- exercising that public path end
++// to end. See checker.slang's own header comment for exactly why that
++// texture is read (numerically) rather than sampled from inside the
++// material's own evaluate(): Phase 3's material reflection contract
++// supports exactly one ParameterBlock<TParams> global per material and
++// nothing else, so a material module has no way to declare its own
++// bindless Texture2D[] array to sample through yet -- the same documented
++// scope boundary src/rx_material/tests/data/test_textured.slang's own
++// `albedoIndex` field already established.
++//
++// THE CENTRAL ENGINEERING PROBLEM THIS SAMPLE SOLVES -- NO CAMERA TRANSFORM
++// IN THE SHARED MATERIAL PIPELINE: shaders/material/forward_entry.slang's
++// shared vertexMain has no model/view/projection transform at all (its own
++// "PHASE 3 SCOPE NOTE" says so explicitly) -- it writes
++// `clipPosition = float4(position, 1.0)` and `worldPos = position` from the
++// SAME incoming POSITION attribute, verbatim. There is no way for a
++// material module (checker.slang/rim.slang) to inject a transform either:
++// MaterialSystem's own reflection rejects any top-level global other than
++// `gParams`, and rx_api.h's IRxMaterialInstance has no setMatrix() to push a
++// per-instance MVP through even if there were one. This sample is the first
++// one to actually need a moving/orbiting camera through rx_material (Task 5
++// through 7's own tests only ever exercise a single fixed pipeline bind,
++// never a real draw with camera motion; samples/05_multipass sidesteps this
++// entirely by NOT using rx_material at all, driving its own hand-written
++// shaders/pipelines instead) -- so it resolves the gap the way
++// forward_entry.slang's own comment anticipates ("a real sample wires an
++// actual transform in before this stage"): by pre-transforming every
++// vertex's POSITION into clip space and every vertex's NORMAL into VIEW
++// space, on the CPU, before upload (transformAndUploadObjectVertices()
++// below), using this sample's own camera view/projection matrices. This is
++// possible without any precision loss specifically because the camera is
++// ORTHOGRAPHIC: an orthographic projection matrix's last row is always
++// (0, 0, 0, 1), so `proj * view * model * vec4(localPos, 1)` always has
++// w == 1.0 EXACTLY, matching forward_entry.slang's own hardcoded
++// `float4(position, 1.0)` assumption bit-for-bit -- a perspective camera
++// could not do this (its w varies per-vertex, which this fixed vertex
++// stage has no way to carry). See makeCameraPose()/
++// transformAndUploadObjectVertices() below for the mechanism, and
++// rim.slang's own header comment for why the normal is pre-rotated into
++// VIEW space specifically (so its rim term can read `v.normal.z` directly
++// as the cosine of the view angle, with no separate camera-position
++// parameter needed at all).
++//
++// HEADLESS ANALYTIC PROBE DERIVATION (read together with checker.slang's
++// and rim.slang's own header comments): the camera is a fixed ORTHOGRAPHIC
++// camera at azimuth 0 (eye at (0, 0, kOrbitRadius), looking straight down
++// -Z, up = +Y) for the whole headless run. Two facts this camera's own
++// geometry makes EXACT, not approximate:
++//   (a) Orthographic projection is invariant to a shift purely along the
++//       view axis -- it never changes a projected point's screen X/Y, only
++//       its depth. So probing at an object's own world-space CENTER
++//       (`projectToPixel(objectPosition, ...)`) lands on the exact same
++//       pixel as probing at whichever surface point the camera actually
++//       sees there (the visible front face for a cube, the near point for
++//       a sphere) -- there is no need to hand-derive a separate "visible
++//       surface point" formula the way a perspective camera would require.
++//   (b) Every cube in this scene is unrotated (model = pure translation)
++//       and every face's UV corners are laid out (0,0)-(1,0)-(1,1)-(0,1)
++//       symmetrically (see generateCube() below) -- so the quad facing the
++//       camera at azimuth 0 (the local +Z face, closest to the eye at
++//       (0,0,+R)) has its geometric CENTER at UV (0.5, 0.5) exactly.
++//       checker.slang's own kCellsPerAxis = 3 grid puts that exact point
++//       robustly inside the grid's middle cell (parity 0, "light", 0.5-cell
++//       margin either side) -- giving `expected color == tint` exactly (see
++//       expectedCheckerColor() below).
++//   (c) A sphere's own near point (the surface point closest to an external
++//       camera) always lies exactly along the line from the sphere's center
++//       to the camera, by definition -- so its LOCAL normal at that point
++//       equals the unit vector from center to camera, which, after this
++//       sample's own view-space normal pre-rotation (see the header comment
++//       above), becomes exactly (0, 0, 1) in view space: ndotv == 1.0
++//       exactly, independent of camera azimuth (true for every point on
++//       this sample's orbit, not just azimuth 0 -- see rim.slang's own
++//       comment). The mesh is a finite tessellation (not a perfect
++//       analytic sphere), so the ACTUAL rendered ndotv at that pixel is
++//       only very close to, not bit-identical to, 1.0 -- negligible given
++//       this sample's fine tessellation (kSphereRings/kSphereSegments
++//       below) and the tolerance-based (not exact-equality) pixel match
++//       this file's own headless gate uses (matchesExpectedColorChannelExact()).
++//
++// SRGB SWAPCHAIN CAVEAT [found by samples/04_streaming, cited here rather
++// than re-derived]: this project's swapchain/offscreen-readback format
++// resolves to an _SRGB-suffixed VkFormat on at least one real driver this
++// codebase has been developed against, which makes the GPU apply the
++// linear -> sRGB transfer function to every fragment-shader output before
++// it lands in the framebuffer -- so a probed byte can be either the raw
++// linear-to-byte value OR its sRGB-encoded counterpart, depending on the
++// format the current machine's driver actually handed back. This file
++// checks against BOTH (matchesExpectedColorChannelExact() below), exactly
++// like 04_streaming's own matchesExpectedColor() -- but, per this task's
++// own brief ("channel-order-exact per 05's probe pattern"), resolves the
++// REAL R/G/B byte order first (channelIndicesForFormat(), copied from
++// samples/05_multipass) rather than accepting either byte order the way
++// 04_streaming's own order-agnostic check does: this sample needs to tell
++// four genuinely different expected colors apart, not just "some non-black
++// pixel showed up."
++//
++// Two modes, exactly like every other sample in this codebase:
++//   (default / no args) Headless correctness gate: fixed camera, 3 frames
++//   through the graph (mirroring 05_multipass's own "repeated execute()
++//   calls against the same reused offscreen backbuffer" argument -- see
++//   that sample's header comment for why this is safe), readback, and the
++//   four analytic pixel assertions above. Registered as ctest
++//   sample_06_materials_headless.
++//   --present. Real window, the camera orbiting continuously (azimuth-only,
++//   fixed radius/elevation -- see makeCameraPose()), polling
++//   materials/checker.slang and materials/rim.slang for on-disk changes
++//   roughly once a second and calling the PUBLIC
++//   IRxMaterialSystem::reloadChanged() (samples/02_hotreload's own
++//   keep-last-good UX, applied here to materials instead of a raw
++//   pipeline). See this file's own recordDraws() for an ADDITIONAL,
++//   sample-local keep-last-good safety net: a hot-reloaded edit that
++//   changes a material's PARAMETER BLOCK SHAPE (adds/removes/retypes a
++//   `gParams` field) is out of this sample's documented hot-reload scope
++//   (matching src/rx_material/tests/test_material_system.cpp's own
++//   reload-fixture convention of only ever changing a material's MATH, not
++//   its params' shape, across reload versions) -- rather than let that
++//   crash a running --present session, that one object's draw is skipped
++//   for the frame and the failure is logged.
++#include <rx_material/rx_api.h>  // PUBLIC surface -- used throughout this file below.
++
++#include <rx_core/log.h>
++#include <rx_graph/executor.h>
++#include <rx_graph/render_graph.h>
++#include <rx_platform/window.h>
++#include <rx_rhi_vk/bindless.h>
++#include <rx_rhi_vk/buffer.h>
++#include <rx_rhi_vk/command.h>
++#include <rx_rhi_vk/context.h>
++#include <rx_rhi_vk/device.h>
++#include <rx_rhi_vk/frame_sync.h>
++#include <rx_rhi_vk/upload.h>
++
++// ============================================================================
++// rx_material INTERNAL BRIDGE -- #include section (BEGIN)
++// ============================================================================
++// The ONLY two rx_material headers this file includes other than
++// rx_api.h -- confined here, and to the `materialBridge` namespace further
++// down (also clearly marked), per this task's own binding constraint: every
++// #include <rx_material/...> other than rx_api.h sits in this bridge, and no
++// IRx* object is ever cast to an internal type outside it. Both uses are
++// exactly the two the coordinator's brief carves out as having no public
++// equivalent in Phase 3 (D5/D11 -- draw submission is not part of the public
++// ABI surface this phase): (1) SYSTEM CREATION -- rx_api.h's own factory
++// (rxCreateMaterialSystem) takes an opaque `void*` bridge pointer to an
++// already-constructed rx::material::MaterialSystem*, per RxMaterialSystemDesc's
++// own doc comment, so *something* has to call MaterialSystem::create()
++// itself; (2) DRAW-TIME BINDING -- MaterialSystem::bindInstance()/
++// getPipeline()/pipelineLayout() are the only way to actually resolve a
++// VkPipeline and bind a material instance's parameters for a real
++// vkCmdDrawIndexed call, and rx_api_detail.h's materialHandle()/
++// materialInstanceBlobData()/materialInstanceBlobSize() are the only way to
++// get from a public IRxMaterial*/IRxMaterialInstance* (obtained entirely
++// through rx_api.h) to the internal rx::material::MaterialHandle/raw
++// parameter bytes those three methods need.
++#include <rx_material/material_system.h>
++#include <rx_material/rx_api_detail.h>
++// ============================================================================
++// rx_material INTERNAL BRIDGE -- #include section (END). The bridge CODE
++// itself lives in `namespace materialBridge` below (also marked BEGIN/END)
++// -- nothing outside those two marked regions in this file ever names an
++// rx_material-internal type or includes an rx_material header other than
++// rx_api.h.
++// ============================================================================
++
++// GLM is a PUBLIC rx_core dependency, transitively available here, matching
++// every other sample's identical comment; GLM_FORCE_DEPTH_ZERO_TO_ONE must
++// precede GLM's first include in this TU.
++#define GLM_FORCE_DEPTH_ZERO_TO_ONE
++#include <glm/glm.hpp>
++#include <glm/gtc/matrix_transform.hpp>
++
++#include <SDL3/SDL.h>
++#include <volk.h>
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <exception>
++#include <filesystem>
++#include <optional>
++#include <sstream>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++namespace {
++
++// --- Small local RAII helper for rx_api.h's COM-lite refcounted objects ---
++// No such helper exists anywhere in rx_material today (every existing test
++// manages IRx* lifetime with plain raw pointers + explicit release() calls
++// -- see e.g. src/rx_material/tests/test_api_factory.cpp) -- this sample is
++// the first REAL, sustained draw-loop consumer of the public API (as
++// opposed to a short, linear test case), so a tiny move-only wrapper here
++// (local to this file, not part of rx_material's own surface) buys the same
++// leak-safety every other RAII type in this codebase already has, without
++// changing rx_material's own ABI-discipline surface at all. Never casts,
++// never touches an internal type -- purely calls release()/addRef() through
++// IRxUnknown's own public vtable.
++template <typename T>
++class RxRef {
++public:
++    RxRef() = default;
++    explicit RxRef(T* ptr) : ptr_(ptr) {}  // Takes ownership of an existing +1 ref (factory/create*() convention).
++    RxRef(const RxRef&) = delete;
++    RxRef& operator=(const RxRef&) = delete;
++    RxRef(RxRef&& other) noexcept : ptr_(other.ptr_) { other.ptr_ = nullptr; }
++    RxRef& operator=(RxRef&& other) noexcept {
++        if (this != &other) {
++            reset();
++            ptr_ = other.ptr_;
++            other.ptr_ = nullptr;
++        }
++        return *this;
++    }
++    ~RxRef() { reset(); }
++
++    void reset() {
++        if (ptr_ != nullptr) {
++            ptr_->release();
++            ptr_ = nullptr;
++        }
++    }
++    T* get() const { return ptr_; }
++    T* operator->() const { return ptr_; }
++    explicit operator bool() const { return ptr_ != nullptr; }
++
++private:
++    T* ptr_ = nullptr;
++};
++
++// --- Tunables --------------------------------------------------------------
++
++constexpr uint32_t kHeadlessWidth = 256;
++constexpr uint32_t kHeadlessHeight = 256;
++constexpr VkDeviceSize kHeadlessPixelBytes = static_cast<VkDeviceSize>(kHeadlessWidth) * kHeadlessHeight * 4;
++constexpr uint32_t kHeadlessFrameCount = 3;
++
++constexpr uint32_t kPresentWidth = 900;
++constexpr uint32_t kPresentHeight = 700;
++constexpr float kOrbitAzimuthRadPerSec = 0.35F;
++constexpr auto kMaterialPollInterval = std::chrono::seconds(1);  // brief: "~1s", not 02_hotreload's ~250ms.
++
++constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
++
++// --- Scene layout -----------------------------------------------------------
++// See this file's own header comment for the analytic reasoning this
++// arrangement (camera + object placement) makes exact.
++
++constexpr float kCubeHalfExtent = 0.85F;
++constexpr float kSphereRadius = 0.85F;
++constexpr uint32_t kSphereRings = 24;
++constexpr uint32_t kSphereSegments = 32;
++
++enum class Shape : uint32_t { Cube = 0, Sphere = 1 };
++enum class MaterialKind : uint32_t { Checker = 0, Rim = 1 };
++
++struct ObjectSpec {
++    Shape shape;
++    MaterialKind materialKind;
++    glm::vec3 position;
++    std::array<float, 4> param4;  // "tint" (Checker) or "rimColor" (Rim), by name -- see createScene().
++};
++
++// cube A/B get `checker`; sphere A/B get `rim` -- checker's UV pattern reads
++// best on a cube's flat faces, rim's view-dependent glow reads best on a
++// sphere's curved surface, and each material still gets its own two
++// differently-parameterized instances either way.
++constexpr std::array<ObjectSpec, 4> kObjectSpecs{{
++    {Shape::Cube, MaterialKind::Checker, {-2.0F, 1.3F, 0.0F}, {1.00F, 0.55F, 0.15F, 1.0F}},    // checker A -- warm orange
++    {Shape::Cube, MaterialKind::Checker, {2.0F, 1.3F, 0.0F}, {0.15F, 0.85F, 0.90F, 1.0F}},      // checker B -- cool teal
++    {Shape::Sphere, MaterialKind::Rim, {-2.0F, -1.3F, 0.0F}, {0.95F, 0.15F, 0.85F, 1.0F}},      // rim A -- magenta
++    {Shape::Sphere, MaterialKind::Rim, {2.0F, -1.3F, 0.0F}, {0.95F, 0.85F, 0.10F, 1.0F}},       // rim B -- golden yellow
++}};
++constexpr uint32_t kObjectCount = static_cast<uint32_t>(kObjectSpecs.size());
++
++// --- Camera: fixed-radius/elevation orbit, azimuth-only (see this file's
++// header comment on why an ORTHOGRAPHIC camera is load-bearing here, not
++// just a style choice) ------------------------------------------------------
++
++constexpr float kOrbitRadius = 8.0F;
++constexpr float kOrbitNear = 4.0F;
++constexpr float kOrbitFar = 12.0F;
++constexpr float kCameraOrthoHalfWidth = 3.3F;
++constexpr float kCameraOrthoHalfHeight = 2.6F;
++constexpr float kHeadlessAzimuth = 0.0F;  // eye at (0, 0, kOrbitRadius), looking straight down -Z.
++
++// Vulkan clip space is Y-down; glm::ortho assumes OpenGL's Y-up NDC -- the
++// same standard fix every other sample in this codebase applies to its own
++// projection matrix.
++glm::mat4 applyVulkanYFlip(glm::mat4 proj) {
++    proj[1][1] *= -1.0F;
++    return proj;
++}
++
++glm::vec3 cameraEyeForAzimuth(float azimuthRadians) {
++    return glm::vec3(std::sin(azimuthRadians) * kOrbitRadius, 0.0F, std::cos(azimuthRadians) * kOrbitRadius);
++}
++
++struct CameraPose {
++    glm::mat4 viewProj;
++    glm::mat3 viewRotation;
++};
++
++// `viewportWidth`/`viewportHeight` only affect the ASPECT-CORRECTED
++// half-extent (letterbox-fit, same convention samples/04_streaming/
++// 05_multipass already use for their own orthographic cameras) -- never the
++// camera's own position/orientation, which is a pure function of `azimuth`.
++CameraPose makeCameraPose(float azimuthRadians, uint32_t viewportWidth, uint32_t viewportHeight) {
++    const glm::vec3 eye = cameraEyeForAzimuth(azimuthRadians);
++    // up = +Y is never parallel to the view direction at any azimuth (the
++    // view direction stays exactly horizontal, elevation 0, for this
++    // sample's whole orbit) -- no degenerate glm::lookAt case to guard.
++    const glm::mat4 view = glm::lookAt(eye, glm::vec3(0.0F), glm::vec3(0.0F, 1.0F, 0.0F));
++
++    float halfWidth = kCameraOrthoHalfWidth;
++    float halfHeight = kCameraOrthoHalfHeight;
++    const float aspect = static_cast<float>(viewportWidth) / static_cast<float>(viewportHeight);
++    const float contentAspect = halfWidth / halfHeight;
++    if (aspect > contentAspect) {
++        halfWidth = halfHeight * aspect;
++    } else {
++        halfHeight = halfWidth / aspect;
++    }
++    const glm::mat4 proj = applyVulkanYFlip(glm::ortho(-halfWidth, halfWidth, -halfHeight, halfHeight, kOrbitNear, kOrbitFar));
++
++    CameraPose pose;
++    pose.viewProj = proj * view;
++    pose.viewRotation = glm::mat3(view);
++    return pose;
++}
++
++struct PixelCoord {
++    uint32_t x;
++    uint32_t y;
++};
++
++// Projects `worldPos` through `viewProj` to a real screen pixel. Orthographic
++// projection never touches w (see this file's header comment) -- clip.w is
++// always exactly 1.0 here, so this never needs a perspective divide.
++PixelCoord projectToPixel(glm::vec3 worldPos, const glm::mat4& viewProj, uint32_t width, uint32_t height) {
++    const glm::vec4 clip = viewProj * glm::vec4(worldPos, 1.0F);
++    const float ndcX = clip.x / clip.w;
++    const float ndcY = clip.y / clip.w;
++    const float pixelX = (ndcX * 0.5F + 0.5F) * static_cast<float>(width);
++    const float pixelY = (ndcY * 0.5F + 0.5F) * static_cast<float>(height);
++    const uint32_t x = static_cast<uint32_t>(std::clamp(pixelX, 0.0F, static_cast<float>(width) - 1.0F));
++    const uint32_t y = static_cast<uint32_t>(std::clamp(pixelY, 0.0F, static_cast<float>(height) - 1.0F));
++    return {x, y};
++}
++
++// --- Procedural geometry: position + normal + uv (03_bindless_mesh's own
++// position+uv convention, extended with 05_multipass's per-vertex normal --
++// this sample's checker.slang needs uv, rim.slang needs normal, and both
++// need to conform to rx_material's OWN fixed vertex-input layout, byte-for-
++// byte -- see the Vertex struct's own static_assert below and forward_entry.
++// slang's "VERTEX INPUT LAYOUT" header comment for the contract this must
++// match exactly: MaterialSystem::getPipeline() builds its
++// VkVertexInputAttributeDescription table internally, from this exact
++// struct shape, not from anything this file declares to it directly. ------
++
++struct Vertex {
++    float position[3];
++    float normal[3];
++    float uv[2];
++};
++static_assert(sizeof(Vertex) == 32,
++              "Vertex must byte-match rx_material's internal MaterialVertexLayout (material_system.cpp) exactly -- "
++              "tightly packed float3 position + float3 normal + float2 uv, no padding, matching forward_entry.slang's "
++              "own vertexMain(position, normal, uv) parameter list.");
++
++struct HostMesh {
++    std::vector<Vertex> vertices;
++    std::vector<uint32_t> indices;
++};
++
++// Adds one quad (two triangles) with per-corner UV (0,0)-(1,0)-(1,1)-(0,1)
++// -- the SAME parameterization on every face, which is exactly what makes
++// every face's own geometric center land at UV (0.5, 0.5) (see this file's
++// header comment, point (b)).
++void addQuad(HostMesh& mesh, glm::vec3 a, glm::vec3 b, glm::vec3 c, glm::vec3 d, glm::vec3 normal) {
++    const uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
++    const std::array<glm::vec3, 4> corners{a, b, c, d};
++    constexpr std::array<std::array<float, 2>, 4> kCornerUv{{{0.0F, 0.0F}, {1.0F, 0.0F}, {1.0F, 1.0F}, {0.0F, 1.0F}}};
++    for (size_t i = 0; i < corners.size(); ++i) {
++        Vertex v{};
++        v.position[0] = corners[i].x;
++        v.position[1] = corners[i].y;
++        v.position[2] = corners[i].z;
++        v.normal[0] = normal.x;
++        v.normal[1] = normal.y;
++        v.normal[2] = normal.z;
++        v.uv[0] = kCornerUv[i][0];
++        v.uv[1] = kCornerUv[i][1];
++        mesh.vertices.push_back(v);
++    }
++    // Winding [empirically verified, not assumed -- see this file's own
++    // development history]: unlike every earlier sample (01-05, all of
++    // which set VK_CULL_MODE_NONE for their own hand-built pipelines),
++    // MaterialSystem's fixed rasterization state (material_system.cpp)
++    // enables VK_CULL_MODE_BACK_BIT with VK_FRONT_FACE_COUNTER_CLOCKWISE --
++    // the first sample in this codebase where a mesh's winding actually
++    // matters. Combined with this file's own applyVulkanYFlip() (needed for
++    // the projection matrix regardless), the winding that reads as
++    // "counter-clockwise, outward-facing" in a plain Y-up authoring sense
++    // reverses to CLOCKWISE in Vulkan's own framebuffer-space convention --
++    // confirmed directly: with the OTHER winding, rim.slang's own
++    // view-dependent probe read back the mesh's FAR side (ndotv == -1) at
++    // every headless probe pixel, not the near side, while checker.slang's
++    // own probe still happened to pass regardless (every cube face shares
++    // the identical UV parameterization, front or back, so that probe
++    // alone could not have caught this). (base, base+2, base+1) / (base,
++    // base+3, base+2) -- reversed from the "natural" (base, base+1, base+2)
++    // / (base, base+2, base+3) -- is what actually renders each face's
++    // intended (outward, camera-facing) side.
++    mesh.indices.push_back(base + 0);
++    mesh.indices.push_back(base + 2);
++    mesh.indices.push_back(base + 1);
++    mesh.indices.push_back(base + 0);
++    mesh.indices.push_back(base + 3);
++    mesh.indices.push_back(base + 2);
++}
++
++// Half-extent `h` cube, local-space, unrotated. The 5th face declared here
++// (local +Z, normal (0,0,1)) is the one facing the camera at headless
++// azimuth 0 (eye at (0,0,+kOrbitRadius) looking down -Z) -- its own
++// geometric center, (0,0,h) in local space, is exactly where this file's
++// header comment's point (b) applies.
++HostMesh generateCube(float h) {
++    HostMesh mesh;
++    addQuad(mesh, {h, -h, -h}, {h, h, -h}, {h, h, h}, {h, -h, h}, {1, 0, 0});        // +X
++    addQuad(mesh, {-h, -h, h}, {-h, h, h}, {-h, h, -h}, {-h, -h, -h}, {-1, 0, 0});    // -X
++    addQuad(mesh, {-h, h, -h}, {-h, h, h}, {h, h, h}, {h, h, -h}, {0, 1, 0});         // +Y
++    addQuad(mesh, {-h, -h, h}, {-h, -h, -h}, {h, -h, -h}, {h, -h, h}, {0, -1, 0});    // -Y
++    addQuad(mesh, {-h, -h, h}, {h, -h, h}, {h, h, h}, {-h, h, h}, {0, 0, 1});         // +Z -- faces the camera at azimuth 0.
++    addQuad(mesh, {h, -h, -h}, {-h, -h, -h}, {-h, h, -h}, {h, h, -h}, {0, 0, -1});    // -Z
++    return mesh;
++}
++
++// Standard UV sphere centered at the origin -- normal = normalized position
++// exactly (every point on an origin-centered sphere has its outward normal
++// exactly along its own position vector). `u`/`v` (longitude/colatitude,
++// [0,1]^2) are stored per-vertex too, even though rim.slang never reads
++// them for shading -- checker.slang could be pointed at a sphere just as
++// well, and a UV sphere is the established convention
++// (samples/03_bindless_mesh/05_multipass) either way.
++HostMesh generateSphere(float radius, uint32_t rings, uint32_t segments) {
++    HostMesh mesh;
++    constexpr float kPi = 3.14159265358979323846F;
++
++    for (uint32_t y = 0; y <= rings; ++y) {
++        const float v = static_cast<float>(y) / static_cast<float>(rings);
++        const float theta = v * kPi;
++        const float sinTheta = std::sin(theta);
++        const float cosTheta = std::cos(theta);
++        for (uint32_t x = 0; x <= segments; ++x) {
++            const float u = static_cast<float>(x) / static_cast<float>(segments);
++            const float phi = u * 2.0F * kPi;
++            const glm::vec3 dir(sinTheta * std::cos(phi), cosTheta, sinTheta * std::sin(phi));
++            Vertex vert{};
++            vert.position[0] = radius * dir.x;
++            vert.position[1] = radius * dir.y;
++            vert.position[2] = radius * dir.z;
++            vert.normal[0] = dir.x;
++            vert.normal[1] = dir.y;
++            vert.normal[2] = dir.z;
++            vert.uv[0] = u;
++            vert.uv[1] = v;
++            mesh.vertices.push_back(vert);
++        }
++    }
++
++    const uint32_t stride = segments + 1;
++    for (uint32_t y = 0; y < rings; ++y) {
++        for (uint32_t x = 0; x < segments; ++x) {
++            const uint32_t i0 = y * stride + x;
++            const uint32_t i1 = i0 + 1;
++            const uint32_t i2 = i0 + stride;
++            const uint32_t i3 = i2 + 1;
++            // Winding reversed from samples/05_multipass's own identical
++            // sphere generator -- see addQuad()'s own comment for why this
++            // sample (the first with real backface culling active) needs
++            // the opposite winding convention.
++            mesh.indices.push_back(i0);
++            mesh.indices.push_back(i1);
++            mesh.indices.push_back(i2);
++            mesh.indices.push_back(i1);
++            mesh.indices.push_back(i3);
++            mesh.indices.push_back(i2);
++        }
++    }
++    return mesh;
++}
++
++// Small procedural checkerboard texture's raw RGBA8 pixels -- created via
++// the PUBLIC IRxMaterialSystem::createTexture2D() (see createScene() below)
++// and bound via IRxMaterialInstance::setTexture() to exercise that public
++// path end to end [binding global constraint]. See checker.slang's own
++// header comment for why its CONTENT never actually reaches the rendered
++// image (Phase 3 materials cannot sample a bindless texture from inside
++// their own evaluate() yet) -- generated as a genuine checkerboard anyway,
++// for the same reason a test fixture still exercises real behavior even
++// when only part of its result is currently observable.
++std::vector<uint8_t> generateCheckerTexturePixels(uint32_t size, uint32_t cellSize) {
++    std::vector<uint8_t> pixels(static_cast<size_t>(size) * size * 4);
++    for (uint32_t y = 0; y < size; ++y) {
++        for (uint32_t x = 0; x < size; ++x) {
++            const uint32_t cellX = x / cellSize;
++            const uint32_t cellY = y / cellSize;
++            const uint8_t value = ((cellX + cellY) % 2 == 0) ? 255 : 0;
++            const size_t idx = (static_cast<size_t>(y) * size + x) * 4;
++            pixels[idx + 0] = value;
++            pixels[idx + 1] = value;
++            pixels[idx + 2] = value;
++            pixels[idx + 3] = 255;
++        }
++    }
++    return pixels;
++}
++
++// ============================================================================
++// rx_material INTERNAL BRIDGE -- namespace materialBridge (BEGIN)
++// ============================================================================
++// Every function below is the ONLY code in this file that names an
++// rx_material-internal type (rx::material::MaterialSystem/MaterialHandle/
++// InstanceBinding) or calls rx_api_detail.h's bridge accessors. Everything
++// OUTSIDE this namespace (Scene, createScene(), recordDraws(), main(), ...)
++// only ever touches `MaterialSystemHandle` below, whose own DEFINITION
++// stores the internal system as an opaque `void*` -- so even a caller that
++// holds one of these handles never has the internal type NAME in scope,
++// let alone casts anything to it. That is deliberately stricter than the
++// letter of this task's acceptance criterion ("no IRx* object is ever cast
++// to an internal type outside [the bridge]") -- it also keeps the internal
++// type's NAME itself out of every other struct/function signature in this
++// file, which is a stronger, easier-to-grep version of the same rule.
++namespace materialBridge {
++
++struct MaterialSystemHandle {
++    void* internal = nullptr;                // rx::material::MaterialSystem*, owned by this handle.
++    IRxMaterialSystem* publicApi = nullptr;   // refcount 1; released by destroySystem() below.
++};
++
++// SYSTEM CREATION bridge: builds the real internal rx::material::
++// MaterialSystem (material_system.h's own create(), including this sample's
++// resolved `sharedShaderDir` -- see main()'s own comment on why this is a
++// real runtime path here, not RX_MATERIAL_SHADER_DIR's compile-time
++// default), then bridges it into a public IRxMaterialSystem via
++// RxMaterialSystemDesc + rxCreateMaterialSystem() exactly as rx_api.h's own
++// factory doc documents. Returns std::nullopt (logged) on either step's
++// failure -- callers never end up holding a half-constructed handle.
++std::optional<MaterialSystemHandle> createSystem(rx::rhi::Device& device, rx::rhi::BindlessTable& bindless,
++                                                  const std::filesystem::path& pipelineCachePath,
++                                                  const std::filesystem::path& sharedShaderDir) {
++    auto internalSystem = rx::material::MaterialSystem::create(device, bindless, pipelineCachePath, sharedShaderDir);
++    if (internalSystem == nullptr) {
++        RX_LOG_ERROR("sample_06_materials: rx::material::MaterialSystem::create failed");
++        return std::nullopt;
++    }
++
++    RxMaterialSystemDesc desc{internalSystem.get()};
++    IRxMaterialSystem* publicSystem = nullptr;
++    if (rxCreateMaterialSystem(&desc, &publicSystem) != RX_OK || publicSystem == nullptr) {
++        RX_LOG_ERROR("sample_06_materials: rxCreateMaterialSystem failed");
++        return std::nullopt;
++    }
++
++    MaterialSystemHandle handle;
++    handle.internal = internalSystem.release();  // ownership moves into this handle now.
++    handle.publicApi = publicSystem;
++    return handle;
++}
++
++// Releases the public wrapper (its own release() drops rx_api.h's own
++// refcount to 0, destroying api_impl.cpp's MaterialSystemImpl -- that
++// object does NOT own the internal system, so this is safe regardless of
++// order relative to the line below) and destroys the internal
++// rx::material::MaterialSystem -- whose own destructor waits for the
++// device to go idle first (material_system.h's own destructor contract).
++// Callers must call this BEFORE the rx::rhi::BindlessTable this handle was
++// created against is destroyed (MaterialSystem::create()'s own doc: "the
++// returned MaterialSystem does NOT take ownership [of bindless]... bindless
++// must outlive this MaterialSystem") -- see destroyScene() below for where
++// that ordering is actually enforced.
++void destroySystem(MaterialSystemHandle& handle) {
++    if (handle.publicApi != nullptr) {
++        handle.publicApi->release();
++        handle.publicApi = nullptr;
++    }
++    if (handle.internal != nullptr) {
++        std::unique_ptr<rx::material::MaterialSystem> owned(static_cast<rx::material::MaterialSystem*>(handle.internal));
++        handle.internal = nullptr;
++        // `owned` destructs here.
++    }
++}
++
++void beginFrame(MaterialSystemHandle& handle, uint32_t frameInFlightIndex, uint64_t frameNumber) {
++    static_cast<rx::material::MaterialSystem*>(handle.internal)->beginFrame(frameInFlightIndex, frameNumber);
++}
++
++void onFrameCompleted(MaterialSystemHandle& handle, uint64_t completedFrameNumber) {
++    static_cast<rx::material::MaterialSystem*>(handle.internal)->onFrameCompleted(completedFrameNumber);
++}
++
++// DRAW-TIME BINDING bridge: resolves `instance`'s pipeline for `ctx`'s own
++// pass shape and binds it plus its set-1 parameter UBO (bindInstance() --
++// lazily compiles via getPipeline() internally, exactly as that method's
++// own doc describes), then returns the material's VkPipelineLayout so the
++// caller can separately bind descriptor SET 0 (the bindless table) itself
++// -- bindInstance() never touches set 0 by design (material_system.h's own
++// comment: "the caller binds the owning rx::rhi::BindlessTable's own
++// descriptor set once per frame/pass"). Throws exactly what bindInstance()/
++// materialHandle()/materialInstanceBlobData() themselves document throwing
++// (std::out_of_range for a stale MaterialHandle, std::invalid_argument for
++// a paramSize mismatch, std::runtime_error for an exhausted parameter arena
++// or a pipeline-build failure) -- recordDraws() below is this function's
++// only caller, and it is the one that decides what "keep last good" means
++// for a failure here (see that function's own comment).
++VkPipelineLayout bindAndGetLayout(MaterialSystemHandle& handle, VkCommandBuffer cmd, const rx::graph::PassContext& ctx,
++                                   IRxMaterial* material, IRxMaterialInstance* instance) {
++    auto* system = static_cast<rx::material::MaterialSystem*>(handle.internal);
++    rx::material::MaterialHandle materialHandle = rx::material::detail::materialHandle(material);
++    rx::material::InstanceBinding binding{materialHandle, rx::material::detail::materialInstanceBlobData(instance),
++                                           rx::material::detail::materialInstanceBlobSize(instance)};
++    system->bindInstance(cmd, ctx, binding);
++    return system->pipelineLayout(materialHandle);
++}
++
++}  // namespace materialBridge
++// ============================================================================
++// rx_material INTERNAL BRIDGE -- namespace materialBridge (END)
++// ============================================================================
++
++// --- Scene ------------------------------------------------------------------
++// Every material creation/instance/texture call from here on is a PUBLIC
++// rx_api.h call (IRxMaterialSystem/IRxMaterial/IRxMaterialInstance/
++// IRxTexture) -- the only non-public thing anything below touches is
++// `materialBridge::MaterialSystemHandle` itself, whose own definition is
++// just a `{void*, IRxMaterialSystem*}` pair (see that struct's own comment).
++
++struct ObjectGpu {
++    Shape shape;
++    glm::vec3 position;
++    std::optional<rx::rhi::Buffer> vertexBuffer;  // sized 2x (rx::rhi::FrameSync::kFramesInFlight) for double-buffering.
++    VkDeviceSize vertexBytesPerFrame = 0;
++    IRxMaterial* material = nullptr;          // non-owning -- Scene::checkerMaterial/rimMaterial owns the +1 ref.
++    IRxMaterialInstance* instance = nullptr;  // owning (+1 ref) -- released in destroyScene().
++};
++
++struct Scene {
++    // std::optional, not a plain member: rx::rhi::BindlessTable's own
++    // default constructor is private (BindlessTable::create() is the only
++    // way to build a real one), so Scene has no accessible default to
++    // construct it with directly -- the same reason MaterialSystem::Impl's
++    // own Allocator/Uploader/ParamArena members are std::optional
++    // (material_system.cpp). LOAD-BEARING here, not just style: this is
++    // what lets a caller declare `Scene scene;` ONCE, in its own stack
++    // frame, and pass `scene` BY REFERENCE into createScene() below to be
++    // populated in place -- see createScene()'s own header comment for the
++    // real bug this fixes (a returned-by-value Scene relocates its
++    // BindlessTable to a new address the moment it moves, which is exactly
++    // the address MaterialSystem::create() stores a raw pointer to for its
++    // own entire lifetime).
++    std::optional<rx::rhi::BindlessTable> bindlessTable;
++    materialBridge::MaterialSystemHandle materialSystem;
++
++    IRxMaterial* checkerMaterial = nullptr;
++    IRxMaterial* rimMaterial = nullptr;
++    IRxTexture* checkerTexture = nullptr;
++
++    HostMesh cubeHostMesh;
++    HostMesh sphereHostMesh;
++    std::optional<rx::rhi::Buffer> cubeIndexBuffer;
++    std::optional<rx::rhi::Buffer> sphereIndexBuffer;
++    uint32_t cubeIndexCount = 0;
++    uint32_t sphereIndexCount = 0;
++
++    std::array<ObjectGpu, kObjectCount> objects;
++
++    // Mutated once per frame before Executor::execute() runs, read back
++    // inside recordDraws() -- same small-piece-of-reference-captured-mutable-
++    // state convention samples/05_multipass's own Scene::
++    // currentFrameInFlightIndex establishes, for the identical reason
++    // (Pass::setExecute()'s callback signature carries no per-frame
++    // parameter of its own).
++    uint32_t currentFrameInFlightIndex = 0;
++};
++
++// Explicit, ordered teardown -- same discipline every other sample in this
++// codebase uses (destroyScene() called before the owning Device/Context/
++// Allocator/Executor go out of scope). Order matters here specifically:
++// materialBridge::destroySystem() must run while `scene.bindlessTable` is
++// STILL ALIVE (MaterialSystem::create()'s own contract: "bindless must
++// outlive this MaterialSystem") -- calling it here, before this function
++// returns and before `scene` itself is ever destructed, guarantees that
++// regardless of Scene's own member declaration order.
++void destroyScene(Scene& scene) {
++    for (ObjectGpu& obj : scene.objects) {
++        if (obj.instance != nullptr) {
++            obj.instance->release();
++            obj.instance = nullptr;
++        }
++        obj.material = nullptr;  // non-owning.
++        obj.vertexBuffer.reset();
++    }
++    scene.cubeIndexBuffer.reset();
++    scene.sphereIndexBuffer.reset();
++    if (scene.checkerTexture != nullptr) {
++        scene.checkerTexture->release();
++        scene.checkerTexture = nullptr;
++    }
++    if (scene.checkerMaterial != nullptr) {
++        scene.checkerMaterial->release();
++        scene.checkerMaterial = nullptr;
++    }
++    if (scene.rimMaterial != nullptr) {
++        scene.rimMaterial->release();
++        scene.rimMaterial = nullptr;
++    }
++    materialBridge::destroySystem(scene.materialSystem);
++    // scene.bindlessTable destructs via RAII once `scene` itself does --
++    // safe now, since materialBridge::destroySystem() above already ran.
++}
++
++// Populates `scene` IN PLACE (an out-parameter, not a return value) --
++// LOAD-BEARING, not a style choice: MaterialSystem::create() (called via
++// materialBridge::createSystem() below) stores a raw pointer to whatever
++// rx::rhi::BindlessTable reference it is given, for this MaterialSystem
++// instance's ENTIRE remaining lifetime (material_system.h's own "bindless
++// must outlive this MaterialSystem" contract). An earlier version of this
++// function built a local `Scene` and returned it BY VALUE
++// (`std::optional<Scene>`) -- which worked (and passed every visible check)
++// right up until the first real MaterialSystem::reloadChanged() call, and
++// only then failed with real Vulkan validation errors: the returned Scene
++// relocates its `bindlessTable` member to the CALLER's own storage the
++// moment the by-value return actually moves it, silently invalidating the
++// raw pointer MaterialSystem::create() had already captured against the
++// LOCAL (about-to-be-destroyed) copy -- reads through that now-dangling
++// pointer happened to come back as all-zero bytes on this development
++// machine, which is exactly why `bindless.descriptorSetLayout()` returned
++// VK_NULL_HANDLE (silently skipping the external-set-0 substitution) only
++// on the SECOND (reload-triggered) PipelineLayoutBuilder::build() call, not
++// the first -- load-time compileMaterial() calls, made from INSIDE this
++// function before the old by-value return ever ran, always saw the still-
++// live local object. Confirmed directly (not guessed) by instrumenting
++// PipelineLayoutBuilder::build() and MaterialSystem::reloadChanged()'s own
++// call site during this task's own development and reproducing the exact
++// VK_NULL_HANDLE readback before this fix. Taking `scene` by reference,
++// populated by a caller that declares it ONCE in its own stack frame and
++// never moves/returns it again, gives `bindlessTable` one single, stable
++// address for its entire lifetime.
++bool createScene(Scene& scene, VkPhysicalDevice physicalDevice, rx::rhi::Device& device, rx::rhi::Allocator& allocator,
++                  rx::rhi::Uploader& uploader, const std::filesystem::path& sharedShaderDir,
++                  const std::filesystem::path& materialsDir, const std::filesystem::path& pipelineCachePath) {
++    rx::rhi::BindlessTable::Capacities capacities{/*sampledImages=*/4, /*samplers=*/1, /*storageBuffers=*/1};
++    auto bindlessTable = rx::rhi::BindlessTable::create(physicalDevice, device.device(), capacities);
++    if (!bindlessTable.has_value()) {
++        RX_LOG_ERROR("sample_06_materials: BindlessTable::create failed");
++        return false;
++    }
++    scene.bindlessTable = std::move(*bindlessTable);
++
++    // ===== rx_material bridge: system creation (materialBridge, above) ====
++    auto systemHandle =
++        materialBridge::createSystem(device, *scene.bindlessTable, pipelineCachePath, sharedShaderDir);
++    if (!systemHandle.has_value()) {
++        return false;
++    }
++    scene.materialSystem = std::move(*systemHandle);
++
++    // ===== Public rx_api.h calls from here on ===========================
++    const std::string checkerPath = (materialsDir / "checker.slang").string();
++    if (scene.materialSystem.publicApi->loadMaterial(checkerPath.c_str(), &scene.checkerMaterial) != RX_OK) {
++        RX_LOG_ERROR("sample_06_materials: loadMaterial('{}') failed", checkerPath);
++        destroyScene(scene);
++        return false;
++    }
++    const std::string rimPath = (materialsDir / "rim.slang").string();
++    if (scene.materialSystem.publicApi->loadMaterial(rimPath.c_str(), &scene.rimMaterial) != RX_OK) {
++        RX_LOG_ERROR("sample_06_materials: loadMaterial('{}') failed", rimPath);
++        destroyScene(scene);
++        return false;
++    }
++
++    const std::vector<uint8_t> checkerPixels = generateCheckerTexturePixels(/*size=*/8, /*cellSize=*/2);
++    RxTextureDesc textureDesc{};
++    textureDesc.pixels = checkerPixels.data();
++    textureDesc.pixelBytes = checkerPixels.size();
++    textureDesc.width = 8;
++    textureDesc.height = 8;
++    textureDesc.format = RX_FORMAT_RGBA8_UNORM;
++    textureDesc.generateMips = 0;
++    if (scene.materialSystem.publicApi->createTexture2D(&textureDesc, &scene.checkerTexture) != RX_OK) {
++        RX_LOG_ERROR("sample_06_materials: createTexture2D failed");
++        destroyScene(scene);
++        return false;
++    }
++
++    scene.cubeHostMesh = generateCube(kCubeHalfExtent);
++    scene.sphereHostMesh = generateSphere(kSphereRadius, kSphereRings, kSphereSegments);
++
++    auto uploadIndexBuffer = [&](const HostMesh& mesh) -> std::optional<rx::rhi::Buffer> {
++        const VkDeviceSize bytes = static_cast<VkDeviceSize>(mesh.indices.size()) * sizeof(uint32_t);
++        auto buffer =
++            allocator.createDeviceLocalBuffer(bytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++        if (!buffer.has_value()) {
++            return std::nullopt;
++        }
++        uploader.uploadToBuffer(*buffer, 0, mesh.indices.data(), bytes);
++        return buffer;
++    };
++    auto cubeIndexBuffer = uploadIndexBuffer(scene.cubeHostMesh);
++    auto sphereIndexBuffer = uploadIndexBuffer(scene.sphereHostMesh);
++    if (!cubeIndexBuffer.has_value() || !sphereIndexBuffer.has_value()) {
++        RX_LOG_ERROR("sample_06_materials: createDeviceLocalBuffer/uploadToBuffer failed for an index buffer");
++        destroyScene(scene);
++        return false;
++    }
++    scene.cubeIndexBuffer = std::move(cubeIndexBuffer);
++    scene.sphereIndexBuffer = std::move(sphereIndexBuffer);
++    scene.cubeIndexCount = static_cast<uint32_t>(scene.cubeHostMesh.indices.size());
++    scene.sphereIndexCount = static_cast<uint32_t>(scene.sphereHostMesh.indices.size());
++    uploader.flush();
++
++    for (size_t i = 0; i < kObjectSpecs.size(); ++i) {
++        const ObjectSpec& spec = kObjectSpecs[i];
++        ObjectGpu& obj = scene.objects[i];
++        obj.shape = spec.shape;
++        obj.position = spec.position;
++        obj.material = (spec.materialKind == MaterialKind::Checker) ? scene.checkerMaterial : scene.rimMaterial;
++
++        if (obj.material->createInstance(&obj.instance) != RX_OK) {
++            RX_LOG_ERROR("sample_06_materials: createInstance failed for object {}", i);
++            destroyScene(scene);
++            return false;
++        }
++
++        if (spec.materialKind == MaterialKind::Checker) {
++            if (obj.instance->setFloat4("tint", spec.param4.data()) != RX_OK) {
++                RX_LOG_ERROR("sample_06_materials: setFloat4('tint') failed for object {}", i);
++                destroyScene(scene);
++                return false;
++            }
++            if (obj.instance->setTexture("checkerTexIndex", scene.checkerTexture) != RX_OK) {
++                RX_LOG_ERROR("sample_06_materials: setTexture('checkerTexIndex') failed for object {}", i);
++                destroyScene(scene);
++                return false;
++            }
++        } else {
++            if (obj.instance->setFloat4("rimColor", spec.param4.data()) != RX_OK) {
++                RX_LOG_ERROR("sample_06_materials: setFloat4('rimColor') failed for object {}", i);
++                destroyScene(scene);
++                return false;
++            }
++        }
++
++        const HostMesh& hostMesh = (spec.shape == Shape::Cube) ? scene.cubeHostMesh : scene.sphereHostMesh;
++        const VkDeviceSize vertexBytes = static_cast<VkDeviceSize>(hostMesh.vertices.size()) * sizeof(Vertex);
++        obj.vertexBytesPerFrame = vertexBytes;
++        auto vertexBuffer = allocator.createDeviceLocalBuffer(
++            vertexBytes * rx::rhi::FrameSync::kFramesInFlight, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++        if (!vertexBuffer.has_value()) {
++            RX_LOG_ERROR("sample_06_materials: createDeviceLocalBuffer failed for object {}'s vertex buffer", i);
++            destroyScene(scene);
++            return false;
++        }
++        obj.vertexBuffer = std::move(vertexBuffer);
++    }
++
++    return true;
++}
++
++// Transforms `object`'s host mesh into clip-space positions + view-space
++// normals (see this file's header comment for why) and uploads the result
++// into frame slot `frameInFlightIndex`'s half of its double-buffered vertex
++// buffer. `pose.viewRotation` alone (not the full model matrix) is applied
++// to normals -- correct because every object here only ever TRANSLATES
++// (model = pure translation, per kObjectSpecs), so object-space normals
++// equal world-space normals already, mirroring samples/05_multipass's
++// identical "translation-only model matrix" simplification.
++void transformAndUploadObjectVertices(rx::rhi::Uploader& uploader, const HostMesh& hostMesh, ObjectGpu& object,
++                                       uint32_t frameInFlightIndex, const CameraPose& pose) {
++    std::vector<Vertex> transformed(hostMesh.vertices.size());
++    for (size_t i = 0; i < transformed.size(); ++i) {
++        const Vertex& src = hostMesh.vertices[i];
++        const glm::vec3 worldPos = glm::vec3(src.position[0], src.position[1], src.position[2]) + object.position;
++        const glm::vec4 clip = pose.viewProj * glm::vec4(worldPos, 1.0F);
++        const glm::vec3 localNormal(src.normal[0], src.normal[1], src.normal[2]);
++        const glm::vec3 viewNormal = glm::normalize(pose.viewRotation * localNormal);
++
++        Vertex& dst = transformed[i];
++        dst.position[0] = clip.x;
++        dst.position[1] = clip.y;
++        dst.position[2] = clip.z;
++        dst.normal[0] = viewNormal.x;
++        dst.normal[1] = viewNormal.y;
++        dst.normal[2] = viewNormal.z;
++        dst.uv[0] = src.uv[0];
++        dst.uv[1] = src.uv[1];
++    }
++    const VkDeviceSize dstOffset = static_cast<VkDeviceSize>(frameInFlightIndex) * object.vertexBytesPerFrame;
++    uploader.uploadToBuffer(*object.vertexBuffer, dstOffset, transformed.data(), object.vertexBytesPerFrame);
++}
++
++void updateFrame(rx::rhi::Uploader& uploader, Scene& scene, uint32_t frameInFlightIndex, float azimuthRadians,
++                  uint32_t viewportWidth, uint32_t viewportHeight) {
++    scene.currentFrameInFlightIndex = frameInFlightIndex;
++    const CameraPose pose = makeCameraPose(azimuthRadians, viewportWidth, viewportHeight);
++    for (size_t i = 0; i < kObjectSpecs.size(); ++i) {
++        ObjectGpu& obj = scene.objects[i];
++        const HostMesh& hostMesh = (obj.shape == Shape::Cube) ? scene.cubeHostMesh : scene.sphereHostMesh;
++        transformAndUploadObjectVertices(uploader, hostMesh, obj, frameInFlightIndex, pose);
++    }
++    uploader.flush();
++}
++
++// --- Render-graph declaration + draw recording ------------------------------
++
++rx::graph::AttachmentDesc swapchainRelativeDesc(VkFormat format) {
++    rx::graph::AttachmentDesc desc;
++    desc.format = format;
++    desc.sizeClass = rx::graph::SizeClass::SwapchainRelative;
++    desc.width = 1.0F;
++    desc.height = 1.0F;
++    return desc;
++}
++
++// Records all 4 objects' draws for the single "forward" pass. Binds
++// descriptor SET 0 (the bindless table) exactly once, right after the
++// first object's own pipeline is bound -- safe because every material this
++// sample loads shares the IDENTICAL VkDescriptorSetLayout for set 0 (the
++// same `bindlessTable.descriptorSetLayout()` handle, passed to every
++// MaterialSystem::loadMaterial()-driven PipelineLayoutBuilder::build() call
++// internally), so set 0 stays Vulkan-compatible across every later
++// vkCmdBindPipeline call bindAndGetLayout() issues for a DIFFERENT
++// material, per the spec's pipeline-layout-compatibility rule.
++//
++// KEEP-LAST-GOOD, EXTENDED TO THE DRAW-TIME BIND ITSELF [see this file's
++// header comment]: a hot-reloaded materials/checker.slang or materials/
++// rim.slang edit that changes `gParams`'s FIELD SHAPE (not just its math)
++// leaves an already-created IRxMaterialInstance holding a blob sized to the
++// OLD shape, which bindAndGetLayout()'s own bindInstance() call would then
++// reject (std::invalid_argument, paramSize mismatch) -- rather than let
++// that propagate up through Executor::execute() and crash a running
++// --present session, this loop catches it per-object, logs it, and skips
++// only that object's draw for this one frame. Every OTHER object (sharing
++// neither the edited file nor, in headless mode, ever exercising this path
++// at all) keeps rendering normally.
++void recordDraws(rx::graph::PassContext& ctx, Scene& scene) {
++    VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.renderArea.width), static_cast<float>(ctx.renderArea.height),
++                         0.0F, 1.0F};
++    VkRect2D scissor{{0, 0}, ctx.renderArea};
++    vkCmdSetViewport(ctx.cmd, 0, 1, &viewport);
++    vkCmdSetScissor(ctx.cmd, 0, 1, &scissor);
++
++    bool bindlessSetBound = false;
++    for (ObjectGpu& object : scene.objects) {
++        VkPipelineLayout layout = VK_NULL_HANDLE;
++        try {
++            layout = materialBridge::bindAndGetLayout(scene.materialSystem, ctx.cmd, ctx, object.material, object.instance);
++        } catch (const std::exception& e) {
++            RX_LOG_ERROR("sample_06_materials: bindAndGetLayout failed for material '{}': {} -- skipping this "
++                         "object's draw for this frame (keep-last-good)",
++                         object.material->name(), e.what());
++            continue;
++        }
++
++        if (!bindlessSetBound) {
++            VkDescriptorSet bindlessSet = scene.bindlessTable->descriptorSet();
++            vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, /*firstSet=*/0, 1, &bindlessSet, 0,
++                                     nullptr);
++            bindlessSetBound = true;
++        }
++
++        VkBuffer vertexBuffer = object.vertexBuffer->handle();
++        VkDeviceSize vertexOffset = static_cast<VkDeviceSize>(scene.currentFrameInFlightIndex) * object.vertexBytesPerFrame;
++        vkCmdBindVertexBuffers(ctx.cmd, 0, 1, &vertexBuffer, &vertexOffset);
++
++        const rx::rhi::Buffer& indexBuffer = (object.shape == Shape::Cube) ? *scene.cubeIndexBuffer : *scene.sphereIndexBuffer;
++        const uint32_t indexCount = (object.shape == Shape::Cube) ? scene.cubeIndexCount : scene.sphereIndexCount;
++        vkCmdBindIndexBuffer(ctx.cmd, indexBuffer.handle(), 0, VK_INDEX_TYPE_UINT32);
++        vkCmdDrawIndexed(ctx.cmd, indexCount, 1, 0, 0, 0);
++    }
++}
++
++void declareGraph(rx::graph::RenderGraph& graph, Scene& scene, VkFormat backbufferFormat) {
++    graph.addPass("forward")
++        .addColorOutput("backbuffer", swapchainRelativeDesc(backbufferFormat))
++        .setDepthStencilOutput("depth", swapchainRelativeDesc(kDepthFormat))
++        .setExecute([&scene](rx::graph::PassContext& ctx) { recordDraws(ctx, scene); });
++    graph.setBackbufferSource("backbuffer");
++}
++
++// --- Headless probe derivation ----------------------------------------------
++// See this file's own header comment for the full analytic reasoning; this
++// section only turns that reasoning into concrete expected-byte tables.
++
++uint8_t srgbEncodeByte(uint8_t linearByte) {
++    const float v = static_cast<float>(linearByte) / 255.0F;
++    const float encoded = (v <= 0.0031308F) ? (12.92F * v) : (1.055F * std::pow(v, 1.0F / 2.4F) - 0.055F);
++    return static_cast<uint8_t>(std::clamp(encoded * 255.0F + 0.5F, 0.0F, 255.0F));
++}
++
++std::array<uint8_t, 3> toByteColor(glm::vec3 linear) {
++    auto toByte = [](float c) { return static_cast<uint8_t>(std::clamp(c * 255.0F + 0.5F, 0.0F, 255.0F)); };
++    return {toByte(linear.r), toByte(linear.g), toByte(linear.b)};
++}
++
++std::array<uint8_t, 3> srgbEncodeColor(const std::array<uint8_t, 3>& linear) {
++    return {srgbEncodeByte(linear[0]), srgbEncodeByte(linear[1]), srgbEncodeByte(linear[2])};
++}
++
++int colorDistanceSq(const std::array<uint8_t, 3>& a, const std::array<uint8_t, 3>& b) {
++    const int dr = static_cast<int>(a[0]) - static_cast<int>(b[0]);
++    const int dg = static_cast<int>(a[1]) - static_cast<int>(b[1]);
++    const int db = static_cast<int>(a[2]) - static_cast<int>(b[2]);
++    return dr * dr + dg * dg + db * db;
++}
++constexpr int kMatchThresholdSq = 40 * 40;  // matches samples/03_bindless_mesh/04_streaming's own probe tolerance.
++
++// Byte position of R/G/B within one texel of `format` -- copied from
++// samples/05_multipass's own channelIndicesForFormat() (see that file's
++// header comment for the full Vulkan-format-naming-convention rationale;
++// not re-derived here). Returns std::nullopt (never a guessed mapping) for
++// any other format.
++struct ChannelIndices {
++    int r;
++    int g;
++    int b;
++};
++
++std::optional<ChannelIndices> channelIndicesForFormat(VkFormat format) {
++    switch (format) {
++        case VK_FORMAT_B8G8R8A8_UNORM:
++        case VK_FORMAT_B8G8R8A8_SRGB:
++        case VK_FORMAT_B8G8R8A8_SNORM:
++            return ChannelIndices{2, 1, 0};
++        case VK_FORMAT_R8G8B8A8_UNORM:
++        case VK_FORMAT_R8G8B8A8_SRGB:
++        case VK_FORMAT_R8G8B8A8_SNORM:
++            return ChannelIndices{0, 1, 2};
++        default:
++            return std::nullopt;
++    }
++}
++
++// CHANNEL-ORDER-EXACT (per this task's own brief), not the order-agnostic
++// as-is/reversed check samples/04_streaming's own matchesExpectedColor()
++// uses -- this sample needs to tell four genuinely different colors apart,
++// which an order-agnostic check cannot reliably do (see samples/
++// 05_multipass's own identical rationale for its cube-probe check). Still
++// accepts EITHER the raw linear byte value or its sRGB-encoded counterpart
++// (see this file's header comment's SRGB CAVEAT) at the real, format-
++// resolved R/G/B byte positions.
++bool matchesExpectedColorChannelExact(const uint8_t* pixel, const ChannelIndices& channels,
++                                       const std::array<uint8_t, 3>& expectedLinear,
++                                       const std::array<uint8_t, 3>& expectedSrgb) {
++    const std::array<uint8_t, 3> actual{pixel[channels.r], pixel[channels.g], pixel[channels.b]};
++    return colorDistanceSq(actual, expectedLinear) < kMatchThresholdSq ||
++           colorDistanceSq(actual, expectedSrgb) < kMatchThresholdSq;
++}
++
++// Exact analytic derivation -- see checker.slang's own evaluate(): at the
++// probed pixel, the checker cell is the grid's middle (kCellsPerAxis = 3)
++// cell, parity 0, lightness 1.0 -- so `color = gParams.tint * 1.0`. The
++// `checkerTexIndex` term contributes exactly 0.0 (see that file's own
++// comment) and the two `* 1e-6` epsilon terms are far below one 8-bit
++// quantization step (1/255 ~= 0.0039) for any component already >= 0 --
++// negligible for this byte-level comparison, exactly like every epsilon
++// term samples/05_multipass's own probes already carry.
++glm::vec3 expectedCheckerColor(const std::array<float, 4>& tint) { return glm::vec3(tint[0], tint[1], tint[2]); }
++
++// Exact analytic derivation -- see rim.slang's own evaluate(): at the
++// probed pixel, ndotv == 1.0 exactly (this file's header comment, point
++// (c)), so rimTerm = pow(1 - 1, 2.5) = 0, and
++// `color = kBaseAlbedo * 1.0 + rimColor.rgb * (0.5 + 0.0)`.
++glm::vec3 expectedRimColor(const std::array<float, 4>& rimColor) {
++    constexpr glm::vec3 kBaseAlbedo(0.12F, 0.12F, 0.12F);
++    constexpr float kAmbientFactor = 0.5F;
++    return kBaseAlbedo + glm::vec3(rimColor[0], rimColor[1], rimColor[2]) * kAmbientFactor;
++}
++
++glm::vec3 expectedColorFor(const ObjectSpec& spec) {
++    return (spec.materialKind == MaterialKind::Checker) ? expectedCheckerColor(spec.param4)
++                                                          : expectedRimColor(spec.param4);
++}
++
++// --- Runtime asset-path resolution [Task 8 ledger item] ---------------------
++// SDL_GetBasePath()-relative, exactly like samples/02_hotreload's own
++// resolveShaderPath() -- so a packaged copy of this sample's own build-
++// output directory (binary + materials/ + material_shaders/ + the Slang
++// runtime libs -- see this sample's CMakeLists.txt and tools/
++// package_samples.sh) runs identically outside the build tree, with no
++// reference to CMAKE_SOURCE_DIR/RX_MATERIAL_SHADER_DIR at all. This is
++// exactly the mechanism MaterialSystem::create()'s own new
++// `sharedShaderDir` parameter (material_system.h) exists to accept.
++std::filesystem::path basePathDirectory() {
++    const char* basePath = SDL_GetBasePath();
++    if (basePath == nullptr) {
++        RX_LOG_WARN("sample_06_materials: SDL_GetBasePath failed ({}); using the current directory instead",
++                    SDL_GetError());
++        return ".";
++    }
++    return std::filesystem::path(basePath);
++}
++
++std::optional<uint32_t> findMemoryTypeIndex(const VkPhysicalDeviceMemoryProperties& memProps, uint32_t typeBits,
++                                             VkMemoryPropertyFlags required) {
++    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
++        if ((typeBits & (1U << i)) != 0U && (memProps.memoryTypes[i].propertyFlags & required) == required) {
++            return i;
++        }
++    }
++    return std::nullopt;
++}
++
++// --- Headless mode: offscreen render + pixel readback ----------------------
++int runHeadless(bool enableValidation) {
++    auto window = rx::platform::Window::create("rx_materials_sample", static_cast<int>(kHeadlessWidth),
++                                                 static_cast<int>(kHeadlessHeight), /*visible=*/false);
++    if (!window.has_value()) {
++        RX_LOG_ERROR("Window::create failed: no display backend available");
++        return 1;
++    }
++
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
++        return 1;
++    }
++
++    auto context = rx::rhi::Context::create(extensions, enableValidation);
++    if (!context.has_value()) {
++        RX_LOG_ERROR("Context::create failed");
++        return 1;
++    }
++
++    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
++    if (surface == VK_NULL_HANDLE) {
++        RX_LOG_ERROR("createVulkanSurface failed");
++        return 1;
++    }
++
++    auto device = rx::rhi::Device::create(*context, surface);
++    if (!device.has_value()) {
++        RX_LOG_ERROR("Device::create failed");
++        return 1;
++    }
++
++    auto allocator = rx::rhi::Allocator::create(*context, *device);
++    if (!allocator.has_value()) {
++        RX_LOG_ERROR("Allocator::create failed");
++        return 1;
++    }
++
++    auto uploader = rx::rhi::Uploader::create(*allocator, *device);
++    if (!uploader.has_value()) {
++        RX_LOG_ERROR("Uploader::create failed");
++        return 1;
++    }
++
++    auto cmdCtx =
++        rx::rhi::CommandContext::create(device->device(), device->graphicsQueue(), device->graphicsQueueFamily());
++    if (!cmdCtx.has_value()) {
++        RX_LOG_ERROR("CommandContext::create failed");
++        return 1;
++    }
++
++    auto executor = rx::graph::Executor::create(*device);
++    if (executor == nullptr) {
++        RX_LOG_ERROR("rx::graph::Executor::create failed");
++        return 1;
++    }
++
++    const VkDevice vkDevice = device->device();
++    const VkFormat targetFormat = device->swapchainFormat();
++
++    const std::filesystem::path basePath = basePathDirectory();
++    const std::filesystem::path pipelineCachePath =
++        std::filesystem::temp_directory_path() / "rx_sample_06_materials_pipeline.cache";
++    // Declared here, once, and never moved/returned again -- see
++    // createScene()'s own header comment for why that address stability is
++    // load-bearing (MaterialSystem::create() stores a raw pointer to
++    // `scene.bindlessTable` for this instance's whole lifetime).
++    Scene scene;
++    if (!createScene(scene, device->physicalDevice(), *device, *allocator, *uploader, basePath / "material_shaders",
++                      basePath / "materials", pipelineCachePath)) {
++        RX_LOG_ERROR("createScene failed");
++        return 1;
++    }
++
++    rx::graph::RenderGraph graph;
++    declareGraph(graph, scene, targetFormat);
++
++    rx::graph::CompileInfo info;
++    info.swapchainWidth = kHeadlessWidth;
++    info.swapchainHeight = kHeadlessHeight;
++    info.swapchainFormat = targetFormat;
++    // Offscreen backbuffer, never presented -- see rx_graph's own
++    // CompileInfo ambiguity resolution #1 (TRANSFER_SRC_OPTIMAL is what
++    // this file's own readback copy needs finalBarriers() to leave
++    // "backbuffer" in), matching every other sample's identical headless
++    // setup.
++    info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    graph.compile(info);
++    executor->realize(graph);
++
++    // Fixed camera for the whole headless run, slot 0 only -- see this
++    // file's header comment (mirrors samples/05_multipass's identical
++    // choice for its own fixed-camera headless mode).
++    updateFrame(*uploader, scene, /*frameInFlightIndex=*/0, kHeadlessAzimuth, kHeadlessWidth, kHeadlessHeight);
++
++    VkImage offscreenImage = VK_NULL_HANDLE;
++    VkDeviceMemory offscreenMemory = VK_NULL_HANDLE;
++    VkImageView offscreenView = VK_NULL_HANDLE;
++
++    auto destroyRawResources = [&]() {
++        if (offscreenView != VK_NULL_HANDLE) {
++            vkDestroyImageView(vkDevice, offscreenView, nullptr);
++        }
++        if (offscreenImage != VK_NULL_HANDLE) {
++            vkDestroyImage(vkDevice, offscreenImage, nullptr);
++        }
++        if (offscreenMemory != VK_NULL_HANDLE) {
++            vkFreeMemory(vkDevice, offscreenMemory, nullptr);
++        }
++        destroyScene(scene);
++    };
++
++    VkImageCreateInfo imageInfo{};
++    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    imageInfo.imageType = VK_IMAGE_TYPE_2D;
++    imageInfo.format = targetFormat;
++    imageInfo.extent = {kHeadlessWidth, kHeadlessHeight, 1};
++    imageInfo.mipLevels = 1;
++    imageInfo.arrayLayers = 1;
++    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
++    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
++    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++
++    if (vkCreateImage(vkDevice, &imageInfo, nullptr, &offscreenImage) != VK_SUCCESS) {
++        RX_LOG_ERROR("vkCreateImage(offscreen target) failed");
++        destroyRawResources();
++        return 1;
++    }
++
++    VkMemoryRequirements memReq{};
++    vkGetImageMemoryRequirements(vkDevice, offscreenImage, &memReq);
++    VkPhysicalDeviceMemoryProperties memProps{};
++    vkGetPhysicalDeviceMemoryProperties(device->physicalDevice(), &memProps);
++    auto memoryTypeIndex = findMemoryTypeIndex(memProps, memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    if (!memoryTypeIndex.has_value()) {
++        RX_LOG_ERROR("no device-local memory type found for the offscreen target");
++        destroyRawResources();
++        return 1;
++    }
++
++    VkMemoryAllocateInfo memAllocInfo{};
++    memAllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++    memAllocInfo.allocationSize = memReq.size;
++    memAllocInfo.memoryTypeIndex = *memoryTypeIndex;
++    if (vkAllocateMemory(vkDevice, &memAllocInfo, nullptr, &offscreenMemory) != VK_SUCCESS) {
++        RX_LOG_ERROR("vkAllocateMemory(offscreen target) failed");
++        destroyRawResources();
++        return 1;
++    }
++    if (vkBindImageMemory(vkDevice, offscreenImage, offscreenMemory, 0) != VK_SUCCESS) {
++        RX_LOG_ERROR("vkBindImageMemory(offscreen target) failed");
++        destroyRawResources();
++        return 1;
++    }
++
++    VkImageViewCreateInfo viewInfo{};
++    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++    viewInfo.image = offscreenImage;
++    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    viewInfo.format = targetFormat;
++    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    viewInfo.subresourceRange.levelCount = 1;
++    viewInfo.subresourceRange.layerCount = 1;
++    if (vkCreateImageView(vkDevice, &viewInfo, nullptr, &offscreenView) != VK_SUCCESS) {
++        RX_LOG_ERROR("vkCreateImageView(offscreen target) failed");
++        destroyRawResources();
++        return 1;
++    }
++
++    // Every render frame is its own SEPARATE runOnce() submission -- same
++    // "BACKBUFFER REUSE ACROSS REPEATED execute() CALLS" argument
++    // samples/05_multipass's own header comment makes in full: each call's
++    // own runOnce() fully vkQueueWaitIdle()s before returning, so the next
++    // call's own tonemap/forward-pass-entry barrier's UNDEFINED assumption
++    // is provably correct despite compile()'s stateless derivation. Frame-
++    // in-flight index stays 0 the whole run (fixed camera -- see
++    // updateFrame()'s own call above); materialBridge::beginFrame()/
++    // onFrameCompleted() are still exercised once per iteration each, with
++    // a genuinely distinct frameNumber, matching MaterialSystem's own
++    // frames-in-flight discipline (material_system.h).
++    const VkExtent2D extent{kHeadlessWidth, kHeadlessHeight};
++    for (uint32_t frame = 0; frame < kHeadlessFrameCount; ++frame) {
++        materialBridge::beginFrame(scene.materialSystem, /*frameInFlightIndex=*/0, /*frameNumber=*/frame);
++        cmdCtx->runOnce([&](VkCommandBuffer cmd) { executor->execute(graph, cmd, offscreenImage, offscreenView, extent); });
++        materialBridge::onFrameCompleted(scene.materialSystem, frame);
++    }
++
++    auto readback = allocator->createHostVisibleBuffer(kHeadlessPixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    if (!readback.has_value()) {
++        RX_LOG_ERROR("createHostVisibleBuffer(readback) failed");
++        destroyRawResources();
++        return 1;
++    }
++
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        VkBufferImageCopy region{};
++        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        region.imageSubresource.layerCount = 1;
++        region.imageExtent = {kHeadlessWidth, kHeadlessHeight, 1};
++        vkCmdCopyImageToBuffer(cmd, offscreenImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1, &region);
++    });
++
++    readback->invalidate();
++    std::vector<uint8_t> pixels(static_cast<size_t>(kHeadlessPixelBytes));
++    std::memcpy(pixels.data(), readback->mappedData(), pixels.size());
++
++    destroyRawResources();
++
++    auto pixelAt = [&](uint32_t x, uint32_t y) -> const uint8_t* {
++        return pixels.data() + (static_cast<size_t>(y) * kHeadlessWidth + x) * 4;
++    };
++
++    bool pass = true;
++    const auto channels = channelIndicesForFormat(targetFormat);
++    if (!channels.has_value()) {
++        RX_LOG_ERROR(
++            "backbuffer format {} is not one of the R8G8B8A8/B8G8R8A8 families this check knows how to map to exact "
++            "R/G/B byte positions -- refusing to guess",
++            static_cast<int>(targetFormat));
++        pass = false;
++    }
++
++    const CameraPose headlessPose = makeCameraPose(kHeadlessAzimuth, kHeadlessWidth, kHeadlessHeight);
++    std::array<std::array<uint8_t, 3>, kObjectCount> expectedLinearBytes{};
++    for (uint32_t i = 0; i < kObjectCount; ++i) {
++        expectedLinearBytes[i] = toByteColor(expectedColorFor(kObjectSpecs[i]));
++    }
++    // Sanity guard: the 4 expected colors must themselves be pairwise
++    // distinguishable at this sample's own match tolerance -- if two ever
++    // collide (e.g. a future edit to kObjectSpecs picks near-identical
++    // tint/rimColor values), a probe that reads either color could pass by
++    // accident even under a real substitution bug, defeating the point of
++    // this gate. Checked here, once, rather than trusted by construction.
++    for (uint32_t i = 0; i < kObjectCount && pass; ++i) {
++        for (uint32_t j = i + 1; j < kObjectCount; ++j) {
++            if (colorDistanceSq(expectedLinearBytes[i], expectedLinearBytes[j]) < kMatchThresholdSq) {
++                RX_LOG_ERROR("expected colors for objects {} and {} are not distinguishable at this sample's own "
++                             "match tolerance -- fix kObjectSpecs",
++                             i, j);
++                pass = false;
++            }
++        }
++    }
++
++    for (uint32_t i = 0; i < kObjectCount && channels.has_value(); ++i) {
++        const ObjectSpec& spec = kObjectSpecs[i];
++        const PixelCoord probe = projectToPixel(spec.position, headlessPose.viewProj, kHeadlessWidth, kHeadlessHeight);
++        const uint8_t* px = pixelAt(probe.x, probe.y);
++        const std::array<uint8_t, 3> expectedSrgb = srgbEncodeColor(expectedLinearBytes[i]);
++        const bool matched = matchesExpectedColorChannelExact(px, *channels, expectedLinearBytes[i], expectedSrgb);
++        RX_LOG_INFO("object {} ({}) world=({:.1f},{:.1f},{:.1f}) pixel=({},{}) channels=({},{},{},{}) expected_linear=("
++                     "{},{},{}) matched={}",
++                     i, spec.materialKind == MaterialKind::Checker ? "checker" : "rim", spec.position.x, spec.position.y,
++                     spec.position.z, probe.x, probe.y, px[0], px[1], px[2], px[3], expectedLinearBytes[i][0],
++                     expectedLinearBytes[i][1], expectedLinearBytes[i][2], matched);
++        if (!matched) {
++            RX_LOG_ERROR("object {}'s probe pixel does not match its expected color", i);
++            pass = false;
++        }
++    }
++
++    if (enableValidation && context->hasValidationErrors()) {
++        RX_LOG_ERROR("Vulkan validation layer reported errors during this run");
++        pass = false;
++    }
++
++    if (pass) {
++        RX_LOG_INFO("materials headless gate PASSED");
++        return 0;
++    }
++    RX_LOG_ERROR("materials headless gate FAILED");
++    return 1;
++}
++
++// --- --present mode: real window, orbiting camera, hot-reload polling ------
++int runPresent(bool enableValidation) {
++    auto window = rx::platform::Window::create("rx_materials_sample (--present)", static_cast<int>(kPresentWidth),
++                                                 static_cast<int>(kPresentHeight), /*visible=*/true);
++    if (!window.has_value()) {
++        RX_LOG_ERROR("Window::create failed: no display backend available");
++        return 1;
++    }
++
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
++        return 1;
++    }
++
++    auto context = rx::rhi::Context::create(extensions, enableValidation);
++    if (!context.has_value()) {
++        RX_LOG_ERROR("Context::create failed");
++        return 1;
++    }
++
++    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
++    if (surface == VK_NULL_HANDLE) {
++        RX_LOG_ERROR("createVulkanSurface failed");
++        return 1;
++    }
++
++    auto device = rx::rhi::Device::create(*context, surface);
++    if (!device.has_value()) {
++        RX_LOG_ERROR("Device::create failed");
++        return 1;
++    }
++    const VkDevice vkDevice = device->device();
++
++    auto allocator = rx::rhi::Allocator::create(*context, *device);
++    if (!allocator.has_value()) {
++        RX_LOG_ERROR("Allocator::create failed");
++        return 1;
++    }
++
++    auto uploader = rx::rhi::Uploader::create(*allocator, *device);
++    if (!uploader.has_value()) {
++        RX_LOG_ERROR("Uploader::create failed");
++        return 1;
++    }
++
++    auto frameSync = rx::rhi::FrameSync::create(vkDevice, device->graphicsQueueFamily(),
++                                                 static_cast<uint32_t>(device->swapchainImages().size()));
++    if (!frameSync.has_value()) {
++        RX_LOG_ERROR("FrameSync::create failed");
++        return 1;
++    }
++
++    auto executor = rx::graph::Executor::create(*device);
++    if (executor == nullptr) {
++        RX_LOG_ERROR("rx::graph::Executor::create failed");
++        return 1;
++    }
++
++    const std::filesystem::path basePath = basePathDirectory();
++    const std::filesystem::path materialsDir = basePath / "materials";
++    const std::filesystem::path pipelineCachePath =
++        std::filesystem::temp_directory_path() / "rx_sample_06_materials_pipeline.cache";
++    // Declared here, once, and never moved/returned again -- see
++    // createScene()'s own header comment for why (MaterialSystem::create()
++    // stores a raw pointer to `scene.bindlessTable` for this instance's
++    // whole lifetime).
++    Scene scene;
++    if (!createScene(scene, device->physicalDevice(), *device, *allocator, *uploader, basePath / "material_shaders",
++                      materialsDir, pipelineCachePath)) {
++        RX_LOG_ERROR("createScene failed");
++        return 1;
++    }
++
++    rx::graph::RenderGraph graph;
++    declareGraph(graph, scene, device->swapchainFormat());
++
++    auto compileForExtent = [&](VkExtent2D extent) {
++        rx::graph::CompileInfo info;
++        info.swapchainWidth = extent.width;
++        info.swapchainHeight = extent.height;
++        info.swapchainFormat = device->swapchainFormat();
++        graph.compile(info);
++        executor->realize(graph);
++    };
++    compileForExtent(device->swapchainExtent());
++
++    std::vector<VkImageView> swapchainViews;
++    auto createSwapchainViews = [&]() -> bool {
++        swapchainViews.assign(device->swapchainImages().size(), VK_NULL_HANDLE);
++        for (size_t i = 0; i < swapchainViews.size(); ++i) {
++            VkImageViewCreateInfo viewInfo{};
++            viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++            viewInfo.image = device->swapchainImages()[i];
++            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++            viewInfo.format = device->swapchainFormat();
++            viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++            viewInfo.subresourceRange.levelCount = 1;
++            viewInfo.subresourceRange.layerCount = 1;
++            if (vkCreateImageView(vkDevice, &viewInfo, nullptr, &swapchainViews[i]) != VK_SUCCESS) {
++                RX_LOG_ERROR("sample_06_materials: vkCreateImageView(swapchain image {}) failed", i);
++                return false;
++            }
++        }
++        return true;
++    };
++    auto destroySwapchainViews = [&]() {
++        for (VkImageView view : swapchainViews) {
++            if (view != VK_NULL_HANDLE) {
++                vkDestroyImageView(vkDevice, view, nullptr);
++            }
++        }
++        swapchainViews.clear();
++    };
++
++    if (!createSwapchainViews()) {
++        destroySwapchainViews();
++        destroyScene(scene);
++        return 1;
++    }
++
++    RX_LOG_INFO("--present: window open ({}x{}); camera orbiting -- watching {} and {} for changes (~1s poll); edit "
++                "either while this window is open -- close the window to exit",
++                kPresentWidth, kPresentHeight, (materialsDir / "checker.slang").string(),
++                (materialsDir / "rim.slang").string());
++
++    const auto startTime = std::chrono::steady_clock::now();
++    auto lastPollTime = startTime;
++
++    // Tracks which frameNumber was last submitted into each frame-in-flight
++    // slot, so materialBridge::onFrameCompleted() can be told exactly which
++    // frame just finished once this loop confirms (via vkWaitForFences)
++    // that slot is free again -- mirrors samples/04_streaming's own
++    // DeletionQueue::onFrameFenceSignaled(slot.frameNumber) bookkeeping,
++    // applied here to rx_material's internal per-frame arena instead.
++    std::array<std::optional<uint64_t>, rx::rhi::FrameSync::kFramesInFlight> lastSubmittedFrameNumber{};
++
++    bool ok = true;
++    bool quit = false;
++    while (!quit) {
++        SDL_Event event;
++        while (SDL_PollEvent(&event)) {
++            if (event.type == SDL_EVENT_QUIT) {
++                quit = true;
++            }
++        }
++        if (quit) {
++            break;
++        }
++
++        const auto now = std::chrono::steady_clock::now();
++        if (now - lastPollTime >= kMaterialPollInterval) {
++            lastPollTime = now;
++            // Public API call -- reloadChanged() itself stats both files
++            // this sample's loadMaterial() calls have been made with,
++            // recompiles whichever changed, and keeps the last-good
++            // compiled state on a failed recompile (material_system.h's own
++            // documented contract); this sample never needs to know which
++            // file changed or whether the reload actually did anything.
++            scene.materialSystem.publicApi->reloadChanged();
++        }
++
++        VkFence fence = frameSync->currentFence();
++        if (vkWaitForFences(vkDevice, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
++            RX_LOG_ERROR("vkWaitForFences failed in present loop");
++            ok = false;
++            break;
++        }
++        if (lastSubmittedFrameNumber[frameSync->currentFrameIndex()].has_value()) {
++            materialBridge::onFrameCompleted(scene.materialSystem, *lastSubmittedFrameNumber[frameSync->currentFrameIndex()]);
++        }
++
++        auto acquire = device->acquireNextImage(frameSync->currentImageAvailableSemaphore());
++        if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
++            if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
++                RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
++                ok = false;
++                break;
++            }
++            destroySwapchainViews();
++            if (!device->recreateSwapchain(surface) ||
++                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
++                !createSwapchainViews()) {
++                RX_LOG_ERROR("swapchain recreation failed after acquireNextImage NeedsRecreate");
++                ok = false;
++                break;
++            }
++            compileForExtent(device->swapchainExtent());
++            continue;
++        }
++        if (acquire.status == rx::rhi::SwapchainStatus::DeviceLost) {
++            RX_LOG_ERROR("device lost during acquireNextImage; exiting present loop");
++            ok = false;
++            break;
++        }
++
++        if (vkResetFences(vkDevice, 1, &fence) != VK_SUCCESS) {
++            RX_LOG_ERROR("vkResetFences failed in present loop");
++            ok = false;
++            break;
++        }
++
++        const float elapsedSeconds = std::chrono::duration<float>(now - startTime).count();
++        const float azimuth = elapsedSeconds * kOrbitAzimuthRadPerSec;
++        const VkExtent2D extent = device->swapchainExtent();
++        updateFrame(*uploader, scene, frameSync->currentFrameIndex(), azimuth, extent.width, extent.height);
++
++        VkCommandPool pool = frameSync->currentCommandPool();
++        if (vkResetCommandPool(vkDevice, pool, 0) != VK_SUCCESS) {
++            RX_LOG_ERROR("vkResetCommandPool failed in present loop");
++            ok = false;
++            break;
++        }
++        VkCommandBuffer cmd = frameSync->currentCommandBuffer();
++
++        VkCommandBufferBeginInfo beginInfo{};
++        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++        if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS) {
++            RX_LOG_ERROR("vkBeginCommandBuffer failed in present loop");
++            ok = false;
++            break;
++        }
++
++        materialBridge::beginFrame(scene.materialSystem, frameSync->currentFrameIndex(), frameSync->frameNumber());
++
++        VkImage swapchainImage = device->swapchainImages()[acquire.imageIndex];
++        executor->execute(graph, cmd, swapchainImage, swapchainViews[acquire.imageIndex], extent);
++
++        if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
++            RX_LOG_ERROR("vkEndCommandBuffer failed in present loop");
++            ok = false;
++            break;
++        }
++
++        VkSemaphore waitSem = frameSync->currentImageAvailableSemaphore();
++        VkSemaphore signalSem = frameSync->renderFinishedSemaphore(acquire.imageIndex);
++        VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++
++        VkSubmitInfo submitInfo{};
++        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
++        submitInfo.waitSemaphoreCount = 1;
++        submitInfo.pWaitSemaphores = &waitSem;
++        submitInfo.pWaitDstStageMask = &waitStage;
++        submitInfo.commandBufferCount = 1;
++        submitInfo.pCommandBuffers = &cmd;
++        submitInfo.signalSemaphoreCount = 1;
++        submitInfo.pSignalSemaphores = &signalSem;
++
++        if (vkQueueSubmit(device->graphicsQueue(), 1, &submitInfo, fence) != VK_SUCCESS) {
++            RX_LOG_ERROR("vkQueueSubmit failed in present loop");
++            ok = false;
++            break;
++        }
++        lastSubmittedFrameNumber[frameSync->currentFrameIndex()] = frameSync->frameNumber();
++
++        auto presentStatus = device->present(acquire.imageIndex, signalSem);
++        if (presentStatus == rx::rhi::SwapchainStatus::NeedsRecreate) {
++            if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
++                RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
++                ok = false;
++                break;
++            }
++            destroySwapchainViews();
++            if (!device->recreateSwapchain(surface) ||
++                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
++                !createSwapchainViews()) {
++                RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
++                ok = false;
++                break;
++            }
++            compileForExtent(device->swapchainExtent());
++        } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
++            RX_LOG_ERROR("device lost during present; exiting present loop");
++            ok = false;
++            break;
++        }
++
++        frameSync->advanceFrame();
++    }
++
++    vkDeviceWaitIdle(vkDevice);
++    destroySwapchainViews();
++    destroyScene(scene);
++    // `executor`, `graph`, and `frameSync` go out of scope after this point,
++    // in reverse declaration order -- Executor's own destructor already
++    // vkDeviceWaitIdle()s before tearing down its transient pool, and
++    // FrameSync's own destructor contract (frame_sync.h) requires exactly
++    // the vkDeviceWaitIdle() call already issued above.
++
++    if (enableValidation && context->hasValidationErrors()) {
++        RX_LOG_ERROR("Vulkan validation layer reported errors during the present loop");
++        return 1;
++    }
++    if (!ok) {
++        return 1;
++    }
++    RX_LOG_INFO("--present: window closed cleanly");
++    return 0;
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    rx::core::log::init();
++
++    bool presentMode = false;
++    bool enableValidation = false;
++    for (int i = 1; i < argc; ++i) {
++        if (std::string_view(argv[i]) == "--present") {
++            presentMode = true;
++        } else if (std::string_view(argv[i]) == "--validate") {
++            enableValidation = true;
++        }
++    }
++
++    if (presentMode) {
++        return runPresent(enableValidation);
++    }
++    return runHeadless(enableValidation);
++}
+diff --git a/samples/06_materials/materials/checker.slang b/samples/06_materials/materials/checker.slang
+new file mode 100644
+index 0000000..8673ff9
+--- /dev/null
++++ b/samples/06_materials/materials/checker.slang
+@@ -0,0 +1,92 @@
++// checker.slang -- Phase 3 material [Task 8, sample 06_materials]: a
++// procedural UV checkerboard, modulated by a per-instance `tint` parameter
++// (rx_api.h's IRxMaterialInstance::setFloat4("tint", ...)) -- the material
++// samples/06_materials/main.cpp applies to both cube objects, each with a
++// DIFFERENT `tint` instance value.
++//
++// Conforms to shaders/material/material.slang's IMaterialShader interface
++// exactly like src/rx_material/tests/data/test_unlit.slang/test_solid.slang/
++// test_textured.slang do (see those files' own header comments for the full
++// per-part convention this follows: `import material;`, an explicit
++// `[[vk::binding(0, 1)]] ParameterBlock<TParams> gParams;`, a struct
++// conforming to IMaterialShader, and the link-time `export ... = ...;`
++// alias forward_entry.slang's `extern struct MaterialImpl` resolves
++// against).
++//
++// `checkerTexIndex` [task-8 binding global constraint: "Use at least one
++// createTexture2D-created texture in one material ... via setTexture ...
++// public texture path exercised end-to-end"] -- main.cpp creates a real,
++// procedurally generated small checkerboard texture via the PUBLIC
++// IRxMaterialSystem::createTexture2D() and binds it here via
++// IRxMaterialInstance::setTexture("checkerTexIndex", texture), exercising
++// createTexture2D()/setTexture()'s full public contract (bindless
++// registration, blob write, addRef/release lifetime) end to end. It is read
++// here NUMERICALLY (see evaluate() below) rather than sampled as real image
++// data: MaterialSystem's own reflection (rx_material/material_system.cpp,
++// reflectMaterialLayout()) rejects any top-level global parameter other
++// than `gParams` itself ("Phase 3 materials support exactly one
++// ParameterBlock<...> gParams and nothing else at global scope"), so a
++// material module has no way to declare its own bindless `Texture2D[]`
++// array to actually sample through -- exactly the same documented,
++// deliberate Phase 3 scope boundary test_textured.slang's own
++// `albedoIndex` field already established (that fixture, too, only reads
++// its bindless index numerically, never samples a real texture). Real
++// bindless texture SAMPLING from inside a material's own evaluate() is
++// future work, not yet wired into the shared material.slang/
++// forward_entry.slang contract -- this sample does not invent that wiring
++// itself (out of Task 8's scope: it would mean editing rx_material's core
++// reflection rules, not just samples/06_materials).
++import material;
++
++struct CheckerParams {
++    float4 tint;
++    uint checkerTexIndex;
++};
++
++[[vk::binding(0, 1)]]
++ParameterBlock<CheckerParams> gParams;
++
++struct Checker : IMaterialShader {
++    float4 evaluate(MaterialVertex v) {
++        // kCellsPerAxis = 3 (odd), NOT 2 or 4 -- deliberate: this sample's
++        // fixed headless camera/object arrangement (see main.cpp's header
++        // comment) makes every cube's own screen-projected center land at
++        // EXACTLY uv = (0.5, 0.5). floor(0.5 * 3) = 1 on both axes -- the
++        // grid's MIDDLE cell, a full 0.5-cell margin away from either
++        // neighboring boundary (1.0 and 2.0) -- robust to any floating-point
++        // jitter in the interpolated UV. An EVEN cell count would instead
++        // put that exact point ON a cell boundary (0.5 * 2 == 1.0 exactly),
++        // an unstable case for a headless pixel assertion that depends on
++        // which side of the boundary rounds which way.
++        const float kCellsPerAxis = 3.0;
++        float2 cell = floor(v.uv * kCellsPerAxis);
++        float parity = fmod(cell.x + cell.y, 2.0);
++        // Middle cell (1, 1) -> parity 0.0 -> the "light" cell (full tint,
++        // lightness 1.0) -- see main.cpp's own header comment for the
++        // resulting exact analytic derivation (expected color == tint).
++        float lightness = (parity < 0.5) ? 1.0 : 0.35;
++
++        float4 color = gParams.tint * lightness;
++
++        // Reads checkerTexIndex without perturbing the analytic color above
++        // -- multiplying by exactly 0.0 is IEEE-754-safe (never constant-
++        // folded away: gParams.checkerTexIndex is a genuine runtime uniform
++        // read from a bound parameter block, not a compile-time constant),
++        // matching test_unlit.slang's own "genuinely, if negligibly, read
++        // every field" convention, applied here to the bindless-index field
++        // this file's header comment explains.
++        color.w += float(gParams.checkerTexIndex) * 0.0;
++        // Genuinely (if negligibly) reads worldPos/normal too, avoiding the
++        // same per-entry-point dead-interpolant validation warning
++        // test_unlit.slang's own header comment documents in detail --
++        // forward_entry.slang's shared vertex stage writes these
++        // unconditionally, and a fragment stage that never reads one at all
++        // triggers a real (if harmless) vertex-output-not-consumed mismatch
++        // under this project's --validate gate.
++        color.x += v.worldPos.x * 1e-6;
++        color.y += v.normal.y * 1e-6;
++        return color;
++    }
++};
++
++export struct MaterialImpl : IMaterialShader = Checker;
+diff --git a/samples/06_materials/materials/rim.slang b/samples/06_materials/materials/rim.slang
+new file mode 100644
+index 0000000..e5d0dcc
+--- /dev/null
++++ b/samples/06_materials/materials/rim.slang
+@@ -0,0 +1,73 @@
++// rim.slang -- Phase 3 material [Task 8, sample 06_materials]: a view-
++// dependent rim-lit material driven by a per-instance `rimColor` parameter
++// (rx_api.h's IRxMaterialInstance::setFloat4("rimColor", ...)) -- the
++// material samples/06_materials/main.cpp applies to both sphere objects,
++// each with a DIFFERENT `rimColor` instance value.
++//
++// Conforms to shaders/material/material.slang's IMaterialShader interface,
++// same shape/convention as checker.slang in this same directory (see that
++// file's own header comment for the full per-part rationale, not repeated
++// here).
++//
++// VIEW-SPACE NORMAL, NOT world/object-space [load-bearing, read before
++// touching main.cpp's vertex-upload code]: `v.normal` here is NOT the
++// object/world-space normal MaterialVertex's own doc (material.slang)
++// otherwise implies -- main.cpp pre-rotates every vertex's normal into VIEW
++// SPACE on the CPU before upload (its own transformAndUploadObjectVertices()
++// applies `mat3(view) * localNormal`), specifically so this shader can read
++// the cosine of the angle between the surface normal and the view direction
++// (`ndotv`) as simply `v.normal.z` -- no separate "camera position"/"view
++// direction" material parameter needed at all. This is a deliberate
++// workaround for a real Phase 3 scope boundary, not an invented shortcut:
++// forward_entry.slang's shared vertexMain has NO mechanism for a material to
++// receive a per-draw camera transform at all (see that file's own "PHASE 3
++// SCOPE NOTE" -- clip position and world position are literally the SAME
++// vertex attribute value, `float4(position, 1.0)`), so the one piece of
++// view-dependence this material's rim term needs has to travel through a
++// vertex ATTRIBUTE this sample already has unrestricted control over,
++// rather than a new material-parameter convention that would be out of this
++// task's scope (samples/06_materials only, not rx_material's core).
++//
++// WHY THE OBJECT-CENTER PROBE PIXEL STILL SHOWS rimColor, not just an
++// edge glow: a CLASSIC rim term (pow(1 - ndotv, power), zero at ndotv == 1)
++// contributes NOTHING at exactly the point a sphere's own screen-projected
++// center resolves to for ANY camera position on this sample's orbit (the
++// point on a sphere nearest the camera always has its normal exactly
++// aligned with the view direction, ndotv == 1.0, a pure consequence of
++// sphere geometry, independent of camera azimuth) -- which would make BOTH
++// sphere instances render identically (indistinguishable rimColor) at
++// exactly the pixel main.cpp's headless gate probes. This formula adds a
++// constant `kAmbientFactor`-weighted rimColor contribution ALONGSIDE the
++// classic edge term specifically so rimColor stays visible at ndotv == 1
++// too -- see main.cpp's own header comment for the exact analytic
++// derivation this produces.
++import material;
++
++struct RimParams {
++    float4 rimColor;
++};
++
++[[vk::binding(0, 1)]]
++ParameterBlock<RimParams> gParams;
++
++struct Rim : IMaterialShader {
++    float4 evaluate(MaterialVertex v) {
++        const float kAmbientFactor = 0.5;
++        const float3 kBaseAlbedo = float3(0.12, 0.12, 0.12);
++        const float kRimPower = 2.5;
++
++        float ndotv = clamp(v.normal.z, -1.0, 1.0);
++        float rimTerm = pow(saturate(1.0 - ndotv), kRimPower);
++
++        float3 color = kBaseAlbedo * saturate(ndotv) + gParams.rimColor.rgb * (kAmbientFactor + rimTerm);
++
++        // Genuinely (if negligibly) reads worldPos/uv too -- see
++        // checker.slang's identical comment on why (avoiding a real, if
++        // harmless, vertex-output-not-consumed validation warning).
++        color.x += v.worldPos.x * 1e-6;
++        color.y += v.uv.x * 1e-6;
++        return float4(color, 1.0);
++    }
++};
++
++export struct MaterialImpl : IMaterialShader = Rim;
+diff --git a/samples/README.md b/samples/README.md
+index ce0e365..31031bc 100644
+--- a/samples/README.md
++++ b/samples/README.md
+@@ -26,26 +26,33 @@ step involved:
+ 03_bindless_mesh/
+   sample_03_bindless_mesh[.exe]    # + texture.png, the Slang runtime libs
+                                     #   below, and LICENSE
+ 04_streaming/
+   sample_04_streaming[.exe]        # + the Slang runtime libs below, and
+                                     #   LICENSE (no other external asset)
+ 05_multipass/
+   sample_05_multipass[.exe]        # + shaders/multipass/*.slang (6 files),
+                                     #   the Slang runtime libs below, and
+                                     #   LICENSE
++06_materials/
++  sample_06_materials[.exe]        # + materials/checker.slang,
++                                    #   materials/rim.slang, +
++                                    #   material_shaders/material.slang,
++                                    #   material_shaders/forward_entry.slang
++                                    #   (rx_material's own shared files), the
++                                    #   Slang runtime libs below, and LICENSE
+ ```
+ 
+ `01_triangle` is the one exception to "needs the Slang runtime libs": its
+ shaders are precompiled offline by `slangc` at build time, so it ships only
+ its two `.spv` files and nothing Slang-related at all [D2] — see its own
+-"Redistribution" section below. The other four do real in-process Slang
++"Redistribution" section below. The other five do real in-process Slang
+ compilation at startup, so each of their directories additionally carries
+ `libslang-compiler.so*`/`slang-compiler.dll` plus the `slang-glslang`/
+ `slang-glsl-module`/`slang-rt` plugins it dlopens on demand, and the Slang
+ `LICENSE` file (Apache-2.0 WITH LLVM-exception — kept for attribution when
+ redistributing those libraries). `cd` into any one subdirectory and run the
+ binary exactly as described in that sample's own section below — every
+ subdirectory in the zip is independently self-contained, so copying just
+ one elsewhere works too.
+ 
+ ## 01_triangle
+@@ -461,20 +468,142 @@ sample, it ships **six** on-disk shader sources instead of one
+ per shader stage, plus `scene_types.slang` (the single source of truth for
+ the `ObjectTransform` bindless-row layout both `shadow.vert.slang` and
+ `lit.vert.slang` read), concatenated in the right order at compile time so
+ `rx::shader::reflect()` sees one linked program per pass; see
+ `scene_types.slang`'s own header comment for why this is done via textual
+ concatenation rather than a real Slang `import`/`__include`. A
+ redistributed copy of just this sample's build-output directory (binary +
+ those six `.slang` files + the Slang runtime libraries) runs identically
+ outside the build tree.
+ 
++## 06_materials
++
++`samples/06_materials/main.cpp` — the Phase 3 showcase for `rx_material`'s
++**public** COM-lite API (`rx_api.h`): every material creation, instance
++creation, per-instance parameter override, texture creation, and hot-reload
++call in this sample goes through `IRxMaterialSystem`/`IRxMaterial`/
++`IRxMaterialInstance`/`IRxTexture` — never an internal `rx::material::` type,
++except inside one clearly marked bridge section in `main.cpp` (system
++creation, and the draw-time `bindInstance()`/`getPipeline()`/
++`pipelineLayout()` calls, which have no public equivalent in Phase 3 by
++design — draw submission itself is not part of the ABI surface this phase).
++
++**Scene**: 4 procedural objects (2 cubes, 2 spheres — generators adapted from
++03_bindless_mesh's own position+uv convention, extended with a per-vertex
++normal like 05_multipass's) drawn through a single `rx_graph` forward pass.
++Two materials, `materials/checker.slang` (a procedural UV checkerboard times
++a `tint` parameter) and `materials/rim.slang` (a view-dependent rim-light
++term times a `rimColor` parameter), each instanced TWICE with different
++parameter values — cube A/B get `checker` (warm orange / cool teal), sphere
++A/B get `rim` (magenta / golden yellow). `checker.slang` also takes a
++bindless texture-index parameter, bound to a real, procedurally generated
++checker texture created through the public `IRxMaterialSystem::
++createTexture2D()` and `IRxMaterialInstance::setTexture()` — exercising that
++public path end to end (see that file's own header comment for why its
++content never actually reaches the rendered pixels yet — Phase 3 materials
++cannot sample a bindless texture from inside their own shading function).
++
++**No camera transform in the shared material pipeline**: `shaders/material/
++forward_entry.slang`'s shared vertex stage has no model/view/projection
++transform at all — clip position and world position are the literal same
++vertex attribute. This sample resolves that gap by pre-transforming every
++vertex's position into clip space and every vertex's normal into view space
++**on the CPU**, using its own camera matrices, before uploading — possible
++without precision loss specifically because the camera is *orthographic*
++(its projection matrix's `w` is always exactly `1.0`, matching
++`forward_entry.slang`'s own hardcoded assumption). See `main.cpp`'s own
++header comment for the full mechanism and the exact analytic pixel
++derivations this makes possible.
++
++- **Headless (default, no flags)** — the `ctest` correctness gate. Fixed
++  orthographic camera, 3 frames through the graph, readback, and 4 analytic
++  pixel assertions (one per object, channel-order-exact, accounting for
++  this project's known SRGB-swapchain-encoding caveat — see
++  `samples/04_streaming`'s own finding). Validation is off by default (see
++  01_triangle's `--validate` section above); `ctest` registers this case as
++  `sample_06_materials_headless` with `--validate` passed explicitly.
++- **`--present`** — opens a real window showing the same 4 objects with the
++  camera continuously orbiting (azimuth-only), polling `materials/
++  checker.slang` and `materials/rim.slang` for on-disk changes roughly once
++  a second and calling the public `IRxMaterialSystem::reloadChanged()` —
++  02_hotreload's own keep-last-good UX, applied here to materials. Not part
++  of `ctest` — see `MANUAL_VERIFICATION.md`.
++
++### Expected output
++
++**Headless mode**:
++
++```
++[info] object 0 (checker) world=(-2.0,1.3,0.0) pixel=(50,77) channels=(...) expected_linear=(255,140,38) matched=true
++[info] object 1 (checker) world=(2.0,1.3,0.0) pixel=(205,77) channels=(...) expected_linear=(38,217,230) matched=true
++[info] object 2 (rim) world=(-2.0,-1.3,0.0) pixel=(50,178) channels=(...) expected_linear=(152,50,139) matched=true
++[info] object 3 (rim) world=(2.0,-1.3,0.0) pixel=(205,178) channels=(...) expected_linear=(152,139,43) matched=true
++[info] materials headless gate PASSED
++```
++
++**`--present` mode** opens a 900x700 window titled `rx_materials_sample
++(--present)` showing an orange checkerboard cube (top-left), a teal
++checkerboard cube (top-right), a magenta rim-lit sphere (bottom-left), and a
++golden-yellow rim-lit sphere (bottom-right), with the camera orbiting
++continuously around the vertical axis. Editing and saving either
++`checker.slang` or `rim.slang` (the copies deployed next to the running
++binary, not the ones in the source tree) changes that material's rendering
++within about a second, with a console log line confirming the reload
++(`hot-reload of '...' succeeded`); a syntactically broken edit keeps the
++last-good material rendering instead of crashing. Closing the window exits
++with status 0 and logs:
++
++```
++[info] --present: window closed cleanly
++```
++
++### Editing a material live
++
++With `--present` running, open the deployed `materials/checker.slang` or
++`materials/rim.slang` (next to the running binary) in any editor and change
++its `evaluate()` body — e.g. checker.slang's cell count:
++
++```hlsl
++const float kCellsPerAxis = 6.0; // was 3.0 -- a finer checkerboard
++```
++
++Save the file — the affected cubes/spheres update within about a second.
++This sample's hot-reload support covers edits that change a material's
++*math*, matching `test_material_system.cpp`'s own reload-fixture convention
++— NOT edits that add/remove/retype a `gParams` field (that changes the
++parameter block's byte layout out from under this sample's already-created
++`IRxMaterialInstance` objects); `recordDraws()` in `main.cpp` catches that
++case defensively (logs it, skips that one object's draw for the frame)
++rather than letting it crash the session.
++
++### Redistribution
++
++Same Slang-runtime-lib mechanism as every in-process-compiling sample, plus
++a ledger item this sample resolves for `rx_material` itself: the two shared
++files every material composes against (`shaders/material/material.slang`,
++`shaders/material/forward_entry.slang`) used to be locatable only via
++`RX_MATERIAL_SHADER_DIR`, a compile-time absolute path anchored at this
++repository's own checkout — meaningless for a redistributed binary.
++`MaterialSystem::create()` (`src/rx_material/include/rx_material/
++material_system.h`) now takes an optional `sharedShaderDir` parameter;
++`RX_MATERIAL_SHADER_DIR` stays the default for every other caller
++(`rx_material`'s own unit/GPU tests), unchanged. This sample resolves a real
++runtime directory (`SDL_GetBasePath()`-relative, exactly like
++02_hotreload's own `resolveShaderPath()`) and passes it explicitly — so a
++redistributed copy of this sample's build-output directory (binary +
++`materials/` + `material_shaders/` + the Slang runtime libraries) runs
++identically outside the build tree, with no reference to this repository's
++checkout at all. Verified directly: this sample's packaged `.zip` output,
++unzipped to a directory outside the build tree entirely, passes its own
++headless gate unmodified on both `linux-native` and (via Wine)
++`windows-cross-zig`.
++
+ ## Building and running
+ 
+ Both sample modes and both build presets work identically on Linux and
+ Steam Deck (Desktop Mode is just Linux) — Windows only differs in how you
+ run the already-cross-compiled binary. There is no `samples`-specific
+ configure step; building the preset builds every sample.
+ 
+ ### Linux (native) — including Steam Deck Desktop Mode
+ 
+ ```sh
+@@ -521,40 +650,52 @@ cmake --build --preset linux-native
+ 
+ ```sh
+ # Headless, end-user default -- validation off, no Vulkan SDK required.
+ # ctest (see below) runs this same headless mode but adds --validate:
+ ./build/linux-native/samples/05_multipass/sample_05_multipass
+ 
+ # Interactive present-mode window, light orbiting in azimuth:
+ ./build/linux-native/samples/05_multipass/sample_05_multipass --present
+ ```
+ 
++```sh
++# Headless, end-user default -- validation off, no Vulkan SDK required.
++# ctest (see below) runs this same headless mode but adds --validate:
++./build/linux-native/samples/06_materials/sample_06_materials
++
++# Interactive present-mode window, camera orbiting, material hot-reload --
++# edit build/linux-native/samples/06_materials/materials/checker.slang or
++# rim.slang while this runs:
++./build/linux-native/samples/06_materials/sample_06_materials --present
++```
++
+ Steam Deck Desktop Mode: open Konsole (or any terminal) from the Desktop
+ Mode taskbar and run the exact same commands above — the Deck's SteamOS is
+ Linux with a Vulkan driver (AMD Mesa RADV), so `linux-native` is the correct
+ preset; there is no Deck-specific build variant. `--present`'s window
+ behaves like any other windowed X11/Wayland app under KDE Plasma (Desktop
+ Mode's desktop environment) — it can be moved, resized, and closed exactly
+ as described above.
+ 
+ ### Windows (cross-compiled from Linux via zig)
+ 
+ ```sh
+ cmake --preset windows-cross-zig
+ cmake --build --preset windows-cross-zig
+ ```
+ 
+ This produces `build/windows-cross-zig/samples/01_triangle/sample_01_triangle.exe`,
+ `build/windows-cross-zig/samples/02_hotreload/sample_02_hotreload.exe`,
+ `build/windows-cross-zig/samples/03_bindless_mesh/sample_03_bindless_mesh.exe`,
+-`build/windows-cross-zig/samples/04_streaming/sample_04_streaming.exe`, and
+-`build/windows-cross-zig/samples/05_multipass/sample_05_multipass.exe`.
++`build/windows-cross-zig/samples/04_streaming/sample_04_streaming.exe`,
++`build/windows-cross-zig/samples/05_multipass/sample_05_multipass.exe`, and
++`build/windows-cross-zig/samples/06_materials/sample_06_materials.exe`.
+ 01_triangle's binary is statically linked and needs no Slang DLLs (its
+ shaders are precompiled offline by `slangc` at build time — see its own
+ "Redistribution" section above) — but it does still need the two `.spv`
+ files deployed next to it (`triangle.vert.spv`/`triangle.frag.spv`). Copy
+ `sample_01_triangle.exe` plus those two files (not the whole build-output
+ directory's `CMakeFiles`/`.pdb`/`.cmake` bookkeeping) to the Windows machine
+ (or run it directly under Wine on Linux) and run it from a
+ terminal/`cmd.exe`/PowerShell:
+ 
+ ```
+@@ -607,38 +748,54 @@ deployed next to it), plus its own six on-disk shader sources
+ `lit.frag.slang`, `tonemap.vert.slang`, `tonemap.frag.slang` — see this
+ sample's own README section above for why six files, not one). Copy the
+ entire `build/windows-cross-zig/samples/05_multipass/` directory (minus the
+ `CMakeFiles`/`.pdb`/`.cmake` build bookkeeping) to run it elsewhere:
+ 
+ ```
+ sample_05_multipass.exe            REM headless correctness gate
+ sample_05_multipass.exe --present  REM interactive present-mode window, light orbiting
+ ```
+ 
++06_materials is the same shape as 02_hotreload for redistribution purposes
++(real in-process Slang compilation, so it needs the same 4 Slang DLLs
++deployed next to it), plus its own `materials/` subdirectory
++(`checker.slang`, `rim.slang`) and a sibling `material_shaders/`
++subdirectory carrying `rx_material`'s two shared files (`material.slang`,
++`forward_entry.slang` — see this sample's own README section above for why
++two separate subdirectories rather than one flat layout). Copy the entire
++`build/windows-cross-zig/samples/06_materials/` directory (minus the
++`CMakeFiles`/`.pdb`/`.cmake` build bookkeeping) to run it elsewhere:
++
++```
++sample_06_materials.exe            REM headless correctness gate
++sample_06_materials.exe --present  REM interactive present-mode window, camera orbiting
++```
++
+ See `MANUAL_VERIFICATION.md` at the repo root for the actual per-platform
+ run checklist (what to record, what "pass" looks like on real hardware).
+ 
+ ### Running the automated test suite
+ 
+ ```sh
+ ctest --preset linux-native --output-on-failure
+ ```
+ 
+ This runs `sample_01_triangle_headless`, `sample_02_hotreload_headless`,
+-`sample_03_bindless_mesh_headless`, `sample_04_streaming_headless`, and
+-`sample_05_multipass_headless` alongside every other project test
+-(`rx_core_tests`, `rx_platform_tests`, `rx_shader_tests`, `rx_rhi_vk_tests`,
+-`rx_graph_tests`, `rx_graph_gpu_tests`, `shader_spirv_test`) — `--present`
+-mode is intentionally excluded from `ctest` (it blocks on a real window
+-and user/OS interaction) and is exercised manually instead.
+-
+-Each of the five `*_headless` `ctest` cases passes `--validate` (see each
++`sample_03_bindless_mesh_headless`, `sample_04_streaming_headless`,
++`sample_05_multipass_headless`, and `sample_06_materials_headless` alongside
++every other project test (`rx_core_tests`, `rx_platform_tests`,
++`rx_shader_tests`, `rx_rhi_vk_tests`, `rx_graph_tests`, `rx_graph_gpu_tests`,
++`rx_material_tests`, `rx_material_gpu_tests`, `shader_spirv_test`) —
++`--present` mode is intentionally excluded from `ctest` (it blocks on a
++real window and user/OS interaction) and is exercised manually instead.
++
++Each of the six `*_headless` `ctest` cases passes `--validate` (see each
+ sample's own section above) — a developer/CI flag that turns on the Vulkan
+ validation layers, requiring the Vulkan SDK (or an equivalent
+ `VK_LAYER_KHRONOS_validation` install) to be present on the machine running
+ `ctest`. This is what keeps the zero-validation-error bar enforced in CI
+ and local development. It is deliberately **not** the default for the
+ plain sample binaries: an end user who downloads a released build (see
+ "Downloading a prebuilt sample bundle" above) and runs it directly gets
+ validation OFF, so a machine with no Vulkan SDK installed (the normal case
+ for an end user) never has the loader attempt a validation-layer manifest
+ lookup at all — headless mode just runs and exits 0/1 on its own
+diff --git a/src/rx_material/CMakeLists.txt b/src/rx_material/CMakeLists.txt
+index ca97fa5..803ab07 100644
+--- a/src/rx_material/CMakeLists.txt
++++ b/src/rx_material/CMakeLists.txt
+@@ -28,28 +28,29 @@ add_library(rx_material STATIC
+ )
+ target_include_directories(rx_material PUBLIC include)
+ target_link_libraries(rx_material PUBLIC rx_core rx_graph rx_rhi_vk rx_shader_layout_types slang::slang)
+ 
+ # RX_MATERIAL_SHADER_DIR -- the fixed, checked-out-repo-relative location of
+ # shaders/material/material.slang + forward_entry.slang, baked in at compile
+ # time exactly like shaders/CMakeLists.txt already bakes
+ # RX_TRIANGLE_VERT_SPV/RX_TRIANGLE_FRAG_SPV into shader_spirv_test: an
+ # absolute path anchored at CMAKE_SOURCE_DIR, valid for any build of THIS
+ # checked-out repository (dev builds, ctest, CI) but not a relocated/
+-# packaged binary -- a deliberate, explicitly-scoped-out concern for this
+-# task (Task 5 is the core material system + its own unit/GPU tests, run
+-# straight from the build tree against the checked-out source, exactly
+-# like rx_shader_tests/rx_graph_tests already do; a later sample that ships
+-# a redistributable package is expected to revisit this the same way
+-# samples/02_hotreload's own build-relative shader deployment does for its
+-# single hotreload.slang file) -- see material_system.h's own comment on
+-# MaterialSystem::create() for the full rationale.
++# packaged binary. This remains the DEFAULT MaterialSystem::create() uses
++# when its `sharedShaderDir` parameter is left empty (Task 5 through Task 7's
++# own unit/GPU tests all rely on exactly that default, unchanged, and keep
++# doing so) -- Task 5 deliberately scoped the redistribution case out;
++# [Task 8] samples/06_materials is the redistributable-package caller that
++# revisits it, passing a runtime-resolved (SDL_GetBasePath()-relative)
++# directory instead so its packaged binary needs no reference to this build
++# tree at all -- see material_system.h's own comment on
++# MaterialSystem::create() for the full parameter contract.
+ target_compile_definitions(rx_material PRIVATE
+   RX_MATERIAL_SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders/material"
+ )
+ 
+ # Slang compiles in-process (never statically linked) -- any BINARY linking
+ # rx_material (transitively, slang::slang) needs the Slang runtime shared
+ # libraries sitting next to it at load time, exactly like every other
+ # rx_shader/slang::slang-linking binary in this repo [R:D2]. Not relevant to
+ # this static library itself, only to executables that link it -- tests/
+ # CMakeLists.txt calls rx_shader_deploy_runtime_libs() (defined in
+diff --git a/src/rx_material/include/rx_material/material_system.h b/src/rx_material/include/rx_material/material_system.h
+index 5b0f1d3..62fed20 100644
+--- a/src/rx_material/include/rx_material/material_system.h
++++ b/src/rx_material/include/rx_material/material_system.h
+@@ -159,22 +159,52 @@ public:
+     // malformed initial data outright (a driver must fall back to
+     // treating it as absent), so the only failure this needs to guard is
+     // the file READ step, not the blob's own internal structure.
+     //
+     // Returns nullptr (logged via RX_LOG_ERROR) if Slang session creation
+     // fails, if `shaders/material/material.slang`/`forward_entry.slang`
+     // cannot be read or fail to compile (an engine-authoring bug, not a
+     // per-material one -- these two files are fixed and shared across
+     // every material this MaterialSystem will ever load), or if any
+     // underlying Vulkan object creation fails.
++    //
++    // `sharedShaderDir` [Task 8 ledger item carried from Task 5, resolved
++    // here]: the directory `material.slang`/`forward_entry.slang` are read
++    // from, AND the Slang session search path `import material;` (every
++    // material module's own first line) resolves against -- both were
++    // previously hardcoded to RX_MATERIAL_SHADER_DIR, a compile-time
++    // absolute path baked in by src/rx_material/CMakeLists.txt, anchored at
++    // this checked-out repository's own CMAKE_SOURCE_DIR. That is exactly
++    // right for a build-tree run (dev builds, ctest, CI -- Task 5 through
++    // Task 7's own tests all rely on it, unchanged, via the default below)
++    // but is meaningless for a REDISTRIBUTED binary, which has no
++    // CMAKE_SOURCE_DIR at all: samples/06_materials is the first caller
++    // that ships as a standalone package (binary + its own materials/ dir +
++    // these two shared files, deployed flat next to it -- see that
++    // sample's own CMakeLists.txt/README), so it needs a real, runtime-
++    // resolved directory (typically SDL_GetBasePath()-relative) instead of
++    // this compile-time one.
++    //
++    // Defaults to an empty path, which means "use RX_MATERIAL_SHADER_DIR"
++    // (this method's ORIGINAL, unchanged behavior) -- every existing
++    // caller (test_material_system.cpp, test_api_factory.cpp,
++    // test_api_contract.cpp, api_impl.cpp) keeps compiling and behaving
++    // identically without passing this parameter at all. A non-empty path
++    // is used verbatim (not validated against RX_MATERIAL_SHADER_DIR in any
++    // way) as both the shared-module read directory and the session search
++    // path; a caller passing one that does not actually contain
++    // material.slang/forward_entry.slang gets the exact same "file could
++    // not be read" nullptr-and-RX_LOG_ERROR failure this method already
++    // documents for that case.
+     static std::unique_ptr<MaterialSystem> create(rx::rhi::Device& device, rx::rhi::BindlessTable& bindless,
+-                                                    const std::filesystem::path& pipelineCachePath);
++                                                    const std::filesystem::path& pipelineCachePath,
++                                                    const std::filesystem::path& sharedShaderDir = {});
+ 
+     // Loads the Slang module at `slangModulePath` as a material: reads its
+     // bytes (moduleHash() below), compiles+composes+links it against the
+     // shared forward_entry.slang entry points [D6, and see
+     // shaders/material/forward_entry.slang's own header comment for the
+     // exact link-time-specialization mechanism], reflects its
+     // `ParameterBlock<TParams> gParams` global into a
+     // `rx::shader::ShaderLayoutInfo` (layoutInfo() below), and builds this
+     // material's `VkPipelineLayout` (pipelineLayout() below) against
+     // `bindless`'s set-0 layout -- all of this happens here, eagerly, not
+diff --git a/src/rx_material/material_system.cpp b/src/rx_material/material_system.cpp
+index 0bd3178..f6fe21c 100644
+--- a/src/rx_material/material_system.cpp
++++ b/src/rx_material/material_system.cpp
+@@ -449,20 +449,31 @@ struct TextureRecord {
+     rx::rhi::BindlessHandle bindlessHandle;
+ };
+ 
+ struct MaterialSystem::Impl {
+     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+     VkDevice device = VK_NULL_HANDLE;
+     rx::rhi::BindlessTable* bindless = nullptr;
+     std::filesystem::path pipelineCachePath;
+     VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+ 
++    // [Task 8] The RESOLVED shared-shader directory this instance was
++    // actually built with -- create()'s own `sharedShaderDir` parameter if
++    // non-empty, else RX_MATERIAL_SHADER_DIR (see create()'s header comment
++    // in material_system.h). Stashed here so reloadChanged()'s own fresh-
++    // session path (which must recreate a session against the SAME shared
++    // modules this instance loaded every OTHER material against) reads it
++    // back rather than re-deriving it -- there is exactly one resolution
++    // point (create()), matching every other "resolved once, reused" Impl
++    // field in this struct.
++    std::filesystem::path sharedShaderDir;
++
+     // One process session per MaterialSystem instance -- NOT the
+     // process-wide shared IGlobalSession rx_shader::Compiler keeps behind
+     // a private, non-exported static (compiler.cpp's sharedGlobalSession())
+     // -- since that instance is private to rx_shader and this task's
+     // Modify list does not include touching rx_shader to expose it. This
+     // pays Slang's real fixed cost (its standard-library load) once more
+     // than the process's rx_shader-owned Compilers already do if both
+     // happen to be alive at once; acceptable for a class that itself is
+     // typically constructed once and lives for the process's whole
+     // renderer lifetime, same as rx::graph::Executor/RenderGraph.
+@@ -543,23 +554,25 @@ struct MaterialSystem::Impl {
+ };
+ 
+ namespace detail {
+ 
+ uint64_t debugCompileCount(const MaterialSystem& system) { return system.impl_->compileCount; }
+ 
+ }  // namespace detail
+ 
+ namespace {
+ 
+-// Loads `filename` (one of the two fixed, shared files under
+-// RX_MATERIAL_SHADER_DIR -- material.slang/forward_entry.slang) as a
+-// module named after its own stem, exactly like rx_shader::Compiler's
++// Loads `filename` (one of the two fixed, shared files under `dir` --
++// material.slang/forward_entry.slang; `dir` is MaterialSystem::create()'s
++// own resolved effectiveShaderDir [Task 8] -- RX_MATERIAL_SHADER_DIR by
++// default, or a caller-supplied runtime directory) as a module named after
++// its own stem, exactly like rx_shader::Compiler's
+ // compileFromFile() reads a file itself and calls loadModuleFromSource()
+ // rather than session->loadModule() -- see MaterialSystem::create()'s own
+ // comment for why this project's established idiom is followed here too,
+ // and material_system.h's comment on RX_MATERIAL_SHADER_DIR for why this
+ // directory is a compile-time-baked absolute path rather than a
+ // create()-time parameter. Returns nullptr (logged) on any failure --
+ // `diagnostics` always receives whatever Slang reported, on success or
+ // failure alike, matching CompileResult's own "diagnostics are never
+ // silently swallowed" contract.
+ slang::IModule* loadSharedModule(slang::ISession* session, const std::filesystem::path& dir, const char* filename,
+@@ -583,40 +596,46 @@ slang::IModule* loadSharedModule(slang::ISession* session, const std::filesystem
+     return module;
+ }
+ 
+ // [Task 7] Factored out of what used to be inlined twice (create()'s
+ // own session setup, and reloadChanged()'s "fresh Compiler per reload"
+ // path) -- identical target/session configuration either way, which is
+ // exactly what task-6-report.md's Fix round 1 (F3) flagged as a real risk
+ // class when two independently-typed-out copies of this same setup drift:
+ // a single function makes drift structurally impossible rather than
+ // relying on two comments staying in sync by hand.
+-bool createMaterialSession(slang::IGlobalSession* globalSession, Slang::ComPtr<slang::ISession>& outSession) {
++bool createMaterialSession(slang::IGlobalSession* globalSession, const std::filesystem::path& shaderDir,
++                            Slang::ComPtr<slang::ISession>& outSession) {
+     slang::TargetDesc targetDesc{};
+     targetDesc.format = SLANG_SPIRV;
+     targetDesc.profile = globalSession->findProfile("sm_6_0");
+ 
+     slang::CompilerOptionEntry capabilityEntry{};
+     SlangCapabilityID spirvFloor = globalSession->findCapability("spirv_1_3");
+     if (spirvFloor != SLANG_CAPABILITY_UNKNOWN) {
+         capabilityEntry.name = slang::CompilerOptionName::Capability;
+         capabilityEntry.value.kind = slang::CompilerOptionValueKind::Int;
+         capabilityEntry.value.intValue0 = static_cast<int32_t>(spirvFloor);
+         targetDesc.compilerOptionEntries = &capabilityEntry;
+         targetDesc.compilerOptionEntryCount = 1;
+     } else {
+         RX_LOG_WARN("rx_material: Slang capability 'spirv_1_3' not found by this Slang build; "
+                     "compiling without an explicit SPIR-V version floor");
+     }
+ 
+-    const std::string shaderDir = RX_MATERIAL_SHADER_DIR;
+-    const char* searchPath = shaderDir.c_str();
++    // [Task 8] `shaderDir` is the CALLER-resolved shared-shader directory
++    // (MaterialSystem::create()'s own `sharedShaderDir` parameter, already
++    // defaulted to RX_MATERIAL_SHADER_DIR by that method if the caller
++    // passed none) -- this function itself no longer reads the macro
++    // directly, so it cannot drift from create()'s own resolution.
++    const std::string shaderDirStr = shaderDir.string();
++    const char* searchPath = shaderDirStr.c_str();
+ 
+     slang::SessionDesc sessionDesc{};
+     sessionDesc.targets = &targetDesc;
+     sessionDesc.targetCount = 1;
+     sessionDesc.searchPaths = &searchPath;
+     sessionDesc.searchPathCount = 1;
+ 
+     if (SLANG_FAILED(globalSession->createSession(sessionDesc, outSession.writeRef())) || outSession.get() == nullptr) {
+         RX_LOG_ERROR("rx_material: IGlobalSession::createSession failed");
+         return false;
+@@ -919,46 +938,55 @@ MaterialSystem::~MaterialSystem() {
+                             static_cast<int>(result));
+             }
+         } else {
+             RX_LOG_WARN("rx_material: vkGetPipelineCacheData reported zero bytes; not writing pipeline cache file");
+         }
+         vkDestroyPipelineCache(impl.device, impl.pipelineCache, nullptr);
+     }
+ }
+ 
+ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device, rx::rhi::BindlessTable& bindless,
+-                                                         const std::filesystem::path& pipelineCachePath) {
++                                                         const std::filesystem::path& pipelineCachePath,
++                                                         const std::filesystem::path& sharedShaderDir) {
+     rx::core::log::init();
+ 
++    // [Task 8] Resolve ONCE, here: `sharedShaderDir` if the caller passed a
++    // real one, else the original compile-time RX_MATERIAL_SHADER_DIR
++    // default -- see this method's own header comment (material_system.h)
++    // for the redistribution problem this solves. Every use of "the shared-
++    // shader directory" below and in reloadChanged() (via
++    // impl->sharedShaderDir) flows from this one resolution.
++    const std::filesystem::path effectiveShaderDir =
++        !sharedShaderDir.empty() ? sharedShaderDir : std::filesystem::path(RX_MATERIAL_SHADER_DIR);
++
+     Slang::ComPtr<slang::IGlobalSession> globalSession;
+     if (SLANG_FAILED(slang::createGlobalSession(globalSession.writeRef())) || globalSession.get() == nullptr) {
+         RX_LOG_ERROR("rx_material: slang::createGlobalSession failed");
+         return nullptr;
+     }
+ 
+     // Target/session setup mirrors rx_shader::Compiler::create() exactly
+     // (SPIR-V target, "sm_6_0" profile, explicit spirv_1_3 capability
+     // floor) [R:A5, spec Fixed decision #3] -- plus `searchPaths`, which
+     // Compiler's own sessions never set (it has no multi-file import to
+     // resolve): this is what lets `import material;` inside
+     // forward_entry.slang and every material module resolve to
+-    // RX_MATERIAL_SHADER_DIR/material.slang without this class needing to
++    // effectiveShaderDir/material.slang without this class needing to
+     // pre-load it explicitly. [Task 7] Factored into createMaterialSession()
+     // so reloadChanged()'s fresh-session path cannot drift from this one.
+     Slang::ComPtr<slang::ISession> session;
+-    if (!createMaterialSession(globalSession.get(), session)) {
++    if (!createMaterialSession(globalSession.get(), effectiveShaderDir, session)) {
+         return nullptr;
+     }
+ 
+-    const std::string shaderDir = RX_MATERIAL_SHADER_DIR;
+     std::string diagnostics;
+-    auto forwardEntry = loadForwardEntry(session, shaderDir, diagnostics);
++    auto forwardEntry = loadForwardEntry(session, effectiveShaderDir, diagnostics);
+     if (!forwardEntry.has_value()) {
+         return nullptr;
+     }
+ 
+     // --- Pipeline cache: load if present, fresh+empty otherwise --------
+     // [Task 5 ambiguity resolution: an unreadable/corrupt cache file is a
+     // logged warning, never fatal -- Vulkan itself guarantees
+     // vkCreatePipelineCache never rejects malformed initialData outright
+     // (a driver must treat it as though none were given), so the only
+     // real failure mode to guard here is the file READ step, not the
+@@ -1027,20 +1055,21 @@ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device,
+         vkDestroyPipelineCache(device.device(), pipelineCache, nullptr);
+         return nullptr;
+     }
+ 
+     auto impl = std::make_unique<Impl>();
+     impl->physicalDevice = device.physicalDevice();
+     impl->device = device.device();
+     impl->bindless = &bindless;
+     impl->pipelineCachePath = pipelineCachePath;
+     impl->pipelineCache = pipelineCache;
++    impl->sharedShaderDir = effectiveShaderDir;
+     impl->globalSession = std::move(globalSession);
+     impl->session = std::move(session);
+     impl->forwardEntryModule = forwardEntry->module;
+     impl->vertexEntryPoint = std::move(forwardEntry->vertexEntryPoint);
+     impl->fragmentEntryPoint = std::move(forwardEntry->fragmentEntryPoint);
+     impl->allocator = std::move(allocator);
+     impl->uploader = std::move(uploader);
+     impl->paramArena = std::move(paramArena);
+ 
+     return std::unique_ptr<MaterialSystem>(new MaterialSystem(std::move(impl)));
+@@ -1174,21 +1203,26 @@ void MaterialSystem::bindInstance(VkCommandBuffer cmd, const rx::graph::PassCont
+         throw std::runtime_error(
+             "rx_material: MaterialSystem::bindInstance: parameter arena exhausted for the current frame");
+     }
+ 
+     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, record->layoutBundle.layout,
+                              /*firstSet=*/kMaterialParamBlockSet, 1, &set, 0, nullptr);
+ }
+ 
+ void MaterialSystem::reloadChanged() {
+     Impl& impl = *impl_;
+-    const std::string shaderDir = RX_MATERIAL_SHADER_DIR;
++    // [Task 8] The SAME resolved directory create() built this instance
++    // with (impl.sharedShaderDir) -- never re-reads RX_MATERIAL_SHADER_DIR
++    // directly, so a MaterialSystem built against a caller-supplied
++    // sharedShaderDir keeps reloading against that same directory, not the
++    // compile-time default.
++    const std::filesystem::path& shaderDir = impl.sharedShaderDir;
+ 
+     for (MaterialHandle handle : impl.materialHandles) {
+         // Re-fetched fresh every iteration -- see Impl::materialHandles'
+         // own comment for why a cached pointer across iterations would be
+         // unsafe (a HandlePool reallocation from an unrelated
+         // loadMaterial() call elsewhere could invalidate it; reloadChanged()
+         // itself never calls loadMaterial(), but the discipline is kept
+         // uniform with every other accessor in this file regardless).
+         MaterialRecord* record = impl.materials.get(handle);
+         if (record == nullptr) {
+@@ -1221,21 +1255,21 @@ void MaterialSystem::reloadChanged() {
+         // rx_shader::Compiler, but the identical caveat applies: reloading
+         // the SAME path -- SAME module name, by construction -- through
+         // impl.session a second time fails with Slang's own "already
+         // loaded with different source" diagnostic). The process's real
+         // fixed cost, `impl.globalSession`'s stdlib load, is reused
+         // unchanged -- only a new, cheap ISession is created here, mirroring
+         // compiler.h's own documented "a fresh Compiler::create() call only
+         // ever pays for a new, cheap ISession, never a new IGlobalSession"
+         // cost model.
+         Slang::ComPtr<slang::ISession> freshSession;
+-        if (!createMaterialSession(impl.globalSession.get(), freshSession)) {
++        if (!createMaterialSession(impl.globalSession.get(), shaderDir, freshSession)) {
+             RX_LOG_WARN("rx_material: reloadChanged: failed to create a fresh Slang session for '{}'; keeping "
+                         "last-good",
+                         record->path.string());
+             continue;
+         }
+ 
+         std::string forwardEntryDiag;
+         auto freshForwardEntry = loadForwardEntry(freshSession, shaderDir, forwardEntryDiag);
+         if (!freshForwardEntry.has_value()) {
+             RX_LOG_WARN("rx_material: reloadChanged: failed to reload forward_entry.slang while reloading '{}'; "
+diff --git a/tools/package_samples.sh b/tools/package_samples.sh
+index 919d5af..9f4717a 100755
+--- a/tools/package_samples.sh
++++ b/tools/package_samples.sh
+@@ -1,12 +1,12 @@
+ #!/usr/bin/env bash
+-# Packages this project's five sample binaries into a single per-platform
++# Packages this project's six sample binaries into a single per-platform
+ # .zip laid out exactly as a user would unzip-and-run it: one subdirectory
+ # per sample, containing that sample's binary plus everything IT needs to
+ # run standalone -- nothing more, nothing missing [R:D2].
+ #
+ # Usage: tools/package_samples.sh <preset> <slang-platform-dir> <output-zip>
+ #   <preset>             linux-native | windows-cross-zig
+ #                        (selects the build dir + the executable suffix)
+ #   <slang-platform-dir> linux-x86_64 | windows-x86_64
+ #                        (the third_party/slang-prebuilt/<this> subdirectory
+ #                        fetch_slang.cmake populated for this preset's
+@@ -27,20 +27,31 @@
+ #   04_streaming      binary + Slang runtime libs + LICENSE
+ #                     (no external asset -- every texture is procedural)
+ #   05_multipass      binary + shaders/multipass/*.slang (6 files, incl.
+ #                     scene_types.slang [fix round 1] -- the single source
+ #                     of truth for ObjectTransform, concatenated ahead of
+ #                     both shadow.vert.slang and lit.vert.slang at compile
+ #                     time, so it must ship too) + Slang runtime libs +
+ #                     LICENSE (no other external asset -- every texture
+ #                     this sample uses is a graph-pooled transient, never
+ #                     an on-disk file)
++#   06_materials      binary + materials/checker.slang + materials/rim.slang
++#                     (this sample's OWN two materials) + material_shaders/
++#                     material.slang + material_shaders/forward_entry.slang
++#                     (rx_material's two SHARED shader files, deployed
++#                     alongside this sample rather than referenced via
++#                     RX_MATERIAL_SHADER_DIR's build-tree-only compile-time
++#                     path [Task 8 ledger item carried from Task 5] -- see
++#                     src/rx_material/include/rx_material/material_system.h's
++#                     MaterialSystem::create() `sharedShaderDir` parameter
++#                     and samples/06_materials/main.cpp's
++#                     basePathDirectory()) + Slang runtime libs + LICENSE
+ #
+ # This script does NOT build anything -- it assumes `cmake --build
+ # --preset <preset>` already ran and each sample's build-output directory
+ # already has its runtime libs/assets deployed next to its binary (that
+ # deployment is CMake's job: rx_shader_deploy_runtime_libs() in
+ # src/rx_shader/CMakeLists.txt for the Slang libs, and each sample's own
+ # POST_BUILD copy step for its on-disk asset). This script's only job is to
+ # select, per sample, the subset of that build-output directory a
+ # redistributed copy actually needs -- leaving out CMake/Ninja build
+ # bookkeeping (CMakeFiles/, cmake_install.cmake, CTestTestfile.cmake, *.pdb,
+@@ -113,27 +124,27 @@ copy_required() {
+ echo "package_samples: staging '$RX_PRESET' samples in '$STAGE_DIR' ..."
+ 
+ # --- 01_triangle: precompiled SPIR-V only, no Slang runtime libs [D2] -----
+ SAMPLE_DIR="$STAGE_DIR/01_triangle"
+ mkdir -p "$SAMPLE_DIR"
+ copy_required "$SAMPLE_DIR" \
+   "$SAMPLES_BUILD_DIR/01_triangle/sample_01_triangle${RX_EXE_SUFFIX}" \
+   "$SAMPLES_BUILD_DIR/01_triangle/triangle.vert.spv" \
+   "$SAMPLES_BUILD_DIR/01_triangle/triangle.frag.spv"
+ 
+-# --- 02_hotreload / 03_bindless_mesh / 04_streaming / 05_multipass: real
+-# in-process Slang compilation -- each needs the Slang runtime libs +
+-# LICENSE deployed next to it. Globbed rather than hardcoded to the pinned
+-# version string, same posture as rx_shader_deploy_runtime_libs() in
+-# src/rx_shader/CMakeLists.txt: Linux filenames embed the Slang version,
+-# Windows filenames don't [R:A1/A6/D2].
+-for RX_SAMPLE in 02_hotreload 03_bindless_mesh 04_streaming 05_multipass; do
++# --- 02_hotreload / 03_bindless_mesh / 04_streaming / 05_multipass /
++# 06_materials: real in-process Slang compilation -- each needs the Slang
++# runtime libs + LICENSE deployed next to it. Globbed rather than hardcoded
++# to the pinned version string, same posture as
++# rx_shader_deploy_runtime_libs() in src/rx_shader/CMakeLists.txt: Linux
++# filenames embed the Slang version, Windows filenames don't [R:A1/A6/D2].
++for RX_SAMPLE in 02_hotreload 03_bindless_mesh 04_streaming 05_multipass 06_materials; do
+   SAMPLE_DIR="$STAGE_DIR/$RX_SAMPLE"
+   mkdir -p "$SAMPLE_DIR"
+   copy_required "$SAMPLE_DIR" "$SAMPLES_BUILD_DIR/$RX_SAMPLE/sample_${RX_SAMPLE}${RX_EXE_SUFFIX}"
+   copy_required "$SAMPLE_DIR" "$SLANG_LICENSE"
+ 
+   if [[ "$RX_PRESET" == "windows-cross-zig" ]]; then
+     copy_required "$SAMPLE_DIR" \
+       "$SAMPLES_BUILD_DIR/$RX_SAMPLE/slang-compiler.dll" \
+       "$SAMPLES_BUILD_DIR/$RX_SAMPLE/slang-glslang.dll" \
+       "$SAMPLES_BUILD_DIR/$RX_SAMPLE/slang-glsl-module.dll" \
+@@ -148,30 +159,42 @@ for RX_SAMPLE in 02_hotreload 03_bindless_mesh 04_streaming 05_multipass; do
+ done
+ 
+ # 02_hotreload additionally ships the live-reloadable shader source; 03
+ # additionally ships its one real-PNG texture. 04 has no external asset
+ # (every texture is procedurally generated) -- nothing extra for it. 05
+ # ships its own six on-disk shader sources (see samples/05_multipass/
+ # CMakeLists.txt's own POST_BUILD deploy step for why these six, flat, no
+ # "multipass/" subdirectory in the deployed layout) -- scene_types.slang
+ # [fix round 1] included: it is concatenated ahead of shadow.vert.slang/
+ # lit.vert.slang at compile time, so a packaged run needs it on disk next
+-# to the binary exactly like the other five.
++# to the binary exactly like the other five. 06 ships its OWN materials/
++# subdirectory (checker.slang/rim.slang) PLUS a sibling material_shaders/
++# subdirectory carrying rx_material's two shared files (material.slang/
++# forward_entry.slang) -- see samples/06_materials/CMakeLists.txt's own
++# POST_BUILD deploy steps for why two separate subdirectories, not a flat
++# layout like 05's.
+ copy_required "$STAGE_DIR/02_hotreload" "$SAMPLES_BUILD_DIR/02_hotreload/hotreload.slang"
+ copy_required "$STAGE_DIR/03_bindless_mesh" "$SAMPLES_BUILD_DIR/03_bindless_mesh/texture.png"
+ copy_required "$STAGE_DIR/05_multipass" \
+   "$SAMPLES_BUILD_DIR/05_multipass/scene_types.slang" \
+   "$SAMPLES_BUILD_DIR/05_multipass/shadow.vert.slang" \
+   "$SAMPLES_BUILD_DIR/05_multipass/lit.vert.slang" \
+   "$SAMPLES_BUILD_DIR/05_multipass/lit.frag.slang" \
+   "$SAMPLES_BUILD_DIR/05_multipass/tonemap.vert.slang" \
+   "$SAMPLES_BUILD_DIR/05_multipass/tonemap.frag.slang"
++mkdir -p "$STAGE_DIR/06_materials/materials" "$STAGE_DIR/06_materials/material_shaders"
++copy_required "$STAGE_DIR/06_materials/materials" \
++  "$SAMPLES_BUILD_DIR/06_materials/materials/checker.slang" \
++  "$SAMPLES_BUILD_DIR/06_materials/materials/rim.slang"
++copy_required "$STAGE_DIR/06_materials/material_shaders" \
++  "$SAMPLES_BUILD_DIR/06_materials/material_shaders/material.slang" \
++  "$SAMPLES_BUILD_DIR/06_materials/material_shaders/forward_entry.slang"
+ 
+ mkdir -p "$(dirname "$RX_OUT_ZIP")"
+ RX_OUT_ZIP_ABS="$(cd "$(dirname "$RX_OUT_ZIP")" && pwd)/$(basename "$RX_OUT_ZIP")"
+ rm -f "$RX_OUT_ZIP_ABS"
+ 
+ echo "package_samples: zipping into '$RX_OUT_ZIP_ABS' ..."
+-(cd "$STAGE_DIR" && zip -r -X -q "$RX_OUT_ZIP_ABS" 01_triangle 02_hotreload 03_bindless_mesh 04_streaming 05_multipass)
++(cd "$STAGE_DIR" && zip -r -X -q "$RX_OUT_ZIP_ABS" 01_triangle 02_hotreload 03_bindless_mesh 04_streaming 05_multipass 06_materials)
+ 
+ echo "package_samples: done. Contents:"
+ unzip -l "$RX_OUT_ZIP_ABS"

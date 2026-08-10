@@ -1,0 +1,868 @@
+# Review package: df40111..77f42cf
+
+## Commits
+77f42cf fix: track per-stage barrier visibility in rx_graph and scope the seam to detail::
+
+## Files changed
+ src/rx_graph/barriers.cpp                | 215 +++++++++++++++++++++----------
+ src/rx_graph/include/rx_graph/barriers.h | 162 +++++++++++++++--------
+ src/rx_graph/tests/test_barriers.cpp     | 170 +++++++++++++++++++++---
+ 3 files changed, 409 insertions(+), 138 deletions(-)
+
+## Diff
+diff --git a/src/rx_graph/barriers.cpp b/src/rx_graph/barriers.cpp
+index d951741..e22c227 100644
+--- a/src/rx_graph/barriers.cpp
++++ b/src/rx_graph/barriers.cpp
+@@ -1,157 +1,232 @@
+ #include <rx_graph/barriers.h>
+ #include <rx_graph/render_graph.h>
+ 
+ #include <algorithm>
+ #include <span>
+ #include <utility>
+ #include <vector>
+ 
+ // Task 2's barrier build: per-resource invalidate/flush state machine
+-// (ported from Granite's RenderGraph::build_physical_barriers -- see
+-// barriers.h's own comment on ResourceBarrierState/applyAccess for the
+-// exact re-derivation and what didn't carry over) applied once per
+-// physical resource, in CompiledGraph::executionOrder() order, over the
++// (ported from Granite's RenderGraph::build_physical_barriers /
++// physical_pass_handle_invalidate_barrier / need_invalidate /
++// physical_pass_handle_flush_barrier -- see barriers.h's own comment on
++// detail::ResourceBarrierState/detail::applyAccess for the exact
++// re-derivation and what didn't carry over) applied once per physical
++// resource, in CompiledGraph::executionOrder() order, over the
+ // resource-access data Task 1's compile() already resolved.
++//
++// What Granite's model has that this port deliberately still does not:
++// its `PipelineEvent` also carries `wait_graphics_semaphore`/
++// `wait_compute_semaphore` and `locked_invalidation`, used to satisfy a
++// dependency via a queue semaphore instead of a same-queue pipeline
++// barrier, and to guard against double-processing one barrier. rx_graph
++// has exactly one queue and calls detail::applyAccess() exactly once per
++// resource per execution-order position (never re-entrantly), so neither
++// concern exists yet -- Task 3's executor, if it ever needs cross-queue
++// hand-off, is where that would be re-added, not here.
+ namespace rx::graph {
+ 
++namespace detail {
++
+ namespace {
+ 
+ // Access bits any declared ResourceAccess in this project can carry that
+-// represent a write [Task 1's Pass::resolveAccess table]. A write pass's
+-// pendingFlush only needs to remember these -- not e.g.
++// represent a write [Task 1's Pass::resolveAccess table]. A write's
++// pendingFlushAccess only needs to remember these -- not e.g.
+ // DEPTH_STENCIL_ATTACHMENT_READ_BIT, which a depth-stencil output also
+ // carries but which never needs flushing (nothing was made dirty by
+ // reading it) [Task 2 brief: "WAW: barrier with srcAccess = prior write
+ // access"].
+ constexpr VkAccessFlags2 kWriteAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                                              VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+ 
+ bool isWriteAccess(VkAccessFlags2 access) {
+     return (access & kWriteAccessMask) != 0;
+ }
+ 
+-bool coveredByInvalidated(const ResourceBarrierState& state, VkPipelineStageFlags2 stages, VkAccessFlags2 access) {
+-    return (state.invalidatedStages & stages) == stages && (state.invalidatedAccess & access) == access;
++// Granite's `Util::for_each_bit64` over a stage mask, re-expressed as a
++// plain loop rather than ported bit-trick for bit-trick's sake -- called
++// at most a handful of times per declared access, never a hot path.
++template <typename Fn>
++void forEachStageBit(VkPipelineStageFlags2 stages, Fn&& fn) {
++    for (uint32_t bit = 0; bit < 64; ++bit) {
++        if ((stages & (VkPipelineStageFlags2{1} << bit)) != 0) {
++            fn(bit);
++        }
++    }
+ }
+ 
+-// One pass's declared accesses, merged per physical resource. Almost
+-// always a 1:1 pass with a single ResourceAccess per resource; the merge
+-// only does real work for Task 2's ambiguity resolution "a resource both
+-// read and written by the same pass (e.g. depth output also declared
+-// sampled -- invalid combination) -- ... derive barriers from the union
+-// access at that pass; do not add new validation in this task": stages
+-// and access simply union, and a write's layout wins over a read's when a
+-// pass declares both for the same resource (the write is what actually
+-// establishes the pass's real image layout; Task 1 does not reject this
+-// combination, so this is "don't crash on it", not new validation).
+-struct CombinedAccess {
+-    VkPipelineStageFlags2 stages = 0;
+-    VkAccessFlags2 access = 0;
+-    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+-};
+-
+-std::vector<std::pair<uint32_t, CombinedAccess>> combineByResource(std::span<const ResourceAccess> accesses) {
+-    std::vector<std::pair<uint32_t, CombinedAccess>> combined;
+-    for (const ResourceAccess& access : accesses) {
+-        auto it = std::find_if(combined.begin(), combined.end(),
+-                                [&](const auto& entry) { return entry.first == access.physicalIndex; });
+-        if (it == combined.end()) {
+-            combined.push_back({access.physicalIndex, CombinedAccess{access.stages, access.access, access.layout}});
+-            continue;
+-        }
+-        it->second.stages |= access.stages;
+-        it->second.access |= access.access;
+-        if (isWriteAccess(access.access) || it->second.layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+-            it->second.layout = access.layout;
++// Granite's `need_invalidate()` (render_graph.cpp ~L1748-1756): true if
++// *any* of the requested stage bits does not yet have every requested
++// access bit recorded as invalidated (visible) for that specific stage.
++// Checking per-stage-bit, not against one aggregate, is exactly the fix
++// this task's Critical finding required: a reader in stage S1 being
++// invalidated must never be read back as "stage S2 is invalidated too."
++bool coveredByInvalidated(const ResourceBarrierState& state, VkPipelineStageFlags2 stages, VkAccessFlags2 access) {
++    bool covered = true;
++    forEachStageBit(stages, [&](uint32_t bit) {
++        if ((state.invalidatedInStage[bit] & access) != access) {
++            covered = false;
+         }
+-    }
+-    return combined;
++    });
++    return covered;
+ }
+ 
+ }  // namespace
+ 
+ std::optional<BarrierTransition> applyAccess(ResourceBarrierState& state, bool isBuffer, VkPipelineStageFlags2 stages,
+                                               VkAccessFlags2 access, VkImageLayout layout) {
+     const bool write = isWriteAccess(access);
+     const bool layoutDiffers = !isBuffer && layout != state.currentLayout;
+-    const bool needBarrier = layoutDiffers || (write && state.everAccessed) ||
+-                              (!write && state.hasPendingFlush && !coveredByInvalidated(state, stages, access));
++    // Granite's need_sync = layout_change || (to_flush_access != 0) ||
++    // need_invalidate(...), applied uniformly to both reads and writes in
++    // physical_pass_handle_invalidate_barrier(). The write-specific
++    // "(write && everAccessed)" disjunct below stands in for Granite's own
++    // gate on whether to actually *emit* a barrier once need_sync is true
++    // (`need_pipeline_barrier = event.pipeline_barrier_src_stages != 0`,
++    // i.e. "only if some prior write exists to sync against") -- Task 1's
++    // topology guarantees the first access to any resource is always a
++    // write, so `everAccessed` and "a prior write exists" coincide here,
++    // and folding need_invalidate's coverage check into the write branch
++    // too would (wrongly) demand a barrier for a resource's very first
++    // write, which has nothing to be invalidated against yet.
++    const bool needBarrier =
++        layoutDiffers || (write && state.everAccessed) || (!write && !coveredByInvalidated(state, stages, access));
+ 
+     std::optional<BarrierTransition> transition;
+     if (needBarrier) {
+         BarrierTransition t;
+-        if (state.hasPendingFlush) {
+-            // WAW, or the first read/write to make a still-unflushed write
+-            // visible: the barrier must wait on (and make available) that
+-            // write.
+-            t.srcStage = state.pendingFlushStages;
+-            t.srcAccess = state.pendingFlushAccess;
+-        } else if (write && state.everAccessed) {
+-            // WAR: the prior access was a read with nothing left to flush
+-            // -- an execution-only dependency [Task 2 brief ambiguity
+-            // resolution].
+-            t.srcStage = state.invalidatedStages;
+-            t.srcAccess = VK_ACCESS_2_NONE;
++        if (write) {
++            if (state.hasPendingFlush) {
++                // WAW: the prior write is still unflushed -- make it
++                // available before this write's own incoming dependency.
++                t.srcStage = state.lastWriteStages;
++                t.srcAccess = state.pendingFlushAccess;
++            } else if (state.everAccessed) {
++                // WAR: nothing is unflushed, but every reader since the
++                // last write must still finish -- srcStage is their union
++                // [Task 2 fix round 1, Critical finding: not Granite's own
++                // `pipeline_barrier_src_stages` here, which names only the
++                // *write's* stage and would not wait on any reader at all;
++                // see detail::ResourceBarrierState::invalidatedStagesUnion's
++                // comment].
++                t.srcStage = state.invalidatedStagesUnion;
++                t.srcAccess = VK_ACCESS_2_NONE;
++            } else {
++                // First use ever.
++                t.srcStage = VK_PIPELINE_STAGE_2_NONE;
++                t.srcAccess = VK_ACCESS_2_NONE;
++            }
+         } else {
+-            // First use ever.
+-            t.srcStage = VK_PIPELINE_STAGE_2_NONE;
+-            t.srcAccess = VK_ACCESS_2_NONE;
++            // Read: chains off the persisted last-write source (Granite's
++            // `pipeline_barrier_src_stages`), which survives a resolved
++            // flush -- so a later read in a stage the first resolving read
++            // never covered still gets a correct barrier instead of
++            // silently falling through with none.
++            t.srcStage = state.lastWriteStages;
++            t.srcAccess = state.hasPendingFlush ? state.pendingFlushAccess : VK_ACCESS_2_NONE;
+         }
+         t.dstStage = stages;
+         t.dstAccess = access;
+         if (!isBuffer) {
+             t.oldLayout = state.currentLayout;
+             t.newLayout = layout;
+         }
+         transition = t;
+     }
+ 
+     if (!isBuffer) {
+         state.currentLayout = layout;
+     }
+ 
+     if (write) {
+-        state.pendingFlushStages = stages;
++        // Granite: a fresh write means every previously-invalidated stage
++        // is stale (it granted visibility to the *old* contents), and
++        // `pipeline_barrier_src_stages`/`to_flush_access` both reset to
++        // this write's own (stage, access) [physical_pass_handle_flush_
++        // barrier()].
++        state.invalidatedInStage.fill(0);
++        state.invalidatedStagesUnion = 0;
++        state.lastWriteStages = stages;
+         state.pendingFlushAccess = access & kWriteAccessMask;
+         state.hasPendingFlush = true;
+-        state.invalidatedStages = 0;
+-        state.invalidatedAccess = 0;
+     } else if (needBarrier) {
++        // Granite: `event.to_flush_access = 0` unconditionally after any
++        // invalidate call, and `invalidated_in_stage[bit] |= barrier.access`
++        // only for the bits this specific barrier's stages cover.
+         state.hasPendingFlush = false;
+-        state.pendingFlushStages = 0;
+         state.pendingFlushAccess = 0;
+-        state.invalidatedStages |= stages;
+-        state.invalidatedAccess |= access;
++        forEachStageBit(stages, [&](uint32_t bit) { state.invalidatedInStage[bit] |= access; });
++        state.invalidatedStagesUnion |= stages;
+     }
+-    // A read that needed no barrier changes nothing: either nothing was
+-    // pending (multiple reads never need to synchronize against each
+-    // other), or its visibility was already covered.
++    // A read that needed no barrier changes nothing: its own stage was
++    // already fully covered, so there is nothing new to record.
+ 
+     state.everAccessed = true;
+     return transition;
+ }
+ 
++}  // namespace detail
++
++namespace {
++
++// One pass's declared accesses, merged per physical resource. Almost
++// always a 1:1 pass with a single ResourceAccess per resource; the merge
++// only does real work for Task 2's ambiguity resolution "a resource both
++// read and written by the same pass (e.g. depth output also declared
++// sampled -- invalid combination) -- ... derive barriers from the union
++// access at that pass; do not add new validation in this task": stages
++// and access simply union, and a write's layout wins over a read's when a
++// pass declares both for the same resource (the write is what actually
++// establishes the pass's real image layout; Task 1 does not reject this
++// combination, so this is "don't crash on it", not new validation).
++struct CombinedAccess {
++    VkPipelineStageFlags2 stages = 0;
++    VkAccessFlags2 access = 0;
++    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
++};
++
++std::vector<std::pair<uint32_t, CombinedAccess>> combineByResource(std::span<const ResourceAccess> accesses) {
++    std::vector<std::pair<uint32_t, CombinedAccess>> combined;
++    for (const ResourceAccess& access : accesses) {
++        auto it = std::find_if(combined.begin(), combined.end(),
++                                [&](const auto& entry) { return entry.first == access.physicalIndex; });
++        if (it == combined.end()) {
++            combined.push_back({access.physicalIndex, CombinedAccess{access.stages, access.access, access.layout}});
++            continue;
++        }
++        it->second.stages |= access.stages;
++        it->second.access |= access.access;
++        if (detail::isWriteAccess(access.access) || it->second.layout == VK_IMAGE_LAYOUT_UNDEFINED) {
++            it->second.layout = access.layout;
++        }
++    }
++    return combined;
++}
++
++}  // namespace
++
+ std::vector<PassBarriers> buildBarriers(const CompiledGraph& graph, PassBarriers& outFinalBarriers) {
+     const std::span<const PhysicalResource> resources = graph.resources();
+-    std::vector<ResourceBarrierState> state(resources.size());  // per-frame: starts empty every call [Task 2 brief D4]
++    std::vector<detail::ResourceBarrierState> state(resources.size());  // per-frame: starts empty [Task 2 brief D4]
+ 
+     const std::span<const uint32_t> order = graph.executionOrder();
+     std::vector<PassBarriers> result(order.size());
+ 
+     for (size_t pos = 0; pos < order.size(); ++pos) {
+         PassBarriers& passBarriers = result[pos];
+         for (const auto& [physicalIndex, combined] : combineByResource(graph.passAccesses(order[pos]))) {
+             const PhysicalResource& resource = resources[physicalIndex];
+-            std::optional<BarrierTransition> transition =
+-                applyAccess(state[physicalIndex], resource.isBuffer, combined.stages, combined.access, combined.layout);
++            std::optional<detail::BarrierTransition> transition = detail::applyAccess(
++                state[physicalIndex], resource.isBuffer, combined.stages, combined.access, combined.layout);
+             if (!transition) {
+                 continue;
+             }
+             if (resource.isBuffer) {
+                 passBarriers.bufferBarriers.push_back(BufferBarrier{
+                     physicalIndex, transition->srcStage, transition->srcAccess, transition->dstStage, transition->dstAccess});
+             } else {
+                 passBarriers.imageBarriers.push_back(ImageBarrier{physicalIndex, transition->srcStage, transition->srcAccess,
+                                                                     transition->dstStage, transition->dstAccess,
+                                                                     transition->oldLayout, transition->newLayout});
+@@ -161,21 +236,21 @@ std::vector<PassBarriers> buildBarriers(const CompiledGraph& graph, PassBarriers
+ 
+     // ---- finalBarriers(): the backbuffer's transition to PRESENT_SRC_KHR,
+     // src = its last write's (stage, access) [Task 2 brief ambiguity
+     // resolution]. That is exactly the resource's pendingFlush at the end
+     // of the walk: nothing reads the backbuffer after its final writer
+     // runs, so nothing ever resolves/clears it first.
+     for (uint32_t i = 0; i < resources.size(); ++i) {
+         if (!resources[i].isBackbuffer) {
+             continue;
+         }
+-        const ResourceBarrierState& s = state[i];
+-        outFinalBarriers.imageBarriers.push_back(ImageBarrier{i, s.pendingFlushStages, s.pendingFlushAccess,
++        const detail::ResourceBarrierState& s = state[i];
++        outFinalBarriers.imageBarriers.push_back(ImageBarrier{i, s.lastWriteStages, s.pendingFlushAccess,
+                                                                 VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE, s.currentLayout,
+                                                                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR});
+         break;
+     }
+ 
+     return result;
+ }
+ 
+ }  // namespace rx::graph
+diff --git a/src/rx_graph/include/rx_graph/barriers.h b/src/rx_graph/include/rx_graph/barriers.h
+index 6dc0017..164ad2d 100644
+--- a/src/rx_graph/include/rx_graph/barriers.h
++++ b/src/rx_graph/include/rx_graph/barriers.h
+@@ -1,16 +1,17 @@
+ #pragma once
+ // Vulkan-Headers only -- same header-hygiene rule as resources.h (no volk,
+ // no vulkan/vulkan.h, no rx_rhi_vk): Task 2's barrier derivation is
+ // device-free, exactly like Task 1's compile() [Task 2 brief].
+ #include <vulkan/vulkan_core.h>
+ 
++#include <array>
+ #include <cstdint>
+ #include <optional>
+ #include <vector>
+ 
+ namespace rx::graph {
+ 
+ class CompiledGraph;  // forward declaration only -- buildBarriers() reads a
+                        // CompiledGraph purely through its own public
+                        // accessors (executionOrder()/resources()/
+                        // passAccesses()); barriers.h never needs the full
+@@ -45,114 +46,173 @@ struct BufferBarrier {
+ };
+ 
+ // Every barrier to insert immediately before one pass (or, for
+ // CompiledGraph::finalBarriers(), immediately after the last surviving
+ // pass, before present).
+ struct PassBarriers {
+     std::vector<ImageBarrier> imageBarriers;
+     std::vector<BufferBarrier> bufferBarriers;
+ };
+ 
++// Not API-stable: ResourceBarrierState/BarrierTransition/applyAccess below
++// are exposed only so barriers.cpp's own unit tests and Task 3's executor
++// can drive the per-resource state machine directly -- buildBarriers() is
++// the one brief-specified, stable entry point. [Task 2 fix round 1,
++// Important finding: this seam is real (buildBarriers() is genuinely built
++// out of it, not scaffolding), but it was placed alongside the brief's
++// locked interface with nothing marking it as a different stability tier;
++// this namespace is that mark.]
++namespace detail {
++
+ // Running invalidate/flush accounting for one physical resource, reset to
+ // this default-constructed state at the start of every buildBarriers()
+ // call [Task 2 brief ambiguity resolution D4: transients are
+ // discard-per-frame, so every resource starts each compile walk at
+ // UNDEFINED layout with empty flush/invalidate state -- cross-frame
+ // carry-over is Task 3's concern, not compile's].
+ //
+-// Ported from Granite's per-resource ResourceState
+-// (render_graph.cpp, RenderGraph::build_physical_barriers:
+-// initial_layout/final_layout/invalidated_types/flushed_types) --
+-// re-expressed as a single running accumulator per resource rather than
+-// Granite's per-physical-pass snapshot, since rx_graph has no subpass
+-// merging to reset state between (dynamic rendering has no equivalent
+-// concept -- see the Phase 3 render-graph research doc, §1/§5). Not
+-// copied: the field names, the single-flush-pair-instead-of-a-64-entry
+-// per-stage-bit array, and every rule below are this task's own
+-// re-derivation against rx_graph's types.
++// Faithfully re-expresses Granite's actual per-resource state
++// (render_graph.hpp's `PipelineEvent`: `pipeline_barrier_src_stages`,
++// `to_flush_access`, `invalidated_in_stage[64]`, `layout` -- see
++// render_graph.cpp's `physical_pass_handle_invalidate_barrier()`/
++// `need_invalidate()`/`physical_pass_handle_flush_barrier()`), not just
++// the brief's one-paragraph paraphrase of it [Task 2 fix round 1, Critical
++// finding: the first port collapsed two Granite fields that must stay
++// separate -- see each field's own comment below for which Granite field
++// it corresponds to and why collapsing it was wrong]. Granite's
++// queue/semaphore/event machinery (`wait_graphics_semaphore`,
++// `locked_invalidation`, ...) is still not ported: rx_graph has one queue
++// and no cross-frame carry-over in Task 2, so there is nothing for that
++// machinery to do here -- see barriers.cpp's own comment for exactly what
++// was dropped and why.
+ struct ResourceBarrierState {
+     VkImageLayout currentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+     bool everAccessed = false;
+ 
+-    // The most recent write's (stage, access) that no barrier has yet made
+-    // available to anything -- empty once a barrier resolves it.
++    // Granite's `pipeline_barrier_src_stages`: the stage of the last real
++    // write. Persists across reads -- nothing but a *new write* ever
++    // changes it, which is exactly why it survives long enough to seed a
++    // later read's barrier even after that read's own resolving barrier
++    // has already cleared `pendingFlushAccess` to 0 below. Losing this
++    // persistence (the first port's bug) is what let a second reader in a
++    // never-covered pipeline stage fall through with zero barriers.
++    VkPipelineStageFlags2 lastWriteStages = 0;
++
++    // Granite's `to_flush_access`: the last write's own access, still
++    // "not yet made available to anything" until any subsequent barrier
++    // (read or write) resolves it -- then unconditionally 0, exactly like
++    // Granite's `event.to_flush_access = 0` at the end of every invalidate
++    // call, regardless of whether that call was for a read or a write.
+     bool hasPendingFlush = false;
+-    VkPipelineStageFlags2 pendingFlushStages = 0;
+     VkAccessFlags2 pendingFlushAccess = 0;
+ 
+-    // Which (stage, access) combinations are already known-visible,
+-    // accumulated by the barrier that last resolved pendingFlush; cleared
+-    // by the next write [Task 2 brief algorithm].
+-    VkPipelineStageFlags2 invalidatedStages = 0;
+-    VkAccessFlags2 invalidatedAccess = 0;
++    // Granite's `invalidated_in_stage[64]`: genuinely per-pipeline-stage
++    // -bit record of which access bits are already visible *at that
++    // specific stage* -- indexed by stage-bit position (bit 7 is
++    // `VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT`'s slot, etc.), matching
++    // `need_invalidate()`'s own per-bit loop. A reader in stage S1 being
++    // invalidated must never be mistaken for stage S2 also being
++    // invalidated -- the first port's single aggregate pair did exactly
++    // that.
++    std::array<VkAccessFlags2, 64> invalidatedInStage{};
++
++    // The union of every stage bit with a nonzero `invalidatedInStage`
++    // entry -- i.e. every stage that has *read* this resource since the
++    // last write. Not a Granite field: Granite's own WAR/WAW barriers
++    // chain off `pipeline_barrier_src_stages` (the last *write's* stage)
++    // unconditionally, which -- traced against the actual source for this
++    // fix round -- would let a write-after-multiple-different-stage-reads
++    // barrier name only the original write's stage as its srcStage, doing
++    // nothing to actually wait for those reads. The coordinator's
++    // ambiguity resolution for WAR ("srcStage = the prior read stages")
++    // and this fix round's required test both call for the *reads'*
++    // stages instead, unioned across every reader since the last write --
++    // this field is what makes that possible without rescanning all 64
++    // `invalidatedInStage` entries on every write-after-read.
++    VkPipelineStageFlags2 invalidatedStagesUnion = 0;
+ };
+ 
+ // The (src, dst, layout) fields one inserted barrier needs, independent of
+ // which physical resource or buffer-vs-image it applies to -- applyAccess()
+ // returns this; buildBarriers() attaches `physicalIndex` and picks
+ // ImageBarrier vs BufferBarrier from PhysicalResource::isBuffer.
+ // oldLayout/newLayout stay VK_IMAGE_LAYOUT_UNDEFINED for a buffer access,
+ // matching ResourceAccess::layout's own "meaningless for buffers" contract.
+ struct BarrierTransition {
+     VkPipelineStageFlags2 srcStage = 0;
+     VkAccessFlags2 srcAccess = 0;
+     VkPipelineStageFlags2 dstStage = 0;
+     VkAccessFlags2 dstAccess = 0;
+     VkImageLayout oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+     VkImageLayout newLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+ };
+ 
+ // Applies one declared (stages, access, layout) access to `state`, in
+-// execution order, and advances it -- the exact per-resource invalidate/
+-// flush accounting [Task 2 brief algorithm]:
++// execution order, and advances it -- the per-resource invalidate/flush
++// accounting, re-derived against Granite's actual per-stage model [Task 2
++// fix round 1]:
+ //   - a barrier is needed if the layout differs; or the access is a write
+-//     and any prior access exists (WAW/WAR need an execution dependency;
+-//     WAR's srcAccess is 0); or the access is a read not yet covered by
+-//     `invalidated*` while a write is still pending flush.
+-//   - a write always ends by setting pendingFlush to its own (stage,
+-//     access) and clearing invalidated; a read that needed a barrier ends
+-//     by clearing pendingFlush and folding (stage, access) into
+-//     invalidated; a read that needed no barrier changes nothing.
++//     and any prior access exists (WAW/WAR need an execution dependency);
++//     or the access is a read not yet covered by `invalidatedInStage` for
++//     every one of its own declared stage bits (checked unconditionally,
++//     not gated on `hasPendingFlush` -- a resolved flush does not mean
++//     every stage has visibility, only that nothing is left to *flush*).
++//   - a read's barrier (when needed) chains srcStage off `lastWriteStages`
++//     (the persisted last-write stage, correct whether or not that write
++//     has already been flushed to some *other* stage) and srcAccess off
++//     `pendingFlushAccess` (0 if already flushed). A write's barrier
++//     chains off `pendingFlushAccess`/`lastWriteStages` for WAW (something
++//     is still unflushed), or off `invalidatedStagesUnion` with
++//     srcAccess=0 for WAR (nothing is unflushed, but every reader since
++//     the last write must still finish first).
++//   - a write always ends by resetting `invalidatedInStage`/
++//     `invalidatedStagesUnion` to empty and setting a fresh
++//     `lastWriteStages`/`pendingFlushAccess`. A read that needed a barrier
++//     ends by clearing `pendingFlushAccess` and folding (stage, access)
++//     into `invalidatedInStage`/`invalidatedStagesUnion` for its own
++//     stage bits only. A read that needed no barrier changes nothing.
+ // Returns the barrier to insert immediately before this access, or
+-// std::nullopt if none is needed (e.g. two consecutive reads with no
+-// intervening write, or a resource's very first write with no layout to
+-// transition from).
++// std::nullopt if none is needed (e.g. two consecutive reads in the same,
++// already-covered stage with no intervening write, or a resource's very
++// first write with no layout to transition from).
+ //
+-// Exposed at namespace scope, not just as a buildBarriers() implementation
+-// detail, because it is also the smallest unit the WAW/WAR accounting
+-// rules can be verified against directly: RenderGraph::compile()'s own
+-// name-based dependency resolution (Task 1) always binds every reader of a
+-// declared resource name to that name's *final* declared writer, so a
+-// read can never itself be ordered ahead of a later write of the very same
+-// name through the public RenderGraph API -- see test_barriers.cpp's
+-// "war-execution-only" case (and this task's report) for the empirical
+-// proof. That is a genuine, deliberate Task 1 simplification (one name is
+-// one physical resource for a compiled graph's lifetime, with no
+-// versioning), not a Task 2 defect to route around by contorting a pass
+-// graph -- so applyAccess() exists to let the WAR rule itself be exercised
+-// in isolation, against a synthetic access sequence, independent of
+-// whether any current RenderGraph pass topology can produce one end to
+-// end.
++// Exposed here, not just as a buildBarriers() implementation detail,
++// because it is also the smallest unit the WAW/WAR/multi-stage-read
++// accounting rules can be verified against directly: RenderGraph::
++// compile()'s own name-based dependency resolution (Task 1) always binds
++// every reader of a declared resource name to that name's *final* declared
++// writer, so a read can never itself be ordered ahead of a later write of
++// the very same name through the public RenderGraph API -- see
++// test_barriers.cpp's "war-execution-only" case (and this task's report)
++// for the empirical proof. That is a genuine, deliberate Task 1
++// simplification (one name is one physical resource for a compiled
++// graph's lifetime, with no versioning), not a Task 2 defect to route
++// around by contorting a pass graph -- so applyAccess() exists to let
++// rules like this be exercised in isolation, against a synthetic access
++// sequence, independent of whether any current RenderGraph pass topology
++// can produce one end to end.
+ std::optional<BarrierTransition> applyAccess(ResourceBarrierState& state, bool isBuffer, VkPipelineStageFlags2 stages,
+                                               VkAccessFlags2 access, VkImageLayout layout);
+ 
++}  // namespace detail
++
+ // Derives every sync2 barrier RenderGraph::compile() needs to insert, from
+ // a CompiledGraph whose culling/ordering/resource-resolution phase (Task 1)
+ // has already run -- compile()'s last phase, after step 4 in
+ // render_graph.cpp populates executionOrder()/resources()/passAccesses().
+ // Device-free: reads `graph` purely through its public accessors, applies
+-// applyAccess() once per physical resource touched at each execution-order
+-// position (merging every ResourceAccess a single pass declares against
+-// one physical resource first -- see barriers.cpp's combineByResource() for
+-// the same-pass-reads-and-writes-the-same-resource ambiguity resolution),
+-// and writes the backbuffer's PRESENT_SRC_KHR transition into
+-// `outFinalBarriers` once the walk reaches its last write.
++// detail::applyAccess() once per physical resource touched at each
++// execution-order position (merging every ResourceAccess a single pass
++// declares against one physical resource first -- see barriers.cpp's
++// combineByResource() for the same-pass-reads-and-writes-the-same-resource
++// ambiguity resolution), and writes the backbuffer's PRESENT_SRC_KHR
++// transition into `outFinalBarriers` once the walk reaches its last write.
+ //
+ // The returned vector has exactly one entry per position in
+ // `graph.executionOrder()` (not per raw pass index, unlike
+ // CompiledGraph::passAccesses()) -- entry `i` is the barriers to insert
+ // immediately before executionOrder()[i]'s pass runs. Called exactly once,
+ // from RenderGraph::compile(), which stores the result on its own
+ // CompiledGraph (passBarriers_/finalBarriers_) -- see render_graph.h.
+ std::vector<PassBarriers> buildBarriers(const CompiledGraph& graph, PassBarriers& outFinalBarriers);
+ 
+ }  // namespace rx::graph
+diff --git a/src/rx_graph/tests/test_barriers.cpp b/src/rx_graph/tests/test_barriers.cpp
+index 3709bed..f89679c 100644
+--- a/src/rx_graph/tests/test_barriers.cpp
++++ b/src/rx_graph/tests/test_barriers.cpp
+@@ -1,32 +1,46 @@
+ // Task 2 brief's exact required doctest cases, asserting every one of the
+-// six mask/layout fields on the barrier structs it names, plus one direct
+-// unit test of applyAccess()'s WAR (write-after-read) rule in isolation.
++// six mask/layout fields on the barrier structs it names; plus, from fix
++// round 1 (Critical finding: the per-resource state machine under-
++// synchronized a second reader in an uncovered pipeline stage, and that
++// compounded into an under-synchronized WAR write), two more cases
++// targeting exactly that pattern -- one at the RenderGraph API level
++// ("multi-stage-read-gets-own-barrier") and one unit-level, direct
++// reproduction of the reviewer's own compounding scenario
++// ("war-unions-all-reader-stages").
+ //
+-// "war-execution-only" cannot be built by declaring passes through
+-// RenderGraph's public API: Task 1's compile() binds every reader of a
+-// declared resource name to that name's *final* declared writer (see
+-// render_graph.cpp's step 2 comment), so a read of "T" can never itself be
+-// ordered ahead of a later write of "T" -- any attempt to declare a second
+-// writer of the same name forces every reader to depend on it instead,
+-// which reorders the read to *after* both writes (write, write, read),
+-// never write, read, write. Confirmed empirically (see this task's
+-// report) before writing this file, rather than assumed. applyAccess()
+-// (barriers.h) is exposed at namespace scope precisely so the WAR
+-// accounting rule itself -- a real, necessary rule for a production
+-// barrier deriver even though today's RenderGraph pass topology can't
+-// exercise it end to end -- can still be verified directly, against a
+-// synthetic access sequence.
++// "war-execution-only" and "war-unions-all-reader-stages" cannot be built
++// by declaring passes through RenderGraph's public API: Task 1's compile()
++// binds every reader of a declared resource name to that name's *final*
++// declared writer (see render_graph.cpp's step 2 comment), so a read of
++// "T" can never itself be ordered ahead of a later write of "T" -- any
++// attempt to declare a second writer of the same name forces every reader
++// to depend on it instead, which reorders the read to *after* both writes
++// (write, write, read), never write, read, write. Confirmed empirically
++// (see this task's report) before writing this file, rather than assumed.
++// detail::applyAccess() (barriers.h) is exposed specifically so rules like
++// WAR/WAW -- real, necessary rules for a production barrier deriver even
++// though today's RenderGraph pass topology can't exercise every one of
++// them end to end -- can still be verified directly, against a synthetic
++// access sequence. It lives in rx::graph::detail (not the top-level
++// rx::graph API the brief's ImageBarrier/BufferBarrier/PassBarriers/
++// buildBarriers() interface specifies) precisely to mark it as that kind
++// of seam, not a second, equally-stable public entry point [Task 2 fix
++// round 1, Important finding].
+ #include <doctest/doctest.h>
+ #include <rx_graph/render_graph.h>
+ 
++#include <algorithm>
++
+ using namespace rx::graph;
++using rx::graph::detail::applyAccess;
++using rx::graph::detail::ResourceBarrierState;
+ 
+ namespace {
+ 
+ constexpr CompileInfo kInfo{1920, 1080, VK_FORMAT_B8G8R8A8_UNORM};
+ 
+ constexpr VkPipelineStageFlags2 kDepthTestStages =
+     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+ constexpr VkAccessFlags2 kDepthReadWrite =
+     VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+ 
+@@ -75,21 +89,31 @@ void checkBufferBarrier(const BufferBarrier& b, uint32_t physicalIndex, VkPipeli
+ }
+ 
+ // Several cases below need the reading pass to itself be Graphics-class
+ // (Task 1's hasAttachmentOutput() classification, keyed on that *same*
+ // pass's own declared outputs -- see pass.h) so the read resolves to
+ // FRAGMENT_SHADER rather than COMPUTE_SHADER; the simplest way to do that
+ // without a throwaway attachment is to have the reading pass double as the
+ // present pass (write "bb" directly). That pass's own first-use write to
+ // "bb" then legitimately owns a second image barrier in the same list, so
+ // these tests locate the barrier under test by physicalIndex instead of
+-// asserting the list's total size.
++// asserting the list's total size -- but assert there is EXACTLY ONE match
++// (via countMatchingImageBarriers(), not just "at least one" via
++// findImageBarrier() alone) before inspecting its fields [Task 2 fix round
++// 1, Minor finding: a regression that both duplicated the barrier under
++// test AND dropped the pass's own unrelated one would previously still
++// have passed a bare `size == 2` + first-match check].
++size_t countMatchingImageBarriers(const std::vector<ImageBarrier>& barriers, uint32_t physicalIndex) {
++    return static_cast<size_t>(
++        std::count_if(barriers.begin(), barriers.end(), [&](const ImageBarrier& b) { return b.physicalIndex == physicalIndex; }));
++}
++
+ const ImageBarrier* findImageBarrier(const std::vector<ImageBarrier>& barriers, uint32_t physicalIndex) {
+     for (const ImageBarrier& b : barriers) {
+         if (b.physicalIndex == physicalIndex) {
+             return &b;
+         }
+     }
+     return nullptr;
+ }
+ 
+ }  // namespace
+@@ -117,20 +141,21 @@ TEST_CASE("shadow-then-sample") {
+     // Before "shadow" itself: UNDEFINED -> DEPTH_ATTACHMENT_OPTIMAL, first
+     // use, so src is NONE/0.
+     REQUIRE(barriers[0].imageBarriers.size() == 1);
+     checkImageBarrier(barriers[0].imageBarriers[0], sm, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE, kDepthTestStages,
+                        kDepthReadWrite, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+     CHECK(barriers[0].bufferBarriers.empty());
+ 
+     // Before "forward": depth write -> fragment sample. "forward" also
+     // owns a second, unrelated first-use barrier for its own "bb" output.
+     REQUIRE(barriers[1].imageBarriers.size() == 2);
++    REQUIRE(countMatchingImageBarriers(barriers[1].imageBarriers, sm) == 1);
+     const ImageBarrier* smBarrier = findImageBarrier(barriers[1].imageBarriers, sm);
+     REQUIRE(smBarrier != nullptr);
+     checkImageBarrier(*smBarrier, sm, kDepthTestStages, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                        VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+     CHECK(barriers[1].bufferBarriers.empty());
+ }
+ 
+ TEST_CASE("no-redundant-read") {
+     RenderGraph graph;
+@@ -168,28 +193,138 @@ TEST_CASE("hdr-tonemap") {
+     graph.addPass("tonemap").addTextureInput("hdr").addColorOutput("bb", colorDesc());  // pass 1
+     graph.setBackbufferSource("bb");
+     graph.compile(kInfo);
+ 
+     const CompiledGraph& compiled = graph.compiled();
+     const uint32_t hdr = physicalIndexOf(compiled, "hdr");
+     const auto barriers = compiled.passBarriers();
+     REQUIRE(barriers.size() == 2);
+ 
+     REQUIRE(barriers[1].imageBarriers.size() == 2);
++    REQUIRE(countMatchingImageBarriers(barriers[1].imageBarriers, hdr) == 1);
+     const ImageBarrier* hdrBarrier = findImageBarrier(barriers[1].imageBarriers, hdr);
+     REQUIRE(hdrBarrier != nullptr);
+     checkImageBarrier(*hdrBarrier, hdr, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+ }
+ 
++// Task 2 fix round 1, Critical finding's required test (a): a resource
++// read by two passes in two *different* pipeline stages, with no
++// intervening write. The first port's bug fully cleared its aggregate
++// invalidated-visibility state the moment the first reader's barrier
++// resolved the pending flush, so the second reader (a different,
++// never-covered stage) got zero barriers -- a real GPU synchronization
++// hazard, not a missed optimization. The fix tracks per-stage-bit
++// visibility (detail::ResourceBarrierState::invalidatedInStage), so B's
++// own stage being uncovered is detected correctly and B still chains a
++// correct barrier off the persisted last-write source.
++TEST_CASE("multi-stage-read-gets-own-barrier") {
++    RenderGraph graph;
++    graph.addPass("W").addColorOutput("T", colorDesc());                              // pass 0
++    // "A" doubles as the present pass (Graphics-class -> FRAGMENT_SHADER read).
++    graph.addPass("A").addTextureInput("T").addColorOutput("bb", colorDesc());          // pass 1
++    // "B" has no attachment output at all -> Compute-class -> COMPUTE_SHADER read,
++    // a stage A's own barrier never touches.
++    graph.addPass("B").addTextureInput("T").setSideEffect();                            // pass 2
++    graph.setBackbufferSource("bb");
++    graph.compile(kInfo);
++
++    const CompiledGraph& compiled = graph.compiled();
++    const auto order = compiled.executionOrder();
++    REQUIRE(order.size() == 3);
++    CHECK(order[0] == 0);
++    CHECK(order[1] == 1);
++    CHECK(order[2] == 2);
++
++    const uint32_t t = physicalIndexOf(compiled, "T");
++    const auto barriers = compiled.passBarriers();
++    REQUIRE(barriers.size() == 3);
++
++    // Before "A": W's write -> A's fragment-shader sample (the flush barrier).
++    REQUIRE(barriers[1].imageBarriers.size() == 2);  // T's flush barrier + bb's first-use one
++    REQUIRE(countMatchingImageBarriers(barriers[1].imageBarriers, t) == 1);
++    const ImageBarrier* aBarrier = findImageBarrier(barriers[1].imageBarriers, t);
++    REQUIRE(aBarrier != nullptr);
++    checkImageBarrier(*aBarrier, t, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
++                       VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
++                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++
++    // Before "B": its own invalidate barrier -- no layout change (A already
++    // transitioned "T" to SHADER_READ_ONLY_OPTIMAL), srcAccess=0 (already
++    // made available to A), but a real barrier all the same, chained off
++    // the same persisted write source A's barrier used, so COMPUTE_SHADER
++    // actually gets a visibility guarantee instead of none.
++    REQUIRE(barriers[2].imageBarriers.size() == 1);
++    checkImageBarrier(barriers[2].imageBarriers[0], t, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_NONE,
++                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
++                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++}
++
++// Task 2 fix round 1, Critical finding's required test (b): the
++// reviewer's own compounding scenario, reproduced directly against
++// detail::applyAccess() -- write, read(S1), read(S2, different stage),
++// then a write (WAR). The WAR write's srcStage must be the union of every
++// reader's stage since the last write (S1 | S2), not just the most recent
++// reader, or the write could start before an in-flight access in the
++// *other* stage has finished.
++TEST_CASE("war-unions-all-reader-stages") {
++    ResourceBarrierState state;
++
++    auto write1 = applyAccess(state, /*isBuffer=*/false, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
++                               VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++    REQUIRE(write1.has_value());
++    CHECK(write1->srcStage == VK_PIPELINE_STAGE_2_NONE);
++    CHECK(write1->srcAccess == VK_ACCESS_2_NONE);
++    CHECK(write1->dstStage == VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
++    CHECK(write1->dstAccess == VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
++    CHECK(write1->oldLayout == VK_IMAGE_LAYOUT_UNDEFINED);
++    CHECK(write1->newLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++
++    auto read1 = applyAccess(state, false, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
++                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    REQUIRE(read1.has_value());
++    CHECK(read1->srcStage == VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
++    CHECK(read1->srcAccess == VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
++    CHECK(read1->dstStage == VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT);
++    CHECK(read1->dstAccess == VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
++    CHECK(read1->oldLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++    CHECK(read1->newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++
++    // read2, a different stage than read1, with no intervening write --
++    // this used to be nullopt (the Critical bug); now it must still get a
++    // barrier, chained off the same persisted write source as read1's.
++    auto read2 = applyAccess(state, false, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
++                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    REQUIRE(read2.has_value());
++    CHECK(read2->srcStage == VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
++    CHECK(read2->srcAccess == VK_ACCESS_2_NONE);  // already made available by read1's barrier
++    CHECK(read2->dstStage == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
++    CHECK(read2->dstAccess == VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
++    CHECK(read2->oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    CHECK(read2->newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);  // no layout change
++
++    // The WAR write: srcStage must be VERTEX_SHADER | COMPUTE_SHADER (the
++    // union of both readers), not just one of them and not the original
++    // write's stage.
++    auto warWrite = applyAccess(state, false, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
++                                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++    REQUIRE(warWrite.has_value());
++    CHECK(warWrite->srcStage == (VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT));
++    CHECK(warWrite->srcAccess == VK_ACCESS_2_NONE);
++    CHECK(warWrite->dstStage == VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
++    CHECK(warWrite->dstAccess == VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
++    CHECK(warWrite->oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    CHECK(warWrite->newLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++}
++
+ TEST_CASE("war-execution-only") {
+     // Direct unit test of applyAccess()'s WAR rule -- see this file's own
+     // header comment for why this cannot be built through RenderGraph's
+     // public API.
+     ResourceBarrierState state;
+ 
+     // The resource's original write (some earlier pass establishing it),
+     // then a read (sampled) -- fast-forwarding to "just read, nothing left
+     // to flush" without needing a whole pass graph.
+     applyAccess(state, /*isBuffer=*/false, kDepthTestStages, kDepthReadWrite, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+@@ -281,17 +416,18 @@ TEST_CASE("culled-contributes-nothing") {
+     CHECK(order[0] == 0);
+     CHECK(order[1] == 2);
+ 
+     const uint32_t shared = physicalIndexOf(compiled, "shared");
+     const auto barriers = compiled.passBarriers();
+     REQUIRE(barriers.size() == 2);
+ 
+     // "consumer" also owns a second, unrelated first-use barrier for its
+     // own "bb" output.
+     REQUIRE(barriers[1].imageBarriers.size() == 2);
++    REQUIRE(countMatchingImageBarriers(barriers[1].imageBarriers, shared) == 1);
+     const ImageBarrier* sharedBarrier = findImageBarrier(barriers[1].imageBarriers, shared);
+     REQUIRE(sharedBarrier != nullptr);
+     checkImageBarrier(*sharedBarrier, shared, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+ }

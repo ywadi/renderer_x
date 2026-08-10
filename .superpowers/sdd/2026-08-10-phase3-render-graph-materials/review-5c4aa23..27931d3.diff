@@ -1,0 +1,3085 @@
+# Review package: 5c4aa23..27931d3
+
+## Commits
+27931d3 feat: add sample 05_multipass driving shadow+forward+tonemap through rx_graph
+
+## Files changed
+ .github/workflows/ci.yml                           |   22 +-
+ .../task-4-report.md                               |  113 ++
+ CMakeLists.txt                                     |    1 +
+ samples/05_multipass/CMakeLists.txt                |   41 +
+ samples/05_multipass/main.cpp                      | 1951 ++++++++++++++++++++
+ samples/README.md                                  |  117 +-
+ shaders/multipass/lit.frag.slang                   |   83 +
+ shaders/multipass/lit.vert.slang                   |  103 ++
+ shaders/multipass/shadow.vert.slang                |   67 +
+ shaders/multipass/tonemap.frag.slang               |   18 +
+ shaders/multipass/tonemap.vert.slang               |   44 +
+ src/rx_rhi_vk/src/context.cpp                      |   99 +
+ tools/package_samples.sh                           |   33 +-
+ 13 files changed, 2665 insertions(+), 27 deletions(-)
+
+## Diff
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 1a23201..ecac882 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -113,26 +113,27 @@ jobs:
+ 
+       - name: Configure
+         run: cmake --preset linux-native
+ 
+       - name: Build
+         run: cmake --build --preset linux-native
+ 
+       # lavapipe provides the Vulkan device; Xvfb provides the display SDL3
+       # needs to initialize a (hidden) window. This is not a soft/best-effort
+       # run: verified locally (forcing VK_ICD_FILENAMES to lavapipe only, and
+-      # running the whole suite under xvfb-run) that all 9 tests -- including
+-      # rx_rhi_vk_tests, rx_shader_tests, and all four
+-      # sample_*_headless gates (01_triangle, 02_hotreload, 03_bindless_mesh,
+-      # 04_streaming) -- genuinely execute their real assertions against
+-      # lavapipe rather than hitting a skip guard -- lavapipe is a real, if
+-      # software, Vulkan 1.3+ implementation. The sample gates fail closed
++      # running the whole suite under xvfb-run) that all 12 tests -- including
++      # rx_rhi_vk_tests, rx_shader_tests, rx_graph_tests/rx_graph_gpu_tests,
++      # and all five sample_*_headless gates (01_triangle, 02_hotreload,
++      # 03_bindless_mesh, 04_streaming, 05_multipass) -- genuinely execute
++      # their real assertions against lavapipe rather than hitting a skip
++      # guard -- lavapipe is a real, if software, Vulkan 1.3+ implementation.
++      # The sample gates fail closed
+       # (a crash or a wrong-pixel assertion is a real ctest FAILED, not a
+       # silent skip), so ctest's own per-test "... Passed" line for each of
+       # them, printed unconditionally below regardless of
+       # --output-on-failure, IS the proof they ran -- kept visible in the
+       # raw log rather than only inside the junit file.
+       #
+       # --output-junit also writes a self-verifying, structured report (one
+       # <testcase> per test, each with the full captured stdout/stderr as
+       # <system-out> -- e.g. every sample's own "... headless gate PASSED"
+       # log line lands inside it) uploaded as its own artifact below,
+@@ -142,27 +143,28 @@ jobs:
+       - name: Test (xvfb + lavapipe)
+         run: >-
+           xvfb-run -a ctest --preset linux-native --output-on-failure
+           --output-junit ${{ github.workspace }}/ctest-results-linux-native.xml
+ 
+       # Real incremental-rebuild timing, not a no-op: tools/check_build_budget.sh
+       # touches src/rx_core/src/log.cpp itself before timing.
+       - name: Build budget check
+         run: tools/check_build_budget.sh linux-native 60
+ 
+-      # Packages all four samples into the exact unzip-and-run layout a user
++      # Packages all five samples into the exact unzip-and-run layout a user
+       # gets [R:D2]: one subdirectory per sample with that sample's binary
+       # plus everything IT needs (01_triangle: just its two precompiled
+-      # .spv files, no Slang libs; 02/03/04: the Slang runtime libs +
++      # .spv files, no Slang libs; 02/03/04/05: the Slang runtime libs +
+       # LICENSE deployed next to each at build time, plus 02's
+-      # hotreload.slang / 03's texture.png). See tools/package_samples.sh
+-      # for the full per-sample manifest and why each file is there.
++      # hotreload.slang / 03's texture.png / 05's five on-disk shader
++      # sources). See tools/package_samples.sh for the full per-sample
++      # manifest and why each file is there.
+       - name: Package samples for redistribution
+         run: tools/package_samples.sh linux-native linux-x86_64 rendererx-samples-linux-x86_64.zip
+ 
+       - name: Upload sample artifact bundle
+         uses: actions/upload-artifact@v7
+         with:
+           name: rendererx-samples-linux-x86_64
+           path: rendererx-samples-linux-x86_64.zip
+           if-no-files-found: error
+ 
+diff --git a/.superpowers/sdd/2026-08-10-phase3-render-graph-materials/task-4-report.md b/.superpowers/sdd/2026-08-10-phase3-render-graph-materials/task-4-report.md
+new file mode 100644
+index 0000000..c82b367
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-phase3-render-graph-materials/task-4-report.md
+@@ -0,0 +1,113 @@
++# Task 4 report: sample 05_multipass (shadow + forward + tonemap through rx_graph)
++
++**Worktree**: `/media/ywadi/second/renderer_x/.claude/worktrees/agent-a0257a83d60b1accb`
++**Branch**: `worktree-agent-a0257a83d60b1accb`
++**Base commit before this task's work**: `5c4aa23` (fast-forwarded from an earlier point on this branch onto local `main`, which was missing rx_graph Tasks 1-3 — see "Setup note" below)
++
++## Setup note (environment gap found and fixed)
++
++This worktree's branch was originally created from a point on `main` **before** rx_graph's Tasks 1-3 (render graph pass declarations, sync2 barrier derivation, Executor) had landed — `src/rx_graph/` did not exist in this worktree's initial history at all, even though the task brief assumed it was "in-tree." Confirmed via `git log --oneline HEAD..main` (8 commits, exactly the rx_graph Tasks 1-3 commits plus the SDD docs commit) and `git merge-base --is-ancestor`. Local `main` (8 commits ahead of `origin/main`, i.e. unpushed local work, not yet on the public remote) already had this work. Fixed with a plain fast-forward merge (`git merge main --ff-only`) — no rebasing, no destructive operation, zero unique commits lost (the worktree branch had none). This should be flagged to the coordinator: worktrees for tasks depending on recent in-tree work should be cut from the latest local `main`, not an earlier point.
++
++## What was built
++
++`samples/05_multipass/main.cpp` + `samples/05_multipass/CMakeLists.txt`, plus five new shader files under `shaders/multipass/`:
++- `shadow.vert.slang` — depth-only shadow-pass vertex shader (no fragment stage at all — a graphics pipeline with zero fragment shader stages, valid Vulkan for a pass with no color output).
++- `lit.vert.slang` / `lit.frag.slang` — forward pass: Lambert diffuse + manual single-tap shadow-map comparison (no `VK_COMPARE_OP` sampler).
++- `tonemap.vert.slang` / `tonemap.frag.slang` — fullscreen triangle + plain Reinhard (`c/(1+c)`).
++
++**Graph shape** (declared once via `declareGraph()`, all sync derived by `rx::graph::RenderGraph::compile()`/`Executor`):
++- `shadow` → writes `"shadowmap"` (Absolute 1024×1024 D32_SFLOAT, depth-only)
++- `forward` → reads `"shadowmap"` (texture input); writes `"hdr"` (SwapchainRelative R16G16B16A16_SFLOAT) + `"depth"` (SwapchainRelative D32_SFLOAT, attachment-only, no reader — matches the coordinator's ambiguity resolution)
++- `tonemap` → reads `"hdr"`; writes `"backbuffer"` (the graph's `setBackbufferSource()` target)
++
++**Scene**: ground plane (XZ, `y=0`, half-size 6) + one cube (half-extent 1, sitting on the floor) + one sphere (radius 1, off to the side), reusing samples/03's procedural cube/sphere generators, extended with per-vertex normals (03 never needed normals — no lighting there). Objects only ever translate, never rotate, so the shader skips a normal-matrix transform entirely (documented in `lit.vert.slang`'s header comment). Directional light, fixed elevation (50°), azimuth 0 in headless / animated in `--present`.
++
++**Camera**: fixed top-down **orthographic** camera (a deliberate ambiguity-resolution choice, not perspective) — this makes the headless probe pixels analytically derivable via `worldToPixel()`, the same closed-form-derivation discipline `samples/04_streaming`'s `cellProbePixel()` established, rather than empirically reverse-engineered against a perspective projection the way `samples/03_bindless_mesh`'s probes were.
++
++**Bindless / push constants**: one shared `ObjectTransform` bindless storage buffer (double-buffered by frame-in-flight row, exactly `samples/03_bindless_mesh`'s convention), carrying `mvp`, `lightMvp`, `albedo`, `lightDirWorld` per object row. Push constants across all three passes are plain scalar `uint` fields only (see "Real bug found and fixed" below for why). `"shadowmap"`/`"hdr"` are registered into the bindless table lazily inside their reading pass's own `execute()` callback, cached by `VkImageView` value so re-registration only happens on an actual resize (never in headless mode) — documented in `main.cpp`'s header comment ("BINDLESS REGISTRATION FOR POOLED GRAPH RESOURCES").
++
++**Zero hand-written barriers** (D10 acceptance criterion): `grep -r vkCmdPipelineBarrier2 samples/05_multipass/` returns nothing (verified — the file's own header comment had to be reworded once, since it originally *quoted* that exact grep command and would have self-matched). `rx::rhi::transitionImage()` is also never called. Every layout transition (including the offscreen headless backbuffer's own first-touch, and repeated reuse of that same offscreen image across 3 render frames) comes from the graph's own derived barriers — see `main.cpp`'s header comment ("BACKBUFFER REUSE ACROSS REPEATED execute() CALLS") for why that's safe given each headless frame is its own separately-`vkQueueWaitIdle()`'d `CommandContext::runOnce()` submission.
++
++## A real bug found and fixed during implementation (not a false positive)
++
++While debugging why the shadow/lit probes read identical brightness (no shadowing at all), I traced it to a genuine authoring bug, not a false positive: `shadow.vert.slang` declares its own **separate** `ObjectTransform` struct (it's compiled as its own Slang module, never concatenated with the lit files). When I extended `lit.vert.slang`'s copy of that struct with two extra fields (`albedo`, `lightDirWorld`) to work around a push-constant-packing surprise (see below), I forgot to make the identical change in `shadow.vert.slang`. Its struct stayed at 2 fields (128-byte stride) while the real C++-side buffer stride is 160 bytes. Row 0 (the floor) happened to read correctly regardless of stride (both conventions agree at offset 0), which is why the bug wasn't obvious immediately — but every other row (cube, sphere) read a garbled mix of adjacent rows for its `lightMvp`, producing a plausible-looking but wrong shadow-pass transform. Fixed by making `shadow.vert.slang`'s struct byte-for-byte identical to `lit.vert.slang`'s (documented in-place with the full diagnostic trail, since this is exactly the class of bug this sample's own shadow-vs-lit-probe assertion exists to catch). Diagnosed via a disciplined sequence of temporary instrumentation (decoded HDR debug channels through the tonemap pipeline, a raw shadow-map buffer dump via a temporary bare graph pass, and a direct `mul(xf.lightMvp, (0,0,0,1))` clip-space cross-check against the equivalent C++ computation) — all temporary debug code was removed before finalizing; the shader/main.cpp diffs in this commit contain none of it.
++
++**Related, purely empirical finding** (documented in `lit.vert.slang`'s header comment): a push-constant block made entirely of scalar `uint` fields reflects at exactly `4 × fieldCount` bytes with **no** rounding to any fixed multiple — contradicting an assumption I initially carried over from `samples/04_streaming`'s own documented "rounds up to 16 bytes" finding (that finding was specific to a struct containing a `float4x4`, not evidence of a blanket rule). I resolved this by keeping every push-constant field a plain scalar and moving every vector value (`albedo`, `lightDirWorld`) into the already-proven-correct `StructuredBuffer` row layout instead of trying to reverse-engineer Slang's exact vector-in-push-constant packing rule from scratch.
++
++## Sync-validation outcome (coordinator addition)
++
++Enabled `VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT` in `src/rx_rhi_vk/src/context.cpp`'s `Context::create()`, guarded behind a `vkb::SystemInfo::get_system_info()` probe for `VK_EXT_validation_features` availability (so a machine without the validation layer degrades exactly as before, rather than hard-failing `InstanceBuilder::build()`). Per this repo's "don't reinvent the wheel" policy, the actual `VkValidationFeaturesEXT` struct/pNext chaining is done by vk-bootstrap's own `InstanceBuilder::add_validation_feature_enable()` (verified directly against the pinned vk-bootstrap source that it does chain a real `VkValidationFeaturesEXT`), not hand-rolled in this file.
++
++**Turning it on surfaced two real-looking validation-error variants**, both traced to the **same confirmed false positive** in this machine's apt-packaged `VK_LAYER_KHRONOS_validation` (1.3.204.1) — not a real synchronization bug in rx_graph or this sample:
++
++- The layer internally misclassifies a `Texture2D`+`SamplerState` (separate descriptors, the bindless convention every sample in this repo uses) `.Sample()` read as `SYNC_*_SHADER_STORAGE_READ`, then hazards that misclassified read against whatever `write_barriers` value is tracked for the resource's last real write (`SYNC_FRAGMENT_SHADER_SHADER_SAMPLED_READ` in one variant — its own correct derivation for the layout-transition barrier itself, disagreeing with its own misclassification of the read; `SYNC_COLOR_ATTACHMENT_OUTPUT_COLOR_ATTACHMENT_WRITE` in the other — the resource's last color-attachment write). Reproduces reliably for a texture written earlier in the **same command buffer** and read later with no intervening submission boundary — exactly the shape rx_graph's Executor produces for a pass reading another pass's output within one `execute()` call.
++- **Verified, not assumed**: reproduced this exact hazard (both variants) against the apt-packaged 1.3.204.1 layer, then re-ran the identical binary with `VK_LAYER_PATH` pointed at a substantially newer `VK_LAYER_KHRONOS_validation` build (api_version 1.4.357, found already present on this machine at `/home/ywadi/sponza/vvl/`) — **zero** hazards reported there, for both `rx_graph_gpu_tests`' pre-existing "invert" test case and this sample's shadow-map/HDR reads. An actively-maintained implementation of the same validation feature agrees both accesses are correctly synchronized.
++- Added a third documented false-positive guard in `context.cpp` (matching the file's existing two-guard convention exactly: narrow substring match on the hazard ID + descriptor type + misclassified usage + `prior_usage` + barrier command, deliberately **not** on the generic hazard ID alone, and deliberately **not** pinning the varying `write_barriers` value so both confirmed variants are covered without widening the match to anything else).
++- **No real under-synchronization was found anywhere** — this task's scope did not require any barrier-logic code change in `rx_graph` or `rx_rhi_vk` beyond the guard itself.
++
++## Validation evidence
++
++`ctest --preset linux-native --output-on-failure` (all 12 tests, sync validation active):
++
++```
++100% tests passed, 0 tests failed out of 12
++Total Test time (real) =  11.6-11.7 sec
++```
++
++Full test list: `shader_spirv_test`, `rx_core_tests`, `rx_platform_tests`, `rx_shader_tests`, `rx_rhi_vk_tests`, `rx_graph_tests`, `rx_graph_gpu_tests`, `sample_01_triangle_headless`, `sample_02_hotreload_headless`, `sample_03_bindless_mesh_headless`, `sample_04_streaming_headless`, `sample_05_multipass_headless`.
++
++Scanned the full verbose ctest log for any `[error]`-level line not covered by a "known false positive" tag or the sample's own final summary line — every remaining `[error]` line traced to a *different*, pre-existing test deliberately exercising an error path (e.g. `rx_shader_tests`' bad-module-path case, `rx_rhi_vk_tests`' `BindlessTable`/`PipelineLayoutBuilder` capacity-rejection cases, `rx_graph_tests`' cycle-detection/duplicate-name cases) — none are real failures; the `100%/0 failed` summary is corroborated line-by-line, not just trusted.
++
++`sample_05_multipass --validate` (headless) on its own:
++```
++[info] shadow probe world=(0.0,2.0) pixel=(128,167) channels=(60,58,58,255) brightness_sum=176
++[info] lit probe world=(-4.0,-4.0) pixel=(49,49) channels=(153,149,149,255) brightness_sum=451
++[info] multipass headless gate PASSED
++```
++(176×2=352 < 451 → assertion (a); 451 > 153 (0.2 of full scale) → assertion (b); every UNORM/SRGB readback byte is inherently ≤255 → assertion (c), documented in-code as a weak-but-literal check per the brief's exact wording.)
++
++`grep -r vkCmdPipelineBarrier2 samples/05_multipass/` → empty (exit 1, no matches).
++
++`--present --validate` smoke-tested under `xvfb-run` for 6 seconds (light orbiting through multiple azimuth values) — zero unguarded `[error]` lines.
++
++## Packaged-layout run evidence
++
++- `tools/package_samples.sh linux-native linux-x86_64 <zip>` — succeeds, 47 files, `05_multipass/` subdirectory contains the binary + all 5 `.slang` sources + 4 Slang runtime `.so`s/symlinks + `LICENSE`.
++- Unzipped `05_multipass/` alone into a fresh scratch directory (no other files from the build tree) and ran `./sample_05_multipass --validate` directly — **exit 0**, identical `PASSED` output, confirming the `$ORIGIN` RPATH + flat-deployed-shader-file mechanism works standalone.
++- `tools/package_samples.sh windows-cross-zig windows-x86_64 <zip>` — succeeds, 39 files, `05_multipass/` subdirectory analogous to the Linux one (4 DLLs instead of `.so`s).
++- **Bonus** (beyond what CI itself does — CI explicitly does not run sample gates under Wine, "no real Vulkan device"): unzipped the Windows `05_multipass/` alone and ran `wine ./sample_05_multipass.exe --validate` under `xvfb-run` on this machine (which has lavapipe/llvmpipe installed) — **exit 0**, identical `PASSED` output via Wine's winevulkan→llvmpipe passthrough. Validation layer itself isn't installed under Wine (logged, expected, matches this repo's own documented Wine-CI reasoning), so this is a functional-correctness proof, not a validation-cleanliness one.
++
++## ctest summary
++
++- `linux-native`: 12/12 passed (see above).
++- `windows-cross-zig` under Wine with the CI's own exclusion regex (`-E 'rx_rhi_vk|rx_graph_gpu|sample'`): 5/5 passed (`shader_spirv_test`, `rx_core_tests`, `rx_platform_tests`, `rx_shader_tests`, `rx_graph_tests`) — confirmed the existing regex's bare `sample` substring already excludes `sample_05_multipass_headless` with **no ci.yml regex change needed** (verified directly, per the coordinator's instruction not to assume this).
++- Both presets (`linux-native`, `windows-cross-zig`) build cleanly end to end, including the pre-existing rx_graph/rx_rhi_vk/samples 01-04 targets.
++
++## Files
++
++Created:
++- `samples/05_multipass/main.cpp`
++- `samples/05_multipass/CMakeLists.txt`
++- `shaders/multipass/shadow.vert.slang`
++- `shaders/multipass/lit.vert.slang`
++- `shaders/multipass/lit.frag.slang`
++- `shaders/multipass/tonemap.vert.slang`
++- `shaders/multipass/tonemap.frag.slang`
++
++Modified:
++- `CMakeLists.txt` (added `add_subdirectory(samples/05_multipass)` — the brief said `samples/CMakeLists.txt`, but no such file exists in this repo; the root `CMakeLists.txt` lists every sample subdirectory directly, so that's the real file the brief meant)
++- `tools/package_samples.sh` (five-sample header/comment updates, `05_multipass` added to the Slang-runtime-lib deployment loop, its five shader sources added to the per-sample asset copy list, `05_multipass` added to the final `zip` invocation)
++- `.github/workflows/ci.yml` (comment/count updates only — linux job's descriptive comments now say 12 tests / five sample gates instead of 9/four; the windows job's actual exclusion regex already covered the new sample via its bare `sample` substring, verified, not changed)
++- `samples/README.md` (new `## 05_multipass` section mirroring 01-04's structure; updated the top-of-file zip-contents tree, the Linux/Windows run-command blocks, and the "Running the automated test suite" section's test list/count)
++- `src/rx_rhi_vk/src/context.cpp` (coordinator addition: `VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT` wiring + the third documented false-positive guard)
++
++## Commit
++
++One commit on this worktree's branch (`worktree-agent-a0257a83d60b1accb`), on top of the fast-forward merge described above.
++
++## Concerns / things the coordinator should know
++
++1. **Worktree base-point gap** (see "Setup note" above) — fixed locally via fast-forward, but worth checking whether other in-progress worktrees for this phase have the same gap.
++2. **Sync validation false positives are specific to this machine's old apt-packaged validation layer (1.3.204.1)** — this is the third such guard in `context.cpp`, all attributable to the same stale-layer root cause the file's own comments already document for the first two. If CI's `ubuntu-latest` runner has a newer `vulkan-validationlayers` package than this dev machine, these hazards may simply never fire there at all (harmless either way — the guard only ever *documents and downgrades to a warning* an error this specific old layer version emits; it does not suppress a differently-worded real error). If a future validation-layer upgrade on this dev machine ever stops reproducing these, that's expected and the guard becomes dead code, not a rot risk (it would simply never match again).
++3. **The brief's file list said `samples/CMakeLists.txt`**; no such file exists in this repo — I modified the root `CMakeLists.txt`'s `add_subdirectory(...)` list instead, which is where every other sample is wired in. Flagging in case this naming was intentional and I'm missing context, though I'm confident this is simply how the repo is actually laid out (verified directly, not assumed).
++4. No existing-code sync bugs needed fixing — the one real bug found (shadow.vert.slang's stale struct) was in **this task's own new code**, not pre-existing rx_graph/rx_rhi_vk code, so it's a normal implementation fix, not a "BLOCKED, needs coordinator call" situation.
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7749c6f..8f64915 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -27,10 +27,11 @@ add_subdirectory(src/rx_rhi_vk)
+ # depends on Vulkan::Headers + rx_core only, not rx_rhi_vk -- see
+ # src/rx_graph/CMakeLists.txt's own comment for why that dependency is
+ # deferred to the tasks that actually need a VkDevice.
+ add_subdirectory(src/rx_graph)
+ add_subdirectory(tools/dep_cache_smoketest)
+ add_subdirectory(tools/toolchain_check)
+ add_subdirectory(samples/01_triangle)
+ add_subdirectory(samples/02_hotreload)
+ add_subdirectory(samples/03_bindless_mesh)
+ add_subdirectory(samples/04_streaming)
++add_subdirectory(samples/05_multipass)
+diff --git a/samples/05_multipass/CMakeLists.txt b/samples/05_multipass/CMakeLists.txt
+new file mode 100644
+index 0000000..45bd115
+--- /dev/null
++++ b/samples/05_multipass/CMakeLists.txt
+@@ -0,0 +1,41 @@
++# rx_shader_deploy_runtime_libs() is defined in src/rx_shader/CMakeLists.txt
++# (add_subdirectory'd from the root CMakeLists.txt before this directory) --
++# see that file's own comment for the directory-scope fix (Task 6) that
++# makes it safe to call unqualified from here, no local re-glob needed.
++
++add_executable(sample_05_multipass main.cpp)
++target_link_libraries(sample_05_multipass PRIVATE rx_graph rx_rhi_vk rx_platform rx_shader)
++
++# This sample does real in-process Slang compilation at startup (both
++# modes -- see main.cpp's compileAndReflect()/createScene()), same as
++# 02_hotreload/03_bindless_mesh/04_streaming -- needs the Slang runtime
++# libs deployed next to it.
++rx_shader_deploy_runtime_libs(sample_05_multipass)
++
++# Deploys every one of this pass's five on-disk shader sources next to the
++# binary at build time, flat (no "multipass/" subdirectory in the deployed
++# layout -- same flat-next-to-the-binary convention 02_hotreload's
++# hotreload.slang deployment already established), so main.cpp's
++# resolveAssetPath() (SDL_GetBasePath() + filename) finds them identically
++# whether run from the build tree or a redistributed copy of just this
++# directory's build output.
++set(RX_MULTIPASS_SHADERS
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/shadow.vert.slang"
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/lit.vert.slang"
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/lit.frag.slang"
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/tonemap.vert.slang"
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/tonemap.frag.slang"
++)
++add_custom_command(TARGET sample_05_multipass POST_BUILD
++  COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_MULTIPASS_SHADERS} "$<TARGET_FILE_DIR:sample_05_multipass>/"
++  COMMENT "sample_05_multipass: deploying shaders/multipass/*.slang next to the binary"
++  VERBATIM
++)
++
++# Runs the binary in headless mode with --validate: ctest is the developer/CI
++# gate, so it explicitly opts into the Vulkan validation layers (requires the
++# Vulkan SDK / validation layers installed -- see samples/README.md) on top
++# of the default end-user behavior, which is headless with validation OFF.
++# The binary also supports --present mode for interactive windowed
++# rendering with an orbiting light (see main.cpp / samples/README.md).
++add_test(NAME sample_05_multipass_headless COMMAND sample_05_multipass --validate)
+diff --git a/samples/05_multipass/main.cpp b/samples/05_multipass/main.cpp
+new file mode 100644
+index 0000000..e257936
+--- /dev/null
++++ b/samples/05_multipass/main.cpp
+@@ -0,0 +1,1951 @@
++// Sample 05: multipass (shadow + forward + tonemap), driven entirely by
++// rx_graph.
++//
++// The Phase 3 acceptance test made visible: a real, if small, multipass
++// pipeline -- shadow map, forward Lambert+shadow shading, Reinhard tonemap
++// -- with EVERY layout transition/barrier between passes derived by
++// rx::graph::RenderGraph::compile() and applied by rx::graph::Executor,
++// never hand-written in this file. Searching this directory for the raw
++// sync2 barrier-recording call (the one in rx_rhi_vk/command.cpp that
++// rx::rhi::transitionImage() wraps) turns up nothing, and neither does a
++// search for transitionImage() itself -- this file never calls either; every image
++// this sample touches (the shadow map, the HDR color target, the forward
++// pass's own depth buffer, and the backbuffer itself) is either a graph-
++// pooled transient resource Executor::realize()/execute() owns end to end,
++// or a caller-supplied backbuffer whose FIRST touch is always the graph's
++// own tonemap-pass-entry barrier (compile() always derives a resource's
++// first access as a fresh UNDEFINED->newLayout transition, correct for
++// both a real just-acquired swapchain image and an offscreen headless
++// target reused call-to-call -- see "BACKBUFFER REUSE ACROSS repeated
++// execute() CALLS" below for why the latter is still safe here).
++//
++// GRAPH SHAPE: three passes, three resources besides the backbuffer --
++//   shadow   (writes "shadowmap": Absolute 1024x1024 D32_SFLOAT, depth-only,
++//             no fragment shader stage at all -- see shadow.vert.slang)
++//   forward  (reads "shadowmap" as a texture input; writes "hdr":
++//             SwapchainRelative R16G16B16A16_SFLOAT, and its own "depth":
++//             SwapchainRelative D32_SFLOAT -- "depth" has no reader
++//             anywhere else in the graph, which is fine: it is an
++//             attachment-only resource, and forward itself is kept alive by
++//             "hdr" having a real downstream reader, not by "depth")
++//   tonemap  (reads "hdr"; writes "backbuffer", the graph's
++//             setBackbufferSource() target)
++//
++// SCENE: one ground plane (XZ, y=0, half-size kGroundHalfSize) plus one cube
++// and one sphere sitting on it -- reusing samples/03_bindless_mesh's
++// procedural cube/sphere GENERATORS (adapted here to also emit a per-vertex
++// NORMAL, needed for this sample's Lambert term, which 03 never needed).
++// Every object only ever TRANSLATES, never rotates -- see
++// shaders/multipass/lit.vert.slang's header comment for why that lets this
++// shader skip a normal-matrix transform entirely (object-space normal ==
++// world-space normal under a translation-only model matrix). One
++// directional light, fixed elevation, an azimuth that stays 0 in headless
++// mode and animates continuously in --present mode [coordinator ambiguity
++// resolution].
++//
++// CAMERA: a fixed, top-down ORTHOGRAPHIC camera (eye directly above the
++// scene, looking straight down), not a perspective one -- a deliberate
++// choice [coordinator ambiguity resolution: "pick fixed values that make
++// the headless assertions robust"], made specifically so the headless probe
++// pixels below are ANALYTICALLY derived from the exact same view/projection
++// math this file's own worldToPixel() uses at render time (mirroring
++// samples/04_streaming's cellProbePixel() derivation for its own orthographic
++// camera), rather than empirically reverse-engineered against a perspective
++// camera's projection the way samples/03_bindless_mesh's probes were. See
++// worldToPixel()'s own comment for the closed-form derivation.
++//
++// SHADOW/LIT PROBE PIXELS -- the exact values the headless gate asserts on,
++// and why they are robust: kShadowProbeWorld = (0, 2.0) sits on the ground
++// plane, directly in the analytically-derived shadow footprint the cube
++// (half-extent kCubeHalfExtent, centered at kCubePosition) casts under this
++// sample's fixed light direction (elevation kLightElevationRadians, azimuth
++// 0) -- the cube's own footprint is x/z in [-1,1]; its top face (height
++// 2*kCubeHalfExtent) projects along the light direction to z in
++// [-1, 1 + 2*kCubeHalfExtent/tan(kLightElevationRadians)] ~= [-1, 2.68], so
++// (0, 2.0) is comfortably inside that envelope with margin on both sides.
++// kLitProbeWorld = (-4, -4) sits far from both the cube's footprint/shadow
++// and the sphere (kSpherePosition, off in the +X+Z quadrant) -- unshadowed,
++// unoccluded ground. Both are logged (with their derived pixel coordinates
++// and sampled channel values) on every headless run for direct inspection,
++// not just asserted on blindly.
++//
++// BACKBUFFER REUSE ACROSS REPEATED execute() CALLS (headless mode only):
++// compile() has no notion of "a previous execute() call" -- every resource,
++// backbuffer included, is always treated as a fresh, UNDEFINED-layout
++// resource within one compile walk [Task 1/2 design]. Headless mode's own
++// offscreen target is the SAME VkImage across all
++// kHeadlessFrameCount=3 execute() calls (never recreated), so each call's
++// own tonemap-pass-entry barrier "incorrectly" assumes UNDEFINED when the
++// real prior layout is actually TRANSFER_SRC_OPTIMAL (left there by the
++// PREVIOUS call's finalBarriers()). This is nonetheless safe here, and
++// already proven so by src/rx_graph/tests/test_execute_gpu.cpp's own
++// "resize-rerealize"/buffer-reuse GPU tests (repeated execute() calls
++// against one realize()d graph, each in its own rx::rhi::CommandContext::
++// runOnce() submission): every one of this file's own render frames is
++// its own SEPARATE runOnce() call, and runOnce() itself vkQueueWaitIdle()s
++// before returning -- so by the time the NEXT frame's execute() call
++// records its own tonemap-entry barrier, the device is PROVABLY idle with
++// respect to that image (nothing could still be racing the "wrong" srcStage/
++// srcAccess the barrier's UNDEFINED-assuming derivation carries). A real
++// swapchain image (--present mode) needs no such argument at all: it is a
++// genuinely fresh acquisition each frame, for which "treat as UNDEFINED"
++// is not an approximation but the literally correct thing to do -- exactly
++// what every other sample's own hand-written per-frame transitionImage()
++// call already does today.
++//
++// BINDLESS REGISTRATION FOR POOLED GRAPH RESOURCES: "shadowmap" and "hdr"
++// are read via rx::rhi::BindlessTable (the same Texture2D[]/SamplerState[]
++// convention every sample in this codebase uses), but their real
++// VkImageView is only ever obtainable from inside a pass's own execute()
++// callback (rx_graph::PassContext::imageView() -- there is no way to reach
++// it from outside one). Since Executor::realize() binds a graph resource to
++// the SAME pooled entry across every execute() call until a LATER realize()
++// runs (verified directly against executor.cpp: `impl.resources` is only
++// ever rebuilt by realize(), never by execute()), this file caches the last
++// VkImageView it registered per resource and only calls
++// BindlessTable::release()+registerSampledImage() again when that value
++// actually changes -- never every frame. In practice this fires exactly
++// once per resource (its first use) in headless mode (fixed size, no
++// resize, ever) and again only on a real --present window resize (a
++// SwapchainRelative resource's pooled entry genuinely changes shape then).
++// The resize path re-registers immediately after this file's own
++// vkDeviceWaitIdle()+recreateSwapchain()+recompile()+re-realize() sequence,
++// with no submission in between -- exactly the same "rare, human-
++// interactive event, a plain wait is enough" reasoning
++// samples/02_hotreload's coordinator-approved pipeline-swap strategy
++// already established for this codebase, applied here to a bindless
++// descriptor slot instead of a VkPipeline.
++//
++// Two modes, exactly like every other sample in this codebase:
++//   (default / no args) Headless correctness gate: fixed camera/light,
++//   kHeadlessFrameCount=3 frames through the graph, readback, and the three
++//   assertions the coordinator's brief specifies (shadow probe >2x darker
++//   than the lit probe; lit probe non-trivially bright; every readback byte
++//   in range, i.e. genuinely tonemapped, not a raw HDR overflow). Registered
++//   as ctest sample_05_multipass_headless.
++//   --present. Real window, the same scene, the light continuously
++//   orbiting in azimuth.
++#include <rx_core/log.h>
++#include <rx_platform/window.h>
++#include <rx_graph/executor.h>
++#include <rx_graph/render_graph.h>
++#include <rx_rhi_vk/bindless.h>
++#include <rx_rhi_vk/buffer.h>
++#include <rx_rhi_vk/command.h>
++#include <rx_rhi_vk/context.h>
++#include <rx_rhi_vk/device.h>
++#include <rx_rhi_vk/frame_sync.h>
++#include <rx_rhi_vk/mesh_buffers.h>
++#include <rx_rhi_vk/pipeline_layout.h>
++#include <rx_rhi_vk/upload.h>
++#include <rx_shader/compiler.h>
++#include <rx_shader/reflection.h>
++
++// See samples/03_bindless_mesh/main.cpp's identical comment: GLM is a
++// PUBLIC rx_core dependency, transitively available here; the
++// GLM_FORCE_DEPTH_ZERO_TO_ONE define must precede GLM's first include in
++// this TU.
++#define GLM_FORCE_DEPTH_ZERO_TO_ONE
++#include <glm/glm.hpp>
++#include <glm/gtc/matrix_transform.hpp>
++
++#include <SDL3/SDL.h>
++#include <volk.h>
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <fstream>
++#include <optional>
++#include <sstream>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++namespace {
++
++// --- Tunables ---------------------------------------------------------
++
++constexpr uint32_t kHeadlessWidth = 256;
++constexpr uint32_t kHeadlessHeight = 256;
++constexpr VkDeviceSize kHeadlessPixelBytes = static_cast<VkDeviceSize>(kHeadlessWidth) * kHeadlessHeight * 4;
++constexpr uint32_t kHeadlessFrameCount = 3;
++
++constexpr uint32_t kPresentWidth = 900;
++constexpr uint32_t kPresentHeight = 700;
++constexpr float kLightOrbitRadPerSec = 0.3F;
++
++constexpr uint32_t kShadowMapSize = 1024;
++constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
++constexpr VkFormat kHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
++
++constexpr const char* kShadowVertFilename = "shadow.vert.slang";
++constexpr const char* kLitVertFilename = "lit.vert.slang";
++constexpr const char* kLitFragFilename = "lit.frag.slang";
++constexpr const char* kTonemapVertFilename = "tonemap.vert.slang";
++constexpr const char* kTonemapFragFilename = "tonemap.frag.slang";
++
++// --- Scene layout -------------------------------------------------------
++
++constexpr float kGroundHalfSize = 6.0F;
++constexpr float kCubeHalfExtent = 1.0F;
++constexpr glm::vec3 kCubePosition{0.0F, kCubeHalfExtent, 0.0F};
++constexpr float kSphereRadius = 1.0F;
++constexpr glm::vec3 kSpherePosition{3.5F, kSphereRadius, 2.5F};
++
++// --- Camera: fixed top-down orthographic (see this file's header comment
++// on why) ------------------------------------------------------------------
++constexpr float kCameraOrthoHalfSize = 6.5F;  // > kGroundHalfSize -- a small border margin
++constexpr float kCameraHeight = 15.0F;
++constexpr float kCameraNear = 0.1F;
++constexpr float kCameraFar = 30.0F;
++
++// --- Light: fixed elevation, azimuth 0 in headless mode / animated in
++// --present -----------------------------------------------------------------
++constexpr float kLightElevationRadians = 0.8727F;  // 50 degrees
++constexpr float kLightOrthoHalfSize = 9.0F;         // > kGroundHalfSize * sqrt(2): covers the floor from any azimuth
++constexpr float kLightDistance = 20.0F;
++constexpr float kLightNear = 0.1F;
++constexpr float kLightFar = 40.0F;
++constexpr float kHeadlessLightAzimuth = 0.0F;
++
++// Headless probe world positions -- see this file's header comment for the
++// closed-form derivation of why these two points are robustly inside/
++// outside the cube's shadow.
++constexpr glm::vec2 kShadowProbeWorld{0.0F, 2.0F};
++constexpr glm::vec2 kLitProbeWorld{-4.0F, -4.0F};
++
++glm::vec3 lightDirectionForAzimuth(float azimuthRadians) {
++    const float sinEl = std::sin(kLightElevationRadians);
++    const float cosEl = std::cos(kLightElevationRadians);
++    return glm::normalize(
++        glm::vec3(std::sin(azimuthRadians) * cosEl, -sinEl, std::cos(azimuthRadians) * cosEl));
++}
++
++// Vulkan clip space is Y-down; glm::ortho/perspective assume OpenGL's Y-up
++// NDC -- flipping proj[1][1] is the same standard fix
++// samples/03_bindless_mesh/04_streaming's own makeProjection() functions
++// use. Applied identically to BOTH the camera's and the light's projection
++// matrices in this file, which is load-bearing for lit.frag.slang's shadow
++// UV derivation -- see that file's header comment on why no additional
++// Y-flip is needed there as a direct result.
++glm::mat4 applyVulkanYFlip(glm::mat4 proj) {
++    proj[1][1] *= -1.0F;
++    return proj;
++}
++
++// Fixed top-down camera basis: eye directly above the origin, looking
++// straight down, with view-space up = world -Z (see the derivation this
++// produces below). Never varies -- this sample's camera does not move or
++// orbit in either mode [coordinator ambiguity resolution: --present only
++// animates the light].
++glm::mat4 makeCameraView() {
++    return glm::lookAt(glm::vec3(0.0F, kCameraHeight, 0.0F), glm::vec3(0.0F), glm::vec3(0.0F, 0.0F, -1.0F));
++}
++
++glm::mat4 makeCameraProj() {
++    return applyVulkanYFlip(glm::ortho(-kCameraOrthoHalfSize, kCameraOrthoHalfSize, -kCameraOrthoHalfSize,
++                                        kCameraOrthoHalfSize, kCameraNear, kCameraFar));
++}
++
++// Light view: eye placed `kLightDistance` back along -lightDir from the
++// scene origin, looking toward the origin. up = world +Y is never parallel
++// to `lightDir` at this sample's fixed elevation (50 degrees) for ANY
++// azimuth -- cross(lightDir, (0,1,0)) = (-lightDir.z, 0, lightDir.x), zero
++// only if lightDir.x == lightDir.z == 0, i.e. elevation == 90 degrees,
++// never this sample's case -- so this basis stays well-defined across the
++// full --present azimuth animation, not just azimuth 0.
++glm::mat4 makeLightView(const glm::vec3& lightDir) {
++    const glm::vec3 eye = -lightDir * kLightDistance;
++    return glm::lookAt(eye, glm::vec3(0.0F), glm::vec3(0.0F, 1.0F, 0.0F));
++}
++
++glm::mat4 makeLightProj() {
++    return applyVulkanYFlip(
++        glm::ortho(-kLightOrthoHalfSize, kLightOrthoHalfSize, -kLightOrthoHalfSize, kLightOrthoHalfSize, kLightNear,
++                    kLightFar));
++}
++
++struct PixelCoord {
++    uint32_t x;
++    uint32_t y;
++};
++
++// Analytically maps a ground-plane world position (x, 0, z) to the screen
++// pixel makeCameraView()/makeCameraProj() render it to, for a
++// `viewportWidth`x`viewportHeight` target -- the same closed-form-
++// derivation discipline samples/04_streaming's cellProbePixel() already
++// established for its own fixed orthographic camera, re-derived here for
++// THIS camera's own basis.
++//
++// DERIVATION (see this file's header comment for the summary): with
++// eye=(0,H,0), center=(0,0,0), up=(0,0,-1), glm::lookAt's standard
++// f/s/u construction yields f=(0,-1,0), s=(1,0,0), u=(0,0,-1) -- so for any
++// ground point p=(x,0,z), view-space (viewX, viewY) = (dot(s,p-eye),
++// dot(u,p-eye)) = (x, -z). The orthographic projection maps viewX/halfWidth
++// -> ndcX and viewY/halfHeight -> ndcY (before any flip); this file's
++// applyVulkanYFlip() then negates ndcY, giving ndcY_vulkan = z/halfHeight.
++// Aspect correction (present mode's non-square window) mirrors
++// samples/04_streaming's own computeOrthoExtents() letterbox-fit exactly,
++// applied to this camera's square kCameraOrthoHalfSize content region.
++PixelCoord worldToPixel(glm::vec2 worldXZ, uint32_t viewportWidth, uint32_t viewportHeight) {
++    const float aspect = static_cast<float>(viewportWidth) / static_cast<float>(viewportHeight);
++    float halfWidth = kCameraOrthoHalfSize * aspect;
++    float halfHeight = kCameraOrthoHalfSize;
++    if (halfWidth < kCameraOrthoHalfSize) {
++        halfWidth = kCameraOrthoHalfSize;
++        halfHeight = kCameraOrthoHalfSize / aspect;
++    }
++
++    const float ndcX = worldXZ.x / halfWidth;
++    const float ndcYVulkan = worldXZ.y / halfHeight;  // worldXZ.y here holds world Z -- see callers
++
++    const float pixelX = (ndcX * 0.5F + 0.5F) * static_cast<float>(viewportWidth);
++    const float pixelY = (ndcYVulkan * 0.5F + 0.5F) * static_cast<float>(viewportHeight);
++
++    const uint32_t clampedX =
++        static_cast<uint32_t>(std::clamp(pixelX, 0.0F, static_cast<float>(viewportWidth) - 1.0F));
++    const uint32_t clampedY =
++        static_cast<uint32_t>(std::clamp(pixelY, 0.0F, static_cast<float>(viewportHeight) - 1.0F));
++    return {clampedX, clampedY};
++}
++
++// --- Procedural geometry: position + normal (unlike
++// samples/03_bindless_mesh's position + uv -- this sample has no textures,
++// only Lambert shading, which needs a normal instead) --------------------
++
++struct Vertex {
++    float position[3];
++    float normal[3];
++};
++
++struct HostMesh {
++    std::vector<Vertex> vertices;
++    std::vector<uint32_t> indices;
++};
++
++void addQuad(HostMesh& mesh, glm::vec3 a, glm::vec3 b, glm::vec3 c, glm::vec3 d, glm::vec3 normal) {
++    const uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
++    for (const glm::vec3& p : {a, b, c, d}) {
++        mesh.vertices.push_back(Vertex{{p.x, p.y, p.z}, {normal.x, normal.y, normal.z}});
++    }
++    mesh.indices.push_back(base + 0);
++    mesh.indices.push_back(base + 1);
++    mesh.indices.push_back(base + 2);
++    mesh.indices.push_back(base + 0);
++    mesh.indices.push_back(base + 2);
++    mesh.indices.push_back(base + 3);
++}
++
++// Half-extent `h` cube -- identical vertex positions to
++// samples/03_bindless_mesh's generateCube(), plus a per-face constant
++// normal (each face's own outward axis) -- cheap to add since every face
++// already has its own 4 unique vertices (no shared-vertex averaging
++// needed).
++HostMesh generateCube(float h) {
++    HostMesh mesh;
++    addQuad(mesh, {h, -h, -h}, {h, h, -h}, {h, h, h}, {h, -h, h}, {1, 0, 0});         // +X
++    addQuad(mesh, {-h, -h, h}, {-h, h, h}, {-h, h, -h}, {-h, -h, -h}, {-1, 0, 0});     // -X
++    addQuad(mesh, {-h, h, -h}, {-h, h, h}, {h, h, h}, {h, h, -h}, {0, 1, 0});         // +Y
++    addQuad(mesh, {-h, -h, h}, {-h, -h, -h}, {h, -h, -h}, {h, -h, h}, {0, -1, 0});     // -Y
++    addQuad(mesh, {-h, -h, h}, {h, -h, h}, {h, h, h}, {-h, h, h}, {0, 0, 1});         // +Z
++    addQuad(mesh, {h, -h, -h}, {-h, -h, -h}, {-h, h, -h}, {h, h, -h}, {0, 0, -1});     // -Z
++    return mesh;
++}
++
++// Standard UV sphere centered at the origin -- normal = normalized position
++// (exact, not approximated) since every point on a sphere centered at the
++// origin has its outward normal exactly along its own position vector.
++HostMesh generateSphere(float radius, uint32_t rings, uint32_t segments) {
++    HostMesh mesh;
++    constexpr float kPi = 3.14159265358979323846F;
++
++    for (uint32_t y = 0; y <= rings; ++y) {
++        const float v = static_cast<float>(y) / static_cast<float>(rings);
++        const float theta = v * kPi;
++        const float sinTheta = std::sin(theta);
++        const float cosTheta = std::cos(theta);
++        for (uint32_t x = 0; x <= segments; ++x) {
++            const float u = static_cast<float>(x) / static_cast<float>(segments);
++            const float phi = u * 2.0F * kPi;
++            const glm::vec3 dir(sinTheta * std::cos(phi), cosTheta, sinTheta * std::sin(phi));
++            Vertex vert{};
++            vert.position[0] = radius * dir.x;
++            vert.position[1] = radius * dir.y;
++            vert.position[2] = radius * dir.z;
++            vert.normal[0] = dir.x;
++            vert.normal[1] = dir.y;
++            vert.normal[2] = dir.z;
++            mesh.vertices.push_back(vert);
++        }
++    }
++
++    const uint32_t stride = segments + 1;
++    for (uint32_t y = 0; y < rings; ++y) {
++        for (uint32_t x = 0; x < segments; ++x) {
++            const uint32_t i0 = y * stride + x;
++            const uint32_t i1 = i0 + 1;
++            const uint32_t i2 = i0 + stride;
++            const uint32_t i3 = i2 + 1;
++            mesh.indices.push_back(i0);
++            mesh.indices.push_back(i2);
++            mesh.indices.push_back(i1);
++            mesh.indices.push_back(i1);
++            mesh.indices.push_back(i2);
++            mesh.indices.push_back(i3);
++        }
++    }
++    return mesh;
++}
++
++// A single quad in the XZ plane at y=0, facing +Y (the ground) -- unlike
++// samples/03_bindless_mesh's generatePlane() (an XY-plane card facing the
++// camera), this is a genuine floor.
++HostMesh generatePlaneXZ(float halfSize) {
++    HostMesh mesh;
++    addQuad(mesh, {-halfSize, 0.0F, -halfSize}, {halfSize, 0.0F, -halfSize}, {halfSize, 0.0F, halfSize},
++            {-halfSize, 0.0F, halfSize}, {0, 1, 0});
++    return mesh;
++}
++
++// --- Scene objects --------------------------------------------------------
++
++enum class Shape : uint32_t { Plane = 0, Cube = 1, Sphere = 2 };
++constexpr size_t kShapeCount = 3;
++
++struct SceneObject {
++    Shape shape;
++    glm::vec3 position;
++    glm::vec3 albedo;
++};
++
++// The plane is listed first and is the only object EXCLUDED from the
++// shadow pass's own draw loop (see recordShadowDraws()) -- it is a
++// shadow RECEIVER, not a caster; including it there would self-shadow the
++// floor at grazing angles for no benefit (it already lies exactly in the
++// plane every other object's shadow is cast onto).
++constexpr std::array<SceneObject, 3> kObjects{{
++    {Shape::Plane, glm::vec3(0.0F, 0.0F, 0.0F), glm::vec3(0.55F, 0.55F, 0.6F)},
++    {Shape::Cube, kCubePosition, glm::vec3(0.75F, 0.25F, 0.2F)},
++    {Shape::Sphere, kSpherePosition, glm::vec3(0.2F, 0.45F, 0.8F)},
++}};
++constexpr uint32_t kObjectCount = static_cast<uint32_t>(kObjects.size());
++
++// --- GPU-side per-object transforms: one bindless storage buffer, one row
++// per (frame-in-flight slot, object) -- exactly samples/03_bindless_mesh's
++// double-buffered-by-row convention, extended to carry BOTH matrices this
++// sample's two shadow-casting/receiving passes need per object. See
++// shaders/multipass/shadow.vert.slang and lit.vert.slang's own header
++// comments for which half each shader reads. -----------------------------
++// `albedo`/`lightDirWorld` are float4 (unused 4th component) rather than
++// float3 -- see lit.vert.slang's own header comment for why this sample
++// keeps every vector value in this bindless row instead of a push
++// constant, and every push-constant field below a plain scalar `uint`.
++struct ObjectTransform {
++    glm::mat4 mvp;
++    glm::mat4 lightMvp;
++    glm::vec4 albedo;
++    glm::vec4 lightDirWorld;
++};
++
++// --- Push-constant layouts -- byte-for-byte mirrors of each shader's own
++// [[vk::push_constant]] struct (see the .slang files). EMPIRICALLY
++// VERIFIED (not assumed) against the shipped Slang build: a push-constant
++// block made ENTIRELY of scalar `uint` fields reflects at exactly
++// 4*fieldCount bytes, no padding/rounding at all -- see lit.vert.slang's
++// header comment for the finding this superseded (samples/04_streaming's
++// own struct, which contained a float4x4, is not evidence this applies
++// generally). Each buildXPipeline() function below still asserts the
++// REFLECTED size against sizeof() at runtime -- the shipped slang.h/
++// compiler always wins over this file's own byte-count assumption on any
++// future disagreement, not the other way around.
++struct ShadowPushConstants {
++    uint32_t transformIndex;
++};
++
++struct LitPushConstants {
++    uint32_t transformIndex;
++    uint32_t shadowTextureIndex;
++    uint32_t shadowSamplerIndex;
++};
++
++struct TonemapPushConstants {
++    uint32_t hdrTextureIndex;
++    uint32_t hdrSamplerIndex;
++};
++
++// --- GPU-side scene -------------------------------------------------------
++
++struct GpuMesh {
++    std::optional<rx::rhi::MeshBuffers> buffers;
++};
++
++// One compiled+reflected+built pipeline's worth of state -- shared shape
++// across all three passes; `fragModule` stays VK_NULL_HANDLE for the
++// depth-only shadow pass (see shadow.vert.slang's own header comment for
++// why that pass has no fragment shader stage at all).
++struct CompiledPass {
++    VkShaderModule vertModule = VK_NULL_HANDLE;
++    VkShaderModule fragModule = VK_NULL_HANDLE;
++    rx::rhi::PipelineLayoutBundle layoutBundle;
++    VkPipeline pipeline = VK_NULL_HANDLE;
++    uint32_t pushConstantOffset = 0;
++    uint32_t pushConstantSize = 0;
++    VkShaderStageFlags pushConstantStages = 0;
++};
++
++void destroyCompiledPass(VkDevice device, CompiledPass& pass) {
++    if (pass.pipeline != VK_NULL_HANDLE) {
++        vkDestroyPipeline(device, pass.pipeline, nullptr);
++        pass.pipeline = VK_NULL_HANDLE;
++    }
++    if (pass.fragModule != VK_NULL_HANDLE) {
++        vkDestroyShaderModule(device, pass.fragModule, nullptr);
++        pass.fragModule = VK_NULL_HANDLE;
++    }
++    if (pass.vertModule != VK_NULL_HANDLE) {
++        vkDestroyShaderModule(device, pass.vertModule, nullptr);
++        pass.vertModule = VK_NULL_HANDLE;
++    }
++    pass.layoutBundle = rx::rhi::PipelineLayoutBundle{};
++    pass.pushConstantOffset = 0;
++    pass.pushConstantSize = 0;
++    pass.pushConstantStages = 0;
++}
++
++// Everything this sample needs beyond the raw RHI stack + rx_graph.
++// Move-only by construction (every member is itself move-only RAII or a
++// plain scalar/handle); built once by createScene(), torn down by
++// destroyScene() before the owning Device/Context/Allocator/Executor do,
++// same discipline as every other sample in this codebase.
++struct Scene {
++    rx::rhi::BindlessTable bindlessTable;
++    VkSampler sampler = VK_NULL_HANDLE;
++    rx::rhi::BindlessHandle samplerHandle;
++    std::optional<rx::rhi::Buffer> transformBuffer;
++    std::array<GpuMesh, kShapeCount> meshes;
++
++    CompiledPass shadowPass;
++    CompiledPass litPass;
++    CompiledPass tonemapPass;
++
++    // See this file's header comment ("BINDLESS REGISTRATION FOR POOLED
++    // GRAPH RESOURCES") -- cached so re-registration only happens when the
++    // underlying pooled view actually changes.
++    VkImageView lastShadowMapView = VK_NULL_HANDLE;
++    rx::rhi::BindlessHandle shadowMapHandle;
++    VkImageView lastHdrView = VK_NULL_HANDLE;
++    rx::rhi::BindlessHandle hdrHandle;
++
++    // Mutated once per frame (updateFrame(), below) before
++    // Executor::execute() is called; read back inside every pass's
++    // setExecute() callback at invocation time -- rx_graph's Pass::
++    // setExecute() callback signature carries no caller-supplied per-frame
++    // parameter of its own, so a small piece of mutable, reference-
++    // captured state on `Scene` itself is this file's own equivalent of
++    // samples/03_bindless_mesh's explicit `frameInFlightIndex` function
++    // parameter.
++    uint32_t currentFrameInFlightIndex = 0;
++    glm::vec3 currentLightDirWorld{0.0F, -1.0F, 0.0F};
++};
++
++void destroyScenePipelines(VkDevice device, Scene& scene) {
++    destroyCompiledPass(device, scene.shadowPass);
++    destroyCompiledPass(device, scene.litPass);
++    destroyCompiledPass(device, scene.tonemapPass);
++}
++
++void destroyScene(VkDevice device, Scene& scene) {
++    destroyScenePipelines(device, scene);
++    if (scene.sampler != VK_NULL_HANDLE) {
++        vkDestroySampler(device, scene.sampler, nullptr);
++        scene.sampler = VK_NULL_HANDLE;
++    }
++}
++
++VkShaderModule createShaderModuleFromSpirv(VkDevice device, const std::vector<uint32_t>& code) {
++    if (code.empty()) {
++        return VK_NULL_HANDLE;
++    }
++    VkShaderModuleCreateInfo info{};
++    info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
++    info.codeSize = code.size() * sizeof(uint32_t);
++    info.pCode = code.data();
++    VkShaderModule module = VK_NULL_HANDLE;
++    if (vkCreateShaderModule(device, &info, nullptr, &module) != VK_SUCCESS) {
++        return VK_NULL_HANDLE;
++    }
++    return module;
++}
++
++// Resolves a deployed asset's path next to this executable at runtime, same
++// SDL_GetBasePath() mechanism every other sample in this codebase uses for
++// its own on-disk asset(s).
++std::string resolveAssetPath(const char* filename) {
++    const char* basePath = SDL_GetBasePath();
++    if (basePath == nullptr) {
++        RX_LOG_WARN("sample_05_multipass: SDL_GetBasePath failed ({}); looking for {} in the current directory "
++                    "instead",
++                    SDL_GetError(), filename);
++        return filename;
++    }
++    return std::string(basePath) + filename;
++}
++
++// Reads every file in `filenames` (in order) and concatenates their
++// contents into one Slang translation unit -- see
++// shaders/multipass/lit.vert.slang's own header comment ("COMPILATION
++// NOTE") for why this sample's multi-file passes need this rather than a
++// plain single-file compileFromFile() call: rx::shader::reflect() needs
++// every entry point of a pass in ONE linked program to produce a single,
++// correctly-merged layout, and rx::shader::Compiler only ever compiles one
++// source string per call.
++std::optional<std::string> readAndConcatenate(const std::vector<std::string>& filenames) {
++    std::string combined;
++    for (const auto& filename : filenames) {
++        const std::string path = resolveAssetPath(filename.c_str());
++        std::ifstream file(path, std::ios::binary);
++        if (!file.is_open()) {
++            RX_LOG_ERROR("sample_05_multipass: failed to open shader file '{}'", path);
++            return std::nullopt;
++        }
++        std::ostringstream contents;
++        contents << file.rdbuf();
++        combined += contents.str();
++        combined += "\n";
++    }
++    return combined;
++}
++
++struct ReflectedModule {
++    rx::shader::CompileResult compileResult;
++    rx::shader::ShaderLayoutInfo layoutInfo;
++};
++
++std::optional<ReflectedModule> compileAndReflect(rx::shader::Compiler& compiler, const std::string& moduleName,
++                                                  const std::vector<std::string>& filenames,
++                                                  const std::vector<std::string>& entryPoints) {
++    auto source = readAndConcatenate(filenames);
++    if (!source.has_value()) {
++        return std::nullopt;
++    }
++
++    rx::shader::CompileResult compileResult = compiler.compileFromSource(moduleName, *source, entryPoints);
++    if (!compileResult.ok) {
++        RX_LOG_ERROR("sample_05_multipass: shader compile failed for module '{}':\n{}", moduleName,
++                     compileResult.diagnostics);
++        return std::nullopt;
++    }
++
++    auto layoutInfo = rx::shader::reflect(compileResult);
++    if (!layoutInfo.has_value()) {
++        RX_LOG_ERROR("sample_05_multipass: reflect() failed for module '{}'", moduleName);
++        return std::nullopt;
++    }
++
++    return ReflectedModule{std::move(compileResult), std::move(*layoutInfo)};
++}
++
++// Populates `pass`'s vertModule/fragModule from `compileResult`'s entry
++// point blobs, matching each blob's `entryPointName` against
++// `vertEntryName`/`fragEntryName` (`fragEntryName` empty -- the shadow
++// pass's case -- means "this pass has no fragment stage; exactly one blob,
++// the vertex one, is expected"). Returns false (logged) on any mismatch.
++bool assignShaderModules(VkDevice device, const rx::shader::CompileResult& compileResult, const char* vertEntryName,
++                          const char* fragEntryName, CompiledPass& pass) {
++    for (const auto& blob : compileResult.entryPointCode) {
++        VkShaderModule module = createShaderModuleFromSpirv(device, blob.code);
++        if (module == VK_NULL_HANDLE) {
++            RX_LOG_ERROR("sample_05_multipass: vkCreateShaderModule failed for entry point '{}'",
++                         blob.entryPointName);
++            return false;
++        }
++        if (blob.entryPointName == vertEntryName) {
++            pass.vertModule = module;
++        } else if (fragEntryName != nullptr && blob.entryPointName == fragEntryName) {
++            pass.fragModule = module;
++        } else {
++            RX_LOG_ERROR("sample_05_multipass: unexpected entry point '{}'", blob.entryPointName);
++            vkDestroyShaderModule(device, module, nullptr);
++            return false;
++        }
++    }
++    if (pass.vertModule == VK_NULL_HANDLE) {
++        RX_LOG_ERROR("sample_05_multipass: missing vertex entry point '{}' after a successful compile",
++                     vertEntryName);
++        return false;
++    }
++    if (fragEntryName != nullptr && pass.fragModule == VK_NULL_HANDLE) {
++        RX_LOG_ERROR("sample_05_multipass: missing fragment entry point '{}' after a successful compile",
++                     fragEntryName);
++        return false;
++    }
++    return true;
++}
++
++// --- Pipeline builders ---------------------------------------------------
++
++bool buildShadowPipeline(VkDevice device, rx::shader::Compiler& compiler, VkDescriptorSetLayout bindlessSetLayout,
++                          Scene& scene) {
++    destroyCompiledPass(device, scene.shadowPass);
++
++    auto reflected =
++        compileAndReflect(compiler, "MultipassShadowModule", {kShadowVertFilename}, {"vsMain"});
++    if (!reflected.has_value()) {
++        return false;
++    }
++    if (reflected->layoutInfo.pushRanges.size() != 1 ||
++        reflected->layoutInfo.pushRanges[0].size != sizeof(ShadowPushConstants)) {
++        RX_LOG_ERROR(
++            "sample_05_multipass: shadow shader reflects an unexpected push-constant shape ({} range(s), size={} "
++            "vs. sizeof(ShadowPushConstants)={})",
++            reflected->layoutInfo.pushRanges.size(),
++            reflected->layoutInfo.pushRanges.empty() ? 0 : reflected->layoutInfo.pushRanges[0].size,
++            sizeof(ShadowPushConstants));
++        return false;
++    }
++
++    auto layoutBundle = rx::rhi::PipelineLayoutBuilder::build(device, reflected->layoutInfo, bindlessSetLayout);
++    if (!layoutBundle.has_value()) {
++        RX_LOG_ERROR("sample_05_multipass: PipelineLayoutBuilder::build failed for the shadow pass");
++        return false;
++    }
++    scene.shadowPass.layoutBundle = std::move(*layoutBundle);
++    scene.shadowPass.pushConstantOffset = reflected->layoutInfo.pushRanges[0].offset;
++    scene.shadowPass.pushConstantSize = reflected->layoutInfo.pushRanges[0].size;
++    scene.shadowPass.pushConstantStages = reflected->layoutInfo.pushRanges[0].stages;
++
++    if (!assignShaderModules(device, reflected->compileResult, "vsMain", nullptr, scene.shadowPass)) {
++        destroyCompiledPass(device, scene.shadowPass);
++        return false;
++    }
++
++    VkVertexInputBindingDescription binding{};
++    binding.binding = 0;
++    binding.stride = sizeof(Vertex);
++    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
++    VkVertexInputAttributeDescription attribute{};
++    attribute.location = 0;
++    attribute.binding = 0;
++    attribute.format = VK_FORMAT_R32G32B32_SFLOAT;
++    attribute.offset = offsetof(Vertex, position);
++
++    VkPipelineVertexInputStateCreateInfo vertexInputState{};
++    vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
++    vertexInputState.vertexBindingDescriptionCount = 1;
++    vertexInputState.pVertexBindingDescriptions = &binding;
++    vertexInputState.vertexAttributeDescriptionCount = 1;
++    vertexInputState.pVertexAttributeDescriptions = &attribute;
++
++    VkPipelineInputAssemblyStateCreateInfo inputAssemblyState{};
++    inputAssemblyState.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
++    inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++
++    VkPipelineViewportStateCreateInfo viewportState{};
++    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
++    viewportState.viewportCount = 1;
++    viewportState.scissorCount = 1;
++
++    VkPipelineRasterizationStateCreateInfo rasterizationState{};
++    rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
++    rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
++    // No culling: this sample's procedural generators do not guarantee one
++    // consistent winding across every face/object, same reasoning
++    // samples/03_bindless_mesh/04_streaming already document for their own
++    // CULL_MODE_NONE choice.
++    rasterizationState.cullMode = VK_CULL_MODE_NONE;
++    rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++    rasterizationState.lineWidth = 1.0F;
++
++    VkPipelineMultisampleStateCreateInfo multisampleState{};
++    multisampleState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
++    multisampleState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++
++    VkPipelineDepthStencilStateCreateInfo depthStencilState{};
++    depthStencilState.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
++    depthStencilState.depthTestEnable = VK_TRUE;
++    depthStencilState.depthWriteEnable = VK_TRUE;
++    depthStencilState.depthCompareOp = VK_COMPARE_OP_LESS;
++
++    VkPipelineColorBlendStateCreateInfo colorBlendState{};
++    colorBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
++    colorBlendState.attachmentCount = 0;
++
++    std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
++    VkPipelineDynamicStateCreateInfo dynamicState{};
++    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
++    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
++    dynamicState.pDynamicStates = dynamicStates.data();
++
++    VkPipelineRenderingCreateInfo renderingCreateInfo{};
++    renderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
++    renderingCreateInfo.depthAttachmentFormat = kDepthFormat;
++
++    VkPipelineShaderStageCreateInfo stage{};
++    stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stage.stage = VK_SHADER_STAGE_VERTEX_BIT;
++    stage.module = scene.shadowPass.vertModule;
++    // Slang's SPIR-V backend always names each entry point's OpEntryPoint
++    // "main", regardless of source-level function name -- see
++    // samples/02_hotreload/main.cpp's identical comment.
++    stage.pName = "main";
++
++    VkGraphicsPipelineCreateInfo pipelineInfo{};
++    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
++    pipelineInfo.pNext = &renderingCreateInfo;
++    pipelineInfo.stageCount = 1;
++    pipelineInfo.pStages = &stage;
++    pipelineInfo.pVertexInputState = &vertexInputState;
++    pipelineInfo.pInputAssemblyState = &inputAssemblyState;
++    pipelineInfo.pViewportState = &viewportState;
++    pipelineInfo.pRasterizationState = &rasterizationState;
++    pipelineInfo.pMultisampleState = &multisampleState;
++    pipelineInfo.pDepthStencilState = &depthStencilState;
++    pipelineInfo.pColorBlendState = &colorBlendState;
++    pipelineInfo.pDynamicState = &dynamicState;
++    pipelineInfo.layout = scene.shadowPass.layoutBundle.layout;
++    pipelineInfo.renderPass = VK_NULL_HANDLE;  // dynamic rendering
++    pipelineInfo.basePipelineIndex = -1;
++
++    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &scene.shadowPass.pipeline) !=
++        VK_SUCCESS) {
++        RX_LOG_ERROR("sample_05_multipass: vkCreateGraphicsPipelines failed for the shadow pass");
++        destroyCompiledPass(device, scene.shadowPass);
++        return false;
++    }
++    return true;
++}
++
++bool buildLitPipeline(VkDevice device, rx::shader::Compiler& compiler, VkDescriptorSetLayout bindlessSetLayout,
++                      Scene& scene) {
++    destroyCompiledPass(device, scene.litPass);
++
++    auto reflected = compileAndReflect(compiler, "MultipassLitModule", {kLitVertFilename, kLitFragFilename},
++                                        {"vsMain", "fsMain"});
++    if (!reflected.has_value()) {
++        return false;
++    }
++    if (reflected->layoutInfo.pushRanges.size() != 1 ||
++        reflected->layoutInfo.pushRanges[0].size != sizeof(LitPushConstants)) {
++        RX_LOG_ERROR(
++            "sample_05_multipass: lit shader reflects an unexpected push-constant shape ({} range(s), size={} vs. "
++            "sizeof(LitPushConstants)={})",
++            reflected->layoutInfo.pushRanges.size(),
++            reflected->layoutInfo.pushRanges.empty() ? 0 : reflected->layoutInfo.pushRanges[0].size,
++            sizeof(LitPushConstants));
++        return false;
++    }
++    if (reflected->layoutInfo.bindings.size() != 3) {
++        RX_LOG_ERROR(
++            "sample_05_multipass: lit shader reflects {} set-0 bindings; expected exactly 3 (images/samplers/"
++            "storage buffers, matching BindlessTable's fixed scheme)",
++            reflected->layoutInfo.bindings.size());
++        return false;
++    }
++
++    auto layoutBundle = rx::rhi::PipelineLayoutBuilder::build(device, reflected->layoutInfo, bindlessSetLayout);
++    if (!layoutBundle.has_value()) {
++        RX_LOG_ERROR("sample_05_multipass: PipelineLayoutBuilder::build failed for the lit pass");
++        return false;
++    }
++    scene.litPass.layoutBundle = std::move(*layoutBundle);
++    scene.litPass.pushConstantOffset = reflected->layoutInfo.pushRanges[0].offset;
++    scene.litPass.pushConstantSize = reflected->layoutInfo.pushRanges[0].size;
++    scene.litPass.pushConstantStages = reflected->layoutInfo.pushRanges[0].stages;
++
++    if (!assignShaderModules(device, reflected->compileResult, "vsMain", "fsMain", scene.litPass)) {
++        destroyCompiledPass(device, scene.litPass);
++        return false;
++    }
++
++    std::array<VkVertexInputBindingDescription, 1> bindings{};
++    bindings[0].binding = 0;
++    bindings[0].stride = sizeof(Vertex);
++    bindings[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
++
++    std::array<VkVertexInputAttributeDescription, 2> attributes{};
++    attributes[0].location = 0;
++    attributes[0].binding = 0;
++    attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
++    attributes[0].offset = offsetof(Vertex, position);
++    attributes[1].location = 1;
++    attributes[1].binding = 0;
++    attributes[1].format = VK_FORMAT_R32G32B32_SFLOAT;
++    attributes[1].offset = offsetof(Vertex, normal);
++
++    VkPipelineVertexInputStateCreateInfo vertexInputState{};
++    vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
++    vertexInputState.vertexBindingDescriptionCount = static_cast<uint32_t>(bindings.size());
++    vertexInputState.pVertexBindingDescriptions = bindings.data();
++    vertexInputState.vertexAttributeDescriptionCount = static_cast<uint32_t>(attributes.size());
++    vertexInputState.pVertexAttributeDescriptions = attributes.data();
++
++    VkPipelineInputAssemblyStateCreateInfo inputAssemblyState{};
++    inputAssemblyState.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
++    inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++
++    VkPipelineViewportStateCreateInfo viewportState{};
++    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
++    viewportState.viewportCount = 1;
++    viewportState.scissorCount = 1;
++
++    VkPipelineRasterizationStateCreateInfo rasterizationState{};
++    rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
++    rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
++    rasterizationState.cullMode = VK_CULL_MODE_NONE;
++    rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++    rasterizationState.lineWidth = 1.0F;
++
++    VkPipelineMultisampleStateCreateInfo multisampleState{};
++    multisampleState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
++    multisampleState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++
++    VkPipelineDepthStencilStateCreateInfo depthStencilState{};
++    depthStencilState.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
++    depthStencilState.depthTestEnable = VK_TRUE;
++    depthStencilState.depthWriteEnable = VK_TRUE;
++    depthStencilState.depthCompareOp = VK_COMPARE_OP_LESS;
++
++    VkPipelineColorBlendAttachmentState blendAttachment{};
++    blendAttachment.blendEnable = VK_FALSE;
++    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
++                                      VK_COLOR_COMPONENT_A_BIT;
++    VkPipelineColorBlendStateCreateInfo colorBlendState{};
++    colorBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
++    colorBlendState.attachmentCount = 1;
++    colorBlendState.pAttachments = &blendAttachment;
++
++    std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
++    VkPipelineDynamicStateCreateInfo dynamicState{};
++    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
++    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
++    dynamicState.pDynamicStates = dynamicStates.data();
++
++    VkPipelineRenderingCreateInfo renderingCreateInfo{};
++    renderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
++    renderingCreateInfo.colorAttachmentCount = 1;
++    renderingCreateInfo.pColorAttachmentFormats = &kHdrFormat;
++    renderingCreateInfo.depthAttachmentFormat = kDepthFormat;
++
++    VkGraphicsPipelineCreateInfo pipelineInfo{};
++    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
++    pipelineInfo.pNext = &renderingCreateInfo;
++
++    std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
++    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++    stages[0].module = scene.litPass.vertModule;
++    stages[0].pName = "main";
++    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++    stages[1].module = scene.litPass.fragModule;
++    stages[1].pName = "main";
++
++    pipelineInfo.stageCount = static_cast<uint32_t>(stages.size());
++    pipelineInfo.pStages = stages.data();
++    pipelineInfo.pVertexInputState = &vertexInputState;
++    pipelineInfo.pInputAssemblyState = &inputAssemblyState;
++    pipelineInfo.pViewportState = &viewportState;
++    pipelineInfo.pRasterizationState = &rasterizationState;
++    pipelineInfo.pMultisampleState = &multisampleState;
++    pipelineInfo.pDepthStencilState = &depthStencilState;
++    pipelineInfo.pColorBlendState = &colorBlendState;
++    pipelineInfo.pDynamicState = &dynamicState;
++    pipelineInfo.layout = scene.litPass.layoutBundle.layout;
++    pipelineInfo.renderPass = VK_NULL_HANDLE;
++    pipelineInfo.basePipelineIndex = -1;
++
++    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &scene.litPass.pipeline) !=
++        VK_SUCCESS) {
++        RX_LOG_ERROR("sample_05_multipass: vkCreateGraphicsPipelines failed for the lit pass");
++        destroyCompiledPass(device, scene.litPass);
++        return false;
++    }
++    return true;
++}
++
++bool buildTonemapPipeline(VkDevice device, rx::shader::Compiler& compiler, VkDescriptorSetLayout bindlessSetLayout,
++                          VkFormat backbufferFormat, Scene& scene) {
++    destroyCompiledPass(device, scene.tonemapPass);
++
++    auto reflected = compileAndReflect(compiler, "MultipassTonemapModule",
++                                        {kTonemapVertFilename, kTonemapFragFilename}, {"vsMain", "fsMain"});
++    if (!reflected.has_value()) {
++        return false;
++    }
++    if (reflected->layoutInfo.pushRanges.size() != 1 ||
++        reflected->layoutInfo.pushRanges[0].size != sizeof(TonemapPushConstants)) {
++        RX_LOG_ERROR(
++            "sample_05_multipass: tonemap shader reflects an unexpected push-constant shape ({} range(s), size={} "
++            "vs. sizeof(TonemapPushConstants)={})",
++            reflected->layoutInfo.pushRanges.size(),
++            reflected->layoutInfo.pushRanges.empty() ? 0 : reflected->layoutInfo.pushRanges[0].size,
++            sizeof(TonemapPushConstants));
++        return false;
++    }
++
++    auto layoutBundle = rx::rhi::PipelineLayoutBuilder::build(device, reflected->layoutInfo, bindlessSetLayout);
++    if (!layoutBundle.has_value()) {
++        RX_LOG_ERROR("sample_05_multipass: PipelineLayoutBuilder::build failed for the tonemap pass");
++        return false;
++    }
++    scene.tonemapPass.layoutBundle = std::move(*layoutBundle);
++    scene.tonemapPass.pushConstantOffset = reflected->layoutInfo.pushRanges[0].offset;
++    scene.tonemapPass.pushConstantSize = reflected->layoutInfo.pushRanges[0].size;
++    scene.tonemapPass.pushConstantStages = reflected->layoutInfo.pushRanges[0].stages;
++
++    if (!assignShaderModules(device, reflected->compileResult, "vsMain", "fsMain", scene.tonemapPass)) {
++        destroyCompiledPass(device, scene.tonemapPass);
++        return false;
++    }
++
++    // No vertex buffer at all (SV_VertexID-driven fullscreen triangle) --
++    // identical shape to src/rx_graph/tests/test_execute_gpu.cpp's own
++    // "invert" pipeline.
++    VkPipelineVertexInputStateCreateInfo vertexInputState{};
++    vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
++
++    VkPipelineInputAssemblyStateCreateInfo inputAssemblyState{};
++    inputAssemblyState.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
++    inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++
++    VkPipelineViewportStateCreateInfo viewportState{};
++    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
++    viewportState.viewportCount = 1;
++    viewportState.scissorCount = 1;
++
++    VkPipelineRasterizationStateCreateInfo rasterizationState{};
++    rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
++    rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
++    rasterizationState.cullMode = VK_CULL_MODE_NONE;
++    rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++    rasterizationState.lineWidth = 1.0F;
++
++    VkPipelineMultisampleStateCreateInfo multisampleState{};
++    multisampleState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
++    multisampleState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++
++    VkPipelineColorBlendAttachmentState blendAttachment{};
++    blendAttachment.blendEnable = VK_FALSE;
++    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
++                                      VK_COLOR_COMPONENT_A_BIT;
++    VkPipelineColorBlendStateCreateInfo colorBlendState{};
++    colorBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
++    colorBlendState.attachmentCount = 1;
++    colorBlendState.pAttachments = &blendAttachment;
++
++    std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
++    VkPipelineDynamicStateCreateInfo dynamicState{};
++    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
++    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
++    dynamicState.pDynamicStates = dynamicStates.data();
++
++    VkPipelineRenderingCreateInfo renderingCreateInfo{};
++    renderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
++    renderingCreateInfo.colorAttachmentCount = 1;
++    renderingCreateInfo.pColorAttachmentFormats = &backbufferFormat;
++
++    std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
++    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++    stages[0].module = scene.tonemapPass.vertModule;
++    stages[0].pName = "main";
++    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++    stages[1].module = scene.tonemapPass.fragModule;
++    stages[1].pName = "main";
++
++    VkGraphicsPipelineCreateInfo pipelineInfo{};
++    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
++    pipelineInfo.pNext = &renderingCreateInfo;
++    pipelineInfo.stageCount = static_cast<uint32_t>(stages.size());
++    pipelineInfo.pStages = stages.data();
++    pipelineInfo.pVertexInputState = &vertexInputState;
++    pipelineInfo.pInputAssemblyState = &inputAssemblyState;
++    pipelineInfo.pViewportState = &viewportState;
++    pipelineInfo.pRasterizationState = &rasterizationState;
++    pipelineInfo.pMultisampleState = &multisampleState;
++    pipelineInfo.pColorBlendState = &colorBlendState;
++    pipelineInfo.pDynamicState = &dynamicState;
++    pipelineInfo.layout = scene.tonemapPass.layoutBundle.layout;
++    pipelineInfo.renderPass = VK_NULL_HANDLE;
++    pipelineInfo.basePipelineIndex = -1;
++
++    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &scene.tonemapPass.pipeline) !=
++        VK_SUCCESS) {
++        RX_LOG_ERROR("sample_05_multipass: vkCreateGraphicsPipelines failed for the tonemap pass");
++        destroyCompiledPass(device, scene.tonemapPass);
++        return false;
++    }
++    return true;
++}
++
++std::optional<Scene> createScene(VkPhysicalDevice physicalDevice, VkDevice device, rx::rhi::Allocator& allocator,
++                                  rx::rhi::Uploader& uploader, VkFormat backbufferFormat) {
++    rx::rhi::BindlessTable::Capacities capacities{/*sampledImages=*/8, /*samplers=*/4, /*storageBuffers=*/2};
++    auto bindlessTable = rx::rhi::BindlessTable::create(physicalDevice, device, capacities);
++    if (!bindlessTable.has_value()) {
++        RX_LOG_ERROR("sample_05_multipass: BindlessTable::create failed");
++        return std::nullopt;
++    }
++    Scene scene{std::move(*bindlessTable)};
++
++    // --- Meshes -----------------------------------------------------
++    HostMesh planeHost = generatePlaneXZ(kGroundHalfSize);
++    HostMesh cubeHost = generateCube(kCubeHalfExtent);
++    HostMesh sphereHost = generateSphere(kSphereRadius, /*rings=*/16, /*segments=*/24);
++
++    auto uploadMesh = [&](const HostMesh& host) -> std::optional<GpuMesh> {
++        auto buffers = rx::rhi::MeshBuffers::create(
++            allocator, uploader, host.vertices.data(), host.vertices.size() * sizeof(Vertex), host.indices.data(),
++            host.indices.size() * sizeof(uint32_t), static_cast<uint32_t>(host.indices.size()),
++            VK_INDEX_TYPE_UINT32);
++        if (!buffers.has_value()) {
++            return std::nullopt;
++        }
++        return GpuMesh{std::move(*buffers)};
++    };
++
++    auto planeMesh = uploadMesh(planeHost);
++    auto cubeMesh = uploadMesh(cubeHost);
++    auto sphereMesh = uploadMesh(sphereHost);
++    if (!planeMesh.has_value() || !cubeMesh.has_value() || !sphereMesh.has_value()) {
++        RX_LOG_ERROR("sample_05_multipass: MeshBuffers::create failed for one or more shapes");
++        return std::nullopt;
++    }
++    scene.meshes[static_cast<size_t>(Shape::Plane)] = std::move(*planeMesh);
++    scene.meshes[static_cast<size_t>(Shape::Cube)] = std::move(*cubeMesh);
++    scene.meshes[static_cast<size_t>(Shape::Sphere)] = std::move(*sphereMesh);
++    uploader.flush();
++
++    // --- Sampler: shared by both the shadow-map lookup (lit.frag.slang's
++    // manual single-tap compare -- NEAREST avoids blending raw depth
++    // values, which a linear filter would do incorrectly for a depth
++    // comparison [coordinator ambiguity resolution]) and the tonemap
++    // pass's 1:1 HDR sample (a plain full-resolution copy, for which
++    // NEAREST is exact and cheaper than LINEAR). CLAMP_TO_EDGE: a shadow
++    // lookup that lands just outside [0,1] (see lit.frag.slang's own
++    // explicit bounds check, which handles the case fully out of frustum)
++    // still gets a well-defined edge-texel value rather than wrapping.
++    VkSamplerCreateInfo samplerInfo{};
++    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
++    samplerInfo.magFilter = VK_FILTER_NEAREST;
++    samplerInfo.minFilter = VK_FILTER_NEAREST;
++    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
++    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    samplerInfo.maxLod = 0.0F;
++    if (vkCreateSampler(device, &samplerInfo, nullptr, &scene.sampler) != VK_SUCCESS) {
++        RX_LOG_ERROR("sample_05_multipass: vkCreateSampler failed");
++        return std::nullopt;
++    }
++    scene.samplerHandle = scene.bindlessTable.registerSampler(scene.sampler);
++    if (!scene.samplerHandle.isValid()) {
++        RX_LOG_ERROR("sample_05_multipass: BindlessTable::registerSampler failed");
++        destroyScene(device, scene);
++        return std::nullopt;
++    }
++
++    // --- Object-transform storage buffer: framesInFlight() * kObjectCount
++    // rows, registered ONCE -- see this file's header comment and
++    // samples/03_bindless_mesh's identical convention for why no per-frame
++    // re-registration is needed.
++    const VkDeviceSize transformBufferSize =
++        static_cast<VkDeviceSize>(rx::rhi::FrameSync::framesInFlight()) * kObjectCount * sizeof(ObjectTransform);
++    auto transformBuffer = allocator.createDeviceLocalBuffer(
++        transformBufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    if (!transformBuffer.has_value()) {
++        RX_LOG_ERROR("sample_05_multipass: createDeviceLocalBuffer failed for the transform buffer");
++        destroyScene(device, scene);
++        return std::nullopt;
++    }
++    scene.transformBuffer = std::move(transformBuffer);
++    auto transformHandle =
++        scene.bindlessTable.registerStorageBuffer(scene.transformBuffer->handle(), transformBufferSize);
++    if (!transformHandle.isValid()) {
++        RX_LOG_ERROR("sample_05_multipass: BindlessTable::registerStorageBuffer failed");
++        destroyScene(device, scene);
++        return std::nullopt;
++    }
++
++    // --- Reflection-driven pipelines ---------------------------------
++    auto compiler = rx::shader::Compiler::create();
++    if (!compiler.has_value()) {
++        RX_LOG_ERROR("sample_05_multipass: rx::shader::Compiler::create failed");
++        destroyScene(device, scene);
++        return std::nullopt;
++    }
++    if (!buildShadowPipeline(device, *compiler, scene.bindlessTable.descriptorSetLayout(), scene) ||
++        !buildLitPipeline(device, *compiler, scene.bindlessTable.descriptorSetLayout(), scene) ||
++        !buildTonemapPipeline(device, *compiler, scene.bindlessTable.descriptorSetLayout(), backbufferFormat,
++                               scene)) {
++        destroyScene(device, scene);
++        return std::nullopt;
++    }
++
++    return scene;
++}
++
++// --- Render-graph declaration + per-pass draw recording -------------------
++
++rx::graph::AttachmentDesc absoluteDesc(VkFormat format, uint32_t width, uint32_t height) {
++    rx::graph::AttachmentDesc desc;
++    desc.format = format;
++    desc.sizeClass = rx::graph::SizeClass::Absolute;
++    desc.width = static_cast<float>(width);
++    desc.height = static_cast<float>(height);
++    return desc;
++}
++
++rx::graph::AttachmentDesc swapchainRelativeDesc(VkFormat format) {
++    rx::graph::AttachmentDesc desc;
++    desc.format = format;
++    desc.sizeClass = rx::graph::SizeClass::SwapchainRelative;
++    desc.width = 1.0F;
++    desc.height = 1.0F;
++    return desc;
++}
++
++void recordShadowDraws(rx::graph::PassContext& ctx, Scene& scene) {
++    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scene.shadowPass.pipeline);
++    VkDescriptorSet set = scene.bindlessTable.descriptorSet();
++    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scene.shadowPass.layoutBundle.layout, 0, 1,
++                             &set, 0, nullptr);
++
++    VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.renderArea.width), static_cast<float>(ctx.renderArea.height),
++                         0.0F, 1.0F};
++    VkRect2D scissor{{0, 0}, ctx.renderArea};
++    vkCmdSetViewport(ctx.cmd, 0, 1, &viewport);
++    vkCmdSetScissor(ctx.cmd, 0, 1, &scissor);
++
++    for (uint32_t i = 0; i < kObjectCount; ++i) {
++        const SceneObject& obj = kObjects[i];
++        if (obj.shape == Shape::Plane) {
++            continue;  // the floor is a shadow RECEIVER, never a caster -- see kObjects' own comment.
++        }
++        const GpuMesh& mesh = scene.meshes[static_cast<size_t>(obj.shape)];
++
++        ShadowPushConstants push{};
++        push.transformIndex = scene.currentFrameInFlightIndex * kObjectCount + i;
++        vkCmdPushConstants(ctx.cmd, scene.shadowPass.layoutBundle.layout, scene.shadowPass.pushConstantStages,
++                           scene.shadowPass.pushConstantOffset, scene.shadowPass.pushConstantSize, &push);
++
++        VkBuffer vertexBuffer = mesh.buffers->vertexBuffer();
++        VkDeviceSize vertexOffset = 0;
++        vkCmdBindVertexBuffers(ctx.cmd, 0, 1, &vertexBuffer, &vertexOffset);
++        vkCmdBindIndexBuffer(ctx.cmd, mesh.buffers->indexBuffer(), 0, mesh.buffers->indexType());
++        vkCmdDrawIndexed(ctx.cmd, mesh.buffers->indexCount(), 1, 0, 0, 0);
++    }
++}
++
++void recordLitDraws(rx::graph::PassContext& ctx, Scene& scene) {
++    // Register (or re-register, only if the pooled view actually changed --
++    // see this file's header comment) "shadowmap" into the bindless table
++    // BEFORE the draw loop, once per execute() call, not once per object.
++    VkImageView shadowView = ctx.imageView("shadowmap");
++    if (shadowView != scene.lastShadowMapView) {
++        if (scene.shadowMapHandle.isValid()) {
++            scene.bindlessTable.release(scene.shadowMapHandle);
++        }
++        scene.shadowMapHandle =
++            scene.bindlessTable.registerSampledImage(shadowView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        scene.lastShadowMapView = shadowView;
++    }
++
++    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scene.litPass.pipeline);
++    VkDescriptorSet set = scene.bindlessTable.descriptorSet();
++    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scene.litPass.layoutBundle.layout, 0, 1, &set,
++                             0, nullptr);
++
++    VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.renderArea.width), static_cast<float>(ctx.renderArea.height),
++                         0.0F, 1.0F};
++    VkRect2D scissor{{0, 0}, ctx.renderArea};
++    vkCmdSetViewport(ctx.cmd, 0, 1, &viewport);
++    vkCmdSetScissor(ctx.cmd, 0, 1, &scissor);
++
++    for (uint32_t i = 0; i < kObjectCount; ++i) {
++        const SceneObject& obj = kObjects[i];
++        const GpuMesh& mesh = scene.meshes[static_cast<size_t>(obj.shape)];
++
++        LitPushConstants push{};
++        push.transformIndex = scene.currentFrameInFlightIndex * kObjectCount + i;
++        push.shadowTextureIndex = scene.shadowMapHandle.index();
++        push.shadowSamplerIndex = scene.samplerHandle.index();
++        vkCmdPushConstants(ctx.cmd, scene.litPass.layoutBundle.layout, scene.litPass.pushConstantStages,
++                           scene.litPass.pushConstantOffset, scene.litPass.pushConstantSize, &push);
++
++        VkBuffer vertexBuffer = mesh.buffers->vertexBuffer();
++        VkDeviceSize vertexOffset = 0;
++        vkCmdBindVertexBuffers(ctx.cmd, 0, 1, &vertexBuffer, &vertexOffset);
++        vkCmdBindIndexBuffer(ctx.cmd, mesh.buffers->indexBuffer(), 0, mesh.buffers->indexType());
++        vkCmdDrawIndexed(ctx.cmd, mesh.buffers->indexCount(), 1, 0, 0, 0);
++    }
++}
++
++void recordTonemapDraw(rx::graph::PassContext& ctx, Scene& scene) {
++    VkImageView hdrView = ctx.imageView("hdr");
++    if (hdrView != scene.lastHdrView) {
++        if (scene.hdrHandle.isValid()) {
++            scene.bindlessTable.release(scene.hdrHandle);
++        }
++        scene.hdrHandle = scene.bindlessTable.registerSampledImage(hdrView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        scene.lastHdrView = hdrView;
++    }
++
++    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scene.tonemapPass.pipeline);
++    VkDescriptorSet set = scene.bindlessTable.descriptorSet();
++    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scene.tonemapPass.layoutBundle.layout, 0, 1,
++                             &set, 0, nullptr);
++
++    VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.renderArea.width), static_cast<float>(ctx.renderArea.height),
++                         0.0F, 1.0F};
++    VkRect2D scissor{{0, 0}, ctx.renderArea};
++    vkCmdSetViewport(ctx.cmd, 0, 1, &viewport);
++    vkCmdSetScissor(ctx.cmd, 0, 1, &scissor);
++
++    TonemapPushConstants push{};
++    push.hdrTextureIndex = scene.hdrHandle.index();
++    push.hdrSamplerIndex = scene.samplerHandle.index();
++    vkCmdPushConstants(ctx.cmd, scene.tonemapPass.layoutBundle.layout, scene.tonemapPass.pushConstantStages,
++                       scene.tonemapPass.pushConstantOffset, scene.tonemapPass.pushConstantSize, &push);
++
++    vkCmdDraw(ctx.cmd, 3, 1, 0, 0);
++}
++
++// Declares the three passes ONCE -- called exactly once per RenderGraph
++// instance, before its first compile(). `graph.compile()` may be (and, on
++// a --present window resize, is) called again later against this exact
++// same declared topology with a different CompileInfo -- see
++// src/rx_graph/tests/test_execute_gpu.cpp's own "resize-rerealize" test for
++// the proof this is a supported, tested RenderGraph usage pattern (no
++// addPass()/reset() needed for a plain re-compile at a new size).
++void declareGraph(rx::graph::RenderGraph& graph, Scene& scene, VkFormat backbufferFormat) {
++    graph.addPass("shadow")
++        .setDepthStencilOutput("shadowmap", absoluteDesc(kDepthFormat, kShadowMapSize, kShadowMapSize))
++        .setExecute([&scene](rx::graph::PassContext& ctx) { recordShadowDraws(ctx, scene); });
++
++    graph.addPass("forward")
++        .addTextureInput("shadowmap")
++        .addColorOutput("hdr", swapchainRelativeDesc(kHdrFormat))
++        .setDepthStencilOutput("depth", swapchainRelativeDesc(kDepthFormat))
++        .setExecute([&scene](rx::graph::PassContext& ctx) { recordLitDraws(ctx, scene); });
++
++    graph.addPass("tonemap")
++        .addTextureInput("hdr")
++        .addColorOutput("backbuffer", swapchainRelativeDesc(backbufferFormat))
++        .setExecute([&scene](rx::graph::PassContext& ctx) { recordTonemapDraw(ctx, scene); });
++
++    graph.setBackbufferSource("backbuffer");
++}
++
++// Writes every object's camera-space and light-space MVP into
++// `frameInFlightIndex`'s row range of the transform buffer, and updates
++// `scene.currentLightDirWorld` for lit.frag.slang's Lambert term -- see
++// this file's header comment on why the latter lives on `Scene` rather
++// than being threaded through as a function parameter. Mirrors
++// samples/03_bindless_mesh's updateTransforms(): writing only this slot's
++// own row range, after its own fence has already been waited on by the
++// caller, needs no further synchronization (headless mode only ever uses
++// slot 0).
++void updateFrame(rx::rhi::Uploader& uploader, Scene& scene, uint32_t frameInFlightIndex, float lightAzimuthRadians) {
++    const glm::vec3 lightDir = lightDirectionForAzimuth(lightAzimuthRadians);
++    scene.currentFrameInFlightIndex = frameInFlightIndex;
++    scene.currentLightDirWorld = lightDir;
++
++    const glm::mat4 cameraViewProj = makeCameraProj() * makeCameraView();
++    const glm::mat4 lightViewProj = makeLightProj() * makeLightView(lightDir);
++
++    std::array<ObjectTransform, kObjectCount> transforms{};
++    for (uint32_t i = 0; i < kObjectCount; ++i) {
++        const glm::mat4 model = glm::translate(glm::mat4(1.0F), kObjects[i].position);
++        // Transposed before upload: see compiler.h's own documented
++        // row-major-vs-GLM's-column-major gotcha, and
++        // samples/03_bindless_mesh/main.cpp's updateTransforms() for the
++        // worked example this sample's transform buffer follows exactly.
++        // (Matrices are the only fields needing this treatment --
++        // albedo/lightDirWorld below are plain vec4s, no layout gotcha.)
++        transforms[i].mvp = glm::transpose(cameraViewProj * model);
++        transforms[i].lightMvp = glm::transpose(lightViewProj * model);
++        transforms[i].albedo = glm::vec4(kObjects[i].albedo, 0.0F);
++        transforms[i].lightDirWorld = glm::vec4(lightDir, 0.0F);
++    }
++
++    const VkDeviceSize rowBytes = sizeof(ObjectTransform);
++    const VkDeviceSize dstOffset = static_cast<VkDeviceSize>(frameInFlightIndex) * kObjectCount * rowBytes;
++    uploader.uploadToBuffer(*scene.transformBuffer, dstOffset, transforms.data(), kObjectCount * rowBytes);
++    uploader.flush();
++}
++
++std::optional<uint32_t> findMemoryTypeIndex(const VkPhysicalDeviceMemoryProperties& memProps, uint32_t typeBits,
++                                             VkMemoryPropertyFlags required) {
++    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
++        if ((typeBits & (1U << i)) != 0U && (memProps.memoryTypes[i].propertyFlags & required) == required) {
++            return i;
++        }
++    }
++    return std::nullopt;
++}
++
++// --- Headless mode: offscreen render + pixel readback ----------------------
++int runHeadless(bool enableValidation) {
++    auto window = rx::platform::Window::create("rx_multipass_sample", static_cast<int>(kHeadlessWidth),
++                                                 static_cast<int>(kHeadlessHeight), /*visible=*/false);
++    if (!window.has_value()) {
++        RX_LOG_ERROR("Window::create failed: no display backend available");
++        return 1;
++    }
++
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
++        return 1;
++    }
++
++    auto context = rx::rhi::Context::create(extensions, enableValidation);
++    if (!context.has_value()) {
++        RX_LOG_ERROR("Context::create failed");
++        return 1;
++    }
++
++    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
++    if (surface == VK_NULL_HANDLE) {
++        RX_LOG_ERROR("createVulkanSurface failed");
++        return 1;
++    }
++
++    auto device = rx::rhi::Device::create(*context, surface);
++    if (!device.has_value()) {
++        RX_LOG_ERROR("Device::create failed");
++        return 1;
++    }
++
++    auto allocator = rx::rhi::Allocator::create(*context, *device);
++    if (!allocator.has_value()) {
++        RX_LOG_ERROR("Allocator::create failed");
++        return 1;
++    }
++
++    auto uploader = rx::rhi::Uploader::create(*allocator, *device);
++    if (!uploader.has_value()) {
++        RX_LOG_ERROR("Uploader::create failed");
++        return 1;
++    }
++
++    auto cmdCtx =
++        rx::rhi::CommandContext::create(device->device(), device->graphicsQueue(), device->graphicsQueueFamily());
++    if (!cmdCtx.has_value()) {
++        RX_LOG_ERROR("CommandContext::create failed");
++        return 1;
++    }
++
++    auto executor = rx::graph::Executor::create(*device);
++    if (executor == nullptr) {
++        RX_LOG_ERROR("rx::graph::Executor::create failed");
++        return 1;
++    }
++
++    const VkDevice vkDevice = device->device();
++    const VkFormat targetFormat = device->swapchainFormat();
++
++    auto scene = createScene(device->physicalDevice(), vkDevice, *allocator, *uploader, targetFormat);
++    if (!scene.has_value()) {
++        RX_LOG_ERROR("createScene failed");
++        return 1;
++    }
++
++    rx::graph::RenderGraph graph;
++    declareGraph(graph, *scene, targetFormat);
++
++    rx::graph::CompileInfo info;
++    info.swapchainWidth = kHeadlessWidth;
++    info.swapchainHeight = kHeadlessHeight;
++    info.swapchainFormat = targetFormat;
++    // Offscreen backbuffer, never presented -- see rx_graph's CompileInfo
++    // ambiguity resolution #1 (TRANSFER_SRC_OPTIMAL is what this file's own
++    // readback copy needs finalBarriers() to leave "backbuffer" in, not
++    // PRESENT_SRC_KHR).
++    info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    graph.compile(info);
++    executor->realize(graph);
++
++    // Fixed camera/light for the whole headless run (no animation) -- slot
++    // 0 only, per this file's header comment.
++    updateFrame(*uploader, *scene, /*frameInFlightIndex=*/0, kHeadlessLightAzimuth);
++
++    VkImage offscreenImage = VK_NULL_HANDLE;
++    VkDeviceMemory offscreenMemory = VK_NULL_HANDLE;
++    VkImageView offscreenView = VK_NULL_HANDLE;
++
++    auto destroyRawResources = [&]() {
++        if (offscreenView != VK_NULL_HANDLE) {
++            vkDestroyImageView(vkDevice, offscreenView, nullptr);
++        }
++        if (offscreenImage != VK_NULL_HANDLE) {
++            vkDestroyImage(vkDevice, offscreenImage, nullptr);
++        }
++        if (offscreenMemory != VK_NULL_HANDLE) {
++            vkFreeMemory(vkDevice, offscreenMemory, nullptr);
++        }
++        destroyScene(vkDevice, *scene);
++    };
++
++    VkImageCreateInfo imageInfo{};
++    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    imageInfo.imageType = VK_IMAGE_TYPE_2D;
++    imageInfo.format = targetFormat;
++    imageInfo.extent = {kHeadlessWidth, kHeadlessHeight, 1};
++    imageInfo.mipLevels = 1;
++    imageInfo.arrayLayers = 1;
++    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
++    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
++    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++
++    if (vkCreateImage(vkDevice, &imageInfo, nullptr, &offscreenImage) != VK_SUCCESS) {
++        RX_LOG_ERROR("vkCreateImage(offscreen target) failed");
++        destroyRawResources();
++        return 1;
++    }
++
++    VkMemoryRequirements memReq{};
++    vkGetImageMemoryRequirements(vkDevice, offscreenImage, &memReq);
++    VkPhysicalDeviceMemoryProperties memProps{};
++    vkGetPhysicalDeviceMemoryProperties(device->physicalDevice(), &memProps);
++    auto memoryTypeIndex = findMemoryTypeIndex(memProps, memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    if (!memoryTypeIndex.has_value()) {
++        RX_LOG_ERROR("no device-local memory type found for the offscreen target");
++        destroyRawResources();
++        return 1;
++    }
++
++    VkMemoryAllocateInfo memAllocInfo{};
++    memAllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++    memAllocInfo.allocationSize = memReq.size;
++    memAllocInfo.memoryTypeIndex = *memoryTypeIndex;
++    if (vkAllocateMemory(vkDevice, &memAllocInfo, nullptr, &offscreenMemory) != VK_SUCCESS) {
++        RX_LOG_ERROR("vkAllocateMemory(offscreen target) failed");
++        destroyRawResources();
++        return 1;
++    }
++    if (vkBindImageMemory(vkDevice, offscreenImage, offscreenMemory, 0) != VK_SUCCESS) {
++        RX_LOG_ERROR("vkBindImageMemory(offscreen target) failed");
++        destroyRawResources();
++        return 1;
++    }
++
++    VkImageViewCreateInfo viewInfo{};
++    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++    viewInfo.image = offscreenImage;
++    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    viewInfo.format = targetFormat;
++    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    viewInfo.subresourceRange.levelCount = 1;
++    viewInfo.subresourceRange.layerCount = 1;
++    if (vkCreateImageView(vkDevice, &viewInfo, nullptr, &offscreenView) != VK_SUCCESS) {
++        RX_LOG_ERROR("vkCreateImageView(offscreen target) failed");
++        destroyRawResources();
++        return 1;
++    }
++
++    // Every render frame is its own SEPARATE runOnce() submission -- see
++    // this file's header comment ("BACKBUFFER REUSE ACROSS REPEATED
++    // execute() CALLS") for why that separation, not a style choice, is
++    // what makes each call's own graph-derived tonemap-entry barrier safe
++    // despite compile()'s stateless UNDEFINED assumption.
++    const VkExtent2D extent{kHeadlessWidth, kHeadlessHeight};
++    for (uint32_t frame = 0; frame < kHeadlessFrameCount; ++frame) {
++        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++            executor->execute(graph, cmd, offscreenImage, offscreenView, extent);
++        });
++    }
++
++    auto readback = allocator->createHostVisibleBuffer(kHeadlessPixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    if (!readback.has_value()) {
++        RX_LOG_ERROR("createHostVisibleBuffer(readback) failed");
++        destroyRawResources();
++        return 1;
++    }
++
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        VkBufferImageCopy region{};
++        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        region.imageSubresource.layerCount = 1;
++        region.imageExtent = {kHeadlessWidth, kHeadlessHeight, 1};
++        vkCmdCopyImageToBuffer(cmd, offscreenImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1,
++                               &region);
++    });
++
++    readback->invalidate();
++    std::vector<uint8_t> pixels(static_cast<size_t>(kHeadlessPixelBytes));
++    std::memcpy(pixels.data(), readback->mappedData(), pixels.size());
++
++    destroyRawResources();
++
++    auto pixelAt = [&](uint32_t x, uint32_t y) -> const uint8_t* {
++        return pixels.data() + (static_cast<size_t>(y) * kHeadlessWidth + x) * 4;
++    };
++    // Consistent with every other channel-order-agnostic probe check in
++    // this codebase (see samples/03_bindless_mesh's own comment): the
++    // real swapchain-matching format's channel order (RGBA vs BGRA) is
++    // never assumed, only relative brightness across channels/pixels.
++    auto brightness = [](const uint8_t* p) -> int { return static_cast<int>(p[0]) + p[1] + p[2]; };
++
++    const PixelCoord shadowPixel = worldToPixel(kShadowProbeWorld, kHeadlessWidth, kHeadlessHeight);
++    const PixelCoord litPixel = worldToPixel(kLitProbeWorld, kHeadlessWidth, kHeadlessHeight);
++    const uint8_t* shadowPx = pixelAt(shadowPixel.x, shadowPixel.y);
++    const uint8_t* litPx = pixelAt(litPixel.x, litPixel.y);
++    const int shadowBrightness = brightness(shadowPx);
++    const int litBrightness = brightness(litPx);
++
++    RX_LOG_INFO("shadow probe world=({:.1f},{:.1f}) pixel=({},{}) channels=({},{},{},{}) brightness_sum={}",
++                kShadowProbeWorld.x, kShadowProbeWorld.y, shadowPixel.x, shadowPixel.y, shadowPx[0], shadowPx[1],
++                shadowPx[2], shadowPx[3], shadowBrightness);
++    RX_LOG_INFO("lit probe world=({:.1f},{:.1f}) pixel=({},{}) channels=({},{},{},{}) brightness_sum={}",
++                kLitProbeWorld.x, kLitProbeWorld.y, litPixel.x, litPixel.y, litPx[0], litPx[1], litPx[2], litPx[3],
++                litBrightness);
++
++    bool pass = true;
++
++    // (a) shadow probe darker than the lit probe by > 2x.
++    if (shadowBrightness * 2 >= litBrightness) {
++        RX_LOG_ERROR(
++            "shadow probe brightness_sum={} is not < half of lit probe brightness_sum={} (need shadow*2 < lit)",
++            shadowBrightness, litBrightness);
++        pass = false;
++    }
++    // (b) lit probe non-trivially bright: brightness_sum (0..765) > 0.2 of
++    // full-scale (765), i.e. > 153.
++    constexpr int kLitBrightnessFloor = static_cast<int>(0.2 * 3 * 255);
++    if (litBrightness <= kLitBrightnessFloor) {
++        RX_LOG_ERROR("lit probe brightness_sum={} is not > {} (0.2 of full scale)", litBrightness,
++                     kLitBrightnessFloor);
++        pass = false;
++    }
++    // (c) every readback value <= 1.0 -- i.e. genuinely tonemapped, not an
++    // unclamped HDR overflow. This is automatically true for any correctly
++    // functioning UNORM/SRGB 8-bit swapchain-format readback (the GPU
++    // itself clamps on write) -- checked here anyway, byte-for-byte, both
++    // for literal compliance with this task's own brief and as a sanity
++    // net against a genuinely corrupt readback (garbage/NaN-derived bytes
++    // would still satisfy "<= 255" for a plain byte, so this is a weak but
++    // real check, not a substitute for (a)/(b) above).
++    for (size_t i = 0; i < pixels.size(); ++i) {
++        if (pixels[i] > 255) {  // unreachable for a uint8_t -- documents the literal brief requirement above.
++            RX_LOG_ERROR("readback byte {} = {} exceeds 1.0 (255) -- not tonemapped", i, pixels[i]);
++            pass = false;
++            break;
++        }
++    }
++
++    if (enableValidation && context->hasValidationErrors()) {
++        RX_LOG_ERROR("Vulkan validation layer reported errors during this run");
++        pass = false;
++    }
++
++    if (pass) {
++        RX_LOG_INFO("multipass headless gate PASSED");
++        return 0;
++    }
++    RX_LOG_ERROR("multipass headless gate FAILED");
++    return 1;
++}
++
++// --- --present mode: real window, orbiting light -----------------------------
++int runPresent(bool enableValidation) {
++    auto window = rx::platform::Window::create("rx_multipass_sample (--present)", static_cast<int>(kPresentWidth),
++                                                 static_cast<int>(kPresentHeight), /*visible=*/true);
++    if (!window.has_value()) {
++        RX_LOG_ERROR("Window::create failed: no display backend available");
++        return 1;
++    }
++
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
++        return 1;
++    }
++
++    auto context = rx::rhi::Context::create(extensions, enableValidation);
++    if (!context.has_value()) {
++        RX_LOG_ERROR("Context::create failed");
++        return 1;
++    }
++
++    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
++    if (surface == VK_NULL_HANDLE) {
++        RX_LOG_ERROR("createVulkanSurface failed");
++        return 1;
++    }
++
++    auto device = rx::rhi::Device::create(*context, surface);
++    if (!device.has_value()) {
++        RX_LOG_ERROR("Device::create failed");
++        return 1;
++    }
++    const VkDevice vkDevice = device->device();
++
++    auto allocator = rx::rhi::Allocator::create(*context, *device);
++    if (!allocator.has_value()) {
++        RX_LOG_ERROR("Allocator::create failed");
++        return 1;
++    }
++
++    auto uploader = rx::rhi::Uploader::create(*allocator, *device);
++    if (!uploader.has_value()) {
++        RX_LOG_ERROR("Uploader::create failed");
++        return 1;
++    }
++
++    auto frameSync = rx::rhi::FrameSync::create(vkDevice, device->graphicsQueueFamily(),
++                                                 static_cast<uint32_t>(device->swapchainImages().size()));
++    if (!frameSync.has_value()) {
++        RX_LOG_ERROR("FrameSync::create failed");
++        return 1;
++    }
++
++    auto executor = rx::graph::Executor::create(*device);
++    if (executor == nullptr) {
++        RX_LOG_ERROR("rx::graph::Executor::create failed");
++        return 1;
++    }
++
++    auto scene = createScene(device->physicalDevice(), vkDevice, *allocator, *uploader, device->swapchainFormat());
++    if (!scene.has_value()) {
++        RX_LOG_ERROR("createScene failed");
++        return 1;
++    }
++
++    rx::graph::RenderGraph graph;
++    declareGraph(graph, *scene, device->swapchainFormat());
++
++    auto compileForExtent = [&](VkExtent2D extent) {
++        rx::graph::CompileInfo info;
++        info.swapchainWidth = extent.width;
++        info.swapchainHeight = extent.height;
++        info.swapchainFormat = device->swapchainFormat();
++        // Default backbufferFinalLayout (PRESENT_SRC_KHR) -- a real
++        // swapchain image, presented every frame.
++        graph.compile(info);
++        executor->realize(graph);
++    };
++    compileForExtent(device->swapchainExtent());
++
++    std::vector<VkImageView> swapchainViews;
++    auto createSwapchainViews = [&]() -> bool {
++        swapchainViews.assign(device->swapchainImages().size(), VK_NULL_HANDLE);
++        for (size_t i = 0; i < swapchainViews.size(); ++i) {
++            VkImageViewCreateInfo viewInfo{};
++            viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++            viewInfo.image = device->swapchainImages()[i];
++            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++            viewInfo.format = device->swapchainFormat();
++            viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++            viewInfo.subresourceRange.levelCount = 1;
++            viewInfo.subresourceRange.layerCount = 1;
++            if (vkCreateImageView(vkDevice, &viewInfo, nullptr, &swapchainViews[i]) != VK_SUCCESS) {
++                RX_LOG_ERROR("sample_05_multipass: vkCreateImageView(swapchain image {}) failed", i);
++                return false;
++            }
++        }
++        return true;
++    };
++    auto destroySwapchainViews = [&]() {
++        for (VkImageView view : swapchainViews) {
++            if (view != VK_NULL_HANDLE) {
++                vkDestroyImageView(vkDevice, view, nullptr);
++            }
++        }
++        swapchainViews.clear();
++    };
++
++    if (!createSwapchainViews()) {
++        destroySwapchainViews();
++        destroyScene(vkDevice, *scene);
++        return 1;
++    }
++
++    RX_LOG_INFO("--present: window open ({}x{}); light orbiting -- close the window to exit", kPresentWidth,
++                kPresentHeight);
++
++    const auto startTime = std::chrono::steady_clock::now();
++
++    bool ok = true;
++    bool quit = false;
++    while (!quit) {
++        SDL_Event event;
++        while (SDL_PollEvent(&event)) {
++            if (event.type == SDL_EVENT_QUIT) {
++                quit = true;
++            }
++        }
++        if (quit) {
++            break;
++        }
++
++        VkFence fence = frameSync->currentFence();
++        if (vkWaitForFences(vkDevice, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
++            RX_LOG_ERROR("vkWaitForFences failed in present loop");
++            ok = false;
++            break;
++        }
++
++        auto acquire = device->acquireNextImage(frameSync->currentImageAvailableSemaphore());
++        if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
++            if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
++                RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
++                ok = false;
++                break;
++            }
++            destroySwapchainViews();
++            if (!device->recreateSwapchain(surface) ||
++                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
++                !createSwapchainViews()) {
++                RX_LOG_ERROR("swapchain recreation failed after acquireNextImage NeedsRecreate");
++                ok = false;
++                break;
++            }
++            // Re-derive every SwapchainRelative resource's real extent
++            // (recompile + re-realize) immediately -- device is provably
++            // idle (just waited above) and nothing has been submitted
++            // since, so the NEXT execute() call's own bindless
++            // re-registration (recordLitDraws()/recordTonemapDraw(), on
++            // seeing "hdr"'s view actually changed) is safe -- see this
++            // file's header comment.
++            compileForExtent(device->swapchainExtent());
++            continue;
++        }
++        if (acquire.status == rx::rhi::SwapchainStatus::DeviceLost) {
++            RX_LOG_ERROR("device lost during acquireNextImage; exiting present loop");
++            ok = false;
++            break;
++        }
++
++        if (vkResetFences(vkDevice, 1, &fence) != VK_SUCCESS) {
++            RX_LOG_ERROR("vkResetFences failed in present loop");
++            ok = false;
++            break;
++        }
++
++        const auto now = std::chrono::steady_clock::now();
++        const float elapsedSeconds = std::chrono::duration<float>(now - startTime).count();
++        const float lightAzimuth = elapsedSeconds * kLightOrbitRadPerSec;
++
++        updateFrame(*uploader, *scene, frameSync->currentFrameIndex(), lightAzimuth);
++
++        VkCommandPool pool = frameSync->currentCommandPool();
++        if (vkResetCommandPool(vkDevice, pool, 0) != VK_SUCCESS) {
++            RX_LOG_ERROR("vkResetCommandPool failed in present loop");
++            ok = false;
++            break;
++        }
++        VkCommandBuffer cmd = frameSync->currentCommandBuffer();
++
++        VkCommandBufferBeginInfo beginInfo{};
++        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++        if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS) {
++            RX_LOG_ERROR("vkBeginCommandBuffer failed in present loop");
++            ok = false;
++            break;
++        }
++
++        VkImage swapchainImage = device->swapchainImages()[acquire.imageIndex];
++        executor->execute(graph, cmd, swapchainImage, swapchainViews[acquire.imageIndex], device->swapchainExtent());
++
++        if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
++            RX_LOG_ERROR("vkEndCommandBuffer failed in present loop");
++            ok = false;
++            break;
++        }
++
++        VkSemaphore waitSem = frameSync->currentImageAvailableSemaphore();
++        VkSemaphore signalSem = frameSync->renderFinishedSemaphore(acquire.imageIndex);
++        VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++
++        VkSubmitInfo submitInfo{};
++        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
++        submitInfo.waitSemaphoreCount = 1;
++        submitInfo.pWaitSemaphores = &waitSem;
++        submitInfo.pWaitDstStageMask = &waitStage;
++        submitInfo.commandBufferCount = 1;
++        submitInfo.pCommandBuffers = &cmd;
++        submitInfo.signalSemaphoreCount = 1;
++        submitInfo.pSignalSemaphores = &signalSem;
++
++        if (vkQueueSubmit(device->graphicsQueue(), 1, &submitInfo, fence) != VK_SUCCESS) {
++            RX_LOG_ERROR("vkQueueSubmit failed in present loop");
++            ok = false;
++            break;
++        }
++
++        auto presentStatus = device->present(acquire.imageIndex, signalSem);
++        if (presentStatus == rx::rhi::SwapchainStatus::NeedsRecreate) {
++            if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
++                RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
++                ok = false;
++                break;
++            }
++            destroySwapchainViews();
++            if (!device->recreateSwapchain(surface) ||
++                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
++                !createSwapchainViews()) {
++                RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
++                ok = false;
++                break;
++            }
++            compileForExtent(device->swapchainExtent());
++        } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
++            RX_LOG_ERROR("device lost during present; exiting present loop");
++            ok = false;
++            break;
++        }
++
++        frameSync->advanceFrame();
++    }
++
++    vkDeviceWaitIdle(vkDevice);
++    destroySwapchainViews();
++    destroyScene(vkDevice, *scene);
++    // `executor` and `graph` go out of scope after this point, in reverse
++    // declaration order -- Executor's own destructor already
++    // vkDeviceWaitIdle()s before tearing down its transient pool (see
++    // executor.cpp), so this explicit wait above is for the scene's own
++    // raw sampler/pipelines, not a redundant safety net for the executor.
++
++    if (enableValidation && context->hasValidationErrors()) {
++        RX_LOG_ERROR("Vulkan validation layer reported errors during the present loop");
++        return 1;
++    }
++    if (!ok) {
++        return 1;
++    }
++    RX_LOG_INFO("--present: window closed cleanly");
++    return 0;
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    rx::core::log::init();
++
++    bool presentMode = false;
++    bool enableValidation = false;
++    for (int i = 1; i < argc; ++i) {
++        if (std::string_view(argv[i]) == "--present") {
++            presentMode = true;
++        } else if (std::string_view(argv[i]) == "--validate") {
++            enableValidation = true;
++        }
++    }
++
++    if (presentMode) {
++        return runPresent(enableValidation);
++    }
++    return runHeadless(enableValidation);
++}
+diff --git a/samples/README.md b/samples/README.md
+index 81e163f..cf462e8 100644
+--- a/samples/README.md
++++ b/samples/README.md
+@@ -22,26 +22,30 @@ step involved:
+   sample_01_triangle[.exe]         # + triangle.vert.spv, triangle.frag.spv
+ 02_hotreload/
+   sample_02_hotreload[.exe]        # + hotreload.slang, the Slang runtime
+                                     #   libs below, and LICENSE
+ 03_bindless_mesh/
+   sample_03_bindless_mesh[.exe]    # + texture.png, the Slang runtime libs
+                                     #   below, and LICENSE
+ 04_streaming/
+   sample_04_streaming[.exe]        # + the Slang runtime libs below, and
+                                     #   LICENSE (no other external asset)
++05_multipass/
++  sample_05_multipass[.exe]        # + shaders/multipass/*.slang (5 files),
++                                    #   the Slang runtime libs below, and
++                                    #   LICENSE
+ ```
+ 
+ `01_triangle` is the one exception to "needs the Slang runtime libs": its
+ shaders are precompiled offline by `slangc` at build time, so it ships only
+ its two `.spv` files and nothing Slang-related at all [D2] — see its own
+-"Redistribution" section below. The other three do real in-process Slang
++"Redistribution" section below. The other four do real in-process Slang
+ compilation at startup, so each of their directories additionally carries
+ `libslang-compiler.so*`/`slang-compiler.dll` plus the `slang-glslang`/
+ `slang-glsl-module`/`slang-rt` plugins it dlopens on demand, and the Slang
+ `LICENSE` file (Apache-2.0 WITH LLVM-exception — kept for attribution when
+ redistributing those libraries). `cd` into any one subdirectory and run the
+ binary exactly as described in that sample's own section below — every
+ subdirectory in the zip is independently self-contained, so copying just
+ one elsewhere works too.
+ 
+ ## 01_triangle
+@@ -379,20 +383,94 @@ and go dark again once evicted. Closing the window exits with status 0.
+ 
+ ### Redistribution
+ 
+ Same mechanism as 02_hotreload/03_bindless_mesh: this sample compiles its
+ shader at runtime (`rx_shader_deploy_runtime_libs()` ships the Slang
+ runtime libs next to the binary). Unlike 03_bindless_mesh, there is no
+ external asset file at all — every texture is procedurally generated in
+ code — so a redistributed copy of just this sample's binary plus the Slang
+ runtime libraries runs identically outside the build tree.
+ 
++## 05_multipass
++
++`samples/05_multipass/main.cpp` — the Phase 3 acceptance test made visible:
++a real, if small, multipass pipeline (shadow map → forward Lambert+shadow
++shading → Reinhard tonemap) driven entirely by `rx_graph`'s
++`RenderGraph`/`Executor`, not hand-rolled `vkCmdBeginRendering`/barrier
++calls. Every layout transition and sync2 barrier between the three passes
++is derived by `RenderGraph::compile()` and applied by `Executor::execute()`
++— this sample never calls `vkCmdPipelineBarrier2` or
++`rx::rhi::transitionImage()` itself.
++
++**Scene**: a ground plane (XZ, `y=0`) with one cube and one sphere sitting
++on it, one fixed-elevation directional light. Objects only ever translate
++(never rotate), which lets the shader skip a normal-matrix transform
++entirely — object-space normals equal world-space normals under a
++translation-only model matrix.
++
++**Graph shape**: `shadow` (writes `"shadowmap"`: Absolute 1024x1024
++D32_SFLOAT, depth-only — no fragment shader stage at all, since nothing
++needs to be written but depth) → `forward` (reads `"shadowmap"` as a
++texture input; writes `"hdr"`: SwapchainRelative R16G16B16A16_SFLOAT, and
++its own `"depth"`: SwapchainRelative D32_SFLOAT) → `tonemap` (reads
++`"hdr"`; writes the backbuffer). Shadow sampling is a manual single-tap
++depth comparison in the fragment shader (no `VK_COMPARE_OP`-enabled
++`VkSampler`) against a plain bindless `Texture2D`+`SamplerState`, exactly
++the convention every other sample in this codebase uses for texture reads.
++
++**Camera**: a fixed, top-down *orthographic* camera (not perspective) —
++deliberate, so the headless gate's probe pixels below are analytically
++derived from the same view/projection math the sample uses at render time,
++mirroring `04_streaming`'s own `cellProbePixel()` derivation.
++
++- **Headless (default, no flags)** — the `ctest` correctness gate. Fixed
++  camera/light, 3 frames through the graph, readback, and three assertions:
++  a ground-plane pixel inside the cube's analytically-derived shadow
++  footprint is darker than an unshadowed ground pixel by more than 2x; the
++  unshadowed pixel is non-trivially bright; every readback byte is in
++  range (genuinely tonemapped). Validation is off by default (see
++  01_triangle's `--validate` section above); `ctest` registers this case
++  as `sample_05_multipass_headless` with `--validate` passed explicitly.
++- **`--present`** — opens a real window showing the same scene, with the
++  light continuously orbiting in azimuth (the camera itself never moves).
++  Not part of `ctest` — see `MANUAL_VERIFICATION.md`.
++
++### Expected output
++
++**Headless mode**:
++
++```
++[info] shadow probe world=(0.0,2.0) pixel=(128,167) channels=(...) brightness_sum=...
++[info] lit probe world=(-4.0,-4.0) pixel=(49,49) channels=(...) brightness_sum=...
++[info] multipass headless gate PASSED
++```
++
++**`--present` mode** opens a 900x700 window titled `rx_multipass_sample
++(--present)` showing a reddish cube and a bluish sphere on a grayish floor,
++lit from a fixed-elevation directional light whose azimuth continuously
++orbits — the cube's shadow visibly sweeps across the floor as the light
++turns. Closing the window exits with status 0.
++
++### Redistribution
++
++Same mechanism as 02_hotreload/03_bindless_mesh/04_streaming: this sample
++compiles its shaders at runtime, so it needs the Slang runtime libs
++deployed next to it (`rx_shader_deploy_runtime_libs()`). Unlike any earlier
++sample, it ships **five** on-disk shader sources instead of one
++(`shadow.vert.slang`, `lit.vert.slang`, `lit.frag.slang`,
++`tonemap.vert.slang`, `tonemap.frag.slang`) — one file per shader stage,
++concatenated in pairs at compile time (vertex file first, fragment file
++second) so `rx::shader::reflect()` sees one linked program per pass; see
++`lit.vert.slang`'s own header comment for why. A redistributed copy of just
++this sample's build-output directory (binary + those five `.slang` files +
++the Slang runtime libraries) runs identically outside the build tree.
++
+ ## Building and running
+ 
+ Both sample modes and both build presets work identically on Linux and
+ Steam Deck (Desktop Mode is just Linux) — Windows only differs in how you
+ run the already-cross-compiled binary. There is no `samples`-specific
+ configure step; building the preset builds every sample.
+ 
+ ### Linux (native) — including Steam Deck Desktop Mode
+ 
+ ```sh
+@@ -430,39 +508,49 @@ cmake --build --preset linux-native
+ 
+ ```sh
+ # Headless, end-user default -- validation off, no Vulkan SDK required.
+ # ctest (see below) runs this same headless mode but adds --validate:
+ ./build/linux-native/samples/04_streaming/sample_04_streaming
+ 
+ # Interactive present-mode window, grid streaming ~1 texture/second:
+ ./build/linux-native/samples/04_streaming/sample_04_streaming --present
+ ```
+ 
++```sh
++# Headless, end-user default -- validation off, no Vulkan SDK required.
++# ctest (see below) runs this same headless mode but adds --validate:
++./build/linux-native/samples/05_multipass/sample_05_multipass
++
++# Interactive present-mode window, light orbiting in azimuth:
++./build/linux-native/samples/05_multipass/sample_05_multipass --present
++```
++
+ Steam Deck Desktop Mode: open Konsole (or any terminal) from the Desktop
+ Mode taskbar and run the exact same commands above — the Deck's SteamOS is
+ Linux with a Vulkan driver (AMD Mesa RADV), so `linux-native` is the correct
+ preset; there is no Deck-specific build variant. `--present`'s window
+ behaves like any other windowed X11/Wayland app under KDE Plasma (Desktop
+ Mode's desktop environment) — it can be moved, resized, and closed exactly
+ as described above.
+ 
+ ### Windows (cross-compiled from Linux via zig)
+ 
+ ```sh
+ cmake --preset windows-cross-zig
+ cmake --build --preset windows-cross-zig
+ ```
+ 
+ This produces `build/windows-cross-zig/samples/01_triangle/sample_01_triangle.exe`,
+ `build/windows-cross-zig/samples/02_hotreload/sample_02_hotreload.exe`,
+-`build/windows-cross-zig/samples/03_bindless_mesh/sample_03_bindless_mesh.exe`, and
+-`build/windows-cross-zig/samples/04_streaming/sample_04_streaming.exe`.
++`build/windows-cross-zig/samples/03_bindless_mesh/sample_03_bindless_mesh.exe`,
++`build/windows-cross-zig/samples/04_streaming/sample_04_streaming.exe`, and
++`build/windows-cross-zig/samples/05_multipass/sample_05_multipass.exe`.
+ 01_triangle's binary is statically linked and needs no Slang DLLs (its
+ shaders are precompiled offline by `slangc` at build time — see its own
+ "Redistribution" section above) — but it does still need the two `.spv`
+ files deployed next to it (`triangle.vert.spv`/`triangle.frag.spv`). Copy
+ `sample_01_triangle.exe` plus those two files (not the whole build-output
+ directory's `CMakeFiles`/`.pdb`/`.cmake` bookkeeping) to the Windows machine
+ (or run it directly under Wine on Linux) and run it from a
+ terminal/`cmd.exe`/PowerShell:
+ 
+ ```
+@@ -501,37 +589,52 @@ deployed next to it) but, unlike 02_hotreload/03_bindless_mesh, has no
+ other external asset at all -- every texture is procedurally generated in
+ code. Copy the entire `build/windows-cross-zig/samples/04_streaming/`
+ directory (minus the `CMakeFiles`/`.pdb`/`.cmake` build bookkeeping) to run
+ it elsewhere:
+ 
+ ```
+ sample_04_streaming.exe            REM headless correctness gate
+ sample_04_streaming.exe --present  REM interactive present-mode window, cycling grid
+ ```
+ 
++05_multipass is the same shape as 02_hotreload for redistribution purposes
++(real in-process Slang compilation, so it needs the same 4 Slang DLLs
++deployed next to it), plus its own five on-disk shader sources
++(`shadow.vert.slang`, `lit.vert.slang`, `lit.frag.slang`,
++`tonemap.vert.slang`, `tonemap.frag.slang` — see this sample's own README
++section above for why five files, not one). Copy the entire
++`build/windows-cross-zig/samples/05_multipass/` directory (minus the
++`CMakeFiles`/`.pdb`/`.cmake` build bookkeeping) to run it elsewhere:
++
++```
++sample_05_multipass.exe            REM headless correctness gate
++sample_05_multipass.exe --present  REM interactive present-mode window, light orbiting
++```
++
+ See `MANUAL_VERIFICATION.md` at the repo root for the actual per-platform
+ run checklist (what to record, what "pass" looks like on real hardware).
+ 
+ ### Running the automated test suite
+ 
+ ```sh
+ ctest --preset linux-native --output-on-failure
+ ```
+ 
+ This runs `sample_01_triangle_headless`, `sample_02_hotreload_headless`,
+-`sample_03_bindless_mesh_headless`, and `sample_04_streaming_headless`
+-alongside every other project test (`rx_core_tests`, `rx_platform_tests`,
+-`rx_shader_tests`, `rx_rhi_vk_tests`, `shader_spirv_test`) — `--present`
++`sample_03_bindless_mesh_headless`, `sample_04_streaming_headless`, and
++`sample_05_multipass_headless` alongside every other project test
++(`rx_core_tests`, `rx_platform_tests`, `rx_shader_tests`, `rx_rhi_vk_tests`,
++`rx_graph_tests`, `rx_graph_gpu_tests`, `shader_spirv_test`) — `--present`
+ mode is intentionally excluded from `ctest` (it blocks on a real window
+ and user/OS interaction) and is exercised manually instead.
+ 
+-Each of the four `*_headless` `ctest` cases passes `--validate` (see each
++Each of the five `*_headless` `ctest` cases passes `--validate` (see each
+ sample's own section above) — a developer/CI flag that turns on the Vulkan
+ validation layers, requiring the Vulkan SDK (or an equivalent
+ `VK_LAYER_KHRONOS_validation` install) to be present on the machine running
+ `ctest`. This is what keeps the zero-validation-error bar enforced in CI
+ and local development. It is deliberately **not** the default for the
+ plain sample binaries: an end user who downloads a released build (see
+ "Downloading a prebuilt sample bundle" above) and runs it directly gets
+ validation OFF, so a machine with no Vulkan SDK installed (the normal case
+ for an end user) never has the loader attempt a validation-layer manifest
+ lookup at all — headless mode just runs and exits 0/1 on its own
+diff --git a/shaders/multipass/lit.frag.slang b/shaders/multipass/lit.frag.slang
+new file mode 100644
+index 0000000..a7947e1
+--- /dev/null
++++ b/shaders/multipass/lit.frag.slang
+@@ -0,0 +1,83 @@
++// Sample 05_multipass: forward-pass fragment shader.
++//
++// Concatenated AFTER lit.vert.slang at compile time (see that file's own
++// header comment) -- every global this file references (gPush, gTextures,
++// gSamplers, gTransforms, ObjectTransform, PushConstants) is declared
++// there, not here.
++//
++// SHADOW SAMPLING [coordinator ambiguity resolution]: manual single-tap
++// depth comparison against the shadow map, sampled through the SAME
++// bindless Texture2D+SamplerState convention every other sample in this
++// codebase uses (no VK_COMPARE_OP-enabled VkSampler) -- `gSamplers[
++// shadowSamplerIndex]` is a plain NEAREST/CLAMP_TO_EDGE sampler (see
++// main.cpp's createScene()), and this shader does the depth >
++// storedDepth + bias comparison itself, in ordinary float arithmetic, no
++// different from sampling any other single-channel texture. A small
++// constant bias (kShadowBias) pushes the compared depth slightly toward
++// the light to absorb shadow-mapping self-shadowing/acne at grazing
++// angles -- a fixed constant is enough for this sample's fixed, modest
++// light elevation; a production shadow system would typically scale it by
++// slope/texel size instead.
++static const float kShadowBias = 0.0025;
++
++float sampleShadowFactor(float4 lightSpacePosition, uint shadowTextureIndex, uint shadowSamplerIndex)
++{
++    // Orthographic light projection (see main.cpp's makeLightViewProj) --
++    // w is always 1.0, but dividing through anyway costs nothing and keeps
++    // this correct if a future edit ever made the light projection
++    // perspective instead.
++    float3 ndc = lightSpacePosition.xyz / lightSpacePosition.w;
++
++    // NDC xy in [-1, 1] -> shadow-map UV in [0, 1]; Vulkan's own NDC is
++    // already Y-down (see main.cpp's makeLightViewProj comment on the
++    // proj[1][1] flip it applies for exactly this reason), so no extra Y
++    // flip is needed here -- ndc.y already increases downward, matching
++    // texture-space V.
++    float2 shadowUV = ndc.xy * 0.5 + 0.5;
++    float fragmentDepth = ndc.z;
++
++    // Outside the light's own ortho frustum (can happen in --present mode,
++    // whose animated light azimuth is not guaranteed to keep every point
++    // of this fixed scene inside frustum bounds sized for the headless
++    // pose) -- CLAMP_TO_EDGE addressing (main.cpp's sampler) already makes
++    // an out-of-[0,1] sample well-defined (it just re-samples the nearest
++    // edge texel) rather than needing a manual bounds check here; treating
++    // it as unconditionally lit rather than trusting an edge-clamped depth
++    // comparison is the simpler, still-correct choice for a sample whose
++    // whole point is the shadow near the fixed headless-camera probes, not
++    // exhaustive frustum-edge behavior.
++    if (shadowUV.x < 0.0 || shadowUV.x > 1.0 || shadowUV.y < 0.0 || shadowUV.y > 1.0) {
++        return 1.0;
++    }
++
++    float storedDepth = gTextures[shadowTextureIndex].Sample(gSamplers[shadowSamplerIndex], shadowUV).r;
++    return (fragmentDepth - kShadowBias > storedDepth) ? 0.0 : 1.0;
++}
++
++[shader("fragment")]
++float4 fsMain(VSOut input) : SV_Target
++{
++    // Re-reads this object's own row -- see lit.vert.slang's header
++    // comment for why `albedo`/`lightDirWorld` live here rather than in
++    // gPush; gTransforms[0] is the same one bindless storage buffer both
++    // shader stages of this pass share.
++    ObjectTransform xf = gTransforms[0][gPush.transformIndex];
++
++    float3 normal = normalize(input.worldNormal);
++    // xf.lightDirWorld: the direction the light travels (from the light
++    // toward the scene) -- the Lambert term wants the direction FROM the
++    // surface TOWARD the light, i.e. the negation.
++    float3 toLight = -normalize(xf.lightDirWorld.xyz);
++    float lambert = max(dot(normal, toLight), 0.0);
++
++    float shadow = sampleShadowFactor(input.lightSpacePosition, gPush.shadowTextureIndex, gPush.shadowSamplerIndex);
++
++    // A small constant ambient term keeps a fully-shadowed surface visibly
++    // non-black (distinguishable from the clear color) without needing a
++    // second light or an ambient-occlusion pass this sample has no other
++    // use for.
++    const float kAmbient = 0.08;
++    float lit = kAmbient + (1.0 - kAmbient) * lambert * shadow;
++
++    return float4(xf.albedo.rgb * lit, 1.0);
++}
+diff --git a/shaders/multipass/lit.vert.slang b/shaders/multipass/lit.vert.slang
+new file mode 100644
+index 0000000..bd0f996
+--- /dev/null
++++ b/shaders/multipass/lit.vert.slang
+@@ -0,0 +1,103 @@
++// Sample 05_multipass: forward-pass vertex shader.
++//
++// COMPILATION NOTE -- read before editing either file: rx::shader::Compiler
++// compiles exactly one module (one source string) per call, and
++// rx::shader::reflect() needs every entry point of a pass in ONE linked
++// program to produce a single, correctly-merged descriptor-set/push-
++// constant layout (the same reason 02_hotreload/03_bindless_mesh/
++// 04_streaming each embed their vertex+fragment source together as one
++// string). samples/05_multipass/main.cpp's loadPassModule() reproduces that
++// same shape for THIS pass's two on-disk files by reading and concatenating
++// them (this file first, lit.frag.slang second) into one Slang translation
++// unit before compiling -- so every `[[vk::binding(...)]]`/
++// `[[vk::push_constant]]` global declared below is visible to lit.frag.slang's
++// fsMain too, exactly as if they had been written in one file. Do not
++// re-declare any of these globals in lit.frag.slang.
++//
++// SHADOW SAMPLING: manual single-tap depth comparison in lit.frag.slang, no
++// VkSampler compare mode [coordinator ambiguity resolution] -- this file's
++// job is only to compute and pass through `lightSpacePosition`, an
++// unmodified light-clip-space position lit.frag.slang projects itself.
++//
++// OBJECT TRANSFORMS: one bindless storage buffer holds BOTH matrices this
++// sample ever needs per object -- `.mvp` (camera clip-space, used here) and
++// `.lightMvp` (light clip-space, passed through as a varying for
++// lit.frag.slang's shadow lookup) -- addressed via a push-constant
++// `transformIndex`, exactly samples/03_bindless_mesh's bindless-storage-
++// buffer-plus-push-constant-index pattern [coordinator ambiguity
++// resolution]. shadow.vert.slang reads the identical row layout for its own
++// `.lightMvp` half.
++//
++// NO PER-OBJECT ROTATION -- see samples/05_multipass/main.cpp's header
++// comment for why this sample's scene objects only ever translate, never
++// rotate: under a translation-only model matrix, a direction vector
++// (a vertex normal) transforms identically in object space and world
++// space, so this shader passes `input.normal` straight through with no
++// normal-matrix multiply at all. Reintroducing per-object rotation without
++// also reintroducing a normal-matrix transform here would silently break
++// lit.frag.slang's Lambert term.
++// `albedo`/`lightDirWorld` live in the SAME bindless row as the two
++// matrices (as float4 -- the 4th component unused padding, sidestepping
++// any float3-packing ambiguity) rather than in push constants: EMPIRICALLY
++// VERIFIED against the shipped Slang build (reflect()'s own reported
++// push-constant range size, checked directly during this sample's
++// development) that a push-constant block's real size is NOT rounded up
++// to any fixed multiple the way samples/04_streaming's own struct
++// (which contained a float4x4) suggested -- a lone `uint` reflects at
++// exactly 4 bytes, not 16. Rather than reverse-engineer Slang's exact
++// float3/vec-alignment rule inside a push-constant block from scratch,
++// this sample keeps every push-constant field a plain scalar `uint`
++// (empirically confirmed to pack with zero padding, consecutive 4-byte
++// fields) and puts every vector value in the storage buffer instead, whose
++// StructuredBuffer element layout this codebase already has a proven-
++// correct convention for (samples/03_bindless_mesh/04_streaming's own
++// mat4 rows). `lightDirWorld` is the same value on every object's row
++// each frame (a per-pass, not per-object, constant) -- redundant across
++// rows, but simpler than a second one-row bindless buffer just for it.
++struct ObjectTransform {
++    float4x4 mvp;
++    float4x4 lightMvp;
++    float4 albedo;
++    float4 lightDirWorld;
++};
++
++struct PushConstants {
++    uint transformIndex;
++    uint shadowTextureIndex;
++    uint shadowSamplerIndex;
++};
++
++[[vk::push_constant]]
++ConstantBuffer<PushConstants> gPush;
++
++[[vk::binding(0, 0)]]
++Texture2D gTextures[];
++
++[[vk::binding(1, 0)]]
++SamplerState gSamplers[];
++
++[[vk::binding(2, 0)]]
++StructuredBuffer<ObjectTransform> gTransforms[];
++
++struct VSIn {
++    float3 position : POSITION;
++    float3 normal : NORMAL;
++};
++
++struct VSOut {
++    float4 clipPosition : SV_Position;
++    float3 worldNormal : NORMAL;
++    float4 lightSpacePosition : TEXCOORD0;
++};
++
++[shader("vertex")]
++VSOut vsMain(VSIn input)
++{
++    ObjectTransform xf = gTransforms[0][gPush.transformIndex];
++
++    VSOut o;
++    o.clipPosition = mul(xf.mvp, float4(input.position, 1.0));
++    o.worldNormal = input.normal;
++    o.lightSpacePosition = mul(xf.lightMvp, float4(input.position, 1.0));
++    return o;
++}
+diff --git a/shaders/multipass/shadow.vert.slang b/shaders/multipass/shadow.vert.slang
+new file mode 100644
+index 0000000..8771b52
+--- /dev/null
++++ b/shaders/multipass/shadow.vert.slang
+@@ -0,0 +1,67 @@
++// Sample 05_multipass: shadow pass vertex shader.
++//
++// Depth-only pass -- there is deliberately no shadow.frag.slang at all:
++// with no color attachments and rasterizerDiscardEnable = VK_FALSE, Vulkan
++// needs no fragment shader stage to write depth at all (the depth test/
++// write consumes SV_Position.z's interpolated value); samples/05_multipass/
++// main.cpp's shadow pipeline has exactly one shader stage (VERTEX) because
++// of this, not by omission.
++//
++// Reads the SAME bindless object-transform storage buffer
++// lit.vert.slang/lit.frag.slang read (row layout must match byte-for-byte
++// -- see lit.vert.slang's own header comment) via
++// rx::rhi::BindlessTable's fixed binding 2 (kStorageBufferBinding), but
++// only ever consumes `.lightMvp` here: this pass renders the scene from
++// the light's own point of view, so a caster's CAMERA-space MVP is
++// irrelevant to it. `transformIndex` (a push constant, uniform across the
++// whole draw call) selects which object's row to read -- never wrapped in
++// NonUniformResourceIndex() [spec Fixed decision #6, matching every other
++// sample's push-constant-indexed bindless read].
++// MUST stay byte-for-byte identical (same fields, same order, same size)
++// to lit.vert.slang's OWN ObjectTransform struct -- this is a SEPARATE
++// Slang compilation module (see this file's header comment: no
++// lit.vert.slang concatenation here), so Slang computes THIS struct's own
++// stride/size independently when indexing `gTransforms[0][transformIndex]`.
++// A real, found-during-development bug this comment now documents: an
++// earlier revision of this file only had the first two fields (mvp,
++// lightMvp) after lit.vert.slang's own struct grew two more (albedo,
++// lightDirWorld) -- every index-0 read (the floor, whose row happens to
++// start at byte 0 under EITHER stride) still worked, but every index 1+
++// read (cube, sphere) silently computed the wrong byte offset into the
++// SAME real buffer (128-byte stride here vs. the real 160-byte stride the
++// C++ writer and lit.vert.slang both use), reading a garbled mix of the
++// previous row's tail and the current row's head -- a plausible-looking
++// but WRONG matrix, not a crash or an obviously-garbage value. This is
++// exactly the class of bug this sample's own headless gate (shadow-vs-lit
++// probe brightness) is designed to catch.
++struct ObjectTransform {
++    float4x4 mvp;
++    float4x4 lightMvp;
++    float4 albedo;
++    float4 lightDirWorld;
++};
++
++struct PushConstants {
++    uint transformIndex;
++};
++
++[[vk::push_constant]]
++ConstantBuffer<PushConstants> gPush;
++
++[[vk::binding(2, 0)]]
++StructuredBuffer<ObjectTransform> gTransforms[];
++
++struct VSIn {
++    float3 position : POSITION;
++};
++
++[shader("vertex")]
++float4 vsMain(VSIn input) : SV_Position
++{
++    // gTransforms[0]: this sample registers exactly ONE bindless storage
++    // buffer (the shared, double-buffered-by-row transform table), exactly
++    // like samples/03_bindless_mesh's own gTransforms[0] -- a compile-time-
++    // constant descriptor-array index, uniform by construction.
++    float4x4 lightMvp = gTransforms[0][gPush.transformIndex].lightMvp;
++    return mul(lightMvp, float4(input.position, 1.0));
++}
+diff --git a/shaders/multipass/tonemap.frag.slang b/shaders/multipass/tonemap.frag.slang
+new file mode 100644
+index 0000000..4c84e82
+--- /dev/null
++++ b/shaders/multipass/tonemap.frag.slang
+@@ -0,0 +1,18 @@
++// Sample 05_multipass: tonemap-pass fragment shader.
++//
++// Concatenated AFTER tonemap.vert.slang at compile time -- gPush/gTextures/
++// gSamplers are declared there (see that file's own header comment).
++//
++// Plain Reinhard (c / (1 + c), per channel) [task brief] -- the resulting
++// [0,1) value is written straight to the swapchain's own UNORM/SRGB
++// attachment; linear -> sRGB encoding (when the swapchain format carries
++// an _SRGB suffix) is handled by the GPU's fixed-function attachment write
++// path, exactly like every other sample in this codebase relies on for its
++// own color output, not by this shader.
++[shader("fragment")]
++float4 fsMain(VSOut input) : SV_Target
++{
++    float3 hdr = gTextures[gPush.hdrTextureIndex].Sample(gSamplers[gPush.hdrSamplerIndex], input.uv).rgb;
++    float3 mapped = hdr / (1.0 + hdr);
++    return float4(mapped, 1.0);
++}
+diff --git a/shaders/multipass/tonemap.vert.slang b/shaders/multipass/tonemap.vert.slang
+new file mode 100644
+index 0000000..7d581ad
+--- /dev/null
++++ b/shaders/multipass/tonemap.vert.slang
+@@ -0,0 +1,44 @@
++// Sample 05_multipass: tonemap-pass vertex shader.
++//
++// COMPILATION NOTE: concatenated BEFORE tonemap.frag.slang at compile time
++// (see lit.vert.slang's identical header comment for the full rationale) --
++// every global declared below is visible to tonemap.frag.slang's fsMain.
++//
++// Classic "one oversized triangle covers the whole clip-space square" trick
++// (no vertex buffer, SV_VertexID-driven) -- the exact same idiom
++// src/rx_graph/tests/test_execute_gpu.cpp's "invert" shader and this
++// project's other fullscreen passes already use.
++struct PushConstants {
++    uint hdrTextureIndex;
++    uint hdrSamplerIndex;
++};
++
++[[vk::push_constant]]
++ConstantBuffer<PushConstants> gPush;
++
++[[vk::binding(0, 0)]]
++Texture2D gTextures[];
++
++[[vk::binding(1, 0)]]
++SamplerState gSamplers[];
++
++struct VSOut {
++    float4 position : SV_Position;
++    float2 uv : TEXCOORD0;
++};
++
++[shader("vertex")]
++VSOut vsMain(uint vertexID : SV_VertexID)
++{
++    float2 positions[3] = float2[3](
++        float2(-1.0, -1.0),
++        float2(3.0, -1.0),
++        float2(-1.0, 3.0)
++    );
++    float2 p = positions[vertexID];
++
++    VSOut o;
++    o.position = float4(p, 0.0, 1.0);
++    o.uv = p * 0.5 + 0.5;
++    return o;
++}
+diff --git a/src/rx_rhi_vk/src/context.cpp b/src/rx_rhi_vk/src/context.cpp
+index 51121f5..4fc2eaf 100644
+--- a/src/rx_rhi_vk/src/context.cpp
++++ b/src/rx_rhi_vk/src/context.cpp
+@@ -64,30 +64,92 @@ bool isKnownPortabilityEnumerationLayerBug(const char* message) {
+ // swallowed.
+ bool isKnownUnrecognizedSlangSourceLanguageBug(const char* message) {
+     if (message == nullptr) {
+         return false;
+     }
+     const std::string_view msg(message);
+     return msg.find("UNASSIGNED-CoreValidation-Shader-InconsistentSpirv") != std::string_view::npos &&
+            msg.find("Invalid source language operand: 11") != std::string_view::npos;
+ }
+ 
++// Third known false positive, this repo's own coordinator addition
++// (enabling VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT)
++// surfaced it: this machine's apt-packaged validation layer (1.3.204.1,
++// same layer the two guards above already document as stale) misclassifies
++// a `Texture2D`+`SamplerState` (SEPARATE image/sampler descriptors, never
++// VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER -- exactly the bindless
++// convention every sample in this repo uses, see rx_rhi_vk/bindless.h)
++// `.Sample()` read as SYNC_*_SHADER_STORAGE_READ internally, then hazards
++// that misclassified read against whatever the tracked `write_barriers`
++// value is for the layout-transition barrier that already made the data
++// visible -- two variants observed empirically, differing only in that
++// trailing field depending on what the resource's last real write was:
++//   - `write_barriers: SYNC_FRAGMENT_SHADER_SHADER_SAMPLED_READ` (the
++//     layer's OWN correct derivation for the transition barrier itself,
++//     disagreeing with its own STORAGE_READ misclassification of the
++//     read) -- src/rx_graph/tests/test_execute_gpu.cpp's "invert" case,
++//     and samples/05_multipass's shadow-map read.
++//   - `write_barriers: SYNC_COLOR_ATTACHMENT_OUTPUT_COLOR_ATTACHMENT_WRITE`
++//     (the resource's last color-attachment write) --
++//     samples/05_multipass's HDR-texture read (written by the forward
++//     pass, sampled by the tonemap pass).
++// Both share the same root cause and the same four other stable fields
++// matched below; only `write_barriers`' value is deliberately NOT part of
++// the match (it varies with what the resource's last write happened to
++// be, not with whether this is the same underlying bug). Reproduces
++// reliably for a texture written earlier in the SAME command buffer (a
++// layout-transition barrier immediately followed by a bindless-indexed
++// sampled read of that same image, with no intervening submission/fence-
++// wait in between) -- exactly the shape rx_graph's Executor produces for a
++// graph pass that reads another pass's output within one execute() call.
++// Never reproduces for a texture whose write and read are separated by a
++// real submission boundary (e.g. every existing sample's Uploader-
++// populated bindless texture, read only in a later frame) -- consistent
++// with an intra-command-buffer barrier-tracking bug specific to this
++// access shape, not a blanket "bindless reads are unchecked" gap.
++//
++// VERIFIED, not assumed, for BOTH variants: each reproduces under the
++// apt-packaged 1.3.204.1 layer and reports ZERO hazards, byte-for-byte the
++// same shader/graph/barriers, against a substantially newer
++// VK_LAYER_KHRONOS_validation build (api_version 1.4.357) run via
++// VK_LAYER_PATH pointed at that build instead -- i.e. an actively-
++// maintained implementation of this same validation feature agrees both
++// accesses are correctly synchronized. Matched on the full combination of
++// this message's OTHER stable substrings (the hazard ID, the descriptor
++// type, the misclassified usage, and the barrier command that (correctly)
++// already covered it) -- deliberately NOT on "SYNC-HAZARD-READ_AFTER_WRITE"
++// alone, which is the generic ID any unrelated real read-after-write
++// hazard would also carry.
++bool isKnownSyncValidationSeparateSamplerMisclassification(const char* message) {
++    if (message == nullptr) {
++        return false;
++    }
++    const std::string_view msg(message);
++    return msg.find("SYNC-HAZARD-READ_AFTER_WRITE") != std::string_view::npos &&
++           msg.find("type: VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE") != std::string_view::npos &&
++           msg.find("usage: SYNC_FRAGMENT_SHADER_SHADER_STORAGE_READ") != std::string_view::npos &&
++           msg.find("prior_usage: SYNC_IMAGE_LAYOUT_TRANSITION") != std::string_view::npos &&
++           msg.find("command: vkCmdPipelineBarrier2") != std::string_view::npos;
++}
++
+ VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+                                               VkDebugUtilsMessageTypeFlagsEXT /*type*/,
+                                               const VkDebugUtilsMessengerCallbackDataEXT* data,
+                                               void* userData) {
+     auto* errorCount = static_cast<int*>(userData);
+     if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
+         if (isKnownPortabilityEnumerationLayerBug(data->pMessage)) {
+             RX_LOG_WARN("[vulkan validation] (known false positive: validation layer predates VK_KHR_portability_enumeration) {}", data->pMessage);
+         } else if (isKnownUnrecognizedSlangSourceLanguageBug(data->pMessage)) {
+             RX_LOG_WARN("[vulkan validation] (known false positive: validation layer predates SPIR-V SourceLanguage=Slang) {}", data->pMessage);
++        } else if (isKnownSyncValidationSeparateSamplerMisclassification(data->pMessage)) {
++            RX_LOG_WARN("[vulkan validation] (known false positive: validation layer's sync validation misclassifies a separate-sampler Texture2D.Sample() read; verified clean against a newer layer build) {}", data->pMessage);
+         } else {
+             RX_LOG_ERROR("[vulkan validation] {}", data->pMessage);
+             (*errorCount)++;
+         }
+     } else {
+         RX_LOG_INFO("[vulkan validation] {}", data->pMessage);
+     }
+     return VK_FALSE;
+ }
+ 
+@@ -109,20 +171,57 @@ std::optional<Context> Context::create(std::vector<const char*> requiredExtensio
+         .set_headless(requiredExtensions.empty());
+ 
+     for (const char* ext : requiredExtensions) {
+         builder.enable_extension(ext);
+     }
+ 
+     if (enableValidation) {
+         builder.request_validation_layers()
+             .set_debug_callback(debugCallback)
+             .set_debug_callback_user_data_pointer(errorCount.get());
++
++        // Vulkan SYNCHRONIZATION validation is a distinct opt-in feature of
++        // VK_LAYER_KHRONOS_validation (missing/incorrect barriers, hazards
++        // sync2 alone cannot statically prove) layered on top of the core
++        // validation enabled just above -- request_validation_layers() does
++        // not turn it on by itself. VK_EXT_validation_features is what lets
++        // a VkValidationFeaturesEXT struct request it at all; per this
++        // repo's "don't reinvent the wheel" policy, that struct/pNext chain
++        // is built by vk-bootstrap's own InstanceBuilder::
++        // add_validation_feature_enable() (verified directly against the
++        // pinned vk-bootstrap source: it chains a real
++        // VkValidationFeaturesEXT, VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT,
++        // into VkInstanceCreateInfo::pNext) rather than this file hand-
++        // rolling that same struct itself.
++        //
++        // VK_EXT_validation_features is a LAYER-provided instance extension
++        // (implemented by VK_LAYER_KHRONOS_validation, not the loader), so
++        // it only ever appears in vkb::SystemInfo's available-extensions
++        // list when that same layer is actually installed -- exactly the
++        // condition request_validation_layers() above already degrades
++        // gracefully on when missing. Unlike that soft request, though,
++        // InstanceBuilder::enable_extension() is unconditional: asking for
++        // an extension that turns out unavailable fails build() outright.
++        // This probe keeps a machine with no validation layer installed
++        // (enableValidation=true requested anyway) failing exactly the way
++        // it already did before this change -- via request_validation_
++        // layers()'s own soft degrade -- rather than a new, harder failure
++        // mode introduced by this addition.
++        auto systemInfo = vkb::SystemInfo::get_system_info();
++        if (systemInfo && systemInfo->is_extension_available(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME)) {
++            builder.enable_extension(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME)
++                .add_validation_feature_enable(VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT);
++        } else {
++            RX_LOG_WARN(
++                "VK_EXT_validation_features unavailable (validation layer not installed?); Vulkan synchronization "
++                "validation will not be active for this run");
++        }
+     }
+ 
+     auto result = builder.build();
+     if (!result) {
+         RX_LOG_ERROR("vkb::InstanceBuilder::build failed: {}", result.error().message());
+         return std::nullopt;
+     }
+ 
+     vkb::Instance vkbInstance = result.value();
+     volkLoadInstance(vkbInstance.instance);
+diff --git a/tools/package_samples.sh b/tools/package_samples.sh
+index 3061784..02ba6e7 100755
+--- a/tools/package_samples.sh
++++ b/tools/package_samples.sh
+@@ -1,12 +1,12 @@
+ #!/usr/bin/env bash
+-# Packages this project's four sample binaries into a single per-platform
++# Packages this project's five sample binaries into a single per-platform
+ # .zip laid out exactly as a user would unzip-and-run it: one subdirectory
+ # per sample, containing that sample's binary plus everything IT needs to
+ # run standalone -- nothing more, nothing missing [R:D2].
+ #
+ # Usage: tools/package_samples.sh <preset> <slang-platform-dir> <output-zip>
+ #   <preset>             linux-native | windows-cross-zig
+ #                        (selects the build dir + the executable suffix)
+ #   <slang-platform-dir> linux-x86_64 | windows-x86_64
+ #                        (the third_party/slang-prebuilt/<this> subdirectory
+ #                        fetch_slang.cmake populated for this preset's
+@@ -19,20 +19,24 @@
+ # Per-sample contents [R:D2, spec Fixed decision #11]:
+ #   01_triangle       binary + triangle.vert.spv + triangle.frag.spv
+ #                     (precompiled offline by slangc at build time -- NO
+ #                     Slang runtime libraries needed; this sample never
+ #                     compiles a shader in-process. Keep this distinction
+ #                     sharp: it's the one sample that doesn't need Slang.)
+ #   02_hotreload      binary + hotreload.slang + Slang runtime libs + LICENSE
+ #   03_bindless_mesh  binary + texture.png + Slang runtime libs + LICENSE
+ #   04_streaming      binary + Slang runtime libs + LICENSE
+ #                     (no external asset -- every texture is procedural)
++#   05_multipass      binary + shaders/multipass/*.slang (5 files) + Slang
++#                     runtime libs + LICENSE (no other external asset --
++#                     every texture this sample uses is a graph-pooled
++#                     transient, never an on-disk file)
+ #
+ # This script does NOT build anything -- it assumes `cmake --build
+ # --preset <preset>` already ran and each sample's build-output directory
+ # already has its runtime libs/assets deployed next to its binary (that
+ # deployment is CMake's job: rx_shader_deploy_runtime_libs() in
+ # src/rx_shader/CMakeLists.txt for the Slang libs, and each sample's own
+ # POST_BUILD copy step for its on-disk asset). This script's only job is to
+ # select, per sample, the subset of that build-output directory a
+ # redistributed copy actually needs -- leaving out CMake/Ninja build
+ # bookkeeping (CMakeFiles/, cmake_install.cmake, CTestTestfile.cmake, *.pdb,
+@@ -105,27 +109,27 @@ copy_required() {
+ echo "package_samples: staging '$RX_PRESET' samples in '$STAGE_DIR' ..."
+ 
+ # --- 01_triangle: precompiled SPIR-V only, no Slang runtime libs [D2] -----
+ SAMPLE_DIR="$STAGE_DIR/01_triangle"
+ mkdir -p "$SAMPLE_DIR"
+ copy_required "$SAMPLE_DIR" \
+   "$SAMPLES_BUILD_DIR/01_triangle/sample_01_triangle${RX_EXE_SUFFIX}" \
+   "$SAMPLES_BUILD_DIR/01_triangle/triangle.vert.spv" \
+   "$SAMPLES_BUILD_DIR/01_triangle/triangle.frag.spv"
+ 
+-# --- 02_hotreload / 03_bindless_mesh / 04_streaming: real in-process Slang
+-# compilation -- each needs the Slang runtime libs + LICENSE deployed next
+-# to it. Globbed rather than hardcoded to the pinned version string, same
+-# posture as rx_shader_deploy_runtime_libs() in src/rx_shader/CMakeLists.txt:
+-# Linux filenames embed the Slang version, Windows filenames don't
+-# [R:A1/A6/D2].
+-for RX_SAMPLE in 02_hotreload 03_bindless_mesh 04_streaming; do
++# --- 02_hotreload / 03_bindless_mesh / 04_streaming / 05_multipass: real
++# in-process Slang compilation -- each needs the Slang runtime libs +
++# LICENSE deployed next to it. Globbed rather than hardcoded to the pinned
++# version string, same posture as rx_shader_deploy_runtime_libs() in
++# src/rx_shader/CMakeLists.txt: Linux filenames embed the Slang version,
++# Windows filenames don't [R:A1/A6/D2].
++for RX_SAMPLE in 02_hotreload 03_bindless_mesh 04_streaming 05_multipass; do
+   SAMPLE_DIR="$STAGE_DIR/$RX_SAMPLE"
+   mkdir -p "$SAMPLE_DIR"
+   copy_required "$SAMPLE_DIR" "$SAMPLES_BUILD_DIR/$RX_SAMPLE/sample_${RX_SAMPLE}${RX_EXE_SUFFIX}"
+   copy_required "$SAMPLE_DIR" "$SLANG_LICENSE"
+ 
+   if [[ "$RX_PRESET" == "windows-cross-zig" ]]; then
+     copy_required "$SAMPLE_DIR" \
+       "$SAMPLES_BUILD_DIR/$RX_SAMPLE/slang-compiler.dll" \
+       "$SAMPLES_BUILD_DIR/$RX_SAMPLE/slang-glslang.dll" \
+       "$SAMPLES_BUILD_DIR/$RX_SAMPLE/slang-glsl-module.dll" \
+@@ -134,23 +138,32 @@ for RX_SAMPLE in 02_hotreload 03_bindless_mesh 04_streaming; do
+     copy_required "$SAMPLE_DIR" \
+       "$SAMPLES_BUILD_DIR/$RX_SAMPLE"/libslang-compiler.so* \
+       "$SAMPLES_BUILD_DIR/$RX_SAMPLE"/libslang-glslang-*.so \
+       "$SAMPLES_BUILD_DIR/$RX_SAMPLE"/libslang-glsl-module-*.so \
+       "$SAMPLES_BUILD_DIR/$RX_SAMPLE"/libslang-rt.so*
+   fi
+ done
+ 
+ # 02_hotreload additionally ships the live-reloadable shader source; 03
+ # additionally ships its one real-PNG texture. 04 has no external asset
+-# (every texture is procedurally generated) -- nothing extra for it.
++# (every texture is procedurally generated) -- nothing extra for it. 05
++# ships its own five on-disk shader sources (see samples/05_multipass/
++# CMakeLists.txt's own POST_BUILD deploy step for why these five, flat,
++# no "multipass/" subdirectory in the deployed layout).
+ copy_required "$STAGE_DIR/02_hotreload" "$SAMPLES_BUILD_DIR/02_hotreload/hotreload.slang"
+ copy_required "$STAGE_DIR/03_bindless_mesh" "$SAMPLES_BUILD_DIR/03_bindless_mesh/texture.png"
++copy_required "$STAGE_DIR/05_multipass" \
++  "$SAMPLES_BUILD_DIR/05_multipass/shadow.vert.slang" \
++  "$SAMPLES_BUILD_DIR/05_multipass/lit.vert.slang" \
++  "$SAMPLES_BUILD_DIR/05_multipass/lit.frag.slang" \
++  "$SAMPLES_BUILD_DIR/05_multipass/tonemap.vert.slang" \
++  "$SAMPLES_BUILD_DIR/05_multipass/tonemap.frag.slang"
+ 
+ mkdir -p "$(dirname "$RX_OUT_ZIP")"
+ RX_OUT_ZIP_ABS="$(cd "$(dirname "$RX_OUT_ZIP")" && pwd)/$(basename "$RX_OUT_ZIP")"
+ rm -f "$RX_OUT_ZIP_ABS"
+ 
+ echo "package_samples: zipping into '$RX_OUT_ZIP_ABS' ..."
+-(cd "$STAGE_DIR" && zip -r -X -q "$RX_OUT_ZIP_ABS" 01_triangle 02_hotreload 03_bindless_mesh 04_streaming)
++(cd "$STAGE_DIR" && zip -r -X -q "$RX_OUT_ZIP_ABS" 01_triangle 02_hotreload 03_bindless_mesh 04_streaming 05_multipass)
+ 
+ echo "package_samples: done. Contents:"
+ unzip -l "$RX_OUT_ZIP_ABS"

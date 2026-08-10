@@ -1,0 +1,328 @@
+# Review package: df7125e..47135af
+
+## Commits
+47135af docs: phase 3 documentation and dep-cache key hardening
+0ae2154 docs: fix seed-notes item ordering
+a34f5c8 docs: carry material texture-sampling wiring as first phase 4 material task
+
+## Files changed
+ README.md                                          |  13 ++-
+ cmake/DepCache.cmake                               |  15 ++-
+ docs/abi.md                                        | 101 +++++++++++++++++++++
+ .../2026-08-09-toolchain-platform-rhi-design.md    |   4 +-
+ .../specs/2026-08-10-phase4-seed-notes.md          |   7 ++
+ .../include/rx_material/material_system.h          |  13 +--
+ 6 files changed, 137 insertions(+), 16 deletions(-)
+
+## Diff
+diff --git a/README.md b/README.md
+index 879b79f..43dcdb3 100644
+--- a/README.md
++++ b/README.md
+@@ -1,13 +1,13 @@
+ # RendererX
+ 
+-A from-scratch Vulkan 1.3 renderer for custom game engines. RendererX establishes a baseline of dynamic rendering and synchronization2 support, targets Steam Deck as the hardware floor, and cross-compiles from Linux to Windows via a vendored zig toolchain. Shaders are authored in Slang. Phase 2 status: Phase 1's foundation layers plus runtime Slang compilation and reflection, bindless resource management, and four samples (triangle, shader hot-reload, bindless mesh, texture streaming) are complete.
++A from-scratch Vulkan 1.3 renderer for custom game engines. RendererX establishes a baseline of dynamic rendering and synchronization2 support, targets Steam Deck as the hardware floor, and cross-compiles from Linux to Windows via a vendored zig toolchain. Shaders are authored in Slang. Phase 3 status: Phase 1's foundation layers, Phase 2's runtime Slang compilation and reflection, bindless resource management, render graph, material system, and six samples (triangle, shader hot-reload, bindless mesh, texture streaming, multipass rendering, materials) are complete.
+ 
+ [![CI](https://github.com/ywadi/renderer_x/actions/workflows/ci.yml/badge.svg)](https://github.com/ywadi/renderer_x/actions/workflows/ci.yml)
+ 
+ ## Requirements
+ 
+ - **Linux host** (for building, including cross-compilation to Windows)
+ - **CMake** 3.21 or later
+ - **Ninja** (build generator)
+ - **Vulkan 1.3 driver** (on the machine running compiled binaries)
+ - **zig** 0.16.0 (vendored per-project at `toolchain/zig/zig`, installed via the one-time setup below — not required in PATH; the CMake toolchain locates it automatically)
+@@ -60,35 +60,42 @@ The resulting Windows executable is statically linked — copy only `build/windo
+ 
+ For detailed build and run instructions per platform, including Steam Deck and manual verification checklist, see [`samples/README.md`](samples/README.md).
+ 
+ ## Project Layout
+ 
+ - **cmake/** — Build system configuration, toolchain files (linux-native, windows-cross-zig), dependency caching
+ - **src/rx_core/** — Foundation library: math (GLM), logging (spdlog), memory, containers, handles
+ - **src/rx_platform/** — Platform abstraction: window (SDL3), input, events, threads
+ - **src/rx_rhi_vk/** — Vulkan 1.3 RHI: device/queue/swapchain, command buffers, pipelines, synchronization
+ - **src/rx_shader/** — Runtime Slang-to-SPIR-V compilation and shader reflection (descriptor/push-constant layout)
+-- **shaders/** — Shader source files (Slang)
++- **src/rx_graph/** — Render graph: declarative passes, automatic barrier derivation, transient pooling, dynamic rendering execution
++- **src/rx_material/** — Material system: Slang-module materials, pipeline caching, COM-lite public API, material hot-reload
++- **shaders/multipass/** — Shader sources for 05_multipass sample (Slang)
++- **shaders/material/** — Shared material-system shaders (Slang)
+ - **samples/01_triangle/** — Hardcoded white triangle via dynamic rendering, headless and present modes
+ - **samples/02_hotreload/** — Fullscreen triangle with a runtime-compiled (Slang, not offline slangc) fragment shader and a reflection-driven pipeline layout; live shader hot-reload in present mode
+ - **samples/03_bindless_mesh/** — Procedural meshes and textures driven entirely through one bindless descriptor table and a reflection-derived pipeline layout
+ - **samples/04_streaming/** — Texture streaming into a fixed bindless residency budget, exercising deferred eviction/re-registration safety while frames are in flight
++- **samples/05_multipass/** — Multipass render graph (shadow map, forward shading, tonemap) demonstrating declarative passes and automatic barrier derivation
++- **samples/06_materials/** — Material-system showcase using the public COM-lite API with hot-reload support and parameter overrides
+ - **tools/** — Utilities: dependency cache, Slang prebuilt fetch, build-budget checker
+ - **third_party/** — Vendored dependencies (volk, vk-bootstrap, VMA, SDL3, GLM, spdlog)
+ 
+ ## Roadmap
+ 
+ **Phase 1 (complete):** Toolchain, platform abstraction, core library, RHI foundation, first triangle sample with both headless and present-mode rendering.
+ 
+ **Phase 2 (complete):** Runtime Slang compilation and shader reflection (`src/rx_shader/`); bindless descriptor management (`rx::rhi::BindlessTable`); reflection-driven pipeline layouts; three new samples (02_hotreload, 03_bindless_mesh, 04_streaming) plus expanded test coverage; CI + packaging for all four samples.
+ 
+-**Phase 3 (in progress) and beyond:** Render graph (declarative passes, automatic barriers); material system (IMaterial, IShaderModule, ITexture, IMesh); asset pipeline (mesh/texture import); scene submission (cameras, lights, culling); rendering techniques (shadows, post-processing, upscaling); tooling (GPU markers, profiling, validation). See [`docs/superpowers/specs/`](docs/superpowers/specs/) for design documents.
++**Phase 3 (complete):** Render graph (`src/rx_graph/`, declarative passes, derived sync2 barriers, transient pooling, dynamic rendering); material system (`src/rx_material/`, Slang-module materials, lazy pipeline cache, COM-lite public API, hot reload); two new samples (05_multipass, 06_materials) with corresponding shader directories (`shaders/multipass/`, `shaders/material/`); expanded test coverage; CI + packaging for all six samples.
++
++**Phase 4 and beyond:** Asset pipeline (mesh/texture import); scene submission (cameras, lights, culling); rendering techniques (shadows, post-processing, upscaling); tooling (GPU markers, profiling, validation). See [`docs/superpowers/specs/`](docs/superpowers/specs/) for design documents.
+ 
+ ## Testing
+ 
+ Run the full test suite (including headless triangle correctness gate):
+ 
+ ```sh
+ ctest --preset linux-native --output-on-failure
+ ```
+ 
+ The suite includes unit tests for rx_core, rx_platform, rx_rhi_vk, shader compilation, and the headless triangle sample. Interactive `--present` mode is tested manually; see [`MANUAL_VERIFICATION.md`](MANUAL_VERIFICATION.md).
+diff --git a/cmake/DepCache.cmake b/cmake/DepCache.cmake
+index 76be311..9fd6807 100644
+--- a/cmake/DepCache.cmake
++++ b/cmake/DepCache.cmake
+@@ -1,30 +1,35 @@
+ # Builds a CMake-based dependency exactly once per (name, pin, target
+-# triple, zig version) and reuses the cached install on every later
+-# configure. A cache hit costs zero compilation.
++# triple, zig version, CMAKE_ARGS) and reuses the cached install on every
++# later configure. A cache hit costs zero compilation.
++#
++# Cache key format: SHA256(name|tag|triple|zig-version|CMAKE_ARGS joined)
++# truncated to 16 hex chars, then prefixed with name: "name-<hash>".
++# Changing CMAKE_ARGS invalidates the key and forces a rebuild.
+ 
+-function(rx_dep_cache_key OUT_VAR NAME TAG)
++function(rx_dep_cache_key OUT_VAR NAME TAG CMAKE_ARGS_LIST)
+   execute_process(
+     COMMAND "${CMAKE_SOURCE_DIR}/toolchain/zig/zig" version
+     OUTPUT_VARIABLE _zig_version
+     OUTPUT_STRIP_TRAILING_WHITESPACE)
+-  string(SHA256 _hash "${NAME}|${TAG}|${RX_TARGET_TRIPLE}|${_zig_version}")
++  string(JOIN "|" _cmake_args_str ${CMAKE_ARGS_LIST})
++  string(SHA256 _hash "${NAME}|${TAG}|${RX_TARGET_TRIPLE}|${_zig_version}|${_cmake_args_str}")
+   string(SUBSTRING "${_hash}" 0 16 _hash)
+   set(${OUT_VAR} "${NAME}-${_hash}" PARENT_SCOPE)
+ endfunction()
+ 
+ function(rx_add_cached_dependency)
+   set(oneValueArgs NAME REPO TAG)
+   set(multiValueArgs CMAKE_ARGS)
+   cmake_parse_arguments(DEP "" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+ 
+-  rx_dep_cache_key(_key ${DEP_NAME} ${DEP_TAG})
++  rx_dep_cache_key(_key ${DEP_NAME} ${DEP_TAG} "${DEP_CMAKE_ARGS}")
+   set(_cache_dir "${CMAKE_SOURCE_DIR}/.deps-cache/${_key}")
+   set(_marker "${_cache_dir}/.rx-built")
+ 
+   if(NOT EXISTS "${_marker}")
+     message(STATUS "[dep-cache] MISS for ${DEP_NAME} (key=${_key}) - building once")
+ 
+     set(_src_dir "${CMAKE_BINARY_DIR}/_deps-src/${DEP_NAME}")
+     if(NOT EXISTS "${_src_dir}/.git")
+       execute_process(COMMAND git clone --quiet "${DEP_REPO}" "${_src_dir}" RESULT_VARIABLE _rv)
+       if(NOT _rv EQUAL 0)
+diff --git a/docs/abi.md b/docs/abi.md
+new file mode 100644
+index 0000000..ab08376
+--- /dev/null
++++ b/docs/abi.md
+@@ -0,0 +1,101 @@
++# RendererX Public ABI Boundary Rules
++
++The RendererX DLL's public interface follows a COM-lite pattern for ABI stability
++and cross-compiler compatibility. This document establishes the rules for future
++interface additions.
++
++## Pattern Summary
++
++Every interface in the public ABI (defined in `rx_api.h`) adheres to these structural
++constraints, derived from research into COM, Slang's ISlangUnknown, and precedents
++like Diligent Engine:
++
++1. **100% pure virtual, single inheritance**: Every interface inherits only from
++   `IRxUnknown`, the three-method root (queryInterface/addRef/release). No data
++   members, no overloads, no virtual destructors — release() replaces the destructor.
++
++2. **Explicit GUID per interface version**: Every interface carries a unique,
++   immutable GUID (128-bit identifier). queryInterface() is the only casting
++   mechanism; dynamic_cast and typeid are forbidden.
++
++3. **No exceptions, no RTTI**: Internal C++ exceptions are caught at the boundary
++   and mapped to RxResult error codes. Callers never see std::exception or
++   type_info.
++
++4. **No STL, no Vulkan/Slang types**: Signatures use only fixed-width POD types
++   (uint32_t, void*) and custom structs. All POD structs crossing the boundary
++   are pinned via static_assert for size/alignment.
++
++5. **Renderer-side allocation only**: Callers receive references to renderer-owned
++   objects through factory methods and addRef/release pairs. A caller never calls
++   delete or free on anything from the DLL.
++
++## Boundary Rules
++
++### Reference Counting
++
++- Every object returned from a factory method arrives with refcount = 1.
++- The caller owns that reference and must eventually call release().
++- Calling addRef/release follows standard COM discipline.
++
++### Parameter Blocks (POD Structs)
++
++- Every struct crossing the boundary must be declared with static_assert checks:
++  ```cpp
++  struct MyParams { /* fixed-width fields only */ };
++  static_assert(sizeof(MyParams) == expectedBytes, "...reason...");
++  static_assert(alignof(MyParams) == expectedAlign, "...reason...");
++  ```
++- No implicit padding. All fields must be explicitly laid out.
++- All integer types must be fixed-width (int32_t, uint64_t, etc.), never int or
++  size_t.
++
++### Error Handling
++
++- Methods return RxResult (int32_t): RX_OK, RX_E_FAIL, RX_E_INVALIDARG,
++  RX_E_NOTFOUND, RX_E_COMPILE, RX_E_NOINTERFACE.
++- Never throw across the boundary.
++- Diagnostic text (compilation errors, etc.) is logged internally via spdlog,
++  not carried as a string parameter.
++
++## Why This Shape
++
++The DLL is built by zig's cross-compiler (zig cc, targeting Windows-GNU ABI) but
++consumed by MSVC clients (D5, §1.3). Three incompatibilities would break a naive C++
++ABI without explicit rules:
++
++1. **Name mangling**: MSVC and GCC mangle virtual method names differently. COM-lite
++   avoids this by using only C-visible symbols (plain virtual functions with
++   stable GUID-based queries instead of C++ RTTI).
++
++2. **Exception handling**: MSVC's SEH and GCC's DWARF unwinding are incompatible.
++   Stopping exceptions at the boundary (catch and return RxResult) eliminates the
++   problem.
++
++3. **Layout assumptions**: std::string, std::vector, and other STL types have
++   ABI-dependent layouts (pointer size, allocator strategy, etc.). Using only POD
++   and static_assert-pinned structs makes layout portable.
++
++The COM-lite approach is proven across many cross-compiler boundaries: Windows
++COM itself (still the standard after 30+ years), Slang (which RendererX already
++links), and Diligent Engine. Reference rx_api.h for the canonical example.
++
++## Pre-Release Interface Evolution
++
++**Before the first SDK release (v1.0)**, GUIDs and method signatures can change
++freely:
++
++- Add new methods to an interface by appending them (no renumbering vtable indices).
++- Create a new interface version (GUIDv2) if you need to remove or reorder methods
++  from an existing interface.
++- Existing interfaces that ship in a Phase can keep being iterated up until release.
++
++**After the first SDK release**, interface GUIDs become immutable:
++
++- Create a new versioned interface (IRxMaterialV2) rather than modifying the
++  original IRxMaterial.
++- Old interfaces stay in the header forever — clients may still link against them.
++- Bump the major version number when introducing breaking interface changes.
++
++This project is currently pre-v1.0 (Phase 3 in development). Interface stability
++is a concern only after the first public release.
+diff --git a/docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md b/docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md
+index cfae20c..af9e86c 100644
+--- a/docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md
++++ b/docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md
+@@ -22,22 +22,22 @@ single DLL. Fixed constraints for the whole project:
+ The full system decomposes into these layers, bottom to top:
+ 
+ | # | Layer | Responsibility |
+ |---|-------|-----------------|
+ | 0 | Toolchain / Cross-Build | Compile from any host to any target |
+ | 1 | Platform Abstraction | Window, input, events, threads, file paths |
+ | 2 | Foundation / Core | Math, logging, memory, containers, job system |
+ | 3 | RHI — Vulkan Backend | Device/queue/swapchain, command buffers, pipelines, sync |
+ | 4 | Shader Compilation & Reflection | Slang → SPIR-V, reflection-driven layouts |
+ | 5 | Resource Management | Buffer/texture lifetime, staging, bindless tables |
+-| 6 | Render Graph | Declarative passes/resources, auto barriers, transient aliasing |
+-| 7 | Material / Shading Abstraction | `IMaterial`, `IShaderModule`, `ITexture`, `IMesh` |
++| 6 | Render Graph | Declarative passes/resources, auto barriers, transient aliasing (delivered: Phase 3) |
++| 7 | Material / Shading Abstraction | `IMaterial`, `IShaderModule`, `ITexture`, `IMesh` (delivered: Phase 3) |
+ | 8 | Scene Submission | Render items, transforms, cameras, lights; culling/LOD |
+ | 9 | Rendering Techniques | Shadows, lighting, post stack, upscaling |
+ | 10 | Asset Import (offline) | Mesh/texture import & baking tooling |
+ | 11 | Public SDK / DLL Surface | The interface game devs link against |
+ | 12 | Tools / Debug / Profiling | Validation, GPU markers, profiling |
+ 
+ This spec covers only layers 0–3. Each remaining layer gets its own spec later.
+ 
+ Two constraints were explicitly relaxed for now and should be revisited if
+ they become a problem: the C++ ABI-stability question for the DLL boundary
+diff --git a/docs/superpowers/specs/2026-08-10-phase4-seed-notes.md b/docs/superpowers/specs/2026-08-10-phase4-seed-notes.md
+index 7b0f6fd..f79dc06 100644
+--- a/docs/superpowers/specs/2026-08-10-phase4-seed-notes.md
++++ b/docs/superpowers/specs/2026-08-10-phase4-seed-notes.md
+@@ -99,16 +99,23 @@ and visible culling statistics.
+    phase exit criterion from Phase 4 onward**: each phase publishes
+    benchmark numbers (desktop + Steam Deck) for its stress/exit samples,
+    and CI carries regression gates on those numbers alongside the
+    correctness gates. (c) **Scene submission is designed around
+    instancing/batching and a global geometry buffer** (single pooled
+    vertex/index storage, per-mesh offsets — the layout GPU-driven
+    drawing requires) from day one; per-object buffer binding is not the
+    design. The Phase 4 spec must carry a dedicated "performance posture"
+    section addressing all of the above explicitly.
+ 
++10. **First task of Phase 4's material work (carried from Phase 3 Task 8
++    review):** wire bindless texture sampling into the material shader
++    interface — `material.slang`/`forward_entry.slang` declarations +
++    `reflectMaterialLayout()`'s allow-list + a GPU test where a
++    `createTexture2D`-created texture visibly changes a rendered pixel.
++    Bounded task, precedes/accompanies StandardPBR (which requires it).
++
+ ## Carried process notes
+ 
+ - Research pass before spec (library selection for glTF/KTX2 with
+   citations), spec + plan authored by the coordinator, SDD execution with
+   per-task review, exit via deployed samples + tagged release — same cycle
+   as Phases 1-3.
+diff --git a/src/rx_material/include/rx_material/material_system.h b/src/rx_material/include/rx_material/material_system.h
+index 62fed20..92facde 100644
+--- a/src/rx_material/include/rx_material/material_system.h
++++ b/src/rx_material/include/rx_material/material_system.h
+@@ -247,26 +247,27 @@ public:
+     // of caller error.
+     [[nodiscard]] uint64_t moduleHash(MaterialHandle handle) const;
+ 
+     // Lazily compiles (builds a real VkPipeline from `req.material`'s
+     // already-linked SPIR-V; never re-invokes Slang -- see
+     // detail::debugCompileCount()'s own comment) and caches one
+     // `VkPipeline` per unique (material content hash, pass signature hash,
+     // specializationBits) key [D7]; a repeated call with an
+     // already-cached key returns the same handle immediately. Every
+     // VkPipeline this creates uses fixed rasterization/multisample/
+-    // blend/depth-stencil state (opaque, no culling, depth test+write
+-    // enabled iff `req.pass.depthFormat != VK_FORMAT_UNDEFINED`) and the
+-    // fixed position/normal/uv vertex-input layout
+-    // forward_entry.slang's own header comment documents -- there are no
+-    // other fixed-function axes for a Phase 3 material pipeline to vary
+-    // on, so none of that state is itself part of the cache key.
++    // blend/depth-stencil state (opaque, back-face culling with
++    // counter-clockwise front-face, depth test+write enabled iff
++    // `req.pass.depthFormat != VK_FORMAT_UNDEFINED`) and the fixed
++    // position/normal/uv vertex-input layout forward_entry.slang's own
++    // header comment documents -- there are no other fixed-function axes
++    // for a Phase 3 material pipeline to vary on, so none of that state is
++    // itself part of the cache key.
+     //
+     // Throws std::out_of_range for an invalid/unknown `req.material`.
+     // Throws std::runtime_error if `req.pass` declares neither a color nor
+     // a depth attachment (colorCount == 0 && depthFormat ==
+     // VK_FORMAT_UNDEFINED) -- there is no Phase 3 use case for a graphics
+     // pipeline with no attachment output at all [Task 5 ambiguity
+     // resolution], or if the underlying vkCreateGraphicsPipelines call
+     // fails.
+     VkPipeline getPipeline(const PipelineRequest& req);
+ 

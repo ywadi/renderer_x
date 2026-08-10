@@ -1,0 +1,329 @@
+# Review package: 16ccad4..089af68
+
+## Commits
+089af68 fix: detect render graph pass dependency cycles and split texture-input stage by pass kind
+
+## Files changed
+ src/rx_graph/include/rx_graph/render_graph.h |   9 ++-
+ src/rx_graph/render_graph.cpp                | 101 +++++++++++++++++++++++++--
+ src/rx_graph/tests/test_compile.cpp          |  59 ++++++++++++++++
+ 3 files changed, 160 insertions(+), 9 deletions(-)
+
+## Diff
+diff --git a/src/rx_graph/include/rx_graph/render_graph.h b/src/rx_graph/include/rx_graph/render_graph.h
+index 9882dd2..75cf872 100644
+--- a/src/rx_graph/include/rx_graph/render_graph.h
++++ b/src/rx_graph/include/rx_graph/render_graph.h
+@@ -23,23 +23,26 @@ struct CompileInfo {
+ };
+ 
+ // The device-free result of RenderGraph::compile(): which declared passes
+ // survive culling and in what order, every physical resource compile()
+ // resolved, and each surviving pass's resolved resource accesses. Task 2
+ // adds per-order-position barrier lists (passBarriers()); this task's
+ // CompiledGraph carries exactly the culling/ordering/lifetime data the
+ // Task 1 brief specifies.
+ //
+ // Only RenderGraph::compile() ever populates one of these -- there is no
+-// public constructor beyond the implicit default (an unpopulated
+-// CompiledGraph, e.g. before the owning RenderGraph's first compile()
+-// call, simply reports empty spans and treats every pass index as absent).
++// public constructor beyond the implicit default. Before the owning
++// RenderGraph's first compile() call (or after reset()), an unpopulated
++// CompiledGraph reports empty spans from executionOrder()/resources(), but
++// isCulled()/passAccesses() throw std::out_of_range for any `passIndex` at
++// all -- there is no pass count yet to be in range of. See those two
++// methods' own comments for the exact per-method contract.
+ class CompiledGraph {
+ public:
+     // Raw pass indices (RenderGraph::addPass() call order, 0-based), in
+     // submission order. Excludes every culled pass.
+     [[nodiscard]] std::span<const uint32_t> executionOrder() const { return executionOrder_; }
+ 
+     // `passIndex` is the raw declaration index (addPass() call order),
+     // the same indexing isCulled()/passAccesses() and executionOrder()'s
+     // *values* (not positions) share -- not a position within
+     // executionOrder(). Out-of-range throws std::out_of_range.
+diff --git a/src/rx_graph/render_graph.cpp b/src/rx_graph/render_graph.cpp
+index 99c1529..e7074f1 100644
+--- a/src/rx_graph/render_graph.cpp
++++ b/src/rx_graph/render_graph.cpp
+@@ -1,15 +1,17 @@
+ #include <rx_graph/render_graph.h>
+ 
+ #include <rx_core/log.h>
+ 
++#include <algorithm>
+ #include <deque>
++#include <functional>
+ #include <set>
+ #include <stdexcept>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <utility>
+ 
+ // Front-half compile algorithm (Task 1 brief; re-implemented against this
+ // project's own types, not ported from Granite's traverse_dependencies/
+ // depend_passes_recursive [render_graph.cpp] -- see the Phase 3 design doc,
+ // decision D1, for why this is a from-scratch reimplementation guided by
+@@ -23,21 +25,27 @@
+ //      from the *whole* declaration set first, so a reader may be declared
+ //      before or after its writer; only the writer *list itself* is
+ //      ordered by declaration index (Impl::resolveReadEdges). This is also
+ //      where "reading a resource nobody wrote" is caught.
+ //   3. Cull: reachability from the backbuffer resource's final writer plus
+ //      every side-effect pass, walking the producer edges built in steps
+ //      1-2 backward (Impl::cull), then a stable topological sort
+ //      (Kahn's algorithm, ties broken by ascending declaration index --
+ //      the Task 1 brief asks for "no reordering heuristics", so this is
+ //      the simplest sort that still yields a deterministic order among
+-//      independent passes) (Impl::order).
++//      independent passes) (Impl::order). If Kahn's algorithm cannot
++//      emit every reachable pass (fix round 1: a circular dependency --
++//      trivially constructible since a reader may legally be declared
++//      before its writer, step 2's whole point -- otherwise compiled to a
++//      silently empty/degenerate graph with no diagnostic), a DFS over
++//      the same producer edges finds one concrete cycle and compile()
++//      throws, naming its passes.
+ //   4. Rescan only the surviving passes, in that execution order, to
+ //      resolve every PhysicalResource (name -> merged desc/imageUsage,
+ //      first/last use as *positions* in the execution order) and every
+ //      surviving pass's resolved ResourceAccess list (Impl::resolveResources).
+ namespace rx::graph {
+ 
+ struct RenderGraph::Impl {
+     std::deque<Pass> passes;  // stable references: addPass() hands out Pass&
+     std::string backbufferName;
+     bool hasBackbuffer = false;
+@@ -69,25 +77,31 @@ ResourceAccess Pass::resolveAccess(const Declaration& decl, uint32_t physicalInd
+             access.access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+             access.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+             break;
+         case AccessKind::DepthStencilOutput:
+             access.stages = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+             access.access =
+                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+             access.layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+             break;
+         case AccessKind::TextureInput:
+-            // Always FRAGMENT_SHADER, even for a Compute-class pass -- the
+-            // Task 1 brief's table gives texture-input access one fixed
+-            // stage, unlike the storage-buffer rows below (which do split
+-            // on pass kind).
+-            access.stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
++            // Fix round 1, mapping extension: the Task 1 brief's own table
++            // gives texture-input access one fixed FRAGMENT_SHADER stage
++            // with no Compute-class row (unlike the storage-buffer rows
++            // below, which do split on pass kind) -- a real gap the Task 1
++            // review flagged, since compute shaders can legally sample a
++            // texture (OpImageSample) too. Coordinator ruling: extend the
++            // same Compute-class/Graphics-class split already applied to
++            // storage buffers to this case as well; access/layout are
++            // identical either way, only the stage changes.
++            access.stages =
++                computeClass ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+             access.access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+             access.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+             break;
+         case AccessKind::StorageBufferOutput:
+             access.stages = computeClass ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                                           : (VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+             access.access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+             access.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+             break;
+         case AccessKind::StorageBufferInput:
+@@ -215,24 +229,26 @@ void RenderGraph::compile(const CompileInfo& info) {
+                                   "' is never written by any pass");
+     }
+     const uint32_t backbufferWriterPass = backbufferWriters->second.back();
+ 
+     // ---- step 3a: cull -- reachability from the roots -------------------
+     // Roots: the backbuffer's final writer, plus every side-effect pass
+     // [Task 1 brief, compile algorithm step 2]. Walking dependsOn edges
+     // backward from a root marks every pass it (transitively) depends on
+     // as reachable; anything never reached is culled.
+     std::vector<bool> reachable(passCount, false);
++    uint32_t reachableCount = 0;
+     std::vector<uint32_t> stack;
+     auto markReachable = [&](uint32_t p) {
+         if (!reachable[p]) {
+             reachable[p] = true;
++            ++reachableCount;
+             stack.push_back(p);
+         }
+     };
+     markReachable(backbufferWriterPass);
+     for (uint32_t p = 0; p < passCount; ++p) {
+         if (g.passes[p].sideEffect_) {
+             markReachable(p);
+         }
+     }
+     while (!stack.empty()) {
+@@ -277,20 +293,93 @@ void RenderGraph::compile(const CompileInfo& info) {
+         uint32_t p = *ready.begin();
+         ready.erase(ready.begin());
+         executionOrder.push_back(p);
+         for (uint32_t successor : successors[p]) {
+             if (--indegree[successor] == 0) {
+                 ready.insert(successor);
+             }
+         }
+     }
+ 
++    // ---- step 3c: cycle detection (fix round 1) --------------------------
++    // Kahn's algorithm above emits a reachable pass exactly when every one
++    // of its dependencies has already been emitted; over an acyclic
++    // reachable subgraph that invariant guarantees every reachable pass
++    // eventually gets emitted. If it didn't -- fewer entries in
++    // executionOrder than reachable passes -- some reachable passes are
++    // stuck behind an unresolved dependency cycle. Without this check,
++    // compile() previously fell straight through to step 4 with a
++    // silently truncated (possibly empty) executionOrder and no
++    // diagnostic anywhere -- exactly the "typo swaps which resource two
++    // passes read/write" landmine flagged in the Task 1 review.
++    //
++    // A cycle can only involve reachable passes (dependsOn[p] for any
++    // reachable p contains only reachable producers -- see the DFS
++    // reachability walk above), so a plain DFS with a recursion-stack
++    // marker restricted to the reachable subgraph, starting from any
++    // unvisited reachable pass, is guaranteed to walk into one: when it
++    // follows a producer edge back to a pass still on its own recursion
++    // stack, that stack's suffix from the revisited pass onward *is* a
++    // concrete cycle -- named in the exception, not just "some pass never
++    // ran" (which could equally be a pass merely downstream of the cycle,
++    // not a member of it).
++    if (executionOrder.size() != reachableCount) {
++        std::vector<uint8_t> visitState(passCount, 0);  // 0 = unvisited, 1 = on the current DFS path, 2 = done
++        std::vector<uint32_t> path;
++        uint32_t cycleStart = passCount;  // sentinel; set once a back-edge is found
++
++        std::function<bool(uint32_t)> visit = [&](uint32_t p) -> bool {
++            visitState[p] = 1;
++            path.push_back(p);
++            for (uint32_t producer : dependsOn[p]) {
++                if (visitState[producer] == 1) {
++                    cycleStart = producer;
++                    return true;
++                }
++                if (visitState[producer] == 0 && visit(producer)) {
++                    return true;
++                }
++            }
++            visitState[p] = 2;
++            path.pop_back();
++            return false;
++        };
++
++        for (uint32_t p = 0; p < passCount && cycleStart == passCount; ++p) {
++            if (reachable[p] && visitState[p] == 0) {
++                visit(p);
++            }
++        }
++
++        // cycleStart == passCount would mean the size mismatch above was
++        // not actually caused by a cycle -- structurally impossible given
++        // Kahn's algorithm's invariant, but if it ever happened this
++        // falls through to a generic message rather than indexing
++        // `path` with the sentinel.
++        std::string cycleDescription;
++        if (cycleStart != passCount) {
++            auto cycleBegin = std::find(path.begin(), path.end(), cycleStart);
++            for (auto it = cycleBegin; it != path.end(); ++it) {
++                if (!cycleDescription.empty()) {
++                    cycleDescription += " -> ";
++                }
++                cycleDescription += "'" + g.passes[*it].name_ + "'";
++            }
++            cycleDescription += " -> '" + g.passes[cycleStart].name_ + "'";
++        } else {
++            cycleDescription = "(unable to isolate a specific cycle -- this should not happen)";
++        }
++
++        RX_LOG_ERROR("rx_graph: dependency cycle detected among passes: {}", cycleDescription);
++        throw std::runtime_error("rx_graph: dependency cycle detected among passes: " + cycleDescription);
++    }
++
+     // ---- step 4: resolve physical resources + per-pass accesses --------
+     // Rescans only the survivors, in execution order, so a resource
+     // touched exclusively by culled passes never gets a PhysicalResource
+     // entry at all (culling test: "x" disappears entirely when its only
+     // writer, A, is culled).
+     CompiledGraph compiled;
+     compiled.executionOrder_ = executionOrder;
+     compiled.culled_.assign(passCount, true);
+     for (uint32_t p : executionOrder) {
+         compiled.culled_[p] = false;
+diff --git a/src/rx_graph/tests/test_compile.cpp b/src/rx_graph/tests/test_compile.cpp
+index 9d4c9ea..e4b44e1 100644
+--- a/src/rx_graph/tests/test_compile.cpp
++++ b/src/rx_graph/tests/test_compile.cpp
+@@ -263,10 +263,69 @@ TEST_CASE("storage buffer accesses resolve compute-class vs graphics-class stage
+ 
+ TEST_CASE("a culled pass reports no resolved accesses") {
+     RenderGraph graph;
+     graph.addPass("A").addColorOutput("x", colorDesc());  // pass 0: culled
+     graph.addPass("B").addColorOutput("bb", colorDesc());
+     graph.setBackbufferSource("bb");
+     graph.compile(kInfo);
+ 
+     CHECK(graph.compiled().passAccesses(0).empty());
+ }
++
++// Fix round 1 -- Task 1 review's Important finding: a circular pass
++// dependency (legally constructible because a reader may be declared
++// before its writer -- exactly the "ordering" test's own mechanism) used
++// to compile to a silently empty executionOrder() with no diagnostic.
++TEST_CASE("a circular pass dependency throws, naming passes in the cycle") {
++    RenderGraph graph;
++    // A and B form a genuine 2-cycle: A reads "y" (B's output) and writes
++    // "x"; B reads "x" (A's output) and writes "y". "present" reads "x"
++    // and writes "bb", which is what roots the cycle to the backbuffer's
++    // writer -- without a reachable root the cycle would just be culled
++    // away, not detected.
++    graph.addPass("A").addTextureInput("y").addColorOutput("x", colorDesc());        // pass 0
++    graph.addPass("B").addTextureInput("x").addColorOutput("y", colorDesc());        // pass 1
++    graph.addPass("present").addTextureInput("x").addColorOutput("bb", colorDesc());  // pass 2
++    graph.setBackbufferSource("bb");
++
++    bool threw = false;
++    try {
++        graph.compile(kInfo);
++    } catch (const std::runtime_error& e) {
++        threw = true;
++        const std::string message = e.what();
++        // Both cycle members must be named -- not just "some pass never
++        // ran" (which could equally describe "present", which is merely
++        // downstream of the cycle, not a member of it).
++        CHECK(message.find("A") != std::string::npos);
++        CHECK(message.find("B") != std::string::npos);
++    }
++    CHECK(threw);
++}
++
++// Fix round 1 -- coordinator ruling on the Task 1 review's Minor finding
++// #2: the same Compute-class/Graphics-class split already applied to
++// storage buffer accesses now also applies to texture-input accesses.
++TEST_CASE("texture input stage resolves per pass kind, like storage buffers already did") {
++    RenderGraph graph;
++    graph.addPass("producer").addColorOutput("tex", colorDesc());  // pass 0
++    // "sampler" has no attachment output at all -- Compute-class.
++    graph.addPass("sampler").addTextureInput("tex").setSideEffect();  // pass 1
++    // "present" has a color output alongside its texture input -- Graphics-class.
++    graph.addPass("present").addTextureInput("tex").addColorOutput("bb", colorDesc());  // pass 2
++    graph.setBackbufferSource("bb");
++    graph.compile(kInfo);
++
++    const CompiledGraph& compiled = graph.compiled();
++
++    const auto samplerAccesses = compiled.passAccesses(1);
++    REQUIRE(samplerAccesses.size() == 1);
++    CHECK(samplerAccesses[0].stages == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
++    CHECK(samplerAccesses[0].access == VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
++    CHECK(samplerAccesses[0].layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++
++    const auto presentAccesses = compiled.passAccesses(2);
++    REQUIRE(presentAccesses.size() == 2);
++    CHECK(presentAccesses[0].stages == VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
++    CHECK(presentAccesses[0].access == VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
++    CHECK(presentAccesses[0].layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++}

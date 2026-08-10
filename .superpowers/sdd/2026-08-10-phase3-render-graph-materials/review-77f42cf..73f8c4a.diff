@@ -1,0 +1,2419 @@
+# Review package: 77f42cf..73f8c4a
+
+## Commits
+73f8c4a feat: add rx_graph executor with transient pool and dynamic rendering
+
+## Files changed
+ src/rx_graph/CMakeLists.txt                  |  30 +-
+ src/rx_graph/executor.cpp                    | 621 +++++++++++++++++++++++
+ src/rx_graph/include/rx_graph/executor.h     | 191 +++++++
+ src/rx_graph/include/rx_graph/pass.h         |  24 +-
+ src/rx_graph/include/rx_graph/render_graph.h |  33 ++
+ src/rx_graph/render_graph.cpp                |  26 +
+ src/rx_graph/tests/CMakeLists.txt            |  40 +-
+ src/rx_graph/tests/doctest_main_gpu.cpp      |  49 ++
+ src/rx_graph/tests/test_barriers.cpp         |  57 ++-
+ src/rx_graph/tests/test_execute_gpu.cpp      | 724 +++++++++++++++++++++++++++
+ src/rx_graph/transient_pool.cpp              | 140 ++++++
+ src/rx_graph/transient_pool.h                | 196 ++++++++
+ src/rx_rhi_vk/include/rx_rhi_vk/device.h     |  10 +
+ 13 files changed, 2113 insertions(+), 28 deletions(-)
+
+## Diff
+diff --git a/src/rx_graph/CMakeLists.txt b/src/rx_graph/CMakeLists.txt
+index 03b293e..1569317 100644
+--- a/src/rx_graph/CMakeLists.txt
++++ b/src/rx_graph/CMakeLists.txt
+@@ -1,23 +1,31 @@
+ # rx_graph: the device-free front half of Phase 3's render graph -- pass
+ # declarations, name-based dependency resolution, culling, topological
+ # ordering, and physical-resource lifetime analysis (Task 1 brief), plus
+ # compile-time sync2 barrier derivation (Task 2 brief, barriers.cpp/h).
+-# Depends on nothing but Vulkan-Headers (VkFormat/Vk*Flags2/Vk*Bit types
+-# only -- no loader, no volk, see render_graph.h's header-hygiene comment)
+-# and rx_core (RX_LOG_ERROR before every validation throw in
+-# render_graph.cpp, matching rx_shader's/rx_rhi_vk's own error-reporting
+-# convention).
++# render_graph.cpp/barriers.cpp depend on nothing but Vulkan-Headers
++# (VkFormat/Vk*Flags2/Vk*Bit types only -- no loader, no volk, see
++# render_graph.h's header-hygiene comment) and rx_core (RX_LOG_ERROR before
++# every validation throw in render_graph.cpp, matching rx_shader's/
++# rx_rhi_vk's own error-reporting convention).
+ #
+-# rx_rhi_vk is deliberately NOT linked here: neither Task 1 nor Task 2
+-# touches a real VkDevice -- barrier derivation is pure per-resource
+-# stage/access/layout accounting over already-declared data. Task 3's
+-# executor is the first thing in this library that needs it -- add that
+-# dependency there, not preemptively here.
++# Task 3 adds rx_rhi_vk to this library's link line: executor.cpp/
++# transient_pool.cpp are the first things in rx_graph that touch a real
++# VkDevice (Texture2D/Buffer/Allocator/DeletionQueue realize the graph's
++# physical resources; rx::rhi::Device supplies the physical device/
++# instance/queue Executor::create() needs). This is additive, not a
++# retraction of Tasks 1-2's device-free design: render_graph.cpp/
++# barriers.cpp are unchanged in that respect, and rx_graph's PUBLIC headers
++# (render_graph.h/pass.h/resources.h/barriers.h/executor.h) still carry no
++# volk and no rx_rhi_vk type -- see executor.h's and transient_pool.h's own
++# header-hygiene comments for exactly where the device-touching boundary
++# now sits.
+ add_library(rx_graph STATIC
+     render_graph.cpp
+     barriers.cpp
++    executor.cpp
++    transient_pool.cpp
+ )
+ target_include_directories(rx_graph PUBLIC include)
+-target_link_libraries(rx_graph PUBLIC Vulkan::Headers rx_core)
++target_link_libraries(rx_graph PUBLIC Vulkan::Headers rx_core rx_rhi_vk)
+ 
+ add_subdirectory(tests)
+diff --git a/src/rx_graph/executor.cpp b/src/rx_graph/executor.cpp
+new file mode 100644
+index 0000000..1bbf1b0
+--- /dev/null
++++ b/src/rx_graph/executor.cpp
+@@ -0,0 +1,621 @@
++#include <rx_graph/executor.h>
++
++#include "transient_pool.h"
++
++#include <rx_core/log.h>
++#include <rx_rhi_vk/deletion_queue.h>
++#include <rx_rhi_vk/device.h>
++#include <volk.h>
++
++#include <algorithm>
++#include <optional>
++#include <span>
++#include <stdexcept>
++#include <string>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++// Task 3's executor: turns a compiled, device-free rx::graph::RenderGraph
++// into real Vulkan work -- transient_pool.h's TransientPool for physical
++// resource realization, sync2 vkCmdPipelineBarrier2 for every
++// CompiledGraph::passBarriers()/finalBarriers() entry, and one
++// vkCmdBeginRendering/vkCmdEndRendering scope per graphics pass [spec
++// Phase 3 design, D2 -- fresh design, not a Granite renderpass-object
++// port; see .superpowers/sdd/2026-08-10-phase3-render-graph-materials/
++// research-rendergraph.md 1's table for why Granite's physical-execution
++// layer specifically does not port here].
++namespace rx::graph {
++
++namespace {
++
++// Depth/depth-stencil formats need DEPTH_BIT (and STENCIL_BIT for the
++// combined ones) as an image barrier's subresource aspect mask instead of
++// COLOR_BIT -- the same well-known Vulkan format table
++// rx_rhi_vk/texture.cpp's own aspectMaskForFormat() already encodes for
++// Texture2D's view creation (not exported from that .cpp, so this is an
++// independent, equally small local copy rather than a barriers.h/.cpp
++// change this task's scope doesn't call for).
++VkImageAspectFlags aspectMaskForFormat(VkFormat format) {
++    switch (format) {
++        case VK_FORMAT_D16_UNORM:
++        case VK_FORMAT_D32_SFLOAT:
++        case VK_FORMAT_X8_D24_UNORM_PACK32:
++            return VK_IMAGE_ASPECT_DEPTH_BIT;
++        case VK_FORMAT_D16_UNORM_S8_UINT:
++        case VK_FORMAT_D24_UNORM_S8_UINT:
++        case VK_FORMAT_D32_SFLOAT_S8_UINT:
++            return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
++        case VK_FORMAT_S8_UINT:
++            return VK_IMAGE_ASPECT_STENCIL_BIT;
++        default:
++            return VK_IMAGE_ASPECT_COLOR_BIT;
++    }
++}
++
++VkExtent2D toExtent(const AttachmentDesc& attachment) {
++    return VkExtent2D{static_cast<uint32_t>(attachment.width + 0.5F), static_cast<uint32_t>(attachment.height + 0.5F)};
++}
++
++// Every declared ResourceAccess a single pass makes against one physical
++// resource, combined into that resource's union of declared pipeline
++// stages/access bits -- an independent copy of barriers.cpp's own (private,
++// anonymous-namespace) combineByResource()/CombinedAccess: this file cannot
++// call that one directly (it is not exported past barriers.cpp, deliberately
++// -- see barriers.h's own comment on why detail:: is the only exposed
++// seam), and this task's scope does not call for changing barriers.h/.cpp
++// to export it. Used both to track each pooled resource's own *last*
++// touched stage this execute() call (see the finalStageThisExecute loop in
++// Executor::execute()) and, for the access half, to synthesize the one
++// barrier a pooled BUFFER's true first-ever-in-the-graph access needs that
++// compile()'s own device-free buildBarriers() correctly never emits -- see
++// synthesizeFirstUseBufferBarrierIfNeeded()'s own comment just below for
++// why that gap is real, not hypothetical.
++struct CombinedAccess {
++    VkPipelineStageFlags2 stages = 0;
++    VkAccessFlags2 access = 0;
++};
++
++std::vector<std::pair<uint32_t, CombinedAccess>> combineAccessesByResource(std::span<const ResourceAccess> accesses) {
++    std::vector<std::pair<uint32_t, CombinedAccess>> combined;
++    for (const ResourceAccess& access : accesses) {
++        auto it = std::find_if(combined.begin(), combined.end(),
++                                [&](const auto& entry) { return entry.first == access.physicalIndex; });
++        if (it == combined.end()) {
++            combined.emplace_back(access.physicalIndex, CombinedAccess{access.stages, access.access});
++        } else {
++            it->second.stages |= access.stages;
++            it->second.access |= access.access;
++        }
++    }
++    return combined;
++}
++
++}  // namespace
++
++// One CompiledGraph::resources() entry's real, device-side binding, as of
++// the most recent Executor::realize() call. Rebuilt from scratch by every
++// realize() call (see Executor::realize()); PassContext's name-based
++// resolvers (imageView()/image()/buffer()/imageFormat()) read straight out
++// of whatever the CURRENT vector holds.
++struct ResolvedResource {
++    bool isBuffer = false;
++    bool isBackbuffer = false;
++
++    // Index into Impl::pool's images_/buffers_ (per isBuffer) -- meaningless
++    // (left at UINT32_MAX) for the backbuffer, which this Executor never
++    // pools [Task 3 ambiguity resolution #4].
++    uint32_t poolIndex = UINT32_MAX;
++
++    VkImage image = VK_NULL_HANDLE;
++    VkImageView view = VK_NULL_HANDLE;
++    VkBuffer buffer = VK_NULL_HANDLE;
++    VkFormat format = VK_FORMAT_UNDEFINED;
++    VkExtent2D extent{0, 0};
++};
++
++struct Executor::Impl {
++    VkDevice device = VK_NULL_HANDLE;
++    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
++    rx::rhi::Allocator allocator;
++    detail::TransientPool pool;
++    rx::rhi::DeletionQueue deletionQueue;
++    bool debugUtilsAvailable = false;
++
++    // Executor's own monotonic tick, one increment per execute() call --
++    // the clock TransientPool's staleness sweep and this Impl's own
++    // deletion-queue pacing (see Executor::execute()) both run against.
++    uint64_t frameCounter = 0;
++
++    // Rebuilt by every realize() call; indexed identically to whatever
++    // CompiledGraph::resources() looked like as of that call.
++    std::vector<ResolvedResource> resources;
++    std::unordered_map<std::string, uint32_t> nameToIndex;
++
++    Impl(VkDevice deviceIn, VkPhysicalDevice physicalDeviceIn, rx::rhi::Allocator allocatorIn)
++        : device(deviceIn),
++          physicalDevice(physicalDeviceIn),
++          allocator(std::move(allocatorIn)),
++          pool(physicalDeviceIn, deviceIn, allocator) {}
++};
++
++namespace {
++
++void beginDebugLabel(Executor::Impl& impl, VkCommandBuffer cmd, std::string_view name) {
++    if (!impl.debugUtilsAvailable) {
++        return;
++    }
++    // VkDebugUtilsLabelEXT::pLabelName must stay valid only for the
++    // duration of this call -- vkCmdBeginDebugUtilsLabelEXT copies/consumes
++    // it immediately, so a local std::string on this function's own stack
++    // is sufficient (no need to keep it alive past the call).
++    const std::string label(name);
++    VkDebugUtilsLabelEXT info{};
++    info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
++    info.pLabelName = label.c_str();
++    vkCmdBeginDebugUtilsLabelEXT(cmd, &info);
++}
++
++void endDebugLabel(Executor::Impl& impl, VkCommandBuffer cmd) {
++    if (!impl.debugUtilsAvailable) {
++        return;
++    }
++    vkCmdEndDebugUtilsLabelEXT(cmd);
++}
++
++// Applies every barrier in `barriers` (one CompiledGraph::passBarriers()
++// position, or finalBarriers()) via a single vkCmdPipelineBarrier2 call --
++// a no-op if `barriers` is empty. `firstBarrierSeen`, shared across every
++// call this same execute() makes, is Task 3 ambiguity resolution #2's own
++// mechanism: the FIRST barrier this execute() call applies against a given
++// (pooled, non-backbuffer) physicalIndex has its compile-time srcStage
++// (always VK_PIPELINE_STAGE_2_NONE for a resource's first access within
++// ANY single compile walk -- device-free compile() has no notion of "a
++// previous frame" at all) overridden with that pooled entry's own tracked
++// TransientPool::PooledImage/PooledBuffer::lastFrameFinalStages -- the
++// real stage the GPU may still be finishing from the LAST execute() call
++// that touched this same physical allocation. Every later barrier against
++// the same physicalIndex, THIS call, is left exactly as compile() derived
++// it (already correctly chained within this one topological walk).
++void applyBarriers(Executor::Impl& impl, const CompiledGraph& compiled, VkCommandBuffer cmd,
++                    const PassBarriers& barriers, std::vector<bool>& firstBarrierSeen) {
++    if (barriers.imageBarriers.empty() && barriers.bufferBarriers.empty()) {
++        return;
++    }
++
++    std::vector<VkImageMemoryBarrier2> vkImageBarriers;
++    vkImageBarriers.reserve(barriers.imageBarriers.size());
++    for (const ImageBarrier& b : barriers.imageBarriers) {
++        const PhysicalResource& physical = compiled.resources()[b.physicalIndex];
++        const ResolvedResource& resolved = impl.resources.at(b.physicalIndex);
++
++        VkPipelineStageFlags2 srcStage = b.srcStage;
++        if (!resolved.isBackbuffer && !firstBarrierSeen[b.physicalIndex]) {
++            srcStage = impl.pool.image(resolved.poolIndex).lastFrameFinalStages;
++        }
++        firstBarrierSeen[b.physicalIndex] = true;
++
++        VkImageMemoryBarrier2 vkBarrier{};
++        vkBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
++        vkBarrier.srcStageMask = srcStage;
++        vkBarrier.srcAccessMask = b.srcAccess;
++        vkBarrier.dstStageMask = b.dstStage;
++        vkBarrier.dstAccessMask = b.dstAccess;
++        vkBarrier.oldLayout = b.oldLayout;
++        vkBarrier.newLayout = b.newLayout;
++        vkBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        vkBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        vkBarrier.image = resolved.image;
++        vkBarrier.subresourceRange.aspectMask = aspectMaskForFormat(physical.attachment.format);
++        vkBarrier.subresourceRange.baseMipLevel = 0;
++        vkBarrier.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
++        vkBarrier.subresourceRange.baseArrayLayer = 0;
++        vkBarrier.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
++        vkImageBarriers.push_back(vkBarrier);
++    }
++
++    std::vector<VkBufferMemoryBarrier2> vkBufferBarriers;
++    vkBufferBarriers.reserve(barriers.bufferBarriers.size());
++    for (const BufferBarrier& b : barriers.bufferBarriers) {
++        const ResolvedResource& resolved = impl.resources.at(b.physicalIndex);
++
++        VkPipelineStageFlags2 srcStage = b.srcStage;
++        if (!resolved.isBackbuffer && !firstBarrierSeen[b.physicalIndex]) {
++            srcStage = impl.pool.buffer(resolved.poolIndex).lastFrameFinalStages;
++        }
++        firstBarrierSeen[b.physicalIndex] = true;
++
++        VkBufferMemoryBarrier2 vkBarrier{};
++        vkBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
++        vkBarrier.srcStageMask = srcStage;
++        vkBarrier.srcAccessMask = b.srcAccess;
++        vkBarrier.dstStageMask = b.dstStage;
++        vkBarrier.dstAccessMask = b.dstAccess;
++        vkBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        vkBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        vkBarrier.buffer = resolved.buffer;
++        vkBarrier.offset = 0;
++        vkBarrier.size = VK_WHOLE_SIZE;
++        vkBufferBarriers.push_back(vkBarrier);
++    }
++
++    VkDependencyInfo dep{};
++    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    dep.imageMemoryBarrierCount = static_cast<uint32_t>(vkImageBarriers.size());
++    dep.pImageMemoryBarriers = vkImageBarriers.empty() ? nullptr : vkImageBarriers.data();
++    dep.bufferMemoryBarrierCount = static_cast<uint32_t>(vkBufferBarriers.size());
++    dep.pBufferMemoryBarriers = vkBufferBarriers.empty() ? nullptr : vkBufferBarriers.data();
++    vkCmdPipelineBarrier2(cmd, &dep);
++}
++
++// Task 2's buildBarriers() correctly emits NO barrier for a resource's
++// very first access within one device-free compile walk: detail::
++// applyAccess()'s "first use ever" branch (barriers.cpp) sets srcStage/
++// srcAccess to NONE and -- for a BUFFER specifically, which has no layout
++// to transition -- `needBarrier` itself is false (layoutDiffers is
++// unconditionally false for a buffer, and `write && everAccessed` is false
++// on a resource's very first write), so no ImageBarrier/BufferBarrier
++// entry is produced at all. That is exactly correct for a compile walk
++// with no notion of "a previous frame" -- nothing has touched this
++// resource yet, so there is nothing to synchronize against.
++//
++// An IMAGE resource's first-ever access never has this gap: its layout
++// always differs from the fresh VK_IMAGE_LAYOUT_UNDEFINED state
++// (layoutDiffers == true unconditionally), so buildBarriers() always DOES
++// emit a real ImageBarrier there, one applyBarriers() above can override
++// the srcStage of. A pooled BUFFER reused across execute() calls has
++// exactly the same cross-frame hazard an image does (the GPU may still be
++// finishing the LAST execute() call's work on this same physical
++// allocation) but no barrier for applyBarriers() to override at all,
++// since compile() never produced one. This function closes that gap:
++// called once per pass, immediately after applyBarriers() has run for it,
++// for every BUFFER resource whose PhysicalResource::firstUsePass is THIS
++// pass's position and which still has no barrier recorded in
++// `firstBarrierSeen` (i.e. compile() genuinely emitted none for it, the
++// buffer-first-use case above -- an already-barriered resource, or one
++// whose true first use is a different pass, is left untouched). Never
++// applies to the backbuffer (always an image, never pooled). See
++// test_execute_gpu.cpp's dedicated "pooled storage buffer... across two
++// consecutive execute() calls" case for the regression this covers.
++void synthesizeFirstUseBufferBarrierIfNeeded(Executor::Impl& impl, const CompiledGraph& compiled, VkCommandBuffer cmd,
++                                              std::span<const ResourceAccess> accesses, size_t pos,
++                                              std::vector<bool>& firstBarrierSeen) {
++    const std::span<const PhysicalResource> resources = compiled.resources();
++    for (const auto& [physIdx, combined] : combineAccessesByResource(accesses)) {
++        const PhysicalResource& physical = resources[physIdx];
++        if (!physical.isBuffer || firstBarrierSeen[physIdx] || physical.firstUsePass != pos) {
++            continue;
++        }
++
++        const ResolvedResource& resolved = impl.resources.at(physIdx);
++
++        VkBufferMemoryBarrier2 vkBarrier{};
++        vkBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
++        vkBarrier.srcStageMask = impl.pool.buffer(resolved.poolIndex).lastFrameFinalStages;
++        vkBarrier.srcAccessMask = VK_ACCESS_2_NONE;
++        vkBarrier.dstStageMask = combined.stages;
++        vkBarrier.dstAccessMask = combined.access;
++        vkBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        vkBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        vkBarrier.buffer = resolved.buffer;
++        vkBarrier.offset = 0;
++        vkBarrier.size = VK_WHOLE_SIZE;
++
++        VkDependencyInfo dep{};
++        dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++        dep.bufferMemoryBarrierCount = 1;
++        dep.pBufferMemoryBarriers = &vkBarrier;
++        vkCmdPipelineBarrier2(cmd, &dep);
++
++        firstBarrierSeen[physIdx] = true;
++    }
++}
++
++}  // namespace
++
++std::unique_ptr<Executor> Executor::create(rx::rhi::Device& device) {
++    auto allocator = rx::rhi::Allocator::createRaw(device.physicalDevice(), device.device(), device.instance());
++    if (!allocator.has_value()) {
++        RX_LOG_ERROR("rx_graph: Executor::create: rx::rhi::Allocator::createRaw failed");
++        return nullptr;
++    }
++
++    auto impl = std::make_unique<Impl>(device.device(), device.physicalDevice(), std::move(*allocator));
++
++    // Task 3 ambiguity resolution #7: query VK_EXT_debug_utils availability
++    // once here, via the plain volk-global-function-pointer-null-check
++    // this whole codebase already relies on everywhere it calls a raw
++    // vkFoo (context.cpp/device.cpp track NO explicit enabled-extension
++    // list at all -- confirmed by reading both; there is nothing to read
++    // "capabilities" off of beyond volk's own loaded tables). volkLoadDevice()
++    // (already run inside rx::rhi::Device::create(), before any Executor
++    // can exist) leaves this device-level function pointer non-null if and
++    // only if VK_EXT_debug_utils was actually enabled/available -- exactly
++    // the same null-checked-before-use discipline every debug-label call
++    // site below follows.
++    impl->debugUtilsAvailable = (vkCmdBeginDebugUtilsLabelEXT != nullptr && vkCmdEndDebugUtilsLabelEXT != nullptr);
++
++    return std::unique_ptr<Executor>(new Executor(std::move(impl)));
++}
++
++Executor::Executor(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
++
++Executor::~Executor() {
++    if (!impl_) {
++        return;
++    }
++    // "waits idle via existing Device teardown conventions" [task-3-brief.md]
++    // -- the same vkDeviceWaitIdle-before-destroying-anything discipline
++    // FrameSync's/DeletionQueue's own destructor contracts already
++    // document as load-bearing elsewhere in this engine. Proves no
++    // in-flight command buffer can still reference anything this
++    // destructor is about to tear down, before retireAll()/flushAll() run
++    // unconditionally (both otherwise-unsafe on a queue that might still
++    // be executing).
++    vkDeviceWaitIdle(impl_->device);
++    impl_->pool.retireAll(impl_->frameCounter, impl_->deletionQueue);
++    impl_->deletionQueue.flushAll();
++}
++
++void Executor::realize(const RenderGraph& graph) {
++    Impl& impl = *impl_;
++    const CompiledGraph& compiled = graph.compiled();
++    const std::span<const PhysicalResource> resources = compiled.resources();
++
++    impl.pool.beginRealizeBatch();
++
++    std::vector<ResolvedResource> resolved(resources.size());
++    std::unordered_map<std::string, uint32_t> nameToIndex;
++    nameToIndex.reserve(resources.size());
++
++    for (uint32_t i = 0; i < resources.size(); ++i) {
++        const PhysicalResource& physical = resources[i];
++        nameToIndex.emplace(physical.name, i);
++
++        ResolvedResource& entry = resolved[i];
++        entry.isBuffer = physical.isBuffer;
++        entry.isBackbuffer = physical.isBackbuffer;
++
++        if (physical.isBackbuffer) {
++            // Never pooled [Task 3 ambiguity resolution #4] -- image/view/
++            // extent are filled in fresh by every execute() call instead;
++            // format is already known now (compile() resolves it from
++            // CompileInfo::swapchainFormat regardless of what its writer
++            // pass declared -- see render_graph.cpp).
++            entry.format = physical.attachment.format;
++            continue;
++        }
++
++        if (physical.isBuffer) {
++            auto poolIndex =
++                impl.pool.acquireBuffer(physical.buffer.size, physical.buffer.usage, impl.frameCounter);
++            if (!poolIndex.has_value()) {
++                RX_LOG_ERROR("rx_graph: Executor::realize: failed to acquire a pooled buffer for resource '{}'",
++                             physical.name);
++                continue;
++            }
++            entry.poolIndex = *poolIndex;
++            entry.buffer = impl.pool.buffer(*poolIndex).buffer->handle();
++        } else {
++            const VkExtent2D extent = toExtent(physical.attachment);
++            auto poolIndex = impl.pool.acquireImage(physical.attachment.format, extent, physical.imageUsage,
++                                                     physical.attachment.samples, impl.frameCounter);
++            if (!poolIndex.has_value()) {
++                RX_LOG_ERROR("rx_graph: Executor::realize: failed to acquire a pooled image for resource '{}'",
++                             physical.name);
++                continue;
++            }
++            entry.poolIndex = *poolIndex;
++            const rx::rhi::Texture2D& texture = *impl.pool.image(*poolIndex).texture;
++            entry.image = texture.image();
++            entry.view = texture.view();
++            entry.format = texture.format();
++            entry.extent = texture.extent();
++        }
++    }
++
++    impl.resources = std::move(resolved);
++    impl.nameToIndex = std::move(nameToIndex);
++}
++
++void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage backbufferImage,
++                        VkImageView backbufferView, VkExtent2D backbufferExtent) {
++    Impl& impl = *impl_;
++    const CompiledGraph& compiled = graph.compiled();
++    const std::span<const PhysicalResource> resources = compiled.resources();
++
++    ++impl.frameCounter;
++
++    // Evict any pooled entry a past realize() released and nothing has
++    // reclaimed for kStaleAfterExecutes consecutive execute() calls, then
++    // let the deletion queue actually run whatever this (or a past) sweep
++    // already tagged as safe -- see transient_pool.h's own comment on
++    // sweepStale()'s frame tagging, and Task 3 ambiguity resolution #2 for
++    // the same-queue/frames-in-flight reasoning that makes self-pacing
++    // this queue (rather than needing an externally-confirmed fence
++    // signal) correct as long as callers drive execute() at a pace bounded
++    // by real frame-in-flight fencing (e.g. rx::rhi::FrameSync) -- trivially
++    // true for a caller that submits and waits synchronously between
++    // calls, as Task 3's own GPU test does, since that is strictly MORE
++    // conservative than the bound this reasoning requires.
++    impl.pool.sweepStale(impl.frameCounter, impl.deletionQueue);
++    if (impl.frameCounter > detail::kStaleAfterExecutes) {
++        impl.deletionQueue.onFrameFenceSignaled(impl.frameCounter - detail::kStaleAfterExecutes - 1);
++    }
++
++    // Bind the backbuffer's ResolvedResource fresh every call [Task 3
++    // ambiguity resolution #4].
++    for (uint32_t i = 0; i < resources.size(); ++i) {
++        if (resources[i].isBackbuffer) {
++            ResolvedResource& entry = impl.resources.at(i);
++            entry.image = backbufferImage;
++            entry.view = backbufferView;
++            entry.extent = backbufferExtent;
++            break;
++        }
++    }
++
++    std::vector<bool> firstBarrierSeen(resources.size(), false);
++    std::vector<bool> attachmentEverWritten(resources.size(), false);
++    std::unordered_map<uint32_t, VkPipelineStageFlags2> finalStageThisExecute;
++
++    const std::span<const uint32_t> order = compiled.executionOrder();
++    const std::span<const PassBarriers> allBarriers = compiled.passBarriers();
++
++    for (size_t pos = 0; pos < order.size(); ++pos) {
++        const uint32_t rawIndex = order[pos];
++        const Pass& pass = graph.passAt(rawIndex);
++        const std::span<const ResourceAccess> accesses = compiled.passAccesses(rawIndex);
++
++        beginDebugLabel(impl, cmd, pass.name());
++
++        applyBarriers(impl, compiled, cmd, allBarriers[pos], firstBarrierSeen);
++        synthesizeFirstUseBufferBarrierIfNeeded(impl, compiled, cmd, accesses, pos, firstBarrierSeen);
++
++        // Classify this pass's own declared accesses into color/depth
++        // attachment outputs [spec Phase 3 design, D2] -- every other
++        // declared AccessKind (TextureInput, StorageBufferOutput/Input)
++        // resolves to a layout that is neither COLOR_ATTACHMENT_OPTIMAL
++        // nor DEPTH_ATTACHMENT_OPTIMAL (see pass.h's Pass::resolveAccess
++        // table), so this is an exhaustive, unambiguous classification,
++        // not a heuristic.
++        std::vector<uint32_t> colorPhysIdx;
++        std::optional<uint32_t> depthPhysIdx;
++        for (const ResourceAccess& access : accesses) {
++            if (access.layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
++                if (std::find(colorPhysIdx.begin(), colorPhysIdx.end(), access.physicalIndex) ==
++                    colorPhysIdx.end()) {
++                    colorPhysIdx.push_back(access.physicalIndex);
++                }
++            } else if (access.layout == VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL) {
++                depthPhysIdx = access.physicalIndex;
++            }
++        }
++
++        const bool isGraphicsPass = !colorPhysIdx.empty() || depthPhysIdx.has_value();
++
++        VkExtent2D renderArea{0, 0};
++        std::vector<VkRenderingAttachmentInfo> colorAttachments;
++        VkRenderingAttachmentInfo depthAttachment{};
++
++        if (isGraphicsPass) {
++            colorAttachments.reserve(colorPhysIdx.size());
++            for (uint32_t physIdx : colorPhysIdx) {
++                const ResolvedResource& resolvedRes = impl.resources.at(physIdx);
++
++                VkRenderingAttachmentInfo info{};
++                info.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
++                info.imageView = resolvedRes.view;
++                info.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++                // Task 3 ambiguity resolution #3: first write-use of an
++                // attachment in a frame clears; later uses load; always
++                // store. Clear values are fixed this phase (per-pass
++                // configurable clear values are future work).
++                info.loadOp = attachmentEverWritten[physIdx] ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
++                info.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++                info.clearValue.color = VkClearColorValue{{0.0F, 0.0F, 0.0F, 1.0F}};
++                attachmentEverWritten[physIdx] = true;
++
++                colorAttachments.push_back(info);
++                renderArea = resolvedRes.extent;
++            }
++
++            if (depthPhysIdx.has_value()) {
++                const ResolvedResource& resolvedRes = impl.resources.at(*depthPhysIdx);
++
++                depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
++                depthAttachment.imageView = resolvedRes.view;
++                depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
++                depthAttachment.loadOp =
++                    attachmentEverWritten[*depthPhysIdx] ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
++                depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++                depthAttachment.clearValue.depthStencil = VkClearDepthStencilValue{1.0F, 0};
++                attachmentEverWritten[*depthPhysIdx] = true;
++
++                if (colorAttachments.empty()) {
++                    renderArea = resolvedRes.extent;
++                }
++            }
++
++            VkRenderingInfo renderingInfo{};
++            renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
++            renderingInfo.renderArea = VkRect2D{{0, 0}, renderArea};
++            renderingInfo.layerCount = 1;
++            renderingInfo.colorAttachmentCount = static_cast<uint32_t>(colorAttachments.size());
++            renderingInfo.pColorAttachments = colorAttachments.empty() ? nullptr : colorAttachments.data();
++            renderingInfo.pDepthAttachment = depthPhysIdx.has_value() ? &depthAttachment : nullptr;
++            vkCmdBeginRendering(cmd, &renderingInfo);
++        }
++
++        PassContext ctx;
++        ctx.cmd = cmd;
++        ctx.renderArea = renderArea;
++        ctx.executor_ = this;
++        pass.invokeExecute(ctx);
++
++        if (isGraphicsPass) {
++            vkCmdEndRendering(cmd);
++        }
++
++        endDebugLabel(impl, cmd);
++
++        for (const auto& [physIdx, combined] : combineAccessesByResource(accesses)) {
++            if (!impl.resources.at(physIdx).isBackbuffer) {
++                finalStageThisExecute[physIdx] = combined.stages;
++            }
++        }
++    }
++
++    applyBarriers(impl, compiled, cmd, compiled.finalBarriers(), firstBarrierSeen);
++
++    // Task 3 ambiguity resolution #2: record what stage each pooled
++    // resource this call actually touched was left at, so the NEXT
++    // execute() call's first-use-of-frame override (applyBarriers() above)
++    // chains off the real value instead of staying pinned at
++    // ALL_COMMANDS forever.
++    for (const auto& [physIdx, stage] : finalStageThisExecute) {
++        const ResolvedResource& resolvedRes = impl.resources.at(physIdx);
++        if (resources[physIdx].isBuffer) {
++            impl.pool.buffer(resolvedRes.poolIndex).lastFrameFinalStages = stage;
++            impl.pool.touchBuffer(resolvedRes.poolIndex, impl.frameCounter);
++        } else {
++            impl.pool.image(resolvedRes.poolIndex).lastFrameFinalStages = stage;
++            impl.pool.touchImage(resolvedRes.poolIndex, impl.frameCounter);
++        }
++    }
++}
++
++namespace {
++
++uint32_t lookupResolvedIndex(const Executor::Impl& impl, std::string_view name) {
++    auto it = impl.nameToIndex.find(std::string(name));
++    if (it == impl.nameToIndex.end()) {
++        throw std::out_of_range("rx_graph: PassContext: no realized resource named '" + std::string(name) + "'");
++    }
++    return it->second;
++}
++
++}  // namespace
++
++VkImageView Executor::resolveImageView(std::string_view name) const {
++    return impl_->resources.at(lookupResolvedIndex(*impl_, name)).view;
++}
++
++VkImage Executor::resolveImage(std::string_view name) const {
++    return impl_->resources.at(lookupResolvedIndex(*impl_, name)).image;
++}
++
++VkBuffer Executor::resolveBuffer(std::string_view name) const {
++    return impl_->resources.at(lookupResolvedIndex(*impl_, name)).buffer;
++}
++
++VkFormat Executor::resolveImageFormat(std::string_view name) const {
++    return impl_->resources.at(lookupResolvedIndex(*impl_, name)).format;
++}
++
++VkImageView PassContext::imageView(std::string_view name) const { return executor_->resolveImageView(name); }
++VkImage PassContext::image(std::string_view name) const { return executor_->resolveImage(name); }
++VkBuffer PassContext::buffer(std::string_view name) const { return executor_->resolveBuffer(name); }
++VkFormat PassContext::imageFormat(std::string_view name) const { return executor_->resolveImageFormat(name); }
++
++}  // namespace rx::graph
+diff --git a/src/rx_graph/include/rx_graph/executor.h b/src/rx_graph/include/rx_graph/executor.h
+new file mode 100644
+index 0000000..2980219
+--- /dev/null
++++ b/src/rx_graph/include/rx_graph/executor.h
+@@ -0,0 +1,191 @@
++#pragma once
++// Vulkan-Headers only, exactly like render_graph.h/pass.h/resources.h/
++// barriers.h -- no volk.h, no vulkan/vulkan.h, no vk_mem_alloc.h anywhere in
++// THIS header. VkCommandBuffer/VkImage/VkImageView/VkBuffer/VkFormat/
++// VkExtent2D are all plain Vulkan *types* (handles are opaque pointers,
++// carrying no function-pointer table themselves) -- exactly the same
++// device-free-header discipline barriers.h's ImageBarrier/BufferBarrier
++// already established for Task 2, just with real (caller-supplied or
++// Executor-resolved) handles this time instead of a bare physicalIndex.
++// Task 3 is the first thing in rx_graph that touches a real VkDevice, but
++// "touches a real device" happens in executor.cpp/transient_pool.cpp, not
++// in this public header: volk usage (and every raw vkFoo call) stays out
++// of every rx_graph header, matching this task's own binding constraint.
++#include <rx_graph/render_graph.h>
++
++#include <cstdint>
++#include <memory>
++#include <string_view>
++
++namespace rx::rhi {
++class Device;
++}  // namespace rx::rhi
++
++namespace rx::graph {
++
++class Executor;
++
++// The device-side handle Executor::execute() hands to a pass's recorded
++// execute() callback (pass.h's Pass::setExecute), once that pass's turn
++// comes up in CompiledGraph::executionOrder(). This is the complete
++// definition pass.h's own forward declaration anticipates -- see that
++// header's comment on class PassContext.
++//
++// `cmd`/`renderArea` are plain public data (not accessors) because every
++// pass callback needs both unconditionally and there is nothing to
++// validate or compute on read -- Executor::execute() fills them in fresh
++// immediately before invoking Pass::invokeExecute() for each pass, and
++// nothing about them is meaningful once that call returns.
++//
++// The four name-based resolvers below all resolve `name` against whatever
++// Executor::realize() most recently bound that name to (a pooled transient
++// resource, or -- for RenderGraph::setBackbufferSource()'s named resource
++// -- the external image Executor::execute() was called with this frame;
++// see executor.cpp's own comment on why the backbuffer is never pooled).
++// `name` must be one of CompiledGraph::resources()' own names (i.e. a name
++// some surviving pass in the currently-realized graph actually reads or
++// writes) -- passing anything else throws std::out_of_range, matching
++// CompiledGraph::passAccesses()'s own out-of-range contract for a raw pass
++// index. Calling any of these before the owning Executor's first
++// realize() (or with a graph reset() since) throws for the same reason:
++// there is nothing bound to look up yet.
++//
++// Task 5 adds passSignature() here (material/pipeline binding metadata);
++// not part of Task 3's scope.
++class PassContext {
++public:
++    VkCommandBuffer cmd = VK_NULL_HANDLE;
++
++    // Extent of this pass's own color/depth attachment(s), in real pixels
++    // -- meaningless (left at {0, 0}) for a pass that declares neither: see
++    // Executor::execute()'s own comment on graphics- vs bare-pass
++    // classification (a pass with no attachment output gets no dynamic-
++    // rendering scope at all, and therefore has no "render area" to speak
++    // of).
++    VkExtent2D renderArea{0, 0};
++
++    [[nodiscard]] VkImageView imageView(std::string_view name) const;
++    [[nodiscard]] VkImage image(std::string_view name) const;
++    [[nodiscard]] VkBuffer buffer(std::string_view name) const;
++    [[nodiscard]] VkFormat imageFormat(std::string_view name) const;
++
++private:
++    friend class Executor;
++    const Executor* executor_ = nullptr;
++};
++
++// Owns every physical resource backing a compiled rx::graph::RenderGraph on
++// a real device -- a pooled transient allocation per non-backbuffer image/
++// buffer resource (transient_pool.h/.cpp, this library's private
++// implementation detail, not a public rx_graph header) -- plus the sync2
++// barrier emission and dynamic-rendering scoping that turn
++// CompiledGraph::passBarriers()/passAccesses()/finalBarriers() into real
++// vkCmdPipelineBarrier2/vkCmdBeginRendering calls. The RenderGraph/
++// CompiledGraph types themselves stay exactly as device-free as Tasks 1-2
++// left them -- Executor is an additional, separate object built ON TOP of
++// a RenderGraph, never a change to what RenderGraph itself is [render_graph.h's
++// own header comment: "Task 3's executor is the first thing in rx_graph
++// that touches a real device," not the graph class].
++//
++// Not copyable or movable (owns a live VkDevice-scoped transient pool and
++// deletion queue that a shallow copy/move could not safely duplicate or
++// hand off) -- always held via the std::unique_ptr create() returns.
++class Executor {
++public:
++    ~Executor();
++    Executor(const Executor&) = delete;
++    Executor& operator=(const Executor&) = delete;
++    Executor(Executor&&) = delete;
++    Executor& operator=(Executor&&) = delete;
++
++    // Builds an Executor against `device`'s already-created VkDevice/
++    // VkPhysicalDevice/VkInstance/graphics queue (an internal
++    // rx::rhi::Allocator, transient pool, and deletion queue -- see
++    // executor.cpp). Returns nullptr (logged via RX_LOG_ERROR) on any
++    // underlying failure (e.g. rx::rhi::Allocator::createRaw()).
++    static std::unique_ptr<Executor> create(rx::rhi::Device& device);
++
++    // Realizes (or re-realizes) every non-backbuffer PhysicalResource
++    // `graph.compiled()` describes against this Executor's transient pool
++    // -- one rx::rhi::Texture2D per image resource, one rx::rhi::Buffer per
++    // buffer resource, keyed by (format, extent, usage, samples)/(size,
++    // usage) respectively (transient_pool.h). Idempotent for an unchanged
++    // compiled shape: calling this again with nothing structurally
++    // different re-binds the exact same pooled entries. Safe (and
++    // expected) to call again after any RenderGraph::compile() that
++    // changed a resource's shape (e.g. a swapchain resize changing a
++    // SwapchainRelative attachment's real extent) -- this Executor's
++    // previous bindings are released back to the pool (not destroyed
++    // outright; a matching future realize() can reclaim them, and an
++    // unmatched one is eventually swept by the transient pool's own
++    // frames-in-flight-bounded eviction -- see transient_pool.h) and
++    // rebuilt from scratch against the new shapes. Must be called at
++    // least once, after `graph`'s first compile(), before the first
++    // execute() call against it.
++    void realize(const RenderGraph& graph);
++
++    // Records one frame's worth of work for `graph` onto `cmd` (an
++    // already-allocated command buffer the caller has already begun
++    // recording into -- Executor never itself calls
++    // vkBeginCommandBuffer/vkEndCommandBuffer, nor submits or waits on
++    // anything, exactly like rx::rhi::CommandContext::runOnce()'s own
++    // `record` callback contract): for every surviving pass in
++    // CompiledGraph::executionOrder(), in order -- one vkCmdPipelineBarrier2
++    // for that position's CompiledGraph::passBarriers() entry (see
++    // executor.cpp for the first-use-of-frame srcStage override this
++    // applies to a pooled resource's very first barrier each call), an
++    // optional vkCmdBeginRendering/vkCmdEndRendering scope when the pass
++    // declares at least one color/depth attachment output (color:
++    // VK_ATTACHMENT_LOAD_OP_CLEAR to {0,0,0,1} on that resource's first
++    // write this call, VK_ATTACHMENT_LOAD_OP_LOAD after; depth: same rule,
++    // clearing to 1.0f; always VK_ATTACHMENT_STORE_OP_STORE -- Task 3
++    // ambiguity resolution #3, fixed for this phase; per-pass configurable
++    // clear values are future work), and the pass's own recorded
++    // execute() callback (Pass::invokeExecute(), given a real PassContext)
++    // -- then one final vkCmdPipelineBarrier2 for
++    // CompiledGraph::finalBarriers() once every pass has run.
++    //
++    // `graph` must already have been realize()d (directly, or via a prior
++    // compile() + realize() call whose resource shapes this call's own
++    // compile() didn't subsequently change) before this is called.
++    // `backbufferImage`/`backbufferView`/`backbufferExtent` are the
++    // caller-owned target for whichever resource
++    // RenderGraph::setBackbufferSource() named -- never pooled by this
++    // Executor, supplied fresh on every call (Task 3 ambiguity resolution
++    // #4): a real swapchain image acquired this frame, or (as in Task 3's
++    // GPU test) a caller-created offscreen image intended for readback
++    // instead of presentation.
++    void execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage backbufferImage, VkImageView backbufferView,
++                 VkExtent2D backbufferExtent);
++
++    // Forward-declared publicly (the struct body is defined, and only
++    // ever meaningfully used, inside executor.cpp) purely so a handful of
++    // free helper functions in executor.cpp's own anonymous namespace --
++    // applyBarriers()/beginDebugLabel()/endDebugLabel(), none of which are
++    // part of Executor's own interface and none of which any caller
++    // outside this .cpp can ever actually name a real Impl instance to
++    // call them with -- can take an `Impl&` parameter at all. C++ access
++    // control is per-translation-unit-blind (a free function gets none of
++    // a class's own member access just by living in the same .cpp file as
++    // its out-of-line member definitions), so `Impl` itself must be
++    // nameable from outside Executor's member functions for that pattern
++    // to compile; nothing about making the mere NAME public exposes any
++    // actual state -- create()/the constructor/impl_ below stay private,
++    // so no caller can ever construct, copy, or reach a real Impl through
++    // Executor's own public surface.
++    struct Impl;
++
++private:
++    friend class PassContext;
++
++    explicit Executor(std::unique_ptr<Impl> impl);
++
++    [[nodiscard]] VkImageView resolveImageView(std::string_view name) const;
++    [[nodiscard]] VkImage resolveImage(std::string_view name) const;
++    [[nodiscard]] VkBuffer resolveBuffer(std::string_view name) const;
++    [[nodiscard]] VkFormat resolveImageFormat(std::string_view name) const;
++
++    std::unique_ptr<Impl> impl_;
++};
++
++}  // namespace rx::graph
+diff --git a/src/rx_graph/include/rx_graph/pass.h b/src/rx_graph/include/rx_graph/pass.h
+index 65048cd..32dc94f 100644
+--- a/src/rx_graph/include/rx_graph/pass.h
++++ b/src/rx_graph/include/rx_graph/pass.h
+@@ -2,23 +2,31 @@
+ #include <rx_graph/resources.h>
+ 
+ #include <functional>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+ 
+ namespace rx::graph {
+ 
+ // The device-side handle Task 3's executor hands to a pass's recorded
+-// callback (real command buffer, resolved physical resources, ...). Not
+-// defined until Task 3 -- Pass::setExecute only stores the callback in
+-// Task 1; nothing invokes it until the executor exists to build one.
++// callback (real command buffer, resolved physical resources, ...).
++// Defined in executor.h (rx_graph/executor.h), not here: pass.h/
++// render_graph.h/resources.h/barriers.h stay device-free headers (no
++// VkCommandBuffer, no volk, no rx_rhi_vk -- see render_graph.h's own
++// header-hygiene comment), so only a forward declaration lives here.
++// Pass::setExecute only stores the callback; Pass::invokeExecute() below
++// is what actually calls it, once Executor::execute() has a real
++// PassContext to hand it -- neither this header nor render_graph.cpp ever
++// needs PassContext's complete definition themselves, since a
++// std::function<void(PassContext&)> can be stored and invoked through a
++// reference to an incomplete type.
+ class PassContext;
+ 
+ class RenderGraph;
+ 
+ // A declarative description of one graph pass's resource reads/writes,
+ // queue hint, and (from Task 3 on) its recorded work. Constructed
+ // exclusively by RenderGraph::addPass() -- there is no public constructor
+ // -- and returned by reference so declarations chain fluently:
+ //
+ //   graph.addPass("forward")
+@@ -63,20 +71,30 @@ public:
+     // Stores the callback Task 3's executor will invoke with a real
+     // PassContext once this pass's turn comes in CompiledGraph::
+     // executionOrder(). Task 1 only stores it -- nothing here or in
+     // RenderGraph::compile() calls it; PassContext is forward-declared
+     // above precisely because no complete definition exists yet.
+     Pass& setExecute(std::function<void(PassContext&)> fn);
+ 
+     [[nodiscard]] std::string_view name() const;
+     [[nodiscard]] QueueClass queueClass() const;
+ 
++    // Task 3: invokes this pass's recorded execute() callback (setExecute()
++    // above) with a real PassContext, if one was ever stored -- a no-op
++    // for a pass that never called setExecute() (e.g. a pass whose only
++    // job is the sync Executor already emits from CompiledGraph::
++    // passBarriers()/the dynamic-rendering clear it triggers, with nothing
++    // further to record). Declared here (not free-standing in
++    // executor.cpp) because execute_ is a private member; implemented in
++    // render_graph.cpp alongside Pass's other methods.
++    void invokeExecute(PassContext& ctx) const;
++
+ private:
+     friend class RenderGraph;
+ 
+     // Which builder method produced one Declaration -- drives both the
+     // stage/access/layout resolution in RenderGraph::compile() (Task 1
+     // brief, compile algorithm step 1) and the imageUsage union stored on
+     // the resource's PhysicalResource entry.
+     enum class AccessKind : uint8_t {
+         ColorOutput,
+         DepthStencilOutput,
+diff --git a/src/rx_graph/include/rx_graph/render_graph.h b/src/rx_graph/include/rx_graph/render_graph.h
+index 85f5712..598d6b6 100644
+--- a/src/rx_graph/include/rx_graph/render_graph.h
++++ b/src/rx_graph/include/rx_graph/render_graph.h
+@@ -14,20 +14,38 @@ namespace rx::graph {
+ // Swapchain-derived inputs RenderGraph::compile() needs to resolve
+ // SwapchainRelative attachment sizes and the backbuffer resource's own
+ // format/extent (see PhysicalResource::attachment's comment and
+ // RenderGraph::setBackbufferSource()). Device-free: these are plain values
+ // the caller already has from rx_rhi_vk's Device/swapchain, not queried
+ // here -- rx_graph never touches a VkDevice in Task 1.
+ struct CompileInfo {
+     uint32_t swapchainWidth = 0;
+     uint32_t swapchainHeight = 0;
+     VkFormat swapchainFormat = VK_FORMAT_UNDEFINED;
++
++    // Task 3 ambiguity resolution #1: VK_IMAGE_LAYOUT_PRESENT_SRC_KHR is
++    // only meaningful for an image the presentation engine will actually
++    // consume (a real swapchain image) -- an offscreen "backbuffer" (e.g.
++    // Task 3's GPU test, which renders into a caller-created, never-
++    // presented VkImage) has no presentation engine to hand off to at all,
++    // so CompiledGraph::finalBarriers() needs a caller-selectable final
++    // layout instead of Task 2's hardcoded PRESENT_SRC_KHR assumption.
++    // Defaults to PRESENT_SRC_KHR (Task 2's original, unchanged behavior
++    // for the production swapchain-presenting case); pass e.g.
++    // VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL for an offscreen backbuffer a
++    // caller intends to read back instead. RenderGraph::compile() applies
++    // this by overwriting buildBarriers()'s own (still PRESENT_SRC_KHR-
++    // producing) finalBarriers() image barrier's newLayout in place -- see
++    // render_graph.cpp's compile(), immediately after its buildBarriers()
++    // call; barriers.h/barriers.cpp's own hardcoded PRESENT_SRC_KHR is
++    // deliberately left untouched by this change.
++    VkImageLayout backbufferFinalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+ };
+ 
+ // The device-free result of RenderGraph::compile(): which declared passes
+ // survive culling and in what order, every physical resource compile()
+ // resolved, each surviving pass's resolved resource accesses (Task 1
+ // brief), and -- from Task 2 on -- the sync2 barriers compile() derived
+ // from those accesses (passBarriers()/finalBarriers(), populated by
+ // compile()'s last phase; see barriers.h).
+ //
+ // Only RenderGraph::compile() ever populates one of these -- there is no
+@@ -116,20 +134,35 @@ public:
+ 
+     // Culls, orders, and resolves resource lifetimes over every pass
+     // declared so far (Task 1 brief's compile algorithm). Throws
+     // std::runtime_error, naming the offending pass/resource, on: no
+     // backbuffer source set; a duplicate pass name; a read of a resource
+     // no pass writes; or a backbuffer source no pass writes.
+     void compile(const CompileInfo& info);
+ 
+     [[nodiscard]] const CompiledGraph& compiled() const;
+ 
++    // Task 3: the one piece of per-pass data CompiledGraph deliberately
++    // never carries forward on its own (see CompiledGraph's class comment
++    // above -- it only ever resolves *resource* data, never the Pass
++    // object itself) -- needed so Executor::execute() can invoke a
++    // surviving pass's recorded execute() callback (pass.h's
++    // Pass::setExecute) and read its name() for debug labels, given only
++    // the raw pass index CompiledGraph::executionOrder() yields. `rawIndex`
++    // uses the exact same indexing as isCulled()/passAccesses() (addPass()
++    // call order); out-of-range throws std::out_of_range, matching those
++    // two methods' own contract. Purely additive: does not change
++    // compile()'s device-free algorithm, ABI-break any existing accessor,
++    // or give a caller any way to mutate a Pass after the fact (returns a
++    // const reference) -- Task 3 is this method's first caller.
++    [[nodiscard]] const Pass& passAt(uint32_t rawIndex) const;
++
+     // Clears every declared pass, the backbuffer source, and any prior
+     // compile() result, so the graph can be re-declared from scratch
+     // (e.g. for the next frame, or when a sample's pass topology changes).
+     // Every Pass& previously handed out by addPass() is invalidated.
+     void reset();
+ 
+ private:
+     struct Impl;
+     std::unique_ptr<Impl> impl_;
+ };
+diff --git a/src/rx_graph/render_graph.cpp b/src/rx_graph/render_graph.cpp
+index a3dcd0a..729c4ff 100644
+--- a/src/rx_graph/render_graph.cpp
++++ b/src/rx_graph/render_graph.cpp
+@@ -466,27 +466,47 @@ void RenderGraph::compile(const CompileInfo& info) {
+             resource.attachment.width = width;
+             resource.attachment.height = height;
+         }
+     }
+ 
+     // ---- Task 2's last phase: derive every sync2 barrier from the
+     // executionOrder()/resources()/passAccesses() data just resolved above
+     // (barriers.h's buildBarriers()) -----------------------------------
+     compiled.passBarriers_ = buildBarriers(compiled, compiled.finalBarriers_);
+ 
++    // ---- Task 3 ambiguity resolution #1: apply CompileInfo::
++    // backbufferFinalLayout. buildBarriers() itself still always produces
++    // VK_IMAGE_LAYOUT_PRESENT_SRC_KHR (barriers.h/barriers.cpp are
++    // untouched by this task) -- compile() overwrites that one field here
++    // instead, immediately after the call above. finalBarriers_ always has
++    // exactly one imageBarrier (the backbuffer's) once compile() has
++    // gotten this far: the backbuffer-writer validation earlier in this
++    // function already guarantees exactly one PhysicalResource has
++    // isBackbuffer == true, and buildBarriers() always emits exactly one
++    // entry for it (barriers.cpp's own loop `break`s after the first
++    // match) -- the emptiness check below is defensive, not expected to
++    // ever trigger.
++    if (!compiled.finalBarriers_.imageBarriers.empty()) {
++        compiled.finalBarriers_.imageBarriers.front().newLayout = info.backbufferFinalLayout;
++    }
++
+     g.compiled = std::move(compiled);
+ }
+ 
+ const CompiledGraph& RenderGraph::compiled() const {
+     return impl_->compiled;
+ }
+ 
++const Pass& RenderGraph::passAt(uint32_t rawIndex) const {
++    return impl_->passes.at(rawIndex);
++}
++
+ void RenderGraph::reset() {
+     impl_->passes.clear();
+     impl_->backbufferName.clear();
+     impl_->hasBackbuffer = false;
+     impl_->compiled = CompiledGraph{};
+ }
+ 
+ Pass::Pass(std::string name, QueueClass queue) : name_(std::move(name)), queue_(queue) {}
+ 
+ Pass& Pass::addColorOutput(std::string_view name, const AttachmentDesc& desc) {
+@@ -526,11 +546,17 @@ Pass& Pass::setExecute(std::function<void(PassContext&)> fn) {
+ }
+ 
+ std::string_view Pass::name() const {
+     return name_;
+ }
+ 
+ QueueClass Pass::queueClass() const {
+     return queue_;
+ }
+ 
++void Pass::invokeExecute(PassContext& ctx) const {
++    if (execute_) {
++        execute_(ctx);
++    }
++}
++
+ }  // namespace rx::graph
+diff --git a/src/rx_graph/tests/CMakeLists.txt b/src/rx_graph/tests/CMakeLists.txt
+index 51245df..a3496c9 100644
+--- a/src/rx_graph/tests/CMakeLists.txt
++++ b/src/rx_graph/tests/CMakeLists.txt
+@@ -1,12 +1,50 @@
+ # Device-free (no rx::platform::Window, no VkSurfaceKHR, no vk-bootstrap
+ # instance) -- unlike rx_rhi_vk_tests' doctest_main.cpp, this binary needs
+ # no warm-up before its first TEST_CASE runs, so doctest_main.cpp here is
+ # the plain DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN translation unit rx_core_tests
+-# uses.
++# uses. Task 1/2 compile()/barrier tests only -- Task 3's GPU-backed tests
++# live in the separate rx_graph_gpu_tests target below, never in this one.
+ add_executable(rx_graph_tests
+     doctest_main.cpp
+     test_compile.cpp
+     test_barriers.cpp
+ )
+ target_link_libraries(rx_graph_tests PRIVATE rx_graph doctest::doctest)
+ add_test(NAME rx_graph_tests COMMAND rx_graph_tests)
++
++# Task 3: GPU-backed Executor tests -- a real headless-but-validated
++# rx::rhi::Device (via rx::platform::Window, exactly like
++# rx_rhi_vk_tests' own windowed test fixtures), so this binary needs the
++# SAME warm-up-before-any-TEST_CASE main() rx_rhi_vk/tests/doctest_main.cpp
++# established (copied into doctest_main_gpu.cpp here -- see that file's own
++# comment for why it is not shared with rx_graph_tests' plain main above:
++# only THIS binary's tests build a real vk-bootstrap instance at all).
++# rx_shader is linked because test_execute_gpu.cpp compiles its "invert"
++# shader in-process (rx::shader::Compiler + reflect(), same reflection-
++# driven pipeline-layout path samples/03_bindless_mesh/main.cpp
++# established) rather than through a slangc build-time precompile --
++# rx_shader_deploy_runtime_libs() (defined in src/rx_shader/CMakeLists.txt,
++# add_subdirectory'd before src/rx_graph in the root CMakeLists.txt) copies
++# the Slang runtime shared libraries this binary needs at load time next
++# to it, exactly like every other rx_shader-linking binary in this repo.
++add_executable(rx_graph_gpu_tests
++    doctest_main_gpu.cpp
++    test_execute_gpu.cpp
++)
++target_link_libraries(rx_graph_gpu_tests PRIVATE rx_graph rx_rhi_vk rx_platform rx_shader doctest::doctest)
++rx_shader_deploy_runtime_libs(rx_graph_gpu_tests)
++
++# --validate: appended for the same reason every sample's own headless
++# ctest gate appends it (samples/01_triangle/CMakeLists.txt etc.) -- ctest
++# is the developer/CI gate, opting into the Vulkan validation layers on
++# top of whatever a plain manual run would default to. This binary's
++# fixtures already build every rx::rhi::Context with enableValidation=true
++# unconditionally (unlike a sample's runtime --validate flag, which
++# toggles validation on/off), and each TEST_CASE's own
++# CHECK_FALSE(context.hasValidationErrors()) is what actually turns any
++# validation message into a real ctest failure, matching every existing
++# rx_rhi_vk_tests test case's own idiom -- doctest itself does not
++# recognize this argument and silently ignores it, so this flag's role
++# here is documentation/consistency with the rest of this repo's GPU-gate
++# invocations, not a behavior switch doctest itself reads.
++add_test(NAME rx_graph_gpu_tests COMMAND rx_graph_gpu_tests --validate)
+diff --git a/src/rx_graph/tests/doctest_main_gpu.cpp b/src/rx_graph/tests/doctest_main_gpu.cpp
+new file mode 100644
+index 0000000..ba34af5
+--- /dev/null
++++ b/src/rx_graph/tests/doctest_main_gpu.cpp
+@@ -0,0 +1,49 @@
++// DOCTEST_CONFIG_IMPLEMENT (not _WITH_MAIN): main() below needs to run code
++// before any TEST_CASE executes, so it constructs and drives the
++// doctest::Context itself instead of using doctest's generated main() --
++// the exact same warm-up pattern src/rx_rhi_vk/tests/doctest_main.cpp
++// establishes, copied here (not shared -- rx_graph_tests, the existing
++// device-free target, keeps its own plain DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
++// doctest_main.cpp unchanged; this file is rx_graph_gpu_tests' own, since
++// only THIS binary's tests ever touch a real VkDevice) because this
++// binary's tests build their own headless/windowed rx::rhi::Context+Device
++// instances directly, and are exposed to the exact same vk-bootstrap
++// process-wide instance-function-pointer-caching hazard documented on that
++// original file: see rx::rhi::Context::create()'s own WARNING (rx_rhi_vk/
++// context.h) for the full defect this warm-up exists to avoid.
++#define DOCTEST_CONFIG_IMPLEMENT
++#include <doctest/doctest.h>
++#include <rx_rhi_vk/context.h>
++#include <rx_platform/window.h>
++
++#include <vector>
++
++namespace {
++
++void warmUpVkBootstrapInstanceFunctionCache() {
++    std::vector<const char*> extensions;
++    auto window = rx::platform::Window::create("rx_graph_gpu_tests_warmup", 64, 64, /*visible=*/false);
++    if (window.has_value()) {
++        extensions = window->requiredVulkanInstanceExtensions();
++    }
++    // enableValidation=true here is not incidental -- see
++    // rx_rhi_vk/tests/doctest_main.cpp's identical warm-up for the full
++    // rationale (the same process-wide vk-bootstrap cache also covers
++    // fp_vkCreateDebugUtilsMessengerEXT, only non-null when the FIRST
++    // instance built in this process actually requested validation).
++    rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    warmUpVkBootstrapInstanceFunctionCache();
++
++    doctest::Context context;
++    context.applyCommandLine(argc, argv);
++    int res = context.run();
++    if (context.shouldExit()) {
++        return res;
++    }
++    return res;
++}
+diff --git a/src/rx_graph/tests/test_barriers.cpp b/src/rx_graph/tests/test_barriers.cpp
+index f89679c..0cb3819 100644
+--- a/src/rx_graph/tests/test_barriers.cpp
++++ b/src/rx_graph/tests/test_barriers.cpp
+@@ -369,34 +369,65 @@ TEST_CASE("compute-to-draw-buffer") {
+     CHECK(barriers[0].bufferBarriers.empty());
+ 
+     REQUIRE(barriers[1].bufferBarriers.size() == 1);
+     checkBufferBarrier(barriers[1].bufferBarriers[0], particles, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+ }
+ 
+ TEST_CASE("present-final") {
+-    RenderGraph graph;
+-    graph.addPass("present").addColorOutput("bb", colorDesc());
+-    graph.setBackbufferSource("bb");
+-    graph.compile(kInfo);
++    // Task 3 ambiguity resolution #1: CompileInfo::backbufferFinalLayout
++    // defaults to VK_IMAGE_LAYOUT_PRESENT_SRC_KHR (Task 2's original,
++    // unchanged behavior) but is now caller-selectable -- an offscreen
++    // "backbuffer" (no presentation engine involved at all, e.g. Task 3's
++    // GPU test) needs some other final layout instead. Both subcases
++    // share everything except that one CompileInfo field and its expected
++    // effect on finalBarriers().
++    SUBCASE("default backbufferFinalLayout is PRESENT_SRC_KHR (Task 2 behavior, unchanged)") {
++        RenderGraph graph;
++        graph.addPass("present").addColorOutput("bb", colorDesc());
++        graph.setBackbufferSource("bb");
++        graph.compile(kInfo);
++
++        const CompiledGraph& compiled = graph.compiled();
++        const uint32_t bb = physicalIndexOf(compiled, "bb");
++
++        const PassBarriers& final_ = compiled.finalBarriers();
++        REQUIRE(final_.imageBarriers.size() == 1);
++        CHECK(final_.bufferBarriers.empty());
++        checkImageBarrier(final_.imageBarriers[0], bb, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
++                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
++                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
++    }
+ 
+-    const CompiledGraph& compiled = graph.compiled();
+-    const uint32_t bb = physicalIndexOf(compiled, "bb");
+-
+-    const PassBarriers& final_ = compiled.finalBarriers();
+-    REQUIRE(final_.imageBarriers.size() == 1);
+-    CHECK(final_.bufferBarriers.empty());
+-    checkImageBarrier(final_.imageBarriers[0], bb, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+-                       VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+-                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
++    SUBCASE("explicit backbufferFinalLayout overrides PRESENT_SRC_KHR (Task 3: offscreen backbuffer)") {
++        RenderGraph graph;
++        graph.addPass("present").addColorOutput("bb", colorDesc());
++        graph.setBackbufferSource("bb");
++
++        CompileInfo info = kInfo;
++        info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++        graph.compile(info);
++
++        const CompiledGraph& compiled = graph.compiled();
++        const uint32_t bb = physicalIndexOf(compiled, "bb");
++
++        const PassBarriers& final_ = compiled.finalBarriers();
++        REQUIRE(final_.imageBarriers.size() == 1);
++        CHECK(final_.bufferBarriers.empty());
++        // Every field but newLayout is unaffected by this override -- same
++        // srcStage/srcAccess/oldLayout as the default subcase above.
++        checkImageBarrier(final_.imageBarriers[0], bb, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
++                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
++                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    }
+ }
+ 
+ TEST_CASE("culled-contributes-nothing") {
+     RenderGraph graph;
+     graph.addPass("producer").addColorOutput("shared", colorDesc());  // pass 0
+     // Reads "shared" but produces nothing anything else depends on, and
+     // isn't a side effect -- culled. Its texture-input access has no
+     // attachment output alongside it, so (if it ran) it would resolve to
+     // COMPUTE_SHADER/SHADER_SAMPLED_READ, a *different* stage than
+     // "consumer" below. If buildBarriers() ever walked culled passes too,
+diff --git a/src/rx_graph/tests/test_execute_gpu.cpp b/src/rx_graph/tests/test_execute_gpu.cpp
+new file mode 100644
+index 0000000..075052a
+--- /dev/null
++++ b/src/rx_graph/tests/test_execute_gpu.cpp
+@@ -0,0 +1,724 @@
++// Task 3's TDD-required GPU test: two cases, both device-backed (a real
++// headless-but-validated rx::rhi::Device, same windowed-headless fixture
++// pattern src/rx_rhi_vk/tests/texture_test.cpp/upload_test.cpp already
++// establish -- rx::rhi::Device::create() needs a real VkSurfaceKHR even
++// though nothing here ever presents to it).
++//
++// Case 1 ("invert"): graph = pass "draw" (writes a pooled 256x256
++// R8G8B8A8_UNORM "color" attachment, side-effect-free -- kept alive only
++// because "invert" reads it, exercising the same reachability-based
++// culling path Tasks 1-2 already established, not a setSideEffect()
++// escape hatch) -> pass "invert" (reads "color" as a texture input,
++// writes the backbuffer "bb"; its execute() callback registers "color"'s
++// resolved view into a real rx::rhi::BindlessTable, binds a small
++// hand-built dynamic-rendering pipeline, and draws a fullscreen triangle
++// that samples + inverts it). "draw" never runs any shader at all: its
++// entire contribution is establishing "color" and being cleared to
++// {0,0,0,1} by Executor::execute()'s own load-op logic -- so the exact,
++// deterministic corner-pixel readback this test asserts is simply that
++// fixed clear color, channel-inverted, in "bb".
++//
++// Case 2 ("resize-rerealize"): compiles the same kind of graph at 128x128,
++// realize()s it, recompiles it at 256x256, realize()s it again, executes
++// once -- proving Executor::realize() is safe to call again after a
++// resource-shape change (TransientPool's acquire/release/reacquire cycle
++// across two different-shaped realizes) with zero validation errors.
++#include <doctest/doctest.h>
++#include <rx_graph/executor.h>
++#include <rx_graph/render_graph.h>
++
++#include <rx_platform/window.h>
++#include <rx_rhi_vk/bindless.h>
++#include <rx_rhi_vk/buffer.h>
++#include <rx_rhi_vk/command.h>
++#include <rx_rhi_vk/context.h>
++#include <rx_rhi_vk/deletion_queue.h>
++#include <rx_rhi_vk/device.h>
++#include <rx_rhi_vk/pipeline_layout.h>
++#include <rx_shader/compiler.h>
++#include <rx_shader/reflection.h>
++
++#include <array>
++#include <cstdint>
++#include <cstring>
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++using namespace rx::graph;
++
++namespace {
++
++constexpr uint32_t kExtent = 256;
++constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
++
++// Same skip-guarded windowed-device fixture pattern as
++// rx_rhi_vk/tests/texture_test.cpp/upload_test.cpp -- Executor::create()
++// needs a real rx::rhi::Device&, which needs a real VkSurfaceKHR even
++// though nothing in either test case below ever presents to it.
++struct GpuFixture {
++    rx::platform::Window window;
++    rx::rhi::Context context;
++    rx::rhi::Device device;
++    rx::rhi::Allocator allocator;
++    std::unique_ptr<Executor> executor;
++};
++
++std::optional<GpuFixture> makeFixture(const char* title) {
++    auto window = rx::platform::Window::create(title, 64, 64, /*visible=*/false);
++    if (!window.has_value()) {
++        MESSAGE("no display backend available, skipping rx_graph GPU test");
++        return std::nullopt;
++    }
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        MESSAGE("video driver reports no Vulkan surface extensions (e.g. dummy driver), skipping rx_graph GPU test");
++        return std::nullopt;
++    }
++
++    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++
++    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
++    REQUIRE(surface != VK_NULL_HANDLE);
++
++    auto device = rx::rhi::Device::create(*context, surface);
++    REQUIRE(device.has_value());
++
++    auto allocator = rx::rhi::Allocator::create(*context, *device);
++    REQUIRE(allocator.has_value());
++
++    auto executor = Executor::create(*device);
++    REQUIRE(executor != nullptr);
++
++    return GpuFixture{std::move(*window), std::move(*context), std::move(*device), std::move(*allocator),
++                       std::move(executor)};
++}
++
++// --- Offscreen "backbuffer" -- an external, never-pooled image the test
++// itself owns [Task 3 ambiguity resolution #4], same raw (non-RAII, manual
++// teardown before device destruction) construction pattern
++// samples/01_triangle/main.cpp's runHeadless() and
++// rx_rhi_vk/tests/clear_color_test.cpp both already use. -----------------
++struct OffscreenImage {
++    VkImage image = VK_NULL_HANDLE;
++    VkDeviceMemory memory = VK_NULL_HANDLE;
++    VkImageView view = VK_NULL_HANDLE;
++};
++
++std::optional<OffscreenImage> createOffscreenImage(VkDevice device, VkPhysicalDevice physicalDevice, VkFormat format,
++                                                     VkExtent2D extent) {
++    OffscreenImage result;
++
++    VkImageCreateInfo imageInfo{};
++    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    imageInfo.imageType = VK_IMAGE_TYPE_2D;
++    imageInfo.format = format;
++    imageInfo.extent = {extent.width, extent.height, 1};
++    imageInfo.mipLevels = 1;
++    imageInfo.arrayLayers = 1;
++    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
++    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
++    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    if (vkCreateImage(device, &imageInfo, nullptr, &result.image) != VK_SUCCESS) {
++        return std::nullopt;
++    }
++
++    VkMemoryRequirements memReq{};
++    vkGetImageMemoryRequirements(device, result.image, &memReq);
++    VkPhysicalDeviceMemoryProperties memProps{};
++    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
++
++    uint32_t memoryTypeIndex = UINT32_MAX;
++    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
++        if ((memReq.memoryTypeBits & (1U << i)) != 0U &&
++            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0U) {
++            memoryTypeIndex = i;
++            break;
++        }
++    }
++    if (memoryTypeIndex == UINT32_MAX) {
++        vkDestroyImage(device, result.image, nullptr);
++        return std::nullopt;
++    }
++
++    VkMemoryAllocateInfo allocInfo{};
++    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++    allocInfo.allocationSize = memReq.size;
++    allocInfo.memoryTypeIndex = memoryTypeIndex;
++    if (vkAllocateMemory(device, &allocInfo, nullptr, &result.memory) != VK_SUCCESS) {
++        vkDestroyImage(device, result.image, nullptr);
++        return std::nullopt;
++    }
++    if (vkBindImageMemory(device, result.image, result.memory, 0) != VK_SUCCESS) {
++        vkFreeMemory(device, result.memory, nullptr);
++        vkDestroyImage(device, result.image, nullptr);
++        return std::nullopt;
++    }
++
++    VkImageViewCreateInfo viewInfo{};
++    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++    viewInfo.image = result.image;
++    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    viewInfo.format = format;
++    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    viewInfo.subresourceRange.levelCount = 1;
++    viewInfo.subresourceRange.layerCount = 1;
++    if (vkCreateImageView(device, &viewInfo, nullptr, &result.view) != VK_SUCCESS) {
++        vkFreeMemory(device, result.memory, nullptr);
++        vkDestroyImage(device, result.image, nullptr);
++        return std::nullopt;
++    }
++
++    return result;
++}
++
++void destroyOffscreenImage(VkDevice device, OffscreenImage& img) {
++    if (img.view != VK_NULL_HANDLE) {
++        vkDestroyImageView(device, img.view, nullptr);
++    }
++    if (img.image != VK_NULL_HANDLE) {
++        vkDestroyImage(device, img.image, nullptr);
++    }
++    if (img.memory != VK_NULL_HANDLE) {
++        vkFreeMemory(device, img.memory, nullptr);
++    }
++    img = OffscreenImage{};
++}
++
++// --- The "invert" pipeline: a fullscreen triangle (SV_VertexID trick, no
++// vertex buffer -- same idiom as shaders/triangle.vert.slang) that samples
++// a bindless-registered Texture2D and writes its channel-inverted color.
++// Compiled at RUNTIME via rx::shader::Compiler [same reasoning as
++// samples/03_bindless_mesh/main.cpp's kShaderSource: reflection must walk
++// the actual shader driving this test's pipeline layout, which requires
++// the runtime path, not a slangc build-time precompile]. Set 0's two
++// bindings deliberately match rx::rhi::BindlessTable's own fixed scheme
++// (kSampledImageBinding=0/kSamplerBinding=1) -- a strict subset of its
++// three slots (no storage buffer use at all), which
++// PipelineLayoutBuilder::build()'s externalSet0 substitution explicitly
++// supports [pipeline_layout.h: "a shader is free to use a strict subset of
++// the three slots"]. ------------------------------------------------------
++constexpr const char* kInvertShaderSource = R"(
++struct PushConstants {
++    uint textureIndex;
++    uint samplerIndex;
++};
++
++[[vk::push_constant]]
++ConstantBuffer<PushConstants> gPush;
++
++[[vk::binding(0, 0)]]
++Texture2D gTextures[];
++
++[[vk::binding(1, 0)]]
++SamplerState gSamplers[];
++
++struct VSOut {
++    float4 position : SV_Position;
++    float2 uv : TEXCOORD0;
++};
++
++[shader("vertex")]
++VSOut vsMain(uint vertexID : SV_VertexID)
++{
++    // The classic "one big triangle covering the whole clip-space square"
++    // trick: (-1,-1), (3,-1), (-1,3) fully covers [-1,1]x[-1,1] once
++    // rasterized/clipped, so every pixel in the render area is covered by
++    // exactly one triangle, same effect as a full-screen quad with no
++    // second draw/index buffer needed.
++    float2 positions[3] = float2[3](
++        float2(-1.0, -1.0),
++        float2(3.0, -1.0),
++        float2(-1.0, 3.0)
++    );
++    float2 p = positions[vertexID];
++
++    VSOut o;
++    o.position = float4(p, 0.0, 1.0);
++    o.uv = p * 0.5 + 0.5;
++    return o;
++}
++
++[shader("fragment")]
++float4 fsMain(VSOut input) : SV_Target
++{
++    float4 c = gTextures[gPush.textureIndex].Sample(gSamplers[gPush.samplerIndex], input.uv);
++    return float4(1.0 - c.rgb, 1.0);
++}
++)";
++
++const std::vector<std::string> kInvertEntryPoints = {"vsMain", "fsMain"};
++
++struct InvertPipeline {
++    VkShaderModule vertModule = VK_NULL_HANDLE;
++    VkShaderModule fragModule = VK_NULL_HANDLE;
++    rx::rhi::PipelineLayoutBundle layoutBundle;
++    VkPipeline pipeline = VK_NULL_HANDLE;
++    uint32_t pushConstantOffset = 0;
++    uint32_t pushConstantSize = 0;
++    VkShaderStageFlags pushConstantStages = 0;
++};
++
++void destroyInvertPipeline(VkDevice device, InvertPipeline& p) {
++    if (p.pipeline != VK_NULL_HANDLE) {
++        vkDestroyPipeline(device, p.pipeline, nullptr);
++    }
++    if (p.fragModule != VK_NULL_HANDLE) {
++        vkDestroyShaderModule(device, p.fragModule, nullptr);
++    }
++    if (p.vertModule != VK_NULL_HANDLE) {
++        vkDestroyShaderModule(device, p.vertModule, nullptr);
++    }
++    p.pipeline = VK_NULL_HANDLE;
++    p.fragModule = VK_NULL_HANDLE;
++    p.vertModule = VK_NULL_HANDLE;
++    p.layoutBundle = rx::rhi::PipelineLayoutBundle{};
++}
++
++std::optional<InvertPipeline> buildInvertPipeline(VkDevice device, VkFormat colorFormat,
++                                                    VkDescriptorSetLayout bindlessSetLayout) {
++    InvertPipeline result;
++
++    auto compiler = rx::shader::Compiler::create();
++    if (!compiler.has_value()) {
++        return std::nullopt;
++    }
++
++    rx::shader::CompileResult compileResult =
++        compiler->compileFromSource("RxGraphInvertModule", kInvertShaderSource, kInvertEntryPoints);
++    if (!compileResult.ok) {
++        MESSAGE("rx_graph invert shader compile failed: ", compileResult.diagnostics);
++        return std::nullopt;
++    }
++
++    auto layoutInfo = rx::shader::reflect(compileResult);
++    if (!layoutInfo.has_value() || layoutInfo->pushRanges.size() != 1) {
++        return std::nullopt;
++    }
++
++    // THE substitution this test exists to prove alongside execution: set
++    // 0 becomes the real BindlessTable's own layout, not a lookalike this
++    // builder would otherwise invent -- see pipeline_layout.h's comment on
++    // build()'s externalSet0 parameter.
++    auto layoutBundle = rx::rhi::PipelineLayoutBuilder::build(device, *layoutInfo, bindlessSetLayout);
++    if (!layoutBundle.has_value()) {
++        return std::nullopt;
++    }
++    result.layoutBundle = std::move(*layoutBundle);
++    result.pushConstantOffset = layoutInfo->pushRanges[0].offset;
++    result.pushConstantSize = layoutInfo->pushRanges[0].size;
++    result.pushConstantStages = layoutInfo->pushRanges[0].stages;
++
++    for (const auto& blob : compileResult.entryPointCode) {
++        VkShaderModuleCreateInfo moduleInfo{};
++        moduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
++        moduleInfo.codeSize = blob.code.size() * sizeof(uint32_t);
++        moduleInfo.pCode = blob.code.data();
++
++        VkShaderModule module = VK_NULL_HANDLE;
++        if (vkCreateShaderModule(device, &moduleInfo, nullptr, &module) != VK_SUCCESS) {
++            destroyInvertPipeline(device, result);
++            return std::nullopt;
++        }
++        if (blob.entryPointName == "vsMain") {
++            result.vertModule = module;
++        } else if (blob.entryPointName == "fsMain") {
++            result.fragModule = module;
++        } else {
++            vkDestroyShaderModule(device, module, nullptr);
++            destroyInvertPipeline(device, result);
++            return std::nullopt;
++        }
++    }
++    if (result.vertModule == VK_NULL_HANDLE || result.fragModule == VK_NULL_HANDLE) {
++        destroyInvertPipeline(device, result);
++        return std::nullopt;
++    }
++
++    std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
++    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++    stages[0].module = result.vertModule;
++    stages[0].pName = "main";
++    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++    stages[1].module = result.fragModule;
++    stages[1].pName = "main";
++
++    VkPipelineVertexInputStateCreateInfo vertexInputState{};
++    vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
++
++    VkPipelineInputAssemblyStateCreateInfo inputAssemblyState{};
++    inputAssemblyState.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
++    inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++
++    VkPipelineViewportStateCreateInfo viewportState{};
++    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
++    viewportState.viewportCount = 1;
++    viewportState.scissorCount = 1;
++
++    VkPipelineRasterizationStateCreateInfo rasterizationState{};
++    rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
++    rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
++    rasterizationState.cullMode = VK_CULL_MODE_NONE;
++    rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++    rasterizationState.lineWidth = 1.0F;
++
++    VkPipelineMultisampleStateCreateInfo multisampleState{};
++    multisampleState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
++    multisampleState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++
++    VkPipelineColorBlendAttachmentState blendAttachment{};
++    blendAttachment.blendEnable = VK_FALSE;
++    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
++                                      VK_COLOR_COMPONENT_A_BIT;
++
++    VkPipelineColorBlendStateCreateInfo colorBlendState{};
++    colorBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
++    colorBlendState.attachmentCount = 1;
++    colorBlendState.pAttachments = &blendAttachment;
++
++    std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
++    VkPipelineDynamicStateCreateInfo dynamicState{};
++    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
++    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
++    dynamicState.pDynamicStates = dynamicStates.data();
++
++    VkPipelineRenderingCreateInfo renderingCreateInfo{};
++    renderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
++    renderingCreateInfo.colorAttachmentCount = 1;
++    renderingCreateInfo.pColorAttachmentFormats = &colorFormat;
++
++    VkGraphicsPipelineCreateInfo pipelineInfo{};
++    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
++    pipelineInfo.pNext = &renderingCreateInfo;
++    pipelineInfo.stageCount = static_cast<uint32_t>(stages.size());
++    pipelineInfo.pStages = stages.data();
++    pipelineInfo.pVertexInputState = &vertexInputState;
++    pipelineInfo.pInputAssemblyState = &inputAssemblyState;
++    pipelineInfo.pViewportState = &viewportState;
++    pipelineInfo.pRasterizationState = &rasterizationState;
++    pipelineInfo.pMultisampleState = &multisampleState;
++    pipelineInfo.pColorBlendState = &colorBlendState;
++    pipelineInfo.pDynamicState = &dynamicState;
++    pipelineInfo.layout = result.layoutBundle.layout;
++    pipelineInfo.renderPass = VK_NULL_HANDLE;  // dynamic rendering
++    pipelineInfo.basePipelineIndex = -1;
++
++    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &result.pipeline) !=
++        VK_SUCCESS) {
++        destroyInvertPipeline(device, result);
++        return std::nullopt;
++    }
++
++    return result;
++}
++
++AttachmentDesc absoluteColorDesc(uint32_t width, uint32_t height) {
++    AttachmentDesc desc;
++    desc.format = kFormat;
++    desc.sizeClass = SizeClass::Absolute;
++    desc.width = static_cast<float>(width);
++    desc.height = static_cast<float>(height);
++    return desc;
++}
++
++}  // namespace
++
++TEST_CASE("Executor::execute draws into a pooled transient, samples it bindlessly, and inverts into the backbuffer") {
++    auto fixture = makeFixture("rx_graph_gpu_invert");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    const VkDevice device = fixture->device.device();
++    const VkPhysicalDevice physicalDevice = fixture->device.physicalDevice();
++
++    auto bindlessTable =
++        rx::rhi::BindlessTable::create(physicalDevice, device, rx::rhi::BindlessTable::Capacities{4, 2, 1});
++    REQUIRE(bindlessTable.has_value());
++
++    auto pipeline = buildInvertPipeline(device, kFormat, bindlessTable->descriptorSetLayout());
++    REQUIRE(pipeline.has_value());
++
++    VkSamplerCreateInfo samplerInfo{};
++    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
++    samplerInfo.magFilter = VK_FILTER_NEAREST;
++    samplerInfo.minFilter = VK_FILTER_NEAREST;
++    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    VkSampler sampler = VK_NULL_HANDLE;
++    REQUIRE(vkCreateSampler(device, &samplerInfo, nullptr, &sampler) == VK_SUCCESS);
++    auto samplerHandle = bindlessTable->registerSampler(sampler);
++    REQUIRE(samplerHandle.isValid());
++
++    auto offscreen = createOffscreenImage(device, physicalDevice, kFormat, VkExtent2D{kExtent, kExtent});
++    REQUIRE(offscreen.has_value());
++
++    // Task 3 ambiguity resolution #6: the "invert" pass's own callback
++    // registers "color"'s resolved view into the bindless table, and its
++    // handle is released via DeletionQueue after this frame's submission
++    // is confirmed complete -- per bindless.h's RELEASE-SAFETY CONTRACT,
++    // not an eager bare release() call.
++    rx::rhi::DeletionQueue deletionQueue;
++    rx::rhi::BindlessHandle colorHandle;
++
++    RenderGraph graph;
++    graph.addPass("draw").addColorOutput("color", absoluteColorDesc(kExtent, kExtent));
++    graph.addPass("invert")
++        .addTextureInput("color")
++        .addColorOutput("bb", absoluteColorDesc(kExtent, kExtent))
++        .setExecute([&](PassContext& ctx) {
++            colorHandle = bindlessTable->registerSampledImage(ctx.imageView("color"),
++                                                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++            REQUIRE(colorHandle.isValid());
++
++            vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
++
++            VkDescriptorSet set = bindlessTable->descriptorSet();
++            vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->layoutBundle.layout, 0, 1,
++                                     &set, 0, nullptr);
++
++            struct {
++                uint32_t textureIndex;
++                uint32_t samplerIndex;
++            } push{colorHandle.index(), samplerHandle.index()};
++            vkCmdPushConstants(ctx.cmd, pipeline->layoutBundle.layout, pipeline->pushConstantStages,
++                                pipeline->pushConstantOffset, pipeline->pushConstantSize, &push);
++
++            VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.renderArea.width),
++                                 static_cast<float>(ctx.renderArea.height), 0.0F, 1.0F};
++            VkRect2D scissor{{0, 0}, ctx.renderArea};
++            vkCmdSetViewport(ctx.cmd, 0, 1, &viewport);
++            vkCmdSetScissor(ctx.cmd, 0, 1, &scissor);
++
++            vkCmdDraw(ctx.cmd, 3, 1, 0, 0);
++        });
++    graph.setBackbufferSource("bb");
++
++    CompileInfo info;
++    info.swapchainWidth = kExtent;
++    info.swapchainHeight = kExtent;
++    info.swapchainFormat = kFormat;
++    // Offscreen backbuffer, never presented -- see Task 3 ambiguity
++    // resolution #1: TRANSFER_SRC_OPTIMAL is what this test's own readback
++    // copy needs finalBarriers() to leave "bb" in, not PRESENT_SRC_KHR.
++    info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    graph.compile(info);
++
++    fixture->executor->realize(graph);
++
++    auto cmdCtx =
++        rx::rhi::CommandContext::create(device, fixture->device.graphicsQueue(), fixture->device.graphicsQueueFamily());
++    REQUIRE(cmdCtx.has_value());
++
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
++    });
++
++    // runOnce() above already vkQueueWaitIdle()'d, so this submission is
++    // provably complete -- tagging with frame 0 and immediately confirming
++    // it here is safe (if conservative: real production code would tag
++    // with a real frame number and confirm it only once a real fence is
++    // known signaled). Demonstrates the deferred-release idiom
++    // bindless.h's contract requires, rather than an eager bare release().
++    deletionQueue.retire([&bindlessTable, colorHandle] { bindlessTable->release(colorHandle); }, 0);
++    deletionQueue.onFrameFenceSignaled(0);
++
++    const VkDeviceSize pixelBytes = static_cast<VkDeviceSize>(kExtent) * kExtent * 4;
++    auto readback = fixture->allocator.createHostVisibleBuffer(pixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    REQUIRE(readback.has_value());
++
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        VkBufferImageCopy region{};
++        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        region.imageSubresource.layerCount = 1;
++        region.imageExtent = {kExtent, kExtent, 1};
++        vkCmdCopyImageToBuffer(cmd, offscreen->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1,
++                                &region);
++    });
++    readback->invalidate();
++
++    std::array<uint8_t, 4> corner{};
++    std::memcpy(corner.data(), readback->mappedData(), corner.size());
++
++    // "draw" clears "color" to {0,0,0,1} (Task 3 ambiguity resolution #3's
++    // fixed color clear value) and runs no shader at all; "invert" samples
++    // that solid black and writes 1.0 - color.rgb, alpha 1.0 -- exact,
++    // deterministic white in every channel.
++    CHECK(corner[0] == 255);
++    CHECK(corner[1] == 255);
++    CHECK(corner[2] == 255);
++    CHECK(corner[3] == 255);
++
++    vkDeviceWaitIdle(device);
++    bindlessTable->release(samplerHandle);
++    vkDestroySampler(device, sampler, nullptr);
++    destroyInvertPipeline(device, *pipeline);
++    destroyOffscreenImage(device, *offscreen);
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("Executor::realize is safe to call again after a resource-shape change (resize-rerealize)") {
++    auto fixture = makeFixture("rx_graph_gpu_resize");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    const VkDevice device = fixture->device.device();
++    const VkPhysicalDevice physicalDevice = fixture->device.physicalDevice();
++
++    // "aux" is SwapchainRelative (1.0x1.0), so its real extent tracks
++    // CompileInfo::swapchainWidth/Height across the two compile() calls
++    // below -- exactly the shape a real swapchain resize produces for any
++    // window-relative attachment. "fill" has no execute() callback at all:
++    // its only job is to exist as a pooled resource whose shape changes,
++    // exercising TransientPool's acquire/release/reacquire path across two
++    // differently-shaped realize() calls.
++    AttachmentDesc auxDesc;
++    auxDesc.format = kFormat;
++    auxDesc.sizeClass = SizeClass::SwapchainRelative;
++    auxDesc.width = 1.0F;
++    auxDesc.height = 1.0F;
++
++    RenderGraph graph;
++    graph.addPass("fill").addColorOutput("aux", auxDesc).addColorOutput("bb", absoluteColorDesc(1, 1));
++    graph.setBackbufferSource("bb");
++
++    CompileInfo info128;
++    info128.swapchainWidth = 128;
++    info128.swapchainHeight = 128;
++    info128.swapchainFormat = kFormat;
++    info128.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    graph.compile(info128);
++    fixture->executor->realize(graph);
++
++    CompileInfo info256 = info128;
++    info256.swapchainWidth = 256;
++    info256.swapchainHeight = 256;
++    graph.compile(info256);
++    fixture->executor->realize(graph);
++
++    auto offscreen = createOffscreenImage(device, physicalDevice, kFormat, VkExtent2D{kExtent, kExtent});
++    REQUIRE(offscreen.has_value());
++
++    auto cmdCtx =
++        rx::rhi::CommandContext::create(device, fixture->device.graphicsQueue(), fixture->device.graphicsQueueFamily());
++    REQUIRE(cmdCtx.has_value());
++
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
++    });
++
++    const VkDeviceSize pixelBytes = static_cast<VkDeviceSize>(kExtent) * kExtent * 4;
++    auto readback = fixture->allocator.createHostVisibleBuffer(pixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    REQUIRE(readback.has_value());
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        VkBufferImageCopy region{};
++        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        region.imageSubresource.layerCount = 1;
++        region.imageExtent = {kExtent, kExtent, 1};
++        vkCmdCopyImageToBuffer(cmd, offscreen->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1,
++                                &region);
++    });
++    readback->invalidate();
++    std::array<uint8_t, 4> corner{};
++    std::memcpy(corner.data(), readback->mappedData(), corner.size());
++    // The fixed clear color, at whatever extent the second (256x256)
++    // compile()/realize() actually bound -- a mismatched/stale pooled
++    // "aux" binding would still let a plain clear succeed (nothing
++    // cross-checks "aux" against "bb" here), but a genuinely broken
++    // reacquire (e.g. a destroyed/dangling image handle, or an extent the
++    // driver considers invalid for this render area) would show up as
++    // either a real Vulkan error this readback surfaces or a validation
++    // message the CHECK_FALSE below catches -- this executes the full
++    // two-compile/two-realize/one-execute path for real, not a no-op.
++    CHECK(corner[0] == 0);
++    CHECK(corner[1] == 0);
++    CHECK(corner[2] == 0);
++    CHECK(corner[3] == 255);
++
++    vkDeviceWaitIdle(device);
++    destroyOffscreenImage(device, *offscreen);
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE(
++    "Executor::execute synthesizes the missing first-use barrier for a pooled storage buffer across two "
++    "consecutive execute() calls") {
++    // Regression coverage for a real gap found while implementing the
++    // image-only [Task 3 ambiguity resolution #2] first-use-of-frame
++    // override: a pooled BUFFER's true first access within one compile
++    // walk gets NO barrier at all from CompiledGraph::passBarriers() (see
++    // executor.cpp's synthesizeFirstUseBufferBarrierIfNeeded() for the
++    // full explanation of why that is Task 2's own correct, tested
++    // behavior for a compile walk with no notion of "a previous frame",
++    // and why it is nonetheless unsafe, unmodified, for a buffer this
++    // Executor pools and reuses call after call). Two back-to-back
++    // execute() calls against the SAME realize()d graph is exactly the
++    // shape that would go unsynchronized without that fix: the SECOND
++    // call's "produce" pass reuses the exact same pooled VkBuffer the
++    // FIRST call's "produce" pass already wrote and "consume" pass already
++    // read, with nothing but this synthesized barrier standing between
++    // them on the same queue.
++    auto fixture = makeFixture("rx_graph_gpu_buffer_reuse");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    const VkDevice device = fixture->device.device();
++
++    BufferDesc dataDesc;
++    dataDesc.size = 256;
++    dataDesc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
++
++    RenderGraph graph;
++    // Compute-class (no attachment output) -- its storage-buffer output
++    // resolves to COMPUTE_SHADER_BIT per pass.h's Pass::resolveAccess
++    // table. No execute() callback: this test only needs the barrier
++    // machinery to run correctly, not any real compute dispatch.
++    graph.addPass("produce", QueueClass::AsyncCompute).addStorageBufferOutput("data", dataDesc).setSideEffect();
++    graph.addPass("consume").addStorageBufferInput("data").addColorOutput("bb", absoluteColorDesc(kExtent, kExtent));
++    graph.setBackbufferSource("bb");
++
++    CompileInfo info;
++    info.swapchainWidth = kExtent;
++    info.swapchainHeight = kExtent;
++    info.swapchainFormat = kFormat;
++    info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    graph.compile(info);
++
++    fixture->executor->realize(graph);
++
++    auto offscreen = createOffscreenImage(device, fixture->device.physicalDevice(), kFormat,
++                                            VkExtent2D{kExtent, kExtent});
++    REQUIRE(offscreen.has_value());
++
++    auto cmdCtx =
++        rx::rhi::CommandContext::create(device, fixture->device.graphicsQueue(), fixture->device.graphicsQueueFamily());
++    REQUIRE(cmdCtx.has_value());
++
++    // Two full execute() calls against the same realize()d graph, each in
++    // its own synchronous submission -- the second call's "produce" pass
++    // is exactly the pooled buffer's second-ever claim by a realize(),
++    // still its first TOUCH within THAT call's own topological walk, the
++    // case synthesizeFirstUseBufferBarrierIfNeeded() exists for.
++    for (int i = 0; i < 2; ++i) {
++        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++            fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
++        });
++    }
++
++    vkDeviceWaitIdle(device);
++    destroyOffscreenImage(device, *offscreen);
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/src/rx_graph/transient_pool.cpp b/src/rx_graph/transient_pool.cpp
+new file mode 100644
+index 0000000..c4eb6ca
+--- /dev/null
++++ b/src/rx_graph/transient_pool.cpp
+@@ -0,0 +1,140 @@
++#include "transient_pool.h"
++
++#include <rx_core/log.h>
++#include <rx_rhi_vk/deletion_queue.h>
++
++#include <memory>
++#include <utility>
++
++namespace rx::graph::detail {
++
++void TransientPool::beginRealizeBatch() {
++    imageClaimedThisBatch_.assign(images_.size(), false);
++    bufferClaimedThisBatch_.assign(buffers_.size(), false);
++}
++
++std::optional<uint32_t> TransientPool::acquireImage(VkFormat format, VkExtent2D extent, VkImageUsageFlags usage,
++                                                      VkSampleCountFlagBits samples, uint64_t currentFrame) {
++    for (uint32_t i = 0; i < images_.size(); ++i) {
++        const PooledImage& entry = images_[i];
++        if (imageClaimedThisBatch_[i] || !entry.texture.has_value()) {
++            continue;
++        }
++        if (entry.format == format && entry.extent.width == extent.width && entry.extent.height == extent.height &&
++            entry.usage == usage && entry.samples == samples) {
++            imageClaimedThisBatch_[i] = true;
++            images_[i].lastUsedFrame = currentFrame;
++            return i;
++        }
++    }
++
++    auto texture = rx::rhi::Texture2D::create(physicalDevice_, device_, *allocator_, extent, format, usage,
++                                                /*requestedMipLevels=*/1);
++    if (!texture.has_value()) {
++        RX_LOG_ERROR("rx_graph: TransientPool::acquireImage: Texture2D::create failed ({}x{}, format={})",
++                     extent.width, extent.height, static_cast<int>(format));
++        return std::nullopt;
++    }
++
++    PooledImage entry;
++    entry.format = format;
++    entry.extent = extent;
++    entry.usage = usage;
++    entry.samples = samples;
++    entry.texture = std::move(*texture);
++    entry.lastFrameFinalStages = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    entry.lastUsedFrame = currentFrame;
++
++    images_.push_back(std::move(entry));
++    imageClaimedThisBatch_.push_back(true);
++    return static_cast<uint32_t>(images_.size() - 1);
++}
++
++std::optional<uint32_t> TransientPool::acquireBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
++                                                       uint64_t currentFrame) {
++    for (uint32_t i = 0; i < buffers_.size(); ++i) {
++        const PooledBuffer& entry = buffers_[i];
++        if (bufferClaimedThisBatch_[i] || !entry.buffer.has_value()) {
++            continue;
++        }
++        if (entry.size == size && entry.usage == usage) {
++            bufferClaimedThisBatch_[i] = true;
++            buffers_[i].lastUsedFrame = currentFrame;
++            return i;
++        }
++    }
++
++    // DEVICE_LOCAL, per task-3-brief.md's transient-pool ambiguity
++    // resolution -- reuses the same ReBAR-aware direct-upload-capable
++    // allocation path every other real device-consuming buffer in this
++    // engine goes through (buffer.h's own comment).
++    auto buffer = allocator_->createDeviceLocalBuffer(size, usage);
++    if (!buffer.has_value()) {
++        RX_LOG_ERROR("rx_graph: TransientPool::acquireBuffer: createDeviceLocalBuffer failed (size={}, usage={})",
++                     size, static_cast<uint32_t>(usage));
++        return std::nullopt;
++    }
++
++    PooledBuffer entry;
++    entry.size = size;
++    entry.usage = usage;
++    entry.buffer = std::move(*buffer);
++    entry.lastFrameFinalStages = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    entry.lastUsedFrame = currentFrame;
++
++    buffers_.push_back(std::move(entry));
++    bufferClaimedThisBatch_.push_back(true);
++    return static_cast<uint32_t>(buffers_.size() - 1);
++}
++
++void TransientPool::touchImage(uint32_t index, uint64_t currentFrame) {
++    images_.at(index).lastUsedFrame = currentFrame;
++}
++
++void TransientPool::touchBuffer(uint32_t index, uint64_t currentFrame) {
++    buffers_.at(index).lastUsedFrame = currentFrame;
++}
++
++void TransientPool::sweepStale(uint64_t currentFrame, rx::rhi::DeletionQueue& deletionQueue) {
++    for (PooledImage& entry : images_) {
++        if (!entry.texture.has_value()) {
++            continue;
++        }
++        if (currentFrame - entry.lastUsedFrame > kStaleAfterExecutes) {
++            auto keepAlive = std::make_shared<rx::rhi::Texture2D>(std::move(*entry.texture));
++            entry.texture.reset();
++            deletionQueue.retire([keepAlive] {}, entry.lastUsedFrame);
++        }
++    }
++    for (PooledBuffer& entry : buffers_) {
++        if (!entry.buffer.has_value()) {
++            continue;
++        }
++        if (currentFrame - entry.lastUsedFrame > kStaleAfterExecutes) {
++            auto keepAlive = std::make_shared<rx::rhi::Buffer>(std::move(*entry.buffer));
++            entry.buffer.reset();
++            deletionQueue.retire([keepAlive] {}, entry.lastUsedFrame);
++        }
++    }
++}
++
++void TransientPool::retireAll(uint64_t currentFrame, rx::rhi::DeletionQueue& deletionQueue) {
++    for (PooledImage& entry : images_) {
++        if (!entry.texture.has_value()) {
++            continue;
++        }
++        auto keepAlive = std::make_shared<rx::rhi::Texture2D>(std::move(*entry.texture));
++        entry.texture.reset();
++        deletionQueue.retire([keepAlive] {}, currentFrame);
++    }
++    for (PooledBuffer& entry : buffers_) {
++        if (!entry.buffer.has_value()) {
++            continue;
++        }
++        auto keepAlive = std::make_shared<rx::rhi::Buffer>(std::move(*entry.buffer));
++        entry.buffer.reset();
++        deletionQueue.retire([keepAlive] {}, currentFrame);
++    }
++}
++
++}  // namespace rx::graph::detail
+diff --git a/src/rx_graph/transient_pool.h b/src/rx_graph/transient_pool.h
+new file mode 100644
+index 0000000..b924cd3
+--- /dev/null
++++ b/src/rx_graph/transient_pool.h
+@@ -0,0 +1,196 @@
++#pragma once
++// Private implementation detail of rx_graph's Executor -- NOT installed
++// under include/rx_graph/, and NOT reachable from any public rx_graph
++// header (executor.h forward-declares only rx::rhi::Device; this header is
++// included by executor.cpp/transient_pool.cpp alone). Unlike every public
++// rx_graph header, this one freely depends on rx_rhi_vk (Texture2D/Buffer/
++// Allocator) and volk -- Task 3's own binding constraint ("no volk in
++// public headers") is about headers a consumer of rx_graph's public API
++// might include, which this one structurally cannot be.
++//
++// Reuses rx::rhi::Texture2D/rx::rhi::Buffer/rx::rhi::Allocator wholesale
++// instead of calling vmaCreateImage/vmaCreateBuffer directly -- this
++// project's own standing rule against rebuilding what already exists
++// [repo CLAUDE.md, "Do not reinvent the wheel"] applies exactly as much to
++// rx_graph's own sibling library as it would to a third-party one.
++#include <rx_rhi_vk/buffer.h>
++#include <rx_rhi_vk/texture.h>
++#include <volk.h>
++
++#include <cstdint>
++#include <functional>
++#include <optional>
++#include <vector>
++
++namespace rx::rhi {
++class DeletionQueue;
++}  // namespace rx::rhi
++
++namespace rx::graph::detail {
++
++// How many consecutive execute() calls (Executor's own frame counter, one
++// tick per execute() call -- see executor.cpp) a pooled entry may go
++// unclaimed by any realize() before it is swept: FrameSync::kFramesInFlight
++// (2) + 1, per task-3-brief.md's own transient-pool ambiguity resolution.
++// The "+1" is deliberate slack, not an off-by-one: an entry freed by a
++// realize() call that ran between two execute() calls should survive at
++// least one full frames-in-flight cycle before eviction, since a
++// same-shape resource could plausibly be reclaimed by a *later* realize()
++// (e.g. a window resize that bounces back to a previous size) without
++// this pool ever needing to reallocate.
++constexpr uint64_t kStaleAfterExecutes = 2 + 1;
++
++// One pooled image entry. `texture` is empty (std::nullopt) exactly when
++// this entry is either not yet created (a freshly-grown vector slot -- see
++// TransientPool::images_) or has been retired via
++// TransientPool::sweepStale() (its real rx::rhi::Texture2D moved into a
++// DeletionQueue-retired closure, leaving this slot vacant and immediately
++// reusable by a future acquireImage() call for a *different* key).
++// Deliberately std::optional rather than a default-constructed
++// placeholder: rx::rhi::Texture2D's own default constructor is private
++// (friends only), so an "empty but valid" Texture2D is not constructible
++// from here at all -- std::optional sidesteps that without needing
++// Texture2D to grant this file friendship.
++struct PooledImage {
++    // Key rx_graph/executor.cpp's acquireImage() matches against --
++    // task-3-brief.md: "keyed by (format, extent, usage, samples)".
++    VkFormat format = VK_FORMAT_UNDEFINED;
++    VkExtent2D extent{0, 0};
++    VkImageUsageFlags usage = 0;
++    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
++
++    std::optional<rx::rhi::Texture2D> texture;
++
++    // Task 3 ambiguity resolution #2: the pipeline stage(s) this entry's
++    // contents were last left "in flight" by, as of the end of the last
++    // execute() call that actually touched it -- VK_PIPELINE_STAGE_2_
++    // ALL_COMMANDS_BIT on an entry that has never been touched by any
++    // execute() yet (its very first use, whether that's a brand new
++    // allocation or a reclaimed-but-previously-untouched-this-realize
++    // entry). Executor::execute() reads this to override the srcStage of
++    // the FIRST barrier that touches this entry's physicalIndex each call
++    // (compile()'s own device-free barrier derivation always says
++    // srcStage NONE there, correct only for a resource's very first use
++    // within ONE compile walk, never across the frame boundary a pooled
++    // entry's real lifetime spans) and OVERWRITES it with this entry's own
++    // final dstStage from THIS call, at the end of execute() -- so the
++    // NEXT call's first-use override chains correctly off what this call
++    // actually left the resource doing.
++    VkPipelineStageFlags2 lastFrameFinalStages = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++
++    // Executor's own monotonic frame counter (one tick per execute() call)
++    // as of the last time this entry was claimed by a realize() call OR
++    // touched by an execute() call -- whichever happened more recently.
++    // sweepStale() compares the CURRENT frame counter against this to
++    // decide eviction; realize()'s acquireImage()/acquireBuffer() and
++    // execute()'s per-pass bookkeeping both bump it.
++    uint64_t lastUsedFrame = 0;
++};
++
++// One pooled buffer entry -- same shape/contract as PooledImage above,
++// keyed by (size, usage) instead [task-3-brief.md].
++struct PooledBuffer {
++    VkDeviceSize size = 0;
++    VkBufferUsageFlags usage = 0;
++
++    std::optional<rx::rhi::Buffer> buffer;
++
++    VkPipelineStageFlags2 lastFrameFinalStages = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    uint64_t lastUsedFrame = 0;
++};
++
++// Executor's private transient-resource pool: acquire-or-create image/
++// buffer entries keyed by their physical descriptor, reused across
++// execute() calls (a realize()d Executor keeps referencing the same
++// entries call after call -- see executor.cpp's ResolvedResource) and
++// across separate realize() calls once a prior binding is released (a
++// resize, or an entirely different RenderGraph topology sharing the same
++// shape) -- entries left unclaimed by any realize() for
++// kStaleAfterExecutes consecutive execute() calls are torn down via
++// rx::rhi::DeletionQueue rather than kept forever.
++//
++// Move-only; not copyable (owns live VMA-backed Vulkan resources through
++// its rx::rhi::Texture2D/Buffer members).
++class TransientPool {
++public:
++    TransientPool(TransientPool&&) noexcept = default;
++    TransientPool& operator=(TransientPool&&) noexcept = default;
++    TransientPool(const TransientPool&) = delete;
++    TransientPool& operator=(const TransientPool&) = delete;
++    ~TransientPool() = default;
++
++    TransientPool(VkPhysicalDevice physicalDevice, VkDevice device, rx::rhi::Allocator& allocator)
++        : physicalDevice_(physicalDevice), device_(device), allocator_(&allocator) {}
++
++    // Begins one realize() call's acquire batch: clears the "already
++    // claimed in this batch" marker every acquire*() call below checks, so
++    // two acquire calls within the SAME realize() invocation for the SAME
++    // key never alias onto one physical resource (two logically distinct
++    // PhysicalResource entries sharing a descriptor must each get their
++    // own allocation) while still allowing a LATER, separate realize()
++    // call to reclaim whatever this batch didn't.
++    void beginRealizeBatch();
++
++    // Returns the index (stable until a future sweepStale() vacates it) of
++    // an image entry matching `format`/`extent`/`usage`/`samples`, not
++    // already claimed within this batch -- reusing the first idle match
++    // found, or creating (and appending) a fresh rx::rhi::Texture2D if
++    // none exists. Marks the returned entry claimed-this-batch and bumps
++    // its lastUsedFrame to `currentFrame`. Returns std::nullopt (logged)
++    // only if creating a brand new entry's Texture2D fails.
++    std::optional<uint32_t> acquireImage(VkFormat format, VkExtent2D extent, VkImageUsageFlags usage,
++                                          VkSampleCountFlagBits samples, uint64_t currentFrame);
++
++    // Same contract as acquireImage(), for a buffer keyed by (size, usage).
++    std::optional<uint32_t> acquireBuffer(VkDeviceSize size, VkBufferUsageFlags usage, uint64_t currentFrame);
++
++    [[nodiscard]] PooledImage& image(uint32_t index) { return images_.at(index); }
++    [[nodiscard]] const PooledImage& image(uint32_t index) const { return images_.at(index); }
++    [[nodiscard]] PooledBuffer& buffer(uint32_t index) { return buffers_.at(index); }
++    [[nodiscard]] const PooledBuffer& buffer(uint32_t index) const { return buffers_.at(index); }
++
++    // Bumps `lastUsedFrame` to `currentFrame` for the given already-
++    // acquired entry -- called once per execute() call, for every pooled
++    // entry that call's realize()-established mapping actually references
++    // (see executor.cpp), so an entry realize() bound once and execute()
++    // keeps reusing every frame never looks "unused" to sweepStale() below.
++    void touchImage(uint32_t index, uint64_t currentFrame);
++    void touchBuffer(uint32_t index, uint64_t currentFrame);
++
++    // Retires (via `deletionQueue`, tagged with each entry's own
++    // lastUsedFrame -- already provably safe to destroy once that frame
++    // number's submission has completed, per this same frames-in-flight
++    // bound) every entry whose `currentFrame - lastUsedFrame >
++    // kStaleAfterExecutes`. Called once per execute() call, before that
++    // call's own barrier/rendering work -- see executor.cpp.
++    void sweepStale(uint64_t currentFrame, rx::rhi::DeletionQueue& deletionQueue);
++
++    // Shutdown path: retires EVERY still-live entry into `deletionQueue`
++    // unconditionally, regardless of lastUsedFrame -- called from
++    // Executor's destructor, immediately after it has already brought the
++    // device to a real idle point (see executor.cpp), so `deletionQueue`'s
++    // own flushAll() immediately after this call is safe to run
++    // unconditionally too.
++    void retireAll(uint64_t currentFrame, rx::rhi::DeletionQueue& deletionQueue);
++
++private:
++    VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
++    VkDevice device_ = VK_NULL_HANDLE;
++    rx::rhi::Allocator* allocator_ = nullptr;
++
++    std::vector<PooledImage> images_;
++    std::vector<PooledBuffer> buffers_;
++
++    // Per-batch "already handed out this realize() call" markers, sized to
++    // match images_/buffers_ and cleared by beginRealizeBatch(). Plain
++    // std::vector<bool> rather than a set: acquire calls per realize() are
++    // a handful (one per PhysicalResource), and this is checked/set at
++    // most once per candidate entry per acquire call -- a linear scan
++    // over a small vector is simpler and fast enough, matching this
++    // project's general preference for the plainest correct data
++    // structure over cleverness with no measured benefit.
++    std::vector<bool> imageClaimedThisBatch_;
++    std::vector<bool> bufferClaimedThisBatch_;
++};
++
++}  // namespace rx::graph::detail
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/device.h b/src/rx_rhi_vk/include/rx_rhi_vk/device.h
+index e31dd85..541311f 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/device.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/device.h
+@@ -30,20 +30,30 @@ struct AcquireResult {
+ class Device {
+ public:
+     Device(Device&&) noexcept;
+     Device& operator=(Device&&) noexcept;
+     Device(const Device&) = delete;
+     Device& operator=(const Device&) = delete;
+     ~Device();
+ 
+     static std::optional<Device> create(Context& context, VkSurfaceKHR surface);
+ 
++    // Task 3 (rx_graph's Executor): the same VkInstance handle this Device
++    // was built against (Context::instance(), stashed at create() time --
++    // see the private instance_ member below). Added because
++    // Executor::create(Device&) needs to build its own
++    // rx::rhi::Allocator::createRaw(physicalDevice, device, instance) from
++    // a Device alone, with no separate Context& in its signature, and
++    // every other accessor on this class already exposes exactly this
++    // kind of already-stored handle (physicalDevice(), device(), ...) the
++    // same trivial way.
++    VkInstance instance() const { return instance_; }
+     VkPhysicalDevice physicalDevice() const { return physicalDevice_; }
+     VkDevice device() const { return device_; }
+     VkQueue graphicsQueue() const { return graphicsQueue_; }
+     uint32_t graphicsQueueFamily() const { return graphicsQueueFamily_; }
+     VkQueue presentQueue() const { return presentQueue_; }
+     VkSwapchainKHR swapchain() const { return swapchain_; }
+     const std::vector<VkImage>& swapchainImages() const { return swapchainImages_; }
+     VkFormat swapchainFormat() const { return swapchainFormat_; }
+     VkExtent2D swapchainExtent() const { return swapchainExtent_; }
+ 
