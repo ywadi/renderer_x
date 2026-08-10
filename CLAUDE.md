@@ -26,3 +26,29 @@ exists, and say so explicitly when that's the call being made. This applies
 to every task, every subagent, and every layer of the renderer — not just
 the RHI/toolchain layers that already lean on SDL3, vk-bootstrap, VMA,
 volk, GLM, spdlog, doctest, and Slang.
+
+## Performance is an exit criterion
+
+RendererX is middleware: its consumers' games are the real workload, so the
+engine **leads on performance instead of waiting for evidence from its own
+small samples** — it builds its own stress cases (synthetic high-draw-count
+benchmark scenes) and proves scalability proactively.
+
+- From Phase 4 onward, **every phase exits with published benchmark numbers**
+  (desktop AND Steam Deck — the hardware floor) for its stress/exit samples,
+  and CI carries **performance regression gates** on those numbers alongside
+  the correctness gates. A performance regression blocks a phase exit the
+  same way a failing test does.
+- Design the fast path as the default path: instanced/batched submission,
+  pooled global geometry buffers, bindless access, minimal derived barriers.
+  Per-object state churn and retrofit-later designs are rejected at review.
+- Features above the Vulkan 1.3 baseline (mesh shaders, hardware RT, etc.)
+  are **optional capabilities with a fallback**, never baseline requirements
+  — but the fallback path is engineered to the same performance bar.
+- Profiling instrumentation (Tracy) is part of the toolchain from Phase 4:
+  performance claims in reports must be measured, not asserted.
+
+This binds every task, every implementer, and every reviewer, like the rules
+above. See `docs/superpowers/specs/2026-08-10-phase4-seed-notes.md` and the
+deferred-registry entries in
+`docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md`.
