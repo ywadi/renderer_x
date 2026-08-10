@@ -23,6 +23,11 @@ add_subdirectory(src/rx_platform)
 # not-yet-defined target name is otherwise fine in modern CMake.
 add_subdirectory(src/rx_shader)
 add_subdirectory(src/rx_rhi_vk)
+# Device-free in Task 1 (pass declarations, culling, ordering, lifetimes):
+# depends on Vulkan::Headers + rx_core only, not rx_rhi_vk -- see
+# src/rx_graph/CMakeLists.txt's own comment for why that dependency is
+# deferred to the tasks that actually need a VkDevice.
+add_subdirectory(src/rx_graph)
 add_subdirectory(tools/dep_cache_smoketest)
 add_subdirectory(tools/toolchain_check)
 add_subdirectory(samples/01_triangle)
