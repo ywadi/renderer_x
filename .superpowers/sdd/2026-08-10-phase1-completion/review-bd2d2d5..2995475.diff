@@ -1,0 +1,342 @@
+# Review package: bd2d2d5..29954757feda3a44dce7d3bf3e11e64515a52e52
+
+## Commits
+2995475 Fix CI: windows-cross-zig needs a host Vulkan loader/ICD for Wine's winevulkan
+b82f004 Fix CI: pin WINEARCH=win64 so Wine doesn't need wine32/i386 multiarch
+6b28f91 Fix CI: linux-native needs libxtst-dev/libxkbcommon-dev for SDL3's X11 XTest check
+1b55ffd Fix CI: linux-native job needs X11 dev headers to build SDL3 from source
+3d61a97 Add GitHub Actions CI: linux-native + windows-cross-zig, real budget check, Wine CRLF fix
+
+## Files changed
+ .github/workflows/ci.yml       | 225 +++++++++++++++++++++++++++++++++++++++++
+ src/rx_core/tests/log_test.cpp |  11 +-
+ tools/check_build_budget.sh    |  62 ++++++++++++
+ 3 files changed, 297 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+index 0000000..daace96
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,225 @@
++name: CI
++
++on:
++  push:
++    branches: [main]
++  pull_request:
++    branches: [main]
++
++# Pinned zig 0.16.0 toolchain download, shared by both jobs below. The
++# sha256 is the real published checksum for zig-x86_64-linux-0.16.0.tar.xz,
++# taken directly from https://ziglang.org/download/index.json (the
++# "0.16.0" -> "x86_64-linux" -> "shasum" field) -- never invented. It was
++# additionally cross-checked by downloading the tarball, verifying this
++# checksum against it, extracting it, and confirming the extracted `zig`
++# binary's own sha256 is byte-for-byte identical to this repository's
++# already-in-use toolchain/zig/zig (gitignored; fetched once by a
++# developer) on the machine this workflow was authored on.
++env:
++  RX_ZIG_VERSION: "0.16.0"
++  RX_ZIG_ARCHIVE: "zig-x86_64-linux-0.16.0.tar.xz"
++  RX_ZIG_URL: "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
++  RX_ZIG_SHA256: "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
++
++jobs:
++  linux-native:
++    name: linux-native
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v7
++
++      # mesa-vulkan-drivers provides lavapipe (llvmpipe's Vulkan ICD, lvp_icd.json)
++      # -- the only Vulkan device this runner has, since it has no real GPU.
++      # vulkan-tools gives vulkaninfo for diagnostics if a run ever needs it.
++      # libvulkan-dev provides the Vulkan loader (libvulkan.so.1) that volk
++      # dlopens at runtime. xvfb provides the X server SDL3 needs even though
++      # every window this codebase creates is hidden (visible=false) --
++      # SDL3 still requires *some* video driver backend to initialize.
++      #
++      # libx11-dev/libxext-dev/libxrandr-dev/libxcursor-dev/libxi-dev/
++      # libxfixes-dev/libxss-dev/libxtst-dev/libxkbcommon-dev: discovered
++      # missing across the first two real runs of this workflow -- SDL3's
++      # own build (third_party/CMakeLists.txt, built from source through
++      # the dep-cache) hard-fails its CMake configure without X11
++      # development libraries present at all ("SDL could not find X11 or
++      # Wayland development libraries"), which this codebase's own
++      # development machine never surfaced (it already had a full desktop
++      # environment's dev packages installed). The first run only
++      # surfaced the top-level "no X11 at all" failure; fixing that with
++      # just libx11-dev+libxext-dev revealed a second, more specific fatal
++      # check ("Couldn't find dependency package for XTEST") one level
++      # deeper in the same CheckX11 macro, since CMake configure stops at
++      # the first fatal error and never reaches later checks. Cross-checked
++      # directly against SDL3's own cmake/sdlchecks.cmake CheckX11 macro
++      # (release-3.4.14) for every *other* SDL_missing_dependency() call it
++      # can still reach (XCURSOR/XINPUT/XFIXES/XRANDR/XSCRNSAVER/XTEST all
++      # require a real library; XDBE/XSHAPE/XSYNC only need headers already
++      # covered by libx11-dev/libxext-dev) so this is the complete set, not
++      # another one-check-at-a-time guess.
++      - name: Install system packages
++        run: |
++          sudo apt-get update
++          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
++            ninja-build mesa-vulkan-drivers vulkan-tools libvulkan-dev xvfb \
++            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
++            libxfixes-dev libxss-dev libxtst-dev libxkbcommon-dev
++
++      - name: Install pinned zig toolchain (checksum-verified)
++        run: |
++          curl -fsSL -o "/tmp/${RX_ZIG_ARCHIVE}" "${RX_ZIG_URL}"
++          echo "${RX_ZIG_SHA256}  /tmp/${RX_ZIG_ARCHIVE}" | sha256sum -c -
++          mkdir -p toolchain/zig
++          tar -xf "/tmp/${RX_ZIG_ARCHIVE}" -C toolchain/zig --strip-components=1
++          toolchain/zig/zig version
++
++      # Slang is host-side tooling fetched once by tools/fetch_slang.cmake
++      # (see that file) -- identical content regardless of which target
++      # triple a job cross-compiles for, since slangc always runs on the
++      # host (Linux, here) even in the windows-cross-zig job. Shared across
++      # both jobs deliberately: whichever job's cache-save wins a race is
++      # harmless, since both would have fetched byte-identical content.
++      - name: Cache prebuilt Slang
++        uses: actions/cache@v5
++        with:
++          path: third_party/slang-prebuilt
++          key: slang-prebuilt-${{ hashFiles('tools/fetch_slang.cmake') }}
++
++      # Unlike the Slang cache above, this key is job-specific
++      # (deps-cache-linux-native-..., not shared with windows-cross-zig):
++      # DepCache.cmake's own cache key already includes the target triple
++      # and zig version, so this preset's .deps-cache/ subdirectories never
++      # collide with the other job's -- but actions/cache treats an exact
++      # key match across concurrent jobs as a single cache *entry*, and
++      # only the first job to finish successfully saves it. Two jobs
++      # racing on one shared key would starve whichever job loses the
++      # race of ever getting its own dependencies cached. A per-preset key
++      # keeps each job's cache independent.
++      - name: Cache third-party dependency builds
++        uses: actions/cache@v5
++        with:
++          path: .deps-cache
++          key: deps-cache-linux-native-${{ hashFiles('third_party/CMakeLists.txt') }}
++
++      - name: Configure
++        run: cmake --preset linux-native
++
++      - name: Build
++        run: cmake --build --preset linux-native
++
++      # lavapipe provides the Vulkan device; Xvfb provides the display SDL3
++      # needs to initialize a (hidden) window. This is not a soft/best-effort
++      # run: verified locally (forcing VK_ICD_FILENAMES to lavapipe only, and
++      # running the whole suite under xvfb-run) that all 5 tests, including
++      # rx_rhi_vk_tests and sample_01_triangle_headless, genuinely execute
++      # their real assertions against lavapipe rather than hitting a skip
++      # guard -- lavapipe is a real, if software, Vulkan 1.3+ implementation.
++      - name: Test (xvfb + lavapipe)
++        run: xvfb-run -a ctest --preset linux-native --output-on-failure
++
++      # Real incremental-rebuild timing, not a no-op: tools/check_build_budget.sh
++      # touches src/rx_core/src/log.cpp itself before timing.
++      - name: Build budget check
++        run: tools/check_build_budget.sh linux-native 60
++
++      - name: Upload sample artifact
++        uses: actions/upload-artifact@v7
++        with:
++          name: sample_01_triangle-linux-native
++          path: build/linux-native/samples/01_triangle/sample_01_triangle
++          if-no-files-found: error
++
++  windows-cross-zig:
++    name: windows-cross-zig
++    runs-on: ubuntu-latest
++    # This project's cross-compiled binaries are x86_64-windows-gnu only --
++    # pure 64-bit, no 32-bit WoW64 component ever needed -- so pin
++    # WINEARCH=win64 rather than let a brand-new prefix default to win32
++    # (which pulls in a wine32/i386-multiarch dependency this project never
++    # otherwise needs). Note this alone did NOT fix the Vulkan-surface
++    # failure below (verified: the same failure reproduced identically with
++    # WINEARCH pinned) -- it's kept as separately-correct hygiene for a
++    # 64-bit-only target, not as that fix.
++    env:
++      WINEARCH: win64
++    steps:
++      - uses: actions/checkout@v7
++
++      # wine runs the cross-compiled Windows test binaries transparently
++      # (cmake/toolchains/windows-cross-zig.cmake sets it as
++      # CMAKE_CROSSCOMPILING_EMULATOR when found). xvfb: same reason as the
++      # linux-native job -- SDL3 needs a video driver backend even for
++      # hidden windows, and Wine's own window creation additionally wants a
++      # real X server underneath it.
++      #
++      # mesa-vulkan-drivers/vulkan-tools/libvulkan-dev: discovered missing
++      # on this workflow's first real run of this job. rx_platform's
++      # Window::create() (src/rx_platform/src/window.cpp) unconditionally
++      # requests SDL_WINDOW_VULKAN -- even rx_platform_tests' "any video
++      # driver" lifecycle case, which has no skip guard -- and Wine's own
++      # built-in Vulkan support (winevulkan/vulkan-1.dll) is a passthrough
++      # to whatever real Vulkan loader/ICD exists on the *host*: with none
++      # installed on this runner, winevulkan has nothing to pass through to
++      # and reports zero surface support, so SDL_CreateWindow(...,
++      # SDL_WINDOW_VULKAN) failed outright (not a skip -- a real failure) in
++      # this job's very first ctest run. Installing the same lavapipe +
++      # loader packages the linux-native job uses gives winevulkan a real
++      # (software) Vulkan implementation to forward to, without changing
++      # what's excluded below: rx_rhi_vk_tests/sample_01_triangle_headless
++      # stay excluded from ctest -- exercising this project's actual
++      # device/swapchain/synchronization2 pipeline through Wine's Vulkan
++      # passthrough is a materially bigger claim than "window creation
++      # succeeds" and is not verified here.
++      - name: Install system packages
++        run: |
++          sudo apt-get update
++          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
++            ninja-build wine xvfb mesa-vulkan-drivers vulkan-tools libvulkan-dev
++
++      - name: Install pinned zig toolchain (checksum-verified)
++        run: |
++          curl -fsSL -o "/tmp/${RX_ZIG_ARCHIVE}" "${RX_ZIG_URL}"
++          echo "${RX_ZIG_SHA256}  /tmp/${RX_ZIG_ARCHIVE}" | sha256sum -c -
++          mkdir -p toolchain/zig
++          tar -xf "/tmp/${RX_ZIG_ARCHIVE}" -C toolchain/zig --strip-components=1
++          toolchain/zig/zig version
++
++      - name: Cache prebuilt Slang
++        uses: actions/cache@v5
++        with:
++          path: third_party/slang-prebuilt
++          key: slang-prebuilt-${{ hashFiles('tools/fetch_slang.cmake') }}
++
++      - name: Cache third-party dependency builds
++        uses: actions/cache@v5
++        with:
++          path: .deps-cache
++          key: deps-cache-windows-cross-zig-${{ hashFiles('third_party/CMakeLists.txt') }}
++
++      - name: Configure
++        run: cmake --preset windows-cross-zig
++
++      - name: Build
++        run: cmake --build --preset windows-cross-zig
++
++      - name: Wine toolchain smoke check
++        run: wine build/windows-cross-zig/tools/toolchain_check/toolchain_check.exe
++
++      # rx_rhi_vk (GPU-backed) and sample_01_triangle_headless are excluded:
++      # Wine in CI has no Vulkan device to hand them, and that is a real,
++      # documented environment limitation -- not a silent pass. rx_core and
++      # rx_platform run for real under Wine (rx_platform's window tests hit
++      # their own existing skip guards gracefully when Wine's video backend
++      # can't produce Vulkan surface extensions, exactly as they do on any
++      # other display-less machine).
++      - name: Test under wine (xvfb; GPU tests excluded -- no Vulkan under Wine)
++        run: xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|sample' --output-on-failure
++
++      - name: Build budget check
++        run: tools/check_build_budget.sh windows-cross-zig 60
++
++      - name: Upload sample artifact
++        uses: actions/upload-artifact@v7
++        with:
++          name: sample_01_triangle-windows-cross-zig
++          path: build/windows-cross-zig/samples/01_triangle/sample_01_triangle.exe
++          if-no-files-found: error
+diff --git a/src/rx_core/tests/log_test.cpp b/src/rx_core/tests/log_test.cpp
+index 515fb76..08a2710 100644
+--- a/src/rx_core/tests/log_test.cpp
++++ b/src/rx_core/tests/log_test.cpp
+@@ -15,12 +15,21 @@ TEST_CASE("RX_LOG_INFO writes the formatted message through spdlog's default log
+ 
+     std::ostringstream capture;
+     auto sink = std::make_shared<spdlog::sinks::ostream_sink_mt>(capture);
+     auto testLogger = std::make_shared<spdlog::logger>("test", sink);
+     testLogger->set_pattern("%v");
+     spdlog::set_default_logger(testLogger);
+ 
+     RX_LOG_INFO("hello {}", 42);
+ 
+     spdlog::set_default_logger(previousDefault);
+-    CHECK(capture.str() == "hello 42\n");
++
++    // Windows spdlog terminates each formatted line with "\r\n"; Linux
++    // spdlog uses a bare "\n". Strip both trailing characters before
++    // comparing so this assertion is portable across native Linux and
++    // Wine-hosted Windows builds alike.
++    std::string captured = capture.str();
++    while (!captured.empty() && (captured.back() == '\n' || captured.back() == '\r')) {
++        captured.pop_back();
++    }
++    CHECK(captured == "hello 42");
+ }
+diff --git a/tools/check_build_budget.sh b/tools/check_build_budget.sh
+new file mode 100755
+index 0000000..a6691f6
+--- /dev/null
++++ b/tools/check_build_budget.sh
+@@ -0,0 +1,62 @@
++#!/usr/bin/env bash
++# Measures a real incremental rebuild and fails if it exceeds a time budget.
++#
++# Usage: tools/check_build_budget.sh <preset> [budget_seconds=60]
++#
++# This must measure an actual incremental build, not a no-op: touching a
++# leaf .cpp that other targets depend on (rx_core's log.cpp, linked into
++# rx_core -> rx_platform -> rx_rhi_vk -> samples/tests) forces a real
++# recompile of that translation unit plus a relink of everything downstream
++# of it, immediately before starting the timer. A preset that has never been
++# configured/built (no binary dir yet) is configured+built once, untimed,
++# first -- so the touch below always has a real object file to invalidate.
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
++
++if [[ $# -lt 1 ]]; then
++  echo "usage: $0 <preset> [budget_seconds=60]" >&2
++  exit 1
++fi
++
++RX_PRESET="$1"
++RX_BUDGET_SECONDS="${2:-60}"
++
++RX_BINARY_DIR="$REPO_ROOT/build/$RX_PRESET"
++RX_LEAF_SOURCE="$REPO_ROOT/src/rx_core/src/log.cpp"
++
++if [[ ! -f "$RX_LEAF_SOURCE" ]]; then
++  echo "check_build_budget: leaf source '$RX_LEAF_SOURCE' does not exist." >&2
++  exit 1
++fi
++
++if [[ ! -d "$RX_BINARY_DIR" ]]; then
++  echo "check_build_budget: no existing build directory at '$RX_BINARY_DIR' - configuring and building once (untimed) first"
++  cmake --preset "$RX_PRESET"
++  cmake --build --preset "$RX_PRESET"
++fi
++
++# Force recompile+relink of the dependent chain: touch the leaf .cpp
++# directly (not a header), so only the one translation unit that already
++# depends on it needs recompiling, plus a relink of every target that links
++# rx_core transitively -- a realistic single-file-edit incremental build,
++# not a full rebuild and not a no-op.
++touch "$RX_LEAF_SOURCE"
++
++echo "check_build_budget: timing incremental build of preset '$RX_PRESET' (budget ${RX_BUDGET_SECONDS}s) ..."
++
++RX_START_SECONDS=$(date +%s)
++cmake --build --preset "$RX_PRESET"
++RX_END_SECONDS=$(date +%s)
++
++RX_ELAPSED_SECONDS=$((RX_END_SECONDS - RX_START_SECONDS))
++
++echo "check_build_budget: incremental build of '$RX_PRESET' took ${RX_ELAPSED_SECONDS}s"
++
++if (( RX_ELAPSED_SECONDS > RX_BUDGET_SECONDS )); then
++  echo "check_build_budget: FAIL - ${RX_ELAPSED_SECONDS}s exceeds the ${RX_BUDGET_SECONDS}s budget for preset '$RX_PRESET'" >&2
++  exit 1
++fi
++
++echo "check_build_budget: OK - ${RX_ELAPSED_SECONDS}s is within the ${RX_BUDGET_SECONDS}s budget for preset '$RX_PRESET'"
