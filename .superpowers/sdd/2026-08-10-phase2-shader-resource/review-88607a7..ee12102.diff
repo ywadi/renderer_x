@@ -1,0 +1,251 @@
+# Review package: 88607a7..ee12102
+
+## Commits
+ee12102 Fix Task 2 review findings: doc-only corrections, no functional change
+
+## Files changed
+ .../task-2-report.md                               | 64 ++++++++++++++++++----
+ src/rx_shader/include/rx_shader/reflection.h       | 39 +++++++------
+ src/rx_shader/src/reflection.cpp                   | 10 ++--
+ 3 files changed, 83 insertions(+), 30 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-2-report.md b/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-2-report.md
+index ff52bc5..fb3bff0 100644
+--- a/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-2-report.md
++++ b/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-2-report.md
+@@ -6,21 +6,21 @@ Implemented the full Task 2 scope: `rx::shader::reflect()` (`rx_shader`)
+ walking a linked Slang program's reflection data into the plain-struct
+ `ShaderLayoutInfo`, and `rx::rhi::PipelineLayoutBuilder` (`rx_rhi_vk`)
+ turning that into real `VkDescriptorSetLayout`/`VkPipelineLayout` objects,
+ with the >128-byte push-constant budget enforced there and only there.
+ Before writing any reflection code, I built a throwaway probe program
+ against the real shipped Slang v2026.14.1 library (compiled directly with
+ `g++`, no CMake) to determine the actual reflection API shapes empirically,
+ cross-checked against `spirv-dis` on the real compiled SPIR-V — this
+ surfaced a genuine discrepancy against the research file (see "Findings"
+ below) that changed the implementation's walk strategy. Both presets
+-configure, build, and test clean; `rx_shader_tests` (10 cases / 83
++configure, build, and test clean; `rx_shader_tests` (10 cases / 73
+ assertions) and `rx_rhi_vk_tests` (8 cases / 107 assertions) both pass with
+ zero validation errors.
+ 
+ ## Findings / discrepancies vs. the research doc
+ 
+ **[R:A3]'s assumed descriptor-set-range walk is unreliable for set
+ attribution on this shipped Slang build; the top-level parameter walk plus
+ the binding-range API are used instead.** [R:A3] describes deriving
+ set/binding/type/count by walking
+ `TypeLayoutReflection::getDescriptorSetCount()` /
+@@ -42,28 +42,36 @@ gFrame`) and walked it both ways:
+ I also found `TypeReflection::getElementCount()` does not reliably report
+ Slang's own documented `SLANG_UNBOUNDED_SIZE` sentinel for a genuinely
+ unsized `Texture2D gTextures[]` global: it returned `0` with no reflection
+ context and `2147483647` with one, neither of which is the sentinel.
+ `TypeLayoutReflection::getBindingRangeBindingCount()` (a different API,
+ walked on the same `getGlobalParamsTypeLayout()`) *did* report
+ `SLANG_UNBOUNDED_SIZE` correctly for the same array.
+ 
+ **Resolution implemented:** `reflect()` (`src/rx_shader/src/reflection.cpp`)
+ uses `ProgramLayout::getParameterByIndex()` for set/binding/category/name
+-(verified correct), and `TypeLayoutReflection::getBindingRangeType()`/
+-`getBindingRangeBindingCount()` for descriptor type and array count/
+-unbounded-ness (the only API observed to report the unbounded sentinel
+-correctly) — correlated to the same parameter by index *and* a
+-leaf-variable-name cross-check, so a future mismatch fails loudly (logged,
+-binding skipped) instead of silently attributing one binding's count to
+-another. This correlation held across two independently-shaped probe
+-shaders (the one above, and a second exercising
++(verified correct); descriptor *type* comes from
++`param->getType()->unwrapArray()->getKind()` (`TypeReflection::Kind`) plus
++`getResourceShape()`/`getResourceAccess()` for the `Kind::Resource` case
++(`mapElementType()` in reflection.cpp); array *count*/unbounded-ness comes
++from `TypeLayoutReflection::getBindingRangeBindingCount()` on
++`getGlobalParamsTypeLayout()` (the only API observed to report the
++unbounded sentinel correctly) — correlated to the same parameter by index
++*and* a leaf-variable-name cross-check, so a future mismatch fails loudly
++(logged, binding skipped) instead of silently attributing one binding's
++count to another. (`TypeLayoutReflection::getBindingRangeType()`, which
++returns a *different* enum — `slang::BindingType`, not
++`TypeReflection::Kind` — was probed during investigation but is not called
++by the actual walk; an earlier draft of this report and of `reflection.h`'s
++comment incorrectly attributed type derivation to it, corrected after
++review.) The count/unbounded-ness correlation held across two
++independently-shaped probe shaders (the one above, and a second exercising
+ `StructuredBuffer`/`RWStructuredBuffer`/`RWTexture2D`/`Sampler2D`). Fully
+ documented in `reflection.h`'s comment on `reflect()` and inline in
+ `reflection.cpp`.
+ 
+ Everything else needed from [R:A3] (`BindingType`/`ParameterCategory` enum
+ values, `PushConstantBuffer`/`PushConstant` identification, `getSize()`/
+ `getOffset()` for push-constant ranges) matched the shipped `slang.h`
+ exactly as documented, including the `[[vk::push_constant]]` bare-struct
+ spelling (`SmallData pc;`, no `ConstantBuffer<T>` wrapper) producing the
+ same `getElementTypeLayout()`-bearing wrapper shape as the explicit
+@@ -178,21 +186,21 @@ hand-constructs its `ShaderLayoutInfo` values rather than calling
+ `reflect()` — it deliberately mirrors `reflection_test.cpp`'s shapes
+ (including the identical 192-byte oversized case) so the two tests
+ together prove the brief's full contract ("reflection succeeds ... but
+ PipelineLayoutBuilder rejects") without either test needing the other
+ component.
+ 
+ ## Verification
+ 
+ - **linux-native, full build:** all targets build clean.
+   `ctest --preset linux-native`: **6/6 pass** (`shader_spirv_test`,
+-  `rx_core_tests`, `rx_platform_tests`, `rx_shader_tests` [10 cases / 83
++  `rx_core_tests`, `rx_platform_tests`, `rx_shader_tests` [10 cases / 73
+   assertions], `rx_rhi_vk_tests` [8 cases / 107 assertions],
+   `sample_01_triangle_headless`). `rx_rhi_vk_tests` run directly (not just
+   via ctest) shows zero real validation errors — only the pre-existing,
+   already-documented `VK_KHR_portability_enumeration` false positives
+   `Context` already filters.
+ - **windows-cross-zig, full configure+build:** clean, all targets
+   including the two touched executables. `ctest --preset
+   windows-cross-zig`: **6/6 pass**, including `rx_shader_tests.exe` and
+   `rx_rhi_vk_tests.exe` both actually executed under Wine on this machine
+   (this preset's ctest is not GPU-excluded in this repo's current
+@@ -287,10 +295,46 @@ real). `PipelineLayoutBuilder::build`'s unbounded-array handling
+ `UPDATE_AFTER_BIND_POOL_BIT`) is exactly the binding-flag shape Task 3's
+ `BindlessTable` needs to be layout-compatible with, though `BindlessTable`
+ is expected to build its own dedicated global set directly (with its own
+ explicit per-resource-class capacities and the additional
+ `VARIABLE_DESCRIPTOR_COUNT` flag on its last binding, per its own brief)
+ rather than route through this generic builder. Task 3's device-feature
+ enablement (`VkPhysicalDeviceVulkan12Features` via
+ `set_required_features_12`) should use the exact same feature list
+ `pipeline_layout_test.cpp` already exercises locally — copying it verbatim
+ into `Device::create()` is a safe, already-proven starting point.
++
++## Fix note (post-review)
++
++Review came back Approved with the functional code verified correct (live
++runs, hand-rechecked binding tables, clean link graph); two documentation-
++accuracy findings were fixed after the fact, doc/comment/report text only,
++zero functional changes:
++
++1. **Misattributed API for descriptor-type derivation.** The Findings
++   section above and `reflection.h`'s comment on `reflect()` originally
++   stated `TypeLayoutReflection::getBindingRangeType()` was used "for
++   descriptor type and array count/unbounded-ness" — that function is
++   never called anywhere in `reflection.cpp`. The real mechanism (already
++   correctly described in this report's Implementation item 3) is
++   `param->getType()->unwrapArray()->getKind()` (`TypeReflection::Kind`)
++   plus `getResourceShape()`/`getResourceAccess()` via `mapElementType()`;
++   `getBindingRangeBindingCount()` (a different function on the same type)
++   is the one actually used, and only for count/unbounded-ness, not type.
++   Both the Findings section above and `reflection.h`'s comment block on
++   `reflect()` are corrected to name the right function for each purpose
++   and to distinguish `TypeReflection::Kind` from the unrelated
++   `slang::BindingType` enum family `getBindingRangeType()` returns.
++2. **Wrong assertion count.** This report's Verification section (and
++   Summary) claimed `rx_shader_tests` runs "10 cases / 83 assertions"; the
++   built binary actually reports 73 assertions (confirmed by re-running it
++   directly). Corrected both occurrences to 73.
++3. **Imprecise flag-bit prose in `reflection.cpp`.** A comment said
++   `SlangResourceShape` modifier flags are "OR'd in starting at 0x10" —
++   true for feedback/shadow/array/multisample (0x10/0x20/0x40/0x80) but
++   `SLANG_TEXTURE_COMBINED_FLAG` is actually `0x100`. The masking code
++   itself (`shape & 0x0F`) was already correct and untouched; only the
++   prose was reworded to list each flag's actual value.
++
++Verified after the fix: `rx_shader_tests` rebuilt and re-run directly
++(linux-native) — still 10 cases / 73 assertions, all passing, output
++unchanged apart from timestamps. No other file touched.
+diff --git a/src/rx_shader/include/rx_shader/reflection.h b/src/rx_shader/include/rx_shader/reflection.h
+index 1e7b60b..321731b 100644
+--- a/src/rx_shader/include/rx_shader/reflection.h
++++ b/src/rx_shader/include/rx_shader/reflection.h
+@@ -37,34 +37,41 @@ namespace rx::shader {
+ // unambiguously decorates it `DescriptorSet 1` and the top-level parameter
+ // walk below reports `getBindingSpace() == 1` correctly for the same
+ // variable). Per this task's brief ("the shipped slang.h wins over the
+ // research file on any disagreement; note the discrepancy in the report"),
+ // reflect() therefore does NOT use that per-range set/binding attribution
+ // at all. Instead it combines two verified-correct sources:
+ //   - `ProgramLayout::getParameterByIndex()` (flat, top-level global scope)
+ //     for set (`getBindingSpace()`), binding (`getBindingIndex()`),
+ //     category, and name -- verified byte-for-byte against `spirv-dis`
+ //     output for every case reflection_test.cpp exercises.
+-//   - `TypeLayoutReflection::getBindingRangeType()` /
+-//     `getBindingRangeBindingCount()` on `getGlobalParamsTypeLayout()`,
+-//     correlated to the same global parameter by index *and* leaf-variable
+-//     name (a defensive cross-check, not just trust-the-index), for
+-//     descriptor type and array count/unbounded-ness -- this is the only
+-//     API observed to correctly report Slang's `SLANG_UNBOUNDED_SIZE`
+-//     sentinel for a genuinely unsized `T x[]` global;
+-//     `TypeReflection::getElementCount()` (with or without a reflection
+-//     context) was observed returning `0` or `2147483647` for the exact
+-//     same unbounded array, neither of which is that sentinel.
+-// See reflection.cpp for the full walk and the resource-kind -> VkDescriptorType
+-// mapping table (verified for Sampler/Texture2D/CombinedSampler/
+-// ConstantBuffer/StructuredBuffer/RWStructuredBuffer/RWTexture2D against
+-// this same shipped build; other resource shapes are mapped per slang.h's
+-// documented enum semantics but were not separately smoke-tested this
+-// task).
++//   - `param->getType()->unwrapArray()->getKind()` (`TypeReflection::Kind`),
++//     plus `getResourceShape()`/`getResourceAccess()` for the `Kind::Resource`
++//     case, for descriptor *type* -- see `mapElementType()` in
++//     reflection.cpp for the full kind/shape/access -> VkDescriptorType
++//     table (verified for Sampler/Texture2D/CombinedSampler/ConstantBuffer/
++//     StructuredBuffer/RWStructuredBuffer/RWTexture2D against this same
++//     shipped build; other resource shapes are mapped per slang.h's
++//     documented enum semantics but were not separately smoke-tested this
++//     task).
++//   - `TypeLayoutReflection::getBindingRangeBindingCount()` on
++//     `getGlobalParamsTypeLayout()`, correlated to the same global
++//     parameter by index *and* leaf-variable name (a defensive cross-check,
++//     not just trust-the-index), for array count/unbounded-ness -- this is
++//     the only API observed to correctly report Slang's
++//     `SLANG_UNBOUNDED_SIZE` sentinel for a genuinely unsized `T x[]`
++//     global; `TypeReflection::getElementCount()` (with or without a
++//     reflection context) was observed returning `0` or `2147483647` for
++//     the exact same unbounded array, neither of which is that sentinel.
++//     (`TypeLayoutReflection::getBindingRangeType()`, which returns a
++//     `slang::BindingType` -- a different enum from `TypeReflection::Kind`
++//     above -- was probed during investigation but is NOT called by the
++//     actual walk; type classification uses `TypeReflection::Kind` only.)
++// See reflection.cpp for the full walk.
+ //
+ // Threading: takes the same process-wide mutex `Compiler` locks for every
+ // front-end operation (module load/compose/link) -- see
+ // src/detail/global_session_mutex.h's comment for why a reflection walk
+ // needs that same external synchronization, not a separate or absent lock.
+ std::optional<ShaderLayoutInfo> reflect(const CompileResult& result);
+ 
+ }  // namespace rx::shader
+diff --git a/src/rx_shader/src/reflection.cpp b/src/rx_shader/src/reflection.cpp
+index 824bfec..20d887d 100644
+--- a/src/rx_shader/src/reflection.cpp
++++ b/src/rx_shader/src/reflection.cpp
+@@ -81,24 +81,26 @@ VkDescriptorType mapElementType(slang::TypeReflection* elemType, const char* par
+         // SLANG_STRUCTURED_BUFFER instead, handled below), but mapped here
+         // defensively in case a future Slang version or a shader construct
+         // this task didn't try routes through them instead.
+         case Kind::ShaderStorageBuffer:
+             return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+         case Kind::TextureBuffer:
+             return VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+         case Kind::Resource: {
+             SlangResourceShape shape = elemType->getResourceShape();
+             // Base shape values (SLANG_TEXTURE_1D=0x01 .. SLANG_TEXTURE_SUBPASS=0x0A)
+-            // are all < 0x10; every modifier (array/multisample/shadow/
+-            // feedback/combined-sampler) is OR'd in starting at 0x10, so
+-            // masking with 0x0F isolates the base shape cleanly [verified:
+-            // slang.h's SlangResourceShape enum values].
++            // are all < 0x10; every modifier bit is OR'd in at or above
++            // 0x10 (feedback=0x10, shadow=0x20, array=0x40,
++            // multisample=0x80, combined-sampler=0x100), so masking with
++            // 0x0F isolates the base shape cleanly regardless of which
++            // modifiers are set [verified: slang.h's SlangResourceShape
++            // enum values].
+             auto baseShape = static_cast<SlangResourceShape>(shape & 0x0F);
+             bool combinedSampler = (shape & SLANG_TEXTURE_COMBINED_FLAG) != 0;
+             SlangResourceAccess access = elemType->getResourceAccess();
+             bool readWrite = access != SLANG_RESOURCE_ACCESS_READ && access != SLANG_RESOURCE_ACCESS_NONE;
+             switch (baseShape) {
+                 case SLANG_TEXTURE_1D:
+                 case SLANG_TEXTURE_2D:
+                 case SLANG_TEXTURE_3D:
+                 case SLANG_TEXTURE_CUBE:
+                 case SLANG_TEXTURE_SUBPASS:

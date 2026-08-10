@@ -1,0 +1,1704 @@
+# Review package: 0d3387e..88607a7eafe064fdd0db5f68bf16103005381e89
+
+## Commits
+88607a7 Add reflection-driven descriptor set/pipeline layouts (Phase 2 Task 2)
+
+## Files changed
+ .../task-2-report.md                               | 296 +++++++++++++++++++++
+ CMakeLists.txt                                     |   9 +-
+ src/rx_rhi_vk/CMakeLists.txt                       |  40 ++-
+ src/rx_rhi_vk/include/rx_rhi_vk/pipeline_layout.h  | 105 ++++++++
+ src/rx_rhi_vk/src/pipeline_layout.cpp              | 171 ++++++++++++
+ src/rx_rhi_vk/tests/pipeline_layout_test.cpp       | 170 ++++++++++++
+ src/rx_shader/CMakeLists.txt                       |  17 +-
+ src/rx_shader/include/rx_shader/reflection.h       |  70 +++++
+ .../include/rx_shader/shader_layout_info.h         |  67 +++++
+ src/rx_shader/src/compiler.cpp                     |  23 +-
+ src/rx_shader/src/detail/global_session_mutex.h    |  36 +++
+ src/rx_shader/src/reflection.cpp                   | 270 +++++++++++++++++++
+ src/rx_shader/tests/reflection_test.cpp            | 182 +++++++++++++
+ 13 files changed, 1435 insertions(+), 21 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-2-report.md b/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-2-report.md
+new file mode 100644
+index 0000000..ff52bc5
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-2-report.md
+@@ -0,0 +1,296 @@
++# Task 2 Report: Reflection → descriptor set layouts + pipeline layouts
++
++## Summary
++
++Implemented the full Task 2 scope: `rx::shader::reflect()` (`rx_shader`)
++walking a linked Slang program's reflection data into the plain-struct
++`ShaderLayoutInfo`, and `rx::rhi::PipelineLayoutBuilder` (`rx_rhi_vk`)
++turning that into real `VkDescriptorSetLayout`/`VkPipelineLayout` objects,
++with the >128-byte push-constant budget enforced there and only there.
++Before writing any reflection code, I built a throwaway probe program
++against the real shipped Slang v2026.14.1 library (compiled directly with
++`g++`, no CMake) to determine the actual reflection API shapes empirically,
++cross-checked against `spirv-dis` on the real compiled SPIR-V — this
++surfaced a genuine discrepancy against the research file (see "Findings"
++below) that changed the implementation's walk strategy. Both presets
++configure, build, and test clean; `rx_shader_tests` (10 cases / 83
++assertions) and `rx_rhi_vk_tests` (8 cases / 107 assertions) both pass with
++zero validation errors.
++
++## Findings / discrepancies vs. the research doc
++
++**[R:A3]'s assumed descriptor-set-range walk is unreliable for set
++attribution on this shipped Slang build; the top-level parameter walk plus
++the binding-range API are used instead.** [R:A3] describes deriving
++set/binding/type/count by walking
++`TypeLayoutReflection::getDescriptorSetCount()` /
++`getDescriptorSetDescriptorRange*()` on `getGlobalParamsTypeLayout()`. I
++built a probe shader with two explicit descriptor sets
++(`[[vk::binding(0,0)]] Texture2D gTextures[]`, `[[vk::binding(0,1)]]
++SamplerState gSampler`, `[[vk::binding(1,1)]] ConstantBuffer<FrameData>
++gFrame`) and walked it both ways:
++
++- The top-level `ProgramLayout::getParameterByIndex()` walk reported
++  `gFrame`'s `getBindingSpace() == 1` — correct, confirmed byte-for-byte
++  against `spirv-dis`'s `OpDecorate %gFrame DescriptorSet 1`.
++- The `getDescriptorSetDescriptorRange*()` walk on
++  `getGlobalParamsTypeLayout()` instead grouped `gFrame`'s range under
++  *descriptor-set-local-index 0* (`spaceOffset == 0`), not 1 — wrong, and
++  would have produced a `VkDescriptorSetLayoutBinding` in the wrong set
++  entirely had I trusted it.
++
++I also found `TypeReflection::getElementCount()` does not reliably report
++Slang's own documented `SLANG_UNBOUNDED_SIZE` sentinel for a genuinely
++unsized `Texture2D gTextures[]` global: it returned `0` with no reflection
++context and `2147483647` with one, neither of which is the sentinel.
++`TypeLayoutReflection::getBindingRangeBindingCount()` (a different API,
++walked on the same `getGlobalParamsTypeLayout()`) *did* report
++`SLANG_UNBOUNDED_SIZE` correctly for the same array.
++
++**Resolution implemented:** `reflect()` (`src/rx_shader/src/reflection.cpp`)
++uses `ProgramLayout::getParameterByIndex()` for set/binding/category/name
++(verified correct), and `TypeLayoutReflection::getBindingRangeType()`/
++`getBindingRangeBindingCount()` for descriptor type and array count/
++unbounded-ness (the only API observed to report the unbounded sentinel
++correctly) — correlated to the same parameter by index *and* a
++leaf-variable-name cross-check, so a future mismatch fails loudly (logged,
++binding skipped) instead of silently attributing one binding's count to
++another. This correlation held across two independently-shaped probe
++shaders (the one above, and a second exercising
++`StructuredBuffer`/`RWStructuredBuffer`/`RWTexture2D`/`Sampler2D`). Fully
++documented in `reflection.h`'s comment on `reflect()` and inline in
++`reflection.cpp`.
++
++Everything else needed from [R:A3] (`BindingType`/`ParameterCategory` enum
++values, `PushConstantBuffer`/`PushConstant` identification, `getSize()`/
++`getOffset()` for push-constant ranges) matched the shipped `slang.h`
++exactly as documented, including the `[[vk::push_constant]]` bare-struct
++spelling (`SmallData pc;`, no `ConstantBuffer<T>` wrapper) producing the
++same `getElementTypeLayout()`-bearing wrapper shape as the explicit
++`ConstantBuffer<T>` spelling — verified both compile to an identical
++reflection shape.
++
++## Implementation
++
++### 1. The Slang-free boundary (`ShaderLayoutInfo`)
++
++Per the as-built context ("no Slang types may appear in rx_rhi_vk headers
++or link deps") and the fact that `rx_shader/compiler.h` (needed for
++`CompileResult`, `reflection.h`'s other dependency) unavoidably includes
++`slang.h`, `ShaderLayoutInfo` itself needed its own header with zero Slang
++dependency: `src/rx_shader/include/rx_shader/shader_layout_info.h` (plain
++struct, only `<vulkan/vulkan.h>`/`<cstdint>`/`<vector>`). `reflection.h`
++includes both `shader_layout_info.h` and `compiler.h`; `pipeline_layout.h`
++includes only `shader_layout_info.h`. To make that a build-graph guarantee
++rather than a convention, `src/rx_shader/CMakeLists.txt` gained a new
++header-only `rx_shader_layout_types` INTERFACE target (this directory's
++`include/`, `Vulkan::Headers` only) — `rx_shader` links it (transparent to
++existing consumers) and `rx_rhi_vk` links *it*, never `rx_shader` itself.
++Root `CMakeLists.txt` reordered `add_subdirectory(src/rx_shader)` before
++`add_subdirectory(src/rx_rhi_vk)` so the target exists before it's
++consumed (not strictly required by modern CMake's deferred target
++resolution, but removes any doubt).
++
++### 2. Mutex sharing across `compiler.cpp`/`reflection.cpp`
++
++The as-built context flagged that reflection touches Slang objects under
++the same mutex `Compiler` uses for front-end calls. `compiler.cpp`'s mutex
++accessor was a function-local static inside an anonymous namespace
++(internal linkage, unreachable from a second TU) — moved to a named
++`rx::shader::detail` namespace with a declaration in a new, non-public
++header (`src/rx_shader/src/detail/global_session_mutex.h`, not under
++`include/`) so `reflection.cpp` can lock the *same* mutex object before
++calling `getLayout()` and walking the result. Rationale documented in that
++header: `getLayout()` is not in slang.h's short list of explicitly
++"experimental concurrent-safe" operations (backend codegen on an
++already-linked component type), so it stays under the same lock as
++everything else per the "front-end operations... externally synchronized
++unless documented otherwise" rule [R:A4/A6].
++
++### 3. `rx::shader::reflect()` (`src/rx_shader/src/reflection.cpp`)
++
++Walks flat global-scope parameters only (matches the spec's "no
++intermediate metadata format" design and Task 2's actual test shapes;
++`ParameterBlock<T>`/nested layouts are out of scope, logged-and-skipped if
++encountered). For each global parameter: `PushConstantBuffer` category →
++one `PushRange` (size from `getElementTypeLayout()->getSize()`, offset
++from `getOffset(category)`); `DescriptorTableSlot` category → one
++`Binding`, type from a `TypeReflection::Kind`/`SlangResourceShape`/
++`SlangResourceAccess`-based mapping (verified against `spirv-dis` for
++Sampler/Texture2D/CombinedSampler/ConstantBuffer/StructuredBuffer/
++RWStructuredBuffer/RWTexture2D; other resource shapes mapped per
++documented enum semantics but not separately smoke-tested, flagged in
++code); every other category logged and skipped. Stage flags are merged
++across every entry point in the linked program and applied to every
++binding/push-range — a deliberately conservative default (over-including
++stage visibility is always Vulkan-spec-legal), since global-parameter
++reflection doesn't surface *which* entry point touches a given global.
++
++### 4. `rx::rhi::PipelineLayoutBuilder` (`src/rx_rhi_vk/src/pipeline_layout.cpp`)
++
++Rejects (before touching Vulkan at all) if the push-constant footprint
++(`max(offset+size)` across ranges) exceeds 128 bytes [spec Fixed decision
++#5, R:B2]. Otherwise groups bindings by set index, gap-filling any skipped
++index with an empty (zero-binding) `VkDescriptorSetLayout` so
++`vkCmdBindDescriptorSets`' positional addressing stays correct even for a
++shader using e.g. set 0 and set 2 but not 1. A set containing any
++`unboundedArray` binding gets `VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT`;
++that specific binding gets `VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
++VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT` (via
++`VkDescriptorSetLayoutBindingFlagsCreateInfo`) and a capacity of
++`kUnboundedArrayDescriptorCapacity` (4096, a documented generic default —
++Task 3's `BindlessTable` defines its own explicit capacities and is
++expected to build its dedicated set directly rather than through this
++constant). On any Vulkan failure, every set layout already created in that
++call is destroyed before returning `std::nullopt`. `PipelineLayoutBundle`
++is move-only RAII (public `setLayouts`/`layout` per the brief's exact
++shape; a private `device_` for teardown, matching this library's existing
++`friend`-constructed RAII types).
++
++### 5. Tests
++
++- `src/rx_shader/tests/reflection_test.cpp` (joins the existing
++  `rx_shader_tests` binary): the mandated exact-value test (unbounded
++  `Texture2D[]` + `SamplerState` + `ConstantBuffer<T>` + push constants) —
++  every set/binding/type/count/stage asserted against a hand-computed
++  table, plus the push-constant range's exact offset (0) and size (80,
++  std430-packed `{uint,uint,float4x4}`); a >128-byte push-constant
++  (`3×float4x4` = 192 bytes) shader asserting `reflect()` still succeeds
++  and reports the real size (128-byte enforcement is `PipelineLayoutBuilder`'s
++  job, verified separately); `reflect()` returns `nullopt` on a failed
++  `CompileResult`.
++- `src/rx_rhi_vk/tests/pipeline_layout_test.cpp` (joins the existing
++  `rx_rhi_vk_tests` binary — the as-built context's explicit guidance for
++  staying protected by that binary's vk-bootstrap warm-up rather than
++  building a new one): a headless device built locally in this file with
++  exactly the `VkPhysicalDeviceVulkan12Features` bits Task 3's brief will
++  make process-wide (not touching `rx::rhi::Device::create()`, which
++  doesn't enable them yet); `PipelineLayoutBuilder::build` on a
++  hand-crafted `ShaderLayoutInfo` mirroring `reflection_test.cpp`'s exact
++  shape → non-null `layout` + 2 non-null `setLayouts`, zero validation
++  errors; the same >128-byte push-constant shape (192 bytes, matching
++  `reflection_test.cpp`'s case) → `build()` returns `nullopt` with a
++  logged error.
++
++**Design note on the reflect()/PipelineLayoutBuilder test split:** since
++`rx_rhi_vk` never links `rx_shader`, `pipeline_layout_test.cpp`
++hand-constructs its `ShaderLayoutInfo` values rather than calling
++`reflect()` — it deliberately mirrors `reflection_test.cpp`'s shapes
++(including the identical 192-byte oversized case) so the two tests
++together prove the brief's full contract ("reflection succeeds ... but
++PipelineLayoutBuilder rejects") without either test needing the other
++component.
++
++## Verification
++
++- **linux-native, full build:** all targets build clean.
++  `ctest --preset linux-native`: **6/6 pass** (`shader_spirv_test`,
++  `rx_core_tests`, `rx_platform_tests`, `rx_shader_tests` [10 cases / 83
++  assertions], `rx_rhi_vk_tests` [8 cases / 107 assertions],
++  `sample_01_triangle_headless`). `rx_rhi_vk_tests` run directly (not just
++  via ctest) shows zero real validation errors — only the pre-existing,
++  already-documented `VK_KHR_portability_enumeration` false positives
++  `Context` already filters.
++- **windows-cross-zig, full configure+build:** clean, all targets
++  including the two touched executables. `ctest --preset
++  windows-cross-zig`: **6/6 pass**, including `rx_shader_tests.exe` and
++  `rx_rhi_vk_tests.exe` both actually executed under Wine on this machine
++  (this preset's ctest is not GPU-excluded in this repo's current
++  configuration) — both the new reflection and pipeline-layout tests pass
++  identically to the Linux run.
++- Manually confirmed (per the vk-bootstrap landmine constraint) that no
++  new test binary was introduced: `pipeline_layout_test.cpp` joined the
++  existing `rx_rhi_vk_tests` executable, protected by its existing
++  `doctest_main.cpp` warm-up with no changes needed there.
++
++## Deviations from brief / spec
++
++1. **Added `src/rx_shader/include/rx_shader/shader_layout_info.h` and the
++   `rx_shader_layout_types` CMake INTERFACE target — not in the brief's
++   file list.** Required to satisfy the as-built context's explicit,
++   non-negotiable constraint ("no Slang types may appear in rx_rhi_vk
++   headers or link deps"): `reflection.h` needs `compiler.h` (for
++   `CompileResult`), which unavoidably includes `slang.h`; without a
++   separate Slang-free header for `ShaderLayoutInfo` alone,
++   `pipeline_layout.h` would have had to include `reflection.h` and
++   transitively drag `slang.h` into `rx_rhi_vk`. This is an adaptation of
++   the brief's file list, not a spec-level deviation — no Fixed Decision
++   changed, and no coordinator sign-off was sought since the brief's own
++   constraint text left no other way to satisfy both requirements
++   simultaneously (one shared `ShaderLayoutInfo` type, and zero Slang in
++   rx_rhi_vk).
++2. **`reflect()` does not use the descriptor-set-range walk [R:A3]
++   describes.** Covered in "Findings" above — the shipped `slang.h`'s
++   actual behavior (verified against real SPIR-V) wins per this task's own
++   instructions.
++3. Everything else matches the brief's interfaces exactly:
++   `ShaderLayoutInfo`'s field shapes, `reflect()`'s signature,
++   `PipelineLayoutBuilder::build`'s signature and `PipelineLayoutBundle`'s
++   public shape.
++
++## Concerns for the coordinator
++
++1. **`kUnboundedArrayDescriptorCapacity` (4096) is a generic default with
++   no empirical stress-test behind the specific number** — chosen to be
++   comfortably within RADV/NVIDIA's effectively-unbounded
++   `maxDescriptorSetUpdateAfterBindSampledImages` limits [R:B2], but Task 3
++   should confirm whether `BindlessTable` truly bypasses this constant
++   entirely (as this task assumes/documents) or whether some future caller
++   of `PipelineLayoutBuilder::build` on an unbounded-array shader still
++   needs it to be configurable.
++2. **Resource-kind → `VkDescriptorType` mapping coverage beyond what was
++   tested**: `Kind::ShaderStorageBuffer`/`Kind::TextureBuffer` (distinct
++   `TypeReflection::Kind` values per `slang.h`) are mapped defensively but
++   were never observed from any construct this task actually compiled
++   (`StructuredBuffer`/`RWStructuredBuffer` both surfaced as
++   `Kind::Resource` + `SLANG_STRUCTURED_BUFFER` instead) — flagged in code;
++   a future task exercising an HLSL `tbuffer`/raw `ShaderStorageBuffer`
++   construct should verify before trusting it.
++3. Per-binding stage-flag merging is "every entry point in the program,"
++   not "every entry point that actually references this specific global"
++   — always spec-legal (over-inclusive, never under) but slightly loses
++   precision; acceptable for Task 2's scope, worth knowing about if a
++   later task cares about minimizing declared stage visibility for some
++   other reason (e.g. driver-side pipeline compilation heuristics).
++
++## Files created
++
++- `src/rx_shader/include/rx_shader/shader_layout_info.h`
++- `src/rx_shader/include/rx_shader/reflection.h`
++- `src/rx_shader/src/detail/global_session_mutex.h`
++- `src/rx_shader/src/reflection.cpp`
++- `src/rx_shader/tests/reflection_test.cpp`
++- `src/rx_rhi_vk/include/rx_rhi_vk/pipeline_layout.h`
++- `src/rx_rhi_vk/src/pipeline_layout.cpp`
++- `src/rx_rhi_vk/tests/pipeline_layout_test.cpp`
++
++## Files modified
++
++- `src/rx_shader/src/compiler.cpp` (mutex accessor moved to
++  `rx::shader::detail`, given external linkage — behavior unchanged)
++- `src/rx_shader/CMakeLists.txt` (+`rx_shader_layout_types` INTERFACE
++  target, +`reflection.cpp`, +`reflection_test.cpp`)
++- `src/rx_rhi_vk/CMakeLists.txt` (+`pipeline_layout.cpp`, links
++  `rx_shader_layout_types`, +`pipeline_layout_test.cpp` in the existing
++  `rx_rhi_vk_tests` binary)
++- `CMakeLists.txt` (reordered `src/rx_shader` before `src/rx_rhi_vk`)
++
++## Readiness for Task 3
++
++`ShaderLayoutInfo`/`PipelineLayoutBuilder` are ready to consume real
++`reflect()` output end to end (proven conceptually by the two tests
++mirroring each other's shapes, though no single test currently pipes
++`reflect()`'s actual output into `PipelineLayoutBuilder::build` in one
++call — a sample in Task 5/6 will be the first place that happens for
++real). `PipelineLayoutBuilder::build`'s unbounded-array handling
++(`UPDATE_AFTER_BIND_BIT | PARTIALLY_BOUND_BIT` + set-level
++`UPDATE_AFTER_BIND_POOL_BIT`) is exactly the binding-flag shape Task 3's
++`BindlessTable` needs to be layout-compatible with, though `BindlessTable`
++is expected to build its own dedicated global set directly (with its own
++explicit per-resource-class capacities and the additional
++`VARIABLE_DESCRIPTOR_COUNT` flag on its last binding, per its own brief)
++rather than route through this generic builder. Task 3's device-feature
++enablement (`VkPhysicalDeviceVulkan12Features` via
++`set_required_features_12`) should use the exact same feature list
++`pipeline_layout_test.cpp` already exercises locally — copying it verbatim
++into `Device::create()` is a safe, already-proven starting point.
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f827082..0663703 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -7,15 +7,22 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+ 
+ enable_testing()
+ 
+ add_subdirectory(third_party)
+ 
+ include(tools/fetch_slang.cmake)
+ add_subdirectory(shaders)
+ 
+ add_subdirectory(src/rx_core)
+ add_subdirectory(src/rx_platform)
+-add_subdirectory(src/rx_rhi_vk)
++# rx_shader before rx_rhi_vk: rx_rhi_vk's PipelineLayoutBuilder
++# (pipeline_layout.h) links rx_shader's `rx_shader_layout_types` INTERFACE
++# target (defined in src/rx_shader/CMakeLists.txt) to get
++# ShaderLayoutInfo's header without slang::slang -- defining that target
++# before the directory that consumes it removes any doubt about
++# add_subdirectory ordering, even though target_link_libraries against a
++# not-yet-defined target name is otherwise fine in modern CMake.
+ add_subdirectory(src/rx_shader)
++add_subdirectory(src/rx_rhi_vk)
+ add_subdirectory(tools/dep_cache_smoketest)
+ add_subdirectory(tools/toolchain_check)
+ add_subdirectory(samples/01_triangle)
+diff --git a/src/rx_rhi_vk/CMakeLists.txt b/src/rx_rhi_vk/CMakeLists.txt
+index f8f4186..720d957 100644
+--- a/src/rx_rhi_vk/CMakeLists.txt
++++ b/src/rx_rhi_vk/CMakeLists.txt
+@@ -8,39 +8,53 @@
+ # src/vma_impl.cpp is the sole VMA_IMPLEMENTATION translation unit for this
+ # entire program (see that file); every other consumer of VMA
+ # (src/buffer.cpp, include/rx_rhi_vk/buffer.h) only ever declares against
+ # vk_mem_alloc.h, never redefines VMA_IMPLEMENTATION.
+ add_library(rx_rhi_vk STATIC
+     src/context.cpp
+     src/device.cpp
+     src/buffer.cpp
+     src/command.cpp
+     src/frame_sync.cpp
++    src/pipeline_layout.cpp
+     src/vma_impl.cpp
+     ${volk_SOURCE_DIR}/volk.c
+ )
+ target_include_directories(rx_rhi_vk PUBLIC include ${volk_SOURCE_DIR} ${vma_SOURCE_DIR}/include)
+-target_link_libraries(rx_rhi_vk PUBLIC rx_core vk-bootstrap::vk-bootstrap)
++# rx_shader_layout_types (defined in src/rx_shader/CMakeLists.txt) is a
++# header-only INTERFACE target exposing ONLY rx_shader's plain-data
++# shader_layout_info.h -- never `rx_shader` itself, which would drag
++# slang::slang (a real link dependency, plus every other rx_shader header)
++# into this library. See pipeline_layout.h's own comment for why
++# PipelineLayoutBuilder needs `rx::shader::ShaderLayoutInfo` without any of
++# that.
++target_link_libraries(rx_rhi_vk PUBLIC rx_core vk-bootstrap::vk-bootstrap rx_shader_layout_types)
+ target_compile_definitions(rx_rhi_vk PUBLIC VK_NO_PROTOTYPES)
+ 
+-# Five test translation units now (context_test.cpp, device_test.cpp,
+-# buffer_test.cpp, clear_color_test.cpp, frame_sync_test.cpp), so -- like
+-# rx_core_tests, and unlike this target before device_test.cpp existed --
+-# doctest's runtime/main is implemented once in a dedicated
+-# tests/doctest_main.cpp shared by all five, rather than in any one test
+-# file. doctest_main.cpp also links rx_platform: it uses rx::platform::Window
+-# to warm up a real vk-bootstrap hazard before any TEST_CASE runs (see the
+-# comment there) -- so test order here is not load-bearing, deliberately; no
+-# --order-by is needed on the add_test line below. clear_color_test.cpp in
+-# particular is pure headless (no window/surface/swapchain) and relies on
+-# that warm-up to be safe regardless of where doctest schedules it relative
+-# to the windowed tests.
++# Six test translation units now (context_test.cpp, device_test.cpp,
++# buffer_test.cpp, clear_color_test.cpp, frame_sync_test.cpp,
++# pipeline_layout_test.cpp), so -- like rx_core_tests, and unlike this
++# target before device_test.cpp existed -- doctest's runtime/main is
++# implemented once in a dedicated tests/doctest_main.cpp shared by all six,
++# rather than in any one test file. doctest_main.cpp also links rx_platform:
++# it uses rx::platform::Window to warm up a real vk-bootstrap hazard before
++# any TEST_CASE runs (see the comment there) -- so test order here is not
++# load-bearing, deliberately; no --order-by is needed on the add_test line
++# below. clear_color_test.cpp and pipeline_layout_test.cpp in particular are
++# pure headless (no window/surface/swapchain) and rely on that warm-up to be
++# safe regardless of where doctest schedules them relative to the windowed
++# tests -- see the Phase 2 plan's Global Constraints on the vk-bootstrap
++# landmine: pipeline_layout_test.cpp builds its own headless device (to
++# enable the descriptor-indexing device features Task 3 will later make
++# process-wide), and joining THIS binary rather than a new one is what keeps
++# it protected by the warm-up above instead of needing to reimplement it.
+ add_executable(rx_rhi_vk_tests
+     tests/doctest_main.cpp
+     tests/context_test.cpp
+     tests/device_test.cpp
+     tests/buffer_test.cpp
+     tests/clear_color_test.cpp
+     tests/frame_sync_test.cpp
++    tests/pipeline_layout_test.cpp
+ )
+ target_link_libraries(rx_rhi_vk_tests PRIVATE rx_rhi_vk rx_platform doctest::doctest)
+ add_test(NAME rx_rhi_vk_tests COMMAND rx_rhi_vk_tests)
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/pipeline_layout.h b/src/rx_rhi_vk/include/rx_rhi_vk/pipeline_layout.h
+new file mode 100644
+index 0000000..6c8b693
+--- /dev/null
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/pipeline_layout.h
+@@ -0,0 +1,105 @@
++#pragma once
++#include <volk.h>
++// The ONLY rx_shader header this file (or any rx_rhi_vk header) includes --
++// a plain-data struct with zero Slang types and zero slang::slang link
++// dependency. See that header's own comment, and
++// rx_shader/CMakeLists.txt's `rx_shader_layout_types` INTERFACE target,
++// for how that separation is enforced at the build-graph level: this
++// library links `rx_shader_layout_types`, never `rx_shader` itself.
++#include <rx_shader/shader_layout_info.h>
++#include <optional>
++#include <vector>
++
++namespace rx::rhi {
++
++class PipelineLayoutBuilder;
++
++// RAII owner of every Vulkan object PipelineLayoutBuilder::build() creates:
++// one VkDescriptorSetLayout per descriptor set index the shader's
++// ShaderLayoutInfo uses (including empty placeholder layouts for any gap --
++// see build()'s comment), and the VkPipelineLayout built from them plus the
++// shader's push-constant ranges. Move-only; destroys everything via
++// vkDestroyPipelineLayout/vkDestroyDescriptorSetLayout on destruction or
++// move-assignment.
++//
++// `setLayouts`/`layout` are public (not private-with-accessor, unlike most
++// RAII types in this library) because callers need them directly: `layout`
++// for vkCreateGraphicsPipelines/vkCmdBindDescriptorSets'
++// firstSet/pDescriptorSets bookkeeping, `setLayouts` for allocating actual
++// VkDescriptorSets against each one. Callers must not destroy either
++// themselves -- this bundle owns both.
++struct PipelineLayoutBundle {
++    std::vector<VkDescriptorSetLayout> setLayouts;
++    VkPipelineLayout layout = VK_NULL_HANDLE;
++
++    PipelineLayoutBundle() = default;
++    PipelineLayoutBundle(PipelineLayoutBundle&&) noexcept;
++    PipelineLayoutBundle& operator=(PipelineLayoutBundle&&) noexcept;
++    PipelineLayoutBundle(const PipelineLayoutBundle&) = delete;
++    PipelineLayoutBundle& operator=(const PipelineLayoutBundle&) = delete;
++    ~PipelineLayoutBundle();
++
++private:
++    friend class PipelineLayoutBuilder;
++
++    explicit PipelineLayoutBundle(VkDevice device) : device_(device) {}
++
++    void destroyAll();
++
++    VkDevice device_ = VK_NULL_HANDLE;
++};
++
++// Turns a shader's reflected ShaderLayoutInfo (rx_shader's reflect() output
++// -- see that header) into a matching VkDescriptorSetLayout per descriptor
++// set index plus the VkPipelineLayout tying them together with the
++// shader's push-constant ranges. Stateless: every method is static, there
++// is nothing to construct.
++class PipelineLayoutBuilder {
++public:
++    PipelineLayoutBuilder() = delete;
++
++    // Upper bound used for VkDescriptorSetLayoutBinding::descriptorCount
++    // when a binding's `unboundedArray` is true -- Vulkan requires a
++    // concrete (nonzero) descriptorCount at layout-creation time even for
++    // an UPDATE_AFTER_BIND | PARTIALLY_BOUND binding (those flags relax
++    // *which* descriptors within that count must be valid/written, not
++    // whether a count is needed at all). This is a generic default sized
++    // for this builder's own reflection-driven path in isolation; Task 3's
++    // BindlessTable defines its own explicit per-resource-class capacities
++    // (1024/16/256 sampled images/samplers/storage buffers, per its own
++    // brief) and is expected to build its dedicated global set directly
++    // rather than route through this constant.
++    static constexpr uint32_t kUnboundedArrayDescriptorCapacity = 4096;
++
++    // Builds one VkDescriptorSetLayout per descriptor set index used by
++    // `layoutInfo.bindings` -- including an empty (zero-binding) layout for
++    // any set index skipped by the shader (e.g. a shader using only set 0
++    // and set 2 still needs a placeholder at index 1, since
++    // vkCmdBindDescriptorSets addresses sets positionally by index, not by
++    // the sparse set of numbers a shader happens to declare) -- then the
++    // VkPipelineLayout tying them together with `layoutInfo.pushRanges`.
++    //
++    // A binding with `unboundedArray == true` gets
++    // VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
++    // VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT (via
++    // VkDescriptorSetLayoutBindingFlagsCreateInfo), and that set's layout
++    // gets VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT --
++    // both required by Vulkan validation for a set that will later be
++    // written to via vkUpdateDescriptorSets while already bound (Task 3's
++    // bindless table depends on this).
++    //
++    // Rejects (returns std::nullopt, logs via RX_LOG_ERROR) if the total
++    // push-constant footprint (max over every range of offset+size) exceeds
++    // the 128-byte guaranteed-minimum floor every Vulkan 1.0+ implementation
++    // must support [spec Fixed decision #5, R:B2] -- enforced here, not in
++    // reflect(), since reflection must faithfully report what a shader
++    // actually declares even when that exceeds this engine's own budget
++    // policy (see rx_shader's reflection_test.cpp for the "reflection
++    // succeeds regardless" half of this contract). Also returns
++    // std::nullopt if any underlying vkCreateDescriptorSetLayout/
++    // vkCreatePipelineLayout call fails, cleaning up every handle already
++    // created in that same call first.
++    static std::optional<PipelineLayoutBundle> build(VkDevice device, const rx::shader::ShaderLayoutInfo& layoutInfo);
++};
++
++}  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/pipeline_layout.cpp b/src/rx_rhi_vk/src/pipeline_layout.cpp
+new file mode 100644
+index 0000000..56c40e9
+--- /dev/null
++++ b/src/rx_rhi_vk/src/pipeline_layout.cpp
+@@ -0,0 +1,171 @@
++#include <rx_rhi_vk/pipeline_layout.h>
++
++#include <rx_core/log.h>
++
++#include <algorithm>
++#include <utility>
++
++namespace rx::rhi {
++
++namespace {
++
++// Every Vulkan 1.0+ implementation must support at least this many bytes of
++// push-constant storage (`VkPhysicalDeviceLimits::maxPushConstantsSize`'s
++// guaranteed minimum) -- confirmed as the *exact* limit (not just the
++// floor) on the Steam Deck's RADV driver [R:B2], so this engine budgets to
++// it rather than to whatever a given desktop GPU happens to report.
++constexpr uint32_t kPushConstantBudgetBytes = 128;
++
++void destroySetLayouts(VkDevice device, const std::vector<VkDescriptorSetLayout>& setLayouts) {
++    for (VkDescriptorSetLayout setLayout : setLayouts) {
++        if (setLayout != VK_NULL_HANDLE) {
++            vkDestroyDescriptorSetLayout(device, setLayout, nullptr);
++        }
++    }
++}
++
++}  // namespace
++
++PipelineLayoutBundle::PipelineLayoutBundle(PipelineLayoutBundle&& other) noexcept : PipelineLayoutBundle() {
++    *this = std::move(other);
++}
++
++PipelineLayoutBundle& PipelineLayoutBundle::operator=(PipelineLayoutBundle&& other) noexcept {
++    if (this != &other) {
++        destroyAll();
++
++        setLayouts = std::move(other.setLayouts);
++        layout = other.layout;
++        device_ = other.device_;
++
++        other.setLayouts.clear();
++        other.layout = VK_NULL_HANDLE;
++        other.device_ = VK_NULL_HANDLE;
++    }
++    return *this;
++}
++
++PipelineLayoutBundle::~PipelineLayoutBundle() {
++    destroyAll();
++}
++
++void PipelineLayoutBundle::destroyAll() {
++    if (layout != VK_NULL_HANDLE) {
++        vkDestroyPipelineLayout(device_, layout, nullptr);
++    }
++    destroySetLayouts(device_, setLayouts);
++}
++
++std::optional<PipelineLayoutBundle> PipelineLayoutBuilder::build(VkDevice device,
++                                                                  const rx::shader::ShaderLayoutInfo& layoutInfo) {
++    // --- Push-constant budget enforcement -----------------------------
++    uint32_t totalPushConstantSpan = 0;
++    for (const auto& range : layoutInfo.pushRanges) {
++        totalPushConstantSpan = std::max(totalPushConstantSpan, range.offset + range.size);
++    }
++    if (totalPushConstantSpan > kPushConstantBudgetBytes) {
++        RX_LOG_ERROR(
++            "rx_rhi_vk::PipelineLayoutBuilder::build: push constant footprint of {} bytes exceeds the "
++            "{}-byte guaranteed-minimum budget [spec Fixed decision #5, R:B2]; rejecting",
++            totalPushConstantSpan, kPushConstantBudgetBytes);
++        return std::nullopt;
++    }
++
++    // --- Group bindings by set index, gap-filling any skipped index ----
++    uint32_t maxSet = 0;
++    for (const auto& binding : layoutInfo.bindings) {
++        maxSet = std::max(maxSet, binding.set);
++    }
++    size_t setCount = layoutInfo.bindings.empty() ? 0 : static_cast<size_t>(maxSet) + 1;
++
++    std::vector<std::vector<const rx::shader::ShaderLayoutInfo::Binding*>> bindingsBySet(setCount);
++    for (const auto& binding : layoutInfo.bindings) {
++        bindingsBySet[binding.set].push_back(&binding);
++    }
++
++    std::vector<VkDescriptorSetLayout> setLayouts;
++    setLayouts.reserve(setCount);
++    for (size_t setIndex = 0; setIndex < setCount; ++setIndex) {
++        std::vector<VkDescriptorSetLayoutBinding> vkBindings;
++        std::vector<VkDescriptorBindingFlags> bindingFlags;
++        bool anyUpdateAfterBind = false;
++
++        vkBindings.reserve(bindingsBySet[setIndex].size());
++        bindingFlags.reserve(bindingsBySet[setIndex].size());
++        for (const auto* binding : bindingsBySet[setIndex]) {
++            VkDescriptorSetLayoutBinding vkBinding{};
++            vkBinding.binding = binding->binding;
++            vkBinding.descriptorType = binding->type;
++            vkBinding.descriptorCount =
++                binding->unboundedArray ? kUnboundedArrayDescriptorCapacity : binding->count;
++            vkBinding.stageFlags = binding->stages;
++            vkBindings.push_back(vkBinding);
++
++            VkDescriptorBindingFlags flags = 0;
++            if (binding->unboundedArray) {
++                flags = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
++                anyUpdateAfterBind = true;
++            }
++            bindingFlags.push_back(flags);
++        }
++
++        VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo{};
++        flagsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
++        flagsInfo.bindingCount = static_cast<uint32_t>(bindingFlags.size());
++        flagsInfo.pBindingFlags = bindingFlags.empty() ? nullptr : bindingFlags.data();
++
++        VkDescriptorSetLayoutCreateInfo setLayoutInfo{};
++        setLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
++        setLayoutInfo.bindingCount = static_cast<uint32_t>(vkBindings.size());
++        setLayoutInfo.pBindings = vkBindings.empty() ? nullptr : vkBindings.data();
++        if (anyUpdateAfterBind) {
++            setLayoutInfo.pNext = &flagsInfo;
++            setLayoutInfo.flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
++        }
++
++        VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
++        VkResult result = vkCreateDescriptorSetLayout(device, &setLayoutInfo, nullptr, &setLayout);
++        if (result != VK_SUCCESS) {
++            RX_LOG_ERROR("rx_rhi_vk::PipelineLayoutBuilder::build: vkCreateDescriptorSetLayout(set {}) failed: "
++                         "VkResult={}",
++                         setIndex, static_cast<int>(result));
++            destroySetLayouts(device, setLayouts);
++            return std::nullopt;
++        }
++        setLayouts.push_back(setLayout);
++    }
++
++    // --- Pipeline layout, tying the sets above to the push ranges ------
++    std::vector<VkPushConstantRange> vkPushRanges;
++    vkPushRanges.reserve(layoutInfo.pushRanges.size());
++    for (const auto& range : layoutInfo.pushRanges) {
++        VkPushConstantRange vkRange{};
++        vkRange.stageFlags = range.stages;
++        vkRange.offset = range.offset;
++        vkRange.size = range.size;
++        vkPushRanges.push_back(vkRange);
++    }
++
++    VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
++    pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
++    pipelineLayoutInfo.setLayoutCount = static_cast<uint32_t>(setLayouts.size());
++    pipelineLayoutInfo.pSetLayouts = setLayouts.empty() ? nullptr : setLayouts.data();
++    pipelineLayoutInfo.pushConstantRangeCount = static_cast<uint32_t>(vkPushRanges.size());
++    pipelineLayoutInfo.pPushConstantRanges = vkPushRanges.empty() ? nullptr : vkPushRanges.data();
++
++    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
++    VkResult pipelineLayoutResult = vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout);
++    if (pipelineLayoutResult != VK_SUCCESS) {
++        RX_LOG_ERROR("rx_rhi_vk::PipelineLayoutBuilder::build: vkCreatePipelineLayout failed: VkResult={}",
++                     static_cast<int>(pipelineLayoutResult));
++        destroySetLayouts(device, setLayouts);
++        return std::nullopt;
++    }
++
++    PipelineLayoutBundle bundle(device);
++    bundle.setLayouts = std::move(setLayouts);
++    bundle.layout = pipelineLayout;
++    return bundle;
++}
++
++}  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/tests/pipeline_layout_test.cpp b/src/rx_rhi_vk/tests/pipeline_layout_test.cpp
+new file mode 100644
+index 0000000..fe2d7ab
+--- /dev/null
++++ b/src/rx_rhi_vk/tests/pipeline_layout_test.cpp
+@@ -0,0 +1,170 @@
++#include <doctest/doctest.h>
++#include <rx_rhi_vk/context.h>
++#include <rx_rhi_vk/pipeline_layout.h>
++#include <VkBootstrap.h>
++#include <utility>
++
++// Pure headless test -- no rx::platform::Window, no VkSurfaceKHR, no
++// swapchain anywhere in this file, exactly like clear_color_test.cpp
++// (safe to run in any order alongside the windowed Device/Buffer tests in
++// this binary because tests/doctest_main.cpp warms vk-bootstrap's
++// process-wide instance-function cache before any TEST_CASE runs -- see
++// the comment there, and the Phase 2 plan's Global Constraints on the
++// vk-bootstrap landmine, for why this test joins rx_rhi_vk_tests rather
++// than a new executable).
++namespace {
++
++// A headless device with exactly the Vulkan 1.2 descriptor-indexing
++// features Task 3's brief will make process-wide on rx::rhi::Device
++// itself (chained the same way vk-bootstrap's set_required_features_12
++// will there): descriptorIndexing, runtimeDescriptorArray,
++// descriptorBindingPartiallyBound, descriptorBindingVariableDescriptorCount,
++// descriptorBindingSampledImageUpdateAfterBind,
++// descriptorBindingStorageImageUpdateAfterBind,
++// descriptorBindingStorageBufferUpdateAfterBind,
++// descriptorBindingUpdateUnusedWhilePending,
++// shaderSampledImageArrayNonUniformIndexing,
++// shaderStorageBufferArrayNonUniformIndexing. Enabled LOCALLY here (not via
++// rx::rhi::Device::create(), which does not enable them yet -- that is
++// Task 3's job) because building a VkDescriptorSetLayout with an
++// UPDATE_AFTER_BIND_BIT | PARTIALLY_BOUND_BIT binding plus the set-level
++// UPDATE_AFTER_BIND_POOL flag requires the matching device features to be
++// enabled at device-creation time, or validation correctly rejects it.
++// This exact feature set is confirmed present on both the Steam Deck's
++// RADV driver [R:B2] and (checked directly on this development machine)
++// both an NVIDIA RTX 2080 and llvmpipe/lavapipe -- treated as a hard
++// requirement (REQUIRE, no skip-guard) rather than an environment-
++// dependent capability, matching clear_color_test.cpp's own headless
++// pattern rather than device_test.cpp's windowed-skip one.
++struct HeadlessDescriptorIndexingDevice {
++    rx::rhi::Context context;
++    vkb::Device vkbDevice;
++    VkDevice device;
++};
++
++HeadlessDescriptorIndexingDevice makeHeadlessDescriptorIndexingDevice() {
++    auto context = rx::rhi::Context::create({}, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++
++    VkPhysicalDeviceVulkan12Features features12{};
++    features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
++    features12.descriptorIndexing = VK_TRUE;
++    features12.runtimeDescriptorArray = VK_TRUE;
++    features12.descriptorBindingPartiallyBound = VK_TRUE;
++    features12.descriptorBindingVariableDescriptorCount = VK_TRUE;
++    features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
++    features12.descriptorBindingStorageImageUpdateAfterBind = VK_TRUE;
++    features12.descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE;
++    features12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
++    features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
++    features12.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
++
++    // No set_surface()/defer_surface_initialization() call -- see
++    // clear_color_test.cpp's comment on Context::create({}, ...) selection:
++    // a genuinely headless instance already has require_present = false,
++    // and deferring surface init would ask for VK_KHR_swapchain without the
++    // prerequisite VK_KHR_surface instance extension a headless Context
++    // never enables.
++    vkb::PhysicalDeviceSelector selector(context->vkbInstance());
++    auto physResult = selector.set_minimum_version(1, 3).set_required_features_12(features12).select();
++    REQUIRE(physResult.has_value());
++
++    auto deviceResult = vkb::DeviceBuilder(physResult.value()).build();
++    REQUIRE(deviceResult.has_value());
++    vkb::Device vkbDevice = deviceResult.value();
++    volkLoadDevice(vkbDevice.device);
++
++    return HeadlessDescriptorIndexingDevice{std::move(*context), vkbDevice, vkbDevice.device};
++}
++
++// Mirrors rx_shader's reflection_test.cpp `kLayoutTestSource` shape exactly
++// (same set/binding/type/count/stage table that test's reflect() call
++// asserts) -- hand-crafted here, not obtained by actually calling
++// rx::shader::reflect(), since rx_rhi_vk deliberately never links rx_shader/
++// slang::slang (see pipeline_layout.h's comment). This is the "build the
++// pipeline layout on a headless device" half of Task 2's brief; the
++// "reflect a shader with ... push constants" half lives in
++// reflection_test.cpp.
++rx::shader::ShaderLayoutInfo makeUnderBudgetLayoutInfo() {
++    rx::shader::ShaderLayoutInfo info;
++
++    rx::shader::ShaderLayoutInfo::Binding textures;
++    textures.set = 0;
++    textures.binding = 0;
++    textures.count = 0;
++    textures.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
++    textures.stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
++    textures.unboundedArray = true;
++    info.bindings.push_back(textures);
++
++    rx::shader::ShaderLayoutInfo::Binding sampler;
++    sampler.set = 1;
++    sampler.binding = 0;
++    sampler.count = 1;
++    sampler.type = VK_DESCRIPTOR_TYPE_SAMPLER;
++    sampler.stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
++    info.bindings.push_back(sampler);
++
++    rx::shader::ShaderLayoutInfo::Binding frame;
++    frame.set = 1;
++    frame.binding = 1;
++    frame.count = 1;
++    frame.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
++    frame.stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
++    info.bindings.push_back(frame);
++
++    rx::shader::ShaderLayoutInfo::PushRange pushRange;
++    pushRange.stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
++    pushRange.offset = 0;
++    pushRange.size = 80;
++    info.pushRanges.push_back(pushRange);
++
++    return info;
++}
++
++}  // namespace
++
++TEST_CASE("PipelineLayoutBuilder::build produces non-null handles with zero validation errors for an unbounded "
++          "array + sampler + uniform buffer + push constants") {
++    HeadlessDescriptorIndexingDevice headless = makeHeadlessDescriptorIndexingDevice();
++
++    {
++        // Inner scope: the bundle (and every VkDescriptorSetLayout/
++        // VkPipelineLayout it owns) must be destroyed against a still-live
++        // device, before the device itself is torn down below -- same
++        // reverse-destruction discipline clear_color_test.cpp documents.
++        auto bundle = rx::rhi::PipelineLayoutBuilder::build(headless.device, makeUnderBudgetLayoutInfo());
++        REQUIRE(bundle.has_value());
++
++        CHECK(bundle->layout != VK_NULL_HANDLE);
++        REQUIRE(bundle->setLayouts.size() == 2);
++        CHECK(bundle->setLayouts[0] != VK_NULL_HANDLE);
++        CHECK(bundle->setLayouts[1] != VK_NULL_HANDLE);
++    }
++
++    vkDeviceWaitIdle(headless.device);
++    vkb::destroy_device(headless.vkbDevice);
++    CHECK_FALSE(headless.context.hasValidationErrors());
++}
++
++TEST_CASE("PipelineLayoutBuilder::build rejects a >128-byte push constant footprint with a logged error") {
++    HeadlessDescriptorIndexingDevice headless = makeHeadlessDescriptorIndexingDevice();
++
++    // Matches reflection_test.cpp's oversized-push-constant case (three
++    // float4x4 members, 192 std430-packed bytes) -- proving reflect()
++    // itself never clamps/rejects it (see that test) while
++    // PipelineLayoutBuilder, the actual budget enforcer, does.
++    rx::shader::ShaderLayoutInfo oversized;
++    rx::shader::ShaderLayoutInfo::PushRange pushRange;
++    pushRange.stages = VK_SHADER_STAGE_VERTEX_BIT;
++    pushRange.offset = 0;
++    pushRange.size = 192;
++    oversized.pushRanges.push_back(pushRange);
++
++    auto bundle = rx::rhi::PipelineLayoutBuilder::build(headless.device, oversized);
++    CHECK_FALSE(bundle.has_value());
++
++    vkDeviceWaitIdle(headless.device);
++    vkb::destroy_device(headless.vkbDevice);
++    CHECK_FALSE(headless.context.hasValidationErrors());
++}
+diff --git a/src/rx_shader/CMakeLists.txt b/src/rx_shader/CMakeLists.txt
+index 3b6fd0a..41a0223 100644
+--- a/src/rx_shader/CMakeLists.txt
++++ b/src/rx_shader/CMakeLists.txt
+@@ -52,25 +52,39 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
+   set(_rx_slang_unversioned_so "${RX_SLANG_TARGET_ROOT}/lib/libslang-compiler.so")
+   if(NOT EXISTS "${_rx_slang_unversioned_so}")
+     message(FATAL_ERROR
+       "[rx_shader] Expected 'libslang-compiler.so' symlink not found under "
+       "'${RX_SLANG_TARGET_ROOT}/lib' -- the Slang archive layout may have "
+       "changed; inspect that directory and update this workaround.")
+   endif()
+   set_target_properties(slang::slang PROPERTIES IMPORTED_LOCATION_RELEASE "${_rx_slang_unversioned_so}")
+ endif()
+ 
++# Slang-free boundary for Task 2's ShaderLayoutInfo: an INTERFACE (header-
++# only) target exposing ONLY this directory's include/ path, with ONLY
++# Vulkan::Headers as a dependency -- no slang::slang, no rx_core. rx_shader
++# itself links this (see below) so its own headers/tests see
++# shader_layout_info.h exactly as before; rx_rhi_vk's CMakeLists links THIS
++# target instead of `rx_shader` so PipelineLayoutBuilder can take a
++# `const rx::shader::ShaderLayoutInfo&` without pulling slang::slang (or any
++# other rx_shader header) into rx_rhi_vk's own headers or link interface --
++# see shader_layout_info.h's own comment for why that separation matters.
++add_library(rx_shader_layout_types INTERFACE)
++target_include_directories(rx_shader_layout_types INTERFACE include)
++target_link_libraries(rx_shader_layout_types INTERFACE Vulkan::Headers)
++
+ add_library(rx_shader STATIC
+     src/compiler.cpp
++    src/reflection.cpp
+ )
+ target_include_directories(rx_shader PUBLIC include)
+-target_link_libraries(rx_shader PUBLIC rx_core slang::slang Vulkan::Headers)
++target_link_libraries(rx_shader PUBLIC rx_core slang::slang rx_shader_layout_types)
+ 
+ # --- Runtime lib placement for any binary linking rx_shader -------------
+ #
+ # Slang compiles in-process via a shared library (libslang-compiler.so /
+ # slang-compiler.dll), never statically linked in, so any executable that
+ # links rx_shader (transitively, slang::slang) needs that library --
+ # plus the plugins it dlopens on demand for certain compile paths
+ # (slang-glslang, slang-glsl-module) and its companion runtime (slang-rt)
+ # -- sitting next to it on disk at run time [R:D2]. NEVER ship slang-llvm
+ # (the CPU/host JIT backend, irrelevant to SPIR-V-only use) or gfx (the
+@@ -145,14 +159,15 @@ target_link_libraries(rx_shader_link_smoketest PRIVATE slang::slang)
+ rx_shader_deploy_runtime_libs(rx_shader_link_smoketest)
+ 
+ # rx_shader's tests do real, in-process Slang compilation (no fake/mocked
+ # Slang session) and are deliberately run straight from the build tree by
+ # ctest (no install step) specifically so the RPATH+copy mechanism above
+ # gets proven for real: if it didn't work, these tests would fail to even
+ # start (missing shared library at load time), not just fail an assertion.
+ add_executable(rx_shader_tests
+     tests/doctest_main.cpp
+     tests/compiler_test.cpp
++    tests/reflection_test.cpp
+ )
+ target_link_libraries(rx_shader_tests PRIVATE rx_shader doctest::doctest)
+ rx_shader_deploy_runtime_libs(rx_shader_tests)
+ add_test(NAME rx_shader_tests COMMAND rx_shader_tests)
+diff --git a/src/rx_shader/include/rx_shader/reflection.h b/src/rx_shader/include/rx_shader/reflection.h
+new file mode 100644
+index 0000000..1e7b60b
+--- /dev/null
++++ b/src/rx_shader/include/rx_shader/reflection.h
+@@ -0,0 +1,70 @@
++#pragma once
++#include <rx_shader/compiler.h>
++#include <rx_shader/shader_layout_info.h>
++#include <optional>
++
++namespace rx::shader {
++
++// Walks a successfully-linked CompileResult's Slang reflection data
++// (`slang::ProgramLayout`, obtained from `CompileResult::linkedProgram`)
++// and produces the plain-struct `ShaderLayoutInfo`
++// `rx::rhi::PipelineLayoutBuilder` (rx_rhi_vk) consumes to build a matching
++// `VkDescriptorSetLayout`/`VkPipelineLayout`. Returns `std::nullopt` (logging
++// why via RX_LOG_ERROR) if `result.ok` is false, if `result.linkedProgram`
++// is null, or if `getLayout()` itself fails.
++//
++// Scope: flat global-scope resource declarations (individual textures,
++// samplers, buffers, and runtime-sized arrays thereof, each with an
++// explicit `[[vk::binding(binding, set)]]`) plus at most a few
++// `[[vk::push_constant]]`-attributed globals. Slang's `ParameterBlock<T>`/
++// nested-parameter-block layouts are out of scope for this walk (Task 2's
++// interfaces and tests never exercise them; the spec's Fixed decision #4
++// notes "no intermediate metadata format exists in this design" -- this is
++// that design, at exactly the granularity the samples need) -- a global
++// parameter reflect() cannot classify is skipped with an RX_LOG_WARN/ERROR,
++// never silently mismapped.
++//
++// Ground truth vs [R:A3]: the research file describes deriving descriptor
++// sets/ranges by walking `TypeLayoutReflection::getDescriptorSetCount()` /
++// `getDescriptorSetDescriptorRange*()` on `getGlobalParamsTypeLayout()`.
++// Direct, empirical testing against the shipped v2026.14.1 `slang.h` (a
++// throwaway probe compiling a shader with two explicit descriptor sets,
++// cross-checked against `spirv-dis` on the real emitted SPIR-V) found that
++// API's *type* and *count* fields correct, but its per-range *descriptor
++// set* attribution wrong for at least one real case (a `ConstantBuffer<T>`
++// explicitly bound to `[[vk::binding(1, 1)]]` was reported under descriptor
++// set index 0's range list, not set 1's, even though the real SPIR-V
++// unambiguously decorates it `DescriptorSet 1` and the top-level parameter
++// walk below reports `getBindingSpace() == 1` correctly for the same
++// variable). Per this task's brief ("the shipped slang.h wins over the
++// research file on any disagreement; note the discrepancy in the report"),
++// reflect() therefore does NOT use that per-range set/binding attribution
++// at all. Instead it combines two verified-correct sources:
++//   - `ProgramLayout::getParameterByIndex()` (flat, top-level global scope)
++//     for set (`getBindingSpace()`), binding (`getBindingIndex()`),
++//     category, and name -- verified byte-for-byte against `spirv-dis`
++//     output for every case reflection_test.cpp exercises.
++//   - `TypeLayoutReflection::getBindingRangeType()` /
++//     `getBindingRangeBindingCount()` on `getGlobalParamsTypeLayout()`,
++//     correlated to the same global parameter by index *and* leaf-variable
++//     name (a defensive cross-check, not just trust-the-index), for
++//     descriptor type and array count/unbounded-ness -- this is the only
++//     API observed to correctly report Slang's `SLANG_UNBOUNDED_SIZE`
++//     sentinel for a genuinely unsized `T x[]` global;
++//     `TypeReflection::getElementCount()` (with or without a reflection
++//     context) was observed returning `0` or `2147483647` for the exact
++//     same unbounded array, neither of which is that sentinel.
++// See reflection.cpp for the full walk and the resource-kind -> VkDescriptorType
++// mapping table (verified for Sampler/Texture2D/CombinedSampler/
++// ConstantBuffer/StructuredBuffer/RWStructuredBuffer/RWTexture2D against
++// this same shipped build; other resource shapes are mapped per slang.h's
++// documented enum semantics but were not separately smoke-tested this
++// task).
++//
++// Threading: takes the same process-wide mutex `Compiler` locks for every
++// front-end operation (module load/compose/link) -- see
++// src/detail/global_session_mutex.h's comment for why a reflection walk
++// needs that same external synchronization, not a separate or absent lock.
++std::optional<ShaderLayoutInfo> reflect(const CompileResult& result);
++
++}  // namespace rx::shader
+diff --git a/src/rx_shader/include/rx_shader/shader_layout_info.h b/src/rx_shader/include/rx_shader/shader_layout_info.h
+new file mode 100644
+index 0000000..02f8a33
+--- /dev/null
++++ b/src/rx_shader/include/rx_shader/shader_layout_info.h
+@@ -0,0 +1,67 @@
++#pragma once
++#include <vulkan/vulkan.h>
++#include <cstdint>
++#include <vector>
++
++namespace rx::shader {
++
++// Plain-data output of reflect() (reflection.h): every set/binding/type/
++// count/stage and push-constant range a compiled Slang program needs,
++// expressed purely in Vulkan + standard-library types. This is deliberately
++// the ONLY rx_shader header rx_rhi_vk's PipelineLayoutBuilder (rx_rhi_vk/
++// pipeline_layout.h) includes -- no Slang type (slang::*, Slang::ComPtr<...>,
++// SlangResult, ...) appears anywhere in this file, on purpose: rx_rhi_vk
++// must never link slang::slang or expose a Slang type from its own headers
++// [Task 2 brief, spec Components table -- rx_rhi_vk's listed dependencies
++// are "Phase 1 RHI, VMA", not rx_shader/slang]. See
++// rx_shader/CMakeLists.txt's `rx_shader_layout_types` INTERFACE target: it
++// exposes exactly this header's include directory (nothing else -- not
++// slang::slang, not compiler.h/reflection.h) to rx_rhi_vk, which is what
++// makes that separation a build-graph guarantee rather than a convention
++// someone could accidentally violate with one stray #include.
++struct ShaderLayoutInfo {
++    // One VkDescriptorSetLayoutBinding's worth of information, before it's
++    // actually turned into one by PipelineLayoutBuilder.
++    struct Binding {
++        uint32_t set = 0;
++        uint32_t binding = 0;
++
++        // Descriptor array length. Meaningless (left at 0) when
++        // `unboundedArray` is true: Slang's own reflection reports
++        // `SLANG_UNBOUNDED_SIZE` (`~size_t(0)`) for a genuinely unsized
++        // `T x[]` global, which has no representation in a uint32_t.
++        // PipelineLayoutBuilder picks its own upper bound for
++        // VkDescriptorSetLayoutBinding::descriptorCount in that case -- see
++        // its header for why and what.
++        uint32_t count = 0;
++
++        VkDescriptorType type = VK_DESCRIPTOR_TYPE_MAX_ENUM;
++
++        // Every shader stage in the linked program that could reach this
++        // binding. reflect() merges stage flags conservatively (every
++        // entry point's stage, not just the ones provably touching this
++        // exact global) -- see reflection.h's comment on reflect() for why
++        // that is always safe for VkDescriptorSetLayoutBinding::stageFlags
++        // even when it over-approximates.
++        VkShaderStageFlags stages = 0;
++
++        // True for a runtime-sized array (`Texture2D g[]`, no bound) --
++        // PipelineLayoutBuilder gives these
++        // UPDATE_AFTER_BIND_BIT | PARTIALLY_BOUND_BIT binding flags plus the
++        // set-level UPDATE_AFTER_BIND_POOL_BIT layout flag, so they can be
++        // written into after binding (Task 3's bindless table depends on
++        // this).
++        bool unboundedArray = false;
++    };
++    std::vector<Binding> bindings;
++
++    // One VkPushConstantRange's worth of information.
++    struct PushRange {
++        VkShaderStageFlags stages = 0;
++        uint32_t offset = 0;
++        uint32_t size = 0;
++    };
++    std::vector<PushRange> pushRanges;
++};
++
++}  // namespace rx::shader
+diff --git a/src/rx_shader/src/compiler.cpp b/src/rx_shader/src/compiler.cpp
+index 76b3eda..e68a20b 100644
+--- a/src/rx_shader/src/compiler.cpp
++++ b/src/rx_shader/src/compiler.cpp
+@@ -1,35 +1,46 @@
+ #include <rx_shader/compiler.h>
+ 
++#include "detail/global_session_mutex.h"
++
+ #include <rx_core/log.h>
+ 
+ #include <filesystem>
+ #include <fstream>
+ #include <mutex>
+ #include <sstream>
+ #include <utility>
+ 
+ namespace rx::shader {
+ 
+-namespace {
+-
+ // See the class comment on rx::shader::Compiler (compiler.h) for why this
+ // is process-wide (one IGlobalSession, ever) rather than per-Compiler, and
+ // why it is guarded by a mutex rather than left to Slang's own (nonexistent)
+-// internal synchronization. Both statics have process lifetime: neither is
+-// ever explicitly torn down, matching Slang's own guidance to create and
++// internal synchronization. The mutex itself has process lifetime and is
++// never explicitly torn down, matching Slang's own guidance to create and
+ // reuse a single global session for as long as the application runs
+ // [R:A4].
++//
++// Given external (not anonymous-namespace) linkage, unlike every other
++// helper in this file, specifically so reflection.cpp -- a second
++// translation unit in this same library -- can lock the exact same mutex
++// object before touching a linked program's reflection data (see
++// detail/global_session_mutex.h's comment for why that needs the same
++// lock as front-end compilation).
++namespace detail {
+ std::mutex& globalSessionMutex() {
+     static std::mutex mutex;
+     return mutex;
+ }
++}  // namespace detail
++
++namespace {
+ 
+ Slang::ComPtr<slang::IGlobalSession>& sharedGlobalSession() {
+     static Slang::ComPtr<slang::IGlobalSession> session;
+     return session;
+ }
+ 
+ // Maps a Slang entry-point stage to the corresponding Vulkan shader-stage
+ // bit. Slang's stage enum also covers ray-tracing/mesh/work-graph stages
+ // this project doesn't use yet (see slang.h's SlangStage) -- they're
+ // mapped for completeness since the underlying VkShaderStageFlagBits
+@@ -94,21 +105,21 @@ void appendDiagnostics(std::string& out, const char* stepName, slang::IBlob* blo
+ // point [R:A2]. `sourcePath` is purely informational (it's what shows up
+ // in diagnostic message locations); it does not need to exist on disk.
+ CompileResult compileImpl(slang::ISession* session,
+                            const std::string& moduleName,
+                            const std::string& sourcePath,
+                            const std::string& sourceText,
+                            const std::vector<std::string>& entryPointNames) {
+     CompileResult result;
+     std::string diagnostics;
+ 
+-    std::lock_guard<std::mutex> lock(globalSessionMutex());
++    std::lock_guard<std::mutex> lock(detail::globalSessionMutex());
+ 
+     // slang_createBlob returns an already-owned (refcount 1) ISlangBlob*,
+     // so attach rather than construct-with-addRef.
+     Slang::ComPtr<slang::IBlob> sourceBlob(Slang::INIT_ATTACH,
+                                             slang_createBlob(sourceText.data(), sourceText.size()));
+ 
+     Slang::ComPtr<slang::IBlob> loadDiagnostics;
+     slang::IModule* module =
+         session->loadModuleFromSource(moduleName.c_str(), sourcePath.c_str(), sourceBlob, loadDiagnostics.writeRef());
+     appendDiagnostics(diagnostics, "load", loadDiagnostics);
+@@ -235,21 +246,21 @@ CompileResult compileImpl(slang::ISession* session,
+     return result;
+ }
+ 
+ }  // namespace
+ 
+ Compiler::Compiler(Slang::ComPtr<slang::ISession> session) : session_(std::move(session)) {}
+ 
+ std::optional<Compiler> Compiler::create() {
+     rx::core::log::init();
+ 
+-    std::lock_guard<std::mutex> lock(globalSessionMutex());
++    std::lock_guard<std::mutex> lock(detail::globalSessionMutex());
+ 
+     Slang::ComPtr<slang::IGlobalSession>& global = sharedGlobalSession();
+     if (global.get() == nullptr) {
+         SlangResult sessionResult = slang::createGlobalSession(global.writeRef());
+         if (SLANG_FAILED(sessionResult) || global.get() == nullptr) {
+             RX_LOG_ERROR("rx_shader: slang::createGlobalSession failed (SlangResult={})",
+                          static_cast<int>(sessionResult));
+             return std::nullopt;
+         }
+     }
+diff --git a/src/rx_shader/src/detail/global_session_mutex.h b/src/rx_shader/src/detail/global_session_mutex.h
+new file mode 100644
+index 0000000..f68fdc4
+--- /dev/null
++++ b/src/rx_shader/src/detail/global_session_mutex.h
+@@ -0,0 +1,36 @@
++#pragma once
++#include <mutex>
++
++namespace rx::shader::detail {
++
++// The single process-lifetime mutex guarding every call that touches
++// Slang's shared global session or anything derived from it -- module
++// load/compose/link (Compiler::compileImpl, compiler.cpp) and now also
++// reflection's layout walk (reflect(), reflection.cpp).
++//
++// Why reflection needs it too: slang.h's own doc comment on IGlobalSession
++// says front-end operations "still require external synchronization unless
++// documented otherwise" [R:A4, R:A6], and `IComponentType::getLayout()` --
++// the entry point reflect() calls to get a `ProgramLayout*` -- computes
++// (and, on a component type's first call, caches) that layout lazily by
++// walking the same session-owned type/layout tables module load and linking
++// populate. Nothing in slang.h documents getLayout()/the reflection
++// accessor tree as an exception to the general "not thread-safe, externally
++// synchronize" rule the way backend codegen
++// (getEntryPointCode/getTargetCode/...) is explicitly called out as an
++// "experimental" concurrent-safe path once a component type is linked --
++// so reflection stays under the same lock as everything else that isn't
++// explicitly documented safe.
++//
++// Declared here (in src/, not include/) rather than as a private detail of
++// compiler.cpp alone because it now has exactly two callers across two
++// translation units in this library (compiler.cpp, reflection.cpp) that
++// must share the SAME mutex object, not one each -- an anonymous-namespace
++// function-local static (compiler.cpp's original shape, before this file
++// existed) has internal linkage and cannot be referenced from a second TU.
++// This header is not installed under rx_shader/include/ and is not part of
++// the public API: nothing outside this library's own .cpp files should
++// include it.
++std::mutex& globalSessionMutex();
++
++}  // namespace rx::shader::detail
+diff --git a/src/rx_shader/src/reflection.cpp b/src/rx_shader/src/reflection.cpp
+new file mode 100644
+index 0000000..824bfec
+--- /dev/null
++++ b/src/rx_shader/src/reflection.cpp
+@@ -0,0 +1,270 @@
++#include <rx_shader/reflection.h>
++
++#include "detail/global_session_mutex.h"
++
++#include <rx_core/log.h>
++
++#include <algorithm>
++#include <cstring>
++#include <mutex>
++
++namespace rx::shader {
++
++namespace {
++
++// Duplicates compiler.cpp's own (anonymous-namespace-private) mapStage()
++// rather than sharing it: only the mutex in detail/global_session_mutex.h
++// needed cross-TU sharing for this task, and a ~15-line, spec-fixed
++// (VkShaderStageFlagBits values never change) switch costs less to
++// duplicate than to hoist into a third shared header for one caller each.
++VkShaderStageFlagBits mapStage(SlangStage stage) {
++    switch (stage) {
++        case SLANG_STAGE_VERTEX:
++            return VK_SHADER_STAGE_VERTEX_BIT;
++        case SLANG_STAGE_HULL:
++            return VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
++        case SLANG_STAGE_DOMAIN:
++            return VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
++        case SLANG_STAGE_GEOMETRY:
++            return VK_SHADER_STAGE_GEOMETRY_BIT;
++        case SLANG_STAGE_FRAGMENT:
++            return VK_SHADER_STAGE_FRAGMENT_BIT;
++        case SLANG_STAGE_COMPUTE:
++            return VK_SHADER_STAGE_COMPUTE_BIT;
++        case SLANG_STAGE_RAY_GENERATION:
++            return VK_SHADER_STAGE_RAYGEN_BIT_KHR;
++        case SLANG_STAGE_INTERSECTION:
++            return VK_SHADER_STAGE_INTERSECTION_BIT_KHR;
++        case SLANG_STAGE_ANY_HIT:
++            return VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
++        case SLANG_STAGE_CLOSEST_HIT:
++            return VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
++        case SLANG_STAGE_MISS:
++            return VK_SHADER_STAGE_MISS_BIT_KHR;
++        case SLANG_STAGE_CALLABLE:
++            return VK_SHADER_STAGE_CALLABLE_BIT_KHR;
++        case SLANG_STAGE_MESH:
++            return VK_SHADER_STAGE_MESH_BIT_EXT;
++        case SLANG_STAGE_AMPLIFICATION:
++            return VK_SHADER_STAGE_TASK_BIT_EXT;
++        default:
++            RX_LOG_WARN("rx_shader::reflect: no VkShaderStageFlagBits mapping for SlangStage {}; using VK_SHADER_STAGE_ALL",
++                        static_cast<int>(stage));
++            return VK_SHADER_STAGE_ALL;
++    }
++}
++
++// Maps one resource-kind global parameter's *element* type (already
++// unwrapped past any array) to the VkDescriptorType it needs. Verified
++// directly against this shipped Slang build (v2026.14.1) + `spirv-dis` on
++// the actual emitted SPIR-V for: SamplerState, ConstantBuffer<T>, Texture2D,
++// a `Texture2D[]` unbounded array, StructuredBuffer<T>/RWStructuredBuffer<T>,
++// RWTexture2D<T>, and Sampler2D (HLSL's combined-texture-sampler shorthand).
++// Other resource shapes below (1D/3D/Cube textures, subpass inputs, byte-
++// address buffers, texel buffers) are mapped per slang.h's documented
++// `SlangResourceShape`/`SlangResourceAccess` semantics but were not
++// separately smoke-tested this task -- flagged here so a future task
++// exercising one of them knows to verify it the same way before trusting
++// it blindly.
++VkDescriptorType mapElementType(slang::TypeReflection* elemType, const char* paramName) {
++    using Kind = slang::TypeReflection::Kind;
++    switch (elemType->getKind()) {
++        case Kind::SamplerState:
++            return VK_DESCRIPTOR_TYPE_SAMPLER;
++        case Kind::ConstantBuffer:
++            return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
++        // Kind::ShaderStorageBuffer / Kind::TextureBuffer are distinct
++        // top-level TypeReflection::Kind values (not sub-shapes of
++        // Kind::Resource) per slang.h -- not observed from any case this
++        // task exercised (StructuredBuffer<T>/RWStructuredBuffer<T> both
++        // surfaced as Kind::Resource with resourceShape ==
++        // SLANG_STRUCTURED_BUFFER instead, handled below), but mapped here
++        // defensively in case a future Slang version or a shader construct
++        // this task didn't try routes through them instead.
++        case Kind::ShaderStorageBuffer:
++            return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++        case Kind::TextureBuffer:
++            return VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
++        case Kind::Resource: {
++            SlangResourceShape shape = elemType->getResourceShape();
++            // Base shape values (SLANG_TEXTURE_1D=0x01 .. SLANG_TEXTURE_SUBPASS=0x0A)
++            // are all < 0x10; every modifier (array/multisample/shadow/
++            // feedback/combined-sampler) is OR'd in starting at 0x10, so
++            // masking with 0x0F isolates the base shape cleanly [verified:
++            // slang.h's SlangResourceShape enum values].
++            auto baseShape = static_cast<SlangResourceShape>(shape & 0x0F);
++            bool combinedSampler = (shape & SLANG_TEXTURE_COMBINED_FLAG) != 0;
++            SlangResourceAccess access = elemType->getResourceAccess();
++            bool readWrite = access != SLANG_RESOURCE_ACCESS_READ && access != SLANG_RESOURCE_ACCESS_NONE;
++            switch (baseShape) {
++                case SLANG_TEXTURE_1D:
++                case SLANG_TEXTURE_2D:
++                case SLANG_TEXTURE_3D:
++                case SLANG_TEXTURE_CUBE:
++                case SLANG_TEXTURE_SUBPASS:
++                    if (combinedSampler) {
++                        return VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++                    }
++                    return readWrite ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
++                case SLANG_STRUCTURED_BUFFER:
++                case SLANG_BYTE_ADDRESS_BUFFER:
++                    // Vulkan has one descriptor type for both read-only and
++                    // read-write raw/structured buffers (SSBOs) -- the
++                    // read/write distinction lives in the SPIR-V access
++                    // qualifiers on the binding, not the descriptor type.
++                    return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++                case SLANG_TEXTURE_BUFFER:
++                    return readWrite ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
++                default:
++                    RX_LOG_WARN("rx_shader::reflect: unsupported resource shape 0x{:x} for global '{}'; skipping",
++                                static_cast<unsigned>(shape), paramName != nullptr ? paramName : "?");
++                    return VK_DESCRIPTOR_TYPE_MAX_ENUM;
++            }
++        }
++        default:
++            RX_LOG_WARN("rx_shader::reflect: unsupported global-parameter type kind {} for '{}'; skipping",
++                        static_cast<int>(elemType->getKind()), paramName != nullptr ? paramName : "?");
++            return VK_DESCRIPTOR_TYPE_MAX_ENUM;
++    }
++}
++
++}  // namespace
++
++std::optional<ShaderLayoutInfo> reflect(const CompileResult& result) {
++    if (!result.ok || result.linkedProgram.get() == nullptr) {
++        RX_LOG_ERROR("rx_shader::reflect: called on a CompileResult with ok=false or no linked program");
++        return std::nullopt;
++    }
++
++    // Same lock Compiler::compileImpl takes for every front-end operation --
++    // see detail/global_session_mutex.h and reflection.h's comment on
++    // reflect() for why getLayout()/the walk below need it too.
++    std::lock_guard<std::mutex> lock(detail::globalSessionMutex());
++
++    Slang::ComPtr<slang::IBlob> layoutDiagnostics;
++    slang::ProgramLayout* layout = result.linkedProgram->getLayout(0, layoutDiagnostics.writeRef());
++    if (layoutDiagnostics.get() != nullptr && layoutDiagnostics->getBufferSize() > 0) {
++        RX_LOG_WARN("rx_shader::reflect: diagnostics from getLayout:\n{}",
++                    std::string(static_cast<const char*>(layoutDiagnostics->getBufferPointer()),
++                                layoutDiagnostics->getBufferSize()));
++    }
++    if (layout == nullptr) {
++        RX_LOG_ERROR("rx_shader::reflect: IComponentType::getLayout returned null");
++        return std::nullopt;
++    }
++
++    // Stage-flag merge: every entry point's stage, OR'd together, applied to
++    // every binding/push range. Slang's global-parameter reflection (used
++    // below) does not surface which specific entry points reference a given
++    // global, only where it's bound -- and over-approximating stage
++    // visibility on a VkDescriptorSetLayoutBinding/VkPushConstantRange is
++    // always spec-legal (Vulkan never rejects a stage flag broader than a
++    // module's actual usage), so this is a safe, if conservative, default
++    // for the flat, single-set-of-globals shape reflect() targets.
++    VkShaderStageFlags allStages = 0;
++    SlangUInt entryPointCount = layout->getEntryPointCount();
++    for (SlangUInt i = 0; i < entryPointCount; ++i) {
++        allStages |= static_cast<VkShaderStageFlags>(mapStage(layout->getEntryPointByIndex(i)->getStage()));
++    }
++
++    slang::TypeLayoutReflection* globalTypeLayout = layout->getGlobalParamsTypeLayout();
++    SlangInt bindingRangeCount = (globalTypeLayout != nullptr) ? globalTypeLayout->getBindingRangeCount() : 0;
++
++    ShaderLayoutInfo info;
++    unsigned paramCount = layout->getParameterCount();
++    for (unsigned i = 0; i < paramCount; ++i) {
++        slang::VariableLayoutReflection* param = layout->getParameterByIndex(i);
++        const char* paramName = param->getName();
++        slang::ParameterCategory category = param->getCategory();
++
++        if (category == slang::ParameterCategory::PushConstantBuffer) {
++            // The wrapper type layout's own size (in the Uniform category)
++            // is 0 regardless of spelling (`[[vk::push_constant]] ConstantBuffer<T> pc;`
++            // or the bare-struct `[[vk::push_constant]] T pc;` form) -- verified
++            // directly: both produce a ConstantBuffer-kind wrapper
++            // TypeLayoutReflection with a non-null getElementTypeLayout()
++            // holding the real struct size. Falling back to the wrapper's
++            // own getSize() if that's ever null is defensive, not expected
++            // to trigger against this shipped build.
++            slang::TypeLayoutReflection* wrapperLayout = param->getTypeLayout();
++            slang::TypeLayoutReflection* elementLayout =
++                (wrapperLayout != nullptr) ? wrapperLayout->getElementTypeLayout() : nullptr;
++            size_t size = (elementLayout != nullptr) ? elementLayout->getSize()
++                                                      : ((wrapperLayout != nullptr) ? wrapperLayout->getSize() : 0);
++            if (size == 0 || size == SLANG_UNBOUNDED_SIZE || size == SLANG_UNKNOWN_SIZE) {
++                RX_LOG_WARN("rx_shader::reflect: push constant '{}' has an unresolvable size ({}); skipping",
++                            paramName != nullptr ? paramName : "?", size);
++                continue;
++            }
++            size_t offset = param->getOffset(category);
++            if (offset == SLANG_UNKNOWN_SIZE) {
++                RX_LOG_WARN("rx_shader::reflect: push constant '{}' has an unresolvable offset; skipping",
++                            paramName != nullptr ? paramName : "?");
++                continue;
++            }
++
++            ShaderLayoutInfo::PushRange range;
++            range.stages = allStages;
++            range.offset = static_cast<uint32_t>(offset);
++            range.size = static_cast<uint32_t>(size);
++            info.pushRanges.push_back(range);
++            continue;
++        }
++
++        if (category != slang::ParameterCategory::DescriptorTableSlot) {
++            // A plain (non-push-constant) global uniform, a ParameterBlock,
++            // or any other category outside this walk's flat-globals scope
++            // (see reflection.h's comment on reflect()) -- logged, never
++            // silently dropped or mismapped.
++            RX_LOG_WARN("rx_shader::reflect: global parameter '{}' has unsupported category {}; skipping",
++                        paramName != nullptr ? paramName : "?", static_cast<int>(category));
++            continue;
++        }
++
++        slang::TypeReflection* elemType = param->getType()->unwrapArray();
++        VkDescriptorType vkType = mapElementType(elemType, paramName);
++        if (vkType == VK_DESCRIPTOR_TYPE_MAX_ENUM) {
++            continue;  // mapElementType already logged why.
++        }
++
++        // Count/unbounded-ness: deliberately NOT from
++        // `TypeReflection::getElementCount()` -- see reflection.h's comment
++        // on reflect() for the discrepancy this was found to have against
++        // [R:A3]'s assumption. `getBindingRangeBindingCount()` on the
++        // global-scope type layout is the API observed to report Slang's
++        // `SLANG_UNBOUNDED_SIZE` sentinel correctly; it's correlated to this
++        // parameter by index *and* leaf-variable name (both matched in
++        // every case this task tested, for two independently-shaped test
++        // shaders) so a future mismatch fails loudly instead of silently
++        // mixing up two bindings' counts.
++        if (static_cast<SlangInt>(i) >= bindingRangeCount) {
++            RX_LOG_ERROR("rx_shader::reflect: no binding-range entry for global parameter '{}' (index {}); skipping",
++                         paramName != nullptr ? paramName : "?", i);
++            continue;
++        }
++        slang::VariableReflection* leafVar = globalTypeLayout->getBindingRangeLeafVariable(static_cast<SlangInt>(i));
++        const char* leafName = (leafVar != nullptr) ? leafVar->getName() : nullptr;
++        if (leafName == nullptr || paramName == nullptr || std::strcmp(leafName, paramName) != 0) {
++            RX_LOG_ERROR(
++                "rx_shader::reflect: binding-range/parameter name mismatch at index {} ('{}' vs '{}'); skipping",
++                i, paramName != nullptr ? paramName : "?", leafName != nullptr ? leafName : "?");
++            continue;
++        }
++
++        SlangInt bindingCount = globalTypeLayout->getBindingRangeBindingCount(static_cast<SlangInt>(i));
++        bool unbounded = static_cast<size_t>(bindingCount) == SLANG_UNBOUNDED_SIZE;
++
++        ShaderLayoutInfo::Binding binding;
++        binding.set = static_cast<uint32_t>(param->getBindingSpace());
++        binding.binding = static_cast<uint32_t>(param->getBindingIndex());
++        binding.count = unbounded ? 0 : static_cast<uint32_t>(bindingCount);
++        binding.type = vkType;
++        binding.stages = allStages;
++        binding.unboundedArray = unbounded;
++        info.bindings.push_back(binding);
++    }
++
++    return info;
++}
++
++}  // namespace rx::shader
+diff --git a/src/rx_shader/tests/reflection_test.cpp b/src/rx_shader/tests/reflection_test.cpp
+new file mode 100644
+index 0000000..a761464
+--- /dev/null
++++ b/src/rx_shader/tests/reflection_test.cpp
+@@ -0,0 +1,182 @@
++#include <doctest/doctest.h>
++#include <rx_shader/compiler.h>
++#include <rx_shader/reflection.h>
++
++#include <algorithm>
++
++namespace {
++
++// One `Texture2D[]` unbounded array + one `SamplerState` + one
++// `ConstantBuffer<T>`, each with an explicit `[[vk::binding(binding, set)]]`,
++// plus a `[[vk::push_constant]]` global -- exactly the shape Task 2's brief
++// asks the reflection test to cover. Hand-computed expected table (verified
++// directly against `spirv-dis` on this exact source's compiled SPIR-V, and
++// against a throwaway reflection probe against this shipped Slang build --
++// see reflection.h's comment on reflect() for the discrepancy that probing
++// found against [R:A3]'s assumed API):
++//
++//   global           | category         | set | binding | count      | VkDescriptorType
++//   ---------------- | ---------------- | --- | ------- | ---------- | -----------------------------
++//   gTextures[]      | DescriptorTable  |  0  |    0    | unbounded  | VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
++//   gSampler         | DescriptorTable  |  1  |    0    |     1      | VK_DESCRIPTOR_TYPE_SAMPLER
++//   gFrame           | DescriptorTable  |  1  |    1    |     1      | VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
++//   gPush            | PushConstant     |  -  |    -    |     -      | offset=0, size=80 bytes
++//                                                                       (2x uint32 = 8B, padded to the
++//                                                                       16B alignment float4x4 needs,
++//                                                                       + 64B matrix = 80B std430 total)
++//
++// `vsMain` reads gFrame+gPush; `fsMain` reads gTextures+gSampler+gPush --
++// every entry point in the linked program touches at least one global, so
++// reflect()'s conservative "every binding/push-range gets every entry
++// point's stage OR'd in" merge (see reflection.h) means every one of the
++// four entries above must carry VERTEX|FRAGMENT.
++const char* kLayoutTestSource = R"(
++struct PushConstants {
++    uint textureIndex;
++    uint samplerIndex;
++    float4x4 mvp;
++};
++
++[[vk::push_constant]]
++ConstantBuffer<PushConstants> gPush;
++
++[[vk::binding(0, 0)]]
++Texture2D gTextures[];
++
++[[vk::binding(0, 1)]]
++SamplerState gSampler;
++
++struct FrameData {
++    float4x4 viewProj;
++};
++
++[[vk::binding(1, 1)]]
++ConstantBuffer<FrameData> gFrame;
++
++struct VSOut {
++    float4 position : SV_Position;
++};
++
++[shader("vertex")]
++VSOut vsMain(uint vertexID : SV_VertexID)
++{
++    VSOut o;
++    o.position = mul(gFrame.viewProj, mul(gPush.mvp, float4(0, 0, 0, 1)));
++    return o;
++}
++
++[shader("fragment")]
++float4 fsMain() : SV_Target
++{
++    return gTextures[gPush.textureIndex].Sample(gSampler, float2(0, 0));
++}
++)";
++
++// A single oversized push-constant global (192 bytes: three float4x4
++// members, std430-packed with no inter-member padding since each 64-byte
++// matrix is already 16-byte aligned) -- reflection must still succeed and
++// report the real size; only PipelineLayoutBuilder (rx_rhi_vk,
++// pipeline_layout_test.cpp) enforces the 128-byte guaranteed-minimum budget
++// [spec Fixed decision #5, R:B2]. Verified directly against this shipped
++// Slang build: elementTypeLayout->getSize() == 192, offset == 0.
++const char* kOversizedPushConstantSource = R"(
++struct BigPushConstants {
++    float4x4 a;
++    float4x4 b;
++    float4x4 c;
++};
++
++[[vk::push_constant]]
++ConstantBuffer<BigPushConstants> gBigPush;
++
++[shader("vertex")]
++float4 vsMain(uint vertexID : SV_VertexID) : SV_Position
++{
++    return mul(gBigPush.a, float4(0, 0, 0, 1));
++}
++)";
++
++const rx::shader::ShaderLayoutInfo::Binding* findBinding(const rx::shader::ShaderLayoutInfo& info, uint32_t set,
++                                                          uint32_t binding) {
++    auto it = std::find_if(info.bindings.begin(), info.bindings.end(), [&](const auto& b) {
++        return b.set == set && b.binding == binding;
++    });
++    return it != info.bindings.end() ? &*it : nullptr;
++}
++
++constexpr VkShaderStageFlags kBothStages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
++
++}  // namespace
++
++TEST_CASE("reflect() reports exact set/binding/type/count/stage for an unbounded array + sampler + "
++          "constant buffer + push constants") {
++    auto compiler = rx::shader::Compiler::create();
++    REQUIRE(compiler.has_value());
++
++    rx::shader::CompileResult compileResult =
++        compiler->compileFromSource("LayoutModule", kLayoutTestSource, {"vsMain", "fsMain"});
++    INFO("diagnostics: " << compileResult.diagnostics);
++    REQUIRE(compileResult.ok);
++
++    auto layout = rx::shader::reflect(compileResult);
++    REQUIRE(layout.has_value());
++
++    REQUIRE(layout->bindings.size() == 3);
++
++    const auto* textures = findBinding(*layout, /*set=*/0, /*binding=*/0);
++    REQUIRE(textures != nullptr);
++    CHECK(textures->type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE);
++    CHECK(textures->unboundedArray);
++    CHECK(textures->count == 0);
++    CHECK(textures->stages == kBothStages);
++
++    const auto* sampler = findBinding(*layout, /*set=*/1, /*binding=*/0);
++    REQUIRE(sampler != nullptr);
++    CHECK(sampler->type == VK_DESCRIPTOR_TYPE_SAMPLER);
++    CHECK_FALSE(sampler->unboundedArray);
++    CHECK(sampler->count == 1);
++    CHECK(sampler->stages == kBothStages);
++
++    const auto* frame = findBinding(*layout, /*set=*/1, /*binding=*/1);
++    REQUIRE(frame != nullptr);
++    CHECK(frame->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
++    CHECK_FALSE(frame->unboundedArray);
++    CHECK(frame->count == 1);
++    CHECK(frame->stages == kBothStages);
++
++    REQUIRE(layout->pushRanges.size() == 1);
++    CHECK(layout->pushRanges[0].offset == 0);
++    CHECK(layout->pushRanges[0].size == 80);
++    CHECK(layout->pushRanges[0].stages == kBothStages);
++}
++
++TEST_CASE("reflect() succeeds on a >128-byte push constant block (budget enforcement is PipelineLayoutBuilder's "
++          "job, not reflect()'s)") {
++    auto compiler = rx::shader::Compiler::create();
++    REQUIRE(compiler.has_value());
++
++    rx::shader::CompileResult compileResult =
++        compiler->compileFromSource("BigPushModule", kOversizedPushConstantSource, {"vsMain"});
++    INFO("diagnostics: " << compileResult.diagnostics);
++    REQUIRE(compileResult.ok);
++
++    auto layout = rx::shader::reflect(compileResult);
++    REQUIRE(layout.has_value());
++
++    REQUIRE(layout->pushRanges.size() == 1);
++    CHECK(layout->pushRanges[0].offset == 0);
++    CHECK(layout->pushRanges[0].size == 192);
++    CHECK(layout->pushRanges[0].size > 128);
++}
++
++TEST_CASE("reflect() returns nullopt for a failed CompileResult") {
++    auto compiler = rx::shader::Compiler::create();
++    REQUIRE(compiler.has_value());
++
++    rx::shader::CompileResult failed =
++        compiler->compileFromSource("BadModule", "this is not valid slang source {{{", {"main"});
++    CHECK_FALSE(failed.ok);
++
++    auto layout = rx::shader::reflect(failed);
++    CHECK_FALSE(layout.has_value());
++}
