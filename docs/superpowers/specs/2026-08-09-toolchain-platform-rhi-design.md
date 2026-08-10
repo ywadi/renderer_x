@@ -173,6 +173,28 @@ it is out of scope for *this* spec only, not out of scope for the project:
     performance counters.
 - macOS/MoltenVK support
 - DLL ABI-stability strategy for the public interface
+- **Task/mesh shaders** (committed 2026-08-10, geometry phase): optional
+  fast path per the optionality principle — RADV exposes
+  VK_EXT_mesh_shader on the Deck floor but RDNA2 task-stage throughput is
+  weak and older GPUs lack it. The meshlet pipeline (meshoptimizer data)
+  ships with a compute-culling + classic-vertex-pipeline baseline; mesh
+  shaders are the capability-queried consumer of the same meshlet data.
+- **GPU-driven pipelines / visibility buffers** (committed 2026-08-10):
+  GPU-driven culling with indirect draw lists needs only core-1.3
+  features (drawIndirectCount, device address, bindless) — no gating;
+  sequenced with/after the geometry phase's meshlets and the HiZ
+  occlusion milestone. Visibility-buffer shading (triangle-ID raster +
+  deferred material resolve) is a techniques-phase decision AFTER
+  meshlets exist; it requires a shade-from-ID path through the material
+  system's specialization model — design work to scope in that phase's
+  spec, not assumed.
+- **GPU decompression (GDeflate-class)** (recorded 2026-08-10, streaming
+  phase, lowest priority of the three): DirectStorage proper is
+  D3D12/Windows-only — the portable target is async IO + compute-shader
+  GDeflate (open spec). Baseline remains KTX2+zstd on worker threads
+  (Phase 4). Gate: adopt only if profiling proves a win on the Deck
+  floor, where spending GPU on decompression while rendering plausibly
+  loses to its Zen 2 cores.
 - **Multi-language bindings** (committed 2026-08-10, SDK phase): the public
   API ships C-ABI-first — a single IDL source generates the C header, the
   C++ COM-lite header, and the DLL shim (bgfx precedent; kills header
