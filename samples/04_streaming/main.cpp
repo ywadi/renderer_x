@@ -24,27 +24,39 @@
 // where that flag is set.
 //
 // FRAME-LAG SAFETY ARGUMENT (read before changing the eviction/retirement
-// code): this sample renders through a real rx::rhi::FrameSync,
-// frames-in-flight == 2 loop (headless mode manually recreates that loop
-// against 2 dedicated offscreen images instead of a swapchain -- see
-// runHeadless() -- specifically so genuine CPU/GPU overlap is exercised;
-// a fully-serialized "wait every frame" loop would never expose an
-// eviction bug and the validation-error assertion at the end would be
-// vacuously true). Each eviction rewrites the victim's descriptor slot's
-// contents (via a fresh registerSampledImage() call, immediately -- legal
-// any time under UPDATE_AFTER_BIND | PARTIALLY_BOUND, see bindless.h's
-// RELEASE-SAFETY CONTRACT) BEFORE this frame's draws are recorded, then
-// retires the OLD Texture2D into the DeletionQueue tagged with
+// code -- this covers BOTH halves of an eviction; an earlier revision of
+// this file only deferred the destruction half and got the rewrite half
+// wrong, a Critical review finding, see "DESCRIPTOR REWRITE SAFETY"
+// below for that half specifically): this sample renders through a real
+// rx::rhi::FrameSync, frames-in-flight == 2 loop (headless mode manually
+// recreates that loop against 2 dedicated offscreen images instead of a
+// swapchain -- see runHeadless() -- specifically so genuine CPU/GPU
+// overlap is exercised; a fully-serialized "wait every frame" loop would
+// never expose an eviction bug and the validation-error assertion at the
+// end would be vacuously true).
+//
+// Both the destruction of the victim's old Texture2D AND the descriptor
+// rewrite that hands the freed slot to the incoming texture are deferred
+// together, in one rx::rhi::DeletionQueue::retire() call, tagged with
 // `frameSync.frameNumber()` -- the CURRENT frame number, at the moment of
-// eviction. Why that specific tag is correct, not off by one either way:
+// eviction (evictOldestAndStreamInNext()'s `currentFrameNumber`
+// parameter). Why that specific tag is correct for BOTH halves, not off
+// by one either way:
 //   - Any command buffer recorded and submitted STRICTLY BEFORE this frame
 //     (frame N-1 and earlier) was recorded while the victim's slot still
-//     held the OLD descriptor contents -- it may still be executing on the
-//     GPU, so the old VkImage/VkImageView must not be destroyed yet.
-//   - This frame (frame N) and every later frame will only ever be
-//     recorded with the slot ALREADY holding the NEW contents (the rewrite
-//     above happens before recording), so frame N itself never depends on
-//     the old resource surviving.
+//     held the OLD descriptor contents and may dynamically sample it --
+//     it may still be executing on the GPU, so neither the old
+//     VkImage/VkImageView may be destroyed NOR may the slot's descriptor
+//     be rewritten yet (see "DESCRIPTOR REWRITE SAFETY" below -- rewriting
+//     a slot a still-pending command buffer dynamically uses is itself a
+//     spec violation, independent of the destroy-timing question).
+//   - This frame (frame N) and every later frame are only ever recorded
+//     with the victim's grid cell already marked non-resident (cleared
+//     immediately, before any deferral) and the incoming texture's cell
+//     not yet marked resident (deferred until the callback below runs) --
+//     so frame N's own draws never reference the slot at all, in either
+//     its old or new state, and never depend on either half completing
+//     first.
 //   - Vulkan queues execute (and, more importantly here, SIGNAL fences)
 //     submissions in submission order on a single queue [Vulkan spec,
 //     queue submission ordering] -- this project submits every frame to
@@ -53,13 +65,50 @@
 //     GUARANTEED to have already completed too -- this is the same
 //     assumption every frames-in-flight double-buffering scheme in this
 //     codebase already relies on (see frame_sync.h/deletion_queue.h).
-//   - DeletionQueue::retire(..., N) only actually runs its destructor once
+//   - DeletionQueue::retire(..., N) only actually runs its callback once
 //     onFrameFenceSignaled(N) is called, which this file only calls once
 //     frame N's own fence has been waited on and confirmed -- by
 //     construction, after frame N-1 has also completed. Tagging with N
 //     (not N-1, which would be premature by the same argument in reverse,
 //     and not N+1, which would just needlessly delay reclaiming the slot)
-//     is exactly right.
+//     is exactly right for the destruction, and is also sufficient (if
+//     one frame more conservative than the theoretical minimum of N+1's
+//     own confirmation) for the rewrite -- reusing the identical tag/timing
+//     for both halves keeps this file's synchronization story to ONE rule
+//     to verify, not two independently-argued ones.
+//
+// DESCRIPTOR REWRITE SAFETY (the half a Critical review finding caught
+// missing from an earlier revision): rewriting a descriptor slot via
+// registerSampledImage() is legal under UPDATE_AFTER_BIND | PARTIALLY_BOUND
+// only when that slot is NOT dynamically used by any command buffer whose
+// submission has not yet completed execution -- see bindless.h's
+// RELEASE-SAFETY CONTRACT for the full spec argument. release() then
+// immediately register() into the just-freed index is NOT a rare
+// coincidence here: BindlessTable's free list is LIFO
+// (rx_core/handle.h's HandlePool::acquire() pops freeList_.back(), and
+// release() pushes to freeList_.back()), so a release() immediately
+// followed by a register() call deterministically reuses the exact same
+// physical slot every single eviction cycle. If that rewrite happened
+// immediately (as an earlier revision of this file did), frame N-1's
+// command buffer -- recorded before the eviction decision, which may
+// still be executing on the GPU since only frame N-2 is fence-confirmed
+// at that point -- could still be dynamically sampling that exact slot
+// through the victim's OLD descriptor contents. That is a genuine
+// Vulkan spec violation (not merely a destroy-timing bug): the bounded
+// consequence is a stale in-flight frame silently sampling the NEW
+// texture's data one frame early (the new texture is always fully
+// uploaded before its descriptor is ever written, so this is never a
+// use-after-free/undefined-memory-read) -- invisible to validation
+// layers, but still not what the spec permits, and it would defeat this
+// sample's entire stated purpose to accept it as "harmless enough." The
+// fix: registerSampledImage() for the incoming texture is called from
+// inside the SAME DeletionQueue-retired callback that destroys the
+// victim's old Texture2D, at the SAME frame-fence-confirmed point --
+// i.e., the incoming texture's grid cell does not become resident
+// (drawable) until 2 frames after the eviction decision, not
+// immediately. This shifts this sample's "full rotation" timing (see
+// runHeadless()'s stream-interval comment) but the assertion itself is
+// unchanged.
 //
 // WHY PUSH-CONSTANT TRANSFORMS, NOT A BINDLESS STORAGE BUFFER: unlike
 // 03_bindless_mesh (whose whole point includes a double-buffered bindless
@@ -474,10 +523,17 @@ struct Vertex {
 // --- GPU-side scene ---------------------------------------------------------
 
 // A logical texture's GPU-side state while it is resident. Empty
-// (`texture` == std::nullopt, `handle` invalid) while that logical texture
-// is not currently loaded.
+// (`texture` == nullptr, `handle` invalid) while that logical texture is
+// not currently loaded/resident. `shared_ptr`, not `optional`, because an
+// evicted texture's ownership must be able to move into a
+// DeletionQueue-retired closure (which requires a copy-constructible
+// target, see deletion_queue.h's own documented pitfall) without an
+// extra wrap-in-make_shared step at the call site, and because an
+// incoming texture is built as a shared_ptr BEFORE it is known whether
+// it will be registered immediately (initial fill) or via a deferred
+// callback (eviction) -- see evictOldestAndStreamInNext().
 struct LogicalTextureSlot {
-    std::optional<rx::rhi::Texture2D> texture;
+    std::shared_ptr<rx::rhi::Texture2D> texture;
     rx::rhi::BindlessHandle handle;
 };
 
@@ -757,14 +813,23 @@ bool buildScenePipeline(VkDevice device, rx::rhi::BindlessTable& bindlessTable, 
     return true;
 }
 
-// Uploads and registers logical texture `logicalIndex`'s freshly-created
-// Texture2D into `bindlessTable`, wiring it into `scene.textures`. Used
-// both for the initial fill (createScene()) and every later eviction
-// cycle (evictOldestAndStreamInNext()).
-bool loadLogicalTexture(VkPhysicalDevice physicalDevice, VkDevice device, rx::rhi::Allocator& allocator,
-                          rx::rhi::Uploader& uploader, Scene& scene,
-                          const std::array<std::array<uint8_t, 3>, kTextureCount>& expectedColors,
-                          uint32_t logicalIndex) {
+// Creates + uploads logical texture `logicalIndex`'s Texture2D and
+// registers it into `bindlessTable` IMMEDIATELY, wiring it into
+// `scene.textures`. Only safe to call when no frame has yet been
+// recorded against `scene`'s BindlessTable at all (i.e. the initial
+// fill in createScene(), before runHeadless()/runPresent()'s loop
+// starts) -- at that point there is no pending command buffer for the
+// immediate registerSampledImage() call to race against, so the
+// "DESCRIPTOR REWRITE SAFETY" concern in this file's header comment does
+// not apply. Eviction (evictOldestAndStreamInNext(), below) does NOT use
+// this function for the incoming texture -- it must defer the
+// registration itself, not just the destruction, so it builds its own
+// shared_ptr<Texture2D> and calls registerSampledImage() from inside a
+// DeletionQueue-retired callback instead.
+bool loadLogicalTextureImmediate(VkPhysicalDevice physicalDevice, VkDevice device, rx::rhi::Allocator& allocator,
+                                   rx::rhi::Uploader& uploader, Scene& scene,
+                                   const std::array<std::array<uint8_t, 3>, kTextureCount>& expectedColors,
+                                   uint32_t logicalIndex) {
     auto texture = rx::rhi::Texture2D::create(physicalDevice, device, allocator,
                                                 VkExtent2D{kTextureSize, kTextureSize}, kTextureFormat,
                                                 VK_IMAGE_USAGE_SAMPLED_BIT, /*requestedMipLevels=*/1);
@@ -785,56 +850,99 @@ bool loadLogicalTexture(VkPhysicalDevice physicalDevice, VkDevice device, rx::rh
         return false;
     }
 
-    scene.textures[logicalIndex].texture = std::move(*texture);
+    scene.textures[logicalIndex].texture = std::make_shared<rx::rhi::Texture2D>(std::move(*texture));
     scene.textures[logicalIndex].handle = handle;
     return true;
 }
 
 // THE eviction-while-in-flight mechanism this whole sample exists to
-// prove. See this file's header comment ("FRAME-LAG SAFETY ARGUMENT") for
-// why tagging the victim's retirement with `currentFrameNumber` (the
-// caller's frameSync.frameNumber() at the moment of the call, BEFORE this
-// frame's draws are recorded) is exactly correct.
+// prove -- see this file's header comment ("FRAME-LAG SAFETY ARGUMENT"
+// and "DESCRIPTOR REWRITE SAFETY") for why BOTH the destruction of the
+// victim's old resource AND the descriptor-slot rewrite for the incoming
+// resource must be deferred to the same fence-confirmed point, not just
+// the destruction.
 bool evictOldestAndStreamInNext(VkPhysicalDevice physicalDevice, VkDevice device, rx::rhi::Allocator& allocator,
                                   rx::rhi::Uploader& uploader, Scene& scene,
                                   const std::array<std::array<uint8_t, 3>, kTextureCount>& expectedColors,
                                   uint64_t currentFrameNumber) {
+    if (scene.residencyOrder.empty()) {
+        // Should not happen with this sample's stream interval (always
+        // well above the 2-frame registration lag below), but a defensive
+        // guard against calling front()/pop_front() on an empty deque is
+        // cheap insurance if a future edit ever shortens that interval.
+        RX_LOG_ERROR("sample_04_streaming: evictOldestAndStreamInNext called with no resident textures");
+        return false;
+    }
     uint32_t victim = scene.residencyOrder.front();
+    scene.residencyOrder.pop_front();
     uint32_t incoming = scene.nextToLoad;
     scene.nextToLoad = (scene.nextToLoad + 1) % kTextureCount;
 
-    // Release BEFORE uploading/registering the replacement: release() is
-    // pure host-side bookkeeping (bindless.h's RELEASE-SAFETY CONTRACT) --
-    // it never touches the GPU, never rewrites the descriptor, and never
-    // touches the victim's Texture2D -- so this ordering is always safe,
-    // and it means the very next registerSampledImage() call below is
-    // very likely (BindlessTable's free list; not a guarantee this code
-    // relies on) to reuse this exact slot, demonstrating "index reused,
-    // no command buffer re-recording needed" as directly as possible.
+    // Host-side bookkeeping only -- safe immediately, per bindless.h's
+    // RELEASE-SAFETY CONTRACT (release() never touches the GPU, never
+    // rewrites the descriptor). The victim's grid cell stops being drawn
+    // starting THIS frame's recording (recordGridDraws() only ever checks
+    // `scene.textures[k].texture`, cleared right below) -- that is what
+    // "evicted" means from the draw loop's perspective, independent of
+    // when the underlying resource is actually destroyed or when its
+    // slot is actually rewritten, both deferred below.
     scene.bindlessTable.release(scene.textures[victim].handle);
+    std::shared_ptr<rx::rhi::Texture2D> victimTexture = std::move(scene.textures[victim].texture);
+    scene.textures[victim].texture = nullptr;
+    scene.textures[victim].handle = rx::rhi::BindlessHandle{};
 
-    if (!loadLogicalTexture(physicalDevice, device, allocator, uploader, scene, expectedColors, incoming)) {
+    // Create + upload the incoming texture's Texture2D immediately: a
+    // brand-new VkImage has no descriptor slot assigned to it at all yet,
+    // so there is no in-flight hazard here whatsoever -- only the
+    // eventual registerSampledImage() call (which WRITES a descriptor
+    // slot -- deterministically the one just released above, see
+    // "DESCRIPTOR REWRITE SAFETY") needs to wait.
+    auto newTexture = rx::rhi::Texture2D::create(physicalDevice, device, allocator,
+                                                  VkExtent2D{kTextureSize, kTextureSize}, kTextureFormat,
+                                                  VK_IMAGE_USAGE_SAMPLED_BIT, /*requestedMipLevels=*/1);
+    if (!newTexture.has_value()) {
+        RX_LOG_ERROR("sample_04_streaming: Texture2D::create failed for logical texture {}", incoming);
+        return false;
+    }
+    std::vector<uint8_t> pixels = makeFlatColorTexture(kTextureSize, expectedColors[incoming]);
+    if (!uploader.uploadToImage(*newTexture, pixels.data(), pixels.size(), /*generateMips=*/false)) {
+        RX_LOG_ERROR("sample_04_streaming: uploadToImage failed for logical texture {}", incoming);
         return false;
     }
     uploader.flush();
+    std::shared_ptr<rx::rhi::Texture2D> incomingTexture = std::make_shared<rx::rhi::Texture2D>(std::move(*newTexture));
 
-    // The victim's OLD Texture2D must outlive any command buffer that
-    // might still be sampling through the descriptor slot it used to
-    // occupy (now already rewritten to the incoming texture's contents,
-    // above) -- retire it instead of letting it destruct here. Wrapped in
-    // a shared_ptr because std::function<void()> requires a
-    // copy-constructible target (see deletion_queue.h's own
-    // "STD::FUNCTION COPY-CONSTRUCTIBILITY PITFALL" comment) -- Texture2D
-    // itself is move-only.
-    if (scene.textures[victim].texture.has_value()) {
-        auto holder = std::make_shared<rx::rhi::Texture2D>(std::move(*scene.textures[victim].texture));
-        scene.deletionQueue.retire([holder] {}, currentFrameNumber);
-    }
-    scene.textures[victim].texture.reset();
-    scene.textures[victim].handle = rx::rhi::BindlessHandle{};
+    // THE fix: both halves of this eviction cycle -- destroying the
+    // victim's old resource, and writing the incoming resource into the
+    // slot that (deterministically) just freed up -- are deferred into
+    // ONE DeletionQueue retirement tagged with the CURRENT frame number,
+    // run only once that frame's fence is confirmed signaled (i.e. once
+    // frame N-1, and everything before it, is also guaranteed complete --
+    // see this file's header comment). `scene` is captured by raw pointer:
+    // safe because this callback only ever runs from inside
+    // onFrameFenceSignaled()/flushAll(), both called on `scene`'s owning
+    // frame loop / destroyScene() while `scene` itself is still alive.
+    Scene* scenePtr = &scene;
+    scene.deletionQueue.retire(
+        [scenePtr, victimTexture, incomingTexture, incoming]() {
+            // victimTexture's Texture2D is destroyed as an ordinary side
+            // effect of this closure (and its captured shared_ptr) being
+            // destroyed once DeletionQueue removes this entry -- nothing
+            // to do here for it explicitly, same pattern as every other
+            // retire() call in this codebase.
+            auto handle = scenePtr->bindlessTable.registerSampledImage(incomingTexture->view(),
+                                                                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            if (!handle.isValid()) {
+                RX_LOG_ERROR("sample_04_streaming: deferred registerSampledImage failed for logical texture {}",
+                             incoming);
+                return;
+            }
+            scenePtr->textures[incoming].texture = incomingTexture;
+            scenePtr->textures[incoming].handle = handle;
+            scenePtr->residencyOrder.push_back(incoming);
+        },
+        currentFrameNumber);
 
-    scene.residencyOrder.pop_front();
-    scene.residencyOrder.push_back(incoming);
     return true;
 }
 
@@ -903,9 +1011,11 @@ std::optional<Scene> createScene(VkPhysicalDevice physicalDevice, VkDevice devic
     }
 
     // --- Initial fill: logical textures 0..kResidentBudget-1 resident
-    // before the first frame is ever recorded.
+    // before the first frame is ever recorded -- immediate registration
+    // is safe here specifically because no frame has been recorded yet
+    // (see loadLogicalTextureImmediate()'s own comment).
     for (uint32_t i = 0; i < kResidentBudget; ++i) {
-        if (!loadLogicalTexture(physicalDevice, device, allocator, uploader, scene, expectedColors, i)) {
+        if (!loadLogicalTextureImmediate(physicalDevice, device, allocator, uploader, scene, expectedColors, i)) {
             destroyScene(device, scene);
             return std::nullopt;
         }
@@ -938,7 +1048,7 @@ void recordGridDraws(VkCommandBuffer cmd, const Scene& scene, const glm::mat4& v
     vkCmdBindIndexBuffer(cmd, scene.quadMesh->indexBuffer(), 0, scene.quadMesh->indexType());
 
     for (uint32_t k = 0; k < kTextureCount; ++k) {
-        if (!scene.textures[k].texture.has_value()) {
+        if (!scene.textures[k].texture) {
             continue;  // not resident right now -- this cell is simply not drawn this frame.
         }
 
@@ -1248,7 +1358,7 @@ int runHeadless() {
         }
 
         for (uint32_t k = 0; k < kTextureCount; ++k) {
-            slot.residentAtRecordTime[k] = scene->textures[k].texture.has_value();
+            slot.residentAtRecordTime[k] = static_cast<bool>(scene->textures[k].texture);
         }
 
         VkCommandPool pool = frameSync->currentCommandPool();

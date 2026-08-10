@@ -238,17 +238,28 @@ synchronization bugs: 24 procedurally generated textures (flat HSV-wheel
 hues, computed at runtime — not loaded from any file) compete for a
 resident budget of only 8 bindless slots. Every few frames (headless) or
 roughly once a second (`--present`) the next logical texture streams in
-through `rx::rhi::Uploader` and the oldest resident texture is evicted:
-`rx::rhi::BindlessTable::release()` returns its descriptor slot, and its
-`rx::rhi::Texture2D` is retired into `rx::rhi::DeletionQueue` — tagged with
-the current frame number — rather than destroyed on the spot. The
-DeletionQueue only actually destroys it once that frame's fence is
-confirmed signaled, which (given this codebase's single-queue,
-submission-ordered execution) also guarantees every earlier frame that
-might still have been sampling the old descriptor contents has completed
-too. Getting that timing exactly right is this sample's whole point — see
-`main.cpp`'s header comment ("FRAME-LAG SAFETY ARGUMENT") for the full
-argument.
+and the oldest resident texture is evicted. `rx::rhi::BindlessTable`'s
+free list is LIFO, so releasing the victim's handle and then registering
+the incoming texture deterministically reuses that exact same physical
+descriptor slot — which means BOTH halves of the swap need protecting,
+not just the destruction: rewriting a descriptor slot via
+`registerSampledImage()` is only legal (per Vulkan's update-after-bind
+rules) when that slot is not dynamically used by any still-pending
+command buffer, so this sample defers the incoming texture's
+registration itself — not merely the victim's `rx::rhi::Texture2D`
+destruction — into the same `rx::rhi::DeletionQueue`-retired callback,
+tagged with the current frame number. That callback only runs once that
+frame's fence is confirmed signaled, which (given this codebase's
+single-queue, submission-ordered execution) also guarantees every
+earlier frame that might still have been dynamically sampling the old
+descriptor contents in that slot has completed too — so the incoming
+texture's grid cell only becomes resident (and drawable) 2 frames after
+the eviction decision, not immediately. Getting that timing exactly
+right for BOTH the destroy and the rewrite is this sample's whole point
+— see `main.cpp`'s header comment ("FRAME-LAG SAFETY ARGUMENT" and
+"DESCRIPTOR REWRITE SAFETY") for the full argument, and
+`rx_rhi_vk/bindless.h`'s RELEASE-SAFETY CONTRACT for the underlying spec
+rule.
 
 24 fixed grid cells (one per logical texture, not one per physical slot)
 sit in a 6x4 grid under a static orthographic camera; a cell is drawn only

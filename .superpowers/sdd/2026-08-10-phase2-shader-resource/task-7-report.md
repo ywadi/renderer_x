@@ -21,6 +21,13 @@ development; both are documented below and in `main.cpp`.
 
 ## 1. The eviction-while-in-flight mechanism (the actual point of this task)
 
+**NOTE — this section describes the ORIGINAL mechanism as first
+implemented; step 2 had a Critical bug (the descriptor-slot rewrite
+itself was not frame-lag-protected, only the destruction was). See
+"Fix round" at the end of this report for the corrected mechanism and
+the full analysis — kept here, uncorrected apart from the one phrasing
+fix below, as the historical record of what was reviewed.**
+
 `evictOldestAndStreamInNext()` (`samples/04_streaming/main.cpp`):
 
 1. `bindlessTable.release(victimHandle)` — pure host-side bookkeeping
@@ -29,12 +36,14 @@ development; both are documented below and in `main.cpp`.
    `Texture2D`).
 2. Create + upload the incoming texture, then
    `bindlessTable.registerSampledImage(...)` — this **rewrites** the
-   slot's descriptor immediately (legal any time under
-   `UPDATE_AFTER_BIND | PARTIALLY_BOUND`), very likely reusing the
-   just-freed index (BindlessTable's free list), demonstrating "index
-   reused, no command-buffer re-recording needed" as directly as
-   possible — though the code never assumes the index is the same, it
-   always uses whatever handle `register()` actually returns.
+   slot's descriptor immediately, **deterministically** reusing the
+   just-freed index (`BindlessTable`'s free list is LIFO — not merely
+   "very likely," which is how an earlier draft of this report
+   mischaracterized it; the determinism is exactly what made the
+   resulting race reproducible every single eviction cycle, not a rare
+   coincidence) — though the code never assumed the index would be the
+   same for correctness purposes, it always used whatever handle
+   `register()` actually returned.
 3. The victim's **old** `Texture2D` is wrapped in a `shared_ptr` (for
    `std::function` copy-constructibility, per `deletion_queue.h`'s own
    documented pitfall) and retired via
@@ -196,13 +205,120 @@ sampler is created.
 - `NonUniformResourceIndex()` is never used (every index is a per-draw
   push-constant, uniform across the whole draw) — no `spirv-val` run
   required per the plan's Global Constraints, same as 03_bindless_mesh.
-- No new engine-layer changes were needed at all — `BindlessTable`,
-  `DeletionQueue`, `Uploader`, `Texture2D`, `FrameSync::frameNumber()`,
-  and `transitionImage`'s aspect parameter were all already exactly
-  sufficient for this sample's needs.
+- No new engine-layer changes were needed at implementation time —
+  `BindlessTable`, `DeletionQueue`, `Uploader`, `Texture2D`,
+  `FrameSync::frameNumber()`, and `transitionImage`'s aspect parameter
+  were all already exactly sufficient for this sample's needs. (One
+  engine-layer *doc* change — tightening `bindless.h`'s RELEASE-SAFETY
+  CONTRACT comment — was made in the fix round below, sanctioned by the
+  coordinator; no engine *behavior* changed.)
 
 ## Files touched
 
 - Create: `samples/04_streaming/main.cpp`, `samples/04_streaming/CMakeLists.txt`
 - Modify: `CMakeLists.txt` (root, `add_subdirectory`), `samples/README.md`
   (new `## 04_streaming` section + build/run instructions)
+- Modify (fix round): `src/rx_rhi_vk/include/rx_rhi_vk/bindless.h`
+  (RELEASE-SAFETY CONTRACT doc tightening, no behavior change),
+  `samples/04_streaming/main.cpp` (descriptor-rewrite fix),
+  `samples/README.md` (04_streaming section restatement)
+
+## Fix round: Critical + Important review findings
+
+Review came back **Needs fixes**: 1 Critical + 1 Important + 1 Minor
+(phrasing).
+
+**CRITICAL — the descriptor-slot REWRITE was not frame-lag-protected,
+only the destruction was.** The original `evictOldestAndStreamInNext()`
+(§1 above) released the victim's handle and then immediately called
+`registerSampledImage()` for the incoming texture. `BindlessTable`'s
+free list is LIFO (`rx_core/handle.h`'s `HandlePool::acquire()` pops
+`freeList_.back()`; `release()` pushes to `freeList_.back()`) — verified
+directly against the header before writing the fix — so that
+immediate register call **deterministically** rewrote the exact
+just-freed physical slot via `vkUpdateDescriptorSets`. At that point
+only frame N-2 was fence-confirmed; frame N-1 could still be executing
+a draw recorded against the OLD descriptor in that exact slot and
+dynamically sampling it. Vulkan's `UPDATE_AFTER_BIND`/`PARTIALLY_BOUND`/
+`UPDATE_UNUSED_WHILE_PENDING` rules permit rewriting only descriptors
+NOT dynamically used by pending command buffers — this one was. Bounded
+consequence (the new texture's data is always fully uploaded before its
+descriptor is ever written, so this was never a use-after-free — a
+stale in-flight frame would silently sample the new texture's data one
+frame early), but it is a genuine spec violation, invisible to
+validation layers, and it directly contradicted this sample's own
+stated purpose.
+
+**Fix:** both halves of an eviction — destroying the victim's old
+`Texture2D` AND registering the incoming texture into the (deterministically
+reused) slot — are now deferred into ONE `DeletionQueue::retire()`
+call, tagged with the same `currentFrameNumber` as before. Concretely,
+`evictOldestAndStreamInNext()` now: releases the victim's handle and
+clears its grid-cell bookkeeping immediately (host-side only, still
+safe per the RELEASE-SAFETY CONTRACT); creates + uploads the incoming
+texture's `Texture2D` immediately (a brand-new `VkImage` has no
+descriptor slot at all yet, so there is no in-flight hazard whatsoever
+in that half); then retires ONE callback, tagged with
+`currentFrameNumber`, that calls `registerSampledImage()` for the
+incoming texture and only THEN marks its grid cell resident (adds it to
+`residencyOrder`, wires up `scene.textures[incoming]`). `LogicalTextureSlot::texture`
+changed from `std::optional<Texture2D>` to `std::shared_ptr<Texture2D>`
+so both the outgoing (destroy) and incoming (register) textures could
+be captured into that one retire callback without an extra wrap step.
+Documented at length in `main.cpp`'s header comment under a new
+"DESCRIPTOR REWRITE SAFETY" section (added alongside the existing
+"FRAME-LAG SAFETY ARGUMENT," which the destruction half already had
+right, per the review). Net effect: the incoming texture's grid cell
+becomes resident/drawable 2 frames after the eviction decision, not
+immediately — this shifts the sample's internal timing but not its
+headless-gate assertion (still "every one of the 24 textures observed
+resident at some point"); re-verified the margin is still comfortable
+(the last never-before-seen texture, index 23, becomes visible at frame
+50 of a 60-frame run — 10 frames of margin before the run ends) and
+confirmed empirically (still `24 / 24` every run, see Verification
+below) rather than trusting the arithmetic alone.
+
+**IMPORTANT — `bindless.h`'s RELEASE-SAFETY CONTRACT overclaimed.**
+Tightened the comment (lines ~112-125 pre-fix) to state the missing
+load-bearing condition explicitly: rewriting a bound descriptor via
+`UPDATE_AFTER_BIND | PARTIALLY_BOUND` is valid only for a slot NOT
+dynamically used by a pending command buffer, release()-then-register()
+into the same LIFO-freed index is the deterministic (not rare) case
+this matters for, and callers must defer the rewrite itself to a
+fence-confirmed point (DeletionQueue-style) — pointing at
+`samples/04_streaming` as the worked example. Doc-only change, no
+behavior change, sanctioned by the coordinator as an engine-file edit
+in scope for this task's fix round.
+
+**MINOR — report phrasing.** §1 above originally said the immediate
+`registerSampledImage()` call was "very likely" reusing the just-freed
+index; corrected in place to "deterministically" (LIFO free list), which
+is exactly what made the race reproducible every cycle rather than an
+occasional flake.
+
+**Verification after the fix round:**
+- Compiled clean (`cmake --build --preset linux-native --target
+  sample_04_streaming`); the `bindless.h` doc-only change triggered a
+  rebuild of `rx_rhi_vk`, `rx_rhi_vk_tests`, and `sample_03_bindless_mesh`
+  (headers are transitively included) — all still built clean.
+- Headless gate re-run 5 consecutive times directly: `24 / 24 logical
+  textures observed resident at some point` and zero unexpected
+  validation errors every time (matches the pre-fix baseline exactly).
+- `ctest --preset linux-native`: 9/9 green (including
+  `rx_rhi_vk_tests` and `sample_03_bindless_mesh_headless`, confirming
+  the `bindless.h` doc edit didn't regress anything it touches
+  transitively).
+- `cmake --build --preset windows-cross-zig` + `ctest --preset
+  windows-cross-zig`: 9/9 green.
+- `-Wall -Wextra` standalone compile: exactly the same one pre-existing
+  warning as before the fix (`-Wmissing-field-initializers` on the
+  `Scene scene{...}` aggregate init, identical to `03_bindless_mesh`'s
+  own shipped pattern) — no new warnings from the restructuring.
+- `--present` mode re-run on the same real hardware (NVIDIA RTX 2080,
+  `DISPLAY=:1`), screenshotted twice ~2s apart: visually identical grid
+  cycling behavior to the pre-fix screenshots, zero unexpected
+  validation errors, clean shutdown.
+- `git log --format='%B'` grepped for AI-attribution strings on the fix
+  commit(s): no matches.
+
+No further deviations.

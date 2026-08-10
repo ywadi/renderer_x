@@ -113,16 +113,39 @@ private:
 // takes ownership of the VkImageView/VkSampler/VkBuffer handles passed to
 // register*(). UPDATE_AFTER_BIND + PARTIALLY_BOUND together make it valid
 // to rewrite a descriptor in a set that is already bound by a command
-// buffer the driver has not finished executing, and make it valid for a
-// bound set to contain slots no shader access ever touches -- but neither
-// flag makes it safe to destroy the GPU resource a slot's descriptor still
-// points at while a command buffer that might read that slot could still
-// be in flight. Guaranteeing that (deferring the real resource destruction
-// until the owning frame's fence has signaled) is explicitly out of scope
-// for this type -- it is Task 4's DeletionQueue's job. Callers must not
-// destroy a registered resource, nor treat release() as a synchronization
-// point for it, until they know (via DeletionQueue or an equivalent
-// fence wait) that no in-flight frame can still reference that slot.
+// buffer the driver has not finished executing -- ONLY for a descriptor
+// slot NOT dynamically used by that pending command buffer. (Per the
+// Vulkan spec's update-after-bind rules: a descriptor updated via
+// UPDATE_AFTER_BIND must not be dynamically used by any command in a
+// submission that has not yet completed execution, unless the update is
+// one the spec separately classifies as unobservable to that command --
+// PARTIALLY_BOUND/UPDATE_UNUSED_WHILE_PENDING relax "an unwritten/unused
+// slot doesn't need a valid descriptor for a shader invocation that never
+// actually indexes it"; neither relaxes rewriting a slot a still-pending
+// command buffer DOES dynamically index.) Concretely: release()-then-
+// immediately-register() into that same freed index (this table's free
+// list is LIFO, so this is the deterministic case, not a rare one) is a
+// spec violation, invisible to validation, if any command buffer
+// recorded before the release might still be executing a draw that
+// dynamically samples that exact slot. Callers doing release-then-
+// re-register under a frames-in-flight loop must defer the REWRITE
+// itself -- not just the eventual destruction of the old resource -- to
+// a point they know no such pending command buffer exists; the same
+// fence-confirmed point DeletionQueue already exists to provide is the
+// natural mechanism (see samples/04_streaming for the worked example: it
+// defers register*() itself into a DeletionQueue-retired callback, using
+// the identical frame-fence discipline it uses for the destruction
+// below).
+//
+// Separately: neither flag makes it safe to destroy the GPU resource a
+// slot's descriptor still points at while a command buffer that might
+// read that slot could still be in flight. Guaranteeing that (deferring
+// the real resource destruction until the owning frame's fence has
+// signaled) is explicitly out of scope for this type -- it is Task 4's
+// DeletionQueue's job. Callers must not destroy a registered resource,
+// nor treat release() as a synchronization point for it, until they know
+// (via DeletionQueue or an equivalent fence wait) that no in-flight frame
+// can still reference that slot.
 class BindlessTable {
 public:
     struct Capacities {
