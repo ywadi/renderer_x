@@ -21,6 +21,24 @@ struct CompileInfo {
     uint32_t swapchainWidth = 0;
     uint32_t swapchainHeight = 0;
     VkFormat swapchainFormat = VK_FORMAT_UNDEFINED;
+
+    // Task 3 ambiguity resolution #1: VK_IMAGE_LAYOUT_PRESENT_SRC_KHR is
+    // only meaningful for an image the presentation engine will actually
+    // consume (a real swapchain image) -- an offscreen "backbuffer" (e.g.
+    // Task 3's GPU test, which renders into a caller-created, never-
+    // presented VkImage) has no presentation engine to hand off to at all,
+    // so CompiledGraph::finalBarriers() needs a caller-selectable final
+    // layout instead of Task 2's hardcoded PRESENT_SRC_KHR assumption.
+    // Defaults to PRESENT_SRC_KHR (Task 2's original, unchanged behavior
+    // for the production swapchain-presenting case); pass e.g.
+    // VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL for an offscreen backbuffer a
+    // caller intends to read back instead. RenderGraph::compile() applies
+    // this by overwriting buildBarriers()'s own (still PRESENT_SRC_KHR-
+    // producing) finalBarriers() image barrier's newLayout in place -- see
+    // render_graph.cpp's compile(), immediately after its buildBarriers()
+    // call; barriers.h/barriers.cpp's own hardcoded PRESENT_SRC_KHR is
+    // deliberately left untouched by this change.
+    VkImageLayout backbufferFinalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 };
 
 // The device-free result of RenderGraph::compile(): which declared passes
@@ -122,6 +140,21 @@ public:
     void compile(const CompileInfo& info);
 
     [[nodiscard]] const CompiledGraph& compiled() const;
+
+    // Task 3: the one piece of per-pass data CompiledGraph deliberately
+    // never carries forward on its own (see CompiledGraph's class comment
+    // above -- it only ever resolves *resource* data, never the Pass
+    // object itself) -- needed so Executor::execute() can invoke a
+    // surviving pass's recorded execute() callback (pass.h's
+    // Pass::setExecute) and read its name() for debug labels, given only
+    // the raw pass index CompiledGraph::executionOrder() yields. `rawIndex`
+    // uses the exact same indexing as isCulled()/passAccesses() (addPass()
+    // call order); out-of-range throws std::out_of_range, matching those
+    // two methods' own contract. Purely additive: does not change
+    // compile()'s device-free algorithm, ABI-break any existing accessor,
+    // or give a caller any way to mutate a Pass after the fact (returns a
+    // const reference) -- Task 3 is this method's first caller.
+    [[nodiscard]] const Pass& passAt(uint32_t rawIndex) const;
 
     // Clears every declared pass, the backbuffer source, and any prior
     // compile() result, so the graph can be re-declared from scratch

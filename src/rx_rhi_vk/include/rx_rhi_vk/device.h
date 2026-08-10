@@ -37,6 +37,16 @@ public:
 
     static std::optional<Device> create(Context& context, VkSurfaceKHR surface);
 
+    // Task 3 (rx_graph's Executor): the same VkInstance handle this Device
+    // was built against (Context::instance(), stashed at create() time --
+    // see the private instance_ member below). Added because
+    // Executor::create(Device&) needs to build its own
+    // rx::rhi::Allocator::createRaw(physicalDevice, device, instance) from
+    // a Device alone, with no separate Context& in its signature, and
+    // every other accessor on this class already exposes exactly this
+    // kind of already-stored handle (physicalDevice(), device(), ...) the
+    // same trivial way.
+    VkInstance instance() const { return instance_; }
     VkPhysicalDevice physicalDevice() const { return physicalDevice_; }
     VkDevice device() const { return device_; }
     VkQueue graphicsQueue() const { return graphicsQueue_; }

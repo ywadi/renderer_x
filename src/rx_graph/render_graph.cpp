@@ -473,11 +473,31 @@ void RenderGraph::compile(const CompileInfo& info) {
     // (barriers.h's buildBarriers()) -----------------------------------
     compiled.passBarriers_ = buildBarriers(compiled, compiled.finalBarriers_);
 
+    // ---- Task 3 ambiguity resolution #1: apply CompileInfo::
+    // backbufferFinalLayout. buildBarriers() itself still always produces
+    // VK_IMAGE_LAYOUT_PRESENT_SRC_KHR (barriers.h/barriers.cpp are
+    // untouched by this task) -- compile() overwrites that one field here
+    // instead, immediately after the call above. finalBarriers_ always has
+    // exactly one imageBarrier (the backbuffer's) once compile() has
+    // gotten this far: the backbuffer-writer validation earlier in this
+    // function already guarantees exactly one PhysicalResource has
+    // isBackbuffer == true, and buildBarriers() always emits exactly one
+    // entry for it (barriers.cpp's own loop `break`s after the first
+    // match) -- the emptiness check below is defensive, not expected to
+    // ever trigger.
+    if (!compiled.finalBarriers_.imageBarriers.empty()) {
+        compiled.finalBarriers_.imageBarriers.front().newLayout = info.backbufferFinalLayout;
+    }
+
     g.compiled = std::move(compiled);
 }
 
 const CompiledGraph& RenderGraph::compiled() const {
     return impl_->compiled;
+}
+
+const Pass& RenderGraph::passAt(uint32_t rawIndex) const {
+    return impl_->passes.at(rawIndex);
 }
 
 void RenderGraph::reset() {
@@ -531,6 +551,12 @@ std::string_view Pass::name() const {
 
 QueueClass Pass::queueClass() const {
     return queue_;
+}
+
+void Pass::invokeExecute(PassContext& ctx) const {
+    if (execute_) {
+        execute_(ctx);
+    }
 }
 
 }  // namespace rx::graph

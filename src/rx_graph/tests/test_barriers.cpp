@@ -376,20 +376,51 @@ TEST_CASE("compute-to-draw-buffer") {
 }
 
 TEST_CASE("present-final") {
-    RenderGraph graph;
-    graph.addPass("present").addColorOutput("bb", colorDesc());
-    graph.setBackbufferSource("bb");
-    graph.compile(kInfo);
+    // Task 3 ambiguity resolution #1: CompileInfo::backbufferFinalLayout
+    // defaults to VK_IMAGE_LAYOUT_PRESENT_SRC_KHR (Task 2's original,
+    // unchanged behavior) but is now caller-selectable -- an offscreen
+    // "backbuffer" (no presentation engine involved at all, e.g. Task 3's
+    // GPU test) needs some other final layout instead. Both subcases
+    // share everything except that one CompileInfo field and its expected
+    // effect on finalBarriers().
+    SUBCASE("default backbufferFinalLayout is PRESENT_SRC_KHR (Task 2 behavior, unchanged)") {
+        RenderGraph graph;
+        graph.addPass("present").addColorOutput("bb", colorDesc());
+        graph.setBackbufferSource("bb");
+        graph.compile(kInfo);
 
-    const CompiledGraph& compiled = graph.compiled();
-    const uint32_t bb = physicalIndexOf(compiled, "bb");
+        const CompiledGraph& compiled = graph.compiled();
+        const uint32_t bb = physicalIndexOf(compiled, "bb");
 
-    const PassBarriers& final_ = compiled.finalBarriers();
-    REQUIRE(final_.imageBarriers.size() == 1);
-    CHECK(final_.bufferBarriers.empty());
-    checkImageBarrier(final_.imageBarriers[0], bb, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                       VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        const PassBarriers& final_ = compiled.finalBarriers();
+        REQUIRE(final_.imageBarriers.size() == 1);
+        CHECK(final_.bufferBarriers.empty());
+        checkImageBarrier(final_.imageBarriers[0], bb, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    }
+
+    SUBCASE("explicit backbufferFinalLayout overrides PRESENT_SRC_KHR (Task 3: offscreen backbuffer)") {
+        RenderGraph graph;
+        graph.addPass("present").addColorOutput("bb", colorDesc());
+        graph.setBackbufferSource("bb");
+
+        CompileInfo info = kInfo;
+        info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        graph.compile(info);
+
+        const CompiledGraph& compiled = graph.compiled();
+        const uint32_t bb = physicalIndexOf(compiled, "bb");
+
+        const PassBarriers& final_ = compiled.finalBarriers();
+        REQUIRE(final_.imageBarriers.size() == 1);
+        CHECK(final_.bufferBarriers.empty());
+        // Every field but newLayout is unaffected by this override -- same
+        // srcStage/srcAccess/oldLayout as the default subcase above.
+        checkImageBarrier(final_.imageBarriers[0], bb, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    }
 }
 
 TEST_CASE("culled-contributes-nothing") {

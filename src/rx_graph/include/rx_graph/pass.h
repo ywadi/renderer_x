@@ -9,9 +9,17 @@
 namespace rx::graph {
 
 // The device-side handle Task 3's executor hands to a pass's recorded
-// callback (real command buffer, resolved physical resources, ...). Not
-// defined until Task 3 -- Pass::setExecute only stores the callback in
-// Task 1; nothing invokes it until the executor exists to build one.
+// callback (real command buffer, resolved physical resources, ...).
+// Defined in executor.h (rx_graph/executor.h), not here: pass.h/
+// render_graph.h/resources.h/barriers.h stay device-free headers (no
+// VkCommandBuffer, no volk, no rx_rhi_vk -- see render_graph.h's own
+// header-hygiene comment), so only a forward declaration lives here.
+// Pass::setExecute only stores the callback; Pass::invokeExecute() below
+// is what actually calls it, once Executor::execute() has a real
+// PassContext to hand it -- neither this header nor render_graph.cpp ever
+// needs PassContext's complete definition themselves, since a
+// std::function<void(PassContext&)> can be stored and invoked through a
+// reference to an incomplete type.
 class PassContext;
 
 class RenderGraph;
@@ -69,6 +77,16 @@ public:
 
     [[nodiscard]] std::string_view name() const;
     [[nodiscard]] QueueClass queueClass() const;
+
+    // Task 3: invokes this pass's recorded execute() callback (setExecute()
+    // above) with a real PassContext, if one was ever stored -- a no-op
+    // for a pass that never called setExecute() (e.g. a pass whose only
+    // job is the sync Executor already emits from CompiledGraph::
+    // passBarriers()/the dynamic-rendering clear it triggers, with nothing
+    // further to record). Declared here (not free-standing in
+    // executor.cpp) because execute_ is a private member; implemented in
+    // render_graph.cpp alongside Pass's other methods.
+    void invokeExecute(PassContext& ctx) const;
 
 private:
     friend class RenderGraph;
