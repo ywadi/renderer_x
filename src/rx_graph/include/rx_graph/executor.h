@@ -67,7 +67,12 @@ namespace detail {
 // CompiledGraph::passAccesses()'s own out-of-range contract for a raw pass
 // index. Calling any of these before the owning Executor's first
 // realize() (or with a graph reset() since) throws for the same reason:
-// there is nothing bound to look up yet.
+// there is nothing bound to look up yet. Passing a valid name of the WRONG
+// kind also throws std::out_of_range -- imageView()/image()/imageFormat()
+// on a buffer-typed name, or buffer() on an image-typed one -- naming both
+// the resource and its actual kind, rather than silently returning a
+// meaningless VK_NULL_HANDLE/VK_FORMAT_UNDEFINED [Fix round 1 + its
+// supplemental follow-up].
 //
 // Task 5 adds passSignature() here (material/pipeline binding metadata);
 // not part of Task 3's scope.

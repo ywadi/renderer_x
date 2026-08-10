@@ -691,14 +691,21 @@ TEST_CASE(
         .addStorageBufferInput("data")
         .addColorOutput("bb", absoluteColorDesc(kExtent, kExtent))
         .setExecute([&](PassContext& ctx) {
-            // [Fix round 1, Minor finding]: PassContext::imageFormat() on a
-            // legitimately-registered but wrong-kind (buffer, not image)
-            // name must throw std::out_of_range, matching the documented
+            // [Fix round 1, Minor finding, plus its supplemental follow-up
+            // covering the remaining three resolvers]: every PassContext
+            // resolver must throw std::out_of_range on a legitimately-
+            // registered but wrong-kind name, matching the documented
             // "throws on anything not resolvable" contract's own spirit --
-            // not silently return VK_FORMAT_UNDEFINED. Exercised here
-            // against the real "data" storage buffer resource, through the
-            // real Executor, inside a real pass callback.
+            // never silently return a meaningless VK_NULL_HANDLE/
+            // VK_FORMAT_UNDEFINED. Exercised here against the real "data"
+            // storage buffer resource (image()/imageView()/imageFormat(),
+            // each expecting an image) and the real "bb" backbuffer image
+            // resource (buffer(), expecting a buffer), through the real
+            // Executor, inside a real pass callback.
             CHECK_THROWS_AS(static_cast<void>(ctx.imageFormat("data")), std::out_of_range);
+            CHECK_THROWS_AS(static_cast<void>(ctx.image("data")), std::out_of_range);
+            CHECK_THROWS_AS(static_cast<void>(ctx.imageView("data")), std::out_of_range);
+            CHECK_THROWS_AS(static_cast<void>(ctx.buffer("bb")), std::out_of_range);
         });
     graph.setBackbufferSource("bb");
 

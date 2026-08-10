@@ -615,34 +615,52 @@ uint32_t lookupResolvedIndex(const Executor::Impl& impl, std::string_view name) 
     return it->second;
 }
 
+// [Fix round 1, Minor finding + its supplemental follow-up]: a resolved
+// resource's image-only fields (view/image/format) are never set to
+// anything but their defaults (VK_NULL_HANDLE/VK_FORMAT_UNDEFINED) for a
+// buffer resource, and vice versa for `buffer` on an image resource --
+// returning one of those silently for a legitimately-registered but
+// wrong-kind name is a meaningless value, not an error a caller could ever
+// act on correctly. Every one of PassContext's four resolvers throws the
+// same way every other "not resolvable" case documented on that class
+// does (naming both the resource and its actual kind) rather than
+// special-casing any one path to succeed with garbage.
+void requireKind(std::string_view name, const ResolvedResource& resolved, bool expectBuffer,
+                  std::string_view resolverName) {
+    if (resolved.isBuffer != expectBuffer) {
+        throw std::out_of_range("rx_graph: PassContext::" + std::string(resolverName) + "(): '" + std::string(name) +
+                                 "' is a " + (resolved.isBuffer ? "buffer" : "image") + " resource, not " +
+                                 (expectBuffer ? "a buffer" : "an image"));
+    }
+}
+
 }  // namespace
 
 VkImageView Executor::resolveImageView(std::string_view name) const {
-    return impl_->resources.at(lookupResolvedIndex(*impl_, name)).view;
+    const uint32_t idx = lookupResolvedIndex(*impl_, name);
+    const ResolvedResource& resolved = impl_->resources.at(idx);
+    requireKind(name, resolved, /*expectBuffer=*/false, "imageView");
+    return resolved.view;
 }
 
 VkImage Executor::resolveImage(std::string_view name) const {
-    return impl_->resources.at(lookupResolvedIndex(*impl_, name)).image;
+    const uint32_t idx = lookupResolvedIndex(*impl_, name);
+    const ResolvedResource& resolved = impl_->resources.at(idx);
+    requireKind(name, resolved, /*expectBuffer=*/false, "image");
+    return resolved.image;
 }
 
 VkBuffer Executor::resolveBuffer(std::string_view name) const {
-    return impl_->resources.at(lookupResolvedIndex(*impl_, name)).buffer;
+    const uint32_t idx = lookupResolvedIndex(*impl_, name);
+    const ResolvedResource& resolved = impl_->resources.at(idx);
+    requireKind(name, resolved, /*expectBuffer=*/true, "buffer");
+    return resolved.buffer;
 }
 
 VkFormat Executor::resolveImageFormat(std::string_view name) const {
     const uint32_t idx = lookupResolvedIndex(*impl_, name);
     const ResolvedResource& resolved = impl_->resources.at(idx);
-    // [Fix round 1, Minor finding]: a buffer resource's ResolvedResource::
-    // format is never set to anything but its default (VK_FORMAT_UNDEFINED)
-    // -- returning that silently for a legitimately-registered but
-    // wrong-kind name is a meaningless value, not an error a caller could
-    // ever act on correctly. Throws the same way every other "not
-    // resolvable" case documented on this class does, rather than special-
-    // casing this one path to succeed with garbage.
-    if (resolved.isBuffer) {
-        throw std::out_of_range("rx_graph: PassContext::imageFormat(): '" + std::string(name) +
-                                 "' is a buffer resource, not an image");
-    }
+    requireKind(name, resolved, /*expectBuffer=*/false, "imageFormat");
     return resolved.format;
 }
 
