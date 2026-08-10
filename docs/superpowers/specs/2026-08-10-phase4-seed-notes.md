@@ -139,6 +139,17 @@ and visible culling statistics.
     ImGui from us (standalone profiler app; we link only the
     instrumentation client).
 
+13. **Public log sink (user-raised 2026-08-10):** consuming engines need
+    renderer logs in their own systems. Add an ABI-safe C callback —
+    `rxSetLogCallback(cb, userData)` receiving (severity enum, category,
+    message, userData) — backed internally by a spdlog forwarding sink;
+    console sink remains the default when unset. Rules: plain C types
+    only, exceptions caught around the invocation, callback may be hit
+    from any thread (documented). Precedents: PhysX error callback, FMOD
+    debug callback, bgfx callback interface. Lands with Phase 4's ABI
+    work (rides item 10's public-surface touch); samples install it to
+    prove the path.
+
 ## Carried process notes
 
 - Research pass before spec (library selection for glTF/KTX2 with
