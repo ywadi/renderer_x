@@ -1,0 +1,1483 @@
+# Review package: 33faa86..241e5cbc984f1bfdb3372c9a7e6b9660b9c15024
+
+## Commits
+241e5cb Add device descriptor-indexing enablement + BindlessTable (Phase 2 Task 3)
+
+## Files changed
+ .../task-3-report.md                               | 261 ++++++++++++++
+ src/rx_rhi_vk/CMakeLists.txt                       |  34 +-
+ src/rx_rhi_vk/include/rx_rhi_vk/bindless.h         | 213 +++++++++++
+ src/rx_rhi_vk/src/bindless.cpp                     | 320 +++++++++++++++++
+ src/rx_rhi_vk/src/device.cpp                       | 121 +++++++
+ src/rx_rhi_vk/tests/bindless_test.cpp              | 395 +++++++++++++++++++++
+ 6 files changed, 1330 insertions(+), 14 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-3-report.md b/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-3-report.md
+new file mode 100644
+index 0000000..e7e4278
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-3-report.md
+@@ -0,0 +1,261 @@
++# Task 3 Report: Device descriptor-indexing enablement + BindlessTable
++
++## Summary
++
++Implemented the full Task 3 scope: `Device::create()` now chains a
++`VkPhysicalDeviceVulkan12Features` (via vk-bootstrap's
++`set_required_features_12`) enabling exactly the ten descriptor-indexing
++bits named in the brief, with a new diagnostic (`logDescriptorIndexingFeatureGaps`)
++that turns a physical-device-selection failure into a loud, per-device,
++per-feature-name error instead of vk-bootstrap's generic "no suitable
++device" message. `rx::rhi::BindlessTable` (`bindless.h`/`bindless.cpp`) is
++the engine's global bindless descriptor set: one update-after-bind
++`VkDescriptorSetLayout`/pool/`VkDescriptorSet` with three runtime-array
++bindings (sampled images, samplers, storage buffers), generational
++`BindlessHandle`s built on `rx::core::HandlePool`, and a documented
++release-safety contract. All four brief-mandated test scenarios pass in a
++new `bindless_test.cpp` joining `rx_rhi_vk_tests`. Full `ctest` is green
++(6/6) on linux-native; `windows-cross-zig` configures and builds clean
++including the new files.
++
++## Implementation
++
++### 1. Device feature enablement (`device.cpp`)
++
++Added a `VkPhysicalDeviceVulkan12Features` with exactly the ten bits from
++the brief (`descriptorIndexing`, `runtimeDescriptorArray`,
++`descriptorBindingPartiallyBound`, `descriptorBindingVariableDescriptorCount`,
++`descriptorBindingSampledImageUpdateAfterBind`,
++`descriptorBindingStorageImageUpdateAfterBind`,
++`descriptorBindingStorageBufferUpdateAfterBind`,
++`descriptorBindingUpdateUnusedWhilePending`,
++`shaderSampledImageArrayNonUniformIndexing`,
++`shaderStorageBufferArrayNonUniformIndexing`), chained via
++`.set_required_features_12(features12)` alongside the existing
++`features11`/`features13` chains — same pattern already established there.
++
++For the "selection failure = loud startup error naming the missing
++feature" requirement: vk-bootstrap's own selection error never names a
++specific missing feature bit, so `logDescriptorIndexingFeatureGaps()`
++(anonymous namespace, called only on `select()` failure) enumerates every
++physical device the instance can see, queries each one's real
++`VkPhysicalDeviceVulkan12Features` via `vkGetPhysicalDeviceFeatures2`, and
++logs one `RX_LOG_ERROR` per device per missing feature, by name. A single
++shared table (`kRequiredDescriptorIndexingFeatures`, name + accessor
++function pointer) is used both to build this diagnostic and to keep it
++from silently drifting out of sync with the ten enabled bits (adding an
++eleventh feature to one list without the other would be a compile-time
++array-size mismatch if someone forgets, though nothing currently enforces
++that beyond code review — flagged as a minor sharp edge in Concerns
++below). If no visible device is actually missing any of the ten bits, the
++diagnostic says so explicitly rather than staying silent, so a selection
++failure caused by something else (surface support, queue families, the
++1.1/1.3 feature sets, API version) doesn't get misattributed.
++
++This path could not be exercised by an automated test in this environment:
++the two available real devices (this machine's NVIDIA RTX 2080 proprietary
++driver, and llvmpipe/lavapipe under the same instance) both support every
++required bit, and the brief's own Tests section only mandates the
++BindlessTable-capacity failure path, not a device-selection failure.
++Verified the formatting mechanics directly instead (a standalone throwaway
++program confirmed `VkPhysicalDeviceProperties::deviceName`, a raw
++`char[256]`, formats correctly through spdlog/fmt) and by code review; a
++real missing-feature run has not been observed end to end.
++
++### 2. `rx::rhi::BindlessTable` (`bindless.h` / `bindless.cpp`)
++
++One descriptor set (set 0) built directly by `BindlessTable::create()`
++(its own pool + layout, not routed through `PipelineLayoutBuilder`, per the
++as-built context): binding 0 = `VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE`, binding
++1 = `VK_DESCRIPTOR_TYPE_SAMPLER`, binding 2 =
++`VK_DESCRIPTOR_TYPE_STORAGE_BUFFER`, all three
++`PARTIALLY_BOUND_BIT | UPDATE_AFTER_BIND_BIT`, binding 2 (the last, the
++only legal position) additionally `VARIABLE_DESCRIPTOR_COUNT_BIT`; set
++layout carries `UPDATE_AFTER_BIND_POOL_BIT`; pool carries
++`UPDATE_AFTER_BIND_BIT`; the descriptor set is allocated with
++`VkDescriptorSetVariableDescriptorCountAllocateInfo` supplying the exact
++`storageBuffers` capacity for binding 2.
++
++`BindlessHandle` carries a `BindlessResourceKind` tag alongside
++`(index, generation)` so one handle type can serve all three
++`register*()`/`release()` calls while each resource class keeps its own
++independent generation sequence internally — implemented as three private
++`rx::core::HandlePool<Tag, EmptyPayload>` members (one tag struct per
++resource kind), reusing `HandlePool` exactly as directed rather than
++reinventing generational bookkeeping. `HandlePool` has no built-in capacity
++cap (it always grows), so each `register*()` checks the returned index
++against that resource class's fixed capacity, and — since this can only
++happen if a caller genuinely over-registers beyond the table's configured
++size — immediately releases the phantom slot back and returns an invalid
++handle with a logged error, rather than writing an out-of-range
++`dstArrayElement`.
++
++Writes go straight to the GPU-visible set via `vkUpdateDescriptorSets` on
++every successful `register*()` call. `release()` only returns the slot to
++its pool's free list; it never touches the descriptor's GPU-visible
++contents or the underlying resource. The header's "RELEASE-SAFETY
++CONTRACT" section documents this explicitly, including that in-flight
++safety for the underlying `VkImageView`/`VkSampler`/`VkBuffer` (as opposed
++to this table's own index bookkeeping, which is safe immediately) is
++Task 4's `DeletionQueue` responsibility, per the as-built context.
++
++**Capacity pre-check against real device limits.** `create()` queries
++`VkPhysicalDeviceVulkan12Properties` via `vkGetPhysicalDeviceProperties2`
++and rejects (before touching any Vulkan object) any requested capacity
++exceeding this device's real
++`maxDescriptorSetUpdateAfterBind{SampledImages,Samplers,StorageBuffers}`,
++logging exactly which capacity and by how much. Also rejects any
++zero-valued capacity (a `VkDescriptorPoolSize`/binding with
++`descriptorCount == 0` is not how this table's fixed three-binding layout
++expresses "unused").
++
++### 3. Tests (`bindless_test.cpp`, joins `rx_rhi_vk_tests`)
++
++Local headless-device fixture (`makeHeadlessBindlessFixture`), matching
++`pipeline_layout_test.cpp`'s established per-file-duplication pattern —
++Vulkan 1.2 descriptor-indexing features *and* Vulkan 1.3
++`dynamicRendering`/`synchronization2` (the latter needed because this
++file's real-resource helper calls `rx::rhi::transitionImage()`, which
++records a `vkCmdPipelineBarrier2` requiring the feature — discovered by a
++real validation error on first run, fixed by adding the
++`features13`/`set_required_features_13` chain `pipeline_layout_test.cpp`
++didn't need).
++
++Four `TEST_CASE`s, each building its own table/device (doctest cases don't
++share state):
++1. `create()` with capacities 1024/16/256 → non-null layout/set; register a
++   real 1x1 sampled image + sampler (raw Vulkan, transitioned to
++   `SHADER_READ_ONLY_OPTIMAL` via `CommandContext`) + a real storage
++   buffer (via `Allocator::createHostVisibleBuffer`) → all three handles
++   valid, index 0, generation 1; zero validation errors.
++2. Register/release/re-register cycles: three sampled-image registrations
++   → indices 0/1/2 gen 1; release index 1, re-register → reuses index 1 at
++   generation 2 (`HandlePool`'s LIFO free list); double-release is a
++   verified no-op; a subsequent fresh registration lands on index 3, not a
++   stale slot.
++3. A minimal `VkPipelineLayout` built directly from the table's own
++   `descriptorSetLayout()` (structurally guaranteed compatible), then
++   `vkCmdBindDescriptorSets` in a `CommandContext::runOnce` with no pipeline
++   bound and no draw/dispatch recorded → validation clean.
++4. Queries the real `maxDescriptorSetUpdateAfterBindSampledImages` at
++   runtime and requests exactly `limit + 1` for `sampledImages` → `create()`
++   returns `std::nullopt` with a logged error, zero validation errors
++   (guards the RADV-sentinel edge case: if a future run reports the
++   unbounded `UINT32_MAX` limit, the test explicitly notes the path is
++   unexercisable there rather than asserting something false).
++
++All existing Phase 1/2 tests in this binary (context/device/buffer/
++clear_color/frame_sync/pipeline_layout) still pass unchanged — the Device
++change is additive.
++
++## Verification
++
++- **linux-native:** full build clean; `ctest`: **6/6 pass**
++  (`shader_spirv_test`, `rx_core_tests`, `rx_platform_tests`,
++  `rx_shader_tests`, `rx_rhi_vk_tests`, `sample_01_triangle_headless`).
++  `rx_rhi_vk_tests` run directly: **12 test cases / 195 assertions, all
++  passing, 0 failed.** The only `[error]`-level log lines in a full run are
++  the two deliberately-exercised clean-rejection paths (this task's
++  absurd-capacity case, and Task 2's pre-existing oversized-push-constant
++  case) — both expected, both `std::nullopt` returns, neither a validation
++  error. `hasValidationErrors()` is `false` on every `TEST_CASE` in this
++  file.
++- **windows-cross-zig:** configure + full build clean, including
++  `bindless.cpp`/`bindless_test.cpp` compiling and `rx_rhi_vk_tests.exe`
++  linking successfully via zig/LLD.
++- Commit hygiene: plain commit message, no AI attribution trailer —
++  verified directly with `git log -1 --format='%B'` after committing.
++
++## Deviations from brief / spec
++
++1. **`BindlessTable::create()` takes `VkPhysicalDevice` in addition to
++   `VkDevice`** — the brief's shorthand signature is
++   `create(VkDevice, capacities) -> std::optional<BindlessTable>`. The
++   brief's own required test ("absurd capacity ... → clean error, no
++   crash") cannot be implemented as a *clean* error without a way to check
++   the request against the device's real
++   `maxDescriptorSetUpdateAfterBind*` limits before issuing any Vulkan
++   call — letting `vkCreateDescriptorSetLayout`/`vkCreateDescriptorPool`
++   fail on an over-limit request instead would depend on
++   driver/validation-layer behavior this engine has no contract with (and
++   would risk counting as a validation error rather than a clean
++   application-level rejection). Adding the physical-device handle was the
++   only way found to satisfy the literal test requirement; this is a
++   signature elaboration, not a Fixed Decision change — the spec's Fixed
++   decision #5 pins the architecture (one set, three runtime-array
++   bindings, the flag combination, index-in-push-constants), not this
++   static factory's exact parameter list. No coordinator sign-off sought
++   given the constraint left no alternative and nothing in the Fixed
++   Decisions relitigates.
++2. **`registerStorageBuffer`'s parameter order is `(buffer, range, offset = 0)`**,
++   not literally the brief's two-token shorthand `(VkBuffer, range)` —
++   `offset` added as a defaulted trailing parameter so the common
++   two-argument call form the brief describes still works, while allowing
++   a non-zero offset when a caller needs one (unavoidable for a real
++   sub-allocated buffer later in the phase).
++3. Everything else matches the brief's interfaces exactly: capacities
++   struct shape, `descriptorSetLayout()`/`descriptorSet()` accessors,
++   `registerSampledImage`/`registerSampler` signatures,
++   `BindlessHandle::index()`, generational semantics, exact feature list
++   enabled via `set_required_features_12`.
++
++## Concerns for the coordinator
++
++1. **The device-selection-failure diagnostic path is implemented but not
++   exercised by any test** (see Implementation §1) — no available device
++   in this environment lacks any of the ten required features, and it
++   isn't in the brief's Tests section. Confirmed the string-formatting
++   mechanics work correctly in isolation; a real end-to-end
++   missing-feature run has not been observed. Low risk (the logic is
++   straightforward vkGetPhysicalDeviceFeatures2 + table walk) but worth
++   knowing the exact scenario has never actually printed for real.
++2. **`kRequiredDescriptorIndexingFeatures` (the diagnostic's name/accessor
++   table) and the `features12.xxx = VK_TRUE` block are two hand-maintained
++   lists of the same ten names** — nothing enforces they stay in sync
++   beyond code review; a future feature addition/removal needs both
++   updated together. Considered generating one from the other but found no
++   clean way to do so without reflection-like machinery disproportionate
++   to ten bools; flagging rather than over-engineering.
++3. Per the as-built context, `BindlessTable`'s set-0 layout is intentionally
++   separate from (and must stay binding-for-binding compatible with)
++   whatever `PipelineLayoutBuilder`/`reflect()` produces for a real
++   shader's set 0 — this task does not itself prove that compatibility
++   end-to-end (no sample/shader exists yet); that proof is explicitly
++   deferred to Task 6 per the as-built context, unchanged from the brief.
++4. Zero-capacity rejection and the per-resource-class capacity-exhaustion
++   guard in `register*()` are defensive additions beyond the brief's
++   explicit test list — not spec deviations (they don't change the
++   architecture), but worth a look since they're new failure surfaces this
++   task introduced without a dedicated test-per-guard (the capacity
++   pre-check *is* tested via the absurd-capacity case; the zero-capacity
++   guard and the register-time exhaustion guard are exercised only by code
++   review, since no test in the brief calls for either).
++
++## Files created
++
++- `src/rx_rhi_vk/include/rx_rhi_vk/bindless.h`
++- `src/rx_rhi_vk/src/bindless.cpp`
++- `src/rx_rhi_vk/tests/bindless_test.cpp`
++
++## Files modified
++
++- `src/rx_rhi_vk/src/device.cpp` (`VkPhysicalDeviceVulkan12Features` chain
++  via `set_required_features_12`; `logDescriptorIndexingFeatureGaps`
++  diagnostic on selection failure)
++- `src/rx_rhi_vk/CMakeLists.txt` (+`src/bindless.cpp` in the `rx_rhi_vk`
++  library; +`tests/bindless_test.cpp` in the existing `rx_rhi_vk_tests`
++  binary, comment updated for the seventh test TU)
++
++## Readiness for Task 4
++
++`BindlessTable::release()`'s documented contract ("returns the index slot
++immediately; never touches the underlying GPU resource; in-flight
++resource-destruction safety is DeletionQueue's job") is exactly the seam
++Task 4's `DeletionQueue` needs to close: a real eviction flow will call
++`BindlessTable::release(handle)` for the bookkeeping and separately retire
++the actual `VkImageView`/`VkSampler`/`VkBuffer` destruction through
++`DeletionQueue`, keyed on the frame fence, per the spec's Fixed decision
++#9. `Device::create()` now enables every descriptor-indexing feature
++`BindlessTable` needs process-wide, so Task 4/5/6 code building a real
++windowed `Device` gets a table-ready device with no further feature
++plumbing.
+diff --git a/src/rx_rhi_vk/CMakeLists.txt b/src/rx_rhi_vk/CMakeLists.txt
+index 720d957..6a5b2d8 100644
+--- a/src/rx_rhi_vk/CMakeLists.txt
++++ b/src/rx_rhi_vk/CMakeLists.txt
+@@ -9,52 +9,58 @@
+ # entire program (see that file); every other consumer of VMA
+ # (src/buffer.cpp, include/rx_rhi_vk/buffer.h) only ever declares against
+ # vk_mem_alloc.h, never redefines VMA_IMPLEMENTATION.
+ add_library(rx_rhi_vk STATIC
+     src/context.cpp
+     src/device.cpp
+     src/buffer.cpp
+     src/command.cpp
+     src/frame_sync.cpp
+     src/pipeline_layout.cpp
++    src/bindless.cpp
+     src/vma_impl.cpp
+     ${volk_SOURCE_DIR}/volk.c
+ )
+ target_include_directories(rx_rhi_vk PUBLIC include ${volk_SOURCE_DIR} ${vma_SOURCE_DIR}/include)
+ # rx_shader_layout_types (defined in src/rx_shader/CMakeLists.txt) is a
+ # header-only INTERFACE target exposing ONLY rx_shader's plain-data
+ # shader_layout_info.h -- never `rx_shader` itself, which would drag
+ # slang::slang (a real link dependency, plus every other rx_shader header)
+ # into this library. See pipeline_layout.h's own comment for why
+ # PipelineLayoutBuilder needs `rx::shader::ShaderLayoutInfo` without any of
+ # that.
+ target_link_libraries(rx_rhi_vk PUBLIC rx_core vk-bootstrap::vk-bootstrap rx_shader_layout_types)
+ target_compile_definitions(rx_rhi_vk PUBLIC VK_NO_PROTOTYPES)
+ 
+-# Six test translation units now (context_test.cpp, device_test.cpp,
++# Seven test translation units now (context_test.cpp, device_test.cpp,
+ # buffer_test.cpp, clear_color_test.cpp, frame_sync_test.cpp,
+-# pipeline_layout_test.cpp), so -- like rx_core_tests, and unlike this
+-# target before device_test.cpp existed -- doctest's runtime/main is
+-# implemented once in a dedicated tests/doctest_main.cpp shared by all six,
+-# rather than in any one test file. doctest_main.cpp also links rx_platform:
+-# it uses rx::platform::Window to warm up a real vk-bootstrap hazard before
+-# any TEST_CASE runs (see the comment there) -- so test order here is not
+-# load-bearing, deliberately; no --order-by is needed on the add_test line
+-# below. clear_color_test.cpp and pipeline_layout_test.cpp in particular are
+-# pure headless (no window/surface/swapchain) and rely on that warm-up to be
++# pipeline_layout_test.cpp, bindless_test.cpp), so -- like rx_core_tests,
++# and unlike this target before device_test.cpp existed -- doctest's
++# runtime/main is implemented once in a dedicated tests/doctest_main.cpp
++# shared by all seven, rather than in any one test file. doctest_main.cpp
++# also links rx_platform: it uses rx::platform::Window to warm up a real
++# vk-bootstrap hazard before any TEST_CASE runs (see the comment there) --
++# so test order here is not load-bearing, deliberately; no --order-by is
++# needed on the add_test line below. clear_color_test.cpp,
++# pipeline_layout_test.cpp, and bindless_test.cpp in particular are pure
++# headless (no window/surface/swapchain) and rely on that warm-up to be
+ # safe regardless of where doctest schedules them relative to the windowed
+ # tests -- see the Phase 2 plan's Global Constraints on the vk-bootstrap
+-# landmine: pipeline_layout_test.cpp builds its own headless device (to
+-# enable the descriptor-indexing device features Task 3 will later make
+-# process-wide), and joining THIS binary rather than a new one is what keeps
+-# it protected by the warm-up above instead of needing to reimplement it.
++# landmine: both pipeline_layout_test.cpp and bindless_test.cpp build their
++# own headless device (the latter to exercise BindlessTable's descriptor-
++# indexing requirements independent of whether Device::create() itself --
++# which now also enables these features process-wide, see device.cpp --
++# happens to run first in this binary), and joining THIS binary rather than
++# a new one is what keeps them protected by the warm-up above instead of
++# needing to reimplement it.
+ add_executable(rx_rhi_vk_tests
+     tests/doctest_main.cpp
+     tests/context_test.cpp
+     tests/device_test.cpp
+     tests/buffer_test.cpp
+     tests/clear_color_test.cpp
+     tests/frame_sync_test.cpp
+     tests/pipeline_layout_test.cpp
++    tests/bindless_test.cpp
+ )
+ target_link_libraries(rx_rhi_vk_tests PRIVATE rx_rhi_vk rx_platform doctest::doctest)
+ add_test(NAME rx_rhi_vk_tests COMMAND rx_rhi_vk_tests)
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/bindless.h b/src/rx_rhi_vk/include/rx_rhi_vk/bindless.h
+new file mode 100644
+index 0000000..6a65e23
+--- /dev/null
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/bindless.h
+@@ -0,0 +1,213 @@
++#pragma once
++#include <volk.h>
++#include <rx_core/handle.h>
++#include <cstdint>
++#include <optional>
++
++namespace rx::rhi {
++
++// Which of BindlessTable's three resource-class arrays a BindlessHandle
++// indexes into. Needed because register*()/release() share one handle type
++// (per the interface this component is built to) even though each resource
++// class keeps its own independent index/generation sequence internally
++// (see BindlessTable's private rx::core::HandlePool members) -- without
++// this tag, release() would have no way to know which pool a given
++// (index, generation) pair belongs to.
++enum class BindlessResourceKind : uint8_t {
++    SampledImage,
++    Sampler,
++    StorageBuffer,
++};
++
++namespace detail {
++
++// Trivial per-resource-kind tags handed to rx::core::HandlePool/Handle so
++// each resource class gets its own independent generation sequence (a
++// sampled-image slot 3/generation 2 and a storage-buffer slot 3/generation
++// 2 must never compare equal or be confused with each other). No payload
++// data is actually needed per slot -- BindlessTable writes straight
++// through to the GPU-visible VkDescriptorSet via vkUpdateDescriptorSets,
++// so HandlePool here is used purely for its generational index-allocation
++// bookkeeping, not as storage for the registered resource itself.
++struct SampledImageSlotTag {};
++struct SamplerSlotTag {};
++struct StorageBufferSlotTag {};
++struct EmptyPayload {};
++
++}  // namespace detail
++
++// A generational handle into one of BindlessTable's three bindless arrays.
++// `index()` is the shader-visible array index -- the value to embed in a
++// push constant / indirection buffer for `ResourceDescriptorHeap`-style
++// indexing in the shader. `generation()` distinguishes a live registration
++// from a stale handle pointing at an already-released-and-reused slot,
++// mirroring rx::core::Handle<Tag>'s own scheme (which this type wraps
++// internally, once per resource kind -- see BindlessTable).
++//
++// Default-constructed handles are invalid (`isValid() == false`,
++// `generation() == 0`); every handle actually returned by a successful
++// register*() call has `generation() >= 1`. register*() also returns an
++// invalid handle (logging an error) if the requested resource class's
++// capacity is already exhausted -- callers must check `isValid()` before
++// using a handle's index for anything.
++class BindlessHandle {
++public:
++    BindlessHandle() = default;
++
++    uint32_t index() const { return index_; }
++    uint32_t generation() const { return generation_; }
++    BindlessResourceKind kind() const { return kind_; }
++    bool isValid() const { return generation_ != 0; }
++
++    bool operator==(const BindlessHandle& other) const {
++        return kind_ == other.kind_ && index_ == other.index_ && generation_ == other.generation_;
++    }
++    bool operator!=(const BindlessHandle& other) const { return !(*this == other); }
++
++private:
++    friend class BindlessTable;
++
++    BindlessHandle(BindlessResourceKind kind, uint32_t index, uint32_t generation)
++        : kind_(kind), index_(index), generation_(generation) {}
++
++    BindlessResourceKind kind_ = BindlessResourceKind::SampledImage;
++    uint32_t index_ = 0;
++    uint32_t generation_ = 0;
++};
++
++// BindlessTable -- the engine's single global bindless descriptor set
++// (set 0), per the spec's Fixed decision #5 [R:B3]: one
++// VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT set layout,
++// one VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT pool, one allocated
++// VkDescriptorSet, with three runtime-array bindings:
++//   binding 0 (kSampledImageBinding)  -- VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
++//   binding 1 (kSamplerBinding)       -- VK_DESCRIPTOR_TYPE_SAMPLER
++//   binding 2 (kStorageBufferBinding) -- VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
++// Every binding carries VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
++// VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT; binding 2, being the LAST
++// binding in the set (the only position Vulkan allows this flag), also
++// carries VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT, and the
++// descriptor set is allocated with exactly `capacities.storageBuffers`
++// actual descriptors for that binding via
++// VkDescriptorSetVariableDescriptorCountAllocateInfo.
++//
++// This is a separate, self-owned set layout from PipelineLayoutBuilder's
++// reflection-driven ones (Task 2) -- BindlessTable owns set 0's actual
++// pool/set here; a shader's own reflected set-0 layout must match this
++// table's layout by construction (same binding numbers/types/flags) for a
++// pipeline built from that reflection to be usable with this table's
++// VkDescriptorSet, which is what a later sample proves end to end.
++//
++// ---------------------------------------------------------------------
++// RELEASE-SAFETY CONTRACT -- read before calling release():
++// ---------------------------------------------------------------------
++// release() only returns a slot's (index, generation) pair to this
++// table's internal free list for a FUTURE register*() call to reuse -- it
++// never itself issues a vkUpdateDescriptorSets call, and it never touches
++// (let alone destroys) the underlying VkImageView/VkSampler/VkBuffer that
++// slot was last written with. A released slot's descriptor binding keeps
++// whatever it was last written with, completely unchanged, until
++// something re-registers into that same index.
++//
++// This table only ever stores an index -> descriptor mapping; it never
++// takes ownership of the VkImageView/VkSampler/VkBuffer handles passed to
++// register*(). UPDATE_AFTER_BIND + PARTIALLY_BOUND together make it valid
++// to rewrite a descriptor in a set that is already bound by a command
++// buffer the driver has not finished executing, and make it valid for a
++// bound set to contain slots no shader access ever touches -- but neither
++// flag makes it safe to destroy the GPU resource a slot's descriptor still
++// points at while a command buffer that might read that slot could still
++// be in flight. Guaranteeing that (deferring the real resource destruction
++// until the owning frame's fence has signaled) is explicitly out of scope
++// for this type -- it is Task 4's DeletionQueue's job. Callers must not
++// destroy a registered resource, nor treat release() as a synchronization
++// point for it, until they know (via DeletionQueue or an equivalent
++// fence wait) that no in-flight frame can still reference that slot.
++class BindlessTable {
++public:
++    struct Capacities {
++        uint32_t sampledImages = 0;
++        uint32_t samplers = 0;
++        uint32_t storageBuffers = 0;
++    };
++
++    static constexpr uint32_t kSampledImageBinding = 0;
++    static constexpr uint32_t kSamplerBinding = 1;
++    static constexpr uint32_t kStorageBufferBinding = 2;
++
++    BindlessTable(BindlessTable&&) noexcept;
++    BindlessTable& operator=(BindlessTable&&) noexcept;
++    BindlessTable(const BindlessTable&) = delete;
++    BindlessTable& operator=(const BindlessTable&) = delete;
++    ~BindlessTable();
++
++    // Builds the set layout + update-after-bind pool + descriptor set
++    // described above.
++    //
++    // `physicalDevice` is used ONLY to defensively pre-check each
++    // requested capacity against this device's real
++    // maxDescriptorSetUpdateAfterBind{SampledImages,Samplers,
++    // StorageBuffers} limits (queried via vkGetPhysicalDeviceProperties2's
++    // VkPhysicalDeviceVulkan12Properties) before issuing a single Vulkan
++    // call -- exceeding one is rejected here as a clean, logged
++    // std::nullopt, never left to whatever a driver/validation layer does
++    // when handed a descriptor set layout/pool request beyond its own
++    // advertised limit. This is a deliberate elaboration of the
++    // VkDevice-only shorthand in this component's brief: the capacity
++    // failure path this class is required to support cannot be
++    // implemented as "clean error, no crash" without a physical-device
++    // handle to check limits against (see task-3-report.md).
++    //
++    // Also rejects (nullopt, logged) if any capacity is 0 -- a
++    // VkDescriptorPoolSize/VkDescriptorSetLayoutBinding with
++    // descriptorCount == 0 is not a valid way to express "this resource
++    // class is unused" for this table's fixed three-binding layout.
++    static std::optional<BindlessTable> create(VkPhysicalDevice physicalDevice, VkDevice device,
++                                                 Capacities capacities);
++
++    VkDescriptorSetLayout descriptorSetLayout() const { return setLayout_; }
++    VkDescriptorSet descriptorSet() const { return set_; }
++
++    // Registers `view` (already expected to be in `layout`, e.g.
++    // VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) at a free index in
++    // binding 0 and writes it immediately via vkUpdateDescriptorSets.
++    // Returns an invalid handle (and logs an error) if this table's
++    // sampled-image capacity is already fully occupied.
++    BindlessHandle registerSampledImage(VkImageView view, VkImageLayout layout);
++
++    // Registers `sampler` at a free index in binding 1, written
++    // immediately. Returns an invalid handle (and logs an error) if this
++    // table's sampler capacity is already fully occupied.
++    BindlessHandle registerSampler(VkSampler sampler);
++
++    // Registers `range` bytes of `buffer` starting at `offset` at a free
++    // index in binding 2, written immediately. Returns an invalid handle
++    // (and logs an error) if this table's storage-buffer capacity is
++    // already fully occupied.
++    BindlessHandle registerStorageBuffer(VkBuffer buffer, VkDeviceSize range, VkDeviceSize offset = 0);
++
++    // Returns `handle`'s slot to the relevant resource class's free list
++    // for future reuse. See the RELEASE-SAFETY CONTRACT above -- this does
++    // NOT touch the descriptor's current GPU-visible contents, and does
++    // NOT destroy or otherwise affect the resource `handle` was registered
++    // with. A no-op (logs nothing) if `handle` is invalid or already
++    // stale/released.
++    void release(BindlessHandle handle);
++
++private:
++    BindlessTable() = default;
++
++    void destroyAll();
++
++    VkDevice device_ = VK_NULL_HANDLE;
++    VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
++    VkDescriptorPool pool_ = VK_NULL_HANDLE;
++    VkDescriptorSet set_ = VK_NULL_HANDLE;
++    Capacities capacities_;
++
++    rx::core::HandlePool<detail::SampledImageSlotTag, detail::EmptyPayload> sampledImages_;
++    rx::core::HandlePool<detail::SamplerSlotTag, detail::EmptyPayload> samplers_;
++    rx::core::HandlePool<detail::StorageBufferSlotTag, detail::EmptyPayload> storageBuffers_;
++};
++
++}  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/bindless.cpp b/src/rx_rhi_vk/src/bindless.cpp
+new file mode 100644
+index 0000000..893b9aa
+--- /dev/null
++++ b/src/rx_rhi_vk/src/bindless.cpp
+@@ -0,0 +1,320 @@
++#include <rx_rhi_vk/bindless.h>
++
++#include <rx_core/log.h>
++
++#include <array>
++#include <utility>
++
++namespace rx::rhi {
++
++namespace {
++
++// Every binding in this table's set is update-after-bind + partially-bound;
++// only the last binding (kStorageBufferBinding) may additionally carry
++// VARIABLE_DESCRIPTOR_COUNT -- Vulkan requires that flag be used on at most
++// the final binding of a set (VUID-VkDescriptorSetLayoutCreateInfo-pNext
++// via VkDescriptorSetLayoutBindingFlagsCreateInfo's own documented
++// constraint).
++constexpr VkDescriptorBindingFlags kCommonBindingFlags =
++    VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
++
++void destroyPoolAndLayout(VkDevice device, VkDescriptorPool pool, VkDescriptorSetLayout setLayout) {
++    if (pool != VK_NULL_HANDLE) {
++        // Destroying the pool implicitly frees the one VkDescriptorSet
++        // allocated from it -- this table's pool is never created with
++        // VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, so there is no
++        // separate vkFreeDescriptorSets step.
++        vkDestroyDescriptorPool(device, pool, nullptr);
++    }
++    if (setLayout != VK_NULL_HANDLE) {
++        vkDestroyDescriptorSetLayout(device, setLayout, nullptr);
++    }
++}
++
++}  // namespace
++
++BindlessTable::BindlessTable(BindlessTable&& other) noexcept : BindlessTable() {
++    *this = std::move(other);
++}
++
++BindlessTable& BindlessTable::operator=(BindlessTable&& other) noexcept {
++    if (this != &other) {
++        destroyAll();
++
++        device_ = other.device_;
++        setLayout_ = other.setLayout_;
++        pool_ = other.pool_;
++        set_ = other.set_;
++        capacities_ = other.capacities_;
++        sampledImages_ = std::move(other.sampledImages_);
++        samplers_ = std::move(other.samplers_);
++        storageBuffers_ = std::move(other.storageBuffers_);
++
++        other.device_ = VK_NULL_HANDLE;
++        other.setLayout_ = VK_NULL_HANDLE;
++        other.pool_ = VK_NULL_HANDLE;
++        other.set_ = VK_NULL_HANDLE;
++        other.capacities_ = Capacities{};
++    }
++    return *this;
++}
++
++BindlessTable::~BindlessTable() {
++    destroyAll();
++}
++
++void BindlessTable::destroyAll() {
++    destroyPoolAndLayout(device_, pool_, setLayout_);
++}
++
++std::optional<BindlessTable> BindlessTable::create(VkPhysicalDevice physicalDevice, VkDevice device,
++                                                     Capacities capacities) {
++    // --- Zero-capacity guard -------------------------------------------
++    if (capacities.sampledImages == 0 || capacities.samplers == 0 || capacities.storageBuffers == 0) {
++        RX_LOG_ERROR(
++            "rx::rhi::BindlessTable::create: all three capacities must be > 0 (got sampledImages={}, "
++            "samplers={}, storageBuffers={}); a zero-count binding is not a valid way to express "
++            "\"unused\" in this table's fixed three-binding layout",
++            capacities.sampledImages, capacities.samplers, capacities.storageBuffers);
++        return std::nullopt;
++    }
++
++    // --- Defensive capacity pre-check against real device limits -------
++    // Done BEFORE any Vulkan object is created: an absurd capacity request
++    // (far beyond what this physical device actually supports) must fail
++    // as a clean, logged std::nullopt here, not as a validation error or
++    // driver-dependent behavior from vkCreateDescriptorSetLayout/
++    // vkCreateDescriptorPool.
++    VkPhysicalDeviceVulkan12Properties props12{};
++    props12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES;
++    VkPhysicalDeviceProperties2 props2{};
++    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
++    props2.pNext = &props12;
++    vkGetPhysicalDeviceProperties2(physicalDevice, &props2);
++
++    struct CapacityCheck {
++        uint32_t requested;
++        uint32_t limit;
++        const char* capacityName;
++        const char* limitName;
++    };
++    const std::array<CapacityCheck, 3> checks{{
++        {capacities.sampledImages, props12.maxDescriptorSetUpdateAfterBindSampledImages, "sampledImages",
++         "maxDescriptorSetUpdateAfterBindSampledImages"},
++        {capacities.samplers, props12.maxDescriptorSetUpdateAfterBindSamplers, "samplers",
++         "maxDescriptorSetUpdateAfterBindSamplers"},
++        {capacities.storageBuffers, props12.maxDescriptorSetUpdateAfterBindStorageBuffers, "storageBuffers",
++         "maxDescriptorSetUpdateAfterBindStorageBuffers"},
++    }};
++    for (const auto& check : checks) {
++        if (check.requested > check.limit) {
++            RX_LOG_ERROR(
++                "rx::rhi::BindlessTable::create: requested {} capacity {} exceeds this device's {} limit "
++                "of {}; rejecting",
++                check.capacityName, check.requested, check.limitName, check.limit);
++            return std::nullopt;
++        }
++    }
++
++    // --- Set layout ------------------------------------------------------
++    std::array<VkDescriptorSetLayoutBinding, 3> bindings{};
++    bindings[0].binding = kSampledImageBinding;
++    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
++    bindings[0].descriptorCount = capacities.sampledImages;
++    bindings[0].stageFlags = VK_SHADER_STAGE_ALL;
++
++    bindings[1].binding = kSamplerBinding;
++    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
++    bindings[1].descriptorCount = capacities.samplers;
++    bindings[1].stageFlags = VK_SHADER_STAGE_ALL;
++
++    bindings[2].binding = kStorageBufferBinding;
++    bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++    bindings[2].descriptorCount = capacities.storageBuffers;
++    bindings[2].stageFlags = VK_SHADER_STAGE_ALL;
++
++    std::array<VkDescriptorBindingFlags, 3> bindingFlags{
++        kCommonBindingFlags, kCommonBindingFlags, kCommonBindingFlags | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT};
++
++    VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo{};
++    flagsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
++    flagsInfo.bindingCount = static_cast<uint32_t>(bindingFlags.size());
++    flagsInfo.pBindingFlags = bindingFlags.data();
++
++    VkDescriptorSetLayoutCreateInfo setLayoutInfo{};
++    setLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
++    setLayoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
++    setLayoutInfo.pNext = &flagsInfo;
++    setLayoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
++    setLayoutInfo.pBindings = bindings.data();
++
++    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
++    VkResult setLayoutResult = vkCreateDescriptorSetLayout(device, &setLayoutInfo, nullptr, &setLayout);
++    if (setLayoutResult != VK_SUCCESS) {
++        RX_LOG_ERROR("rx::rhi::BindlessTable::create: vkCreateDescriptorSetLayout failed: VkResult={}",
++                     static_cast<int>(setLayoutResult));
++        return std::nullopt;
++    }
++
++    // --- Update-after-bind pool ------------------------------------------
++    std::array<VkDescriptorPoolSize, 3> poolSizes{};
++    poolSizes[0] = {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, capacities.sampledImages};
++    poolSizes[1] = {VK_DESCRIPTOR_TYPE_SAMPLER, capacities.samplers};
++    poolSizes[2] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, capacities.storageBuffers};
++
++    VkDescriptorPoolCreateInfo poolInfo{};
++    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
++    poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
++    poolInfo.maxSets = 1;
++    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
++    poolInfo.pPoolSizes = poolSizes.data();
++
++    VkDescriptorPool pool = VK_NULL_HANDLE;
++    VkResult poolResult = vkCreateDescriptorPool(device, &poolInfo, nullptr, &pool);
++    if (poolResult != VK_SUCCESS) {
++        RX_LOG_ERROR("rx::rhi::BindlessTable::create: vkCreateDescriptorPool failed: VkResult={}",
++                     static_cast<int>(poolResult));
++        vkDestroyDescriptorSetLayout(device, setLayout, nullptr);
++        return std::nullopt;
++    }
++
++    // --- Descriptor set (variable count on the last binding) -------------
++    VkDescriptorSetVariableDescriptorCountAllocateInfo variableCountInfo{};
++    variableCountInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO;
++    variableCountInfo.descriptorSetCount = 1;
++    variableCountInfo.pDescriptorCounts = &capacities.storageBuffers;
++
++    VkDescriptorSetAllocateInfo allocInfo{};
++    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
++    allocInfo.pNext = &variableCountInfo;
++    allocInfo.descriptorPool = pool;
++    allocInfo.descriptorSetCount = 1;
++    allocInfo.pSetLayouts = &setLayout;
++
++    VkDescriptorSet set = VK_NULL_HANDLE;
++    VkResult allocResult = vkAllocateDescriptorSets(device, &allocInfo, &set);
++    if (allocResult != VK_SUCCESS) {
++        RX_LOG_ERROR("rx::rhi::BindlessTable::create: vkAllocateDescriptorSets failed: VkResult={}",
++                     static_cast<int>(allocResult));
++        destroyPoolAndLayout(device, pool, setLayout);
++        return std::nullopt;
++    }
++
++    BindlessTable table;
++    table.device_ = device;
++    table.setLayout_ = setLayout;
++    table.pool_ = pool;
++    table.set_ = set;
++    table.capacities_ = capacities;
++    return table;
++}
++
++BindlessHandle BindlessTable::registerSampledImage(VkImageView view, VkImageLayout layout) {
++    auto internal = sampledImages_.acquire(detail::EmptyPayload{});
++    if (internal.index() >= capacities_.sampledImages) {
++        RX_LOG_ERROR(
++            "rx::rhi::BindlessTable::registerSampledImage: sampled-image capacity ({}) already fully "
++            "occupied; rejecting",
++            capacities_.sampledImages);
++        sampledImages_.release(internal);
++        return BindlessHandle{};
++    }
++
++    VkDescriptorImageInfo imageInfo{};
++    imageInfo.sampler = VK_NULL_HANDLE;
++    imageInfo.imageView = view;
++    imageInfo.imageLayout = layout;
++
++    VkWriteDescriptorSet write{};
++    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++    write.dstSet = set_;
++    write.dstBinding = kSampledImageBinding;
++    write.dstArrayElement = internal.index();
++    write.descriptorCount = 1;
++    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
++    write.pImageInfo = &imageInfo;
++
++    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
++
++    return BindlessHandle(BindlessResourceKind::SampledImage, internal.index(), internal.generation());
++}
++
++BindlessHandle BindlessTable::registerSampler(VkSampler sampler) {
++    auto internal = samplers_.acquire(detail::EmptyPayload{});
++    if (internal.index() >= capacities_.samplers) {
++        RX_LOG_ERROR(
++            "rx::rhi::BindlessTable::registerSampler: sampler capacity ({}) already fully occupied; "
++            "rejecting",
++            capacities_.samplers);
++        samplers_.release(internal);
++        return BindlessHandle{};
++    }
++
++    VkDescriptorImageInfo imageInfo{};
++    imageInfo.sampler = sampler;
++    imageInfo.imageView = VK_NULL_HANDLE;
++    imageInfo.imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++
++    VkWriteDescriptorSet write{};
++    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++    write.dstSet = set_;
++    write.dstBinding = kSamplerBinding;
++    write.dstArrayElement = internal.index();
++    write.descriptorCount = 1;
++    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
++    write.pImageInfo = &imageInfo;
++
++    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
++
++    return BindlessHandle(BindlessResourceKind::Sampler, internal.index(), internal.generation());
++}
++
++BindlessHandle BindlessTable::registerStorageBuffer(VkBuffer buffer, VkDeviceSize range, VkDeviceSize offset) {
++    auto internal = storageBuffers_.acquire(detail::EmptyPayload{});
++    if (internal.index() >= capacities_.storageBuffers) {
++        RX_LOG_ERROR(
++            "rx::rhi::BindlessTable::registerStorageBuffer: storage-buffer capacity ({}) already fully "
++            "occupied; rejecting",
++            capacities_.storageBuffers);
++        storageBuffers_.release(internal);
++        return BindlessHandle{};
++    }
++
++    VkDescriptorBufferInfo bufferInfo{};
++    bufferInfo.buffer = buffer;
++    bufferInfo.offset = offset;
++    bufferInfo.range = range;
++
++    VkWriteDescriptorSet write{};
++    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++    write.dstSet = set_;
++    write.dstBinding = kStorageBufferBinding;
++    write.dstArrayElement = internal.index();
++    write.descriptorCount = 1;
++    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++    write.pBufferInfo = &bufferInfo;
++
++    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
++
++    return BindlessHandle(BindlessResourceKind::StorageBuffer, internal.index(), internal.generation());
++}
++
++void BindlessTable::release(BindlessHandle handle) {
++    if (!handle.isValid()) {
++        return;
++    }
++    switch (handle.kind()) {
++        case BindlessResourceKind::SampledImage:
++            sampledImages_.release(rx::core::Handle<detail::SampledImageSlotTag>(handle.index(), handle.generation()));
++            break;
++        case BindlessResourceKind::Sampler:
++            samplers_.release(rx::core::Handle<detail::SamplerSlotTag>(handle.index(), handle.generation()));
++            break;
++        case BindlessResourceKind::StorageBuffer:
++            storageBuffers_.release(
++                rx::core::Handle<detail::StorageBufferSlotTag>(handle.index(), handle.generation()));
++            break;
++    }
++}
++
++}  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/device.cpp b/src/rx_rhi_vk/src/device.cpp
+index 1ddc8d2..5f09d62 100644
+--- a/src/rx_rhi_vk/src/device.cpp
++++ b/src/rx_rhi_vk/src/device.cpp
+@@ -1,23 +1,113 @@
+ #include <rx_rhi_vk/device.h>
+ #include <rx_core/log.h>
+ #include <VkBootstrap.h>
++#include <array>
+ #include <utility>
++#include <vector>
+ 
+ namespace rx::rhi {
+ 
+ namespace {
+ 
+ void destroySurface(const Context& context, VkSurfaceKHR surface) {
+     vkb::destroy_surface(context.vkbInstance(), surface);
+ }
+ 
++// One entry per bit this Device requires from VkPhysicalDeviceVulkan12Features
++// [Phase 2 spec Fixed decision #5, R:B1/B2] -- kept as a table of
++// (name, accessor) pairs rather than ten separate `if`s so the "loud
++// startup error naming the missing feature" diagnostic below and the
++// feature-request struct below it can never silently drift apart.
++struct RequiredVulkan12Feature {
++    const char* name;
++    VkBool32 (*get)(const VkPhysicalDeviceVulkan12Features&);
++};
++
++constexpr std::array<RequiredVulkan12Feature, 10> kRequiredDescriptorIndexingFeatures{{
++    {"descriptorIndexing", [](const VkPhysicalDeviceVulkan12Features& f) { return f.descriptorIndexing; }},
++    {"runtimeDescriptorArray", [](const VkPhysicalDeviceVulkan12Features& f) { return f.runtimeDescriptorArray; }},
++    {"descriptorBindingPartiallyBound",
++     [](const VkPhysicalDeviceVulkan12Features& f) { return f.descriptorBindingPartiallyBound; }},
++    {"descriptorBindingVariableDescriptorCount",
++     [](const VkPhysicalDeviceVulkan12Features& f) { return f.descriptorBindingVariableDescriptorCount; }},
++    {"descriptorBindingSampledImageUpdateAfterBind",
++     [](const VkPhysicalDeviceVulkan12Features& f) { return f.descriptorBindingSampledImageUpdateAfterBind; }},
++    {"descriptorBindingStorageImageUpdateAfterBind",
++     [](const VkPhysicalDeviceVulkan12Features& f) { return f.descriptorBindingStorageImageUpdateAfterBind; }},
++    {"descriptorBindingStorageBufferUpdateAfterBind",
++     [](const VkPhysicalDeviceVulkan12Features& f) { return f.descriptorBindingStorageBufferUpdateAfterBind; }},
++    {"descriptorBindingUpdateUnusedWhilePending",
++     [](const VkPhysicalDeviceVulkan12Features& f) { return f.descriptorBindingUpdateUnusedWhilePending; }},
++    {"shaderSampledImageArrayNonUniformIndexing",
++     [](const VkPhysicalDeviceVulkan12Features& f) { return f.shaderSampledImageArrayNonUniformIndexing; }},
++    {"shaderStorageBufferArrayNonUniformIndexing",
++     [](const VkPhysicalDeviceVulkan12Features& f) { return f.shaderStorageBufferArrayNonUniformIndexing; }},
++}};
++
++// Called only after vkb::PhysicalDeviceSelector::select() has already
++// failed, to turn its generic "no suitable device" error into a loud,
++// specific one when the actual cause is a missing descriptor-indexing
++// feature bit: vk-bootstrap's own error message never names which
++// required feature a candidate device lacked, which is not good enough
++// for a hard startup requirement [task-3-brief.md]. Enumerates every
++// physical device this instance can see and, for each, reports by name
++// any of kRequiredDescriptorIndexingFeatures it does not support. If no
++// device is missing any of these bits, says so explicitly instead of
++// staying silent -- the real cause of the selection failure is then
++// something else entirely (surface support, queue families, the 1.1/1.3
++// feature sets, API version), and misattributing it to descriptor
++// indexing would send whoever reads this log down the wrong path.
++void logDescriptorIndexingFeatureGaps(VkInstance instance) {
++    uint32_t deviceCount = 0;
++    if (vkEnumeratePhysicalDevices(instance, &deviceCount, nullptr) != VK_SUCCESS || deviceCount == 0) {
++        RX_LOG_ERROR("Device::create: no Vulkan physical devices are visible to this instance at all");
++        return;
++    }
++
++    std::vector<VkPhysicalDevice> devices(deviceCount);
++    if (vkEnumeratePhysicalDevices(instance, &deviceCount, devices.data()) != VK_SUCCESS) {
++        return;
++    }
++
++    bool anyGapReported = false;
++    for (VkPhysicalDevice physicalDevice : devices) {
++        VkPhysicalDeviceProperties properties{};
++        vkGetPhysicalDeviceProperties(physicalDevice, &properties);
++
++        VkPhysicalDeviceVulkan12Features features12{};
++        features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
++        VkPhysicalDeviceFeatures2 features2{};
++        features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
++        features2.pNext = &features12;
++        vkGetPhysicalDeviceFeatures2(physicalDevice, &features2);
++
++        for (const auto& required : kRequiredDescriptorIndexingFeatures) {
++            if (!required.get(features12)) {
++                RX_LOG_ERROR(
++                    "Device::create: physical device '{}' is missing required descriptor-indexing "
++                    "feature '{}' [Phase 2 spec Fixed decision #5, R:B1/B2]",
++                    properties.deviceName, required.name);
++                anyGapReported = true;
++            }
++        }
++    }
++
++    if (!anyGapReported) {
++        RX_LOG_ERROR(
++            "Device::create: physical device selection failed, but every visible device already "
++            "supports all required descriptor-indexing features -- the actual cause is something "
++            "else (surface support, queue families, Vulkan 1.1/1.3 feature requirements, or API "
++            "version)");
++    }
++}
++
+ }  // namespace
+ 
+ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
+     // shaderDrawParameters (promoted from VK_KHR_shader_draw_parameters to
+     // Vulkan 1.1 core) is required by any HLSL/Slang vertex shader that
+     // reads SV_VertexID: to reproduce HLSL's zero-based SV_VertexID exactly
+     // (unaffected by a nonzero firstVertex/vkCmdDraw base), Slang's SPIR-V
+     // backend emits `gl_VertexIndex - gl_BaseVertex`, which declares
+     // OpCapability DrawParameters and a BaseVertex BuiltIn input -- verified
+     // directly via `spirv-dis` on samples/01_triangle's compiled
+@@ -32,28 +122,59 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
+     // nothing on any target this project cares about.
+     VkPhysicalDeviceVulkan11Features features11{};
+     features11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+     features11.shaderDrawParameters = VK_TRUE;
+ 
+     VkPhysicalDeviceVulkan13Features features13{};
+     features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+     features13.dynamicRendering = VK_TRUE;
+     features13.synchronization2 = VK_TRUE;
+ 
++    // Descriptor-indexing feature set for bindless resources (Task 3 --
++    // rx_rhi_vk/bindless.h's BindlessTable and PipelineLayoutBuilder's
++    // (Task 2) unbounded-array bindings both require these enabled at
++    // device-creation time) [Phase 2 spec Fixed decision #5, R:B1/B2].
++    // None of these bits are guaranteed just by requiring Vulkan 1.3 --
++    // every one remains an individually-optional feature -- but all ten
++    // are confirmed present on this project's stated floor hardware (Steam
++    // Deck RADV) via the Vulkan Roadmap 2022 profile, and on every desktop
++    // GPU/driver this project has been developed and tested against
++    // (verified directly: NVIDIA RTX 2080 proprietary driver, and
++    // llvmpipe/lavapipe). set_required_features_12() below makes
++    // vkb::PhysicalDeviceSelector::select() require all ten from any
++    // candidate device; logDescriptorIndexingFeatureGaps() (this file,
++    // above) turns a resulting selection failure into a loud, specific
++    // error naming exactly which bit(s) are missing, rather than
++    // vk-bootstrap's own generic "no suitable device" message.
++    VkPhysicalDeviceVulkan12Features features12{};
++    features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
++    features12.descriptorIndexing = VK_TRUE;
++    features12.runtimeDescriptorArray = VK_TRUE;
++    features12.descriptorBindingPartiallyBound = VK_TRUE;
++    features12.descriptorBindingVariableDescriptorCount = VK_TRUE;
++    features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
++    features12.descriptorBindingStorageImageUpdateAfterBind = VK_TRUE;
++    features12.descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE;
++    features12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
++    features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
++    features12.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
++
+     vkb::PhysicalDeviceSelector selector(context.vkbInstance());
+     auto physResult = selector.set_surface(surface)
+                           .set_minimum_version(1, 3)
+                           .set_required_features_11(features11)
++                          .set_required_features_12(features12)
+                           .set_required_features_13(features13)
+                           .select();
+     if (!physResult) {
+         RX_LOG_ERROR("vkb::PhysicalDeviceSelector::select failed: {}", physResult.error().message());
++        logDescriptorIndexingFeatureGaps(context.instance());
+         destroySurface(context, surface);
+         return std::nullopt;
+     }
+ 
+     auto deviceResult = vkb::DeviceBuilder(physResult.value()).build();
+     if (!deviceResult) {
+         RX_LOG_ERROR("vkb::DeviceBuilder::build failed: {}", deviceResult.error().message());
+         destroySurface(context, surface);
+         return std::nullopt;
+     }
+diff --git a/src/rx_rhi_vk/tests/bindless_test.cpp b/src/rx_rhi_vk/tests/bindless_test.cpp
+new file mode 100644
+index 0000000..c2706b5
+--- /dev/null
++++ b/src/rx_rhi_vk/tests/bindless_test.cpp
+@@ -0,0 +1,395 @@
++#include <doctest/doctest.h>
++#include <rx_rhi_vk/bindless.h>
++#include <rx_rhi_vk/buffer.h>
++#include <rx_rhi_vk/command.h>
++#include <rx_rhi_vk/context.h>
++#include <VkBootstrap.h>
++#include <cstdint>
++#include <utility>
++
++// Pure headless test -- no rx::platform::Window, no VkSurfaceKHR, no
++// swapchain anywhere in this file, exactly like clear_color_test.cpp and
++// pipeline_layout_test.cpp (safe to run in any order alongside the windowed
++// Device/Buffer tests in this binary because tests/doctest_main.cpp warms
++// vk-bootstrap's process-wide instance-function cache before any TEST_CASE
++// runs -- see the comment there, and the Phase 2 plan's Global Constraints
++// on the vk-bootstrap landmine, for why this test joins rx_rhi_vk_tests
++// rather than a new executable).
++namespace {
++
++// Same descriptor-indexing feature set Device::create() now enables
++// process-wide (device.cpp) -- built locally here rather than routed
++// through rx::rhi::Device itself because Device::create() requires a real
++// VkSurfaceKHR/windowed swapchain, and this file's tests are deliberately
++// pure headless (per task-3-brief.md's "Tests (headless device)"), the
++// same reasoning pipeline_layout_test.cpp's own local copy documents.
++struct HeadlessBindlessFixture {
++    rx::rhi::Context context;
++    vkb::Device vkbDevice;
++    VkDevice device;
++    VkPhysicalDevice physicalDevice;
++    VkQueue graphicsQueue;
++    uint32_t graphicsQueueFamily;
++};
++
++HeadlessBindlessFixture makeHeadlessBindlessFixture() {
++    auto context = rx::rhi::Context::create({}, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++
++    VkPhysicalDeviceVulkan12Features features12{};
++    features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
++    features12.descriptorIndexing = VK_TRUE;
++    features12.runtimeDescriptorArray = VK_TRUE;
++    features12.descriptorBindingPartiallyBound = VK_TRUE;
++    features12.descriptorBindingVariableDescriptorCount = VK_TRUE;
++    features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
++    features12.descriptorBindingStorageImageUpdateAfterBind = VK_TRUE;
++    features12.descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE;
++    features12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
++    features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
++    features12.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
++
++    // synchronization2 is required here too, unlike pipeline_layout_test.cpp's
++    // otherwise-identical fixture: this file's makeRealSampledImage() below
++    // calls rx::rhi::transitionImage(), which records a
++    // vkCmdPipelineBarrier2 (VUID-vkCmdPipelineBarrier2-synchronization2-03848
++    // requires the feature enabled, not just the device's API version to be
++    // >= 1.3 -- discovered by this test failing validation-clean without
++    // it). dynamicRendering is included alongside it for the same reason
++    // clear_color_test.cpp's headless fixture enables both together.
++    VkPhysicalDeviceVulkan13Features features13{};
++    features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
++    features13.dynamicRendering = VK_TRUE;
++    features13.synchronization2 = VK_TRUE;
++
++    // No set_surface()/defer_surface_initialization() -- see
++    // clear_color_test.cpp's comment on Context::create({}, ...) selection
++    // for why that's correct for a genuinely headless instance, not merely
++    // a workaround.
++    vkb::PhysicalDeviceSelector selector(context->vkbInstance());
++    auto physResult = selector.set_minimum_version(1, 3)
++                          .set_required_features_12(features12)
++                          .set_required_features_13(features13)
++                          .select();
++    REQUIRE(physResult.has_value());
++
++    auto deviceResult = vkb::DeviceBuilder(physResult.value()).build();
++    REQUIRE(deviceResult.has_value());
++    vkb::Device vkbDevice = deviceResult.value();
++    volkLoadDevice(vkbDevice.device);
++
++    auto graphicsQueueResult = vkbDevice.get_queue(vkb::QueueType::graphics);
++    REQUIRE(graphicsQueueResult.has_value());
++    auto graphicsQueueIndexResult = vkbDevice.get_queue_index(vkb::QueueType::graphics);
++    REQUIRE(graphicsQueueIndexResult.has_value());
++
++    return HeadlessBindlessFixture{std::move(*context), vkbDevice, vkbDevice.device,
++                                    vkbDevice.physical_device.physical_device, graphicsQueueResult.value(),
++                                    graphicsQueueIndexResult.value()};
++}
++
++rx::rhi::BindlessTable::Capacities makeTestCapacities() {
++    return rx::rhi::BindlessTable::Capacities{/*sampledImages=*/1024, /*samplers=*/16, /*storageBuffers=*/256};
++}
++
++// A real 1x1 sampled image (transitioned to SHADER_READ_ONLY_OPTIMAL) plus
++// a real sampler -- deliberately raw Vulkan (mirroring clear_color_test.cpp's
++// own raw-image pattern) rather than routed through a not-yet-existing
++// Texture2D helper (that's Task 4's job). Caller owns teardown via
++// destroy(), which must run before the device that created these resources
++// is destroyed.
++struct RealSampledImage {
++    VkImage image;
++    VkDeviceMemory memory;
++    VkImageView view;
++    VkSampler sampler;
++
++    void destroy(VkDevice device) {
++        vkDestroySampler(device, sampler, nullptr);
++        vkDestroyImageView(device, view, nullptr);
++        vkDestroyImage(device, image, nullptr);
++        vkFreeMemory(device, memory, nullptr);
++    }
++};
++
++RealSampledImage makeRealSampledImage(VkDevice device, VkPhysicalDevice physicalDevice, VkQueue queue,
++                                       uint32_t queueFamily) {
++    constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
++
++    VkImageCreateInfo imageInfo{};
++    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    imageInfo.imageType = VK_IMAGE_TYPE_2D;
++    imageInfo.format = kFormat;
++    imageInfo.extent = {1, 1, 1};
++    imageInfo.mipLevels = 1;
++    imageInfo.arrayLayers = 1;
++    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
++    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
++    imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
++    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++
++    VkImage image = VK_NULL_HANDLE;
++    REQUIRE(vkCreateImage(device, &imageInfo, nullptr, &image) == VK_SUCCESS);
++
++    VkMemoryRequirements memReq{};
++    vkGetImageMemoryRequirements(device, image, &memReq);
++
++    VkPhysicalDeviceMemoryProperties memProps{};
++    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
++
++    uint32_t memoryTypeIndex = UINT32_MAX;
++    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
++        if ((memReq.memoryTypeBits & (1U << i)) != 0U &&
++            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0U) {
++            memoryTypeIndex = i;
++            break;
++        }
++    }
++    REQUIRE(memoryTypeIndex != UINT32_MAX);
++
++    VkMemoryAllocateInfo memAllocInfo{};
++    memAllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++    memAllocInfo.allocationSize = memReq.size;
++    memAllocInfo.memoryTypeIndex = memoryTypeIndex;
++
++    VkDeviceMemory memory = VK_NULL_HANDLE;
++    REQUIRE(vkAllocateMemory(device, &memAllocInfo, nullptr, &memory) == VK_SUCCESS);
++    REQUIRE(vkBindImageMemory(device, image, memory, 0) == VK_SUCCESS);
++
++    VkImageViewCreateInfo viewInfo{};
++    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++    viewInfo.image = image;
++    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    viewInfo.format = kFormat;
++    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    viewInfo.subresourceRange.levelCount = 1;
++    viewInfo.subresourceRange.layerCount = 1;
++
++    VkImageView view = VK_NULL_HANDLE;
++    REQUIRE(vkCreateImageView(device, &viewInfo, nullptr, &view) == VK_SUCCESS);
++
++    {
++        auto cmdCtx = rx::rhi::CommandContext::create(device, queue, queueFamily);
++        REQUIRE(cmdCtx.has_value());
++        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++            rx::rhi::transitionImage(cmd, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        });
++    }
++
++    VkSamplerCreateInfo samplerInfo{};
++    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
++    samplerInfo.magFilter = VK_FILTER_NEAREST;
++    samplerInfo.minFilter = VK_FILTER_NEAREST;
++    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    samplerInfo.maxLod = 0.0F;
++
++    VkSampler sampler = VK_NULL_HANDLE;
++    REQUIRE(vkCreateSampler(device, &samplerInfo, nullptr, &sampler) == VK_SUCCESS);
++
++    return RealSampledImage{image, memory, view, sampler};
++}
++
++}  // namespace
++
++TEST_CASE("BindlessTable::create builds a valid set/layout and registers real resources with zero validation "
++          "errors") {
++    HeadlessBindlessFixture fixture = makeHeadlessBindlessFixture();
++
++    {
++        auto table = rx::rhi::BindlessTable::create(fixture.physicalDevice, fixture.device, makeTestCapacities());
++        REQUIRE(table.has_value());
++        CHECK(table->descriptorSetLayout() != VK_NULL_HANDLE);
++        CHECK(table->descriptorSet() != VK_NULL_HANDLE);
++
++        RealSampledImage image =
++            makeRealSampledImage(fixture.device, fixture.physicalDevice, fixture.graphicsQueue, fixture.graphicsQueueFamily);
++
++        auto imageHandle = table->registerSampledImage(image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        CHECK(imageHandle.isValid());
++        CHECK(imageHandle.index() == 0);
++        CHECK(imageHandle.generation() == 1);
++        CHECK(imageHandle.kind() == rx::rhi::BindlessResourceKind::SampledImage);
++
++        auto samplerHandle = table->registerSampler(image.sampler);
++        CHECK(samplerHandle.isValid());
++        CHECK(samplerHandle.index() == 0);
++        CHECK(samplerHandle.generation() == 1);
++        CHECK(samplerHandle.kind() == rx::rhi::BindlessResourceKind::Sampler);
++
++        auto allocator = rx::rhi::Allocator::createRaw(fixture.physicalDevice, fixture.device, fixture.context.instance());
++        REQUIRE(allocator.has_value());
++        auto buffer = allocator->createHostVisibleBuffer(256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
++        REQUIRE(buffer.has_value());
++
++        auto bufferHandle = table->registerStorageBuffer(buffer->handle(), /*range=*/256);
++        CHECK(bufferHandle.isValid());
++        CHECK(bufferHandle.index() == 0);
++        CHECK(bufferHandle.generation() == 1);
++        CHECK(bufferHandle.kind() == rx::rhi::BindlessResourceKind::StorageBuffer);
++
++        // Every RAII/manual resource above must be torn down against a
++        // still-live device, before the device itself goes away below --
++        // same reverse-destruction discipline clear_color_test.cpp
++        // documents. `buffer`/`allocator`/`table` (RAII) go out of scope at
++        // the end of this block; `image` (manual) is destroyed explicitly
++        // first since it isn't RAII.
++        image.destroy(fixture.device);
++    }
++
++    vkDeviceWaitIdle(fixture.device);
++    vkb::destroy_device(fixture.vkbDevice);
++    CHECK_FALSE(fixture.context.hasValidationErrors());
++}
++
++TEST_CASE("BindlessTable register/release/re-register cycles reuse indices with bumped generations") {
++    HeadlessBindlessFixture fixture = makeHeadlessBindlessFixture();
++
++    {
++        auto table = rx::rhi::BindlessTable::create(fixture.physicalDevice, fixture.device, makeTestCapacities());
++        REQUIRE(table.has_value());
++
++        RealSampledImage image =
++            makeRealSampledImage(fixture.device, fixture.physicalDevice, fixture.graphicsQueue, fixture.graphicsQueueFamily);
++
++        // Three registrations of the SAME real view/layout -- this test is
++        // about index/generation bookkeeping, not about distinct resource
++        // content, so reusing one real (validation-legal) VkImageView
++        // across all three slots is deliberate and keeps the test focused.
++        auto h0 = table->registerSampledImage(image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        auto h1 = table->registerSampledImage(image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        auto h2 = table->registerSampledImage(image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        REQUIRE(h0.isValid());
++        REQUIRE(h1.isValid());
++        REQUIRE(h2.isValid());
++        CHECK(h0.index() == 0);
++        CHECK(h1.index() == 1);
++        CHECK(h2.index() == 2);
++        CHECK(h0.generation() == 1);
++        CHECK(h1.generation() == 1);
++        CHECK(h2.generation() == 1);
++
++        // Release the middle slot and re-register: must reuse index 1 with
++        // generation bumped to 2 -- the free list is LIFO (rx::core::
++        // HandlePool's own documented behavior), so the very next
++        // acquisition after releasing exactly one slot must land on that
++        // same slot.
++        table->release(h1);
++        auto h1Again = table->registerSampledImage(image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        REQUIRE(h1Again.isValid());
++        CHECK(h1Again.index() == 1);
++        CHECK(h1Again.generation() == 2);
++        CHECK(h1Again != h1);
++
++        // Releasing an already-released (stale) handle a second time is a
++        // documented no-op, not a crash or an error.
++        table->release(h1);
++        table->release(h1);
++
++        // A brand-new registration after the reuse above must land on a
++        // fresh index (3), not clobber anything still live.
++        auto h3 = table->registerSampledImage(image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        REQUIRE(h3.isValid());
++        CHECK(h3.index() == 3);
++        CHECK(h3.generation() == 1);
++
++        image.destroy(fixture.device);
++    }
++
++    vkDeviceWaitIdle(fixture.device);
++    vkb::destroy_device(fixture.vkbDevice);
++    CHECK_FALSE(fixture.context.hasValidationErrors());
++}
++
++TEST_CASE("BindlessTable descriptor set can be bound in a dispatch-free command buffer with zero validation "
++          "errors") {
++    HeadlessBindlessFixture fixture = makeHeadlessBindlessFixture();
++
++    {
++        auto table = rx::rhi::BindlessTable::create(fixture.physicalDevice, fixture.device, makeTestCapacities());
++        REQUIRE(table.has_value());
++
++        RealSampledImage image =
++            makeRealSampledImage(fixture.device, fixture.physicalDevice, fixture.graphicsQueue, fixture.graphicsQueueFamily);
++        auto imageHandle = table->registerSampledImage(image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        REQUIRE(imageHandle.isValid());
++        auto samplerHandle = table->registerSampler(image.sampler);
++        REQUIRE(samplerHandle.isValid());
++
++        auto allocator = rx::rhi::Allocator::createRaw(fixture.physicalDevice, fixture.device, fixture.context.instance());
++        REQUIRE(allocator.has_value());
++        auto buffer = allocator->createHostVisibleBuffer(256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
++        REQUIRE(buffer.has_value());
++        auto bufferHandle = table->registerStorageBuffer(buffer->handle(), /*range=*/256);
++        REQUIRE(bufferHandle.isValid());
++
++        // A minimal VkPipelineLayout built directly from this table's own
++        // set layout, guaranteed structurally compatible with it (same
++        // VkDescriptorSetLayout handle) -- exactly enough for
++        // vkCmdBindDescriptorSets to be valid with no pipeline bound and no
++        // draw/dispatch recorded, per task-3-brief.md's "bind + no draw"
++        // gate.
++        VkDescriptorSetLayout setLayout = table->descriptorSetLayout();
++        VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
++        pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
++        pipelineLayoutInfo.setLayoutCount = 1;
++        pipelineLayoutInfo.pSetLayouts = &setLayout;
++
++        VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
++        REQUIRE(vkCreatePipelineLayout(fixture.device, &pipelineLayoutInfo, nullptr, &pipelineLayout) == VK_SUCCESS);
++
++        {
++            auto cmdCtx = rx::rhi::CommandContext::create(fixture.device, fixture.graphicsQueue, fixture.graphicsQueueFamily);
++            REQUIRE(cmdCtx.has_value());
++
++            VkDescriptorSet set = table->descriptorSet();
++            cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &set, 0, nullptr);
++            });
++        }
++
++        vkDestroyPipelineLayout(fixture.device, pipelineLayout, nullptr);
++        image.destroy(fixture.device);
++    }
++
++    vkDeviceWaitIdle(fixture.device);
++    vkb::destroy_device(fixture.vkbDevice);
++    CHECK_FALSE(fixture.context.hasValidationErrors());
++}
++
++TEST_CASE("BindlessTable::create rejects a capacity beyond this device's real update-after-bind limit with a "
++          "clean error, no crash") {
++    HeadlessBindlessFixture fixture = makeHeadlessBindlessFixture();
++
++    VkPhysicalDeviceVulkan12Properties props12{};
++    props12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES;
++    VkPhysicalDeviceProperties2 props2{};
++    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
++    props2.pNext = &props12;
++    vkGetPhysicalDeviceProperties2(fixture.physicalDevice, &props2);
++
++    if (props12.maxDescriptorSetUpdateAfterBindSampledImages == UINT32_MAX) {
++        // A driver reporting the "no meaningful limit" sentinel (RADV's
++        // documented behavior [R:B2]) genuinely has no capacity this test
++        // could request that is "beyond" it -- there is nothing to
++        // exercise on such hardware, and that is the correct, honest
++        // outcome, not a gap in this test.
++        MESSAGE("this device reports an unbounded maxDescriptorSetUpdateAfterBindSampledImages; absurd-capacity "
++                "rejection path is not exercisable here");
++        vkb::destroy_device(fixture.vkbDevice);
++        return;
++    }
++
++    rx::rhi::BindlessTable::Capacities absurd{};
++    absurd.sampledImages = props12.maxDescriptorSetUpdateAfterBindSampledImages + 1;
++    absurd.samplers = 16;
++    absurd.storageBuffers = 256;
++
++    auto table = rx::rhi::BindlessTable::create(fixture.physicalDevice, fixture.device, absurd);
++    CHECK_FALSE(table.has_value());
++
++    vkb::destroy_device(fixture.vkbDevice);
++    CHECK_FALSE(fixture.context.hasValidationErrors());
++}
