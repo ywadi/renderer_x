@@ -1,0 +1,2943 @@
+# Review package: 0e6f0dc..3fcbc3a
+
+## Commits
+3fcbc3a Add Uploader, DeletionQueue, Texture2D mips, MeshBuffers (Phase 2 Task 4)
+
+## Files changed
+ .../task-4-report.md                               | 343 +++++++++++++++++++++
+ src/rx_rhi_vk/CMakeLists.txt                       |  56 ++--
+ src/rx_rhi_vk/include/rx_rhi_vk/buffer.h           |  81 +++++
+ src/rx_rhi_vk/include/rx_rhi_vk/deletion_queue.h   | 122 ++++++++
+ src/rx_rhi_vk/include/rx_rhi_vk/frame_sync.h       |  20 +-
+ src/rx_rhi_vk/include/rx_rhi_vk/mesh_buffers.h     |  77 +++++
+ src/rx_rhi_vk/include/rx_rhi_vk/texture.h          | 141 +++++++++
+ src/rx_rhi_vk/include/rx_rhi_vk/upload.h           | 166 ++++++++++
+ src/rx_rhi_vk/src/buffer.cpp                       |  74 +++++
+ src/rx_rhi_vk/src/deletion_queue.cpp               |  58 ++++
+ src/rx_rhi_vk/src/frame_sync.cpp                   |   2 +
+ src/rx_rhi_vk/src/mesh_buffers.cpp                 |  47 +++
+ src/rx_rhi_vk/src/stb_impl.cpp                     |  20 ++
+ src/rx_rhi_vk/src/texture.cpp                      | 264 ++++++++++++++++
+ src/rx_rhi_vk/src/upload.cpp                       | 317 +++++++++++++++++++
+ src/rx_rhi_vk/tests/clear_color_test.cpp           |  52 ++--
+ src/rx_rhi_vk/tests/deletion_queue_test.cpp        | 271 ++++++++++++++++
+ src/rx_rhi_vk/tests/texture_test.cpp               | 155 ++++++++++
+ src/rx_rhi_vk/tests/upload_test.cpp                | 244 +++++++++++++++
+ third_party/CMakeLists.txt                         |  30 ++
+ 20 files changed, 2488 insertions(+), 52 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-4-report.md b/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-4-report.md
+new file mode 100644
+index 0000000..efda829
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-4-report.md
+@@ -0,0 +1,343 @@
++# Task 4 Report: Uploader, DeletionQueue, Texture2D + mips, MeshBuffers
++
++## Summary
++
++Implemented the full Task 4 scope: `rx::rhi::Uploader` (ReBAR-aware staging
++ring buffer + synchronous batched `flush()`), `rx::rhi::DeletionQueue`
++(fence-gated deferred destruction, decoupled from any Vulkan state),
++`rx::rhi::Texture2D` (VMA image + view with blit-chain mip generation and
++a format-feature-checked single-mip fallback), and `rx::rhi::MeshBuffers`
++(device-local vertex/index buffers populated through `Uploader`). Also
++closed the tracked API gap from Phase 1 Task 3's review: `Buffer::flush()`/
++`Buffer::invalidate()` now wrap `vmaFlushAllocation`/`vmaInvalidateAllocation`
++directly, and `clear_color_test.cpp`'s host-coherence proxy `REQUIRE` loop
++was replaced with a real `invalidate()` call. stb_image is wired into
++`third_party/CMakeLists.txt` (fetched, compiled once in `stb_impl.cpp`) per
++spec Fixed decision #10, even though no call site exists yet (Uploader
++takes decoded pixels in, not a file path, matching the brief's own
++interface — the sample tasks will be the first real `stbi_load()` caller).
++`FrameSync` gained the one accessor `DeletionQueue` needs:
++`frameNumber()`, a monotonic counter distinct from the existing
++`currentFrameIndex()` mod-2 slot index. Ten test cases across three new
++test files plus the two updated existing test files. Full `ctest` is
++green (6/6, 22/22 sub-cases, 625/625 assertions) on linux-native, zero
++unexpected validation errors; `windows-cross-zig` configures and builds
++clean including all new/changed files.
++
++## Implementation
++
++### 1. `Buffer::flush()`/`Buffer::invalidate()` (buffer.h/buffer.cpp)
++
++Thin wrappers over `vmaFlushAllocation`/`vmaInvalidateAllocation`
++(`offset`, `size = VK_WHOLE_SIZE` defaults), logging `RX_LOG_ERROR` on the
++rare non-`VK_SUCCESS` return, no-op on an invalid/moved-from `Buffer`.
++Documented as safe (and cheap — VMA itself skips the real
++`vkFlush/InvalidateMappedMemoryRanges` call) to invoke unconditionally
++regardless of whether the underlying memory type is actually coherent.
++Used wherever mapped memory crosses a CPU↔GPU handoff in this task's own
++code: `Uploader`'s ring-buffer writes call `flush()` before the GPU reads
++them (`vkCmdCopyBuffer`/`vkCmdCopyBufferToImage` source); every test's
++readback buffer calls `invalidate()` before the host reads it.
++
++`clear_color_test.cpp`'s pre-existing coherence proxy (`REQUIRE` that
++every `HOST_VISIBLE` memory type on the device is also `HOST_COHERENT`)
++was removed and replaced with a real `readback->invalidate()` call before
++the `memcpy` — per the brief's "your call, explain it," this is the
++correct simplification: it's now provably correct even on a hypothetical
++non-coherent host-visible heap, not just the coherent-in-practice
++hardware this machine happens to expose. `buffer_test.cpp` had no such
++proxy guard (pure CPU-write/CPU-read, no GPU write involved) and needed
++no change.
++
++### 2. New `Allocator` methods (buffer.h/buffer.cpp)
++
++- `createDeviceLocalBuffer(size, usage)` — `VMA_MEMORY_USAGE_AUTO`, no
++  `HOST_ACCESS_*` flags, no `MAPPED_BIT` → device-local only. Backs
++  `MeshBuffers`.
++- `createUploadRingBuffer(size, usage) -> UploadBufferResult{Buffer,
++  bool deviceLocal}` — the exact ReBAR-aware pattern from [R:C1]:
++  `AUTO + HOST_ACCESS_SEQUENTIAL_WRITE_BIT | HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT
++  | MAPPED_BIT`; `deviceLocal` is classified once via
++  `vmaGetMemoryTypeProperties` on the resulting `VmaAllocationInfo::memoryType`
++  (no `VkPhysicalDevice` needed for this specific check). Backs `Uploader`.
++- `raw() -> VmaAllocator` — minimal accessor `Texture2D::create()` (a
++  different TU) needs to call `vmaCreateImage`/`vmaDestroyImage` directly,
++  without making `buffer.h`/`buffer.cpp` know anything about `Texture2D`.
++
++### 3. `FrameSync::frameNumber()` (frame_sync.h/frame_sync.cpp)
++
++One `uint64_t frameNumber_` member, incremented alongside
++`currentFrame_` inside `advanceFrame()`. Documented explicitly as the
++value `DeletionQueue`'s `retire()`/`onFrameFenceSignaled()` should be
++keyed on in production code — `currentFrameIndex()` cycles mod
++`kFramesInFlight` (0, 1, 0, 1, ...) and cannot disambiguate "frame 5"
++from "frame 7," which a real deferred-destruction queue needs to be able
++to do.
++
++### 4. `rx::rhi::DeletionQueue` (deletion_queue.h/deletion_queue.cpp)
++
++Deliberately owns **no** Vulkan state — `retire(std::function<void()>,
++uint64_t frameIndex)` appends to a `std::vector<Item>`;
++`onFrameFenceSignaled(completedFrameIndex)` runs (in original retire()
++order) and removes every item with `frameIndex <= completedFrameIndex`
++via a two-pass rebuild (avoids relying on `std::remove_if`/`erase_if`'s
++unspecified per-element call count for a predicate with side effects);
++`flushAll(waitIdleFirst)` runs everything unconditionally, invoking
++`waitIdleFirst` first if provided. The destructor logs
++(`RX_LOG_ERROR`) rather than crashing if anything is still pending —
++it cannot itself guarantee device idle, so it can't safely run
++destructors, but it also can't silently let the mistake pass.
++
++**Documented pitfall (real, not hypothetical — hit during this task's
++own test-writing):** `std::function<void()>` requires its target to be
++copy-constructible. A lambda that captures a move-only resource
++(`Buffer`, `Texture2D`, ...) directly by move fails to compile the
++moment it's handed to `std::function`. The header now documents the
++standard fix (wrap in `std::shared_ptr` first) prominently, since every
++real caller of `retire()` will hit this the first time they try to
++retire a real GPU resource.
++
++### 5. `rx::rhi::Texture2D` (texture.h/texture.cpp)
++
++VMA-backed `VkImage` + `VkImageView`, move-only RAII. `create()` computes
++`floor(log2(max(w,h))) + 1` for `requestedMipLevels == 0` (auto full
++chain), else clamps the request down to that maximum. Before honoring
++`mipLevels > 1`, queries `vkGetPhysicalDeviceFormatProperties` and
++requires **both** `VK_FORMAT_FEATURE_BLIT_SRC_BIT` and `_DST_BIT` under
++optimal tiling (the brief's shorthand names only `_DST_BIT`; a blit chain
++needs `_SRC_BIT` equally, since every level but the last is a blit
++source for the next — documented as a brief elaboration, not a spec
++deviation) — unsupported falls back to a single mip level with
++`RX_LOG_WARN`, never a hard failure. `usage` gets `TRANSFER_DST_BIT`
++unconditionally and `TRANSFER_SRC_BIT` added iff `mipLevels > 1`.
++`recordMipChainBlit()` records the per-level barrier + `vkCmdBlitImage`
++sequence (own local `transitionLevelRange()` helper — a per-mip-level-
++range version of `command.h`'s `transitionImage()`, same maximally-
++conservative ALL_COMMANDS/MEMORY_READ|WRITE barrier, since
++`transitionImage()` itself always covers `VK_REMAINING_MIP_LEVELS` and
++can't express an arbitrary sub-range), leaving every level in
++`SHADER_READ_ONLY_OPTIMAL`. The sRGB-averaging caveat [R:C2] is
++documented both at the declaration (texture.h) and directly above the
++`vkCmdBlitImage` call (texture.cpp) — vkCmdBlitImage's linear filter
++averages texel values in the image's own stored encoding, which is
++correct for UNORM but not for sRGB (the exact bug class libktx's `ktx
++create` once shipped and fixed).
++
++**Deviation from brief's shorthand signature** (documented, same
++precedent as Task 3's `BindlessTable::create`): `create()` takes
++`VkPhysicalDevice` (format-feature query) and `VkDevice`
++(`vkCreateImageView`/`vkDestroyImageView`) in addition to `Allocator&` —
++neither is reachable from `Allocator` alone.
++
++### 6. `rx::rhi::Uploader` (upload.h/upload.cpp)
++
++Owns a command pool/buffer/fence plus one persistent ring `Buffer`
++(`Allocator::createUploadRingBuffer`, `VK_BUFFER_USAGE_TRANSFER_SRC_BIT`).
++`uploadToBuffer`/`uploadToImage` reserve ring space (aligned to 16 bytes,
++satisfying `vkCmdCopyBufferToImage`'s 4-byte `bufferOffset` VUID with
++margin), `memcpy` + `Buffer::flush()`, then record the copy (plus, for
++images, the `UNDEFINED → TRANSFER_DST_OPTIMAL` transition via the
++existing `command.h::transitionImage()` and either
++`Texture2D::recordMipChainBlit()` or a final transition to
++`SHADER_READ_ONLY_OPTIMAL`) onto the internal command buffer — nothing
++submits until `flush()`. If a reservation would run past the ring
++buffer's end, `reserveRingSpace()` calls `flush()` internally first
++(submits + waits everything recorded so far, frees the whole ring) and
++restarts at offset 0 — verified by a dedicated test with a deliberately
++tiny (64-byte) ring buffer and two 48-byte uploads. `usesDirectPath()`
++reports which memory type the ring buffer actually landed in (logged
++once at `create()`, never per-upload). The destructor auto-flushes
++pending work before tearing down, so a caller that forgets a final
++`flush()` never silently loses recorded-but-unsubmitted work.
++
++Move ctor/assignment hand-written (not `= default`): this class owns raw
++Vulkan handles (`pool_`/`cmd_`/`fence_`) alongside the RAII `ringBuffer_`
++member, and a defaulted move would copy the raw handles without nulling
++the source — the exact double-destroy hazard every other RAII type in
++this library avoids by hand-writing its move operations. No plain
++default constructor either, for the same reason `MeshBuffers`/`Texture2D`
++don't have one: `Buffer`'s own default constructor is private
++(friends-only), so a default `Uploader()` can't default-construct
++`ringBuffer_`; `create()` builds every member up front and constructs
++directly via a parameterized private constructor instead.
++
++### 7. `rx::rhi::MeshBuffers` (mesh_buffers.h/mesh_buffers.cpp)
++
++Two `Allocator::createDeviceLocalBuffer` buffers (vertex:
++`VERTEX_BUFFER_BIT`, index: `INDEX_BUFFER_BIT`, both additionally
++`TRANSFER_DST_BIT | TRANSFER_SRC_BIT` — SRC added beyond the brief's
++literal ask so a debug readback, or a future GPU-side consumer, can copy
++out of them directly; proven by `upload_test.cpp`'s own readback-from-
++`mesh->vertexBuffer()`/`indexBuffer()` assertions), populated via
++`Uploader::uploadToBuffer` + one `uploader.flush()` this call issues
++itself. Move ctor/assignment are `= default` — unlike every other RAII
++type mentioned above, `MeshBuffers` owns zero raw handles (only two
++well-behaved `Buffer` members), so the default member-wise move is
++correct: it invokes `Buffer`'s own public move operations, which already
++null their source correctly.
++
++### 8. stb_image wiring (third_party/CMakeLists.txt, stb_impl.cpp)
++
++Same `FetchContent_Populate` + `PARENT_SCOPE` pattern as volk/VMA (stb
++has no CMakeLists.txt at all, and no version tags — pinned to commit
++`2c980bb59875b0d32144a71867fbdebb2f77cd20`, verified live against
++`git ls-remote`/a real clone; also verified CMake's `FetchContent` +
++`GIT_SHALLOW TRUE` correctly resolves an exact commit SHA, unlike a raw
++`git clone --branch <sha>` which fails — confirmed with a throwaway
++CMake project before relying on it). `src/rx_rhi_vk/src/stb_impl.cpp` is
++the sole `STB_IMAGE_IMPLEMENTATION` TU, mirroring `vma_impl.cpp`. No call
++site exists yet in this task (Texture2D/Uploader's own interfaces take
++decoded pixel bytes in, exactly as the brief specifies) — the dependency
++is fully wired end to end for the sample tasks that will call
++`stbi_load()`.
++
++### 9. Tests
++
++- `buffer_test.cpp` (unchanged), `clear_color_test.cpp` (invalidate()
++  replaces the coherence proxy, see §1).
++- `upload_test.cpp` (windowed fixture, `Uploader::create()` needs a real
++  `rx::rhi::Device&`): byte-exact round-trip (4096 bytes); ring-buffer
++  auto-flush-mid-batch correctness (64-byte ring, two 48-byte uploads);
++  oversize-upload clean rejection; `MeshBuffers::create` end-to-end
++  (vertex+index byte-exact, both through a fresh `Uploader` copy AND
++  directly out of `mesh->vertexBuffer()`/`indexBuffer()`).
++- `deletion_queue_test.cpp`: three pure-logic cases (defer-until-signaled-
++  run-exactly-once; multi-item FIFO-within-due-set ordering;
++  `flushAll`'s `waitIdleFirst` + unconditional-run contract) plus the
++  brief-mandated real-Vulkan stress test — headless fixture, 40
++  iterations reusing 2 fence-guarded "frame slots" (mirroring
++  `FrameSync::kFramesInFlight`), each iteration submitting a real,
++  **not immediately waited on** `vkCmdCopyBuffer` referencing a fresh
++  host-visible + device-local buffer pair, retired via `DeletionQueue`
++  tagged at that iteration's frame index, destroyed only once that
++  slot's fence is later confirmed signaled. Asserts `pendingCount() >=
++  kSlots` mid-loop (proof the queue is really deferring, not trivially
++  discarding) and zero validation errors at the end (the real proof
++  nothing was destroyed while a pending submission still referenced it).
++- `texture_test.cpp` (windowed fixture): 64x64 `R8G8B8A8_UNORM` upload
++  with `generateMips=true` → `mipLevels() == 7` (auto full chain),
++  deterministic gradient pixels, level-0 readback byte-exact, zero
++  validation errors; explicit `requestedMipLevels` (3 honored verbatim;
++  10 clamped down to a 4x4 extent's real maximum of 3).
++
++## Verification
++
++- **linux-native:** full build clean; `ctest`: **6/6 pass**
++  (`shader_spirv_test`, `rx_core_tests`, `rx_platform_tests`,
++  `rx_shader_tests`, `rx_rhi_vk_tests`, `sample_01_triangle_headless`).
++  `rx_rhi_vk_tests` run directly: **22 test cases / 625 assertions, 0
++  failed.** Every `[error]`-level log line in a full direct run is one of
++  three deliberately-exercised clean-rejection paths (two pre-existing
++  from Tasks 2/3, plus this task's own oversize-ring-upload case) — no
++  unexpected errors, and `grep` for `Validation Error` outside the
++  pre-existing documented `known false positive` (portability-enumeration
++  layer quirk) returns nothing. A warm incremental rebuild (touch one
++  `.cpp`, rebuild) took ~2 seconds.
++- **windows-cross-zig:** configure + full build clean, including every
++  new/changed file (`upload.cpp`, `deletion_queue.cpp`, `texture.cpp`,
++  `mesh_buffers.cpp`, `stb_impl.cpp`, and all three new test TUs)
++  compiling and `rx_rhi_vk_tests.exe`/`sample_01_triangle.exe` linking
++  successfully via zig/LLD.
++- Commit hygiene: verified directly with `git log -1 --format='%B'`
++  after committing (see commit list below) — no AI attribution.
++
++## Deviations from brief / spec
++
++1. **`Texture2D::create()` takes `VkPhysicalDevice` AND `VkDevice`** in
++   addition to `Allocator&` (brief's shorthand: `create(Allocator&,
++   extent, format, usage, mipLevels)`) — needed for the format-feature
++   query and `vkCreateImageView`/`vkDestroyImageView` respectively;
++   `Allocator` alone exposes neither. Same precedent/reasoning as Task
++   3's `BindlessTable::create` deviation (task-3-report.md).
++2. **Mip-chain format-feature check requires both `BLIT_SRC_BIT` and
++   `BLIT_DST_BIT`**, not just `BLIT_DST_BIT` as the brief's shorthand
++   names — a blit chain reads FROM level N (needs `BLIT_SRC_BIT`) to
++   write TO level N+1 (needs `BLIT_DST_BIT`); checking only the
++   destination bit would miss a device that can write-but-not-read-blit
++   a format (rare, but the check is free to make correct). Strengthens
++   correctness; does not relitigate the architecture.
++3. **`MeshBuffers::create()` takes an explicit `indexCount` parameter**
++   beyond the brief's bare shorthand — stored and exposed via
++   `indexCount()` for direct `vkCmdDrawIndexed` use; the caller already
++   knows this value unambiguously (independent of index type), so
++   deriving it from `indexBytes`/`indexType` size would be strictly worse
++   ergonomics for zero benefit.
++4. Everything else matches the brief's interfaces: `Uploader::create`,
++   `uploadToBuffer`/`uploadToImage`, synchronous `flush()`;
++   `DeletionQueue::retire`/`onFrameFenceSignaled`/`flushAll`;
++   `Buffer::flush`/`invalidate` wrapping the VMA calls exactly as
++   specified.
++
++## Concerns for the coordinator
++
++1. **The single-mip-fallback path (`RX_LOG_WARN`, unsupported blit
++   format) is implemented but not exercised by an automated test** — no
++   format lacking `BLIT_SRC+DST` support under optimal tiling was found
++   that would also be portable/deterministic across this project's
++   actual test-running hardware set (NVIDIA, lavapipe/llvmpipe, and
++   whatever CI/Wine ends up running) without risking flakiness; forcing
++   it artificially (e.g. a compressed BC format needing its own optional
++   feature + 4x4 block-aligned extents) seemed like it would trade one
++   untested path for a new, less honest one. This mirrors Task 3's own
++   precedent (`logDescriptorIndexingFeatureGaps`, task-3-report.md §1) of
++   flagging an implemented-but-hardware-unexercisable path rather than
++   forcing a fragile test.
++2. **`std::function`'s copy-constructibility requirement is a real,
++   sharp edge for every future `DeletionQueue::retire()` caller** —
++   documented prominently in the header (the "STD::FUNCTION
++   COPY-CONSTRUCTIBILITY PITFALL" section) and demonstrated in the
++   stress test's own `std::make_shared<Buffer>(...)` pattern, but every
++   Task 6/7 call site retiring a real `Texture2D`/`Buffer` will hit this
++   the first time unless they've read that comment. Worth being aware of
++   when reviewing those tasks' `retire()` call sites.
++3. **`Uploader`'s ring-buffer auto-flush-on-overflow (`reserveRingSpace`)
++   is a synchronous stall from the caller's perspective** — correct and
++   simple (an explicit Phase 2 choice per the brief), but a caller doing
++   many uploads through a too-small ring buffer will pay a submit+wait
++   per overflow rather than getting one clean error; this is by design
++   (never fails except on a genuinely-too-large single upload) but worth
++   knowing if a future sample's ring-buffer sizing turns out too small
++   in practice (default is 16 MiB).
++4. **This task did not add a dedicated `Device::createDeletionQueueHook()`
++   or similar** — `DeletionQueue` is deliberately Vulkan-agnostic per the
++   brief's own interface (`retire(std::function<void()>, uint64_t)`), so
++   the actual fence-wait-then-`onFrameFenceSignaled()` wiring into a real
++   present loop is left to whichever task builds one (none in Phase 2's
++   remaining scope needs a windowed present loop beyond what samples 5-7
++   already have their own headless gates for) — flagging so it isn't
++   mistaken for an oversight.
++
++## Files created
++
++- `src/rx_rhi_vk/include/rx_rhi_vk/upload.h`, `src/upload.cpp`
++- `src/rx_rhi_vk/include/rx_rhi_vk/deletion_queue.h`, `src/deletion_queue.cpp`
++- `src/rx_rhi_vk/include/rx_rhi_vk/texture.h`, `src/texture.cpp`
++- `src/rx_rhi_vk/include/rx_rhi_vk/mesh_buffers.h`, `src/mesh_buffers.cpp`
++- `src/rx_rhi_vk/src/stb_impl.cpp`
++- `src/rx_rhi_vk/tests/upload_test.cpp`, `tests/deletion_queue_test.cpp`,
++  `tests/texture_test.cpp`
++
++## Files modified
++
++- `src/rx_rhi_vk/include/rx_rhi_vk/buffer.h` / `src/buffer.cpp` —
++  `Buffer::flush`/`invalidate`; `Allocator::createDeviceLocalBuffer`,
++  `createUploadRingBuffer`, `raw()`.
++- `src/rx_rhi_vk/include/rx_rhi_vk/frame_sync.h` / `src/frame_sync.cpp` —
++  `frameNumber()` monotonic counter.
++- `src/rx_rhi_vk/tests/clear_color_test.cpp` — coherence-proxy `REQUIRE`
++  loop replaced with a real `Buffer::invalidate()` call.
++- `third_party/CMakeLists.txt` — stb fetch.
++- `src/rx_rhi_vk/CMakeLists.txt` — new sources, new include dir, new test
++  TUs.
++
++## Readiness for Task 5/6/7
++
++`Uploader`/`Texture2D`/`MeshBuffers` are ready for Task 6's bindless-mesh
++sample to consume directly (`Uploader::create` against a real windowed
++`Device`, `Texture2D::create` + `uploadToImage` for each generated
++texture, `MeshBuffers::create` for procedural geometry). `DeletionQueue`
++is ready for Task 7's streaming sample's eviction path — the exact
++scenario its own stress test already exercises end to end, just without
++a real `BindlessTable::release()` call interleaved (that interleaving is
++Task 7's own proof, per the as-built context's "release-safety contract"
++note in `bindless.h`).
+diff --git a/src/rx_rhi_vk/CMakeLists.txt b/src/rx_rhi_vk/CMakeLists.txt
+index 6a5b2d8..ca2c409 100644
+--- a/src/rx_rhi_vk/CMakeLists.txt
++++ b/src/rx_rhi_vk/CMakeLists.txt
+@@ -1,66 +1,78 @@
+-# volk_SOURCE_DIR/vma_SOURCE_DIR are populated (and PARENT_SCOPE-propagated
+-# up to the root) by third_party/CMakeLists.txt's FetchContent_Populate
+-# calls -- see the comments there for why it's Populate (source only)
+-# rather than MakeAvailable (which would also add_subdirectory each
+-# library's own CMakeLists.txt: volk's problematic `volk` target, and VMA's
+-# sample-application target with its unwanted GLFW dependency).
++# volk_SOURCE_DIR/vma_SOURCE_DIR/stb_SOURCE_DIR are populated (and
++# PARENT_SCOPE-propagated up to the root) by third_party/CMakeLists.txt's
++# FetchContent_Populate calls -- see the comments there for why it's
++# Populate (source only) rather than MakeAvailable (which would also
++# add_subdirectory each library's own CMakeLists.txt: volk's problematic
++# `volk` target, VMA's sample-application target with its unwanted GLFW
++# dependency, and stb has no CMakeLists.txt at all to add_subdirectory).
+ #
+ # src/vma_impl.cpp is the sole VMA_IMPLEMENTATION translation unit for this
+ # entire program (see that file); every other consumer of VMA
+ # (src/buffer.cpp, include/rx_rhi_vk/buffer.h) only ever declares against
+-# vk_mem_alloc.h, never redefines VMA_IMPLEMENTATION.
++# vk_mem_alloc.h, never redefines VMA_IMPLEMENTATION. src/stb_impl.cpp is
++# the equivalent sole STB_IMAGE_IMPLEMENTATION translation unit, for the
++# identical reason (see that file's own comment).
+ add_library(rx_rhi_vk STATIC
+     src/context.cpp
+     src/device.cpp
+     src/buffer.cpp
+     src/command.cpp
+     src/frame_sync.cpp
+     src/pipeline_layout.cpp
+     src/bindless.cpp
++    src/upload.cpp
++    src/deletion_queue.cpp
++    src/texture.cpp
++    src/mesh_buffers.cpp
+     src/vma_impl.cpp
++    src/stb_impl.cpp
+     ${volk_SOURCE_DIR}/volk.c
+ )
+-target_include_directories(rx_rhi_vk PUBLIC include ${volk_SOURCE_DIR} ${vma_SOURCE_DIR}/include)
++target_include_directories(rx_rhi_vk PUBLIC include ${volk_SOURCE_DIR} ${vma_SOURCE_DIR}/include ${stb_SOURCE_DIR})
+ # rx_shader_layout_types (defined in src/rx_shader/CMakeLists.txt) is a
+ # header-only INTERFACE target exposing ONLY rx_shader's plain-data
+ # shader_layout_info.h -- never `rx_shader` itself, which would drag
+ # slang::slang (a real link dependency, plus every other rx_shader header)
+ # into this library. See pipeline_layout.h's own comment for why
+ # PipelineLayoutBuilder needs `rx::shader::ShaderLayoutInfo` without any of
+ # that.
+ target_link_libraries(rx_rhi_vk PUBLIC rx_core vk-bootstrap::vk-bootstrap rx_shader_layout_types)
+ target_compile_definitions(rx_rhi_vk PUBLIC VK_NO_PROTOTYPES)
+ 
+-# Seven test translation units now (context_test.cpp, device_test.cpp,
++# Ten test translation units now (context_test.cpp, device_test.cpp,
+ # buffer_test.cpp, clear_color_test.cpp, frame_sync_test.cpp,
+-# pipeline_layout_test.cpp, bindless_test.cpp), so -- like rx_core_tests,
++# pipeline_layout_test.cpp, bindless_test.cpp, upload_test.cpp,
++# deletion_queue_test.cpp, texture_test.cpp), so -- like rx_core_tests,
+ # and unlike this target before device_test.cpp existed -- doctest's
+ # runtime/main is implemented once in a dedicated tests/doctest_main.cpp
+-# shared by all seven, rather than in any one test file. doctest_main.cpp
++# shared by all ten, rather than in any one test file. doctest_main.cpp
+ # also links rx_platform: it uses rx::platform::Window to warm up a real
+ # vk-bootstrap hazard before any TEST_CASE runs (see the comment there) --
+ # so test order here is not load-bearing, deliberately; no --order-by is
+ # needed on the add_test line below. clear_color_test.cpp,
+-# pipeline_layout_test.cpp, and bindless_test.cpp in particular are pure
+-# headless (no window/surface/swapchain) and rely on that warm-up to be
+-# safe regardless of where doctest schedules them relative to the windowed
+-# tests -- see the Phase 2 plan's Global Constraints on the vk-bootstrap
+-# landmine: both pipeline_layout_test.cpp and bindless_test.cpp build their
+-# own headless device (the latter to exercise BindlessTable's descriptor-
+-# indexing requirements independent of whether Device::create() itself --
+-# which now also enables these features process-wide, see device.cpp --
+-# happens to run first in this binary), and joining THIS binary rather than
+-# a new one is what keeps them protected by the warm-up above instead of
+-# needing to reimplement it.
++# pipeline_layout_test.cpp, bindless_test.cpp, and deletion_queue_test.cpp
++# in particular are pure headless (no window/surface/swapchain) and rely
++# on that warm-up to be safe regardless of where doctest schedules them
++# relative to the windowed tests -- see the Phase 2 plan's Global
++# Constraints on the vk-bootstrap landmine: pipeline_layout_test.cpp,
++# bindless_test.cpp, and deletion_queue_test.cpp each build their own
++# headless device, and joining THIS binary rather than a new one is what
++# keeps them protected by the warm-up above instead of needing to
++# reimplement it. upload_test.cpp/texture_test.cpp are windowed (Uploader::
++# create() needs a real rx::rhi::Device&), skip-guarded exactly like
++# buffer_test.cpp/device_test.cpp on a display-less machine.
+ add_executable(rx_rhi_vk_tests
+     tests/doctest_main.cpp
+     tests/context_test.cpp
+     tests/device_test.cpp
+     tests/buffer_test.cpp
+     tests/clear_color_test.cpp
+     tests/frame_sync_test.cpp
+     tests/pipeline_layout_test.cpp
+     tests/bindless_test.cpp
++    tests/upload_test.cpp
++    tests/deletion_queue_test.cpp
++    tests/texture_test.cpp
+ )
+ target_link_libraries(rx_rhi_vk_tests PRIVATE rx_rhi_vk rx_platform doctest::doctest)
+ add_test(NAME rx_rhi_vk_tests COMMAND rx_rhi_vk_tests)
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h b/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h
+index 1afa04c..ca9c705 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h
+@@ -51,20 +51,50 @@ public:
+     Buffer(Buffer&&) noexcept;
+     Buffer& operator=(Buffer&&) noexcept;
+     Buffer(const Buffer&) = delete;
+     Buffer& operator=(const Buffer&) = delete;
+     ~Buffer();
+ 
+     VkBuffer handle() const { return buffer_; }
+     void* mappedData() const { return mappedData_; }
+     VkDeviceSize size() const { return size_; }
+ 
++    // Wraps vmaFlushAllocation()/vmaInvalidateAllocation() -- the API gap
++    // flagged by Phase 1 Task 3's review: that task's readback test had no
++    // way to reach the underlying VmaAllocation to invalidate it, and had
++    // to fall back to verifying (once, as a test precondition) that every
++    // HOST_VISIBLE memory type on the device was also HOST_COHERENT
++    // instead. These two calls close that gap for real.
++    //
++    // Call flush() after writing to mappedData() whenever the GPU will
++    // read those bytes next (e.g. this Buffer is about to be used as a
++    // vkCmdCopyBuffer/vkCmdCopyBufferToImage source). Call invalidate()
++    // before reading mappedData() whenever the GPU may have written to
++    // this Buffer since the last time the CPU read it (e.g. this Buffer
++    // is a transfer-destination readback buffer and a copy into it was
++    // just submitted and waited on). `size` of VK_WHOLE_SIZE (the
++    // default) covers everything from `offset` to the end of this
++    // Buffer's allocation, matching VMA's own sentinel semantics.
++    //
++    // Both are correct AND cheap to call unconditionally, even on a
++    // memory type that turns out to already be HOST_COHERENT: VMA's own
++    // implementation checks the underlying memory type first and skips
++    // the real vkFlushMappedMemoryRanges/vkInvalidateMappedMemoryRanges
++    // call entirely when it isn't needed. So callers should always call
++    // the appropriate one around a CPU<->GPU handoff on mapped memory
++    // rather than trying to detect/assume coherence themselves the way
++    // Phase 1's readback test had to. No-ops if this Buffer is invalid
++    // (default-constructed or moved-from). Logs (RX_LOG_ERROR) and
++    // otherwise no-ops on the rare underlying VkResult failure.
++    void flush(VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE) const;
++    void invalidate(VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE) const;
++
+ private:
+     friend class Allocator;
+ 
+     Buffer() = default;
+     Buffer(VmaAllocator allocator, VkBuffer buffer, VmaAllocation allocation, void* mappedData, VkDeviceSize size)
+         : allocator_(allocator), buffer_(buffer), allocation_(allocation), mappedData_(mappedData), size_(size) {}
+ 
+     void destroyAll();
+ 
+     VmaAllocator allocator_ = VK_NULL_HANDLE;
+@@ -96,20 +126,71 @@ public:
+     static std::optional<Allocator> createRaw(VkPhysicalDevice physicalDevice, VkDevice device, VkInstance instance);
+ 
+     // Allocates a VkBuffer with `usage`, backed by host-visible, persistently
+     // mapped memory (VMA_MEMORY_USAGE_AUTO +
+     // VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+     // VMA_ALLOCATION_CREATE_MAPPED_BIT) -- suitable for CPU-written,
+     // GPU-read data such as vertex/index/uniform buffers updated every
+     // frame. Returns std::nullopt on any failure (logged via RX_LOG_ERROR).
+     std::optional<Buffer> createHostVisibleBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
+ 
++    // Allocates a VkBuffer with `usage`, backed by DEVICE_LOCAL memory with
++    // no host-visibility request at all (VMA_MEMORY_USAGE_AUTO, no
++    // HOST_ACCESS_* flags, no MAPPED_BIT) -- the resulting Buffer's
++    // mappedData() is always nullptr. Suitable for GPU-only resources
++    // written exactly once via a real transfer (rx::rhi::Uploader) and
++    // read many times afterward, such as rx::rhi::MeshBuffers' vertex/
++    // index buffers -- never for anything the CPU writes directly.
++    // Returns std::nullopt on any failure (logged via RX_LOG_ERROR).
++    std::optional<Buffer> createDeviceLocalBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
++
++    // Result of createUploadRingBuffer() below: the allocated staging
++    // Buffer, plus whether VMA actually placed it in memory that is BOTH
++    // DEVICE_LOCAL and HOST_VISIBLE (the ReBAR/integrated-memory "direct"
++    // fast path [R:C1]) as opposed to falling back to plain HOST_VISIBLE
++    // system memory (the non-ReBAR desktop case). `deviceLocal` is a
++    // one-time, informational classification for logging/diagnostics --
++    // rx::rhi::Uploader's copy code (vkCmdCopyBuffer/
++    // vkCmdCopyBufferToImage from this buffer) is identical either way;
++    // only the underlying memory's physical location and copy bandwidth
++    // differ.
++    struct UploadBufferResult {
++        Buffer buffer;
++        bool deviceLocal = false;
++    };
++
++    // Allocates a VkBuffer with `usage` (typically just
++    // VK_BUFFER_USAGE_TRANSFER_SRC_BIT -- this is always a copy *source*,
++    // never a real destination resource) via VMA_MEMORY_USAGE_AUTO +
++    // VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
++    // VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT |
++    // VMA_ALLOCATION_CREATE_MAPPED_BIT -- the exact ReBAR-aware pattern
++    // [R:C1] documents: VMA tries a memory type that is both DEVICE_LOCAL
++    // and HOST_VISIBLE first, falling back to plain HOST_VISIBLE system
++    // memory if none exists or allocation from it fails. Which one was
++    // actually obtained is reported via the returned `deviceLocal` flag
++    // (checked once via vmaGetMemoryTypeProperties -- no physical-device
++    // handle needed here). Returns std::nullopt on any failure (logged).
++    std::optional<UploadBufferResult> createUploadRingBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
++
++    // Raw VmaAllocator handle -- needed by rx::rhi::Texture2D::create()
++    // (texture.h, a separate header/TU) to call vmaCreateImage/
++    // vmaDestroyImage directly, mirroring what this Allocator's own
++    // createHostVisibleBuffer()/createDeviceLocalBuffer() do internally
++    // for buffers. Deliberately not wrapped in an Allocator::createImage()
++    // method here: that would make buffer.h/buffer.cpp know about
++    // Texture2D (format-feature queries, mip-level computation), which
++    // belongs entirely in texture.h/texture.cpp instead. Not intended for
++    // ordinary callers -- prefer the create*Buffer() methods above for
++    // buffers, and Texture2D::create() for images.
++    VmaAllocator raw() const { return allocator_; }
++
+ private:
+     Allocator() = default;
+     explicit Allocator(VmaAllocator allocator) : allocator_(allocator) {}
+ 
+     void destroyAll();
+ 
+     VmaAllocator allocator_ = VK_NULL_HANDLE;
+ };
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/deletion_queue.h b/src/rx_rhi_vk/include/rx_rhi_vk/deletion_queue.h
+new file mode 100644
+index 0000000..e77b5e9
+--- /dev/null
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/deletion_queue.h
+@@ -0,0 +1,122 @@
++#pragma once
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <vector>
++
++namespace rx::rhi {
++
++// Fence-gated deferred-destruction queue [spec Fixed decision #9]. A
++// resource retired while it might still be referenced by an in-flight
++// command buffer must not actually be destroyed until the GPU has
++// finished with it -- retire() tags a destructor closure with the frame
++// index the resource was last used in; onFrameFenceSignaled(frameIndex)
++// runs (and permanently removes) every retired destructor whose tagged
++// frame index is <= the frame index the caller has just confirmed
++// completed on the GPU.
++//
++// This class deliberately owns NO Vulkan state at all -- no VkDevice, no
++// VkFence, nothing. It is a pure bookkeeping queue: the caller (a frame
++// loop, or a headless test driving fences by hand) is the one that waits
++// on real fences and decides when a given frame index is actually safe;
++// DeletionQueue's only job is running the right closures at the right
++// time, each exactly once. `frameIndex` here is meant to be a
++// monotonically increasing counter that never repeats for the lifetime of
++// whatever owns this queue -- rx::rhi::FrameSync::frameNumber() (added
++// this task for exactly this purpose) is the intended source in
++// production code, NOT FrameSync::currentFrameIndex(), which cycles mod
++// FrameSync::framesInFlight() and therefore cannot disambiguate "frame 5"
++// from "frame 7" once both land on the same frame-in-flight slot.
++//
++// Typical frame-loop usage:
++//   deletionQueue.retire([tex = std::make_shared<Texture2D>(std::move(oldTexture))] {},
++//                         frameSync.frameNumber());
++//   ... later, once this frame's fence has been waited on ...
++//   deletionQueue.onFrameFenceSignaled(frameSync.frameNumber());
++//
++// (The lambda's body can be empty when the destructor is really just "let
++// this moved-in RAII object's own destructor run" -- retire() still calls
++// it, which is harmless, and dropping the moved-in capture when the
++// std::function itself is erased is what actually destroys the
++// underlying Vulkan object either way.)
++//
++// STD::FUNCTION COPY-CONSTRUCTIBILITY PITFALL -- read before capturing a
++// move-only resource (rx::rhi::Buffer, Texture2D, MeshBuffers, Uploader,
++// ...) directly by move: `std::function<void()>`'s type-erased storage
++// requires its target callable to be COPY-constructible, even though
++// DeletionQueue itself never actually copies the std::function objects it
++// stores. A lambda that captures a move-only object by move (e.g.
++// `[buf = std::move(someBuffer)] {}`) has an implicitly-deleted copy
++// constructor, which fails to compile the moment it is handed to
++// `std::function<void()>` -- not a DeletionQueue bug, a real, standard
++// `std::function` requirement. The standard fix -- used throughout this
++// engine's own tests -- is to wrap the moved-in resource in a
++// `std::shared_ptr` first (`std::make_shared<Buffer>(std::move(buffer))`),
++// which IS copyable (the shared_ptr, not the Buffer inside it), and whose
++// own destructor still runs the underlying Vulkan teardown exactly once
++// when the last reference (here, always exactly one: the retired
++// std::function itself) is dropped.
++class DeletionQueue {
++public:
++    DeletionQueue() = default;
++    DeletionQueue(DeletionQueue&&) noexcept = default;
++    DeletionQueue& operator=(DeletionQueue&&) noexcept = default;
++    DeletionQueue(const DeletionQueue&) = delete;
++    DeletionQueue& operator=(const DeletionQueue&) = delete;
++
++    // Destructor contract (load-bearing, not a style note, mirroring
++    // FrameSync's own destructor contract in frame_sync.h): destroying a
++    // DeletionQueue with anything still pending runs every remaining
++    // captured RAII destructor as an ordinary side effect of this
++    // object's std::vector<Item> member being destroyed -- WITHOUT ever
++    // calling the destructor closures themselves and WITHOUT any device-
++    // idle guarantee. That is almost never what a caller actually wants
++    // (it is exactly the premature-destroy-while-in-flight bug this whole
++    // class exists to prevent). Callers must call flushAll() (which does
++    // provide a device-idle opportunity via `waitIdleFirst`) before
++    // letting a non-empty DeletionQueue go out of scope. This destructor
++    // cannot enforce that (it has no VkDevice to wait idle on), but it
++    // does the next best thing: logs a loud RX_LOG_ERROR naming how many
++    // destructors were never flushed, so the mistake is never silent.
++    ~DeletionQueue();
++
++    // Queues `destructor` to run once frame `frameIndex` has completed on
++    // the GPU (per this class's own contract above -- see
++    // onFrameFenceSignaled()). `destructor` may be empty-bodied if its
++    // only purpose is to own a moved-in RAII capture (see the class
++    // comment above).
++    void retire(std::function<void()> destructor, uint64_t frameIndex);
++
++    // Runs (in the order they were retired) and permanently removes every
++    // retired destructor tagged with frameIndex <= `completedFrameIndex`.
++    // Call this once per frame-loop iteration, immediately after
++    // confirming (via vkWaitForFences/vkGetFenceStatus, outside this
++    // class) that the fence for `completedFrameIndex` has actually
++    // signaled -- this function trusts the caller's claim entirely and
++    // never itself touches any Vulkan fence. Safe to call with nothing
++    // pending, or with nothing yet due (no-op either way).
++    void onFrameFenceSignaled(uint64_t completedFrameIndex);
++
++    // Shutdown path: runs every retired destructor unconditionally,
++    // regardless of its tagged frame index, then clears the queue.
++    // `waitIdleFirst`, if non-empty, is invoked before running anything --
++    // pass e.g. `[device] { vkDeviceWaitIdle(device); }` so this queue
++    // never runs a destructor while the GPU could still be using the
++    // resource it frees. Safe to call on an already-empty queue (still
++    // invokes `waitIdleFirst` if provided, then no-ops).
++    void flushAll(const std::function<void()>& waitIdleFirst = {});
++
++    // Number of retired destructors not yet run. Test/diagnostic
++    // accessor -- production frame-loop code has no need for it.
++    size_t pendingCount() const { return items_.size(); }
++
++private:
++    struct Item {
++        uint64_t frameIndex = 0;
++        std::function<void()> destructor;
++    };
++
++    std::vector<Item> items_;
++};
++
++}  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/frame_sync.h b/src/rx_rhi_vk/include/rx_rhi_vk/frame_sync.h
+index 97b94e2..01692e2 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/frame_sync.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/frame_sync.h
+@@ -85,20 +85,31 @@ public:
+     ~FrameSync();
+ 
+     static std::optional<FrameSync> create(VkDevice device, uint32_t queueFamily, uint32_t swapchainImageCount);
+ 
+     static constexpr uint32_t framesInFlight() { return kFramesInFlight; }
+ 
+     // Index of the frame-in-flight slot every current*() accessor below
+     // currently reads from; advanced by advanceFrame().
+     uint32_t currentFrameIndex() const { return currentFrame_; }
+ 
++    // Monotonically increasing count of completed advanceFrame() calls
++    // since create() -- NOT the same value as currentFrameIndex(), which
++    // cycles mod kFramesInFlight (0, 1, 0, 1, ...) and therefore cannot
++    // disambiguate "frame 5" from "frame 7" once both land on the same
++    // frame-in-flight slot. rx::rhi::DeletionQueue (Task 4) keys its
++    // retire()/onFrameFenceSignaled() calls on THIS counter instead,
++    // specifically because it needs a value that never repeats for the
++    // lifetime of this FrameSync -- the minimal hook this class needed
++    // for that integration, per the Phase 2 plan's Task 4 brief.
++    uint64_t frameNumber() const { return frameNumber_; }
++
+     // Current frame-in-flight slot's fence. Created VK_FENCE_CREATE_SIGNALED_BIT
+     // so the loop's very first wait on any slot returns immediately. The
+     // loop's contract with this fence: wait on it before touching this
+     // slot's command pool/buffer again (the wait is what proves the GPU is
+     // done with whatever this slot last submitted), but only reset it once
+     // the loop has confirmed it is actually going to record and submit again
+     // this iteration -- see frame_sync.h's discussion in the present loop's
+     // own comments (samples/01_triangle/main.cpp) for why resetting
+     // unconditionally before acquireNextImage() would deadlock the very next
+     // wait whenever acquire itself reports NeedsRecreate.
+@@ -125,22 +136,26 @@ public:
+     // Device::acquireNextImage() returned) -- signaled by the submit that
+     // renders into that image, waited on by Device::present() for that same
+     // image. See the class-level comment for why this must be indexed by
+     // image, not by frame-in-flight slot.
+     VkSemaphore renderFinishedSemaphore(uint32_t imageIndex) const { return renderFinished_[imageIndex]; }
+ 
+     // Advances to the next frame-in-flight slot ((current + 1) % framesInFlight()).
+     // Call exactly once per loop iteration that completes a full
+     // acquire/record/submit/present cycle -- not on an iteration that bails
+     // out early via NeedsRecreate's `continue` path, since that iteration
+-    // never submitted anything against the current slot.
+-    void advanceFrame() { currentFrame_ = (currentFrame_ + 1) % kFramesInFlight; }
++    // never submitted anything against the current slot. Also increments
++    // frameNumber() -- the two counters advance together, by construction.
++    void advanceFrame() {
++        currentFrame_ = (currentFrame_ + 1) % kFramesInFlight;
++        ++frameNumber_;
++    }
+ 
+     // Rebuilds the per-swapchain-image renderFinished semaphores for a new
+     // image count after Device::recreateSwapchain() -- the per-frame-in-
+     // flight objects (fences/imageAvailable semaphores/command pools/command
+     // buffers) are untouched, since none of them depend on how many
+     // swapchain images exist. Caller must have reached device idle first
+     // (see the class-level destructor contract; the present loop's
+     // NeedsRecreate path already guarantees this by construction). Returns
+     // false (logged) on any vkCreateSemaphore failure, leaving this
+     // FrameSync with however many of the new semaphores were successfully
+@@ -158,13 +173,14 @@ private:
+     VkDevice device_ = VK_NULL_HANDLE;
+ 
+     std::array<VkFence, kFramesInFlight> fences_{};
+     std::array<VkSemaphore, kFramesInFlight> imageAvailable_{};
+     std::array<VkCommandPool, kFramesInFlight> commandPools_{};
+     std::array<VkCommandBuffer, kFramesInFlight> commandBuffers_{};
+ 
+     std::vector<VkSemaphore> renderFinished_;
+ 
+     uint32_t currentFrame_ = 0;
++    uint64_t frameNumber_ = 0;
+ };
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/mesh_buffers.h b/src/rx_rhi_vk/include/rx_rhi_vk/mesh_buffers.h
+new file mode 100644
+index 0000000..82ed282
+--- /dev/null
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/mesh_buffers.h
+@@ -0,0 +1,77 @@
++#pragma once
++#include <rx_rhi_vk/buffer.h>
++#include <cstdint>
++#include <optional>
++#include <utility>
++
++namespace rx::rhi {
++
++class Uploader;
++
++// Two device-local (Allocator::createDeviceLocalBuffer() -- no host
++// visibility at all) buffers, vertex and index, populated exactly once
++// via an rx::rhi::Uploader and thereafter read-only from the GPU's
++// perspective -- the mesh-storage building block Task 6+'s sample
++// geometry is built on.
++//
++// Move-only; both underlying rx::rhi::Buffer members already handle
++// their own vmaDestroyBuffer teardown correctly on move/destruction, so
++// MeshBuffers itself needs no raw handles, no destroyAll(), and its move
++// constructor/assignment are safely `= default` (unlike most other RAII
++// types in this library, which own at least one raw Vulkan handle
++// directly and must hand-write their move operations to null the source --
++// see e.g. rx::rhi::Uploader's own comment on exactly this point).
++//
++// MeshBuffers must not outlive the Allocator (and beneath it, Device/
++// Context) its two Buffers were allocated from -- same discipline as
++// every other Allocator-derived RAII type in this library (see buffer.h).
++class MeshBuffers {
++public:
++    MeshBuffers(MeshBuffers&&) noexcept = default;
++    MeshBuffers& operator=(MeshBuffers&&) noexcept = default;
++    MeshBuffers(const MeshBuffers&) = delete;
++    MeshBuffers& operator=(const MeshBuffers&) = delete;
++    ~MeshBuffers() = default;
++
++    // Allocates a device-local vertex buffer (`vertexBytes`, usage
++    // VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
++    // and index buffer (`indexBytes`, usage
++    // VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
++    // via `allocator`, then uploads `vertexData`/`indexData` into them
++    // through `uploader` and calls `uploader.flush()` itself before
++    // returning -- so by the time this call returns, both buffers are
++    // already fully populated and safe to bind/draw from immediately
++    // (no separate flush() needed by the caller for just this call).
++    // `indexCount` is stored verbatim for indexCount() below (this class
++    // does not infer it from indexBytes/index-type size, since a caller
++    // already knows it and a stored value is unambiguous regardless of
++    // index type).
++    //
++    // Returns std::nullopt (logged) if either buffer allocation or either
++    // upload fails.
++    static std::optional<MeshBuffers> create(Allocator& allocator, Uploader& uploader, const void* vertexData,
++                                              VkDeviceSize vertexBytes, const void* indexData,
++                                              VkDeviceSize indexBytes, uint32_t indexCount,
++                                              VkIndexType indexType = VK_INDEX_TYPE_UINT32);
++
++    VkBuffer vertexBuffer() const { return vertexBuffer_.handle(); }
++    VkBuffer indexBuffer() const { return indexBuffer_.handle(); }
++    VkDeviceSize vertexBufferSize() const { return vertexBuffer_.size(); }
++    VkDeviceSize indexBufferSize() const { return indexBuffer_.size(); }
++    uint32_t indexCount() const { return indexCount_; }
++    VkIndexType indexType() const { return indexType_; }
++
++private:
++    MeshBuffers(Buffer vertexBuffer, Buffer indexBuffer, uint32_t indexCount, VkIndexType indexType)
++        : vertexBuffer_(std::move(vertexBuffer)),
++          indexBuffer_(std::move(indexBuffer)),
++          indexCount_(indexCount),
++          indexType_(indexType) {}
++
++    Buffer vertexBuffer_;
++    Buffer indexBuffer_;
++    uint32_t indexCount_ = 0;
++    VkIndexType indexType_ = VK_INDEX_TYPE_UINT32;
++};
++
++}  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/texture.h b/src/rx_rhi_vk/include/rx_rhi_vk/texture.h
+new file mode 100644
+index 0000000..a1166e4
+--- /dev/null
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/texture.h
+@@ -0,0 +1,141 @@
++#pragma once
++// volk first: with VK_NO_PROTOTYPES set (rx_rhi_vk's PUBLIC compile
++// definition, buffer.h's own comment on VMA's dynamic-loading path
++// explains why), <vulkan/vulkan.h> declares no real Vulkan functions at
++// all -- volk.h is what actually declares them, as `extern PFN_vkFoo vkFoo;`
++// globals populated by volkLoadDevice()/volkLoadInstance() (see context.h/
++// device.h). Every direct Vulkan call this header's .cpp makes
++// (vkCreateImageView, vkCmdBlitImage, vkCmdPipelineBarrier2, ...) needs
++// this; buffer.h/buffer.cpp never needed it because they only ever call
++// VMA's own vmaCreateBuffer()-style functions, never a raw vkFoo directly.
++#include <volk.h>
++// Reuses buffer.h's include of <vk_mem_alloc.h> (with
++// VMA_STATIC_VULKAN_FUNCTIONS=0 / VMA_DYNAMIC_VULKAN_FUNCTIONS=1 already
++// defined there) rather than repeating those defines here -- VMA requires
++// them visible before its header is included, but only ever once
++// per-TU-chain; buffer.h already does this. See buffer.h's own comment for
++// the full rationale. This also brings in rx::rhi::Allocator, needed below.
++#include <rx_rhi_vk/buffer.h>
++#include <optional>
++
++namespace rx::rhi {
++
++// A single VMA-backed VkImage + VkImageView, always 2D, always a single
++// array layer. Move-only RAII: destroys the view then the image
++// (vmaDestroyImage, which also frees the VmaAllocation) on destruction or
++// move-assignment.
++//
++// Same lifetime discipline as Buffer (buffer.h): a Texture2D must not
++// outlive the Allocator (and beneath it, Device/Context) it was created
++// from.
++class Texture2D {
++public:
++    Texture2D(Texture2D&&) noexcept;
++    Texture2D& operator=(Texture2D&&) noexcept;
++    Texture2D(const Texture2D&) = delete;
++    Texture2D& operator=(const Texture2D&) = delete;
++    ~Texture2D();
++
++    // Pass 0 for `requestedMipLevels` to auto-compute a full mip chain
++    // down to 1x1 (floor(log2(max(extent.width, extent.height))) + 1);
++    // pass a specific count to request exactly that many (clamped down to
++    // the maximum the extent actually supports, silently -- requesting
++    // more levels than an extent can produce is a caller-side rounding
++    // convenience, not an error worth failing over).
++    //
++    // Before honoring any mipLevels > 1 request, this queries
++    // `physicalDevice`'s VK_FORMAT_FEATURE_BLIT_SRC_BIT |
++    // VK_FORMAT_FEATURE_BLIT_DST_BIT support for `format` under optimal
++    // tiling (both bits: the blit chain this Texture2D's
++    // recordMipChainBlit() records reads FROM level N via
++    // VK_FORMAT_FEATURE_BLIT_SRC_BIT and writes TO level N+1 via
++    // VK_FORMAT_FEATURE_BLIT_DST_BIT -- the brief's own shorthand names
++    // only the DST bit, but SRC is equally required for a blit chain to
++    // work at all, so both are checked here). If either is unsupported,
++    // this silently falls back to a single mip level and logs
++    // RX_LOG_WARN naming the format [R:C2] -- never a hard failure, since
++    // a texture with no mips is still a perfectly usable texture.
++    //
++    // `usage` is ORed with VK_IMAGE_USAGE_TRANSFER_DST_BIT unconditionally
++    // (level 0 always needs to be a copy destination for
++    // rx::rhi::Uploader::uploadToImage()) and additionally with
++    // VK_IMAGE_USAGE_TRANSFER_SRC_BIT whenever the resulting mip count
++    // ends up > 1 (every level but the last needs to be a blit source).
++    // Callers should NOT add either of those bits themselves; this
++    // function already does.
++    //
++    // `physicalDevice`/`device` are used for the format-feature query
++    // above and for vkCreateImageView/vkDestroyImageView respectively --
++    // the same kind of brief-shorthand elaboration Task 3's
++    // BindlessTable::create() made for its own capacity pre-check (see
++    // that class's own header comment and task-3-report.md), for the same
++    // reason: a clean, logged single-mip fallback cannot be implemented
++    // without a real feature query, and an Allocator alone exposes
++    // neither a VkPhysicalDevice nor a VkDevice to get one from.
++    //
++    // Returns std::nullopt (logged) on any image/view creation failure.
++    static std::optional<Texture2D> create(VkPhysicalDevice physicalDevice, VkDevice device, Allocator& allocator,
++                                            VkExtent2D extent, VkFormat format, VkImageUsageFlags usage,
++                                            uint32_t requestedMipLevels = 0);
++
++    VkImage image() const { return image_; }
++    VkImageView view() const { return view_; }
++    VkExtent2D extent() const { return extent_; }
++    VkFormat format() const { return format_; }
++    uint32_t mipLevels() const { return mipLevels_; }
++
++    // Records the full mip-chain blit for a texture whose level 0 was
++    // just written (e.g. by rx::rhi::Uploader::uploadToImage()) and is
++    // currently in VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, with every level
++    // 1..mipLevels()-1 still in its initial VK_IMAGE_LAYOUT_UNDEFINED.
++    // Issues the per-level VkImageMemoryBarrier2 + vkCmdBlitImage sequence
++    // (level 0 -> 1, barrier, 1 -> 2, barrier, ...) and leaves EVERY level
++    // in VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL on return, ready for
++    // sampling. A no-op beyond that same final transition if
++    // mipLevels() == 1 (nothing to blit; level 0 alone still needs the
++    // TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL barrier).
++    //
++    // sRGB CAVEAT [R:C2]: vkCmdBlitImage's VK_FILTER_LINEAR box-filters
++    // texel VALUES in the image's own stored encoding -- for a UNORM
++    // format this is a correct linear-light average; for an SRGB format
++    // the same blit instead averages gamma-encoded (perceptual) values
++    // directly, which is NOT equivalent to decoding to linear light,
++    // averaging, and re-encoding to sRGB. The result is measurably
++    // (if subtly) too dark/desaturated versus a "correct" mip chain --
++    // this is the exact bug class libktx's own `ktx create` tool shipped
++    // and later fixed ("sRGB images being resampled without first
++    // decoding to linear", KTX-Software v4.4.2 release notes). This
++    // engine accepts that caveat for this phase rather than building a
++    // decode/average/re-encode compute pass: the spec's Fixed decision #8
++    // restricts Phase 2 samples to UNORM formats specifically so this
++    // caveat never actually applies to shipped content. Do not reuse this
++    // function unmodified for an SRGB-format Texture2D without accounting
++    // for it first.
++    void recordMipChainBlit(VkCommandBuffer cmd) const;
++
++private:
++    Texture2D() = default;
++    Texture2D(VmaAllocator allocator, VkDevice device, VkImage image, VmaAllocation allocation, VkImageView view,
++               VkExtent2D extent, VkFormat format, uint32_t mipLevels)
++        : allocator_(allocator),
++          device_(device),
++          image_(image),
++          allocation_(allocation),
++          view_(view),
++          extent_(extent),
++          format_(format),
++          mipLevels_(mipLevels) {}
++
++    void destroyAll();
++
++    VmaAllocator allocator_ = VK_NULL_HANDLE;
++    VkDevice device_ = VK_NULL_HANDLE;
++    VkImage image_ = VK_NULL_HANDLE;
++    VmaAllocation allocation_ = VK_NULL_HANDLE;
++    VkImageView view_ = VK_NULL_HANDLE;
++    VkExtent2D extent_{0, 0};
++    VkFormat format_ = VK_FORMAT_UNDEFINED;
++    uint32_t mipLevels_ = 1;
++};
++
++}  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/upload.h b/src/rx_rhi_vk/include/rx_rhi_vk/upload.h
+new file mode 100644
+index 0000000..eb7dddd
+--- /dev/null
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/upload.h
+@@ -0,0 +1,166 @@
++#pragma once
++#include <rx_rhi_vk/buffer.h>
++#include <cstdint>
++#include <optional>
++#include <utility>
++
++namespace rx::rhi {
++
++class Device;
++class Texture2D;
++
++// Gets CPU-side bytes into GPU-visible/device-local Vulkan resources:
++// uploadToBuffer() for an arbitrary destination VkBuffer, uploadToImage()
++// for a Texture2D (optionally generating its full mip chain via
++// Texture2D::recordMipChainBlit() in the same submission) [spec Fixed
++// decision #7, R:C1].
++//
++// SYNCHRONOUS, BATCHED FLUSH -- read before assuming per-call semantics:
++// uploadToBuffer()/uploadToImage() only RECORD commands (a
++// vkCmdCopyBuffer/vkCmdCopyBufferToImage, plus any mip-chain blit) onto
++// this Uploader's own internal command buffer; nothing touches the GPU
++// until flush() actually submits everything recorded so far and BLOCKS
++// the calling thread on a fence wait until it completes. This lets
++// several uploads share one submission (cheaper than one submit-and-wait
++// per resource) while keeping this phase's API deliberately simple: a
++// fully synchronous flush() is an explicitly acceptable Phase 2 choice
++// [R:C1] -- "Synchronous flush API is acceptable this phase ... per-frame
++// async batching is a later optimization." A future Uploader revision
++// replacing this with a fence the caller polls (instead of blocking on)
++// would change flush()'s contract but not uploadToBuffer()/
++// uploadToImage()'s.
++//
++// STAGING RING BUFFER + REBAR DETECTION [R:C1]: one persistent,
++// CPU-writable ring buffer (Allocator::createUploadRingBuffer(), using
++// VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT) backs
++// every upload. VMA tries to place it in memory that is BOTH
++// DEVICE_LOCAL and HOST_VISIBLE first (ReBAR-enabled desktop GPUs, or a
++// unified-memory APU like Steam Deck) for a fast on-device copy;
++// hardware without that (the common non-ReBAR desktop case) transparently
++// falls back to plain HOST_VISIBLE system memory, and the exact same
++// vkCmdCopyBuffer/vkCmdCopyBufferToImage code path below still works
++// correctly either way -- just over a slower, real PCIe-bound transfer
++// instead of an on-device one. Which one was obtained is detected once at
++// create() (never per-upload) and logged once via RX_LOG_INFO; see
++// usesDirectPath(). Every mapped write into the ring buffer is followed
++// by Buffer::flush() (this task's own Buffer API addition) before the GPU
++// reads it, so this is correct even on a hypothetical non-coherent
++// HOST_VISIBLE memory type, not just the coherent-in-practice hardware
++// this engine has been tested against.
++//
++// If a single upload's write position would run past the ring buffer's
++// end before the pending batch is flushed, this Uploader transparently
++// calls flush() itself first (submitting + waiting on everything
++// recorded so far, which frees the whole ring buffer for reuse since
++// flush() is synchronous) and then continues writing from offset 0 --
++// callers never need to reason about ring-buffer capacity themselves
++// unless a single upload's size exceeds the ring buffer's total capacity,
++// which fails cleanly (logged, returns false) rather than silently
++// corrupting anything.
++class Uploader {
++public:
++    Uploader(Uploader&&) noexcept;
++    Uploader& operator=(Uploader&&) noexcept;
++    Uploader(const Uploader&) = delete;
++    Uploader& operator=(const Uploader&) = delete;
++
++    // Auto-flushes any pending (recorded-but-not-yet-submitted) uploads
++    // before tearing down the ring buffer/command pool/fence, so a
++    // caller that forgets an explicit final flush() never silently loses
++    // work -- see flush()'s own comment for why this is safe to do here
++    // unconditionally (it blocks on the same fence wait flush() always
++    // does).
++    ~Uploader();
++
++    static constexpr VkDeviceSize kDefaultRingBufferSize = 16u * 1024u * 1024u;  // 16 MiB
++
++    // Builds this Uploader's internal command pool/buffer/fence against
++    // `device`'s graphics queue, and its staging ring buffer (`usage`
++    // VK_BUFFER_USAGE_TRANSFER_SRC_BIT only -- this buffer is always a
++    // copy source, never a real destination) of `ringBufferSize` bytes
++    // via `allocator`. Returns std::nullopt (logged) on any failure.
++    static std::optional<Uploader> create(Allocator& allocator, Device& device,
++                                           VkDeviceSize ringBufferSize = kDefaultRingBufferSize);
++
++    // Copies `size` bytes from `data` into `dst` at `dstOffset`, through
++    // the ring buffer, recording a vkCmdCopyBuffer onto this Uploader's
++    // internal command buffer -- see the class comment for why nothing
++    // actually reaches the GPU until flush(). `dst` is assumed to already
++    // be sized/allocated by the caller (e.g. via
++    // Allocator::createDeviceLocalBuffer()) with VK_BUFFER_USAGE_TRANSFER_DST_BIT.
++    // Returns false (logged) only if `size` exceeds this Uploader's total
++    // ring-buffer capacity outright -- every other case (including a
++    // same-batch auto-flush to reclaim ring space) succeeds. A `size` of
++    // 0 is a no-op that returns true.
++    bool uploadToBuffer(VkBuffer dst, VkDeviceSize dstOffset, const void* data, VkDeviceSize size);
++
++    // Copies `pixelBytes` bytes from `pixels` (tightly packed, matching
++    // `dst`'s extent/format texel layout) into mip level 0 of `dst`,
++    // through the ring buffer, then transitions `dst` to
++    // VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL -- via
++    // Texture2D::recordMipChainBlit() (generating the full mip chain in
++    // the same recorded batch) when `generateMips` is true AND
++    // `dst.mipLevels() > 1`, or via a single whole-image layout
++    // transition otherwise. As with uploadToBuffer(), nothing reaches the
++    // GPU until flush(). Returns false (logged) only if `pixelBytes`
++    // exceeds this Uploader's total ring-buffer capacity outright. A
++    // `pixelBytes` of 0 is a no-op that returns true.
++    bool uploadToImage(Texture2D& dst, const void* pixels, VkDeviceSize pixelBytes, bool generateMips);
++
++    // Submits every uploadTo*() call recorded since the last flush() (or
++    // since create()), waits (via this Uploader's own dedicated fence)
++    // for the GPU to finish, then resets the ring buffer's write cursor
++    // back to 0 and the command buffer for reuse. Safe to call with
++    // nothing pending (no-op).
++    void flush();
++
++    // Whether the ring buffer ended up in DEVICE_LOCAL memory (the
++    // ReBAR/integrated-memory fast path) as opposed to the plain
++    // HOST_VISIBLE fallback -- see the class comment. Informational only;
++    // does not change which Vulkan calls uploadTo*() issues.
++    bool usesDirectPath() const { return ringBufferIsDeviceLocal_; }
++
++private:
++    // No plain default constructor: `ringBuffer_` is a real
++    // rx::rhi::Buffer, whose own default constructor is private to Buffer
++    // (friends only, see buffer.h) -- Uploader is not a friend of Buffer
++    // and does not need to be. create() builds every member's real value
++    // up front and constructs this Uploader directly via this
++    // parameterized constructor instead (mirroring
++    // rx::rhi::MeshBuffers/Texture2D's own equivalent constructors, for
++    // the same reason). The move constructor/assignment below are
++    // hand-written rather than `= default` for the opposite reason: this
++    // class also owns several *raw* Vulkan handles (pool_/cmd_/fence_),
++    // which a defaulted move would copy without nulling the source --
++    // exactly the double-destroy hazard every other RAII type in this
++    // library's move operations are hand-written to avoid.
++    Uploader(VkDevice device, VkQueue queue, VkCommandPool pool, VkCommandBuffer cmd, VkFence fence,
++             Buffer ringBuffer, VkDeviceSize ringBufferSize, bool ringBufferIsDeviceLocal)
++        : device_(device),
++          queue_(queue),
++          pool_(pool),
++          cmd_(cmd),
++          fence_(fence),
++          ringBuffer_(std::move(ringBuffer)),
++          ringBufferSize_(ringBufferSize),
++          ringBufferIsDeviceLocal_(ringBufferIsDeviceLocal) {}
++
++    void beginRecordingIfNeeded();
++    bool reserveRingSpace(VkDeviceSize size, VkDeviceSize& outOffset);
++    void destroyAll();
++
++    VkDevice device_ = VK_NULL_HANDLE;
++    VkQueue queue_ = VK_NULL_HANDLE;
++    VkCommandPool pool_ = VK_NULL_HANDLE;
++    VkCommandBuffer cmd_ = VK_NULL_HANDLE;
++    VkFence fence_ = VK_NULL_HANDLE;
++
++    Buffer ringBuffer_;
++    VkDeviceSize ringBufferSize_ = 0;
++    VkDeviceSize ringCursor_ = 0;
++    bool ringBufferIsDeviceLocal_ = false;
++
++    bool recording_ = false;
++};
++
++}  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/buffer.cpp b/src/rx_rhi_vk/src/buffer.cpp
+index 8d203d7..c4a7ced 100644
+--- a/src/rx_rhi_vk/src/buffer.cpp
++++ b/src/rx_rhi_vk/src/buffer.cpp
+@@ -55,20 +55,74 @@ std::optional<Buffer> Allocator::createHostVisibleBuffer(VkDeviceSize size, VkBu
+     VkResult result =
+         vmaCreateBuffer(allocator_, &bufferInfo, &allocCreateInfo, &buffer, &allocation, &allocationInfo);
+     if (result != VK_SUCCESS) {
+         RX_LOG_ERROR("vmaCreateBuffer failed: VkResult={}", static_cast<int>(result));
+         return std::nullopt;
+     }
+ 
+     return Buffer(allocator_, buffer, allocation, allocationInfo.pMappedData, size);
+ }
+ 
++std::optional<Buffer> Allocator::createDeviceLocalBuffer(VkDeviceSize size, VkBufferUsageFlags usage) {
++    VkBufferCreateInfo bufferInfo{};
++    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
++    bufferInfo.size = size;
++    bufferInfo.usage = usage;
++    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++
++    VmaAllocationCreateInfo allocCreateInfo{};
++    allocCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
++
++    VkBuffer buffer = VK_NULL_HANDLE;
++    VmaAllocation allocation = VK_NULL_HANDLE;
++    VmaAllocationInfo allocationInfo{};
++    VkResult result =
++        vmaCreateBuffer(allocator_, &bufferInfo, &allocCreateInfo, &buffer, &allocation, &allocationInfo);
++    if (result != VK_SUCCESS) {
++        RX_LOG_ERROR("vmaCreateBuffer (device-local) failed: VkResult={}", static_cast<int>(result));
++        return std::nullopt;
++    }
++
++    return Buffer(allocator_, buffer, allocation, allocationInfo.pMappedData, size);
++}
++
++std::optional<Allocator::UploadBufferResult> Allocator::createUploadRingBuffer(VkDeviceSize size,
++                                                                                  VkBufferUsageFlags usage) {
++    VkBufferCreateInfo bufferInfo{};
++    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
++    bufferInfo.size = size;
++    bufferInfo.usage = usage;
++    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++
++    VmaAllocationCreateInfo allocCreateInfo{};
++    allocCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
++    allocCreateInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
++                             VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT |
++                             VMA_ALLOCATION_CREATE_MAPPED_BIT;
++
++    VkBuffer buffer = VK_NULL_HANDLE;
++    VmaAllocation allocation = VK_NULL_HANDLE;
++    VmaAllocationInfo allocationInfo{};
++    VkResult result =
++        vmaCreateBuffer(allocator_, &bufferInfo, &allocCreateInfo, &buffer, &allocation, &allocationInfo);
++    if (result != VK_SUCCESS) {
++        RX_LOG_ERROR("vmaCreateBuffer (upload ring buffer) failed: VkResult={}", static_cast<int>(result));
++        return std::nullopt;
++    }
++
++    VkMemoryPropertyFlags memoryFlags = 0;
++    vmaGetMemoryTypeProperties(allocator_, allocationInfo.memoryType, &memoryFlags);
++    bool deviceLocal = (memoryFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
++
++    return UploadBufferResult{Buffer(allocator_, buffer, allocation, allocationInfo.pMappedData, size), deviceLocal};
++}
++
+ Allocator::Allocator(Allocator&& other) noexcept : Allocator() {
+     *this = std::move(other);
+ }
+ 
+ Allocator& Allocator::operator=(Allocator&& other) noexcept {
+     if (this != &other) {
+         destroyAll();
+ 
+         allocator_ = other.allocator_;
+         other.allocator_ = VK_NULL_HANDLE;
+@@ -112,11 +166,31 @@ Buffer& Buffer::operator=(Buffer&& other) noexcept {
+ Buffer::~Buffer() {
+     destroyAll();
+ }
+ 
+ void Buffer::destroyAll() {
+     if (buffer_ != VK_NULL_HANDLE) {
+         vmaDestroyBuffer(allocator_, buffer_, allocation_);
+     }
+ }
+ 
++void Buffer::flush(VkDeviceSize offset, VkDeviceSize size) const {
++    if (buffer_ == VK_NULL_HANDLE) {
++        return;
++    }
++    VkResult result = vmaFlushAllocation(allocator_, allocation_, offset, size);
++    if (result != VK_SUCCESS) {
++        RX_LOG_ERROR("vmaFlushAllocation failed: VkResult={}", static_cast<int>(result));
++    }
++}
++
++void Buffer::invalidate(VkDeviceSize offset, VkDeviceSize size) const {
++    if (buffer_ == VK_NULL_HANDLE) {
++        return;
++    }
++    VkResult result = vmaInvalidateAllocation(allocator_, allocation_, offset, size);
++    if (result != VK_SUCCESS) {
++        RX_LOG_ERROR("vmaInvalidateAllocation failed: VkResult={}", static_cast<int>(result));
++    }
++}
++
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/deletion_queue.cpp b/src/rx_rhi_vk/src/deletion_queue.cpp
+new file mode 100644
+index 0000000..9c5771b
+--- /dev/null
++++ b/src/rx_rhi_vk/src/deletion_queue.cpp
+@@ -0,0 +1,58 @@
++#include <rx_rhi_vk/deletion_queue.h>
++#include <rx_core/log.h>
++#include <utility>
++
++namespace rx::rhi {
++
++DeletionQueue::~DeletionQueue() {
++    if (!items_.empty()) {
++        RX_LOG_ERROR(
++            "DeletionQueue destroyed with {} destructor(s) never flushed -- call flushAll() before destruction; "
++            "their captured resources are being destroyed now, with no device-idle guarantee",
++            items_.size());
++    }
++}
++
++void DeletionQueue::retire(std::function<void()> destructor, uint64_t frameIndex) {
++    items_.push_back(Item{frameIndex, std::move(destructor)});
++}
++
++void DeletionQueue::onFrameFenceSignaled(uint64_t completedFrameIndex) {
++    if (items_.empty()) {
++        return;
++    }
++
++    // Two-pass rather than an erase-remove-with-side-effects idiom: the
++    // predicate in std::remove_if/std::erase_if is not guaranteed to be
++    // invoked exactly once per element, which would make "call the
++    // destructor as a side effect of the predicate" unsafe. Building a
++    // fresh `remaining` vector, running due destructors in their original
++    // retire() order along the way, keeps both guarantees ("runs each due
++    // destructor exactly once" and "preserves order") simple and correct.
++    std::vector<Item> remaining;
++    remaining.reserve(items_.size());
++    for (auto& item : items_) {
++        if (item.frameIndex <= completedFrameIndex) {
++            if (item.destructor) {
++                item.destructor();
++            }
++        } else {
++            remaining.push_back(std::move(item));
++        }
++    }
++    items_ = std::move(remaining);
++}
++
++void DeletionQueue::flushAll(const std::function<void()>& waitIdleFirst) {
++    if (waitIdleFirst) {
++        waitIdleFirst();
++    }
++    for (auto& item : items_) {
++        if (item.destructor) {
++            item.destructor();
++        }
++    }
++    items_.clear();
++}
++
++}  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/frame_sync.cpp b/src/rx_rhi_vk/src/frame_sync.cpp
+index e52c8ad..0d9c014 100644
+--- a/src/rx_rhi_vk/src/frame_sync.cpp
++++ b/src/rx_rhi_vk/src/frame_sync.cpp
+@@ -101,28 +101,30 @@ FrameSync& FrameSync::operator=(FrameSync&& other) noexcept {
+     if (this != &other) {
+         destroyAll();
+ 
+         device_ = other.device_;
+         fences_ = other.fences_;
+         imageAvailable_ = other.imageAvailable_;
+         commandPools_ = other.commandPools_;
+         commandBuffers_ = other.commandBuffers_;
+         renderFinished_ = std::move(other.renderFinished_);
+         currentFrame_ = other.currentFrame_;
++        frameNumber_ = other.frameNumber_;
+ 
+         other.device_ = VK_NULL_HANDLE;
+         other.fences_.fill(VK_NULL_HANDLE);
+         other.imageAvailable_.fill(VK_NULL_HANDLE);
+         other.commandPools_.fill(VK_NULL_HANDLE);
+         other.commandBuffers_.fill(VK_NULL_HANDLE);
+         other.renderFinished_.clear();
+         other.currentFrame_ = 0;
++        other.frameNumber_ = 0;
+     }
+     return *this;
+ }
+ 
+ FrameSync::~FrameSync() {
+     destroyAll();
+ }
+ 
+ void FrameSync::destroyAll() {
+     destroyRenderFinishedSemaphores();
+diff --git a/src/rx_rhi_vk/src/mesh_buffers.cpp b/src/rx_rhi_vk/src/mesh_buffers.cpp
+new file mode 100644
+index 0000000..266c373
+--- /dev/null
++++ b/src/rx_rhi_vk/src/mesh_buffers.cpp
+@@ -0,0 +1,47 @@
++#include <rx_rhi_vk/mesh_buffers.h>
++#include <rx_rhi_vk/upload.h>
++#include <rx_core/log.h>
++#include <utility>
++
++namespace rx::rhi {
++
++std::optional<MeshBuffers> MeshBuffers::create(Allocator& allocator, Uploader& uploader, const void* vertexData,
++                                                VkDeviceSize vertexBytes, const void* indexData,
++                                                VkDeviceSize indexBytes, uint32_t indexCount, VkIndexType indexType) {
++    // TRANSFER_SRC_BIT alongside TRANSFER_DST_BIT on both buffers, even
++    // though production draw code only ever reads them as
++    // VERTEX_BUFFER_BIT/INDEX_BUFFER_BIT: it costs nothing on any target
++    // this engine cares about, and it is what lets a debug readback (or a
++    // future GPU-side consumer, e.g. building an acceleration structure
++    // straight from these buffers) copy out of them directly instead of
++    // needing a separate shadow copy.
++    auto vertexBuffer = allocator.createDeviceLocalBuffer(
++        vertexBytes,
++        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    if (!vertexBuffer.has_value()) {
++        RX_LOG_ERROR("MeshBuffers::create: vertex buffer allocation failed ({} bytes)", vertexBytes);
++        return std::nullopt;
++    }
++
++    auto indexBuffer = allocator.createDeviceLocalBuffer(
++        indexBytes,
++        VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    if (!indexBuffer.has_value()) {
++        RX_LOG_ERROR("MeshBuffers::create: index buffer allocation failed ({} bytes)", indexBytes);
++        return std::nullopt;
++    }
++
++    if (!uploader.uploadToBuffer(vertexBuffer->handle(), 0, vertexData, vertexBytes)) {
++        RX_LOG_ERROR("MeshBuffers::create: vertex upload failed");
++        return std::nullopt;
++    }
++    if (!uploader.uploadToBuffer(indexBuffer->handle(), 0, indexData, indexBytes)) {
++        RX_LOG_ERROR("MeshBuffers::create: index upload failed");
++        return std::nullopt;
++    }
++    uploader.flush();
++
++    return MeshBuffers(std::move(*vertexBuffer), std::move(*indexBuffer), indexCount, indexType);
++}
++
++}  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/stb_impl.cpp b/src/rx_rhi_vk/src/stb_impl.cpp
+new file mode 100644
+index 0000000..bc3a008
+--- /dev/null
++++ b/src/rx_rhi_vk/src/stb_impl.cpp
+@@ -0,0 +1,20 @@
++// The sole STB_IMAGE_IMPLEMENTATION translation unit for this entire
++// program -- mirrors vma_impl.cpp's own single-TU-implementation
++// discipline for the exact same reason: stb_image.h's real implementation
++// only gets compiled wherever STB_IMAGE_IMPLEMENTATION is defined before
++// the header is included, and defining it in more than one TU is a
++// duplicate-symbol link error. Every other consumer of stb_image (none in
++// this task; texture.cpp decodes nothing from disk yet -- Uploader::
++// uploadToImage() takes already-decoded pixels, per the brief's own
++// interface) would only ever #include <stb_image.h> for declarations,
++// never redefine STB_IMAGE_IMPLEMENTATION.
++//
++// Nothing in Task 4 actually calls into stb_image yet -- Texture2D/
++// Uploader's own interfaces (per the brief) take raw pixel bytes in, not
++// a file path, so there is no in-tree call site for e.g. stbi_load() in
++// this task. This TU exists anyway, now, so the dependency (third_party/
++// CMakeLists.txt's stb fetch, spec Fixed decision #10) is fully wired
++// end to end -- compiled, linked, ready -- for the sample tasks (6+) that
++// will actually call stbi_load() to decode a real PNG from disk.
++#define STB_IMAGE_IMPLEMENTATION
++#include <stb_image.h>
+diff --git a/src/rx_rhi_vk/src/texture.cpp b/src/rx_rhi_vk/src/texture.cpp
+new file mode 100644
+index 0000000..f40ff5b
+--- /dev/null
++++ b/src/rx_rhi_vk/src/texture.cpp
+@@ -0,0 +1,264 @@
++#include <rx_rhi_vk/texture.h>
++#include <rx_core/log.h>
++#include <algorithm>
++#include <cmath>
++#include <utility>
++
++namespace rx::rhi {
++
++namespace {
++
++// floor(log2(max(w, h))) + 1 -- the number of mip levels needed to reach a
++// final 1x1 level from `extent`. `extent` of {0, *}/{*, 0} (degenerate,
++// should never happen for a real texture) is defensively clamped to 1
++// level rather than calling std::log2(0).
++uint32_t computeMaxMipLevels(VkExtent2D extent) {
++    uint32_t maxDim = std::max(extent.width, extent.height);
++    if (maxDim == 0) {
++        return 1;
++    }
++    return static_cast<uint32_t>(std::floor(std::log2(static_cast<double>(maxDim)))) + 1;
++}
++
++// Depth/depth-stencil formats need DEPTH_BIT (and STENCIL_BIT for the
++// combined ones) as their view's aspect mask instead of COLOR_BIT. None of
++// Task 4's own tests exercise a depth format (they're all color UNORM),
++// but Task 6's brief already calls out "Depth buffer via Texture2D" as a
++// near-term consumer, so this is handled correctly from the start rather
++// than assumed-color-only.
++VkImageAspectFlags aspectMaskForFormat(VkFormat format) {
++    switch (format) {
++        case VK_FORMAT_D16_UNORM:
++        case VK_FORMAT_D32_SFLOAT:
++        case VK_FORMAT_X8_D24_UNORM_PACK32:
++            return VK_IMAGE_ASPECT_DEPTH_BIT;
++        case VK_FORMAT_D16_UNORM_S8_UINT:
++        case VK_FORMAT_D24_UNORM_S8_UINT:
++        case VK_FORMAT_D32_SFLOAT_S8_UINT:
++            return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
++        case VK_FORMAT_S8_UINT:
++            return VK_IMAGE_ASPECT_STENCIL_BIT;
++        default:
++            return VK_IMAGE_ASPECT_COLOR_BIT;
++    }
++}
++
++// A per-mip-level-range version of rx::rhi::transitionImage (command.h):
++// same maximally-conservative ALL_COMMANDS/MEMORY_READ|WRITE barrier
++// (correct for any transition at the cost of over-synchronizing --
++// appropriate here for the same reason command.h's own comment gives:
++// this is setup/upload code, not a steady-state per-frame path), just
++// parametrized over an arbitrary [baseLevel, baseLevel+levelCount) range
++// instead of always covering VK_REMAINING_MIP_LEVELS -- which is exactly
++// what recordMipChainBlit() below needs and transitionImage() itself
++// cannot express.
++void transitionLevelRange(VkCommandBuffer cmd, VkImage image, uint32_t baseLevel, uint32_t levelCount,
++                           VkImageLayout oldLayout, VkImageLayout newLayout) {
++    VkImageMemoryBarrier2 barrier{};
++    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
++    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    barrier.srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
++    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
++    barrier.oldLayout = oldLayout;
++    barrier.newLayout = newLayout;
++    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barrier.image = image;
++    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    barrier.subresourceRange.baseMipLevel = baseLevel;
++    barrier.subresourceRange.levelCount = levelCount;
++    barrier.subresourceRange.baseArrayLayer = 0;
++    barrier.subresourceRange.layerCount = 1;
++
++    VkDependencyInfo depInfo{};
++    depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    depInfo.imageMemoryBarrierCount = 1;
++    depInfo.pImageMemoryBarriers = &barrier;
++
++    vkCmdPipelineBarrier2(cmd, &depInfo);
++}
++
++}  // namespace
++
++std::optional<Texture2D> Texture2D::create(VkPhysicalDevice physicalDevice, VkDevice device, Allocator& allocator,
++                                            VkExtent2D extent, VkFormat format, VkImageUsageFlags usage,
++                                            uint32_t requestedMipLevels) {
++    uint32_t maxPossible = computeMaxMipLevels(extent);
++    uint32_t mipLevels = requestedMipLevels == 0 ? maxPossible : std::min(requestedMipLevels, maxPossible);
++
++    if (mipLevels > 1) {
++        VkFormatProperties formatProps{};
++        vkGetPhysicalDeviceFormatProperties(physicalDevice, format, &formatProps);
++        // Both bits, not just BLIT_DST (see this method's declaration
++        // comment in texture.h for why SRC is equally required) [R:C2].
++        constexpr VkFormatFeatureFlags kBlitChainFeatures =
++            VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
++        if ((formatProps.optimalTilingFeatures & kBlitChainFeatures) != kBlitChainFeatures) {
++            RX_LOG_WARN(
++                "Texture2D::create: format {} does not support BLIT_SRC+BLIT_DST under optimal tiling on this "
++                "device -- falling back to a single mip level instead of the requested {} [R:C2]",
++                static_cast<int>(format), mipLevels);
++            mipLevels = 1;
++        }
++    }
++
++    // Level 0 always needs to be a transfer destination (Uploader's
++    // initial pixel copy); every level but the last additionally needs
++    // to be a transfer source once mipLevels > 1 (each level but the last
++    // is a vkCmdBlitImage source for the next one). Callers must not add
++    // either bit themselves -- see the header comment.
++    VkImageUsageFlags finalUsage = usage | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++    if (mipLevels > 1) {
++        finalUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    }
++
++    VkImageCreateInfo imageInfo{};
++    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    imageInfo.imageType = VK_IMAGE_TYPE_2D;
++    imageInfo.format = format;
++    imageInfo.extent = {extent.width, extent.height, 1};
++    imageInfo.mipLevels = mipLevels;
++    imageInfo.arrayLayers = 1;
++    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
++    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
++    imageInfo.usage = finalUsage;
++    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++
++    // No HOST_ACCESS_* flags requested at all -- VMA_MEMORY_USAGE_AUTO
++    // with no host-visibility request resolves to DEVICE_LOCAL memory,
++    // exactly right for an optimal-tiling sampled image nothing on the
++    // CPU side ever maps directly (mirrors Allocator::
++    // createDeviceLocalBuffer's own reasoning in buffer.cpp).
++    VmaAllocationCreateInfo allocCreateInfo{};
++    allocCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
++
++    VkImage image = VK_NULL_HANDLE;
++    VmaAllocation allocation = VK_NULL_HANDLE;
++    VkResult result = vmaCreateImage(allocator.raw(), &imageInfo, &allocCreateInfo, &image, &allocation, nullptr);
++    if (result != VK_SUCCESS) {
++        RX_LOG_ERROR("vmaCreateImage failed: VkResult={}", static_cast<int>(result));
++        return std::nullopt;
++    }
++
++    VkImageViewCreateInfo viewInfo{};
++    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++    viewInfo.image = image;
++    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    viewInfo.format = format;
++    viewInfo.subresourceRange.aspectMask = aspectMaskForFormat(format);
++    viewInfo.subresourceRange.baseMipLevel = 0;
++    viewInfo.subresourceRange.levelCount = mipLevels;
++    viewInfo.subresourceRange.baseArrayLayer = 0;
++    viewInfo.subresourceRange.layerCount = 1;
++
++    VkImageView view = VK_NULL_HANDLE;
++    result = vkCreateImageView(device, &viewInfo, nullptr, &view);
++    if (result != VK_SUCCESS) {
++        RX_LOG_ERROR("vkCreateImageView failed: VkResult={}", static_cast<int>(result));
++        vmaDestroyImage(allocator.raw(), image, allocation);
++        return std::nullopt;
++    }
++
++    return Texture2D(allocator.raw(), device, image, allocation, view, extent, format, mipLevels);
++}
++
++void Texture2D::recordMipChainBlit(VkCommandBuffer cmd) const {
++    if (mipLevels_ <= 1) {
++        // Nothing to blit -- level 0 alone still needs the
++        // TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL transition
++        // Uploader::uploadToImage() otherwise relies on this function for.
++        transitionLevelRange(cmd, image_, 0, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        return;
++    }
++
++    int32_t srcWidth = static_cast<int32_t>(extent_.width);
++    int32_t srcHeight = static_cast<int32_t>(extent_.height);
++
++    for (uint32_t level = 1; level < mipLevels_; ++level) {
++        // Level `level - 1` was just written -- either the original pixel
++        // upload (level 0) or the previous loop iteration's blit
++        // destination (any later level) -- and is still
++        // TRANSFER_DST_OPTIMAL; promote it to a blit source. Level
++        // `level` is still its initial UNDEFINED layout; prepare it as
++        // this iteration's blit destination.
++        transitionLevelRange(cmd, image_, level - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++        transitionLevelRange(cmd, image_, level, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++
++        int32_t dstWidth = std::max(1, srcWidth / 2);
++        int32_t dstHeight = std::max(1, srcHeight / 2);
++
++        VkImageBlit blit{};
++        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1, 0, 1};
++        blit.srcOffsets[0] = {0, 0, 0};
++        blit.srcOffsets[1] = {srcWidth, srcHeight, 1};
++        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
++        blit.dstOffsets[0] = {0, 0, 0};
++        blit.dstOffsets[1] = {dstWidth, dstHeight, 1};
++
++        // sRGB CAVEAT -- see this method's declaration comment in
++        // texture.h before reusing this for an SRGB format.
++        vkCmdBlitImage(cmd, image_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                       1, &blit, VK_FILTER_LINEAR);
++
++        srcWidth = dstWidth;
++        srcHeight = dstHeight;
++    }
++
++    // Every level but the last is now TRANSFER_SRC_OPTIMAL (promoted
++    // above to serve as that iteration's blit source); the last level is
++    // still TRANSFER_DST_OPTIMAL (blitted into, never promoted since
++    // nothing blits from it). Two range transitions cover the whole mip
++    // chain instead of one per level.
++    transitionLevelRange(cmd, image_, 0, mipLevels_ - 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    transitionLevelRange(cmd, image_, mipLevels_ - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++}
++
++Texture2D::Texture2D(Texture2D&& other) noexcept : Texture2D() {
++    *this = std::move(other);
++}
++
++Texture2D& Texture2D::operator=(Texture2D&& other) noexcept {
++    if (this != &other) {
++        destroyAll();
++
++        allocator_ = other.allocator_;
++        device_ = other.device_;
++        image_ = other.image_;
++        allocation_ = other.allocation_;
++        view_ = other.view_;
++        extent_ = other.extent_;
++        format_ = other.format_;
++        mipLevels_ = other.mipLevels_;
++
++        other.allocator_ = VK_NULL_HANDLE;
++        other.device_ = VK_NULL_HANDLE;
++        other.image_ = VK_NULL_HANDLE;
++        other.allocation_ = VK_NULL_HANDLE;
++        other.view_ = VK_NULL_HANDLE;
++        other.extent_ = VkExtent2D{0, 0};
++        other.format_ = VK_FORMAT_UNDEFINED;
++        other.mipLevels_ = 1;
++    }
++    return *this;
++}
++
++Texture2D::~Texture2D() {
++    destroyAll();
++}
++
++void Texture2D::destroyAll() {
++    if (view_ != VK_NULL_HANDLE) {
++        vkDestroyImageView(device_, view_, nullptr);
++    }
++    if (image_ != VK_NULL_HANDLE) {
++        vmaDestroyImage(allocator_, image_, allocation_);
++    }
++}
++
++}  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/upload.cpp b/src/rx_rhi_vk/src/upload.cpp
+new file mode 100644
+index 0000000..a3bfded
+--- /dev/null
++++ b/src/rx_rhi_vk/src/upload.cpp
+@@ -0,0 +1,317 @@
++#include <rx_rhi_vk/upload.h>
++#include <rx_rhi_vk/command.h>
++#include <rx_rhi_vk/device.h>
++#include <rx_rhi_vk/texture.h>
++#include <rx_core/log.h>
++#include <cstring>
++#include <utility>
++
++namespace rx::rhi {
++
++namespace {
++
++// vkCmdCopyBufferToImage requires bufferOffset to be a multiple of 4 (and,
++// for best behavior across formats, of the texel block size); vkCmdCopyBuffer
++// has no such requirement but aligning every reservation uniformly is
++// simpler than special-casing buffer-vs-image copies here. 16 covers every
++// texel block size this engine's Phase 2 formats use (RGBA8 = 4 bytes,
++// RGBA16F = 8 bytes, etc.) with room to spare.
++constexpr VkDeviceSize kRingAlignment = 16;
++
++VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment) {
++    return (value + alignment - 1) & ~(alignment - 1);
++}
++
++}  // namespace
++
++std::optional<Uploader> Uploader::create(Allocator& allocator, Device& device, VkDeviceSize ringBufferSize) {
++    VkDevice vkDevice = device.device();
++    VkQueue queue = device.graphicsQueue();
++
++    VkCommandPoolCreateInfo poolInfo{};
++    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
++    // RESET_COMMAND_BUFFER_BIT: beginRecordingIfNeeded() re-begins the same
++    // single command buffer every flush() cycle for this Uploader's whole
++    // lifetime, via an explicit vkResetCommandBuffer -- same reasoning as
++    // rx::rhi::CommandContext's own pool (command.cpp).
++    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++    poolInfo.queueFamilyIndex = device.graphicsQueueFamily();
++
++    VkCommandPool pool = VK_NULL_HANDLE;
++    if (vkCreateCommandPool(vkDevice, &poolInfo, nullptr, &pool) != VK_SUCCESS) {
++        RX_LOG_ERROR("Uploader::create: vkCreateCommandPool failed");
++        return std::nullopt;
++    }
++
++    VkCommandBufferAllocateInfo cmdAllocInfo{};
++    cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
++    cmdAllocInfo.commandPool = pool;
++    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++    cmdAllocInfo.commandBufferCount = 1;
++
++    VkCommandBuffer cmd = VK_NULL_HANDLE;
++    if (vkAllocateCommandBuffers(vkDevice, &cmdAllocInfo, &cmd) != VK_SUCCESS) {
++        RX_LOG_ERROR("Uploader::create: vkAllocateCommandBuffers failed");
++        vkDestroyCommandPool(vkDevice, pool, nullptr);
++        return std::nullopt;
++    }
++
++    // Created unsignaled -- flush() always submits before it ever waits on
++    // this fence, so there is no "first wait must return immediately"
++    // requirement the way FrameSync's per-slot fences have.
++    VkFenceCreateInfo fenceInfo{};
++    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
++
++    VkFence fence = VK_NULL_HANDLE;
++    if (vkCreateFence(vkDevice, &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
++        RX_LOG_ERROR("Uploader::create: vkCreateFence failed");
++        vkDestroyCommandPool(vkDevice, pool, nullptr);
++        return std::nullopt;
++    }
++
++    auto ringResult = allocator.createUploadRingBuffer(ringBufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    if (!ringResult.has_value()) {
++        RX_LOG_ERROR("Uploader::create: failed to allocate the {}-byte staging ring buffer", ringBufferSize);
++        vkDestroyFence(vkDevice, fence, nullptr);
++        vkDestroyCommandPool(vkDevice, pool, nullptr);
++        return std::nullopt;
++    }
++
++    // Detected once here, never per-upload -- see the class comment in
++    // upload.h and [R:C1].
++    if (ringResult->deviceLocal) {
++        RX_LOG_INFO(
++            "Uploader::create: staging ring buffer placed in DEVICE_LOCAL + HOST_VISIBLE memory (ReBAR/unified "
++            "memory direct-upload path)");
++    } else {
++        RX_LOG_INFO(
++            "Uploader::create: staging ring buffer placed in plain HOST_VISIBLE memory (non-ReBAR staging "
++            "fallback path)");
++    }
++
++    return Uploader(vkDevice, queue, pool, cmd, fence, std::move(ringResult->buffer), ringBufferSize,
++                     ringResult->deviceLocal);
++}
++
++void Uploader::beginRecordingIfNeeded() {
++    if (recording_) {
++        return;
++    }
++
++    vkResetCommandBuffer(cmd_, 0);
++
++    VkCommandBufferBeginInfo beginInfo{};
++    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++    if (vkBeginCommandBuffer(cmd_, &beginInfo) != VK_SUCCESS) {
++        RX_LOG_ERROR("Uploader: vkBeginCommandBuffer failed");
++        return;
++    }
++    recording_ = true;
++}
++
++bool Uploader::reserveRingSpace(VkDeviceSize size, VkDeviceSize& outOffset) {
++    if (size == 0) {
++        outOffset = 0;
++        return true;
++    }
++    if (size > ringBufferSize_) {
++        RX_LOG_ERROR("Uploader: upload of {} bytes exceeds the {}-byte staging ring buffer's total capacity", size,
++                     ringBufferSize_);
++        return false;
++    }
++
++    VkDeviceSize aligned = alignUp(ringCursor_, kRingAlignment);
++    if (aligned + size > ringBufferSize_) {
++        // Not enough room left before the ring buffer's end -- flush what
++        // is already recorded (submits + waits, per the class comment),
++        // which resets ringCursor_ back to 0, then restart there. Already
++        // known to fit: `size <= ringBufferSize_` was just checked above.
++        flush();
++        aligned = 0;
++    }
++
++    outOffset = aligned;
++    ringCursor_ = aligned + size;
++    return true;
++}
++
++bool Uploader::uploadToBuffer(VkBuffer dst, VkDeviceSize dstOffset, const void* data, VkDeviceSize size) {
++    if (size == 0) {
++        return true;
++    }
++
++    VkDeviceSize ringOffset = 0;
++    if (!reserveRingSpace(size, ringOffset)) {
++        return false;
++    }
++
++    std::memcpy(static_cast<uint8_t*>(ringBuffer_.mappedData()) + ringOffset, data, size);
++    // Written-before-GPU-read on a possibly-non-coherent HOST_VISIBLE
++    // memory type -- exactly the case Buffer::flush() exists for (this
++    // task's own API addition, closing the gap Phase 1 Task 3's review
++    // flagged).
++    ringBuffer_.flush(ringOffset, size);
++
++    beginRecordingIfNeeded();
++
++    VkBufferCopy region{};
++    region.srcOffset = ringOffset;
++    region.dstOffset = dstOffset;
++    region.size = size;
++    vkCmdCopyBuffer(cmd_, ringBuffer_.handle(), dst, 1, &region);
++    return true;
++}
++
++bool Uploader::uploadToImage(Texture2D& dst, const void* pixels, VkDeviceSize pixelBytes, bool generateMips) {
++    if (pixelBytes == 0) {
++        return true;
++    }
++
++    VkDeviceSize ringOffset = 0;
++    if (!reserveRingSpace(pixelBytes, ringOffset)) {
++        return false;
++    }
++
++    std::memcpy(static_cast<uint8_t*>(ringBuffer_.mappedData()) + ringOffset, pixels, pixelBytes);
++    ringBuffer_.flush(ringOffset, pixelBytes);
++
++    beginRecordingIfNeeded();
++
++    // Every level starts VK_IMAGE_LAYOUT_UNDEFINED (image creation's
++    // initialLayout) -- transitioning the whole resource at once via the
++    // existing whole-image helper is correct and simpler than a
++    // level-0-only transition here, since every level but 0 needs this
++    // exact same UNDEFINED -> TRANSFER_DST_OPTIMAL step before
++    // recordMipChainBlit() below can transition them again individually.
++    transitionImage(cmd_, dst.image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++
++    VkBufferImageCopy region{};
++    region.bufferOffset = ringOffset;
++    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    region.imageSubresource.mipLevel = 0;
++    region.imageSubresource.baseArrayLayer = 0;
++    region.imageSubresource.layerCount = 1;
++    region.imageExtent = {dst.extent().width, dst.extent().height, 1};
++    vkCmdCopyBufferToImage(cmd_, ringBuffer_.handle(), dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++
++    if (generateMips && dst.mipLevels() > 1) {
++        // Handles every level's per-level barriers + blits, and leaves
++        // every level (including 0) in SHADER_READ_ONLY_OPTIMAL --
++        // including the level-0 TRANSFER_DST_OPTIMAL -> TRANSFER_SRC_OPTIMAL
++        // step this copy's destination layout above sets up for.
++        dst.recordMipChainBlit(cmd_);
++    } else {
++        transitionImage(cmd_, dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    }
++    return true;
++}
++
++void Uploader::flush() {
++    if (!recording_) {
++        return;
++    }
++
++    if (vkEndCommandBuffer(cmd_) != VK_SUCCESS) {
++        RX_LOG_ERROR("Uploader::flush: vkEndCommandBuffer failed");
++        recording_ = false;
++        ringCursor_ = 0;
++        return;
++    }
++
++    VkSubmitInfo submitInfo{};
++    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
++    submitInfo.commandBufferCount = 1;
++    submitInfo.pCommandBuffers = &cmd_;
++
++    if (vkResetFences(device_, 1, &fence_) != VK_SUCCESS) {
++        RX_LOG_ERROR("Uploader::flush: vkResetFences failed");
++    }
++    if (vkQueueSubmit(queue_, 1, &submitInfo, fence_) != VK_SUCCESS) {
++        RX_LOG_ERROR("Uploader::flush: vkQueueSubmit failed");
++        recording_ = false;
++        ringCursor_ = 0;
++        return;
++    }
++
++    // Synchronous by design -- see the class comment in upload.h for why
++    // this is an acceptable Phase 2 choice.
++    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
++
++    recording_ = false;
++    ringCursor_ = 0;
++}
++
++Uploader::Uploader(Uploader&& other) noexcept
++    : device_(other.device_),
++      queue_(other.queue_),
++      pool_(other.pool_),
++      cmd_(other.cmd_),
++      fence_(other.fence_),
++      ringBuffer_(std::move(other.ringBuffer_)),
++      ringBufferSize_(other.ringBufferSize_),
++      ringCursor_(other.ringCursor_),
++      ringBufferIsDeviceLocal_(other.ringBufferIsDeviceLocal_),
++      recording_(other.recording_) {
++    other.device_ = VK_NULL_HANDLE;
++    other.queue_ = VK_NULL_HANDLE;
++    other.pool_ = VK_NULL_HANDLE;
++    other.cmd_ = VK_NULL_HANDLE;
++    other.fence_ = VK_NULL_HANDLE;
++    other.ringBufferSize_ = 0;
++    other.ringCursor_ = 0;
++    other.ringBufferIsDeviceLocal_ = false;
++    other.recording_ = false;
++}
++
++Uploader& Uploader::operator=(Uploader&& other) noexcept {
++    if (this != &other) {
++        destroyAll();
++
++        device_ = other.device_;
++        queue_ = other.queue_;
++        pool_ = other.pool_;
++        cmd_ = other.cmd_;
++        fence_ = other.fence_;
++        // Buffer's own move-assignment destroys ringBuffer_'s previous
++        // contents (if any) before taking over other.ringBuffer_'s.
++        ringBuffer_ = std::move(other.ringBuffer_);
++        ringBufferSize_ = other.ringBufferSize_;
++        ringCursor_ = other.ringCursor_;
++        ringBufferIsDeviceLocal_ = other.ringBufferIsDeviceLocal_;
++        recording_ = other.recording_;
++
++        other.device_ = VK_NULL_HANDLE;
++        other.queue_ = VK_NULL_HANDLE;
++        other.pool_ = VK_NULL_HANDLE;
++        other.cmd_ = VK_NULL_HANDLE;
++        other.fence_ = VK_NULL_HANDLE;
++        other.ringBufferSize_ = 0;
++        other.ringCursor_ = 0;
++        other.ringBufferIsDeviceLocal_ = false;
++        other.recording_ = false;
++    }
++    return *this;
++}
++
++Uploader::~Uploader() {
++    // Auto-flush pending (recorded-but-not-yet-submitted) work before
++    // tearing anything down -- see the class comment in upload.h. Safe
++    // unconditionally: flush() itself no-ops if nothing is recording.
++    flush();
++    destroyAll();
++}
++
++void Uploader::destroyAll() {
++    if (fence_ != VK_NULL_HANDLE) {
++        vkDestroyFence(device_, fence_, nullptr);
++    }
++    if (pool_ != VK_NULL_HANDLE) {
++        // Implicitly frees cmd_ (allocated from this pool) -- no separate
++        // vkFreeCommandBuffers call needed, same as FrameSync's pools.
++        vkDestroyCommandPool(device_, pool_, nullptr);
++    }
++}
++
++}  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/tests/clear_color_test.cpp b/src/rx_rhi_vk/tests/clear_color_test.cpp
+index 90d8384..d62f2ed 100644
+--- a/src/rx_rhi_vk/tests/clear_color_test.cpp
++++ b/src/rx_rhi_vk/tests/clear_color_test.cpp
+@@ -112,43 +112,20 @@ TEST_CASE("CommandContext::runOnce + transitionImage clear an offscreen image vi
+     uint32_t memoryTypeIndex = UINT32_MAX;
+     for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+         if ((memReq.memoryTypeBits & (1U << i)) != 0U &&
+             (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0U) {
+             memoryTypeIndex = i;
+             break;
+         }
+     }
+     REQUIRE(memoryTypeIndex != UINT32_MAX);
+ 
+-    // Allocator::createHostVisibleBuffer (Task 2) only ever *requires*
+-    // VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT for its
+-    // VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT allocations
+-    // (verified directly against VMA v3.4.0's FindMemoryPreferences(): the
+-    // sequential-write path only adds VK_MEMORY_PROPERTY_HOST_CACHED_BIT to
+-    // outNotPreferredFlags, never requires HOST_COHERENT) -- so nothing
+-    // guarantees through that API alone that the readback buffer created
+-    // below ends up host-coherent. Buffer/Allocator's public surface has no
+-    // way to reach the underlying VmaAllocation to call
+-    // vmaInvalidateAllocation() explicitly, so instead verify the
+-    // precondition this test's memcpy-after-vkQueueWaitIdle read relies on:
+-    // every HOST_VISIBLE memory type this physical device exposes is also
+-    // HOST_COHERENT (true for every desktop Vulkan driver in practice,
+-    // never violated in this codebase's target set) -- making that
+-    // assumption a verified, testable fact rather than a silent one that
+-    // could someday read stale data on hardware with a truly non-coherent
+-    // host-visible heap.
+-    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+-        if ((memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0U) {
+-            REQUIRE((memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0U);
+-        }
+-    }
+-
+     VkMemoryAllocateInfo memAllocInfo{};
+     memAllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+     memAllocInfo.allocationSize = memReq.size;
+     memAllocInfo.memoryTypeIndex = memoryTypeIndex;
+ 
+     VkDeviceMemory imageMemory = VK_NULL_HANDLE;
+     REQUIRE(vkAllocateMemory(device, &memAllocInfo, nullptr, &imageMemory) == VK_SUCCESS);
+     REQUIRE(vkBindImageMemory(device, image, imageMemory, 0) == VK_SUCCESS);
+ 
+     VkImageViewCreateInfo viewInfo{};
+@@ -212,25 +189,44 @@ TEST_CASE("CommandContext::runOnce + transitionImage clear an offscreen image vi
+             VkBufferImageCopy region{};
+             region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+             region.imageSubresource.mipLevel = 0;
+             region.imageSubresource.baseArrayLayer = 0;
+             region.imageSubresource.layerCount = 1;
+             region.imageExtent = {kSize, kSize, 1};
+ 
+             vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1, &region);
+         });
+ 
+-        // runOnce() above already vkQueueWaitIdle()'d before returning, and
+-        // the REQUIRE above confirmed this device's host-visible memory is
+-        // also host-coherent, so the copy's writes are already visible to
+-        // this host read with no further barrier or
+-        // vkInvalidateMappedMemoryRanges needed.
++        // runOnce() above already vkQueueWaitIdle()'d before returning, so
++        // the copy is complete on the GPU side -- but Allocator::
++        // createHostVisibleBuffer only ever *requires*
++        // VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT (verified directly against
++        // VMA v3.4.0's FindMemoryPreferences(): the sequential-write path
++        // only adds VK_MEMORY_PROPERTY_HOST_CACHED_BIT to
++        // outNotPreferredFlags, never requires HOST_COHERENT), so nothing
++        // guarantees the GPU's writes are visible to a plain memcpy from
++        // this mapped pointer without an explicit invalidate first. An
++        // earlier version of this test worked around that gap by
++        // `REQUIRE`ing every HOST_VISIBLE memory type on this physical
++        // device was also HOST_COHERENT as a proxy precondition, because
++        // Buffer/Allocator's public surface had no way to reach the
++        // underlying VmaAllocation to call vmaInvalidateAllocation()
++        // directly. Buffer::invalidate() (added this task, closing that
++        // exact gap from Phase 1 Task 3's review) replaces the proxy
++        // check entirely: it is correct to call unconditionally regardless
++        // of whether this memory type actually is coherent -- VMA's own
++        // implementation skips the real vkInvalidateMappedMemoryRanges
++        // call when the memory type doesn't need it -- so this now works
++        // correctly even on a hypothetical non-coherent host-visible heap,
++        // not just the coherent-in-practice hardware this test happens to
++        // run on today.
++        readback->invalidate();
+         std::memcpy(pixels.data(), readback->mappedData(), pixels.size());
+     }
+ 
+     vkDeviceWaitIdle(device);
+     vkDestroyImageView(device, imageView, nullptr);
+     vkDestroyImage(device, image, nullptr);
+     vkFreeMemory(device, imageMemory, nullptr);
+     vkb::destroy_device(vkbDevice);
+ 
+     CHECK(pixels[0] == 255);
+diff --git a/src/rx_rhi_vk/tests/deletion_queue_test.cpp b/src/rx_rhi_vk/tests/deletion_queue_test.cpp
+new file mode 100644
+index 0000000..8323c03
+--- /dev/null
++++ b/src/rx_rhi_vk/tests/deletion_queue_test.cpp
+@@ -0,0 +1,271 @@
++#include <doctest/doctest.h>
++#include <rx_rhi_vk/buffer.h>
++#include <rx_rhi_vk/context.h>
++#include <rx_rhi_vk/deletion_queue.h>
++#include <VkBootstrap.h>
++#include <array>
++#include <cstdint>
++#include <cstring>
++#include <memory>
++#include <utility>
++#include <vector>
++
++// The first three TEST_CASEs below are pure logic tests -- no Vulkan
++// object, no device, nothing -- exercising DeletionQueue's own bookkeeping
++// contract in isolation. The last is a real-Vulkan stress test proving
++// that contract holds for genuine, asynchronously in-flight GPU resources,
++// not just plain closures. Pure headless (no rx::platform::Window, no
++// VkSurfaceKHR) exactly like clear_color_test.cpp/bindless_test.cpp --
++// protected by tests/doctest_main.cpp's process-wide vk-bootstrap warm-up,
++// same as those two files.
++
++TEST_CASE("DeletionQueue defers a retired destructor until its frame's fence signals, then runs it exactly once") {
++    rx::rhi::DeletionQueue queue;
++    int destroyCount = 0;
++    queue.retire([&destroyCount] { ++destroyCount; }, /*frameIndex=*/5);
++    CHECK(queue.pendingCount() == 1);
++
++    // Earlier frames signaling must not touch it -- this is the
++    // "not destroyed until fence signal" half of the brief's own test
++    // description.
++    queue.onFrameFenceSignaled(3);
++    CHECK(destroyCount == 0);
++    queue.onFrameFenceSignaled(4);
++    CHECK(destroyCount == 0);
++    CHECK(queue.pendingCount() == 1);
++
++    // Its own frame signaling runs it exactly once.
++    queue.onFrameFenceSignaled(5);
++    CHECK(destroyCount == 1);
++    CHECK(queue.pendingCount() == 0);
++
++    // A later signal must not run it again -- it was already removed.
++    queue.onFrameFenceSignaled(10);
++    CHECK(destroyCount == 1);
++}
++
++TEST_CASE("DeletionQueue runs several retired destructors in retire() order once each becomes due, independent of "
++          "signal order") {
++    rx::rhi::DeletionQueue queue;
++    std::vector<int> ranOrder;
++    queue.retire([&ranOrder] { ranOrder.push_back(1); }, 1);
++    queue.retire([&ranOrder] { ranOrder.push_back(2); }, 2);
++    queue.retire([&ranOrder] { ranOrder.push_back(3); }, 4);
++    CHECK(queue.pendingCount() == 3);
++
++    // Signaling frame 2 must run BOTH frame-1 and frame-2 items (every
++    // frameIndex <= 2), in the order they were retired, and leave the
++    // frame-4 item untouched.
++    queue.onFrameFenceSignaled(2);
++    REQUIRE(ranOrder.size() == 2);
++    CHECK(ranOrder[0] == 1);
++    CHECK(ranOrder[1] == 2);
++    CHECK(queue.pendingCount() == 1);
++
++    queue.onFrameFenceSignaled(4);
++    REQUIRE(ranOrder.size() == 3);
++    CHECK(ranOrder[2] == 3);
++    CHECK(queue.pendingCount() == 0);
++}
++
++TEST_CASE("DeletionQueue::flushAll runs every pending destructor regardless of frame index, invokes waitIdleFirst, "
++          "and leaves the queue empty") {
++    rx::rhi::DeletionQueue queue;
++    int count = 0;
++    queue.retire([&count] { ++count; }, 100);
++    queue.retire([&count] { ++count; }, 200);
++
++    bool waited = false;
++    queue.flushAll([&waited] { waited = true; });
++
++    CHECK(waited);
++    CHECK(count == 2);
++    CHECK(queue.pendingCount() == 0);
++
++    // Safe (and a true no-op beyond invoking waitIdleFirst again) on an
++    // already-empty queue.
++    bool waitedAgain = false;
++    queue.flushAll([&waitedAgain] { waitedAgain = true; });
++    CHECK(waitedAgain);
++    CHECK(count == 2);
++}
++
++namespace {
++
++// Pure headless fixture -- no window/surface/swapchain -- matching
++// bindless_test.cpp's own HeadlessBindlessFixture pattern exactly, minus
++// anything this test doesn't need (descriptor indexing, sync2). This
++// test's real Vulkan resources are host-visible/device-local buffers and
++// a plain vkCmdCopyBuffer, so a minimum-1.3-version device with no extra
++// feature structs is enough.
++struct HeadlessFixture {
++    rx::rhi::Context context;
++    vkb::Device vkbDevice;
++    VkDevice device;
++    VkPhysicalDevice physicalDevice;
++    VkQueue queue;
++    uint32_t queueFamily;
++};
++
++HeadlessFixture makeHeadlessFixture() {
++    auto context = rx::rhi::Context::create({}, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++
++    vkb::PhysicalDeviceSelector selector(context->vkbInstance());
++    auto physResult = selector.set_minimum_version(1, 3).select();
++    REQUIRE(physResult.has_value());
++
++    auto deviceResult = vkb::DeviceBuilder(physResult.value()).build();
++    REQUIRE(deviceResult.has_value());
++    vkb::Device vkbDevice = deviceResult.value();
++    volkLoadDevice(vkbDevice.device);
++
++    auto queueResult = vkbDevice.get_queue(vkb::QueueType::graphics);
++    REQUIRE(queueResult.has_value());
++    auto queueIndexResult = vkbDevice.get_queue_index(vkb::QueueType::graphics);
++    REQUIRE(queueIndexResult.has_value());
++
++    return HeadlessFixture{std::move(*context), vkbDevice, vkbDevice.device, vkbDevice.physical_device.physical_device,
++                            queueResult.value(), queueIndexResult.value()};
++}
++
++}  // namespace
++
++// The scenario the brief actually asks for end to end: real Vulkan
++// buffers, real asynchronous (submitted-but-not-immediately-waited-on)
++// GPU work, and many retire/signal cycles reusing a small, fixed number
++// of "frame slots" -- exactly the pattern a real FrameSync-driven frame
++// loop uses (FrameSync::kFramesInFlight == 2), just built by hand here
++// since this test has no rx::rhi::Device/FrameSync (headless, no
++// surface). If DeletionQueue destroyed anything even one frame too early,
++// the validation layer's command-buffer-resource-tracking would catch a
++// buffer being destroyed while a still-pending submission references it
++// -- that is precisely what this test's zero-validation-errors assertion
++// is checking for, not merely that the code runs without crashing.
++TEST_CASE("DeletionQueue retire-while-in-flight stress: many retire/signal cycles reusing 2 frame slots, zero "
++          "validation errors, no premature destroy") {
++    HeadlessFixture fixture = makeHeadlessFixture();
++
++    {
++        auto allocator = rx::rhi::Allocator::createRaw(fixture.physicalDevice, fixture.device, fixture.context.instance());
++        REQUIRE(allocator.has_value());
++
++        constexpr uint32_t kSlots = 2;
++        constexpr int kIterations = 40;
++        constexpr VkDeviceSize kBufferSize = 64;
++
++        VkCommandPoolCreateInfo poolInfo{};
++        poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
++        poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++        poolInfo.queueFamilyIndex = fixture.queueFamily;
++        VkCommandPool pool = VK_NULL_HANDLE;
++        REQUIRE(vkCreateCommandPool(fixture.device, &poolInfo, nullptr, &pool) == VK_SUCCESS);
++
++        std::array<VkCommandBuffer, kSlots> cmds{};
++        VkCommandBufferAllocateInfo cmdAllocInfo{};
++        cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
++        cmdAllocInfo.commandPool = pool;
++        cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++        cmdAllocInfo.commandBufferCount = kSlots;
++        REQUIRE(vkAllocateCommandBuffers(fixture.device, &cmdAllocInfo, cmds.data()) == VK_SUCCESS);
++
++        std::array<VkFence, kSlots> fences{};
++        VkFenceCreateInfo fenceInfo{};
++        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
++        // SIGNALED at creation -- the loop's wait on each slot before its
++        // first real use must return immediately, same reasoning as
++        // FrameSync's own per-slot fences (frame_sync.h).
++        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
++        for (uint32_t i = 0; i < kSlots; ++i) {
++            REQUIRE(vkCreateFence(fixture.device, &fenceInfo, nullptr, &fences[i]) == VK_SUCCESS);
++        }
++
++        rx::rhi::DeletionQueue deletionQueue;
++        bool observedNonEmptyMidLoop = false;
++
++        for (int i = 0; i < kIterations; ++i) {
++            uint32_t slot = static_cast<uint32_t>(i) % kSlots;
++
++            // Confirms slot `slot`'s previous submission (frame
++            // i - kSlots, if this slot has been used before) has actually
++            // completed on the GPU -- exactly the fence wait a real frame
++            // loop performs before reusing a frame-in-flight slot.
++            REQUIRE(vkWaitForFences(fixture.device, 1, &fences[slot], VK_TRUE, UINT64_MAX) == VK_SUCCESS);
++            if (i >= static_cast<int>(kSlots)) {
++                deletionQueue.onFrameFenceSignaled(static_cast<uint64_t>(i - static_cast<int>(kSlots)));
++            }
++            REQUIRE(vkResetFences(fixture.device, 1, &fences[slot]) == VK_SUCCESS);
++
++            auto srcBuffer = allocator->createHostVisibleBuffer(kBufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++            REQUIRE(srcBuffer.has_value());
++            std::array<uint8_t, kBufferSize> pattern{};
++            for (size_t b = 0; b < pattern.size(); ++b) {
++                pattern[b] = static_cast<uint8_t>((i + static_cast<int>(b)) & 0xFF);
++            }
++            std::memcpy(srcBuffer->mappedData(), pattern.data(), pattern.size());
++            srcBuffer->flush();
++
++            auto dstBuffer = allocator->createDeviceLocalBuffer(kBufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++            REQUIRE(dstBuffer.has_value());
++
++            REQUIRE(vkResetCommandBuffer(cmds[slot], 0) == VK_SUCCESS);
++            VkCommandBufferBeginInfo beginInfo{};
++            beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++            REQUIRE(vkBeginCommandBuffer(cmds[slot], &beginInfo) == VK_SUCCESS);
++            VkBufferCopy region{0, 0, kBufferSize};
++            vkCmdCopyBuffer(cmds[slot], srcBuffer->handle(), dstBuffer->handle(), 1, &region);
++            REQUIRE(vkEndCommandBuffer(cmds[slot]) == VK_SUCCESS);
++
++            VkSubmitInfo submitInfo{};
++            submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
++            submitInfo.commandBufferCount = 1;
++            submitInfo.pCommandBuffers = &cmds[slot];
++            // Deliberately NOT waited on here (no vkQueueWaitIdle/
++            // vkWaitForFences immediately after submit) -- both buffers
++            // are genuinely in flight from this point until this same
++            // slot's fence is confirmed signaled kSlots iterations later,
++            // above. Retiring them now, tagged at frame `i`, is exactly
++            // the "resource used by an in-flight frame" scenario the
++            // brief's test description asks for.
++            REQUIRE(vkQueueSubmit(fixture.queue, 1, &submitInfo, fences[slot]) == VK_SUCCESS);
++
++            // std::function<void()> requires a copy-constructible target
++            // -- a lambda that moves a move-only rx::rhi::Buffer directly
++            // into its capture is not copy-constructible, so it must be
++            // wrapped in a std::shared_ptr first (see deletion_queue.h's
++            // own "STD::FUNCTION COPY-CONSTRUCTIBILITY PITFALL" comment;
++            // this is a real std::function requirement, not a
++            // DeletionQueue limitation).
++            auto srcHolder = std::make_shared<rx::rhi::Buffer>(std::move(*srcBuffer));
++            auto dstHolder = std::make_shared<rx::rhi::Buffer>(std::move(*dstBuffer));
++            deletionQueue.retire([srcHolder, dstHolder] {}, static_cast<uint64_t>(i));
++
++            if (i == 5) {
++                // Concrete evidence the queue is really deferring, not
++                // trivially discarding: several frames' worth of buffers
++                // must still be pending at this point (only frames
++                // 0..i-kSlots have had a chance to be confirmed done).
++                observedNonEmptyMidLoop = deletionQueue.pendingCount() >= kSlots;
++            }
++        }
++
++        CHECK(observedNonEmptyMidLoop);
++
++        // Drain the last kSlots frames' worth of still-pending
++        // retirements -- real device-idle wait first, per flushAll()'s
++        // own contract, since nothing has confirmed those specific
++        // submissions are done yet.
++        deletionQueue.flushAll([&fixture] { vkDeviceWaitIdle(fixture.device); });
++        CHECK(deletionQueue.pendingCount() == 0);
++
++        for (VkFence fence : fences) {
++            vkDestroyFence(fixture.device, fence, nullptr);
++        }
++        vkDestroyCommandPool(fixture.device, pool, nullptr);
++    }
++
++    vkDeviceWaitIdle(fixture.device);
++    vkb::destroy_device(fixture.vkbDevice);
++    CHECK_FALSE(fixture.context.hasValidationErrors());
++}
+diff --git a/src/rx_rhi_vk/tests/texture_test.cpp b/src/rx_rhi_vk/tests/texture_test.cpp
+new file mode 100644
+index 0000000..96c7d3a
+--- /dev/null
++++ b/src/rx_rhi_vk/tests/texture_test.cpp
+@@ -0,0 +1,155 @@
++#include <doctest/doctest.h>
++#include <rx_rhi_vk/command.h>
++#include <rx_rhi_vk/device.h>
++#include <rx_rhi_vk/texture.h>
++#include <rx_rhi_vk/upload.h>
++#include <rx_platform/window.h>
++#include <cstdint>
++#include <cstring>
++#include <optional>
++#include <utility>
++#include <vector>
++
++namespace {
++
++// Same skip-guarded windowed-device fixture pattern as upload_test.cpp --
++// Uploader::create() needs a real rx::rhi::Device&.
++struct TextureTestFixture {
++    rx::platform::Window window;
++    rx::rhi::Context context;
++    rx::rhi::Device device;
++    rx::rhi::Allocator allocator;
++};
++
++std::optional<TextureTestFixture> makeFixture(const char* title) {
++    auto window = rx::platform::Window::create(title, 64, 64, /*visible=*/false);
++    if (!window.has_value()) {
++        MESSAGE("no display backend available, skipping Texture2D test");
++        return std::nullopt;
++    }
++
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        MESSAGE("video driver reports no Vulkan surface extensions (e.g. dummy driver), skipping Texture2D test");
++        return std::nullopt;
++    }
++
++    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++
++    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
++    REQUIRE(surface != VK_NULL_HANDLE);
++
++    auto device = rx::rhi::Device::create(*context, surface);
++    REQUIRE(device.has_value());
++
++    auto allocator = rx::rhi::Allocator::create(*context, *device);
++    REQUIRE(allocator.has_value());
++
++    return TextureTestFixture{std::move(*window), std::move(*context), std::move(*device), std::move(*allocator)};
++}
++
++// Deterministic 64x64 RGBA8 gradient -- every channel is a simple
++// function of (x, y) that never overflows a uint8_t for this extent
++// (x, y both in [0, 63]: x*4 and y*4 max out at 252, (x+y)*2 maxes out at
++// 252), so the exact bytes are trivially reproducible for comparison
++// after the round trip.
++std::vector<uint8_t> makeGradientPixels(uint32_t width, uint32_t height) {
++    std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4);
++    for (uint32_t y = 0; y < height; ++y) {
++        for (uint32_t x = 0; x < width; ++x) {
++            size_t i = (static_cast<size_t>(y) * width + x) * 4;
++            pixels[i + 0] = static_cast<uint8_t>(x * 4);
++            pixels[i + 1] = static_cast<uint8_t>(y * 4);
++            pixels[i + 2] = static_cast<uint8_t>((x + y) * 2);
++            pixels[i + 3] = 255;
++        }
++    }
++    return pixels;
++}
++
++}  // namespace
++
++TEST_CASE("Texture2D + Uploader::uploadToImage: 64x64 upload with generated mips, level 0 readback exact, level "
++          "count correct, validation clean") {
++    auto fixture = makeFixture("rx_rhi_vk_texture_test_upload_mips");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device);
++    REQUIRE(uploader.has_value());
++
++    constexpr VkExtent2D kExtent{64, 64};
++    constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
++
++    auto texture = rx::rhi::Texture2D::create(fixture->device.physicalDevice(), fixture->device.device(),
++                                               fixture->allocator, kExtent, kFormat, VK_IMAGE_USAGE_SAMPLED_BIT,
++                                               /*requestedMipLevels=*/0);
++    REQUIRE(texture.has_value());
++    // floor(log2(64)) + 1 == 7 -- the full chain down to a 1x1 level.
++    CHECK(texture->mipLevels() == 7);
++    CHECK(texture->image() != VK_NULL_HANDLE);
++    CHECK(texture->view() != VK_NULL_HANDLE);
++
++    std::vector<uint8_t> pixels = makeGradientPixels(kExtent.width, kExtent.height);
++    REQUIRE(uploader->uploadToImage(*texture, pixels.data(), pixels.size(), /*generateMips=*/true));
++    uploader->flush();
++
++    // Readback: transition (back) to a copy source, then copy level 0
++    // out to a host-visible buffer -- transitionImage() covers every
++    // level via VK_REMAINING_MIP_LEVELS, which is harmless here since the
++    // copy itself only ever reads level 0.
++    auto readback = fixture->allocator.createHostVisibleBuffer(pixels.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    REQUIRE(readback.has_value());
++
++    auto cmdCtx = rx::rhi::CommandContext::create(fixture->device.device(), fixture->device.graphicsQueue(),
++                                                    fixture->device.graphicsQueueFamily());
++    REQUIRE(cmdCtx.has_value());
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        rx::rhi::transitionImage(cmd, texture->image(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++                                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++
++        VkBufferImageCopy region{};
++        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        region.imageSubresource.mipLevel = 0;
++        region.imageSubresource.baseArrayLayer = 0;
++        region.imageSubresource.layerCount = 1;
++        region.imageExtent = {kExtent.width, kExtent.height, 1};
++        vkCmdCopyImageToBuffer(cmd, texture->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1,
++                               &region);
++    });
++
++    readback->invalidate();
++    std::vector<uint8_t> readBackPixels(pixels.size());
++    std::memcpy(readBackPixels.data(), readback->mappedData(), pixels.size());
++
++    CHECK(std::memcmp(readBackPixels.data(), pixels.data(), pixels.size()) == 0);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("Texture2D::create honors an explicit requestedMipLevels below the auto-computed maximum") {
++    auto fixture = makeFixture("rx_rhi_vk_texture_test_explicit_miplevels");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto texture =
++        rx::rhi::Texture2D::create(fixture->device.physicalDevice(), fixture->device.device(), fixture->allocator,
++                                    VkExtent2D{64, 64}, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT,
++                                    /*requestedMipLevels=*/3);
++    REQUIRE(texture.has_value());
++    CHECK(texture->mipLevels() == 3);
++
++    // Requesting more than the extent could ever support clamps down
++    // silently rather than failing -- a 4x4 extent can only ever produce
++    // 3 levels (4 -> 2 -> 1) regardless of what's requested.
++    auto clamped =
++        rx::rhi::Texture2D::create(fixture->device.physicalDevice(), fixture->device.device(), fixture->allocator,
++                                    VkExtent2D{4, 4}, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT,
++                                    /*requestedMipLevels=*/10);
++    REQUIRE(clamped.has_value());
++    CHECK(clamped->mipLevels() == 3);
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/src/rx_rhi_vk/tests/upload_test.cpp b/src/rx_rhi_vk/tests/upload_test.cpp
+new file mode 100644
+index 0000000..02063cb
+--- /dev/null
++++ b/src/rx_rhi_vk/tests/upload_test.cpp
+@@ -0,0 +1,244 @@
++#include <doctest/doctest.h>
++#include <rx_rhi_vk/command.h>
++#include <rx_rhi_vk/device.h>
++#include <rx_rhi_vk/mesh_buffers.h>
++#include <rx_rhi_vk/upload.h>
++#include <rx_platform/window.h>
++#include <array>
++#include <cstdint>
++#include <cstring>
++#include <optional>
++#include <utility>
++#include <vector>
++
++namespace {
++
++// Same skip-guarded windowed-device fixture pattern as buffer_test.cpp/
++// device_test.cpp -- Uploader::create() takes a real rx::rhi::Device&
++// (it needs a real graphics queue + queue family), which only exists
++// against a real VkSurfaceKHR per device.h, so (unlike
++// deletion_queue_test.cpp's pure-headless fixture, which never touches
++// rx::rhi::Device at all) this file's tests need a window.
++struct UploadTestFixture {
++    rx::platform::Window window;
++    rx::rhi::Context context;
++    rx::rhi::Device device;
++    rx::rhi::Allocator allocator;
++};
++
++std::optional<UploadTestFixture> makeFixture(const char* title) {
++    auto window = rx::platform::Window::create(title, 64, 64, /*visible=*/false);
++    if (!window.has_value()) {
++        MESSAGE("no display backend available, skipping Uploader test");
++        return std::nullopt;
++    }
++
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        MESSAGE("video driver reports no Vulkan surface extensions (e.g. dummy driver), skipping Uploader test");
++        return std::nullopt;
++    }
++
++    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++
++    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
++    REQUIRE(surface != VK_NULL_HANDLE);
++
++    auto device = rx::rhi::Device::create(*context, surface);
++    REQUIRE(device.has_value());
++
++    auto allocator = rx::rhi::Allocator::create(*context, *device);
++    REQUIRE(allocator.has_value());
++
++    return UploadTestFixture{std::move(*window), std::move(*context), std::move(*device), std::move(*allocator)};
++}
++
++// Copies `size` bytes out of `src` (assumed device-local, TRANSFER_SRC_BIT)
++// into a freshly allocated, invalidated, host-visible buffer -- the
++// readback half of every round-trip test below.
++std::vector<uint8_t> readBackBuffer(rx::rhi::Allocator& allocator, VkDevice device, VkQueue queue,
++                                     uint32_t queueFamily, VkBuffer src, VkDeviceSize size) {
++    auto readback = allocator.createHostVisibleBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    REQUIRE(readback.has_value());
++
++    auto cmdCtx = rx::rhi::CommandContext::create(device, queue, queueFamily);
++    REQUIRE(cmdCtx.has_value());
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        VkBufferCopy region{0, 0, size};
++        vkCmdCopyBuffer(cmd, src, readback->handle(), 1, &region);
++    });
++
++    // GPU write (the copy above) happened after this host-visible buffer
++    // was mapped -- invalidate() before reading, per Buffer's own
++    // contract (this task's own Buffer API addition).
++    readback->invalidate();
++
++    std::vector<uint8_t> result(static_cast<size_t>(size));
++    std::memcpy(result.data(), readback->mappedData(), result.size());
++    return result;
++}
++
++}  // namespace
++
++TEST_CASE("Uploader::uploadToBuffer round-trips bytes through the staging path byte-exact") {
++    auto fixture = makeFixture("rx_rhi_vk_upload_test_roundtrip");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device);
++    REQUIRE(uploader.has_value());
++    // Not a hard assertion either way -- both the direct (ReBAR/unified
++    // memory) and staging (plain HOST_VISIBLE) paths are correct;
++    // reporting which one this machine took is diagnostic, matching
++    // Task 3's own bindless_test.cpp precedent of reporting hardware-
++    // dependent facts via MESSAGE rather than asserting a specific one.
++    MESSAGE("Uploader::usesDirectPath() on this machine: ", uploader->usesDirectPath());
++
++    constexpr VkDeviceSize kSize = 4096;
++    std::array<uint8_t, kSize> pattern{};
++    for (size_t i = 0; i < pattern.size(); ++i) {
++        pattern[i] = static_cast<uint8_t>((i * 31 + 7) & 0xFF);
++    }
++
++    auto dst = fixture->allocator.createDeviceLocalBuffer(
++        kSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    REQUIRE(dst.has_value());
++
++    REQUIRE(uploader->uploadToBuffer(dst->handle(), 0, pattern.data(), kSize));
++    uploader->flush();
++
++    std::vector<uint8_t> readBack = readBackBuffer(fixture->allocator, fixture->device.device(),
++                                                     fixture->device.graphicsQueue(),
++                                                     fixture->device.graphicsQueueFamily(), dst->handle(), kSize);
++    CHECK(std::memcmp(readBack.data(), pattern.data(), kSize) == 0);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("Uploader auto-flushes mid-batch when the ring buffer runs out of room, and every upload stays "
++          "byte-exact") {
++    auto fixture = makeFixture("rx_rhi_vk_upload_test_ring_wrap");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    // Deliberately tiny (64 bytes) so two 48-byte uploads in the same
++    // batch cannot both fit -- the second one forces reserveRingSpace()'s
++    // internal auto-flush path (upload.cpp) before it can write anything,
++    // per the class comment in upload.h. Neither upload result should be
++    // affected by that internal flush happening mid-batch.
++    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device, /*ringBufferSize=*/64);
++    REQUIRE(uploader.has_value());
++
++    constexpr VkDeviceSize kChunkSize = 48;
++    std::array<uint8_t, kChunkSize> patternA{};
++    std::array<uint8_t, kChunkSize> patternB{};
++    for (size_t i = 0; i < kChunkSize; ++i) {
++        patternA[i] = static_cast<uint8_t>(i);
++        patternB[i] = static_cast<uint8_t>(0xFF - i);
++    }
++
++    auto dstA = fixture->allocator.createDeviceLocalBuffer(
++        kChunkSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    REQUIRE(dstA.has_value());
++    auto dstB = fixture->allocator.createDeviceLocalBuffer(
++        kChunkSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    REQUIRE(dstB.has_value());
++
++    REQUIRE(uploader->uploadToBuffer(dstA->handle(), 0, patternA.data(), kChunkSize));
++    REQUIRE(uploader->uploadToBuffer(dstB->handle(), 0, patternB.data(), kChunkSize));
++    uploader->flush();
++
++    std::vector<uint8_t> readA = readBackBuffer(fixture->allocator, fixture->device.device(),
++                                                  fixture->device.graphicsQueue(),
++                                                  fixture->device.graphicsQueueFamily(), dstA->handle(), kChunkSize);
++    std::vector<uint8_t> readB = readBackBuffer(fixture->allocator, fixture->device.device(),
++                                                  fixture->device.graphicsQueue(),
++                                                  fixture->device.graphicsQueueFamily(), dstB->handle(), kChunkSize);
++    CHECK(std::memcmp(readA.data(), patternA.data(), kChunkSize) == 0);
++    CHECK(std::memcmp(readB.data(), patternB.data(), kChunkSize) == 0);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("Uploader::uploadToBuffer rejects a single upload larger than the ring buffer's total capacity") {
++    auto fixture = makeFixture("rx_rhi_vk_upload_test_oversize");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device, /*ringBufferSize=*/64);
++    REQUIRE(uploader.has_value());
++
++    std::array<uint8_t, 128> tooBig{};
++    auto dst = fixture->allocator.createDeviceLocalBuffer(128, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    REQUIRE(dst.has_value());
++
++    CHECK_FALSE(uploader->uploadToBuffer(dst->handle(), 0, tooBig.data(), tooBig.size()));
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("MeshBuffers::create uploads vertex+index data into device-local buffers, byte-exact readback") {
++    auto fixture = makeFixture("rx_rhi_vk_upload_test_meshbuffers");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device);
++    REQUIRE(uploader.has_value());
++
++    struct Vertex {
++        float position[3];
++        float uv[2];
++    };
++    constexpr std::array<Vertex, 4> kVertices{{
++        {{0.0F, 0.0F, 0.0F}, {0.0F, 0.0F}},
++        {{1.0F, 0.0F, 0.0F}, {1.0F, 0.0F}},
++        {{1.0F, 1.0F, 0.0F}, {1.0F, 1.0F}},
++        {{0.0F, 1.0F, 0.0F}, {0.0F, 1.0F}},
++    }};
++    constexpr std::array<uint32_t, 6> kIndices{{0, 1, 2, 2, 3, 0}};
++
++    auto mesh = rx::rhi::MeshBuffers::create(fixture->allocator, *uploader, kVertices.data(), sizeof(kVertices),
++                                              kIndices.data(), sizeof(kIndices),
++                                              static_cast<uint32_t>(kIndices.size()), VK_INDEX_TYPE_UINT32);
++    REQUIRE(mesh.has_value());
++    CHECK(mesh->indexCount() == 6);
++    CHECK(mesh->indexType() == VK_INDEX_TYPE_UINT32);
++    CHECK(mesh->vertexBufferSize() == sizeof(kVertices));
++    CHECK(mesh->indexBufferSize() == sizeof(kIndices));
++
++    // MeshBuffers::create() does not add TRANSFER_SRC_BIT to either
++    // buffer's usage (it only ever needs to be a transfer *destination*
++    // in production) -- readBackBuffer() below needs a fresh pair of
++    // TRANSFER_SRC-capable device-local buffers instead, populated
++    // through the same Uploader, purely so this test can verify the
++    // upload path independently of MeshBuffers' own accessors already
++    // returning correct handles/sizes above.
++    auto vertexCopy = fixture->allocator.createDeviceLocalBuffer(
++        sizeof(kVertices), VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    REQUIRE(vertexCopy.has_value());
++    REQUIRE(uploader->uploadToBuffer(vertexCopy->handle(), 0, kVertices.data(), sizeof(kVertices)));
++    uploader->flush();
++
++    std::vector<uint8_t> readBack =
++        readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
++                        fixture->device.graphicsQueueFamily(), vertexCopy->handle(), sizeof(kVertices));
++    CHECK(std::memcmp(readBack.data(), kVertices.data(), sizeof(kVertices)) == 0);
++
++    // The real proof that MeshBuffers' OWN vertex/index buffers actually
++    // contain the right bytes (not just that Uploader in isolation works,
++    // which the copy above already showed): copy straight out of
++    // mesh->vertexBuffer()/indexBuffer() themselves.
++    std::vector<uint8_t> meshVertexReadBack =
++        readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
++                        fixture->device.graphicsQueueFamily(), mesh->vertexBuffer(), sizeof(kVertices));
++    CHECK(std::memcmp(meshVertexReadBack.data(), kVertices.data(), sizeof(kVertices)) == 0);
++
++    std::vector<uint8_t> meshIndexReadBack =
++        readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
++                        fixture->device.graphicsQueueFamily(), mesh->indexBuffer(), sizeof(kIndices));
++    CHECK(std::memcmp(meshIndexReadBack.data(), kIndices.data(), sizeof(kIndices)) == 0);
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/third_party/CMakeLists.txt b/third_party/CMakeLists.txt
+index a4a2a8f..b39c859 100644
+--- a/third_party/CMakeLists.txt
++++ b/third_party/CMakeLists.txt
+@@ -179,20 +179,50 @@ set(RX_VMA_TAG "v3.4.0")
+ FetchContent_Declare(vma
+   GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
+   GIT_TAG ${RX_VMA_TAG}
+   GIT_SHALLOW TRUE)
+ FetchContent_GetProperties(vma)
+ if(NOT vma_POPULATED)
+   FetchContent_Populate(vma)
+ endif()
+ set(vma_SOURCE_DIR "${vma_SOURCE_DIR}" PARENT_SCOPE)
+ 
++# stb (stb_image.h): header-only image decoder, used by rx_rhi_vk's texture
++# upload path (Task 4, rx::rhi::Texture2D/Uploader) to decode PNG/JPG/etc.
++# pixel data from disk into raw RGBA8 bytes -- the spec's Fixed decision
++# #10: "stb_image ... Public upload surface is 'pixels + format + extent
++# in -> bindless handle out' so a libktx backend can slot in later without
++# touching descriptor code" [R:C3]. Exactly like volk/VMA above: stb's repo
++# has no CMakeLists.txt at all (it's a loose collection of public-domain
++# single-header libraries, not a buildable project) and no version tags
++# (all releases are untagged commits on `master`), so this fetches the
++# source only via FetchContent_Populate (never FetchContent_MakeAvailable,
++# which would have nothing to add_subdirectory anyway) and PARENT_SCOPE-
++# propagates stb_SOURCE_DIR up to the root scope for src/rx_rhi_vk (a
++# sibling directory under the root CMakeLists.txt, not a descendant of this
++# one) to consume -- same CMake 3.22 sibling-scope reason documented above
++# volk/VMA. The implementation itself is compiled exactly once, in
++# src/rx_rhi_vk/src/stb_impl.cpp (STB_IMAGE_IMPLEMENTATION defined there
++# only), mirroring vma_impl.cpp's own single-TU-implementation discipline:
++# defining STB_IMAGE_IMPLEMENTATION in more than one TU is a
++# duplicate-symbol link error.
++set(RX_STB_TAG "2c980bb59875b0d32144a71867fbdebb2f77cd20") # nothings/stb has no version tags; pinned commit, master as of this task's date
++FetchContent_Declare(stb
++  GIT_REPOSITORY https://github.com/nothings/stb.git
++  GIT_TAG ${RX_STB_TAG}
++  GIT_SHALLOW TRUE)
++FetchContent_GetProperties(stb)
++if(NOT stb_POPULATED)
++  FetchContent_Populate(stb)
++endif()
++set(stb_SOURCE_DIR "${stb_SOURCE_DIR}" PARENT_SCOPE)
++
+ # vk-bootstrap: instance/device/swapchain setup helper, a real compiled
+ # library, so (unlike volk/GLM/doctest) it goes through the dependency cache
+ # rather than plain FetchContent.
+ #
+ # Investigated risk (flagged from Task 5.6, the rx_platform find_package(Vulkan)
+ # fix): does vk-bootstrap's own CMakeLists.txt (checked directly against the
+ # pinned commit) require the Vulkan loader for its *library* target, not just
+ # its tests/examples (already disabled below via VK_BOOTSTRAP_TEST=OFF)? Yes,
+ # conditionally: it needs a Vulkan::Headers target and tries, in order,
+ # (1) find_package(VulkanHeaders CONFIG), (2) find_package(Vulkan) -- the
