@@ -151,3 +151,53 @@ TEST_CASE("FrameSync runs a real frames-in-flight acquire/submit/present loop") 
 
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
+
+// FrameSync::frameNumber() (added this task, alongside rx::rhi::
+// DeletionQueue -- see that class's own header comment) has no real
+// Vulkan work to exercise: it's a plain counter incremented by
+// advanceFrame() alongside currentFrame_. No acquire/submit/present
+// needed to prove it -- just build a real FrameSync (still needs a real
+// windowed Device: FrameSync::create() takes a VkDevice) and call
+// advanceFrame() enough times to wrap currentFrameIndex() around its
+// mod-kFramesInFlight cycle at least twice, confirming frameNumber()
+// itself never wraps or repeats while currentFrameIndex() does -- the
+// exact distinction DeletionQueue's retire()/onFrameFenceSignaled() ABA-
+// avoidance depends on (frame_sync.h's own comment on frameNumber()).
+TEST_CASE("FrameSync::frameNumber() advances monotonically with advanceFrame(), independent of "
+          "currentFrameIndex()'s mod-kFramesInFlight cycling") {
+    auto fixture = makeFixture("rx_rhi_vk_frame_sync_test_frame_number");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto device = rx::rhi::Device::create(fixture->context, fixture->surface);
+    REQUIRE(device.has_value());
+    const VkDevice vkDevice = device->device();
+
+    auto frameSync = rx::rhi::FrameSync::create(vkDevice, device->graphicsQueueFamily(),
+                                                  static_cast<uint32_t>(device->swapchainImages().size()));
+    REQUIRE(frameSync.has_value());
+
+    // Starts at 0, matching currentFrameIndex()'s own starting value.
+    CHECK(frameSync->frameNumber() == 0);
+    CHECK(frameSync->currentFrameIndex() == 0);
+
+    constexpr uint64_t kIterations = 10;  // > 2 * kFramesInFlight, so currentFrameIndex() wraps at least twice
+    for (uint64_t i = 1; i <= kIterations; ++i) {
+        frameSync->advanceFrame();
+        // Monotonic, never repeats -- unlike currentFrameIndex() below.
+        CHECK(frameSync->frameNumber() == i);
+        CHECK(frameSync->currentFrameIndex() == static_cast<uint32_t>(i % rx::rhi::FrameSync::kFramesInFlight));
+    }
+
+    // Concrete evidence of the exact distinction frameNumber() exists
+    // for: two different frameNumber() values (2 and 4, both reachable
+    // within kIterations above) land on the SAME currentFrameIndex() slot
+    // -- a DeletionQueue keyed on currentFrameIndex() alone could not
+    // tell those two frames apart; frameNumber() can.
+    CHECK(2 % rx::rhi::FrameSync::kFramesInFlight == 4 % rx::rhi::FrameSync::kFramesInFlight);
+    CHECK(2 != 4);
+
+    REQUIRE(vkDeviceWaitIdle(vkDevice) == VK_SUCCESS);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}

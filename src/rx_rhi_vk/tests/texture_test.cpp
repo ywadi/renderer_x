@@ -128,6 +128,92 @@ TEST_CASE("Texture2D + Uploader::uploadToImage: 64x64 upload with generated mips
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 
+TEST_CASE("Texture2D + Uploader::uploadToImage: a single-mip-level texture round-trips exactly through both "
+          "uploadToImage() branches -- generateMips=true (exercises Texture2D::recordMipChainBlit()'s own "
+          "early-return branch) and generateMips=false (exercises uploadToImage()'s plain-transition branch), "
+          "hardware-independent") {
+    auto fixture = makeFixture("rx_rhi_vk_texture_test_single_mip");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device);
+    REQUIRE(uploader.has_value());
+
+    constexpr VkExtent2D kExtent{16, 16};
+    constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    std::vector<uint8_t> pixels = makeGradientPixels(kExtent.width, kExtent.height);
+
+    auto readBackLevel0 = [&](rx::rhi::Texture2D& texture) {
+        auto readback = fixture->allocator.createHostVisibleBuffer(pixels.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        REQUIRE(readback.has_value());
+
+        auto cmdCtx = rx::rhi::CommandContext::create(fixture->device.device(), fixture->device.graphicsQueue(),
+                                                        fixture->device.graphicsQueueFamily());
+        REQUIRE(cmdCtx.has_value());
+        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+            rx::rhi::transitionImage(cmd, texture.image(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            VkBufferImageCopy region{};
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent = {kExtent.width, kExtent.height, 1};
+            vkCmdCopyImageToBuffer(cmd, texture.image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1,
+                                   &region);
+        });
+        readback->invalidate();
+        std::vector<uint8_t> result(pixels.size());
+        std::memcpy(result.data(), readback->mappedData(), pixels.size());
+        return result;
+    };
+
+    // Sub-case 1: generateMips=true on a requestedMipLevels=1 texture --
+    // uploadToImage() now calls Texture2D::recordMipChainBlit()
+    // unconditionally whenever generateMips is true (see upload.cpp),
+    // which for mipLevels() == 1 takes its own early-return branch (a
+    // single transitionLevelRange() call, no vkCmdBlitImage at all) --
+    // previously unreachable through this public API (this task's
+    // review, Important 2).
+    {
+        // TRANSFER_SRC_BIT requested explicitly: Texture2D::create() only
+        // auto-adds it when mipLevels() > 1 (a single-mip texture never
+        // needs to be a blit source in production), but this test's own
+        // readback helper needs it to run vkCmdCopyImageToBuffer.
+        auto textureA = rx::rhi::Texture2D::create(fixture->device.physicalDevice(), fixture->device.device(),
+                                                     fixture->allocator, kExtent, kFormat,
+                                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                                     /*requestedMipLevels=*/1);
+        REQUIRE(textureA.has_value());
+        REQUIRE(textureA->mipLevels() == 1);
+
+        REQUIRE(uploader->uploadToImage(*textureA, pixels.data(), pixels.size(), /*generateMips=*/true));
+        uploader->flush();
+
+        std::vector<uint8_t> readBack = readBackLevel0(*textureA);
+        CHECK(std::memcmp(readBack.data(), pixels.data(), pixels.size()) == 0);
+    }
+
+    // Sub-case 2: generateMips=false on the same kind of texture --
+    // uploadToImage()'s plain single-transition `else` branch (never
+    // calls recordMipChainBlit() at all).
+    {
+        auto textureB = rx::rhi::Texture2D::create(fixture->device.physicalDevice(), fixture->device.device(),
+                                                     fixture->allocator, kExtent, kFormat,
+                                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                                     /*requestedMipLevels=*/1);
+        REQUIRE(textureB.has_value());
+        REQUIRE(textureB->mipLevels() == 1);
+
+        REQUIRE(uploader->uploadToImage(*textureB, pixels.data(), pixels.size(), /*generateMips=*/false));
+        uploader->flush();
+
+        std::vector<uint8_t> readBack = readBackLevel0(*textureB);
+        CHECK(std::memcmp(readBack.data(), pixels.data(), pixels.size()) == 0);
+    }
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
 TEST_CASE("Texture2D::create honors an explicit requestedMipLevels below the auto-computed maximum") {
     auto fixture = makeFixture("rx_rhi_vk_texture_test_explicit_miplevels");
     if (!fixture.has_value()) {

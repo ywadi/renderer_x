@@ -341,3 +341,207 @@ scenario its own stress test already exercises end to end, just without
 a real `BindlessTable::release()` call interleaved (that interleaving is
 Task 7's own proof, per the as-built context's "release-safety contract"
 note in `bindless.h`).
+
+---
+
+## Fix Round 1 (review: 1 Critical + 3 Important)
+
+### CRITICAL — ReBAR direct path was structurally unreachable
+
+**Independently re-verified the root cause against this project's own
+vendored VMA 3.4.0 source before implementing anything** (not just
+trusted the review's summary):
+
+- `vk_mem_alloc.h:3757`, `VmaBufferImageUsage::ContainsDeviceAccess()`:
+  `return (Value & ~BaseType(VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+  VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) != 0;` — masks OUT both transfer
+  bits; a buffer whose usage is ONLY `TRANSFER_SRC_BIT` (the original
+  `createUploadRingBuffer()`'s exact usage) reports `false`.
+- `vk_mem_alloc.h:4264-4302`, `FindMemoryPreferences()`'s
+  `VMA_MEMORY_USAGE_AUTO` branch, `hostAccessSequentialWrite` case: when
+  `deviceAccess` (that same `ContainsDeviceAccess()` result) is true AND
+  `hostAccessAllowTransferInstead` is true, it sets
+  `outPreferredFlags |= DEVICE_LOCAL_BIT | HOST_VISIBLE_BIT` (the
+  intended combined preference). When `deviceAccess` is FALSE (the ring
+  buffer's actual case), it instead falls into `else`: sets
+  `outPreferredFlags |= HOST_VISIBLE_BIT` and then, since `!deviceAccess`
+  and `usage != AUTO_PREFER_DEVICE`, explicitly sets
+  `outNotPreferredFlags |= DEVICE_LOCAL_BIT` -- i.e. the original
+  implementation's flag combination didn't just fail to help, it
+  actively steered VMA AWAY from DEVICE_LOCAL memory. This is a stronger
+  finding than "buys nothing" and is now cited precisely in
+  `buffer.h`'s own comments.
+- Live-verified on this machine (real run, `RX_LOG_INFO` output): before
+  the fix, every `Uploader::create()` logged "ring buffer placed in
+  plain HOST_VISIBLE memory" — the direct path never engaged, matching
+  the review's claim exactly.
+
+**Fix implemented (matches the review's prescribed shape):**
+`Allocator::createDeviceLocalBuffer()` (used by `MeshBuffers` and any
+caller allocating a real destination buffer) now requests
+`ALLOW_TRANSFER_INSTEAD_BIT` itself, applied to a buffer whose `usage`
+carries a real device-consuming bit (`VERTEX_BUFFER_BIT`,
+`INDEX_BUFFER_BIT`, ...) — exactly where `ContainsDeviceAccess()` reports
+`true` and the combined-preference branch above actually fires. The
+resulting `Buffer` gains a new classification,
+`Buffer::directPathCapable()` (true only when the real allocation landed
+BOTH `DEVICE_LOCAL_BIT` and `HOST_VISIBLE_BIT`, checked once via
+`vmaGetMemoryTypeProperties`). `createHostVisibleBuffer()` always reports
+`directPathCapable() == false` — a hardcoded value, not a measurement,
+since that factory never requests the flag at all (documented explicitly
+so a test can force the non-direct branch deterministically).
+`createUploadRingBuffer()` had the flag REMOVED (it was dead weight, now
+documented as such) and returns a plain `optional<Buffer>` again (the
+short-lived `UploadBufferResult`/`deviceLocal` classification from the
+first implementation is gone).
+
+`Uploader::uploadToBuffer()`'s signature changed from `(VkBuffer dst,
+...)` to `(Buffer& dst, ...)` — required so the method can inspect
+`dst.directPathCapable()`/`dst.mappedData()` to decide the branch (a bare
+handle carries neither). Per call: if `dst.directPathCapable() &&
+dst.mappedData() != nullptr`, it `memcpy`s straight into
+`dst.mappedData()` and calls `dst.flush()` — no staging copy, no command
+recorded, no ring buffer touched. Otherwise it stages through the ring
+exactly as before. Each outcome is logged once per `Uploader` instance
+(`RX_LOG_INFO`, first occurrence only) and exposed for tests via
+`everUsedDirectPath()`/`everUsedStagingPath()` (replacing the removed
+`usesDirectPath()`, which no longer made sense once the decision became
+per-call rather than fixed at `Uploader::create()`).
+`MeshBuffers::create()`'s two `uploadToBuffer()` calls were updated to
+pass `*vertexBuffer`/`*indexBuffer` — both of MeshBuffers' own buffers
+already carry a real device-consuming usage bit, so they now genuinely
+benefit from the direct path on qualifying hardware.
+
+**Images:** `uploadToImage()` is unchanged in this respect and
+`upload.h`'s class comment now says explicitly why: a `VkImage` cannot be
+written from the host at all without `VK_EXT_host_image_copy`, which is
+not in this project's Vulkan 1.3 + descriptor-indexing baseline (spec
+Fixed decision #5) — there is no "direct" branch for images to take, by
+construction of the API, not a scope cut.
+
+**Direct-path engagement evidence (this machine, ReBAR-capable RTX
+2080):**
+```
+[info] Uploader::uploadToBuffer: destination memory is DEVICE_LOCAL + HOST_VISIBLE -- writing directly, no staging copy [R:C1]
+```
+logged from the dedicated mechanism test (`upload_test.cpp`,
+"...takes the direct memcpy-into-mapped-destination path...") AND from
+the `MeshBuffers::create()` test (its vertex/index buffer uploads) — the
+exact scenario the review named. `Buffer::directPathCapable()` was
+`true` and `uploader->everUsedDirectPath()` asserted `true` via `CHECK`
+(a real doctest assertion, verified passing directly in the run output —
+not a `MESSAGE`) in both. The staging branch is exercised deterministically
+(hardware-independent) via a dedicated test that forces it by using
+`createHostVisibleBuffer()`'s hardcoded-false classification as the
+destination.
+
+**Tests added/changed (`upload_test.cpp`):** new
+"...takes the direct memcpy-into-mapped-destination path..." test
+(`VERTEX_BUFFER_BIT` destination; asserts `everUsedDirectPath()`/
+`everUsedStagingPath()` via `CHECK` gated on the real
+`directPathCapable()` classification, not a soft `MESSAGE`); new
+"...stages through the ring buffer when the destination is not
+direct-path-capable, deterministically..." test (forces staging via
+`createHostVisibleBuffer()`, independent of hardware); existing
+round-trip/ring-wrap/oversize/MeshBuffers tests updated for the
+`Buffer&` signature change, with the plain round-trip test's destination
+usage left device-access-bit-free specifically so it keeps exercising
+staging deterministically too.
+
+### IMPORTANT 1 — missing `SAMPLED_IMAGE_FILTER_LINEAR_BIT` check
+
+`texture.cpp`'s mip format-feature check now requires all three of
+`VK_FORMAT_FEATURE_BLIT_SRC_BIT`, `_BLIT_DST_BIT`, and
+`_SAMPLED_IMAGE_FILTER_LINEAR_BIT` under optimal tiling before honoring
+`mipLevels > 1` — `vkCmdBlitImage` with `VK_FILTER_LINEAR`
+(`recordMipChainBlit()`'s filter choice) separately requires the source
+format to support linear filtering
+(`VUID-vkCmdBlitImage-filter-02001`), independent of the two blit bits.
+Missing any of the three still falls back to a single mip level with
+`RX_LOG_WARN`, unchanged. `texture.h`'s declaration comment updated to
+match.
+
+### IMPORTANT 2 — `mipLevels() == 1` path was entirely untested
+
+Root cause: `uploadToImage()`'s original guard was `generateMips &&
+dst.mipLevels() > 1`, which meant `Texture2D::recordMipChainBlit()`'s own
+early-return branch (`mipLevels_ <= 1`) was UNREACHABLE through the
+public `Uploader` API no matter what a test passed for `generateMips` —
+a single-mip texture always took `uploadToImage()`'s plain `else`
+branch instead, never calling `recordMipChainBlit()` at all. Simplified
+the guard to just `generateMips` (dropped the redundant `&&
+dst.mipLevels() > 1`): `recordMipChainBlit()` already handles
+`mipLevels() == 1` correctly and cheaply via its own early return (an
+identical single `transitionLevelRange()` call to `uploadToImage()`'s
+own `else` branch), so the extra clause was dead-weight duplication with
+zero behavioral difference for that case, and removing it is what makes
+the early-return branch reachable through the public API at all. No
+behavior changed for any existing `mipLevels() > 1` scenario.
+
+Added one test (`texture_test.cpp`) with two sub-cases on a
+`requestedMipLevels=1` texture: `generateMips=true` (now exercises
+`recordMipChainBlit()`'s early-return branch) and `generateMips=false`
+(exercises `uploadToImage()`'s plain-transition `else` branch) — both
+round-trip level 0 byte-exact. (Caught and fixed a test-only bug while
+writing this: the sub-case textures need `TRANSFER_SRC_BIT` requested
+explicitly in `usage`, since `Texture2D::create()` only auto-adds it when
+`mipLevels() > 1`; the test's own readback needs it regardless of that
+production-side optimization.)
+
+### IMPORTANT 3 — no direct unit test for `FrameSync::frameNumber()`
+
+Added a test (`frame_sync_test.cpp`) that builds a real windowed
+`Device` + `FrameSync` (no acquire/submit/present needed — `frameNumber()`
+is pure bookkeeping incremented alongside `currentFrame_` in
+`advanceFrame()`) and calls `advanceFrame()` 10 times (`>
+2 * kFramesInFlight`, so `currentFrameIndex()` wraps at least twice),
+asserting `frameNumber()` matches the iteration count exactly every time
+while `currentFrameIndex()` cycles mod 2 — plus an explicit assertion
+that two different `frameNumber()` values (2 and 4) land on the same
+`currentFrameIndex()` slot, the concrete case `DeletionQueue`'s ABA
+avoidance depends on `frameNumber()` (not `currentFrameIndex()`) to
+resolve correctly.
+
+## Verification (fix round)
+
+- **linux-native:** full build clean; `ctest`: **7/7 pass** (the sixth
+  and seventh, `sample_01_triangle_headless`/`sample_02_hotreload_headless`,
+  landed via the concurrent Task 5 merge into `main` while this fix round
+  was in progress — unrelated to and unaffected by these changes).
+  `rx_rhi_vk_tests` run directly: **26 test cases / 703 assertions, 0
+  failed.** Every `[error]`-level log line is one of three deliberately-
+  exercised clean-rejection paths (unchanged from the original
+  submission); `grep` for `Validation Error` outside the pre-existing
+  documented `known false positive` returns nothing.
+- **windows-cross-zig:** configure + full build clean, including every
+  changed file.
+- Commit hygiene: verified directly with `git log --format='%B'` after
+  committing — no AI attribution.
+
+## Deviations from brief / spec (fix round, additive to the list above)
+
+5. **`Uploader::uploadToBuffer()` now takes `Buffer&` instead of
+   `VkBuffer`** — required for the Critical fix (the method must inspect
+   `directPathCapable()`/`mappedData()` on the actual destination
+   object, which a bare handle cannot provide). Callers holding only a
+   raw `VkBuffer` with no accompanying `rx::rhi::Buffer` cannot use this
+   method at all now; none of this codebase's callers were in that
+   position (`MeshBuffers`, all tests).
+6. **`Allocator::createUploadRingBuffer()`'s return type reverted from
+   `optional<UploadBufferResult>` back to `optional<Buffer>`** — the
+   `deviceLocal` classification it carried was a measurement of a
+   structurally-impossible outcome (see the Critical fix above) and is
+   gone; `Uploader::usesDirectPath()` (which read it) is replaced by
+   `everUsedDirectPath()`/`everUsedStagingPath()`.
+
+## Concerns for the coordinator (fix round, additive)
+
+5. **The direct path's engagement is now genuinely hardware-dependent
+   per call, not per-`Uploader`-instance** — a single `Uploader` can take
+   the direct branch for one destination and the staging branch for
+   another in the same batch (this is correct and intended, but worth
+   noting for Task 6/7: don't assume one `Uploader`'s `everUsedDirectPath()`
+   generalizes to every future upload through it).
+6. **The single-mip-format-fallback path (all three feature bits, now)
+   remains untested for the same reason as before** (Concern 1 in the
+   original submission) — unchanged, still flagged rather than forced.

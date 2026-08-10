@@ -90,14 +90,24 @@ std::optional<Texture2D> Texture2D::create(VkPhysicalDevice physicalDevice, VkDe
     if (mipLevels > 1) {
         VkFormatProperties formatProps{};
         vkGetPhysicalDeviceFormatProperties(physicalDevice, format, &formatProps);
-        // Both bits, not just BLIT_DST (see this method's declaration
-        // comment in texture.h for why SRC is equally required) [R:C2].
-        constexpr VkFormatFeatureFlags kBlitChainFeatures =
-            VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+        // Three bits, not just BLIT_DST (see this method's declaration
+        // comment in texture.h for why SRC is equally required) [R:C2]:
+        // BLIT_SRC_BIT/BLIT_DST_BIT for the blit itself, PLUS
+        // SAMPLED_IMAGE_FILTER_LINEAR_BIT -- vkCmdBlitImage with
+        // VK_FILTER_LINEAR (recordMipChainBlit()'s filter choice) also
+        // requires the SOURCE format to support linear filtering under
+        // the tiling in use (VUID-vkCmdBlitImage-filter-02001: "If filter
+        // is VK_FILTER_LINEAR, ... must contain
+        // VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT"), a
+        // requirement independent of the two blit bits above and missed
+        // by this task's own first implementation (flagged in review).
+        constexpr VkFormatFeatureFlags kBlitChainFeatures = VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+                                                              VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                                              VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
         if ((formatProps.optimalTilingFeatures & kBlitChainFeatures) != kBlitChainFeatures) {
             RX_LOG_WARN(
-                "Texture2D::create: format {} does not support BLIT_SRC+BLIT_DST under optimal tiling on this "
-                "device -- falling back to a single mip level instead of the requested {} [R:C2]",
+                "Texture2D::create: format {} does not support BLIT_SRC+BLIT_DST+FILTER_LINEAR under optimal "
+                "tiling on this device -- falling back to a single mip level instead of the requested {} [R:C2]",
                 static_cast<int>(format), mipLevels);
             mipLevels = 1;
         }

@@ -58,6 +58,23 @@ public:
     void* mappedData() const { return mappedData_; }
     VkDeviceSize size() const { return size_; }
 
+    // True only for a Buffer created by Allocator::createDeviceLocalBuffer()
+    // whose resulting VMA memory type turned out to be BOTH
+    // VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT and
+    // VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT -- the ReBAR/unified-memory
+    // "direct upload" classification [R:C1]. rx::rhi::Uploader::
+    // uploadToBuffer() checks this (together with mappedData() != nullptr)
+    // to decide whether it can memcpy straight into this Buffer and skip
+    // the staging ring entirely. Always false for a Buffer created by
+    // createHostVisibleBuffer() (that factory never requests the
+    // ALLOW_TRANSFER_INSTEAD_BIT preference in the first place -- see its
+    // own comment) regardless of what its real memory type happens to be;
+    // this is a deliberate, hardcoded false, not a measurement, precisely
+    // so a test can force the non-direct branch deterministically without
+    // depending on any specific hardware's classification (see
+    // upload_test.cpp).
+    bool directPathCapable() const { return directPathCapable_; }
+
     // Wraps vmaFlushAllocation()/vmaInvalidateAllocation() -- the API gap
     // flagged by Phase 1 Task 3's review: that task's readback test had no
     // way to reach the underlying VmaAllocation to invalidate it, and had
@@ -92,8 +109,14 @@ private:
     friend class Allocator;
 
     Buffer() = default;
-    Buffer(VmaAllocator allocator, VkBuffer buffer, VmaAllocation allocation, void* mappedData, VkDeviceSize size)
-        : allocator_(allocator), buffer_(buffer), allocation_(allocation), mappedData_(mappedData), size_(size) {}
+    Buffer(VmaAllocator allocator, VkBuffer buffer, VmaAllocation allocation, void* mappedData, VkDeviceSize size,
+           bool directPathCapable = false)
+        : allocator_(allocator),
+          buffer_(buffer),
+          allocation_(allocation),
+          mappedData_(mappedData),
+          size_(size),
+          directPathCapable_(directPathCapable) {}
 
     void destroyAll();
 
@@ -102,6 +125,7 @@ private:
     VmaAllocation allocation_ = VK_NULL_HANDLE;
     void* mappedData_ = nullptr;
     VkDeviceSize size_ = 0;
+    bool directPathCapable_ = false;
 };
 
 // Owns a VmaAllocator built against a specific VkInstance/VkPhysicalDevice/
@@ -133,44 +157,68 @@ public:
     // frame. Returns std::nullopt on any failure (logged via RX_LOG_ERROR).
     std::optional<Buffer> createHostVisibleBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
 
-    // Allocates a VkBuffer with `usage`, backed by DEVICE_LOCAL memory with
-    // no host-visibility request at all (VMA_MEMORY_USAGE_AUTO, no
-    // HOST_ACCESS_* flags, no MAPPED_BIT) -- the resulting Buffer's
-    // mappedData() is always nullptr. Suitable for GPU-only resources
-    // written exactly once via a real transfer (rx::rhi::Uploader) and
-    // read many times afterward, such as rx::rhi::MeshBuffers' vertex/
-    // index buffers -- never for anything the CPU writes directly.
-    // Returns std::nullopt on any failure (logged via RX_LOG_ERROR).
+    // Allocates a VkBuffer with `usage` -- intended for a real
+    // device-consuming role (VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+    // _INDEX_BUFFER_BIT, _STORAGE_BUFFER_BIT, ...; TRANSFER_DST_BIT alone
+    // does NOT count, see below) -- via VMA_MEMORY_USAGE_AUTO +
+    // VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+    // VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT |
+    // VMA_ALLOCATION_CREATE_MAPPED_BIT -- the real ReBAR-aware
+    // direct-upload pattern [R:C1], applied to the actual destination
+    // resource rather than a staging buffer (see the CRITICAL fix note
+    // below for why that distinction is load-bearing).
+    //
+    // **Why `usage` must carry a real device-consuming bit for this to do
+    // anything:** verified directly against this project's vendored VMA
+    // 3.4.0 source (`vk_mem_alloc.h`). `VmaBufferImageUsage::
+    // ContainsDeviceAccess()` masks OUT `TRANSFER_SRC_BIT`/`TRANSFER_DST_BIT`
+    // and returns whether anything else remains -- a buffer whose usage is
+    // ONLY transfer bits reports `ContainsDeviceAccess() == false`.
+    // `FindMemoryPreferences()`'s `VMA_MEMORY_USAGE_AUTO` branch only adds
+    // `DEVICE_LOCAL_BIT | HOST_VISIBLE_BIT` to its *preferred* flags when
+    // `ContainsDeviceAccess() == true` (the `deviceAccess` local) AND
+    // `ALLOW_TRANSFER_INSTEAD_BIT` is set; when `ContainsDeviceAccess()`
+    // is false, that same code path instead pushes `DEVICE_LOCAL_BIT` into
+    // *not-preferred* -- actively steering AWAY from the memory this
+    // pattern is supposed to land in. This is exactly the mistake this
+    // task's own first implementation made on `createUploadRingBuffer()`'s
+    // TRANSFER_SRC-only staging buffer (fixed below) and exactly why this
+    // method requires a real device-consuming usage bit to be worth
+    // calling with these flags at all -- a caller passing e.g. only
+    // `TRANSFER_DST_BIT` here gets a buffer that structurally can never
+    // report directPathCapable() == true, no matter the hardware.
+    //
+    // On a ReBAR-enabled desktop GPU or unified-memory APU, this resolves
+    // to memory that is BOTH DEVICE_LOCAL and HOST_VISIBLE
+    // (`Buffer::directPathCapable()` true, `mappedData()` non-null) --
+    // callers (rx::rhi::Uploader::uploadToBuffer(), rx::rhi::MeshBuffers)
+    // can then write directly into it and skip a staging copy entirely.
+    // Everywhere else it resolves to plain DEVICE_LOCAL-only memory
+    // (`directPathCapable()` false, `mappedData()` null -- VMA does not
+    // map memory it cannot map), identical to this method's behavior
+    // before this task's Critical review fix. Returns std::nullopt on any
+    // failure (logged via RX_LOG_ERROR).
     std::optional<Buffer> createDeviceLocalBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
-
-    // Result of createUploadRingBuffer() below: the allocated staging
-    // Buffer, plus whether VMA actually placed it in memory that is BOTH
-    // DEVICE_LOCAL and HOST_VISIBLE (the ReBAR/integrated-memory "direct"
-    // fast path [R:C1]) as opposed to falling back to plain HOST_VISIBLE
-    // system memory (the non-ReBAR desktop case). `deviceLocal` is a
-    // one-time, informational classification for logging/diagnostics --
-    // rx::rhi::Uploader's copy code (vkCmdCopyBuffer/
-    // vkCmdCopyBufferToImage from this buffer) is identical either way;
-    // only the underlying memory's physical location and copy bandwidth
-    // differ.
-    struct UploadBufferResult {
-        Buffer buffer;
-        bool deviceLocal = false;
-    };
 
     // Allocates a VkBuffer with `usage` (typically just
     // VK_BUFFER_USAGE_TRANSFER_SRC_BIT -- this is always a copy *source*,
     // never a real destination resource) via VMA_MEMORY_USAGE_AUTO +
     // VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-    // VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT |
-    // VMA_ALLOCATION_CREATE_MAPPED_BIT -- the exact ReBAR-aware pattern
-    // [R:C1] documents: VMA tries a memory type that is both DEVICE_LOCAL
-    // and HOST_VISIBLE first, falling back to plain HOST_VISIBLE system
-    // memory if none exists or allocation from it fails. Which one was
-    // actually obtained is reported via the returned `deviceLocal` flag
-    // (checked once via vmaGetMemoryTypeProperties -- no physical-device
-    // handle needed here). Returns std::nullopt on any failure (logged).
-    std::optional<UploadBufferResult> createUploadRingBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
+    // VMA_ALLOCATION_CREATE_MAPPED_BIT -- always resolves to plain
+    // HOST_VISIBLE memory, exactly VMA's own "Simple staging buffer"
+    // pattern [R:C1]. The resulting Buffer's directPathCapable() is
+    // always false: a TRANSFER_SRC-only usage can never make
+    // ContainsDeviceAccess() true (see createDeviceLocalBuffer()'s own
+    // comment above), so there is no point requesting
+    // ALLOW_TRANSFER_INSTEAD_BIT here at all -- an earlier version of this
+    // method did, and it was structurally inert (this task's own Critical
+    // review finding: the flag never changed which memory type this
+    // buffer landed in, on any hardware). rx::rhi::Uploader's internal
+    // staging ring buffer is exactly this: a plain, always-staging
+    // resource; the direct-upload optimization belongs on the
+    // *destination* (createDeviceLocalBuffer() above), not here. Returns
+    // std::nullopt on any failure (logged).
+    std::optional<Buffer> createUploadRingBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
 
     // Raw VmaAllocator handle -- needed by rx::rhi::Texture2D::create()
     // (texture.h, a separate header/TU) to call vmaCreateImage/

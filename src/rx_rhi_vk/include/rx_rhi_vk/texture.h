@@ -45,16 +45,22 @@ public:
     //
     // Before honoring any mipLevels > 1 request, this queries
     // `physicalDevice`'s VK_FORMAT_FEATURE_BLIT_SRC_BIT |
-    // VK_FORMAT_FEATURE_BLIT_DST_BIT support for `format` under optimal
-    // tiling (both bits: the blit chain this Texture2D's
-    // recordMipChainBlit() records reads FROM level N via
-    // VK_FORMAT_FEATURE_BLIT_SRC_BIT and writes TO level N+1 via
-    // VK_FORMAT_FEATURE_BLIT_DST_BIT -- the brief's own shorthand names
-    // only the DST bit, but SRC is equally required for a blit chain to
-    // work at all, so both are checked here). If either is unsupported,
-    // this silently falls back to a single mip level and logs
-    // RX_LOG_WARN naming the format [R:C2] -- never a hard failure, since
-    // a texture with no mips is still a perfectly usable texture.
+    // VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT
+    // support for `format` under optimal tiling. The brief's own
+    // shorthand names only the DST bit, but two more bits are equally
+    // required for this Texture2D's actual recordMipChainBlit()
+    // implementation to be valid, not just "nice to check": SRC is needed
+    // because the blit chain reads FROM level N (via BLIT_SRC_BIT) to
+    // write TO level N+1 (via BLIT_DST_BIT), and FILTER_LINEAR is needed
+    // because recordMipChainBlit() calls vkCmdBlitImage with
+    // VK_FILTER_LINEAR, which Vulkan separately requires the SOURCE
+    // format to support under this same optimal-tiling feature set
+    // (VUID-vkCmdBlitImage-filter-02001) -- missing that third bit was a
+    // real gap this task's review caught, not a hypothetical one. If any
+    // of the three is unsupported, this silently falls back to a single
+    // mip level and logs RX_LOG_WARN naming the format [R:C2] -- never a
+    // hard failure, since a texture with no mips is still a perfectly
+    // usable texture.
     //
     // `usage` is ORed with VK_IMAGE_USAGE_TRANSFER_DST_BIT unconditionally
     // (level 0 always needs to be a copy destination for

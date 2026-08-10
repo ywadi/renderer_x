@@ -69,30 +69,11 @@ std::optional<Buffer> Allocator::createDeviceLocalBuffer(VkDeviceSize size, VkBu
     bufferInfo.usage = usage;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    VmaAllocationCreateInfo allocCreateInfo{};
-    allocCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
-
-    VkBuffer buffer = VK_NULL_HANDLE;
-    VmaAllocation allocation = VK_NULL_HANDLE;
-    VmaAllocationInfo allocationInfo{};
-    VkResult result =
-        vmaCreateBuffer(allocator_, &bufferInfo, &allocCreateInfo, &buffer, &allocation, &allocationInfo);
-    if (result != VK_SUCCESS) {
-        RX_LOG_ERROR("vmaCreateBuffer (device-local) failed: VkResult={}", static_cast<int>(result));
-        return std::nullopt;
-    }
-
-    return Buffer(allocator_, buffer, allocation, allocationInfo.pMappedData, size);
-}
-
-std::optional<Allocator::UploadBufferResult> Allocator::createUploadRingBuffer(VkDeviceSize size,
-                                                                                  VkBufferUsageFlags usage) {
-    VkBufferCreateInfo bufferInfo{};
-    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferInfo.size = size;
-    bufferInfo.usage = usage;
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
+    // ALLOW_TRANSFER_INSTEAD_BIT here (not on createUploadRingBuffer()'s
+    // staging buffer) is this task's Critical review fix -- see this
+    // method's own header comment in buffer.h for the exact VMA
+    // FindMemoryPreferences()/ContainsDeviceAccess() mechanics this
+    // depends on `usage` actually carrying a device-consuming bit for.
     VmaAllocationCreateInfo allocCreateInfo{};
     allocCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
     allocCreateInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
@@ -105,15 +86,49 @@ std::optional<Allocator::UploadBufferResult> Allocator::createUploadRingBuffer(V
     VkResult result =
         vmaCreateBuffer(allocator_, &bufferInfo, &allocCreateInfo, &buffer, &allocation, &allocationInfo);
     if (result != VK_SUCCESS) {
-        RX_LOG_ERROR("vmaCreateBuffer (upload ring buffer) failed: VkResult={}", static_cast<int>(result));
+        RX_LOG_ERROR("vmaCreateBuffer (device-local, direct-path-eligible) failed: VkResult={}",
+                     static_cast<int>(result));
         return std::nullopt;
     }
 
     VkMemoryPropertyFlags memoryFlags = 0;
     vmaGetMemoryTypeProperties(allocator_, allocationInfo.memoryType, &memoryFlags);
-    bool deviceLocal = (memoryFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+    bool directPathCapable = (memoryFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 &&
+                              (memoryFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
 
-    return UploadBufferResult{Buffer(allocator_, buffer, allocation, allocationInfo.pMappedData, size), deviceLocal};
+    return Buffer(allocator_, buffer, allocation, allocationInfo.pMappedData, size, directPathCapable);
+}
+
+std::optional<Buffer> Allocator::createUploadRingBuffer(VkDeviceSize size, VkBufferUsageFlags usage) {
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = size;
+    bufferInfo.usage = usage;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    // Deliberately NO ALLOW_TRANSFER_INSTEAD_BIT -- see this method's own
+    // header comment in buffer.h: for a TRANSFER_SRC-only usage (this
+    // buffer's real-world use, per rx::rhi::Uploader), that flag is
+    // structurally inert (verified directly against vendored VMA 3.4.0
+    // source) and an earlier version of this method carried it as dead,
+    // misleading weight -- this task's own Critical review finding.
+    VmaAllocationCreateInfo allocCreateInfo{};
+    allocCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
+    allocCreateInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation allocation = VK_NULL_HANDLE;
+    VmaAllocationInfo allocationInfo{};
+    VkResult result =
+        vmaCreateBuffer(allocator_, &bufferInfo, &allocCreateInfo, &buffer, &allocation, &allocationInfo);
+    if (result != VK_SUCCESS) {
+        RX_LOG_ERROR("vmaCreateBuffer (upload ring buffer) failed: VkResult={}", static_cast<int>(result));
+        return std::nullopt;
+    }
+
+    // directPathCapable left at its default (false) -- this Buffer is
+    // never a direct-upload destination candidate, by construction.
+    return Buffer(allocator_, buffer, allocation, allocationInfo.pMappedData, size);
 }
 
 Allocator::Allocator(Allocator&& other) noexcept : Allocator() {
@@ -153,12 +168,14 @@ Buffer& Buffer::operator=(Buffer&& other) noexcept {
         allocation_ = other.allocation_;
         mappedData_ = other.mappedData_;
         size_ = other.size_;
+        directPathCapable_ = other.directPathCapable_;
 
         other.allocator_ = VK_NULL_HANDLE;
         other.buffer_ = VK_NULL_HANDLE;
         other.allocation_ = VK_NULL_HANDLE;
         other.mappedData_ = nullptr;
         other.size_ = 0;
+        other.directPathCapable_ = false;
     }
     return *this;
 }

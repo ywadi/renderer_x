@@ -89,12 +89,6 @@ TEST_CASE("Uploader::uploadToBuffer round-trips bytes through the staging path b
 
     auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device);
     REQUIRE(uploader.has_value());
-    // Not a hard assertion either way -- both the direct (ReBAR/unified
-    // memory) and staging (plain HOST_VISIBLE) paths are correct;
-    // reporting which one this machine took is diagnostic, matching
-    // Task 3's own bindless_test.cpp precedent of reporting hardware-
-    // dependent facts via MESSAGE rather than asserting a specific one.
-    MESSAGE("Uploader::usesDirectPath() on this machine: ", uploader->usesDirectPath());
 
     constexpr VkDeviceSize kSize = 4096;
     std::array<uint8_t, kSize> pattern{};
@@ -102,11 +96,119 @@ TEST_CASE("Uploader::uploadToBuffer round-trips bytes through the staging path b
         pattern[i] = static_cast<uint8_t>((i * 31 + 7) & 0xFF);
     }
 
+    // No device-consuming usage bit (TRANSFER_DST/SRC only) -- structurally
+    // never direct-path-capable (see Allocator::createDeviceLocalBuffer's
+    // own comment), so this specific round-trip always exercises the
+    // staging branch, matching this test's name.
     auto dst = fixture->allocator.createDeviceLocalBuffer(
         kSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     REQUIRE(dst.has_value());
+    CHECK_FALSE(dst->directPathCapable());
 
-    REQUIRE(uploader->uploadToBuffer(dst->handle(), 0, pattern.data(), kSize));
+    REQUIRE(uploader->uploadToBuffer(*dst, 0, pattern.data(), kSize));
+    uploader->flush();
+    CHECK(uploader->everUsedStagingPath());
+    CHECK_FALSE(uploader->everUsedDirectPath());
+
+    std::vector<uint8_t> readBack = readBackBuffer(fixture->allocator, fixture->device.device(),
+                                                     fixture->device.graphicsQueue(),
+                                                     fixture->device.graphicsQueueFamily(), dst->handle(), kSize);
+    CHECK(std::memcmp(readBack.data(), pattern.data(), kSize) == 0);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("Uploader::uploadToBuffer takes the direct memcpy-into-mapped-destination path when the destination's "
+          "own allocation lands DEVICE_LOCAL+HOST_VISIBLE -- mechanism asserted, not just observed") {
+    auto fixture = makeFixture("rx_rhi_vk_upload_test_direct_path");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device);
+    REQUIRE(uploader.has_value());
+
+    constexpr VkDeviceSize kSize = 256;
+    std::array<uint8_t, kSize> pattern{};
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        pattern[i] = static_cast<uint8_t>((i * 17 + 3) & 0xFF);
+    }
+
+    // VERTEX_BUFFER_BIT is the real device-consuming usage bit that makes
+    // VmaBufferImageUsage::ContainsDeviceAccess() true, which is what
+    // makes Allocator::createDeviceLocalBuffer()'s
+    // ALLOW_TRANSFER_INSTEAD_BIT request meaningful at all (this task's
+    // own Critical review finding -- see that method's header comment).
+    auto dst = fixture->allocator.createDeviceLocalBuffer(
+        kSize,
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    REQUIRE(dst.has_value());
+
+    REQUIRE(uploader->uploadToBuffer(*dst, 0, pattern.data(), kSize));
+
+    if (dst->directPathCapable()) {
+        // The exact scenario this task's Critical review fix exists for:
+        // a ReBAR-capable desktop GPU (this project's own dev machine, a
+        // 246MB BAR window on an RTX 2080) or a unified-memory device
+        // (e.g. CI's lavapipe) must genuinely take the direct branch for
+        // a buffer this small -- asserted with CHECK, not merely logged
+        // or MESSAGE'd.
+        CHECK(uploader->everUsedDirectPath());
+        CHECK_FALSE(uploader->everUsedStagingPath());
+    } else {
+        // Only reachable on hardware with no memory type that is both
+        // DEVICE_LOCAL and HOST_VISIBLE for this usage combination (e.g.
+        // a discrete GPU with ReBAR unavailable/disabled) -- still a
+        // correct outcome, just not the one this test is named for; the
+        // staging branch must have engaged instead.
+        MESSAGE(
+            "this device's VERTEX_BUFFER_BIT|TRANSFER_DST_BIT allocation did not land DEVICE_LOCAL+HOST_VISIBLE -- "
+            "staging path exercised instead, which is still correct");
+        CHECK(uploader->everUsedStagingPath());
+    }
+
+    // flush() only matters for the staging branch (nothing was recorded
+    // for a direct-path write) -- harmless/no-op otherwise either way.
+    uploader->flush();
+
+    std::vector<uint8_t> readBack = readBackBuffer(fixture->allocator, fixture->device.device(),
+                                                     fixture->device.graphicsQueue(),
+                                                     fixture->device.graphicsQueueFamily(), dst->handle(), kSize);
+    CHECK(std::memcmp(readBack.data(), pattern.data(), kSize) == 0);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("Uploader::uploadToBuffer stages through the ring buffer when the destination is not direct-path-"
+          "capable, deterministically (hardware-independent)") {
+    auto fixture = makeFixture("rx_rhi_vk_upload_test_staging_deterministic");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device);
+    REQUIRE(uploader.has_value());
+
+    constexpr VkDeviceSize kSize = 256;
+    std::array<uint8_t, kSize> pattern{};
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        pattern[i] = static_cast<uint8_t>((i * 5 + 1) & 0xFF);
+    }
+
+    // createHostVisibleBuffer() always reports directPathCapable() ==
+    // false (a hardcoded false, not a measurement -- see buffer.h's own
+    // comment on Buffer::directPathCapable()), regardless of this
+    // machine's real memory-type classification -- the deterministic way
+    // to force and verify the staging branch's own correctness
+    // independent of any specific hardware's ReBAR/unified-memory
+    // availability, exactly what this task's review asked for ("assert
+    // the mechanism, not the hardware").
+    auto dst = fixture->allocator.createHostVisibleBuffer(kSize,
+                                                            VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    REQUIRE(dst.has_value());
+    REQUIRE_FALSE(dst->directPathCapable());
+
+    REQUIRE(uploader->uploadToBuffer(*dst, 0, pattern.data(), kSize));
+    CHECK(uploader->everUsedStagingPath());
+    CHECK_FALSE(uploader->everUsedDirectPath());
     uploader->flush();
 
     std::vector<uint8_t> readBack = readBackBuffer(fixture->allocator, fixture->device.device(),
@@ -146,8 +248,8 @@ TEST_CASE("Uploader auto-flushes mid-batch when the ring buffer runs out of room
         kChunkSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     REQUIRE(dstB.has_value());
 
-    REQUIRE(uploader->uploadToBuffer(dstA->handle(), 0, patternA.data(), kChunkSize));
-    REQUIRE(uploader->uploadToBuffer(dstB->handle(), 0, patternB.data(), kChunkSize));
+    REQUIRE(uploader->uploadToBuffer(*dstA, 0, patternA.data(), kChunkSize));
+    REQUIRE(uploader->uploadToBuffer(*dstB, 0, patternB.data(), kChunkSize));
     uploader->flush();
 
     std::vector<uint8_t> readA = readBackBuffer(fixture->allocator, fixture->device.device(),
@@ -174,7 +276,7 @@ TEST_CASE("Uploader::uploadToBuffer rejects a single upload larger than the ring
     auto dst = fixture->allocator.createDeviceLocalBuffer(128, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     REQUIRE(dst.has_value());
 
-    CHECK_FALSE(uploader->uploadToBuffer(dst->handle(), 0, tooBig.data(), tooBig.size()));
+    CHECK_FALSE(uploader->uploadToBuffer(*dst, 0, tooBig.data(), tooBig.size()));
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 
@@ -218,7 +320,7 @@ TEST_CASE("MeshBuffers::create uploads vertex+index data into device-local buffe
     auto vertexCopy = fixture->allocator.createDeviceLocalBuffer(
         sizeof(kVertices), VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     REQUIRE(vertexCopy.has_value());
-    REQUIRE(uploader->uploadToBuffer(vertexCopy->handle(), 0, kVertices.data(), sizeof(kVertices)));
+    REQUIRE(uploader->uploadToBuffer(*vertexCopy, 0, kVertices.data(), sizeof(kVertices)));
     uploader->flush();
 
     std::vector<uint8_t> readBack =

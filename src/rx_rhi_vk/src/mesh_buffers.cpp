@@ -31,11 +31,18 @@ std::optional<MeshBuffers> MeshBuffers::create(Allocator& allocator, Uploader& u
         return std::nullopt;
     }
 
-    if (!uploader.uploadToBuffer(vertexBuffer->handle(), 0, vertexData, vertexBytes)) {
+    // Both buffers carry a real device-consuming usage bit
+    // (VERTEX_BUFFER_BIT/INDEX_BUFFER_BIT) on top of TRANSFER_DST_BIT --
+    // exactly what Uploader::uploadToBuffer()'s direct-path check needs
+    // Allocator::createDeviceLocalBuffer() to have requested
+    // ALLOW_TRANSFER_INSTEAD_BIT against (see that method's own comment).
+    // On a ReBAR-enabled/unified-memory device, both uploads below skip
+    // the staging ring entirely.
+    if (!uploader.uploadToBuffer(*vertexBuffer, 0, vertexData, vertexBytes)) {
         RX_LOG_ERROR("MeshBuffers::create: vertex upload failed");
         return std::nullopt;
     }
-    if (!uploader.uploadToBuffer(indexBuffer->handle(), 0, indexData, indexBytes)) {
+    if (!uploader.uploadToBuffer(*indexBuffer, 0, indexData, indexBytes)) {
         RX_LOG_ERROR("MeshBuffers::create: index upload failed");
         return std::nullopt;
     }

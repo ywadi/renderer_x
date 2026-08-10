@@ -69,28 +69,15 @@ std::optional<Uploader> Uploader::create(Allocator& allocator, Device& device, V
         return std::nullopt;
     }
 
-    auto ringResult = allocator.createUploadRingBuffer(ringBufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-    if (!ringResult.has_value()) {
+    auto ringBuffer = allocator.createUploadRingBuffer(ringBufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    if (!ringBuffer.has_value()) {
         RX_LOG_ERROR("Uploader::create: failed to allocate the {}-byte staging ring buffer", ringBufferSize);
         vkDestroyFence(vkDevice, fence, nullptr);
         vkDestroyCommandPool(vkDevice, pool, nullptr);
         return std::nullopt;
     }
 
-    // Detected once here, never per-upload -- see the class comment in
-    // upload.h and [R:C1].
-    if (ringResult->deviceLocal) {
-        RX_LOG_INFO(
-            "Uploader::create: staging ring buffer placed in DEVICE_LOCAL + HOST_VISIBLE memory (ReBAR/unified "
-            "memory direct-upload path)");
-    } else {
-        RX_LOG_INFO(
-            "Uploader::create: staging ring buffer placed in plain HOST_VISIBLE memory (non-ReBAR staging "
-            "fallback path)");
-    }
-
-    return Uploader(vkDevice, queue, pool, cmd, fence, std::move(ringResult->buffer), ringBufferSize,
-                     ringResult->deviceLocal);
+    return Uploader(vkDevice, queue, pool, cmd, fence, std::move(*ringBuffer), ringBufferSize);
 }
 
 void Uploader::beginRecordingIfNeeded() {
@@ -136,10 +123,48 @@ bool Uploader::reserveRingSpace(VkDeviceSize size, VkDeviceSize& outOffset) {
     return true;
 }
 
-bool Uploader::uploadToBuffer(VkBuffer dst, VkDeviceSize dstOffset, const void* data, VkDeviceSize size) {
+bool Uploader::uploadToBuffer(Buffer& dst, VkDeviceSize dstOffset, const void* data, VkDeviceSize size) {
     if (size == 0) {
         return true;
     }
+
+    // DIRECT PATH: `dst`'s own allocation (Allocator::
+    // createDeviceLocalBuffer(), when `dst`'s usage carries a real
+    // device-consuming bit) landed in memory that is BOTH DEVICE_LOCAL
+    // and HOST_VISIBLE -- write straight into it, no staging copy, no
+    // command recorded at all. See the class comment in upload.h for the
+    // full mechanics and why this task's first implementation (flag on
+    // the ring buffer instead of the destination) never actually engaged
+    // this branch on any hardware.
+    if (dst.directPathCapable() && dst.mappedData() != nullptr) {
+        if (!loggedDirectPathOnce_) {
+            RX_LOG_INFO(
+                "Uploader::uploadToBuffer: destination memory is DEVICE_LOCAL + HOST_VISIBLE -- writing directly, "
+                "no staging copy [R:C1]");
+            loggedDirectPathOnce_ = true;
+        }
+        std::memcpy(static_cast<uint8_t*>(dst.mappedData()) + dstOffset, data, size);
+        // Written-before-GPU-read (a later draw/dispatch reading this
+        // buffer) on a possibly-non-coherent memory type -- Buffer::
+        // flush() (this task's own API addition) makes this correct
+        // regardless of coherence, exactly as it does for the ring
+        // buffer's own writes below.
+        dst.flush(dstOffset, size);
+        everUsedDirectPath_ = true;
+        return true;
+    }
+
+    // STAGING PATH: `dst` is not direct-path-capable (no device-consuming
+    // usage bit, or this hardware genuinely has no memory type that is
+    // both DEVICE_LOCAL and HOST_VISIBLE) -- go through the ring buffer,
+    // exactly as this class always did.
+    if (!loggedStagingPathOnce_) {
+        RX_LOG_INFO(
+            "Uploader::uploadToBuffer: destination memory is not DEVICE_LOCAL+HOST_VISIBLE -- staging through the "
+            "ring buffer [R:C1]");
+        loggedStagingPathOnce_ = true;
+    }
+    everUsedStagingPath_ = true;
 
     VkDeviceSize ringOffset = 0;
     if (!reserveRingSpace(size, ringOffset)) {
@@ -147,10 +172,6 @@ bool Uploader::uploadToBuffer(VkBuffer dst, VkDeviceSize dstOffset, const void* 
     }
 
     std::memcpy(static_cast<uint8_t*>(ringBuffer_.mappedData()) + ringOffset, data, size);
-    // Written-before-GPU-read on a possibly-non-coherent HOST_VISIBLE
-    // memory type -- exactly the case Buffer::flush() exists for (this
-    // task's own API addition, closing the gap Phase 1 Task 3's review
-    // flagged).
     ringBuffer_.flush(ringOffset, size);
 
     beginRecordingIfNeeded();
@@ -159,7 +180,7 @@ bool Uploader::uploadToBuffer(VkBuffer dst, VkDeviceSize dstOffset, const void* 
     region.srcOffset = ringOffset;
     region.dstOffset = dstOffset;
     region.size = size;
-    vkCmdCopyBuffer(cmd_, ringBuffer_.handle(), dst, 1, &region);
+    vkCmdCopyBuffer(cmd_, ringBuffer_.handle(), dst.handle(), 1, &region);
     return true;
 }
 
@@ -195,11 +216,22 @@ bool Uploader::uploadToImage(Texture2D& dst, const void* pixels, VkDeviceSize pi
     region.imageExtent = {dst.extent().width, dst.extent().height, 1};
     vkCmdCopyBufferToImage(cmd_, ringBuffer_.handle(), dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-    if (generateMips && dst.mipLevels() > 1) {
+    if (generateMips) {
         // Handles every level's per-level barriers + blits, and leaves
         // every level (including 0) in SHADER_READ_ONLY_OPTIMAL --
         // including the level-0 TRANSFER_DST_OPTIMAL -> TRANSFER_SRC_OPTIMAL
         // step this copy's destination layout above sets up for.
+        //
+        // No `&& dst.mipLevels() > 1` guard here (an earlier version of
+        // this code had one): recordMipChainBlit() already handles
+        // mipLevels() == 1 correctly and cheaply via its own early
+        // return (a single transitionLevelRange() call, identical to
+        // this method's own `else` branch below) -- adding a redundant
+        // guard here would just be duplicated logic with no behavioral
+        // difference, and it made recordMipChainBlit()'s early-return
+        // branch unreachable through this public API at all (flagged in
+        // this task's own review; see texture_test.cpp's dedicated
+        // single-mip test).
         dst.recordMipChainBlit(cmd_);
     } else {
         transitionImage(cmd_, dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -252,8 +284,11 @@ Uploader::Uploader(Uploader&& other) noexcept
       ringBuffer_(std::move(other.ringBuffer_)),
       ringBufferSize_(other.ringBufferSize_),
       ringCursor_(other.ringCursor_),
-      ringBufferIsDeviceLocal_(other.ringBufferIsDeviceLocal_),
-      recording_(other.recording_) {
+      recording_(other.recording_),
+      everUsedDirectPath_(other.everUsedDirectPath_),
+      everUsedStagingPath_(other.everUsedStagingPath_),
+      loggedDirectPathOnce_(other.loggedDirectPathOnce_),
+      loggedStagingPathOnce_(other.loggedStagingPathOnce_) {
     other.device_ = VK_NULL_HANDLE;
     other.queue_ = VK_NULL_HANDLE;
     other.pool_ = VK_NULL_HANDLE;
@@ -261,8 +296,11 @@ Uploader::Uploader(Uploader&& other) noexcept
     other.fence_ = VK_NULL_HANDLE;
     other.ringBufferSize_ = 0;
     other.ringCursor_ = 0;
-    other.ringBufferIsDeviceLocal_ = false;
     other.recording_ = false;
+    other.everUsedDirectPath_ = false;
+    other.everUsedStagingPath_ = false;
+    other.loggedDirectPathOnce_ = false;
+    other.loggedStagingPathOnce_ = false;
 }
 
 Uploader& Uploader::operator=(Uploader&& other) noexcept {
@@ -279,8 +317,11 @@ Uploader& Uploader::operator=(Uploader&& other) noexcept {
         ringBuffer_ = std::move(other.ringBuffer_);
         ringBufferSize_ = other.ringBufferSize_;
         ringCursor_ = other.ringCursor_;
-        ringBufferIsDeviceLocal_ = other.ringBufferIsDeviceLocal_;
         recording_ = other.recording_;
+        everUsedDirectPath_ = other.everUsedDirectPath_;
+        everUsedStagingPath_ = other.everUsedStagingPath_;
+        loggedDirectPathOnce_ = other.loggedDirectPathOnce_;
+        loggedStagingPathOnce_ = other.loggedStagingPathOnce_;
 
         other.device_ = VK_NULL_HANDLE;
         other.queue_ = VK_NULL_HANDLE;
@@ -289,8 +330,11 @@ Uploader& Uploader::operator=(Uploader&& other) noexcept {
         other.fence_ = VK_NULL_HANDLE;
         other.ringBufferSize_ = 0;
         other.ringCursor_ = 0;
-        other.ringBufferIsDeviceLocal_ = false;
         other.recording_ = false;
+        other.everUsedDirectPath_ = false;
+        other.everUsedStagingPath_ = false;
+        other.loggedDirectPathOnce_ = false;
+        other.loggedStagingPathOnce_ = false;
     }
     return *this;
 }
