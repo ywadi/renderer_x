@@ -113,6 +113,20 @@ and visible culling statistics.
     `createTexture2D`-created texture visibly changes a rendered pixel.
     Bounded task, precedes/accompanies StandardPBR (which requires it).
 
+11. **Scene data model — decision required in the Phase 4 spec (user-raised
+    2026-08-10):** no ECS has been chosen, and the spec must first answer
+    whether the renderer should have one at all. Coordinator
+    recommendation: renderer core uses a render-proxy representation
+    (handle-based, SoA component managers for renderables/transforms/
+    lights/cameras — the Filament precedent), because consumers own their
+    world/ECS and the renderer is middleware; a full game ECS in the
+    renderer imposes our entity model on theirs. EnTT/flecs are the
+    research-pass candidates IF an ECS is warranted (samples/tooling, or
+    if internal component managers reduce to reinventing EnTT). The spec
+    records the decision with rationale either way; the chosen layout must
+    satisfy the performance posture (item 9: pooled, instanced,
+    parallel-iterable).
+
 ## Carried process notes
 
 - Research pass before spec (library selection for glTF/KTX2 with
