@@ -30,9 +30,12 @@ struct CompileInfo {
 // Task 1 brief specifies.
 //
 // Only RenderGraph::compile() ever populates one of these -- there is no
-// public constructor beyond the implicit default (an unpopulated
-// CompiledGraph, e.g. before the owning RenderGraph's first compile()
-// call, simply reports empty spans and treats every pass index as absent).
+// public constructor beyond the implicit default. Before the owning
+// RenderGraph's first compile() call (or after reset()), an unpopulated
+// CompiledGraph reports empty spans from executionOrder()/resources(), but
+// isCulled()/passAccesses() throw std::out_of_range for any `passIndex` at
+// all -- there is no pass count yet to be in range of. See those two
+// methods' own comments for the exact per-method contract.
 class CompiledGraph {
 public:
     // Raw pass indices (RenderGraph::addPass() call order, 0-based), in

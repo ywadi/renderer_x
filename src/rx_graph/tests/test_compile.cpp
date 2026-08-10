@@ -270,3 +270,62 @@ TEST_CASE("a culled pass reports no resolved accesses") {
 
     CHECK(graph.compiled().passAccesses(0).empty());
 }
+
+// Fix round 1 -- Task 1 review's Important finding: a circular pass
+// dependency (legally constructible because a reader may be declared
+// before its writer -- exactly the "ordering" test's own mechanism) used
+// to compile to a silently empty executionOrder() with no diagnostic.
+TEST_CASE("a circular pass dependency throws, naming passes in the cycle") {
+    RenderGraph graph;
+    // A and B form a genuine 2-cycle: A reads "y" (B's output) and writes
+    // "x"; B reads "x" (A's output) and writes "y". "present" reads "x"
+    // and writes "bb", which is what roots the cycle to the backbuffer's
+    // writer -- without a reachable root the cycle would just be culled
+    // away, not detected.
+    graph.addPass("A").addTextureInput("y").addColorOutput("x", colorDesc());        // pass 0
+    graph.addPass("B").addTextureInput("x").addColorOutput("y", colorDesc());        // pass 1
+    graph.addPass("present").addTextureInput("x").addColorOutput("bb", colorDesc());  // pass 2
+    graph.setBackbufferSource("bb");
+
+    bool threw = false;
+    try {
+        graph.compile(kInfo);
+    } catch (const std::runtime_error& e) {
+        threw = true;
+        const std::string message = e.what();
+        // Both cycle members must be named -- not just "some pass never
+        // ran" (which could equally describe "present", which is merely
+        // downstream of the cycle, not a member of it).
+        CHECK(message.find("A") != std::string::npos);
+        CHECK(message.find("B") != std::string::npos);
+    }
+    CHECK(threw);
+}
+
+// Fix round 1 -- coordinator ruling on the Task 1 review's Minor finding
+// #2: the same Compute-class/Graphics-class split already applied to
+// storage buffer accesses now also applies to texture-input accesses.
+TEST_CASE("texture input stage resolves per pass kind, like storage buffers already did") {
+    RenderGraph graph;
+    graph.addPass("producer").addColorOutput("tex", colorDesc());  // pass 0
+    // "sampler" has no attachment output at all -- Compute-class.
+    graph.addPass("sampler").addTextureInput("tex").setSideEffect();  // pass 1
+    // "present" has a color output alongside its texture input -- Graphics-class.
+    graph.addPass("present").addTextureInput("tex").addColorOutput("bb", colorDesc());  // pass 2
+    graph.setBackbufferSource("bb");
+    graph.compile(kInfo);
+
+    const CompiledGraph& compiled = graph.compiled();
+
+    const auto samplerAccesses = compiled.passAccesses(1);
+    REQUIRE(samplerAccesses.size() == 1);
+    CHECK(samplerAccesses[0].stages == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    CHECK(samplerAccesses[0].access == VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    CHECK(samplerAccesses[0].layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    const auto presentAccesses = compiled.passAccesses(2);
+    REQUIRE(presentAccesses.size() == 2);
+    CHECK(presentAccesses[0].stages == VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+    CHECK(presentAccesses[0].access == VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    CHECK(presentAccesses[0].layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}

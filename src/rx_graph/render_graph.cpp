@@ -2,7 +2,9 @@
 
 #include <rx_core/log.h>
 
+#include <algorithm>
 #include <deque>
+#include <functional>
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
@@ -30,7 +32,13 @@
 //      (Kahn's algorithm, ties broken by ascending declaration index --
 //      the Task 1 brief asks for "no reordering heuristics", so this is
 //      the simplest sort that still yields a deterministic order among
-//      independent passes) (Impl::order).
+//      independent passes) (Impl::order). If Kahn's algorithm cannot
+//      emit every reachable pass (fix round 1: a circular dependency --
+//      trivially constructible since a reader may legally be declared
+//      before its writer, step 2's whole point -- otherwise compiled to a
+//      silently empty/degenerate graph with no diagnostic), a DFS over
+//      the same producer edges finds one concrete cycle and compile()
+//      throws, naming its passes.
 //   4. Rescan only the surviving passes, in that execution order, to
 //      resolve every PhysicalResource (name -> merged desc/imageUsage,
 //      first/last use as *positions* in the execution order) and every
@@ -76,11 +84,17 @@ ResourceAccess Pass::resolveAccess(const Declaration& decl, uint32_t physicalInd
             access.layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
             break;
         case AccessKind::TextureInput:
-            // Always FRAGMENT_SHADER, even for a Compute-class pass -- the
-            // Task 1 brief's table gives texture-input access one fixed
-            // stage, unlike the storage-buffer rows below (which do split
-            // on pass kind).
-            access.stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+            // Fix round 1, mapping extension: the Task 1 brief's own table
+            // gives texture-input access one fixed FRAGMENT_SHADER stage
+            // with no Compute-class row (unlike the storage-buffer rows
+            // below, which do split on pass kind) -- a real gap the Task 1
+            // review flagged, since compute shaders can legally sample a
+            // texture (OpImageSample) too. Coordinator ruling: extend the
+            // same Compute-class/Graphics-class split already applied to
+            // storage buffers to this case as well; access/layout are
+            // identical either way, only the stage changes.
+            access.stages =
+                computeClass ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
             access.access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
             access.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             break;
@@ -222,10 +236,12 @@ void RenderGraph::compile(const CompileInfo& info) {
     // backward from a root marks every pass it (transitively) depends on
     // as reachable; anything never reached is culled.
     std::vector<bool> reachable(passCount, false);
+    uint32_t reachableCount = 0;
     std::vector<uint32_t> stack;
     auto markReachable = [&](uint32_t p) {
         if (!reachable[p]) {
             reachable[p] = true;
+            ++reachableCount;
             stack.push_back(p);
         }
     };
@@ -282,6 +298,79 @@ void RenderGraph::compile(const CompileInfo& info) {
                 ready.insert(successor);
             }
         }
+    }
+
+    // ---- step 3c: cycle detection (fix round 1) --------------------------
+    // Kahn's algorithm above emits a reachable pass exactly when every one
+    // of its dependencies has already been emitted; over an acyclic
+    // reachable subgraph that invariant guarantees every reachable pass
+    // eventually gets emitted. If it didn't -- fewer entries in
+    // executionOrder than reachable passes -- some reachable passes are
+    // stuck behind an unresolved dependency cycle. Without this check,
+    // compile() previously fell straight through to step 4 with a
+    // silently truncated (possibly empty) executionOrder and no
+    // diagnostic anywhere -- exactly the "typo swaps which resource two
+    // passes read/write" landmine flagged in the Task 1 review.
+    //
+    // A cycle can only involve reachable passes (dependsOn[p] for any
+    // reachable p contains only reachable producers -- see the DFS
+    // reachability walk above), so a plain DFS with a recursion-stack
+    // marker restricted to the reachable subgraph, starting from any
+    // unvisited reachable pass, is guaranteed to walk into one: when it
+    // follows a producer edge back to a pass still on its own recursion
+    // stack, that stack's suffix from the revisited pass onward *is* a
+    // concrete cycle -- named in the exception, not just "some pass never
+    // ran" (which could equally be a pass merely downstream of the cycle,
+    // not a member of it).
+    if (executionOrder.size() != reachableCount) {
+        std::vector<uint8_t> visitState(passCount, 0);  // 0 = unvisited, 1 = on the current DFS path, 2 = done
+        std::vector<uint32_t> path;
+        uint32_t cycleStart = passCount;  // sentinel; set once a back-edge is found
+
+        std::function<bool(uint32_t)> visit = [&](uint32_t p) -> bool {
+            visitState[p] = 1;
+            path.push_back(p);
+            for (uint32_t producer : dependsOn[p]) {
+                if (visitState[producer] == 1) {
+                    cycleStart = producer;
+                    return true;
+                }
+                if (visitState[producer] == 0 && visit(producer)) {
+                    return true;
+                }
+            }
+            visitState[p] = 2;
+            path.pop_back();
+            return false;
+        };
+
+        for (uint32_t p = 0; p < passCount && cycleStart == passCount; ++p) {
+            if (reachable[p] && visitState[p] == 0) {
+                visit(p);
+            }
+        }
+
+        // cycleStart == passCount would mean the size mismatch above was
+        // not actually caused by a cycle -- structurally impossible given
+        // Kahn's algorithm's invariant, but if it ever happened this
+        // falls through to a generic message rather than indexing
+        // `path` with the sentinel.
+        std::string cycleDescription;
+        if (cycleStart != passCount) {
+            auto cycleBegin = std::find(path.begin(), path.end(), cycleStart);
+            for (auto it = cycleBegin; it != path.end(); ++it) {
+                if (!cycleDescription.empty()) {
+                    cycleDescription += " -> ";
+                }
+                cycleDescription += "'" + g.passes[*it].name_ + "'";
+            }
+            cycleDescription += " -> '" + g.passes[cycleStart].name_ + "'";
+        } else {
+            cycleDescription = "(unable to isolate a specific cycle -- this should not happen)";
+        }
+
+        RX_LOG_ERROR("rx_graph: dependency cycle detected among passes: {}", cycleDescription);
+        throw std::runtime_error("rx_graph: dependency cycle detected among passes: " + cycleDescription);
     }
 
     // ---- step 4: resolve physical resources + per-pass accesses --------
