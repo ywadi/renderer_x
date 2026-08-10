@@ -26,10 +26,14 @@
 #   03_bindless_mesh  binary + texture.png + Slang runtime libs + LICENSE
 #   04_streaming      binary + Slang runtime libs + LICENSE
 #                     (no external asset -- every texture is procedural)
-#   05_multipass      binary + shaders/multipass/*.slang (5 files) + Slang
-#                     runtime libs + LICENSE (no other external asset --
-#                     every texture this sample uses is a graph-pooled
-#                     transient, never an on-disk file)
+#   05_multipass      binary + shaders/multipass/*.slang (6 files, incl.
+#                     scene_types.slang [fix round 1] -- the single source
+#                     of truth for ObjectTransform, concatenated ahead of
+#                     both shadow.vert.slang and lit.vert.slang at compile
+#                     time, so it must ship too) + Slang runtime libs +
+#                     LICENSE (no other external asset -- every texture
+#                     this sample uses is a graph-pooled transient, never
+#                     an on-disk file)
 #
 # This script does NOT build anything -- it assumes `cmake --build
 # --preset <preset>` already ran and each sample's build-output directory
@@ -146,12 +150,16 @@ done
 # 02_hotreload additionally ships the live-reloadable shader source; 03
 # additionally ships its one real-PNG texture. 04 has no external asset
 # (every texture is procedurally generated) -- nothing extra for it. 05
-# ships its own five on-disk shader sources (see samples/05_multipass/
-# CMakeLists.txt's own POST_BUILD deploy step for why these five, flat,
-# no "multipass/" subdirectory in the deployed layout).
+# ships its own six on-disk shader sources (see samples/05_multipass/
+# CMakeLists.txt's own POST_BUILD deploy step for why these six, flat, no
+# "multipass/" subdirectory in the deployed layout) -- scene_types.slang
+# [fix round 1] included: it is concatenated ahead of shadow.vert.slang/
+# lit.vert.slang at compile time, so a packaged run needs it on disk next
+# to the binary exactly like the other five.
 copy_required "$STAGE_DIR/02_hotreload" "$SAMPLES_BUILD_DIR/02_hotreload/hotreload.slang"
 copy_required "$STAGE_DIR/03_bindless_mesh" "$SAMPLES_BUILD_DIR/03_bindless_mesh/texture.png"
 copy_required "$STAGE_DIR/05_multipass" \
+  "$SAMPLES_BUILD_DIR/05_multipass/scene_types.slang" \
   "$SAMPLES_BUILD_DIR/05_multipass/shadow.vert.slang" \
   "$SAMPLES_BUILD_DIR/05_multipass/lit.vert.slang" \
   "$SAMPLES_BUILD_DIR/05_multipass/lit.frag.slang" \

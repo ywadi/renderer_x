@@ -6,13 +6,14 @@
 // program to produce a single, correctly-merged descriptor-set/push-
 // constant layout (the same reason 02_hotreload/03_bindless_mesh/
 // 04_streaming each embed their vertex+fragment source together as one
-// string). samples/05_multipass/main.cpp's loadPassModule() reproduces that
-// same shape for THIS pass's two on-disk files by reading and concatenating
-// them (this file first, lit.frag.slang second) into one Slang translation
-// unit before compiling -- so every `[[vk::binding(...)]]`/
-// `[[vk::push_constant]]` global declared below is visible to lit.frag.slang's
-// fsMain too, exactly as if they had been written in one file. Do not
-// re-declare any of these globals in lit.frag.slang.
+// string). samples/05_multipass/main.cpp's compileAndReflect() reproduces
+// that same shape for THIS pass's on-disk files by reading and
+// concatenating them (scene_types.slang first, this file second,
+// lit.frag.slang third) into one Slang translation unit before compiling
+// -- so every `[[vk::binding(...)]]`/`[[vk::push_constant]]` global
+// declared below, and `ObjectTransform` (scene_types.slang), are visible
+// to lit.frag.slang's fsMain too, exactly as if they had all been written
+// in one file. Do not re-declare any of these globals in lit.frag.slang.
 //
 // SHADOW SAMPLING: manual single-tap depth comparison in lit.frag.slang, no
 // VkSampler compare mode [coordinator ambiguity resolution] -- this file's
@@ -36,6 +37,14 @@
 // normal-matrix multiply at all. Reintroducing per-object rotation without
 // also reintroducing a normal-matrix transform here would silently break
 // lit.frag.slang's Lambert term.
+// `ObjectTransform` itself now lives in scene_types.slang (concatenated
+// ahead of this file at compile time -- see the COMPILATION NOTE above
+// and that file's own header comment for the full "why not import/
+// __include" rationale) [fix round 1: this struct used to be declared
+// here directly, and separately again in shadow.vert.slang, with only a
+// comment guarding the two copies from drifting -- they drifted; see
+// scene_types.slang's header for the postmortem].
+//
 // `albedo`/`lightDirWorld` live in the SAME bindless row as the two
 // matrices (as float4 -- the 4th component unused padding, sidestepping
 // any float3-packing ambiguity) rather than in push constants: EMPIRICALLY
@@ -54,13 +63,6 @@
 // mat4 rows). `lightDirWorld` is the same value on every object's row
 // each frame (a per-pass, not per-object, constant) -- redundant across
 // rows, but simpler than a second one-row bindless buffer just for it.
-struct ObjectTransform {
-    float4x4 mvp;
-    float4x4 lightMvp;
-    float4 albedo;
-    float4 lightDirWorld;
-};
-
 struct PushConstants {
     uint transformIndex;
     uint shadowTextureIndex;

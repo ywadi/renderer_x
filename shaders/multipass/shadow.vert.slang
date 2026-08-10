@@ -8,39 +8,23 @@
 // of this, not by omission.
 //
 // Reads the SAME bindless object-transform storage buffer
-// lit.vert.slang/lit.frag.slang read (row layout must match byte-for-byte
-// -- see lit.vert.slang's own header comment) via
-// rx::rhi::BindlessTable's fixed binding 2 (kStorageBufferBinding), but
-// only ever consumes `.lightMvp` here: this pass renders the scene from
-// the light's own point of view, so a caster's CAMERA-space MVP is
+// lit.vert.slang/lit.frag.slang read (row layout must match byte-for-byte)
+// via rx::rhi::BindlessTable's fixed binding 2 (kStorageBufferBinding),
+// but only ever consumes `.lightMvp` here: this pass renders the scene
+// from the light's own point of view, so a caster's CAMERA-space MVP is
 // irrelevant to it. `transformIndex` (a push constant, uniform across the
 // whole draw call) selects which object's row to read -- never wrapped in
 // NonUniformResourceIndex() [spec Fixed decision #6, matching every other
 // sample's push-constant-indexed bindless read].
-// MUST stay byte-for-byte identical (same fields, same order, same size)
-// to lit.vert.slang's OWN ObjectTransform struct -- this is a SEPARATE
-// Slang compilation module (see this file's header comment: no
-// lit.vert.slang concatenation here), so Slang computes THIS struct's own
-// stride/size independently when indexing `gTransforms[0][transformIndex]`.
-// A real, found-during-development bug this comment now documents: an
-// earlier revision of this file only had the first two fields (mvp,
-// lightMvp) after lit.vert.slang's own struct grew two more (albedo,
-// lightDirWorld) -- every index-0 read (the floor, whose row happens to
-// start at byte 0 under EITHER stride) still worked, but every index 1+
-// read (cube, sphere) silently computed the wrong byte offset into the
-// SAME real buffer (128-byte stride here vs. the real 160-byte stride the
-// C++ writer and lit.vert.slang both use), reading a garbled mix of the
-// previous row's tail and the current row's head -- a plausible-looking
-// but WRONG matrix, not a crash or an obviously-garbage value. This is
-// exactly the class of bug this sample's own headless gate (shadow-vs-lit
-// probe brightness) is designed to catch.
-struct ObjectTransform {
-    float4x4 mvp;
-    float4x4 lightMvp;
-    float4 albedo;
-    float4 lightDirWorld;
-};
-
+//
+// `ObjectTransform` is concatenated ahead of this file at compile time
+// from scene_types.slang -- see samples/05_multipass/main.cpp's
+// buildShadowPipeline() and scene_types.slang's own header comment for
+// why (and for the postmortem of the real bug this fixes: this file used
+// to declare its OWN separate copy of this struct, since it is compiled
+// as its own Slang module -- never concatenated with the lit files -- and
+// that copy silently drifted out of sync with lit.vert.slang's when the
+// latter grew two more fields). [fix round 1]
 struct PushConstants {
     uint transformIndex;
 };

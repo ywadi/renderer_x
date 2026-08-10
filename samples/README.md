@@ -30,7 +30,7 @@ step involved:
   sample_04_streaming[.exe]        # + the Slang runtime libs below, and
                                     #   LICENSE (no other external asset)
 05_multipass/
-  sample_05_multipass[.exe]        # + shaders/multipass/*.slang (5 files),
+  sample_05_multipass[.exe]        # + shaders/multipass/*.slang (6 files),
                                     #   the Slang runtime libs below, and
                                     #   LICENSE
 ```
@@ -455,14 +455,18 @@ turns. Closing the window exits with status 0.
 Same mechanism as 02_hotreload/03_bindless_mesh/04_streaming: this sample
 compiles its shaders at runtime, so it needs the Slang runtime libs
 deployed next to it (`rx_shader_deploy_runtime_libs()`). Unlike any earlier
-sample, it ships **five** on-disk shader sources instead of one
-(`shadow.vert.slang`, `lit.vert.slang`, `lit.frag.slang`,
-`tonemap.vert.slang`, `tonemap.frag.slang`) — one file per shader stage,
-concatenated in pairs at compile time (vertex file first, fragment file
-second) so `rx::shader::reflect()` sees one linked program per pass; see
-`lit.vert.slang`'s own header comment for why. A redistributed copy of just
-this sample's build-output directory (binary + those five `.slang` files +
-the Slang runtime libraries) runs identically outside the build tree.
+sample, it ships **six** on-disk shader sources instead of one
+(`scene_types.slang`, `shadow.vert.slang`, `lit.vert.slang`,
+`lit.frag.slang`, `tonemap.vert.slang`, `tonemap.frag.slang`) — one file
+per shader stage, plus `scene_types.slang` (the single source of truth for
+the `ObjectTransform` bindless-row layout both `shadow.vert.slang` and
+`lit.vert.slang` read), concatenated in the right order at compile time so
+`rx::shader::reflect()` sees one linked program per pass; see
+`scene_types.slang`'s own header comment for why this is done via textual
+concatenation rather than a real Slang `import`/`__include`. A
+redistributed copy of just this sample's build-output directory (binary +
+those six `.slang` files + the Slang runtime libraries) runs identically
+outside the build tree.
 
 ## Building and running
 
@@ -598,11 +602,11 @@ sample_04_streaming.exe --present  REM interactive present-mode window, cycling 
 
 05_multipass is the same shape as 02_hotreload for redistribution purposes
 (real in-process Slang compilation, so it needs the same 4 Slang DLLs
-deployed next to it), plus its own five on-disk shader sources
-(`shadow.vert.slang`, `lit.vert.slang`, `lit.frag.slang`,
-`tonemap.vert.slang`, `tonemap.frag.slang` — see this sample's own README
-section above for why five files, not one). Copy the entire
-`build/windows-cross-zig/samples/05_multipass/` directory (minus the
+deployed next to it), plus its own six on-disk shader sources
+(`scene_types.slang`, `shadow.vert.slang`, `lit.vert.slang`,
+`lit.frag.slang`, `tonemap.vert.slang`, `tonemap.frag.slang` — see this
+sample's own README section above for why six files, not one). Copy the
+entire `build/windows-cross-zig/samples/05_multipass/` directory (minus the
 `CMakeFiles`/`.pdb`/`.cmake` build bookkeeping) to run it elsewhere:
 
 ```

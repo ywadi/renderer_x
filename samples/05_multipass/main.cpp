@@ -183,6 +183,11 @@ constexpr uint32_t kShadowMapSize = 1024;
 constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
 constexpr VkFormat kHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 
+// [fix round 1] the single source of truth for ObjectTransform, shared by
+// the shadow and lit passes -- concatenated ahead of each pass's own
+// file(s) below, never Slang `import`ed/`__include`d; see that file's own
+// header comment for why.
+constexpr const char* kSceneTypesFilename = "scene_types.slang";
 constexpr const char* kShadowVertFilename = "shadow.vert.slang";
 constexpr const char* kLitVertFilename = "lit.vert.slang";
 constexpr const char* kLitFragFilename = "lit.frag.slang";
@@ -445,12 +450,42 @@ constexpr uint32_t kObjectCount = static_cast<uint32_t>(kObjects.size());
 // float3 -- see lit.vert.slang's own header comment for why this sample
 // keeps every vector value in this bindless row instead of a push
 // constant, and every push-constant field below a plain scalar `uint`.
+//
+// Byte-for-byte mirror of shaders/multipass/scene_types.slang's
+// ObjectTransform -- THE single source of truth on the shader side since
+// fix round 1 (both shadow.vert.slang and lit.vert.slang now consume that
+// one file instead of each declaring their own copy; see that file's own
+// header comment for the real drift bug this closes). This struct is the
+// other half of that single-source-of-truth story: the strongest drift
+// guard expressible today is the static_assert immediately below, which
+// fails the BUILD (not a runtime probe) the moment this struct's size
+// stops matching the hand-computed shader-side stride. A stronger,
+// reflect()-driven check (asking Slang itself what stride it actually
+// used for this StructuredBuffer element) is NOT possible today --
+// rx::shader::ShaderLayoutInfo (shader_layout_info.h) reports set/binding/
+// type/count/stage/push-range shape only, nothing about a StructuredBuffer
+// element's internal layout -- ledgered as an rx_shader enhancement
+// candidate by the coordinator, explicitly out of this task's scope.
 struct ObjectTransform {
     glm::mat4 mvp;
     glm::mat4 lightMvp;
     glm::vec4 albedo;
     glm::vec4 lightDirWorld;
 };
+// Hand-computed from scene_types.slang's own field list, in order: two
+// float4x4 (64 bytes each -- GLM's mat4 is 16 packed floats, matching
+// Slang's own float4x4 StructuredBuffer element size with no interior
+// padding possible, since 64 is already a 16-byte multiple) plus two
+// float4 (16 bytes each). If a future edit to scene_types.slang adds,
+// removes, or reorders a field without updating this constant AND the
+// struct above to match, this assert fails at compile time -- exactly the
+// class of drift a mismatched hand-written copy used to hide until a
+// runtime probe caught it (see scene_types.slang's header for that
+// postmortem).
+constexpr size_t kObjectTransformShaderStrideBytes = 64 + 64 + 16 + 16;
+static_assert(sizeof(ObjectTransform) == kObjectTransformShaderStrideBytes,
+              "ObjectTransform must match shaders/multipass/scene_types.slang's ObjectTransform stride exactly -- "
+              "update kObjectTransformShaderStrideBytes (and this struct) together with that file");
 
 // --- Push-constant layouts -- byte-for-byte mirrors of each shader's own
 // [[vk::push_constant]] struct (see the .slang files). EMPIRICALLY
@@ -693,8 +728,11 @@ bool buildShadowPipeline(VkDevice device, rx::shader::Compiler& compiler, VkDesc
                           Scene& scene) {
     destroyCompiledPass(device, scene.shadowPass);
 
-    auto reflected =
-        compileAndReflect(compiler, "MultipassShadowModule", {kShadowVertFilename}, {"vsMain"});
+    // scene_types.slang listed first: see that file's own header comment
+    // and kSceneTypesFilename's comment for why ObjectTransform is shared
+    // this way rather than via Slang's own import/__include [fix round 1].
+    auto reflected = compileAndReflect(compiler, "MultipassShadowModule",
+                                        {kSceneTypesFilename, kShadowVertFilename}, {"vsMain"});
     if (!reflected.has_value()) {
         return false;
     }
@@ -824,7 +862,10 @@ bool buildLitPipeline(VkDevice device, rx::shader::Compiler& compiler, VkDescrip
                       Scene& scene) {
     destroyCompiledPass(device, scene.litPass);
 
-    auto reflected = compileAndReflect(compiler, "MultipassLitModule", {kLitVertFilename, kLitFragFilename},
+    // scene_types.slang listed first -- see buildShadowPipeline()'s
+    // identical comment [fix round 1].
+    auto reflected = compileAndReflect(compiler, "MultipassLitModule",
+                                        {kSceneTypesFilename, kLitVertFilename, kLitFragFilename},
                                         {"vsMain", "fsMain"});
     if (!reflected.has_value()) {
         return false;
@@ -1641,6 +1682,45 @@ int runHeadless(bool enableValidation) {
             pass = false;
             break;
         }
+    }
+
+    // (d) [fix round 1] object index 1 (the cube -- see kObjects) renders
+    // at its ANALYTICALLY EXPECTED screen position, not just "some shadow
+    // exists somewhere". Deliberately index 1, not index 0 (the floor):
+    // this is exactly the row a stride/offset drift between the C++ writer
+    // and either shader's ObjectTransform struct would corrupt while
+    // leaving row 0 looking fine (row 0 starts at byte offset 0 under any
+    // stride assumption -- see scene_types.slang's header comment for the
+    // real bug this class of check would have caught immediately). Probes
+    // the cube's own world XZ center (worldToPixel() -- the same fixed
+    // top-down camera every other probe in this file uses) and checks for
+    // its distinctly RED-leaning albedo (0.75, 0.25, 0.2) against the
+    // floor's near-neutral gray (0.55, 0.55, 0.6) and the sphere's
+    // blue-leaning albedo (0.2, 0.45, 0.8) -- channel-order-agnostic (see
+    // isReddish() below): a mvp/lightMvp drift severe enough to move the
+    // cube off its expected footprint, or a struct-offset drift severe
+    // enough to substitute a neighboring row's data, would both make this
+    // probe land on the floor (near-neutral, fails) rather than the cube
+    // (clearly red-dominant, passes).
+    const PixelCoord cubePixel =
+        worldToPixel(glm::vec2(kCubePosition.x, kCubePosition.z), kHeadlessWidth, kHeadlessHeight);
+    const uint8_t* cubePx = pixelAt(cubePixel.x, cubePixel.y);
+    auto isReddish = [](const uint8_t* p) {
+        constexpr int kMargin = 15;
+        const bool asRgba = p[0] > p[1] + kMargin && p[0] > p[2] + kMargin;  // R=p[0] dominant
+        const bool asBgra = p[2] > p[1] + kMargin && p[2] > p[0] + kMargin;  // R=p[2] dominant
+        return asRgba || asBgra;
+    };
+    RX_LOG_INFO("cube probe world=({:.1f},{:.1f}) pixel=({},{}) channels=({},{},{},{})", kCubePosition.x,
+                kCubePosition.z, cubePixel.x, cubePixel.y, cubePx[0], cubePx[1], cubePx[2], cubePx[3]);
+    if (!isReddish(cubePx)) {
+        RX_LOG_ERROR(
+            "cube probe (object index 1) at pixel ({},{}) channels=({},{},{}) is not clearly red-dominant -- "
+            "the cube is not rendering at its analytically expected position (ObjectTransform stride/offset "
+            "drift between the C++ writer and a shader-side copy is exactly the bug class this check exists "
+            "to catch -- see scene_types.slang)",
+            cubePixel.x, cubePixel.y, cubePx[0], cubePx[1], cubePx[2]);
+        pass = false;
     }
 
     if (enableValidation && context->hasValidationErrors()) {
