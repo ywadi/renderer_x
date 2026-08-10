@@ -96,14 +96,24 @@ TEST_CASE("Uploader::uploadToBuffer round-trips bytes through the staging path b
         pattern[i] = static_cast<uint8_t>((i * 31 + 7) & 0xFF);
     }
 
-    // No device-consuming usage bit (TRANSFER_DST/SRC only) -- structurally
-    // never direct-path-capable (see Allocator::createDeviceLocalBuffer's
-    // own comment), so this specific round-trip always exercises the
-    // staging branch, matching this test's name.
-    auto dst = fixture->allocator.createDeviceLocalBuffer(
+    // createHostVisibleBuffer() (not createDeviceLocalBuffer()) is the
+    // deterministic, hardware-independent way to force the staging branch,
+    // matching this test's name -- its directPathCapable() is a hardcoded
+    // false by construction, not a measurement (buffer.h). Task 8 fix:
+    // this used to call createDeviceLocalBuffer() with TRANSFER_DST/SRC-
+    // only usage on the (then-believed) assumption that a transfer-only
+    // usage bit combination can NEVER measure as direct-path-capable "no
+    // matter the hardware" -- empirically false, caught by a real CI
+    // failure on GitHub Actions' lavapipe/llvmpipe build (which, unlike
+    // this project's own development machine's local lavapipe build,
+    // exposes no non-host-visible DEVICE_LOCAL memory type at all, so
+    // even a transfer-only buffer measures directPathCapable()==true
+    // there) -- see createDeviceLocalBuffer()'s corrected header comment
+    // in buffer.h for the full mechanism.
+    auto dst = fixture->allocator.createHostVisibleBuffer(
         kSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     REQUIRE(dst.has_value());
-    CHECK_FALSE(dst->directPathCapable());
+    REQUIRE_FALSE(dst->directPathCapable());
 
     REQUIRE(uploader->uploadToBuffer(*dst, 0, pattern.data(), kSize));
     uploader->flush();
@@ -272,9 +282,24 @@ TEST_CASE("Uploader::uploadToBuffer rejects a single upload larger than the ring
     auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device, /*ringBufferSize=*/64);
     REQUIRE(uploader.has_value());
 
+    // The ring-buffer capacity check (reserveRingSpace(), upload.cpp) only
+    // runs on the STAGING branch -- a direct-path-capable destination
+    // writes straight into its own mapped allocation and never touches
+    // the ring buffer at all, so this rejection can only be exercised
+    // against a destination the staging branch is guaranteed to take.
+    // createHostVisibleBuffer() (hardcoded directPathCapable()==false, not
+    // measured) is that deterministic, hardware-independent guarantee --
+    // createDeviceLocalBuffer() here (Task 8 fix) measured
+    // directPathCapable()==true on GitHub Actions' lavapipe build, which
+    // made this 128-byte direct-path write against a real 128-byte
+    // allocation trivially succeed and silently skip the rejection this
+    // test exists to check -- see buffer.h's corrected comment on
+    // createDeviceLocalBuffer() for why that measurement is
+    // backend-dependent, not a bug.
     std::array<uint8_t, 128> tooBig{};
-    auto dst = fixture->allocator.createDeviceLocalBuffer(128, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    auto dst = fixture->allocator.createHostVisibleBuffer(128, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     REQUIRE(dst.has_value());
+    REQUIRE_FALSE(dst->directPathCapable());
 
     CHECK_FALSE(uploader->uploadToBuffer(*dst, 0, tooBig.data(), tooBig.size()));
     CHECK_FALSE(fixture->context.hasValidationErrors());

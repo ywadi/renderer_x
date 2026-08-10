@@ -184,9 +184,30 @@ public:
     // task's own first implementation made on `createUploadRingBuffer()`'s
     // TRANSFER_SRC-only staging buffer (fixed below) and exactly why this
     // method requires a real device-consuming usage bit to be worth
-    // calling with these flags at all -- a caller passing e.g. only
-    // `TRANSFER_DST_BIT` here gets a buffer that structurally can never
-    // report directPathCapable() == true, no matter the hardware.
+    // calling with these flags at all on hardware that actually has a
+    // choice to steer away from.
+    //
+    // **Correction (Phase 2 Task 8, verified against a real CI failure --
+    // not a hypothetical):** "not-preferred" is a soft tie-breaking signal
+    // among *multiple candidate* memory types, not a hard exclusion. On a
+    // backend whose Vulkan memory types don't include any HOST_VISIBLE
+    // type that ISN'T also DEVICE_LOCAL (verified directly: GitHub Actions'
+    // `ubuntu-latest` lavapipe/llvmpipe build reports exactly this, even
+    // though this same test passed against this project's development
+    // machine's own local lavapipe build -- Mesa/llvmpipe's exposed memory
+    // types are not identical across builds/versions), there is nothing
+    // better to steer toward instead, and the one remaining valid memory
+    // type still gets selected -- which CAN be both DEVICE_LOCAL and
+    // HOST_VISIBLE even for a `TRANSFER_DST_BIT`-only usage. So a caller
+    // passing only transfer bits here is NOT guaranteed
+    // `directPathCapable() == false` "no matter the hardware" (the
+    // previous, now-corrected claim here) -- only "on hardware that has a
+    // genuinely separate non-host-visible DEVICE_LOCAL memory pool to
+    // steer into instead." A test that needs to deterministically force
+    // (not just usually get) the staging branch regardless of backend must
+    // use `createHostVisibleBuffer()` below instead, whose
+    // `directPathCapable()` is a hardcoded `false` by construction, not a
+    // measurement -- see `src/rx_rhi_vk/tests/upload_test.cpp`.
     //
     // On a ReBAR-enabled desktop GPU or unified-memory APU, this resolves
     // to memory that is BOTH DEVICE_LOCAL and HOST_VISIBLE
