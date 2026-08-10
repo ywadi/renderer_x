@@ -88,10 +88,12 @@ VkDescriptorType mapElementType(slang::TypeReflection* elemType, const char* par
         case Kind::Resource: {
             SlangResourceShape shape = elemType->getResourceShape();
             // Base shape values (SLANG_TEXTURE_1D=0x01 .. SLANG_TEXTURE_SUBPASS=0x0A)
-            // are all < 0x10; every modifier (array/multisample/shadow/
-            // feedback/combined-sampler) is OR'd in starting at 0x10, so
-            // masking with 0x0F isolates the base shape cleanly [verified:
-            // slang.h's SlangResourceShape enum values].
+            // are all < 0x10; every modifier bit is OR'd in at or above
+            // 0x10 (feedback=0x10, shadow=0x20, array=0x40,
+            // multisample=0x80, combined-sampler=0x100), so masking with
+            // 0x0F isolates the base shape cleanly regardless of which
+            // modifiers are set [verified: slang.h's SlangResourceShape
+            // enum values].
             auto baseShape = static_cast<SlangResourceShape>(shape & 0x0F);
             bool combinedSampler = (shape & SLANG_TEXTURE_COMBINED_FLAG) != 0;
             SlangResourceAccess access = elemType->getResourceAccess();

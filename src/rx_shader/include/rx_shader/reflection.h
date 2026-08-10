@@ -44,22 +44,29 @@ namespace rx::shader {
 //     for set (`getBindingSpace()`), binding (`getBindingIndex()`),
 //     category, and name -- verified byte-for-byte against `spirv-dis`
 //     output for every case reflection_test.cpp exercises.
-//   - `TypeLayoutReflection::getBindingRangeType()` /
-//     `getBindingRangeBindingCount()` on `getGlobalParamsTypeLayout()`,
-//     correlated to the same global parameter by index *and* leaf-variable
-//     name (a defensive cross-check, not just trust-the-index), for
-//     descriptor type and array count/unbounded-ness -- this is the only
-//     API observed to correctly report Slang's `SLANG_UNBOUNDED_SIZE`
-//     sentinel for a genuinely unsized `T x[]` global;
-//     `TypeReflection::getElementCount()` (with or without a reflection
-//     context) was observed returning `0` or `2147483647` for the exact
-//     same unbounded array, neither of which is that sentinel.
-// See reflection.cpp for the full walk and the resource-kind -> VkDescriptorType
-// mapping table (verified for Sampler/Texture2D/CombinedSampler/
-// ConstantBuffer/StructuredBuffer/RWStructuredBuffer/RWTexture2D against
-// this same shipped build; other resource shapes are mapped per slang.h's
-// documented enum semantics but were not separately smoke-tested this
-// task).
+//   - `param->getType()->unwrapArray()->getKind()` (`TypeReflection::Kind`),
+//     plus `getResourceShape()`/`getResourceAccess()` for the `Kind::Resource`
+//     case, for descriptor *type* -- see `mapElementType()` in
+//     reflection.cpp for the full kind/shape/access -> VkDescriptorType
+//     table (verified for Sampler/Texture2D/CombinedSampler/ConstantBuffer/
+//     StructuredBuffer/RWStructuredBuffer/RWTexture2D against this same
+//     shipped build; other resource shapes are mapped per slang.h's
+//     documented enum semantics but were not separately smoke-tested this
+//     task).
+//   - `TypeLayoutReflection::getBindingRangeBindingCount()` on
+//     `getGlobalParamsTypeLayout()`, correlated to the same global
+//     parameter by index *and* leaf-variable name (a defensive cross-check,
+//     not just trust-the-index), for array count/unbounded-ness -- this is
+//     the only API observed to correctly report Slang's
+//     `SLANG_UNBOUNDED_SIZE` sentinel for a genuinely unsized `T x[]`
+//     global; `TypeReflection::getElementCount()` (with or without a
+//     reflection context) was observed returning `0` or `2147483647` for
+//     the exact same unbounded array, neither of which is that sentinel.
+//     (`TypeLayoutReflection::getBindingRangeType()`, which returns a
+//     `slang::BindingType` -- a different enum from `TypeReflection::Kind`
+//     above -- was probed during investigation but is NOT called by the
+//     actual walk; type classification uses `TypeReflection::Kind` only.)
+// See reflection.cpp for the full walk.
 //
 // Threading: takes the same process-wide mutex `Compiler` locks for every
 // front-end operation (module load/compose/link) -- see
