@@ -73,6 +73,36 @@ public:
     // Steam Deck baseline [R:A5, spec Fixed decision #3]. Returns
     // std::nullopt (logging the reason via RX_LOG_ERROR) if either step
     // fails.
+    //
+    // MATRIX LAYOUT -- read before writing any shader that reads a matrix
+    // out of a buffer: this session is built via the plain C++ API
+    // (`slang::SessionDesc`), which leaves `SessionDesc::
+    // defaultMatrixLayoutMode` at its own default -- ROW-major. That is a
+    // DIFFERENT default than the `slangc` CLI's own long-standing legacy
+    // default (column-major) -- i.e. a shader compiled through THIS
+    // `Compiler` and the exact same shader compiled offline via `slangc`
+    // (01_triangle's build-time path, shaders/CMakeLists.txt) can lay out
+    // an unqualified `float4x4` differently in memory, with no
+    // `row_major`/`column_major` qualifier anywhere in the source to flag
+    // it. Concretely: a `float4x4` read out of a
+    // `ConstantBuffer<T>`/`StructuredBuffer<T>`/push-constant element
+    // compiled through this Compiler is ROW-major in memory. Any
+    // host-side matrix producer that defaults to COLUMN-major storage
+    // instead -- GLM's `glm::mat4`, most notably, since this engine
+    // already depends on it (`rx_core` links `glm::glm` PUBLIC) -- must
+    // transpose at the host/device boundary before writing those bytes
+    // into a buffer a shader compiled through this Compiler will read as
+    // a matrix, or the shader reads a transposed (garbled) transform.
+    // This was found empirically, not from documentation alone: see
+    // `samples/03_bindless_mesh/main.cpp`'s `updateTransforms()` for the
+    // worked example (`glm::transpose(viewProj * model)` immediately
+    // before the upload) and its comment for the debugging trail that
+    // found it (a rendered-and-inspected image, not just reasoning about
+    // the spec). `rx::shader::ShaderLayoutInfo` (shader_layout_info.h)
+    // reports set/binding/type/count/range shape only -- it carries no
+    // matrix-layout information at all, so this doc comment is the one
+    // place that contract is written down; see this same paragraph if you
+    // land there first.
     static std::optional<Compiler> create();
 
     // Compiles `source` (a complete Slang translation unit) as a module

@@ -11,9 +11,10 @@
 # reference to a plain, non-CACHE `RX_SLANG_RUNTIME_LIBS` (file(GLOB)'d in
 # rx_shader/CMakeLists.txt's own directory scope) resolved to nothing here.
 # Fixed properly in src/rx_shader/CMakeLists.txt (Task 6): the function now
-# re-globs internally using the CACHE-INTERNAL `RX_SLANG_TARGET_ROOT`
-# (visible in any directory scope), so every caller -- this one included --
-# just calls it below with nothing to set up first.
+# re-globs internally using the CACHE-PATH `RX_SLANG_TARGET_ROOT` (a
+# `CACHE PATH` variable set in tools/fetch_slang.cmake, visible in any
+# directory scope), so every caller -- this one included -- just calls it
+# below with nothing to set up first.
 
 add_executable(sample_02_hotreload main.cpp)
 target_link_libraries(sample_02_hotreload PRIVATE rx_rhi_vk rx_platform rx_shader)

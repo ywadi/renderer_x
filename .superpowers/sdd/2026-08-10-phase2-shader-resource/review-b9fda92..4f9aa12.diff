@@ -1,0 +1,2679 @@
+# Review package: b9fda92..4f9aa12
+
+## Commits
+4f9aa12 Add samples/03_bindless_mesh: reflection + bindless + upload integration proof (Phase 2 Task 6)
+
+## Files changed
+ CMakeLists.txt                                    |    1 +
+ samples/02_hotreload/CMakeLists.txt               |   42 +-
+ samples/03_bindless_mesh/CMakeLists.txt           |   31 +
+ samples/03_bindless_mesh/main.cpp                 | 1621 +++++++++++++++++++++
+ samples/03_bindless_mesh/texture.png              |  Bin 0 -> 684 bytes
+ samples/README.md                                 |  100 +-
+ src/rx_rhi_vk/include/rx_rhi_vk/pipeline_layout.h |   62 +-
+ src/rx_rhi_vk/src/pipeline_layout.cpp             |  107 +-
+ src/rx_rhi_vk/tests/pipeline_layout_test.cpp      |  170 ++-
+ src/rx_shader/CMakeLists.txt                      |   74 +-
+ 10 files changed, 2128 insertions(+), 80 deletions(-)
+
+## Diff
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3b66e8c..b835fcf 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -20,10 +20,11 @@ add_subdirectory(src/rx_platform)
+ # ShaderLayoutInfo's header without slang::slang -- defining that target
+ # before the directory that consumes it removes any doubt about
+ # add_subdirectory ordering, even though target_link_libraries against a
+ # not-yet-defined target name is otherwise fine in modern CMake.
+ add_subdirectory(src/rx_shader)
+ add_subdirectory(src/rx_rhi_vk)
+ add_subdirectory(tools/dep_cache_smoketest)
+ add_subdirectory(tools/toolchain_check)
+ add_subdirectory(samples/01_triangle)
+ add_subdirectory(samples/02_hotreload)
++add_subdirectory(samples/03_bindless_mesh)
+diff --git a/samples/02_hotreload/CMakeLists.txt b/samples/02_hotreload/CMakeLists.txt
+index 93822da..d9b7610 100644
+--- a/samples/02_hotreload/CMakeLists.txt
++++ b/samples/02_hotreload/CMakeLists.txt
+@@ -1,50 +1,26 @@
+ # rx_shader_deploy_runtime_libs() is defined in src/rx_shader/CMakeLists.txt,
+ # add_subdirectory'd from the root CMakeLists.txt before this directory --
+ # CMake function *names* are visible to sibling directories processed later
+ # by the same parent (empirically verified: a function defined in one
+ # add_subdirectory'd listfile is callable from a second, later
+ # add_subdirectory'd listfile of the same parent).
+ #
+-# BUT: an unqualified variable reference inside a CMake function body is
+-# resolved through the *calling* scope, not the function's *definition*
+-# scope (also empirically verified) -- so rx_shader_deploy_runtime_libs()'s
+-# reference to RX_SLANG_RUNTIME_LIBS (a plain, non-CACHE variable
+-# file(GLOB)'d in rx_shader/CMakeLists.txt's own directory scope) resolves
+-# to nothing here, since this directory never set it. Re-glob the exact
+-# same list here (mirrors rx_shader/CMakeLists.txt's own glob patterns
+-# verbatim; RX_SLANG_TARGET_ROOT is a CACHE variable, so it *is* visible in
+-# this scope) so the call below actually has something to copy -- without
+-# this, the function's add_custom_command silently degenerates into a
+-# `cmake -E copy_if_different <dest-dir>` with no source files, which fails
+-# at build time with a CMake -E usage error.
+-if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+-  file(GLOB RX_SLANG_RUNTIME_LIBS
+-    "${RX_SLANG_TARGET_ROOT}/bin/slang-compiler.dll"
+-    "${RX_SLANG_TARGET_ROOT}/bin/slang-glslang.dll"
+-    "${RX_SLANG_TARGET_ROOT}/bin/slang-glsl-module.dll"
+-    "${RX_SLANG_TARGET_ROOT}/bin/slang-rt.dll"
+-  )
+-else()
+-  file(GLOB RX_SLANG_RUNTIME_LIBS
+-    "${RX_SLANG_TARGET_ROOT}/lib/libslang-compiler.so*"
+-    "${RX_SLANG_TARGET_ROOT}/lib/libslang-glslang-*.so"
+-    "${RX_SLANG_TARGET_ROOT}/lib/libslang-glsl-module-*.so"
+-    "${RX_SLANG_TARGET_ROOT}/lib/libslang-rt.so*"
+-  )
+-endif()
+-if(NOT RX_SLANG_RUNTIME_LIBS)
+-  message(FATAL_ERROR
+-    "[sample_02_hotreload] No Slang runtime libraries found under "
+-    "'${RX_SLANG_TARGET_ROOT}' -- see src/rx_shader/CMakeLists.txt's "
+-    "identical check for context.")
+-endif()
++# Used to need a local re-glob workaround here: an unqualified variable
++# reference inside a CMake function body resolves through the *calling*
++# scope, not the function's *definition* scope, so the function's old
++# reference to a plain, non-CACHE `RX_SLANG_RUNTIME_LIBS` (file(GLOB)'d in
++# rx_shader/CMakeLists.txt's own directory scope) resolved to nothing here.
++# Fixed properly in src/rx_shader/CMakeLists.txt (Task 6): the function now
++# re-globs internally using the CACHE-INTERNAL `RX_SLANG_TARGET_ROOT`
++# (visible in any directory scope), so every caller -- this one included --
++# just calls it below with nothing to set up first.
+ 
+ add_executable(sample_02_hotreload main.cpp)
+ target_link_libraries(sample_02_hotreload PRIVATE rx_rhi_vk rx_platform rx_shader)
+ 
+ # This sample does real in-process Slang compilation on every run (both
+ # modes) -- it is the redistribution proof for the Task 1 runtime-lib
+ # deployment mechanism [R:D2, spec Fixed decision #11].
+ rx_shader_deploy_runtime_libs(sample_02_hotreload)
+ 
+ # Deploys the live-reloadable shader source next to the binary at build
+diff --git a/samples/03_bindless_mesh/CMakeLists.txt b/samples/03_bindless_mesh/CMakeLists.txt
+new file mode 100644
+index 0000000..a706572
+--- /dev/null
++++ b/samples/03_bindless_mesh/CMakeLists.txt
+@@ -0,0 +1,31 @@
++# rx_shader_deploy_runtime_libs() is defined in src/rx_shader/CMakeLists.txt
++# (add_subdirectory'd from the root CMakeLists.txt before this directory) --
++# see that file's own comment for the directory-scope fix (Task 6) that
++# makes it safe to call unqualified from here, no local re-glob needed.
++
++add_executable(sample_03_bindless_mesh main.cpp)
++target_link_libraries(sample_03_bindless_mesh PRIVATE rx_rhi_vk rx_platform rx_shader)
++
++# This sample does real in-process Slang compilation at startup (both
++# modes -- see main.cpp's kShaderSource/buildScenePipeline()), same as
++# 02_hotreload -- needs the Slang runtime libs deployed next to it.
++rx_shader_deploy_runtime_libs(sample_03_bindless_mesh)
++
++# Deploys the one real PNG this sample decodes via stb_image (see
++# main.cpp's resolveTexturePath()/createScene()) next to the binary at
++# build time, so a redistributed copy of just this build-output directory
++# (binary + texture.png + the Slang runtime libs above) works identically
++# outside the build tree -- same mechanism/rationale as 02_hotreload's
++# hotreload.slang deployment.
++add_custom_command(TARGET sample_03_bindless_mesh POST_BUILD
++  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
++          "${CMAKE_CURRENT_SOURCE_DIR}/texture.png"
++          "$<TARGET_FILE_DIR:sample_03_bindless_mesh>/texture.png"
++  COMMENT "sample_03_bindless_mesh: deploying texture.png next to the binary"
++  VERBATIM
++)
++
++# Runs the binary with no arguments -- headless mode (default, used by
++# ctest). The binary also supports --present mode for interactive windowed
++# rendering with an orbiting camera (see main.cpp / samples/README.md).
++add_test(NAME sample_03_bindless_mesh_headless COMMAND sample_03_bindless_mesh)
+diff --git a/samples/03_bindless_mesh/main.cpp b/samples/03_bindless_mesh/main.cpp
+new file mode 100644
+index 0000000..6c973d8
+--- /dev/null
++++ b/samples/03_bindless_mesh/main.cpp
+@@ -0,0 +1,1621 @@
++// Sample 03: bindless mesh.
++//
++// The Phase 2 integration proof: reflection-driven pipeline layouts,
++// bindless resource management, and the real upload path, all working
++// together in one scene. Procedural geometry (cube, sphere, plane --
++// generated in code below, no importer) textured with 4 procedurally
++// generated images plus one real PNG decoded via stb_image, every texture
++// uploaded through rx::rhi::Uploader into one rx::rhi::BindlessTable (set
++// 0). The pipeline's descriptor set layout and push-constant range come
++// entirely from rx::shader::reflect() on the shader source embedded below
++// (kShaderSource) -- there is no hand-typed VkDescriptorSetLayoutBinding
++// anywhere in this file for set 0; that is the entire point of this
++// sample (Task 6 brief).
++//
++// SET-0 SUBSTITUTION: BindlessTable's real descriptor set layout (built
++// from caller capacities, VARIABLE_DESCRIPTOR_COUNT on its last binding)
++// and a from-scratch layout PipelineLayoutBuilder would otherwise invent
++// for the same reflected shape are NOT compatible Vulkan pipeline layouts
++// "by construction" (Task 3's review finding) -- this sample is what
++// exercises the fix: rx::rhi::PipelineLayoutBuilder::build()'s new
++// `externalSet0` parameter (rx_rhi_vk/pipeline_layout.h), passed
++// `bindlessTable.descriptorSetLayout()` directly, below.
++//
++// PUSH CONSTANTS (12 bytes, well under the 128-byte budget):
++//   { uint32 transformIndex; uint32 textureIndex; uint32 samplerIndex; }
++// All three are UNIFORM across a single draw call (every vertex/fragment
++// invocation within one vkCmdDrawIndexed call reads the exact same push-
++// constant bytes) -- never wrapped in NonUniformResourceIndex() in the
++// shader below [spec Fixed decision #6, R:B3/E4]. `transformIndex` selects
++// a row inside ONE bindless storage buffer holding every object's
++// precomputed MVP for the frame currently in flight (see "Double-buffered
++// transforms" below); `textureIndex`/`samplerIndex` select this object's
++// sampled image / sampler directly.
++//
++// DOUBLE-BUFFERED TRANSFORMS, NO RE-REGISTRATION: rather than reallocating
++// a fresh bindless storage-buffer slot every frame (churning the
++// descriptor set) or racing a single-buffered transform buffer against an
++// in-flight frame still reading it (FrameSync keeps 2 frames in flight),
++// this sample allocates ONE storage buffer sized for
++// `FrameSync::framesInFlight() * kObjectCount` mat4 rows, registers it
++// ONCE into the bindless table, and every frame writes only the row range
++// belonging to the frame-in-flight slot currently being recorded --
++// `transformIndex = frameSync.currentFrameIndex() * kObjectCount +
++// objectIndex`. That row range was last read by a draw using this exact
++// slot, and this sample's present loop (mirroring 01_triangle/
++// 02_hotreload) already waits on that slot's own fence before reaching
++// this point in the loop -- so the row range is provably idle before being
++// overwritten, with no extra synchronization needed beyond what the
++// standard frames-in-flight loop already provides. (Headless mode only
++// ever uses frame-in-flight slot 0's rows.)
++//
++// Depth buffer: rx::rhi::Texture2D, VK_FORMAT_D32_SFLOAT, mipLevels=1, no
++// upload (never touched by Uploader -- created, transitioned once, used
++// as a depth attachment only) [Task 6 brief: "Depth buffer via
++// Texture2D... create with mipLevels=1, no upload"].
++//
++// Two modes, exactly like 01_triangle/02_hotreload:
++//   (default / no args) Headless correctness gate: one frame, offscreen,
++//   256x256, camera at its orbit's t=0 pose (a fixed, well-known front
++//   view -- see kCamera* below), readback + probe pixels asserting >=3
++//   distinct texture colors actually landed on screen, validation clean,
++//   exit 0/1. Registered as ctest sample_03_bindless_mesh_headless.
++//   --present. Real window, the same scene, camera continuously orbiting
++//   (see runPresent()'s use of elapsed time to drive the orbit angle the
++//   headless gate always evaluates at t=0).
++#include <rx_core/log.h>
++#include <rx_platform/window.h>
++#include <rx_rhi_vk/bindless.h>
++#include <rx_rhi_vk/buffer.h>
++#include <rx_rhi_vk/command.h>
++#include <rx_rhi_vk/context.h>
++#include <rx_rhi_vk/device.h>
++#include <rx_rhi_vk/frame_sync.h>
++#include <rx_rhi_vk/mesh_buffers.h>
++#include <rx_rhi_vk/pipeline_layout.h>
++#include <rx_rhi_vk/texture.h>
++#include <rx_rhi_vk/upload.h>
++#include <rx_shader/compiler.h>
++#include <rx_shader/reflection.h>
++
++// GLM is already a PUBLIC dependency of rx_core (see
++// src/rx_core/CMakeLists.txt), transitively available here through
++// rx_rhi_vk/rx_platform -- no separate link needed. GLM_FORCE_DEPTH_ZERO_TO_ONE
++// makes glm::perspective() emit Vulkan's [0,1] clip-space depth range
++// instead of OpenGL's default [-1,1]; must be defined before the first GLM
++// include in any TU that calls glm::perspective(), which is only this one.
++#define GLM_FORCE_DEPTH_ZERO_TO_ONE
++#include <glm/glm.hpp>
++#include <glm/gtc/matrix_transform.hpp>
++#include <glm/gtc/type_ptr.hpp>
++
++#include <stb_image.h>
++
++#include <SDL3/SDL.h>
++#include <volk.h>
++
++#include <array>
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++namespace {
++
++constexpr uint32_t kHeadlessWidth = 256;
++constexpr uint32_t kHeadlessHeight = 256;
++constexpr VkDeviceSize kHeadlessPixelBytes = static_cast<VkDeviceSize>(kHeadlessWidth) * kHeadlessHeight * 4;
++
++// --present mode's window size -- arbitrary, viewport/scissor are dynamic
++// state (same reasoning as 01_triangle/02_hotreload).
++constexpr uint32_t kPresentWidth = 900;
++constexpr uint32_t kPresentHeight = 700;
++
++constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
++constexpr VkFormat kTextureFormat = VK_FORMAT_R8G8B8A8_UNORM;
++
++constexpr const char* kTextureFilename = "texture.png";
++
++// --- Scene layout -----------------------------------------------------
++//
++// 5 objects along the X axis (2 cubes, 2 spheres, 1 plane), one texture
++// each -- every one of the 4 procedurally generated textures plus the one
++// real decoded PNG gets used by exactly one object, so ">=3 distinct
++// texture samples" (the headless gate's own requirement) is trivially
++// satisfied with margin to spare.
++enum class Shape : uint32_t { Cube, Sphere, Plane };
++
++struct SceneObject {
++    Shape shape;
++    float x;
++    float spinRadPerSec;
++    uint32_t textureIndex;
++    uint32_t samplerIndex;
++};
++
++constexpr float kObjectSpacing = 4.0F;
++constexpr std::array<SceneObject, 5> kObjects{{
++    {Shape::Cube, -2.0F * kObjectSpacing, 0.6F, 0, 0},
++    {Shape::Cube, -1.0F * kObjectSpacing, -0.4F, 1, 1},
++    {Shape::Sphere, 0.0F, 0.5F, 2, 0},
++    {Shape::Sphere, 1.0F * kObjectSpacing, -0.5F, 3, 1},
++    {Shape::Plane, 2.0F * kObjectSpacing, 0.0F, 4, 0},
++}};
++constexpr uint32_t kObjectCount = static_cast<uint32_t>(kObjects.size());
++
++// Camera: orbits the origin in the XZ plane at a fixed radius/height,
++// always looking at the origin. At t=0 (angle=0) the camera sits on the
++// +Z axis -- a fixed, well-known front view the headless gate always
++// renders (see runHeadless()). --present mode advances `angle` with
++// elapsed time (see runPresent()) -- this is the "camera orbits in
++// present mode" the brief asks for; headless mode is just this same orbit
++// function evaluated at time=0, not a separate camera path.
++constexpr float kCameraRadius = 26.0F;
++constexpr float kCameraHeight = 5.0F;
++constexpr float kCameraOrbitRadPerSec = 0.35F;
++constexpr float kCameraFovYRadians = 0.8F;  // ~46 degrees
++constexpr float kCameraNear = 0.1F;
++constexpr float kCameraFar = 200.0F;
++
++glm::vec3 cameraEyeAtAngle(float angle) {
++    return glm::vec3(kCameraRadius * std::sin(angle), kCameraHeight, kCameraRadius * std::cos(angle));
++}
++
++// Vulkan clip space's Y axis points down the screen; GLM's glm::perspective
++// (even with GLM_FORCE_DEPTH_ZERO_TO_ONE) still assumes an OpenGL-style
++// Y-up NDC -- flipping proj[1][1] is the standard, widely used fix (see
++// e.g. Sascha Willems' Vulkan samples) for using GLM's projection helpers
++// directly with Vulkan.
++glm::mat4 makeProjection(float aspect) {
++    glm::mat4 proj = glm::perspective(kCameraFovYRadians, aspect, kCameraNear, kCameraFar);
++    proj[1][1] *= -1.0F;
++    return proj;
++}
++
++// --- Shader source (compiled at RUNTIME via rx_shader::Compiler, per the
++// Task 6 brief -- reflection must walk the actual shader driving this
++// sample's layouts, which requires the runtime path, not a slangc
++// build-time precompile like 01_triangle's shaders) -------------------
++//
++// Set 0's three bindings deliberately match rx::rhi::BindlessTable's own
++// fixed scheme exactly (kSampledImageBinding=0/kSamplerBinding=1/
++// kStorageBufferBinding=2, each an unbounded runtime array) -- this is
++// what makes the externalSet0 substitution below valid: reflect() must
++// report this exact shape for PipelineLayoutBuilder::build()'s shape
++// check to accept rx::rhi::BindlessTable::descriptorSetLayout() as a
++// substitute for a from-scratch set-0 layout.
++constexpr const char* kShaderSource = R"(
++struct PushConstants {
++    uint transformIndex;
++    uint textureIndex;
++    uint samplerIndex;
++};
++
++[[vk::push_constant]]
++ConstantBuffer<PushConstants> gPush;
++
++[[vk::binding(0, 0)]]
++Texture2D gTextures[];
++
++[[vk::binding(1, 0)]]
++SamplerState gSamplers[];
++
++[[vk::binding(2, 0)]]
++StructuredBuffer<float4x4> gTransforms[];
++
++struct VSIn {
++    float3 position : POSITION;
++    float2 uv : TEXCOORD0;
++};
++
++struct VSOut {
++    float4 position : SV_Position;
++    float2 uv : TEXCOORD0;
++};
++
++[shader("vertex")]
++VSOut vsMain(VSIn input)
++{
++    // gTransforms[0]: this sample only ever registers ONE bindless
++    // storage buffer (the shared, double-buffered-by-row transform
++    // table) -- a compile-time-constant descriptor-array index, uniform
++    // by construction, never NonUniformResourceIndex-wrapped.
++    // gPush.transformIndex: uniform across this whole draw call (every
++    // invocation reading the same push-constant bytes) -- selects a ROW
++    // inside that one buffer, not a different descriptor.
++    float4x4 mvp = gTransforms[0][gPush.transformIndex];
++    VSOut o;
++    o.position = mul(mvp, float4(input.position, 1.0));
++    o.uv = input.uv;
++    return o;
++}
++
++[shader("fragment")]
++float4 fsMain(VSOut input) : SV_Target
++{
++    return gTextures[gPush.textureIndex].Sample(gSamplers[gPush.samplerIndex], input.uv);
++}
++)";
++
++const std::vector<std::string> kEntryPointNames = {"vsMain", "fsMain"};
++
++// --- Procedural geometry -------------------------------------------------
++
++struct Vertex {
++    float position[3];
++    float uv[2];
++};
++
++struct HostMesh {
++    std::vector<Vertex> vertices;
++    std::vector<uint32_t> indices;
++};
++
++void addQuad(HostMesh& mesh, glm::vec3 a, glm::vec3 b, glm::vec3 c, glm::vec3 d) {
++    uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
++    mesh.vertices.push_back(Vertex{{a.x, a.y, a.z}, {0.0F, 0.0F}});
++    mesh.vertices.push_back(Vertex{{b.x, b.y, b.z}, {1.0F, 0.0F}});
++    mesh.vertices.push_back(Vertex{{c.x, c.y, c.z}, {1.0F, 1.0F}});
++    mesh.vertices.push_back(Vertex{{d.x, d.y, d.z}, {0.0F, 1.0F}});
++    mesh.indices.push_back(base + 0);
++    mesh.indices.push_back(base + 1);
++    mesh.indices.push_back(base + 2);
++    mesh.indices.push_back(base + 0);
++    mesh.indices.push_back(base + 2);
++    mesh.indices.push_back(base + 3);
++}
++
++// Half-extent `h` cube, 24 vertices (4 per face -- each face needs its own
++// UV corners, so faces cannot share corner vertices), 36 indices.
++HostMesh generateCube(float h) {
++    HostMesh mesh;
++    addQuad(mesh, {h, -h, -h}, {h, h, -h}, {h, h, h}, {h, -h, h});         // +X
++    addQuad(mesh, {-h, -h, h}, {-h, h, h}, {-h, h, -h}, {-h, -h, -h});     // -X
++    addQuad(mesh, {-h, h, -h}, {-h, h, h}, {h, h, h}, {h, h, -h});         // +Y
++    addQuad(mesh, {-h, -h, h}, {-h, -h, -h}, {h, -h, -h}, {h, -h, h});     // -Y
++    addQuad(mesh, {-h, -h, h}, {h, -h, h}, {h, h, h}, {-h, h, h});         // +Z
++    addQuad(mesh, {h, -h, -h}, {-h, -h, -h}, {-h, h, -h}, {h, h, -h});     // -Z
++    return mesh;
++}
++
++// Standard UV sphere, radius `radius`, `rings` latitude bands x `segments`
++// longitude bands.
++HostMesh generateSphere(float radius, uint32_t rings, uint32_t segments) {
++    HostMesh mesh;
++    constexpr float kPi = 3.14159265358979323846F;
++
++    for (uint32_t y = 0; y <= rings; ++y) {
++        float v = static_cast<float>(y) / static_cast<float>(rings);
++        float theta = v * kPi;
++        float sinTheta = std::sin(theta);
++        float cosTheta = std::cos(theta);
++        for (uint32_t x = 0; x <= segments; ++x) {
++            float u = static_cast<float>(x) / static_cast<float>(segments);
++            float phi = u * 2.0F * kPi;
++            float sinPhi = std::sin(phi);
++            float cosPhi = std::cos(phi);
++            Vertex vert{};
++            vert.position[0] = radius * sinTheta * cosPhi;
++            vert.position[1] = radius * cosTheta;
++            vert.position[2] = radius * sinTheta * sinPhi;
++            vert.uv[0] = u;
++            vert.uv[1] = v;
++            mesh.vertices.push_back(vert);
++        }
++    }
++
++    uint32_t stride = segments + 1;
++    for (uint32_t y = 0; y < rings; ++y) {
++        for (uint32_t x = 0; x < segments; ++x) {
++            uint32_t i0 = y * stride + x;
++            uint32_t i1 = i0 + 1;
++            uint32_t i2 = i0 + stride;
++            uint32_t i3 = i2 + 1;
++            mesh.indices.push_back(i0);
++            mesh.indices.push_back(i2);
++            mesh.indices.push_back(i1);
++            mesh.indices.push_back(i1);
++            mesh.indices.push_back(i2);
++            mesh.indices.push_back(i3);
++        }
++    }
++    return mesh;
++}
++
++// A single quad in the XY plane (facing +Z), half-size `halfSize`.
++HostMesh generatePlane(float halfSize) {
++    HostMesh mesh;
++    addQuad(mesh, {-halfSize, -halfSize, 0.0F}, {halfSize, -halfSize, 0.0F}, {halfSize, halfSize, 0.0F},
++            {-halfSize, halfSize, 0.0F});
++    return mesh;
++}
++
++// --- Procedural textures -------------------------------------------------
++
++std::vector<uint8_t> makeCheckerboard(uint32_t size, uint32_t cellSize, std::array<uint8_t, 3> colorA,
++                                       std::array<uint8_t, 3> colorB) {
++    std::vector<uint8_t> pixels(static_cast<size_t>(size) * size * 4);
++    for (uint32_t y = 0; y < size; ++y) {
++        for (uint32_t x = 0; x < size; ++x) {
++            bool useA = ((x / cellSize) + (y / cellSize)) % 2 == 0;
++            const auto& c = useA ? colorA : colorB;
++            size_t i = (static_cast<size_t>(y) * size + x) * 4;
++            pixels[i + 0] = c[0];
++            pixels[i + 1] = c[1];
++            pixels[i + 2] = c[2];
++            pixels[i + 3] = 255;
++        }
++    }
++    return pixels;
++}
++
++std::vector<uint8_t> makeGradient(uint32_t size, std::array<uint8_t, 3> colorA, std::array<uint8_t, 3> colorB,
++                                   bool diagonal) {
++    std::vector<uint8_t> pixels(static_cast<size_t>(size) * size * 4);
++    for (uint32_t y = 0; y < size; ++y) {
++        for (uint32_t x = 0; x < size; ++x) {
++            float t = diagonal ? (static_cast<float>(x + y) / static_cast<float>(2 * (size - 1)))
++                                : (static_cast<float>(x) / static_cast<float>(size - 1));
++            size_t i = (static_cast<size_t>(y) * size + x) * 4;
++            for (int c = 0; c < 3; ++c) {
++                float value = static_cast<float>(colorA[c]) * (1.0F - t) + static_cast<float>(colorB[c]) * t;
++                pixels[i + static_cast<size_t>(c)] = static_cast<uint8_t>(value + 0.5F);
++            }
++            pixels[i + 3] = 255;
++        }
++    }
++    return pixels;
++}
++
++// --- GPU-side scene -------------------------------------------------------
++
++// `MeshBuffers` has no default constructor at all (only ever produced by
++// its own `create()` factory) -- wrapping it in `std::optional` is what
++// lets `GpuMesh`, and in turn `std::array<GpuMesh, 3>` (Scene::meshes,
++// below), stay default-constructible without needing a real MeshBuffers
++// up front.
++struct GpuMesh {
++    std::optional<rx::rhi::MeshBuffers> buffers;
++};
++
++// Everything the bindless-mesh scene needs beyond the raw RHI stack:
++// BindlessTable, the 5 uploaded textures + 2 samplers each registered into
++// it, the one double-buffered transform storage buffer (also registered
++// into it, see this file's header comment), the 3 mesh types' GPU buffers,
++// the reflection-driven pipeline, and the depth buffer. Move-only by
++// construction (every member is itself move-only RAII); built once by
++// createScene() below and torn down by simply going out of scope, in
++// reverse declaration order, before the owning Device/Context/Allocator
++// do -- same discipline every other sample in this codebase follows.
++// `Buffer` also has no PUBLICLY accessible default constructor (private,
++// friend-of-Allocator-only) -- same reasoning as GpuMesh::buffers above,
++// `transformBuffer` is `std::optional<Buffer>` so Scene stays a plain
++// aggregate constructible via `Scene scene{std::move(*bindlessTable)};`
++// (only `bindlessTable`, the first member, needs an explicit initializer;
++// every other member below is default-constructible on its own: vector,
++// optional, and trivial handle/scalar types).
++struct Scene {
++    rx::rhi::BindlessTable bindlessTable;
++    std::vector<rx::rhi::Texture2D> textures;
++    std::array<VkSampler, 2> samplers{VK_NULL_HANDLE, VK_NULL_HANDLE};
++    std::optional<rx::rhi::Buffer> transformBuffer;
++    std::array<GpuMesh, 3> meshes;  // indexed by Shape
++
++    VkShaderModule vertModule = VK_NULL_HANDLE;
++    VkShaderModule fragModule = VK_NULL_HANDLE;
++    rx::rhi::PipelineLayoutBundle layoutBundle;
++    VkPipeline pipeline = VK_NULL_HANDLE;
++    uint32_t pushConstantOffset = 0;
++    uint32_t pushConstantSize = 0;
++    VkShaderStageFlags pushConstantStages = 0;
++};
++
++void destroyScenePipeline(VkDevice device, Scene& scene) {
++    if (scene.pipeline != VK_NULL_HANDLE) {
++        vkDestroyPipeline(device, scene.pipeline, nullptr);
++        scene.pipeline = VK_NULL_HANDLE;
++    }
++    if (scene.fragModule != VK_NULL_HANDLE) {
++        vkDestroyShaderModule(device, scene.fragModule, nullptr);
++        scene.fragModule = VK_NULL_HANDLE;
++    }
++    if (scene.vertModule != VK_NULL_HANDLE) {
++        vkDestroyShaderModule(device, scene.vertModule, nullptr);
++        scene.vertModule = VK_NULL_HANDLE;
++    }
++    scene.layoutBundle = rx::rhi::PipelineLayoutBundle{};
++}
++
++void destroyScene(VkDevice device, Scene& scene) {
++    destroyScenePipeline(device, scene);
++    for (VkSampler sampler : scene.samplers) {
++        if (sampler != VK_NULL_HANDLE) {
++            vkDestroySampler(device, sampler, nullptr);
++        }
++    }
++    scene.samplers.fill(VK_NULL_HANDLE);
++}
++
++// Builds the VkPipelineVertexInputStateCreateInfo-adjacent state (binding +
++// attribute descriptions) for `Vertex` -- shared by every mesh type in this
++// sample (they all share one vertex layout).
++struct VertexInputState {
++    VkVertexInputBindingDescription binding{};
++    std::array<VkVertexInputAttributeDescription, 2> attributes{};
++};
++
++VertexInputState makeVertexInputState() {
++    VertexInputState state;
++    state.binding.binding = 0;
++    state.binding.stride = sizeof(Vertex);
++    state.binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
++
++    state.attributes[0].location = 0;
++    state.attributes[0].binding = 0;
++    state.attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
++    state.attributes[0].offset = offsetof(Vertex, position);
++
++    state.attributes[1].location = 1;
++    state.attributes[1].binding = 0;
++    state.attributes[1].format = VK_FORMAT_R32G32_SFLOAT;
++    state.attributes[1].offset = offsetof(Vertex, uv);
++    return state;
++}
++
++// Compiles kShaderSource, reflects it, and builds the pipeline layout +
++// VkPipeline -- the reflection-driven core of this sample. Returns false
++// (logged) on any failure; on success, fills in scene.vertModule/
++// fragModule/layoutBundle/pipeline/pushConstant* (any previous pipeline
++// state in `scene` is destroyed first).
++bool buildScenePipeline(VkDevice device, rx::rhi::BindlessTable& bindlessTable, VkFormat colorFormat, Scene& scene) {
++    destroyScenePipeline(device, scene);
++
++    auto compiler = rx::shader::Compiler::create();
++    if (!compiler.has_value()) {
++        RX_LOG_ERROR("sample_03_bindless_mesh: rx::shader::Compiler::create failed");
++        return false;
++    }
++
++    rx::shader::CompileResult compileResult =
++        compiler->compileFromSource("BindlessMeshModule", kShaderSource, kEntryPointNames);
++    if (!compileResult.ok) {
++        RX_LOG_ERROR("sample_03_bindless_mesh: shader compile failed:\n{}", compileResult.diagnostics);
++        return false;
++    }
++
++    auto layoutInfo = rx::shader::reflect(compileResult);
++    if (!layoutInfo.has_value()) {
++        RX_LOG_ERROR("sample_03_bindless_mesh: reflect() failed on an otherwise-successful compile");
++        return false;
++    }
++    if (layoutInfo->bindings.size() != 3) {
++        RX_LOG_ERROR(
++            "sample_03_bindless_mesh: shader reflects {} set-0 bindings; expected exactly 3 (images/samplers/"
++            "storage buffers, matching BindlessTable's fixed scheme)",
++            layoutInfo->bindings.size());
++        return false;
++    }
++    if (layoutInfo->pushRanges.size() != 1) {
++        RX_LOG_ERROR("sample_03_bindless_mesh: shader reflects {} push-constant ranges; expected exactly 1",
++                     layoutInfo->pushRanges.size());
++        return false;
++    }
++
++    // THE substitution this whole sample exists to prove: set 0 becomes
++    // the real BindlessTable's own layout, not a lookalike this builder
++    // would otherwise invent from `layoutInfo` alone -- see
++    // pipeline_layout.h's comment on build() and this file's header
++    // comment for the full rationale.
++    auto layoutBundle =
++        rx::rhi::PipelineLayoutBuilder::build(device, *layoutInfo, bindlessTable.descriptorSetLayout());
++    if (!layoutBundle.has_value()) {
++        RX_LOG_ERROR("sample_03_bindless_mesh: PipelineLayoutBuilder::build failed (externalSet0 shape mismatch?)");
++        return false;
++    }
++
++    scene.layoutBundle = std::move(*layoutBundle);
++    scene.pushConstantOffset = layoutInfo->pushRanges[0].offset;
++    scene.pushConstantSize = layoutInfo->pushRanges[0].size;
++    scene.pushConstantStages = layoutInfo->pushRanges[0].stages;
++
++    for (const auto& blob : compileResult.entryPointCode) {
++        VkShaderModuleCreateInfo moduleInfo{};
++        moduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
++        moduleInfo.codeSize = blob.code.size() * sizeof(uint32_t);
++        moduleInfo.pCode = blob.code.data();
++
++        VkShaderModule module = VK_NULL_HANDLE;
++        if (vkCreateShaderModule(device, &moduleInfo, nullptr, &module) != VK_SUCCESS) {
++            RX_LOG_ERROR("sample_03_bindless_mesh: vkCreateShaderModule failed for entry point '{}'",
++                         blob.entryPointName);
++            destroyScenePipeline(device, scene);
++            return false;
++        }
++        if (blob.entryPointName == "vsMain") {
++            scene.vertModule = module;
++        } else if (blob.entryPointName == "fsMain") {
++            scene.fragModule = module;
++        } else {
++            RX_LOG_ERROR("sample_03_bindless_mesh: unexpected entry point '{}'", blob.entryPointName);
++            vkDestroyShaderModule(device, module, nullptr);
++            destroyScenePipeline(device, scene);
++            return false;
++        }
++    }
++    if (scene.vertModule == VK_NULL_HANDLE || scene.fragModule == VK_NULL_HANDLE) {
++        RX_LOG_ERROR("sample_03_bindless_mesh: missing vsMain/fsMain shader module after a successful compile");
++        destroyScenePipeline(device, scene);
++        return false;
++    }
++
++    std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
++    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++    stages[0].module = scene.vertModule;
++    // Slang's SPIR-V backend always names each entry point's OpEntryPoint
++    // "main" regardless of the source-level function name -- see
++    // 02_hotreload/main.cpp's comment on this exact point.
++    stages[0].pName = "main";
++    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++    stages[1].module = scene.fragModule;
++    stages[1].pName = "main";
++
++    VertexInputState vertexInput = makeVertexInputState();
++    VkPipelineVertexInputStateCreateInfo vertexInputState{};
++    vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
++    vertexInputState.vertexBindingDescriptionCount = 1;
++    vertexInputState.pVertexBindingDescriptions = &vertexInput.binding;
++    vertexInputState.vertexAttributeDescriptionCount = static_cast<uint32_t>(vertexInput.attributes.size());
++    vertexInputState.pVertexAttributeDescriptions = vertexInput.attributes.data();
++
++    VkPipelineInputAssemblyStateCreateInfo inputAssemblyState{};
++    inputAssemblyState.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
++    inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++
++    VkPipelineViewportStateCreateInfo viewportState{};
++    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
++    viewportState.viewportCount = 1;
++    viewportState.scissorCount = 1;
++
++    VkPipelineRasterizationStateCreateInfo rasterizationState{};
++    rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
++    rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
++    // No culling: this sample's procedural geometry generators do not
++    // guarantee a single consistent outward winding order across every
++    // face (cube/sphere/plane each walk their own perimeter independently,
++    // see generateCube()/generateSphere()/generatePlane() above), and
++    // nothing in this shader depends on face orientation (no lighting) --
++    // culling would only risk silently dropping real geometry for no
++    // benefit here.
++    rasterizationState.cullMode = VK_CULL_MODE_NONE;
++    rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++    rasterizationState.lineWidth = 1.0F;
++
++    VkPipelineMultisampleStateCreateInfo multisampleState{};
++    multisampleState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
++    multisampleState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++
++    VkPipelineDepthStencilStateCreateInfo depthStencilState{};
++    depthStencilState.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
++    depthStencilState.depthTestEnable = VK_TRUE;
++    depthStencilState.depthWriteEnable = VK_TRUE;
++    depthStencilState.depthCompareOp = VK_COMPARE_OP_LESS;
++
++    VkPipelineColorBlendAttachmentState blendAttachment{};
++    blendAttachment.blendEnable = VK_FALSE;
++    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
++                                      VK_COLOR_COMPONENT_A_BIT;
++
++    VkPipelineColorBlendStateCreateInfo colorBlendState{};
++    colorBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
++    colorBlendState.attachmentCount = 1;
++    colorBlendState.pAttachments = &blendAttachment;
++
++    std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
++    VkPipelineDynamicStateCreateInfo dynamicState{};
++    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
++    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
++    dynamicState.pDynamicStates = dynamicStates.data();
++
++    VkPipelineRenderingCreateInfo renderingCreateInfo{};
++    renderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
++    renderingCreateInfo.colorAttachmentCount = 1;
++    renderingCreateInfo.pColorAttachmentFormats = &colorFormat;
++    renderingCreateInfo.depthAttachmentFormat = kDepthFormat;
++
++    VkGraphicsPipelineCreateInfo pipelineInfo{};
++    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
++    pipelineInfo.pNext = &renderingCreateInfo;
++    pipelineInfo.stageCount = static_cast<uint32_t>(stages.size());
++    pipelineInfo.pStages = stages.data();
++    pipelineInfo.pVertexInputState = &vertexInputState;
++    pipelineInfo.pInputAssemblyState = &inputAssemblyState;
++    pipelineInfo.pViewportState = &viewportState;
++    pipelineInfo.pRasterizationState = &rasterizationState;
++    pipelineInfo.pMultisampleState = &multisampleState;
++    pipelineInfo.pDepthStencilState = &depthStencilState;
++    pipelineInfo.pColorBlendState = &colorBlendState;
++    pipelineInfo.pDynamicState = &dynamicState;
++    pipelineInfo.layout = scene.layoutBundle.layout;
++    pipelineInfo.renderPass = VK_NULL_HANDLE;  // dynamic rendering
++    pipelineInfo.basePipelineIndex = -1;
++
++    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &scene.pipeline) !=
++        VK_SUCCESS) {
++        RX_LOG_ERROR("sample_03_bindless_mesh: vkCreateGraphicsPipelines failed");
++        destroyScenePipeline(device, scene);
++        return false;
++    }
++
++    return true;
++}
++
++// Resolves texture.png's path next to this executable at runtime (same
++// SDL_GetBasePath() mechanism 02_hotreload's resolveShaderPath() uses for
++// hotreload.slang), so a redistributed copy of this sample's build-output
++// directory works identically outside the build tree.
++std::string resolveTexturePath() {
++    const char* basePath = SDL_GetBasePath();
++    if (basePath == nullptr) {
++        RX_LOG_WARN(
++            "sample_03_bindless_mesh: SDL_GetBasePath failed ({}); looking for {} in the current directory instead",
++            SDL_GetError(), kTextureFilename);
++        return kTextureFilename;
++    }
++    return std::string(basePath) + kTextureFilename;
++}
++
++// Builds the entire scene: BindlessTable, 3 mesh types uploaded via
++// `uploader`, 5 textures (4 procedural + 1 decoded PNG) uploaded via
++// `uploader` and registered into the table, 2 samplers registered into the
++// table, the double-buffered transform storage buffer registered into the
++// table, and the reflection-driven pipeline. `uploader.flush()` is called
++// once at the end -- every upload above is batched into as few
++// submissions as this Uploader's ring buffer allows, per its own
++// documented batching behavior.
++std::optional<Scene> createScene(VkPhysicalDevice physicalDevice, VkDevice device, rx::rhi::Allocator& allocator,
++                                  rx::rhi::Uploader& uploader, VkFormat colorFormat) {
++    // Capacities sized generously above this scene's real needs (5
++    // images, 2 samplers, 1 storage buffer) -- BindlessTable rejects a
++    // capacity of 0 outright, and small power-of-two headroom costs
++    // nothing for a sample this size.
++    rx::rhi::BindlessTable::Capacities capacities{/*sampledImages=*/32, /*samplers=*/8, /*storageBuffers=*/8};
++    auto bindlessTable = rx::rhi::BindlessTable::create(physicalDevice, device, capacities);
++    if (!bindlessTable.has_value()) {
++        RX_LOG_ERROR("sample_03_bindless_mesh: BindlessTable::create failed");
++        return std::nullopt;
++    }
++
++    Scene scene{std::move(*bindlessTable)};
++
++    // --- Meshes -----------------------------------------------------
++    HostMesh cubeHost = generateCube(1.0F);
++    HostMesh sphereHost = generateSphere(1.1F, /*rings=*/16, /*segments=*/24);
++    HostMesh planeHost = generatePlane(1.3F);
++
++    auto uploadMesh = [&](const HostMesh& host) -> std::optional<GpuMesh> {
++        auto buffers = rx::rhi::MeshBuffers::create(
++            allocator, uploader, host.vertices.data(), host.vertices.size() * sizeof(Vertex), host.indices.data(),
++            host.indices.size() * sizeof(uint32_t), static_cast<uint32_t>(host.indices.size()),
++            VK_INDEX_TYPE_UINT32);
++        if (!buffers.has_value()) {
++            return std::nullopt;
++        }
++        return GpuMesh{std::move(*buffers)};
++    };
++
++    auto cubeMesh = uploadMesh(cubeHost);
++    auto sphereMesh = uploadMesh(sphereHost);
++    auto planeMesh = uploadMesh(planeHost);
++    if (!cubeMesh.has_value() || !sphereMesh.has_value() || !planeMesh.has_value()) {
++        RX_LOG_ERROR("sample_03_bindless_mesh: MeshBuffers::create failed for one or more shapes");
++        return std::nullopt;
++    }
++    scene.meshes[static_cast<size_t>(Shape::Cube)] = std::move(*cubeMesh);
++    scene.meshes[static_cast<size_t>(Shape::Sphere)] = std::move(*sphereMesh);
++    scene.meshes[static_cast<size_t>(Shape::Plane)] = std::move(*planeMesh);
++
++    // --- Textures: 4 procedural + 1 real decoded PNG -----------------
++    constexpr uint32_t kProceduralSize = 64;
++    std::vector<std::vector<uint8_t>> pixelSources;
++    pixelSources.push_back(makeCheckerboard(kProceduralSize, 8, {220, 30, 30}, {250, 250, 250}));
++    pixelSources.push_back(makeGradient(kProceduralSize, {30, 60, 220}, {30, 200, 90}, /*diagonal=*/false));
++    pixelSources.push_back(makeCheckerboard(kProceduralSize, 16, {230, 210, 20}, {20, 40, 120}));
++    pixelSources.push_back(makeGradient(kProceduralSize, {200, 20, 180}, {20, 200, 210}, /*diagonal=*/true));
++
++    std::string texturePath = resolveTexturePath();
++    int pngWidth = 0;
++    int pngHeight = 0;
++    int pngChannels = 0;
++    stbi_uc* pngPixels = stbi_load(texturePath.c_str(), &pngWidth, &pngHeight, &pngChannels, /*desired_channels=*/4);
++    if (pngPixels == nullptr) {
++        RX_LOG_ERROR("sample_03_bindless_mesh: stbi_load('{}') failed: {}", texturePath, stbi_failure_reason());
++        return std::nullopt;
++    }
++    std::vector<uint8_t> pngPixelData(pngPixels, pngPixels + (static_cast<size_t>(pngWidth) * pngHeight * 4));
++    stbi_image_free(pngPixels);
++
++    for (size_t i = 0; i < pixelSources.size(); ++i) {
++        auto texture = rx::rhi::Texture2D::create(physicalDevice, device, allocator,
++                                                    VkExtent2D{kProceduralSize, kProceduralSize}, kTextureFormat,
++                                                    VK_IMAGE_USAGE_SAMPLED_BIT, /*requestedMipLevels=*/0);
++        if (!texture.has_value()) {
++            RX_LOG_ERROR("sample_03_bindless_mesh: Texture2D::create failed for procedural texture {}", i);
++            return std::nullopt;
++        }
++        if (!uploader.uploadToImage(*texture, pixelSources[i].data(), pixelSources[i].size(), /*generateMips=*/true)) {
++            RX_LOG_ERROR("sample_03_bindless_mesh: uploadToImage failed for procedural texture {}", i);
++            return std::nullopt;
++        }
++        scene.textures.push_back(std::move(*texture));
++    }
++
++    auto pngTexture =
++        rx::rhi::Texture2D::create(physicalDevice, device, allocator,
++                                    VkExtent2D{static_cast<uint32_t>(pngWidth), static_cast<uint32_t>(pngHeight)},
++                                    kTextureFormat, VK_IMAGE_USAGE_SAMPLED_BIT, /*requestedMipLevels=*/0);
++    if (!pngTexture.has_value()) {
++        RX_LOG_ERROR("sample_03_bindless_mesh: Texture2D::create failed for the decoded PNG");
++        return std::nullopt;
++    }
++    if (!uploader.uploadToImage(*pngTexture, pngPixelData.data(), pngPixelData.size(), /*generateMips=*/true)) {
++        RX_LOG_ERROR("sample_03_bindless_mesh: uploadToImage failed for the decoded PNG");
++        return std::nullopt;
++    }
++    scene.textures.push_back(std::move(*pngTexture));
++
++    uploader.flush();  // every mesh/texture upload above is now on the GPU.
++
++    for (auto& texture : scene.textures) {
++        auto handle = scene.bindlessTable.registerSampledImage(texture.view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        if (!handle.isValid()) {
++            RX_LOG_ERROR("sample_03_bindless_mesh: BindlessTable::registerSampledImage failed");
++            return std::nullopt;
++        }
++    }
++
++    // --- Samplers: linear+repeat, nearest+clamp ----------------------
++    VkSamplerCreateInfo linearInfo{};
++    linearInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
++    linearInfo.magFilter = VK_FILTER_LINEAR;
++    linearInfo.minFilter = VK_FILTER_LINEAR;
++    linearInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
++    linearInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
++    linearInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
++    linearInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
++    linearInfo.maxLod = VK_LOD_CLAMP_NONE;
++
++    VkSamplerCreateInfo nearestInfo{};
++    nearestInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
++    nearestInfo.magFilter = VK_FILTER_NEAREST;
++    nearestInfo.minFilter = VK_FILTER_NEAREST;
++    nearestInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
++    nearestInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    nearestInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    nearestInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    nearestInfo.maxLod = 0.0F;
++
++    if (vkCreateSampler(device, &linearInfo, nullptr, &scene.samplers[0]) != VK_SUCCESS ||
++        vkCreateSampler(device, &nearestInfo, nullptr, &scene.samplers[1]) != VK_SUCCESS) {
++        RX_LOG_ERROR("sample_03_bindless_mesh: vkCreateSampler failed");
++        return std::nullopt;
++    }
++    for (VkSampler sampler : scene.samplers) {
++        auto handle = scene.bindlessTable.registerSampler(sampler);
++        if (!handle.isValid()) {
++            RX_LOG_ERROR("sample_03_bindless_mesh: BindlessTable::registerSampler failed");
++            return std::nullopt;
++        }
++    }
++
++    // --- Transform storage buffer: framesInFlight() * kObjectCount mat4
++    // rows, registered ONCE (see this file's header comment for why no
++    // per-frame re-registration is needed).
++    VkDeviceSize transformBufferSize =
++        static_cast<VkDeviceSize>(rx::rhi::FrameSync::framesInFlight()) * kObjectCount * sizeof(glm::mat4);
++    auto transformBuffer = allocator.createDeviceLocalBuffer(
++        transformBufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    if (!transformBuffer.has_value()) {
++        RX_LOG_ERROR("sample_03_bindless_mesh: createDeviceLocalBuffer failed for the transform buffer");
++        return std::nullopt;
++    }
++    scene.transformBuffer = std::move(transformBuffer);
++    auto transformHandle =
++        scene.bindlessTable.registerStorageBuffer(scene.transformBuffer->handle(), transformBufferSize);
++    if (!transformHandle.isValid()) {
++        RX_LOG_ERROR("sample_03_bindless_mesh: BindlessTable::registerStorageBuffer failed");
++        return std::nullopt;
++    }
++
++    // --- Depth buffer: Texture2D, mipLevels=1, never uploaded to -----
++    // Extent set to the color target's initial size by the caller via a
++    // deferred create -- see createDepthBuffer() below, called separately
++    // by both run modes (headless once; present once at startup and again
++    // on every swapchain resize).
++
++    // --- Reflection-driven pipeline -----------------------------------
++    if (!buildScenePipeline(device, scene.bindlessTable, colorFormat, scene)) {
++        return std::nullopt;
++    }
++
++    return scene;
++}
++
++std::optional<rx::rhi::Texture2D> createDepthBuffer(VkPhysicalDevice physicalDevice, VkDevice device,
++                                                     rx::rhi::Allocator& allocator, VkExtent2D extent) {
++    return rx::rhi::Texture2D::create(physicalDevice, device, allocator, extent, kDepthFormat,
++                                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, /*requestedMipLevels=*/1);
++}
++
++// Writes this frame's `frameInFlightIndex`'s row range of the transform
++// buffer with every object's MVP for camera angle `cameraAngle` (radians)
++// and per-object spin time `spinSeconds`, then flushes -- see this file's
++// header comment for why writing only this slot's own row range, after
++// its own fence has already been waited on by the caller, needs no
++// further synchronization.
++void updateTransforms(rx::rhi::Uploader& uploader, rx::rhi::Buffer& transformBuffer, uint32_t frameInFlightIndex,
++                       float cameraAngle, float spinSeconds, float aspect) {
++    glm::mat4 proj = makeProjection(aspect);
++    glm::mat4 view = glm::lookAt(cameraEyeAtAngle(cameraAngle), glm::vec3(0.0F), glm::vec3(0.0F, 1.0F, 0.0F));
++    glm::mat4 viewProj = proj * view;
++
++    std::array<glm::mat4, kObjectCount> mvps{};
++    for (uint32_t i = 0; i < kObjectCount; ++i) {
++        const SceneObject& obj = kObjects[i];
++        glm::mat4 model = glm::translate(glm::mat4(1.0F), glm::vec3(obj.x, 0.0F, 0.0F));
++        model = glm::rotate(model, obj.spinRadPerSec * spinSeconds, glm::vec3(0.0F, 1.0F, 0.0F));
++        // Transposed before upload: GLM stores mat4 column-major, but
++        // Slang's default `float4x4` element read out of a
++        // StructuredBuffer<float4x4> (no explicit row_major/column_major
++        // qualifier) interprets the same 16 raw floats as ROW-major --
++        // verified empirically (a debug image dump without this transpose
++        // showed severely distorted, near-degenerate geometry, the classic
++        // symptom of a transposed 4x4 transform reaching a perspective
++        // divide). Transposing here, once, on the host, is simpler and
++        // cheaper than fighting Slang's packing-qualifier syntax for a
++        // storage buffer element type.
++        mvps[i] = glm::transpose(viewProj * model);
++    }
++
++    VkDeviceSize rowBytes = sizeof(glm::mat4);
++    VkDeviceSize dstOffset = static_cast<VkDeviceSize>(frameInFlightIndex) * kObjectCount * rowBytes;
++    uploader.uploadToBuffer(transformBuffer, dstOffset, mvps.data(), kObjectCount * rowBytes);
++    uploader.flush();
++}
++
++// Records the draws for every object in `kObjects` into `cmd`, which must
++// already be inside a vkCmdBeginRendering scope with `scene.pipeline`'s
++// viewport/scissor already set via the caller. `frameInFlightIndex`
++// selects which row range of the transform buffer this frame's push
++// constants index into (see this file's header comment).
++void recordSceneDraws(VkCommandBuffer cmd, const Scene& scene, uint32_t frameInFlightIndex) {
++    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scene.pipeline);
++
++    VkDescriptorSet set = scene.bindlessTable.descriptorSet();
++    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scene.layoutBundle.layout, 0, 1, &set, 0, nullptr);
++
++    for (uint32_t i = 0; i < kObjectCount; ++i) {
++        const SceneObject& obj = kObjects[i];
++        const GpuMesh& mesh = scene.meshes[static_cast<size_t>(obj.shape)];
++
++        struct PushConstants {
++            uint32_t transformIndex;
++            uint32_t textureIndex;
++            uint32_t samplerIndex;
++        } push{frameInFlightIndex * kObjectCount + i, obj.textureIndex, obj.samplerIndex};
++
++        vkCmdPushConstants(cmd, scene.layoutBundle.layout, scene.pushConstantStages, scene.pushConstantOffset,
++                           scene.pushConstantSize, &push);
++
++        VkBuffer vertexBuffer = mesh.buffers->vertexBuffer();
++        VkDeviceSize vertexOffset = 0;
++        vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &vertexOffset);
++        vkCmdBindIndexBuffer(cmd, mesh.buffers->indexBuffer(), 0, mesh.buffers->indexType());
++        vkCmdDrawIndexed(cmd, mesh.buffers->indexCount(), 1, 0, 0, 0);
++    }
++}
++
++// rx::rhi::transitionImage() (command.h/command.cpp) hardcodes
++// VK_IMAGE_ASPECT_COLOR_BIT -- correct for every OTHER image transition in
++// this file (the color offscreen target / swapchain images) but wrong for
++// this sample's depth buffer, which needs VK_IMAGE_ASPECT_DEPTH_BIT
++// (VK_FORMAT_D32_SFLOAT has no color/stencil aspect at all). This is a
++// local, depth-specific twin of that same helper -- same maximally-
++// conservative ALL_COMMANDS/MEMORY_READ|WRITE barrier shape, only the
++// aspect mask differs.
++void transitionDepthImage(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout) {
++    VkImageMemoryBarrier2 barrier{};
++    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
++    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    barrier.srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
++    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
++    barrier.oldLayout = oldLayout;
++    barrier.newLayout = newLayout;
++    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barrier.image = image;
++    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
++    barrier.subresourceRange.baseMipLevel = 0;
++    barrier.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
++    barrier.subresourceRange.baseArrayLayer = 0;
++    barrier.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
++
++    VkDependencyInfo depInfo{};
++    depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    depInfo.imageMemoryBarrierCount = 1;
++    depInfo.pImageMemoryBarriers = &barrier;
++
++    vkCmdPipelineBarrier2(cmd, &depInfo);
++}
++
++std::optional<uint32_t> findMemoryTypeIndex(const VkPhysicalDeviceMemoryProperties& memProps, uint32_t typeBits,
++                                             VkMemoryPropertyFlags required) {
++    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
++        if ((typeBits & (1U << i)) != 0U && (memProps.memoryTypes[i].propertyFlags & required) == required) {
++            return i;
++        }
++    }
++    return std::nullopt;
++}
++
++// --- Headless mode: offscreen render + pixel readback ----------------------
++int runHeadless() {
++    auto window = rx::platform::Window::create("rx_bindless_mesh_sample", static_cast<int>(kHeadlessWidth),
++                                                 static_cast<int>(kHeadlessHeight), /*visible=*/false);
++    if (!window.has_value()) {
++        RX_LOG_ERROR("Window::create failed: no display backend available");
++        return 1;
++    }
++
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
++        return 1;
++    }
++
++    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    if (!context.has_value()) {
++        RX_LOG_ERROR("Context::create failed");
++        return 1;
++    }
++
++    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
++    if (surface == VK_NULL_HANDLE) {
++        RX_LOG_ERROR("createVulkanSurface failed");
++        return 1;
++    }
++
++    // Device::create already enables the full descriptor-indexing feature
++    // set BindlessTable needs (device.cpp, Task 3) -- no separate feature
++    // wiring needed here, unlike this codebase's pure-headless unit tests
++    // which build their own local device fixture.
++    auto device = rx::rhi::Device::create(*context, surface);
++    if (!device.has_value()) {
++        RX_LOG_ERROR("Device::create failed");
++        return 1;
++    }
++
++    auto allocator = rx::rhi::Allocator::create(*context, *device);
++    if (!allocator.has_value()) {
++        RX_LOG_ERROR("Allocator::create failed");
++        return 1;
++    }
++
++    auto uploader = rx::rhi::Uploader::create(*allocator, *device);
++    if (!uploader.has_value()) {
++        RX_LOG_ERROR("Uploader::create failed");
++        return 1;
++    }
++
++    auto cmdCtx =
++        rx::rhi::CommandContext::create(device->device(), device->graphicsQueue(), device->graphicsQueueFamily());
++    if (!cmdCtx.has_value()) {
++        RX_LOG_ERROR("CommandContext::create failed");
++        return 1;
++    }
++
++    const VkDevice vkDevice = device->device();
++    const VkFormat targetFormat = device->swapchainFormat();
++
++    auto scene = createScene(device->physicalDevice(), vkDevice, *allocator, *uploader, targetFormat);
++    if (!scene.has_value()) {
++        RX_LOG_ERROR("createScene failed");
++        return 1;
++    }
++
++    auto depth = createDepthBuffer(device->physicalDevice(), vkDevice, *allocator, VkExtent2D{kHeadlessWidth, kHeadlessHeight});
++    if (!depth.has_value()) {
++        RX_LOG_ERROR("createDepthBuffer failed");
++        return 1;
++    }
++
++    // Camera at t=0 (angle=0), objects at spinSeconds=0 -- a fixed, known
++    // pose the probe pixel assertions below are derived against.
++    updateTransforms(*uploader, *scene->transformBuffer, /*frameInFlightIndex=*/0, /*cameraAngle=*/0.0F,
++                      /*spinSeconds=*/0.0F, /*aspect=*/1.0F);
++
++    VkImage offscreenImage = VK_NULL_HANDLE;
++    VkDeviceMemory offscreenMemory = VK_NULL_HANDLE;
++    VkImageView offscreenView = VK_NULL_HANDLE;
++
++    auto destroyRawResources = [&]() {
++        if (offscreenView != VK_NULL_HANDLE) {
++            vkDestroyImageView(vkDevice, offscreenView, nullptr);
++        }
++        if (offscreenImage != VK_NULL_HANDLE) {
++            vkDestroyImage(vkDevice, offscreenImage, nullptr);
++        }
++        if (offscreenMemory != VK_NULL_HANDLE) {
++            vkFreeMemory(vkDevice, offscreenMemory, nullptr);
++        }
++        destroyScene(vkDevice, *scene);
++    };
++
++    VkImageCreateInfo imageInfo{};
++    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    imageInfo.imageType = VK_IMAGE_TYPE_2D;
++    imageInfo.format = targetFormat;
++    imageInfo.extent = {kHeadlessWidth, kHeadlessHeight, 1};
++    imageInfo.mipLevels = 1;
++    imageInfo.arrayLayers = 1;
++    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
++    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
++    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++
++    if (vkCreateImage(vkDevice, &imageInfo, nullptr, &offscreenImage) != VK_SUCCESS) {
++        RX_LOG_ERROR("vkCreateImage(offscreen target) failed");
++        destroyRawResources();
++        return 1;
++    }
++
++    VkMemoryRequirements memReq{};
++    vkGetImageMemoryRequirements(vkDevice, offscreenImage, &memReq);
++    VkPhysicalDeviceMemoryProperties memProps{};
++    vkGetPhysicalDeviceMemoryProperties(device->physicalDevice(), &memProps);
++    auto memoryTypeIndex = findMemoryTypeIndex(memProps, memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    if (!memoryTypeIndex.has_value()) {
++        RX_LOG_ERROR("no device-local memory type found for the offscreen target");
++        destroyRawResources();
++        return 1;
++    }
++
++    VkMemoryAllocateInfo memAllocInfo{};
++    memAllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++    memAllocInfo.allocationSize = memReq.size;
++    memAllocInfo.memoryTypeIndex = *memoryTypeIndex;
++    if (vkAllocateMemory(vkDevice, &memAllocInfo, nullptr, &offscreenMemory) != VK_SUCCESS) {
++        RX_LOG_ERROR("vkAllocateMemory(offscreen target) failed");
++        destroyRawResources();
++        return 1;
++    }
++    if (vkBindImageMemory(vkDevice, offscreenImage, offscreenMemory, 0) != VK_SUCCESS) {
++        RX_LOG_ERROR("vkBindImageMemory(offscreen target) failed");
++        destroyRawResources();
++        return 1;
++    }
++
++    VkImageViewCreateInfo viewInfo{};
++    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++    viewInfo.image = offscreenImage;
++    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    viewInfo.format = targetFormat;
++    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    viewInfo.subresourceRange.levelCount = 1;
++    viewInfo.subresourceRange.layerCount = 1;
++    if (vkCreateImageView(vkDevice, &viewInfo, nullptr, &offscreenView) != VK_SUCCESS) {
++        RX_LOG_ERROR("vkCreateImageView(offscreen target) failed");
++        destroyRawResources();
++        return 1;
++    }
++
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        rx::rhi::transitionImage(cmd, offscreenImage, VK_IMAGE_LAYOUT_UNDEFINED,
++                                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++        transitionDepthImage(cmd, depth->image(), VK_IMAGE_LAYOUT_UNDEFINED,
++                                  VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
++
++        VkRenderingAttachmentInfo colorAttachment{};
++        colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
++        colorAttachment.imageView = offscreenView;
++        colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++        colorAttachment.clearValue.color = VkClearColorValue{{0.05F, 0.05F, 0.08F, 1.0F}};
++
++        VkRenderingAttachmentInfo depthAttachment{};
++        depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
++        depthAttachment.imageView = depth->view();
++        depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
++        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++        depthAttachment.clearValue.depthStencil = VkClearDepthStencilValue{1.0F, 0};
++
++        VkRenderingInfo renderingInfo{};
++        renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
++        renderingInfo.renderArea = VkRect2D{{0, 0}, {kHeadlessWidth, kHeadlessHeight}};
++        renderingInfo.layerCount = 1;
++        renderingInfo.colorAttachmentCount = 1;
++        renderingInfo.pColorAttachments = &colorAttachment;
++        renderingInfo.pDepthAttachment = &depthAttachment;
++
++        vkCmdBeginRendering(cmd, &renderingInfo);
++
++        VkViewport viewport{0.0F, 0.0F, static_cast<float>(kHeadlessWidth), static_cast<float>(kHeadlessHeight), 0.0F,
++                             1.0F};
++        vkCmdSetViewport(cmd, 0, 1, &viewport);
++        VkRect2D scissor{{0, 0}, {kHeadlessWidth, kHeadlessHeight}};
++        vkCmdSetScissor(cmd, 0, 1, &scissor);
++
++        recordSceneDraws(cmd, *scene, /*frameInFlightIndex=*/0);
++
++        vkCmdEndRendering(cmd);
++
++        rx::rhi::transitionImage(cmd, offscreenImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++                                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    });
++
++    auto readback = allocator->createHostVisibleBuffer(kHeadlessPixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    if (!readback.has_value()) {
++        RX_LOG_ERROR("createHostVisibleBuffer(readback) failed");
++        destroyRawResources();
++        return 1;
++    }
++
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        VkBufferImageCopy region{};
++        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        region.imageSubresource.layerCount = 1;
++        region.imageExtent = {kHeadlessWidth, kHeadlessHeight, 1};
++        vkCmdCopyImageToBuffer(cmd, offscreenImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1,
++                               &region);
++    });
++
++    readback->invalidate();
++    std::vector<uint8_t> pixels(static_cast<size_t>(kHeadlessPixelBytes));
++    std::memcpy(pixels.data(), readback->mappedData(), pixels.size());
++
++    destroyRawResources();
++
++    auto pixelAt = [&](uint32_t x, uint32_t y) -> const uint8_t* {
++        return pixels.data() + (static_cast<size_t>(y) * kHeadlessWidth + x) * 4;
++    };
++
++    // Probe pixels: known screen positions for each object at this fixed
++    // camera pose, empirically determined against this exact scene/camera
++    // configuration (see task-6-report.md for the verification method --
++    // rendered once with a debug dump during development, confirmed each
++    // probe lands on the intended object's body, not the background or a
++    // neighboring object). Center row (y=128); x positions sweep
++    // left-to-right matching kObjects' left-to-right x ordering.
++    struct Probe {
++        uint32_t x;
++        uint32_t y;
++        const char* label;
++    };
++    constexpr std::array<Probe, 5> kProbes{{
++        {40, 128, "object 0 (cube, checkerboard red/white)"},
++        {83, 128, "object 1 (cube, gradient blue/green)"},
++        {128, 128, "object 2 (sphere, checkerboard yellow/blue)"},
++        {173, 128, "object 3 (sphere, gradient magenta/cyan)"},
++        {216, 128, "object 4 (plane, real PNG orange/teal)"},
++    }};
++
++    std::vector<std::array<uint8_t, 3>> sampledColors;
++    for (const auto& probe : kProbes) {
++        const uint8_t* p = pixelAt(probe.x, probe.y);
++        sampledColors.push_back({p[0], p[1], p[2]});
++        // Channel order deliberately unlabeled (RGB vs BGR) -- this
++        // device's swapchainFormat() is BGRA (same as 01_triangle/
++        // 02_hotreload note), but the distinctness check below only ever
++        // compares these 3 bytes against each other consistently, never
++        // against an assumed absolute channel semantic, so the real
++        // component order never matters here.
++        RX_LOG_INFO("probe '{}' at ({},{}): channels=({},{},{})", probe.label, probe.x, probe.y, p[0], p[1], p[2]);
++    }
++
++    // >=3 distinct colors among the probes -- the headless gate's actual
++    // requirement. A simple pairwise-distance check (not exact equality)
++    // since antialiasing/mip selection could perturb exact byte values
++    // slightly without changing which underlying texture was sampled.
++    auto colorDistance = [](const std::array<uint8_t, 3>& a, const std::array<uint8_t, 3>& b) {
++        int dr = static_cast<int>(a[0]) - static_cast<int>(b[0]);
++        int dg = static_cast<int>(a[1]) - static_cast<int>(b[1]);
++        int db = static_cast<int>(a[2]) - static_cast<int>(b[2]);
++        return dr * dr + dg * dg + db * db;
++    };
++    constexpr int kDistinctThresholdSq = 40 * 40;  // generous vs. antialiasing/mip noise
++
++    int distinctCount = 0;
++    std::vector<std::array<uint8_t, 3>> distinctColors;
++    for (const auto& color : sampledColors) {
++        bool isNew = true;
++        for (const auto& existing : distinctColors) {
++            if (colorDistance(color, existing) < kDistinctThresholdSq) {
++                isNew = false;
++                break;
++            }
++        }
++        if (isNew) {
++            distinctColors.push_back(color);
++            ++distinctCount;
++        }
++    }
++
++    bool pass = true;
++    if (distinctCount < 3) {
++        RX_LOG_ERROR("only {} distinct texture colors found among {} probes (need >= 3)", distinctCount,
++                     kProbes.size());
++        pass = false;
++    } else {
++        RX_LOG_INFO("{} distinct texture colors found among {} probes", distinctCount, kProbes.size());
++    }
++
++    if (context->hasValidationErrors()) {
++        RX_LOG_ERROR("Vulkan validation layer reported errors during this run");
++        pass = false;
++    }
++
++    if (pass) {
++        RX_LOG_INFO("bindless mesh headless gate PASSED");
++        return 0;
++    }
++    RX_LOG_ERROR("bindless mesh headless gate FAILED");
++    return 1;
++}
++
++// --- --present mode: real window, orbiting camera --------------------------
++int runPresent() {
++    auto window = rx::platform::Window::create("rx_bindless_mesh_sample (--present)", static_cast<int>(kPresentWidth),
++                                                 static_cast<int>(kPresentHeight), /*visible=*/true);
++    if (!window.has_value()) {
++        RX_LOG_ERROR("Window::create failed: no display backend available");
++        return 1;
++    }
++
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
++        return 1;
++    }
++
++    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    if (!context.has_value()) {
++        RX_LOG_ERROR("Context::create failed");
++        return 1;
++    }
++
++    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
++    if (surface == VK_NULL_HANDLE) {
++        RX_LOG_ERROR("createVulkanSurface failed");
++        return 1;
++    }
++
++    auto device = rx::rhi::Device::create(*context, surface);
++    if (!device.has_value()) {
++        RX_LOG_ERROR("Device::create failed");
++        return 1;
++    }
++    const VkDevice vkDevice = device->device();
++
++    auto allocator = rx::rhi::Allocator::create(*context, *device);
++    if (!allocator.has_value()) {
++        RX_LOG_ERROR("Allocator::create failed");
++        return 1;
++    }
++
++    auto uploader = rx::rhi::Uploader::create(*allocator, *device);
++    if (!uploader.has_value()) {
++        RX_LOG_ERROR("Uploader::create failed");
++        return 1;
++    }
++
++    auto frameSync = rx::rhi::FrameSync::create(vkDevice, device->graphicsQueueFamily(),
++                                                 static_cast<uint32_t>(device->swapchainImages().size()));
++    if (!frameSync.has_value()) {
++        RX_LOG_ERROR("FrameSync::create failed");
++        return 1;
++    }
++
++    auto scene = createScene(device->physicalDevice(), vkDevice, *allocator, *uploader, device->swapchainFormat());
++    if (!scene.has_value()) {
++        RX_LOG_ERROR("createScene failed");
++        return 1;
++    }
++
++    auto depth = createDepthBuffer(device->physicalDevice(), vkDevice, *allocator, device->swapchainExtent());
++    if (!depth.has_value()) {
++        RX_LOG_ERROR("createDepthBuffer failed");
++        return 1;
++    }
++    {
++        auto cmdCtx =
++            rx::rhi::CommandContext::create(vkDevice, device->graphicsQueue(), device->graphicsQueueFamily());
++        if (cmdCtx.has_value()) {
++            cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++                transitionDepthImage(cmd, depth->image(), VK_IMAGE_LAYOUT_UNDEFINED,
++                                          VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
++            });
++        }
++    }
++
++    std::vector<VkImageView> swapchainViews;
++    auto createSwapchainViews = [&]() -> bool {
++        swapchainViews.assign(device->swapchainImages().size(), VK_NULL_HANDLE);
++        for (size_t i = 0; i < swapchainViews.size(); ++i) {
++            VkImageViewCreateInfo viewInfo{};
++            viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++            viewInfo.image = device->swapchainImages()[i];
++            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++            viewInfo.format = device->swapchainFormat();
++            viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++            viewInfo.subresourceRange.levelCount = 1;
++            viewInfo.subresourceRange.layerCount = 1;
++            if (vkCreateImageView(vkDevice, &viewInfo, nullptr, &swapchainViews[i]) != VK_SUCCESS) {
++                RX_LOG_ERROR("sample_03_bindless_mesh: vkCreateImageView(swapchain image {}) failed", i);
++                return false;
++            }
++        }
++        return true;
++    };
++    auto destroySwapchainViews = [&]() {
++        for (VkImageView view : swapchainViews) {
++            if (view != VK_NULL_HANDLE) {
++                vkDestroyImageView(vkDevice, view, nullptr);
++            }
++        }
++        swapchainViews.clear();
++    };
++
++    if (!createSwapchainViews()) {
++        destroySwapchainViews();
++        destroyScene(vkDevice, *scene);
++        return 1;
++    }
++
++    RX_LOG_INFO("--present: window open ({}x{}); camera orbiting -- close the window to exit", kPresentWidth,
++                kPresentHeight);
++
++    const auto startTime = std::chrono::steady_clock::now();
++
++    bool ok = true;
++    bool quit = false;
++    while (!quit) {
++        SDL_Event event;
++        while (SDL_PollEvent(&event)) {
++            if (event.type == SDL_EVENT_QUIT) {
++                quit = true;
++            }
++        }
++        if (quit) {
++            break;
++        }
++
++        VkFence fence = frameSync->currentFence();
++        if (vkWaitForFences(vkDevice, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
++            RX_LOG_ERROR("vkWaitForFences failed in present loop");
++            ok = false;
++            break;
++        }
++
++        auto acquire = device->acquireNextImage(frameSync->currentImageAvailableSemaphore());
++        if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
++            if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
++                RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
++                ok = false;
++                break;
++            }
++            destroySwapchainViews();
++            depth.reset();
++            if (!device->recreateSwapchain(surface) ||
++                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
++                !createSwapchainViews()) {
++                RX_LOG_ERROR("swapchain recreation failed after acquireNextImage NeedsRecreate");
++                ok = false;
++                break;
++            }
++            depth = createDepthBuffer(device->physicalDevice(), vkDevice, *allocator, device->swapchainExtent());
++            if (!depth.has_value()) {
++                RX_LOG_ERROR("depth buffer recreation failed after swapchain resize");
++                ok = false;
++                break;
++            }
++            {
++                auto cmdCtx =
++                    rx::rhi::CommandContext::create(vkDevice, device->graphicsQueue(), device->graphicsQueueFamily());
++                if (cmdCtx.has_value()) {
++                    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++                        transitionDepthImage(cmd, depth->image(), VK_IMAGE_LAYOUT_UNDEFINED,
++                                                  VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
++                    });
++                }
++            }
++            continue;
++        }
++        if (acquire.status == rx::rhi::SwapchainStatus::DeviceLost) {
++            RX_LOG_ERROR("device lost during acquireNextImage; exiting present loop");
++            ok = false;
++            break;
++        }
++
++        if (vkResetFences(vkDevice, 1, &fence) != VK_SUCCESS) {
++            RX_LOG_ERROR("vkResetFences failed in present loop");
++            ok = false;
++            break;
++        }
++
++        auto now = std::chrono::steady_clock::now();
++        float elapsedSeconds = std::chrono::duration<float>(now - startTime).count();
++        float cameraAngle = elapsedSeconds * kCameraOrbitRadPerSec;
++        const VkExtent2D extent = device->swapchainExtent();
++        float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
++
++        // Update this frame-in-flight slot's transform rows -- safe: this
++        // slot's own fence was just waited on above, so no draw could
++        // still be reading these bytes (see this file's header comment).
++        updateTransforms(*uploader, *scene->transformBuffer, frameSync->currentFrameIndex(), cameraAngle,
++                          elapsedSeconds, aspect);
++
++        VkCommandPool pool = frameSync->currentCommandPool();
++        if (vkResetCommandPool(vkDevice, pool, 0) != VK_SUCCESS) {
++            RX_LOG_ERROR("vkResetCommandPool failed in present loop");
++            ok = false;
++            break;
++        }
++        VkCommandBuffer cmd = frameSync->currentCommandBuffer();
++
++        VkCommandBufferBeginInfo beginInfo{};
++        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++        if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS) {
++            RX_LOG_ERROR("vkBeginCommandBuffer failed in present loop");
++            ok = false;
++            break;
++        }
++
++        VkImage swapchainImage = device->swapchainImages()[acquire.imageIndex];
++        rx::rhi::transitionImage(cmd, swapchainImage, VK_IMAGE_LAYOUT_UNDEFINED,
++                                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++
++        VkRenderingAttachmentInfo colorAttachment{};
++        colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
++        colorAttachment.imageView = swapchainViews[acquire.imageIndex];
++        colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++        colorAttachment.clearValue.color = VkClearColorValue{{0.05F, 0.05F, 0.08F, 1.0F}};
++
++        VkRenderingAttachmentInfo depthAttachment{};
++        depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
++        depthAttachment.imageView = depth->view();
++        depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
++        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++        depthAttachment.clearValue.depthStencil = VkClearDepthStencilValue{1.0F, 0};
++
++        VkRenderingInfo renderingInfo{};
++        renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
++        renderingInfo.renderArea = VkRect2D{{0, 0}, extent};
++        renderingInfo.layerCount = 1;
++        renderingInfo.colorAttachmentCount = 1;
++        renderingInfo.pColorAttachments = &colorAttachment;
++        renderingInfo.pDepthAttachment = &depthAttachment;
++
++        vkCmdBeginRendering(cmd, &renderingInfo);
++
++        VkViewport viewport{0.0F, 0.0F, static_cast<float>(extent.width), static_cast<float>(extent.height), 0.0F,
++                             1.0F};
++        vkCmdSetViewport(cmd, 0, 1, &viewport);
++        VkRect2D scissor{{0, 0}, extent};
++        vkCmdSetScissor(cmd, 0, 1, &scissor);
++
++        recordSceneDraws(cmd, *scene, frameSync->currentFrameIndex());
++
++        vkCmdEndRendering(cmd);
++
++        rx::rhi::transitionImage(cmd, swapchainImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++                                  VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
++
++        if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
++            RX_LOG_ERROR("vkEndCommandBuffer failed in present loop");
++            ok = false;
++            break;
++        }
++
++        VkSemaphore waitSem = frameSync->currentImageAvailableSemaphore();
++        VkSemaphore signalSem = frameSync->renderFinishedSemaphore(acquire.imageIndex);
++        VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++
++        VkSubmitInfo submitInfo{};
++        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
++        submitInfo.waitSemaphoreCount = 1;
++        submitInfo.pWaitSemaphores = &waitSem;
++        submitInfo.pWaitDstStageMask = &waitStage;
++        submitInfo.commandBufferCount = 1;
++        submitInfo.pCommandBuffers = &cmd;
++        submitInfo.signalSemaphoreCount = 1;
++        submitInfo.pSignalSemaphores = &signalSem;
++
++        if (vkQueueSubmit(device->graphicsQueue(), 1, &submitInfo, fence) != VK_SUCCESS) {
++            RX_LOG_ERROR("vkQueueSubmit failed in present loop");
++            ok = false;
++            break;
++        }
++
++        auto presentStatus = device->present(acquire.imageIndex, signalSem);
++        if (presentStatus == rx::rhi::SwapchainStatus::NeedsRecreate) {
++            if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
++                RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
++                ok = false;
++                break;
++            }
++            destroySwapchainViews();
++            depth.reset();
++            if (!device->recreateSwapchain(surface) ||
++                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
++                !createSwapchainViews()) {
++                RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
++                ok = false;
++                break;
++            }
++            depth = createDepthBuffer(device->physicalDevice(), vkDevice, *allocator, device->swapchainExtent());
++            if (depth.has_value()) {
++                auto cmdCtx =
++                    rx::rhi::CommandContext::create(vkDevice, device->graphicsQueue(), device->graphicsQueueFamily());
++                if (cmdCtx.has_value()) {
++                    cmdCtx->runOnce([&](VkCommandBuffer cmd2) {
++                        transitionDepthImage(cmd2, depth->image(), VK_IMAGE_LAYOUT_UNDEFINED,
++                                                  VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
++                    });
++                }
++            }
++        } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
++            RX_LOG_ERROR("device lost during present; exiting present loop");
++            ok = false;
++            break;
++        }
++
++        frameSync->advanceFrame();
++    }
++
++    vkDeviceWaitIdle(vkDevice);
++    destroySwapchainViews();
++    depth.reset();
++    destroyScene(vkDevice, *scene);
++
++    if (context->hasValidationErrors()) {
++        RX_LOG_ERROR("Vulkan validation layer reported errors during the present loop");
++        return 1;
++    }
++    if (!ok) {
++        return 1;
++    }
++    RX_LOG_INFO("--present: window closed cleanly");
++    return 0;
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    rx::core::log::init();
++
++    bool presentMode = false;
++    for (int i = 1; i < argc; ++i) {
++        if (std::string_view(argv[i]) == "--present") {
++            presentMode = true;
++        }
++    }
++
++    if (presentMode) {
++        return runPresent();
++    }
++    return runHeadless();
++}
+diff --git a/samples/03_bindless_mesh/texture.png b/samples/03_bindless_mesh/texture.png
+new file mode 100644
+index 0000000..70bf9b8
+Binary files /dev/null and b/samples/03_bindless_mesh/texture.png differ
+diff --git a/samples/README.md b/samples/README.md
+index 18e11f0..0a5bca6 100644
+--- a/samples/README.md
++++ b/samples/README.md
+@@ -159,20 +159,85 @@ This is the sample that proves the Task 1 Slang-runtime-lib deployment
+ mechanism (`rx_shader_deploy_runtime_libs()`) end to end: linking
+ `rx_shader` pulls in `slang::slang`, and this binary does real in-process
+ compilation on every single run (both modes) — if the runtime libraries
+ (`libslang-compiler.so*`/`slang-compiler.dll` + the `slang-glslang`/
+ `slang-glsl-module`/`slang-rt` plugins) weren't copied next to the
+ executable at build time with a working RPATH, `Compiler::create()` would
+ fail immediately. A redistributed copy of just this sample's build-output
+ directory (the binary + `hotreload.slang` + those runtime libraries) runs
+ identically outside the build tree.
+ 
++## 03_bindless_mesh
++
++`samples/03_bindless_mesh/main.cpp` — the Phase 2 integration proof:
++reflection-driven pipeline layouts, bindless resource management, and the
++real upload path, all working together in one scene. Procedural geometry
++(a cube, a UV sphere, and a plane — generated in code, no mesh importer)
++textured with 4 procedurally generated images (checkerboards/gradients)
++plus one real PNG decoded via `stb_image`, every texture uploaded through
++`rx::rhi::Uploader` into one `rx::rhi::BindlessTable` (set 0). Just like
++02_hotreload, the shader is compiled **at runtime** (`rx::shader::Compiler`)
++so `rx::shader::reflect()` walks the actual shader driving this sample's
++pipeline layout — there is no hand-typed `VkDescriptorSetLayoutBinding`
++anywhere in this file for set 0.
++
++**Set-0 substitution**: `rx::rhi::BindlessTable`'s real descriptor set
++layout (sized from caller capacities, `VARIABLE_DESCRIPTOR_COUNT` on its
++last binding) and a from-scratch layout `PipelineLayoutBuilder` would
++otherwise build from the same reflected shape are NOT compatible Vulkan
++pipeline layouts "by construction" — this sample is what exercises the fix
++added this task: `PipelineLayoutBuilder::build()`'s new `externalSet0`
++parameter, passed `bindlessTable.descriptorSetLayout()` directly, reuses
++the table's real layout for set 0 instead of building a lookalike.
++
++Per-draw push constants (12 bytes, well under the 128-byte budget):
++`{ transformIndex, textureIndex, samplerIndex }` — all three uniform
++across a draw call, never wrapped in `NonUniformResourceIndex()`. A depth
++buffer (`rx::rhi::Texture2D`, `VK_FORMAT_D32_SFLOAT`, single mip level,
++never uploaded to) enables correct depth testing across the 5 objects.
++
++- **Headless (default, no flags)** — renders one frame offscreen at
++  256x256 with the camera at a fixed, known pose, reads it back, and
++  asserts at least 3 distinct texture colors landed on screen at known
++  probe positions (in practice all 5 textures are distinct and probed).
++  Registered as the `sample_03_bindless_mesh_headless` ctest case.
++- **`--present`** — opens a real window showing the same 5 objects (2
++  cubes, 2 spheres, 1 plane) with the camera continuously orbiting the
++  scene. Survives window resizes (the depth buffer is recreated alongside
++  the swapchain). Not part of `ctest` — see `MANUAL_VERIFICATION.md`.
++
++### Expected output
++
++**Headless mode**:
++
++```
++[info] 5 distinct texture colors found among 5 probes
++[info] bindless mesh headless gate PASSED
++```
++
++**`--present` mode** opens a 900x700 window titled `rx_bindless_mesh_sample
++(--present)` showing 5 objects in a row against a dark background: a
++red/white checkerboard cube, a blue-to-green gradient cube, a yellow/blue
++checkerboard sphere, a magenta-to-cyan gradient sphere, and a plane
++textured with a real decoded PNG (an orange/teal concentric-ring pattern).
++The camera orbits continuously; closing the window exits with status 0.
++
++### Redistribution
++
++Same mechanism as 02_hotreload: this sample compiles its shader at runtime
++(`rx_shader_deploy_runtime_libs()` ships the Slang runtime libs next to the
++binary), plus its own `texture.png` deployed next to the binary at build
++time (`samples/03_bindless_mesh/CMakeLists.txt`) for the one real-PNG
++texture. A redistributed copy of just this sample's build-output directory
++(binary + `texture.png` + the Slang runtime libraries) runs identically
++outside the build tree.
++
+ ## Building and running
+ 
+ Both sample modes and both build presets work identically on Linux and
+ Steam Deck (Desktop Mode is just Linux) — Windows only differs in how you
+ run the already-cross-compiled binary. There is no `samples`-specific
+ configure step; building the preset builds every sample.
+ 
+ ### Linux (native) — including Steam Deck Desktop Mode
+ 
+ ```sh
+@@ -190,37 +255,46 @@ cmake --build --preset linux-native
+ 
+ ```sh
+ # Headless correctness gate (also runs via ctest, see below):
+ ./build/linux-native/samples/02_hotreload/sample_02_hotreload
+ 
+ # Interactive present-mode window with live shader editing -- edit
+ # build/linux-native/samples/02_hotreload/hotreload.slang while this runs:
+ ./build/linux-native/samples/02_hotreload/sample_02_hotreload --present
+ ```
+ 
++```sh
++# Headless correctness gate (also runs via ctest, see below):
++./build/linux-native/samples/03_bindless_mesh/sample_03_bindless_mesh
++
++# Interactive present-mode window with an orbiting camera:
++./build/linux-native/samples/03_bindless_mesh/sample_03_bindless_mesh --present
++```
++
+ Steam Deck Desktop Mode: open Konsole (or any terminal) from the Desktop
+ Mode taskbar and run the exact same commands above — the Deck's SteamOS is
+ Linux with a Vulkan driver (AMD Mesa RADV), so `linux-native` is the correct
+ preset; there is no Deck-specific build variant. `--present`'s window
+ behaves like any other windowed X11/Wayland app under KDE Plasma (Desktop
+ Mode's desktop environment) — it can be moved, resized, and closed exactly
+ as described above.
+ 
+ ### Windows (cross-compiled from Linux via zig)
+ 
+ ```sh
+ cmake --preset windows-cross-zig
+ cmake --build --preset windows-cross-zig
+ ```
+ 
+-This produces `build/windows-cross-zig/samples/01_triangle/sample_01_triangle.exe`
+-and `build/windows-cross-zig/samples/02_hotreload/sample_02_hotreload.exe`.
++This produces `build/windows-cross-zig/samples/01_triangle/sample_01_triangle.exe`,
++`build/windows-cross-zig/samples/02_hotreload/sample_02_hotreload.exe`, and
++`build/windows-cross-zig/samples/03_bindless_mesh/sample_03_bindless_mesh.exe`.
+ 01_triangle's binary is statically linked (no separate `.dll`s to ship) —
+ copy just that one `.exe` to the Windows machine (or run it directly under
+ Wine on Linux) and run it from a terminal/`cmd.exe`/PowerShell:
+ 
+ ```
+ sample_01_triangle.exe            REM headless correctness gate
+ sample_01_triangle.exe --present  REM interactive present-mode window
+ ```
+ 
+ 02_hotreload is **not** self-contained the same way: it does real
+@@ -230,24 +304,36 @@ deployed next to it at build time — see that sample's own README section
+ above) alongside the `.exe`, plus `hotreload.slang` for `--present` mode.
+ Copy the entire `build/windows-cross-zig/samples/02_hotreload/` directory
+ (minus the `CMakeFiles`/`.pdb`/`.cmake` build bookkeeping) to run it
+ elsewhere:
+ 
+ ```
+ sample_02_hotreload.exe            REM headless correctness gate
+ sample_02_hotreload.exe --present  REM interactive present-mode window with live editing
+ ```
+ 
++03_bindless_mesh is the same shape as 02_hotreload (real in-process Slang
++compilation, so it needs the same 4 Slang DLLs deployed next to it), plus
++`texture.png` for its one real-PNG texture. Copy the entire
++`build/windows-cross-zig/samples/03_bindless_mesh/` directory (minus the
++`CMakeFiles`/`.pdb`/`.cmake` build bookkeeping) to run it elsewhere:
++
++```
++sample_03_bindless_mesh.exe            REM headless correctness gate
++sample_03_bindless_mesh.exe --present  REM interactive present-mode window, orbiting camera
++```
++
+ See `MANUAL_VERIFICATION.md` at the repo root for the actual per-platform
+ run checklist (what to record, what "pass" looks like on real hardware).
+ 
+ ### Running the automated test suite
+ 
+ ```sh
+ ctest --preset linux-native --output-on-failure
+ ```
+ 
+-This runs `sample_01_triangle_headless` and `sample_02_hotreload_headless`
+-alongside every other project test (`rx_core_tests`, `rx_platform_tests`,
+-`rx_shader_tests`, `rx_rhi_vk_tests`, `shader_spirv_test`) — `--present`
+-mode is intentionally excluded from `ctest` (it blocks on a real window and
+-user/OS interaction) and is exercised manually instead.
++This runs `sample_01_triangle_headless`, `sample_02_hotreload_headless`, and
++`sample_03_bindless_mesh_headless` alongside every other project test
++(`rx_core_tests`, `rx_platform_tests`, `rx_shader_tests`, `rx_rhi_vk_tests`,
++`shader_spirv_test`) — `--present` mode is intentionally excluded from
++`ctest` (it blocks on a real window and user/OS interaction) and is
++exercised manually instead.
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/pipeline_layout.h b/src/rx_rhi_vk/include/rx_rhi_vk/pipeline_layout.h
+index 6c8b693..b18467e 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/pipeline_layout.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/pipeline_layout.h
+@@ -20,40 +20,54 @@ class PipelineLayoutBuilder;
+ // see build()'s comment), and the VkPipelineLayout built from them plus the
+ // shader's push-constant ranges. Move-only; destroys everything via
+ // vkDestroyPipelineLayout/vkDestroyDescriptorSetLayout on destruction or
+ // move-assignment.
+ //
+ // `setLayouts`/`layout` are public (not private-with-accessor, unlike most
+ // RAII types in this library) because callers need them directly: `layout`
+ // for vkCreateGraphicsPipelines/vkCmdBindDescriptorSets'
+ // firstSet/pDescriptorSets bookkeeping, `setLayouts` for allocating actual
+ // VkDescriptorSets against each one. Callers must not destroy either
+-// themselves -- this bundle owns both.
++// themselves -- this bundle owns both, WITH ONE DOCUMENTED EXCEPTION: when
++// `build()` was called with a non-null `externalSet0` (see that function's
++// comment), `setLayouts[0]` is that caller-supplied handle, not one this
++// bundle created -- this bundle never destroys it (on destruction or
++// move-assignment) and the original caller remains solely responsible for
++// its lifetime, which by construction outlives every use of it here (Task
++// 6's BindlessTable instance, e.g., outlives every pipeline built against
++// its `descriptorSetLayout()`). Every OTHER entry in `setLayouts` (index 1+
++// always, index 0 too when no external layout was supplied) is owned and
++// destroyed by this bundle exactly as before.
+ struct PipelineLayoutBundle {
+     std::vector<VkDescriptorSetLayout> setLayouts;
+     VkPipelineLayout layout = VK_NULL_HANDLE;
+ 
+     PipelineLayoutBundle() = default;
+     PipelineLayoutBundle(PipelineLayoutBundle&&) noexcept;
+     PipelineLayoutBundle& operator=(PipelineLayoutBundle&&) noexcept;
+     PipelineLayoutBundle(const PipelineLayoutBundle&) = delete;
+     PipelineLayoutBundle& operator=(const PipelineLayoutBundle&) = delete;
+     ~PipelineLayoutBundle();
+ 
+ private:
+     friend class PipelineLayoutBuilder;
+ 
+     explicit PipelineLayoutBundle(VkDevice device) : device_(device) {}
+ 
+     void destroyAll();
+ 
+     VkDevice device_ = VK_NULL_HANDLE;
++
++    // True iff setLayouts[0] is the caller-supplied `externalSet0` handle
++    // from build() -- see the class comment above. destroyAll() skips
++    // index 0 when this is true.
++    bool externalSet0_ = false;
+ };
+ 
+ // Turns a shader's reflected ShaderLayoutInfo (rx_shader's reflect() output
+ // -- see that header) into a matching VkDescriptorSetLayout per descriptor
+ // set index plus the VkPipelineLayout tying them together with the
+ // shader's push-constant ranges. Stateless: every method is static, there
+ // is nothing to construct.
+ class PipelineLayoutBuilder {
+ public:
+     PipelineLayoutBuilder() = delete;
+@@ -92,14 +106,58 @@ public:
+     // push-constant footprint (max over every range of offset+size) exceeds
+     // the 128-byte guaranteed-minimum floor every Vulkan 1.0+ implementation
+     // must support [spec Fixed decision #5, R:B2] -- enforced here, not in
+     // reflect(), since reflection must faithfully report what a shader
+     // actually declares even when that exceeds this engine's own budget
+     // policy (see rx_shader's reflection_test.cpp for the "reflection
+     // succeeds regardless" half of this contract). Also returns
+     // std::nullopt if any underlying vkCreateDescriptorSetLayout/
+     // vkCreatePipelineLayout call fails, cleaning up every handle already
+     // created in that same call first.
+-    static std::optional<PipelineLayoutBundle> build(VkDevice device, const rx::shader::ShaderLayoutInfo& layoutInfo);
++    //
++    // EXTERNAL SET-0 SUBSTITUTION -- added this task, closing the gap Task
++    // 3's review found: this builder used to always create its own set-0
++    // layout from `layoutInfo` alone, sized to `kUnboundedArrayDescriptorCapacity`
++    // with no VARIABLE_DESCRIPTOR_COUNT flag -- structurally incompatible
++    // with rx::rhi::BindlessTable's real set-0 layout (built from caller
++    // capacities, VARIABLE_DESCRIPTOR_COUNT on its last binding). A shader
++    // reflecting a bindless-shaped set 0 (unbounded Texture2D/SamplerState/
++    // StructuredBuffer arrays at bindings 0/1/2 -- exactly BindlessTable's
++    // own fixed scheme, `BindlessTable::kSampledImageBinding` etc.) needs
++    // its VkPipelineLayout's set 0 to be the ACTUAL BindlessTable it will
++    // bind at draw time, not a lookalike this builder invented.
++    //
++    // When `externalSet0` is non-null: this builder does NOT create a set-0
++    // layout at all -- `externalSet0` becomes `setLayouts[0]` verbatim,
++    // NOT owned by the returned bundle (see PipelineLayoutBundle's own
++    // comment: the caller, e.g. a BindlessTable that outlives every
++    // pipeline built against it, remains solely responsible for destroying
++    // it). Before doing so, this still validates that `layoutInfo`'s own
++    // set-0 bindings (if any) are a subset-compatible SHAPE for that
++    // substitution to be sound: every set-0 binding's number must be one of
++    // BindlessTable's three fixed slots (kSampledImageBinding/
++    // kSamplerBinding/kStorageBufferBinding) with EXACTLY that slot's
++    // descriptor type (a mismatch -- e.g. a shader declaring a
++    // VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER at binding 0, where the bindless
++    // table's binding 0 is always VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE -- is
++    // rejected), and any binding declaring a bounded (non-unbounded) count
++    // must stay within `kUnboundedArrayDescriptorCapacity` (this builder
++    // cannot see the real external layout's actual per-binding capacity
++    // through an opaque VkDescriptorSetLayout handle -- Vulkan exposes no
++    // "describe this layout back to me" API -- so this is a generic sanity
++    // ceiling, not a check against BindlessTable's specific instance
++    // capacities). A shader is free to use a strict subset of the three
++    // slots (e.g. images + samplers only, no storage buffers) -- that is
++    // exactly the "subset-compatible" the brief asks for, not an exact-set
++    // match. This is a host-side, pre-pipeline-creation sanity gate with a
++    // clear logged reason on failure; it does not replace (and is narrower
++    // than) whatever `vkCreateGraphicsPipelines` validation itself checks
++    // against the real bound descriptor set's SPIR-V-declared shape.
++    //
++    // Set indices 1+ (and set 0 too, when `externalSet0` is
++    // VK_NULL_HANDLE, the default) are entirely unaffected -- built exactly
++    // as before.
++    static std::optional<PipelineLayoutBundle> build(VkDevice device, const rx::shader::ShaderLayoutInfo& layoutInfo,
++                                                       VkDescriptorSetLayout externalSet0 = VK_NULL_HANDLE);
+ };
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/pipeline_layout.cpp b/src/rx_rhi_vk/src/pipeline_layout.cpp
+index 56c40e9..c49bda3 100644
+--- a/src/rx_rhi_vk/src/pipeline_layout.cpp
++++ b/src/rx_rhi_vk/src/pipeline_layout.cpp
+@@ -1,98 +1,185 @@
+ #include <rx_rhi_vk/pipeline_layout.h>
+ 
++#include <rx_rhi_vk/bindless.h>
+ #include <rx_core/log.h>
+ 
+ #include <algorithm>
++#include <array>
+ #include <utility>
+ 
+ namespace rx::rhi {
+ 
+ namespace {
+ 
+ // Every Vulkan 1.0+ implementation must support at least this many bytes of
+ // push-constant storage (`VkPhysicalDeviceLimits::maxPushConstantsSize`'s
+ // guaranteed minimum) -- confirmed as the *exact* limit (not just the
+ // floor) on the Steam Deck's RADV driver [R:B2], so this engine budgets to
+ // it rather than to whatever a given desktop GPU happens to report.
+ constexpr uint32_t kPushConstantBudgetBytes = 128;
+ 
+-void destroySetLayouts(VkDevice device, const std::vector<VkDescriptorSetLayout>& setLayouts) {
+-    for (VkDescriptorSetLayout setLayout : setLayouts) {
+-        if (setLayout != VK_NULL_HANDLE) {
+-            vkDestroyDescriptorSetLayout(device, setLayout, nullptr);
++// `startIndex` lets callers skip index 0 when it is a caller-owned external
++// layout (build()'s `externalSet0` parameter / PipelineLayoutBundle's own
++// `externalSet0_` flag) -- see both those comments for why this bundle must
++// never destroy that handle.
++void destroySetLayouts(VkDevice device, const std::vector<VkDescriptorSetLayout>& setLayouts, size_t startIndex = 0) {
++    for (size_t i = startIndex; i < setLayouts.size(); ++i) {
++        if (setLayouts[i] != VK_NULL_HANDLE) {
++            vkDestroyDescriptorSetLayout(device, setLayouts[i], nullptr);
+         }
+     }
+ }
+ 
++// The fixed binding-number -> descriptor-type shape build()'s `externalSet0`
++// path validates a shader's reflected set-0 bindings against -- see
++// pipeline_layout.h's comment on build() for the full rationale. This is
++// deliberately BindlessTable's own scheme (bindless.h), not an independent
++// invention: `externalSet0` only has one real producer in this codebase
++// (BindlessTable::descriptorSetLayout()), and validating against anything
++// else would just be a different, unrelated shape that happens to also not
++// match the real handle build() is about to substitute in.
++struct ExpectedBindlessSlot {
++    uint32_t binding;
++    VkDescriptorType type;
++};
++
++constexpr std::array<ExpectedBindlessSlot, 3> kExpectedExternalSet0Shape{{
++    {BindlessTable::kSampledImageBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE},
++    {BindlessTable::kSamplerBinding, VK_DESCRIPTOR_TYPE_SAMPLER},
++    {BindlessTable::kStorageBufferBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
++}};
++
++// See build()'s comment for exactly what "subset-compatible shape" means
++// here. Returns false having already logged the specific reason via
++// RX_LOG_ERROR -- callers should treat that as the full diagnostic, not add
++// their own generic message on top.
++bool validateExternalSet0Shape(const std::vector<const rx::shader::ShaderLayoutInfo::Binding*>& set0Bindings) {
++    for (const auto* binding : set0Bindings) {
++        const ExpectedBindlessSlot* expected = nullptr;
++        for (const auto& slot : kExpectedExternalSet0Shape) {
++            if (slot.binding == binding->binding) {
++                expected = &slot;
++                break;
++            }
++        }
++        if (expected == nullptr) {
++            RX_LOG_ERROR(
++                "rx_rhi_vk::PipelineLayoutBuilder::build: reflected set-0 binding {} has no counterpart in the "
++                "external bindless-table layout (known slots: {}=SAMPLED_IMAGE, {}=SAMPLER, {}=STORAGE_BUFFER); "
++                "rejecting",
++                binding->binding, BindlessTable::kSampledImageBinding, BindlessTable::kSamplerBinding,
++                BindlessTable::kStorageBufferBinding);
++            return false;
++        }
++        if (binding->type != expected->type) {
++            RX_LOG_ERROR(
++                "rx_rhi_vk::PipelineLayoutBuilder::build: reflected set-0 binding {} declares descriptor type {} "
++                "but the external bindless-table layout's matching slot is type {}; rejecting",
++                binding->binding, static_cast<int>(binding->type), static_cast<int>(expected->type));
++            return false;
++        }
++        if (!binding->unboundedArray && binding->count > PipelineLayoutBuilder::kUnboundedArrayDescriptorCapacity) {
++            RX_LOG_ERROR(
++                "rx_rhi_vk::PipelineLayoutBuilder::build: reflected set-0 binding {} declares a bounded count of "
++                "{}, exceeding this builder's generic capacity ceiling of {}; rejecting",
++                binding->binding, binding->count, PipelineLayoutBuilder::kUnboundedArrayDescriptorCapacity);
++            return false;
++        }
++    }
++    return true;
++}
++
+ }  // namespace
+ 
+ PipelineLayoutBundle::PipelineLayoutBundle(PipelineLayoutBundle&& other) noexcept : PipelineLayoutBundle() {
+     *this = std::move(other);
+ }
+ 
+ PipelineLayoutBundle& PipelineLayoutBundle::operator=(PipelineLayoutBundle&& other) noexcept {
+     if (this != &other) {
+         destroyAll();
+ 
+         setLayouts = std::move(other.setLayouts);
+         layout = other.layout;
+         device_ = other.device_;
++        externalSet0_ = other.externalSet0_;
+ 
+         other.setLayouts.clear();
+         other.layout = VK_NULL_HANDLE;
+         other.device_ = VK_NULL_HANDLE;
++        other.externalSet0_ = false;
+     }
+     return *this;
+ }
+ 
+ PipelineLayoutBundle::~PipelineLayoutBundle() {
+     destroyAll();
+ }
+ 
+ void PipelineLayoutBundle::destroyAll() {
+     if (layout != VK_NULL_HANDLE) {
+         vkDestroyPipelineLayout(device_, layout, nullptr);
+     }
+-    destroySetLayouts(device_, setLayouts);
++    destroySetLayouts(device_, setLayouts, externalSet0_ ? 1 : 0);
+ }
+ 
+ std::optional<PipelineLayoutBundle> PipelineLayoutBuilder::build(VkDevice device,
+-                                                                  const rx::shader::ShaderLayoutInfo& layoutInfo) {
++                                                                  const rx::shader::ShaderLayoutInfo& layoutInfo,
++                                                                  VkDescriptorSetLayout externalSet0) {
+     // --- Push-constant budget enforcement -----------------------------
+     uint32_t totalPushConstantSpan = 0;
+     for (const auto& range : layoutInfo.pushRanges) {
+         totalPushConstantSpan = std::max(totalPushConstantSpan, range.offset + range.size);
+     }
+     if (totalPushConstantSpan > kPushConstantBudgetBytes) {
+         RX_LOG_ERROR(
+             "rx_rhi_vk::PipelineLayoutBuilder::build: push constant footprint of {} bytes exceeds the "
+             "{}-byte guaranteed-minimum budget [spec Fixed decision #5, R:B2]; rejecting",
+             totalPushConstantSpan, kPushConstantBudgetBytes);
+         return std::nullopt;
+     }
+ 
+     // --- Group bindings by set index, gap-filling any skipped index ----
++    // Forced up to at least 1 when `externalSet0` is supplied: the caller
++    // wants set 0 wired to that handle regardless of whether this shader
++    // itself declares anything there (a shader with zero set-0 bindings is
++    // a valid, if degenerate, "subset" of the bindless table's shape).
+     uint32_t maxSet = 0;
+     for (const auto& binding : layoutInfo.bindings) {
+         maxSet = std::max(maxSet, binding.set);
+     }
+     size_t setCount = layoutInfo.bindings.empty() ? 0 : static_cast<size_t>(maxSet) + 1;
++    if (externalSet0 != VK_NULL_HANDLE) {
++        setCount = std::max(setCount, size_t{1});
++    }
+ 
+     std::vector<std::vector<const rx::shader::ShaderLayoutInfo::Binding*>> bindingsBySet(setCount);
+     for (const auto& binding : layoutInfo.bindings) {
+         bindingsBySet[binding.set].push_back(&binding);
+     }
+ 
++    if (externalSet0 != VK_NULL_HANDLE && !validateExternalSet0Shape(bindingsBySet[0])) {
++        return std::nullopt;  // validateExternalSet0Shape already logged why.
++    }
++
+     std::vector<VkDescriptorSetLayout> setLayouts;
+     setLayouts.reserve(setCount);
+     for (size_t setIndex = 0; setIndex < setCount; ++setIndex) {
++        // Substitution: set 0 becomes the caller's own layout verbatim, no
++        // vkCreateDescriptorSetLayout call at all -- see build()'s comment
++        // in pipeline_layout.h for the full ownership contract.
++        if (setIndex == 0 && externalSet0 != VK_NULL_HANDLE) {
++            setLayouts.push_back(externalSet0);
++            continue;
++        }
++
+         std::vector<VkDescriptorSetLayoutBinding> vkBindings;
+         std::vector<VkDescriptorBindingFlags> bindingFlags;
+         bool anyUpdateAfterBind = false;
+ 
+         vkBindings.reserve(bindingsBySet[setIndex].size());
+         bindingFlags.reserve(bindingsBySet[setIndex].size());
+         for (const auto* binding : bindingsBySet[setIndex]) {
+             VkDescriptorSetLayoutBinding vkBinding{};
+             vkBinding.binding = binding->binding;
+             vkBinding.descriptorType = binding->type;
+@@ -122,21 +209,24 @@ std::optional<PipelineLayoutBundle> PipelineLayoutBuilder::build(VkDevice device
+             setLayoutInfo.pNext = &flagsInfo;
+             setLayoutInfo.flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+         }
+ 
+         VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+         VkResult result = vkCreateDescriptorSetLayout(device, &setLayoutInfo, nullptr, &setLayout);
+         if (result != VK_SUCCESS) {
+             RX_LOG_ERROR("rx_rhi_vk::PipelineLayoutBuilder::build: vkCreateDescriptorSetLayout(set {}) failed: "
+                          "VkResult={}",
+                          setIndex, static_cast<int>(result));
+-            destroySetLayouts(device, setLayouts);
++            // setLayouts[0] is `externalSet0` here only if setIndex reached
++            // this point after already pushing it above (setIndex > 0) --
++            // never destroy it.
++            destroySetLayouts(device, setLayouts, externalSet0 != VK_NULL_HANDLE ? 1 : 0);
+             return std::nullopt;
+         }
+         setLayouts.push_back(setLayout);
+     }
+ 
+     // --- Pipeline layout, tying the sets above to the push ranges ------
+     std::vector<VkPushConstantRange> vkPushRanges;
+     vkPushRanges.reserve(layoutInfo.pushRanges.size());
+     for (const auto& range : layoutInfo.pushRanges) {
+         VkPushConstantRange vkRange{};
+@@ -151,21 +241,22 @@ std::optional<PipelineLayoutBundle> PipelineLayoutBuilder::build(VkDevice device
+     pipelineLayoutInfo.setLayoutCount = static_cast<uint32_t>(setLayouts.size());
+     pipelineLayoutInfo.pSetLayouts = setLayouts.empty() ? nullptr : setLayouts.data();
+     pipelineLayoutInfo.pushConstantRangeCount = static_cast<uint32_t>(vkPushRanges.size());
+     pipelineLayoutInfo.pPushConstantRanges = vkPushRanges.empty() ? nullptr : vkPushRanges.data();
+ 
+     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+     VkResult pipelineLayoutResult = vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout);
+     if (pipelineLayoutResult != VK_SUCCESS) {
+         RX_LOG_ERROR("rx_rhi_vk::PipelineLayoutBuilder::build: vkCreatePipelineLayout failed: VkResult={}",
+                      static_cast<int>(pipelineLayoutResult));
+-        destroySetLayouts(device, setLayouts);
++        destroySetLayouts(device, setLayouts, externalSet0 != VK_NULL_HANDLE ? 1 : 0);
+         return std::nullopt;
+     }
+ 
+     PipelineLayoutBundle bundle(device);
+     bundle.setLayouts = std::move(setLayouts);
+     bundle.layout = pipelineLayout;
++    bundle.externalSet0_ = (externalSet0 != VK_NULL_HANDLE);
+     return bundle;
+ }
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/tests/pipeline_layout_test.cpp b/src/rx_rhi_vk/tests/pipeline_layout_test.cpp
+index fe2d7ab..640ff7c 100644
+--- a/src/rx_rhi_vk/tests/pipeline_layout_test.cpp
++++ b/src/rx_rhi_vk/tests/pipeline_layout_test.cpp
+@@ -1,11 +1,12 @@
+ #include <doctest/doctest.h>
++#include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/pipeline_layout.h>
+ #include <VkBootstrap.h>
+ #include <utility>
+ 
+ // Pure headless test -- no rx::platform::Window, no VkSurfaceKHR, no
+ // swapchain anywhere in this file, exactly like clear_color_test.cpp
+ // (safe to run in any order alongside the windowed Device/Buffer tests in
+ // this binary because tests/doctest_main.cpp warms vk-bootstrap's
+ // process-wide instance-function cache before any TEST_CASE runs -- see
+@@ -29,24 +30,30 @@ namespace {
+ // Task 3's job) because building a VkDescriptorSetLayout with an
+ // UPDATE_AFTER_BIND_BIT | PARTIALLY_BOUND_BIT binding plus the set-level
+ // UPDATE_AFTER_BIND_POOL flag requires the matching device features to be
+ // enabled at device-creation time, or validation correctly rejects it.
+ // This exact feature set is confirmed present on both the Steam Deck's
+ // RADV driver [R:B2] and (checked directly on this development machine)
+ // both an NVIDIA RTX 2080 and llvmpipe/lavapipe -- treated as a hard
+ // requirement (REQUIRE, no skip-guard) rather than an environment-
+ // dependent capability, matching clear_color_test.cpp's own headless
+ // pattern rather than device_test.cpp's windowed-skip one.
++//
++// `physicalDevice` was added this task (Task 6) alongside the two
++// external-set-0 tests below, which need a real rx::rhi::BindlessTable
++// (BindlessTable::create() takes a VkPhysicalDevice) -- the two
++// pre-existing tests above never needed it.
+ struct HeadlessDescriptorIndexingDevice {
+     rx::rhi::Context context;
+     vkb::Device vkbDevice;
+     VkDevice device;
++    VkPhysicalDevice physicalDevice;
+ };
+ 
+ HeadlessDescriptorIndexingDevice makeHeadlessDescriptorIndexingDevice() {
+     auto context = rx::rhi::Context::create({}, /*enableValidation=*/true);
+     REQUIRE(context.has_value());
+ 
+     VkPhysicalDeviceVulkan12Features features12{};
+     features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+     features12.descriptorIndexing = VK_TRUE;
+     features12.runtimeDescriptorArray = VK_TRUE;
+@@ -67,21 +74,26 @@ HeadlessDescriptorIndexingDevice makeHeadlessDescriptorIndexingDevice() {
+     // never enables.
+     vkb::PhysicalDeviceSelector selector(context->vkbInstance());
+     auto physResult = selector.set_minimum_version(1, 3).set_required_features_12(features12).select();
+     REQUIRE(physResult.has_value());
+ 
+     auto deviceResult = vkb::DeviceBuilder(physResult.value()).build();
+     REQUIRE(deviceResult.has_value());
+     vkb::Device vkbDevice = deviceResult.value();
+     volkLoadDevice(vkbDevice.device);
+ 
+-    return HeadlessDescriptorIndexingDevice{std::move(*context), vkbDevice, vkbDevice.device};
++    return HeadlessDescriptorIndexingDevice{std::move(*context), vkbDevice, vkbDevice.device,
++                                             vkbDevice.physical_device.physical_device};
++}
++
++rx::rhi::BindlessTable::Capacities makeTestBindlessCapacities() {
++    return rx::rhi::BindlessTable::Capacities{/*sampledImages=*/1024, /*samplers=*/16, /*storageBuffers=*/256};
+ }
+ 
+ // Mirrors rx_shader's reflection_test.cpp `kLayoutTestSource` shape exactly
+ // (same set/binding/type/count/stage table that test's reflect() call
+ // asserts) -- hand-crafted here, not obtained by actually calling
+ // rx::shader::reflect(), since rx_rhi_vk deliberately never links rx_shader/
+ // slang::slang (see pipeline_layout.h's comment). This is the "build the
+ // pipeline layout on a headless device" half of Task 2's brief; the
+ // "reflect a shader with ... push constants" half lives in
+ // reflection_test.cpp.
+@@ -161,10 +173,166 @@ TEST_CASE("PipelineLayoutBuilder::build rejects a >128-byte push constant footpr
+     pushRange.size = 192;
+     oversized.pushRanges.push_back(pushRange);
+ 
+     auto bundle = rx::rhi::PipelineLayoutBuilder::build(headless.device, oversized);
+     CHECK_FALSE(bundle.has_value());
+ 
+     vkDeviceWaitIdle(headless.device);
+     vkb::destroy_device(headless.vkbDevice);
+     CHECK_FALSE(headless.context.hasValidationErrors());
+ }
++
++// --- External set-0 substitution (Task 6) -----------------------------
++//
++// Closes the gap Task 3's review found: BindlessTable's real set-0 layout
++// (capacities-sized, VARIABLE_DESCRIPTOR_COUNT on its last binding) and
++// this builder's own from-scratch set-0 layout (always
++// kUnboundedArrayDescriptorCapacity, no VARIABLE_DESCRIPTOR_COUNT flag) are
++// NOT compatible pipeline layouts "by construction" -- build()'s new
++// `externalSet0` parameter lets a caller substitute the real handle in
++// directly instead. These two tests are the "focused unit test (mismatched-
++// type rejection + happy path)" the Task 6 brief requires.
++
++TEST_CASE("PipelineLayoutBuilder::build with an external set-0 layout: happy path reuses the caller's exact "
++          "VkDescriptorSetLayout for set 0 and validates a subset-compatible reflected shape") {
++    HeadlessDescriptorIndexingDevice headless = makeHeadlessDescriptorIndexingDevice();
++
++    {
++        auto table = rx::rhi::BindlessTable::create(headless.physicalDevice, headless.device,
++                                                      makeTestBindlessCapacities());
++        REQUIRE(table.has_value());
++
++        // A reflected shape using two of BindlessTable's three fixed slots
++        // (images + samplers) -- deliberately a STRICT SUBSET, not an
++        // exact match, per the brief's "subset-compatible shape" wording:
++        // a shader need not touch every bindless resource class to be
++        // substitution-compatible with the table that provides all three.
++        rx::shader::ShaderLayoutInfo info;
++
++        rx::shader::ShaderLayoutInfo::Binding images;
++        images.set = 0;
++        images.binding = rx::rhi::BindlessTable::kSampledImageBinding;
++        images.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
++        images.stages = VK_SHADER_STAGE_FRAGMENT_BIT;
++        images.unboundedArray = true;
++        info.bindings.push_back(images);
++
++        rx::shader::ShaderLayoutInfo::Binding samplers;
++        samplers.set = 0;
++        samplers.binding = rx::rhi::BindlessTable::kSamplerBinding;
++        samplers.type = VK_DESCRIPTOR_TYPE_SAMPLER;
++        samplers.stages = VK_SHADER_STAGE_FRAGMENT_BIT;
++        samplers.unboundedArray = true;
++        info.bindings.push_back(samplers);
++
++        // A per-draw push range alongside the substituted set 0 -- proves
++        // push constants keep working unmodified.
++        rx::shader::ShaderLayoutInfo::PushRange pushRange;
++        pushRange.stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
++        pushRange.offset = 0;
++        pushRange.size = 12;
++        info.pushRanges.push_back(pushRange);
++
++        auto bundle = rx::rhi::PipelineLayoutBuilder::build(headless.device, info, table->descriptorSetLayout());
++        REQUIRE(bundle.has_value());
++        REQUIRE(bundle->setLayouts.size() == 1);
++        // The exact handle, not a lookalike this builder created itself --
++        // the entire point of the substitution.
++        CHECK(bundle->setLayouts[0] == table->descriptorSetLayout());
++        CHECK(bundle->layout != VK_NULL_HANDLE);
++    }
++
++    // `table`'s descriptor set layout must still be alive when `bundle`
++    // above is destroyed (bundle must not touch it -- see
++    // PipelineLayoutBundle's ownership comment); it goes out of scope
++    // here, after `bundle` already has (reverse declaration order), so
++    // this also exercises that destroyAll() genuinely skipped it.
++    vkDeviceWaitIdle(headless.device);
++    vkb::destroy_device(headless.vkbDevice);
++    CHECK_FALSE(headless.context.hasValidationErrors());
++}
++
++TEST_CASE("PipelineLayoutBuilder::build with an external set-0 layout: rejects a reflected set-0 binding whose "
++          "descriptor type doesn't match the external bindless-table layout's shape") {
++    HeadlessDescriptorIndexingDevice headless = makeHeadlessDescriptorIndexingDevice();
++
++    {
++        auto table = rx::rhi::BindlessTable::create(headless.physicalDevice, headless.device,
++                                                      makeTestBindlessCapacities());
++        REQUIRE(table.has_value());
++
++        // Binding number 0 matches BindlessTable::kSampledImageBinding, but
++        // the declared type (UNIFORM_BUFFER) does not match that slot's
++        // real type (SAMPLED_IMAGE) -- the mismatched-type case build()
++        // must reject before ever touching `externalSet0`.
++        rx::shader::ShaderLayoutInfo info;
++        rx::shader::ShaderLayoutInfo::Binding wrongType;
++        wrongType.set = 0;
++        wrongType.binding = rx::rhi::BindlessTable::kSampledImageBinding;
++        wrongType.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
++        wrongType.count = 1;
++        wrongType.stages = VK_SHADER_STAGE_FRAGMENT_BIT;
++        info.bindings.push_back(wrongType);
++
++        auto bundle = rx::rhi::PipelineLayoutBuilder::build(headless.device, info, table->descriptorSetLayout());
++        CHECK_FALSE(bundle.has_value());
++    }
++
++    vkDeviceWaitIdle(headless.device);
++    vkb::destroy_device(headless.vkbDevice);
++    CHECK_FALSE(headless.context.hasValidationErrors());
++}
++
++TEST_CASE("PipelineLayoutBuilder::build with an external set-0 layout: rejects a set-0 binding number with no "
++          "counterpart in the bindless-table shape") {
++    HeadlessDescriptorIndexingDevice headless = makeHeadlessDescriptorIndexingDevice();
++
++    {
++        auto table = rx::rhi::BindlessTable::create(headless.physicalDevice, headless.device,
++                                                      makeTestBindlessCapacities());
++        REQUIRE(table.has_value());
++
++        // Binding 7 has no counterpart in BindlessTable's fixed 0/1/2
++        // scheme at all, regardless of its declared type.
++        rx::shader::ShaderLayoutInfo info;
++        rx::shader::ShaderLayoutInfo::Binding unknownBinding;
++        unknownBinding.set = 0;
++        unknownBinding.binding = 7;
++        unknownBinding.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
++        unknownBinding.unboundedArray = true;
++        info.bindings.push_back(unknownBinding);
++
++        auto bundle = rx::rhi::PipelineLayoutBuilder::build(headless.device, info, table->descriptorSetLayout());
++        CHECK_FALSE(bundle.has_value());
++    }
++
++    vkDeviceWaitIdle(headless.device);
++    vkb::destroy_device(headless.vkbDevice);
++    CHECK_FALSE(headless.context.hasValidationErrors());
++}
++
++TEST_CASE("PipelineLayoutBuilder::build with an external set-0 layout: wires set 0 to the external handle even "
++          "when the shader reflects zero set-0 bindings") {
++    HeadlessDescriptorIndexingDevice headless = makeHeadlessDescriptorIndexingDevice();
++
++    {
++        auto table = rx::rhi::BindlessTable::create(headless.physicalDevice, headless.device,
++                                                      makeTestBindlessCapacities());
++        REQUIRE(table.has_value());
++
++        // A shader that declares no descriptor bindings at all (e.g. one
++        // that only ever indexes the bindless table via a push-constant
++        // index into a set it happens to share globally) is still a valid,
++        // if degenerate, subset -- setCount must still reach 1 so set 0
++        // gets wired to `externalSet0`.
++        rx::shader::ShaderLayoutInfo info;
++
++        auto bundle = rx::rhi::PipelineLayoutBuilder::build(headless.device, info, table->descriptorSetLayout());
++        REQUIRE(bundle.has_value());
++        REQUIRE(bundle->setLayouts.size() == 1);
++        CHECK(bundle->setLayouts[0] == table->descriptorSetLayout());
++    }
++
++    vkDeviceWaitIdle(headless.device);
++    vkb::destroy_device(headless.vkbDevice);
++    CHECK_FALSE(headless.context.hasValidationErrors());
++}
+diff --git a/src/rx_shader/CMakeLists.txt b/src/rx_shader/CMakeLists.txt
+index 41a0223..cdd75ac 100644
+--- a/src/rx_shader/CMakeLists.txt
++++ b/src/rx_shader/CMakeLists.txt
+@@ -83,72 +83,88 @@ target_link_libraries(rx_shader PUBLIC rx_core slang::slang rx_shader_layout_typ
+ #
+ # Slang compiles in-process via a shared library (libslang-compiler.so /
+ # slang-compiler.dll), never statically linked in, so any executable that
+ # links rx_shader (transitively, slang::slang) needs that library --
+ # plus the plugins it dlopens on demand for certain compile paths
+ # (slang-glslang, slang-glsl-module) and its companion runtime (slang-rt)
+ # -- sitting next to it on disk at run time [R:D2]. NEVER ship slang-llvm
+ # (the CPU/host JIT backend, irrelevant to SPIR-V-only use) or gfx (the
+ # deprecated GFX layer) [spec Fixed decision #11].
+ #
+-# Globbed rather than hardcoded to the pinned version string: the Linux
+-# filenames embed the Slang version (e.g. "libslang-compiler.so.0.2026.14.1"),
+-# and Slang's own release history has changed archive layout/naming before
+-# [R:A6] -- glob patterns tolerate a version bump without needing an edit
+-# here, matching the same "verify the layout, don't assume paths" posture
++# Globbed (inside rx_shader_deploy_runtime_libs() itself, below) rather
++# than hardcoded to the pinned version string: the Linux filenames embed
++# the Slang version (e.g. "libslang-compiler.so.0.2026.14.1"), and Slang's
++# own release history has changed archive layout/naming before [R:A6] --
++# glob patterns tolerate a version bump without needing an edit here,
++# matching the same "verify the layout, don't assume paths" posture
+ # fetch_slang.cmake already takes with its sentinel-file check. The
+ # Windows names carry no version suffix (verified directly against the
+ # real archive), so those are exact.
+-if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+-  file(GLOB RX_SLANG_RUNTIME_LIBS
+-    "${RX_SLANG_TARGET_ROOT}/bin/slang-compiler.dll"
+-    "${RX_SLANG_TARGET_ROOT}/bin/slang-glslang.dll"
+-    "${RX_SLANG_TARGET_ROOT}/bin/slang-glsl-module.dll"
+-    "${RX_SLANG_TARGET_ROOT}/bin/slang-rt.dll"
+-  )
+-else()
+-  file(GLOB RX_SLANG_RUNTIME_LIBS
+-    "${RX_SLANG_TARGET_ROOT}/lib/libslang-compiler.so*"
+-    "${RX_SLANG_TARGET_ROOT}/lib/libslang-glslang-*.so"
+-    "${RX_SLANG_TARGET_ROOT}/lib/libslang-glsl-module-*.so"
+-    "${RX_SLANG_TARGET_ROOT}/lib/libslang-rt.so*"
+-  )
+-endif()
+-
+-if(NOT RX_SLANG_RUNTIME_LIBS)
+-  message(FATAL_ERROR
+-    "[rx_shader] No Slang runtime libraries found under '${RX_SLANG_TARGET_ROOT}' "
+-    "-- fetch_slang.cmake's archive layout assumption may be stale; inspect "
+-    "that tree before continuing.")
+-endif()
+-
++#
+ # Deploys the Slang runtime libs above next to `target`, and points its
+ # RPATH (Linux/ELF only -- CMake ignores RPATH properties on Windows, so
+ # this is unconditional and harmless there) at its own directory rather
+ # than the original fetched location under third_party/.
+ #
+ # BUILD_WITH_INSTALL_RPATH + INSTALL_RPATH="$ORIGIN" (rather than just
+ # relying on CMake's default automatic build-tree RPATH, which would
+ # already embed the *absolute* path to third_party/slang-prebuilt/.../lib
+ # and quietly work without this) is deliberate: it makes the build-tree
+ # binary's RPATH identical to what a redistributed copy would carry --
+ # nothing but "$ORIGIN" -- so running it from the build tree actually
+ # proves the redistribution-relevant mechanism (copy-adjacent + relative
+ # RPATH), not merely that the original fetch directory still happens to be
+ # on disk.
++#
++# DIRECTORY-SCOPE FIX (Task 6, tracked since Task 5's review): this used to
++# reference the plain, non-CACHE `RX_SLANG_RUNTIME_LIBS` variable
++# file(GLOB)'d above, in THIS listfile's own directory scope. A CMake
++# function body resolves an unqualified variable through the *calling*
++# scope, not its *definition* scope -- verified directly (see Task 5's own
++# finding) -- so calling this function from a sibling directory (any
++# samples/*/CMakeLists.txt) resolved to nothing there, and
++# samples/02_hotreload/CMakeLists.txt had to re-glob the identical pattern
++# itself as a local workaround just to give this function's
++# add_custom_command something to copy. Re-globbing inside the function
++# body itself, using the already-CACHE-INTERNAL `RX_SLANG_TARGET_ROOT`
++# (visible in any scope, unlike the old plain `RX_SLANG_RUNTIME_LIBS`),
++# closes this for good: every caller, in any directory, now gets a fresh,
++# correct glob with no re-globbing workaround required on their end.
+ function(rx_shader_deploy_runtime_libs target)
++  if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
++    file(GLOB _rx_shader_runtime_libs
++      "${RX_SLANG_TARGET_ROOT}/bin/slang-compiler.dll"
++      "${RX_SLANG_TARGET_ROOT}/bin/slang-glslang.dll"
++      "${RX_SLANG_TARGET_ROOT}/bin/slang-glsl-module.dll"
++      "${RX_SLANG_TARGET_ROOT}/bin/slang-rt.dll"
++    )
++  else()
++    file(GLOB _rx_shader_runtime_libs
++      "${RX_SLANG_TARGET_ROOT}/lib/libslang-compiler.so*"
++      "${RX_SLANG_TARGET_ROOT}/lib/libslang-glslang-*.so"
++      "${RX_SLANG_TARGET_ROOT}/lib/libslang-glsl-module-*.so"
++      "${RX_SLANG_TARGET_ROOT}/lib/libslang-rt.so*"
++    )
++  endif()
++  if(NOT _rx_shader_runtime_libs)
++    message(FATAL_ERROR
++      "[rx_shader_deploy_runtime_libs] No Slang runtime libraries found under "
++      "'${RX_SLANG_TARGET_ROOT}' for target '${target}' -- fetch_slang.cmake's "
++      "archive layout assumption may be stale; inspect that tree before continuing.")
++  endif()
++
+   set_target_properties(${target} PROPERTIES
+     BUILD_WITH_INSTALL_RPATH TRUE
+     INSTALL_RPATH "$ORIGIN"
+   )
+   add_custom_command(TARGET ${target} POST_BUILD
+-    COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_SLANG_RUNTIME_LIBS} "$<TARGET_FILE_DIR:${target}>"
++    COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${_rx_shader_runtime_libs} "$<TARGET_FILE_DIR:${target}>"
+     COMMENT "rx_shader: copying Slang runtime libraries next to $<TARGET_FILE_NAME:${target}>"
+     VERBATIM
+   )
+ endfunction()
+ 
+ # --- Windows link smoke test --------------------------------------------
+ # De-risks the one real unknown in this task before anything else got
+ # built on top of it: does zig/LLD's COFF linker accept an MSVC-built
+ # import library? [R:A6/D2] -- see tests/link_smoketest.cpp and the task
+ # report for the empirical result. Deploy the runtime libs to it too (not

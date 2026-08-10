@@ -62,13 +62,25 @@ private:
 // VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT and
 // VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT on both the
 // source and destination side, VK_REMAINING_MIP_LEVELS/
-// VK_REMAINING_ARRAY_LAYERS, and the color aspect. This is deliberately the
-// maximally-conservative barrier -- correct for any layout transition on
-// any color image, at the cost of over-synchronizing -- not a
-// finely-scoped, minimal-stall barrier; callers with real performance
-// requirements should build their own VkImageMemoryBarrier2 with a tighter
-// stage/access scope instead. Suitable for setup/test code and any path
-// where correctness matters more than throughput.
-void transitionImage(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout);
+// VK_REMAINING_ARRAY_LAYERS, and `aspectMask` (defaulted to
+// VK_IMAGE_ASPECT_COLOR_BIT, so every existing call site -- every one of
+// which transitions a color image -- needs no change at all). Pass
+// VK_IMAGE_ASPECT_DEPTH_BIT (and/or VK_IMAGE_ASPECT_STENCIL_BIT) for a
+// depth/depth-stencil image instead; a depth-only format like
+// VK_FORMAT_D32_SFLOAT has no color aspect at all, and validation
+// correctly rejects a COLOR_BIT barrier against one
+// (UNASSIGNED-CoreValidation-DrawState-InvalidImageAspect -- the exact
+// error a depth image transitioned through the COLOR_BIT default would
+// hit; samples/03_bindless_mesh hit this for real before this parameter
+// existed, via a since-deleted local twin of this same function). This is
+// deliberately the maximally-conservative barrier otherwise -- correct
+// for any layout transition on any image of the given aspect, at the cost
+// of over-synchronizing -- not a finely-scoped, minimal-stall barrier;
+// callers with real performance requirements should build their own
+// VkImageMemoryBarrier2 with a tighter stage/access scope instead.
+// Suitable for setup/test code and any path where correctness matters
+// more than throughput.
+void transitionImage(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout,
+                      VkImageAspectFlags aspectMask = VK_IMAGE_ASPECT_COLOR_BIT);
 
 }  // namespace rx::rhi

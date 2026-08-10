@@ -125,8 +125,10 @@ target_link_libraries(rx_shader PUBLIC rx_core slang::slang rx_shader_layout_typ
 # samples/02_hotreload/CMakeLists.txt had to re-glob the identical pattern
 # itself as a local workaround just to give this function's
 # add_custom_command something to copy. Re-globbing inside the function
-# body itself, using the already-CACHE-INTERNAL `RX_SLANG_TARGET_ROOT`
-# (visible in any scope, unlike the old plain `RX_SLANG_RUNTIME_LIBS`),
+# body itself, using the already-CACHE-PATH `RX_SLANG_TARGET_ROOT`
+# (a `CACHE PATH` variable set in tools/fetch_slang.cmake -- cache
+# variables are visible in any directory scope, unlike the old plain
+# `RX_SLANG_RUNTIME_LIBS`),
 # closes this for good: every caller, in any directory, now gets a fresh,
 # correct glob with no re-globbing workaround required on their end.
 function(rx_shader_deploy_runtime_libs target)

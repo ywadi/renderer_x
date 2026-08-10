@@ -282,6 +282,44 @@ TEST_CASE("PipelineLayoutBuilder::build with an external set-0 layout: rejects a
     CHECK_FALSE(headless.context.hasValidationErrors());
 }
 
+TEST_CASE("PipelineLayoutBuilder::build with an external set-0 layout: rejects a bounded set-0 binding count "
+          "exceeding this builder's generic capacity ceiling") {
+    HeadlessDescriptorIndexingDevice headless = makeHeadlessDescriptorIndexingDevice();
+
+    {
+        auto table = rx::rhi::BindlessTable::create(headless.physicalDevice, headless.device,
+                                                      makeTestBindlessCapacities());
+        REQUIRE(table.has_value());
+
+        // Binding number and type both match BindlessTable's real
+        // sampled-image slot exactly, but `unboundedArray` is false with a
+        // bounded `count` one past kUnboundedArrayDescriptorCapacity --
+        // the "counts within capacity" half of the shape check (a
+        // reflected finite-size array declared implausibly large for this
+        // builder's own generic ceiling, independent of whatever the real
+        // external layout's actual capacity happens to be -- see
+        // pipeline_layout.h's comment on build() for why this builder has
+        // no way to see that real capacity through an opaque
+        // VkDescriptorSetLayout handle at all).
+        rx::shader::ShaderLayoutInfo info;
+        rx::shader::ShaderLayoutInfo::Binding oversizedBounded;
+        oversizedBounded.set = 0;
+        oversizedBounded.binding = rx::rhi::BindlessTable::kSampledImageBinding;
+        oversizedBounded.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        oversizedBounded.unboundedArray = false;
+        oversizedBounded.count = rx::rhi::PipelineLayoutBuilder::kUnboundedArrayDescriptorCapacity + 1;
+        oversizedBounded.stages = VK_SHADER_STAGE_FRAGMENT_BIT;
+        info.bindings.push_back(oversizedBounded);
+
+        auto bundle = rx::rhi::PipelineLayoutBuilder::build(headless.device, info, table->descriptorSetLayout());
+        CHECK_FALSE(bundle.has_value());
+    }
+
+    vkDeviceWaitIdle(headless.device);
+    vkb::destroy_device(headless.vkbDevice);
+    CHECK_FALSE(headless.context.hasValidationErrors());
+}
+
 TEST_CASE("PipelineLayoutBuilder::build with an external set-0 layout: rejects a set-0 binding number with no "
           "counterpart in the bindless-table shape") {
     HeadlessDescriptorIndexingDevice headless = makeHeadlessDescriptorIndexingDevice();

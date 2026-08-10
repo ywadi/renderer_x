@@ -19,6 +19,11 @@ namespace rx::shader {
 // slang::slang, not compiler.h/reflection.h) to rx_rhi_vk, which is what
 // makes that separation a build-graph guarantee rather than a convention
 // someone could accidentally violate with one stray #include.
+//
+// This struct carries NO matrix-layout information -- for the default
+// row-major-vs-column-major matrix packing this Compiler's sessions use
+// (a real, easy-to-miss gotcha for a `float4x4` read out of a buffer), see
+// compiler.h's doc comment on `Compiler::create()`.
 struct ShaderLayoutInfo {
     // One VkDescriptorSetLayoutBinding's worth of information, before it's
     // actually turned into one by PipelineLayoutBuilder.
