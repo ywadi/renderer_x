@@ -45,6 +45,15 @@ and visible culling statistics.
    through the existing Uploader/BindlessTable machinery; mip chains from
    the container (not blit-generated) where present.
 
+5. **Layer/mask system in scene submission (user-requested 2026-08-10):**
+   per-renderable layer bitmask; per-camera cull mask (a camera draws only
+   matching layers); per-light channel mask (a light illuminates only
+   matching objects AND only matching casters render into its shadow
+   passes). Applied at draw-list building time — no render-graph changes
+   required. Follow the established engine conventions (Unity layers /
+   Unreal lighting channels / Godot cull masks) rather than inventing new
+   semantics; pick mask widths and defaults in the Phase 4 spec.
+
 ## Carried process notes
 
 - Research pass before spec (library selection for glTF/KTX2 with
