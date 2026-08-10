@@ -72,6 +72,17 @@ and visible culling statistics.
    meshlet generation (meshopt_buildMeshlets) and LOD chains
    (meshopt_simplify) — see the master design doc's deferred registry.
 
+8. **Task/job system adopted in Phase 4 (user-confirmed 2026-08-10):**
+   Phase 4's asset work (async IO, KTX2/zstd decode, meshoptimizer
+   post-processing) is the natural adoption point for a ready-made
+   work-stealing task scheduler (candidates: enkiTS, Taskflow — research
+   pass decides with citations; ad-hoc std::thread pools are not
+   acceptable per the production bar). Parallel command-buffer recording
+   (per-thread command pools, one render-graph pass callback per worker)
+   is the later, profiling-gated milestone the render graph's
+   independent-pass design already enables — do not build it before draw
+   counts justify it.
+
 ## Carried process notes
 
 - Research pass before spec (library selection for glTF/KTX2 with
