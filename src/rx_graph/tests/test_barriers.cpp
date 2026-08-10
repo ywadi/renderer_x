@@ -1,25 +1,39 @@
 // Task 2 brief's exact required doctest cases, asserting every one of the
-// six mask/layout fields on the barrier structs it names, plus one direct
-// unit test of applyAccess()'s WAR (write-after-read) rule in isolation.
+// six mask/layout fields on the barrier structs it names; plus, from fix
+// round 1 (Critical finding: the per-resource state machine under-
+// synchronized a second reader in an uncovered pipeline stage, and that
+// compounded into an under-synchronized WAR write), two more cases
+// targeting exactly that pattern -- one at the RenderGraph API level
+// ("multi-stage-read-gets-own-barrier") and one unit-level, direct
+// reproduction of the reviewer's own compounding scenario
+// ("war-unions-all-reader-stages").
 //
-// "war-execution-only" cannot be built by declaring passes through
-// RenderGraph's public API: Task 1's compile() binds every reader of a
-// declared resource name to that name's *final* declared writer (see
-// render_graph.cpp's step 2 comment), so a read of "T" can never itself be
-// ordered ahead of a later write of "T" -- any attempt to declare a second
-// writer of the same name forces every reader to depend on it instead,
-// which reorders the read to *after* both writes (write, write, read),
-// never write, read, write. Confirmed empirically (see this task's
-// report) before writing this file, rather than assumed. applyAccess()
-// (barriers.h) is exposed at namespace scope precisely so the WAR
-// accounting rule itself -- a real, necessary rule for a production
-// barrier deriver even though today's RenderGraph pass topology can't
-// exercise it end to end -- can still be verified directly, against a
-// synthetic access sequence.
+// "war-execution-only" and "war-unions-all-reader-stages" cannot be built
+// by declaring passes through RenderGraph's public API: Task 1's compile()
+// binds every reader of a declared resource name to that name's *final*
+// declared writer (see render_graph.cpp's step 2 comment), so a read of
+// "T" can never itself be ordered ahead of a later write of "T" -- any
+// attempt to declare a second writer of the same name forces every reader
+// to depend on it instead, which reorders the read to *after* both writes
+// (write, write, read), never write, read, write. Confirmed empirically
+// (see this task's report) before writing this file, rather than assumed.
+// detail::applyAccess() (barriers.h) is exposed specifically so rules like
+// WAR/WAW -- real, necessary rules for a production barrier deriver even
+// though today's RenderGraph pass topology can't exercise every one of
+// them end to end -- can still be verified directly, against a synthetic
+// access sequence. It lives in rx::graph::detail (not the top-level
+// rx::graph API the brief's ImageBarrier/BufferBarrier/PassBarriers/
+// buildBarriers() interface specifies) precisely to mark it as that kind
+// of seam, not a second, equally-stable public entry point [Task 2 fix
+// round 1, Important finding].
 #include <doctest/doctest.h>
 #include <rx_graph/render_graph.h>
 
+#include <algorithm>
+
 using namespace rx::graph;
+using rx::graph::detail::applyAccess;
+using rx::graph::detail::ResourceBarrierState;
 
 namespace {
 
@@ -82,7 +96,17 @@ void checkBufferBarrier(const BufferBarrier& b, uint32_t physicalIndex, VkPipeli
 // present pass (write "bb" directly). That pass's own first-use write to
 // "bb" then legitimately owns a second image barrier in the same list, so
 // these tests locate the barrier under test by physicalIndex instead of
-// asserting the list's total size.
+// asserting the list's total size -- but assert there is EXACTLY ONE match
+// (via countMatchingImageBarriers(), not just "at least one" via
+// findImageBarrier() alone) before inspecting its fields [Task 2 fix round
+// 1, Minor finding: a regression that both duplicated the barrier under
+// test AND dropped the pass's own unrelated one would previously still
+// have passed a bare `size == 2` + first-match check].
+size_t countMatchingImageBarriers(const std::vector<ImageBarrier>& barriers, uint32_t physicalIndex) {
+    return static_cast<size_t>(
+        std::count_if(barriers.begin(), barriers.end(), [&](const ImageBarrier& b) { return b.physicalIndex == physicalIndex; }));
+}
+
 const ImageBarrier* findImageBarrier(const std::vector<ImageBarrier>& barriers, uint32_t physicalIndex) {
     for (const ImageBarrier& b : barriers) {
         if (b.physicalIndex == physicalIndex) {
@@ -124,6 +148,7 @@ TEST_CASE("shadow-then-sample") {
     // Before "forward": depth write -> fragment sample. "forward" also
     // owns a second, unrelated first-use barrier for its own "bb" output.
     REQUIRE(barriers[1].imageBarriers.size() == 2);
+    REQUIRE(countMatchingImageBarriers(barriers[1].imageBarriers, sm) == 1);
     const ImageBarrier* smBarrier = findImageBarrier(barriers[1].imageBarriers, sm);
     REQUIRE(smBarrier != nullptr);
     checkImageBarrier(*smBarrier, sm, kDepthTestStages, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
@@ -175,12 +200,122 @@ TEST_CASE("hdr-tonemap") {
     REQUIRE(barriers.size() == 2);
 
     REQUIRE(barriers[1].imageBarriers.size() == 2);
+    REQUIRE(countMatchingImageBarriers(barriers[1].imageBarriers, hdr) == 1);
     const ImageBarrier* hdrBarrier = findImageBarrier(barriers[1].imageBarriers, hdr);
     REQUIRE(hdrBarrier != nullptr);
     checkImageBarrier(*hdrBarrier, hdr, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
+// Task 2 fix round 1, Critical finding's required test (a): a resource
+// read by two passes in two *different* pipeline stages, with no
+// intervening write. The first port's bug fully cleared its aggregate
+// invalidated-visibility state the moment the first reader's barrier
+// resolved the pending flush, so the second reader (a different,
+// never-covered stage) got zero barriers -- a real GPU synchronization
+// hazard, not a missed optimization. The fix tracks per-stage-bit
+// visibility (detail::ResourceBarrierState::invalidatedInStage), so B's
+// own stage being uncovered is detected correctly and B still chains a
+// correct barrier off the persisted last-write source.
+TEST_CASE("multi-stage-read-gets-own-barrier") {
+    RenderGraph graph;
+    graph.addPass("W").addColorOutput("T", colorDesc());                              // pass 0
+    // "A" doubles as the present pass (Graphics-class -> FRAGMENT_SHADER read).
+    graph.addPass("A").addTextureInput("T").addColorOutput("bb", colorDesc());          // pass 1
+    // "B" has no attachment output at all -> Compute-class -> COMPUTE_SHADER read,
+    // a stage A's own barrier never touches.
+    graph.addPass("B").addTextureInput("T").setSideEffect();                            // pass 2
+    graph.setBackbufferSource("bb");
+    graph.compile(kInfo);
+
+    const CompiledGraph& compiled = graph.compiled();
+    const auto order = compiled.executionOrder();
+    REQUIRE(order.size() == 3);
+    CHECK(order[0] == 0);
+    CHECK(order[1] == 1);
+    CHECK(order[2] == 2);
+
+    const uint32_t t = physicalIndexOf(compiled, "T");
+    const auto barriers = compiled.passBarriers();
+    REQUIRE(barriers.size() == 3);
+
+    // Before "A": W's write -> A's fragment-shader sample (the flush barrier).
+    REQUIRE(barriers[1].imageBarriers.size() == 2);  // T's flush barrier + bb's first-use one
+    REQUIRE(countMatchingImageBarriers(barriers[1].imageBarriers, t) == 1);
+    const ImageBarrier* aBarrier = findImageBarrier(barriers[1].imageBarriers, t);
+    REQUIRE(aBarrier != nullptr);
+    checkImageBarrier(*aBarrier, t, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                       VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    // Before "B": its own invalidate barrier -- no layout change (A already
+    // transitioned "T" to SHADER_READ_ONLY_OPTIMAL), srcAccess=0 (already
+    // made available to A), but a real barrier all the same, chained off
+    // the same persisted write source A's barrier used, so COMPUTE_SHADER
+    // actually gets a visibility guarantee instead of none.
+    REQUIRE(barriers[2].imageBarriers.size() == 1);
+    checkImageBarrier(barriers[2].imageBarriers[0], t, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_NONE,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
+// Task 2 fix round 1, Critical finding's required test (b): the
+// reviewer's own compounding scenario, reproduced directly against
+// detail::applyAccess() -- write, read(S1), read(S2, different stage),
+// then a write (WAR). The WAR write's srcStage must be the union of every
+// reader's stage since the last write (S1 | S2), not just the most recent
+// reader, or the write could start before an in-flight access in the
+// *other* stage has finished.
+TEST_CASE("war-unions-all-reader-stages") {
+    ResourceBarrierState state;
+
+    auto write1 = applyAccess(state, /*isBuffer=*/false, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                               VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    REQUIRE(write1.has_value());
+    CHECK(write1->srcStage == VK_PIPELINE_STAGE_2_NONE);
+    CHECK(write1->srcAccess == VK_ACCESS_2_NONE);
+    CHECK(write1->dstStage == VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
+    CHECK(write1->dstAccess == VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    CHECK(write1->oldLayout == VK_IMAGE_LAYOUT_UNDEFINED);
+    CHECK(write1->newLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+    auto read1 = applyAccess(state, false, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    REQUIRE(read1.has_value());
+    CHECK(read1->srcStage == VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
+    CHECK(read1->srcAccess == VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    CHECK(read1->dstStage == VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT);
+    CHECK(read1->dstAccess == VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    CHECK(read1->oldLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    CHECK(read1->newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    // read2, a different stage than read1, with no intervening write --
+    // this used to be nullopt (the Critical bug); now it must still get a
+    // barrier, chained off the same persisted write source as read1's.
+    auto read2 = applyAccess(state, false, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    REQUIRE(read2.has_value());
+    CHECK(read2->srcStage == VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
+    CHECK(read2->srcAccess == VK_ACCESS_2_NONE);  // already made available by read1's barrier
+    CHECK(read2->dstStage == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    CHECK(read2->dstAccess == VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    CHECK(read2->oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    CHECK(read2->newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);  // no layout change
+
+    // The WAR write: srcStage must be VERTEX_SHADER | COMPUTE_SHADER (the
+    // union of both readers), not just one of them and not the original
+    // write's stage.
+    auto warWrite = applyAccess(state, false, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    REQUIRE(warWrite.has_value());
+    CHECK(warWrite->srcStage == (VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT));
+    CHECK(warWrite->srcAccess == VK_ACCESS_2_NONE);
+    CHECK(warWrite->dstStage == VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
+    CHECK(warWrite->dstAccess == VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    CHECK(warWrite->oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    CHECK(warWrite->newLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 }
 
 TEST_CASE("war-execution-only") {
@@ -288,6 +423,7 @@ TEST_CASE("culled-contributes-nothing") {
     // "consumer" also owns a second, unrelated first-use barrier for its
     // own "bb" output.
     REQUIRE(barriers[1].imageBarriers.size() == 2);
+    REQUIRE(countMatchingImageBarriers(barriers[1].imageBarriers, shared) == 1);
     const ImageBarrier* sharedBarrier = findImageBarrier(barriers[1].imageBarriers, shared);
     REQUIRE(sharedBarrier != nullptr);
     checkImageBarrier(*sharedBarrier, shared, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
