@@ -131,21 +131,14 @@ jobs:
   windows-cross-zig:
     name: windows-cross-zig
     runs-on: ubuntu-latest
-    # Discovered directly from this workflow's own first real run: a
-    # brand-new Wine prefix defaults to WINEARCH=win32, which needs wine32
-    # (and i386 multiarch) -- this runner's "wine" package only pulled in
-    # wine64 to satisfy that dependency, so the default win32 prefix setup
-    # silently half-completed (Wine's own log: "it looks like wine32 is
-    # missing") and left Wine's window/Vulkan subsystem broken: SDL3's very
-    # first, unconditional Window::create() call failed outright
-    # ("Installed Vulkan doesn't implement the VK_KHR_surface extension"),
-    # not merely hitting a skip guard. This project's cross-compiled
-    # binaries are x86_64-windows-gnu only -- pure 64-bit, no 32-bit WoW64
-    # component ever needed -- so telling Wine to create a 64-bit-only
-    # prefix from the start sidesteps the wine32 dependency entirely.
-    # Verified locally: a fresh WINEARCH=win64 prefix runs
-    # toolchain_check.exe, rx_core_tests.exe, and rx_platform_tests.exe
-    # (the exact binary that failed in CI) all cleanly.
+    # This project's cross-compiled binaries are x86_64-windows-gnu only --
+    # pure 64-bit, no 32-bit WoW64 component ever needed -- so pin
+    # WINEARCH=win64 rather than let a brand-new prefix default to win32
+    # (which pulls in a wine32/i386-multiarch dependency this project never
+    # otherwise needs). Note this alone did NOT fix the Vulkan-surface
+    # failure below (verified: the same failure reproduced identically with
+    # WINEARCH pinned) -- it's kept as separately-correct hygiene for a
+    # 64-bit-only target, not as that fix.
     env:
       WINEARCH: win64
     steps:
@@ -157,11 +150,30 @@ jobs:
       # linux-native job -- SDL3 needs a video driver backend even for
       # hidden windows, and Wine's own window creation additionally wants a
       # real X server underneath it.
+      #
+      # mesa-vulkan-drivers/vulkan-tools/libvulkan-dev: discovered missing
+      # on this workflow's first real run of this job. rx_platform's
+      # Window::create() (src/rx_platform/src/window.cpp) unconditionally
+      # requests SDL_WINDOW_VULKAN -- even rx_platform_tests' "any video
+      # driver" lifecycle case, which has no skip guard -- and Wine's own
+      # built-in Vulkan support (winevulkan/vulkan-1.dll) is a passthrough
+      # to whatever real Vulkan loader/ICD exists on the *host*: with none
+      # installed on this runner, winevulkan has nothing to pass through to
+      # and reports zero surface support, so SDL_CreateWindow(...,
+      # SDL_WINDOW_VULKAN) failed outright (not a skip -- a real failure) in
+      # this job's very first ctest run. Installing the same lavapipe +
+      # loader packages the linux-native job uses gives winevulkan a real
+      # (software) Vulkan implementation to forward to, without changing
+      # what's excluded below: rx_rhi_vk_tests/sample_01_triangle_headless
+      # stay excluded from ctest -- exercising this project's actual
+      # device/swapchain/synchronization2 pipeline through Wine's Vulkan
+      # passthrough is a materially bigger claim than "window creation
+      # succeeds" and is not verified here.
       - name: Install system packages
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            ninja-build wine xvfb
+            ninja-build wine xvfb mesa-vulkan-drivers vulkan-tools libvulkan-dev
 
       - name: Install pinned zig toolchain (checksum-verified)
         run: |
