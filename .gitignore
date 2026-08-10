@@ -5,3 +5,5 @@ build/
 build-*/
 .cache/
 .claude/
+rendererx-samples-*.zip
+ctest-results-*.xml

@@ -7,6 +7,43 @@ of the normal `cmake --build --preset <preset>` flow (see the root
 `CMakeLists.txt`'s `add_subdirectory(samples/...)` lines) and don't need any
 separate build step.
 
+## Downloading a prebuilt sample bundle (no build required)
+
+Every green CI run (`.github/workflows/ci.yml`) uploads one workflow
+artifact per platform — `rendererx-samples-linux-x86_64.zip` from the
+`linux-native` job, `rendererx-samples-windows-x86_64.zip` from the
+`windows-cross-zig` job — built by `tools/package_samples.sh`. Download
+either from the run's "Artifacts" section on GitHub, unzip it, and each
+sample is immediately runnable from its own subdirectory, no `cmake`/build
+step involved:
+
+```
+01_triangle/
+  sample_01_triangle[.exe]         # + triangle.vert.spv, triangle.frag.spv
+02_hotreload/
+  sample_02_hotreload[.exe]        # + hotreload.slang, the Slang runtime
+                                    #   libs below, and LICENSE
+03_bindless_mesh/
+  sample_03_bindless_mesh[.exe]    # + texture.png, the Slang runtime libs
+                                    #   below, and LICENSE
+04_streaming/
+  sample_04_streaming[.exe]        # + the Slang runtime libs below, and
+                                    #   LICENSE (no other external asset)
+```
+
+`01_triangle` is the one exception to "needs the Slang runtime libs": its
+shaders are precompiled offline by `slangc` at build time, so it ships only
+its two `.spv` files and nothing Slang-related at all [D2] — see its own
+"Redistribution" section below. The other three do real in-process Slang
+compilation at startup, so each of their directories additionally carries
+`libslang-compiler.so*`/`slang-compiler.dll` plus the `slang-glslang`/
+`slang-glsl-module`/`slang-rt` plugins it dlopens on demand, and the Slang
+`LICENSE` file (Apache-2.0 WITH LLVM-exception — kept for attribution when
+redistributing those libraries). `cd` into any one subdirectory and run the
+binary exactly as described in that sample's own section below — every
+subdirectory in the zip is independently self-contained, so copying just
+one elsewhere works too.
+
 ## 01_triangle
 
 `samples/01_triangle/main.cpp` — renders one hardcoded white triangle on a
@@ -69,6 +106,22 @@ Closing the window exits the process with status 0 and logs:
 ```
 [info] --present: window closed cleanly
 ```
+
+### Redistribution
+
+Unlike every other sample here, 01_triangle's shaders (`triangle.vert.slang`/
+`triangle.frag.slang`) are compiled to SPIR-V **offline**, by `slangc`, at
+build time (`CMakeLists.txt`'s `add_custom_command`s) — this binary never
+calls into Slang at runtime, so it needs **no Slang runtime libraries at
+all** [D2]. It does still need the two resulting `.spv` files on disk
+somewhere it can find them at run time: `CMakeLists.txt` deploys
+`triangle.vert.spv`/`triangle.frag.spv` next to the binary at build time
+(the same pattern 02_hotreload uses for `hotreload.slang`), and `main.cpp`'s
+`resolveSpvPath()` looks for them next to the executable (via
+`SDL_GetBasePath()`) before falling back to the compile-time build-tree
+path. A redistributed copy of just this sample's three files (the binary +
+the two `.spv` files) runs identically outside the build tree — no Slang
+DLLs/`.so`s, no LICENSE file, nothing else needed.
 
 ## 02_hotreload
 
@@ -379,9 +432,14 @@ This produces `build/windows-cross-zig/samples/01_triangle/sample_01_triangle.ex
 `build/windows-cross-zig/samples/02_hotreload/sample_02_hotreload.exe`,
 `build/windows-cross-zig/samples/03_bindless_mesh/sample_03_bindless_mesh.exe`, and
 `build/windows-cross-zig/samples/04_streaming/sample_04_streaming.exe`.
-01_triangle's binary is statically linked (no separate `.dll`s to ship) —
-copy just that one `.exe` to the Windows machine (or run it directly under
-Wine on Linux) and run it from a terminal/`cmd.exe`/PowerShell:
+01_triangle's binary is statically linked and needs no Slang DLLs (its
+shaders are precompiled offline by `slangc` at build time — see its own
+"Redistribution" section above) — but it does still need the two `.spv`
+files deployed next to it (`triangle.vert.spv`/`triangle.frag.spv`). Copy
+`sample_01_triangle.exe` plus those two files (not the whole build-output
+directory's `CMakeFiles`/`.pdb`/`.cmake` bookkeeping) to the Windows machine
+(or run it directly under Wine on Linux) and run it from a
+terminal/`cmd.exe`/PowerShell:
 
 ```
 sample_01_triangle.exe            REM headless correctness gate

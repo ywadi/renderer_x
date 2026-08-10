@@ -71,6 +71,39 @@ constexpr uint32_t kCenterY = 150;
 constexpr uint32_t kCornerX = 10;
 constexpr uint32_t kCornerY = 10;
 
+constexpr const char* kVertFilename = "triangle.vert.spv";
+constexpr const char* kFragFilename = "triangle.frag.spv";
+
+// Resolves a precompiled SPIR-V file's path next to this executable at
+// runtime (same SDL_GetBasePath() mechanism 02_hotreload's
+// resolveShaderPath()/03_bindless_mesh's resolveTexturePath() use), so a
+// redistributed copy of this sample's build-output directory (binary + the
+// two .spv files deployed next to it by CMakeLists.txt's POST_BUILD copy
+// step) works identically outside the build tree -- this sample ships no
+// Slang runtime libraries (its shaders are precompiled offline by slangc at
+// build time, never compiled in-process [R:D2]), but it still needs these
+// two files on disk somewhere findable at run time, and a hardcoded
+// absolute build-tree path (the old behavior, still available below as a
+// fallback) is not that.
+//
+// Falls back to `buildTreeFallback` -- the compile-time absolute path
+// (RX_TRIANGLE_VERT_SPV/RX_TRIANGLE_FRAG_SPV, still valid when running
+// in-place from the build tree, e.g. under a debugger with a stale deploy
+// step) -- only if the exe-relative copy can't be found; the redistributed
+// zip's only copy is the exe-relative one, and this is the path that
+// actually gets exercised there.
+std::string resolveSpvPath(const char* filename, const char* buildTreeFallback) {
+    const char* basePath = SDL_GetBasePath();
+    if (basePath != nullptr) {
+        std::string candidate = std::string(basePath) + filename;
+        std::ifstream probe(candidate, std::ios::binary);
+        if (probe.good()) {
+            return candidate;
+        }
+    }
+    return buildTreeFallback;
+}
+
 std::vector<char> readFile(const char* path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
@@ -156,11 +189,12 @@ void destroyTrianglePipeline(VkDevice device, TrianglePipeline& p) {
 std::optional<TrianglePipeline> createTrianglePipeline(VkDevice device, VkFormat colorFormat) {
     TrianglePipeline result;
 
-    auto vertCode = readFile(RX_TRIANGLE_VERT_SPV);
-    auto fragCode = readFile(RX_TRIANGLE_FRAG_SPV);
+    const std::string vertPath = resolveSpvPath(kVertFilename, RX_TRIANGLE_VERT_SPV);
+    const std::string fragPath = resolveSpvPath(kFragFilename, RX_TRIANGLE_FRAG_SPV);
+    auto vertCode = readFile(vertPath.c_str());
+    auto fragCode = readFile(fragPath.c_str());
     if (vertCode.empty() || fragCode.empty()) {
-        RX_LOG_ERROR("failed to read compiled triangle shader SPIR-V from {} / {}", RX_TRIANGLE_VERT_SPV,
-                      RX_TRIANGLE_FRAG_SPV);
+        RX_LOG_ERROR("failed to read compiled triangle shader SPIR-V from {} / {}", vertPath, fragPath);
         return std::nullopt;
     }
 
