@@ -184,6 +184,19 @@ std::optional<uint32_t> findMemoryTypeIndex(const VkPhysicalDeviceMemoryProperti
 // generically -- `pushConstantSize == 0` means "this shader declared no
 // push constant, don't push anything" (the embedded ctest sources' case).
 //
+// pushConstantOffset is `pushRanges[0].offset` verbatim, not assumed to be
+// 0 -- post-review fix (an earlier version of this file hardcoded offset 0
+// into the vkCmdPushConstants call below instead of tracking it here; that
+// was only correct by coincidence, because hotreload.slang's single
+// `[[vk::push_constant]]` global happens to reflect at offset 0 today, and
+// nothing enforced that staying true). This sample rejects >1 push range
+// (see buildPipelineFromCompileResult) but never assumes *where* the one
+// range it does support starts -- honoring whatever reflect() reports is
+// strictly more correct than hand-waving it away, and a live-editable
+// shader (the entire point of this sample) deserves the host code
+// tracking what the shader actually declares rather than silently
+// mis-pushing bytes to the wrong offset the moment an edit changes it.
+//
 // Move-only (implicitly, via the non-copyable rx::rhi::PipelineLayoutBundle
 // member) -- raw VkShaderModule/VkPipeline handles are torn down explicitly
 // by destroyReloadablePipeline() below, same discipline as 01_triangle's
@@ -195,6 +208,7 @@ struct ReloadablePipeline {
     VkShaderModule fragModule = VK_NULL_HANDLE;
     rx::rhi::PipelineLayoutBundle layoutBundle;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    uint32_t pushConstantOffset = 0;
     uint32_t pushConstantSize = 0;
     VkShaderStageFlags pushConstantStages = 0;
 };
@@ -217,6 +231,7 @@ void destroyReloadablePipeline(VkDevice device, ReloadablePipeline& p) {
     p.pipeline = VK_NULL_HANDLE;
     p.fragModule = VK_NULL_HANDLE;
     p.vertModule = VK_NULL_HANDLE;
+    p.pushConstantOffset = 0;
     p.pushConstantSize = 0;
     p.pushConstantStages = 0;
 }
@@ -275,6 +290,7 @@ std::optional<ReloadablePipeline> buildPipelineFromCompileResult(VkDevice device
     ReloadablePipeline result;
     result.layoutBundle = std::move(*layoutBundle);
     if (!layoutInfo->pushRanges.empty()) {
+        result.pushConstantOffset = layoutInfo->pushRanges[0].offset;
         result.pushConstantSize = layoutInfo->pushRanges[0].size;
         result.pushConstantStages = layoutInfo->pushRanges[0].stages;
     }
@@ -434,6 +450,15 @@ std::optional<ReloadablePipeline> buildPipelineFromFile(VkDevice device, const s
 // call. A no-op for a shader with zero push ranges (the embedded ctest
 // sources), so this same helper is safe to call unconditionally from both
 // modes' render code.
+//
+// `data` is sized to exactly the reflected range's byte length and pushed
+// at exactly its reflected offset (p.pushConstantOffset) -- not
+// hardcoded to offset 0 -- so this stays correct even if a future shader
+// edit reflects a nonzero offset (e.g. more than one global ends up
+// sharing the push-constant block in some future edit); `time` still
+// lands at the start of `data`, which is the struct-relative offset 0
+// PushConstants::time actually has, regardless of where that struct's
+// bytes start within the overall push-constant block.
 void pushTimeIfDeclared(VkCommandBuffer cmd, const ReloadablePipeline& p, float timeSeconds) {
     if (p.pushConstantSize == 0) {
         return;
@@ -442,7 +467,8 @@ void pushTimeIfDeclared(VkCommandBuffer cmd, const ReloadablePipeline& p, float 
     if (data.size() >= sizeof(float)) {
         std::memcpy(data.data(), &timeSeconds, sizeof(float));
     }
-    vkCmdPushConstants(cmd, p.layoutBundle.layout, p.pushConstantStages, 0, p.pushConstantSize, data.data());
+    vkCmdPushConstants(cmd, p.layoutBundle.layout, p.pushConstantStages, p.pushConstantOffset, p.pushConstantSize,
+                       data.data());
 }
 
 // Per-swapchain-image VkImageViews for --present mode -- identical
