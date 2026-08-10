@@ -70,6 +70,102 @@ Closing the window exits the process with status 0 and logs:
 [info] --present: window closed cleanly
 ```
 
+## 02_hotreload
+
+`samples/02_hotreload/main.cpp` — a fullscreen triangle whose fragment
+shader is compiled **at runtime** by `rx_shader`'s `Compiler` (in-process
+Slang → SPIR-V), not pre-baked offline by `slangc` like 01_triangle's
+shaders. Unlike 01_triangle's hand-typed empty `VkPipelineLayoutCreateInfo`,
+this sample's `VkPipelineLayout` always comes from `rx::shader::reflect()` +
+`rx::rhi::PipelineLayoutBuilder::build()` — driven by whatever the compiled
+shader actually declares (a single push-constant `float time`, no
+descriptor bindings). Two modes, one shared compile→reflect→build→pipeline
+path:
+
+- **Headless (default, no flags)** — the `ctest` correctness gate. Compiles
+  an embedded solid-white shader, renders it into a dedicated **offscreen**
+  256x256 image (same discipline as 01_triangle: never an unacquired
+  swapchain image), and reads it back. Then compiles a second embedded
+  solid-black shader, swaps the pipeline, renders again, and asserts the
+  readback actually changed — proving a reload really rebuilds what gets
+  rendered, not just that compilation succeeds. Registered as the
+  `sample_02_hotreload_headless` ctest case.
+- **`--present`** — opens a real window and renders `hotreload.slang` (a
+  file on disk, deployed next to the binary at build time — see
+  `CMakeLists.txt`). Every ~250ms (~4Hz, a plain `std::filesystem::
+  last_write_time` poll — no file-watcher dependency) it checks whether
+  that file changed on disk; on a change it recompiles via
+  `Compiler::compileFromFile`, and on success swaps in a freshly built
+  pipeline. **On a compile failure, the last-good pipeline keeps
+  rendering** — Slang's diagnostics are logged to the console (the exact
+  error, with source context) and the window never goes blank or crashes
+  because of a shader typo. Not part of `ctest` (interactive by nature) —
+  see `MANUAL_VERIFICATION.md` for the per-platform manual check.
+
+### Editing the shader live
+
+With `--present` running, open the `hotreload.slang` sitting next to the
+running binary (**not** `samples/02_hotreload/hotreload.slang` in the
+source tree — that copy is only the template deployed at build time) in
+any editor and change `fsMain`'s body, e.g.:
+
+```hlsl
+[shader("fragment")]
+float4 fsMain(float4 fragCoord : SV_Position) : SV_Target
+{
+    uint cx = uint(fragCoord.x) / 32;
+    uint cy = uint(fragCoord.y) / 32;
+    float c = ((cx + cy) % 2 == 0) ? 1.0 : 0.0;
+    return float4(c, c, 0.0, 1.0);   // yellow/black checkerboard
+}
+```
+
+Save the file — the window updates within about 250ms, with a console log
+line confirming the swap (`reload succeeded, pipeline swapped`). Introduce
+a typo instead and the console logs Slang's diagnostics while the window
+keeps showing whatever last compiled successfully; fix the typo and save
+again to recover. `gPush.time` (seconds since the window opened) is
+available to any edit that wants to animate; the shipped default uses it to
+drive a moving diagonal stripe pattern.
+
+Pipeline swap strategy: this sample's coordinator sign-off allows a plain
+`vkDeviceWaitIdle()` immediately before destroying the old pipeline on
+every reload, rather than a fence-keyed deferred-destruction queue (not yet
+part of this codebase at the time this sample was written) — acceptable
+because reloads are a rare, human-interactive event, not a per-frame
+operation, so the stall is invisible in practice.
+
+### Expected output
+
+**Headless mode**:
+
+```
+[info] hotreload headless gate PASSED
+```
+
+**`--present` mode** opens an 800x600 window titled `rx_hotreload_sample
+(--present)` showing an animated diagonal stripe pattern (orange/blue,
+shifting continuously via the `time` push constant) covering the whole
+window. Editing and saving `hotreload.slang` (see above) changes the
+pattern within ~250ms. Closing the window exits with status 0 and logs:
+
+```
+[info] --present: window closed cleanly
+```
+
+### Redistribution
+
+This is the sample that proves the Task 1 Slang-runtime-lib deployment
+mechanism (`rx_shader_deploy_runtime_libs()`) end to end: linking
+`rx_shader` pulls in `slang::slang`, and this binary does real in-process
+compilation on every single run (both modes) — if the runtime libraries
+(`libslang-compiler.so*`/`slang-compiler.dll` + the `slang-glslang`/
+`slang-glsl-module`/`slang-rt` plugins) weren't copied next to the
+executable at build time with a working RPATH, `Compiler::create()` would
+fail immediately. A redistributed copy of just this sample's build-output
+directory (the binary + `hotreload.slang` + those runtime libraries) runs
+identically outside the build tree.
+
 ## Building and running
 
 Both sample modes and both build presets work identically on Linux and
@@ -92,6 +188,15 @@ cmake --build --preset linux-native
 ./build/linux-native/samples/01_triangle/sample_01_triangle --present
 ```
 
+```sh
+# Headless correctness gate (also runs via ctest, see below):
+./build/linux-native/samples/02_hotreload/sample_02_hotreload
+
+# Interactive present-mode window with live shader editing -- edit
+# build/linux-native/samples/02_hotreload/hotreload.slang while this runs:
+./build/linux-native/samples/02_hotreload/sample_02_hotreload --present
+```
+
 Steam Deck Desktop Mode: open Konsole (or any terminal) from the Desktop
 Mode taskbar and run the exact same commands above — the Deck's SteamOS is
 Linux with a Vulkan driver (AMD Mesa RADV), so `linux-native` is the correct
@@ -107,14 +212,29 @@ cmake --preset windows-cross-zig
 cmake --build --preset windows-cross-zig
 ```
 
-This produces `build/windows-cross-zig/samples/01_triangle/sample_01_triangle.exe`.
-The binary is statically linked (no separate `.dll`s to ship) — copy just
-that one `.exe` to the Windows machine (or run it directly under Wine on
-Linux) and run it from a terminal/`cmd.exe`/PowerShell:
+This produces `build/windows-cross-zig/samples/01_triangle/sample_01_triangle.exe`
+and `build/windows-cross-zig/samples/02_hotreload/sample_02_hotreload.exe`.
+01_triangle's binary is statically linked (no separate `.dll`s to ship) —
+copy just that one `.exe` to the Windows machine (or run it directly under
+Wine on Linux) and run it from a terminal/`cmd.exe`/PowerShell:
 
 ```
 sample_01_triangle.exe            REM headless correctness gate
 sample_01_triangle.exe --present  REM interactive present-mode window
+```
+
+02_hotreload is **not** self-contained the same way: it does real
+in-process Slang compilation, so it needs `slang-compiler.dll` +
+`slang-glslang.dll` + `slang-glsl-module.dll` + `slang-rt.dll` (all
+deployed next to it at build time — see that sample's own README section
+above) alongside the `.exe`, plus `hotreload.slang` for `--present` mode.
+Copy the entire `build/windows-cross-zig/samples/02_hotreload/` directory
+(minus the `CMakeFiles`/`.pdb`/`.cmake` build bookkeeping) to run it
+elsewhere:
+
+```
+sample_02_hotreload.exe            REM headless correctness gate
+sample_02_hotreload.exe --present  REM interactive present-mode window with live editing
 ```
 
 See `MANUAL_VERIFICATION.md` at the repo root for the actual per-platform
@@ -126,7 +246,8 @@ run checklist (what to record, what "pass" looks like on real hardware).
 ctest --preset linux-native --output-on-failure
 ```
 
-This runs `sample_01_triangle_headless` alongside every other project test
-(`rx_core_tests`, `rx_platform_tests`, `rx_rhi_vk_tests`, `shader_spirv_test`)
-— `--present` mode is intentionally excluded from `ctest` (it blocks on a
-real window and user/OS interaction) and is exercised manually instead.
+This runs `sample_01_triangle_headless` and `sample_02_hotreload_headless`
+alongside every other project test (`rx_core_tests`, `rx_platform_tests`,
+`rx_shader_tests`, `rx_rhi_vk_tests`, `shader_spirv_test`) — `--present`
+mode is intentionally excluded from `ctest` (it blocks on a real window and
+user/OS interaction) and is exercised manually instead.
