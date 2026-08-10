@@ -1,6 +1,8 @@
 # RendererX Public ABI Boundary Rules
 
-The RendererX DLL's public interface follows a COM-lite pattern for ABI stability
+RendererX's public interface (`rx_api.h`, today built into the static
+libraries; the standalone DLL artifact is deferred per spec D5) follows a
+COM-lite pattern for ABI stability
 and cross-compiler compatibility. This document establishes the rules for future
 interface additions.
 
