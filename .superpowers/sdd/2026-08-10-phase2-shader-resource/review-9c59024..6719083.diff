@@ -1,0 +1,1058 @@
+# Review package: 9c59024..6719083ef330b7cdbc9084a278960aed4c17c569
+
+## Commits
+6719083 Add Task 8 report; record Phase 2 Task 8 completion in SDD ledger
+ca8f4be Fix hardware-assuming Uploader tests that broke real CI (pre-existing red main)
+e051006 Phase 2 Task 8: CI + packaging for all four samples
+
+## Files changed
+ .github/workflows/ci.yml                           | 135 +++++++++++----
+ .gitignore                                         |   2 +
+ .../2026-08-10-phase2-shader-resource/progress.md  |   2 +
+ .../task-8-report.md                               | 191 +++++++++++++++++++++
+ samples/01_triangle/CMakeLists.txt                 |  19 ++
+ samples/01_triangle/main.cpp                       |  42 ++++-
+ samples/README.md                                  |  64 ++++++-
+ src/rx_rhi_vk/include/rx_rhi_vk/buffer.h           |  27 ++-
+ src/rx_rhi_vk/tests/upload_test.cpp                |  39 ++++-
+ tools/package_samples.sh                           | 156 +++++++++++++++++
+ 10 files changed, 631 insertions(+), 46 deletions(-)
+
+## Diff
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index daace96..bbdb6fb 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -65,31 +65,42 @@ jobs:
+             libxfixes-dev libxss-dev libxtst-dev libxkbcommon-dev
+ 
+       - name: Install pinned zig toolchain (checksum-verified)
+         run: |
+           curl -fsSL -o "/tmp/${RX_ZIG_ARCHIVE}" "${RX_ZIG_URL}"
+           echo "${RX_ZIG_SHA256}  /tmp/${RX_ZIG_ARCHIVE}" | sha256sum -c -
+           mkdir -p toolchain/zig
+           tar -xf "/tmp/${RX_ZIG_ARCHIVE}" -C toolchain/zig --strip-components=1
+           toolchain/zig/zig version
+ 
+-      # Slang is host-side tooling fetched once by tools/fetch_slang.cmake
+-      # (see that file) -- identical content regardless of which target
+-      # triple a job cross-compiles for, since slangc always runs on the
+-      # host (Linux, here) even in the windows-cross-zig job. Shared across
+-      # both jobs deliberately: whichever job's cache-save wins a race is
+-      # harmless, since both would have fetched byte-identical content.
++      # Keyed per-job (not shared with windows-cross-zig, unlike before):
++      # tools/fetch_slang.cmake fetches ONE platform subtree here
++      # (third_party/slang-prebuilt/linux-x86_64/, host==target on this
++      # preset) but windows-cross-zig fetches TWO (that same linux-x86_64/
++      # host tree for slangc, PLUS a second windows-x86_64/ tree for the
++      # target-side runtime libs) under the identical path. A shared key
++      # across both jobs was fine before this task (both jobs populated the
++      # same single subtree), but is now a real cache-effectiveness bug
++      # (tracked from Task 1's review): actions/cache never re-saves an
++      # exact key match, so whichever job's save "wins" that shared key
++      # forever after starves the other job of a hit for the subtree only
++      # IT populates -- windows-cross-zig would end up re-fetching its
++      # windows-x86_64/ tree from GitHub on every single cold-restore run
++      # (self-healing, not a correctness bug, just a silently-defeated
++      # cache). Per-job keys mean each job's full fetched state (both
++      # subtrees for windows-cross-zig, one for linux-native) is exactly
++      # what gets saved and restored for that job every time.
+       - name: Cache prebuilt Slang
+         uses: actions/cache@v5
+         with:
+           path: third_party/slang-prebuilt
+-          key: slang-prebuilt-${{ hashFiles('tools/fetch_slang.cmake') }}
++          key: slang-prebuilt-linux-native-${{ hashFiles('tools/fetch_slang.cmake') }}
+ 
+       # Unlike the Slang cache above, this key is job-specific
+       # (deps-cache-linux-native-..., not shared with windows-cross-zig):
+       # DepCache.cmake's own cache key already includes the target triple
+       # and zig version, so this preset's .deps-cache/ subdirectories never
+       # collide with the other job's -- but actions/cache treats an exact
+       # key match across concurrent jobs as a single cache *entry*, and
+       # only the first job to finish successfully saves it. Two jobs
+       # racing on one shared key would starve whichever job loses the
+       # race of ever getting its own dependencies cached. A per-preset key
+@@ -102,37 +113,72 @@ jobs:
+ 
+       - name: Configure
+         run: cmake --preset linux-native
+ 
+       - name: Build
+         run: cmake --build --preset linux-native
+ 
+       # lavapipe provides the Vulkan device; Xvfb provides the display SDL3
+       # needs to initialize a (hidden) window. This is not a soft/best-effort
+       # run: verified locally (forcing VK_ICD_FILENAMES to lavapipe only, and
+-      # running the whole suite under xvfb-run) that all 5 tests, including
+-      # rx_rhi_vk_tests and sample_01_triangle_headless, genuinely execute
+-      # their real assertions against lavapipe rather than hitting a skip
+-      # guard -- lavapipe is a real, if software, Vulkan 1.3+ implementation.
++      # running the whole suite under xvfb-run) that all 9 tests -- including
++      # rx_rhi_vk_tests, rx_shader_tests, and all four
++      # sample_*_headless gates (01_triangle, 02_hotreload, 03_bindless_mesh,
++      # 04_streaming) -- genuinely execute their real assertions against
++      # lavapipe rather than hitting a skip guard -- lavapipe is a real, if
++      # software, Vulkan 1.3+ implementation. The sample gates fail closed
++      # (a crash or a wrong-pixel assertion is a real ctest FAILED, not a
++      # silent skip), so ctest's own per-test "... Passed" line for each of
++      # them, printed unconditionally below regardless of
++      # --output-on-failure, IS the proof they ran -- kept visible in the
++      # raw log rather than only inside the junit file.
++      #
++      # --output-junit also writes a self-verifying, structured report (one
++      # <testcase> per test, each with the full captured stdout/stderr as
++      # <system-out> -- e.g. every sample's own "... headless gate PASSED"
++      # log line lands inside it) uploaded as its own artifact below,
++      # closing Phase 1's deferred-minor suggestion to consider
++      # -V/--output-junit for exactly this reason: a durable, greppable
++      # artifact that outlives the raw console log.
+       - name: Test (xvfb + lavapipe)
+-        run: xvfb-run -a ctest --preset linux-native --output-on-failure
++        run: >-
++          xvfb-run -a ctest --preset linux-native --output-on-failure
++          --output-junit ${{ github.workspace }}/ctest-results-linux-native.xml
+ 
+       # Real incremental-rebuild timing, not a no-op: tools/check_build_budget.sh
+       # touches src/rx_core/src/log.cpp itself before timing.
+       - name: Build budget check
+         run: tools/check_build_budget.sh linux-native 60
+ 
+-      - name: Upload sample artifact
++      # Packages all four samples into the exact unzip-and-run layout a user
++      # gets [R:D2]: one subdirectory per sample with that sample's binary
++      # plus everything IT needs (01_triangle: just its two precompiled
++      # .spv files, no Slang libs; 02/03/04: the Slang runtime libs +
++      # LICENSE deployed next to each at build time, plus 02's
++      # hotreload.slang / 03's texture.png). See tools/package_samples.sh
++      # for the full per-sample manifest and why each file is there.
++      - name: Package samples for redistribution
++        run: tools/package_samples.sh linux-native linux-x86_64 rendererx-samples-linux-x86_64.zip
++
++      - name: Upload sample artifact bundle
++        uses: actions/upload-artifact@v7
++        with:
++          name: rendererx-samples-linux-x86_64
++          path: rendererx-samples-linux-x86_64.zip
++          if-no-files-found: error
++
++      - name: Upload ctest junit results
+         uses: actions/upload-artifact@v7
++        if: always()
+         with:
+-          name: sample_01_triangle-linux-native
+-          path: build/linux-native/samples/01_triangle/sample_01_triangle
++          name: ctest-results-linux-native
++          path: ctest-results-linux-native.xml
+           if-no-files-found: error
+ 
+   windows-cross-zig:
+     name: windows-cross-zig
+     runs-on: ubuntu-latest
+     # This project's cross-compiled binaries are x86_64-windows-gnu only --
+     # pure 64-bit, no 32-bit WoW64 component ever needed -- so pin
+     # WINEARCH=win64 rather than let a brand-new prefix default to win32
+     # (which pulls in a wine32/i386-multiarch dependency this project never
+     # otherwise needs). Note this alone did NOT fix the Vulkan-surface
+@@ -157,69 +203,100 @@ jobs:
+       # requests SDL_WINDOW_VULKAN -- even rx_platform_tests' "any video
+       # driver" lifecycle case, which has no skip guard -- and Wine's own
+       # built-in Vulkan support (winevulkan/vulkan-1.dll) is a passthrough
+       # to whatever real Vulkan loader/ICD exists on the *host*: with none
+       # installed on this runner, winevulkan has nothing to pass through to
+       # and reports zero surface support, so SDL_CreateWindow(...,
+       # SDL_WINDOW_VULKAN) failed outright (not a skip -- a real failure) in
+       # this job's very first ctest run. Installing the same lavapipe +
+       # loader packages the linux-native job uses gives winevulkan a real
+       # (software) Vulkan implementation to forward to, without changing
+-      # what's excluded below: rx_rhi_vk_tests/sample_01_triangle_headless
+-      # stay excluded from ctest -- exercising this project's actual
++      # what's excluded below: rx_rhi_vk_tests and every sample_*_headless
++      # gate stay excluded from ctest -- exercising this project's actual
+       # device/swapchain/synchronization2 pipeline through Wine's Vulkan
+       # passthrough is a materially bigger claim than "window creation
+       # succeeds" and is not verified here.
+       - name: Install system packages
+         run: |
+           sudo apt-get update
+           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+             ninja-build wine xvfb mesa-vulkan-drivers vulkan-tools libvulkan-dev
+ 
+       - name: Install pinned zig toolchain (checksum-verified)
+         run: |
+           curl -fsSL -o "/tmp/${RX_ZIG_ARCHIVE}" "${RX_ZIG_URL}"
+           echo "${RX_ZIG_SHA256}  /tmp/${RX_ZIG_ARCHIVE}" | sha256sum -c -
+           mkdir -p toolchain/zig
+           tar -xf "/tmp/${RX_ZIG_ARCHIVE}" -C toolchain/zig --strip-components=1
+           toolchain/zig/zig version
+ 
++      # Per-job key -- see the linux-native job's identically-worded comment
++      # above the equivalent step for why (this job is the one that
++      # actually populates two platform subtrees under this one cache path,
++      # which is what made a shared key a cache-effectiveness bug in the
++      # first place).
+       - name: Cache prebuilt Slang
+         uses: actions/cache@v5
+         with:
+           path: third_party/slang-prebuilt
+-          key: slang-prebuilt-${{ hashFiles('tools/fetch_slang.cmake') }}
++          key: slang-prebuilt-windows-cross-zig-${{ hashFiles('tools/fetch_slang.cmake') }}
+ 
+       - name: Cache third-party dependency builds
+         uses: actions/cache@v5
+         with:
+           path: .deps-cache
+           key: deps-cache-windows-cross-zig-${{ hashFiles('third_party/CMakeLists.txt') }}
+ 
+       - name: Configure
+         run: cmake --preset windows-cross-zig
+ 
+       - name: Build
+         run: cmake --build --preset windows-cross-zig
+ 
+       - name: Wine toolchain smoke check
+         run: wine build/windows-cross-zig/tools/toolchain_check/toolchain_check.exe
+ 
+-      # rx_rhi_vk (GPU-backed) and sample_01_triangle_headless are excluded:
+-      # Wine in CI has no Vulkan device to hand them, and that is a real,
+-      # documented environment limitation -- not a silent pass. rx_core and
+-      # rx_platform run for real under Wine (rx_platform's window tests hit
+-      # their own existing skip guards gracefully when Wine's video backend
+-      # can't produce Vulkan surface extensions, exactly as they do on any
+-      # other display-less machine).
++      # rx_rhi_vk (GPU-backed) and every sample_*_headless gate are excluded:
++      # Wine in CI has no real Vulkan device to hand them, and that is a
++      # real, documented environment limitation -- not a silent pass.
++      # rx_core, rx_platform, shader_spirv_test, AND rx_shader_tests all run
++      # for real under Wine and are NOT excluded here -- rx_shader_tests
++      # does real in-process Slang compilation (slang::createGlobalSession
++      # etc.) via the MSVC-built slang-compiler.dll cross-linked through
++      # zig/LLD [R:A6/D2], which needs no GPU at all (SPIR-V codegen is pure
++      # CPU work), and this was investigated rather than assumed: Task 1
++      # verified directly that Slang's Windows DLLs (slang-compiler.dll +
++      # its slang-glslang/slang-glsl-module/slang-rt plugins) load correctly
++      # under Wine and the full compiler test suite passes there -- this CI
++      # run is what proves that holds on the actual GitHub Actions runner,
++      # not just the development machine that first checked it.
++      # rx_platform's window tests hit their own existing skip guards
++      # gracefully when Wine's video backend can't produce Vulkan surface
++      # extensions, exactly as they do on any other display-less machine.
+       - name: Test under wine (xvfb; GPU tests excluded -- no Vulkan under Wine)
+-        run: xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|sample' --output-on-failure
++        run: >-
++          xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|sample' --output-on-failure
++          --output-junit ${{ github.workspace }}/ctest-results-windows-cross-zig.xml
+ 
+       - name: Build budget check
+         run: tools/check_build_budget.sh windows-cross-zig 60
+ 
+-      - name: Upload sample artifact
++      # Same packaging mechanism as the linux-native job -- see
++      # tools/package_samples.sh and that job's identically-worded comment
++      # above its own packaging step for the full per-sample manifest.
++      - name: Package samples for redistribution
++        run: tools/package_samples.sh windows-cross-zig windows-x86_64 rendererx-samples-windows-x86_64.zip
++
++      - name: Upload sample artifact bundle
++        uses: actions/upload-artifact@v7
++        with:
++          name: rendererx-samples-windows-x86_64
++          path: rendererx-samples-windows-x86_64.zip
++          if-no-files-found: error
++
++      - name: Upload ctest junit results
+         uses: actions/upload-artifact@v7
++        if: always()
+         with:
+-          name: sample_01_triangle-windows-cross-zig
+-          path: build/windows-cross-zig/samples/01_triangle/sample_01_triangle.exe
++          name: ctest-results-windows-cross-zig
++          path: ctest-results-windows-cross-zig.xml
+           if-no-files-found: error
+diff --git a/.gitignore b/.gitignore
+index 676395e..68fafd4 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,7 +1,9 @@
+ toolchain/
+ .deps-cache/
+ third_party/slang-prebuilt/
+ build/
+ build-*/
+ .cache/
+ .claude/
++rendererx-samples-*.zip
++ctest-results-*.xml
+diff --git a/.superpowers/sdd/2026-08-10-phase2-shader-resource/progress.md b/.superpowers/sdd/2026-08-10-phase2-shader-resource/progress.md
+index 4b69ca2..2946f39 100644
+--- a/.superpowers/sdd/2026-08-10-phase2-shader-resource/progress.md
++++ b/.superpowers/sdd/2026-08-10-phase2-shader-resource/progress.md
+@@ -19,10 +19,12 @@ Task 4: review NEEDS FIXES — 1 Critical (ReBAR direct path structurally dead:
+ Task 4: fix round 1/5 (4/4 addressed — destination-side ALLOW_TRANSFER_INSTEAD verified against VMA's ContainsDeviceAccess precondition, memcpy+flush non-coherent-safe, CHECK-not-MESSAGE engagement assertion passing live on RTX 2080, byte-exactness both branches; linear-filter bit added; single-mip both-branches test; frameNumber monotonicity test. Re-review: all addressed, no new breakage; commits 6f00fb7..12815a5)
+ Task 4: complete (commits 0e6f0dc..12815a5 incl. fix round, review clean; 26 cases/703 assertions; Buffer::flush/invalidate gap closed for good)
+ Task 4: minor (deferred): single-mip FORMAT-fallback path still untested (no portable failing format; logic verified by review twice); direct-path engagement now per-call not per-Uploader (Task 6/7 heads-up, noted in their dispatch context).
+ Task 6: review Approved (30/30 cases 732/732 assertions live, 5/5 probe gate; matrix-layout diagnosis independently confirmed the only correctly-scoped fix — Slang has no per-declaration majority qualifier; depth-twin masks verified at all 4 sites; set-0 ownership contract traced through every destruction path). Fix round dispatched for the 2 Important debt items (engine-level matrix-layout doc on Compiler::create; parameterize transitionImage aspect + delete the sample's twin) + 2 minors (CACHE PATH comment, third rejection test) — closing now so Task 7 doesn't inherit them.
+ Task 6: fix round 1/5 (2 Important + 2 minor addressed — engine-level matrix-layout doc with cross-refs, transitionImage aspect parameterization with twin fully deleted and 4 sites migrated, CACHE PATH comments, third rejection test; re-review: all addressed, 31/738 corroborated live, no new breakage; commits 9e46726..bb5fe15)
+ Task 6: complete (commits b9fda92..1d4f8e7 incl. fix round, review clean; the reflection+bindless+upload integration proof runs verified on real hardware)
+ Task 7: review NEEDS FIXES — 1 Critical (descriptor-slot REWRITE not frame-lag-protected: release-then-immediate-reregister deterministically rewrites the just-freed slot via LIFO HandlePool while frame N-1 may still dynamically sample it — spec violation invisible to validation; destruction-side math verified correct) + 1 Important (bindless.h's Task 3-era RELEASE-SAFETY CONTRACT comment overclaims rewrite safety, missing the not-dynamically-used condition). Fix round 1 dispatched: defer the slot rewrite to the fence-confirmed point (DeletionQueue-style), tighten the engine contract comment, correct the report's "very likely" to deterministic.
+ Task 7: fix round 1/5 (all 3 addressed — slot rewrite now deferred inside the same DeletionQueue retirement as the destruction, register+bookkeeping atomic at the fence-confirmed point, no remaining hazard window per end-to-end trace; contract comment tightened with the not-dynamically-used condition; report corrected to deterministic. Re-review: all addressed; commits 412c4fd..ba90eee)
+ Task 7: complete (commits 732e0c8..ba90eee incl. fix round, review clean; eviction-while-in-flight now FULLY proven — both halves fence-gated)
+ Task 7: minor (deferred to close-out wave): the deferred registration closure logs-and-drops on registerSampledImage failure (fire-and-forget lambda) where the pre-fix code hard-propagated — unexercised in practice (16 capacity vs 8 resident), flagged by re-review as a real error-handling regression worth a propagation path or a documented acceptance.
++Task 8: complete (commits e051006..ca8f4be; both CI jobs REAL green on GitHub — run https://github.com/ywadi/renderer_x/actions/runs/31364667891, linux-native 3m15s + windows-cross-zig 4m44s, both build-budget checks 2-3s/60s). Slang prebuilt cache key fixed to per-job (closing Task 1's tracked cache-effectiveness gap); both ctest steps now also emit --output-junit uploaded as its own artifact (closes Phase 1's deferred -V/--output-junit suggestion); rx_shader_tests confirmed running (and passing) under Wine on the real runner, not just locally. Found and fixed a genuine pre-existing redistribution bug while implementing packaging: sample_01_triangle read its SPIR-V from a hardcoded absolute build-tree path, which would break on any redistributed copy — fixed via SDL_GetBasePath() + a build-time deploy step, same pattern 02/03 already used. Also found and fixed a genuine pre-existing RED MAIN unrelated to this task's own files: two rx_rhi_vk upload_test.cpp cases assumed a transfer-only-usage buffer can never measure directPathCapable()==true "no matter the hardware" (buffer.h's own doc comment) — false on GitHub Actions' lavapipe/llvmpipe build specifically (verified via 3 consecutive real failed runs, same two assertions each time), which has no non-host-visible DEVICE_LOCAL memory type to steer away into; fixed both tests to use the already-established createHostVisibleBuffer() hardware-independent pattern a third test case in the same file already modeled, and corrected the falsified doc comment. All four samples packaged per-platform (tools/package_samples.sh) into rendererx-samples-<platform>.zip workflow artifacts laid out exactly as D2 specifies (01_triangle: binary + 2 .spv files, no Slang libs; 02/03/04: Slang runtime libs + LICENSE + on-disk asset where applicable; slang-llvm/gfx never present) — spot-verified by downloading the actual linux zip from the green run and running sample_01_triangle + sample_02_hotreload headless from the unzipped layout, both PASSED. samples/README.md finalized with a downloadable-artifact section, 01_triangle's own Redistribution section, and corrected Windows copy instructions.
++Task 8: note for Task 9 (close-out): the buffer.h/upload_test.cpp fix above is a real, verified finding (not present in either ledger's prior deferred lists) — worth a glance during final whole-branch review in case any other test elsewhere in the suite carries the same "no matter the hardware" assumption about VMA memory-type steering (none found in this task's own grep across rx_rhi_vk/tests, but reviewer's own pass may want to re-confirm).
+diff --git a/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-8-report.md b/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-8-report.md
+new file mode 100644
+index 0000000..486da7e
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-8-report.md
+@@ -0,0 +1,191 @@
++# Task 8 report: CI + packaging for Phase 2 samples
++
++Status: **complete**. Both CI jobs REAL green on GitHub. Commits `e051006..ca8f4be`.
++
++Final green run: https://github.com/ywadi/renderer_x/actions/runs/31364667891
++(`linux-native` 3m15s, `windows-cross-zig` 4m44s, both build-budget checks 2-3s
++against a 60s budget).
++
++## What was done
++
++### 1. CI workflow (`.github/workflows/ci.yml`)
++
++- **Slang prebuilt cache key fixed to per-job** (`slang-prebuilt-linux-native-...`
++  / `slang-prebuilt-windows-cross-zig-...` instead of one shared key). This was
++  a tracked item from Task 1's review: since Task 1, `windows-cross-zig`
++  fetches TWO platform subtrees (`linux-x86_64/` for host-side `slangc`,
++  `windows-x86_64/` for target runtime libs) under the one previously-shared
++  cache path/key, so whichever job's save "won" that key forever starved the
++  other job of a hit for the subtree only it populates. Per-job keys fix this.
++- **`--output-junit` added to both jobs' `ctest` invocations**, uploaded as its
++  own artifact (`ctest-results-linux-native` / `ctest-results-windows-cross-zig`,
++  `if: always()` so it uploads even on a failed run). Addresses Phase 1's
++  deferred-minor suggestion to consider `-V`/`--output-junit` for
++  self-verifying logs: each `<testcase>` carries its full captured stdout,
++  so e.g. every sample's own `"... headless gate PASSED"` line is durably
++  present in a structured, greppable artifact, not just the raw console log.
++  Console output itself is unchanged/still visible — ctest's default per-test
++  `"... Passed"` line was already unconditional before this task.
++- **Packaging step added to both jobs**: `tools/package_samples.sh <preset>
++  <slang-platform-dir> <output-zip>`, uploaded as `rendererx-samples-linux-x86_64`
++  / `rendererx-samples-windows-x86_64` workflow artifacts.
++- Comment updated on the `windows-cross-zig` job's Wine test step to document
++  (rather than silently rely on) the fact that `rx_shader_tests` already runs
++  under Wine there and passes — Slang's Windows DLLs do load under Wine
++  (Task 1 verified this locally; this task's own green run re-verifies it on
++  the actual GitHub Actions runner, per the brief's "investigate, don't
++  assume the dev machine's result transfers" instruction).
++
++### 2. Packaging (`tools/package_samples.sh`, new)
++
++Builds a per-platform zip with one subdirectory per sample, containing exactly
++what a redistributed copy needs [R:D2], nothing else (no `CMakeFiles/`,
++`cmake_install.cmake`, `CTestTestfile.cmake`, `.pdb`):
++
++- `01_triangle/`: binary + `triangle.vert.spv` + `triangle.frag.spv`. **No
++  Slang runtime libraries** — its shaders are precompiled offline by `slangc`
++  at build time, so it never calls into Slang at runtime.
++- `02_hotreload/`, `03_bindless_mesh/`, `04_streaming/`: binary + Slang
++  runtime libs (`libslang-compiler.so*`/`slang-compiler.dll` +
++  `slang-glslang`/`slang-glsl-module`/`slang-rt`) + the Slang `LICENSE` +
++  each sample's own on-disk asset (`hotreload.slang` for 02, `texture.png`
++  for 03; 04 has none). `slang-llvm`/`gfx` never appear anywhere.
++
++Every expected file is existence-checked before copying (fails loudly, not
++silently, if the build-output layout ever changes shape).
++
++### 3. Real redistribution bug found and fixed: `sample_01_triangle`
++
++While implementing the packaging requirement, found that
++`sample_01_triangle` read its precompiled SPIR-V via a **hardcoded absolute
++build-tree path** (`RX_TRIANGLE_VERT_SPV`/`RX_TRIANGLE_FRAG_SPV`, pointing at
++`build/<preset>/shaders/...` on whichever machine built it) — a redistributed
++copy run on any other machine would always fail at
++`"failed to read compiled triangle shader SPIR-V"`. Fixed:
++
++- `samples/01_triangle/CMakeLists.txt`: added a `POST_BUILD` copy step
++  deploying the two `.spv` files next to the binary (same pattern
++  `02_hotreload` already uses for `hotreload.slang`).
++- `samples/01_triangle/main.cpp`: added `resolveSpvPath()` (same
++  `SDL_GetBasePath()` mechanism `02_hotreload`/`03_bindless_mesh` already
++  use), tried first, falling back to the old compile-time absolute path only
++  for in-place build-tree runs.
++
++Verified by copying just the binary + the two `.spv` files to an empty
++directory and running it there — passed before this fix would have been
++correct to add, and passes after.
++
++### 4. Real pre-existing red main found and fixed: `upload_test.cpp`
++
++`main` had been red for the last 3 pushes before this task started (Task 6's
++and Task 7's own CI runs both failed identically — confirmed by pulling their
++actual job logs via `gh api .../logs`). Same two assertions, same line
++numbers, every time — not something this task's own changes caused, but
++squarely inside "a red run gets fixed in-task."
++
++Root cause: `src/rx_rhi_vk/tests/upload_test.cpp` had two `TEST_CASE`s that
++constructed their destination buffer via `Allocator::createDeviceLocalBuffer()`
++with transfer-only usage bits, on the documented assumption (`buffer.h`'s own
++comment) that such a buffer can never measure `directPathCapable()==true`
++"no matter the hardware." That held on this project's own development
++machine's local lavapipe and on a real discrete GPU, but is **false** on
++GitHub Actions' `ubuntu-latest` lavapipe/llvmpipe build specifically: it
++exposes no non-host-visible `DEVICE_LOCAL` memory type at all, so VMA's soft
++"steer away from `DEVICE_LOCAL`" preference (used when `usage` carries no
++real device-consuming bit) has nothing better to steer toward, and the
++buffer measures `DEVICE_LOCAL+HOST_VISIBLE` anyway — engaging the direct
++path instead of the intended staging path, failing both tests' staging-
++specific assertions.
++
++Fixed both to use `createHostVisibleBuffer()` instead — its
++`directPathCapable()` is a hardcoded `false` by construction, not a
++measurement, which is the exact deterministic pattern a third test case in
++the same file already modeled for this reason. Corrected the now-falsified
++"no matter the hardware" doc comment on `createDeviceLocalBuffer()` in
++`buffer.h` to describe the real, narrower guarantee. Verified clean on both
++presets locally and confirmed the fix on the real GitHub Actions runner
++(the same run this task ends on).
++
++### 5. `samples/README.md` finalized
++
++- New top-level "Downloading a prebuilt sample bundle" section describing the
++  two CI zip artifacts and their exact per-sample layout.
++- New "Redistribution" subsection for `01_triangle` (previously only
++  02/03/04 had one), documenting the no-Slang-libs / two-`.spv`-files
++  distinction.
++- Corrected the Windows copy instructions for `01_triangle`, which
++  previously (incorrectly, before the bug fix above) said "copy just that
++  one `.exe`."
++
++## Verify
++
++- `ctest --preset linux-native --output-on-failure`: **9/9 passed** locally,
++  both before and after every change in this task.
++- Both presets rebuild cleanly (`cmake --build --preset ...`) after every
++  change, including the `upload_test.cpp`/`buffer.h` fix.
++- GitHub Actions run
++  [31364667891](https://github.com/ywadi/renderer_x/actions/runs/31364667891):
++  **both jobs green**. `linux-native`: Configure/Build/Test (9/9,
++  xvfb+lavapipe)/Build budget (2s/60s)/Package/Upload — all green.
++  `windows-cross-zig`: Configure/Build/Wine toolchain smoke check/Test under
++  Wine (`rx_core_tests`, `rx_platform_tests`, `rx_shader_tests`,
++  `shader_spirv_test` — `rx_shader_tests` confirmed passing under Wine on the
++  real runner)/Build budget (3s/60s)/Package/Upload — all green.
++- **Artifact spot-check** (the binding's own required proof): downloaded the
++  actual `rendererx-samples-linux-x86_64` artifact from the green run above
++  via `gh run download`, unzipped it to a scratch directory, and ran
++  `sample_01_triangle` (headless) and `sample_02_hotreload` (headless) directly
++  from that unzipped layout, with no build tree involved:
++  - `sample_01_triangle` → `[info] triangle readback PASSED`, exit 0.
++  - `sample_02_hotreload` → RUNPATH confirmed `$ORIGIN`, real in-process Slang
++    compilation succeeded against the bundled `libslang-compiler.so` etc.,
++    `[info] hotreload headless gate PASSED`, exit 0.
++  - Confirmed via `find`: no `slang-llvm`/`gfx` artifact anywhere in either
++    platform's zip; `LICENSE` present in every Slang-linking sample directory;
++    `01_triangle/` carries no Slang libraries at all.
++- Also downloaded and inspected `rendererx-samples-windows-x86_64.zip`:
++  correct per-sample layout, all 4 DLLs + LICENSE present for 02/03/04, no
++  `.pdb`/build bookkeeping leaked in.
++- `git log --format='%B' e051006^..ca8f4be` grepped for
++  `co-authored-by|claude|anthropic|generated with|ai-generated`: **zero
++  matches** — both commits clean.
++
++## Concerns for the coordinator
++
++1. The `buffer.h`/`upload_test.cpp` fix, while directly necessitated by a
++   real CI failure this task needed to clear, touches files outside this
++   task's nominal file list (`.github/workflows/ci.yml` +
++   `samples/README.md`). Flagged explicitly in both this report and the SDD
++   ledger for Task 9's final whole-branch review to double check nothing
++   else in the suite carries the same "no matter the hardware" assumption
++   about VMA memory-type steering (my own grep across `rx_rhi_vk/tests/*.cpp`
++   found no other instance, but a second pass may want to re-confirm).
++2. Each sample directory inside a platform zip is fully self-contained (own
++   copy of the ~34MB `libslang-compiler.so`/25MB `slang-compiler.dll` etc.),
++   so the zips are ~136-165MB rather than a much smaller shared-lib layout
++   would be. This is deliberate and matches the spec's own "per-sample
++   directories... laid out exactly as a user would unzip-and-run them" and
++   every sample's README "Redistribution" section's own claim that copying
++   just that one sample's directory works standalone — flagging the size
++   tradeoff explicitly in case the coordinator wants a shared-lib layout
++   instead for the eventual `v0.2.0-phase2` GitHub Release in Task 9.
++3. GitHub Actions' `ubuntu-latest` lavapipe/llvmpipe build exposing no
++   non-host-visible `DEVICE_LOCAL` memory type (finding #4 above) is a
++   genuinely interesting data point for the project's stated Steam Deck
++   floor (also an integrated/unified-memory device, per the Phase 2 research
++   file's B2) — worth keeping in mind for any future test that assumes a
++   discrete-GPU-shaped memory layout.
++
++## Files created
++
++- `tools/package_samples.sh`
++
++## Files modified
++
++- `.github/workflows/ci.yml`
++- `.gitignore`
++- `samples/01_triangle/CMakeLists.txt`
++- `samples/01_triangle/main.cpp`
++- `samples/README.md`
++- `src/rx_rhi_vk/include/rx_rhi_vk/buffer.h`
++- `src/rx_rhi_vk/tests/upload_test.cpp`
+diff --git a/samples/01_triangle/CMakeLists.txt b/samples/01_triangle/CMakeLists.txt
+index 6ba6e45..bce8af2 100644
+--- a/samples/01_triangle/CMakeLists.txt
++++ b/samples/01_triangle/CMakeLists.txt
+@@ -4,13 +4,32 @@
+ # compiles the .slang sources to SPIR-V. Same consumption pattern as
+ # shader_spirv_test in that same file.
+ add_executable(sample_01_triangle main.cpp)
+ target_link_libraries(sample_01_triangle PRIVATE rx_rhi_vk rx_platform)
+ target_compile_definitions(sample_01_triangle PRIVATE
+   RX_TRIANGLE_VERT_SPV="${RX_TRIANGLE_VERT_SPV}"
+   RX_TRIANGLE_FRAG_SPV="${RX_TRIANGLE_FRAG_SPV}"
+ )
+ add_dependencies(sample_01_triangle triangle_shaders)
+ 
++# Deploys the two precompiled SPIR-V files next to the binary at build time
++# (redistribution fix, Task 8): main.cpp's resolveSpvPath() looks for them
++# exe-relative first (via SDL_GetBasePath()) before falling back to the
++# compile-time absolute build-tree path above -- without this copy step, a
++# redistributed copy of just this build-output directory would have nothing
++# there to find, and the compile-time fallback path (which points inside
++# THIS machine's build tree, under shaders/) would not exist on a different
++# machine either. This sample ships no Slang runtime libraries [D2] -- its
++# shaders are precompiled offline by slangc at build time, not compiled
++# in-process -- so these two files are the entire redistribution surface a
++# copy of this sample's directory needs beyond the binary itself.
++add_custom_command(TARGET sample_01_triangle POST_BUILD
++  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
++          "${RX_TRIANGLE_VERT_SPV}" "${RX_TRIANGLE_FRAG_SPV}"
++          "$<TARGET_FILE_DIR:sample_01_triangle>/"
++  COMMENT "sample_01_triangle: deploying precompiled SPIR-V next to the binary"
++  VERBATIM
++)
++
+ # Runs the binary with no arguments -- headless mode (default, used by ctest).
+ # The binary also supports --present mode for interactive windowed rendering.
+ add_test(NAME sample_01_triangle_headless COMMAND sample_01_triangle)
+diff --git a/samples/01_triangle/main.cpp b/samples/01_triangle/main.cpp
+index 0041461..8ad6f80 100644
+--- a/samples/01_triangle/main.cpp
++++ b/samples/01_triangle/main.cpp
+@@ -64,20 +64,53 @@ constexpr uint32_t kPresentHeight = 600;
+ // Center of the triangle's body (NDC apex (0,-0.5), base corners
+ // (+-0.5, 0.5) -- with a 256x256 viewport and no Y-flip, that maps to a
+ // triangle spanning roughly screen Y in [64,192], widest at the base) --
+ // must sample white. (10,10) is well outside the triangle on every side --
+ // must sample the black clear color.
+ constexpr uint32_t kCenterX = 128;
+ constexpr uint32_t kCenterY = 150;
+ constexpr uint32_t kCornerX = 10;
+ constexpr uint32_t kCornerY = 10;
+ 
++constexpr const char* kVertFilename = "triangle.vert.spv";
++constexpr const char* kFragFilename = "triangle.frag.spv";
++
++// Resolves a precompiled SPIR-V file's path next to this executable at
++// runtime (same SDL_GetBasePath() mechanism 02_hotreload's
++// resolveShaderPath()/03_bindless_mesh's resolveTexturePath() use), so a
++// redistributed copy of this sample's build-output directory (binary + the
++// two .spv files deployed next to it by CMakeLists.txt's POST_BUILD copy
++// step) works identically outside the build tree -- this sample ships no
++// Slang runtime libraries (its shaders are precompiled offline by slangc at
++// build time, never compiled in-process [R:D2]), but it still needs these
++// two files on disk somewhere findable at run time, and a hardcoded
++// absolute build-tree path (the old behavior, still available below as a
++// fallback) is not that.
++//
++// Falls back to `buildTreeFallback` -- the compile-time absolute path
++// (RX_TRIANGLE_VERT_SPV/RX_TRIANGLE_FRAG_SPV, still valid when running
++// in-place from the build tree, e.g. under a debugger with a stale deploy
++// step) -- only if the exe-relative copy can't be found; the redistributed
++// zip's only copy is the exe-relative one, and this is the path that
++// actually gets exercised there.
++std::string resolveSpvPath(const char* filename, const char* buildTreeFallback) {
++    const char* basePath = SDL_GetBasePath();
++    if (basePath != nullptr) {
++        std::string candidate = std::string(basePath) + filename;
++        std::ifstream probe(candidate, std::ios::binary);
++        if (probe.good()) {
++            return candidate;
++        }
++    }
++    return buildTreeFallback;
++}
++
+ std::vector<char> readFile(const char* path) {
+     std::ifstream file(path, std::ios::binary | std::ios::ate);
+     if (!file.is_open()) {
+         return {};
+     }
+     std::streamsize size = file.tellg();
+     if (size <= 0) {
+         return {};
+     }
+     file.seekg(0);
+@@ -149,25 +182,26 @@ void destroyTrianglePipeline(VkDevice device, TrianglePipeline& p) {
+ // between headless mode's offscreen render target and --present mode's real
+ // swapchain images (see the file-level comment for why one pipeline is
+ // valid for both). Dynamic viewport/scissor means this same VkPipeline
+ // stays valid across a --present window resize with no recreation needed.
+ // Returns nullopt (logged) on any failure, having already destroyed
+ // whatever partial state it created -- callers never need to call
+ // destroyTrianglePipeline() themselves on a nullopt return.
+ std::optional<TrianglePipeline> createTrianglePipeline(VkDevice device, VkFormat colorFormat) {
+     TrianglePipeline result;
+ 
+-    auto vertCode = readFile(RX_TRIANGLE_VERT_SPV);
+-    auto fragCode = readFile(RX_TRIANGLE_FRAG_SPV);
++    const std::string vertPath = resolveSpvPath(kVertFilename, RX_TRIANGLE_VERT_SPV);
++    const std::string fragPath = resolveSpvPath(kFragFilename, RX_TRIANGLE_FRAG_SPV);
++    auto vertCode = readFile(vertPath.c_str());
++    auto fragCode = readFile(fragPath.c_str());
+     if (vertCode.empty() || fragCode.empty()) {
+-        RX_LOG_ERROR("failed to read compiled triangle shader SPIR-V from {} / {}", RX_TRIANGLE_VERT_SPV,
+-                      RX_TRIANGLE_FRAG_SPV);
++        RX_LOG_ERROR("failed to read compiled triangle shader SPIR-V from {} / {}", vertPath, fragPath);
+         return std::nullopt;
+     }
+ 
+     result.vertModule = createShaderModule(device, vertCode);
+     result.fragModule = createShaderModule(device, fragCode);
+     if (result.vertModule == VK_NULL_HANDLE || result.fragModule == VK_NULL_HANDLE) {
+         RX_LOG_ERROR("vkCreateShaderModule failed for the triangle demo shaders");
+         destroyTrianglePipeline(device, result);
+         return std::nullopt;
+     }
+diff --git a/samples/README.md b/samples/README.md
+index bca40d7..0287a9a 100644
+--- a/samples/README.md
++++ b/samples/README.md
+@@ -1,19 +1,56 @@
+ # Samples
+ 
+ Runnable demos that exercise `rx_rhi_vk` (and, beneath it, `rx_core`/
+ `rx_platform`) end to end against a real Vulkan driver. Each sample gets its
+ own subdirectory and its own `CMakeLists.txt`; all of them are built as part
+ of the normal `cmake --build --preset <preset>` flow (see the root
+ `CMakeLists.txt`'s `add_subdirectory(samples/...)` lines) and don't need any
+ separate build step.
+ 
++## Downloading a prebuilt sample bundle (no build required)
++
++Every green CI run (`.github/workflows/ci.yml`) uploads one workflow
++artifact per platform — `rendererx-samples-linux-x86_64.zip` from the
++`linux-native` job, `rendererx-samples-windows-x86_64.zip` from the
++`windows-cross-zig` job — built by `tools/package_samples.sh`. Download
++either from the run's "Artifacts" section on GitHub, unzip it, and each
++sample is immediately runnable from its own subdirectory, no `cmake`/build
++step involved:
++
++```
++01_triangle/
++  sample_01_triangle[.exe]         # + triangle.vert.spv, triangle.frag.spv
++02_hotreload/
++  sample_02_hotreload[.exe]        # + hotreload.slang, the Slang runtime
++                                    #   libs below, and LICENSE
++03_bindless_mesh/
++  sample_03_bindless_mesh[.exe]    # + texture.png, the Slang runtime libs
++                                    #   below, and LICENSE
++04_streaming/
++  sample_04_streaming[.exe]        # + the Slang runtime libs below, and
++                                    #   LICENSE (no other external asset)
++```
++
++`01_triangle` is the one exception to "needs the Slang runtime libs": its
++shaders are precompiled offline by `slangc` at build time, so it ships only
++its two `.spv` files and nothing Slang-related at all [D2] — see its own
++"Redistribution" section below. The other three do real in-process Slang
++compilation at startup, so each of their directories additionally carries
++`libslang-compiler.so*`/`slang-compiler.dll` plus the `slang-glslang`/
++`slang-glsl-module`/`slang-rt` plugins it dlopens on demand, and the Slang
++`LICENSE` file (Apache-2.0 WITH LLVM-exception — kept for attribution when
++redistributing those libraries). `cd` into any one subdirectory and run the
++binary exactly as described in that sample's own section below — every
++subdirectory in the zip is independently self-contained, so copying just
++one elsewhere works too.
++
+ ## 01_triangle
+ 
+ `samples/01_triangle/main.cpp` — renders one hardcoded white triangle on a
+ black background via a Vulkan 1.3 dynamic-rendering pipeline (no vertex
+ buffers: the vertex shader generates its 3 NDC positions from
+ `SV_VertexID`). Two modes, selected by a command-line flag, sharing the
+ exact same pipeline-construction code and draw call:
+ 
+ - **Headless (default, no flags)** — the correctness gate this repo's CI and
+   `ctest` run. Builds the full stack (window, validated instance, surface,
+@@ -63,20 +100,36 @@ roughly:
+ 
+ Resizing the window keeps the triangle centered and proportioned to the new
+ window size (viewport/scissor are dynamic state, recomputed from
+ `Device::swapchainExtent()` every frame — no stretching or stale content).
+ Closing the window exits the process with status 0 and logs:
+ 
+ ```
+ [info] --present: window closed cleanly
+ ```
+ 
++### Redistribution
++
++Unlike every other sample here, 01_triangle's shaders (`triangle.vert.slang`/
++`triangle.frag.slang`) are compiled to SPIR-V **offline**, by `slangc`, at
++build time (`CMakeLists.txt`'s `add_custom_command`s) — this binary never
++calls into Slang at runtime, so it needs **no Slang runtime libraries at
++all** [D2]. It does still need the two resulting `.spv` files on disk
++somewhere it can find them at run time: `CMakeLists.txt` deploys
++`triangle.vert.spv`/`triangle.frag.spv` next to the binary at build time
++(the same pattern 02_hotreload uses for `hotreload.slang`), and `main.cpp`'s
++`resolveSpvPath()` looks for them next to the executable (via
++`SDL_GetBasePath()`) before falling back to the compile-time build-tree
++path. A redistributed copy of just this sample's three files (the binary +
++the two `.spv` files) runs identically outside the build tree — no Slang
++DLLs/`.so`s, no LICENSE file, nothing else needed.
++
+ ## 02_hotreload
+ 
+ `samples/02_hotreload/main.cpp` — a fullscreen triangle whose fragment
+ shader is compiled **at runtime** by `rx_shader`'s `Compiler` (in-process
+ Slang → SPIR-V), not pre-baked offline by `slangc` like 01_triangle's
+ shaders. Unlike 01_triangle's hand-typed empty `VkPipelineLayoutCreateInfo`,
+ this sample's `VkPipelineLayout` always comes from `rx::shader::reflect()` +
+ `rx::rhi::PipelineLayoutBuilder::build()` — driven by whatever the compiled
+ shader actually declares (a single push-constant `float time`, no
+ descriptor bindings). Two modes, one shared compile→reflect→build→pipeline
+@@ -372,23 +425,28 @@ as described above.
+ 
+ ```sh
+ cmake --preset windows-cross-zig
+ cmake --build --preset windows-cross-zig
+ ```
+ 
+ This produces `build/windows-cross-zig/samples/01_triangle/sample_01_triangle.exe`,
+ `build/windows-cross-zig/samples/02_hotreload/sample_02_hotreload.exe`,
+ `build/windows-cross-zig/samples/03_bindless_mesh/sample_03_bindless_mesh.exe`, and
+ `build/windows-cross-zig/samples/04_streaming/sample_04_streaming.exe`.
+-01_triangle's binary is statically linked (no separate `.dll`s to ship) —
+-copy just that one `.exe` to the Windows machine (or run it directly under
+-Wine on Linux) and run it from a terminal/`cmd.exe`/PowerShell:
++01_triangle's binary is statically linked and needs no Slang DLLs (its
++shaders are precompiled offline by `slangc` at build time — see its own
++"Redistribution" section above) — but it does still need the two `.spv`
++files deployed next to it (`triangle.vert.spv`/`triangle.frag.spv`). Copy
++`sample_01_triangle.exe` plus those two files (not the whole build-output
++directory's `CMakeFiles`/`.pdb`/`.cmake` bookkeeping) to the Windows machine
++(or run it directly under Wine on Linux) and run it from a
++terminal/`cmd.exe`/PowerShell:
+ 
+ ```
+ sample_01_triangle.exe            REM headless correctness gate
+ sample_01_triangle.exe --present  REM interactive present-mode window
+ ```
+ 
+ 02_hotreload is **not** self-contained the same way: it does real
+ in-process Slang compilation, so it needs `slang-compiler.dll` +
+ `slang-glslang.dll` + `slang-glsl-module.dll` + `slang-rt.dll` (all
+ deployed next to it at build time — see that sample's own README section
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h b/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h
+index 2ab8bc2..c70c424 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h
+@@ -177,23 +177,44 @@ public:
+     // `FindMemoryPreferences()`'s `VMA_MEMORY_USAGE_AUTO` branch only adds
+     // `DEVICE_LOCAL_BIT | HOST_VISIBLE_BIT` to its *preferred* flags when
+     // `ContainsDeviceAccess() == true` (the `deviceAccess` local) AND
+     // `ALLOW_TRANSFER_INSTEAD_BIT` is set; when `ContainsDeviceAccess()`
+     // is false, that same code path instead pushes `DEVICE_LOCAL_BIT` into
+     // *not-preferred* -- actively steering AWAY from the memory this
+     // pattern is supposed to land in. This is exactly the mistake this
+     // task's own first implementation made on `createUploadRingBuffer()`'s
+     // TRANSFER_SRC-only staging buffer (fixed below) and exactly why this
+     // method requires a real device-consuming usage bit to be worth
+-    // calling with these flags at all -- a caller passing e.g. only
+-    // `TRANSFER_DST_BIT` here gets a buffer that structurally can never
+-    // report directPathCapable() == true, no matter the hardware.
++    // calling with these flags at all on hardware that actually has a
++    // choice to steer away from.
++    //
++    // **Correction (Phase 2 Task 8, verified against a real CI failure --
++    // not a hypothetical):** "not-preferred" is a soft tie-breaking signal
++    // among *multiple candidate* memory types, not a hard exclusion. On a
++    // backend whose Vulkan memory types don't include any HOST_VISIBLE
++    // type that ISN'T also DEVICE_LOCAL (verified directly: GitHub Actions'
++    // `ubuntu-latest` lavapipe/llvmpipe build reports exactly this, even
++    // though this same test passed against this project's development
++    // machine's own local lavapipe build -- Mesa/llvmpipe's exposed memory
++    // types are not identical across builds/versions), there is nothing
++    // better to steer toward instead, and the one remaining valid memory
++    // type still gets selected -- which CAN be both DEVICE_LOCAL and
++    // HOST_VISIBLE even for a `TRANSFER_DST_BIT`-only usage. So a caller
++    // passing only transfer bits here is NOT guaranteed
++    // `directPathCapable() == false` "no matter the hardware" (the
++    // previous, now-corrected claim here) -- only "on hardware that has a
++    // genuinely separate non-host-visible DEVICE_LOCAL memory pool to
++    // steer into instead." A test that needs to deterministically force
++    // (not just usually get) the staging branch regardless of backend must
++    // use `createHostVisibleBuffer()` below instead, whose
++    // `directPathCapable()` is a hardcoded `false` by construction, not a
++    // measurement -- see `src/rx_rhi_vk/tests/upload_test.cpp`.
+     //
+     // On a ReBAR-enabled desktop GPU or unified-memory APU, this resolves
+     // to memory that is BOTH DEVICE_LOCAL and HOST_VISIBLE
+     // (`Buffer::directPathCapable()` true, `mappedData()` non-null) --
+     // callers (rx::rhi::Uploader::uploadToBuffer(), rx::rhi::MeshBuffers)
+     // can then write directly into it and skip a staging copy entirely.
+     // Everywhere else it resolves to plain DEVICE_LOCAL-only memory
+     // (`directPathCapable()` false, `mappedData()` null -- VMA does not
+     // map memory it cannot map), identical to this method's behavior
+     // before this task's Critical review fix. Returns std::nullopt on any
+diff --git a/src/rx_rhi_vk/tests/upload_test.cpp b/src/rx_rhi_vk/tests/upload_test.cpp
+index 82c0a13..8484098 100644
+--- a/src/rx_rhi_vk/tests/upload_test.cpp
++++ b/src/rx_rhi_vk/tests/upload_test.cpp
+@@ -89,28 +89,38 @@ TEST_CASE("Uploader::uploadToBuffer round-trips bytes through the staging path b
+ 
+     auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device);
+     REQUIRE(uploader.has_value());
+ 
+     constexpr VkDeviceSize kSize = 4096;
+     std::array<uint8_t, kSize> pattern{};
+     for (size_t i = 0; i < pattern.size(); ++i) {
+         pattern[i] = static_cast<uint8_t>((i * 31 + 7) & 0xFF);
+     }
+ 
+-    // No device-consuming usage bit (TRANSFER_DST/SRC only) -- structurally
+-    // never direct-path-capable (see Allocator::createDeviceLocalBuffer's
+-    // own comment), so this specific round-trip always exercises the
+-    // staging branch, matching this test's name.
+-    auto dst = fixture->allocator.createDeviceLocalBuffer(
++    // createHostVisibleBuffer() (not createDeviceLocalBuffer()) is the
++    // deterministic, hardware-independent way to force the staging branch,
++    // matching this test's name -- its directPathCapable() is a hardcoded
++    // false by construction, not a measurement (buffer.h). Task 8 fix:
++    // this used to call createDeviceLocalBuffer() with TRANSFER_DST/SRC-
++    // only usage on the (then-believed) assumption that a transfer-only
++    // usage bit combination can NEVER measure as direct-path-capable "no
++    // matter the hardware" -- empirically false, caught by a real CI
++    // failure on GitHub Actions' lavapipe/llvmpipe build (which, unlike
++    // this project's own development machine's local lavapipe build,
++    // exposes no non-host-visible DEVICE_LOCAL memory type at all, so
++    // even a transfer-only buffer measures directPathCapable()==true
++    // there) -- see createDeviceLocalBuffer()'s corrected header comment
++    // in buffer.h for the full mechanism.
++    auto dst = fixture->allocator.createHostVisibleBuffer(
+         kSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+     REQUIRE(dst.has_value());
+-    CHECK_FALSE(dst->directPathCapable());
++    REQUIRE_FALSE(dst->directPathCapable());
+ 
+     REQUIRE(uploader->uploadToBuffer(*dst, 0, pattern.data(), kSize));
+     uploader->flush();
+     CHECK(uploader->everUsedStagingPath());
+     CHECK_FALSE(uploader->everUsedDirectPath());
+ 
+     std::vector<uint8_t> readBack = readBackBuffer(fixture->allocator, fixture->device.device(),
+                                                      fixture->device.graphicsQueue(),
+                                                      fixture->device.graphicsQueueFamily(), dst->handle(), kSize);
+     CHECK(std::memcmp(readBack.data(), pattern.data(), kSize) == 0);
+@@ -265,23 +275,38 @@ TEST_CASE("Uploader auto-flushes mid-batch when the ring buffer runs out of room
+ 
+ TEST_CASE("Uploader::uploadToBuffer rejects a single upload larger than the ring buffer's total capacity") {
+     auto fixture = makeFixture("rx_rhi_vk_upload_test_oversize");
+     if (!fixture.has_value()) {
+         return;
+     }
+ 
+     auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device, /*ringBufferSize=*/64);
+     REQUIRE(uploader.has_value());
+ 
++    // The ring-buffer capacity check (reserveRingSpace(), upload.cpp) only
++    // runs on the STAGING branch -- a direct-path-capable destination
++    // writes straight into its own mapped allocation and never touches
++    // the ring buffer at all, so this rejection can only be exercised
++    // against a destination the staging branch is guaranteed to take.
++    // createHostVisibleBuffer() (hardcoded directPathCapable()==false, not
++    // measured) is that deterministic, hardware-independent guarantee --
++    // createDeviceLocalBuffer() here (Task 8 fix) measured
++    // directPathCapable()==true on GitHub Actions' lavapipe build, which
++    // made this 128-byte direct-path write against a real 128-byte
++    // allocation trivially succeed and silently skip the rejection this
++    // test exists to check -- see buffer.h's corrected comment on
++    // createDeviceLocalBuffer() for why that measurement is
++    // backend-dependent, not a bug.
+     std::array<uint8_t, 128> tooBig{};
+-    auto dst = fixture->allocator.createDeviceLocalBuffer(128, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    auto dst = fixture->allocator.createHostVisibleBuffer(128, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+     REQUIRE(dst.has_value());
++    REQUIRE_FALSE(dst->directPathCapable());
+ 
+     CHECK_FALSE(uploader->uploadToBuffer(*dst, 0, tooBig.data(), tooBig.size()));
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
+ TEST_CASE("MeshBuffers::create uploads vertex+index data into device-local buffers, byte-exact readback") {
+     auto fixture = makeFixture("rx_rhi_vk_upload_test_meshbuffers");
+     if (!fixture.has_value()) {
+         return;
+     }
+diff --git a/tools/package_samples.sh b/tools/package_samples.sh
+new file mode 100755
+index 0000000..3061784
+--- /dev/null
++++ b/tools/package_samples.sh
+@@ -0,0 +1,156 @@
++#!/usr/bin/env bash
++# Packages this project's four sample binaries into a single per-platform
++# .zip laid out exactly as a user would unzip-and-run it: one subdirectory
++# per sample, containing that sample's binary plus everything IT needs to
++# run standalone -- nothing more, nothing missing [R:D2].
++#
++# Usage: tools/package_samples.sh <preset> <slang-platform-dir> <output-zip>
++#   <preset>             linux-native | windows-cross-zig
++#                        (selects the build dir + the executable suffix)
++#   <slang-platform-dir> linux-x86_64 | windows-x86_64
++#                        (the third_party/slang-prebuilt/<this> subdirectory
++#                        fetch_slang.cmake populated for this preset's
++#                        *target* -- see that file's own header comment; used
++#                        here only to locate the Slang LICENSE file to bundle
++#                        alongside any sample that ships Slang runtime libs)
++#   <output-zip>         path (relative or absolute) to write the .zip to;
++#                        parent directories are created if needed.
++#
++# Per-sample contents [R:D2, spec Fixed decision #11]:
++#   01_triangle       binary + triangle.vert.spv + triangle.frag.spv
++#                     (precompiled offline by slangc at build time -- NO
++#                     Slang runtime libraries needed; this sample never
++#                     compiles a shader in-process. Keep this distinction
++#                     sharp: it's the one sample that doesn't need Slang.)
++#   02_hotreload      binary + hotreload.slang + Slang runtime libs + LICENSE
++#   03_bindless_mesh  binary + texture.png + Slang runtime libs + LICENSE
++#   04_streaming      binary + Slang runtime libs + LICENSE
++#                     (no external asset -- every texture is procedural)
++#
++# This script does NOT build anything -- it assumes `cmake --build
++# --preset <preset>` already ran and each sample's build-output directory
++# already has its runtime libs/assets deployed next to its binary (that
++# deployment is CMake's job: rx_shader_deploy_runtime_libs() in
++# src/rx_shader/CMakeLists.txt for the Slang libs, and each sample's own
++# POST_BUILD copy step for its on-disk asset). This script's only job is to
++# select, per sample, the subset of that build-output directory a
++# redistributed copy actually needs -- leaving out CMake/Ninja build
++# bookkeeping (CMakeFiles/, cmake_install.cmake, CTestTestfile.cmake, *.pdb,
++# etc.) that a real user unzipping this would never want -- and to add the
++# Slang LICENSE alongside any sample that bundles Slang's shared libraries
++# (Apache-2.0 attribution).
++#
++# Every expected file is verified to exist before being copied: a missing
++# file fails this script loudly (non-zero exit, clear message) rather than
++# silently shipping an incomplete redistribution layout -- same
++# investigate-don't-skip discipline the rest of this project's CI uses.
++set -euo pipefail
++
++if [[ $# -ne 3 ]]; then
++  echo "usage: $0 <preset> <slang-platform-dir> <output-zip>" >&2
++  echo "  preset:             linux-native | windows-cross-zig" >&2
++  echo "  slang-platform-dir: linux-x86_64 | windows-x86_64" >&2
++  echo "  output-zip:         path to write the packaged .zip to" >&2
++  exit 1
++fi
++
++RX_PRESET="$1"
++RX_SLANG_PLATFORM_DIR="$2"
++RX_OUT_ZIP="$3"
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
++SAMPLES_BUILD_DIR="$REPO_ROOT/build/$RX_PRESET/samples"
++SLANG_LICENSE="$REPO_ROOT/third_party/slang-prebuilt/$RX_SLANG_PLATFORM_DIR/LICENSE"
++
++case "$RX_PRESET" in
++  linux-native)
++    RX_EXE_SUFFIX=""
++    ;;
++  windows-cross-zig)
++    RX_EXE_SUFFIX=".exe"
++    ;;
++  *)
++    echo "package_samples: unknown preset '$RX_PRESET' (expected linux-native or windows-cross-zig)" >&2
++    exit 1
++    ;;
++esac
++
++if [[ ! -d "$SAMPLES_BUILD_DIR" ]]; then
++  echo "package_samples: '$SAMPLES_BUILD_DIR' does not exist -- build the '$RX_PRESET' preset first" >&2
++  exit 1
++fi
++
++STAGE_DIR="$(mktemp -d)"
++trap 'rm -rf "$STAGE_DIR"' EXIT
++
++# Copies every path given, failing loudly if any of them doesn't exist --
++# used both for required files (binary, on-disk assets, LICENSE) and for
++# the Slang runtime-lib globs below (an unmatched glob is passed through
++# by bash as the literal, non-existent pattern string, so it fails this
++# same existence check rather than silently copying zero files).
++copy_required() {
++  local dest_dir="$1"
++  shift
++  local src
++  for src in "$@"; do
++    if [[ ! -e "$src" ]]; then
++      echo "package_samples: expected file '$src' does not exist -- redistribution layout is incomplete" >&2
++      exit 1
++    fi
++    cp -a "$src" "$dest_dir/"
++  done
++}
++
++echo "package_samples: staging '$RX_PRESET' samples in '$STAGE_DIR' ..."
++
++# --- 01_triangle: precompiled SPIR-V only, no Slang runtime libs [D2] -----
++SAMPLE_DIR="$STAGE_DIR/01_triangle"
++mkdir -p "$SAMPLE_DIR"
++copy_required "$SAMPLE_DIR" \
++  "$SAMPLES_BUILD_DIR/01_triangle/sample_01_triangle${RX_EXE_SUFFIX}" \
++  "$SAMPLES_BUILD_DIR/01_triangle/triangle.vert.spv" \
++  "$SAMPLES_BUILD_DIR/01_triangle/triangle.frag.spv"
++
++# --- 02_hotreload / 03_bindless_mesh / 04_streaming: real in-process Slang
++# compilation -- each needs the Slang runtime libs + LICENSE deployed next
++# to it. Globbed rather than hardcoded to the pinned version string, same
++# posture as rx_shader_deploy_runtime_libs() in src/rx_shader/CMakeLists.txt:
++# Linux filenames embed the Slang version, Windows filenames don't
++# [R:A1/A6/D2].
++for RX_SAMPLE in 02_hotreload 03_bindless_mesh 04_streaming; do
++  SAMPLE_DIR="$STAGE_DIR/$RX_SAMPLE"
++  mkdir -p "$SAMPLE_DIR"
++  copy_required "$SAMPLE_DIR" "$SAMPLES_BUILD_DIR/$RX_SAMPLE/sample_${RX_SAMPLE}${RX_EXE_SUFFIX}"
++  copy_required "$SAMPLE_DIR" "$SLANG_LICENSE"
++
++  if [[ "$RX_PRESET" == "windows-cross-zig" ]]; then
++    copy_required "$SAMPLE_DIR" \
++      "$SAMPLES_BUILD_DIR/$RX_SAMPLE/slang-compiler.dll" \
++      "$SAMPLES_BUILD_DIR/$RX_SAMPLE/slang-glslang.dll" \
++      "$SAMPLES_BUILD_DIR/$RX_SAMPLE/slang-glsl-module.dll" \
++      "$SAMPLES_BUILD_DIR/$RX_SAMPLE/slang-rt.dll"
++  else
++    copy_required "$SAMPLE_DIR" \
++      "$SAMPLES_BUILD_DIR/$RX_SAMPLE"/libslang-compiler.so* \
++      "$SAMPLES_BUILD_DIR/$RX_SAMPLE"/libslang-glslang-*.so \
++      "$SAMPLES_BUILD_DIR/$RX_SAMPLE"/libslang-glsl-module-*.so \
++      "$SAMPLES_BUILD_DIR/$RX_SAMPLE"/libslang-rt.so*
++  fi
++done
++
++# 02_hotreload additionally ships the live-reloadable shader source; 03
++# additionally ships its one real-PNG texture. 04 has no external asset
++# (every texture is procedurally generated) -- nothing extra for it.
++copy_required "$STAGE_DIR/02_hotreload" "$SAMPLES_BUILD_DIR/02_hotreload/hotreload.slang"
++copy_required "$STAGE_DIR/03_bindless_mesh" "$SAMPLES_BUILD_DIR/03_bindless_mesh/texture.png"
++
++mkdir -p "$(dirname "$RX_OUT_ZIP")"
++RX_OUT_ZIP_ABS="$(cd "$(dirname "$RX_OUT_ZIP")" && pwd)/$(basename "$RX_OUT_ZIP")"
++rm -f "$RX_OUT_ZIP_ABS"
++
++echo "package_samples: zipping into '$RX_OUT_ZIP_ABS' ..."
++(cd "$STAGE_DIR" && zip -r -X -q "$RX_OUT_ZIP_ABS" 01_triangle 02_hotreload 03_bindless_mesh 04_streaming)
++
++echo "package_samples: done. Contents:"
++unzip -l "$RX_OUT_ZIP_ABS"
