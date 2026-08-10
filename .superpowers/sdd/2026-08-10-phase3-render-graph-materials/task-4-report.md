@@ -148,3 +148,30 @@ Per the coordinator's explicit instruction, did **not** extend `rx_shader` in th
 ### Commit
 
 New commit on this worktree's branch, on top of the original task-4 commit — see the STATUS reply for the hash.
+
+## Fix round 2 (post re-review)
+
+Re-review finding: `isReddish()` (fix round 1's substitution check) tested "byte0 dominant OR byte2 dominant" as a channel-order-agnostic stand-in for "red-dominant, whichever byte order this device uses" -- but that predicate is satisfied by a genuinely BLUE-dominant pixel too, in whichever byte order is NOT the device's real one (e.g. under a real RGBA8 device, the sphere's own blue channel living at byte2 would satisfy the "byte2 dominant" half of the OR, which the old check unconditionally read as "red"). A direct-substitution bug that swapped in the sphere's row for the cube's would very plausibly have still passed this check -- exactly the defect it was written to catch.
+
+### Fix
+
+Added `channelIndicesForFormat(VkFormat)` (right after `worldToPixel()`): resolves this sample's actual backbuffer `VkFormat` (already known at runtime — `targetFormat = device->swapchainFormat()`) to the TRUE byte positions of R/G/B, covering the `VK_FORMAT_{B8G8R8A8,R8G8B8A8}_{UNORM,SRGB,SNORM}` families (every 8bpc format this sample has actually observed on linux-native lavapipe, this dev machine's NVIDIA driver, and windows-cross-zig under Wine) and returning `std::nullopt` — never a guess — for anything else, which the caller treats as a hard gate failure rather than skipping the check.
+
+Object index 1's probe (fix round 1) now:
+1. Resolves the real R/G/B byte indices once via `channelIndicesForFormat(targetFormat)`; fails loudly if unrecognized.
+2. Asserts `cubePx[r] > cubePx[g] + margin && cubePx[r] > cubePx[b] + margin` — genuinely red-dominant, using the TRUE indices, not an order-agnostic OR.
+3. **Direct substitution detection** (per the coordinator's "prefer also" suggestion): the cube's two actual neighboring rows in the transform buffer are index 0 (floor, `kObjects`) and index 2 (sphere). Added two more hard assertions using the same true indices: the probe must NOT look like the floor's near-neutral gray (`max-min < margin`) and must NOT look like the sphere's blue-dominant albedo (`cubePx[b] > cubePx[r] + margin && cubePx[b] > cubePx[g] + margin`) — pinning down exactly which neighboring row a substitution bug would have pulled in, not just "not red."
+
+Verified against this run's real captured bytes (`channels=(103,113,164,255)`): consistent with a `B8G8R8A8`-family device (`r=2, g=1, b=0` → R=164, G=113, B=103) — red-dominant by a wide margin (gap ≈ 51–61, threshold 15), and clearly neither near-neutral (gap 61 ≫ 15) nor blue-dominant (B=103 is the smallest of the three, not the largest).
+
+### Re-verification after the fix
+
+- `sample_05_multipass --validate` (headless): `PASSED`; cube probe assertion and both new substitution checks pass against real captured data.
+- `grep -r vkCmdPipelineBarrier2 samples/05_multipass/` → still empty.
+- `ctest --preset linux-native --output-on-failure`: **12/12 passed** (fresh run, post-fix).
+- `windows-cross-zig`: fresh full rebuild — clean.
+- Both presets repackaged via `tools/package_samples.sh` (Linux 48 files, Windows 40 files — unchanged file counts, this fix touched only `main.cpp`) and re-verified standalone: Linux native (`exit 0`, `PASSED`) and Windows via `wine`+`xvfb-run` (`exit 0`, `PASSED`).
+
+### Commit
+
+New commit on this worktree's branch, on top of the fix-round-1 commit — see the STATUS reply for the hash.

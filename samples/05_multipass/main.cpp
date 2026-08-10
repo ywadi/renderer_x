@@ -319,6 +319,53 @@ PixelCoord worldToPixel(glm::vec2 worldXZ, uint32_t viewportWidth, uint32_t view
     return {clampedX, clampedY};
 }
 
+// Byte position of each of R/G/B within one texel of `format`, in a
+// 4-byte-per-texel 8-bit UNORM/SRGB readback -- [fix round 2]. Every other
+// channel-order check in this file (brightness sums, the shadow-vs-lit
+// probe comparison) is deliberately channel-order-AGNOSTIC (see e.g.
+// samples/03_bindless_mesh's own identical comment): it only ever compares
+// a pixel against ITSELF or against another pixel, never against an
+// absolute "this byte is red" claim, so it never needed to know this
+// mapping. The object-index-1 substitution check below is different --
+// it must tell a genuinely red-dominant pixel (the cube's own albedo)
+// apart from a genuinely BLUE-dominant one (the sphere's), which an
+// order-agnostic "is either outer byte dominant" check cannot do: that
+// check is satisfied by EITHER a real red-dominant OR a real blue-
+// dominant pixel, in either true byte order, which is exactly the review
+// finding that superseded it (a substituted sphere row would have passed
+// it). This function exists to give that check the TRUE, format-derived
+// R/G/B byte indices instead.
+//
+// Vulkan's own format-naming convention lists components in increasing
+// memory-address order -- VK_FORMAT_B8G8R8A8_* means byte0=B, byte1=G,
+// byte2=R, byte3=A; VK_FORMAT_R8G8B8A8_* means byte0=R, byte1=G, byte2=B,
+// byte3=A. Every 8-bit-per-channel swapchain/offscreen-readback format
+// this sample has actually observed (linux-native on both lavapipe and
+// this development machine's NVIDIA driver; windows-cross-zig under Wine)
+// is one of these two families. Returns std::nullopt (never a guessed
+// mapping) for anything else -- the caller must fail its check loudly
+// rather than assert against an unverified channel order.
+struct ChannelIndices {
+    int r;
+    int g;
+    int b;
+};
+
+std::optional<ChannelIndices> channelIndicesForFormat(VkFormat format) {
+    switch (format) {
+        case VK_FORMAT_B8G8R8A8_UNORM:
+        case VK_FORMAT_B8G8R8A8_SRGB:
+        case VK_FORMAT_B8G8R8A8_SNORM:
+            return ChannelIndices{2, 1, 0};
+        case VK_FORMAT_R8G8B8A8_UNORM:
+        case VK_FORMAT_R8G8B8A8_SRGB:
+        case VK_FORMAT_R8G8B8A8_SNORM:
+            return ChannelIndices{0, 1, 2};
+        default:
+            return std::nullopt;
+    }
+}
+
 // --- Procedural geometry: position + normal (unlike
 // samples/03_bindless_mesh's position + uv -- this sample has no textures,
 // only Lambert shading, which needs a normal instead) --------------------
@@ -1684,43 +1731,96 @@ int runHeadless(bool enableValidation) {
         }
     }
 
-    // (d) [fix round 1] object index 1 (the cube -- see kObjects) renders
-    // at its ANALYTICALLY EXPECTED screen position, not just "some shadow
-    // exists somewhere". Deliberately index 1, not index 0 (the floor):
-    // this is exactly the row a stride/offset drift between the C++ writer
-    // and either shader's ObjectTransform struct would corrupt while
-    // leaving row 0 looking fine (row 0 starts at byte offset 0 under any
-    // stride assumption -- see scene_types.slang's header comment for the
-    // real bug this class of check would have caught immediately). Probes
-    // the cube's own world XZ center (worldToPixel() -- the same fixed
-    // top-down camera every other probe in this file uses) and checks for
-    // its distinctly RED-leaning albedo (0.75, 0.25, 0.2) against the
-    // floor's near-neutral gray (0.55, 0.55, 0.6) and the sphere's
-    // blue-leaning albedo (0.2, 0.45, 0.8) -- channel-order-agnostic (see
-    // isReddish() below): a mvp/lightMvp drift severe enough to move the
-    // cube off its expected footprint, or a struct-offset drift severe
-    // enough to substitute a neighboring row's data, would both make this
-    // probe land on the floor (near-neutral, fails) rather than the cube
-    // (clearly red-dominant, passes).
+    // (d) [fix round 1, tightened in fix round 2] object index 1 (the cube
+    // -- see kObjects) renders at its ANALYTICALLY EXPECTED screen
+    // position, not just "some shadow exists somewhere". Deliberately
+    // index 1, not index 0 (the floor): this is exactly the row a
+    // stride/offset drift between the C++ writer and either shader's
+    // ObjectTransform struct would corrupt while leaving row 0 looking
+    // fine (row 0 starts at byte offset 0 under any stride assumption --
+    // see scene_types.slang's header comment for the real bug this class
+    // of check would have caught immediately). Probes the cube's own
+    // world XZ center (worldToPixel() -- the same fixed top-down camera
+    // every other probe in this file uses).
+    //
+    // CHANNEL-ORDER-EXACT, not agnostic [fix round 2 -- re-review finding]:
+    // an earlier revision of this check accepted "byte0 dominant OR byte2
+    // dominant" as a stand-in for "red-dominant, whichever byte order this
+    // device uses" -- but that is satisfied by a genuinely BLUE-dominant
+    // pixel too (the sphere's own albedo direction), in whichever byte
+    // order is NOT the true one: e.g. under a real RGBA device, the
+    // sphere's blue channel (byte2) being dominant would satisfy the
+    // "byte2 dominant" half of that OR, which the old check laundered
+    // into "red-dominant" unconditionally. That is precisely the failure
+    // mode this probe exists to catch (a neighboring row's data
+    // substituted in for the cube's own), so a check that cannot tell red
+    // from blue cannot actually catch it. Fixed by resolving this
+    // sample's REAL backbuffer format (channelIndicesForFormat(),
+    // above) to the true R/G/B byte positions ONCE, then testing against
+    // those exact indices only -- both a genuine "is this red" assertion
+    // AND, as direct substitution detection, genuine "is this NOT the
+    // floor's near-neutral gray" / "is this NOT the sphere's blue-
+    // dominant albedo" assertions against the cube's two actual
+    // neighboring rows in the transform buffer (index 0 and index 2).
     const PixelCoord cubePixel =
         worldToPixel(glm::vec2(kCubePosition.x, kCubePosition.z), kHeadlessWidth, kHeadlessHeight);
     const uint8_t* cubePx = pixelAt(cubePixel.x, cubePixel.y);
-    auto isReddish = [](const uint8_t* p) {
-        constexpr int kMargin = 15;
-        const bool asRgba = p[0] > p[1] + kMargin && p[0] > p[2] + kMargin;  // R=p[0] dominant
-        const bool asBgra = p[2] > p[1] + kMargin && p[2] > p[0] + kMargin;  // R=p[2] dominant
-        return asRgba || asBgra;
-    };
     RX_LOG_INFO("cube probe world=({:.1f},{:.1f}) pixel=({},{}) channels=({},{},{},{})", kCubePosition.x,
                 kCubePosition.z, cubePixel.x, cubePixel.y, cubePx[0], cubePx[1], cubePx[2], cubePx[3]);
-    if (!isReddish(cubePx)) {
+
+    const auto cubeChannels = channelIndicesForFormat(targetFormat);
+    if (!cubeChannels.has_value()) {
         RX_LOG_ERROR(
-            "cube probe (object index 1) at pixel ({},{}) channels=({},{},{}) is not clearly red-dominant -- "
-            "the cube is not rendering at its analytically expected position (ObjectTransform stride/offset "
-            "drift between the C++ writer and a shader-side copy is exactly the bug class this check exists "
-            "to catch -- see scene_types.slang)",
-            cubePixel.x, cubePixel.y, cubePx[0], cubePx[1], cubePx[2]);
+            "cube probe: backbuffer format {} is not one of the R8G8B8A8/B8G8R8A8 families this check knows how "
+            "to map to exact R/G/B byte positions -- refusing to guess",
+            static_cast<int>(targetFormat));
         pass = false;
+    } else {
+        constexpr int kMargin = 15;  // matches this file's other probe margins
+        const int r = cubeChannels->r;
+        const int g = cubeChannels->g;
+        const int b = cubeChannels->b;
+
+        // Positive check: the cube's own albedo (0.75, 0.25, 0.2) is
+        // clearly red-dominant.
+        const bool isRedDominant = cubePx[r] > cubePx[g] + kMargin && cubePx[r] > cubePx[b] + kMargin;
+        if (!isRedDominant) {
+            RX_LOG_ERROR(
+                "cube probe (object index 1) at pixel ({},{}) R={} G={} B={} is not clearly red-dominant -- the "
+                "cube is not rendering at its analytically expected position (ObjectTransform stride/offset "
+                "drift between the C++ writer and a shader-side copy is exactly the bug class this check exists "
+                "to catch -- see scene_types.slang)",
+                cubePixel.x, cubePixel.y, cubePx[r], cubePx[g], cubePx[b]);
+            pass = false;
+        }
+
+        // Direct substitution detection: the cube's two actual neighboring
+        // rows in the transform buffer are index 0 (the floor, near-
+        // neutral gray -- (0.55, 0.55, 0.6)) and index 2 (the sphere,
+        // blue-dominant -- (0.2, 0.45, 0.8)). A struct-offset drift that
+        // substitutes either neighbor's data in for the cube's own row
+        // must fail at least one of these, even in the (algebraically
+        // impossible once isRedDominant already holds) case that some
+        // future edit weakens the positive check above.
+        const bool looksLikeFloor = std::max({cubePx[r], cubePx[g], cubePx[b]}) -
+                                         std::min({cubePx[r], cubePx[g], cubePx[b]}) <
+                                     kMargin;
+        if (looksLikeFloor) {
+            RX_LOG_ERROR(
+                "cube probe (object index 1) at pixel ({},{}) R={} G={} B={} looks like the FLOOR's near-neutral "
+                "albedo (object index 0, the cube's neighboring row) -- a likely direct row substitution",
+                cubePixel.x, cubePixel.y, cubePx[r], cubePx[g], cubePx[b]);
+            pass = false;
+        }
+        const bool looksLikeSphere = cubePx[b] > cubePx[r] + kMargin && cubePx[b] > cubePx[g] + kMargin;
+        if (looksLikeSphere) {
+            RX_LOG_ERROR(
+                "cube probe (object index 1) at pixel ({},{}) R={} G={} B={} looks like the SPHERE's blue-"
+                "dominant albedo (object index 2, the cube's other neighboring row) -- a likely direct row "
+                "substitution",
+                cubePixel.x, cubePixel.y, cubePx[r], cubePx[g], cubePx[b]);
+            pass = false;
+        }
     }
 
     if (enableValidation && context->hasValidationErrors()) {
