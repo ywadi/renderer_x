@@ -127,6 +127,18 @@ and visible culling statistics.
     satisfy the performance posture (item 9: pooled, instanced,
     parallel-iterable).
 
+12. **Dear ImGui debug overlay (user-raised 2026-08-10, scoped):** Phase 4
+    adds an OPTIONAL debug-UI module (samples/tooling only) rendering
+    ImGui draw data through the render graph as a normal declared pass,
+    leaning on upstream's maintained SDL3 + Vulkan (dynamic rendering)
+    backends per repo policy. First consumer: sample 07's on-screen
+    culling statistics. HARD BOUNDARY: core libraries (rx_rhi_vk,
+    rx_graph, rx_material, public ABI) carry zero ImGui awareness — no
+    types in signatures, no hooks in core headers. Docking/multi-window
+    editor UI is tooling-phase scope, not Phase 4. Tracy requires no
+    ImGui from us (standalone profiler app; we link only the
+    instrumentation client).
+
 ## Carried process notes
 
 - Research pass before spec (library selection for glTF/KTX2 with
