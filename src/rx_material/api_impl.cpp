@@ -145,6 +145,31 @@ std::vector<ReflectedParam> reflectMaterialParams(slang::IGlobalSession* globalS
     targetDesc.format = SLANG_SPIRV;
     targetDesc.profile = globalSession->findProfile("sm_6_0");
 
+    // [Fix round 1, task-6-review.md F3] Mirrors MaterialSystem::create()'s
+    // own target setup (material_system.cpp) EXACTLY, field for field --
+    // the authoritative session that will eventually govern GPU binding
+    // (Task 7) and this reflection-only session must agree on every
+    // TargetDesc/SessionDesc knob, not just format/profile/searchPaths,
+    // so there is no configuration-driven risk of the two ever
+    // classifying a field's shape differently. After this, the only
+    // remaining difference between the two sessions is that they are
+    // necessarily separate `slang::ISession`/`slang::IGlobalSession`
+    // instances (this file cannot reach into MaterialSystem::Impl's
+    // private session at all -- see this file's own top comment) --
+    // structural, already-disclosed, and not a configuration divergence.
+    slang::CompilerOptionEntry capabilityEntry{};
+    SlangCapabilityID spirvFloor = globalSession->findCapability("spirv_1_3");
+    if (spirvFloor != SLANG_CAPABILITY_UNKNOWN) {
+        capabilityEntry.name = slang::CompilerOptionName::Capability;
+        capabilityEntry.value.kind = slang::CompilerOptionValueKind::Int;
+        capabilityEntry.value.intValue0 = static_cast<int32_t>(spirvFloor);
+        targetDesc.compilerOptionEntries = &capabilityEntry;
+        targetDesc.compilerOptionEntryCount = 1;
+    } else {
+        RX_LOG_WARN("rx_material: rx_api: Slang capability 'spirv_1_3' not found by this Slang build; reflecting "
+                    "material parameters without an explicit SPIR-V version floor");
+    }
+
     const std::string shaderDir = RX_MATERIAL_SHADER_DIR;
     const char* searchPath = shaderDir.c_str();
 
@@ -406,61 +431,101 @@ RxResult RX_CALL MaterialInstanceImpl::setFloat(const char* name, float value) {
     if (name == nullptr) {
         return RX_E_INVALIDARG;
     }
-    std::optional<ParamKind> kind = material_->paramKind(name);
-    if (!kind.has_value()) {
-        return RX_E_NOTFOUND;
+    // [Fix round 1, task-6-review.md F1] The `const char*` -> std::string
+    // conversion inside paramKind()'s lookup, and the `unordered_map`
+    // insertion below (which can rehash/allocate), can both throw
+    // std::bad_alloc -- exactly the cross-ABI-exception failure mode D5
+    // forbids. Every other public entry point in this file already
+    // catches at its own boundary; this setter (and setFloat4/setTexture
+    // below) previously did not -- see the review finding this fixes.
+    try {
+        std::optional<ParamKind> kind = material_->paramKind(name);
+        if (!kind.has_value()) {
+            return RX_E_NOTFOUND;
+        }
+        if (*kind != ParamKind::Float) {
+            return RX_E_INVALIDARG;
+        }
+        releaseStoredTextureIfAny(name);
+        StoredParam param;
+        param.kind = ParamKind::Float;
+        param.floats[0] = value;
+        params_[name] = param;
+        return RX_OK;
+    } catch (const std::exception& e) {
+        RX_LOG_ERROR("rx_material: rx_api: MaterialInstanceImpl::setFloat('{}') failed: {}", name, e.what());
+        return RX_E_FAIL;
     }
-    if (*kind != ParamKind::Float) {
-        return RX_E_INVALIDARG;
-    }
-    releaseStoredTextureIfAny(name);
-    StoredParam param;
-    param.kind = ParamKind::Float;
-    param.floats[0] = value;
-    params_[name] = param;
-    return RX_OK;
 }
 
 RxResult RX_CALL MaterialInstanceImpl::setFloat4(const char* name, const float value[4]) {
     if (name == nullptr || value == nullptr) {
         return RX_E_INVALIDARG;
     }
-    std::optional<ParamKind> kind = material_->paramKind(name);
-    if (!kind.has_value()) {
-        return RX_E_NOTFOUND;
+    try {
+        std::optional<ParamKind> kind = material_->paramKind(name);
+        if (!kind.has_value()) {
+            return RX_E_NOTFOUND;
+        }
+        if (*kind != ParamKind::Float4) {
+            return RX_E_INVALIDARG;
+        }
+        releaseStoredTextureIfAny(name);
+        StoredParam param;
+        param.kind = ParamKind::Float4;
+        param.floats[0] = value[0];
+        param.floats[1] = value[1];
+        param.floats[2] = value[2];
+        param.floats[3] = value[3];
+        params_[name] = param;
+        return RX_OK;
+    } catch (const std::exception& e) {
+        RX_LOG_ERROR("rx_material: rx_api: MaterialInstanceImpl::setFloat4('{}') failed: {}", name, e.what());
+        return RX_E_FAIL;
     }
-    if (*kind != ParamKind::Float4) {
-        return RX_E_INVALIDARG;
-    }
-    releaseStoredTextureIfAny(name);
-    StoredParam param;
-    param.kind = ParamKind::Float4;
-    param.floats[0] = value[0];
-    param.floats[1] = value[1];
-    param.floats[2] = value[2];
-    param.floats[3] = value[3];
-    params_[name] = param;
-    return RX_OK;
 }
 
 RxResult RX_CALL MaterialInstanceImpl::setTexture(const char* name, IRxTexture* texture) {
     if (name == nullptr || texture == nullptr) {
         return RX_E_INVALIDARG;
     }
-    std::optional<ParamKind> kind = material_->paramKind(name);
-    if (!kind.has_value()) {
-        return RX_E_NOTFOUND;
+    try {
+        std::optional<ParamKind> kind = material_->paramKind(name);
+        if (!kind.has_value()) {
+            return RX_E_NOTFOUND;
+        }
+        if (*kind != ParamKind::TextureIndex) {
+            return RX_E_INVALIDARG;
+        }
+
+        // Ordering matters here beyond just the try/catch: capture
+        // whatever this name previously held, but do not touch ANY
+        // refcount until AFTER the (possibly-throwing) map mutation has
+        // already succeeded. If `params_[name] = newParam` throws
+        // (bad_alloc during a rehash), nothing has been addRef()'d or
+        // release()'d yet, so this call leaves every refcount exactly as
+        // it was on entry -- no leaked reference on `texture`, no
+        // double-release of whatever was previously stored.
+        IRxTexture* previousTexture = nullptr;
+        auto it = params_.find(name);
+        if (it != params_.end() && it->second.kind == ParamKind::TextureIndex) {
+            previousTexture = it->second.texture;
+        }
+
+        StoredParam newParam;
+        newParam.kind = ParamKind::TextureIndex;
+        newParam.texture = texture;
+        params_[name] = newParam;
+
+        texture->addRef();
+        if (previousTexture != nullptr) {
+            previousTexture->release();
+        }
+        return RX_OK;
+    } catch (const std::exception& e) {
+        RX_LOG_ERROR("rx_material: rx_api: MaterialInstanceImpl::setTexture('{}') failed: {}", name, e.what());
+        return RX_E_FAIL;
     }
-    if (*kind != ParamKind::TextureIndex) {
-        return RX_E_INVALIDARG;
-    }
-    releaseStoredTextureIfAny(name);
-    texture->addRef();
-    StoredParam param;
-    param.kind = ParamKind::TextureIndex;
-    param.texture = texture;
-    params_[name] = param;
-    return RX_OK;
 }
 
 // --- MaterialImpl ----------------------------------------------------------
@@ -554,8 +619,28 @@ RxResult RX_CALL MaterialSystemImpl::loadMaterial(const char* slangModulePath, I
 
     std::filesystem::path path(slangModulePath);
     try {
-        rx::material::MaterialHandle handle = internal_->loadMaterial(path);
-
+        // [Fix round 1, task-6-review.md F2] The reflection-only pass
+        // runs FIRST, before ever touching `internal_` -- deliberately
+        // reordered from the original submission, which called
+        // `internal_->loadMaterial()` (expensive and STATEFUL: it
+        // creates a real VkDescriptorSetLayout/VkPipelineLayout and
+        // registers a MaterialRecord inside `internal_`) before this
+        // side-effect-free validation step. That ordering meant a
+        // reflection failure AFTER a successful internal load
+        // permanently orphaned the just-created internal record (Task
+        // 5's MaterialSystem exposes no unload/release path). Running
+        // reflection first means: if it fails, `internal_` is never
+        // touched at all, so there is nothing to orphan; if it succeeds,
+        // `internal_->loadMaterial()` runs exactly once, same as before.
+        // (Reflection succeeding does not GUARANTEE internal_'s own,
+        // stricter shape checks also pass -- reflectMaterialParams()
+        // only takes the first ParameterBlock it finds and silently
+        // ignores any OTHER top-level global, while internal_'s own
+        // reflectMaterialLayout() rejects those outright -- but if
+        // internal_->loadMaterial() throws in THAT direction, it is
+        // Task 5's own already-correct exception safety: a throwing
+        // loadMaterial() never registers a MaterialRecord in the first
+        // place, so there is still nothing orphaned either way.)
         if (!ensureReflectionGlobalSession()) {
             return RX_E_COMPILE;
         }
@@ -566,6 +651,8 @@ RxResult RX_CALL MaterialSystemImpl::loadMaterial(const char* slangModulePath, I
             RX_LOG_ERROR("rx_material: rx_api: {}", reflectError);
             return RX_E_COMPILE;
         }
+
+        rx::material::MaterialHandle handle = internal_->loadMaterial(path);
 
         std::unordered_map<std::string, ParamKind> params;
         params.reserve(reflected.size());

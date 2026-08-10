@@ -35,6 +35,31 @@ IRxMaterialSystem* makeDeviceFreeSystem() {
     return system;
 }
 
+// [Fix round 1, task-6-review.md F1] Cheap structural guard, not an OOM
+// injection test: proves an entry point returned a value from the fixed
+// RxResult enum (i.e. it returned normally at all, rather than an
+// uncaught C++ exception unwinding out of it -- doctest itself would
+// catch and FAIL the enclosing TEST_CASE on that, per its default
+// exception-trapping behavior, so "every CHECK below actually ran" is
+// itself part of what this test proves). Forcing a genuine bad_alloc to
+// distinguish try/catch-present from try/catch-absent code was
+// considered and rejected as not worth the fault-injection scaffolding
+// it would need (per the coordinator's own fix-round-1 instructions);
+// this is the cheaper, always-available substitute.
+bool isDocumentedResult(RxResult result) {
+    switch (result) {
+        case RX_OK:
+        case RX_E_FAIL:
+        case RX_E_INVALIDARG:
+        case RX_E_NOTFOUND:
+        case RX_E_COMPILE:
+        case RX_E_NOINTERFACE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 }  // namespace
 
 TEST_CASE("rxCreateMaterialSystem rejects null desc/outSystem with RX_E_INVALIDARG") {
@@ -136,5 +161,44 @@ TEST_CASE("loadMaterial rejects null slangModulePath/outMaterial with RX_E_INVAL
 TEST_CASE("reloadChanged is a documented Task 6 no-op that always returns RX_OK (Task 7 wires the real behavior)") {
     IRxMaterialSystem* system = makeDeviceFreeSystem();
     CHECK(system->reloadChanged() == RX_OK);
+    system->release();
+}
+
+// [Fix round 1, task-6-review.md F1] Entry-point audit: every
+// RxResult-returning method reachable from a device-free (null-internal)
+// IRxMaterialSystem, across a spread of normal/edge/malformed inputs,
+// returns a value from the documented RxResult enum and never lets an
+// exception escape (see isDocumentedResult()'s own comment for exactly
+// what that does and doesn't prove). IRxMaterialInstance's three
+// setters are NOT reachable from here: constructing a real
+// IRxMaterialInstance requires a real IRxMaterial, which requires
+// internal_->loadMaterial() to actually succeed against a real
+// VkDevice-backed rx::material::MaterialSystem -- an architectural fact,
+// not a shortcut (a null-internal IRxMaterialSystem's loadMaterial()
+// always returns RX_E_FAIL before ever constructing one -- see the
+// dedicated test above). The equivalent setter audit, with a real
+// instance, lives in test_api_factory.cpp's own "entry-point audit" case
+// instead.
+TEST_CASE("entry-point audit: every RxResult-returning method on a device-free IRxMaterialSystem returns a "
+          "documented code across normal/edge/malformed inputs, never crashes") {
+    IRxMaterialSystem* system = makeDeviceFreeSystem();
+
+    void* outUnknown = nullptr;
+    CHECK(isDocumentedResult(system->queryInterface(kIID_IRxUnknown, &outUnknown)));
+    if (outUnknown != nullptr) {
+        static_cast<IRxUnknown*>(outUnknown)->release();
+    }
+    void* outUnrelated = nullptr;
+    CHECK(isDocumentedResult(system->queryInterface(kIID_IRxMaterial, &outUnrelated)));
+    CHECK(isDocumentedResult(system->queryInterface(kIID_IRxUnknown, nullptr)));
+
+    IRxMaterial* material = nullptr;
+    CHECK(isDocumentedResult(system->loadMaterial(nullptr, &material)));
+    CHECK(isDocumentedResult(system->loadMaterial("does/not/matter.slang", nullptr)));
+    CHECK(isDocumentedResult(system->loadMaterial("", &material)));
+    CHECK(isDocumentedResult(system->loadMaterial("does/not/matter.slang", &material)));
+
+    CHECK(isDocumentedResult(system->reloadChanged()));
+
     system->release();
 }

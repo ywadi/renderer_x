@@ -12,6 +12,7 @@
 #include <doctest/doctest.h>
 #include <rx_material/material_system.h>
 #include <rx_material/rx_api.h>
+#include <rx_material/rx_api_detail.h>
 #include <rx_platform/window.h>
 #include <rx_rhi_vk/bindless.h>
 #include <rx_rhi_vk/context.h>
@@ -135,6 +136,25 @@ private:
     uint32_t refCount_ = 1;
 };
 
+// [Fix round 1, task-6-review.md F1] Same cheap structural guard as
+// test_api_contract.cpp's own identically-named helper (duplicated, not
+// shared -- matching this file's own established precedent of not
+// reaching into another test binary's private helpers). See that file's
+// comment on its own copy for exactly what this does and doesn't prove.
+bool isDocumentedResult(RxResult result) {
+    switch (result) {
+        case RX_OK:
+        case RX_E_FAIL:
+        case RX_E_INVALIDARG:
+        case RX_E_NOTFOUND:
+        case RX_E_COMPILE:
+        case RX_E_NOINTERFACE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 }  // namespace
 
 TEST_CASE("rxCreateMaterialSystem + loadMaterial: happy path against a real device, IRxMaterialInstance validates "
@@ -253,7 +273,8 @@ TEST_CASE("IRxMaterialInstance::setTexture validates a real bindless-index (uint
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 
-TEST_CASE("loadMaterial maps a real Slang compile failure to RX_E_COMPILE, never throws across the boundary") {
+TEST_CASE("loadMaterial maps a real Slang compile failure to RX_E_COMPILE, never throws across the boundary, and "
+          "leaves no orphaned live API object behind") {
     auto fixture = makeFixture("rx_api_factory_bad_module");
     if (!fixture.has_value()) {
         return;
@@ -267,11 +288,83 @@ TEST_CASE("loadMaterial maps a real Slang compile failure to RX_E_COMPILE, never
     IRxMaterialSystem* system = nullptr;
     REQUIRE(rxCreateMaterialSystem(&desc, &system) == RX_OK);
 
+    // [Fix round 1, task-6-review.md F2] Recorded AFTER the system object
+    // itself exists (so this count only reflects what `loadMaterial`
+    // below does, not construction of `system`), immediately before the
+    // call that is expected to fail. A failed loadMaterial() must never
+    // leave behind a live MaterialImpl API object -- this is the
+    // detail::debugLiveApiObjectCount() seam's exact purpose (see
+    // rx_api_detail.h). Note what this DOES and DOES NOT prove: it
+    // observes only IRxUnknown-rooted API wrapper objects
+    // (MaterialSystemImpl/MaterialImpl/MaterialInstanceImpl), not
+    // rx::material::MaterialSystem's own internal MaterialRecord/GPU
+    // resources (Task 5's MaterialSystem exposes no count accessor for
+    // those) -- so it cannot directly observe F2's specific internal-
+    // record-orphaning failure mode. It DOES prove the API layer itself
+    // never constructs-then-abandons a MaterialImpl on this failure
+    // path, which was already true before the F2 reorder (loadMaterial
+    // only ever calls `new MaterialImpl(...)` after every prior step has
+    // already succeeded) and remains true after it -- a real, if
+    // narrower, regression guard.
+    uint64_t liveBefore = rx::material::detail::debugLiveApiObjectCount();
+
     IRxMaterial* material = reinterpret_cast<IRxMaterial*>(static_cast<uintptr_t>(0x1));  // poisoned
     std::string badPath = testDataPath("test_bad_syntax.slang").string();
     CHECK(system->loadMaterial(badPath.c_str(), &material) == RX_E_COMPILE);
     CHECK(material == nullptr);
+    CHECK(rx::material::detail::debugLiveApiObjectCount() == liveBefore);
 
+    system->release();
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("entry-point audit: IRxMaterialInstance's three setters return a documented RxResult across "
+          "normal/edge/malformed inputs against a real instance, never crash") {
+    auto fixture = makeFixture("rx_api_factory_setter_audit");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto internal = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+                                                            freshCachePath("api_setter_audit"));
+    REQUIRE(internal != nullptr);
+
+    RxMaterialSystemDesc desc{internal.get()};
+    IRxMaterialSystem* system = nullptr;
+    REQUIRE(rxCreateMaterialSystem(&desc, &system) == RX_OK);
+
+    IRxMaterial* material = nullptr;
+    std::string unlitPath = testDataPath("test_unlit.slang").string();
+    REQUIRE(system->loadMaterial(unlitPath.c_str(), &material) == RX_OK);
+
+    IRxMaterialInstance* instance = nullptr;
+    REQUIRE(material->createInstance(&instance) == RX_OK);
+
+    auto* texture = new FakeTexture();
+    float value4[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+    // A long name deliberately pokes at std::string's allocation path
+    // (the exact code F1 found without a try/catch) -- not an OOM
+    // injection, just a normal-sized-heap-allocation input rather than a
+    // short-string-optimized one.
+    std::string longName(4096, 'x');
+
+    const char* names[] = {"tint", "nonexistent", "", longName.c_str()};
+    for (const char* name : names) {
+        CHECK(isDocumentedResult(instance->setFloat(name, 1.0F)));
+        CHECK(isDocumentedResult(instance->setFloat4(name, value4)));
+        CHECK(isDocumentedResult(instance->setTexture(name, texture)));
+    }
+
+    // Null-argument edges on all three setters.
+    CHECK(isDocumentedResult(instance->setFloat(nullptr, 1.0F)));
+    CHECK(isDocumentedResult(instance->setFloat4("tint", nullptr)));
+    CHECK(isDocumentedResult(instance->setFloat4(nullptr, value4)));
+    CHECK(isDocumentedResult(instance->setTexture("tint", nullptr)));
+    CHECK(isDocumentedResult(instance->setTexture(nullptr, texture)));
+
+    texture->release();
+    instance->release();
+    material->release();
     system->release();
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
