@@ -147,7 +147,12 @@ it is out of scope for *this* spec only, not out of scope for the project:
   subsystems so they aren't lost before those layers get specced:
   - **Geometry processing** (layer 8, scene submission): meshlet
     generation, virtual geometry, LOD management, skeletal mesh skinning,
-    morph targets.
+    morph targets. **meshoptimizer is the committed library** for
+    import-time optimization (Phase 4), meshlet building, and LOD
+    simplification (decided 2026-08-10; see also the Phase 4 seed notes).
+    Asset decompression stays CPU-side (KTX2+zstd on worker threads) —
+    GPU decompression was evaluated and dropped 2026-08-10 (D3D12-bound
+    ecosystem; no expected win on the Deck floor).
   - **Lighting infrastructure & spatial queries** (layer 9, techniques):
     acceleration structures (BVH for ray tracing), clustered/deferred
     lighting grids, shadow cascades, global illumination probes.
@@ -188,13 +193,6 @@ it is out of scope for *this* spec only, not out of scope for the project:
   meshlets exist; it requires a shade-from-ID path through the material
   system's specialization model — design work to scope in that phase's
   spec, not assumed.
-- **GPU decompression (GDeflate-class)** (recorded 2026-08-10, streaming
-  phase, lowest priority of the three): DirectStorage proper is
-  D3D12/Windows-only — the portable target is async IO + compute-shader
-  GDeflate (open spec). Baseline remains KTX2+zstd on worker threads
-  (Phase 4). Gate: adopt only if profiling proves a win on the Deck
-  floor, where spending GPU on decompression while rendering plausibly
-  loses to its Zen 2 cores.
 - **Multi-language bindings** (committed 2026-08-10, SDK phase): the public
   API ships C-ABI-first — a single IDL source generates the C header, the
   C++ COM-lite header, and the DLL shim (bgfx precedent; kills header
