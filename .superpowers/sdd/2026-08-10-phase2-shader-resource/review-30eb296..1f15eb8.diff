@@ -1,0 +1,1387 @@
+# Review package: 30eb296..1f15eb8
+
+## Commits
+1f15eb8 Add rx_shader: in-process Slang compilation to SPIR-V
+
+## Files changed
+ .../task-1-report.md                               | 251 ++++++++++++++++
+ CMakeLists.txt                                     |   1 +
+ src/rx_shader/CMakeLists.txt                       | 158 ++++++++++
+ src/rx_shader/include/rx_shader/compiler.h         |  98 ++++++
+ src/rx_shader/src/compiler.cpp                     | 332 +++++++++++++++++++++
+ src/rx_shader/tests/compiler_test.cpp              | 186 ++++++++++++
+ src/rx_shader/tests/doctest_main.cpp               |   7 +
+ src/rx_shader/tests/link_smoketest.cpp             |  21 ++
+ tools/fetch_slang.cmake                            | 227 ++++++++++----
+ 9 files changed, 1218 insertions(+), 63 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-1-report.md b/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-1-report.md
+new file mode 100644
+index 0000000..e9129bc
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-1-report.md
+@@ -0,0 +1,251 @@
++# Task 1 Report: Slang runtime linking + ShaderCompiler (rx_shader)
++
++## Summary
++
++Implemented the full Task 1 scope: reworked `tools/fetch_slang.cmake` for
++version-keyed markers and a target-side Windows archive fetch, empirically
++proved the Windows link smoke test (the plan's risk gate) both links AND
++runs correctly under Wine, built the `rx_shader` module (`Compiler` +
++`CompileResult` exactly per the brief's interface, including the opaque
++retained `IComponentType` for Task 2), wrote real tests exercising the
++actual Slang compiler (no mocks), and wired runtime Slang-library placement
++(RPATH `$ORIGIN` + build-time copy) proven by `rx_shader_tests` running
++straight from the build tree. Both presets configure, build, and test
++clean. One real, previously-unknown toolchain defect was found and fixed
++along the way (see "Findings" below) — not a plan-level blocker, but
++load-bearing for anyone else linking a versioned `.so` through this
++project's zig toolchain.
++
++## Windows link smoke test (risk gate) — PASSED, with a bonus result
++
++Per the brief, this was done first, before writing any of the real
++Compiler implementation. A trivial TU (`src/rx_shader/tests/link_smoketest.cpp`)
++calling `slang::createGlobalSession`, built via the `windows-cross-zig`
++preset, links cleanly against the MSVC-built `slang-compiler.lib` through
++zig/LLD — no linker errors. Empirically verified twice: once as a
++standalone `zig c++` invocation in isolation (before touching the real
++CMake files), and again as the actual `rx_shader_link_smoketest` target
++inside the real build.
++
++Beyond what the gate required (link success only), I also copied the
++required DLLs next to the built `.exe` and ran it under Wine 11.0 (present
++on this machine) — it executes correctly and returns 0. I went one step
++further and ran the *entire* `rx_shader_tests.exe` (real Slang
++compilation, not just `createGlobalSession`) under Wine too: all 7 test
++cases / 40 assertions pass identically to the Linux run. This is directly
++relevant to Task 8's open question ("wine-run the non-GPU test set... if
++[the Slang DLLs] don't [load under wine], exclude... investigate") — on
++this machine, with this Slang version, they do load and work under Wine,
++including the on-demand `slang-glslang`/`slang-glsl-module` plugins
++exercised by the bad-source-diagnostics test path. This is one data point,
++not exhaustive CI-environment coverage, so Task 8 should still verify on
++the actual CI runner rather than take this as settled.
++
++## Findings / discrepancies vs. the research doc
++
++1. **zig cc rejects a SONAME-versioned `.so` path as a link input (new
++   finding, not in the research doc).** Slang's shipped
++   `slangTargets-release.cmake` points `slang::slang`'s
++   `IMPORTED_LOCATION_RELEASE` directly at
++   `lib/libslang-compiler.so.0.2026.14.1`. Linking this via this project's
++   `zig-cxx-linux` wrapper failed with `unrecognized file extension` — a
++   real limitation in zig 0.16.0's driver-level file-type sniffing (it
++   doesn't recognize a SONAME-style multi-dot version suffix as a valid
++   direct link input, unlike gcc/clang's drivers, and unlike LLD itself,
++   which has no such restriction). Confirmed directly with a minimal
++   repro (`zig c++ trivial.cpp -o out lib/libslang-compiler.so.0.2026.14.1`
++   fails; the same command with the plain `libslang-compiler.so` symlink
++   succeeds). Fixed in `src/rx_shader/CMakeLists.txt` by retargeting
++   `IMPORTED_LOCATION_RELEASE` at that plain-named symlink (same inode,
++   same embedded `DT_SONAME`, so the consuming binary's actual runtime
++   dependency — and therefore the runtime-lib copy step — is completely
++   unaffected; only the path fed to the compiler driver at link time
++   changes). This did not affect the standalone Linux API-validation
++   smoke test earlier in this task because that used plain `g++`, not the
++   project's zig wrapper — worth flagging since it means "compiles with
++   g++" is not sufficient evidence for "compiles in this project."
++2. **`findCapability` uses lowercase `spirv_1_3`, not the uppercase
++   `SPIRV_1_3` also present in `slangc -h capability`'s output.** Both
++   exist; `slangc -h capability` explicitly documents `spirv_1_{0..5}`
++   (lowercase) as "minimum supported SPIR-V version," which is the
++   documented semantic this task needs (matches R:A5's "capability
++   spirv_1_3" exactly) — used that one. The uppercase `SPIRV_1_x` family
++   appears to be a different capability-atom namespace; not investigated
++   further since it wasn't needed.
++3. Everything else in R:A1/A2/A4/A5/A6/D2 matched the real shipped
++   `slang.h`/archives exactly as documented — API signatures, archive
++   layouts (including the Windows `cmake/` vs Linux `lib/cmake/slang/`
++   split), threading rules, and the COM-lite cross-ABI linking claim all
++   verified directly against the real v2026.14.1 archives (both Linux and
++   a freshly-downloaded Windows one) before writing any code against them.
++
++## Implementation
++
++### 1. `tools/fetch_slang.cmake` (reworked)
++
++- Marker is now `.rx-fetched-<version>`; the old unversioned
++  `.rx-fetched` is never consulted. A missing/stale versioned marker wipes
++  the whole platform directory (`file(REMOVE_RECURSE)`) before re-fetching
++  — closes the Phase 1 deferred finding (a version bump previously left a
++  stale marker in place and silently kept old binaries).
++- Host-side `slangc` fetch is unchanged in spirit (still guards on
++  `CMAKE_HOST_SYSTEM_NAME`, still Linux-only today) but now goes through a
++  shared `_rx_fetch_slang_platform()` function.
++- New target-side fetch: when `CMAKE_SYSTEM_NAME STREQUAL "Windows"`
++  (true under the `windows-cross-zig` toolchain even though the fetch
++  itself still runs on this Linux host), additionally fetches
++  `slang-2026.14.1-windows-x86_64.tar.gz` into
++  `third_party/slang-prebuilt/windows-x86_64/`. On native builds, target
++  == host, so no second download.
++- Exposes `RX_SLANG_TARGET_ROOT` and `slang_ROOT` (both cache vars, the
++  latter consulted automatically by `find_package(slang CONFIG)` via
++  CMP0074) so `src/rx_shader/CMakeLists.txt` needs no per-platform
++  `PATHS`/`NO_DEFAULT_PATH` branching — verified CMake's Config-mode search
++  always tries both the `<prefix>/(cmake|CMake)/` (Windows layout) and
++  `<prefix>/(lib/*|share)/cmake/<name>*/` (Linux layout) forms regardless
++  of host OS.
++
++### 2. `src/rx_shader` (new module)
++
++- `include/rx_shader/compiler.h` / `src/compiler.cpp`: `Compiler::create()`
++  lazily creates one process-lifetime `slang::IGlobalSession` (mutex-guarded
++  static, never explicitly torn down) shared by every `Compiler` instance
++  in the process, then creates a per-instance `ISession` targeting SPIR-V
++  with an explicit `spirv_1_3` capability floor (graceful fallback +
++  logged warning if a future Slang version ever renames that capability).
++  `compileFromSource`/`compileFromFile` share one pipeline: load module →
++  find each entry point by name → `createCompositeComponentType` → `link`
++  → `getLayout` (for per-entry-point stage) → `getEntryPointCode` per
++  entry point. Diagnostics from every step are concatenated and always
++  captured in `CompileResult::diagnostics`, logged via `RX_LOG_WARN` on
++  success-with-diagnostics or `RX_LOG_ERROR` on failure — never swallowed.
++  The linked `IComponentType` is retained in `CompileResult::linkedProgram`
++  on success (null on failure) for Task 2.
++- `CMakeLists.txt`: `find_package(slang CONFIG REQUIRED)` (no manual
++  `PATHS`), promotes `slang::slang` to `IMPORTED_GLOBAL` (needed by sibling
++  directories the same way spdlog/Vulkan-Headers/SDL3/vk-bootstrap already
++  are), the zig-cc `IMPORTED_LOCATION_RELEASE` workaround from Finding #1,
++  a `rx_shader_deploy_runtime_libs()` function (glob-based library
++  discovery so a future version bump doesn't require editing filenames,
++  `BUILD_WITH_INSTALL_RPATH`/`INSTALL_RPATH="$ORIGIN"` + POST_BUILD copy),
++  applied to both `rx_shader_link_smoketest` and `rx_shader_tests`.
++- Tests (`tests/compiler_test.cpp`, real execution, no mocks): known-good
++  vertex+fragment module → 2 SPIR-V blobs, magic `0x07230203`, correct
++  `VK_SHADER_STAGE_VERTEX_BIT`/`VK_SHADER_STAGE_FRAGMENT_BIT`, retained
++  `linkedProgram`; deliberately-broken source → `ok=false` + diagnostics
++  containing the literal offending source line; two compiles through the
++  same `Compiler` (session reuse) with a generous timing sanity bound;
++  two independent `Compiler::create()` calls (process-wide global-session
++  reuse) with the same bound; `compileFromFile` round-trip via a temp
++  file; `compileFromFile` on a nonexistent path fails cleanly. 7 test
++  cases, 40 assertions.
++- `CMakeLists.txt` (root): added `add_subdirectory(src/rx_shader)`.
++
++### 3. Runtime lib placement — proof
++
++`rx_shader_tests`' `RUNPATH` is verified (via `readelf -d`) to be exactly
++`$ORIGIN` (not an absolute path into `third_party/`), and `ldd` resolves
++`libslang-compiler.so.0.2026.14.1` to the copy sitting next to the binary
++in the build tree. `rx_shader_tests` runs from that build-tree location
++under `ctest` — this is the actual proof the mechanism works, not just
++that it's configured. Same mechanism verified on Windows: the four
++required DLLs (`slang-compiler`, `slang-glslang`, `slang-glsl-module`,
++`slang-rt` — `slang-llvm`/`gfx` correctly excluded) land next to the
++`.exe` files, and `rx_shader_tests.exe` runs correctly under Wine straight
++from that location.
++
++## Verification
++
++- **linux-native, full clean build from scratch:** 12.2s wall, zero
++  warnings under `-Wall -Wextra` (checked manually against the real
++  compile-database flags for both new source files; the project itself
++  enables no warning flags anywhere, so this was an extra check, not a
++  build requirement). `ctest --preset linux-native`: **6/6 tests pass**
++  (`shader_spirv_test`, `rx_core_tests`, `rx_platform_tests`,
++  `rx_rhi_vk_tests`, `rx_shader_tests`, `sample_01_triangle_headless`).
++- **windows-cross-zig, full clean configure+build from scratch:** 14.7s
++  wall, zero errors, all 47 build targets including
++  `rx_shader_link_smoketest.exe` and `rx_shader_tests.exe`.
++  `ctest --preset windows-cross-zig -E 'rx_rhi_vk|sample'` (same exclusion
++  CI already uses, since Wine here has no real Vulkan device): **4/4
++  pass**, including `rx_shader_tests`. Additionally ran
++  `rx_shader_tests.exe` and `rx_shader_link_smoketest.exe` directly under
++  Wine outside ctest — both pass/exit 0.
++- Phase 1's `slangc`-based offline SPIR-V path (`shader_spirv_test`,
++  `triangle.{vert,frag}.spv`) still works unmodified on both presets.
++- Fetch rework verified live: the reworked script re-fetched the Linux
++  archive fresh (old unversioned marker correctly ignored and removed)
++  and fetched the Windows archive for the first time when
++  `windows-cross-zig` was configured; both platform trees' version-keyed
++  markers (`.rx-fetched-2026.14.1`) are the only markers present
++  afterward.
++
++## Deviations from brief / spec
++
++None. No coordinator sign-off was needed — no Fixed Decision required
++deviation. The zig-cc linker-driver workaround (Finding #1) is an
++implementation detail needed to make Fixed Decision #1 ("link
++`slang::slang`... via zig/LLD") actually work under this project's
++specific toolchain; it doesn't change what gets linked or shipped, only
++which on-disk path the compiler driver is handed.
++
++## Concerns for the coordinator
++
++1. **Pre-existing, unrelated to this task:**
++   `.superpowers/sdd/2026-08-09-toolchain-platform-rhi/task-4-report.md`
++   (tracked in git, part of this repo's history since commit `4c6ba3e`,
++   "Track .superpowers/ SDD workspace in git instead of ignoring it')
++   contains a "Full commit message" example block with literal AI
++   attribution text (`Co-Authored-By: Claude...` / `Claude-Session:
++   https://claude.ai/...`). I confirmed the *actual* commit
++   `git log --format='%B'` shows for that content today (`b508684`, "Add
++   rx_core...") carries no such text — the live git history is clean, so
++   the attribution text only exists inside that one report file's
++   markdown content, not in any commit's actual metadata. I did not touch
++   that file (out of scope for this task, and it's someone else's task
++   record), but since the repo's own policy is "no AI attribution... in
++   this repo's history **or remote-visible content**" and that file is
++   tracked/pushed, it's worth the coordinator's attention.
++2. **CI cache-key overlap (not exercised by this task; flagging for Task
++   8):** `.github/workflows/ci.yml` caches `third_party/slang-prebuilt`
++   under the identical key
++   (`slang-prebuilt-${{ hashFiles('tools/fetch_slang.cmake') }}`) in both
++   the `linux-native` and `windows-cross-zig` jobs. Before this task, both
++   jobs populated the same single `linux-x86_64/` subtree, so this was
++   harmless. Now the `windows-cross-zig` job also populates a second
++   `windows-x86_64/` subtree under the same cache path/key — whichever
++   job's cache-save completes first "wins" that key, so the other job may
++   not get a hit for its own platform's subtree on a cold cache and will
++   just re-fetch it directly from GitHub (self-healing, not a correctness
++   bug, just a minor CI time cost on some runs). Not fixed here since it's
++   pure CI wiring outside this task's file list; Task 8 (which does own
++   CI) should consider keying by target platform.
++3. `rx_shader`'s Windows-target build was verified via `wine`-run tests on
++   this development machine, not on the actual GitHub Actions Windows-cross
++   runner; Task 8 should still re-verify there since Wine versions/configs
++   can differ.
++
++## Files created
++
++- `src/rx_shader/include/rx_shader/compiler.h` (98 lines)
++- `src/rx_shader/src/compiler.cpp` (332 lines)
++- `src/rx_shader/CMakeLists.txt` (158 lines)
++- `src/rx_shader/tests/compiler_test.cpp` (186 lines)
++- `src/rx_shader/tests/doctest_main.cpp` (7 lines)
++- `src/rx_shader/tests/link_smoketest.cpp` (21 lines)
++
++## Files modified
++
++- `tools/fetch_slang.cmake` (rewritten: 165 insertions, 63 deletions)
++- `CMakeLists.txt` (+1 line: `add_subdirectory(src/rx_shader)`)
++
++## Readiness for Task 2
++
++`rx_shader`'s `CompileResult::linkedProgram` (a
++`Slang::ComPtr<slang::IComponentType>`) is the exact lifetime-anchored
++handle Task 2's `reflect()` needs to call `->getLayout(...)` on. `rx_shader`
++already links `Vulkan::Headers` publicly (needed for `VkShaderStageFlagBits`
++today; Task 2's `ShaderLayoutInfo`/`VkDescriptorType` mapping can use the
++same include without new plumbing). Task 2's `reflection_test.cpp` can join
++the existing `rx_shader_tests` binary via the existing `doctest_main.cpp`
++(no changes needed there).
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b9af5b9..f827082 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -8,13 +8,14 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+ enable_testing()
+ 
+ add_subdirectory(third_party)
+ 
+ include(tools/fetch_slang.cmake)
+ add_subdirectory(shaders)
+ 
+ add_subdirectory(src/rx_core)
+ add_subdirectory(src/rx_platform)
+ add_subdirectory(src/rx_rhi_vk)
++add_subdirectory(src/rx_shader)
+ add_subdirectory(tools/dep_cache_smoketest)
+ add_subdirectory(tools/toolchain_check)
+ add_subdirectory(samples/01_triangle)
+diff --git a/src/rx_shader/CMakeLists.txt b/src/rx_shader/CMakeLists.txt
+new file mode 100644
+index 0000000..3b6fd0a
+--- /dev/null
++++ b/src/rx_shader/CMakeLists.txt
+@@ -0,0 +1,158 @@
++# Slang runtime linking: find_package(slang CONFIG) locates the prebuilt
++# tree tools/fetch_slang.cmake fetched -- RX_SLANG_TARGET_ROOT/slang_ROOT
++# are set there (included from the root CMakeLists.txt before this
++# directory is added; see that file's header comment for why "target" and
++# "host" are different trees under windows-cross-zig, and why exposing
++# slang_ROOT alone, with no PATHS/NO_DEFAULT_PATH here, is enough for
++# CMake's Config-mode search to find slangConfig.cmake under either the
++# Linux layout (<root>/lib/cmake/slang/) or the Windows layout
++# (<root>/cmake/)).
++#
++# Link slang::slang ONLY [R:E3, spec Fixed decision #1] -- never
++# slang::gfx (deprecated upstream in favor of slang-rhi) and never ship/
++# link slang-llvm (the 25-84 MB CPU/host JIT backend, irrelevant to a
++# SPIR-V-only compiler).
++find_package(slang CONFIG REQUIRED)
++
++# slang::slang is an IMPORTED (non-GLOBAL by default) target created deep
++# inside slangTargets.cmake, in this directory's scope. rx_shader links it
++# PUBLIC (any executable calling into rx_shader's Compiler needs Slang's
++# headers/library too), and those executables live in sibling directories
++# (this library's own tests/, and samples/ from Task 5 onward) that never
++# call find_package(slang ...) themselves -- so, exactly like every other
++# imported dependency in this project (see third_party/CMakeLists.txt's
++# spdlog/Vulkan-Headers/SDL3/vk-bootstrap promotions), it must be promoted
++# to global scope or those sibling directories simply won't resolve the
++# target name at all.
++set_target_properties(slang::slang PROPERTIES IMPORTED_GLOBAL TRUE)
++
++if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
++  # zig cc's own linker-driver front-end does its own file-type sniffing by
++  # extension and does not recognize a SONAME-versioned suffix like
++  # "libslang-compiler.so.0.2026.14.1" as a valid link input
++  # ("unrecognized file extension"), even though the underlying LLD linker
++  # has no such restriction -- verified directly: this exact CMake target,
++  # used unmodified, fails to link with that message under this project's
++  # zig-cxx-linux wrapper (plain gcc/clang drivers accept the same file
++  # fine, which is why this was not caught by the standalone API
++  # validation done earlier in this task using g++ directly). Slang's own
++  # shipped CMake package points slang::slang's IMPORTED_LOCATION at
++  # exactly that versioned real file
++  # (lib/cmake/slang/slangTargets-release.cmake). "libslang-compiler.so" --
++  # a symlink Slang itself ships right next to it, with the plain ".so"
++  # extension zig's sniffer accepts -- resolves to the exact same inode
++  # with the exact same embedded DT_SONAME, so retargeting
++  # IMPORTED_LOCATION at the symlink changes nothing about what ends up in
++  # a consumer's DT_NEEDED entry (still
++  # "libslang-compiler.so.0.2026.14.1", the exact file this module's own
++  # runtime-lib copy step below places next to every consumer) -- it only
++  # changes which path the compiler driver is asked to sniff at link time.
++  # Windows needs no equivalent fix: slang-compiler.lib's plain ".lib"
++  # extension was never the problem there.
++  set(_rx_slang_unversioned_so "${RX_SLANG_TARGET_ROOT}/lib/libslang-compiler.so")
++  if(NOT EXISTS "${_rx_slang_unversioned_so}")
++    message(FATAL_ERROR
++      "[rx_shader] Expected 'libslang-compiler.so' symlink not found under "
++      "'${RX_SLANG_TARGET_ROOT}/lib' -- the Slang archive layout may have "
++      "changed; inspect that directory and update this workaround.")
++  endif()
++  set_target_properties(slang::slang PROPERTIES IMPORTED_LOCATION_RELEASE "${_rx_slang_unversioned_so}")
++endif()
++
++add_library(rx_shader STATIC
++    src/compiler.cpp
++)
++target_include_directories(rx_shader PUBLIC include)
++target_link_libraries(rx_shader PUBLIC rx_core slang::slang Vulkan::Headers)
++
++# --- Runtime lib placement for any binary linking rx_shader -------------
++#
++# Slang compiles in-process via a shared library (libslang-compiler.so /
++# slang-compiler.dll), never statically linked in, so any executable that
++# links rx_shader (transitively, slang::slang) needs that library --
++# plus the plugins it dlopens on demand for certain compile paths
++# (slang-glslang, slang-glsl-module) and its companion runtime (slang-rt)
++# -- sitting next to it on disk at run time [R:D2]. NEVER ship slang-llvm
++# (the CPU/host JIT backend, irrelevant to SPIR-V-only use) or gfx (the
++# deprecated GFX layer) [spec Fixed decision #11].
++#
++# Globbed rather than hardcoded to the pinned version string: the Linux
++# filenames embed the Slang version (e.g. "libslang-compiler.so.0.2026.14.1"),
++# and Slang's own release history has changed archive layout/naming before
++# [R:A6] -- glob patterns tolerate a version bump without needing an edit
++# here, matching the same "verify the layout, don't assume paths" posture
++# fetch_slang.cmake already takes with its sentinel-file check. The
++# Windows names carry no version suffix (verified directly against the
++# real archive), so those are exact.
++if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
++  file(GLOB RX_SLANG_RUNTIME_LIBS
++    "${RX_SLANG_TARGET_ROOT}/bin/slang-compiler.dll"
++    "${RX_SLANG_TARGET_ROOT}/bin/slang-glslang.dll"
++    "${RX_SLANG_TARGET_ROOT}/bin/slang-glsl-module.dll"
++    "${RX_SLANG_TARGET_ROOT}/bin/slang-rt.dll"
++  )
++else()
++  file(GLOB RX_SLANG_RUNTIME_LIBS
++    "${RX_SLANG_TARGET_ROOT}/lib/libslang-compiler.so*"
++    "${RX_SLANG_TARGET_ROOT}/lib/libslang-glslang-*.so"
++    "${RX_SLANG_TARGET_ROOT}/lib/libslang-glsl-module-*.so"
++    "${RX_SLANG_TARGET_ROOT}/lib/libslang-rt.so*"
++  )
++endif()
++
++if(NOT RX_SLANG_RUNTIME_LIBS)
++  message(FATAL_ERROR
++    "[rx_shader] No Slang runtime libraries found under '${RX_SLANG_TARGET_ROOT}' "
++    "-- fetch_slang.cmake's archive layout assumption may be stale; inspect "
++    "that tree before continuing.")
++endif()
++
++# Deploys the Slang runtime libs above next to `target`, and points its
++# RPATH (Linux/ELF only -- CMake ignores RPATH properties on Windows, so
++# this is unconditional and harmless there) at its own directory rather
++# than the original fetched location under third_party/.
++#
++# BUILD_WITH_INSTALL_RPATH + INSTALL_RPATH="$ORIGIN" (rather than just
++# relying on CMake's default automatic build-tree RPATH, which would
++# already embed the *absolute* path to third_party/slang-prebuilt/.../lib
++# and quietly work without this) is deliberate: it makes the build-tree
++# binary's RPATH identical to what a redistributed copy would carry --
++# nothing but "$ORIGIN" -- so running it from the build tree actually
++# proves the redistribution-relevant mechanism (copy-adjacent + relative
++# RPATH), not merely that the original fetch directory still happens to be
++# on disk.
++function(rx_shader_deploy_runtime_libs target)
++  set_target_properties(${target} PROPERTIES
++    BUILD_WITH_INSTALL_RPATH TRUE
++    INSTALL_RPATH "$ORIGIN"
++  )
++  add_custom_command(TARGET ${target} POST_BUILD
++    COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_SLANG_RUNTIME_LIBS} "$<TARGET_FILE_DIR:${target}>"
++    COMMENT "rx_shader: copying Slang runtime libraries next to $<TARGET_FILE_NAME:${target}>"
++    VERBATIM
++  )
++endfunction()
++
++# --- Windows link smoke test --------------------------------------------
++# De-risks the one real unknown in this task before anything else got
++# built on top of it: does zig/LLD's COFF linker accept an MSVC-built
++# import library? [R:A6/D2] -- see tests/link_smoketest.cpp and the task
++# report for the empirical result. Deploy the runtime libs to it too (not
++# just built, but able to actually run) since that was verified directly
++# as part of this task rather than left as an assumption.
++add_executable(rx_shader_link_smoketest tests/link_smoketest.cpp)
++target_link_libraries(rx_shader_link_smoketest PRIVATE slang::slang)
++rx_shader_deploy_runtime_libs(rx_shader_link_smoketest)
++
++# rx_shader's tests do real, in-process Slang compilation (no fake/mocked
++# Slang session) and are deliberately run straight from the build tree by
++# ctest (no install step) specifically so the RPATH+copy mechanism above
++# gets proven for real: if it didn't work, these tests would fail to even
++# start (missing shared library at load time), not just fail an assertion.
++add_executable(rx_shader_tests
++    tests/doctest_main.cpp
++    tests/compiler_test.cpp
++)
++target_link_libraries(rx_shader_tests PRIVATE rx_shader doctest::doctest)
++rx_shader_deploy_runtime_libs(rx_shader_tests)
++add_test(NAME rx_shader_tests COMMAND rx_shader_tests)
+diff --git a/src/rx_shader/include/rx_shader/compiler.h b/src/rx_shader/include/rx_shader/compiler.h
+new file mode 100644
+index 0000000..130a9d2
+--- /dev/null
++++ b/src/rx_shader/include/rx_shader/compiler.h
+@@ -0,0 +1,98 @@
++#pragma once
++#include <slang-com-ptr.h>
++#include <slang.h>
++#include <vulkan/vulkan.h>
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace rx::shader {
++
++// One SPIR-V module's worth of compiled code for a single entry point,
++// ready to hand straight to vkCreateShaderModule.
++struct SpirvBlob {
++    std::vector<uint32_t> code;
++    VkShaderStageFlagBits stage = VK_SHADER_STAGE_ALL;
++    std::string entryPointName;
++};
++
++// Result of one Compiler::compileFromSource/compileFromFile call.
++//
++// Diagnostics (warnings AND errors -- Slang surfaces both the same way, as
++// non-empty IBlob text at every compile step [R:A2]) are always captured
++// here, never silently swallowed, regardless of `ok`: a successful compile
++// can still carry warning text worth surfacing to a caller/log.
++struct CompileResult {
++    bool ok = false;
++    std::vector<SpirvBlob> entryPointCode;
++    std::string diagnostics;
++
++    // Opaque retained handle to the fully linked component type that
++    // `entryPointCode` above was extracted from. Kept alive here (rather
++    // than released at the end of the compile call) purely so Task 2's
++    // reflection code can call `linkedProgram->getLayout(...)` on it
++    // later -- the `ProgramLayout*` that call returns is only valid for as
++    // long as the IComponentType it came from is alive, and this is that
++    // lifetime anchor. Null when `ok` is false.
++    Slang::ComPtr<slang::IComponentType> linkedProgram;
++};
++
++// Compiles Slang source (from a string or a file) to SPIR-V, in-process,
++// via the Slang runtime library (`slang::slang` -- never `slang::gfx`,
++// which is deprecated upstream in favor of slang-rhi [R:E3]).
++//
++// Every Compiler instance shares one process-lifetime `slang::IGlobalSession`
++// behind a mutex: per slang.h's own doc comment on IGlobalSession, "a
++// single global session object is currently *not* thread-safe... global
++// session and the objects created from it should be externally
++// synchronized when shared across threads" [R:A4, R:A6]. This class
++// deliberately uses exactly one such session for the whole process (never
++// one per Compiler) to amortize Slang's real cost -- loading its standard
++// library -- across every Compiler instance and every compile call; the
++// mutex serializes the front-end operations (module load, composition,
++// linking) that touch it. Each Compiler owns its own `slang::ISession`
++// (cheap; "session per target config" [spec Fixed decision #2]), created
++// once in `create()` and reused for every subsequent compile call on that
++// instance -- this is the "session reuse" a hot-reload loop relies on.
++class Compiler {
++public:
++    // Slang::ComPtr already handles move/release correctly on its own, so
++    // these can all be defaulted -- there is no raw resource here that
++    // needs custom teardown logic.
++    Compiler(Compiler&&) noexcept = default;
++    Compiler& operator=(Compiler&&) noexcept = default;
++    Compiler(const Compiler&) = delete;
++    Compiler& operator=(const Compiler&) = delete;
++    ~Compiler() = default;
++
++    // Creates (or, after the first successful call anywhere in the
++    // process, reuses) the shared global session, then creates a fresh
++    // SPIR-V-target `ISession` for this Compiler instance -- pinned to an
++    // explicit SPIR-V 1.3 capability floor matching the Vulkan 1.3 /
++    // Steam Deck baseline [R:A5, spec Fixed decision #3]. Returns
++    // std::nullopt (logging the reason via RX_LOG_ERROR) if either step
++    // fails.
++    static std::optional<Compiler> create();
++
++    // Compiles `source` (a complete Slang translation unit) as a module
++    // named `moduleName`, then finds and links every name in
++    // `entryPointNames`, in order -- `CompileResult::entryPointCode` is
++    // populated in the same order on success.
++    CompileResult compileFromSource(const std::string& moduleName,
++                                     const std::string& source,
++                                     const std::vector<std::string>& entryPointNames);
++
++    // Reads the Slang source at `path` from disk and compiles it exactly
++    // like compileFromSource, using the file's stem as the module name so
++    // diagnostics reference the real path on disk (useful for hot-reload:
++    // error messages point at the file the user is actually editing).
++    CompileResult compileFromFile(const std::string& path, const std::vector<std::string>& entryPointNames);
++
++private:
++    explicit Compiler(Slang::ComPtr<slang::ISession> session);
++
++    Slang::ComPtr<slang::ISession> session_;
++};
++
++}  // namespace rx::shader
+diff --git a/src/rx_shader/src/compiler.cpp b/src/rx_shader/src/compiler.cpp
+new file mode 100644
+index 0000000..76b3eda
+--- /dev/null
++++ b/src/rx_shader/src/compiler.cpp
+@@ -0,0 +1,332 @@
++#include <rx_shader/compiler.h>
++
++#include <rx_core/log.h>
++
++#include <filesystem>
++#include <fstream>
++#include <mutex>
++#include <sstream>
++#include <utility>
++
++namespace rx::shader {
++
++namespace {
++
++// See the class comment on rx::shader::Compiler (compiler.h) for why this
++// is process-wide (one IGlobalSession, ever) rather than per-Compiler, and
++// why it is guarded by a mutex rather than left to Slang's own (nonexistent)
++// internal synchronization. Both statics have process lifetime: neither is
++// ever explicitly torn down, matching Slang's own guidance to create and
++// reuse a single global session for as long as the application runs
++// [R:A4].
++std::mutex& globalSessionMutex() {
++    static std::mutex mutex;
++    return mutex;
++}
++
++Slang::ComPtr<slang::IGlobalSession>& sharedGlobalSession() {
++    static Slang::ComPtr<slang::IGlobalSession> session;
++    return session;
++}
++
++// Maps a Slang entry-point stage to the corresponding Vulkan shader-stage
++// bit. Slang's stage enum also covers ray-tracing/mesh/work-graph stages
++// this project doesn't use yet (see slang.h's SlangStage) -- they're
++// mapped for completeness since the underlying VkShaderStageFlagBits
++// values already exist in Vulkan-Headers regardless of whether any device
++// this project targets supports the extensions that make them meaningful.
++VkShaderStageFlagBits mapStage(SlangStage stage) {
++    switch (stage) {
++        case SLANG_STAGE_VERTEX:
++            return VK_SHADER_STAGE_VERTEX_BIT;
++        case SLANG_STAGE_HULL:
++            return VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
++        case SLANG_STAGE_DOMAIN:
++            return VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
++        case SLANG_STAGE_GEOMETRY:
++            return VK_SHADER_STAGE_GEOMETRY_BIT;
++        case SLANG_STAGE_FRAGMENT:
++            return VK_SHADER_STAGE_FRAGMENT_BIT;
++        case SLANG_STAGE_COMPUTE:
++            return VK_SHADER_STAGE_COMPUTE_BIT;
++        case SLANG_STAGE_RAY_GENERATION:
++            return VK_SHADER_STAGE_RAYGEN_BIT_KHR;
++        case SLANG_STAGE_INTERSECTION:
++            return VK_SHADER_STAGE_INTERSECTION_BIT_KHR;
++        case SLANG_STAGE_ANY_HIT:
++            return VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
++        case SLANG_STAGE_CLOSEST_HIT:
++            return VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
++        case SLANG_STAGE_MISS:
++            return VK_SHADER_STAGE_MISS_BIT_KHR;
++        case SLANG_STAGE_CALLABLE:
++            return VK_SHADER_STAGE_CALLABLE_BIT_KHR;
++        case SLANG_STAGE_MESH:
++            return VK_SHADER_STAGE_MESH_BIT_EXT;
++        case SLANG_STAGE_AMPLIFICATION:
++            return VK_SHADER_STAGE_TASK_BIT_EXT;
++        default:
++            RX_LOG_WARN("rx_shader: no VkShaderStageFlagBits mapping for SlangStage {}; using VK_SHADER_STAGE_ALL",
++                        static_cast<int>(stage));
++            return VK_SHADER_STAGE_ALL;
++    }
++}
++
++// Appends one diagnostic step's text (if any) to `out`, labelled with
++// `stepName`. Slang hands back a non-null, non-empty IBlob for warnings
++// just as it does for errors, so this runs unconditionally after every
++// step regardless of that step's own success/failure -- diagnostics are
++// never gated on `ok` [R:A2, spec Fixed decision #2].
++void appendDiagnostics(std::string& out, const char* stepName, slang::IBlob* blob) {
++    if (blob == nullptr || blob->getBufferSize() == 0) {
++        return;
++    }
++    out.append("[").append(stepName).append("] ");
++    out.append(static_cast<const char*>(blob->getBufferPointer()), blob->getBufferSize());
++    if (out.empty() || out.back() != '\n') {
++        out.push_back('\n');
++    }
++}
++
++// The shared compile pipeline behind both Compiler::compileFromSource and
++// Compiler::compileFromFile: load module from source text -> find each
++// requested entry point -> compose -> link -> extract SPIR-V per entry
++// point [R:A2]. `sourcePath` is purely informational (it's what shows up
++// in diagnostic message locations); it does not need to exist on disk.
++CompileResult compileImpl(slang::ISession* session,
++                           const std::string& moduleName,
++                           const std::string& sourcePath,
++                           const std::string& sourceText,
++                           const std::vector<std::string>& entryPointNames) {
++    CompileResult result;
++    std::string diagnostics;
++
++    std::lock_guard<std::mutex> lock(globalSessionMutex());
++
++    // slang_createBlob returns an already-owned (refcount 1) ISlangBlob*,
++    // so attach rather than construct-with-addRef.
++    Slang::ComPtr<slang::IBlob> sourceBlob(Slang::INIT_ATTACH,
++                                            slang_createBlob(sourceText.data(), sourceText.size()));
++
++    Slang::ComPtr<slang::IBlob> loadDiagnostics;
++    slang::IModule* module =
++        session->loadModuleFromSource(moduleName.c_str(), sourcePath.c_str(), sourceBlob, loadDiagnostics.writeRef());
++    appendDiagnostics(diagnostics, "load", loadDiagnostics);
++
++    if (module == nullptr) {
++        result.ok = false;
++        result.diagnostics = diagnostics;
++        RX_LOG_ERROR("rx_shader: failed to load module '{}':\n{}", moduleName, result.diagnostics);
++        return result;
++    }
++
++    std::vector<slang::IComponentType*> parts;
++    parts.reserve(1 + entryPointNames.size());
++    parts.push_back(module);
++
++    // IModule::getDefinedEntryPointCount()/IComponentType::getEntryPointCount()
++    // on a raw IModule is documented to always be 0 (an entry point defined
++    // in a module is not automatically part of the linkage) -- so `module`
++    // contributes zero entry points to the composite below, and the
++    // explicit IEntryPoint objects appended after it are the only ones,
++    // in exactly the order pushed. That ordering is load-bearing: it is
++    // what lets the getLayout()-based stage lookup further down assume
++    // ProgramLayout::getEntryPointByIndex(i) corresponds to
++    // entryPointNames[i].
++    std::vector<Slang::ComPtr<slang::IEntryPoint>> entryPoints;
++    entryPoints.reserve(entryPointNames.size());
++    for (const auto& name : entryPointNames) {
++        Slang::ComPtr<slang::IEntryPoint> entryPoint;
++        SlangResult entryPointResult = module->findEntryPointByName(name.c_str(), entryPoint.writeRef());
++        if (SLANG_FAILED(entryPointResult) || entryPoint.get() == nullptr) {
++            diagnostics.append("error: entry point '")
++                .append(name)
++                .append("' not found in module '")
++                .append(moduleName)
++                .append("'\n");
++            result.ok = false;
++            result.diagnostics = diagnostics;
++            RX_LOG_ERROR("rx_shader: {}", result.diagnostics);
++            return result;
++        }
++        entryPoints.push_back(std::move(entryPoint));
++    }
++    for (auto& entryPoint : entryPoints) {
++        parts.push_back(entryPoint.get());
++    }
++
++    Slang::ComPtr<slang::IBlob> compositeDiagnostics;
++    Slang::ComPtr<slang::IComponentType> composite;
++    SlangResult compositeResult = session->createCompositeComponentType(
++        parts.data(), static_cast<SlangInt>(parts.size()), composite.writeRef(), compositeDiagnostics.writeRef());
++    appendDiagnostics(diagnostics, "compose", compositeDiagnostics);
++    if (SLANG_FAILED(compositeResult) || composite.get() == nullptr) {
++        result.ok = false;
++        result.diagnostics = diagnostics;
++        RX_LOG_ERROR("rx_shader: failed to compose module '{}':\n{}", moduleName, result.diagnostics);
++        return result;
++    }
++
++    Slang::ComPtr<slang::IBlob> linkDiagnostics;
++    Slang::ComPtr<slang::IComponentType> linked;
++    SlangResult linkResult = composite->link(linked.writeRef(), linkDiagnostics.writeRef());
++    appendDiagnostics(diagnostics, "link", linkDiagnostics);
++    if (SLANG_FAILED(linkResult) || linked.get() == nullptr) {
++        result.ok = false;
++        result.diagnostics = diagnostics;
++        RX_LOG_ERROR("rx_shader: failed to link module '{}':\n{}", moduleName, result.diagnostics);
++        return result;
++    }
++
++    // Needed only to recover each entry point's VkShaderStageFlagBits (see
++    // the ordering note above); diagnostics from this step are still
++    // captured even though a null layout is tolerated below (code
++    // generation can still proceed without it -- stage just falls back to
++    // VK_SHADER_STAGE_ALL for that blob, which mapStage() also warns about
++    // for the analogous unknown-stage case).
++    Slang::ComPtr<slang::IBlob> layoutDiagnostics;
++    slang::ProgramLayout* layout = linked->getLayout(0, layoutDiagnostics.writeRef());
++    appendDiagnostics(diagnostics, "layout", layoutDiagnostics);
++
++    bool allEntryPointsOk = true;
++    std::vector<SpirvBlob> blobs;
++    blobs.reserve(entryPointNames.size());
++    for (size_t i = 0; i < entryPointNames.size(); ++i) {
++        Slang::ComPtr<slang::IBlob> codeDiagnostics;
++        Slang::ComPtr<slang::IBlob> codeBlob;
++        SlangResult codeResult =
++            linked->getEntryPointCode(static_cast<SlangInt>(i), 0, codeBlob.writeRef(), codeDiagnostics.writeRef());
++        appendDiagnostics(diagnostics, "codegen", codeDiagnostics);
++        if (SLANG_FAILED(codeResult) || codeBlob.get() == nullptr) {
++            allEntryPointsOk = false;
++            diagnostics.append("error: code generation failed for entry point '")
++                .append(entryPointNames[i])
++                .append("'\n");
++            continue;
++        }
++
++        SpirvBlob blob;
++        blob.entryPointName = entryPointNames[i];
++        blob.stage = (layout != nullptr && i < static_cast<size_t>(layout->getEntryPointCount()))
++                         ? mapStage(layout->getEntryPointByIndex(i)->getStage())
++                         : VK_SHADER_STAGE_ALL;
++
++        size_t byteSize = codeBlob->getBufferSize();
++        const auto* wordData = static_cast<const uint32_t*>(codeBlob->getBufferPointer());
++        blob.code.assign(wordData, wordData + byteSize / sizeof(uint32_t));
++        blobs.push_back(std::move(blob));
++    }
++
++    result.ok = allEntryPointsOk;
++    result.diagnostics = diagnostics;
++    result.entryPointCode = std::move(blobs);
++    if (result.ok) {
++        result.linkedProgram = linked;
++    }
++
++    if (!diagnostics.empty()) {
++        if (result.ok) {
++            RX_LOG_WARN("rx_shader: diagnostics while compiling '{}':\n{}", moduleName, diagnostics);
++        } else {
++            RX_LOG_ERROR("rx_shader: compile of '{}' failed:\n{}", moduleName, diagnostics);
++        }
++    }
++
++    return result;
++}
++
++}  // namespace
++
++Compiler::Compiler(Slang::ComPtr<slang::ISession> session) : session_(std::move(session)) {}
++
++std::optional<Compiler> Compiler::create() {
++    rx::core::log::init();
++
++    std::lock_guard<std::mutex> lock(globalSessionMutex());
++
++    Slang::ComPtr<slang::IGlobalSession>& global = sharedGlobalSession();
++    if (global.get() == nullptr) {
++        SlangResult sessionResult = slang::createGlobalSession(global.writeRef());
++        if (SLANG_FAILED(sessionResult) || global.get() == nullptr) {
++            RX_LOG_ERROR("rx_shader: slang::createGlobalSession failed (SlangResult={})",
++                         static_cast<int>(sessionResult));
++            return std::nullopt;
++        }
++    }
++
++    slang::TargetDesc targetDesc = {};
++    targetDesc.format = SLANG_SPIRV;
++    // "sm_6_0" matches the profile Phase 1's slangc-based offline path
++    // already uses for the same SPIR-V target (shaders/CMakeLists.txt),
++    // so both the build-time and runtime compilation paths agree on
++    // feature/shader-model availability.
++    targetDesc.profile = global->findProfile("sm_6_0");
++
++    // Explicit SPIR-V 1.3 capability floor, matching the Vulkan 1.3 /
++    // Steam Deck baseline [R:A5, spec Fixed decision #3]. findCapability
++    // returns SLANG_CAPABILITY_UNKNOWN for a name it doesn't recognize;
++    // rather than silently feeding that sentinel into compilerOptionEntries
++    // (which could produce a confusing downstream compiler error), fall
++    // back to compiling without an explicit floor and log loudly -- this
++    // should never actually trigger against the pinned Slang version this
++    // was verified against, but a future version bump changing capability
++    // names is exactly the kind of drift [R:A6] this guards against.
++    slang::CompilerOptionEntry capabilityEntry{};
++    SlangCapabilityID spirvFloor = global->findCapability("spirv_1_3");
++    if (spirvFloor != SLANG_CAPABILITY_UNKNOWN) {
++        capabilityEntry.name = slang::CompilerOptionName::Capability;
++        capabilityEntry.value.kind = slang::CompilerOptionValueKind::Int;
++        capabilityEntry.value.intValue0 = static_cast<int32_t>(spirvFloor);
++        targetDesc.compilerOptionEntries = &capabilityEntry;
++        targetDesc.compilerOptionEntryCount = 1;
++    } else {
++        RX_LOG_WARN(
++            "rx_shader: Slang capability 'spirv_1_3' not found by this Slang build; "
++            "compiling without an explicit SPIR-V version floor");
++    }
++
++    slang::SessionDesc sessionDesc = {};
++    sessionDesc.targets = &targetDesc;
++    sessionDesc.targetCount = 1;
++
++    Slang::ComPtr<slang::ISession> session;
++    SlangResult createSessionResult = global->createSession(sessionDesc, session.writeRef());
++    if (SLANG_FAILED(createSessionResult) || session.get() == nullptr) {
++        RX_LOG_ERROR("rx_shader: IGlobalSession::createSession failed (SlangResult={})",
++                     static_cast<int>(createSessionResult));
++        return std::nullopt;
++    }
++
++    return Compiler(std::move(session));
++}
++
++CompileResult Compiler::compileFromSource(const std::string& moduleName,
++                                           const std::string& source,
++                                           const std::vector<std::string>& entryPointNames) {
++    // The path is purely a diagnostic label here -- there is no real file
++    // backing a compileFromSource call.
++    return compileImpl(session_.get(), moduleName, moduleName + ".slang", source, entryPointNames);
++}
++
++CompileResult Compiler::compileFromFile(const std::string& path, const std::vector<std::string>& entryPointNames) {
++    std::ifstream file(path, std::ios::binary);
++    if (!file) {
++        CompileResult result;
++        result.ok = false;
++        result.diagnostics = "error: could not open shader file '" + path + "'\n";
++        RX_LOG_ERROR("rx_shader: {}", result.diagnostics);
++        return result;
++    }
++
++    std::ostringstream contents;
++    contents << file.rdbuf();
++
++    std::string moduleName = std::filesystem::path(path).stem().string();
++    if (moduleName.empty()) {
++        moduleName = "shaderModule";
++    }
++
++    return compileImpl(session_.get(), moduleName, path, contents.str(), entryPointNames);
++}
++
++}  // namespace rx::shader
+diff --git a/src/rx_shader/tests/compiler_test.cpp b/src/rx_shader/tests/compiler_test.cpp
+new file mode 100644
+index 0000000..af8cc59
+--- /dev/null
++++ b/src/rx_shader/tests/compiler_test.cpp
+@@ -0,0 +1,186 @@
++#include <doctest/doctest.h>
++#include <rx_shader/compiler.h>
++
++#include <chrono>
++#include <cstdio>
++#include <filesystem>
++#include <fstream>
++
++namespace {
++
++constexpr uint32_t kSpirvMagic = 0x07230203u;
++
++// A complete, real vertex+fragment module compiled from a single source
++// string -- deliberately mirrors shaders/triangle.vert.slang +
++// triangle.frag.slang's fullscreen-triangle-without-a-vertex-buffer trick,
++// but as two named entry points in one module so a single
++// compileFromSource call exercises both stages at once.
++const char* kGoodSource = R"(
++struct VSOut {
++    float4 position : SV_Position;
++    float4 color : COLOR0;
++};
++
++[shader("vertex")]
++VSOut vsMain(uint vertexID : SV_VertexID)
++{
++    float2 positions[3] = float2[3](
++        float2(0.0, -0.5),
++        float2(0.5, 0.5),
++        float2(-0.5, 0.5)
++    );
++    VSOut o;
++    o.position = float4(positions[vertexID], 0.0, 1.0);
++    o.color = float4(1.0, 1.0, 1.0, 1.0);
++    return o;
++}
++
++[shader("fragment")]
++float4 fsMain(float4 color : COLOR0) : SV_Target
++{
++    return color;
++}
++)";
++
++// Deliberately references an identifier that doesn't exist anywhere in
++// scope, so this must fail to compile.
++const char* kBadSource = R"(
++[shader("fragment")]
++float4 fsMain(float4 color : COLOR0) : SV_Target
++{
++    return colorTypoNotDefined;
++}
++)";
++
++}  // namespace
++
++TEST_CASE("Compiler::create succeeds and yields a usable compiler") {
++    auto compiler = rx::shader::Compiler::create();
++    REQUIRE(compiler.has_value());
++}
++
++TEST_CASE("compileFromSource on a known-good shader yields 2 valid SPIR-V blobs with correct stages") {
++    auto compiler = rx::shader::Compiler::create();
++    REQUIRE(compiler.has_value());
++
++    rx::shader::CompileResult result =
++        compiler->compileFromSource("GoodModule", kGoodSource, {"vsMain", "fsMain"});
++
++    INFO("diagnostics: " << result.diagnostics);
++    CHECK(result.ok);
++    REQUIRE(result.entryPointCode.size() == 2);
++
++    const rx::shader::SpirvBlob& vs = result.entryPointCode[0];
++    CHECK(vs.entryPointName == "vsMain");
++    CHECK(vs.stage == VK_SHADER_STAGE_VERTEX_BIT);
++    REQUIRE(vs.code.size() >= 1);
++    CHECK(vs.code[0] == kSpirvMagic);
++
++    const rx::shader::SpirvBlob& fs = result.entryPointCode[1];
++    CHECK(fs.entryPointName == "fsMain");
++    CHECK(fs.stage == VK_SHADER_STAGE_FRAGMENT_BIT);
++    REQUIRE(fs.code.size() >= 1);
++    CHECK(fs.code[0] == kSpirvMagic);
++
++    // The linked component type must be retained for Task 2's reflection.
++    CHECK(result.linkedProgram.get() != nullptr);
++}
++
++TEST_CASE("compileFromSource on a broken shader fails with diagnostics containing the error line") {
++    auto compiler = rx::shader::Compiler::create();
++    REQUIRE(compiler.has_value());
++
++    rx::shader::CompileResult result = compiler->compileFromSource("BadModule", kBadSource, {"fsMain"});
++
++    CHECK_FALSE(result.ok);
++    CHECK(result.entryPointCode.empty());
++    REQUIRE_FALSE(result.diagnostics.empty());
++    // The offending source line is reproduced verbatim in Slang's
++    // diagnostic text (source-context display), so this is a direct check
++    // that the actual error line made it into the captured diagnostics,
++    // not just some generic failure message.
++    CHECK(result.diagnostics.find("colorTypoNotDefined") != std::string::npos);
++    CHECK(result.linkedProgram.get() == nullptr);
++}
++
++TEST_CASE("a second compile through the same Compiler reuses the global session without crashing") {
++    auto compiler = rx::shader::Compiler::create();
++    REQUIRE(compiler.has_value());
++
++    auto start = std::chrono::steady_clock::now();
++    rx::shader::CompileResult first = compiler->compileFromSource("GoodModule", kGoodSource, {"vsMain", "fsMain"});
++    auto afterFirst = std::chrono::steady_clock::now();
++    rx::shader::CompileResult second = compiler->compileFromSource("GoodModule", kGoodSource, {"vsMain", "fsMain"});
++    auto afterSecond = std::chrono::steady_clock::now();
++
++    CHECK(first.ok);
++    CHECK(second.ok);
++    REQUIRE(second.entryPointCode.size() == 2);
++    CHECK(second.entryPointCode[0].code[0] == kSpirvMagic);
++    CHECK(second.entryPointCode[1].code[0] == kSpirvMagic);
++
++    // "Sane timing" (not a strict comparative benchmark, which would be
++    // flaky under a loaded CI runner): each individual compile call --
++    // module load + entry point lookup + compose + link + codegen for a
++    // two-entry-point module this small -- should comfortably finish well
++    // under a second once the (one-time, process-wide) Slang stdlib load
++    // has already happened in Compiler::create() above. A multi-second
++    // stall here would indicate the global session is being recreated (or
++    // the mutex is somehow serializing against unrelated work) rather
++    // than genuinely reused.
++    auto firstMs = std::chrono::duration_cast<std::chrono::milliseconds>(afterFirst - start).count();
++    auto secondMs = std::chrono::duration_cast<std::chrono::milliseconds>(afterSecond - afterFirst).count();
++    CHECK(firstMs < 5000);
++    CHECK(secondMs < 5000);
++}
++
++TEST_CASE("creating a second, independent Compiler also reuses the process-wide global session") {
++    auto first = rx::shader::Compiler::create();
++    REQUIRE(first.has_value());
++
++    auto start = std::chrono::steady_clock::now();
++    auto second = rx::shader::Compiler::create();
++    auto elapsed = std::chrono::steady_clock::now() - start;
++    REQUIRE(second.has_value());
++
++    // By the time this test runs, some earlier test in this binary has
++    // already paid the one-time global-session/stdlib-load cost, so this
++    // second (in-process) Compiler::create() should be cheap -- it only
++    // needs to create a new (lightweight) ISession, not a new
++    // IGlobalSession. A generous bound, not a tight benchmark.
++    CHECK(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() < 2000);
++
++    rx::shader::CompileResult result = second->compileFromSource("GoodModule", kGoodSource, {"vsMain"});
++    CHECK(result.ok);
++}
++
++TEST_CASE("compileFromFile reads and compiles Slang source from disk") {
++    auto compiler = rx::shader::Compiler::create();
++    REQUIRE(compiler.has_value());
++
++    std::filesystem::path tempPath =
++        std::filesystem::temp_directory_path() / "rx_shader_compiler_test_from_file.slang";
++    {
++        std::ofstream out(tempPath, std::ios::binary | std::ios::trunc);
++        REQUIRE(out.good());
++        out << kGoodSource;
++    }
++
++    rx::shader::CompileResult result = compiler->compileFromFile(tempPath.string(), {"vsMain", "fsMain"});
++    std::filesystem::remove(tempPath);
++
++    INFO("diagnostics: " << result.diagnostics);
++    CHECK(result.ok);
++    REQUIRE(result.entryPointCode.size() == 2);
++    CHECK(result.entryPointCode[0].code[0] == kSpirvMagic);
++    CHECK(result.entryPointCode[1].code[0] == kSpirvMagic);
++}
++
++TEST_CASE("compileFromFile on a nonexistent path fails cleanly with diagnostics") {
++    auto compiler = rx::shader::Compiler::create();
++    REQUIRE(compiler.has_value());
++
++    rx::shader::CompileResult result = compiler->compileFromFile("/nonexistent/path/does_not_exist.slang", {"main"});
++    CHECK_FALSE(result.ok);
++    REQUIRE_FALSE(result.diagnostics.empty());
++}
+diff --git a/src/rx_shader/tests/doctest_main.cpp b/src/rx_shader/tests/doctest_main.cpp
+new file mode 100644
+index 0000000..08c4a04
+--- /dev/null
++++ b/src/rx_shader/tests/doctest_main.cpp
+@@ -0,0 +1,7 @@
++// rx_shader's tests never construct a VkDevice/VkInstance (compilation is
++// pure host-side Slang work), so none of the vk-bootstrap process-wide
++// function-pointer-caching hazard documented on rx_rhi_vk's doctest_main.cpp
++// applies here -- doctest's own generated main is sufficient, with no
++// warm-up step needed before any TEST_CASE runs.
++#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
++#include <doctest/doctest.h>
+diff --git a/src/rx_shader/tests/link_smoketest.cpp b/src/rx_shader/tests/link_smoketest.cpp
+new file mode 100644
+index 0000000..1d58533
+--- /dev/null
++++ b/src/rx_shader/tests/link_smoketest.cpp
+@@ -0,0 +1,21 @@
++// Windows link smoke test (task-1-brief.md step 2; [R:A6, R:D2]): proves
++// that a trivial translation unit calling slang::createGlobalSession
++// cross-compiles AND links, via the windows-cross-zig preset's zig/LLD
++// toolchain, against the MSVC-built slang-compiler.lib import library --
++// the one real unknown this task needed to de-risk before writing any of
++// rx_shader's real Compiler implementation on top of it (a plan-level risk
++// gate: a link failure here means STOP, not improvise). This file is
++// deliberately minimal ("a trivial TU") and has no dependency on the rest
++// of rx_shader.
++//
++// Built for both presets (harmless and cheap on linux-native, where the
++// equivalent same-ABI link was already known-safe); the actual risk this
++// exists to cover is specific to windows-cross-zig.
++#include <slang-com-ptr.h>
++#include <slang.h>
++
++int main() {
++    Slang::ComPtr<slang::IGlobalSession> globalSession;
++    SlangResult result = slang::createGlobalSession(globalSession.writeRef());
++    return SLANG_FAILED(result) ? 1 : 0;
++}
+diff --git a/tools/fetch_slang.cmake b/tools/fetch_slang.cmake
+index 501876e..791f716 100644
+--- a/tools/fetch_slang.cmake
++++ b/tools/fetch_slang.cmake
+@@ -1,86 +1,187 @@
+-# Fetches the prebuilt Slang shader compiler (slangc) from its GitHub
+-# release archive. Slang is NEVER compiled from source in this project --
+-# only pinned prebuilt release binaries are used.
++# Fetches prebuilt Slang shader-compiler archives from GitHub releases.
++# Slang is NEVER compiled from source in this project -- only pinned
++# prebuilt release binaries are used.
+ #
+-# slangc is host-side tooling: it runs on the machine doing the build, not
+-# on whatever the build's *target* is. That means this must always fetch the
+-# HOST's archive, even when the active CMake toolchain targets a different
+-# platform (e.g. the windows-cross-zig preset still runs slangc here on
+-# Linux to produce SPIR-V, then just copies the resulting .spv bytes into
+-# whichever target binary needs them). Guard on CMAKE_HOST_SYSTEM_NAME (the
+-# machine actually invoking cmake), never on CMAKE_SYSTEM_NAME/
+-# CMAKE_SYSTEM_PROCESSOR (those describe the *target*, and would say
+-# "Windows" under windows-cross-zig despite slangc still running here).
++# Two independent things get fetched, for two independent reasons:
+ #
+-# Produces: RX_SLANGC (cache variable, absolute path to the extracted
+-# slangc executable).
++# 1. slangc (host-side tooling): it runs on the machine doing the build,
++#    not on whatever the build's *target* is. That means this always
++#    fetches the HOST's archive, even when the active CMake toolchain
++#    targets a different platform (e.g. the windows-cross-zig preset still
++#    runs slangc here on Linux to produce SPIR-V, then just copies the
++#    resulting .spv bytes into whichever target binary needs them). Guard
++#    on CMAKE_HOST_SYSTEM_NAME (the machine actually invoking cmake), never
++#    on CMAKE_SYSTEM_NAME/CMAKE_SYSTEM_PROCESSOR (those describe the
++#    *target*, and would say "Windows" under windows-cross-zig despite
++#    slangc still running here).
++# 2. The Slang runtime library (`slang::slang`, i.e. libslang-compiler.so /
++#    slang-compiler.dll + its import lib) that rx_shader links against and
++#    ships next to any binary doing in-process Slang compilation. This one
++#    IS target-side -- an import lib/DLL built for Windows is useless when
++#    the target is Linux and vice versa -- so it's fetched per
++#    CMAKE_SYSTEM_NAME instead. On a native build (linux-native), target ==
++#    host, so this reuses the exact same extracted tree as slangc above;
++#    no second download. On windows-cross-zig, this is a second archive
++#    (a real MSVC-built Windows tree) fetched alongside the host's Linux
++#    one.
++#
++# Produces:
++#   RX_SLANGC            - absolute path to the extracted host-side slangc
++#                           executable (cache variable).
++#   RX_SLANG_ROOT         - root of the fetched host-side Slang prebuilt
++#                           tree (cache variable).
++#   RX_SLANG_TARGET_ROOT - root of the Slang prebuilt tree matching the
++#                           current CMAKE_SYSTEM_NAME target -- what
++#                           rx_shader's find_package(slang CONFIG) should
++#                           be pointed at (cache variable).
++#   slang_ROOT            - same value as RX_SLANG_TARGET_ROOT, exposed
++#                           under the exact name find_package(slang ...)
++#                           consults automatically (CMP0074) so callers can
++#                           just say find_package(slang CONFIG REQUIRED)
++#                           with no extra PATHS plumbing.
+ 
+ set(RX_SLANG_VERSION "2026.14.1")
+ 
++# Fetches and extracts one platform's prebuilt Slang archive into
++# third_party/slang-prebuilt/<platform_dir>, gated on a version-keyed
++# marker file (.rx-fetched-<version>) rather than the old Phase 1
++# unversioned ".rx-fetched" marker. That old marker is a real defect
++# (tracked in the Phase 1 deferred findings): because it didn't encode
++# which version was actually fetched, bumping RX_SLANG_VERSION left the
++# marker in place from a stale prior fetch, and the fetch step silently
++# skipped re-downloading -- the tree on disk stayed at the OLD version
++# while every other part of the build assumed the newly-pinned one. A
++# version-keyed marker makes a version bump self-invalidating: the marker
++# this function looks for changes name the moment RX_SLANG_VERSION changes,
++# so a mismatched/absent marker always forces a fresh fetch. Any leftover
++# Phase-1-era unversioned marker is never consulted as evidence of
++# "already fetched" -- it is simply irrelevant now, and gets removed along
++# with the rest of the directory whenever a fetch actually runs (see
++# file(REMOVE_RECURSE...) below).
++function(_rx_fetch_slang_platform)
++  set(oneValueArgs PLATFORM_DIR ARCHIVE_NAME SENTINEL_RELATIVE ROOT_OUT_VAR)
++  cmake_parse_arguments(ARG "" "${oneValueArgs}" "" ${ARGN})
++
++  set(_root "${CMAKE_SOURCE_DIR}/third_party/slang-prebuilt/${ARG_PLATFORM_DIR}")
++  set(_marker "${_root}/.rx-fetched-${RX_SLANG_VERSION}")
++  set(_url "https://github.com/shader-slang/slang/releases/download/v${RX_SLANG_VERSION}/${ARG_ARCHIVE_NAME}")
++
++  if(NOT EXISTS "${_marker}")
++    message(STATUS "[fetch_slang] Fetching Slang ${RX_SLANG_VERSION} prebuilt (${ARG_PLATFORM_DIR}) from ${_url} ...")
++
++    # Wipe any previous extraction (a stale different-version tree, a
++    # leftover Phase-1-era unversioned marker, or a partial extraction from
++    # an interrupted fetch) rather than extracting on top of it -- Slang's
++    # own archive layout has changed between releases before (see the
++    # A6 threading/ABI research note), so old files from a different
++    # version must never linger alongside the new ones.
++    file(REMOVE_RECURSE "${_root}")
++    file(MAKE_DIRECTORY "${_root}")
++
++    set(_archive_path "${CMAKE_BINARY_DIR}/_slang-fetch/${ARG_ARCHIVE_NAME}")
++    file(DOWNLOAD "${_url}" "${_archive_path}" STATUS _dl_status)
++    list(GET _dl_status 0 _dl_code)
++    list(GET _dl_status 1 _dl_message)
++    if(NOT _dl_code EQUAL 0)
++      file(REMOVE "${_archive_path}")
++      message(FATAL_ERROR "[fetch_slang] Download failed (${_dl_message}) for URL: ${_url}")
++    endif()
++
++    file(ARCHIVE_EXTRACT INPUT "${_archive_path}" DESTINATION "${_root}")
++    file(REMOVE "${_archive_path}")
++
++    if(NOT EXISTS "${_root}/${ARG_SENTINEL_RELATIVE}")
++      message(FATAL_ERROR
++        "[fetch_slang] Extracted archive has no '${ARG_SENTINEL_RELATIVE}' under "
++        "'${_root}'. The upstream archive layout may have changed -- inspect "
++        "that directory and update this script's assumed layout.")
++    endif()
++
++    file(WRITE "${_marker}" "${_url}\n")
++  else()
++    message(STATUS "[fetch_slang] Slang ${RX_SLANG_VERSION} prebuilt already present at ${_root} (marker found) - skipping download")
++  endif()
++
++  set("${ARG_ROOT_OUT_VAR}" "${_root}" PARENT_SCOPE)
++endfunction()
++
++# --- 1. Host-side slangc -----------------------------------------------
+ if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
+   # Verified directly against the pinned release: shader-slang publishes a
+   # single glibc-2.27-baseline linux-x86_64 archive, no per-distro variants.
+-  set(RX_SLANG_PLATFORM "linux-x86_64")
+-  set(RX_SLANG_ARCHIVE_NAME "slang-${RX_SLANG_VERSION}-linux-x86_64-glibc-2.27.tar.gz")
++  set(RX_SLANG_HOST_PLATFORM "linux-x86_64")
++  set(RX_SLANG_HOST_ARCHIVE "slang-${RX_SLANG_VERSION}-linux-x86_64-glibc-2.27.tar.gz")
+ else()
+   message(FATAL_ERROR
+     "[fetch_slang] No prebuilt Slang archive mapping for host system "
+     "'${CMAKE_HOST_SYSTEM_NAME}'. slangc runs on the host, not the cross-"
+     "compilation target, so a host-specific archive must be added to "
+     "tools/fetch_slang.cmake before building on this host.")
+ endif()
+ 
+-set(RX_SLANG_URL
+-  "https://github.com/shader-slang/slang/releases/download/v${RX_SLANG_VERSION}/${RX_SLANG_ARCHIVE_NAME}")
+-
+-# third_party/slang-prebuilt/ is git-ignored (see .gitignore) -- this is
+-# fetched binary tooling, not source under version control.
+-set(RX_SLANG_ROOT "${CMAKE_SOURCE_DIR}/third_party/slang-prebuilt/${RX_SLANG_PLATFORM}")
+-set(RX_SLANG_MARKER "${RX_SLANG_ROOT}/.rx-fetched")
++# Verified directly against the real 2026.14.1 linux-x86_64-glibc-2.27
++# archive (extracted and inspected its tree): it has NO top-level wrapper
++# directory -- bin/, include/, lib/, share/ sit right at the archive root,
++# so slangc lands at "<root>/bin/slangc" -- used below as both the fetch
++# sentinel and RX_SLANGC's location.
++_rx_fetch_slang_platform(
++  PLATFORM_DIR "${RX_SLANG_HOST_PLATFORM}"
++  ARCHIVE_NAME "${RX_SLANG_HOST_ARCHIVE}"
++  SENTINEL_RELATIVE "bin/slangc"
++  ROOT_OUT_VAR RX_SLANG_HOST_ROOT
++)
+ 
+-if(NOT EXISTS "${RX_SLANG_MARKER}")
+-  message(STATUS "[fetch_slang] Fetching Slang ${RX_SLANG_VERSION} prebuilt (${RX_SLANG_PLATFORM}) from ${RX_SLANG_URL} ...")
++set(RX_SLANG_ROOT "${RX_SLANG_HOST_ROOT}" CACHE PATH "Root of the fetched host-side Slang prebuilt tree" FORCE)
+ 
+-  file(MAKE_DIRECTORY "${RX_SLANG_ROOT}")
+-  set(_rx_slang_archive_path "${CMAKE_BINARY_DIR}/_slang-fetch/${RX_SLANG_ARCHIVE_NAME}")
++# Also verified: slangc's ELF RUNPATH is "$ORIGIN/../lib:$ORIGIN", so it
++# resolves its own shared libraries (libslang.so etc.) relative to its own
++# location without needing LD_LIBRARY_PATH set by the caller.
++set(RX_SLANGC "${RX_SLANG_ROOT}/bin/slangc" CACHE FILEPATH "Path to the fetched slangc compiler executable" FORCE)
+ 
+-  file(DOWNLOAD "${RX_SLANG_URL}" "${_rx_slang_archive_path}"
+-       STATUS _rx_slang_dl_status)
+-  list(GET _rx_slang_dl_status 0 _rx_slang_dl_code)
+-  list(GET _rx_slang_dl_status 1 _rx_slang_dl_message)
+-  if(NOT _rx_slang_dl_code EQUAL 0)
+-    file(REMOVE "${_rx_slang_archive_path}")
+-    message(FATAL_ERROR
+-      "[fetch_slang] Download failed (${_rx_slang_dl_message}) for URL: ${RX_SLANG_URL}")
+-  endif()
+-
+-  file(ARCHIVE_EXTRACT INPUT "${_rx_slang_archive_path}" DESTINATION "${RX_SLANG_ROOT}")
+-  file(REMOVE "${_rx_slang_archive_path}")
+-
+-  # Verified directly against the real 2026.14.1 linux-x86_64-glibc-2.27
+-  # archive (extracted and inspected its tree): it has NO top-level wrapper
+-  # directory -- bin/, include/, lib/, share/ sit right at the archive
+-  # root, so slangc lands at "${RX_SLANG_ROOT}/bin/slangc". Do not assume
+-  # this blindly for other platforms/versions if this script is ever
+-  # extended -- re-verify against the actual extracted tree first.
+-  #
+-  # Also verified: slangc's ELF RUNPATH is "$ORIGIN/../lib:$ORIGIN", so it
+-  # resolves its own shared libraries (libslang.so etc.) relative to its own
+-  # location without needing LD_LIBRARY_PATH set by the caller.
+-  if(NOT EXISTS "${RX_SLANG_ROOT}/bin/slangc")
+-    message(FATAL_ERROR
+-      "[fetch_slang] Extracted archive has no 'bin/slangc' under "
+-      "'${RX_SLANG_ROOT}'. The upstream archive layout may have changed -- "
+-      "inspect that directory and update this script's assumed layout.")
+-  endif()
++if(NOT EXISTS "${RX_SLANGC}")
++  message(FATAL_ERROR "[fetch_slang] RX_SLANGC ('${RX_SLANGC}') does not exist after fetch/marker check.")
++endif()
+ 
+-  file(WRITE "${RX_SLANG_MARKER}" "${RX_SLANG_URL}\n")
++# --- 2. Target-side Slang runtime library (what rx_shader links) -------
++#
++# CMAKE_SYSTEM_NAME describes the build *target* here (unlike the host
++# guard above, this is deliberately the target, not the host) -- exactly
++# the distinction the windows-cross-zig toolchain file exists to make:
++# CMAKE_SYSTEM_NAME is "Windows" there even though everything in section 1
++# above still runs on this Linux host.
++if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
++  # Verified directly against the real 2026.14.1 windows-x86_64 archive:
++  # unlike the Linux layout, the CMake package sits at a top-level "cmake/"
++  # (not "lib/cmake/slang/"), and all binaries/import libs live in
++  # flat bin/ and lib/ dirs -- see the docstring at the top of this file
++  # and [R:A1] for the full archive layout comparison.
++  set(RX_SLANG_WINDOWS_ARCHIVE "slang-${RX_SLANG_VERSION}-windows-x86_64.tar.gz")
++  _rx_fetch_slang_platform(
++    PLATFORM_DIR "windows-x86_64"
++    ARCHIVE_NAME "${RX_SLANG_WINDOWS_ARCHIVE}"
++    SENTINEL_RELATIVE "cmake/slangConfig.cmake"
++    ROOT_OUT_VAR RX_SLANG_WINDOWS_ROOT
++  )
++  set(RX_SLANG_TARGET_ROOT "${RX_SLANG_WINDOWS_ROOT}" CACHE PATH
++    "Root of the Slang prebuilt tree matching the current CMAKE_SYSTEM_NAME target" FORCE)
+ else()
+-  message(STATUS "[fetch_slang] Slang ${RX_SLANG_VERSION} prebuilt already present at ${RX_SLANG_ROOT} (marker found) - skipping download")
++  # Native build (e.g. linux-native): target == host, reuse the same tree
++  # already fetched above instead of fetching a second, identical copy.
++  set(RX_SLANG_TARGET_ROOT "${RX_SLANG_ROOT}" CACHE PATH
++    "Root of the Slang prebuilt tree matching the current CMAKE_SYSTEM_NAME target" FORCE)
+ endif()
+ 
+-set(RX_SLANGC "${RX_SLANG_ROOT}/bin/slangc" CACHE FILEPATH "Path to the fetched slangc compiler executable")
+-
+-if(NOT EXISTS "${RX_SLANGC}")
+-  message(FATAL_ERROR "[fetch_slang] RX_SLANGC ('${RX_SLANGC}') does not exist after fetch/marker check.")
+-endif()
++# find_package(<PackageName> ...)'s Config-mode search consults the cache/
++# environment variable "<PackageName>_ROOT" automatically (CMP0074, default
++# NEW since this project's cmake_minimum_required is well above 3.12) as
++# one of the installation-prefix candidates fed into its standard
++# W/U-convention subdirectory search (see the CMake find_package docs:
++# "<prefix>/(cmake|CMake)/" and "<prefix>/(lib/<arch>|lib*|share)/cmake/
++# <name>*/" are BOTH always searched under every prefix, regardless of
++# host OS) -- so exposing this one variable is sufficient for rx_shader's
++# plain `find_package(slang CONFIG REQUIRED)` to find slangConfig.cmake
++# whether it's under RX_SLANG_TARGET_ROOT/lib/cmake/slang/ (Linux layout)
++# or RX_SLANG_TARGET_ROOT/cmake/ (Windows layout), with no per-platform
++# branching needed at the call site.
++set(slang_ROOT "${RX_SLANG_TARGET_ROOT}" CACHE PATH
++  "Root of the Slang prebuilt tree find_package(slang CONFIG) should search (CMP0074)" FORCE)
