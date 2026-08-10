@@ -1,0 +1,966 @@
+# Review package: ecbe33d94c78e77dd435308cdcd3c707a3b3ac27..775769b
+
+## Commits
+775769b Default sample validation off; ctest gates opt in with --validate
+
+## Files changed
+ MANUAL_VERIFICATION.md                  | 17 ++++---
+ samples/01_triangle/CMakeLists.txt      |  7 ++-
+ samples/01_triangle/main.cpp            | 19 ++++----
+ samples/02_hotreload/CMakeLists.txt     |  9 ++--
+ samples/02_hotreload/main.cpp           | 19 ++++----
+ samples/03_bindless_mesh/CMakeLists.txt |  9 ++--
+ samples/03_bindless_mesh/main.cpp       | 19 ++++----
+ samples/04_streaming/CMakeLists.txt     |  9 ++--
+ samples/04_streaming/main.cpp           | 19 ++++----
+ samples/README.md                       | 79 ++++++++++++++++++++++++---------
+ 10 files changed, 136 insertions(+), 70 deletions(-)
+
+## Diff
+diff --git a/MANUAL_VERIFICATION.md b/MANUAL_VERIFICATION.md
+index 2dfb995..0a3124a 100644
+--- a/MANUAL_VERIFICATION.md
++++ b/MANUAL_VERIFICATION.md
+@@ -16,28 +16,33 @@ copying that one binary; nothing else from the build tree is needed.
+ - The window opens and shows a solid white, upward-pointing triangle
+   centered in the lower-middle of an otherwise solid black window (see
+   `samples/README.md`'s "Expected output" section for the exact shape/
+   placement).
+ - Resizing the window (drag an edge/corner, or maximize/restore) keeps the
+   triangle centered and correctly proportioned at the new size, with no
+   visible corruption, stretching, or a frozen/stale frame — at any point,
+   any number of times.
+ - Closing the window (clicking its close button, or `Alt+F4`/equivalent)
+   exits the process promptly, with no crash, hang, or leftover process.
+-- On Linux, `VK_LAYER_KHRONOS_validation` output during the run contains no
+-  `[error]`-level line beyond this codebase's two documented, narrowly-
+-  matched false-positive guards (`context.cpp`'s
+-  `isKnownPortabilityEnumerationLayerBug` /
++- On Linux, run with `--validate` (see `samples/README.md`) so the Vulkan
++  validation layers are actually active, and confirm `VK_LAYER_KHRONOS_
++  validation` output during the run contains no `[error]`-level line beyond
++  this codebase's two documented, narrowly-matched false-positive guards
++  (`context.cpp`'s `isKnownPortabilityEnumerationLayerBug` /
+   `isKnownUnrecognizedSlangSourceLanguageBug`) — run with
+   `RX_LOG` output visible (the default; nothing needs enabling) and grep for
+-  `[error]` if in doubt. Windows builds don't carry the validation layer in
+-  this project's toolchain, so this check is Linux-only.
++  `[error]` if in doubt. `--validate` requires the Vulkan SDK (or an
++  equivalent `VK_LAYER_KHRONOS_validation` install) on the machine; without
++  it validation is silently off, which is the normal end-user default (see
++  `samples/README.md`) but not what this pre-release check wants. Windows
++  builds don't carry the validation layer in this project's toolchain, so
++  this check is Linux-only.
+ 
+ ## Linux (native, `linux-native` preset)
+ 
+ - [x] Build: `cmake --preset linux-native && cmake --build --preset linux-native`
+ - [x] Run: `./build/linux-native/samples/01_triangle/sample_01_triangle --present`
+ - [x] Triangle renders correctly (screenshot-verified, see below)
+ - [x] Survives repeated resizes (scripted: 5 sequential resizes + a 15-step
+       randomized resize soak, sizes from 300x200 to 1200x900) with zero
+       unexpected validation errors
+ - [x] Closes cleanly (verified via `SIGTERM`, which SDL3 translates into a
+diff --git a/samples/01_triangle/CMakeLists.txt b/samples/01_triangle/CMakeLists.txt
+index bce8af2..975e96d 100644
+--- a/samples/01_triangle/CMakeLists.txt
++++ b/samples/01_triangle/CMakeLists.txt
+@@ -23,13 +23,16 @@ add_dependencies(sample_01_triangle triangle_shaders)
+ # in-process -- so these two files are the entire redistribution surface a
+ # copy of this sample's directory needs beyond the binary itself.
+ add_custom_command(TARGET sample_01_triangle POST_BUILD
+   COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+           "${RX_TRIANGLE_VERT_SPV}" "${RX_TRIANGLE_FRAG_SPV}"
+           "$<TARGET_FILE_DIR:sample_01_triangle>/"
+   COMMENT "sample_01_triangle: deploying precompiled SPIR-V next to the binary"
+   VERBATIM
+ )
+ 
+-# Runs the binary with no arguments -- headless mode (default, used by ctest).
++# Runs the binary in headless mode with --validate: ctest is the developer/CI
++# gate, so it explicitly opts into the Vulkan validation layers (requires the
++# Vulkan SDK / validation layers installed -- see samples/README.md) on top
++# of the default end-user behavior, which is headless with validation OFF.
+ # The binary also supports --present mode for interactive windowed rendering.
+-add_test(NAME sample_01_triangle_headless COMMAND sample_01_triangle)
++add_test(NAME sample_01_triangle_headless COMMAND sample_01_triangle --validate)
+diff --git a/samples/01_triangle/main.cpp b/samples/01_triangle/main.cpp
+index 8ad6f80..2fee777 100644
+--- a/samples/01_triangle/main.cpp
++++ b/samples/01_triangle/main.cpp
+@@ -326,39 +326,39 @@ bool createSwapchainViews(VkDevice device, const rx::rhi::Device& rhiDevice, std
+ void destroySwapchainViews(VkDevice device, std::vector<VkImageView>& views) {
+     for (VkImageView view : views) {
+         if (view != VK_NULL_HANDLE) {
+             vkDestroyImageView(device, view, nullptr);
+         }
+     }
+     views.clear();
+ }
+ 
+ // --- Headless mode: offscreen render + pixel readback ----------------------
+-int runHeadless() {
++int runHeadless(bool enableValidation) {
+     auto window = rx::platform::Window::create("rx_triangle_sample", static_cast<int>(kWidth),
+                                                  static_cast<int>(kHeight), /*visible=*/false);
+     if (!window.has_value()) {
+         RX_LOG_ERROR("Window::create failed: no display backend available");
+         return 1;
+     }
+ 
+     auto extensions = window->requiredVulkanInstanceExtensions();
+     if (extensions.empty()) {
+         RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
+         return 1;
+     }
+ 
+     // Exactly one Context is built in this process -- see the WARNING on
+     // Context::create() in context.h about vk-bootstrap's process-wide
+     // cached instance function pointers; a single windowed, validated
+     // Context sidesteps that hazard entirely.
+-    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    auto context = rx::rhi::Context::create(extensions, enableValidation);
+     if (!context.has_value()) {
+         RX_LOG_ERROR("Context::create failed");
+         return 1;
+     }
+ 
+     VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
+     if (surface == VK_NULL_HANDLE) {
+         RX_LOG_ERROR("createVulkanSurface failed");
+         return 1;
+     }
+@@ -595,21 +595,21 @@ int runHeadless() {
+             RX_LOG_ERROR("center pixel ({},{}) channel {} = {} (expected > 200)", kCenterX, kCenterY, c, center[c]);
+             pass = false;
+         }
+     }
+     for (int c = 0; c < 3; ++c) {
+         if (corner[c] >= 20) {
+             RX_LOG_ERROR("corner pixel ({},{}) channel {} = {} (expected < 20)", kCornerX, kCornerY, c, corner[c]);
+             pass = false;
+         }
+     }
+-    if (context->hasValidationErrors()) {
++    if (enableValidation && context->hasValidationErrors()) {
+         RX_LOG_ERROR("Vulkan validation layer reported errors during this run");
+         pass = false;
+     }
+ 
+     if (pass) {
+         RX_LOG_INFO("triangle readback PASSED");
+         return 0;
+     }
+     RX_LOG_ERROR("triangle readback FAILED");
+     return 1;
+@@ -635,35 +635,35 @@ int runHeadless() {
+ // acquiring, but only RESETS it AFTER acquireNextImage() has confirmed it
+ // actually has an image to render into. Resetting unconditionally before
+ // acquiring would deadlock the very next iteration's wait whenever acquire
+ // itself reports NeedsRecreate (a real, reachable path -- e.g. a just-
+ // resized or minimized window): that iteration `continue`s without ever
+ // submitting again, so an unconditionally-reset fence would never be
+ // re-signaled by anything, and the next wait on it would block forever. This
+ // is the same wait-before-acquire/reset-after-acquire-succeeds ordering used
+ // by every mainstream Vulkan frames-in-flight reference (e.g.
+ // vulkan-tutorial.com's "Frames in flight" chapter) for exactly this reason.
+-int runPresent() {
++int runPresent(bool enableValidation) {
+     auto window = rx::platform::Window::create("rx_triangle_sample (--present)", static_cast<int>(kPresentWidth),
+                                                  static_cast<int>(kPresentHeight), /*visible=*/true);
+     if (!window.has_value()) {
+         RX_LOG_ERROR("Window::create failed: no display backend available");
+         return 1;
+     }
+ 
+     auto extensions = window->requiredVulkanInstanceExtensions();
+     if (extensions.empty()) {
+         RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
+         return 1;
+     }
+ 
+-    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    auto context = rx::rhi::Context::create(extensions, enableValidation);
+     if (!context.has_value()) {
+         RX_LOG_ERROR("Context::create failed");
+         return 1;
+     }
+ 
+     VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
+     if (surface == VK_NULL_HANDLE) {
+         RX_LOG_ERROR("createVulkanSurface failed");
+         return 1;
+     }
+@@ -856,38 +856,41 @@ int runPresent() {
+     }
+ 
+     // Shutdown: vkDeviceWaitIdle BEFORE destroying FrameSync (via its
+     // destructor when this function returns), the per-image views, and the
+     // pipeline -- the only point any of these may legally die. See
+     // frame_sync.h's destructor contract.
+     vkDeviceWaitIdle(vkDevice);
+     destroySwapchainViews(vkDevice, swapchainViews);
+     destroyTrianglePipeline(vkDevice, trianglePipeline);
+ 
+-    if (context->hasValidationErrors()) {
++    if (enableValidation && context->hasValidationErrors()) {
+         RX_LOG_ERROR("Vulkan validation layer reported errors during the present loop");
+         return 1;
+     }
+     if (!ok) {
+         return 1;
+     }
+     RX_LOG_INFO("--present: window closed cleanly");
+     return 0;
+ }
+ 
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+     rx::core::log::init();
+ 
+     bool presentMode = false;
++    bool enableValidation = false;
+     for (int i = 1; i < argc; ++i) {
+         if (std::string_view(argv[i]) == "--present") {
+             presentMode = true;
++        } else if (std::string_view(argv[i]) == "--validate") {
++            enableValidation = true;
+         }
+     }
+ 
+     if (presentMode) {
+-        return runPresent();
++        return runPresent(enableValidation);
+     }
+-    return runHeadless();
++    return runHeadless(enableValidation);
+ }
+diff --git a/samples/02_hotreload/CMakeLists.txt b/samples/02_hotreload/CMakeLists.txt
+index bd857fe..08c1084 100644
+--- a/samples/02_hotreload/CMakeLists.txt
++++ b/samples/02_hotreload/CMakeLists.txt
+@@ -32,14 +32,17 @@ rx_shader_deploy_runtime_libs(sample_02_hotreload)
+ # runtime libs above) works identically, which is the whole point of the
+ # redistribution proof.
+ add_custom_command(TARGET sample_02_hotreload POST_BUILD
+   COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+           "${CMAKE_CURRENT_SOURCE_DIR}/hotreload.slang"
+           "$<TARGET_FILE_DIR:sample_02_hotreload>/hotreload.slang"
+   COMMENT "sample_02_hotreload: deploying hotreload.slang next to the binary"
+   VERBATIM
+ )
+ 
+-# Runs the binary with no arguments -- headless mode (default, used by
+-# ctest). The binary also supports --present mode for interactive windowed
++# Runs the binary in headless mode with --validate: ctest is the developer/CI
++# gate, so it explicitly opts into the Vulkan validation layers (requires the
++# Vulkan SDK / validation layers installed -- see samples/README.md) on top
++# of the default end-user behavior, which is headless with validation OFF.
++# The binary also supports --present mode for interactive windowed
+ # rendering with live shader editing (see main.cpp / samples/README.md).
+-add_test(NAME sample_02_hotreload_headless COMMAND sample_02_hotreload)
++add_test(NAME sample_02_hotreload_headless COMMAND sample_02_hotreload --validate)
+diff --git a/samples/02_hotreload/main.cpp b/samples/02_hotreload/main.cpp
+index ce55afc..5147b5d 100644
+--- a/samples/02_hotreload/main.cpp
++++ b/samples/02_hotreload/main.cpp
+@@ -515,39 +515,39 @@ std::string resolveShaderPath() {
+     if (basePath == nullptr) {
+         RX_LOG_WARN("sample_02_hotreload: SDL_GetBasePath failed ({}); looking for {} in the current directory "
+                     "instead",
+                     SDL_GetError(), kShaderFilename);
+         return kShaderFilename;
+     }
+     return std::string(basePath) + kShaderFilename;
+ }
+ 
+ // --- Headless mode: offscreen render + pixel readback ----------------------
+-int runHeadless() {
++int runHeadless(bool enableValidation) {
+     auto window = rx::platform::Window::create("rx_hotreload_sample", static_cast<int>(kHeadlessWidth),
+                                                  static_cast<int>(kHeadlessHeight), /*visible=*/false);
+     if (!window.has_value()) {
+         RX_LOG_ERROR("Window::create failed: no display backend available");
+         return 1;
+     }
+ 
+     auto extensions = window->requiredVulkanInstanceExtensions();
+     if (extensions.empty()) {
+         RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
+         return 1;
+     }
+ 
+     // Exactly one Context is built in this process -- see the WARNING on
+     // Context::create() in context.h; a single windowed, validated Context
+     // (same extension set --present mode would use) sidesteps the
+     // vk-bootstrap process-wide function-pointer caching hazard entirely.
+-    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    auto context = rx::rhi::Context::create(extensions, enableValidation);
+     if (!context.has_value()) {
+         RX_LOG_ERROR("Context::create failed");
+         return 1;
+     }
+ 
+     VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
+     if (surface == VK_NULL_HANDLE) {
+         RX_LOG_ERROR("createVulkanSurface failed");
+         return 1;
+     }
+@@ -815,49 +815,49 @@ int runHeadless() {
+             RX_LOG_ERROR("source B center pixel channel {} = {} (expected < 20)", c, b[c]);
+             pass = false;
+         }
+     }
+     // The whole point of this gate: reloading the shader actually changed
+     // what gets rendered.
+     if (std::abs(static_cast<int>(a[0]) - static_cast<int>(b[0])) < 100) {
+         RX_LOG_ERROR("readback did not change between source A and source B -- hot reload had no effect");
+         pass = false;
+     }
+-    if (context->hasValidationErrors()) {
++    if (enableValidation && context->hasValidationErrors()) {
+         RX_LOG_ERROR("Vulkan validation layer reported errors during this run");
+         pass = false;
+     }
+ 
+     if (pass) {
+         RX_LOG_INFO("hotreload headless gate PASSED");
+         return 0;
+     }
+     RX_LOG_ERROR("hotreload headless gate FAILED");
+     return 1;
+ }
+ 
+ // --- --present mode: real window, live shader editing -----------------------
+-int runPresent() {
++int runPresent(bool enableValidation) {
+     auto window = rx::platform::Window::create("rx_hotreload_sample (--present)", static_cast<int>(kPresentWidth),
+                                                  static_cast<int>(kPresentHeight), /*visible=*/true);
+     if (!window.has_value()) {
+         RX_LOG_ERROR("Window::create failed: no display backend available");
+         return 1;
+     }
+ 
+     auto extensions = window->requiredVulkanInstanceExtensions();
+     if (extensions.empty()) {
+         RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
+         return 1;
+     }
+ 
+-    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    auto context = rx::rhi::Context::create(extensions, enableValidation);
+     if (!context.has_value()) {
+         RX_LOG_ERROR("Context::create failed");
+         return 1;
+     }
+ 
+     VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
+     if (surface == VK_NULL_HANDLE) {
+         RX_LOG_ERROR("createVulkanSurface failed");
+         return 1;
+     }
+@@ -1105,38 +1105,41 @@ int runPresent() {
+     }
+ 
+     // Shutdown: vkDeviceWaitIdle BEFORE destroying FrameSync (its
+     // destructor runs when this function returns), the per-image views,
+     // and the pipeline -- the only point any of these may legally die (see
+     // frame_sync.h's destructor contract).
+     vkDeviceWaitIdle(vkDevice);
+     destroySwapchainViews(vkDevice, swapchainViews);
+     destroyReloadablePipeline(vkDevice, pipeline);
+ 
+-    if (context->hasValidationErrors()) {
++    if (enableValidation && context->hasValidationErrors()) {
+         RX_LOG_ERROR("Vulkan validation layer reported errors during the present loop");
+         return 1;
+     }
+     if (!ok) {
+         return 1;
+     }
+     RX_LOG_INFO("--present: window closed cleanly");
+     return 0;
+ }
+ 
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+     rx::core::log::init();
+ 
+     bool presentMode = false;
++    bool enableValidation = false;
+     for (int i = 1; i < argc; ++i) {
+         if (std::string_view(argv[i]) == "--present") {
+             presentMode = true;
++        } else if (std::string_view(argv[i]) == "--validate") {
++            enableValidation = true;
+         }
+     }
+ 
+     if (presentMode) {
+-        return runPresent();
++        return runPresent(enableValidation);
+     }
+-    return runHeadless();
++    return runHeadless(enableValidation);
+ }
+diff --git a/samples/03_bindless_mesh/CMakeLists.txt b/samples/03_bindless_mesh/CMakeLists.txt
+index a706572..e76e71e 100644
+--- a/samples/03_bindless_mesh/CMakeLists.txt
++++ b/samples/03_bindless_mesh/CMakeLists.txt
+@@ -18,14 +18,17 @@ rx_shader_deploy_runtime_libs(sample_03_bindless_mesh)
+ # outside the build tree -- same mechanism/rationale as 02_hotreload's
+ # hotreload.slang deployment.
+ add_custom_command(TARGET sample_03_bindless_mesh POST_BUILD
+   COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+           "${CMAKE_CURRENT_SOURCE_DIR}/texture.png"
+           "$<TARGET_FILE_DIR:sample_03_bindless_mesh>/texture.png"
+   COMMENT "sample_03_bindless_mesh: deploying texture.png next to the binary"
+   VERBATIM
+ )
+ 
+-# Runs the binary with no arguments -- headless mode (default, used by
+-# ctest). The binary also supports --present mode for interactive windowed
++# Runs the binary in headless mode with --validate: ctest is the developer/CI
++# gate, so it explicitly opts into the Vulkan validation layers (requires the
++# Vulkan SDK / validation layers installed -- see samples/README.md) on top
++# of the default end-user behavior, which is headless with validation OFF.
++# The binary also supports --present mode for interactive windowed
+ # rendering with an orbiting camera (see main.cpp / samples/README.md).
+-add_test(NAME sample_03_bindless_mesh_headless COMMAND sample_03_bindless_mesh)
++add_test(NAME sample_03_bindless_mesh_headless COMMAND sample_03_bindless_mesh --validate)
+diff --git a/samples/03_bindless_mesh/main.cpp b/samples/03_bindless_mesh/main.cpp
+index bca1b42..2b67dd2 100644
+--- a/samples/03_bindless_mesh/main.cpp
++++ b/samples/03_bindless_mesh/main.cpp
+@@ -925,35 +925,35 @@ std::optional<uint32_t> findMemoryTypeIndex(const VkPhysicalDeviceMemoryProperti
+                                              VkMemoryPropertyFlags required) {
+     for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+         if ((typeBits & (1U << i)) != 0U && (memProps.memoryTypes[i].propertyFlags & required) == required) {
+             return i;
+         }
+     }
+     return std::nullopt;
+ }
+ 
+ // --- Headless mode: offscreen render + pixel readback ----------------------
+-int runHeadless() {
++int runHeadless(bool enableValidation) {
+     auto window = rx::platform::Window::create("rx_bindless_mesh_sample", static_cast<int>(kHeadlessWidth),
+                                                  static_cast<int>(kHeadlessHeight), /*visible=*/false);
+     if (!window.has_value()) {
+         RX_LOG_ERROR("Window::create failed: no display backend available");
+         return 1;
+     }
+ 
+     auto extensions = window->requiredVulkanInstanceExtensions();
+     if (extensions.empty()) {
+         RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
+         return 1;
+     }
+ 
+-    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    auto context = rx::rhi::Context::create(extensions, enableValidation);
+     if (!context.has_value()) {
+         RX_LOG_ERROR("Context::create failed");
+         return 1;
+     }
+ 
+     VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
+     if (surface == VK_NULL_HANDLE) {
+         RX_LOG_ERROR("createVulkanSurface failed");
+         return 1;
+     }
+@@ -1218,49 +1218,49 @@ int runHeadless() {
+ 
+     bool pass = true;
+     if (distinctCount < 3) {
+         RX_LOG_ERROR("only {} distinct texture colors found among {} probes (need >= 3)", distinctCount,
+                      kProbes.size());
+         pass = false;
+     } else {
+         RX_LOG_INFO("{} distinct texture colors found among {} probes", distinctCount, kProbes.size());
+     }
+ 
+-    if (context->hasValidationErrors()) {
++    if (enableValidation && context->hasValidationErrors()) {
+         RX_LOG_ERROR("Vulkan validation layer reported errors during this run");
+         pass = false;
+     }
+ 
+     if (pass) {
+         RX_LOG_INFO("bindless mesh headless gate PASSED");
+         return 0;
+     }
+     RX_LOG_ERROR("bindless mesh headless gate FAILED");
+     return 1;
+ }
+ 
+ // --- --present mode: real window, orbiting camera --------------------------
+-int runPresent() {
++int runPresent(bool enableValidation) {
+     auto window = rx::platform::Window::create("rx_bindless_mesh_sample (--present)", static_cast<int>(kPresentWidth),
+                                                  static_cast<int>(kPresentHeight), /*visible=*/true);
+     if (!window.has_value()) {
+         RX_LOG_ERROR("Window::create failed: no display backend available");
+         return 1;
+     }
+ 
+     auto extensions = window->requiredVulkanInstanceExtensions();
+     if (extensions.empty()) {
+         RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
+         return 1;
+     }
+ 
+-    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    auto context = rx::rhi::Context::create(extensions, enableValidation);
+     if (!context.has_value()) {
+         RX_LOG_ERROR("Context::create failed");
+         return 1;
+     }
+ 
+     VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
+     if (surface == VK_NULL_HANDLE) {
+         RX_LOG_ERROR("createVulkanSurface failed");
+         return 1;
+     }
+@@ -1550,38 +1550,41 @@ int runPresent() {
+         }
+ 
+         frameSync->advanceFrame();
+     }
+ 
+     vkDeviceWaitIdle(vkDevice);
+     destroySwapchainViews();
+     depth.reset();
+     destroyScene(vkDevice, *scene);
+ 
+-    if (context->hasValidationErrors()) {
++    if (enableValidation && context->hasValidationErrors()) {
+         RX_LOG_ERROR("Vulkan validation layer reported errors during the present loop");
+         return 1;
+     }
+     if (!ok) {
+         return 1;
+     }
+     RX_LOG_INFO("--present: window closed cleanly");
+     return 0;
+ }
+ 
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+     rx::core::log::init();
+ 
+     bool presentMode = false;
++    bool enableValidation = false;
+     for (int i = 1; i < argc; ++i) {
+         if (std::string_view(argv[i]) == "--present") {
+             presentMode = true;
++        } else if (std::string_view(argv[i]) == "--validate") {
++            enableValidation = true;
+         }
+     }
+ 
+     if (presentMode) {
+-        return runPresent();
++        return runPresent(enableValidation);
+     }
+-    return runHeadless();
++    return runHeadless(enableValidation);
+ }
+diff --git a/samples/04_streaming/CMakeLists.txt b/samples/04_streaming/CMakeLists.txt
+index 1a933e2..87c8e90 100644
+--- a/samples/04_streaming/CMakeLists.txt
++++ b/samples/04_streaming/CMakeLists.txt
+@@ -7,14 +7,17 @@ add_executable(sample_04_streaming main.cpp)
+ target_link_libraries(sample_04_streaming PRIVATE rx_rhi_vk rx_platform rx_shader)
+ 
+ # This sample does real in-process Slang compilation at startup (both
+ # modes -- see main.cpp's kShaderSource/buildScenePipeline()), same as
+ # 02_hotreload/03_bindless_mesh -- needs the Slang runtime libs deployed
+ # next to it. Every texture this sample uses is procedurally generated in
+ # code (see main.cpp's computeExpectedColors()/makeFlatColorTexture()) --
+ # unlike 03_bindless_mesh, there is no external asset file to deploy.
+ rx_shader_deploy_runtime_libs(sample_04_streaming)
+ 
+-# Runs the binary with no arguments -- headless mode (default, used by
+-# ctest). The binary also supports --present mode for interactive windowed
++# Runs the binary in headless mode with --validate: ctest is the developer/CI
++# gate, so it explicitly opts into the Vulkan validation layers (requires the
++# Vulkan SDK / validation layers installed -- see samples/README.md) on top
++# of the default end-user behavior, which is headless with validation OFF.
++# The binary also supports --present mode for interactive windowed
+ # rendering with a continuously cycling grid (see main.cpp / samples/README.md).
+-add_test(NAME sample_04_streaming_headless COMMAND sample_04_streaming)
++add_test(NAME sample_04_streaming_headless COMMAND sample_04_streaming --validate)
+diff --git a/samples/04_streaming/main.cpp b/samples/04_streaming/main.cpp
+index bdc431c..1ba5fc4 100644
+--- a/samples/04_streaming/main.cpp
++++ b/samples/04_streaming/main.cpp
+@@ -1224,35 +1224,35 @@ void destroyOffscreenSlot(VkDevice device, OffscreenSlot& slot) {
+         slot.image = VK_NULL_HANDLE;
+     }
+     if (slot.memory != VK_NULL_HANDLE) {
+         vkFreeMemory(device, slot.memory, nullptr);
+         slot.memory = VK_NULL_HANDLE;
+     }
+ }
+ 
+ // --- Headless mode: 60 real frames through a genuine 2-frames-in-flight
+ // offscreen loop, with deferred readback probes -----------------------------
+-int runHeadless() {
++int runHeadless(bool enableValidation) {
+     auto window = rx::platform::Window::create("rx_streaming_sample", static_cast<int>(kHeadlessWidth),
+                                                  static_cast<int>(kHeadlessHeight), /*visible=*/false);
+     if (!window.has_value()) {
+         RX_LOG_ERROR("Window::create failed: no display backend available");
+         return 1;
+     }
+ 
+     auto extensions = window->requiredVulkanInstanceExtensions();
+     if (extensions.empty()) {
+         RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
+         return 1;
+     }
+ 
+-    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    auto context = rx::rhi::Context::create(extensions, enableValidation);
+     if (!context.has_value()) {
+         RX_LOG_ERROR("Context::create failed");
+         return 1;
+     }
+ 
+     VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
+     if (surface == VK_NULL_HANDLE) {
+         RX_LOG_ERROR("createVulkanSurface failed");
+         return 1;
+     }
+@@ -1486,49 +1486,49 @@ int runHeadless() {
+     for (uint32_t k = 0; k < kTextureCount; ++k) {
+         if (!observedResident[k]) {
+             RX_LOG_ERROR("sample_04_streaming: logical texture {} was never observed resident on screen", k);
+             ++missingCount;
+             pass = false;
+         }
+     }
+     RX_LOG_INFO("sample_04_streaming: {} / {} logical textures observed resident at some point",
+                 kTextureCount - missingCount, kTextureCount);
+ 
+-    if (context->hasValidationErrors()) {
++    if (enableValidation && context->hasValidationErrors()) {
+         RX_LOG_ERROR("Vulkan validation layer reported errors during this run");
+         pass = false;
+     }
+ 
+     if (pass) {
+         RX_LOG_INFO("streaming headless gate PASSED");
+         return 0;
+     }
+     RX_LOG_ERROR("streaming headless gate FAILED");
+     return 1;
+ }
+ 
+ // --- --present mode: real window, continuously cycling grid ----------------
+-int runPresent() {
++int runPresent(bool enableValidation) {
+     auto window = rx::platform::Window::create("rx_streaming_sample (--present)", static_cast<int>(kPresentWidth),
+                                                  static_cast<int>(kPresentHeight), /*visible=*/true);
+     if (!window.has_value()) {
+         RX_LOG_ERROR("Window::create failed: no display backend available");
+         return 1;
+     }
+ 
+     auto extensions = window->requiredVulkanInstanceExtensions();
+     if (extensions.empty()) {
+         RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
+         return 1;
+     }
+ 
+-    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    auto context = rx::rhi::Context::create(extensions, enableValidation);
+     if (!context.has_value()) {
+         RX_LOG_ERROR("Context::create failed");
+         return 1;
+     }
+ 
+     VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
+     if (surface == VK_NULL_HANDLE) {
+         RX_LOG_ERROR("createVulkanSurface failed");
+         return 1;
+     }
+@@ -1778,38 +1778,41 @@ int runPresent() {
+             break;
+         }
+ 
+         frameSync->advanceFrame();
+     }
+ 
+     vkDeviceWaitIdle(vkDevice);
+     destroySwapchainViews();
+     destroyScene(vkDevice, *scene);  // drains the DeletionQueue (flushAll) before tearing down.
+ 
+-    if (context->hasValidationErrors()) {
++    if (enableValidation && context->hasValidationErrors()) {
+         RX_LOG_ERROR("Vulkan validation layer reported errors during the present loop");
+         return 1;
+     }
+     if (!ok) {
+         return 1;
+     }
+     RX_LOG_INFO("--present: window closed cleanly");
+     return 0;
+ }
+ 
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+     rx::core::log::init();
+ 
+     bool presentMode = false;
++    bool enableValidation = false;
+     for (int i = 1; i < argc; ++i) {
+         if (std::string_view(argv[i]) == "--present") {
+             presentMode = true;
++        } else if (std::string_view(argv[i]) == "--validate") {
++            enableValidation = true;
+         }
+     }
+ 
+     if (presentMode) {
+-        return runPresent();
++        return runPresent(enableValidation);
+     }
+-    return runHeadless();
++    return runHeadless(enableValidation);
+ }
+diff --git a/samples/README.md b/samples/README.md
+index 0287a9a..81e163f 100644
+--- a/samples/README.md
++++ b/samples/README.md
+@@ -46,39 +46,53 @@ one elsewhere works too.
+ 
+ ## 01_triangle
+ 
+ `samples/01_triangle/main.cpp` — renders one hardcoded white triangle on a
+ black background via a Vulkan 1.3 dynamic-rendering pipeline (no vertex
+ buffers: the vertex shader generates its 3 NDC positions from
+ `SV_VertexID`). Two modes, selected by a command-line flag, sharing the
+ exact same pipeline-construction code and draw call:
+ 
+ - **Headless (default, no flags)** — the correctness gate this repo's CI and
+-  `ctest` run. Builds the full stack (window, validated instance, surface,
+-  device, real swapchain — created and queried, but deliberately never
+-  written to), renders into a dedicated **offscreen** 256x256 image, reads
+-  the result back to the host, and asserts the center pixel is white and a
+-  corner pixel is black. Exits 0 on pass, 1 on failure, and also fails if the
+-  Vulkan validation layer reported anything beyond this project's two
+-  documented, narrowly-matched false-positive guards (see `context.cpp`).
+-  Registered as the `sample_01_triangle_headless` ctest case.
++  `ctest` run. Builds the full stack (window, instance, surface, device,
++  real swapchain — created and queried, but deliberately never written to),
++  renders into a dedicated **offscreen** 256x256 image, reads the result
++  back to the host, and asserts the center pixel is white and a corner pixel
++  is black. Exits 0 on pass, 1 on failure. Validation is OFF by default (see
++  `--validate` below) — an end-user running this sample as-is needs no
++  Vulkan SDK / validation layers installed. `ctest` registers this case as
++  `sample_01_triangle_headless` with `--validate` passed explicitly, so the
++  automated gate additionally fails if the Vulkan validation layer reported
++  anything beyond this project's two documented, narrowly-matched
++  false-positive guards (see `context.cpp`).
++- **`--validate`** — a developer/CI flag, not needed for a normal run: turns
++  on the Vulkan validation layers and the debug messenger that reports
++  through them. Requires the Vulkan SDK (or an equivalent
++  `VK_LAYER_KHRONOS_validation` install) to actually be present on the
++  machine — without it, `Context::create()` simply builds an unvalidated
++  instance (vk-bootstrap's `request_validation_layers()` is only called when
++  this flag is set), so nothing breaks, but no validation checking happens
++  either. Combine with headless (the default) or `--present`. This is what
++  every `ctest` registration below passes.
+ - **`--present`** — opens a real, visible, resizable window and renders the
+   same triangle into the actual swapchain images every frame, via the
+   canonical frames-in-flight present loop (`rx::rhi::FrameSync`:
+   `src/rx_rhi_vk/include/rx_rhi_vk/frame_sync.h`). This is the first and
+   only place in this codebase that writes to a swapchain image — and only
+   ever the image `vkAcquireNextImageKHR` actually returned. Runs until the
+   window is closed (or the process receives `SIGINT`/`SIGTERM`, which SDL
+   translates into a clean shutdown); survives being resized at any point,
+-  any number of times, with zero validation errors. Not part of `ctest` —
+-  it's interactive by nature. See `MANUAL_VERIFICATION.md` at the repo root
+-  for the per-platform manual check this mode gets before a release.
++  any number of times. Add `--validate` to also confirm zero validation
++  errors across those resizes (what `MANUAL_VERIFICATION.md`'s pre-release
++  checklist does). Not part of `ctest` — it's interactive by nature. See
++  `MANUAL_VERIFICATION.md` at the repo root for the per-platform manual
++  check this mode gets before a release.
+ 
+ ### Expected output
+ 
+ **Headless mode** prints one of these lines to the log and exits accordingly
+ — there is no visible window (it's created hidden):
+ 
+ ```
+ [info] triangle readback PASSED
+ ```
+ 
+@@ -134,22 +148,24 @@ this sample's `VkPipelineLayout` always comes from `rx::shader::reflect()` +
+ shader actually declares (a single push-constant `float time`, no
+ descriptor bindings). Two modes, one shared compile→reflect→build→pipeline
+ path:
+ 
+ - **Headless (default, no flags)** — the `ctest` correctness gate. Compiles
+   an embedded solid-white shader, renders it into a dedicated **offscreen**
+   256x256 image (same discipline as 01_triangle: never an unacquired
+   swapchain image), and reads it back. Then compiles a second embedded
+   solid-black shader, swaps the pipeline, renders again, and asserts the
+   readback actually changed — proving a reload really rebuilds what gets
+-  rendered, not just that compilation succeeds. Registered as the
+-  `sample_02_hotreload_headless` ctest case.
++  rendered, not just that compilation succeeds. Validation is off by
++  default (see 01_triangle's `--validate` section above for what that flag
++  does and why); `ctest` registers this case as
++  `sample_02_hotreload_headless` with `--validate` passed explicitly.
+ - **`--present`** — opens a real window and renders `hotreload.slang` (a
+   file on disk, deployed next to the binary at build time — see
+   `CMakeLists.txt`). Every ~250ms (~4Hz, a plain `std::filesystem::
+   last_write_time` poll — no file-watcher dependency) it checks whether
+   that file changed on disk; on a change it recompiles via
+   `Compiler::compileFromFile`, and on success swaps in a freshly built
+   pipeline. **On a compile failure, the last-good pipeline keeps
+   rendering** — Slang's diagnostics are logged to the console (the exact
+   error, with source context) and the window never goes blank or crashes
+   because of a shader typo. Not part of `ctest` (interactive by nature) —
+@@ -245,21 +261,23 @@ the table's real layout for set 0 instead of building a lookalike.
+ Per-draw push constants (12 bytes, well under the 128-byte budget):
+ `{ transformIndex, textureIndex, samplerIndex }` — all three uniform
+ across a draw call, never wrapped in `NonUniformResourceIndex()`. A depth
+ buffer (`rx::rhi::Texture2D`, `VK_FORMAT_D32_SFLOAT`, single mip level,
+ never uploaded to) enables correct depth testing across the 5 objects.
+ 
+ - **Headless (default, no flags)** — renders one frame offscreen at
+   256x256 with the camera at a fixed, known pose, reads it back, and
+   asserts at least 3 distinct texture colors landed on screen at known
+   probe positions (in practice all 5 textures are distinct and probed).
+-  Registered as the `sample_03_bindless_mesh_headless` ctest case.
++  Validation is off by default (see 01_triangle's `--validate` section
++  above); `ctest` registers this case as `sample_03_bindless_mesh_headless`
++  with `--validate` passed explicitly.
+ - **`--present`** — opens a real window showing the same 5 objects (2
+   cubes, 2 spheres, 1 plane) with the camera continuously orbiting the
+   scene. Survives window resizes (the depth buffer is recreated alongside
+   the swapchain). Not part of `ctest` — see `MANUAL_VERIFICATION.md`.
+ 
+ ### Expected output
+ 
+ **Headless mode**:
+ 
+ ```
+@@ -327,23 +345,25 @@ instead, since the grid and camera never move), which
+ `PipelineLayoutBuilder`'s external-set-0 substitution explicitly supports
+ ("a shader is free to use a strict subset of the three slots").
+ 
+ - **Headless (default, no flags)** — the `ctest` correctness gate. Runs 60
+   real frames through a genuine 2-frames-in-flight offscreen loop (2
+   dedicated offscreen images, not 1 — real CPU/GPU overlap between
+   adjacent frames is exercised on purpose, not serialized away), with
+   deferred readback probes at every grid cell's screen position on every
+   frame. Asserts every one of the 24 logical textures was actually
+   observed resident on screen at some point (not just "registered" —
+-  the probe reads real rendered pixels), plus zero validation errors —
+-  the assertion that would catch a premature-destroy bug. Registered as
+-  the `sample_04_streaming_headless` ctest case.
++  the probe reads real rendered pixels). Validation is off by default (see
++  01_triangle's `--validate` section above); `ctest` registers this case as
++  `sample_04_streaming_headless` with `--validate` passed explicitly, which
++  adds the zero-validation-errors assertion that would catch a
++  premature-destroy bug.
+ - **`--present`** — opens a real window showing the same 24-cell grid,
+   static camera, streaming continuing indefinitely at roughly 1
+   texture/second. Not part of `ctest` — see `MANUAL_VERIFICATION.md`.
+ 
+ ### Expected output
+ 
+ **Headless mode**:
+ 
+ ```
+ [info] sample_04_streaming: 24 / 24 logical textures observed resident at some point
+@@ -374,46 +394,50 @@ run the already-cross-compiled binary. There is no `samples`-specific
+ configure step; building the preset builds every sample.
+ 
+ ### Linux (native) — including Steam Deck Desktop Mode
+ 
+ ```sh
+ cmake --preset linux-native
+ cmake --build --preset linux-native
+ ```
+ 
+ ```sh
+-# Headless correctness gate (also runs via ctest, see below):
++# Headless, end-user default -- validation off, no Vulkan SDK required.
++# ctest (see below) runs this same headless mode but adds --validate:
+ ./build/linux-native/samples/01_triangle/sample_01_triangle
+ 
+ # Interactive present-mode window:
+ ./build/linux-native/samples/01_triangle/sample_01_triangle --present
+ ```
+ 
+ ```sh
+-# Headless correctness gate (also runs via ctest, see below):
++# Headless, end-user default -- validation off, no Vulkan SDK required.
++# ctest (see below) runs this same headless mode but adds --validate:
+ ./build/linux-native/samples/02_hotreload/sample_02_hotreload
+ 
+ # Interactive present-mode window with live shader editing -- edit
+ # build/linux-native/samples/02_hotreload/hotreload.slang while this runs:
+ ./build/linux-native/samples/02_hotreload/sample_02_hotreload --present
+ ```
+ 
+ ```sh
+-# Headless correctness gate (also runs via ctest, see below):
++# Headless, end-user default -- validation off, no Vulkan SDK required.
++# ctest (see below) runs this same headless mode but adds --validate:
+ ./build/linux-native/samples/03_bindless_mesh/sample_03_bindless_mesh
+ 
+ # Interactive present-mode window with an orbiting camera:
+ ./build/linux-native/samples/03_bindless_mesh/sample_03_bindless_mesh --present
+ ```
+ 
+ ```sh
+-# Headless correctness gate (also runs via ctest, see below):
++# Headless, end-user default -- validation off, no Vulkan SDK required.
++# ctest (see below) runs this same headless mode but adds --validate:
+ ./build/linux-native/samples/04_streaming/sample_04_streaming
+ 
+ # Interactive present-mode window, grid streaming ~1 texture/second:
+ ./build/linux-native/samples/04_streaming/sample_04_streaming --present
+ ```
+ 
+ Steam Deck Desktop Mode: open Konsole (or any terminal) from the Desktop
+ Mode taskbar and run the exact same commands above — the Deck's SteamOS is
+ Linux with a Vulkan driver (AMD Mesa RADV), so `linux-native` is the correct
+ preset; there is no Deck-specific build variant. `--present`'s window
+@@ -492,10 +516,23 @@ run checklist (what to record, what "pass" looks like on real hardware).
+ ```sh
+ ctest --preset linux-native --output-on-failure
+ ```
+ 
+ This runs `sample_01_triangle_headless`, `sample_02_hotreload_headless`,
+ `sample_03_bindless_mesh_headless`, and `sample_04_streaming_headless`
+ alongside every other project test (`rx_core_tests`, `rx_platform_tests`,
+ `rx_shader_tests`, `rx_rhi_vk_tests`, `shader_spirv_test`) — `--present`
+ mode is intentionally excluded from `ctest` (it blocks on a real window
+ and user/OS interaction) and is exercised manually instead.
++
++Each of the four `*_headless` `ctest` cases passes `--validate` (see each
++sample's own section above) — a developer/CI flag that turns on the Vulkan
++validation layers, requiring the Vulkan SDK (or an equivalent
++`VK_LAYER_KHRONOS_validation` install) to be present on the machine running
++`ctest`. This is what keeps the zero-validation-error bar enforced in CI
++and local development. It is deliberately **not** the default for the
++plain sample binaries: an end user who downloads a released build (see
++"Downloading a prebuilt sample bundle" above) and runs it directly gets
++validation OFF, so a machine with no Vulkan SDK installed (the normal case
++for an end user) never has the loader attempt a validation-layer manifest
++lookup at all — headless mode just runs and exits 0/1 on its own
++correctness assertions, with no Vulkan-loader diagnostics in the mix.
