@@ -54,6 +54,15 @@ and visible culling statistics.
    Unreal lighting channels / Godot cull masks) rather than inventing new
    semantics; pick mask widths and defaults in the Phase 4 spec.
 
+6. **Input expansion in rx_platform (user-raised 2026-08-10):** the Phase 4
+   fly-through camera requires relative mouse capture (raw deltas, cursor
+   show/hide) and gamepad support (Steam Deck is the hardware floor — the
+   fly-through must be drivable by pad, not only mouse). SDL3 provides
+   both natively; the work is exposing them through rx_platform's existing
+   event/input surface. Window-resize handling needs no Phase 4 work — the
+   full chain (SDL3 events → swapchain recreation → graph re-realization)
+   exists and is regression-tested as of Phase 3.
+
 ## Carried process notes
 
 - Research pass before spec (library selection for glTF/KTX2 with
