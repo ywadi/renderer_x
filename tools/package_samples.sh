@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Packages this project's four sample binaries into a single per-platform
+# Packages this project's five sample binaries into a single per-platform
 # .zip laid out exactly as a user would unzip-and-run it: one subdirectory
 # per sample, containing that sample's binary plus everything IT needs to
 # run standalone -- nothing more, nothing missing [R:D2].
@@ -26,6 +26,10 @@
 #   03_bindless_mesh  binary + texture.png + Slang runtime libs + LICENSE
 #   04_streaming      binary + Slang runtime libs + LICENSE
 #                     (no external asset -- every texture is procedural)
+#   05_multipass      binary + shaders/multipass/*.slang (5 files) + Slang
+#                     runtime libs + LICENSE (no other external asset --
+#                     every texture this sample uses is a graph-pooled
+#                     transient, never an on-disk file)
 #
 # This script does NOT build anything -- it assumes `cmake --build
 # --preset <preset>` already ran and each sample's build-output directory
@@ -112,13 +116,13 @@ copy_required "$SAMPLE_DIR" \
   "$SAMPLES_BUILD_DIR/01_triangle/triangle.vert.spv" \
   "$SAMPLES_BUILD_DIR/01_triangle/triangle.frag.spv"
 
-# --- 02_hotreload / 03_bindless_mesh / 04_streaming: real in-process Slang
-# compilation -- each needs the Slang runtime libs + LICENSE deployed next
-# to it. Globbed rather than hardcoded to the pinned version string, same
-# posture as rx_shader_deploy_runtime_libs() in src/rx_shader/CMakeLists.txt:
-# Linux filenames embed the Slang version, Windows filenames don't
-# [R:A1/A6/D2].
-for RX_SAMPLE in 02_hotreload 03_bindless_mesh 04_streaming; do
+# --- 02_hotreload / 03_bindless_mesh / 04_streaming / 05_multipass: real
+# in-process Slang compilation -- each needs the Slang runtime libs +
+# LICENSE deployed next to it. Globbed rather than hardcoded to the pinned
+# version string, same posture as rx_shader_deploy_runtime_libs() in
+# src/rx_shader/CMakeLists.txt: Linux filenames embed the Slang version,
+# Windows filenames don't [R:A1/A6/D2].
+for RX_SAMPLE in 02_hotreload 03_bindless_mesh 04_streaming 05_multipass; do
   SAMPLE_DIR="$STAGE_DIR/$RX_SAMPLE"
   mkdir -p "$SAMPLE_DIR"
   copy_required "$SAMPLE_DIR" "$SAMPLES_BUILD_DIR/$RX_SAMPLE/sample_${RX_SAMPLE}${RX_EXE_SUFFIX}"
@@ -141,16 +145,25 @@ done
 
 # 02_hotreload additionally ships the live-reloadable shader source; 03
 # additionally ships its one real-PNG texture. 04 has no external asset
-# (every texture is procedurally generated) -- nothing extra for it.
+# (every texture is procedurally generated) -- nothing extra for it. 05
+# ships its own five on-disk shader sources (see samples/05_multipass/
+# CMakeLists.txt's own POST_BUILD deploy step for why these five, flat,
+# no "multipass/" subdirectory in the deployed layout).
 copy_required "$STAGE_DIR/02_hotreload" "$SAMPLES_BUILD_DIR/02_hotreload/hotreload.slang"
 copy_required "$STAGE_DIR/03_bindless_mesh" "$SAMPLES_BUILD_DIR/03_bindless_mesh/texture.png"
+copy_required "$STAGE_DIR/05_multipass" \
+  "$SAMPLES_BUILD_DIR/05_multipass/shadow.vert.slang" \
+  "$SAMPLES_BUILD_DIR/05_multipass/lit.vert.slang" \
+  "$SAMPLES_BUILD_DIR/05_multipass/lit.frag.slang" \
+  "$SAMPLES_BUILD_DIR/05_multipass/tonemap.vert.slang" \
+  "$SAMPLES_BUILD_DIR/05_multipass/tonemap.frag.slang"
 
 mkdir -p "$(dirname "$RX_OUT_ZIP")"
 RX_OUT_ZIP_ABS="$(cd "$(dirname "$RX_OUT_ZIP")" && pwd)/$(basename "$RX_OUT_ZIP")"
 rm -f "$RX_OUT_ZIP_ABS"
 
 echo "package_samples: zipping into '$RX_OUT_ZIP_ABS' ..."
-(cd "$STAGE_DIR" && zip -r -X -q "$RX_OUT_ZIP_ABS" 01_triangle 02_hotreload 03_bindless_mesh 04_streaming)
+(cd "$STAGE_DIR" && zip -r -X -q "$RX_OUT_ZIP_ABS" 01_triangle 02_hotreload 03_bindless_mesh 04_streaming 05_multipass)
 
 echo "package_samples: done. Contents:"
 unzip -l "$RX_OUT_ZIP_ABS"

@@ -29,12 +29,16 @@ step involved:
 04_streaming/
   sample_04_streaming[.exe]        # + the Slang runtime libs below, and
                                     #   LICENSE (no other external asset)
+05_multipass/
+  sample_05_multipass[.exe]        # + shaders/multipass/*.slang (5 files),
+                                    #   the Slang runtime libs below, and
+                                    #   LICENSE
 ```
 
 `01_triangle` is the one exception to "needs the Slang runtime libs": its
 shaders are precompiled offline by `slangc` at build time, so it ships only
 its two `.spv` files and nothing Slang-related at all [D2] — see its own
-"Redistribution" section below. The other three do real in-process Slang
+"Redistribution" section below. The other four do real in-process Slang
 compilation at startup, so each of their directories additionally carries
 `libslang-compiler.so*`/`slang-compiler.dll` plus the `slang-glslang`/
 `slang-glsl-module`/`slang-rt` plugins it dlopens on demand, and the Slang
@@ -386,6 +390,80 @@ external asset file at all — every texture is procedurally generated in
 code — so a redistributed copy of just this sample's binary plus the Slang
 runtime libraries runs identically outside the build tree.
 
+## 05_multipass
+
+`samples/05_multipass/main.cpp` — the Phase 3 acceptance test made visible:
+a real, if small, multipass pipeline (shadow map → forward Lambert+shadow
+shading → Reinhard tonemap) driven entirely by `rx_graph`'s
+`RenderGraph`/`Executor`, not hand-rolled `vkCmdBeginRendering`/barrier
+calls. Every layout transition and sync2 barrier between the three passes
+is derived by `RenderGraph::compile()` and applied by `Executor::execute()`
+— this sample never calls `vkCmdPipelineBarrier2` or
+`rx::rhi::transitionImage()` itself.
+
+**Scene**: a ground plane (XZ, `y=0`) with one cube and one sphere sitting
+on it, one fixed-elevation directional light. Objects only ever translate
+(never rotate), which lets the shader skip a normal-matrix transform
+entirely — object-space normals equal world-space normals under a
+translation-only model matrix.
+
+**Graph shape**: `shadow` (writes `"shadowmap"`: Absolute 1024x1024
+D32_SFLOAT, depth-only — no fragment shader stage at all, since nothing
+needs to be written but depth) → `forward` (reads `"shadowmap"` as a
+texture input; writes `"hdr"`: SwapchainRelative R16G16B16A16_SFLOAT, and
+its own `"depth"`: SwapchainRelative D32_SFLOAT) → `tonemap` (reads
+`"hdr"`; writes the backbuffer). Shadow sampling is a manual single-tap
+depth comparison in the fragment shader (no `VK_COMPARE_OP`-enabled
+`VkSampler`) against a plain bindless `Texture2D`+`SamplerState`, exactly
+the convention every other sample in this codebase uses for texture reads.
+
+**Camera**: a fixed, top-down *orthographic* camera (not perspective) —
+deliberate, so the headless gate's probe pixels below are analytically
+derived from the same view/projection math the sample uses at render time,
+mirroring `04_streaming`'s own `cellProbePixel()` derivation.
+
+- **Headless (default, no flags)** — the `ctest` correctness gate. Fixed
+  camera/light, 3 frames through the graph, readback, and three assertions:
+  a ground-plane pixel inside the cube's analytically-derived shadow
+  footprint is darker than an unshadowed ground pixel by more than 2x; the
+  unshadowed pixel is non-trivially bright; every readback byte is in
+  range (genuinely tonemapped). Validation is off by default (see
+  01_triangle's `--validate` section above); `ctest` registers this case
+  as `sample_05_multipass_headless` with `--validate` passed explicitly.
+- **`--present`** — opens a real window showing the same scene, with the
+  light continuously orbiting in azimuth (the camera itself never moves).
+  Not part of `ctest` — see `MANUAL_VERIFICATION.md`.
+
+### Expected output
+
+**Headless mode**:
+
+```
+[info] shadow probe world=(0.0,2.0) pixel=(128,167) channels=(...) brightness_sum=...
+[info] lit probe world=(-4.0,-4.0) pixel=(49,49) channels=(...) brightness_sum=...
+[info] multipass headless gate PASSED
+```
+
+**`--present` mode** opens a 900x700 window titled `rx_multipass_sample
+(--present)` showing a reddish cube and a bluish sphere on a grayish floor,
+lit from a fixed-elevation directional light whose azimuth continuously
+orbits — the cube's shadow visibly sweeps across the floor as the light
+turns. Closing the window exits with status 0.
+
+### Redistribution
+
+Same mechanism as 02_hotreload/03_bindless_mesh/04_streaming: this sample
+compiles its shaders at runtime, so it needs the Slang runtime libs
+deployed next to it (`rx_shader_deploy_runtime_libs()`). Unlike any earlier
+sample, it ships **five** on-disk shader sources instead of one
+(`shadow.vert.slang`, `lit.vert.slang`, `lit.frag.slang`,
+`tonemap.vert.slang`, `tonemap.frag.slang`) — one file per shader stage,
+concatenated in pairs at compile time (vertex file first, fragment file
+second) so `rx::shader::reflect()` sees one linked program per pass; see
+`lit.vert.slang`'s own header comment for why. A redistributed copy of just
+this sample's build-output directory (binary + those five `.slang` files +
+the Slang runtime libraries) runs identically outside the build tree.
+
 ## Building and running
 
 Both sample modes and both build presets work identically on Linux and
@@ -437,6 +515,15 @@ cmake --build --preset linux-native
 ./build/linux-native/samples/04_streaming/sample_04_streaming --present
 ```
 
+```sh
+# Headless, end-user default -- validation off, no Vulkan SDK required.
+# ctest (see below) runs this same headless mode but adds --validate:
+./build/linux-native/samples/05_multipass/sample_05_multipass
+
+# Interactive present-mode window, light orbiting in azimuth:
+./build/linux-native/samples/05_multipass/sample_05_multipass --present
+```
+
 Steam Deck Desktop Mode: open Konsole (or any terminal) from the Desktop
 Mode taskbar and run the exact same commands above — the Deck's SteamOS is
 Linux with a Vulkan driver (AMD Mesa RADV), so `linux-native` is the correct
@@ -454,8 +541,9 @@ cmake --build --preset windows-cross-zig
 
 This produces `build/windows-cross-zig/samples/01_triangle/sample_01_triangle.exe`,
 `build/windows-cross-zig/samples/02_hotreload/sample_02_hotreload.exe`,
-`build/windows-cross-zig/samples/03_bindless_mesh/sample_03_bindless_mesh.exe`, and
-`build/windows-cross-zig/samples/04_streaming/sample_04_streaming.exe`.
+`build/windows-cross-zig/samples/03_bindless_mesh/sample_03_bindless_mesh.exe`,
+`build/windows-cross-zig/samples/04_streaming/sample_04_streaming.exe`, and
+`build/windows-cross-zig/samples/05_multipass/sample_05_multipass.exe`.
 01_triangle's binary is statically linked and needs no Slang DLLs (its
 shaders are precompiled offline by `slangc` at build time — see its own
 "Redistribution" section above) — but it does still need the two `.spv`
@@ -508,6 +596,20 @@ sample_04_streaming.exe            REM headless correctness gate
 sample_04_streaming.exe --present  REM interactive present-mode window, cycling grid
 ```
 
+05_multipass is the same shape as 02_hotreload for redistribution purposes
+(real in-process Slang compilation, so it needs the same 4 Slang DLLs
+deployed next to it), plus its own five on-disk shader sources
+(`shadow.vert.slang`, `lit.vert.slang`, `lit.frag.slang`,
+`tonemap.vert.slang`, `tonemap.frag.slang` — see this sample's own README
+section above for why five files, not one). Copy the entire
+`build/windows-cross-zig/samples/05_multipass/` directory (minus the
+`CMakeFiles`/`.pdb`/`.cmake` build bookkeeping) to run it elsewhere:
+
+```
+sample_05_multipass.exe            REM headless correctness gate
+sample_05_multipass.exe --present  REM interactive present-mode window, light orbiting
+```
+
 See `MANUAL_VERIFICATION.md` at the repo root for the actual per-platform
 run checklist (what to record, what "pass" looks like on real hardware).
 
@@ -518,13 +620,14 @@ ctest --preset linux-native --output-on-failure
 ```
 
 This runs `sample_01_triangle_headless`, `sample_02_hotreload_headless`,
-`sample_03_bindless_mesh_headless`, and `sample_04_streaming_headless`
-alongside every other project test (`rx_core_tests`, `rx_platform_tests`,
-`rx_shader_tests`, `rx_rhi_vk_tests`, `shader_spirv_test`) — `--present`
+`sample_03_bindless_mesh_headless`, `sample_04_streaming_headless`, and
+`sample_05_multipass_headless` alongside every other project test
+(`rx_core_tests`, `rx_platform_tests`, `rx_shader_tests`, `rx_rhi_vk_tests`,
+`rx_graph_tests`, `rx_graph_gpu_tests`, `shader_spirv_test`) — `--present`
 mode is intentionally excluded from `ctest` (it blocks on a real window
 and user/OS interaction) and is exercised manually instead.
 
-Each of the four `*_headless` `ctest` cases passes `--validate` (see each
+Each of the five `*_headless` `ctest` cases passes `--validate` (see each
 sample's own section above) — a developer/CI flag that turns on the Vulkan
 validation layers, requiring the Vulkan SDK (or an equivalent
 `VK_LAYER_KHRONOS_validation` install) to be present on the machine running
