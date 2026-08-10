@@ -100,7 +100,14 @@ void TransientPool::sweepStale(uint64_t currentFrame, rx::rhi::DeletionQueue& de
         if (!entry.texture.has_value()) {
             continue;
         }
-        if (currentFrame - entry.lastUsedFrame > kStaleAfterExecutes) {
+        // [Fix round 1, Minor finding]: >= , not > -- an entry last
+        // touched at frame F is idle during calls F+1..F+kStaleAfterExecutes
+        // (kStaleAfterExecutes idle calls, matching the ruling's literal
+        // "unused for kFramesInFlight+1 consecutive executes" threshold
+        // exactly); `currentFrame - lastUsedFrame == kStaleAfterExecutes`
+        // at the last of those calls, so retirement must trigger there,
+        // not one call later.
+        if (currentFrame - entry.lastUsedFrame >= kStaleAfterExecutes) {
             auto keepAlive = std::make_shared<rx::rhi::Texture2D>(std::move(*entry.texture));
             entry.texture.reset();
             deletionQueue.retire([keepAlive] {}, entry.lastUsedFrame);
@@ -110,7 +117,14 @@ void TransientPool::sweepStale(uint64_t currentFrame, rx::rhi::DeletionQueue& de
         if (!entry.buffer.has_value()) {
             continue;
         }
-        if (currentFrame - entry.lastUsedFrame > kStaleAfterExecutes) {
+        // [Fix round 1, Minor finding]: >= , not > -- an entry last
+        // touched at frame F is idle during calls F+1..F+kStaleAfterExecutes
+        // (kStaleAfterExecutes idle calls, matching the ruling's literal
+        // "unused for kFramesInFlight+1 consecutive executes" threshold
+        // exactly); `currentFrame - lastUsedFrame == kStaleAfterExecutes`
+        // at the last of those calls, so retirement must trigger there,
+        // not one call later.
+        if (currentFrame - entry.lastUsedFrame >= kStaleAfterExecutes) {
             auto keepAlive = std::make_shared<rx::rhi::Buffer>(std::move(*entry.buffer));
             entry.buffer.reset();
             deletionQueue.retire([keepAlive] {}, entry.lastUsedFrame);

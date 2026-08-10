@@ -255,10 +255,12 @@ jobs:
       - name: Wine toolchain smoke check
         run: wine build/windows-cross-zig/tools/toolchain_check/toolchain_check.exe
 
-      # rx_rhi_vk (GPU-backed) and every sample_*_headless gate are excluded:
-      # Wine in CI has no real Vulkan device to hand them, and that is a
-      # real, documented environment limitation -- not a silent pass.
-      # rx_core, rx_platform, shader_spirv_test, AND rx_shader_tests all run
+      # rx_rhi_vk (GPU-backed), rx_graph_gpu_tests (Task 3's Executor GPU
+      # tests -- same GPU-backed reason as rx_rhi_vk_tests, added when that
+      # target was introduced), and every sample_*_headless gate are
+      # excluded: Wine in CI has no real Vulkan device to hand them, and
+      # that is a real, documented environment limitation -- not a silent
+      # pass. rx_core, rx_platform, shader_spirv_test, AND rx_shader_tests all run
       # for real under Wine and are NOT excluded here -- rx_shader_tests
       # does real in-process Slang compilation (slang::createGlobalSession
       # etc.) via the MSVC-built slang-compiler.dll cross-linked through
@@ -274,7 +276,7 @@ jobs:
       # extensions, exactly as they do on any other display-less machine.
       - name: Test under wine (xvfb; GPU tests excluded -- no Vulkan under Wine)
         run: >-
-          xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|sample' --output-on-failure
+          xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|sample' --output-on-failure
           --output-junit ${{ github.workspace }}/ctest-results-windows-cross-zig.xml
 
       - name: Build budget check

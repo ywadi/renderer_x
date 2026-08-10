@@ -547,10 +547,9 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
             vkCmdBeginRendering(cmd, &renderingInfo);
         }
 
-        PassContext ctx;
+        PassContext ctx(*this);
         ctx.cmd = cmd;
         ctx.renderArea = renderArea;
-        ctx.executor_ = this;
         pass.invokeExecute(ctx);
 
         if (isGraphicsPass) {
@@ -559,9 +558,30 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
 
         endDebugLabel(impl, cmd);
 
+        // [Fix round 1, Critical finding]: UNION every pass's stage into
+        // this resource's running total for the whole execute() call --
+        // NOT an overwrite. PhysicalResource::lastUsePass names only the
+        // single highest-position touching pass, but a resource can
+        // legitimately have several passes tied for "last" in the sense
+        // that matters here: several readers of the same write, at
+        // different pipeline stages, with no intervening write between
+        // any of them (e.g. a shadow map sampled by both a lighting pass
+        // and a debug-overlay pass). Every one of those readers' work must
+        // still be waited on by next call's first-use-of-frame override
+        // (see applyBarriers()) -- an overwrite silently drops every
+        // reader but the last one processed, which reproduced as a real,
+        // empirically-verified write-after-read hazard (see
+        // task-3-review.md's Critical finding and task-3-report.md's fix-
+        // round section). Carrying the union forward is always safe (only
+        // ever adds extra, conservative wait scope) -- a subsequent WRITE
+        // within the SAME execute() call already correctly waits on every
+        // reader via Task 2's own invalidatedStagesUnion-based WAR barrier,
+        // so there is no case where accumulating instead of resetting on a
+        // write causes an actual over-synchronization problem worth
+        // special-casing.
         for (const auto& [physIdx, combined] : combineAccessesByResource(accesses)) {
             if (!impl.resources.at(physIdx).isBackbuffer) {
-                finalStageThisExecute[physIdx] = combined.stages;
+                finalStageThisExecute[physIdx] |= combined.stages;
             }
         }
     }
@@ -610,12 +630,39 @@ VkBuffer Executor::resolveBuffer(std::string_view name) const {
 }
 
 VkFormat Executor::resolveImageFormat(std::string_view name) const {
-    return impl_->resources.at(lookupResolvedIndex(*impl_, name)).format;
+    const uint32_t idx = lookupResolvedIndex(*impl_, name);
+    const ResolvedResource& resolved = impl_->resources.at(idx);
+    // [Fix round 1, Minor finding]: a buffer resource's ResolvedResource::
+    // format is never set to anything but its default (VK_FORMAT_UNDEFINED)
+    // -- returning that silently for a legitimately-registered but
+    // wrong-kind name is a meaningless value, not an error a caller could
+    // ever act on correctly. Throws the same way every other "not
+    // resolvable" case documented on this class does, rather than special-
+    // casing this one path to succeed with garbage.
+    if (resolved.isBuffer) {
+        throw std::out_of_range("rx_graph: PassContext::imageFormat(): '" + std::string(name) +
+                                 "' is a buffer resource, not an image");
+    }
+    return resolved.format;
 }
 
 VkImageView PassContext::imageView(std::string_view name) const { return executor_->resolveImageView(name); }
 VkImage PassContext::image(std::string_view name) const { return executor_->resolveImage(name); }
 VkBuffer PassContext::buffer(std::string_view name) const { return executor_->resolveBuffer(name); }
 VkFormat PassContext::imageFormat(std::string_view name) const { return executor_->resolveImageFormat(name); }
+
+namespace detail {
+
+VkPipelineStageFlags2 debugLastFrameFinalStages(const Executor& executor, std::string_view name) {
+    const Executor::Impl& impl = *executor.impl_;
+    const uint32_t idx = lookupResolvedIndex(impl, name);
+    const ResolvedResource& resolved = impl.resources.at(idx);
+    if (resolved.isBuffer) {
+        return impl.pool.buffer(resolved.poolIndex).lastFrameFinalStages;
+    }
+    return impl.pool.image(resolved.poolIndex).lastFrameFinalStages;
+}
+
+}  // namespace detail
 
 }  // namespace rx::graph

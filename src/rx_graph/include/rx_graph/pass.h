@@ -22,6 +22,17 @@ namespace rx::graph {
 // reference to an incomplete type.
 class PassContext;
 
+// Forward-declared purely to name it in Pass's `friend class Executor;`
+// grant below -- pass.h itself never needs Executor's complete definition
+// (executor.h), only the ability to say which class may call the private
+// invokeExecute() a real PassContext requires. [Fix round 1, Important
+// finding: without this, any code holding a const RenderGraph& could reach
+// a Pass via RenderGraph::passAt() and call invokeExecute() with a
+// default-constructed (executor_ == nullptr) PassContext -- see
+// PassContext's own comment in executor.h for the matching half of this
+// fix.]
+class Executor;
+
 class RenderGraph;
 
 // A declarative description of one graph pass's resource reads/writes,
@@ -78,18 +89,27 @@ public:
     [[nodiscard]] std::string_view name() const;
     [[nodiscard]] QueueClass queueClass() const;
 
+private:
+    friend class RenderGraph;
+    friend class Executor;
+
     // Task 3: invokes this pass's recorded execute() callback (setExecute()
     // above) with a real PassContext, if one was ever stored -- a no-op
     // for a pass that never called setExecute() (e.g. a pass whose only
     // job is the sync Executor already emits from CompiledGraph::
     // passBarriers()/the dynamic-rendering clear it triggers, with nothing
-    // further to record). Declared here (not free-standing in
-    // executor.cpp) because execute_ is a private member; implemented in
-    // render_graph.cpp alongside Pass's other methods.
+    // further to record). Implemented in render_graph.cpp alongside Pass's
+    // other methods.
+    //
+    // Private + friend-gated to Executor alone [Fix round 1, Important
+    // finding]: a real PassContext is only ever safely constructible by
+    // Executor (see executor.h's matching fix), so nothing outside this
+    // library's own Executor should be able to invoke a pass's callback at
+    // all -- a caller holding only a const RenderGraph& (RenderGraph::
+    // passAt() is public and returns const Pass&) must not be able to
+    // reach this. Declared here rather than free-standing in executor.cpp
+    // because execute_ is itself a private member.
     void invokeExecute(PassContext& ctx) const;
-
-private:
-    friend class RenderGraph;
 
     // Which builder method produced one Declaration -- drives both the
     // stage/access/layout resolution in RenderGraph::compile() (Task 1

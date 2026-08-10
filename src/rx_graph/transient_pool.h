@@ -160,9 +160,13 @@ public:
     // Retires (via `deletionQueue`, tagged with each entry's own
     // lastUsedFrame -- already provably safe to destroy once that frame
     // number's submission has completed, per this same frames-in-flight
-    // bound) every entry whose `currentFrame - lastUsedFrame >
-    // kStaleAfterExecutes`. Called once per execute() call, before that
-    // call's own barrier/rendering work -- see executor.cpp.
+    // bound) every entry whose `currentFrame - lastUsedFrame >=
+    // kStaleAfterExecutes` (exactly "unused for kStaleAfterExecutes
+    // consecutive execute() calls" [Fix round 1, Minor finding -- an
+    // earlier revision used `>`, which held an idle entry alive one call
+    // longer than the ruling's literal wording]). Called once per
+    // execute() call, before that call's own barrier/rendering work -- see
+    // executor.cpp.
     void sweepStale(uint64_t currentFrame, rx::rhi::DeletionQueue& deletionQueue);
 
     // Shutdown path: retires EVERY still-live entry into `deletionQueue`

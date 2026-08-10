@@ -43,6 +43,7 @@
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -686,7 +687,19 @@ TEST_CASE(
     // table. No execute() callback: this test only needs the barrier
     // machinery to run correctly, not any real compute dispatch.
     graph.addPass("produce", QueueClass::AsyncCompute).addStorageBufferOutput("data", dataDesc).setSideEffect();
-    graph.addPass("consume").addStorageBufferInput("data").addColorOutput("bb", absoluteColorDesc(kExtent, kExtent));
+    graph.addPass("consume")
+        .addStorageBufferInput("data")
+        .addColorOutput("bb", absoluteColorDesc(kExtent, kExtent))
+        .setExecute([&](PassContext& ctx) {
+            // [Fix round 1, Minor finding]: PassContext::imageFormat() on a
+            // legitimately-registered but wrong-kind (buffer, not image)
+            // name must throw std::out_of_range, matching the documented
+            // "throws on anything not resolvable" contract's own spirit --
+            // not silently return VK_FORMAT_UNDEFINED. Exercised here
+            // against the real "data" storage buffer resource, through the
+            // real Executor, inside a real pass callback.
+            CHECK_THROWS_AS(static_cast<void>(ctx.imageFormat("data")), std::out_of_range);
+        });
     graph.setBackbufferSource("bb");
 
     CompileInfo info;
@@ -716,6 +729,90 @@ TEST_CASE(
             fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
         });
     }
+
+    vkDeviceWaitIdle(device);
+    destroyOffscreenImage(device, *offscreen);
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE(
+    "Executor::execute unions every final-touching pass's stage into a pooled resource's cross-frame carry-forward "
+    "-- not just the topologically-last one") {
+    // Fix round 1, Critical finding regression test. The reviewer's own
+    // probe (task-3-review.md) reproduced this exact shape: a resource
+    // written once, then read by two independent passes with no
+    // intervening write -- "readGraphics" (a Graphics-class pass, since it
+    // also declares a color output; its texture-input read resolves to
+    // VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT per pass.h's resolveAccess
+    // table) and "readCompute" (Compute-class; resolves to
+    // VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT). Both are "shared"'s final
+    // touching passes this execute() call -- an overwrite (the pre-fix
+    // behavior) would keep only whichever of the two runs topologically
+    // last, silently dropping the other's stage from the NEXT execute()
+    // call's first-use-of-frame srcStage override and reproducing a real,
+    // unsynchronized write-after-read hazard this codebase's validation
+    // setup cannot detect on its own (no VK_VALIDATION_FEATURE_ENABLE_
+    // SYNCHRONIZATION_VALIDATION_EXT anywhere in context.cpp) -- this test
+    // asserts on the real tracked value directly via
+    // detail::debugLastFrameFinalStages(), a test/debug-only seam (see
+    // executor.h's own comment on it, mirroring barriers.h's identical
+    // detail:: carve-out), rather than relying on --validate to ever be
+    // able to catch a wrong value here.
+    auto fixture = makeFixture("rx_graph_gpu_stage_union");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    const VkDevice device = fixture->device.device();
+
+    BufferDesc outBDesc;
+    outBDesc.size = 256;
+    outBDesc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+
+    RenderGraph graph;
+    graph.addPass("write").addColorOutput("shared", absoluteColorDesc(kExtent, kExtent));
+    graph.addPass("readGraphics")
+        .addTextureInput("shared")
+        .addColorOutput("bb", absoluteColorDesc(kExtent, kExtent));
+    graph.addPass("readCompute", QueueClass::AsyncCompute)
+        .addTextureInput("shared")
+        .addStorageBufferOutput("outB", outBDesc)
+        .setSideEffect();
+    graph.setBackbufferSource("bb");
+
+    CompileInfo info;
+    info.swapchainWidth = kExtent;
+    info.swapchainHeight = kExtent;
+    info.swapchainFormat = kFormat;
+    info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    graph.compile(info);
+
+    fixture->executor->realize(graph);
+
+    auto offscreen = createOffscreenImage(device, fixture->device.physicalDevice(), kFormat,
+                                            VkExtent2D{kExtent, kExtent});
+    REQUIRE(offscreen.has_value());
+
+    auto cmdCtx =
+        rx::rhi::CommandContext::create(device, fixture->device.graphicsQueue(), fixture->device.graphicsQueueFamily());
+    REQUIRE(cmdCtx.has_value());
+
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
+    });
+
+    const VkPipelineStageFlags2 tracked = detail::debugLastFrameFinalStages(*fixture->executor, "shared");
+    CHECK((tracked & VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT) != 0);
+    CHECK((tracked & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) != 0);
+
+    // A second execute() call actually consumes that unioned value as the
+    // next frame's first-use override -- proving the fix's output feeds
+    // back into the real barrier path end to end, not just that the
+    // tracked value looks right in isolation.
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
+    });
 
     vkDeviceWaitIdle(device);
     destroyOffscreenImage(device, *offscreen);

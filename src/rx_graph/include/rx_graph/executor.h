@@ -25,6 +25,25 @@ namespace rx::graph {
 
 class Executor;
 
+namespace detail {
+
+// Test/debug-only seam -- NOT part of the stable public contract, exactly
+// the same carve-out convention barriers.h's own `detail::` namespace
+// already establishes ("exposed only so barriers.cpp's own unit tests and
+// Task 3's executor can drive the per-resource state machine directly").
+// Returns whatever `executor` currently has tracked as `name`'s pooled
+// entry's lastFrameFinalStages (Task 3 ambiguity resolution #2's cross-
+// frame carry-forward value -- see transient_pool.h's PooledImage/
+// PooledBuffer::lastFrameFinalStages) -- added [Fix round 1, Critical
+// finding] because this codebase enables no Vulkan synchronization
+// validation anywhere (see rx_rhi_vk/context.cpp), so no --validate run
+// could ever catch a wrong value here on its own; a test needs to observe
+// it directly instead. Throws std::out_of_range under the same conditions
+// PassContext's own resolvers do (see that class's comment).
+[[nodiscard]] VkPipelineStageFlags2 debugLastFrameFinalStages(const Executor& executor, std::string_view name);
+
+}  // namespace detail
+
 // The device-side handle Executor::execute() hands to a pass's recorded
 // execute() callback (pass.h's Pass::setExecute), once that pass's turn
 // comes up in CompiledGraph::executionOrder(). This is the complete
@@ -52,6 +71,19 @@ class Executor;
 //
 // Task 5 adds passSignature() here (material/pipeline binding metadata);
 // not part of Task 3's scope.
+//
+// Not default-constructible, and constructible only by Executor [Fix
+// round 1, Important finding]: an earlier revision left the implicit
+// default constructor public, leaving `executor_` at its default
+// (nullptr) -- combined with Pass::invokeExecute() also being public at
+// the time, any code holding only a const RenderGraph& could construct a
+// blank PassContext and invoke a pass's callback with it, crashing (null-
+// pointer dereference through executor_) the moment that callback called
+// any of the four resolvers below. Both halves of that gap are closed
+// together: invokeExecute() is now private + friend-gated to Executor
+// (pass.h), and this class's only constructor is private + friend-gated
+// to Executor too, so a PassContext can never exist at all without a real,
+// non-null Executor behind it.
 class PassContext {
 public:
     VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -64,6 +96,11 @@ public:
     // of).
     VkExtent2D renderArea{0, 0};
 
+    PassContext(const PassContext&) = delete;
+    PassContext& operator=(const PassContext&) = delete;
+    PassContext(PassContext&&) = delete;
+    PassContext& operator=(PassContext&&) = delete;
+
     [[nodiscard]] VkImageView imageView(std::string_view name) const;
     [[nodiscard]] VkImage image(std::string_view name) const;
     [[nodiscard]] VkBuffer buffer(std::string_view name) const;
@@ -71,7 +108,10 @@ public:
 
 private:
     friend class Executor;
-    const Executor* executor_ = nullptr;
+
+    explicit PassContext(const Executor& executor) : executor_(&executor) {}
+
+    const Executor* executor_;
 };
 
 // Owns every physical resource backing a compiled rx::graph::RenderGraph on
@@ -177,6 +217,7 @@ public:
 
 private:
     friend class PassContext;
+    friend VkPipelineStageFlags2 detail::debugLastFrameFinalStages(const Executor&, std::string_view);
 
     explicit Executor(std::unique_ptr<Impl> impl);
 
