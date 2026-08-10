@@ -5,39 +5,15 @@
 # add_subdirectory'd listfile is callable from a second, later
 # add_subdirectory'd listfile of the same parent).
 #
-# BUT: an unqualified variable reference inside a CMake function body is
-# resolved through the *calling* scope, not the function's *definition*
-# scope (also empirically verified) -- so rx_shader_deploy_runtime_libs()'s
-# reference to RX_SLANG_RUNTIME_LIBS (a plain, non-CACHE variable
-# file(GLOB)'d in rx_shader/CMakeLists.txt's own directory scope) resolves
-# to nothing here, since this directory never set it. Re-glob the exact
-# same list here (mirrors rx_shader/CMakeLists.txt's own glob patterns
-# verbatim; RX_SLANG_TARGET_ROOT is a CACHE variable, so it *is* visible in
-# this scope) so the call below actually has something to copy -- without
-# this, the function's add_custom_command silently degenerates into a
-# `cmake -E copy_if_different <dest-dir>` with no source files, which fails
-# at build time with a CMake -E usage error.
-if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
-  file(GLOB RX_SLANG_RUNTIME_LIBS
-    "${RX_SLANG_TARGET_ROOT}/bin/slang-compiler.dll"
-    "${RX_SLANG_TARGET_ROOT}/bin/slang-glslang.dll"
-    "${RX_SLANG_TARGET_ROOT}/bin/slang-glsl-module.dll"
-    "${RX_SLANG_TARGET_ROOT}/bin/slang-rt.dll"
-  )
-else()
-  file(GLOB RX_SLANG_RUNTIME_LIBS
-    "${RX_SLANG_TARGET_ROOT}/lib/libslang-compiler.so*"
-    "${RX_SLANG_TARGET_ROOT}/lib/libslang-glslang-*.so"
-    "${RX_SLANG_TARGET_ROOT}/lib/libslang-glsl-module-*.so"
-    "${RX_SLANG_TARGET_ROOT}/lib/libslang-rt.so*"
-  )
-endif()
-if(NOT RX_SLANG_RUNTIME_LIBS)
-  message(FATAL_ERROR
-    "[sample_02_hotreload] No Slang runtime libraries found under "
-    "'${RX_SLANG_TARGET_ROOT}' -- see src/rx_shader/CMakeLists.txt's "
-    "identical check for context.")
-endif()
+# Used to need a local re-glob workaround here: an unqualified variable
+# reference inside a CMake function body resolves through the *calling*
+# scope, not the function's *definition* scope, so the function's old
+# reference to a plain, non-CACHE `RX_SLANG_RUNTIME_LIBS` (file(GLOB)'d in
+# rx_shader/CMakeLists.txt's own directory scope) resolved to nothing here.
+# Fixed properly in src/rx_shader/CMakeLists.txt (Task 6): the function now
+# re-globs internally using the CACHE-INTERNAL `RX_SLANG_TARGET_ROOT`
+# (visible in any directory scope), so every caller -- this one included --
+# just calls it below with nothing to set up first.
 
 add_executable(sample_02_hotreload main.cpp)
 target_link_libraries(sample_02_hotreload PRIVATE rx_rhi_vk rx_platform rx_shader)

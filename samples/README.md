@@ -166,6 +166,71 @@ fail immediately. A redistributed copy of just this sample's build-output
 directory (the binary + `hotreload.slang` + those runtime libraries) runs
 identically outside the build tree.
 
+## 03_bindless_mesh
+
+`samples/03_bindless_mesh/main.cpp` — the Phase 2 integration proof:
+reflection-driven pipeline layouts, bindless resource management, and the
+real upload path, all working together in one scene. Procedural geometry
+(a cube, a UV sphere, and a plane — generated in code, no mesh importer)
+textured with 4 procedurally generated images (checkerboards/gradients)
+plus one real PNG decoded via `stb_image`, every texture uploaded through
+`rx::rhi::Uploader` into one `rx::rhi::BindlessTable` (set 0). Just like
+02_hotreload, the shader is compiled **at runtime** (`rx::shader::Compiler`)
+so `rx::shader::reflect()` walks the actual shader driving this sample's
+pipeline layout — there is no hand-typed `VkDescriptorSetLayoutBinding`
+anywhere in this file for set 0.
+
+**Set-0 substitution**: `rx::rhi::BindlessTable`'s real descriptor set
+layout (sized from caller capacities, `VARIABLE_DESCRIPTOR_COUNT` on its
+last binding) and a from-scratch layout `PipelineLayoutBuilder` would
+otherwise build from the same reflected shape are NOT compatible Vulkan
+pipeline layouts "by construction" — this sample is what exercises the fix
+added this task: `PipelineLayoutBuilder::build()`'s new `externalSet0`
+parameter, passed `bindlessTable.descriptorSetLayout()` directly, reuses
+the table's real layout for set 0 instead of building a lookalike.
+
+Per-draw push constants (12 bytes, well under the 128-byte budget):
+`{ transformIndex, textureIndex, samplerIndex }` — all three uniform
+across a draw call, never wrapped in `NonUniformResourceIndex()`. A depth
+buffer (`rx::rhi::Texture2D`, `VK_FORMAT_D32_SFLOAT`, single mip level,
+never uploaded to) enables correct depth testing across the 5 objects.
+
+- **Headless (default, no flags)** — renders one frame offscreen at
+  256x256 with the camera at a fixed, known pose, reads it back, and
+  asserts at least 3 distinct texture colors landed on screen at known
+  probe positions (in practice all 5 textures are distinct and probed).
+  Registered as the `sample_03_bindless_mesh_headless` ctest case.
+- **`--present`** — opens a real window showing the same 5 objects (2
+  cubes, 2 spheres, 1 plane) with the camera continuously orbiting the
+  scene. Survives window resizes (the depth buffer is recreated alongside
+  the swapchain). Not part of `ctest` — see `MANUAL_VERIFICATION.md`.
+
+### Expected output
+
+**Headless mode**:
+
+```
+[info] 5 distinct texture colors found among 5 probes
+[info] bindless mesh headless gate PASSED
+```
+
+**`--present` mode** opens a 900x700 window titled `rx_bindless_mesh_sample
+(--present)` showing 5 objects in a row against a dark background: a
+red/white checkerboard cube, a blue-to-green gradient cube, a yellow/blue
+checkerboard sphere, a magenta-to-cyan gradient sphere, and a plane
+textured with a real decoded PNG (an orange/teal concentric-ring pattern).
+The camera orbits continuously; closing the window exits with status 0.
+
+### Redistribution
+
+Same mechanism as 02_hotreload: this sample compiles its shader at runtime
+(`rx_shader_deploy_runtime_libs()` ships the Slang runtime libs next to the
+binary), plus its own `texture.png` deployed next to the binary at build
+time (`samples/03_bindless_mesh/CMakeLists.txt`) for the one real-PNG
+texture. A redistributed copy of just this sample's build-output directory
+(binary + `texture.png` + the Slang runtime libraries) runs identically
+outside the build tree.
+
 ## Building and running
 
 Both sample modes and both build presets work identically on Linux and
@@ -197,6 +262,14 @@ cmake --build --preset linux-native
 ./build/linux-native/samples/02_hotreload/sample_02_hotreload --present
 ```
 
+```sh
+# Headless correctness gate (also runs via ctest, see below):
+./build/linux-native/samples/03_bindless_mesh/sample_03_bindless_mesh
+
+# Interactive present-mode window with an orbiting camera:
+./build/linux-native/samples/03_bindless_mesh/sample_03_bindless_mesh --present
+```
+
 Steam Deck Desktop Mode: open Konsole (or any terminal) from the Desktop
 Mode taskbar and run the exact same commands above — the Deck's SteamOS is
 Linux with a Vulkan driver (AMD Mesa RADV), so `linux-native` is the correct
@@ -212,8 +285,9 @@ cmake --preset windows-cross-zig
 cmake --build --preset windows-cross-zig
 ```
 
-This produces `build/windows-cross-zig/samples/01_triangle/sample_01_triangle.exe`
-and `build/windows-cross-zig/samples/02_hotreload/sample_02_hotreload.exe`.
+This produces `build/windows-cross-zig/samples/01_triangle/sample_01_triangle.exe`,
+`build/windows-cross-zig/samples/02_hotreload/sample_02_hotreload.exe`, and
+`build/windows-cross-zig/samples/03_bindless_mesh/sample_03_bindless_mesh.exe`.
 01_triangle's binary is statically linked (no separate `.dll`s to ship) —
 copy just that one `.exe` to the Windows machine (or run it directly under
 Wine on Linux) and run it from a terminal/`cmd.exe`/PowerShell:
@@ -237,6 +311,17 @@ sample_02_hotreload.exe            REM headless correctness gate
 sample_02_hotreload.exe --present  REM interactive present-mode window with live editing
 ```
 
+03_bindless_mesh is the same shape as 02_hotreload (real in-process Slang
+compilation, so it needs the same 4 Slang DLLs deployed next to it), plus
+`texture.png` for its one real-PNG texture. Copy the entire
+`build/windows-cross-zig/samples/03_bindless_mesh/` directory (minus the
+`CMakeFiles`/`.pdb`/`.cmake` build bookkeeping) to run it elsewhere:
+
+```
+sample_03_bindless_mesh.exe            REM headless correctness gate
+sample_03_bindless_mesh.exe --present  REM interactive present-mode window, orbiting camera
+```
+
 See `MANUAL_VERIFICATION.md` at the repo root for the actual per-platform
 run checklist (what to record, what "pass" looks like on real hardware).
 
@@ -246,8 +331,9 @@ run checklist (what to record, what "pass" looks like on real hardware).
 ctest --preset linux-native --output-on-failure
 ```
 
-This runs `sample_01_triangle_headless` and `sample_02_hotreload_headless`
-alongside every other project test (`rx_core_tests`, `rx_platform_tests`,
-`rx_shader_tests`, `rx_rhi_vk_tests`, `shader_spirv_test`) — `--present`
-mode is intentionally excluded from `ctest` (it blocks on a real window and
-user/OS interaction) and is exercised manually instead.
+This runs `sample_01_triangle_headless`, `sample_02_hotreload_headless`, and
+`sample_03_bindless_mesh_headless` alongside every other project test
+(`rx_core_tests`, `rx_platform_tests`, `rx_shader_tests`, `rx_rhi_vk_tests`,
+`shader_spirv_test`) — `--present` mode is intentionally excluded from
+`ctest` (it blocks on a real window and user/OS interaction) and is
+exercised manually instead.

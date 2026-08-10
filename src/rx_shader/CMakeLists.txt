@@ -90,37 +90,16 @@ target_link_libraries(rx_shader PUBLIC rx_core slang::slang rx_shader_layout_typ
 # (the CPU/host JIT backend, irrelevant to SPIR-V-only use) or gfx (the
 # deprecated GFX layer) [spec Fixed decision #11].
 #
-# Globbed rather than hardcoded to the pinned version string: the Linux
-# filenames embed the Slang version (e.g. "libslang-compiler.so.0.2026.14.1"),
-# and Slang's own release history has changed archive layout/naming before
-# [R:A6] -- glob patterns tolerate a version bump without needing an edit
-# here, matching the same "verify the layout, don't assume paths" posture
+# Globbed (inside rx_shader_deploy_runtime_libs() itself, below) rather
+# than hardcoded to the pinned version string: the Linux filenames embed
+# the Slang version (e.g. "libslang-compiler.so.0.2026.14.1"), and Slang's
+# own release history has changed archive layout/naming before [R:A6] --
+# glob patterns tolerate a version bump without needing an edit here,
+# matching the same "verify the layout, don't assume paths" posture
 # fetch_slang.cmake already takes with its sentinel-file check. The
 # Windows names carry no version suffix (verified directly against the
 # real archive), so those are exact.
-if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
-  file(GLOB RX_SLANG_RUNTIME_LIBS
-    "${RX_SLANG_TARGET_ROOT}/bin/slang-compiler.dll"
-    "${RX_SLANG_TARGET_ROOT}/bin/slang-glslang.dll"
-    "${RX_SLANG_TARGET_ROOT}/bin/slang-glsl-module.dll"
-    "${RX_SLANG_TARGET_ROOT}/bin/slang-rt.dll"
-  )
-else()
-  file(GLOB RX_SLANG_RUNTIME_LIBS
-    "${RX_SLANG_TARGET_ROOT}/lib/libslang-compiler.so*"
-    "${RX_SLANG_TARGET_ROOT}/lib/libslang-glslang-*.so"
-    "${RX_SLANG_TARGET_ROOT}/lib/libslang-glsl-module-*.so"
-    "${RX_SLANG_TARGET_ROOT}/lib/libslang-rt.so*"
-  )
-endif()
-
-if(NOT RX_SLANG_RUNTIME_LIBS)
-  message(FATAL_ERROR
-    "[rx_shader] No Slang runtime libraries found under '${RX_SLANG_TARGET_ROOT}' "
-    "-- fetch_slang.cmake's archive layout assumption may be stale; inspect "
-    "that tree before continuing.")
-endif()
-
+#
 # Deploys the Slang runtime libs above next to `target`, and points its
 # RPATH (Linux/ELF only -- CMake ignores RPATH properties on Windows, so
 # this is unconditional and harmless there) at its own directory rather
@@ -135,13 +114,50 @@ endif()
 # proves the redistribution-relevant mechanism (copy-adjacent + relative
 # RPATH), not merely that the original fetch directory still happens to be
 # on disk.
+#
+# DIRECTORY-SCOPE FIX (Task 6, tracked since Task 5's review): this used to
+# reference the plain, non-CACHE `RX_SLANG_RUNTIME_LIBS` variable
+# file(GLOB)'d above, in THIS listfile's own directory scope. A CMake
+# function body resolves an unqualified variable through the *calling*
+# scope, not its *definition* scope -- verified directly (see Task 5's own
+# finding) -- so calling this function from a sibling directory (any
+# samples/*/CMakeLists.txt) resolved to nothing there, and
+# samples/02_hotreload/CMakeLists.txt had to re-glob the identical pattern
+# itself as a local workaround just to give this function's
+# add_custom_command something to copy. Re-globbing inside the function
+# body itself, using the already-CACHE-INTERNAL `RX_SLANG_TARGET_ROOT`
+# (visible in any scope, unlike the old plain `RX_SLANG_RUNTIME_LIBS`),
+# closes this for good: every caller, in any directory, now gets a fresh,
+# correct glob with no re-globbing workaround required on their end.
 function(rx_shader_deploy_runtime_libs target)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    file(GLOB _rx_shader_runtime_libs
+      "${RX_SLANG_TARGET_ROOT}/bin/slang-compiler.dll"
+      "${RX_SLANG_TARGET_ROOT}/bin/slang-glslang.dll"
+      "${RX_SLANG_TARGET_ROOT}/bin/slang-glsl-module.dll"
+      "${RX_SLANG_TARGET_ROOT}/bin/slang-rt.dll"
+    )
+  else()
+    file(GLOB _rx_shader_runtime_libs
+      "${RX_SLANG_TARGET_ROOT}/lib/libslang-compiler.so*"
+      "${RX_SLANG_TARGET_ROOT}/lib/libslang-glslang-*.so"
+      "${RX_SLANG_TARGET_ROOT}/lib/libslang-glsl-module-*.so"
+      "${RX_SLANG_TARGET_ROOT}/lib/libslang-rt.so*"
+    )
+  endif()
+  if(NOT _rx_shader_runtime_libs)
+    message(FATAL_ERROR
+      "[rx_shader_deploy_runtime_libs] No Slang runtime libraries found under "
+      "'${RX_SLANG_TARGET_ROOT}' for target '${target}' -- fetch_slang.cmake's "
+      "archive layout assumption may be stale; inspect that tree before continuing.")
+  endif()
+
   set_target_properties(${target} PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
     INSTALL_RPATH "$ORIGIN"
   )
   add_custom_command(TARGET ${target} POST_BUILD
-    COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_SLANG_RUNTIME_LIBS} "$<TARGET_FILE_DIR:${target}>"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${_rx_shader_runtime_libs} "$<TARGET_FILE_DIR:${target}>"
     COMMENT "rx_shader: copying Slang runtime libraries next to $<TARGET_FILE_NAME:${target}>"
     VERBATIM
   )

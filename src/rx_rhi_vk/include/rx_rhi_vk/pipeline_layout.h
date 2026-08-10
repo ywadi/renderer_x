@@ -27,7 +27,16 @@ class PipelineLayoutBuilder;
 // for vkCreateGraphicsPipelines/vkCmdBindDescriptorSets'
 // firstSet/pDescriptorSets bookkeeping, `setLayouts` for allocating actual
 // VkDescriptorSets against each one. Callers must not destroy either
-// themselves -- this bundle owns both.
+// themselves -- this bundle owns both, WITH ONE DOCUMENTED EXCEPTION: when
+// `build()` was called with a non-null `externalSet0` (see that function's
+// comment), `setLayouts[0]` is that caller-supplied handle, not one this
+// bundle created -- this bundle never destroys it (on destruction or
+// move-assignment) and the original caller remains solely responsible for
+// its lifetime, which by construction outlives every use of it here (Task
+// 6's BindlessTable instance, e.g., outlives every pipeline built against
+// its `descriptorSetLayout()`). Every OTHER entry in `setLayouts` (index 1+
+// always, index 0 too when no external layout was supplied) is owned and
+// destroyed by this bundle exactly as before.
 struct PipelineLayoutBundle {
     std::vector<VkDescriptorSetLayout> setLayouts;
     VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -47,6 +56,11 @@ private:
     void destroyAll();
 
     VkDevice device_ = VK_NULL_HANDLE;
+
+    // True iff setLayouts[0] is the caller-supplied `externalSet0` handle
+    // from build() -- see the class comment above. destroyAll() skips
+    // index 0 when this is true.
+    bool externalSet0_ = false;
 };
 
 // Turns a shader's reflected ShaderLayoutInfo (rx_shader's reflect() output
@@ -99,7 +113,51 @@ public:
     // std::nullopt if any underlying vkCreateDescriptorSetLayout/
     // vkCreatePipelineLayout call fails, cleaning up every handle already
     // created in that same call first.
-    static std::optional<PipelineLayoutBundle> build(VkDevice device, const rx::shader::ShaderLayoutInfo& layoutInfo);
+    //
+    // EXTERNAL SET-0 SUBSTITUTION -- added this task, closing the gap Task
+    // 3's review found: this builder used to always create its own set-0
+    // layout from `layoutInfo` alone, sized to `kUnboundedArrayDescriptorCapacity`
+    // with no VARIABLE_DESCRIPTOR_COUNT flag -- structurally incompatible
+    // with rx::rhi::BindlessTable's real set-0 layout (built from caller
+    // capacities, VARIABLE_DESCRIPTOR_COUNT on its last binding). A shader
+    // reflecting a bindless-shaped set 0 (unbounded Texture2D/SamplerState/
+    // StructuredBuffer arrays at bindings 0/1/2 -- exactly BindlessTable's
+    // own fixed scheme, `BindlessTable::kSampledImageBinding` etc.) needs
+    // its VkPipelineLayout's set 0 to be the ACTUAL BindlessTable it will
+    // bind at draw time, not a lookalike this builder invented.
+    //
+    // When `externalSet0` is non-null: this builder does NOT create a set-0
+    // layout at all -- `externalSet0` becomes `setLayouts[0]` verbatim,
+    // NOT owned by the returned bundle (see PipelineLayoutBundle's own
+    // comment: the caller, e.g. a BindlessTable that outlives every
+    // pipeline built against it, remains solely responsible for destroying
+    // it). Before doing so, this still validates that `layoutInfo`'s own
+    // set-0 bindings (if any) are a subset-compatible SHAPE for that
+    // substitution to be sound: every set-0 binding's number must be one of
+    // BindlessTable's three fixed slots (kSampledImageBinding/
+    // kSamplerBinding/kStorageBufferBinding) with EXACTLY that slot's
+    // descriptor type (a mismatch -- e.g. a shader declaring a
+    // VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER at binding 0, where the bindless
+    // table's binding 0 is always VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE -- is
+    // rejected), and any binding declaring a bounded (non-unbounded) count
+    // must stay within `kUnboundedArrayDescriptorCapacity` (this builder
+    // cannot see the real external layout's actual per-binding capacity
+    // through an opaque VkDescriptorSetLayout handle -- Vulkan exposes no
+    // "describe this layout back to me" API -- so this is a generic sanity
+    // ceiling, not a check against BindlessTable's specific instance
+    // capacities). A shader is free to use a strict subset of the three
+    // slots (e.g. images + samplers only, no storage buffers) -- that is
+    // exactly the "subset-compatible" the brief asks for, not an exact-set
+    // match. This is a host-side, pre-pipeline-creation sanity gate with a
+    // clear logged reason on failure; it does not replace (and is narrower
+    // than) whatever `vkCreateGraphicsPipelines` validation itself checks
+    // against the real bound descriptor set's SPIR-V-declared shape.
+    //
+    // Set indices 1+ (and set 0 too, when `externalSet0` is
+    // VK_NULL_HANDLE, the default) are entirely unaffected -- built exactly
+    // as before.
+    static std::optional<PipelineLayoutBundle> build(VkDevice device, const rx::shader::ShaderLayoutInfo& layoutInfo,
+                                                       VkDescriptorSetLayout externalSet0 = VK_NULL_HANDLE);
 };
 
 }  // namespace rx::rhi

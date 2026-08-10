@@ -1,4 +1,5 @@
 #include <doctest/doctest.h>
+#include <rx_rhi_vk/bindless.h>
 #include <rx_rhi_vk/context.h>
 #include <rx_rhi_vk/pipeline_layout.h>
 #include <VkBootstrap.h>
@@ -36,10 +37,16 @@ namespace {
 // requirement (REQUIRE, no skip-guard) rather than an environment-
 // dependent capability, matching clear_color_test.cpp's own headless
 // pattern rather than device_test.cpp's windowed-skip one.
+//
+// `physicalDevice` was added this task (Task 6) alongside the two
+// external-set-0 tests below, which need a real rx::rhi::BindlessTable
+// (BindlessTable::create() takes a VkPhysicalDevice) -- the two
+// pre-existing tests above never needed it.
 struct HeadlessDescriptorIndexingDevice {
     rx::rhi::Context context;
     vkb::Device vkbDevice;
     VkDevice device;
+    VkPhysicalDevice physicalDevice;
 };
 
 HeadlessDescriptorIndexingDevice makeHeadlessDescriptorIndexingDevice() {
@@ -74,7 +81,12 @@ HeadlessDescriptorIndexingDevice makeHeadlessDescriptorIndexingDevice() {
     vkb::Device vkbDevice = deviceResult.value();
     volkLoadDevice(vkbDevice.device);
 
-    return HeadlessDescriptorIndexingDevice{std::move(*context), vkbDevice, vkbDevice.device};
+    return HeadlessDescriptorIndexingDevice{std::move(*context), vkbDevice, vkbDevice.device,
+                                             vkbDevice.physical_device.physical_device};
+}
+
+rx::rhi::BindlessTable::Capacities makeTestBindlessCapacities() {
+    return rx::rhi::BindlessTable::Capacities{/*sampledImages=*/1024, /*samplers=*/16, /*storageBuffers=*/256};
 }
 
 // Mirrors rx_shader's reflection_test.cpp `kLayoutTestSource` shape exactly
@@ -163,6 +175,162 @@ TEST_CASE("PipelineLayoutBuilder::build rejects a >128-byte push constant footpr
 
     auto bundle = rx::rhi::PipelineLayoutBuilder::build(headless.device, oversized);
     CHECK_FALSE(bundle.has_value());
+
+    vkDeviceWaitIdle(headless.device);
+    vkb::destroy_device(headless.vkbDevice);
+    CHECK_FALSE(headless.context.hasValidationErrors());
+}
+
+// --- External set-0 substitution (Task 6) -----------------------------
+//
+// Closes the gap Task 3's review found: BindlessTable's real set-0 layout
+// (capacities-sized, VARIABLE_DESCRIPTOR_COUNT on its last binding) and
+// this builder's own from-scratch set-0 layout (always
+// kUnboundedArrayDescriptorCapacity, no VARIABLE_DESCRIPTOR_COUNT flag) are
+// NOT compatible pipeline layouts "by construction" -- build()'s new
+// `externalSet0` parameter lets a caller substitute the real handle in
+// directly instead. These two tests are the "focused unit test (mismatched-
+// type rejection + happy path)" the Task 6 brief requires.
+
+TEST_CASE("PipelineLayoutBuilder::build with an external set-0 layout: happy path reuses the caller's exact "
+          "VkDescriptorSetLayout for set 0 and validates a subset-compatible reflected shape") {
+    HeadlessDescriptorIndexingDevice headless = makeHeadlessDescriptorIndexingDevice();
+
+    {
+        auto table = rx::rhi::BindlessTable::create(headless.physicalDevice, headless.device,
+                                                      makeTestBindlessCapacities());
+        REQUIRE(table.has_value());
+
+        // A reflected shape using two of BindlessTable's three fixed slots
+        // (images + samplers) -- deliberately a STRICT SUBSET, not an
+        // exact match, per the brief's "subset-compatible shape" wording:
+        // a shader need not touch every bindless resource class to be
+        // substitution-compatible with the table that provides all three.
+        rx::shader::ShaderLayoutInfo info;
+
+        rx::shader::ShaderLayoutInfo::Binding images;
+        images.set = 0;
+        images.binding = rx::rhi::BindlessTable::kSampledImageBinding;
+        images.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        images.stages = VK_SHADER_STAGE_FRAGMENT_BIT;
+        images.unboundedArray = true;
+        info.bindings.push_back(images);
+
+        rx::shader::ShaderLayoutInfo::Binding samplers;
+        samplers.set = 0;
+        samplers.binding = rx::rhi::BindlessTable::kSamplerBinding;
+        samplers.type = VK_DESCRIPTOR_TYPE_SAMPLER;
+        samplers.stages = VK_SHADER_STAGE_FRAGMENT_BIT;
+        samplers.unboundedArray = true;
+        info.bindings.push_back(samplers);
+
+        // A per-draw push range alongside the substituted set 0 -- proves
+        // push constants keep working unmodified.
+        rx::shader::ShaderLayoutInfo::PushRange pushRange;
+        pushRange.stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        pushRange.offset = 0;
+        pushRange.size = 12;
+        info.pushRanges.push_back(pushRange);
+
+        auto bundle = rx::rhi::PipelineLayoutBuilder::build(headless.device, info, table->descriptorSetLayout());
+        REQUIRE(bundle.has_value());
+        REQUIRE(bundle->setLayouts.size() == 1);
+        // The exact handle, not a lookalike this builder created itself --
+        // the entire point of the substitution.
+        CHECK(bundle->setLayouts[0] == table->descriptorSetLayout());
+        CHECK(bundle->layout != VK_NULL_HANDLE);
+    }
+
+    // `table`'s descriptor set layout must still be alive when `bundle`
+    // above is destroyed (bundle must not touch it -- see
+    // PipelineLayoutBundle's ownership comment); it goes out of scope
+    // here, after `bundle` already has (reverse declaration order), so
+    // this also exercises that destroyAll() genuinely skipped it.
+    vkDeviceWaitIdle(headless.device);
+    vkb::destroy_device(headless.vkbDevice);
+    CHECK_FALSE(headless.context.hasValidationErrors());
+}
+
+TEST_CASE("PipelineLayoutBuilder::build with an external set-0 layout: rejects a reflected set-0 binding whose "
+          "descriptor type doesn't match the external bindless-table layout's shape") {
+    HeadlessDescriptorIndexingDevice headless = makeHeadlessDescriptorIndexingDevice();
+
+    {
+        auto table = rx::rhi::BindlessTable::create(headless.physicalDevice, headless.device,
+                                                      makeTestBindlessCapacities());
+        REQUIRE(table.has_value());
+
+        // Binding number 0 matches BindlessTable::kSampledImageBinding, but
+        // the declared type (UNIFORM_BUFFER) does not match that slot's
+        // real type (SAMPLED_IMAGE) -- the mismatched-type case build()
+        // must reject before ever touching `externalSet0`.
+        rx::shader::ShaderLayoutInfo info;
+        rx::shader::ShaderLayoutInfo::Binding wrongType;
+        wrongType.set = 0;
+        wrongType.binding = rx::rhi::BindlessTable::kSampledImageBinding;
+        wrongType.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        wrongType.count = 1;
+        wrongType.stages = VK_SHADER_STAGE_FRAGMENT_BIT;
+        info.bindings.push_back(wrongType);
+
+        auto bundle = rx::rhi::PipelineLayoutBuilder::build(headless.device, info, table->descriptorSetLayout());
+        CHECK_FALSE(bundle.has_value());
+    }
+
+    vkDeviceWaitIdle(headless.device);
+    vkb::destroy_device(headless.vkbDevice);
+    CHECK_FALSE(headless.context.hasValidationErrors());
+}
+
+TEST_CASE("PipelineLayoutBuilder::build with an external set-0 layout: rejects a set-0 binding number with no "
+          "counterpart in the bindless-table shape") {
+    HeadlessDescriptorIndexingDevice headless = makeHeadlessDescriptorIndexingDevice();
+
+    {
+        auto table = rx::rhi::BindlessTable::create(headless.physicalDevice, headless.device,
+                                                      makeTestBindlessCapacities());
+        REQUIRE(table.has_value());
+
+        // Binding 7 has no counterpart in BindlessTable's fixed 0/1/2
+        // scheme at all, regardless of its declared type.
+        rx::shader::ShaderLayoutInfo info;
+        rx::shader::ShaderLayoutInfo::Binding unknownBinding;
+        unknownBinding.set = 0;
+        unknownBinding.binding = 7;
+        unknownBinding.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        unknownBinding.unboundedArray = true;
+        info.bindings.push_back(unknownBinding);
+
+        auto bundle = rx::rhi::PipelineLayoutBuilder::build(headless.device, info, table->descriptorSetLayout());
+        CHECK_FALSE(bundle.has_value());
+    }
+
+    vkDeviceWaitIdle(headless.device);
+    vkb::destroy_device(headless.vkbDevice);
+    CHECK_FALSE(headless.context.hasValidationErrors());
+}
+
+TEST_CASE("PipelineLayoutBuilder::build with an external set-0 layout: wires set 0 to the external handle even "
+          "when the shader reflects zero set-0 bindings") {
+    HeadlessDescriptorIndexingDevice headless = makeHeadlessDescriptorIndexingDevice();
+
+    {
+        auto table = rx::rhi::BindlessTable::create(headless.physicalDevice, headless.device,
+                                                      makeTestBindlessCapacities());
+        REQUIRE(table.has_value());
+
+        // A shader that declares no descriptor bindings at all (e.g. one
+        // that only ever indexes the bindless table via a push-constant
+        // index into a set it happens to share globally) is still a valid,
+        // if degenerate, subset -- setCount must still reach 1 so set 0
+        // gets wired to `externalSet0`.
+        rx::shader::ShaderLayoutInfo info;
+
+        auto bundle = rx::rhi::PipelineLayoutBuilder::build(headless.device, info, table->descriptorSetLayout());
+        REQUIRE(bundle.has_value());
+        REQUIRE(bundle->setLayouts.size() == 1);
+        CHECK(bundle->setLayouts[0] == table->descriptorSetLayout());
+    }
 
     vkDeviceWaitIdle(headless.device);
     vkb::destroy_device(headless.vkbDevice);
