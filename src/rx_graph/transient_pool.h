@@ -78,6 +78,16 @@ struct PooledImage {
     // actually left the resource doing.
     VkPipelineStageFlags2 lastFrameFinalStages = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 
+    // WRITE-access companion to lastFrameFinalStages: the union of write
+    // accesses the prior execute() left un-flushed on this entry. The
+    // next call's first-use (UNDEFINED-discard) barrier must carry these
+    // in srcAccessMask -- execution ordering alone does not make a prior
+    // frame's final writes AVAILABLE, and a discard transition over
+    // pending writes is a write-after-write hazard (surfaced by
+    // synchronization validation's cross-submission tracking). Starts at
+    // MEMORY_WRITE to mirror ALL_COMMANDS' conservatism.
+    VkAccessFlags2 lastFrameFinalAccess = VK_ACCESS_2_MEMORY_WRITE_BIT;
+
     // Executor's own monotonic frame counter (one tick per execute() call)
     // as of the last time this entry was claimed by a realize() call OR
     // touched by an execute() call -- whichever happened more recently.
@@ -96,6 +106,8 @@ struct PooledBuffer {
     std::optional<rx::rhi::Buffer> buffer;
 
     VkPipelineStageFlags2 lastFrameFinalStages = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    // See PooledImage::lastFrameFinalAccess -- same availability contract.
+    VkAccessFlags2 lastFrameFinalAccess = VK_ACCESS_2_MEMORY_WRITE_BIT;
     uint64_t lastUsedFrame = 0;
 };
 

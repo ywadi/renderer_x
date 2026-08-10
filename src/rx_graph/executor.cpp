@@ -71,6 +71,14 @@ VkExtent2D toExtent(const AttachmentDesc& attachment) {
 // compile()'s own device-free buildBarriers() correctly never emits -- see
 // synthesizeFirstUseBufferBarrierIfNeeded()'s own comment just below for
 // why that gap is real, not hypothetical.
+// Access bits that constitute WRITES for the pool's cross-frame
+// availability tracking (lastFrameFinalAccess) -- read bits are
+// meaningless in a srcAccessMask and are masked out at accumulation.
+constexpr VkAccessFlags2 kPoolWriteAccessMask =
+    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+    VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
+    VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+
 struct CombinedAccess {
     VkPipelineStageFlags2 stages = 0;
     VkAccessFlags2 access = 0;
@@ -190,15 +198,35 @@ void applyBarriers(Executor::Impl& impl, const CompiledGraph& compiled, VkComman
         const ResolvedResource& resolved = impl.resources.at(b.physicalIndex);
 
         VkPipelineStageFlags2 srcStage = b.srcStage;
+        VkAccessFlags2 srcAccess = b.srcAccess;
         if (!resolved.isBackbuffer && !firstBarrierSeen[b.physicalIndex]) {
             srcStage = impl.pool.image(resolved.poolIndex).lastFrameFinalStages;
+            // Make the prior frame's final writes AVAILABLE before this
+            // frame's discard transition (execution ordering alone does
+            // not flush caches -- see PooledImage::lastFrameFinalAccess).
+            srcAccess = impl.pool.image(resolved.poolIndex).lastFrameFinalAccess;
+        } else if (resolved.isBackbuffer && !firstBarrierSeen[b.physicalIndex] &&
+                   b.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+            // Backbuffer acquire chaining: when the backbuffer is a freshly
+            // acquired swapchain image, its first (UNDEFINED-discard) layout
+            // transition must be ordered AFTER the presentation engine's
+            // acquire read. A semaphore wait only orders the stages named in
+            // pWaitDstStageMask -- the contract with callers (all samples)
+            // is that the submission waits the acquire semaphore at
+            // COLOR_ATTACHMENT_OUTPUT, so this transition's srcStage must be
+            // that same stage, not the compile-time NONE (which races the
+            // acquire under synchronization validation's present-engine
+            // tracking, layers >= ~1.3.240). For offscreen backbuffers
+            // (tests) the extra execution-only dependency is trivially
+            // satisfied -- srcAccess stays 0 either way.
+            srcStage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
         }
         firstBarrierSeen[b.physicalIndex] = true;
 
         VkImageMemoryBarrier2 vkBarrier{};
         vkBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
         vkBarrier.srcStageMask = srcStage;
-        vkBarrier.srcAccessMask = b.srcAccess;
+        vkBarrier.srcAccessMask = srcAccess;
         vkBarrier.dstStageMask = b.dstStage;
         vkBarrier.dstAccessMask = b.dstAccess;
         vkBarrier.oldLayout = b.oldLayout;
@@ -220,15 +248,18 @@ void applyBarriers(Executor::Impl& impl, const CompiledGraph& compiled, VkComman
         const ResolvedResource& resolved = impl.resources.at(b.physicalIndex);
 
         VkPipelineStageFlags2 srcStage = b.srcStage;
+        VkAccessFlags2 srcAccess = b.srcAccess;
         if (!resolved.isBackbuffer && !firstBarrierSeen[b.physicalIndex]) {
             srcStage = impl.pool.buffer(resolved.poolIndex).lastFrameFinalStages;
+            // Same availability contract as the image path above.
+            srcAccess = impl.pool.buffer(resolved.poolIndex).lastFrameFinalAccess;
         }
         firstBarrierSeen[b.physicalIndex] = true;
 
         VkBufferMemoryBarrier2 vkBarrier{};
         vkBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
         vkBarrier.srcStageMask = srcStage;
-        vkBarrier.srcAccessMask = b.srcAccess;
+        vkBarrier.srcAccessMask = srcAccess;
         vkBarrier.dstStageMask = b.dstStage;
         vkBarrier.dstAccessMask = b.dstAccess;
         vkBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -292,7 +323,10 @@ void synthesizeFirstUseBufferBarrierIfNeeded(Executor::Impl& impl, const Compile
         VkBufferMemoryBarrier2 vkBarrier{};
         vkBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
         vkBarrier.srcStageMask = impl.pool.buffer(resolved.poolIndex).lastFrameFinalStages;
-        vkBarrier.srcAccessMask = VK_ACCESS_2_NONE;
+        // Prior-frame final writes must be made available here too -- the
+        // synthesized barrier exists precisely because this is a pooled
+        // buffer's true first access of the frame.
+        vkBarrier.srcAccessMask = impl.pool.buffer(resolved.poolIndex).lastFrameFinalAccess;
         vkBarrier.dstStageMask = combined.stages;
         vkBarrier.dstAccessMask = combined.access;
         vkBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -458,6 +492,7 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
     std::vector<bool> firstBarrierSeen(resources.size(), false);
     std::vector<bool> attachmentEverWritten(resources.size(), false);
     std::unordered_map<uint32_t, VkPipelineStageFlags2> finalStageThisExecute;
+    std::unordered_map<uint32_t, VkAccessFlags2> finalAccessThisExecute;
 
     const std::span<const uint32_t> order = compiled.executionOrder();
     const std::span<const PassBarriers> allBarriers = compiled.passBarriers();
@@ -617,6 +652,7 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
         for (const auto& [physIdx, combined] : combineAccessesByResource(accesses)) {
             if (!impl.resources.at(physIdx).isBackbuffer) {
                 finalStageThisExecute[physIdx] |= combined.stages;
+                finalAccessThisExecute[physIdx] |= combined.access & kPoolWriteAccessMask;
             }
         }
     }
@@ -630,11 +666,14 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
     // ALL_COMMANDS forever.
     for (const auto& [physIdx, stage] : finalStageThisExecute) {
         const ResolvedResource& resolvedRes = impl.resources.at(physIdx);
+        const VkAccessFlags2 access = finalAccessThisExecute[physIdx];
         if (resources[physIdx].isBuffer) {
             impl.pool.buffer(resolvedRes.poolIndex).lastFrameFinalStages = stage;
+            impl.pool.buffer(resolvedRes.poolIndex).lastFrameFinalAccess = access;
             impl.pool.touchBuffer(resolvedRes.poolIndex, impl.frameCounter);
         } else {
             impl.pool.image(resolvedRes.poolIndex).lastFrameFinalStages = stage;
+            impl.pool.image(resolvedRes.poolIndex).lastFrameFinalAccess = access;
             impl.pool.touchImage(resolvedRes.poolIndex, impl.frameCounter);
         }
     }

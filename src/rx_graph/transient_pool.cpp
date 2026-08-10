@@ -43,6 +43,7 @@ std::optional<uint32_t> TransientPool::acquireImage(VkFormat format, VkExtent2D 
     entry.samples = samples;
     entry.texture = std::move(*texture);
     entry.lastFrameFinalStages = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    entry.lastFrameFinalAccess = VK_ACCESS_2_MEMORY_WRITE_BIT;
     entry.lastUsedFrame = currentFrame;
 
     images_.push_back(std::move(entry));
@@ -80,6 +81,7 @@ std::optional<uint32_t> TransientPool::acquireBuffer(VkDeviceSize size, VkBuffer
     entry.usage = usage;
     entry.buffer = std::move(*buffer);
     entry.lastFrameFinalStages = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    entry.lastFrameFinalAccess = VK_ACCESS_2_MEMORY_WRITE_BIT;
     entry.lastUsedFrame = currentFrame;
 
     buffers_.push_back(std::move(entry));

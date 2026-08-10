@@ -132,7 +132,14 @@ TEST_CASE("Device acquire/present round-trip succeeds without device loss") {
     barrier.subresourceRange.baseArrayLayer = 0;
     barrier.subresourceRange.layerCount = 1;
 
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
+    // srcStage must be COLOR_ATTACHMENT_OUTPUT -- the same stage the submit
+    // below waits the acquire semaphore at. A semaphore wait only orders the
+    // waited stages (and logically-later ones) after the presentation
+    // engine's acquire read; a TOP_OF_PIPE-sourced layout transition is NOT
+    // ordered by that wait and races the acquire (flagged by
+    // synchronization validation's present-engine tracking, layers >= ~1.3.240).
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
                          nullptr, 0, nullptr, 1, &barrier);
 
     REQUIRE(vkEndCommandBuffer(cmd) == VK_SUCCESS);
