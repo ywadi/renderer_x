@@ -1,5 +1,7 @@
 #include <rx_shader/compiler.h>
 
+#include "detail/global_session_mutex.h"
+
 #include <rx_core/log.h>
 
 #include <filesystem>
@@ -10,19 +12,28 @@
 
 namespace rx::shader {
 
-namespace {
-
 // See the class comment on rx::shader::Compiler (compiler.h) for why this
 // is process-wide (one IGlobalSession, ever) rather than per-Compiler, and
 // why it is guarded by a mutex rather than left to Slang's own (nonexistent)
-// internal synchronization. Both statics have process lifetime: neither is
-// ever explicitly torn down, matching Slang's own guidance to create and
+// internal synchronization. The mutex itself has process lifetime and is
+// never explicitly torn down, matching Slang's own guidance to create and
 // reuse a single global session for as long as the application runs
 // [R:A4].
+//
+// Given external (not anonymous-namespace) linkage, unlike every other
+// helper in this file, specifically so reflection.cpp -- a second
+// translation unit in this same library -- can lock the exact same mutex
+// object before touching a linked program's reflection data (see
+// detail/global_session_mutex.h's comment for why that needs the same
+// lock as front-end compilation).
+namespace detail {
 std::mutex& globalSessionMutex() {
     static std::mutex mutex;
     return mutex;
 }
+}  // namespace detail
+
+namespace {
 
 Slang::ComPtr<slang::IGlobalSession>& sharedGlobalSession() {
     static Slang::ComPtr<slang::IGlobalSession> session;
@@ -101,7 +112,7 @@ CompileResult compileImpl(slang::ISession* session,
     CompileResult result;
     std::string diagnostics;
 
-    std::lock_guard<std::mutex> lock(globalSessionMutex());
+    std::lock_guard<std::mutex> lock(detail::globalSessionMutex());
 
     // slang_createBlob returns an already-owned (refcount 1) ISlangBlob*,
     // so attach rather than construct-with-addRef.
@@ -242,7 +253,7 @@ Compiler::Compiler(Slang::ComPtr<slang::ISession> session) : session_(std::move(
 std::optional<Compiler> Compiler::create() {
     rx::core::log::init();
 
-    std::lock_guard<std::mutex> lock(globalSessionMutex());
+    std::lock_guard<std::mutex> lock(detail::globalSessionMutex());
 
     Slang::ComPtr<slang::IGlobalSession>& global = sharedGlobalSession();
     if (global.get() == nullptr) {

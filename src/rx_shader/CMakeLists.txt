@@ -59,11 +59,25 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
   set_target_properties(slang::slang PROPERTIES IMPORTED_LOCATION_RELEASE "${_rx_slang_unversioned_so}")
 endif()
 
+# Slang-free boundary for Task 2's ShaderLayoutInfo: an INTERFACE (header-
+# only) target exposing ONLY this directory's include/ path, with ONLY
+# Vulkan::Headers as a dependency -- no slang::slang, no rx_core. rx_shader
+# itself links this (see below) so its own headers/tests see
+# shader_layout_info.h exactly as before; rx_rhi_vk's CMakeLists links THIS
+# target instead of `rx_shader` so PipelineLayoutBuilder can take a
+# `const rx::shader::ShaderLayoutInfo&` without pulling slang::slang (or any
+# other rx_shader header) into rx_rhi_vk's own headers or link interface --
+# see shader_layout_info.h's own comment for why that separation matters.
+add_library(rx_shader_layout_types INTERFACE)
+target_include_directories(rx_shader_layout_types INTERFACE include)
+target_link_libraries(rx_shader_layout_types INTERFACE Vulkan::Headers)
+
 add_library(rx_shader STATIC
     src/compiler.cpp
+    src/reflection.cpp
 )
 target_include_directories(rx_shader PUBLIC include)
-target_link_libraries(rx_shader PUBLIC rx_core slang::slang Vulkan::Headers)
+target_link_libraries(rx_shader PUBLIC rx_core slang::slang rx_shader_layout_types)
 
 # --- Runtime lib placement for any binary linking rx_shader -------------
 #
@@ -152,6 +166,7 @@ rx_shader_deploy_runtime_libs(rx_shader_link_smoketest)
 add_executable(rx_shader_tests
     tests/doctest_main.cpp
     tests/compiler_test.cpp
+    tests/reflection_test.cpp
 )
 target_link_libraries(rx_shader_tests PRIVATE rx_shader doctest::doctest)
 rx_shader_deploy_runtime_libs(rx_shader_tests)
