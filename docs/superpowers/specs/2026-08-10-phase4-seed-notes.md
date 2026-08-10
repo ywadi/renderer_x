@@ -165,6 +165,23 @@ and visible culling statistics.
     scheduled — the renderer's contract is a joint-matrix palette per
     skinned mesh per frame.
 
+15. **Render-graph history resources (user-directed 2026-08-10):** Phase 4
+    includes a bounded rx_graph core task adding the persistent resource
+    class: history declaration API (additive, addTextureInput-shaped),
+    load-instead-of-discard first-use semantics (barrier state machine
+    initialized with last-frame layout instead of UNDEFINED), a pinned
+    pool beside the transient pool (never recycled/aliased), ping-pong
+    handling under frames-in-flight, and a GPU test proving frame N's
+    write is read by frame N+1 through a declared history input with
+    zero validation errors. No Phase 4 feature consumes it — the test is
+    the consumer; the techniques phase's temporal cluster (TAA, motion
+    blur, upscalers) is the payoff. Rationale: zero dependencies on other
+    Phase 4 work, extends existing cross-frame machinery
+    (lastFrameFinalStages) while the graph's review scaffolding is
+    proven, and kills the design-coupling risk with future intra-frame
+    aliasing (which must treat persistence as first-class — sequencing
+    constraint recorded in the master registry).
+
 ## Carried process notes
 
 - Research pass before spec (library selection for glTF/KTX2 with
