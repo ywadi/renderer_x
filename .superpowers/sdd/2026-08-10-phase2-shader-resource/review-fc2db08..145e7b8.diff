@@ -1,0 +1,503 @@
+# Review package: fc2db08..145e7b8
+
+## Commits
+145e7b8 Phase 2 release fix wave: docs, streaming retry, buffer flush, log race
+
+## Files changed
+ README.md                                  | 10 ++--
+ samples/04_streaming/main.cpp              | 21 ++++++++
+ src/rx_core/src/log.cpp                    | 20 ++++---
+ src/rx_rhi_vk/include/rx_rhi_vk/buffer.h   | 11 ++--
+ src/rx_rhi_vk/src/buffer.cpp               |  8 ++-
+ src/rx_rhi_vk/src/mesh_buffers.cpp         | 17 ++++++
+ src/rx_shader/include/rx_shader/compiler.h | 27 ++++++++++
+ src/rx_shader/src/compiler.cpp             |  8 +++
+ src/rx_shader/tests/compiler_test.cpp      | 83 ++++++++++++++++++++++++++++++
+ 9 files changed, 191 insertions(+), 14 deletions(-)
+
+## Diff
+diff --git a/README.md b/README.md
+index d210ea0..879b79f 100644
+--- a/README.md
++++ b/README.md
+@@ -1,13 +1,13 @@
+ # RendererX
+ 
+-A from-scratch Vulkan 1.3 renderer for custom game engines. RendererX establishes a baseline of dynamic rendering and synchronization2 support, targets Steam Deck as the hardware floor, and cross-compiles from Linux to Windows via a vendored zig toolchain. Shaders are authored in Slang. Phase 1 status: foundation layers complete (toolchain → platform → RHI → first triangle sample).
++A from-scratch Vulkan 1.3 renderer for custom game engines. RendererX establishes a baseline of dynamic rendering and synchronization2 support, targets Steam Deck as the hardware floor, and cross-compiles from Linux to Windows via a vendored zig toolchain. Shaders are authored in Slang. Phase 2 status: Phase 1's foundation layers plus runtime Slang compilation and reflection, bindless resource management, and four samples (triangle, shader hot-reload, bindless mesh, texture streaming) are complete.
+ 
+ [![CI](https://github.com/ywadi/renderer_x/actions/workflows/ci.yml/badge.svg)](https://github.com/ywadi/renderer_x/actions/workflows/ci.yml)
+ 
+ ## Requirements
+ 
+ - **Linux host** (for building, including cross-compilation to Windows)
+ - **CMake** 3.21 or later
+ - **Ninja** (build generator)
+ - **Vulkan 1.3 driver** (on the machine running compiled binaries)
+ - **zig** 0.16.0 (vendored per-project at `toolchain/zig/zig`, installed via the one-time setup below — not required in PATH; the CMake toolchain locates it automatically)
+@@ -59,32 +59,36 @@ cmake --build --preset windows-cross-zig
+ The resulting Windows executable is statically linked — copy only `build/windows-cross-zig/samples/01_triangle/sample_01_triangle.exe` to a Windows machine and run it directly.
+ 
+ For detailed build and run instructions per platform, including Steam Deck and manual verification checklist, see [`samples/README.md`](samples/README.md).
+ 
+ ## Project Layout
+ 
+ - **cmake/** — Build system configuration, toolchain files (linux-native, windows-cross-zig), dependency caching
+ - **src/rx_core/** — Foundation library: math (GLM), logging (spdlog), memory, containers, handles
+ - **src/rx_platform/** — Platform abstraction: window (SDL3), input, events, threads
+ - **src/rx_rhi_vk/** — Vulkan 1.3 RHI: device/queue/swapchain, command buffers, pipelines, synchronization
++- **src/rx_shader/** — Runtime Slang-to-SPIR-V compilation and shader reflection (descriptor/push-constant layout)
+ - **shaders/** — Shader source files (Slang)
+ - **samples/01_triangle/** — Hardcoded white triangle via dynamic rendering, headless and present modes
++- **samples/02_hotreload/** — Fullscreen triangle with a runtime-compiled (Slang, not offline slangc) fragment shader and a reflection-driven pipeline layout; live shader hot-reload in present mode
++- **samples/03_bindless_mesh/** — Procedural meshes and textures driven entirely through one bindless descriptor table and a reflection-derived pipeline layout
++- **samples/04_streaming/** — Texture streaming into a fixed bindless residency budget, exercising deferred eviction/re-registration safety while frames are in flight
+ - **tools/** — Utilities: dependency cache, Slang prebuilt fetch, build-budget checker
+ - **third_party/** — Vendored dependencies (volk, vk-bootstrap, VMA, SDL3, GLM, spdlog)
+ 
+ ## Roadmap
+ 
+ **Phase 1 (complete):** Toolchain, platform abstraction, core library, RHI foundation, first triangle sample with both headless and present-mode rendering.
+ 
+-**Phase 2 (in progress):** Runtime Slang compilation and shader reflection; bindless descriptor design; additional samples and test coverage.
++**Phase 2 (complete):** Runtime Slang compilation and shader reflection (`src/rx_shader/`); bindless descriptor management (`rx::rhi::BindlessTable`); reflection-driven pipeline layouts; three new samples (02_hotreload, 03_bindless_mesh, 04_streaming) plus expanded test coverage; CI + packaging for all four samples.
+ 
+-**Phase 3 and beyond:** Render graph (declarative passes, automatic barriers); material system (IMaterial, IShaderModule, ITexture, IMesh); asset pipeline (mesh/texture import); scene submission (cameras, lights, culling); rendering techniques (shadows, post-processing, upscaling); tooling (GPU markers, profiling, validation). See [`docs/superpowers/specs/`](docs/superpowers/specs/) for design documents.
++**Phase 3 (in progress) and beyond:** Render graph (declarative passes, automatic barriers); material system (IMaterial, IShaderModule, ITexture, IMesh); asset pipeline (mesh/texture import); scene submission (cameras, lights, culling); rendering techniques (shadows, post-processing, upscaling); tooling (GPU markers, profiling, validation). See [`docs/superpowers/specs/`](docs/superpowers/specs/) for design documents.
+ 
+ ## Testing
+ 
+ Run the full test suite (including headless triangle correctness gate):
+ 
+ ```sh
+ ctest --preset linux-native --output-on-failure
+ ```
+ 
+ The suite includes unit tests for rx_core, rx_platform, rx_rhi_vk, shader compilation, and the headless triangle sample. Interactive `--present` mode is tested manually; see [`MANUAL_VERIFICATION.md`](MANUAL_VERIFICATION.md).
+diff --git a/samples/04_streaming/main.cpp b/samples/04_streaming/main.cpp
+index 950e6e6..bdc431c 100644
+--- a/samples/04_streaming/main.cpp
++++ b/samples/04_streaming/main.cpp
+@@ -926,22 +926,43 @@ bool evictOldestAndStreamInNext(VkPhysicalDevice physicalDevice, VkDevice device
+     scene.deletionQueue.retire(
+         [scenePtr, victimTexture, incomingTexture, incoming]() {
+             // victimTexture's Texture2D is destroyed as an ordinary side
+             // effect of this closure (and its captured shared_ptr) being
+             // destroyed once DeletionQueue removes this entry -- nothing
+             // to do here for it explicitly, same pattern as every other
+             // retire() call in this codebase.
+             auto handle = scenePtr->bindlessTable.registerSampledImage(incomingTexture->view(),
+                                                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+             if (!handle.isValid()) {
++                // DOCUMENTED ACCEPTANCE: this is effectively unreachable,
++                // not merely rare. createScene() sizes
++                // BindlessTable::Capacities::sampledImages at 16 (see its
++                // own comment below), while this sample's steady state
++                // only ever needs kResidentBudget=8 resident slots PLUS,
++                // at most, the one in-flight registration this very
++                // callback is attempting -- 9 of 16 slots occupied at
++                // once, with 7 slots of permanent headroom the eviction
++                // loop never approaches. There is no static assert tying
++                // BindlessTable's runtime capacity to kResidentBudget,
++                // though, so "effectively unreachable" is not "provably
++                // impossible" -- handle it for real rather than silently
++                // dropping `incoming` out of rotation forever. Resetting
++                // nextToLoad back to `incoming` puts it at the front of
++                // the streaming rotation again, so the very next eviction
++                // cycle retries loading this same logical texture instead
++                // of permanently losing one slot of residency budget
++                // (residencyOrder would otherwise stay one entry short of
++                // kResidentBudget until, if ever, nextToLoad wraps all the
++                // way back around to `incoming` on its own).
+                 RX_LOG_ERROR("sample_04_streaming: deferred registerSampledImage failed for logical texture {}",
+                              incoming);
++                scenePtr->nextToLoad = incoming;
+                 return;
+             }
+             scenePtr->textures[incoming].texture = incomingTexture;
+             scenePtr->textures[incoming].handle = handle;
+             scenePtr->residencyOrder.push_back(incoming);
+         },
+         currentFrameNumber);
+ 
+     return true;
+ }
+diff --git a/src/rx_core/src/log.cpp b/src/rx_core/src/log.cpp
+index 70163f8..f66d2cf 100644
+--- a/src/rx_core/src/log.cpp
++++ b/src/rx_core/src/log.cpp
+@@ -1,14 +1,22 @@
+ #include <rx_core/log.h>
+ 
++#include <mutex>
++
+ namespace rx::core::log {
+ 
+ void init() {
+-    static bool initialized = false;
+-    if (initialized) {
+-        return;
+-    }
+-    spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
+-    initialized = true;
++    // std::call_once/std::once_flag, not a bare `static bool` guarded by a
++    // plain `if` -- that pattern's read-then-write of `initialized` is not
++    // atomic, so two threads racing to call init() for the first time can
++    // both observe `initialized == false` and both proceed past the check
++    // (a real bug found when rx_shader's Compiler::create() called this
++    // before taking its own global-session mutex: two threads racing to
++    // create the first Compiler in a process raced here too). call_once
++    // guarantees the callable runs exactly once and that every caller --
++    // whichever thread wins, and every thread that merely blocks waiting
++    // for it -- only returns after that one run completes.
++    static std::once_flag initFlag;
++    std::call_once(initFlag, [] { spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v"); });
+ }
+ 
+ }  // namespace rx::core::log
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h b/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h
+index c70c424..c62d3ff 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h
+@@ -1,21 +1,26 @@
+ #pragma once
+ 
+ // VMA function-loading mode: hand VMA only the two entry points volk exposes
+ // as real global function pointers (vkGetInstanceProcAddr/
+-// vkGetDeviceProcAddr, populated by volkInitialize()/volkLoadInstance()/
+-// volkLoadDevice() -- see rx_rhi_vk/context.h and device.h) and let VMA's
++// vkGetDeviceProcAddr, both populated by volkInitialize()/volkLoadInstance()
++// -- NOT volkLoadDevice(), verified directly against the vendored volk.c:
++// volkLoadInstance() calls volkGenLoadInstance(), which is what assigns the
++// global `vkGetDeviceProcAddr` pointer (volk.c:253); volkLoadDevice() only
++// populates a per-device VolkDeviceTable, never touching that global. See
++// rx_rhi_vk/context.h (volkInitialize()/volkLoadInstance()) and device.h
++// (volkLoadDevice(), irrelevant to this global) -- and let VMA's
+ // own dynamic-loading path (VMA_DYNAMIC_VULKAN_FUNCTIONS) resolve every
+ // other Vulkan entry point itself via those two. Do NOT hand-fill a partial
+ // VmaVulkanFunctions table instead (the classic copy-pasted Vulkan-1.0-era
+ // sample): with VmaAllocatorCreateInfo::vulkanApiVersion ==
+-// VK_API_VERSION_1_3 (see allocator.cpp), VMA additionally needs the `*2`
++// VK_API_VERSION_1_3 (see buffer.cpp), VMA additionally needs the `*2`
+ // variants -- vkGetBufferMemoryRequirements2, vkBindBufferMemory2,
+ // vkGetPhysicalDeviceMemoryProperties2, vkGetDeviceBufferMemoryRequirements,
+ // etc. -- which a hand-filled 1.0-only table omits; VMA's internal
+ // ValidateVulkanFunctions() asserts (and behaves incorrectly in builds where
+ // asserts are compiled out) if any function required by the requested API
+ // version is still null after import. Letting VMA's own dynamic importer
+ // fetch everything past the two required entry points means it always asks
+ // for exactly the set its own vulkanApiVersion/extension flags require, so
+ // this can never drift out of sync with VMA's own requirements.
+ //
+diff --git a/src/rx_rhi_vk/src/buffer.cpp b/src/rx_rhi_vk/src/buffer.cpp
+index aaae069..6953d2d 100644
+--- a/src/rx_rhi_vk/src/buffer.cpp
++++ b/src/rx_rhi_vk/src/buffer.cpp
+@@ -8,22 +8,26 @@ namespace rx::rhi {
+ 
+ std::optional<Allocator> Allocator::create(Context& context, Device& device) {
+     return createRaw(device.physicalDevice(), device.device(), context.instance());
+ }
+ 
+ std::optional<Allocator> Allocator::createRaw(VkPhysicalDevice physicalDevice, VkDevice device, VkInstance instance) {
+     // Only the two entry points VMA's dynamic-loading path actually
+     // requires (see buffer.h's comment above the VMA_STATIC_VULKAN_FUNCTIONS
+     // / VMA_DYNAMIC_VULKAN_FUNCTIONS defines for why nothing else is
+     // hand-filled here). volk exposes both as real global function pointers
+-    // once volkInitialize()/volkLoadInstance() (Context::create) and
+-    // volkLoadDevice() (Device::create) have run.
++    // once volkInitialize()/volkLoadInstance() (Context::create) have run --
++    // volkLoadInstance() is what populates vkGetDeviceProcAddr too (verified
++    // against volk.c:253; see buffer.h's comment for the exact call chain).
++    // Device::create()'s volkLoadDevice() call populates a separate
++    // per-device function table and is not what this global pointer relies
++    // on.
+     VmaVulkanFunctions vulkanFunctions{};
+     vulkanFunctions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
+     vulkanFunctions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
+ 
+     VmaAllocatorCreateInfo createInfo{};
+     createInfo.physicalDevice = physicalDevice;
+     createInfo.device = device;
+     createInfo.instance = instance;
+     createInfo.vulkanApiVersion = VK_API_VERSION_1_3;
+     createInfo.pVulkanFunctions = &vulkanFunctions;
+diff --git a/src/rx_rhi_vk/src/mesh_buffers.cpp b/src/rx_rhi_vk/src/mesh_buffers.cpp
+index 1434377..773290b 100644
+--- a/src/rx_rhi_vk/src/mesh_buffers.cpp
++++ b/src/rx_rhi_vk/src/mesh_buffers.cpp
+@@ -35,20 +35,37 @@ std::optional<MeshBuffers> MeshBuffers::create(Allocator& allocator, Uploader& u
+     // (VERTEX_BUFFER_BIT/INDEX_BUFFER_BIT) on top of TRANSFER_DST_BIT --
+     // exactly what Uploader::uploadToBuffer()'s direct-path check needs
+     // Allocator::createDeviceLocalBuffer() to have requested
+     // ALLOW_TRANSFER_INSTEAD_BIT against (see that method's own comment).
+     // On a ReBAR-enabled/unified-memory device, both uploads below skip
+     // the staging ring entirely.
+     if (!uploader.uploadToBuffer(*vertexBuffer, 0, vertexData, vertexBytes)) {
+         RX_LOG_ERROR("MeshBuffers::create: vertex upload failed");
+         return std::nullopt;
+     }
++    // REAL BUG FIX: flush immediately after the vertex upload succeeds,
++    // rather than deferring to a single flush() call at the very end
++    // after both uploads. If the vertex upload took the staging path, it
++    // only RECORDED a copy into Uploader's command buffer -- nothing
++    // touches the GPU until flush() submits it. Without this early
++    // flush(), a subsequent index-upload failure below hits `return
++    // std::nullopt` before flush() ever runs, so `vertexBuffer`'s RAII
++    // destructor fires (destroying its VkBuffer) while that copy is still
++    // only recorded, never submitted -- and once flush() eventually runs
++    // on some *later* Uploader use, it would submit a copy command
++    // referencing an already-destroyed buffer. Flushing here makes the
++    // vertex copy submitted and (per Uploader::flush()'s synchronous
++    // contract) complete before vertexBuffer can ever be destroyed,
++    // independent of whether the index upload below succeeds. flush() is
++    // a safe no-op if the vertex upload took the direct (non-staging)
++    // path instead (nothing was recorded, so there is nothing to submit).
++    uploader.flush();
+     if (!uploader.uploadToBuffer(*indexBuffer, 0, indexData, indexBytes)) {
+         RX_LOG_ERROR("MeshBuffers::create: index upload failed");
+         return std::nullopt;
+     }
+     uploader.flush();
+ 
+     return MeshBuffers(std::move(*vertexBuffer), std::move(*indexBuffer), indexCount, indexType);
+ }
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_shader/include/rx_shader/compiler.h b/src/rx_shader/include/rx_shader/compiler.h
+index fbeea64..6f1bdb3 100644
+--- a/src/rx_shader/include/rx_shader/compiler.h
++++ b/src/rx_shader/include/rx_shader/compiler.h
+@@ -48,20 +48,41 @@ struct CompileResult {
+ // session and the objects created from it should be externally
+ // synchronized when shared across threads" [R:A4, R:A6]. This class
+ // deliberately uses exactly one such session for the whole process (never
+ // one per Compiler) to amortize Slang's real cost -- loading its standard
+ // library -- across every Compiler instance and every compile call; the
+ // mutex serializes the front-end operations (module load, composition,
+ // linking) that touch it. Each Compiler owns its own `slang::ISession`
+ // (cheap; "session per target config" [spec Fixed decision #2]), created
+ // once in `create()` and reused for every subsequent compile call on that
+ // instance -- this is the "session reuse" a hot-reload loop relies on.
++//
++// SAME-MODULE-NAME CAVEAT -- read before building any reload/recompile
++// loop: an `ISession` appears to cache loaded modules by name, so calling
++// compileFromSource()/compileFromFile() a SECOND time with the SAME
++// `moduleName` (compileFromFile() always derives this from the file's
++// stem, so this is exactly "reload the same path twice") but DIFFERENT
++// source, through the SAME Compiler instance, fails with Slang's own
++// "module already loaded with different source" diagnostic -- this is a
++// real, verified finding, not a hypothetical: see
++// `samples/02_hotreload/main.cpp`'s `buildPipelineFromFile()` and its own
++// doc comment for exactly this failure and the load-bearing fix. The safe
++// pattern is what that sample does: build a FRESH `Compiler` (and,
++// underneath it, a fresh `ISession`) for every reload, rather than
++// reusing one `Compiler` across repeated compiles of a changing file/
++// module name. This does not reintroduce the cost this class exists to
++// amortize -- the process-lifetime global session above (the genuinely
++// expensive part, Slang's stdlib load) is shared process-wide regardless
++// of how many `Compiler`/`ISession` instances are created, per this
++// class's own design described above; a fresh `Compiler::create()` call
++// only ever pays for a new, cheap `ISession`, never a new
++// `IGlobalSession`.
+ class Compiler {
+ public:
+     // Slang::ComPtr already handles move/release correctly on its own, so
+     // these can all be defaulted -- there is no raw resource here that
+     // needs custom teardown logic.
+     Compiler(Compiler&&) noexcept = default;
+     Compiler& operator=(Compiler&&) noexcept = default;
+     Compiler(const Compiler&) = delete;
+     Compiler& operator=(const Compiler&) = delete;
+     ~Compiler() = default;
+@@ -110,19 +131,25 @@ public:
+     // `entryPointNames`, in order -- `CompileResult::entryPointCode` is
+     // populated in the same order on success.
+     CompileResult compileFromSource(const std::string& moduleName,
+                                      const std::string& source,
+                                      const std::vector<std::string>& entryPointNames);
+ 
+     // Reads the Slang source at `path` from disk and compiles it exactly
+     // like compileFromSource, using the file's stem as the module name so
+     // diagnostics reference the real path on disk (useful for hot-reload:
+     // error messages point at the file the user is actually editing).
++    //
++    // Calling this a second time on the SAME `path` through THIS SAME
++    // Compiler after the file's content on disk has changed fails -- see
++    // this header's class-level "SAME-MODULE-NAME CAVEAT" comment above
++    // for why and for the safe pattern (a fresh Compiler per reload, as
++    // `samples/02_hotreload/main.cpp`'s `buildPipelineFromFile()` does).
+     CompileResult compileFromFile(const std::string& path, const std::vector<std::string>& entryPointNames);
+ 
+ private:
+     explicit Compiler(Slang::ComPtr<slang::ISession> session);
+ 
+     Slang::ComPtr<slang::ISession> session_;
+ };
+ 
+ }  // namespace rx::shader
+diff --git a/src/rx_shader/src/compiler.cpp b/src/rx_shader/src/compiler.cpp
+index e68a20b..29b5296 100644
+--- a/src/rx_shader/src/compiler.cpp
++++ b/src/rx_shader/src/compiler.cpp
+@@ -244,20 +244,28 @@ CompileResult compileImpl(slang::ISession* session,
+     }
+ 
+     return result;
+ }
+ 
+ }  // namespace
+ 
+ Compiler::Compiler(Slang::ComPtr<slang::ISession> session) : session_(std::move(session)) {}
+ 
+ std::optional<Compiler> Compiler::create() {
++    // Deliberately called before this function's own mutex lock below --
++    // that used to be a real race (two threads both first-creating a
++    // Compiler concurrently could race inside log::init() itself, since it
++    // used to guard its one-time setup with a bare, non-atomic `static
++    // bool`). Fixed at the source: rx::core::log::init() (src/rx_core/src/
++    // log.cpp) now uses std::call_once, so it is safe to call from any
++    // number of concurrent threads with no lock of this function's own
++    // needed around it.
+     rx::core::log::init();
+ 
+     std::lock_guard<std::mutex> lock(detail::globalSessionMutex());
+ 
+     Slang::ComPtr<slang::IGlobalSession>& global = sharedGlobalSession();
+     if (global.get() == nullptr) {
+         SlangResult sessionResult = slang::createGlobalSession(global.writeRef());
+         if (SLANG_FAILED(sessionResult) || global.get() == nullptr) {
+             RX_LOG_ERROR("rx_shader: slang::createGlobalSession failed (SlangResult={})",
+                          static_cast<int>(sessionResult));
+diff --git a/src/rx_shader/tests/compiler_test.cpp b/src/rx_shader/tests/compiler_test.cpp
+index af8cc59..caf255c 100644
+--- a/src/rx_shader/tests/compiler_test.cpp
++++ b/src/rx_shader/tests/compiler_test.cpp
+@@ -1,12 +1,13 @@
+ #include <doctest/doctest.h>
+ #include <rx_shader/compiler.h>
++#include <rx_shader/reflection.h>
+ 
+ #include <chrono>
+ #include <cstdio>
+ #include <filesystem>
+ #include <fstream>
+ 
+ namespace {
+ 
+ constexpr uint32_t kSpirvMagic = 0x07230203u;
+ 
+@@ -45,20 +46,51 @@ float4 fsMain(float4 color : COLOR0) : SV_Target
+ // Deliberately references an identifier that doesn't exist anywhere in
+ // scope, so this must fail to compile.
+ const char* kBadSource = R"(
+ [shader("fragment")]
+ float4 fsMain(float4 color : COLOR0) : SV_Target
+ {
+     return colorTypoNotDefined;
+ }
+ )";
+ 
++// "Source A" for the same-module-name regression test below: a fragment
++// module with zero push-constant globals.
++const char* kSameModuleReloadSourceA = R"(
++[shader("fragment")]
++float4 fsMain() : SV_Target
++{
++    return float4(1.0, 0.0, 0.0, 1.0);
++}
++)";
++
++// "Source B": the exact same module name as source A will be compiled
++// under, but with a `[[vk::push_constant]]` global source A never
++// declared -- a real, reflectable difference (pushRanges.size() 0 -> 1,
++// see reflection_test.cpp for this same [[vk::push_constant]] pattern)
++// this regression test asserts on to prove the second compile actually
++// reflects source B, not a stale/cached source A.
++const char* kSameModuleReloadSourceB = R"(
++struct PushConstants {
++    float4 tint;
++};
++
++[[vk::push_constant]]
++ConstantBuffer<PushConstants> gPush;
++
++[shader("fragment")]
++float4 fsMain() : SV_Target
++{
++    return gPush.tint;
++}
++)";
++
+ }  // namespace
+ 
+ TEST_CASE("Compiler::create succeeds and yields a usable compiler") {
+     auto compiler = rx::shader::Compiler::create();
+     REQUIRE(compiler.has_value());
+ }
+ 
+ TEST_CASE("compileFromSource on a known-good shader yields 2 valid SPIR-V blobs with correct stages") {
+     auto compiler = rx::shader::Compiler::create();
+     REQUIRE(compiler.has_value());
+@@ -177,10 +209,61 @@ TEST_CASE("compileFromFile reads and compiles Slang source from disk") {
+ }
+ 
+ TEST_CASE("compileFromFile on a nonexistent path fails cleanly with diagnostics") {
+     auto compiler = rx::shader::Compiler::create();
+     REQUIRE(compiler.has_value());
+ 
+     rx::shader::CompileResult result = compiler->compileFromFile("/nonexistent/path/does_not_exist.slang", {"main"});
+     CHECK_FALSE(result.ok);
+     REQUIRE_FALSE(result.diagnostics.empty());
+ }
++
++// Regression test for compiler.h's "SAME-MODULE-NAME CAVEAT": recompiling
++// the same module name with different source, through a FRESH Compiler
++// each time (the documented safe pattern -- what
++// samples/02_hotreload/main.cpp's buildPipelineFromFile() does for real
++// reloads), must actually reflect the new source rather than silently
++// reusing something cached under the old one.
++TEST_CASE(
++    "recompiling the same module name with different source through a fresh Compiler each time reflects the new "
++    "source") {
++    auto compilerA = rx::shader::Compiler::create();
++    REQUIRE(compilerA.has_value());
++    rx::shader::CompileResult resultA =
++        compilerA->compileFromSource("SameModuleReloadCaveat", kSameModuleReloadSourceA, {"fsMain"});
++    INFO("resultA diagnostics: " << resultA.diagnostics);
++    REQUIRE(resultA.ok);
++    REQUIRE(resultA.entryPointCode.size() == 1);
++    auto layoutA = rx::shader::reflect(resultA);
++    REQUIRE(layoutA.has_value());
++    CHECK(layoutA->pushRanges.empty());
++
++    // Same module name as above ("SameModuleReloadCaveat"), different
++    // source -- through a BRAND-NEW Compiler/ISession, never `compilerA`.
++    // Reusing `compilerA` here would be the exact bug this caveat
++    // documents: Slang's own "module already loaded with different
++    // source" diagnostic, verified directly against this project's
++    // pinned Slang build (see compiler.h's class-level comment).
++    auto compilerB = rx::shader::Compiler::create();
++    REQUIRE(compilerB.has_value());
++    rx::shader::CompileResult resultB =
++        compilerB->compileFromSource("SameModuleReloadCaveat", kSameModuleReloadSourceB, {"fsMain"});
++    INFO("resultB diagnostics: " << resultB.diagnostics);
++    REQUIRE(resultB.ok);
++    REQUIRE(resultB.entryPointCode.size() == 1);
++    auto layoutB = rx::shader::reflect(resultB);
++    REQUIRE(layoutB.has_value());
++
++    // The actual regression assertion: source B's compile reflects
++    // source B's shape (one push-constant range, one float4 = 16 bytes),
++    // not source A's (zero push-constant ranges) -- a real structural
++    // difference, not a coincidental one.
++    REQUIRE(layoutB->pushRanges.size() == 1);
++    CHECK(layoutB->pushRanges[0].size == 16);
++    CHECK(layoutA->pushRanges.size() != layoutB->pushRanges.size());
++
++    // Belt-and-suspenders: the compiled SPIR-V words themselves differ
++    // too (source B's push-constant load vs. source A's hardcoded
++    // constant), confirming this is a genuinely different compiled
++    // module, not a stale cached result silently reused.
++    CHECK(resultA.entryPointCode[0].code != resultB.entryPointCode[0].code);
++}
