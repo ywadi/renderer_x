@@ -1,0 +1,1619 @@
+# Review package: 6f00fb7..12815a5
+
+## Commits
+12815a5 Fix Task 4 review: real ReBAR direct upload path, mip filter check, tests
+
+## Files changed
+ .../task-4-report.md                               | 204 +++++++++++++++++++++
+ src/rx_rhi_vk/include/rx_rhi_vk/buffer.h           | 116 ++++++++----
+ src/rx_rhi_vk/include/rx_rhi_vk/texture.h          |  26 ++-
+ src/rx_rhi_vk/include/rx_rhi_vk/upload.h           | 169 ++++++++++-------
+ src/rx_rhi_vk/src/buffer.cpp                       |  41 +++--
+ src/rx_rhi_vk/src/mesh_buffers.cpp                 |  11 +-
+ src/rx_rhi_vk/src/texture.cpp                      |  22 ++-
+ src/rx_rhi_vk/src/upload.cpp                       | 100 +++++++---
+ src/rx_rhi_vk/tests/frame_sync_test.cpp            |  50 +++++
+ src/rx_rhi_vk/tests/texture_test.cpp               |  86 +++++++++
+ src/rx_rhi_vk/tests/upload_test.cpp                | 124 +++++++++++--
+ 11 files changed, 782 insertions(+), 167 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-4-report.md b/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-4-report.md
+index efda829..135a084 100644
+--- a/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-4-report.md
++++ b/.superpowers/sdd/2026-08-10-phase2-shader-resource/task-4-report.md
+@@ -334,10 +334,214 @@ is fully wired end to end for the sample tasks that will call
+ 
+ `Uploader`/`Texture2D`/`MeshBuffers` are ready for Task 6's bindless-mesh
+ sample to consume directly (`Uploader::create` against a real windowed
+ `Device`, `Texture2D::create` + `uploadToImage` for each generated
+ texture, `MeshBuffers::create` for procedural geometry). `DeletionQueue`
+ is ready for Task 7's streaming sample's eviction path — the exact
+ scenario its own stress test already exercises end to end, just without
+ a real `BindlessTable::release()` call interleaved (that interleaving is
+ Task 7's own proof, per the as-built context's "release-safety contract"
+ note in `bindless.h`).
++
++---
++
++## Fix Round 1 (review: 1 Critical + 3 Important)
++
++### CRITICAL — ReBAR direct path was structurally unreachable
++
++**Independently re-verified the root cause against this project's own
++vendored VMA 3.4.0 source before implementing anything** (not just
++trusted the review's summary):
++
++- `vk_mem_alloc.h:3757`, `VmaBufferImageUsage::ContainsDeviceAccess()`:
++  `return (Value & ~BaseType(VK_BUFFER_USAGE_TRANSFER_DST_BIT |
++  VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) != 0;` — masks OUT both transfer
++  bits; a buffer whose usage is ONLY `TRANSFER_SRC_BIT` (the original
++  `createUploadRingBuffer()`'s exact usage) reports `false`.
++- `vk_mem_alloc.h:4264-4302`, `FindMemoryPreferences()`'s
++  `VMA_MEMORY_USAGE_AUTO` branch, `hostAccessSequentialWrite` case: when
++  `deviceAccess` (that same `ContainsDeviceAccess()` result) is true AND
++  `hostAccessAllowTransferInstead` is true, it sets
++  `outPreferredFlags |= DEVICE_LOCAL_BIT | HOST_VISIBLE_BIT` (the
++  intended combined preference). When `deviceAccess` is FALSE (the ring
++  buffer's actual case), it instead falls into `else`: sets
++  `outPreferredFlags |= HOST_VISIBLE_BIT` and then, since `!deviceAccess`
++  and `usage != AUTO_PREFER_DEVICE`, explicitly sets
++  `outNotPreferredFlags |= DEVICE_LOCAL_BIT` -- i.e. the original
++  implementation's flag combination didn't just fail to help, it
++  actively steered VMA AWAY from DEVICE_LOCAL memory. This is a stronger
++  finding than "buys nothing" and is now cited precisely in
++  `buffer.h`'s own comments.
++- Live-verified on this machine (real run, `RX_LOG_INFO` output): before
++  the fix, every `Uploader::create()` logged "ring buffer placed in
++  plain HOST_VISIBLE memory" — the direct path never engaged, matching
++  the review's claim exactly.
++
++**Fix implemented (matches the review's prescribed shape):**
++`Allocator::createDeviceLocalBuffer()` (used by `MeshBuffers` and any
++caller allocating a real destination buffer) now requests
++`ALLOW_TRANSFER_INSTEAD_BIT` itself, applied to a buffer whose `usage`
++carries a real device-consuming bit (`VERTEX_BUFFER_BIT`,
++`INDEX_BUFFER_BIT`, ...) — exactly where `ContainsDeviceAccess()` reports
++`true` and the combined-preference branch above actually fires. The
++resulting `Buffer` gains a new classification,
++`Buffer::directPathCapable()` (true only when the real allocation landed
++BOTH `DEVICE_LOCAL_BIT` and `HOST_VISIBLE_BIT`, checked once via
++`vmaGetMemoryTypeProperties`). `createHostVisibleBuffer()` always reports
++`directPathCapable() == false` — a hardcoded value, not a measurement,
++since that factory never requests the flag at all (documented explicitly
++so a test can force the non-direct branch deterministically).
++`createUploadRingBuffer()` had the flag REMOVED (it was dead weight, now
++documented as such) and returns a plain `optional<Buffer>` again (the
++short-lived `UploadBufferResult`/`deviceLocal` classification from the
++first implementation is gone).
++
++`Uploader::uploadToBuffer()`'s signature changed from `(VkBuffer dst,
++...)` to `(Buffer& dst, ...)` — required so the method can inspect
++`dst.directPathCapable()`/`dst.mappedData()` to decide the branch (a bare
++handle carries neither). Per call: if `dst.directPathCapable() &&
++dst.mappedData() != nullptr`, it `memcpy`s straight into
++`dst.mappedData()` and calls `dst.flush()` — no staging copy, no command
++recorded, no ring buffer touched. Otherwise it stages through the ring
++exactly as before. Each outcome is logged once per `Uploader` instance
++(`RX_LOG_INFO`, first occurrence only) and exposed for tests via
++`everUsedDirectPath()`/`everUsedStagingPath()` (replacing the removed
++`usesDirectPath()`, which no longer made sense once the decision became
++per-call rather than fixed at `Uploader::create()`).
++`MeshBuffers::create()`'s two `uploadToBuffer()` calls were updated to
++pass `*vertexBuffer`/`*indexBuffer` — both of MeshBuffers' own buffers
++already carry a real device-consuming usage bit, so they now genuinely
++benefit from the direct path on qualifying hardware.
++
++**Images:** `uploadToImage()` is unchanged in this respect and
++`upload.h`'s class comment now says explicitly why: a `VkImage` cannot be
++written from the host at all without `VK_EXT_host_image_copy`, which is
++not in this project's Vulkan 1.3 + descriptor-indexing baseline (spec
++Fixed decision #5) — there is no "direct" branch for images to take, by
++construction of the API, not a scope cut.
++
++**Direct-path engagement evidence (this machine, ReBAR-capable RTX
++2080):**
++```
++[info] Uploader::uploadToBuffer: destination memory is DEVICE_LOCAL + HOST_VISIBLE -- writing directly, no staging copy [R:C1]
++```
++logged from the dedicated mechanism test (`upload_test.cpp`,
++"...takes the direct memcpy-into-mapped-destination path...") AND from
++the `MeshBuffers::create()` test (its vertex/index buffer uploads) — the
++exact scenario the review named. `Buffer::directPathCapable()` was
++`true` and `uploader->everUsedDirectPath()` asserted `true` via `CHECK`
++(a real doctest assertion, verified passing directly in the run output —
++not a `MESSAGE`) in both. The staging branch is exercised deterministically
++(hardware-independent) via a dedicated test that forces it by using
++`createHostVisibleBuffer()`'s hardcoded-false classification as the
++destination.
++
++**Tests added/changed (`upload_test.cpp`):** new
++"...takes the direct memcpy-into-mapped-destination path..." test
++(`VERTEX_BUFFER_BIT` destination; asserts `everUsedDirectPath()`/
++`everUsedStagingPath()` via `CHECK` gated on the real
++`directPathCapable()` classification, not a soft `MESSAGE`); new
++"...stages through the ring buffer when the destination is not
++direct-path-capable, deterministically..." test (forces staging via
++`createHostVisibleBuffer()`, independent of hardware); existing
++round-trip/ring-wrap/oversize/MeshBuffers tests updated for the
++`Buffer&` signature change, with the plain round-trip test's destination
++usage left device-access-bit-free specifically so it keeps exercising
++staging deterministically too.
++
++### IMPORTANT 1 — missing `SAMPLED_IMAGE_FILTER_LINEAR_BIT` check
++
++`texture.cpp`'s mip format-feature check now requires all three of
++`VK_FORMAT_FEATURE_BLIT_SRC_BIT`, `_BLIT_DST_BIT`, and
++`_SAMPLED_IMAGE_FILTER_LINEAR_BIT` under optimal tiling before honoring
++`mipLevels > 1` — `vkCmdBlitImage` with `VK_FILTER_LINEAR`
++(`recordMipChainBlit()`'s filter choice) separately requires the source
++format to support linear filtering
++(`VUID-vkCmdBlitImage-filter-02001`), independent of the two blit bits.
++Missing any of the three still falls back to a single mip level with
++`RX_LOG_WARN`, unchanged. `texture.h`'s declaration comment updated to
++match.
++
++### IMPORTANT 2 — `mipLevels() == 1` path was entirely untested
++
++Root cause: `uploadToImage()`'s original guard was `generateMips &&
++dst.mipLevels() > 1`, which meant `Texture2D::recordMipChainBlit()`'s own
++early-return branch (`mipLevels_ <= 1`) was UNREACHABLE through the
++public `Uploader` API no matter what a test passed for `generateMips` —
++a single-mip texture always took `uploadToImage()`'s plain `else`
++branch instead, never calling `recordMipChainBlit()` at all. Simplified
++the guard to just `generateMips` (dropped the redundant `&&
++dst.mipLevels() > 1`): `recordMipChainBlit()` already handles
++`mipLevels() == 1` correctly and cheaply via its own early return (an
++identical single `transitionLevelRange()` call to `uploadToImage()`'s
++own `else` branch), so the extra clause was dead-weight duplication with
++zero behavioral difference for that case, and removing it is what makes
++the early-return branch reachable through the public API at all. No
++behavior changed for any existing `mipLevels() > 1` scenario.
++
++Added one test (`texture_test.cpp`) with two sub-cases on a
++`requestedMipLevels=1` texture: `generateMips=true` (now exercises
++`recordMipChainBlit()`'s early-return branch) and `generateMips=false`
++(exercises `uploadToImage()`'s plain-transition `else` branch) — both
++round-trip level 0 byte-exact. (Caught and fixed a test-only bug while
++writing this: the sub-case textures need `TRANSFER_SRC_BIT` requested
++explicitly in `usage`, since `Texture2D::create()` only auto-adds it when
++`mipLevels() > 1`; the test's own readback needs it regardless of that
++production-side optimization.)
++
++### IMPORTANT 3 — no direct unit test for `FrameSync::frameNumber()`
++
++Added a test (`frame_sync_test.cpp`) that builds a real windowed
++`Device` + `FrameSync` (no acquire/submit/present needed — `frameNumber()`
++is pure bookkeeping incremented alongside `currentFrame_` in
++`advanceFrame()`) and calls `advanceFrame()` 10 times (`>
++2 * kFramesInFlight`, so `currentFrameIndex()` wraps at least twice),
++asserting `frameNumber()` matches the iteration count exactly every time
++while `currentFrameIndex()` cycles mod 2 — plus an explicit assertion
++that two different `frameNumber()` values (2 and 4) land on the same
++`currentFrameIndex()` slot, the concrete case `DeletionQueue`'s ABA
++avoidance depends on `frameNumber()` (not `currentFrameIndex()`) to
++resolve correctly.
++
++## Verification (fix round)
++
++- **linux-native:** full build clean; `ctest`: **7/7 pass** (the sixth
++  and seventh, `sample_01_triangle_headless`/`sample_02_hotreload_headless`,
++  landed via the concurrent Task 5 merge into `main` while this fix round
++  was in progress — unrelated to and unaffected by these changes).
++  `rx_rhi_vk_tests` run directly: **26 test cases / 703 assertions, 0
++  failed.** Every `[error]`-level log line is one of three deliberately-
++  exercised clean-rejection paths (unchanged from the original
++  submission); `grep` for `Validation Error` outside the pre-existing
++  documented `known false positive` returns nothing.
++- **windows-cross-zig:** configure + full build clean, including every
++  changed file.
++- Commit hygiene: verified directly with `git log --format='%B'` after
++  committing — no AI attribution.
++
++## Deviations from brief / spec (fix round, additive to the list above)
++
++5. **`Uploader::uploadToBuffer()` now takes `Buffer&` instead of
++   `VkBuffer`** — required for the Critical fix (the method must inspect
++   `directPathCapable()`/`mappedData()` on the actual destination
++   object, which a bare handle cannot provide). Callers holding only a
++   raw `VkBuffer` with no accompanying `rx::rhi::Buffer` cannot use this
++   method at all now; none of this codebase's callers were in that
++   position (`MeshBuffers`, all tests).
++6. **`Allocator::createUploadRingBuffer()`'s return type reverted from
++   `optional<UploadBufferResult>` back to `optional<Buffer>`** — the
++   `deviceLocal` classification it carried was a measurement of a
++   structurally-impossible outcome (see the Critical fix above) and is
++   gone; `Uploader::usesDirectPath()` (which read it) is replaced by
++   `everUsedDirectPath()`/`everUsedStagingPath()`.
++
++## Concerns for the coordinator (fix round, additive)
++
++5. **The direct path's engagement is now genuinely hardware-dependent
++   per call, not per-`Uploader`-instance** — a single `Uploader` can take
++   the direct branch for one destination and the staging branch for
++   another in the same batch (this is correct and intended, but worth
++   noting for Task 6/7: don't assume one `Uploader`'s `everUsedDirectPath()`
++   generalizes to every future upload through it).
++6. **The single-mip-format-fallback path (all three feature bits, now)
++   remains untested for the same reason as before** (Concern 1 in the
++   original submission) — unchanged, still flagged rather than forced.
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h b/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h
+index ca9c705..2ab8bc2 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h
+@@ -51,20 +51,37 @@ public:
+     Buffer(Buffer&&) noexcept;
+     Buffer& operator=(Buffer&&) noexcept;
+     Buffer(const Buffer&) = delete;
+     Buffer& operator=(const Buffer&) = delete;
+     ~Buffer();
+ 
+     VkBuffer handle() const { return buffer_; }
+     void* mappedData() const { return mappedData_; }
+     VkDeviceSize size() const { return size_; }
+ 
++    // True only for a Buffer created by Allocator::createDeviceLocalBuffer()
++    // whose resulting VMA memory type turned out to be BOTH
++    // VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT and
++    // VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT -- the ReBAR/unified-memory
++    // "direct upload" classification [R:C1]. rx::rhi::Uploader::
++    // uploadToBuffer() checks this (together with mappedData() != nullptr)
++    // to decide whether it can memcpy straight into this Buffer and skip
++    // the staging ring entirely. Always false for a Buffer created by
++    // createHostVisibleBuffer() (that factory never requests the
++    // ALLOW_TRANSFER_INSTEAD_BIT preference in the first place -- see its
++    // own comment) regardless of what its real memory type happens to be;
++    // this is a deliberate, hardcoded false, not a measurement, precisely
++    // so a test can force the non-direct branch deterministically without
++    // depending on any specific hardware's classification (see
++    // upload_test.cpp).
++    bool directPathCapable() const { return directPathCapable_; }
++
+     // Wraps vmaFlushAllocation()/vmaInvalidateAllocation() -- the API gap
+     // flagged by Phase 1 Task 3's review: that task's readback test had no
+     // way to reach the underlying VmaAllocation to invalidate it, and had
+     // to fall back to verifying (once, as a test precondition) that every
+     // HOST_VISIBLE memory type on the device was also HOST_COHERENT
+     // instead. These two calls close that gap for real.
+     //
+     // Call flush() after writing to mappedData() whenever the GPU will
+     // read those bytes next (e.g. this Buffer is about to be used as a
+     // vkCmdCopyBuffer/vkCmdCopyBufferToImage source). Call invalidate()
+@@ -85,30 +102,37 @@ public:
+     // Phase 1's readback test had to. No-ops if this Buffer is invalid
+     // (default-constructed or moved-from). Logs (RX_LOG_ERROR) and
+     // otherwise no-ops on the rare underlying VkResult failure.
+     void flush(VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE) const;
+     void invalidate(VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE) const;
+ 
+ private:
+     friend class Allocator;
+ 
+     Buffer() = default;
+-    Buffer(VmaAllocator allocator, VkBuffer buffer, VmaAllocation allocation, void* mappedData, VkDeviceSize size)
+-        : allocator_(allocator), buffer_(buffer), allocation_(allocation), mappedData_(mappedData), size_(size) {}
++    Buffer(VmaAllocator allocator, VkBuffer buffer, VmaAllocation allocation, void* mappedData, VkDeviceSize size,
++           bool directPathCapable = false)
++        : allocator_(allocator),
++          buffer_(buffer),
++          allocation_(allocation),
++          mappedData_(mappedData),
++          size_(size),
++          directPathCapable_(directPathCapable) {}
+ 
+     void destroyAll();
+ 
+     VmaAllocator allocator_ = VK_NULL_HANDLE;
+     VkBuffer buffer_ = VK_NULL_HANDLE;
+     VmaAllocation allocation_ = VK_NULL_HANDLE;
+     void* mappedData_ = nullptr;
+     VkDeviceSize size_ = 0;
++    bool directPathCapable_ = false;
+ };
+ 
+ // Owns a VmaAllocator built against a specific VkInstance/VkPhysicalDevice/
+ // VkDevice triple. Move-only RAII: destroys the underlying VmaAllocator via
+ // vmaDestroyAllocator on destruction or move-assignment.
+ class Allocator {
+ public:
+     Allocator(Allocator&&) noexcept;
+     Allocator& operator=(Allocator&&) noexcept;
+     Allocator(const Allocator&) = delete;
+@@ -126,58 +150,82 @@ public:
+     static std::optional<Allocator> createRaw(VkPhysicalDevice physicalDevice, VkDevice device, VkInstance instance);
+ 
+     // Allocates a VkBuffer with `usage`, backed by host-visible, persistently
+     // mapped memory (VMA_MEMORY_USAGE_AUTO +
+     // VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+     // VMA_ALLOCATION_CREATE_MAPPED_BIT) -- suitable for CPU-written,
+     // GPU-read data such as vertex/index/uniform buffers updated every
+     // frame. Returns std::nullopt on any failure (logged via RX_LOG_ERROR).
+     std::optional<Buffer> createHostVisibleBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
+ 
+-    // Allocates a VkBuffer with `usage`, backed by DEVICE_LOCAL memory with
+-    // no host-visibility request at all (VMA_MEMORY_USAGE_AUTO, no
+-    // HOST_ACCESS_* flags, no MAPPED_BIT) -- the resulting Buffer's
+-    // mappedData() is always nullptr. Suitable for GPU-only resources
+-    // written exactly once via a real transfer (rx::rhi::Uploader) and
+-    // read many times afterward, such as rx::rhi::MeshBuffers' vertex/
+-    // index buffers -- never for anything the CPU writes directly.
+-    // Returns std::nullopt on any failure (logged via RX_LOG_ERROR).
++    // Allocates a VkBuffer with `usage` -- intended for a real
++    // device-consuming role (VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
++    // _INDEX_BUFFER_BIT, _STORAGE_BUFFER_BIT, ...; TRANSFER_DST_BIT alone
++    // does NOT count, see below) -- via VMA_MEMORY_USAGE_AUTO +
++    // VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
++    // VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT |
++    // VMA_ALLOCATION_CREATE_MAPPED_BIT -- the real ReBAR-aware
++    // direct-upload pattern [R:C1], applied to the actual destination
++    // resource rather than a staging buffer (see the CRITICAL fix note
++    // below for why that distinction is load-bearing).
++    //
++    // **Why `usage` must carry a real device-consuming bit for this to do
++    // anything:** verified directly against this project's vendored VMA
++    // 3.4.0 source (`vk_mem_alloc.h`). `VmaBufferImageUsage::
++    // ContainsDeviceAccess()` masks OUT `TRANSFER_SRC_BIT`/`TRANSFER_DST_BIT`
++    // and returns whether anything else remains -- a buffer whose usage is
++    // ONLY transfer bits reports `ContainsDeviceAccess() == false`.
++    // `FindMemoryPreferences()`'s `VMA_MEMORY_USAGE_AUTO` branch only adds
++    // `DEVICE_LOCAL_BIT | HOST_VISIBLE_BIT` to its *preferred* flags when
++    // `ContainsDeviceAccess() == true` (the `deviceAccess` local) AND
++    // `ALLOW_TRANSFER_INSTEAD_BIT` is set; when `ContainsDeviceAccess()`
++    // is false, that same code path instead pushes `DEVICE_LOCAL_BIT` into
++    // *not-preferred* -- actively steering AWAY from the memory this
++    // pattern is supposed to land in. This is exactly the mistake this
++    // task's own first implementation made on `createUploadRingBuffer()`'s
++    // TRANSFER_SRC-only staging buffer (fixed below) and exactly why this
++    // method requires a real device-consuming usage bit to be worth
++    // calling with these flags at all -- a caller passing e.g. only
++    // `TRANSFER_DST_BIT` here gets a buffer that structurally can never
++    // report directPathCapable() == true, no matter the hardware.
++    //
++    // On a ReBAR-enabled desktop GPU or unified-memory APU, this resolves
++    // to memory that is BOTH DEVICE_LOCAL and HOST_VISIBLE
++    // (`Buffer::directPathCapable()` true, `mappedData()` non-null) --
++    // callers (rx::rhi::Uploader::uploadToBuffer(), rx::rhi::MeshBuffers)
++    // can then write directly into it and skip a staging copy entirely.
++    // Everywhere else it resolves to plain DEVICE_LOCAL-only memory
++    // (`directPathCapable()` false, `mappedData()` null -- VMA does not
++    // map memory it cannot map), identical to this method's behavior
++    // before this task's Critical review fix. Returns std::nullopt on any
++    // failure (logged via RX_LOG_ERROR).
+     std::optional<Buffer> createDeviceLocalBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
+ 
+-    // Result of createUploadRingBuffer() below: the allocated staging
+-    // Buffer, plus whether VMA actually placed it in memory that is BOTH
+-    // DEVICE_LOCAL and HOST_VISIBLE (the ReBAR/integrated-memory "direct"
+-    // fast path [R:C1]) as opposed to falling back to plain HOST_VISIBLE
+-    // system memory (the non-ReBAR desktop case). `deviceLocal` is a
+-    // one-time, informational classification for logging/diagnostics --
+-    // rx::rhi::Uploader's copy code (vkCmdCopyBuffer/
+-    // vkCmdCopyBufferToImage from this buffer) is identical either way;
+-    // only the underlying memory's physical location and copy bandwidth
+-    // differ.
+-    struct UploadBufferResult {
+-        Buffer buffer;
+-        bool deviceLocal = false;
+-    };
+-
+     // Allocates a VkBuffer with `usage` (typically just
+     // VK_BUFFER_USAGE_TRANSFER_SRC_BIT -- this is always a copy *source*,
+     // never a real destination resource) via VMA_MEMORY_USAGE_AUTO +
+     // VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+-    // VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT |
+-    // VMA_ALLOCATION_CREATE_MAPPED_BIT -- the exact ReBAR-aware pattern
+-    // [R:C1] documents: VMA tries a memory type that is both DEVICE_LOCAL
+-    // and HOST_VISIBLE first, falling back to plain HOST_VISIBLE system
+-    // memory if none exists or allocation from it fails. Which one was
+-    // actually obtained is reported via the returned `deviceLocal` flag
+-    // (checked once via vmaGetMemoryTypeProperties -- no physical-device
+-    // handle needed here). Returns std::nullopt on any failure (logged).
+-    std::optional<UploadBufferResult> createUploadRingBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
++    // VMA_ALLOCATION_CREATE_MAPPED_BIT -- always resolves to plain
++    // HOST_VISIBLE memory, exactly VMA's own "Simple staging buffer"
++    // pattern [R:C1]. The resulting Buffer's directPathCapable() is
++    // always false: a TRANSFER_SRC-only usage can never make
++    // ContainsDeviceAccess() true (see createDeviceLocalBuffer()'s own
++    // comment above), so there is no point requesting
++    // ALLOW_TRANSFER_INSTEAD_BIT here at all -- an earlier version of this
++    // method did, and it was structurally inert (this task's own Critical
++    // review finding: the flag never changed which memory type this
++    // buffer landed in, on any hardware). rx::rhi::Uploader's internal
++    // staging ring buffer is exactly this: a plain, always-staging
++    // resource; the direct-upload optimization belongs on the
++    // *destination* (createDeviceLocalBuffer() above), not here. Returns
++    // std::nullopt on any failure (logged).
++    std::optional<Buffer> createUploadRingBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
+ 
+     // Raw VmaAllocator handle -- needed by rx::rhi::Texture2D::create()
+     // (texture.h, a separate header/TU) to call vmaCreateImage/
+     // vmaDestroyImage directly, mirroring what this Allocator's own
+     // createHostVisibleBuffer()/createDeviceLocalBuffer() do internally
+     // for buffers. Deliberately not wrapped in an Allocator::createImage()
+     // method here: that would make buffer.h/buffer.cpp know about
+     // Texture2D (format-feature queries, mip-level computation), which
+     // belongs entirely in texture.h/texture.cpp instead. Not intended for
+     // ordinary callers -- prefer the create*Buffer() methods above for
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/texture.h b/src/rx_rhi_vk/include/rx_rhi_vk/texture.h
+index a1166e4..2a41793 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/texture.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/texture.h
+@@ -38,30 +38,36 @@ public:
+ 
+     // Pass 0 for `requestedMipLevels` to auto-compute a full mip chain
+     // down to 1x1 (floor(log2(max(extent.width, extent.height))) + 1);
+     // pass a specific count to request exactly that many (clamped down to
+     // the maximum the extent actually supports, silently -- requesting
+     // more levels than an extent can produce is a caller-side rounding
+     // convenience, not an error worth failing over).
+     //
+     // Before honoring any mipLevels > 1 request, this queries
+     // `physicalDevice`'s VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+-    // VK_FORMAT_FEATURE_BLIT_DST_BIT support for `format` under optimal
+-    // tiling (both bits: the blit chain this Texture2D's
+-    // recordMipChainBlit() records reads FROM level N via
+-    // VK_FORMAT_FEATURE_BLIT_SRC_BIT and writes TO level N+1 via
+-    // VK_FORMAT_FEATURE_BLIT_DST_BIT -- the brief's own shorthand names
+-    // only the DST bit, but SRC is equally required for a blit chain to
+-    // work at all, so both are checked here). If either is unsupported,
+-    // this silently falls back to a single mip level and logs
+-    // RX_LOG_WARN naming the format [R:C2] -- never a hard failure, since
+-    // a texture with no mips is still a perfectly usable texture.
++    // VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT
++    // support for `format` under optimal tiling. The brief's own
++    // shorthand names only the DST bit, but two more bits are equally
++    // required for this Texture2D's actual recordMipChainBlit()
++    // implementation to be valid, not just "nice to check": SRC is needed
++    // because the blit chain reads FROM level N (via BLIT_SRC_BIT) to
++    // write TO level N+1 (via BLIT_DST_BIT), and FILTER_LINEAR is needed
++    // because recordMipChainBlit() calls vkCmdBlitImage with
++    // VK_FILTER_LINEAR, which Vulkan separately requires the SOURCE
++    // format to support under this same optimal-tiling feature set
++    // (VUID-vkCmdBlitImage-filter-02001) -- missing that third bit was a
++    // real gap this task's review caught, not a hypothetical one. If any
++    // of the three is unsupported, this silently falls back to a single
++    // mip level and logs RX_LOG_WARN naming the format [R:C2] -- never a
++    // hard failure, since a texture with no mips is still a perfectly
++    // usable texture.
+     //
+     // `usage` is ORed with VK_IMAGE_USAGE_TRANSFER_DST_BIT unconditionally
+     // (level 0 always needs to be a copy destination for
+     // rx::rhi::Uploader::uploadToImage()) and additionally with
+     // VK_IMAGE_USAGE_TRANSFER_SRC_BIT whenever the resulting mip count
+     // ends up > 1 (every level but the last needs to be a blit source).
+     // Callers should NOT add either of those bits themselves; this
+     // function already does.
+     //
+     // `physicalDevice`/`device` are used for the format-feature query
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/upload.h b/src/rx_rhi_vk/include/rx_rhi_vk/upload.h
+index eb7dddd..b213ee2 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/upload.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/upload.h
+@@ -3,67 +3,95 @@
+ #include <cstdint>
+ #include <optional>
+ #include <utility>
+ 
+ namespace rx::rhi {
+ 
+ class Device;
+ class Texture2D;
+ 
+ // Gets CPU-side bytes into GPU-visible/device-local Vulkan resources:
+-// uploadToBuffer() for an arbitrary destination VkBuffer, uploadToImage()
+-// for a Texture2D (optionally generating its full mip chain via
++// uploadToBuffer() for a destination rx::rhi::Buffer, uploadToImage() for
++// a Texture2D (optionally generating its full mip chain via
+ // Texture2D::recordMipChainBlit() in the same submission) [spec Fixed
+ // decision #7, R:C1].
+ //
+ // SYNCHRONOUS, BATCHED FLUSH -- read before assuming per-call semantics:
+-// uploadToBuffer()/uploadToImage() only RECORD commands (a
+-// vkCmdCopyBuffer/vkCmdCopyBufferToImage, plus any mip-chain blit) onto
+-// this Uploader's own internal command buffer; nothing touches the GPU
+-// until flush() actually submits everything recorded so far and BLOCKS
+-// the calling thread on a fence wait until it completes. This lets
+-// several uploads share one submission (cheaper than one submit-and-wait
+-// per resource) while keeping this phase's API deliberately simple: a
+-// fully synchronous flush() is an explicitly acceptable Phase 2 choice
+-// [R:C1] -- "Synchronous flush API is acceptable this phase ... per-frame
+-// async batching is a later optimization." A future Uploader revision
+-// replacing this with a fence the caller polls (instead of blocking on)
+-// would change flush()'s contract but not uploadToBuffer()/
+-// uploadToImage()'s.
++// every upload that goes through the staging ring (see below) only
++// RECORDS a command (a vkCmdCopyBuffer/vkCmdCopyBufferToImage, plus any
++// mip-chain blit) onto this Uploader's own internal command buffer;
++// nothing touches the GPU until flush() actually submits everything
++// recorded so far and BLOCKS the calling thread on a fence wait until it
++// completes. This lets several uploads share one submission (cheaper
++// than one submit-and-wait per resource) while keeping this phase's API
++// deliberately simple: a fully synchronous flush() is an explicitly
++// acceptable Phase 2 choice [R:C1] -- "Synchronous flush API is
++// acceptable this phase ... per-frame async batching is a later
++// optimization." A future Uploader revision replacing this with a fence
++// the caller polls (instead of blocking on) would change flush()'s
++// contract but not uploadToBuffer()/uploadToImage()'s. (A direct-path
++// buffer upload, below, has no command to record at all -- see its own
++// paragraph.)
+ //
+-// STAGING RING BUFFER + REBAR DETECTION [R:C1]: one persistent,
+-// CPU-writable ring buffer (Allocator::createUploadRingBuffer(), using
+-// VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT) backs
+-// every upload. VMA tries to place it in memory that is BOTH
+-// DEVICE_LOCAL and HOST_VISIBLE first (ReBAR-enabled desktop GPUs, or a
+-// unified-memory APU like Steam Deck) for a fast on-device copy;
+-// hardware without that (the common non-ReBAR desktop case) transparently
+-// falls back to plain HOST_VISIBLE system memory, and the exact same
+-// vkCmdCopyBuffer/vkCmdCopyBufferToImage code path below still works
+-// correctly either way -- just over a slower, real PCIe-bound transfer
+-// instead of an on-device one. Which one was obtained is detected once at
+-// create() (never per-upload) and logged once via RX_LOG_INFO; see
+-// usesDirectPath(). Every mapped write into the ring buffer is followed
+-// by Buffer::flush() (this task's own Buffer API addition) before the GPU
+-// reads it, so this is correct even on a hypothetical non-coherent
+-// HOST_VISIBLE memory type, not just the coherent-in-practice hardware
+-// this engine has been tested against.
++// DIRECT UPLOAD (BUFFERS ONLY) VS. STAGING RING [R:C1] -- CORRECTED THIS
++// TASK'S REVIEW CYCLE, read before assuming the mechanism below: the
++// ReBAR-aware "direct" fast path applies to the DESTINATION buffer's OWN
++// allocation, not to this Uploader's internal staging ring. The first
++// version of this class got this backwards -- it applied
++// ALLOW_TRANSFER_INSTEAD_BIT to the ring buffer (which only ever has
++// VK_BUFFER_USAGE_TRANSFER_SRC_BIT usage), and verified directly against
++// vendored VMA 3.4.0 source that this is structurally inert: VMA's
++// FindMemoryPreferences() only adds DEVICE_LOCAL to its preferred flags
++// when the buffer's usage contains a real device-consuming bit
++// (VmaBufferImageUsage::ContainsDeviceAccess(), which masks OUT the
++// transfer bits) -- a TRANSFER_SRC-only buffer can never trigger that
++// branch, on any hardware, confirmed live on this project's own
++// ReBAR-capable desktop GPU (the direct path never engaged once). The
++// fix: rx::rhi::Allocator::createDeviceLocalBuffer() (buffer.h) is what
++// now requests ALLOW_TRANSFER_INSTEAD_BIT, applied to a buffer with its
++// REAL device-consuming usage (VERTEX_BUFFER_BIT, INDEX_BUFFER_BIT, ...)
++// -- exactly the resource this "direct" path is supposed to describe.
++// uploadToBuffer() checks `dst.directPathCapable() && dst.mappedData() !=
++// nullptr` per call: when true (ReBAR-enabled desktop GPU, or a
++// unified-memory APU like Steam Deck, landed `dst`'s own memory in
++// something BOTH DEVICE_LOCAL and HOST_VISIBLE), it memcpy's straight
++// into `dst.mappedData()` and calls `dst.flush()` -- no staging copy, no
++// command recorded, no ring buffer touched at all. Otherwise it falls
++// back to exactly the staging-ring mechanism this class always had:
++// memcpy into the ring, Buffer::flush() it (correct even on a
++// hypothetical non-coherent HOST_VISIBLE memory type, not just the
++// coherent-in-practice hardware this engine has been tested against),
++// record a vkCmdCopyBuffer from the ring into `dst`. Which branch a given
++// call took is logged once per outcome (RX_LOG_INFO, the first time each
++// is observed -- not per call) and exposed for tests via
++// everUsedDirectPath()/everUsedStagingPath().
+ //
+-// If a single upload's write position would run past the ring buffer's
+-// end before the pending batch is flushed, this Uploader transparently
+-// calls flush() itself first (submitting + waiting on everything
+-// recorded so far, which frees the whole ring buffer for reuse since
+-// flush() is synchronous) and then continues writing from offset 0 --
+-// callers never need to reason about ring-buffer capacity themselves
+-// unless a single upload's size exceeds the ring buffer's total capacity,
+-// which fails cleanly (logged, returns false) rather than silently
+-// corrupting anything.
++// IMAGES ALWAYS STAGE -- this is the honest shape of [R:C1]'s guidance,
++// not a cop-out: a VkImage cannot be written from the host at all without
++// VK_EXT_host_image_copy, which is not in this project's baseline
++// (Vulkan 1.3 core + the descriptor-indexing feature set [spec Fixed
++// decision #5] -- no host-image-copy anywhere in that list). There is no
++// "direct" branch for uploadToImage() to take, on any hardware, by
++// construction of the Vulkan API itself -- every image upload goes
++// through the staging ring, unconditionally, exactly as this class
++// always did for images.
++//
++// If a single ring-staged upload's write position would run past the
++// ring buffer's end before the pending batch is flushed, this Uploader
++// transparently calls flush() itself first (submitting + waiting on
++// everything recorded so far, which frees the whole ring buffer for
++// reuse since flush() is synchronous) and then continues writing from
++// offset 0 -- callers never need to reason about ring-buffer capacity
++// themselves unless a single upload's size exceeds the ring buffer's
++// total capacity, which fails cleanly (logged, returns false) rather
++// than silently corrupting anything. This never applies to a
++// direct-path buffer upload, which never touches the ring at all.
+ class Uploader {
+ public:
+     Uploader(Uploader&&) noexcept;
+     Uploader& operator=(Uploader&&) noexcept;
+     Uploader(const Uploader&) = delete;
+     Uploader& operator=(const Uploader&) = delete;
+ 
+     // Auto-flushes any pending (recorded-but-not-yet-submitted) uploads
+     // before tearing down the ring buffer/command pool/fence, so a
+     // caller that forgets an explicit final flush() never silently loses
+@@ -75,92 +103,105 @@ public:
+     static constexpr VkDeviceSize kDefaultRingBufferSize = 16u * 1024u * 1024u;  // 16 MiB
+ 
+     // Builds this Uploader's internal command pool/buffer/fence against
+     // `device`'s graphics queue, and its staging ring buffer (`usage`
+     // VK_BUFFER_USAGE_TRANSFER_SRC_BIT only -- this buffer is always a
+     // copy source, never a real destination) of `ringBufferSize` bytes
+     // via `allocator`. Returns std::nullopt (logged) on any failure.
+     static std::optional<Uploader> create(Allocator& allocator, Device& device,
+                                            VkDeviceSize ringBufferSize = kDefaultRingBufferSize);
+ 
+-    // Copies `size` bytes from `data` into `dst` at `dstOffset`, through
+-    // the ring buffer, recording a vkCmdCopyBuffer onto this Uploader's
+-    // internal command buffer -- see the class comment for why nothing
+-    // actually reaches the GPU until flush(). `dst` is assumed to already
++    // Copies `size` bytes from `data` into `dst` at `dstOffset`. Takes
++    // `dst` by reference (not a bare VkBuffer) specifically so this
++    // method can inspect `dst.directPathCapable()`/`dst.mappedData()` to
++    // decide the direct-vs-staging branch described in the class comment
++    // above -- a bare handle carries neither. `dst` is assumed to already
+     // be sized/allocated by the caller (e.g. via
+-    // Allocator::createDeviceLocalBuffer()) with VK_BUFFER_USAGE_TRANSFER_DST_BIT.
+-    // Returns false (logged) only if `size` exceeds this Uploader's total
+-    // ring-buffer capacity outright -- every other case (including a
+-    // same-batch auto-flush to reclaim ring space) succeeds. A `size` of
+-    // 0 is a no-op that returns true.
+-    bool uploadToBuffer(VkBuffer dst, VkDeviceSize dstOffset, const void* data, VkDeviceSize size);
++    // Allocator::createDeviceLocalBuffer()) with
++    // VK_BUFFER_USAGE_TRANSFER_DST_BIT (needed for the staging branch;
++    // harmless/unused for the direct branch). Returns false (logged) only
++    // if the staging branch is taken AND `size` exceeds this Uploader's
++    // total ring-buffer capacity outright -- every other case (including
++    // a same-batch auto-flush to reclaim ring space, and every direct-path
++    // call regardless of size) succeeds. A `size` of 0 is a no-op that
++    // returns true.
++    bool uploadToBuffer(Buffer& dst, VkDeviceSize dstOffset, const void* data, VkDeviceSize size);
+ 
+     // Copies `pixelBytes` bytes from `pixels` (tightly packed, matching
+     // `dst`'s extent/format texel layout) into mip level 0 of `dst`,
+     // through the ring buffer, then transitions `dst` to
+     // VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL -- via
+     // Texture2D::recordMipChainBlit() (generating the full mip chain in
+-    // the same recorded batch) when `generateMips` is true AND
+-    // `dst.mipLevels() > 1`, or via a single whole-image layout
+-    // transition otherwise. As with uploadToBuffer(), nothing reaches the
+-    // GPU until flush(). Returns false (logged) only if `pixelBytes`
++    // the same recorded batch) when `generateMips` is true, or via a
++    // single whole-image layout transition when it's false. Note this is
++    // NOT additionally gated on `dst.mipLevels() > 1`: recordMipChainBlit()
++    // already handles a single-mip `dst` correctly and cheaply via its
++    // own early-return branch, so `generateMips` alone decides which of
++    // the two branches runs. As with uploadToBuffer(), nothing reaches
++    // the GPU until flush(). Returns false (logged) only if `pixelBytes`
+     // exceeds this Uploader's total ring-buffer capacity outright. A
+     // `pixelBytes` of 0 is a no-op that returns true.
+     bool uploadToImage(Texture2D& dst, const void* pixels, VkDeviceSize pixelBytes, bool generateMips);
+ 
+     // Submits every uploadTo*() call recorded since the last flush() (or
+     // since create()), waits (via this Uploader's own dedicated fence)
+     // for the GPU to finish, then resets the ring buffer's write cursor
+     // back to 0 and the command buffer for reuse. Safe to call with
+     // nothing pending (no-op).
+     void flush();
+ 
+-    // Whether the ring buffer ended up in DEVICE_LOCAL memory (the
+-    // ReBAR/integrated-memory fast path) as opposed to the plain
+-    // HOST_VISIBLE fallback -- see the class comment. Informational only;
+-    // does not change which Vulkan calls uploadTo*() issues.
+-    bool usesDirectPath() const { return ringBufferIsDeviceLocal_; }
++    // True once at least one uploadToBuffer() call has taken the direct
++    // (memcpy-straight-into-`dst`) branch / the staging-ring branch,
++    // respectively, at any point in this Uploader's lifetime. Test/
++    // diagnostic accessors -- production code has no need for them
++    // (uploadToBuffer()'s return value already reports success/failure
++    // uniformly regardless of which branch ran).
++    bool everUsedDirectPath() const { return everUsedDirectPath_; }
++    bool everUsedStagingPath() const { return everUsedStagingPath_; }
+ 
+ private:
+     // No plain default constructor: `ringBuffer_` is a real
+     // rx::rhi::Buffer, whose own default constructor is private to Buffer
+     // (friends only, see buffer.h) -- Uploader is not a friend of Buffer
+     // and does not need to be. create() builds every member's real value
+     // up front and constructs this Uploader directly via this
+     // parameterized constructor instead (mirroring
+     // rx::rhi::MeshBuffers/Texture2D's own equivalent constructors, for
+     // the same reason). The move constructor/assignment below are
+     // hand-written rather than `= default` for the opposite reason: this
+     // class also owns several *raw* Vulkan handles (pool_/cmd_/fence_),
+     // which a defaulted move would copy without nulling the source --
+     // exactly the double-destroy hazard every other RAII type in this
+     // library's move operations are hand-written to avoid.
+     Uploader(VkDevice device, VkQueue queue, VkCommandPool pool, VkCommandBuffer cmd, VkFence fence,
+-             Buffer ringBuffer, VkDeviceSize ringBufferSize, bool ringBufferIsDeviceLocal)
++             Buffer ringBuffer, VkDeviceSize ringBufferSize)
+         : device_(device),
+           queue_(queue),
+           pool_(pool),
+           cmd_(cmd),
+           fence_(fence),
+           ringBuffer_(std::move(ringBuffer)),
+-          ringBufferSize_(ringBufferSize),
+-          ringBufferIsDeviceLocal_(ringBufferIsDeviceLocal) {}
++          ringBufferSize_(ringBufferSize) {}
+ 
+     void beginRecordingIfNeeded();
+     bool reserveRingSpace(VkDeviceSize size, VkDeviceSize& outOffset);
+     void destroyAll();
+ 
+     VkDevice device_ = VK_NULL_HANDLE;
+     VkQueue queue_ = VK_NULL_HANDLE;
+     VkCommandPool pool_ = VK_NULL_HANDLE;
+     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
+     VkFence fence_ = VK_NULL_HANDLE;
+ 
+     Buffer ringBuffer_;
+     VkDeviceSize ringBufferSize_ = 0;
+     VkDeviceSize ringCursor_ = 0;
+-    bool ringBufferIsDeviceLocal_ = false;
+ 
+     bool recording_ = false;
++
++    bool everUsedDirectPath_ = false;
++    bool everUsedStagingPath_ = false;
++    bool loggedDirectPathOnce_ = false;
++    bool loggedStagingPathOnce_ = false;
+ };
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/buffer.cpp b/src/rx_rhi_vk/src/buffer.cpp
+index c4a7ced..aaae069 100644
+--- a/src/rx_rhi_vk/src/buffer.cpp
++++ b/src/rx_rhi_vk/src/buffer.cpp
+@@ -62,65 +62,80 @@ std::optional<Buffer> Allocator::createHostVisibleBuffer(VkDeviceSize size, VkBu
+     return Buffer(allocator_, buffer, allocation, allocationInfo.pMappedData, size);
+ }
+ 
+ std::optional<Buffer> Allocator::createDeviceLocalBuffer(VkDeviceSize size, VkBufferUsageFlags usage) {
+     VkBufferCreateInfo bufferInfo{};
+     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+     bufferInfo.size = size;
+     bufferInfo.usage = usage;
+     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+ 
++    // ALLOW_TRANSFER_INSTEAD_BIT here (not on createUploadRingBuffer()'s
++    // staging buffer) is this task's Critical review fix -- see this
++    // method's own header comment in buffer.h for the exact VMA
++    // FindMemoryPreferences()/ContainsDeviceAccess() mechanics this
++    // depends on `usage` actually carrying a device-consuming bit for.
+     VmaAllocationCreateInfo allocCreateInfo{};
+     allocCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
++    allocCreateInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
++                             VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT |
++                             VMA_ALLOCATION_CREATE_MAPPED_BIT;
+ 
+     VkBuffer buffer = VK_NULL_HANDLE;
+     VmaAllocation allocation = VK_NULL_HANDLE;
+     VmaAllocationInfo allocationInfo{};
+     VkResult result =
+         vmaCreateBuffer(allocator_, &bufferInfo, &allocCreateInfo, &buffer, &allocation, &allocationInfo);
+     if (result != VK_SUCCESS) {
+-        RX_LOG_ERROR("vmaCreateBuffer (device-local) failed: VkResult={}", static_cast<int>(result));
++        RX_LOG_ERROR("vmaCreateBuffer (device-local, direct-path-eligible) failed: VkResult={}",
++                     static_cast<int>(result));
+         return std::nullopt;
+     }
+ 
+-    return Buffer(allocator_, buffer, allocation, allocationInfo.pMappedData, size);
++    VkMemoryPropertyFlags memoryFlags = 0;
++    vmaGetMemoryTypeProperties(allocator_, allocationInfo.memoryType, &memoryFlags);
++    bool directPathCapable = (memoryFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 &&
++                              (memoryFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
++
++    return Buffer(allocator_, buffer, allocation, allocationInfo.pMappedData, size, directPathCapable);
+ }
+ 
+-std::optional<Allocator::UploadBufferResult> Allocator::createUploadRingBuffer(VkDeviceSize size,
+-                                                                                  VkBufferUsageFlags usage) {
++std::optional<Buffer> Allocator::createUploadRingBuffer(VkDeviceSize size, VkBufferUsageFlags usage) {
+     VkBufferCreateInfo bufferInfo{};
+     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+     bufferInfo.size = size;
+     bufferInfo.usage = usage;
+     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+ 
++    // Deliberately NO ALLOW_TRANSFER_INSTEAD_BIT -- see this method's own
++    // header comment in buffer.h: for a TRANSFER_SRC-only usage (this
++    // buffer's real-world use, per rx::rhi::Uploader), that flag is
++    // structurally inert (verified directly against vendored VMA 3.4.0
++    // source) and an earlier version of this method carried it as dead,
++    // misleading weight -- this task's own Critical review finding.
+     VmaAllocationCreateInfo allocCreateInfo{};
+     allocCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
+-    allocCreateInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+-                             VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT |
+-                             VMA_ALLOCATION_CREATE_MAPPED_BIT;
++    allocCreateInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+ 
+     VkBuffer buffer = VK_NULL_HANDLE;
+     VmaAllocation allocation = VK_NULL_HANDLE;
+     VmaAllocationInfo allocationInfo{};
+     VkResult result =
+         vmaCreateBuffer(allocator_, &bufferInfo, &allocCreateInfo, &buffer, &allocation, &allocationInfo);
+     if (result != VK_SUCCESS) {
+         RX_LOG_ERROR("vmaCreateBuffer (upload ring buffer) failed: VkResult={}", static_cast<int>(result));
+         return std::nullopt;
+     }
+ 
+-    VkMemoryPropertyFlags memoryFlags = 0;
+-    vmaGetMemoryTypeProperties(allocator_, allocationInfo.memoryType, &memoryFlags);
+-    bool deviceLocal = (memoryFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+-
+-    return UploadBufferResult{Buffer(allocator_, buffer, allocation, allocationInfo.pMappedData, size), deviceLocal};
++    // directPathCapable left at its default (false) -- this Buffer is
++    // never a direct-upload destination candidate, by construction.
++    return Buffer(allocator_, buffer, allocation, allocationInfo.pMappedData, size);
+ }
+ 
+ Allocator::Allocator(Allocator&& other) noexcept : Allocator() {
+     *this = std::move(other);
+ }
+ 
+ Allocator& Allocator::operator=(Allocator&& other) noexcept {
+     if (this != &other) {
+         destroyAll();
+ 
+@@ -146,26 +161,28 @@ Buffer::Buffer(Buffer&& other) noexcept : Buffer() {
+ 
+ Buffer& Buffer::operator=(Buffer&& other) noexcept {
+     if (this != &other) {
+         destroyAll();
+ 
+         allocator_ = other.allocator_;
+         buffer_ = other.buffer_;
+         allocation_ = other.allocation_;
+         mappedData_ = other.mappedData_;
+         size_ = other.size_;
++        directPathCapable_ = other.directPathCapable_;
+ 
+         other.allocator_ = VK_NULL_HANDLE;
+         other.buffer_ = VK_NULL_HANDLE;
+         other.allocation_ = VK_NULL_HANDLE;
+         other.mappedData_ = nullptr;
+         other.size_ = 0;
++        other.directPathCapable_ = false;
+     }
+     return *this;
+ }
+ 
+ Buffer::~Buffer() {
+     destroyAll();
+ }
+ 
+ void Buffer::destroyAll() {
+     if (buffer_ != VK_NULL_HANDLE) {
+diff --git a/src/rx_rhi_vk/src/mesh_buffers.cpp b/src/rx_rhi_vk/src/mesh_buffers.cpp
+index 266c373..1434377 100644
+--- a/src/rx_rhi_vk/src/mesh_buffers.cpp
++++ b/src/rx_rhi_vk/src/mesh_buffers.cpp
+@@ -24,24 +24,31 @@ std::optional<MeshBuffers> MeshBuffers::create(Allocator& allocator, Uploader& u
+     }
+ 
+     auto indexBuffer = allocator.createDeviceLocalBuffer(
+         indexBytes,
+         VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+     if (!indexBuffer.has_value()) {
+         RX_LOG_ERROR("MeshBuffers::create: index buffer allocation failed ({} bytes)", indexBytes);
+         return std::nullopt;
+     }
+ 
+-    if (!uploader.uploadToBuffer(vertexBuffer->handle(), 0, vertexData, vertexBytes)) {
++    // Both buffers carry a real device-consuming usage bit
++    // (VERTEX_BUFFER_BIT/INDEX_BUFFER_BIT) on top of TRANSFER_DST_BIT --
++    // exactly what Uploader::uploadToBuffer()'s direct-path check needs
++    // Allocator::createDeviceLocalBuffer() to have requested
++    // ALLOW_TRANSFER_INSTEAD_BIT against (see that method's own comment).
++    // On a ReBAR-enabled/unified-memory device, both uploads below skip
++    // the staging ring entirely.
++    if (!uploader.uploadToBuffer(*vertexBuffer, 0, vertexData, vertexBytes)) {
+         RX_LOG_ERROR("MeshBuffers::create: vertex upload failed");
+         return std::nullopt;
+     }
+-    if (!uploader.uploadToBuffer(indexBuffer->handle(), 0, indexData, indexBytes)) {
++    if (!uploader.uploadToBuffer(*indexBuffer, 0, indexData, indexBytes)) {
+         RX_LOG_ERROR("MeshBuffers::create: index upload failed");
+         return std::nullopt;
+     }
+     uploader.flush();
+ 
+     return MeshBuffers(std::move(*vertexBuffer), std::move(*indexBuffer), indexCount, indexType);
+ }
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/texture.cpp b/src/rx_rhi_vk/src/texture.cpp
+index f40ff5b..aa92e59 100644
+--- a/src/rx_rhi_vk/src/texture.cpp
++++ b/src/rx_rhi_vk/src/texture.cpp
+@@ -83,28 +83,38 @@ void transitionLevelRange(VkCommandBuffer cmd, VkImage image, uint32_t baseLevel
+ 
+ std::optional<Texture2D> Texture2D::create(VkPhysicalDevice physicalDevice, VkDevice device, Allocator& allocator,
+                                             VkExtent2D extent, VkFormat format, VkImageUsageFlags usage,
+                                             uint32_t requestedMipLevels) {
+     uint32_t maxPossible = computeMaxMipLevels(extent);
+     uint32_t mipLevels = requestedMipLevels == 0 ? maxPossible : std::min(requestedMipLevels, maxPossible);
+ 
+     if (mipLevels > 1) {
+         VkFormatProperties formatProps{};
+         vkGetPhysicalDeviceFormatProperties(physicalDevice, format, &formatProps);
+-        // Both bits, not just BLIT_DST (see this method's declaration
+-        // comment in texture.h for why SRC is equally required) [R:C2].
+-        constexpr VkFormatFeatureFlags kBlitChainFeatures =
+-            VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
++        // Three bits, not just BLIT_DST (see this method's declaration
++        // comment in texture.h for why SRC is equally required) [R:C2]:
++        // BLIT_SRC_BIT/BLIT_DST_BIT for the blit itself, PLUS
++        // SAMPLED_IMAGE_FILTER_LINEAR_BIT -- vkCmdBlitImage with
++        // VK_FILTER_LINEAR (recordMipChainBlit()'s filter choice) also
++        // requires the SOURCE format to support linear filtering under
++        // the tiling in use (VUID-vkCmdBlitImage-filter-02001: "If filter
++        // is VK_FILTER_LINEAR, ... must contain
++        // VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT"), a
++        // requirement independent of the two blit bits above and missed
++        // by this task's own first implementation (flagged in review).
++        constexpr VkFormatFeatureFlags kBlitChainFeatures = VK_FORMAT_FEATURE_BLIT_SRC_BIT |
++                                                              VK_FORMAT_FEATURE_BLIT_DST_BIT |
++                                                              VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+         if ((formatProps.optimalTilingFeatures & kBlitChainFeatures) != kBlitChainFeatures) {
+             RX_LOG_WARN(
+-                "Texture2D::create: format {} does not support BLIT_SRC+BLIT_DST under optimal tiling on this "
+-                "device -- falling back to a single mip level instead of the requested {} [R:C2]",
++                "Texture2D::create: format {} does not support BLIT_SRC+BLIT_DST+FILTER_LINEAR under optimal "
++                "tiling on this device -- falling back to a single mip level instead of the requested {} [R:C2]",
+                 static_cast<int>(format), mipLevels);
+             mipLevels = 1;
+         }
+     }
+ 
+     // Level 0 always needs to be a transfer destination (Uploader's
+     // initial pixel copy); every level but the last additionally needs
+     // to be a transfer source once mipLevels > 1 (each level but the last
+     // is a vkCmdBlitImage source for the next one). Callers must not add
+     // either bit themselves -- see the header comment.
+diff --git a/src/rx_rhi_vk/src/upload.cpp b/src/rx_rhi_vk/src/upload.cpp
+index a3bfded..9ee69e1 100644
+--- a/src/rx_rhi_vk/src/upload.cpp
++++ b/src/rx_rhi_vk/src/upload.cpp
+@@ -62,42 +62,29 @@ std::optional<Uploader> Uploader::create(Allocator& allocator, Device& device, V
+     VkFenceCreateInfo fenceInfo{};
+     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+ 
+     VkFence fence = VK_NULL_HANDLE;
+     if (vkCreateFence(vkDevice, &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
+         RX_LOG_ERROR("Uploader::create: vkCreateFence failed");
+         vkDestroyCommandPool(vkDevice, pool, nullptr);
+         return std::nullopt;
+     }
+ 
+-    auto ringResult = allocator.createUploadRingBuffer(ringBufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+-    if (!ringResult.has_value()) {
++    auto ringBuffer = allocator.createUploadRingBuffer(ringBufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    if (!ringBuffer.has_value()) {
+         RX_LOG_ERROR("Uploader::create: failed to allocate the {}-byte staging ring buffer", ringBufferSize);
+         vkDestroyFence(vkDevice, fence, nullptr);
+         vkDestroyCommandPool(vkDevice, pool, nullptr);
+         return std::nullopt;
+     }
+ 
+-    // Detected once here, never per-upload -- see the class comment in
+-    // upload.h and [R:C1].
+-    if (ringResult->deviceLocal) {
+-        RX_LOG_INFO(
+-            "Uploader::create: staging ring buffer placed in DEVICE_LOCAL + HOST_VISIBLE memory (ReBAR/unified "
+-            "memory direct-upload path)");
+-    } else {
+-        RX_LOG_INFO(
+-            "Uploader::create: staging ring buffer placed in plain HOST_VISIBLE memory (non-ReBAR staging "
+-            "fallback path)");
+-    }
+-
+-    return Uploader(vkDevice, queue, pool, cmd, fence, std::move(ringResult->buffer), ringBufferSize,
+-                     ringResult->deviceLocal);
++    return Uploader(vkDevice, queue, pool, cmd, fence, std::move(*ringBuffer), ringBufferSize);
+ }
+ 
+ void Uploader::beginRecordingIfNeeded() {
+     if (recording_) {
+         return;
+     }
+ 
+     vkResetCommandBuffer(cmd_, 0);
+ 
+     VkCommandBufferBeginInfo beginInfo{};
+@@ -129,44 +116,78 @@ bool Uploader::reserveRingSpace(VkDeviceSize size, VkDeviceSize& outOffset) {
+         // known to fit: `size <= ringBufferSize_` was just checked above.
+         flush();
+         aligned = 0;
+     }
+ 
+     outOffset = aligned;
+     ringCursor_ = aligned + size;
+     return true;
+ }
+ 
+-bool Uploader::uploadToBuffer(VkBuffer dst, VkDeviceSize dstOffset, const void* data, VkDeviceSize size) {
++bool Uploader::uploadToBuffer(Buffer& dst, VkDeviceSize dstOffset, const void* data, VkDeviceSize size) {
+     if (size == 0) {
+         return true;
+     }
+ 
++    // DIRECT PATH: `dst`'s own allocation (Allocator::
++    // createDeviceLocalBuffer(), when `dst`'s usage carries a real
++    // device-consuming bit) landed in memory that is BOTH DEVICE_LOCAL
++    // and HOST_VISIBLE -- write straight into it, no staging copy, no
++    // command recorded at all. See the class comment in upload.h for the
++    // full mechanics and why this task's first implementation (flag on
++    // the ring buffer instead of the destination) never actually engaged
++    // this branch on any hardware.
++    if (dst.directPathCapable() && dst.mappedData() != nullptr) {
++        if (!loggedDirectPathOnce_) {
++            RX_LOG_INFO(
++                "Uploader::uploadToBuffer: destination memory is DEVICE_LOCAL + HOST_VISIBLE -- writing directly, "
++                "no staging copy [R:C1]");
++            loggedDirectPathOnce_ = true;
++        }
++        std::memcpy(static_cast<uint8_t*>(dst.mappedData()) + dstOffset, data, size);
++        // Written-before-GPU-read (a later draw/dispatch reading this
++        // buffer) on a possibly-non-coherent memory type -- Buffer::
++        // flush() (this task's own API addition) makes this correct
++        // regardless of coherence, exactly as it does for the ring
++        // buffer's own writes below.
++        dst.flush(dstOffset, size);
++        everUsedDirectPath_ = true;
++        return true;
++    }
++
++    // STAGING PATH: `dst` is not direct-path-capable (no device-consuming
++    // usage bit, or this hardware genuinely has no memory type that is
++    // both DEVICE_LOCAL and HOST_VISIBLE) -- go through the ring buffer,
++    // exactly as this class always did.
++    if (!loggedStagingPathOnce_) {
++        RX_LOG_INFO(
++            "Uploader::uploadToBuffer: destination memory is not DEVICE_LOCAL+HOST_VISIBLE -- staging through the "
++            "ring buffer [R:C1]");
++        loggedStagingPathOnce_ = true;
++    }
++    everUsedStagingPath_ = true;
++
+     VkDeviceSize ringOffset = 0;
+     if (!reserveRingSpace(size, ringOffset)) {
+         return false;
+     }
+ 
+     std::memcpy(static_cast<uint8_t*>(ringBuffer_.mappedData()) + ringOffset, data, size);
+-    // Written-before-GPU-read on a possibly-non-coherent HOST_VISIBLE
+-    // memory type -- exactly the case Buffer::flush() exists for (this
+-    // task's own API addition, closing the gap Phase 1 Task 3's review
+-    // flagged).
+     ringBuffer_.flush(ringOffset, size);
+ 
+     beginRecordingIfNeeded();
+ 
+     VkBufferCopy region{};
+     region.srcOffset = ringOffset;
+     region.dstOffset = dstOffset;
+     region.size = size;
+-    vkCmdCopyBuffer(cmd_, ringBuffer_.handle(), dst, 1, &region);
++    vkCmdCopyBuffer(cmd_, ringBuffer_.handle(), dst.handle(), 1, &region);
+     return true;
+ }
+ 
+ bool Uploader::uploadToImage(Texture2D& dst, const void* pixels, VkDeviceSize pixelBytes, bool generateMips) {
+     if (pixelBytes == 0) {
+         return true;
+     }
+ 
+     VkDeviceSize ringOffset = 0;
+     if (!reserveRingSpace(pixelBytes, ringOffset)) {
+@@ -188,25 +209,36 @@ bool Uploader::uploadToImage(Texture2D& dst, const void* pixels, VkDeviceSize pi
+ 
+     VkBufferImageCopy region{};
+     region.bufferOffset = ringOffset;
+     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+     region.imageSubresource.mipLevel = 0;
+     region.imageSubresource.baseArrayLayer = 0;
+     region.imageSubresource.layerCount = 1;
+     region.imageExtent = {dst.extent().width, dst.extent().height, 1};
+     vkCmdCopyBufferToImage(cmd_, ringBuffer_.handle(), dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+ 
+-    if (generateMips && dst.mipLevels() > 1) {
++    if (generateMips) {
+         // Handles every level's per-level barriers + blits, and leaves
+         // every level (including 0) in SHADER_READ_ONLY_OPTIMAL --
+         // including the level-0 TRANSFER_DST_OPTIMAL -> TRANSFER_SRC_OPTIMAL
+         // step this copy's destination layout above sets up for.
++        //
++        // No `&& dst.mipLevels() > 1` guard here (an earlier version of
++        // this code had one): recordMipChainBlit() already handles
++        // mipLevels() == 1 correctly and cheaply via its own early
++        // return (a single transitionLevelRange() call, identical to
++        // this method's own `else` branch below) -- adding a redundant
++        // guard here would just be duplicated logic with no behavioral
++        // difference, and it made recordMipChainBlit()'s early-return
++        // branch unreachable through this public API at all (flagged in
++        // this task's own review; see texture_test.cpp's dedicated
++        // single-mip test).
+         dst.recordMipChainBlit(cmd_);
+     } else {
+         transitionImage(cmd_, dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+     }
+     return true;
+ }
+ 
+ void Uploader::flush() {
+     if (!recording_) {
+@@ -245,59 +277,71 @@ void Uploader::flush() {
+ 
+ Uploader::Uploader(Uploader&& other) noexcept
+     : device_(other.device_),
+       queue_(other.queue_),
+       pool_(other.pool_),
+       cmd_(other.cmd_),
+       fence_(other.fence_),
+       ringBuffer_(std::move(other.ringBuffer_)),
+       ringBufferSize_(other.ringBufferSize_),
+       ringCursor_(other.ringCursor_),
+-      ringBufferIsDeviceLocal_(other.ringBufferIsDeviceLocal_),
+-      recording_(other.recording_) {
++      recording_(other.recording_),
++      everUsedDirectPath_(other.everUsedDirectPath_),
++      everUsedStagingPath_(other.everUsedStagingPath_),
++      loggedDirectPathOnce_(other.loggedDirectPathOnce_),
++      loggedStagingPathOnce_(other.loggedStagingPathOnce_) {
+     other.device_ = VK_NULL_HANDLE;
+     other.queue_ = VK_NULL_HANDLE;
+     other.pool_ = VK_NULL_HANDLE;
+     other.cmd_ = VK_NULL_HANDLE;
+     other.fence_ = VK_NULL_HANDLE;
+     other.ringBufferSize_ = 0;
+     other.ringCursor_ = 0;
+-    other.ringBufferIsDeviceLocal_ = false;
+     other.recording_ = false;
++    other.everUsedDirectPath_ = false;
++    other.everUsedStagingPath_ = false;
++    other.loggedDirectPathOnce_ = false;
++    other.loggedStagingPathOnce_ = false;
+ }
+ 
+ Uploader& Uploader::operator=(Uploader&& other) noexcept {
+     if (this != &other) {
+         destroyAll();
+ 
+         device_ = other.device_;
+         queue_ = other.queue_;
+         pool_ = other.pool_;
+         cmd_ = other.cmd_;
+         fence_ = other.fence_;
+         // Buffer's own move-assignment destroys ringBuffer_'s previous
+         // contents (if any) before taking over other.ringBuffer_'s.
+         ringBuffer_ = std::move(other.ringBuffer_);
+         ringBufferSize_ = other.ringBufferSize_;
+         ringCursor_ = other.ringCursor_;
+-        ringBufferIsDeviceLocal_ = other.ringBufferIsDeviceLocal_;
+         recording_ = other.recording_;
++        everUsedDirectPath_ = other.everUsedDirectPath_;
++        everUsedStagingPath_ = other.everUsedStagingPath_;
++        loggedDirectPathOnce_ = other.loggedDirectPathOnce_;
++        loggedStagingPathOnce_ = other.loggedStagingPathOnce_;
+ 
+         other.device_ = VK_NULL_HANDLE;
+         other.queue_ = VK_NULL_HANDLE;
+         other.pool_ = VK_NULL_HANDLE;
+         other.cmd_ = VK_NULL_HANDLE;
+         other.fence_ = VK_NULL_HANDLE;
+         other.ringBufferSize_ = 0;
+         other.ringCursor_ = 0;
+-        other.ringBufferIsDeviceLocal_ = false;
+         other.recording_ = false;
++        other.everUsedDirectPath_ = false;
++        other.everUsedStagingPath_ = false;
++        other.loggedDirectPathOnce_ = false;
++        other.loggedStagingPathOnce_ = false;
+     }
+     return *this;
+ }
+ 
+ Uploader::~Uploader() {
+     // Auto-flush pending (recorded-but-not-yet-submitted) work before
+     // tearing anything down -- see the class comment in upload.h. Safe
+     // unconditionally: flush() itself no-ops if nothing is recording.
+     flush();
+     destroyAll();
+diff --git a/src/rx_rhi_vk/tests/frame_sync_test.cpp b/src/rx_rhi_vk/tests/frame_sync_test.cpp
+index 0d4a083..1782cb9 100644
+--- a/src/rx_rhi_vk/tests/frame_sync_test.cpp
++++ b/src/rx_rhi_vk/tests/frame_sync_test.cpp
+@@ -144,10 +144,60 @@ TEST_CASE("FrameSync runs a real frames-in-flight acquire/submit/present loop")
+ 
+     // Destructor contract (frame_sync.h): FrameSync must not be destroyed
+     // until the device is idle. `frameSync` and `device` both unwind at the
+     // end of this scope in reverse declaration order (frameSync first, then
+     // device) -- this explicit wait is what makes that safe, exactly as the
+     // production present loop's shutdown sequence does.
+     REQUIRE(vkDeviceWaitIdle(vkDevice) == VK_SUCCESS);
+ 
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
++
++// FrameSync::frameNumber() (added this task, alongside rx::rhi::
++// DeletionQueue -- see that class's own header comment) has no real
++// Vulkan work to exercise: it's a plain counter incremented by
++// advanceFrame() alongside currentFrame_. No acquire/submit/present
++// needed to prove it -- just build a real FrameSync (still needs a real
++// windowed Device: FrameSync::create() takes a VkDevice) and call
++// advanceFrame() enough times to wrap currentFrameIndex() around its
++// mod-kFramesInFlight cycle at least twice, confirming frameNumber()
++// itself never wraps or repeats while currentFrameIndex() does -- the
++// exact distinction DeletionQueue's retire()/onFrameFenceSignaled() ABA-
++// avoidance depends on (frame_sync.h's own comment on frameNumber()).
++TEST_CASE("FrameSync::frameNumber() advances monotonically with advanceFrame(), independent of "
++          "currentFrameIndex()'s mod-kFramesInFlight cycling") {
++    auto fixture = makeFixture("rx_rhi_vk_frame_sync_test_frame_number");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto device = rx::rhi::Device::create(fixture->context, fixture->surface);
++    REQUIRE(device.has_value());
++    const VkDevice vkDevice = device->device();
++
++    auto frameSync = rx::rhi::FrameSync::create(vkDevice, device->graphicsQueueFamily(),
++                                                  static_cast<uint32_t>(device->swapchainImages().size()));
++    REQUIRE(frameSync.has_value());
++
++    // Starts at 0, matching currentFrameIndex()'s own starting value.
++    CHECK(frameSync->frameNumber() == 0);
++    CHECK(frameSync->currentFrameIndex() == 0);
++
++    constexpr uint64_t kIterations = 10;  // > 2 * kFramesInFlight, so currentFrameIndex() wraps at least twice
++    for (uint64_t i = 1; i <= kIterations; ++i) {
++        frameSync->advanceFrame();
++        // Monotonic, never repeats -- unlike currentFrameIndex() below.
++        CHECK(frameSync->frameNumber() == i);
++        CHECK(frameSync->currentFrameIndex() == static_cast<uint32_t>(i % rx::rhi::FrameSync::kFramesInFlight));
++    }
++
++    // Concrete evidence of the exact distinction frameNumber() exists
++    // for: two different frameNumber() values (2 and 4, both reachable
++    // within kIterations above) land on the SAME currentFrameIndex() slot
++    // -- a DeletionQueue keyed on currentFrameIndex() alone could not
++    // tell those two frames apart; frameNumber() can.
++    CHECK(2 % rx::rhi::FrameSync::kFramesInFlight == 4 % rx::rhi::FrameSync::kFramesInFlight);
++    CHECK(2 != 4);
++
++    REQUIRE(vkDeviceWaitIdle(vkDevice) == VK_SUCCESS);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/src/rx_rhi_vk/tests/texture_test.cpp b/src/rx_rhi_vk/tests/texture_test.cpp
+index 96c7d3a..e099cc8 100644
+--- a/src/rx_rhi_vk/tests/texture_test.cpp
++++ b/src/rx_rhi_vk/tests/texture_test.cpp
+@@ -121,20 +121,106 @@ TEST_CASE("Texture2D + Uploader::uploadToImage: 64x64 upload with generated mips
+     });
+ 
+     readback->invalidate();
+     std::vector<uint8_t> readBackPixels(pixels.size());
+     std::memcpy(readBackPixels.data(), readback->mappedData(), pixels.size());
+ 
+     CHECK(std::memcmp(readBackPixels.data(), pixels.data(), pixels.size()) == 0);
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
++TEST_CASE("Texture2D + Uploader::uploadToImage: a single-mip-level texture round-trips exactly through both "
++          "uploadToImage() branches -- generateMips=true (exercises Texture2D::recordMipChainBlit()'s own "
++          "early-return branch) and generateMips=false (exercises uploadToImage()'s plain-transition branch), "
++          "hardware-independent") {
++    auto fixture = makeFixture("rx_rhi_vk_texture_test_single_mip");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device);
++    REQUIRE(uploader.has_value());
++
++    constexpr VkExtent2D kExtent{16, 16};
++    constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
++    std::vector<uint8_t> pixels = makeGradientPixels(kExtent.width, kExtent.height);
++
++    auto readBackLevel0 = [&](rx::rhi::Texture2D& texture) {
++        auto readback = fixture->allocator.createHostVisibleBuffer(pixels.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++        REQUIRE(readback.has_value());
++
++        auto cmdCtx = rx::rhi::CommandContext::create(fixture->device.device(), fixture->device.graphicsQueue(),
++                                                        fixture->device.graphicsQueueFamily());
++        REQUIRE(cmdCtx.has_value());
++        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++            rx::rhi::transitionImage(cmd, texture.image(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++                                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++            VkBufferImageCopy region{};
++            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++            region.imageSubresource.layerCount = 1;
++            region.imageExtent = {kExtent.width, kExtent.height, 1};
++            vkCmdCopyImageToBuffer(cmd, texture.image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1,
++                                   &region);
++        });
++        readback->invalidate();
++        std::vector<uint8_t> result(pixels.size());
++        std::memcpy(result.data(), readback->mappedData(), pixels.size());
++        return result;
++    };
++
++    // Sub-case 1: generateMips=true on a requestedMipLevels=1 texture --
++    // uploadToImage() now calls Texture2D::recordMipChainBlit()
++    // unconditionally whenever generateMips is true (see upload.cpp),
++    // which for mipLevels() == 1 takes its own early-return branch (a
++    // single transitionLevelRange() call, no vkCmdBlitImage at all) --
++    // previously unreachable through this public API (this task's
++    // review, Important 2).
++    {
++        // TRANSFER_SRC_BIT requested explicitly: Texture2D::create() only
++        // auto-adds it when mipLevels() > 1 (a single-mip texture never
++        // needs to be a blit source in production), but this test's own
++        // readback helper needs it to run vkCmdCopyImageToBuffer.
++        auto textureA = rx::rhi::Texture2D::create(fixture->device.physicalDevice(), fixture->device.device(),
++                                                     fixture->allocator, kExtent, kFormat,
++                                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
++                                                     /*requestedMipLevels=*/1);
++        REQUIRE(textureA.has_value());
++        REQUIRE(textureA->mipLevels() == 1);
++
++        REQUIRE(uploader->uploadToImage(*textureA, pixels.data(), pixels.size(), /*generateMips=*/true));
++        uploader->flush();
++
++        std::vector<uint8_t> readBack = readBackLevel0(*textureA);
++        CHECK(std::memcmp(readBack.data(), pixels.data(), pixels.size()) == 0);
++    }
++
++    // Sub-case 2: generateMips=false on the same kind of texture --
++    // uploadToImage()'s plain single-transition `else` branch (never
++    // calls recordMipChainBlit() at all).
++    {
++        auto textureB = rx::rhi::Texture2D::create(fixture->device.physicalDevice(), fixture->device.device(),
++                                                     fixture->allocator, kExtent, kFormat,
++                                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
++                                                     /*requestedMipLevels=*/1);
++        REQUIRE(textureB.has_value());
++        REQUIRE(textureB->mipLevels() == 1);
++
++        REQUIRE(uploader->uploadToImage(*textureB, pixels.data(), pixels.size(), /*generateMips=*/false));
++        uploader->flush();
++
++        std::vector<uint8_t> readBack = readBackLevel0(*textureB);
++        CHECK(std::memcmp(readBack.data(), pixels.data(), pixels.size()) == 0);
++    }
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
+ TEST_CASE("Texture2D::create honors an explicit requestedMipLevels below the auto-computed maximum") {
+     auto fixture = makeFixture("rx_rhi_vk_texture_test_explicit_miplevels");
+     if (!fixture.has_value()) {
+         return;
+     }
+ 
+     auto texture =
+         rx::rhi::Texture2D::create(fixture->device.physicalDevice(), fixture->device.device(), fixture->allocator,
+                                     VkExtent2D{64, 64}, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT,
+                                     /*requestedMipLevels=*/3);
+diff --git a/src/rx_rhi_vk/tests/upload_test.cpp b/src/rx_rhi_vk/tests/upload_test.cpp
+index 02063cb..82c0a13 100644
+--- a/src/rx_rhi_vk/tests/upload_test.cpp
++++ b/src/rx_rhi_vk/tests/upload_test.cpp
+@@ -82,38 +82,140 @@ std::vector<uint8_t> readBackBuffer(rx::rhi::Allocator& allocator, VkDevice devi
+ }  // namespace
+ 
+ TEST_CASE("Uploader::uploadToBuffer round-trips bytes through the staging path byte-exact") {
+     auto fixture = makeFixture("rx_rhi_vk_upload_test_roundtrip");
+     if (!fixture.has_value()) {
+         return;
+     }
+ 
+     auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device);
+     REQUIRE(uploader.has_value());
+-    // Not a hard assertion either way -- both the direct (ReBAR/unified
+-    // memory) and staging (plain HOST_VISIBLE) paths are correct;
+-    // reporting which one this machine took is diagnostic, matching
+-    // Task 3's own bindless_test.cpp precedent of reporting hardware-
+-    // dependent facts via MESSAGE rather than asserting a specific one.
+-    MESSAGE("Uploader::usesDirectPath() on this machine: ", uploader->usesDirectPath());
+ 
+     constexpr VkDeviceSize kSize = 4096;
+     std::array<uint8_t, kSize> pattern{};
+     for (size_t i = 0; i < pattern.size(); ++i) {
+         pattern[i] = static_cast<uint8_t>((i * 31 + 7) & 0xFF);
+     }
+ 
++    // No device-consuming usage bit (TRANSFER_DST/SRC only) -- structurally
++    // never direct-path-capable (see Allocator::createDeviceLocalBuffer's
++    // own comment), so this specific round-trip always exercises the
++    // staging branch, matching this test's name.
+     auto dst = fixture->allocator.createDeviceLocalBuffer(
+         kSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+     REQUIRE(dst.has_value());
++    CHECK_FALSE(dst->directPathCapable());
+ 
+-    REQUIRE(uploader->uploadToBuffer(dst->handle(), 0, pattern.data(), kSize));
++    REQUIRE(uploader->uploadToBuffer(*dst, 0, pattern.data(), kSize));
++    uploader->flush();
++    CHECK(uploader->everUsedStagingPath());
++    CHECK_FALSE(uploader->everUsedDirectPath());
++
++    std::vector<uint8_t> readBack = readBackBuffer(fixture->allocator, fixture->device.device(),
++                                                     fixture->device.graphicsQueue(),
++                                                     fixture->device.graphicsQueueFamily(), dst->handle(), kSize);
++    CHECK(std::memcmp(readBack.data(), pattern.data(), kSize) == 0);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("Uploader::uploadToBuffer takes the direct memcpy-into-mapped-destination path when the destination's "
++          "own allocation lands DEVICE_LOCAL+HOST_VISIBLE -- mechanism asserted, not just observed") {
++    auto fixture = makeFixture("rx_rhi_vk_upload_test_direct_path");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device);
++    REQUIRE(uploader.has_value());
++
++    constexpr VkDeviceSize kSize = 256;
++    std::array<uint8_t, kSize> pattern{};
++    for (size_t i = 0; i < pattern.size(); ++i) {
++        pattern[i] = static_cast<uint8_t>((i * 17 + 3) & 0xFF);
++    }
++
++    // VERTEX_BUFFER_BIT is the real device-consuming usage bit that makes
++    // VmaBufferImageUsage::ContainsDeviceAccess() true, which is what
++    // makes Allocator::createDeviceLocalBuffer()'s
++    // ALLOW_TRANSFER_INSTEAD_BIT request meaningful at all (this task's
++    // own Critical review finding -- see that method's header comment).
++    auto dst = fixture->allocator.createDeviceLocalBuffer(
++        kSize,
++        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    REQUIRE(dst.has_value());
++
++    REQUIRE(uploader->uploadToBuffer(*dst, 0, pattern.data(), kSize));
++
++    if (dst->directPathCapable()) {
++        // The exact scenario this task's Critical review fix exists for:
++        // a ReBAR-capable desktop GPU (this project's own dev machine, a
++        // 246MB BAR window on an RTX 2080) or a unified-memory device
++        // (e.g. CI's lavapipe) must genuinely take the direct branch for
++        // a buffer this small -- asserted with CHECK, not merely logged
++        // or MESSAGE'd.
++        CHECK(uploader->everUsedDirectPath());
++        CHECK_FALSE(uploader->everUsedStagingPath());
++    } else {
++        // Only reachable on hardware with no memory type that is both
++        // DEVICE_LOCAL and HOST_VISIBLE for this usage combination (e.g.
++        // a discrete GPU with ReBAR unavailable/disabled) -- still a
++        // correct outcome, just not the one this test is named for; the
++        // staging branch must have engaged instead.
++        MESSAGE(
++            "this device's VERTEX_BUFFER_BIT|TRANSFER_DST_BIT allocation did not land DEVICE_LOCAL+HOST_VISIBLE -- "
++            "staging path exercised instead, which is still correct");
++        CHECK(uploader->everUsedStagingPath());
++    }
++
++    // flush() only matters for the staging branch (nothing was recorded
++    // for a direct-path write) -- harmless/no-op otherwise either way.
++    uploader->flush();
++
++    std::vector<uint8_t> readBack = readBackBuffer(fixture->allocator, fixture->device.device(),
++                                                     fixture->device.graphicsQueue(),
++                                                     fixture->device.graphicsQueueFamily(), dst->handle(), kSize);
++    CHECK(std::memcmp(readBack.data(), pattern.data(), kSize) == 0);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("Uploader::uploadToBuffer stages through the ring buffer when the destination is not direct-path-"
++          "capable, deterministically (hardware-independent)") {
++    auto fixture = makeFixture("rx_rhi_vk_upload_test_staging_deterministic");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device);
++    REQUIRE(uploader.has_value());
++
++    constexpr VkDeviceSize kSize = 256;
++    std::array<uint8_t, kSize> pattern{};
++    for (size_t i = 0; i < pattern.size(); ++i) {
++        pattern[i] = static_cast<uint8_t>((i * 5 + 1) & 0xFF);
++    }
++
++    // createHostVisibleBuffer() always reports directPathCapable() ==
++    // false (a hardcoded false, not a measurement -- see buffer.h's own
++    // comment on Buffer::directPathCapable()), regardless of this
++    // machine's real memory-type classification -- the deterministic way
++    // to force and verify the staging branch's own correctness
++    // independent of any specific hardware's ReBAR/unified-memory
++    // availability, exactly what this task's review asked for ("assert
++    // the mechanism, not the hardware").
++    auto dst = fixture->allocator.createHostVisibleBuffer(kSize,
++                                                            VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    REQUIRE(dst.has_value());
++    REQUIRE_FALSE(dst->directPathCapable());
++
++    REQUIRE(uploader->uploadToBuffer(*dst, 0, pattern.data(), kSize));
++    CHECK(uploader->everUsedStagingPath());
++    CHECK_FALSE(uploader->everUsedDirectPath());
+     uploader->flush();
+ 
+     std::vector<uint8_t> readBack = readBackBuffer(fixture->allocator, fixture->device.device(),
+                                                      fixture->device.graphicsQueue(),
+                                                      fixture->device.graphicsQueueFamily(), dst->handle(), kSize);
+     CHECK(std::memcmp(readBack.data(), pattern.data(), kSize) == 0);
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
+ TEST_CASE("Uploader auto-flushes mid-batch when the ring buffer runs out of room, and every upload stays "
+@@ -139,22 +241,22 @@ TEST_CASE("Uploader auto-flushes mid-batch when the ring buffer runs out of room
+         patternB[i] = static_cast<uint8_t>(0xFF - i);
+     }
+ 
+     auto dstA = fixture->allocator.createDeviceLocalBuffer(
+         kChunkSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+     REQUIRE(dstA.has_value());
+     auto dstB = fixture->allocator.createDeviceLocalBuffer(
+         kChunkSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+     REQUIRE(dstB.has_value());
+ 
+-    REQUIRE(uploader->uploadToBuffer(dstA->handle(), 0, patternA.data(), kChunkSize));
+-    REQUIRE(uploader->uploadToBuffer(dstB->handle(), 0, patternB.data(), kChunkSize));
++    REQUIRE(uploader->uploadToBuffer(*dstA, 0, patternA.data(), kChunkSize));
++    REQUIRE(uploader->uploadToBuffer(*dstB, 0, patternB.data(), kChunkSize));
+     uploader->flush();
+ 
+     std::vector<uint8_t> readA = readBackBuffer(fixture->allocator, fixture->device.device(),
+                                                   fixture->device.graphicsQueue(),
+                                                   fixture->device.graphicsQueueFamily(), dstA->handle(), kChunkSize);
+     std::vector<uint8_t> readB = readBackBuffer(fixture->allocator, fixture->device.device(),
+                                                   fixture->device.graphicsQueue(),
+                                                   fixture->device.graphicsQueueFamily(), dstB->handle(), kChunkSize);
+     CHECK(std::memcmp(readA.data(), patternA.data(), kChunkSize) == 0);
+     CHECK(std::memcmp(readB.data(), patternB.data(), kChunkSize) == 0);
+@@ -167,21 +269,21 @@ TEST_CASE("Uploader::uploadToBuffer rejects a single upload larger than the ring
+         return;
+     }
+ 
+     auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device, /*ringBufferSize=*/64);
+     REQUIRE(uploader.has_value());
+ 
+     std::array<uint8_t, 128> tooBig{};
+     auto dst = fixture->allocator.createDeviceLocalBuffer(128, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+     REQUIRE(dst.has_value());
+ 
+-    CHECK_FALSE(uploader->uploadToBuffer(dst->handle(), 0, tooBig.data(), tooBig.size()));
++    CHECK_FALSE(uploader->uploadToBuffer(*dst, 0, tooBig.data(), tooBig.size()));
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
+ TEST_CASE("MeshBuffers::create uploads vertex+index data into device-local buffers, byte-exact readback") {
+     auto fixture = makeFixture("rx_rhi_vk_upload_test_meshbuffers");
+     if (!fixture.has_value()) {
+         return;
+     }
+ 
+     auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device);
+@@ -211,21 +313,21 @@ TEST_CASE("MeshBuffers::create uploads vertex+index data into device-local buffe
+     // MeshBuffers::create() does not add TRANSFER_SRC_BIT to either
+     // buffer's usage (it only ever needs to be a transfer *destination*
+     // in production) -- readBackBuffer() below needs a fresh pair of
+     // TRANSFER_SRC-capable device-local buffers instead, populated
+     // through the same Uploader, purely so this test can verify the
+     // upload path independently of MeshBuffers' own accessors already
+     // returning correct handles/sizes above.
+     auto vertexCopy = fixture->allocator.createDeviceLocalBuffer(
+         sizeof(kVertices), VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+     REQUIRE(vertexCopy.has_value());
+-    REQUIRE(uploader->uploadToBuffer(vertexCopy->handle(), 0, kVertices.data(), sizeof(kVertices)));
++    REQUIRE(uploader->uploadToBuffer(*vertexCopy, 0, kVertices.data(), sizeof(kVertices)));
+     uploader->flush();
+ 
+     std::vector<uint8_t> readBack =
+         readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
+                         fixture->device.graphicsQueueFamily(), vertexCopy->handle(), sizeof(kVertices));
+     CHECK(std::memcmp(readBack.data(), kVertices.data(), sizeof(kVertices)) == 0);
+ 
+     // The real proof that MeshBuffers' OWN vertex/index buffers actually
+     // contain the right bytes (not just that Uploader in isolation works,
+     // which the copy above already showed): copy straight out of
