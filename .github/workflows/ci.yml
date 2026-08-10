@@ -131,6 +131,23 @@ jobs:
   windows-cross-zig:
     name: windows-cross-zig
     runs-on: ubuntu-latest
+    # Discovered directly from this workflow's own first real run: a
+    # brand-new Wine prefix defaults to WINEARCH=win32, which needs wine32
+    # (and i386 multiarch) -- this runner's "wine" package only pulled in
+    # wine64 to satisfy that dependency, so the default win32 prefix setup
+    # silently half-completed (Wine's own log: "it looks like wine32 is
+    # missing") and left Wine's window/Vulkan subsystem broken: SDL3's very
+    # first, unconditional Window::create() call failed outright
+    # ("Installed Vulkan doesn't implement the VK_KHR_surface extension"),
+    # not merely hitting a skip guard. This project's cross-compiled
+    # binaries are x86_64-windows-gnu only -- pure 64-bit, no 32-bit WoW64
+    # component ever needed -- so telling Wine to create a 64-bit-only
+    # prefix from the start sidesteps the wine32 dependency entirely.
+    # Verified locally: a fresh WINEARCH=win64 prefix runs
+    # toolchain_check.exe, rx_core_tests.exe, and rx_platform_tests.exe
+    # (the exact binary that failed in CI) all cleanly.
+    env:
+      WINEARCH: win64
     steps:
       - uses: actions/checkout@v7
 
