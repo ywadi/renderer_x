@@ -56,11 +56,38 @@ jobs:
       # require a real library; XDBE/XSHAPE/XSYNC only need headers already
       # covered by libx11-dev/libxext-dev) so this is the complete set, not
       # another one-check-at-a-time guess.
+      #
+      # vulkan-validationlayers [post-release fix, CI run acfce89]: provides
+      # VK_LAYER_KHRONOS_validation itself -- a SEPARATE Ubuntu package from
+      # libvulkan-dev/vulkan-tools/mesa-vulkan-drivers above, none of which
+      # pull it in as a dependency (verified directly: apt-cache depends on
+      # each of those three lists no vulkan-validationlayers pull-in, and
+      # this package was simply never in this list). Its absence was root-
+      # caused, not assumed: rx_rhi_vk/src/context.cpp's own
+      # VK_EXT_validation_features probe already queries vk-bootstrap's
+      # SystemInfo, whose available_extensions it verified (by reading the
+      # pinned vk-bootstrap commit 556b79b's SystemInfo constructor
+      # directly) already merges each installed layer's OWN extensions via
+      # a per-layer vkEnumerateInstanceExtensionProperties(layer.layerName,
+      # ...) call -- i.e. that probe is already layer-scoped, not the
+      # unscoped bug it might look like at a glance. Reproduced the CI log's
+      # exact "VK_EXT_validation_features unavailable... will not be
+      # active" warning locally by pointing VK_LAYER_PATH at an empty
+      # directory (simulating the layer being genuinely undiscoverable,
+      # exactly this runner's real state before this line existed) against
+      # an otherwise-unmodified rx_rhi_vk_tests binary, and confirmed the
+      # warning disappears with the layer package installed and VK_LAYER_PATH
+      # unset -- i.e. this one missing apt package, not any code path in
+      # this repository, was the entire root cause. See descriptor_arena.h/
+      # .cpp's own "BUDGETS ARE ARENA-ENFORCED" comment for this same CI
+      # run's other, unrelated finding (DescriptorArena's exhaustion
+      # contract relying on driver-optional VkDescriptorPool enforcement).
       - name: Install system packages
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            ninja-build mesa-vulkan-drivers vulkan-tools libvulkan-dev xvfb \
+            ninja-build mesa-vulkan-drivers vulkan-tools libvulkan-dev \
+            vulkan-validationlayers xvfb \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
             libxfixes-dev libxss-dev libxtst-dev libxkbcommon-dev
 

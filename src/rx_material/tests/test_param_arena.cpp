@@ -180,6 +180,18 @@ TEST_CASE("ParamArena: byte-arena exhaustion and descriptor-pool exhaustion at a
         // A fresh beginFrame(1) resets both the byte cursor and the paired
         // DescriptorArena's pool, so this sub-case starts from a clean
         // slate independent of the byte-arena sub-case above.
+        //
+        // [Post-release fix, CI lavapipe run acfce89] This now exercises
+        // rx::rhi::DescriptorArena's own arena-enforced maxSets/uniformBuffers
+        // budget (descriptor_arena.h's class-level BUDGETS ARE
+        // ARENA-ENFORCED comment), not driver-side VkDescriptorPool
+        // enforcement -- ParamArena::create() sizes both of that budget's
+        // fields to kMaxInstancesPerFrame (instance.cpp), so this loop hits
+        // the SAME arena-enforced ceiling deterministically on every
+        // driver, including lavapipe (which legally never enforces
+        // VkDescriptorPool's own limits itself -- see
+        // rx_rhi_vk/tests/descriptor_arena_test.cpp for that class's own
+        // direct, per-budget coverage).
         arena->beginFrame(1);
         uint32_t successfulAllocations = 0;
         for (; successfulAllocations < rx::material::ParamArena::kMaxInstancesPerFrame; ++successfulAllocations) {

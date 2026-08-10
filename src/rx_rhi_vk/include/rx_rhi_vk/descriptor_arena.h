@@ -42,6 +42,35 @@ struct DescriptorArenaCapacities {
 // THIS arena and one fresh byte range from THAT one, and both are reclaimed
 // together the next time this same frame-in-flight slot comes back around.
 //
+// BUDGETS ARE ARENA-ENFORCED, NOT DRIVER-ENFORCED [post-release fix, CI
+// lavapipe run acfce89]: allocate() tracks this slot's own consumed set
+// count and per-type (uniformBuffers) descriptor count against `capacities`
+// and refuses (VK_NULL_HANDLE, logged) BEFORE ever calling
+// vkAllocateDescriptorSets once either ceiling would be exceeded. This is
+// not defensive belt-and-suspenders -- it is the only correct way to make
+// "exhausted -> null" a real, portable contract, because the Vulkan spec
+// itself never obligates a driver to detect or report pool exhaustion at
+// all: vkAllocateDescriptorSets's own spec text says the allocation "may
+// fail due to lack of space in the descriptor pool" if a call would push
+// the pool's total sets past maxSets, or any one descriptor type's count
+// past that type's pool size -- "may", not "must" (only the resulting
+// ERROR CODE, VK_ERROR_OUT_OF_POOL_MEMORY / VK_ERROR_FRAGMENTED_POOL, is
+// mandatory IF an implementation chooses to detect exhaustion at all).
+// lavapipe/Mesa is a real, spec-conformant example of an implementation
+// that does not choose to: CI's lavapipe run let a call past this class's
+// documented maxSets ceiling succeed for real (verified directly:
+// descriptor_arena_test.cpp/test_param_arena.cpp both asserted the
+// documented-limit allocation returns VK_NULL_HANDLE, which held on every
+// real GPU driver this project had tested against but failed on lavapipe
+// specifically), while this project's own dev-machine driver happened to
+// enforce it -- exactly the driver-optional gap the spec permits. Tracking
+// and refusing in software here means "documented limit -> VK_NULL_HANDLE"
+// is now true on every conformant driver, including lavapipe, by
+// construction, with genuine driver-level exhaustion (a real
+// VK_ERROR_OUT_OF_POOL_MEMORY/VK_ERROR_FRAGMENTED_POOL from
+// vkAllocateDescriptorSets, e.g. from fragmentation this class's own
+// accounting cannot see) kept as a logged fallback path, never removed.
+//
 // DEVICE-FREE-WHERE-POSSIBLE: create() needs only a VkDevice -- no
 // VkPhysicalDevice, no VkInstance, no window/surface -- unlike
 // rx::rhi::BindlessTable, which additionally needs a VkPhysicalDevice to
@@ -99,10 +128,23 @@ public:
 
     // Allocates one VkDescriptorSet of `layout` from the CURRENT slot's
     // pool (whichever beginFrame() most recently reset -- slot 0 if
-    // allocate() is called before the first beginFrame()). Returns
-    // VK_NULL_HANDLE (logged) if that slot's pool cannot satisfy the
-    // request (e.g. maxSets already exhausted this reset cycle).
-    [[nodiscard]] VkDescriptorSet allocate(VkDescriptorSetLayout layout);
+    // allocate() is called before the first beginFrame()). `layout`'s own
+    // VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER descriptor count -- summed across
+    // every binding in that layout, e.g. 1 for the single-UBO-binding shape
+    // every real caller in this codebase uses today (see rx_material's
+    // ParamArena) -- must be passed as `uniformBufferDescriptorCount`: this
+    // class has no way to introspect an opaque VkDescriptorSetLayout's own
+    // bindings (Vulkan provides no query for that), so the caller is the
+    // only source of truth for how much of the `uniformBuffers` budget one
+    // allocate() call actually consumes. Returns VK_NULL_HANDLE (logged) if
+    // allocating this set would exceed EITHER this slot's remaining maxSets
+    // or its remaining uniformBuffers budget (checked, and refused, before
+    // vkAllocateDescriptorSets is ever called -- see the class-level
+    // BUDGETS ARE ARENA-ENFORCED comment above for why), or if the
+    // underlying driver call itself fails for a genuine reason (e.g. real
+    // pool fragmentation) despite this arena's own accounting having
+    // budget left.
+    [[nodiscard]] VkDescriptorSet allocate(VkDescriptorSetLayout layout, uint32_t uniformBufferDescriptorCount = 1);
 
     [[nodiscard]] uint32_t framesInFlight() const { return static_cast<uint32_t>(pools_.size()); }
 
@@ -113,6 +155,14 @@ private:
 
     VkDevice device_ = VK_NULL_HANDLE;
     std::vector<VkDescriptorPool> pools_;
+    Capacities capacities_;
+    // Parallel to pools_, one entry per frame-in-flight slot -- this slot's
+    // own count of sets/uniformBuffer-descriptors allocated since the most
+    // recent beginFrame() reset it to 0. This is the arena-side enforcement
+    // state the class-level BUDGETS ARE ARENA-ENFORCED comment documents;
+    // never touched by the driver, only by allocate()/beginFrame() here.
+    std::vector<uint32_t> allocatedSets_;
+    std::vector<uint32_t> allocatedUniformBuffers_;
     uint32_t currentFrame_ = 0;
 };
 

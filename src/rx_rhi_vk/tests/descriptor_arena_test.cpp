@@ -3,6 +3,7 @@
 #include <rx_rhi_vk/context.h>
 #include <rx_rhi_vk/descriptor_arena.h>
 #include <VkBootstrap.h>
+#include <array>
 #include <utility>
 
 // Pure headless test -- no rx::platform::Window, no VkSurfaceKHR, no
@@ -101,7 +102,12 @@ TEST_CASE("DescriptorArena::allocate across 3 simulated frames reuses reset pool
 
         // --- Simulated frame 0 (slot 0): allocate up to this arena's own
         // maxSets, then confirm exhaustion is a clean VK_NULL_HANDLE, not a
-        // crash or a validation error.
+        // crash or a validation error. [post-release fix, CI lavapipe run
+        // acfce89] This is now DescriptorArena's own arena-enforced budget
+        // firing (see descriptor_arena.h's class-level BUDGETS ARE
+        // ARENA-ENFORCED comment) -- deterministic on every driver,
+        // including lavapipe, which legally never enforces
+        // VkDescriptorPool's maxSets/pool-size limits itself.
         arena->beginFrame(0);
         for (uint32_t i = 0; i < capacities.maxSets; ++i) {
             VkDescriptorSet set = arena->allocate(layout);
@@ -157,6 +163,110 @@ TEST_CASE("DescriptorArena::create rejects framesInFlight == 0 and zero capaciti
     // A valid call still succeeds -- proves the rejections above are
     // specific to the bad inputs, not a broken fixture.
     CHECK(rx::rhi::DescriptorArena::create(fixture.device, /*framesInFlight=*/2).has_value());
+
+    vkb::destroy_device(fixture.vkbDevice);
+    CHECK_FALSE(fixture.context.hasValidationErrors());
+}
+
+// A set layout with TWO uniform-buffer bindings (binding 0 and binding 1,
+// one descriptor each) -- used below to prove allocate()'s own
+// uniformBuffers accounting sums the caller-supplied
+// `uniformBufferDescriptorCount` per call rather than just counting calls,
+// exactly the distinction a single-binding layout (makeUboSetLayout above)
+// cannot exercise.
+VkDescriptorSetLayout makeTwoUboSetLayout(VkDevice device) {
+    std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
+    bindings[0].binding = 0;
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[1].binding = 1;
+    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bindings[1].descriptorCount = 1;
+    bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    info.bindingCount = static_cast<uint32_t>(bindings.size());
+    info.pBindings = bindings.data();
+
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    REQUIRE(vkCreateDescriptorSetLayout(device, &info, nullptr, &layout) == VK_SUCCESS);
+    return layout;
+}
+
+// [Post-release fix, CI lavapipe run acfce89] Both TEST_CASEs above happen
+// to size maxSets == uniformBuffers, so hitting one ceiling always means
+// hitting the other at the exact same allocate() call -- neither one can
+// tell, on its own, which of the two arena-enforced budgets
+// (descriptor_arena.h's class-level BUDGETS ARE ARENA-ENFORCED comment)
+// actually fired. This case deliberately sizes the two ceilings DIFFERENTLY
+// in both directions, so each sub-case's exhaustion can only be explained
+// by the one budget that is actually smaller.
+TEST_CASE("DescriptorArena::allocate enforces its own maxSets and per-type uniformBuffers budgets independently, "
+          "before ever calling the driver") {
+    HeadlessDescriptorArenaFixture fixture = makeFixture();
+
+    {
+        VkDescriptorSetLayout oneUboLayout = makeUboSetLayout(fixture.device);
+
+        // --- Sub-case A: uniformBuffers is the SMALLER budget (3 vs. 8) --
+        // exhaustion must fire at the 4th allocate() call even though
+        // maxSets (8) is nowhere close to used up.
+        {
+            rx::rhi::DescriptorArena::Capacities capacities{/*maxSets=*/8, /*uniformBuffers=*/3};
+            auto arena = rx::rhi::DescriptorArena::create(fixture.device, /*framesInFlight=*/1, capacities);
+            REQUIRE(arena.has_value());
+            arena->beginFrame(0);
+
+            for (uint32_t i = 0; i < capacities.uniformBuffers; ++i) {
+                REQUIRE(arena->allocate(oneUboLayout) != VK_NULL_HANDLE);
+            }
+            // uniformBuffers (3) is exhausted; maxSets (8) has 5 slots left
+            // -- this VK_NULL_HANDLE can only be the per-type budget.
+            CHECK(arena->allocate(oneUboLayout) == VK_NULL_HANDLE);
+        }
+
+        // --- Sub-case B: maxSets is the SMALLER budget (3 vs. 8) --
+        // exhaustion must fire at the 4th allocate() call even though
+        // uniformBuffers (8) is nowhere close to used up.
+        {
+            rx::rhi::DescriptorArena::Capacities capacities{/*maxSets=*/3, /*uniformBuffers=*/8};
+            auto arena = rx::rhi::DescriptorArena::create(fixture.device, /*framesInFlight=*/1, capacities);
+            REQUIRE(arena.has_value());
+            arena->beginFrame(0);
+
+            for (uint32_t i = 0; i < capacities.maxSets; ++i) {
+                REQUIRE(arena->allocate(oneUboLayout) != VK_NULL_HANDLE);
+            }
+            // maxSets (3) is exhausted; uniformBuffers (8) has 5 descriptors
+            // left -- this VK_NULL_HANDLE can only be the maxSets budget.
+            CHECK(arena->allocate(oneUboLayout) == VK_NULL_HANDLE);
+        }
+
+        // --- Sub-case C: a single allocate() call consuming MORE than one
+        // uniformBuffers descriptor (a real two-UBO-binding layout, paired
+        // with the matching uniformBufferDescriptorCount=2 argument) --
+        // proves the budget sums descriptors per call, not just counts
+        // calls. 5 descriptors of budget, 2 consumed per call: two calls
+        // fit (4 of 5 used), a third would need 2 more (6 total) and must
+        // fail even though 1 descriptor of headroom nominally remains.
+        {
+            VkDescriptorSetLayout twoUboLayout = makeTwoUboSetLayout(fixture.device);
+            rx::rhi::DescriptorArena::Capacities capacities{/*maxSets=*/8, /*uniformBuffers=*/5};
+            auto arena = rx::rhi::DescriptorArena::create(fixture.device, /*framesInFlight=*/1, capacities);
+            REQUIRE(arena.has_value());
+            arena->beginFrame(0);
+
+            REQUIRE(arena->allocate(twoUboLayout, /*uniformBufferDescriptorCount=*/2) != VK_NULL_HANDLE);
+            REQUIRE(arena->allocate(twoUboLayout, /*uniformBufferDescriptorCount=*/2) != VK_NULL_HANDLE);
+            CHECK(arena->allocate(twoUboLayout, /*uniformBufferDescriptorCount=*/2) == VK_NULL_HANDLE);
+
+            vkDestroyDescriptorSetLayout(fixture.device, twoUboLayout, nullptr);
+        }
+
+        vkDestroyDescriptorSetLayout(fixture.device, oneUboLayout, nullptr);
+    }
 
     vkb::destroy_device(fixture.vkbDevice);
     CHECK_FALSE(fixture.context.hasValidationErrors());

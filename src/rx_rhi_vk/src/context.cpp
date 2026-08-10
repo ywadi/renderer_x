@@ -206,6 +206,28 @@ std::optional<Context> Context::create(std::vector<const char*> requiredExtensio
         // it already did before this change -- via request_validation_
         // layers()'s own soft degrade -- rather than a new, harder failure
         // mode introduced by this addition.
+        // VERIFIED, not assumed, layer-scoped already [post-release fix, CI
+        // lavapipe run acfce89 -- CI's log showed this warning firing on a
+        // runner initially believed to have VK_LAYER_KHRONOS_validation
+        // installed]: read directly against the pinned vk-bootstrap commit
+        // (third_party/CMakeLists.txt's RX_VK_BOOTSTRAP_COMMIT, checked out
+        // at build/<preset>/_deps-src/vk-bootstrap), SystemInfo's own
+        // constructor already loops over every layer
+        // vkEnumerateInstanceLayerProperties returns and merges EACH one's
+        // own extensions via a per-layer
+        // vkEnumerateInstanceExtensionProperties(layer.layerName, ...) call
+        // into available_extensions -- i.e. is_extension_available() below
+        // is already layer-scoped, not the unscoped bug that warning's
+        // wording might suggest. Reproduced directly: pointing
+        // VK_LAYER_PATH at an empty directory (making the layer genuinely
+        // undiscoverable) reliably reproduces this exact warning against an
+        // otherwise-unmodified build; restoring VK_LAYER_PATH makes it
+        // disappear. The real root cause of the CI failure was
+        // .github/workflows/ci.yml's linux-native job never installing the
+        // `vulkan-validationlayers` package in the first place (a separate
+        // Ubuntu package from libvulkan-dev/vulkan-tools/mesa-vulkan-
+        // drivers, confirmed via `apt-cache depends` that none of those
+        // three pull it in) -- fixed there, not here.
         auto systemInfo = vkb::SystemInfo::get_system_info();
         if (systemInfo && systemInfo->is_extension_available(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME)) {
             builder.enable_extension(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME)

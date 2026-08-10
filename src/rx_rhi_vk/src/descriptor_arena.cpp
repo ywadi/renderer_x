@@ -14,10 +14,15 @@ DescriptorArena& DescriptorArena::operator=(DescriptorArena&& other) noexcept {
 
         device_ = other.device_;
         pools_ = std::move(other.pools_);
+        capacities_ = other.capacities_;
+        allocatedSets_ = std::move(other.allocatedSets_);
+        allocatedUniformBuffers_ = std::move(other.allocatedUniformBuffers_);
         currentFrame_ = other.currentFrame_;
 
         other.device_ = VK_NULL_HANDLE;
         other.pools_.clear();
+        other.allocatedSets_.clear();
+        other.allocatedUniformBuffers_.clear();
         other.currentFrame_ = 0;
     }
     return *this;
@@ -76,6 +81,9 @@ std::optional<DescriptorArena> DescriptorArena::create(VkDevice device, uint32_t
     DescriptorArena arena;
     arena.device_ = device;
     arena.pools_ = std::move(pools);
+    arena.capacities_ = capacities;
+    arena.allocatedSets_.assign(framesInFlight, 0);
+    arena.allocatedUniformBuffers_.assign(framesInFlight, 0);
     return arena;
 }
 
@@ -86,9 +94,39 @@ void DescriptorArena::beginFrame(uint32_t frameIndex) {
         RX_LOG_ERROR("rx::rhi::DescriptorArena::beginFrame: vkResetDescriptorPool failed for slot {}: VkResult={}",
                      currentFrame_, static_cast<int>(result));
     }
+    // Reset this slot's own arena-enforced budget tracking regardless of
+    // the vkResetDescriptorPool result above -- a failed reset is already
+    // logged as an error by this class (nothing more this method can do
+    // about it), and every VkDescriptorSet the pool held is conceptually
+    // gone either way once beginFrame() has been called for this slot.
+    allocatedSets_[currentFrame_] = 0;
+    allocatedUniformBuffers_[currentFrame_] = 0;
 }
 
-VkDescriptorSet DescriptorArena::allocate(VkDescriptorSetLayout layout) {
+VkDescriptorSet DescriptorArena::allocate(VkDescriptorSetLayout layout, uint32_t uniformBufferDescriptorCount) {
+    // Arena-enforced budget check FIRST -- see descriptor_arena.h's
+    // class-level BUDGETS ARE ARENA-ENFORCED comment for why this cannot be
+    // left to the driver: vkAllocateDescriptorSets is never even called
+    // once either ceiling would be exceeded, so "documented limit ->
+    // VK_NULL_HANDLE" holds deterministically on every driver, including
+    // ones (lavapipe/Mesa) that legally never detect real pool exhaustion
+    // themselves.
+    if (allocatedSets_[currentFrame_] + 1 > capacities_.maxSets) {
+        RX_LOG_ERROR(
+            "rx::rhi::DescriptorArena::allocate: arena-enforced maxSets budget exhausted for frame slot {} ({} of "
+            "{} sets already allocated this reset cycle)",
+            currentFrame_, allocatedSets_[currentFrame_], capacities_.maxSets);
+        return VK_NULL_HANDLE;
+    }
+    if (allocatedUniformBuffers_[currentFrame_] + uniformBufferDescriptorCount > capacities_.uniformBuffers) {
+        RX_LOG_ERROR(
+            "rx::rhi::DescriptorArena::allocate: arena-enforced uniformBuffers budget exhausted for frame slot {} "
+            "({} of {} UBO descriptors already allocated this reset cycle, {} more requested)",
+            currentFrame_, allocatedUniformBuffers_[currentFrame_], capacities_.uniformBuffers,
+            uniformBufferDescriptorCount);
+        return VK_NULL_HANDLE;
+    }
+
     VkDescriptorSetAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     allocInfo.descriptorPool = pools_[currentFrame_];
@@ -98,11 +136,20 @@ VkDescriptorSet DescriptorArena::allocate(VkDescriptorSetLayout layout) {
     VkDescriptorSet set = VK_NULL_HANDLE;
     VkResult result = vkAllocateDescriptorSets(device_, &allocInfo, &set);
     if (result != VK_SUCCESS) {
+        // Genuine driver-level failure fallback path (e.g. real pool
+        // fragmentation, VK_ERROR_FRAGMENTED_POOL) -- this arena's own
+        // budget check above found room, but the driver still could not
+        // satisfy the request. Logged distinctly from the arena-enforced
+        // rejections above so the two cases are never confused when
+        // reading logs.
         RX_LOG_ERROR("rx::rhi::DescriptorArena::allocate: vkAllocateDescriptorSets failed for frame slot {}: "
                      "VkResult={}",
                      currentFrame_, static_cast<int>(result));
         return VK_NULL_HANDLE;
     }
+
+    allocatedSets_[currentFrame_] += 1;
+    allocatedUniformBuffers_[currentFrame_] += uniformBufferDescriptorCount;
     return set;
 }
 
