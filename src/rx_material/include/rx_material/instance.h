@@ -83,6 +83,25 @@ struct InstanceBinding {
     size_t paramSize = 0;
 };
 
+class ParamArena;
+
+namespace detail {
+
+// Test-only seam -- NOT part of the stable internal contract, mirroring
+// rx_graph's own `detail::debugLastFrameFinalStages()` and this same
+// library's own `detail::debugCompileCount()` carve-out convention:
+// exposed purely so a standalone ParamArena test [Fix round 1,
+// task-7-review.md F2] can read back the raw bytes writeAndAllocate()
+// wrote into a given frame-in-flight slot's own host-visible buffer, to
+// prove cross-frame isolation and reset behavior directly -- there is no
+// other way to observe this from outside ParamArena's own implementation
+// (writeAndAllocate() returns only an opaque VkDescriptorSet, by design;
+// see that method's own comment). Returns nullptr if `arena` has no
+// buffers at all (never true for a successfully create()'d ParamArena).
+[[nodiscard]] const void* debugFrameBufferData(const ParamArena& arena, uint32_t frameIndex);
+
+}  // namespace detail
+
 // ParamArena -- the GPU-visible half of "material instance" [Task 7
 // brief]: a per-frames-in-flight, host-visible, persistently-mapped,
 // bump-allocated uniform-buffer arena (the CPU-writable byte storage) paired
@@ -172,6 +191,8 @@ public:
     [[nodiscard]] uint32_t framesInFlight() const { return static_cast<uint32_t>(buffers_.size()); }
 
 private:
+    friend const void* detail::debugFrameBufferData(const ParamArena& arena, uint32_t frameIndex);
+
     ParamArena() = default;
 
     // std::optional, not a plain member: rx::rhi::DescriptorArena's own

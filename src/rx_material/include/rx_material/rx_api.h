@@ -149,7 +149,19 @@ static_assert(sizeof(RxTextureDesc) == 32,
 //                         material.
 //   RX_E_INVALIDARG    -- `name`/`value`/`texture` is null, OR `name` is
 //                         a real reflected parameter of a DIFFERENT type
-//                         than this setter binds.
+//                         than this setter binds, OR (setTexture only,
+//                         see below) `texture` is not an engine-created
+//                         IRxTexture.
+// setTexture()'s own invariant [Fix round 1, task-7-review.md F1]:
+// `texture` must be an IRxTexture obtained from
+// IRxMaterialSystem::createTexture2D() (directly, or via a chain of
+// queryInterface() calls on one) -- exactly what IRxTexture's own doc
+// comment above already documents every valid instance as being. Any
+// OTHER IRxTexture implementation (a hand-rolled third-party one, a test
+// double, ...) is REJECTED with RX_E_INVALIDARG, never silently bound: a
+// foreign texture has no real bindless-table registration this engine
+// can report, so binding it anyway would mean writing an arbitrary, real
+// slot's index into the parameter blob with no diagnostic signal at all.
 // Values are stored into a CPU-side blob owned by the instance object, laid
 // out byte-for-byte at the material's own reflected field offsets [Task 7]
 // -- draw-time binding of that blob into a real per-instance descriptor

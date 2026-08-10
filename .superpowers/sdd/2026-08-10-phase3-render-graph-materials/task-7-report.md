@@ -387,3 +387,181 @@ section 3" above.
   relies on elsewhere (and D9's own text scopes the DeletionQueue
   requirement to "pipeline destruction" specifically). Recorded here
   explicitly as a reviewed, deliberate design choice, not an oversight.
+
+---
+
+## Fix round 1 (review: `task-7-review.md`, commit `067fdde`)
+
+Review verdict: spec ❌ on "production grade" (1 High: F1) plus 1 Medium
+(F2). Both addressed below.
+
+### F1 (High) — `setTexture()` silently bound bindless index 0 for a non-engine `IRxTexture`
+
+**Root cause.** `MaterialInstanceImpl::setTexture()` already used the
+correct, RTTI-free detection mechanism (a private
+`kIID_InternalTextureBridge` `queryInterface` check to distinguish a real,
+`createTexture2D()`-backed `TextureImpl` from anything else), but applied
+the wrong *policy* on a QI failure: `bindlessIndex` stayed `0` (a real,
+arbitrary bindless slot) and the call still returned `RX_OK`. A caller
+passing any non-engine `IRxTexture` got silently wrong rendering with zero
+diagnostic signal — the review correctly identified this as inconsistent
+with `rx_api.h`'s own documented `IRxTexture` invariant ("always wraps a
+renderer-owned... texture, created via `IRxMaterialSystem::
+createTexture2D()`"), and with the reason originally given for keeping
+the fallback (preserving Task 6's `FakeTexture` refcount tests) as not
+holding up: the bridge GUID is anonymous-namespace-private, so no test
+double could ever legitimately answer it regardless of policy.
+
+**Fix applied** (`api_impl.cpp`): the QI-failure branch now returns
+`RX_E_INVALIDARG` immediately (logged) instead of defaulting
+`bindlessIndex` to `0` and proceeding. The real bindless index is only
+ever read once the QI has already succeeded. `kIID_InternalTextureBridge`'s
+own header comment updated to describe the reject-not-fallback behavior.
+`rx_api.h`'s `IRxMaterialInstance`/`setTexture` doc comment now states the
+invariant explicitly at the call site itself, not only on `IRxTexture`'s
+own comment: `texture` must be engine-created (via `createTexture2D()`,
+directly or through a `queryInterface()` chain on one); any other
+implementation is rejected with `RX_E_INVALIDARG`.
+
+**Test changes** (`test_api_factory.cpp`) — adapted, not deleted, per the
+coordinator's instruction:
+- The old "`IRxMaterialInstance::setTexture` validates a real
+  bindless-index (uint) parameter and manages the `IRxTexture` reference
+  it stores" test (which asserted `RX_OK` for a `FakeTexture`) is now
+  "`IRxMaterialInstance::setTexture` rejects a non-engine-created
+  `IRxTexture`... with `RX_E_INVALIDARG`" — same `FakeTexture` double,
+  same fixture, now asserting the rejection, plus a new assertion that the
+  rejection happens *before* any refcount mutation (`fake->refCount()`
+  unchanged across the rejected call — proving the QI check runs ahead of
+  any addRef()).
+- A NEW test, "`IRxMaterialInstance::setTexture` manages the `IRxTexture`
+  reference it stores across overwrite and instance destruction (real
+  engine-created textures)", preserves the exact addRef/release lifecycle
+  coverage the old `FakeTexture`-based assertions provided — same
+  overwrite/destroy sequence, same three checkpoints (store, overwrite,
+  instance destruction) — but against two REAL `IRxTexture`s obtained via
+  `IRxMaterialSystem::createTexture2D()`, since a rejected texture never
+  reaches the refcount-mutating code path at all. `TextureImpl` exposes no
+  `refCount()` accessor of its own (unlike the test-only `FakeTexture`), so
+  this test reads a live texture's current refcount via a new
+  side-effect-free `probeRefCount()` helper (one `addRef()` immediately
+  undone by one `release()`, net zero) rather than adding a debug-only
+  accessor to the ABI-facing `IRxTexture`/`TextureImpl` itself.
+- Every OTHER pre-existing `FakeTexture`-based `setTexture` call in this
+  file (the "happy path" test's `wrongTypeTexture`/`notFoundTexture`, the
+  "entry-point audit" test's `texture`) is unaffected by this fix: each of
+  those hits a name-not-found or field-kind mismatch before the
+  engine-texture check would ever run, so their expected results are
+  unchanged — verified by re-running, not just reasoned about.
+
+### F2 (Medium) — no standalone `ParamArena` test; every delivered exercise used `frameInFlightIndex == 0` only
+
+**Root cause.** `instance.h`'s own header comment claimed `ParamArena`
+"[l]ives at namespace scope... so it can be unit-tested on its own," but
+no test actually did so — every exercise went through
+`MaterialSystem::bindInstance()`, and both of `test_material_system.cpp`'s
+`bindInstance()` cases called `beginFrame(0, ...)` exclusively. Nothing
+confirmed slot isolation at the `ParamArena`-composed layer (as opposed to
+`DescriptorArena` alone, which already had this coverage) or confirmed the
+documented exhaustion/failure path is reachable in practice at a non-zero
+frame-in-flight index.
+
+**Fix applied:** new `src/rx_material/tests/test_param_arena.cpp` (added
+to `rx_material_gpu_tests`), exercising `ParamArena` directly against a
+bare `VkDevice` + `rx::rhi::Allocator` — no `MaterialSystem`,
+`BindlessTable`, or `RenderGraph`/`Executor` involved, mirroring
+`rx_rhi_vk/tests/descriptor_arena_test.cpp`'s own minimal headless fixture
+(`Context::create({}, true)` + a bare `vkb::PhysicalDeviceSelector`/
+`DeviceBuilder`, no descriptor-indexing or dynamic-rendering features
+needed). A new test-only seam, `rx::material::detail::
+debugFrameBufferData(const ParamArena&, uint32_t frameIndex)`
+(`instance.h`/`.cpp`, `friend`-gated into `ParamArena`, mirroring this
+codebase's own `detail::debugCompileCount()`/`detail::
+debugLastFrameFinalStages()` carve-out convention), reads back the raw
+bytes a given frame-in-flight slot's own host-visible buffer actually
+holds — `writeAndAllocate()` itself returns only an opaque
+`VkDescriptorSet` by design, so there was no other way to observe this
+from outside `ParamArena`'s own implementation.
+
+Two new test cases, both exercising `frameInFlightIndex` values other
+than (and in addition to) `0`, per the coordinator's explicit instruction:
+- **Frame isolation + reset-not-fresh-arena**: `beginFrame(0)` writes blob
+  A; `beginFrame(1)` writes blob B; asserts slot 0 still holds exactly
+  blob A's bytes (untouched by slot 1's own bump allocation) and slot 1
+  holds exactly blob B's. Then `beginFrame(2)` (wraps back to slot 0) —
+  writes blob C and asserts it landed at slot 0's buffer offset 0 again
+  (proving the reset, not merely a coincidentally-still-empty arena, is
+  what reclaimed the capacity) while slot 1 still holds blob B untouched.
+- **Exhaustion, at `frameInFlightIndex == 1`**: (a) a single
+  `writeAndAllocate()` request larger than `kBytesPerFrame` fails cleanly
+  (`VK_NULL_HANDLE`, logged), and a normal-sized write immediately after
+  it still succeeds with byte-exact content — proving the failed oversized
+  request did not corrupt the slot; (b) a fresh `beginFrame(1)`, then
+  `kMaxInstancesPerFrame` (512) successful `writeAndAllocate()` calls
+  followed by one more that must fail cleanly — proving the descriptor-
+  pool ceiling is reached at exactly the documented number and the
+  overflow attempt fails without corrupting the 512 already-written
+  blobs (re-checked byte-exact after the failed 513th call).
+
+Both new cases pass, zero validation errors — confirmed the real Vulkan
+error paths fire as designed (`rx::material::ParamArena::writeAndAllocate:
+frame slot 1 exhausted...` and `rx::rhi::DescriptorArena::allocate:
+vkAllocateDescriptorSets failed for frame slot 1...` both observed in the
+log during this run, not merely asserted blind).
+
+**Not fixed, noted for the record:** `writeAndAllocate()`'s byte-arena
+cursor advances (memcpy + `cursor = end`) *before* attempting the
+`DescriptorArena::allocate()` call; if that later allocation fails (pool
+exhausted), the cursor has still moved, wasting some byte-arena space on
+the failed call. This does not corrupt any already-written data (the
+bounds check for the *next* write is still against the real, moved-forward
+cursor, so no overlap can occur) and was not something the review's F2
+finding asked to be fixed (it asked for a *test*, not a behavior change,
+and no test assertion here depends on the cursor staying put after a
+failed allocation) — flagged here explicitly rather than silently
+patched, since a coordinator revisiting this later may want the cursor
+rolled back on that specific failure path for byte-arena efficiency.
+
+### Re-verification after both fixes
+
+- `ctest --preset linux-native --output-on-failure`: **14/14 passed**
+  (full repo regression).
+- `rx_material_gpu_tests --validate`: **25 test cases / 344 assertions**
+  (up from 22/296 — net +1 test case from splitting the F1 test into two,
+  +2 new `ParamArena` cases), all passing, zero validation errors.
+- `rx_material_tests`: **10 test cases / 50 assertions**, unchanged —
+  confirms zero regression on the device-free ABI contract surface.
+- `rx_rhi_vk_tests`: unaffected by this round's changes, re-run for
+  completeness — unchanged pass count.
+- Both presets rebuilt clean: `cmake --build build/linux-native` and
+  `cmake --build build/windows-cross-zig` — zero errors, every
+  touched/new target (`rx_rhi_vk`, `rx_material`, `rx_material_gpu_tests`,
+  `rx_material_tests`) relinked successfully.
+- Manual warning re-check (same method as the original submission —
+  extracted each changed/new file's real `compile_commands.json`
+  invocation, ran it with `-Wall -Wextra -Wpedantic -Wshadow` appended):
+  zero warnings/errors originating in `api_impl.cpp`, `instance.cpp`,
+  `test_api_factory.cpp`, `test_param_arena.cpp`.
+- AI-attribution grep on every file touched this round: zero matches.
+
+### Files touched this round
+
+- `src/rx_material/api_impl.cpp` (F1: `setTexture()` now rejects a
+  QI-bridge failure with `RX_E_INVALIDARG`; updated
+  `kIID_InternalTextureBridge`'s own header comment).
+- `src/rx_material/include/rx_material/rx_api.h` (F1: documented the
+  engine-created-texture-only invariant directly at `IRxMaterialInstance`/
+  `setTexture`'s own doc comment).
+- `src/rx_material/include/rx_material/instance.h` (F2: new
+  `detail::debugFrameBufferData()` test-only seam, `friend`-declared into
+  `ParamArena`).
+- `src/rx_material/instance.cpp` (F2: `debugFrameBufferData()`
+  implementation).
+- `src/rx_material/tests/test_api_factory.cpp` (F1: split/adapted the
+  `FakeTexture`-based `setTexture` test into a rejection test + a new
+  real-texture refcount-lifecycle test with a `probeRefCount()` helper).
+- `src/rx_material/tests/test_param_arena.cpp` (F2: new standalone
+  `ParamArena` test file — frame isolation/reset, exhaustion).
+- `src/rx_material/tests/CMakeLists.txt` (F2: registers
+  `test_param_arena.cpp` on `rx_material_gpu_tests`).
+- This report (`task-7-report.md`) — this Fix round 1 section.

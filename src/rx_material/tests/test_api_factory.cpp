@@ -225,8 +225,19 @@ TEST_CASE("rxCreateMaterialSystem + loadMaterial: happy path against a real devi
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 
-TEST_CASE("IRxMaterialInstance::setTexture validates a real bindless-index (uint) parameter and manages the "
-          "IRxTexture reference it stores") {
+// [Fix round 1, task-7-review.md F1] `FakeTexture` is a hand-rolled,
+// non-engine `IRxTexture` implementation -- it fails the internal
+// `kIID_InternalTextureBridge` queryInterface check (anonymous-namespace-
+// private to api_impl.cpp; no test double could ever answer it), so
+// `setTexture()` must REJECT it with RX_E_INVALIDARG rather than silently
+// binding bindless index 0. This test previously (Task 6/7's original
+// submission) asserted RX_OK here and used `FakeTexture` to exercise
+// setTexture()'s addRef()/release() lifecycle management -- that
+// lifecycle coverage now lives in the REAL-texture test right below this
+// one (a rejected call never reaches the refcount-mutating code path at
+// all, so `FakeTexture` genuinely cannot exercise it anymore).
+TEST_CASE("IRxMaterialInstance::setTexture rejects a non-engine-created IRxTexture (e.g. a hand-rolled test "
+          "double) with RX_E_INVALIDARG") {
     auto fixture = makeFixture("rx_api_factory_texture_param");
     if (!fixture.has_value()) {
         return;
@@ -249,27 +260,92 @@ TEST_CASE("IRxMaterialInstance::setTexture validates a real bindless-index (uint
     REQUIRE(material->createInstance(&instance) == RX_OK);
 
     // Wrong setter for a real uint (bindless-index) field -- type
-    // mismatch.
+    // mismatch, checked (and unaffected by F1's fix) before the
+    // engine-texture check ever runs.
     CHECK(instance->setFloat("albedoIndex", 1.0F) == RX_E_INVALIDARG);
 
-    auto* first = new FakeTexture();
-    CHECK(first->refCount() == 1);
+    auto* fake = new FakeTexture();
+    CHECK(fake->refCount() == 1);
+    CHECK(instance->setTexture("albedoIndex", fake) == RX_E_INVALIDARG);
+    // Rejection happens before any refcount mutation at all -- `fake`'s
+    // count is completely untouched by the rejected call.
+    CHECK(fake->refCount() == 1);
+    fake->release();
+
+    instance->release();
+    material->release();
+    system->release();
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// The addRef()/release() lifecycle coverage the old FakeTexture-based test
+// used to provide, preserved here against REAL engine-created textures
+// (the only kind setTexture() accepts as of F1's fix) -- probeRefCount()
+// below reads a live IRxTexture's current refcount side-effect-free (one
+// addRef() immediately undone by one release(), net zero) since, unlike
+// the test-only FakeTexture double, the real TextureImpl exposes no
+// refCount() accessor of its own.
+namespace {
+uint32_t probeRefCount(IRxTexture* texture) {
+    uint32_t afterAddRef = texture->addRef();
+    uint32_t afterRelease = texture->release();
+    (void)afterRelease;
+    return afterAddRef - 1;
+}
+}  // namespace
+
+TEST_CASE("IRxMaterialInstance::setTexture manages the IRxTexture reference it stores across overwrite and "
+          "instance destruction (real engine-created textures)") {
+    auto fixture = makeFixture("rx_api_factory_texture_refcount");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto internal = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+                                                            freshCachePath("api_texture_refcount"));
+    REQUIRE(internal != nullptr);
+
+    RxMaterialSystemDesc desc{internal.get()};
+    IRxMaterialSystem* system = nullptr;
+    REQUIRE(rxCreateMaterialSystem(&desc, &system) == RX_OK);
+
+    IRxMaterial* material = nullptr;
+    std::string texturedPath = testDataPath("test_textured.slang").string();
+    REQUIRE(system->loadMaterial(texturedPath.c_str(), &material) == RX_OK);
+
+    IRxMaterialInstance* instance = nullptr;
+    REQUIRE(material->createInstance(&instance) == RX_OK);
+
+    std::vector<uint8_t> pixels(static_cast<size_t>(2) * 2 * 4, 0x40);
+    RxTextureDesc td{};
+    td.pixels = pixels.data();
+    td.pixelBytes = pixels.size();
+    td.width = 2;
+    td.height = 2;
+    td.format = RX_FORMAT_RGBA8_UNORM;
+    td.generateMips = 0;
+
+    IRxTexture* first = nullptr;
+    REQUIRE(system->createTexture2D(&td, &first) == RX_OK);
+    CHECK(probeRefCount(first) == 1);
+
     REQUIRE(instance->setTexture("albedoIndex", first) == RX_OK);
-    CHECK(first->refCount() == 2);  // instance now holds its own reference too
+    CHECK(probeRefCount(first) == 2);  // instance now holds its own reference too
 
     // Overwriting the same parameter releases the previously stored
     // texture and addRef()s the new one.
-    auto* second = new FakeTexture();
+    IRxTexture* second = nullptr;
+    REQUIRE(system->createTexture2D(&td, &second) == RX_OK);
     REQUIRE(instance->setTexture("albedoIndex", second) == RX_OK);
-    CHECK(first->refCount() == 1);   // instance's reference on `first` was released
-    CHECK(second->refCount() == 2);  // instance now holds a reference on `second`
+    CHECK(probeRefCount(first) == 1);   // instance's reference on `first` was released
+    CHECK(probeRefCount(second) == 2);  // instance now holds a reference on `second`
 
     first->release();  // drop the caller's own ref -- `first` is fully destroyed now.
 
     // Destroying the instance releases whatever it still holds
     // (`second`) exactly once.
     instance->release();
-    CHECK(second->refCount() == 1);  // only the caller's own ref remains
+    CHECK(probeRefCount(second) == 1);  // only the caller's own ref remains
     second->release();
 
     material->release();

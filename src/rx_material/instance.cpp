@@ -88,4 +88,16 @@ VkDescriptorSet ParamArena::writeAndAllocate(VkDescriptorSetLayout setLayout, co
     return set;
 }
 
+namespace detail {
+
+const void* debugFrameBufferData(const ParamArena& arena, uint32_t frameIndex) {
+    if (arena.buffers_.empty()) {
+        return nullptr;
+    }
+    uint32_t slot = frameIndex % static_cast<uint32_t>(arena.buffers_.size());
+    return arena.buffers_[slot].mappedData();
+}
+
+}  // namespace detail
+
 }  // namespace rx::material

@@ -26,6 +26,11 @@ add_executable(rx_material_gpu_tests
     # contract lives in rx_material_tests below; this is the ONE case
     # this task's tests need a real device for.
     test_api_factory.cpp
+    # Task 7 fix round 1 (F2): standalone ParamArena tests against a bare
+    # VkDevice + rx::rhi::Allocator -- no MaterialSystem/BindlessTable/
+    # RenderGraph needed, matching rx_rhi_vk/tests/descriptor_arena_test.cpp's
+    # own minimal headless fixture pattern.
+    test_param_arena.cpp
 )
 target_link_libraries(rx_material_gpu_tests PRIVATE rx_material rx_rhi_vk rx_platform doctest::doctest)
 rx_shader_deploy_runtime_libs(rx_material_gpu_tests)

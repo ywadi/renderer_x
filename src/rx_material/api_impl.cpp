@@ -73,10 +73,22 @@ bool guidEquals(const RxGuid& a, const RxGuid& b) { return std::memcmp(&a, &b, s
 // implementation" (e.g. a test-only double). A texture that does not
 // answer to this GUID (anything not created via
 // IRxMaterialSystem::createTexture2D()) has no real bindless registration
-// to report at all -- setTexture() falls back to writing bindless index 0
-// for it (see that method's own comment) rather than failing the whole
-// call; this is exactly what keeps test_api_factory.cpp's existing
-// FakeTexture-based refcount/lifecycle tests (Task 6) passing unchanged.
+// to report at all -- setTexture() REJECTS it outright with
+// RX_E_INVALIDARG (see that method's own comment) [Fix round 1,
+// task-7-review.md F1: an earlier version of this file instead fell back
+// to writing bindless index 0 for it, a real, arbitrary slot -- silent
+// wrong-texture binding with zero diagnostic signal, on exactly the axis
+// ("errors are RxResult codes, never silent wrong behavior") this
+// codebase otherwise holds to rigorously. rx_api.h's own IRxTexture doc
+// comment already documents that a valid IRxTexture "always" wraps an
+// engine-created texture, so rejecting anything that fails this check
+// enforces a contract the header already claims, not a new restriction].
+// test_api_factory.cpp's Task 6 FakeTexture-based tests were adapted
+// (not deleted) to assert this rejection directly; the refcount/lifecycle
+// coverage those tests used to provide via FakeTexture now lives in a
+// dedicated real-texture (IRxMaterialSystem::createTexture2D()-backed)
+// test instead, since a rejected texture never reaches the refcount-
+// mutating code path at all.
 //
 // Deliberately NOT IRxUnknown-rooted (no addRef/release of its own): this
 // is a same-lifetime "peek" at data TextureImpl itself already owns, never
@@ -349,15 +361,27 @@ RxResult RX_CALL MaterialInstanceImpl::setTexture(const char* name, IRxTexture* 
             return RX_E_FAIL;
         }
 
-        // Recovers a REAL bindless index for an engine-created texture via
-        // the private queryInterface bridge (see kIID_InternalTextureBridge's
-        // own comment); falls back to 0 for anything else (a test-only
-        // IRxTexture double has no real bindless registration to report).
-        uint32_t bindlessIndex = 0;
+        // [Fix round 1, task-7-review.md F1] `texture` must be a real,
+        // engine-created texture (IRxMaterialSystem::createTexture2D()) --
+        // recovered via the private queryInterface bridge (see
+        // kIID_InternalTextureBridge's own comment). Anything that fails
+        // this QI (a hand-rolled test double, a hypothetical third-party
+        // IRxTexture implementation, ...) is REJECTED outright: there is
+        // no real bindless index to report for it, and silently binding
+        // index 0 -- a real, arbitrary slot -- would be a debugging-
+        // nightmare failure mode with zero diagnostic signal. This
+        // enforces the invariant rx_api.h's own IRxTexture/setTexture doc
+        // comments already document: a valid `texture` argument always
+        // wraps an engine-created resource.
         void* bridgeOut = nullptr;
-        if (texture->queryInterface(kIID_InternalTextureBridge, &bridgeOut) == RX_OK && bridgeOut != nullptr) {
-            bindlessIndex = static_cast<IInternalTextureBridge*>(bridgeOut)->bindlessIndex();
+        if (texture->queryInterface(kIID_InternalTextureBridge, &bridgeOut) != RX_OK || bridgeOut == nullptr) {
+            RX_LOG_ERROR(
+                "rx_material: rx_api: MaterialInstanceImpl::setTexture('{}'): `texture` was not created via "
+                "IRxMaterialSystem::createTexture2D() (failed the internal engine-texture check) -- rejecting",
+                name);
+            return RX_E_INVALIDARG;
         }
+        uint32_t bindlessIndex = static_cast<IInternalTextureBridge*>(bridgeOut)->bindlessIndex();
 
         // [Fix round 1, task-6-review.md F1 -- ordering preserved] capture
         // whatever this name previously held, perform the (possibly-
