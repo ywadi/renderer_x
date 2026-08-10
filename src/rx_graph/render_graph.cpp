@@ -43,6 +43,9 @@
 //      resolve every PhysicalResource (name -> merged desc/imageUsage,
 //      first/last use as *positions* in the execution order) and every
 //      surviving pass's resolved ResourceAccess list (Impl::resolveResources).
+//   5. (Task 2) Derive every sync2 barrier from steps 1-4's output
+//      (barriers.h's buildBarriers(), ported from Granite's per-resource
+//      invalidate/flush accounting -- see that header's own comment).
 namespace rx::graph {
 
 struct RenderGraph::Impl {
@@ -464,6 +467,11 @@ void RenderGraph::compile(const CompileInfo& info) {
             resource.attachment.height = height;
         }
     }
+
+    // ---- Task 2's last phase: derive every sync2 barrier from the
+    // executionOrder()/resources()/passAccesses() data just resolved above
+    // (barriers.h's buildBarriers()) -----------------------------------
+    compiled.passBarriers_ = buildBarriers(compiled, compiled.finalBarriers_);
 
     g.compiled = std::move(compiled);
 }

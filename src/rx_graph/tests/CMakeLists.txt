@@ -6,6 +6,7 @@
 add_executable(rx_graph_tests
     doctest_main.cpp
     test_compile.cpp
+    test_barriers.cpp
 )
 target_link_libraries(rx_graph_tests PRIVATE rx_graph doctest::doctest)
 add_test(NAME rx_graph_tests COMMAND rx_graph_tests)

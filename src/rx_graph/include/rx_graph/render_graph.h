@@ -1,4 +1,5 @@
 #pragma once
+#include <rx_graph/barriers.h>
 #include <rx_graph/pass.h>
 #include <rx_graph/resources.h>
 
@@ -24,10 +25,10 @@ struct CompileInfo {
 
 // The device-free result of RenderGraph::compile(): which declared passes
 // survive culling and in what order, every physical resource compile()
-// resolved, and each surviving pass's resolved resource accesses. Task 2
-// adds per-order-position barrier lists (passBarriers()); this task's
-// CompiledGraph carries exactly the culling/ordering/lifetime data the
-// Task 1 brief specifies.
+// resolved, each surviving pass's resolved resource accesses (Task 1
+// brief), and -- from Task 2 on -- the sync2 barriers compile() derived
+// from those accesses (passBarriers()/finalBarriers(), populated by
+// compile()'s last phase; see barriers.h).
 //
 // Only RenderGraph::compile() ever populates one of these -- there is no
 // public constructor beyond the implicit default. Before the owning
@@ -57,6 +58,21 @@ public:
         return passAccesses_.at(passIndex);
     }
 
+    // Task 2: barriers to insert immediately before executionOrder()[pos]'s
+    // pass. Same length as executionOrder() -- indexed by *position*, not
+    // raw pass index (unlike passAccesses(), which is raw-index-keyed,
+    // because a culled pass has no position to be indexed by at all).
+    // Populated by RenderGraph::compile()'s last phase (barriers.h's
+    // buildBarriers()); empty before the owning RenderGraph's first
+    // compile() call or after reset(), exactly like executionOrder().
+    [[nodiscard]] std::span<const PassBarriers> passBarriers() const { return passBarriers_; }
+
+    // Task 2: the backbuffer's transition to VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+    // after the last surviving pass runs -- not "immediately before a
+    // pass" like passBarriers()'s entries, so it is not itself part of
+    // that span. Default-constructed (empty) before the first compile().
+    [[nodiscard]] const PassBarriers& finalBarriers() const { return finalBarriers_; }
+
 private:
     friend class RenderGraph;
 
@@ -64,6 +80,8 @@ private:
     std::vector<bool> culled_;                              // indexed by raw pass index
     std::vector<PhysicalResource> resources_;
     std::vector<std::vector<ResourceAccess>> passAccesses_;  // indexed by raw pass index
+    std::vector<PassBarriers> passBarriers_;                 // indexed by executionOrder() position
+    PassBarriers finalBarriers_;
 };
 
 // Owns every Pass declared against it and, after compile(), the derived
