@@ -1231,7 +1231,7 @@ void destroyOffscreenSlot(VkDevice device, OffscreenSlot& slot) {
 
 // --- Headless mode: 60 real frames through a genuine 2-frames-in-flight
 // offscreen loop, with deferred readback probes -----------------------------
-int runHeadless() {
+int runHeadless(bool enableValidation) {
     auto window = rx::platform::Window::create("rx_streaming_sample", static_cast<int>(kHeadlessWidth),
                                                  static_cast<int>(kHeadlessHeight), /*visible=*/false);
     if (!window.has_value()) {
@@ -1245,7 +1245,7 @@ int runHeadless() {
         return 1;
     }
 
-    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
+    auto context = rx::rhi::Context::create(extensions, enableValidation);
     if (!context.has_value()) {
         RX_LOG_ERROR("Context::create failed");
         return 1;
@@ -1493,7 +1493,7 @@ int runHeadless() {
     RX_LOG_INFO("sample_04_streaming: {} / {} logical textures observed resident at some point",
                 kTextureCount - missingCount, kTextureCount);
 
-    if (context->hasValidationErrors()) {
+    if (enableValidation && context->hasValidationErrors()) {
         RX_LOG_ERROR("Vulkan validation layer reported errors during this run");
         pass = false;
     }
@@ -1507,7 +1507,7 @@ int runHeadless() {
 }
 
 // --- --present mode: real window, continuously cycling grid ----------------
-int runPresent() {
+int runPresent(bool enableValidation) {
     auto window = rx::platform::Window::create("rx_streaming_sample (--present)", static_cast<int>(kPresentWidth),
                                                  static_cast<int>(kPresentHeight), /*visible=*/true);
     if (!window.has_value()) {
@@ -1521,7 +1521,7 @@ int runPresent() {
         return 1;
     }
 
-    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
+    auto context = rx::rhi::Context::create(extensions, enableValidation);
     if (!context.has_value()) {
         RX_LOG_ERROR("Context::create failed");
         return 1;
@@ -1785,7 +1785,7 @@ int runPresent() {
     destroySwapchainViews();
     destroyScene(vkDevice, *scene);  // drains the DeletionQueue (flushAll) before tearing down.
 
-    if (context->hasValidationErrors()) {
+    if (enableValidation && context->hasValidationErrors()) {
         RX_LOG_ERROR("Vulkan validation layer reported errors during the present loop");
         return 1;
     }
@@ -1802,14 +1802,17 @@ int main(int argc, char** argv) {
     rx::core::log::init();
 
     bool presentMode = false;
+    bool enableValidation = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--present") {
             presentMode = true;
+        } else if (std::string_view(argv[i]) == "--validate") {
+            enableValidation = true;
         }
     }
 
     if (presentMode) {
-        return runPresent();
+        return runPresent(enableValidation);
     }
-    return runHeadless();
+    return runHeadless(enableValidation);
 }

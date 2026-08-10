@@ -39,7 +39,10 @@ add_custom_command(TARGET sample_02_hotreload POST_BUILD
   VERBATIM
 )
 
-# Runs the binary with no arguments -- headless mode (default, used by
-# ctest). The binary also supports --present mode for interactive windowed
+# Runs the binary in headless mode with --validate: ctest is the developer/CI
+# gate, so it explicitly opts into the Vulkan validation layers (requires the
+# Vulkan SDK / validation layers installed -- see samples/README.md) on top
+# of the default end-user behavior, which is headless with validation OFF.
+# The binary also supports --present mode for interactive windowed
 # rendering with live shader editing (see main.cpp / samples/README.md).
-add_test(NAME sample_02_hotreload_headless COMMAND sample_02_hotreload)
+add_test(NAME sample_02_hotreload_headless COMMAND sample_02_hotreload --validate)

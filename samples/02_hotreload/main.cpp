@@ -522,7 +522,7 @@ std::string resolveShaderPath() {
 }
 
 // --- Headless mode: offscreen render + pixel readback ----------------------
-int runHeadless() {
+int runHeadless(bool enableValidation) {
     auto window = rx::platform::Window::create("rx_hotreload_sample", static_cast<int>(kHeadlessWidth),
                                                  static_cast<int>(kHeadlessHeight), /*visible=*/false);
     if (!window.has_value()) {
@@ -540,7 +540,7 @@ int runHeadless() {
     // Context::create() in context.h; a single windowed, validated Context
     // (same extension set --present mode would use) sidesteps the
     // vk-bootstrap process-wide function-pointer caching hazard entirely.
-    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
+    auto context = rx::rhi::Context::create(extensions, enableValidation);
     if (!context.has_value()) {
         RX_LOG_ERROR("Context::create failed");
         return 1;
@@ -822,7 +822,7 @@ int runHeadless() {
         RX_LOG_ERROR("readback did not change between source A and source B -- hot reload had no effect");
         pass = false;
     }
-    if (context->hasValidationErrors()) {
+    if (enableValidation && context->hasValidationErrors()) {
         RX_LOG_ERROR("Vulkan validation layer reported errors during this run");
         pass = false;
     }
@@ -836,7 +836,7 @@ int runHeadless() {
 }
 
 // --- --present mode: real window, live shader editing -----------------------
-int runPresent() {
+int runPresent(bool enableValidation) {
     auto window = rx::platform::Window::create("rx_hotreload_sample (--present)", static_cast<int>(kPresentWidth),
                                                  static_cast<int>(kPresentHeight), /*visible=*/true);
     if (!window.has_value()) {
@@ -850,7 +850,7 @@ int runPresent() {
         return 1;
     }
 
-    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
+    auto context = rx::rhi::Context::create(extensions, enableValidation);
     if (!context.has_value()) {
         RX_LOG_ERROR("Context::create failed");
         return 1;
@@ -1112,7 +1112,7 @@ int runPresent() {
     destroySwapchainViews(vkDevice, swapchainViews);
     destroyReloadablePipeline(vkDevice, pipeline);
 
-    if (context->hasValidationErrors()) {
+    if (enableValidation && context->hasValidationErrors()) {
         RX_LOG_ERROR("Vulkan validation layer reported errors during the present loop");
         return 1;
     }
@@ -1129,14 +1129,17 @@ int main(int argc, char** argv) {
     rx::core::log::init();
 
     bool presentMode = false;
+    bool enableValidation = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--present") {
             presentMode = true;
+        } else if (std::string_view(argv[i]) == "--validate") {
+            enableValidation = true;
         }
     }
 
     if (presentMode) {
-        return runPresent();
+        return runPresent(enableValidation);
     }
-    return runHeadless();
+    return runHeadless(enableValidation);
 }

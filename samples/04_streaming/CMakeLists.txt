@@ -14,7 +14,10 @@ target_link_libraries(sample_04_streaming PRIVATE rx_rhi_vk rx_platform rx_shade
 # unlike 03_bindless_mesh, there is no external asset file to deploy.
 rx_shader_deploy_runtime_libs(sample_04_streaming)
 
-# Runs the binary with no arguments -- headless mode (default, used by
-# ctest). The binary also supports --present mode for interactive windowed
+# Runs the binary in headless mode with --validate: ctest is the developer/CI
+# gate, so it explicitly opts into the Vulkan validation layers (requires the
+# Vulkan SDK / validation layers installed -- see samples/README.md) on top
+# of the default end-user behavior, which is headless with validation OFF.
+# The binary also supports --present mode for interactive windowed
 # rendering with a continuously cycling grid (see main.cpp / samples/README.md).
-add_test(NAME sample_04_streaming_headless COMMAND sample_04_streaming)
+add_test(NAME sample_04_streaming_headless COMMAND sample_04_streaming --validate)

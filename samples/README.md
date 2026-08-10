@@ -53,14 +53,26 @@ buffers: the vertex shader generates its 3 NDC positions from
 exact same pipeline-construction code and draw call:
 
 - **Headless (default, no flags)** — the correctness gate this repo's CI and
-  `ctest` run. Builds the full stack (window, validated instance, surface,
-  device, real swapchain — created and queried, but deliberately never
-  written to), renders into a dedicated **offscreen** 256x256 image, reads
-  the result back to the host, and asserts the center pixel is white and a
-  corner pixel is black. Exits 0 on pass, 1 on failure, and also fails if the
-  Vulkan validation layer reported anything beyond this project's two
-  documented, narrowly-matched false-positive guards (see `context.cpp`).
-  Registered as the `sample_01_triangle_headless` ctest case.
+  `ctest` run. Builds the full stack (window, instance, surface, device,
+  real swapchain — created and queried, but deliberately never written to),
+  renders into a dedicated **offscreen** 256x256 image, reads the result
+  back to the host, and asserts the center pixel is white and a corner pixel
+  is black. Exits 0 on pass, 1 on failure. Validation is OFF by default (see
+  `--validate` below) — an end-user running this sample as-is needs no
+  Vulkan SDK / validation layers installed. `ctest` registers this case as
+  `sample_01_triangle_headless` with `--validate` passed explicitly, so the
+  automated gate additionally fails if the Vulkan validation layer reported
+  anything beyond this project's two documented, narrowly-matched
+  false-positive guards (see `context.cpp`).
+- **`--validate`** — a developer/CI flag, not needed for a normal run: turns
+  on the Vulkan validation layers and the debug messenger that reports
+  through them. Requires the Vulkan SDK (or an equivalent
+  `VK_LAYER_KHRONOS_validation` install) to actually be present on the
+  machine — without it, `Context::create()` simply builds an unvalidated
+  instance (vk-bootstrap's `request_validation_layers()` is only called when
+  this flag is set), so nothing breaks, but no validation checking happens
+  either. Combine with headless (the default) or `--present`. This is what
+  every `ctest` registration below passes.
 - **`--present`** — opens a real, visible, resizable window and renders the
   same triangle into the actual swapchain images every frame, via the
   canonical frames-in-flight present loop (`rx::rhi::FrameSync`:
@@ -69,9 +81,11 @@ exact same pipeline-construction code and draw call:
   ever the image `vkAcquireNextImageKHR` actually returned. Runs until the
   window is closed (or the process receives `SIGINT`/`SIGTERM`, which SDL
   translates into a clean shutdown); survives being resized at any point,
-  any number of times, with zero validation errors. Not part of `ctest` —
-  it's interactive by nature. See `MANUAL_VERIFICATION.md` at the repo root
-  for the per-platform manual check this mode gets before a release.
+  any number of times. Add `--validate` to also confirm zero validation
+  errors across those resizes (what `MANUAL_VERIFICATION.md`'s pre-release
+  checklist does). Not part of `ctest` — it's interactive by nature. See
+  `MANUAL_VERIFICATION.md` at the repo root for the per-platform manual
+  check this mode gets before a release.
 
 ### Expected output
 
@@ -141,8 +155,10 @@ path:
   swapchain image), and reads it back. Then compiles a second embedded
   solid-black shader, swaps the pipeline, renders again, and asserts the
   readback actually changed — proving a reload really rebuilds what gets
-  rendered, not just that compilation succeeds. Registered as the
-  `sample_02_hotreload_headless` ctest case.
+  rendered, not just that compilation succeeds. Validation is off by
+  default (see 01_triangle's `--validate` section above for what that flag
+  does and why); `ctest` registers this case as
+  `sample_02_hotreload_headless` with `--validate` passed explicitly.
 - **`--present`** — opens a real window and renders `hotreload.slang` (a
   file on disk, deployed next to the binary at build time — see
   `CMakeLists.txt`). Every ~250ms (~4Hz, a plain `std::filesystem::
@@ -252,7 +268,9 @@ never uploaded to) enables correct depth testing across the 5 objects.
   256x256 with the camera at a fixed, known pose, reads it back, and
   asserts at least 3 distinct texture colors landed on screen at known
   probe positions (in practice all 5 textures are distinct and probed).
-  Registered as the `sample_03_bindless_mesh_headless` ctest case.
+  Validation is off by default (see 01_triangle's `--validate` section
+  above); `ctest` registers this case as `sample_03_bindless_mesh_headless`
+  with `--validate` passed explicitly.
 - **`--present`** — opens a real window showing the same 5 objects (2
   cubes, 2 spheres, 1 plane) with the camera continuously orbiting the
   scene. Survives window resizes (the depth buffer is recreated alongside
@@ -334,9 +352,11 @@ instead, since the grid and camera never move), which
   deferred readback probes at every grid cell's screen position on every
   frame. Asserts every one of the 24 logical textures was actually
   observed resident on screen at some point (not just "registered" —
-  the probe reads real rendered pixels), plus zero validation errors —
-  the assertion that would catch a premature-destroy bug. Registered as
-  the `sample_04_streaming_headless` ctest case.
+  the probe reads real rendered pixels). Validation is off by default (see
+  01_triangle's `--validate` section above); `ctest` registers this case as
+  `sample_04_streaming_headless` with `--validate` passed explicitly, which
+  adds the zero-validation-errors assertion that would catch a
+  premature-destroy bug.
 - **`--present`** — opens a real window showing the same 24-cell grid,
   static camera, streaming continuing indefinitely at roughly 1
   texture/second. Not part of `ctest` — see `MANUAL_VERIFICATION.md`.
@@ -381,7 +401,8 @@ cmake --build --preset linux-native
 ```
 
 ```sh
-# Headless correctness gate (also runs via ctest, see below):
+# Headless, end-user default -- validation off, no Vulkan SDK required.
+# ctest (see below) runs this same headless mode but adds --validate:
 ./build/linux-native/samples/01_triangle/sample_01_triangle
 
 # Interactive present-mode window:
@@ -389,7 +410,8 @@ cmake --build --preset linux-native
 ```
 
 ```sh
-# Headless correctness gate (also runs via ctest, see below):
+# Headless, end-user default -- validation off, no Vulkan SDK required.
+# ctest (see below) runs this same headless mode but adds --validate:
 ./build/linux-native/samples/02_hotreload/sample_02_hotreload
 
 # Interactive present-mode window with live shader editing -- edit
@@ -398,7 +420,8 @@ cmake --build --preset linux-native
 ```
 
 ```sh
-# Headless correctness gate (also runs via ctest, see below):
+# Headless, end-user default -- validation off, no Vulkan SDK required.
+# ctest (see below) runs this same headless mode but adds --validate:
 ./build/linux-native/samples/03_bindless_mesh/sample_03_bindless_mesh
 
 # Interactive present-mode window with an orbiting camera:
@@ -406,7 +429,8 @@ cmake --build --preset linux-native
 ```
 
 ```sh
-# Headless correctness gate (also runs via ctest, see below):
+# Headless, end-user default -- validation off, no Vulkan SDK required.
+# ctest (see below) runs this same headless mode but adds --validate:
 ./build/linux-native/samples/04_streaming/sample_04_streaming
 
 # Interactive present-mode window, grid streaming ~1 texture/second:
@@ -499,3 +523,16 @@ alongside every other project test (`rx_core_tests`, `rx_platform_tests`,
 `rx_shader_tests`, `rx_rhi_vk_tests`, `shader_spirv_test`) — `--present`
 mode is intentionally excluded from `ctest` (it blocks on a real window
 and user/OS interaction) and is exercised manually instead.
+
+Each of the four `*_headless` `ctest` cases passes `--validate` (see each
+sample's own section above) — a developer/CI flag that turns on the Vulkan
+validation layers, requiring the Vulkan SDK (or an equivalent
+`VK_LAYER_KHRONOS_validation` install) to be present on the machine running
+`ctest`. This is what keeps the zero-validation-error bar enforced in CI
+and local development. It is deliberately **not** the default for the
+plain sample binaries: an end user who downloads a released build (see
+"Downloading a prebuilt sample bundle" above) and runs it directly gets
+validation OFF, so a machine with no Vulkan SDK installed (the normal case
+for an end user) never has the loader attempt a validation-layer manifest
+lookup at all — headless mode just runs and exits 0/1 on its own
+correctness assertions, with no Vulkan-loader diagnostics in the mix.

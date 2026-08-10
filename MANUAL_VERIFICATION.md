@@ -23,14 +23,19 @@ copying that one binary; nothing else from the build tree is needed.
   any number of times.
 - Closing the window (clicking its close button, or `Alt+F4`/equivalent)
   exits the process promptly, with no crash, hang, or leftover process.
-- On Linux, `VK_LAYER_KHRONOS_validation` output during the run contains no
-  `[error]`-level line beyond this codebase's two documented, narrowly-
-  matched false-positive guards (`context.cpp`'s
-  `isKnownPortabilityEnumerationLayerBug` /
+- On Linux, run with `--validate` (see `samples/README.md`) so the Vulkan
+  validation layers are actually active, and confirm `VK_LAYER_KHRONOS_
+  validation` output during the run contains no `[error]`-level line beyond
+  this codebase's two documented, narrowly-matched false-positive guards
+  (`context.cpp`'s `isKnownPortabilityEnumerationLayerBug` /
   `isKnownUnrecognizedSlangSourceLanguageBug`) — run with
   `RX_LOG` output visible (the default; nothing needs enabling) and grep for
-  `[error]` if in doubt. Windows builds don't carry the validation layer in
-  this project's toolchain, so this check is Linux-only.
+  `[error]` if in doubt. `--validate` requires the Vulkan SDK (or an
+  equivalent `VK_LAYER_KHRONOS_validation` install) on the machine; without
+  it validation is silently off, which is the normal end-user default (see
+  `samples/README.md`) but not what this pre-release check wants. Windows
+  builds don't carry the validation layer in this project's toolchain, so
+  this check is Linux-only.
 
 ## Linux (native, `linux-native` preset)
 
