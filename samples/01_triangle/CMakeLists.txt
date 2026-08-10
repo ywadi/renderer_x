@@ -11,6 +11,6 @@ target_compile_definitions(sample_01_triangle PRIVATE
 )
 add_dependencies(sample_01_triangle triangle_shaders)
 
-# Runs the binary with no arguments -- headless mode, the only mode this
-# task builds: full stack up, offscreen render, pixel readback, exit 0/1.
+# Runs the binary with no arguments -- headless mode (default, used by ctest).
+# The binary also supports --present mode for interactive windowed rendering.
 add_test(NAME sample_01_triangle_headless COMMAND sample_01_triangle)

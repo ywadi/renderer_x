@@ -660,6 +660,7 @@ int runPresent() {
 
     std::vector<VkImageView> swapchainViews;
     if (!createSwapchainViews(vkDevice, *device, swapchainViews)) {
+        destroySwapchainViews(vkDevice, swapchainViews);
         destroyTrianglePipeline(vkDevice, trianglePipeline);
         return 1;
     }
