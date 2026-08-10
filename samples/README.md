@@ -231,6 +231,77 @@ texture. A redistributed copy of just this sample's build-output directory
 (binary + `texture.png` + the Slang runtime libraries) runs identically
 outside the build tree.
 
+## 04_streaming
+
+`samples/04_streaming/main.cpp` — the sample most likely to reveal real
+synchronization bugs: 24 procedurally generated textures (flat HSV-wheel
+hues, computed at runtime — not loaded from any file) compete for a
+resident budget of only 8 bindless slots. Every few frames (headless) or
+roughly once a second (`--present`) the next logical texture streams in
+through `rx::rhi::Uploader` and the oldest resident texture is evicted:
+`rx::rhi::BindlessTable::release()` returns its descriptor slot, and its
+`rx::rhi::Texture2D` is retired into `rx::rhi::DeletionQueue` — tagged with
+the current frame number — rather than destroyed on the spot. The
+DeletionQueue only actually destroys it once that frame's fence is
+confirmed signaled, which (given this codebase's single-queue,
+submission-ordered execution) also guarantees every earlier frame that
+might still have been sampling the old descriptor contents has completed
+too. Getting that timing exactly right is this sample's whole point — see
+`main.cpp`'s header comment ("FRAME-LAG SAFETY ARGUMENT") for the full
+argument.
+
+24 fixed grid cells (one per logical texture, not one per physical slot)
+sit in a 6x4 grid under a static orthographic camera; a cell is drawn only
+while its texture is currently resident — a non-resident cell is skipped
+entirely in the draw loop, which is exactly what
+`VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT` (set on `BindlessTable`'s
+bindings) makes valid: a bound descriptor set is allowed to contain slots
+no draw call this frame ever indexes. The shader's set 0 only uses 2 of
+`BindlessTable`'s 3 fixed bindings (images + samplers — no storage
+buffers; this sample's per-object transform is a push-constant `mvp`
+instead, since the grid and camera never move), which
+`PipelineLayoutBuilder`'s external-set-0 substitution explicitly supports
+("a shader is free to use a strict subset of the three slots").
+
+- **Headless (default, no flags)** — the `ctest` correctness gate. Runs 60
+  real frames through a genuine 2-frames-in-flight offscreen loop (2
+  dedicated offscreen images, not 1 — real CPU/GPU overlap between
+  adjacent frames is exercised on purpose, not serialized away), with
+  deferred readback probes at every grid cell's screen position on every
+  frame. Asserts every one of the 24 logical textures was actually
+  observed resident on screen at some point (not just "registered" —
+  the probe reads real rendered pixels), plus zero validation errors —
+  the assertion that would catch a premature-destroy bug. Registered as
+  the `sample_04_streaming_headless` ctest case.
+- **`--present`** — opens a real window showing the same 24-cell grid,
+  static camera, streaming continuing indefinitely at roughly 1
+  texture/second. Not part of `ctest` — see `MANUAL_VERIFICATION.md`.
+
+### Expected output
+
+**Headless mode**:
+
+```
+[info] sample_04_streaming: 24 / 24 logical textures observed resident at some point
+[info] streaming headless gate PASSED
+```
+
+**`--present` mode** opens a 900x700 window titled `rx_streaming_sample
+(--present)` showing up to 8 flat-colored squares arranged across a 6x4
+grid against a dark background, smoothly cycling through the HSV color
+wheel as textures stream in and evict roughly once a second — cells light
+up left-to-right, top-to-bottom as their logical texture becomes resident,
+and go dark again once evicted. Closing the window exits with status 0.
+
+### Redistribution
+
+Same mechanism as 02_hotreload/03_bindless_mesh: this sample compiles its
+shader at runtime (`rx_shader_deploy_runtime_libs()` ships the Slang
+runtime libs next to the binary). Unlike 03_bindless_mesh, there is no
+external asset file at all — every texture is procedurally generated in
+code — so a redistributed copy of just this sample's binary plus the Slang
+runtime libraries runs identically outside the build tree.
+
 ## Building and running
 
 Both sample modes and both build presets work identically on Linux and
@@ -270,6 +341,14 @@ cmake --build --preset linux-native
 ./build/linux-native/samples/03_bindless_mesh/sample_03_bindless_mesh --present
 ```
 
+```sh
+# Headless correctness gate (also runs via ctest, see below):
+./build/linux-native/samples/04_streaming/sample_04_streaming
+
+# Interactive present-mode window, grid streaming ~1 texture/second:
+./build/linux-native/samples/04_streaming/sample_04_streaming --present
+```
+
 Steam Deck Desktop Mode: open Konsole (or any terminal) from the Desktop
 Mode taskbar and run the exact same commands above — the Deck's SteamOS is
 Linux with a Vulkan driver (AMD Mesa RADV), so `linux-native` is the correct
@@ -286,8 +365,9 @@ cmake --build --preset windows-cross-zig
 ```
 
 This produces `build/windows-cross-zig/samples/01_triangle/sample_01_triangle.exe`,
-`build/windows-cross-zig/samples/02_hotreload/sample_02_hotreload.exe`, and
-`build/windows-cross-zig/samples/03_bindless_mesh/sample_03_bindless_mesh.exe`.
+`build/windows-cross-zig/samples/02_hotreload/sample_02_hotreload.exe`,
+`build/windows-cross-zig/samples/03_bindless_mesh/sample_03_bindless_mesh.exe`, and
+`build/windows-cross-zig/samples/04_streaming/sample_04_streaming.exe`.
 01_triangle's binary is statically linked (no separate `.dll`s to ship) —
 copy just that one `.exe` to the Windows machine (or run it directly under
 Wine on Linux) and run it from a terminal/`cmd.exe`/PowerShell:
@@ -322,6 +402,19 @@ sample_03_bindless_mesh.exe            REM headless correctness gate
 sample_03_bindless_mesh.exe --present  REM interactive present-mode window, orbiting camera
 ```
 
+04_streaming is the same shape as 02_hotreload for redistribution purposes
+(real in-process Slang compilation, so it needs the same 4 Slang DLLs
+deployed next to it) but, unlike 02_hotreload/03_bindless_mesh, has no
+other external asset at all -- every texture is procedurally generated in
+code. Copy the entire `build/windows-cross-zig/samples/04_streaming/`
+directory (minus the `CMakeFiles`/`.pdb`/`.cmake` build bookkeeping) to run
+it elsewhere:
+
+```
+sample_04_streaming.exe            REM headless correctness gate
+sample_04_streaming.exe --present  REM interactive present-mode window, cycling grid
+```
+
 See `MANUAL_VERIFICATION.md` at the repo root for the actual per-platform
 run checklist (what to record, what "pass" looks like on real hardware).
 
@@ -331,9 +424,9 @@ run checklist (what to record, what "pass" looks like on real hardware).
 ctest --preset linux-native --output-on-failure
 ```
 
-This runs `sample_01_triangle_headless`, `sample_02_hotreload_headless`, and
-`sample_03_bindless_mesh_headless` alongside every other project test
-(`rx_core_tests`, `rx_platform_tests`, `rx_shader_tests`, `rx_rhi_vk_tests`,
-`shader_spirv_test`) — `--present` mode is intentionally excluded from
-`ctest` (it blocks on a real window and user/OS interaction) and is
-exercised manually instead.
+This runs `sample_01_triangle_headless`, `sample_02_hotreload_headless`,
+`sample_03_bindless_mesh_headless`, and `sample_04_streaming_headless`
+alongside every other project test (`rx_core_tests`, `rx_platform_tests`,
+`rx_shader_tests`, `rx_rhi_vk_tests`, `shader_spirv_test`) — `--present`
+mode is intentionally excluded from `ctest` (it blocks on a real window
+and user/OS interaction) and is exercised manually instead.
