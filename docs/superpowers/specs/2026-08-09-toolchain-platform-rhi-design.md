@@ -178,8 +178,13 @@ it is out of scope for *this* spec only, not out of scope for the project:
     submission — Phase 4's transform pools keep last-frame copies cheap)
     and render-graph HISTORY resources (persistent named images with
     load-instead-of-discard semantics — a deliberate extension of the
-    graph's discard-per-frame transient model). TAA, temporal upscalers,
-    and motion blur all consume the same two pieces.
+    graph's discard-per-frame transient model; pulled into Phase 4 as a
+    bounded core task, seed item 15). TAA, temporal upscalers, and motion
+    blur all consume the same two pieces. SEQUENCING CONSTRAINT: any
+    future intra-frame transient-aliasing allocator must treat
+    persistent/history resources as a first-class non-aliasable class —
+    aliasing must not be designed against a world where every resource
+    discards per frame.
   - **Profiling & debug instrumentation** (layer 12, tooling): GPU markers
     (PIX/RenderDoc integration), debug line drawing, memory leak tracking,
     performance counters.
