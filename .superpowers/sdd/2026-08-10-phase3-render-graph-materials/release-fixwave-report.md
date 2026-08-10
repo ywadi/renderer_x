@@ -227,3 +227,167 @@ package fix, context.cpp documentation note. `.superpowers/sdd/.../progress.md`'
 pre-existing uncommitted edit (present before this fix wave started) was
 left untouched — out of scope for "touch only what these two fixes
 require."
+
+## Re-review (scoped): commit f4ce432, verified against the working tree
+
+Verified directly against `git show f4ce432` / `git diff acfce89..f4ce432` and the
+current source, not just this report's own prose. All four review points below
+were checked against the actual code; none required a change.
+
+### 1. Fix 1 — DescriptorArena enforcement math
+
+Traced `allocate()`'s two checks
+(`src/rx_rhi_vk/src/descriptor_arena.cpp:114-128`) by hand against the
+report's own worked examples:
+
+- **Off-by-one at the limit:** `allocatedSets_[slot] + 1 > capacities_.maxSets`
+  means the call that brings the running count *to* `maxSets` still passes
+  (`N-1+1 > N` is false), and only the next call fails (`N+1 > N` is true).
+  Confirmed limit-th allocation succeeds, limit+1-th fails, both for
+  `maxSets` and for `uniformBuffers` (same pattern,
+  `allocated + requested > capacity`). No off-by-one.
+- **Counter drift:** counters increment only after `vkAllocateDescriptorSets`
+  returns `VK_SUCCESS` (lines 151-152) — the genuine-driver-failure path
+  (`result != VK_SUCCESS`) returns before either increment, so a real driver
+  rejection never inflates the counters past what the pool actually holds.
+  The one path where the arena's belief and the pool's real state could
+  diverge is `beginFrame()` zeroing both counters unconditionally even when
+  the preceding `vkResetDescriptorPool` itself failed (descriptor_arena.cpp:97-103) —
+  this is explicitly acknowledged in-comment, not silent, and a pool-reset
+  failure is already an unrecoverable, separately-logged driver error with no
+  better recovery available to this class; not a new gap this fix introduced.
+- **Test math re-derived independently** for all three new sub-cases
+  (descriptor_arena_test.cpp:206-273): sub-case A (uniformBuffers=3 <
+  maxSets=8) and B (maxSets=3 < uniformBuffers=8) each isolate one budget
+  correctly per the check order (maxSets checked first, so B's 4th call fails
+  on maxSets before uniformBuffers is even considered); sub-case C
+  (maxSets=8, uniformBuffers=5, 2 descriptors/call) — 2+2=4 of 5 fits, third
+  call's 4+2=6 > 5 correctly fails despite 1 nominal descriptor of headroom.
+  Matches the report's own arithmetic exactly.
+- **ParamArena determinism confirmed at the wiring site**, not just asserted:
+  `src/rx_material/instance.cpp:17-19` sizes
+  `DescriptorArenaCapacities{maxSets=kMaxInstancesPerFrame,
+  uniformBuffers=kMaxInstancesPerFrame}` (both 512), and its one real call
+  site (`instance.cpp:72`, `descriptorArena_->allocate(setLayout)`) uses the
+  default `uniformBufferDescriptorCount=1` — matching ParamArena's
+  single-UBO-binding layout exactly, so `test_param_arena.cpp`'s exhaustion
+  loop now hits the same arena-enforced ceiling deterministically regardless
+  of driver. Grepped the whole `src/` tree for other `DescriptorArena`
+  callers: `instance.cpp` is the only non-test caller, so "every real
+  caller" in the header's doc comment is accurate, not an unverified claim.
+
+No defects found in Fix 1.
+
+### 2. Fix 2 — CI validation layer install
+
+- Confirmed via full-file read of `.github/workflows/ci.yml` and
+  `git diff --stat acfce89..f4ce432` that the *only* functional change is
+  `vulkan-validationlayers` added to `linux-native`'s apt install line; the
+  rest of the diff to that file is comment-only. `windows-cross-zig` is
+  untouched. `vulkan-validationlayers` is a real, long-standing Ubuntu
+  universe package (present since well before any Ubuntu release GitHub's
+  `ubuntu-latest` could resolve to) that provides
+  `VK_LAYER_KHRONOS_validation` — correct package for this purpose.
+- **Critical assessment, confirmed:** the report's own evidence supports a
+  reading stronger than its own section header ("sync validation warning")
+  states. `vulkan-validationlayers` is the package that provides the
+  validation layer *itself* (not one specific feature of an
+  already-installed layer) — the report says this explicitly in its own
+  ci.yml comment ("provides VK_LAYER_KHRONOS_validation itself"). Read
+  together with `context.cpp`'s own comment that `request_validation_layers()`
+  "degrades gracefully" when the layer is entirely absent, the missing
+  package means **no Vulkan validation layer of any kind — core validation
+  included, not only the synchronization-validation feature — was ever
+  active on the `linux-native` CI runner before this fix**. Every prior
+  green CI run's `CHECK_FALSE(hasValidationErrors())` assertion (present
+  throughout the GPU test suites since at least Phase 2) passed vacuously:
+  with no layer loaded, `debugCallback` was never invoked at all, so
+  `errorCount` could never become nonzero regardless of what the code
+  actually did on the GPU. **Ledger line: the "zero Vulkan validation
+  errors" bar was enforced only on developer machines (which happened to
+  have the package installed locally) for the entirety of Phases 1-3's CI
+  history up to and including run acfce89 — CI itself only started
+  genuinely checking this with commit f4ce432.** This is materially broader
+  than "sync validation was inactive" and is worth carrying forward
+  explicitly, not just as an implementation detail of this fix.
+
+### 3. Risk scan — false-positive guard stability on a different CI layer version
+
+Read all three guards in `src/rx_rhi_vk/src/context.cpp`
+(`isKnownPortabilityEnumerationLayerBug`,
+`isKnownUnrecognizedSlangSourceLanguageBug`,
+`isKnownSyncValidationSeparateSamplerMisclassification`). All three match on
+literal substrings of the validation layer's own emitted message text, with
+no version check. Per guard:
+
+- **Portability-enumeration guard**: keys on a VUID string and a fixed
+  loader/extension-name phrase. Low risk either way — it exists because a
+  layer *older* than `VK_KHR_portability_enumeration`'s introduction
+  misreports it; a CI-installed layer newer than the local 1.3.204.1 simply
+  won't emit this message at all (the guard goes dormant, not unsafe), and an
+  even-older layer would still emit the same wording since it's the loader's
+  own fixed extension name plus a fixed Khronos VUID string, not something
+  the layer's own version changes.
+- **Slang-source-language guard**: keys on an internal SPIRV-Tools check ID
+  plus the literal operand number ("Invalid source language operand: 11").
+  Similarly low risk in the "goes dormant on a newer layer" direction (once
+  the bundled SPIRV-Tools recognizes `SourceLanguage=Slang`, the message
+  stops being emitted); some residual risk if an intermediate layer version
+  reworded this specific diagnostic, but the operand-number phrasing is a
+  stable, generic SPIRV-Tools pattern used for every unrecognized enum value,
+  not bespoke text likely to be reworded independently of the enum itself.
+- **Sync-validation misclassification guard (highest risk of the three):**
+  matches five literal substrings together, including internal field-name
+  tokens (`type:`, `usage:`, `prior_usage:`, `command:`) and their
+  enum-to-string spellings, which is exactly the kind of internal
+  validation-layer reporting format Khronos has changed wording/fields on
+  across releases historically. The report's own verification tested exactly
+  two data points — the local 1.3.204.1 (has the bug, this exact text) and a
+  separately-obtained 1.4.357 (bug absent entirely, so nothing to match) —
+  and did **not** test whatever version Ubuntu's `apt-get install
+  vulkan-validationlayers` actually resolves to on the `ubuntu-latest`
+  runner, which is unpinned and very likely differs from both tested
+  versions. This is also the guard most likely to matter in practice: sync
+  validation itself is, per point 2 above, running on CI for the first time
+  ever with this same commit, so this exact code path gets its first real
+  CI exercise concurrently with an unverified layer version.
+
+No preemptive change is being requested — the guards are reasonable given
+what's verifiable pre-merge, and over-fitting them to an unavailable CI-side
+layer version would be guessing. Flagged as a specific thing to watch on the
+next CI run, not a blocker.
+
+### 4. Scope and hygiene
+
+- `git diff --stat acfce89..f4ce432` matches this report's own file list
+  exactly: `descriptor_arena.{h,cpp}` + both test files, `ci.yml`,
+  `context.cpp`, and this report. No other file in the repo changed.
+- `git show f4ce432` — author/committer both `Yousef Wadi
+  <ywadi85@gmail.com>`, no `Co-Authored-By` or any AI-attribution trailer;
+  grepped the full commit (message + diff) for
+  `claude|anthropic|co-authored|generated by|AI assist|copilot|gpt|openai` —
+  zero matches.
+- `.superpowers/sdd/.../progress.md`'s pre-existing uncommitted edit is
+  confirmed still unstaged in the working tree (not part of f4ce432), per
+  the report's own claim.
+- Both-environment 15/15 evidence is concrete: specific commands, specific
+  driver identification (`vulkaninfo --summary` output quoted), specific
+  per-binary doctest assertion counts, specific `grep -c` results for the
+  warning and for unguarded `[vulkan validation]` lines. Not a bare
+  assertion of "tests passed."
+
+### Verdict
+
+**CLEAR TO PUSH.** Zero open defects in the arena enforcement logic, the CI
+package fix, or commit hygiene. Two non-blocking notes carried forward for
+the ledger/next-CI-run rather than as blockers: (a) the validation-inactive
+gap was project-wide (core validation, not only sync validation) for all of
+Phases 1-3's CI history through run acfce89 — record this explicitly rather
+than only as "sync validation was off"; (b) watch the first post-fix CI run
+for any new, unguarded `[vulkan validation]` line matching
+`SYNC-HAZARD-READ_AFTER_WRITE` that doesn't hit
+`isKnownSyncValidationSeparateSamplerMisclassification`'s exact five
+substrings — that guard was verified against only two (old/new) layer
+versions, neither of which is guaranteed to be what `ubuntu-latest`'s
+unpinned `apt-get install vulkan-validationlayers` actually installs, and
+this is sync validation's first-ever genuine run on CI.

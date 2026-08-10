@@ -1,0 +1,784 @@
+# Review package: acfce89..f4ce432
+
+## Commits
+f4ce432 Enforce DescriptorArena budgets in software; install CI validation layer
+
+## Files changed
+ .github/workflows/ci.yml                           |  29 ++-
+ .../release-fixwave-report.md                      | 229 +++++++++++++++++++++
+ src/rx_material/tests/test_param_arena.cpp         |  12 ++
+ src/rx_rhi_vk/include/rx_rhi_vk/descriptor_arena.h |  58 +++++-
+ src/rx_rhi_vk/src/context.cpp                      |  22 ++
+ src/rx_rhi_vk/src/descriptor_arena.cpp             |  49 ++++-
+ src/rx_rhi_vk/tests/descriptor_arena_test.cpp      | 112 +++++++++-
+ 7 files changed, 504 insertions(+), 7 deletions(-)
+
+## Diff
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 71616a1..79f82d2 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -49,25 +49,52 @@ jobs:
+       # just libx11-dev+libxext-dev revealed a second, more specific fatal
+       # check ("Couldn't find dependency package for XTEST") one level
+       # deeper in the same CheckX11 macro, since CMake configure stops at
+       # the first fatal error and never reaches later checks. Cross-checked
+       # directly against SDL3's own cmake/sdlchecks.cmake CheckX11 macro
+       # (release-3.4.14) for every *other* SDL_missing_dependency() call it
+       # can still reach (XCURSOR/XINPUT/XFIXES/XRANDR/XSCRNSAVER/XTEST all
+       # require a real library; XDBE/XSHAPE/XSYNC only need headers already
+       # covered by libx11-dev/libxext-dev) so this is the complete set, not
+       # another one-check-at-a-time guess.
++      #
++      # vulkan-validationlayers [post-release fix, CI run acfce89]: provides
++      # VK_LAYER_KHRONOS_validation itself -- a SEPARATE Ubuntu package from
++      # libvulkan-dev/vulkan-tools/mesa-vulkan-drivers above, none of which
++      # pull it in as a dependency (verified directly: apt-cache depends on
++      # each of those three lists no vulkan-validationlayers pull-in, and
++      # this package was simply never in this list). Its absence was root-
++      # caused, not assumed: rx_rhi_vk/src/context.cpp's own
++      # VK_EXT_validation_features probe already queries vk-bootstrap's
++      # SystemInfo, whose available_extensions it verified (by reading the
++      # pinned vk-bootstrap commit 556b79b's SystemInfo constructor
++      # directly) already merges each installed layer's OWN extensions via
++      # a per-layer vkEnumerateInstanceExtensionProperties(layer.layerName,
++      # ...) call -- i.e. that probe is already layer-scoped, not the
++      # unscoped bug it might look like at a glance. Reproduced the CI log's
++      # exact "VK_EXT_validation_features unavailable... will not be
++      # active" warning locally by pointing VK_LAYER_PATH at an empty
++      # directory (simulating the layer being genuinely undiscoverable,
++      # exactly this runner's real state before this line existed) against
++      # an otherwise-unmodified rx_rhi_vk_tests binary, and confirmed the
++      # warning disappears with the layer package installed and VK_LAYER_PATH
++      # unset -- i.e. this one missing apt package, not any code path in
++      # this repository, was the entire root cause. See descriptor_arena.h/
++      # .cpp's own "BUDGETS ARE ARENA-ENFORCED" comment for this same CI
++      # run's other, unrelated finding (DescriptorArena's exhaustion
++      # contract relying on driver-optional VkDescriptorPool enforcement).
+       - name: Install system packages
+         run: |
+           sudo apt-get update
+           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+-            ninja-build mesa-vulkan-drivers vulkan-tools libvulkan-dev xvfb \
++            ninja-build mesa-vulkan-drivers vulkan-tools libvulkan-dev \
++            vulkan-validationlayers xvfb \
+             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+             libxfixes-dev libxss-dev libxtst-dev libxkbcommon-dev
+ 
+       - name: Install pinned zig toolchain (checksum-verified)
+         run: |
+           curl -fsSL -o "/tmp/${RX_ZIG_ARCHIVE}" "${RX_ZIG_URL}"
+           echo "${RX_ZIG_SHA256}  /tmp/${RX_ZIG_ARCHIVE}" | sha256sum -c -
+           mkdir -p toolchain/zig
+           tar -xf "/tmp/${RX_ZIG_ARCHIVE}" -C toolchain/zig --strip-components=1
+           toolchain/zig/zig version
+diff --git a/.superpowers/sdd/2026-08-10-phase3-render-graph-materials/release-fixwave-report.md b/.superpowers/sdd/2026-08-10-phase3-render-graph-materials/release-fixwave-report.md
+new file mode 100644
+index 0000000..780bbac
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-10-phase3-render-graph-materials/release-fixwave-report.md
+@@ -0,0 +1,229 @@
++# Release fix wave: CI run acfce89 (lavapipe 2/15 failures)
++
++## Scope
++
++Two independent fixes against the CI failures on lavapipe (software Vulkan):
++
++1. `rx::rhi::DescriptorArena` relying on driver-optional `VkDescriptorPool`
++   exhaustion detection for its documented `allocate() -> VK_NULL_HANDLE`
++   contract.
++2. Vulkan synchronization validation silently inactive in CI
++   (`VK_EXT_validation_features unavailable` warning).
++
++## Fix 1 — DescriptorArena enforces its own budgets
++
++**Root cause (confirmed, matches the brief):** the Vulkan spec's own
++`vkAllocateDescriptorSets` description text says the allocation "may fail
++due to lack of space in the descriptor pool" if a call would push the
++pool's total sets past `maxSets`, or any one descriptor type's count past
++that type's pool size — "may", not "must". Only the resulting *error code*
++(`VK_ERROR_OUT_OF_POOL_MEMORY`) is mandatory *if* an implementation chooses
++to detect exhaustion at all. lavapipe/Mesa is a real, spec-conformant
++implementation that does not choose to — it let CI's `descriptor_arena_test.cpp`/
++`test_param_arena.cpp` allocate past the documented `maxSets` ceiling and
++return a real, non-null `VkDescriptorSet`. This project's own dev-machine
++driver happened to enforce the limit, which is why local GPU runs were
++green while CI wasn't.
++
++**Change:** `DescriptorArena` now tracks, per frame-in-flight slot, its own
++allocated-set count and allocated-uniform-buffer-descriptor count against
++the `Capacities` it was `create()`d with, and checks both *before* ever
++calling `vkAllocateDescriptorSets`. `allocate()` gained a
++`uniformBufferDescriptorCount` parameter (default `1`, matching every real
++caller's single-UBO-binding shape — `rx_material`'s `ParamArena` — so no
++existing call site needed to change) so the per-type budget accounts for
++however many UBO descriptors one call's `VkDescriptorSetLayout` actually
++consumes, since Vulkan gives no API to introspect an opaque layout handle.
++Genuine driver-level failure (`VK_ERROR_OUT_OF_POOL_MEMORY` /
++`VK_ERROR_FRAGMENTED_POOL` from `vkAllocateDescriptorSets` itself, e.g. real
++fragmentation this class's own accounting can't see) is kept as a distinct,
++logged fallback path — never removed, just no longer the only line of
++defense.
++
++Files:
++- `src/rx_rhi_vk/include/rx_rhi_vk/descriptor_arena.h` — class-level
++  "BUDGETS ARE ARENA-ENFORCED" comment (cites the spec text above),
++  `allocate()` signature/doc update, new per-slot counter members.
++- `src/rx_rhi_vk/src/descriptor_arena.cpp` — counter storage in
++  `create()`/move-assign, reset in `beginFrame()`, the two budget checks
++  (maxSets, then uniformBuffers) at the top of `allocate()`, distinct log
++  lines for arena-enforced vs. genuine-driver-failure rejections.
++- `src/rx_rhi_vk/tests/descriptor_arena_test.cpp` — updated comment on the
++  existing exhaustion assertions (now arena-enforced, deterministic on
++  every driver); added a new `TEST_CASE` with three sub-cases that size
++  `maxSets`/`uniformBuffers` *differently* so each ceiling's exhaustion can
++  only be explained by the budget that's actually smaller: (A)
++  `uniformBuffers` smaller than `maxSets`, (B) `maxSets` smaller than
++  `uniformBuffers`, (C) a real two-UBO-binding layout allocated with
++  `uniformBufferDescriptorCount=2`, proving the budget sums descriptors per
++  call rather than just counting calls (2+2=4 of 5 fits, a third call
++  needing 2 more (6) fails even though 1 descriptor of naive headroom
++  "remains").
++- `src/rx_material/tests/test_param_arena.cpp` — comment-only update on the
++  descriptor-pool-exhaustion sub-case clarifying it now exercises
++  `DescriptorArena`'s arena-enforced budget (both `maxSets` and
++  `uniformBuffers` sized to `kMaxInstancesPerFrame` by
++  `ParamArena::create()`), not driver behavior. No assertion changes needed
++  — the existing shape already tests the right thing once the underlying
++  class enforces it itself.
++
++## Fix 2 — sync validation warning: root cause was NOT in context.cpp
++
++The brief's working hypothesis was that `context.cpp`'s
++`VK_EXT_validation_features` availability probe checks instance-level
++extension enumeration *without* layer scoping. **That hypothesis did not
++hold up under direct verification** and the actual fix is elsewhere:
++
++- Read the pinned vk-bootstrap commit's actual source
++  (`third_party/CMakeLists.txt`'s `RX_VK_BOOTSTRAP_COMMIT` =
++  `556b79b165386f6c1a18362d30f2a076fdaa2778`, checked out at
++  `build/linux-native/_deps-src/vk-bootstrap/src/VkBootstrap.cpp`).
++  `SystemInfo`'s own constructor already loops over every layer
++  `vkEnumerateInstanceLayerProperties` returns and merges each one's own
++  extensions via a **per-layer**
++  `vkEnumerateInstanceExtensionProperties(layer.layerName, ...)` call into
++  `available_extensions` — i.e. `context.cpp`'s
++  `systemInfo->is_extension_available(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME)`
++  call is already layer-scoped.
++- Reproduced this directly: pointing `VK_LAYER_PATH` at an empty directory
++  (making `VK_LAYER_KHRONOS_validation` genuinely undiscoverable) against
++  the *unmodified* `rx_rhi_vk_tests` binary reliably reproduces the exact
++  CI warning text. Restoring the normal environment (layer discoverable)
++  makes it disappear — proving the probe correctly activates sync
++  validation whenever the layer is actually present, with no code change.
++- Root-caused the CI gap instead: `.github/workflows/ci.yml`'s
++  `linux-native` job's "Install system packages" step never installed
++  `vulkan-validationlayers` — a separate Ubuntu package from
++  `libvulkan-dev`/`vulkan-tools`/`mesa-vulkan-drivers`, confirmed via
++  `apt-cache depends` that none of those three pull it in. This local dev
++  machine has `vulkan-validationlayers 1.3.204.1-2` installed as its own
++  explicit package (`dpkg -l`), which is *why* local runs already had sync
++  validation active and never surfaced this gap.
++
++**Change:** added `vulkan-validationlayers` to the `linux-native` job's
++apt-get install line in `.github/workflows/ci.yml`, with a comment
++documenting the verification above. `windows-cross-zig` was checked too:
++every real `Context::create(..., /*enableValidation=*/true)` call site
++lives in `rx_rhi_vk_tests`, `rx_graph_gpu_tests`, `rx_material_gpu_tests`,
++or a `sample_*_headless` gate — all already excluded from that job's own
++`ctest -E` filter (no real Vulkan under Wine) — so it needs no equivalent
++package.
++
++Also added a short verification comment directly in `context.cpp` at the
++probe site itself, so a future reader doesn't re-open this same
++(disproven) lead.
++
++Files:
++- `.github/workflows/ci.yml` — added `vulkan-validationlayers` to
++  `linux-native`'s package list, with the verification comment above.
++- `src/rx_rhi_vk/src/context.cpp` — comment only, no logic change: records
++  that the probe was verified layer-scoped-correct and the real fix is in
++  CI's package list.
++
++## Verification
++
++### 1. Full suite, default (real) GPU driver
++
++```
++$ ctest --preset linux-native --output-on-failure
++...
++100% tests passed, 0 tests failed out of 15
++Total Test time (real) =  24.17 sec
++```
++
++### 2. Full suite, CI-mirrored (xvfb + lavapipe forced)
++
++Lavapipe forced via `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`
++(confirmed via `vulkaninfo --summary` under that env: `deviceName =
++llvmpipe (LLVM 15.0.7, 256 bits)`, `driverName = llvmpipe`), run the same
++way CI's own `Test (xvfb + lavapipe)` step does:
++
++```
++$ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json xvfb-run -a ctest --preset linux-native -V
++...
++100% tests passed, 0 tests failed out of 15
++Total Test time (real) =   8.80 sec
++```
++
++Evidence the arena-enforced budget is what's firing now (deterministic on
++lavapipe, where it previously was NOT firing):
++
++```
++[error] rx::rhi::DescriptorArena::allocate: arena-enforced maxSets budget exhausted for frame slot 0 (4 of 4 sets already allocated this reset cycle)
++[error] rx::rhi::DescriptorArena::allocate: arena-enforced uniformBuffers budget exhausted for frame slot 0 (3 of 3 UBO descriptors already allocated this reset cycle, 1 more requested)
++[error] rx::rhi::DescriptorArena::allocate: arena-enforced maxSets budget exhausted for frame slot 0 (3 of 3 sets already allocated this reset cycle)
++[error] rx::rhi::DescriptorArena::allocate: arena-enforced uniformBuffers budget exhausted for frame slot 0 (4 of 5 UBO descriptors already allocated this reset cycle, 2 more requested)
++[error] rx::rhi::DescriptorArena::allocate: arena-enforced maxSets budget exhausted for frame slot 1 (512 of 512 sets already allocated this reset cycle)  # ParamArena's own exhaustion sub-case
++```
++
++Evidence the sync-validation warning is gone (layer now installed on this
++run's simulated-CI environment) and no new, unguarded validation messages
++surfaced now that sync validation is genuinely active against lavapipe for
++the first time:
++
++```
++$ grep -c "VK_EXT_validation_features unavailable" ctest-lavapipe-final.log
++0
++$ grep "\[vulkan validation\]" ctest-lavapipe-final.log | grep -v "known false positive" | wc -l
++0
++```
++
++Every `[vulkan validation]` line present in the run is one of the three
++already-documented, evidence-backed false positives in `context.cpp`
++(`isKnownPortabilityEnumerationLayerBug`,
++`isKnownUnrecognizedSlangSourceLanguageBug`,
++`isKnownSyncValidationSeparateSamplerMisclassification`) — no new guard was
++needed.
++
++Per-binary doctest tallies from the same lavapipe run, all zero failures:
++
++```
++[doctest] assertions: 6 | 6 passed | 0 failed |     (rx_core_tests)
++[doctest] assertions: 12 | 12 passed | 0 failed |   (rx_platform_tests)
++[doctest] assertions: 3 | 3 passed | 0 failed |     (shader_spirv_test)
++[doctest] assertions: 86 | 86 passed | 0 failed |   (rx_shader_tests)
++[doctest] assertions: 787 | 787 passed | 0 failed | (rx_rhi_vk_tests)
++[doctest] assertions: 212 | 212 passed | 0 failed | (rx_graph_tests)
++[doctest] assertions: 57 | 57 passed | 0 failed |   (rx_graph_gpu_tests)
++[doctest] assertions: 344 | 344 passed | 0 failed | (rx_material_gpu_tests)
++[doctest] assertions: 50 | 50 passed | 0 failed |   (rx_material_tests)
++```
++
++### 3. Both presets build clean
++
++```
++$ cmake --build --preset linux-native      # exit 0, no warnings emitted as errors
++$ cmake --build --preset windows-cross-zig # exit 0
++```
++
++`windows-cross-zig`'s own `ctest -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample'`
++selection (6 tests, matching CI) also re-run clean under `xvfb-run` as a
++bonus consistency check (not part of the mandatory verification, since CI
++was only failing on `linux-native`):
++
++```
++100% tests passed, 0 tests failed out of 6
++```
++
++## Deviation from the brief (and why)
++
++Fix 2's brief assumed the root cause lived in `context.cpp`'s extension
++probe. Direct verification (reading the pinned vk-bootstrap commit's actual
++source, then reproducing/un-reproducing the exact CI warning locally by
++toggling `VK_LAYER_PATH`) showed that code was already correct — the probe
++is already layer-scoped and activates sync validation correctly whenever
++the layer is discoverable. The real defect was `.github/workflows/ci.yml`
++never installing the `vulkan-validationlayers` package on the
++`linux-native` runner. Fixed there instead, with `context.cpp` receiving
++only a documentation comment recording the (negative) finding. This is a
++narrower change than the brief anticipated, not a larger one — no
++`context.cpp` logic was touched.
++
++## Commit
++
++Single commit, both fixes (they share verification and are small enough
++not to warrant splitting): descriptor arena enforcement + tests, CI
++package fix, context.cpp documentation note. `.superpowers/sdd/.../progress.md`'s
++pre-existing uncommitted edit (present before this fix wave started) was
++left untouched — out of scope for "touch only what these two fixes
++require."
+diff --git a/src/rx_material/tests/test_param_arena.cpp b/src/rx_material/tests/test_param_arena.cpp
+index 2303c57..6327217 100644
+--- a/src/rx_material/tests/test_param_arena.cpp
++++ b/src/rx_material/tests/test_param_arena.cpp
+@@ -173,20 +173,32 @@ TEST_CASE("ParamArena: byte-arena exhaustion and descriptor-pool exhaustion at a
+         VkDescriptorSet normalSet = arena->writeAndAllocate(layout, blob.data(), blob.size());
+         REQUIRE(normalSet != VK_NULL_HANDLE);
+         const void* slot1Data = rx::material::detail::debugFrameBufferData(*arena, 1);
+         REQUIRE(slot1Data != nullptr);
+         CHECK(std::memcmp(slot1Data, blob.data(), blob.size()) == 0);
+ 
+         // --- Descriptor-pool exhaustion, at the SAME non-zero slot -------
+         // A fresh beginFrame(1) resets both the byte cursor and the paired
+         // DescriptorArena's pool, so this sub-case starts from a clean
+         // slate independent of the byte-arena sub-case above.
++        //
++        // [Post-release fix, CI lavapipe run acfce89] This now exercises
++        // rx::rhi::DescriptorArena's own arena-enforced maxSets/uniformBuffers
++        // budget (descriptor_arena.h's class-level BUDGETS ARE
++        // ARENA-ENFORCED comment), not driver-side VkDescriptorPool
++        // enforcement -- ParamArena::create() sizes both of that budget's
++        // fields to kMaxInstancesPerFrame (instance.cpp), so this loop hits
++        // the SAME arena-enforced ceiling deterministically on every
++        // driver, including lavapipe (which legally never enforces
++        // VkDescriptorPool's own limits itself -- see
++        // rx_rhi_vk/tests/descriptor_arena_test.cpp for that class's own
++        // direct, per-budget coverage).
+         arena->beginFrame(1);
+         uint32_t successfulAllocations = 0;
+         for (; successfulAllocations < rx::material::ParamArena::kMaxInstancesPerFrame; ++successfulAllocations) {
+             VkDescriptorSet s = arena->writeAndAllocate(layout, blob.data(), blob.size());
+             if (s == VK_NULL_HANDLE) {
+                 break;
+             }
+         }
+         // Every one of the documented kMaxInstancesPerFrame allocations
+         // must have succeeded -- the byte arena (1 MiB, ~256+16 bytes per
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/descriptor_arena.h b/src/rx_rhi_vk/include/rx_rhi_vk/descriptor_arena.h
+index d0583e6..a539e70 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/descriptor_arena.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/descriptor_arena.h
+@@ -35,20 +35,49 @@ struct DescriptorArenaCapacities {
+ // allocator [Phase 3 Task 7 brief]: one VkDescriptorPool per frame-in-flight
+ // slot, reset (never individually freed) via beginFrame(), and a single
+ // allocate(VkDescriptorSetLayout) that hands out one VkDescriptorSet from
+ // whichever slot beginFrame() most recently reset. This is the GPU-object
+ // counterpart to rx_material's own per-frame CPU-side parameter arena
+ // (src/rx_material/include/rx_material/instance.h's ParamArena): every
+ // material instance bound in a frame gets one fresh VkDescriptorSet from
+ // THIS arena and one fresh byte range from THAT one, and both are reclaimed
+ // together the next time this same frame-in-flight slot comes back around.
+ //
++// BUDGETS ARE ARENA-ENFORCED, NOT DRIVER-ENFORCED [post-release fix, CI
++// lavapipe run acfce89]: allocate() tracks this slot's own consumed set
++// count and per-type (uniformBuffers) descriptor count against `capacities`
++// and refuses (VK_NULL_HANDLE, logged) BEFORE ever calling
++// vkAllocateDescriptorSets once either ceiling would be exceeded. This is
++// not defensive belt-and-suspenders -- it is the only correct way to make
++// "exhausted -> null" a real, portable contract, because the Vulkan spec
++// itself never obligates a driver to detect or report pool exhaustion at
++// all: vkAllocateDescriptorSets's own spec text says the allocation "may
++// fail due to lack of space in the descriptor pool" if a call would push
++// the pool's total sets past maxSets, or any one descriptor type's count
++// past that type's pool size -- "may", not "must" (only the resulting
++// ERROR CODE, VK_ERROR_OUT_OF_POOL_MEMORY / VK_ERROR_FRAGMENTED_POOL, is
++// mandatory IF an implementation chooses to detect exhaustion at all).
++// lavapipe/Mesa is a real, spec-conformant example of an implementation
++// that does not choose to: CI's lavapipe run let a call past this class's
++// documented maxSets ceiling succeed for real (verified directly:
++// descriptor_arena_test.cpp/test_param_arena.cpp both asserted the
++// documented-limit allocation returns VK_NULL_HANDLE, which held on every
++// real GPU driver this project had tested against but failed on lavapipe
++// specifically), while this project's own dev-machine driver happened to
++// enforce it -- exactly the driver-optional gap the spec permits. Tracking
++// and refusing in software here means "documented limit -> VK_NULL_HANDLE"
++// is now true on every conformant driver, including lavapipe, by
++// construction, with genuine driver-level exhaustion (a real
++// VK_ERROR_OUT_OF_POOL_MEMORY/VK_ERROR_FRAGMENTED_POOL from
++// vkAllocateDescriptorSets, e.g. from fragmentation this class's own
++// accounting cannot see) kept as a logged fallback path, never removed.
++//
+ // DEVICE-FREE-WHERE-POSSIBLE: create() needs only a VkDevice -- no
+ // VkPhysicalDevice, no VkInstance, no window/surface -- unlike
+ // rx::rhi::BindlessTable, which additionally needs a VkPhysicalDevice to
+ // pre-check update-after-bind limits (bindless.h). This arena's pools are
+ // plain, non-update-after-bind pools with no such per-device ceiling to
+ // check, so there is nothing else this class needs beyond the device
+ // itself.
+ //
+ // RESET, NOT FREE -- every pool this class owns is created WITHOUT
+ // VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT: beginFrame() calls
+@@ -92,28 +121,49 @@ public:
+ 
+     // Resets frame slot `frameIndex % framesInFlight()`'s pool
+     // (vkResetDescriptorPool) -- see the class-level SAFETY CONTRACT above.
+     // Every VkDescriptorSet previously allocated from that slot becomes
+     // invalid the moment this returns. Logs (RX_LOG_ERROR) and otherwise
+     // no-ops on the rare underlying VkResult failure.
+     void beginFrame(uint32_t frameIndex);
+ 
+     // Allocates one VkDescriptorSet of `layout` from the CURRENT slot's
+     // pool (whichever beginFrame() most recently reset -- slot 0 if
+-    // allocate() is called before the first beginFrame()). Returns
+-    // VK_NULL_HANDLE (logged) if that slot's pool cannot satisfy the
+-    // request (e.g. maxSets already exhausted this reset cycle).
+-    [[nodiscard]] VkDescriptorSet allocate(VkDescriptorSetLayout layout);
++    // allocate() is called before the first beginFrame()). `layout`'s own
++    // VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER descriptor count -- summed across
++    // every binding in that layout, e.g. 1 for the single-UBO-binding shape
++    // every real caller in this codebase uses today (see rx_material's
++    // ParamArena) -- must be passed as `uniformBufferDescriptorCount`: this
++    // class has no way to introspect an opaque VkDescriptorSetLayout's own
++    // bindings (Vulkan provides no query for that), so the caller is the
++    // only source of truth for how much of the `uniformBuffers` budget one
++    // allocate() call actually consumes. Returns VK_NULL_HANDLE (logged) if
++    // allocating this set would exceed EITHER this slot's remaining maxSets
++    // or its remaining uniformBuffers budget (checked, and refused, before
++    // vkAllocateDescriptorSets is ever called -- see the class-level
++    // BUDGETS ARE ARENA-ENFORCED comment above for why), or if the
++    // underlying driver call itself fails for a genuine reason (e.g. real
++    // pool fragmentation) despite this arena's own accounting having
++    // budget left.
++    [[nodiscard]] VkDescriptorSet allocate(VkDescriptorSetLayout layout, uint32_t uniformBufferDescriptorCount = 1);
+ 
+     [[nodiscard]] uint32_t framesInFlight() const { return static_cast<uint32_t>(pools_.size()); }
+ 
+ private:
+     DescriptorArena() = default;
+ 
+     void destroyAll();
+ 
+     VkDevice device_ = VK_NULL_HANDLE;
+     std::vector<VkDescriptorPool> pools_;
++    Capacities capacities_;
++    // Parallel to pools_, one entry per frame-in-flight slot -- this slot's
++    // own count of sets/uniformBuffer-descriptors allocated since the most
++    // recent beginFrame() reset it to 0. This is the arena-side enforcement
++    // state the class-level BUDGETS ARE ARENA-ENFORCED comment documents;
++    // never touched by the driver, only by allocate()/beginFrame() here.
++    std::vector<uint32_t> allocatedSets_;
++    std::vector<uint32_t> allocatedUniformBuffers_;
+     uint32_t currentFrame_ = 0;
+ };
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/context.cpp b/src/rx_rhi_vk/src/context.cpp
+index 4fc2eaf..956ed2d 100644
+--- a/src/rx_rhi_vk/src/context.cpp
++++ b/src/rx_rhi_vk/src/context.cpp
+@@ -199,20 +199,42 @@ std::optional<Context> Context::create(std::vector<const char*> requiredExtensio
+         // list when that same layer is actually installed -- exactly the
+         // condition request_validation_layers() above already degrades
+         // gracefully on when missing. Unlike that soft request, though,
+         // InstanceBuilder::enable_extension() is unconditional: asking for
+         // an extension that turns out unavailable fails build() outright.
+         // This probe keeps a machine with no validation layer installed
+         // (enableValidation=true requested anyway) failing exactly the way
+         // it already did before this change -- via request_validation_
+         // layers()'s own soft degrade -- rather than a new, harder failure
+         // mode introduced by this addition.
++        // VERIFIED, not assumed, layer-scoped already [post-release fix, CI
++        // lavapipe run acfce89 -- CI's log showed this warning firing on a
++        // runner initially believed to have VK_LAYER_KHRONOS_validation
++        // installed]: read directly against the pinned vk-bootstrap commit
++        // (third_party/CMakeLists.txt's RX_VK_BOOTSTRAP_COMMIT, checked out
++        // at build/<preset>/_deps-src/vk-bootstrap), SystemInfo's own
++        // constructor already loops over every layer
++        // vkEnumerateInstanceLayerProperties returns and merges EACH one's
++        // own extensions via a per-layer
++        // vkEnumerateInstanceExtensionProperties(layer.layerName, ...) call
++        // into available_extensions -- i.e. is_extension_available() below
++        // is already layer-scoped, not the unscoped bug that warning's
++        // wording might suggest. Reproduced directly: pointing
++        // VK_LAYER_PATH at an empty directory (making the layer genuinely
++        // undiscoverable) reliably reproduces this exact warning against an
++        // otherwise-unmodified build; restoring VK_LAYER_PATH makes it
++        // disappear. The real root cause of the CI failure was
++        // .github/workflows/ci.yml's linux-native job never installing the
++        // `vulkan-validationlayers` package in the first place (a separate
++        // Ubuntu package from libvulkan-dev/vulkan-tools/mesa-vulkan-
++        // drivers, confirmed via `apt-cache depends` that none of those
++        // three pull it in) -- fixed there, not here.
+         auto systemInfo = vkb::SystemInfo::get_system_info();
+         if (systemInfo && systemInfo->is_extension_available(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME)) {
+             builder.enable_extension(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME)
+                 .add_validation_feature_enable(VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT);
+         } else {
+             RX_LOG_WARN(
+                 "VK_EXT_validation_features unavailable (validation layer not installed?); Vulkan synchronization "
+                 "validation will not be active for this run");
+         }
+     }
+diff --git a/src/rx_rhi_vk/src/descriptor_arena.cpp b/src/rx_rhi_vk/src/descriptor_arena.cpp
+index c4b035c..5fbfcae 100644
+--- a/src/rx_rhi_vk/src/descriptor_arena.cpp
++++ b/src/rx_rhi_vk/src/descriptor_arena.cpp
+@@ -7,24 +7,29 @@
+ namespace rx::rhi {
+ 
+ DescriptorArena::DescriptorArena(DescriptorArena&& other) noexcept : DescriptorArena() { *this = std::move(other); }
+ 
+ DescriptorArena& DescriptorArena::operator=(DescriptorArena&& other) noexcept {
+     if (this != &other) {
+         destroyAll();
+ 
+         device_ = other.device_;
+         pools_ = std::move(other.pools_);
++        capacities_ = other.capacities_;
++        allocatedSets_ = std::move(other.allocatedSets_);
++        allocatedUniformBuffers_ = std::move(other.allocatedUniformBuffers_);
+         currentFrame_ = other.currentFrame_;
+ 
+         other.device_ = VK_NULL_HANDLE;
+         other.pools_.clear();
++        other.allocatedSets_.clear();
++        other.allocatedUniformBuffers_.clear();
+         other.currentFrame_ = 0;
+     }
+     return *this;
+ }
+ 
+ DescriptorArena::~DescriptorArena() { destroyAll(); }
+ 
+ void DescriptorArena::destroyAll() {
+     for (VkDescriptorPool pool : pools_) {
+         if (pool != VK_NULL_HANDLE) {
+@@ -69,41 +74,83 @@ std::optional<DescriptorArena> DescriptorArena::create(VkDevice device, uint32_t
+                 vkDestroyDescriptorPool(device, created, nullptr);
+             }
+             return std::nullopt;
+         }
+         pools.push_back(pool);
+     }
+ 
+     DescriptorArena arena;
+     arena.device_ = device;
+     arena.pools_ = std::move(pools);
++    arena.capacities_ = capacities;
++    arena.allocatedSets_.assign(framesInFlight, 0);
++    arena.allocatedUniformBuffers_.assign(framesInFlight, 0);
+     return arena;
+ }
+ 
+ void DescriptorArena::beginFrame(uint32_t frameIndex) {
+     currentFrame_ = frameIndex % static_cast<uint32_t>(pools_.size());
+     VkResult result = vkResetDescriptorPool(device_, pools_[currentFrame_], 0);
+     if (result != VK_SUCCESS) {
+         RX_LOG_ERROR("rx::rhi::DescriptorArena::beginFrame: vkResetDescriptorPool failed for slot {}: VkResult={}",
+                      currentFrame_, static_cast<int>(result));
+     }
++    // Reset this slot's own arena-enforced budget tracking regardless of
++    // the vkResetDescriptorPool result above -- a failed reset is already
++    // logged as an error by this class (nothing more this method can do
++    // about it), and every VkDescriptorSet the pool held is conceptually
++    // gone either way once beginFrame() has been called for this slot.
++    allocatedSets_[currentFrame_] = 0;
++    allocatedUniformBuffers_[currentFrame_] = 0;
+ }
+ 
+-VkDescriptorSet DescriptorArena::allocate(VkDescriptorSetLayout layout) {
++VkDescriptorSet DescriptorArena::allocate(VkDescriptorSetLayout layout, uint32_t uniformBufferDescriptorCount) {
++    // Arena-enforced budget check FIRST -- see descriptor_arena.h's
++    // class-level BUDGETS ARE ARENA-ENFORCED comment for why this cannot be
++    // left to the driver: vkAllocateDescriptorSets is never even called
++    // once either ceiling would be exceeded, so "documented limit ->
++    // VK_NULL_HANDLE" holds deterministically on every driver, including
++    // ones (lavapipe/Mesa) that legally never detect real pool exhaustion
++    // themselves.
++    if (allocatedSets_[currentFrame_] + 1 > capacities_.maxSets) {
++        RX_LOG_ERROR(
++            "rx::rhi::DescriptorArena::allocate: arena-enforced maxSets budget exhausted for frame slot {} ({} of "
++            "{} sets already allocated this reset cycle)",
++            currentFrame_, allocatedSets_[currentFrame_], capacities_.maxSets);
++        return VK_NULL_HANDLE;
++    }
++    if (allocatedUniformBuffers_[currentFrame_] + uniformBufferDescriptorCount > capacities_.uniformBuffers) {
++        RX_LOG_ERROR(
++            "rx::rhi::DescriptorArena::allocate: arena-enforced uniformBuffers budget exhausted for frame slot {} "
++            "({} of {} UBO descriptors already allocated this reset cycle, {} more requested)",
++            currentFrame_, allocatedUniformBuffers_[currentFrame_], capacities_.uniformBuffers,
++            uniformBufferDescriptorCount);
++        return VK_NULL_HANDLE;
++    }
++
+     VkDescriptorSetAllocateInfo allocInfo{};
+     allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+     allocInfo.descriptorPool = pools_[currentFrame_];
+     allocInfo.descriptorSetCount = 1;
+     allocInfo.pSetLayouts = &layout;
+ 
+     VkDescriptorSet set = VK_NULL_HANDLE;
+     VkResult result = vkAllocateDescriptorSets(device_, &allocInfo, &set);
+     if (result != VK_SUCCESS) {
++        // Genuine driver-level failure fallback path (e.g. real pool
++        // fragmentation, VK_ERROR_FRAGMENTED_POOL) -- this arena's own
++        // budget check above found room, but the driver still could not
++        // satisfy the request. Logged distinctly from the arena-enforced
++        // rejections above so the two cases are never confused when
++        // reading logs.
+         RX_LOG_ERROR("rx::rhi::DescriptorArena::allocate: vkAllocateDescriptorSets failed for frame slot {}: "
+                      "VkResult={}",
+                      currentFrame_, static_cast<int>(result));
+         return VK_NULL_HANDLE;
+     }
++
++    allocatedSets_[currentFrame_] += 1;
++    allocatedUniformBuffers_[currentFrame_] += uniformBufferDescriptorCount;
+     return set;
+ }
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/tests/descriptor_arena_test.cpp b/src/rx_rhi_vk/tests/descriptor_arena_test.cpp
+index 3c5a551..063b2fa 100644
+--- a/src/rx_rhi_vk/tests/descriptor_arena_test.cpp
++++ b/src/rx_rhi_vk/tests/descriptor_arena_test.cpp
+@@ -1,15 +1,16 @@
+ #include <doctest/doctest.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/descriptor_arena.h>
+ #include <VkBootstrap.h>
++#include <array>
+ #include <utility>
+ 
+ // Pure headless test -- no rx::platform::Window, no VkSurfaceKHR, no
+ // swapchain anywhere in this file, exactly like clear_color_test.cpp/
+ // pipeline_layout_test.cpp/bindless_test.cpp/deletion_queue_test.cpp (safe
+ // to run in any order alongside the windowed Device/Buffer tests in this
+ // binary because tests/doctest_main.cpp warms vk-bootstrap's process-wide
+ // instance-function cache before any TEST_CASE runs -- see the comment
+ // there). DescriptorArena needs neither descriptor-indexing nor
+ // dynamic-rendering/sync2 device features (unlike bindless_test.cpp's own
+@@ -94,21 +95,26 @@ TEST_CASE("DescriptorArena::allocate across 3 simulated frames reuses reset pool
+             write.dstSet = set;
+             write.dstBinding = 0;
+             write.descriptorCount = 1;
+             write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+             write.pBufferInfo = &bufferInfo;
+             vkUpdateDescriptorSets(fixture.device, 1, &write, 0, nullptr);
+         };
+ 
+         // --- Simulated frame 0 (slot 0): allocate up to this arena's own
+         // maxSets, then confirm exhaustion is a clean VK_NULL_HANDLE, not a
+-        // crash or a validation error.
++        // crash or a validation error. [post-release fix, CI lavapipe run
++        // acfce89] This is now DescriptorArena's own arena-enforced budget
++        // firing (see descriptor_arena.h's class-level BUDGETS ARE
++        // ARENA-ENFORCED comment) -- deterministic on every driver,
++        // including lavapipe, which legally never enforces
++        // VkDescriptorPool's maxSets/pool-size limits itself.
+         arena->beginFrame(0);
+         for (uint32_t i = 0; i < capacities.maxSets; ++i) {
+             VkDescriptorSet set = arena->allocate(layout);
+             REQUIRE(set != VK_NULL_HANDLE);
+             writeUbo(set);
+         }
+         CHECK(arena->allocate(layout) == VK_NULL_HANDLE);
+ 
+         // --- Simulated frame 1 (slot 1): a DIFFERENT pool, so allocation
+         // succeeds again immediately -- proves the two frame-in-flight
+@@ -154,10 +160,114 @@ TEST_CASE("DescriptorArena::create rejects framesInFlight == 0 and zero capaciti
+     rx::rhi::DescriptorArena::Capacities zeroUbos{/*maxSets=*/4, /*uniformBuffers=*/0};
+     CHECK_FALSE(rx::rhi::DescriptorArena::create(fixture.device, /*framesInFlight=*/2, zeroUbos).has_value());
+ 
+     // A valid call still succeeds -- proves the rejections above are
+     // specific to the bad inputs, not a broken fixture.
+     CHECK(rx::rhi::DescriptorArena::create(fixture.device, /*framesInFlight=*/2).has_value());
+ 
+     vkb::destroy_device(fixture.vkbDevice);
+     CHECK_FALSE(fixture.context.hasValidationErrors());
+ }
++
++// A set layout with TWO uniform-buffer bindings (binding 0 and binding 1,
++// one descriptor each) -- used below to prove allocate()'s own
++// uniformBuffers accounting sums the caller-supplied
++// `uniformBufferDescriptorCount` per call rather than just counting calls,
++// exactly the distinction a single-binding layout (makeUboSetLayout above)
++// cannot exercise.
++VkDescriptorSetLayout makeTwoUboSetLayout(VkDevice device) {
++    std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
++    bindings[0].binding = 0;
++    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
++    bindings[0].descriptorCount = 1;
++    bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
++    bindings[1].binding = 1;
++    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
++    bindings[1].descriptorCount = 1;
++    bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
++
++    VkDescriptorSetLayoutCreateInfo info{};
++    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
++    info.bindingCount = static_cast<uint32_t>(bindings.size());
++    info.pBindings = bindings.data();
++
++    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
++    REQUIRE(vkCreateDescriptorSetLayout(device, &info, nullptr, &layout) == VK_SUCCESS);
++    return layout;
++}
++
++// [Post-release fix, CI lavapipe run acfce89] Both TEST_CASEs above happen
++// to size maxSets == uniformBuffers, so hitting one ceiling always means
++// hitting the other at the exact same allocate() call -- neither one can
++// tell, on its own, which of the two arena-enforced budgets
++// (descriptor_arena.h's class-level BUDGETS ARE ARENA-ENFORCED comment)
++// actually fired. This case deliberately sizes the two ceilings DIFFERENTLY
++// in both directions, so each sub-case's exhaustion can only be explained
++// by the one budget that is actually smaller.
++TEST_CASE("DescriptorArena::allocate enforces its own maxSets and per-type uniformBuffers budgets independently, "
++          "before ever calling the driver") {
++    HeadlessDescriptorArenaFixture fixture = makeFixture();
++
++    {
++        VkDescriptorSetLayout oneUboLayout = makeUboSetLayout(fixture.device);
++
++        // --- Sub-case A: uniformBuffers is the SMALLER budget (3 vs. 8) --
++        // exhaustion must fire at the 4th allocate() call even though
++        // maxSets (8) is nowhere close to used up.
++        {
++            rx::rhi::DescriptorArena::Capacities capacities{/*maxSets=*/8, /*uniformBuffers=*/3};
++            auto arena = rx::rhi::DescriptorArena::create(fixture.device, /*framesInFlight=*/1, capacities);
++            REQUIRE(arena.has_value());
++            arena->beginFrame(0);
++
++            for (uint32_t i = 0; i < capacities.uniformBuffers; ++i) {
++                REQUIRE(arena->allocate(oneUboLayout) != VK_NULL_HANDLE);
++            }
++            // uniformBuffers (3) is exhausted; maxSets (8) has 5 slots left
++            // -- this VK_NULL_HANDLE can only be the per-type budget.
++            CHECK(arena->allocate(oneUboLayout) == VK_NULL_HANDLE);
++        }
++
++        // --- Sub-case B: maxSets is the SMALLER budget (3 vs. 8) --
++        // exhaustion must fire at the 4th allocate() call even though
++        // uniformBuffers (8) is nowhere close to used up.
++        {
++            rx::rhi::DescriptorArena::Capacities capacities{/*maxSets=*/3, /*uniformBuffers=*/8};
++            auto arena = rx::rhi::DescriptorArena::create(fixture.device, /*framesInFlight=*/1, capacities);
++            REQUIRE(arena.has_value());
++            arena->beginFrame(0);
++
++            for (uint32_t i = 0; i < capacities.maxSets; ++i) {
++                REQUIRE(arena->allocate(oneUboLayout) != VK_NULL_HANDLE);
++            }
++            // maxSets (3) is exhausted; uniformBuffers (8) has 5 descriptors
++            // left -- this VK_NULL_HANDLE can only be the maxSets budget.
++            CHECK(arena->allocate(oneUboLayout) == VK_NULL_HANDLE);
++        }
++
++        // --- Sub-case C: a single allocate() call consuming MORE than one
++        // uniformBuffers descriptor (a real two-UBO-binding layout, paired
++        // with the matching uniformBufferDescriptorCount=2 argument) --
++        // proves the budget sums descriptors per call, not just counts
++        // calls. 5 descriptors of budget, 2 consumed per call: two calls
++        // fit (4 of 5 used), a third would need 2 more (6 total) and must
++        // fail even though 1 descriptor of headroom nominally remains.
++        {
++            VkDescriptorSetLayout twoUboLayout = makeTwoUboSetLayout(fixture.device);
++            rx::rhi::DescriptorArena::Capacities capacities{/*maxSets=*/8, /*uniformBuffers=*/5};
++            auto arena = rx::rhi::DescriptorArena::create(fixture.device, /*framesInFlight=*/1, capacities);
++            REQUIRE(arena.has_value());
++            arena->beginFrame(0);
++
++            REQUIRE(arena->allocate(twoUboLayout, /*uniformBufferDescriptorCount=*/2) != VK_NULL_HANDLE);
++            REQUIRE(arena->allocate(twoUboLayout, /*uniformBufferDescriptorCount=*/2) != VK_NULL_HANDLE);
++            CHECK(arena->allocate(twoUboLayout, /*uniformBufferDescriptorCount=*/2) == VK_NULL_HANDLE);
++
++            vkDestroyDescriptorSetLayout(fixture.device, twoUboLayout, nullptr);
++        }
++
++        vkDestroyDescriptorSetLayout(fixture.device, oneUboLayout, nullptr);
++    }
++
++    vkb::destroy_device(fixture.vkbDevice);
++    CHECK_FALSE(fixture.context.hasValidationErrors());
++}
