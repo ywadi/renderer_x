@@ -151,6 +151,20 @@ it is out of scope for *this* spec only, not out of scope for the project:
   - **Lighting infrastructure & spatial queries** (layer 9, techniques):
     acceleration structures (BVH for ray tracing), clustered/deferred
     lighting grids, shadow cascades, global illumination probes.
+  - **Hardware ray tracing** (layer 9, techniques; committed 2026-08-10):
+    an OPTIONAL device capability, never baseline — Steam Deck (the
+    hardware floor) exposes VK_KHR_ray_query/ray_tracing_pipeline via RADV
+    but with minimal RT hardware, so every RT feature ships behind a
+    startup capability query with a raster fallback (RT shadows → shadow
+    maps, RT reflections → screen-space/cubemap). Optionality-with-
+    fallback is the engine-wide principle for any feature above the
+    Vulkan 1.3 baseline. Sequencing: requires Phase 4's scene layer
+    (acceleration structures need real scene geometry); first deliverables
+    are ray_query-based shadows/AO, not full RT pipelines. The existing
+    foundations were chosen RT-compatible deliberately: bindless set 0
+    (any-hit material access), Slang (RT shader stages), render graph
+    (RT pass = compute-class pass + acceleration-structure resource type),
+    VMA (AS allocation).
   - **Post-processing & image reconstruction** (layer 9, techniques): tone
     mapping, color grading, temporal anti-aliasing, hardware upscaling
     wrappers (DLSS, FSR, XeSS).
