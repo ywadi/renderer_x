@@ -1,7 +1,9 @@
 #include <rx_rhi_vk/device.h>
 #include <rx_core/log.h>
 #include <VkBootstrap.h>
+#include <array>
 #include <utility>
+#include <vector>
 
 namespace rx::rhi {
 
@@ -9,6 +11,94 @@ namespace {
 
 void destroySurface(const Context& context, VkSurfaceKHR surface) {
     vkb::destroy_surface(context.vkbInstance(), surface);
+}
+
+// One entry per bit this Device requires from VkPhysicalDeviceVulkan12Features
+// [Phase 2 spec Fixed decision #5, R:B1/B2] -- kept as a table of
+// (name, accessor) pairs rather than ten separate `if`s so the "loud
+// startup error naming the missing feature" diagnostic below and the
+// feature-request struct below it can never silently drift apart.
+struct RequiredVulkan12Feature {
+    const char* name;
+    VkBool32 (*get)(const VkPhysicalDeviceVulkan12Features&);
+};
+
+constexpr std::array<RequiredVulkan12Feature, 10> kRequiredDescriptorIndexingFeatures{{
+    {"descriptorIndexing", [](const VkPhysicalDeviceVulkan12Features& f) { return f.descriptorIndexing; }},
+    {"runtimeDescriptorArray", [](const VkPhysicalDeviceVulkan12Features& f) { return f.runtimeDescriptorArray; }},
+    {"descriptorBindingPartiallyBound",
+     [](const VkPhysicalDeviceVulkan12Features& f) { return f.descriptorBindingPartiallyBound; }},
+    {"descriptorBindingVariableDescriptorCount",
+     [](const VkPhysicalDeviceVulkan12Features& f) { return f.descriptorBindingVariableDescriptorCount; }},
+    {"descriptorBindingSampledImageUpdateAfterBind",
+     [](const VkPhysicalDeviceVulkan12Features& f) { return f.descriptorBindingSampledImageUpdateAfterBind; }},
+    {"descriptorBindingStorageImageUpdateAfterBind",
+     [](const VkPhysicalDeviceVulkan12Features& f) { return f.descriptorBindingStorageImageUpdateAfterBind; }},
+    {"descriptorBindingStorageBufferUpdateAfterBind",
+     [](const VkPhysicalDeviceVulkan12Features& f) { return f.descriptorBindingStorageBufferUpdateAfterBind; }},
+    {"descriptorBindingUpdateUnusedWhilePending",
+     [](const VkPhysicalDeviceVulkan12Features& f) { return f.descriptorBindingUpdateUnusedWhilePending; }},
+    {"shaderSampledImageArrayNonUniformIndexing",
+     [](const VkPhysicalDeviceVulkan12Features& f) { return f.shaderSampledImageArrayNonUniformIndexing; }},
+    {"shaderStorageBufferArrayNonUniformIndexing",
+     [](const VkPhysicalDeviceVulkan12Features& f) { return f.shaderStorageBufferArrayNonUniformIndexing; }},
+}};
+
+// Called only after vkb::PhysicalDeviceSelector::select() has already
+// failed, to turn its generic "no suitable device" error into a loud,
+// specific one when the actual cause is a missing descriptor-indexing
+// feature bit: vk-bootstrap's own error message never names which
+// required feature a candidate device lacked, which is not good enough
+// for a hard startup requirement [task-3-brief.md]. Enumerates every
+// physical device this instance can see and, for each, reports by name
+// any of kRequiredDescriptorIndexingFeatures it does not support. If no
+// device is missing any of these bits, says so explicitly instead of
+// staying silent -- the real cause of the selection failure is then
+// something else entirely (surface support, queue families, the 1.1/1.3
+// feature sets, API version), and misattributing it to descriptor
+// indexing would send whoever reads this log down the wrong path.
+void logDescriptorIndexingFeatureGaps(VkInstance instance) {
+    uint32_t deviceCount = 0;
+    if (vkEnumeratePhysicalDevices(instance, &deviceCount, nullptr) != VK_SUCCESS || deviceCount == 0) {
+        RX_LOG_ERROR("Device::create: no Vulkan physical devices are visible to this instance at all");
+        return;
+    }
+
+    std::vector<VkPhysicalDevice> devices(deviceCount);
+    if (vkEnumeratePhysicalDevices(instance, &deviceCount, devices.data()) != VK_SUCCESS) {
+        return;
+    }
+
+    bool anyGapReported = false;
+    for (VkPhysicalDevice physicalDevice : devices) {
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(physicalDevice, &properties);
+
+        VkPhysicalDeviceVulkan12Features features12{};
+        features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+        VkPhysicalDeviceFeatures2 features2{};
+        features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        features2.pNext = &features12;
+        vkGetPhysicalDeviceFeatures2(physicalDevice, &features2);
+
+        for (const auto& required : kRequiredDescriptorIndexingFeatures) {
+            if (!required.get(features12)) {
+                RX_LOG_ERROR(
+                    "Device::create: physical device '{}' is missing required descriptor-indexing "
+                    "feature '{}' [Phase 2 spec Fixed decision #5, R:B1/B2]",
+                    properties.deviceName, required.name);
+                anyGapReported = true;
+            }
+        }
+    }
+
+    if (!anyGapReported) {
+        RX_LOG_ERROR(
+            "Device::create: physical device selection failed, but every visible device already "
+            "supports all required descriptor-indexing features -- the actual cause is something "
+            "else (surface support, queue families, Vulkan 1.1/1.3 feature requirements, or API "
+            "version)");
+    }
 }
 
 }  // namespace
@@ -39,14 +129,45 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
     features13.dynamicRendering = VK_TRUE;
     features13.synchronization2 = VK_TRUE;
 
+    // Descriptor-indexing feature set for bindless resources (Task 3 --
+    // rx_rhi_vk/bindless.h's BindlessTable and PipelineLayoutBuilder's
+    // (Task 2) unbounded-array bindings both require these enabled at
+    // device-creation time) [Phase 2 spec Fixed decision #5, R:B1/B2].
+    // None of these bits are guaranteed just by requiring Vulkan 1.3 --
+    // every one remains an individually-optional feature -- but all ten
+    // are confirmed present on this project's stated floor hardware (Steam
+    // Deck RADV) via the Vulkan Roadmap 2022 profile, and on every desktop
+    // GPU/driver this project has been developed and tested against
+    // (verified directly: NVIDIA RTX 2080 proprietary driver, and
+    // llvmpipe/lavapipe). set_required_features_12() below makes
+    // vkb::PhysicalDeviceSelector::select() require all ten from any
+    // candidate device; logDescriptorIndexingFeatureGaps() (this file,
+    // above) turns a resulting selection failure into a loud, specific
+    // error naming exactly which bit(s) are missing, rather than
+    // vk-bootstrap's own generic "no suitable device" message.
+    VkPhysicalDeviceVulkan12Features features12{};
+    features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    features12.descriptorIndexing = VK_TRUE;
+    features12.runtimeDescriptorArray = VK_TRUE;
+    features12.descriptorBindingPartiallyBound = VK_TRUE;
+    features12.descriptorBindingVariableDescriptorCount = VK_TRUE;
+    features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+    features12.descriptorBindingStorageImageUpdateAfterBind = VK_TRUE;
+    features12.descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE;
+    features12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
+    features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+    features12.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
+
     vkb::PhysicalDeviceSelector selector(context.vkbInstance());
     auto physResult = selector.set_surface(surface)
                           .set_minimum_version(1, 3)
                           .set_required_features_11(features11)
+                          .set_required_features_12(features12)
                           .set_required_features_13(features13)
                           .select();
     if (!physResult) {
         RX_LOG_ERROR("vkb::PhysicalDeviceSelector::select failed: {}", physResult.error().message());
+        logDescriptorIndexingFeatureGaps(context.instance());
         destroySurface(context, surface);
         return std::nullopt;
     }

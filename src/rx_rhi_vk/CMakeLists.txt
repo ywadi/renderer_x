@@ -16,6 +16,7 @@ add_library(rx_rhi_vk STATIC
     src/command.cpp
     src/frame_sync.cpp
     src/pipeline_layout.cpp
+    src/bindless.cpp
     src/vma_impl.cpp
     ${volk_SOURCE_DIR}/volk.c
 )
@@ -30,23 +31,27 @@ target_include_directories(rx_rhi_vk PUBLIC include ${volk_SOURCE_DIR} ${vma_SOU
 target_link_libraries(rx_rhi_vk PUBLIC rx_core vk-bootstrap::vk-bootstrap rx_shader_layout_types)
 target_compile_definitions(rx_rhi_vk PUBLIC VK_NO_PROTOTYPES)
 
-# Six test translation units now (context_test.cpp, device_test.cpp,
+# Seven test translation units now (context_test.cpp, device_test.cpp,
 # buffer_test.cpp, clear_color_test.cpp, frame_sync_test.cpp,
-# pipeline_layout_test.cpp), so -- like rx_core_tests, and unlike this
-# target before device_test.cpp existed -- doctest's runtime/main is
-# implemented once in a dedicated tests/doctest_main.cpp shared by all six,
-# rather than in any one test file. doctest_main.cpp also links rx_platform:
-# it uses rx::platform::Window to warm up a real vk-bootstrap hazard before
-# any TEST_CASE runs (see the comment there) -- so test order here is not
-# load-bearing, deliberately; no --order-by is needed on the add_test line
-# below. clear_color_test.cpp and pipeline_layout_test.cpp in particular are
-# pure headless (no window/surface/swapchain) and rely on that warm-up to be
+# pipeline_layout_test.cpp, bindless_test.cpp), so -- like rx_core_tests,
+# and unlike this target before device_test.cpp existed -- doctest's
+# runtime/main is implemented once in a dedicated tests/doctest_main.cpp
+# shared by all seven, rather than in any one test file. doctest_main.cpp
+# also links rx_platform: it uses rx::platform::Window to warm up a real
+# vk-bootstrap hazard before any TEST_CASE runs (see the comment there) --
+# so test order here is not load-bearing, deliberately; no --order-by is
+# needed on the add_test line below. clear_color_test.cpp,
+# pipeline_layout_test.cpp, and bindless_test.cpp in particular are pure
+# headless (no window/surface/swapchain) and rely on that warm-up to be
 # safe regardless of where doctest schedules them relative to the windowed
 # tests -- see the Phase 2 plan's Global Constraints on the vk-bootstrap
-# landmine: pipeline_layout_test.cpp builds its own headless device (to
-# enable the descriptor-indexing device features Task 3 will later make
-# process-wide), and joining THIS binary rather than a new one is what keeps
-# it protected by the warm-up above instead of needing to reimplement it.
+# landmine: both pipeline_layout_test.cpp and bindless_test.cpp build their
+# own headless device (the latter to exercise BindlessTable's descriptor-
+# indexing requirements independent of whether Device::create() itself --
+# which now also enables these features process-wide, see device.cpp --
+# happens to run first in this binary), and joining THIS binary rather than
+# a new one is what keeps them protected by the warm-up above instead of
+# needing to reimplement it.
 add_executable(rx_rhi_vk_tests
     tests/doctest_main.cpp
     tests/context_test.cpp
@@ -55,6 +60,7 @@ add_executable(rx_rhi_vk_tests
     tests/clear_color_test.cpp
     tests/frame_sync_test.cpp
     tests/pipeline_layout_test.cpp
+    tests/bindless_test.cpp
 )
 target_link_libraries(rx_rhi_vk_tests PRIVATE rx_rhi_vk rx_platform doctest::doctest)
 add_test(NAME rx_rhi_vk_tests COMMAND rx_rhi_vk_tests)
