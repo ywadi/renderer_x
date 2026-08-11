@@ -979,7 +979,13 @@ int main(int argc, char** argv) {
     }
 
     if (logCallback) {
-        rx::core::log::forwardSink()->set(&sampleLogCallback, nullptr);
+        // Called from main(), never from inside sampleLogCallback() itself,
+        // so this can never hit the one documented rejection case (calling
+        // set()/rxSetLogCallback() from inside the installed callback's own
+        // invocation -- rx_core/log_forward_sink.h's own comment on set())
+        // -- always succeeds here.
+        bool installed = rx::core::log::forwardSink()->set(&sampleLogCallback, nullptr);
+        (void)installed;
     }
 
     if (presentMode) {

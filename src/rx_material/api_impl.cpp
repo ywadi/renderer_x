@@ -671,10 +671,31 @@ extern "C" RxResult rxCreateMaterialSystem(const RxMaterialSystemDesc* desc, IRx
 // rx_api.h's own comment on it), so `cb` converts to ForwardCallback with
 // no cast, no calling-convention change, and no UB: they are not merely
 // ABI-compatible, they are literally the identical function pointer type.
+//
+// [Fix round 1, task-5-review.md Medium] Wrapped in the same catch-all
+// every other RxResult-returning entry point in this file already uses
+// (docs/abi.md's unconditional "never throw across the boundary" rule) --
+// this was previously the one exception to that pattern in this file.
+// LogForwardSink::set() itself only returns `false` for exactly one
+// documented misuse (see rx_api.h's own (c)) -- mapped to RX_E_FAIL here,
+// matching this file's existing "narrow, documented rejection -> specific
+// RxResult" convention elsewhere (e.g. setTexture()'s RX_E_INVALIDARG for
+// a non-engine texture).
 extern "C" RxResult rxSetLogCallback(RxLogCallback cb, void* userData) {
-    rx::core::log::init();
-    rx::core::log::forwardSink()->set(cb, userData);
-    return RX_OK;
+    try {
+        rx::core::log::init();
+        if (!rx::core::log::forwardSink()->set(cb, userData)) {
+            RX_LOG_ERROR(
+                "rx_material: rx_api: rxSetLogCallback called from inside the currently-installed callback's own "
+                "invocation (directly or indirectly) -- rejected, no state changed (see rx_api.h's own (c): this "
+                "would otherwise self-deadlock)");
+            return RX_E_FAIL;
+        }
+        return RX_OK;
+    } catch (const std::exception& e) {
+        RX_LOG_ERROR("rx_material: rx_api: rxSetLogCallback failed: {}", e.what());
+        return RX_E_FAIL;
+    }
 }
 
 }  // namespace rx::material

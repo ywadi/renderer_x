@@ -1,9 +1,25 @@
 #include <rx_core/log_forward_sink.h>
 
+#include <cassert>
 #include <cstdio>
 #include <string>
 
 #include <spdlog/spdlog.h>
+// spdlog is built here as a precompiled library (SPDLOG_COMPILED_LIB) --
+// base_sink.h's own template method bodies (base_sink-inl.h) are then
+// normally pulled in only by spdlog's OWN build, which explicitly
+// instantiates base_sink<std::mutex>/base_sink<null_mutex> (the only two
+// Mutex types spdlog's own built-in sinks ever use) into libspdlog.a.
+// LogForwardSink instantiates base_sink<std::recursive_mutex> instead
+// (see log_forward_sink.h's own comment on why) -- a third instantiation
+// spdlog's precompiled library was never built with, so this include
+// (legal and idempotent regardless of SPDLOG_HEADER_ONLY -- base_sink-
+// inl.h re-includes base_sink.h itself, guarded by that header's own
+// `#pragma once`) makes the template bodies visible in THIS translation
+// unit, letting the compiler instantiate that one specific
+// specialization locally instead of expecting it to already exist in
+// the prebuilt .a.
+#include <spdlog/sinks/base_sink-inl.h>
 
 namespace rx::core::log {
 
@@ -40,13 +56,68 @@ int32_t mapLevel(spdlog::level::level_enum level) {
     }
 }
 
+// [Fix round 1, task-5-review.md Critical + item (c)] Set to true for the
+// ENTIRE duration of this thread's own callback invocation inside
+// sink_it_() below (RAII-reset via ForwardGuard, so it clears even if the
+// callback throws) -- read by:
+//   - sink_it_() itself, at entry: a true value here means this exact
+//     call is a RE-ENTRANT one (the callback currently running on this
+//     thread just logged something, which is what drove spdlog back into
+//     this same sink's log()/sink_it_() on the same thread -- see
+//     base_sink<std::recursive_mutex> in the header for why that
+//     recursive call can even reach here instead of deadlocking one
+//     level up). Detected, it returns immediately WITHOUT touching
+//     callbackMutex_ or invoking anything again -- the re-entrant record
+//     is silently dropped for forwarding purposes only; the same
+//     logger's OTHER sinks (the real console sink included) are
+//     completely unaffected by this early return, since spdlog's
+//     logger::log_it_() calls every sink independently and this only
+//     short-circuits OUR sink's own turn.
+//   - set(), at entry: a true value here means set()/rxSetLogCallback()
+//     is being called FROM INSIDE the currently-running callback itself
+//     (directly, or indirectly through something that callback called)
+//     -- the one misuse rxSetLogCallback()'s own doc comment forbids,
+//     because that thread already holds callbackMutex_ for this
+//     invocation's whole duration (see sink_it_()) and callbackMutex_ is
+//     deliberately NOT recursive (unlike spdlog's own mutex_ above) --
+//     see set()'s own doc comment for why a plain mutex is exactly what
+//     makes its cross-thread blocking guarantee correct, and why this
+//     thread_local check is what keeps the SAME-thread reentrant case
+//     from self-deadlocking on it instead.
+thread_local bool t_insideForward = false;
+
+struct ForwardGuard {
+    ForwardGuard() { t_insideForward = true; }
+    ~ForwardGuard() { t_insideForward = false; }
+};
+
 }  // namespace
 
-void LogForwardSink::set(ForwardCallback callback, void* userData) {
+bool LogForwardSink::set(ForwardCallback callback, void* userData) {
+    // [Fix round 1, task-5-review.md item (c)] Debug-build assertion --
+    // compiled out under this project's own -DNDEBUG (both configured
+    // presets build RelWithDebInfo, which CMake's own defaults define
+    // NDEBUG for; verified directly against this tree's own
+    // build.ninja). Present as documentation-and-defense-in-depth for a
+    // genuine Debug build elsewhere, NOT as this project's real safety
+    // net -- the `return false` below is what actually, always (NDEBUG
+    // or not) prevents the self-deadlock this project's own builds would
+    // otherwise be exposed to.
+    assert(!t_insideForward &&
+           "rxSetLogCallback()/LogForwardSink::set() must never be called from inside the currently-installed "
+           "callback's own invocation -- that thread already holds callbackMutex_ for the duration of the "
+           "callback, and this mutex is deliberately non-recursive, so calling back in would self-deadlock. "
+           "Returning false instead (RX_E_FAIL at the rxSetLogCallback() ABI layer).");
+    if (t_insideForward) {
+        return false;  // rejected -- see the assert's own message above; no state touched, no lock attempted.
+    }
+
     std::lock_guard<std::mutex> lock(callbackMutex_);
     callback_ = callback;
     userData_ = callback != nullptr ? userData : nullptr;
     disabledByException_ = false;
+    installed_.store(callback != nullptr);
+    return true;
 }
 
 bool LogForwardSink::disabledByException() const {
@@ -54,32 +125,51 @@ bool LogForwardSink::disabledByException() const {
     return disabledByException_;
 }
 
-void LogForwardSink::disableIfStillInstalled(ForwardCallback callback, void* userData) {
-    std::lock_guard<std::mutex> lock(callbackMutex_);
-    if (callback_ == callback && userData_ == userData) {
-        callback_ = nullptr;
-        userData_ = nullptr;
-        disabledByException_ = true;
-    }
-}
-
 void LogForwardSink::sink_it_(const spdlog::details::log_msg& msg) {
-    // Snapshot under the lock, then release it BEFORE invoking the
-    // callback: invoking an arbitrary caller-supplied function pointer
-    // while holding callbackMutex_ would deadlock if that callback logs
-    // anything itself (a re-entrant call back into this exact sink, on
-    // the same thread, trying to lock the same non-recursive mutex again)
-    // or calls back into set()/rxSetLogCallback() to change/uninstall the
-    // callback. Copying the pair out and unlocking first avoids both.
-    ForwardCallback callback;
-    void* userData;
-    {
-        std::lock_guard<std::mutex> lock(callbackMutex_);
-        if (callback_ == nullptr) {
-            return;  // near-zero cost path: nothing installed, nothing more to do.
-        }
-        callback = callback_;
-        userData = userData_;
+    // [Fix round 1, task-5-review.md item (a)/(b)] Re-entrancy guard,
+    // checked FIRST, before anything else (including the fast-path
+    // installed_ load below): if this thread is already inside a
+    // forwarded callback invocation (see t_insideForward's own comment),
+    // this call is the callback logging something itself -- drop it for
+    // forwarding purposes only and return immediately. This is what lets
+    // base_sink<std::recursive_mutex>'s own mutex_ be re-acquired by the
+    // SAME thread one level up (in log(), which wraps this whole call)
+    // without ever reaching a second, nested invocation of the callback
+    // here.
+    if (t_insideForward) {
+        return;
+    }
+
+    // [Fix round 1, task-5-review.md Low #3] Fast path: near-zero cost
+    // when nothing is installed -- one atomic load, no mutex acquired on
+    // THIS sink's own side at all (see installed_'s own comment on why
+    // this is safe as a hint rather than the authoritative check).
+    if (!installed_.load()) {
+        return;
+    }
+
+    // [Fix round 1, task-5-review.md Critical] callbackMutex_ is held for
+    // the callback invocation's ENTIRE duration below, not just while
+    // copying `callback_`/`userData_` out (an earlier revision released
+    // the lock first specifically to avoid a self-deadlock on a
+    // self-logging callback -- but that revision's own reasoning was
+    // incomplete: base_sink<Mutex>::log() (spdlog, final, cannot be
+    // overridden) ALREADY wraps this entire sink_it_() call in its own
+    // mutex_ lock regardless of anything callbackMutex_ does, so a
+    // self-logging callback was always going to hit THAT lock again on
+    // the same thread first -- switching mutex_ to a recursive_mutex
+    // (the header's base_sink<std::recursive_mutex>) plus the
+    // t_insideForward guard above is what actually closes that hazard,
+    // which means callbackMutex_ no longer needs to release early for
+    // that reason at all. Holding it here instead is what makes set()'s
+    // own blocking-until-drained guarantee true: set() cannot acquire
+    // this same mutex, and therefore cannot return to ITS caller
+    // (rxSetLogCallback(), hence a consuming engine that may free
+    // userData immediately afterward), until this invocation below has
+    // completely finished.
+    std::lock_guard<std::mutex> lock(callbackMutex_);
+    if (callback_ == nullptr) {
+        return;  // race window between the fast-path load above and this lock; safe, authoritative re-check.
     }
 
     // spdlog::string_view_t views (msg.payload/msg.logger_name) are not
@@ -92,19 +182,31 @@ void LogForwardSink::sink_it_(const spdlog::details::log_msg& msg) {
     std::string message(msg.payload.data(), msg.payload.size());
     int32_t severity = mapLevel(msg.level);
 
+    ForwardGuard guard;  // t_insideForward = true for the invocation below; resets on return OR exception.
     try {
-        callback(severity, category.c_str(), message.c_str(), userData);
+        callback_(severity, category.c_str(), message.c_str(), userData_);
     } catch (const std::exception& e) {
         std::fprintf(stderr,
                       "rx_core: log-forward callback threw std::exception(\"%s\") -- disabling it permanently "
                       "(this log record's own delivery is otherwise silently dropped, never re-thrown)\n",
                       e.what());
-        disableIfStillInstalled(callback, userData);
+        // Still holding callbackMutex_ continuously since the check above
+        // -- no other thread's set() could have raced in and replaced
+        // callback_/userData_ in the meantime, so this is unconditionally
+        // correct (no compare-before-clear needed, unlike an earlier
+        // revision that released the lock before invoking).
+        callback_ = nullptr;
+        userData_ = nullptr;
+        disabledByException_ = true;
+        installed_.store(false);
     } catch (...) {
         std::fprintf(stderr,
                       "rx_core: log-forward callback threw a non-std::exception value -- disabling it "
                       "permanently\n");
-        disableIfStillInstalled(callback, userData);
+        callback_ = nullptr;
+        userData_ = nullptr;
+        disabledByException_ = true;
+        installed_.store(false);
     }
 }
 

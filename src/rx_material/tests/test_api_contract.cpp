@@ -293,3 +293,40 @@ TEST_CASE("rxSetLogCallback installs a process-wide callback that observes a rea
 
     system->release();
 }
+
+// [Fix round 1, task-5-review.md item (c)] The one documented misuse:
+// calling rxSetLogCallback() from inside the currently-installed
+// callback's own invocation. Must be rejected with RX_E_FAIL, never
+// deadlock -- this test's own completion is part of that proof, mirroring
+// rx_core's own mechanism-level test (log_test.cpp) at the ABI layer.
+TEST_CASE("rxSetLogCallback rejects (RX_E_FAIL, does not deadlock) a call made from inside the currently-installed "
+          "callback's own invocation") {
+    struct Captured {
+        std::mutex mutex;
+        int callCount = 0;
+        RxResult selfCallResult = RX_OK;
+    } captured;
+
+    RxLogCallback selfCallingCallback = [](RxLogSeverity, const char*, const char*, void* userData) {
+        auto* c = static_cast<Captured*>(userData);
+        RxResult result = rxSetLogCallback(nullptr, nullptr);  // called from inside itself -- the forbidden case.
+        std::lock_guard<std::mutex> lock(c->mutex);
+        c->callCount++;
+        c->selfCallResult = result;
+    };
+
+    CHECK(rxSetLogCallback(selfCallingCallback, &captured) == RX_OK);
+    LogCallbackGuard guard;
+
+    IRxMaterialSystem* system = makeDeviceFreeSystem();
+    IRxMaterial* material = nullptr;
+    CHECK(system->loadMaterial("does/not/matter.slang", &material) == RX_E_FAIL);  // triggers the callback above.
+
+    {
+        std::lock_guard<std::mutex> lock(captured.mutex);
+        CHECK(captured.callCount == 1);
+        CHECK(captured.selfCallResult == RX_E_FAIL);
+    }
+
+    system->release();
+}

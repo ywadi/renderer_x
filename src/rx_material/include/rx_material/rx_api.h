@@ -311,7 +311,13 @@ static_assert(RX_LOG_TRACE == 0 && RX_LOG_DEBUG == 1 && RX_LOG_INFO == 2 && RX_L
 // callback returns -- a callback that needs the text afterward must copy
 // it before returning. `userData` is exactly whatever pointer was passed
 // to the rxSetLogCallback() call that installed this callback, handed
-// back unexamined -- this boundary never dereferences it itself.
+// back unexamined -- this boundary never dereferences it itself. See
+// rxSetLogCallback()'s own (a)/(b)/(c) below for the full lifetime/
+// re-entrancy contract this callback must follow -- in short: `userData`
+// stays valid until rxSetLogCallback() replaces/clears it AND returns
+// (not merely until it is called); this callback must be quick, must not
+// assume re-entrant delivery of anything it logs itself, and must never
+// call rxSetLogCallback() from within its own invocation.
 typedef void (*RxLogCallback)(RxLogSeverity severity, const char* category, const char* message, void* userData);
 
 // Installs `cb` as the process-wide log-forwarding target (`userData`
@@ -320,13 +326,47 @@ typedef void (*RxLogCallback)(RxLogSeverity severity, const char* category, cons
 // active and restores console-only output: the renderer's own console
 // sink is never touched or removed by this call either way, so
 // installing/uninstalling a callback only adds/removes FORWARDING, never
-// silences the console. Always returns RX_OK for every valid transition
-// (install a non-null `cb`, replace an already-installed one, or
-// uninstall via nullptr) -- there is no invalid input to reject here:
-// `userData` is opaque and never dereferenced by this boundary, so even a
-// null/garbage `userData` alongside a non-null `cb` is legal (whatever
-// `cb` itself does with it is entirely `cb`'s own contract, not this
-// call's to validate).
+// silences the console. Returns RX_OK for every valid transition (install
+// a non-null `cb`, replace an already-installed one, or uninstall via
+// nullptr) -- `userData` is opaque and never dereferenced by this
+// boundary, so even a null/garbage `userData` alongside a non-null `cb`
+// is legal. RX_E_FAIL is returned for exactly one documented misuse: see
+// point (c) below.
+//
+// [Fix round 1, task-5-review.md Critical] Lifetime contract -- read
+// this before relying on `userData`'s lifetime:
+//   (a) This call does not RETURN until any invocation of the PREVIOUS
+//       `cb`/`userData` pair that was already in flight on ANOTHER
+//       thread has fully completed. Once this call returns, `userData`
+//       (the one just replaced or cleared -- NOT the one just installed,
+//       if any) is safe to free immediately: no further invocation of it
+//       is running or will ever start. This is an actual blocking
+//       guarantee (rx_core::log::LogForwardSink::set() takes the same
+//       lock the in-flight invocation holds for its own entire
+//       duration), not merely a documentation promise -- see that
+//       class's own comment for the mechanism and the reproduced
+//       use-after-free this closes.
+//   (b) `cb` must be QUICK and must not assume delivery is re-entrant:
+//       if `cb` itself logs anything (through RX_LOG_*/spdlog on the
+//       SAME thread while still running), that inner record is silently
+//       DROPPED for forwarding purposes only -- it never reaches `cb`
+//       a second time nested inside itself. The renderer's own console
+//       (and any other sink on the same logger) still receives and
+//       prints that inner record normally; only forwarding to `cb` is
+//       skipped for it. This is deliberate (see RxLogCallback's own
+//       comment on why), not a bug to work around.
+//   (c) `cb` must NEVER call rxSetLogCallback() (on itself, a different
+//       callback, or nullptr) from within its own invocation, directly
+//       or indirectly -- the thread running `cb` already holds the lock
+//       (a) describes for the whole invocation, and that lock is
+//       deliberately non-recursive, so calling back in would
+//       self-deadlock. This is caught (not silently hung): a debug-build
+//       `assert()` fires (compiled out under this project's own
+//       -DNDEBUG, both presets -- documentation/defense-in-depth for a
+//       Debug build elsewhere, not this project's own real safety net),
+//       and -- always active regardless of NDEBUG -- this call instead
+//       returns RX_E_FAIL immediately, touching no state at all, rather
+//       than attempting the lock.
 //
 // Exception discipline: `cb` is invoked inside a catch-all (matching this
 // whole header's "no exception crosses a boundary this engine controls"
@@ -337,7 +377,12 @@ typedef void (*RxLogCallback)(RxLogSeverity severity, const char* category, cons
 // stderr (deliberately never re-entering spdlog/this same logger from
 // inside its own sink callback -- not safe to attempt), and `cb` is
 // PERMANENTLY disabled (no further delivery to it) until a fresh
-// rxSetLogCallback() call installs something new.
+// rxSetLogCallback() call installs something new. rxSetLogCallback()'s
+// OWN body is likewise wrapped in a catch-all, matching every other
+// RxResult-returning entry point in this codebase (docs/abi.md's
+// unconditional "never throw across the boundary" rule) -- returns
+// RX_E_FAIL on an internal failure (e.g. allocation failure registering
+// the forwarding sink for the first time).
 //
 // Thread-affinity (D5/D23, Phase 4): `cb` may be invoked from ANY thread
 // that logs -- including rx_task worker threads -- not only whichever

@@ -1,5 +1,142 @@
 # Task 5 report: Public log sink (D23, seed 13)
 
+## Fix round 1 (post-review)
+
+Review (`task-5-review.md`, commit `7da8ee4`): **Approved with findings** —
+spec ❌, 1 Critical + 1 Medium + 2 Low. This section documents the fix; the
+rest of this report is the original round-1 account, left intact below for
+the record — where the two disagree, this section is authoritative.
+
+**Critical — uninstall/in-flight-callback lifetime race (reproduced UAF).**
+The review built a standalone probe against the unmodified sink and
+reproduced a real use-after-free (5/5 runs): `sink_it_()` copied
+`{callback_, userData_}` out and released `callbackMutex_` *before*
+invoking the callback (a deliberate choice at the time, to avoid a
+self-logging callback deadlocking on that same mutex) — so `set(nullptr,
+...)` (hence `rxSetLogCallback(nullptr, ...)`) could return while the
+*previous* callback was still running on another thread with the *old*
+`userData`, which a caller following the (at-the-time undocumented) "install
+→ uninstall → free" sequence would then free out from under it.
+
+**Fix (the coordinator's required design):** `sink_it_()` now holds
+`callbackMutex_` for the callback invocation's ENTIRE duration, not just
+while copying the pair out. `set()` takes the same mutex, so it cannot
+return until any invocation already in flight has fully finished —
+`rxSetLogCallback(nullptr, ...)` now genuinely blocks until drained, and
+`userData` is safe to free the instant it returns. This reintroduces the
+self-logging-callback deadlock the old design avoided differently: closed
+with `base_sink<std::recursive_mutex>` (see the toolchain note below) plus a
+`thread_local` re-entrancy flag (`t_insideForward`) that `sink_it_()` checks
+first and returns immediately on, dropping the re-entrant forward only —
+every *other* sink on the same logger (the real console sink included)
+still receives it normally, since spdlog's `logger::log_it_()` calls each
+sink independently. The same flag lets `set()` detect and reject (`false`,
+no state touched, no lock attempted) a call made from *inside* the
+currently-installed callback's own invocation — the one case that would
+still self-deadlock (that thread already holds `callbackMutex_` for the
+whole invocation, which is deliberately non-recursive) — backed by a
+debug-build `assert()` too, though see the honesty note below on why that
+assert is not this project's real safety net. `rxSetLogCallback()` maps a
+`false` return to `RX_E_FAIL`.
+
+**Toolchain finding worth recording:** `base_sink<std::recursive_mutex>`
+does not link against this project's precompiled spdlog (`SPDLOG_COMPILED_LIB`
+— only `base_sink<std::mutex>`/`base_sink<null_mutex>` are explicitly
+instantiated into `libspdlog.a`, matching spdlog's own built-in sinks).
+Fixed by directly `#include <spdlog/sinks/base_sink-inl.h>` in
+`log_forward_sink.cpp` — legal regardless of `SPDLOG_HEADER_ONLY` (that
+header re-includes `base_sink.h`, idempotently, under `#pragma once`) — so
+the compiler instantiates that one specialization locally instead of
+expecting it already compiled into the prebuilt library. No spdlog rebuild,
+no dep-cache change.
+
+**Medium — missing catch-all.** `rxSetLogCallback()`'s body is now wrapped
+in the same `try`/`catch (const std::exception&) { RX_LOG_ERROR(...); return
+RX_E_FAIL; }` pattern every other `RxResult`-returning entry point in
+`api_impl.cpp` already used — it was the sole exception before this round.
+
+**Low #3 — steady-state cost.** Added `std::atomic<bool> installed_` as a
+fast-path hint: `sink_it_()` checks the `thread_local` re-entrancy flag,
+then this atomic, and returns before ever touching `callbackMutex_` when
+nothing is installed — restoring a genuinely near-zero-cost uninstalled
+path (no mutex acquired on this sink's own side at all). Doc comments
+(`log_forward_sink.h`, and this report) now state the true cost precisely
+instead of the prior "one mutex lock" undercount: spdlog's own
+`base_sink<Mutex>::log()` unconditionally takes *its own* lock around every
+sink on every record regardless of install state (unavoidable, paid by the
+console sink too); this class adds a *second* lock only on the installed
+path, never on the uninstalled one.
+
+**Low #4/informational — `std::thread` vs `rx_task`.** Acknowledged, not
+changed: the worker-thread delivery test (`log_test.cpp`) still uses a raw
+`std::thread`, not `rx::task::Scheduler`. This satisfies the binding
+resolution given to the review (generic "worker-thread delivery," verified
+via a genuine cross-thread `threadId` assertion) but deviates from the
+original brief's more specific "via rx_task" wording — a faithfulness nit
+for a future task that touches this file, not addressed in this round.
+
+**Honesty note on the debug assert:** this project's own `CMakePresets.json`
+builds both presets `RelWithDebInfo`, and CMake's own defaults define
+`NDEBUG` for that build type — confirmed directly against this tree's
+`build.ninja` (`-DNDEBUG` is present on every compile line, both presets).
+A plain `assert()` therefore compiles out in every build this project
+actually configures. The `assert()` added at `set()`'s reentrancy check is
+present as documentation-and-defense-in-depth for a genuine Debug build
+elsewhere — it is NOT what makes this project's own builds safe. What
+actually prevents the self-deadlock here, unconditionally, is the
+`thread_local` check returning `false` before ever attempting the lock; the
+`assert()` is a secondary, mostly-symbolic layer on top of that, called out
+explicitly here rather than presented as real protection it isn't.
+
+### Tests added this round (all device-free, `rx_core`/`rx_material` existing
+test files extended, no new `tests/CMakeLists.txt` entries)
+
+- **Reviewer's UAF-reproduction probe** (`log_test.cpp`) — install →
+  concurrent storm from 4 threads driving the sink directly (`sink->log()`,
+  not through the shared console-carrying default logger, to keep the storm
+  quiet and precise) → uninstall → immediately free `userData` and allocate
+  a same-size replacement while the storm keeps running a little longer with
+  nothing installed → join → assert the replacement was never touched. Run
+  20 times in one `TEST_CASE`. ASan/UBSan were re-considered per the
+  review's own note and are not usable in this project's zig cc/zig c++
+  toolchain (same conclusion the review already reached independently) — this
+  uses the same poison/observe pattern the review's own probe used instead.
+  Verified stable across 4 separate full-suite runs on this machine (no
+  crash, no hang, no corrupted replacement) on top of the 20 internal
+  repetitions each run already performs.
+- **Re-entrant-callback test** (`log_test.cpp`) — a callback that logs from
+  inside itself, run through a temporary logger with two real sinks (a
+  capturing stand-in for "console" + the real forward sink), asserting: (1)
+  the callback itself is invoked exactly once (the inner, re-entrant record
+  is dropped for forwarding), (2) both the outer and inner message text
+  reach the other sink, (3) the test completes at all (no deadlock).
+- **Inside-callback-uninstall rejection test** — implemented device-free at
+  both layers: `log_test.cpp` (`LogForwardSink::set()` directly, asserting
+  `false`) and `test_api_contract.cpp` (`rxSetLogCallback()` through the
+  real ABI entry point, asserting `RX_E_FAIL`), both triggered by a real
+  callback invocation, both proving no deadlock by completing, both
+  confirming state is unchanged (still installed, still delivering) after
+  the rejection.
+
+### Verification (fix round 1)
+
+Both presets rebuilt clean end-to-end (`cmake --build`, full targets, zero
+new warnings beyond the pre-existing unrelated `_WIN32_WINNT` one).
+`rx_core_tests`: **16/16 cases, 102/102 assertions** (up from 13/27).
+`rx_material_tests`: **13/13 cases, 71/71 assertions** (up from 12/65 — one
+net new test; some assertion-count arithmetic shifted with the new case).
+`rx_material_gpu_tests` unaffected: **25/25 cases, 344/344 assertions, zero
+Vulkan validation errors** — re-ran to confirm no regression from the sink
+rework. Full `linux-native` `ctest`: **16/16 suites**. Re-ran both new
+binaries under Wine against the real `windows-cross-zig` build output
+(`rx_core_tests.exe`/`rx_material_tests.exe`) — identical pass counts on
+both platforms. `sample_01_triangle --validate --log-callback` re-verified:
+same behavior as round 1, exit 0, every console line still mirrored through
+`[log-callback]`. The UAF probe TEST_CASE itself was additionally run 3 more
+times standalone (4 total) with no failure, hang, or crash on any run.
+
+---
+
 ## Summary
 
 Added `rxSetLogCallback()` — a process-wide, ABI-stable entry point that
@@ -187,6 +324,15 @@ throwing callback itself is never invoked again).
   logging — a caller-side contract issue (same class of footgun as most
   logging libraries' own re-entrancy caveats), not something this task
   engineered a guard against.
+  **[Superseded, fix round 1]** This bullet described round 1's actual
+  shipped behavior at review time and is kept for the record, but it is no
+  longer accurate: the fix round rebuilt the locking model (`callbackMutex_`
+  now held across the invocation, closing a separate, more serious Critical
+  UAF this bullet did not anticipate) and, as part of closing the
+  self-deadlock that new model would otherwise reintroduce, added an actual
+  guard — re-entrant forwards are now dropped after exactly one nested
+  attempt (never recursing further), not merely avoiding a deadlock while
+  still recursing. See "Fix round 1" at the top of this report.
 - Sample 01's `--log-callback` proves the underlying `rx_core` mechanism,
   not `rxSetLogCallback()` itself end-to-end in a *running* sample (the
   ABI wrapper is exercised authentically in `rx_material_tests` instead —
