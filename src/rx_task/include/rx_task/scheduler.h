@@ -47,6 +47,16 @@ class Scheduler {
   // reported-2-hardware-thread machine). workerCount() below returns the
   // resolved value.
   //
+  // WORKER COUNT IS THE CONSUMER'S BUDGET, NOT A MACHINE-WIDE DEFAULT
+  // (see docs/threading.md's "Host-engine coexistence" section): the
+  // `hardware_concurrency() - 1` default above is for a STANDALONE
+  // consumer that owns the whole machine (this phase's own samples and
+  // tests). An embedding host engine is expected to pass the worker
+  // budget IT has decided to grant the renderer instead -- every
+  // parallelFor() call self-scales to whatever workerCount() this
+  // Scheduler actually ends up with via autoGrainSize(), so a smaller
+  // granted budget costs the caller nothing beyond this one number.
+  //
   // Returns nullptr if the underlying scheduler failed to start (out-of-
   // memory or a platform thread-creation failure only -- there is no
   // recoverable configuration-error path here).
@@ -79,11 +89,24 @@ class Scheduler {
   Scheduler& operator=(Scheduler&&) = delete;
 
   // Blocking fan-out over the half-open range [0, itemCount): splits it
-  // into contiguous chunks of at least `grainSize` items (enkiTS's own
-  // "min range" / grain-size concept -- the last chunk may be smaller than
-  // `grainSize` if itemCount is not a multiple of it) and calls `fn` once
-  // per chunk with that chunk's [begin, end) and the index of whichever
-  // worker executed it. Returns only once every chunk has run.
+  // into contiguous chunks of at least the EFFECTIVE grain size (enkiTS's
+  // own "min range" concept -- the last chunk may be smaller than that if
+  // itemCount is not a multiple of it) and calls `fn` once per chunk with
+  // that chunk's [begin, end) and the index of whichever worker executed
+  // it. Returns only once every chunk has run.
+  //
+  // GRAIN SIZE [spec D4 amendment, "Parallelism is the engine default,
+  // not a mode": "there is no on/off switch and no caller-chosen chunk
+  // count... self-scaling, never toggled" -- see docs/threading.md's own
+  // section on this]: `grainSize == 0` means AUTO -- the effective grain
+  // is `autoGrainSize(itemCount, workerCount())` (below), which is also
+  // exactly what the `parallelFor(itemCount, fn)` overload below uses; a
+  // caller never HAS to choose a grain to get parallel execution. A
+  // nonzero `grainSize` is used verbatim as the effective grain -- kept as
+  // a measurement affordance for the rare caller doing controlled tuning
+  // (the stress benchmark's `--threads`-adjacent instrumentation is the
+  // motivating case), not a general-purpose "mode" callers are expected
+  // to reach for.
   //
   // THE CALLING THREAD PARTICIPATES: this is enkiTS's documented default
   // behavior (TaskScheduler::WaitforTask() runs pending chunks itself
@@ -107,6 +130,41 @@ class Scheduler {
   // from an unrelated thread that never registered with this Scheduler.
   void parallelFor(uint32_t itemCount, uint32_t grainSize,
                     std::function<void(uint32_t begin, uint32_t end, uint32_t workerIndex)> fn);
+
+  // The engine-default path [spec D4 amendment]: always auto-grain.
+  // Equivalent to `parallelFor(itemCount, 0, fn)` -- exists so ordinary
+  // callers never need to know grainSize/autoGrainSize() exist at all to
+  // get parallel execution; see the three-argument overload's own doc
+  // comment for the full grain-size contract this delegates into.
+  void parallelFor(uint32_t itemCount, std::function<void(uint32_t begin, uint32_t end, uint32_t workerIndex)> fn);
+
+  // Auto-grain floor: parallelFor()'s AUTO heuristic (grainSize == 0,
+  // including the two-argument overload above) never picks an effective
+  // grain smaller than this, regardless of itemCount/workerCount() --
+  // floors the per-item scheduling overhead for trivial callback bodies.
+  // See autoGrainSize()'s own doc comment for the full formula this
+  // participates in.
+  static constexpr uint32_t kMinGrain = 64;
+
+  // The exact formula parallelFor() uses internally for its AUTO grain
+  // [spec D4 amendment]: `max(kMinGrain, itemCount / (workerCount * 4))`.
+  // Four chunks per worker is the balance point this formula encodes
+  // between stealing granularity (more, smaller chunks let enkiTS's
+  // work-stealing rebalance more finely across workers finishing at
+  // different times) and per-task scheduling overhead (fewer, larger
+  // chunks mean less enkiTS bookkeeping per item processed); kMinGrain
+  // then floors the result so a trivial callback body on a small
+  // itemCount never gets sliced finer than the point where per-chunk
+  // overhead would dominate the actual work.
+  //
+  // A pure, static function -- deliberately callable without a live
+  // Scheduler instance (directly unit-testable against known
+  // itemCount/workerCount pairs), and exactly what a real parallelFor()
+  // call computes internally when grainSize == 0, passing this
+  // Scheduler's own workerCount(). `workerCount == 0` is treated the same
+  // as `workerCount == 1` (defensive: no real Scheduler's workerCount()
+  // is ever 0, but this function accepts arbitrary input).
+  [[nodiscard]] static uint32_t autoGrainSize(uint32_t itemCount, uint32_t workerCount);
 
   // Enqueues `fn` to run, later, on this Scheduler's single dedicated IO
   // thread -- never on a parallelFor() worker, and never on the calling

@@ -270,11 +270,36 @@ Scheduler::~Scheduler() {
   }
 }
 
+uint32_t Scheduler::autoGrainSize(uint32_t itemCount, uint32_t workerCount) {
+  // Fix-round 2 [spec D4 amendment: "no caller-chosen chunk count...
+  // self-scaling, never toggled"]. workerCount == 0 guarded to behave
+  // like 1 -- see this function's own header doc comment; no real
+  // Scheduler::workerCount() is ever 0 (create()'s resolveWorkerCount()
+  // clamps to a minimum of 1), but this is a pure static function anyone
+  // can call directly with arbitrary input.
+  const uint32_t denom = (workerCount > 0 ? workerCount : 1) * 4;
+  const uint32_t computed = itemCount / denom;
+  return computed > kMinGrain ? computed : kMinGrain;
+}
+
 void Scheduler::parallelFor(uint32_t itemCount, uint32_t grainSize,
                              std::function<void(uint32_t begin, uint32_t end, uint32_t workerIndex)> fn) {
   if (itemCount == 0) {
     return;
   }
+  // Profiling: an RX_ZONE/RX_PLOT instrumentation point belongs right
+  // here (per-call chunk-count/grain-size plot, zone around the blocking
+  // fan-out below) -- deliberately not added yet: rx_core/profile.h does
+  // not exist on main as of this task (a concurrent profiling task owns
+  // creating it, and was told to stay out of rx_task); lands as that
+  // task's own follow-up once the header exists.
+  //
+  // grainSize == 0 means AUTO [spec D4 amendment] -- see this method's
+  // header doc comment and autoGrainSize()'s own comment for the formula.
+  // A nonzero grainSize is used verbatim (the measurement-affordance
+  // path), exactly as before this fix round.
+  const uint32_t effectiveGrain = grainSize > 0 ? grainSize : autoGrainSize(itemCount, impl_->resolvedWorkerCount);
+
   enki::TaskSet taskSet(itemCount, [&fn](enki::TaskSetPartition range, uint32_t threadNum) {
     fn(range.start, range.end, threadNum);
   });
@@ -282,7 +307,7 @@ void Scheduler::parallelFor(uint32_t itemCount, uint32_t grainSize,
   // actual runtime split size (m_RangeToRun) from m_MinRange at that call
   // (TaskScheduler::AddTaskSetToPipeInt), not at TaskSet construction, but
   // only ever reads m_MinRange as of that moment.
-  taskSet.m_MinRange = grainSize > 0 ? grainSize : 1;
+  taskSet.m_MinRange = effectiveGrain;
 
   impl_->taskScheduler.AddTaskSetToPipe(&taskSet);
   // The calling thread participates here: WaitforTask() is enkiTS's own
@@ -292,6 +317,11 @@ void Scheduler::parallelFor(uint32_t itemCount, uint32_t grainSize,
   // deadlock: the inner call's own WaitforTask() drains whatever chunks
   // (inner or outer) are available, on whichever thread reaches it.
   impl_->taskScheduler.WaitforTask(&taskSet);
+}
+
+void Scheduler::parallelFor(uint32_t itemCount,
+                             std::function<void(uint32_t begin, uint32_t end, uint32_t workerIndex)> fn) {
+  parallelFor(itemCount, 0, std::move(fn));
 }
 
 void Scheduler::runOnIoThread(std::function<void()> fn) {

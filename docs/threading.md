@@ -70,6 +70,93 @@ chunk) or the dedicated IO thread (`runOnIoThread()`):
   pool; only the primary command buffer (main-thread-only, above) calls
   `vkCmdExecuteCommands()` to stitch them into the frame.
 
+## Parallelism is the default, not a mode
+
+[Spec D4, amended] There is no on/off switch and no caller-chosen chunk
+count anywhere engine-owned work runs. A pass provides either a
+whole-pass callback (hand-written simple passes — the library model
+means the engine cannot split code it does not own) or a chunked
+callback; every chunked pass records in parallel unconditionally, with
+the executor deriving chunk count from `rx::task::Scheduler` and
+grain-based scaling making small workloads effectively serial at the cost
+of one task submission — self-scaling, never toggled. All engine-owned
+work (culling, draw-list building, import internals, and Stage 2's
+scene-submit helper, which is the chunked callback for any scene-driven
+pass) is parallel by default with no flags.
+
+`rx::task::Scheduler::parallelFor()` is where this lands mechanically:
+its `grainSize` parameter defaults to AUTO (`0`, or simply omitted via the
+`parallelFor(itemCount, fn)` overload) — `Scheduler::autoGrainSize()`
+computes `max(kMinGrain, itemCount / (workerCount() * 4))`, so a caller
+never has to reason about chunk counts to get parallel execution, and a
+tiny `itemCount` naturally collapses toward one or a few chunks rather
+than needing a separate "don't bother, it's small" code path. A nonzero
+`grainSize` still works (used verbatim) — kept as a measurement
+affordance for controlled tuning, not a mode callers reach for. `--threads`
+exists only in the stress benchmark (sample 07) as a measurement
+instrument, not as an engine-wide parallelism switch: it configures how
+many workers the benchmark's own `Scheduler` is constructed with, so the
+benchmark can publish parallel-vs-single numbers — it does not gate
+whether any engine-owned work runs in parallel, which is unconditional
+regardless.
+
+## Host-engine coexistence
+
+[Master registry, `docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md`,
+"Scheduler sharing with host engines" (committed 2026-08-11, SDK phase):
+an embedding game engine must eventually be able to make the renderer's
+task scheduler and its own job system ONE pool, never two politely-idle
+ones that quietly starve each other for cache and scheduler time.
+`rx::task::Scheduler` is built with that end state in mind, in three
+parts:
+
+1. **Idle behavior is bursty, not always-on.** Verified directly against
+   the pinned enkiTS v1.12 source (not assumed): each internal worker's
+   own dispatch loop (`TaskScheduler::TaskingThreadFunction`,
+   `TaskScheduler.cpp:281-317`) spins with an increasing backoff for at
+   most `gc_SpinCount = 10` attempts (`TaskScheduler.cpp:75`) after
+   finding no work, then calls `WaitForNewTasks()`
+   (`TaskScheduler.cpp:686-715`) — which double-checks for a
+   just-arrived task first (avoiding a lost-wakeup race) and, if
+   genuinely idle, blocks on a real OS semaphore
+   (`SemaphoreWait()`: `WaitForSingleObject(..., INFINITE)` on Windows,
+   `sem_wait()` on POSIX/Linux — `TaskScheduler.cpp:1336-1341` /
+   `1421-1424`) until signaled. That is a genuine kernel-level blocking
+   wait, not a spin loop burning CPU: an idle worker's steady-state cost
+   is near-zero. The dedicated IO thread's own idle wait
+   (`IoLoopTask::Execute()`'s `WaitForNewPinnedTasks()` call,
+   `scheduler.cpp` — same underlying semaphore mechanism, traced in that
+   file's own comments) additionally blocks on real I/O inside whatever
+   `fn` a caller submitted. Renderer-core occupancy is therefore bursty
+   by design: workers wake for a `parallelFor()` fan-out, run to
+   completion, and go back to sleep on a kernel wait — never a
+   background thread perpetually spinning and competing with a host
+   application's own subsystems (audio, physics) while the renderer has
+   nothing to do.
+2. **Worker count is the consumer's budget, not a machine-wide default.**
+   `Scheduler::create(workerCount)`'s `hardware_concurrency() - 1`
+   default (`workerCount == 0`) is exactly that: a default for a
+   STANDALONE consumer (this phase's own samples and tests) that owns the
+   whole machine. An embedding engine is expected to construct its
+   `Scheduler` with the worker budget IT has decided to grant the
+   renderer — however it arrives at that number (a fraction of its own
+   pool, a fixed count, its own scheduling policy) — rather than accept
+   the hardware-derived default. Every `parallelFor()` call self-scales
+   to whatever `workerCount()` the Scheduler was actually built with, via
+   the auto-grain heuristic above — a smaller granted budget costs the
+   caller nothing beyond passing that number to `create()`; there is no
+   separate configuration surface to keep in sync.
+3. **External-thread participation is the recorded SDK-phase end state,
+   not implemented now.** The actual "one shared pool" end state is a
+   host engine registering its OWN threads into the renderer's enkiTS
+   scheduler (enkiTS's `RegisterExternalTaskThread()` /
+   `numExternalTaskThreads` mechanism — see `TaskScheduler.h`'s own
+   documentation of it), so host job-system work and renderer work
+   interleave on literally the same OS threads instead of two separate,
+   politely-idle pools. That is SDK-phase scope (the public ABI surface
+   Phase 4 does not grow beyond the log sink, per D23) — recorded in the
+   master registry, not implemented in `rx::task::Scheduler` today.
+
 ## The handoff pattern
 
 Workers never call into a main-thread-only API directly. Instead:

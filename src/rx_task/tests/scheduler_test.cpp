@@ -73,6 +73,76 @@ TEST_CASE("Scheduler::parallelFor touches every one of 10k items exactly once") 
   }
 }
 
+TEST_CASE("Scheduler::parallelFor's auto-grain overload (grainSize omitted) touches every item exactly "
+          "once, for itemCount 0/1/63/64/65/10000 -- no caller-chosen chunk count needed "
+          "[spec D4 amendment: \"Parallelism is the engine default, not a mode\"]") {
+  auto scheduler = rx::task::Scheduler::create(2);
+  REQUIRE(scheduler != nullptr);
+
+  for (uint32_t itemCount : {0u, 1u, 63u, 64u, 65u, 10000u}) {
+    std::vector<std::atomic<uint32_t>> touchCounts(itemCount);
+    for (auto& count : touchCounts) {
+      count.store(0);
+    }
+
+    scheduler->parallelFor(itemCount, [&](uint32_t begin, uint32_t end, uint32_t workerIndex) {
+      REQUIRE(begin < end);
+      REQUIRE(end <= itemCount);
+      (void)workerIndex;
+      for (uint32_t i = begin; i < end; ++i) {
+        touchCounts[i].fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+
+    for (uint32_t i = 0; i < itemCount; ++i) {
+      CHECK(touchCounts[i].load() == 1);
+    }
+  }
+}
+
+TEST_CASE("Scheduler::parallelFor's three-argument form with an explicit grainSize of 0 behaves "
+          "identically to the auto-grain overload -- 0 literally means AUTO, not \"grain of 1\"") {
+  auto scheduler = rx::task::Scheduler::create(2);
+  REQUIRE(scheduler != nullptr);
+
+  constexpr uint32_t kItemCount = 10000;
+  std::vector<std::atomic<uint32_t>> touchCounts(kItemCount);
+  for (auto& count : touchCounts) {
+    count.store(0);
+  }
+
+  scheduler->parallelFor(kItemCount, 0, [&](uint32_t begin, uint32_t end, uint32_t) {
+    for (uint32_t i = begin; i < end; ++i) {
+      touchCounts[i].fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+
+  for (uint32_t i = 0; i < kItemCount; ++i) {
+    CHECK(touchCounts[i].load() == 1);
+  }
+}
+
+TEST_CASE("Scheduler::autoGrainSize computes max(kMinGrain, itemCount / (workerCount * 4)) directly, "
+          "without needing a live Scheduler instance [spec D4 amendment]") {
+  CHECK(rx::task::Scheduler::kMinGrain == 64);
+
+  // Below (or exactly at) the floor -- kMinGrain wins.
+  CHECK(rx::task::Scheduler::autoGrainSize(0, 4) == 64);
+  CHECK(rx::task::Scheduler::autoGrainSize(100, 4) == 64);      // 100 / 16 = 6
+  CHECK(rx::task::Scheduler::autoGrainSize(10000, 39) == 64);   // 10000 / 156 = 64 (exact)
+
+  // Above the floor -- the formula's own value wins.
+  CHECK(rx::task::Scheduler::autoGrainSize(10000, 4) == 625);    // 10000 / 16 = 625
+  CHECK(rx::task::Scheduler::autoGrainSize(1000, 1) == 250);     // 1000 / 4 = 250
+  CHECK(rx::task::Scheduler::autoGrainSize(100000, 8) == 3125);  // 100000 / 32 = 3125
+
+  // Defensive guard: workerCount == 0 (never produced by a real
+  // Scheduler -- workerCount() is always >= 1 by construction -- but this
+  // is a pure static function callable with arbitrary input) is treated
+  // the same as workerCount == 1, not a division by zero.
+  CHECK(rx::task::Scheduler::autoGrainSize(1000, 0) == rx::task::Scheduler::autoGrainSize(1000, 1));
+}
+
 TEST_CASE("Scheduler::parallelFor genuinely runs multiple workers CONCURRENTLY -- a deterministic "
           "barrier proof, not a scheduling-heuristic guess (task-2-review.md Important finding: the old "
           "distinctWorkersUsed > 1 heuristic reproduced 2 failures in 27 runs under `taskset -c 0,1`)") {
