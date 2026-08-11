@@ -157,8 +157,12 @@ G2); then the canonical meshoptimizer sequence
 optimizeVertexFetch [R:assets]); AABB computed from final positions
 (G11); skinning data (JOINTS_0/WEIGHTS_0, skins, inverse bind matrices)
 parsed and PRESERVED in `MeshAsset` per seed item 14, unused until the
-animation phase. COLOR_0 and TEXCOORD_1 are explicitly deferred
-(recorded, not silently dropped: importer logs when present).
+animation phase. **Amended per feature-gap audit FG2:** glTF punctual
+lights (KHR_lights_punctual) and cameras are likewise parsed and
+PRESERVED in `ImportedScene` (types/params stored, unconsumed until the
+techniques phase — same retrofit economics as skinning). COLOR_0 and
+TEXCOORD_1 are explicitly deferred (recorded, not silently dropped:
+importer logs when present).
 
 ### D8 — Vertex format (pooled, fixed for Phase 4)
 
@@ -319,7 +323,10 @@ variant. Manual exposure parameter on the tonemap (G-item; auto-exposure
 is techniques-phase). Both materials are ordinary `.slang` modules on
 the public `IMaterialShader` interface — zero special treatment (seed 3
 restated). Specialization bits get their first real axes (alpha mode,
-double-sided).
+double-sided). **Amended per feature-gap audit FG1:** StandardPBR
+includes an interim flat ambient/environment term (uniform color ×
+occlusion — metals must not render black without IBL); the full
+skybox+IBL environment path is registered for the techniques phase.
 
 ### D23 — Public ABI in Phase 4
 

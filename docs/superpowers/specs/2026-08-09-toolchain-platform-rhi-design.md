@@ -188,6 +188,38 @@ it is out of scope for *this* spec only, not out of scope for the project:
   - **Profiling & debug instrumentation** (layer 12, tooling): GPU markers
     (PIX/RenderDoc integration), debug line drawing, memory leak tracking,
     performance counters.
+- **Feature-gap audit register (2026-08-11**, full evidence:
+  `.superpowers/sdd/2026-08-11-phase4-scene-assets/feature-gap-audit.md`;
+  none of these may be dropped without an explicit recorded ruling**):**
+  - *V1-blocking:* (FG1) environment lighting — skybox pass + image-based
+    ambient/IBL (interim flat ambient term lands with StandardPBR in Phase 4
+    Stage 1; skybox+prefiltered IBL at the head of the techniques phase);
+    (FG2) punctual lights — point/spot types, attenuation/units, their
+    shadow paths, clustered shading (techniques phase; glTF
+    KHR_lights_punctual + camera parse-and-preserve lands in Phase 4
+    Stage 1 import per the seed-14 economics); (FG3) dynamic content
+    contract — runtime/transient meshes + per-frame texture updates for
+    host UI/text/particles/video/procedural (bgfx transient/dynamic
+    precedent; contract designed in the scene/SDK ABI projection —
+    the SDK spec is OBLIGATED to answer it).
+  - *V1-expected:* (FG4) device-lost/GPU-hang policy + crash diagnostics
+    (breadcrumbs, VK_EXT_device_fault via the log sink; SDK policy +
+    tooling phase); (FG5) host caps/degradation report + adapter
+    enumeration/selection (SDK phase — the optionality principle's
+    reporting channel); (FG6) MSAA policy decision + resolve-attachment
+    semantics in the graph (decide in techniques-phase spec, before
+    aliasing/history ossify the resource model); (FG7) window edge states
+    — minimize/zero-extent guard (Phase 4 Stage 1 hardening ticket),
+    occlusion + DPI policy (SDK phase at latest); (FG8) HDR display
+    output + swapchain colorspace ladder (techniques phase, with the
+    post stack); (FG9) renderer-wide VRAM budget + memory-pressure
+    response, VK_EXT_memory_budget (streaming phase's central input —
+    registered here so that phase's spec inherits it); (FG10)
+    host-provided native window embedding via SDL3 foreign-window
+    properties, or a recorded rejection (SDK spec must answer).
+  - *Post-V1:* (FG11) consumer screenshot/capture API (SDK/tooling);
+    (FG12) frames-in-flight configurability + present-wait latency
+    control (profiling/SDK phase).
 - macOS/MoltenVK support
 - DLL ABI-stability strategy for the public interface
 - **Task/mesh shaders** (committed 2026-08-10, geometry phase): optional
