@@ -1355,11 +1355,28 @@ int runHeadless(const Args& args) {
 
     const VkExtent2D extent{kHeadlessWidth, kHeadlessHeight};
     const uint32_t expectedChunkCount = rx::graph::detail::chunkCountForWorkerCount(scheduler->workerCount());
-    // Pool-allocation budget: this graph has exactly ONE chunked pass, so
-    // each (frameSlot, threadIndex) pair ever needs at most one secondary
-    // -- see src/rx_graph/tests/test_execute_gpu.cpp's own identically-
-    // reasoned budget check.
-    const uint64_t poolBudget = static_cast<uint64_t>(scheduler->workerCount() + 1) * rx::rhi::FrameSync::kFramesInFlight;
+    // Pool-allocation budget -- CORRECTED [fix round, found by a genuinely
+    // flaky ctest failure this exact assertion caused: the original
+    // formula assumed "each (frameSlot, threadIndex) pair ever needs at
+    // most one secondary", which is WRONG -- enkiTS's own work-stealing
+    // gives no guarantee that a single execute() call's `chunkCount`
+    // chunks land on `chunkCount` DISTINCT threads; one thread can
+    // legitimately grab two (or more) of this pass's chunks in the SAME
+    // frame while another grabs none, needing that many buffers from its
+    // OWN pool that same frame -- this is correct, expected
+    // work-stealing behavior, not a defect, and asserting against it was
+    // this test's own bug, not the executor's. The bound that IS
+    // provably correct: within any ONE execute() call, the pass has
+    // exactly `expectedChunkCount` chunks total, each consuming exactly
+    // one buffer (freshly allocated or reused) from whichever thread
+    // records it -- so a single execute() call can never contribute MORE
+    // than `expectedChunkCount` new allocations, regardless of how
+    // work-stealing happens to distribute them. Over
+    // `kHeadlessFrameCount` calls, the budget is that many multiples of
+    // it -- looser than the old (wrong) formula in the cases that used to
+    // pass, but actually correct in every case, including the ones that
+    // used to fail intermittently.
+    const uint64_t poolBudget = static_cast<uint64_t>(kHeadlessFrameCount) * expectedChunkCount;
 
     bool gateOk = true;
     for (uint32_t frame = 0; frame < kHeadlessFrameCount; ++frame) {

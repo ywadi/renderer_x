@@ -1357,13 +1357,21 @@ TEST_CASE("Pass::setExecuteChunked records every chunk in parallel, drawing each
     // own headless counter gate will assert against too -- see executor.h's
     // detail::chunkCountForWorkerCount() doc comment.
     const rx::graph::detail::ExecutorChunkDebugStats stats = rx::graph::detail::debugChunkStats(*fixture->executor);
-    CHECK(stats.lastChunkCount == rx::graph::detail::chunkCountForWorkerCount(fixture->scheduler->workerCount()));
-    // Pool-allocation budget: at most one secondary per (frameSlot,
-    // threadIndex) pair is ever needed here (one chunked pass, one chunk
-    // per thread this test's single execute() call could possibly use) --
-    // see ChunkCommandPool's own comment for why this budget is
-    // (workerCount() + 1) * kFramesInFlight.
-    CHECK(stats.totalPoolAllocations <= static_cast<uint64_t>(fixture->scheduler->workerCount() + 1) * 2);
+    const uint32_t expectedChunkCount = rx::graph::detail::chunkCountForWorkerCount(fixture->scheduler->workerCount());
+    CHECK(stats.lastChunkCount == expectedChunkCount);
+    // Pool-allocation budget -- CORRECTED [fix round; see
+    // samples/07_stress/main.cpp's own runHeadless() for the full account
+    // of the bug this replaces]: "at most one secondary per (frameSlot,
+    // threadIndex) pair" is WRONG -- enkiTS's work-stealing gives no
+    // guarantee that `expectedChunkCount` chunks land on that many
+    // DISTINCT threads; one thread can legitimately grab more than one of
+    // this pass's chunks in a single execute() call. The bound that IS
+    // provably correct: exactly ONE execute() call happens in this test,
+    // and a single execute() call's chunked pass has exactly
+    // `expectedChunkCount` chunks total, each consuming exactly one
+    // buffer (freshly allocated or reused) -- so total allocations this
+    // whole test can ever cause is bounded by `expectedChunkCount` itself.
+    CHECK(stats.totalPoolAllocations <= expectedChunkCount);
 
     // --- Whole-pass twin: SAME recordCells() call, all 4 cells in one shot,
     // through setExecute() (ctx.cmd, not ctx.chunkCommandBuffer()) --------
