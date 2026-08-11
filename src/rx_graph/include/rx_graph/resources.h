@@ -116,6 +116,24 @@ struct PhysicalResource {
     uint32_t lastUsePass = 0;
 
     bool isBackbuffer = false;
+
+    // Phase 4 Task 1: true for a resource established via
+    // Pass::setHistoryOutput()/read via Pass::addHistoryInput() -- i.e. a
+    // persistent, ping-ponged resource backed by TWO pinned physical
+    // images (Executor's pinned pool, transient_pool.h), never the regular
+    // discard-per-frame transient pool a normal PhysicalResource uses.
+    // Mutually exclusive with a name ever appearing in a non-history
+    // declaration (RenderGraph::compile()'s own namespace-mixing
+    // validation rejects a graph that tries both) and with isBackbuffer
+    // (a history name can never satisfy setBackbufferSource()'s own
+    // writer-existence check -- see render_graph.cpp's comment on why
+    // Pass::isWriteKind() deliberately excludes HistoryOutput). firstUsePass/
+    // lastUsePass/imageUsage are still populated the same generic way as
+    // any other resource but are largely informational for a history
+    // resource -- ping-pong slot selection and cross-frame layout/stage
+    // tracking are entirely Executor-side concerns (executor.cpp), not
+    // something this device-free compile() result drives directly.
+    bool isHistory = false;
 };
 
 }  // namespace rx::graph

@@ -420,6 +420,211 @@ std::optional<InvertPipeline> buildInvertPipeline(VkDevice device, VkFormat colo
     return result;
 }
 
+// --- Phase 4 Task 1's history GPU test: the "fill" pipeline -- a
+// fullscreen triangle (same SV_VertexID trick as kInvertShaderSource
+// above) that writes a push-constant solid color, with NO texture/
+// descriptor-set dependency at all (unlike the invert pipeline, which
+// needs a real BindlessTable to substitute at set 0). Used by the
+// history-output-writing pass to paint a known, frame-varying pattern
+// into "hist"'s write slot -- PipelineLayoutBuilder::build() is called
+// with NO externalSet0 below precisely because this shader declares no
+// descriptor sets at all for it to need substituting. -------------------
+constexpr const char* kFillShaderSource = R"(
+struct PushConstants {
+    float4 color;
+};
+
+[[vk::push_constant]]
+ConstantBuffer<PushConstants> gPush;
+
+struct VSOut {
+    float4 position : SV_Position;
+};
+
+[shader("vertex")]
+VSOut vsMain(uint vertexID : SV_VertexID)
+{
+    float2 positions[3] = float2[3](
+        float2(-1.0, -1.0),
+        float2(3.0, -1.0),
+        float2(-1.0, 3.0)
+    );
+    VSOut o;
+    o.position = float4(positions[vertexID], 0.0, 1.0);
+    return o;
+}
+
+[shader("fragment")]
+float4 fsMain() : SV_Target
+{
+    return gPush.color;
+}
+)";
+
+const std::vector<std::string> kFillEntryPoints = {"vsMain", "fsMain"};
+
+struct FillPipeline {
+    VkShaderModule vertModule = VK_NULL_HANDLE;
+    VkShaderModule fragModule = VK_NULL_HANDLE;
+    rx::rhi::PipelineLayoutBundle layoutBundle;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    uint32_t pushConstantOffset = 0;
+    uint32_t pushConstantSize = 0;
+    VkShaderStageFlags pushConstantStages = 0;
+};
+
+void destroyFillPipeline(VkDevice device, FillPipeline& p) {
+    if (p.pipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device, p.pipeline, nullptr);
+    }
+    if (p.fragModule != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, p.fragModule, nullptr);
+    }
+    if (p.vertModule != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, p.vertModule, nullptr);
+    }
+    p.pipeline = VK_NULL_HANDLE;
+    p.fragModule = VK_NULL_HANDLE;
+    p.vertModule = VK_NULL_HANDLE;
+    p.layoutBundle = rx::rhi::PipelineLayoutBundle{};
+}
+
+std::optional<FillPipeline> buildFillPipeline(VkDevice device, VkFormat colorFormat) {
+    FillPipeline result;
+
+    auto compiler = rx::shader::Compiler::create();
+    if (!compiler.has_value()) {
+        return std::nullopt;
+    }
+
+    rx::shader::CompileResult compileResult =
+        compiler->compileFromSource("RxGraphFillModule", kFillShaderSource, kFillEntryPoints);
+    if (!compileResult.ok) {
+        MESSAGE("rx_graph fill shader compile failed: ", compileResult.diagnostics);
+        return std::nullopt;
+    }
+
+    auto layoutInfo = rx::shader::reflect(compileResult);
+    if (!layoutInfo.has_value() || layoutInfo->pushRanges.size() != 1) {
+        return std::nullopt;
+    }
+
+    // No externalSet0 -- this shader declares no descriptor sets at all
+    // (see this block's own comment above).
+    auto layoutBundle = rx::rhi::PipelineLayoutBuilder::build(device, *layoutInfo);
+    if (!layoutBundle.has_value()) {
+        return std::nullopt;
+    }
+    result.layoutBundle = std::move(*layoutBundle);
+    result.pushConstantOffset = layoutInfo->pushRanges[0].offset;
+    result.pushConstantSize = layoutInfo->pushRanges[0].size;
+    result.pushConstantStages = layoutInfo->pushRanges[0].stages;
+
+    for (const auto& blob : compileResult.entryPointCode) {
+        VkShaderModuleCreateInfo moduleInfo{};
+        moduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        moduleInfo.codeSize = blob.code.size() * sizeof(uint32_t);
+        moduleInfo.pCode = blob.code.data();
+
+        VkShaderModule module = VK_NULL_HANDLE;
+        if (vkCreateShaderModule(device, &moduleInfo, nullptr, &module) != VK_SUCCESS) {
+            destroyFillPipeline(device, result);
+            return std::nullopt;
+        }
+        if (blob.entryPointName == "vsMain") {
+            result.vertModule = module;
+        } else if (blob.entryPointName == "fsMain") {
+            result.fragModule = module;
+        } else {
+            vkDestroyShaderModule(device, module, nullptr);
+            destroyFillPipeline(device, result);
+            return std::nullopt;
+        }
+    }
+    if (result.vertModule == VK_NULL_HANDLE || result.fragModule == VK_NULL_HANDLE) {
+        destroyFillPipeline(device, result);
+        return std::nullopt;
+    }
+
+    std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = result.vertModule;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = result.fragModule;
+    stages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo vertexInputState{};
+    vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssemblyState{};
+    inputAssemblyState.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rasterizationState{};
+    rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizationState.cullMode = VK_CULL_MODE_NONE;
+    rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizationState.lineWidth = 1.0F;
+
+    VkPipelineMultisampleStateCreateInfo multisampleState{};
+    multisampleState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampleState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineColorBlendAttachmentState blendAttachment{};
+    blendAttachment.blendEnable = VK_FALSE;
+    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+                                      VK_COLOR_COMPONENT_A_BIT;
+
+    VkPipelineColorBlendStateCreateInfo colorBlendState{};
+    colorBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlendState.attachmentCount = 1;
+    colorBlendState.pAttachments = &blendAttachment;
+
+    std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState{};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+    dynamicState.pDynamicStates = dynamicStates.data();
+
+    VkPipelineRenderingCreateInfo renderingCreateInfo{};
+    renderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    renderingCreateInfo.colorAttachmentCount = 1;
+    renderingCreateInfo.pColorAttachmentFormats = &colorFormat;
+
+    VkGraphicsPipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.pNext = &renderingCreateInfo;
+    pipelineInfo.stageCount = static_cast<uint32_t>(stages.size());
+    pipelineInfo.pStages = stages.data();
+    pipelineInfo.pVertexInputState = &vertexInputState;
+    pipelineInfo.pInputAssemblyState = &inputAssemblyState;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterizationState;
+    pipelineInfo.pMultisampleState = &multisampleState;
+    pipelineInfo.pColorBlendState = &colorBlendState;
+    pipelineInfo.pDynamicState = &dynamicState;
+    pipelineInfo.layout = result.layoutBundle.layout;
+    pipelineInfo.renderPass = VK_NULL_HANDLE;  // dynamic rendering
+    pipelineInfo.basePipelineIndex = -1;
+
+    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &result.pipeline) !=
+        VK_SUCCESS) {
+        destroyFillPipeline(device, result);
+        return std::nullopt;
+    }
+
+    return result;
+}
+
 AttachmentDesc absoluteColorDesc(uint32_t width, uint32_t height) {
     AttachmentDesc desc;
     desc.format = kFormat;
@@ -822,6 +1027,199 @@ TEST_CASE(
     });
 
     vkDeviceWaitIdle(device);
+    destroyOffscreenImage(device, *offscreen);
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE(
+    "Phase 4 Task 1: a history resource's write slot survives into the NEXT frame's read, and frame 1's read is "
+    "reported invalid") {
+    // Pass "write_history" (setHistoryOutput("hist") only, no reader of
+    // its own) writes a frame-varying solid color into "hist"'s write slot
+    // via the "fill" pipeline; pass "read_history" (addHistoryInput("hist")
+    // + addColorOutput("bb")) samples "hist" bindlessly through the SAME
+    // "invert" pipeline/shader test_execute_gpu.cpp's very first TEST_CASE
+    // above already builds and proves end to end -- reused verbatim here
+    // rather than writing a third near-duplicate "sample and pass through"
+    // shader, and its channel inversion is simply accounted for in this
+    // test's own expected-pixel arithmetic below (black -> white,
+    // red -> cyan) instead of removed.
+    //
+    // Ping-pong parity [design contract point 2]: execute() call N writes
+    // slot (N % 2), reads slot ((N + 1) % 2) -- call 1 writes slot 1,
+    // reads slot 0 (never written by any real pass -- only black-cleared
+    // at creation [design contract point 3], so historyValid() must read
+    // false and the sampled result must be exactly the black-clear
+    // color, inverted = white); call 2 writes slot 0, reads slot 1 (=
+    // call 1's write -- historyValid() must now read true, and the
+    // sampled result must be exactly call 1's fill color, inverted).
+    auto fixture = makeFixture("rx_graph_gpu_history");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    const VkDevice device = fixture->device.device();
+    const VkPhysicalDevice physicalDevice = fixture->device.physicalDevice();
+
+    auto bindlessTable =
+        rx::rhi::BindlessTable::create(physicalDevice, device, rx::rhi::BindlessTable::Capacities{4, 2, 1});
+    REQUIRE(bindlessTable.has_value());
+
+    auto fillPipeline = buildFillPipeline(device, kFormat);
+    REQUIRE(fillPipeline.has_value());
+
+    auto samplePipeline = buildInvertPipeline(device, kFormat, bindlessTable->descriptorSetLayout());
+    REQUIRE(samplePipeline.has_value());
+
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_NEAREST;
+    samplerInfo.minFilter = VK_FILTER_NEAREST;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    REQUIRE(vkCreateSampler(device, &samplerInfo, nullptr, &sampler) == VK_SUCCESS);
+    auto samplerHandle = bindlessTable->registerSampler(sampler);
+    REQUIRE(samplerHandle.isValid());
+
+    auto offscreen = createOffscreenImage(device, physicalDevice, kFormat, VkExtent2D{kExtent, kExtent});
+    REQUIRE(offscreen.has_value());
+
+    rx::rhi::DeletionQueue deletionQueue;
+
+    // Mutated by the test between execute() calls; captured by reference in
+    // "write_history"'s callback below -- the SAME compiled/realized graph
+    // is executed twice, exactly like the resize-rerealize and buffer-reuse
+    // cases above already do.
+    std::array<float, 4> currentFillColor{1.0F, 0.0F, 0.0F, 1.0F};  // frame 1: red
+    bool observedHistoryValid = false;
+
+    RenderGraph graph;
+    graph.addPass("write_history").setHistoryOutput("hist", absoluteColorDesc(kExtent, kExtent)).setExecute(
+        [&](PassContext& ctx) {
+            vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, fillPipeline->pipeline);
+            vkCmdPushConstants(ctx.cmd, fillPipeline->layoutBundle.layout, fillPipeline->pushConstantStages,
+                                fillPipeline->pushConstantOffset, fillPipeline->pushConstantSize,
+                                currentFillColor.data());
+
+            VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.renderArea.width),
+                                 static_cast<float>(ctx.renderArea.height), 0.0F, 1.0F};
+            VkRect2D scissor{{0, 0}, ctx.renderArea};
+            vkCmdSetViewport(ctx.cmd, 0, 1, &viewport);
+            vkCmdSetScissor(ctx.cmd, 0, 1, &scissor);
+
+            vkCmdDraw(ctx.cmd, 3, 1, 0, 0);
+        });
+
+    rx::rhi::BindlessHandle histHandle;
+    graph.addPass("read_history")
+        .addHistoryInput("hist")
+        .addColorOutput("bb", absoluteColorDesc(kExtent, kExtent))
+        .setExecute([&](PassContext& ctx) {
+            observedHistoryValid = ctx.historyValid("hist");
+
+            histHandle =
+                bindlessTable->registerSampledImage(ctx.imageView("hist"), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            REQUIRE(histHandle.isValid());
+
+            vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, samplePipeline->pipeline);
+
+            VkDescriptorSet set = bindlessTable->descriptorSet();
+            vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, samplePipeline->layoutBundle.layout, 0,
+                                     1, &set, 0, nullptr);
+
+            struct {
+                uint32_t textureIndex;
+                uint32_t samplerIndex;
+            } push{histHandle.index(), samplerHandle.index()};
+            vkCmdPushConstants(ctx.cmd, samplePipeline->layoutBundle.layout, samplePipeline->pushConstantStages,
+                                samplePipeline->pushConstantOffset, samplePipeline->pushConstantSize, &push);
+
+            VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.renderArea.width),
+                                 static_cast<float>(ctx.renderArea.height), 0.0F, 1.0F};
+            VkRect2D scissor{{0, 0}, ctx.renderArea};
+            vkCmdSetViewport(ctx.cmd, 0, 1, &viewport);
+            vkCmdSetScissor(ctx.cmd, 0, 1, &scissor);
+
+            vkCmdDraw(ctx.cmd, 3, 1, 0, 0);
+        });
+    graph.setBackbufferSource("bb");
+
+    CompileInfo info;
+    info.swapchainWidth = kExtent;
+    info.swapchainHeight = kExtent;
+    info.swapchainFormat = kFormat;
+    info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    graph.compile(info);
+
+    fixture->executor->realize(graph);
+
+    auto cmdCtx =
+        rx::rhi::CommandContext::create(device, fixture->device.graphicsQueue(), fixture->device.graphicsQueueFamily());
+    REQUIRE(cmdCtx.has_value());
+
+    auto readBackCorner = [&]() -> std::array<uint8_t, 4> {
+        const VkDeviceSize pixelBytes = static_cast<VkDeviceSize>(kExtent) * kExtent * 4;
+        auto readback = fixture->allocator.createHostVisibleBuffer(pixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        REQUIRE(readback.has_value());
+        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+            VkBufferImageCopy region{};
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent = {kExtent, kExtent, 1};
+            vkCmdCopyImageToBuffer(cmd, offscreen->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1,
+                                    &region);
+        });
+        readback->invalidate();
+        std::array<uint8_t, 4> corner{};
+        std::memcpy(corner.data(), readback->mappedData(), corner.size());
+        return corner;
+    };
+
+    // ---- frame 1 (execute() call #1): writes slot 1, reads slot 0 (never
+    // written -- only black-cleared at creation). historyValid() must be
+    // false; the sampled result is the black clear color, inverted =
+    // white. ---------------------------------------------------------------
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
+    });
+    deletionQueue.retire([&bindlessTable, histHandle] { bindlessTable->release(histHandle); }, 0);
+    deletionQueue.onFrameFenceSignaled(0);
+
+    CHECK_FALSE(observedHistoryValid);
+    const std::array<uint8_t, 4> frame1Corner = readBackCorner();
+    CHECK(frame1Corner[0] == 255);
+    CHECK(frame1Corner[1] == 255);
+    CHECK(frame1Corner[2] == 255);
+    CHECK(frame1Corner[3] == 255);
+
+    // ---- frame 2 (execute() call #2): writes slot 0 (a fresh green fill,
+    // overwriting the slot frame 1 read from), reads slot 1 -- exactly
+    // frame 1's red fill. historyValid() must now be true; the sampled
+    // result is red, inverted = cyan -- proving frame 2's readback
+    // contains frame 1's pattern, not frame 2's own (still-being-written)
+    // one. --------------------------------------------------------------
+    currentFillColor = {0.0F, 1.0F, 0.0F, 1.0F};
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
+    });
+    deletionQueue.retire([&bindlessTable, histHandle] { bindlessTable->release(histHandle); }, 1);
+    deletionQueue.onFrameFenceSignaled(1);
+
+    CHECK(observedHistoryValid);
+    const std::array<uint8_t, 4> frame2Corner = readBackCorner();
+    CHECK(frame2Corner[0] == 0);
+    CHECK(frame2Corner[1] == 255);
+    CHECK(frame2Corner[2] == 255);
+    CHECK(frame2Corner[3] == 255);
+
+    vkDeviceWaitIdle(device);
+    bindlessTable->release(samplerHandle);
+    vkDestroySampler(device, sampler, nullptr);
+    destroyInvertPipeline(device, *samplePipeline);
+    destroyFillPipeline(device, *fillPipeline);
     destroyOffscreenImage(device, *offscreen);
 
     CHECK_FALSE(fixture->context.hasValidationErrors());

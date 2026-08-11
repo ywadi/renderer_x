@@ -13,13 +13,17 @@
 // project's own standing rule against rebuilding what already exists
 // [repo CLAUDE.md, "Do not reinvent the wheel"] applies exactly as much to
 // rx_graph's own sibling library as it would to a third-party one.
+#include <rx_graph/barriers.h>
 #include <rx_rhi_vk/buffer.h>
 #include <rx_rhi_vk/texture.h>
 #include <volk.h>
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace rx::rhi {
@@ -111,6 +115,71 @@ struct PooledBuffer {
     uint64_t lastUsedFrame = 0;
 };
 
+// Phase 4 Task 1: one ping-pong SLOT of a pinned history resource -- one of
+// the two physical images a single history-resource name is backed by
+// [design contract point 2: "TWO pinned physical images per history
+// resource (slot A/B)"].
+//
+// `barrierState` is the SAME per-resource invalidate/flush state machine
+// barriers.h's own detail::ResourceBarrierState/applyAccess() already
+// implement and buildBarriers() already drives for every ordinary
+// PhysicalResource -- reused here verbatim rather than re-derived, per this
+// repo's own "don't reinvent the wheel" rule (CLAUDE.md) and because the
+// exact behavior needed (barrier only when the layout differs or a prior
+// write/read demands one, WAW/WAR-correct, per-stage read coverage) is
+// EXACTLY what that state machine already gets right. The one thing that
+// makes a pinned slot's use of it different from buildBarriers()' own: a
+// PinnedHistorySlot's ResourceBarrierState is constructed ONCE, when the
+// slot is first created, and then lives for the pinned entry's ENTIRE
+// lifetime (every subsequent Executor::execute() call feeds it more
+// accesses without ever resetting it) -- never reset to a fresh
+// UNDEFINED/everAccessed=false state at the start of a compile() walk the
+// way buildBarriers() resets its own per-call vector. That persistence IS
+// design contract point 4's "barrier state machine initialized from
+// tracked last-frame layout instead of UNDEFINED", for free: there is
+// simply no reset to undo it.
+struct PinnedHistorySlot {
+    std::optional<rx::rhi::Texture2D> texture;
+    detail::ResourceBarrierState barrierState;
+
+    // Phase 4 Task 1, PassContext::historyValid(): true once a REAL
+    // Pass::setHistoryOutput()-declared write has landed in this slot at
+    // least once -- set by Executor::execute() only when it processes an
+    // actual HistoryOutput access against this slot, NEVER by the
+    // black-clear-at-creation init below (that establishes DEFINED
+    // content for a valid sampled read, but it is not "this frame's real
+    // history contents" in the sense historyValid() promises). Latches
+    // true forever once set -- a history resource's write slot does not
+    // revert to "never written" once it has been.
+    bool everWrittenByRealPass = false;
+};
+
+// Phase 4 Task 1: one history resource's full pinned entry -- both ping-pong
+// slots plus the shared shape it was created/last resized against. Looked
+// up by NAME (TransientPool::acquireHistory()), never by shape -- the
+// opposite of PooledImage/PooledBuffer's opportunistic shape-based reuse
+// above, since two DIFFERENT history resources of the same shape must never
+// alias onto the same physical images the way two same-shaped transient
+// resources happily do [design contract point 2: "never key-matched...
+// never aliased"]. Never swept by TransientPool::sweepStale() either (see
+// that method's own comment) -- retired only by TransientPool::retireAll()
+// at Executor shutdown, or replaced wholesale by a future acquireHistory()
+// call whose shape no longer matches (a resize; see that method's comment).
+struct PinnedHistoryEntry {
+    std::string name;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkExtent2D extent{0, 0};
+    VkImageUsageFlags usage = 0;
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+
+    // Slot 0 / slot 1 -- Executor::execute() selects which is this frame's
+    // write vs. read slot from its own frame counter's parity (frameCounter
+    // % 2 writes, (frameCounter + 1) % 2 reads -- see that file's own
+    // comment); this struct itself has no notion of "read" or "write", only
+    // "slot 0" and "slot 1".
+    std::array<PinnedHistorySlot, 2> slots;
+};
+
 // Executor's private transient-resource pool: acquire-or-create image/
 // buffer entries keyed by their physical descriptor, reused across
 // execute() calls (a realize()d Executor keeps referencing the same
@@ -156,10 +225,48 @@ public:
     // Same contract as acquireImage(), for a buffer keyed by (size, usage).
     std::optional<uint32_t> acquireBuffer(VkDeviceSize size, VkBufferUsageFlags usage, uint64_t currentFrame);
 
+    // Phase 4 Task 1: returns the index (stable for the pool's lifetime --
+    // see this struct's own class comment on why a pinned entry is never
+    // swept the way acquireImage()'s entries are) of `name`'s pinned entry,
+    // creating both slots fresh if `name` has never been acquired before,
+    // or if its shape (`format`/`extent`/`usage`/`samples`) no longer
+    // matches what was pinned for it previously (a resize -- the old
+    // slots' rx::rhi::Texture2D are retired into `deletionQueue`, tagged
+    // with `currentFrame`, exactly like sweepStale()'s own retirement, and
+    // fresh ones created in their place; a resize necessarily discards
+    // whatever history content existed, which is why `freshlyCreated`
+    // comes back true for this case too, not just a true first-ever
+    // creation).
+    //
+    // Looked up by `name` ALONE -- never by shape -- so two different
+    // history resources sharing a shape never alias onto one pinned entry
+    // [design contract point 2].
+    //
+    // `freshlyCreated`, written through the pointer, is how the caller
+    // (Executor::realize()) knows whether it must record the one-time
+    // black-clear-at-creation init submission for the returned entry's two
+    // slots (see executor.cpp's initializePinnedHistoryEntry()) -- this
+    // function only creates/replaces the Texture2Ds and seeds each fresh
+    // slot's ResourceBarrierState/everWrittenByRealPass back to their
+    // defaults; it never itself records a single vkCmd* call (no
+    // VkCommandBuffer is available at this layer -- see executor.h's own
+    // header-hygiene comment), matching every other TransientPool method's
+    // "resource lifetime only, never a live command" division of labor
+    // with executor.cpp.
+    //
+    // Returns std::nullopt (logged) only if creating a brand new Texture2D
+    // fails.
+    std::optional<uint32_t> acquireHistory(std::string_view name, VkFormat format, VkExtent2D extent,
+                                            VkImageUsageFlags usage, VkSampleCountFlagBits samples,
+                                            uint64_t currentFrame, rx::rhi::DeletionQueue& deletionQueue,
+                                            bool* freshlyCreated);
+
     [[nodiscard]] PooledImage& image(uint32_t index) { return images_.at(index); }
     [[nodiscard]] const PooledImage& image(uint32_t index) const { return images_.at(index); }
     [[nodiscard]] PooledBuffer& buffer(uint32_t index) { return buffers_.at(index); }
     [[nodiscard]] const PooledBuffer& buffer(uint32_t index) const { return buffers_.at(index); }
+    [[nodiscard]] PinnedHistoryEntry& pinned(uint32_t index) { return pinned_.at(index); }
+    [[nodiscard]] const PinnedHistoryEntry& pinned(uint32_t index) const { return pinned_.at(index); }
 
     // Bumps `lastUsedFrame` to `currentFrame` for the given already-
     // acquired entry -- called once per execute() call, for every pooled
@@ -179,13 +286,27 @@ public:
     // longer than the ruling's literal wording]). Called once per
     // execute() call, before that call's own barrier/rendering work -- see
     // executor.cpp.
+    //
+    // Phase 4 Task 1: deliberately never touches pinned_ [design contract
+    // point 2: "never swept while the graph holds them"] -- a pinned
+    // entry's `lastUsedFrame`-equivalent staleness tracking simply does not
+    // exist; once created, a history resource is retired only by
+    // retireAll() (shutdown) or replaced wholesale by a later
+    // acquireHistory() call for the SAME name whose shape no longer
+    // matches (a resize, handled inside acquireHistory() itself). This is
+    // the simplest, most conservative choice that still satisfies "never
+    // recycled/aliased" [seed-15 rationale]: an unclaimed pinned entry
+    // simply stays parked (a handful of images at most, in any Phase 4
+    // scene) rather than needing its own staleness clock and re-init
+    // machinery for a case no current caller exercises.
     void sweepStale(uint64_t currentFrame, rx::rhi::DeletionQueue& deletionQueue);
 
-    // Shutdown path: retires EVERY still-live entry into `deletionQueue`
-    // unconditionally, regardless of lastUsedFrame -- called from
-    // Executor's destructor, immediately after it has already brought the
-    // device to a real idle point (see executor.cpp), so `deletionQueue`'s
-    // own flushAll() immediately after this call is safe to run
+    // Shutdown path: retires EVERY still-live entry -- including every
+    // pinned history entry's two slots -- into `deletionQueue`
+    // unconditionally, regardless of lastUsedFrame. Called from Executor's
+    // destructor, immediately after it has already brought the device to
+    // a real idle point (see executor.cpp), so `deletionQueue`'s own
+    // flushAll() immediately after this call is safe to run
     // unconditionally too.
     void retireAll(uint64_t currentFrame, rx::rhi::DeletionQueue& deletionQueue);
 
@@ -196,6 +317,17 @@ private:
 
     std::vector<PooledImage> images_;
     std::vector<PooledBuffer> buffers_;
+
+    // Phase 4 Task 1: pinned history entries, keyed by name (linear scan in
+    // acquireHistory() -- a graph has at most a handful of history
+    // resources, nowhere near enough to justify a name->index map on top
+    // of images_/buffers_' own precedent of a plain linear scan for the
+    // same reason). No claimed-this-batch tracking (imageClaimedThisBatch_'s
+    // own twin) -- name-keyed lookup cannot alias two different
+    // PhysicalResource entries onto one pinned entry the way shape-keyed
+    // lookup could, so there is nothing for a per-batch marker to guard
+    // against here.
+    std::vector<PinnedHistoryEntry> pinned_;
 
     // Per-batch "already handed out this realize() call" markers, sized to
     // match images_/buffers_ and cleared by beginRealizeBatch(). Plain

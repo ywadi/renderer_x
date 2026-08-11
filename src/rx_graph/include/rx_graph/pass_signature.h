@@ -36,11 +36,23 @@ namespace rx::graph {
 // (see rx_material's material_system.cpp), so the render graph only needs
 // to contribute what IT actually varies per pass: attachment shape.
 struct PassSignature {
+    // Phase 4 Task 1 (carried final-review finding from Phase 3): the
+    // ceiling on how many color attachments any single declared pass may
+    // have -- RenderGraph::compile() throws, naming the offending pass, if
+    // a Pass::addColorOutput()/setHistoryOutput() call would push a single
+    // pass's own color-attachment count past this (render_graph.cpp).
+    // Named here (not a bare magic number) precisely because this array's
+    // own size is the ONE existing place that limit was already implicit
+    // but unenforced -- every other reference to "8" for this purpose
+    // (there were none outside this array before this task) should use
+    // this constant instead of repeating the literal.
+    static constexpr uint32_t kMaxColorAttachments = 8;
+
     // VK_FORMAT_UNDEFINED-padded: only the first `colorCount` entries are
     // meaningful. Fixed-size (not a vector) so PassSignature stays a
     // trivially-comparable, trivially-hashable value type, matching every
     // other rx_graph value type's own device-free-header discipline.
-    std::array<VkFormat, 8> colorFormats{};
+    std::array<VkFormat, kMaxColorAttachments> colorFormats{};
     uint32_t colorCount = 0;
     VkFormat depthFormat = VK_FORMAT_UNDEFINED;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;

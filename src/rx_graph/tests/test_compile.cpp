@@ -4,6 +4,7 @@
 // swapchain-relative size resolution, compute-vs-graphics storage buffer
 // stage classification) that the six required cases don't otherwise touch.
 #include <doctest/doctest.h>
+#include <rx_graph/pass_signature.h>
 #include <rx_graph/render_graph.h>
 
 #include <stdexcept>
@@ -328,4 +329,271 @@ TEST_CASE("texture input stage resolves per pass kind, like storage buffers alre
     CHECK(presentAccesses[0].stages == VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
     CHECK(presentAccesses[0].access == VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     CHECK(presentAccesses[0].layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
+// ============================================================================
+// Phase 4 Task 1: history resources + the carried color-attachment bounds
+// check. Device-free -- everything below exercises RenderGraph::compile()'s
+// declaration/validation/culling semantics only, never a real device (the
+// GPU-backed ping-pong/first-frame-contract test lives in
+// test_execute_gpu.cpp, rx_graph_gpu_tests).
+// ============================================================================
+
+TEST_CASE("history output resolves color or depth by format, like addColorOutput/setDepthStencilOutput") {
+    RenderGraph graph;
+    graph.addPass("write_color_hist").setHistoryOutput("hist_color", colorDesc());  // pass 0
+    graph.addPass("write_depth_hist").setHistoryOutput("hist_depth", depthDesc());  // pass 1
+    graph.addPass("present").addColorOutput("bb", colorDesc());                     // pass 2
+    graph.setBackbufferSource("bb");
+    graph.compile(kInfo);
+
+    const CompiledGraph& compiled = graph.compiled();
+
+    const auto colorAccesses = compiled.passAccesses(0);
+    REQUIRE(colorAccesses.size() == 1);
+    CHECK(colorAccesses[0].stages == VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
+    CHECK(colorAccesses[0].access == VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    CHECK(colorAccesses[0].layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+    const auto depthAccesses = compiled.passAccesses(1);
+    REQUIRE(depthAccesses.size() == 1);
+    CHECK(depthAccesses[0].stages ==
+          (VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT));
+    CHECK(depthAccesses[0].access ==
+          (VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT));
+    CHECK(depthAccesses[0].layout == VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+
+    // Both are marked isHistory and sampled -- unconditionally, per
+    // setHistoryOutput()'s own comment, even though neither is read by an
+    // addHistoryInput() declaration anywhere in THIS graph.
+    const PhysicalResource* histColor = findResource(compiled, "hist_color");
+    REQUIRE(histColor != nullptr);
+    CHECK(histColor->isHistory);
+    CHECK((histColor->imageUsage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0U);
+    CHECK((histColor->imageUsage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0U);
+
+    const PhysicalResource* histDepth = findResource(compiled, "hist_depth");
+    REQUIRE(histDepth != nullptr);
+    CHECK(histDepth->isHistory);
+    CHECK((histDepth->imageUsage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0U);
+    CHECK((histDepth->imageUsage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0U);
+}
+
+// Mirrors "texture input stage resolves per pass kind" above, for
+// addHistoryInput() instead of addTextureInput() -- same Compute-class/
+// Graphics-class split, same resolved access/layout.
+TEST_CASE("history input resolves like texture input, compute vs graphics split") {
+    RenderGraph graph;
+    graph.addPass("writer").setHistoryOutput("hist", colorDesc());  // pass 0
+    // "reader" has no attachment output at all -- Compute-class.
+    graph.addPass("reader").addHistoryInput("hist").setSideEffect();  // pass 1
+    // "present" has a color output alongside its history input -- Graphics-class.
+    graph.addPass("present").addHistoryInput("hist").addColorOutput("bb", colorDesc());  // pass 2
+    graph.setBackbufferSource("bb");
+    graph.compile(kInfo);
+
+    const CompiledGraph& compiled = graph.compiled();
+
+    const auto readerAccesses = compiled.passAccesses(1);
+    REQUIRE(readerAccesses.size() == 1);
+    CHECK(readerAccesses[0].stages == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    CHECK(readerAccesses[0].access == VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    CHECK(readerAccesses[0].layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    const auto presentAccesses = compiled.passAccesses(2);
+    REQUIRE(presentAccesses.size() == 2);
+    CHECK(presentAccesses[0].stages == VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+    CHECK(presentAccesses[0].access == VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    CHECK(presentAccesses[0].layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
+TEST_CASE("a resource used as both a history and a transient/buffer resource throws, naming it") {
+    RenderGraph graph;
+    graph.addPass("writer").setHistoryOutput("shared_name", colorDesc());
+    graph.addPass("other_writer").addColorOutput("shared_name", colorDesc());
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+
+    bool threw = false;
+    try {
+        graph.compile(kInfo);
+    } catch (const std::runtime_error& e) {
+        threw = true;
+        CHECK(std::string(e.what()).find("shared_name") != std::string::npos);
+    }
+    CHECK(threw);
+}
+
+TEST_CASE("more than one setHistoryOutput() pass for the same name throws, naming the resource and both passes") {
+    RenderGraph graph;
+    graph.addPass("writerA").setHistoryOutput("hist", colorDesc());
+    graph.addPass("writerB").setHistoryOutput("hist", colorDesc());
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+
+    bool threw = false;
+    try {
+        graph.compile(kInfo);
+    } catch (const std::runtime_error& e) {
+        threw = true;
+        const std::string message = e.what();
+        CHECK(message.find("hist") != std::string::npos);
+        CHECK(message.find("writerA") != std::string::npos);
+        CHECK(message.find("writerB") != std::string::npos);
+    }
+    CHECK(threw);
+}
+
+TEST_CASE("addHistoryInput() reading an undeclared history resource throws, naming the pass and the resource") {
+    RenderGraph graph;
+    graph.addPass("reader").addHistoryInput("ghost_history").setSideEffect();
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+
+    bool threw = false;
+    try {
+        graph.compile(kInfo);
+    } catch (const std::runtime_error& e) {
+        threw = true;
+        const std::string message = e.what();
+        CHECK(message.find("reader") != std::string::npos);
+        CHECK(message.find("ghost_history") != std::string::npos);
+    }
+    CHECK(threw);
+}
+
+// A setHistoryOutput() pass persists across the frame boundary regardless
+// of whether anything in THIS compiled graph reads it -- it must survive
+// culling exactly like a setSideEffect() pass does, never be treated as
+// dead code just because nothing downstream consumes it this frame (see
+// setHistoryOutput()'s own comment, pass.h).
+TEST_CASE("a history-output pass is never culled even with no reader in the graph") {
+    RenderGraph graph;
+    graph.addPass("write_only_history").setHistoryOutput("hist", colorDesc());  // pass 0: no reader anywhere
+    graph.addPass("present").addColorOutput("bb", colorDesc());                 // pass 1
+    graph.setBackbufferSource("bb");
+    graph.compile(kInfo);
+
+    const CompiledGraph& compiled = graph.compiled();
+    CHECK_FALSE(compiled.isCulled(0));
+
+    const auto order = compiled.executionOrder();
+    REQUIRE(order.size() == 2);
+    CHECK(findResource(compiled, "hist") != nullptr);
+}
+
+// addHistoryInput() must NOT add a same-frame dependsOn edge onto its
+// resource's setHistoryOutput() writer (see that method's own comment) --
+// proven here by a shape that WOULD be a genuine dependency cycle if that
+// edge existed: "accum" writes history "hist" AND reads "hist" (its own
+// previous-frame contents, the canonical ping-pong-accumulator pattern),
+// while ALSO depending on "present" through an ordinary same-frame chain
+// that itself depends on "accum"'s own ordinary output. If addHistoryInput()
+// wrongly created dependsOn["accum"] -> writer("hist") == "accum" itself,
+// that would be a trivial (already-guarded) self-edge and prove nothing;
+// the real proof is that compile() succeeds AT ALL with "accum" declaring
+// both -- a same-frame edge from history would not by itself create a
+// cycle here, so this test's real assertion is simply that BOTH
+// declarations coexisting on one pass, and being read by another pass
+// entirely, compiles cleanly with the expected execution order.
+TEST_CASE("a history-input read creates no same-frame ordering dependency on its own resource's history-output writer") {
+    RenderGraph graph;
+    // "accum" both reads last frame's "hist" and writes this frame's "hist"
+    // -- the canonical persistent-accumulator pattern setHistoryOutput()'s
+    // own comment describes.
+    graph.addPass("accum").addHistoryInput("hist").setHistoryOutput("hist", colorDesc()).addColorOutput(
+        "resolved", colorDesc());  // pass 0
+    graph.addPass("present").addTextureInput("resolved").addColorOutput("bb", colorDesc());  // pass 1
+    graph.setBackbufferSource("bb");
+    graph.compile(kInfo);
+
+    const CompiledGraph& compiled = graph.compiled();
+    const auto order = compiled.executionOrder();
+    REQUIRE(order.size() == 2);
+    CHECK(order[0] == 0);  // accum
+    CHECK(order[1] == 1);  // present
+
+    // Both the read and the write declarations resolve to the SAME
+    // physicalIndex (one logical name, per the device-free model) --
+    // exactly two ResourceAccess entries against "hist"'s physicalIndex on
+    // pass 0, plus the unrelated "resolved" color output.
+    const uint32_t histIdx = [&] {
+        const auto resources = compiled.resources();
+        for (uint32_t i = 0; i < resources.size(); ++i) {
+            if (resources[i].name == "hist") {
+                return i;
+            }
+        }
+        FAIL("no physical resource named 'hist'");
+        return UINT32_MAX;
+    }();
+    const auto accumAccesses = compiled.passAccesses(0);
+    uint32_t histAccessCount = 0;
+    for (const ResourceAccess& access : accumAccesses) {
+        if (access.physicalIndex == histIdx) {
+            ++histAccessCount;
+        }
+    }
+    CHECK(histAccessCount == 2);
+}
+
+TEST_CASE("compile() throws, naming the pass, when it declares more color outputs than kMaxColorAttachments") {
+    RenderGraph graph;
+    Pass& pass = graph.addPass("too_many_colors").setSideEffect();
+    for (uint32_t i = 0; i < PassSignature::kMaxColorAttachments + 1; ++i) {
+        pass.addColorOutput("color_" + std::to_string(i), colorDesc());
+    }
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+
+    bool threw = false;
+    try {
+        graph.compile(kInfo);
+    } catch (const std::runtime_error& e) {
+        threw = true;
+        CHECK(std::string(e.what()).find("too_many_colors") != std::string::npos);
+    }
+    CHECK(threw);
+}
+
+TEST_CASE("compile() accepts a pass declaring exactly kMaxColorAttachments color outputs") {
+    RenderGraph graph;
+    Pass& pass = graph.addPass("exactly_max_colors").setSideEffect();
+    for (uint32_t i = 0; i < PassSignature::kMaxColorAttachments; ++i) {
+        pass.addColorOutput("color_" + std::to_string(i), colorDesc());
+    }
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+    CHECK_NOTHROW(graph.compile(kInfo));
+}
+
+// A HistoryOutput declaration that resolves to a color format counts
+// toward the SAME per-pass limit as an ordinary addColorOutput() -- see
+// compile()'s own bounds-check comment for why (it IS a color attachment
+// output, chosen dynamically by format).
+TEST_CASE("a HistoryOutput declaration counts toward the color-attachment bounds check when it resolves to color") {
+    RenderGraph graph;
+    Pass& pass = graph.addPass("too_many_colors").setSideEffect();
+    for (uint32_t i = 0; i < PassSignature::kMaxColorAttachments; ++i) {
+        pass.addColorOutput("color_" + std::to_string(i), colorDesc());
+    }
+    pass.setHistoryOutput("one_history_too_many", colorDesc());  // pushes the count to kMaxColorAttachments + 1
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+    CHECK_THROWS_AS(graph.compile(kInfo), std::runtime_error);
+}
+
+// A depth-format HistoryOutput never counts toward the color-attachment
+// bounds check, matching setDepthStencilOutput()'s own long-standing
+// unbounded treatment.
+TEST_CASE("a depth-format HistoryOutput declaration never counts toward the color-attachment bounds check") {
+    RenderGraph graph;
+    Pass& pass = graph.addPass("at_max_colors_plus_history_depth").setSideEffect();
+    for (uint32_t i = 0; i < PassSignature::kMaxColorAttachments; ++i) {
+        pass.addColorOutput("color_" + std::to_string(i), colorDesc());
+    }
+    pass.setHistoryOutput("hist_depth", depthDesc());
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+    CHECK_NOTHROW(graph.compile(kInfo));
 }

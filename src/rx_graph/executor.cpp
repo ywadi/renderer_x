@@ -3,6 +3,7 @@
 #include "transient_pool.h"
 
 #include <rx_core/log.h>
+#include <rx_rhi_vk/command.h>
 #include <rx_rhi_vk/deletion_queue.h>
 #include <rx_rhi_vk/device.h>
 #include <volk.h>
@@ -110,11 +111,27 @@ struct ResolvedResource {
     bool isBuffer = false;
     bool isBackbuffer = false;
 
-    // Index into Impl::pool's images_/buffers_ (per isBuffer) -- meaningless
-    // (left at UINT32_MAX) for the backbuffer, which this Executor never
-    // pools [Task 3 ambiguity resolution #4].
+    // Phase 4 Task 1: true for a Pass::addHistoryInput()/setHistoryOutput()
+    // resource -- pinned, ping-ponged, never pooled the way an ordinary
+    // image is. Mutually exclusive with isBuffer (history is images-only)
+    // and isBackbuffer (see resources.h's PhysicalResource::isHistory
+    // comment for why the two can never coincide).
+    bool isHistory = false;
+
+    // Index into Impl::pool's images_/buffers_ (per isBuffer), or --  when
+    // isHistory -- into Impl::pool's pinned_ instead [Phase 4 Task 1].
+    // Meaningless (left at UINT32_MAX) for the backbuffer, which this
+    // Executor never pools [Task 3 ambiguity resolution #4].
     uint32_t poolIndex = UINT32_MAX;
 
+    // Meaningless (left at their defaults) for isHistory == true: a
+    // history resource has TWO real images (ping-pong slots), never one,
+    // so there is no single VkImage/VkImageView a generic field here could
+    // hold -- every history-aware code path (applyHistoryAccesses(),
+    // Executor::resolveImageView()/resolveImage(), the attachment-view
+    // resolution in Executor::execute()) resolves the correct slot's real
+    // handle directly from Impl::pool.pinned(poolIndex) instead, keyed by
+    // this frame's read/write role, every time it needs one.
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkBuffer buffer = VK_NULL_HANDLE;
@@ -125,6 +142,16 @@ struct ResolvedResource {
 struct Executor::Impl {
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+
+    // Phase 4 Task 1: needed to build the one-time init-clear
+    // rx::rhi::CommandContext a freshly (re)created pinned history entry's
+    // two slots need (see initializePinnedHistoryEntry() below) -- every
+    // other Executor operation records onto a caller-supplied
+    // VkCommandBuffer (execute()'s own `cmd` parameter) and never needed a
+    // real queue/queue-family of its own before this.
+    VkQueue graphicsQueue = VK_NULL_HANDLE;
+    uint32_t graphicsQueueFamily = 0;
+
     rx::rhi::Allocator allocator;
     detail::TransientPool pool;
     rx::rhi::DeletionQueue deletionQueue;
@@ -133,6 +160,11 @@ struct Executor::Impl {
     // Executor's own monotonic tick, one increment per execute() call --
     // the clock TransientPool's staleness sweep and this Impl's own
     // deletion-queue pacing (see Executor::execute()) both run against.
+    // Phase 4 Task 1: also the ping-pong parity clock -- a history
+    // resource's write slot for a given execute() call is
+    // `frameCounter % 2`, its read slot `(frameCounter + 1) % 2` [design
+    // contract point 2], read by every history-aware function below
+    // directly off this same field, never a separate counter.
     uint64_t frameCounter = 0;
 
     // Rebuilt by every realize() call; indexed identically to whatever
@@ -140,9 +172,12 @@ struct Executor::Impl {
     std::vector<ResolvedResource> resources;
     std::unordered_map<std::string, uint32_t> nameToIndex;
 
-    Impl(VkDevice deviceIn, VkPhysicalDevice physicalDeviceIn, rx::rhi::Allocator allocatorIn)
+    Impl(VkDevice deviceIn, VkPhysicalDevice physicalDeviceIn, VkQueue graphicsQueueIn, uint32_t graphicsQueueFamilyIn,
+         rx::rhi::Allocator allocatorIn)
         : device(deviceIn),
           physicalDevice(physicalDeviceIn),
+          graphicsQueue(graphicsQueueIn),
+          graphicsQueueFamily(graphicsQueueFamilyIn),
           allocator(std::move(allocatorIn)),
           pool(physicalDeviceIn, deviceIn, allocator) {}
 };
@@ -196,6 +231,19 @@ void applyBarriers(Executor::Impl& impl, const CompiledGraph& compiled, VkComman
     for (const ImageBarrier& b : barriers.imageBarriers) {
         const PhysicalResource& physical = compiled.resources()[b.physicalIndex];
         const ResolvedResource& resolved = impl.resources.at(b.physicalIndex);
+
+        // Phase 4 Task 1: a history resource never has a single real
+        // VkImage this compile-time-derived barrier could apply to (its
+        // `resolved.image` is left at its default, VK_NULL_HANDLE -- see
+        // ResolvedResource's own comment) -- applyHistoryAccesses() (called
+        // separately, from Executor::execute()) computes and applies its
+        // OWN real barriers for it directly, per-slot, from the unmerged
+        // per-declaration access list. Skipped here entirely, including
+        // `firstBarrierSeen` bookkeeping, which nothing history-related
+        // ever consults.
+        if (resolved.isHistory) {
+            continue;
+        }
 
         VkPipelineStageFlags2 srcStage = b.srcStage;
         VkAccessFlags2 srcAccess = b.srcAccess;
@@ -345,6 +393,208 @@ void synthesizeFirstUseBufferBarrierIfNeeded(Executor::Impl& impl, const Compile
     }
 }
 
+// Phase 4 Task 1: history resources bypass compile()'s own device-free
+// barrier derivation (allBarriers[pos]) ENTIRELY -- see
+// transient_pool.h's PinnedHistorySlot class comment for why: a single
+// physicalIndex's compile-time barrier, when a pass declares BOTH an
+// addHistoryInput() read and (the same or a different pass, same frame)
+// a setHistoryOutput() write of the SAME name, would have to describe TWO
+// DIFFERENT real images (this frame's read slot and this frame's write
+// slot) with only one (barriers.cpp's own combineByResource()-merged)
+// oldLayout/newLayout pair -- structurally incapable of it. This function
+// instead walks `accesses` (compiled.passAccesses(), the UNMERGED
+// per-declaration list, never allBarriers[pos]) directly and, for every
+// access against a history physicalIndex, resolves ITS OWN real slot --
+// write slot for a COLOR_ATTACHMENT_OPTIMAL/DEPTH_ATTACHMENT_OPTIMAL
+// access, read slot for a SHADER_READ_ONLY_OPTIMAL one, exhaustive and
+// unambiguous exactly like the colorPhysIdx/depthPhysIdx classification
+// just below in Executor::execute() -- and computes/applies its own real
+// vkCmdPipelineBarrier2, chained off THAT SLOT's own persisted
+// detail::ResourceBarrierState (never reset between execute() calls,
+// unlike buildBarriers()' per-compile-walk state -- see
+// PinnedHistorySlot's own comment for why that persistence alone realizes
+// design contract point 4's "barrier state machine initialized from
+// tracked last-frame layout instead of UNDEFINED"). Also latches
+// PinnedHistorySlot::everWrittenByRealPass for a write access -- the value
+// PassContext::historyValid() reads.
+void applyHistoryAccesses(Executor::Impl& impl, const CompiledGraph& compiled, VkCommandBuffer cmd,
+                           std::span<const ResourceAccess> accesses) {
+    const std::span<const PhysicalResource> resources = compiled.resources();
+    const auto writeSlot = static_cast<uint32_t>(impl.frameCounter % 2);
+    const auto readSlot = static_cast<uint32_t>((impl.frameCounter + 1) % 2);
+
+    for (const ResourceAccess& access : accesses) {
+        const PhysicalResource& physical = resources[access.physicalIndex];
+        if (!physical.isHistory) {
+            continue;
+        }
+
+        const bool isWrite = access.layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
+                              access.layout == VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        const uint32_t slotIndex = isWrite ? writeSlot : readSlot;
+
+        const ResolvedResource& resolved = impl.resources.at(access.physicalIndex);
+        detail::PinnedHistoryEntry& entry = impl.pool.pinned(resolved.poolIndex);
+        detail::PinnedHistorySlot& slot = entry.slots[slotIndex];
+
+        auto transition =
+            detail::applyAccess(slot.barrierState, /*isBuffer=*/false, access.stages, access.access, access.layout);
+        if (transition.has_value()) {
+            VkImageMemoryBarrier2 vkBarrier{};
+            vkBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            vkBarrier.srcStageMask = transition->srcStage;
+            vkBarrier.srcAccessMask = transition->srcAccess;
+            vkBarrier.dstStageMask = transition->dstStage;
+            vkBarrier.dstAccessMask = transition->dstAccess;
+            vkBarrier.oldLayout = transition->oldLayout;
+            vkBarrier.newLayout = transition->newLayout;
+            vkBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            vkBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            vkBarrier.image = slot.texture->image();
+            vkBarrier.subresourceRange.aspectMask = aspectMaskForFormat(physical.attachment.format);
+            vkBarrier.subresourceRange.baseMipLevel = 0;
+            vkBarrier.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+            vkBarrier.subresourceRange.baseArrayLayer = 0;
+            vkBarrier.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+
+            VkDependencyInfo dep{};
+            dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            dep.imageMemoryBarrierCount = 1;
+            dep.pImageMemoryBarriers = &vkBarrier;
+            vkCmdPipelineBarrier2(cmd, &dep);
+        }
+
+        if (isWrite) {
+            slot.everWrittenByRealPass = true;
+        }
+    }
+}
+
+// Phase 4 Task 1: the VkImageView Executor::execute()'s own dynamic-
+// rendering attachment-building loop (below) should bind for `resolved` --
+// this frame's WRITE slot for a history resource (Impl::frameCounter % 2;
+// see applyHistoryAccesses()'s matching write-slot derivation, which has
+// already transitioned that exact slot to COLOR_ATTACHMENT_OPTIMAL/
+// DEPTH_ATTACHMENT_OPTIMAL by the time this runs), or simply `resolved.view`
+// unchanged for any ordinary (non-history) resource.
+VkImageView resolveAttachmentView(Executor::Impl& impl, const ResolvedResource& resolved) {
+    if (resolved.isHistory) {
+        const auto writeSlot = static_cast<uint32_t>(impl.frameCounter % 2);
+        return impl.pool.pinned(resolved.poolIndex).slots[writeSlot].texture->view();
+    }
+    return resolved.view;
+}
+
+// Phase 4 Task 1, design contract point 3: the "small init submission"
+// half of the brief's two offered choices for getting a pinned slot's
+// contents into a DEFINED (black/1.0-cleared) state before its first-ever
+// use as a sampled read -- chosen over "clear-on-first-write-load" because
+// that alternative cannot cover the actual hazard at all: under the
+// ping-pong parity this task uses (write slot = frameCounter % 2, read
+// slot = (frameCounter + 1) % 2 -- see Impl::frameCounter's own comment),
+// the VERY FIRST execute() call that ever touches a history resource
+// reads a slot that will not be WRITTEN (by any real pass) until the frame
+// AFTER NEXT -- there is no "first write" for a LOAD_OP to piggyback on
+// before that first read happens. An explicit clear, run once here via its
+// own one-shot rx::rhi::CommandContext submission (the same
+// vkQueueWaitIdle-per-call tool this codebase already uses for setup/test
+// work -- rx_rhi_vk/command.h's own doc comment), is unconditionally
+// correct for both roles a freshly (re)created slot might be used in
+// first, and only ever runs once per pinned entry's lifetime (or once per
+// resize) -- see TransientPool::acquireHistory()'s `freshlyCreated` output
+// parameter, this function's only caller.
+//
+// Does NOT go through detail::applyAccess() for the clear's own barrier --
+// unlike every other caller of that function, this one is not a real
+// declared ResourceAccess: barriers.cpp's own isWriteAccess()/
+// kWriteAccessMask (its write-classification helper, scoped deliberately
+// to "every write access any declared ResourceAccess in this project can
+// carry" per that mask's own comment) does not recognize
+// VK_ACCESS_2_TRANSFER_WRITE_BIT as a write at all, so feeding it through
+// applyAccess() would mis-classify this as a READ and leave
+// lastWriteStages/pendingFlushAccess/hasPendingFlush understated (0/0/
+// false) instead of reflecting the real transfer write that just
+// happened. Harmless in THIS specific call site purely by accident of
+// timing (rx::rhi::CommandContext::runOnce() already vkQueueWaitIdle()s
+// before returning, so nothing ever needs to synchronize against this
+// clear across a submission boundary regardless of what state is left
+// behind) -- but relying on that coincidence instead of recording the
+// truth would be a latent bug waiting for a future caller that submits
+// this asynchronously instead. The transition itself is fully known
+// anyway (a freshly-created slot's ResourceBarrierState is always
+// UNDEFINED/everAccessed=false, so this is unconditionally "first use
+// ever": srcStage/srcAccess = NONE, oldLayout = UNDEFINED) -- hand-writing
+// it and then hand-seeding the resulting state as a real write is both
+// more precise and no more code than routing around the mask gap.
+void initializePinnedHistoryEntry(Executor::Impl& impl, uint32_t pinnedIndex) {
+    detail::PinnedHistoryEntry& entry = impl.pool.pinned(pinnedIndex);
+
+    auto cmdCtx = rx::rhi::CommandContext::create(impl.device, impl.graphicsQueue, impl.graphicsQueueFamily);
+    if (!cmdCtx.has_value()) {
+        RX_LOG_ERROR("rx_graph: Executor::realize: failed to create a CommandContext to init-clear history "
+                     "resource '{}'",
+                     entry.name);
+        return;
+    }
+
+    const VkImageAspectFlags aspect = aspectMaskForFormat(entry.format);
+    const bool isDepthOrStencil = aspect != VK_IMAGE_ASPECT_COLOR_BIT;
+
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        for (detail::PinnedHistorySlot& slot : entry.slots) {
+            VkImageMemoryBarrier2 vkBarrier{};
+            vkBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            vkBarrier.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+            vkBarrier.srcAccessMask = VK_ACCESS_2_NONE;
+            vkBarrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            vkBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            vkBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            vkBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            vkBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            vkBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            vkBarrier.image = slot.texture->image();
+            vkBarrier.subresourceRange.aspectMask = aspect;
+            vkBarrier.subresourceRange.baseMipLevel = 0;
+            vkBarrier.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+            vkBarrier.subresourceRange.baseArrayLayer = 0;
+            vkBarrier.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+
+            VkDependencyInfo dep{};
+            dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            dep.imageMemoryBarrierCount = 1;
+            dep.pImageMemoryBarriers = &vkBarrier;
+            vkCmdPipelineBarrier2(cmd, &dep);
+
+            // Hand-seed the state as if a real detail::applyAccess() write
+            // had just run (see this function's own comment above for why
+            // it is not literally called here) -- everything a subsequent
+            // real access's own detail::applyAccess() call needs to chain
+            // correctly off this clear.
+            slot.barrierState.currentLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            slot.barrierState.everAccessed = true;
+            slot.barrierState.lastWriteStages = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            slot.barrierState.pendingFlushAccess = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            slot.barrierState.hasPendingFlush = true;
+
+            VkImageSubresourceRange range{};
+            range.aspectMask = aspect;
+            range.baseMipLevel = 0;
+            range.levelCount = VK_REMAINING_MIP_LEVELS;
+            range.baseArrayLayer = 0;
+            range.layerCount = VK_REMAINING_ARRAY_LAYERS;
+            if (isDepthOrStencil) {
+                VkClearDepthStencilValue clearValue{1.0F, 0};
+                vkCmdClearDepthStencilImage(cmd, slot.texture->image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                             &clearValue, 1, &range);
+            } else {
+                VkClearColorValue clearValue{{0.0F, 0.0F, 0.0F, 1.0F}};
+                vkCmdClearColorImage(cmd, slot.texture->image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearValue, 1,
+                                      &range);
+            }
+        }
+    });
+}
+
 }  // namespace
 
 std::unique_ptr<Executor> Executor::create(rx::rhi::Device& device) {
@@ -354,7 +604,8 @@ std::unique_ptr<Executor> Executor::create(rx::rhi::Device& device) {
         return nullptr;
     }
 
-    auto impl = std::make_unique<Impl>(device.device(), device.physicalDevice(), std::move(*allocator));
+    auto impl = std::make_unique<Impl>(device.device(), device.physicalDevice(), device.graphicsQueue(),
+                                        device.graphicsQueueFamily(), std::move(*allocator));
 
     // Task 3 ambiguity resolution #7: query VK_EXT_debug_utils availability
     // once here, via the plain volk-global-function-pointer-null-check
@@ -409,6 +660,7 @@ void Executor::realize(const RenderGraph& graph) {
         ResolvedResource& entry = resolved[i];
         entry.isBuffer = physical.isBuffer;
         entry.isBackbuffer = physical.isBackbuffer;
+        entry.isHistory = physical.isHistory;
 
         if (physical.isBackbuffer) {
             // Never pooled [Task 3 ambiguity resolution #4] -- image/view/
@@ -417,6 +669,33 @@ void Executor::realize(const RenderGraph& graph) {
             // CompileInfo::swapchainFormat regardless of what its writer
             // pass declared -- see render_graph.cpp).
             entry.format = physical.attachment.format;
+            continue;
+        }
+
+        if (physical.isHistory) {
+            // Phase 4 Task 1: pinned, ping-ponged, looked up by NAME (never
+            // shape) -- see TransientPool::acquireHistory()'s own comment.
+            // `.image`/`.view` are deliberately left at their defaults;
+            // every history-aware code path resolves the correct real slot
+            // straight from Impl::pool.pinned(poolIndex) instead (see
+            // ResolvedResource's own comment).
+            const VkExtent2D extent = toExtent(physical.attachment);
+            bool freshlyCreated = false;
+            auto pinnedIndex =
+                impl.pool.acquireHistory(physical.name, physical.attachment.format, extent, physical.imageUsage,
+                                          physical.attachment.samples, impl.frameCounter, impl.deletionQueue,
+                                          &freshlyCreated);
+            if (!pinnedIndex.has_value()) {
+                RX_LOG_ERROR("rx_graph: Executor::realize: failed to acquire a pinned history entry for resource '{}'",
+                             physical.name);
+                continue;
+            }
+            entry.poolIndex = *pinnedIndex;
+            entry.format = physical.attachment.format;
+            entry.extent = extent;
+            if (freshlyCreated) {
+                initializePinnedHistoryEntry(impl, *pinnedIndex);
+            }
             continue;
         }
 
@@ -506,6 +785,7 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
 
         applyBarriers(impl, compiled, cmd, allBarriers[pos], firstBarrierSeen);
         synthesizeFirstUseBufferBarrierIfNeeded(impl, compiled, cmd, accesses, pos, firstBarrierSeen);
+        applyHistoryAccesses(impl, compiled, cmd, accesses);
 
         // Classify this pass's own declared accesses into color/depth
         // attachment outputs [spec Phase 3 design, D2] -- every other
@@ -540,7 +820,7 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
 
                 VkRenderingAttachmentInfo info{};
                 info.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-                info.imageView = resolvedRes.view;
+                info.imageView = resolveAttachmentView(impl, resolvedRes);
                 info.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                 // Task 3 ambiguity resolution #3: first write-use of an
                 // attachment in a frame clears; later uses load; always
@@ -559,7 +839,7 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
                 const ResolvedResource& resolvedRes = impl.resources.at(*depthPhysIdx);
 
                 depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-                depthAttachment.imageView = resolvedRes.view;
+                depthAttachment.imageView = resolveAttachmentView(impl, resolvedRes);
                 depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
                 depthAttachment.loadOp =
                     attachmentEverWritten[*depthPhysIdx] ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
@@ -649,8 +929,17 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
         // so there is no case where accumulating instead of resetting on a
         // write causes an actual over-synchronization problem worth
         // special-casing.
+        // Phase 4 Task 1: history physicalIndex entries are deliberately
+        // excluded here -- their poolIndex addresses Impl::pool's pinned_
+        // vector, not images_/buffers_ (the two the loop just below this
+        // one indexes into), and their cross-frame carry-forward is
+        // already handled per-slot, inline, by applyHistoryAccesses()
+        // above (PinnedHistorySlot::barrierState persists across
+        // execute() calls on its own -- there is nothing left for this
+        // generic mechanism to do for them at all).
         for (const auto& [physIdx, combined] : combineAccessesByResource(accesses)) {
-            if (!impl.resources.at(physIdx).isBackbuffer) {
+            const ResolvedResource& combinedRes = impl.resources.at(physIdx);
+            if (!combinedRes.isBackbuffer && !combinedRes.isHistory) {
                 finalStageThisExecute[physIdx] |= combined.stages;
                 finalAccessThisExecute[physIdx] |= combined.access & kPoolWriteAccessMask;
             }
@@ -714,6 +1003,13 @@ VkImageView Executor::resolveImageView(std::string_view name) const {
     const uint32_t idx = lookupResolvedIndex(*impl_, name);
     const ResolvedResource& resolved = impl_->resources.at(idx);
     requireKind(name, resolved, /*expectBuffer=*/false, "imageView");
+    if (resolved.isHistory) {
+        // Phase 4 Task 1: always THIS FRAME'S READ SLOT -- see executor.h's
+        // updated doc comment on this resolver for why there is no
+        // equivalent "give me the write slot" path at all.
+        const auto readSlot = static_cast<uint32_t>((impl_->frameCounter + 1) % 2);
+        return impl_->pool.pinned(resolved.poolIndex).slots[readSlot].texture->view();
+    }
     return resolved.view;
 }
 
@@ -721,6 +1017,10 @@ VkImage Executor::resolveImage(std::string_view name) const {
     const uint32_t idx = lookupResolvedIndex(*impl_, name);
     const ResolvedResource& resolved = impl_->resources.at(idx);
     requireKind(name, resolved, /*expectBuffer=*/false, "image");
+    if (resolved.isHistory) {
+        const auto readSlot = static_cast<uint32_t>((impl_->frameCounter + 1) % 2);
+        return impl_->pool.pinned(resolved.poolIndex).slots[readSlot].texture->image();
+    }
     return resolved.image;
 }
 
@@ -735,13 +1035,29 @@ VkFormat Executor::resolveImageFormat(std::string_view name) const {
     const uint32_t idx = lookupResolvedIndex(*impl_, name);
     const ResolvedResource& resolved = impl_->resources.at(idx);
     requireKind(name, resolved, /*expectBuffer=*/false, "imageFormat");
+    // Both ping-pong slots of a history resource always share one shape
+    // [design contract point 2] -- resolved.format (set once in
+    // Executor::realize(), unconditionally, regardless of isHistory) is
+    // already correct with no per-slot redirect needed.
     return resolved.format;
+}
+
+bool Executor::resolveHistoryValid(std::string_view name) const {
+    const uint32_t idx = lookupResolvedIndex(*impl_, name);
+    const ResolvedResource& resolved = impl_->resources.at(idx);
+    if (!resolved.isHistory) {
+        throw std::out_of_range("rx_graph: PassContext::historyValid(): '" + std::string(name) +
+                                 "' is not a history resource");
+    }
+    const auto readSlot = static_cast<uint32_t>((impl_->frameCounter + 1) % 2);
+    return impl_->pool.pinned(resolved.poolIndex).slots[readSlot].everWrittenByRealPass;
 }
 
 VkImageView PassContext::imageView(std::string_view name) const { return executor_->resolveImageView(name); }
 VkImage PassContext::image(std::string_view name) const { return executor_->resolveImage(name); }
 VkBuffer PassContext::buffer(std::string_view name) const { return executor_->resolveBuffer(name); }
 VkFormat PassContext::imageFormat(std::string_view name) const { return executor_->resolveImageFormat(name); }
+bool PassContext::historyValid(std::string_view name) const { return executor_->resolveHistoryValid(name); }
 
 namespace detail {
 

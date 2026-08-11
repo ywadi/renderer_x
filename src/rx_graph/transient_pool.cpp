@@ -89,6 +89,73 @@ std::optional<uint32_t> TransientPool::acquireBuffer(VkDeviceSize size, VkBuffer
     return static_cast<uint32_t>(buffers_.size() - 1);
 }
 
+std::optional<uint32_t> TransientPool::acquireHistory(std::string_view name, VkFormat format, VkExtent2D extent,
+                                                        VkImageUsageFlags usage, VkSampleCountFlagBits samples,
+                                                        uint64_t currentFrame, rx::rhi::DeletionQueue& deletionQueue,
+                                                        bool* freshlyCreated) {
+    *freshlyCreated = false;
+
+    uint32_t index = static_cast<uint32_t>(pinned_.size());
+    for (uint32_t i = 0; i < pinned_.size(); ++i) {
+        if (pinned_[i].name == name) {
+            index = i;
+            break;
+        }
+    }
+
+    const bool isNewEntry = (index == pinned_.size());
+    if (isNewEntry) {
+        PinnedHistoryEntry entry;
+        entry.name = std::string(name);
+        pinned_.push_back(std::move(entry));
+    }
+
+    PinnedHistoryEntry& entry = pinned_[index];
+    const bool shapeMatches = !isNewEntry && entry.format == format && entry.extent.width == extent.width &&
+                               entry.extent.height == extent.height && entry.usage == usage &&
+                               entry.samples == samples && entry.slots[0].texture.has_value() &&
+                               entry.slots[1].texture.has_value();
+    if (shapeMatches) {
+        return index;
+    }
+
+    // Either a brand new entry, or an existing one whose shape no longer
+    // matches (a resize) -- either way, both slots need a fresh
+    // Texture2D, and any PREVIOUSLY-live one must be retired (not
+    // destroyed outright: the GPU may still be reading/writing it via an
+    // in-flight submission from a past execute() call) rather than simply
+    // dropped, exactly like sweepStale()'s own retirement of a stale
+    // ordinary pooled entry.
+    for (PinnedHistorySlot& slot : entry.slots) {
+        if (slot.texture.has_value()) {
+            auto keepAlive = std::make_shared<rx::rhi::Texture2D>(std::move(*slot.texture));
+            slot.texture.reset();
+            deletionQueue.retire([keepAlive] {}, currentFrame);
+        }
+
+        auto texture = rx::rhi::Texture2D::create(physicalDevice_, device_, *allocator_, extent, format, usage,
+                                                    /*requestedMipLevels=*/1);
+        if (!texture.has_value()) {
+            RX_LOG_ERROR("rx_graph: TransientPool::acquireHistory: Texture2D::create failed for '{}' ({}x{}, format={})",
+                         entry.name, extent.width, extent.height, static_cast<int>(format));
+            return std::nullopt;
+        }
+        slot.texture = std::move(*texture);
+        // Fresh state for a fresh (or resized-away) image -- a resize
+        // discards whatever history content/sync state existed, same as
+        // every other resized PhysicalResource's pooled backing.
+        slot.barrierState = detail::ResourceBarrierState{};
+        slot.everWrittenByRealPass = false;
+    }
+
+    entry.format = format;
+    entry.extent = extent;
+    entry.usage = usage;
+    entry.samples = samples;
+    *freshlyCreated = true;
+    return index;
+}
+
 void TransientPool::touchImage(uint32_t index, uint64_t currentFrame) {
     images_.at(index).lastUsedFrame = currentFrame;
 }
@@ -150,6 +217,19 @@ void TransientPool::retireAll(uint64_t currentFrame, rx::rhi::DeletionQueue& del
         auto keepAlive = std::make_shared<rx::rhi::Buffer>(std::move(*entry.buffer));
         entry.buffer.reset();
         deletionQueue.retire([keepAlive] {}, currentFrame);
+    }
+    // Phase 4 Task 1: pinned history entries are never touched by
+    // sweepStale() (see that method's own comment) -- retireAll() is the
+    // ONLY path that ever tears one down, at Executor shutdown.
+    for (PinnedHistoryEntry& entry : pinned_) {
+        for (PinnedHistorySlot& slot : entry.slots) {
+            if (!slot.texture.has_value()) {
+                continue;
+            }
+            auto keepAlive = std::make_shared<rx::rhi::Texture2D>(std::move(*slot.texture));
+            slot.texture.reset();
+            deletionQueue.retire([keepAlive] {}, currentFrame);
+        }
     }
 }
 

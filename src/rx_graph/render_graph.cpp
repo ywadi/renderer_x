@@ -1,6 +1,7 @@
 #include <rx_graph/render_graph.h>
 
 #include <rx_core/log.h>
+#include <rx_graph/pass_signature.h>
 
 #include <algorithm>
 #include <deque>
@@ -46,6 +47,23 @@
 //   5. (Task 2) Derive every sync2 barrier from steps 1-4's output
 //      (barriers.h's buildBarriers(), ported from Granite's per-resource
 //      invalidate/flush accounting -- see that header's own comment).
+//
+// Phase 4 Task 1 additions (history/persistent resources -- see pass.h's
+// addHistoryInput()/setHistoryOutput() comments for the full contract):
+// a bounds check ahead of step 1 (no pass may declare more than
+// PassSignature::kMaxColorAttachments color outputs -- a carried Phase 3
+// final-review finding, unrelated to history but landing in this same
+// task); a namespace-mixing + exactly-one-writer validation pass, also
+// ahead of step 1; step 2 gets a HistoryInput-specific twin that resolves
+// against the history writer map instead of writersByName, deliberately
+// WITHOUT adding a dependsOn edge; step 3's cull treats every
+// setHistoryOutput()-declaring pass as an implicit root, like
+// setSideEffect(); step 4's resource-resolution switch grows two more
+// cases. Steps 1/3b/3c/5 (writersByName/dependsOn construction, the
+// topological sort, cycle detection, and buildBarriers() itself) are
+// completely unchanged -- a history resource's REAL cross-frame
+// ping-pong/layout-carry synchronization is entirely Executor-side
+// (executor.cpp), never something this device-free algorithm computes.
 namespace rx::graph {
 
 struct RenderGraph::Impl {
@@ -62,9 +80,46 @@ struct RenderGraph::Impl {
 // free function in this .cpp's own namespace is neither, even though it
 // lives in the same translation unit.
 
+namespace {
+
+// Phase 4 Task 1: is `format` a depth or depth/stencil format -- the same
+// bucket executor.cpp's own aspectMaskForFormat() (and, before that,
+// rx_rhi_vk/texture.cpp's identically-named function) already uses to
+// decide DEPTH_BIT-vs-COLOR_BIT aspect masks. An independent, equally
+// small local copy for the same reason executor.cpp's own copy documents
+// itself as one (neither is exported past its own .cpp) -- this one drives
+// Pass::resolveAccess's HistoryOutput color-vs-depth dispatch below, a
+// device-free decision that must not pull in rx_rhi_vk (or even volk) just
+// to answer "is this VkFormat enum value one of six depth ones", exactly
+// like setDepthStencilOutput()'s own existing resolveAccess row never
+// checks its format at all (a pure-stencil-only format is bucketed here as
+// "depth-like" for the same reason that pre-existing row does: this task's
+// scope does not extend to giving depth-vs-stencil-only formats separate
+// layouts, a gap setDepthStencilOutput already has today).
+bool isDepthOrStencilFormat(VkFormat format) {
+    switch (format) {
+        case VK_FORMAT_D16_UNORM:
+        case VK_FORMAT_D32_SFLOAT:
+        case VK_FORMAT_X8_D24_UNORM_PACK32:
+        case VK_FORMAT_D16_UNORM_S8_UINT:
+        case VK_FORMAT_D24_UNORM_S8_UINT:
+        case VK_FORMAT_D32_SFLOAT_S8_UINT:
+        case VK_FORMAT_S8_UINT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+}  // namespace
+
 bool Pass::hasAttachmentOutput() const {
     for (const Declaration& decl : declarations_) {
-        if (decl.kind == AccessKind::ColorOutput || decl.kind == AccessKind::DepthStencilOutput) {
+        // Phase 4 Task 1: a persistent (history) output IS an attachment
+        // output -- see setHistoryOutput()'s own comment (pass.h) and this
+        // method's updated doc comment.
+        if (decl.kind == AccessKind::ColorOutput || decl.kind == AccessKind::DepthStencilOutput ||
+            decl.kind == AccessKind::HistoryOutput) {
             return true;
         }
     }
@@ -113,11 +168,49 @@ ResourceAccess Pass::resolveAccess(const Declaration& decl, uint32_t physicalInd
             access.access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
             access.layout = VK_IMAGE_LAYOUT_UNDEFINED;
             break;
+        case AccessKind::HistoryInput:
+            // Phase 4 Task 1: identical resolution to TextureInput above --
+            // a sampled read is a sampled read regardless of whether the
+            // resource it targets happens to be persistent. The only
+            // difference between the two kinds is upstream of this
+            // function entirely (which name-resolution path -- writersByName
+            // vs historyOutputWritersByName -- and which physical images Executor::
+            // execute() actually binds), never the resolved stage/access/
+            // layout triple itself.
+            access.stages =
+                computeClass ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+            access.access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+            access.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            break;
+        case AccessKind::HistoryOutput:
+            // Phase 4 Task 1: color or depth/stencil, chosen by
+            // decl.attachment.format -- exactly the same two rows
+            // ColorOutput/DepthStencilOutput use above, just selected
+            // dynamically instead of by which builder method was called
+            // (setHistoryOutput() is the one output declaration whose
+            // format alone decides its attachment kind; see pass.h's own
+            // comment on why there is no separate "setHistoryDepthOutput").
+            if (isDepthOrStencilFormat(decl.attachment.format)) {
+                access.stages =
+                    VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+                access.access =
+                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                access.layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+            } else {
+                access.stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+                access.access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+                access.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            }
+            break;
     }
     return access;
 }
 
 bool Pass::isWriteKind(AccessKind kind) {
+    // Phase 4 Task 1: HistoryOutput is deliberately NOT included here --
+    // see this method's own doc comment (pass.h) for exactly why a
+    // resource kind that unquestionably IS a write must still stay out of
+    // the writersByName/dependsOn edge graph this predicate feeds.
     return kind == AccessKind::ColorOutput || kind == AccessKind::DepthStencilOutput ||
            kind == AccessKind::StorageBufferOutput;
 }
@@ -162,6 +255,80 @@ void RenderGraph::compile(const CompileInfo& info) {
                 RX_LOG_ERROR("rx_graph: duplicate pass name '{}'", pass.name_);
                 throw std::runtime_error("rx_graph: duplicate pass name '" + pass.name_ + "'");
             }
+        }
+    }
+
+    // ---- bounds check (carried from the Phase 3 final review): no single
+    // pass may declare more than PassSignature::kMaxColorAttachments color
+    // outputs -- a HistoryOutput declaration that resolves to a color
+    // format (isDepthOrStencilFormat() false) counts exactly like an
+    // ordinary addColorOutput() for this purpose, since it is one, per
+    // Pass::hasAttachmentOutput()/resolveAccess above; a depth/stencil one
+    // (either kind) never counts here at all, matching
+    // setDepthStencilOutput()'s own long-standing (never bounded, "at most
+    // one, by convention" per pass.h's class comment) treatment. Checked
+    // per pass over the WHOLE declaration set, before culling -- this is a
+    // structural pass-shape violation, not something whether the pass
+    // survives culling should affect. -----------------------------------
+    for (const Pass& pass : g.passes) {
+        uint32_t colorCount = 0;
+        for (const Pass::Declaration& decl : pass.declarations_) {
+            if (decl.kind == Pass::AccessKind::ColorOutput ||
+                (decl.kind == Pass::AccessKind::HistoryOutput && !isDepthOrStencilFormat(decl.attachment.format))) {
+                ++colorCount;
+            }
+        }
+        if (colorCount > PassSignature::kMaxColorAttachments) {
+            RX_LOG_ERROR("rx_graph: pass '{}' declares {} color outputs, more than the maximum of {}", pass.name_,
+                         colorCount, PassSignature::kMaxColorAttachments);
+            throw std::runtime_error("rx_graph: pass '" + pass.name_ + "' declares " + std::to_string(colorCount) +
+                                      " color outputs, more than the maximum of " +
+                                      std::to_string(PassSignature::kMaxColorAttachments));
+        }
+    }
+
+    // ---- history resources: namespace-mixing + exactly-one-writer checks,
+    // and the writer lookup addHistoryInput() resolves against (Phase 4
+    // Task 1). Also structural, checked over the WHOLE declaration set
+    // before culling -- a history resource's writer is never subject to
+    // culling in the first place (see step 3a below), so there is no
+    // "wait until culling settles" reason to defer this either. ----------
+    std::unordered_set<std::string> historyNames;
+    std::unordered_set<std::string> nonHistoryNames;
+    std::unordered_map<std::string, std::vector<uint32_t>> historyOutputWritersByName;
+    for (uint32_t p = 0; p < passCount; ++p) {
+        for (const Pass::Declaration& decl : g.passes[p].declarations_) {
+            const bool isHistoryKind =
+                decl.kind == Pass::AccessKind::HistoryInput || decl.kind == Pass::AccessKind::HistoryOutput;
+            (isHistoryKind ? historyNames : nonHistoryNames).insert(decl.resourceName);
+            if (decl.kind == Pass::AccessKind::HistoryOutput) {
+                historyOutputWritersByName[decl.resourceName].push_back(p);
+            }
+        }
+    }
+    for (const std::string& name : historyNames) {
+        if (nonHistoryNames.contains(name)) {
+            RX_LOG_ERROR("rx_graph: resource '{}' is used as both a history resource and a transient/buffer "
+                         "resource -- history names are their own namespace",
+                         name);
+            throw std::runtime_error("rx_graph: resource '" + name +
+                                      "' is used as both a history resource and a transient/buffer resource -- "
+                                      "history names are their own namespace");
+        }
+    }
+    for (const auto& [name, writers] : historyOutputWritersByName) {
+        if (writers.size() > 1) {
+            std::string passNames;
+            for (uint32_t p : writers) {
+                if (!passNames.empty()) {
+                    passNames += ", ";
+                }
+                passNames += "'" + g.passes[p].name_ + "'";
+            }
+            RX_LOG_ERROR("rx_graph: history resource '{}' has more than one setHistoryOutput() pass: {}", name,
+                         passNames);
+            throw std::runtime_error("rx_graph: history resource '" + name +
+                                      "' has more than one setHistoryOutput() pass: " + passNames);
         }
     }
 
@@ -224,6 +391,34 @@ void RenderGraph::compile(const CompileInfo& info) {
         }
     }
 
+    // ---- step 2b: resolve HistoryInput reads against historyOutputWritersByName
+    // instead of writersByName (Phase 4 Task 1) -- deliberately separate
+    // from the loop above: a HistoryInput read must NOT add a dependsOn
+    // edge onto its resource's setHistoryOutput() writer (see
+    // addHistoryInput()'s own comment, pass.h, for why that dependency
+    // would be wrong, not just redundant), but it still needs the SAME
+    // "reading something nobody declares" validation every other read
+    // kind gets, so a typo'd or never-established history name is caught
+    // here exactly as loudly.
+    for (uint32_t p = 0; p < passCount; ++p) {
+        const Pass& pass = g.passes[p];
+        for (const Pass::Declaration& decl : pass.declarations_) {
+            if (decl.kind != Pass::AccessKind::HistoryInput) {
+                continue;
+            }
+            auto it = historyOutputWritersByName.find(decl.resourceName);
+            if (it == historyOutputWritersByName.end() || it->second.empty()) {
+                RX_LOG_ERROR("rx_graph: pass '{}' reads history resource '{}', which no pass declares via "
+                             "setHistoryOutput()",
+                             pass.name_, decl.resourceName);
+                throw std::runtime_error("rx_graph: pass '" + pass.name_ + "' reads history resource '" +
+                                          decl.resourceName + "', which no pass declares via setHistoryOutput()");
+            }
+            // No dependsOn edge added -- intentional, see this block's own
+            // comment above.
+        }
+    }
+
     // ---- backbuffer resource must have a writer -------------------------
     auto backbufferWriters = writersByName.find(g.backbufferName);
     if (backbufferWriters == writersByName.end() || backbufferWriters->second.empty()) {
@@ -252,6 +447,19 @@ void RenderGraph::compile(const CompileInfo& info) {
     for (uint32_t p = 0; p < passCount; ++p) {
         if (g.passes[p].sideEffect_) {
             markReachable(p);
+        }
+        // Phase 4 Task 1: a setHistoryOutput() declaration is an implicit
+        // side effect -- its write persists into next frame's ping-pong
+        // slot regardless of whether anything in THIS compiled graph
+        // reads it (see setHistoryOutput()'s own comment, pass.h). Without
+        // this, a history-only writer with no in-graph reader would be
+        // wrongly culled as dead code the very first time Phase 4 adds a
+        // pass that writes history and nothing else in the same frame.
+        for (const Pass::Declaration& decl : g.passes[p].declarations_) {
+            if (decl.kind == Pass::AccessKind::HistoryOutput) {
+                markReachable(p);
+                break;
+            }
         }
     }
     while (!stack.empty()) {
@@ -438,6 +646,30 @@ void RenderGraph::compile(const CompileInfo& info) {
                     break;
                 case Pass::AccessKind::StorageBufferInput:
                     break;
+                case Pass::AccessKind::HistoryInput:
+                    // Phase 4 Task 1: a history resource is ALWAYS sampled
+                    // eventually (that is its entire point -- see
+                    // setHistoryOutput()'s own unconditional
+                    // VK_IMAGE_USAGE_SAMPLED_BIT union just below, which
+                    // covers the case no addHistoryInput() declaration
+                    // exists in THIS compiled graph at all); still unioned
+                    // here too so a graph that DOES declare one is in no
+                    // way relying on that other union instead.
+                    resource.isHistory = true;
+                    resource.imageUsage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+                    break;
+                case Pass::AccessKind::HistoryOutput:
+                    resource.attachment = decl.attachment;
+                    resource.isHistory = true;
+                    // Always sampled (see the HistoryInput case's comment
+                    // above) in addition to its color-or-depth attachment
+                    // usage, chosen by format exactly like
+                    // Pass::resolveAccess's own HistoryOutput row.
+                    resource.imageUsage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+                    resource.imageUsage |= isDepthOrStencilFormat(decl.attachment.format)
+                                               ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                                               : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+                    break;
             }
 
             accesses.push_back(Pass::resolveAccess(decl, physicalIndex, computeClass));
@@ -521,6 +753,16 @@ Pass& Pass::setDepthStencilOutput(std::string_view name, const AttachmentDesc& d
 
 Pass& Pass::addTextureInput(std::string_view name) {
     declarations_.push_back(Declaration{AccessKind::TextureInput, std::string(name), AttachmentDesc{}, BufferDesc{}});
+    return *this;
+}
+
+Pass& Pass::addHistoryInput(std::string_view name) {
+    declarations_.push_back(Declaration{AccessKind::HistoryInput, std::string(name), AttachmentDesc{}, BufferDesc{}});
+    return *this;
+}
+
+Pass& Pass::setHistoryOutput(std::string_view name, const AttachmentDesc& desc) {
+    declarations_.push_back(Declaration{AccessKind::HistoryOutput, std::string(name), desc, BufferDesc{}});
     return *this;
 }
 

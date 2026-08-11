@@ -107,10 +107,40 @@ public:
     PassContext(PassContext&&) = delete;
     PassContext& operator=(PassContext&&) = delete;
 
+    // For a history-resource `name` (Pass::addHistoryInput()/
+    // setHistoryOutput()), imageView()/image() resolve to THIS FRAME'S
+    // READ SLOT -- the previous frame's write, i.e. exactly what a pass
+    // declaring addHistoryInput() actually wants to sample. A pass
+    // establishing `name` via setHistoryOutput() alone never needs to call
+    // these for it at all: this frame's WRITE slot is bound automatically
+    // as the pass's own color/depth attachment (Executor::execute(), same
+    // as any other addColorOutput()/setDepthStencilOutput() resource) --
+    // there is no name-based accessor for "the write slot" because nothing
+    // in this codebase needs one; a pass callback interacts with its own
+    // attachment purely through the dynamic-rendering scope it runs
+    // inside, never by re-resolving its own output by name.
     [[nodiscard]] VkImageView imageView(std::string_view name) const;
     [[nodiscard]] VkImage image(std::string_view name) const;
     [[nodiscard]] VkBuffer buffer(std::string_view name) const;
     [[nodiscard]] VkFormat imageFormat(std::string_view name) const;
+
+    // Phase 4 Task 1: false until `name`'s history resource has completed
+    // one full ping-pong cycle -- i.e. until THIS frame's read slot has
+    // actually been the target of a real Pass::setHistoryOutput() write in
+    // some PAST execute() call, not merely the black-clear-at-creation
+    // init every pinned slot gets before its first-ever use (see
+    // transient_pool.h's PinnedHistorySlot::everWrittenByRealPass, the
+    // exact value this resolves to). A pass reading addHistoryInput(name)
+    // is expected to branch on this -- e.g. skip a temporal blend entirely
+    // on its own first-ever frame, since the "previous frame" it would
+    // blend against does not exist yet and this call only guarantees
+    // DEFINED (black/1.0-cleared), not MEANINGFUL, content for that case.
+    // `name` must be a history-resource name among CompiledGraph::
+    // resources() -- throws std::out_of_range otherwise, matching every
+    // other resolver's own "not resolvable" contract (a name that exists
+    // but is NOT a history resource throws too, naming it, exactly like
+    // buffer()/imageView() do for a wrong-kind name).
+    [[nodiscard]] bool historyValid(std::string_view name) const;
 
     // Task 5 (rx_material): this pass's own attachment shape, exactly as
     // Executor::execute() classified it this call (colorAttachments/
@@ -255,6 +285,7 @@ private:
     [[nodiscard]] VkImage resolveImage(std::string_view name) const;
     [[nodiscard]] VkBuffer resolveBuffer(std::string_view name) const;
     [[nodiscard]] VkFormat resolveImageFormat(std::string_view name) const;
+    [[nodiscard]] bool resolveHistoryValid(std::string_view name) const;
 
     std::unique_ptr<Impl> impl_;
 };
