@@ -205,6 +205,15 @@ it is out of scope for *this* spec only, not out of scope for the project:
   meshlets exist; it requires a shade-from-ID path through the material
   system's specialization model — design work to scope in that phase's
   spec, not assumed.
+- **Scheduler sharing with host engines** (committed 2026-08-11, SDK
+  phase): an embedding game engine must be able to make the renderer's
+  task scheduler and its own job system ONE pool — via consumer-chosen
+  worker budgets at creation (available from Phase 4 Stage 0) and, at the
+  SDK surface, external-thread participation (host threads registered
+  into the renderer's enkiTS scheduler). Rationale: the renderer must
+  never starve host subsystems (audio, physics); idle workers sleep on
+  semaphores and occupancy is bursty by design, but the end state is a
+  single shared pool, not two polite ones.
 - **Multi-language bindings** (committed 2026-08-10, SDK phase): the public
   API ships C-ABI-first — a single IDL source generates the C header, the
   C++ COM-lite header, and the DLL shim (bgfx precedent; kills header
