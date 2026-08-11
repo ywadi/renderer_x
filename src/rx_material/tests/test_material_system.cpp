@@ -536,7 +536,7 @@ TEST_CASE("MaterialSystem persists its VkPipelineCache to disk across instances"
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 
-TEST_CASE("MaterialSystem::create succeeds with a corrupt pipeline-cache file (logs warning, uses fresh cache)") {
+TEST_CASE("MaterialSystem::create succeeds with an invalid pipeline-cache file; the driver discards invalid data") {
     auto fixture = makeFixture("rx_material_cache_corrupt");
     if (!fixture.has_value()) {
         return;
@@ -544,24 +544,31 @@ TEST_CASE("MaterialSystem::create succeeds with a corrupt pipeline-cache file (l
 
     std::filesystem::path cachePath = freshCachePath("corrupt");
 
-    // Write garbage bytes to simulate a corrupted cache file
+    // Write REAL garbage (512 bytes of 0xDE pattern) -- definitively not a
+    // valid VkPipelineCache header. The Vulkan spec guarantees that drivers
+    // ignore invalid initialData passed to vkCreatePipelineCache (see
+    // material_system.cpp's comment on this behavior).
     {
         std::ofstream corruptFile(cachePath, std::ios::binary);
         REQUIRE(corruptFile.is_open());
-        const std::array<uint8_t, 256> garbage{};
+        std::vector<uint8_t> garbage(512);
+        for (size_t i = 0; i < garbage.size(); ++i) {
+            garbage[i] = static_cast<uint8_t>(0xDE + (i & 0xFF));
+        }
         corruptFile.write(reinterpret_cast<const char*>(garbage.data()), garbage.size());
     }
 
     REQUIRE(std::filesystem::exists(cachePath));
 
-    // MaterialSystem::create() should succeed despite the corrupt file,
-    // logging a warning and using a fresh cache instead (Task 5
-    // ambiguity resolution: corrupt/unreadable cache is best-effort,
-    // never fatal).
+    // MaterialSystem::create() must succeed despite the corrupt file,
+    // relying on Vulkan's documented contract: vkCreatePipelineCache
+    // discards invalid initialData and proceeds with a fresh cache. This
+    // resilience is inherent to the Vulkan driver, not explicit logging
+    // or detection in this code.
     auto system = rx::material::MaterialSystem::create(fixture->device, fixture->bindless, cachePath);
     REQUIRE(system != nullptr);
 
-    // Verify we can still use the system normally
+    // Verify the system is fully functional after loading an invalid cache
     rx::material::MaterialHandle handle = system->loadMaterial(testDataPath("test_unlit.slang"));
     rx::material::PipelineRequest request;
     request.material = handle;

@@ -170,10 +170,12 @@ jobs:
       # artifact that outlives the raw console log.
       #
       # When upgrading vulkan-validationlayers to a newer version: verify
-      # the three context.cpp false-positive guards
-      # (rx_rhi_vk/src/context.cpp, search for "TODO(task-2-review-rv1)")
-      # remain valid against the new layer's reported message set. If any
-      # guard-suppressed message is no longer generated, remove that guard.
+      # the three context.cpp false-positive guards remain valid against the
+      # new layer's reported message set:
+      # 1. isKnownPortabilityEnumerationLayerBug() (line 33)
+      # 2. isKnownUnrecognizedSlangSourceLanguageBug() (line 65)
+      # 3. isKnownSyncValidationSeparateSamplerMisclassification() (line 122)
+      # If any guard-suppressed message is no longer generated, remove that guard.
       # If new false-positive messages appear, add guards for them (the
       # existing three are KNOWN false-positives reproduced locally, which is
       # the only acceptable reason to suppress validation messages).

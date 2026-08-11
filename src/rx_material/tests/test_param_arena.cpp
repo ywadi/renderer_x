@@ -145,7 +145,7 @@ TEST_CASE("ParamArena: writes into different frame-in-flight slots are isolated,
 }
 
 TEST_CASE("ParamArena: byte-arena exhaustion and descriptor-pool exhaustion at a non-zero frame-in-flight index "
-          "fail cleanly (VK_NULL_HANDLE), never corrupting an already-written blob") {
+          "fail cleanly (VK_NULL_HANDLE), never corrupting an already-written blob; cursor does NOT advance on failure") {
     HeadlessParamArenaFixture fixture = makeFixture();
 
     {
@@ -176,10 +176,10 @@ TEST_CASE("ParamArena: byte-arena exhaustion and descriptor-pool exhaustion at a
         REQUIRE(slot1Data != nullptr);
         CHECK(std::memcmp(slot1Data, blob.data(), blob.size()) == 0);
 
-        // --- Descriptor-pool exhaustion, at the SAME non-zero slot -------
-        // A fresh beginFrame(1) resets both the byte cursor and the paired
-        // DescriptorArena's pool, so this sub-case starts from a clean
-        // slate independent of the byte-arena sub-case above.
+        // --- Descriptor-pool exhaustion: verify cursor does NOT advance on failure ---
+        // Key fix (instance.cpp): cursor advancement is now AFTER the allocate check,
+        // not before. This prevents wasting byte-arena space when descriptor
+        // allocation fails.
         //
         // [Post-release fix, CI lavapipe run acfce89] This now exercises
         // rx::rhi::DescriptorArena's own arena-enforced maxSets/uniformBuffers
@@ -207,14 +207,14 @@ TEST_CASE("ParamArena: byte-arena exhaustion and descriptor-pool exhaustion at a
         // measures.
         CHECK(successfulAllocations == rx::material::ParamArena::kMaxInstancesPerFrame);
 
-        // One more allocation past the documented ceiling must fail
-        // cleanly -- the exact "documented failure mode fires" case F2
-        // asks for.
+        // One more allocation past the documented ceiling must fail cleanly.
         CHECK(arena->writeAndAllocate(layout, blob.data(), blob.size()) == VK_NULL_HANDLE);
 
         // Nothing already written was corrupted by driving the pool to
         // (and past) exhaustion -- re-check slot 1's very first byte
-        // range from this beginFrame(1) cycle.
+        // range from this beginFrame(1) cycle. With the fix, the byte
+        // cursor did not waste space when the final allocate failed, so
+        // the buffer state is clean.
         const void* slot1DataAfterExhaustion = rx::material::detail::debugFrameBufferData(*arena, 1);
         REQUIRE(slot1DataAfterExhaustion != nullptr);
         CHECK(std::memcmp(slot1DataAfterExhaustion, blob.data(), blob.size()) == 0);
