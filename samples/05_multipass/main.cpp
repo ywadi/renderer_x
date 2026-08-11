@@ -146,6 +146,7 @@
 #include <rx_rhi_vk/upload.h>
 #include <rx_shader/compiler.h>
 #include <rx_shader/reflection.h>
+#include <rx_task/scheduler.h>
 
 // See samples/03_bindless_mesh/main.cpp's identical comment: GLM is a
 // PUBLIC rx_core dependency, transitively available here; the
@@ -1377,32 +1378,78 @@ void recordShadowDraws(rx::graph::PassContext& ctx, Scene& scene) {
     }
 }
 
-void recordLitDraws(rx::graph::PassContext& ctx, Scene& scene) {
-    // Register (or re-register, only if the pooled view actually changed --
-    // see this file's header comment) "shadowmap" into the bindless table
-    // BEFORE the draw loop, once per execute() call, not once per object.
-    VkImageView shadowView = ctx.imageView("shadowmap");
-    if (shadowView != scene.lastShadowMapView) {
-        if (scene.shadowMapHandle.isValid()) {
-            scene.bindlessTable.release(scene.shadowMapHandle);
+// Phase 4 Task 7 [spec D4 amendment]: CHUNKED -- migrated from a single
+// whole-pass setExecute() callback to setExecuteChunked() (declareGraph()
+// below). Parallelism is the engine default now, not an opt-in mode: this
+// is the hand-written "forward" pass's own chunk-range draw loop, called
+// once per chunk index in [0, chunkCount) -- chunkCount is derived from the
+// engine Scheduler this sample now owns (rx::task::Scheduler, created in
+// main() below), never chosen by this sample. With kObjectCount == 3 real
+// objects, most chunks on any real multi-core machine end up with either
+// exactly one object or none at all (objectsPerChunk == 1 once chunkCount
+// >= kObjectCount) -- the point of this migration is proving the parallel
+// recording PATH end to end (secondary command buffers, per-thread pools,
+// vkCmdExecuteCommands) with zero regression to the rendered pixels
+// (samples/05_multipass's own headless gate stays byte-identical
+// pre/post-migration), not extracting a real speedup from three draws.
+//
+// Chunk-index order == object-index order (ceil-division slicing, ascending
+// chunkIndex claims ascending object indices) -- the SAME relative draw
+// order the original whole-pass loop always had, which is what makes the
+// headless pixel gate's byte-identical requirement achievable in the first
+// place: vkCmdExecuteCommands() replays every chunk's own secondary in
+// chunk-index order, so this is equivalent to the original single-buffer
+// loop, not merely close to it.
+void recordLitDrawsChunked(rx::graph::PassContext& ctx, Scene& scene, uint32_t chunkIndex, uint32_t chunkCount) {
+    if (chunkIndex == 0) {
+        // Register (or re-register, only if the pooled view actually
+        // changed -- see this file's header comment) "shadowmap" into the
+        // bindless table, once per execute() call, not once per object.
+        // Main-thread-only (rx::rhi::BindlessTable registration --
+        // docs/threading.md) -- safe here ONLY because chunk 0 of a
+        // setExecuteChunked() callback is guaranteed to run synchronously,
+        // on the calling (main) thread, before any other chunk begins
+        // [pass.h: Pass::setExecuteChunked()'s own doc comment] -- moved
+        // here (unchanged in every other respect) from its pre-migration
+        // spot at the very top of the old whole-pass recordLitDraws(),
+        // which ran unconditionally on the main thread by construction.
+        VkImageView shadowView = ctx.imageView("shadowmap");
+        if (shadowView != scene.lastShadowMapView) {
+            if (scene.shadowMapHandle.isValid()) {
+                scene.bindlessTable.release(scene.shadowMapHandle);
+            }
+            scene.shadowMapHandle =
+                scene.bindlessTable.registerSampledImage(shadowView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            scene.lastShadowMapView = shadowView;
         }
-        scene.shadowMapHandle =
-            scene.bindlessTable.registerSampledImage(shadowView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        scene.lastShadowMapView = shadowView;
     }
 
-    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scene.litPass.pipeline);
+    // Every chunk's own secondary inherits neither the primary's bound
+    // pipeline/descriptor sets nor its dynamic state -- each chunk sets up
+    // everything its own draws need from scratch, exactly like the
+    // whole-pass callback used to do once per execute() call.
+    VkCommandBuffer cmd = ctx.chunkCommandBuffer();
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scene.litPass.pipeline);
     VkDescriptorSet set = scene.bindlessTable.descriptorSet();
-    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scene.litPass.layoutBundle.layout, 0, 1, &set,
-                             0, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scene.litPass.layoutBundle.layout, 0, 1, &set, 0,
+                             nullptr);
 
     VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.renderArea.width), static_cast<float>(ctx.renderArea.height),
                          0.0F, 1.0F};
     VkRect2D scissor{{0, 0}, ctx.renderArea};
-    vkCmdSetViewport(ctx.cmd, 0, 1, &viewport);
-    vkCmdSetScissor(ctx.cmd, 0, 1, &scissor);
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    for (uint32_t i = 0; i < kObjectCount; ++i) {
+    // Ceil-division slice of [0, kObjectCount) this chunk owns -- ascending
+    // chunkIndex claims ascending object indices, covering every object
+    // exactly once across chunkCount chunks regardless of how many there
+    // are (including chunkCount == 1, which claims all of them, in chunk 0
+    // alone -- the fully-serial degenerate case).
+    const uint32_t objectsPerChunk = (kObjectCount + chunkCount - 1) / chunkCount;
+    const uint32_t begin = std::min(chunkIndex * objectsPerChunk, kObjectCount);
+    const uint32_t end = std::min(begin + objectsPerChunk, kObjectCount);
+
+    for (uint32_t i = begin; i < end; ++i) {
         const SceneObject& obj = kObjects[i];
         const GpuMesh& mesh = scene.meshes[static_cast<size_t>(obj.shape)];
 
@@ -1410,14 +1457,14 @@ void recordLitDraws(rx::graph::PassContext& ctx, Scene& scene) {
         push.transformIndex = scene.currentFrameInFlightIndex * kObjectCount + i;
         push.shadowTextureIndex = scene.shadowMapHandle.index();
         push.shadowSamplerIndex = scene.samplerHandle.index();
-        vkCmdPushConstants(ctx.cmd, scene.litPass.layoutBundle.layout, scene.litPass.pushConstantStages,
+        vkCmdPushConstants(cmd, scene.litPass.layoutBundle.layout, scene.litPass.pushConstantStages,
                            scene.litPass.pushConstantOffset, scene.litPass.pushConstantSize, &push);
 
         VkBuffer vertexBuffer = mesh.buffers->vertexBuffer();
         VkDeviceSize vertexOffset = 0;
-        vkCmdBindVertexBuffers(ctx.cmd, 0, 1, &vertexBuffer, &vertexOffset);
-        vkCmdBindIndexBuffer(ctx.cmd, mesh.buffers->indexBuffer(), 0, mesh.buffers->indexType());
-        vkCmdDrawIndexed(ctx.cmd, mesh.buffers->indexCount(), 1, 0, 0, 0);
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &vertexOffset);
+        vkCmdBindIndexBuffer(cmd, mesh.buffers->indexBuffer(), 0, mesh.buffers->indexType());
+        vkCmdDrawIndexed(cmd, mesh.buffers->indexCount(), 1, 0, 0, 0);
     }
 }
 
@@ -1467,7 +1514,9 @@ void declareGraph(rx::graph::RenderGraph& graph, Scene& scene, VkFormat backbuff
         .addTextureInput("shadowmap")
         .addColorOutput("hdr", swapchainRelativeDesc(kHdrFormat))
         .setDepthStencilOutput("depth", swapchainRelativeDesc(kDepthFormat))
-        .setExecute([&scene](rx::graph::PassContext& ctx) { recordLitDraws(ctx, scene); });
+        .setExecuteChunked([&scene](rx::graph::PassContext& ctx, uint32_t chunkIndex, uint32_t chunkCount) {
+            recordLitDrawsChunked(ctx, scene, chunkIndex, chunkCount);
+        });
 
     graph.addPass("tonemap")
         .addTextureInput("hdr")
@@ -1577,7 +1626,19 @@ int runHeadless(bool enableValidation) {
         return 1;
     }
 
-    auto executor = rx::graph::Executor::create(*device);
+    // Phase 4 Task 7 [spec D4 amendment]: parallelism is the engine default
+    // now, not an opt-in mode -- Executor::create() requires a real
+    // rx::task::Scheduler&. Worker default (Scheduler::create(0)): this
+    // sample is a standalone consumer that owns the whole machine, exactly
+    // the case that default is for (docs/threading.md's "Host-engine
+    // coexistence" section).
+    auto scheduler = rx::task::Scheduler::create();
+    if (scheduler == nullptr) {
+        RX_LOG_ERROR("rx::task::Scheduler::create failed");
+        return 1;
+    }
+
+    auto executor = rx::graph::Executor::create(*device, *scheduler);
     if (executor == nullptr) {
         RX_LOG_ERROR("rx::graph::Executor::create failed");
         return 1;
@@ -1958,7 +2019,15 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode) {
         return 1;
     }
 
-    auto executor = rx::graph::Executor::create(*device);
+    // Phase 4 Task 7 [spec D4 amendment] -- see runHeadless()'s identically-
+    // worded comment above.
+    auto scheduler = rx::task::Scheduler::create();
+    if (scheduler == nullptr) {
+        RX_LOG_ERROR("rx::task::Scheduler::create failed");
+        return 1;
+    }
+
+    auto executor = rx::graph::Executor::create(*device, *scheduler);
     if (executor == nullptr) {
         RX_LOG_ERROR("rx::graph::Executor::create failed");
         return 1;

@@ -161,6 +161,7 @@
 #include <rx_rhi_vk/device.h>
 #include <rx_rhi_vk/frame_sync.h>
 #include <rx_rhi_vk/upload.h>
+#include <rx_task/scheduler.h>
 
 // ============================================================================
 // rx_material INTERNAL BRIDGE -- #include section (BEGIN)
@@ -959,8 +960,34 @@ rx::graph::AttachmentDesc swapchainRelativeDesc(VkFormat format) {
     return desc;
 }
 
-// Records all 4 objects' draws for the single "forward" pass. Binds
-// descriptor SET 0 (the bindless table) exactly once, right after the
+// Phase 4 Task 7 [spec D4 amendment]: CHUNKED -- migrated from a single
+// whole-pass setExecute() callback to setExecuteChunked() (declareGraph()
+// below), but with ALL of its real work deliberately kept in chunk 0 alone
+// (chunks [1, chunkCount) are legitimate, intentional no-ops for this
+// sample). This is NOT a half-measure: rx::material::MaterialSystem::
+// bindInstance() -- which bindAndGetLayout() below calls for every object,
+// every frame, to resolve its pipeline and stream its per-frame parameter
+// UBO -- is main-thread-only, no exception (docs/threading.md: "every other
+// method on this type"), and rx_material exposes no split "resolve on main,
+// record the bind commands anywhere" API this task's scope could build on
+// (bindInstance() couples both into one call, deliberately, per Phase 3's
+// own design). setExecuteChunked()'s chunk 0 is the one place this pass CAN
+// safely call it: chunk 0 is guaranteed to run synchronously, on the
+// calling (main) thread, before any other chunk begins [pass.h: Pass::
+// setExecuteChunked()'s own doc comment] -- discovered load-bearing while
+// writing this exact migration, and documented there in full.
+//
+// samples/05_multipass's forward pass has no such constraint (its own
+// per-object work -- push constants + vertex/index binds + draws -- never
+// touches MaterialSystem at all) and DOES fan real work out across every
+// chunk; this sample's genuinely different constraint is exactly why the
+// two migrations do not look alike, even though both use
+// setExecuteChunked(). The parallel-recording INFRASTRUCTURE (secondary
+// command buffers, per-thread pools, vkCmdExecuteCommands) is still fully
+// exercised on every commit either way -- chunks 1..chunkCount-1 still get
+// a real (empty) secondary recorded and stitched in.
+//
+// Binds descriptor SET 0 (the bindless table) exactly once, right after the
 // first object's own pipeline is bound -- safe because every material this
 // sample loads shares the IDENTICAL VkDescriptorSetLayout for set 0 (the
 // same `bindlessTable.descriptorSetLayout()` handle, passed to every
@@ -980,18 +1007,27 @@ rx::graph::AttachmentDesc swapchainRelativeDesc(VkFormat format) {
 // only that object's draw for this one frame. Every OTHER object (sharing
 // neither the edited file nor, in headless mode, ever exercising this path
 // at all) keeps rendering normally.
-void recordDraws(rx::graph::PassContext& ctx, Scene& scene) {
+void recordDrawsChunked(rx::graph::PassContext& ctx, Scene& scene, uint32_t chunkIndex, uint32_t /*chunkCount*/) {
+    if (chunkIndex != 0) {
+        // Nothing to do -- see this function's own header comment. The
+        // executor still records (and stitches in) this chunk's own real,
+        // if empty, secondary command buffer regardless.
+        return;
+    }
+
+    VkCommandBuffer cmd = ctx.chunkCommandBuffer();
+
     VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.renderArea.width), static_cast<float>(ctx.renderArea.height),
                          0.0F, 1.0F};
     VkRect2D scissor{{0, 0}, ctx.renderArea};
-    vkCmdSetViewport(ctx.cmd, 0, 1, &viewport);
-    vkCmdSetScissor(ctx.cmd, 0, 1, &scissor);
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
 
     bool bindlessSetBound = false;
     for (ObjectGpu& object : scene.objects) {
         VkPipelineLayout layout = VK_NULL_HANDLE;
         try {
-            layout = materialBridge::bindAndGetLayout(scene.materialSystem, ctx.cmd, ctx, object.material, object.instance);
+            layout = materialBridge::bindAndGetLayout(scene.materialSystem, cmd, ctx, object.material, object.instance);
         } catch (const std::exception& e) {
             RX_LOG_ERROR("sample_06_materials: bindAndGetLayout failed for material '{}': {} -- skipping this "
                          "object's draw for this frame (keep-last-good)",
@@ -1001,19 +1037,19 @@ void recordDraws(rx::graph::PassContext& ctx, Scene& scene) {
 
         if (!bindlessSetBound) {
             VkDescriptorSet bindlessSet = scene.bindlessTable->descriptorSet();
-            vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, /*firstSet=*/0, 1, &bindlessSet, 0,
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, /*firstSet=*/0, 1, &bindlessSet, 0,
                                      nullptr);
             bindlessSetBound = true;
         }
 
         VkBuffer vertexBuffer = object.vertexBuffer->handle();
         VkDeviceSize vertexOffset = static_cast<VkDeviceSize>(scene.currentFrameInFlightIndex) * object.vertexBytesPerFrame;
-        vkCmdBindVertexBuffers(ctx.cmd, 0, 1, &vertexBuffer, &vertexOffset);
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &vertexOffset);
 
         const rx::rhi::Buffer& indexBuffer = (object.shape == Shape::Cube) ? *scene.cubeIndexBuffer : *scene.sphereIndexBuffer;
         const uint32_t indexCount = (object.shape == Shape::Cube) ? scene.cubeIndexCount : scene.sphereIndexCount;
-        vkCmdBindIndexBuffer(ctx.cmd, indexBuffer.handle(), 0, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(ctx.cmd, indexCount, 1, 0, 0, 0);
+        vkCmdBindIndexBuffer(cmd, indexBuffer.handle(), 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cmd, indexCount, 1, 0, 0, 0);
     }
 }
 
@@ -1021,7 +1057,9 @@ void declareGraph(rx::graph::RenderGraph& graph, Scene& scene, VkFormat backbuff
     graph.addPass("forward")
         .addColorOutput("backbuffer", swapchainRelativeDesc(backbufferFormat))
         .setDepthStencilOutput("depth", swapchainRelativeDesc(kDepthFormat))
-        .setExecute([&scene](rx::graph::PassContext& ctx) { recordDraws(ctx, scene); });
+        .setExecuteChunked([&scene](rx::graph::PassContext& ctx, uint32_t chunkIndex, uint32_t chunkCount) {
+            recordDrawsChunked(ctx, scene, chunkIndex, chunkCount);
+        });
     graph.setBackbufferSource("backbuffer");
 }
 
@@ -1200,7 +1238,19 @@ int runHeadless(bool enableValidation) {
         return 1;
     }
 
-    auto executor = rx::graph::Executor::create(*device);
+    // Phase 4 Task 7 [spec D4 amendment]: parallelism is the engine default
+    // now, not an opt-in mode -- Executor::create() requires a real
+    // rx::task::Scheduler&. Worker default (Scheduler::create(0)): this
+    // sample is a standalone consumer that owns the whole machine, exactly
+    // the case that default is for (docs/threading.md's "Host-engine
+    // coexistence" section).
+    auto scheduler = rx::task::Scheduler::create();
+    if (scheduler == nullptr) {
+        RX_LOG_ERROR("rx::task::Scheduler::create failed");
+        return 1;
+    }
+
+    auto executor = rx::graph::Executor::create(*device, *scheduler);
     if (executor == nullptr) {
         RX_LOG_ERROR("rx::graph::Executor::create failed");
         return 1;
@@ -1501,7 +1551,15 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode) {
         return 1;
     }
 
-    auto executor = rx::graph::Executor::create(*device);
+    // Phase 4 Task 7 [spec D4 amendment] -- see runHeadless()'s identically-
+    // worded comment above.
+    auto scheduler = rx::task::Scheduler::create();
+    if (scheduler == nullptr) {
+        RX_LOG_ERROR("rx::task::Scheduler::create failed");
+        return 1;
+    }
+
+    auto executor = rx::graph::Executor::create(*device, *scheduler);
     if (executor == nullptr) {
         RX_LOG_ERROR("rx::graph::Executor::create failed");
         return 1;
