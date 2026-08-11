@@ -24,3 +24,6 @@ add_executable(rx_platform_tests
 )
 target_link_libraries(rx_platform_tests PRIVATE rx_platform doctest::doctest)
 add_test(NAME rx_platform_tests COMMAND rx_platform_tests)
+# Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+# (windows-cross Wine hang, run 31512073559).
+set_tests_properties(rx_platform_tests PROPERTIES TIMEOUT 120)

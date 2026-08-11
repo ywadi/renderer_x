@@ -46,3 +46,6 @@ add_custom_command(TARGET sample_02_hotreload POST_BUILD
 # The binary also supports --present mode for interactive windowed
 # rendering with live shader editing (see main.cpp / samples/README.md).
 add_test(NAME sample_02_hotreload_headless COMMAND sample_02_hotreload --validate)
+# Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+# (windows-cross Wine hang, run 31512073559).
+set_tests_properties(sample_02_hotreload_headless PROPERTIES TIMEOUT 300)

@@ -189,3 +189,6 @@ add_executable(rx_shader_tests
 target_link_libraries(rx_shader_tests PRIVATE rx_shader doctest::doctest)
 rx_shader_deploy_runtime_libs(rx_shader_tests)
 add_test(NAME rx_shader_tests COMMAND rx_shader_tests)
+# Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+# (windows-cross Wine hang, run 31512073559).
+set_tests_properties(rx_shader_tests PROPERTIES TIMEOUT 120)

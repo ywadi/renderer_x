@@ -45,6 +45,9 @@ target_compile_definitions(rx_material_gpu_tests PRIVATE
 # CHECK_FALSE(context.hasValidationErrors())); this binary's own fixtures
 # build every rx::rhi::Context with enableValidation=true unconditionally.
 add_test(NAME rx_material_gpu_tests COMMAND rx_material_gpu_tests --validate)
+# Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+# (windows-cross Wine hang, run 31512073559).
+set_tests_properties(rx_material_gpu_tests PROPERTIES TIMEOUT 300)
 
 # Task 6 [spec Phase 3 design D5]: rx_api.h's COM-lite ABI contract is the
 # first genuinely device-free surface this library has (queryInterface
@@ -67,3 +70,6 @@ add_executable(rx_material_tests
 target_link_libraries(rx_material_tests PRIVATE rx_material doctest::doctest)
 rx_shader_deploy_runtime_libs(rx_material_tests)
 add_test(NAME rx_material_tests COMMAND rx_material_tests)
+# Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+# (windows-cross Wine hang, run 31512073559).
+set_tests_properties(rx_material_tests PROPERTIES TIMEOUT 120)

@@ -11,6 +11,9 @@ add_executable(rx_graph_tests
 )
 target_link_libraries(rx_graph_tests PRIVATE rx_graph doctest::doctest)
 add_test(NAME rx_graph_tests COMMAND rx_graph_tests)
+# Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+# (windows-cross Wine hang, run 31512073559).
+set_tests_properties(rx_graph_tests PROPERTIES TIMEOUT 120)
 
 # Task 3: GPU-backed Executor tests -- a real headless-but-validated
 # rx::rhi::Device (via rx::platform::Window, exactly like
@@ -48,3 +51,6 @@ rx_shader_deploy_runtime_libs(rx_graph_gpu_tests)
 # here is documentation/consistency with the rest of this repo's GPU-gate
 # invocations, not a behavior switch doctest itself reads.
 add_test(NAME rx_graph_gpu_tests COMMAND rx_graph_gpu_tests --validate)
+# Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+# (windows-cross Wine hang, run 31512073559).
+set_tests_properties(rx_graph_gpu_tests PROPERTIES TIMEOUT 300)

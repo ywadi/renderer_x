@@ -59,3 +59,6 @@ add_custom_command(TARGET sample_06_materials POST_BUILD
 # orbiting camera and material hot-reload polling (see main.cpp /
 # samples/README.md).
 add_test(NAME sample_06_materials_headless COMMAND sample_06_materials --validate)
+# Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+# (windows-cross Wine hang, run 31512073559).
+set_tests_properties(sample_06_materials_headless PROPERTIES TIMEOUT 300)

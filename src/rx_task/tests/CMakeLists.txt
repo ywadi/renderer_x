@@ -7,3 +7,6 @@ add_executable(rx_task_tests
 )
 target_link_libraries(rx_task_tests PRIVATE rx_task doctest::doctest)
 add_test(NAME rx_task_tests COMMAND rx_task_tests)
+# Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+# (windows-cross Wine hang, run 31512073559).
+set_tests_properties(rx_task_tests PROPERTIES TIMEOUT 120)

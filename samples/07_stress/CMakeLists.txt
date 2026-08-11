@@ -47,3 +47,6 @@ add_custom_command(TARGET sample_07_stress POST_BUILD
 # (this test) vs. wall-clock (published separately, never CI-blocking) is
 # exactly why this is safe to keep small and deterministic.
 add_test(NAME sample_07_stress_headless COMMAND sample_07_stress --validate --draws 16)
+# Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+# (windows-cross Wine hang, run 31512073559).
+set_tests_properties(sample_07_stress_headless PROPERTIES TIMEOUT 300)

@@ -36,3 +36,6 @@ add_custom_command(TARGET sample_01_triangle POST_BUILD
 # of the default end-user behavior, which is headless with validation OFF.
 # The binary also supports --present mode for interactive windowed rendering.
 add_test(NAME sample_01_triangle_headless COMMAND sample_01_triangle --validate)
+# Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+# (windows-cross Wine hang, run 31512073559).
+set_tests_properties(sample_01_triangle_headless PROPERTIES TIMEOUT 300)

@@ -21,3 +21,6 @@ rx_shader_deploy_runtime_libs(sample_04_streaming)
 # The binary also supports --present mode for interactive windowed
 # rendering with a continuously cycling grid (see main.cpp / samples/README.md).
 add_test(NAME sample_04_streaming_headless COMMAND sample_04_streaming --validate)
+# Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+# (windows-cross Wine hang, run 31512073559).
+set_tests_properties(sample_04_streaming_headless PROPERTIES TIMEOUT 300)

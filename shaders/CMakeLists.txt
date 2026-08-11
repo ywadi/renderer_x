@@ -41,3 +41,6 @@ target_compile_definitions(shader_spirv_test PRIVATE
 )
 add_dependencies(shader_spirv_test triangle_shaders)
 add_test(NAME shader_spirv_test COMMAND shader_spirv_test)
+# Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+# (windows-cross Wine hang, run 31512073559).
+set_tests_properties(shader_spirv_test PROPERTIES TIMEOUT 120)
