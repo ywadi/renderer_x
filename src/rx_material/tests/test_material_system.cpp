@@ -6,19 +6,23 @@
 #include <rx_rhi_vk/context.h>
 #include <rx_rhi_vk/device.h>
 
+#include <rx_core/debug_checks.h>
 #include <rx_graph/executor.h>
 #include <rx_graph/render_graph.h>
 #include <rx_task/scheduler.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -841,6 +845,299 @@ TEST_CASE("MaterialSystem::bindInstance rejects a paramSize that does not match 
     destroyOffscreenColorImage(fixture->device.device(), *offscreen);
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
+
+#ifdef RX_DEBUG_CHECKS
+// --- RX_ASSERT_MAIN_THREAD integration [Phase 4 Task 7 fix round 1, review
+// Medium finding] ------------------------------------------------------------
+// Proves the guard placed at the very top of MaterialSystem::bindInstance()
+// (and, transitively, the one inside getPipeline() it calls internally) is
+// genuinely wired into the real rx_graph/rx_task chunked-pass machinery --
+// not just unit-testable in isolation (rx_core's own debug_checks_test.cpp
+// covers the mechanism itself with a plain std::thread). Both cases install
+// a capture hook (rx::core::debug::detail::setViolationHookForTests) that
+// RECORDS a violation and returns normally rather than aborting/throwing --
+// documented as safe here for the exact reason debug_checks.h's own
+// ViolationHook contract comment requires: each TEST_CASE below arranges for
+// only ONE thread to ever touch this MaterialSystem's shared, unsynchronized
+// state during the one execute() call it makes (every chunk but the single
+// one under test is a deliberate no-op), so letting a violating call
+// continue past the guard never races a REAL concurrent access here, even
+// though the hook does not itself prevent it.
+namespace {
+
+struct BindInstanceGuardCapture {
+    std::mutex mutex;
+    std::vector<std::string> contexts;
+};
+
+std::atomic<BindInstanceGuardCapture*> g_bindInstanceCapture{nullptr};
+
+void captureBindInstanceViolation(const char* context) {
+    BindInstanceGuardCapture* capture = g_bindInstanceCapture.load(std::memory_order_relaxed);
+    if (capture == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(capture->mutex);
+    capture->contexts.emplace_back(context != nullptr ? context : "");
+}
+
+// RAII guard mirroring log_test.cpp's ForwardCallbackGuard/debug_checks_test.
+// cpp's ViolationHookGuard: restores the production default (abort-on-
+// violation) on scope exit regardless of how the TEST_CASE exits, so a
+// left-over capture hook can never swallow a real violation in a later test.
+struct BindInstanceGuardHookScope {
+    ~BindInstanceGuardHookScope() {
+        g_bindInstanceCapture.store(nullptr, std::memory_order_relaxed);
+        rx::core::debug::detail::setViolationHookForTests(nullptr);
+    }
+};
+
+bool contextsContain(const std::vector<std::string>& contexts, const std::string& needle) {
+    for (const std::string& context : contexts) {
+        if (context == needle) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+TEST_CASE("MaterialSystem::bindInstance's RX_ASSERT_MAIN_THREAD guard does not fire for the legal chunk-0-only "
+          "call (chunk 0 always runs synchronously on the main thread, per spec D4's chunk-0 guarantee)") {
+    auto fixture = makeFixture("rx_material_bind_instance_guard_legal");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto system = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+                                                          freshCachePath("bind_instance_guard_legal"));
+    REQUIRE(system != nullptr);
+
+    rx::material::MaterialHandle handle = system->loadMaterial(testDataPath("test_unlit.slang"));
+    uint32_t blockSize = system->paramBlockSize(handle);
+    REQUIRE(blockSize > 0);
+    std::vector<uint8_t> blob(blockSize, 0);
+    const std::vector<rx::material::MaterialParamInfo>& params = system->materialParams(handle);
+    REQUIRE(params.size() == 1);
+    float tint[4] = {0.1F, 0.2F, 0.3F, 1.0F};
+    std::memcpy(blob.data() + params[0].offset, tint, sizeof(tint));
+    rx::material::InstanceBinding binding{handle, blob.data(), blob.size()};
+
+    auto scheduler = rx::task::Scheduler::create();
+    REQUIRE(scheduler != nullptr);
+    auto executor = rx::graph::Executor::create(fixture->device, *scheduler);
+    REQUIRE(executor != nullptr);
+
+    constexpr VkExtent2D kExtent{64, 64};
+    constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+
+    rx::graph::RenderGraph graph;
+    rx::graph::AttachmentDesc colorDesc;
+    colorDesc.format = kColorFormat;
+    std::atomic<uint32_t> chunk0Calls{0};
+    graph.addPass("bind_instance_guard_legal")
+        .addColorOutput("color", colorDesc)
+        .setExecuteChunked([&](rx::graph::PassContext& ctx, uint32_t chunkIndex, uint32_t /*chunkCount*/) {
+            if (chunkIndex != 0) {
+                return;  // every non-zero chunk is a deliberate no-op for this test.
+            }
+            chunk0Calls.fetch_add(1, std::memory_order_relaxed);
+            system->beginFrame(/*frameInFlightIndex=*/0, /*frameNumber=*/0);
+            system->bindInstance(ctx.chunkCommandBuffer(), ctx, binding);
+        });
+    graph.setBackbufferSource("color");
+
+    rx::graph::CompileInfo compileInfo;
+    compileInfo.swapchainWidth = kExtent.width;
+    compileInfo.swapchainHeight = kExtent.height;
+    compileInfo.swapchainFormat = kColorFormat;
+    compileInfo.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    graph.compile(compileInfo);
+    executor->realize(graph);
+
+    BindInstanceGuardCapture capture;
+    g_bindInstanceCapture.store(&capture, std::memory_order_relaxed);
+    rx::core::debug::detail::setViolationHookForTests(&captureBindInstanceViolation);
+    BindInstanceGuardHookScope hookScope;
+
+    auto offscreen =
+        createOffscreenColorImage(fixture->device.device(), fixture->device.physicalDevice(), kColorFormat, kExtent);
+    REQUIRE(offscreen.has_value());
+    {
+        auto cmdCtx = rx::rhi::CommandContext::create(fixture->device.device(), fixture->device.graphicsQueue(),
+                                                        fixture->device.graphicsQueueFamily());
+        REQUIRE(cmdCtx.has_value());
+        cmdCtx->runOnce(
+            [&](VkCommandBuffer cmd) { executor->execute(graph, cmd, offscreen->image, offscreen->view, kExtent); });
+    }
+    CHECK(chunk0Calls.load() == 1);
+
+    {
+        std::lock_guard<std::mutex> lock(capture.mutex);
+        CHECK(capture.contexts.empty());
+    }
+
+    destroyOffscreenColorImage(fixture->device.device(), *offscreen);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("MaterialSystem::bindInstance's RX_ASSERT_MAIN_THREAD guard fires, naming bindInstance, for an illegal "
+          "call that actually lands on a thread other than the main thread (claimed via CAS by whichever chunk "
+          "gets there first -- deterministic regardless of enkiTS's own real split/steal order, unlike fixating "
+          "on one specific chunk index, which empirically always got run on the main thread itself for this "
+          "pass's own recursive-split shape)") {
+    auto fixture = makeFixture("rx_material_bind_instance_guard_illegal");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto system = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+                                                          freshCachePath("bind_instance_guard_illegal"));
+    REQUIRE(system != nullptr);
+
+    rx::material::MaterialHandle handle = system->loadMaterial(testDataPath("test_unlit.slang"));
+    uint32_t blockSize = system->paramBlockSize(handle);
+    REQUIRE(blockSize > 0);
+    std::vector<uint8_t> blob(blockSize, 0);
+    const std::vector<rx::material::MaterialParamInfo>& params = system->materialParams(handle);
+    REQUIRE(params.size() == 1);
+    float tint[4] = {0.4F, 0.5F, 0.6F, 1.0F};
+    std::memcpy(blob.data() + params[0].offset, tint, sizeof(tint));
+    rx::material::InstanceBinding binding{handle, blob.data(), blob.size()};
+
+    // A generous worker count (6, well above most dev/CI machines' own
+    // hardware-derived default) so chunkCountForWorkerCount() derives 6
+    // chunks -- chunks [1, 6) fan out across 6 real background workers
+    // (already parked on a semaphore per docs/threading.md, so they wake
+    // essentially immediately). See the CAS-claim design below for why this
+    // test no longer depends on any SPECIFIC chunk index actually landing
+    // on a worker (an earlier revision fixated on chunkCount - 1, the last
+    // chunk, which -- empirically, across 15/15 real runs -- always ran on
+    // the calling/main thread itself for this exact pass shape: enkiTS's
+    // own recursive parallelFor split keeps the rightmost remaining slice
+    // for the calling thread to finish directly rather than handing it to
+    // a worker, which is a real, useful property of the scheduler, not a
+    // bug -- it just makes "the last chunk" a bad choice for "a chunk that
+    // is likely on a worker").
+    auto scheduler = rx::task::Scheduler::create(/*workerCount=*/6);
+    REQUIRE(scheduler != nullptr);
+    auto executor = rx::graph::Executor::create(fixture->device, *scheduler);
+    REQUIRE(executor != nullptr);
+
+    constexpr VkExtent2D kExtent{64, 64};
+    constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+
+    rx::graph::RenderGraph graph;
+    rx::graph::AttachmentDesc colorDesc;
+    colorDesc.format = kColorFormat;
+
+    const std::thread::id mainThreadId = std::this_thread::get_id();
+
+    // CAS-claimed: whichever chunk callback FIRST observes "I am not
+    // running on the main thread" wins the right to be the one and only
+    // illegal caller this execute() call makes -- every other chunk,
+    // including any other one that also happens to run on a worker, backs
+    // off instead of also calling bindInstance(). This is real mutual
+    // exclusion (compare_exchange_strong on `claimed`), not a probabilistic
+    // hope: it is what makes it safe to let the guard's test hook record-
+    // and-return (rather than abort) here -- at most one thread EVER
+    // touches this MaterialSystem's shared, unsynchronized state during
+    // this one call, by construction, regardless of how many chunks
+    // actually land on real workers.
+    std::atomic<bool> claimed{false};
+    std::mutex recordedThreadMutex;
+    std::optional<std::thread::id> recordedThreadId;
+    std::atomic<uint32_t> illegalChunkCalls{0};
+
+    graph.addPass("bind_instance_guard_illegal")
+        .addColorOutput("color", colorDesc)
+        .setExecuteChunked([&](rx::graph::PassContext& ctx, uint32_t chunkIndex, uint32_t /*chunkCount*/) {
+            if (chunkIndex == 0) {
+                return;  // chunk 0 stays untouched -- this scenario is exclusively about chunk >= 1.
+            }
+            if (std::this_thread::get_id() == mainThreadId) {
+                return;  // this particular chunk landed on the main thread -- legal either way; not a candidate.
+            }
+            bool expected = false;
+            if (!claimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+                return;  // some other chunk already claimed the one illegal call this test makes.
+            }
+            illegalChunkCalls.fetch_add(1, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lock(recordedThreadMutex);
+                recordedThreadId = std::this_thread::get_id();
+            }
+            // Deliberately illegal: bindInstance() is main-thread-only
+            // (docs/threading.md D5) and this callback has already proven
+            // (above) it is running on a genuine non-main thread -- exactly
+            // the contract violation RX_ASSERT_MAIN_THREAD exists to
+            // catch. Safe to let continue past the guard here (see this
+            // TEST_CASE's own header comment): the CAS claim above
+            // guarantees no other thread touches `system` for the rest of
+            // this execute() call.
+            system->beginFrame(/*frameInFlightIndex=*/0, /*frameNumber=*/0);
+            system->bindInstance(ctx.chunkCommandBuffer(), ctx, binding);
+        });
+    graph.setBackbufferSource("color");
+
+    const uint32_t expectedChunkCount = rx::graph::detail::chunkCountForWorkerCount(scheduler->workerCount());
+    REQUIRE(expectedChunkCount >= 2);
+
+    rx::graph::CompileInfo compileInfo;
+    compileInfo.swapchainWidth = kExtent.width;
+    compileInfo.swapchainHeight = kExtent.height;
+    compileInfo.swapchainFormat = kColorFormat;
+    compileInfo.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    graph.compile(compileInfo);
+    executor->realize(graph);
+
+    BindInstanceGuardCapture capture;
+    g_bindInstanceCapture.store(&capture, std::memory_order_relaxed);
+    rx::core::debug::detail::setViolationHookForTests(&captureBindInstanceViolation);
+    BindInstanceGuardHookScope hookScope;
+
+    auto offscreen =
+        createOffscreenColorImage(fixture->device.device(), fixture->device.physicalDevice(), kColorFormat, kExtent);
+    REQUIRE(offscreen.has_value());
+    {
+        auto cmdCtx = rx::rhi::CommandContext::create(fixture->device.device(), fixture->device.graphicsQueue(),
+                                                        fixture->device.graphicsQueueFamily());
+        REQUIRE(cmdCtx.has_value());
+        cmdCtx->runOnce(
+            [&](VkCommandBuffer cmd) { executor->execute(graph, cmd, offscreen->image, offscreen->view, kExtent); });
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(capture.mutex);
+        if (claimed.load(std::memory_order_acquire)) {
+            // The common, expected case with 5 chunks racing across 6 real
+            // background workers: at least one landed on a genuine worker
+            // and claimed the illegal call -- the guard must have fired,
+            // naming bindInstance (and, transitively, getPipeline(), which
+            // bindInstance() calls internally and carries the identical
+            // guard -- both firing on this one violating call is expected,
+            // not a double-count bug).
+            CHECK(illegalChunkCalls.load() == 1);
+            REQUIRE(recordedThreadId.has_value());
+            CHECK(*recordedThreadId != mainThreadId);
+            CHECK(contextsContain(capture.contexts, "MaterialSystem::bindInstance"));
+            CHECK(contextsContain(capture.contexts, "MaterialSystem::getPipeline"));
+        } else {
+            // Degenerate case, not expected in practice (5 items racing
+            // across 6 parked workers) but handled rather than assumed
+            // away: no chunk ever observed itself running on a non-main
+            // thread, so no illegal call was made at all this run -- the
+            // guard correctly never fired.
+            CHECK(illegalChunkCalls.load() == 0);
+            CHECK(capture.contexts.empty());
+        }
+    }
+
+    destroyOffscreenColorImage(fixture->device.device(), *offscreen);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+#endif  // RX_DEBUG_CHECKS
 
 // --- createTexture2D()/textureBindlessIndex()/releaseTexture() -----------
 // [Task 7 coordinator addition 4].
