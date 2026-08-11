@@ -536,3 +536,185 @@ edits):
   `parallelFor()`'s output), and every pre-existing timing-sensitive test
   was re-confirmed flake-free under the same constrained-CPU conditions
   round 1's fix was validated against.
+
+## Audit-closure round (Stage 0 exit gate)
+
+Commit: `d444064` (base `a5e7dbf`), branch `main`, not pushed.
+
+### F1 (HIGH, TSAN-reproduced use-after-free) — fixed
+
+**Upstream-vs-wrapper decision: wrapper fix — no upstream fix exists to
+port.** Checked directly before writing any code: cloned
+`github.com/dougbinks/enkiTS.git` master (`ccd4e8c`, 5 commits ahead of
+the pinned `v1.12` tag) and diffed `AddPinnedTaskInt`
+(`TaskScheduler.cpp:899-913`) against the pinned source — byte-identical.
+`git blame` on that exact range: last touched 2021-04-19 (`788dc62d`); the
+5 commits between `v1.12` and master are all zig-build/CI/DLL-install
+packaging, none touching `TaskScheduler.cpp`'s scheduling logic. Searched
+upstream issues for related reports (`gh api search/issues`): found #52
+("ThreadSanitizer reports", closed 2020 — a different, already-fixed
+false-positive in the *task-set pipe*'s `ReaderTryReadBack`/
+`WriterTryWriteFront`, unrelated to pinned tasks) and #48 ("Pinned task
+problem", closed 2020 — a different, already-fixed *liveness*/lost-wakeup
+bug, not a memory-safety one). Neither addresses this hazard. Proceeded to
+the audit's fallback: a wrapper-side two-phase delete.
+
+**Mechanism (verified against source, not assumed):**
+`TaskScheduler::AddPinnedTaskInt` publishes a pinned task to its dequeue
+list (`WriterWriteFront`, `TaskScheduler.cpp:902`) and THEN reads
+`pTask_->threadNum` twice more (`:904`, `:907`) on the SUBMITTER's own
+thread, to decide which semaphore to signal. The instant the task is
+published, the IO thread may dequeue it, run `Execute()`, push it to the
+reap list, and (with the pre-fix code) delete it — all before the
+submitting thread's own call to `AddPinnedTask()` finishes those two
+extra reads. This is a genuine use-after-free reachable under exactly the
+documented, legal usage `scheduler.h` already described ("safe to call
+from any thread, including concurrently from several threads at once and
+from within a parallelFor() chunk") — no destructor race needed.
+
+**Fix:** `IoTask` gained an atomic `published_` flag. `runOnIoThread()`
+calls `task->markPublished()` (release-store) strictly AFTER
+`AddPinnedTask()` returns — by construction, after enkiTS's own extra
+reads have already happened on that same thread. The IO thread's reaper
+(`IoLoopTask::reapPublished()`) checks `isPublished()` (acquire-load)
+before ever deleting a task, deferring anything not yet published to the
+next reap cycle instead. `~Scheduler()`'s existing defense-in-depth drain
+(fix round 1) was extended the same way, for both its `outstandingIo` and
+`trash_` sweeps, so the same guarantee holds at teardown too — with a
+separate `leaked` (not `dropped`) tally for the — expected to never
+actually trigger — case of a task whose submitter has not yet published
+by the time every thread is joined.
+
+**TSAN reproduction** (scratch build: unmodified/then-fixed
+`scheduler.cpp` + `scheduler.h`, no-op shim `rx_core/log.h`/`profile.h`,
+pinned enkiTS v1.12's `TaskScheduler.cpp` — all compiled with
+`-fsanitize=thread -O1 -g`; TSAN's own `mmap`/ASLR incompatibility on this
+host worked around with `setarch $(uname -m) -R`, not by disabling
+anything sanitizer-relevant). Harness: 20 `Scheduler(workerCount=4)`
+lifetimes, each running `parallelFor(4000, 1, fn)` where `fn` calls
+`runOnIoThread()` once per item in its `[begin,end)` range (not once per
+chunk — enkiTS's actual chunk count is driven by its own
+`m_NumPartitions`, thread-count-derived, independent of `grainSize`; a
+per-chunk call would only yield ~35 concurrent submitters per scheduler,
+still enough to race but confusingly under-labeled against the intended
+"4000" — found and corrected while building this harness, documented in
+both the harness and the new in-tree test).
+
+```
+Pre-fix,  4 consecutive runs: races = 4, 4, 4, 3   (functional: 20/20 schedulers fully completed every run)
+Post-fix, 10 consecutive runs: races = 0 (all 10)  (functional: 20/20 schedulers fully completed every run)
+```
+
+Representative pre-fix trace (one of the 3-4 per run, all identical in
+shape):
+```
+WARNING: ThreadSanitizer: data race
+  Write of size 8 ... by thread T5:
+    #0 operator delete(void*)
+    #1 rx::task::(anonymous namespace)::IoLoopTask::Execute() scheduler.cpp:118
+    #2 enki::TaskScheduler::RunPinnedTasks(...) TaskScheduler.cpp:964
+    ...
+  Previous read of size 4 ... by thread T1:
+    #0 enki::TaskScheduler::AddPinnedTaskInt(enki::IPinnedTask*) TaskScheduler.cpp:904
+    #1 enki::TaskScheduler::AddPinnedTask(enki::IPinnedTask*) TaskScheduler.cpp:920
+    #2 rx::task::Scheduler::runOnIoThread(std::function<void ()>) scheduler.cpp:354
+    ...
+SUMMARY: ThreadSanitizer: data race ... in operator delete(void*)
+```
+Exact match to the audit's own citation (`AddPinnedTaskInt` at
+`TaskScheduler.cpp:904` racing `delete`/`~IoTask` at `scheduler.cpp:118`).
+
+**New in-tree test:** `"Scheduler::runOnIoThread survives many CONCURRENT
+submitters..."` — `parallelFor(4000, 1, fn)` with `fn` calling
+`runOnIoThread()` once per item in its range, asserting all 4000 ran.
+Non-TSAN CI cannot observe the race itself, but this exercises the exact
+concurrent-publish pattern the fix closes — the audit's own stated reason
+for requiring it ("the review-time 200 trials/125k submissions probe
+measured *drops*, not lifetime").
+
+### F5-partial — `RX_ASSERT_MAIN_THREAD` on `Scheduler::pumpMain()`
+
+One line, exactly mirroring every other guarded call site in this
+codebase (`bindless.cpp`, `upload.cpp`, `material_system.cpp`,
+`deletion_queue.cpp`). Added to `docs/threading.md`'s "Main-thread-only"
+list as a new `[guarded]` entry. Test mirrors
+`rx_core/tests/debug_checks_test.cpp`'s own established pattern (plain
+`std::thread`, capture-hook, assert it fires naming `"Scheduler::
+pumpMain"`) — placed deliberately LAST in `scheduler_test.cpp` so several
+earlier tests' legitimate main-thread `pumpMain()` calls have already
+satisfied `assertMainThreadImpl()`'s lazy main-thread capture before this
+test's worker thread ever reaches the guard (the exact ordering hazard
+`debug_checks_test.cpp`'s own header comment discloses).
+
+### F6 (doc-only) — chunk ≥ 1 exceptions are process-fatal
+
+Documented at `rx_graph/include/rx_graph/pass.h`'s `setExecuteChunked()`
+(a full paragraph: enkiTS worker threads have no handler to catch into,
+so an uncaught exception on chunk ≥ 1 calls `std::terminate()` for the
+whole process, even though `PassContext`'s resolvers document throwing
+and are legal to call from any chunk) and mirrored in
+`docs/threading.md`'s "Worker-allowed" section, right after the existing
+chunk-0 exception paragraph. No code change — this round's brief scoped
+it as doc-only (a try/catch in `recordOneChunk` was the audit's
+alternative, not requested here).
+
+### F10 (doc-only) — executor self-pacing caller-discipline bound
+
+One paragraph added to `executor.h`'s `execute()` doc comment, naming the
+"≤ 1 execute() per real fence-bounded frame" bound explicitly at the
+public contract (previously only in `executor.cpp`'s own internal
+comment, per the audit's exact citation) — every in-tree caller already
+satisfies it; nothing enforces it.
+
+### Verification
+
+Full rebuild (both presets) after all four items — `pass.h`/`executor.h`
+are consumed broadly (rx_material, every sample, rx_graph's own tests), so
+this rebuilt 27 targets on each preset, zero errors, one pre-existing
+`_WIN32_WINNT` redefinition warning unrelated to this change (present
+identically on unrelated files like `render_graph.cpp`).
+
+`rx_task_tests`: 15/15 cases, 33942/33942 assertions, `SUCCESS!` — native,
+under Wine on windows-cross-zig, and (non-TSAN) flake discipline:
+```
+Unconstrained, 20 consecutive runs:      pass=20 fail=0
+`taskset -c 0,1`, 20 consecutive runs:   pass=20 fail=0
+```
+
+Full repo suite, both presets, zero regressions (now 17/17, up from 16 —
+`sample_07_stress_headless` landed between rounds via a different task):
+- `ctest --preset linux-native`: 17/17 passed (45.7s).
+- `ctest --preset windows-cross-zig` (Wine emulator): 17/17 passed
+  (63.2s).
+
+Validation: `ctest -R "gpu|multipass|materials|stress"` output grepped
+for `validation error`/`VUID` — zero matches, confirming the audit's own
+"zero validation errors" baseline is unaffected by this round's changes.
+
+### Audit-closure concerns
+
+- F1's fix closes the exact hazard the audit reproduced and cited by line
+  number; it does not attempt to also solve the separate, narrower
+  theoretical window already disclosed in round 1 (a submitter whose
+  `AddPinnedTask()` call is still in flight, on another thread, at the
+  exact instant `~Scheduler()` reaches its final drain) beyond leaking
+  (not deleting) anything caught in that state — deleting it without the
+  publish guarantee would simply reopen F1's own race by another name.
+- Building the TSAN harness surfaced a real but SEPARATE (non-bug)
+  gotcha, documented in both the harness and the new test's own comments
+  so it is not rediscovered: `grainSize` is a floor, not a target —
+  enkiTS's actual steady-state chunk size is `itemCount / m_NumPartitions`
+  (thread-count-derived), so a large `itemCount` with `grainSize=1` does
+  NOT itself produce `itemCount` separate chunks. Not a defect in
+  `parallelFor()` (this is enkiTS's own, correct, documented-by-source
+  work-stealing granularity, and every existing in-tree test already
+  accounted for it correctly by looping per-item inside a chunk rather
+  than assuming one callback per item) — flagged here only because it
+  cost real debugging time to rediscover while building this task's own
+  TSAN harness, and a future reader hitting the same "why did my chunk
+  count come out lower than itemCount" surprise should find the answer
+  documented rather than rediscovering it.
+- F6/F10 were scoped doc-only per this round's brief; the audit's own
+  alternative fixes (a try/catch in `recordOneChunk`, a debug counter
+  cross-check for the pacing bound) remain unimplemented, recorded rather
+  than silently dropped.
