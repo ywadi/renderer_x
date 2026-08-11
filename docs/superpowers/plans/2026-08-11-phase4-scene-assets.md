@@ -125,6 +125,64 @@ and its closure record are in the ledger.**
 
 ## STAGE 1 — Asset Pipeline
 
+### Task 9 (PRIMARY GATE): Ticket completeness research & hardening
+
+**User-mandated 2026-08-11.** Before ANY Stage 1/2 implementation, every
+Phase 4 ticket is deepened from its current vague form into a detailed,
+production-grade specification measured against what first-tier renderers
+(Filament, bgfx, Godot, the glTF 2.0 spec in full, Unreal/Unity feature
+expectations) actually require. The feature-gap audit found MISSING
+capabilities; this gate hardens the capabilities that ARE planned but
+under-specified. It is a research + coordinator-authoring task, NOT
+implementation.
+
+**Process (research gathers, coordinator authors — per the standing
+mandate):**
+1. Fable/Sonnet research agents produce, per ticket, a completeness
+   matrix: [required feature] × [first-tier-renderer precedent] ×
+   [consume-now / preserve-for-later / log-don't-drop / genuinely-N/A for
+   Phase 4] × [does our chosen library actually support it, cited]. Every
+   claim cited; the library's real capability (e.g. fastgltf's actual
+   per-extension support, and which need external decode libs) verified,
+   not assumed.
+2. The coordinator rewrites each ticket body + the corresponding plan
+   task with concrete, exhaustive acceptance criteria from that matrix —
+   nothing vague survives.
+3. Any newly-surfaced missing capability is registered (feature-gap
+   register) with a phase fit, same as the prior audits.
+
+**Coverage bar — all Phase 4 tickets, Stage 1 blocking, Stage 2 hardened
+in the same pass:**
+- **glTF import (#2)** is the worked example of the depth required. The
+  rule (established 2026-08-11): a renderer need not *render* every glTF
+  feature in Phase 4, but it MUST (a) **decode** whatever is needed to
+  open the file at all — **compression is non-negotiable: EXT_meshopt_
+  compression (gltfpack's output, the de-facto shipping format;
+  meshoptimizer's decode is already vendored), KHR_mesh_quantization,
+  KHR_draco_mesh_compression** — a file that won't load is not "partial
+  import," it is a broken importer; (b) **preserve** what later phases
+  consume — **animation channels/samplers and morph targets**, same
+  seed-14 economics as skinning/lights/cameras; (c) **log, never silently
+  drop** everything else — KHR_texture_transform, image-source variants
+  (external-URI / data-URI / .glb-bufferView), `extras` application JSON
+  (game devs' own data), non-triangle primitive modes, and every
+  KHR_materials_* extension beyond core. The hardened #2 enumerates each
+  with its disposition.
+- Every other ticket (GeometryPool, KTX2, async import, StandardPBR,
+  window state, scene, draw lists/culling, layers, input, ImGui, shadows,
+  sample 09) gets the same treatment against its domain's first-tier bar
+  (e.g. StandardPBR vs the full glTF metallic-roughness + the interim
+  ambient FG1 + which KHR_materials_* to support-or-log; texture pipeline
+  vs all glTF image sources + colorspace correctness; input vs the full
+  gamepad/keyboard/mouse surface real games need).
+
+**Exit:** every Phase 4 ticket carries exhaustive acceptance criteria
+grounded in a cited completeness matrix; the matrices are committed to
+the SDD workspace; the feature-gap register absorbs any new findings.
+This gate is COMPLETE before Task 10 (GeometryPool) dispatches. (Tasks
+10+ below are the former Tasks 9+, renumbered by this insertion.)
+
+
 ### Task 9: GeometryPool (D8/D9)
 
 **Files:** Create `src/rx_asset/{CMakeLists.txt,include/rx_asset/geometry_pool.h,geometry_pool.cpp,tests/...}`.
