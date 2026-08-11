@@ -686,6 +686,71 @@ TEST_CASE("loadMaterial maps a real Slang compile failure to RX_E_COMPILE, never
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 
+// [Stage 0 audit F3 regression, GPU-backed half] api_impl.cpp:534 used to
+// construct std::filesystem::path OUTSIDE loadMaterial()'s try block
+// (api_impl.cpp:548 also called path.string() inside the catch, which
+// would itself have been unreachable if construction is what threw). On
+// the windows-cross-zig target (path::value_type == wchar_t there), a
+// byte sequence invalid as UTF-8 makes that narrow->wide construction
+// throw std::system_error, unwinding straight across this ABI boundary.
+// The fix moved the construction inside the try and switched the
+// catch-side log to the raw `slangModulePath` const char*.
+//
+// This test calls the REAL, production loadMaterial() against a real
+// internal_ MaterialSystem (a real VkDevice) -- the device-free case in
+// test_api_contract.cpp cannot reach this construction line at all
+// (internal_ == nullptr short-circuits first there; see that test's own
+// comment), so THIS is the case that genuinely exercises the fixed code,
+// not merely a structural "returned a documented RxResult" check.
+//
+// Honesty note (stated once here, not re-derived elsewhere): on Linux/
+// libstdc++ (every POSIX libc++, in fact), std::filesystem::path::
+// value_type is `char`, so constructing a path from a `const char*` is a
+// straight byte copy with no narrow->wide conversion at all -- this exact
+// input can never actually throw std::system_error on this platform, on
+// either side of the fix. What this test DOES prove on Linux: the moved
+// construction still lets malformed byte content flow safely all the way
+// through to the real internal MaterialSystem's own file-open failure
+// (there is no file at this path), surfacing as the same documented
+// RX_E_COMPILE a genuine Slang compile failure produces (see the test
+// immediately above), never a crash or an uncaught exception. The
+// std::system_error-specific half of F3 is windows-cross-only and
+// verified here only by inspection of the fix itself -- this repo's CI
+// has no windows-cross GPU job to run a device-backed test like this one
+// against on that target (Stage 0 audit's own F8 observation).
+TEST_CASE("loadMaterial against a real internal MaterialSystem rejects a byte sequence invalid as UTF-8 as the "
+          "module path with a documented error code, never throws or terminates") {
+    auto fixture = makeFixture("rx_api_factory_malformed_path");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto internal = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+                                                            freshCachePath("api_malformed_path"));
+    REQUIRE(internal != nullptr);
+
+    RxMaterialSystemDesc desc{internal.get()};
+    IRxMaterialSystem* system = nullptr;
+    REQUIRE(rxCreateMaterialSystem(&desc, &system) == RX_OK);
+
+    uint64_t liveBefore = rx::material::detail::debugLiveApiObjectCount();
+
+    // Same malformed byte sequence as test_api_contract.cpp's device-free
+    // case -- see that test's own comment for why each byte is invalid
+    // UTF-8 and why the NUL sits only at the true end.
+    const char kMalformedUtf8Path[] = {'b', 'a', 'd', '_', static_cast<char>(0xFF), static_cast<char>(0xFE),
+                                        static_cast<char>(0x80), '.', 's', 'l', 'a', 'n', 'g', '\0'};
+
+    IRxMaterial* material = reinterpret_cast<IRxMaterial*>(static_cast<uintptr_t>(0x1));  // poisoned
+    RxResult result = system->loadMaterial(kMalformedUtf8Path, &material);
+    CHECK(result == RX_E_COMPILE);
+    CHECK(material == nullptr);
+    CHECK(rx::material::detail::debugLiveApiObjectCount() == liveBefore);
+
+    system->release();
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
 TEST_CASE("entry-point audit: IRxMaterialInstance's three setters return a documented RxResult across "
           "normal/edge/malformed inputs against a real instance, never crash") {
     auto fixture = makeFixture("rx_api_factory_setter_audit");

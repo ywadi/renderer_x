@@ -1111,13 +1111,53 @@ MaterialSystem::~MaterialSystem() {
         }
     }
 
-    // [Task 7] Any still-live TextureRecord's rx::rhi::Texture2D is torn
-    // down by plain RAII when `impl_` itself is destroyed just after this
-    // function returns -- safe specifically because vkDeviceWaitIdle()
-    // above already ran first, so no in-flight command buffer can still
-    // reference one. Nothing further to do here (unlike materials/
-    // pipelines, a Texture2D owns no raw handle this destructor needs to
-    // vkDestroy by hand).
+    // [Stage 0 audit follow-on, found while regression-testing F2] A
+    // still-live TextureRecord's rx::rhi::Texture2D must be torn down HERE,
+    // explicitly, not left to plain RAII when `impl_` itself is destroyed
+    // just after this function returns: `impl.textures` (this struct's
+    // `HandlePool<TextureTag, TextureRecord>`) is declared BEFORE
+    // `impl.allocator` above, so ordinary reverse-declaration-order member
+    // destruction would tear `allocator` down FIRST -- while a still-live
+    // Texture2D's own destructor (running afterward, as part of
+    // `impl.textures`' own destruction) still needs that exact
+    // `VmaAllocator` to call `vmaDestroyImage` through. That is a real,
+    // reproducible use-after-free (confirmed via a scratch VMA debug build:
+    // "Some allocations were not freed before destruction of this memory
+    // block!" at `allocator`'s own teardown, followed by a crash once
+    // `textures` finally runs its own destructors against the
+    // already-destroyed allocator) for ANY texture a caller never
+    // explicitly released before dropping the MaterialSystem -- e.g. an app
+    // that shuts down with textures still bound to live materials, a
+    // completely ordinary sequence nothing before this stopped to test.
+    // See this destructor's own materialHandles loop just above for why
+    // this re-derives each `TextureRecord*` fresh via `textures.get()`
+    // rather than a vector of pointers gathered earlier -- identical
+    // HandlePool-reallocation hazard, identical fix.
+    //
+    // Releasing the bindless slot unconditionally here (like
+    // `defaultSamplerHandle` just below) rather than deferring it through
+    // `deletionQueue` is correct specifically BECAUSE vkDeviceWaitIdle()
+    // above already ran: bindless.h's own release-safety contract (see
+    // releaseTexture()'s own comment for the general, still-in-flight
+    // case F2 exists to fix) only requires deferring past the point no
+    // in-flight command buffer could still be dynamically indexing the
+    // slot -- device-idle already IS that point, unconditionally.
+    for (TextureHandle handle : impl.textureHandles) {
+        TextureRecord* record = impl.textures.get(handle);
+        if (record == nullptr) {
+            continue;  // already released (releaseTexture()) before shutdown.
+        }
+        if (record->bindlessHandle.isValid()) {
+            impl.bindless->release(record->bindlessHandle);
+        }
+        // Moving the real Texture2D into this loop-scoped local and letting
+        // it go out of scope at the end of THIS iteration runs its real
+        // vkDestroyImageView/vmaDestroyImage teardown right here, while
+        // `impl.allocator`/`impl.device` are unquestionably still alive --
+        // never leaving it to `impl.textures`' own later, wrongly-ordered
+        // implicit destruction.
+        rx::rhi::Texture2D doomed = std::move(record->texture);
+    }
 
     // [Task 4] Return the default sampler's slot to `bindless`'s free list
     // (safe -- see bindless.h's own RELEASE-SAFETY CONTRACT -- and good
@@ -1843,11 +1883,23 @@ void MaterialSystem::releaseTexture(TextureHandle handle) {
         return;
     }
 
-    // Per bindless.h's own RELEASE-SAFETY CONTRACT: returning the slot to
-    // the free list now is safe (it never rewrites/destroys anything a
-    // pending command buffer might still read); the real Texture2D/VkImage/
-    // VkImageView teardown is what must wait for the GPU, deferred below.
-    impl.bindless->release(record->bindlessHandle);
+    // [Stage 0 audit F2] bindless.h's own RELEASE-SAFETY CONTRACT (see that
+    // header's comment above BindlessTable::release()) is explicit that
+    // release()-then-immediately-register() into the SAME freed index is a
+    // spec violation unless the slot's return to the free list waits for
+    // the same fence-confirmed point the real resource teardown already
+    // waits for -- the table's free list is LIFO, so a premature release()
+    // here would hand this exact slot back out to the very next
+    // createTexture2D() call deterministically, not rarely, while a still
+    // in-flight frame's draws could still be dynamically indexing it.
+    // Folding the release() into the SAME DeletionQueue-retired closure as
+    // the Texture2D teardown below (rather than calling it eagerly, right
+    // here) defers both to the identical fence-confirmed point; the
+    // closure runs on the main thread from onFrameCompleted(), so
+    // BindlessTable::release()'s RX_ASSERT_MAIN_THREAD guard stays
+    // satisfied exactly like it did when this call ran here directly.
+    rx::rhi::BindlessTable* bindless = impl.bindless;
+    rx::rhi::BindlessHandle bindlessHandle = record->bindlessHandle;
 
     // DeletionQueue's own std::function-copy-constructibility requirement
     // (deletion_queue.h's own header comment): wrap the moved-out,
@@ -1855,8 +1907,15 @@ void MaterialSystem::releaseTexture(TextureHandle handle) {
     // copy-constructible.
     auto texturePtr = std::make_shared<rx::rhi::Texture2D>(std::move(record->texture));
     impl.textures.release(handle);
-    impl.deletionQueue.retire([texturePtr]() { /* dropping the last shared_ptr ref destroys the Texture2D. */ },
-                               impl.currentFrameNumber);
+    impl.deletionQueue.retire(
+        [bindless, bindlessHandle, texturePtr]() {
+            // Returns the slot to bindless's free list only now that this
+            // frame's fence has actually signaled -- see this function's
+            // own comment above for why that timing is load-bearing.
+            bindless->release(bindlessHandle);
+            // Dropping the last shared_ptr ref destroys the Texture2D.
+        },
+        impl.currentFrameNumber);
 }
 
 }  // namespace rx::material

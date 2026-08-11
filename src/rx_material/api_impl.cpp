@@ -136,10 +136,38 @@ public:
 
     uint32_t RX_CALL addRef() override { return refCount_.fetch_add(1, std::memory_order_relaxed) + 1; }
 
+    // [Stage 0 audit F3] `delete` here runs Derived's real destructor chain
+    // -- e.g. TextureImpl::~TextureImpl() -> MaterialSystem::releaseTexture()
+    // -> DeletionQueue::retire(), which allocates (std::function type
+    // erasure + vector::push_back). A real, if rare, std::bad_alloc (or any
+    // other exception a future destructor down this chain might throw) must
+    // never unwind out of release() and across the ABI -- docs/abi.md rule
+    // 3 ("no exceptions across the boundary") applies here exactly like it
+    // does to every RxResult-returning method, even though release()'s own
+    // return type has no error channel to report through. Logged and
+    // swallowed, not rethrown or retried: the refcount already hit zero
+    // (this object's contract with every caller is already "gone" the
+    // instant this function was entered), so there is no well-defined
+    // "half-deleted" state to recover into -- leaking the object outright
+    // is strictly safer than calling delete a second time on a Derived*
+    // whose destructor may have partially run.
     uint32_t RX_CALL release() override {
         uint32_t remaining = refCount_.fetch_sub(1, std::memory_order_acq_rel) - 1;
         if (remaining == 0) {
-            delete static_cast<Derived*>(this);
+            try {
+                delete static_cast<Derived*>(this);
+            } catch (const std::exception& e) {
+                RX_LOG_ERROR(
+                    "rx_material: rx_api: release(): destructor threw while destroying an object at refcount "
+                    "zero; the object is leaked (not deleted a second time) rather than risk operating on a "
+                    "partially-destroyed instance: {}",
+                    e.what());
+            } catch (...) {
+                RX_LOG_ERROR(
+                    "rx_material: rx_api: release(): destructor threw a non-std::exception value while "
+                    "destroying an object at refcount zero; the object is leaked (not deleted a second time) "
+                    "rather than risk operating on a partially-destroyed instance");
+            }
         }
         return remaining;
     }
@@ -531,8 +559,20 @@ RxResult RX_CALL MaterialSystemImpl::loadMaterial(const char* slangModulePath, I
         return RX_E_FAIL;
     }
 
-    std::filesystem::path path(slangModulePath);
     try {
+        // [Stage 0 audit F3] `std::filesystem::path`'s constructor is not
+        // exception-free for every input on every ABI this project targets:
+        // on the windows-cross-zig target, `path::value_type` is `wchar_t`,
+        // so constructing from a narrow `const char*` runs a codecvt-based
+        // narrow->wide conversion that throws `std::system_error` on a byte
+        // sequence that is not valid UTF-8 -- untrusted caller input, not
+        // only an OOM path. Constructing `path` INSIDE this try (previously
+        // it lived outside, unguarded) is what actually catches that. The
+        // raw `slangModulePath` (never `path.string()`, which cannot be
+        // called below if construction itself is what threw) is what the
+        // catch clause logs.
+        std::filesystem::path path(slangModulePath);
+
         // [Task 7] No more separate reflection-only pass to run first --
         // MaterialSystem::loadMaterial() itself now computes every field's
         // name/kind/offset/size from the SAME already-linked program that
@@ -545,7 +585,7 @@ RxResult RX_CALL MaterialSystemImpl::loadMaterial(const char* slangModulePath, I
         *outMaterial = material;
         return RX_OK;
     } catch (const std::exception& e) {
-        RX_LOG_ERROR("rx_material: rx_api: loadMaterial('{}') failed: {}", path.string(), e.what());
+        RX_LOG_ERROR("rx_material: rx_api: loadMaterial('{}') failed: {}", slangModulePath, e.what());
         return RX_E_COMPILE;
     }
 }

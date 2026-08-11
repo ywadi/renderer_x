@@ -139,6 +139,15 @@ static_assert(sizeof(RxTextureDesc) == 32,
               "RxTextureDesc must stay exactly 32 bytes (pixels:8 + pixelBytes:8 + width:4 + height:4 + format:4 + "
               "generateMips:4, no padding on any ABI this project targets) -- pinned so a caller can construct it "
               "as a plain aggregate on either side of the boundary.");
+// [Stage 0 audit F7] docs/abi.md's own Parameter Blocks rule requires BOTH
+// a sizeof and an alignof static_assert per boundary-crossing struct --
+// only sizeof was pinned above. `pixels` (a pointer) and `pixelBytes`
+// (uint64_t) are this struct's widest members, so its alignment is 8 on
+// every ABI this project targets (the same 8-byte-pointer assumption the
+// sizeof pin above already bakes in).
+static_assert(alignof(RxTextureDesc) == 8,
+              "RxTextureDesc's alignment must stay pinned at 8 (driven by its 8-byte pixels pointer/pixelBytes "
+              "field) -- a change here could shift this struct's own already-pinned 32-byte size via padding.");
 
 // --- IRxMaterialInstance: one material's bound-parameter set -----------
 // setFloat/setFloat4/setTexture validate `name` against the owning
@@ -266,6 +275,14 @@ struct RxMaterialSystemDesc {
 static_assert(sizeof(RxMaterialSystemDesc) == sizeof(void*),
               "RxMaterialSystemDesc must stay exactly one pointer wide -- it is passed by pointer across the ABI "
               "and a caller may construct it as a plain aggregate on either side.");
+// [Stage 0 audit F7] Same rationale as RxTextureDesc's alignof pin above --
+// docs/abi.md requires both sizeof and alignof for every boundary struct.
+// Expressed relative to `alignof(void*)`, mirroring this struct's own
+// sizeof pin above (`sizeof(void*)`, not a fixed literal), since its one
+// member IS a `void*`.
+static_assert(alignof(RxMaterialSystemDesc) == alignof(void*),
+              "RxMaterialSystemDesc's alignment must match a bare pointer's -- it is passed by pointer across the "
+              "ABI and a caller may construct it as a plain aggregate on either side.");
 
 // RX_E_INVALIDARG if `desc` or `outSystem` is null. On success,
 // `*outSystem` is a new IRxMaterialSystem with refcount 1 (the caller

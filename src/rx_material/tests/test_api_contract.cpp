@@ -149,6 +149,51 @@ TEST_CASE("loadMaterial on a device-free IRxMaterialSystem fails safely (RX_E_FA
     system->release();
 }
 
+// [Stage 0 audit F3 regression, device-free half] api_impl.cpp:534 used to
+// construct std::filesystem::path OUTSIDE loadMaterial()'s try block --
+// on the windows-cross-zig target (path::value_type == wchar_t there), a
+// byte sequence invalid as UTF-8 makes that narrow->wide construction
+// throw std::system_error, which would unwind straight across this ABI
+// boundary uncaught. The fix moved that construction inside the try.
+//
+// This device-free case (internal_ == nullptr) is the honest boundary of
+// what a device-free test CAN prove here: loadMaterial()'s own
+// internal_ == nullptr guard (this file's own header comment; see the
+// "fails safely" test above) returns RX_E_FAIL before ever reaching the
+// path construction line at all, on every input, malformed or not -- so
+// this test does not, and cannot, exercise the actual moved-into-try
+// construction. What it DOES prove: a byte sequence invalid as UTF-8
+// flowing into loadMaterial()'s argument, on a device-free instance,
+// still comes back as a plain documented RxResult, never a crash. The
+// case that genuinely exercises the fixed construction line (a real
+// internal_ MaterialSystem, which needs a real VkDevice) lives in
+// test_api_factory.cpp instead ("loadMaterial against a real internal
+// MaterialSystem rejects a malformed-UTF-8 ... module path"), which also
+// states honestly why even that GPU-backed case cannot force the
+// std::system_error half on Linux (path::value_type == char there; no
+// narrow->wide conversion ever runs) -- that half of F3 is
+// windows-cross-only and verified by inspection of the fix, not by a
+// runnable test in this repo (no windows-cross GPU job exists to run one
+// against, per the Stage 0 audit's own F8 observation).
+TEST_CASE("loadMaterial on a device-free instance rejects a byte sequence invalid as UTF-8 with a documented "
+          "error code, never throws or crashes") {
+    IRxMaterialSystem* system = makeDeviceFreeSystem();
+
+    // 0xFF/0xFE are not valid UTF-8 leading bytes; 0x80 is a lone
+    // continuation byte with no leading byte before it -- all three make
+    // this byte sequence invalid UTF-8 without embedding a NUL (which
+    // would just truncate the C string instead of exercising this case).
+    const char kMalformedUtf8Path[] = {'b', 'a', 'd', '_', static_cast<char>(0xFF), static_cast<char>(0xFE),
+                                        static_cast<char>(0x80), '.', 's', 'l', 'a', 'n', 'g', '\0'};
+
+    IRxMaterial* material = reinterpret_cast<IRxMaterial*>(static_cast<uintptr_t>(0x1));  // poisoned
+    RxResult result = system->loadMaterial(kMalformedUtf8Path, &material);
+    CHECK(result == RX_E_FAIL);
+    CHECK(material == nullptr);
+
+    system->release();
+}
+
 TEST_CASE("loadMaterial rejects null slangModulePath/outMaterial with RX_E_INVALIDARG before touching internal "
           "state") {
     IRxMaterialSystem* system = makeDeviceFreeSystem();

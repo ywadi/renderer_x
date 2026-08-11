@@ -1249,6 +1249,96 @@ TEST_CASE("MaterialSystem::createTexture2D registers a real bindless-indexed tex
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 
+// [Stage 0 audit F2 regression] releaseTexture() used to call
+// impl.bindless->release(record->bindlessHandle) immediately, returning the
+// slot to BindlessTable's free list right away even though the real
+// Texture2D/VkImage/VkImageView teardown correctly waited for
+// onFrameCompleted() -- a release-then-createTexture2D within the
+// frames-in-flight window could hand that exact slot straight back out to
+// a NEW registration while a still in-flight frame's draws were still
+// dynamically indexing it (bindless.h:140-149's own release-safety
+// contract). The fix folds the bindless release into the SAME
+// DeletionQueue-retired closure as the real teardown.
+//
+// This test discriminates the fix from the bug the same way bindless.h's
+// own contract comment does: rx::core::HandlePool's free list is LIFO
+// (handle.h's acquire()/release()), so a premature release is not a rare
+// race here -- it is the deterministic next-registration outcome. Filling
+// the fixture's BindlessTable sampled-image capacity (4, see makeFixture()
+// above) completely, releasing exactly one slot, then trying to register
+// MORE textures than that single freed slot could ever satisfy turns "did
+// the slot come back too early" into an observable throw/no-throw, not a
+// probabilistic one.
+TEST_CASE("MaterialSystem::releaseTexture defers returning the bindless slot itself to the free list until "
+          "onFrameCompleted, not just the real Texture2D teardown") {
+    auto fixture = makeFixture("rx_material_release_slot_deferred");
+    if (!fixture.has_value()) {
+        return;
+    }
+    auto system = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+                                                          freshCachePath("release_slot_deferred"));
+    REQUIRE(system != nullptr);
+
+    constexpr uint32_t kWidth = 2;
+    constexpr uint32_t kHeight = 2;
+    std::vector<uint8_t> pixels(static_cast<size_t>(kWidth) * kHeight * 4, 0);
+
+    rx::material::TextureCreateInfo info;
+    info.width = kWidth;
+    info.height = kHeight;
+    info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    info.generateMips = false;
+    info.pixels = pixels.data();
+    info.pixelBytes = pixels.size();
+
+    // Fixture's own BindlessTable::Capacities.sampledImages == 4 -- fill it
+    // completely. MaterialSystem::create() itself only ever registers a
+    // SAMPLER (the default sampler), never a sampled image, so all 4
+    // sampled-image slots are available here (see makeFixture()/
+    // MaterialSystem::create()'s own registerSampler() call).
+    std::vector<rx::material::TextureHandle> handles;
+    for (int i = 0; i < 4; ++i) {
+        rx::material::TextureHandle h = system->createTexture2D(info);
+        REQUIRE(h.isValid());
+        handles.push_back(h);
+    }
+    uint32_t releasedIndex = system->textureBindlessIndex(handles[2]);
+
+    system->beginFrame(/*frameInFlightIndex=*/0, /*frameNumber=*/42);
+    system->releaseTexture(handles[2]);
+
+    // If the slot were returned to bindless's free list immediately (the
+    // pre-fix bug), the very next createTexture2D() would succeed and
+    // reuse it -- LIFO, so deterministically EXACTLY `releasedIndex`, not
+    // some other slot. With the fix, the slot has not come back yet (no
+    // onFrameCompleted() has run at all): every attempt below must fail
+    // with capacity exhausted, exactly as if nothing had ever been
+    // released. Two attempts, not one, per this regression's own "enough
+    // to exhaust the free list if the slot were recycled early" framing.
+    CHECK_THROWS_AS(static_cast<void>(system->createTexture2D(info)), std::runtime_error);
+    CHECK_THROWS_AS(static_cast<void>(system->createTexture2D(info)), std::runtime_error);
+
+    // An earlier frame number must not run this retirement either (mirrors
+    // the existing createTexture2D test's own "not yet actually destroyed"
+    // check) -- the slot must still not be back.
+    system->onFrameCompleted(41);
+    CHECK_THROWS_AS(static_cast<void>(system->createTexture2D(info)), std::runtime_error);
+
+    // NOW genuinely safe: this frame's fence has signaled.
+    system->onFrameCompleted(42);
+
+    // The slot is back -- and, per the free list's own LIFO order, it is
+    // handed out to the very next registration, landing on the EXACT index
+    // that was released above (not merely "some" slot becoming available),
+    // positively confirming this is the deferred release actually taking
+    // effect.
+    rx::material::TextureHandle reused = system->createTexture2D(info);
+    CHECK(reused.isValid());
+    CHECK(system->textureBindlessIndex(reused) == releasedIndex);
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
 TEST_CASE("MaterialSystem::createTexture2D rejects zero width/height and null/empty pixel data") {
     auto fixture = makeFixture("rx_material_create_texture_invalid");
     if (!fixture.has_value()) {

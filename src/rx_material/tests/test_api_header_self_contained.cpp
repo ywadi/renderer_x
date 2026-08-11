@@ -16,11 +16,52 @@
 
 static_assert(sizeof(RxGuid) == 16, "rx_api.h's own pinned RxGuid size -- re-checked here so this self-containment "
                                      "TU actually exercises the type, not just names it");
+static_assert(alignof(RxGuid) == 4, "rx_api.h's own pinned RxGuid alignment -- re-checked here for the same reason");
 static_assert(sizeof(RxMaterialSystemDesc) == sizeof(void*),
               "rx_api.h's own pinned RxMaterialSystemDesc size -- re-checked here for the same reason");
+// [Stage 0 audit F7] RxMaterialSystemDesc/RxTextureDesc's own pinned
+// alignments -- re-checked here for the identical reason every sizeof
+// pin in this file already is (this file's own header comment).
+static_assert(alignof(RxMaterialSystemDesc) == alignof(void*),
+              "rx_api.h's own pinned RxMaterialSystemDesc alignment -- re-checked here for the same reason");
 // [Task 7] RxTextureDesc's own pinned size -- same re-check discipline.
 static_assert(sizeof(RxTextureDesc) == 32, "rx_api.h's own pinned RxTextureDesc size -- re-checked here for the "
                                             "same reason");
+static_assert(alignof(RxTextureDesc) == 8,
+              "rx_api.h's own pinned RxTextureDesc alignment -- re-checked here for the same reason");
+
+// [Stage 0 audit F7] "No GUID-uniqueness test exists across the five
+// kIID_* constants (manually verified unique)" -- replaced here with an
+// enforced compile-time proof instead of a one-time manual check.
+// `guidEquals()` compares RxGuid's 4 members field-by-field (no padding to
+// worry about -- see the pinned static_asserts above) so every one of the
+// 10 pairwise comparisons below is a plain constexpr equality, no
+// runtime/doctest dependency needed -- fitting this file's own established
+// "successful compilation IS the test" style.
+constexpr bool guidEquals(const RxGuid& a, const RxGuid& b) {
+    return a.data1 == b.data1 && a.data2 == b.data2 && a.data3 == b.data3 && a.data4[0] == b.data4[0] &&
+           a.data4[1] == b.data4[1] && a.data4[2] == b.data4[2] && a.data4[3] == b.data4[3] &&
+           a.data4[4] == b.data4[4] && a.data4[5] == b.data4[5] && a.data4[6] == b.data4[6] &&
+           a.data4[7] == b.data4[7];
+}
+
+static_assert(!guidEquals(kIID_IRxUnknown, kIID_IRxTexture), "kIID_IRxUnknown/kIID_IRxTexture must differ");
+static_assert(!guidEquals(kIID_IRxUnknown, kIID_IRxMaterialInstance),
+              "kIID_IRxUnknown/kIID_IRxMaterialInstance must differ");
+static_assert(!guidEquals(kIID_IRxUnknown, kIID_IRxMaterial), "kIID_IRxUnknown/kIID_IRxMaterial must differ");
+static_assert(!guidEquals(kIID_IRxUnknown, kIID_IRxMaterialSystem),
+              "kIID_IRxUnknown/kIID_IRxMaterialSystem must differ");
+static_assert(!guidEquals(kIID_IRxTexture, kIID_IRxMaterialInstance),
+              "kIID_IRxTexture/kIID_IRxMaterialInstance must differ");
+static_assert(!guidEquals(kIID_IRxTexture, kIID_IRxMaterial), "kIID_IRxTexture/kIID_IRxMaterial must differ");
+static_assert(!guidEquals(kIID_IRxTexture, kIID_IRxMaterialSystem),
+              "kIID_IRxTexture/kIID_IRxMaterialSystem must differ");
+static_assert(!guidEquals(kIID_IRxMaterialInstance, kIID_IRxMaterial),
+              "kIID_IRxMaterialInstance/kIID_IRxMaterial must differ");
+static_assert(!guidEquals(kIID_IRxMaterialInstance, kIID_IRxMaterialSystem),
+              "kIID_IRxMaterialInstance/kIID_IRxMaterialSystem must differ");
+static_assert(!guidEquals(kIID_IRxMaterial, kIID_IRxMaterialSystem),
+              "kIID_IRxMaterial/kIID_IRxMaterialSystem must differ");
 
 namespace {
 
