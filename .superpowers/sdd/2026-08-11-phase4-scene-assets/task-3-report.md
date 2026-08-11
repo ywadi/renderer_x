@@ -1,5 +1,170 @@
 # Task 3 report: Tracy profiler client integration
 
+## Fix round 1 (post-review)
+
+Review (`task-3-review.md`, commit `460d7b6`): **Approved with findings** —
+spec ✅, 1 Medium + 1 Low sharing one root cause, 1 Informational (unchanged,
+still accepted as originally disclosed). This section documents the fix;
+the rest of this report is the original round-1 account, left intact below
+for the record — where the two disagree, this section is authoritative.
+
+**Root cause (Medium + Low):** this project's vendored Tracy was built with
+`TRACY_ON_DEMAND` left at Tracy's own default, OFF. Traced directly against
+the vendored v0.14.0 source (not assumed):
+
+- `ScopedZone::Name()` (`TracyScoped.hpp`, backing `RX_ZONE_DYNAMIC_NAME`)
+  and the dynamic-name `VkCtxScope` constructor (`TracyVulkan.hpp`, backing
+  `RX_GPU_ZONE_DYNAMIC`) both do a real `tracy_malloc()`/`AllocSourceLocation()`
+  + `memcpy()` on every call, gated only by `if (!m_active) return;` — and
+  with `TRACY_ON_DEMAND` off, `m_active` is unconditionally `is_active`,
+  never checked against `GetProfiler().IsConnected()`.
+- `VkCtx::Collect()` (`TracyVulkan.hpp`, backing `RX_GPU_COLLECT`) always
+  runs its real `vkGetQueryPoolResults` readback path; its own
+  `#ifdef TRACY_ON_DEMAND if (!GetProfiler().IsConnected()) { <cheap
+  reset only>; return; }` early-out branch was compiled out entirely.
+
+Both contradict D3's "passive (~no cost) until a profiler connects" and the
+brief's "no allocations" cheap-macro constraint — for these two macros and
+this one collect call specifically, not the plain `RX_ZONE`/`RX_ZONE_NAMED`/
+`RX_FRAME_MARK`/`RX_PLOT` macros, which the review independently confirmed
+were already lock-free-ring-buffer-only regardless of this flag.
+
+**Fix:** `third_party/CMakeLists.txt`'s Tracy `CMAKE_ARGS` now passes
+`-DTRACY_ON_DEMAND=ON` (alongside the existing `-DTRACY_ENABLE=ON
+-DTRACY_STATIC=ON`) — a dependency-build-time flag, so it required a fresh
+Tracy library build under a new dep-cache key (automatic; the dep-cache key
+is a hash of `CMAKE_ARGS`, so this is not a hand-invalidation). Tracy's own
+`set_option` macro applies `TRACY_ON_DEMAND` as a `PUBLIC` compile
+definition on `Tracy::TracyClient`, so it propagates to this project's own
+code the identical way `TRACY_ENABLE` already does — zero additional CMake
+wiring on this project's side. Documented at both dynamic-name macro
+declarations (`rx_core/profile.h`'s `RX_ZONE_DYNAMIC_NAME`, `rx_rhi_vk/tracy_gpu.h`'s
+`RX_GPU_ZONE_DYNAMIC`/`RX_GPU_COLLECT`) and in `third_party/CMakeLists.txt`'s
+own Tracy-vendoring comment, including the disclosed tradeoff: on-demand
+means the client buffers nothing before a profiler connects, so **capture
+history starts at connection time** — attaching mid-run shows zones from
+that point forward only, never retroactively.
+
+### Verification (fix round 1)
+
+**1. Disconnected passivity — empirical, both by source citation and by
+direct timing measurement.** Cited the exact early-out branches above (not
+re-asserted from the macro name). For the empirical half, built two tiny
+standalone probes in the scratchpad, linked against the project's own two
+already-built Tracy variants (`.deps-cache/tracy-e3a816522c42b4b5` =
+`TRACY_ENABLE` only, the exact pre-fix build; `.deps-cache/tracy-7fe6be05d35747f5`
+= `TRACY_ENABLE`+`TRACY_ON_DEMAND`, the fix), using the project's own
+zig-cxx-linux toolchain wrapper for ABI consistency, each running 2,000,000
+iterations of `ZoneScopedN("probe_zone"); ZoneName(dynamicName.data(), dynamicName.size());`
+with **no profiler ever connecting**:
+
+```
+without TRACY_ON_DEMAND (pre-fix):  ~49.0–50.1 ns/iteration  (3 runs, <2% variance)
+with    TRACY_ON_DEMAND (post-fix): ~1.93 ns/iteration       (3 runs, <0.1% variance)
+```
+
+A ~25× reduction. A malloc-call-counting `LD_PRELOAD` interposer was also
+tried first but turned out not to observe Tracy's real cost at all —
+`tracy_malloc` (`TracyAlloc.hpp`) resolves to `rpmalloc()`, Tracy's own
+bundled pool allocator, not libc `malloc()` (confirmed by reading the
+header) — so it is reported for completeness (flat ~0 calls in both builds,
+confirming rpmalloc's own page-growth isn't what scales with the loop) but
+the timing numbers above are the decisive evidence.
+
+Repeated the identical experiment through this project's **own**
+`rx_core/profile.h` macros (`RX_ZONE_NAMED`/`RX_ZONE_DYNAMIC_NAME`) with a
+third configuration — `TRACY_ENABLE` undefined entirely, the real
+`RX_TRACY=OFF` behavior — as the absolute zero-cost baseline:
+
+```
+RX_TRACY=OFF (TRACY_ENABLE undefined):              ~0.00 ns/iteration (loop fully optimized away, 3 runs)
+RX_TRACY=ON + TRACY_ON_DEMAND=ON, disconnected:      ~1.3–1.4 ns/iteration (3 runs)
+```
+
+~1.3 ns is a handful of CPU cycles (one atomic connection-id load plus a
+branch) — negligible in absolute terms and against the true no-Tracy
+baseline, and a ~36× reduction from the pre-fix raw-Tracy-macro measurement
+above. This satisfies the "cite the exact branch AND show a timing delta
+... being negligible" verification option in full, with the branch citation
+and the timing delta pointing at the identical mechanism.
+
+**2. Live capture re-done, connecting mid-run.** Ran
+`sample_05_multipass --present` under `xvfb-run` with the on-demand-fixed
+binaries, let it run **5 seconds with no profiler connected** (the passive
+phase this fix restores), then connected `tracy-capture` mid-run
+(8s capture window): 761 frames, 6,064 zones,
+(`/tmp/.../scratchpad/sample05_capture_ondemand.tracy`). `tracy-csvexport`
+confirms every zone this task placed still captures correctly
+post-connection, structurally identical to the round-1 capture:
+
+```
+graph_pass         executor.cpp:826   2274 counts (~3 passes x 758 frames)
+execute            executor.cpp:762    758 counts (once per frame)
+Collect            TracyVulkan.hpp:256 758 counts (RX_GPU_COLLECT firing once/frame post-connection)
+present            device.cpp:346      757 counts
+acquireNextImage   device.cpp:325      758 counts
+```
+
+GPU zones (`-g -u`): `forward`/`shadow`/`tonemap` (the real, dynamic
+per-pass names) — 757 each, with real captured GPU execution-time values —
+confirming per-pass dynamic naming, CPU and GPU, still works correctly with
+on-demand connection. Bonus confirmation of the disclosed tradeoff: the
+first captured GPU zone's own "time from start of program" timestamp is
+~14.2s into the process's life (it had been running ~5s passively plus
+connection/setup time before capture began) — capture genuinely starts at
+connection time, not process start, exactly as documented.
+
+**3. Full suite, both presets, both configurations — all green.** Fresh
+Tracy builds (new dep-cache keys, since `CMAKE_ARGS` changed) for both
+`RX_TRACY=ON` presets:
+
+```
+linux-native      (RX_TRACY=ON, on-demand):  16/16 passed (26.7s)
+windows-cross-zig (RX_TRACY=ON, on-demand):  16/16 passed (47.2s, Wine-executed)
+```
+
+`TracyTargets.cmake` for both fresh installs confirms
+`INTERFACE_COMPILE_DEFINITIONS "TRACY_ENABLE;TRACY_ON_DEMAND"`; both
+projects' own `compile_commands.json` show `TRACY_ON_DEMAND` on all 69
+Tracy-linked compile commands.
+
+Re-ran the `RX_TRACY=OFF` configuration fresh (new build tree): zero
+`[dep-cache]` Tracy activity, 16/16 tests passed (25.0s), zero `tracy::`/
+`___tracy_` symbols via `nm -C` across every binary/library, zero
+`TRACY_ENABLE`/`TRACY_ON_DEMAND` in `compile_commands.json`, no
+`TracyClient*` object anywhere in the build tree — identical clean result
+to round 1, confirmed again after the fix.
+
+**Zero validation errors, re-confirmed with the on-demand build:** re-ran
+`sample_05_multipass --present --validate` under sync validation with the
+new binaries — 19,900 `[vulkan validation]`-tagged lines, **all 19,900**
+carrying this codebase's own pre-existing `"(known false positive: ...)"`
+markers (the same three already-documented categories from round 1); zero
+unrecognized validation lines; zero non-validation `[error]` lines. Same
+clean result as round 1, unaffected by the on-demand change (expected — the
+fix touches only Tracy's own client-side behavior, not any Vulkan call this
+project makes).
+
+**4. Cost disclosure, honest before/after (this is the part round 1's
+report omitted and the review caught):**
+
+| | Before (round 1, as shipped) | After (this fix) |
+|---|---|---|
+| `RX_ZONE`/`RX_ZONE_NAMED`/`RX_FRAME_MARK`/`RX_PLOT`, disconnected | ~free (lock-free ring-buffer write only) | unchanged — still ~free |
+| `RX_ZONE_DYNAMIC_NAME`/`RX_GPU_ZONE_DYNAMIC`, disconnected | **real `malloc`+`memcpy` every call, unconditionally** (~49 ns/call measured) | **early-out before allocating** (~1.3–1.9 ns/call measured, ~25–36× reduction) |
+| `RX_GPU_COLLECT`, disconnected | **real `vkGetQueryPoolResults` readback every frame, unconditionally** | **early-out to a cheap query-pool reset only** |
+| Capture semantics | N/A (always "recording", nothing to distinguish) | **tradeoff, disclosed:** no pre-connection buffering — a profiler attaching mid-run sees zones from that moment forward only, never retroactively |
+
+Round 1's report claimed D3's "passive (~no cost) until a profiler
+connects" was satisfied without disclosing that two of the macros this same
+task added were the exception. That gap is closed: the exception no longer
+exists (both now early-out identically to the always-cheap macros when
+disconnected), and the one real tradeoff the fix itself introduces
+(connection-time capture start) is now stated explicitly rather than left
+implicit.
+
+---
+
 **Scope note (coordinator mid-task correction):** `src/rx_task` is **excluded**
 from this task entirely — the coordinator flagged it as concurrently owned by
 a Task 2 fix round while this task was in flight. No file under `src/rx_task`

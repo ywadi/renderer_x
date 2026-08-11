@@ -65,6 +65,36 @@
 // because dispatch item 4 explicitly requires dynamic per-pass zone naming,
 // and profile.h is this project's one CPU-zone include point, so the
 // wrapper belongs here rather than as a raw Tracy call in a .cpp.
+//
+// COST AND THE TRACY_ON_DEMAND TRADEOFF [task-3 fix round 1, Medium
+// finding] -- read this before adding a new call site. Unlike every other
+// macro on this page, this one is NOT a bare ring-buffer write: Tracy's own
+// underlying `ScopedZone::Name()` (public/client/TracyScoped.hpp, verified
+// directly against the vendored v0.14.0 source) does a real
+// `tracy_malloc()` + `memcpy()` on every call, because the text is a
+// runtime value Tracy must copy rather than a literal it can retain by
+// pointer. Left unguarded, that would run on every call regardless of
+// whether anything is listening -- directly contradicting D3's "passive
+// (~no cost) until a profiler connects" for this one macro, which is
+// exactly what an earlier pass of this task shipped and a fix-round review
+// caught. Fixed at the dependency-build level, not here: this project's
+// vendored Tracy is built with `-DTRACY_ON_DEMAND=ON`
+// (third_party/CMakeLists.txt), which changes `ScopedZone`'s (and every
+// zone type's) `m_active` gate from a bare `is_active` to
+// `is_active && GetProfiler().IsConnected()`, AND makes `Name()` itself
+// re-check the live connection id before doing any work -- so with no
+// profiler attached, this macro now costs a few branches and returns,
+// never reaching `tracy_malloc`. The allocation only happens WHILE a
+// profiler is actually connected and actively measuring, which is the
+// accepted, intended cost of real-time profiling, not a design flaw.
+//
+// The tradeoff that comes with `TRACY_ON_DEMAND`, disclosed rather than
+// hidden: the client buffers nothing before a profiler connects, so
+// capture HISTORY STARTS AT CONNECTION TIME -- attaching mid-run shows
+// zones from that moment forward only, never retroactively. Acceptable for
+// this project's own use (interactive local profiling sessions, not
+// after-the-fact forensic capture of a run nobody was watching), and
+// matches Tracy's own documented on-demand model exactly.
 #define RX_ZONE_DYNAMIC_NAME(text, size) ZoneName(text, size)
 
 // RX_FRAME_MARK -- marks the end of one rendered frame (Tracy's FrameMark).

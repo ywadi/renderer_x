@@ -347,18 +347,49 @@ set_target_properties(enkiTS::enkiTS PROPERTIES IMPORTED_GLOBAL TRUE)
 # reference link error, not a silent no-op. The two must always agree; both
 # are driven by the identical RX_TRACY guard at the CMake level so they
 # structurally cannot disagree. TRACY_STATIC=ON matches every other
-# compiled dependency here being linked statically. TRACY_ON_DEMAND stays
-# OFF (Tracy's own default): D3's "passive (~no cost) until a profiler
-# connects" behavior is already the plain TRACY_ENABLE-only default this
-# project wants, per the spec citation -- ON_DEMAND is an additional,
-# separate opt-in this task's brief never asked for.
+# compiled dependency here being linked statically.
+#
+# TRACY_ON_DEMAND=ON [task-3 fix round 1, Medium+Low finding]: turned ON
+# here -- NOT Tracy's own default (OFF) -- because leaving it off left two
+# real gaps against D3's own "passive (~no cost) until a profiler connects"
+# text, both traced directly against the vendored source before this fix:
+#   - ScopedZone::Name()/VkCtxScope's dynamic-name constructor (backing
+#     RX_ZONE_DYNAMIC_NAME/RX_GPU_ZONE_DYNAMIC -- rx_core/profile.h,
+#     rx_rhi_vk/tracy_gpu.h) tracy_malloc()+memcpy() unconditionally on
+#     every call when on-demand is off, since `m_active` is then just
+#     `is_active` with no connection check at all
+#     (public/client/TracyScoped.hpp, public/tracy/TracyVulkan.hpp).
+#   - VkCtx::Collect() (backing RX_GPU_COLLECT) always does a real
+#     vkGetQueryPoolResults readback, every frame, with no connection
+#     check either (public/tracy/TracyVulkan.hpp).
+# With TRACY_ON_DEMAND defined, BOTH of those gain the exact early-out this
+# project wants for free, straight from Tracy's own source (no code on this
+# project's side needed): every `m_active` initializer becomes
+# `is_active && GetProfiler().IsConnected()`, and Collect() gets its own
+# `#ifdef TRACY_ON_DEMAND if (!GetProfiler().IsConnected()) { <cheap
+# query-pool reset only>; return; }` branch. Disconnected, both dynamic-name
+# macros and the per-frame Collect() now cost a few branches and nothing
+# more -- no allocation, no GPU readback -- restoring "passive (~no cost)
+# until a profiler connects" for the two sites that violated it. The plain
+# RX_ZONE/RX_ZONE_NAMED/RX_FRAME_MARK/RX_PLOT macros were already this cheap
+# either way (a lock-free ring-buffer write, no allocation, regardless of
+# TRACY_ON_DEMAND) and are unaffected by this flag other than gaining the
+# identical connection check.
+#
+# TRADEOFF, disclosed (not free): on-demand means the client buffers
+# nothing before a profiler connects -- capture history starts at the
+# moment of connection, not at process startup. A profiler that attaches
+# mid-run sees only frames/zones from that point forward; whatever ran
+# before connecting is not retroactively visible. Documented again at each
+# dynamic-name macro's own declaration (profile.h, tracy_gpu.h) since that
+# is where a reader is most likely to reason about zone cost.
 if(RX_TRACY)
     set(RX_TRACY_TAG "v0.14.0")
     rx_add_cached_dependency(
       NAME tracy
       REPO https://github.com/wolfpld/tracy.git
       TAG ${RX_TRACY_TAG}
-      CMAKE_ARGS -DTRACY_ENABLE=ON -DTRACY_STATIC=ON
+      CMAKE_ARGS -DTRACY_ENABLE=ON -DTRACY_STATIC=ON -DTRACY_ON_DEMAND=ON
     )
     find_package(Tracy CONFIG REQUIRED PATHS "${tracy_CACHE_DIR}" NO_DEFAULT_PATH)
 

@@ -58,6 +58,26 @@ using GpuProfileContext = TracyVkCtx;
 // null check into `active` here is what makes this macro genuinely safe to
 // call with a null `ctx`, matching this header's own "safe on a null
 // context" claim on createGpuProfileContext() above.
+//
+// COST AND THE TRACY_ON_DEMAND TRADEOFF [task-3 fix round 1, Medium
+// finding] -- the GPU-side twin of the identical note on
+// rx_core/profile.h's RX_ZONE_DYNAMIC_NAME; read that one for the full
+// explanation, this is the short version. The dynamic-name `VkCtxScope`
+// constructor this macro drives (public/tracy/TracyVulkan.hpp) calls
+// `Profiler::AllocSourceLocation(...)` -- a real `tracy_malloc()` +
+// `memcpy()` -- on every invocation, unconditionally, UNLESS
+// `TRACY_ON_DEMAND` changes its `m_active` gate to
+// `is_active && GetProfiler().IsConnected()`. This project's vendored
+// Tracy is built with `-DTRACY_ON_DEMAND=ON` (third_party/CMakeLists.txt)
+// specifically so this per-pass GPU zone (like its CPU-side counterpart)
+// only pays that allocation cost while a profiler is actually connected
+// and measuring -- disconnected, `active` is already false from the
+// `(ctx) != nullptr` computation above being combined with the connection
+// check Tracy itself adds, so the constructor returns before allocating
+// (and before even the `vkCmdWriteTimestamp` call). Same disclosed
+// tradeoff as the CPU-side macro: on-demand means no pre-connection
+// buffering, so a profiler attaching mid-run sees GPU zones from that
+// point forward only.
 #define RX_GPU_ZONE_DYNAMIC(ctx, varname, cmd, nameText) \
     TracyVkZoneTransient(ctx, varname, cmd, nameText, (ctx) != nullptr)
 
@@ -73,6 +93,16 @@ using GpuProfileContext = TracyVkCtx;
 // (RX_TRACY off already routes here to nothing, but also any
 // createGpuProfileContext() failure while RX_TRACY is on) is silently
 // skipped rather than dereferenced.
+//
+// COST [task-3 fix round 1, Low finding]: `VkCtx::Collect()`'s own body
+// (public/tracy/TracyVulkan.hpp, verified directly) does a real
+// `vkGetQueryPoolResults` readback every call when there is pending data --
+// which there always is, every frame, once any pass has recorded a GPU
+// zone -- UNLESS `TRACY_ON_DEMAND` is defined, in which case `Collect()`
+// gains its own `if (!GetProfiler().IsConnected()) { <cheap query-pool
+// reset only>; return; }` early-out before ever touching the real readback
+// path. Covered by the identical `-DTRACY_ON_DEMAND=ON` build flag as
+// RX_GPU_ZONE_DYNAMIC above -- no additional wiring needed here.
 #define RX_GPU_COLLECT(ctx, cmd) \
     do {                         \
         if ((ctx) != nullptr) {  \
