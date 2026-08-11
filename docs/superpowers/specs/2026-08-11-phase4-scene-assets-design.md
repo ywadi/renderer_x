@@ -108,6 +108,18 @@ scene-submit helper, which is the chunked callback for any scene-driven
 pass) is parallel by default with no flags. `--threads` exists only in
 the stress benchmark as a measurement instrument.
 
+**Chunk-0 main-thread guarantee (adjudicated 2026-08-11, Task 7):**
+chunk 0 of every chunked pass records synchronously on the main thread,
+before the worker fan-out; chunks >= 1 record on workers. This is a
+deliberate affordance: main-thread-only APIs (per docs/threading.md's
+D5 list, e.g. MaterialSystem::bindInstance) are legal in chunk 0 and
+ONLY chunk 0. Calling them from chunk >= 1 is a contract violation that
+must fail loudly in dev builds — main-thread-only subsystems carry
+debug thread-affinity assertions (dev-preset-active regardless of
+NDEBUG). The alternative (splitting bind APIs into main-side resolve +
+any-thread record) is the recorded future path if profiling ever shows
+chunk 0 serialization dominating.
+
 ### D5 — Threading contract for existing subsystems (Phase 4 rule)
 
 **GPU-object mutation stays main-thread-only**: BindlessTable
