@@ -7,6 +7,7 @@
 // "<prefix>/include") -- see third_party/CMakeLists.txt's own comment.
 #include <TaskScheduler.h>
 
+#include <rx_core/debug_checks.h>
 #include <rx_core/log.h>
 #include <rx_core/profile.h>
 
@@ -56,6 +57,44 @@ std::atomic<size_t> g_lastDroppedIoTaskCount{0};
 // comment for why whatever is left in `outstanding` once the IO thread is
 // joined is exactly the set of tasks that were submitted but never got a
 // chance to execute.
+//
+// TWO-PHASE DELETE -- audit finding F1, HIGH, TSAN-reproduced. The comment
+// above closes the CONSUMER-side post-Execute() dereference correctly, but
+// missed a SEPARATE, SUBMITTER-side hazard entirely inside enkiTS itself:
+// TaskScheduler::AddPinnedTaskInt() (TaskScheduler.cpp:899-913, pinned
+// v1.12; verified byte-identical on upstream master `ccd4e8c` -- no fix
+// exists to port) does:
+//
+//   m_pPinnedTaskListPerThread[...][pTask_->threadNum].WriterWriteFront(pTask_);  // PUBLISHES -- IO thread may now dequeue+run+trash+delete it
+//   ThreadState state = m_pThreadDataStore[pTask_->threadNum]...;                 // READS pTask_->threadNum AGAIN, on the SUBMITTER's own thread
+//   if (state == ...) SemaphoreSignal(*m_pThreadDataStore[pTask_->threadNum]...); // READS pTask_->threadNum a THIRD time
+//
+// The moment `WriterWriteFront` publishes the task, the IO thread can
+// dequeue it, run Execute(), push it to `trash`, and (on ITS OWN next
+// drain, formerly unconditional) `delete` it -- all before the SUBMITTING
+// thread's own call to AddPinnedTask() returns from reading `threadNum`
+// those two more times. TSAN-reproduced directly against this exact
+// wrapper + the pinned enkiTS source (scratch build, `-fsanitize=thread`):
+// 3-4 "data race ... heap block freed" reports per run, 3/3 runs, every
+// one pairing `AddPinnedTaskInt` (TaskScheduler.cpp:904) against
+// `~IoTask`/`delete task` (this file). Full tallies in task-2-report.md's
+// audit-closure section.
+//
+// FIX: never delete an IoTask until BOTH (a) Execute() has run it (it's in
+// `trash`) AND (b) its own SUBMITTER has confirmed AddPinnedTask() has
+// fully returned on the submitter's own call stack -- i.e. enkiTS itself
+// can no longer possibly be touching `threadNum` from that side. `markPublished()`
+// is called by runOnIoThread() (below), on the submitter's own thread,
+// STRICTLY AFTER AddPinnedTask() returns -- by then, both extra reads
+// above have already happened, sequenced-before by ordinary same-thread
+// program order. The release-store there paired with the acquire-load in
+// isPublished() (used by IoLoopTask's reap loop below) establishes a real
+// synchronizes-with edge, so a task can only ever be deleted strictly
+// after the submitter is done with it -- not "usually fast enough", a
+// genuine ordering guarantee. A task that finishes executing before its
+// own submitter has published it is simply deferred to the reaper's next
+// cycle (or the destructor's final drain, ~Scheduler()) rather than
+// deleted early.
 class IoTask final : public enki::IPinnedTask {
  public:
   IoTask(uint32_t threadNum, std::function<void()> fn, std::vector<IoTask*>& trash, std::mutex& outstandingMutex,
@@ -78,11 +117,21 @@ class IoTask final : public enki::IPinnedTask {
     trash_.push_back(this);
   }
 
+  // Called by runOnIoThread(), on the submitter's own thread, strictly
+  // AFTER its call to enki::TaskScheduler::AddPinnedTask(this) has
+  // returned -- see this class's own F1 fix comment above for exactly why
+  // that ordering is the entire point. Never called from Execute() itself.
+  void markPublished() { published_.store(true, std::memory_order_release); }
+
+  // Checked by IoLoopTask's reap loop before ever deleting this object.
+  bool isPublished() const { return published_.load(std::memory_order_acquire); }
+
  private:
   std::function<void()> fn_;
   std::vector<IoTask*>& trash_;
   std::mutex& outstandingMutex_;
   std::vector<IoTask*>& outstanding_;
+  std::atomic<bool> published_{false};
 };
 
 // The dedicated IO thread's entire body, itself run as a single long-lived
@@ -110,15 +159,31 @@ class IoLoopTask final : public enki::IPinnedTask {
       // joins threads, so this is guaranteed to wake, never hang).
       scheduler_->WaitForNewPinnedTasks();
       scheduler_->RunPinnedTasks();
-      // Safe to reap now -- see IoTask's own comment above. trash_ is
-      // touched only from this thread (IoTask::Execute() runs only on the
-      // IO thread by construction; this loop runs only on the IO thread
-      // too), so no lock is needed.
-      for (IoTask* task : trash_) {
-        delete task;
-      }
-      trash_.clear();
+      reapPublished();
     }
+  }
+
+  // Two-phase delete [F1 fix] -- trash_ is touched only from this thread
+  // (IoTask::Execute() runs only on the IO thread by construction; this
+  // loop runs only on the IO thread too), so no lock is needed for trash_
+  // ITSELF; isPublished() is what actually needs (and gets, internally)
+  // cross-thread synchronization. Only ever deletes a task once BOTH it
+  // has run (it's in trash_ at all) AND its own submitter's
+  // AddPinnedTask() call has fully returned (isPublished()) -- anything
+  // not yet published is deferred, staying in trash_ for the NEXT cycle
+  // (or ~Scheduler()'s final drain) rather than deleted early. See
+  // IoTask's own class comment for the full race this closes.
+  void reapPublished() {
+    std::vector<IoTask*> stillPending;
+    stillPending.reserve(trash_.size());
+    for (IoTask* task : trash_) {
+      if (task->isPublished()) {
+        delete task;
+      } else {
+        stillPending.push_back(task);
+      }
+    }
+    trash_ = std::move(stillPending);
   }
 
   std::vector<IoTask*>& trash() { return trash_; }
@@ -239,35 +304,91 @@ Scheduler::~Scheduler() {
   // to actually happen.
   impl_->taskScheduler.WaitforAllAndShutdown();
 
-  // Step 3: defense-in-depth drain. Every IoTask this Scheduler ever
+  // Step 3: defense-in-depth drain, in two parts -- outstandingIo (never
+  // executed at all) and IoLoopTask's own trash_ (executed, but not yet
+  // reclaimed -- see Step 3b below). Every IoTask this Scheduler ever
   // handed to enkiTS removed itself from outstandingIo the moment it
-  // actually ran (IoTask::Execute(), above) -- given step 2's empirical
+  // actually ran (IoTask::Execute()) -- given Step 2's empirical
   // guarantee, outstandingIo is expected to already be empty here in
-  // every realistic run. Whatever is still in it regardless is, by
-  // construction, unreachable by any future Execute() call (every thread
-  // that could ever have run one is now joined) -- delete each directly
-  // (safe for exactly that reason) and log once, loudly, with the total
-  // count (this drop path's tasks plus any refused at intake in step 1),
-  // matching rx_rhi_vk::DeletionQueue's own posture on non-empty teardown
+  // every realistic run.
+  //
+  // [F1 fix] Even here -- a task that never got Execute() called at all --
+  // deletion is STILL gated on isPublished(), not unconditional: a task
+  // sitting unexecuted in outstandingIo at this point was, by
+  // construction, already handed to AddPinnedTask() (outstandingIo.
+  // push_back() always precedes that call in runOnIoThread(), with no
+  // early return between them) -- so its submitter's own AddPinnedTaskInt()
+  // reads of `threadNum` are either already done (safe to delete) or, in
+  // the same vanishingly narrow theoretical window Step 1's own comment
+  // already discloses, still technically in flight on that submitter's own
+  // thread (NOT safe to delete yet). isPublished() is the exact same
+  // signal that distinguishes the two cases here as it is for the trash_
+  // path below -- checking it is what makes this genuinely defense-in-
+  // depth for F1 specifically, not just for the separate "never ran at
+  // all" concern this step already existed to cover.
+  //
+  // Whatever DOES pass the check is, by construction, unreachable by any
+  // future Execute() call (every thread that could ever have run one is
+  // now joined) -- delete it directly (safe for exactly that reason).
+  // Matches rx_rhi_vk::DeletionQueue's own posture on non-empty teardown
   // (loud log, nothing silently unaccounted for) -- unlike DeletionQueue,
   // this really can leave nothing to run (no captured RAII destructor is
   // ever invoked for a dropped task), which is why deletion, not
   // execution, is the right action here.
+  // `leaked` (below) is a DIFFERENT axis than "dropped": it counts tasks
+  // that could not be immediately reclaimed yet (not safely deletable,
+  // per isPublished()) regardless of whether they ever ran -- overlapping
+  // with, not additional to, the never-executed count. Kept as its own
+  // tally rather than folded into totalDropped/debugLastDroppedIoTaskCount()
+  // (whose documented contract is specifically "never ran"), so nothing
+  // here is double-counted.
   std::vector<IoTask*> abandoned;
   {
     std::lock_guard<std::mutex> lock(impl_->outstandingIoMutex);
     abandoned.swap(impl_->outstandingIo);
   }
+  size_t leaked = 0;
   for (IoTask* task : abandoned) {
-    delete task;
+    if (task->isPublished()) {
+      delete task;
+    } else {
+      ++leaked;
+    }
   }
+
+  // Step 3b [F1 fix]: finish the two-phase delete for anything IoLoopTask's
+  // own reaper had already run but not yet published-and-therefore-not-yet
+  // -deleted at the moment of its very last reap cycle (see IoTask's class
+  // comment) -- safe to check/finish unconditionally here, no lock needed:
+  // the IO thread is fully joined by this point, so nothing will ever
+  // touch trash_ or call Execute()/markPublished() on these again. Every
+  // LEGITIMATE runOnIoThread() caller has, by ordinary program order,
+  // already returned from AddPinnedTask() (and therefore already called
+  // markPublished()) before ~Scheduler() could even begin -- so both this
+  // and the loop above are expected to find every remaining entry already
+  // published; the checks exist for the theoretical caller-races-
+  // destructor case, not the common one. These DID run (fn_ already
+  // executed, inside Execute()) -- unlike `abandoned`, this loop's leaked
+  // count is purely a delayed-reclamation concern, never a dropped-work
+  // one.
+  for (IoTask* task : impl_->ioLoopTask->trash()) {
+    if (task->isPublished()) {
+      delete task;
+    } else {
+      ++leaked;
+    }
+  }
+  impl_->ioLoopTask->trash().clear();
+
   const size_t totalDropped = impl_->droppedAtIntakeCount.load(std::memory_order_acquire) + abandoned.size();
   g_lastDroppedIoTaskCount.store(totalDropped, std::memory_order_release);
-  if (totalDropped > 0) {
+  if (totalDropped > 0 || leaked > 0) {
     RX_LOG_WARN(
-        "rx::task::Scheduler: dropped {} runOnIoThread() task(s) at teardown ({} refused at intake, {} queued but "
-        "never executed) -- never run, deleted without executing",
-        totalDropped, impl_->droppedAtIntakeCount.load(std::memory_order_acquire), abandoned.size());
+        "rx::task::Scheduler: {} runOnIoThread() task(s) dropped at teardown ({} refused at intake, {} queued but "
+        "never executed) -- never run, deleted without executing; {} additional task(s) had already run but could "
+        "not be safely reclaimed yet (theoretical caller-races-destructor window -- see ~Scheduler()'s own "
+        "comment), leaked rather than risk reopening the F1 use-after-free this fix closes",
+        totalDropped, impl_->droppedAtIntakeCount.load(std::memory_order_acquire), abandoned.size(), leaked);
   }
 }
 
@@ -352,6 +473,15 @@ void Scheduler::runOnIoThread(std::function<void()> fn) {
   // WaitForNewPinnedTasks() -- this is what gives runOnIoThread() its FIFO
   // guarantee without this wrapper needing any queue of its own.
   impl_->taskScheduler.AddPinnedTask(task);
+
+  // F1 fix -- MUST come after AddPinnedTask() returns, never before and
+  // never merged into it: this is the exact line whose ordering closes the
+  // TSAN-reproduced UAF (see IoTask's own class comment for the full
+  // mechanism). By this point enkiTS's own AddPinnedTaskInt() has finished
+  // every read of `task->threadNum` it will ever make from this call, so
+  // it is now safe for the reaper to delete `task` once it also sees this
+  // publish.
+  task->markPublished();
 }
 
 void Scheduler::postToMain(std::function<void()> fn) {
@@ -360,6 +490,12 @@ void Scheduler::postToMain(std::function<void()> fn) {
 }
 
 void Scheduler::pumpMain() {
+  // Audit finding F5-partial: pumpMain() runs whatever GPU-object-mutating
+  // closures postToMain() queued (D5's own handoff pattern), so it is
+  // main-thread-only exactly like every other guarded mutator in
+  // docs/threading.md's list -- it simply had no runtime guard yet.
+  RX_ASSERT_MAIN_THREAD("Scheduler::pumpMain");
+
   // Swap out under the lock, then run outside it: postToMain() calls
   // arriving while these run (e.g. from a worker still executing while
   // pumpMain() drains) are simply picked up by the NEXT pumpMain() call,

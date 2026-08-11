@@ -1,12 +1,14 @@
 #include <rx_task/scheduler.h>
 
 #include <doctest/doctest.h>
+#include <rx_core/debug_checks.h>
 #include <rx_core/log.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -451,3 +453,103 @@ TEST_CASE("Scheduler::create/destroy repeats cleanly 3 times in sequence, exerci
     // thread before the next cycle's create() runs.
   }
 }
+
+// --- Audit-closure round: F1 (HIGH, TSAN-reproduced UAF) -------------------
+TEST_CASE("Scheduler::runOnIoThread survives many CONCURRENT submitters -- parallelFor chunks each firing "
+          "runOnIoThread() once per item -- without crashing or losing a single submission (audit finding "
+          "F1's repro shape: AddPinnedTaskInt's post-publish threadNum reads racing the IO thread's "
+          "delete-after-run reap, TSAN-reproduced 3-4 reports/run pre-fix, 0/10 post-fix -- see scheduler.cpp's "
+          "IoTask class comment for the two-phase-delete fix and task-2-report.md for the full tallies). "
+          "Non-TSAN CI cannot observe the race itself, but this exercises the exact concurrent-publish "
+          "pattern the fix closes -- the audit noted its prior absence from this suite.") {
+  auto scheduler = rx::task::Scheduler::create(4);
+  REQUIRE(scheduler != nullptr);
+
+  // grain=1 as a FLOOR only -- enkiTS's actual chunk count is driven by its
+  // own m_NumPartitions (thread-count-derived), not by grainSize alone, so
+  // a large itemCount with grainSize=1 does NOT itself produce itemCount
+  // separate chunks (found directly while building this test's TSAN
+  // counterpart -- see task-2-report.md). Calling runOnIoThread() once per
+  // ITEM inside each chunk's own [begin,end) loop, rather than once per
+  // chunk, is what actually produces many concurrent submitters here,
+  // regardless of how few chunks enkiTS decides to create.
+  constexpr uint32_t kItems = 4000;
+  std::atomic<uint32_t> ran{0};
+
+  scheduler->parallelFor(kItems, 1, [&](uint32_t begin, uint32_t end, uint32_t) {
+    for (uint32_t i = begin; i < end; ++i) {
+      scheduler->runOnIoThread([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
+    }
+  });
+
+  REQUIRE(waitUntil([&] { return ran.load(std::memory_order_acquire) == kItems; }, std::chrono::seconds(30)));
+  CHECK(ran.load() == kItems);
+}
+
+// --- Audit-closure round: F5-partial (RX_ASSERT_MAIN_THREAD on pumpMain) ---
+#ifdef RX_DEBUG_CHECKS
+
+namespace {
+
+struct PumpMainGuardCapture {
+  std::mutex mutex;
+  std::vector<std::string> contexts;
+};
+
+std::atomic<PumpMainGuardCapture*> g_pumpMainCapture{nullptr};
+
+void capturePumpMainViolation(const char* context) {
+  PumpMainGuardCapture* capture = g_pumpMainCapture.load(std::memory_order_relaxed);
+  if (capture == nullptr) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(capture->mutex);
+  capture->contexts.emplace_back(context != nullptr ? context : "");
+}
+
+// RAII guard mirroring debug_checks_test.cpp's own ViolationHookGuard:
+// restores the production default (abort-on-violation) on scope exit
+// regardless of how the enclosing TEST_CASE exits.
+struct PumpMainGuardHookScope {
+  ~PumpMainGuardHookScope() {
+    g_pumpMainCapture.store(nullptr, std::memory_order_relaxed);
+    rx::core::debug::detail::setViolationHookForTests(nullptr);
+  }
+};
+
+}  // namespace
+
+// Deliberately placed LAST in this file: rx_core::debug::assertMainThreadImpl
+// lazily captures "the main thread" on the FIRST call to ANY
+// RX_ASSERT_MAIN_THREAD site in this whole process (debug_checks.h's own
+// disclosed limitation) -- several earlier TEST_CASEs above already call
+// scheduler->pumpMain() legitimately from doctest's own main/running thread
+// (e.g. the postToMain tests), so by the time THIS test's worker thread
+// calls it, "main" is already correctly learned. Reordering this file so a
+// WORKER thread reached pumpMain() (and therefore this guard) before any
+// legitimate main-thread call would invalidate that assumption -- exactly
+// the hazard debug_checks_test.cpp's own header comment documents.
+TEST_CASE("Scheduler::pumpMain's RX_ASSERT_MAIN_THREAD guard fires, naming pumpMain, for a call from a "
+          "genuinely different thread (audit finding F5-partial)") {
+  auto scheduler = rx::task::Scheduler::create(2);
+  REQUIRE(scheduler != nullptr);
+
+  PumpMainGuardCapture capture;
+  g_pumpMainCapture.store(&capture, std::memory_order_relaxed);
+  rx::core::debug::detail::setViolationHookForTests(&capturePumpMainViolation);
+  PumpMainGuardHookScope hookScope;
+
+  // A plain std::thread, not a parallelFor() worker -- matches
+  // debug_checks_test.cpp's own reasoning: this hook never throws (safe
+  // regardless), and a plain std::thread is a deterministically different
+  // thread::id, with none of a real scheduler's work-stealing uncertainty
+  // about which thread happens to run a given unit of work.
+  std::thread worker([&scheduler] { scheduler->pumpMain(); });
+  worker.join();
+
+  std::lock_guard<std::mutex> lock(capture.mutex);
+  REQUIRE(capture.contexts.size() == 1);
+  CHECK(capture.contexts[0] == "Scheduler::pumpMain");
+}
+
+#endif  // RX_DEBUG_CHECKS

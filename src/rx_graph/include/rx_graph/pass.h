@@ -219,6 +219,27 @@ public:
     // draws need from scratch, every invocation, exactly like a whole-pass
     // callback already does once per execute() call today.
     //
+    // EXCEPTIONS FROM CHUNK >= 1 ARE PROCESS-FATAL -- read before this
+    // callback's own resolver calls in a chunk it cannot prove is chunk 0
+    // [audit finding F6]. Chunks [1, chunkCount) run on rx::task::Scheduler
+    // worker threads inside enkiTS's own TaskingThreadFunction dispatch
+    // loop (scheduler.cpp's parallelFor(), no try/catch anywhere in that
+    // call chain, by design -- enkiTS worker threads have no handler of
+    // their own to catch into): an exception that escapes `fn` on any
+    // chunk other than 0 unwinds into that loop and calls std::terminate(),
+    // crashing the whole process, not just failing this one pass or frame.
+    // PassContext's own resolvers (e.g. a resource-name lookup) DOCUMENT
+    // throwing `std::out_of_range` (executor.h) and are legal to call from
+    // any chunk including these -- the same typo'd resource name that is a
+    // cleanly catchable exception on chunk 0 (still running synchronously
+    // on the main thread at that point) becomes a process-fatal crash on
+    // chunk 1..chunkCount-1. In practice: `fn` must be noexcept-in-effect
+    // for every chunk index it is not certain is 0 -- validate resource
+    // names / anything else that can throw on chunk 0 only (where the
+    // exception is still catchable, per this class's own "chunk 0 is
+    // guaranteed to run first, alone" contract above), and treat a throw
+    // from a later chunk as a bug to prevent, not a condition to handle.
+    //
     // Mutually exclusive with setExecute() above -- throws std::logic_error
     // if this pass already has a whole-pass callback stored.
     Pass& setExecuteChunked(std::function<void(PassContext&, uint32_t chunkIndex, uint32_t chunkCount)> fn);

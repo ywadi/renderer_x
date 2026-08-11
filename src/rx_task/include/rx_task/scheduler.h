@@ -202,6 +202,10 @@ class Scheduler {
   // point). A function queued by a postToMain() call made concurrently
   // with (or after) a given pumpMain() call may run on this call or a
   // later one; pumpMain() never blocks waiting for more work to arrive.
+  //
+  // Thread-affinity (D5, Phase 4; audit finding F5-partial): main-thread-
+  // only -- carries a dev-time RX_ASSERT_MAIN_THREAD guard -- see
+  // docs/threading.md.
   void pumpMain();
 
   // Number of background parallelFor() worker threads (the resolved value

@@ -368,6 +368,21 @@ public:
     // #4): a real swapchain image acquired this frame, or (as in Task 3's
     // GPU test) a caller-created offscreen image intended for readback
     // instead of presentation.
+    //
+    // CALLER-DISCIPLINE BOUND, UNENFORCED [audit finding F10]: every cross-
+    // frame safety argument this method relies on -- the chunk-pool reset
+    // above, secondary-buffer reuse, and the deletion queue's own pacing
+    // (executor.cpp's own comment on sweepStale()/onFrameFenceSignaled()
+    // has the full reasoning) -- assumes at most ONE execute() call per
+    // real, fence-bounded frame (i.e. the caller does not submit and start
+    // a second execute() before confirming, via its own fence wait, that
+    // an earlier frame's GPU work sharing the same frame-in-flight slot has
+    // completed). Every in-tree caller already satisfies this (samples via
+    // `FrameSync`'s fence-wait-then-record cycle; GPU tests via a
+    // synchronous submit-and-wait between calls, which is strictly more
+    // conservative than the bound requires) -- but nothing here asserts it,
+    // so a future caller driving two graphs per real frame would reset
+    // pools the GPU could still be reading.
     void execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage backbufferImage, VkImageView backbufferView,
                  VkExtent2D backbufferExtent);
 

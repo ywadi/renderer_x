@@ -67,6 +67,15 @@ and compiles to nothing at all when it is OFF:
   `RenderableManager`/`TransformManager`/`LightManager` mutation
   (create/set/destroy) stays main-thread-only; read-only SoA traversal for
   culling (below) does not. Not guarded — does not exist yet.
+- **`rx::task::Scheduler`** — `pumpMain()` **[guarded]** [audit finding
+  F5-partial]: runs whatever GPU-object-mutating closures `postToMain()`
+  queued (the handoff pattern below), so it carries the identical
+  main-thread-only contract as everything above it, just via a different
+  entry point. `parallelFor()` is NOT main-thread-only itself (its
+  documented contract is "calling thread, whichever one that is" — see
+  `scheduler.h`); this guard is specifically about the pump point workers
+  hand GPU mutation back through, not about `Scheduler` in general.
+  (`src/rx_task/include/rx_task/scheduler.h`)
 
 The `rx_material` public ABI surface (`api_impl.cpp`'s
 `IRxMaterialSystem::loadMaterial()`/`createTexture2D()`) carries the
@@ -112,6 +121,18 @@ chunk) or the dedicated IO thread (`runOnIoThread()`):
   documented, for every **[guarded]** entry in "Main-thread-only" above
   [Phase 4 Task 7 fix round 1]: calling one of those from chunk >= 1 now
   fails loudly (dev builds) instead of silently corrupting shared state.
+  **An exception escaping a chunk >= 1 callback is process-fatal by
+  design** [audit finding F6] — `rx::task::Scheduler::parallelFor()`'s
+  underlying enkiTS worker-thread dispatch loop has no handler to catch
+  into, so an uncaught exception there calls `std::terminate()` for the
+  whole process, not just this one pass. `PassContext`'s resolvers
+  document throwing (`std::out_of_range` — `executor.h`) and are legal to
+  call from any chunk, but the SAME throw that is cleanly catchable on
+  chunk 0 (still synchronous, on the main thread, per the paragraph
+  above) is process-fatal on every other chunk — see
+  `rx::graph::Pass::setExecuteChunked()`'s own doc comment for the full
+  contract. In practice: a chunked callback must be noexcept-in-effect
+  for any chunk index it cannot prove is 0.
 
 ## Parallelism is the default, not a mode
 
