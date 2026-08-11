@@ -3,6 +3,7 @@
 #include <rx_material/material_system.h>
 #include <rx_material/rx_api_detail.h>
 
+#include <rx_core/debug_checks.h>
 #include <rx_core/log.h>
 #include <rx_core/log_forward_sink.h>
 
@@ -514,6 +515,7 @@ RxResult RX_CALL MaterialSystemImpl::queryInterface(const RxGuid& iid, void** ou
 }
 
 RxResult RX_CALL MaterialSystemImpl::loadMaterial(const char* slangModulePath, IRxMaterial** outMaterial) {
+    RX_ASSERT_MAIN_THREAD("IRxMaterialSystem::loadMaterial");
     if (outMaterial == nullptr) {
         return RX_E_INVALIDARG;
     }
@@ -568,6 +570,7 @@ RxResult RX_CALL MaterialSystemImpl::reloadChanged() {
 }
 
 RxResult RX_CALL MaterialSystemImpl::createTexture2D(const RxTextureDesc* desc, IRxTexture** outTexture) {
+    RX_ASSERT_MAIN_THREAD("IRxMaterialSystem::createTexture2D");
     if (outTexture == nullptr) {
         return RX_E_INVALIDARG;
     }

@@ -1,5 +1,6 @@
 #include <rx_rhi_vk/bindless.h>
 
+#include <rx_core/debug_checks.h>
 #include <rx_core/log.h>
 
 #include <array>
@@ -210,6 +211,7 @@ std::optional<BindlessTable> BindlessTable::create(VkPhysicalDevice physicalDevi
 }
 
 BindlessHandle BindlessTable::registerSampledImage(VkImageView view, VkImageLayout layout) {
+    RX_ASSERT_MAIN_THREAD("BindlessTable::registerSampledImage");
     auto internal = sampledImages_.acquire(detail::EmptyPayload{});
     if (internal.index() >= capacities_.sampledImages) {
         RX_LOG_ERROR(
@@ -240,6 +242,7 @@ BindlessHandle BindlessTable::registerSampledImage(VkImageView view, VkImageLayo
 }
 
 BindlessHandle BindlessTable::registerSampler(VkSampler sampler) {
+    RX_ASSERT_MAIN_THREAD("BindlessTable::registerSampler");
     auto internal = samplers_.acquire(detail::EmptyPayload{});
     if (internal.index() >= capacities_.samplers) {
         RX_LOG_ERROR(
@@ -270,6 +273,7 @@ BindlessHandle BindlessTable::registerSampler(VkSampler sampler) {
 }
 
 BindlessHandle BindlessTable::registerStorageBuffer(VkBuffer buffer, VkDeviceSize range, VkDeviceSize offset) {
+    RX_ASSERT_MAIN_THREAD("BindlessTable::registerStorageBuffer");
     auto internal = storageBuffers_.acquire(detail::EmptyPayload{});
     if (internal.index() >= capacities_.storageBuffers) {
         RX_LOG_ERROR(
@@ -300,6 +304,7 @@ BindlessHandle BindlessTable::registerStorageBuffer(VkBuffer buffer, VkDeviceSiz
 }
 
 void BindlessTable::release(BindlessHandle handle) {
+    RX_ASSERT_MAIN_THREAD("BindlessTable::release");
     if (!handle.isValid()) {
         return;
     }

@@ -1,4 +1,5 @@
 #include <rx_rhi_vk/deletion_queue.h>
+#include <rx_core/debug_checks.h>
 #include <rx_core/log.h>
 #include <utility>
 
@@ -14,6 +15,13 @@ DeletionQueue::~DeletionQueue() {
 }
 
 void DeletionQueue::retire(std::function<void()> destructor, uint64_t frameIndex) {
+    // [Phase 4 Task 7 fix round 1] Only the enqueue-style mutator is
+    // guarded here -- onFrameFenceSignaled()/flushAll() below are the
+    // per-frame drain/shutdown paths, out of this fix round's explicit
+    // scope (docs/threading.md's own main-thread-only note for this class
+    // covers all three; this guard specifically targets the one mutator a
+    // chunk >= 1 caller could plausibly reach mid-frame).
+    RX_ASSERT_MAIN_THREAD("DeletionQueue::retire");
     items_.push_back(Item{frameIndex, std::move(destructor)});
 }
 

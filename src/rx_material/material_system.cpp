@@ -1,5 +1,6 @@
 #include <rx_material/material_system.h>
 
+#include <rx_core/debug_checks.h>
 #include <rx_core/handle.h>
 #include <rx_core/log.h>
 #include <rx_core/profile.h>
@@ -1350,6 +1351,7 @@ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device, 
 }
 
 MaterialHandle MaterialSystem::loadMaterial(const std::filesystem::path& slangModulePath) {
+    RX_ASSERT_MAIN_THREAD("MaterialSystem::loadMaterial");
     RX_ZONE;
     Impl& impl = *impl_;
 
@@ -1446,6 +1448,7 @@ void MaterialSystem::onFrameCompleted(uint64_t completedFrameNumber) {
 
 void MaterialSystem::bindInstance(VkCommandBuffer cmd, const rx::graph::PassContext& passContext,
                                    const InstanceBinding& binding) {
+    RX_ASSERT_MAIN_THREAD("MaterialSystem::bindInstance");
     Impl& impl = *impl_;
 
     MaterialRecord* record = impl.materials.get(binding.material);
@@ -1503,6 +1506,7 @@ void MaterialSystem::bindInstance(VkCommandBuffer cmd, const rx::graph::PassCont
 }
 
 void MaterialSystem::reloadChanged() {
+    RX_ASSERT_MAIN_THREAD("MaterialSystem::reloadChanged");
     RX_ZONE;
     Impl& impl = *impl_;
     // [Task 8] The SAME resolved directory create() built this instance
@@ -1648,6 +1652,7 @@ void MaterialSystem::reloadChanged() {
 }
 
 VkPipeline MaterialSystem::getPipeline(const PipelineRequest& req) {
+    RX_ASSERT_MAIN_THREAD("MaterialSystem::getPipeline");
     RX_ZONE;
     Impl& impl = *impl_;
 

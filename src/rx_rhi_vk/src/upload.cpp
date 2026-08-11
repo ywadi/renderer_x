@@ -2,6 +2,7 @@
 #include <rx_rhi_vk/command.h>
 #include <rx_rhi_vk/device.h>
 #include <rx_rhi_vk/texture.h>
+#include <rx_core/debug_checks.h>
 #include <rx_core/log.h>
 #include <rx_core/profile.h>
 #include <cstring>
@@ -125,6 +126,7 @@ bool Uploader::reserveRingSpace(VkDeviceSize size, VkDeviceSize& outOffset) {
 }
 
 bool Uploader::uploadToBuffer(Buffer& dst, VkDeviceSize dstOffset, const void* data, VkDeviceSize size) {
+    RX_ASSERT_MAIN_THREAD("Uploader::uploadToBuffer");
     RX_ZONE;
     if (size == 0) {
         return true;
@@ -187,6 +189,7 @@ bool Uploader::uploadToBuffer(Buffer& dst, VkDeviceSize dstOffset, const void* d
 }
 
 bool Uploader::uploadToImage(Texture2D& dst, const void* pixels, VkDeviceSize pixelBytes, bool generateMips) {
+    RX_ASSERT_MAIN_THREAD("Uploader::uploadToImage");
     RX_ZONE;
     if (pixelBytes == 0) {
         return true;

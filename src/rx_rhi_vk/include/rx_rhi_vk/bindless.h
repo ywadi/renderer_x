@@ -148,6 +148,9 @@ private:
 // can still reference that slot.
 // Thread-affinity (D5, Phase 4): registerSampledImage()/registerSampler()/
 // registerStorageBuffer()/release() are main-thread-only -- see docs/threading.md.
+// All four carry a dev-time RX_ASSERT_MAIN_THREAD guard [Phase 4 Task 7 fix
+// round 1] that fails loudly on a chunk >= 1 violation instead of
+// corrupting this table's internal handle pools/descriptor set silently.
 class BindlessTable {
 public:
     struct Capacities {

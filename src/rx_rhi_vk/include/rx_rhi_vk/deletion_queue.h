@@ -57,7 +57,11 @@ namespace rx::rhi {
 // when the last reference (here, always exactly one: the retired
 // std::function itself) is dropped.
 // Thread-affinity (D5, Phase 4): retire()/onFrameFenceSignaled()/flushAll()
-// are main-thread-only -- see docs/threading.md.
+// are main-thread-only -- see docs/threading.md. retire() (the
+// enqueue-style mutator a chunked pass could plausibly reach mid-frame)
+// carries a dev-time RX_ASSERT_MAIN_THREAD guard [Phase 4 Task 7 fix round
+// 1] that fails loudly on a chunk >= 1 violation instead of corrupting
+// items_ silently.
 class DeletionQueue {
 public:
     DeletionQueue() = default;

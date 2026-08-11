@@ -131,6 +131,11 @@ namespace detail {
 //
 // Thread-affinity (D5, Phase 4): loadMaterial()/getPipeline() (and every
 // other method here) are main-thread-only -- see docs/threading.md.
+// loadMaterial()/getPipeline()/reloadChanged()/bindInstance() carry a
+// dev-time RX_ASSERT_MAIN_THREAD guard [Phase 4 Task 7 fix round 1] that
+// fails loudly on a chunk >= 1 violation (the one contract a chunked pass
+// can actually reach mid-frame, per spec D4's chunk-0 guarantee) instead of
+// corrupting this system's unsynchronized internal state silently.
 class MaterialSystem {
 public:
     // Saves this instance's VkPipelineCache to the path passed to create()

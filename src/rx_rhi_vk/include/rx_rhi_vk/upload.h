@@ -87,7 +87,10 @@ class Texture2D;
 // direct-path buffer upload, which never touches the ring at all.
 //
 // Thread-affinity (D5, Phase 4): uploadToBuffer()/uploadToImage()/flush()
-// are main-thread-only -- see docs/threading.md.
+// are main-thread-only -- see docs/threading.md. uploadToBuffer()/
+// uploadToImage() carry a dev-time RX_ASSERT_MAIN_THREAD guard [Phase 4
+// Task 7 fix round 1] that fails loudly on a chunk >= 1 violation instead
+// of corrupting the shared ring buffer/command-recording state silently.
 class Uploader {
 public:
     Uploader(Uploader&&) noexcept;

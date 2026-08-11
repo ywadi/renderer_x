@@ -7,7 +7,13 @@ secondary command recording) via `rx::task::Scheduler`
 scheduler [spec D2]. This document is the contract every subsystem —
 existing and future — is held to as that work lands, and it is what every
 new public header's one-line thread-affinity note (see the rule at the
-bottom of this file) points back to.
+bottom of this file) points back to. Several of the concrete
+main-thread-only mutators below (`BindlessTable`/`Uploader`/
+`MaterialSystem`/`DeletionQueue::retire()`) now back this contract with a
+dev-time `RX_ASSERT_MAIN_THREAD` runtime guard [Phase 4 Task 7 fix round 1,
+`rx_core/include/rx_core/debug_checks.h`] — a call from a chunk >= 1 fails
+loudly (logged, then `std::abort()`) instead of silently corrupting shared
+state; see "Main-thread-only" below for exactly which methods.
 
 ## The rule
 
@@ -26,27 +32,48 @@ explicitly deferred.
 
 Call these ONLY from the thread that owns the `VkDevice`/render loop (in
 `rx::task::Scheduler` terms: the thread that called `Scheduler::create()`,
-i.e. the thread that also calls `pumpMain()`):
+i.e. the thread that also calls `pumpMain()`). Entries marked **[guarded]**
+carry a dev-time `RX_ASSERT_MAIN_THREAD` runtime check [Phase 4 Task 7 fix
+round 1] at the very top of the named method(s): a call from any other
+thread logs an ERROR naming the API and calls `std::abort()` rather than
+silently mutating shared state from the wrong thread. The guard is compiled
+in whenever `RX_DEBUG_CHECKS` is ON (default in both dev presets,
+independent of `NDEBUG` — see `rx_core/include/rx_core/debug_checks.h`'s
+own header comment for why a bare `assert()` would not have worked here)
+and compiles to nothing at all when it is OFF:
 
 - **`rx::rhi::BindlessTable`** — `registerSampledImage()`/
-  `registerSampler()`/`registerStorageBuffer()`/`release()`
+  `registerSampler()`/`registerStorageBuffer()`/`release()` **[guarded, all
+  four]**
   (`src/rx_rhi_vk/include/rx_rhi_vk/bindless.h`)
-- **`rx::rhi::Uploader`** — `uploadToBuffer()`/`uploadToImage()`/`flush()`
+- **`rx::rhi::Uploader`** — `uploadToBuffer()`/`uploadToImage()` **[guarded,
+  both]**/`flush()` (not guarded — always called from within an already-
+  guarded uploadTo*() call in every path this codebase has today)
   (`src/rx_rhi_vk/include/rx_rhi_vk/upload.h`)
-- **`rx::material::MaterialSystem`** — `loadMaterial()`/`getPipeline()`
-  (and every other method on this type — it is not internally
-  synchronized at all, matching `rx::graph::RenderGraph`/`Executor`'s
-  existing scoping)
+- **`rx::material::MaterialSystem`** — `loadMaterial()`/`getPipeline()`/
+  `reloadChanged()`/`bindInstance()` **[guarded, all four]** (and every
+  other method on this type — it is not internally synchronized at all,
+  matching `rx::graph::RenderGraph`/`Executor`'s existing scoping)
   (`src/rx_material/include/rx_material/material_system.h`)
-- **`rx::rhi::DeletionQueue`** — `retire()`/`onFrameFenceSignaled()`/
-  `flushAll()` (`src/rx_rhi_vk/include/rx_rhi_vk/deletion_queue.h`)
+- **`rx::rhi::DeletionQueue`** — `retire()` **[guarded]**/
+  `onFrameFenceSignaled()`/`flushAll()` (not guarded — the per-frame
+  drain and shutdown paths, out of this fix round's scope; `retire()` is
+  the one enqueue-style mutator a chunk >= 1 caller could plausibly reach
+  mid-frame) (`src/rx_rhi_vk/include/rx_rhi_vk/deletion_queue.h`)
 - **`rx::asset::GeometryPool`** (future, Stage 1) — suballocation is a
   main-thread-owned `VmaVirtualBlock` operation, same rationale as the
-  four above.
+  four above. Not guarded — does not exist yet.
 - **`rx::scene::*Manager` registries** (future, Stage 2) —
   `RenderableManager`/`TransformManager`/`LightManager` mutation
   (create/set/destroy) stays main-thread-only; read-only SoA traversal for
-  culling (below) does not.
+  culling (below) does not. Not guarded — does not exist yet.
+
+The `rx_material` public ABI surface (`api_impl.cpp`'s
+`IRxMaterialSystem::loadMaterial()`/`createTexture2D()`) carries the
+identical guard at its own entry point too, ahead of (and in addition to)
+the internal `MaterialSystem` guard the call eventually reaches —
+`docs`/spec do not separately list the ABI layer as its own
+main-thread-only surface, but a violation there is caught just as loudly.
 
 ## Worker-allowed
 
@@ -81,7 +108,10 @@ chunk) or the dedicated IO thread (`runOnIoThread()`):
   resolves a pipeline and streams a per-frame parameter UBO in one call,
   with no split resolve/record API to fall back on). Every chunk *other*
   than chunk 0 still follows the "any worker, never main-thread-only"
-  rule above without exception.
+  rule above without exception — enforced at runtime, not merely
+  documented, for every **[guarded]** entry in "Main-thread-only" above
+  [Phase 4 Task 7 fix round 1]: calling one of those from chunk >= 1 now
+  fails loudly (dev builds) instead of silently corrupting shared state.
 
 ## Parallelism is the default, not a mode
 
