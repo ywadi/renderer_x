@@ -10,15 +10,20 @@
 // error codes on malformed input) lives in test_api_contract.cpp
 // (rx_material_tests) instead -- see that file's own header comment.
 #include <doctest/doctest.h>
+#include <rx_graph/executor.h>
+#include <rx_graph/render_graph.h>
 #include <rx_material/material_system.h>
 #include <rx_material/rx_api.h>
 #include <rx_material/rx_api_detail.h>
 #include <rx_platform/window.h>
 #include <rx_rhi_vk/bindless.h>
+#include <rx_rhi_vk/buffer.h>
+#include <rx_rhi_vk/command.h>
 #include <rx_rhi_vk/context.h>
 #include <rx_rhi_vk/device.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -157,6 +162,281 @@ bool isDocumentedResult(RxResult result) {
         default:
             return false;
     }
+}
+
+// ===== Task 4 [seed-10 carried] ===========================================
+// Render+readback helper for the "the bound texture actually changes the
+// rendered image" GPU tests below. Draws a full-screen quad through
+// `internal`'s real MaterialSystem::bindInstance() -- the internal bridge
+// sample 06_materials established (public rx_api.h surface for material/
+// instance/texture management, this one internal call for the draw-time
+// bind rx_api.h deliberately does not expose this phase -- see rx_api.h's
+// own comment) -- exactly like test_material_system.cpp's own bindInstance
+// GPU tests already do, then reads back one pixel from each screen
+// quadrant.
+//
+// QUADRANT-PROBE DERIVATION (documented once here, not re-derived per call
+// site): the quad's 4 corners map screen space (0,0)/(W,0)/(W,H)/(0,H) to
+// UV (0,0)/(1,0)/(1,1)/(0,1) respectively (bilinear across both triangles --
+// see kVertices below), so a screen pixel at continuous position
+// (x+0.5, y+0.5) samples UV ((x+0.5)/W, (y+0.5)/H). A LINEAR-filtered sample
+// against a 2x2 texture is EXACTLY (zero blend) the corresponding texel
+// whenever a UV component stays within [0, 0.25] or [0.75, 1]: standard
+// bilinear tap math puts both sample taps on the SAME clamped texel index
+// throughout that whole range, not just exactly at the texel center (worked
+// by hand in task-4-report.md). Probing at 1/8 and 7/8 fractions of each
+// axis sits comfortably inside those exact-match bands, so every readback
+// below is an exact, zero-tolerance byte match, never a blended
+// approximation.
+constexpr uint32_t kQuadrantProbeExtent = 64;
+constexpr VkFormat kQuadrantProbeColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+
+struct QuadTestVertex {
+    float position[3];
+    float normal[3];
+    float uv[2];
+};
+
+struct QuadrantPixels {
+    std::array<uint8_t, 4> topLeft;
+    std::array<uint8_t, 4> topRight;
+    std::array<uint8_t, 4> bottomLeft;
+    std::array<uint8_t, 4> bottomRight;
+};
+
+// Identical shape to test_material_system.cpp's own helper of the same
+// name -- duplicated, not shared, matching this file's own established
+// precedent (see its header comment) of not reaching into another test
+// binary's private helpers.
+struct OffscreenColorImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+};
+
+std::optional<OffscreenColorImage> createOffscreenColorImage(VkDevice device, VkPhysicalDevice physicalDevice,
+                                                               VkFormat format, VkExtent2D extent) {
+    OffscreenColorImage result;
+
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = format;
+    imageInfo.extent = {extent.width, extent.height, 1};
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(device, &imageInfo, nullptr, &result.image) != VK_SUCCESS) {
+        return std::nullopt;
+    }
+
+    VkMemoryRequirements memReq{};
+    vkGetImageMemoryRequirements(device, result.image, &memReq);
+    VkPhysicalDeviceMemoryProperties memProps{};
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
+
+    uint32_t memoryTypeIndex = UINT32_MAX;
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+        if ((memReq.memoryTypeBits & (1U << i)) != 0U &&
+            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0U) {
+            memoryTypeIndex = i;
+            break;
+        }
+    }
+    if (memoryTypeIndex == UINT32_MAX) {
+        vkDestroyImage(device, result.image, nullptr);
+        return std::nullopt;
+    }
+
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memReq.size;
+    allocInfo.memoryTypeIndex = memoryTypeIndex;
+    if (vkAllocateMemory(device, &allocInfo, nullptr, &result.memory) != VK_SUCCESS) {
+        vkDestroyImage(device, result.image, nullptr);
+        return std::nullopt;
+    }
+    if (vkBindImageMemory(device, result.image, result.memory, 0) != VK_SUCCESS) {
+        vkFreeMemory(device, result.memory, nullptr);
+        vkDestroyImage(device, result.image, nullptr);
+        return std::nullopt;
+    }
+
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = result.image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = format;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(device, &viewInfo, nullptr, &result.view) != VK_SUCCESS) {
+        vkFreeMemory(device, result.memory, nullptr);
+        vkDestroyImage(device, result.image, nullptr);
+        return std::nullopt;
+    }
+
+    return result;
+}
+
+void destroyOffscreenColorImage(VkDevice device, OffscreenColorImage& img) {
+    if (img.view != VK_NULL_HANDLE) {
+        vkDestroyImageView(device, img.view, nullptr);
+    }
+    if (img.image != VK_NULL_HANDLE) {
+        vkDestroyImage(device, img.image, nullptr);
+    }
+    if (img.memory != VK_NULL_HANDLE) {
+        vkFreeMemory(device, img.memory, nullptr);
+    }
+    img = OffscreenColorImage{};
+}
+
+std::optional<QuadrantPixels> renderQuadAndReadbackQuadrants(rx::rhi::Device& device, rx::rhi::BindlessTable& bindless,
+                                                              rx::material::MaterialSystem& internal,
+                                                              rx::material::MaterialHandle materialHandle,
+                                                              const void* paramBlob, size_t paramBlobSize) {
+    auto allocator = rx::rhi::Allocator::createRaw(device.physicalDevice(), device.device(), device.instance());
+    if (!allocator.has_value()) {
+        return std::nullopt;
+    }
+
+    // Full-screen quad, clip-space corners fed directly -- forward_entry.
+    // slang's own "PHASE 3 SCOPE NOTE": `position` IS clip space, no
+    // transform exists. Winding: EMPIRICALLY VERIFIED against this exact
+    // pipeline (a real GPU run, not a hand-derived formula taken on faith --
+    // an initial hand derivation using Vulkan's own documented signed-area
+    // facing formula got this backwards and was caught by exactly this
+    // task's own GPU test rendering nothing at all; see task-4-report.md for
+    // the full account) -- (A,C,B)/(A,D,C) is the winding that survives the
+    // fixed VK_CULL_MODE_BACK_BIT/VK_FRONT_FACE_COUNTER_CLOCKWISE
+    // rasterization state getPipeline() (material_system.cpp) always
+    // builds, against a standard (non-flipped) VkViewport. NOT the same
+    // winding as sample 06_materials' own addQuad(), which is correct for
+    // THAT sample's own Y-flipped-projection setup, not this transform-free
+    // one.
+    constexpr std::array<QuadTestVertex, 4> kVertices{{
+        {{-1.0F, -1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 0.0F}},  // A: top-left
+        {{1.0F, -1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 0.0F}},   // B: top-right
+        {{1.0F, 1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 1.0F}},    // C: bottom-right
+        {{-1.0F, 1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F}},   // D: bottom-left
+    }};
+    constexpr std::array<uint32_t, 6> kIndices{0, 2, 1, 0, 3, 2};
+
+    auto vertexBuffer = allocator->createHostVisibleBuffer(sizeof(kVertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    auto indexBuffer = allocator->createHostVisibleBuffer(sizeof(kIndices), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    if (!vertexBuffer.has_value() || !indexBuffer.has_value()) {
+        return std::nullopt;
+    }
+    std::memcpy(vertexBuffer->mappedData(), kVertices.data(), sizeof(kVertices));
+    vertexBuffer->flush();
+    std::memcpy(indexBuffer->mappedData(), kIndices.data(), sizeof(kIndices));
+    indexBuffer->flush();
+
+    auto executor = rx::graph::Executor::create(device);
+    if (executor == nullptr) {
+        return std::nullopt;
+    }
+
+    constexpr VkExtent2D kExtent{kQuadrantProbeExtent, kQuadrantProbeExtent};
+
+    rx::graph::RenderGraph graph;
+    rx::graph::Pass& pass = graph.addPass("forward");
+    rx::graph::AttachmentDesc colorDesc;
+    colorDesc.format = kQuadrantProbeColorFormat;
+    pass.addColorOutput("color", colorDesc);
+    graph.setBackbufferSource("color");
+
+    pass.setExecute([&](rx::graph::PassContext& ctx) {
+        internal.beginFrame(/*frameInFlightIndex=*/0, /*frameNumber=*/0);
+        rx::material::InstanceBinding binding{materialHandle, paramBlob, paramBlobSize};
+        internal.bindInstance(ctx.cmd, ctx, binding);
+
+        // Descriptor SET 0 (the real bindless table) -- bindInstance()
+        // itself only ever binds set 1 (this material's own gParams UBO),
+        // exactly like sample 06_materials' own recordDraws() comment
+        // documents ("Binds descriptor SET 0 ... exactly once").
+        VkDescriptorSet bindlessSet = bindless.descriptorSet();
+        vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, internal.pipelineLayout(materialHandle),
+                                 /*firstSet=*/0, 1, &bindlessSet, 0, nullptr);
+
+        VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.renderArea.width),
+                             static_cast<float>(ctx.renderArea.height), 0.0F, 1.0F};
+        VkRect2D scissor{{0, 0}, ctx.renderArea};
+        vkCmdSetViewport(ctx.cmd, 0, 1, &viewport);
+        vkCmdSetScissor(ctx.cmd, 0, 1, &scissor);
+
+        VkBuffer vb = vertexBuffer->handle();
+        VkDeviceSize vbOffset = 0;
+        vkCmdBindVertexBuffers(ctx.cmd, 0, 1, &vb, &vbOffset);
+        vkCmdBindIndexBuffer(ctx.cmd, indexBuffer->handle(), 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(ctx.cmd, static_cast<uint32_t>(kIndices.size()), 1, 0, 0, 0);
+    });
+
+    rx::graph::CompileInfo compileInfo;
+    compileInfo.swapchainWidth = kExtent.width;
+    compileInfo.swapchainHeight = kExtent.height;
+    compileInfo.swapchainFormat = kQuadrantProbeColorFormat;
+    compileInfo.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    graph.compile(compileInfo);
+    executor->realize(graph);
+
+    auto offscreen =
+        createOffscreenColorImage(device.device(), device.physicalDevice(), kQuadrantProbeColorFormat, kExtent);
+    if (!offscreen.has_value()) {
+        return std::nullopt;
+    }
+
+    auto readback = allocator->createHostVisibleBuffer(static_cast<VkDeviceSize>(kExtent.width) * kExtent.height * 4,
+                                                          VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    if (!readback.has_value()) {
+        destroyOffscreenColorImage(device.device(), *offscreen);
+        return std::nullopt;
+    }
+
+    auto cmdCtx =
+        rx::rhi::CommandContext::create(device.device(), device.graphicsQueue(), device.graphicsQueueFamily());
+    if (!cmdCtx.has_value()) {
+        destroyOffscreenColorImage(device.device(), *offscreen);
+        return std::nullopt;
+    }
+
+    cmdCtx->runOnce(
+        [&](VkCommandBuffer cmd) { executor->execute(graph, cmd, offscreen->image, offscreen->view, kExtent); });
+
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        VkBufferImageCopy region{};
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent = {kExtent.width, kExtent.height, 1};
+        vkCmdCopyImageToBuffer(cmd, offscreen->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1,
+                                &region);
+    });
+
+    readback->invalidate();
+    const auto* pixels = static_cast<const uint8_t*>(readback->mappedData());
+
+    auto pixelAt = [&](uint32_t x, uint32_t y) -> std::array<uint8_t, 4> {
+        size_t offset = (static_cast<size_t>(y) * kExtent.width + x) * 4;
+        return {pixels[offset], pixels[offset + 1], pixels[offset + 2], pixels[offset + 3]};
+    };
+
+    // 1/8 and 7/8 fractions -- see this function's own header comment.
+    const uint32_t nearEdge = kExtent.width / 8;
+    const uint32_t farEdge = kExtent.width - nearEdge - 1;
+
+    QuadrantPixels result;
+    result.topLeft = pixelAt(nearEdge, nearEdge);
+    result.topRight = pixelAt(farEdge, nearEdge);
+    result.bottomLeft = pixelAt(nearEdge, farEdge);
+    result.bottomRight = pixelAt(farEdge, farEdge);
+
+    destroyOffscreenColorImage(device.device(), *offscreen);
+    return result;
 }
 
 }  // namespace
@@ -717,4 +997,220 @@ TEST_CASE("IRxMaterialSystem::reloadChanged is a safe no-op on a device-free ins
     REQUIRE(rxCreateMaterialSystem(&desc, &system) == RX_OK);
     CHECK(system->reloadChanged() == RX_OK);
     system->release();
+}
+
+// ===== Task 4 [seed-10 carried] ===========================================
+// The carried bar this task closes (Phase 3 Task 8's own review, "The
+// central question: texture path vs. texture sampling"): a
+// `createTexture2D`-created texture bound via `setTexture` must VISIBLY
+// change the rendered image, not merely reach a GPU-visible blob numerically
+// inert. `test_textured_sample.slang` (tests/data/) is the fixture --
+// `evaluate()` returns `rx_sampleTexture(gParams.albedoIndex, uv)` directly,
+// unlike test_textured.slang's own `albedoIndex` (still only read
+// numerically, kept as the "real bindless-index PATH, not sampling" case
+// this task's own review found and this fixture is deliberately NOT).
+namespace {
+constexpr std::array<uint8_t, 4> kQuadTopLeft{255, 0, 0, 255};
+constexpr std::array<uint8_t, 4> kQuadTopRight{0, 255, 0, 255};
+constexpr std::array<uint8_t, 4> kQuadBottomLeft{0, 0, 255, 255};
+constexpr std::array<uint8_t, 4> kQuadBottomRight{255, 255, 0, 255};
+
+// Row-major 2x2 RGBA8 buffer: row 0 = [topLeft, topRight], row 1 =
+// [bottomLeft, bottomRight] -- matches renderQuadAndReadbackQuadrants()'s
+// own UV<->quadrant derivation exactly.
+std::vector<uint8_t> makeQuadTestPixels() {
+    std::vector<uint8_t> pixels;
+    pixels.reserve(16);
+    pixels.insert(pixels.end(), kQuadTopLeft.begin(), kQuadTopLeft.end());
+    pixels.insert(pixels.end(), kQuadTopRight.begin(), kQuadTopRight.end());
+    pixels.insert(pixels.end(), kQuadBottomLeft.begin(), kQuadBottomLeft.end());
+    pixels.insert(pixels.end(), kQuadBottomRight.begin(), kQuadBottomRight.end());
+    return pixels;
+}
+
+void checkQuadrantPixels(const QuadrantPixels& readback) {
+    CHECK(std::memcmp(readback.topLeft.data(), kQuadTopLeft.data(), 4) == 0);
+    CHECK(std::memcmp(readback.topRight.data(), kQuadTopRight.data(), 4) == 0);
+    CHECK(std::memcmp(readback.bottomLeft.data(), kQuadBottomLeft.data(), 4) == 0);
+    CHECK(std::memcmp(readback.bottomRight.data(), kQuadBottomRight.data(), 4) == 0);
+}
+}  // namespace
+
+TEST_CASE("IRxMaterialInstance::setTexture's bound texture actually changes the rendered image via "
+          "rx_sampleTexture (public API up to the internal draw-time bridge)") {
+    auto fixture = makeFixture("rx_api_factory_sample_texture");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto internal = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+                                                            freshCachePath("api_sample_texture"));
+    REQUIRE(internal != nullptr);
+
+    RxMaterialSystemDesc desc{internal.get()};
+    IRxMaterialSystem* system = nullptr;
+    REQUIRE(rxCreateMaterialSystem(&desc, &system) == RX_OK);
+
+    std::vector<uint8_t> pixels = makeQuadTestPixels();
+    RxTextureDesc textureDesc{};
+    textureDesc.pixels = pixels.data();
+    textureDesc.pixelBytes = pixels.size();
+    textureDesc.width = 2;
+    textureDesc.height = 2;
+    textureDesc.format = RX_FORMAT_RGBA8_UNORM;
+    textureDesc.generateMips = 0;
+
+    IRxTexture* texture = nullptr;
+    REQUIRE(system->createTexture2D(&textureDesc, &texture) == RX_OK);
+    REQUIRE(texture != nullptr);
+
+    IRxMaterial* material = nullptr;
+    std::string materialPath = testDataPath("test_textured_sample.slang").string();
+    REQUIRE(system->loadMaterial(materialPath.c_str(), &material) == RX_OK);
+    REQUIRE(material != nullptr);
+
+    IRxMaterialInstance* instance = nullptr;
+    REQUIRE(material->createInstance(&instance) == RX_OK);
+    REQUIRE(instance->setTexture("albedoIndex", texture) == RX_OK);
+
+    rx::material::MaterialHandle handle = rx::material::detail::materialHandle(material);
+    const void* blob = rx::material::detail::materialInstanceBlobData(instance);
+    size_t blobSize = rx::material::detail::materialInstanceBlobSize(instance);
+
+    auto readback =
+        renderQuadAndReadbackQuadrants(fixture->device, fixture->bindless, *internal, handle, blob, blobSize);
+    REQUIRE(readback.has_value());
+    checkQuadrantPixels(*readback);
+
+    instance->release();
+    material->release();
+    texture->release();
+    system->release();
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// [Task 4] Hot-reload regression: a textured material keeps sampling
+// correctly across reloadChanged() (D9) -- not merely keeping SOME
+// last-good pipeline (Task 7's own general reload machinery already
+// covers that thoroughly), but specifically that the re-rendered image
+// still shows the real texture content after a genuine recompile.
+TEST_CASE("hot-reload of a textured material keeps sampling correctly (reloadChanged() then re-render)") {
+    auto fixture = makeFixture("rx_api_factory_sample_texture_reload");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto internal = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+                                                            freshCachePath("api_sample_texture_reload"));
+    REQUIRE(internal != nullptr);
+
+    RxMaterialSystemDesc desc{internal.get()};
+    IRxMaterialSystem* system = nullptr;
+    REQUIRE(rxCreateMaterialSystem(&desc, &system) == RX_OK);
+
+    std::vector<uint8_t> pixels = makeQuadTestPixels();
+    RxTextureDesc textureDesc{};
+    textureDesc.pixels = pixels.data();
+    textureDesc.pixelBytes = pixels.size();
+    textureDesc.width = 2;
+    textureDesc.height = 2;
+    textureDesc.format = RX_FORMAT_RGBA8_UNORM;
+    textureDesc.generateMips = 0;
+
+    IRxTexture* texture = nullptr;
+    REQUIRE(system->createTexture2D(&textureDesc, &texture) == RX_OK);
+
+    // Loaded from a TEMP COPY, not the committed tests/data/ fixture
+    // directly -- reloadChanged() (D9) needs a real on-disk mtime/content
+    // change to detect, and this test must never mutate a committed
+    // fixture file.
+    std::filesystem::path modulePath =
+        std::filesystem::temp_directory_path() / "rx_api_factory_textured_sample_reload_test.slang";
+    auto baseTime = std::filesystem::file_time_type::clock::now();
+    auto writeModule = [&](const char* content, std::filesystem::file_time_type mtime) {
+        std::ofstream out(modulePath, std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(out));
+        out << content;
+        out.close();
+        std::error_code ec;
+        std::filesystem::last_write_time(modulePath, mtime, ec);
+        REQUIRE_FALSE(ec);
+    };
+
+    constexpr const char* kV1 = R"(
+import material;
+struct TexturedSampleParams { uint albedoIndex; };
+[[vk::binding(0, 1)]] ParameterBlock<TexturedSampleParams> gParams;
+struct TexturedSample : IMaterialShader {
+    float4 evaluate(MaterialVertex v) {
+        float4 sampled = rx_sampleTexture(gParams.albedoIndex, v.uv);
+        sampled.x += v.worldPos.x * 1e-6;
+        sampled.y += v.normal.y * 1e-6;
+        return sampled;
+    }
+};
+export struct MaterialImpl : IMaterialShader = TexturedSample;
+)";
+    // v2: textually different (one inert extra statement) but semantically
+    // identical sampling behavior -- forces a real content-hash change and
+    // a real recompile [D9]; the point of this regression is that the SAME
+    // sampling result survives a genuine reload, not that the math changes.
+    constexpr const char* kV2 = R"(
+import material;
+struct TexturedSampleParams { uint albedoIndex; };
+[[vk::binding(0, 1)]] ParameterBlock<TexturedSampleParams> gParams;
+struct TexturedSample : IMaterialShader {
+    float4 evaluate(MaterialVertex v) {
+        float4 sampled = rx_sampleTexture(gParams.albedoIndex, v.uv);
+        sampled.x += v.worldPos.x * 1e-6;
+        sampled.y += v.normal.y * 1e-6;
+        sampled.z += 0.0;
+        return sampled;
+    }
+};
+export struct MaterialImpl : IMaterialShader = TexturedSample;
+)";
+
+    writeModule(kV1, baseTime);
+
+    IRxMaterial* material = nullptr;
+    std::string modulePathStr = modulePath.string();
+    REQUIRE(system->loadMaterial(modulePathStr.c_str(), &material) == RX_OK);
+
+    IRxMaterialInstance* instance = nullptr;
+    REQUIRE(material->createInstance(&instance) == RX_OK);
+    REQUIRE(instance->setTexture("albedoIndex", texture) == RX_OK);
+
+    rx::material::MaterialHandle handle = rx::material::detail::materialHandle(material);
+    uint64_t hashBefore = internal->moduleHash(handle);
+
+    {
+        const void* blob = rx::material::detail::materialInstanceBlobData(instance);
+        size_t blobSize = rx::material::detail::materialInstanceBlobSize(instance);
+        auto readback =
+            renderQuadAndReadbackQuadrants(fixture->device, fixture->bindless, *internal, handle, blob, blobSize);
+        REQUIRE(readback.has_value());
+        checkQuadrantPixels(*readback);
+    }
+
+    writeModule(kV2, baseTime + std::chrono::seconds(1));
+    REQUIRE(system->reloadChanged() == RX_OK);
+    CHECK(internal->moduleHash(handle) != hashBefore);
+
+    {
+        const void* blob = rx::material::detail::materialInstanceBlobData(instance);
+        size_t blobSize = rx::material::detail::materialInstanceBlobSize(instance);
+        auto readback =
+            renderQuadAndReadbackQuadrants(fixture->device, fixture->bindless, *internal, handle, blob, blobSize);
+        REQUIRE(readback.has_value());
+        checkQuadrantPixels(*readback);
+    }
+
+    instance->release();
+    material->release();
+    texture->release();
+    system->release();
+    std::error_code ec;
+    std::filesystem::remove(modulePath, ec);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
 }

@@ -231,6 +231,81 @@ MaterialParamKind classifyFieldKind(slang::TypeLayoutReflection* typeLayout) {
     }
 }
 
+// --- Bindless texture-sampling globals [Task 4, seed-10 carried] --------
+// material.slang's own `gTextures`/`gSamplers` (unbounded arrays at set 0,
+// the SAME external bindless set every other set-0 binding in this engine
+// already uses -- see rx_rhi_vk::PipelineLayoutBuilder::build()'s own
+// "EXTERNAL SET-0 SUBSTITUTION" comment) plus its `gMaterialGlobals` push
+// constant (the real default-sampler bindless index -- see material.slang's
+// own header comment). These are handled as OPTIONAL below (this walk does
+// not hard-require any of the three, and would accept a hypothetical future
+// material composite that omitted them) -- but verified directly against
+// this project's shipped Slang build (not assumed) that in PRACTICE they are
+// present in every material's own linked-program reflection today, whether
+// or not that material's evaluate() ever calls rx_sampleTexture: `import
+// material;` pulls in every one of material.slang's own top-level globals
+// regardless of which of them the importing module's reachable entry-point
+// code actually touches. See material.slang's own header comment, and
+// test_material_system.cpp's reflection test (which asserts exactly this
+// for test_unlit.slang, a material that never samples anything).
+constexpr uint32_t kBindlessTextureArraySet = 0;
+
+// Classifies a `DescriptorTableSlot`-category top-level global's element
+// type -- mirrors rx_shader::reflect()'s own `mapElementType()` (same
+// shipped Slang build, same verified masking technique for
+// `SlangResourceShape`), narrowed to exactly the two shapes material.slang
+// declares (this file's own established discipline: reject anything this
+// task's test list does not exercise rather than generalize speculatively
+// -- see reflectMaterialLayout()'s own header comment on the identical
+// choice for the ParameterBlock walk).
+enum class BindlessArrayElementKind { SampledImageArray, SamplerArray, Other };
+
+BindlessArrayElementKind classifyBindlessArrayElement(slang::TypeReflection* elemType) {
+    if (elemType == nullptr) {
+        return BindlessArrayElementKind::Other;
+    }
+    if (elemType->getKind() == slang::TypeReflection::Kind::SamplerState) {
+        return BindlessArrayElementKind::SamplerArray;
+    }
+    if (elemType->getKind() == slang::TypeReflection::Kind::Resource) {
+        SlangResourceShape shape = elemType->getResourceShape();
+        auto baseShape = static_cast<SlangResourceShape>(shape & 0x0F);
+        bool combinedSampler = (shape & SLANG_TEXTURE_COMBINED_FLAG) != 0;
+        if (baseShape == SLANG_TEXTURE_2D && !combinedSampler) {
+            return BindlessArrayElementKind::SampledImageArray;
+        }
+    }
+    return BindlessArrayElementKind::Other;
+}
+
+// Whether Slang reflects the global named `paramName` as a genuinely
+// unbounded array (`SLANG_UNBOUNDED_SIZE`) -- the same
+// `getBindingRangeBindingCount()` API rx_shader::reflect() already
+// established as the only one that reports that sentinel correctly (see
+// that file's own header comment), but correlated by NAME rather than by
+// loop index: unlike reflect()'s own flat-globals-only walk, this
+// program's top-level parameters also include a `ParameterBlock` (gParams,
+// `SubElementRegisterSpace` category), and whether that consumes a slot in
+// `getGlobalParamsTypeLayout()`'s own binding-range list (making an
+// index-based correlation drift) is not a documented, verified fact this
+// task tested -- a name search sidesteps the question entirely rather than
+// assume either answer.
+bool isReflectedAsUnboundedArray(slang::TypeLayoutReflection* globalTypeLayout, const char* paramName) {
+    if (globalTypeLayout == nullptr || paramName == nullptr) {
+        return false;
+    }
+    SlangInt bindingRangeCount = globalTypeLayout->getBindingRangeCount();
+    for (SlangInt i = 0; i < bindingRangeCount; ++i) {
+        slang::VariableReflection* leafVar = globalTypeLayout->getBindingRangeLeafVariable(i);
+        const char* leafName = (leafVar != nullptr) ? leafVar->getName() : nullptr;
+        if (leafName != nullptr && std::strcmp(leafName, paramName) == 0) {
+            SlangInt bindingCount = globalTypeLayout->getBindingRangeBindingCount(i);
+            return static_cast<size_t>(bindingCount) == SLANG_UNBOUNDED_SIZE;
+        }
+    }
+    return false;
+}
+
 // --- Material-specific reflection ---------------------------------------
 // rx_shader::reflect() (reflection.h) deliberately does not handle
 // `ParameterBlock<T>` at all ("Slang's ParameterBlock<T>/nested-parameter-
@@ -264,13 +339,13 @@ MaterialParamKind classifyFieldKind(slang::TypeLayoutReflection* typeLayout) {
 // Rejects (returns std::nullopt, `error` filled in) anything else it
 // encounters as a top-level global parameter: more than one
 // ParameterBlock, one bound to the wrong set, or any OTHER kind of global
-// (an ordinary flat resource, a push constant, ...) -- Phase 3 materials
-// support exactly one ParameterBlock<TParams> gParams and nothing else at
-// global scope; textures/other bindless resources route through gParams's
-// own bindless-table INDICES (plain uint data), never a resource-typed
-// field or a second global [D8]. This is a deliberate scope boundary, not
-// an oversight: a material declaring extra flat globals is a real,
-// supportable future case (the underlying flat-resource reflection
+// -- Phase 3 materials support exactly one ParameterBlock<TParams> gParams
+// at global scope, PLUS, as of Task 4, exactly the three optional bindless-
+// sampling globals material.slang itself declares (`gTextures`/`gSamplers`
+// at set 0, `gMaterialGlobals` as a push constant -- see that file's own
+// header comment). Any OTHER kind of global (an ordinary flat resource this
+// task did not declare, a second/differently-shaped push constant, ...) is
+// a real, supportable future case (the underlying flat-resource reflection
 // technique reflect() already uses is directly reusable for it), but
 // nothing in this task's test list exercises one, and writing that mapping
 // without a single verified case to check it against would be exactly the
@@ -297,77 +372,198 @@ std::optional<MaterialReflection> reflectMaterialLayout(slang::ProgramLayout* la
                                                          std::string& error) {
     MaterialReflection result;
     bool foundParamBlock = false;
+    bool foundTextureArray = false;
+    bool foundSamplerArray = false;
+    bool foundMaterialGlobalsPushConstant = false;
+
+    // [Task 4] Needed only by the DescriptorTableSlot branch below, for
+    // isReflectedAsUnboundedArray()'s name-correlated lookup -- computed
+    // once here rather than per-parameter, matching rx_shader::reflect()'s
+    // own precedent of hoisting this above its walk.
+    slang::TypeLayoutReflection* globalTypeLayout = layout->getGlobalParamsTypeLayout();
 
     unsigned paramCount = layout->getParameterCount();
     for (unsigned i = 0; i < paramCount; ++i) {
         slang::VariableLayoutReflection* param = layout->getParameterByIndex(i);
         const char* rawName = param->getName();
         std::string name = (rawName != nullptr) ? rawName : "<anonymous>";
+        slang::ParameterCategory category = param->getCategory();
 
-        const bool isParamBlock = param->getCategory() == slang::ParameterCategory::SubElementRegisterSpace &&
+        // --- Case 1: the material's own ParameterBlock<TParams> gParams,
+        // at set 1 -- unchanged from Task 5/7 except for living inside this
+        // new if/else-if chain instead of an early-reject.
+        const bool isParamBlock = category == slang::ParameterCategory::SubElementRegisterSpace &&
                                    param->getTypeLayout() != nullptr &&
                                    param->getTypeLayout()->getKind() == slang::TypeReflection::Kind::ParameterBlock;
-        if (!isParamBlock) {
-            error = "material module '" + moduleLabel + "' declares unsupported top-level global parameter '" +
-                    name +
-                    "' (Phase 3 materials support exactly one ParameterBlock<...> gParams and nothing else at "
-                    "global scope -- route textures through gParams's own bindless-table indices instead)";
-            return std::nullopt;
-        }
-        if (foundParamBlock) {
-            error = "material module '" + moduleLabel +
-                    "' declares more than one top-level ParameterBlock global ('" + name +
-                    "' is the second) -- Phase 3 materials support exactly one";
-            return std::nullopt;
-        }
-
-        auto set = static_cast<uint32_t>(param->getBindingIndex());
-        if (set != kMaterialParamBlockSet) {
-            error = "material module '" + moduleLabel + "': parameter block '" + name +
-                     "' is bound to descriptor set " + std::to_string(set) + "; this engine requires set " +
-                     std::to_string(kMaterialParamBlockSet) +
-                     " -- declare it as `[[vk::binding(0, 1)]] ParameterBlock<...> gParams;`";
-            return std::nullopt;
-        }
-
-        rx::shader::ShaderLayoutInfo::Binding binding;
-        binding.set = kMaterialParamBlockSet;
-        binding.binding = kMaterialParamBlockBinding;
-        binding.count = 1;
-        binding.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        binding.stages = kMaterialStageFlags;
-        binding.unboundedArray = false;
-        result.shaderLayout.bindings.push_back(binding);
-        foundParamBlock = true;
-
-        // [Task 7] Field-level walk -- see this function's own header
-        // comment for exactly what/why.
-        slang::TypeLayoutReflection* blockTypeLayout = param->getTypeLayout();
-        slang::TypeLayoutReflection* elementLayout =
-            blockTypeLayout != nullptr ? blockTypeLayout->getElementTypeLayout() : nullptr;
-        if (elementLayout != nullptr) {
-            result.paramBlockSize = static_cast<uint32_t>(elementLayout->getSize(slang::ParameterCategory::Uniform));
-            unsigned fieldCount = elementLayout->getFieldCount();
-            for (unsigned f = 0; f < fieldCount; ++f) {
-                slang::VariableLayoutReflection* field = elementLayout->getFieldByIndex(f);
-                if (field == nullptr) {
-                    continue;
-                }
-                const char* fieldRawName = field->getName();
-                if (fieldRawName == nullptr) {
-                    continue;
-                }
-                slang::TypeLayoutReflection* fieldTypeLayout = field->getTypeLayout();
-                MaterialParamInfo fieldInfo;
-                fieldInfo.name = fieldRawName;
-                fieldInfo.kind = classifyFieldKind(fieldTypeLayout);
-                fieldInfo.offset = static_cast<uint32_t>(field->getOffset(slang::ParameterCategory::Uniform));
-                fieldInfo.size = fieldTypeLayout != nullptr
-                                     ? static_cast<uint32_t>(fieldTypeLayout->getSize(slang::ParameterCategory::Uniform))
-                                     : 0;
-                result.params.push_back(std::move(fieldInfo));
+        if (isParamBlock) {
+            if (foundParamBlock) {
+                error = "material module '" + moduleLabel +
+                        "' declares more than one top-level ParameterBlock global ('" + name +
+                        "' is the second) -- Phase 3 materials support exactly one";
+                return std::nullopt;
             }
+
+            auto set = static_cast<uint32_t>(param->getBindingIndex());
+            if (set != kMaterialParamBlockSet) {
+                error = "material module '" + moduleLabel + "': parameter block '" + name +
+                         "' is bound to descriptor set " + std::to_string(set) + "; this engine requires set " +
+                         std::to_string(kMaterialParamBlockSet) +
+                         " -- declare it as `[[vk::binding(0, 1)]] ParameterBlock<...> gParams;`";
+                return std::nullopt;
+            }
+
+            rx::shader::ShaderLayoutInfo::Binding binding;
+            binding.set = kMaterialParamBlockSet;
+            binding.binding = kMaterialParamBlockBinding;
+            binding.count = 1;
+            binding.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            binding.stages = kMaterialStageFlags;
+            binding.unboundedArray = false;
+            result.shaderLayout.bindings.push_back(binding);
+            foundParamBlock = true;
+
+            // [Task 7] Field-level walk -- see this function's own header
+            // comment for exactly what/why.
+            slang::TypeLayoutReflection* blockTypeLayout = param->getTypeLayout();
+            slang::TypeLayoutReflection* elementLayout =
+                blockTypeLayout != nullptr ? blockTypeLayout->getElementTypeLayout() : nullptr;
+            if (elementLayout != nullptr) {
+                result.paramBlockSize =
+                    static_cast<uint32_t>(elementLayout->getSize(slang::ParameterCategory::Uniform));
+                unsigned fieldCount = elementLayout->getFieldCount();
+                for (unsigned f = 0; f < fieldCount; ++f) {
+                    slang::VariableLayoutReflection* field = elementLayout->getFieldByIndex(f);
+                    if (field == nullptr) {
+                        continue;
+                    }
+                    const char* fieldRawName = field->getName();
+                    if (fieldRawName == nullptr) {
+                        continue;
+                    }
+                    slang::TypeLayoutReflection* fieldTypeLayout = field->getTypeLayout();
+                    MaterialParamInfo fieldInfo;
+                    fieldInfo.name = fieldRawName;
+                    fieldInfo.kind = classifyFieldKind(fieldTypeLayout);
+                    fieldInfo.offset = static_cast<uint32_t>(field->getOffset(slang::ParameterCategory::Uniform));
+                    fieldInfo.size =
+                        fieldTypeLayout != nullptr
+                            ? static_cast<uint32_t>(fieldTypeLayout->getSize(slang::ParameterCategory::Uniform))
+                            : 0;
+                    result.params.push_back(std::move(fieldInfo));
+                }
+            }
+            continue;
         }
+
+        // --- Case 2 [Task 4]: material.slang's own set-0 bindless arrays
+        // (gTextures/gSamplers) -- handled as optional (this walk does not
+        // require them), but in practice present for every material
+        // regardless of whether its evaluate() actually calls
+        // rx_sampleTexture -- see this function's own header comment.
+        // Folded onto the SAME external BindlessTable every other set-0
+        // binding in this engine already uses
+        // (rx::rhi::PipelineLayoutBuilder::build()'s "EXTERNAL SET-0
+        // SUBSTITUTION"), never a new descriptor set.
+        if (category == slang::ParameterCategory::DescriptorTableSlot) {
+            auto set = static_cast<uint32_t>(param->getBindingSpace());
+            auto bindingIndex = static_cast<uint32_t>(param->getBindingIndex());
+            slang::TypeReflection* elemType = param->getType() != nullptr ? param->getType()->unwrapArray() : nullptr;
+            BindlessArrayElementKind kind = classifyBindlessArrayElement(elemType);
+            bool unbounded = isReflectedAsUnboundedArray(globalTypeLayout, rawName);
+
+            if (set == kBindlessTextureArraySet && bindingIndex == rx::rhi::BindlessTable::kSampledImageBinding &&
+                kind == BindlessArrayElementKind::SampledImageArray && unbounded && !foundTextureArray) {
+                rx::shader::ShaderLayoutInfo::Binding binding;
+                binding.set = set;
+                binding.binding = bindingIndex;
+                binding.count = 0;
+                binding.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                binding.stages = kMaterialStageFlags;
+                binding.unboundedArray = true;
+                result.shaderLayout.bindings.push_back(binding);
+                foundTextureArray = true;
+                continue;
+            }
+            if (set == kBindlessTextureArraySet && bindingIndex == rx::rhi::BindlessTable::kSamplerBinding &&
+                kind == BindlessArrayElementKind::SamplerArray && unbounded && !foundSamplerArray) {
+                rx::shader::ShaderLayoutInfo::Binding binding;
+                binding.set = set;
+                binding.binding = bindingIndex;
+                binding.count = 0;
+                binding.type = VK_DESCRIPTOR_TYPE_SAMPLER;
+                binding.stages = kMaterialStageFlags;
+                binding.unboundedArray = true;
+                result.shaderLayout.bindings.push_back(binding);
+                foundSamplerArray = true;
+                continue;
+            }
+
+            error = "material module '" + moduleLabel + "' declares an unsupported bindless global '" + name +
+                    "' at set " + std::to_string(set) + " binding " + std::to_string(bindingIndex) +
+                    " (this engine recognizes only material.slang's own `gTextures` [unbounded Texture2D[], set " +
+                    std::to_string(kBindlessTextureArraySet) + ", binding " +
+                    std::to_string(rx::rhi::BindlessTable::kSampledImageBinding) +
+                    "] / `gSamplers` [unbounded SamplerState[], set " + std::to_string(kBindlessTextureArraySet) +
+                    ", binding " + std::to_string(rx::rhi::BindlessTable::kSamplerBinding) + "] shape)";
+            return std::nullopt;
+        }
+
+        // --- Case 3 [Task 4]: material.slang's own `gMaterialGlobals` push
+        // constant (the real default-sampler bindless index -- see that
+        // file's own header comment). Handled as optional, same reason as
+        // Case 2 (and, empirically, present for every material for the
+        // identical reason).
+        if (category == slang::ParameterCategory::PushConstantBuffer) {
+            if (foundMaterialGlobalsPushConstant) {
+                error = "material module '" + moduleLabel +
+                        "' declares more than one push-constant global ('" + name + "' is the second)";
+                return std::nullopt;
+            }
+
+            slang::TypeLayoutReflection* wrapperLayout = param->getTypeLayout();
+            slang::TypeLayoutReflection* elementLayout =
+                wrapperLayout != nullptr ? wrapperLayout->getElementTypeLayout() : nullptr;
+            const char* elementTypeName = elementLayout != nullptr ? elementLayout->getName() : nullptr;
+            if (elementTypeName == nullptr || std::strcmp(elementTypeName, "RxMaterialGlobals") != 0) {
+                error = "material module '" + moduleLabel + "' declares an unsupported push-constant global '" +
+                        name + "' (this engine recognizes only material.slang's own `RxMaterialGlobals`)";
+                return std::nullopt;
+            }
+
+            size_t elementSize =
+                elementLayout != nullptr ? elementLayout->getSize(slang::ParameterCategory::Uniform) : 0;
+            size_t offset = param->getOffset(slang::ParameterCategory::PushConstantBuffer);
+
+            // bindInstance() (below) pushes exactly `sizeof(uint32_t)` bytes
+            // from a local `uint32_t` for this range -- a mismatch here
+            // would make that call read past the end of that local
+            // variable. RxMaterialGlobals declares exactly one `uint`
+            // field, so this is expected to hold always; reject loudly
+            // (rather than let vkCmdPushConstants silently over-read) if a
+            // future edit to material.slang's struct shape ever changes it
+            // without updating bindInstance() to match.
+            if (elementSize != sizeof(uint32_t)) {
+                error = "material module '" + moduleLabel +
+                        "' links against a `RxMaterialGlobals` whose reflected size is " +
+                        std::to_string(elementSize) + " bytes; this engine's bindInstance() only knows how to "
+                        "push exactly " + std::to_string(sizeof(uint32_t)) + " bytes (one `uint`) for it";
+                return std::nullopt;
+            }
+
+            rx::shader::ShaderLayoutInfo::PushRange range;
+            range.stages = kMaterialStageFlags;
+            range.offset = static_cast<uint32_t>(offset);
+            range.size = static_cast<uint32_t>(elementSize);
+            result.shaderLayout.pushRanges.push_back(range);
+            foundMaterialGlobalsPushConstant = true;
+            continue;
+        }
+
+        error = "material module '" + moduleLabel + "' declares unsupported top-level global parameter '" + name +
+                "' (Phase 3 materials support exactly one ParameterBlock<...> gParams and nothing else at global "
+                "scope, plus, as of Task 4, material.slang's own optional bindless-sampling globals -- route "
+                "textures through gParams's own bindless-table indices and rx_sampleTexture instead)";
+        return std::nullopt;
     }
 
     if (!foundParamBlock) {
@@ -539,6 +735,17 @@ struct MaterialSystem::Impl {
     std::optional<rx::rhi::Allocator> allocator;
     std::optional<rx::rhi::Uploader> uploader;
     std::optional<rx::material::ParamArena> paramArena;
+
+    // [Task 4] This MaterialSystem's own single default LINEAR-filtering
+    // sampler for rx_sampleTexture() -- see material.slang's own header
+    // comment for why every material shares exactly one, and why its real
+    // bindless index is carried via a push constant (written on every
+    // bindInstance() call below) rather than a fixed/assumed slot number.
+    // Created once in create(), destroyed in ~MaterialSystem() (after that
+    // destructor's own vkDeviceWaitIdle(), same discipline as every other
+    // GPU object it tears down).
+    VkSampler defaultSampler = VK_NULL_HANDLE;
+    rx::rhi::BindlessHandle defaultSamplerHandle;
 
     // Fence-gated deferred destruction for VkPipeline (reloadChanged()'s
     // own retirements) and rx::rhi::Texture2D (releaseTexture()'s own) --
@@ -911,6 +1118,19 @@ MaterialSystem::~MaterialSystem() {
     // pipelines, a Texture2D owns no raw handle this destructor needs to
     // vkDestroy by hand).
 
+    // [Task 4] Return the default sampler's slot to `bindless`'s free list
+    // (safe -- see bindless.h's own RELEASE-SAFETY CONTRACT -- and good
+    // hygiene, exactly like releaseTexture() already does for a texture's
+    // own slot) before destroying the real VkSampler handle. Both are safe
+    // unconditionally here specifically because vkDeviceWaitIdle() above
+    // already confirmed no in-flight command buffer can still reference it.
+    if (impl.defaultSamplerHandle.isValid()) {
+        impl.bindless->release(impl.defaultSamplerHandle);
+    }
+    if (impl.defaultSampler != VK_NULL_HANDLE) {
+        vkDestroySampler(impl.device, impl.defaultSampler, nullptr);
+    }
+
     // Best-effort save -- never fatal, matching create()'s equally
     // best-effort LOAD of this same file [Task 5 ambiguity resolution].
     if (impl.pipelineCache != VK_NULL_HANDLE) {
@@ -1057,6 +1277,57 @@ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device, 
         return nullptr;
     }
 
+    // [Task 4] The single default LINEAR-filtering sampler every material's
+    // rx_sampleTexture() call samples with -- see material.slang's own
+    // header comment, and Impl::defaultSampler's, for why this is created
+    // and registered exactly once here rather than per-material or
+    // per-texture. LINEAR + no LOD clamp matches this codebase's own
+    // already-established "general-purpose color texture" sampler recipe
+    // (samples/03_bindless_mesh's own `linearInfo`) -- as opposed to sample
+    // 05's own NEAREST + CLAMP_TO_EDGE shadow/tonemap sampler, which has its
+    // own depth-comparison/1:1-copy reasons to differ.
+    //
+    // CLAMP_TO_EDGE, not sample 03's own REPEAT: this is this engine's ONE
+    // process-wide DEFAULT sampler (per-material sampler selection is
+    // explicit future work -- see this file's own header comment), used for
+    // whatever a material's own UV parameterization happens to be. A
+    // material sampling right up to UV 0/1 at a mesh seam (the common case
+    // for a unique, non-tiled albedo map -- exactly this task's own GPU
+    // test fixture, a 2x2 texture covering one quad with no tiling intent
+    // at all) gets WRONG-NEIGHBOR bleed under REPEAT (the opposite edge
+    // wraps into the filter's blend) but a well-defined, edge-duplicated
+    // result under CLAMP_TO_EDGE -- verified directly by hand and by this
+    // task's own GPU test (see task-4-report.md): REPEAT was tried first
+    // and produced exactly this 4-way-blended-corner artifact at this
+    // task's own quadrant probes, which is not a test-tuning problem but a
+    // real default-sampler-shape choice this task got to make. A material
+    // that genuinely wants tiling can still get it (a future per-material/
+    // per-texture sampler selection is real, supportable future work, not
+    // built speculatively here since nothing tests it yet); CLAMP_TO_EDGE
+    // is the safer default absent that.
+    VkSamplerCreateInfo defaultSamplerInfo{};
+    defaultSamplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    defaultSamplerInfo.magFilter = VK_FILTER_LINEAR;
+    defaultSamplerInfo.minFilter = VK_FILTER_LINEAR;
+    defaultSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    defaultSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    defaultSamplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    defaultSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    defaultSamplerInfo.maxLod = VK_LOD_CLAMP_NONE;
+    VkSampler defaultSampler = VK_NULL_HANDLE;
+    if (vkCreateSampler(device.device(), &defaultSamplerInfo, nullptr, &defaultSampler) != VK_SUCCESS) {
+        RX_LOG_ERROR("rx_material: vkCreateSampler (default material sampler) failed");
+        vkDestroyPipelineCache(device.device(), pipelineCache, nullptr);
+        return nullptr;
+    }
+    rx::rhi::BindlessHandle defaultSamplerHandle = bindless.registerSampler(defaultSampler);
+    if (!defaultSamplerHandle.isValid()) {
+        RX_LOG_ERROR("rx_material: BindlessTable::registerSampler (default material sampler) failed");
+        vkDestroySampler(device.device(), defaultSampler, nullptr);
+        vkDestroyPipelineCache(device.device(), pipelineCache, nullptr);
+        return nullptr;
+    }
+
     auto impl = std::make_unique<Impl>();
     impl->physicalDevice = device.physicalDevice();
     impl->device = device.device();
@@ -1072,6 +1343,8 @@ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device, 
     impl->allocator = std::move(allocator);
     impl->uploader = std::move(uploader);
     impl->paramArena = std::move(paramArena);
+    impl->defaultSampler = defaultSampler;
+    impl->defaultSamplerHandle = defaultSamplerHandle;
 
     return std::unique_ptr<MaterialSystem>(new MaterialSystem(std::move(impl)));
 }
@@ -1192,6 +1465,25 @@ void MaterialSystem::bindInstance(VkCommandBuffer cmd, const rx::graph::PassCont
     PipelineRequest req{binding.material, passContext.passSignature(), /*specializationBits=*/0};
     VkPipeline pipeline = getPipeline(req);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+
+    // [Task 4] Guarded on the reflected layout actually declaring this
+    // push range -- true for every material in practice (see
+    // reflectMaterialLayout()'s own header comment), but this still checks
+    // rather than assumes it: pushing unconditionally against a pipeline
+    // layout that turned out to have NO matching VkPushConstantRange would
+    // be a validation error (vkCmdPushConstants against a range absent from
+    // the bound layout), and this material's own reflected
+    // `record->layoutInfo` is the authoritative source for whether that
+    // range exists on THIS material's pipeline layout specifically -- not
+    // an assumption this function should hardcode. See material.slang's
+    // own header comment for why this value (not a fixed slot) is the real
+    // registered index of MaterialSystem's own default sampler.
+    if (!record->layoutInfo.pushRanges.empty()) {
+        const rx::shader::ShaderLayoutInfo::PushRange& range = record->layoutInfo.pushRanges[0];
+        uint32_t defaultSamplerIndex = impl.defaultSamplerHandle.index();
+        vkCmdPushConstants(cmd, record->layoutBundle.layout, range.stages, range.offset, range.size,
+                            &defaultSamplerIndex);
+    }
 
     if (record->layoutBundle.setLayouts.size() <= kMaterialParamBlockSet) {
         throw std::runtime_error(

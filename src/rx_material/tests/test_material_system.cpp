@@ -302,6 +302,40 @@ void destroyOffscreenColorImage(VkDevice device, OffscreenColorImage& img) {
 
 }  // namespace
 
+// [Task 4] material.slang now unconditionally declares its own set-0
+// `gTextures`/`gSamplers` bindless arrays and `gMaterialGlobals` push
+// constant (see that file's own header comment) -- verified directly
+// against this project's shipped Slang build (not assumed) that these are
+// NOT dead-code-eliminated from a material's own reflected program even
+// when its evaluate() never calls rx_sampleTexture at all: `import
+// material;` pulls in every one of material.slang's own top-level globals
+// regardless of which of them the importing module's entry points actually
+// reach. So EVERY material -- test_unlit.slang included, which references
+// none of them -- now reflects 3 bindings (its own set-1 gParams plus
+// material.slang's set-0 gTextures/gSamplers) and 1 push range
+// (gMaterialGlobals), not just the one gParams binding Task 5/7 originally
+// established. This is by design, not a regression: the same external
+// BindlessTable substitution (rx::rhi::PipelineLayoutBuilder::build()) is
+// wired in either way, so a material's pipeline layout is correct whether
+// or not it actually samples a texture.
+//
+// Finds the one binding in `bindings` at (set, binding) -- rather than
+// assume a fixed index -- since this test no longer controls the SHAPE
+// (1 fixed binding) precisely enough to hardcode positions the way it used
+// to; Slang's own top-level-parameter ordering for this composite is not a
+// documented contract this test should pin down beyond "some order".
+const rx::shader::ShaderLayoutInfo::Binding& findBinding(const rx::shader::ShaderLayoutInfo& layout, uint32_t set,
+                                                          uint32_t binding) {
+    for (const auto& b : layout.bindings) {
+        if (b.set == set && b.binding == binding) {
+            return b;
+        }
+    }
+    FAIL("no binding found at set " << set << " binding " << binding);
+    static rx::shader::ShaderLayoutInfo::Binding kNotFound;
+    return kNotFound;
+}
+
 TEST_CASE("MaterialSystem::loadMaterial reflects the set-1 parameter block and builds a pipeline layout") {
     auto fixture = makeFixture("rx_material_load_reflect");
     if (!fixture.has_value()) {
@@ -316,12 +350,25 @@ TEST_CASE("MaterialSystem::loadMaterial reflects the set-1 parameter block and b
     CHECK(handle.isValid());
 
     const rx::shader::ShaderLayoutInfo& layout = system->layoutInfo(handle);
-    REQUIRE(layout.bindings.size() == 1);
-    CHECK(layout.bindings[0].set == 1);
-    CHECK(layout.bindings[0].binding == 0);
-    CHECK(layout.bindings[0].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
-    CHECK(layout.bindings[0].count == 1);
-    CHECK_FALSE(layout.bindings[0].unboundedArray);
+    REQUIRE(layout.bindings.size() == 3);
+
+    const auto& paramBlock = findBinding(layout, 1, 0);
+    CHECK(paramBlock.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+    CHECK(paramBlock.count == 1);
+    CHECK_FALSE(paramBlock.unboundedArray);
+
+    const auto& textures = findBinding(layout, 0, rx::rhi::BindlessTable::kSampledImageBinding);
+    CHECK(textures.type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE);
+    CHECK(textures.unboundedArray);
+
+    const auto& samplers = findBinding(layout, 0, rx::rhi::BindlessTable::kSamplerBinding);
+    CHECK(samplers.type == VK_DESCRIPTOR_TYPE_SAMPLER);
+    CHECK(samplers.unboundedArray);
+
+    // [Task 4] gMaterialGlobals -- same "always present regardless of use"
+    // reasoning as the two bindings above.
+    REQUIRE(layout.pushRanges.size() == 1);
+    CHECK(layout.pushRanges[0].size == sizeof(uint32_t));
 
     CHECK(system->pipelineLayout(handle) != VK_NULL_HANDLE);
     CHECK_FALSE(fixture->context.hasValidationErrors());
