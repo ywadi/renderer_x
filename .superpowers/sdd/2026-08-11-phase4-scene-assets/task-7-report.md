@@ -8,6 +8,8 @@
 4. `01558ab` — ci(packaging): wire sample 07's counter gate, wall-clock artifact, and packaging
 5. `8f8e173` — test(rx_graph): cover the chunked bare/compute-pass path end to end
 6. `a03e0be` — docs(threading): finalize the Task 7 chunk-recording contract in docs/threading.md
+7. `490a261` — fix: correct the pool-allocation budget formula (was intermittently flaky) — see
+   "A flaky test, found and fixed" below
 
 No AI attribution in any commit message (verified: `git log --format=%B` on all
 six, grepped for "Claude"/"Co-Authored"/"generated" — none found). Author/committer
@@ -281,6 +283,43 @@ regression coverage added for gaps found during implementation otherwise)
 compute-chunk test added; 146 before it, 39 of which are new from this
 task).
 
+## A flaky test, found and fixed (not just reported as passing)
+
+After everything above landed and the full suite had already passed
+several times, a routine re-run of `ctest --preset linux-native` (done
+specifically because "verification-before-completion" means re-checking,
+not trusting an earlier green run) turned up an intermittent failure:
+`sample_07_stress_headless` failed on `totalPoolAllocations=17 exceeds
+budget 16`. This was investigated to a real root cause, not dismissed as
+a fluke or silently retried away.
+
+**Root cause**: both this gate's own budget assertion and an
+identically-reasoned one in `rx_graph_gpu_tests` assumed "each
+(frame-slot, thread-index) pair ever needs at most one secondary command
+buffer". That assumption is wrong: enkiTS's work-stealing gives no
+guarantee that a pass's `chunkCount` chunks land on that many *distinct*
+threads within one `execute()` call — one thread can legitimately grab
+more than one of that pass's chunks in the same frame (while another
+grabs none), needing that many buffers from its own arena that frame.
+This is correct, expected scheduling behavior — not an engine defect. The
+bug was in the test's own reasoning, not in `Executor::recordChunkedPass()`
+or `acquireChunkCommandBuffer()`.
+
+**Fix**: both assertions now use the bound that IS provably correct: a
+single `execute()` call's chunked pass has exactly `chunkCount` chunks
+total, each consuming exactly one buffer regardless of which thread
+records it, so one `execute()` call can never contribute more than
+`chunkCount` new allocations. Budget is now `frameCount * chunkCount`
+(commit `490a261`).
+
+**Verified the fix, not just the absence of the one failure already
+seen**: 40 repeated standalone runs of `sample_07_stress --draws 16
+--validate`, 20 repeated runs of `rx_graph_gpu_tests --validate`, and
+three repeated full `ctest` runs under both validation-layer
+configurations — **0 failures** across all of them post-fix (the old
+formula had reproduced the flake roughly 1 run in 15 before the fix, both
+via `ctest` and via direct repeated invocation).
+
 ## Verification
 
 - **Full suite, linux-native, default validation layer**: `xvfb-run -a
@@ -322,6 +361,9 @@ task).
   per-sample layout.
 - **CI YAML**: validated with `python3 -c "import yaml; ...load..."` (parses
   clean) and `actionlint` (zero findings).
+- **Stability** (post pool-budget fix, above): 40× `sample_07_stress`
+  standalone, 20× `rx_graph_gpu_tests` standalone, 3× full `ctest` under
+  each validation-layer configuration — 0 failures.
 
 ## Numbers (dev machine, Intel Core i7-9700F @ 3.00GHz, 8 cores/8 threads,
 hardware_concurrency()==8 → default Scheduler worker count == 7)
