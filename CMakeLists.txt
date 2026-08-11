@@ -22,6 +22,25 @@ enable_testing()
 # on an RX_TRACY=OFF build).
 option(RX_TRACY "Enable the Tracy profiler client (CPU + Vulkan GPU zones); OFF removes Tracy entirely from the build" ON)
 
+# RX_DEBUG_CHECKS: engine-wide switch for dev-time runtime assertions
+# (RX_ASSERT_MAIN_THREAD, rx_core/debug_checks.h) [Phase 4 Task 7 fix round
+# 1, spec D4's "Chunk-0 main-thread guarantee" paragraph: "main-thread-only
+# subsystems carry debug thread-affinity assertions (dev-preset-active
+# regardless of NDEBUG)"] -- ON by default (and explicitly ON in both dev
+# presets, CMakePresets.json) but trivially OFF-able (`-DRX_DEBUG_CHECKS=OFF`),
+# independent of RX_TRACY (a different concern) and independent of NDEBUG
+# (this project's own presets both compile with `-DNDEBUG`, which would
+# silently remove a bare `assert()` -- this option exists specifically so
+# a real violation is caught in the SAME builds this project actually
+# produces). Read by src/rx_core/CMakeLists.txt to decide whether
+# RX_DEBUG_CHECKS is defined (PUBLIC, transitively) and debug_checks.cpp's
+# real body compiles in at all -- when OFF, every RX_ASSERT_MAIN_THREAD
+# call site expands to nothing and the resulting binaries contain zero
+# guard-related symbols (verified in task-7-report.md's fix-round section
+# via nm/strings, mirroring RX_TRACY's own OFF-verification convention
+# above).
+option(RX_DEBUG_CHECKS "Enable dev-time thread-affinity assertions (RX_ASSERT_MAIN_THREAD); independent of NDEBUG" ON)
+
 add_subdirectory(third_party)
 
 include(tools/fetch_slang.cmake)
