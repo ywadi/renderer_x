@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Packages this project's six sample binaries into a single per-platform
+# Packages this project's seven sample binaries into a single per-platform
 # .zip laid out exactly as a user would unzip-and-run it: one subdirectory
 # per sample, containing that sample's binary plus everything IT needs to
 # run standalone -- nothing more, nothing missing [R:D2].
@@ -45,6 +45,14 @@
 #                     MaterialSystem::create() `sharedShaderDir` parameter
 #                     and samples/06_materials/main.cpp's
 #                     basePathDirectory()) + Slang runtime libs + LICENSE
+#   07_stress         binary + shaders/stress/*.slang (4 files:
+#                     instanced.vert.slang/instanced.frag.slang/
+#                     tonemap.vert.slang/tonemap.frag.slang -- see
+#                     samples/07_stress/CMakeLists.txt's own POST_BUILD
+#                     deploy step) + Slang runtime libs + LICENSE (no other
+#                     external asset -- every mesh is procedural, every
+#                     instance's transform/color lives in a bindless
+#                     storage buffer this sample uploads itself)
 #
 # This script does NOT build anything -- it assumes `cmake --build
 # --preset <preset>` already ran and each sample's build-output directory
@@ -132,12 +140,12 @@ copy_required "$SAMPLE_DIR" \
   "$SAMPLES_BUILD_DIR/01_triangle/triangle.frag.spv"
 
 # --- 02_hotreload / 03_bindless_mesh / 04_streaming / 05_multipass /
-# 06_materials: real in-process Slang compilation -- each needs the Slang
-# runtime libs + LICENSE deployed next to it. Globbed rather than hardcoded
-# to the pinned version string, same posture as
+# 06_materials / 07_stress: real in-process Slang compilation -- each needs
+# the Slang runtime libs + LICENSE deployed next to it. Globbed rather than
+# hardcoded to the pinned version string, same posture as
 # rx_shader_deploy_runtime_libs() in src/rx_shader/CMakeLists.txt: Linux
 # filenames embed the Slang version, Windows filenames don't [R:A1/A6/D2].
-for RX_SAMPLE in 02_hotreload 03_bindless_mesh 04_streaming 05_multipass 06_materials; do
+for RX_SAMPLE in 02_hotreload 03_bindless_mesh 04_streaming 05_multipass 06_materials 07_stress; do
   SAMPLE_DIR="$STAGE_DIR/$RX_SAMPLE"
   mkdir -p "$SAMPLE_DIR"
   copy_required "$SAMPLE_DIR" "$SAMPLES_BUILD_DIR/$RX_SAMPLE/sample_${RX_SAMPLE}${RX_EXE_SUFFIX}"
@@ -171,7 +179,13 @@ done
 # subdirectory carrying rx_material's two shared files (material.slang/
 # forward_entry.slang) -- see samples/06_materials/CMakeLists.txt's own
 # POST_BUILD deploy steps for why two separate subdirectories, not a flat
-# layout like 05's.
+# layout like 05's. 07 ships its own four on-disk shader sources flat (same
+# convention as 05 -- see samples/07_stress/CMakeLists.txt's own POST_BUILD
+# deploy step): instanced.vert.slang/instanced.frag.slang (the chunked
+# forward pass) and tonemap.vert.slang/tonemap.frag.slang (its own copy,
+# not shared with 05's -- see shaders/stress/tonemap.*.slang's own header
+# comment for why this codebase does not share per-pass shader files
+# across samples).
 copy_required "$STAGE_DIR/02_hotreload" "$SAMPLES_BUILD_DIR/02_hotreload/hotreload.slang"
 copy_required "$STAGE_DIR/03_bindless_mesh" "$SAMPLES_BUILD_DIR/03_bindless_mesh/texture.png"
 copy_required "$STAGE_DIR/05_multipass" \
@@ -188,13 +202,18 @@ copy_required "$STAGE_DIR/06_materials/materials" \
 copy_required "$STAGE_DIR/06_materials/material_shaders" \
   "$SAMPLES_BUILD_DIR/06_materials/material_shaders/material.slang" \
   "$SAMPLES_BUILD_DIR/06_materials/material_shaders/forward_entry.slang"
+copy_required "$STAGE_DIR/07_stress" \
+  "$SAMPLES_BUILD_DIR/07_stress/instanced.vert.slang" \
+  "$SAMPLES_BUILD_DIR/07_stress/instanced.frag.slang" \
+  "$SAMPLES_BUILD_DIR/07_stress/tonemap.vert.slang" \
+  "$SAMPLES_BUILD_DIR/07_stress/tonemap.frag.slang"
 
 mkdir -p "$(dirname "$RX_OUT_ZIP")"
 RX_OUT_ZIP_ABS="$(cd "$(dirname "$RX_OUT_ZIP")" && pwd)/$(basename "$RX_OUT_ZIP")"
 rm -f "$RX_OUT_ZIP_ABS"
 
 echo "package_samples: zipping into '$RX_OUT_ZIP_ABS' ..."
-(cd "$STAGE_DIR" && zip -r -X -q "$RX_OUT_ZIP_ABS" 01_triangle 02_hotreload 03_bindless_mesh 04_streaming 05_multipass 06_materials)
+(cd "$STAGE_DIR" && zip -r -X -q "$RX_OUT_ZIP_ABS" 01_triangle 02_hotreload 03_bindless_mesh 04_streaming 05_multipass 06_materials 07_stress)
 
 echo "package_samples: done. Contents:"
 unzip -l "$RX_OUT_ZIP_ABS"

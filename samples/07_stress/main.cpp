@@ -1364,8 +1364,23 @@ int runHeadless(const Args& args) {
     bool gateOk = true;
     for (uint32_t frame = 0; frame < kHeadlessFrameCount; ++frame) {
         scene->drawsSubmitted->store(0, std::memory_order_relaxed);
-        cmdCtx->runOnce(
-            [&](VkCommandBuffer cmd) { executor->execute(graph, cmd, offscreenImage, offscreenView, extent); });
+        // Timed around ONLY executor->execute() itself, inside runOnce()'s
+        // own record callback -- NOT runOnce() as a whole, which also
+        // vkQueueSubmit()s and vkQueueWaitIdle()s (a synchronous setup/test
+        // convenience -- rx_rhi_vk/command.h's own doc comment -- whose GPU
+        // wait time has nothing to do with CPU recording cost). This is the
+        // same "cpu_record_ms" this sample's --present loop reports, just
+        // computed here so a plain headless run -- the shape CI can run
+        // without a real display -- produces the identical published metric
+        // [task-7-brief.md item 8: "single-thread vs default worker count
+        // CPU record-time for the forward pass"].
+        double recordMs = 0.0;
+        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+            const auto recordStart = std::chrono::steady_clock::now();
+            executor->execute(graph, cmd, offscreenImage, offscreenView, extent);
+            const auto recordEnd = std::chrono::steady_clock::now();
+            recordMs = std::chrono::duration<double, std::milli>(recordEnd - recordStart).count();
+        });
         RX_FRAME_MARK;
 
         const uint64_t drawsThisFrame = scene->drawsSubmitted->load(std::memory_order_relaxed);
@@ -1386,8 +1401,12 @@ int runHeadless(const Args& args) {
                          stats.totalPoolAllocations, poolBudget);
             gateOk = false;
         }
-        RX_LOG_INFO("sample_07_stress: frame {}: draws={} chunkCount={} poolAllocations={}", frame, drawsThisFrame,
-                    stats.lastChunkCount, stats.totalPoolAllocations);
+        // "stress:" prefix matches --present's own per-second stats line --
+        // this is the line tools/*, CI, and task-7-report.md all grep for
+        // (see this file's header comment).
+        RX_LOG_INFO("stress: frame={} threads={} cpu_record_ms={:.3f} draws={} chunkCount={} poolAllocations={}",
+                    frame, scheduler->workerCount(), recordMs, drawsThisFrame, stats.lastChunkCount,
+                    stats.totalPoolAllocations);
     }
 
     auto readback = allocator->createHostVisibleBuffer(kHeadlessPixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
