@@ -1,5 +1,116 @@
 # Task 3 report: Tracy profiler client integration
 
+## Hotfix (defect found post-closure by Task 4's implementer)
+
+**Defect:** `src/rx_rhi_vk/src/tracy_gpu.cpp`'s `createGpuProfileContext()`
+created its short-lived setup `VkCommandPool` with only
+`VK_COMMAND_POOL_CREATE_TRANSIENT_BIT` — missing
+`VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT`. Task 4's implementer hit
+this building a real `rx::graph::Executor` under `RX_TRACY=ON` with
+validation (full diagnosis: `task-4-report.md`, "Concern" section).
+
+**Root cause, traced directly against the vendored v0.14.0
+`TracyVulkan.hpp`:** `VkCtx`'s constructor (both the plain and calibrated
+overload) always does ONE begin/end/submit/waitIdle cycle on the setup
+`cmd` first (`CreateQueryPool()`'s own reset). Then, **only when
+`m_timeDomain` is still `VK_TIME_DOMAIN_DEVICE_EXT`** — i.e.
+`FindAvailableTimeDomains()` did not find a host-comparable calibration
+domain (`VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_EXT` on Linux) among whatever
+`vkGetPhysicalDeviceCalibrateableTimeDomainsEXT` reports for the selected
+physical device — it re-begins the SAME `cmd` **two more times** for the
+timestamp-write and re-reset steps. Re-beginning a command buffer that has
+already reached the executable state, without an explicit
+`vkResetCommandBuffer`/`vkResetCommandPool` in between, requires the
+owning pool to carry `VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT`
+(Vulkan spec, `VUID-vkBeginCommandBuffer-commandBuffer-00050`). Our pool
+didn't have it.
+
+**Fix, and why this flag and not "reset the pool per collect cycle":** the
+setup pool in question is created, used, and destroyed entirely within one
+`createGpuProfileContext()` call — it never touches the per-frame
+`RX_GPU_COLLECT` path (that runs on a completely different, caller-owned
+command buffer elsewhere). There is no "collect cycle" of this project's
+own to insert a reset into: every extra `vkBeginCommandBuffer` happens
+*inside* Tracy's own constructor, synchronously, with no seam this
+project's code could hook a reset into even if desired. The pool's own
+creation flag is the only lever available, and it is also the textbook-
+correct one — it is exactly the contract Tracy's own manual states for
+this buffer ("must be in the initial state and be able to be reset...
+will rerecord and submit it to the queue multiple times"). Added
+`VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT` to the pool's `flags`
+(OR'd with the existing `TRANSIENT_BIT`), with the reasoning above recorded
+as a comment at the call site.
+
+### Verification
+
+**Reproduced first, then fixed, then reproduced-fixed** (not fix-then-hope):
+
+1. Confirmed the failure is real and driver-dependent, not universal:
+   forcing lavapipe alone (`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`)
+   and running `rx_graph_gpu_tests --validate` against the **pre-fix**
+   binary reproduced the exact VUID Task 4 reported
+   (`VUID-vkBeginCommandBuffer-commandBuffer-00050`), 5/5 test cases
+   failing. Running the identical binary with the DEFAULT device
+   selection (NVIDIA discrete GPU visible and preferred by vk-bootstrap)
+   showed 0 failures — confirming the bug is real but conditionally
+   exercised, not something the pre-fix binary always trips.
+2. Applied the fix, rebuilt.
+3. **`rx_graph_gpu_tests` and `rx_material_gpu_tests`, lavapipe forced,
+   default (system) validation layer:** 5/5 and 25/25 test cases pass
+   (84/84 and 344/344 assertions), zero `VUID-vkBeginCommandBuffer`
+   errors — only this codebase's own pre-existing, already-documented
+   `VK_KHR_portability_enumeration`-layer-version false positives.
+4. **Same two binaries, lavapipe forced, `VK_LAYER_PATH=/home/ywadi/sponza/vvl`
+   (the "newer" layer build):** 5/5 and 25/25 pass, **zero** validation
+   lines of any kind (that layer build doesn't even emit the
+   portability-enumeration false positives round 1's report already
+   catalogued) — clean under both validation layers, as required.
+5. **Full suite, both dev presets, default device selection (standard
+   `ctest`):** `linux-native` 16/16 (28.7s), `windows-cross-zig` 16/16
+   (51.4s, Wine-executed) — no regression from the fix.
+
+### Why did the original Task 3 verification (16/16 green) not catch this?
+
+**Answer:** vk-bootstrap's `PhysicalDeviceSelector` prefers the discrete
+GPU when more than one device is visible, and this dev machine has both
+an NVIDIA proprietary driver and Mesa llvmpipe/lavapipe installed — every
+`ctest` run in round 1 and fix round 1 used the *default* device
+selection, which picked NVIDIA, never lavapipe. Traced directly against
+`TracyVulkan.hpp`'s `FindAvailableTimeDomains()`: NVIDIA's driver reports
+`VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_EXT` among its calibrateable time
+domains, so Tracy's `VkCtx` constructor takes the **single-begin**
+branch (no re-record at all) — the bug is structurally unreachable on
+that path. Lavapipe reports only `VK_TIME_DOMAIN_DEVICE_EXT` (confirmed
+by forcing it and observing the VUID above), forcing the **multi-begin**
+branch that the missing reset flag actually breaks. Round 1's own report
+DID check lavapipe — but only for `VK_EXT_calibrated_timestamps`
+*extension presence* (`vulkaninfo`'s extension list, confirmed present on
+both drivers) — never for which *time domains* the extension reports once
+enabled, which is the finer-grained, driver-specific fact that actually
+decides which of Tracy's two constructor branches runs. Extension
+presence and "which calibration domains it offers" are different facts;
+checking only the former missed the latter.
+
+**Verification-matrix gap, stated plainly:** a local `ctest` run on any
+developer machine with a discrete GPU installed silently exercises only
+that GPU's device-selection path — never lavapipe — for every test that
+constructs a real `Device`/`Executor`, even though this project's own CI
+target and documented reference driver *is* lavapipe. "Green suite
+locally" and "green suite on the driver CI actually runs on" are not the
+same claim unless a run explicitly forces the CI driver via
+`VK_ICD_FILENAMES`. Task 3's own verification checklist never did this for
+the GPU-context-creation path specifically (device/Executor-constructing
+GPU tests) — it should have, every time a task touches Vulkan device or
+context creation, not only when a task's own brief happens to mention
+lavapipe. Recording this here for the Stage 0 audit: **any task whose
+diff can affect physical-device selection, device/Executor construction,
+or per-device Vulkan object creation should include an explicit
+lavapipe-forced GPU-test run in its own verification, not just a plain
+`ctest` pass**, exactly as this hotfix now does and as Task 4's own
+verification already did unprompted.
+
+---
+
 ## Fix round 1 (post-review)
 
 Review (`task-3-review.md`, commit `460d7b6`): **Approved with findings** —
