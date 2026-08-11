@@ -174,3 +174,147 @@ TEST_CASE("Device acquire/present round-trip succeeds without device loss") {
 
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
+
+// Present-mode control [Phase 4 Task 6, spec seed 1]. Same fixture and same
+// acquire/record/submit/present shape as the round-trip test directly
+// above -- including its fixed COLOR_ATTACHMENT_OUTPUT barrier srcStage,
+// which matters here for exactly the reason that test's own comment gives:
+// a TOP_OF_PIPE-sourced layout transition is not ordered by the acquire
+// semaphore's wait and would race the acquire under synchronization
+// validation. This test drives that same shape against a swapchain that
+// has gone through Device::setPresentMode()/recreateSwapchain() rather
+// than the one straight out of Device::create(), which is the one thing
+// it adds.
+TEST_CASE("Device present-mode ladder: VsyncOn is FIFO; VsyncOff recreates cleanly to an available mode") {
+    auto fixture = makeFixture("rx_rhi_vk_device_test_present_mode");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto device = rx::rhi::Device::create(fixture->context, fixture->surface);
+    REQUIRE(device.has_value());
+
+    // Creation-time default [Task 6]: explicit FIFO under
+    // PresentMode::VsyncOn -- replacing vk-bootstrap's previous implicit
+    // MAILBOX-if-available preference. See device.cpp's Device::create()
+    // comment at its swapchain-builder call site.
+    CHECK(device->presentMode() == VK_PRESENT_MODE_FIFO_KHR);
+
+    // setPresentMode() only records the request; recreateSwapchain() (the
+    // very same NeedsRecreate path a real window resize already drives) is
+    // what actually applies it -- no second recreation flow exists to call
+    // instead.
+    device->setPresentMode(rx::rhi::PresentMode::VsyncOff);
+    REQUIRE(device->recreateSwapchain(fixture->surface));
+
+    // The ladder's CONTRACT, not a specific optional mode: under
+    // Xvfb/lavapipe (this project's CI GPU) only FIFO may actually be
+    // reported available for this surface, in which case the ladder's own
+    // documented fallback (MAILBOX -> IMMEDIATE -> FIFO-with-warning,
+    // device.cpp's selectPresentMode()) is exactly what gets exercised
+    // here and FIFO is the correct, expected outcome -- not a failure. A
+    // driver/surface that does support MAILBOX or IMMEDIATE instead
+    // resolves to one of those. Either way the result must be one of these
+    // three; nothing else is a valid ladder output.
+    const VkPresentModeKHR actualAfterVsyncOff = device->presentMode();
+    CHECK((actualAfterVsyncOff == VK_PRESENT_MODE_MAILBOX_KHR ||
+           actualAfterVsyncOff == VK_PRESENT_MODE_IMMEDIATE_KHR ||
+           actualAfterVsyncOff == VK_PRESENT_MODE_FIFO_KHR));
+
+    VkDevice vkDevice = device->device();
+
+    VkSemaphoreCreateInfo semaphoreInfo{};
+    semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    VkSemaphore acquireSemaphore = VK_NULL_HANDLE;
+    VkSemaphore renderFinishedSemaphore = VK_NULL_HANDLE;
+    REQUIRE(vkCreateSemaphore(vkDevice, &semaphoreInfo, nullptr, &acquireSemaphore) == VK_SUCCESS);
+    REQUIRE(vkCreateSemaphore(vkDevice, &semaphoreInfo, nullptr, &renderFinishedSemaphore) == VK_SUCCESS);
+
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VkFence submitFence = VK_NULL_HANDLE;
+    REQUIRE(vkCreateFence(vkDevice, &fenceInfo, nullptr, &submitFence) == VK_SUCCESS);
+
+    // Throwaway command pool/buffer, local to this test -- same rationale
+    // as the round-trip test above.
+    VkCommandPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    poolInfo.queueFamilyIndex = device->graphicsQueueFamily();
+    VkCommandPool commandPool = VK_NULL_HANDLE;
+    REQUIRE(vkCreateCommandPool(vkDevice, &poolInfo, nullptr, &commandPool) == VK_SUCCESS);
+
+    VkCommandBufferAllocateInfo cmdAllocInfo{};
+    cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmdAllocInfo.commandPool = commandPool;
+    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdAllocInfo.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    REQUIRE(vkAllocateCommandBuffers(vkDevice, &cmdAllocInfo, &cmd) == VK_SUCCESS);
+
+    auto acquire = device->acquireNextImage(acquireSemaphore);
+    REQUIRE(acquire.status == rx::rhi::SwapchainStatus::Ok);
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    REQUIRE(vkBeginCommandBuffer(cmd, &beginInfo) == VK_SUCCESS);
+
+    // No rendering happens in this test -- just the mandatory
+    // UNDEFINED -> PRESENT_SRC_KHR layout transition every acquired image
+    // needs before it can be presented.
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = 0;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = device->swapchainImages()[acquire.imageIndex];
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+
+    // srcStage must be COLOR_ATTACHMENT_OUTPUT -- the same stage the submit
+    // below waits the acquire semaphore at. See the round-trip test above
+    // for the full rationale (a TOP_OF_PIPE-sourced layout transition is
+    // NOT ordered by that wait and races the acquire under synchronization
+    // validation).
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
+                         nullptr, 0, nullptr, 1, &barrier);
+
+    REQUIRE(vkEndCommandBuffer(cmd) == VK_SUCCESS);
+
+    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.waitSemaphoreCount = 1;
+    submitInfo.pWaitSemaphores = &acquireSemaphore;
+    submitInfo.pWaitDstStageMask = &waitStage;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
+    submitInfo.signalSemaphoreCount = 1;
+    submitInfo.pSignalSemaphores = &renderFinishedSemaphore;
+
+    REQUIRE(vkQueueSubmit(device->graphicsQueue(), 1, &submitInfo, submitFence) == VK_SUCCESS);
+    REQUIRE(vkWaitForFences(vkDevice, 1, &submitFence, VK_TRUE, UINT64_MAX) == VK_SUCCESS);
+
+    auto presentStatus = device->present(acquire.imageIndex, renderFinishedSemaphore);
+    CHECK(presentStatus != rx::rhi::SwapchainStatus::DeviceLost);
+
+    // Same ordering rationale as the round-trip test above: never destroy a
+    // semaphore the presentation engine might still be consuming without an
+    // idle/fence guarantee first.
+    vkDeviceWaitIdle(vkDevice);
+
+    vkDestroyCommandPool(vkDevice, commandPool, nullptr);
+    vkDestroyFence(vkDevice, submitFence, nullptr);
+    vkDestroySemaphore(vkDevice, renderFinishedSemaphore, nullptr);
+    vkDestroySemaphore(vkDevice, acquireSemaphore, nullptr);
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}

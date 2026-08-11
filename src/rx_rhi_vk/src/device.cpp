@@ -2,11 +2,27 @@
 #include <rx_core/log.h>
 #include <rx_core/profile.h>
 #include <VkBootstrap.h>
+#include <algorithm>
 #include <array>
 #include <utility>
 #include <vector>
 
 namespace rx::rhi {
+
+const char* presentModeName(VkPresentModeKHR mode) {
+    switch (mode) {
+        case VK_PRESENT_MODE_FIFO_KHR:
+            return "FIFO";
+        case VK_PRESENT_MODE_MAILBOX_KHR:
+            return "MAILBOX";
+        case VK_PRESENT_MODE_IMMEDIATE_KHR:
+            return "IMMEDIATE";
+        case VK_PRESENT_MODE_FIFO_RELAXED_KHR:
+            return "FIFO_RELAXED";
+        default:
+            return "UNKNOWN";
+    }
+}
 
 namespace {
 
@@ -100,6 +116,57 @@ void logDescriptorIndexingFeatureGaps(VkInstance instance) {
             "else (surface support, queue families, Vulkan 1.1/1.3 feature requirements, or API "
             "version)");
     }
+}
+
+// Present-mode fallback ladder [Phase 4 Task 6, spec seed 1, R:present].
+// Resolves `desired` against the present modes this physical device
+// actually reports supporting for `surface` (queried directly via
+// vkGetPhysicalDeviceSurfacePresentModesKHR, per this task's resolution --
+// VK_KHR_surface is always enabled at instance level by the time this
+// runs, since every Device is built from a real windowing surface, so the
+// function pointer is already loaded by Context::create()'s
+// volkLoadInstance() call).
+//
+// PresentMode::VsyncOn always resolves to FIFO with no query needed: FIFO
+// is the one present mode the Vulkan spec guarantees every surface
+// supports (spec 34.1, "Presentation Mode Support"), so asking the driver
+// first would only ever confirm what the spec already promises.
+//
+// PresentMode::VsyncOff prefers MAILBOX (uncapped framerate, no tearing),
+// then IMMEDIATE (uncapped, tearing possible), and only falls back to
+// FIFO -- logging a one-line warning when it does, since that silently
+// keeps vsync effectively on despite the caller asking for it off -- when
+// this surface supports neither. The returned mode is always one this
+// surface has already been confirmed to support, so the caller can hand
+// it straight to vkb::SwapchainBuilder::set_desired_present_mode()
+// without relying on vk-bootstrap's own (different, undocumented-here)
+// fallback behavior.
+VkPresentModeKHR selectPresentMode(VkPhysicalDevice physicalDevice, VkSurfaceKHR surface, PresentMode desired) {
+    if (desired == PresentMode::VsyncOn) {
+        return VK_PRESENT_MODE_FIFO_KHR;
+    }
+
+    uint32_t modeCount = 0;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, surface, &modeCount, nullptr);
+    std::vector<VkPresentModeKHR> supportedModes(modeCount);
+    if (modeCount > 0) {
+        vkGetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, surface, &modeCount, supportedModes.data());
+    }
+
+    auto supports = [&supportedModes](VkPresentModeKHR mode) {
+        return std::find(supportedModes.begin(), supportedModes.end(), mode) != supportedModes.end();
+    };
+
+    if (supports(VK_PRESENT_MODE_MAILBOX_KHR)) {
+        return VK_PRESENT_MODE_MAILBOX_KHR;
+    }
+    if (supports(VK_PRESENT_MODE_IMMEDIATE_KHR)) {
+        return VK_PRESENT_MODE_IMMEDIATE_KHR;
+    }
+    RX_LOG_WARN(
+        "Device: PresentMode::VsyncOff requested but this surface supports neither MAILBOX nor IMMEDIATE -- "
+        "falling back to FIFO (vsync stays effectively on)");
+    return VK_PRESENT_MODE_FIFO_KHR;
 }
 
 }  // namespace
@@ -226,6 +293,19 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
     }
 
     vkb::SwapchainBuilder swapchainBuilder(vkbDevice, surface);
+    // Present-mode control [Phase 4 Task 6, spec seed 1]: explicit FIFO
+    // default (PresentMode::VsyncOn), not vk-bootstrap's own implicit
+    // preference (MAILBOX if the surface supports it, else FIFO). This is
+    // a BEHAVIORAL CHANGE from every Device built before this task: a
+    // sample that happened to run against a MAILBOX-capable surface
+    // previously got MAILBOX with no code anywhere having chosen it; now
+    // it gets FIFO unless something explicitly opts out via
+    // setPresentMode(PresentMode::VsyncOff) + recreateSwapchain() (see
+    // those methods' own comments) -- e.g. a sample's --vsync off flag.
+    // No availability query is needed for FIFO specifically -- see
+    // selectPresentMode()'s own comment above on why the spec already
+    // guarantees it for every surface.
+    swapchainBuilder.set_desired_present_mode(VK_PRESENT_MODE_FIFO_KHR);
     auto swapchainResult = swapchainBuilder.build();
     if (!swapchainResult) {
         RX_LOG_ERROR("vkb::SwapchainBuilder::build failed: {}", swapchainResult.error().message());
@@ -259,6 +339,10 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
     dev.swapchainImages_ = imagesResult.value();
     dev.swapchainFormat_ = vkbSwapchain.image_format;
     dev.swapchainExtent_ = vkbSwapchain.extent;
+    dev.desiredPresentMode_ = PresentMode::VsyncOn;
+    dev.actualPresentMode_ = vkbSwapchain.present_mode;
+    RX_LOG_INFO("Device::create: present mode in use: {} (explicit default, PresentMode::VsyncOn)",
+                presentModeName(dev.actualPresentMode_));
     return dev;
 }
 
@@ -282,6 +366,8 @@ Device& Device::operator=(Device&& other) noexcept {
         swapchainImages_ = std::move(other.swapchainImages_);
         swapchainFormat_ = other.swapchainFormat_;
         swapchainExtent_ = other.swapchainExtent_;
+        desiredPresentMode_ = other.desiredPresentMode_;
+        actualPresentMode_ = other.actualPresentMode_;
 
         other.instance_ = VK_NULL_HANDLE;
         other.physicalDevice_ = VK_NULL_HANDLE;
@@ -295,6 +381,8 @@ Device& Device::operator=(Device&& other) noexcept {
         other.swapchainImages_.clear();
         other.swapchainFormat_ = VK_FORMAT_UNDEFINED;
         other.swapchainExtent_ = VkExtent2D{0, 0};
+        other.desiredPresentMode_ = PresentMode::VsyncOn;
+        other.actualPresentMode_ = VK_PRESENT_MODE_FIFO_KHR;
     }
     return *this;
 }
@@ -370,6 +458,13 @@ SwapchainStatus Device::present(uint32_t imageIndex, VkSemaphore wait) {
     }
 }
 
+void Device::setPresentMode(PresentMode mode) {
+    // See this method's own header comment: this only records `mode` for
+    // the next recreateSwapchain() call to apply -- no swapchain touched
+    // here, no second recreation flow invented.
+    desiredPresentMode_ = mode;
+}
+
 bool Device::recreateSwapchain(VkSurfaceKHR surface) {
     if (surface != surface_) {
         // Not necessarily wrong (a caller could legitimately be handing
@@ -392,7 +487,21 @@ bool Device::recreateSwapchain(VkSurfaceKHR surface) {
     }
     swapchainImages_.clear();
 
+    // Present-mode control [Phase 4 Task 6]: resolve the mode most
+    // recently recorded via setPresentMode() (VsyncOn by default, matching
+    // create()'s own default) against what this surface actually supports
+    // -- see selectPresentMode()'s comment for the exact ladder -- and
+    // hand the already-verified-available result straight to
+    // set_desired_present_mode(). This is the sole place that ladder
+    // executes for a live Device: create() above inlines the VsyncOn-only
+    // half of it (no query needed for FIFO), and every present-mode change
+    // after creation, whether from a real resize/NeedsRecreate or a
+    // caller-driven setPresentMode() + recreateSwapchain() pair, flows
+    // through here.
+    VkPresentModeKHR selectedPresentMode = selectPresentMode(physicalDevice_, surface, desiredPresentMode_);
+
     vkb::SwapchainBuilder swapchainBuilder(physicalDevice_, device_, surface);
+    swapchainBuilder.set_desired_present_mode(selectedPresentMode);
     auto swapchainResult = swapchainBuilder.build();
     if (!swapchainResult) {
         RX_LOG_ERROR("vkb::SwapchainBuilder::build failed during recreate: {}", swapchainResult.error().message());
@@ -412,6 +521,9 @@ bool Device::recreateSwapchain(VkSurfaceKHR surface) {
     swapchainFormat_ = vkbSwapchain.image_format;
     swapchainExtent_ = vkbSwapchain.extent;
     surface_ = surface;
+    actualPresentMode_ = vkbSwapchain.present_mode;
+    RX_LOG_INFO("Device::recreateSwapchain: present mode in use: {} ({})", presentModeName(actualPresentMode_),
+                desiredPresentMode_ == PresentMode::VsyncOn ? "PresentMode::VsyncOn" : "PresentMode::VsyncOff");
     return true;
 }
 

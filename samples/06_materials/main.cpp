@@ -141,7 +141,12 @@
 //   reload-fixture convention of only ever changing a material's MATH, not
 //   its params' shape, across reload versions) -- rather than let that
 //   crash a running --present session, that one object's draw is skipped
-//   for the frame and the failure is logged.
+//   for the frame and the failure is logged. Also accepts --vsync on|off
+//   (default on) [Phase 4 Task 6]: forwarded into Device::setPresentMode()
+//   + recreateSwapchain() right after Device::create(), before any
+//   per-swapchain-image resource is built. Has no effect in headless mode,
+//   whose swapchain is built once and never presented -- the flag still
+//   parses there, it just has nothing to apply to.
 #include <rx_material/rx_api.h>  // PUBLIC surface -- used throughout this file below.
 
 #include <rx_core/log.h>
@@ -1426,7 +1431,7 @@ int runHeadless(bool enableValidation) {
 }
 
 // --- --present mode: real window, orbiting camera, hot-reload polling ------
-int runPresent(bool enableValidation) {
+int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode) {
     auto window = rx::platform::Window::create("rx_materials_sample (--present)", static_cast<int>(kPresentWidth),
                                                  static_cast<int>(kPresentHeight), /*visible=*/true);
     if (!window.has_value()) {
@@ -1458,6 +1463,24 @@ int runPresent(bool enableValidation) {
         return 1;
     }
     const VkDevice vkDevice = device->device();
+
+    // --vsync [Phase 4 Task 6]: Device::create() always builds its
+    // swapchain with an explicit FIFO default (PresentMode::VsyncOn) --
+    // see device.cpp's own comment at the creation site. setPresentMode()
+    // only records what the caller wants; recreateSwapchain() (the exact
+    // path the NeedsRecreate handling below already drives on a real
+    // resize) is what actually applies it -- reused here, once, before any
+    // per-swapchain-image resource (FrameSync, image views) is built
+    // against this device, so nothing downstream is built against a
+    // swapchain generation that is about to be replaced.
+    if (vsyncMode == rx::rhi::PresentMode::VsyncOff) {
+        device->setPresentMode(vsyncMode);
+        if (!device->recreateSwapchain(surface)) {
+            RX_LOG_ERROR("Device::recreateSwapchain failed while applying --vsync off");
+            return 1;
+        }
+    }
+    RX_LOG_INFO("--present: present mode in use: {}", rx::rhi::presentModeName(device->presentMode()));
 
     auto allocator = rx::rhi::Allocator::create(*context, *device);
     if (!allocator.has_value()) {
@@ -1737,16 +1760,32 @@ int main(int argc, char** argv) {
 
     bool presentMode = false;
     bool enableValidation = false;
+    // --vsync on|off, default on [Phase 4 Task 6] -- forwarded to
+    // runPresent() only. Headless mode's swapchain is built once via
+    // Device::create() and never presented (see this file's header
+    // comment), so there is nothing for a present-mode choice to affect
+    // there; the flag is still parsed like any other (no error on it) but
+    // simply has no effect in that path.
+    rx::rhi::PresentMode vsyncMode = rx::rhi::PresentMode::VsyncOn;
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--present") {
             presentMode = true;
         } else if (std::string_view(argv[i]) == "--validate") {
             enableValidation = true;
+        } else if (std::string_view(argv[i]) == "--vsync" && i + 1 < argc) {
+            std::string_view value = argv[++i];
+            if (value == "off") {
+                vsyncMode = rx::rhi::PresentMode::VsyncOff;
+            } else if (value == "on") {
+                vsyncMode = rx::rhi::PresentMode::VsyncOn;
+            } else {
+                RX_LOG_ERROR("--vsync expects 'on' or 'off', got '{}' -- defaulting to on", value);
+            }
         }
     }
 
     if (presentMode) {
-        return runPresent(enableValidation);
+        return runPresent(enableValidation, vsyncMode);
     }
     return runHeadless(enableValidation);
 }

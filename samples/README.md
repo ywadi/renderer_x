@@ -97,6 +97,25 @@ exact same pipeline-construction code and draw call:
   checklist does). Not part of `ctest` — it's interactive by nature. See
   `MANUAL_VERIFICATION.md` at the repo root for the per-platform manual
   check this mode gets before a release.
+- **`--vsync on|off`** (default `on`) — present-mode control
+  [`src/rx_rhi_vk/include/rx_rhi_vk/device.h`'s `Device::setPresentMode()`].
+  **Behavioral change from earlier phases:** `Device::create()` used to
+  hand swapchain creation to vk-bootstrap with no present mode requested at
+  all, which meant an *implicit* MAILBOX-if-the-surface-supports-it,
+  else-FIFO preference — nobody in this codebase had actually chosen that,
+  it just fell out of vk-bootstrap's own default. Every `Device` now
+  requests an *explicit* default of FIFO (`on`, the default here) instead,
+  so a plain `--present` run with no `--vsync` flag behaves the same on
+  every machine regardless of what the surface happens to support. Pass
+  `--vsync off` to opt into the uncapped-framerate ladder instead: MAILBOX
+  if the surface supports it, else IMMEDIATE, else FIFO again (with a
+  one-line warning logged, since that silently keeps vsync effectively on
+  despite asking for it off) — whichever this machine's driver/surface
+  combination actually supports. The present mode actually settled on is
+  logged once at startup in `--present` mode (see below); only `--present`
+  mode has anything to apply it to — a plain headless run parses `--vsync`
+  like any other flag but has no visible swapchain for it to affect, so it
+  is silently ignored there.
 
 ### Expected output
 
@@ -107,7 +126,14 @@ exact same pipeline-construction code and draw call:
 [info] triangle readback PASSED
 ```
 
-**`--present` mode** opens an 800x600 window titled `rx_triangle_sample
+**`--present` mode** logs the present mode actually in use once at startup
+(FIFO unless `--vsync off` resolved to something else — see above):
+
+```
+[info] --present: present mode in use: FIFO
+```
+
+It then opens an 800x600 window titled `rx_triangle_sample
 (--present)` showing a solid white, upward-pointing triangle centered
 horizontally in the lower-middle of an otherwise solid black window —
 roughly:
@@ -181,6 +207,9 @@ path:
   error, with source context) and the window never goes blank or crashes
   because of a shader typo. Not part of `ctest` (interactive by nature) —
   see `MANUAL_VERIFICATION.md` for the per-platform manual check.
+- **`--vsync on|off`** (default `on`) — same present-mode control as
+  01_triangle's `--vsync` section above; only `--present` mode has a
+  swapchain for it to affect.
 
 ### Editing the shader live
 
@@ -223,7 +252,9 @@ operation, so the stall is invisible in practice.
 [info] hotreload headless gate PASSED
 ```
 
-**`--present` mode** opens an 800x600 window titled `rx_hotreload_sample
+**`--present` mode** logs the present mode actually in use once at startup
+(same `[info] --present: present mode in use: ...` line as 01_triangle
+above), then opens an 800x600 window titled `rx_hotreload_sample
 (--present)` showing an animated diagonal stripe pattern (orange/blue,
 shifting continuously via the `time` push constant) covering the whole
 window. Editing and saving `hotreload.slang` (see above) changes the
@@ -286,6 +317,9 @@ never uploaded to) enables correct depth testing across the 5 objects.
   cubes, 2 spheres, 1 plane) with the camera continuously orbiting the
   scene. Survives window resizes (the depth buffer is recreated alongside
   the swapchain). Not part of `ctest` — see `MANUAL_VERIFICATION.md`.
+- **`--vsync on|off`** (default `on`) — same present-mode control as
+  01_triangle's `--vsync` section above; only `--present` mode has a
+  swapchain for it to affect.
 
 ### Expected output
 
@@ -296,7 +330,9 @@ never uploaded to) enables correct depth testing across the 5 objects.
 [info] bindless mesh headless gate PASSED
 ```
 
-**`--present` mode** opens a 900x700 window titled `rx_bindless_mesh_sample
+**`--present` mode** logs the present mode actually in use once at startup
+(same `[info] --present: present mode in use: ...` line as 01_triangle
+above), then opens a 900x700 window titled `rx_bindless_mesh_sample
 (--present)` showing 5 objects in a row against a dark background: a
 red/white checkerboard cube, a blue-to-green gradient cube, a yellow/blue
 checkerboard sphere, a magenta-to-cyan gradient sphere, and a plane
@@ -371,6 +407,9 @@ instead, since the grid and camera never move), which
 - **`--present`** — opens a real window showing the same 24-cell grid,
   static camera, streaming continuing indefinitely at roughly 1
   texture/second. Not part of `ctest` — see `MANUAL_VERIFICATION.md`.
+- **`--vsync on|off`** (default `on`) — same present-mode control as
+  01_triangle's `--vsync` section above; only `--present` mode has a
+  swapchain for it to affect.
 
 ### Expected output
 
@@ -381,7 +420,9 @@ instead, since the grid and camera never move), which
 [info] streaming headless gate PASSED
 ```
 
-**`--present` mode** opens a 900x700 window titled `rx_streaming_sample
+**`--present` mode** logs the present mode actually in use once at startup
+(same `[info] --present: present mode in use: ...` line as 01_triangle
+above), then opens a 900x700 window titled `rx_streaming_sample
 (--present)` showing up to 8 flat-colored squares arranged across a 6x4
 grid against a dark background, smoothly cycling through the HSV color
 wheel as textures stream in and evict roughly once a second — cells light
@@ -440,6 +481,9 @@ mirroring `04_streaming`'s own `cellProbePixel()` derivation.
 - **`--present`** — opens a real window showing the same scene, with the
   light continuously orbiting in azimuth (the camera itself never moves).
   Not part of `ctest` — see `MANUAL_VERIFICATION.md`.
+- **`--vsync on|off`** (default `on`) — same present-mode control as
+  01_triangle's `--vsync` section above; only `--present` mode has a
+  swapchain for it to affect.
 
 ### Expected output
 
@@ -451,7 +495,9 @@ mirroring `04_streaming`'s own `cellProbePixel()` derivation.
 [info] multipass headless gate PASSED
 ```
 
-**`--present` mode** opens a 900x700 window titled `rx_multipass_sample
+**`--present` mode** logs the present mode actually in use once at startup
+(same `[info] --present: present mode in use: ...` line as 01_triangle
+above), then opens a 900x700 window titled `rx_multipass_sample
 (--present)` showing a reddish cube and a bluish sphere on a grayish floor,
 lit from a fixed-elevation directional light whose azimuth continuously
 orbits — the cube's shadow visibly sweeps across the floor as the light
@@ -527,6 +573,9 @@ derivations this makes possible.
   a second and calling the public `IRxMaterialSystem::reloadChanged()` —
   02_hotreload's own keep-last-good UX, applied here to materials. Not part
   of `ctest` — see `MANUAL_VERIFICATION.md`.
+- **`--vsync on|off`** (default `on`) — same present-mode control as
+  01_triangle's `--vsync` section above; only `--present` mode has a
+  swapchain for it to affect.
 
 ### Expected output
 
@@ -540,7 +589,9 @@ derivations this makes possible.
 [info] materials headless gate PASSED
 ```
 
-**`--present` mode** opens a 900x700 window titled `rx_materials_sample
+**`--present` mode** logs the present mode actually in use once at startup
+(same `[info] --present: present mode in use: ...` line as 01_triangle
+above), then opens a 900x700 window titled `rx_materials_sample
 (--present)` showing an orange checkerboard cube (top-left), a teal
 checkerboard cube (top-right), a magenta rim-lit sphere (bottom-left), and a
 golden-yellow rim-lit sphere (bottom-right), with the camera orbiting
@@ -618,6 +669,10 @@ cmake --build --preset linux-native
 
 # Interactive present-mode window:
 ./build/linux-native/samples/01_triangle/sample_01_triangle --present
+
+# Same, with vsync off -- MAILBOX/IMMEDIATE if the surface supports either,
+# else FIFO again (see the --vsync section above):
+./build/linux-native/samples/01_triangle/sample_01_triangle --present --vsync off
 ```
 
 ```sh

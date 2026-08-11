@@ -17,6 +17,26 @@ struct AcquireResult {
     uint32_t imageIndex;
 };
 
+// Present-mode control [Phase 4 Task 6, spec seed 1]. Only two choices are
+// exposed at this layer -- an on/off vsync preference, not a raw
+// VkPresentModeKHR -- because the actual mode is driver/surface-dependent
+// (see Device::setPresentMode()'s own comment for the exact fallback
+// ladder each of these resolves to). Callers that need the concrete mode
+// actually in use (for logging or a HUD) read it back via
+// Device::presentMode() instead of assuming one from this enum.
+enum class PresentMode {
+    VsyncOn,
+    VsyncOff,
+};
+
+// Human-readable name for a VkPresentModeKHR, for logging/HUD use (e.g. a
+// sample printing Device::presentMode() once at startup). Covers every
+// value Device's own present-mode ladder can select (FIFO, MAILBOX,
+// IMMEDIATE) plus FIFO_RELAXED for completeness, with "UNKNOWN" as the
+// fallback for anything else (e.g. the shared-present extension modes this
+// codebase never requests).
+const char* presentModeName(VkPresentModeKHR mode);
+
 // Device owns the logical VkDevice selected/built against a Context's
 // vkb::Instance, its graphics and present queues, and a VkSwapchainKHR built
 // against a caller-provided VkSurfaceKHR.
@@ -68,6 +88,35 @@ public:
     VkFormat swapchainFormat() const { return swapchainFormat_; }
     VkExtent2D swapchainExtent() const { return swapchainExtent_; }
 
+    // Records the present mode this Device should build its NEXT swapchain
+    // against. Does NOT itself touch the live swapchain or recreate
+    // anything -- recreateSwapchain() (the same path every caller already
+    // drives on SwapchainStatus::NeedsRecreate, e.g. a window resize) is
+    // the sole place a present-mode change actually takes effect, per this
+    // task's explicit constraint against inventing a second recreation
+    // flow. A caller that wants the change applied immediately (e.g. a
+    // sample honoring a --vsync flag at startup, before its first frame)
+    // must call recreateSwapchain(surface) itself right after this call.
+    //
+    // The mode actually built is resolved from `mode` against what this
+    // surface/device supports, via the ladder in device.cpp's
+    // selectPresentMode(): VsyncOn always resolves to FIFO (the one
+    // present mode the Vulkan spec guarantees for every surface).
+    // VsyncOff prefers MAILBOX (uncapped, no tearing), then IMMEDIATE
+    // (uncapped, tearing possible), and only falls back to FIFO -- logging
+    // a one-line warning when it does, since that silently keeps vsync
+    // effectively on despite the caller asking for it off -- if this
+    // surface supports neither.
+    void setPresentMode(PresentMode mode);
+
+    // The actual VkPresentModeKHR currently in use, as reported back by
+    // vk-bootstrap after the ladder above resolved the most recent
+    // setPresentMode() request (or, before any setPresentMode() call, the
+    // explicit FIFO default create() builds every Device with -- see that
+    // function's own comment). For logging/HUD use; presentModeName()
+    // above turns this into a readable string.
+    VkPresentModeKHR presentMode() const { return actualPresentMode_; }
+
     // Acquires the next available swapchain image, signaling `signal` once
     // it is safe to render into it. VK_SUBOPTIMAL_KHR is treated as success
     // here: the image is still valid to render into and present, so
@@ -83,6 +132,12 @@ public:
     // Does not take ownership of `surface` and does not touch the surface
     // this Device already owns; in the expected usage the same surface
     // handle is passed again on every call.
+    //
+    // Also the sole place the present mode most recently recorded via
+    // setPresentMode() is actually applied [Phase 4 Task 6] -- every
+    // caller of this function (resize/NeedsRecreate handling, or a sample
+    // applying --vsync at startup) gets that behavior for free, with no
+    // separate "apply present mode" path to call.
     bool recreateSwapchain(VkSurfaceKHR surface);
 
 private:
@@ -104,6 +159,15 @@ private:
     std::vector<VkImage> swapchainImages_;
     VkFormat swapchainFormat_ = VK_FORMAT_UNDEFINED;
     VkExtent2D swapchainExtent_{0, 0};
+
+    // Desired mode recorded by setPresentMode(), consulted by
+    // recreateSwapchain() (and create()'s own equivalent inline logic) the
+    // next time either builds a swapchain. Defaults to VsyncOn to match
+    // create()'s explicit FIFO default -- see that function's comment.
+    PresentMode desiredPresentMode_ = PresentMode::VsyncOn;
+    // What the ladder actually resolved `desiredPresentMode_` to, as
+    // reported back by vk-bootstrap. Returned by presentMode().
+    VkPresentModeKHR actualPresentMode_ = VK_PRESENT_MODE_FIFO_KHR;
 };
 
 }  // namespace rx::rhi
