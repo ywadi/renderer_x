@@ -477,3 +477,185 @@ omitting it.
    under the cap, so the cap itself is unexercised by any test or
    measurement in this task).
 4. Samples 01-04 untouched, as directed — pre-graph tier references.
+
+## Fix round 1 (review Medium: no thread-affinity guard)
+
+`task-7-review.md`: Approved, chunk-0-synchronous design ACCEPTED and
+adjudicated into spec D4 (`d1c4f0d`). One Medium left open: nothing
+previously caught a main-thread-only API called from a chunked pass's
+worker chunks (chunk >= 1) at runtime — a violation silently corrupted
+shared state instead of failing loudly. This section covers closing it.
+
+### Commits (main, local only, not pushed)
+
+8. `5db9608` — feat(rx_core): add dev-time RX_ASSERT_MAIN_THREAD thread-affinity guard
+9. `46b762b` — feat: wire RX_ASSERT_MAIN_THREAD into main-thread-only mutators
+10. `c9dae6e` — test(rx_material): cover bindInstance's main-thread guard end to end
+11. (this report update)
+
+No AI attribution in any of the three (verified: `git log --format=%B`
+on all three, grepped for "Claude"/"Co-Authored"/"generated"/"anthropic"/
+"ai assist" — none found). Author/committer identity is the local git
+config's own (`Yousef Wadi <ywadi85@gmail.com>`), untouched.
+
+### The mechanism: `rx_core/debug_checks.h`
+
+`RX_ASSERT_MAIN_THREAD(context)` — one macro, placed as the first
+statement of a guarded function. Backing implementation
+(`assertMainThreadImpl`, `debug_checks.cpp`):
+
+- Captures "this process's main thread" **lazily**, on the first call to
+  the function from anywhere in the process (`static const
+  std::thread::id kMainThreadId = std::this_thread::get_id();` —
+  C++11's own exactly-once static-local-init guarantee, not code this
+  facility adds). Chosen over the review's other offered option (an
+  explicit `markMainThread()` some subsystem would need to remember to
+  call) as the less intrusive of the two: zero new call sites anywhere
+  in this engine's setup path beyond the guarded mutators themselves.
+  Disclosed limitation (in the header/impl's own comments, not hidden):
+  this only mis-learns the main thread if the very first guarded call in
+  the whole process happens on a non-main thread — not a real risk in
+  this engine's own call graph, since every real caller is reached only
+  after synchronous main-thread device/scene setup that already calls a
+  guarded API at least once before any `parallelFor()` fan-out can exist.
+- On a mismatch: `RX_LOG_ERROR` naming the offending API/context, then
+  calls an installable violation hook (production default:
+  `std::abort()`, after logging). The hook is a test-only `detail::`
+  seam (`setViolationHookForTests`), mirroring the
+  `rx::material::detail::debugCompileCount()` /
+  `rx::task::detail::debugLastDroppedIoTaskCount()` carve-out convention
+  already established in this codebase — not part of the stable public
+  contract.
+- Gated on its own CMake option, `RX_DEBUG_CHECKS` (default **ON** in
+  both dev presets — `CMakePresets.json`), **not** `assert()`/`NDEBUG`:
+  both presets build `RelWithDebInfo`, which defines `-DNDEBUG` (per
+  `task-5-review.md`'s own "NDEBUG assert honesty disclosure" finding),
+  which would silently compile away a bare `assert()` in every build
+  this project actually produces. When OFF, the macro expands to nothing
+  at all, matching `RX_ZONE`'s own no-op-when-disabled contract — see
+  verification below for direct proof the OFF configuration carries zero
+  guard-related symbols.
+
+### Where it's wired (docs/threading.md's D5 list, the concrete entries)
+
+One `RX_ASSERT_MAIN_THREAD(...)` call, first statement, naming the API:
+
+- `BindlessTable::registerSampledImage`/`registerSampler`/
+  `registerStorageBuffer`/`release` (`bindless.cpp`)
+- `Uploader::uploadToBuffer`/`uploadToImage` (`upload.cpp`)
+- `MaterialSystem::loadMaterial`/`getPipeline`/`reloadChanged`/
+  `bindInstance` (`material_system.cpp`)
+- `IRxMaterialSystem::loadMaterial`/`createTexture2D` (`api_impl.cpp`) —
+  ahead of (and in addition to) the internal `MaterialSystem` guard the
+  call eventually reaches
+- `DeletionQueue::retire` (`deletion_queue.cpp`) — the one enqueue-style
+  mutator a chunk >= 1 caller could plausibly reach mid-frame;
+  `onFrameFenceSignaled`/`flushAll` are the per-frame drain and shutdown
+  paths, out of this fix round's scope (documented as such at the call
+  site and in `docs/threading.md`)
+- `GeometryPool`/the scene managers: not guarded — neither exists yet,
+  per the coordinator's own explicit "future, skip" instruction
+
+`docs/threading.md`'s header note and each affected class's one-line
+thread-affinity comment (`bindless.h`, `upload.h`, `deletion_queue.h`,
+`material_system.h`) now say which methods are actively guarded.
+
+### Tests
+
+`src/rx_core/tests/debug_checks_test.cpp` — the mechanism itself,
+device-free and fully deterministic: no fire from the main test thread
+(the bare macro call, which also compiles/runs identically when
+`RX_DEBUG_CHECKS` is OFF, matching `profile_test.cpp`'s own "never
+spells out `#ifdef` itself" convention); fires with the exact context
+string from a genuinely different thread (a plain `std::thread` — safe
+to let the hook return normally here, unlike an enkiTS worker, where an
+uncaught exception risks `std::terminate()`); `setViolationHookForTests
+(nullptr)` restores the production default.
+
+`src/rx_material/tests/test_material_system.cpp` — `bindInstance()`
+specifically, end to end against a real `rx::graph::Executor`-driven
+chunked pass (the only legitimate source of a real `PassContext&`, so
+this cannot be a bare-`std::thread` unit test):
+
+- Legal: a chunk-0-only `bindInstance()` call never fires the hook
+  (chunk 0 is guaranteed synchronous on the main thread by spec D4).
+- Illegal: a call from a chunk that actually lands on a worker thread
+  fires the hook, naming both `MaterialSystem::bindInstance` and
+  `MaterialSystem::getPipeline` (called internally by `bindInstance`,
+  guarded too — both firing on one violating call is expected, not a
+  double-count bug).
+
+**A real scheduling finding, not just a passing test.** The illegal
+case's first draft targeted chunk `chunkCount - 1` (the last chunk) with
+a `Scheduler` built with 6 workers, reasoning that "the last chunk"
+should be a likely worker target. It was not: **15/15 real runs** had
+that specific chunk executed by the calling/main thread itself — not a
+bug, but a real, reproducible property of this pass's own recursive
+`parallelFor` split shape (the calling thread keeps the rightmost
+remaining slice for itself rather than handing every piece to a worker).
+Fixating on one chunk index was therefore the wrong design: rewritten so
+every non-zero chunk callback checks its OWN thread identity and the
+first one to observe it is genuinely off the main thread claims the
+single illegal call via `compare_exchange_strong` on a shared
+`std::atomic<bool>` — real mutual exclusion, not a probabilistic hope,
+which is also what keeps it safe for the test's violation hook to
+record-and-return instead of aborting (at most one thread ever touches
+`MaterialSystem`'s unsynchronized state per run, by construction). After
+the rewrite: **15/15 real runs** correctly exercised the firing branch,
+naming both `bindInstance` and `getPipeline`.
+
+### Verification
+
+- `linux-native`, default validation layer: full suite, **3 repeated
+  clean runs, 17/17** each.
+- `linux-native`, forced Lavapipe ICD + the newer standalone
+  `VK_LAYER_khronos_validation` build (`VK_ICD_FILENAMES=.../lvp_icd.json
+  VK_LAYER_PATH=/home/ywadi/sponza/vvl`): **17/17**, one run.
+- `windows-cross-zig`: built clean (96/96 targets, only the pre-existing
+  benign duplicate `_WIN32_WINNT` warning); device-free subset under
+  Wine per the existing CI exclusion regex (`-E
+  'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample'`): **7/7**, including
+  `rx_core_tests` (the new `debug_checks_test.cpp`).
+- Targeted repetition: `rx_material_gpu_tests` run standalone **20/20**
+  clean; the new illegal-guard `TEST_CASE` run standalone in isolation
+  **15/15** clean, firing correctly every time post-rewrite (see the
+  scheduling finding above); `rx_core_tests` run standalone **5/5**
+  clean (a pre-existing per-run cost of ~20s from an unrelated storm
+  test in `log_test.cpp`, not this fix round's work, is why this loop
+  wasn't pushed to 20 iterations like the others).
+- **`RX_DEBUG_CHECKS=OFF`, separate fresh configure + build tree**
+  (`-DRX_DEBUG_CHECKS=OFF`, deleted after verification): 110/110 targets
+  built clean; **17/17 tests passed** (the two new guard `TEST_CASE`s in
+  `debug_checks_test.cpp`/`test_material_system.cpp` compile away
+  entirely under their own `#ifdef RX_DEBUG_CHECKS`, so this run
+  confirms both "still compiles/links/passes" and "the guarded tests
+  correctly vanish rather than fail"). Zero guard-related symbols,
+  verified four ways (mirroring Task 3's own `RX_TRACY=OFF` convention):
+  - `nm -C` across every executable and static library in the build
+    tree, searched for the real symbol names specifically
+    (`assertMainThreadImpl`, `rx::core::debug::detail::
+    setViolationHookForTests`, `g_violationHook`,
+    `defaultViolationHook`) — **zero** hits anywhere. (An unfiltered
+    substring grep for `debug_checks` alone is NOT meaningful here and
+    was checked/discarded as a false-positive source: it also matches
+    `_GLOBAL__sub_I_debug_checks_test.cpp`, a compiler-generated
+    per-translation-unit static-initializer name that
+    `_GLOBAL__sub_I_profile_test.cpp` — Task 3's own file — produces
+    identically; both are doctest's own `TEST_CASE` registration
+    machinery, present regardless of any feature flag. The archive
+    member name `debug_checks.cpp.o:` inside `librx_core.a` is likewise
+    just `nm`'s own listing header for that member, which the direct
+    check below confirms is genuinely empty.)
+  - `debug_checks.cpp.o` itself: `size` reports **0/0/0**
+    text/data/bss — a genuinely empty object file, not merely one with
+    no exported symbols.
+  - `grep -c RX_DEBUG_CHECKS compile_commands.json`: **0** in the OFF
+    tree vs **73** in the ON tree (control).
+  - `strings` across every binary for the guard's own log format string
+    (`"main-thread-only API called from a non-main thread"`): **zero**
+    matches. (`strings` does surface pre-existing, unrelated
+    `RX_LOG_ERROR` text this fix round did not add, e.g.
+    `BindlessTable::registerSampledImage`'s own capacity-exceeded
+    message — expected, and the same caveat Task 3's own report
+    disclosed for its analogous check; `nm`'s symbol-name search above
+    is the authoritative one.)
