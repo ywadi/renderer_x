@@ -93,9 +93,20 @@ the primary executes them inside its `vkCmdBeginRendering` scope with
 `VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT`. Chosen over
 multi-primary stitching because our workload is one heavy pass
 (intra-pass chunking), and this is the shipping pattern (Godot 4.3
-reference [R:threading]). The graph API grows an opt-in: a pass may
-declare `setParallelRecord(chunkCount)` and provide a chunked callback;
-non-opted passes record exactly as today (zero regression risk).
+reference [R:threading]).
+
+**Parallelism is the engine default, not a mode (user-directed):** there
+is no on/off switch and no caller-chosen chunk count. A pass provides
+either a whole-pass callback (hand-written simple passes — the library
+model means the engine cannot split code it does not own) or a chunked
+callback; every chunked pass records in parallel unconditionally, with
+the executor deriving chunk count from the scheduler and grain-based
+scaling making small workloads effectively serial at the cost of one
+task submission — self-scaling, never toggled. All engine-owned work
+(culling, draw-list building, import internals, and Stage 2's
+scene-submit helper, which is the chunked callback for any scene-driven
+pass) is parallel by default with no flags. `--threads` exists only in
+the stress benchmark as a measurement instrument.
 
 ### D5 — Threading contract for existing subsystems (Phase 4 rule)
 

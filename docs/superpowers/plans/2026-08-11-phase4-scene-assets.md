@@ -82,11 +82,12 @@ class Scheduler {  // owns enki::TaskScheduler; one per app; main thread partici
 
 **Files:** Modify `src/rx_graph/include/rx_graph/pass.h` + `executor.cpp` (opt-in parallel recording per D4): 
 ```cpp
-Pass& setParallelRecord(uint32_t chunkCount);            // opt-in; default = today's single-callback path
+// No opt-in flag and no caller-chosen count: providing a chunked callback IS the parallel path
+// (executor derives chunk count from the scheduler; grain scaling handles small workloads).
 Pass& setExecuteChunked(std::function<void(PassContext&, uint32_t chunkIndex, uint32_t chunkCount)> fn);
 // PassContext gains: VkCommandBuffer chunkCommandBuffer() — the secondary this chunk records into (workers)
 ```
-Executor: per-thread × per-frames-in-flight command pools (created lazily per scheduler worker count); for parallel passes: begin rendering with SECONDARY_COMMAND_BUFFERS contents, secondaries begun with VkCommandBufferInheritanceRenderingInfo matching the pass's attachment formats/samples [R:threading], chunks fanned out via rx_task parallelFor, vkCmdExecuteCommands in chunk order, pools reset per frame slot. Non-parallel passes byte-identical to today.
+Executor: per-thread × per-frames-in-flight command pools (created lazily per scheduler worker count); for parallel passes: begin rendering with SECONDARY_COMMAND_BUFFERS contents, secondaries begun with VkCommandBufferInheritanceRenderingInfo matching the pass's attachment formats/samples [R:threading], chunks fanned out via rx_task parallelFor, vkCmdExecuteCommands in chunk order, pools reset per frame slot. Whole-pass-callback passes byte-identical to today (they are the hand-written simple case, not a disabled mode).
 Create `samples/07_stress/` + `shaders/stress/*.slang`: procedural instanced field (default 30,000 draws — cubes/spheres mix, per-instance transform+color via bindless arena, 4 pipeline/material variations to make sorting/state non-trivial), flags: `--draws N --threads N --vsync on|off --validate` (threads default = scheduler default, i.e. parallel recording ON; `--threads 1` is the A/B baseline), forward+tonemap through the graph with the forward pass parallel-recorded; ImGui NOT yet (Stage 2) — stats to stdout each second + Tracy zones; headless gate: fixed 3 frames, counter assertions (exact draws submitted, chunk count = threads, pool allocations within budget) + tolerance probe on 4 analytic pixels; **CI counter gate** (D18) + wall-clock printed and uploaded as artifact `stress-numbers.txt`; report publishes single-vs-multi-thread record timings (Tracy evidence) on the dev machine.
 **Steps:** TDD gate → implement executor path → sample → measurements → packaging/CI wiring → commit(s).
 
@@ -150,7 +151,7 @@ Pipeline per primitive: fastgltf parse → mandatory attributes (missing normals
 
 ### Task 12: Async import pipeline (D5 contract in action)
 
-**Files:** Modify `src/rx_asset/registry.{h,cpp}` (+`importGltfAsync(path, ..., CompletionFn)` — parse/decode/transcode/meshopt on workers via rx_task, GPU uploads + registry mutation marshalled through postToMain; progress/Tracy zones), tests.
+**Files:** Modify `src/rx_asset/registry.{h,cpp}` (+`importGltfAsync(path, ..., CompletionFn)` — parse/decode/transcode/meshopt on workers via rx_task; the SYNC importGltf also parallelizes per-primitive work internally (parallelism is the default, not an async-only property), GPU uploads + registry mutation marshalled through postToMain; progress/Tracy zones), tests.
 **Steps:** test: async import of cube + DamagedHelmet completes with identical results to sync path (deep compare of counts/ranges); main-thread-affinity assertions (registry mutation thread id checks in debug); a deliberately slow decode overlapped with rendered frames (frame loop keeps presenting — test drives N frames while import in flight, asserts no stall > threshold frames on counters not wall-clock) → implement → commit.
 
 ### Task 13: StandardPBR + Unlit + sample 08_gltf_viewer (D22)
@@ -188,6 +189,8 @@ Reversed-Z: depth attachment usage in samples migrating in Task 18/19; Camera he
 struct DrawRecord { asset::MeshRange range; uint32_t blockId; asset::MaterialHandle mat; uint32_t instanceIndex; };  // asset-level material handle (T10 Registry resolves to the bindable material instance at record time)
 struct ViewLists { std::vector<DrawRecord> opaque /*sorted FtB by u64 key: pipeline|material|depth*/, blend /*BtF*/; CullCounters counters; };
 class DrawListBuilder { ViewLists build(const Scene&, const Camera&, task::Scheduler&); ShadowLists buildShadow(const Scene&, const DirectionalLight&, const Camera&, task::Scheduler&); };
+// PLUS the engine-provided chunked submit helper (parallel recording becomes the DEFAULT for scene-driven passes):
+// rx::scene::recordDrawList(PassContext&, chunkIndex, chunkCount, const ViewLists&, ...) — sample 09 hand-chunks nothing.
 ```
 Frustum cull: planes from reversed-Z viewProj; AABB-vs-planes batched in parallelFor chunks (grain ~512); layer masks (camera cullMask, light channels incl. caster filtering); shadow ortho frustum fitted to camera-visible bounds + conservative caster extrusion along light dir (D15). Sort per D14. Counters exact (CI-gateable).
 **Steps:** device-free tests with synthetic scenes: known in/out AABB sets (exact counters), mask filtering matrices, sort-order assertions (opaque key monotonic, blend depth descending), off-screen-caster-still-casts case, determinism across thread counts (same lists any --threads) → implement → commit.
