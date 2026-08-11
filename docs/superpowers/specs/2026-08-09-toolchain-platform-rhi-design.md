@@ -208,9 +208,15 @@ it is out of scope for *this* spec only, not out of scope for the project:
     enumeration/selection (SDK phase — the optionality principle's
     reporting channel); (FG6) MSAA policy decision + resolve-attachment
     semantics in the graph (decide in techniques-phase spec, before
-    aliasing/history ossify the resource model); (FG7) window edge states
-    — minimize/zero-extent guard (Phase 4 Stage 1 hardening ticket),
-    occlusion + DPI policy (SDK phase at latest); (FG8) HDR display
+    aliasing/history ossify the resource model); (FG7) window state —
+    zero-extent/minimize guard + windowed/borderless-fullscreen toggle
+    (Phase 4 Stage 1 hardening ticket #25; borderless is a plain SDL3
+    window flag on the existing recreation machinery), occlusion + DPI
+    policy (SDK phase at latest); (FG7b) EXCLUSIVE fullscreen via
+    VK_EXT_full_screen_exclusive — an OPTIONAL capability (Windows-desktop
+    only; irrelevant on the Deck floor where Gamescope owns the display),
+    acquire/release + swapchain lifecycle, SDK/platform phase with a
+    windowed fallback per the optionality principle; (FG8) HDR display
     output + swapchain colorspace ladder (techniques phase, with the
     post stack); (FG9) renderer-wide VRAM budget + memory-pressure
     response, VK_EXT_memory_budget (streaming phase's central input —
