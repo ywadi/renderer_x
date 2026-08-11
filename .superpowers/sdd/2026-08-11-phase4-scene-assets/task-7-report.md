@@ -659,3 +659,113 @@ naming both `bindInstance` and `getPipeline`.
     message — expected, and the same caveat Task 3's own report
     disclosed for its analogous check; `nm`'s symbol-name search above
     is the authoritative one.)
+
+## Fix round 2 (review: illegal-chunk test's vacuous-pass window)
+
+The reviewer reproduced fix round 1's CAS-only illegal-chunk test
+30 times and found **2/30 runs where every chunk (including chunks 1
+through 5) executed on the calling/main thread itself** — the test's own
+`else` branch (`illegalChunkCalls == 0`, `capture.contexts.empty()`)
+silently "passed" having exercised nothing. Correct on its own terms
+(nothing it asserted was false), but not what this test exists to prove.
+The coordinator's instruction: make worker participation for the illegal
+call **deterministic by construction**, using "the same barrier trick
+as the Task 2 fix" — `rx::task::Scheduler`'s own
+`scheduler_test.cpp` (`"Scheduler::parallelFor genuinely runs multiple
+workers CONCURRENTLY"`): a shared atomic counter, each participant
+increments it once then busy-waits (bounded, yielding) until it observes
+the counter reach the participant count — completion is only possible
+with genuine concurrent progress, since a single thread stuck inside
+one participant's own wait cannot also go and run the other.
+
+### Commits (main, local only, not pushed)
+
+12. `3b7fe52` — test(rx_material): force worker participation in the illegal-chunk guard test via a barrier
+13. (this report update)
+
+No AI attribution (verified the same way as every prior commit in this
+report: `git log --format=%B`, grepped for
+"Claude"/"Co-Authored"/"generated"/"anthropic"/"ai assist" — none
+found). Author/committer identity unchanged
+(`Yousef Wadi <ywadi85@gmail.com>`).
+
+### Why chunk 0 could not be the one blocking
+
+The coordinator's literal wording placed the wait in chunk 0 ("chunk 0
+... BLOCKS ... until an atomic flag is set by another chunk"). Checked
+against `Executor::recordChunkedPass()` (`executor.cpp`, already quoted
+in this same report's original "Numbers"/design sections) before writing
+a single line of test code, because the instruction contradicted what I
+already knew about that function's own sequencing:
+
+```cpp
+recordOneChunk(0, /*workerIndex=*/0);          // chunk 0: synchronous, to completion
+
+if (chunkCount > 1) {
+    impl.scheduler->parallelFor(chunkCount - 1, /*grainSize=*/1, ...);  // chunks [1, chunkCount)
+}
+```
+
+Chunk 0's own callback is called and must RETURN before the executor's
+next line even calls `parallelFor()` for chunks [1, chunkCount) at all.
+If chunk 0's callback blocks waiting for a flag only a later chunk can
+set, that later chunk's dispatch is never reached — the wait times out
+**100% of the time**, not rarely; this is a direct, provable consequence
+of already-cited code, not something that needed empirical
+reproduction to rule out. Implementing the literal instruction as
+written would have replaced one review finding (a rare vacuous pass)
+with a permanent hard failure of this specific test every single time.
+
+Implemented the same underlying trick instead, relocated to fit this
+executor's real contract: the two-participant rendezvous barrier runs
+between **chunks 1 and 2** — both genuinely dispatched by the SAME
+`parallelFor()` call, unlike chunk 0. A single thread cannot resolve
+this barrier by itself for the identical reason the Task 2 proof relies
+on (a thread stuck inside chunk 1's wait cannot simultaneously go run
+chunk 2), so a successful (non-timeout) resolution proves at least one
+of {chunk 1, chunk 2} ran on a thread distinct from whichever ran the
+other. Since a single thread cannot BE both of two mutually-waiting
+callers, at most one of the two can be `mainThreadId` — the other is
+unconditionally a genuine worker. Chunk 0 stays a plain no-op, as in
+every earlier revision. `expectedChunkCount >= 3` is asserted via
+`REQUIRE` (needs chunks 1 and 2 both to exist; the test's own
+`workerCount = 6` gives chunkCount = 6, well above the floor).
+
+After the barrier resolves, whichever of the two observes it is not on
+the main thread claims the one illegal `bindInstance()` call via the
+same `compare_exchange_strong` mutual exclusion as fix round 1 — now
+unconditionally guaranteed to happen rather than merely likely, so the
+test asserts `REQUIRE(claimed)` outright instead of branching on it.
+
+**The hazard the coordinator flagged** (the hook seam must record-and-
+return rather than abort in test mode, and no deadlock path may exist if
+the illegal-call chunk gets stuck) does not arise in this placement: the
+barrier's own wait is satisfied — both chunks have already arrived and
+proceeded past their `while` loop — strictly BEFORE either one attempts
+the illegal call. The illegal call, and the hook it triggers, run
+entirely after the barrier has already resolved; nothing about how the
+hook behaves can affect whether the barrier itself completes. A
+`REQUIRE_MESSAGE` after `execute()` returns checks a `barrierTimedOut`
+flag with a descriptive failure message, matching this test's own
+established convention of never asserting from inside a chunk callback
+(the barrier's own bounded wait, 10s, is generous relative to the
+near-instant real wake time of 6 already-parked workers, matching
+`scheduler_test.cpp`'s own 20s-per-unit precedent in spirit).
+
+### Verification — both tallies requested, same binary, reproduced before reporting
+
+```
+Unconstrained, 30 consecutive runs:      pass=30 fail=0
+`taskset -c 0,1`, 10 consecutive runs:   pass=10 fail=0
+```
+
+Both loops run directly against
+`build/linux-native/src/rx_material/tests/rx_material_gpu_tests
+--test-case="*rendezvous barrier*"`, one process per iteration, output
+captured per run. Checked (not merely assumed) that every one of the 40
+runs genuinely exercised the firing branch rather than passing
+vacuously: `grep -l "main-thread-only API called from a non-main
+thread: MaterialSystem::bindInstance"` matched all 30 unconstrained logs
+and all 10 `taskset` logs — 40/40, not just 40/40 exit codes. Also
+re-ran the full `linux-native` suite once more after this change:
+**17/17**.
