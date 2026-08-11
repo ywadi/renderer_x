@@ -176,48 +176,126 @@ TEST_CASE("ParamArena: byte-arena exhaustion and descriptor-pool exhaustion at a
         REQUIRE(slot1Data != nullptr);
         CHECK(std::memcmp(slot1Data, blob.data(), blob.size()) == 0);
 
-        // --- Descriptor-pool exhaustion: verify cursor does NOT advance on failure ---
-        // Key fix (instance.cpp): cursor advancement is now AFTER the allocate check,
-        // not before. This prevents wasting byte-arena space when descriptor
-        // allocation fails.
+        // --- Descriptor-pool exhaustion: prove the cursor genuinely does NOT
+        // advance on a failed allocate() (instance.cpp: `cursor = end;` now
+        // sits AFTER the `set == VK_NULL_HANDLE` check, not before it).
         //
+        // Why this needs more than "one more call fails cleanly": once the
+        // descriptor arena's arena-enforced maxSets budget
+        // (kMaxInstancesPerFrame, matched 1:1 against ParamArena's own
+        // constant -- see the [Post-release fix, CI lavapipe run acfce89]
+        // comment further down) is exhausted, EVERY subsequent
+        // writeAndAllocate() call on this frame slot fails on the
+        // descriptor check -- permanently, until the next beginFrame(),
+        // which would also rewind the byte cursor back to 0 and destroy
+        // the very evidence being looked for. So there is no way to get a
+        // SUCCESSFUL write after the failure to prove the point; the
+        // discriminator instead has to come from TWO CONSECUTIVE FAILING
+        // calls.
+        //
+        // writeAndAllocate()'s memcpy() always runs (into the byte arena,
+        // at the offset the CURRENT cursor computes) before the descriptor
+        // check, on every call, success or failure alike -- that hasn't
+        // changed by the fix, only what happens to the cursor VARIABLE
+        // afterward has:
+        //   - Fixed code (cursor advances only on success): the cursor
+        //     stays parked at the same value across repeated failures, so
+        //     failing call #2's memcpy lands at the EXACT SAME offset as
+        //     failing call #1's and overwrites it.
+        //   - Pre-fix/reverted code (cursor advances unconditionally,
+        //     before the descriptor check): failing call #1 still moves
+        //     the cursor forward by one blob width despite failing, so
+        //     failing call #2 lands one blob width FURTHER ALONG instead,
+        //     leaving call #1's bytes untouched.
+        // Reading back the bytes at the offset both calls compute from
+        // therefore reads as failing-call-#2's sentinel with the fix, and
+        // failing-call-#1's (unchanged) sentinel with the bug -- an
+        // objective, deterministic distinguisher that never depends on
+        // uninitialized memory content.
+        //
+        // Every blob below is exactly kUniformBufferAlignment (256) bytes,
+        // so each successful write's OWN aligned offset advances the
+        // cursor by exactly one blob width with zero rounding waste:
+        // write i (0-indexed) always lands at i * kUniformBufferAlignment.
+        arena->beginFrame(1);
+
+        std::array<uint8_t, static_cast<std::size_t>(rx::material::ParamArena::kUniformBufferAlignment)> fillBlob{};
+        fillBlob.fill(0x22);
+
+        // (a) One successful writeAndAllocate -- record where its bytes land
+        // (offset 0, the start of the freshly-reset slot).
+        VkDescriptorSet firstSet = arena->writeAndAllocate(layout, fillBlob.data(), fillBlob.size());
+        REQUIRE(firstSet != VK_NULL_HANDLE);
+        const void* slot1DataFirst = rx::material::detail::debugFrameBufferData(*arena, 1);
+        REQUIRE(slot1DataFirst != nullptr);
+        CHECK(std::memcmp(slot1DataFirst, fillBlob.data(), fillBlob.size()) == 0);
+
         // [Post-release fix, CI lavapipe run acfce89] This now exercises
         // rx::rhi::DescriptorArena's own arena-enforced maxSets/uniformBuffers
         // budget (descriptor_arena.h's class-level BUDGETS ARE
         // ARENA-ENFORCED comment), not driver-side VkDescriptorPool
         // enforcement -- ParamArena::create() sizes both of that budget's
-        // fields to kMaxInstancesPerFrame (instance.cpp), so this loop hits
-        // the SAME arena-enforced ceiling deterministically on every
-        // driver, including lavapipe (which legally never enforces
+        // fields to kMaxInstancesPerFrame (instance.cpp), so filling to that
+        // ceiling hits the SAME arena-enforced limit deterministically on
+        // every driver, including lavapipe (which legally never enforces
         // VkDescriptorPool's own limits itself -- see
         // rx_rhi_vk/tests/descriptor_arena_test.cpp for that class's own
-        // direct, per-budget coverage).
-        arena->beginFrame(1);
-        uint32_t successfulAllocations = 0;
+        // direct, per-budget coverage). Fill the remaining budget (one
+        // allocation already done above).
+        uint32_t successfulAllocations = 1;
         for (; successfulAllocations < rx::material::ParamArena::kMaxInstancesPerFrame; ++successfulAllocations) {
-            VkDescriptorSet s = arena->writeAndAllocate(layout, blob.data(), blob.size());
-            if (s == VK_NULL_HANDLE) {
-                break;
-            }
+            VkDescriptorSet s = arena->writeAndAllocate(layout, fillBlob.data(), fillBlob.size());
+            REQUIRE(s != VK_NULL_HANDLE);
         }
-        // Every one of the documented kMaxInstancesPerFrame allocations
-        // must have succeeded -- the byte arena (1 MiB, ~256+16 bytes per
-        // aligned allocation) has ample headroom for this many small
-        // writes, so descriptor-pool capacity is what this loop actually
-        // measures.
         CHECK(successfulAllocations == rx::material::ParamArena::kMaxInstancesPerFrame);
 
-        // One more allocation past the documented ceiling must fail cleanly.
-        CHECK(arena->writeAndAllocate(layout, blob.data(), blob.size()) == VK_NULL_HANDLE);
+        // The offset the NEXT writeAndAllocate() call will compute from,
+        // PROVIDED the cursor has not moved since the last success --
+        // exactly kMaxInstancesPerFrame full-width blobs in. Byte-arena
+        // headroom check: kMaxInstancesPerFrame * kUniformBufferAlignment =
+        // 512 * 256 = 131072 bytes used; kBytesPerFrame is 1 MiB
+        // (1048576 bytes), leaving ~896 KiB free -- ample room for two more
+        // 256-byte writes to land inside the buffer under EITHER cursor
+        // behavior below, so this test measures descriptor-pool exhaustion
+        // only, never byte-arena exhaustion.
+        constexpr VkDeviceSize kExpectedStuckOffset =
+            static_cast<VkDeviceSize>(rx::material::ParamArena::kMaxInstancesPerFrame) *
+            rx::material::ParamArena::kUniformBufferAlignment;
 
-        // Nothing already written was corrupted by driving the pool to
-        // (and past) exhaustion -- re-check slot 1's very first byte
-        // range from this beginFrame(1) cycle. With the fix, the byte
-        // cursor did not waste space when the final allocate failed, so
-        // the buffer state is clean.
+        // (b) One writeAndAllocate call that FAILS (descriptor budget
+        // exhausted). Its own memcpy still executes at whatever offset the
+        // cursor is CURRENTLY at -- kExpectedStuckOffset, identical in old
+        // and new code for THIS specific call, since no divergence has
+        // happened yet.
+        std::array<uint8_t, static_cast<std::size_t>(rx::material::ParamArena::kUniformBufferAlignment)> sentinel1{};
+        sentinel1.fill(0x77);
+        CHECK(arena->writeAndAllocate(layout, sentinel1.data(), sentinel1.size()) == VK_NULL_HANDLE);
+
+        // (c) ANOTHER writeAndAllocate call on the same frame slot -- also
+        // fails on the descriptor check (maxSets stays exhausted until the
+        // next beginFrame()), but its memcpy's own destination offset is
+        // exactly where the discrimination happens: with the fix, the
+        // cursor never moved after (b)'s failure, so this write re-enters
+        // at kExpectedStuckOffset and overwrites sentinel1 with sentinel2;
+        // with the pre-fix bug, (b)'s failure already advanced the cursor
+        // past kExpectedStuckOffset once, so this write lands one blob
+        // width further along instead, leaving sentinel1 untouched.
+        std::array<uint8_t, static_cast<std::size_t>(rx::material::ParamArena::kUniformBufferAlignment)> sentinel2{};
+        sentinel2.fill(0x99);
+        CHECK(arena->writeAndAllocate(layout, sentinel2.data(), sentinel2.size()) == VK_NULL_HANDLE);
+
         const void* slot1DataAfterExhaustion = rx::material::detail::debugFrameBufferData(*arena, 1);
         REQUIRE(slot1DataAfterExhaustion != nullptr);
-        CHECK(std::memcmp(slot1DataAfterExhaustion, blob.data(), blob.size()) == 0);
+        const auto* stuckOffsetBytes = static_cast<const uint8_t*>(slot1DataAfterExhaustion) + kExpectedStuckOffset;
+
+        // THE discriminator: with the fix, sentinel2 (the LATER failing
+        // write) is what's actually sitting at the stuck offset, because
+        // both failing calls kept landing on top of each other -- the
+        // cursor never advanced on failure. With the pre-fix
+        // cursor-advance-before-allocate bug reinstated, sentinel1 would
+        // still be sitting there untouched instead (failing call (c) would
+        // have landed one blob width further along), and this CHECK fails.
+        CHECK(std::memcmp(stuckOffsetBytes, sentinel2.data(), sentinel2.size()) == 0);
 
         vkDestroyDescriptorSetLayout(fixture.device, layout, nullptr);
     }
