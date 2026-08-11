@@ -1,5 +1,67 @@
 # Task 6 report: Present-mode control (spec seed 1)
 
+## Fix round 1 (post-review)
+
+Review (`task-6-review.md`): spec ✅, 1 Medium to fix, 1 Informational
+(disclosure only). This section documents the fix; the rest of this report
+is the original round-1 account, left intact below for the record.
+
+**Medium — GPU test assertion nearly vacuous.** The original
+`presentMode() ∈ {MAILBOX, IMMEDIATE, FIFO}` check after the `VsyncOff`
+toggle would pass even for a selector hardwired to always return `FIFO` —
+it only proved the result was *some* legal mode, never that it was the
+*right* one for this surface. **Fix:** the test now independently queries
+`vkGetPhysicalDeviceSurfacePresentModesKHR` for the fixture's real surface
+(the same call `device.cpp`'s `selectPresentMode()` makes internally, but
+re-derived from scratch in the test rather than trusted from the code under
+test), computes the expected ladder outcome itself (MAILBOX if that query
+reports it available, else IMMEDIATE, else FIFO), and asserts
+`device->presentMode() == expected` after `setPresentMode(VsyncOff)` +
+`recreateSwapchain()`. This now fails on any surface reporting MAILBOX or
+IMMEDIATE available if the selector doesn't actually pick it — a hardwired
+selector no longer passes. Driver-independence is preserved: the test makes
+no assumption about *which* optional modes exist, only that the selector's
+choice matches the documented preference order applied to whatever the real
+availability list turns out to be. `VsyncOn` → exactly `FIFO` was already
+asserted (`CHECK(device->presentMode() == VK_PRESENT_MODE_FIFO_KHR)`,
+unconditional, no query needed — the Vulkan spec guarantees it); left
+unchanged. The fallback-to-FIFO branch (surface supports neither optional
+mode) remains inspection-verified only, per the original disclosure below —
+no available driver here still forces it, so this fix does not change that.
+
+**Informational — logging line-count wording (no action, per review).**
+"one-line warning" (device.h/device.cpp/README) describes the single line
+of runtime *log output* `RX_LOG_WARN`'s one call produces, not the source
+code's physical line count (the call itself spans two source lines, a
+concatenated string literal). Disclosed here per the review; wording left
+as-is since it accurately describes the actual log line emitted at runtime.
+
+### Verification (fix round 1)
+
+- `cmake --build build/linux-native --target rx_rhi_vk_tests` — rebuilds
+  clean after the test change.
+- `xvfb-run -a ./build/linux-native/src/rx_rhi_vk/rx_rhi_vk_tests
+  --test-case="*present-mode*"` — passes, **20/20 assertions** (was 18;
+  the 2 new ones are the independently-queried expected-mode check
+  replacing the old membership check). Observed: `VsyncOff` resolved to
+  `IMMEDIATE` under the default system validation layer (this surface has
+  no MAILBOX here) — matches the independently-computed expectation.
+- `xvfb-run -a ./build/linux-native/src/rx_rhi_vk/rx_rhi_vk_tests` (full
+  suite) — **35/35 test cases, 807/807 assertions pass** (was 805; +2 from
+  the strengthened test).
+- `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
+  VK_LAYER_PATH=/home/ywadi/sponza/vvl xvfb-run -a ctest --preset
+  linux-native -R rx_rhi_vk` — **1/1 pass**. Under this ICD/layer
+  combination `VsyncOff` resolved to `MAILBOX` (this lavapipe build does
+  support it) — again matches the independently-computed expectation,
+  confirming the strengthened assertion discriminates correctly across two
+  different driver/layer combinations, not just one.
+- `xvfb-run -a ctest --preset linux-native` — **16/16 tests pass**, full
+  suite unaffected.
+- `cmake --build build/windows-cross-zig --target rx_rhi_vk_tests` — builds
+  and links clean (`.exe` present); only the pre-existing, unrelated
+  `_WIN32_WINNT` macro-redefinition warning.
+
 ## Scope
 
 `src/rx_rhi_vk/device.{h,cpp}`, all six samples' `main.cpp` flag parsing,

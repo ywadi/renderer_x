@@ -1,9 +1,11 @@
 #include <doctest/doctest.h>
 #include <rx_rhi_vk/device.h>
 #include <rx_platform/window.h>
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -200,6 +202,37 @@ TEST_CASE("Device present-mode ladder: VsyncOn is FIFO; VsyncOff recreates clean
     // comment at its swapchain-builder call site.
     CHECK(device->presentMode() == VK_PRESENT_MODE_FIFO_KHR);
 
+    // Independently compute what the ladder SHOULD pick for VsyncOff on
+    // this exact surface, by querying vkGetPhysicalDeviceSurfacePresentModesKHR
+    // directly here -- the same call device.cpp's selectPresentMode() makes
+    // internally, but re-done from scratch in this test rather than trusted
+    // from the production code under test. This is what makes the
+    // assertion below non-vacuous [fix round 1, task-6-review.md Medium]: a
+    // selector hardwired to always return FIFO would fail this comparison
+    // on any surface that reports MAILBOX or IMMEDIATE available, whereas
+    // a bare "is it one of the three legal modes" check could not tell a
+    // hardwired-FIFO selector apart from a working ladder. Still
+    // driver-independent -- this makes no assumption about WHICH optional
+    // modes this surface supports, only that whatever the ladder picks
+    // matches applying the documented preference order (MAILBOX, else
+    // IMMEDIATE, else FIFO) to the REAL availability list queried here.
+    uint32_t supportedModeCount = 0;
+    REQUIRE(vkGetPhysicalDeviceSurfacePresentModesKHR(device->physicalDevice(), fixture->surface,
+                                                       &supportedModeCount, nullptr) == VK_SUCCESS);
+    std::vector<VkPresentModeKHR> supportedModes(supportedModeCount);
+    REQUIRE(vkGetPhysicalDeviceSurfacePresentModesKHR(device->physicalDevice(), fixture->surface,
+                                                       &supportedModeCount,
+                                                       supportedModes.data()) == VK_SUCCESS);
+    auto supports = [&supportedModes](VkPresentModeKHR mode) {
+        return std::find(supportedModes.begin(), supportedModes.end(), mode) != supportedModes.end();
+    };
+    VkPresentModeKHR expectedAfterVsyncOff = VK_PRESENT_MODE_FIFO_KHR;
+    if (supports(VK_PRESENT_MODE_MAILBOX_KHR)) {
+        expectedAfterVsyncOff = VK_PRESENT_MODE_MAILBOX_KHR;
+    } else if (supports(VK_PRESENT_MODE_IMMEDIATE_KHR)) {
+        expectedAfterVsyncOff = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    }
+
     // setPresentMode() only records the request; recreateSwapchain() (the
     // very same NeedsRecreate path a real window resize already drives) is
     // what actually applies it -- no second recreation flow exists to call
@@ -207,19 +240,14 @@ TEST_CASE("Device present-mode ladder: VsyncOn is FIFO; VsyncOff recreates clean
     device->setPresentMode(rx::rhi::PresentMode::VsyncOff);
     REQUIRE(device->recreateSwapchain(fixture->surface));
 
-    // The ladder's CONTRACT, not a specific optional mode: under
-    // Xvfb/lavapipe (this project's CI GPU) only FIFO may actually be
-    // reported available for this surface, in which case the ladder's own
-    // documented fallback (MAILBOX -> IMMEDIATE -> FIFO-with-warning,
-    // device.cpp's selectPresentMode()) is exactly what gets exercised
-    // here and FIFO is the correct, expected outcome -- not a failure. A
-    // driver/surface that does support MAILBOX or IMMEDIATE instead
-    // resolves to one of those. Either way the result must be one of these
-    // three; nothing else is a valid ladder output.
-    const VkPresentModeKHR actualAfterVsyncOff = device->presentMode();
-    CHECK((actualAfterVsyncOff == VK_PRESENT_MODE_MAILBOX_KHR ||
-           actualAfterVsyncOff == VK_PRESENT_MODE_IMMEDIATE_KHR ||
-           actualAfterVsyncOff == VK_PRESENT_MODE_FIFO_KHR));
+    // Discriminates a broken/hardwired selector on every driver: on a
+    // surface that reports MAILBOX or IMMEDIATE available, a selector that
+    // always returns FIFO now fails here, regardless of what this specific
+    // dev/CI machine happens to support (the fallback-to-FIFO branch itself
+    // stays inspection-verified -- see this file's/task-6-report.md's own
+    // disclosure -- since no available surface here actually lacks both
+    // optional modes to force it).
+    CHECK(device->presentMode() == expectedAfterVsyncOff);
 
     VkDevice vkDevice = device->device();
 
