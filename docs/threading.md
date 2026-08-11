@@ -60,15 +60,28 @@ chunk) or the dedicated IO thread (`runOnIoThread()`):
   1).
 - Culling (frustum/shadow-caster AABB tests over SoA bounds — Stage 2).
 - Secondary command-buffer recording into a **per-thread, per-frame-in-
-  flight command pool** — Task 7 forward-reference: one `VkCommandPool`
-  per worker thread per frame-in-flight slot, reset as a whole pool once
-  per frame, never touched by more than one thread at a time (a
-  `VkCommandPool` is not internally synchronized — allocating/recording
-  from the same pool on two threads concurrently is a Vulkan spec
-  violation, not merely a performance concern). Each secondary buffer is
-  recorded start-to-finish on the single worker thread that owns its
-  pool; only the primary command buffer (main-thread-only, above) calls
-  `vkCmdExecuteCommands()` to stitch them into the frame.
+  flight command pool** — implemented [Phase 4 Task 7,
+  `rx::graph::Executor::recordChunkedPass()`]: one `VkCommandPool` per
+  (worker thread index, frame-in-flight slot) pair, created lazily, reset
+  as a whole pool once per frame, never touched by more than one thread
+  at a time (a `VkCommandPool` is not internally synchronized —
+  allocating/recording from the same pool on two threads concurrently is
+  a Vulkan spec violation, not merely a performance concern). Each
+  secondary buffer is recorded start-to-finish on the single worker
+  thread that owns its pool; only the primary command buffer
+  (main-thread-only, above) calls `vkCmdExecuteCommands()` to stitch them
+  into the frame.
+  **One exception to "any worker":** a chunked pass's own **chunk 0 is
+  guaranteed to run synchronously, on the calling (main) thread**, before
+  any other chunk begins (`rx::graph::Pass::setExecuteChunked()`'s own
+  doc comment has the full contract) — the one safe place a chunked pass
+  may call a main-thread-only API it cannot avoid needing once per frame
+  (discovered load-bearing, not merely convenient, migrating
+  samples/06_materials' own forward pass: `MaterialSystem::bindInstance()`
+  resolves a pipeline and streams a per-frame parameter UBO in one call,
+  with no split resolve/record API to fall back on). Every chunk *other*
+  than chunk 0 still follows the "any worker, never main-thread-only"
+  rule above without exception.
 
 ## Parallelism is the default, not a mode
 
@@ -99,6 +112,21 @@ many workers the benchmark's own `Scheduler` is constructed with, so the
 benchmark can publish parallel-vs-single numbers — it does not gate
 whether any engine-owned work runs in parallel, which is unconditional
 regardless.
+
+**A render-graph pass's own CHUNK COUNT is a separate formula from the
+`autoGrainSize()` one above** — implemented
+[`rx::graph::detail::chunkCountForWorkerCount()`, `executor.h`]:
+`min(scheduler.workerCount(), kMaxChunksPerPass)`, a pure function of the
+scheduler's own worker count, deliberately independent of any pass's own
+workload size (`Pass::setExecuteChunked()`'s signature carries no such
+hint at all — D4's "no caller-chosen count" applies here too). The
+executor then fans those chunks out via ONE `parallelFor(chunkCount - 1,
+grainSize=1, ...)` call (chunk 0 runs synchronously first — see
+"Worker-allowed" above) — grain **1**, not AUTO, since each chunk index
+is already the right-sized unit of work; `autoGrainSize()`'s own
+formula is for splitting a *known itemCount* (culling, draw-list
+building), a different problem `Pass::setExecuteChunked()` does not
+have.
 
 ## Host-engine coexistence
 
