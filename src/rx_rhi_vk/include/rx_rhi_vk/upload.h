@@ -85,6 +85,9 @@ class Texture2D;
 // total capacity, which fails cleanly (logged, returns false) rather
 // than silently corrupting anything. This never applies to a
 // direct-path buffer upload, which never touches the ring at all.
+//
+// Thread-affinity (D5, Phase 4): uploadToBuffer()/uploadToImage()/flush()
+// are main-thread-only -- see docs/threading.md.
 class Uploader {
 public:
     Uploader(Uploader&&) noexcept;

@@ -13,6 +13,13 @@ include(tools/fetch_slang.cmake)
 add_subdirectory(shaders)
 
 add_subdirectory(src/rx_core)
+# rx_task: the engine's sole task scheduler wrapper [spec D2, Phase 4
+# Stage 0 Task 2] -- device-free, depends only on rx_core (logging) +
+# enkiTS (third_party/CMakeLists.txt). Added here, independent of the
+# rx_platform/rx_shader/rx_rhi_vk/rx_graph/rx_material chain below: nothing
+# in this task's scope links rx_task yet (Task 7/12 are the first
+# consumers), and nothing it depends on requires any of those libraries.
+add_subdirectory(src/rx_task)
 add_subdirectory(src/rx_platform)
 # rx_shader before rx_rhi_vk: rx_rhi_vk's PipelineLayoutBuilder
 # (pipeline_layout.h) links rx_shader's `rx_shader_layout_types` INTERFACE

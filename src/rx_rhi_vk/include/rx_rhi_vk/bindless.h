@@ -146,6 +146,8 @@ private:
 // nor treat release() as a synchronization point for it, until they know
 // (via DeletionQueue or an equivalent fence wait) that no in-flight frame
 // can still reference that slot.
+// Thread-affinity (D5, Phase 4): registerSampledImage()/registerSampler()/
+// registerStorageBuffer()/release() are main-thread-only -- see docs/threading.md.
 class BindlessTable {
 public:
     struct Capacities {

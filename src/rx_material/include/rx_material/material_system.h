@@ -128,6 +128,9 @@ namespace detail {
 // serialize their own access to it. This is a deliberate, explicit scoping
 // decision consistent with this codebase's existing device-object
 // wrappers, not an oversight.
+//
+// Thread-affinity (D5, Phase 4): loadMaterial()/getPipeline() (and every
+// other method here) are main-thread-only -- see docs/threading.md.
 class MaterialSystem {
 public:
     // Saves this instance's VkPipelineCache to the path passed to create()

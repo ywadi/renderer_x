@@ -251,3 +251,50 @@ find_package(vk-bootstrap REQUIRED PATHS "${vk-bootstrap_CACHE_DIR}" NO_DEFAULT_
 
 # Same CMake 3.22 limitation as spdlog/SDL3/Vulkan-Headers above.
 set_target_properties(vk-bootstrap::vk-bootstrap PROPERTIES IMPORTED_GLOBAL TRUE)
+
+# enkiTS: the engine's sole task scheduler [spec D2] -- src/rx_task wraps
+# it thinly as rx::task::Scheduler (Phase 4 Stage 0, Task 2). Zlib license
+# (Doug Binks, see the pinned tag's own License.txt -- permissive, no
+# attribution requirement beyond "appreciated but not required").
+#
+# Pinned v1.12 -- the current tag on github.com/dougbinks/enkiTS as of this
+# task (verified directly: `git ls-remote --tags`), matching [R:threading]'s
+# own version citation. Note enkiTS's CMakeLists.txt project() call still
+# reports VERSION "1.11" (an upstream tag/project-version mismatch, not a
+# mistake on this project's part -- verified directly against the checked-
+# out v1.12 tag's own CMakeLists.txt).
+#
+# Routed through the dep-cache like spdlog/Vulkan-Headers/SDL3/vk-bootstrap
+# above, not vendored as source under third_party/ [task-2 resolution 1]:
+# enkiTS's own CMakeLists.txt already installs a clean, real CMake package
+# (ENKITS_INSTALL=ON produces enkiTSConfig.cmake exporting an `enkiTS::
+# enkiTS` imported target with correct INTERFACE_INCLUDE_DIRECTORIES/
+# INTERFACE_COMPILE_DEFINITIONS) -- verified directly by configuring,
+# building, and installing this exact tag through BOTH this project's
+# toolchains (linux-native and windows-cross-zig) from a clean prefix, then
+# linking and RUNNING a real enki::TaskScheduler/TaskSet program against
+# each installed tree (the windows-cross-zig one under Wine) -- both
+# produced a working static library with no source-level or link-level
+# changes needed. Given a dependency whose own install already "exports
+# cleanly through rx_add_cached_dependency" (the resolution's own bar), that
+# beats hand-vendoring the two source files under third_party/ for no
+# benefit.
+#
+# ENKITS_BUILD_C_INTERFACE/ENKITS_BUILD_EXAMPLES=OFF: this project only
+# ever calls the C++ API (TaskScheduler.h), and enkiTS's example
+# executables would otherwise build unconditionally and add nothing this
+# project links against. ENKITS_BUILD_SHARED=OFF: matches every other
+# compiled dependency here (spdlog/SDL3) being linked statically.
+set(RX_ENKITS_TAG "v1.12")
+rx_add_cached_dependency(
+  NAME enkiTS
+  REPO https://github.com/dougbinks/enkiTS.git
+  TAG ${RX_ENKITS_TAG}
+  CMAKE_ARGS -DENKITS_INSTALL=ON -DENKITS_BUILD_C_INTERFACE=OFF -DENKITS_BUILD_EXAMPLES=OFF -DENKITS_BUILD_SHARED=OFF
+)
+find_package(enkiTS CONFIG REQUIRED PATHS "${enkiTS_CACHE_DIR}" NO_DEFAULT_PATH)
+
+# Same CMake 3.22 limitation as spdlog/SDL3/Vulkan-Headers/vk-bootstrap
+# above: promote to global scope for src/rx_task (a sibling directory) to
+# link.
+set_target_properties(enkiTS::enkiTS PROPERTIES IMPORTED_GLOBAL TRUE)

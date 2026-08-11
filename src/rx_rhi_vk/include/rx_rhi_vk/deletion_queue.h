@@ -56,6 +56,8 @@ namespace rx::rhi {
 // own destructor still runs the underlying Vulkan teardown exactly once
 // when the last reference (here, always exactly one: the retired
 // std::function itself) is dropped.
+// Thread-affinity (D5, Phase 4): retire()/onFrameFenceSignaled()/flushAll()
+// are main-thread-only -- see docs/threading.md.
 class DeletionQueue {
 public:
     DeletionQueue() = default;
