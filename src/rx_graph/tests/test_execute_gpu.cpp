@@ -1505,3 +1505,136 @@ TEST_CASE("PassContext::chunkCommandBuffer throws from a whole-pass setExecute c
 
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
+
+// Phase 4 Task 7 [spec D4 amendment]: "Chunked COMPUTE passes: no rendering
+// scope -- secondaries with plain inheritance, same fan-out" -- every other
+// chunked-pass test above uses a GRAPHICS pass (an attachment output); this
+// one is BARE (no addColorOutput()/setDepthStencilOutput() at all, exactly
+// samples/05_multipass's/06_materials's own compute-class shape via
+// QueueClass::AsyncCompute + addStorageBufferOutput() + setSideEffect() --
+// this file's own "buffer reuse" test above already establishes that
+// pattern for a WHOLE-pass compute pass), proving recordChunkedPass()'s
+// `!isGraphicsPass` branch (no vkCmdBeginRendering/vkCmdEndRendering at
+// all, plain VkCommandBufferInheritanceInfo with no
+// VkCommandBufferInheritanceRenderingInfo chained in) is real, exercised
+// code, not merely a code path that happens to compile. Each chunk
+// vkCmdFillBuffer()s its own, disjoint slice of a storage buffer with a
+// chunk-index-derived pattern (real GPU writes, not just draw-free
+// bookkeeping) -- read back afterward and checked byte-exact per chunk.
+TEST_CASE("Executor::execute chunks a BARE (compute-class, no attachment output) pass with no rendering scope and "
+          "plain secondary inheritance") {
+    auto fixture = makeFixture("rx_graph_gpu_chunked_compute");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    const VkDevice device = fixture->device.device();
+
+    constexpr uint32_t kSlotCount = 8;  // comfortably >= any real chunk count this fixture's Scheduler will derive.
+    constexpr uint32_t kSlotBytes = 256;  // vkCmdFillBuffer requires a multiple of 4; well over that.
+    constexpr VkDeviceSize kBufferBytes = static_cast<VkDeviceSize>(kSlotCount) * kSlotBytes;
+
+    BufferDesc dataDesc;
+    dataDesc.size = kBufferBytes;
+    dataDesc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                      VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+    std::atomic<uint32_t> chunksSeen{0};
+    // Captured from inside the chunked callback (the only place a real
+    // PassContext can resolve "data" by name) so this test can read it back
+    // afterward -- every chunk resolves the SAME underlying VkBuffer (one
+    // resource, resolved once for the whole execute() call), so it is safe
+    // for any chunk to be the one that happens to win this race (the value
+    // written is identical regardless of which chunk writes it).
+    std::atomic<VkBuffer> capturedBuffer{VK_NULL_HANDLE};
+
+    RenderGraph graph;
+    graph.addPass("compute_chunked", QueueClass::AsyncCompute)
+        .addStorageBufferOutput("data", dataDesc)
+        .setSideEffect()
+        .setExecuteChunked([&](PassContext& ctx, uint32_t chunkIndex, uint32_t chunkCount) {
+            REQUIRE(chunkCount <= kSlotCount);  // fits this test's own fixed slot table.
+            chunksSeen.fetch_add(1, std::memory_order_relaxed);
+            VkBuffer buf = ctx.buffer("data");
+            capturedBuffer.store(buf, std::memory_order_relaxed);
+            // Pattern: (chunkIndex + 1) repeated as a uint32 -- never 0, so
+            // an accidentally-unfilled slot (chunkCount < kSlotCount, the
+            // common case) is trivially distinguishable from a real chunk's
+            // own fill.
+            const uint32_t pattern = chunkIndex + 1;
+            vkCmdFillBuffer(ctx.chunkCommandBuffer(), buf, static_cast<VkDeviceSize>(chunkIndex) * kSlotBytes,
+                             kSlotBytes, pattern);
+        });
+
+    // RenderGraph::compile() requires a backbuffer source regardless of
+    // what else the graph does -- "present_stub" exists only to establish
+    // one, exactly like this file's very first ("invert") case's own
+    // "draw" pass establishes "color" with no shader at all: its entire
+    // contribution is being cleared by Executor::execute()'s own load-op
+    // logic. Otherwise fully independent of "compute_chunked" (no shared
+    // resource, no declared edge) -- side-effect-free is fine since
+    // setBackbufferSource() itself is what keeps a graph's backbuffer
+    // writer from being culled (render_graph.cpp's own cull step).
+    graph.addPass("present_stub").addColorOutput("bb", absoluteColorDesc(kExtent, kExtent));
+    graph.setBackbufferSource("bb");
+
+    CompileInfo info;
+    info.swapchainWidth = kExtent;
+    info.swapchainHeight = kExtent;
+    info.swapchainFormat = kFormat;
+    graph.compile(info);
+    fixture->executor->realize(graph);
+
+    auto cmdCtx =
+        rx::rhi::CommandContext::create(device, fixture->device.graphicsQueue(), fixture->device.graphicsQueueFamily());
+    REQUIRE(cmdCtx.has_value());
+
+    // Executor::execute() needs A backbuffer target even though this graph
+    // never writes one through the graph itself -- reuse the same tiny
+    // offscreen image every other case in this file uses; `graph.
+    // setBackbufferSource()` was never called, so compile()'s own
+    // no-side-effect-pass-reads-it path is irrelevant here and this image
+    // is simply unused by the graph (Executor::execute()'s own signature
+    // always takes one, backbuffer-less graphs included).
+    auto offscreen = createOffscreenImage(device, fixture->device.physicalDevice(), kFormat,
+                                            VkExtent2D{kExtent, kExtent});
+    REQUIRE(offscreen.has_value());
+
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
+    });
+
+    const rx::graph::detail::ExecutorChunkDebugStats stats = rx::graph::detail::debugChunkStats(*fixture->executor);
+    const uint32_t expectedChunkCount =
+        rx::graph::detail::chunkCountForWorkerCount(fixture->scheduler->workerCount());
+    CHECK(stats.lastChunkCount == expectedChunkCount);
+    CHECK(chunksSeen.load() == expectedChunkCount);
+
+    const VkBuffer dataBuffer = capturedBuffer.load();
+    REQUIRE(dataBuffer != VK_NULL_HANDLE);
+
+    auto readback = fixture->allocator.createHostVisibleBuffer(kBufferBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    REQUIRE(readback.has_value());
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        VkBufferCopy region{};
+        region.size = kBufferBytes;
+        vkCmdCopyBuffer(cmd, dataBuffer, readback->handle(), 1, &region);
+    });
+    readback->invalidate();
+
+    std::vector<uint32_t> words(static_cast<size_t>(kBufferBytes / sizeof(uint32_t)));
+    std::memcpy(words.data(), readback->mappedData(), words.size() * sizeof(uint32_t));
+    const uint32_t wordsPerSlot = kSlotBytes / sizeof(uint32_t);
+    for (uint32_t chunkIndex = 0; chunkIndex < expectedChunkCount; ++chunkIndex) {
+        CAPTURE(chunkIndex);
+        const uint32_t expected = chunkIndex + 1;
+        for (uint32_t w = 0; w < wordsPerSlot; ++w) {
+            CHECK(words[chunkIndex * wordsPerSlot + w] == expected);
+        }
+    }
+
+    vkDeviceWaitIdle(device);
+    destroyOffscreenImage(device, *offscreen);
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
