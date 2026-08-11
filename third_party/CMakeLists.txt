@@ -389,7 +389,17 @@ if(RX_TRACY)
       NAME tracy
       REPO https://github.com/wolfpld/tracy.git
       TAG ${RX_TRACY_TAG}
-      CMAKE_ARGS -DTRACY_ENABLE=ON -DTRACY_STATIC=ON -DTRACY_ON_DEMAND=ON
+      # TRACY_NO_BROADCAST + TRACY_ONLY_LOCALHOST [CI Wine hang, runs
+      # 31512073559/31521284064]: the on-demand client's first zone spins up
+      # its network layer, and its UDP discovery broadcast wedges process
+      # EXIT under CI's cold-prefix Wine (tests print SUCCESS, the process
+      # never dies, ctest times out at the new 120s guard) — exactly and
+      # only the three test binaries that fire a Tracy macro hung; the four
+      # zone-free ones passed. Broadcast is LAN-discovery convenience we do
+      # not use (we connect directly); localhost-only is CI hygiene. Local
+      # warm-prefix Wine exits fine either way, which is why this never
+      # reproduced off-CI.
+      CMAKE_ARGS -DTRACY_ENABLE=ON -DTRACY_STATIC=ON -DTRACY_ON_DEMAND=ON -DTRACY_NO_BROADCAST=ON -DTRACY_ONLY_LOCALHOST=ON
     )
     find_package(Tracy CONFIG REQUIRED PATHS "${tracy_CACHE_DIR}" NO_DEFAULT_PATH)
 
