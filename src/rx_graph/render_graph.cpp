@@ -789,7 +789,25 @@ Pass& Pass::setSideEffect() {
 }
 
 Pass& Pass::setExecute(std::function<void(PassContext&)> fn) {
+    // Phase 4 Task 7 [spec D4 amendment]: mutually exclusive with
+    // setExecuteChunked() -- see pass.h's own comment on both methods for
+    // why a silent "last call wins" would be the wrong failure mode here.
+    if (executeChunked_) {
+        throw std::logic_error("rx_graph: Pass::setExecute(): pass '" + name_ +
+                                "' already has a setExecuteChunked() callback -- a pass may provide only one "
+                                "execution strategy");
+    }
     execute_ = std::move(fn);
+    return *this;
+}
+
+Pass& Pass::setExecuteChunked(std::function<void(PassContext&, uint32_t, uint32_t)> fn) {
+    if (execute_) {
+        throw std::logic_error("rx_graph: Pass::setExecuteChunked(): pass '" + name_ +
+                                "' already has a setExecute() callback -- a pass may provide only one execution "
+                                "strategy");
+    }
+    executeChunked_ = std::move(fn);
     return *this;
 }
 
@@ -804,6 +822,12 @@ QueueClass Pass::queueClass() const {
 void Pass::invokeExecute(PassContext& ctx) const {
     if (execute_) {
         execute_(ctx);
+    }
+}
+
+void Pass::invokeExecuteChunked(PassContext& ctx, uint32_t chunkIndex, uint32_t chunkCount) const {
+    if (executeChunked_) {
+        executeChunked_(ctx, chunkIndex, chunkCount);
     }
 }
 

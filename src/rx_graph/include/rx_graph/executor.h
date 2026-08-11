@@ -22,6 +22,19 @@ namespace rx::rhi {
 class Device;
 }  // namespace rx::rhi
 
+// Phase 4 Task 7 [spec D4 amendment]: only forward-declared here -- executor.h
+// itself never calls a Scheduler method, only names a reference in
+// Executor::create()'s signature and stores a pointer to it internally
+// (executor.cpp, which does #include <rx_task/scheduler.h> for real).
+// Thread-affinity (D5, Phase 4): see docs/threading.md -- Executor::create()
+// must be called from `scheduler`'s own main thread (the thread that called
+// rx::task::Scheduler::create()), and `scheduler` must outlive the Executor
+// created against it (every execute() call fans chunked passes out through
+// it).
+namespace rx::task {
+class Scheduler;
+}  // namespace rx::task
+
 namespace rx::graph {
 
 class Executor;
@@ -42,6 +55,74 @@ namespace detail {
 // it directly instead. Throws std::out_of_range under the same conditions
 // PassContext's own resolvers do (see that class's comment).
 [[nodiscard]] VkPipelineStageFlags2 debugLastFrameFinalStages(const Executor& executor, std::string_view name);
+
+// Phase 4 Task 7 [spec D4 amendment, "the executor derives chunk count from
+// the scheduler"]: THE canonical chunk-count derivation for every chunked
+// pass this Executor runs -- a pure function of `workerCount`
+// (rx::task::Scheduler::workerCount(), i.e. background workers ONLY,
+// excluding the participating main thread -- see scheduler.h's own doc
+// comment on that exclusion) so both Executor::execute() and a caller
+// wanting to predict/assert it (samples/07_stress's headless counter gate)
+// share one source of truth, exactly like Scheduler::autoGrainSize() is
+// itself a public, independently-callable pure function for the same
+// reason.
+//
+// `min(workerCount, kMaxChunksPerPass)`: deliberately NOT `workerCount + 1`
+// (that quantity instead sizes Executor's own per-thread command-pool
+// coverage, below -- pools must cover every index parallelFor()'s
+// workerIndex could ever report, INCLUDING the main thread's index 0, but
+// the CHUNK COUNT itself does not need to also cover the main thread's own
+// slot: `workerCount` background workers is already the number of
+// recording streams that can usefully run concurrently while the main
+// thread is elsewhere; the main thread MAY still end up grabbing one of
+// those `workerCount` chunks via Scheduler::parallelFor()'s own
+// calling-thread-participates behavior, which costs nothing extra to
+// support since pool coverage already accounts for it). This is also
+// EXACTLY why `--threads 1` (samples/07_stress's single-thread A/B
+// baseline -- Scheduler::create(1)) is a genuine, unconditionally serial
+// recording path: workerCount() == 1 resolves to chunkCountForWorkerCount()
+// == 1, i.e. exactly one chunk exists that frame, so there is nothing for a
+// second thread to steal regardless of which thread ends up running it.
+//
+// kMaxChunksPerPass = 16: a sane ceiling independent of how many hardware
+// threads a machine reports, so a very high core-count box does not fan a
+// single pass out into dozens of secondary command buffers -- each
+// carrying its own vkBeginCommandBuffer/vkEndCommandBuffer/
+// vkCmdExecuteCommands overhead -- for a benefit that stops scaling well
+// past it (the threading research doc's own vkguide.dev citation: "10-1000
+// draw calls per secondary; 2-10 secondaries per frame optimal" -- 16 is
+// deliberately a little above that upper bound, leaving headroom for a
+// future multi-chunked-pass frame without needing to be revisited, not a
+// value tuned to sit inside it).
+constexpr uint32_t kMaxChunksPerPass = 16;
+[[nodiscard]] uint32_t chunkCountForWorkerCount(uint32_t workerCount);
+
+// Test/debug-only seam -- NOT part of the stable public contract, same
+// carve-out convention as debugLastFrameFinalStages() above and
+// rx::task::detail::debugLastDroppedIoTaskCount() (scheduler.h). Snapshots
+// this Executor's chunked-recording counters as of the moment it is
+// called -- intended to be read right after an execute() call whose pass
+// graph included at least one chunked pass.
+struct ExecutorChunkDebugStats {
+    // How many chunks the MOST RECENTLY EXECUTED chunked pass (across
+    // every execute() call this Executor has ever made) fanned out to --
+    // i.e. chunkCountForWorkerCount(scheduler.workerCount()) as of that
+    // pass's own execution, held here so a caller does not need its own
+    // copy of `scheduler` just to recompute it. 0 if this Executor has
+    // never executed a graph containing a chunked pass.
+    uint32_t lastChunkCount = 0;
+
+    // Cumulative real vkAllocateCommandBuffers() calls this Executor has
+    // made for chunk secondary command buffers, over its WHOLE lifetime --
+    // see executor.cpp's own comment on the per-(frame-slot, thread-index)
+    // command-buffer arena for why this is expected to reach a steady
+    // state (stop growing) after at most kFramesInFlight execute() calls
+    // that all exercise the same chunked pass(es): every later frame reuses
+    // an already-allocated buffer from the same slot instead of allocating
+    // a new one.
+    uint64_t totalPoolAllocations = 0;
+};
+[[nodiscard]] ExecutorChunkDebugStats debugChunkStats(const Executor& executor);
 
 }  // namespace detail
 
@@ -124,6 +205,25 @@ public:
     [[nodiscard]] VkBuffer buffer(std::string_view name) const;
     [[nodiscard]] VkFormat imageFormat(std::string_view name) const;
 
+    // Phase 4 Task 7 [spec D4 amendment]: the secondary command buffer THIS
+    // CHUNK records into -- valid only from inside a Pass::setExecuteChunked()
+    // callback (`cmd` above stays VK_NULL_HANDLE for that callback kind; use
+    // this instead). Backed by a thread_local slot Executor::execute() sets
+    // for the duration of each individual chunk invocation (executor.cpp) --
+    // safe to call from any thread a chunked callback runs on, including
+    // concurrently from several chunks' own threads at once, since each
+    // thread only ever reads its OWN slot.
+    //
+    // Throws std::out_of_range if called from a whole-pass
+    // (Pass::setExecute()) callback -- established resolver error style
+    // (rx_graph: PassContext::<method>(): ..., same exception TYPE every
+    // resolver above already throws, e.g. requireKind()'s "wrong kind of
+    // resource" case in executor.cpp): a caller of this class only ever
+    // needs to catch the one exception type it throws, whether the
+    // complaint is "name not resolvable", "wrong resource kind", or (this
+    // one) "wrong calling context".
+    [[nodiscard]] VkCommandBuffer chunkCommandBuffer() const;
+
     // Phase 4 Task 1: false until `name`'s history resource has completed
     // one full ping-pong cycle -- i.e. until THIS frame's read slot has
     // actually been the target of a real Pass::setHistoryOutput() write in
@@ -203,7 +303,20 @@ public:
     // rx::rhi::Allocator, transient pool, and deletion queue -- see
     // executor.cpp). Returns nullptr (logged via RX_LOG_ERROR) on any
     // underlying failure (e.g. rx::rhi::Allocator::createRaw()).
-    static std::unique_ptr<Executor> create(rx::rhi::Device& device);
+    //
+    // Phase 4 Task 7 [spec D4 amendment, "Parallelism is the engine
+    // default, not a mode"]: `scheduler` is REQUIRED, not optional --
+    // there is no null-scheduler / parallelism-disabled construction path,
+    // matching every other engine-owned-work call site's own "self-scaling,
+    // never toggled" posture (docs/threading.md). Every chunked pass this
+    // Executor ever runs (Pass::setExecuteChunked()) fans out through
+    // `scheduler`, so `scheduler` must outlive this Executor, and this
+    // Executor's own execute()/realize()/destructor calls must all happen
+    // on `scheduler`'s own main thread (the thread that called
+    // rx::task::Scheduler::create() -- see that header's class comment;
+    // this Executor never itself calls parallelFor() from any other
+    // thread).
+    static std::unique_ptr<Executor> create(rx::rhi::Device& device, rx::task::Scheduler& scheduler);
 
     // Realizes (or re-realizes) every non-backbuffer PhysicalResource
     // `graph.compiled()` describes against this Executor's transient pool
@@ -278,6 +391,7 @@ public:
 private:
     friend class PassContext;
     friend VkPipelineStageFlags2 detail::debugLastFrameFinalStages(const Executor&, std::string_view);
+    friend detail::ExecutorChunkDebugStats detail::debugChunkStats(const Executor&);
 
     explicit Executor(std::unique_ptr<Impl> impl);
 
@@ -286,6 +400,26 @@ private:
     [[nodiscard]] VkBuffer resolveBuffer(std::string_view name) const;
     [[nodiscard]] VkFormat resolveImageFormat(std::string_view name) const;
     [[nodiscard]] bool resolveHistoryValid(std::string_view name) const;
+    // Phase 4 Task 7: backs PassContext::chunkCommandBuffer() -- see that
+    // method's own doc comment.
+    [[nodiscard]] VkCommandBuffer resolveChunkCommandBuffer() const;
+
+    // Phase 4 Task 7: factored out of execute() purely for readability --
+    // still a genuine Executor MEMBER function (not a free function in
+    // executor.cpp's anonymous namespace) specifically so it keeps the
+    // friend-granted access to Pass::hasChunkedExecute()/
+    // invokeExecuteChunked() that a free function in the same .cpp would
+    // NOT have: C++ access control is per-CLASS, not per-translation-unit
+    // (see this header's own comment on why `struct Impl` above is public,
+    // for the same underlying reason executor.cpp's other free helpers
+    // need it). Fans `pass`'s chunked callback out across impl_->scheduler,
+    // one call per chunk index, then stitches every chunk's own recorded
+    // secondary into `cmd` via a single vkCmdExecuteCommands() call in
+    // chunk-index order -- see executor.cpp's own comment on this method
+    // for the full contract (dynamic-rendering wrapping for a graphics
+    // pass, plain inheritance for a bare/compute one).
+    void recordChunkedPass(const Pass& pass, PassContext& ctx, VkCommandBuffer cmd, bool isGraphicsPass,
+                            VkRenderingInfo& renderingInfo, const PassSignature& signature, uint32_t frameSlot);
 
     std::unique_ptr<Impl> impl_;
 };

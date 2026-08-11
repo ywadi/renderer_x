@@ -157,7 +157,71 @@ public:
     // executionOrder(). Task 1 only stores it -- nothing here or in
     // RenderGraph::compile() calls it; PassContext is forward-declared
     // above precisely because no complete definition exists yet.
+    //
+    // Phase 4 Task 7 [spec D4 amendment, "Parallelism is the engine
+    // default, not a mode"]: mutually exclusive with setExecuteChunked()
+    // below -- a pass provides EITHER a whole-pass callback (this one; the
+    // hand-written simple case the engine cannot itself split, since it
+    // does not own the code inside it) OR a chunked one, never both. Throws
+    // std::logic_error if this pass already has a setExecuteChunked()
+    // callback stored -- a silent "last call wins" would let a caller
+    // accidentally record two conflicting execution strategies for the
+    // same pass with no diagnostic at all.
     Pass& setExecute(std::function<void(PassContext&)> fn);
+
+    // Phase 4 Task 7 [spec D4 amendment; docs/threading.md "Parallelism is
+    // the default, not a mode"]: stores the CHUNKED callback Executor::
+    // execute() fans out across rx::task::Scheduler workers -- see that
+    // header's own class comment for the worker-allowed thread-affinity
+    // note this callback is held to (D5). Providing this callback IS the
+    // parallel path: there is no separate opt-in flag and no
+    // caller-chosen chunk count (the executor derives `chunkCount` from
+    // the scheduler it was created with -- see executor.h's
+    // detail::chunkCountForWorkerCount(), the documented derivation `fn`
+    // can rely on being handed as its own `chunkCount` argument every
+    // single time this pass runs, for the lifetime of one Executor).
+    //
+    // `fn` is called once per chunk index in [0, chunkCount). CHUNK 0 IS
+    // GUARANTEED to run synchronously, on the SAME thread that called
+    // Executor::execute() (this Executor's Scheduler's own main thread --
+    // Executor::create()'s doc comment), to completion, BEFORE any other
+    // chunk begins -- never concurrent with chunk 1..chunkCount-1 or with
+    // itself. Chunks [1, chunkCount) fan out across the scheduler's
+    // participating background workers (Scheduler::parallelFor()), POSSIBLY
+    // CONCURRENTLY with each other (never with chunk 0, which has already
+    // finished by then).
+    //
+    // This makes chunk 0 the one safe place a chunked pass may call a
+    // main-thread-only API it cannot avoid needing once per frame
+    // (BindlessTable registration, Uploader submissions,
+    // MaterialSystem::loadMaterial()/getPipeline()/bindInstance(),
+    // DeletionQueue -- docs/threading.md's "Main-thread-only" list;
+    // discovered load-bearing, not merely convenient, while migrating
+    // samples/06_materials' own forward pass: MaterialSystem::bindInstance()
+    // resolves a material's pipeline AND streams its per-frame parameter
+    // UBO in one call, main-thread-only with no split "resolve on main,
+    // record anywhere" API to fall back on). Every OTHER chunk -- including
+    // chunk 0 whenever a pass has no such constraint at all, e.g.
+    // samples/05_multipass's and samples/07_stress's own forward passes --
+    // must still touch no shared, unsynchronized state other than through
+    // its own PassContext& (whose chunkCommandBuffer() below is exactly one
+    // real VkCommandBuffer per chunk, safe to record into without any lock)
+    // and must never call a main-thread-only API from anywhere but chunk 0.
+    //
+    // `fn` records exclusively through PassContext::chunkCommandBuffer()
+    // (a secondary command buffer, one per chunk this frame) -- NOT
+    // PassContext::cmd, which stays at its default VK_NULL_HANDLE for a
+    // chunked pass's invocation (Executor::execute() never assigns it in
+    // this path): a secondary command buffer inherits neither the
+    // primary's bound pipeline/descriptor sets nor its dynamic state
+    // (viewport/scissor -- core Vulkan secondary-buffer semantics, not an
+    // engine restriction), so `fn` must set up everything its own chunk's
+    // draws need from scratch, every invocation, exactly like a whole-pass
+    // callback already does once per execute() call today.
+    //
+    // Mutually exclusive with setExecute() above -- throws std::logic_error
+    // if this pass already has a whole-pass callback stored.
+    Pass& setExecuteChunked(std::function<void(PassContext&, uint32_t chunkIndex, uint32_t chunkCount)> fn);
 
     [[nodiscard]] std::string_view name() const;
     [[nodiscard]] QueueClass queueClass() const;
@@ -183,6 +247,21 @@ private:
     // reach this. Declared here rather than free-standing in executor.cpp
     // because execute_ is itself a private member.
     void invokeExecute(PassContext& ctx) const;
+
+    // Phase 4 Task 7: true if setExecuteChunked() (not setExecute()) was
+    // called for this pass -- Executor::execute() branches its whole
+    // per-pass recording strategy on this (parallel fan-out + secondary
+    // command buffers vs. today's single whole-pass callback on the
+    // primary). False for a pass with neither callback stored (a bare
+    // barrier-only pass) exactly like invokeExecute() already no-ops for
+    // that case.
+    [[nodiscard]] bool hasChunkedExecute() const { return static_cast<bool>(executeChunked_); }
+
+    // The chunked twin of invokeExecute() above -- same friend-gating
+    // rationale, same no-op-if-never-set posture (never actually reached
+    // with executeChunked_ unset: Executor::execute() only takes this path
+    // when hasChunkedExecute() is already true).
+    void invokeExecuteChunked(PassContext& ctx, uint32_t chunkIndex, uint32_t chunkCount) const;
 
     // Which builder method produced one Declaration -- drives both the
     // stage/access/layout resolution in RenderGraph::compile() (Task 1
@@ -261,6 +340,8 @@ private:
     QueueClass queue_ = QueueClass::Graphics;
     bool sideEffect_ = false;
     std::function<void(PassContext&)> execute_;
+    // Phase 4 Task 7 [spec D4 amendment].
+    std::function<void(PassContext&, uint32_t, uint32_t)> executeChunked_;
     std::vector<Declaration> declarations_;
 };
 

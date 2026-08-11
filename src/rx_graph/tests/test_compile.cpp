@@ -200,6 +200,31 @@ TEST_CASE("Pass accessors and RenderGraph::reset()") {
     CHECK_THROWS_AS(graph.compile(kInfo), std::runtime_error);
 }
 
+// Phase 4 Task 7 [spec D4 amendment, "Parallelism is the engine default, not
+// a mode"]: setExecute()/setExecuteChunked() are mutually exclusive -- a
+// pass provides EITHER a whole-pass callback OR a chunked one, never both,
+// and the second call in either order throws rather than silently letting
+// "last call wins" leave an ambiguous pass. Device-free (this file's own
+// scope): neither callback is ever actually INVOKED here -- that needs a
+// real Executor (rx_graph_gpu_tests' own test_execute_gpu.cpp).
+TEST_CASE("Pass::setExecute and setExecuteChunked are mutually exclusive, throwing std::logic_error naming the pass") {
+    RenderGraph graph;
+
+    Pass& chunkedFirst = graph.addPass("chunked_first");
+    chunkedFirst.setExecuteChunked([](PassContext&, uint32_t, uint32_t) {});
+    CHECK_THROWS_AS(chunkedFirst.setExecute([](PassContext&) {}), std::logic_error);
+    // The failed setExecute() call must not have clobbered the already-
+    // stored chunked callback -- re-calling setExecuteChunked() (a legal,
+    // idempotent re-set of the SAME kind) must still throw for the SAME
+    // reason, proving the pass's chunked-callback state survived the
+    // rejected setExecute() attempt untouched.
+    CHECK_THROWS_AS(chunkedFirst.setExecute([](PassContext&) {}), std::logic_error);
+
+    Pass& wholeFirst = graph.addPass("whole_first");
+    wholeFirst.setExecute([](PassContext&) {});
+    CHECK_THROWS_AS(wholeFirst.setExecuteChunked([](PassContext&, uint32_t, uint32_t) {}), std::logic_error);
+}
+
 TEST_CASE("the backbuffer's resolved attachment always mirrors the swapchain") {
     RenderGraph graph;
     AttachmentDesc declared = colorDesc();

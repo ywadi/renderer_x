@@ -7,10 +7,14 @@
 #include <rx_rhi_vk/command.h>
 #include <rx_rhi_vk/deletion_queue.h>
 #include <rx_rhi_vk/device.h>
+#include <rx_rhi_vk/frame_sync.h>
 #include <rx_rhi_vk/tracy_gpu.h>
+#include <rx_task/scheduler.h>
 #include <volk.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -141,6 +145,25 @@ struct ResolvedResource {
     VkExtent2D extent{0, 0};
 };
 
+// Phase 4 Task 7 [spec D4 amendment; R:threading "Per-Thread, Per-Frame
+// Command Pools"]: one worker (or the participating main) thread's secondary
+// command-buffer arena for ONE frame-in-flight slot. `pool` is created
+// lazily (VK_NULL_HANDLE until the first chunk this (frameSlot, threadIndex)
+// pair ever needs to record); `buffers` grows on demand the first time a
+// given frame needs MORE simultaneous secondaries from this pool than any
+// past frame at this same slot ever did, and is otherwise fully reused,
+// frame after frame, via a whole-pool vkResetCommandPool() at the start of
+// each frame that reuses this slot (resetChunkPoolsForFrameSlot(), below) --
+// never a per-buffer reset (this pool is created WITHOUT
+// VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT), matching rx::rhi::
+// FrameSync's own primary-command-buffer pools (frame_sync.cpp) and the
+// "bulk reset; no per-buffer fences needed" pattern R:threading documents.
+struct ChunkCommandPool {
+    VkCommandPool pool = VK_NULL_HANDLE;
+    std::vector<VkCommandBuffer> buffers;
+    uint32_t usedThisFrame = 0;
+};
+
 struct Executor::Impl {
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
@@ -183,14 +206,40 @@ struct Executor::Impl {
     std::vector<ResolvedResource> resources;
     std::unordered_map<std::string, uint32_t> nameToIndex;
 
+    // Phase 4 Task 7 [spec D4 amendment]: non-owning -- `scheduler` must
+    // outlive this Executor (executor.h's create() doc comment). Every
+    // chunked pass's fan-out goes through this pointer; never null once
+    // construction succeeds (create() always supplies a real reference).
+    rx::task::Scheduler* scheduler = nullptr;
+
+    // Indexed [frameSlot][threadIndex] -- see ChunkCommandPool's own
+    // comment above and chunkFrameSlotForThisExecute()'s comment below for
+    // exactly what each index means. Sized to scheduler->workerCount() + 1
+    // entries per frame slot at construction time (below) -- the "+1"
+    // covers the participating main thread's own index 0 alongside every
+    // background worker's [scheduler.h: parallelFor()'s workerIndex
+    // includes the calling thread] -- and never resized again (Scheduler::
+    // workerCount() is fixed for a Scheduler's whole lifetime).
+    std::array<std::vector<ChunkCommandPool>, rx::rhi::FrameSync::kFramesInFlight> chunkPools;
+
+    // Phase 4 Task 7 debug/stats seam backing detail::debugChunkStats() --
+    // see executor.h's own comment on that function/struct.
+    uint32_t lastChunkCount = 0;
+    std::atomic<uint64_t> totalChunkPoolAllocations{0};
+
     Impl(VkDevice deviceIn, VkPhysicalDevice physicalDeviceIn, VkQueue graphicsQueueIn, uint32_t graphicsQueueFamilyIn,
-         rx::rhi::Allocator allocatorIn)
+         rx::rhi::Allocator allocatorIn, rx::task::Scheduler& schedulerIn)
         : device(deviceIn),
           physicalDevice(physicalDeviceIn),
           graphicsQueue(graphicsQueueIn),
           graphicsQueueFamily(graphicsQueueFamilyIn),
           allocator(std::move(allocatorIn)),
-          pool(physicalDeviceIn, deviceIn, allocator) {}
+          pool(physicalDeviceIn, deviceIn, allocator),
+          scheduler(&schedulerIn) {
+        for (std::vector<ChunkCommandPool>& perThread : chunkPools) {
+            perThread.resize(static_cast<size_t>(scheduler->workerCount()) + 1);
+        }
+    }
 };
 
 namespace {
@@ -606,9 +655,133 @@ void initializePinnedHistoryEntry(Executor::Impl& impl, uint32_t pinnedIndex) {
     });
 }
 
+// Phase 4 Task 7 [spec D4 amendment]: resets every ChunkCommandPool this
+// Executor has ever lazily created for frame-in-flight slot `frameSlot` --
+// called once, unconditionally, near the top of every Executor::execute()
+// call, before any pass (chunked or otherwise) runs this frame. A whole-pool
+// vkResetCommandPool() recycles every secondary command buffer ever
+// allocated from that pool back to Vulkan's INITIAL state in one call
+// [R:threading: "bulk reset; no per-buffer fences needed"] -- `usedThisFrame`
+// resetting to 0 alongside it is what lets acquireChunkCommandBuffer() below
+// treat `buffers` as a reusable arena rather than re-allocating every frame.
+// A pool that was never actually created (still VK_NULL_HANDLE -- no chunked
+// pass has ever landed on this exact (frameSlot, threadIndex) pair) is
+// simply skipped; resetting a pool that was never used costs a driver call
+// for nothing.
+void resetChunkPoolsForFrameSlot(Executor::Impl& impl, uint32_t frameSlot) {
+    for (ChunkCommandPool& cp : impl.chunkPools[frameSlot]) {
+        if (cp.pool != VK_NULL_HANDLE) {
+            vkResetCommandPool(impl.device, cp.pool, 0);
+        }
+        cp.usedThisFrame = 0;
+    }
+}
+
+// Returns a secondary VkCommandBuffer, in Vulkan's INITIAL state (ready for
+// vkBeginCommandBuffer), from `threadIndex`'s own arena for `frameSlot` --
+// VK_NULL_HANDLE (logged) on any Vulkan failure, which callers must treat as
+// "this chunk recorded nothing" rather than crash. Reuses an
+// already-allocated buffer left over from a past frame's use of this exact
+// (frameSlot, threadIndex) pair when one is available (resetChunkPoolsForFrameSlot()
+// above already reset it to INITIAL state this frame); allocates a genuinely
+// new one -- counted via impl.totalChunkPoolAllocations, the
+// detail::debugChunkStats() seam's own budget counter -- only the first time
+// a given (frameSlot, threadIndex) pair needs MORE simultaneous secondaries
+// than any past frame at that same slot ever did (in this project's own
+// samples, at most one chunked pass per frame, so this budget stabilizes
+// after the first kFramesInFlight execute() calls).
+//
+// Never touched by more than one thread at a time BY CONSTRUCTION --
+// `threadIndex` is the identity of whichever single physical OS thread is
+// calling this (docs/threading.md's own "never touched by more than one
+// thread at a time" contract for exactly this arena: a VkCommandPool is not
+// internally synchronized, and no two of this Scheduler's threads ever share
+// a workerIndex), so no lock guards `cp` itself. impl.totalChunkPoolAllocations
+// is the one piece of shared state this function CAN touch from multiple
+// threads concurrently (two different threadIndex's own first-allocation-
+// this-frame moments can race each other) -- a std::atomic<uint64_t>, per
+// Impl's own field comment, precisely because of that.
+VkCommandBuffer acquireChunkCommandBuffer(Executor::Impl& impl, uint32_t frameSlot, uint32_t threadIndex) {
+    ChunkCommandPool& cp = impl.chunkPools[frameSlot].at(threadIndex);
+
+    if (cp.pool == VK_NULL_HANDLE) {
+        VkCommandPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        // TRANSIENT, deliberately NOT RESET_COMMAND_BUFFER_BIT -- see
+        // ChunkCommandPool's own comment for why (whole-pool reset only).
+        poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        poolInfo.queueFamilyIndex = impl.graphicsQueueFamily;
+        const VkResult result = vkCreateCommandPool(impl.device, &poolInfo, nullptr, &cp.pool);
+        if (result != VK_SUCCESS) {
+            RX_LOG_ERROR("rx_graph: Executor: vkCreateCommandPool failed for chunk pool (frameSlot={}, "
+                         "threadIndex={}): VkResult={}",
+                         frameSlot, threadIndex, static_cast<int>(result));
+            return VK_NULL_HANDLE;
+        }
+    }
+
+    if (cp.usedThisFrame < cp.buffers.size()) {
+        return cp.buffers[cp.usedThisFrame++];
+    }
+
+    VkCommandBufferAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool = cp.pool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    const VkResult result = vkAllocateCommandBuffers(impl.device, &allocInfo, &cmd);
+    if (result != VK_SUCCESS) {
+        RX_LOG_ERROR("rx_graph: Executor: vkAllocateCommandBuffers failed for chunk secondary (frameSlot={}, "
+                     "threadIndex={}): VkResult={}",
+                     frameSlot, threadIndex, static_cast<int>(result));
+        return VK_NULL_HANDLE;
+    }
+    cp.buffers.push_back(cmd);
+    cp.usedThisFrame++;
+    impl.totalChunkPoolAllocations.fetch_add(1, std::memory_order_relaxed);
+    return cmd;
+}
+
+// Phase 4 Task 7: backs PassContext::chunkCommandBuffer() -- see that
+// method's own doc comment (executor.h) for the full contract. thread_local
+// rather than a field on PassContext itself: a chunked pass's PassContext is
+// ONE object shared by every chunk's own (possibly concurrent) invocation of
+// Pass::invokeExecuteChunked(), so any per-chunk mutable state on PassContext
+// itself would race; each thread instead only ever reads/writes its OWN slot
+// here.
+thread_local VkCommandBuffer tChunkCommandBuffer = VK_NULL_HANDLE;
+
+// RAII guard around one chunk callback invocation: sets the calling thread's
+// tChunkCommandBuffer slot for the callback's duration, restoring whatever
+// it held before on scope exit (including via an exception unwinding through
+// the callback) -- "restore the previous value" rather than "always clear to
+// VK_NULL_HANDLE" defends a hypothetical nested chunk invocation (none of
+// this project's own callers nest them, but this makes the guarantee
+// unconditional rather than "true in practice"). This is also what makes
+// PassContext::chunkCommandBuffer() correctly throw when called from a
+// WHOLE-PASS callback even on a thread that previously ran a chunk earlier
+// in the SAME execute() call: this scope's destructor already restored that
+// thread's slot back to VK_NULL_HANDLE (or whatever it was before) the
+// moment the earlier chunk's own callback returned, so no stale handle from
+// a past chunk can ever leak into a later, unrelated callback.
+class ChunkCommandBufferScope {
+public:
+    explicit ChunkCommandBufferScope(VkCommandBuffer cmd) : previous_(tChunkCommandBuffer) {
+        tChunkCommandBuffer = cmd;
+    }
+    ~ChunkCommandBufferScope() { tChunkCommandBuffer = previous_; }
+    ChunkCommandBufferScope(const ChunkCommandBufferScope&) = delete;
+    ChunkCommandBufferScope& operator=(const ChunkCommandBufferScope&) = delete;
+
+private:
+    VkCommandBuffer previous_;
+};
+
 }  // namespace
 
-std::unique_ptr<Executor> Executor::create(rx::rhi::Device& device) {
+std::unique_ptr<Executor> Executor::create(rx::rhi::Device& device, rx::task::Scheduler& scheduler) {
     auto allocator = rx::rhi::Allocator::createRaw(device.physicalDevice(), device.device(), device.instance());
     if (!allocator.has_value()) {
         RX_LOG_ERROR("rx_graph: Executor::create: rx::rhi::Allocator::createRaw failed");
@@ -616,7 +789,7 @@ std::unique_ptr<Executor> Executor::create(rx::rhi::Device& device) {
     }
 
     auto impl = std::make_unique<Impl>(device.device(), device.physicalDevice(), device.graphicsQueue(),
-                                        device.graphicsQueueFamily(), std::move(*allocator));
+                                        device.graphicsQueueFamily(), std::move(*allocator), scheduler);
 
     // Task 3 ambiguity resolution #7: query VK_EXT_debug_utils availability
     // once here, via the plain volk-global-function-pointer-null-check
@@ -661,6 +834,20 @@ Executor::~Executor() {
     // Null-safe unconditionally (RX_TRACY off, or any context-creation
     // failure) -- see tracy_gpu.h's own comment on RX_GPU_CONTEXT_DESTROY.
     RX_GPU_CONTEXT_DESTROY(impl_->gpuProfileCtx);
+    // Phase 4 Task 7: destroying each lazily-created chunk pool implicitly
+    // frees every secondary VkCommandBuffer ever allocated from it -- same
+    // "destroying the pool is enough, no separate vkFreeCommandBuffers"
+    // pattern rx::rhi::CommandContext::destroyAll() already uses. Safe here,
+    // after vkDeviceWaitIdle() above, for the same reason every other
+    // teardown call in this destructor is: nothing on the device can still
+    // be executing (or about to reference) any of these buffers.
+    for (std::vector<ChunkCommandPool>& perThread : impl_->chunkPools) {
+        for (ChunkCommandPool& cp : perThread) {
+            if (cp.pool != VK_NULL_HANDLE) {
+                vkDestroyCommandPool(impl_->device, cp.pool, nullptr);
+            }
+        }
+    }
     impl_->pool.retireAll(impl_->frameCounter, impl_->deletionQueue);
     impl_->deletionQueue.flushAll();
 }
@@ -765,6 +952,16 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
     const std::span<const PhysicalResource> resources = compiled.resources();
 
     ++impl.frameCounter;
+
+    // Phase 4 Task 7 [spec D4 amendment]: this call's own frame-in-flight
+    // slot for the CHUNK secondary-buffer arenas (ChunkCommandPool, above) --
+    // an independent 2-cycle from history's own ping-pong parity below (both
+    // derive from frameCounter, but there is no requirement they share a
+    // phase; each only needs to be internally consistent with itself across
+    // calls). Reset UNCONDITIONALLY, before any pass runs this frame, exactly
+    // once -- a chunked pass may be the very first pass in the graph.
+    const uint32_t chunkFrameSlot = static_cast<uint32_t>(impl.frameCounter % rx::rhi::FrameSync::kFramesInFlight);
+    resetChunkPoolsForFrameSlot(impl, chunkFrameSlot);
 
     // Evict any pooled entry a past realize() released and nothing has
     // reclaimed for kStaleAfterExecutes consecutive execute() calls, then
@@ -879,6 +1076,14 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
         VkExtent2D renderArea{0, 0};
         std::vector<VkRenderingAttachmentInfo> colorAttachments;
         VkRenderingAttachmentInfo depthAttachment{};
+        // Phase 4 Task 7: hoisted out of the `if (isGraphicsPass)` block
+        // below (it used to be a block-local) so a CHUNKED graphics pass can
+        // still reach it after the block closes -- see recordChunkedPass()'s
+        // own comment for why its vkCmdBeginRendering() call (with
+        // VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT set into this
+        // same struct's `flags`) happens AFTER every chunk has already
+        // finished recording, not here.
+        VkRenderingInfo renderingInfo{};
 
         if (isGraphicsPass) {
             colorAttachments.reserve(colorPhysIdx.size());
@@ -919,14 +1124,24 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
                 }
             }
 
-            VkRenderingInfo renderingInfo{};
             renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
             renderingInfo.renderArea = VkRect2D{{0, 0}, renderArea};
             renderingInfo.layerCount = 1;
             renderingInfo.colorAttachmentCount = static_cast<uint32_t>(colorAttachments.size());
             renderingInfo.pColorAttachments = colorAttachments.empty() ? nullptr : colorAttachments.data();
             renderingInfo.pDepthAttachment = depthPhysIdx.has_value() ? &depthAttachment : nullptr;
-            vkCmdBeginRendering(cmd, &renderingInfo);
+            // Phase 4 Task 7: only the WHOLE-PASS path begins rendering
+            // here, inline, with the (implicit, flags == 0) default
+            // "contents recorded directly into the primary" mode -- a
+            // CHUNKED pass instead defers this exact call to
+            // recordChunkedPass() below, with
+            // VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT set,
+            // after every chunk's own secondary has finished recording (see
+            // that function's own comment for why recording order and
+            // primary-command-stream order are independent here).
+            if (!pass.hasChunkedExecute()) {
+                vkCmdBeginRendering(cmd, &renderingInfo);
+            }
         }
 
         // Task 5 (rx_material): mirror this pass's own attachment shape
@@ -964,13 +1179,23 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
         }
 
         PassContext ctx(*this);
-        ctx.cmd = cmd;
         ctx.renderArea = renderArea;
         ctx.passSignature_ = signature;
-        pass.invokeExecute(ctx);
 
-        if (isGraphicsPass) {
-            vkCmdEndRendering(cmd);
+        // Phase 4 Task 7 [spec D4 amendment, "Parallelism is the engine
+        // default, not a mode"]: a chunked pass fans its recording out in
+        // parallel (recordChunkedPass()); a whole-pass one runs exactly as
+        // every pass did before this task -- byte-identical, since this
+        // branch reaches the SAME two statements (ctx.cmd = cmd;
+        // pass.invokeExecute(ctx);) with nothing else changed around them.
+        if (pass.hasChunkedExecute()) {
+            recordChunkedPass(pass, ctx, cmd, isGraphicsPass, renderingInfo, signature, chunkFrameSlot);
+        } else {
+            ctx.cmd = cmd;
+            pass.invokeExecute(ctx);
+            if (isGraphicsPass) {
+                vkCmdEndRendering(cmd);
+            }
         }
 
         endDebugLabel(impl, cmd);
@@ -1050,6 +1275,209 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
     // the finalBarriers() call just above never opens one) -- exactly
     // Tracy's own documented requirement for TracyVkCollect.
     RX_GPU_COLLECT(impl.gpuProfileCtx, cmd);
+}
+
+// Phase 4 Task 7 [spec D4 amendment; R:threading "Secondary Command Buffers
+// + Dynamic Rendering"]: records `pass`'s chunked callback in parallel
+// across impl_->scheduler's workers (background workers AND the
+// participating main thread -- scheduler.h), then stitches every chunk's own
+// recorded secondary into `cmd` via ONE vkCmdExecuteCommands() call, in
+// chunk-index order.
+//
+// RECORDING ORDER VS. PRIMARY COMMAND-STREAM ORDER: for a GRAPHICS pass
+// (isGraphicsPass), every chunk finishes recording its OWN, independent
+// secondary command buffer BEFORE this function ever calls
+// vkCmdBeginRendering() on `cmd` at all. That is equivalent to (not merely
+// "close enough to") recording every chunk strictly inside the primary's
+// rendering scope: a secondary is an independent command-buffer object, so
+// the wall-clock order in which its contents are FILLED IN has no bearing on
+// GPU-visible execution order, which is governed entirely by `cmd`'s own
+// recorded command sequence -- vkCmdBeginRendering(cmd,
+// ...SECONDARY_COMMAND_BUFFERS_BIT...) then vkCmdExecuteCommands(cmd, ...)
+// then vkCmdEndRendering(cmd), exactly as if every chunk had been recorded
+// strictly between the begin and the execute calls. Doing it in this order
+// (fan out and finish every secondary FIRST, touch the primary only after)
+// needs no restructuring of `renderingInfo`'s construction above and keeps
+// the primary's own command stream exactly two calls longer than the
+// whole-pass path (vkCmdBeginRendering + vkCmdExecuteCommands +
+// vkCmdEndRendering vs. vkCmdBeginRendering + <inline recording> +
+// vkCmdEndRendering) regardless of chunkCount.
+//
+// For a BARE/compute-class chunked pass (!isGraphicsPass) [task-7-brief.md:
+// "Chunked COMPUTE passes: no rendering scope -- secondaries with plain
+// inheritance, same fan-out"]: `renderingInfo` is never touched at all, and
+// each secondary's own VkCommandBufferInheritanceInfo::pNext stays null
+// (plain inheritance, no VkCommandBufferInheritanceRenderingInfo chained in)
+// -- see the per-chunk lambda below.
+//
+// CHUNK 0 IS GUARANTEED SYNCHRONOUS, ON THIS CALL'S OWN THREAD -- discovered
+// necessary while migrating samples/06_materials' own forward pass (not
+// merely convenient): rx::material::MaterialSystem::bindInstance() (which a
+// per-object material draw must call to resolve its pipeline and stream its
+// parameter UBO) is main-thread-only, no exception, and a chunked callback
+// has NO thread-affinity guarantee otherwise -- Scheduler::parallelFor()'s
+// own doc comment is explicit that the calling thread merely "participates",
+// racing every background worker for each chunk, including chunk 0.
+// Without a genuine guarantee, a pass with unavoidably-sequential,
+// main-thread-only per-frame setup (docs/threading.md's "Main-thread-only"
+// list) would have no safe way to use setExecuteChunked() at all. This
+// executor closes that gap once, here, rather than leaving every such pass
+// to reinvent its own workaround: chunk 0's own invocation of `pass`'s
+// callback always runs directly on the thread that called
+// Executor::execute() (which is itself contractually this Executor's
+// Scheduler's own main thread -- Executor::create()'s doc comment), to
+// completion, BEFORE chunks [1, chunkCount) are ever handed to
+// parallelFor() -- i.e. chunk 0 is never concurrent with any other chunk.
+// A pass with no such constraint (samples/05_multipass's forward pass;
+// samples/07_stress's) is unaffected: every chunk's own draw-recording work
+// is equally safe on any thread, so this ordering costs nothing but
+// (chunkCount > 1 ? one synchronous chunk's worth of otherwise-parallel
+// work : nothing) -- negligible next to real per-frame draw volumes, and,
+// for chunkCount == 1 (samples/07_stress's `--threads 1` A/B baseline)
+// EXACTLY the fully-serial recording path that baseline needs, with no
+// parallelFor()/enkiTS task-submission overhead at all.
+void Executor::recordChunkedPass(const Pass& pass, PassContext& ctx, VkCommandBuffer cmd, bool isGraphicsPass,
+                                  VkRenderingInfo& renderingInfo, const PassSignature& signature,
+                                  uint32_t frameSlot) {
+    Impl& impl = *impl_;
+
+    const uint32_t chunkCount = detail::chunkCountForWorkerCount(impl.scheduler->workerCount());
+    impl.lastChunkCount = chunkCount;
+    std::vector<VkCommandBuffer> chunkBuffers(chunkCount, VK_NULL_HANDLE);
+
+    // Records chunk `chunkIndex`'s own secondary command buffer, acquiring
+    // it from `workerIndex`'s own (frameSlot, threadIndex) arena -- shared
+    // verbatim by the guaranteed-synchronous chunk 0 call and every
+    // parallelFor()-dispatched chunk [1, chunkCount) below, so the two
+    // paths cannot silently drift apart.
+    auto recordOneChunk = [&](uint32_t chunkIndex, uint32_t workerIndex) {
+        // Per-chunk CPU zone [task-7-brief.md item 3: "RX_ZONE per
+        // chunk-record (worker side)"] -- recorded on whichever thread
+        // actually runs this chunk (always the calling thread for chunk 0 --
+        // see this function's own comment above).
+        RX_ZONE_NAMED("graph_pass_chunk_record");
+        RX_ZONE_DYNAMIC_NAME(pass.name().data(), pass.name().size());
+
+        const VkCommandBuffer secondary = acquireChunkCommandBuffer(impl, frameSlot, workerIndex);
+        if (secondary == VK_NULL_HANDLE) {
+            // Already logged by acquireChunkCommandBuffer() -- this chunk
+            // simply contributes nothing (chunkBuffers[chunkIndex] stays
+            // VK_NULL_HANDLE, filtered out below).
+            return;
+        }
+
+        VkCommandBufferInheritanceRenderingInfo inheritRendering{};
+        VkCommandBufferInheritanceInfo inherit{};
+        inherit.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO;
+        // renderPass/framebuffer stay VK_NULL_HANDLE (dynamic rendering --
+        // R:threading: "renderPass = NULL with dynamic rendering").
+        // occlusionQueryEnable/queryFlags/pipelineStatistics stay at their
+        // zero defaults -- no pass in this codebase uses queries.
+
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.pInheritanceInfo = &inherit;
+
+        if (isGraphicsPass) {
+            // VkCommandBufferInheritanceRenderingInfo must match the
+            // primary's own vkCmdBeginRendering() shape for this pass
+            // exactly [R:threading] -- `signature` already IS that shape
+            // (Executor::execute() derives it from the identical
+            // colorPhysIdx/depthPhysIdx classification renderingInfo itself
+            // was built from, just above this call). Unused color slots
+            // stay VK_FORMAT_UNDEFINED (PassSignature's own zero-init
+            // padding, per pass_signature.h); stencil is always
+            // VK_FORMAT_UNDEFINED here too -- this engine never binds a
+            // separate stencil attachment (pStencilAttachment is never set
+            // on renderingInfo either).
+            inheritRendering.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO;
+            inheritRendering.colorAttachmentCount = signature.colorCount;
+            inheritRendering.pColorAttachmentFormats = signature.colorFormats.data();
+            inheritRendering.depthAttachmentFormat = signature.depthFormat;
+            inheritRendering.stencilAttachmentFormat = VK_FORMAT_UNDEFINED;
+            inheritRendering.rasterizationSamples = signature.samples;
+            inherit.pNext = &inheritRendering;
+            beginInfo.flags =
+                VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
+        } else {
+            // Plain inheritance -- inherit.pNext stays null.
+            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        }
+
+        const VkResult beginResult = vkBeginCommandBuffer(secondary, &beginInfo);
+        if (beginResult != VK_SUCCESS) {
+            RX_LOG_ERROR(
+                "rx_graph: Executor: vkBeginCommandBuffer failed for chunk {}/{} of pass '{}': VkResult={}",
+                chunkIndex, chunkCount, std::string(pass.name()), static_cast<int>(beginResult));
+            return;
+        }
+
+        {
+            // Scoped so PassContext::chunkCommandBuffer() resolves to
+            // `secondary` for exactly the duration of this one chunk's own
+            // callback invocation, on exactly this thread -- see
+            // ChunkCommandBufferScope's own comment.
+            ChunkCommandBufferScope scope(secondary);
+            pass.invokeExecuteChunked(ctx, chunkIndex, chunkCount);
+        }
+
+        vkEndCommandBuffer(secondary);
+        chunkBuffers[chunkIndex] = secondary;
+    };
+
+    // The fan-out itself gets its own zone [task-7-brief.md item 3],
+    // distinct from the per-chunk RX_ZONE recordOneChunk() declares above --
+    // this one spans chunk 0's own synchronous call PLUS the whole blocking
+    // parallelFor() call for the rest, on whichever thread reaches this
+    // point (contractually this Executor's Scheduler's own main thread --
+    // see this function's own comment above).
+    RX_ZONE_NAMED("graph_pass_chunk_fanout");
+    RX_ZONE_DYNAMIC_NAME(pass.name().data(), pass.name().size());
+
+    // Chunk 0: always synchronous, always workerIndex 0 -- enkiTS's own
+    // convention ("Thread 0 is main thread", verified directly against
+    // TaskScheduler.h) makes 0 the correct, real identity for whichever
+    // thread this call is running on, which Executor::create()'s own
+    // contract already requires to be this Scheduler's main thread.
+    recordOneChunk(0, /*workerIndex=*/0);
+
+    if (chunkCount > 1) {
+        impl.scheduler->parallelFor(chunkCount - 1, /*grainSize=*/1,
+                                     [&](uint32_t begin, uint32_t /*end*/, uint32_t workerIndex) {
+                                         // grainSize == 1 over [0, chunkCount
+                                         // - 1): every partition is exactly
+                                         // one item wide; `begin + 1` maps it
+                                         // back into the real [1, chunkCount)
+                                         // chunk-index space chunk 0 already
+                                         // claimed above.
+                                         recordOneChunk(begin + 1, workerIndex);
+                                     });
+    }
+
+    // Filter out any chunk that failed to record at all (see the
+    // VK_NULL_HANDLE early-returns above) -- vkCmdExecuteCommands() requires
+    // commandBufferCount > 0 and every handle in pCommandBuffers to be
+    // valid, so a defensive, logged degrade here is "this pass drew less
+    // than it should have" (already logged, per-chunk, above), never a
+    // crash or a validation error from handing it a null handle.
+    std::vector<VkCommandBuffer> validChunkBuffers;
+    validChunkBuffers.reserve(chunkBuffers.size());
+    for (VkCommandBuffer buf : chunkBuffers) {
+        if (buf != VK_NULL_HANDLE) {
+            validChunkBuffers.push_back(buf);
+        }
+    }
+
+    if (isGraphicsPass) {
+        renderingInfo.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+        vkCmdBeginRendering(cmd, &renderingInfo);
+    }
+    if (!validChunkBuffers.empty()) {
+        vkCmdExecuteCommands(cmd, static_cast<uint32_t>(validChunkBuffers.size()), validChunkBuffers.data());
+    }
+    if (isGraphicsPass) {
+        vkCmdEndRendering(cmd);
+    }
 }
 
 namespace {
@@ -1137,13 +1565,44 @@ bool Executor::resolveHistoryValid(std::string_view name) const {
     return impl_->pool.pinned(resolved.poolIndex).slots[readSlot].everWrittenByRealPass;
 }
 
+// Phase 4 Task 7: backs PassContext::chunkCommandBuffer() -- see that
+// method's own doc comment (executor.h) and tChunkCommandBuffer/
+// ChunkCommandBufferScope's own comments above for the thread_local
+// mechanism this reads.
+VkCommandBuffer Executor::resolveChunkCommandBuffer() const {
+    if (tChunkCommandBuffer == VK_NULL_HANDLE) {
+        throw std::out_of_range(
+            "rx_graph: PassContext::chunkCommandBuffer(): not currently inside a Pass::setExecuteChunked() "
+            "callback (called from a whole-pass setExecute() callback, or from outside any pass callback at all)");
+    }
+    return tChunkCommandBuffer;
+}
+
 VkImageView PassContext::imageView(std::string_view name) const { return executor_->resolveImageView(name); }
 VkImage PassContext::image(std::string_view name) const { return executor_->resolveImage(name); }
 VkBuffer PassContext::buffer(std::string_view name) const { return executor_->resolveBuffer(name); }
 VkFormat PassContext::imageFormat(std::string_view name) const { return executor_->resolveImageFormat(name); }
 bool PassContext::historyValid(std::string_view name) const { return executor_->resolveHistoryValid(name); }
+VkCommandBuffer PassContext::chunkCommandBuffer() const { return executor_->resolveChunkCommandBuffer(); }
 
 namespace detail {
+
+// Phase 4 Task 7: see executor.h's own extensive comment on this function
+// for the full derivation rationale -- kept here as a one-line formula
+// specifically so it stays trivially re-derivable by inspection, matching
+// rx::task::Scheduler::autoGrainSize()'s own "pure, static, directly
+// unit-testable" posture.
+uint32_t chunkCountForWorkerCount(uint32_t workerCount) {
+    return std::max<uint32_t>(1, std::min(workerCount, kMaxChunksPerPass));
+}
+
+ExecutorChunkDebugStats debugChunkStats(const Executor& executor) {
+    const Executor::Impl& impl = *executor.impl_;
+    ExecutorChunkDebugStats stats;
+    stats.lastChunkCount = impl.lastChunkCount;
+    stats.totalPoolAllocations = impl.totalChunkPoolAllocations.load(std::memory_order_relaxed);
+    return stats;
+}
 
 VkPipelineStageFlags2 debugLastFrameFinalStages(const Executor& executor, std::string_view name) {
     const Executor::Impl& impl = *executor.impl_;

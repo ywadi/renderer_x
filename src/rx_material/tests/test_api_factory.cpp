@@ -21,6 +21,7 @@
 #include <rx_rhi_vk/command.h>
 #include <rx_rhi_vk/context.h>
 #include <rx_rhi_vk/device.h>
+#include <rx_task/scheduler.h>
 
 #include <algorithm>
 #include <array>
@@ -337,7 +338,14 @@ std::optional<QuadrantPixels> renderQuadAndReadbackQuadrants(rx::rhi::Device& de
     std::memcpy(indexBuffer->mappedData(), kIndices.data(), sizeof(kIndices));
     indexBuffer->flush();
 
-    auto executor = rx::graph::Executor::create(device);
+    // Phase 4 Task 7 [spec D4 amendment]: Executor::create() now requires a
+    // real rx::task::Scheduler& -- this function's own local one, kept alive
+    // for the rest of this function's (synchronous) execution.
+    auto scheduler = rx::task::Scheduler::create();
+    if (scheduler == nullptr) {
+        return std::nullopt;
+    }
+    auto executor = rx::graph::Executor::create(device, *scheduler);
     if (executor == nullptr) {
         return std::nullopt;
     }

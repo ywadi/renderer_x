@@ -37,8 +37,10 @@
 #include <rx_rhi_vk/pipeline_layout.h>
 #include <rx_shader/compiler.h>
 #include <rx_shader/reflection.h>
+#include <rx_task/scheduler.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -59,11 +61,19 @@ constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
 // rx_rhi_vk/tests/texture_test.cpp/upload_test.cpp -- Executor::create()
 // needs a real rx::rhi::Device&, which needs a real VkSurfaceKHR even
 // though nothing in either test case below ever presents to it.
+//
+// Phase 4 Task 7 [spec D4 amendment]: Executor::create() now also requires a
+// real rx::task::Scheduler& (parallelism is the engine default -- there is
+// no null-scheduler construction path). `scheduler` is declared BEFORE
+// `executor` so it is destroyed AFTER it (members destruct in reverse
+// declaration order) -- Executor::create()'s own doc comment requires the
+// Scheduler to outlive the Executor built against it.
 struct GpuFixture {
     rx::platform::Window window;
     rx::rhi::Context context;
     rx::rhi::Device device;
     rx::rhi::Allocator allocator;
+    std::unique_ptr<rx::task::Scheduler> scheduler;
     std::unique_ptr<Executor> executor;
 };
 
@@ -91,11 +101,14 @@ std::optional<GpuFixture> makeFixture(const char* title) {
     auto allocator = rx::rhi::Allocator::create(*context, *device);
     REQUIRE(allocator.has_value());
 
-    auto executor = Executor::create(*device);
+    auto scheduler = rx::task::Scheduler::create();
+    REQUIRE(scheduler != nullptr);
+
+    auto executor = Executor::create(*device, *scheduler);
     REQUIRE(executor != nullptr);
 
-    return GpuFixture{std::move(*window), std::move(*context), std::move(*device), std::move(*allocator),
-                       std::move(executor)};
+    return GpuFixture{std::move(*window),    std::move(*context),  std::move(*device),
+                       std::move(*allocator), std::move(scheduler), std::move(executor)};
 }
 
 // --- Offscreen "backbuffer" -- an external, never-pooled image the test
@@ -1220,6 +1233,274 @@ TEST_CASE(
     vkDestroySampler(device, sampler, nullptr);
     destroyInvertPipeline(device, *samplePipeline);
     destroyFillPipeline(device, *fillPipeline);
+    destroyOffscreenImage(device, *offscreen);
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// --- Phase 4 Task 7 [spec D4 amendment]: Pass::setExecuteChunked() TDD
+// gates. Both cases below draw a 2x2 grid of 4 solid-color cells (the
+// FillPipeline above, reused verbatim -- no bindless dependency, so it is
+// the simplest pipeline this file already has to reuse) via SCISSOR-clipped
+// draws of the same full-clip-space triangle, one cell per logical "item",
+// distributed across chunks by (chunkIndex, chunkCount) -- the exact
+// ceil-division slicing samples/05_multipass and samples/06_materials'
+// migrated forward passes use for real objects.
+namespace {
+
+constexpr uint32_t kCellCount = 4;
+constexpr std::array<std::array<float, 4>, kCellCount> kCellColors{{
+    {1.0F, 0.0F, 0.0F, 1.0F},  // cell 0: red
+    {0.0F, 1.0F, 0.0F, 1.0F},  // cell 1: green
+    {0.0F, 0.0F, 1.0F, 1.0F},  // cell 2: blue
+    {1.0F, 1.0F, 0.0F, 1.0F},  // cell 3: yellow
+}};
+
+// Records cell [begin, end) of the 2x2 grid onto `cmd` -- shared verbatim by
+// both the chunked callback (one slice per chunk) and the whole-pass
+// callback (one call covering all 4 cells at once), which is exactly what
+// makes the two TEST_CASEs below a genuine apples-to-apples byte-identical
+// comparison rather than two independently-written draw loops that merely
+// happen to agree.
+void recordCells(VkCommandBuffer cmd, const FillPipeline& pipeline, uint32_t extent, uint32_t begin, uint32_t end) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.pipeline);
+    VkViewport viewport{0.0F, 0.0F, static_cast<float>(extent), static_cast<float>(extent), 0.0F, 1.0F};
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+    const uint32_t half = extent / 2;
+    for (uint32_t cell = begin; cell < end; ++cell) {
+        const uint32_t cx = cell % 2;
+        const uint32_t cy = cell / 2;
+        VkRect2D scissor{{static_cast<int32_t>(cx * half), static_cast<int32_t>(cy * half)}, {half, half}};
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+        vkCmdPushConstants(cmd, pipeline.layoutBundle.layout, pipeline.pushConstantStages,
+                            pipeline.pushConstantOffset, pipeline.pushConstantSize, kCellColors[cell].data());
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+    }
+}
+
+std::array<uint8_t, 4> readCellCenter(const std::array<uint8_t, 4>* pixels, uint32_t extent, uint32_t cell) {
+    const uint32_t half = extent / 2;
+    const uint32_t cx = cell % 2;
+    const uint32_t cy = cell / 2;
+    const uint32_t x = cx * half + half / 2;
+    const uint32_t y = cy * half + half / 2;
+    return pixels[static_cast<size_t>(y) * extent + x];
+}
+
+}  // namespace
+
+TEST_CASE("Pass::setExecuteChunked records every chunk in parallel, drawing each cell exactly once, with zero "
+          "validation errors, and its composited output is pixel-identical to the equivalent whole-pass recording") {
+    auto fixture = makeFixture("rx_graph_gpu_chunked");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    const VkDevice device = fixture->device.device();
+    const VkPhysicalDevice physicalDevice = fixture->device.physicalDevice();
+
+    auto fillPipeline = buildFillPipeline(device, kFormat);
+    REQUIRE(fillPipeline.has_value());
+
+    auto offscreenChunked = createOffscreenImage(device, physicalDevice, kFormat, VkExtent2D{kExtent, kExtent});
+    REQUIRE(offscreenChunked.has_value());
+    auto offscreenWhole = createOffscreenImage(device, physicalDevice, kFormat, VkExtent2D{kExtent, kExtent});
+    REQUIRE(offscreenWhole.has_value());
+
+    // How many times each cell index was actually drawn, summed across every
+    // chunk (however many the executor ends up fanning out to) -- must land
+    // on exactly 1 per cell, proving the ceil-division slicing below covers
+    // every cell exactly once with no gaps or double-draws, regardless of
+    // chunkCount. std::atomic: multiple chunks' own callbacks can run this
+    // concurrently, on different threads.
+    std::array<std::atomic<uint32_t>, kCellCount> drawCounts{};
+
+    RenderGraph chunkedGraph;
+    chunkedGraph.addPass("quad_fill")
+        .addColorOutput("bb", absoluteColorDesc(kExtent, kExtent))
+        .setExecuteChunked([&](PassContext& ctx, uint32_t chunkIndex, uint32_t chunkCount) {
+            REQUIRE(chunkCount >= 1);
+            const uint32_t cellsPerChunk = (kCellCount + chunkCount - 1) / chunkCount;
+            const uint32_t begin = std::min(chunkIndex * cellsPerChunk, kCellCount);
+            const uint32_t end = std::min(begin + cellsPerChunk, kCellCount);
+            for (uint32_t cell = begin; cell < end; ++cell) {
+                drawCounts[cell].fetch_add(1, std::memory_order_relaxed);
+            }
+            recordCells(ctx.chunkCommandBuffer(), *fillPipeline, kExtent, begin, end);
+        });
+    chunkedGraph.setBackbufferSource("bb");
+
+    CompileInfo chunkedInfo;
+    chunkedInfo.swapchainWidth = kExtent;
+    chunkedInfo.swapchainHeight = kExtent;
+    chunkedInfo.swapchainFormat = kFormat;
+    chunkedInfo.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    chunkedGraph.compile(chunkedInfo);
+    fixture->executor->realize(chunkedGraph);
+
+    auto cmdCtx =
+        rx::rhi::CommandContext::create(device, fixture->device.graphicsQueue(), fixture->device.graphicsQueueFamily());
+    REQUIRE(cmdCtx.has_value());
+
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        fixture->executor->execute(chunkedGraph, cmd, offscreenChunked->image, offscreenChunked->view,
+                                    VkExtent2D{kExtent, kExtent});
+    });
+
+    for (uint32_t cell = 0; cell < kCellCount; ++cell) {
+        CAPTURE(cell);
+        CHECK(drawCounts[cell].load() == 1);
+    }
+
+    // Chunk-count derivation is the one source of truth samples/07_stress's
+    // own headless counter gate will assert against too -- see executor.h's
+    // detail::chunkCountForWorkerCount() doc comment.
+    const rx::graph::detail::ExecutorChunkDebugStats stats = rx::graph::detail::debugChunkStats(*fixture->executor);
+    CHECK(stats.lastChunkCount == rx::graph::detail::chunkCountForWorkerCount(fixture->scheduler->workerCount()));
+    // Pool-allocation budget: at most one secondary per (frameSlot,
+    // threadIndex) pair is ever needed here (one chunked pass, one chunk
+    // per thread this test's single execute() call could possibly use) --
+    // see ChunkCommandPool's own comment for why this budget is
+    // (workerCount() + 1) * kFramesInFlight.
+    CHECK(stats.totalPoolAllocations <= static_cast<uint64_t>(fixture->scheduler->workerCount() + 1) * 2);
+
+    // --- Whole-pass twin: SAME recordCells() call, all 4 cells in one shot,
+    // through setExecute() (ctx.cmd, not ctx.chunkCommandBuffer()) --------
+    RenderGraph wholeGraph;
+    wholeGraph.addPass("quad_fill")
+        .addColorOutput("bb", absoluteColorDesc(kExtent, kExtent))
+        .setExecute([&](PassContext& ctx) { recordCells(ctx.cmd, *fillPipeline, kExtent, 0, kCellCount); });
+    wholeGraph.setBackbufferSource("bb");
+    wholeGraph.compile(chunkedInfo);
+    fixture->executor->realize(wholeGraph);
+
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        fixture->executor->execute(wholeGraph, cmd, offscreenWhole->image, offscreenWhole->view,
+                                    VkExtent2D{kExtent, kExtent});
+    });
+
+    const VkDeviceSize pixelBytes = static_cast<VkDeviceSize>(kExtent) * kExtent * 4;
+    auto readbackChunked = fixture->allocator.createHostVisibleBuffer(pixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    REQUIRE(readbackChunked.has_value());
+    auto readbackWhole = fixture->allocator.createHostVisibleBuffer(pixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    REQUIRE(readbackWhole.has_value());
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        VkBufferImageCopy region{};
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent = {kExtent, kExtent, 1};
+        vkCmdCopyImageToBuffer(cmd, offscreenChunked->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                readbackChunked->handle(), 1, &region);
+        vkCmdCopyImageToBuffer(cmd, offscreenWhole->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                readbackWhole->handle(), 1, &region);
+    });
+    readbackChunked->invalidate();
+    readbackWhole->invalidate();
+
+    // BYTE-IDENTICAL, whole-image -- the strongest form of the "chunked
+    // recording must not change rendered output" claim this task's brief
+    // requires of samples/05_multipass and samples/06_materials' own
+    // migrations, proven once here at the executor level with a full
+    // memcmp rather than a handful of probe pixels.
+    CHECK(std::memcmp(readbackChunked->mappedData(), readbackWhole->mappedData(), static_cast<size_t>(pixelBytes)) ==
+          0);
+
+    const auto* chunkedPixels = static_cast<const std::array<uint8_t, 4>*>(readbackChunked->mappedData());
+    for (uint32_t cell = 0; cell < kCellCount; ++cell) {
+        CAPTURE(cell);
+        const std::array<uint8_t, 4> px = readCellCenter(chunkedPixels, kExtent, cell);
+        CHECK(px[0] == static_cast<uint8_t>(kCellColors[cell][0] * 255.0F));
+        CHECK(px[1] == static_cast<uint8_t>(kCellColors[cell][1] * 255.0F));
+        CHECK(px[2] == static_cast<uint8_t>(kCellColors[cell][2] * 255.0F));
+        CHECK(px[3] == 255);
+    }
+
+    vkDeviceWaitIdle(device);
+    destroyFillPipeline(device, *fillPipeline);
+    destroyOffscreenImage(device, *offscreenChunked);
+    destroyOffscreenImage(device, *offscreenWhole);
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("PassContext::chunkCommandBuffer throws from a whole-pass setExecute callback; ctx.cmd stays "
+          "VK_NULL_HANDLE inside a chunked one") {
+    auto fixture = makeFixture("rx_graph_gpu_chunked_context_misuse");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    const VkDevice device = fixture->device.device();
+    const VkPhysicalDevice physicalDevice = fixture->device.physicalDevice();
+
+    // Neither pass callback below issues a single draw call (both only
+    // probe PassContext's own accessors) -- no pipeline is needed at all
+    // for this test, unlike the previous one.
+    auto offscreen = createOffscreenImage(device, physicalDevice, kFormat, VkExtent2D{kExtent, kExtent});
+    REQUIRE(offscreen.has_value());
+
+    CompileInfo info;
+    info.swapchainWidth = kExtent;
+    info.swapchainHeight = kExtent;
+    info.swapchainFormat = kFormat;
+    info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
+    auto cmdCtx =
+        rx::rhi::CommandContext::create(device, fixture->device.graphicsQueue(), fixture->device.graphicsQueueFamily());
+    REQUIRE(cmdCtx.has_value());
+
+    // --- Whole-pass: chunkCommandBuffer() must throw std::out_of_range,
+    // and never reach the draw calls below it in the same callback --------
+    bool threw = false;
+    bool drewAnyway = false;
+    RenderGraph wholeGraph;
+    wholeGraph.addPass("whole")
+        .addColorOutput("bb", absoluteColorDesc(kExtent, kExtent))
+        .setExecute([&](PassContext& ctx) {
+            CHECK(ctx.cmd != VK_NULL_HANDLE);
+            try {
+                (void)ctx.chunkCommandBuffer();
+                drewAnyway = true;
+            } catch (const std::out_of_range&) {
+                threw = true;
+            }
+        });
+    wholeGraph.setBackbufferSource("bb");
+    wholeGraph.compile(info);
+    fixture->executor->realize(wholeGraph);
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        fixture->executor->execute(wholeGraph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
+    });
+    CHECK(threw);
+    CHECK_FALSE(drewAnyway);
+
+    // --- Chunked: ctx.cmd (the field every whole-pass callback reads) must
+    // stay at its default VK_NULL_HANDLE -- chunkCommandBuffer() is the only
+    // valid way to get a real command buffer out of a chunked callback ----
+    bool sawNullCtxCmd = false;
+    bool sawRealChunkCmd = false;
+    RenderGraph chunkedGraph;
+    chunkedGraph.addPass("chunked")
+        .addColorOutput("bb", absoluteColorDesc(kExtent, kExtent))
+        .setExecuteChunked([&](PassContext& ctx, uint32_t /*chunkIndex*/, uint32_t /*chunkCount*/) {
+            if (ctx.cmd == VK_NULL_HANDLE) {
+                sawNullCtxCmd = true;
+            }
+            if (ctx.chunkCommandBuffer() != VK_NULL_HANDLE) {
+                sawRealChunkCmd = true;
+            }
+        });
+    chunkedGraph.setBackbufferSource("bb");
+    chunkedGraph.compile(info);
+    fixture->executor->realize(chunkedGraph);
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        fixture->executor->execute(chunkedGraph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
+    });
+    CHECK(sawNullCtxCmd);
+    CHECK(sawRealChunkCmd);
+
+    vkDeviceWaitIdle(device);
     destroyOffscreenImage(device, *offscreen);
 
     CHECK_FALSE(fixture->context.hasValidationErrors());

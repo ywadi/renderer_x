@@ -19,6 +19,16 @@
 # volk and no rx_rhi_vk type -- see executor.h's and transient_pool.h's own
 # header-hygiene comments for exactly where the device-touching boundary
 # now sits.
+#
+# Phase 4 Task 7 adds rx_task PUBLIC [spec D4 amendment]: Executor::create()
+# now takes a required rx::task::Scheduler& (parallelism is the engine
+# default, not an opt-in mode -- there is no null-scheduler path), and
+# executor.h's own PassContext::chunkCommandBuffer() forward-declares
+# nothing scheduler-shaped, but executor.cpp fans chunked passes out via
+# Scheduler::parallelFor() directly. PUBLIC (not PRIVATE) because
+# executor.h's Executor::create() signature names rx::task::Scheduler in a
+# public header -- every caller needs rx_task's own include directory
+# transitively, exactly like Vulkan::Headers/rx_rhi_vk above.
 add_library(rx_graph STATIC
     render_graph.cpp
     barriers.cpp
@@ -26,6 +36,6 @@ add_library(rx_graph STATIC
     transient_pool.cpp
 )
 target_include_directories(rx_graph PUBLIC include)
-target_link_libraries(rx_graph PUBLIC Vulkan::Headers rx_core rx_rhi_vk)
+target_link_libraries(rx_graph PUBLIC Vulkan::Headers rx_core rx_rhi_vk rx_task)
 
 add_subdirectory(tests)

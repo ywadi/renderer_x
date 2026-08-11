@@ -8,6 +8,7 @@
 
 #include <rx_graph/executor.h>
 #include <rx_graph/render_graph.h>
+#include <rx_task/scheduler.h>
 
 #include <array>
 #include <chrono>
@@ -725,7 +726,15 @@ TEST_CASE("MaterialSystem::bindInstance binds a real pipeline + set-1 UBO descri
     float tint[4] = {0.25F, 0.5F, 0.75F, 1.0F};
     std::memcpy(blob.data() + params[0].offset, tint, sizeof(tint));
 
-    auto executor = rx::graph::Executor::create(fixture->device);
+    // Phase 4 Task 7 [spec D4 amendment]: Executor::create() now requires a
+    // real rx::task::Scheduler& (parallelism is the engine default -- see
+    // that method's own doc comment). This test never touches a chunked
+    // pass, so a plain default-worker-count Scheduler local to this
+    // TEST_CASE is all it needs -- declared before `executor` so it
+    // outlives it (reverse-destruction-order local variables).
+    auto scheduler = rx::task::Scheduler::create();
+    REQUIRE(scheduler != nullptr);
+    auto executor = rx::graph::Executor::create(fixture->device, *scheduler);
     REQUIRE(executor != nullptr);
 
     constexpr VkExtent2D kExtent{64, 64};
@@ -782,7 +791,9 @@ TEST_CASE("MaterialSystem::bindInstance rejects a paramSize that does not match 
 
     rx::material::MaterialHandle handle = system->loadMaterial(testDataPath("test_unlit.slang"));
 
-    auto executor = rx::graph::Executor::create(fixture->device);
+    auto scheduler = rx::task::Scheduler::create();
+    REQUIRE(scheduler != nullptr);
+    auto executor = rx::graph::Executor::create(fixture->device, *scheduler);
     REQUIRE(executor != nullptr);
 
     constexpr VkExtent2D kExtent{64, 64};

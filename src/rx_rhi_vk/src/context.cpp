@@ -131,6 +131,51 @@ bool isKnownSyncValidationSeparateSamplerMisclassification(const char* message) 
            msg.find("command: vkCmdPipelineBarrier2") != std::string_view::npos;
 }
 
+// Fourth known false positive, the SAME root cause as the third guard just
+// above (this machine's apt-packaged 1.3.204.1 layer misclassifying a
+// separate Texture2D+SamplerState `.Sample()` read as
+// SYNC_*_SHADER_STORAGE_READ) -- discovered by [Phase 4 Task 7, spec D4
+// amendment] when samples/05_multipass's forward pass first became a
+// CHUNKED pass (Pass::setExecuteChunked()): its shadow-map sample read now
+// happens inside a SECONDARY command buffer, stitched into the primary via
+// vkCmdExecuteCommands() -- and the SAME misclassified hazard the third
+// guard already suppresses at the inner "vkCmdDraw: Hazard READ_AFTER_WRITE"
+// message ALSO surfaces one level up, as a SEPARATE "vkCmdExecuteCommands:
+// Hazard READ_AFTER_WRITE for entry N" message summarizing the secondary's
+// own recorded access against the primary's prior barrier -- this outer
+// message's format omits the `type: VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE` field
+// the third guard keys on (it names the ACCESS, not the descriptor,
+// replacing `usage:`/`prior_usage:` with `recorded_usage:`/`prior_usage:` on
+// the two halves of the same layer-internal comparison), so the third guard
+// does not (and, matched on that field, should not) catch it -- a distinct
+// guard, not a broadened one, keeps each guard's match narrow to its own
+// exact message shape.
+//
+// VERIFIED, not assumed: reproduces under the apt-packaged 1.3.204.1 layer
+// (samples/05_multipass --validate, forward pass chunked, sampling its own
+// shadow map) and reports ZERO hazards, byte-for-byte the same shader/
+// graph/barriers/chunking, against the same substantially newer
+// VK_LAYER_KHRONOS_validation build (api_version 1.4.357, VK_LAYER_PATH
+// override) the third guard's own comment already cites -- an actively-
+// maintained implementation of this same validation feature agrees the
+// secondary's access is correctly synchronized by the primary's barrier.
+// Matched on "vkCmdExecuteCommands" plus the hazard ID plus the two
+// recorded/prior usage fields plus the barrier command -- narrow enough that
+// an unrelated real read-after-write hazard reported through
+// vkCmdExecuteCommands (a genuinely un-synchronized secondary) would not
+// share this exact combination.
+bool isKnownSyncValidationSeparateSamplerMisclassificationViaExecuteCommands(const char* message) {
+    if (message == nullptr) {
+        return false;
+    }
+    const std::string_view msg(message);
+    return msg.find("SYNC-HAZARD-READ_AFTER_WRITE") != std::string_view::npos &&
+           msg.find("vkCmdExecuteCommands") != std::string_view::npos &&
+           msg.find("recorded_usage: SYNC_FRAGMENT_SHADER_SHADER_STORAGE_READ") != std::string_view::npos &&
+           msg.find("prior_usage: SYNC_IMAGE_LAYOUT_TRANSITION") != std::string_view::npos &&
+           msg.find("command: vkCmdPipelineBarrier2") != std::string_view::npos;
+}
+
 VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
                                               VkDebugUtilsMessageTypeFlagsEXT /*type*/,
                                               const VkDebugUtilsMessengerCallbackDataEXT* data,
@@ -143,6 +188,8 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBits
             RX_LOG_WARN("[vulkan validation] (known false positive: validation layer predates SPIR-V SourceLanguage=Slang) {}", data->pMessage);
         } else if (isKnownSyncValidationSeparateSamplerMisclassification(data->pMessage)) {
             RX_LOG_WARN("[vulkan validation] (known false positive: validation layer's sync validation misclassifies a separate-sampler Texture2D.Sample() read; verified clean against a newer layer build) {}", data->pMessage);
+        } else if (isKnownSyncValidationSeparateSamplerMisclassificationViaExecuteCommands(data->pMessage)) {
+            RX_LOG_WARN("[vulkan validation] (known false positive: same separate-sampler misclassification as above, reported via vkCmdExecuteCommands for a chunked pass's secondary command buffer; verified clean against a newer layer build) {}", data->pMessage);
         } else {
             RX_LOG_ERROR("[vulkan validation] {}", data->pMessage);
             (*errorCount)++;
