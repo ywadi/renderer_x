@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -51,12 +52,25 @@ class Scheduler {
   // recoverable configuration-error path here).
   static std::unique_ptr<Scheduler> create(uint32_t workerCount = 0);
 
-  // Shuts the underlying task scheduler down: requests shutdown, wakes and
-  // joins every worker thread (including the dedicated IO thread's pinned-
-  // task loop) and only then returns. Safe even with pending
-  // postToMain()/runOnIoThread() work still queued (it is simply dropped,
-  // matching a normal application-teardown expectation -- this is not a
-  // drain-to-completion operation).
+  // Shuts the underlying task scheduler down: stops accepting new
+  // runOnIoThread() submissions, requests shutdown, waits for whatever the
+  // IO thread is already running to finish (enkiTS's own
+  // WaitforAllAndShutdown() drains everything already queued before it
+  // returns -- empirically verified, see scheduler.cpp), then joins every
+  // worker thread including the IO thread. Any runOnIoThread() submission
+  // that arrives concurrently with this destructor (a caller responsibility
+  // violation -- destroying a Scheduler while another thread might still
+  // call it is a lifetime bug on the caller's part regardless of this
+  // note) is refused rather than silently leaked: refused-at-the-door
+  // submissions, and the vanishingly rare case of one that slips past that
+  // check but never gets a chance to run before every thread is joined,
+  // are both deleted (never executed) and counted -- see
+  // detail::debugLastDroppedIoTaskCount() and scheduler.cpp's own comment
+  // on why the latter path is defense-in-depth rather than something this
+  // task could reproduce on demand. postToMain() work still queued when
+  // pumpMain() is never called again is simply dropped (its captured
+  // closure destroyed as an ordinary side effect) -- this is not a
+  // drain-to-completion operation for that queue.
   ~Scheduler();
 
   Scheduler(const Scheduler&) = delete;
@@ -145,5 +159,22 @@ class Scheduler {
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+namespace detail {
+
+// Test-only seam -- NOT part of the stable public contract, mirroring
+// rx::material::detail::debugCompileCount()'s own carve-out convention
+// (there is no other way to observe this from outside: the count only
+// exists during, and briefly after, a specific Scheduler's destruction).
+// Returns how many runOnIoThread() submissions the MOST RECENTLY
+// DESTROYED Scheduler in this process dropped (deleted without ever
+// calling their fn) at teardown -- either refused outright because that
+// Scheduler's destructor had already begun, or (the defense-in-depth
+// path -- see scheduler.cpp) still unexecuted after its dedicated IO
+// thread was fully joined. 0 if no Scheduler has been destroyed yet in
+// this process, or the last one destroyed dropped nothing.
+[[nodiscard]] size_t debugLastDroppedIoTaskCount();
+
+}  // namespace detail
 
 }  // namespace rx::task

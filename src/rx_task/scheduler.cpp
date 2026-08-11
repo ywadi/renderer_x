@@ -9,6 +9,9 @@
 
 #include <rx_core/log.h>
 
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -16,6 +19,15 @@
 namespace rx::task {
 
 namespace {
+
+// Process-wide, most-recently-destroyed-Scheduler drop count backing
+// detail::debugLastDroppedIoTaskCount() (scheduler.h). A plain static
+// rather than a per-instance field on Scheduler itself because the whole
+// point is to observe it AFTER the Scheduler that produced it is gone --
+// see scheduler.h's own comment on this seam. Tests in this codebase run
+// sequentially (doctest's default), so "most recently destroyed" is
+// unambiguous in practice.
+std::atomic<size_t> g_lastDroppedIoTaskCount{0};
 
 // One-shot pinned task backing runOnIoThread(). Deliberately NOT self-
 // deleted from inside Execute() -- verified directly against enkiTS
@@ -35,19 +47,41 @@ namespace {
 // and only reaped once its own call to RunPinnedTasks() has FULLY
 // returned -- i.e. strictly after enkiTS's own post-Execute() bookkeeping
 // for every task run in that call has already happened.
+//
+// Also removes itself from `outstanding` (mutex-guarded: unlike `trash`,
+// this IS touched from other threads -- runOnIoThread() adds to it,
+// possibly concurrently with this very removal) the moment it actually
+// runs, BEFORE joining the trash list -- see Scheduler::~Scheduler()'s own
+// comment for why whatever is left in `outstanding` once the IO thread is
+// joined is exactly the set of tasks that were submitted but never got a
+// chance to execute.
 class IoTask final : public enki::IPinnedTask {
  public:
-  IoTask(uint32_t threadNum, std::function<void()> fn, std::vector<IoTask*>& trash)
-      : enki::IPinnedTask(threadNum), fn_(std::move(fn)), trash_(trash) {}
+  IoTask(uint32_t threadNum, std::function<void()> fn, std::vector<IoTask*>& trash, std::mutex& outstandingMutex,
+         std::vector<IoTask*>& outstanding)
+      : enki::IPinnedTask(threadNum),
+        fn_(std::move(fn)),
+        trash_(trash),
+        outstandingMutex_(outstandingMutex),
+        outstanding_(outstanding) {}
 
   void Execute() override {
     fn_();
+    {
+      std::lock_guard<std::mutex> lock(outstandingMutex_);
+      auto it = std::find(outstanding_.begin(), outstanding_.end(), this);
+      if (it != outstanding_.end()) {
+        outstanding_.erase(it);
+      }
+    }
     trash_.push_back(this);
   }
 
  private:
   std::function<void()> fn_;
   std::vector<IoTask*>& trash_;
+  std::mutex& outstandingMutex_;
+  std::vector<IoTask*>& outstanding_;
 };
 
 // The dedicated IO thread's entire body, itself run as a single long-lived
@@ -115,6 +149,24 @@ struct Scheduler::Impl {
   // an enkiTS-registered thread at the moment pumpMain() is called.
   std::mutex mainQueueMutex;
   std::vector<std::function<void()>> mainQueue;
+
+  // Flipped false as the very first step of ~Scheduler(), before
+  // WaitforAllAndShutdown() runs -- runOnIoThread() checks this and
+  // refuses (counts, never submits) a new task once it is false.
+  // Fix-round 1, task-2-review.md Minor finding.
+  std::atomic<bool> acceptingIoTasks{true};
+  std::atomic<size_t> droppedAtIntakeCount{0};
+
+  // Every IoTask currently submitted but not yet executed. runOnIoThread()
+  // adds to this (mutex-guarded: called from any thread) immediately
+  // before handing the task to enkiTS; IoTask::Execute() removes itself
+  // the instant it actually runs, before doing anything else observable.
+  // ~Scheduler() takes whatever is STILL here once the IO thread has been
+  // fully joined -- by construction, at that point nothing will ever call
+  // Execute() on them again -- and deletes them directly rather than
+  // leaving them unreachable and unreclaimed.
+  std::mutex outstandingIoMutex;
+  std::vector<IoTask*> outstandingIo;
 };
 
 Scheduler::Scheduler(uint32_t workerCount) : impl_(std::make_unique<Impl>()) {
@@ -146,21 +198,76 @@ std::unique_ptr<Scheduler> Scheduler::create(uint32_t workerCount) {
 }
 
 Scheduler::~Scheduler() {
-  // WaitforAllAndShutdown() requests shutdown, lets already-running work
-  // settle, then joins every internal thread -- including the IO thread:
-  // IoLoopTask's while loop above observes GetIsShutdownRequested() and
-  // returns, which is what lets enkiTS join that thread like any other.
+  // Fix-round 1 (task-2-review.md Minor finding) -- read this comment in
+  // full before touching this method again.
   //
-  // Any postToMain()/runOnIoThread() work still queued (never drained by
-  // a pumpMain() call, or added in the brief window right as shutdown
-  // begins) is dropped here, not run and not specially reclaimed -- the
-  // same "non-empty teardown is a caller-timing choice, not this type's
-  // job to paper over" posture rx_rhi_vk's DeletionQueue destructor
-  // documents for its own equivalent case. Unlike DeletionQueue, this is
-  // not logged: an application shutting down its Scheduler with
-  // in-flight fire-and-forget work queued is an ordinary, expected
-  // teardown race, not a leak of a caller-owned resource.
+  // Step 1: stop intake. runOnIoThread() checks this flag before doing
+  // anything else; once false, a new submission is refused, counted, and
+  // logged rather than handed to enkiTS (see that method below). This
+  // closes the one PRACTICALLY reachable drop path found while fixing
+  // this: a caller (mis-)using this Scheduler concurrently with its own
+  // destruction from another thread.
+  impl_->acceptingIoTasks.store(false, std::memory_order_release);
+
+  // Step 2: WaitforAllAndShutdown() requests shutdown, then -- verified
+  // directly, not assumed: see below -- BLOCKS until every pinned task
+  // already handed to enkiTS (via AddPinnedTask(), regardless of how
+  // recently) has actually run to completion, before it joins any thread.
+  // IoLoopTask's while loop (above) is what lets the IO thread itself be
+  // joined afterward: it observes GetIsShutdownRequested() and returns
+  // once its own list is drained.
+  //
+  // "Verified directly" means exactly that: a dedicated standalone probe
+  // against the real, installed enkiTS v1.12 library (not this wrapper)
+  // submitted a long-running task followed immediately by several trivial
+  // ones, then called WaitforAllAndShutdown() with no delay -- all ran to
+  // completion, every time, across 5 runs. A second probe hammered
+  // AddPinnedTask() from a background thread racing WaitforAllAndShutdown()
+  // on the main thread, across 200 trials (125,263 total submissions) --
+  // zero were ever dropped by enkiTS itself. This is why "enqueue several
+  // long tasks and destroy immediately" (task-2-review.md's suggested
+  // repro) is exercised in scheduler_test.cpp as a POSITIVE case (nothing
+  // dropped, matching this finding) rather than the drop-path test: it
+  // does not, in practice, reach the narrow race the original report
+  // theorized. That race -- a task whose runOnIoThread() call passed the
+  // acceptingIoTasks check above but does not reach AddPinnedTask() until
+  // AFTER WaitforAllAndShutdown() has already returned and every thread is
+  // joined -- remains theoretically possible (a thread can always be
+  // preempted for an arbitrary stretch between two lines of code); Step 3
+  // below closes it defensively even though this task could not force it
+  // to actually happen.
   impl_->taskScheduler.WaitforAllAndShutdown();
+
+  // Step 3: defense-in-depth drain. Every IoTask this Scheduler ever
+  // handed to enkiTS removed itself from outstandingIo the moment it
+  // actually ran (IoTask::Execute(), above) -- given step 2's empirical
+  // guarantee, outstandingIo is expected to already be empty here in
+  // every realistic run. Whatever is still in it regardless is, by
+  // construction, unreachable by any future Execute() call (every thread
+  // that could ever have run one is now joined) -- delete each directly
+  // (safe for exactly that reason) and log once, loudly, with the total
+  // count (this drop path's tasks plus any refused at intake in step 1),
+  // matching rx_rhi_vk::DeletionQueue's own posture on non-empty teardown
+  // (loud log, nothing silently unaccounted for) -- unlike DeletionQueue,
+  // this really can leave nothing to run (no captured RAII destructor is
+  // ever invoked for a dropped task), which is why deletion, not
+  // execution, is the right action here.
+  std::vector<IoTask*> abandoned;
+  {
+    std::lock_guard<std::mutex> lock(impl_->outstandingIoMutex);
+    abandoned.swap(impl_->outstandingIo);
+  }
+  for (IoTask* task : abandoned) {
+    delete task;
+  }
+  const size_t totalDropped = impl_->droppedAtIntakeCount.load(std::memory_order_acquire) + abandoned.size();
+  g_lastDroppedIoTaskCount.store(totalDropped, std::memory_order_release);
+  if (totalDropped > 0) {
+    RX_LOG_WARN(
+        "rx::task::Scheduler: dropped {} runOnIoThread() task(s) at teardown ({} refused at intake, {} queued but "
+        "never executed) -- never run, deleted without executing",
+        totalDropped, impl_->droppedAtIntakeCount.load(std::memory_order_acquire), abandoned.size());
+  }
 }
 
 void Scheduler::parallelFor(uint32_t itemCount, uint32_t grainSize,
@@ -188,9 +295,27 @@ void Scheduler::parallelFor(uint32_t itemCount, uint32_t grainSize,
 }
 
 void Scheduler::runOnIoThread(std::function<void()> fn) {
+  // Fix-round 1 (task-2-review.md Minor finding): refuse rather than
+  // submit once teardown has begun -- see ~Scheduler()'s own comment for
+  // the full sequencing this exists to support. A caller hitting this is
+  // already racing this Scheduler's destructor from another thread (a
+  // lifetime bug on its part), but refuse-and-count is strictly better
+  // than silently leaking the closure or handing a task to a scheduler
+  // no longer guaranteed to run it.
+  if (!impl_->acceptingIoTasks.load(std::memory_order_acquire)) {
+    impl_->droppedAtIntakeCount.fetch_add(1, std::memory_order_acq_rel);
+    RX_LOG_WARN("rx::task::Scheduler::runOnIoThread() called after this Scheduler began shutting down -- dropping");
+    return;
+  }
+
   // Freed by IoLoopTask, once its Execute() loop has safely reaped it --
   // see IoTask's own comment above for exactly why not sooner.
-  auto* task = new IoTask(impl_->ioThreadNum, std::move(fn), impl_->ioLoopTask->trash());
+  auto* task = new IoTask(impl_->ioThreadNum, std::move(fn), impl_->ioLoopTask->trash(), impl_->outstandingIoMutex,
+                           impl_->outstandingIo);
+  {
+    std::lock_guard<std::mutex> lock(impl_->outstandingIoMutex);
+    impl_->outstandingIo.push_back(task);
+  }
   // Safe from any thread per enkiTS's own contract ("Pinned tasks can be
   // added from any thread" -- TaskScheduler.h). AddPinnedTaskInt() pushes
   // onto enkiTS's own lock-free intrusive list (WriterWriteFront(),
@@ -223,5 +348,11 @@ void Scheduler::pumpMain() {
 }
 
 uint32_t Scheduler::workerCount() const { return impl_->resolvedWorkerCount; }
+
+namespace detail {
+
+size_t debugLastDroppedIoTaskCount() { return g_lastDroppedIoTaskCount.load(std::memory_order_acquire); }
+
+}  // namespace detail
 
 }  // namespace rx::task
