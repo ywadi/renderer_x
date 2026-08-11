@@ -45,7 +45,8 @@ namespace rx::task {
 class Scheduler {  // owns enki::TaskScheduler; one per app; main thread participates
  public:
   static std::unique_ptr<Scheduler> create(uint32_t workerCount /*0 = hw-1*/);
-  void parallelFor(uint32_t itemCount, uint32_t grainSize, std::function<void(uint32_t begin, uint32_t end, uint32_t workerIndex)> fn); // blocking fan-out
+  void parallelFor(uint32_t itemCount, std::function<void(uint32_t begin, uint32_t end, uint32_t workerIndex)> fn); // blocking fan-out, AUTO grain (parallelism-default: no caller knobs)
+  void parallelFor(uint32_t itemCount, uint32_t grainSize, std::function<void(uint32_t begin, uint32_t end, uint32_t workerIndex)> fn); // explicit grain = measurement affordance only
   void runOnIoThread(std::function<void()> fn);         // pinned IO thread, FIFO
   void postToMain(std::function<void()> fn);            // queued; drained by pumpMain()
   void pumpMain();                                      // main-thread drain point (frame loop calls once per frame)
