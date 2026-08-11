@@ -14,6 +14,8 @@
 #include <rx_material/rx_api_detail.h>
 
 #include <cstdint>
+#include <mutex>
+#include <string>
 
 // Re-pinned here (not just in rx_api.h) so this contract test file
 // itself exercises the exact sizes a real consumer would depend on --
@@ -206,6 +208,88 @@ TEST_CASE("entry-point audit: every RxResult-returning method on a device-free I
     CHECK(isDocumentedResult(system->loadMaterial("does/not/matter.slang", &material)));
 
     CHECK(isDocumentedResult(system->reloadChanged()));
+
+    system->release();
+}
+
+// ===== rxSetLogCallback [spec Phase 4 design D23, seed 13] =================
+// Process-wide, not tied to any IRxMaterialSystem instance -- every case
+// below uninstalls (rxSetLogCallback(nullptr, nullptr)) before returning,
+// via LogCallbackGuard, so a later TEST_CASE anywhere in this binary never
+// observes a callback left over from one of these (and, since a failed
+// REQUIRE unwinds via a C++ exception under doctest, the RAII guard covers
+// that path too -- see its own comment).
+namespace {
+
+struct LogCallbackGuard {
+    ~LogCallbackGuard() { rxSetLogCallback(nullptr, nullptr); }
+};
+
+}  // namespace
+
+TEST_CASE("rxSetLogCallback returns RX_OK for every valid transition (install/replace/uninstall), regardless of "
+          "userData") {
+    LogCallbackGuard guard;
+
+    // Uninstalling when nothing is installed is still a valid transition.
+    CHECK(rxSetLogCallback(nullptr, nullptr) == RX_OK);
+
+    RxLogCallback noop = [](RxLogSeverity, const char*, const char*, void*) {};
+    CHECK(rxSetLogCallback(noop, nullptr) == RX_OK);
+
+    int sentinel = 0;
+    CHECK(rxSetLogCallback(noop, &sentinel) == RX_OK);  // replace with new userData
+
+    CHECK(rxSetLogCallback(nullptr, &sentinel) == RX_OK);  // uninstall -- userData irrelevant when cb is null
+}
+
+TEST_CASE("rxSetLogCallback installs a process-wide callback that observes a real rx_material log record "
+          "(severity/category/message), and nullptr uninstalls it") {
+    struct Captured {
+        std::mutex mutex;
+        RxLogSeverity severity = -1;
+        std::string category;
+        std::string message;
+        int callCount = 0;
+    } captured;
+
+    RxLogCallback callback = [](RxLogSeverity severity, const char* category, const char* message, void* userData) {
+        auto* c = static_cast<Captured*>(userData);
+        std::lock_guard<std::mutex> lock(c->mutex);
+        c->severity = severity;
+        c->category = category != nullptr ? category : "";
+        c->message = message != nullptr ? message : "";
+        c->callCount++;
+    };
+
+    CHECK(rxSetLogCallback(callback, &captured) == RX_OK);
+    LogCallbackGuard guard;
+
+    // Device-free loadMaterial() logs a real RX_LOG_ERROR through this
+    // exact boundary (api_impl.cpp's own loadMaterial() -- see the
+    // "device-free" test above this section) -- an authentic trigger,
+    // not a synthetic log call made just for this test.
+    IRxMaterialSystem* system = makeDeviceFreeSystem();
+    IRxMaterial* material = nullptr;
+    CHECK(system->loadMaterial("does/not/matter.slang", &material) == RX_E_FAIL);
+
+    {
+        std::lock_guard<std::mutex> lock(captured.mutex);
+        CHECK(captured.callCount >= 1);
+        CHECK(captured.severity == RX_LOG_ERROR);
+        CHECK(captured.category.empty());  // rx_core's RX_LOG_* macros use the unnamed default logger.
+        CHECK(captured.message.find("loadMaterial") != std::string::npos);
+        captured.callCount = 0;
+    }
+
+    // Uninstall: the next log record through this same boundary is no
+    // longer delivered.
+    CHECK(rxSetLogCallback(nullptr, nullptr) == RX_OK);
+    CHECK(system->loadMaterial("does/not/matter.slang", &material) == RX_E_FAIL);
+    {
+        std::lock_guard<std::mutex> lock(captured.mutex);
+        CHECK(captured.callCount == 0);
+    }
 
     system->release();
 }

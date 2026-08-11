@@ -272,3 +272,87 @@ static_assert(sizeof(RxMaterialSystemDesc) == sizeof(void*),
 // owns that reference and must release() it); on failure `*outSystem` is
 // set to null.
 extern "C" RxResult rxCreateMaterialSystem(const RxMaterialSystemDesc* desc, IRxMaterialSystem** outSystem);
+
+// --- rxSetLogCallback: the public log sink [spec Phase 4 design D23,
+// seed 13] -------------------------------------------------------------
+// A consuming engine's own logging/telemetry system is the reason this
+// exists: spdlog itself is an internal implementation detail this
+// boundary never exposes (no spdlog:: type appears anywhere in this
+// header, matching every other ABI rule above) -- this is the one way a
+// caller observes renderer diagnostics (rx_core's RX_LOG_INFO/WARN/ERROR
+// and everything that funnels through them) from outside this codebase.
+//
+// Severity crossing the ABI, like RxResult/RxFormat above: a plain
+// int32_t typedef with named constants, not a scoped/fixed-underlying-
+// type `enum class` -- this header's own established convention (see
+// RxResult's own comment at the top) rather than a second one.
+typedef int32_t RxLogSeverity;
+enum : RxLogSeverity {
+    RX_LOG_TRACE = 0,
+    RX_LOG_DEBUG = 1,
+    RX_LOG_INFO = 2,
+    RX_LOG_WARN = 3,
+    RX_LOG_ERROR = 4,
+};
+static_assert(RX_LOG_TRACE == 0 && RX_LOG_DEBUG == 1 && RX_LOG_INFO == 2 && RX_LOG_WARN == 3 && RX_LOG_ERROR == 4,
+              "RxLogSeverity's numeric values are pinned to spdlog::level::level_enum's own Trace..Error values "
+              "(spdlog/common.h) -- rx_core's LogForwardSink "
+              "(src/rx_core/include/rx_core/log_forward_sink.h) maps spdlog levels directly onto these integers "
+              "with no translation table on either side, so renumbering here would silently desync the severity "
+              "an installed RxLogCallback receives from what spdlog itself actually recorded.");
+
+// A callback matching THIS signature receives every record the renderer
+// logs, once installed via rxSetLogCallback() below. `category` is the
+// spdlog logger name the record was issued through (empty string "" for
+// every RX_LOG_INFO/WARN/ERROR call today -- those all go through
+// rx_core's one unnamed default logger, src/rx_core/include/rx_core/log.h).
+// `category`/`message` are valid ONLY for the duration of this one
+// invocation: both point at temporary buffers freed the moment the
+// callback returns -- a callback that needs the text afterward must copy
+// it before returning. `userData` is exactly whatever pointer was passed
+// to the rxSetLogCallback() call that installed this callback, handed
+// back unexamined -- this boundary never dereferences it itself.
+typedef void (*RxLogCallback)(RxLogSeverity severity, const char* category, const char* message, void* userData);
+
+// Installs `cb` as the process-wide log-forwarding target (`userData`
+// travels back to `cb` unexamined -- see RxLogCallback's own comment
+// above). `cb == nullptr` UNINSTALLS whatever callback is currently
+// active and restores console-only output: the renderer's own console
+// sink is never touched or removed by this call either way, so
+// installing/uninstalling a callback only adds/removes FORWARDING, never
+// silences the console. Always returns RX_OK for every valid transition
+// (install a non-null `cb`, replace an already-installed one, or
+// uninstall via nullptr) -- there is no invalid input to reject here:
+// `userData` is opaque and never dereferenced by this boundary, so even a
+// null/garbage `userData` alongside a non-null `cb` is legal (whatever
+// `cb` itself does with it is entirely `cb`'s own contract, not this
+// call's to validate).
+//
+// Exception discipline: `cb` is invoked inside a catch-all (matching this
+// whole header's "no exception crosses a boundary this engine controls"
+// rule, R:M§1.3 point 2 -- `cb` is technically caller-owned code, not
+// renderer code, but the same discipline applies since it runs on this
+// engine's own logging call stack). If `cb` throws, that exception is
+// swallowed, one diagnostic is printed directly to the process's own
+// stderr (deliberately never re-entering spdlog/this same logger from
+// inside its own sink callback -- not safe to attempt), and `cb` is
+// PERMANENTLY disabled (no further delivery to it) until a fresh
+// rxSetLogCallback() call installs something new.
+//
+// Thread-affinity (D5/D23, Phase 4): `cb` may be invoked from ANY thread
+// that logs -- including rx_task worker threads -- not only whichever
+// thread called rxSetLogCallback() itself. This is the one deliberate
+// exception to docs/threading.md's otherwise-universal main-thread-only
+// default (see that file's own note that the public ABI surface Phase 4
+// adds is exactly this log sink); `cb` must be safe to call concurrently
+// from multiple threads and must not assume render/main-thread affinity
+// -- see docs/threading.md.
+//
+// GUID note: unlike Task 7's createTexture2D() addition above (which
+// changed IRxMaterialSystem's own vtable shape and therefore needed a
+// regenerated kIID_IRxMaterialSystem, per this header's own comment on
+// that), rxSetLogCallback() changes NO existing interface's shape at all
+// -- it is a free `extern "C"` function plus two new POD-ish types
+// (RxLogSeverity, RxLogCallback), exactly like rxCreateMaterialSystem
+// itself. No IID anywhere in this header needs to change, and none has.
+extern "C" RxResult rxSetLogCallback(RxLogCallback cb, void* userData);

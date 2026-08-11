@@ -1,5 +1,6 @@
 add_library(rx_core STATIC
     src/log.cpp
+    src/log_forward_sink.cpp
 )
 target_include_directories(rx_core PUBLIC include)
 target_link_libraries(rx_core PUBLIC spdlog::spdlog glm::glm)

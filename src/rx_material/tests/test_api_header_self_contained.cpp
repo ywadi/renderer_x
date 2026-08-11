@@ -45,6 +45,22 @@ using MaterialSystemPtr = IRxMaterialSystem*;
 using FactoryFn = RxResult (*)(const RxMaterialSystemDesc*, IRxMaterialSystem**);
 [[maybe_unused]] constexpr FactoryFn kFactory = &rxCreateMaterialSystem;
 
+// [spec Phase 4 design D23, seed 13] rxSetLogCallback's own types --
+// named here for the identical "cannot be quietly defeated by an
+// otherwise-unreferenced declaration" reason as everything else in this
+// file (this header's own comment above).
+static_assert(sizeof(RxLogSeverity) == sizeof(int32_t),
+              "rx_api.h's own pinned RxLogSeverity size -- re-checked here for the same reason as RxGuid/"
+              "RxMaterialSystemDesc/RxTextureDesc above");
+[[maybe_unused]] constexpr RxLogSeverity kTraceSeverity = RX_LOG_TRACE;
+[[maybe_unused]] constexpr RxLogSeverity kDebugSeverity = RX_LOG_DEBUG;
+[[maybe_unused]] constexpr RxLogSeverity kInfoSeverity = RX_LOG_INFO;
+[[maybe_unused]] constexpr RxLogSeverity kWarnSeverity = RX_LOG_WARN;
+[[maybe_unused]] constexpr RxLogSeverity kErrorSeverity = RX_LOG_ERROR;
+[[maybe_unused]] RxLogCallback kUnusedLogCallback = nullptr;
+using SetLogCallbackFn = RxResult (*)(RxLogCallback, void*);
+[[maybe_unused]] constexpr SetLogCallbackFn kSetLogCallback = &rxSetLogCallback;
+
 // [Task 7] RxTextureDesc/RxFormat/IRxMaterialSystem::createTexture2D --
 // named here too, for the identical "cannot be quietly defeated by an
 // otherwise-unreferenced declaration" reason this file's own header

@@ -29,6 +29,25 @@
 //   MANUAL_VERIFICATION.md at the repo root); exits 0 on a clean window
 //   close, 1 on any Vulkan failure or device loss.
 //
+//   --log-callback (either mode, on top). [spec Phase 4 design D23, seed
+//   13] Installs a tiny adapter (sampleLogCallback() below) proving the
+//   public log sink a consuming engine would use to route renderer
+//   diagnostics into its own logging system. This sample deliberately
+//   calls rx::core::log::forwardSink() directly rather than linking
+//   rx_material and going through its rxSetLogCallback() ABI wrapper:
+//   rx_material transitively links slang::slang and needs its runtime
+//   libraries deployed next to the binary (see rx_material/CMakeLists.txt),
+//   a disproportionate dependency to pull into the smallest, lightest
+//   sample purely to demonstrate log forwarding -- sample 06_materials
+//   already links rx_material for unrelated reasons and is out of scope
+//   here (sibling task touches it). rx_api.h's rxSetLogCallback() is a
+//   direct, uncasted pass-through to this exact same rx_core mechanism
+//   (see api_impl.cpp's own comment on why no translation is needed), so
+//   this demo exercises the identical delivery path a real ABI consumer
+//   gets -- just reached one layer lower, without the extra link weight.
+//   Gate-unaffected: sample_01_triangle_headless (ctest) never passes this
+//   flag.
+//
 // Both modes build and draw through the exact same VkPipeline-construction
 // code (createTrianglePipeline() below): dynamic rendering, dynamic
 // viewport/scissor, no vertex input (the vertex shader generates positions
@@ -36,6 +55,7 @@
 // device->swapchainFormat() either way (headless mode's offscreen image is
 // deliberately created in that same format for exactly this reason).
 #include <rx_core/log.h>
+#include <rx_core/log_forward_sink.h>
 #include <rx_core/profile.h>
 #include <rx_platform/window.h>
 #include <rx_rhi_vk/buffer.h>
@@ -49,6 +69,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <optional>
@@ -908,6 +929,21 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode) {
     return 0;
 }
 
+// --log-callback adapter [spec Phase 4 design D23, seed 13] -- stands in
+// for a consuming engine's own logging system: real integration code
+// would route these three fields into that engine's own log sink instead
+// of stdout. `userData` is unused here (nullptr installed below) since
+// this demo has no per-installation state to carry.
+void sampleLogCallback(int32_t severity, const char* category, const char* message, void* /*userData*/) {
+    static constexpr const char* kSeverityNames[] = {"TRACE", "DEBUG", "INFO", "WARN", "ERROR"};
+    const char* severityName =
+        (severity >= 0 && severity < static_cast<int32_t>(std::size(kSeverityNames))) ? kSeverityNames[severity]
+                                                                                        : "UNKNOWN";
+    bool hasCategory = category != nullptr && category[0] != '\0';
+    std::fprintf(stdout, "[log-callback] [%s]%s%s %s\n", severityName, hasCategory ? " " : "",
+                 hasCategory ? category : "", message != nullptr ? message : "");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -922,6 +958,7 @@ int main(int argc, char** argv) {
     // there; the flag is still parsed like any other (no error on it) but
     // simply has no effect in that path.
     rx::rhi::PresentMode vsyncMode = rx::rhi::PresentMode::VsyncOn;
+    bool logCallback = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--present") {
             presentMode = true;
@@ -936,7 +973,13 @@ int main(int argc, char** argv) {
             } else {
                 RX_LOG_ERROR("--vsync expects 'on' or 'off', got '{}' -- defaulting to on", value);
             }
+        } else if (std::string_view(argv[i]) == "--log-callback") {
+            logCallback = true;
         }
+    }
+
+    if (logCallback) {
+        rx::core::log::forwardSink()->set(&sampleLogCallback, nullptr);
     }
 
     if (presentMode) {

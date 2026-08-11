@@ -4,6 +4,7 @@
 #include <rx_material/rx_api_detail.h>
 
 #include <rx_core/log.h>
+#include <rx_core/log_forward_sink.h>
 
 #include <atomic>
 #include <cstdint>
@@ -652,6 +653,28 @@ extern "C" RxResult rxCreateMaterialSystem(const RxMaterialSystemDesc* desc, IRx
         RX_LOG_ERROR("rx_material: rx_api: rxCreateMaterialSystem failed: {}", e.what());
         return RX_E_FAIL;
     }
+}
+
+// rxSetLogCallback() [spec Phase 4 design D23, seed 13] -- process-wide,
+// not tied to any IRxMaterialSystem instance (unlike everything else in
+// this file), so it lives here as a second, independent extern "C" entry
+// point rather than a method on any interface above. init() is called
+// defensively first (matching every other rx_core-logging entry point in
+// this codebase, e.g. MaterialSystem::create()/Compiler::create()) so
+// this is safe to call before any device/material system has been
+// created at all -- log::init()'s own call_once makes repeat calls free.
+//
+// RxLogCallback's signature (RxLogSeverity, const char*, const char*,
+// void*) is the SAME C++ type as rx_core::log::ForwardCallback's
+// (int32_t, const char*, const char*, void*) after typedef resolution --
+// RxLogSeverity IS int32_t (a plain alias, not a distinct enum type; see
+// rx_api.h's own comment on it), so `cb` converts to ForwardCallback with
+// no cast, no calling-convention change, and no UB: they are not merely
+// ABI-compatible, they are literally the identical function pointer type.
+extern "C" RxResult rxSetLogCallback(RxLogCallback cb, void* userData) {
+    rx::core::log::init();
+    rx::core::log::forwardSink()->set(cb, userData);
+    return RX_OK;
 }
 
 }  // namespace rx::material
