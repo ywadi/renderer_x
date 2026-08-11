@@ -8,6 +8,7 @@
 #include <TaskScheduler.h>
 
 #include <rx_core/log.h>
+#include <rx_core/profile.h>
 
 #include <algorithm>
 #include <atomic>
@@ -287,13 +288,9 @@ void Scheduler::parallelFor(uint32_t itemCount, uint32_t grainSize,
   if (itemCount == 0) {
     return;
   }
-  // Profiling: an RX_ZONE/RX_PLOT instrumentation point belongs right
-  // here (per-call chunk-count/grain-size plot, zone around the blocking
-  // fan-out below) -- deliberately not added yet: rx_core/profile.h does
-  // not exist on main as of this task (a concurrent profiling task owns
-  // creating it, and was told to stay out of rx_task); lands as that
-  // task's own follow-up once the header exists.
-  //
+  RX_ZONE;
+  RX_PLOT("parallelFor items", static_cast<int64_t>(itemCount));
+
   // grainSize == 0 means AUTO [spec D4 amendment] -- see this method's
   // header doc comment and autoGrainSize()'s own comment for the formula.
   // A nonzero grainSize is used verbatim (the measurement-affordance

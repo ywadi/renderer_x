@@ -406,6 +406,12 @@ TEST_CASE("Scheduler::runOnIoThread refuses (and counts) a call made from within
       // the ordering below deterministic rather than a race with how
       // quickly the main thread reaches ~Scheduler()'s first line.
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+      // By this point, Step 1 (acceptingIoTasks := false) of ~Scheduler()'s
+      // teardown has completed, which is why this nested runOnIoThread()
+      // call below gets dropped -- self-documents this nested call's
+      // dependence on ~Scheduler step ordering per task-2-review.md.
+
       raw->runOnIoThread([&nestedCallAccepted] { nestedCallAccepted.store(true, std::memory_order_release); });
     });
 

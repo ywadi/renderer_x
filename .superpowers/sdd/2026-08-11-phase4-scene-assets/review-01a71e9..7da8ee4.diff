@@ -1,0 +1,1123 @@
+# Review package: 01a71e9..7da8ee4
+
+## Commits
+7da8ee4 Add public log sink (rxSetLogCallback) for consuming engines
+
+## Files changed
+ .../task-5-report.md                               | 194 +++++++++++++++++++++
+ samples/01_triangle/main.cpp                       |  43 +++++
+ src/rx_core/CMakeLists.txt                         |   1 +
+ src/rx_core/include/rx_core/log_forward_sink.h     | 118 +++++++++++++
+ src/rx_core/src/log.cpp                            |  14 +-
+ src/rx_core/src/log_forward_sink.cpp               | 126 +++++++++++++
+ src/rx_core/tests/log_test.cpp                     | 124 +++++++++++++
+ src/rx_material/api_impl.cpp                       |  23 +++
+ src/rx_material/include/rx_material/rx_api.h       |  84 +++++++++
+ src/rx_material/tests/test_api_contract.cpp        |  84 +++++++++
+ .../tests/test_api_header_self_contained.cpp       |  16 ++
+ 11 files changed, 826 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-5-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-5-report.md
+new file mode 100644
+index 0000000..06867eb
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-5-report.md
+@@ -0,0 +1,194 @@
++# Task 5 report: Public log sink (D23, seed 13)
++
++## Summary
++
++Added `rxSetLogCallback()` — a process-wide, ABI-stable entry point that
++lets a consuming engine observe every record RendererX logs through
++`rx_core`'s spdlog-backed logging (`RX_LOG_INFO/WARN/ERROR`) from its own
++logging/telemetry system, from any thread. The mechanism itself
++(`rx::core::log::LogForwardSink`) lives in `rx_core` as a plain spdlog
++sink with zero ABI-type knowledge; the ABI wrapper in `rx_material`
++(`rxSetLogCallback`, `RxLogSeverity`, `RxLogCallback`) is a direct,
++uncasted pass-through to it.
++
++## Design decisions
++
++**1. `RxLogSeverity` follows `RxResult`'s own convention, not a new one.**
++`typedef int32_t RxLogSeverity; enum : RxLogSeverity { RX_LOG_TRACE = 0, ...
++RX_LOG_ERROR = 4 };` — a plain `int32_t` typedef with named constants,
++matching `RxResult`/`RxFormat` exactly rather than introducing a scoped
++`enum class` shape into this header. Values are pinned by a `static_assert`
++that also documents *why*: they equal `spdlog::level::level_enum`'s own
++`trace..err` values 1:1 (verified against `spdlog/common.h`,
++`SPDLOG_LEVEL_TRACE..ERROR = 0..4`), so `LogForwardSink` needs no
++translation table on either side — a raw `int32_t` crosses from spdlog's
++`log_msg.level` straight to the callback. `spdlog::level::critical` (5)
++folds into `RX_LOG_ERROR` (this engine has no `RX_LOG_CRITICAL` macro).
++
++**2. `RxLogCallback` needs no cast at the ABI/internal boundary.** Because
++`RxLogSeverity` is a plain alias for `int32_t` (not a distinct enum type),
++`RxLogCallback` (`void(*)(RxLogSeverity, const char*, const char*, void*)`)
++and `rx_core::log::ForwardCallback` (`void(*)(int32_t, const char*, const
++char*, void*)`) are the literal same C++ type after alias resolution.
++`api_impl.cpp`'s `rxSetLogCallback()` passes `cb` straight through with no
++`reinterpret_cast` — avoiding the "calling through an incompatible
++function pointer type" UB a cast-based bridge would otherwise carry.
++
++**3. Mechanism lives in `rx_core`, not `rx_material`.** `LogForwardSink`
++is a pure `spdlog::sinks::base_sink<std::mutex>` extension with no
++knowledge of `rx_api.h` at all — placed at
++`src/rx_core/include/rx_core/log_forward_sink.h` +
++`src/rx_core/src/log_forward_sink.cpp`, matching `log.h`/`log.cpp`'s own
++include/src split (the brief's `src/rx_core/log_forward_sink.{h,cpp}` path
++is this convention's shorthand). `forwardSink()` is an idempotent,
++`call_once`-guarded lazy singleton, callable from anywhere any number of
++times: it constructs the sink and appends it to
++`spdlog::default_logger()`'s own sink list exactly once per process,
++additively (the console sink is never touched/removed). `log::init()`
++calls it too (defensive/eager), so both `log::init()` and
++`rxSetLogCallback()` converge on the same instance regardless of which
++runs first.
++
++**4. Mutex-guarded `{callback, userData}` pair, not atomics.** Justified
++in `log_forward_sink.h`'s own doc comment: `callback`/`userData` must be
++observed *together* — a torn read pairing a new callback with stale
++userData (or vice versa) would silently corrupt the caller's own context
++on the very next racing log record. The critical section on both sides
++(a two-pointer copy) is cheap enough that a mutex is immaterial next to
++spdlog's own formatting/IO cost, so there's no real incentive for a
++lock-free alternative. `sink_it_()` snapshots the pair and **releases the
++lock before invoking the callback** — deliberately, to avoid a
++self-deadlock if the callback logs anything itself (a re-entrant call back
++into this same sink, same thread, same non-recursive mutex) or calls back
++into `set()`/`rxSetLogCallback()`.
++
++**5. Throw-disable is precise, not a blunt global kill switch.** On an
++exception, `disableIfStillInstalled()` only nulls the callback if it is
++*still* the one that just threw (compare-before-clear) — so a legitimate
++concurrent `set()` racing the disable can never be clobbered by it. The
++one console warning goes directly to `stderr` via `std::fprintf`, never
++back through spdlog (re-entering the same logger/sink from inside its own
++callback path is exactly what decision 4 above avoids). `disabledByException()`
++is a dedicated, mutex-guarded test seam so tests can assert the disable
++state deterministically instead of scraping stderr text.
++
++**6. No GUID change; explicitly a free function + PODs.** `rxSetLogCallback()`
++adds zero vtable slots to any existing interface — unlike Task 7's
++`createTexture2D()`, which *did* need `kIID_IRxMaterialSystem` regenerated
++because it changed `IRxMaterialSystem`'s own shape. `rx_api.h` carries an
++explicit comment contrasting the two cases; no `kIID_*` constant anywhere
++in the header was touched (verifiable directly in the diff — no GUID
++literal changed).
++
++**7. Sample 01 demos the underlying mechanism, not the ABI wrapper
++directly — with the tradeoff stated up front.** `sample_01_triangle`
++links only `rx_rhi_vk`/`rx_platform`, no `rx_material`. Linking
++`rx_material` (transitively `slang::slang` + its runtime-library
++deployment step) into the smallest, lightest sample purely to prove log
++forwarding was judged disproportionate — `rx_api.h`'s `rxSetLogCallback()`
++is a direct, uncasted pass-through to `rx::core::log::forwardSink()` (see
++decision 2), so the sample calls that same `rx_core` entry point one layer
++lower, with zero new link dependencies. The `--log-callback` flag installs
++`sampleLogCallback()` (prints `[log-callback] [SEVERITY] message` to
++stdout, standing in for a consuming engine's own log sink); the existing
++`sample_01_triangle_headless` ctest gate never passes it, so the gate is
++unaffected. This is a deliberate scope call, documented at the top of
++`main.cpp` and flagged here for visibility rather than silently taken.
++
++## Files changed
++
++- `src/rx_core/include/rx_core/log_forward_sink.h` (new) — `ForwardCallback`,
++  `LogForwardSink`, `forwardSink()`.
++- `src/rx_core/src/log_forward_sink.cpp` (new) — severity mapping,
++  `set()`/`sink_it_()`/`flush_()`/`disableIfStillInstalled()`, singleton.
++- `src/rx_core/src/log.cpp` — `init()` now also calls `forwardSink()`
++  inside its existing `call_once` block.
++- `src/rx_core/CMakeLists.txt` — added `src/log_forward_sink.cpp` to the
++  `rx_core` library's sources. No test-file additions (see below).
++- `src/rx_core/tests/log_test.cpp` (extended, not replaced) — four new
++  `TEST_CASE`s: delivery of severity/category/message, uninstall-stops-
++  delivery, worker-thread delivery (`std::thread`, asserts
++  `captured.threadId != mainThreadId`), throw-disable path.
++- `src/rx_material/include/rx_material/rx_api.h` — `RxLogSeverity`,
++  `RxLogCallback`, `rxSetLogCallback()` declaration with full ABI/thread-
++  affinity/exception-discipline doc comment (points at `docs/threading.md`
++  per that file's own "every new public header carries a one-line
++  thread-affinity note" rule).
++- `src/rx_material/api_impl.cpp` — `rxSetLogCallback()` definition
++  (`log::init()` defensively, then `forwardSink()->set(cb, userData)`,
++  always `RX_OK`).
++- `src/rx_material/tests/test_api_contract.cpp` (extended) — two new
++  `TEST_CASE`s: RX_OK across install/replace/uninstall transitions; an
++  authentic end-to-end delivery test that triggers a REAL `RX_LOG_ERROR`
++  through `api_impl.cpp`'s own device-free `loadMaterial()` path (not a
++  synthetic log call) and verifies uninstall stops it.
++- `src/rx_material/tests/test_api_header_self_contained.cpp` (extended) —
++  names `RxLogSeverity`/`RX_LOG_*`/`RxLogCallback`/`rxSetLogCallback` in
++  the header-alone compilation unit, plus a re-pinned `sizeof(RxLogSeverity)`
++  static_assert matching the file's existing pattern.
++- `samples/01_triangle/main.cpp` — `--log-callback` flag +
++  `sampleLogCallback()` adapter (see decision 7).
++
++**No `tests/CMakeLists.txt` in either `rx_core` or `rx_material` was
++touched** — every new test lives in an existing, already-listed `.cpp`
++file, per the brief's "prefer extending existing test FILES" guidance.
++Nothing to flag for the merge on that front.
++
++## Verification
++
++Both presets configured and built clean (`cmake --preset
++linux-native`/`windows-cross-zig`, full build, zero errors; the
++`windows-cross-zig` build's only warnings are the pre-existing,
++unrelated `_WIN32_WINNT macro redefined` toolchain warning that appears on
++every file in that preset, files I never touched included — not a
++regression).
++
++`linux-native` full `ctest` run: **16/16 suites passed**, including
++`rx_core_tests` (13 cases / 27 assertions, up from 2 cases before this
++task) and `rx_material_tests` (12 cases / 65 assertions) covering the new
++surface, plus the untouched `rx_material_gpu_tests` (25 cases / 344
++assertions, zero validation errors) proving no regression to the existing
++device-backed ABI surface.
++
++Ran `sample_01_triangle --validate` (gate-equivalent, exit 0) and
++`sample_01_triangle --validate --log-callback` by hand: every console log
++line during a full headless run (Vulkan validation warnings, device
++creation, `"triangle readback PASSED"`) was mirrored through
++`[log-callback] [SEVERITY] message`, confirming end-to-end delivery in a
++real running sample, not just under test. Exit code 0 in both runs.
++
++Throw-disable path verified with real output, not just assertions:
++
++```
++[error] this record's callback throws
++rx_core: log-forward callback threw std::exception("boom") -- disabling it permanently ...
++[error] a second record after the callback was disabled
++```
++
++(the second record's own console line still prints — via the untouched
++console sink — while `disabledByException()` stays `true` and the
++throwing callback itself is never invoked again).
++
++## Concerns / follow-ups
++
++- `LogForwardSink` attaches to whichever *specific* logger object is
++  `spdlog::default_logger()` the first time `forwardSink()` runs anywhere
++  in the process. If some other code permanently swapped the default
++  logger to a different instance without restoring it, `RX_LOG_*` calls
++  after that point would bypass the forwarding sink. The one existing test
++  that swaps loggers (`log_test.cpp`'s original ostream-sink test) already
++  restores the original afterward, so this is a pre-existing pattern this
++  task relies on rather than one it introduces — flagged for anyone adding
++  a *future* logger swap without a restore.
++- A callback that logs from inside itself (calling back into `RX_LOG_*`)
++  will re-enter `sink_it_()` on the same thread; decision 4's "unlock
++  before invoking" avoids a deadlock on that path, but an unconditional
++  self-logging callback would still recurse for as long as it keeps
++  logging — a caller-side contract issue (same class of footgun as most
++  logging libraries' own re-entrancy caveats), not something this task
++  engineered a guard against.
++- Sample 01's `--log-callback` proves the underlying `rx_core` mechanism,
++  not `rxSetLogCallback()` itself end-to-end in a *running* sample (the
++  ABI wrapper is exercised authentically in `rx_material_tests` instead —
++  see decision 7's full rationale for why linking `rx_material` into this
++  particular sample was judged disproportionate).
+diff --git a/samples/01_triangle/main.cpp b/samples/01_triangle/main.cpp
+index 802d94d..524fc80 100644
+--- a/samples/01_triangle/main.cpp
++++ b/samples/01_triangle/main.cpp
+@@ -16,40 +16,61 @@
+ //   --present. Opens a real, visible window and runs the canonical
+ //   frames-in-flight present loop (rx::rhi::FrameSync) against the actual
+ //   swapchain images -- the first and only place in this codebase that
+ //   legally writes to a swapchain image, and only ever the acquired index.
+ //   Survives window resizes via Device's NeedsRecreate/recreateSwapchain
+ //   path; closes cleanly on window-close (SDL_EVENT_QUIT). Not part of
+ //   ctest (it's an interactive/manual-verification path -- see
+ //   MANUAL_VERIFICATION.md at the repo root); exits 0 on a clean window
+ //   close, 1 on any Vulkan failure or device loss.
+ //
++//   --log-callback (either mode, on top). [spec Phase 4 design D23, seed
++//   13] Installs a tiny adapter (sampleLogCallback() below) proving the
++//   public log sink a consuming engine would use to route renderer
++//   diagnostics into its own logging system. This sample deliberately
++//   calls rx::core::log::forwardSink() directly rather than linking
++//   rx_material and going through its rxSetLogCallback() ABI wrapper:
++//   rx_material transitively links slang::slang and needs its runtime
++//   libraries deployed next to the binary (see rx_material/CMakeLists.txt),
++//   a disproportionate dependency to pull into the smallest, lightest
++//   sample purely to demonstrate log forwarding -- sample 06_materials
++//   already links rx_material for unrelated reasons and is out of scope
++//   here (sibling task touches it). rx_api.h's rxSetLogCallback() is a
++//   direct, uncasted pass-through to this exact same rx_core mechanism
++//   (see api_impl.cpp's own comment on why no translation is needed), so
++//   this demo exercises the identical delivery path a real ABI consumer
++//   gets -- just reached one layer lower, without the extra link weight.
++//   Gate-unaffected: sample_01_triangle_headless (ctest) never passes this
++//   flag.
++//
+ // Both modes build and draw through the exact same VkPipeline-construction
+ // code (createTrianglePipeline() below): dynamic rendering, dynamic
+ // viewport/scissor, no vertex input (the vertex shader generates positions
+ // from SV_VertexID), no cull, no blend, 1 sample, targeting
+ // device->swapchainFormat() either way (headless mode's offscreen image is
+ // deliberately created in that same format for exactly this reason).
+ #include <rx_core/log.h>
++#include <rx_core/log_forward_sink.h>
+ #include <rx_core/profile.h>
+ #include <rx_platform/window.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/frame_sync.h>
+ 
+ #include <SDL3/SDL.h>
+ #include <volk.h>
+ 
+ #include <array>
+ #include <cstdint>
++#include <cstdio>
+ #include <cstring>
+ #include <fstream>
+ #include <optional>
+ #include <string_view>
+ #include <utility>
+ #include <vector>
+ 
+ namespace {
+ 
+ constexpr uint32_t kWidth = 256;
+@@ -877,30 +898,52 @@ int runPresent(bool enableValidation) {
+         RX_LOG_ERROR("Vulkan validation layer reported errors during the present loop");
+         return 1;
+     }
+     if (!ok) {
+         return 1;
+     }
+     RX_LOG_INFO("--present: window closed cleanly");
+     return 0;
+ }
+ 
++// --log-callback adapter [spec Phase 4 design D23, seed 13] -- stands in
++// for a consuming engine's own logging system: real integration code
++// would route these three fields into that engine's own log sink instead
++// of stdout. `userData` is unused here (nullptr installed below) since
++// this demo has no per-installation state to carry.
++void sampleLogCallback(int32_t severity, const char* category, const char* message, void* /*userData*/) {
++    static constexpr const char* kSeverityNames[] = {"TRACE", "DEBUG", "INFO", "WARN", "ERROR"};
++    const char* severityName =
++        (severity >= 0 && severity < static_cast<int32_t>(std::size(kSeverityNames))) ? kSeverityNames[severity]
++                                                                                        : "UNKNOWN";
++    bool hasCategory = category != nullptr && category[0] != '\0';
++    std::fprintf(stdout, "[log-callback] [%s]%s%s %s\n", severityName, hasCategory ? " " : "",
++                 hasCategory ? category : "", message != nullptr ? message : "");
++}
++
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+     rx::core::log::init();
+ 
+     bool presentMode = false;
+     bool enableValidation = false;
++    bool logCallback = false;
+     for (int i = 1; i < argc; ++i) {
+         if (std::string_view(argv[i]) == "--present") {
+             presentMode = true;
+         } else if (std::string_view(argv[i]) == "--validate") {
+             enableValidation = true;
++        } else if (std::string_view(argv[i]) == "--log-callback") {
++            logCallback = true;
+         }
+     }
+ 
++    if (logCallback) {
++        rx::core::log::forwardSink()->set(&sampleLogCallback, nullptr);
++    }
++
+     if (presentMode) {
+         return runPresent(enableValidation);
+     }
+     return runHeadless(enableValidation);
+ }
+diff --git a/src/rx_core/CMakeLists.txt b/src/rx_core/CMakeLists.txt
+index 1a93ad4..fca8cf4 100644
+--- a/src/rx_core/CMakeLists.txt
++++ b/src/rx_core/CMakeLists.txt
+@@ -1,12 +1,13 @@
+ add_library(rx_core STATIC
+     src/log.cpp
++    src/log_forward_sink.cpp
+ )
+ target_include_directories(rx_core PUBLIC include)
+ target_link_libraries(rx_core PUBLIC spdlog::spdlog glm::glm)
+ 
+ # Tracy client integration [spec D3, Phase 4 Stage 0 Task 3] -- rx_core is
+ # the ONE place this project defines TRACY_ENABLE and links Tracy::TracyClient,
+ # both PUBLIC: rx_core is a public, transitive dependency of every other
+ # library and sample in this engine, so this single wiring point is what
+ # makes rx_core/profile.h's RX_ZONE*/RX_FRAME_MARK/RX_PLOT macros (and
+ # rx_rhi_vk/tracy_gpu.h's own GPU-zone macros, which key off the identical
+diff --git a/src/rx_core/include/rx_core/log_forward_sink.h b/src/rx_core/include/rx_core/log_forward_sink.h
+new file mode 100644
+index 0000000..92ca70f
+--- /dev/null
++++ b/src/rx_core/include/rx_core/log_forward_sink.h
+@@ -0,0 +1,118 @@
++#pragma once
++
++// log_forward_sink.h -- the spdlog sink backing rx_material's public
++// rxSetLogCallback() ABI entry point [spec Phase 4 design D23, seed 13:
++// "public log sink -- consuming engines need renderer logs in their own
++// systems"]. Lives in rx_core (not rx_material) because it is a pure
++// spdlog extension with zero rx_material/ABI-type knowledge: rx_api.h's
++// RxLogCallback is `void (*)(RxLogSeverity, const char*, const char*,
++// void*)` where RxLogSeverity is itself just a plain `int32_t` typedef
++// (not a distinct enum type -- see rx_api.h's own comment on it), so it
++// is byte-for-byte, TYPE-for-type identical to ForwardCallback below
++// (`int32_t` in that exact slot). rx_material's api_impl.cpp therefore
++// passes an RxLogCallback straight through to LogForwardSink::set() with
++// no cast/trampoline at all -- see that file's own rxSetLogCallback() for
++// the one call site.
++//
++// Thread-affinity (D5/D23, Phase 4): the callback installed via set() may
++// be invoked from ANY thread that logs through the logger this sink is
++// attached to -- worker threads included. This is the one deliberate
++// exception to docs/threading.md's otherwise-universal main-thread-only
++// default (see that file's own note that the public ABI surface Phase 4
++// adds is exactly this log sink); a caller's callback must be safe to run
++// concurrently from multiple threads and must not assume render/main-
++// thread affinity -- see docs/threading.md.
++
++#include <cstdint>
++#include <memory>
++#include <mutex>
++
++#include <spdlog/sinks/base_sink.h>
++
++namespace rx::core::log {
++
++// Callback signature. Severity values mirror spdlog::level::level_enum's
++// own Trace..Error values 1:1 (spdlog/common.h: trace=0, debug=1, info=2,
++// warn=3, err=4) -- spdlog::level::critical folds down to 4 (Error) too,
++// since this engine's own severity scale stops at Error (matching
++// RX_LOG_ERROR's own ceiling in log.h; there is no RX_LOG_CRITICAL).
++// `category`/`message` are valid ONLY for the duration of one invocation
++// -- both point at buffers this sink frees the moment the callback
++// returns (rx_api.h's RxLogCallback documents the identical contract for
++// any caller reaching this through rxSetLogCallback()).
++using ForwardCallback = void (*)(int32_t severity, const char* category, const char* message, void* userData);
++
++// An spdlog sink that forwards every record it receives to a single,
++// process-wide installed callback -- or does nothing at all when none is
++// installed (the common, steady-state case: one mutex lock plus a null
++// check, no string formatting/allocation performed on that path -- the
++// "near-zero cost otherwise" this sink is required to hold to).
++//
++// Never constructed directly by a consumer -- see forwardSink() below,
++// the one accessor that lazily creates AND registers this into the
++// current default logger's sink list exactly once per process, however
++// many times or from wherever it is called.
++class LogForwardSink final : public spdlog::sinks::base_sink<std::mutex> {
++public:
++    // Installs `callback`/`userData` as the active forwarding target.
++    // `callback == nullptr` uninstalls -- no further delivery until a new
++    // one is installed (restores "console-only": the console sink
++    // spdlog::default_logger() already carries is never touched/removed
++    // by this class either way, so console output and forwarding are
++    // always independent, additive concerns). Also clears any prior
++    // throwing-callback disable state -- installing a callback is always
++    // a fresh start, even right after a previous one was permanently
++    // disabled for throwing (see disabledByException()'s own comment).
++    //
++    // Thread-safe against concurrent sink_it_()/set() calls from any
++    // thread: guarded by callbackMutex_ below, a mutex-guarded {callback,
++    // userData} PAIR rather than two independent atomics (or an atomic
++    // pointer to a heap-allocated pair). Chosen because `callback` and
++    // `userData` must always be observed TOGETHER -- a torn read that saw
++    // a new callback paired with the old userData (or vice versa) would
++    // silently hand a caller's callback the wrong context on the very
++    // next log record racing a set() call -- and the critical section on
++    // both the read side (sink_it_, which copies the pair out and
++    // releases the lock BEFORE invoking the callback -- see the .cpp) and
++    // the write side (set()) is a plain two-pointer copy, cheap enough
++    // that a mutex here is immaterial next to spdlog's own formatting/IO
++    // work. There is no real perf incentive to reach for a lock-free
++    // alternative for something this rarely written and this cheap to
++    // read.
++    void set(ForwardCallback callback, void* userData);
++
++    // True once a throwing callback has been permanently disabled (see
++    // sink_it_()'s catch-all in the .cpp) -- lets tests assert the
++    // disable path fired deterministically rather than scraping stderr
++    // for the one console warning it also emits.
++    [[nodiscard]] bool disabledByException() const;
++
++protected:
++    void sink_it_(const spdlog::details::log_msg& msg) override;
++    void flush_() override;
++
++private:
++    // Disables `callback`/`userData` ONLY if they are still the
++    // currently-installed pair (guards against a narrow, accepted race:
++    // callback A throws on thread 1 while a legitimate set() on thread 2
++    // has already replaced it with callback B in between -- this must
++    // never clobber B).
++    void disableIfStillInstalled(ForwardCallback callback, void* userData);
++
++    mutable std::mutex callbackMutex_;
++    ForwardCallback callback_ = nullptr;
++    void* userData_ = nullptr;
++    bool disabledByException_ = false;
++};
++
++// Returns the process-wide LogForwardSink singleton, constructing it and
++// appending it to spdlog::default_logger()'s own sink list the first time
++// this is called from anywhere in the process (idempotent regardless of
++// caller or call count -- both rx::core::log::init() and rx_material's
++// rxSetLogCallback() call this unconditionally, so whichever runs first
++// does the real work; every later call just returns the same instance).
++// This ADDS a sink; it never replaces or removes the console sink
++// spdlog::default_logger() already carries.
++std::shared_ptr<LogForwardSink> forwardSink();
++
++}  // namespace rx::core::log
+diff --git a/src/rx_core/src/log.cpp b/src/rx_core/src/log.cpp
+index f66d2cf..2d3a528 100644
+--- a/src/rx_core/src/log.cpp
++++ b/src/rx_core/src/log.cpp
+@@ -1,22 +1,34 @@
+ #include <rx_core/log.h>
++#include <rx_core/log_forward_sink.h>
+ 
+ #include <mutex>
+ 
+ namespace rx::core::log {
+ 
+ void init() {
+     // std::call_once/std::once_flag, not a bare `static bool` guarded by a
+     // plain `if` -- that pattern's read-then-write of `initialized` is not
+     // atomic, so two threads racing to call init() for the first time can
+     // both observe `initialized == false` and both proceed past the check
+     // (a real bug found when rx_shader's Compiler::create() called this
+     // before taking its own global-session mutex: two threads racing to
+     // create the first Compiler in a process raced here too). call_once
+     // guarantees the callable runs exactly once and that every caller --
+     // whichever thread wins, and every thread that merely blocks waiting
+     // for it -- only returns after that one run completes.
+     static std::once_flag initFlag;
+-    std::call_once(initFlag, [] { spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v"); });
++    std::call_once(initFlag, [] {
++        spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
++        // [spec D23, seed 13] Registers the public-log-sink forwarding
++        // sink into the default logger, once, alongside the console sink
++        // above -- see log_forward_sink.h's own comment. forwardSink()
++        // is independently idempotent (its own call_once), so this call
++        // is defensive/eager, not the only place it can ever run: every
++        // process that reaches rx_material's rxSetLogCallback() calls it
++        // too, in case that happens before anything else ever called
++        // rx::core::log::init().
++        forwardSink();
++    });
+ }
+ 
+ }  // namespace rx::core::log
+diff --git a/src/rx_core/src/log_forward_sink.cpp b/src/rx_core/src/log_forward_sink.cpp
+new file mode 100644
+index 0000000..e62bc79
+--- /dev/null
++++ b/src/rx_core/src/log_forward_sink.cpp
+@@ -0,0 +1,126 @@
++#include <rx_core/log_forward_sink.h>
++
++#include <cstdio>
++#include <string>
++
++#include <spdlog/spdlog.h>
++
++namespace rx::core::log {
++
++namespace {
++
++// spdlog::level::level_enum's own numeric values (spdlog/common.h):
++// trace=0, debug=1, info=2, warn=3, err=4, critical=5, off=6. Folded 1:1
++// onto this engine's own severity scale, which stops at Error (4) -- see
++// ForwardCallback's own doc comment in the header for why critical/off
++// collapse the way they do below.
++int32_t mapLevel(spdlog::level::level_enum level) {
++    switch (level) {
++        case spdlog::level::trace:
++            return 0;
++        case spdlog::level::debug:
++            return 1;
++        case spdlog::level::info:
++            return 2;
++        case spdlog::level::warn:
++            return 3;
++        case spdlog::level::err:
++            return 4;
++        case spdlog::level::critical:
++            return 4;  // folds into Error -- this engine has no RX_LOG_CRITICAL.
++        case spdlog::level::off:
++        case spdlog::level::n_levels:
++        default:
++            // off/n_levels should never reach sink_it_ (they are filter
++            // values, never assigned to a real log_msg) -- treated as
++            // Error defensively rather than asserting, since a
++            // logging-adjacent path is the wrong place to crash a
++            // process over an unexpected-but-harmless enum value.
++            return 4;
++    }
++}
++
++}  // namespace
++
++void LogForwardSink::set(ForwardCallback callback, void* userData) {
++    std::lock_guard<std::mutex> lock(callbackMutex_);
++    callback_ = callback;
++    userData_ = callback != nullptr ? userData : nullptr;
++    disabledByException_ = false;
++}
++
++bool LogForwardSink::disabledByException() const {
++    std::lock_guard<std::mutex> lock(callbackMutex_);
++    return disabledByException_;
++}
++
++void LogForwardSink::disableIfStillInstalled(ForwardCallback callback, void* userData) {
++    std::lock_guard<std::mutex> lock(callbackMutex_);
++    if (callback_ == callback && userData_ == userData) {
++        callback_ = nullptr;
++        userData_ = nullptr;
++        disabledByException_ = true;
++    }
++}
++
++void LogForwardSink::sink_it_(const spdlog::details::log_msg& msg) {
++    // Snapshot under the lock, then release it BEFORE invoking the
++    // callback: invoking an arbitrary caller-supplied function pointer
++    // while holding callbackMutex_ would deadlock if that callback logs
++    // anything itself (a re-entrant call back into this exact sink, on
++    // the same thread, trying to lock the same non-recursive mutex again)
++    // or calls back into set()/rxSetLogCallback() to change/uninstall the
++    // callback. Copying the pair out and unlocking first avoids both.
++    ForwardCallback callback;
++    void* userData;
++    {
++        std::lock_guard<std::mutex> lock(callbackMutex_);
++        if (callback_ == nullptr) {
++            return;  // near-zero cost path: nothing installed, nothing more to do.
++        }
++        callback = callback_;
++        userData = userData_;
++    }
++
++    // spdlog::string_view_t views (msg.payload/msg.logger_name) are not
++    // guaranteed null-terminated -- copy into std::string first so the
++    // `const char*` handed to the callback is safely null-terminated for
++    // the callback's own duration (rx_api.h's RxLogCallback documents this
++    // exact string-lifetime contract for any caller reaching this through
++    // rxSetLogCallback()).
++    std::string category(msg.logger_name.data(), msg.logger_name.size());
++    std::string message(msg.payload.data(), msg.payload.size());
++    int32_t severity = mapLevel(msg.level);
++
++    try {
++        callback(severity, category.c_str(), message.c_str(), userData);
++    } catch (const std::exception& e) {
++        std::fprintf(stderr,
++                      "rx_core: log-forward callback threw std::exception(\"%s\") -- disabling it permanently "
++                      "(this log record's own delivery is otherwise silently dropped, never re-thrown)\n",
++                      e.what());
++        disableIfStillInstalled(callback, userData);
++    } catch (...) {
++        std::fprintf(stderr,
++                      "rx_core: log-forward callback threw a non-std::exception value -- disabling it "
++                      "permanently\n");
++        disableIfStillInstalled(callback, userData);
++    }
++}
++
++void LogForwardSink::flush_() {
++    // Nothing buffered on this sink's own side -- the callback (if any)
++    // ran synchronously, inline, inside sink_it_() above.
++}
++
++std::shared_ptr<LogForwardSink> forwardSink() {
++    static std::shared_ptr<LogForwardSink> sink;
++    static std::once_flag flag;
++    std::call_once(flag, [] {
++        sink = std::make_shared<LogForwardSink>();
++        spdlog::default_logger()->sinks().push_back(sink);
++    });
++    return sink;
++}
++
++}  // namespace rx::core::log
+diff --git a/src/rx_core/tests/log_test.cpp b/src/rx_core/tests/log_test.cpp
+index 08a2710..99c6513 100644
+--- a/src/rx_core/tests/log_test.cpp
++++ b/src/rx_core/tests/log_test.cpp
+@@ -1,14 +1,22 @@
+ #include <doctest/doctest.h>
+ #include <rx_core/log.h>
++#include <rx_core/log_forward_sink.h>
+ #include <spdlog/sinks/ostream_sink.h>
++
++#include <cstdint>
++#include <memory>
++#include <mutex>
+ #include <sstream>
++#include <stdexcept>
++#include <string>
++#include <thread>
+ 
+ TEST_CASE("log::init is idempotent") {
+     rx::core::log::init();
+     rx::core::log::init();
+     CHECK(true);
+ }
+ 
+ TEST_CASE("RX_LOG_INFO writes the formatted message through spdlog's default logger") {
+     rx::core::log::init();
+     auto previousDefault = spdlog::default_logger();
+@@ -26,10 +34,126 @@ TEST_CASE("RX_LOG_INFO writes the formatted message through spdlog's default log
+     // Windows spdlog terminates each formatted line with "\r\n"; Linux
+     // spdlog uses a bare "\n". Strip both trailing characters before
+     // comparing so this assertion is portable across native Linux and
+     // Wine-hosted Windows builds alike.
+     std::string captured = capture.str();
+     while (!captured.empty() && (captured.back() == '\n' || captured.back() == '\r')) {
+         captured.pop_back();
+     }
+     CHECK(captured == "hello 42");
+ }
++
++// ===== LogForwardSink [spec Phase 4 design D23, seed 13] ===================
++// Device-free: none of these touch a VkDevice, and none of them swap out
++// spdlog::default_logger() the way the ostream_sink test above does --
++// LogForwardSink is attached to whichever logger object is CURRENTLY the
++// default the first time forwardSink() runs anywhere in this process (see
++// its own header comment), so as long as every test that swaps loggers
++// restores the original afterward (the one above already does), these
++// cases can rely on RX_LOG_* reaching the very same sink instance
++// regardless of test execution order.
++namespace {
++
++struct CapturedRecord {
++    std::mutex mutex;
++    int32_t severity = -1;
++    std::string category;
++    std::string message;
++    std::thread::id threadId{};
++    int callCount = 0;
++};
++
++void captureCallback(int32_t severity, const char* category, const char* message, void* userData) {
++    auto* captured = static_cast<CapturedRecord*>(userData);
++    std::lock_guard<std::mutex> lock(captured->mutex);
++    captured->severity = severity;
++    captured->category = category != nullptr ? category : "";
++    captured->message = message != nullptr ? message : "";
++    captured->threadId = std::this_thread::get_id();
++    captured->callCount++;
++}
++
++// RAII guard: uninstalls the forwarding sink's callback on scope exit no
++// matter how the enclosing TEST_CASE exits, including a failed REQUIRE
++// (doctest unwinds via a C++ exception in that case). Without this, a
++// TEST_CASE that fails a REQUIRE between installing a callback and
++// uninstalling it would leave a dangling `userData` pointer -- this stack
++// frame's own CapturedRecord -- permanently installed in the process-wide
++// singleton, corrupting every later TEST_CASE in this binary that happens
++// to log anything.
++struct ForwardCallbackGuard {
++    std::shared_ptr<rx::core::log::LogForwardSink> sink;
++    ~ForwardCallbackGuard() { sink->set(nullptr, nullptr); }
++};
++
++}  // namespace
++
++TEST_CASE("LogForwardSink delivers severity/category/message to an installed callback for a real logged record") {
++    rx::core::log::init();
++    auto sink = rx::core::log::forwardSink();
++
++    CapturedRecord captured;
++    sink->set(&captureCallback, &captured);
++    ForwardCallbackGuard guard{sink};
++
++    RX_LOG_ERROR("forward sink test message {}", 42);
++
++    std::lock_guard<std::mutex> lock(captured.mutex);
++    CHECK(captured.callCount >= 1);
++    CHECK(captured.severity == 4);  // Error, per LogForwardSink's own Trace..Error mapping.
++    CHECK(captured.message == "forward sink test message 42");
++    // Category = the spdlog logger name the record was issued through --
++    // RX_LOG_* always goes through spdlog's unnamed default logger.
++    CHECK(captured.category.empty());
++}
++
++TEST_CASE("LogForwardSink stops delivering once uninstalled via a nullptr callback") {
++    rx::core::log::init();
++    auto sink = rx::core::log::forwardSink();
++
++    CapturedRecord captured;
++    sink->set(&captureCallback, &captured);
++    sink->set(nullptr, nullptr);  // uninstall immediately -- no guard needed, already null.
++
++    RX_LOG_ERROR("this record must not be delivered to captured");
++
++    std::lock_guard<std::mutex> lock(captured.mutex);
++    CHECK(captured.callCount == 0);
++}
++
++TEST_CASE("LogForwardSink delivers to the installed callback from a worker thread, not just the installer's own "
++          "thread") {
++    rx::core::log::init();
++    auto sink = rx::core::log::forwardSink();
++
++    CapturedRecord captured;
++    sink->set(&captureCallback, &captured);
++    ForwardCallbackGuard guard{sink};
++
++    std::thread::id mainThreadId = std::this_thread::get_id();
++    std::thread worker([] { RX_LOG_ERROR("logged from a worker thread"); });
++    worker.join();
++
++    std::lock_guard<std::mutex> lock(captured.mutex);
++    CHECK(captured.callCount >= 1);
++    CHECK(captured.threadId != mainThreadId);
++}
++
++TEST_CASE("LogForwardSink permanently disables a throwing callback after one console warning, without crashing") {
++    rx::core::log::init();
++    auto sink = rx::core::log::forwardSink();
++
++    auto throwingCallback = +[](int32_t, const char*, const char*, void*) { throw std::runtime_error("boom"); };
++    sink->set(throwingCallback, nullptr);
++    ForwardCallbackGuard guard{sink};
++
++    CHECK_FALSE(sink->disabledByException());
++    RX_LOG_ERROR("this record's callback throws");
++    CHECK(sink->disabledByException());
++
++    // Genuinely disabled, not merely a flag nobody acts on: a second log
++    // record after the throw does not crash the process (this whole test
++    // case completing IS part of that proof) and disabledByException()
++    // stays true rather than somehow clearing itself.
++    RX_LOG_ERROR("a second record after the callback was disabled");
++    CHECK(sink->disabledByException());
++}
+diff --git a/src/rx_material/api_impl.cpp b/src/rx_material/api_impl.cpp
+index 2fe8759..7e10ba2 100644
+--- a/src/rx_material/api_impl.cpp
++++ b/src/rx_material/api_impl.cpp
+@@ -1,16 +1,17 @@
+ #include <rx_material/rx_api.h>
+ 
+ #include <rx_material/material_system.h>
+ #include <rx_material/rx_api_detail.h>
+ 
+ #include <rx_core/log.h>
++#include <rx_core/log_forward_sink.h>
+ 
+ #include <atomic>
+ #include <cstdint>
+ #include <cstring>
+ #include <filesystem>
+ #include <optional>
+ #include <string>
+ #include <unordered_map>
+ #include <utility>
+ #include <vector>
+@@ -647,11 +648,33 @@ extern "C" RxResult rxCreateMaterialSystem(const RxMaterialSystemDesc* desc, IRx
+     try {
+         auto* internal = static_cast<rx::material::MaterialSystem*>(desc->internalMaterialSystem);
+         *outSystem = new MaterialSystemImpl(internal);
+         return RX_OK;
+     } catch (const std::exception& e) {
+         RX_LOG_ERROR("rx_material: rx_api: rxCreateMaterialSystem failed: {}", e.what());
+         return RX_E_FAIL;
+     }
+ }
+ 
++// rxSetLogCallback() [spec Phase 4 design D23, seed 13] -- process-wide,
++// not tied to any IRxMaterialSystem instance (unlike everything else in
++// this file), so it lives here as a second, independent extern "C" entry
++// point rather than a method on any interface above. init() is called
++// defensively first (matching every other rx_core-logging entry point in
++// this codebase, e.g. MaterialSystem::create()/Compiler::create()) so
++// this is safe to call before any device/material system has been
++// created at all -- log::init()'s own call_once makes repeat calls free.
++//
++// RxLogCallback's signature (RxLogSeverity, const char*, const char*,
++// void*) is the SAME C++ type as rx_core::log::ForwardCallback's
++// (int32_t, const char*, const char*, void*) after typedef resolution --
++// RxLogSeverity IS int32_t (a plain alias, not a distinct enum type; see
++// rx_api.h's own comment on it), so `cb` converts to ForwardCallback with
++// no cast, no calling-convention change, and no UB: they are not merely
++// ABI-compatible, they are literally the identical function pointer type.
++extern "C" RxResult rxSetLogCallback(RxLogCallback cb, void* userData) {
++    rx::core::log::init();
++    rx::core::log::forwardSink()->set(cb, userData);
++    return RX_OK;
++}
++
+ }  // namespace rx::material
+diff --git a/src/rx_material/include/rx_material/rx_api.h b/src/rx_material/include/rx_material/rx_api.h
+index 9a69e17..793274d 100644
+--- a/src/rx_material/include/rx_material/rx_api.h
++++ b/src/rx_material/include/rx_material/rx_api.h
+@@ -265,10 +265,94 @@ struct RxMaterialSystemDesc {
+ };
+ static_assert(sizeof(RxMaterialSystemDesc) == sizeof(void*),
+               "RxMaterialSystemDesc must stay exactly one pointer wide -- it is passed by pointer across the ABI "
+               "and a caller may construct it as a plain aggregate on either side.");
+ 
+ // RX_E_INVALIDARG if `desc` or `outSystem` is null. On success,
+ // `*outSystem` is a new IRxMaterialSystem with refcount 1 (the caller
+ // owns that reference and must release() it); on failure `*outSystem` is
+ // set to null.
+ extern "C" RxResult rxCreateMaterialSystem(const RxMaterialSystemDesc* desc, IRxMaterialSystem** outSystem);
++
++// --- rxSetLogCallback: the public log sink [spec Phase 4 design D23,
++// seed 13] -------------------------------------------------------------
++// A consuming engine's own logging/telemetry system is the reason this
++// exists: spdlog itself is an internal implementation detail this
++// boundary never exposes (no spdlog:: type appears anywhere in this
++// header, matching every other ABI rule above) -- this is the one way a
++// caller observes renderer diagnostics (rx_core's RX_LOG_INFO/WARN/ERROR
++// and everything that funnels through them) from outside this codebase.
++//
++// Severity crossing the ABI, like RxResult/RxFormat above: a plain
++// int32_t typedef with named constants, not a scoped/fixed-underlying-
++// type `enum class` -- this header's own established convention (see
++// RxResult's own comment at the top) rather than a second one.
++typedef int32_t RxLogSeverity;
++enum : RxLogSeverity {
++    RX_LOG_TRACE = 0,
++    RX_LOG_DEBUG = 1,
++    RX_LOG_INFO = 2,
++    RX_LOG_WARN = 3,
++    RX_LOG_ERROR = 4,
++};
++static_assert(RX_LOG_TRACE == 0 && RX_LOG_DEBUG == 1 && RX_LOG_INFO == 2 && RX_LOG_WARN == 3 && RX_LOG_ERROR == 4,
++              "RxLogSeverity's numeric values are pinned to spdlog::level::level_enum's own Trace..Error values "
++              "(spdlog/common.h) -- rx_core's LogForwardSink "
++              "(src/rx_core/include/rx_core/log_forward_sink.h) maps spdlog levels directly onto these integers "
++              "with no translation table on either side, so renumbering here would silently desync the severity "
++              "an installed RxLogCallback receives from what spdlog itself actually recorded.");
++
++// A callback matching THIS signature receives every record the renderer
++// logs, once installed via rxSetLogCallback() below. `category` is the
++// spdlog logger name the record was issued through (empty string "" for
++// every RX_LOG_INFO/WARN/ERROR call today -- those all go through
++// rx_core's one unnamed default logger, src/rx_core/include/rx_core/log.h).
++// `category`/`message` are valid ONLY for the duration of this one
++// invocation: both point at temporary buffers freed the moment the
++// callback returns -- a callback that needs the text afterward must copy
++// it before returning. `userData` is exactly whatever pointer was passed
++// to the rxSetLogCallback() call that installed this callback, handed
++// back unexamined -- this boundary never dereferences it itself.
++typedef void (*RxLogCallback)(RxLogSeverity severity, const char* category, const char* message, void* userData);
++
++// Installs `cb` as the process-wide log-forwarding target (`userData`
++// travels back to `cb` unexamined -- see RxLogCallback's own comment
++// above). `cb == nullptr` UNINSTALLS whatever callback is currently
++// active and restores console-only output: the renderer's own console
++// sink is never touched or removed by this call either way, so
++// installing/uninstalling a callback only adds/removes FORWARDING, never
++// silences the console. Always returns RX_OK for every valid transition
++// (install a non-null `cb`, replace an already-installed one, or
++// uninstall via nullptr) -- there is no invalid input to reject here:
++// `userData` is opaque and never dereferenced by this boundary, so even a
++// null/garbage `userData` alongside a non-null `cb` is legal (whatever
++// `cb` itself does with it is entirely `cb`'s own contract, not this
++// call's to validate).
++//
++// Exception discipline: `cb` is invoked inside a catch-all (matching this
++// whole header's "no exception crosses a boundary this engine controls"
++// rule, R:M§1.3 point 2 -- `cb` is technically caller-owned code, not
++// renderer code, but the same discipline applies since it runs on this
++// engine's own logging call stack). If `cb` throws, that exception is
++// swallowed, one diagnostic is printed directly to the process's own
++// stderr (deliberately never re-entering spdlog/this same logger from
++// inside its own sink callback -- not safe to attempt), and `cb` is
++// PERMANENTLY disabled (no further delivery to it) until a fresh
++// rxSetLogCallback() call installs something new.
++//
++// Thread-affinity (D5/D23, Phase 4): `cb` may be invoked from ANY thread
++// that logs -- including rx_task worker threads -- not only whichever
++// thread called rxSetLogCallback() itself. This is the one deliberate
++// exception to docs/threading.md's otherwise-universal main-thread-only
++// default (see that file's own note that the public ABI surface Phase 4
++// adds is exactly this log sink); `cb` must be safe to call concurrently
++// from multiple threads and must not assume render/main-thread affinity
++// -- see docs/threading.md.
++//
++// GUID note: unlike Task 7's createTexture2D() addition above (which
++// changed IRxMaterialSystem's own vtable shape and therefore needed a
++// regenerated kIID_IRxMaterialSystem, per this header's own comment on
++// that), rxSetLogCallback() changes NO existing interface's shape at all
++// -- it is a free `extern "C"` function plus two new POD-ish types
++// (RxLogSeverity, RxLogCallback), exactly like rxCreateMaterialSystem
++// itself. No IID anywhere in this header needs to change, and none has.
++extern "C" RxResult rxSetLogCallback(RxLogCallback cb, void* userData);
+diff --git a/src/rx_material/tests/test_api_contract.cpp b/src/rx_material/tests/test_api_contract.cpp
+index 996c661..49da352 100644
+--- a/src/rx_material/tests/test_api_contract.cpp
++++ b/src/rx_material/tests/test_api_contract.cpp
+@@ -7,20 +7,22 @@
+ // of those four methods ever touch the internal pointer. Only
+ // loadMaterial() needs a real internal MaterialSystem (a real VkDevice),
+ // which is exactly why its happy path lives in test_api_factory.cpp
+ // (rx_material_gpu_tests) instead -- this file only checks that calling
+ // it on a device-free instance fails safely (RX_E_FAIL), never crashes.
+ #include <doctest/doctest.h>
+ #include <rx_material/rx_api.h>
+ #include <rx_material/rx_api_detail.h>
+ 
+ #include <cstdint>
++#include <mutex>
++#include <string>
+ 
+ // Re-pinned here (not just in rx_api.h) so this contract test file
+ // itself exercises the exact sizes a real consumer would depend on --
+ // mirrors test_api_header_self_contained.cpp's identical pair, kept
+ // here too per this task's own test-list wording.
+ static_assert(sizeof(RxGuid) == 16);
+ static_assert(sizeof(RxMaterialSystemDesc) == sizeof(void*));
+ 
+ namespace {
+ 
+@@ -202,10 +204,92 @@ TEST_CASE("entry-point audit: every RxResult-returning method on a device-free I
+     IRxMaterial* material = nullptr;
+     CHECK(isDocumentedResult(system->loadMaterial(nullptr, &material)));
+     CHECK(isDocumentedResult(system->loadMaterial("does/not/matter.slang", nullptr)));
+     CHECK(isDocumentedResult(system->loadMaterial("", &material)));
+     CHECK(isDocumentedResult(system->loadMaterial("does/not/matter.slang", &material)));
+ 
+     CHECK(isDocumentedResult(system->reloadChanged()));
+ 
+     system->release();
+ }
++
++// ===== rxSetLogCallback [spec Phase 4 design D23, seed 13] =================
++// Process-wide, not tied to any IRxMaterialSystem instance -- every case
++// below uninstalls (rxSetLogCallback(nullptr, nullptr)) before returning,
++// via LogCallbackGuard, so a later TEST_CASE anywhere in this binary never
++// observes a callback left over from one of these (and, since a failed
++// REQUIRE unwinds via a C++ exception under doctest, the RAII guard covers
++// that path too -- see its own comment).
++namespace {
++
++struct LogCallbackGuard {
++    ~LogCallbackGuard() { rxSetLogCallback(nullptr, nullptr); }
++};
++
++}  // namespace
++
++TEST_CASE("rxSetLogCallback returns RX_OK for every valid transition (install/replace/uninstall), regardless of "
++          "userData") {
++    LogCallbackGuard guard;
++
++    // Uninstalling when nothing is installed is still a valid transition.
++    CHECK(rxSetLogCallback(nullptr, nullptr) == RX_OK);
++
++    RxLogCallback noop = [](RxLogSeverity, const char*, const char*, void*) {};
++    CHECK(rxSetLogCallback(noop, nullptr) == RX_OK);
++
++    int sentinel = 0;
++    CHECK(rxSetLogCallback(noop, &sentinel) == RX_OK);  // replace with new userData
++
++    CHECK(rxSetLogCallback(nullptr, &sentinel) == RX_OK);  // uninstall -- userData irrelevant when cb is null
++}
++
++TEST_CASE("rxSetLogCallback installs a process-wide callback that observes a real rx_material log record "
++          "(severity/category/message), and nullptr uninstalls it") {
++    struct Captured {
++        std::mutex mutex;
++        RxLogSeverity severity = -1;
++        std::string category;
++        std::string message;
++        int callCount = 0;
++    } captured;
++
++    RxLogCallback callback = [](RxLogSeverity severity, const char* category, const char* message, void* userData) {
++        auto* c = static_cast<Captured*>(userData);
++        std::lock_guard<std::mutex> lock(c->mutex);
++        c->severity = severity;
++        c->category = category != nullptr ? category : "";
++        c->message = message != nullptr ? message : "";
++        c->callCount++;
++    };
++
++    CHECK(rxSetLogCallback(callback, &captured) == RX_OK);
++    LogCallbackGuard guard;
++
++    // Device-free loadMaterial() logs a real RX_LOG_ERROR through this
++    // exact boundary (api_impl.cpp's own loadMaterial() -- see the
++    // "device-free" test above this section) -- an authentic trigger,
++    // not a synthetic log call made just for this test.
++    IRxMaterialSystem* system = makeDeviceFreeSystem();
++    IRxMaterial* material = nullptr;
++    CHECK(system->loadMaterial("does/not/matter.slang", &material) == RX_E_FAIL);
++
++    {
++        std::lock_guard<std::mutex> lock(captured.mutex);
++        CHECK(captured.callCount >= 1);
++        CHECK(captured.severity == RX_LOG_ERROR);
++        CHECK(captured.category.empty());  // rx_core's RX_LOG_* macros use the unnamed default logger.
++        CHECK(captured.message.find("loadMaterial") != std::string::npos);
++        captured.callCount = 0;
++    }
++
++    // Uninstall: the next log record through this same boundary is no
++    // longer delivered.
++    CHECK(rxSetLogCallback(nullptr, nullptr) == RX_OK);
++    CHECK(system->loadMaterial("does/not/matter.slang", &material) == RX_E_FAIL);
++    {
++        std::lock_guard<std::mutex> lock(captured.mutex);
++        CHECK(captured.callCount == 0);
++    }
++
++    system->release();
++}
+diff --git a/src/rx_material/tests/test_api_header_self_contained.cpp b/src/rx_material/tests/test_api_header_self_contained.cpp
+index ce93ef4..edd8337 100644
+--- a/src/rx_material/tests/test_api_header_self_contained.cpp
++++ b/src/rx_material/tests/test_api_header_self_contained.cpp
+@@ -38,20 +38,36 @@ using MaterialSystemPtr = IRxMaterialSystem*;
+ 
+ [[maybe_unused]] const RxGuid& kUnknownGuidRef = kIID_IRxUnknown;
+ [[maybe_unused]] const RxGuid& kTextureGuidRef = kIID_IRxTexture;
+ [[maybe_unused]] const RxGuid& kMaterialInstanceGuidRef = kIID_IRxMaterialInstance;
+ [[maybe_unused]] const RxGuid& kMaterialGuidRef = kIID_IRxMaterial;
+ [[maybe_unused]] const RxGuid& kMaterialSystemGuidRef = kIID_IRxMaterialSystem;
+ 
+ using FactoryFn = RxResult (*)(const RxMaterialSystemDesc*, IRxMaterialSystem**);
+ [[maybe_unused]] constexpr FactoryFn kFactory = &rxCreateMaterialSystem;
+ 
++// [spec Phase 4 design D23, seed 13] rxSetLogCallback's own types --
++// named here for the identical "cannot be quietly defeated by an
++// otherwise-unreferenced declaration" reason as everything else in this
++// file (this header's own comment above).
++static_assert(sizeof(RxLogSeverity) == sizeof(int32_t),
++              "rx_api.h's own pinned RxLogSeverity size -- re-checked here for the same reason as RxGuid/"
++              "RxMaterialSystemDesc/RxTextureDesc above");
++[[maybe_unused]] constexpr RxLogSeverity kTraceSeverity = RX_LOG_TRACE;
++[[maybe_unused]] constexpr RxLogSeverity kDebugSeverity = RX_LOG_DEBUG;
++[[maybe_unused]] constexpr RxLogSeverity kInfoSeverity = RX_LOG_INFO;
++[[maybe_unused]] constexpr RxLogSeverity kWarnSeverity = RX_LOG_WARN;
++[[maybe_unused]] constexpr RxLogSeverity kErrorSeverity = RX_LOG_ERROR;
++[[maybe_unused]] RxLogCallback kUnusedLogCallback = nullptr;
++using SetLogCallbackFn = RxResult (*)(RxLogCallback, void*);
++[[maybe_unused]] constexpr SetLogCallbackFn kSetLogCallback = &rxSetLogCallback;
++
+ // [Task 7] RxTextureDesc/RxFormat/IRxMaterialSystem::createTexture2D --
+ // named here too, for the identical "cannot be quietly defeated by an
+ // otherwise-unreferenced declaration" reason this file's own header
+ // comment states.
+ [[maybe_unused]] RxTextureDesc kUnusedTextureDesc{};
+ [[maybe_unused]] constexpr RxFormat kUnormFormat = RX_FORMAT_RGBA8_UNORM;
+ [[maybe_unused]] constexpr RxFormat kSrgbFormat = RX_FORMAT_RGBA8_SRGB;
+ using CreateTexture2DFn = RxResult (IRxMaterialSystem::*)(const RxTextureDesc*, IRxTexture**);
+ [[maybe_unused]] constexpr CreateTexture2DFn kCreateTexture2D = &IRxMaterialSystem::createTexture2D;
+ 

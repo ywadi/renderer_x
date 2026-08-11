@@ -1,0 +1,1875 @@
+# Review package: 01a71e9..85a70ed
+
+## Commits
+85a70ed feat: add explicit present-mode control to Device and all six samples
+
+## Files changed
+ .../task-6-report.md                               | 156 +++++++++++++++++++++
+ samples/01_triangle/main.cpp                       |  46 +++++-
+ samples/02_hotreload/main.cpp                      |  45 +++++-
+ samples/03_bindless_mesh/main.cpp                  |  45 +++++-
+ samples/04_streaming/main.cpp                      |  46 +++++-
+ samples/05_multipass/main.cpp                      |  45 +++++-
+ samples/06_materials/main.cpp                      |  45 +++++-
+ samples/README.md                                  |  67 ++++++++-
+ src/rx_rhi_vk/include/rx_rhi_vk/device.h           |  64 +++++++++
+ src/rx_rhi_vk/src/device.cpp                       | 112 +++++++++++++++
+ src/rx_rhi_vk/tests/device_test.cpp                | 144 +++++++++++++++++++
+ 11 files changed, 792 insertions(+), 23 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-6-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-6-report.md
+new file mode 100644
+index 0000000..a118b03
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-6-report.md
+@@ -0,0 +1,156 @@
++# Task 6 report: Present-mode control (spec seed 1)
++
++## Scope
++
++`src/rx_rhi_vk/device.{h,cpp}`, all six samples' `main.cpp` flag parsing,
++`samples/README.md`. No changes outside this scope (texture wiring and the
++log-sink task are separate agents' worktrees).
++
++## What changed
++
++**`rx::rhi::PresentMode`** (`device.h`): `enum class PresentMode { VsyncOn,
++VsyncOff };`, plus a free `presentModeName(VkPresentModeKHR)` helper for
++logging/HUD use, shared by `Device`'s own internal logging and all six
++samples' startup log line.
++
++**`Device::setPresentMode(PresentMode)`**: records the desired mode only —
++does not touch the live swapchain. **`Device::presentMode()`**: returns the
++actual `VkPresentModeKHR` currently in use (read back from vk-bootstrap after
++the ladder resolves it), for logging/HUD.
++
++**Ladder** (`selectPresentMode()`, `device.cpp`, anonymous namespace):
++`VsyncOn` always resolves to `FIFO` with no query (the one mode the Vulkan
++spec guarantees every surface supports). `VsyncOff` queries
++`vkGetPhysicalDeviceSurfacePresentModesKHR` directly and prefers `MAILBOX`,
++then `IMMEDIATE`, falling back to `FIFO` with a one-line `RX_LOG_WARN` only
++when the surface supports neither. The already-verified-available result is
++handed straight to `vkb::SwapchainBuilder::set_desired_present_mode()`,
++bypassing vk-bootstrap's own (different, undocumented-here) fallback.
++
++**Single recreation path, no second flow invented**: `recreateSwapchain()`
++is the sole place the ladder actually executes for a live `Device` — it
++already runs on every `NeedsRecreate` (resize, out-of-date, suboptimal) and
++now also resolves `desiredPresentMode_` against the ladder every time.
++`setPresentMode()` itself does nothing to the swapchain; a caller that wants
++the new mode applied immediately (every sample's `--vsync` handling) calls
++`recreateSwapchain(surface)` right after `setPresentMode()`, reusing the
++exact function resize already drives.
++
++**Creation-time default, explicit — behavioral change**: `Device::create()`
++now calls `swapchainBuilder.set_desired_present_mode(VK_PRESENT_MODE_FIFO_KHR)`
++unconditionally, replacing vk-bootstrap's own implicit
++MAILBOX-if-available-else-FIFO preference. Before this task, a sample
++running against a MAILBOX-capable surface got MAILBOX with no code anywhere
++having chosen it; every `Device` now gets FIFO unless something explicitly
++opts out via `setPresentMode(VsyncOff)` + `recreateSwapchain()`. Documented
++at the creation site and on `PresentMode`/`setPresentMode()`'s own comments.
++
++**All six samples** (`01_triangle` .. `06_materials`): `--vsync on|off`
++(default `on`), parsed in the same `for`-loop/`std::string_view` style as
++`--validate`, consuming one extra `argv` slot for the value; an unrecognized
++value logs an error and defaults to `on`. Forwarded only into `runPresent()`
++(new second parameter, `rx::rhi::PresentMode`) — `runHeadless()`'s signature
++is untouched, since its swapchain is built once and never presented, so
++there is nothing for a present-mode choice to affect there; the flag still
++parses in headless mode, it just has no effect (documented at the flag-parse
++site and in each file's own header comment). Inside `runPresent()`, right
++after `Device::create()` succeeds and before any per-swapchain-image
++resource (`FrameSync`, image views) is built: if `--vsync off`,
++`setPresentMode()` + `recreateSwapchain(surface)` once; either way, one
++`RX_LOG_INFO("--present: present mode in use: {}", ...)` line using the new
++`presentModeName()` helper. The default (`on`) case skips the extra
++recreate call entirely — `Device::create()`'s own explicit-FIFO default
++already matches it, so no wasted double-swapchain-build at startup.
++
++**`samples/README.md`**: full `--vsync` explanation (behavioral change,
++ladder, headless no-op) written once under `01_triangle`, mirroring how
++`--validate` is documented; the other five samples get a one-line pointer
++back to it, matching the existing `--validate` cross-reference convention.
++Each sample's "Expected output" section now notes the startup present-mode
++log line. One CLI example (`--present --vsync off`) added to the "Building
++and running" section.
++
++## Tests
++
++**GPU test** (`device_test.cpp`, new `TEST_CASE`): same fixture and the same
++acquire/record/submit/present shape as the existing round-trip test directly
++above it, including its fixed `COLOR_ATTACHMENT_OUTPUT` barrier `srcStage`
++(read before writing this test, per the brief) — copied, not
++reinvented, since the brief required following that exact acquire-semaphore
++chaining. Adds: `Device::create()` → `CHECK(presentMode() ==
++VK_PRESENT_MODE_FIFO_KHR)`; `setPresentMode(VsyncOff)` +
++`REQUIRE(recreateSwapchain(surface))`; `CHECK` the result is one of
++`{MAILBOX, IMMEDIATE, FIFO}` (the ladder's *contract*, not a specific
++optional mode — driver-dependent); then one full acquire/submit/present
++cycle against the recreated swapchain; `CHECK_FALSE(hasValidationErrors())`.
++
++**Sample flag parsing**: no existing "device-free arg-parse test" harness
++exists anywhere under `samples/` (checked — every sample's only registered
++`ctest` case runs the real binary headless with `--validate`; there is no
++separate unit-test binary for CLI parsing to extend). Per the task's own
++conditional wording ("where the samples have parse tests"), none were added;
++covered instead by direct manual runs of the built binaries (below) plus the
++existing `ctest` headless registrations, which already exercise `main()`'s
++parsing loop end to end and now implicitly confirm `--vsync` is a no-op
++there (unchanged headless behavior/output).
++
++**Manual verification** (`xvfb-run`, hidden window):
++- `sample_01_triangle --present --validate` (no `--vsync`): logs
++  `present mode in use: FIFO` once from `Device::create()`, no
++  `recreateSwapchain` log line (confirms no redundant recreate on the
++  default path), sample's own line echoes `FIFO`.
++- `sample_01_triangle --present --validate --vsync off`: `Device::create()`
++  logs `FIFO`, then `Device::recreateSwapchain` logs `IMMEDIATE
++  (PresentMode::VsyncOff)` (this dev machine's Mesa/lavapipe surface has no
++  MAILBOX here), sample's own line echoes `IMMEDIATE`; ran 5s under Xvfb, no
++  crash.
++- `sample_06_materials --present --validate --vsync off`: same pattern,
++  confirmed on a more complex sample (allocator/uploader/material-system
++  wiring all present) — no crash, no validation errors, present-mode log
++  line correct.
++- `sample_01_triangle --validate --vsync off` (headless, no `--present`):
++  flag parses, ignored, unchanged `triangle readback PASSED` output.
++- `sample_01_triangle --vsync bogus`: logs
++  `--vsync expects 'on' or 'off', got 'bogus' -- defaulting to on`,
++  continues normally.
++
++## Verification evidence
++
++- `cmake --preset linux-native && cmake --build build/linux-native` — full
++  project, zero errors, zero new warnings.
++- `cmake --preset windows-cross-zig && cmake --build build/windows-cross-zig
++  --target rx_rhi_vk_tests sample_01_triangle sample_02_hotreload
++  sample_03_bindless_mesh sample_04_streaming sample_05_multipass
++  sample_06_materials` — all link successfully (`.exe` outputs present);
++  only pre-existing, unrelated `_WIN32_WINNT` macro-redefinition warnings.
++- `xvfb-run -a ctest --preset linux-native` — **16/16 tests pass** (full
++  suite: `rx_rhi_vk_tests`, all six `sample_NN_*_headless` gates, everything
++  else untouched by this task).
++- `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
++  VK_LAYER_PATH=/home/ywadi/sponza/vvl xvfb-run -a ctest --preset
++  linux-native -R rx_rhi_vk` — **1/1 pass** under the newer validation layer
++  + lavapipe ICD. Under this combination the ladder resolved `VsyncOff` to
++  `MAILBOX` (this lavapipe build does support it, contrary to the brief's
++  own hedge that only FIFO might be available under Xvfb/lavapipe) — the
++  test asserts the ladder's contract (`{MAILBOX, IMMEDIATE, FIFO}`), not a
++  specific mode, so this is a pass either way.
++- `xvfb-run -a ./build/linux-native/src/rx_rhi_vk/rx_rhi_vk_tests` (default
++  system layer) — **35/35 test cases, 805/805 assertions pass**, zero
++  validation errors (the two pre-existing, independently-documented
++  `VK_KHR_portability_enumeration` false positives are unaffected by this
++  task and still filtered by `Context::hasValidationErrors()`).
++
++## Notes / concerns
++
++- `Device::recreateSwapchain()` still rebuilds the swapchain from scratch
++  (destroy-then-build, no `oldSwapchain` hand-off) — pre-existing behavior,
++  unchanged; out of this task's scope (present-mode selection only).
++- The ladder's `VsyncOff` fallback-to-FIFO branch (surface supports neither
++  MAILBOX nor IMMEDIATE) is exercised only by the warning-log code path in
++  this task's testing — no available driver/surface combination on this
++  dev machine actually lacks both modes, so that exact branch's *log
++  output* was verified by inspection/reasoning (guarded, one-line,
++  `RX_LOG_WARN`) rather than by an environment that forces it. The ladder
++  logic itself (three sequential `if`s, no other exit) is simple enough
++  that this is a reasonable risk to accept, but it is disclosed rather than
++  silently assumed correct.
+diff --git a/samples/01_triangle/main.cpp b/samples/01_triangle/main.cpp
+index 802d94d..2c425aa 100644
+--- a/samples/01_triangle/main.cpp
++++ b/samples/01_triangle/main.cpp
+@@ -11,21 +11,27 @@
+ //   until vkAcquireNextImageKHR returns it -- rendering into an un-acquired
+ //   swapchain image is a Vulkan spec violation regardless of whether a given
+ //   driver tolerates it. Registered as ctest sample_01_triangle_headless;
+ //   exits 0/1.
+ //
+ //   --present. Opens a real, visible window and runs the canonical
+ //   frames-in-flight present loop (rx::rhi::FrameSync) against the actual
+ //   swapchain images -- the first and only place in this codebase that
+ //   legally writes to a swapchain image, and only ever the acquired index.
+ //   Survives window resizes via Device's NeedsRecreate/recreateSwapchain
+-//   path; closes cleanly on window-close (SDL_EVENT_QUIT). Not part of
++//   path; closes cleanly on window-close (SDL_EVENT_QUIT). Also accepts
++//   --vsync on|off (default on) [Phase 4 Task 6]: forwarded into
++//   Device::setPresentMode() + recreateSwapchain() right after
++//   Device::create(), before any per-swapchain-image resource is built --
++//   see runPresent()'s own comment. Has no effect in headless mode, whose
++//   swapchain is built once and never presented (the flag still parses
++//   there, it just has nothing to apply to). Not part of
+ //   ctest (it's an interactive/manual-verification path -- see
+ //   MANUAL_VERIFICATION.md at the repo root); exits 0 on a clean window
+ //   close, 1 on any Vulkan failure or device loss.
+ //
+ // Both modes build and draw through the exact same VkPipeline-construction
+ // code (createTrianglePipeline() below): dynamic rendering, dynamic
+ // viewport/scissor, no vertex input (the vertex shader generates positions
+ // from SV_VertexID), no cull, no blend, 1 sample, targeting
+ // device->swapchainFormat() either way (headless mode's offscreen image is
+ // deliberately created in that same format for exactly this reason).
+@@ -641,21 +647,21 @@ int runHeadless(bool enableValidation) {
+ // acquiring, but only RESETS it AFTER acquireNextImage() has confirmed it
+ // actually has an image to render into. Resetting unconditionally before
+ // acquiring would deadlock the very next iteration's wait whenever acquire
+ // itself reports NeedsRecreate (a real, reachable path -- e.g. a just-
+ // resized or minimized window): that iteration `continue`s without ever
+ // submitting again, so an unconditionally-reset fence would never be
+ // re-signaled by anything, and the next wait on it would block forever. This
+ // is the same wait-before-acquire/reset-after-acquire-succeeds ordering used
+ // by every mainstream Vulkan frames-in-flight reference (e.g.
+ // vulkan-tutorial.com's "Frames in flight" chapter) for exactly this reason.
+-int runPresent(bool enableValidation) {
++int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode) {
+     auto window = rx::platform::Window::create("rx_triangle_sample (--present)", static_cast<int>(kPresentWidth),
+                                                  static_cast<int>(kPresentHeight), /*visible=*/true);
+     if (!window.has_value()) {
+         RX_LOG_ERROR("Window::create failed: no display backend available");
+         return 1;
+     }
+ 
+     auto extensions = window->requiredVulkanInstanceExtensions();
+     if (extensions.empty()) {
+         RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
+@@ -677,20 +683,38 @@ int runPresent(bool enableValidation) {
+     // Device::create takes ownership of `surface` unconditionally -- see
+     // rx_rhi_vk/device.h. `surface` remains valid and usable (just not
+     // ours to destroy) for the recreateSwapchain() calls below.
+     auto device = rx::rhi::Device::create(*context, surface);
+     if (!device.has_value()) {
+         RX_LOG_ERROR("Device::create failed");
+         return 1;
+     }
+     const VkDevice vkDevice = device->device();
+ 
++    // --vsync [Phase 4 Task 6]: Device::create() always builds its
++    // swapchain with an explicit FIFO default (PresentMode::VsyncOn) --
++    // see device.cpp's own comment at the creation site. setPresentMode()
++    // only records what the caller wants; recreateSwapchain() (the exact
++    // path the NeedsRecreate handling below already drives on a real
++    // resize) is what actually applies it -- reused here, once, before any
++    // per-swapchain-image resource (FrameSync, image views) is built
++    // against this device, so nothing downstream is built against a
++    // swapchain generation that is about to be replaced.
++    if (vsyncMode == rx::rhi::PresentMode::VsyncOff) {
++        device->setPresentMode(vsyncMode);
++        if (!device->recreateSwapchain(surface)) {
++            RX_LOG_ERROR("Device::recreateSwapchain failed while applying --vsync off");
++            return 1;
++        }
++    }
++    RX_LOG_INFO("--present: present mode in use: {}", rx::rhi::presentModeName(device->presentMode()));
++
+     auto frameSync = rx::rhi::FrameSync::create(vkDevice, device->graphicsQueueFamily(),
+                                                  static_cast<uint32_t>(device->swapchainImages().size()));
+     if (!frameSync.has_value()) {
+         RX_LOG_ERROR("FrameSync::create failed");
+         return 1;
+     }
+ 
+     // Pipeline: shared with headless mode (see createTrianglePipeline).
+     auto pipelineResult = createTrianglePipeline(vkDevice, device->swapchainFormat());
+     if (!pipelineResult.has_value()) {
+@@ -884,23 +908,39 @@ int runPresent(bool enableValidation) {
+     return 0;
+ }
+ 
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+     rx::core::log::init();
+ 
+     bool presentMode = false;
+     bool enableValidation = false;
++    // --vsync on|off, default on [Phase 4 Task 6] -- forwarded to
++    // runPresent() only. Headless mode's swapchain is built once via
++    // Device::create() and never presented (see this file's header
++    // comment), so there is nothing for a present-mode choice to affect
++    // there; the flag is still parsed like any other (no error on it) but
++    // simply has no effect in that path.
++    rx::rhi::PresentMode vsyncMode = rx::rhi::PresentMode::VsyncOn;
+     for (int i = 1; i < argc; ++i) {
+         if (std::string_view(argv[i]) == "--present") {
+             presentMode = true;
+         } else if (std::string_view(argv[i]) == "--validate") {
+             enableValidation = true;
++        } else if (std::string_view(argv[i]) == "--vsync" && i + 1 < argc) {
++            std::string_view value = argv[++i];
++            if (value == "off") {
++                vsyncMode = rx::rhi::PresentMode::VsyncOff;
++            } else if (value == "on") {
++                vsyncMode = rx::rhi::PresentMode::VsyncOn;
++            } else {
++                RX_LOG_ERROR("--vsync expects 'on' or 'off', got '{}' -- defaulting to on", value);
++            }
+         }
+     }
+ 
+     if (presentMode) {
+-        return runPresent(enableValidation);
++        return runPresent(enableValidation, vsyncMode);
+     }
+     return runHeadless(enableValidation);
+ }
+diff --git a/samples/02_hotreload/main.cpp b/samples/02_hotreload/main.cpp
+index 7a9d2d0..3413ea8 100644
+--- a/samples/02_hotreload/main.cpp
++++ b/samples/02_hotreload/main.cpp
+@@ -32,20 +32,27 @@
+ //   checks whether hotreload.slang (deployed next to this binary at build
+ //   time -- see CMakeLists.txt -- and located at runtime via
+ //   SDL_GetBasePath(), so a redistributed copy of this sample's directory
+ //   works identically) changed on disk. On a change: recompile via
+ //   Compiler::compileFromFile; on success, build the new pipeline and swap
+ //   it in; on failure, log Slang's diagnostics (already logged by
+ //   rx_shader's Compiler itself) and keep rendering the last-good
+ //   pipeline -- the running window never goes blank or crashes because of
+ //   a shader typo.
+ //
++// Also accepts --vsync on|off (default on) [Phase 4 Task 6]: forwarded
++// into Device::setPresentMode() + recreateSwapchain() right after
++// Device::create() in runPresent(), before any per-swapchain-image
++// resource is built. Has no effect in headless mode, whose swapchain is
++// built once and never presented -- the flag still parses there, it just
++// has nothing to apply to.
++//
+ // Pipeline swap strategy (present mode only): Task 4 of this phase
+ // (DeletionQueue, fence-keyed deferred destruction) had not landed at the
+ // time this sample was written. Per the coordinator's explicit sign-off
+ // for this task, the old pipeline is retired with a plain
+ // vkDeviceWaitIdle() immediately before destroying it, rather than a
+ // DeletionQueue::retire() call -- acceptable because reloads are a rare,
+ // human-interactive event (one file save every few seconds at most), not
+ // a per-frame operation, so the stall this causes is invisible in
+ // practice. A later pass wiring this sample to DeletionQueue can drop the
+ // wait entirely; nothing else about the swap needs to change.
+@@ -838,21 +845,21 @@ int runHeadless(bool enableValidation) {
+ 
+     if (pass) {
+         RX_LOG_INFO("hotreload headless gate PASSED");
+         return 0;
+     }
+     RX_LOG_ERROR("hotreload headless gate FAILED");
+     return 1;
+ }
+ 
+ // --- --present mode: real window, live shader editing -----------------------
+-int runPresent(bool enableValidation) {
++int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode) {
+     auto window = rx::platform::Window::create("rx_hotreload_sample (--present)", static_cast<int>(kPresentWidth),
+                                                  static_cast<int>(kPresentHeight), /*visible=*/true);
+     if (!window.has_value()) {
+         RX_LOG_ERROR("Window::create failed: no display backend available");
+         return 1;
+     }
+ 
+     auto extensions = window->requiredVulkanInstanceExtensions();
+     if (extensions.empty()) {
+         RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
+@@ -871,20 +878,38 @@ int runPresent(bool enableValidation) {
+         return 1;
+     }
+ 
+     auto device = rx::rhi::Device::create(*context, surface);
+     if (!device.has_value()) {
+         RX_LOG_ERROR("Device::create failed");
+         return 1;
+     }
+     const VkDevice vkDevice = device->device();
+ 
++    // --vsync [Phase 4 Task 6]: Device::create() always builds its
++    // swapchain with an explicit FIFO default (PresentMode::VsyncOn) --
++    // see device.cpp's own comment at the creation site. setPresentMode()
++    // only records what the caller wants; recreateSwapchain() (the exact
++    // path the NeedsRecreate handling below already drives on a real
++    // resize) is what actually applies it -- reused here, once, before any
++    // per-swapchain-image resource (FrameSync, image views) is built
++    // against this device, so nothing downstream is built against a
++    // swapchain generation that is about to be replaced.
++    if (vsyncMode == rx::rhi::PresentMode::VsyncOff) {
++        device->setPresentMode(vsyncMode);
++        if (!device->recreateSwapchain(surface)) {
++            RX_LOG_ERROR("Device::recreateSwapchain failed while applying --vsync off");
++            return 1;
++        }
++    }
++    RX_LOG_INFO("--present: present mode in use: {}", rx::rhi::presentModeName(device->presentMode()));
++
+     auto frameSync = rx::rhi::FrameSync::create(vkDevice, device->graphicsQueueFamily(),
+                                                  static_cast<uint32_t>(device->swapchainImages().size()));
+     if (!frameSync.has_value()) {
+         RX_LOG_ERROR("FrameSync::create failed");
+         return 1;
+     }
+ 
+     const std::string shaderPath = resolveShaderPath();
+     RX_LOG_INFO("sample_02_hotreload: watching {} for changes (~4Hz poll); edit it and save while this window is "
+                 "open",
+@@ -1136,23 +1161,39 @@ int runPresent(bool enableValidation) {
+     return 0;
+ }
+ 
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+     rx::core::log::init();
+ 
+     bool presentMode = false;
+     bool enableValidation = false;
++    // --vsync on|off, default on [Phase 4 Task 6] -- forwarded to
++    // runPresent() only. Headless mode's swapchain is built once via
++    // Device::create() and never presented (see this file's header
++    // comment), so there is nothing for a present-mode choice to affect
++    // there; the flag is still parsed like any other (no error on it) but
++    // simply has no effect in that path.
++    rx::rhi::PresentMode vsyncMode = rx::rhi::PresentMode::VsyncOn;
+     for (int i = 1; i < argc; ++i) {
+         if (std::string_view(argv[i]) == "--present") {
+             presentMode = true;
+         } else if (std::string_view(argv[i]) == "--validate") {
+             enableValidation = true;
++        } else if (std::string_view(argv[i]) == "--vsync" && i + 1 < argc) {
++            std::string_view value = argv[++i];
++            if (value == "off") {
++                vsyncMode = rx::rhi::PresentMode::VsyncOff;
++            } else if (value == "on") {
++                vsyncMode = rx::rhi::PresentMode::VsyncOn;
++            } else {
++                RX_LOG_ERROR("--vsync expects 'on' or 'off', got '{}' -- defaulting to on", value);
++            }
+         }
+     }
+ 
+     if (presentMode) {
+-        return runPresent(enableValidation);
++        return runPresent(enableValidation, vsyncMode);
+     }
+     return runHeadless(enableValidation);
+ }
+diff --git a/samples/03_bindless_mesh/main.cpp b/samples/03_bindless_mesh/main.cpp
+index 240b571..2e4a6af 100644
+--- a/samples/03_bindless_mesh/main.cpp
++++ b/samples/03_bindless_mesh/main.cpp
+@@ -55,21 +55,26 @@
+ // Texture2D... create with mipLevels=1, no upload"].
+ //
+ // Two modes, exactly like 01_triangle/02_hotreload:
+ //   (default / no args) Headless correctness gate: one frame, offscreen,
+ //   256x256, camera at its orbit's t=0 pose (a fixed, well-known front
+ //   view -- see kCamera* below), readback + probe pixels asserting >=3
+ //   distinct texture colors actually landed on screen, validation clean,
+ //   exit 0/1. Registered as ctest sample_03_bindless_mesh_headless.
+ //   --present. Real window, the same scene, camera continuously orbiting
+ //   (see runPresent()'s use of elapsed time to drive the orbit angle the
+-//   headless gate always evaluates at t=0).
++//   headless gate always evaluates at t=0). Also accepts --vsync on|off
++//   (default on) [Phase 4 Task 6]: forwarded into Device::setPresentMode()
++//   + recreateSwapchain() right after Device::create(), before any
++//   per-swapchain-image resource is built. Has no effect in headless mode,
++//   whose swapchain is built once and never presented -- the flag still
++//   parses there, it just has nothing to apply to.
+ #include <rx_core/log.h>
+ #include <rx_core/profile.h>
+ #include <rx_platform/window.h>
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/frame_sync.h>
+ #include <rx_rhi_vk/mesh_buffers.h>
+@@ -1239,21 +1244,21 @@ int runHeadless(bool enableValidation) {
+ 
+     if (pass) {
+         RX_LOG_INFO("bindless mesh headless gate PASSED");
+         return 0;
+     }
+     RX_LOG_ERROR("bindless mesh headless gate FAILED");
+     return 1;
+ }
+ 
+ // --- --present mode: real window, orbiting camera --------------------------
+-int runPresent(bool enableValidation) {
++int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode) {
+     auto window = rx::platform::Window::create("rx_bindless_mesh_sample (--present)", static_cast<int>(kPresentWidth),
+                                                  static_cast<int>(kPresentHeight), /*visible=*/true);
+     if (!window.has_value()) {
+         RX_LOG_ERROR("Window::create failed: no display backend available");
+         return 1;
+     }
+ 
+     auto extensions = window->requiredVulkanInstanceExtensions();
+     if (extensions.empty()) {
+         RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
+@@ -1272,20 +1277,38 @@ int runPresent(bool enableValidation) {
+         return 1;
+     }
+ 
+     auto device = rx::rhi::Device::create(*context, surface);
+     if (!device.has_value()) {
+         RX_LOG_ERROR("Device::create failed");
+         return 1;
+     }
+     const VkDevice vkDevice = device->device();
+ 
++    // --vsync [Phase 4 Task 6]: Device::create() always builds its
++    // swapchain with an explicit FIFO default (PresentMode::VsyncOn) --
++    // see device.cpp's own comment at the creation site. setPresentMode()
++    // only records what the caller wants; recreateSwapchain() (the exact
++    // path the NeedsRecreate handling below already drives on a real
++    // resize) is what actually applies it -- reused here, once, before any
++    // per-swapchain-image resource (FrameSync, image views) is built
++    // against this device, so nothing downstream is built against a
++    // swapchain generation that is about to be replaced.
++    if (vsyncMode == rx::rhi::PresentMode::VsyncOff) {
++        device->setPresentMode(vsyncMode);
++        if (!device->recreateSwapchain(surface)) {
++            RX_LOG_ERROR("Device::recreateSwapchain failed while applying --vsync off");
++            return 1;
++        }
++    }
++    RX_LOG_INFO("--present: present mode in use: {}", rx::rhi::presentModeName(device->presentMode()));
++
+     auto allocator = rx::rhi::Allocator::create(*context, *device);
+     if (!allocator.has_value()) {
+         RX_LOG_ERROR("Allocator::create failed");
+         return 1;
+     }
+ 
+     auto uploader = rx::rhi::Uploader::create(*allocator, *device);
+     if (!uploader.has_value()) {
+         RX_LOG_ERROR("Uploader::create failed");
+         return 1;
+@@ -1579,23 +1602,39 @@ int runPresent(bool enableValidation) {
+     return 0;
+ }
+ 
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+     rx::core::log::init();
+ 
+     bool presentMode = false;
+     bool enableValidation = false;
++    // --vsync on|off, default on [Phase 4 Task 6] -- forwarded to
++    // runPresent() only. Headless mode's swapchain is built once via
++    // Device::create() and never presented (see this file's header
++    // comment), so there is nothing for a present-mode choice to affect
++    // there; the flag is still parsed like any other (no error on it) but
++    // simply has no effect in that path.
++    rx::rhi::PresentMode vsyncMode = rx::rhi::PresentMode::VsyncOn;
+     for (int i = 1; i < argc; ++i) {
+         if (std::string_view(argv[i]) == "--present") {
+             presentMode = true;
+         } else if (std::string_view(argv[i]) == "--validate") {
+             enableValidation = true;
++        } else if (std::string_view(argv[i]) == "--vsync" && i + 1 < argc) {
++            std::string_view value = argv[++i];
++            if (value == "off") {
++                vsyncMode = rx::rhi::PresentMode::VsyncOff;
++            } else if (value == "on") {
++                vsyncMode = rx::rhi::PresentMode::VsyncOn;
++            } else {
++                RX_LOG_ERROR("--vsync expects 'on' or 'off', got '{}' -- defaulting to on", value);
++            }
+         }
+     }
+ 
+     if (presentMode) {
+-        return runPresent(enableValidation);
++        return runPresent(enableValidation, vsyncMode);
+     }
+     return runHeadless(enableValidation);
+ }
+diff --git a/samples/04_streaming/main.cpp b/samples/04_streaming/main.cpp
+index e9b394e..f1a22f1 100644
+--- a/samples/04_streaming/main.cpp
++++ b/samples/04_streaming/main.cpp
+@@ -146,21 +146,27 @@
+ //
+ // Two modes, exactly like every other sample in this codebase:
+ //   (default / no args) Headless correctness gate: 60 real frames through
+ //   a genuine 2-frames-in-flight offscreen loop, readback probes at every
+ //   grid cell's screen position on every frame, asserting every one of
+ //   the 24 textures was actually observed resident on screen at some
+ //   point, plus zero validation errors (the assertion that would catch a
+ //   premature-destroy bug). Registered as ctest
+ //   sample_04_streaming_headless.
+ //   --present. Real window, the same 24-cell grid, static camera,
+-//   streaming continuing forever at roughly 1 texture/second.
++//   streaming continuing forever at roughly 1 texture/second. Also accepts
++//   --vsync on|off (default on) [Phase 4 Task 6]: forwarded into
++//   Device::setPresentMode() + recreateSwapchain() right after
++//   Device::create(), before any per-swapchain-image resource is built.
++//   Has no effect in headless mode, whose swapchain is built once and
++//   never presented -- the flag still parses there, it just has nothing
++//   to apply to.
+ #include <rx_core/log.h>
+ #include <rx_core/profile.h>
+ #include <rx_platform/window.h>
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/deletion_queue.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/frame_sync.h>
+@@ -1507,21 +1513,21 @@ int runHeadless(bool enableValidation) {
+ 
+     if (pass) {
+         RX_LOG_INFO("streaming headless gate PASSED");
+         return 0;
+     }
+     RX_LOG_ERROR("streaming headless gate FAILED");
+     return 1;
+ }
+ 
+ // --- --present mode: real window, continuously cycling grid ----------------
+-int runPresent(bool enableValidation) {
++int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode) {
+     auto window = rx::platform::Window::create("rx_streaming_sample (--present)", static_cast<int>(kPresentWidth),
+                                                  static_cast<int>(kPresentHeight), /*visible=*/true);
+     if (!window.has_value()) {
+         RX_LOG_ERROR("Window::create failed: no display backend available");
+         return 1;
+     }
+ 
+     auto extensions = window->requiredVulkanInstanceExtensions();
+     if (extensions.empty()) {
+         RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
+@@ -1540,20 +1546,38 @@ int runPresent(bool enableValidation) {
+         return 1;
+     }
+ 
+     auto device = rx::rhi::Device::create(*context, surface);
+     if (!device.has_value()) {
+         RX_LOG_ERROR("Device::create failed");
+         return 1;
+     }
+     const VkDevice vkDevice = device->device();
+ 
++    // --vsync [Phase 4 Task 6]: Device::create() always builds its
++    // swapchain with an explicit FIFO default (PresentMode::VsyncOn) --
++    // see device.cpp's own comment at the creation site. setPresentMode()
++    // only records what the caller wants; recreateSwapchain() (the exact
++    // path the NeedsRecreate handling below already drives on a real
++    // resize) is what actually applies it -- reused here, once, before any
++    // per-swapchain-image resource (FrameSync, image views) is built
++    // against this device, so nothing downstream is built against a
++    // swapchain generation that is about to be replaced.
++    if (vsyncMode == rx::rhi::PresentMode::VsyncOff) {
++        device->setPresentMode(vsyncMode);
++        if (!device->recreateSwapchain(surface)) {
++            RX_LOG_ERROR("Device::recreateSwapchain failed while applying --vsync off");
++            return 1;
++        }
++    }
++    RX_LOG_INFO("--present: present mode in use: {}", rx::rhi::presentModeName(device->presentMode()));
++
+     auto allocator = rx::rhi::Allocator::create(*context, *device);
+     if (!allocator.has_value()) {
+         RX_LOG_ERROR("Allocator::create failed");
+         return 1;
+     }
+ 
+     auto uploader = rx::rhi::Uploader::create(*allocator, *device);
+     if (!uploader.has_value()) {
+         RX_LOG_ERROR("Uploader::create failed");
+         return 1;
+@@ -1807,23 +1831,39 @@ int runPresent(bool enableValidation) {
+     return 0;
+ }
+ 
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+     rx::core::log::init();
+ 
+     bool presentMode = false;
+     bool enableValidation = false;
++    // --vsync on|off, default on [Phase 4 Task 6] -- forwarded to
++    // runPresent() only. Headless mode's swapchain is built once via
++    // Device::create() and never presented (see this file's header
++    // comment), so there is nothing for a present-mode choice to affect
++    // there; the flag is still parsed like any other (no error on it) but
++    // simply has no effect in that path.
++    rx::rhi::PresentMode vsyncMode = rx::rhi::PresentMode::VsyncOn;
+     for (int i = 1; i < argc; ++i) {
+         if (std::string_view(argv[i]) == "--present") {
+             presentMode = true;
+         } else if (std::string_view(argv[i]) == "--validate") {
+             enableValidation = true;
++        } else if (std::string_view(argv[i]) == "--vsync" && i + 1 < argc) {
++            std::string_view value = argv[++i];
++            if (value == "off") {
++                vsyncMode = rx::rhi::PresentMode::VsyncOff;
++            } else if (value == "on") {
++                vsyncMode = rx::rhi::PresentMode::VsyncOn;
++            } else {
++                RX_LOG_ERROR("--vsync expects 'on' or 'off', got '{}' -- defaulting to on", value);
++            }
+         }
+     }
+ 
+     if (presentMode) {
+-        return runPresent(enableValidation);
++        return runPresent(enableValidation, vsyncMode);
+     }
+     return runHeadless(enableValidation);
+ }
+diff --git a/samples/05_multipass/main.cpp b/samples/05_multipass/main.cpp
+index abbde6f..559cbe5 100644
+--- a/samples/05_multipass/main.cpp
++++ b/samples/05_multipass/main.cpp
+@@ -117,21 +117,26 @@
+ // descriptor slot instead of a VkPipeline.
+ //
+ // Two modes, exactly like every other sample in this codebase:
+ //   (default / no args) Headless correctness gate: fixed camera/light,
+ //   kHeadlessFrameCount=3 frames through the graph, readback, and the three
+ //   assertions the coordinator's brief specifies (shadow probe >2x darker
+ //   than the lit probe; lit probe non-trivially bright; every readback byte
+ //   in range, i.e. genuinely tonemapped, not a raw HDR overflow). Registered
+ //   as ctest sample_05_multipass_headless.
+ //   --present. Real window, the same scene, the light continuously
+-//   orbiting in azimuth.
++//   orbiting in azimuth. Also accepts --vsync on|off (default on)
++//   [Phase 4 Task 6]: forwarded into Device::setPresentMode() +
++//   recreateSwapchain() right after Device::create(), before any
++//   per-swapchain-image resource is built. Has no effect in headless mode,
++//   whose swapchain is built once and never presented -- the flag still
++//   parses there, it just has nothing to apply to.
+ #include <rx_core/log.h>
+ #include <rx_core/profile.h>
+ #include <rx_platform/window.h>
+ #include <rx_graph/executor.h>
+ #include <rx_graph/render_graph.h>
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/device.h>
+@@ -1836,21 +1841,21 @@ int runHeadless(bool enableValidation) {
+ 
+     if (pass) {
+         RX_LOG_INFO("multipass headless gate PASSED");
+         return 0;
+     }
+     RX_LOG_ERROR("multipass headless gate FAILED");
+     return 1;
+ }
+ 
+ // --- --present mode: real window, orbiting light -----------------------------
+-int runPresent(bool enableValidation) {
++int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode) {
+     auto window = rx::platform::Window::create("rx_multipass_sample (--present)", static_cast<int>(kPresentWidth),
+                                                  static_cast<int>(kPresentHeight), /*visible=*/true);
+     if (!window.has_value()) {
+         RX_LOG_ERROR("Window::create failed: no display backend available");
+         return 1;
+     }
+ 
+     auto extensions = window->requiredVulkanInstanceExtensions();
+     if (extensions.empty()) {
+         RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
+@@ -1869,20 +1874,38 @@ int runPresent(bool enableValidation) {
+         return 1;
+     }
+ 
+     auto device = rx::rhi::Device::create(*context, surface);
+     if (!device.has_value()) {
+         RX_LOG_ERROR("Device::create failed");
+         return 1;
+     }
+     const VkDevice vkDevice = device->device();
+ 
++    // --vsync [Phase 4 Task 6]: Device::create() always builds its
++    // swapchain with an explicit FIFO default (PresentMode::VsyncOn) --
++    // see device.cpp's own comment at the creation site. setPresentMode()
++    // only records what the caller wants; recreateSwapchain() (the exact
++    // path the NeedsRecreate handling below already drives on a real
++    // resize) is what actually applies it -- reused here, once, before any
++    // per-swapchain-image resource (FrameSync, image views) is built
++    // against this device, so nothing downstream is built against a
++    // swapchain generation that is about to be replaced.
++    if (vsyncMode == rx::rhi::PresentMode::VsyncOff) {
++        device->setPresentMode(vsyncMode);
++        if (!device->recreateSwapchain(surface)) {
++            RX_LOG_ERROR("Device::recreateSwapchain failed while applying --vsync off");
++            return 1;
++        }
++    }
++    RX_LOG_INFO("--present: present mode in use: {}", rx::rhi::presentModeName(device->presentMode()));
++
+     auto allocator = rx::rhi::Allocator::create(*context, *device);
+     if (!allocator.has_value()) {
+         RX_LOG_ERROR("Allocator::create failed");
+         return 1;
+     }
+ 
+     auto uploader = rx::rhi::Uploader::create(*allocator, *device);
+     if (!uploader.has_value()) {
+         RX_LOG_ERROR("Uploader::create failed");
+         return 1;
+@@ -2119,23 +2142,39 @@ int runPresent(bool enableValidation) {
+     return 0;
+ }
+ 
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+     rx::core::log::init();
+ 
+     bool presentMode = false;
+     bool enableValidation = false;
++    // --vsync on|off, default on [Phase 4 Task 6] -- forwarded to
++    // runPresent() only. Headless mode's swapchain is built once via
++    // Device::create() and never presented (see this file's header
++    // comment), so there is nothing for a present-mode choice to affect
++    // there; the flag is still parsed like any other (no error on it) but
++    // simply has no effect in that path.
++    rx::rhi::PresentMode vsyncMode = rx::rhi::PresentMode::VsyncOn;
+     for (int i = 1; i < argc; ++i) {
+         if (std::string_view(argv[i]) == "--present") {
+             presentMode = true;
+         } else if (std::string_view(argv[i]) == "--validate") {
+             enableValidation = true;
++        } else if (std::string_view(argv[i]) == "--vsync" && i + 1 < argc) {
++            std::string_view value = argv[++i];
++            if (value == "off") {
++                vsyncMode = rx::rhi::PresentMode::VsyncOff;
++            } else if (value == "on") {
++                vsyncMode = rx::rhi::PresentMode::VsyncOn;
++            } else {
++                RX_LOG_ERROR("--vsync expects 'on' or 'off', got '{}' -- defaulting to on", value);
++            }
+         }
+     }
+ 
+     if (presentMode) {
+-        return runPresent(enableValidation);
++        return runPresent(enableValidation, vsyncMode);
+     }
+     return runHeadless(enableValidation);
+ }
+diff --git a/samples/06_materials/main.cpp b/samples/06_materials/main.cpp
+index 5b6bb49..6b2089a 100644
+--- a/samples/06_materials/main.cpp
++++ b/samples/06_materials/main.cpp
+@@ -134,21 +134,26 @@
+ //   IRxMaterialSystem::reloadChanged() (samples/02_hotreload's own
+ //   keep-last-good UX, applied here to materials instead of a raw
+ //   pipeline). See this file's own recordDraws() for an ADDITIONAL,
+ //   sample-local keep-last-good safety net: a hot-reloaded edit that
+ //   changes a material's PARAMETER BLOCK SHAPE (adds/removes/retypes a
+ //   `gParams` field) is out of this sample's documented hot-reload scope
+ //   (matching src/rx_material/tests/test_material_system.cpp's own
+ //   reload-fixture convention of only ever changing a material's MATH, not
+ //   its params' shape, across reload versions) -- rather than let that
+ //   crash a running --present session, that one object's draw is skipped
+-//   for the frame and the failure is logged.
++//   for the frame and the failure is logged. Also accepts --vsync on|off
++//   (default on) [Phase 4 Task 6]: forwarded into Device::setPresentMode()
++//   + recreateSwapchain() right after Device::create(), before any
++//   per-swapchain-image resource is built. Has no effect in headless mode,
++//   whose swapchain is built once and never presented -- the flag still
++//   parses there, it just has nothing to apply to.
+ #include <rx_material/rx_api.h>  // PUBLIC surface -- used throughout this file below.
+ 
+ #include <rx_core/log.h>
+ #include <rx_core/profile.h>
+ #include <rx_graph/executor.h>
+ #include <rx_graph/render_graph.h>
+ #include <rx_platform/window.h>
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/command.h>
+@@ -1419,21 +1424,21 @@ int runHeadless(bool enableValidation) {
+ 
+     if (pass) {
+         RX_LOG_INFO("materials headless gate PASSED");
+         return 0;
+     }
+     RX_LOG_ERROR("materials headless gate FAILED");
+     return 1;
+ }
+ 
+ // --- --present mode: real window, orbiting camera, hot-reload polling ------
+-int runPresent(bool enableValidation) {
++int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode) {
+     auto window = rx::platform::Window::create("rx_materials_sample (--present)", static_cast<int>(kPresentWidth),
+                                                  static_cast<int>(kPresentHeight), /*visible=*/true);
+     if (!window.has_value()) {
+         RX_LOG_ERROR("Window::create failed: no display backend available");
+         return 1;
+     }
+ 
+     auto extensions = window->requiredVulkanInstanceExtensions();
+     if (extensions.empty()) {
+         RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
+@@ -1452,20 +1457,38 @@ int runPresent(bool enableValidation) {
+         return 1;
+     }
+ 
+     auto device = rx::rhi::Device::create(*context, surface);
+     if (!device.has_value()) {
+         RX_LOG_ERROR("Device::create failed");
+         return 1;
+     }
+     const VkDevice vkDevice = device->device();
+ 
++    // --vsync [Phase 4 Task 6]: Device::create() always builds its
++    // swapchain with an explicit FIFO default (PresentMode::VsyncOn) --
++    // see device.cpp's own comment at the creation site. setPresentMode()
++    // only records what the caller wants; recreateSwapchain() (the exact
++    // path the NeedsRecreate handling below already drives on a real
++    // resize) is what actually applies it -- reused here, once, before any
++    // per-swapchain-image resource (FrameSync, image views) is built
++    // against this device, so nothing downstream is built against a
++    // swapchain generation that is about to be replaced.
++    if (vsyncMode == rx::rhi::PresentMode::VsyncOff) {
++        device->setPresentMode(vsyncMode);
++        if (!device->recreateSwapchain(surface)) {
++            RX_LOG_ERROR("Device::recreateSwapchain failed while applying --vsync off");
++            return 1;
++        }
++    }
++    RX_LOG_INFO("--present: present mode in use: {}", rx::rhi::presentModeName(device->presentMode()));
++
+     auto allocator = rx::rhi::Allocator::create(*context, *device);
+     if (!allocator.has_value()) {
+         RX_LOG_ERROR("Allocator::create failed");
+         return 1;
+     }
+ 
+     auto uploader = rx::rhi::Uploader::create(*allocator, *device);
+     if (!uploader.has_value()) {
+         RX_LOG_ERROR("Uploader::create failed");
+         return 1;
+@@ -1730,23 +1753,39 @@ int runPresent(bool enableValidation) {
+     return 0;
+ }
+ 
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+     rx::core::log::init();
+ 
+     bool presentMode = false;
+     bool enableValidation = false;
++    // --vsync on|off, default on [Phase 4 Task 6] -- forwarded to
++    // runPresent() only. Headless mode's swapchain is built once via
++    // Device::create() and never presented (see this file's header
++    // comment), so there is nothing for a present-mode choice to affect
++    // there; the flag is still parsed like any other (no error on it) but
++    // simply has no effect in that path.
++    rx::rhi::PresentMode vsyncMode = rx::rhi::PresentMode::VsyncOn;
+     for (int i = 1; i < argc; ++i) {
+         if (std::string_view(argv[i]) == "--present") {
+             presentMode = true;
+         } else if (std::string_view(argv[i]) == "--validate") {
+             enableValidation = true;
++        } else if (std::string_view(argv[i]) == "--vsync" && i + 1 < argc) {
++            std::string_view value = argv[++i];
++            if (value == "off") {
++                vsyncMode = rx::rhi::PresentMode::VsyncOff;
++            } else if (value == "on") {
++                vsyncMode = rx::rhi::PresentMode::VsyncOn;
++            } else {
++                RX_LOG_ERROR("--vsync expects 'on' or 'off', got '{}' -- defaulting to on", value);
++            }
+         }
+     }
+ 
+     if (presentMode) {
+-        return runPresent(enableValidation);
++        return runPresent(enableValidation, vsyncMode);
+     }
+     return runHeadless(enableValidation);
+ }
+diff --git a/samples/README.md b/samples/README.md
+index 31031bc..49c5484 100644
+--- a/samples/README.md
++++ b/samples/README.md
+@@ -90,31 +90,57 @@ exact same pipeline-construction code and draw call:
+   `src/rx_rhi_vk/include/rx_rhi_vk/frame_sync.h`). This is the first and
+   only place in this codebase that writes to a swapchain image — and only
+   ever the image `vkAcquireNextImageKHR` actually returned. Runs until the
+   window is closed (or the process receives `SIGINT`/`SIGTERM`, which SDL
+   translates into a clean shutdown); survives being resized at any point,
+   any number of times. Add `--validate` to also confirm zero validation
+   errors across those resizes (what `MANUAL_VERIFICATION.md`'s pre-release
+   checklist does). Not part of `ctest` — it's interactive by nature. See
+   `MANUAL_VERIFICATION.md` at the repo root for the per-platform manual
+   check this mode gets before a release.
++- **`--vsync on|off`** (default `on`) — present-mode control
++  [`src/rx_rhi_vk/include/rx_rhi_vk/device.h`'s `Device::setPresentMode()`].
++  **Behavioral change from earlier phases:** `Device::create()` used to
++  hand swapchain creation to vk-bootstrap with no present mode requested at
++  all, which meant an *implicit* MAILBOX-if-the-surface-supports-it,
++  else-FIFO preference — nobody in this codebase had actually chosen that,
++  it just fell out of vk-bootstrap's own default. Every `Device` now
++  requests an *explicit* default of FIFO (`on`, the default here) instead,
++  so a plain `--present` run with no `--vsync` flag behaves the same on
++  every machine regardless of what the surface happens to support. Pass
++  `--vsync off` to opt into the uncapped-framerate ladder instead: MAILBOX
++  if the surface supports it, else IMMEDIATE, else FIFO again (with a
++  one-line warning logged, since that silently keeps vsync effectively on
++  despite asking for it off) — whichever this machine's driver/surface
++  combination actually supports. The present mode actually settled on is
++  logged once at startup in `--present` mode (see below); only `--present`
++  mode has anything to apply it to — a plain headless run parses `--vsync`
++  like any other flag but has no visible swapchain for it to affect, so it
++  is silently ignored there.
+ 
+ ### Expected output
+ 
+ **Headless mode** prints one of these lines to the log and exits accordingly
+ — there is no visible window (it's created hidden):
+ 
+ ```
+ [info] triangle readback PASSED
+ ```
+ 
+-**`--present` mode** opens an 800x600 window titled `rx_triangle_sample
++**`--present` mode** logs the present mode actually in use once at startup
++(FIFO unless `--vsync off` resolved to something else — see above):
++
++```
++[info] --present: present mode in use: FIFO
++```
++
++It then opens an 800x600 window titled `rx_triangle_sample
+ (--present)` showing a solid white, upward-pointing triangle centered
+ horizontally in the lower-middle of an otherwise solid black window —
+ roughly:
+ 
+ ```
+ ┌──────────────────────────────┐
+ │                                │
+ │               ▲                │
+ │              ▲ ▲               │
+ │             ▲   ▲              │
+@@ -174,20 +200,23 @@ path:
+   file on disk, deployed next to the binary at build time — see
+   `CMakeLists.txt`). Every ~250ms (~4Hz, a plain `std::filesystem::
+   last_write_time` poll — no file-watcher dependency) it checks whether
+   that file changed on disk; on a change it recompiles via
+   `Compiler::compileFromFile`, and on success swaps in a freshly built
+   pipeline. **On a compile failure, the last-good pipeline keeps
+   rendering** — Slang's diagnostics are logged to the console (the exact
+   error, with source context) and the window never goes blank or crashes
+   because of a shader typo. Not part of `ctest` (interactive by nature) —
+   see `MANUAL_VERIFICATION.md` for the per-platform manual check.
++- **`--vsync on|off`** (default `on`) — same present-mode control as
++  01_triangle's `--vsync` section above; only `--present` mode has a
++  swapchain for it to affect.
+ 
+ ### Editing the shader live
+ 
+ With `--present` running, open the `hotreload.slang` sitting next to the
+ running binary (**not** `samples/02_hotreload/hotreload.slang` in the
+ source tree — that copy is only the template deployed at build time) in
+ any editor and change `fsMain`'s body, e.g.:
+ 
+ ```hlsl
+ [shader("fragment")]
+@@ -216,21 +245,23 @@ because reloads are a rare, human-interactive event, not a per-frame
+ operation, so the stall is invisible in practice.
+ 
+ ### Expected output
+ 
+ **Headless mode**:
+ 
+ ```
+ [info] hotreload headless gate PASSED
+ ```
+ 
+-**`--present` mode** opens an 800x600 window titled `rx_hotreload_sample
++**`--present` mode** logs the present mode actually in use once at startup
++(same `[info] --present: present mode in use: ...` line as 01_triangle
++above), then opens an 800x600 window titled `rx_hotreload_sample
+ (--present)` showing an animated diagonal stripe pattern (orange/blue,
+ shifting continuously via the `time` push constant) covering the whole
+ window. Editing and saving `hotreload.slang` (see above) changes the
+ pattern within ~250ms. Closing the window exits with status 0 and logs:
+ 
+ ```
+ [info] --present: window closed cleanly
+ ```
+ 
+ ### Redistribution
+@@ -279,31 +310,36 @@ never uploaded to) enables correct depth testing across the 5 objects.
+   256x256 with the camera at a fixed, known pose, reads it back, and
+   asserts at least 3 distinct texture colors landed on screen at known
+   probe positions (in practice all 5 textures are distinct and probed).
+   Validation is off by default (see 01_triangle's `--validate` section
+   above); `ctest` registers this case as `sample_03_bindless_mesh_headless`
+   with `--validate` passed explicitly.
+ - **`--present`** — opens a real window showing the same 5 objects (2
+   cubes, 2 spheres, 1 plane) with the camera continuously orbiting the
+   scene. Survives window resizes (the depth buffer is recreated alongside
+   the swapchain). Not part of `ctest` — see `MANUAL_VERIFICATION.md`.
++- **`--vsync on|off`** (default `on`) — same present-mode control as
++  01_triangle's `--vsync` section above; only `--present` mode has a
++  swapchain for it to affect.
+ 
+ ### Expected output
+ 
+ **Headless mode**:
+ 
+ ```
+ [info] 5 distinct texture colors found among 5 probes
+ [info] bindless mesh headless gate PASSED
+ ```
+ 
+-**`--present` mode** opens a 900x700 window titled `rx_bindless_mesh_sample
++**`--present` mode** logs the present mode actually in use once at startup
++(same `[info] --present: present mode in use: ...` line as 01_triangle
++above), then opens a 900x700 window titled `rx_bindless_mesh_sample
+ (--present)` showing 5 objects in a row against a dark background: a
+ red/white checkerboard cube, a blue-to-green gradient cube, a yellow/blue
+ checkerboard sphere, a magenta-to-cyan gradient sphere, and a plane
+ textured with a real decoded PNG (an orange/teal concentric-ring pattern).
+ The camera orbits continuously; closing the window exits with status 0.
+ 
+ ### Redistribution
+ 
+ Same mechanism as 02_hotreload: this sample compiles its shader at runtime
+ (`rx_shader_deploy_runtime_libs()` ships the Slang runtime libs next to the
+@@ -364,31 +400,36 @@ instead, since the grid and camera never move), which
+   frame. Asserts every one of the 24 logical textures was actually
+   observed resident on screen at some point (not just "registered" —
+   the probe reads real rendered pixels). Validation is off by default (see
+   01_triangle's `--validate` section above); `ctest` registers this case as
+   `sample_04_streaming_headless` with `--validate` passed explicitly, which
+   adds the zero-validation-errors assertion that would catch a
+   premature-destroy bug.
+ - **`--present`** — opens a real window showing the same 24-cell grid,
+   static camera, streaming continuing indefinitely at roughly 1
+   texture/second. Not part of `ctest` — see `MANUAL_VERIFICATION.md`.
++- **`--vsync on|off`** (default `on`) — same present-mode control as
++  01_triangle's `--vsync` section above; only `--present` mode has a
++  swapchain for it to affect.
+ 
+ ### Expected output
+ 
+ **Headless mode**:
+ 
+ ```
+ [info] sample_04_streaming: 24 / 24 logical textures observed resident at some point
+ [info] streaming headless gate PASSED
+ ```
+ 
+-**`--present` mode** opens a 900x700 window titled `rx_streaming_sample
++**`--present` mode** logs the present mode actually in use once at startup
++(same `[info] --present: present mode in use: ...` line as 01_triangle
++above), then opens a 900x700 window titled `rx_streaming_sample
+ (--present)` showing up to 8 flat-colored squares arranged across a 6x4
+ grid against a dark background, smoothly cycling through the HSV color
+ wheel as textures stream in and evict roughly once a second — cells light
+ up left-to-right, top-to-bottom as their logical texture becomes resident,
+ and go dark again once evicted. Closing the window exits with status 0.
+ 
+ ### Redistribution
+ 
+ Same mechanism as 02_hotreload/03_bindless_mesh: this sample compiles its
+ shader at runtime (`rx_shader_deploy_runtime_libs()` ships the Slang
+@@ -433,32 +474,37 @@ mirroring `04_streaming`'s own `cellProbePixel()` derivation.
+   camera/light, 3 frames through the graph, readback, and three assertions:
+   a ground-plane pixel inside the cube's analytically-derived shadow
+   footprint is darker than an unshadowed ground pixel by more than 2x; the
+   unshadowed pixel is non-trivially bright; every readback byte is in
+   range (genuinely tonemapped). Validation is off by default (see
+   01_triangle's `--validate` section above); `ctest` registers this case
+   as `sample_05_multipass_headless` with `--validate` passed explicitly.
+ - **`--present`** — opens a real window showing the same scene, with the
+   light continuously orbiting in azimuth (the camera itself never moves).
+   Not part of `ctest` — see `MANUAL_VERIFICATION.md`.
++- **`--vsync on|off`** (default `on`) — same present-mode control as
++  01_triangle's `--vsync` section above; only `--present` mode has a
++  swapchain for it to affect.
+ 
+ ### Expected output
+ 
+ **Headless mode**:
+ 
+ ```
+ [info] shadow probe world=(0.0,2.0) pixel=(128,167) channels=(...) brightness_sum=...
+ [info] lit probe world=(-4.0,-4.0) pixel=(49,49) channels=(...) brightness_sum=...
+ [info] multipass headless gate PASSED
+ ```
+ 
+-**`--present` mode** opens a 900x700 window titled `rx_multipass_sample
++**`--present` mode** logs the present mode actually in use once at startup
++(same `[info] --present: present mode in use: ...` line as 01_triangle
++above), then opens a 900x700 window titled `rx_multipass_sample
+ (--present)` showing a reddish cube and a bluish sphere on a grayish floor,
+ lit from a fixed-elevation directional light whose azimuth continuously
+ orbits — the cube's shadow visibly sweeps across the floor as the light
+ turns. Closing the window exits with status 0.
+ 
+ ### Redistribution
+ 
+ Same mechanism as 02_hotreload/03_bindless_mesh/04_streaming: this sample
+ compiles its shaders at runtime, so it needs the Slang runtime libs
+ deployed next to it (`rx_shader_deploy_runtime_libs()`). Unlike any earlier
+@@ -520,34 +566,39 @@ derivations this makes possible.
+   this project's known SRGB-swapchain-encoding caveat — see
+   `samples/04_streaming`'s own finding). Validation is off by default (see
+   01_triangle's `--validate` section above); `ctest` registers this case as
+   `sample_06_materials_headless` with `--validate` passed explicitly.
+ - **`--present`** — opens a real window showing the same 4 objects with the
+   camera continuously orbiting (azimuth-only), polling `materials/
+   checker.slang` and `materials/rim.slang` for on-disk changes roughly once
+   a second and calling the public `IRxMaterialSystem::reloadChanged()` —
+   02_hotreload's own keep-last-good UX, applied here to materials. Not part
+   of `ctest` — see `MANUAL_VERIFICATION.md`.
++- **`--vsync on|off`** (default `on`) — same present-mode control as
++  01_triangle's `--vsync` section above; only `--present` mode has a
++  swapchain for it to affect.
+ 
+ ### Expected output
+ 
+ **Headless mode**:
+ 
+ ```
+ [info] object 0 (checker) world=(-2.0,1.3,0.0) pixel=(50,77) channels=(...) expected_linear=(255,140,38) matched=true
+ [info] object 1 (checker) world=(2.0,1.3,0.0) pixel=(205,77) channels=(...) expected_linear=(38,217,230) matched=true
+ [info] object 2 (rim) world=(-2.0,-1.3,0.0) pixel=(50,178) channels=(...) expected_linear=(152,50,139) matched=true
+ [info] object 3 (rim) world=(2.0,-1.3,0.0) pixel=(205,178) channels=(...) expected_linear=(152,139,43) matched=true
+ [info] materials headless gate PASSED
+ ```
+ 
+-**`--present` mode** opens a 900x700 window titled `rx_materials_sample
++**`--present` mode** logs the present mode actually in use once at startup
++(same `[info] --present: present mode in use: ...` line as 01_triangle
++above), then opens a 900x700 window titled `rx_materials_sample
+ (--present)` showing an orange checkerboard cube (top-left), a teal
+ checkerboard cube (top-right), a magenta rim-lit sphere (bottom-left), and a
+ golden-yellow rim-lit sphere (bottom-right), with the camera orbiting
+ continuously around the vertical axis. Editing and saving either
+ `checker.slang` or `rim.slang` (the copies deployed next to the running
+ binary, not the ones in the source tree) changes that material's rendering
+ within about a second, with a console log line confirming the reload
+ (`hot-reload of '...' succeeded`); a syntactically broken edit keeps the
+ last-good material rendering instead of crashing. Closing the window exits
+ with status 0 and logs:
+@@ -611,20 +662,24 @@ cmake --preset linux-native
+ cmake --build --preset linux-native
+ ```
+ 
+ ```sh
+ # Headless, end-user default -- validation off, no Vulkan SDK required.
+ # ctest (see below) runs this same headless mode but adds --validate:
+ ./build/linux-native/samples/01_triangle/sample_01_triangle
+ 
+ # Interactive present-mode window:
+ ./build/linux-native/samples/01_triangle/sample_01_triangle --present
++
++# Same, with vsync off -- MAILBOX/IMMEDIATE if the surface supports either,
++# else FIFO again (see the --vsync section above):
++./build/linux-native/samples/01_triangle/sample_01_triangle --present --vsync off
+ ```
+ 
+ ```sh
+ # Headless, end-user default -- validation off, no Vulkan SDK required.
+ # ctest (see below) runs this same headless mode but adds --validate:
+ ./build/linux-native/samples/02_hotreload/sample_02_hotreload
+ 
+ # Interactive present-mode window with live shader editing -- edit
+ # build/linux-native/samples/02_hotreload/hotreload.slang while this runs:
+ ./build/linux-native/samples/02_hotreload/sample_02_hotreload --present
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/device.h b/src/rx_rhi_vk/include/rx_rhi_vk/device.h
+index 395fb51..229b6fd 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/device.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/device.h
+@@ -10,20 +10,40 @@ enum class SwapchainStatus {
+     Ok,
+     NeedsRecreate,
+     DeviceLost,
+ };
+ 
+ struct AcquireResult {
+     SwapchainStatus status;
+     uint32_t imageIndex;
+ };
+ 
++// Present-mode control [Phase 4 Task 6, spec seed 1]. Only two choices are
++// exposed at this layer -- an on/off vsync preference, not a raw
++// VkPresentModeKHR -- because the actual mode is driver/surface-dependent
++// (see Device::setPresentMode()'s own comment for the exact fallback
++// ladder each of these resolves to). Callers that need the concrete mode
++// actually in use (for logging or a HUD) read it back via
++// Device::presentMode() instead of assuming one from this enum.
++enum class PresentMode {
++    VsyncOn,
++    VsyncOff,
++};
++
++// Human-readable name for a VkPresentModeKHR, for logging/HUD use (e.g. a
++// sample printing Device::presentMode() once at startup). Covers every
++// value Device's own present-mode ladder can select (FIFO, MAILBOX,
++// IMMEDIATE) plus FIFO_RELAXED for completeness, with "UNKNOWN" as the
++// fallback for anything else (e.g. the shared-present extension modes this
++// codebase never requests).
++const char* presentModeName(VkPresentModeKHR mode);
++
+ // Device owns the logical VkDevice selected/built against a Context's
+ // vkb::Instance, its graphics and present queues, and a VkSwapchainKHR built
+ // against a caller-provided VkSurfaceKHR.
+ //
+ // Device::create() takes ownership of the VkSurfaceKHR passed to it,
+ // unconditionally: on success the returned Device owns and destroys it
+ // (together with the swapchain and device) on destruction or move-assign;
+ // on failure Device::create destroys the surface itself before returning
+ // std::nullopt. Either way, the caller must not destroy that surface handle
+ // itself once create() has been called with it.
+@@ -61,35 +81,70 @@ public:
+     // whether this one, ordinarily-optional Vulkan extension is live;
+     // rx_rhi_vk/tracy_gpu.h is the sole consumer that gives this fact any
+     // profiling meaning (TracyVkContextCalibrated vs plain TracyVkContext).
+     bool calibratedTimestampsEnabled() const { return calibratedTimestampsEnabled_; }
+ 
+     VkSwapchainKHR swapchain() const { return swapchain_; }
+     const std::vector<VkImage>& swapchainImages() const { return swapchainImages_; }
+     VkFormat swapchainFormat() const { return swapchainFormat_; }
+     VkExtent2D swapchainExtent() const { return swapchainExtent_; }
+ 
++    // Records the present mode this Device should build its NEXT swapchain
++    // against. Does NOT itself touch the live swapchain or recreate
++    // anything -- recreateSwapchain() (the same path every caller already
++    // drives on SwapchainStatus::NeedsRecreate, e.g. a window resize) is
++    // the sole place a present-mode change actually takes effect, per this
++    // task's explicit constraint against inventing a second recreation
++    // flow. A caller that wants the change applied immediately (e.g. a
++    // sample honoring a --vsync flag at startup, before its first frame)
++    // must call recreateSwapchain(surface) itself right after this call.
++    //
++    // The mode actually built is resolved from `mode` against what this
++    // surface/device supports, via the ladder in device.cpp's
++    // selectPresentMode(): VsyncOn always resolves to FIFO (the one
++    // present mode the Vulkan spec guarantees for every surface).
++    // VsyncOff prefers MAILBOX (uncapped, no tearing), then IMMEDIATE
++    // (uncapped, tearing possible), and only falls back to FIFO -- logging
++    // a one-line warning when it does, since that silently keeps vsync
++    // effectively on despite the caller asking for it off -- if this
++    // surface supports neither.
++    void setPresentMode(PresentMode mode);
++
++    // The actual VkPresentModeKHR currently in use, as reported back by
++    // vk-bootstrap after the ladder above resolved the most recent
++    // setPresentMode() request (or, before any setPresentMode() call, the
++    // explicit FIFO default create() builds every Device with -- see that
++    // function's own comment). For logging/HUD use; presentModeName()
++    // above turns this into a readable string.
++    VkPresentModeKHR presentMode() const { return actualPresentMode_; }
++
+     // Acquires the next available swapchain image, signaling `signal` once
+     // it is safe to render into it. VK_SUBOPTIMAL_KHR is treated as success
+     // here: the image is still valid to render into and present, so
+     // recreation is deferred to present()'s return value instead.
+     AcquireResult acquireNextImage(VkSemaphore signal);
+ 
+     // Presents `imageIndex`, waiting on `wait` first unless it is
+     // VK_NULL_HANDLE.
+     SwapchainStatus present(uint32_t imageIndex, VkSemaphore wait);
+ 
+     // Waits for the device to go idle, destroys the current swapchain, and
+     // rebuilds it against `surface` (refreshing images/format/extent).
+     // Does not take ownership of `surface` and does not touch the surface
+     // this Device already owns; in the expected usage the same surface
+     // handle is passed again on every call.
++    //
++    // Also the sole place the present mode most recently recorded via
++    // setPresentMode() is actually applied [Phase 4 Task 6] -- every
++    // caller of this function (resize/NeedsRecreate handling, or a sample
++    // applying --vsync at startup) gets that behavior for free, with no
++    // separate "apply present mode" path to call.
+     bool recreateSwapchain(VkSurfaceKHR surface);
+ 
+ private:
+     Device() = default;
+ 
+     void destroyAll();
+ 
+     VkInstance instance_ = VK_NULL_HANDLE;
+     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
+     VkDevice device_ = VK_NULL_HANDLE;
+@@ -97,13 +152,22 @@ private:
+ 
+     VkQueue graphicsQueue_ = VK_NULL_HANDLE;
+     uint32_t graphicsQueueFamily_ = 0;
+     VkQueue presentQueue_ = VK_NULL_HANDLE;
+     bool calibratedTimestampsEnabled_ = false;
+ 
+     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
+     std::vector<VkImage> swapchainImages_;
+     VkFormat swapchainFormat_ = VK_FORMAT_UNDEFINED;
+     VkExtent2D swapchainExtent_{0, 0};
++
++    // Desired mode recorded by setPresentMode(), consulted by
++    // recreateSwapchain() (and create()'s own equivalent inline logic) the
++    // next time either builds a swapchain. Defaults to VsyncOn to match
++    // create()'s explicit FIFO default -- see that function's comment.
++    PresentMode desiredPresentMode_ = PresentMode::VsyncOn;
++    // What the ladder actually resolved `desiredPresentMode_` to, as
++    // reported back by vk-bootstrap. Returned by presentMode().
++    VkPresentModeKHR actualPresentMode_ = VK_PRESENT_MODE_FIFO_KHR;
+ };
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/device.cpp b/src/rx_rhi_vk/src/device.cpp
+index 181d5ef..52f7559 100644
+--- a/src/rx_rhi_vk/src/device.cpp
++++ b/src/rx_rhi_vk/src/device.cpp
+@@ -1,20 +1,36 @@
+ #include <rx_rhi_vk/device.h>
+ #include <rx_core/log.h>
+ #include <rx_core/profile.h>
+ #include <VkBootstrap.h>
++#include <algorithm>
+ #include <array>
+ #include <utility>
+ #include <vector>
+ 
+ namespace rx::rhi {
+ 
++const char* presentModeName(VkPresentModeKHR mode) {
++    switch (mode) {
++        case VK_PRESENT_MODE_FIFO_KHR:
++            return "FIFO";
++        case VK_PRESENT_MODE_MAILBOX_KHR:
++            return "MAILBOX";
++        case VK_PRESENT_MODE_IMMEDIATE_KHR:
++            return "IMMEDIATE";
++        case VK_PRESENT_MODE_FIFO_RELAXED_KHR:
++            return "FIFO_RELAXED";
++        default:
++            return "UNKNOWN";
++    }
++}
++
+ namespace {
+ 
+ void destroySurface(const Context& context, VkSurfaceKHR surface) {
+     vkb::destroy_surface(context.vkbInstance(), surface);
+ }
+ 
+ // One entry per bit this Device requires from VkPhysicalDeviceVulkan12Features
+ // [Phase 2 spec Fixed decision #5, R:B1/B2] -- kept as a table of
+ // (name, accessor) pairs rather than ten separate `if`s so the "loud
+ // startup error naming the missing feature" diagnostic below and the
+@@ -95,20 +111,71 @@ void logDescriptorIndexingFeatureGaps(VkInstance instance) {
+ 
+     if (!anyGapReported) {
+         RX_LOG_ERROR(
+             "Device::create: physical device selection failed, but every visible device already "
+             "supports all required descriptor-indexing features -- the actual cause is something "
+             "else (surface support, queue families, Vulkan 1.1/1.3 feature requirements, or API "
+             "version)");
+     }
+ }
+ 
++// Present-mode fallback ladder [Phase 4 Task 6, spec seed 1, R:present].
++// Resolves `desired` against the present modes this physical device
++// actually reports supporting for `surface` (queried directly via
++// vkGetPhysicalDeviceSurfacePresentModesKHR, per this task's resolution --
++// VK_KHR_surface is always enabled at instance level by the time this
++// runs, since every Device is built from a real windowing surface, so the
++// function pointer is already loaded by Context::create()'s
++// volkLoadInstance() call).
++//
++// PresentMode::VsyncOn always resolves to FIFO with no query needed: FIFO
++// is the one present mode the Vulkan spec guarantees every surface
++// supports (spec 34.1, "Presentation Mode Support"), so asking the driver
++// first would only ever confirm what the spec already promises.
++//
++// PresentMode::VsyncOff prefers MAILBOX (uncapped framerate, no tearing),
++// then IMMEDIATE (uncapped, tearing possible), and only falls back to
++// FIFO -- logging a one-line warning when it does, since that silently
++// keeps vsync effectively on despite the caller asking for it off -- when
++// this surface supports neither. The returned mode is always one this
++// surface has already been confirmed to support, so the caller can hand
++// it straight to vkb::SwapchainBuilder::set_desired_present_mode()
++// without relying on vk-bootstrap's own (different, undocumented-here)
++// fallback behavior.
++VkPresentModeKHR selectPresentMode(VkPhysicalDevice physicalDevice, VkSurfaceKHR surface, PresentMode desired) {
++    if (desired == PresentMode::VsyncOn) {
++        return VK_PRESENT_MODE_FIFO_KHR;
++    }
++
++    uint32_t modeCount = 0;
++    vkGetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, surface, &modeCount, nullptr);
++    std::vector<VkPresentModeKHR> supportedModes(modeCount);
++    if (modeCount > 0) {
++        vkGetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, surface, &modeCount, supportedModes.data());
++    }
++
++    auto supports = [&supportedModes](VkPresentModeKHR mode) {
++        return std::find(supportedModes.begin(), supportedModes.end(), mode) != supportedModes.end();
++    };
++
++    if (supports(VK_PRESENT_MODE_MAILBOX_KHR)) {
++        return VK_PRESENT_MODE_MAILBOX_KHR;
++    }
++    if (supports(VK_PRESENT_MODE_IMMEDIATE_KHR)) {
++        return VK_PRESENT_MODE_IMMEDIATE_KHR;
++    }
++    RX_LOG_WARN(
++        "Device: PresentMode::VsyncOff requested but this surface supports neither MAILBOX nor IMMEDIATE -- "
++        "falling back to FIFO (vsync stays effectively on)");
++    return VK_PRESENT_MODE_FIFO_KHR;
++}
++
+ }  // namespace
+ 
+ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
+     // shaderDrawParameters (promoted from VK_KHR_shader_draw_parameters to
+     // Vulkan 1.1 core) is required by any HLSL/Slang vertex shader that
+     // reads SV_VertexID: to reproduce HLSL's zero-based SV_VertexID exactly
+     // (unaffected by a nonzero firstVertex/vkCmdDraw base), Slang's SPIR-V
+     // backend emits `gl_VertexIndex - gl_BaseVertex`, which declares
+     // OpCapability DrawParameters and a BaseVertex BuiltIn input -- verified
+     // directly via `spirv-dis` on samples/01_triangle's compiled
+@@ -219,20 +286,33 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
+ 
+     auto presentQueueResult = vkbDevice.get_queue(vkb::QueueType::present);
+     if (!presentQueueResult) {
+         RX_LOG_ERROR("vkb::Device::get_queue(present) failed: {}", presentQueueResult.error().message());
+         vkb::destroy_device(vkbDevice);
+         destroySurface(context, surface);
+         return std::nullopt;
+     }
+ 
+     vkb::SwapchainBuilder swapchainBuilder(vkbDevice, surface);
++    // Present-mode control [Phase 4 Task 6, spec seed 1]: explicit FIFO
++    // default (PresentMode::VsyncOn), not vk-bootstrap's own implicit
++    // preference (MAILBOX if the surface supports it, else FIFO). This is
++    // a BEHAVIORAL CHANGE from every Device built before this task: a
++    // sample that happened to run against a MAILBOX-capable surface
++    // previously got MAILBOX with no code anywhere having chosen it; now
++    // it gets FIFO unless something explicitly opts out via
++    // setPresentMode(PresentMode::VsyncOff) + recreateSwapchain() (see
++    // those methods' own comments) -- e.g. a sample's --vsync off flag.
++    // No availability query is needed for FIFO specifically -- see
++    // selectPresentMode()'s own comment above on why the spec already
++    // guarantees it for every surface.
++    swapchainBuilder.set_desired_present_mode(VK_PRESENT_MODE_FIFO_KHR);
+     auto swapchainResult = swapchainBuilder.build();
+     if (!swapchainResult) {
+         RX_LOG_ERROR("vkb::SwapchainBuilder::build failed: {}", swapchainResult.error().message());
+         vkb::destroy_device(vkbDevice);
+         destroySurface(context, surface);
+         return std::nullopt;
+     }
+     vkb::Swapchain vkbSwapchain = swapchainResult.value();
+ 
+     auto imagesResult = vkbSwapchain.get_images();
+@@ -252,20 +332,24 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
+     dev.graphicsQueue_ = graphicsQueueResult.value();
+     dev.graphicsQueueFamily_ = graphicsQueueIndexResult.value();
+     dev.presentQueue_ = presentQueueResult.value();
+     dev.calibratedTimestampsEnabled_ = calibratedTimestampsEnabled;
+     RX_LOG_INFO("Device::create: VK_EXT_calibrated_timestamps {} on the selected physical device",
+                 calibratedTimestampsEnabled ? "ENABLED" : "not present -- falling back to uncalibrated GPU zones");
+     dev.swapchain_ = vkbSwapchain.swapchain;
+     dev.swapchainImages_ = imagesResult.value();
+     dev.swapchainFormat_ = vkbSwapchain.image_format;
+     dev.swapchainExtent_ = vkbSwapchain.extent;
++    dev.desiredPresentMode_ = PresentMode::VsyncOn;
++    dev.actualPresentMode_ = vkbSwapchain.present_mode;
++    RX_LOG_INFO("Device::create: present mode in use: {} (explicit default, PresentMode::VsyncOn)",
++                presentModeName(dev.actualPresentMode_));
+     return dev;
+ }
+ 
+ Device::Device(Device&& other) noexcept : Device() {
+     *this = std::move(other);
+ }
+ 
+ Device& Device::operator=(Device&& other) noexcept {
+     if (this != &other) {
+         destroyAll();
+@@ -275,33 +359,37 @@ Device& Device::operator=(Device&& other) noexcept {
+         device_ = other.device_;
+         surface_ = other.surface_;
+         graphicsQueue_ = other.graphicsQueue_;
+         graphicsQueueFamily_ = other.graphicsQueueFamily_;
+         presentQueue_ = other.presentQueue_;
+         calibratedTimestampsEnabled_ = other.calibratedTimestampsEnabled_;
+         swapchain_ = other.swapchain_;
+         swapchainImages_ = std::move(other.swapchainImages_);
+         swapchainFormat_ = other.swapchainFormat_;
+         swapchainExtent_ = other.swapchainExtent_;
++        desiredPresentMode_ = other.desiredPresentMode_;
++        actualPresentMode_ = other.actualPresentMode_;
+ 
+         other.instance_ = VK_NULL_HANDLE;
+         other.physicalDevice_ = VK_NULL_HANDLE;
+         other.device_ = VK_NULL_HANDLE;
+         other.surface_ = VK_NULL_HANDLE;
+         other.graphicsQueue_ = VK_NULL_HANDLE;
+         other.graphicsQueueFamily_ = 0;
+         other.presentQueue_ = VK_NULL_HANDLE;
+         other.calibratedTimestampsEnabled_ = false;
+         other.swapchain_ = VK_NULL_HANDLE;
+         other.swapchainImages_.clear();
+         other.swapchainFormat_ = VK_FORMAT_UNDEFINED;
+         other.swapchainExtent_ = VkExtent2D{0, 0};
++        other.desiredPresentMode_ = PresentMode::VsyncOn;
++        other.actualPresentMode_ = VK_PRESENT_MODE_FIFO_KHR;
+     }
+     return *this;
+ }
+ 
+ Device::~Device() {
+     destroyAll();
+ }
+ 
+ void Device::destroyAll() {
+     if (swapchain_ != VK_NULL_HANDLE) {
+@@ -363,20 +451,27 @@ SwapchainStatus Device::present(uint32_t imageIndex, VkSemaphore wait) {
+             return SwapchainStatus::NeedsRecreate;
+         case VK_ERROR_DEVICE_LOST:
+             RX_LOG_ERROR("vkQueuePresentKHR: device lost");
+             return SwapchainStatus::DeviceLost;
+         default:
+             RX_LOG_ERROR("vkQueuePresentKHR failed: VkResult={}", static_cast<int>(result));
+             return SwapchainStatus::NeedsRecreate;
+     }
+ }
+ 
++void Device::setPresentMode(PresentMode mode) {
++    // See this method's own header comment: this only records `mode` for
++    // the next recreateSwapchain() call to apply -- no swapchain touched
++    // here, no second recreation flow invented.
++    desiredPresentMode_ = mode;
++}
++
+ bool Device::recreateSwapchain(VkSurfaceKHR surface) {
+     if (surface != surface_) {
+         // Not necessarily wrong (a caller could legitimately be handing
+         // this Device a brand-new surface), but the intended/expected usage
+         // is to pass the same surface handle back on every call -- this
+         // Device does not take ownership of `surface` here and will not
+         // destroy the previously-owned one, so silently swapping it in
+         // could leak the old surface if that wasn't the caller's intent.
+         RX_LOG_WARN(
+             "Device::recreateSwapchain: surface handle changed (previously owned {}, now given {}); the "
+@@ -385,34 +480,51 @@ bool Device::recreateSwapchain(VkSurfaceKHR surface) {
+     }
+ 
+     vkDeviceWaitIdle(device_);
+ 
+     if (swapchain_ != VK_NULL_HANDLE) {
+         vkDestroySwapchainKHR(device_, swapchain_, nullptr);
+         swapchain_ = VK_NULL_HANDLE;
+     }
+     swapchainImages_.clear();
+ 
++    // Present-mode control [Phase 4 Task 6]: resolve the mode most
++    // recently recorded via setPresentMode() (VsyncOn by default, matching
++    // create()'s own default) against what this surface actually supports
++    // -- see selectPresentMode()'s comment for the exact ladder -- and
++    // hand the already-verified-available result straight to
++    // set_desired_present_mode(). This is the sole place that ladder
++    // executes for a live Device: create() above inlines the VsyncOn-only
++    // half of it (no query needed for FIFO), and every present-mode change
++    // after creation, whether from a real resize/NeedsRecreate or a
++    // caller-driven setPresentMode() + recreateSwapchain() pair, flows
++    // through here.
++    VkPresentModeKHR selectedPresentMode = selectPresentMode(physicalDevice_, surface, desiredPresentMode_);
++
+     vkb::SwapchainBuilder swapchainBuilder(physicalDevice_, device_, surface);
++    swapchainBuilder.set_desired_present_mode(selectedPresentMode);
+     auto swapchainResult = swapchainBuilder.build();
+     if (!swapchainResult) {
+         RX_LOG_ERROR("vkb::SwapchainBuilder::build failed during recreate: {}", swapchainResult.error().message());
+         return false;
+     }
+     vkb::Swapchain vkbSwapchain = swapchainResult.value();
+ 
+     auto imagesResult = vkbSwapchain.get_images();
+     if (!imagesResult) {
+         RX_LOG_ERROR("vkb::Swapchain::get_images failed during recreate: {}", imagesResult.error().message());
+         vkb::destroy_swapchain(vkbSwapchain);
+         return false;
+     }
+ 
+     swapchain_ = vkbSwapchain.swapchain;
+     swapchainImages_ = imagesResult.value();
+     swapchainFormat_ = vkbSwapchain.image_format;
+     swapchainExtent_ = vkbSwapchain.extent;
+     surface_ = surface;
++    actualPresentMode_ = vkbSwapchain.present_mode;
++    RX_LOG_INFO("Device::recreateSwapchain: present mode in use: {} ({})", presentModeName(actualPresentMode_),
++                desiredPresentMode_ == PresentMode::VsyncOn ? "PresentMode::VsyncOn" : "PresentMode::VsyncOff");
+     return true;
+ }
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/tests/device_test.cpp b/src/rx_rhi_vk/tests/device_test.cpp
+index 8d3d5b1..ed36c09 100644
+--- a/src/rx_rhi_vk/tests/device_test.cpp
++++ b/src/rx_rhi_vk/tests/device_test.cpp
+@@ -167,10 +167,154 @@ TEST_CASE("Device acquire/present round-trip succeeds without device loss") {
+     // fully idle before tearing down.
+     vkDeviceWaitIdle(vkDevice);
+ 
+     vkDestroyCommandPool(vkDevice, commandPool, nullptr);
+     vkDestroyFence(vkDevice, submitFence, nullptr);
+     vkDestroySemaphore(vkDevice, renderFinishedSemaphore, nullptr);
+     vkDestroySemaphore(vkDevice, acquireSemaphore, nullptr);
+ 
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
++
++// Present-mode control [Phase 4 Task 6, spec seed 1]. Same fixture and same
++// acquire/record/submit/present shape as the round-trip test directly
++// above -- including its fixed COLOR_ATTACHMENT_OUTPUT barrier srcStage,
++// which matters here for exactly the reason that test's own comment gives:
++// a TOP_OF_PIPE-sourced layout transition is not ordered by the acquire
++// semaphore's wait and would race the acquire under synchronization
++// validation. This test drives that same shape against a swapchain that
++// has gone through Device::setPresentMode()/recreateSwapchain() rather
++// than the one straight out of Device::create(), which is the one thing
++// it adds.
++TEST_CASE("Device present-mode ladder: VsyncOn is FIFO; VsyncOff recreates cleanly to an available mode") {
++    auto fixture = makeFixture("rx_rhi_vk_device_test_present_mode");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto device = rx::rhi::Device::create(fixture->context, fixture->surface);
++    REQUIRE(device.has_value());
++
++    // Creation-time default [Task 6]: explicit FIFO under
++    // PresentMode::VsyncOn -- replacing vk-bootstrap's previous implicit
++    // MAILBOX-if-available preference. See device.cpp's Device::create()
++    // comment at its swapchain-builder call site.
++    CHECK(device->presentMode() == VK_PRESENT_MODE_FIFO_KHR);
++
++    // setPresentMode() only records the request; recreateSwapchain() (the
++    // very same NeedsRecreate path a real window resize already drives) is
++    // what actually applies it -- no second recreation flow exists to call
++    // instead.
++    device->setPresentMode(rx::rhi::PresentMode::VsyncOff);
++    REQUIRE(device->recreateSwapchain(fixture->surface));
++
++    // The ladder's CONTRACT, not a specific optional mode: under
++    // Xvfb/lavapipe (this project's CI GPU) only FIFO may actually be
++    // reported available for this surface, in which case the ladder's own
++    // documented fallback (MAILBOX -> IMMEDIATE -> FIFO-with-warning,
++    // device.cpp's selectPresentMode()) is exactly what gets exercised
++    // here and FIFO is the correct, expected outcome -- not a failure. A
++    // driver/surface that does support MAILBOX or IMMEDIATE instead
++    // resolves to one of those. Either way the result must be one of these
++    // three; nothing else is a valid ladder output.
++    const VkPresentModeKHR actualAfterVsyncOff = device->presentMode();
++    CHECK((actualAfterVsyncOff == VK_PRESENT_MODE_MAILBOX_KHR ||
++           actualAfterVsyncOff == VK_PRESENT_MODE_IMMEDIATE_KHR ||
++           actualAfterVsyncOff == VK_PRESENT_MODE_FIFO_KHR));
++
++    VkDevice vkDevice = device->device();
++
++    VkSemaphoreCreateInfo semaphoreInfo{};
++    semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
++    VkSemaphore acquireSemaphore = VK_NULL_HANDLE;
++    VkSemaphore renderFinishedSemaphore = VK_NULL_HANDLE;
++    REQUIRE(vkCreateSemaphore(vkDevice, &semaphoreInfo, nullptr, &acquireSemaphore) == VK_SUCCESS);
++    REQUIRE(vkCreateSemaphore(vkDevice, &semaphoreInfo, nullptr, &renderFinishedSemaphore) == VK_SUCCESS);
++
++    VkFenceCreateInfo fenceInfo{};
++    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
++    VkFence submitFence = VK_NULL_HANDLE;
++    REQUIRE(vkCreateFence(vkDevice, &fenceInfo, nullptr, &submitFence) == VK_SUCCESS);
++
++    // Throwaway command pool/buffer, local to this test -- same rationale
++    // as the round-trip test above.
++    VkCommandPoolCreateInfo poolInfo{};
++    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
++    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
++    poolInfo.queueFamilyIndex = device->graphicsQueueFamily();
++    VkCommandPool commandPool = VK_NULL_HANDLE;
++    REQUIRE(vkCreateCommandPool(vkDevice, &poolInfo, nullptr, &commandPool) == VK_SUCCESS);
++
++    VkCommandBufferAllocateInfo cmdAllocInfo{};
++    cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
++    cmdAllocInfo.commandPool = commandPool;
++    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++    cmdAllocInfo.commandBufferCount = 1;
++    VkCommandBuffer cmd = VK_NULL_HANDLE;
++    REQUIRE(vkAllocateCommandBuffers(vkDevice, &cmdAllocInfo, &cmd) == VK_SUCCESS);
++
++    auto acquire = device->acquireNextImage(acquireSemaphore);
++    REQUIRE(acquire.status == rx::rhi::SwapchainStatus::Ok);
++
++    VkCommandBufferBeginInfo beginInfo{};
++    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++    REQUIRE(vkBeginCommandBuffer(cmd, &beginInfo) == VK_SUCCESS);
++
++    // No rendering happens in this test -- just the mandatory
++    // UNDEFINED -> PRESENT_SRC_KHR layout transition every acquired image
++    // needs before it can be presented.
++    VkImageMemoryBarrier barrier{};
++    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++    barrier.srcAccessMask = 0;
++    barrier.dstAccessMask = 0;
++    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
++    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barrier.image = device->swapchainImages()[acquire.imageIndex];
++    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    barrier.subresourceRange.baseMipLevel = 0;
++    barrier.subresourceRange.levelCount = 1;
++    barrier.subresourceRange.baseArrayLayer = 0;
++    barrier.subresourceRange.layerCount = 1;
++
++    // srcStage must be COLOR_ATTACHMENT_OUTPUT -- the same stage the submit
++    // below waits the acquire semaphore at. See the round-trip test above
++    // for the full rationale (a TOP_OF_PIPE-sourced layout transition is
++    // NOT ordered by that wait and races the acquire under synchronization
++    // validation).
++    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
++                         nullptr, 0, nullptr, 1, &barrier);
++
++    REQUIRE(vkEndCommandBuffer(cmd) == VK_SUCCESS);
++
++    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++    VkSubmitInfo submitInfo{};
++    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
++    submitInfo.waitSemaphoreCount = 1;
++    submitInfo.pWaitSemaphores = &acquireSemaphore;
++    submitInfo.pWaitDstStageMask = &waitStage;
++    submitInfo.commandBufferCount = 1;
++    submitInfo.pCommandBuffers = &cmd;
++    submitInfo.signalSemaphoreCount = 1;
++    submitInfo.pSignalSemaphores = &renderFinishedSemaphore;
++
++    REQUIRE(vkQueueSubmit(device->graphicsQueue(), 1, &submitInfo, submitFence) == VK_SUCCESS);
++    REQUIRE(vkWaitForFences(vkDevice, 1, &submitFence, VK_TRUE, UINT64_MAX) == VK_SUCCESS);
++
++    auto presentStatus = device->present(acquire.imageIndex, renderFinishedSemaphore);
++    CHECK(presentStatus != rx::rhi::SwapchainStatus::DeviceLost);
++
++    // Same ordering rationale as the round-trip test above: never destroy a
++    // semaphore the presentation engine might still be consuming without an
++    // idle/fence guarantee first.
++    vkDeviceWaitIdle(vkDevice);
++
++    vkDestroyCommandPool(vkDevice, commandPool, nullptr);
++    vkDestroyFence(vkDevice, submitFence, nullptr);
++    vkDestroySemaphore(vkDevice, renderFinishedSemaphore, nullptr);
++    vkDestroySemaphore(vkDevice, acquireSemaphore, nullptr);
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}

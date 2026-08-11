@@ -1,0 +1,1053 @@
+# Review package: f9d0554..bcb58b8
+
+## Commits
+bcb58b8 feat: adopt enkiTS as the engine task scheduler (rx_task) + threading contract doc
+
+## Files changed
+ CMakeLists.txt                                     |   7 +
+ docs/threading.md                                  | 115 +++++++++
+ .../include/rx_material/material_system.h          |   3 +
+ src/rx_rhi_vk/include/rx_rhi_vk/bindless.h         |   2 +
+ src/rx_rhi_vk/include/rx_rhi_vk/deletion_queue.h   |   2 +
+ src/rx_rhi_vk/include/rx_rhi_vk/upload.h           |   3 +
+ src/rx_task/CMakeLists.txt                         |  18 ++
+ src/rx_task/include/rx_task/scheduler.h            | 149 ++++++++++++
+ src/rx_task/scheduler.cpp                          | 227 ++++++++++++++++++
+ src/rx_task/tests/CMakeLists.txt                   |   9 +
+ src/rx_task/tests/doctest_main.cpp                 |   6 +
+ src/rx_task/tests/scheduler_test.cpp               | 261 +++++++++++++++++++++
+ third_party/CMakeLists.txt                         |  47 ++++
+ 13 files changed, 849 insertions(+)
+
+## Diff
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 95c7071..dc8a6e2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -6,20 +6,27 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+ 
+ enable_testing()
+ 
+ add_subdirectory(third_party)
+ 
+ include(tools/fetch_slang.cmake)
+ add_subdirectory(shaders)
+ 
+ add_subdirectory(src/rx_core)
++# rx_task: the engine's sole task scheduler wrapper [spec D2, Phase 4
++# Stage 0 Task 2] -- device-free, depends only on rx_core (logging) +
++# enkiTS (third_party/CMakeLists.txt). Added here, independent of the
++# rx_platform/rx_shader/rx_rhi_vk/rx_graph/rx_material chain below: nothing
++# in this task's scope links rx_task yet (Task 7/12 are the first
++# consumers), and nothing it depends on requires any of those libraries.
++add_subdirectory(src/rx_task)
+ add_subdirectory(src/rx_platform)
+ # rx_shader before rx_rhi_vk: rx_rhi_vk's PipelineLayoutBuilder
+ # (pipeline_layout.h) links rx_shader's `rx_shader_layout_types` INTERFACE
+ # target (defined in src/rx_shader/CMakeLists.txt) to get
+ # ShaderLayoutInfo's header without slang::slang -- defining that target
+ # before the directory that consumes it removes any doubt about
+ # add_subdirectory ordering, even though target_link_libraries against a
+ # not-yet-defined target name is otherwise fine in modern CMake.
+ add_subdirectory(src/rx_shader)
+ add_subdirectory(src/rx_rhi_vk)
+diff --git a/docs/threading.md b/docs/threading.md
+new file mode 100644
+index 0000000..f5a43c2
+--- /dev/null
++++ b/docs/threading.md
+@@ -0,0 +1,115 @@
++# RendererX Threading Contract (D5)
++
++Phase 4 introduces the engine's first real multi-threaded work (parallel
++asset import/decode, parallel culling and draw-list building, parallel
++secondary command recording) via `rx::task::Scheduler`
++(`src/rx_task/include/rx_task/scheduler.h`), the engine's sole task
++scheduler [spec D2]. This document is the contract every subsystem —
++existing and future — is held to as that work lands, and it is what every
++new public header's one-line thread-affinity note (see the rule at the
++bottom of this file) points back to.
++
++## The rule
++
++**GPU-object mutation stays main-thread-only.** None of the subsystems
++listed below grow locks in Phase 4. Workers do pure CPU work and hand
++results back to the main thread through `rx::task::Scheduler`'s
++`postToMain()`/`pumpMain()` handoff. This is a deliberate, explicit scoping
++decision, not an oversight: retrofitting concurrency into already-reviewed
++Phase 2/3 subsystems is high-risk and low-need for what Phase 4 actually
++requires, and the handoff pattern below fully serves every asset-loading
++use case this phase has. Truly concurrent GPU-object creation (e.g. several
++threads each submitting to their own queue) is a streaming-phase design,
++explicitly deferred.
++
++## Main-thread-only
++
++Call these ONLY from the thread that owns the `VkDevice`/render loop (in
++`rx::task::Scheduler` terms: the thread that called `Scheduler::create()`,
++i.e. the thread that also calls `pumpMain()`):
++
++- **`rx::rhi::BindlessTable`** — `registerSampledImage()`/
++  `registerSampler()`/`registerStorageBuffer()`/`release()`
++  (`src/rx_rhi_vk/include/rx_rhi_vk/bindless.h`)
++- **`rx::rhi::Uploader`** — `uploadToBuffer()`/`uploadToImage()`/`flush()`
++  (`src/rx_rhi_vk/include/rx_rhi_vk/upload.h`)
++- **`rx::material::MaterialSystem`** — `loadMaterial()`/`getPipeline()`
++  (and every other method on this type — it is not internally
++  synchronized at all, matching `rx::graph::RenderGraph`/`Executor`'s
++  existing scoping)
++  (`src/rx_material/include/rx_material/material_system.h`)
++- **`rx::rhi::DeletionQueue`** — `retire()`/`onFrameFenceSignaled()`/
++  `flushAll()` (`src/rx_rhi_vk/include/rx_rhi_vk/deletion_queue.h`)
++- **`rx::asset::GeometryPool`** (future, Stage 1) — suballocation is a
++  main-thread-owned `VmaVirtualBlock` operation, same rationale as the
++  four above.
++- **`rx::scene::*Manager` registries** (future, Stage 2) —
++  `RenderableManager`/`TransformManager`/`LightManager` mutation
++  (create/set/destroy) stays main-thread-only; read-only SoA traversal for
++  culling (below) does not.
++
++## Worker-allowed
++
++Safe to run on any `rx::task::Scheduler` worker (inside a `parallelFor()`
++chunk) or the dedicated IO thread (`runOnIoThread()`):
++
++- Pure CPU transforms (matrix math, AABB computation, skinning-data
++  parsing/preservation).
++- Parse/decode/transcode/optimize (fastgltf parsing, libktx Basis
++  transcode, meshoptimizer passes, MikkTSpace tangent generation — Stage
++  1).
++- Culling (frustum/shadow-caster AABB tests over SoA bounds — Stage 2).
++- Secondary command-buffer recording into a **per-thread, per-frame-in-
++  flight command pool** — Task 7 forward-reference: one `VkCommandPool`
++  per worker thread per frame-in-flight slot, reset as a whole pool once
++  per frame, never touched by more than one thread at a time (a
++  `VkCommandPool` is not internally synchronized — allocating/recording
++  from the same pool on two threads concurrently is a Vulkan spec
++  violation, not merely a performance concern). Each secondary buffer is
++  recorded start-to-finish on the single worker thread that owns its
++  pool; only the primary command buffer (main-thread-only, above) calls
++  `vkCmdExecuteCommands()` to stitch them into the frame.
++
++## The handoff pattern
++
++Workers never call into a main-thread-only API directly. Instead:
++
++```cpp
++// On a worker (inside a parallelFor() chunk, or runOnIoThread()):
++auto decoded = decodeTexture(bytes);           // pure CPU work
++scheduler->postToMain([decoded = std::move(decoded), &bindless, &uploader] {
++  // Runs later, on the main thread, when it calls pumpMain().
++  uploader.uploadToImage(texture, decoded.pixels, decoded.byteSize, /*generateMips=*/true);
++  bindless.registerSampledImage(texture.view(), texture.layout());
++});
++
++// Once per frame, on the main thread (the frame loop's own pump point):
++scheduler->pumpMain();
++```
++
++`runOnIoThread()` is the other half of the same pattern for the
++blocking-I/O side specifically (file reads, decode-adjacent syscalls that
++would otherwise stall a `parallelFor()` worker): it runs `fn` on the
++scheduler's one dedicated IO thread, FIFO, off the main thread and off
++every `parallelFor()` worker — see `scheduler.h`'s own doc comments for
++exactly how enkiTS's `IPinnedTask` mechanism backs it. A worker (or the IO
++thread itself) doing I/O-adjacent work still finishes by calling
++`postToMain()` for whatever step actually needs to touch the GPU-object
++APIs above.
++
++## Every new public header carries a one-line thread-affinity note
++
++Per D5: any header added or touched from Phase 4 onward that exposes a
++main-thread-only or worker-allowed API gets a one-line comment near its
++class/function declaration pointing back to this file, e.g.:
++
++```cpp
++// Thread-affinity (D5, Phase 4): retire()/onFrameFenceSignaled()/flushAll()
++// are main-thread-only -- see docs/threading.md.
++class DeletionQueue {
++```
++
++This is deliberately terse (one line, not a restatement of this whole
++document) — the point is that a reader hits a pointer to the actual
++contract at the point of use, not a duplicate copy of it that can drift out
++of sync.
+diff --git a/src/rx_material/include/rx_material/material_system.h b/src/rx_material/include/rx_material/material_system.h
+index 92facde..012e468 100644
+--- a/src/rx_material/include/rx_material/material_system.h
++++ b/src/rx_material/include/rx_material/material_system.h
+@@ -121,20 +121,23 @@ namespace detail {
+ // cache -- a shallow copy/move could not safely duplicate or hand off);
+ // always held via the std::unique_ptr create() returns, matching
+ // rx::graph::Executor's and rx::graph::RenderGraph's own established
+ // pattern in this codebase.
+ //
+ // Not internally synchronized -- like rx::graph::RenderGraph/Executor,
+ // callers using one MaterialSystem instance from more than one thread must
+ // serialize their own access to it. This is a deliberate, explicit scoping
+ // decision consistent with this codebase's existing device-object
+ // wrappers, not an oversight.
++//
++// Thread-affinity (D5, Phase 4): loadMaterial()/getPipeline() (and every
++// other method here) are main-thread-only -- see docs/threading.md.
+ class MaterialSystem {
+ public:
+     // Saves this instance's VkPipelineCache to the path passed to create()
+     // (best-effort -- a write failure is logged, never fatal, mirroring
+     // create()'s own best-effort LOAD of that same file), then destroys
+     // every VkPipeline/VkShaderModule/VkDescriptorSetLayout/VkPipelineLayout/
+     // VkPipelineCache this instance owns. Waits for the device to go idle
+     // first (matching rx::graph::Executor::~Executor()'s own
+     // vkDeviceWaitIdle-before-destroying-anything discipline).
+     ~MaterialSystem();
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/bindless.h b/src/rx_rhi_vk/include/rx_rhi_vk/bindless.h
+index e872d6c..3d98f84 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/bindless.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/bindless.h
+@@ -139,20 +139,22 @@ private:
+ //
+ // Separately: neither flag makes it safe to destroy the GPU resource a
+ // slot's descriptor still points at while a command buffer that might
+ // read that slot could still be in flight. Guaranteeing that (deferring
+ // the real resource destruction until the owning frame's fence has
+ // signaled) is explicitly out of scope for this type -- it is Task 4's
+ // DeletionQueue's job. Callers must not destroy a registered resource,
+ // nor treat release() as a synchronization point for it, until they know
+ // (via DeletionQueue or an equivalent fence wait) that no in-flight frame
+ // can still reference that slot.
++// Thread-affinity (D5, Phase 4): registerSampledImage()/registerSampler()/
++// registerStorageBuffer()/release() are main-thread-only -- see docs/threading.md.
+ class BindlessTable {
+ public:
+     struct Capacities {
+         uint32_t sampledImages = 0;
+         uint32_t samplers = 0;
+         uint32_t storageBuffers = 0;
+     };
+ 
+     static constexpr uint32_t kSampledImageBinding = 0;
+     static constexpr uint32_t kSamplerBinding = 1;
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/deletion_queue.h b/src/rx_rhi_vk/include/rx_rhi_vk/deletion_queue.h
+index e77b5e9..d834a47 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/deletion_queue.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/deletion_queue.h
+@@ -49,20 +49,22 @@ namespace rx::rhi {
+ // `[buf = std::move(someBuffer)] {}`) has an implicitly-deleted copy
+ // constructor, which fails to compile the moment it is handed to
+ // `std::function<void()>` -- not a DeletionQueue bug, a real, standard
+ // `std::function` requirement. The standard fix -- used throughout this
+ // engine's own tests -- is to wrap the moved-in resource in a
+ // `std::shared_ptr` first (`std::make_shared<Buffer>(std::move(buffer))`),
+ // which IS copyable (the shared_ptr, not the Buffer inside it), and whose
+ // own destructor still runs the underlying Vulkan teardown exactly once
+ // when the last reference (here, always exactly one: the retired
+ // std::function itself) is dropped.
++// Thread-affinity (D5, Phase 4): retire()/onFrameFenceSignaled()/flushAll()
++// are main-thread-only -- see docs/threading.md.
+ class DeletionQueue {
+ public:
+     DeletionQueue() = default;
+     DeletionQueue(DeletionQueue&&) noexcept = default;
+     DeletionQueue& operator=(DeletionQueue&&) noexcept = default;
+     DeletionQueue(const DeletionQueue&) = delete;
+     DeletionQueue& operator=(const DeletionQueue&) = delete;
+ 
+     // Destructor contract (load-bearing, not a style note, mirroring
+     // FrameSync's own destructor contract in frame_sync.h): destroying a
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/upload.h b/src/rx_rhi_vk/include/rx_rhi_vk/upload.h
+index b213ee2..586457c 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/upload.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/upload.h
+@@ -78,20 +78,23 @@ class Texture2D;
+ // If a single ring-staged upload's write position would run past the
+ // ring buffer's end before the pending batch is flushed, this Uploader
+ // transparently calls flush() itself first (submitting + waiting on
+ // everything recorded so far, which frees the whole ring buffer for
+ // reuse since flush() is synchronous) and then continues writing from
+ // offset 0 -- callers never need to reason about ring-buffer capacity
+ // themselves unless a single upload's size exceeds the ring buffer's
+ // total capacity, which fails cleanly (logged, returns false) rather
+ // than silently corrupting anything. This never applies to a
+ // direct-path buffer upload, which never touches the ring at all.
++//
++// Thread-affinity (D5, Phase 4): uploadToBuffer()/uploadToImage()/flush()
++// are main-thread-only -- see docs/threading.md.
+ class Uploader {
+ public:
+     Uploader(Uploader&&) noexcept;
+     Uploader& operator=(Uploader&&) noexcept;
+     Uploader(const Uploader&) = delete;
+     Uploader& operator=(const Uploader&) = delete;
+ 
+     // Auto-flushes any pending (recorded-but-not-yet-submitted) uploads
+     // before tearing down the ring buffer/command pool/fence, so a
+     // caller that forgets an explicit final flush() never silently loses
+diff --git a/src/rx_task/CMakeLists.txt b/src/rx_task/CMakeLists.txt
+new file mode 100644
+index 0000000..c138463
+--- /dev/null
++++ b/src/rx_task/CMakeLists.txt
+@@ -0,0 +1,18 @@
++# rx_task: the engine's sole task scheduler wrapper [spec D2] -- a thin
++# rx::task::Scheduler around enkiTS (third_party/CMakeLists.txt's
++# enkiTS::enkiTS, pinned v1.12, zlib license), entirely hidden behind a
++# pimpl (scheduler.cpp) so this library's own PUBLIC header
++# (include/rx_task/scheduler.h) names no enkiTS type at all -- see that
++# header's own comment for why. Device-free: no Vulkan, no rx_rhi_vk.
++# Links rx_core for RX_LOG_INFO only (Scheduler::Scheduler() logs its
++# resolved worker/IO-thread accounting once at construction) -- nothing
++# else in this task's scope consumes rx_task yet (brief: "Zero integration
++# into the frame loop yet -- no existing library/sample links rx_task in
++# this task").
++add_library(rx_task STATIC
++    scheduler.cpp
++)
++target_include_directories(rx_task PUBLIC include)
++target_link_libraries(rx_task PUBLIC rx_core PRIVATE enkiTS::enkiTS)
++
++add_subdirectory(tests)
+diff --git a/src/rx_task/include/rx_task/scheduler.h b/src/rx_task/include/rx_task/scheduler.h
+new file mode 100644
+index 0000000..d4509eb
+--- /dev/null
++++ b/src/rx_task/include/rx_task/scheduler.h
+@@ -0,0 +1,149 @@
++#pragma once
++#include <cstdint>
++#include <functional>
++#include <memory>
++
++namespace rx::task {
++
++// rx::task::Scheduler -- the engine's single task scheduler [spec D2]:
++// thinly wraps enki::TaskScheduler (zlib, pinned at v1.12 -- see
++// third_party/CMakeLists.txt's own comment for the vendoring rationale)
++// entirely inside scheduler.cpp's private Impl below, so this header never
++// names an enki type at all. That is deliberate, not incidental: D2 chose
++// enkiTS over Taskflow as the SOLE engine scheduler but explicitly wants
++// the dependency to stay swappable, and a caller of this header never
++// needs enkiTS's own include directory or any of its types to use a
++// Scheduler.
++//
++// THREAD-AFFINITY (D5; see docs/threading.md for the full contract this
++// header is one instance of): create() must be called on the thread that
++// will act as this Scheduler's "main" thread for its entire lifetime --
++// that same thread (and ONLY that thread) may call parallelFor() and
++// pumpMain(). postToMain() and runOnIoThread() are safe to call from any
++// thread, including from inside a parallelFor() chunk callback or from the
++// dedicated IO thread itself.
++//
++// One Scheduler per application process is the intended usage (D2: "one
++// per app"); nothing here enforces that as a singleton, but constructing
++// more than one competes needlessly for the same hardware threads.
++class Scheduler {
++ public:
++  // Creates and Initialize()s the underlying task scheduler. Must be
++  // called from the thread that will subsequently be this Scheduler's
++  // "main" thread (see the class comment) -- enkiTS registers whichever
++  // thread calls its Initialize() as internal thread 0, and this factory
++  // calls that from the calling thread directly, on purpose, so "the
++  // thread that called create()" and "enkiTS's main-participating thread"
++  // are always the same thread.
++  //
++  // `workerCount` is the number of background worker threads that
++  // participate in parallelFor() work-stealing, IN ADDITION to the
++  // calling/main thread (which also participates -- see parallelFor()) and
++  // the single dedicated IO thread runOnIoThread() uses (which never runs
++  // parallelFor() work -- see that method). Passing 0 resolves to
++  // `std::thread::hardware_concurrency() - 1`, clamped to a minimum of 1
++  // (so a Scheduler always has at least one background worker even on a
++  // reported-2-hardware-thread machine). workerCount() below returns the
++  // resolved value.
++  //
++  // Returns nullptr if the underlying scheduler failed to start (out-of-
++  // memory or a platform thread-creation failure only -- there is no
++  // recoverable configuration-error path here).
++  static std::unique_ptr<Scheduler> create(uint32_t workerCount = 0);
++
++  // Shuts the underlying task scheduler down: requests shutdown, wakes and
++  // joins every worker thread (including the dedicated IO thread's pinned-
++  // task loop) and only then returns. Safe even with pending
++  // postToMain()/runOnIoThread() work still queued (it is simply dropped,
++  // matching a normal application-teardown expectation -- this is not a
++  // drain-to-completion operation).
++  ~Scheduler();
++
++  Scheduler(const Scheduler&) = delete;
++  Scheduler& operator=(const Scheduler&) = delete;
++  Scheduler(Scheduler&&) = delete;
++  Scheduler& operator=(Scheduler&&) = delete;
++
++  // Blocking fan-out over the half-open range [0, itemCount): splits it
++  // into contiguous chunks of at least `grainSize` items (enkiTS's own
++  // "min range" / grain-size concept -- the last chunk may be smaller than
++  // `grainSize` if itemCount is not a multiple of it) and calls `fn` once
++  // per chunk with that chunk's [begin, end) and the index of whichever
++  // worker executed it. Returns only once every chunk has run.
++  //
++  // THE CALLING THREAD PARTICIPATES: this is enkiTS's documented default
++  // behavior (TaskScheduler::WaitforTask() runs pending chunks itself
++  // while it blocks), not an accident of this wrapper -- a single-item
++  // parallelFor() on a Scheduler with zero background workers still runs
++  // `fn` exactly once, on the calling thread, with no background thread
++  // involved at all. `workerIndex` values therefore include the calling
++  // thread's own index (0) alongside every background worker's index;
++  // this wrapper draws no distinction between them in the callback.
++  //
++  // Safe to call reentrantly from within a chunk callback (a "nested"
++  // parallelFor()) -- the inner call's WaitforTask() participates in
++  // running the OUTER task's remaining chunks too while it waits, which is
++  // exactly what makes this safe rather than a deadlock: enkiTS's task
++  // pipe has no notion of "this thread already owns an outer wait", so a
++  // nested call is just another task the same machinery drains.
++  //
++  // Must be called from this Scheduler's main thread (see the class
++  // comment) or from within a task already running on one of this
++  // Scheduler's own threads (worker or nested-parallelFor call) -- never
++  // from an unrelated thread that never registered with this Scheduler.
++  void parallelFor(uint32_t itemCount, uint32_t grainSize,
++                    std::function<void(uint32_t begin, uint32_t end, uint32_t workerIndex)> fn);
++
++  // Enqueues `fn` to run, later, on this Scheduler's single dedicated IO
++  // thread -- never on a parallelFor() worker, and never on the calling
++  // thread itself (unless the calling thread happens to BE the IO thread,
++  // e.g. an IO task itself queuing a follow-up IO task). Calls are
++  // executed strictly FIFO relative to each other, in the order
++  // runOnIoThread() was called (enkiTS's own pinned-task list guarantees
++  // this -- see scheduler.cpp for exactly how). Safe to call from any
++  // thread, including concurrently from several threads at once and from
++  // within a parallelFor() chunk or a postToMain() callback.
++  //
++  // Intended for the D5 handoff pattern's blocking-I/O half (file reads,
++  // decode-adjacent syscalls) -- see docs/threading.md. `fn` must not
++  // block indefinitely: this Scheduler has exactly one IO thread, so a
++  // stuck `fn` stalls every runOnIoThread() call queued after it.
++  void runOnIoThread(std::function<void()> fn);
++
++  // Enqueues `fn` to run later, on whichever thread next calls pumpMain()
++  // (intended to always be this Scheduler's main thread -- see the class
++  // comment). FIFO relative to other postToMain() calls made from the
++  // SAME calling thread (a plain mutex-guarded queue -- see scheduler.cpp
++  // -- gives a single total order across every caller, but only a single
++  // thread's own sequence of calls has a meaningful "before/after" to
++  // preserve; interleavings across concurrently-calling threads settle in
++  // whatever order they acquire the queue's mutex). Safe to call from any
++  // thread. This is the D5 handoff mechanism workers use to hand GPU-object
++  // mutation back to the main thread (docs/threading.md) -- deliberately
++  // NOT built on any enkiTS pinned-task mechanism (kept thin and testable
++  // on its own).
++  void postToMain(std::function<void()> fn);
++
++  // Drains every function queued by postToMain() so far and runs each, in
++  // FIFO order, on the CALLING thread -- intended to be called once per
++  // frame from this Scheduler's main thread (the frame loop's own pump
++  // point). A function queued by a postToMain() call made concurrently
++  // with (or after) a given pumpMain() call may run on this call or a
++  // later one; pumpMain() never blocks waiting for more work to arrive.
++  void pumpMain();
++
++  // Number of background parallelFor() worker threads (the resolved value
++  // if 0 was passed to create()) -- EXCLUDES the calling/main thread and
++  // the dedicated IO thread, both of which exist and participate in this
++  // Scheduler's work regardless of this count (see create()'s and
++  // parallelFor()'s own comments for exactly how each participates).
++  uint32_t workerCount() const;
++
++ private:
++  explicit Scheduler(uint32_t workerCount);
++
++  struct Impl;
++  std::unique_ptr<Impl> impl_;
++};
++
++}  // namespace rx::task
+diff --git a/src/rx_task/scheduler.cpp b/src/rx_task/scheduler.cpp
+new file mode 100644
+index 0000000..b4b3589
+--- /dev/null
++++ b/src/rx_task/scheduler.cpp
+@@ -0,0 +1,227 @@
++#include "rx_task/scheduler.h"
++
++// enkiTS's own installed/BUILD_INTERFACE include layout puts TaskScheduler.h
++// directly on the include path with no subdirectory prefix (verified
++// directly against the installed tree: enkiTS::enkiTS's
++// INTERFACE_INCLUDE_DIRECTORIES is "<prefix>/include/enkiTS", not
++// "<prefix>/include") -- see third_party/CMakeLists.txt's own comment.
++#include <TaskScheduler.h>
++
++#include <rx_core/log.h>
++
++#include <mutex>
++#include <thread>
++#include <vector>
++
++namespace rx::task {
++
++namespace {
++
++// One-shot pinned task backing runOnIoThread(). Deliberately NOT self-
++// deleted from inside Execute() -- verified directly against enkiTS
++// v1.12's TaskScheduler::RunPinnedTasks(threadNum_, priority_) source
++// (TaskScheduler.cpp):
++//
++//   pPinnedTaskSet->Execute();
++//   pPinnedTaskSet->m_RunningCount.fetch_sub(1, ...);   // touches *this
++//   TaskComplete(pPinnedTaskSet, true, threadNum_);      // touches *this
++//
++// enkiTS itself dereferences the task object in the two lines immediately
++// AFTER Execute() returns (decrementing ICompletable::m_RunningCount, then
++// walking m_pDependents inside TaskComplete()). A `delete this;` at the
++// end of Execute() would make both of those a use-after-free. Instead,
++// Execute() appends `this` to a trash list owned by the IO thread's own
++// IoLoopTask (below), which is only ever touched by the IO thread itself
++// and only reaped once its own call to RunPinnedTasks() has FULLY
++// returned -- i.e. strictly after enkiTS's own post-Execute() bookkeeping
++// for every task run in that call has already happened.
++class IoTask final : public enki::IPinnedTask {
++ public:
++  IoTask(uint32_t threadNum, std::function<void()> fn, std::vector<IoTask*>& trash)
++      : enki::IPinnedTask(threadNum), fn_(std::move(fn)), trash_(trash) {}
++
++  void Execute() override {
++    fn_();
++    trash_.push_back(this);
++  }
++
++ private:
++  std::function<void()> fn_;
++  std::vector<IoTask*>& trash_;
++};
++
++// The dedicated IO thread's entire body, itself run as a single long-lived
++// pinned task on the one EXTRA internal enkiTS thread Scheduler::Impl
++// configures beyond `resolvedWorkerCount` (see Scheduler::Scheduler()
++// below). This is enkiTS's own documented idiom for a thread that runs
++// ONLY pinned tasks and never participates in parallelFor() work-stealing
++// -- verbatim the pattern enkiTS's own example/WaitForNewPinnedTasks.cpp
++// ships as `RunPinnedTaskLoopTask`: once the extra internal thread's
++// TaskingThreadFunction dispatch loop picks this task up and calls
++// Execute(), it never returns (so that thread can never go back to
++// stealing ordinary parallelFor() chunks) until shutdown is requested --
++// which is exactly what makes this thread "dedicated" rather than merely
++// "usually free".
++class IoLoopTask final : public enki::IPinnedTask {
++ public:
++  IoLoopTask(enki::TaskScheduler* scheduler, uint32_t threadNum)
++      : enki::IPinnedTask(threadNum), scheduler_(scheduler) {}
++
++  void Execute() override {
++    while (!scheduler_->GetIsShutdownRequested()) {
++      // Sleeps until a pinned task targets this thread number, or shutdown
++      // is requested (TaskScheduler::StopThreads() unconditionally signals
++      // every thread's own wait-for-new-pinned-task semaphore while it
++      // joins threads, so this is guaranteed to wake, never hang).
++      scheduler_->WaitForNewPinnedTasks();
++      scheduler_->RunPinnedTasks();
++      // Safe to reap now -- see IoTask's own comment above. trash_ is
++      // touched only from this thread (IoTask::Execute() runs only on the
++      // IO thread by construction; this loop runs only on the IO thread
++      // too), so no lock is needed.
++      for (IoTask* task : trash_) {
++        delete task;
++      }
++      trash_.clear();
++    }
++  }
++
++  std::vector<IoTask*>& trash() { return trash_; }
++
++ private:
++  enki::TaskScheduler* scheduler_;
++  std::vector<IoTask*> trash_;
++};
++
++uint32_t resolveWorkerCount(uint32_t requested) {
++  if (requested != 0) {
++    return requested;
++  }
++  const uint32_t hw = std::thread::hardware_concurrency();
++  return hw > 1 ? hw - 1 : 1;
++}
++
++}  // namespace
++
++struct Scheduler::Impl {
++  enki::TaskScheduler taskScheduler;
++  uint32_t resolvedWorkerCount = 0;
++  uint32_t ioThreadNum = 0;
++  std::unique_ptr<IoLoopTask> ioLoopTask;
++
++  // postToMain()'s queue: a plain mutex-guarded vector, deliberately NOT
++  // built on any enkiTS mechanism [brief resolution 2] -- keeps this seam
++  // thin, testable on its own, and independent of whether "main" is even
++  // an enkiTS-registered thread at the moment pumpMain() is called.
++  std::mutex mainQueueMutex;
++  std::vector<std::function<void()>> mainQueue;
++};
++
++Scheduler::Scheduler(uint32_t workerCount) : impl_(std::make_unique<Impl>()) {
++  impl_->resolvedWorkerCount = resolveWorkerCount(workerCount);
++
++  enki::TaskSchedulerConfig config;
++  // +1: one extra internal thread beyond the resolved worker count, handed
++  // the IO-only pinned-task loop immediately below [D2: "IPinnedTask maps
++  // to the dedicated IO thread"]. numExternalTaskThreads stays 0 -- this
++  // Scheduler never asks a caller-owned std::thread to register itself;
++  // every thread enkiTS knows about here is one enkiTS itself created and
++  // owns the join-on-shutdown lifetime of.
++  config.numTaskThreadsToCreate = impl_->resolvedWorkerCount + 1;
++  impl_->taskScheduler.Initialize(config);
++
++  // GetNumTaskThreads() == numTaskThreadsToCreate + numExternalTaskThreads
++  // + 1 (main) == (resolvedWorkerCount + 1) + 0 + 1. The dedicated IO
++  // thread is whichever internal thread number enkiTS created last.
++  impl_->ioThreadNum = impl_->taskScheduler.GetNumTaskThreads() - 1;
++  impl_->ioLoopTask = std::make_unique<IoLoopTask>(&impl_->taskScheduler, impl_->ioThreadNum);
++  impl_->taskScheduler.AddPinnedTask(impl_->ioLoopTask.get());
++
++  RX_LOG_INFO("rx::task::Scheduler: {} worker thread(s) + 1 IO thread (thread {}) + main", impl_->resolvedWorkerCount,
++              impl_->ioThreadNum);
++}
++
++std::unique_ptr<Scheduler> Scheduler::create(uint32_t workerCount) {
++  return std::unique_ptr<Scheduler>(new Scheduler(workerCount));
++}
++
++Scheduler::~Scheduler() {
++  // WaitforAllAndShutdown() requests shutdown, lets already-running work
++  // settle, then joins every internal thread -- including the IO thread:
++  // IoLoopTask's while loop above observes GetIsShutdownRequested() and
++  // returns, which is what lets enkiTS join that thread like any other.
++  //
++  // Any postToMain()/runOnIoThread() work still queued (never drained by
++  // a pumpMain() call, or added in the brief window right as shutdown
++  // begins) is dropped here, not run and not specially reclaimed -- the
++  // same "non-empty teardown is a caller-timing choice, not this type's
++  // job to paper over" posture rx_rhi_vk's DeletionQueue destructor
++  // documents for its own equivalent case. Unlike DeletionQueue, this is
++  // not logged: an application shutting down its Scheduler with
++  // in-flight fire-and-forget work queued is an ordinary, expected
++  // teardown race, not a leak of a caller-owned resource.
++  impl_->taskScheduler.WaitforAllAndShutdown();
++}
++
++void Scheduler::parallelFor(uint32_t itemCount, uint32_t grainSize,
++                             std::function<void(uint32_t begin, uint32_t end, uint32_t workerIndex)> fn) {
++  if (itemCount == 0) {
++    return;
++  }
++  enki::TaskSet taskSet(itemCount, [&fn](enki::TaskSetPartition range, uint32_t threadNum) {
++    fn(range.start, range.end, threadNum);
++  });
++  // Must be set before AddTaskSetToPipe(): enkiTS recomputes the task's
++  // actual runtime split size (m_RangeToRun) from m_MinRange at that call
++  // (TaskScheduler::AddTaskSetToPipeInt), not at TaskSet construction, but
++  // only ever reads m_MinRange as of that moment.
++  taskSet.m_MinRange = grainSize > 0 ? grainSize : 1;
++
++  impl_->taskScheduler.AddTaskSetToPipe(&taskSet);
++  // The calling thread participates here: WaitforTask() is enkiTS's own
++  // documented "run pending chunks on this thread while waiting" call --
++  // not a passive block. This is also what makes nested parallelFor()
++  // (calling this method again from within `fn`) safe rather than a
++  // deadlock: the inner call's own WaitforTask() drains whatever chunks
++  // (inner or outer) are available, on whichever thread reaches it.
++  impl_->taskScheduler.WaitforTask(&taskSet);
++}
++
++void Scheduler::runOnIoThread(std::function<void()> fn) {
++  // Freed by IoLoopTask, once its Execute() loop has safely reaped it --
++  // see IoTask's own comment above for exactly why not sooner.
++  auto* task = new IoTask(impl_->ioThreadNum, std::move(fn), impl_->ioLoopTask->trash());
++  // Safe from any thread per enkiTS's own contract ("Pinned tasks can be
++  // added from any thread" -- TaskScheduler.h). AddPinnedTaskInt() pushes
++  // onto enkiTS's own lock-free intrusive list (WriterWriteFront(),
++  // dequeued tail-first via ReaderReadBack() -- verified directly against
++  // LockLessMultiReadPipe.h: this is a genuine FIFO, not a stack), and
++  // wakes the IO thread immediately if it was parked in
++  // WaitForNewPinnedTasks() -- this is what gives runOnIoThread() its FIFO
++  // guarantee without this wrapper needing any queue of its own.
++  impl_->taskScheduler.AddPinnedTask(task);
++}
++
++void Scheduler::postToMain(std::function<void()> fn) {
++  std::lock_guard<std::mutex> lock(impl_->mainQueueMutex);
++  impl_->mainQueue.push_back(std::move(fn));
++}
++
++void Scheduler::pumpMain() {
++  // Swap out under the lock, then run outside it: postToMain() calls
++  // arriving while these run (e.g. from a worker still executing while
++  // pumpMain() drains) are simply picked up by the NEXT pumpMain() call,
++  // never blocked on or lost.
++  std::vector<std::function<void()>> toRun;
++  {
++    std::lock_guard<std::mutex> lock(impl_->mainQueueMutex);
++    toRun.swap(impl_->mainQueue);
++  }
++  for (auto& fn : toRun) {
++    fn();
++  }
++}
++
++uint32_t Scheduler::workerCount() const { return impl_->resolvedWorkerCount; }
++
++}  // namespace rx::task
+diff --git a/src/rx_task/tests/CMakeLists.txt b/src/rx_task/tests/CMakeLists.txt
+new file mode 100644
+index 0000000..8ab2ff6
+--- /dev/null
++++ b/src/rx_task/tests/CMakeLists.txt
+@@ -0,0 +1,9 @@
++# Device-free (no VkDevice, no rx::platform::Window) -- exactly like
++# rx_graph_tests' own doctest_main.cpp (src/rx_graph/tests/CMakeLists.txt),
++# this binary needs no warm-up before its first TEST_CASE runs.
++add_executable(rx_task_tests
++    doctest_main.cpp
++    scheduler_test.cpp
++)
++target_link_libraries(rx_task_tests PRIVATE rx_task doctest::doctest)
++add_test(NAME rx_task_tests COMMAND rx_task_tests)
+diff --git a/src/rx_task/tests/doctest_main.cpp b/src/rx_task/tests/doctest_main.cpp
+new file mode 100644
+index 0000000..058ecda
+--- /dev/null
++++ b/src/rx_task/tests/doctest_main.cpp
+@@ -0,0 +1,6 @@
++// rx_task's tests never construct a VkDevice/VkInstance -- Scheduler is
++// entirely device-free -- so, exactly like rx_graph_tests' own
++// doctest_main.cpp, doctest's own generated main is sufficient with no
++// warm-up step needed before any TEST_CASE runs.
++#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
++#include <doctest/doctest.h>
+diff --git a/src/rx_task/tests/scheduler_test.cpp b/src/rx_task/tests/scheduler_test.cpp
+new file mode 100644
+index 0000000..cbc4981
+--- /dev/null
++++ b/src/rx_task/tests/scheduler_test.cpp
+@@ -0,0 +1,261 @@
++#include <rx_task/scheduler.h>
++
++#include <doctest/doctest.h>
++
++#include <atomic>
++#include <chrono>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++namespace {
++
++// Bounded busy-wait used only for cross-thread completion signals this
++// test file itself creates (never used to paper over a real Scheduler
++// API, which is synchronous wherever the brief requires it -- parallelFor()
++// blocks until done by contract). Fails the calling CHECK/REQUIRE instead
++// of hanging forever if `predicate` never becomes true, so a genuine
++// regression (e.g. a deadlocked IO thread) shows up as a normal test
++// failure within a few seconds, not a stuck CI job.
++template <typename Predicate>
++bool waitUntil(Predicate predicate, std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
++  const auto deadline = std::chrono::steady_clock::now() + timeout;
++  while (!predicate()) {
++    if (std::chrono::steady_clock::now() >= deadline) {
++      return false;
++    }
++    std::this_thread::yield();
++  }
++  return true;
++}
++
++}  // namespace
++
++TEST_CASE("Scheduler::workerCount resolves 0 to hardware_concurrency()-1 clamped to a minimum of 1, "
++          "and returns an explicit request unchanged") {
++  auto zero = rx::task::Scheduler::create(0);
++  REQUIRE(zero != nullptr);
++  const uint32_t hw = std::thread::hardware_concurrency();
++  const uint32_t expected = hw > 1 ? hw - 1 : 1;
++  CHECK(zero->workerCount() == expected);
++  CHECK(zero->workerCount() >= 1);
++
++  auto explicitCount = rx::task::Scheduler::create(3);
++  REQUIRE(explicitCount != nullptr);
++  CHECK(explicitCount->workerCount() == 3);
++}
++
++TEST_CASE("Scheduler::parallelFor touches every one of 10k items exactly once, "
++          "and uses more than one worker thread when workerCount() > 0") {
++  auto scheduler = rx::task::Scheduler::create(0);
++  REQUIRE(scheduler != nullptr);
++
++  constexpr uint32_t kItemCount = 10000;
++  constexpr uint32_t kGrainSize = 64;
++
++  std::vector<std::atomic<uint32_t>> touchCounts(kItemCount);
++  for (auto& count : touchCounts) {
++    count.store(0);
++  }
++
++  // Generously sized -- large enough to hold any workerIndex enkiTS could
++  // report (main + every background worker); this test only cares which
++  // slots ever got touched, not the exact thread accounting.
++  constexpr uint32_t kMaxTrackedWorkers = 256;
++  std::vector<std::atomic<uint32_t>> perWorkerTouches(kMaxTrackedWorkers);
++  for (auto& count : perWorkerTouches) {
++    count.store(0);
++  }
++
++  scheduler->parallelFor(kItemCount, kGrainSize, [&](uint32_t begin, uint32_t end, uint32_t workerIndex) {
++    REQUIRE(begin < end);
++    REQUIRE(end <= kItemCount);
++    for (uint32_t i = begin; i < end; ++i) {
++      touchCounts[i].fetch_add(1, std::memory_order_relaxed);
++    }
++    if (workerIndex < kMaxTrackedWorkers) {
++      perWorkerTouches[workerIndex].fetch_add(1, std::memory_order_relaxed);
++    }
++  });
++
++  for (uint32_t i = 0; i < kItemCount; ++i) {
++    CHECK(touchCounts[i].load() == 1);
++  }
++
++  uint32_t distinctWorkersUsed = 0;
++  for (auto& count : perWorkerTouches) {
++    if (count.load() > 0) {
++      ++distinctWorkersUsed;
++    }
++  }
++  CHECK(distinctWorkersUsed >= 1);
++  if (scheduler->workerCount() > 0) {
++    // Not a hard guarantee of enkiTS's work-stealing heuristics for any
++    // given run, but with 10k items split into 64-item grains (>150
++    // chunks) and at least one background worker available, the
++    // scheduler not using it at all would indicate something structurally
++    // wrong with how this wrapper configured/queued the work.
++    CHECK(distinctWorkersUsed > 1);
++  }
++}
++
++TEST_CASE("Scheduler::parallelFor nests safely: an outer chunk's callback can call parallelFor() "
++          "again without deadlock") {
++  auto scheduler = rx::task::Scheduler::create(0);
++  REQUIRE(scheduler != nullptr);
++
++  constexpr uint32_t kOuter = 64;
++  constexpr uint32_t kInner = 256;
++  std::atomic<uint32_t> completedOuterItems{0};
++
++  scheduler->parallelFor(kOuter, 4, [&](uint32_t begin, uint32_t end, uint32_t) {
++    for (uint32_t i = begin; i < end; ++i) {
++      std::atomic<uint32_t> innerSum{0};
++      scheduler->parallelFor(kInner, 16, [&](uint32_t ibegin, uint32_t iend, uint32_t) {
++        innerSum.fetch_add(iend - ibegin, std::memory_order_relaxed);
++      });
++      CHECK(innerSum.load() == kInner);
++      completedOuterItems.fetch_add(1, std::memory_order_relaxed);
++    }
++  });
++
++  CHECK(completedOuterItems.load() == kOuter);
++}
++
++TEST_CASE("Scheduler::postToMain runs queued functions on the pumpMain()-calling thread, "
++          "in the order a single thread queued them") {
++  auto scheduler = rx::task::Scheduler::create(2);
++  REQUIRE(scheduler != nullptr);
++
++  const std::thread::id mainId = std::this_thread::get_id();
++  constexpr int kCount = 200;
++  std::vector<int> order;
++  std::vector<std::thread::id> seenIds;
++
++  for (int i = 0; i < kCount; ++i) {
++    scheduler->postToMain([&order, &seenIds, i] {
++      order.push_back(i);
++      seenIds.push_back(std::this_thread::get_id());
++    });
++  }
++
++  // Nothing runs before pumpMain() is called.
++  CHECK(order.empty());
++
++  scheduler->pumpMain();
++
++  REQUIRE(order.size() == static_cast<size_t>(kCount));
++  for (int i = 0; i < kCount; ++i) {
++    CHECK(order[static_cast<size_t>(i)] == i);
++  }
++  for (const auto& id : seenIds) {
++    CHECK(id == mainId);
++  }
++}
++
++TEST_CASE("Scheduler::postToMain is safe to call from worker threads, and the queued work still "
++          "runs only on whichever thread calls pumpMain()") {
++  auto scheduler = rx::task::Scheduler::create(0);
++  REQUIRE(scheduler != nullptr);
++
++  const std::thread::id mainId = std::this_thread::get_id();
++  std::mutex resultsMutex;
++  std::vector<std::thread::id> executedOnIds;
++  std::vector<std::thread::id> queuedFromIds;
++
++  constexpr uint32_t kItemCount = 500;
++  scheduler->parallelFor(kItemCount, 8, [&](uint32_t begin, uint32_t end, uint32_t) {
++    std::thread::id queuedFrom = std::this_thread::get_id();
++    scheduler->postToMain([&resultsMutex, &executedOnIds, &queuedFromIds, queuedFrom] {
++      std::lock_guard<std::mutex> lock(resultsMutex);
++      executedOnIds.push_back(std::this_thread::get_id());
++      queuedFromIds.push_back(queuedFrom);
++    });
++    (void)begin;
++    (void)end;
++  });
++
++  scheduler->pumpMain();
++
++  // One postToMain() call per parallelFor() chunk -- the exact chunk
++  // count is enkiTS's own splitting heuristic to decide, not something
++  // this test pins down; only the bound (at least one chunk, never more
++  // chunks than items) and the actual thread-affinity guarantee matter
++  // here.
++  REQUIRE(!executedOnIds.empty());
++  REQUIRE(executedOnIds.size() <= kItemCount);
++  REQUIRE(queuedFromIds.size() == executedOnIds.size());
++  for (const auto& id : executedOnIds) {
++    CHECK(id == mainId);
++  }
++}
++
++TEST_CASE("Scheduler::runOnIoThread executes off the main thread, in FIFO order, "
++          "and survives 1000 rapid submissions") {
++  auto scheduler = rx::task::Scheduler::create(2);
++  REQUIRE(scheduler != nullptr);
++
++  const std::thread::id mainId = std::this_thread::get_id();
++  constexpr int kCount = 1000;
++
++  std::mutex resultsMutex;
++  std::vector<int> order;
++  std::vector<std::thread::id> seenIds;
++  std::atomic<int> remaining{kCount};
++
++  for (int i = 0; i < kCount; ++i) {
++    scheduler->runOnIoThread([&resultsMutex, &order, &seenIds, &remaining, i] {
++      {
++        std::lock_guard<std::mutex> lock(resultsMutex);
++        order.push_back(i);
++        seenIds.push_back(std::this_thread::get_id());
++      }
++      remaining.fetch_sub(1, std::memory_order_release);
++    });
++  }
++
++  const bool completed = waitUntil([&] { return remaining.load(std::memory_order_acquire) == 0; });
++  REQUIRE(completed);
++
++  REQUIRE(order.size() == static_cast<size_t>(kCount));
++  for (int i = 0; i < kCount; ++i) {
++    CHECK(order[static_cast<size_t>(i)] == i);
++  }
++
++  REQUIRE(!seenIds.empty());
++  for (const auto& id : seenIds) {
++    CHECK(id != mainId);
++  }
++  // All 1000 ran on the SAME thread -- one dedicated IO thread, never a
++  // pool of them.
++  for (const auto& id : seenIds) {
++    CHECK(id == seenIds.front());
++  }
++}
++
++TEST_CASE("Scheduler::create/destroy repeats cleanly 3 times in sequence, exercising every API "
++          "each cycle (no leak or deadlock on teardown)") {
++  for (int cycle = 0; cycle < 3; ++cycle) {
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++    CHECK(scheduler->workerCount() == 2);
++
++    std::atomic<uint32_t> parallelSum{0};
++    scheduler->parallelFor(100, 10, [&](uint32_t begin, uint32_t end, uint32_t) {
++      parallelSum.fetch_add(end - begin, std::memory_order_relaxed);
++    });
++    CHECK(parallelSum.load() == 100);
++
++    std::atomic<bool> ioRan{false};
++    scheduler->runOnIoThread([&ioRan] { ioRan.store(true, std::memory_order_release); });
++    REQUIRE(waitUntil([&] { return ioRan.load(std::memory_order_acquire); }));
++
++    bool mainRan = false;
++    scheduler->postToMain([&mainRan] { mainRan = true; });
++    scheduler->pumpMain();
++    CHECK(mainRan);
++
++    // scheduler destructs here at end of scope, joining every internal
++    // thread before the next cycle's create() runs.
++  }
++}
+diff --git a/third_party/CMakeLists.txt b/third_party/CMakeLists.txt
+index b39c859..294dfde 100644
+--- a/third_party/CMakeLists.txt
++++ b/third_party/CMakeLists.txt
+@@ -244,10 +244,57 @@ set(RX_VK_BOOTSTRAP_COMMIT "556b79b165386f6c1a18362d30f2a076fdaa2778")
+ rx_add_cached_dependency(
+   NAME vk-bootstrap
+   REPO https://github.com/charles-lunarg/vk-bootstrap.git
+   TAG ${RX_VK_BOOTSTRAP_COMMIT}
+   CMAKE_ARGS -DVK_BOOTSTRAP_TEST=OFF "-DCMAKE_PREFIX_PATH=${Vulkan-Headers_CACHE_DIR}"
+ )
+ find_package(vk-bootstrap REQUIRED PATHS "${vk-bootstrap_CACHE_DIR}" NO_DEFAULT_PATH)
+ 
+ # Same CMake 3.22 limitation as spdlog/SDL3/Vulkan-Headers above.
+ set_target_properties(vk-bootstrap::vk-bootstrap PROPERTIES IMPORTED_GLOBAL TRUE)
++
++# enkiTS: the engine's sole task scheduler [spec D2] -- src/rx_task wraps
++# it thinly as rx::task::Scheduler (Phase 4 Stage 0, Task 2). Zlib license
++# (Doug Binks, see the pinned tag's own License.txt -- permissive, no
++# attribution requirement beyond "appreciated but not required").
++#
++# Pinned v1.12 -- the current tag on github.com/dougbinks/enkiTS as of this
++# task (verified directly: `git ls-remote --tags`), matching [R:threading]'s
++# own version citation. Note enkiTS's CMakeLists.txt project() call still
++# reports VERSION "1.11" (an upstream tag/project-version mismatch, not a
++# mistake on this project's part -- verified directly against the checked-
++# out v1.12 tag's own CMakeLists.txt).
++#
++# Routed through the dep-cache like spdlog/Vulkan-Headers/SDL3/vk-bootstrap
++# above, not vendored as source under third_party/ [task-2 resolution 1]:
++# enkiTS's own CMakeLists.txt already installs a clean, real CMake package
++# (ENKITS_INSTALL=ON produces enkiTSConfig.cmake exporting an `enkiTS::
++# enkiTS` imported target with correct INTERFACE_INCLUDE_DIRECTORIES/
++# INTERFACE_COMPILE_DEFINITIONS) -- verified directly by configuring,
++# building, and installing this exact tag through BOTH this project's
++# toolchains (linux-native and windows-cross-zig) from a clean prefix, then
++# linking and RUNNING a real enki::TaskScheduler/TaskSet program against
++# each installed tree (the windows-cross-zig one under Wine) -- both
++# produced a working static library with no source-level or link-level
++# changes needed. Given a dependency whose own install already "exports
++# cleanly through rx_add_cached_dependency" (the resolution's own bar), that
++# beats hand-vendoring the two source files under third_party/ for no
++# benefit.
++#
++# ENKITS_BUILD_C_INTERFACE/ENKITS_BUILD_EXAMPLES=OFF: this project only
++# ever calls the C++ API (TaskScheduler.h), and enkiTS's example
++# executables would otherwise build unconditionally and add nothing this
++# project links against. ENKITS_BUILD_SHARED=OFF: matches every other
++# compiled dependency here (spdlog/SDL3) being linked statically.
++set(RX_ENKITS_TAG "v1.12")
++rx_add_cached_dependency(
++  NAME enkiTS
++  REPO https://github.com/dougbinks/enkiTS.git
++  TAG ${RX_ENKITS_TAG}
++  CMAKE_ARGS -DENKITS_INSTALL=ON -DENKITS_BUILD_C_INTERFACE=OFF -DENKITS_BUILD_EXAMPLES=OFF -DENKITS_BUILD_SHARED=OFF
++)
++find_package(enkiTS CONFIG REQUIRED PATHS "${enkiTS_CACHE_DIR}" NO_DEFAULT_PATH)
++
++# Same CMake 3.22 limitation as spdlog/SDL3/Vulkan-Headers/vk-bootstrap
++# above: promote to global scope for src/rx_task (a sibling directory) to
++# link.
++set_target_properties(enkiTS::enkiTS PROPERTIES IMPORTED_GLOBAL TRUE)

@@ -536,6 +536,41 @@ TEST_CASE("MaterialSystem persists its VkPipelineCache to disk across instances"
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 
+TEST_CASE("MaterialSystem::create succeeds with a corrupt pipeline-cache file (logs warning, uses fresh cache)") {
+    auto fixture = makeFixture("rx_material_cache_corrupt");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    std::filesystem::path cachePath = freshCachePath("corrupt");
+
+    // Write garbage bytes to simulate a corrupted cache file
+    {
+        std::ofstream corruptFile(cachePath, std::ios::binary);
+        REQUIRE(corruptFile.is_open());
+        const std::array<uint8_t, 256> garbage{};
+        corruptFile.write(reinterpret_cast<const char*>(garbage.data()), garbage.size());
+    }
+
+    REQUIRE(std::filesystem::exists(cachePath));
+
+    // MaterialSystem::create() should succeed despite the corrupt file,
+    // logging a warning and using a fresh cache instead (Task 5
+    // ambiguity resolution: corrupt/unreadable cache is best-effort,
+    // never fatal).
+    auto system = rx::material::MaterialSystem::create(fixture->device, fixture->bindless, cachePath);
+    REQUIRE(system != nullptr);
+
+    // Verify we can still use the system normally
+    rx::material::MaterialHandle handle = system->loadMaterial(testDataPath("test_unlit.slang"));
+    rx::material::PipelineRequest request;
+    request.material = handle;
+    request.pass = makeColorOnlySignature();
+    CHECK(system->getPipeline(request) != VK_NULL_HANDLE);
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
 // ===== Task 7 =============================================================
 
 TEST_CASE("MaterialSystem::materialParams/paramBlockSize reflect real per-field name/kind/offset/size, computed "

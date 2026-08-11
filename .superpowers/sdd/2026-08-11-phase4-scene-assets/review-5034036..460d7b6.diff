@@ -1,0 +1,2103 @@
+# Review package: 5034036..460d7b6
+
+## Commits
+460d7b6 feat: integrate Tracy profiler client (CPU + Vulkan GPU zones)
+
+## Files changed
+ .../task-3-report.md                               | 298 +++++++++++++++++++++
+ CMakeLists.txt                                     |  15 ++
+ CMakePresets.json                                  |   4 +-
+ samples/01_triangle/main.cpp                       |  10 +
+ samples/02_hotreload/main.cpp                      |  13 +
+ samples/03_bindless_mesh/main.cpp                  |  11 +
+ samples/04_streaming/main.cpp                      |  11 +
+ samples/05_multipass/main.cpp                      |  10 +
+ samples/06_materials/main.cpp                      |  10 +
+ src/rx_core/CMakeLists.txt                         |  20 ++
+ src/rx_core/include/rx_core/profile.h              |  90 +++++++
+ src/rx_core/tests/profile_test.cpp                 |  73 +++++
+ src/rx_graph/executor.cpp                          |  84 ++++++
+ src/rx_material/instance.cpp                       |   2 +
+ src/rx_material/material_system.cpp                |   4 +
+ src/rx_rhi_vk/CMakeLists.txt                       |   1 +
+ src/rx_rhi_vk/include/rx_rhi_vk/device.h           |  12 +
+ src/rx_rhi_vk/include/rx_rhi_vk/tracy_gpu.h        | 127 +++++++++
+ src/rx_rhi_vk/src/descriptor_arena.cpp             |   2 +
+ src/rx_rhi_vk/src/device.cpp                       |  35 +++
+ src/rx_rhi_vk/src/tracy_gpu.cpp                    |  79 ++++++
+ src/rx_rhi_vk/src/upload.cpp                       |   3 +
+ third_party/CMakeLists.txt                         |  69 +++++
+ 23 files changed, 981 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-3-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-3-report.md
+new file mode 100644
+index 0000000..1ab5032
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-3-report.md
+@@ -0,0 +1,298 @@
++# Task 3 report: Tracy profiler client integration
++
++**Scope note (coordinator mid-task correction):** `src/rx_task` is **excluded**
++from this task entirely — the coordinator flagged it as concurrently owned by
++a Task 2 fix round while this task was in flight. No file under `src/rx_task`
++was read or edited. `rx::task::Scheduler::parallelFor`'s zone+plot placement,
++named in the original dispatch, is **dropped** from this task's scope; it is
++not implemented here and remains open for whichever task next touches
++`rx_task`.
++
++## 1. Vendoring
++
++Tracy client, pinned **v0.14.0** (verified current stable tag via
++`git ls-remote --tags` at vendoring time — matches
++`[R:threading]`'s "≥ v0.11" citation and its "`VK_EXT_calibrated_timestamps`
++added in v0.11.0" fact). **BSD-3** license (Tracy's own `LICENSE` file).
++Client-only: exactly one compiled translation unit
++(`public/TracyClient.cpp`) plus client-side headers. The profiler UI/server
++(`profiler/`, `server/`, `capture/`, `python/`) is never built by this
++project, never `add_subdirectory`'d, never linked.
++
++Routed through the dep-cache (`rx_add_cached_dependency`, `third_party/CMakeLists.txt`)
++like spdlog/Vulkan-Headers/SDL3/vk-bootstrap/enkiTS — **not** hand-vendored as
++loose source like volk/VMA/stb: Tracy's own `CMakeLists.txt` already builds a
++real `TracyClient` target and installs a clean CMake package
++(`install(EXPORT TracyConfig ...)` → `TracyConfig.cmake`, exporting
++`Tracy::TracyClient`) — verified directly by reading it before writing the
++vendoring block. `CMAKE_ARGS -DTRACY_ENABLE=ON -DTRACY_STATIC=ON` — the
++`TRACY_ENABLE=ON` is deliberate and load-bearing: `TracyClient.cpp` is itself
++guarded by `#ifdef TRACY_ENABLE` top-to-bottom, so building the dependency
++without it would produce a near-empty stub library that this project's own
++`TRACY_ENABLE`-visible code (via rx_core's public compile definition) would
++fail to link against.
++
++Entirely guarded behind the new top-level `RX_TRACY` option (declared in
++root `CMakeLists.txt`, before `third_party` is added): when OFF, the whole
++Tracy `rx_add_cached_dependency` block never executes — Tracy is never
++cloned, configured, or compiled, and `Tracy::TracyClient` never exists as a
++target. This is a structural guarantee, not a convention.
++
++## 2. `rx_core/profile.h`
++
++CPU-zone macros, all no-op when `TRACY_ENABLE` is undefined (which itself is
++only ever defined when `RX_TRACY` is ON, via `rx_core`'s own `CMakeLists.txt`,
++`PUBLIC`):
++
++- `RX_ZONE` — object-like, statement-style (`RX_ZONE;`), mirrors Tracy's own
++  `ZoneScoped`. Function-name zone.
++- `RX_ZONE_NAMED(nameLiteral)` — `ZoneScopedN`.
++- `RX_ZONE_DYNAMIC_NAME(text, size)` — **added beyond the four macros named
++  in the dispatch** (`RX_ZONE`/`RX_ZONE_NAMED`/`RX_FRAME_MARK`/`RX_PLOT`).
++  Necessary because dispatch item 4 explicitly requires per-pass zones keyed
++  by a render-graph pass's runtime `std::string` name, which `ZoneScopedN`
++  cannot take directly (its `name` must have static storage duration).
++  Wraps Tracy's own documented idiom: manual `tracy.tex`, "If you want to
++  set zone name on a per-call basis, you may do so using the
++  `ZoneName(text, size)` macro" — verified directly against the vendored
++  v0.14.0 manual before writing this. Called with an `RX_ZONE_NAMED`
++  already active in the same scope.
++- `RX_FRAME_MARK` — `FrameMark`, statement-style.
++- `RX_PLOT(nameLiteral, value)` — `TracyPlot`.
++
++`#else` branch defines every macro as a bare no-op, matching Tracy's own
++`#ifndef TRACY_ENABLE` branch bit-for-bit, without depending on any Tracy
++header being reachable (it is not, when `RX_TRACY` is OFF — Tracy was never
++fetched). No other rx_* public header includes a Tracy CPU header anywhere
++in this codebase (verified by grep before finishing).
++
++**TDD test:** `src/rx_core/tests/profile_test.cpp` — one TU using all five
++macros unconditionally (no `#ifdef` of its own), added to `rx_core_tests`.
++Compiled and run green in **both** verified configurations (RX_TRACY=ON and
++RX_TRACY=OFF — see §6).
++
++## 3. CMake wiring
++
++- `RX_TRACY` option, root `CMakeLists.txt`, **default ON**.
++- `CMakePresets.json`: `RX_TRACY: "ON"` explicit in both `linux-native` and
++  `windows-cross-zig` cacheVariables.
++- `src/rx_core/CMakeLists.txt`: `if(RX_TRACY)` → `target_compile_definitions(rx_core PUBLIC TRACY_ENABLE)`
++  + `target_link_libraries(rx_core PUBLIC Tracy::TracyClient)`. Both PUBLIC
++  because rx_core is a transitive dependency of every other library/sample —
++  this is the single wiring point that makes the whole project agree on
++  whether Tracy is compiled in.
++- Trivially OFF-able: `-DRX_TRACY=OFF` (verified with a fresh, separate
++  configure — §6).
++
++## 4. Zone placements
++
++| Site | File | Macro(s) |
++|---|---|---|
++| FrameSync acquire | `rx_rhi_vk/src/device.cpp`, `Device::acquireNextImage` | `RX_ZONE` |
++| FrameSync present | `rx_rhi_vk/src/device.cpp`, `Device::present` | `RX_ZONE` |
++| Executor::execute (whole) | `rx_graph/executor.cpp` | `RX_ZONE` |
++| Executor per-pass (CPU) | `rx_graph/executor.cpp`, inside the pass loop | `RX_ZONE_NAMED("graph_pass")` + `RX_ZONE_DYNAMIC_NAME(pass.name().data(), pass.name().size())` |
++| Executor per-pass (GPU) | `rx_graph/executor.cpp`, same loop | `RX_GPU_ZONE_DYNAMIC` (transient GPU zone, dynamic pass name) |
++| MaterialSystem::loadMaterial | `rx_material/material_system.cpp` | `RX_ZONE` |
++| MaterialSystem::getPipeline | `rx_material/material_system.cpp` | `RX_ZONE` |
++| MaterialSystem::reloadChanged | `rx_material/material_system.cpp` | `RX_ZONE` |
++| Uploader::uploadToBuffer | `rx_rhi_vk/src/upload.cpp` | `RX_ZONE` |
++| Uploader::uploadToImage | `rx_rhi_vk/src/upload.cpp` | `RX_ZONE` |
++| DescriptorArena::beginFrame | `rx_rhi_vk/src/descriptor_arena.cpp` | `RX_ZONE` |
++| ParamArena::beginFrame | `rx_material/instance.cpp` | `RX_ZONE` |
++| ~~rx_task Scheduler::parallelFor~~ | — | **excluded, see scope note above** |
++
++**Note on "FrameSync acquire/present":** `rx::rhi::FrameSync` itself declares
++no `acquire`/`present` method — it owns only sync primitives and command
++buffers. The real acquire/present calls every sample's frame loop drives
++FrameSync's fences/semaphores around are `Device::acquireNextImage`/
++`Device::present` (`rx_rhi_vk/device.cpp`), which is where the zones landed.
++
++**RX_FRAME_MARK, all six samples, both modes** (`samples/*/main.cpp`):
++present-mode path is identical across all six (right after
++`device->present(...)`'s status handling, before `frameSync->advanceFrame()`).
++Headless-mode path differs per sample's own structure (some render exactly
++one frame via a single `runOnce()`, others loop):
++
++- `01_triangle`: one `RX_FRAME_MARK` after its single headless `runOnce()`.
++- `02_hotreload`: inside the shared `renderAndReadback` lambda's per-`frame`
++  loop (each iteration re-clears/redraws the same attachment).
++- `03_bindless_mesh`: one `RX_FRAME_MARK` after its single headless render
++  `runOnce()` (the readback-only `runOnce()` that follows is not a frame).
++- `04_streaming`: inside its real `rx::rhi::FrameSync`-driven headless loop
++  (the one sample whose headless mode genuinely cycles frames-in-flight).
++- `05_multipass`, `06_materials`: inside the `for (frame...) { cmdCtx->runOnce(...) }`
++  headless loop, each iteration being its own `Executor::execute()` call.
++
++## 5. GPU context (`rx_rhi_vk/tracy_gpu.{h,cpp}`)
++
++New, second Tracy-header seam (mirrors `profile.h`'s rule, scoped to
++`<tracy/TracyVulkan.hpp>`): `GpuProfileContext` (= `TracyVkCtx` when
++`TRACY_ENABLE`, else `void*`), plus three self-null-safe macros:
++`RX_GPU_ZONE_DYNAMIC`, `RX_GPU_COLLECT`, `RX_GPU_CONTEXT_DESTROY`.
++
++**Real bug caught and fixed during implementation:** Tracy's `VkCtxScope`
++constructor (backing `TracyVkZoneTransient`) dereferences `ctx` whenever its
++`active` parameter is true, with no null-guard of its own (verified directly
++against the vendored v0.14.0 source). A naive `active=true` would
++null-pointer-dereference-crash the instant `createGpuProfileContext()`
++returns null. Fixed by computing `active` as `(ctx) != nullptr` inside the
++macro itself, and by wrapping `RX_GPU_COLLECT`/`RX_GPU_CONTEXT_DESTROY` in
++their own internal null checks — so every call site in `executor.cpp` is
++safe unconditionally, with no caller-side null check or `#ifdef` needed.
++
++**Calibrated vs plain, wired through vk-bootstrap:** `Device::create()`
++(`device.cpp`) now calls `physResult.value().enable_extension_if_present(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)`
++— vk-bootstrap's own "enable if present, else no-op" call — and exposes the
++result via a new `Device::calibratedTimestampsEnabled()` accessor.
++`Device` has zero knowledge of Tracy; `createGpuProfileContext()`
++(`tracy_gpu.cpp`) is the sole consumer, choosing `TracyVkContextCalibrated`
++or plain `TracyVkContext` based on that one accessor.
++
++**Lavapipe empirically checked (dispatch item 5's explicit ask):** verified
++directly via `vulkaninfo` on this dev machine, which exposes both an NVIDIA
++RTX 2080 (proprietary driver) and Mesa's llvmpipe/lavapipe as Vulkan
++devices — **both report `VK_EXT_calibrated_timestamps`** (`VK_EXT_calibrated_timestamps: extension revision 2` for each). `[R:threading]`'s "unverified"
++flag on lavapipe support is resolved: **present**. One caveat, disclosed
++honestly: because every Vulkan implementation available in this environment
++supports the extension, the plain (uncalibrated) `TracyVkContext` fallback
++branch in `tracy_gpu.cpp` compiles and follows the identical documented Tracy
++idiom, but was not driver-exercised live in this task — there is no
++available driver here that lacks the extension to force that branch.
++
++**`TracyVkCollect` hook:** at the very end of `Executor::execute()`, after
++`finalBarriers()` (so `cmd` is guaranteed outside a render-pass instance,
++Tracy's documented requirement) — chosen over reaching into `FrameSync`
++itself, which has (and should keep) zero knowledge of Tracy or of any
++Executor's GPU context.
++
++**`TracyVkZone` around per-pass recording:** implemented as
++`RX_GPU_ZONE_DYNAMIC` (Tracy's *transient* GPU zone,
++`TracyVkZoneTransient`), not plain `TracyVkZone`, for the identical reason
++the CPU-side per-pass zone needed `RX_ZONE_DYNAMIC_NAME`: a pass's name is a
++runtime `std::string`, and `TracyVkZone`'s own `name` parameter must be a
++compile-time literal. Cited: Tracy manual, "Transient GPU zones" — "available
++in OpenGL, Vulkan, Direct3D 11/12 and WebGPU macros."
++
++## 6. Verification
++
++### Both dev presets, RX_TRACY=ON (default)
++
++```
++linux-native:      16/16 tests passed  (26.6s)
++windows-cross-zig: 16/16 tests passed  (47.4s, Wine-executed)
++```
++
++Configure logs show Tracy actually fetched/built with `TRACY_ENABLE: ON`
++(cmake/options.cmake's own status lines) on both toolchains; windows-cross-zig
++linked Tracy's `ws2_32`/`dbghelp`/`secur32` MinGW-family libs automatically
++(Tracy's own CMakeLists handles this — no project-side code needed), with
++only a benign duplicate `_WIN32_WINNT` macro-redefinition warning
++(same value, harmless).
++
++### RX_TRACY=OFF (extra required verification run)
++
++Separate, fresh configure (`-DRX_TRACY=OFF`) at `build/linux-native-notracy`:
++
++- Configure log: **zero** dep-cache activity for Tracy (the `if(RX_TRACY)`
++  block never ran at all — no clone, no compile).
++- Build: 105/105 targets built clean.
++- `ctest`: **16/16 tests passed** (24.6s), including `rx_core_tests`
++  (`profile_test.cpp` compiling/running as bare no-ops).
++- **Zero Tracy symbols, verified two ways:**
++  - `nm -C` across every executable and static library in the build tree:
++    zero `tracy::`-namespaced or `___tracy_`-prefixed symbols anywhere (a
++    control run against the same command on the RX_TRACY=ON build's
++    `sample_05_multipass` found `___tracy_after_lock_lockable_ctx` and
++    friends immediately, confirming the check itself is meaningful).
++  - `grep -c "TRACY_ENABLE" compile_commands.json`: **0** occurrences in the
++    OFF build vs **69** in the ON build.
++  - No `TracyClient.cpp.o` object file anywhere in the OFF build tree.
++  - (`strings` on the OFF binaries does surface the literal path
++    `.../rx_rhi_vk/src/tracy_gpu.cpp` — that is DWARF debug-line info
++    naming *this project's own* no-op stub source file, not Tracy library
++    code; `nm` is the authoritative check and it is clean.)
++
++### Live Tracy capture against `sample_05_multipass --present`
++
++Built Tracy's own `tracy-capture` and `tracy-csvexport` CLI tools
++**standalone, outside this project's build** (scratchpad only — never
++vendored into the repo, consistent with "client-only, never the
++profiler UI/server"), to connect a real capture and inspect it.
++
++Ran `sample_05_multipass --present` under `xvfb-run` (headless X, this
++sandbox has no real display), connected `tracy-capture` over the network
++protocol Tracy's client broadcasts on:
++
++**Run 1 (no `--validate`, ~8s capture):** 1858 frames, 14,862 zones,
++46.04 MB trace (`/tmp/.../scratchpad/sample05_capture.tracy`).
++`tracy-csvexport`'s zone-statistics view confirms every CPU zone this task
++added, attributed to the exact file:line this task placed it at:
++
++```
++name,src_file,src_line,counts
++graph_pass,      rx_graph/executor.cpp,   826, 5571   (~3 passes x 1857 frames)
++execute,         rx_graph/executor.cpp,   762, 1857   (once per frame)
++uploadToBuffer,  rx_rhi_vk/src/upload.cpp,128, 1863
++Collect,         tracy/TracyVulkan.hpp,   256, 1857   (Tracy's own self-instrumented
++                                                        Collect() -- confirms RX_GPU_COLLECT
++                                                        fired exactly once/frame)
++present,         rx_rhi_vk/src/device.cpp,346, 1856
++acquireNextImage,rx_rhi_vk/src/device.cpp,325, 1857
++```
++
++`tracy-csvexport -g -u` (per-GPU-zone-event report) confirms the per-pass
++**GPU** zones with their real, dynamic, render-graph-derived names —
++`shadow`, `forward`, `tonemap` (sample_05's three declared passes) — each
++~1856 times, with real captured GPU execution-time values (tens of
++microseconds), attributed to `rx_graph/executor.cpp` (the
++`RX_GPU_ZONE_DYNAMIC` call site). This is direct, positive proof the whole
++GPU-context/calibrated-timestamps/transient-zone/collect pipeline is live
++and correct end to end, not just compiling.
++
++The run's own log confirms the calibrated path was taken:
++```
++Device::create: VK_EXT_calibrated_timestamps ENABLED on the selected physical device
++rx_rhi_vk: Tracy GPU context created with calibrated timestamps (VK_EXT_calibrated_timestamps)
++```
++
++**Run 2 (`--present --validate`, ~6s capture, sync validation active):**
++1783 frames, 14,262 zones, 35.15 MB trace
++(`/tmp/.../scratchpad/sample05_capture_validated.tracy`). Log analysis:
++24,020 `[vulkan validation]`-tagged lines total, and **all 24,020** carry
++this codebase's own pre-existing `"(known false positive: ...)"` markers
++(three categories, all already documented in `context.cpp` from earlier
++phases — `VK_KHR_portability_enumeration` layer-version mismatch, SPIR-V
++`SourceLanguage=Slang` mismatch, and the separate-sampler sync-validation
++false positive). **Zero** validation lines outside that already-accepted
++set; **zero** `RX_LOG_ERROR` lines of any kind. Zero-validation-error, with
++sync validation active, with the full CPU+GPU Tracy instrumentation live.
++
++## Files
++
++- New: `src/rx_core/include/rx_core/profile.h`, `src/rx_core/tests/profile_test.cpp`,
++  `src/rx_rhi_vk/include/rx_rhi_vk/tracy_gpu.h`, `src/rx_rhi_vk/src/tracy_gpu.cpp`.
++- Modified (CMake): `CMakeLists.txt`, `CMakePresets.json`,
++  `third_party/CMakeLists.txt`, `src/rx_core/CMakeLists.txt`,
++  `src/rx_rhi_vk/CMakeLists.txt`.
++- Modified (zones): `src/rx_rhi_vk/include/rx_rhi_vk/device.h`,
++  `src/rx_rhi_vk/src/device.cpp`, `src/rx_graph/executor.cpp`,
++  `src/rx_material/material_system.cpp`, `src/rx_material/instance.cpp`,
++  `src/rx_rhi_vk/src/upload.cpp`, `src/rx_rhi_vk/src/descriptor_arena.cpp`,
++  `samples/{01_triangle,02_hotreload,03_bindless_mesh,04_streaming,05_multipass,06_materials}/main.cpp`.
++- Evidence (scratchpad, not committed): `sample05_capture.tracy`,
++  `sample05_capture_validated.tracy`, `zone_summary.csv`,
++  `gpu_zone_events.csv`, `sample05_present.log`,
++  `sample05_present_validated.log`.
++
++## Concerns
++
++1. `rx_task`/`Scheduler::parallelFor` zone+plot: excluded per the
++   coordinator's mid-task scope correction. Open for a future task.
++2. `RX_ZONE_DYNAMIC_NAME` is a fifth macro beyond the four literally named
++   in the resolutions — added because dispatch item 4 requires it; documented
++   and cited in `profile.h`.
++3. The plain (uncalibrated) `TracyVkContext` GPU-context fallback branch is
++   reviewed and compiles but was not driver-exercised live in this task —
++   no available Vulkan implementation in this sandbox lacks
++   `VK_EXT_calibrated_timestamps` to force that branch.
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index dc8a6e2..decbdf9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,19 +1,34 @@
+ cmake_minimum_required(VERSION 3.21)
+ project(renderer_x LANGUAGES C CXX)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+ 
+ enable_testing()
+ 
++# RX_TRACY: engine-wide switch for the Tracy profiler client integration
++# [spec D3, Phase 4 Stage 0 Task 3] -- ON by default (and explicitly ON in
++# both dev presets, CMakePresets.json) but trivially OFF-able
++# (`-DRX_TRACY=OFF`, or any preset that overrides it). Read by
++# third_party/CMakeLists.txt (added immediately below, so this option must
++# be declared first) to decide whether Tracy is fetched/built/linked at
++# all, and by src/rx_core/CMakeLists.txt to decide whether TRACY_ENABLE is
++# defined and Tracy::TracyClient linked -- both PUBLIC on rx_core, which
++# every other library and sample transitively depends on. When OFF, Tracy
++# is never fetched, never compiled, and never linked into any target in
++# this build -- not merely disabled at runtime -- so the resulting binaries
++# contain zero Tracy symbols (verified in task-3-report.md via nm/strings
++# on an RX_TRACY=OFF build).
++option(RX_TRACY "Enable the Tracy profiler client (CPU + Vulkan GPU zones); OFF removes Tracy entirely from the build" ON)
++
+ add_subdirectory(third_party)
+ 
+ include(tools/fetch_slang.cmake)
+ add_subdirectory(shaders)
+ 
+ add_subdirectory(src/rx_core)
+ # rx_task: the engine's sole task scheduler wrapper [spec D2, Phase 4
+ # Stage 0 Task 2] -- device-free, depends only on rx_core (logging) +
+ # enkiTS (third_party/CMakeLists.txt). Added here, independent of the
+ # rx_platform/rx_shader/rx_rhi_vk/rx_graph/rx_material chain below: nothing
+diff --git a/CMakePresets.json b/CMakePresets.json
+index a044b63..20dced6 100644
+--- a/CMakePresets.json
++++ b/CMakePresets.json
+@@ -1,27 +1,27 @@
+ {
+   "version": 3,
+   "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+   "configurePresets": [
+     {
+       "name": "linux-native",
+       "generator": "Ninja",
+       "binaryDir": "${sourceDir}/build/linux-native",
+       "toolchainFile": "${sourceDir}/cmake/toolchains/linux-native.cmake",
+-      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
++      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "RX_TRACY": "ON" }
+     },
+     {
+       "name": "windows-cross-zig",
+       "generator": "Ninja",
+       "binaryDir": "${sourceDir}/build/windows-cross-zig",
+       "toolchainFile": "${sourceDir}/cmake/toolchains/windows-cross-zig.cmake",
+-      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
++      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "RX_TRACY": "ON" }
+     }
+   ],
+   "buildPresets": [
+     { "name": "linux-native", "configurePreset": "linux-native" },
+     { "name": "windows-cross-zig", "configurePreset": "windows-cross-zig" }
+   ],
+   "testPresets": [
+     {
+       "name": "linux-native",
+       "configurePreset": "linux-native",
+diff --git a/samples/01_triangle/main.cpp b/samples/01_triangle/main.cpp
+index 2fee777..802d94d 100644
+--- a/samples/01_triangle/main.cpp
++++ b/samples/01_triangle/main.cpp
+@@ -23,20 +23,21 @@
+ //   MANUAL_VERIFICATION.md at the repo root); exits 0 on a clean window
+ //   close, 1 on any Vulkan failure or device loss.
+ //
+ // Both modes build and draw through the exact same VkPipeline-construction
+ // code (createTrianglePipeline() below): dynamic rendering, dynamic
+ // viewport/scissor, no vertex input (the vertex shader generates positions
+ // from SV_VertexID), no cull, no blend, 1 sample, targeting
+ // device->swapchainFormat() either way (headless mode's offscreen image is
+ // deliberately created in that same format for exactly this reason).
+ #include <rx_core/log.h>
++#include <rx_core/profile.h>
+ #include <rx_platform/window.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/frame_sync.h>
+ 
+ #include <SDL3/SDL.h>
+ #include <volk.h>
+ 
+@@ -524,20 +525,25 @@ int runHeadless(bool enableValidation) {
+         vkCmdSetScissor(cmd, 0, 1, &scissor);
+ 
+         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, trianglePipeline.pipeline);
+         vkCmdDraw(cmd, 3, 1, 0, 0);
+ 
+         vkCmdEndRendering(cmd);
+ 
+         rx::rhi::transitionImage(cmd, offscreenImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+     });
++    // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3, spec
++    // D3] -- headless-mode path: this sample's headless mode renders
++    // exactly one frame (the runOnce() call just above), so this is the
++    // single frame boundary to mark.
++    RX_FRAME_MARK;
+ 
+     // --- Readback ---------------------------------------------------------
+     auto readback = allocator->createHostVisibleBuffer(kPixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+     if (!readback.has_value()) {
+         RX_LOG_ERROR("createHostVisibleBuffer(readback) failed");
+         destroyRawResources();
+         return 1;
+     }
+ 
+     cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+@@ -845,20 +851,24 @@ int runPresent(bool enableValidation) {
+                 RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
+                 ok = false;
+                 break;
+             }
+         } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("device lost during present; exiting present loop");
+             ok = false;
+             break;
+         }
+ 
++        // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3,
++        // spec D3] -- present-mode path, right after this frame's present/
++        // submit has completed.
++        RX_FRAME_MARK;
+         frameSync->advanceFrame();
+     }
+ 
+     // Shutdown: vkDeviceWaitIdle BEFORE destroying FrameSync (via its
+     // destructor when this function returns), the per-image views, and the
+     // pipeline -- the only point any of these may legally die. See
+     // frame_sync.h's destructor contract.
+     vkDeviceWaitIdle(vkDevice);
+     destroySwapchainViews(vkDevice, swapchainViews);
+     destroyTrianglePipeline(vkDevice, trianglePipeline);
+diff --git a/samples/02_hotreload/main.cpp b/samples/02_hotreload/main.cpp
+index 5147b5d..7a9d2d0 100644
+--- a/samples/02_hotreload/main.cpp
++++ b/samples/02_hotreload/main.cpp
+@@ -50,20 +50,21 @@
+ // practice. A later pass wiring this sample to DeletionQueue can drop the
+ // wait entirely; nothing else about the swap needs to change.
+ //
+ // Redistribution: this is the sample that proves the Slang runtime-lib
+ // deployment mechanism (rx_shader_deploy_runtime_libs(), CMakeLists.txt)
+ // for real -- linking rx_shader pulls in slang::slang, and this binary
+ // does real in-process compilation on every run (both modes), so if the
+ // runtime libs weren't copied next to it with a working $ORIGIN RPATH,
+ // Compiler::create() would fail immediately.
+ #include <rx_core/log.h>
++#include <rx_core/profile.h>
+ #include <rx_platform/window.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/frame_sync.h>
+ #include <rx_rhi_vk/pipeline_layout.h>
+ #include <rx_shader/compiler.h>
+ #include <rx_shader/reflection.h>
+ 
+@@ -727,20 +728,28 @@ int runHeadless(bool enableValidation) {
+                                      0.0F, 1.0F};
+                 vkCmdSetViewport(cmd, 0, 1, &viewport);
+                 VkRect2D scissor{{0, 0}, {kHeadlessWidth, kHeadlessHeight}};
+                 vkCmdSetScissor(cmd, 0, 1, &scissor);
+ 
+                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.pipeline);
+                 pushTimeIfDeclared(cmd, pipeline, 0.0F);
+                 vkCmdDraw(cmd, 3, 1, 0, 0);
+ 
+                 vkCmdEndRendering(cmd);
++
++                // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0
++                // Task 3, spec D3] -- headless-mode path: each iteration of
++                // this loop re-clears and redraws the same offscreen
++                // attachment, i.e. renders one frame's worth of content,
++                // even though all `frameCount` iterations share a single
++                // runOnce() submission.
++                RX_FRAME_MARK;
+             }
+ 
+             rx::rhi::transitionImage(cmd, offscreenImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+ 
+             VkBufferImageCopy region{};
+             region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+             region.imageSubresource.mipLevel = 0;
+             region.imageSubresource.baseArrayLayer = 0;
+             region.imageSubresource.layerCount = 1;
+@@ -1094,20 +1103,24 @@ int runPresent(bool enableValidation) {
+                 RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
+                 ok = false;
+                 break;
+             }
+         } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("device lost during present; exiting present loop");
+             ok = false;
+             break;
+         }
+ 
++        // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3,
++        // spec D3] -- present-mode path, right after this frame's present/
++        // submit has completed.
++        RX_FRAME_MARK;
+         frameSync->advanceFrame();
+     }
+ 
+     // Shutdown: vkDeviceWaitIdle BEFORE destroying FrameSync (its
+     // destructor runs when this function returns), the per-image views,
+     // and the pipeline -- the only point any of these may legally die (see
+     // frame_sync.h's destructor contract).
+     vkDeviceWaitIdle(vkDevice);
+     destroySwapchainViews(vkDevice, swapchainViews);
+     destroyReloadablePipeline(vkDevice, pipeline);
+diff --git a/samples/03_bindless_mesh/main.cpp b/samples/03_bindless_mesh/main.cpp
+index 2b67dd2..240b571 100644
+--- a/samples/03_bindless_mesh/main.cpp
++++ b/samples/03_bindless_mesh/main.cpp
+@@ -57,20 +57,21 @@
+ // Two modes, exactly like 01_triangle/02_hotreload:
+ //   (default / no args) Headless correctness gate: one frame, offscreen,
+ //   256x256, camera at its orbit's t=0 pose (a fixed, well-known front
+ //   view -- see kCamera* below), readback + probe pixels asserting >=3
+ //   distinct texture colors actually landed on screen, validation clean,
+ //   exit 0/1. Registered as ctest sample_03_bindless_mesh_headless.
+ //   --present. Real window, the same scene, camera continuously orbiting
+ //   (see runPresent()'s use of elapsed time to drive the orbit angle the
+ //   headless gate always evaluates at t=0).
+ #include <rx_core/log.h>
++#include <rx_core/profile.h>
+ #include <rx_platform/window.h>
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/frame_sync.h>
+ #include <rx_rhi_vk/mesh_buffers.h>
+ #include <rx_rhi_vk/pipeline_layout.h>
+ #include <rx_rhi_vk/texture.h>
+@@ -1121,20 +1122,26 @@ int runHeadless(bool enableValidation) {
+         VkRect2D scissor{{0, 0}, {kHeadlessWidth, kHeadlessHeight}};
+         vkCmdSetScissor(cmd, 0, 1, &scissor);
+ 
+         recordSceneDraws(cmd, *scene, /*frameInFlightIndex=*/0);
+ 
+         vkCmdEndRendering(cmd);
+ 
+         rx::rhi::transitionImage(cmd, offscreenImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+     });
++    // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3, spec
++    // D3] -- headless-mode path: this sample's headless mode renders
++    // exactly one frame (the runOnce() call just above; the readback-only
++    // runOnce() below is not itself a rendered frame), so this is the
++    // single frame boundary to mark.
++    RX_FRAME_MARK;
+ 
+     auto readback = allocator->createHostVisibleBuffer(kHeadlessPixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+     if (!readback.has_value()) {
+         RX_LOG_ERROR("createHostVisibleBuffer(readback) failed");
+         destroyRawResources();
+         return 1;
+     }
+ 
+     cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+         VkBufferImageCopy region{};
+@@ -1542,20 +1549,24 @@ int runPresent(bool enableValidation) {
+                                   VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+                     });
+                 }
+             }
+         } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("device lost during present; exiting present loop");
+             ok = false;
+             break;
+         }
+ 
++        // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3,
++        // spec D3] -- present-mode path, right after this frame's present/
++        // submit has completed.
++        RX_FRAME_MARK;
+         frameSync->advanceFrame();
+     }
+ 
+     vkDeviceWaitIdle(vkDevice);
+     destroySwapchainViews();
+     depth.reset();
+     destroyScene(vkDevice, *scene);
+ 
+     if (enableValidation && context->hasValidationErrors()) {
+         RX_LOG_ERROR("Vulkan validation layer reported errors during the present loop");
+diff --git a/samples/04_streaming/main.cpp b/samples/04_streaming/main.cpp
+index 1ba5fc4..e9b394e 100644
+--- a/samples/04_streaming/main.cpp
++++ b/samples/04_streaming/main.cpp
+@@ -148,20 +148,21 @@
+ //   (default / no args) Headless correctness gate: 60 real frames through
+ //   a genuine 2-frames-in-flight offscreen loop, readback probes at every
+ //   grid cell's screen position on every frame, asserting every one of
+ //   the 24 textures was actually observed resident on screen at some
+ //   point, plus zero validation errors (the assertion that would catch a
+ //   premature-destroy bug). Registered as ctest
+ //   sample_04_streaming_headless.
+ //   --present. Real window, the same 24-cell grid, static camera,
+ //   streaming continuing forever at roughly 1 texture/second.
+ #include <rx_core/log.h>
++#include <rx_core/profile.h>
+ #include <rx_platform/window.h>
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/deletion_queue.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/frame_sync.h>
+ #include <rx_rhi_vk/mesh_buffers.h>
+ #include <rx_rhi_vk/pipeline_layout.h>
+@@ -1455,20 +1456,26 @@ int runHeadless(bool enableValidation) {
+         // completed.
+         if (vkQueueSubmit(device->graphicsQueue(), 1, &submitInfo, fence) != VK_SUCCESS) {
+             RX_LOG_ERROR("vkQueueSubmit failed in headless streaming loop");
+             ok = false;
+             break;
+         }
+ 
+         slot.frameNumber = thisFrameNumber;
+         slot.everUsed = true;
+ 
++        // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3,
++        // spec D3] -- headless-mode path: unlike this sample's siblings,
++        // this headless loop drives a real rx::rhi::FrameSync frames-in-
++        // flight cycle (kHeadlessTotalFrames + kSlotCount iterations), so
++        // each iteration is a genuine rendered frame in its own right.
++        RX_FRAME_MARK;
+         frameSync->advanceFrame();
+     }
+ 
+     if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
+         RX_LOG_ERROR("vkDeviceWaitIdle failed at headless streaming shutdown");
+         ok = false;
+     }
+     for (auto& slot : slots) {
+         destroyOffscreenSlot(vkDevice, *slot);
+     }
+@@ -1771,20 +1778,24 @@ int runPresent(bool enableValidation) {
+                 RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
+                 ok = false;
+                 break;
+             }
+         } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("device lost during present; exiting present loop");
+             ok = false;
+             break;
+         }
+ 
++        // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3,
++        // spec D3] -- present-mode path; see the headless loop above for
++        // this sample's other frame boundary.
++        RX_FRAME_MARK;
+         frameSync->advanceFrame();
+     }
+ 
+     vkDeviceWaitIdle(vkDevice);
+     destroySwapchainViews();
+     destroyScene(vkDevice, *scene);  // drains the DeletionQueue (flushAll) before tearing down.
+ 
+     if (enableValidation && context->hasValidationErrors()) {
+         RX_LOG_ERROR("Vulkan validation layer reported errors during the present loop");
+         return 1;
+diff --git a/samples/05_multipass/main.cpp b/samples/05_multipass/main.cpp
+index ce45c88..abbde6f 100644
+--- a/samples/05_multipass/main.cpp
++++ b/samples/05_multipass/main.cpp
+@@ -119,20 +119,21 @@
+ // Two modes, exactly like every other sample in this codebase:
+ //   (default / no args) Headless correctness gate: fixed camera/light,
+ //   kHeadlessFrameCount=3 frames through the graph, readback, and the three
+ //   assertions the coordinator's brief specifies (shadow probe >2x darker
+ //   than the lit probe; lit probe non-trivially bright; every readback byte
+ //   in range, i.e. genuinely tonemapped, not a raw HDR overflow). Registered
+ //   as ctest sample_05_multipass_headless.
+ //   --present. Real window, the same scene, the light continuously
+ //   orbiting in azimuth.
+ #include <rx_core/log.h>
++#include <rx_core/profile.h>
+ #include <rx_platform/window.h>
+ #include <rx_graph/executor.h>
+ #include <rx_graph/render_graph.h>
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/frame_sync.h>
+ #include <rx_rhi_vk/mesh_buffers.h>
+@@ -1644,20 +1645,25 @@ int runHeadless(bool enableValidation) {
+     // Every render frame is its own SEPARATE runOnce() submission -- see
+     // this file's header comment ("BACKBUFFER REUSE ACROSS REPEATED
+     // execute() CALLS") for why that separation, not a style choice, is
+     // what makes each call's own graph-derived tonemap-entry barrier safe
+     // despite compile()'s stateless UNDEFINED assumption.
+     const VkExtent2D extent{kHeadlessWidth, kHeadlessHeight};
+     for (uint32_t frame = 0; frame < kHeadlessFrameCount; ++frame) {
+         cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+             executor->execute(graph, cmd, offscreenImage, offscreenView, extent);
+         });
++        // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3,
++        // spec D3] -- headless-mode path: each loop iteration is its own
++        // separate runOnce() submission through the render graph, i.e. a
++        // real, distinct rendered frame.
++        RX_FRAME_MARK;
+     }
+ 
+     auto readback = allocator->createHostVisibleBuffer(kHeadlessPixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+     if (!readback.has_value()) {
+         RX_LOG_ERROR("createHostVisibleBuffer(readback) failed");
+         destroyRawResources();
+         return 1;
+     }
+ 
+     cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+@@ -2079,20 +2085,24 @@ int runPresent(bool enableValidation) {
+                 ok = false;
+                 break;
+             }
+             compileForExtent(device->swapchainExtent());
+         } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("device lost during present; exiting present loop");
+             ok = false;
+             break;
+         }
+ 
++        // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3,
++        // spec D3] -- present-mode path, right after this frame's present/
++        // submit has completed.
++        RX_FRAME_MARK;
+         frameSync->advanceFrame();
+     }
+ 
+     vkDeviceWaitIdle(vkDevice);
+     destroySwapchainViews();
+     destroyScene(vkDevice, *scene);
+     // `executor` and `graph` go out of scope after this point, in reverse
+     // declaration order -- Executor's own destructor already
+     // vkDeviceWaitIdle()s before tearing down its transient pool (see
+     // executor.cpp), so this explicit wait above is for the scene's own
+diff --git a/samples/06_materials/main.cpp b/samples/06_materials/main.cpp
+index 63a5ba0..5b6bb49 100644
+--- a/samples/06_materials/main.cpp
++++ b/samples/06_materials/main.cpp
+@@ -138,20 +138,21 @@
+ //   changes a material's PARAMETER BLOCK SHAPE (adds/removes/retypes a
+ //   `gParams` field) is out of this sample's documented hot-reload scope
+ //   (matching src/rx_material/tests/test_material_system.cpp's own
+ //   reload-fixture convention of only ever changing a material's MATH, not
+ //   its params' shape, across reload versions) -- rather than let that
+ //   crash a running --present session, that one object's draw is skipped
+ //   for the frame and the failure is logged.
+ #include <rx_material/rx_api.h>  // PUBLIC surface -- used throughout this file below.
+ 
+ #include <rx_core/log.h>
++#include <rx_core/profile.h>
+ #include <rx_graph/executor.h>
+ #include <rx_graph/render_graph.h>
+ #include <rx_platform/window.h>
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/frame_sync.h>
+ #include <rx_rhi_vk/upload.h>
+@@ -1323,20 +1324,25 @@ int runHeadless(bool enableValidation) {
+     // in-flight index stays 0 the whole run (fixed camera -- see
+     // updateFrame()'s own call above); materialBridge::beginFrame()/
+     // onFrameCompleted() are still exercised once per iteration each, with
+     // a genuinely distinct frameNumber, matching MaterialSystem's own
+     // frames-in-flight discipline (material_system.h).
+     const VkExtent2D extent{kHeadlessWidth, kHeadlessHeight};
+     for (uint32_t frame = 0; frame < kHeadlessFrameCount; ++frame) {
+         materialBridge::beginFrame(scene.materialSystem, /*frameInFlightIndex=*/0, /*frameNumber=*/frame);
+         cmdCtx->runOnce([&](VkCommandBuffer cmd) { executor->execute(graph, cmd, offscreenImage, offscreenView, extent); });
+         materialBridge::onFrameCompleted(scene.materialSystem, frame);
++        // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3,
++        // spec D3] -- headless-mode path: each loop iteration is its own
++        // separate runOnce() submission through the render graph, i.e. a
++        // real, distinct rendered frame.
++        RX_FRAME_MARK;
+     }
+ 
+     auto readback = allocator->createHostVisibleBuffer(kHeadlessPixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+     if (!readback.has_value()) {
+         RX_LOG_ERROR("createHostVisibleBuffer(readback) failed");
+         destroyRawResources();
+         return 1;
+     }
+ 
+     cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+@@ -1690,20 +1696,24 @@ int runPresent(bool enableValidation) {
+                 ok = false;
+                 break;
+             }
+             compileForExtent(device->swapchainExtent());
+         } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("device lost during present; exiting present loop");
+             ok = false;
+             break;
+         }
+ 
++        // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3,
++        // spec D3] -- present-mode path, right after this frame's present/
++        // submit has completed.
++        RX_FRAME_MARK;
+         frameSync->advanceFrame();
+     }
+ 
+     vkDeviceWaitIdle(vkDevice);
+     destroySwapchainViews();
+     destroyScene(scene);
+     // `executor`, `graph`, and `frameSync` go out of scope after this point,
+     // in reverse declaration order -- Executor's own destructor already
+     // vkDeviceWaitIdle()s before tearing down its transient pool, and
+     // FrameSync's own destructor contract (frame_sync.h) requires exactly
+diff --git a/src/rx_core/CMakeLists.txt b/src/rx_core/CMakeLists.txt
+index 88a9438..1a93ad4 100644
+--- a/src/rx_core/CMakeLists.txt
++++ b/src/rx_core/CMakeLists.txt
+@@ -1,14 +1,34 @@
+ add_library(rx_core STATIC
+     src/log.cpp
+ )
+ target_include_directories(rx_core PUBLIC include)
+ target_link_libraries(rx_core PUBLIC spdlog::spdlog glm::glm)
+ 
++# Tracy client integration [spec D3, Phase 4 Stage 0 Task 3] -- rx_core is
++# the ONE place this project defines TRACY_ENABLE and links Tracy::TracyClient,
++# both PUBLIC: rx_core is a public, transitive dependency of every other
++# library and sample in this engine, so this single wiring point is what
++# makes rx_core/profile.h's RX_ZONE*/RX_FRAME_MARK/RX_PLOT macros (and
++# rx_rhi_vk/tracy_gpu.h's own GPU-zone macros, which key off the identical
++# TRACY_ENABLE definition) agree, project-wide, on whether Tracy is compiled
++# in -- with zero additional per-library CMake wiring. Guarded on RX_TRACY
++# (third_party/CMakeLists.txt's own top-level option): when it is OFF, the
++# Tracy::TracyClient target does not exist at all (that whole dependency
++# block never runs), so neither this compile definition nor this link
++# dependency exists either -- the OFF configuration compiles and links with
++# zero Tracy symbols anywhere in the resulting binaries, by construction,
++# not by convention.
++if(RX_TRACY)
++    target_compile_definitions(rx_core PUBLIC TRACY_ENABLE)
++    target_link_libraries(rx_core PUBLIC Tracy::TracyClient)
++endif()
++
+ add_executable(rx_core_tests
+     tests/doctest_main.cpp
+     tests/log_test.cpp
+     tests/handle_test.cpp
+     tests/math_test.cpp
++    tests/profile_test.cpp
+ )
+ target_link_libraries(rx_core_tests PRIVATE rx_core doctest::doctest)
+ add_test(NAME rx_core_tests COMMAND rx_core_tests)
+diff --git a/src/rx_core/include/rx_core/profile.h b/src/rx_core/include/rx_core/profile.h
+new file mode 100644
+index 0000000..dd4c617
+--- /dev/null
++++ b/src/rx_core/include/rx_core/profile.h
+@@ -0,0 +1,90 @@
++#pragma once
++
++// rx_core/profile.h -- the engine's ONLY CPU-zone Tracy seam [spec D3,
++// Phase 4 Stage 0 Task 3]. Every other rx_* public header must consume
++// profiling exclusively through the RX_ZONE*/RX_FRAME_MARK/RX_PLOT macros
++// below, never by naming a Tracy type/macro directly -- this is the ONE
++// header, project-wide, that may #include a Tracy CPU header. (rx_rhi_vk's
++// tracy_gpu.h is the separate, equally exclusive seam for the Vulkan
++// GPU-zone API -- TracyVulkan.hpp is never named outside that one file
++// either. Two seams, each the sole owner of its own domain, not one seam
++// covering both -- GPU-zone macros are inherently Vulkan-coupled and belong
++// in rx_rhi_vk, not rx_core, which stays Vulkan-free.)
++//
++// TRACY_ENABLE is a PUBLIC compile definition on rx_core (see
++// src/rx_core/CMakeLists.txt), set if and only if the top-level RX_TRACY
++// CMake option is ON (third_party/CMakeLists.txt's own `if(RX_TRACY)` guard
++// decides whether Tracy is even fetched/built at all). Because rx_core is a
++// public, transitive dependency of every other library and sample in this
++// engine, that one definition point is what makes every RX_ZONE*/
++// RX_FRAME_MARK/RX_PLOT call site in the whole codebase agree on whether
++// Tracy is compiled in, with no per-library wiring required.
++//
++// When TRACY_ENABLE is OFF, <tracy/Tracy.hpp> is not even reachable on the
++// include path -- the dependency was never fetched (RX_TRACY was OFF at
++// configure time) -- so this header must not name a Tracy header or symbol
++// at all in that branch. The #else block below defines every macro as a
++// bare no-op directly, matching Tracy's own "compiles to nothing when
++// disabled" contract (public/tracy/Tracy.hpp's own `#ifndef TRACY_ENABLE`
++// branch, verified directly against the vendored v0.14.0 tag before writing
++// this) bit for bit, without depending on that header being present.
++#ifdef TRACY_ENABLE
++
++#include <tracy/Tracy.hpp>
++
++// RX_ZONE -- scoped CPU zone for the remainder of the enclosing block,
++// named automatically after the enclosing function (Tracy's own
++// ZoneScoped: records function name, source file, and line at the call
++// site). Statement-style, no parentheses at the call site (`RX_ZONE;`),
++// mirroring Tracy's own ZoneScoped convention exactly -- this is an
++// object-like macro, not a function-like one, so it can expand to a local
++// RAII variable declaration.
++#define RX_ZONE ZoneScoped
++
++// RX_ZONE_NAMED(nameLiteral) -- scoped CPU zone with a fixed, compile-time
++// display name (Tracy's ZoneScopedN; `nameLiteral` must be a string literal
++// with static storage duration -- Tracy retains only the pointer, never
++// copies the text). Use RX_ZONE_DYNAMIC_NAME below, inside the same scope,
++// to additionally attach a runtime-known name to this same zone.
++#define RX_ZONE_NAMED(nameLiteral) ZoneScopedN(nameLiteral)
++
++// RX_ZONE_DYNAMIC_NAME(text, size) -- sets a per-call, runtime-known name
++// on the CURRENTLY ACTIVE zone (i.e. the nearest enclosing RX_ZONE/
++// RX_ZONE_NAMED in this same scope) [task-3 dispatch item 4: per-pass zones
++// keyed by a render-graph pass's own std::string-backed name, which is
++// never a compile-time literal]. Tracy's own documented idiom for exactly
++// this case (Tracy user manual, "Marking frames" -> zone-naming
++// subsection: "If you want to set zone name on a per-call basis, you may
++// do so using the ZoneName(text, size) macro" -- verified directly against
++// the vendored v0.14.0 manual/tracy.tex before writing this). `text` need
++// not be null-terminated (an explicit `size` is always passed); Tracy
++// copies the bytes into its own buffer, unlike a zone's static NAME
++// literal above, so `text`'s lifetime need only cover this call, not the
++// zone's own duration. The one addition to the 4-macro list this task's
++// resolutions named (RX_ZONE/RX_ZONE_NAMED/RX_FRAME_MARK/RX_PLOT) -- added
++// because dispatch item 4 explicitly requires dynamic per-pass zone naming,
++// and profile.h is this project's one CPU-zone include point, so the
++// wrapper belongs here rather than as a raw Tracy call in a .cpp.
++#define RX_ZONE_DYNAMIC_NAME(text, size) ZoneName(text, size)
++
++// RX_FRAME_MARK -- marks the end of one rendered frame (Tracy's FrameMark).
++// Statement-style, no parentheses (`RX_FRAME_MARK;`), exactly like RX_ZONE
++// above and Tracy's own FrameMark. Call once per frame, in every sample's
++// frame loop (present and headless paths alike) [task-3 dispatch item 4].
++#define RX_FRAME_MARK FrameMark
++
++// RX_PLOT(nameLiteral, value) -- plots a named numeric time series (Tracy's
++// TracyPlot; `nameLiteral` must be a string literal with static storage
++// duration, same requirement as RX_ZONE_NAMED's name). `value` may be any
++// type TracyPlot itself accepts (integral or floating-point).
++#define RX_PLOT(nameLiteral, value) TracyPlot(nameLiteral, value)
++
++#else
++
++#define RX_ZONE
++#define RX_ZONE_NAMED(nameLiteral)
++#define RX_ZONE_DYNAMIC_NAME(text, size)
++#define RX_FRAME_MARK
++#define RX_PLOT(nameLiteral, value)
++
++#endif  // TRACY_ENABLE
+diff --git a/src/rx_core/tests/profile_test.cpp b/src/rx_core/tests/profile_test.cpp
+new file mode 100644
+index 0000000..0a26bf5
+--- /dev/null
++++ b/src/rx_core/tests/profile_test.cpp
+@@ -0,0 +1,73 @@
++#include <doctest/doctest.h>
++#include <rx_core/profile.h>
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++
++// Compile-and-run coverage for rx_core/profile.h [task-3 binding
++// constraint: "profile.h no-op compile test: a TU using all macros with
++// TRACY off AND on"]. This single TU is unconditional -- it always compiles
++// and always runs, in BOTH of this task's verified configurations (RX_TRACY
++// ON, the default dev-preset build, and RX_TRACY OFF, the extra verification
++// build in the report) -- TRACY_ENABLE's own value (propagated transitively
++// from rx_core's PUBLIC compile definition, see src/rx_core/CMakeLists.txt)
++// is what silently switches every macro below between a real Tracy call and
++// a bare no-op; this file never spells out `#ifdef TRACY_ENABLE` itself,
++// which is the whole point -- a caller of these macros never needs to know
++// or care which build it is in.
++
++namespace {
++
++int zoneScopedFunction(int value) {
++    RX_ZONE;
++    return value * 2;
++}
++
++int zoneNamedFunction(int value) {
++    RX_ZONE_NAMED("zoneNamedFunction");
++    return value + 1;
++}
++
++int dynamicNameFunction(const char* dynamicLabel, size_t labelLen) {
++    RX_ZONE_NAMED("dynamicNameFunction");
++    RX_ZONE_DYNAMIC_NAME(dynamicLabel, labelLen);
++    return static_cast<int>(labelLen);
++}
++
++}  // namespace
++
++TEST_CASE("RX_ZONE compiles and runs (no-op or real zone depending on TRACY_ENABLE)") {
++    CHECK(zoneScopedFunction(21) == 42);
++}
++
++TEST_CASE("RX_ZONE_NAMED compiles and runs") {
++    CHECK(zoneNamedFunction(41) == 42);
++}
++
++TEST_CASE("RX_ZONE_DYNAMIC_NAME compiles and runs alongside RX_ZONE_NAMED") {
++    const std::string dynamicPassName = "graph_pass_example";
++    CHECK(dynamicNameFunction(dynamicPassName.data(), dynamicPassName.size()) ==
++          static_cast<int>(dynamicPassName.size()));
++}
++
++TEST_CASE("RX_FRAME_MARK compiles and runs in a loop, as every sample's frame loop does") {
++    for (int frame = 0; frame < 3; ++frame) {
++        RX_ZONE;
++        RX_FRAME_MARK;
++    }
++    CHECK(true);
++}
++
++TEST_CASE("RX_PLOT compiles and runs with integral and floating-point values") {
++    // Tracy's own TracyPlot forwards to an overload set (PlotData(const
++    // char*, int64_t/float/double)) -- a plain `int` is ambiguous between
++    // them (an equally-good implicit conversion to any of the three), so
++    // this deliberately casts to int64_t explicitly, matching how any real
++    // caller (e.g. a future pool-byte-budget or draw-count plot) must.
++    for (int i = 0; i < 5; ++i) {
++        RX_PLOT("profile_test.counter", static_cast<int64_t>(i));
++        RX_PLOT("profile_test.ratio", static_cast<double>(i) / 2.0);
++    }
++    CHECK(true);
++}
+diff --git a/src/rx_graph/executor.cpp b/src/rx_graph/executor.cpp
+index 76cddba..6b21a06 100644
+--- a/src/rx_graph/executor.cpp
++++ b/src/rx_graph/executor.cpp
+@@ -1,18 +1,20 @@
+ #include <rx_graph/executor.h>
+ 
+ #include "transient_pool.h"
+ 
+ #include <rx_core/log.h>
++#include <rx_core/profile.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/deletion_queue.h>
+ #include <rx_rhi_vk/device.h>
++#include <rx_rhi_vk/tracy_gpu.h>
+ #include <volk.h>
+ 
+ #include <algorithm>
+ #include <optional>
+ #include <span>
+ #include <stdexcept>
+ #include <string>
+ #include <unordered_map>
+ #include <utility>
+ #include <vector>
+@@ -150,20 +152,29 @@ struct Executor::Impl {
+     // VkCommandBuffer (execute()'s own `cmd` parameter) and never needed a
+     // real queue/queue-family of its own before this.
+     VkQueue graphicsQueue = VK_NULL_HANDLE;
+     uint32_t graphicsQueueFamily = 0;
+ 
+     rx::rhi::Allocator allocator;
+     detail::TransientPool pool;
+     rx::rhi::DeletionQueue deletionQueue;
+     bool debugUtilsAvailable = false;
+ 
++    // Tracy GPU-zone context [Phase 4 Stage 0 Task 3, spec D3] -- created
++    // once per Executor (i.e. per Device, since Executor::create() is the
++    // sole owner of exactly one of these) in Executor::create() below, and
++    // destroyed in ~Executor(). nullptr when RX_TRACY/TRACY_ENABLE is off
++    // (createGpuProfileContext() itself degrades to a constant nullptr
++    // return in that build -- see tracy_gpu.h/.cpp) or if context creation
++    // failed -- every use of it below is null-safe either way.
++    rx::rhi::GpuProfileContext gpuProfileCtx = nullptr;
++
+     // Executor's own monotonic tick, one increment per execute() call --
+     // the clock TransientPool's staleness sweep and this Impl's own
+     // deletion-queue pacing (see Executor::execute()) both run against.
+     // Phase 4 Task 1: also the ping-pong parity clock -- a history
+     // resource's write slot for a given execute() call is
+     // `frameCounter % 2`, its read slot `(frameCounter + 1) % 2` [design
+     // contract point 2], read by every history-aware function below
+     // directly off this same field, never a separate counter.
+     uint64_t frameCounter = 0;
+ 
+@@ -613,38 +624,50 @@ std::unique_ptr<Executor> Executor::create(rx::rhi::Device& device) {
+     // vkFoo (context.cpp/device.cpp track NO explicit enabled-extension
+     // list at all -- confirmed by reading both; there is nothing to read
+     // "capabilities" off of beyond volk's own loaded tables). volkLoadDevice()
+     // (already run inside rx::rhi::Device::create(), before any Executor
+     // can exist) leaves this device-level function pointer non-null if and
+     // only if VK_EXT_debug_utils was actually enabled/available -- exactly
+     // the same null-checked-before-use discipline every debug-label call
+     // site below follows.
+     impl->debugUtilsAvailable = (vkCmdBeginDebugUtilsLabelEXT != nullptr && vkCmdEndDebugUtilsLabelEXT != nullptr);
+ 
++    // Tracy GPU-zone context: created once per Executor/Device [Phase 4
++    // Stage 0 Task 3, spec D3] -- see tracy_gpu.h's own comment for exactly
++    // which of TracyVkContextCalibrated/TracyVkContext this resolves to,
++    // and why null-safe unconditionally (nullptr on RX_TRACY=OFF or on any
++    // creation failure, never fatal to Executor::create() itself -- a
++    // renderer must not fail to start because a profiler capability could
++    // not be wired up).
++    impl->gpuProfileCtx = rx::rhi::createGpuProfileContext(device);
++
+     return std::unique_ptr<Executor>(new Executor(std::move(impl)));
+ }
+ 
+ Executor::Executor(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+ 
+ Executor::~Executor() {
+     if (!impl_) {
+         return;
+     }
+     // "waits idle via existing Device teardown conventions" [task-3-brief.md]
+     // -- the same vkDeviceWaitIdle-before-destroying-anything discipline
+     // FrameSync's/DeletionQueue's own destructor contracts already
+     // document as load-bearing elsewhere in this engine. Proves no
+     // in-flight command buffer can still reference anything this
+     // destructor is about to tear down, before retireAll()/flushAll() run
+     // unconditionally (both otherwise-unsafe on a queue that might still
+     // be executing).
+     vkDeviceWaitIdle(impl_->device);
++    // Null-safe unconditionally (RX_TRACY off, or any context-creation
++    // failure) -- see tracy_gpu.h's own comment on RX_GPU_CONTEXT_DESTROY.
++    RX_GPU_CONTEXT_DESTROY(impl_->gpuProfileCtx);
+     impl_->pool.retireAll(impl_->frameCounter, impl_->deletionQueue);
+     impl_->deletionQueue.flushAll();
+ }
+ 
+ void Executor::realize(const RenderGraph& graph) {
+     Impl& impl = *impl_;
+     const CompiledGraph& compiled = graph.compiled();
+     const std::span<const PhysicalResource> resources = compiled.resources();
+ 
+     impl.pool.beginRealizeBatch();
+@@ -726,20 +749,24 @@ void Executor::realize(const RenderGraph& graph) {
+             entry.extent = texture.extent();
+         }
+     }
+ 
+     impl.resources = std::move(resolved);
+     impl.nameToIndex = std::move(nameToIndex);
+ }
+ 
+ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage backbufferImage,
+                         VkImageView backbufferView, VkExtent2D backbufferExtent) {
++    // Whole-execute() CPU zone [Phase 4 Stage 0 Task 3, spec D3: "Executor::
++    // execute (whole)"] -- spans this entire call, i.e. every pass this
++    // frame, on top of the per-pass zones declared inside the loop below.
++    RX_ZONE;
+     Impl& impl = *impl_;
+     const CompiledGraph& compiled = graph.compiled();
+     const std::span<const PhysicalResource> resources = compiled.resources();
+ 
+     ++impl.frameCounter;
+ 
+     // Evict any pooled entry a past realize() released and nothing has
+     // reclaimed for kStaleAfterExecutes consecutive execute() calls, then
+     // let the deletion queue actually run whatever this (or a past) sweep
+     // already tagged as safe -- see transient_pool.h's own comment on
+@@ -774,20 +801,60 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
+     std::unordered_map<uint32_t, VkAccessFlags2> finalAccessThisExecute;
+ 
+     const std::span<const uint32_t> order = compiled.executionOrder();
+     const std::span<const PassBarriers> allBarriers = compiled.passBarriers();
+ 
+     for (size_t pos = 0; pos < order.size(); ++pos) {
+         const uint32_t rawIndex = order[pos];
+         const Pass& pass = graph.passAt(rawIndex);
+         const std::span<const ResourceAccess> accesses = compiled.passAccesses(rawIndex);
+ 
++        // Per-pass CPU zone, named dynamically from the pass's own
++        // std::string-backed name [Phase 4 Stage 0 Task 3, spec D3: "per-
++        // pass named zones (use the pass's name string ... Tracy zones
++        // want static strings; use ZoneScopedN for fixed + ZoneText/
++        // ZoneName for the dynamic pass name")]. A pass name is set once,
++        // at RenderGraph::addPass() time, and never changes for the
++        // lifetime of the graph -- but it is still a runtime std::string,
++        // never a compile-time literal, so it cannot be handed to
++        // ZoneScopedN's own `name` parameter directly (Tracy retains only
++        // the pointer for that one, assuming static storage duration).
++        // RX_ZONE_NAMED below gives the zone a fixed, always-valid display
++        // name ("graph_pass"); RX_ZONE_DYNAMIC_NAME then attaches this
++        // call's real pass name via Tracy's documented per-call dynamic-
++        // name mechanism (see rx_core/profile.h's own citation of the
++        // Tracy manual for exactly this macro).
++        RX_ZONE_NAMED("graph_pass");
++        RX_ZONE_DYNAMIC_NAME(pass.name().data(), pass.name().size());
++
++        // Matching per-pass GPU zone [spec D3: "TracyVkZone around
++        // Executor's per-pass command recording"] -- spans from just
++        // before this pass's own barriers through its
++        // vkCmdBeginRendering/execute-callback/vkCmdEndRendering (i.e. the
++        // same span the CPU zone above covers), timestamped on `cmd`
++        // itself. Uses the "transient" GPU-zone idiom (TracyVkZoneTransient,
++        // via RX_GPU_ZONE_DYNAMIC -- see tracy_gpu.h's own citation of the
++        // Tracy manual's "Transient GPU zones" section) rather than plain
++        // TracyVkZone specifically because -- exactly like the CPU zone
++        // above -- a render-graph pass's name is a runtime std::string, not
++        // a compile-time literal; TracyVkZone's own `name` parameter must be
++        // the latter. `pass.name().data()` is safe to hand to Tracy's
++        // internal `strlen()` call unterminated-string-free: Pass::name()
++        // (render_graph.cpp) always returns the WHOLE backing std::string
++        // (never a substring), so `.data()` is null-terminated by the same
++        // guarantee std::string::c_str() gives. Null-safe unconditionally
++        // (RX_GPU_ZONE_DYNAMIC compiles away entirely when TRACY_ENABLE is
++        // off; Tracy's own VkCtxScope no-ops when constructed with a null
++        // ctx when it is on -- verified directly against the vendored
++        // v0.14.0 source before writing this).
++        RX_GPU_ZONE_DYNAMIC(impl.gpuProfileCtx, rxGpuPassZone, cmd, pass.name().data());
++
+         beginDebugLabel(impl, cmd, pass.name());
+ 
+         applyBarriers(impl, compiled, cmd, allBarriers[pos], firstBarrierSeen);
+         synthesizeFirstUseBufferBarrierIfNeeded(impl, compiled, cmd, accesses, pos, firstBarrierSeen);
+         applyHistoryAccesses(impl, compiled, cmd, accesses);
+ 
+         // Classify this pass's own declared accesses into color/depth
+         // attachment outputs [spec Phase 3 design, D2] -- every other
+         // declared AccessKind (TextureInput, StorageBufferOutput/Input)
+         // resolves to a layout that is neither COLOR_ATTACHMENT_OPTIMAL
+@@ -959,20 +1026,37 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
+         if (resources[physIdx].isBuffer) {
+             impl.pool.buffer(resolvedRes.poolIndex).lastFrameFinalStages = stage;
+             impl.pool.buffer(resolvedRes.poolIndex).lastFrameFinalAccess = access;
+             impl.pool.touchBuffer(resolvedRes.poolIndex, impl.frameCounter);
+         } else {
+             impl.pool.image(resolvedRes.poolIndex).lastFrameFinalStages = stage;
+             impl.pool.image(resolvedRes.poolIndex).lastFrameFinalAccess = access;
+             impl.pool.touchImage(resolvedRes.poolIndex, impl.frameCounter);
+         }
+     }
++
++    // Collect this frame's GPU timestamp queries [spec D3: "TracyVkCollect
++    // once per frame (hook where FrameSync completes a frame)"] -- hooked
++    // HERE, at the very end of this same execute() call, rather than
++    // reaching back into rx::rhi::FrameSync itself: FrameSync (frame_sync.h)
++    // has no notion of Tracy or of this Executor's GPU context at all (by
++    // design -- see profile.h/tracy_gpu.h's own "no Tracy in any OTHER
++    // public header" rule), while Executor::execute() already runs exactly
++    // once per real frame, on the exact command buffer FrameSync's own
++    // frame-in-flight slot owns, and is the sole owner of gpuProfileCtx --
++    // making this the one point in the whole call graph that already has
++    // every piece Collect() needs with no new coupling. `cmd` is guaranteed
++    // outside a render pass instance here (every vkCmdEndRendering this
++    // call could have issued already ran, inside the per-pass loop above;
++    // the finalBarriers() call just above never opens one) -- exactly
++    // Tracy's own documented requirement for TracyVkCollect.
++    RX_GPU_COLLECT(impl.gpuProfileCtx, cmd);
+ }
+ 
+ namespace {
+ 
+ uint32_t lookupResolvedIndex(const Executor::Impl& impl, std::string_view name) {
+     auto it = impl.nameToIndex.find(std::string(name));
+     if (it == impl.nameToIndex.end()) {
+         throw std::out_of_range("rx_graph: PassContext: no realized resource named '" + std::string(name) + "'");
+     }
+     return it->second;
+diff --git a/src/rx_material/instance.cpp b/src/rx_material/instance.cpp
+index df985b4..24545be 100644
+--- a/src/rx_material/instance.cpp
++++ b/src/rx_material/instance.cpp
+@@ -1,13 +1,14 @@
+ #include <rx_material/instance.h>
+ 
+ #include <rx_core/log.h>
++#include <rx_core/profile.h>
+ 
+ #include <cstring>
+ #include <utility>
+ 
+ namespace rx::material {
+ 
+ std::optional<ParamArena> ParamArena::create(VkDevice device, rx::rhi::Allocator& allocator,
+                                               uint32_t framesInFlight) {
+     if (framesInFlight == 0) {
+         RX_LOG_ERROR("rx::material::ParamArena::create: framesInFlight must be > 0");
+@@ -34,20 +35,21 @@ std::optional<ParamArena> ParamArena::create(VkDevice device, rx::rhi::Allocator
+ 
+     ParamArena arena;
+     arena.device_ = device;
+     arena.descriptorArena_ = std::move(*descriptorArena);
+     arena.buffers_ = std::move(buffers);
+     arena.cursors_.assign(framesInFlight, 0);
+     return arena;
+ }
+ 
+ void ParamArena::beginFrame(uint32_t frameIndex) {
++    RX_ZONE;
+     currentFrame_ = frameIndex % static_cast<uint32_t>(buffers_.size());
+     cursors_[currentFrame_] = 0;
+     descriptorArena_->beginFrame(frameIndex);
+ }
+ 
+ VkDescriptorSet ParamArena::writeAndAllocate(VkDescriptorSetLayout setLayout, const void* data, size_t size) {
+     if (data == nullptr || size == 0) {
+         RX_LOG_ERROR("rx::material::ParamArena::writeAndAllocate: data/size must be non-null/non-zero");
+         return VK_NULL_HANDLE;
+     }
+diff --git a/src/rx_material/material_system.cpp b/src/rx_material/material_system.cpp
+index f6fe21c..a59c6c8 100644
+--- a/src/rx_material/material_system.cpp
++++ b/src/rx_material/material_system.cpp
+@@ -1,14 +1,15 @@
+ #include <rx_material/material_system.h>
+ 
+ #include <rx_core/handle.h>
+ #include <rx_core/log.h>
++#include <rx_core/profile.h>
+ #include <rx_rhi_vk/deletion_queue.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/pipeline_layout.h>
+ #include <rx_rhi_vk/texture.h>
+ #include <rx_rhi_vk/upload.h>
+ 
+ #include <slang-com-ptr.h>
+ #include <slang.h>
+ 
+ #include <array>
+@@ -1069,20 +1070,21 @@ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device,
+     impl->vertexEntryPoint = std::move(forwardEntry->vertexEntryPoint);
+     impl->fragmentEntryPoint = std::move(forwardEntry->fragmentEntryPoint);
+     impl->allocator = std::move(allocator);
+     impl->uploader = std::move(uploader);
+     impl->paramArena = std::move(paramArena);
+ 
+     return std::unique_ptr<MaterialSystem>(new MaterialSystem(std::move(impl)));
+ }
+ 
+ MaterialHandle MaterialSystem::loadMaterial(const std::filesystem::path& slangModulePath) {
++    RX_ZONE;
+     Impl& impl = *impl_;
+ 
+     // Copies impl.session (Slang::ComPtr addRef, cheap) rather than moving
+     // it -- this MaterialSystem keeps using impl.session for every FUTURE
+     // loadMaterial() call too. See compileMaterial()'s own header comment.
+     ++impl.compileCount;
+     std::string diagnostics;
+     auto compiled = compileMaterial(impl.device, *impl.bindless, Slang::ComPtr<slang::ISession>(impl.session),
+                                      impl.forwardEntryModule, impl.vertexEntryPoint.get(),
+                                      impl.fragmentEntryPoint.get(), slangModulePath, diagnostics);
+@@ -1202,20 +1204,21 @@ void MaterialSystem::bindInstance(VkCommandBuffer cmd, const rx::graph::PassCont
+     if (set == VK_NULL_HANDLE) {
+         throw std::runtime_error(
+             "rx_material: MaterialSystem::bindInstance: parameter arena exhausted for the current frame");
+     }
+ 
+     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, record->layoutBundle.layout,
+                              /*firstSet=*/kMaterialParamBlockSet, 1, &set, 0, nullptr);
+ }
+ 
+ void MaterialSystem::reloadChanged() {
++    RX_ZONE;
+     Impl& impl = *impl_;
+     // [Task 8] The SAME resolved directory create() built this instance
+     // with (impl.sharedShaderDir) -- never re-reads RX_MATERIAL_SHADER_DIR
+     // directly, so a MaterialSystem built against a caller-supplied
+     // sharedShaderDir keeps reloading against that same directory, not the
+     // compile-time default.
+     const std::filesystem::path& shaderDir = impl.sharedShaderDir;
+ 
+     for (MaterialHandle handle : impl.materialHandles) {
+         // Re-fetched fresh every iteration -- see Impl::materialHandles'
+@@ -1346,20 +1349,21 @@ void MaterialSystem::reloadChanged() {
+         record->layoutBundle = std::move(compiled->layoutBundle);
+         record->vertexModule = compiled->vertexModule;
+         record->fragmentModule = compiled->fragmentModule;
+ 
+         RX_LOG_INFO("rx_material: hot-reload of '{}' succeeded (module hash {:#x} -> {:#x})", record->path.string(),
+                     oldHash, record->contentHash);
+     }
+ }
+ 
+ VkPipeline MaterialSystem::getPipeline(const PipelineRequest& req) {
++    RX_ZONE;
+     Impl& impl = *impl_;
+ 
+     MaterialRecord* record = impl.materials.get(req.material);
+     if (record == nullptr) {
+         throw std::out_of_range("rx_material: MaterialSystem::getPipeline: invalid or stale MaterialHandle");
+     }
+ 
+     // [Task 5 ambiguity resolution] no Phase 3 use case for a graphics
+     // pipeline with neither a color nor a depth attachment.
+     if (req.pass.colorCount == 0 && req.pass.depthFormat == VK_FORMAT_UNDEFINED) {
+diff --git a/src/rx_rhi_vk/CMakeLists.txt b/src/rx_rhi_vk/CMakeLists.txt
+index 941833d..f156e42 100644
+--- a/src/rx_rhi_vk/CMakeLists.txt
++++ b/src/rx_rhi_vk/CMakeLists.txt
+@@ -18,20 +18,21 @@ add_library(rx_rhi_vk STATIC
+     src/buffer.cpp
+     src/command.cpp
+     src/frame_sync.cpp
+     src/pipeline_layout.cpp
+     src/bindless.cpp
+     src/upload.cpp
+     src/deletion_queue.cpp
+     src/texture.cpp
+     src/mesh_buffers.cpp
+     src/descriptor_arena.cpp
++    src/tracy_gpu.cpp
+     src/vma_impl.cpp
+     src/stb_impl.cpp
+     ${volk_SOURCE_DIR}/volk.c
+ )
+ target_include_directories(rx_rhi_vk PUBLIC include ${volk_SOURCE_DIR} ${vma_SOURCE_DIR}/include ${stb_SOURCE_DIR})
+ # rx_shader_layout_types (defined in src/rx_shader/CMakeLists.txt) is a
+ # header-only INTERFACE target exposing ONLY rx_shader's plain-data
+ # shader_layout_info.h -- never `rx_shader` itself, which would drag
+ # slang::slang (a real link dependency, plus every other rx_shader header)
+ # into this library. See pipeline_layout.h's own comment for why
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/device.h b/src/rx_rhi_vk/include/rx_rhi_vk/device.h
+index 541311f..395fb51 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/device.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/device.h
+@@ -45,20 +45,31 @@ public:
+     // a Device alone, with no separate Context& in its signature, and
+     // every other accessor on this class already exposes exactly this
+     // kind of already-stored handle (physicalDevice(), device(), ...) the
+     // same trivial way.
+     VkInstance instance() const { return instance_; }
+     VkPhysicalDevice physicalDevice() const { return physicalDevice_; }
+     VkDevice device() const { return device_; }
+     VkQueue graphicsQueue() const { return graphicsQueue_; }
+     uint32_t graphicsQueueFamily() const { return graphicsQueueFamily_; }
+     VkQueue presentQueue() const { return presentQueue_; }
++
++    // True iff VK_EXT_calibrated_timestamps was present on the selected
++    // physical device AND successfully enabled on the logical device this
++    // Device wraps (see device.cpp's own comment on the optional, guarded
++    // enable_extension_if_present() call in create()) [Phase 4 Stage 0
++    // Task 3]. This class has no idea Tracy exists -- it only reports
++    // whether this one, ordinarily-optional Vulkan extension is live;
++    // rx_rhi_vk/tracy_gpu.h is the sole consumer that gives this fact any
++    // profiling meaning (TracyVkContextCalibrated vs plain TracyVkContext).
++    bool calibratedTimestampsEnabled() const { return calibratedTimestampsEnabled_; }
++
+     VkSwapchainKHR swapchain() const { return swapchain_; }
+     const std::vector<VkImage>& swapchainImages() const { return swapchainImages_; }
+     VkFormat swapchainFormat() const { return swapchainFormat_; }
+     VkExtent2D swapchainExtent() const { return swapchainExtent_; }
+ 
+     // Acquires the next available swapchain image, signaling `signal` once
+     // it is safe to render into it. VK_SUBOPTIMAL_KHR is treated as success
+     // here: the image is still valid to render into and present, so
+     // recreation is deferred to present()'s return value instead.
+     AcquireResult acquireNextImage(VkSemaphore signal);
+@@ -80,18 +91,19 @@ private:
+     void destroyAll();
+ 
+     VkInstance instance_ = VK_NULL_HANDLE;
+     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
+     VkDevice device_ = VK_NULL_HANDLE;
+     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+ 
+     VkQueue graphicsQueue_ = VK_NULL_HANDLE;
+     uint32_t graphicsQueueFamily_ = 0;
+     VkQueue presentQueue_ = VK_NULL_HANDLE;
++    bool calibratedTimestampsEnabled_ = false;
+ 
+     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
+     std::vector<VkImage> swapchainImages_;
+     VkFormat swapchainFormat_ = VK_FORMAT_UNDEFINED;
+     VkExtent2D swapchainExtent_{0, 0};
+ };
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/tracy_gpu.h b/src/rx_rhi_vk/include/rx_rhi_vk/tracy_gpu.h
+new file mode 100644
+index 0000000..17ca55e
+--- /dev/null
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/tracy_gpu.h
+@@ -0,0 +1,127 @@
++#pragma once
++#include <volk.h>
++
++// tracy_gpu.h -- the ONLY header in this codebase that may include a Tracy
++// Vulkan header (<tracy/TracyVulkan.hpp>) [Phase 4 Stage 0 Task 3, spec D3].
++// This mirrors rx_core/profile.h's own rule for CPU zones, extended to
++// rx_rhi_vk's Vulkan-coupled GPU-zone seam: every OTHER rx_rhi_vk/rx_graph
++// header (device.h, executor.h, ...) stays Tracy-free; a .cpp needing a GPU
++// zone includes THIS header, never <tracy/TracyVulkan.hpp> directly. Two
++// seams, each the sole owner of its own domain -- GPU zones belong here,
++// not in rx_core, which stays Vulkan-free.
++//
++// TRACY_ENABLE is the identical PUBLIC compile definition rx_core/profile.h
++// documents (propagated transitively from src/rx_core/CMakeLists.txt's
++// own `if(RX_TRACY)` guard). When it is OFF, <tracy/TracyVulkan.hpp> is not
++// even reachable on the include path (Tracy was never fetched -- see
++// third_party/CMakeLists.txt's own `if(RX_TRACY)` guard), so this header
++// must not name it at all in that branch -- every macro below is defined as
++// a bare no-op directly instead, and GpuProfileContext degrades to a plain
++// `void*` that createGpuProfileContext() always returns null for. Callers
++// (executor.cpp) never need their own `#ifdef TRACY_ENABLE`: every symbol
++// below exists and is safe to call unconditionally in both configurations.
++#ifdef TRACY_ENABLE
++#include <tracy/TracyVulkan.hpp>
++#endif
++
++namespace rx::rhi {
++
++class Device;
++
++#ifdef TRACY_ENABLE
++
++using GpuProfileContext = TracyVkCtx;
++
++// RX_GPU_ZONE_DYNAMIC(ctx, varname, cmd, nameText) -- GPU zone spanning the
++// rest of the enclosing block, named from a RUNTIME string (not required to
++// be a compile-time literal) [task-3 dispatch item 4: per-pass zones keyed
++// by a render-graph pass's own std::string-backed name]. Tracy's own
++// documented mechanism for exactly this case is the "Transient GPU zone"
++// (Tracy user manual, "Transient GPU zones": "Transient zones... are
++// available in OpenGL, Vulkan, Direct3D 11/12 and WebGPU macros" -- verified
++// directly against the vendored v0.14.0 manual/tracy.tex before writing
++// this) -- TracyVkZoneTransient(ctx, varname, cmdbuf, name, active), whose
++// `name` parameter is a runtime `const char*` Tracy copies into its own
++// buffer, unlike TracyVkZone's compile-time-literal `name`. `varname` names
++// the RAII scope variable (needed because more than one GPU zone macro in
++// one scope would otherwise collide on Tracy's own default variable name --
++// see the manual's "Multiple zones in one scope" section).
++//
++// `active` is deliberately computed here as `(ctx) != nullptr`, NOT a bare
++// `true`: verified directly against the vendored v0.14.0 source
++// (TracyVulkan.hpp's VkCtxScope constructor) that `active == false` is what
++// makes that constructor return immediately, BEFORE it would otherwise
++// unconditionally dereference `ctx` (`ctx->NextQueryId()`, no null-guard of
++// its own) -- a null ctx with `active` hardcoded true would be a real
++// null-pointer-dereference crash the moment createGpuProfileContext()
++// returns null (RX_TRACY off, or any context-creation failure). Folding the
++// null check into `active` here is what makes this macro genuinely safe to
++// call with a null `ctx`, matching this header's own "safe on a null
++// context" claim on createGpuProfileContext() above.
++#define RX_GPU_ZONE_DYNAMIC(ctx, varname, cmd, nameText) \
++    TracyVkZoneTransient(ctx, varname, cmd, nameText, (ctx) != nullptr)
++
++// RX_GPU_COLLECT(ctx, cmd) -- collects this frame's GPU timestamp queries
++// (Tracy's TracyVkCollect, `ctx->Collect(cmd)` -- no null-guard of its own,
++// verified directly against the vendored v0.14.0 source, same as
++// VkCtxScope's constructor above) -- call once per frame, once every
++// TracyVkZone/RX_GPU_ZONE_DYNAMIC this frame recorded on `cmd` has closed.
++// Per Tracy's manual: `cmd` must be in the recording state and OUTSIDE a
++// render pass instance (i.e. after every vkCmdEndRendering this frame has
++// already run). The null check is wrapped INSIDE this macro (do/while(0)
++// so it still behaves like one statement at the call site) so a null `ctx`
++// (RX_TRACY off already routes here to nothing, but also any
++// createGpuProfileContext() failure while RX_TRACY is on) is silently
++// skipped rather than dereferenced.
++#define RX_GPU_COLLECT(ctx, cmd) \
++    do {                         \
++        if ((ctx) != nullptr) {  \
++            TracyVkCollect(ctx, cmd); \
++        }                        \
++    } while (0)
++
++// RX_GPU_CONTEXT_DESTROY(ctx) -- destroys a context created by
++// createGpuProfileContext() below (Tracy's TracyVkDestroy, `ctx->~VkCtx()`
++// -- no null-guard of its own either). Same null-safe wrapping as
++// RX_GPU_COLLECT above, for the identical reason.
++#define RX_GPU_CONTEXT_DESTROY(ctx) \
++    do {                            \
++        if ((ctx) != nullptr) {     \
++            TracyVkDestroy(ctx);    \
++        }                           \
++    } while (0)
++
++#else
++
++using GpuProfileContext = void*;
++
++#define RX_GPU_ZONE_DYNAMIC(ctx, varname, cmd, nameText)
++#define RX_GPU_COLLECT(ctx, cmd)
++#define RX_GPU_CONTEXT_DESTROY(ctx)
++
++#endif  // TRACY_ENABLE
++
++// Creates `device`'s Tracy GPU-zone context [spec D3]: TracyVkContextCalibrated
++// when VK_EXT_calibrated_timestamps was enabled on `device`'s logical device
++// at creation time (device.calibratedTimestampsEnabled(); see device.cpp's
++// own optional, guarded enable_extension_if_present() call -- this function
++// never touches Vulkan device-creation itself), else plain TracyVkContext.
++// Returns nullptr when RX_TRACY/TRACY_ENABLE is off, or on any underlying
++// context-creation failure -- RX_GPU_ZONE_DYNAMIC/RX_GPU_COLLECT/
++// RX_GPU_CONTEXT_DESTROY above are all safe on a null context regardless
++// (compiled away entirely when TRACY_ENABLE is off; each wraps its own null
++// check when it is on), so callers never need their own #ifdef TRACY_ENABLE
++// or null check.
++//
++// Allocates and fully consumes one short-lived VkCommandPool/VkCommandBuffer
++// of its own (against `device`'s graphics queue/family) to perform the
++// handful of calibration submissions Tracy's context constructor issues
++// synchronously -- neither is retained by the returned context or by this
++// function past return (Tracy's own manual: "[the command buffer] will be
++// in the executable state on exit from the initialization function"; the
++// VkCtx type itself keeps no member referencing the queue/cmdbuf it was
++// constructed with, verified directly against the vendored v0.14.0 source
++// before writing this).
++[[nodiscard]] GpuProfileContext createGpuProfileContext(Device& device);
++
++}  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/descriptor_arena.cpp b/src/rx_rhi_vk/src/descriptor_arena.cpp
+index 5fbfcae..00d29eb 100644
+--- a/src/rx_rhi_vk/src/descriptor_arena.cpp
++++ b/src/rx_rhi_vk/src/descriptor_arena.cpp
+@@ -1,13 +1,14 @@
+ #include <rx_rhi_vk/descriptor_arena.h>
+ 
+ #include <rx_core/log.h>
++#include <rx_core/profile.h>
+ 
+ #include <utility>
+ 
+ namespace rx::rhi {
+ 
+ DescriptorArena::DescriptorArena(DescriptorArena&& other) noexcept : DescriptorArena() { *this = std::move(other); }
+ 
+ DescriptorArena& DescriptorArena::operator=(DescriptorArena&& other) noexcept {
+     if (this != &other) {
+         destroyAll();
+@@ -81,20 +82,21 @@ std::optional<DescriptorArena> DescriptorArena::create(VkDevice device, uint32_t
+     DescriptorArena arena;
+     arena.device_ = device;
+     arena.pools_ = std::move(pools);
+     arena.capacities_ = capacities;
+     arena.allocatedSets_.assign(framesInFlight, 0);
+     arena.allocatedUniformBuffers_.assign(framesInFlight, 0);
+     return arena;
+ }
+ 
+ void DescriptorArena::beginFrame(uint32_t frameIndex) {
++    RX_ZONE;
+     currentFrame_ = frameIndex % static_cast<uint32_t>(pools_.size());
+     VkResult result = vkResetDescriptorPool(device_, pools_[currentFrame_], 0);
+     if (result != VK_SUCCESS) {
+         RX_LOG_ERROR("rx::rhi::DescriptorArena::beginFrame: vkResetDescriptorPool failed for slot {}: VkResult={}",
+                      currentFrame_, static_cast<int>(result));
+     }
+     // Reset this slot's own arena-enforced budget tracking regardless of
+     // the vkResetDescriptorPool result above -- a failed reset is already
+     // logged as an error by this class (nothing more this method can do
+     // about it), and every VkDescriptorSet the pool held is conceptually
+diff --git a/src/rx_rhi_vk/src/device.cpp b/src/rx_rhi_vk/src/device.cpp
+index 5f09d62..181d5ef 100644
+--- a/src/rx_rhi_vk/src/device.cpp
++++ b/src/rx_rhi_vk/src/device.cpp
+@@ -1,12 +1,13 @@
+ #include <rx_rhi_vk/device.h>
+ #include <rx_core/log.h>
++#include <rx_core/profile.h>
+ #include <VkBootstrap.h>
+ #include <array>
+ #include <utility>
+ #include <vector>
+ 
+ namespace rx::rhi {
+ 
+ namespace {
+ 
+ void destroySurface(const Context& context, VkSurfaceKHR surface) {
+@@ -165,20 +166,39 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
+                           .set_required_features_12(features12)
+                           .set_required_features_13(features13)
+                           .select();
+     if (!physResult) {
+         RX_LOG_ERROR("vkb::PhysicalDeviceSelector::select failed: {}", physResult.error().message());
+         logDescriptorIndexingFeatureGaps(context.instance());
+         destroySurface(context, surface);
+         return std::nullopt;
+     }
+ 
++    // VK_EXT_calibrated_timestamps: optional, guarded -- enabled at device
++    // creation only when the selected physical device actually supports it
++    // [Phase 4 Stage 0 Task 3, spec D3]. `enable_extension_if_present()` is
++    // vk-bootstrap's own documented "make it enabled on the device IF
++    // present, otherwise a no-op" call (VkBootstrap.h) -- this is not a
++    // required feature (unlike the Vulkan 1.1/1.2/1.3 feature sets above):
++    // a device lacking it is still fully supported, just without GPU-side
++    // calibrated Tracy zones (rx_rhi_vk/tracy_gpu.h falls back to plain
++    // TracyVkContext in that case -- see that file's own comment). This
++    // class has no idea Tracy exists; it only reports the plain fact via
++    // calibratedTimestampsEnabled() below. Empirically checked directly on
++    // this dev machine's two available drivers as part of this task: BOTH
++    // the NVIDIA proprietary driver and Mesa's llvmpipe/lavapipe software
++    // rasterizer report `VK_EXT_calibrated_timestamps` (verified via
++    // `vulkaninfo`) -- lavapipe support was flagged [R:threading] as
++    // "unverified" going into this task; it is verified present here.
++    const bool calibratedTimestampsEnabled =
++        physResult.value().enable_extension_if_present(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
++
+     auto deviceResult = vkb::DeviceBuilder(physResult.value()).build();
+     if (!deviceResult) {
+         RX_LOG_ERROR("vkb::DeviceBuilder::build failed: {}", deviceResult.error().message());
+         destroySurface(context, surface);
+         return std::nullopt;
+     }
+     vkb::Device vkbDevice = deviceResult.value();
+     volkLoadDevice(vkbDevice.device);
+ 
+     auto graphicsQueueResult = vkbDevice.get_queue(vkb::QueueType::graphics);
+@@ -225,20 +245,23 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
+     }
+ 
+     Device dev;
+     dev.instance_ = context.instance();
+     dev.physicalDevice_ = vkbDevice.physical_device.physical_device;
+     dev.device_ = vkbDevice.device;
+     dev.surface_ = surface;
+     dev.graphicsQueue_ = graphicsQueueResult.value();
+     dev.graphicsQueueFamily_ = graphicsQueueIndexResult.value();
+     dev.presentQueue_ = presentQueueResult.value();
++    dev.calibratedTimestampsEnabled_ = calibratedTimestampsEnabled;
++    RX_LOG_INFO("Device::create: VK_EXT_calibrated_timestamps {} on the selected physical device",
++                calibratedTimestampsEnabled ? "ENABLED" : "not present -- falling back to uncalibrated GPU zones");
+     dev.swapchain_ = vkbSwapchain.swapchain;
+     dev.swapchainImages_ = imagesResult.value();
+     dev.swapchainFormat_ = vkbSwapchain.image_format;
+     dev.swapchainExtent_ = vkbSwapchain.extent;
+     return dev;
+ }
+ 
+ Device::Device(Device&& other) noexcept : Device() {
+     *this = std::move(other);
+ }
+@@ -247,32 +270,34 @@ Device& Device::operator=(Device&& other) noexcept {
+     if (this != &other) {
+         destroyAll();
+ 
+         instance_ = other.instance_;
+         physicalDevice_ = other.physicalDevice_;
+         device_ = other.device_;
+         surface_ = other.surface_;
+         graphicsQueue_ = other.graphicsQueue_;
+         graphicsQueueFamily_ = other.graphicsQueueFamily_;
+         presentQueue_ = other.presentQueue_;
++        calibratedTimestampsEnabled_ = other.calibratedTimestampsEnabled_;
+         swapchain_ = other.swapchain_;
+         swapchainImages_ = std::move(other.swapchainImages_);
+         swapchainFormat_ = other.swapchainFormat_;
+         swapchainExtent_ = other.swapchainExtent_;
+ 
+         other.instance_ = VK_NULL_HANDLE;
+         other.physicalDevice_ = VK_NULL_HANDLE;
+         other.device_ = VK_NULL_HANDLE;
+         other.surface_ = VK_NULL_HANDLE;
+         other.graphicsQueue_ = VK_NULL_HANDLE;
+         other.graphicsQueueFamily_ = 0;
+         other.presentQueue_ = VK_NULL_HANDLE;
++        other.calibratedTimestampsEnabled_ = false;
+         other.swapchain_ = VK_NULL_HANDLE;
+         other.swapchainImages_.clear();
+         other.swapchainFormat_ = VK_FORMAT_UNDEFINED;
+         other.swapchainExtent_ = VkExtent2D{0, 0};
+     }
+     return *this;
+ }
+ 
+ Device::~Device() {
+     destroyAll();
+@@ -284,38 +309,48 @@ void Device::destroyAll() {
+     }
+     if (device_ != VK_NULL_HANDLE) {
+         vkDestroyDevice(device_, nullptr);
+     }
+     if (surface_ != VK_NULL_HANDLE) {
+         vkDestroySurfaceKHR(instance_, surface_, nullptr);
+     }
+ }
+ 
+ AcquireResult Device::acquireNextImage(VkSemaphore signal) {
++    // FrameSync's frame loop begins here every iteration [Phase 4 Stage 0
++    // Task 3, spec D3: "FrameSync acquire/present" zone placement --
++    // FrameSync itself (frame_sync.h/.cpp) owns no acquire/present method
++    // of its own; these two Device functions are the real acquire/present
++    // calls every sample's present loop drives its FrameSync fences/
++    // semaphores around].
++    RX_ZONE;
+     uint32_t imageIndex = 0;
+     VkResult result = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, signal, VK_NULL_HANDLE, &imageIndex);
+     switch (result) {
+         case VK_SUCCESS:
+         case VK_SUBOPTIMAL_KHR:
+             return AcquireResult{SwapchainStatus::Ok, imageIndex};
+         case VK_ERROR_OUT_OF_DATE_KHR:
+             return AcquireResult{SwapchainStatus::NeedsRecreate, 0};
+         case VK_ERROR_DEVICE_LOST:
+             RX_LOG_ERROR("vkAcquireNextImageKHR: device lost");
+             return AcquireResult{SwapchainStatus::DeviceLost, 0};
+         default:
+             RX_LOG_ERROR("vkAcquireNextImageKHR failed: VkResult={}", static_cast<int>(result));
+             return AcquireResult{SwapchainStatus::NeedsRecreate, 0};
+     }
+ }
+ 
+ SwapchainStatus Device::present(uint32_t imageIndex, VkSemaphore wait) {
++    // See acquireNextImage()'s own comment -- the matching "present" half
++    // of FrameSync's own acquire/present zone pair.
++    RX_ZONE;
+     VkPresentInfoKHR presentInfo{};
+     presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+     if (wait != VK_NULL_HANDLE) {
+         presentInfo.waitSemaphoreCount = 1;
+         presentInfo.pWaitSemaphores = &wait;
+     }
+     presentInfo.swapchainCount = 1;
+     presentInfo.pSwapchains = &swapchain_;
+     presentInfo.pImageIndices = &imageIndex;
+ 
+diff --git a/src/rx_rhi_vk/src/tracy_gpu.cpp b/src/rx_rhi_vk/src/tracy_gpu.cpp
+new file mode 100644
+index 0000000..20c673c
+--- /dev/null
++++ b/src/rx_rhi_vk/src/tracy_gpu.cpp
+@@ -0,0 +1,79 @@
++#include <rx_rhi_vk/tracy_gpu.h>
++
++#include <rx_core/log.h>
++#include <rx_rhi_vk/device.h>
++
++namespace rx::rhi {
++
++#ifdef TRACY_ENABLE
++
++GpuProfileContext createGpuProfileContext(Device& device) {
++    // Short-lived setup pool/buffer for the calibration submissions
++    // TracyVkContext(Calibrated)'s own constructor issues synchronously --
++    // see this function's own header comment (tracy_gpu.h) for why neither
++    // is retained past this call.
++    VkCommandPoolCreateInfo poolInfo{};
++    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
++    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
++    poolInfo.queueFamilyIndex = device.graphicsQueueFamily();
++
++    VkCommandPool pool = VK_NULL_HANDLE;
++    if (vkCreateCommandPool(device.device(), &poolInfo, nullptr, &pool) != VK_SUCCESS) {
++        RX_LOG_ERROR("rx_rhi_vk: createGpuProfileContext: vkCreateCommandPool failed");
++        return nullptr;
++    }
++
++    VkCommandBufferAllocateInfo cmdAllocInfo{};
++    cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
++    cmdAllocInfo.commandPool = pool;
++    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++    cmdAllocInfo.commandBufferCount = 1;
++
++    VkCommandBuffer cmd = VK_NULL_HANDLE;
++    if (vkAllocateCommandBuffers(device.device(), &cmdAllocInfo, &cmd) != VK_SUCCESS) {
++        RX_LOG_ERROR("rx_rhi_vk: createGpuProfileContext: vkAllocateCommandBuffers failed");
++        vkDestroyCommandPool(device.device(), pool, nullptr);
++        return nullptr;
++    }
++
++    // Direct-symbol form (TRACY_VK_USE_SYMBOL_TABLE is never defined by this
++    // project): Tracy calls bare `vkFoo(...)` names internally, which
++    // resolve to volk's own already-loaded global function-pointer
++    // variables of the identical names -- exactly the calling convention
++    // every other raw Vulkan call in this codebase already relies on under
++    // VK_NO_PROTOTYPES + volk (e.g. executor.cpp's vkCmdBeginDebugUtilsLabelEXT
++    // null-checked-before-use pattern). `vkGetPhysicalDeviceCalibrateableTimeDomainsEXT`/
++    // `vkGetCalibratedTimestampsEXT` are volk-loaded globals too (loaded by
++    // volkLoadInstance()/volkLoadDevice(), both already called before any
++    // Device exists -- see context.cpp/device.cpp), supplied directly by
++    // name per the manual's own "retrieve the following function pointers"
++    // instruction (Tracy user manual, "Calibrated context").
++    GpuProfileContext ctx = nullptr;
++    if (device.calibratedTimestampsEnabled()) {
++        ctx = TracyVkContextCalibrated(device.physicalDevice(), device.device(), device.graphicsQueue(), cmd,
++                                        vkGetPhysicalDeviceCalibrateableTimeDomainsEXT, vkGetCalibratedTimestampsEXT);
++        RX_LOG_INFO("rx_rhi_vk: Tracy GPU context created with calibrated timestamps (VK_EXT_calibrated_timestamps)");
++    } else {
++        ctx = TracyVkContext(device.physicalDevice(), device.device(), device.graphicsQueue(), cmd);
++        RX_LOG_INFO("rx_rhi_vk: Tracy GPU context created without calibrated timestamps (extension not enabled)");
++    }
++
++    // The command buffer TracyVkContext(Calibrated) just consumed is left
++    // in the executable state (its own manual's own documented contract);
++    // safe to free/destroy the whole temporary pool now regardless.
++    vkFreeCommandBuffers(device.device(), pool, 1, &cmd);
++    vkDestroyCommandPool(device.device(), pool, nullptr);
++
++    if (ctx == nullptr) {
++        RX_LOG_ERROR("rx_rhi_vk: createGpuProfileContext: Tracy context creation returned null");
++    }
++    return ctx;
++}
++
++#else
++
++GpuProfileContext createGpuProfileContext(Device& /*device*/) { return nullptr; }
++
++#endif  // TRACY_ENABLE
++
++}  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/upload.cpp b/src/rx_rhi_vk/src/upload.cpp
+index 9ee69e1..bfe6f2b 100644
+--- a/src/rx_rhi_vk/src/upload.cpp
++++ b/src/rx_rhi_vk/src/upload.cpp
+@@ -1,15 +1,16 @@
+ #include <rx_rhi_vk/upload.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/texture.h>
+ #include <rx_core/log.h>
++#include <rx_core/profile.h>
+ #include <cstring>
+ #include <utility>
+ 
+ namespace rx::rhi {
+ 
+ namespace {
+ 
+ // vkCmdCopyBufferToImage requires bufferOffset to be a multiple of 4 (and,
+ // for best behavior across formats, of the texel block size); vkCmdCopyBuffer
+ // has no such requirement but aligning every reservation uniformly is
+@@ -117,20 +118,21 @@ bool Uploader::reserveRingSpace(VkDeviceSize size, VkDeviceSize& outOffset) {
+         flush();
+         aligned = 0;
+     }
+ 
+     outOffset = aligned;
+     ringCursor_ = aligned + size;
+     return true;
+ }
+ 
+ bool Uploader::uploadToBuffer(Buffer& dst, VkDeviceSize dstOffset, const void* data, VkDeviceSize size) {
++    RX_ZONE;
+     if (size == 0) {
+         return true;
+     }
+ 
+     // DIRECT PATH: `dst`'s own allocation (Allocator::
+     // createDeviceLocalBuffer(), when `dst`'s usage carries a real
+     // device-consuming bit) landed in memory that is BOTH DEVICE_LOCAL
+     // and HOST_VISIBLE -- write straight into it, no staging copy, no
+     // command recorded at all. See the class comment in upload.h for the
+     // full mechanics and why this task's first implementation (flag on
+@@ -178,20 +180,21 @@ bool Uploader::uploadToBuffer(Buffer& dst, VkDeviceSize dstOffset, const void* d
+ 
+     VkBufferCopy region{};
+     region.srcOffset = ringOffset;
+     region.dstOffset = dstOffset;
+     region.size = size;
+     vkCmdCopyBuffer(cmd_, ringBuffer_.handle(), dst.handle(), 1, &region);
+     return true;
+ }
+ 
+ bool Uploader::uploadToImage(Texture2D& dst, const void* pixels, VkDeviceSize pixelBytes, bool generateMips) {
++    RX_ZONE;
+     if (pixelBytes == 0) {
+         return true;
+     }
+ 
+     VkDeviceSize ringOffset = 0;
+     if (!reserveRingSpace(pixelBytes, ringOffset)) {
+         return false;
+     }
+ 
+     std::memcpy(static_cast<uint8_t*>(ringBuffer_.mappedData()) + ringOffset, pixels, pixelBytes);
+diff --git a/third_party/CMakeLists.txt b/third_party/CMakeLists.txt
+index 294dfde..fa5c49e 100644
+--- a/third_party/CMakeLists.txt
++++ b/third_party/CMakeLists.txt
+@@ -291,10 +291,79 @@ rx_add_cached_dependency(
+   REPO https://github.com/dougbinks/enkiTS.git
+   TAG ${RX_ENKITS_TAG}
+   CMAKE_ARGS -DENKITS_INSTALL=ON -DENKITS_BUILD_C_INTERFACE=OFF -DENKITS_BUILD_EXAMPLES=OFF -DENKITS_BUILD_SHARED=OFF
+ )
+ find_package(enkiTS CONFIG REQUIRED PATHS "${enkiTS_CACHE_DIR}" NO_DEFAULT_PATH)
+ 
+ # Same CMake 3.22 limitation as spdlog/SDL3/Vulkan-Headers/vk-bootstrap
+ # above: promote to global scope for src/rx_task (a sibling directory) to
+ # link.
+ set_target_properties(enkiTS::enkiTS PROPERTIES IMPORTED_GLOBAL TRUE)
++
++# Tracy: the engine's profiler client [spec D3, Phase 4 Stage 0 Task 3].
++# Client-only -- this pulls in exactly one compiled translation unit
++# (public/TracyClient.cpp) and the client-side headers; the profiler
++# UI/server (profiler/, server/, capture/, python/, meson.build's own
++# separate "tracy-profiler" target) is never built here, never
++# add_subdirectory'd, and never linked by anything in this project. BSD-3
++# license (see the pinned tag's own LICENSE file -- permissive, no
++# attribution requirement beyond the standard copyright-notice retention;
++# recorded here per this task's own resolution to note the license at
++# vendoring time).
++#
++# Entirely guarded behind RX_TRACY (declared as a top-level option() in the
++# root CMakeLists.txt, before this file is add_subdirectory'd, so it is
++# already set by the time this line runs): when OFF, this whole block never
++# executes -- Tracy is never git-cloned, never configured, never compiled,
++# and the `Tracy::TracyClient` target never exists -- rather than being
++# built-but-disabled-at-runtime. This is what makes "RX_TRACY=OFF -> zero
++# Tracy symbols in every binary" a structural guarantee instead of a
++# TRACY_ENABLE-macro convention that could bit-rot.
++#
++# Pinned v0.14.0 -- the current tag on github.com/wolfpld/tracy as of this
++# task (verified directly: `git ls-remote --tags`, matching [R:threading]'s
++# own ">= v0.11" citation and its "VK_EXT_calibrated_timestamps added in
++# v0.11.0" fact -- v0.14.0 carries that support unchanged).
++#
++# Routed through the dep-cache like spdlog/Vulkan-Headers/SDL3/
++# vk-bootstrap/enkiTS above, not hand-vendored as loose source under
++# third_party/: Tracy's own CMakeLists.txt (verified directly against the
++# pinned tag) already builds a real `TracyClient` target and installs a
++# clean CMake package (`install(EXPORT TracyConfig ...)` +
++# `configure_package_config_file` producing TracyConfig.cmake, exporting a
++# `Tracy::TracyClient` imported target with correct
++# INTERFACE_INCLUDE_DIRECTORIES) -- exactly the "exports cleanly through
++# rx_add_cached_dependency" bar the enkiTS vendoring precedent set, so
++# hand-vendoring the source under third_party/ instead would add nothing.
++#
++# TRACY_ENABLE=ON IS passed here, deliberately matching (never drifting
++# from) src/rx_core/CMakeLists.txt's own `if(RX_TRACY)
++# target_compile_definitions(rx_core PUBLIC TRACY_ENABLE)`: TracyClient.cpp
++# itself (verified directly by reading it) is guarded top-to-bottom by
++# `#ifdef TRACY_ENABLE` -- built WITHOUT it, the compiled Tracy::TracyClient
++# library would be a near-empty stub (no profiler thread, no networking, no
++# real zone bookkeeping), and this project's own code (which DOES see
++# TRACY_ENABLE, from rx_core's PUBLIC definition) would emit real calls
++# into `tracy::` symbols that stub build never defines -- an undefined-
++# reference link error, not a silent no-op. The two must always agree; both
++# are driven by the identical RX_TRACY guard at the CMake level so they
++# structurally cannot disagree. TRACY_STATIC=ON matches every other
++# compiled dependency here being linked statically. TRACY_ON_DEMAND stays
++# OFF (Tracy's own default): D3's "passive (~no cost) until a profiler
++# connects" behavior is already the plain TRACY_ENABLE-only default this
++# project wants, per the spec citation -- ON_DEMAND is an additional,
++# separate opt-in this task's brief never asked for.
++if(RX_TRACY)
++    set(RX_TRACY_TAG "v0.14.0")
++    rx_add_cached_dependency(
++      NAME tracy
++      REPO https://github.com/wolfpld/tracy.git
++      TAG ${RX_TRACY_TAG}
++      CMAKE_ARGS -DTRACY_ENABLE=ON -DTRACY_STATIC=ON
++    )
++    find_package(Tracy CONFIG REQUIRED PATHS "${tracy_CACHE_DIR}" NO_DEFAULT_PATH)
++
++    # Same CMake 3.22 limitation as spdlog/SDL3/Vulkan-Headers/vk-bootstrap/
++    # enkiTS above: promote to global scope for src/rx_core (a sibling
++    # directory) to link.
++    set_target_properties(Tracy::TracyClient PROPERTIES IMPORTED_GLOBAL TRUE)
++endif()

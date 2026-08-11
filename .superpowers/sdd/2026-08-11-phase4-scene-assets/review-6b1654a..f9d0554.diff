@@ -1,0 +1,2512 @@
+# Review package: 6b1654a..f9d0554
+
+## Commits
+f9d0554 feat: add render-graph history resources and color-attachment bounds check
+
+## Files changed
+ src/rx_graph/executor.cpp                      | 332 ++++++++++++++++++++-
+ src/rx_graph/include/rx_graph/executor.h       |  31 ++
+ src/rx_graph/include/rx_graph/pass.h           | 105 ++++++-
+ src/rx_graph/include/rx_graph/pass_signature.h |  14 +-
+ src/rx_graph/include/rx_graph/resources.h      |  18 ++
+ src/rx_graph/render_graph.cpp                  | 244 ++++++++++++++-
+ src/rx_graph/tests/test_compile.cpp            | 268 +++++++++++++++++
+ src/rx_graph/tests/test_execute_gpu.cpp        | 398 +++++++++++++++++++++++++
+ src/rx_graph/transient_pool.cpp                |  80 +++++
+ src/rx_graph/transient_pool.h                  | 142 ++++++++-
+ 10 files changed, 1613 insertions(+), 19 deletions(-)
+
+## Diff
+diff --git a/src/rx_graph/executor.cpp b/src/rx_graph/executor.cpp
+index 6fd060b..76cddba 100644
+--- a/src/rx_graph/executor.cpp
++++ b/src/rx_graph/executor.cpp
+@@ -1,15 +1,16 @@
+ #include <rx_graph/executor.h>
+ 
+ #include "transient_pool.h"
+ 
+ #include <rx_core/log.h>
++#include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/deletion_queue.h>
+ #include <rx_rhi_vk/device.h>
+ #include <volk.h>
+ 
+ #include <algorithm>
+ #include <optional>
+ #include <span>
+ #include <stdexcept>
+ #include <string>
+ #include <unordered_map>
+@@ -103,53 +104,87 @@ std::vector<std::pair<uint32_t, CombinedAccess>> combineAccessesByResource(std::
+ 
+ // One CompiledGraph::resources() entry's real, device-side binding, as of
+ // the most recent Executor::realize() call. Rebuilt from scratch by every
+ // realize() call (see Executor::realize()); PassContext's name-based
+ // resolvers (imageView()/image()/buffer()/imageFormat()) read straight out
+ // of whatever the CURRENT vector holds.
+ struct ResolvedResource {
+     bool isBuffer = false;
+     bool isBackbuffer = false;
+ 
+-    // Index into Impl::pool's images_/buffers_ (per isBuffer) -- meaningless
+-    // (left at UINT32_MAX) for the backbuffer, which this Executor never
+-    // pools [Task 3 ambiguity resolution #4].
++    // Phase 4 Task 1: true for a Pass::addHistoryInput()/setHistoryOutput()
++    // resource -- pinned, ping-ponged, never pooled the way an ordinary
++    // image is. Mutually exclusive with isBuffer (history is images-only)
++    // and isBackbuffer (see resources.h's PhysicalResource::isHistory
++    // comment for why the two can never coincide).
++    bool isHistory = false;
++
++    // Index into Impl::pool's images_/buffers_ (per isBuffer), or --  when
++    // isHistory -- into Impl::pool's pinned_ instead [Phase 4 Task 1].
++    // Meaningless (left at UINT32_MAX) for the backbuffer, which this
++    // Executor never pools [Task 3 ambiguity resolution #4].
+     uint32_t poolIndex = UINT32_MAX;
+ 
++    // Meaningless (left at their defaults) for isHistory == true: a
++    // history resource has TWO real images (ping-pong slots), never one,
++    // so there is no single VkImage/VkImageView a generic field here could
++    // hold -- every history-aware code path (applyHistoryAccesses(),
++    // Executor::resolveImageView()/resolveImage(), the attachment-view
++    // resolution in Executor::execute()) resolves the correct slot's real
++    // handle directly from Impl::pool.pinned(poolIndex) instead, keyed by
++    // this frame's read/write role, every time it needs one.
+     VkImage image = VK_NULL_HANDLE;
+     VkImageView view = VK_NULL_HANDLE;
+     VkBuffer buffer = VK_NULL_HANDLE;
+     VkFormat format = VK_FORMAT_UNDEFINED;
+     VkExtent2D extent{0, 0};
+ };
+ 
+ struct Executor::Impl {
+     VkDevice device = VK_NULL_HANDLE;
+     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
++
++    // Phase 4 Task 1: needed to build the one-time init-clear
++    // rx::rhi::CommandContext a freshly (re)created pinned history entry's
++    // two slots need (see initializePinnedHistoryEntry() below) -- every
++    // other Executor operation records onto a caller-supplied
++    // VkCommandBuffer (execute()'s own `cmd` parameter) and never needed a
++    // real queue/queue-family of its own before this.
++    VkQueue graphicsQueue = VK_NULL_HANDLE;
++    uint32_t graphicsQueueFamily = 0;
++
+     rx::rhi::Allocator allocator;
+     detail::TransientPool pool;
+     rx::rhi::DeletionQueue deletionQueue;
+     bool debugUtilsAvailable = false;
+ 
+     // Executor's own monotonic tick, one increment per execute() call --
+     // the clock TransientPool's staleness sweep and this Impl's own
+     // deletion-queue pacing (see Executor::execute()) both run against.
++    // Phase 4 Task 1: also the ping-pong parity clock -- a history
++    // resource's write slot for a given execute() call is
++    // `frameCounter % 2`, its read slot `(frameCounter + 1) % 2` [design
++    // contract point 2], read by every history-aware function below
++    // directly off this same field, never a separate counter.
+     uint64_t frameCounter = 0;
+ 
+     // Rebuilt by every realize() call; indexed identically to whatever
+     // CompiledGraph::resources() looked like as of that call.
+     std::vector<ResolvedResource> resources;
+     std::unordered_map<std::string, uint32_t> nameToIndex;
+ 
+-    Impl(VkDevice deviceIn, VkPhysicalDevice physicalDeviceIn, rx::rhi::Allocator allocatorIn)
++    Impl(VkDevice deviceIn, VkPhysicalDevice physicalDeviceIn, VkQueue graphicsQueueIn, uint32_t graphicsQueueFamilyIn,
++         rx::rhi::Allocator allocatorIn)
+         : device(deviceIn),
+           physicalDevice(physicalDeviceIn),
++          graphicsQueue(graphicsQueueIn),
++          graphicsQueueFamily(graphicsQueueFamilyIn),
+           allocator(std::move(allocatorIn)),
+           pool(physicalDeviceIn, deviceIn, allocator) {}
+ };
+ 
+ namespace {
+ 
+ void beginDebugLabel(Executor::Impl& impl, VkCommandBuffer cmd, std::string_view name) {
+     if (!impl.debugUtilsAvailable) {
+         return;
+     }
+@@ -190,20 +225,33 @@ void applyBarriers(Executor::Impl& impl, const CompiledGraph& compiled, VkComman
+     if (barriers.imageBarriers.empty() && barriers.bufferBarriers.empty()) {
+         return;
+     }
+ 
+     std::vector<VkImageMemoryBarrier2> vkImageBarriers;
+     vkImageBarriers.reserve(barriers.imageBarriers.size());
+     for (const ImageBarrier& b : barriers.imageBarriers) {
+         const PhysicalResource& physical = compiled.resources()[b.physicalIndex];
+         const ResolvedResource& resolved = impl.resources.at(b.physicalIndex);
+ 
++        // Phase 4 Task 1: a history resource never has a single real
++        // VkImage this compile-time-derived barrier could apply to (its
++        // `resolved.image` is left at its default, VK_NULL_HANDLE -- see
++        // ResolvedResource's own comment) -- applyHistoryAccesses() (called
++        // separately, from Executor::execute()) computes and applies its
++        // OWN real barriers for it directly, per-slot, from the unmerged
++        // per-declaration access list. Skipped here entirely, including
++        // `firstBarrierSeen` bookkeeping, which nothing history-related
++        // ever consults.
++        if (resolved.isHistory) {
++            continue;
++        }
++
+         VkPipelineStageFlags2 srcStage = b.srcStage;
+         VkAccessFlags2 srcAccess = b.srcAccess;
+         if (!resolved.isBackbuffer && !firstBarrierSeen[b.physicalIndex]) {
+             srcStage = impl.pool.image(resolved.poolIndex).lastFrameFinalStages;
+             // Make the prior frame's final writes AVAILABLE before this
+             // frame's discard transition (execution ordering alone does
+             // not flush caches -- see PooledImage::lastFrameFinalAccess).
+             srcAccess = impl.pool.image(resolved.poolIndex).lastFrameFinalAccess;
+         } else if (resolved.isBackbuffer && !firstBarrierSeen[b.physicalIndex] &&
+                    b.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+@@ -338,30 +386,233 @@ void synthesizeFirstUseBufferBarrierIfNeeded(Executor::Impl& impl, const Compile
+         VkDependencyInfo dep{};
+         dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+         dep.bufferMemoryBarrierCount = 1;
+         dep.pBufferMemoryBarriers = &vkBarrier;
+         vkCmdPipelineBarrier2(cmd, &dep);
+ 
+         firstBarrierSeen[physIdx] = true;
+     }
+ }
+ 
++// Phase 4 Task 1: history resources bypass compile()'s own device-free
++// barrier derivation (allBarriers[pos]) ENTIRELY -- see
++// transient_pool.h's PinnedHistorySlot class comment for why: a single
++// physicalIndex's compile-time barrier, when a pass declares BOTH an
++// addHistoryInput() read and (the same or a different pass, same frame)
++// a setHistoryOutput() write of the SAME name, would have to describe TWO
++// DIFFERENT real images (this frame's read slot and this frame's write
++// slot) with only one (barriers.cpp's own combineByResource()-merged)
++// oldLayout/newLayout pair -- structurally incapable of it. This function
++// instead walks `accesses` (compiled.passAccesses(), the UNMERGED
++// per-declaration list, never allBarriers[pos]) directly and, for every
++// access against a history physicalIndex, resolves ITS OWN real slot --
++// write slot for a COLOR_ATTACHMENT_OPTIMAL/DEPTH_ATTACHMENT_OPTIMAL
++// access, read slot for a SHADER_READ_ONLY_OPTIMAL one, exhaustive and
++// unambiguous exactly like the colorPhysIdx/depthPhysIdx classification
++// just below in Executor::execute() -- and computes/applies its own real
++// vkCmdPipelineBarrier2, chained off THAT SLOT's own persisted
++// detail::ResourceBarrierState (never reset between execute() calls,
++// unlike buildBarriers()' per-compile-walk state -- see
++// PinnedHistorySlot's own comment for why that persistence alone realizes
++// design contract point 4's "barrier state machine initialized from
++// tracked last-frame layout instead of UNDEFINED"). Also latches
++// PinnedHistorySlot::everWrittenByRealPass for a write access -- the value
++// PassContext::historyValid() reads.
++void applyHistoryAccesses(Executor::Impl& impl, const CompiledGraph& compiled, VkCommandBuffer cmd,
++                           std::span<const ResourceAccess> accesses) {
++    const std::span<const PhysicalResource> resources = compiled.resources();
++    const auto writeSlot = static_cast<uint32_t>(impl.frameCounter % 2);
++    const auto readSlot = static_cast<uint32_t>((impl.frameCounter + 1) % 2);
++
++    for (const ResourceAccess& access : accesses) {
++        const PhysicalResource& physical = resources[access.physicalIndex];
++        if (!physical.isHistory) {
++            continue;
++        }
++
++        const bool isWrite = access.layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
++                              access.layout == VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
++        const uint32_t slotIndex = isWrite ? writeSlot : readSlot;
++
++        const ResolvedResource& resolved = impl.resources.at(access.physicalIndex);
++        detail::PinnedHistoryEntry& entry = impl.pool.pinned(resolved.poolIndex);
++        detail::PinnedHistorySlot& slot = entry.slots[slotIndex];
++
++        auto transition =
++            detail::applyAccess(slot.barrierState, /*isBuffer=*/false, access.stages, access.access, access.layout);
++        if (transition.has_value()) {
++            VkImageMemoryBarrier2 vkBarrier{};
++            vkBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
++            vkBarrier.srcStageMask = transition->srcStage;
++            vkBarrier.srcAccessMask = transition->srcAccess;
++            vkBarrier.dstStageMask = transition->dstStage;
++            vkBarrier.dstAccessMask = transition->dstAccess;
++            vkBarrier.oldLayout = transition->oldLayout;
++            vkBarrier.newLayout = transition->newLayout;
++            vkBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++            vkBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++            vkBarrier.image = slot.texture->image();
++            vkBarrier.subresourceRange.aspectMask = aspectMaskForFormat(physical.attachment.format);
++            vkBarrier.subresourceRange.baseMipLevel = 0;
++            vkBarrier.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
++            vkBarrier.subresourceRange.baseArrayLayer = 0;
++            vkBarrier.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
++
++            VkDependencyInfo dep{};
++            dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++            dep.imageMemoryBarrierCount = 1;
++            dep.pImageMemoryBarriers = &vkBarrier;
++            vkCmdPipelineBarrier2(cmd, &dep);
++        }
++
++        if (isWrite) {
++            slot.everWrittenByRealPass = true;
++        }
++    }
++}
++
++// Phase 4 Task 1: the VkImageView Executor::execute()'s own dynamic-
++// rendering attachment-building loop (below) should bind for `resolved` --
++// this frame's WRITE slot for a history resource (Impl::frameCounter % 2;
++// see applyHistoryAccesses()'s matching write-slot derivation, which has
++// already transitioned that exact slot to COLOR_ATTACHMENT_OPTIMAL/
++// DEPTH_ATTACHMENT_OPTIMAL by the time this runs), or simply `resolved.view`
++// unchanged for any ordinary (non-history) resource.
++VkImageView resolveAttachmentView(Executor::Impl& impl, const ResolvedResource& resolved) {
++    if (resolved.isHistory) {
++        const auto writeSlot = static_cast<uint32_t>(impl.frameCounter % 2);
++        return impl.pool.pinned(resolved.poolIndex).slots[writeSlot].texture->view();
++    }
++    return resolved.view;
++}
++
++// Phase 4 Task 1, design contract point 3: the "small init submission"
++// half of the brief's two offered choices for getting a pinned slot's
++// contents into a DEFINED (black/1.0-cleared) state before its first-ever
++// use as a sampled read -- chosen over "clear-on-first-write-load" because
++// that alternative cannot cover the actual hazard at all: under the
++// ping-pong parity this task uses (write slot = frameCounter % 2, read
++// slot = (frameCounter + 1) % 2 -- see Impl::frameCounter's own comment),
++// the VERY FIRST execute() call that ever touches a history resource
++// reads a slot that will not be WRITTEN (by any real pass) until the frame
++// AFTER NEXT -- there is no "first write" for a LOAD_OP to piggyback on
++// before that first read happens. An explicit clear, run once here via its
++// own one-shot rx::rhi::CommandContext submission (the same
++// vkQueueWaitIdle-per-call tool this codebase already uses for setup/test
++// work -- rx_rhi_vk/command.h's own doc comment), is unconditionally
++// correct for both roles a freshly (re)created slot might be used in
++// first, and only ever runs once per pinned entry's lifetime (or once per
++// resize) -- see TransientPool::acquireHistory()'s `freshlyCreated` output
++// parameter, this function's only caller.
++//
++// Does NOT go through detail::applyAccess() for the clear's own barrier --
++// unlike every other caller of that function, this one is not a real
++// declared ResourceAccess: barriers.cpp's own isWriteAccess()/
++// kWriteAccessMask (its write-classification helper, scoped deliberately
++// to "every write access any declared ResourceAccess in this project can
++// carry" per that mask's own comment) does not recognize
++// VK_ACCESS_2_TRANSFER_WRITE_BIT as a write at all, so feeding it through
++// applyAccess() would mis-classify this as a READ and leave
++// lastWriteStages/pendingFlushAccess/hasPendingFlush understated (0/0/
++// false) instead of reflecting the real transfer write that just
++// happened. Harmless in THIS specific call site purely by accident of
++// timing (rx::rhi::CommandContext::runOnce() already vkQueueWaitIdle()s
++// before returning, so nothing ever needs to synchronize against this
++// clear across a submission boundary regardless of what state is left
++// behind) -- but relying on that coincidence instead of recording the
++// truth would be a latent bug waiting for a future caller that submits
++// this asynchronously instead. The transition itself is fully known
++// anyway (a freshly-created slot's ResourceBarrierState is always
++// UNDEFINED/everAccessed=false, so this is unconditionally "first use
++// ever": srcStage/srcAccess = NONE, oldLayout = UNDEFINED) -- hand-writing
++// it and then hand-seeding the resulting state as a real write is both
++// more precise and no more code than routing around the mask gap.
++void initializePinnedHistoryEntry(Executor::Impl& impl, uint32_t pinnedIndex) {
++    detail::PinnedHistoryEntry& entry = impl.pool.pinned(pinnedIndex);
++
++    auto cmdCtx = rx::rhi::CommandContext::create(impl.device, impl.graphicsQueue, impl.graphicsQueueFamily);
++    if (!cmdCtx.has_value()) {
++        RX_LOG_ERROR("rx_graph: Executor::realize: failed to create a CommandContext to init-clear history "
++                     "resource '{}'",
++                     entry.name);
++        return;
++    }
++
++    const VkImageAspectFlags aspect = aspectMaskForFormat(entry.format);
++    const bool isDepthOrStencil = aspect != VK_IMAGE_ASPECT_COLOR_BIT;
++
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        for (detail::PinnedHistorySlot& slot : entry.slots) {
++            VkImageMemoryBarrier2 vkBarrier{};
++            vkBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
++            vkBarrier.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
++            vkBarrier.srcAccessMask = VK_ACCESS_2_NONE;
++            vkBarrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
++            vkBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
++            vkBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++            vkBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++            vkBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++            vkBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++            vkBarrier.image = slot.texture->image();
++            vkBarrier.subresourceRange.aspectMask = aspect;
++            vkBarrier.subresourceRange.baseMipLevel = 0;
++            vkBarrier.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
++            vkBarrier.subresourceRange.baseArrayLayer = 0;
++            vkBarrier.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
++
++            VkDependencyInfo dep{};
++            dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++            dep.imageMemoryBarrierCount = 1;
++            dep.pImageMemoryBarriers = &vkBarrier;
++            vkCmdPipelineBarrier2(cmd, &dep);
++
++            // Hand-seed the state as if a real detail::applyAccess() write
++            // had just run (see this function's own comment above for why
++            // it is not literally called here) -- everything a subsequent
++            // real access's own detail::applyAccess() call needs to chain
++            // correctly off this clear.
++            slot.barrierState.currentLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++            slot.barrierState.everAccessed = true;
++            slot.barrierState.lastWriteStages = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
++            slot.barrierState.pendingFlushAccess = VK_ACCESS_2_TRANSFER_WRITE_BIT;
++            slot.barrierState.hasPendingFlush = true;
++
++            VkImageSubresourceRange range{};
++            range.aspectMask = aspect;
++            range.baseMipLevel = 0;
++            range.levelCount = VK_REMAINING_MIP_LEVELS;
++            range.baseArrayLayer = 0;
++            range.layerCount = VK_REMAINING_ARRAY_LAYERS;
++            if (isDepthOrStencil) {
++                VkClearDepthStencilValue clearValue{1.0F, 0};
++                vkCmdClearDepthStencilImage(cmd, slot.texture->image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                                             &clearValue, 1, &range);
++            } else {
++                VkClearColorValue clearValue{{0.0F, 0.0F, 0.0F, 1.0F}};
++                vkCmdClearColorImage(cmd, slot.texture->image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearValue, 1,
++                                      &range);
++            }
++        }
++    });
++}
++
+ }  // namespace
+ 
+ std::unique_ptr<Executor> Executor::create(rx::rhi::Device& device) {
+     auto allocator = rx::rhi::Allocator::createRaw(device.physicalDevice(), device.device(), device.instance());
+     if (!allocator.has_value()) {
+         RX_LOG_ERROR("rx_graph: Executor::create: rx::rhi::Allocator::createRaw failed");
+         return nullptr;
+     }
+ 
+-    auto impl = std::make_unique<Impl>(device.device(), device.physicalDevice(), std::move(*allocator));
++    auto impl = std::make_unique<Impl>(device.device(), device.physicalDevice(), device.graphicsQueue(),
++                                        device.graphicsQueueFamily(), std::move(*allocator));
+ 
+     // Task 3 ambiguity resolution #7: query VK_EXT_debug_utils availability
+     // once here, via the plain volk-global-function-pointer-null-check
+     // this whole codebase already relies on everywhere it calls a raw
+     // vkFoo (context.cpp/device.cpp track NO explicit enabled-extension
+     // list at all -- confirmed by reading both; there is nothing to read
+     // "capabilities" off of beyond volk's own loaded tables). volkLoadDevice()
+     // (already run inside rx::rhi::Device::create(), before any Executor
+     // can exist) leaves this device-level function pointer non-null if and
+     // only if VK_EXT_debug_utils was actually enabled/available -- exactly
+@@ -402,31 +653,59 @@ void Executor::realize(const RenderGraph& graph) {
+     std::unordered_map<std::string, uint32_t> nameToIndex;
+     nameToIndex.reserve(resources.size());
+ 
+     for (uint32_t i = 0; i < resources.size(); ++i) {
+         const PhysicalResource& physical = resources[i];
+         nameToIndex.emplace(physical.name, i);
+ 
+         ResolvedResource& entry = resolved[i];
+         entry.isBuffer = physical.isBuffer;
+         entry.isBackbuffer = physical.isBackbuffer;
++        entry.isHistory = physical.isHistory;
+ 
+         if (physical.isBackbuffer) {
+             // Never pooled [Task 3 ambiguity resolution #4] -- image/view/
+             // extent are filled in fresh by every execute() call instead;
+             // format is already known now (compile() resolves it from
+             // CompileInfo::swapchainFormat regardless of what its writer
+             // pass declared -- see render_graph.cpp).
+             entry.format = physical.attachment.format;
+             continue;
+         }
+ 
++        if (physical.isHistory) {
++            // Phase 4 Task 1: pinned, ping-ponged, looked up by NAME (never
++            // shape) -- see TransientPool::acquireHistory()'s own comment.
++            // `.image`/`.view` are deliberately left at their defaults;
++            // every history-aware code path resolves the correct real slot
++            // straight from Impl::pool.pinned(poolIndex) instead (see
++            // ResolvedResource's own comment).
++            const VkExtent2D extent = toExtent(physical.attachment);
++            bool freshlyCreated = false;
++            auto pinnedIndex =
++                impl.pool.acquireHistory(physical.name, physical.attachment.format, extent, physical.imageUsage,
++                                          physical.attachment.samples, impl.frameCounter, impl.deletionQueue,
++                                          &freshlyCreated);
++            if (!pinnedIndex.has_value()) {
++                RX_LOG_ERROR("rx_graph: Executor::realize: failed to acquire a pinned history entry for resource '{}'",
++                             physical.name);
++                continue;
++            }
++            entry.poolIndex = *pinnedIndex;
++            entry.format = physical.attachment.format;
++            entry.extent = extent;
++            if (freshlyCreated) {
++                initializePinnedHistoryEntry(impl, *pinnedIndex);
++            }
++            continue;
++        }
++
+         if (physical.isBuffer) {
+             auto poolIndex =
+                 impl.pool.acquireBuffer(physical.buffer.size, physical.buffer.usage, impl.frameCounter);
+             if (!poolIndex.has_value()) {
+                 RX_LOG_ERROR("rx_graph: Executor::realize: failed to acquire a pooled buffer for resource '{}'",
+                              physical.name);
+                 continue;
+             }
+             entry.poolIndex = *poolIndex;
+             entry.buffer = impl.pool.buffer(*poolIndex).buffer->handle();
+@@ -499,20 +778,21 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
+ 
+     for (size_t pos = 0; pos < order.size(); ++pos) {
+         const uint32_t rawIndex = order[pos];
+         const Pass& pass = graph.passAt(rawIndex);
+         const std::span<const ResourceAccess> accesses = compiled.passAccesses(rawIndex);
+ 
+         beginDebugLabel(impl, cmd, pass.name());
+ 
+         applyBarriers(impl, compiled, cmd, allBarriers[pos], firstBarrierSeen);
+         synthesizeFirstUseBufferBarrierIfNeeded(impl, compiled, cmd, accesses, pos, firstBarrierSeen);
++        applyHistoryAccesses(impl, compiled, cmd, accesses);
+ 
+         // Classify this pass's own declared accesses into color/depth
+         // attachment outputs [spec Phase 3 design, D2] -- every other
+         // declared AccessKind (TextureInput, StorageBufferOutput/Input)
+         // resolves to a layout that is neither COLOR_ATTACHMENT_OPTIMAL
+         // nor DEPTH_ATTACHMENT_OPTIMAL (see pass.h's Pass::resolveAccess
+         // table), so this is an exhaustive, unambiguous classification,
+         // not a heuristic.
+         std::vector<uint32_t> colorPhysIdx;
+         std::optional<uint32_t> depthPhysIdx;
+@@ -533,40 +813,40 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
+         std::vector<VkRenderingAttachmentInfo> colorAttachments;
+         VkRenderingAttachmentInfo depthAttachment{};
+ 
+         if (isGraphicsPass) {
+             colorAttachments.reserve(colorPhysIdx.size());
+             for (uint32_t physIdx : colorPhysIdx) {
+                 const ResolvedResource& resolvedRes = impl.resources.at(physIdx);
+ 
+                 VkRenderingAttachmentInfo info{};
+                 info.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+-                info.imageView = resolvedRes.view;
++                info.imageView = resolveAttachmentView(impl, resolvedRes);
+                 info.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                 // Task 3 ambiguity resolution #3: first write-use of an
+                 // attachment in a frame clears; later uses load; always
+                 // store. Clear values are fixed this phase (per-pass
+                 // configurable clear values are future work).
+                 info.loadOp = attachmentEverWritten[physIdx] ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+                 info.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                 info.clearValue.color = VkClearColorValue{{0.0F, 0.0F, 0.0F, 1.0F}};
+                 attachmentEverWritten[physIdx] = true;
+ 
+                 colorAttachments.push_back(info);
+                 renderArea = resolvedRes.extent;
+             }
+ 
+             if (depthPhysIdx.has_value()) {
+                 const ResolvedResource& resolvedRes = impl.resources.at(*depthPhysIdx);
+ 
+                 depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+-                depthAttachment.imageView = resolvedRes.view;
++                depthAttachment.imageView = resolveAttachmentView(impl, resolvedRes);
+                 depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+                 depthAttachment.loadOp =
+                     attachmentEverWritten[*depthPhysIdx] ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+                 depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                 depthAttachment.clearValue.depthStencil = VkClearDepthStencilValue{1.0F, 0};
+                 attachmentEverWritten[*depthPhysIdx] = true;
+ 
+                 if (colorAttachments.empty()) {
+                     renderArea = resolvedRes.extent;
+                 }
+@@ -642,22 +922,31 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
+         // reader but the last one processed, which reproduced as a real,
+         // empirically-verified write-after-read hazard (see
+         // task-3-review.md's Critical finding and task-3-report.md's fix-
+         // round section). Carrying the union forward is always safe (only
+         // ever adds extra, conservative wait scope) -- a subsequent WRITE
+         // within the SAME execute() call already correctly waits on every
+         // reader via Task 2's own invalidatedStagesUnion-based WAR barrier,
+         // so there is no case where accumulating instead of resetting on a
+         // write causes an actual over-synchronization problem worth
+         // special-casing.
++        // Phase 4 Task 1: history physicalIndex entries are deliberately
++        // excluded here -- their poolIndex addresses Impl::pool's pinned_
++        // vector, not images_/buffers_ (the two the loop just below this
++        // one indexes into), and their cross-frame carry-forward is
++        // already handled per-slot, inline, by applyHistoryAccesses()
++        // above (PinnedHistorySlot::barrierState persists across
++        // execute() calls on its own -- there is nothing left for this
++        // generic mechanism to do for them at all).
+         for (const auto& [physIdx, combined] : combineAccessesByResource(accesses)) {
+-            if (!impl.resources.at(physIdx).isBackbuffer) {
++            const ResolvedResource& combinedRes = impl.resources.at(physIdx);
++            if (!combinedRes.isBackbuffer && !combinedRes.isHistory) {
+                 finalStageThisExecute[physIdx] |= combined.stages;
+                 finalAccessThisExecute[physIdx] |= combined.access & kPoolWriteAccessMask;
+             }
+         }
+     }
+ 
+     applyBarriers(impl, compiled, cmd, compiled.finalBarriers(), firstBarrierSeen);
+ 
+     // Task 3 ambiguity resolution #2: record what stage each pooled
+     // resource this call actually touched was left at, so the NEXT
+@@ -707,48 +996,75 @@ void requireKind(std::string_view name, const ResolvedResource& resolved, bool e
+                                  (expectBuffer ? "a buffer" : "an image"));
+     }
+ }
+ 
+ }  // namespace
+ 
+ VkImageView Executor::resolveImageView(std::string_view name) const {
+     const uint32_t idx = lookupResolvedIndex(*impl_, name);
+     const ResolvedResource& resolved = impl_->resources.at(idx);
+     requireKind(name, resolved, /*expectBuffer=*/false, "imageView");
++    if (resolved.isHistory) {
++        // Phase 4 Task 1: always THIS FRAME'S READ SLOT -- see executor.h's
++        // updated doc comment on this resolver for why there is no
++        // equivalent "give me the write slot" path at all.
++        const auto readSlot = static_cast<uint32_t>((impl_->frameCounter + 1) % 2);
++        return impl_->pool.pinned(resolved.poolIndex).slots[readSlot].texture->view();
++    }
+     return resolved.view;
+ }
+ 
+ VkImage Executor::resolveImage(std::string_view name) const {
+     const uint32_t idx = lookupResolvedIndex(*impl_, name);
+     const ResolvedResource& resolved = impl_->resources.at(idx);
+     requireKind(name, resolved, /*expectBuffer=*/false, "image");
++    if (resolved.isHistory) {
++        const auto readSlot = static_cast<uint32_t>((impl_->frameCounter + 1) % 2);
++        return impl_->pool.pinned(resolved.poolIndex).slots[readSlot].texture->image();
++    }
+     return resolved.image;
+ }
+ 
+ VkBuffer Executor::resolveBuffer(std::string_view name) const {
+     const uint32_t idx = lookupResolvedIndex(*impl_, name);
+     const ResolvedResource& resolved = impl_->resources.at(idx);
+     requireKind(name, resolved, /*expectBuffer=*/true, "buffer");
+     return resolved.buffer;
+ }
+ 
+ VkFormat Executor::resolveImageFormat(std::string_view name) const {
+     const uint32_t idx = lookupResolvedIndex(*impl_, name);
+     const ResolvedResource& resolved = impl_->resources.at(idx);
+     requireKind(name, resolved, /*expectBuffer=*/false, "imageFormat");
++    // Both ping-pong slots of a history resource always share one shape
++    // [design contract point 2] -- resolved.format (set once in
++    // Executor::realize(), unconditionally, regardless of isHistory) is
++    // already correct with no per-slot redirect needed.
+     return resolved.format;
+ }
+ 
++bool Executor::resolveHistoryValid(std::string_view name) const {
++    const uint32_t idx = lookupResolvedIndex(*impl_, name);
++    const ResolvedResource& resolved = impl_->resources.at(idx);
++    if (!resolved.isHistory) {
++        throw std::out_of_range("rx_graph: PassContext::historyValid(): '" + std::string(name) +
++                                 "' is not a history resource");
++    }
++    const auto readSlot = static_cast<uint32_t>((impl_->frameCounter + 1) % 2);
++    return impl_->pool.pinned(resolved.poolIndex).slots[readSlot].everWrittenByRealPass;
++}
++
+ VkImageView PassContext::imageView(std::string_view name) const { return executor_->resolveImageView(name); }
+ VkImage PassContext::image(std::string_view name) const { return executor_->resolveImage(name); }
+ VkBuffer PassContext::buffer(std::string_view name) const { return executor_->resolveBuffer(name); }
+ VkFormat PassContext::imageFormat(std::string_view name) const { return executor_->resolveImageFormat(name); }
++bool PassContext::historyValid(std::string_view name) const { return executor_->resolveHistoryValid(name); }
+ 
+ namespace detail {
+ 
+ VkPipelineStageFlags2 debugLastFrameFinalStages(const Executor& executor, std::string_view name) {
+     const Executor::Impl& impl = *executor.impl_;
+     const uint32_t idx = lookupResolvedIndex(impl, name);
+     const ResolvedResource& resolved = impl.resources.at(idx);
+     if (resolved.isBuffer) {
+         return impl.pool.buffer(resolved.poolIndex).lastFrameFinalStages;
+     }
+diff --git a/src/rx_graph/include/rx_graph/executor.h b/src/rx_graph/include/rx_graph/executor.h
+index c139299..c67bdc9 100644
+--- a/src/rx_graph/include/rx_graph/executor.h
++++ b/src/rx_graph/include/rx_graph/executor.h
+@@ -100,25 +100,55 @@ public:
+     // classification (a pass with no attachment output gets no dynamic-
+     // rendering scope at all, and therefore has no "render area" to speak
+     // of).
+     VkExtent2D renderArea{0, 0};
+ 
+     PassContext(const PassContext&) = delete;
+     PassContext& operator=(const PassContext&) = delete;
+     PassContext(PassContext&&) = delete;
+     PassContext& operator=(PassContext&&) = delete;
+ 
++    // For a history-resource `name` (Pass::addHistoryInput()/
++    // setHistoryOutput()), imageView()/image() resolve to THIS FRAME'S
++    // READ SLOT -- the previous frame's write, i.e. exactly what a pass
++    // declaring addHistoryInput() actually wants to sample. A pass
++    // establishing `name` via setHistoryOutput() alone never needs to call
++    // these for it at all: this frame's WRITE slot is bound automatically
++    // as the pass's own color/depth attachment (Executor::execute(), same
++    // as any other addColorOutput()/setDepthStencilOutput() resource) --
++    // there is no name-based accessor for "the write slot" because nothing
++    // in this codebase needs one; a pass callback interacts with its own
++    // attachment purely through the dynamic-rendering scope it runs
++    // inside, never by re-resolving its own output by name.
+     [[nodiscard]] VkImageView imageView(std::string_view name) const;
+     [[nodiscard]] VkImage image(std::string_view name) const;
+     [[nodiscard]] VkBuffer buffer(std::string_view name) const;
+     [[nodiscard]] VkFormat imageFormat(std::string_view name) const;
+ 
++    // Phase 4 Task 1: false until `name`'s history resource has completed
++    // one full ping-pong cycle -- i.e. until THIS frame's read slot has
++    // actually been the target of a real Pass::setHistoryOutput() write in
++    // some PAST execute() call, not merely the black-clear-at-creation
++    // init every pinned slot gets before its first-ever use (see
++    // transient_pool.h's PinnedHistorySlot::everWrittenByRealPass, the
++    // exact value this resolves to). A pass reading addHistoryInput(name)
++    // is expected to branch on this -- e.g. skip a temporal blend entirely
++    // on its own first-ever frame, since the "previous frame" it would
++    // blend against does not exist yet and this call only guarantees
++    // DEFINED (black/1.0-cleared), not MEANINGFUL, content for that case.
++    // `name` must be a history-resource name among CompiledGraph::
++    // resources() -- throws std::out_of_range otherwise, matching every
++    // other resolver's own "not resolvable" contract (a name that exists
++    // but is NOT a history resource throws too, naming it, exactly like
++    // buffer()/imageView() do for a wrong-kind name).
++    [[nodiscard]] bool historyValid(std::string_view name) const;
++
+     // Task 5 (rx_material): this pass's own attachment shape, exactly as
+     // Executor::execute() classified it this call (colorAttachments/
+     // depthPhysIdx/sample count -- see that function's own
+     // isGraphicsPass/colorPhysIdx/depthPhysIdx locals, which this mirrors
+     // into the device-free rx::graph::PassSignature value a material's
+     // pipeline-variant cache key needs). Default-constructed
+     // (colorCount == 0, depthFormat == VK_FORMAT_UNDEFINED,
+     // samples == VK_SAMPLE_COUNT_1_BIT) for a pass with no attachment
+     // output at all (a "bare" pass, per Executor::execute()'s own
+     // graphics-vs-bare classification) -- there is no attachment shape to
+@@ -248,15 +278,16 @@ public:
+ private:
+     friend class PassContext;
+     friend VkPipelineStageFlags2 detail::debugLastFrameFinalStages(const Executor&, std::string_view);
+ 
+     explicit Executor(std::unique_ptr<Impl> impl);
+ 
+     [[nodiscard]] VkImageView resolveImageView(std::string_view name) const;
+     [[nodiscard]] VkImage resolveImage(std::string_view name) const;
+     [[nodiscard]] VkBuffer resolveBuffer(std::string_view name) const;
+     [[nodiscard]] VkFormat resolveImageFormat(std::string_view name) const;
++    [[nodiscard]] bool resolveHistoryValid(std::string_view name) const;
+ 
+     std::unique_ptr<Impl> impl_;
+ };
+ 
+ }  // namespace rx::graph
+diff --git a/src/rx_graph/include/rx_graph/pass.h b/src/rx_graph/include/rx_graph/pass.h
+index fce130f..228c2ac 100644
+--- a/src/rx_graph/include/rx_graph/pass.h
++++ b/src/rx_graph/include/rx_graph/pass.h
+@@ -57,20 +57,93 @@ public:
+     // Declares the (at most one, by convention -- see pass.h's class
+     // comment for why this is not enforced in Task 1) depth/stencil
+     // attachment this pass writes.
+     Pass& setDepthStencilOutput(std::string_view name, const AttachmentDesc& desc);
+ 
+     // Declares a sampled read of a resource some earlier-established pass
+     // wrote as an attachment. `name` must already have a writer somewhere
+     // in the graph -- see RenderGraph::compile()'s validation.
+     Pass& addTextureInput(std::string_view name);
+ 
++    // Phase 4 Task 1: declares a sampled read of history resource `name`'s
++    // PREVIOUS FRAME's contents -- NOT this frame's own setHistoryOutput()
++    // write to the same name (there is no way to read that through this
++    // API at all; a pass wanting to see its own frame's output writes a
++    // DIFFERENT, ordinary name via addColorOutput()/setDepthStencilOutput()
++    // and lets some other pass addTextureInput() that one instead -- see
++    // this class's own "reading your own frame's write" note under
++    // setHistoryOutput() below). `name` must have exactly one
++    // setHistoryOutput() declarer somewhere in the graph (any pass, not
++    // necessarily this one, and not necessarily before this declaration --
++    // same declaration-order independence as addTextureInput()); compile()
++    // throws, naming both the reading pass and `name`, if no pass declares
++    // it. Resolves like addTextureInput() (FRAGMENT_SHADER or
++    // COMPUTE_SHADER by this pass's own Graphics-/Compute-class split,
++    // SHADER_SAMPLED_READ, SHADER_READ_ONLY_OPTIMAL) -- see
++    // render_graph.cpp's Pass::resolveAccess.
++    //
++    // Deliberately creates NO same-frame ordering dependency on `name`'s
++    // setHistoryOutput() writer (RenderGraph::compile() never adds a
++    // dependsOn edge for this declaration kind, unlike every other read
++    // kind) -- the read and this frame's write are two DIFFERENT pinned
++    // physical images (ping-pong slots), so there is no same-frame data
++    // hazard between them to order against; the real, necessary
++    // synchronization is a cross-frame one Executor::execute() derives
++    // from each pinned slot's own tracked state (executor.cpp), not
++    // anything RenderGraph::compile()'s intra-frame DAG could express or
++    // needs to.
++    Pass& addHistoryInput(std::string_view name);
++
++    // Phase 4 Task 1: declares `name` as a persistent (history) written
++    // attachment -- color or depth/stencil, chosen from `desc.format`
++    // exactly like addColorOutput() vs setDepthStencilOutput() would (see
++    // render_graph.cpp's Pass::resolveAccess). Unlike every other output
++    // declaration, this resource is backed by TWO pinned physical images
++    // that ping-pong across frames (Executor's pinned pool,
++    // transient_pool.h) rather than one discard-per-frame transient
++    // allocation -- `name`'s contents, once written, survive into the
++    // NEXT frame's addHistoryInput() read of the same name (a different
++    // pass's declaration, or a future frame's), never this SAME frame's.
++    //
++    // At most one setHistoryOutput() declaration for a given `name` may
++    // exist across the whole graph (compile() throws, naming `name` and
++    // both offending passes, on a second one) -- unlike addColorOutput(),
++    // which tolerates multiple writers of the same name via its
++    // write-after-write chain, there is no such chain here: a ping-ponged
++    // resource has exactly one writer's worth of "this frame's slot" to
++    // fill. `name` also may not be used by any NON-history declaration
++    // anywhere in the graph (addColorOutput/setDepthStencilOutput/
++    // addTextureInput/addStorageBufferOutput/addStorageBufferInput) --
++    // history names are their own namespace, and compile() rejects mixing
++    // them with transient/buffer uses of the same name (naming `name`).
++    //
++    // A pass establishing `name` this way is never culled even if nothing
++    // in THIS graph reads it (RenderGraph::compile()'s reachability walk
++    // treats every setHistoryOutput()-declaring pass as an implicit root,
++    // exactly like setSideEffect() -- see that method's own comment and
++    // render_graph.cpp's cull step): its effect crosses the frame
++    // boundary, so "nothing downstream reads it in this compiled graph" is
++    // never a valid reason to discard it, unlike an ordinary dead-end
++    // write.
++    //
++    // Per-frame load semantics stay VK_ATTACHMENT_LOAD_OP_CLEAR on this
++    // pass's own first write each frame, exactly like any other attachment
++    // output [Task 3 ambiguity resolution #3] -- a history resource's
++    // pass is expected to fully rewrite its own write slot every frame it
++    // runs (Phase 4 has no consumer needing partial/incremental history
++    // updates), so there is no "preserve what was already in the write
++    // slot" load-preserve mode in this phase. A future phase wanting that
++    // (e.g. a pass that only updates part of a persistent buffer) would
++    // need a dedicated load-preserve declaration this one deliberately
++    // does not provide.
++    Pass& setHistoryOutput(std::string_view name, const AttachmentDesc& desc);
++
+     // Declares a storage buffer this pass writes (read-write, per the Task
+     // 1 brief's stage/access table: a storage buffer *output* carries both
+     // SHADER_STORAGE_WRITE and SHADER_STORAGE_READ access).
+     Pass& addStorageBufferOutput(std::string_view name, const BufferDesc& desc);
+ 
+     // Declares a storage buffer read of a resource some earlier-established
+     // pass wrote via addStorageBufferOutput.
+     Pass& addStorageBufferInput(std::string_view name);
+ 
+     // Exempts this pass from culling: RenderGraph::compile() keeps it (and
+@@ -114,57 +187,81 @@ private:
+     // Which builder method produced one Declaration -- drives both the
+     // stage/access/layout resolution in RenderGraph::compile() (Task 1
+     // brief, compile algorithm step 1) and the imageUsage union stored on
+     // the resource's PhysicalResource entry.
+     enum class AccessKind : uint8_t {
+         ColorOutput,
+         DepthStencilOutput,
+         TextureInput,
+         StorageBufferOutput,
+         StorageBufferInput,
++        // Phase 4 Task 1: see addHistoryInput()/setHistoryOutput() above.
++        // Deliberately listed last (not interleaved next to the
++        // TextureInput/ColorOutput/DepthStencilOutput kinds they otherwise
++        // parallel) purely so every existing switch/if-chain over this
++        // enum that was written before this task stays easy to diff
++        // against -- no ordering significance beyond that.
++        HistoryInput,
++        HistoryOutput,
+     };
+ 
+     struct Declaration {
+         AccessKind kind;
+         std::string resourceName;
+-        AttachmentDesc attachment;  // meaningful for ColorOutput/DepthStencilOutput
++        AttachmentDesc attachment;  // meaningful for ColorOutput/DepthStencilOutput/HistoryOutput
+         BufferDesc buffer;          // meaningful for StorageBufferOutput
+     };
+ 
+     Pass(std::string name, QueueClass queue);
+ 
+     // These three helpers live here (private members of Pass), rather than
+     // as free functions in render_graph.cpp, purely because of access
+     // control: AccessKind and Declaration are private nested types, so
+     // only Pass's own members (or its declared friend, RenderGraph) can
+     // name them -- a free function in another translation-unit-local
+     // namespace cannot, even inside the same .cpp file. RenderGraph::
+     // compile() (the friend) is the only caller of all three.
+ 
+     // True if this pass declares at least one color or depth/stencil
+     // output -- RenderGraph::compile() uses this to classify a pass as
+     // "Graphics-class" (this) vs "Compute-class" (neither): the Task 1
+     // brief's storage-buffer stage table resolves differently for the two.
+     // See resources.h's comment on QueueClass for why that hint is not
+-    // used for this classification instead.
++    // used for this classification instead. Phase 4 Task 1: a
++    // setHistoryOutput() declaration counts as an attachment output here
++    // too -- it IS one (a color or depth/stencil write, chosen by format;
++    // see Pass::resolveAccess), just persistent instead of discarded.
+     [[nodiscard]] bool hasAttachmentOutput() const;
+ 
+     // Resolves one declaration's VkPipelineStageFlags2/VkAccessFlags2/
+     // VkImageLayout triple, per the Task 1 brief's compile algorithm step
+     // 1. `computeClass` selects between the Compute-class and
+     // Graphics-class storage-buffer stage rows of that table; irrelevant
+     // to every other declaration kind, which has exactly one fixed row.
+     static ResourceAccess resolveAccess(const Declaration& decl, uint32_t physicalIndex, bool computeClass);
+ 
+     // True for a declaration kind that establishes/updates a resource
+-    // (color/depth-stencil/storage-buffer output); false for a read
+-    // (texture input, storage buffer input).
++    // (color/depth-stencil/storage-buffer output) AND that should
++    // participate in RenderGraph::compile()'s cross-pass dependency-edge
++    // graph (writersByName/dependsOn -- render_graph.cpp step 1); false
++    // for a read (texture input, storage buffer input) AND, deliberately,
++    // for HistoryOutput [Phase 4 Task 1]: a history resource's write
++    // genuinely does establish/update it (hasAttachmentOutput() above and
++    // Pass::resolveAccess both treat it as a real write), but it must NOT
++    // feed the SAME-FRAME writersByName/dependsOn machinery that
++    // addTextureInput()'s read-resolution walks -- a addHistoryInput()
++    // read of the same name resolves against a separate,
++    // dependency-edge-free lookup instead (render_graph.cpp's
++    // historyOutputWritersByName), precisely so reading last frame's contents
++    // never creates a same-frame ordering dependency on this frame's
++    // writer (see addHistoryInput()'s own comment above for why that
++    // dependency would be actively wrong, not just unnecessary).
+     static bool isWriteKind(AccessKind kind);
+ 
+     std::string name_;
+     QueueClass queue_ = QueueClass::Graphics;
+     bool sideEffect_ = false;
+     std::function<void(PassContext&)> execute_;
+     std::vector<Declaration> declarations_;
+ };
+ 
+ }  // namespace rx::graph
+diff --git a/src/rx_graph/include/rx_graph/pass_signature.h b/src/rx_graph/include/rx_graph/pass_signature.h
+index eaf4cd3..fb903cf 100644
+--- a/src/rx_graph/include/rx_graph/pass_signature.h
++++ b/src/rx_graph/include/rx_graph/pass_signature.h
+@@ -29,25 +29,37 @@ namespace rx::graph {
+ // one, an actual dependency cycle -- rx_material aliases this type instead
+ // (`rx::material::PassSignature`, material_system.h) so callers never need
+ // to spell the rx::graph name.
+ //
+ // Deliberately NOT the full fixed-function pipeline state a real variant
+ // key could in principle include (blend state, rasterization state, ...) --
+ // Phase 3's material pipelines fix every other piece of state themselves
+ // (see rx_material's material_system.cpp), so the render graph only needs
+ // to contribute what IT actually varies per pass: attachment shape.
+ struct PassSignature {
++    // Phase 4 Task 1 (carried final-review finding from Phase 3): the
++    // ceiling on how many color attachments any single declared pass may
++    // have -- RenderGraph::compile() throws, naming the offending pass, if
++    // a Pass::addColorOutput()/setHistoryOutput() call would push a single
++    // pass's own color-attachment count past this (render_graph.cpp).
++    // Named here (not a bare magic number) precisely because this array's
++    // own size is the ONE existing place that limit was already implicit
++    // but unenforced -- every other reference to "8" for this purpose
++    // (there were none outside this array before this task) should use
++    // this constant instead of repeating the literal.
++    static constexpr uint32_t kMaxColorAttachments = 8;
++
+     // VK_FORMAT_UNDEFINED-padded: only the first `colorCount` entries are
+     // meaningful. Fixed-size (not a vector) so PassSignature stays a
+     // trivially-comparable, trivially-hashable value type, matching every
+     // other rx_graph value type's own device-free-header discipline.
+-    std::array<VkFormat, 8> colorFormats{};
++    std::array<VkFormat, kMaxColorAttachments> colorFormats{};
+     uint32_t colorCount = 0;
+     VkFormat depthFormat = VK_FORMAT_UNDEFINED;
+     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+ 
+     bool operator==(const PassSignature&) const = default;
+ 
+     // FNV-1a 64-bit over every field above, in declaration order (the
+     // unused, VK_FORMAT_UNDEFINED-padded tail of `colorFormats` past
+     // `colorCount` is included too -- default-constructed to 0 and never
+     // mutated independently of `colorCount`, so two PassSignatures that
+diff --git a/src/rx_graph/include/rx_graph/resources.h b/src/rx_graph/include/rx_graph/resources.h
+index c3352be..c334ac3 100644
+--- a/src/rx_graph/include/rx_graph/resources.h
++++ b/src/rx_graph/include/rx_graph/resources.h
+@@ -109,13 +109,31 @@ struct PhysicalResource {
+ 
+     // Positions into CompiledGraph::executionOrder() (NOT raw pass
+     // indices) of this resource's first and last touching pass, over every
+     // surviving pass that reads or writes it. Equal when a resource is
+     // touched by exactly one surviving pass (e.g. the backbuffer, touched
+     // only by its final writer).
+     uint32_t firstUsePass = 0;
+     uint32_t lastUsePass = 0;
+ 
+     bool isBackbuffer = false;
++
++    // Phase 4 Task 1: true for a resource established via
++    // Pass::setHistoryOutput()/read via Pass::addHistoryInput() -- i.e. a
++    // persistent, ping-ponged resource backed by TWO pinned physical
++    // images (Executor's pinned pool, transient_pool.h), never the regular
++    // discard-per-frame transient pool a normal PhysicalResource uses.
++    // Mutually exclusive with a name ever appearing in a non-history
++    // declaration (RenderGraph::compile()'s own namespace-mixing
++    // validation rejects a graph that tries both) and with isBackbuffer
++    // (a history name can never satisfy setBackbufferSource()'s own
++    // writer-existence check -- see render_graph.cpp's comment on why
++    // Pass::isWriteKind() deliberately excludes HistoryOutput). firstUsePass/
++    // lastUsePass/imageUsage are still populated the same generic way as
++    // any other resource but are largely informational for a history
++    // resource -- ping-pong slot selection and cross-frame layout/stage
++    // tracking are entirely Executor-side concerns (executor.cpp), not
++    // something this device-free compile() result drives directly.
++    bool isHistory = false;
+ };
+ 
+ }  // namespace rx::graph
+diff --git a/src/rx_graph/render_graph.cpp b/src/rx_graph/render_graph.cpp
+index 729c4ff..2bf5d06 100644
+--- a/src/rx_graph/render_graph.cpp
++++ b/src/rx_graph/render_graph.cpp
+@@ -1,13 +1,14 @@
+ #include <rx_graph/render_graph.h>
+ 
+ #include <rx_core/log.h>
++#include <rx_graph/pass_signature.h>
+ 
+ #include <algorithm>
+ #include <deque>
+ #include <functional>
+ #include <set>
+ #include <stdexcept>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <utility>
+ 
+@@ -39,39 +40,93 @@
+ //      silently empty/degenerate graph with no diagnostic), a DFS over
+ //      the same producer edges finds one concrete cycle and compile()
+ //      throws, naming its passes.
+ //   4. Rescan only the surviving passes, in that execution order, to
+ //      resolve every PhysicalResource (name -> merged desc/imageUsage,
+ //      first/last use as *positions* in the execution order) and every
+ //      surviving pass's resolved ResourceAccess list (Impl::resolveResources).
+ //   5. (Task 2) Derive every sync2 barrier from steps 1-4's output
+ //      (barriers.h's buildBarriers(), ported from Granite's per-resource
+ //      invalidate/flush accounting -- see that header's own comment).
++//
++// Phase 4 Task 1 additions (history/persistent resources -- see pass.h's
++// addHistoryInput()/setHistoryOutput() comments for the full contract):
++// a bounds check ahead of step 1 (no pass may declare more than
++// PassSignature::kMaxColorAttachments color outputs -- a carried Phase 3
++// final-review finding, unrelated to history but landing in this same
++// task); a namespace-mixing + exactly-one-writer validation pass, also
++// ahead of step 1; step 2 gets a HistoryInput-specific twin that resolves
++// against the history writer map instead of writersByName, deliberately
++// WITHOUT adding a dependsOn edge; step 3's cull treats every
++// setHistoryOutput()-declaring pass as an implicit root, like
++// setSideEffect(); step 4's resource-resolution switch grows two more
++// cases. Steps 1/3b/3c/5 (writersByName/dependsOn construction, the
++// topological sort, cycle detection, and buildBarriers() itself) are
++// completely unchanged -- a history resource's REAL cross-frame
++// ping-pong/layout-carry synchronization is entirely Executor-side
++// (executor.cpp), never something this device-free algorithm computes.
+ namespace rx::graph {
+ 
+ struct RenderGraph::Impl {
+     std::deque<Pass> passes;  // stable references: addPass() hands out Pass&
+     std::string backbufferName;
+     bool hasBackbuffer = false;
+     CompiledGraph compiled;
+ };
+ 
+ // hasAttachmentOutput()/resolveAccess()/isWriteKind() are private members
+ // of Pass (declared in pass.h), not free functions here, because
+ // AccessKind/Declaration are private nested types of Pass: only Pass's own
+ // members or its declared friend (RenderGraph) may name them at all, and a
+ // free function in this .cpp's own namespace is neither, even though it
+ // lives in the same translation unit.
+ 
++namespace {
++
++// Phase 4 Task 1: is `format` a depth or depth/stencil format -- the same
++// bucket executor.cpp's own aspectMaskForFormat() (and, before that,
++// rx_rhi_vk/texture.cpp's identically-named function) already uses to
++// decide DEPTH_BIT-vs-COLOR_BIT aspect masks. An independent, equally
++// small local copy for the same reason executor.cpp's own copy documents
++// itself as one (neither is exported past its own .cpp) -- this one drives
++// Pass::resolveAccess's HistoryOutput color-vs-depth dispatch below, a
++// device-free decision that must not pull in rx_rhi_vk (or even volk) just
++// to answer "is this VkFormat enum value one of six depth ones", exactly
++// like setDepthStencilOutput()'s own existing resolveAccess row never
++// checks its format at all (a pure-stencil-only format is bucketed here as
++// "depth-like" for the same reason that pre-existing row does: this task's
++// scope does not extend to giving depth-vs-stencil-only formats separate
++// layouts, a gap setDepthStencilOutput already has today).
++bool isDepthOrStencilFormat(VkFormat format) {
++    switch (format) {
++        case VK_FORMAT_D16_UNORM:
++        case VK_FORMAT_D32_SFLOAT:
++        case VK_FORMAT_X8_D24_UNORM_PACK32:
++        case VK_FORMAT_D16_UNORM_S8_UINT:
++        case VK_FORMAT_D24_UNORM_S8_UINT:
++        case VK_FORMAT_D32_SFLOAT_S8_UINT:
++        case VK_FORMAT_S8_UINT:
++            return true;
++        default:
++            return false;
++    }
++}
++
++}  // namespace
++
+ bool Pass::hasAttachmentOutput() const {
+     for (const Declaration& decl : declarations_) {
+-        if (decl.kind == AccessKind::ColorOutput || decl.kind == AccessKind::DepthStencilOutput) {
++        // Phase 4 Task 1: a persistent (history) output IS an attachment
++        // output -- see setHistoryOutput()'s own comment (pass.h) and this
++        // method's updated doc comment.
++        if (decl.kind == AccessKind::ColorOutput || decl.kind == AccessKind::DepthStencilOutput ||
++            decl.kind == AccessKind::HistoryOutput) {
+             return true;
+         }
+     }
+     return false;
+ }
+ 
+ ResourceAccess Pass::resolveAccess(const Declaration& decl, uint32_t physicalIndex, bool computeClass) {
+     ResourceAccess access{};
+     access.physicalIndex = physicalIndex;
+     switch (decl.kind) {
+@@ -106,25 +161,63 @@ ResourceAccess Pass::resolveAccess(const Declaration& decl, uint32_t physicalInd
+                                           : (VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+             access.access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+             access.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+             break;
+         case AccessKind::StorageBufferInput:
+             access.stages = computeClass ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                                           : (VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+             access.access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+             access.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+             break;
++        case AccessKind::HistoryInput:
++            // Phase 4 Task 1: identical resolution to TextureInput above --
++            // a sampled read is a sampled read regardless of whether the
++            // resource it targets happens to be persistent. The only
++            // difference between the two kinds is upstream of this
++            // function entirely (which name-resolution path -- writersByName
++            // vs historyOutputWritersByName -- and which physical images Executor::
++            // execute() actually binds), never the resolved stage/access/
++            // layout triple itself.
++            access.stages =
++                computeClass ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
++            access.access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
++            access.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++            break;
++        case AccessKind::HistoryOutput:
++            // Phase 4 Task 1: color or depth/stencil, chosen by
++            // decl.attachment.format -- exactly the same two rows
++            // ColorOutput/DepthStencilOutput use above, just selected
++            // dynamically instead of by which builder method was called
++            // (setHistoryOutput() is the one output declaration whose
++            // format alone decides its attachment kind; see pass.h's own
++            // comment on why there is no separate "setHistoryDepthOutput").
++            if (isDepthOrStencilFormat(decl.attachment.format)) {
++                access.stages =
++                    VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
++                access.access =
++                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
++                access.layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
++            } else {
++                access.stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
++                access.access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
++                access.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++            }
++            break;
+     }
+     return access;
+ }
+ 
+ bool Pass::isWriteKind(AccessKind kind) {
++    // Phase 4 Task 1: HistoryOutput is deliberately NOT included here --
++    // see this method's own doc comment (pass.h) for exactly why a
++    // resource kind that unquestionably IS a write must still stay out of
++    // the writersByName/dependsOn edge graph this predicate feeds.
+     return kind == AccessKind::ColorOutput || kind == AccessKind::DepthStencilOutput ||
+            kind == AccessKind::StorageBufferOutput;
+ }
+ 
+ RenderGraph::RenderGraph() : impl_(std::make_unique<Impl>()) {
+     rx::core::log::init();
+ }
+ 
+ RenderGraph::~RenderGraph() = default;
+ 
+@@ -158,20 +251,94 @@ void RenderGraph::compile(const CompileInfo& info) {
+     {
+         std::unordered_set<std::string_view> seenNames;
+         for (const Pass& pass : g.passes) {
+             if (!seenNames.insert(pass.name_).second) {
+                 RX_LOG_ERROR("rx_graph: duplicate pass name '{}'", pass.name_);
+                 throw std::runtime_error("rx_graph: duplicate pass name '" + pass.name_ + "'");
+             }
+         }
+     }
+ 
++    // ---- bounds check (carried from the Phase 3 final review): no single
++    // pass may declare more than PassSignature::kMaxColorAttachments color
++    // outputs -- a HistoryOutput declaration that resolves to a color
++    // format (isDepthOrStencilFormat() false) counts exactly like an
++    // ordinary addColorOutput() for this purpose, since it is one, per
++    // Pass::hasAttachmentOutput()/resolveAccess above; a depth/stencil one
++    // (either kind) never counts here at all, matching
++    // setDepthStencilOutput()'s own long-standing (never bounded, "at most
++    // one, by convention" per pass.h's class comment) treatment. Checked
++    // per pass over the WHOLE declaration set, before culling -- this is a
++    // structural pass-shape violation, not something whether the pass
++    // survives culling should affect. -----------------------------------
++    for (const Pass& pass : g.passes) {
++        uint32_t colorCount = 0;
++        for (const Pass::Declaration& decl : pass.declarations_) {
++            if (decl.kind == Pass::AccessKind::ColorOutput ||
++                (decl.kind == Pass::AccessKind::HistoryOutput && !isDepthOrStencilFormat(decl.attachment.format))) {
++                ++colorCount;
++            }
++        }
++        if (colorCount > PassSignature::kMaxColorAttachments) {
++            RX_LOG_ERROR("rx_graph: pass '{}' declares {} color outputs, more than the maximum of {}", pass.name_,
++                         colorCount, PassSignature::kMaxColorAttachments);
++            throw std::runtime_error("rx_graph: pass '" + pass.name_ + "' declares " + std::to_string(colorCount) +
++                                      " color outputs, more than the maximum of " +
++                                      std::to_string(PassSignature::kMaxColorAttachments));
++        }
++    }
++
++    // ---- history resources: namespace-mixing + exactly-one-writer checks,
++    // and the writer lookup addHistoryInput() resolves against (Phase 4
++    // Task 1). Also structural, checked over the WHOLE declaration set
++    // before culling -- a history resource's writer is never subject to
++    // culling in the first place (see step 3a below), so there is no
++    // "wait until culling settles" reason to defer this either. ----------
++    std::unordered_set<std::string> historyNames;
++    std::unordered_set<std::string> nonHistoryNames;
++    std::unordered_map<std::string, std::vector<uint32_t>> historyOutputWritersByName;
++    for (uint32_t p = 0; p < passCount; ++p) {
++        for (const Pass::Declaration& decl : g.passes[p].declarations_) {
++            const bool isHistoryKind =
++                decl.kind == Pass::AccessKind::HistoryInput || decl.kind == Pass::AccessKind::HistoryOutput;
++            (isHistoryKind ? historyNames : nonHistoryNames).insert(decl.resourceName);
++            if (decl.kind == Pass::AccessKind::HistoryOutput) {
++                historyOutputWritersByName[decl.resourceName].push_back(p);
++            }
++        }
++    }
++    for (const std::string& name : historyNames) {
++        if (nonHistoryNames.contains(name)) {
++            RX_LOG_ERROR("rx_graph: resource '{}' is used as both a history resource and a transient/buffer "
++                         "resource -- history names are their own namespace",
++                         name);
++            throw std::runtime_error("rx_graph: resource '" + name +
++                                      "' is used as both a history resource and a transient/buffer resource -- "
++                                      "history names are their own namespace");
++        }
++    }
++    for (const auto& [name, writers] : historyOutputWritersByName) {
++        if (writers.size() > 1) {
++            std::string passNames;
++            for (uint32_t p : writers) {
++                if (!passNames.empty()) {
++                    passNames += ", ";
++                }
++                passNames += "'" + g.passes[p].name_ + "'";
++            }
++            RX_LOG_ERROR("rx_graph: history resource '{}' has more than one setHistoryOutput() pass: {}", name,
++                         passNames);
++            throw std::runtime_error("rx_graph: history resource '" + name +
++                                      "' has more than one setHistoryOutput() pass: " + passNames);
++        }
++    }
++
+     // ---- step 1: collect writers, across the WHOLE declaration set -----
+     // Ascending declaration index per resource name is guaranteed by
+     // iterating passes 0..passCount-1 in order and appending as writes are
+     // found -- no sort needed. write-after-write chains (a later-declared
+     // writer depends on the immediately preceding one for the same name)
+     // are recorded here too, per this task's ambiguity resolution: "the
+     // later-declared pass depends on the earlier writer".
+     std::unordered_map<std::string, std::vector<uint32_t>> writersByName;
+     std::vector<std::vector<uint32_t>> dependsOn(passCount);  // dependsOn[p] = producers p depends on
+ 
+@@ -217,20 +384,48 @@ void RenderGraph::compile(const CompileInfo& info) {
+             // write-after-write chain built in step 1 already orders every
+             // earlier writer strictly before that one, so depending on the
+             // last entry transitively depends on the whole chain.
+             uint32_t writer = it->second.back();
+             if (writer != p) {
+                 dependsOn[p].push_back(writer);
+             }
+         }
+     }
+ 
++    // ---- step 2b: resolve HistoryInput reads against historyOutputWritersByName
++    // instead of writersByName (Phase 4 Task 1) -- deliberately separate
++    // from the loop above: a HistoryInput read must NOT add a dependsOn
++    // edge onto its resource's setHistoryOutput() writer (see
++    // addHistoryInput()'s own comment, pass.h, for why that dependency
++    // would be wrong, not just redundant), but it still needs the SAME
++    // "reading something nobody declares" validation every other read
++    // kind gets, so a typo'd or never-established history name is caught
++    // here exactly as loudly.
++    for (uint32_t p = 0; p < passCount; ++p) {
++        const Pass& pass = g.passes[p];
++        for (const Pass::Declaration& decl : pass.declarations_) {
++            if (decl.kind != Pass::AccessKind::HistoryInput) {
++                continue;
++            }
++            auto it = historyOutputWritersByName.find(decl.resourceName);
++            if (it == historyOutputWritersByName.end() || it->second.empty()) {
++                RX_LOG_ERROR("rx_graph: pass '{}' reads history resource '{}', which no pass declares via "
++                             "setHistoryOutput()",
++                             pass.name_, decl.resourceName);
++                throw std::runtime_error("rx_graph: pass '" + pass.name_ + "' reads history resource '" +
++                                          decl.resourceName + "', which no pass declares via setHistoryOutput()");
++            }
++            // No dependsOn edge added -- intentional, see this block's own
++            // comment above.
++        }
++    }
++
+     // ---- backbuffer resource must have a writer -------------------------
+     auto backbufferWriters = writersByName.find(g.backbufferName);
+     if (backbufferWriters == writersByName.end() || backbufferWriters->second.empty()) {
+         RX_LOG_ERROR("rx_graph: backbuffer source resource '{}' is never written by any pass", g.backbufferName);
+         throw std::runtime_error("rx_graph: backbuffer source resource '" + g.backbufferName +
+                                   "' is never written by any pass");
+     }
+     const uint32_t backbufferWriterPass = backbufferWriters->second.back();
+ 
+     // ---- step 3a: cull -- reachability from the roots -------------------
+@@ -246,20 +441,33 @@ void RenderGraph::compile(const CompileInfo& info) {
+             reachable[p] = true;
+             ++reachableCount;
+             stack.push_back(p);
+         }
+     };
+     markReachable(backbufferWriterPass);
+     for (uint32_t p = 0; p < passCount; ++p) {
+         if (g.passes[p].sideEffect_) {
+             markReachable(p);
+         }
++        // Phase 4 Task 1: a setHistoryOutput() declaration is an implicit
++        // side effect -- its write persists into next frame's ping-pong
++        // slot regardless of whether anything in THIS compiled graph
++        // reads it (see setHistoryOutput()'s own comment, pass.h). Without
++        // this, a history-only writer with no in-graph reader would be
++        // wrongly culled as dead code the very first time Phase 4 adds a
++        // pass that writes history and nothing else in the same frame.
++        for (const Pass::Declaration& decl : g.passes[p].declarations_) {
++            if (decl.kind == Pass::AccessKind::HistoryOutput) {
++                markReachable(p);
++                break;
++            }
++        }
+     }
+     while (!stack.empty()) {
+         uint32_t p = stack.back();
+         stack.pop_back();
+         for (uint32_t producer : dependsOn[p]) {
+             markReachable(producer);
+         }
+     }
+ 
+     // ---- step 3b: stable topological order of survivors -----------------
+@@ -431,20 +639,44 @@ void RenderGraph::compile(const CompileInfo& info) {
+                     resource.imageUsage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+                     break;
+                 case Pass::AccessKind::TextureInput:
+                     resource.imageUsage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+                     break;
+                 case Pass::AccessKind::StorageBufferOutput:
+                     resource.buffer = decl.buffer;
+                     break;
+                 case Pass::AccessKind::StorageBufferInput:
+                     break;
++                case Pass::AccessKind::HistoryInput:
++                    // Phase 4 Task 1: a history resource is ALWAYS sampled
++                    // eventually (that is its entire point -- see
++                    // setHistoryOutput()'s own unconditional
++                    // VK_IMAGE_USAGE_SAMPLED_BIT union just below, which
++                    // covers the case no addHistoryInput() declaration
++                    // exists in THIS compiled graph at all); still unioned
++                    // here too so a graph that DOES declare one is in no
++                    // way relying on that other union instead.
++                    resource.isHistory = true;
++                    resource.imageUsage |= VK_IMAGE_USAGE_SAMPLED_BIT;
++                    break;
++                case Pass::AccessKind::HistoryOutput:
++                    resource.attachment = decl.attachment;
++                    resource.isHistory = true;
++                    // Always sampled (see the HistoryInput case's comment
++                    // above) in addition to its color-or-depth attachment
++                    // usage, chosen by format exactly like
++                    // Pass::resolveAccess's own HistoryOutput row.
++                    resource.imageUsage |= VK_IMAGE_USAGE_SAMPLED_BIT;
++                    resource.imageUsage |= isDepthOrStencilFormat(decl.attachment.format)
++                                               ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
++                                               : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++                    break;
+             }
+ 
+             accesses.push_back(Pass::resolveAccess(decl, physicalIndex, computeClass));
+         }
+     }
+ 
+     // ---- resolve SwapchainRelative sizes / the backbuffer's own shape --
+     for (PhysicalResource& resource : compiled.resources_) {
+         if (resource.isBuffer) {
+             continue;
+@@ -517,20 +749,30 @@ Pass& Pass::addColorOutput(std::string_view name, const AttachmentDesc& desc) {
+ Pass& Pass::setDepthStencilOutput(std::string_view name, const AttachmentDesc& desc) {
+     declarations_.push_back(Declaration{AccessKind::DepthStencilOutput, std::string(name), desc, BufferDesc{}});
+     return *this;
+ }
+ 
+ Pass& Pass::addTextureInput(std::string_view name) {
+     declarations_.push_back(Declaration{AccessKind::TextureInput, std::string(name), AttachmentDesc{}, BufferDesc{}});
+     return *this;
+ }
+ 
++Pass& Pass::addHistoryInput(std::string_view name) {
++    declarations_.push_back(Declaration{AccessKind::HistoryInput, std::string(name), AttachmentDesc{}, BufferDesc{}});
++    return *this;
++}
++
++Pass& Pass::setHistoryOutput(std::string_view name, const AttachmentDesc& desc) {
++    declarations_.push_back(Declaration{AccessKind::HistoryOutput, std::string(name), desc, BufferDesc{}});
++    return *this;
++}
++
+ Pass& Pass::addStorageBufferOutput(std::string_view name, const BufferDesc& desc) {
+     declarations_.push_back(Declaration{AccessKind::StorageBufferOutput, std::string(name), AttachmentDesc{}, desc});
+     return *this;
+ }
+ 
+ Pass& Pass::addStorageBufferInput(std::string_view name) {
+     declarations_.push_back(
+         Declaration{AccessKind::StorageBufferInput, std::string(name), AttachmentDesc{}, BufferDesc{}});
+     return *this;
+ }
+diff --git a/src/rx_graph/tests/test_compile.cpp b/src/rx_graph/tests/test_compile.cpp
+index e4b44e1..5dfc972 100644
+--- a/src/rx_graph/tests/test_compile.cpp
++++ b/src/rx_graph/tests/test_compile.cpp
+@@ -1,16 +1,17 @@
+ // Task 1 brief's exact test expectations (culling/ordering/lifetimes/
+ // usage-union/diamond/errors), plus a few extra cases exercising the rest
+ // of the Pass/RenderGraph/CompiledGraph surface (accessors, reset(),
+ // swapchain-relative size resolution, compute-vs-graphics storage buffer
+ // stage classification) that the six required cases don't otherwise touch.
+ #include <doctest/doctest.h>
++#include <rx_graph/pass_signature.h>
+ #include <rx_graph/render_graph.h>
+ 
+ #include <stdexcept>
+ #include <string>
+ 
+ using namespace rx::graph;
+ 
+ namespace {
+ 
+ // A representative 1080p swapchain -- no test below depends on the exact
+@@ -322,10 +323,277 @@ TEST_CASE("texture input stage resolves per pass kind, like storage buffers alre
+     CHECK(samplerAccesses[0].stages == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+     CHECK(samplerAccesses[0].access == VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+     CHECK(samplerAccesses[0].layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+ 
+     const auto presentAccesses = compiled.passAccesses(2);
+     REQUIRE(presentAccesses.size() == 2);
+     CHECK(presentAccesses[0].stages == VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+     CHECK(presentAccesses[0].access == VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+     CHECK(presentAccesses[0].layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+ }
++
++// ============================================================================
++// Phase 4 Task 1: history resources + the carried color-attachment bounds
++// check. Device-free -- everything below exercises RenderGraph::compile()'s
++// declaration/validation/culling semantics only, never a real device (the
++// GPU-backed ping-pong/first-frame-contract test lives in
++// test_execute_gpu.cpp, rx_graph_gpu_tests).
++// ============================================================================
++
++TEST_CASE("history output resolves color or depth by format, like addColorOutput/setDepthStencilOutput") {
++    RenderGraph graph;
++    graph.addPass("write_color_hist").setHistoryOutput("hist_color", colorDesc());  // pass 0
++    graph.addPass("write_depth_hist").setHistoryOutput("hist_depth", depthDesc());  // pass 1
++    graph.addPass("present").addColorOutput("bb", colorDesc());                     // pass 2
++    graph.setBackbufferSource("bb");
++    graph.compile(kInfo);
++
++    const CompiledGraph& compiled = graph.compiled();
++
++    const auto colorAccesses = compiled.passAccesses(0);
++    REQUIRE(colorAccesses.size() == 1);
++    CHECK(colorAccesses[0].stages == VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
++    CHECK(colorAccesses[0].access == VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
++    CHECK(colorAccesses[0].layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++
++    const auto depthAccesses = compiled.passAccesses(1);
++    REQUIRE(depthAccesses.size() == 1);
++    CHECK(depthAccesses[0].stages ==
++          (VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT));
++    CHECK(depthAccesses[0].access ==
++          (VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT));
++    CHECK(depthAccesses[0].layout == VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
++
++    // Both are marked isHistory and sampled -- unconditionally, per
++    // setHistoryOutput()'s own comment, even though neither is read by an
++    // addHistoryInput() declaration anywhere in THIS graph.
++    const PhysicalResource* histColor = findResource(compiled, "hist_color");
++    REQUIRE(histColor != nullptr);
++    CHECK(histColor->isHistory);
++    CHECK((histColor->imageUsage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0U);
++    CHECK((histColor->imageUsage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0U);
++
++    const PhysicalResource* histDepth = findResource(compiled, "hist_depth");
++    REQUIRE(histDepth != nullptr);
++    CHECK(histDepth->isHistory);
++    CHECK((histDepth->imageUsage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0U);
++    CHECK((histDepth->imageUsage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0U);
++}
++
++// Mirrors "texture input stage resolves per pass kind" above, for
++// addHistoryInput() instead of addTextureInput() -- same Compute-class/
++// Graphics-class split, same resolved access/layout.
++TEST_CASE("history input resolves like texture input, compute vs graphics split") {
++    RenderGraph graph;
++    graph.addPass("writer").setHistoryOutput("hist", colorDesc());  // pass 0
++    // "reader" has no attachment output at all -- Compute-class.
++    graph.addPass("reader").addHistoryInput("hist").setSideEffect();  // pass 1
++    // "present" has a color output alongside its history input -- Graphics-class.
++    graph.addPass("present").addHistoryInput("hist").addColorOutput("bb", colorDesc());  // pass 2
++    graph.setBackbufferSource("bb");
++    graph.compile(kInfo);
++
++    const CompiledGraph& compiled = graph.compiled();
++
++    const auto readerAccesses = compiled.passAccesses(1);
++    REQUIRE(readerAccesses.size() == 1);
++    CHECK(readerAccesses[0].stages == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
++    CHECK(readerAccesses[0].access == VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
++    CHECK(readerAccesses[0].layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++
++    const auto presentAccesses = compiled.passAccesses(2);
++    REQUIRE(presentAccesses.size() == 2);
++    CHECK(presentAccesses[0].stages == VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
++    CHECK(presentAccesses[0].access == VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
++    CHECK(presentAccesses[0].layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++}
++
++TEST_CASE("a resource used as both a history and a transient/buffer resource throws, naming it") {
++    RenderGraph graph;
++    graph.addPass("writer").setHistoryOutput("shared_name", colorDesc());
++    graph.addPass("other_writer").addColorOutput("shared_name", colorDesc());
++    graph.addPass("present").addColorOutput("bb", colorDesc());
++    graph.setBackbufferSource("bb");
++
++    bool threw = false;
++    try {
++        graph.compile(kInfo);
++    } catch (const std::runtime_error& e) {
++        threw = true;
++        CHECK(std::string(e.what()).find("shared_name") != std::string::npos);
++    }
++    CHECK(threw);
++}
++
++TEST_CASE("more than one setHistoryOutput() pass for the same name throws, naming the resource and both passes") {
++    RenderGraph graph;
++    graph.addPass("writerA").setHistoryOutput("hist", colorDesc());
++    graph.addPass("writerB").setHistoryOutput("hist", colorDesc());
++    graph.addPass("present").addColorOutput("bb", colorDesc());
++    graph.setBackbufferSource("bb");
++
++    bool threw = false;
++    try {
++        graph.compile(kInfo);
++    } catch (const std::runtime_error& e) {
++        threw = true;
++        const std::string message = e.what();
++        CHECK(message.find("hist") != std::string::npos);
++        CHECK(message.find("writerA") != std::string::npos);
++        CHECK(message.find("writerB") != std::string::npos);
++    }
++    CHECK(threw);
++}
++
++TEST_CASE("addHistoryInput() reading an undeclared history resource throws, naming the pass and the resource") {
++    RenderGraph graph;
++    graph.addPass("reader").addHistoryInput("ghost_history").setSideEffect();
++    graph.addPass("present").addColorOutput("bb", colorDesc());
++    graph.setBackbufferSource("bb");
++
++    bool threw = false;
++    try {
++        graph.compile(kInfo);
++    } catch (const std::runtime_error& e) {
++        threw = true;
++        const std::string message = e.what();
++        CHECK(message.find("reader") != std::string::npos);
++        CHECK(message.find("ghost_history") != std::string::npos);
++    }
++    CHECK(threw);
++}
++
++// A setHistoryOutput() pass persists across the frame boundary regardless
++// of whether anything in THIS compiled graph reads it -- it must survive
++// culling exactly like a setSideEffect() pass does, never be treated as
++// dead code just because nothing downstream consumes it this frame (see
++// setHistoryOutput()'s own comment, pass.h).
++TEST_CASE("a history-output pass is never culled even with no reader in the graph") {
++    RenderGraph graph;
++    graph.addPass("write_only_history").setHistoryOutput("hist", colorDesc());  // pass 0: no reader anywhere
++    graph.addPass("present").addColorOutput("bb", colorDesc());                 // pass 1
++    graph.setBackbufferSource("bb");
++    graph.compile(kInfo);
++
++    const CompiledGraph& compiled = graph.compiled();
++    CHECK_FALSE(compiled.isCulled(0));
++
++    const auto order = compiled.executionOrder();
++    REQUIRE(order.size() == 2);
++    CHECK(findResource(compiled, "hist") != nullptr);
++}
++
++// addHistoryInput() must NOT add a same-frame dependsOn edge onto its
++// resource's setHistoryOutput() writer (see that method's own comment) --
++// proven here by a shape that WOULD be a genuine dependency cycle if that
++// edge existed: "accum" writes history "hist" AND reads "hist" (its own
++// previous-frame contents, the canonical ping-pong-accumulator pattern),
++// while ALSO depending on "present" through an ordinary same-frame chain
++// that itself depends on "accum"'s own ordinary output. If addHistoryInput()
++// wrongly created dependsOn["accum"] -> writer("hist") == "accum" itself,
++// that would be a trivial (already-guarded) self-edge and prove nothing;
++// the real proof is that compile() succeeds AT ALL with "accum" declaring
++// both -- a same-frame edge from history would not by itself create a
++// cycle here, so this test's real assertion is simply that BOTH
++// declarations coexisting on one pass, and being read by another pass
++// entirely, compiles cleanly with the expected execution order.
++TEST_CASE("a history-input read creates no same-frame ordering dependency on its own resource's history-output writer") {
++    RenderGraph graph;
++    // "accum" both reads last frame's "hist" and writes this frame's "hist"
++    // -- the canonical persistent-accumulator pattern setHistoryOutput()'s
++    // own comment describes.
++    graph.addPass("accum").addHistoryInput("hist").setHistoryOutput("hist", colorDesc()).addColorOutput(
++        "resolved", colorDesc());  // pass 0
++    graph.addPass("present").addTextureInput("resolved").addColorOutput("bb", colorDesc());  // pass 1
++    graph.setBackbufferSource("bb");
++    graph.compile(kInfo);
++
++    const CompiledGraph& compiled = graph.compiled();
++    const auto order = compiled.executionOrder();
++    REQUIRE(order.size() == 2);
++    CHECK(order[0] == 0);  // accum
++    CHECK(order[1] == 1);  // present
++
++    // Both the read and the write declarations resolve to the SAME
++    // physicalIndex (one logical name, per the device-free model) --
++    // exactly two ResourceAccess entries against "hist"'s physicalIndex on
++    // pass 0, plus the unrelated "resolved" color output.
++    const uint32_t histIdx = [&] {
++        const auto resources = compiled.resources();
++        for (uint32_t i = 0; i < resources.size(); ++i) {
++            if (resources[i].name == "hist") {
++                return i;
++            }
++        }
++        FAIL("no physical resource named 'hist'");
++        return UINT32_MAX;
++    }();
++    const auto accumAccesses = compiled.passAccesses(0);
++    uint32_t histAccessCount = 0;
++    for (const ResourceAccess& access : accumAccesses) {
++        if (access.physicalIndex == histIdx) {
++            ++histAccessCount;
++        }
++    }
++    CHECK(histAccessCount == 2);
++}
++
++TEST_CASE("compile() throws, naming the pass, when it declares more color outputs than kMaxColorAttachments") {
++    RenderGraph graph;
++    Pass& pass = graph.addPass("too_many_colors").setSideEffect();
++    for (uint32_t i = 0; i < PassSignature::kMaxColorAttachments + 1; ++i) {
++        pass.addColorOutput("color_" + std::to_string(i), colorDesc());
++    }
++    graph.addPass("present").addColorOutput("bb", colorDesc());
++    graph.setBackbufferSource("bb");
++
++    bool threw = false;
++    try {
++        graph.compile(kInfo);
++    } catch (const std::runtime_error& e) {
++        threw = true;
++        CHECK(std::string(e.what()).find("too_many_colors") != std::string::npos);
++    }
++    CHECK(threw);
++}
++
++TEST_CASE("compile() accepts a pass declaring exactly kMaxColorAttachments color outputs") {
++    RenderGraph graph;
++    Pass& pass = graph.addPass("exactly_max_colors").setSideEffect();
++    for (uint32_t i = 0; i < PassSignature::kMaxColorAttachments; ++i) {
++        pass.addColorOutput("color_" + std::to_string(i), colorDesc());
++    }
++    graph.addPass("present").addColorOutput("bb", colorDesc());
++    graph.setBackbufferSource("bb");
++    CHECK_NOTHROW(graph.compile(kInfo));
++}
++
++// A HistoryOutput declaration that resolves to a color format counts
++// toward the SAME per-pass limit as an ordinary addColorOutput() -- see
++// compile()'s own bounds-check comment for why (it IS a color attachment
++// output, chosen dynamically by format).
++TEST_CASE("a HistoryOutput declaration counts toward the color-attachment bounds check when it resolves to color") {
++    RenderGraph graph;
++    Pass& pass = graph.addPass("too_many_colors").setSideEffect();
++    for (uint32_t i = 0; i < PassSignature::kMaxColorAttachments; ++i) {
++        pass.addColorOutput("color_" + std::to_string(i), colorDesc());
++    }
++    pass.setHistoryOutput("one_history_too_many", colorDesc());  // pushes the count to kMaxColorAttachments + 1
++    graph.addPass("present").addColorOutput("bb", colorDesc());
++    graph.setBackbufferSource("bb");
++    CHECK_THROWS_AS(graph.compile(kInfo), std::runtime_error);
++}
++
++// A depth-format HistoryOutput never counts toward the color-attachment
++// bounds check, matching setDepthStencilOutput()'s own long-standing
++// unbounded treatment.
++TEST_CASE("a depth-format HistoryOutput declaration never counts toward the color-attachment bounds check") {
++    RenderGraph graph;
++    Pass& pass = graph.addPass("at_max_colors_plus_history_depth").setSideEffect();
++    for (uint32_t i = 0; i < PassSignature::kMaxColorAttachments; ++i) {
++        pass.addColorOutput("color_" + std::to_string(i), colorDesc());
++    }
++    pass.setHistoryOutput("hist_depth", depthDesc());
++    graph.addPass("present").addColorOutput("bb", colorDesc());
++    graph.setBackbufferSource("bb");
++    CHECK_NOTHROW(graph.compile(kInfo));
++}
+diff --git a/src/rx_graph/tests/test_execute_gpu.cpp b/src/rx_graph/tests/test_execute_gpu.cpp
+index 27773c9..242defb 100644
+--- a/src/rx_graph/tests/test_execute_gpu.cpp
++++ b/src/rx_graph/tests/test_execute_gpu.cpp
+@@ -413,20 +413,225 @@ std::optional<InvertPipeline> buildInvertPipeline(VkDevice device, VkFormat colo
+ 
+     if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &result.pipeline) !=
+         VK_SUCCESS) {
+         destroyInvertPipeline(device, result);
+         return std::nullopt;
+     }
+ 
+     return result;
+ }
+ 
++// --- Phase 4 Task 1's history GPU test: the "fill" pipeline -- a
++// fullscreen triangle (same SV_VertexID trick as kInvertShaderSource
++// above) that writes a push-constant solid color, with NO texture/
++// descriptor-set dependency at all (unlike the invert pipeline, which
++// needs a real BindlessTable to substitute at set 0). Used by the
++// history-output-writing pass to paint a known, frame-varying pattern
++// into "hist"'s write slot -- PipelineLayoutBuilder::build() is called
++// with NO externalSet0 below precisely because this shader declares no
++// descriptor sets at all for it to need substituting. -------------------
++constexpr const char* kFillShaderSource = R"(
++struct PushConstants {
++    float4 color;
++};
++
++[[vk::push_constant]]
++ConstantBuffer<PushConstants> gPush;
++
++struct VSOut {
++    float4 position : SV_Position;
++};
++
++[shader("vertex")]
++VSOut vsMain(uint vertexID : SV_VertexID)
++{
++    float2 positions[3] = float2[3](
++        float2(-1.0, -1.0),
++        float2(3.0, -1.0),
++        float2(-1.0, 3.0)
++    );
++    VSOut o;
++    o.position = float4(positions[vertexID], 0.0, 1.0);
++    return o;
++}
++
++[shader("fragment")]
++float4 fsMain() : SV_Target
++{
++    return gPush.color;
++}
++)";
++
++const std::vector<std::string> kFillEntryPoints = {"vsMain", "fsMain"};
++
++struct FillPipeline {
++    VkShaderModule vertModule = VK_NULL_HANDLE;
++    VkShaderModule fragModule = VK_NULL_HANDLE;
++    rx::rhi::PipelineLayoutBundle layoutBundle;
++    VkPipeline pipeline = VK_NULL_HANDLE;
++    uint32_t pushConstantOffset = 0;
++    uint32_t pushConstantSize = 0;
++    VkShaderStageFlags pushConstantStages = 0;
++};
++
++void destroyFillPipeline(VkDevice device, FillPipeline& p) {
++    if (p.pipeline != VK_NULL_HANDLE) {
++        vkDestroyPipeline(device, p.pipeline, nullptr);
++    }
++    if (p.fragModule != VK_NULL_HANDLE) {
++        vkDestroyShaderModule(device, p.fragModule, nullptr);
++    }
++    if (p.vertModule != VK_NULL_HANDLE) {
++        vkDestroyShaderModule(device, p.vertModule, nullptr);
++    }
++    p.pipeline = VK_NULL_HANDLE;
++    p.fragModule = VK_NULL_HANDLE;
++    p.vertModule = VK_NULL_HANDLE;
++    p.layoutBundle = rx::rhi::PipelineLayoutBundle{};
++}
++
++std::optional<FillPipeline> buildFillPipeline(VkDevice device, VkFormat colorFormat) {
++    FillPipeline result;
++
++    auto compiler = rx::shader::Compiler::create();
++    if (!compiler.has_value()) {
++        return std::nullopt;
++    }
++
++    rx::shader::CompileResult compileResult =
++        compiler->compileFromSource("RxGraphFillModule", kFillShaderSource, kFillEntryPoints);
++    if (!compileResult.ok) {
++        MESSAGE("rx_graph fill shader compile failed: ", compileResult.diagnostics);
++        return std::nullopt;
++    }
++
++    auto layoutInfo = rx::shader::reflect(compileResult);
++    if (!layoutInfo.has_value() || layoutInfo->pushRanges.size() != 1) {
++        return std::nullopt;
++    }
++
++    // No externalSet0 -- this shader declares no descriptor sets at all
++    // (see this block's own comment above).
++    auto layoutBundle = rx::rhi::PipelineLayoutBuilder::build(device, *layoutInfo);
++    if (!layoutBundle.has_value()) {
++        return std::nullopt;
++    }
++    result.layoutBundle = std::move(*layoutBundle);
++    result.pushConstantOffset = layoutInfo->pushRanges[0].offset;
++    result.pushConstantSize = layoutInfo->pushRanges[0].size;
++    result.pushConstantStages = layoutInfo->pushRanges[0].stages;
++
++    for (const auto& blob : compileResult.entryPointCode) {
++        VkShaderModuleCreateInfo moduleInfo{};
++        moduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
++        moduleInfo.codeSize = blob.code.size() * sizeof(uint32_t);
++        moduleInfo.pCode = blob.code.data();
++
++        VkShaderModule module = VK_NULL_HANDLE;
++        if (vkCreateShaderModule(device, &moduleInfo, nullptr, &module) != VK_SUCCESS) {
++            destroyFillPipeline(device, result);
++            return std::nullopt;
++        }
++        if (blob.entryPointName == "vsMain") {
++            result.vertModule = module;
++        } else if (blob.entryPointName == "fsMain") {
++            result.fragModule = module;
++        } else {
++            vkDestroyShaderModule(device, module, nullptr);
++            destroyFillPipeline(device, result);
++            return std::nullopt;
++        }
++    }
++    if (result.vertModule == VK_NULL_HANDLE || result.fragModule == VK_NULL_HANDLE) {
++        destroyFillPipeline(device, result);
++        return std::nullopt;
++    }
++
++    std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
++    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++    stages[0].module = result.vertModule;
++    stages[0].pName = "main";
++    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++    stages[1].module = result.fragModule;
++    stages[1].pName = "main";
++
++    VkPipelineVertexInputStateCreateInfo vertexInputState{};
++    vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
++
++    VkPipelineInputAssemblyStateCreateInfo inputAssemblyState{};
++    inputAssemblyState.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
++    inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++
++    VkPipelineViewportStateCreateInfo viewportState{};
++    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
++    viewportState.viewportCount = 1;
++    viewportState.scissorCount = 1;
++
++    VkPipelineRasterizationStateCreateInfo rasterizationState{};
++    rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
++    rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
++    rasterizationState.cullMode = VK_CULL_MODE_NONE;
++    rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++    rasterizationState.lineWidth = 1.0F;
++
++    VkPipelineMultisampleStateCreateInfo multisampleState{};
++    multisampleState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
++    multisampleState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++
++    VkPipelineColorBlendAttachmentState blendAttachment{};
++    blendAttachment.blendEnable = VK_FALSE;
++    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
++                                      VK_COLOR_COMPONENT_A_BIT;
++
++    VkPipelineColorBlendStateCreateInfo colorBlendState{};
++    colorBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
++    colorBlendState.attachmentCount = 1;
++    colorBlendState.pAttachments = &blendAttachment;
++
++    std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
++    VkPipelineDynamicStateCreateInfo dynamicState{};
++    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
++    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
++    dynamicState.pDynamicStates = dynamicStates.data();
++
++    VkPipelineRenderingCreateInfo renderingCreateInfo{};
++    renderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
++    renderingCreateInfo.colorAttachmentCount = 1;
++    renderingCreateInfo.pColorAttachmentFormats = &colorFormat;
++
++    VkGraphicsPipelineCreateInfo pipelineInfo{};
++    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
++    pipelineInfo.pNext = &renderingCreateInfo;
++    pipelineInfo.stageCount = static_cast<uint32_t>(stages.size());
++    pipelineInfo.pStages = stages.data();
++    pipelineInfo.pVertexInputState = &vertexInputState;
++    pipelineInfo.pInputAssemblyState = &inputAssemblyState;
++    pipelineInfo.pViewportState = &viewportState;
++    pipelineInfo.pRasterizationState = &rasterizationState;
++    pipelineInfo.pMultisampleState = &multisampleState;
++    pipelineInfo.pColorBlendState = &colorBlendState;
++    pipelineInfo.pDynamicState = &dynamicState;
++    pipelineInfo.layout = result.layoutBundle.layout;
++    pipelineInfo.renderPass = VK_NULL_HANDLE;  // dynamic rendering
++    pipelineInfo.basePipelineIndex = -1;
++
++    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &result.pipeline) !=
++        VK_SUCCESS) {
++        destroyFillPipeline(device, result);
++        return std::nullopt;
++    }
++
++    return result;
++}
++
+ AttachmentDesc absoluteColorDesc(uint32_t width, uint32_t height) {
+     AttachmentDesc desc;
+     desc.format = kFormat;
+     desc.sizeClass = SizeClass::Absolute;
+     desc.width = static_cast<float>(width);
+     desc.height = static_cast<float>(height);
+     return desc;
+ }
+ 
+ }  // namespace
+@@ -819,10 +1024,203 @@ TEST_CASE(
+     // tracked value looks right in isolation.
+     cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+         fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
+     });
+ 
+     vkDeviceWaitIdle(device);
+     destroyOffscreenImage(device, *offscreen);
+ 
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
++
++TEST_CASE(
++    "Phase 4 Task 1: a history resource's write slot survives into the NEXT frame's read, and frame 1's read is "
++    "reported invalid") {
++    // Pass "write_history" (setHistoryOutput("hist") only, no reader of
++    // its own) writes a frame-varying solid color into "hist"'s write slot
++    // via the "fill" pipeline; pass "read_history" (addHistoryInput("hist")
++    // + addColorOutput("bb")) samples "hist" bindlessly through the SAME
++    // "invert" pipeline/shader test_execute_gpu.cpp's very first TEST_CASE
++    // above already builds and proves end to end -- reused verbatim here
++    // rather than writing a third near-duplicate "sample and pass through"
++    // shader, and its channel inversion is simply accounted for in this
++    // test's own expected-pixel arithmetic below (black -> white,
++    // red -> cyan) instead of removed.
++    //
++    // Ping-pong parity [design contract point 2]: execute() call N writes
++    // slot (N % 2), reads slot ((N + 1) % 2) -- call 1 writes slot 1,
++    // reads slot 0 (never written by any real pass -- only black-cleared
++    // at creation [design contract point 3], so historyValid() must read
++    // false and the sampled result must be exactly the black-clear
++    // color, inverted = white); call 2 writes slot 0, reads slot 1 (=
++    // call 1's write -- historyValid() must now read true, and the
++    // sampled result must be exactly call 1's fill color, inverted).
++    auto fixture = makeFixture("rx_graph_gpu_history");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    const VkDevice device = fixture->device.device();
++    const VkPhysicalDevice physicalDevice = fixture->device.physicalDevice();
++
++    auto bindlessTable =
++        rx::rhi::BindlessTable::create(physicalDevice, device, rx::rhi::BindlessTable::Capacities{4, 2, 1});
++    REQUIRE(bindlessTable.has_value());
++
++    auto fillPipeline = buildFillPipeline(device, kFormat);
++    REQUIRE(fillPipeline.has_value());
++
++    auto samplePipeline = buildInvertPipeline(device, kFormat, bindlessTable->descriptorSetLayout());
++    REQUIRE(samplePipeline.has_value());
++
++    VkSamplerCreateInfo samplerInfo{};
++    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
++    samplerInfo.magFilter = VK_FILTER_NEAREST;
++    samplerInfo.minFilter = VK_FILTER_NEAREST;
++    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    VkSampler sampler = VK_NULL_HANDLE;
++    REQUIRE(vkCreateSampler(device, &samplerInfo, nullptr, &sampler) == VK_SUCCESS);
++    auto samplerHandle = bindlessTable->registerSampler(sampler);
++    REQUIRE(samplerHandle.isValid());
++
++    auto offscreen = createOffscreenImage(device, physicalDevice, kFormat, VkExtent2D{kExtent, kExtent});
++    REQUIRE(offscreen.has_value());
++
++    rx::rhi::DeletionQueue deletionQueue;
++
++    // Mutated by the test between execute() calls; captured by reference in
++    // "write_history"'s callback below -- the SAME compiled/realized graph
++    // is executed twice, exactly like the resize-rerealize and buffer-reuse
++    // cases above already do.
++    std::array<float, 4> currentFillColor{1.0F, 0.0F, 0.0F, 1.0F};  // frame 1: red
++    bool observedHistoryValid = false;
++
++    RenderGraph graph;
++    graph.addPass("write_history").setHistoryOutput("hist", absoluteColorDesc(kExtent, kExtent)).setExecute(
++        [&](PassContext& ctx) {
++            vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, fillPipeline->pipeline);
++            vkCmdPushConstants(ctx.cmd, fillPipeline->layoutBundle.layout, fillPipeline->pushConstantStages,
++                                fillPipeline->pushConstantOffset, fillPipeline->pushConstantSize,
++                                currentFillColor.data());
++
++            VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.renderArea.width),
++                                 static_cast<float>(ctx.renderArea.height), 0.0F, 1.0F};
++            VkRect2D scissor{{0, 0}, ctx.renderArea};
++            vkCmdSetViewport(ctx.cmd, 0, 1, &viewport);
++            vkCmdSetScissor(ctx.cmd, 0, 1, &scissor);
++
++            vkCmdDraw(ctx.cmd, 3, 1, 0, 0);
++        });
++
++    rx::rhi::BindlessHandle histHandle;
++    graph.addPass("read_history")
++        .addHistoryInput("hist")
++        .addColorOutput("bb", absoluteColorDesc(kExtent, kExtent))
++        .setExecute([&](PassContext& ctx) {
++            observedHistoryValid = ctx.historyValid("hist");
++
++            histHandle =
++                bindlessTable->registerSampledImage(ctx.imageView("hist"), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++            REQUIRE(histHandle.isValid());
++
++            vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, samplePipeline->pipeline);
++
++            VkDescriptorSet set = bindlessTable->descriptorSet();
++            vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, samplePipeline->layoutBundle.layout, 0,
++                                     1, &set, 0, nullptr);
++
++            struct {
++                uint32_t textureIndex;
++                uint32_t samplerIndex;
++            } push{histHandle.index(), samplerHandle.index()};
++            vkCmdPushConstants(ctx.cmd, samplePipeline->layoutBundle.layout, samplePipeline->pushConstantStages,
++                                samplePipeline->pushConstantOffset, samplePipeline->pushConstantSize, &push);
++
++            VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.renderArea.width),
++                                 static_cast<float>(ctx.renderArea.height), 0.0F, 1.0F};
++            VkRect2D scissor{{0, 0}, ctx.renderArea};
++            vkCmdSetViewport(ctx.cmd, 0, 1, &viewport);
++            vkCmdSetScissor(ctx.cmd, 0, 1, &scissor);
++
++            vkCmdDraw(ctx.cmd, 3, 1, 0, 0);
++        });
++    graph.setBackbufferSource("bb");
++
++    CompileInfo info;
++    info.swapchainWidth = kExtent;
++    info.swapchainHeight = kExtent;
++    info.swapchainFormat = kFormat;
++    info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    graph.compile(info);
++
++    fixture->executor->realize(graph);
++
++    auto cmdCtx =
++        rx::rhi::CommandContext::create(device, fixture->device.graphicsQueue(), fixture->device.graphicsQueueFamily());
++    REQUIRE(cmdCtx.has_value());
++
++    auto readBackCorner = [&]() -> std::array<uint8_t, 4> {
++        const VkDeviceSize pixelBytes = static_cast<VkDeviceSize>(kExtent) * kExtent * 4;
++        auto readback = fixture->allocator.createHostVisibleBuffer(pixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++        REQUIRE(readback.has_value());
++        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++            VkBufferImageCopy region{};
++            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++            region.imageSubresource.layerCount = 1;
++            region.imageExtent = {kExtent, kExtent, 1};
++            vkCmdCopyImageToBuffer(cmd, offscreen->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1,
++                                    &region);
++        });
++        readback->invalidate();
++        std::array<uint8_t, 4> corner{};
++        std::memcpy(corner.data(), readback->mappedData(), corner.size());
++        return corner;
++    };
++
++    // ---- frame 1 (execute() call #1): writes slot 1, reads slot 0 (never
++    // written -- only black-cleared at creation). historyValid() must be
++    // false; the sampled result is the black clear color, inverted =
++    // white. ---------------------------------------------------------------
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
++    });
++    deletionQueue.retire([&bindlessTable, histHandle] { bindlessTable->release(histHandle); }, 0);
++    deletionQueue.onFrameFenceSignaled(0);
++
++    CHECK_FALSE(observedHistoryValid);
++    const std::array<uint8_t, 4> frame1Corner = readBackCorner();
++    CHECK(frame1Corner[0] == 255);
++    CHECK(frame1Corner[1] == 255);
++    CHECK(frame1Corner[2] == 255);
++    CHECK(frame1Corner[3] == 255);
++
++    // ---- frame 2 (execute() call #2): writes slot 0 (a fresh green fill,
++    // overwriting the slot frame 1 read from), reads slot 1 -- exactly
++    // frame 1's red fill. historyValid() must now be true; the sampled
++    // result is red, inverted = cyan -- proving frame 2's readback
++    // contains frame 1's pattern, not frame 2's own (still-being-written)
++    // one. --------------------------------------------------------------
++    currentFillColor = {0.0F, 1.0F, 0.0F, 1.0F};
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
++    });
++    deletionQueue.retire([&bindlessTable, histHandle] { bindlessTable->release(histHandle); }, 1);
++    deletionQueue.onFrameFenceSignaled(1);
++
++    CHECK(observedHistoryValid);
++    const std::array<uint8_t, 4> frame2Corner = readBackCorner();
++    CHECK(frame2Corner[0] == 0);
++    CHECK(frame2Corner[1] == 255);
++    CHECK(frame2Corner[2] == 255);
++    CHECK(frame2Corner[3] == 255);
++
++    vkDeviceWaitIdle(device);
++    bindlessTable->release(samplerHandle);
++    vkDestroySampler(device, sampler, nullptr);
++    destroyInvertPipeline(device, *samplePipeline);
++    destroyFillPipeline(device, *fillPipeline);
++    destroyOffscreenImage(device, *offscreen);
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/src/rx_graph/transient_pool.cpp b/src/rx_graph/transient_pool.cpp
+index d7bdf03..d9bb834 100644
+--- a/src/rx_graph/transient_pool.cpp
++++ b/src/rx_graph/transient_pool.cpp
+@@ -82,20 +82,87 @@ std::optional<uint32_t> TransientPool::acquireBuffer(VkDeviceSize size, VkBuffer
+     entry.buffer = std::move(*buffer);
+     entry.lastFrameFinalStages = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+     entry.lastFrameFinalAccess = VK_ACCESS_2_MEMORY_WRITE_BIT;
+     entry.lastUsedFrame = currentFrame;
+ 
+     buffers_.push_back(std::move(entry));
+     bufferClaimedThisBatch_.push_back(true);
+     return static_cast<uint32_t>(buffers_.size() - 1);
+ }
+ 
++std::optional<uint32_t> TransientPool::acquireHistory(std::string_view name, VkFormat format, VkExtent2D extent,
++                                                        VkImageUsageFlags usage, VkSampleCountFlagBits samples,
++                                                        uint64_t currentFrame, rx::rhi::DeletionQueue& deletionQueue,
++                                                        bool* freshlyCreated) {
++    *freshlyCreated = false;
++
++    uint32_t index = static_cast<uint32_t>(pinned_.size());
++    for (uint32_t i = 0; i < pinned_.size(); ++i) {
++        if (pinned_[i].name == name) {
++            index = i;
++            break;
++        }
++    }
++
++    const bool isNewEntry = (index == pinned_.size());
++    if (isNewEntry) {
++        PinnedHistoryEntry entry;
++        entry.name = std::string(name);
++        pinned_.push_back(std::move(entry));
++    }
++
++    PinnedHistoryEntry& entry = pinned_[index];
++    const bool shapeMatches = !isNewEntry && entry.format == format && entry.extent.width == extent.width &&
++                               entry.extent.height == extent.height && entry.usage == usage &&
++                               entry.samples == samples && entry.slots[0].texture.has_value() &&
++                               entry.slots[1].texture.has_value();
++    if (shapeMatches) {
++        return index;
++    }
++
++    // Either a brand new entry, or an existing one whose shape no longer
++    // matches (a resize) -- either way, both slots need a fresh
++    // Texture2D, and any PREVIOUSLY-live one must be retired (not
++    // destroyed outright: the GPU may still be reading/writing it via an
++    // in-flight submission from a past execute() call) rather than simply
++    // dropped, exactly like sweepStale()'s own retirement of a stale
++    // ordinary pooled entry.
++    for (PinnedHistorySlot& slot : entry.slots) {
++        if (slot.texture.has_value()) {
++            auto keepAlive = std::make_shared<rx::rhi::Texture2D>(std::move(*slot.texture));
++            slot.texture.reset();
++            deletionQueue.retire([keepAlive] {}, currentFrame);
++        }
++
++        auto texture = rx::rhi::Texture2D::create(physicalDevice_, device_, *allocator_, extent, format, usage,
++                                                    /*requestedMipLevels=*/1);
++        if (!texture.has_value()) {
++            RX_LOG_ERROR("rx_graph: TransientPool::acquireHistory: Texture2D::create failed for '{}' ({}x{}, format={})",
++                         entry.name, extent.width, extent.height, static_cast<int>(format));
++            return std::nullopt;
++        }
++        slot.texture = std::move(*texture);
++        // Fresh state for a fresh (or resized-away) image -- a resize
++        // discards whatever history content/sync state existed, same as
++        // every other resized PhysicalResource's pooled backing.
++        slot.barrierState = detail::ResourceBarrierState{};
++        slot.everWrittenByRealPass = false;
++    }
++
++    entry.format = format;
++    entry.extent = extent;
++    entry.usage = usage;
++    entry.samples = samples;
++    *freshlyCreated = true;
++    return index;
++}
++
+ void TransientPool::touchImage(uint32_t index, uint64_t currentFrame) {
+     images_.at(index).lastUsedFrame = currentFrame;
+ }
+ 
+ void TransientPool::touchBuffer(uint32_t index, uint64_t currentFrame) {
+     buffers_.at(index).lastUsedFrame = currentFrame;
+ }
+ 
+ void TransientPool::sweepStale(uint64_t currentFrame, rx::rhi::DeletionQueue& deletionQueue) {
+     for (PooledImage& entry : images_) {
+@@ -144,13 +211,26 @@ void TransientPool::retireAll(uint64_t currentFrame, rx::rhi::DeletionQueue& del
+         deletionQueue.retire([keepAlive] {}, currentFrame);
+     }
+     for (PooledBuffer& entry : buffers_) {
+         if (!entry.buffer.has_value()) {
+             continue;
+         }
+         auto keepAlive = std::make_shared<rx::rhi::Buffer>(std::move(*entry.buffer));
+         entry.buffer.reset();
+         deletionQueue.retire([keepAlive] {}, currentFrame);
+     }
++    // Phase 4 Task 1: pinned history entries are never touched by
++    // sweepStale() (see that method's own comment) -- retireAll() is the
++    // ONLY path that ever tears one down, at Executor shutdown.
++    for (PinnedHistoryEntry& entry : pinned_) {
++        for (PinnedHistorySlot& slot : entry.slots) {
++            if (!slot.texture.has_value()) {
++                continue;
++            }
++            auto keepAlive = std::make_shared<rx::rhi::Texture2D>(std::move(*slot.texture));
++            slot.texture.reset();
++            deletionQueue.retire([keepAlive] {}, currentFrame);
++        }
++    }
+ }
+ 
+ }  // namespace rx::graph::detail
+diff --git a/src/rx_graph/transient_pool.h b/src/rx_graph/transient_pool.h
+index baac64c..50b99cf 100644
+--- a/src/rx_graph/transient_pool.h
++++ b/src/rx_graph/transient_pool.h
+@@ -6,27 +6,31 @@
+ // rx_graph header, this one freely depends on rx_rhi_vk (Texture2D/Buffer/
+ // Allocator) and volk -- Task 3's own binding constraint ("no volk in
+ // public headers") is about headers a consumer of rx_graph's public API
+ // might include, which this one structurally cannot be.
+ //
+ // Reuses rx::rhi::Texture2D/rx::rhi::Buffer/rx::rhi::Allocator wholesale
+ // instead of calling vmaCreateImage/vmaCreateBuffer directly -- this
+ // project's own standing rule against rebuilding what already exists
+ // [repo CLAUDE.md, "Do not reinvent the wheel"] applies exactly as much to
+ // rx_graph's own sibling library as it would to a third-party one.
++#include <rx_graph/barriers.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/texture.h>
+ #include <volk.h>
+ 
++#include <array>
+ #include <cstdint>
+ #include <functional>
+ #include <optional>
++#include <string>
++#include <string_view>
+ #include <vector>
+ 
+ namespace rx::rhi {
+ class DeletionQueue;
+ }  // namespace rx::rhi
+ 
+ namespace rx::graph::detail {
+ 
+ // How many consecutive execute() calls (Executor's own frame counter, one
+ // tick per execute() call -- see executor.cpp) a pooled entry may go
+@@ -104,20 +108,85 @@ struct PooledBuffer {
+     VkBufferUsageFlags usage = 0;
+ 
+     std::optional<rx::rhi::Buffer> buffer;
+ 
+     VkPipelineStageFlags2 lastFrameFinalStages = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+     // See PooledImage::lastFrameFinalAccess -- same availability contract.
+     VkAccessFlags2 lastFrameFinalAccess = VK_ACCESS_2_MEMORY_WRITE_BIT;
+     uint64_t lastUsedFrame = 0;
+ };
+ 
++// Phase 4 Task 1: one ping-pong SLOT of a pinned history resource -- one of
++// the two physical images a single history-resource name is backed by
++// [design contract point 2: "TWO pinned physical images per history
++// resource (slot A/B)"].
++//
++// `barrierState` is the SAME per-resource invalidate/flush state machine
++// barriers.h's own detail::ResourceBarrierState/applyAccess() already
++// implement and buildBarriers() already drives for every ordinary
++// PhysicalResource -- reused here verbatim rather than re-derived, per this
++// repo's own "don't reinvent the wheel" rule (CLAUDE.md) and because the
++// exact behavior needed (barrier only when the layout differs or a prior
++// write/read demands one, WAW/WAR-correct, per-stage read coverage) is
++// EXACTLY what that state machine already gets right. The one thing that
++// makes a pinned slot's use of it different from buildBarriers()' own: a
++// PinnedHistorySlot's ResourceBarrierState is constructed ONCE, when the
++// slot is first created, and then lives for the pinned entry's ENTIRE
++// lifetime (every subsequent Executor::execute() call feeds it more
++// accesses without ever resetting it) -- never reset to a fresh
++// UNDEFINED/everAccessed=false state at the start of a compile() walk the
++// way buildBarriers() resets its own per-call vector. That persistence IS
++// design contract point 4's "barrier state machine initialized from
++// tracked last-frame layout instead of UNDEFINED", for free: there is
++// simply no reset to undo it.
++struct PinnedHistorySlot {
++    std::optional<rx::rhi::Texture2D> texture;
++    detail::ResourceBarrierState barrierState;
++
++    // Phase 4 Task 1, PassContext::historyValid(): true once a REAL
++    // Pass::setHistoryOutput()-declared write has landed in this slot at
++    // least once -- set by Executor::execute() only when it processes an
++    // actual HistoryOutput access against this slot, NEVER by the
++    // black-clear-at-creation init below (that establishes DEFINED
++    // content for a valid sampled read, but it is not "this frame's real
++    // history contents" in the sense historyValid() promises). Latches
++    // true forever once set -- a history resource's write slot does not
++    // revert to "never written" once it has been.
++    bool everWrittenByRealPass = false;
++};
++
++// Phase 4 Task 1: one history resource's full pinned entry -- both ping-pong
++// slots plus the shared shape it was created/last resized against. Looked
++// up by NAME (TransientPool::acquireHistory()), never by shape -- the
++// opposite of PooledImage/PooledBuffer's opportunistic shape-based reuse
++// above, since two DIFFERENT history resources of the same shape must never
++// alias onto the same physical images the way two same-shaped transient
++// resources happily do [design contract point 2: "never key-matched...
++// never aliased"]. Never swept by TransientPool::sweepStale() either (see
++// that method's own comment) -- retired only by TransientPool::retireAll()
++// at Executor shutdown, or replaced wholesale by a future acquireHistory()
++// call whose shape no longer matches (a resize; see that method's comment).
++struct PinnedHistoryEntry {
++    std::string name;
++    VkFormat format = VK_FORMAT_UNDEFINED;
++    VkExtent2D extent{0, 0};
++    VkImageUsageFlags usage = 0;
++    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
++
++    // Slot 0 / slot 1 -- Executor::execute() selects which is this frame's
++    // write vs. read slot from its own frame counter's parity (frameCounter
++    // % 2 writes, (frameCounter + 1) % 2 reads -- see that file's own
++    // comment); this struct itself has no notion of "read" or "write", only
++    // "slot 0" and "slot 1".
++    std::array<PinnedHistorySlot, 2> slots;
++};
++
+ // Executor's private transient-resource pool: acquire-or-create image/
+ // buffer entries keyed by their physical descriptor, reused across
+ // execute() calls (a realize()d Executor keeps referencing the same
+ // entries call after call -- see executor.cpp's ResolvedResource) and
+ // across separate realize() calls once a prior binding is released (a
+ // resize, or an entirely different RenderGraph topology sharing the same
+ // shape) -- entries left unclaimed by any realize() for
+ // kStaleAfterExecutes consecutive execute() calls are torn down via
+ // rx::rhi::DeletionQueue rather than kept forever.
+ //
+@@ -149,61 +218,124 @@ public:
+     // found, or creating (and appending) a fresh rx::rhi::Texture2D if
+     // none exists. Marks the returned entry claimed-this-batch and bumps
+     // its lastUsedFrame to `currentFrame`. Returns std::nullopt (logged)
+     // only if creating a brand new entry's Texture2D fails.
+     std::optional<uint32_t> acquireImage(VkFormat format, VkExtent2D extent, VkImageUsageFlags usage,
+                                           VkSampleCountFlagBits samples, uint64_t currentFrame);
+ 
+     // Same contract as acquireImage(), for a buffer keyed by (size, usage).
+     std::optional<uint32_t> acquireBuffer(VkDeviceSize size, VkBufferUsageFlags usage, uint64_t currentFrame);
+ 
++    // Phase 4 Task 1: returns the index (stable for the pool's lifetime --
++    // see this struct's own class comment on why a pinned entry is never
++    // swept the way acquireImage()'s entries are) of `name`'s pinned entry,
++    // creating both slots fresh if `name` has never been acquired before,
++    // or if its shape (`format`/`extent`/`usage`/`samples`) no longer
++    // matches what was pinned for it previously (a resize -- the old
++    // slots' rx::rhi::Texture2D are retired into `deletionQueue`, tagged
++    // with `currentFrame`, exactly like sweepStale()'s own retirement, and
++    // fresh ones created in their place; a resize necessarily discards
++    // whatever history content existed, which is why `freshlyCreated`
++    // comes back true for this case too, not just a true first-ever
++    // creation).
++    //
++    // Looked up by `name` ALONE -- never by shape -- so two different
++    // history resources sharing a shape never alias onto one pinned entry
++    // [design contract point 2].
++    //
++    // `freshlyCreated`, written through the pointer, is how the caller
++    // (Executor::realize()) knows whether it must record the one-time
++    // black-clear-at-creation init submission for the returned entry's two
++    // slots (see executor.cpp's initializePinnedHistoryEntry()) -- this
++    // function only creates/replaces the Texture2Ds and seeds each fresh
++    // slot's ResourceBarrierState/everWrittenByRealPass back to their
++    // defaults; it never itself records a single vkCmd* call (no
++    // VkCommandBuffer is available at this layer -- see executor.h's own
++    // header-hygiene comment), matching every other TransientPool method's
++    // "resource lifetime only, never a live command" division of labor
++    // with executor.cpp.
++    //
++    // Returns std::nullopt (logged) only if creating a brand new Texture2D
++    // fails.
++    std::optional<uint32_t> acquireHistory(std::string_view name, VkFormat format, VkExtent2D extent,
++                                            VkImageUsageFlags usage, VkSampleCountFlagBits samples,
++                                            uint64_t currentFrame, rx::rhi::DeletionQueue& deletionQueue,
++                                            bool* freshlyCreated);
++
+     [[nodiscard]] PooledImage& image(uint32_t index) { return images_.at(index); }
+     [[nodiscard]] const PooledImage& image(uint32_t index) const { return images_.at(index); }
+     [[nodiscard]] PooledBuffer& buffer(uint32_t index) { return buffers_.at(index); }
+     [[nodiscard]] const PooledBuffer& buffer(uint32_t index) const { return buffers_.at(index); }
++    [[nodiscard]] PinnedHistoryEntry& pinned(uint32_t index) { return pinned_.at(index); }
++    [[nodiscard]] const PinnedHistoryEntry& pinned(uint32_t index) const { return pinned_.at(index); }
+ 
+     // Bumps `lastUsedFrame` to `currentFrame` for the given already-
+     // acquired entry -- called once per execute() call, for every pooled
+     // entry that call's realize()-established mapping actually references
+     // (see executor.cpp), so an entry realize() bound once and execute()
+     // keeps reusing every frame never looks "unused" to sweepStale() below.
+     void touchImage(uint32_t index, uint64_t currentFrame);
+     void touchBuffer(uint32_t index, uint64_t currentFrame);
+ 
+     // Retires (via `deletionQueue`, tagged with each entry's own
+     // lastUsedFrame -- already provably safe to destroy once that frame
+     // number's submission has completed, per this same frames-in-flight
+     // bound) every entry whose `currentFrame - lastUsedFrame >=
+     // kStaleAfterExecutes` (exactly "unused for kStaleAfterExecutes
+     // consecutive execute() calls" [Fix round 1, Minor finding -- an
+     // earlier revision used `>`, which held an idle entry alive one call
+     // longer than the ruling's literal wording]). Called once per
+     // execute() call, before that call's own barrier/rendering work -- see
+     // executor.cpp.
++    //
++    // Phase 4 Task 1: deliberately never touches pinned_ [design contract
++    // point 2: "never swept while the graph holds them"] -- a pinned
++    // entry's `lastUsedFrame`-equivalent staleness tracking simply does not
++    // exist; once created, a history resource is retired only by
++    // retireAll() (shutdown) or replaced wholesale by a later
++    // acquireHistory() call for the SAME name whose shape no longer
++    // matches (a resize, handled inside acquireHistory() itself). This is
++    // the simplest, most conservative choice that still satisfies "never
++    // recycled/aliased" [seed-15 rationale]: an unclaimed pinned entry
++    // simply stays parked (a handful of images at most, in any Phase 4
++    // scene) rather than needing its own staleness clock and re-init
++    // machinery for a case no current caller exercises.
+     void sweepStale(uint64_t currentFrame, rx::rhi::DeletionQueue& deletionQueue);
+ 
+-    // Shutdown path: retires EVERY still-live entry into `deletionQueue`
+-    // unconditionally, regardless of lastUsedFrame -- called from
+-    // Executor's destructor, immediately after it has already brought the
+-    // device to a real idle point (see executor.cpp), so `deletionQueue`'s
+-    // own flushAll() immediately after this call is safe to run
++    // Shutdown path: retires EVERY still-live entry -- including every
++    // pinned history entry's two slots -- into `deletionQueue`
++    // unconditionally, regardless of lastUsedFrame. Called from Executor's
++    // destructor, immediately after it has already brought the device to
++    // a real idle point (see executor.cpp), so `deletionQueue`'s own
++    // flushAll() immediately after this call is safe to run
+     // unconditionally too.
+     void retireAll(uint64_t currentFrame, rx::rhi::DeletionQueue& deletionQueue);
+ 
+ private:
+     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
+     VkDevice device_ = VK_NULL_HANDLE;
+     rx::rhi::Allocator* allocator_ = nullptr;
+ 
+     std::vector<PooledImage> images_;
+     std::vector<PooledBuffer> buffers_;
+ 
++    // Phase 4 Task 1: pinned history entries, keyed by name (linear scan in
++    // acquireHistory() -- a graph has at most a handful of history
++    // resources, nowhere near enough to justify a name->index map on top
++    // of images_/buffers_' own precedent of a plain linear scan for the
++    // same reason). No claimed-this-batch tracking (imageClaimedThisBatch_'s
++    // own twin) -- name-keyed lookup cannot alias two different
++    // PhysicalResource entries onto one pinned entry the way shape-keyed
++    // lookup could, so there is nothing for a per-batch marker to guard
++    // against here.
++    std::vector<PinnedHistoryEntry> pinned_;
++
+     // Per-batch "already handed out this realize() call" markers, sized to
+     // match images_/buffers_ and cleared by beginRealizeBatch(). Plain
+     // std::vector<bool> rather than a set: acquire calls per realize() are
+     // a handful (one per PhysicalResource), and this is checked/set at
+     // most once per candidate entry per acquire call -- a linear scan
+     // over a small vector is simpler and fast enough, matching this
+     // project's general preference for the plainest correct data
+     // structure over cleverness with no measured benefit.
+     std::vector<bool> imageClaimedThisBatch_;
+     std::vector<bool> bufferClaimedThisBatch_;
