@@ -263,6 +263,25 @@ std::optional<ShaderLayoutInfo> reflect(const CompileResult& result) {
         binding.type = vkType;
         binding.stages = allStages;
         binding.unboundedArray = unbounded;
+
+        // Element stride for storage buffers -- extracted from the element type's
+        // layout size. Only populated for VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        // left at 0 for all other binding types.
+        if (vkType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+            slang::TypeLayoutReflection* paramTypeLayout = param->getTypeLayout();
+            if (paramTypeLayout != nullptr) {
+                // For StructuredBuffer<T> / RWStructuredBuffer<T>, attempt to extract T's size.
+                // The param type layout represents the resource wrapper; we need its element layout.
+                slang::TypeLayoutReflection* elemTypeLayout = paramTypeLayout->getElementTypeLayout();
+                if (elemTypeLayout != nullptr) {
+                    size_t elemSize = elemTypeLayout->getSize();
+                    if (elemSize != 0 && elemSize != SLANG_UNBOUNDED_SIZE && elemSize != SLANG_UNKNOWN_SIZE) {
+                        binding.elementStride = static_cast<uint32_t>(elemSize);
+                    }
+                }
+            }
+        }
+
         info.bindings.push_back(binding);
     }
 

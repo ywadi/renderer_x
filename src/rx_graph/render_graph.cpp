@@ -523,6 +523,12 @@ void RenderGraph::compile(const CompileInfo& info) {
     // diagnostic anywhere -- exactly the "typo swaps which resource two
     // passes read/write" landmine flagged in the Task 1 review.
     //
+    // Unreachable cyclic subgraphs are automatically culled as dead code
+    // by step 3a above (a pass with no dependency path from backbuffer or
+    // side-effect passes never enters the reachable set). This check only
+    // detects and rejects cycles that involve reachable passes -- a real
+    // bug that must be reported. Reachable cycles are always fatal.
+    //
     // A cycle can only involve reachable passes (dependsOn[p] for any
     // reachable p contains only reachable producers -- see the DFS
     // reachability walk above), so a plain DFS with a recursion-stack

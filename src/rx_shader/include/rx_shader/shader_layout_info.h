@@ -57,6 +57,13 @@ struct ShaderLayoutInfo {
         // written into after binding (Task 3's bindless table depends on
         // this).
         bool unboundedArray = false;
+
+        // Element stride for storage-buffer bindings -- the size in bytes of
+        // the element type for StructuredBuffer<T> or RWStructuredBuffer<T>.
+        // Always 0 for non-storage-buffer bindings (samplers, textures, etc.).
+        // For a storage buffer, this reflects the Slang type's element size
+        // and can be used to validate layout assumptions at pipeline-build time.
+        uint32_t elementStride = 0;
     };
     std::vector<Binding> bindings;
 

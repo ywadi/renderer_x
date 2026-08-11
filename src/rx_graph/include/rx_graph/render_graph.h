@@ -137,6 +137,12 @@ public:
     // std::runtime_error, naming the offending pass/resource, on: no
     // backbuffer source set; a duplicate pass name; a read of a resource
     // no pass writes; or a backbuffer source no pass writes.
+    //
+    // Unreachable cyclic subgraphs (cycles with no dependency path from
+    // backbuffer or side-effect passes) are automatically culled as dead code
+    // and never cause compile() to throw. Reachable cycles (involving any
+    // pass dependency-reachable from the backbuffer or a side-effect pass)
+    // are always fatal and throw std::runtime_error with the cycle named.
     void compile(const CompileInfo& info);
 
     [[nodiscard]] const CompiledGraph& compiled() const;

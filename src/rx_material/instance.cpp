@@ -69,12 +69,13 @@ VkDescriptorSet ParamArena::writeAndAllocate(VkDescriptorSetLayout setLayout, co
 
     std::memcpy(static_cast<uint8_t*>(buffer.mappedData()) + alignedOffset, data, size);
     buffer.flush(alignedOffset, static_cast<VkDeviceSize>(size));
-    cursor = end;
 
     VkDescriptorSet set = descriptorArena_->allocate(setLayout);
     if (set == VK_NULL_HANDLE) {
         return VK_NULL_HANDLE;  // already logged by DescriptorArena::allocate().
     }
+
+    cursor = end;
 
     VkDescriptorBufferInfo bufferInfo{buffer.handle(), alignedOffset, static_cast<VkDeviceSize>(size)};
     VkWriteDescriptorSet write{};

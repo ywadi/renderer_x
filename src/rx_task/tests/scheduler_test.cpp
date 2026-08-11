@@ -129,7 +129,7 @@ TEST_CASE("Scheduler::autoGrainSize computes max(kMinGrain, itemCount / (workerC
   // Below (or exactly at) the floor -- kMinGrain wins.
   CHECK(rx::task::Scheduler::autoGrainSize(0, 4) == 64);
   CHECK(rx::task::Scheduler::autoGrainSize(100, 4) == 64);      // 100 / 16 = 6
-  CHECK(rx::task::Scheduler::autoGrainSize(10000, 39) == 64);   // 10000 / 156 = 64 (exact)
+  CHECK(rx::task::Scheduler::autoGrainSize(10000, 39) == 64);   // 10000 / 156 truncated = 64
 
   // Above the floor -- the formula's own value wins.
   CHECK(rx::task::Scheduler::autoGrainSize(10000, 4) == 625);    // 10000 / 16 = 625

@@ -289,6 +289,12 @@ public:
     // allocate and populate the real set-1 VkDescriptorSet a
     // ParameterBlock needs -- IMaterialInstance's job, not this task's).
     // Throws std::out_of_range for an invalid/unknown `handle`.
+    //
+    // CAUTION: The returned reference is invalidated by a later loadMaterial()
+    // call on this same instance -- HandlePool's internal reallocation may
+    // move the underlying MaterialRecord. Store the actual values of interest
+    // (set/binding counts, type information, etc.) rather than caching a
+    // ShaderLayoutInfo pointer/reference across a loadMaterial() call.
     [[nodiscard]] const rx::shader::ShaderLayoutInfo& layoutInfo(MaterialHandle handle) const;
 
     // `handle`'s reflected `TParams` fields -- name, kind, and BYTE

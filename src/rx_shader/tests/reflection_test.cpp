@@ -180,3 +180,40 @@ TEST_CASE("reflect() returns nullopt for a failed CompileResult") {
     auto layout = rx::shader::reflect(failed);
     CHECK_FALSE(layout.has_value());
 }
+
+TEST_CASE("reflect() reports elementStride for storage-buffer bindings (StructuredBuffer element size)") {
+    const char* storageBufferSource = R"(
+        struct ObjectData {
+            float4x4 transform;
+            float4 color;
+        };
+
+        [[vk::binding(0, 0)]]
+        StructuredBuffer<ObjectData> gObjects;
+
+        [shader("vertex")]
+        float4 main(uint vertexID : SV_VertexID) : SV_Position {
+            // Use the storage buffer to ensure it's included in reflection
+            ObjectData data = gObjects[0];
+            return data.color;
+        }
+    )";
+
+    auto compiler = rx::shader::Compiler::create();
+    REQUIRE(compiler.has_value());
+
+    rx::shader::CompileResult compileResult =
+        compiler->compileFromSource("StorageBufferModule", storageBufferSource, {"main"});
+    INFO("diagnostics: " << compileResult.diagnostics);
+    REQUIRE(compileResult.ok);
+
+    auto layout = rx::shader::reflect(compileResult);
+    REQUIRE(layout.has_value());
+
+    // Storage buffer should report its element stride.
+    // ObjectData is: float4x4 (64 bytes, std430) + float4 (16 bytes) = 80 bytes total
+    const auto* readBuffer = findBinding(*layout, /*set=*/0, /*binding=*/0);
+    REQUIRE(readBuffer != nullptr);
+    CHECK(readBuffer->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+    CHECK(readBuffer->elementStride == 80);
+}

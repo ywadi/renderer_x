@@ -800,6 +800,46 @@ bool buildShadowPipeline(VkDevice device, rx::shader::Compiler& compiler, VkDesc
         return false;
     }
 
+    // Runtime-verify that the reflected ObjectTransform element stride (from
+    // the StructuredBuffer<ObjectTransform> binding) matches the C++ struct size,
+    // if the stride extraction succeeded. This catches drift where the shader's
+    // struct definition and C++'s ObjectTransform struct fall out of sync
+    // (fix round 1's postmortem: that exact drift used to happen silently until
+    // a runtime probe caught it). If stride extraction returns 0 (API limitation
+    // or Slang version), the check is skipped but logged as a warning.
+    bool foundTransformBinding = false;
+    for (const auto& binding : reflected->layoutInfo.bindings) {
+        if (binding.binding == 2 && binding.set == 0 &&
+            binding.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+            foundTransformBinding = true;
+            if (binding.elementStride != 0) {
+                // Stride was extracted; verify it matches the C++ struct
+                if (binding.elementStride != sizeof(ObjectTransform)) {
+                    RX_LOG_ERROR(
+                        "sample_05_multipass: shadow shader's ObjectTransform element stride ({} bytes, from "
+                        "reflection) does not match C++'s sizeof(ObjectTransform) ({} bytes) -- struct definitions "
+                        "are out of sync; update both shaders/multipass/scene_types.slang and this file together",
+                        binding.elementStride, sizeof(ObjectTransform));
+                    return false;
+                }
+            } else {
+                // Stride extraction returned 0 (API/version limitation); log but continue
+                RX_LOG_WARN(
+                    "sample_05_multipass: shadow shader's ObjectTransform element stride could not be extracted "
+                    "from reflection (API limitation or Slang version); sizeof(ObjectTransform)={} bytes -- "
+                    "manual verification via the static_assert above is still in place",
+                    sizeof(ObjectTransform));
+            }
+            break;
+        }
+    }
+    if (!foundTransformBinding) {
+        RX_LOG_ERROR(
+            "sample_05_multipass: shadow shader does not reflect the expected ObjectTransform storage buffer "
+            "(binding 2, set 0); shader definition may have changed");
+        return false;
+    }
+
     auto layoutBundle = rx::rhi::PipelineLayoutBuilder::build(device, reflected->layoutInfo, bindlessSetLayout);
     if (!layoutBundle.has_value()) {
         RX_LOG_ERROR("sample_05_multipass: PipelineLayoutBuilder::build failed for the shadow pass");
