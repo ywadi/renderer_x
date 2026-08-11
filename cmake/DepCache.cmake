@@ -1,24 +1,53 @@
 # Builds a CMake-based dependency exactly once per (name, pin, target
-# triple, zig version, CMAKE_ARGS) and reuses the cached install on every
-# later configure. A cache hit costs zero compilation.
+# triple, zig version, CMAKE_ARGS, CMAKE_BUILD_TYPE, and toolchain/wrapper config)
+# and reuses the cached install on every later configure. A cache hit costs zero compilation.
 #
-# Cache key format: SHA256(name|tag|triple|zig-version|length-prefixed CMAKE_ARGS)
-# CMAKE_ARGS are encoded as "<len>:<arg>" per element (length-prefixing ensures
-# distinct keys for distinct argument lists, regardless of delimiter characters).
-# Truncated to 16 hex chars, then prefixed with name: "name-<hash>". Changing
-# CMAKE_ARGS invalidates the key and forces a rebuild.
+# Cache key format: SHA256(name|tag|triple|zig-version|build-type|length-prefixed CMAKE_ARGS|length-prefixed file-hashes)
+# CMAKE_ARGS and file hashes are encoded as "<len>:<arg>" or "<len>:<hash>" per element
+# (length-prefixing ensures distinct keys for distinct argument lists or config changes,
+# regardless of delimiter characters). File hashes cover cmake/DepCache.cmake, toolchains/*,
+# and zig-wrappers/* to detect configuration changes at the source.
+# Truncated to 16 hex chars, then prefixed with name: "name-<hash>". Changing any input
+# (CMAKE_ARGS, CMAKE_BUILD_TYPE, toolchain, or zig wrapper) invalidates the key and forces
+# a rebuild.
 
 function(rx_dep_cache_key OUT_VAR NAME TAG CMAKE_ARGS_LIST)
   execute_process(
     COMMAND "${CMAKE_SOURCE_DIR}/toolchain/zig/zig" version
     OUTPUT_VARIABLE _zig_version
     OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+  # Encode CMAKE_ARGS with length-prefixing
   set(_cmake_args_encoded "")
   foreach(_arg ${CMAKE_ARGS_LIST})
     string(LENGTH "${_arg}" _arg_len)
     string(APPEND _cmake_args_encoded "${_arg_len}:${_arg}")
   endforeach()
-  string(SHA256 _hash "${NAME}|${TAG}|${RX_TARGET_TRIPLE}|${_zig_version}|${_cmake_args_encoded}")
+
+  # Hash configuration files that affect the build: DepCache.cmake itself,
+  # toolchain files, and zig wrapper scripts
+  set(_config_files_encoded "")
+
+  # DepCache.cmake
+  file(SHA256 "${CMAKE_SOURCE_DIR}/cmake/DepCache.cmake" _depcache_hash)
+  string(LENGTH "${_depcache_hash}" _len)
+  string(APPEND _config_files_encoded "${_len}:${_depcache_hash}")
+
+  # Current toolchain file (the one actually being used)
+  file(SHA256 "${CMAKE_TOOLCHAIN_FILE}" _toolchain_hash)
+  string(LENGTH "${_toolchain_hash}" _len)
+  string(APPEND _config_files_encoded "${_len}:${_toolchain_hash}")
+
+  # All zig-wrapper scripts (in case any are modified)
+  file(GLOB _zig_wrappers "${CMAKE_SOURCE_DIR}/cmake/zig-wrappers/*")
+  list(SORT _zig_wrappers)
+  foreach(_wrapper ${_zig_wrappers})
+    file(SHA256 "${_wrapper}" _wrapper_hash)
+    string(LENGTH "${_wrapper_hash}" _len)
+    string(APPEND _config_files_encoded "${_len}:${_wrapper_hash}")
+  endforeach()
+
+  string(SHA256 _hash "${NAME}|${TAG}|${RX_TARGET_TRIPLE}|${_zig_version}|${CMAKE_BUILD_TYPE}|${_cmake_args_encoded}|${_config_files_encoded}")
   string(SUBSTRING "${_hash}" 0 16 _hash)
   set(${OUT_VAR} "${NAME}-${_hash}" PARENT_SCOPE)
 endfunction()

@@ -136,7 +136,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: .deps-cache
-          key: deps-cache-linux-native-${{ hashFiles('third_party/CMakeLists.txt') }}
+          key: deps-cache-linux-native-${{ hashFiles('third_party/CMakeLists.txt', 'cmake/DepCache.cmake', 'cmake/toolchains/linux-native.cmake', 'cmake/zig-wrappers/*') }}
 
       - name: Configure
         run: cmake --preset linux-native
@@ -323,7 +323,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: .deps-cache
-          key: deps-cache-windows-cross-zig-${{ hashFiles('third_party/CMakeLists.txt') }}
+          key: deps-cache-windows-cross-zig-${{ hashFiles('third_party/CMakeLists.txt', 'cmake/DepCache.cmake', 'cmake/toolchains/windows-cross-zig.cmake', 'cmake/zig-wrappers/*') }}
 
       - name: Configure
         run: cmake --preset windows-cross-zig
