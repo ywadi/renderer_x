@@ -324,7 +324,10 @@ sink; vsync control in all samples; parallel recording + **sample
 07_stress** (≥30k procedural instanced draws, `--threads N`,
 `--vsync`, Tracy-zoned, counter gate + published parallel-vs-single
 numbers); ledgered-minors cleanup batch. All Phase 1-3 debt is either
-closed or explicitly re-recorded with rationale.
+closed or explicitly re-recorded with rationale. **Exit gate
+(user-mandated): a Fable-model adversarial audit of the entire existing
+foundation, with every finding closed or explicitly ruled before the
+stage completes** — see the plan's Stage 0 exit gate section.
 
 **Stage 1 — Asset Pipeline.** GeometryPool; import
 (fastgltf+MikkTSpace+meshopt, skin preservation, AABBs, fallbacks);

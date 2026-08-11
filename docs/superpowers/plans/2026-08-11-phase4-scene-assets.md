@@ -103,6 +103,24 @@ Create `samples/07_stress/` + `shaders/stress/*.slang`: procedural instanced fie
 6. `.github/workflows/ci.yml`: echo installed vulkan-validationlayers version in the test step log (visibility for the guard-fragility watch-item); add a comment documenting the pinned-version upgrade procedure.
 **Steps:** per item: test-first where testable → fix → suite green both presets → single commit `chore: clear phase 1-3 ledgered minors`.
 
+### Stage 0 exit gate: Foundation audit (Fable-model, user-mandated)
+
+After Tasks 1-8 close and before Stage 0 is declared complete, a
+**Fable-model audit agent** performs an adversarial audit of the ENTIRE
+existing foundation — everything Stage 1+ builds on: rx_core, rx_platform,
+rx_rhi_vk, rx_shader, rx_graph, rx_material, rx_task, shaders/, samples,
+build system, CI, and the binding docs (threading contract, ABI rules,
+performance policy). Scope: cross-subsystem seams and lifetimes,
+concurrency contracts vs. actual implementations, synchronization
+correctness beyond what per-task reviews could see, ABI discipline,
+test-coverage honesty (what the gates actually prove vs. claim),
+docs-vs-reality drift, and adherence to every CLAUDE.md policy. The
+auditor probes empirically (builds, tests, targeted instrumentation in
+scratch), not just by reading. **Every finding is triaged by the
+coordinator and closed via fix rounds (or explicitly ruled + recorded)
+before Stage 0 exits — the stage is NOT complete until the audit report
+and its closure record are in the ledger.**
+
 ---
 
 ## STAGE 1 — Asset Pipeline
