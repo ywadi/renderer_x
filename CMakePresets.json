@@ -14,7 +14,7 @@
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/windows-cross-zig",
       "toolchainFile": "${sourceDir}/cmake/toolchains/windows-cross-zig.cmake",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "RX_TRACY": "ON", "RX_DEBUG_CHECKS": "ON" }
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "RX_TRACY": "OFF", "RX_DEBUG_CHECKS": "ON" }
     }
   ],
   "buildPresets": [

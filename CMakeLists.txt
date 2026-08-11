@@ -20,6 +20,17 @@ enable_testing()
 # this build -- not merely disabled at runtime -- so the resulting binaries
 # contain zero Tracy symbols (verified in task-3-report.md via nm/strings
 # on an RX_TRACY=OFF build).
+# NOTE: the windows-cross-zig preset overrides this to OFF (see CMakePresets.json).
+# Tracy is a dev-host profiling tool used on Linux-native where captures actually
+# work; profiling through Wine has zero value, and Tracy's profiler background
+# thread does not tear down cleanly at process exit under CI cold-prefix Wine
+# (tests print SUCCESS but the process never exits -> ctest timeout; CI runs
+# 31512073559/31521284064/31523638220). RX_TRACY=OFF is a first-class,
+# symbol-verified configuration (Task 3), so the Windows sample binaries simply
+# ship without the profiler client, and the Tracy-ON path stays fully exercised
+# (build + run + on-demand passivity) by the linux-native CI job. A dedicated
+# build-only step in the windows job still compiles the RX_TRACY=ON Windows path
+# so a cross-compile break in TracyClient.cpp is still caught.
 option(RX_TRACY "Enable the Tracy profiler client (CPU + Vulkan GPU zones); OFF removes Tracy entirely from the build" ON)
 
 # RX_DEBUG_CHECKS: engine-wide switch for dev-time runtime assertions

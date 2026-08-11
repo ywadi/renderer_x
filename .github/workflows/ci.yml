@@ -331,6 +331,19 @@ jobs:
       - name: Build
         run: cmake --build --preset windows-cross-zig
 
+      # The windows-cross-zig preset builds with RX_TRACY=OFF (Tracy's profiler
+      # thread hangs at process exit under CI cold-prefix Wine; profiling has no
+      # value through Wine anyway -- see CMakeLists.txt's RX_TRACY note). This
+      # throwaway configure+build with RX_TRACY=ON still verifies the Windows
+      # cross-compile of TracyClient.cpp stays healthy, WITHOUT running any
+      # Tracy-linked binary under Wine.
+      - name: Verify RX_TRACY=ON cross-compiles for Windows (build only, no run)
+        run: |
+          cmake -S . -B build/windows-tracy-buildcheck \
+            --toolchain cmake/toolchains/windows-cross-zig.cmake \
+            -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DRX_TRACY=ON -DRX_DEBUG_CHECKS=ON
+          cmake --build build/windows-tracy-buildcheck
+
       - name: Wine toolchain smoke check
         run: wine build/windows-cross-zig/tools/toolchain_check/toolchain_check.exe
 
