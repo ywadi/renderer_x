@@ -25,6 +25,7 @@ add_library(rx_rhi_vk STATIC
     src/texture.cpp
     src/mesh_buffers.cpp
     src/descriptor_arena.cpp
+    src/tracy_gpu.cpp
     src/vma_impl.cpp
     src/stb_impl.cpp
     ${volk_SOURCE_DIR}/volk.c

@@ -155,6 +155,7 @@
 //   --present. Real window, the same 24-cell grid, static camera,
 //   streaming continuing forever at roughly 1 texture/second.
 #include <rx_core/log.h>
+#include <rx_core/profile.h>
 #include <rx_platform/window.h>
 #include <rx_rhi_vk/bindless.h>
 #include <rx_rhi_vk/buffer.h>
@@ -1462,6 +1463,12 @@ int runHeadless(bool enableValidation) {
         slot.frameNumber = thisFrameNumber;
         slot.everUsed = true;
 
+        // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3,
+        // spec D3] -- headless-mode path: unlike this sample's siblings,
+        // this headless loop drives a real rx::rhi::FrameSync frames-in-
+        // flight cycle (kHeadlessTotalFrames + kSlotCount iterations), so
+        // each iteration is a genuine rendered frame in its own right.
+        RX_FRAME_MARK;
         frameSync->advanceFrame();
     }
 
@@ -1778,6 +1785,10 @@ int runPresent(bool enableValidation) {
             break;
         }
 
+        // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3,
+        // spec D3] -- present-mode path; see the headless loop above for
+        // this sample's other frame boundary.
+        RX_FRAME_MARK;
         frameSync->advanceFrame();
     }
 

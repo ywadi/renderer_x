@@ -2,6 +2,7 @@
 
 #include <rx_core/handle.h>
 #include <rx_core/log.h>
+#include <rx_core/profile.h>
 #include <rx_rhi_vk/deletion_queue.h>
 #include <rx_rhi_vk/device.h>
 #include <rx_rhi_vk/pipeline_layout.h>
@@ -1076,6 +1077,7 @@ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device, 
 }
 
 MaterialHandle MaterialSystem::loadMaterial(const std::filesystem::path& slangModulePath) {
+    RX_ZONE;
     Impl& impl = *impl_;
 
     // Copies impl.session (Slang::ComPtr addRef, cheap) rather than moving
@@ -1209,6 +1211,7 @@ void MaterialSystem::bindInstance(VkCommandBuffer cmd, const rx::graph::PassCont
 }
 
 void MaterialSystem::reloadChanged() {
+    RX_ZONE;
     Impl& impl = *impl_;
     // [Task 8] The SAME resolved directory create() built this instance
     // with (impl.sharedShaderDir) -- never re-reads RX_MATERIAL_SHADER_DIR
@@ -1353,6 +1356,7 @@ void MaterialSystem::reloadChanged() {
 }
 
 VkPipeline MaterialSystem::getPipeline(const PipelineRequest& req) {
+    RX_ZONE;
     Impl& impl = *impl_;
 
     MaterialRecord* record = impl.materials.get(req.material);

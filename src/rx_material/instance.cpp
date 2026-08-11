@@ -1,6 +1,7 @@
 #include <rx_material/instance.h>
 
 #include <rx_core/log.h>
+#include <rx_core/profile.h>
 
 #include <cstring>
 #include <utility>
@@ -41,6 +42,7 @@ std::optional<ParamArena> ParamArena::create(VkDevice device, rx::rhi::Allocator
 }
 
 void ParamArena::beginFrame(uint32_t frameIndex) {
+    RX_ZONE;
     currentFrame_ = frameIndex % static_cast<uint32_t>(buffers_.size());
     cursors_[currentFrame_] = 0;
     descriptorArena_->beginFrame(frameIndex);

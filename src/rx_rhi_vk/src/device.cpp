@@ -1,5 +1,6 @@
 #include <rx_rhi_vk/device.h>
 #include <rx_core/log.h>
+#include <rx_core/profile.h>
 #include <VkBootstrap.h>
 #include <array>
 #include <utility>
@@ -172,6 +173,25 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
         return std::nullopt;
     }
 
+    // VK_EXT_calibrated_timestamps: optional, guarded -- enabled at device
+    // creation only when the selected physical device actually supports it
+    // [Phase 4 Stage 0 Task 3, spec D3]. `enable_extension_if_present()` is
+    // vk-bootstrap's own documented "make it enabled on the device IF
+    // present, otherwise a no-op" call (VkBootstrap.h) -- this is not a
+    // required feature (unlike the Vulkan 1.1/1.2/1.3 feature sets above):
+    // a device lacking it is still fully supported, just without GPU-side
+    // calibrated Tracy zones (rx_rhi_vk/tracy_gpu.h falls back to plain
+    // TracyVkContext in that case -- see that file's own comment). This
+    // class has no idea Tracy exists; it only reports the plain fact via
+    // calibratedTimestampsEnabled() below. Empirically checked directly on
+    // this dev machine's two available drivers as part of this task: BOTH
+    // the NVIDIA proprietary driver and Mesa's llvmpipe/lavapipe software
+    // rasterizer report `VK_EXT_calibrated_timestamps` (verified via
+    // `vulkaninfo`) -- lavapipe support was flagged [R:threading] as
+    // "unverified" going into this task; it is verified present here.
+    const bool calibratedTimestampsEnabled =
+        physResult.value().enable_extension_if_present(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+
     auto deviceResult = vkb::DeviceBuilder(physResult.value()).build();
     if (!deviceResult) {
         RX_LOG_ERROR("vkb::DeviceBuilder::build failed: {}", deviceResult.error().message());
@@ -232,6 +252,9 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
     dev.graphicsQueue_ = graphicsQueueResult.value();
     dev.graphicsQueueFamily_ = graphicsQueueIndexResult.value();
     dev.presentQueue_ = presentQueueResult.value();
+    dev.calibratedTimestampsEnabled_ = calibratedTimestampsEnabled;
+    RX_LOG_INFO("Device::create: VK_EXT_calibrated_timestamps {} on the selected physical device",
+                calibratedTimestampsEnabled ? "ENABLED" : "not present -- falling back to uncalibrated GPU zones");
     dev.swapchain_ = vkbSwapchain.swapchain;
     dev.swapchainImages_ = imagesResult.value();
     dev.swapchainFormat_ = vkbSwapchain.image_format;
@@ -254,6 +277,7 @@ Device& Device::operator=(Device&& other) noexcept {
         graphicsQueue_ = other.graphicsQueue_;
         graphicsQueueFamily_ = other.graphicsQueueFamily_;
         presentQueue_ = other.presentQueue_;
+        calibratedTimestampsEnabled_ = other.calibratedTimestampsEnabled_;
         swapchain_ = other.swapchain_;
         swapchainImages_ = std::move(other.swapchainImages_);
         swapchainFormat_ = other.swapchainFormat_;
@@ -266,6 +290,7 @@ Device& Device::operator=(Device&& other) noexcept {
         other.graphicsQueue_ = VK_NULL_HANDLE;
         other.graphicsQueueFamily_ = 0;
         other.presentQueue_ = VK_NULL_HANDLE;
+        other.calibratedTimestampsEnabled_ = false;
         other.swapchain_ = VK_NULL_HANDLE;
         other.swapchainImages_.clear();
         other.swapchainFormat_ = VK_FORMAT_UNDEFINED;
@@ -291,6 +316,13 @@ void Device::destroyAll() {
 }
 
 AcquireResult Device::acquireNextImage(VkSemaphore signal) {
+    // FrameSync's frame loop begins here every iteration [Phase 4 Stage 0
+    // Task 3, spec D3: "FrameSync acquire/present" zone placement --
+    // FrameSync itself (frame_sync.h/.cpp) owns no acquire/present method
+    // of its own; these two Device functions are the real acquire/present
+    // calls every sample's present loop drives its FrameSync fences/
+    // semaphores around].
+    RX_ZONE;
     uint32_t imageIndex = 0;
     VkResult result = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, signal, VK_NULL_HANDLE, &imageIndex);
     switch (result) {
@@ -309,6 +341,9 @@ AcquireResult Device::acquireNextImage(VkSemaphore signal) {
 }
 
 SwapchainStatus Device::present(uint32_t imageIndex, VkSemaphore wait) {
+    // See acquireNextImage()'s own comment -- the matching "present" half
+    // of FrameSync's own acquire/present zone pair.
+    RX_ZONE;
     VkPresentInfoKHR presentInfo{};
     presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     if (wait != VK_NULL_HANDLE) {

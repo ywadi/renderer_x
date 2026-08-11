@@ -298,3 +298,72 @@ find_package(enkiTS CONFIG REQUIRED PATHS "${enkiTS_CACHE_DIR}" NO_DEFAULT_PATH)
 # above: promote to global scope for src/rx_task (a sibling directory) to
 # link.
 set_target_properties(enkiTS::enkiTS PROPERTIES IMPORTED_GLOBAL TRUE)
+
+# Tracy: the engine's profiler client [spec D3, Phase 4 Stage 0 Task 3].
+# Client-only -- this pulls in exactly one compiled translation unit
+# (public/TracyClient.cpp) and the client-side headers; the profiler
+# UI/server (profiler/, server/, capture/, python/, meson.build's own
+# separate "tracy-profiler" target) is never built here, never
+# add_subdirectory'd, and never linked by anything in this project. BSD-3
+# license (see the pinned tag's own LICENSE file -- permissive, no
+# attribution requirement beyond the standard copyright-notice retention;
+# recorded here per this task's own resolution to note the license at
+# vendoring time).
+#
+# Entirely guarded behind RX_TRACY (declared as a top-level option() in the
+# root CMakeLists.txt, before this file is add_subdirectory'd, so it is
+# already set by the time this line runs): when OFF, this whole block never
+# executes -- Tracy is never git-cloned, never configured, never compiled,
+# and the `Tracy::TracyClient` target never exists -- rather than being
+# built-but-disabled-at-runtime. This is what makes "RX_TRACY=OFF -> zero
+# Tracy symbols in every binary" a structural guarantee instead of a
+# TRACY_ENABLE-macro convention that could bit-rot.
+#
+# Pinned v0.14.0 -- the current tag on github.com/wolfpld/tracy as of this
+# task (verified directly: `git ls-remote --tags`, matching [R:threading]'s
+# own ">= v0.11" citation and its "VK_EXT_calibrated_timestamps added in
+# v0.11.0" fact -- v0.14.0 carries that support unchanged).
+#
+# Routed through the dep-cache like spdlog/Vulkan-Headers/SDL3/
+# vk-bootstrap/enkiTS above, not hand-vendored as loose source under
+# third_party/: Tracy's own CMakeLists.txt (verified directly against the
+# pinned tag) already builds a real `TracyClient` target and installs a
+# clean CMake package (`install(EXPORT TracyConfig ...)` +
+# `configure_package_config_file` producing TracyConfig.cmake, exporting a
+# `Tracy::TracyClient` imported target with correct
+# INTERFACE_INCLUDE_DIRECTORIES) -- exactly the "exports cleanly through
+# rx_add_cached_dependency" bar the enkiTS vendoring precedent set, so
+# hand-vendoring the source under third_party/ instead would add nothing.
+#
+# TRACY_ENABLE=ON IS passed here, deliberately matching (never drifting
+# from) src/rx_core/CMakeLists.txt's own `if(RX_TRACY)
+# target_compile_definitions(rx_core PUBLIC TRACY_ENABLE)`: TracyClient.cpp
+# itself (verified directly by reading it) is guarded top-to-bottom by
+# `#ifdef TRACY_ENABLE` -- built WITHOUT it, the compiled Tracy::TracyClient
+# library would be a near-empty stub (no profiler thread, no networking, no
+# real zone bookkeeping), and this project's own code (which DOES see
+# TRACY_ENABLE, from rx_core's PUBLIC definition) would emit real calls
+# into `tracy::` symbols that stub build never defines -- an undefined-
+# reference link error, not a silent no-op. The two must always agree; both
+# are driven by the identical RX_TRACY guard at the CMake level so they
+# structurally cannot disagree. TRACY_STATIC=ON matches every other
+# compiled dependency here being linked statically. TRACY_ON_DEMAND stays
+# OFF (Tracy's own default): D3's "passive (~no cost) until a profiler
+# connects" behavior is already the plain TRACY_ENABLE-only default this
+# project wants, per the spec citation -- ON_DEMAND is an additional,
+# separate opt-in this task's brief never asked for.
+if(RX_TRACY)
+    set(RX_TRACY_TAG "v0.14.0")
+    rx_add_cached_dependency(
+      NAME tracy
+      REPO https://github.com/wolfpld/tracy.git
+      TAG ${RX_TRACY_TAG}
+      CMAKE_ARGS -DTRACY_ENABLE=ON -DTRACY_STATIC=ON
+    )
+    find_package(Tracy CONFIG REQUIRED PATHS "${tracy_CACHE_DIR}" NO_DEFAULT_PATH)
+
+    # Same CMake 3.22 limitation as spdlog/SDL3/Vulkan-Headers/vk-bootstrap/
+    # enkiTS above: promote to global scope for src/rx_core (a sibling
+    # directory) to link.
+    set_target_properties(Tracy::TracyClient PROPERTIES IMPORTED_GLOBAL TRUE)
+endif()

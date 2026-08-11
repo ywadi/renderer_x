@@ -1,6 +1,7 @@
 #include <rx_rhi_vk/descriptor_arena.h>
 
 #include <rx_core/log.h>
+#include <rx_core/profile.h>
 
 #include <utility>
 
@@ -88,6 +89,7 @@ std::optional<DescriptorArena> DescriptorArena::create(VkDevice device, uint32_t
 }
 
 void DescriptorArena::beginFrame(uint32_t frameIndex) {
+    RX_ZONE;
     currentFrame_ = frameIndex % static_cast<uint32_t>(pools_.size());
     VkResult result = vkResetDescriptorPool(device_, pools_[currentFrame_], 0);
     if (result != VK_SUCCESS) {

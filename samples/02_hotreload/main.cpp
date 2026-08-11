@@ -57,6 +57,7 @@
 // runtime libs weren't copied next to it with a working $ORIGIN RPATH,
 // Compiler::create() would fail immediately.
 #include <rx_core/log.h>
+#include <rx_core/profile.h>
 #include <rx_platform/window.h>
 #include <rx_rhi_vk/buffer.h>
 #include <rx_rhi_vk/command.h>
@@ -734,6 +735,14 @@ int runHeadless(bool enableValidation) {
                 vkCmdDraw(cmd, 3, 1, 0, 0);
 
                 vkCmdEndRendering(cmd);
+
+                // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0
+                // Task 3, spec D3] -- headless-mode path: each iteration of
+                // this loop re-clears and redraws the same offscreen
+                // attachment, i.e. renders one frame's worth of content,
+                // even though all `frameCount` iterations share a single
+                // runOnce() submission.
+                RX_FRAME_MARK;
             }
 
             rx::rhi::transitionImage(cmd, offscreenImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -1101,6 +1110,10 @@ int runPresent(bool enableValidation) {
             break;
         }
 
+        // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3,
+        // spec D3] -- present-mode path, right after this frame's present/
+        // submit has completed.
+        RX_FRAME_MARK;
         frameSync->advanceFrame();
     }
 

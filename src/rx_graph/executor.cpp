@@ -3,9 +3,11 @@
 #include "transient_pool.h"
 
 #include <rx_core/log.h>
+#include <rx_core/profile.h>
 #include <rx_rhi_vk/command.h>
 #include <rx_rhi_vk/deletion_queue.h>
 #include <rx_rhi_vk/device.h>
+#include <rx_rhi_vk/tracy_gpu.h>
 #include <volk.h>
 
 #include <algorithm>
@@ -156,6 +158,15 @@ struct Executor::Impl {
     detail::TransientPool pool;
     rx::rhi::DeletionQueue deletionQueue;
     bool debugUtilsAvailable = false;
+
+    // Tracy GPU-zone context [Phase 4 Stage 0 Task 3, spec D3] -- created
+    // once per Executor (i.e. per Device, since Executor::create() is the
+    // sole owner of exactly one of these) in Executor::create() below, and
+    // destroyed in ~Executor(). nullptr when RX_TRACY/TRACY_ENABLE is off
+    // (createGpuProfileContext() itself degrades to a constant nullptr
+    // return in that build -- see tracy_gpu.h/.cpp) or if context creation
+    // failed -- every use of it below is null-safe either way.
+    rx::rhi::GpuProfileContext gpuProfileCtx = nullptr;
 
     // Executor's own monotonic tick, one increment per execute() call --
     // the clock TransientPool's staleness sweep and this Impl's own
@@ -620,6 +631,15 @@ std::unique_ptr<Executor> Executor::create(rx::rhi::Device& device) {
     // site below follows.
     impl->debugUtilsAvailable = (vkCmdBeginDebugUtilsLabelEXT != nullptr && vkCmdEndDebugUtilsLabelEXT != nullptr);
 
+    // Tracy GPU-zone context: created once per Executor/Device [Phase 4
+    // Stage 0 Task 3, spec D3] -- see tracy_gpu.h's own comment for exactly
+    // which of TracyVkContextCalibrated/TracyVkContext this resolves to,
+    // and why null-safe unconditionally (nullptr on RX_TRACY=OFF or on any
+    // creation failure, never fatal to Executor::create() itself -- a
+    // renderer must not fail to start because a profiler capability could
+    // not be wired up).
+    impl->gpuProfileCtx = rx::rhi::createGpuProfileContext(device);
+
     return std::unique_ptr<Executor>(new Executor(std::move(impl)));
 }
 
@@ -638,6 +658,9 @@ Executor::~Executor() {
     // unconditionally (both otherwise-unsafe on a queue that might still
     // be executing).
     vkDeviceWaitIdle(impl_->device);
+    // Null-safe unconditionally (RX_TRACY off, or any context-creation
+    // failure) -- see tracy_gpu.h's own comment on RX_GPU_CONTEXT_DESTROY.
+    RX_GPU_CONTEXT_DESTROY(impl_->gpuProfileCtx);
     impl_->pool.retireAll(impl_->frameCounter, impl_->deletionQueue);
     impl_->deletionQueue.flushAll();
 }
@@ -733,6 +756,10 @@ void Executor::realize(const RenderGraph& graph) {
 
 void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage backbufferImage,
                         VkImageView backbufferView, VkExtent2D backbufferExtent) {
+    // Whole-execute() CPU zone [Phase 4 Stage 0 Task 3, spec D3: "Executor::
+    // execute (whole)"] -- spans this entire call, i.e. every pass this
+    // frame, on top of the per-pass zones declared inside the loop below.
+    RX_ZONE;
     Impl& impl = *impl_;
     const CompiledGraph& compiled = graph.compiled();
     const std::span<const PhysicalResource> resources = compiled.resources();
@@ -780,6 +807,46 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
         const uint32_t rawIndex = order[pos];
         const Pass& pass = graph.passAt(rawIndex);
         const std::span<const ResourceAccess> accesses = compiled.passAccesses(rawIndex);
+
+        // Per-pass CPU zone, named dynamically from the pass's own
+        // std::string-backed name [Phase 4 Stage 0 Task 3, spec D3: "per-
+        // pass named zones (use the pass's name string ... Tracy zones
+        // want static strings; use ZoneScopedN for fixed + ZoneText/
+        // ZoneName for the dynamic pass name")]. A pass name is set once,
+        // at RenderGraph::addPass() time, and never changes for the
+        // lifetime of the graph -- but it is still a runtime std::string,
+        // never a compile-time literal, so it cannot be handed to
+        // ZoneScopedN's own `name` parameter directly (Tracy retains only
+        // the pointer for that one, assuming static storage duration).
+        // RX_ZONE_NAMED below gives the zone a fixed, always-valid display
+        // name ("graph_pass"); RX_ZONE_DYNAMIC_NAME then attaches this
+        // call's real pass name via Tracy's documented per-call dynamic-
+        // name mechanism (see rx_core/profile.h's own citation of the
+        // Tracy manual for exactly this macro).
+        RX_ZONE_NAMED("graph_pass");
+        RX_ZONE_DYNAMIC_NAME(pass.name().data(), pass.name().size());
+
+        // Matching per-pass GPU zone [spec D3: "TracyVkZone around
+        // Executor's per-pass command recording"] -- spans from just
+        // before this pass's own barriers through its
+        // vkCmdBeginRendering/execute-callback/vkCmdEndRendering (i.e. the
+        // same span the CPU zone above covers), timestamped on `cmd`
+        // itself. Uses the "transient" GPU-zone idiom (TracyVkZoneTransient,
+        // via RX_GPU_ZONE_DYNAMIC -- see tracy_gpu.h's own citation of the
+        // Tracy manual's "Transient GPU zones" section) rather than plain
+        // TracyVkZone specifically because -- exactly like the CPU zone
+        // above -- a render-graph pass's name is a runtime std::string, not
+        // a compile-time literal; TracyVkZone's own `name` parameter must be
+        // the latter. `pass.name().data()` is safe to hand to Tracy's
+        // internal `strlen()` call unterminated-string-free: Pass::name()
+        // (render_graph.cpp) always returns the WHOLE backing std::string
+        // (never a substring), so `.data()` is null-terminated by the same
+        // guarantee std::string::c_str() gives. Null-safe unconditionally
+        // (RX_GPU_ZONE_DYNAMIC compiles away entirely when TRACY_ENABLE is
+        // off; Tracy's own VkCtxScope no-ops when constructed with a null
+        // ctx when it is on -- verified directly against the vendored
+        // v0.14.0 source before writing this).
+        RX_GPU_ZONE_DYNAMIC(impl.gpuProfileCtx, rxGpuPassZone, cmd, pass.name().data());
 
         beginDebugLabel(impl, cmd, pass.name());
 
@@ -966,6 +1033,23 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
             impl.pool.touchImage(resolvedRes.poolIndex, impl.frameCounter);
         }
     }
+
+    // Collect this frame's GPU timestamp queries [spec D3: "TracyVkCollect
+    // once per frame (hook where FrameSync completes a frame)"] -- hooked
+    // HERE, at the very end of this same execute() call, rather than
+    // reaching back into rx::rhi::FrameSync itself: FrameSync (frame_sync.h)
+    // has no notion of Tracy or of this Executor's GPU context at all (by
+    // design -- see profile.h/tracy_gpu.h's own "no Tracy in any OTHER
+    // public header" rule), while Executor::execute() already runs exactly
+    // once per real frame, on the exact command buffer FrameSync's own
+    // frame-in-flight slot owns, and is the sole owner of gpuProfileCtx --
+    // making this the one point in the whole call graph that already has
+    // every piece Collect() needs with no new coupling. `cmd` is guaranteed
+    // outside a render pass instance here (every vkCmdEndRendering this
+    // call could have issued already ran, inside the per-pass loop above;
+    // the finalBarriers() call just above never opens one) -- exactly
+    // Tracy's own documented requirement for TracyVkCollect.
+    RX_GPU_COLLECT(impl.gpuProfileCtx, cmd);
 }
 
 namespace {

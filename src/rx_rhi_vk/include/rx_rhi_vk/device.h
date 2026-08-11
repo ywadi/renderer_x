@@ -52,6 +52,17 @@ public:
     VkQueue graphicsQueue() const { return graphicsQueue_; }
     uint32_t graphicsQueueFamily() const { return graphicsQueueFamily_; }
     VkQueue presentQueue() const { return presentQueue_; }
+
+    // True iff VK_EXT_calibrated_timestamps was present on the selected
+    // physical device AND successfully enabled on the logical device this
+    // Device wraps (see device.cpp's own comment on the optional, guarded
+    // enable_extension_if_present() call in create()) [Phase 4 Stage 0
+    // Task 3]. This class has no idea Tracy exists -- it only reports
+    // whether this one, ordinarily-optional Vulkan extension is live;
+    // rx_rhi_vk/tracy_gpu.h is the sole consumer that gives this fact any
+    // profiling meaning (TracyVkContextCalibrated vs plain TracyVkContext).
+    bool calibratedTimestampsEnabled() const { return calibratedTimestampsEnabled_; }
+
     VkSwapchainKHR swapchain() const { return swapchain_; }
     const std::vector<VkImage>& swapchainImages() const { return swapchainImages_; }
     VkFormat swapchainFormat() const { return swapchainFormat_; }
@@ -87,6 +98,7 @@ private:
     VkQueue graphicsQueue_ = VK_NULL_HANDLE;
     uint32_t graphicsQueueFamily_ = 0;
     VkQueue presentQueue_ = VK_NULL_HANDLE;
+    bool calibratedTimestampsEnabled_ = false;
 
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     std::vector<VkImage> swapchainImages_;

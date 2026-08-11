@@ -64,6 +64,7 @@
 //   (see runPresent()'s use of elapsed time to drive the orbit angle the
 //   headless gate always evaluates at t=0).
 #include <rx_core/log.h>
+#include <rx_core/profile.h>
 #include <rx_platform/window.h>
 #include <rx_rhi_vk/bindless.h>
 #include <rx_rhi_vk/buffer.h>
@@ -1128,6 +1129,12 @@ int runHeadless(bool enableValidation) {
         rx::rhi::transitionImage(cmd, offscreenImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     });
+    // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3, spec
+    // D3] -- headless-mode path: this sample's headless mode renders
+    // exactly one frame (the runOnce() call just above; the readback-only
+    // runOnce() below is not itself a rendered frame), so this is the
+    // single frame boundary to mark.
+    RX_FRAME_MARK;
 
     auto readback = allocator->createHostVisibleBuffer(kHeadlessPixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     if (!readback.has_value()) {
@@ -1549,6 +1556,10 @@ int runPresent(bool enableValidation) {
             break;
         }
 
+        // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3,
+        // spec D3] -- present-mode path, right after this frame's present/
+        // submit has completed.
+        RX_FRAME_MARK;
         frameSync->advanceFrame();
     }
 

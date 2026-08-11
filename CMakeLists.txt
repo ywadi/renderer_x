@@ -7,6 +7,21 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 enable_testing()
 
+# RX_TRACY: engine-wide switch for the Tracy profiler client integration
+# [spec D3, Phase 4 Stage 0 Task 3] -- ON by default (and explicitly ON in
+# both dev presets, CMakePresets.json) but trivially OFF-able
+# (`-DRX_TRACY=OFF`, or any preset that overrides it). Read by
+# third_party/CMakeLists.txt (added immediately below, so this option must
+# be declared first) to decide whether Tracy is fetched/built/linked at
+# all, and by src/rx_core/CMakeLists.txt to decide whether TRACY_ENABLE is
+# defined and Tracy::TracyClient linked -- both PUBLIC on rx_core, which
+# every other library and sample transitively depends on. When OFF, Tracy
+# is never fetched, never compiled, and never linked into any target in
+# this build -- not merely disabled at runtime -- so the resulting binaries
+# contain zero Tracy symbols (verified in task-3-report.md via nm/strings
+# on an RX_TRACY=OFF build).
+option(RX_TRACY "Enable the Tracy profiler client (CPU + Vulkan GPU zones); OFF removes Tracy entirely from the build" ON)
+
 add_subdirectory(third_party)
 
 include(tools/fetch_slang.cmake)

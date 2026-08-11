@@ -126,6 +126,7 @@
 //   --present. Real window, the same scene, the light continuously
 //   orbiting in azimuth.
 #include <rx_core/log.h>
+#include <rx_core/profile.h>
 #include <rx_platform/window.h>
 #include <rx_graph/executor.h>
 #include <rx_graph/render_graph.h>
@@ -1651,6 +1652,11 @@ int runHeadless(bool enableValidation) {
         cmdCtx->runOnce([&](VkCommandBuffer cmd) {
             executor->execute(graph, cmd, offscreenImage, offscreenView, extent);
         });
+        // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3,
+        // spec D3] -- headless-mode path: each loop iteration is its own
+        // separate runOnce() submission through the render graph, i.e. a
+        // real, distinct rendered frame.
+        RX_FRAME_MARK;
     }
 
     auto readback = allocator->createHostVisibleBuffer(kHeadlessPixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -2086,6 +2092,10 @@ int runPresent(bool enableValidation) {
             break;
         }
 
+        // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3,
+        // spec D3] -- present-mode path, right after this frame's present/
+        // submit has completed.
+        RX_FRAME_MARK;
         frameSync->advanceFrame();
     }
 
