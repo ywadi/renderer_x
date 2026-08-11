@@ -983,10 +983,10 @@ TEST_CASE("MaterialSystem::bindInstance's RX_ASSERT_MAIN_THREAD guard does not f
 }
 
 TEST_CASE("MaterialSystem::bindInstance's RX_ASSERT_MAIN_THREAD guard fires, naming bindInstance, for an illegal "
-          "call that actually lands on a thread other than the main thread (claimed via CAS by whichever chunk "
-          "gets there first -- deterministic regardless of enkiTS's own real split/steal order, unlike fixating "
-          "on one specific chunk index, which empirically always got run on the main thread itself for this "
-          "pass's own recursive-split shape)") {
+          "call from a chunk PROVEN to run on a genuine worker thread by a two-chunk rendezvous barrier -- "
+          "deterministic by construction, not by luck (fix round 2: the CAS-only version below it replaced had "
+          "a real, reviewer-reproduced vacuous-pass window -- 2/30 runs where every chunk landed on the main "
+          "thread and the test silently passed having exercised nothing)") {
     auto fixture = makeFixture("rx_material_bind_instance_guard_illegal");
     if (!fixture.has_value()) {
         return;
@@ -1006,20 +1006,15 @@ TEST_CASE("MaterialSystem::bindInstance's RX_ASSERT_MAIN_THREAD guard fires, nam
     std::memcpy(blob.data() + params[0].offset, tint, sizeof(tint));
     rx::material::InstanceBinding binding{handle, blob.data(), blob.size()};
 
-    // A generous worker count (6, well above most dev/CI machines' own
-    // hardware-derived default) so chunkCountForWorkerCount() derives 6
-    // chunks -- chunks [1, 6) fan out across 6 real background workers
-    // (already parked on a semaphore per docs/threading.md, so they wake
-    // essentially immediately). See the CAS-claim design below for why this
-    // test no longer depends on any SPECIFIC chunk index actually landing
-    // on a worker (an earlier revision fixated on chunkCount - 1, the last
-    // chunk, which -- empirically, across 15/15 real runs -- always ran on
-    // the calling/main thread itself for this exact pass shape: enkiTS's
-    // own recursive parallelFor split keeps the rightmost remaining slice
-    // for the calling thread to finish directly rather than handing it to
-    // a worker, which is a real, useful property of the scheduler, not a
-    // bug -- it just makes "the last chunk" a bad choice for "a chunk that
-    // is likely on a worker").
+    // A generous worker count (6) so chunkCountForWorkerCount() derives 6
+    // chunks -- chunks [1, 6) (5 items) fan out via ONE parallelFor() call
+    // across 6 real background workers, already parked on a semaphore per
+    // docs/threading.md. See the barrier design below for why this test no
+    // longer depends on any chunk landing on a worker "probably" -- it is
+    // now forced by construction. Needs chunkCount >= 3 (checked via
+    // REQUIRE below) so the fanned range has at least 2 items for the
+    // barrier (chunks 1 and 2); 6 workers leaves ample headroom above that
+    // floor.
     auto scheduler = rx::task::Scheduler::create(/*workerCount=*/6);
     REQUIRE(scheduler != nullptr);
     auto executor = rx::graph::Executor::create(fixture->device, *scheduler);
@@ -1034,17 +1029,62 @@ TEST_CASE("MaterialSystem::bindInstance's RX_ASSERT_MAIN_THREAD guard fires, nam
 
     const std::thread::id mainThreadId = std::this_thread::get_id();
 
-    // CAS-claimed: whichever chunk callback FIRST observes "I am not
-    // running on the main thread" wins the right to be the one and only
-    // illegal caller this execute() call makes -- every other chunk,
-    // including any other one that also happens to run on a worker, backs
-    // off instead of also calling bindInstance(). This is real mutual
-    // exclusion (compare_exchange_strong on `claimed`), not a probabilistic
-    // hope: it is what makes it safe to let the guard's test hook record-
-    // and-return (rather than abort) here -- at most one thread EVER
-    // touches this MaterialSystem's shared, unsynchronized state during
-    // this one call, by construction, regardless of how many chunks
-    // actually land on real workers.
+    // --- The barrier [fix round 2, coordinator's own "same barrier trick
+    // as the Task 2 fix" instruction] -----------------------------------
+    //
+    // The coordinator's literal wording ("chunk 0 blocks until a later
+    // chunk signals it") does not fit this executor's actual, VERIFIED
+    // execution order -- Executor::recordChunkedPass() (executor.cpp)
+    // calls chunk 0's callback synchronously TO COMPLETION
+    // (`recordOneChunk(0, 0);`) and only THEN, on the very next line,
+    // calls `scheduler->parallelFor(chunkCount - 1, ...)` to dispatch
+    // chunks [1, chunkCount). If chunk 0's own callback blocks waiting for
+    // a flag only a later chunk can set, that later chunk's dispatch is
+    // never reached at all -- the wait times out 100% of the time, by
+    // construction, not rarely. This is not a hypothetical: it follows
+    // directly from code already cited in this task's own fix-round-1
+    // report. Chunk 0 stays a plain no-op below, exactly as in every
+    // earlier revision of this test.
+    //
+    // What DOES fit -- and is the SAME rendezvous-barrier trick the
+    // coordinator pointed at (rx_task's own scheduler_test.cpp: two units
+    // of ONE parallelFor(2, 1, fn) call, each incrementing a shared atomic
+    // then busy-waiting for it to reach 2, bounded by a timeout that
+    // records rather than hangs) -- is applying it to two chunks that
+    // *are* both dispatched by the SAME parallelFor call: chunks 1 and 2,
+    // both members of chunks [1, chunkCount) above. A single thread cannot
+    // resolve this barrier alone: if one thread runs chunk 1 and reaches
+    // the wait (having already incremented the counter to 1), it cannot
+    // also go on to run chunk 2 itself -- it is not yet back from chunk
+    // 1's own callback, so the scheduler has no opportunity to hand it
+    // chunk 2 too. The counter can only reach 2 if some OTHER thread
+    // (necessarily one of the 6 real, already-parked workers, or main --
+    // main is unavailable here since it is inside the very
+    // `parallelFor()` call INITIATING chunk 1 and chunk 2, not itself one
+    // of the two, until/unless it ALSO helps by grabbing one of these two
+    // sub-ranges while waiting for the whole set to finish) runs chunk 2
+    // concurrently. The barrier resolving (no timeout) therefore proves at
+    // least one of {chunk 1, chunk 2} ran on a thread distinct from
+    // whichever thread ran the other -- and since a single thread cannot
+    // be both callers' own thread AND wait on itself, at most ONE of the
+    // two can be `mainThreadId`; the other is unconditionally a genuine
+    // worker. This is forced by construction, exactly like the Task 2
+    // fix's own proof, just relocated to the two chunks this executor's
+    // real sequencing actually allows to participate in a mutual wait.
+    std::atomic<uint32_t> barrierArrived{0};
+    std::atomic<bool> barrierTimedOut{false};
+    constexpr auto kBarrierTimeout = std::chrono::seconds(10);
+
+    // CAS-claimed, same as fix round 1: whichever of {chunk 1, chunk 2}
+    // resolves the barrier AND observes it is not on the main thread
+    // claims the one illegal call this test makes. The claim happens
+    // strictly AFTER the barrier has already resolved (both arrived) --
+    // the violation hook records and returns rather than aborting (see
+    // BindInstanceGuardHookScope/captureBindInstanceViolation above), so
+    // the claiming chunk completes its own callback normally either way;
+    // there is no path where the barrier's OWN resolution depends on the
+    // illegal call finishing, which is exactly what rules out the
+    // coordinator's flagged deadlock hazard here.
     std::atomic<bool> claimed{false};
     std::mutex recordedThreadMutex;
     std::optional<std::thread::id> recordedThreadId;
@@ -1053,15 +1093,30 @@ TEST_CASE("MaterialSystem::bindInstance's RX_ASSERT_MAIN_THREAD guard fires, nam
     graph.addPass("bind_instance_guard_illegal")
         .addColorOutput("color", colorDesc)
         .setExecuteChunked([&](rx::graph::PassContext& ctx, uint32_t chunkIndex, uint32_t /*chunkCount*/) {
-            if (chunkIndex == 0) {
-                return;  // chunk 0 stays untouched -- this scenario is exclusively about chunk >= 1.
+            if (chunkIndex != 1 && chunkIndex != 2) {
+                return;  // chunk 0 and every fanned chunk beyond the barrier pair stay plain no-ops.
             }
+
+            barrierArrived.fetch_add(1, std::memory_order_acq_rel);
+            const auto waitStart = std::chrono::steady_clock::now();
+            while (barrierArrived.load(std::memory_order_acquire) < 2) {
+                if (std::chrono::steady_clock::now() - waitStart > kBarrierTimeout) {
+                    barrierTimedOut.store(true, std::memory_order_relaxed);
+                    return;  // fails loudly outside the callback, below -- see the REQUIRE_MESSAGE after execute().
+                }
+                std::this_thread::yield();
+            }
+
+            // Barrier resolved: both chunk 1 and chunk 2 have reached this
+            // point. Per this TEST_CASE's own header comment, at most one
+            // of them can be mainThreadId -- so at least one of the two
+            // calls reaching here is unconditionally a genuine worker.
             if (std::this_thread::get_id() == mainThreadId) {
-                return;  // this particular chunk landed on the main thread -- legal either way; not a candidate.
+                return;  // this one happens to be main -- legal either way; the other one is the proven worker.
             }
             bool expected = false;
             if (!claimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-                return;  // some other chunk already claimed the one illegal call this test makes.
+                return;  // the other barrier participant already claimed it (also non-main) -- avoid a double call.
             }
             illegalChunkCalls.fetch_add(1, std::memory_order_relaxed);
             {
@@ -1072,17 +1127,16 @@ TEST_CASE("MaterialSystem::bindInstance's RX_ASSERT_MAIN_THREAD guard fires, nam
             // (docs/threading.md D5) and this callback has already proven
             // (above) it is running on a genuine non-main thread -- exactly
             // the contract violation RX_ASSERT_MAIN_THREAD exists to
-            // catch. Safe to let continue past the guard here (see this
-            // TEST_CASE's own header comment): the CAS claim above
-            // guarantees no other thread touches `system` for the rest of
-            // this execute() call.
+            // catch. Safe to let continue past the guard here: the CAS
+            // claim above guarantees no other thread touches `system` for
+            // the rest of this execute() call.
             system->beginFrame(/*frameInFlightIndex=*/0, /*frameNumber=*/0);
             system->bindInstance(ctx.chunkCommandBuffer(), ctx, binding);
         });
     graph.setBackbufferSource("color");
 
     const uint32_t expectedChunkCount = rx::graph::detail::chunkCountForWorkerCount(scheduler->workerCount());
-    REQUIRE(expectedChunkCount >= 2);
+    REQUIRE(expectedChunkCount >= 3);  // need chunks 1 AND 2 to both exist for the barrier.
 
     rx::graph::CompileInfo compileInfo;
     compileInfo.swapchainWidth = kExtent.width;
@@ -1108,30 +1162,28 @@ TEST_CASE("MaterialSystem::bindInstance's RX_ASSERT_MAIN_THREAD guard fires, nam
             [&](VkCommandBuffer cmd) { executor->execute(graph, cmd, offscreen->image, offscreen->view, kExtent); });
     }
 
+    REQUIRE_MESSAGE(!barrierTimedOut.load(std::memory_order_relaxed),
+                     "the chunk 1 / chunk 2 rendezvous barrier did not resolve within 10s -- either a real "
+                     "scheduler deadlock or a change in enkiTS's own parallelFor/work-stealing behavior that "
+                     "invalidates this test's own documented assumptions about it (see this TEST_CASE's header "
+                     "comment)");
+
+    // No longer an "if claimed" branch, unlike fix round 1's CAS-only
+    // version: the barrier above makes this unconditional. If it resolved
+    // at all (checked above), at least one of {chunk 1, chunk 2} is
+    // provably non-main, so the CAS claim below is guaranteed to have
+    // happened -- REQUIRE, not a conditional CHECK.
+    REQUIRE(claimed.load(std::memory_order_acquire));
+    CHECK(illegalChunkCalls.load() == 1);
+    REQUIRE(recordedThreadId.has_value());
+    CHECK(*recordedThreadId != mainThreadId);
     {
         std::lock_guard<std::mutex> lock(capture.mutex);
-        if (claimed.load(std::memory_order_acquire)) {
-            // The common, expected case with 5 chunks racing across 6 real
-            // background workers: at least one landed on a genuine worker
-            // and claimed the illegal call -- the guard must have fired,
-            // naming bindInstance (and, transitively, getPipeline(), which
-            // bindInstance() calls internally and carries the identical
-            // guard -- both firing on this one violating call is expected,
-            // not a double-count bug).
-            CHECK(illegalChunkCalls.load() == 1);
-            REQUIRE(recordedThreadId.has_value());
-            CHECK(*recordedThreadId != mainThreadId);
-            CHECK(contextsContain(capture.contexts, "MaterialSystem::bindInstance"));
-            CHECK(contextsContain(capture.contexts, "MaterialSystem::getPipeline"));
-        } else {
-            // Degenerate case, not expected in practice (5 items racing
-            // across 6 parked workers) but handled rather than assumed
-            // away: no chunk ever observed itself running on a non-main
-            // thread, so no illegal call was made at all this run -- the
-            // guard correctly never fired.
-            CHECK(illegalChunkCalls.load() == 0);
-            CHECK(capture.contexts.empty());
-        }
+        // getPipeline() is called internally by bindInstance() and carries
+        // the identical guard -- both firing on this one violating call is
+        // expected, not a double-count bug.
+        CHECK(contextsContain(capture.contexts, "MaterialSystem::bindInstance"));
+        CHECK(contextsContain(capture.contexts, "MaterialSystem::getPipeline"));
     }
 
     destroyOffscreenColorImage(fixture->device.device(), *offscreen);
