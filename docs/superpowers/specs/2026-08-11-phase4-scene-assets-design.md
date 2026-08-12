@@ -295,7 +295,13 @@ that *can* block honestly.
 No ECS. `src/rx_scene` implements Filament-precedent managers
 [R:scene]: `RenderableManager`, `TransformManager`, `LightManager`,
 plus a plain `Camera` value type — SoA storage, generational handles,
-create/set/destroy API, consumed by DrawListBuilder. EnTT remains the
+create/set/destroy API, consumed by DrawListBuilder. **Consumer-boundary
+contract:** the handle API is the seam a HOST engine drives — a handle is
+a plain value the host stores inside its own world model (ECS component /
+scene-graph node / flat array; the renderer is neutral), and the host's
+systems call set-by-handle each frame. The internal SoA managers are
+ECS-shaped storage, not an ECS framework, never exposed as one. Design
+for cheap per-frame set-by-handle from host systems. EnTT remains the
 recorded candidate for samples/tooling only. (Registry updated.)
 
 ### D20 — Debug overlay: Dear ImGui v1.92.x as `rx_debug_ui` (seed 12 confirmed)
