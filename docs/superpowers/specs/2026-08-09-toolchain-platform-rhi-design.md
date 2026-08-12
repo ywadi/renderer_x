@@ -261,6 +261,13 @@ it is out of scope for *this* spec only, not out of scope for the project:
   sweep is ever wanted directly from C++, but C-first is the strategy.
   The COM-lite surface discipline (PODs, no STL/exceptions, error codes)
   already satisfies every generator's input constraints by construction.
+  **Paradigm-neutral consumer principle (2026-08-12):** consuming the
+  engine requires NO particular paradigm of the caller — the binary ABI
+  is a C-callable function-pointer table and the API is handle-based
+  (create/set/destroy by handle), so procedural (C), ownership/trait
+  (Rust), data-oriented (Zig), and OOP callers are all first-class. The
+  C++ interface header is an ergonomic convenience, never a requirement;
+  the engine imposes neither OOP nor an ECS on the host.
 - **Main-loop ownership** (decided 2026-08-10, binds the SDK-phase spec):
   RendererX is library-model — the consuming game/engine owns `main()` and
   the frame loop and calls an explicit frame API (begin-frame → declare
