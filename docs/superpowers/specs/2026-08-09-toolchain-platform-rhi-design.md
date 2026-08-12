@@ -218,9 +218,7 @@ it is out of scope for *this* spec only, not out of scope for the project:
     acquire/release + swapchain lifecycle, SDK/platform phase with a
     windowed fallback per the optionality principle; (FG8) HDR display
     output + swapchain colorspace ladder (techniques phase, with the
-    post stack); (FG9) renderer-wide VRAM budget + memory-pressure
-    response, VK_EXT_memory_budget (streaming phase's central input —
-    registered here so that phase's spec inherits it); (FG10)
+    post stack); (FG9) renderer-wide memory budget + reporting + eviction-policy design ELEVATED to Phase 4 Stage 1 (scheduled ticket, 2026-08-12) — accounting/VK_EXT_memory_budget/host report/eviction-contract land in Phase 4; the eviction MECHANISM + residency pairs with the streaming phase's workloads; (FG10)
     host-provided native window embedding via SDL3 foreign-window
     properties, or a recorded rejection (SDK spec must answer).
   - *Post-V1:* (FG11) consumer screenshot/capture API (SDK/tooling);
