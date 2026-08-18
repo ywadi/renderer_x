@@ -46,9 +46,23 @@ and compiles to nothing at all when it is OFF:
   `registerSampler()`/`registerStorageBuffer()`/`release()` **[guarded, all
   four]**
   (`src/rx_rhi_vk/include/rx_rhi_vk/bindless.h`)
-- **`rx::rhi::Uploader`** — `uploadToBuffer()`/`uploadToImage()` **[guarded,
-  both]**/`flush()` (not guarded — always called from within an already-
-  guarded uploadTo*() call in every path this codebase has today)
+- **`rx::rhi::Uploader`** — `uploadToBuffer()`/`uploadToImage()`/`flush()`/
+  `isComplete()`/`wait()` **[guarded, all five]** [Phase 4 Task 11, spec
+  D25 as amended by gate ruling RC4]: `flush()` gained its guard this task
+  because it is no longer reachable only via an already-guarded
+  uploadTo*() call — `flush()` with nothing recorded (returning an
+  already-complete `UploadTicket`) is now a legitimate standalone call, so
+  the old "always called from within an already-guarded call" reasoning no
+  longer holds. `isComplete()`/`wait()` are new this task; both poll/wait
+  on this Uploader's own timeline semaphore, which the Vulkan spec itself
+  permits from any thread with no external synchronization
+  (`vkGetSemaphoreCounterValue`/`vkWaitSemaphores` need none) — the guard
+  here is this project's own D5 policy scoping, matching every other
+  Uploader entry point's identical scoping, not a hazard these two
+  introduce. `flush()` now returns a pollable `UploadTicket` instead of
+  blocking; existing callers that need the old always-blocking contract
+  (e.g. `MeshBuffers::create()`) call `wait()` on the returned ticket
+  explicitly.
   (`src/rx_rhi_vk/include/rx_rhi_vk/upload.h`)
 - **`rx::material::MaterialSystem`** — `loadMaterial()`/`getPipeline()`/
   `reloadChanged()`/`bindInstance()` **[guarded, all four]** (and every

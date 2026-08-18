@@ -42,28 +42,33 @@ std::optional<MeshBuffers> MeshBuffers::create(Allocator& allocator, Uploader& u
         RX_LOG_ERROR("MeshBuffers::create: vertex upload failed");
         return std::nullopt;
     }
-    // REAL BUG FIX: flush immediately after the vertex upload succeeds,
-    // rather than deferring to a single flush() call at the very end
-    // after both uploads. If the vertex upload took the staging path, it
-    // only RECORDED a copy into Uploader's command buffer -- nothing
-    // touches the GPU until flush() submits it. Without this early
-    // flush(), a subsequent index-upload failure below hits `return
-    // std::nullopt` before flush() ever runs, so `vertexBuffer`'s RAII
-    // destructor fires (destroying its VkBuffer) while that copy is still
-    // only recorded, never submitted -- and once flush() eventually runs
-    // on some *later* Uploader use, it would submit a copy command
-    // referencing an already-destroyed buffer. Flushing here makes the
-    // vertex copy submitted and (per Uploader::flush()'s synchronous
-    // contract) complete before vertexBuffer can ever be destroyed,
-    // independent of whether the index upload below succeeds. flush() is
-    // a safe no-op if the vertex upload took the direct (non-staging)
-    // path instead (nothing was recorded, so there is nothing to submit).
-    uploader.flush();
+    // REAL BUG FIX: flush+WAIT immediately after the vertex upload
+    // succeeds, rather than deferring to a single flush() call at the
+    // very end after both uploads. If the vertex upload took the staging
+    // path, it only RECORDED a copy into Uploader's command buffer --
+    // nothing touches the GPU until flush() submits it. Without this
+    // early flush()+wait(), a subsequent index-upload failure below hits
+    // `return std::nullopt` before the copy is confirmed complete, so
+    // `vertexBuffer`'s RAII destructor fires (destroying its VkBuffer)
+    // while that copy may still be running on the GPU -- corrupting or
+    // crashing whenever it eventually completes against an
+    // already-destroyed buffer. [Phase 4 Task 11, spec D25] flush() alone
+    // no longer blocks -- MeshBuffers::create() is exactly the
+    // "convenience wrapper" plan Task 11 names explicitly: it keeps its
+    // OWN pre-Task-11 blocking contract on purpose (the whole point of
+    // this factory is "both buffers are already fully populated and safe
+    // to bind/draw from immediately" by the time it returns), via an
+    // explicit wait(ticket) right after flush() -- byte-identical
+    // external behavior to before, just no longer implicit. wait() is a
+    // safe no-op if the vertex upload took the direct (non-staging) path
+    // instead (nothing was recorded, so flush() returns the trivially-
+    // complete ticket and wait() returns immediately).
+    uploader.wait(uploader.flush());
     if (!uploader.uploadToBuffer(*indexBuffer, 0, indexData, indexBytes)) {
         RX_LOG_ERROR("MeshBuffers::create: index upload failed");
         return std::nullopt;
     }
-    uploader.flush();
+    uploader.wait(uploader.flush());
 
     return MeshBuffers(std::move(*vertexBuffer), std::move(*indexBuffer), indexCount, indexType);
 }

@@ -82,6 +82,32 @@ public:
     uint32_t graphicsQueueFamily() const { return graphicsQueueFamily_; }
     VkQueue presentQueue() const { return presentQueue_; }
 
+    // Optional DEDICATED transfer queue [Phase 4 Task 11, spec D25, gate
+    // ruling #28 row 10]: acquired via vk-bootstrap's
+    // `get_dedicated_queue(QueueType::transfer)` -- NEVER
+    // `require_dedicated_transfer_queue()`, which would make PHYSICAL
+    // DEVICE SELECTION itself fail outright on hardware lacking one (the
+    // wrong primitive for an optional/fallback feature; verified against
+    // vk-bootstrap's own `has_dedicated_transfer_queue()` definition: a
+    // family that supports transfer but NOT graphics/compute, which many
+    // devices -- including this project's own dev/CI hardware -- simply
+    // do not expose). A missing dedicated queue is not a Device::create()
+    // failure; it is a graceful, logged degrade (see create()) --
+    // `hasDedicatedTransferQueue()` reports which case this Device landed
+    // in; `transferQueue()`/`transferQueueFamily()` are only meaningful
+    // when it returns true (VK_NULL_HANDLE/0 otherwise -- callers must
+    // check the flag first, not assume a nonzero handle).
+    //
+    // ACQUISITION ONLY this phase -- nothing in this codebase submits to
+    // transferQueue() yet (cross-queue submission and queue-family
+    // ownership-transfer barriers stay streaming-phase policy, per the
+    // toolchain-platform-rhi-design registry's "Upload/transfer asynchrony
+    // policy" entry). The accessor existing and being correctly populated
+    // (or correctly absent) is this phase's entire acceptance bar.
+    bool hasDedicatedTransferQueue() const { return hasDedicatedTransferQueue_; }
+    VkQueue transferQueue() const { return transferQueue_; }
+    uint32_t transferQueueFamily() const { return transferQueueFamily_; }
+
     // True iff VK_EXT_calibrated_timestamps was present on the selected
     // physical device AND successfully enabled on the logical device this
     // Device wraps (see device.cpp's own comment on the optional, guarded
@@ -176,6 +202,9 @@ private:
     VkQueue graphicsQueue_ = VK_NULL_HANDLE;
     uint32_t graphicsQueueFamily_ = 0;
     VkQueue presentQueue_ = VK_NULL_HANDLE;
+    VkQueue transferQueue_ = VK_NULL_HANDLE;
+    uint32_t transferQueueFamily_ = 0;
+    bool hasDedicatedTransferQueue_ = false;
     bool calibratedTimestampsEnabled_ = false;
     bool memoryBudgetExtensionEnabled_ = false;
 

@@ -225,6 +225,25 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
     features12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
     features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
     features12.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
+    // timelineSemaphore [Phase 4 Task 11, spec D25 as amended by gate
+    // ruling RC4]: rx::rhi::Uploader's ticket-completion primitive
+    // (upload.cpp) needs VK_SEMAPHORE_TYPE_TIMELINE, which -- despite
+    // `VK_KHR_timeline_semaphore`'s functionality being fully promoted
+    // into Vulkan 1.2 core, confirmed against the Khronos registry man
+    // page -- is still a FEATURE BIT that must be explicitly requested at
+    // device-creation time, not something API version alone turns on
+    // (`vkCreateSemaphore` with `VK_SEMAPHORE_TYPE_TIMELINE` otherwise
+    // hard-fails VUID-VkSemaphoreTypeCreateInfo-timelineSemaphore-03252 --
+    // caught empirically by this task's own test suite before this line
+    // existed). Required unconditionally, matching every other bit in this
+    // struct: verified present on both this project's own dev drivers
+    // (NVIDIA proprietary and Mesa llvmpipe/lavapipe, `vulkaninfo`) and
+    // mandated by the Vulkan Roadmap 2022 profile this project's Steam
+    // Deck RADV floor hardware already targets -- no optionality/fallback
+    // needed the way VK_EXT_calibrated_timestamps/VK_EXT_memory_budget
+    // (genuinely optional extensions, not core-promoted feature bits) get
+    // below.
+    features12.timelineSemaphore = VK_TRUE;
 
     vkb::PhysicalDeviceSelector selector(context.vkbInstance());
     auto physResult = selector.set_surface(surface)
@@ -313,6 +332,27 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
         return std::nullopt;
     }
 
+    // Optional dedicated transfer queue [Phase 4 Task 11, spec D25, gate
+    // ruling #28 row 10]: `get_dedicated_queue()` fails gracefully via its
+    // own `Result` (not a hard PhysicalDeviceSelector-level requirement,
+    // unlike `require_dedicated_transfer_queue()`, which this task
+    // deliberately never calls) on hardware with no queue family that
+    // supports transfer but NOT graphics/compute. A missing dedicated
+    // queue is not a Device::create() failure -- it is a graceful, logged
+    // degrade (below); every caller falls back to graphicsQueue() for any
+    // future transfer work, not exercised this phase (acquisition only --
+    // see device.h's own comment on hasDedicatedTransferQueue()).
+    VkQueue transferQueue = VK_NULL_HANDLE;
+    uint32_t transferQueueFamily = 0;
+    bool hasDedicatedTransferQueue = false;
+    auto transferQueueResult = vkbDevice.get_dedicated_queue(vkb::QueueType::transfer);
+    auto transferQueueIndexResult = vkbDevice.get_dedicated_queue_index(vkb::QueueType::transfer);
+    if (transferQueueResult && transferQueueIndexResult) {
+        transferQueue = transferQueueResult.value();
+        transferQueueFamily = transferQueueIndexResult.value();
+        hasDedicatedTransferQueue = true;
+    }
+
     vkb::SwapchainBuilder swapchainBuilder(vkbDevice, surface);
     // Present-mode control [Phase 4 Task 6, spec seed 1]: explicit FIFO
     // default (PresentMode::VsyncOn), not vk-bootstrap's own implicit
@@ -353,6 +393,15 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
     dev.graphicsQueue_ = graphicsQueueResult.value();
     dev.graphicsQueueFamily_ = graphicsQueueIndexResult.value();
     dev.presentQueue_ = presentQueueResult.value();
+    dev.transferQueue_ = transferQueue;
+    dev.transferQueueFamily_ = transferQueueFamily;
+    dev.hasDedicatedTransferQueue_ = hasDedicatedTransferQueue;
+    RX_LOG_INFO("Device::create: dedicated transfer queue {} [Phase 4 Task 11, spec D25] (acquisition only -- "
+                "nothing submits to it this phase)",
+                hasDedicatedTransferQueue
+                    ? "ACQUIRED"
+                    : "not present on this physical device -- falling back to the graphics queue for any future "
+                      "transfer work");
     dev.calibratedTimestampsEnabled_ = calibratedTimestampsEnabled;
     RX_LOG_INFO("Device::create: VK_EXT_calibrated_timestamps {} on the selected physical device",
                 calibratedTimestampsEnabled ? "ENABLED" : "not present -- falling back to uncalibrated GPU zones");
@@ -386,6 +435,9 @@ Device& Device::operator=(Device&& other) noexcept {
         graphicsQueue_ = other.graphicsQueue_;
         graphicsQueueFamily_ = other.graphicsQueueFamily_;
         presentQueue_ = other.presentQueue_;
+        transferQueue_ = other.transferQueue_;
+        transferQueueFamily_ = other.transferQueueFamily_;
+        hasDedicatedTransferQueue_ = other.hasDedicatedTransferQueue_;
         calibratedTimestampsEnabled_ = other.calibratedTimestampsEnabled_;
         memoryBudgetExtensionEnabled_ = other.memoryBudgetExtensionEnabled_;
         swapchain_ = other.swapchain_;
@@ -402,6 +454,9 @@ Device& Device::operator=(Device&& other) noexcept {
         other.graphicsQueue_ = VK_NULL_HANDLE;
         other.graphicsQueueFamily_ = 0;
         other.presentQueue_ = VK_NULL_HANDLE;
+        other.transferQueue_ = VK_NULL_HANDLE;
+        other.transferQueueFamily_ = 0;
+        other.hasDedicatedTransferQueue_ = false;
         other.calibratedTimestampsEnabled_ = false;
         other.memoryBudgetExtensionEnabled_ = false;
         other.swapchain_ = VK_NULL_HANDLE;

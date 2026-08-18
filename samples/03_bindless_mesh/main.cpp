@@ -776,7 +776,13 @@ std::optional<Scene> createScene(VkPhysicalDevice physicalDevice, VkDevice devic
     }
     scene.textures.push_back(std::move(*pngTexture));
 
-    uploader.flush();  // every mesh/texture upload above is now on the GPU.
+    // [Phase 4 Task 11, spec D25] Uploader::flush() no longer blocks on
+    // its own -- wait() explicitly to preserve this setup path's original
+    // "every mesh/texture upload above is now on the GPU" guarantee
+    // byte-identically before the descriptor registrations below (which
+    // this sample stays outside Task 11's primary migration scope for --
+    // sample 04 is the named vehicle for the new poll-based pattern).
+    uploader.wait(uploader.flush());
 
     for (auto& texture : scene.textures) {
         auto handle = scene.bindlessTable.registerSampledImage(texture.view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -892,7 +898,13 @@ void updateTransforms(rx::rhi::Uploader& uploader, rx::rhi::Buffer& transformBuf
     VkDeviceSize rowBytes = sizeof(glm::mat4);
     VkDeviceSize dstOffset = static_cast<VkDeviceSize>(frameInFlightIndex) * kObjectCount * rowBytes;
     uploader.uploadToBuffer(transformBuffer, dstOffset, mvps.data(), kObjectCount * rowBytes);
-    uploader.flush();
+    // [Phase 4 Task 11, spec D25] wait() explicitly: this per-frame
+    // transform upload's data is read by this SAME frame's draw commands,
+    // which is exactly the dependency Uploader::flush()'s old blocking
+    // contract used to guarantee implicitly. Preserved byte-identically
+    // here (out of this task's primary migration scope -- sample 04 is
+    // the named vehicle for the new poll-based pattern).
+    uploader.wait(uploader.flush());
 }
 
 // Records the draws for every object in `kObjects` into `cmd`, which must

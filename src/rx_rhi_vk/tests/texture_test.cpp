@@ -94,7 +94,9 @@ TEST_CASE("Texture2D + Uploader::uploadToImage: 64x64 upload with generated mips
 
     std::vector<uint8_t> pixels = makeGradientPixels(kExtent.width, kExtent.height);
     REQUIRE(uploader->uploadToImage(*texture, pixels.data(), pixels.size(), /*generateMips=*/true));
-    uploader->flush();
+    // [Phase 4 Task 11, spec D25] flush() no longer blocks -- wait()
+    // explicitly before this readback's own separate submission.
+    uploader->wait(uploader->flush());
 
     // Readback: transition (back) to a copy source, then copy level 0
     // out to a host-visible buffer -- transitionImage() covers every
@@ -187,7 +189,7 @@ TEST_CASE("Texture2D + Uploader::uploadToImage: a single-mip-level texture round
         REQUIRE(textureA->mipLevels() == 1);
 
         REQUIRE(uploader->uploadToImage(*textureA, pixels.data(), pixels.size(), /*generateMips=*/true));
-        uploader->flush();
+        uploader->wait(uploader->flush());
 
         std::vector<uint8_t> readBack = readBackLevel0(*textureA);
         CHECK(std::memcmp(readBack.data(), pixels.data(), pixels.size()) == 0);
@@ -205,7 +207,7 @@ TEST_CASE("Texture2D + Uploader::uploadToImage: a single-mip-level texture round
         REQUIRE(textureB->mipLevels() == 1);
 
         REQUIRE(uploader->uploadToImage(*textureB, pixels.data(), pixels.size(), /*generateMips=*/false));
-        uploader->flush();
+        uploader->wait(uploader->flush());
 
         std::vector<uint8_t> readBack = readBackLevel0(*textureB);
         CHECK(std::memcmp(readBack.data(), pixels.data(), pixels.size()) == 0);

@@ -38,14 +38,18 @@ public:
     // and index buffer (`indexBytes`, usage
     // VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
     // via `allocator`, then uploads `vertexData`/`indexData` into them
-    // through `uploader` and calls `uploader.flush()` itself before
-    // returning -- so by the time this call returns, both buffers are
-    // already fully populated and safe to bind/draw from immediately
-    // (no separate flush() needed by the caller for just this call).
-    // `indexCount` is stored verbatim for indexCount() below (this class
-    // does not infer it from indexBytes/index-type size, since a caller
-    // already knows it and a stored value is unambiguous regardless of
-    // index type).
+    // through `uploader` and calls `uploader.wait(uploader.flush())`
+    // itself before returning -- so by the time this call returns, both
+    // buffers are already fully populated and safe to bind/draw from
+    // immediately (no separate flush()/wait() needed by the caller for
+    // just this call). [Phase 4 Task 11, spec D25] `Uploader::flush()`
+    // itself no longer blocks; this factory keeps its OWN pre-Task-11
+    // blocking contract on purpose, via that explicit wait(ticket) --
+    // documented as a deliberate convenience, per plan Task 11's own
+    // text, not an accidental holdover. `indexCount` is stored verbatim
+    // for indexCount() below (this class does not infer it from
+    // indexBytes/index-type size, since a caller already knows it and a
+    // stored value is unambiguous regardless of index type).
     //
     // Returns std::nullopt (logged) if either buffer allocation or either
     // upload fails.

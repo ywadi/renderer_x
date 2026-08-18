@@ -1,13 +1,49 @@
 #pragma once
 #include <rx_rhi_vk/buffer.h>
 #include <cstdint>
+#include <deque>
 #include <optional>
 #include <utility>
+#include <vector>
 
 namespace rx::rhi {
 
 class Device;
 class Texture2D;
+
+// [Phase 4 Task 11, spec D25 as amended by gate ruling RC4] A pollable
+// handle to the GPU work a specific `Uploader::flush()` call submitted --
+// `value` is the counter value this Uploader's own timeline semaphore
+// reaches once that work (and, by construction, every earlier submission
+// on the same queue -- see flush()'s own comment) has completed.
+//
+// `value == 0` is the reserved "already complete" sentinel: the timeline
+// semaphore starts at counter value 0 and only ever counts up, so
+// `currentValue >= 0` is unconditionally true without ever touching the
+// semaphore -- exactly the ticket a `flush()` call with nothing new to
+// submit (nothing recorded since the last flush, or a batch that only
+// ever took the direct memcpy path -- see uploadToBuffer()'s own comment)
+// returns, matching this class's pre-Task-11 no-op-flush behavior with no
+// fence/semaphore machinery touched at all [matrix-issue28 rows 8/9].
+//
+// Comparable/copyable POD; safe to store, copy, and query long after the
+// `flush()` call that produced it, independent of how many LATER flush()
+// calls have since been issued (this is the whole point of the redesign --
+// see the class comment on Uploader below).
+struct UploadTicket {
+    uint64_t value = 0;
+
+    // Diagnostic-only: Uploader::ringWrapCount() at the moment this ticket
+    // was issued. Carried over from this ticket's originally proposed
+    // shape (issue #28 body: "fence + ring generation") even though
+    // neither isComplete() nor wait() below ever consult it -- completion
+    // is determined entirely by `value` against the timeline semaphore.
+    // Production code has no need to read this; it exists so a test can
+    // assert which "lap" of the ring a given upload landed in.
+    uint32_t ringGeneration = 0;
+
+    bool operator==(const UploadTicket&) const = default;
+};
 
 // Gets CPU-side bytes into GPU-visible/device-local Vulkan resources:
 // uploadToBuffer() for a destination rx::rhi::Buffer, uploadToImage() for
@@ -15,22 +51,62 @@ class Texture2D;
 // Texture2D::recordMipChainBlit() in the same submission) [spec Fixed
 // decision #7, R:C1].
 //
-// SYNCHRONOUS, BATCHED FLUSH -- read before assuming per-call semantics:
-// every upload that goes through the staging ring (see below) only
-// RECORDS a command (a vkCmdCopyBuffer/vkCmdCopyBufferToImage, plus any
-// mip-chain blit) onto this Uploader's own internal command buffer;
-// nothing touches the GPU until flush() actually submits everything
-// recorded so far and BLOCKS the calling thread on a fence wait until it
-// completes. This lets several uploads share one submission (cheaper
-// than one submit-and-wait per resource) while keeping this phase's API
-// deliberately simple: a fully synchronous flush() is an explicitly
-// acceptable Phase 2 choice [R:C1] -- "Synchronous flush API is
-// acceptable this phase ... per-frame async batching is a later
-// optimization." A future Uploader revision replacing this with a fence
-// the caller polls (instead of blocking on) would change flush()'s
-// contract but not uploadToBuffer()/uploadToImage()'s. (A direct-path
-// buffer upload, below, has no command to record at all -- see its own
-// paragraph.)
+// BATCHED, POLLABLE FLUSH [Phase 4 Task 11, spec D25 as amended by gate
+// ruling RC4] -- read before assuming per-call semantics: every upload
+// that goes through the staging ring (see below) only RECORDS a command
+// (a vkCmdCopyBuffer/vkCmdCopyBufferToImage, plus any mip-chain blit) onto
+// one of this Uploader's own internal command buffers; nothing touches the
+// GPU until flush() submits everything recorded so far. Unlike this
+// class's pre-Task-11 shape, flush() no longer BLOCKS the calling thread
+// on that submission: it returns an UploadTicket immediately, and
+// isComplete(ticket)/wait(ticket) below let a caller check or block on
+// that specific batch's completion whenever it actually needs to (not
+// necessarily right away, or ever, if it never needs to know). This lets
+// several uploads share one submission (cheaper than one submit-and-wait
+// per resource) while letting a caller overlap many frames' worth of
+// uploads without ever stalling its own main thread inside flush() itself.
+//
+// TICKET PRIMITIVE: ONE TIMELINE SEMAPHORE, owned by this Uploader for its
+// whole lifetime. Every work-submitting flush() call signals the NEXT
+// monotonically increasing counter value and returns
+// UploadTicket{thatValue, ringWrapCount()}; isComplete(ticket) is one
+// vkGetSemaphoreCounterValue compare (current >= ticket.value); wait(ticket)
+// is vkWaitSemaphores for that value (returns immediately if already
+// reached). Chosen over a fence (pool or single-reused) specifically
+// because a REUSED fence is structurally incompatible with a pollable
+// ticket: resetting fence F to submit ticket N+1's work while a caller
+// might still be querying/waiting on ticket N (which used the SAME fence
+// object) either corrupts ticket N's reported status or is an outright
+// Vulkan validation error (vkResetFences while a wait on that fence is
+// still meaningful elsewhere) -- the exact hazard gate matrix-issue28's
+// row 1 traces to this class's original single-`VkFence` design. A
+// monotonic timeline-semaphore counter has no reset step at all (core
+// Vulkan 1.2, no extension gating needed on this project's 1.3 baseline),
+// eliminating the hazard by construction: two overlapping flush() calls
+// with no wait on the first one in between is the NORMAL case, not a
+// hazard -- see upload_test.cpp's dedicated overlapping-flush test, the
+// single highest-priority correctness gate for this class.
+//
+// TWO tickets from two DIFFERENT flush() calls are ordered exactly like
+// their counter values: ticket N+1's value is always > ticket N's, and
+// because both are signaled by submissions to the SAME queue in the SAME
+// order they were issued, waiting on the LATER ticket also guarantees the
+// earlier one's work has completed (this is what lets ~Uploader() below
+// wait on only the single most-recently-queued value at teardown, rather
+// than tracking every outstanding ticket it ever handed out).
+//
+// COMMAND-BUFFER ROTATION: a direct consequence of the same "flush() no
+// longer blocks" change -- reusing a single command buffer the way this
+// class did before Task 11 (vkResetCommandBuffer on every new batch) is
+// now the SAME class of hazard as the fence-reuse one above, just for the
+// command buffer instead of the completion primitive: resetting/
+// re-recording into a buffer whose previous submission may still be
+// pending on the GPU is a hard Vulkan violation. This class now keeps a
+// small, lazily-grown ROTATION of command buffers (all allocated from one
+// pool) and picks any buffer whose last submission is confirmed complete
+// (or allocates a fresh one if none is free) every time a new batch starts
+// recording -- never blocking to reclaim one, matching the timeline
+// semaphore's own "no artificial in-flight depth limit" character.
 //
 // DIRECT UPLOAD (BUFFERS ONLY) VS. STAGING RING [R:C1] -- CORRECTED THIS
 // TASK'S REVIEW CYCLE, read before assuming the mechanism below: the
@@ -55,15 +131,17 @@ class Texture2D;
 // unified-memory APU like Steam Deck, landed `dst`'s own memory in
 // something BOTH DEVICE_LOCAL and HOST_VISIBLE), it memcpy's straight
 // into `dst.mappedData()` and calls `dst.flush()` -- no staging copy, no
-// command recorded, no ring buffer touched at all. Otherwise it falls
-// back to exactly the staging-ring mechanism this class always had:
-// memcpy into the ring, Buffer::flush() it (correct even on a
-// hypothetical non-coherent HOST_VISIBLE memory type, not just the
-// coherent-in-practice hardware this engine has been tested against),
-// record a vkCmdCopyBuffer from the ring into `dst`. Which branch a given
-// call took is logged once per outcome (RX_LOG_INFO, the first time each
-// is observed -- not per call) and exposed for tests via
-// everUsedDirectPath()/everUsedStagingPath().
+// command recorded, no ring buffer touched at all, and (per the ticket
+// design above) no fence/semaphore machinery touched by the flush() call
+// that later covers it either, if nothing else in that batch needed real
+// GPU work [matrix-issue28 row 8]. Otherwise it falls back to exactly the
+// staging-ring mechanism this class always had: memcpy into the ring,
+// Buffer::flush() it (correct even on a hypothetical non-coherent
+// HOST_VISIBLE memory type, not just the coherent-in-practice hardware
+// this engine has been tested against), record a vkCmdCopyBuffer from the
+// ring into `dst`. Which branch a given call took is logged once per
+// outcome (RX_LOG_INFO, the first time each is observed -- not per call)
+// and exposed for tests via everUsedDirectPath()/everUsedStagingPath().
 //
 // IMAGES ALWAYS STAGE -- this is the honest shape of [R:C1]'s guidance,
 // not a cop-out: a VkImage cannot be written from the host at all without
@@ -73,24 +151,47 @@ class Texture2D;
 // "direct" branch for uploadToImage() to take, on any hardware, by
 // construction of the Vulkan API itself -- every image upload goes
 // through the staging ring, unconditionally, exactly as this class
-// always did for images.
+// always did for images; its ticket is therefore never the trivially-
+// complete sentinel [matrix-issue28 row 7].
+//
+// RING RECLAMATION KEYED TO TICKET COMPLETION, NOT TO HAVING BLOCKED
+// [matrix-issue28 rows 5/6, the D3D12 fence-gated-ring-buffer pattern]:
+// this Uploader tracks a FIFO queue of (ticket, ring-byte-range) entries,
+// one per work-submitting flush() call. Reclaiming ring space (needed
+// only when a write would wrap past the buffer's end) first pops every
+// entry at the FRONT of that queue whose ticket is already complete
+// (a pure poll, never blocking) and, only if the requested range still
+// overlaps the oldest remaining entry, blocks on THAT SPECIFIC ticket
+// (never a whole-ring flush-and-wait) before trying again. The ring
+// buffer itself is fixed-size (set once at create(), never grown) --
+// exhaustion under many in-flight tickets blocks on the oldest one
+// covering the needed range, exactly the D3D12-precedented
+// block-on-oldest policy, not silent growth.
 //
 // If a single ring-staged upload's write position would run past the
 // ring buffer's end before the pending batch is flushed, this Uploader
-// transparently calls flush() itself first (submitting + waiting on
-// everything recorded so far, which frees the whole ring buffer for
-// reuse since flush() is synchronous) and then continues writing from
-// offset 0 -- callers never need to reason about ring-buffer capacity
-// themselves unless a single upload's size exceeds the ring buffer's
-// total capacity, which fails cleanly (logged, returns false) rather
-// than silently corrupting anything. This never applies to a
-// direct-path buffer upload, which never touches the ring at all.
+// transparently flushes what is already recorded (submitting it, and
+// tracking its ring range per the paragraph above -- not waiting on it)
+// and then continues writing from offset 0 once enough of the ring's
+// front is confirmed reclaimable -- callers never need to reason about
+// ring-buffer capacity themselves unless a single upload's size exceeds
+// the ring buffer's total capacity, which fails cleanly (logged, returns
+// false) rather than silently corrupting anything. This never applies to
+// a direct-path buffer upload, which never touches the ring at all.
 //
-// Thread-affinity (D5, Phase 4): uploadToBuffer()/uploadToImage()/flush()
-// are main-thread-only -- see docs/threading.md. uploadToBuffer()/
-// uploadToImage() carry a dev-time RX_ASSERT_MAIN_THREAD guard [Phase 4
-// Task 7 fix round 1] that fails loudly on a chunk >= 1 violation instead
-// of corrupting the shared ring buffer/command-recording state silently.
+// Thread-affinity (D5, Phase 4): uploadToBuffer()/uploadToImage()/flush()/
+// isComplete()/wait() are main-thread-only -- see docs/threading.md.
+// uploadToBuffer()/uploadToImage()/flush()/isComplete()/wait() all carry a
+// dev-time RX_ASSERT_MAIN_THREAD guard [Phase 4 Task 7 fix round 1;
+// extended to flush()/isComplete()/wait() in Task 11, since flush() can
+// now be a legitimate standalone call -- e.g. on nothing recorded -- no
+// longer reachable only via an already-guarded uploadTo*() call] that
+// fails loudly on a chunk >= 1 violation instead of corrupting shared
+// state silently. isComplete()/wait() poll/wait on this Uploader's own
+// timeline semaphore, which the Vulkan spec itself permits from any
+// thread with no external synchronization -- the guard here is this
+// project's own D5 policy scoping, matching every other Uploader entry
+// point's identical scoping, not a hazard these two introduce.
 class Uploader {
 public:
     Uploader(Uploader&&) noexcept;
@@ -99,16 +200,21 @@ public:
     Uploader& operator=(const Uploader&) = delete;
 
     // Auto-flushes any pending (recorded-but-not-yet-submitted) uploads
-    // before tearing down the ring buffer/command pool/fence, so a
-    // caller that forgets an explicit final flush() never silently loses
-    // work -- see flush()'s own comment for why this is safe to do here
-    // unconditionally (it blocks on the same fence wait flush() always
-    // does).
+    // and then WAITS for every ticket this Uploader ever queued --
+    // including ones from earlier flush() calls a caller never itself
+    // waited/polled on -- before tearing down the timeline semaphore/
+    // command pool/ring buffer, so a caller that never explicitly waited
+    // on a ticket never silently loses work or destroys a resource the
+    // GPU is still using. Waiting on only the single most-recently-queued
+    // value is sufficient (see the class comment's paragraph on ticket
+    // ordering above) -- it transitively covers every earlier ticket too.
     ~Uploader();
 
     static constexpr VkDeviceSize kDefaultRingBufferSize = 16u * 1024u * 1024u;  // 16 MiB
 
-    // Builds this Uploader's internal command pool/buffer/fence against
+    // Builds this Uploader's internal command pool (command buffers are
+    // allocated from it lazily, on demand -- see the class comment's
+    // "COMMAND-BUFFER ROTATION" paragraph) and timeline semaphore against
     // `device`'s graphics queue, and its staging ring buffer (`usage`
     // VK_BUFFER_USAGE_TRANSFER_SRC_BIT only -- this buffer is always a
     // copy source, never a real destination) of `ringBufferSize` bytes
@@ -149,11 +255,54 @@ public:
     bool uploadToImage(Texture2D& dst, const void* pixels, VkDeviceSize pixelBytes, bool generateMips);
 
     // Submits every uploadTo*() call recorded since the last flush() (or
-    // since create()), waits (via this Uploader's own dedicated fence)
-    // for the GPU to finish, then resets the ring buffer's write cursor
-    // back to 0 and the command buffer for reuse. Safe to call with
-    // nothing pending (no-op).
-    void flush();
+    // since create()) and returns a pollable UploadTicket -- see the class
+    // comment above for the full ticket design. Does NOT block: a caller
+    // that needs the old always-blocking behavior calls wait() on the
+    // returned ticket explicitly (see MeshBuffers::create() for exactly
+    // this pattern). If nothing was recorded since the last flush() (no
+    // uploadTo*() call happened, or every call in this batch took the
+    // direct memcpy path with zero real GPU work queued), returns the
+    // trivially-complete UploadTicket{0, ringWrapCount()} without
+    // touching the timeline semaphore or submitting anything at all --
+    // matching this class's pre-Task-11 no-op-flush() behavior exactly.
+    UploadTicket flush();
+
+    // Pure poll, no blocking: true iff this Uploader's timeline semaphore
+    // has reached (or passed) `ticket.value`. A `ticket.value` of 0
+    // (the trivially-complete sentinel) is always true without querying
+    // the semaphore at all. On the rare vkGetSemaphoreCounterValue
+    // failure, logs a named RX_LOG_ERROR (never silently treated as
+    // either state) and conservatively returns false.
+    bool isComplete(UploadTicket ticket) const;
+
+    // Blocks the calling thread until this Uploader's timeline semaphore
+    // reaches `ticket.value` (vkWaitSemaphores, UINT64_MAX timeout) --
+    // the direct analog of this class's pre-Task-11 always-blocking
+    // flush(). Returns immediately if `ticket` is already complete
+    // (including the ticket.value == 0 sentinel, which never touches the
+    // semaphore at all -- see isComplete()'s own comment).
+    void wait(UploadTicket ticket) const;
+
+    // How many times this Uploader's ring buffer has wrapped back to
+    // offset 0 since create() -- diagnostic/test accessor (see
+    // UploadTicket::ringGeneration's own comment); production code has no
+    // need for it.
+    uint32_t ringWrapCount() const { return ringGeneration_; }
+
+    // How many times reserveRingSpace() had to block (wait() on a
+    // specific in-flight ticket) to reclaim ring space, across this
+    // Uploader's whole lifetime -- test/diagnostic accessor proving the
+    // D3D12-pattern partial reclaim in the class comment above actually
+    // engages (a stress test asserts this stays below the number of
+    // flush() calls issued, per matrix-issue28 row 5). Production code
+    // has no need for it.
+    uint32_t blockingRingWaitCount() const { return blockingRingWaitCount_; }
+
+    // This Uploader's fixed ring-buffer capacity, exactly as passed to
+    // create() -- never changes for this Uploader's lifetime (this class
+    // never silently grows the ring; see the class comment's ring-
+    // reclamation paragraph). Test/diagnostic accessor.
+    VkDeviceSize ringCapacity() const { return ringBufferSize_; }
 
     // True once at least one uploadToBuffer() call has taken the direct
     // (memcpy-straight-into-`dst`) branch / the staging-ring branch,
@@ -174,33 +323,74 @@ private:
     // rx::rhi::MeshBuffers/Texture2D's own equivalent constructors, for
     // the same reason). The move constructor/assignment below are
     // hand-written rather than `= default` for the opposite reason: this
-    // class also owns several *raw* Vulkan handles (pool_/cmd_/fence_),
-    // which a defaulted move would copy without nulling the source --
-    // exactly the double-destroy hazard every other RAII type in this
-    // library's move operations are hand-written to avoid.
-    Uploader(VkDevice device, VkQueue queue, VkCommandPool pool, VkCommandBuffer cmd, VkFence fence,
-             Buffer ringBuffer, VkDeviceSize ringBufferSize)
+    // class also owns several *raw* Vulkan handles (pool_/timelineSemaphore_/
+    // every VkCommandBuffer inside cmdSlots_), which a defaulted move
+    // would copy without nulling the source -- exactly the double-destroy
+    // hazard every other RAII type in this library's move operations are
+    // hand-written to avoid.
+    Uploader(VkDevice device, VkQueue queue, VkCommandPool pool, VkSemaphore timelineSemaphore, Buffer ringBuffer,
+             VkDeviceSize ringBufferSize)
         : device_(device),
           queue_(queue),
           pool_(pool),
-          cmd_(cmd),
-          fence_(fence),
+          timelineSemaphore_(timelineSemaphore),
           ringBuffer_(std::move(ringBuffer)),
           ringBufferSize_(ringBufferSize) {}
 
+    // [Phase 4 Task 11] One rotating recorded-command-buffer slot -- see
+    // the class comment's "COMMAND-BUFFER ROTATION" paragraph for why a
+    // single reused buffer is no longer safe once flush() stops blocking.
+    struct CmdSlot {
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        UploadTicket lastTicket{};
+        bool everSubmitted = false;
+    };
+
+    // [Phase 4 Task 11] One entry in the ring-reclamation FIFO -- see the
+    // class comment's "RING RECLAMATION" paragraph. `[start, end)` is the
+    // half-open byte range, within one "lap" of the ring, that `ticket`'s
+    // flush() call submitted staging/image copies out of.
+    struct PendingRegion {
+        UploadTicket ticket;
+        VkDeviceSize start = 0;
+        VkDeviceSize end = 0;
+    };
+
+    static constexpr size_t kInvalidSlot = static_cast<size_t>(-1);
+
     void beginRecordingIfNeeded();
     bool reserveRingSpace(VkDeviceSize size, VkDeviceSize& outOffset);
+    void reclaimCompletedRegions();
+    // VK_NULL_HANDLE (not an out-of-bounds index) when beginRecordingIfNeeded()
+    // itself failed to allocate/begin a slot -- the caller (uploadToBuffer()/
+    // uploadToImage()) still unconditionally records into whatever this
+    // returns on that rare path, exactly like this class's pre-Task-11
+    // behavior against its single `cmd_` member; a VK_NULL_HANDLE command
+    // buffer fails loudly (validation error) rather than corrupting memory.
+    VkCommandBuffer activeCmd() const {
+        return activeSlot_ == kInvalidSlot ? VK_NULL_HANDLE : cmdSlots_[activeSlot_].cmd;
+    }
     void destroyAll();
 
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;
     VkCommandPool pool_ = VK_NULL_HANDLE;
-    VkCommandBuffer cmd_ = VK_NULL_HANDLE;
-    VkFence fence_ = VK_NULL_HANDLE;
+    VkSemaphore timelineSemaphore_ = VK_NULL_HANDLE;
+    uint64_t lastQueuedValue_ = 0;
+
+    std::vector<CmdSlot> cmdSlots_;
+    size_t activeSlot_ = kInvalidSlot;
 
     Buffer ringBuffer_;
     VkDeviceSize ringBufferSize_ = 0;
     VkDeviceSize ringCursor_ = 0;
+    // Boundary between "already pushed into pendingRegions_ by a previous
+    // flush()" and "written since then, not yet tracked" -- see flush()'s
+    // own comment.
+    VkDeviceSize lastFlushRingCursor_ = 0;
+    std::deque<PendingRegion> pendingRegions_;
+    uint32_t ringGeneration_ = 0;
+    uint32_t blockingRingWaitCount_ = 0;
 
     bool recording_ = false;
 

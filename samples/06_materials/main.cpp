@@ -855,7 +855,11 @@ bool createScene(Scene& scene, VkPhysicalDevice physicalDevice, rx::rhi::Device&
     scene.sphereIndexBuffer = std::move(sphereIndexBuffer);
     scene.cubeIndexCount = static_cast<uint32_t>(scene.cubeHostMesh.indices.size());
     scene.sphereIndexCount = static_cast<uint32_t>(scene.sphereHostMesh.indices.size());
-    uploader.flush();
+    // [Phase 4 Task 11, spec D25] Uploader::flush() no longer blocks on
+    // its own -- wait() explicitly to preserve this setup path's prior
+    // guarantee byte-identically (out of this task's primary migration
+    // scope).
+    uploader.wait(uploader.flush());
 
     for (size_t i = 0; i < kObjectSpecs.size(); ++i) {
         const ObjectSpec& spec = kObjectSpecs[i];
@@ -946,7 +950,11 @@ void updateFrame(rx::rhi::Uploader& uploader, Scene& scene, uint32_t frameInFlig
         const HostMesh& hostMesh = (obj.shape == Shape::Cube) ? scene.cubeHostMesh : scene.sphereHostMesh;
         transformAndUploadObjectVertices(uploader, hostMesh, obj, frameInFlightIndex, pose);
     }
-    uploader.flush();
+    // [Phase 4 Task 11, spec D25] wait() explicitly: this per-frame vertex
+    // upload's data is read by this SAME frame's draw commands --
+    // preserved byte-identically, out of this task's primary migration
+    // scope.
+    uploader.wait(uploader.flush());
 }
 
 // --- Render-graph declaration + draw recording ------------------------------

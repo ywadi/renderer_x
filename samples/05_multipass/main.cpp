@@ -1255,7 +1255,13 @@ std::optional<Scene> createScene(VkPhysicalDevice physicalDevice, VkDevice devic
     scene.meshes[static_cast<size_t>(Shape::Plane)] = std::move(*planeMesh);
     scene.meshes[static_cast<size_t>(Shape::Cube)] = std::move(*cubeMesh);
     scene.meshes[static_cast<size_t>(Shape::Sphere)] = std::move(*sphereMesh);
-    uploader.flush();
+    // [Phase 4 Task 11, spec D25] Uploader::flush() no longer blocks on
+    // its own -- wait() explicitly to preserve this setup path's prior
+    // guarantee byte-identically (out of this task's primary migration
+    // scope; MeshBuffers::create() above already waits on its own two
+    // uploads internally, so this call has nothing left to cover in
+    // practice, but stays explicit for any future upload added here).
+    uploader.wait(uploader.flush());
 
     // --- Sampler: shared by both the shadow-map lookup (lit.frag.slang's
     // manual single-tap compare -- NEAREST avoids blending raw depth
@@ -1561,7 +1567,11 @@ void updateFrame(rx::rhi::Uploader& uploader, Scene& scene, uint32_t frameInFlig
     const VkDeviceSize rowBytes = sizeof(ObjectTransform);
     const VkDeviceSize dstOffset = static_cast<VkDeviceSize>(frameInFlightIndex) * kObjectCount * rowBytes;
     uploader.uploadToBuffer(*scene.transformBuffer, dstOffset, transforms.data(), kObjectCount * rowBytes);
-    uploader.flush();
+    // [Phase 4 Task 11, spec D25] wait() explicitly: this per-frame
+    // transform upload's data is read by this SAME frame's draw commands
+    // (both the shadow and lit passes) -- preserved byte-identically, out
+    // of this task's primary migration scope.
+    uploader.wait(uploader.flush());
 }
 
 std::optional<uint32_t> findMemoryTypeIndex(const VkPhysicalDeviceMemoryProperties& memProps, uint32_t typeBits,

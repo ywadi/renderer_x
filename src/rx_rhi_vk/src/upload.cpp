@@ -24,6 +24,13 @@ VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
+// Half-open interval overlap test -- used by reserveRingSpace() to decide
+// whether a candidate write range would stomp on a still-unreclaimed
+// PendingRegion [matrix-issue28 rows 5/6].
+bool regionsOverlap(VkDeviceSize start, VkDeviceSize size, VkDeviceSize otherStart, VkDeviceSize otherEnd) {
+    return !(start + size <= otherStart || otherEnd <= start);
+}
+
 }  // namespace
 
 std::optional<Uploader> Uploader::create(Allocator& allocator, Device& device, VkDeviceSize ringBufferSize) {
@@ -32,10 +39,10 @@ std::optional<Uploader> Uploader::create(Allocator& allocator, Device& device, V
 
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    // RESET_COMMAND_BUFFER_BIT: beginRecordingIfNeeded() re-begins the same
-    // single command buffer every flush() cycle for this Uploader's whole
-    // lifetime, via an explicit vkResetCommandBuffer -- same reasoning as
-    // rx::rhi::CommandContext's own pool (command.cpp).
+    // RESET_COMMAND_BUFFER_BIT: beginRecordingIfNeeded() individually
+    // resets whichever command-buffer slot it picks (never the whole pool
+    // at once) every time a new batch starts recording -- see the class
+    // comment's "COMMAND-BUFFER ROTATION" paragraph in upload.h.
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = device.graphicsQueueFamily();
 
@@ -45,28 +52,29 @@ std::optional<Uploader> Uploader::create(Allocator& allocator, Device& device, V
         return std::nullopt;
     }
 
-    VkCommandBufferAllocateInfo cmdAllocInfo{};
-    cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cmdAllocInfo.commandPool = pool;
-    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmdAllocInfo.commandBufferCount = 1;
+    // Timeline semaphore [Phase 4 Task 11, spec D25 as amended by gate
+    // ruling RC4]: the ticket-completion primitive for this Uploader's
+    // whole lifetime, replacing the single reused VkFence every flush()
+    // used to vkResetFences()+resubmit into (matrix-issue28 row 1 --
+    // reset-while-referenced hazard the moment flush() stops blocking).
+    // Core Vulkan 1.2 (VK_KHR_timeline_semaphore's functionality is fully
+    // subsumed into 1.2 core, confirmed against the Khronos registry man
+    // page), no extension gating needed on this project's Vulkan 1.3
+    // baseline. Starts at counter value 0 -- see UploadTicket's own
+    // comment on why that makes value == 0 a safe "always complete"
+    // sentinel with no special-casing needed in isComplete()/wait().
+    VkSemaphoreTypeCreateInfo timelineTypeInfo{};
+    timelineTypeInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    timelineTypeInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    timelineTypeInfo.initialValue = 0;
 
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    if (vkAllocateCommandBuffers(vkDevice, &cmdAllocInfo, &cmd) != VK_SUCCESS) {
-        RX_LOG_ERROR("Uploader::create: vkAllocateCommandBuffers failed");
-        vkDestroyCommandPool(vkDevice, pool, nullptr);
-        return std::nullopt;
-    }
+    VkSemaphoreCreateInfo semaphoreInfo{};
+    semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    semaphoreInfo.pNext = &timelineTypeInfo;
 
-    // Created unsignaled -- flush() always submits before it ever waits on
-    // this fence, so there is no "first wait must return immediately"
-    // requirement the way FrameSync's per-slot fences have.
-    VkFenceCreateInfo fenceInfo{};
-    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-
-    VkFence fence = VK_NULL_HANDLE;
-    if (vkCreateFence(vkDevice, &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
-        RX_LOG_ERROR("Uploader::create: vkCreateFence failed");
+    VkSemaphore timelineSemaphore = VK_NULL_HANDLE;
+    if (vkCreateSemaphore(vkDevice, &semaphoreInfo, nullptr, &timelineSemaphore) != VK_SUCCESS) {
+        RX_LOG_ERROR("Uploader::create: vkCreateSemaphore (timeline) failed");
         vkDestroyCommandPool(vkDevice, pool, nullptr);
         return std::nullopt;
     }
@@ -76,17 +84,17 @@ std::optional<Uploader> Uploader::create(Allocator& allocator, Device& device, V
     // in-scope call site this task itself categorizes explicitly (every
     // other existing call site keeps createUploadRingBuffer()'s own
     // Staging default anyway, so this is a documentation-of-intent change,
-    // not a behavior change).
+    // not a behavior change). Unchanged by Task 11.
     auto ringBuffer =
         allocator.createUploadRingBuffer(ringBufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemoryCategory::Staging);
     if (!ringBuffer.has_value()) {
         RX_LOG_ERROR("Uploader::create: failed to allocate the {}-byte staging ring buffer", ringBufferSize);
-        vkDestroyFence(vkDevice, fence, nullptr);
+        vkDestroySemaphore(vkDevice, timelineSemaphore, nullptr);
         vkDestroyCommandPool(vkDevice, pool, nullptr);
         return std::nullopt;
     }
 
-    return Uploader(vkDevice, queue, pool, cmd, fence, std::move(*ringBuffer), ringBufferSize);
+    return Uploader(vkDevice, queue, pool, timelineSemaphore, std::move(*ringBuffer), ringBufferSize);
 }
 
 void Uploader::beginRecordingIfNeeded() {
@@ -94,16 +102,56 @@ void Uploader::beginRecordingIfNeeded() {
         return;
     }
 
-    vkResetCommandBuffer(cmd_, 0);
+    // Pick any command-buffer slot whose last submission (if any) is
+    // already confirmed complete; grow the rotation with a freshly
+    // allocated buffer if none is free rather than block -- see the class
+    // comment's "COMMAND-BUFFER ROTATION" paragraph in upload.h for why a
+    // single reused buffer is unsafe once flush() no longer blocks, and
+    // why "grow, never block" is the deliberate policy here (blocking
+    // inside a call this class does not time-bound -- unlike flush()/
+    // isComplete(), which the wall-clock test does bound -- would just
+    // relocate the hazard rather than remove it).
+    size_t freeSlot = kInvalidSlot;
+    for (size_t i = 0; i < cmdSlots_.size(); ++i) {
+        if (!cmdSlots_[i].everSubmitted || isComplete(cmdSlots_[i].lastTicket)) {
+            freeSlot = i;
+            break;
+        }
+    }
+
+    if (freeSlot == kInvalidSlot) {
+        VkCommandBufferAllocateInfo cmdAllocInfo{};
+        cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cmdAllocInfo.commandPool = pool_;
+        cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cmdAllocInfo.commandBufferCount = 1;
+
+        VkCommandBuffer newCmd = VK_NULL_HANDLE;
+        if (vkAllocateCommandBuffers(device_, &cmdAllocInfo, &newCmd) != VK_SUCCESS) {
+            RX_LOG_ERROR("Uploader: vkAllocateCommandBuffers failed while growing the command-buffer rotation");
+            return;
+        }
+        cmdSlots_.push_back(CmdSlot{newCmd, UploadTicket{}, false});
+        freeSlot = cmdSlots_.size() - 1;
+    }
+
+    vkResetCommandBuffer(cmdSlots_[freeSlot].cmd, 0);
 
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkBeginCommandBuffer(cmd_, &beginInfo) != VK_SUCCESS) {
+    if (vkBeginCommandBuffer(cmdSlots_[freeSlot].cmd, &beginInfo) != VK_SUCCESS) {
         RX_LOG_ERROR("Uploader: vkBeginCommandBuffer failed");
         return;
     }
+    activeSlot_ = freeSlot;
     recording_ = true;
+}
+
+void Uploader::reclaimCompletedRegions() {
+    while (!pendingRegions_.empty() && isComplete(pendingRegions_.front().ticket)) {
+        pendingRegions_.pop_front();
+    }
 }
 
 bool Uploader::reserveRingSpace(VkDeviceSize size, VkDeviceSize& outOffset) {
@@ -120,11 +168,33 @@ bool Uploader::reserveRingSpace(VkDeviceSize size, VkDeviceSize& outOffset) {
     VkDeviceSize aligned = alignUp(ringCursor_, kRingAlignment);
     if (aligned + size > ringBufferSize_) {
         // Not enough room left before the ring buffer's end -- flush what
-        // is already recorded (submits + waits, per the class comment),
-        // which resets ringCursor_ back to 0, then restart there. Already
-        // known to fit: `size <= ringBufferSize_` was just checked above.
+        // is already recorded (submits it and tracks its ring range in
+        // pendingRegions_, per flush()'s own comment; does NOT wait) and
+        // start a new "lap" at offset 0. Already known to fit: `size <=
+        // ringBufferSize_` was just checked above.
         flush();
+        ringCursor_ = 0;
+        lastFlushRingCursor_ = 0;
+        ++ringGeneration_;
         aligned = 0;
+    }
+
+    // D3D12-pattern ring reclamation [matrix-issue28 rows 5/6]: poll-
+    // reclaim every already-complete entry at the front of the queue
+    // first (never blocks); only if the requested range still overlaps
+    // the OLDEST remaining entry, block on THAT SPECIFIC ticket (never a
+    // whole-ring flush-and-wait) and retry. In steady state (a ring sized
+    // comfortably above the working set) this loop's body never runs --
+    // see upload_test.cpp's ring-wrap stress test, which asserts
+    // blockingRingWaitCount() stays below the number of flush() calls
+    // issued, proving partial reclaim actually engages rather than
+    // degenerating into "block every time."
+    reclaimCompletedRegions();
+    while (!pendingRegions_.empty() &&
+           regionsOverlap(aligned, size, pendingRegions_.front().start, pendingRegions_.front().end)) {
+        ++blockingRingWaitCount_;
+        wait(pendingRegions_.front().ticket);
+        reclaimCompletedRegions();
     }
 
     outOffset = aligned;
@@ -191,7 +261,7 @@ bool Uploader::uploadToBuffer(Buffer& dst, VkDeviceSize dstOffset, const void* d
     region.srcOffset = ringOffset;
     region.dstOffset = dstOffset;
     region.size = size;
-    vkCmdCopyBuffer(cmd_, ringBuffer_.handle(), dst.handle(), 1, &region);
+    vkCmdCopyBuffer(activeCmd(), ringBuffer_.handle(), dst.handle(), 1, &region);
     return true;
 }
 
@@ -211,6 +281,7 @@ bool Uploader::uploadToImage(Texture2D& dst, const void* pixels, VkDeviceSize pi
     ringBuffer_.flush(ringOffset, pixelBytes);
 
     beginRecordingIfNeeded();
+    VkCommandBuffer cmd = activeCmd();
 
     // Every level starts VK_IMAGE_LAYOUT_UNDEFINED (image creation's
     // initialLayout) -- transitioning the whole resource at once via the
@@ -218,7 +289,7 @@ bool Uploader::uploadToImage(Texture2D& dst, const void* pixels, VkDeviceSize pi
     // level-0-only transition here, since every level but 0 needs this
     // exact same UNDEFINED -> TRANSFER_DST_OPTIMAL step before
     // recordMipChainBlit() below can transition them again individually.
-    transitionImage(cmd_, dst.image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    transitionImage(cmd, dst.image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
     VkBufferImageCopy region{};
     region.bufferOffset = ringOffset;
@@ -227,7 +298,7 @@ bool Uploader::uploadToImage(Texture2D& dst, const void* pixels, VkDeviceSize pi
     region.imageSubresource.baseArrayLayer = 0;
     region.imageSubresource.layerCount = 1;
     region.imageExtent = {dst.extent().width, dst.extent().height, 1};
-    vkCmdCopyBufferToImage(cmd_, ringBuffer_.handle(), dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    vkCmdCopyBufferToImage(cmd, ringBuffer_.handle(), dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
     if (generateMips) {
         // Handles every level's per-level barriers + blits, and leaves
@@ -245,58 +316,148 @@ bool Uploader::uploadToImage(Texture2D& dst, const void* pixels, VkDeviceSize pi
         // branch unreachable through this public API at all (flagged in
         // this task's own review; see texture_test.cpp's dedicated
         // single-mip test).
-        dst.recordMipChainBlit(cmd_);
+        dst.recordMipChainBlit(cmd);
     } else {
-        transitionImage(cmd_, dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        transitionImage(cmd, dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
     return true;
 }
 
-void Uploader::flush() {
+UploadTicket Uploader::flush() {
+    RX_ASSERT_MAIN_THREAD("Uploader::flush");
+
     if (!recording_) {
-        return;
+        // Nothing recorded since the last flush() (or since create()) --
+        // matches this class's pre-Task-11 no-op flush() exactly, and per
+        // matrix-issue28 rows 8/9 this is ALSO the correct ticket for a
+        // batch that only ever took the direct memcpy path: zero fence/
+        // semaphore machinery touched, ticket reports complete on this
+        // same call stack, no waiting required.
+        return UploadTicket{0, ringGeneration_};
     }
 
-    if (vkEndCommandBuffer(cmd_) != VK_SUCCESS) {
+    CmdSlot& slot = cmdSlots_[activeSlot_];
+    if (vkEndCommandBuffer(slot.cmd) != VK_SUCCESS) {
         RX_LOG_ERROR("Uploader::flush: vkEndCommandBuffer failed");
         recording_ = false;
-        ringCursor_ = 0;
-        return;
+        activeSlot_ = kInvalidSlot;
+        return UploadTicket{0, ringGeneration_};
     }
+
+    // Monotonically increasing counter value this submission signals --
+    // never reused, never reset (the whole point of the timeline-
+    // semaphore redesign; see the class comment's "TICKET PRIMITIVE"
+    // paragraph). A value is consumed here even if the submit below fails,
+    // deliberately: no caller can be holding a ticket for a value that was
+    // never actually signaled (flush() only ever returns the trivially-
+    // complete sentinel on failure, below), so skipping a value on failure
+    // is simpler and just as correct as trying to roll the counter back.
+    const uint64_t ticketValue = ++lastQueuedValue_;
+
+    VkTimelineSemaphoreSubmitInfo timelineInfo{};
+    timelineInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+    timelineInfo.signalSemaphoreValueCount = 1;
+    timelineInfo.pSignalSemaphoreValues = &ticketValue;
 
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.pNext = &timelineInfo;
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd_;
+    submitInfo.pCommandBuffers = &slot.cmd;
+    submitInfo.signalSemaphoreCount = 1;
+    submitInfo.pSignalSemaphores = &timelineSemaphore_;
 
-    if (vkResetFences(device_, 1, &fence_) != VK_SUCCESS) {
-        RX_LOG_ERROR("Uploader::flush: vkResetFences failed");
-    }
-    if (vkQueueSubmit(queue_, 1, &submitInfo, fence_) != VK_SUCCESS) {
+    if (vkQueueSubmit(queue_, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS) {
         RX_LOG_ERROR("Uploader::flush: vkQueueSubmit failed");
         recording_ = false;
-        ringCursor_ = 0;
+        activeSlot_ = kInvalidSlot;
+        return UploadTicket{0, ringGeneration_};
+    }
+
+    UploadTicket ticket{ticketValue, ringGeneration_};
+    slot.lastTicket = ticket;
+    slot.everSubmitted = true;
+
+    // Track the ring range this batch actually wrote (buffer staging
+    // and/or image staging both advance ringCursor_ identically) so
+    // reserveRingSpace()'s reclamation loop can poll/wait on it later --
+    // see the class comment's "RING RECLAMATION" paragraph. A batch that
+    // recorded real GPU work but never touched the ring at all is not
+    // possible: uploadToImage() always reserves ring space, and
+    // uploadToBuffer()'s staging branch (the only branch that calls
+    // beginRecordingIfNeeded()) does too -- so `recording_` being true
+    // here guarantees ringCursor_ > lastFlushRingCursor_.
+    if (ringCursor_ > lastFlushRingCursor_) {
+        pendingRegions_.push_back(PendingRegion{ticket, lastFlushRingCursor_, ringCursor_});
+        lastFlushRingCursor_ = ringCursor_;
+    }
+
+    recording_ = false;
+    activeSlot_ = kInvalidSlot;
+    return ticket;
+}
+
+bool Uploader::isComplete(UploadTicket ticket) const {
+    RX_ASSERT_MAIN_THREAD("Uploader::isComplete");
+
+    // The trivially-complete sentinel (see UploadTicket's own comment):
+    // the timeline semaphore starts at 0 and only ever counts up, so
+    // `current >= 0` is unconditionally true -- skip the Vulkan call
+    // entirely rather than spending one just to confirm the obvious.
+    if (ticket.value == 0) {
+        return true;
+    }
+
+    uint64_t current = 0;
+    VkResult result = vkGetSemaphoreCounterValue(device_, timelineSemaphore_, &current);
+    if (result != VK_SUCCESS) {
+        // Loud and named, never silently treated as either complete or
+        // incomplete [plan Task 11 scope summary] -- this is genuinely
+        // exceptional (device loss / out-of-memory territory, per the
+        // vkGetSemaphoreCounterValue man page), not a normal "not yet"
+        // outcome, so it gets its own ERROR line distinct from a plain
+        // `false` return.
+        RX_LOG_ERROR("Uploader::isComplete: vkGetSemaphoreCounterValue failed (VkResult {})",
+                     static_cast<int>(result));
+        return false;
+    }
+    return current >= ticket.value;
+}
+
+void Uploader::wait(UploadTicket ticket) const {
+    RX_ASSERT_MAIN_THREAD("Uploader::wait");
+
+    if (ticket.value == 0) {
         return;
     }
 
-    // Synchronous by design -- see the class comment in upload.h for why
-    // this is an acceptable Phase 2 choice.
-    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
-
-    recording_ = false;
-    ringCursor_ = 0;
+    VkSemaphoreWaitInfo waitInfo{};
+    waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    waitInfo.semaphoreCount = 1;
+    waitInfo.pSemaphores = &timelineSemaphore_;
+    waitInfo.pValues = &ticket.value;
+    VkResult result = vkWaitSemaphores(device_, &waitInfo, UINT64_MAX);
+    if (result != VK_SUCCESS) {
+        RX_LOG_ERROR("Uploader::wait: vkWaitSemaphores failed (VkResult {})", static_cast<int>(result));
+    }
 }
 
 Uploader::Uploader(Uploader&& other) noexcept
     : device_(other.device_),
       queue_(other.queue_),
       pool_(other.pool_),
-      cmd_(other.cmd_),
-      fence_(other.fence_),
+      timelineSemaphore_(other.timelineSemaphore_),
+      lastQueuedValue_(other.lastQueuedValue_),
+      cmdSlots_(std::move(other.cmdSlots_)),
+      activeSlot_(other.activeSlot_),
       ringBuffer_(std::move(other.ringBuffer_)),
       ringBufferSize_(other.ringBufferSize_),
       ringCursor_(other.ringCursor_),
+      lastFlushRingCursor_(other.lastFlushRingCursor_),
+      pendingRegions_(std::move(other.pendingRegions_)),
+      ringGeneration_(other.ringGeneration_),
+      blockingRingWaitCount_(other.blockingRingWaitCount_),
       recording_(other.recording_),
       everUsedDirectPath_(other.everUsedDirectPath_),
       everUsedStagingPath_(other.everUsedStagingPath_),
@@ -305,10 +466,16 @@ Uploader::Uploader(Uploader&& other) noexcept
     other.device_ = VK_NULL_HANDLE;
     other.queue_ = VK_NULL_HANDLE;
     other.pool_ = VK_NULL_HANDLE;
-    other.cmd_ = VK_NULL_HANDLE;
-    other.fence_ = VK_NULL_HANDLE;
+    other.timelineSemaphore_ = VK_NULL_HANDLE;
+    other.lastQueuedValue_ = 0;
+    other.cmdSlots_.clear();
+    other.activeSlot_ = kInvalidSlot;
     other.ringBufferSize_ = 0;
     other.ringCursor_ = 0;
+    other.lastFlushRingCursor_ = 0;
+    other.pendingRegions_.clear();
+    other.ringGeneration_ = 0;
+    other.blockingRingWaitCount_ = 0;
     other.recording_ = false;
     other.everUsedDirectPath_ = false;
     other.everUsedStagingPath_ = false;
@@ -323,13 +490,19 @@ Uploader& Uploader::operator=(Uploader&& other) noexcept {
         device_ = other.device_;
         queue_ = other.queue_;
         pool_ = other.pool_;
-        cmd_ = other.cmd_;
-        fence_ = other.fence_;
+        timelineSemaphore_ = other.timelineSemaphore_;
+        lastQueuedValue_ = other.lastQueuedValue_;
+        cmdSlots_ = std::move(other.cmdSlots_);
+        activeSlot_ = other.activeSlot_;
         // Buffer's own move-assignment destroys ringBuffer_'s previous
         // contents (if any) before taking over other.ringBuffer_'s.
         ringBuffer_ = std::move(other.ringBuffer_);
         ringBufferSize_ = other.ringBufferSize_;
         ringCursor_ = other.ringCursor_;
+        lastFlushRingCursor_ = other.lastFlushRingCursor_;
+        pendingRegions_ = std::move(other.pendingRegions_);
+        ringGeneration_ = other.ringGeneration_;
+        blockingRingWaitCount_ = other.blockingRingWaitCount_;
         recording_ = other.recording_;
         everUsedDirectPath_ = other.everUsedDirectPath_;
         everUsedStagingPath_ = other.everUsedStagingPath_;
@@ -339,10 +512,16 @@ Uploader& Uploader::operator=(Uploader&& other) noexcept {
         other.device_ = VK_NULL_HANDLE;
         other.queue_ = VK_NULL_HANDLE;
         other.pool_ = VK_NULL_HANDLE;
-        other.cmd_ = VK_NULL_HANDLE;
-        other.fence_ = VK_NULL_HANDLE;
+        other.timelineSemaphore_ = VK_NULL_HANDLE;
+        other.lastQueuedValue_ = 0;
+        other.cmdSlots_.clear();
+        other.activeSlot_ = kInvalidSlot;
         other.ringBufferSize_ = 0;
         other.ringCursor_ = 0;
+        other.lastFlushRingCursor_ = 0;
+        other.pendingRegions_.clear();
+        other.ringGeneration_ = 0;
+        other.blockingRingWaitCount_ = 0;
         other.recording_ = false;
         other.everUsedDirectPath_ = false;
         other.everUsedStagingPath_ = false;
@@ -353,20 +532,32 @@ Uploader& Uploader::operator=(Uploader&& other) noexcept {
 }
 
 Uploader::~Uploader() {
-    // Auto-flush pending (recorded-but-not-yet-submitted) work before
-    // tearing anything down -- see the class comment in upload.h. Safe
-    // unconditionally: flush() itself no-ops if nothing is recording.
+    // Auto-flush pending (recorded-but-not-yet-submitted) work, then wait
+    // for EVERY ticket this Uploader ever queued -- not just the one this
+    // final flush() itself returns, which could be the trivially-complete
+    // sentinel even while an earlier, still-outstanding batch a caller
+    // never waited/polled on is genuinely still running on the GPU. See
+    // the class comment's paragraph on ticket ordering: waiting on the
+    // single highest value ever queued transitively covers every earlier
+    // one too, since they all signal the same monotonic counter in
+    // submission order. Safe unconditionally on a moved-from Uploader:
+    // flush() itself no-ops (recording_ is false), and
+    // lastQueuedValue_ == 0 skips the wait below.
     flush();
+    if (lastQueuedValue_ > 0) {
+        wait(UploadTicket{lastQueuedValue_, ringGeneration_});
+    }
     destroyAll();
 }
 
 void Uploader::destroyAll() {
-    if (fence_ != VK_NULL_HANDLE) {
-        vkDestroyFence(device_, fence_, nullptr);
+    if (timelineSemaphore_ != VK_NULL_HANDLE) {
+        vkDestroySemaphore(device_, timelineSemaphore_, nullptr);
     }
     if (pool_ != VK_NULL_HANDLE) {
-        // Implicitly frees cmd_ (allocated from this pool) -- no separate
-        // vkFreeCommandBuffers call needed, same as FrameSync's pools.
+        // Implicitly frees every command buffer ever allocated from it
+        // (every cmdSlots_ entry) -- no separate vkFreeCommandBuffers call
+        // needed, same as FrameSync's own pools.
         vkDestroyCommandPool(device_, pool_, nullptr);
     }
 }

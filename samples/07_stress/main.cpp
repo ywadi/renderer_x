@@ -975,7 +975,12 @@ std::optional<Scene> createScene(VkPhysicalDevice physicalDevice, VkDevice devic
         destroyScene(device, scene);
         return std::nullopt;
     }
-    uploader.flush();
+    // [Phase 4 Task 11, spec D25] Uploader::flush() no longer blocks on
+    // its own -- wait() explicitly to preserve this setup path's prior
+    // guarantee byte-identically (out of this task's primary migration
+    // scope; instance data is uploaded ONCE, before the frame loop, so
+    // blocking here has no per-frame cost).
+    uploader.wait(uploader.flush());
     scene.instanceBufferHandle =
         scene.bindlessTable.registerStorageBuffer(scene.instanceBuffer->handle(), instanceBufferSize);
     if (!scene.instanceBufferHandle.isValid()) {

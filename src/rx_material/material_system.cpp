@@ -1850,7 +1850,13 @@ TextureHandle MaterialSystem::createTexture2D(const TextureCreateInfo& info) {
                                        info.generateMips)) {
         throw std::runtime_error("rx_material: MaterialSystem::createTexture2D: Uploader::uploadToImage failed");
     }
-    impl.uploader->flush();
+    // [Phase 4 Task 11, spec D25] Uploader::flush() no longer blocks on its
+    // own -- createTexture2D() is a public, synchronous API contract
+    // (`rx_material/rx_api.h`: the returned handle is immediately safe to
+    // bind/sample), so this call site explicitly wait()s on the ticket to
+    // preserve that contract byte-identically, exactly like
+    // MeshBuffers::create()'s own documented choice.
+    impl.uploader->wait(impl.uploader->flush());
 
     rx::rhi::BindlessHandle bindlessHandle =
         impl.bindless->registerSampledImage(texture->view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);

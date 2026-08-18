@@ -903,7 +903,8 @@ bool evictOldestAndStreamInNext(VkPhysicalDevice physicalDevice, VkDevice device
     // so there is no in-flight hazard here whatsoever -- only the
     // eventual registerSampledImage() call (which WRITES a descriptor
     // slot -- deterministically the one just released above, see
-    // "DESCRIPTOR REWRITE SAFETY") needs to wait.
+    // "DESCRIPTOR REWRITE SAFETY") needs the upload to be genuinely done
+    // first.
     auto newTexture = rx::rhi::Texture2D::create(physicalDevice, device, allocator,
                                                   VkExtent2D{kTextureSize, kTextureSize}, kTextureFormat,
                                                   VK_IMAGE_USAGE_SAMPLED_BIT, /*requestedMipLevels=*/1);
@@ -916,7 +917,16 @@ bool evictOldestAndStreamInNext(VkPhysicalDevice physicalDevice, VkDevice device
         RX_LOG_ERROR("sample_04_streaming: uploadToImage failed for logical texture {}", incoming);
         return false;
     }
-    uploader.flush();
+    // [Phase 4 Task 11, spec D25] THE migration this sample exists to
+    // demonstrate: flush() no longer blocks here -- it returns a pollable
+    // UploadTicket immediately (this call used to stall the main/render
+    // thread for the whole GPU copy, per claim-validation-2026-08-18's
+    // claim 1, the origin of this ticket). The eviction-cycle's
+    // completion-dependent step (the descriptor rewrite below) becomes an
+    // EXPLICIT poll-or-wait choice instead of an accidental block: this
+    // callback polls isComplete() first (see below) rather than assuming
+    // completion the way the old blocking flush() made implicit.
+    rx::rhi::UploadTicket uploadTicket = uploader.flush();
     std::shared_ptr<rx::rhi::Texture2D> incomingTexture = std::make_shared<rx::rhi::Texture2D>(std::move(*newTexture));
 
     // THE fix: both halves of this eviction cycle -- destroying the
@@ -925,13 +935,32 @@ bool evictOldestAndStreamInNext(VkPhysicalDevice physicalDevice, VkDevice device
     // ONE DeletionQueue retirement tagged with the CURRENT frame number,
     // run only once that frame's fence is confirmed signaled (i.e. once
     // frame N-1, and everything before it, is also guaranteed complete --
-    // see this file's header comment). `scene` is captured by raw pointer:
-    // safe because this callback only ever runs from inside
-    // onFrameFenceSignaled()/flushAll(), both called on `scene`'s owning
-    // frame loop / destroyScene() while `scene` itself is still alive.
+    // see this file's header comment). `scene`/`uploader` are captured by
+    // raw pointer: safe because this callback only ever runs from inside
+    // onFrameFenceSignaled()/flushAll(), both called on `scene`'s/
+    // `uploader`'s owning frame loop / destroyScene() while both are
+    // still alive.
     Scene* scenePtr = &scene;
+    rx::rhi::Uploader* uploaderPtr = &uploader;
     scene.deletionQueue.retire(
-        [scenePtr, victimTexture, incomingTexture, incoming]() {
+        [scenePtr, uploaderPtr, uploadTicket, victimTexture, incomingTexture, incoming]() {
+            // [Phase 4 Task 11] Poll first -- the expected, common case:
+            // by the time this callback runs (at least kFramesInFlight
+            // frames after the upload was issued, on the SAME queue as
+            // every frame's own submission -- see this file's header
+            // comment), the copy is essentially always already complete,
+            // so isComplete() here is a cheap, non-blocking confirmation,
+            // not a stall. wait() is a defensive fallback for the
+            // vanishingly rare case it somehow is not -- logged loudly so
+            // a genuine stall here is visible, not silently eaten.
+            if (!uploaderPtr->isComplete(uploadTicket)) {
+                RX_LOG_WARN(
+                    "sample_04_streaming: incoming texture {} not yet complete at deferred descriptor-rewrite "
+                    "time -- falling back to an explicit wait()",
+                    incoming);
+                uploaderPtr->wait(uploadTicket);
+            }
+
             // victimTexture's Texture2D is destroyed as an ordinary side
             // effect of this closure (and its captured shared_ptr) being
             // destroyed once DeletionQueue removes this entry -- nothing
@@ -1049,7 +1078,14 @@ std::optional<Scene> createScene(VkPhysicalDevice physicalDevice, VkDevice devic
         }
         scene.residencyOrder.push_back(i);
     }
-    uploader.flush();
+    // [Phase 4 Task 11, spec D25] Uploader::flush() no longer blocks on
+    // its own -- wait() explicitly here (setup time, before the frame
+    // loop and before any registerSampledImage() call above reads
+    // texture data, so blocking has zero per-frame cost): a deliberate,
+    // reviewable choice, matching MeshBuffers::create()'s own documented
+    // convenience -- the eviction cycle below (evictOldestAndStreamInNext())
+    // is this sample's real per-frame migration target instead.
+    uploader.wait(uploader.flush());
 
     if (!buildScenePipeline(device, scene.bindlessTable, colorFormat, scene)) {
         destroyScene(device, scene);
