@@ -671,3 +671,12 @@ $ wine rx_asset_gltf_gpu_tests.exe --validate        # 36/36, 635/635
   from the review process) were left unstaged, verified via `git
   status --short` immediately before `git add`.
 - No AI attribution in the commit message; author identity untouched.
+
+---
+COORDINATOR NOTE (2026-08-18, post-re-review): the pre-fix-round proof
+tables above (section 2B lines re KHR_materials_variants/emissive_strength
+and "Known gaps" item 2) are SUPERSEDED by the "Fix round 1" section —
+variants is now implemented primitive-level (not via warnExt) and
+emissive_strength is fixture-tested. Re-review confirmed the code/tests
+correct; only these earlier table rows are stale. Kept as-written for
+history; this note is the reconciliation.
