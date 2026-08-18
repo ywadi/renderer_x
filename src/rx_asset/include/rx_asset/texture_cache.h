@@ -201,6 +201,17 @@ public:
     // Main-thread-only (D5).
     [[nodiscard]] bool isUploadComplete(rx::rhi::UploadTicket ticket) const;
 
+    // [Fix round 1] Test/diagnostic-only: how many times THIS cache has
+    // ever called Uploader::wait() -- i.e. how many times loadFromBytes()
+    // (the blocking convenience) has actually blocked. The async import
+    // pipeline exclusively uses registerDecoded(), so this counter staying
+    // at its pre-import baseline throughout an async import is a DIRECT
+    // proof of "wait-calls-from-async-path == 0" (matrix-issue22), not
+    // merely inferred from wall-clock timing.
+    //
+    // Main-thread-only (D5).
+    [[nodiscard]] size_t waitCallCountForTesting() const;
+
     // [Task 15] Production-named release path for a texture
     // registerDecoded() created whose OWNING async import was cancelled
     // (or failed) before the registry ever exposed a handle referencing
@@ -404,6 +415,7 @@ private:
     bool anisotropySupported_ = false;
     float maxAnisotropy_ = 1.0F;
     uint32_t maxImageDimension2D_ = 0;
+    size_t waitCallCountForTesting_ = 0;
 
     // [FG9] Incrementally maintained by registerRealTexture() (+1) and
     // evictForTesting()'s deferred reclaim callback (-1) -- HandlePool

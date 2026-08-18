@@ -377,6 +377,18 @@ MeshRange GeometryPool::upload(std::span<const PoolVertex> vertices, std::span<c
         // which is not this call's job to do.
         return range;
     }
+    // [Fix round 1, matrix-issue22 "wait-calls-from-async-path == 0"
+    // direct assertion] Counted HERE, at the one call site in this whole
+    // class that ever calls Uploader::wait() -- uploadDeferred() below
+    // never does. The async import pipeline (registry.cpp) exclusively
+    // uses uploadDeferred()/flushPendingUploads()/isUploadComplete(), so
+    // this counter staying at its pre-import baseline throughout an async
+    // import is a DIRECT proof (not merely inferred from wall-clock
+    // timing) that the async path never reaches this line. Kept in
+    // rx_asset rather than as a new accessor on rx_rhi_vk's own Uploader
+    // (out of scope this fix round -- a separate, unrelated CI-red fix
+    // task holds exclusive ownership of src/rx_rhi_vk).
+    ++waitCallCountForTesting_;
     uploader_.wait(uploader_.flush());
     return range;
 }
@@ -394,6 +406,11 @@ rx::rhi::UploadTicket GeometryPool::flushPendingUploads() {
 bool GeometryPool::isUploadComplete(rx::rhi::UploadTicket ticket) const {
     RX_ASSERT_MAIN_THREAD("GeometryPool::isUploadComplete");
     return uploader_.isComplete(ticket);
+}
+
+size_t GeometryPool::waitCallCountForTesting() const {
+    RX_ASSERT_MAIN_THREAD("GeometryPool::waitCallCountForTesting");
+    return waitCallCountForTesting_;
 }
 
 void GeometryPool::free(const MeshRange& range) {

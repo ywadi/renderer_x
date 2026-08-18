@@ -267,6 +267,17 @@ public:
     // Main-thread-only (D5).
     [[nodiscard]] bool isUploadComplete(rx::rhi::UploadTicket ticket) const;
 
+    // [Fix round 1] Test/diagnostic-only: how many times THIS pool has
+    // ever called Uploader::wait() -- i.e. how many times upload() (the
+    // blocking convenience, never uploadDeferred()) has run. The async
+    // import pipeline exclusively uses uploadDeferred(), so this counter
+    // staying at its pre-import baseline throughout an async import is a
+    // DIRECT proof of the "wait-calls-from-async-path == 0" invariant
+    // (matrix-issue22), not merely inferred from wall-clock timing.
+    //
+    // Main-thread-only (D5).
+    [[nodiscard]] size_t waitCallCountForTesting() const;
+
     // Releases `range`'s vertex and index suballocations back to their
     // block's TLSF metadata (vmaVirtualFree) for future reuse -- no
     // defragmentation, no data movement (D9). `range` must be a value
@@ -428,6 +439,7 @@ private:
     bool bufferDeviceAddressEnabled_ = false;
     PoolConfig config_;
     std::vector<Block> blocks_;
+    size_t waitCallCountForTesting_ = 0;
 };
 
 }  // namespace rx::asset

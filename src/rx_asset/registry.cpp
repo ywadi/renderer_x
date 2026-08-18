@@ -100,18 +100,56 @@ void runAsyncImportPrepareStep(std::shared_ptr<AsyncImportJob> job);
 
 void pollAsyncImportUploads(std::shared_ptr<AsyncImportJob> job);
 
+// [Fix round 1] Abandon-path rollback, gated on outstanding upload
+// tickets actually completing first -- NOT a direct call to
+// marshalGltfImportRollback(). Found load-bearing by this task's own new
+// cancel-mid-upload rollback test (async_import_test.cpp), which
+// reproduced a genuine Vulkan validation error ("vkDestroyImage ... in
+// use by a command buffer") the first time it exercised cancellation
+// AFTER prepare() had already issued real upload tickets: freeing
+// GeometryPool's suballocation makes that memory range immediately
+// reusable by the very next upload (a write-after-write hazard against
+// the still-in-flight old copy), and releasing a TextureCache handle
+// whose DeletionQueue-tagged reclaim later runs risks destroying a
+// VkImage a still-in-flight transfer command buffer is writing into --
+// in BOTH cases, only once marshalGltfImportUploadsComplete() confirms
+// every ticket prepare() actually issued has genuinely finished on the
+// GPU is it safe to free/release. Never a blocking wait (D25's own "poll,
+// never a blocking wait" invariant, unchanged even on this abandon path)
+// -- re-posts itself via postToMain() exactly like the non-cancelled poll
+// loop below, until safe.
+void rollbackAsyncImportWhenSafe(std::shared_ptr<AsyncImportJob> job) {
+    if (job->pending && !marshalGltfImportUploadsComplete(*job->pool, job->textures, *job->pending)) {
+        rx::task::Scheduler* scheduler = job->scheduler;
+        scheduler->postToMain([job = std::move(job)]() mutable { rollbackAsyncImportWhenSafe(std::move(job)); });
+        return;
+    }
+    marshalGltfImportRollback(*job->pool, job->textures, std::move(job->pending));
+}
+
 void runAsyncImportPrepareStep(std::shared_ptr<AsyncImportJob> job) {
     if (job->cancelled.load(std::memory_order_acquire) || job->registry == nullptr) {
-        marshalGltfImportRollback(*job->pool, job->textures, std::move(job->pending));
+        rollbackAsyncImportWhenSafe(std::move(job));
         return;
     }
     const bool more = marshalGltfImportPrepareStep(*job->pool, job->textures, *job->pending);
+    rx::task::Scheduler* scheduler = job->scheduler;
     if (more) {
-        rx::task::Scheduler* scheduler = job->scheduler;
         scheduler->postToMain([job = std::move(job)]() mutable { runAsyncImportPrepareStep(std::move(job)); });
         return;
     }
-    pollAsyncImportUploads(std::move(job));
+    // [Fix round 1] Deliberately a SEPARATE postToMain() tick rather than
+    // an inline call: keeps every pumpMain() call doing exactly one
+    // bounded unit of work (prepare-step OR poll-check, never both in the
+    // same call -- the same "never batch two units into one call" posture
+    // the RC6 wall-clock budget already requires elsewhere), and gives a
+    // deterministic, non-racy window (one pumpMain() tick wide) between
+    // "every GPU resource this import needs is now registered" and "the
+    // first upload-ticket completion check runs" -- load-bearing for this
+    // task's own cancel-mid-upload rollback test (async_import_test.cpp),
+    // which needs to observe "fully prepared" and call cancelImport()
+    // before any poll/finalize has a chance to run.
+    scheduler->postToMain([job = std::move(job)]() mutable { pollAsyncImportUploads(std::move(job)); });
 }
 
 // [Task 15] Poll step -- re-posts itself via postToMain() until every
@@ -122,8 +160,10 @@ void runAsyncImportPrepareStep(std::shared_ptr<AsyncImportJob> job) {
 void pollAsyncImportUploads(std::shared_ptr<AsyncImportJob> job) {
     if (job->cancelled.load(std::memory_order_acquire) || job->registry == nullptr) {
         // Abandon semantics: no registry mutation, no callback -- release
-        // whatever prepare() already registered GPU-side.
-        marshalGltfImportRollback(*job->pool, job->textures, std::move(job->pending));
+        // whatever prepare() already registered GPU-side, once it is
+        // actually safe to (see rollbackAsyncImportWhenSafe()'s own
+        // comment above).
+        rollbackAsyncImportWhenSafe(std::move(job));
         return;
     }
     if (!marshalGltfImportUploadsComplete(*job->pool, job->textures, *job->pending)) {

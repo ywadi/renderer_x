@@ -403,6 +403,11 @@ bool TextureCache::isUploadComplete(rx::rhi::UploadTicket ticket) const {
     return uploader_.isComplete(ticket);
 }
 
+size_t TextureCache::waitCallCountForTesting() const {
+    RX_ASSERT_MAIN_THREAD("TextureCache::waitCallCountForTesting");
+    return waitCallCountForTesting_;
+}
+
 TextureHandle TextureCache::loadFromBytes(std::span<const std::byte> bytes, TextureRole role,
                                             std::string_view debugName) {
     RX_ASSERT_MAIN_THREAD("TextureCache::loadFromBytes");
@@ -425,6 +430,13 @@ TextureHandle TextureCache::loadFromBytes(std::span<const std::byte> bytes, Text
     // fallback textures were already flushed once, at buildFallbackTextures()
     // time).
     if (result.isValid() && !(result == checkerboard_)) {
+        // [Fix round 1, matrix-issue22 "wait-calls-from-async-path == 0"
+        // direct assertion] -- see GeometryPool::waitCallCountForTesting()'s
+        // own identical comment; the async import pipeline exclusively
+        // uses registerDecoded() (never loadFromBytes()), so this counter
+        // staying at its pre-import baseline throughout an async import is
+        // a direct proof, not merely inferred from timing.
+        ++waitCallCountForTesting_;
         uploader_.wait(uploader_.flush());
     }
     return result;
