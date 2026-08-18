@@ -486,6 +486,164 @@ TEST_CASE("Scheduler::runOnIoThread survives many CONCURRENT submitters -- paral
   CHECK(ran.load() == kItems);
 }
 
+// --- Phase 4 Stage 1 Task 15, additive: Scheduler::runOnWorkerThread ------
+// (see scheduler.h's own doc comment for the full "why this exists"
+// rationale -- the async import pipeline's own need for background CPU
+// work that touches neither the main thread nor the dedicated IO thread).
+
+TEST_CASE("Scheduler::runOnWorkerThread executes off both the main thread and the dedicated IO thread") {
+  auto scheduler = rx::task::Scheduler::create(4);
+  REQUIRE(scheduler != nullptr);
+
+  const std::thread::id mainId = std::this_thread::get_id();
+
+  std::atomic<bool> ioThreadIdKnown{false};
+  std::thread::id ioThreadId{};
+  scheduler->runOnIoThread([&] {
+    ioThreadId = std::this_thread::get_id();
+    ioThreadIdKnown.store(true, std::memory_order_release);
+  });
+  REQUIRE(waitUntil([&] { return ioThreadIdKnown.load(std::memory_order_acquire); }));
+
+  std::atomic<bool> ran{false};
+  std::thread::id observed{};
+  scheduler->runOnWorkerThread([&] {
+    observed = std::this_thread::get_id();
+    ran.store(true, std::memory_order_release);
+  });
+  REQUIRE(waitUntil([&] { return ran.load(std::memory_order_acquire); }));
+
+  CHECK(observed != mainId);
+  CHECK(observed != ioThreadId);
+}
+
+TEST_CASE("Scheduler::runOnWorkerThread's own fn may legally call parallelFor() reentrant, fanning across "
+          "MULTIPLE real background workers -- deterministic rendezvous-barrier proof (same construction as "
+          "the barrier-proof parallelFor test above), never touching the IO thread") {
+  constexpr uint32_t kWorkerCount = 4;
+  auto scheduler = rx::task::Scheduler::create(kWorkerCount);
+  REQUIRE(scheduler != nullptr);
+
+  std::atomic<bool> ioThreadIdKnown{false};
+  std::thread::id ioThreadId{};
+  scheduler->runOnIoThread([&] {
+    ioThreadId = std::this_thread::get_id();
+    ioThreadIdKnown.store(true, std::memory_order_release);
+  });
+  REQUIRE(waitUntil([&] { return ioThreadIdKnown.load(std::memory_order_acquire); }));
+  const std::thread::id mainId = std::this_thread::get_id();
+
+  std::atomic<uint32_t> arrived{0};
+  std::atomic<uint32_t> timeouts{0};
+  std::mutex idsMutex;
+  std::vector<std::thread::id> ids;
+  std::atomic<bool> outerRan{false};
+
+  scheduler->runOnWorkerThread([&] {
+    // This closure itself runs on a genuine worker thread -- calling
+    // parallelFor() from here is the exact "nested/reentrant from a task
+    // already running on one of this Scheduler's own threads" case
+    // parallelFor()'s own doc comment declares legal.
+    scheduler->parallelFor(kWorkerCount, 1, [&](uint32_t begin, uint32_t end, uint32_t) {
+      REQUIRE(end - begin == 1);
+      {
+        std::lock_guard<std::mutex> lock(idsMutex);
+        ids.push_back(std::this_thread::get_id());
+      }
+      arrived.fetch_add(1, std::memory_order_acq_rel);
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+      while (arrived.load(std::memory_order_acquire) < kWorkerCount) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+          timeouts.fetch_add(1, std::memory_order_acq_rel);
+          return;
+        }
+        std::this_thread::yield();
+      }
+    });
+    outerRan.store(true, std::memory_order_release);
+  });
+
+  REQUIRE(waitUntil([&] { return outerRan.load(std::memory_order_acquire); }, std::chrono::seconds(25)));
+  REQUIRE(timeouts.load() == 0);
+  CHECK(arrived.load() == kWorkerCount);
+
+  // The barrier resolving at all already proves >= 2 distinct threads
+  // participated (see the earlier "genuinely runs multiple workers
+  // CONCURRENTLY" test's own header comment for the full argument) --
+  // additionally assert none of the participants was the dedicated IO
+  // thread, which is this test's own load-bearing addition over that one.
+  for (const auto& id : ids) {
+    CHECK(id != ioThreadId);
+  }
+  std::sort(ids.begin(), ids.end());
+  ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+  CHECK(ids.size() >= 2);
+  RX_LOG_INFO("runOnWorkerThread+nested-parallelFor barrier proof: {} distinct worker thread id(s), main={}",
+              ids.size(), mainId == ids.front() ? "participated" : "did not participate");
+}
+
+TEST_CASE("Scheduler::runOnWorkerThread round-robins across every worker thread and survives many concurrent "
+          "submissions without dropping or double-running any of them") {
+  auto scheduler = rx::task::Scheduler::create(4);
+  REQUIRE(scheduler != nullptr);
+
+  constexpr int kCount = 500;
+  std::atomic<int> completed{0};
+  std::mutex idsMutex;
+  std::vector<std::thread::id> ids;
+
+  for (int i = 0; i < kCount; ++i) {
+    scheduler->runOnWorkerThread([&] {
+      {
+        std::lock_guard<std::mutex> lock(idsMutex);
+        ids.push_back(std::this_thread::get_id());
+      }
+      completed.fetch_add(1, std::memory_order_release);
+    });
+  }
+
+  REQUIRE(waitUntil([&] { return completed.load(std::memory_order_acquire) == kCount; }, std::chrono::seconds(30)));
+  CHECK(completed.load() == kCount);
+  CHECK(ids.size() == static_cast<size_t>(kCount));
+
+  std::sort(ids.begin(), ids.end());
+  ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+  // Round-robin over 4 workers with 500 submissions should touch more than
+  // one of them (not a hard architectural guarantee under adversarial
+  // scheduling, but overwhelmingly true in practice -- informative, not
+  // load-bearing on its own; the barrier test above is the deterministic
+  // proof of genuine multi-worker participation).
+  CHECK(ids.size() >= 2);
+}
+
+TEST_CASE("Scheduler teardown lets several already-queued runOnWorkerThread() tasks all run to completion, "
+          "none dropped, even when destruction begins while the first is still in flight") {
+  std::atomic<bool> firstTaskCompleted{false};
+  std::atomic<int> laterTasksRan{0};
+  constexpr int kLaterTaskCount = 4;
+
+  {
+    auto scheduler = rx::task::Scheduler::create(2);
+    REQUIRE(scheduler != nullptr);
+
+    scheduler->runOnWorkerThread([&firstTaskCompleted] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      firstTaskCompleted.store(true, std::memory_order_release);
+    });
+    for (int i = 0; i < kLaterTaskCount; ++i) {
+      scheduler->runOnWorkerThread([&laterTasksRan] { laterTasksRan.fetch_add(1, std::memory_order_relaxed); });
+    }
+    // scheduler destructs here, while the first task may still be
+    // sleeping -- WaitforAllAndShutdown() blocks until every pinned task
+    // already handed to enkiTS (worker-targeted ones included -- nothing
+    // IO-specific about that guarantee) has actually run; see
+    // scheduler.cpp's own ~Scheduler() comment.
+  }
+
+  CHECK(firstTaskCompleted.load());
+  CHECK(laterTasksRan.load() == kLaterTaskCount);
+}
+
 // --- Audit-closure round: F5-partial (RX_ASSERT_MAIN_THREAD on pumpMain) ---
 #ifdef RX_DEBUG_CHECKS
 

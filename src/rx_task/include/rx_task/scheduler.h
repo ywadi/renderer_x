@@ -182,6 +182,60 @@ class Scheduler {
   // stuck `fn` stalls every runOnIoThread() call queued after it.
   void runOnIoThread(std::function<void()> fn);
 
+  // [Phase 4 Stage 1 Task 15, additive] Enqueues `fn` to run, later, on ONE
+  // of this Scheduler's regular background parallelFor() worker threads
+  // (round-robin over [1, workerCount()]) -- NEVER on the calling thread,
+  // NEVER on the main thread, and NEVER on the dedicated IO thread. Unlike
+  // runOnIoThread()'s target (a thread permanently dedicated to pinned
+  // tasks, via IoLoopTask's own infinite Execute() loop below), the target
+  // worker here is an ORDINARY parallelFor() participant: enkiTS's own
+  // per-thread dispatch loop (TaskingThreadFunction) already checks for
+  // and runs any pinned task addressed to it (TryRunTask() calls
+  // RunPinnedTasks() first, every iteration -- verified directly against
+  // the pinned enkiTS v1.12 source) as part of its NORMAL cycle, so this
+  // costs nothing beyond one enkiTS pinned-task dispatch and returns the
+  // worker to ordinary parallelFor() duty immediately after `fn` returns --
+  // no new thread is created, and workerCount() is unchanged.
+  //
+  // WHY THIS EXISTS [documented per the repository's "don't touch rx_task
+  // unless a genuine blocking defect forces it" policy -- flagged here
+  // prominently, see docs/threading.md's own cross-reference and the
+  // task-15-report.md rationale for the full analysis]: the async import
+  // pipeline (Task 15) needs to run CPU-heavy, potentially slow decode
+  // work (parse/transcode/tangent-generation/meshopt) via parallelFor()
+  // WITHOUT blocking the main thread and WITHOUT ever touching the
+  // dedicated IO thread (which must stay free for FIFO byte-source reads).
+  // Every OTHER Scheduler primitive fails at least one of those two
+  // requirements: parallelFor() itself may only legally be called from the
+  // main thread (blocks it for the call's whole duration -- unacceptable
+  // for a "deliberately slow decode" workload) or from a task already
+  // running on one of this Scheduler's own threads; runOnIoThread()'s own
+  // callback runs ON the dedicated IO thread, and calling parallelFor()
+  // FROM one nests into that same IO thread's own WaitforTask()
+  // participation (verified directly against the pinned enkiTS source:
+  // WaitforTask()'s spin loop calls TryRunTask() on the CALLING thread,
+  // which would let the IO thread itself execute decode chunks -- exactly
+  // the invariant Task 15 must not violate); and this Scheduler
+  // deliberately refuses arbitrary foreign threads (an unregistered
+  // caller's `gtl_threadNum` collides with thread 0's own enkiTS
+  // registration -- confirmed against the vendored source, not merely
+  // asserted by the class comment above). runOnWorkerThread()'s own `fn`
+  // runs on a genuine, ALREADY-registered enkiTS worker thread, so a
+  // NESTED parallelFor() call from inside it is both legal (per the
+  // paragraph above) and structurally incapable of reaching the IO thread
+  // (IoLoopTask's own Execute() loop never returns to enkiTS's ordinary
+  // TaskSet-stealing path at all, by construction -- see IoLoopTask below).
+  //
+  // Safe to call from any thread (mirrors runOnIoThread()'s own contract);
+  // `fn` itself may safely call parallelFor() (nested/reentrant, exactly
+  // as any worker-thread chunk callback may -- see parallelFor()'s own doc
+  // comment) or postToMain(). Multiple concurrent submissions are safe and
+  // do not need to target the same worker thread to be correct -- FIFO
+  // ordering across DIFFERENT target threads is not guaranteed (unlike
+  // runOnIoThread()'s single-thread FIFO contract), only per-target-thread
+  // ordering is.
+  void runOnWorkerThread(std::function<void()> fn);
+
   // Enqueues `fn` to run later, on whichever thread next calls pumpMain()
   // (intended to always be this Scheduler's main thread -- see the class
   // comment). FIFO relative to other postToMain() calls made from the

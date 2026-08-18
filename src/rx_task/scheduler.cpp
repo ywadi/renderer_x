@@ -97,13 +97,32 @@ std::atomic<size_t> g_lastDroppedIoTaskCount{0};
 // deleted early.
 class IoTask final : public enki::IPinnedTask {
  public:
+  // `trashMutex`: nullptr for the ORIGINAL IO-thread use (runOnIoThread())
+  // -- trash_ there is only ever touched by the single dedicated IO
+  // thread itself (IoTask::Execute() always runs ON that one thread, and
+  // IoLoopTask::reapPublished() only ever runs on that SAME thread, on its
+  // own loop cadence -- see IoLoopTask's own class comment), so no lock is
+  // needed and none was ever taken here before Task 15.
+  //
+  // [Phase 4 Stage 1 Task 15, additive] Non-null for the NEW
+  // runOnWorkerThread() use: unlike the IO case, an ordinary worker
+  // thread's Execute() call (this constructor's `threadNum` may be any
+  // regular worker) races a DIFFERENT thread's opportunistic reap
+  // (Scheduler::runOnWorkerThread()/~Scheduler(), which may run on the
+  // submitter's own thread, not the executing worker's) touching the
+  // exact same `trash` vector -- genuinely concurrent push_back() vs.
+  // reassignment without this lock (caught by this task's own test suite:
+  // a SIGSEGV under concurrent submission before this fix). Guarding this
+  // one push_back is the minimal fix; the reap side
+  // (reapPublishedTrash()) takes the identical mutex.
   IoTask(uint32_t threadNum, std::function<void()> fn, std::vector<IoTask*>& trash, std::mutex& outstandingMutex,
-         std::vector<IoTask*>& outstanding)
+         std::vector<IoTask*>& outstanding, std::mutex* trashMutex = nullptr)
       : enki::IPinnedTask(threadNum),
         fn_(std::move(fn)),
         trash_(trash),
         outstandingMutex_(outstandingMutex),
-        outstanding_(outstanding) {}
+        outstanding_(outstanding),
+        trashMutex_(trashMutex) {}
 
   void Execute() override {
     fn_();
@@ -114,7 +133,12 @@ class IoTask final : public enki::IPinnedTask {
         outstanding_.erase(it);
       }
     }
-    trash_.push_back(this);
+    if (trashMutex_ != nullptr) {
+      std::lock_guard<std::mutex> lock(*trashMutex_);
+      trash_.push_back(this);
+    } else {
+      trash_.push_back(this);
+    }
   }
 
   // Called by runOnIoThread(), on the submitter's own thread, strictly
@@ -131,6 +155,7 @@ class IoTask final : public enki::IPinnedTask {
   std::vector<IoTask*>& trash_;
   std::mutex& outstandingMutex_;
   std::vector<IoTask*>& outstanding_;
+  std::mutex* trashMutex_;
   std::atomic<bool> published_{false};
 };
 
@@ -233,7 +258,105 @@ struct Scheduler::Impl {
   // leaving them unreachable and unreclaimed.
   std::mutex outstandingIoMutex;
   std::vector<IoTask*> outstandingIo;
+
+  // [Phase 4 Stage 1 Task 15, additive -- runOnWorkerThread()] A SECOND,
+  // independent instance of the exact same "outstanding + trash, two-phase
+  // delete" bookkeeping IoTask/IoLoopTask already established above,
+  // reused verbatim (IoTask itself already takes `threadNum` as a plain
+  // constructor parameter -- nothing IO-specific inside it) for tasks
+  // targeting an ORDINARY worker thread instead of the dedicated IO
+  // thread. The one real difference from the IO case: there is no
+  // dedicated "IoLoopTask"-style infinite loop on a worker thread to reap
+  // this trash on its own cadence (an ordinary worker returns to normal
+  // parallelFor() duty the instant its pinned task's Execute() returns) --
+  // reapWorkerTrash() below is instead called opportunistically, once per
+  // runOnWorkerThread() submission (cheap: a linear scan of whatever is
+  // currently pending, almost always empty or tiny), plus once more,
+  // unconditionally, during ~Scheduler()'s own final drain -- mirroring
+  // the identical two call sites (Step 2/Step 3b below, and this class's
+  // own destructor) that already reap `outstandingIo`/`ioLoopTask->trash()`.
+  std::vector<IoTask*> workerTaskTrash;
+  // Guards workerTaskTrash specifically [Task 15 fix -- see IoTask's own
+  // updated class comment]: unlike IoLoopTask's own trash_ (single-thread
+  // touched by construction), this one is genuinely touched from both the
+  // EXECUTING worker thread (IoTask::Execute()'s push_back) and whichever
+  // thread calls runOnWorkerThread()/~Scheduler() (the reap side) --
+  // concurrently, in general.
+  std::mutex workerTaskTrashMutex;
+  std::mutex outstandingWorkerMutex;
+  std::vector<IoTask*> outstandingWorker;
+  // Round-robin cursor over [1, resolvedWorkerCount] (thread 0 is main,
+  // thread resolvedWorkerCount+1 is the dedicated IO thread -- see
+  // Scheduler::Scheduler()'s own thread-numbering comment). Plain
+  // (non-atomic) uint32_t incremented under no lock: a data race here
+  // would only ever produce a slightly-less-even distribution across
+  // workers (two concurrent callers picking the same target thread
+  // number), never an out-of-range one (the modulo below is applied to
+  // whatever value is read), so this is deliberately left unsynchronized
+  // rather than paying for an atomic on every submission.
+  uint32_t nextWorkerTaskThread = 0;
 };
+
+namespace {
+
+// Used by Scheduler::runOnWorkerThread()/~Scheduler() for the worker-task
+// trash list (see Impl::workerTaskTrash's own comment) -- IoTask's own
+// class-comment "two-phase delete" contract, PLUS a third gate this
+// free function adds that IoLoopTask::reapPublished() (the ORIGINAL,
+// IO-thread-only reaper, left untouched) never needed:
+//
+// THREE-WAY GATE, not two [bug found and fixed empirically by this task's
+// own ASan/ENKI_ASSERT-enabled repro -- `ENKI_ASSERT( GetIsComplete() )`
+// firing inside `~ICompletable()`, i.e. a genuine use-after-free of
+// enkiTS's OWN internal bookkeeping, not merely this wrapper's]: a task
+// must be (1) present in `trash` (this class's own "Execute() has run"
+// signal -- IoTask::Execute() pushes itself there), (2) isPublished()
+// (the F1 fix's "submitter's AddPinnedTask() call has fully returned"
+// signal), AND (3) task->GetIsComplete() (enkiTS's OWN completion flag,
+// `ICompletable::m_RunningCount == 0`, acquire-loaded here against the
+// release-store `TaskComplete()` performs). Gate (3) is the one this
+// class's ORIGINAL (IO-only) design got "for free" by construction: IO
+// tasks are only ever reaped by IoLoopTask's own loop, strictly AFTER its
+// own `scheduler_->RunPinnedTasks();` call has FULLY RETURNED for that
+// whole batch -- and RunPinnedTasks() is exactly what calls
+// `m_RunningCount.fetch_sub(...)` then `TaskComplete()` (the store that
+// sets GetIsComplete() true) for every task it runs, on the SAME thread,
+// strictly AFTER that task's own Execute() returns. Reaping on a
+// DIFFERENT thread (runOnWorkerThread()'s worker-task case, where the
+// reaper may be the SUBMITTER's thread, not the executing worker's) has
+// no such same-thread ordering to lean on: Execute() pushing `this` into
+// `trash` happens INSIDE Execute() itself, which can return (and this
+// task become reapable by gates (1)+(2) alone) BEFORE enkiTS's own
+// RunPinnedTasks() has gotten to its OWN post-Execute() lines on the
+// executing thread -- deleting at that point is a genuine race against
+// enkiTS's own internal writes to the same object. Gate (3) closes it:
+// GetIsComplete()'s acquire load only ever observes `true` once
+// TaskComplete()'s release store has happened, which (per the C++ memory
+// model) makes everything TaskComplete() itself already did
+// happen-before this reaper's own observation -- safe to delete after
+// that, from any thread.
+void reapPublishedTrash(std::vector<IoTask*>& trash, std::mutex& trashMutex) {
+  std::vector<IoTask*> current;
+  {
+    std::lock_guard<std::mutex> lock(trashMutex);
+    current.swap(trash);
+  }
+  std::vector<IoTask*> stillPending;
+  stillPending.reserve(current.size());
+  for (IoTask* task : current) {
+    if (task->isPublished() && task->GetIsComplete()) {
+      delete task;
+    } else {
+      stillPending.push_back(task);
+    }
+  }
+  if (!stillPending.empty()) {
+    std::lock_guard<std::mutex> lock(trashMutex);
+    trash.insert(trash.end(), stillPending.begin(), stillPending.end());
+  }
+}
+
+}  // namespace
 
 Scheduler::Scheduler(uint32_t workerCount) : impl_(std::make_unique<Impl>()) {
   impl_->resolvedWorkerCount = resolveWorkerCount(workerCount);
@@ -380,6 +503,38 @@ Scheduler::~Scheduler() {
   }
   impl_->ioLoopTask->trash().clear();
 
+  // [Task 15, additive] Identical final drain for runOnWorkerThread()'s own
+  // outstanding/trash pair -- WaitforAllAndShutdown() above already
+  // guarantees every pinned task handed to enkiTS (worker-targeted ones
+  // included, nothing IO-specific about that guarantee) has run to
+  // completion by this point, exactly like the IO-specific drain above.
+  std::vector<IoTask*> abandonedWorker;
+  {
+    std::lock_guard<std::mutex> lock(impl_->outstandingWorkerMutex);
+    abandonedWorker.swap(impl_->outstandingWorker);
+  }
+  for (IoTask* task : abandonedWorker) {
+    // GetIsComplete() gate: see reapPublishedTrash()'s own comment for why
+    // a worker-targeted task needs this third check where the IO-specific
+    // drain above does not (same-thread-ordering argument that does not
+    // hold across threads). WaitforAllAndShutdown() already guarantees
+    // this is true for everything reaching here in every realistic run;
+    // checked anyway rather than assumed.
+    if (task->isPublished() && task->GetIsComplete()) {
+      delete task;
+    } else {
+      ++leaked;
+    }
+  }
+  for (IoTask* task : impl_->workerTaskTrash) {
+    if (task->isPublished() && task->GetIsComplete()) {
+      delete task;
+    } else {
+      ++leaked;
+    }
+  }
+  impl_->workerTaskTrash.clear();
+
   const size_t totalDropped = impl_->droppedAtIntakeCount.load(std::memory_order_acquire) + abandoned.size();
   g_lastDroppedIoTaskCount.store(totalDropped, std::memory_order_release);
   if (totalDropped > 0 || leaked > 0) {
@@ -481,6 +636,60 @@ void Scheduler::runOnIoThread(std::function<void()> fn) {
   // every read of `task->threadNum` it will ever make from this call, so
   // it is now safe for the reaper to delete `task` once it also sees this
   // publish.
+  task->markPublished();
+}
+
+void Scheduler::runOnWorkerThread(std::function<void()> fn) {
+  // Same shutdown-safety posture as runOnIoThread() above -- reusing the
+  // identical `acceptingIoTasks`/`droppedAtIntakeCount` guards rather than
+  // a second pair of flags: both methods hand a pinned task to the SAME
+  // underlying enki::TaskScheduler with the SAME "never submit after
+  // teardown has begun" concern, so one shared guard covers both without
+  // conflating anything semantically -- "accepting new pinned-task
+  // submissions" is the actual invariant being guarded either way.
+  if (!impl_->acceptingIoTasks.load(std::memory_order_acquire)) {
+    impl_->droppedAtIntakeCount.fetch_add(1, std::memory_order_acq_rel);
+    RX_LOG_WARN(
+        "rx::task::Scheduler::runOnWorkerThread() called after this Scheduler began shutting down -- dropping");
+    return;
+  }
+
+  // Opportunistic reap [Impl::workerTaskTrash's own comment] -- bounded by
+  // however many prior runOnWorkerThread() tasks have already both
+  // executed and been published, almost always a tiny number (or zero).
+  reapPublishedTrash(impl_->workerTaskTrash, impl_->workerTaskTrashMutex);
+
+  // Round-robin over the resolvedWorkerCount REAL background worker
+  // threads (thread numbers [1, resolvedWorkerCount] -- thread 0 is main,
+  // thread resolvedWorkerCount+1 is the dedicated IO thread; see
+  // Scheduler::Scheduler()'s own thread-numbering comment). resolvedWorkerCount
+  // is always >= 1 (resolveWorkerCount()'s own floor), so this never picks
+  // thread 0 or the IO thread.
+  const uint32_t targetThread = 1 + (impl_->nextWorkerTaskThread % impl_->resolvedWorkerCount);
+  ++impl_->nextWorkerTaskThread;
+
+  // Freed once both this call's own AddPinnedTask() has fully returned
+  // (markPublished() below) AND the task has actually executed (reaped by
+  // a later reapPublishedTrash() call, or ~Scheduler()'s own final drain)
+  // -- identical two-phase-delete discipline to runOnIoThread()'s IoTask,
+  // reused verbatim (see Impl::workerTaskTrash's own comment for why no
+  // dedicated reaper loop is needed here).
+  auto* task = new IoTask(targetThread, std::move(fn), impl_->workerTaskTrash, impl_->outstandingWorkerMutex,
+                           impl_->outstandingWorker, &impl_->workerTaskTrashMutex);
+  {
+    std::lock_guard<std::mutex> lock(impl_->outstandingWorkerMutex);
+    impl_->outstandingWorker.push_back(task);
+  }
+  // Safe from any thread, exactly like runOnIoThread()'s identical call --
+  // see that method's own comment. The target worker's own
+  // TaskingThreadFunction dispatch loop picks this up via its normal
+  // TryRunTask() -> RunPinnedTasks() call, the very next time it cycles
+  // (immediately if idle-parked -- AddPinnedTaskInt() signals its wait
+  // semaphore exactly like the IO thread's case).
+  impl_->taskScheduler.AddPinnedTask(task);
+
+  // F1-fix ordering, identical rationale to runOnIoThread()'s own comment:
+  // MUST come after AddPinnedTask() returns.
   task->markPublished();
 }
 
