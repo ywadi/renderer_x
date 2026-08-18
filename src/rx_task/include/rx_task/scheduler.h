@@ -182,20 +182,23 @@ class Scheduler {
   // stuck `fn` stalls every runOnIoThread() call queued after it.
   void runOnIoThread(std::function<void()> fn);
 
-  // [Phase 4 Stage 1 Task 15, additive] Enqueues `fn` to run, later, on ONE
-  // of this Scheduler's regular background parallelFor() worker threads
-  // (round-robin over [1, workerCount()]) -- NEVER on the calling thread,
-  // NEVER on the main thread, and NEVER on the dedicated IO thread. Unlike
-  // runOnIoThread()'s target (a thread permanently dedicated to pinned
-  // tasks, via IoLoopTask's own infinite Execute() loop below), the target
-  // worker here is an ORDINARY parallelFor() participant: enkiTS's own
-  // per-thread dispatch loop (TaskingThreadFunction) already checks for
-  // and runs any pinned task addressed to it (TryRunTask() calls
-  // RunPinnedTasks() first, every iteration -- verified directly against
-  // the pinned enkiTS v1.12 source) as part of its NORMAL cycle, so this
-  // costs nothing beyond one enkiTS pinned-task dispatch and returns the
-  // worker to ordinary parallelFor() duty immediately after `fn` returns --
-  // no new thread is created, and workerCount() is unchanged.
+  // [Phase 4 Stage 1 Task 15, additive; mechanism rewritten in fix round 1
+  // -- see docs/threading.md's own "Pinned-task dispatch: persistent
+  // tasks, not per-submission ones" section, which this comment
+  // summarizes] Enqueues `fn` to run, later, on this Scheduler's single
+  // dedicated WORKER-TASK-LANE thread -- a second thread permanently
+  // reserved for this purpose alone, distinct from BOTH the ordinary
+  // [1, workerCount()] parallelFor() pool AND the dedicated IO thread
+  // runOnIoThread() targets. This lane thread is created ONCE, at
+  // Scheduler::create() (`numTaskThreadsToCreate` is `workerCount() + 2`,
+  // not `+1` -- the IO thread plus this one), and is never counted in
+  // workerCount() (which still reports only the ordinary parallelFor()
+  // pool size, unchanged). Calls are executed strictly FIFO relative to
+  // each other, in the order runOnWorkerThread() was called -- exactly
+  // the same single-thread FIFO contract runOnIoThread() gives its own
+  // target, now true here too (this round's redesign eliminated the
+  // earlier round-robin-over-parallelFor-workers behavior entirely, not
+  // merely changed its ordering guarantee).
   //
   // WHY THIS EXISTS [documented per the repository's "don't touch rx_task
   // unless a genuine blocking defect forces it" policy -- flagged here
@@ -220,20 +223,20 @@ class Scheduler {
   // caller's `gtl_threadNum` collides with thread 0's own enkiTS
   // registration -- confirmed against the vendored source, not merely
   // asserted by the class comment above). runOnWorkerThread()'s own `fn`
-  // runs on a genuine, ALREADY-registered enkiTS worker thread, so a
-  // NESTED parallelFor() call from inside it is both legal (per the
-  // paragraph above) and structurally incapable of reaching the IO thread
-  // (IoLoopTask's own Execute() loop never returns to enkiTS's ordinary
-  // TaskSet-stealing path at all, by construction -- see IoLoopTask below).
+  // runs on a genuine, ALREADY-registered enkiTS worker thread (this
+  // lane), so a NESTED parallelFor() call from inside it is both legal
+  // (per the paragraph above) and structurally incapable of reaching the
+  // IO thread (this lane's own persistent pinned task never touches
+  // enkiTS's ordinary TaskSet-stealing path at all -- see scheduler.cpp's
+  // `ClosureQueueLoopTask`).
   //
   // Safe to call from any thread (mirrors runOnIoThread()'s own contract);
   // `fn` itself may safely call parallelFor() (nested/reentrant, exactly
   // as any worker-thread chunk callback may -- see parallelFor()'s own doc
-  // comment) or postToMain(). Multiple concurrent submissions are safe and
-  // do not need to target the same worker thread to be correct -- FIFO
-  // ordering across DIFFERENT target threads is not guaranteed (unlike
-  // runOnIoThread()'s single-thread FIFO contract), only per-target-thread
-  // ordering is.
+  // comment) or postToMain(). Multiple concurrent submissions are safe;
+  // with only one target thread now, per-target-thread FIFO ordering (the
+  // only ordering this API has ever promised) is simply FIFO ordering,
+  // full stop.
   void runOnWorkerThread(std::function<void()> fn);
 
   // Enqueues `fn` to run later, on whichever thread next calls pumpMain()
