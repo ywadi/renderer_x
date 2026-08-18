@@ -912,36 +912,168 @@ TEST_CASE("importGltfAsync: cancelImport() after >=1 real GPU resource (texture 
     // non-resident immediately and defers the real HandlePool reclaim into
     // DeletionQueue [D24 clause (c)] -- liveTextureCountForTesting() only
     // reflects it once the deletion queue's own fence-gated pass runs.
-    // DeletionQueue::onFrameFenceSignaled()'s own documented contract
-    // (deletion_queue.h) requires the caller to have ALREADY confirmed the
-    // tagged frame's GPU work is genuinely done before calling it --
-    // vkDeviceWaitIdle() here is that confirmation (this rollback happens
-    // mid-flight, before this test's own fixture has a real per-frame
-    // fence/FrameSync of its own to poll), matching this codebase's own
-    // existing precedent for a hard GPU-idle barrier in a test
-    // (texture_cache_test.cpp's own render/readback fixture teardown).
     //
-    // [Fix round 1 finding, FIXED, not just worked around in this test]
-    // Before registry.cpp's own rollbackAsyncImportWhenSafe() existed,
-    // rollback called marshalGltfImportRollback() unconditionally the
-    // instant `cancelled` was observed -- freeing GeometryPool's
-    // suballocation (immediately reusable by the very next upload: a
-    // write-after-write hazard against the still-in-flight old copy) and
-    // releasing a TextureCache handle whose deferred DeletionQueue reclaim
-    // could destroy a VkImage a still-in-flight transfer command buffer
-    // was writing into. This exact test reproduced that as a genuine
-    // "vkDestroyImage ... in use by a command buffer" validation error the
-    // first time it exercised cancellation AFTER prepare() had already
-    // issued real upload tickets. registry.cpp's rollbackAsyncImportWhenSafe()
-    // now polls marshalGltfImportUploadsComplete() (D25's own non-blocking
-    // poll, never a wait()) and only frees/releases once every ticket
-    // prepare() issued has genuinely finished on the GPU -- the
-    // vkDeviceWaitIdle() below is therefore redundant-but-cheap extra
-    // insurance for THIS test's own subsequent DeletionQueue-driven
-    // destroy, not a workaround for a still-open production bug.
-    vkDeviceWaitIdle(fixture->device.device());
+    // [Fix round 2, ITEM 2] Deliberately NO vkDeviceWaitIdle() before this
+    // call -- round 1's own version had one here, and independent review
+    // proved it was masking the very race this test exists to catch:
+    // reverting registry.cpp's rollbackAsyncImportWhenSafe() back to an
+    // unconditional, immediate marshalGltfImportRollback() call still
+    // passed 8/8 with the wait in place (the wait, all on its own, drains
+    // every in-flight GPU submission -- including the still-racing old
+    // copy -- before onFrameFenceSignaled() ever gets a chance to destroy
+    // anything, regardless of whether the production code itself waited
+    // for anything). THIS is now the actual discriminating step: with
+    // rollbackAsyncImportWhenSafe() intact, every upload ticket
+    // prepare() issued is already confirmed complete (via
+    // marshalGltfImportUploadsComplete()'s own non-blocking poll) by the
+    // time marshalGltfImportRollback() ever runs, so destroying
+    // immediately afterward, with no additional wait of any kind, is
+    // safe. See task-15-report.md's round-2 section for the fresh
+    // revert-evidence pair (fails reverted / passes intact) this
+    // restructuring was verified against. Ordinary fixture teardown
+    // (Device::~Device()'s own unconditional vkDeviceWaitIdle) remains
+    // the safety net for whatever this call does NOT reclaim -- nothing
+    // in this test relies on an extra manual wait for that.
     fixture->deletionQueue->onFrameFenceSignaled(0);
     CHECK(fixture->textures->liveTextureCountForTesting() == liveTexturesBefore);
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// ---------------------------------------------------------------------
+// Cancel mid-registration [Fix round 2, ITEM 1, CRITICAL]: a cancellation
+// caught between two texture slots -- some already marshalled, some
+// not -- must never touch the ones marshal has not reached yet, whose
+// TextureRef::handle still holds the COMPUTE-time shared checkerboard
+// placeholder (import_gltf.cpp's own fillRef() lambda), not a handle this
+// import owns.
+// ---------------------------------------------------------------------
+
+TEST_CASE("importGltfAsync: cancelImport() after EXACTLY 1 of N texture slots has been registered does NOT "
+          "release the shared checkerboard fallback -- liveTextureCountForTesting() never drops below the "
+          "pre-import baseline, checkerboard stays resolvable") {
+    if (!std::filesystem::exists(damagedHelmetPath())) {
+        MESSAGE("DamagedHelmet not fetched (run tools/fetch_assets.sh) -- skipping the checkerboard-safety test");
+        return;
+    }
+    auto fixture = makeFixture("async_cancel_checkerboard_safety");
+    if (!fixture) {
+        return;
+    }
+    attachPool(*fixture);
+    // DamagedHelmet has 5 present, real (Ready-outcome) texture slots
+    // (baseColor/metallicRoughness/normal/occlusion/emissive) -- N > 1 is
+    // load-bearing here: this test needs marshal to still have slots left
+    // to reach AFTER the point it cancels, which is exactly the window
+    // the bug this test targets lives in.
+    attachTextureCache(*fixture);
+    auto scheduler = rx::task::Scheduler::create(4);
+    REQUIRE(scheduler != nullptr);
+
+    FilesystemByteSource source(std::filesystem::path(damagedHelmetPath()).parent_path());
+    std::vector<std::byte> documentBytes = readFileBytes(damagedHelmetPath());
+
+    Registry registry;
+    const size_t liveTexturesBefore = fixture->textures->liveTextureCountForTesting();
+    const TextureHandle checkerboard = fixture->textures->checkerboardHandle();
+    REQUIRE(fixture->textures->resolve(checkerboard).width == 4);  // sanity: this IS the checkerboard, its own fixed dims
+
+    bool done = false;
+    AsyncImportHandle handle = registry.importGltfAsync(documentBytes, source, *fixture->pool, *scheduler,
+                                                            fixture->textures.get(), [&](ImportResult) { done = true; });
+    REQUIRE(handle.isValid());
+
+    // Pump ONE bounded step at a time (same swap-then-run reasoning as the
+    // cancel-mid-upload test above) until liveTextureCountForTesting()
+    // first becomes EXACTLY baseline+1 -- marshalGltfImportPrepareStep()
+    // registers at most one real texture slot per call (RC6 time-slicing),
+    // and a Ready-outcome registration is the ONLY thing that increments
+    // liveCount (a Failed/Checkerboard-outcome slot's own registerDecoded()
+    // call returns a SHARED fallback handle, never a new pool acquisition
+    // -- see TextureCache::applyDecodeResult()), so this is a precise,
+    // non-guessed "exactly 1 of N slots marshalled, N-1 still ahead"
+    // checkpoint, not an approximation.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    bool oneRegistered = false;
+    size_t minLiveObservedDuringDrive = liveTexturesBefore;
+    while (std::chrono::steady_clock::now() < deadline) {
+        scheduler->pumpMain();
+        const size_t live = fixture->textures->liveTextureCountForTesting();
+        minLiveObservedDuringDrive = std::min(minLiveObservedDuringDrive, live);
+        if (live == liveTexturesBefore + 1) {
+            oneRegistered = true;
+            break;
+        }
+        REQUIRE_FALSE(done);  // must not have finalized before this loop caught the 1-of-N window
+        REQUIRE(live <= liveTexturesBefore + 1);  // never overshoots past exactly 1
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(oneRegistered);
+    // Never dropped below baseline on the way here either (the checkerboard
+    // and every role fallback are built once at TextureCache::create() and
+    // must never be touched by anything this import's own marshal does).
+    REQUIRE(minLiveObservedDuringDrive >= liveTexturesBefore);
+
+    registry.cancelImport(handle);
+
+    // Drain the rollback, watching liveTextureCountForTesting() on EVERY
+    // tick (not just at the end) -- the bug this test targets is a
+    // TRANSIENT-if-unwatched drop (releaseUnpublished() on the shared
+    // checkerboard handle marks it non-resident immediately, then
+    // DeletionQueue's own later reclaim is what would actually destroy
+    // the VkImage; watching every tick catches the non-resident marking
+    // half too, not merely the eventual destroy).
+    //
+    // Deliberately NOT an early-exit-on-first-observed-state loop like
+    // the geometry-side cancel-mid-upload test above -- GeometryPool::
+    // stats().vertexBytesUsed dropping to zero is a synchronous,
+    // reliable "pool.free() has now actually run" signal, but there is
+    // no equivalent synchronous signal on the texture side:
+    // liveTextureCountForTesting() does not change at all until
+    // onFrameFenceSignaled() below runs, so "cancelled == true" alone
+    // says nothing about whether rollbackAsyncImportWhenSafe()'s own
+    // ticket-completion poll (marshalGltfImportEnsureRollbackTicketed(),
+    // ITEM 3) has finished yet. Instead: drive a fixed, generous settle
+    // window of pumpMain() calls AFTER cancellation is first observed,
+    // long enough for that poll loop to genuinely converge (the
+    // underlying GPU work is one small JPEG decode's worth of bytes --
+    // real completion happens within a handful of frames on any GPU this
+    // test suite runs on).
+    size_t minLiveObservedDuringRollback = fixture->textures->liveTextureCountForTesting();
+    const auto rollbackDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    bool cancelledObserved = false;
+    int settleTicksRemaining = 200;
+    while (std::chrono::steady_clock::now() < rollbackDeadline && settleTicksRemaining > 0) {
+        scheduler->pumpMain();
+        minLiveObservedDuringRollback =
+            std::min(minLiveObservedDuringRollback, fixture->textures->liveTextureCountForTesting());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (registry.importProgress(handle).cancelled) {
+            cancelledObserved = true;
+        }
+        if (cancelledObserved) {
+            --settleTicksRemaining;
+        }
+    }
+    REQUIRE(cancelledObserved);
+    CHECK_FALSE(done);
+    CHECK(minLiveObservedDuringRollback >= liveTexturesBefore);
+
+    // Real reclaim -- deliberately no vkDeviceWaitIdle() here either, same
+    // reasoning as ITEM 2's own restructuring above: the production fix
+    // (rollbackAsyncImportWhenSafe(), plus this round's own `registered`
+    // gate in marshalGltfImportRollback()) is what must make this safe.
+    fixture->deletionQueue->onFrameFenceSignaled(0);
+    CHECK(fixture->textures->liveTextureCountForTesting() == liveTexturesBefore);
+
+    // The direct proof: the shared checkerboard itself is still exactly
+    // what it always was -- same dims, still a resident fallback record --
+    // not a destroyed/dangling handle silently substituted or corrupted.
+    const TextureRecord& cb = fixture->textures->resolve(checkerboard);
+    CHECK(cb.isFallback);
+    CHECK(cb.resident);
+    CHECK(cb.width == 4);
+    CHECK(cb.height == 4);
 
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }

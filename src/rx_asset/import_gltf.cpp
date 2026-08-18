@@ -1633,6 +1633,14 @@ bool marshalGltfImportPrepareStep(GeometryPool& pool, TextureCache* textures, Ma
                 }
                 TextureHandle handle = textures->registerDecoded(slot.decoded, slot.debugName);
                 textureRefForSlot(mat.asset, static_cast<MaterialTextureSlot>(slotIdx)).handle = handle;
+                // [Fix round 2, CRITICAL] Marks this slot as having
+                // actually reached marshal -- see PendingTextureLoad's
+                // own comment (import_pipeline.h) for why
+                // marshalGltfImportRollback() needs this, distinct from
+                // `attempted`, to avoid releasing the shared checkerboard
+                // fallback for a slot cancellation caught before its own
+                // marshal turn arrived.
+                slot.registered = true;
                 pending.hasTextureUploads = true;
                 return true;  // ONE real texture registered this call -- yield to the caller's own pump loop
             }
@@ -1721,19 +1729,87 @@ ImportResult marshalGltfImportFinalize(Registry& registry, std::unique_ptr<Marsh
     return result;
 }
 
+void marshalGltfImportEnsureRollbackTicketed(TextureCache* textures, MarshalPendingImport& pending) {
+    if (textures != nullptr && pending.hasTextureUploads && !pending.textureTicketIssued) {
+        pending.textureTicket = textures->flushPendingUploads();
+        pending.textureTicketIssued = true;
+    }
+}
+
+// [Fix round 2, ITEM 3] Loud-failure backstop for the "no registered
+// upload survives into marshalGltfImportRollback() without an issued
+// ticket" invariant this file's own comments (marshalGltfImportRollback's
+// call sites) document. Deliberately NOT a bare assert() -- this
+// project's presets compile with `-DNDEBUG` in every configuration
+// (including CI), which would silently compile a bare assert() away
+// entirely (the same reasoning rx_core/debug_checks.h's own top comment
+// documents at length for RX_ASSERT_MAIN_THREAD); RX_DEBUG_CHECKS is
+// this engine's own always-available switch instead (ON by default in
+// both dev presets), independent of NDEBUG.
+void checkRollbackTicketInvariant(bool ok, const char* what) {
+#ifdef RX_DEBUG_CHECKS
+    if (!ok) {
+        RX_LOG_ERROR("rx_asset: marshalGltfImportRollback: invariant violated -- {}", what);
+        std::abort();
+    }
+#else
+    (void)ok;
+    (void)what;
+#endif
+}
+
 void marshalGltfImportRollback(GeometryPool& pool, TextureCache* textures, std::unique_ptr<MarshalPendingImport> pendingPtr) {
     if (!pendingPtr) {
         return;
     }
     MarshalPendingImport pending = std::move(*pendingPtr);
+    // [Fix round 2, ITEM 3] Geometry-side half of the same invariant class
+    // marshalGltfImportEnsureRollbackTicketed()'s own comment documents
+    // for textures -- provably unreachable given marshalGltfImportPrepareStep()'s
+    // own geometry branch (uploadDeferred()+flushPendingUploads() issued
+    // together, no yield between them), enforced here rather than merely
+    // asserted in a comment so a future change that breaks that atomicity
+    // fails loudly instead of silently reintroducing this bug class.
+    checkRollbackTicketInvariant(!pending.hasGeometry || pending.poolTicketIssued,
+                                  "GeometryPool upload registered without an issued ticket -- rollback would free "
+                                  "an in-flight range");
     if (pending.hasGeometry) {
         pool.free(pending.combinedRange);
     }
+    // [Fix round 2, ITEM 3] The texture-side half of the SAME invariant --
+    // by this point, EVERY caller must already have run
+    // marshalGltfImportEnsureRollbackTicketed() (registry.cpp's own
+    // rollbackAsyncImportWhenSafe() always does), which forces a real
+    // ticket into existence for any registered-but-unflushed texture
+    // batch. Unlike the geometry case above, this one is NOT provably
+    // unreachable by construction (registerDecoded() genuinely can yield
+    // mid-batch, unticketed) -- it is made unreachable by the caller
+    // contract instead, so this check is the loud-failure backstop for
+    // that contract specifically, not a restatement of an already-provable
+    // invariant.
+    checkRollbackTicketInvariant(!pending.hasTextureUploads || pending.textureTicketIssued,
+                                  "texture upload(s) registered without an issued ticket -- call "
+                                  "marshalGltfImportEnsureRollbackTicketed() before marshalGltfImportRollback()");
     if (textures != nullptr) {
         for (PendingMaterialCompute& mat : pending.compute.materials) {
             for (size_t slotIdx = 0; slotIdx < mat.textureSlots.size(); ++slotIdx) {
                 PendingTextureLoad& slot = mat.textureSlots[slotIdx];
-                if (!slot.attempted || slot.decoded.outcome != TextureDecodeResult::Outcome::Ready) {
+                // [Fix round 2, CRITICAL] `registered` is the primary
+                // gate, NOT `attempted` -- an attempted-but-not-yet-
+                // registered slot's own TextureRef::handle still holds
+                // the COMPUTE-time placeholder (the shared checkerboard
+                // fallback, import_gltf.cpp's own fillRef() lambda),
+                // never a handle this rollback owns. `decoded.outcome ==
+                // Ready` still matters SEPARATELY even once registered:
+                // a registered-but-Failed/Checkerboard-outcome slot's
+                // handle is applyDecodeResult()'s own shared
+                // failure/checkerboard fallback (texture_cache.cpp), not
+                // a real per-import allocation either -- both gates are
+                // required, neither alone is sufficient (see
+                // PendingTextureLoad's own comment, import_pipeline.h,
+                // and task-15-report.md's round-2 section for the
+                // empirical reproduction this fix closes).
+                if (!slot.registered || slot.decoded.outcome != TextureDecodeResult::Outcome::Ready) {
                     continue;
                 }
                 TextureHandle handle = textureRefForSlot(mat.asset, static_cast<MaterialTextureSlot>(slotIdx)).handle;

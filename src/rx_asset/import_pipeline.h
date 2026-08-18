@@ -75,8 +75,23 @@ struct PendingSubmeshCompute {
 // never needed a real load (unbound, or textures == nullptr) and
 // `MaterialAsset`'s own TextureRef::handle already holds its final D11
 // fallback/utility value from compute time -- marshal leaves it untouched.
+//
+// [Fix round 2, CRITICAL] `registered` -- true only once
+// marshalGltfImportPrepareStep() has actually called registerDecoded()
+// for THIS slot (main thread, marshal time). Until then, even an
+// `attempted` slot's own TextureRef::handle still holds the COMPUTE-time
+// placeholder (import_gltf.cpp's own fillRef() lambda pre-sets every
+// present slot to the SHARED checkerboard fallback, overwritten with a
+// real/failure handle only when this slot's marshal turn arrives) --
+// marshalGltfImportRollback() MUST gate on this flag, not `attempted`
+// alone, or a cancellation landing mid-registration (some slots
+// marshalled, some not yet) releases the shared checkerboard itself
+// (TextureCache::releaseUnpublished() on every other still-live import's
+// fallback handle -- confirmed empirically, see task-15-report.md's
+// round-2 section).
 struct PendingTextureLoad {
     bool attempted = false;
+    bool registered = false;
     TextureRole role = TextureRole::GenericData;
     std::string debugName;
     TextureDecodeResult decoded;
@@ -315,11 +330,52 @@ struct MarshalPendingImport {
 // (file order) and returns the finished ImportResult.
 [[nodiscard]] ImportResult marshalGltfImportFinalize(Registry& registry, std::unique_ptr<MarshalPendingImport> pending);
 
+// [Fix round 2, ITEM 3] Closes the one gap marshalGltfImportUploadsComplete()
+// cannot see on its own: a texture slot can be REGISTERED
+// (TextureCache::registerDecoded() already called, real GPU-side copy
+// command recorded) without yet having a TICKET (TextureCache::
+// flushPendingUploads() not yet called -- marshalGltfImportPrepareStep()
+// only issues the texture ticket once EVERY slot is done, but yields
+// after each individual registration, so a cancellation observed between
+// two slot registrations lands `pending` in exactly this state:
+// `hasTextureUploads == true`, `textureTicketIssued == false`). With no
+// ticket issued, marshalGltfImportUploadsComplete() has nothing to poll
+// and (incorrectly, on its own) reports "nothing outstanding" --
+// releasing that slot's handle in that state destroys an image whose
+// copy command has been recorded but never even submitted, corrupting
+// whatever command buffer that recording lives in once anything LATER
+// ends/flushes it (reproduced empirically as a real
+// `UNASSIGNED-CoreValidation-DrawState-InvalidCommandBuffer-VkImage`
+// validation error; see task-15-report.md's round-2 section). Call this
+// BEFORE marshalGltfImportUploadsComplete() on the abandon/rollback path,
+// every time -- idempotent (a no-op once `textureTicketIssued` is
+// already true, or if nothing was ever registered), forces a REAL ticket
+// to exist for whatever has been recorded so far by calling
+// TextureCache::flushPendingUploads() early (safe: flush()'s own
+// contract is "submit whatever is recorded so far", not "only once, at
+// the very end" -- nothing about calling it earlier than usual is
+// unsound). Never calls wait() (D25's own invariant, unchanged).
+//
+// GEOMETRY has no equivalent gap: GeometryPool::uploadDeferred() and its
+// own flushPendingUploads() call are issued together, unconditionally,
+// inside the SAME marshalGltfImportPrepareStep() call with no yield in
+// between (see that function's own geometry branch) -- `pending.hasGeometry
+// == true` and `pending.poolTicketIssued == false` can never coexist once
+// prepare() has run at all. marshalGltfImportRollback() itself asserts
+// this invariant (debug builds) rather than merely documenting it, so any
+// future change that breaks the atomicity fails loudly instead of
+// silently reopening this same class of bug on the geometry side.
+void marshalGltfImportEnsureRollbackTicketed(TextureCache* textures, MarshalPendingImport& pending);
+
 // Releases every GPU resource marshalGltfImportPrepareDeferred() already
 // registered (TextureCache::releaseUnpublished()/GeometryPool::free()) --
 // the cancellation/teardown rollback path for an import observed cancelled
 // AFTER prepare() but BEFORE finalize(). Safe to call on a
-// default/moved-from MarshalPendingImport (no-op).
+// default/moved-from MarshalPendingImport (no-op). REQUIRES
+// marshalGltfImportEnsureRollbackTicketed() to have already been called
+// (see that function's own comment) -- callers on the abandon path (this
+// library's own registry.cpp) always call it first; direct callers of
+// this function must too.
 void marshalGltfImportRollback(GeometryPool& pool, TextureCache* textures, std::unique_ptr<MarshalPendingImport> pending);
 
 }  // namespace rx::asset

@@ -118,11 +118,27 @@ void pollAsyncImportUploads(std::shared_ptr<AsyncImportJob> job);
 // never a blocking wait" invariant, unchanged even on this abandon path)
 // -- re-posts itself via postToMain() exactly like the non-cancelled poll
 // loop below, until safe.
+//
+// [Fix round 2, ITEM 3] marshalGltfImportEnsureRollbackTicketed() runs
+// FIRST, every call (idempotent) -- closes the one gap
+// marshalGltfImportUploadsComplete() cannot see on its own: a texture
+// slot registered but not yet ticketed (registerDecoded() already ran,
+// but marshalGltfImportPrepareStep() yielded before this batch's own
+// flushPendingUploads() call). Without this, marshalGltfImportUploadsComplete()
+// would report "nothing outstanding" for that slot (no ticket to poll)
+// and let marshalGltfImportRollback() release a handle whose copy
+// command has been recorded but never even submitted -- see that
+// function's own comment (import_pipeline.h) for the full mechanism and
+// task-15-report.md's round-2 section for the empirical reproduction
+// this closes.
 void rollbackAsyncImportWhenSafe(std::shared_ptr<AsyncImportJob> job) {
-    if (job->pending && !marshalGltfImportUploadsComplete(*job->pool, job->textures, *job->pending)) {
-        rx::task::Scheduler* scheduler = job->scheduler;
-        scheduler->postToMain([job = std::move(job)]() mutable { rollbackAsyncImportWhenSafe(std::move(job)); });
-        return;
+    if (job->pending) {
+        marshalGltfImportEnsureRollbackTicketed(job->textures, *job->pending);
+        if (!marshalGltfImportUploadsComplete(*job->pool, job->textures, *job->pending)) {
+            rx::task::Scheduler* scheduler = job->scheduler;
+            scheduler->postToMain([job = std::move(job)]() mutable { rollbackAsyncImportWhenSafe(std::move(job)); });
+            return;
+        }
     }
     marshalGltfImportRollback(*job->pool, job->textures, std::move(job->pending));
 }
