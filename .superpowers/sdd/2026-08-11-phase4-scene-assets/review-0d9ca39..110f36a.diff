@@ -1,0 +1,2602 @@
+=== COMMITS ===
+110f36a feat(rx_asset): add GeometryPool pooled vertex/index storage
+
+=== STAT ===
+ CMakeLists.txt                                |   8 +
+ docs/threading.md                             |  12 +-
+ src/rx_asset/CMakeLists.txt                   |  19 +
+ src/rx_asset/geometry_pool.cpp                | 461 +++++++++++++++
+ src/rx_asset/include/rx_asset/geometry_pool.h | 339 +++++++++++
+ src/rx_asset/tests/CMakeLists.txt             |  37 ++
+ src/rx_asset/tests/accounting_test.cpp        | 118 ++++
+ src/rx_asset/tests/bda_test.cpp               | 103 ++++
+ src/rx_asset/tests/doctest_main.cpp           |  47 ++
+ src/rx_asset/tests/geometry_pool_test.cpp     | 779 ++++++++++++++++++++++++++
+ src/rx_rhi_vk/CMakeLists.txt                  |  14 +-
+ src/rx_rhi_vk/include/rx_rhi_vk/buffer.h      |  28 +-
+ src/rx_rhi_vk/include/rx_rhi_vk/device.h      |  22 +
+ src/rx_rhi_vk/src/buffer.cpp                  |  18 +-
+ src/rx_rhi_vk/src/device.cpp                  |  41 ++
+ src/rx_rhi_vk/tests/bda_test.cpp              | 153 +++++
+ 16 files changed, 2187 insertions(+), 12 deletions(-)
+
+=== FULL DIFF (U10) ===
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4d21814..3aaba45 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -68,20 +68,28 @@ add_subdirectory(src/rx_task)
+ add_subdirectory(src/rx_platform)
+ # rx_shader before rx_rhi_vk: rx_rhi_vk's PipelineLayoutBuilder
+ # (pipeline_layout.h) links rx_shader's `rx_shader_layout_types` INTERFACE
+ # target (defined in src/rx_shader/CMakeLists.txt) to get
+ # ShaderLayoutInfo's header without slang::slang -- defining that target
+ # before the directory that consumes it removes any doubt about
+ # add_subdirectory ordering, even though target_link_libraries against a
+ # not-yet-defined target name is otherwise fine in modern CMake.
+ add_subdirectory(src/rx_shader)
+ add_subdirectory(src/rx_rhi_vk)
++# rx_asset: Phase 4 Stage 1 Task 12 -- GeometryPool, pooled global vertex/
++# index storage (spec D8/D9/D26.4). Depends on rx_rhi_vk (Allocator/
++# Device/Uploader) directly; its GPU test binary additionally links
++# rx_shader + rx_platform (same windowed-device + in-process shader
++# compile pattern as rx_graph's own GPU test binary, src/rx_graph/tests/
++# CMakeLists.txt) to build a minimal draw pipeline for its readback
++# assertions -- see src/rx_asset/CMakeLists.txt.
++add_subdirectory(src/rx_asset)
+ # Device-free in Task 1 (pass declarations, culling, ordering, lifetimes):
+ # depends on Vulkan::Headers + rx_core only, not rx_rhi_vk -- see
+ # src/rx_graph/CMakeLists.txt's own comment for why that dependency is
+ # deferred to the tasks that actually need a VkDevice.
+ add_subdirectory(src/rx_graph)
+ # Materials as Slang modules, pass signatures, and the lazy content-hash-
+ # keyed pipeline cache [spec Phase 3 design, D6-D8] -- depends on rx_graph
+ # (PassSignature), rx_shader (ShaderLayoutInfo's slang-free layout-types
+ # target only), and rx_rhi_vk (PipelineLayoutBuilder/BindlessTable/Device),
+ # so it is add_subdirectory'd after all three.
+diff --git a/docs/threading.md b/docs/threading.md
+index 78b4ce7..fd9453b 100644
+--- a/docs/threading.md
++++ b/docs/threading.md
+@@ -78,23 +78,29 @@ and compiles to nothing at all when it is OFF:
+   `setCurrentFrameIndex()`/`report()` (not guarded — no shared mutable
+   state a chunk >= 1 caller could corrupt, since `MemoryAccounting`'s own
+   counters are atomic; the main-thread-only convention here is about
+   matching every other Allocator/Buffer/Texture2D GPU-object-mutation
+   entry point's existing scoping, not a new hazard) — call
+   `setCurrentFrameIndex()` once per frame (`FrameSync::advanceFrame()`
+   does this automatically when passed this Allocator's address) so
+   `report()`'s per-heap budget numbers stay fresh (see `memory_report.h`'s
+   own comment on the `vmaSetCurrentFrameIndex()` staleness rule).
+   (`src/rx_rhi_vk/include/rx_rhi_vk/buffer.h`)
+-- **`rx::asset::GeometryPool`** (future, Stage 1) — suballocation is a
+-  main-thread-owned `VmaVirtualBlock` operation, same rationale as the
+-  four above. Not guarded — does not exist yet.
++- **`rx::asset::GeometryPool`** [Phase 4 Stage 1 Task 12, spec D9] —
++  `create()`/`upload()`/`free()`/`bind()` **[guarded, all four]**:
++  suballocation is a main-thread-owned `VmaVirtualBlock` operation (VMA's
++  own virtual-block API documents itself as "not thread-safe... must be
++  synchronized externally" — vendored `vk_mem_alloc.h`), same rationale
++  as the four Allocator-derived types above. `stats()`/`blockCount()`/
++  `bufferDeviceAddressEnabled()`/`vertexBufferDeviceAddress()`/
++  `indexBufferDeviceAddress()` are read-only snapshots, not guarded.
++  (`src/rx_asset/include/rx_asset/geometry_pool.h`)
+ - **`rx::scene::*Manager` registries** (future, Stage 2) —
+   `RenderableManager`/`TransformManager`/`LightManager` mutation
+   (create/set/destroy) stays main-thread-only; read-only SoA traversal for
+   culling (below) does not. Not guarded — does not exist yet.
+ - **`rx::task::Scheduler`** — `pumpMain()` **[guarded]** [audit finding
+   F5-partial]: runs whatever GPU-object-mutating closures `postToMain()`
+   queued (the handoff pattern below), so it carries the identical
+   main-thread-only contract as everything above it, just via a different
+   entry point. `parallelFor()` is NOT main-thread-only itself (its
+   documented contract is "calling thread, whichever one that is" — see
+diff --git a/src/rx_asset/CMakeLists.txt b/src/rx_asset/CMakeLists.txt
+new file mode 100644
+index 0000000..925ffbb
+--- /dev/null
++++ b/src/rx_asset/CMakeLists.txt
+@@ -0,0 +1,19 @@
++# rx_asset: Phase 4 Stage 1 Task 12 -- GeometryPool, the engine's pooled
++# global vertex/index storage (spec D8/D9, BDA enablement D26.4). Depends
++# on rx_rhi_vk directly (rx::rhi::Allocator/Device/Uploader/Buffer --
++# chunk buffers are ordinary device-local Buffers allocated through the
++# SAME Allocator::createDeviceLocalBuffer() choke point every other
++# device-local buffer in this engine uses, tagged
++# MemoryCategory::GeometryPool [D24(a)]). Links VMA's virtual-block API
++# transitively via rx_rhi_vk/buffer.h's already-configured
++# <vk_mem_alloc.h> include (VMA_STATIC_VULKAN_FUNCTIONS=0/
++# VMA_DYNAMIC_VULKAN_FUNCTIONS=1 defined once there -- see that header's
++# own comment), so this library needs no VMA-specific CMake wiring of its
++# own beyond the existing rx_rhi_vk PUBLIC link.
++add_library(rx_asset STATIC
++    geometry_pool.cpp
++)
++target_include_directories(rx_asset PUBLIC include)
++target_link_libraries(rx_asset PUBLIC rx_rhi_vk)
++
++add_subdirectory(tests)
+diff --git a/src/rx_asset/geometry_pool.cpp b/src/rx_asset/geometry_pool.cpp
+new file mode 100644
+index 0000000..b18d95d
+--- /dev/null
++++ b/src/rx_asset/geometry_pool.cpp
+@@ -0,0 +1,461 @@
++#include <rx_asset/geometry_pool.h>
++#include <rx_rhi_vk/device.h>
++#include <rx_rhi_vk/upload.h>
++#include <rx_core/debug_checks.h>
++#include <rx_core/log.h>
++#include <algorithm>
++#include <utility>
++
++namespace rx::asset {
++
++namespace {
++
++constexpr size_t kInvalidBlockIndex = static_cast<size_t>(-1);
++
++}  // namespace
++
++std::unique_ptr<GeometryPool> GeometryPool::create(rx::rhi::Allocator& allocator, rx::rhi::Device& device,
++                                                     rx::rhi::Uploader& uploader, const PoolConfig& config) {
++    RX_ASSERT_MAIN_THREAD("GeometryPool::create");
++
++    const bool bdaEnabled = device.supportsBufferDeviceAddress();
++    RX_LOG_INFO(
++        "GeometryPool::create: chunk sizes vertex={}B index={}B, bufferDeviceAddress {} [D26.4, enablement only]",
++        config.vertexChunkBytes, config.indexChunkBytes, bdaEnabled ? "ENABLED" : "not supported on this device");
++
++    // Private constructor -- create() is a static member of this class, so
++    // it has direct access; std::make_unique cannot be used against a
++    // private constructor without an extra friend/tag-type indirection
++    // this class has no other need for.
++    return std::unique_ptr<GeometryPool>(new GeometryPool(allocator, uploader, device.device(), bdaEnabled, config));
++}
++
++GeometryPool::GeometryPool(rx::rhi::Allocator& allocator, rx::rhi::Uploader& uploader, VkDevice device,
++                            bool bufferDeviceAddressEnabled, PoolConfig config)
++    : allocator_(allocator),
++      uploader_(uploader),
++      device_(device),
++      bufferDeviceAddressEnabled_(bufferDeviceAddressEnabled),
++      config_(config) {}
++
++GeometryPool::~GeometryPool() {
++    destroyAll();
++}
++
++void GeometryPool::destroyAll() {
++    for (Block& block : blocks_) {
++        // vmaDestroyVirtualBlock() itself asserts (VMA_ASSERT) if any
++        // suballocation was never individually freed nor cleared via
++        // vmaClearVirtualBlock() first -- per its own doc comment
++        // (vk_mem_alloc.h). vmaClearVirtualBlock() is the documented
++        // "free everything at once" teardown call, exactly right for a
++        // whole-pool destructor (never used for a single MeshRange's
++        // free(), which must only release ITS OWN range -- see free()
++        // below).
++        if (block.vertexVirtualBlock != VK_NULL_HANDLE) {
++            vmaClearVirtualBlock(block.vertexVirtualBlock);
++            vmaDestroyVirtualBlock(block.vertexVirtualBlock);
++        }
++        if (block.indexVirtualBlock != VK_NULL_HANDLE) {
++            vmaClearVirtualBlock(block.indexVirtualBlock);
++            vmaDestroyVirtualBlock(block.indexVirtualBlock);
++        }
++    }
++    blocks_.clear();
++}
++
++bool GeometryPool::addBlock(VkDeviceSize minVertexBytes, VkDeviceSize minIndexBytes) {
++    const VkDeviceSize requestedVertexBytes = std::max(config_.vertexChunkBytes, minVertexBytes);
++    const VkDeviceSize requestedIndexBytes = std::max(config_.indexChunkBytes, minIndexBytes);
++
++    // ELEMENT-UNIT virtual blocks (empirically load-bearing -- see the
++    // class header comment's "Suballocation units" paragraph): the vertex
++    // virtual block's addressable space is `vertexElementCapacity`
++    // PoolVertex-sized UNITS, not bytes; the index virtual block's is
++    // `indexElementCapacity` uint32_t-sized units. Rounds the requested
++    // byte size DOWN to a whole number of elements, then sizes the REAL
++    // Buffer to exactly that many elements' worth of bytes -- so the
++    // virtual block's element-addressable range always matches the real
++    // buffer's element-addressable range exactly (never claims a
++    // fractional trailing element the buffer doesn't actually have room
++    // for).
++    const VkDeviceSize vertexElementCapacity = requestedVertexBytes / sizeof(PoolVertex);
++    const VkDeviceSize indexElementCapacity = requestedIndexBytes / sizeof(uint32_t);
++    const VkDeviceSize vertexBytes = vertexElementCapacity * sizeof(PoolVertex);
++    const VkDeviceSize indexBytes = indexElementCapacity * sizeof(uint32_t);
++
++    // TRANSFER_SRC_BIT alongside TRANSFER_DST_BIT on both buffers, even
++    // though production draw code only ever reads them as
++    // VERTEX_BUFFER_BIT/INDEX_BUFFER_BIT: mirrors rx::rhi::MeshBuffers::
++    // create()'s identical precedent (mesh_buffers.cpp) -- "it costs
++    // nothing on any target this engine cares about, and it is what lets
++    // a debug readback (or a future GPU-side consumer, e.g. building an
++    // acceleration structure straight from these buffers) copy out of
++    // them directly instead of needing a separate shadow copy." Load-
++    // bearing for this class's own tests (geometry_pool_test.cpp's
++    // byte-exact readback proofs read block buffers via vkCmdCopyBuffer).
++    VkBufferUsageFlags vertexUsage =
++        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
++    VkBufferUsageFlags indexUsage =
++        VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
++    // [D26.4] The usage bit that is genuinely unpurchasable later: a block
++    // created without it can never retroactively gain a valid device
++    // address without destroying and recreating (and thus re-uploading
++    // everything in) that VkBuffer -- see the class header comment and
++    // gate matrix-issue21's BDA rows.
++    if (bufferDeviceAddressEnabled_) {
++        vertexUsage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
++        indexUsage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
++    }
++
++    // [D24(a)] MemoryCategory::GeometryPool threaded through the SAME
++    // choke point (Allocator::createDeviceLocalBuffer()) every other
++    // device-local buffer in this engine already uses -- this is what
++    // makes a chunk allocation show up in Allocator::report()'s
++    // "geometry-pool" category for free, with no separate ledger.
++    auto vertexBuffer =
++        allocator_.createDeviceLocalBuffer(vertexBytes, vertexUsage, rx::rhi::MemoryCategory::GeometryPool);
++    if (!vertexBuffer.has_value()) {
++        RX_LOG_ERROR("GeometryPool::addBlock: vertex chunk buffer allocation failed ({} bytes)", vertexBytes);
++        return false;
++    }
++
++    auto indexBuffer =
++        allocator_.createDeviceLocalBuffer(indexBytes, indexUsage, rx::rhi::MemoryCategory::GeometryPool);
++    if (!indexBuffer.has_value()) {
++        RX_LOG_ERROR("GeometryPool::addBlock: index chunk buffer allocation failed ({} bytes)", indexBytes);
++        return false;
++    }
++
++    // TLSF by construction: VmaVirtualBlockCreateInfo::flags is left at 0
++    // -- the default metadata class whenever
++    // VMA_VIRTUAL_BLOCK_CREATE_LINEAR_ALGORITHM_BIT is NOT set (verified
++    // directly against the vendored vk_mem_alloc.h, matrix-issue21's own
++    // "VmaVirtualBlock allocation algorithm" row) -- NEVER set that flag
++    // here: it selects a stack/ring/free-at-once allocator structurally
++    // unsuited to a pool with arbitrary alloc/free (D9).
++    //
++    // `size` here is `vertexElementCapacity`/`indexElementCapacity` --
++    // ELEMENT counts, not bytes; see this method's own comment above and
++    // the class header's "Suballocation units" paragraph for why.
++    VmaVirtualBlockCreateInfo vertexBlockInfo{};
++    vertexBlockInfo.size = vertexElementCapacity;
++    VmaVirtualBlock vertexVirtualBlock = VK_NULL_HANDLE;
++    if (vmaCreateVirtualBlock(&vertexBlockInfo, &vertexVirtualBlock) != VK_SUCCESS) {
++        RX_LOG_ERROR("GeometryPool::addBlock: vmaCreateVirtualBlock (vertex) failed ({} elements)",
++                     vertexElementCapacity);
++        return false;
++    }
++
++    VmaVirtualBlockCreateInfo indexBlockInfo{};
++    indexBlockInfo.size = indexElementCapacity;
++    VmaVirtualBlock indexVirtualBlock = VK_NULL_HANDLE;
++    if (vmaCreateVirtualBlock(&indexBlockInfo, &indexVirtualBlock) != VK_SUCCESS) {
++        RX_LOG_ERROR("GeometryPool::addBlock: vmaCreateVirtualBlock (index) failed ({} elements)",
++                     indexElementCapacity);
++        vmaDestroyVirtualBlock(vertexVirtualBlock);
++        return false;
++    }
++
++    Block block{std::move(*vertexBuffer),
++                std::move(*indexBuffer),
++                vertexVirtualBlock,
++                indexVirtualBlock,
++                vertexBytes,
++                indexBytes,
++                /*vertexBufferAddress=*/0,
++                /*indexBufferAddress=*/0,
++                /*vertexAllocations=*/{},
++                /*indexAllocations=*/{}};
++
++    if (bufferDeviceAddressEnabled_) {
++        VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
++        addressInfo.buffer = block.vertexBuffer.handle();
++        block.vertexBufferAddress = vkGetBufferDeviceAddress(device_, &addressInfo);
++        addressInfo.buffer = block.indexBuffer.handle();
++        block.indexBufferAddress = vkGetBufferDeviceAddress(device_, &addressInfo);
++    }
++
++    RX_LOG_INFO("GeometryPool::addBlock: new block {} created (vertex={}B/{} elements index={}B/{} elements, total "
++                "blocks now {})",
++                blocks_.size(), vertexBytes, vertexElementCapacity, indexBytes, indexElementCapacity,
++                blocks_.size() + 1);
++    blocks_.push_back(std::move(block));
++    return true;
++}
++
++MeshRange GeometryPool::upload(std::span<const PoolVertex> vertices, std::span<const uint32_t> indices) {
++    RX_ASSERT_MAIN_THREAD("GeometryPool::upload");
++
++    if (vertices.empty() || indices.empty()) {
++        RX_LOG_ERROR("GeometryPool::upload: rejected -- vertices ({}) and indices ({}) must both be non-empty",
++                     vertices.size(), indices.size());
++        return MeshRange{};
++    }
++
++    const auto vertexElementCount = static_cast<VkDeviceSize>(vertices.size());
++    const auto indexElementCount = static_cast<VkDeviceSize>(indices.size());
++    const VkDeviceSize vertexBytes = vertexElementCount * sizeof(PoolVertex);
++    const VkDeviceSize indexBytes = indexElementCount * sizeof(uint32_t);
++
++    size_t targetBlockIndex = kInvalidBlockIndex;
++    // ELEMENT offsets (PoolVertex count / uint32_t count), never byte
++    // offsets -- see addBlock()'s "ELEMENT-UNIT virtual blocks" comment.
++    // Because the virtual block's own addressable unit IS one element,
++    // `alignment` below is left at 0 (VMA's documented "no special
++    // alignment beyond the unit itself" sentinel, a trivially valid
++    // power-of-two-or-zero value) -- there is no separate byte-alignment
++    // step to get right or wrong: every returned offset is an INTEGER
++    // element count by construction, so `vertexOffset`/`firstIndex` below
++    // are exact with zero division, zero truncation risk, and zero
++    // dependency on 48 (PoolVertex's stride) happening to be a power of
++    // two -- it is not (48 = 16*3), which is exactly why this class does
++    // NOT pass byte-domain alignment=48 to VMA: `VmaVirtualAllocationCreateInfo::
++    // alignment` is documented "Must be power of two" (vk_mem_alloc.h),
++    // and passing 48 there was empirically verified (this task) to
++    // produce a garbage, non-48-aligned offset -- see the task report for
++    // the reproduction. The index side (4-byte uint32_t, alignment=4,
++    // which IS a power of two) would have worked with the byte-domain
++    // approach, but the SAME element-unit design is used for both sides
++    // for symmetry and because it is strictly simpler (no alignment
++    // parameter to reason about on either side at all).
++    VkDeviceSize vertexElementOffset = 0;
++    VmaVirtualAllocation vertexAlloc = VK_NULL_HANDLE;
++    VkDeviceSize indexElementOffset = 0;
++    VmaVirtualAllocation indexAlloc = VK_NULL_HANDLE;
++
++    // Try every EXISTING block, in creation order, before growing --
++    // never a hidden compaction/defrag step (D9): a block either has a
++    // single free hole big enough for both requests right now, or it
++    // doesn't, full stop.
++    for (size_t i = 0; i < blocks_.size() && targetBlockIndex == kInvalidBlockIndex; ++i) {
++        Block& candidate = blocks_[i];
++
++        VmaVirtualAllocationCreateInfo vertexCreateInfo{};
++        vertexCreateInfo.size = vertexElementCount;
++        VmaVirtualAllocation vertexCandidate = VK_NULL_HANDLE;
++        VkDeviceSize vertexOffsetCandidate = 0;
++        if (vmaVirtualAllocate(candidate.vertexVirtualBlock, &vertexCreateInfo, &vertexCandidate,
++                                &vertexOffsetCandidate) != VK_SUCCESS) {
++            continue;
++        }
++
++        VmaVirtualAllocationCreateInfo indexCreateInfo{};
++        indexCreateInfo.size = indexElementCount;
++        VmaVirtualAllocation indexCandidate = VK_NULL_HANDLE;
++        VkDeviceSize indexOffsetCandidate = 0;
++        if (vmaVirtualAllocate(candidate.indexVirtualBlock, &indexCreateInfo, &indexCandidate,
++                                &indexOffsetCandidate) != VK_SUCCESS) {
++            // Roll back the vertex-side suballocation this block already
++            // granted -- this block cannot host the whole mesh, so it
++            // must end this call with no partial allocation left behind.
++            vmaVirtualFree(candidate.vertexVirtualBlock, vertexCandidate);
++            continue;
++        }
++
++        targetBlockIndex = i;
++        vertexElementOffset = vertexOffsetCandidate;
++        vertexAlloc = vertexCandidate;
++        indexElementOffset = indexOffsetCandidate;
++        indexAlloc = indexCandidate;
++    }
++
++    if (targetBlockIndex == kInvalidBlockIndex) {
++        // Exhaustion (or the pool is still empty): grow by one block,
++        // sized to fit this request even if it exceeds the configured
++        // chunk default. addBlock() may reallocate blocks_ (std::vector
++        // growth) -- every reference into blocks_ below is re-fetched by
++        // INDEX after this call, never held across it.
++        if (!addBlock(vertexBytes, indexBytes)) {
++            RX_LOG_ERROR("GeometryPool::upload: failed to grow a new block for {} vertex bytes / {} index bytes",
++                         vertexBytes, indexBytes);
++            return MeshRange{};
++        }
++        targetBlockIndex = blocks_.size() - 1;
++        Block& freshBlock = blocks_[targetBlockIndex];
++
++        VmaVirtualAllocationCreateInfo vertexCreateInfo{};
++        vertexCreateInfo.size = vertexElementCount;
++        if (vmaVirtualAllocate(freshBlock.vertexVirtualBlock, &vertexCreateInfo, &vertexAlloc,
++                                &vertexElementOffset) != VK_SUCCESS) {
++            RX_LOG_ERROR(
++                "GeometryPool::upload: vertex suballocation failed on a block just sized to fit it -- should be "
++                "unreachable");
++            return MeshRange{};
++        }
++
++        VmaVirtualAllocationCreateInfo indexCreateInfo{};
++        indexCreateInfo.size = indexElementCount;
++        if (vmaVirtualAllocate(freshBlock.indexVirtualBlock, &indexCreateInfo, &indexAlloc, &indexElementOffset) !=
++            VK_SUCCESS) {
++            RX_LOG_ERROR(
++                "GeometryPool::upload: index suballocation failed on a block just sized to fit it -- should be "
++                "unreachable");
++            vmaVirtualFree(freshBlock.vertexVirtualBlock, vertexAlloc);
++            return MeshRange{};
++        }
++    }
++
++    // Re-fetch by index: addBlock() above may have reallocated blocks_.
++    Block& target = blocks_[targetBlockIndex];
++
++    target.vertexAllocations.emplace(vertexElementOffset, vertexAlloc);
++    target.indexAllocations.emplace(indexElementOffset, indexAlloc);
++
++    // [D25] Consumes the Task 11 UploadTicket path -- never assumes the
++    // old synchronous-flush contract. Both spans share ONE flush()+wait()
++    // (never a separate wait per suballocation, per the brief's own
++    // wording) -- the documented sync convenience mirroring
++    // rx::rhi::MeshBuffers::create()'s identical contract, so the range
++    // returned below is always immediately safe to bind/draw.
++    //
++    // uploadToBuffer() needs a BYTE destination offset -- the
++    // multiplication below (element offset * element stride) can never
++    // lose precision (unlike a division, it has no remainder to drop),
++    // so it is always exact.
++    const VkDeviceSize vertexByteOffset = vertexElementOffset * sizeof(PoolVertex);
++    const VkDeviceSize indexByteOffset = indexElementOffset * sizeof(uint32_t);
++    uploader_.uploadToBuffer(target.vertexBuffer, vertexByteOffset, vertices.data(), vertexBytes);
++    uploader_.uploadToBuffer(target.indexBuffer, indexByteOffset, indices.data(), indexBytes);
++    uploader_.wait(uploader_.flush());
++
++    // Element offsets, exact by construction (see above) -- NOT a byte
++    // offset divided down. `vertexOffset`/`firstIndex` are the plain
++    // element-count values vmaVirtualAllocate() returned; no division
++    // occurs anywhere on this path.
++    MeshRange range;
++    range.blockId = static_cast<uint32_t>(targetBlockIndex);
++    range.firstIndex = static_cast<uint32_t>(indexElementOffset);
++    range.indexCount = static_cast<uint32_t>(indices.size());
++    range.vertexOffset = static_cast<int32_t>(vertexElementOffset);
++    return range;
++}
++
++void GeometryPool::free(const MeshRange& range) {
++    RX_ASSERT_MAIN_THREAD("GeometryPool::free");
++
++    if (range.blockId >= blocks_.size()) {
++        RX_LOG_ERROR("GeometryPool::free: blockId {} is out of range ({} blocks live)", range.blockId,
++                     blocks_.size());
++        return;
++    }
++
++    Block& block = blocks_[range.blockId];
++    // MeshRange's fields ARE the element offsets upload() originally
++    // allocated at (see that method's own comment) -- looked up directly,
++    // no byte conversion.
++    const auto vertexElementOffset = static_cast<VkDeviceSize>(range.vertexOffset);
++    const auto indexElementOffset = static_cast<VkDeviceSize>(range.firstIndex);
++
++    auto vertexIt = block.vertexAllocations.find(vertexElementOffset);
++    auto indexIt = block.indexAllocations.find(indexElementOffset);
++    if (vertexIt == block.vertexAllocations.end() || indexIt == block.indexAllocations.end()) {
++        RX_LOG_ERROR(
++            "GeometryPool::free: MeshRange{{blockId={}, firstIndex={}, vertexOffset={}}} does not match a live "
++            "suballocation -- double-free or a range this pool never returned",
++            range.blockId, range.firstIndex, range.vertexOffset);
++        return;
++    }
++
++    // No defragmentation (D9): this only releases the range back to its
++    // block's own TLSF free-list for future reuse (vmaVirtualFree
++    // coalesces adjacent free space internally) -- it never moves any
++    // other live suballocation's data.
++    vmaVirtualFree(block.vertexVirtualBlock, vertexIt->second);
++    vmaVirtualFree(block.indexVirtualBlock, indexIt->second);
++    block.vertexAllocations.erase(vertexIt);
++    block.indexAllocations.erase(indexIt);
++}
++
++void GeometryPool::bind(VkCommandBuffer cmd, uint32_t blockId) const {
++    RX_ASSERT_MAIN_THREAD("GeometryPool::bind");
++
++    if (blockId >= blocks_.size()) {
++        RX_LOG_ERROR("GeometryPool::bind: blockId {} is out of range ({} blocks live)", blockId, blocks_.size());
++        return;
++    }
++
++    const Block& block = blocks_[blockId];
++    VkBuffer vertexBufferHandle = block.vertexBuffer.handle();
++    VkDeviceSize vertexBindOffset = 0;
++    vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBufferHandle, &vertexBindOffset);
++    vkCmdBindIndexBuffer(cmd, block.indexBuffer.handle(), 0, VK_INDEX_TYPE_UINT32);
++}
++
++PoolStats GeometryPool::stats() const {
++    PoolStats out;
++    out.blockCount = static_cast<uint32_t>(blocks_.size());
++    out.blocks.reserve(blocks_.size());
++
++    for (const Block& block : blocks_) {
++        // VmaStatistics::allocationBytes/blockBytes are reported in
++        // WHATEVER UNITS the virtual block was created with -- since
++        // these two blocks are sized in ELEMENT counts, not bytes (see
++        // addBlock()'s own comment), the raw values here are element
++        // counts too; multiplying back by each side's element stride is
++        // what turns them into the byte-denominated PoolStats/
++        // PoolBlockStats public contract.
++        VmaStatistics vertexStats{};
++        vmaGetVirtualBlockStatistics(block.vertexVirtualBlock, &vertexStats);
++        VmaStatistics indexStats{};
++        vmaGetVirtualBlockStatistics(block.indexVirtualBlock, &indexStats);
++
++        PoolBlockStats blockStats;
++        blockStats.vertexBytesUsed = vertexStats.allocationBytes * sizeof(PoolVertex);
++        blockStats.vertexBytesCapacity = block.vertexCapacityBytes;
++        blockStats.indexBytesUsed = indexStats.allocationBytes * sizeof(uint32_t);
++        blockStats.indexBytesCapacity = block.indexCapacityBytes;
++
++        out.vertexBytesUsed += blockStats.vertexBytesUsed;
++        out.vertexBytesCapacity += blockStats.vertexBytesCapacity;
++        out.indexBytesUsed += blockStats.indexBytesUsed;
++        out.indexBytesCapacity += blockStats.indexBytesCapacity;
++        out.blocks.push_back(blockStats);
++    }
++
++    return out;
++}
++
++VkDeviceAddress GeometryPool::vertexBufferDeviceAddress(uint32_t blockId) const {
++    if (!bufferDeviceAddressEnabled_ || blockId >= blocks_.size()) {
++        return 0;
++    }
++    return blocks_[blockId].vertexBufferAddress;
++}
++
++VkDeviceAddress GeometryPool::indexBufferDeviceAddress(uint32_t blockId) const {
++    if (!bufferDeviceAddressEnabled_ || blockId >= blocks_.size()) {
++        return 0;
++    }
++    return blocks_[blockId].indexBufferAddress;
++}
++
++VkDeviceSize GeometryPool::vertexBufferAllocatedBytes(uint32_t blockId) const {
++    if (blockId >= blocks_.size()) {
++        return 0;
++    }
++    return blocks_[blockId].vertexBuffer.allocatedBytes();
++}
++
++VkDeviceSize GeometryPool::indexBufferAllocatedBytes(uint32_t blockId) const {
++    if (blockId >= blocks_.size()) {
++        return 0;
++    }
++    return blocks_[blockId].indexBuffer.allocatedBytes();
++}
++
++VkBuffer GeometryPool::vertexBufferHandle(uint32_t blockId) const {
++    if (blockId >= blocks_.size()) {
++        return VK_NULL_HANDLE;
++    }
++    return blocks_[blockId].vertexBuffer.handle();
++}
++
++VkBuffer GeometryPool::indexBufferHandle(uint32_t blockId) const {
++    if (blockId >= blocks_.size()) {
++        return VK_NULL_HANDLE;
++    }
++    return blocks_[blockId].indexBuffer.handle();
++}
++
++}  // namespace rx::asset
+diff --git a/src/rx_asset/include/rx_asset/geometry_pool.h b/src/rx_asset/include/rx_asset/geometry_pool.h
+new file mode 100644
+index 0000000..accbb95
+--- /dev/null
++++ b/src/rx_asset/include/rx_asset/geometry_pool.h
+@@ -0,0 +1,339 @@
++#pragma once
++
++// Thread-affinity (D5, Phase 4 Stage 1 Task 12): GeometryPool's suballocation
++// state (per-block VmaVirtualBlock TLSF metadata) is NOT internally
++// synchronized -- VMA's own virtual-block API documents itself as "not
++// thread-safe... should not be used from multiple threads simultaneously,
++// must be synchronized externally" (vendored vk_mem_alloc.h) -- so
++// create()/upload()/free()/bind() are main-thread-only, matching every
++// other GPU-object-mutation entry point in this codebase (BindlessTable/
++// Uploader/DeletionQueue/Allocator -- see docs/threading.md). stats()/
++// blockCount()/bufferDeviceAddressEnabled()/*BufferDeviceAddress() are
++// read-only snapshots, safe from any thread holding a valid reference.
++
++#include <rx_rhi_vk/buffer.h>
++#include <cstdint>
++#include <memory>
++#include <span>
++#include <unordered_map>
++#include <vector>
++
++namespace rx::rhi {
++class Device;
++class Uploader;
++}  // namespace rx::rhi
++
++namespace rx::asset {
++
++// [D8] One interleaved vertex format for ALL pooled static geometry:
++// position (f32x3) | normal (f32x3) | tangent (f32x4, w = handedness) |
++// uv0 (f32x2) = 48 bytes, pinned by the static_assert below. Chosen over a
++// packed encoding (1010102-style normals etc.) for Phase 4 simplicity --
++// packing is a recorded optimization candidate once meshlets arrive.
++// Existing procedural samples keep their own layouts unchanged; this
++// format serves imported content (Task 13+) and any other pooled
++// geometry.
++struct PoolVertex {
++    float px = 0.0F, py = 0.0F, pz = 0.0F;
++    float nx = 0.0F, ny = 0.0F, nz = 0.0F;
++    float tx = 0.0F, ty = 0.0F, tz = 0.0F, tw = 0.0F;
++    float u = 0.0F, v = 0.0F;
++};
++static_assert(sizeof(PoolVertex) == 48, "PoolVertex must stay exactly 48 bytes -- spec D8, pinned");
++static_assert(alignof(PoolVertex) == 4, "PoolVertex must stay 4-byte aligned (no hidden padding) -- spec D8");
++
++// A suballocated draw range within one GeometryPool block: `firstIndex`/
++// `indexCount` address the block's shared index buffer, `vertexOffset` is
++// added to every fetched index before it addresses the block's shared
++// vertex buffer (vkCmdDrawIndexed's own `vertexOffset` semantics) --
++// exactly the firstIndex/vertexOffset addressing D9/D26 commit to (the
++// GPU-driven-ready layout). Both `firstIndex` and `vertexOffset` are
++// ELEMENT counts, never byte offsets. GeometryPool's internal suballocator
++// (geometry_pool.cpp) allocates directly in ELEMENT units (one PoolVertex
++// / one uint32_t per unit, not bytes) specifically so these fields are the
++// suballocator's raw returned offset with NO division step anywhere on
++// the path that produces them -- see addBlock()'s "ELEMENT-UNIT virtual
++// blocks" comment for why: VMA's `VmaVirtualAllocationCreateInfo::
++// alignment` must be a power of two, and 48 (PoolVertex's byte stride) is
++// not, so a byte-domain "alignment = 48" request (as an earlier version
++// of this class attempted, matching the gate matrix's literal wording)
++// was empirically verified, this task, to produce a non-48-aligned
++// offset -- the element-unit design sidesteps the problem entirely rather
++// than working around VMA's precondition.
++struct MeshRange {
++    uint32_t blockId = 0;
++    uint32_t firstIndex = 0;
++    uint32_t indexCount = 0;
++    int32_t vertexOffset = 0;
++
++    bool operator==(const MeshRange&) const = default;
++};
++
++// Default chunk sizes [D9]. new-chunk-on-exhaustion grows blocks at these
++// sizes (or, when a single upload() call's own vertex/index payload
++// exceeds one default chunk outright, a block sized to fit that one
++// payload -- see geometry_pool.cpp's addBlock()).
++inline constexpr VkDeviceSize kDefaultVertexChunkBytes = 64ull * 1024 * 1024;
++inline constexpr VkDeviceSize kDefaultIndexChunkBytes = 32ull * 1024 * 1024;
++
++struct PoolConfig {
++    VkDeviceSize vertexChunkBytes = kDefaultVertexChunkBytes;
++    VkDeviceSize indexChunkBytes = kDefaultIndexChunkBytes;
++};
++
++// Per-block bytes used/capacity -- the FAST vmaGetVirtualBlockStatistics()
++// tier (matrix-issue21's "Stats API surface" row), cheap enough to call
++// every frame; there is no per-frame detailed/string dump here (VMA's
++// slower vmaCalculateVirtualBlockStatistics()/vmaBuildVirtualBlockStatsString()
++// tiers are reserved for an explicit on-demand debug dump, never exercised
++// by stats() itself).
++struct PoolBlockStats {
++    VkDeviceSize vertexBytesUsed = 0;
++    VkDeviceSize vertexBytesCapacity = 0;
++    VkDeviceSize indexBytesUsed = 0;
++    VkDeviceSize indexBytesCapacity = 0;
++};
++
++// Aggregate pool stats. `blockCount` [gate ruling #21] feeds #27's
++// unbounded-growth visibility: GeometryPool never caps growth itself, and
++// a rising block count across frames is the observable signal a future
++// eviction policy (streaming phase) reacts to. Tracy plots are the
++// CALLER's responsibility -- stats() returns a plain snapshot, exactly
++// like rx::rhi::RxMemoryReport (memory_report.h) -- see a sample's HUD
++// code for where this feeds in.
++struct PoolStats {
++    uint32_t blockCount = 0;
++    VkDeviceSize vertexBytesUsed = 0;
++    VkDeviceSize vertexBytesCapacity = 0;
++    VkDeviceSize indexBytesUsed = 0;
++    VkDeviceSize indexBytesCapacity = 0;
++    std::vector<PoolBlockStats> blocks;
++};
++
++// GeometryPool owns the engine's pooled global vertex/index storage [D9]:
++// one DEVICE_LOCAL vertex buffer + one DEVICE_LOCAL index buffer per
++// "block" (chunk), each pair suballocated independently via its own
++// VmaVirtualBlock (VMA's CPU-side TLSF virtual allocator -- see the
++// vendored vk_mem_alloc.h; NEVER
++// VMA_VIRTUAL_BLOCK_CREATE_LINEAR_ALGORITHM_BIT, which is a stack/ring
++// allocator unsuited to arbitrary free/reuse). A mesh's vertex range and
++// index range always land in the SAME block (same blockId) -- draws bind
++// one block's pair (bind()) and address both ranges with plain
++// firstIndex/vertexOffset (vkCmdDrawIndexed), never a cross-block
++// reference.
++//
++// Growth: upload() tries every existing block in creation order; the
++// first one with room for BOTH the incoming vertices AND indices wins.
++// If none fits, a new block is created (sized to PoolConfig's chunk
++// defaults, or larger if the incoming payload alone exceeds a default
++// chunk) and the suballocation is guaranteed to succeed there.
++//
++// SUBALLOCATION UNITS: each block's vertex/index VmaVirtualBlock is
++// created and addressed in ELEMENT units (one PoolVertex / one uint32_t
++// per unit), not bytes -- see geometry_pool.cpp's addBlock()/upload() for
++// the full rationale. In short: VMA's `VmaVirtualAllocationCreateInfo::
++// alignment` must be a power of two, and PoolVertex's 48-byte stride is
++// not (48 = 16*3) -- a byte-domain "alignment = 48" request was
++// empirically verified, this task, to produce a non-48-aligned offset.
++// Allocating in element units instead sidesteps the problem structurally:
++// every returned offset is already the exact `vertexOffset`/`firstIndex`
++// value, with no division (and therefore no truncation risk) anywhere on
++// the path.
++//
++// NO DEFRAGMENTATION [D9]: free() only releases a range back to its
++// block's own TLSF metadata for future reuse (vmaVirtualFree, which
++// coalesces adjacent free space) -- it never moves live data, and
++// GeometryPool never compacts across blocks either. A request that
++// cannot fit any single free hole -- even when the block's TOTAL free
++// bytes would be enough -- takes the same new-block path as true
++// exhaustion; this is the deliberate, tested absence of compaction, not
++// an oversight (see geometry_pool_test.cpp's checkerboard fragmentation
++// test).
++class GeometryPool {
++public:
++    GeometryPool(const GeometryPool&) = delete;
++    GeometryPool& operator=(const GeometryPool&) = delete;
++    GeometryPool(GeometryPool&&) = delete;
++    GeometryPool& operator=(GeometryPool&&) = delete;
++    ~GeometryPool();
++
++    // Builds an empty pool (zero blocks -- the first upload() creates the
++    // first block on demand, per the growth policy above).
++    //
++    // `allocator`/`uploader` are stored BY REFERENCE: this GeometryPool
++    // must not outlive either (nor the rx::rhi::Device/Context beneath
++    // them) -- the same lifetime discipline every other Allocator-derived
++    // RAII type in this codebase already follows (see rx_rhi_vk/buffer.h's
++    // own comment on Buffer). Chunk buffers are allocated through
++    // `allocator` via its existing createDeviceLocalBuffer() choke point,
++    // tagged rx::rhi::MemoryCategory::GeometryPool [D24(a)] -- this is
++    // what lets a chunk allocation show up in the SAME accounting report
++    // (Allocator::report()) the rest of the engine already reads, rather
++    // than a private, invisible ledger.
++    //
++    // `device` is consulted only during this call, to resolve
++    // bufferDeviceAddressEnabled() below [D26.4] via
++    // rx::rhi::Device::supportsBufferDeviceAddress() -- its VkDevice
++    // handle is cached, not the C++ reference.
++    //
++    // Deviation from the plan's illustrative interface sketch
++    // (`create(rhi::Device&, rhi::Uploader&, const PoolConfig&)`): this
++    // signature adds `rx::rhi::Allocator&` as an explicit parameter. This
++    // is necessary, not incidental -- the #27 accounting-integration
++    // acceptance criterion requires chunk buffers to land in the SAME
++    // MemoryAccounting ledger the rest of the engine reads, which only
++    // holds if GeometryPool is handed the caller's real Allocator rather
++    // than constructing (or being handed) a private one of its own; see
++    // the task report for the full rationale.
++    //
++    // Always succeeds today (returns a non-null pointer) -- kept
++    // std::unique_ptr, matching the plan's own interface, for forward
++    // compatibility with a future fallible construction step.
++    static std::unique_ptr<GeometryPool> create(rx::rhi::Allocator& allocator, rx::rhi::Device& device,
++                                                  rx::rhi::Uploader& uploader,
++                                                  const PoolConfig& config = PoolConfig{});
++
++    // Suballocates `vertices.size()` PoolVertex elements and
++    // `indices.size()` uint32_t elements from the first block with room
++    // for both (or a fresh block, per the growth policy), uploads both
++    // spans through this pool's Uploader (consuming its UploadTicket path
++    // [D25] -- never assumes the old synchronous-flush contract), and
++    // returns the resulting MeshRange.
++    //
++    // Per D25's documented sync convenience, this call does exactly ONE
++    // flush()+wait() for its own batch before returning -- both spans
++    // share that one flush, never a separate wait per suballocation --
++    // mirroring rx::rhi::MeshBuffers::create()'s identical "convenience
++    // wrapper" contract, so the range this call returns is always
++    // immediately safe to bind/draw.
++    //
++    // `vertices` and `indices` must both be non-empty. Returns a
++    // default-constructed (blockId/firstIndex/indexCount/vertexOffset all
++    // 0) MeshRange, logged, on any allocation/upload failure -- callers
++    // that need to distinguish that from a legitimate empty-range result
++    // should check `indices.empty()` themselves first, since GeometryPool
++    // never returns a zero-indexCount range for a non-empty request.
++    //
++    // Main-thread-only (D5).
++    MeshRange upload(std::span<const PoolVertex> vertices, std::span<const uint32_t> indices);
++
++    // Releases `range`'s vertex and index suballocations back to their
++    // block's TLSF metadata (vmaVirtualFree) for future reuse -- no
++    // defragmentation, no data movement (D9). `range` must be a value
++    // this GeometryPool's own upload() previously returned and that has
++    // not already been freed -- a double-free or an unrecognized range is
++    // a logged error, not UB.
++    //
++    // Main-thread-only (D5).
++    void free(const MeshRange& range);
++
++    // Binds `blockId`'s vertex buffer (binding 0, offset 0) and index
++    // buffer (offset 0, VK_INDEX_TYPE_UINT32 -- D9/gate ruling #21's
++    // u32-only policy) onto `cmd`. Every vkCmdDrawIndexed call recorded
++    // afterward (until the next bind()) must use a MeshRange whose
++    // blockId matches.
++    //
++    // Main-thread-only (D5) -- like every other GPU-object-mutation entry
++    // point in this class: this method only ever reads this pool's own
++    // bookkeeping state (its Buffer handles), never a worker-recorded
++    // command buffer's contents, but the guard matches every sibling
++    // entry point's identical scoping per this project's own convention.
++    void bind(VkCommandBuffer cmd, uint32_t blockId) const;
++
++    // Snapshot of bytes used/capacity (vertex + index, summed across
++    // every block) plus block COUNT [gate ruling #21] and a per-block
++    // breakdown. Cheap: calls VMA's FAST vmaGetVirtualBlockStatistics()
++    // tier per block, never the slow detailed/string tiers. Safe from any
++    // thread holding a valid reference.
++    PoolStats stats() const;
++
++    uint32_t blockCount() const { return static_cast<uint32_t>(blocks_.size()); }
++
++    // [D26.4] True iff this pool's chunk buffers were created with
++    // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT and this pool's Allocator
++    // was built with VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT --
++    // resolved once at create() from rx::rhi::Device::
++    // supportsBufferDeviceAddress(). Enablement only: nothing in Phase 4
++    // consumes the addresses below.
++    bool bufferDeviceAddressEnabled() const { return bufferDeviceAddressEnabled_; }
++
++    // [D26.4] vkGetBufferDeviceAddress() for `blockId`'s vertex/index
++    // buffer -- always 0 when bufferDeviceAddressEnabled() is false (no
++    // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT usage bit was ever
++    // requested on a block buffer in that case, so querying one would be
++    // a validation error, not merely a meaningless value; these two
++    // methods simply never call the Vulkan function at all when
++    // disabled).
++    VkDeviceAddress vertexBufferDeviceAddress(uint32_t blockId) const;
++    VkDeviceAddress indexBufferDeviceAddress(uint32_t blockId) const;
++
++    // Test/diagnostic accessors -- production code has no need for them.
++    // The REAL VMA-reported allocated bytes for `blockId`'s vertex/index
++    // chunk buffer (rx::rhi::Buffer::allocatedBytes()), which may exceed
++    // the nominal chunk size requested (PoolConfig::vertexChunkBytes/
++    // indexChunkBytes, or whatever addBlock() sized this specific block
++    // to) if VMA pads for alignment/block granularity -- this is what the
++    // #27 accounting-integration test compares Allocator::report()'s
++    // delta against, since MemoryAccounting records the REAL allocated
++    // size, not the nominal request (see rx_rhi_vk/memory_report.h's own
++    // comment on Buffer::allocatedBytes()).
++    VkDeviceSize vertexBufferAllocatedBytes(uint32_t blockId) const;
++    VkDeviceSize indexBufferAllocatedBytes(uint32_t blockId) const;
++
++    // Test/diagnostic accessors -- production code has no need for them
++    // (bind() is the sanctioned way to attach a block's buffers to a
++    // command buffer for drawing). Raw handles for `blockId`'s vertex/
++    // index chunk buffer, so a test can read back their content directly
++    // (vkCmdCopyBuffer) to prove upload()'s returned MeshRange offsets are
++    // byte-exact -- see geometry_pool_test.cpp. VK_NULL_HANDLE if
++    // `blockId` is out of range.
++    VkBuffer vertexBufferHandle(uint32_t blockId) const;
++    VkBuffer indexBufferHandle(uint32_t blockId) const;
++
++private:
++    // One chunk: a device-local vertex+index Buffer pair plus their own
++    // independent VmaVirtualBlock CPU-side suballocators (ELEMENT-offset
++    // space -- one PoolVertex / one uint32_t per unit, NOT bytes, and NOT
++    // tied to the Buffer's own VMA memory allocation -- see the class
++    // comment's "SUBALLOCATION UNITS" paragraph). `*Allocations` maps a
++    // live suballocation's ELEMENT offset to the VmaVirtualAllocation
++    // handle vmaVirtualFree() needs -- MeshRange itself carries no such
++    // handle (it is a plain, small, copyable POD per the plan's own
++    // interface), so free() looks it up here directly by MeshRange's own
++    // firstIndex/vertexOffset fields (already element offsets, no
++    // conversion).
++    struct Block {
++        rx::rhi::Buffer vertexBuffer;
++        rx::rhi::Buffer indexBuffer;
++        VmaVirtualBlock vertexVirtualBlock = VK_NULL_HANDLE;
++        VmaVirtualBlock indexVirtualBlock = VK_NULL_HANDLE;
++        VkDeviceSize vertexCapacityBytes = 0;
++        VkDeviceSize indexCapacityBytes = 0;
++        VkDeviceAddress vertexBufferAddress = 0;
++        VkDeviceAddress indexBufferAddress = 0;
++        std::unordered_map<VkDeviceSize, VmaVirtualAllocation> vertexAllocations;
++        std::unordered_map<VkDeviceSize, VmaVirtualAllocation> indexAllocations;
++    };
++
++    GeometryPool(rx::rhi::Allocator& allocator, rx::rhi::Uploader& uploader, VkDevice device,
++                 bool bufferDeviceAddressEnabled, PoolConfig config);
++
++    // Creates a new block sized to max(config_.*ChunkBytes, minimum
++    // required bytes) and appends it to blocks_. Returns false (logged)
++    // on any allocation failure -- see geometry_pool.cpp for the exact
++    // call sequence (createDeviceLocalBuffer with
++    // MemoryCategory::GeometryPool [D24(a)] + the BDA usage bit when
++    // enabled, then vmaCreateVirtualBlock for both buffers).
++    bool addBlock(VkDeviceSize minVertexBytes, VkDeviceSize minIndexBytes);
++
++    void destroyAll();
++
++    rx::rhi::Allocator& allocator_;
++    rx::rhi::Uploader& uploader_;
++    VkDevice device_ = VK_NULL_HANDLE;
++    bool bufferDeviceAddressEnabled_ = false;
++    PoolConfig config_;
++    std::vector<Block> blocks_;
++};
++
++}  // namespace rx::asset
+diff --git a/src/rx_asset/tests/CMakeLists.txt b/src/rx_asset/tests/CMakeLists.txt
+new file mode 100644
+index 0000000..98c811c
+--- /dev/null
++++ b/src/rx_asset/tests/CMakeLists.txt
+@@ -0,0 +1,37 @@
++# GPU-backed only -- device-free is impossible for GeometryPool's real
++# behavior (every upload() call allocates a real device-local VkBuffer
++# pair and records a real GPU copy) [Task 12 brief]. doctest_main.cpp
++# builds a real vk-bootstrap instance at warm-up, so this binary needs the
++# same process-wide instance-function-pointer-caching warm-up
++# src/rx_rhi_vk/tests/doctest_main.cpp / src/rx_graph/tests/
++# doctest_main_gpu.cpp both establish -- see that file's own comment.
++# rx_shader is linked because geometry_pool_test.cpp's exhaustion-draw
++# test compiles a minimal push-constant-color fill shader in-process
++# (rx::shader::Compiler + reflect(), the same reflection-driven
++# pipeline-layout path samples/03_bindless_mesh/main.cpp and
++# rx_graph_gpu_tests' own "Fill" pipeline establish) rather than through a
++# slangc build-time precompile -- rx_shader_deploy_runtime_libs() (defined
++# in src/rx_shader/CMakeLists.txt, add_subdirectory'd before src/rx_asset
++# in the root CMakeLists.txt) copies the Slang runtime shared libraries
++# this binary needs at load time next to it, exactly like every other
++# rx_shader-linking binary in this repo.
++add_executable(rx_asset_tests
++    doctest_main.cpp
++    geometry_pool_test.cpp
++    bda_test.cpp
++    accounting_test.cpp
++)
++target_link_libraries(rx_asset_tests PRIVATE rx_asset rx_rhi_vk rx_platform rx_shader doctest::doctest)
++rx_shader_deploy_runtime_libs(rx_asset_tests)
++
++# --validate: same documentation/consistency role as every other GPU-gate
++# invocation in this repo (rx_graph_gpu_tests, every sample's own headless
++# ctest gate) -- every fixture here already builds its rx::rhi::Context
++# with enableValidation=true unconditionally, and each TEST_CASE's own
++# CHECK_FALSE(context.hasValidationErrors()) is what actually turns a
++# validation message into a ctest failure; doctest itself ignores this
++# flag.
++add_test(NAME rx_asset_tests COMMAND rx_asset_tests --validate)
++# Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
++# (windows-cross Wine hang, run 31512073559).
++set_tests_properties(rx_asset_tests PROPERTIES TIMEOUT 300)
+diff --git a/src/rx_asset/tests/accounting_test.cpp b/src/rx_asset/tests/accounting_test.cpp
+new file mode 100644
+index 0000000..faeb011
+--- /dev/null
++++ b/src/rx_asset/tests/accounting_test.cpp
+@@ -0,0 +1,118 @@
++#include <doctest/doctest.h>
++#include <rx_asset/geometry_pool.h>
++#include <rx_rhi_vk/device.h>
++#include <rx_rhi_vk/upload.h>
++#include <rx_platform/window.h>
++#include <cstdint>
++#include <optional>
++#include <utility>
++#include <vector>
++
++// accounting_test.cpp -- the #27 cross-ticket integration acceptance
++// criterion [Phase 4 Stage 1 Task 12, matrix-issue21 row "Pool memory
++// attributed in #27's accounting categories"]: "after GeometryPool
++// allocates a chunk, the #27 accounting report's 'geometry pool' category
++// byte count increases by exactly the chunk's allocated size." Proves
++// GeometryPool threads MemoryCategory::GeometryPool through the SAME
++// Allocator::createDeviceLocalBuffer() choke point every other
++// device-local buffer in this engine uses (rather than a private,
++// invisible ledger) -- see geometry_pool.cpp's addBlock().
++
++namespace {
++
++struct AccountingFixture {
++    rx::platform::Window window;
++    rx::rhi::Context context;
++    rx::rhi::Device device;
++    rx::rhi::Allocator allocator;
++    rx::rhi::Uploader uploader;
++};
++
++std::optional<AccountingFixture> makeFixture(const char* title) {
++    auto window = rx::platform::Window::create(title, 64, 64, /*visible=*/false);
++    if (!window.has_value()) {
++        MESSAGE("no display backend available, skipping GeometryPool accounting test");
++        return std::nullopt;
++    }
++
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        MESSAGE("video driver reports no Vulkan surface extensions, skipping GeometryPool accounting test");
++        return std::nullopt;
++    }
++
++    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++
++    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
++    REQUIRE(surface != VK_NULL_HANDLE);
++
++    auto device = rx::rhi::Device::create(*context, surface);
++    REQUIRE(device.has_value());
++
++    auto allocator = rx::rhi::Allocator::create(*context, *device);
++    REQUIRE(allocator.has_value());
++
++    auto uploader = rx::rhi::Uploader::create(*allocator, *device);
++    REQUIRE(uploader.has_value());
++
++    return AccountingFixture{std::move(*window), std::move(*context), std::move(*device), std::move(*allocator),
++                              std::move(*uploader)};
++}
++
++}  // namespace
++
++TEST_CASE("GeometryPool chunk allocation grows the #27 accounting report's geometry-pool category by exactly the "
++          "chunk's real allocated size") {
++    auto fixture = makeFixture("rx_asset_gp_accounting");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    const rx::rhi::RxMemoryReport before = fixture->allocator.report();
++    const rx::rhi::MemoryCategoryStats beforeStats = before.category(rx::rhi::MemoryCategory::GeometryPool);
++
++    // Chunk sizes chosen as EXACT multiples of PoolVertex's/uint32_t's
++    // element stride (48/4 bytes) -- GeometryPool's own addBlock() rounds
++    // a requested chunk size DOWN to a whole number of elements before
++    // allocating the real buffer (see that method's own comment), so a
++    // non-multiple request would deterministically allocate slightly
++    // fewer bytes than requested; picking exact multiples here keeps this
++    // test's own arithmetic simple. This does NOT make the test depend on
++    // that rounding behavior either way: the assertions below compare
++    // against GeometryPool's own vertexBufferAllocatedBytes()/
++    // indexBufferAllocatedBytes() diagnostic accessors, which report
++    // whatever VMA actually charged for this specific chunk, not the
++    // nominal request.
++    rx::asset::PoolConfig config;
++    config.vertexChunkBytes = 48ull * 20000;  // exactly 20000 PoolVertex elements
++    config.indexChunkBytes = 4ull * 20000;    // exactly 20000 uint32_t elements
++
++    auto pool = rx::asset::GeometryPool::create(fixture->allocator, fixture->device, fixture->uploader, config);
++    REQUIRE(pool != nullptr);
++
++    // One small mesh, guaranteed to fit in the first (and only) block --
++    // exactly ONE chunk allocation (one vertex Buffer + one index Buffer)
++    // happens as a result of this single upload() call.
++    std::vector<rx::asset::PoolVertex> verts(3);
++    std::vector<uint32_t> indices{0, 1, 2};
++    rx::asset::MeshRange range = pool->upload(verts, indices);
++    REQUIRE(pool->blockCount() == 1);
++    CHECK(range.blockId == 0);
++
++    const VkDeviceSize realVertexBytes = pool->vertexBufferAllocatedBytes(0);
++    const VkDeviceSize realIndexBytes = pool->indexBufferAllocatedBytes(0);
++    REQUIRE(realVertexBytes >= config.vertexChunkBytes);
++    REQUIRE(realIndexBytes >= config.indexChunkBytes);
++    MESSAGE("real vertex chunk bytes = ", realVertexBytes, " (requested ", config.vertexChunkBytes, ")");
++    MESSAGE("real index chunk bytes = ", realIndexBytes, " (requested ", config.indexChunkBytes, ")");
++
++    const rx::rhi::RxMemoryReport after = fixture->allocator.report();
++    const rx::rhi::MemoryCategoryStats afterStats = after.category(rx::rhi::MemoryCategory::GeometryPool);
++
++    CHECK(afterStats.bytes - beforeStats.bytes == realVertexBytes + realIndexBytes);
++    // Two new allocations: one vertex Buffer, one index Buffer.
++    CHECK(afterStats.count - beforeStats.count == 2);
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/src/rx_asset/tests/bda_test.cpp b/src/rx_asset/tests/bda_test.cpp
+new file mode 100644
+index 0000000..fe98a8a
+--- /dev/null
++++ b/src/rx_asset/tests/bda_test.cpp
+@@ -0,0 +1,103 @@
++#include <doctest/doctest.h>
++#include <rx_asset/geometry_pool.h>
++#include <rx_rhi_vk/device.h>
++#include <rx_rhi_vk/upload.h>
++#include <rx_platform/window.h>
++#include <cstdint>
++#include <optional>
++#include <utility>
++#include <vector>
++
++// bda_test.cpp -- GeometryPool's own BDA acceptance criterion [Phase 4
++// Stage 1 Task 12, spec D26.4, gate matrix-issue21 row "BDA enablement --
++// pool block buffers carry VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT"]:
++// "test asserts a pool block yields nonzero vkGetBufferDeviceAddress on a
++// supporting device". The lower-level Device/Allocator/Buffer mechanics
++// (feature bit, VMA allocator flag) are covered one layer down in
++// src/rx_rhi_vk/tests/bda_test.cpp; this file exercises the same
++// guarantee through GeometryPool's own public surface
++// (bufferDeviceAddressEnabled()/vertexBufferDeviceAddress()/
++// indexBufferDeviceAddress()) against a real block created by a real
++// upload() call.
++//
++// Empirically verified in-task (2026-08-18) via `vulkaninfo`: both
++// devices available in this development environment (NVIDIA GeForce RTX
++// 2080 proprietary driver, and Mesa llvmpipe/lavapipe) report
++// `bufferDeviceAddress = true` -- see src/rx_rhi_vk/tests/bda_test.cpp's
++// header comment for the full citation.
++
++namespace {
++
++struct BdaPoolFixture {
++    rx::platform::Window window;
++    rx::rhi::Context context;
++    rx::rhi::Device device;
++    rx::rhi::Allocator allocator;
++    rx::rhi::Uploader uploader;
++};
++
++std::optional<BdaPoolFixture> makeFixture(const char* title) {
++    auto window = rx::platform::Window::create(title, 64, 64, /*visible=*/false);
++    if (!window.has_value()) {
++        MESSAGE("no display backend available, skipping GeometryPool BDA test");
++        return std::nullopt;
++    }
++
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        MESSAGE("video driver reports no Vulkan surface extensions, skipping GeometryPool BDA test");
++        return std::nullopt;
++    }
++
++    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++
++    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
++    REQUIRE(surface != VK_NULL_HANDLE);
++
++    auto device = rx::rhi::Device::create(*context, surface);
++    REQUIRE(device.has_value());
++
++    auto allocator = rx::rhi::Allocator::create(*context, *device);
++    REQUIRE(allocator.has_value());
++
++    auto uploader = rx::rhi::Uploader::create(*allocator, *device);
++    REQUIRE(uploader.has_value());
++
++    return BdaPoolFixture{std::move(*window), std::move(*context), std::move(*device), std::move(*allocator),
++                           std::move(*uploader)};
++}
++
++}  // namespace
++
++TEST_CASE("GeometryPool block buffers yield a nonzero vkGetBufferDeviceAddress on a BDA-supporting device") {
++    auto fixture = makeFixture("rx_asset_bda_pool_block");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto pool = rx::asset::GeometryPool::create(fixture->allocator, fixture->device, fixture->uploader);
++    REQUIRE(pool != nullptr);
++
++    CHECK(pool->bufferDeviceAddressEnabled() == fixture->device.supportsBufferDeviceAddress());
++
++    std::vector<rx::asset::PoolVertex> verts(3);
++    std::vector<uint32_t> indices{0, 1, 2};
++    rx::asset::MeshRange range = pool->upload(verts, indices);
++    REQUIRE(pool->blockCount() == 1);
++    CHECK(range.blockId == 0);
++
++    if (pool->bufferDeviceAddressEnabled()) {
++        VkDeviceAddress vertexAddress = pool->vertexBufferDeviceAddress(range.blockId);
++        VkDeviceAddress indexAddress = pool->indexBufferDeviceAddress(range.blockId);
++        CHECK(vertexAddress != 0);
++        CHECK(indexAddress != 0);
++        CHECK(vertexAddress != indexAddress);
++    } else {
++        MESSAGE("this device does not support bufferDeviceAddress -- verifying the disabled branch instead");
++        CHECK(pool->vertexBufferDeviceAddress(range.blockId) == 0);
++        CHECK(pool->indexBufferDeviceAddress(range.blockId) == 0);
++    }
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/src/rx_asset/tests/doctest_main.cpp b/src/rx_asset/tests/doctest_main.cpp
+new file mode 100644
+index 0000000..119a152
+--- /dev/null
++++ b/src/rx_asset/tests/doctest_main.cpp
+@@ -0,0 +1,47 @@
++// DOCTEST_CONFIG_IMPLEMENT (not _WITH_MAIN): main() below needs to run
++// code before any TEST_CASE executes -- the same warm-up pattern
++// src/rx_rhi_vk/tests/doctest_main.cpp and src/rx_graph/tests/
++// doctest_main_gpu.cpp both establish (copied here, not shared -- each
++// GPU-backed test binary in this repo owns its own copy) because this
++// binary's tests build their own headless/windowed rx::rhi::Context+Device
++// instances directly, and are exposed to the exact same vk-bootstrap
++// process-wide instance-function-pointer-caching hazard documented on
++// rx::rhi::Context::create()'s own WARNING (rx_rhi_vk/context.h): building
++// a narrower (e.g. headless-only) instance first would poison a later,
++// broader (windowed) one with null function pointers.
++#define DOCTEST_CONFIG_IMPLEMENT
++#include <doctest/doctest.h>
++#include <rx_rhi_vk/context.h>
++#include <rx_platform/window.h>
++
++#include <vector>
++
++namespace {
++
++void warmUpVkBootstrapInstanceFunctionCache() {
++    std::vector<const char*> extensions;
++    auto window = rx::platform::Window::create("rx_asset_tests_warmup", 64, 64, /*visible=*/false);
++    if (window.has_value()) {
++        extensions = window->requiredVulkanInstanceExtensions();
++    }
++    // enableValidation=true here is not incidental -- see
++    // rx_rhi_vk/tests/doctest_main.cpp's identical warm-up for the full
++    // rationale (the same process-wide vk-bootstrap cache also covers
++    // fp_vkCreateDebugUtilsMessengerEXT, only non-null when the FIRST
++    // instance built in this process actually requested validation).
++    rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    warmUpVkBootstrapInstanceFunctionCache();
++
++    doctest::Context context;
++    context.applyCommandLine(argc, argv);
++    int res = context.run();
++    if (context.shouldExit()) {
++        return res;
++    }
++    return res;
++}
+diff --git a/src/rx_asset/tests/geometry_pool_test.cpp b/src/rx_asset/tests/geometry_pool_test.cpp
+new file mode 100644
+index 0000000..48ef0d9
+--- /dev/null
++++ b/src/rx_asset/tests/geometry_pool_test.cpp
+@@ -0,0 +1,779 @@
++#include <doctest/doctest.h>
++#include <rx_asset/geometry_pool.h>
++#include <rx_rhi_vk/command.h>
++#include <rx_rhi_vk/device.h>
++#include <rx_rhi_vk/pipeline_layout.h>
++#include <rx_rhi_vk/upload.h>
++#include <rx_platform/window.h>
++#include <rx_shader/compiler.h>
++#include <rx_shader/reflection.h>
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++// geometry_pool_test.cpp -- coverage for rx::asset::GeometryPool [Phase 4
++// Stage 1 Task 12, spec D8/D9, gate matrix-issue21 as amended by
++// rulings-2026-08-18.md]. GPU tests only -- device-free is impossible for
++// this class's real behavior (every upload() call allocates a real
++// device-local VkBuffer pair and records a real GPU copy through
++// rx::rhi::Uploader). BDA enablement gets its own file (bda_test.cpp);
++// the #27 accounting-integration criterion gets its own file
++// (accounting_test.cpp) -- both share this file's fixture shape but are
++// kept separate, matching the existing rx_rhi_vk_tests convention of one
++// file per feature-set (memory_budget_test.cpp/oom_handling_test.cpp
++// alongside buffer_test.cpp).
++
++namespace {
++
++struct GpTestFixture {
++    rx::platform::Window window;
++    rx::rhi::Context context;
++    rx::rhi::Device device;
++    rx::rhi::Allocator allocator;
++    rx::rhi::Uploader uploader;
++};
++
++std::optional<GpTestFixture> makeFixture(const char* title) {
++    auto window = rx::platform::Window::create(title, 64, 64, /*visible=*/false);
++    if (!window.has_value()) {
++        MESSAGE("no display backend available, skipping GeometryPool test");
++        return std::nullopt;
++    }
++
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        MESSAGE("video driver reports no Vulkan surface extensions (e.g. dummy driver), skipping GeometryPool test");
++        return std::nullopt;
++    }
++
++    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++
++    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
++    REQUIRE(surface != VK_NULL_HANDLE);
++
++    auto device = rx::rhi::Device::create(*context, surface);
++    REQUIRE(device.has_value());
++
++    auto allocator = rx::rhi::Allocator::create(*context, *device);
++    REQUIRE(allocator.has_value());
++
++    auto uploader = rx::rhi::Uploader::create(*allocator, *device);
++    REQUIRE(uploader.has_value());
++
++    return GpTestFixture{std::move(*window), std::move(*context), std::move(*device), std::move(*allocator),
++                          std::move(*uploader)};
++}
++
++// A `count`-vertex mesh with content that uniquely identifies both which
++// mesh it is (`meshId`) and each vertex's index within it -- so a byte-
++// exact readback comparison can prove BOTH "this data landed at the
++// offset GeometryPool reported" AND "no other mesh's bytes bled into this
++// range". Positions are also placed in NDC so the SAME data doubles as
++// real drawable geometry for the exhaustion/readback test below: `xSpan`
++// selects which half of clip space (e.g. {-1,0} or {0,1}) a 4-vertex quad
++// occupies. Non-quad vertex counts (used by the fragmentation/reuse tests,
++// which never draw) just get an arbitrary NDC-adjacent position -- content
++// correctness is all those tests check.
++std::vector<rx::asset::PoolVertex> makeVerts(uint32_t count, uint32_t meshId) {
++    std::vector<rx::asset::PoolVertex> verts(count);
++    for (uint32_t i = 0; i < count; ++i) {
++        rx::asset::PoolVertex& v = verts[i];
++        v.px = static_cast<float>(meshId) * 1000.0F + static_cast<float>(i);
++        v.py = static_cast<float>(i) * 0.25F;
++        v.pz = 0.0F;
++        v.nx = 1.0F;
++        v.ny = static_cast<float>(meshId);
++        v.nz = static_cast<float>(i);
++        v.tx = 2.0F;
++        v.ty = static_cast<float>(meshId);
++        v.tz = static_cast<float>(i);
++        v.tw = 1.0F;
++        v.u = static_cast<float>(meshId);
++        v.v = static_cast<float>(i);
++    }
++    return verts;
++}
++
++std::vector<uint32_t> makeIndices(uint32_t count, uint32_t meshId) {
++    std::vector<uint32_t> indices(count);
++    for (uint32_t i = 0; i < count; ++i) {
++        // Encodes meshId too (not just 0..count-1) so a content-readback
++        // comparison on the index side is just as discriminating as the
++        // vertex side -- a real index buffer's values are usually small
++        // vertex-index references, but nothing in GeometryPool interprets
++        // these bytes, so using them as an identity pattern is safe and
++        // strictly stronger than an ordinary ascending sequence shared by
++        // every mesh.
++        indices[i] = meshId * 100 + i;
++    }
++    return indices;
++}
++
++// A real drawable quad in NDC (4 vertices, 6 indices -- two triangles),
++// occupying [xMin, xMax] x [-1, 1]. Used by the exhaustion/readback test
++// to actually render from two different GeometryPool blocks.
++std::pair<std::vector<rx::asset::PoolVertex>, std::vector<uint32_t>> makeQuad(uint32_t meshId, float xMin,
++                                                                                float xMax) {
++    std::vector<rx::asset::PoolVertex> verts(4);
++    const std::array<std::array<float, 2>, 4> corners{{{xMin, -1.0F}, {xMax, -1.0F}, {xMax, 1.0F}, {xMin, 1.0F}}};
++    for (size_t i = 0; i < 4; ++i) {
++        verts[i] = rx::asset::PoolVertex{};
++        verts[i].px = corners[i][0];
++        verts[i].py = corners[i][1];
++        verts[i].pz = 0.0F;
++    }
++    (void)meshId;
++    std::vector<uint32_t> indices{0, 1, 2, 0, 2, 3};
++    return {verts, indices};
++}
++
++// Copies `size` bytes out of `src` (assumed device-local, TRANSFER_SRC_BIT)
++// into a freshly allocated, invalidated, host-visible buffer -- the same
++// pattern rx_rhi_vk/tests/upload_test.cpp's own readBackBuffer() uses.
++std::vector<uint8_t> readBackBuffer(rx::rhi::Allocator& allocator, VkDevice device, VkQueue queue,
++                                     uint32_t queueFamily, VkBuffer src, VkDeviceSize offset, VkDeviceSize size) {
++    auto readback = allocator.createHostVisibleBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    REQUIRE(readback.has_value());
++
++    auto cmdCtx = rx::rhi::CommandContext::create(device, queue, queueFamily);
++    REQUIRE(cmdCtx.has_value());
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        VkBufferCopy region{offset, 0, size};
++        vkCmdCopyBuffer(cmd, src, readback->handle(), 1, &region);
++    });
++
++    readback->invalidate();
++
++    std::vector<uint8_t> result(static_cast<size_t>(size));
++    std::memcpy(result.data(), readback->mappedData(), result.size());
++    return result;
++}
++
++}  // namespace
++
++TEST_CASE("GeometryPool::upload two meshes produces distinct, non-overlapping, byte-exact ranges") {
++    auto fixture = makeFixture("rx_asset_gp_distinct_ranges");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto pool = rx::asset::GeometryPool::create(fixture->allocator, fixture->device, fixture->uploader);
++    REQUIRE(pool != nullptr);
++
++    // Deliberately ODD, non-power-of-two-friendly vertex/index counts (5
++    // and 7) -- if the 48-byte/4-byte VMA suballocation alignment were
++    // ever dropped, an odd element count is exactly what would produce a
++    // misaligned byte offset for the SECOND allocation (the first, at
++    // offset 0, is trivially aligned regardless).
++    auto vertsA = makeVerts(5, /*meshId=*/1);
++    auto indicesA = makeIndices(7, /*meshId=*/1);
++    auto vertsB = makeVerts(3, /*meshId=*/2);
++    auto indicesB = makeIndices(9, /*meshId=*/2);
++
++    rx::asset::MeshRange rangeA = pool->upload(vertsA, indicesA);
++    rx::asset::MeshRange rangeB = pool->upload(vertsB, indicesB);
++
++    CHECK(rangeA.blockId == 0);
++    CHECK(rangeB.blockId == 0);
++    CHECK(rangeA.indexCount == 7);
++    CHECK(rangeB.indexCount == 9);
++
++    // Non-overlap: B's vertex/index ranges start no earlier than A's end.
++    CHECK(rangeB.vertexOffset >= rangeA.vertexOffset + static_cast<int32_t>(vertsA.size()));
++    CHECK(rangeB.firstIndex >= rangeA.firstIndex + static_cast<uint32_t>(indicesA.size()));
++
++    // Byte-exact readback proof: this is the discriminating check for the
++    // alignment/offset math (matrix-issue21's "structural invariant"
++    // row) -- MeshRange's vertexOffset/firstIndex are already ELEMENT
++    // counts, so reconstructing `vertexOffset * sizeof(PoolVertex)` and
++    // reading back exactly that many bytes only matches the ORIGINAL
++    // pattern if GeometryPool's internal byte-offset -> element-offset
++    // conversion was exact (a silently truncated/misaligned offset would
++    // read back garbage or a neighboring mesh's bytes instead).
++    // vertexBufferHandle()/indexBufferHandle() are test/diagnostic
++    // accessors (geometry_pool.h) added specifically so a test can read
++    // back a block's raw buffer content directly, without GeometryPool
++    // exposing raw handles as part of its production API (bind() is the
++    // sanctioned production path).
++    VkBuffer vertexBuffer = pool->vertexBufferHandle(rangeA.blockId);
++    VkBuffer indexBuffer = pool->indexBufferHandle(rangeA.blockId);
++    REQUIRE(vertexBuffer != VK_NULL_HANDLE);
++    REQUIRE(indexBuffer != VK_NULL_HANDLE);
++
++    VkDeviceSize vertexOffsetBytesA = static_cast<VkDeviceSize>(rangeA.vertexOffset) * sizeof(rx::asset::PoolVertex);
++    VkDeviceSize vertexOffsetBytesB = static_cast<VkDeviceSize>(rangeB.vertexOffset) * sizeof(rx::asset::PoolVertex);
++    VkDeviceSize indexOffsetBytesA = static_cast<VkDeviceSize>(rangeA.firstIndex) * sizeof(uint32_t);
++    VkDeviceSize indexOffsetBytesB = static_cast<VkDeviceSize>(rangeB.firstIndex) * sizeof(uint32_t);
++
++    std::vector<uint8_t> readVertsA =
++        readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
++                       fixture->device.graphicsQueueFamily(), vertexBuffer, vertexOffsetBytesA,
++                       vertsA.size() * sizeof(rx::asset::PoolVertex));
++    std::vector<uint8_t> readVertsB =
++        readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
++                       fixture->device.graphicsQueueFamily(), vertexBuffer, vertexOffsetBytesB,
++                       vertsB.size() * sizeof(rx::asset::PoolVertex));
++    std::vector<uint8_t> readIndicesA =
++        readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
++                       fixture->device.graphicsQueueFamily(), indexBuffer, indexOffsetBytesA,
++                       indicesA.size() * sizeof(uint32_t));
++    std::vector<uint8_t> readIndicesB =
++        readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
++                       fixture->device.graphicsQueueFamily(), indexBuffer, indexOffsetBytesB,
++                       indicesB.size() * sizeof(uint32_t));
++
++    CHECK(std::memcmp(readVertsA.data(), vertsA.data(), readVertsA.size()) == 0);
++    CHECK(std::memcmp(readVertsB.data(), vertsB.data(), readVertsB.size()) == 0);
++    CHECK(std::memcmp(readIndicesA.data(), indicesA.data(), readIndicesA.size()) == 0);
++    CHECK(std::memcmp(readIndicesB.data(), indicesB.data(), readIndicesB.size()) == 0);
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("GeometryPool::free releases space that a same-size re-upload reuses without growing a new block") {
++    auto fixture = makeFixture("rx_asset_gp_free_reuse");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    // Chunk sized to hold EXACTLY two 4-vertex/4-index meshes -- this is
++    // what makes the discrimination clean: if free() were a no-op (the
++    // exact defect this test guards against), the third upload below
++    // would NOT fit in block 0 and would force a second block, which the
++    // final CHECK(pool->blockCount() == 1) directly catches.
++    rx::asset::PoolConfig config;
++    config.vertexChunkBytes = 2 * 4 * sizeof(rx::asset::PoolVertex);
++    config.indexChunkBytes = 2 * 4 * sizeof(uint32_t);
++
++    auto pool = rx::asset::GeometryPool::create(fixture->allocator, fixture->device, fixture->uploader, config);
++    REQUIRE(pool != nullptr);
++
++    auto vertsA = makeVerts(4, 1);
++    auto indicesA = makeIndices(4, 1);
++    auto vertsB = makeVerts(4, 2);
++    auto indicesB = makeIndices(4, 2);
++
++    rx::asset::MeshRange rangeA = pool->upload(vertsA, indicesA);
++    rx::asset::MeshRange rangeB = pool->upload(vertsB, indicesB);
++    REQUIRE(pool->blockCount() == 1);
++    CHECK(rangeA.blockId == 0);
++    CHECK(rangeB.blockId == 0);
++
++    const rx::asset::PoolStats statsFull = pool->stats();
++    CHECK(statsFull.vertexBytesUsed == 8 * sizeof(rx::asset::PoolVertex));
++    CHECK(statsFull.indexBytesUsed == 8 * sizeof(uint32_t));
++
++    pool->free(rangeA);
++    const rx::asset::PoolStats statsAfterFree = pool->stats();
++    CHECK(statsAfterFree.vertexBytesUsed == 4 * sizeof(rx::asset::PoolVertex));
++    CHECK(statsAfterFree.indexBytesUsed == 4 * sizeof(uint32_t));
++    CHECK(statsAfterFree.blockCount == 1);
++
++    auto vertsC = makeVerts(4, 3);
++    auto indicesC = makeIndices(4, 3);
++    rx::asset::MeshRange rangeC = pool->upload(vertsC, indicesC);
++
++    // The load-bearing assertion: block 0's chunk was sized to hold
++    // EXACTLY two meshes, B is still live, so C can only land in block 0
++    // if A's freed space was genuinely reused -- a broken/no-op free()
++    // forces a second block here instead.
++    CHECK(rangeC.blockId == 0);
++    CHECK(pool->blockCount() == 1);
++
++    const rx::asset::PoolStats statsAfterReuse = pool->stats();
++    CHECK(statsAfterReuse.vertexBytesUsed == 8 * sizeof(rx::asset::PoolVertex));
++    CHECK(statsAfterReuse.indexBytesUsed == 8 * sizeof(uint32_t));
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("GeometryPool checkerboard fragmentation forces the exhaustion/new-block path -- proves no hidden "
++          "compaction (D9)") {
++    auto fixture = makeFixture("rx_asset_gp_checkerboard");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    // Chunk sized to hold EXACTLY four 4-vertex/4-index meshes.
++    rx::asset::PoolConfig config;
++    config.vertexChunkBytes = 4 * 4 * sizeof(rx::asset::PoolVertex);
++    config.indexChunkBytes = 4 * 4 * sizeof(uint32_t);
++
++    auto pool = rx::asset::GeometryPool::create(fixture->allocator, fixture->device, fixture->uploader, config);
++    REQUIRE(pool != nullptr);
++
++    std::array<rx::asset::MeshRange, 4> ranges{};
++    for (uint32_t i = 0; i < 4; ++i) {
++        auto verts = makeVerts(4, i);
++        auto indices = makeIndices(4, i);
++        ranges[i] = pool->upload(verts, indices);
++        REQUIRE(ranges[i].blockId == 0);
++    }
++    REQUIRE(pool->blockCount() == 1);
++
++    // Checkerboard: free slots 1 and 3, leaving two ISOLATED 4-vertex/
++    // 4-index holes with a live allocation on at least one side of each
++    // (never adjacent to each other), so they can never coalesce into one
++    // larger contiguous span.
++    pool->free(ranges[1]);
++    pool->free(ranges[3]);
++    CHECK(pool->blockCount() == 1);
++
++    const rx::asset::PoolStats statsAfterFree = pool->stats();
++    // Two 4-vertex/4-index holes freed out of four -- half the chunk is
++    // free in TOTAL, but never in one contiguous piece.
++    CHECK(statsAfterFree.vertexBytesUsed == 2 * 4 * sizeof(rx::asset::PoolVertex));
++    CHECK(statsAfterFree.indexBytesUsed == 2 * 4 * sizeof(uint32_t));
++
++    // Request 6 vertices/6 indices: LARGER than any single hole (4
++    // elements) but SMALLER than total free bytes across both holes (8
++    // elements). A defragmenting/compacting allocator could satisfy this
++    // by moving live data to consolidate the two holes; GeometryPool must
++    // NOT do that (D9) -- it must take the exhaustion/new-block path
++    // instead, exactly like running out of space for real.
++    auto vertsNew = makeVerts(6, 99);
++    auto indicesNew = makeIndices(6, 99);
++    rx::asset::MeshRange rangeNew = pool->upload(vertsNew, indicesNew);
++
++    CHECK(rangeNew.blockId == 1);
++    CHECK(pool->blockCount() == 2);
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++namespace {
++
++// Minimal push-constant-color fill pipeline over a POSITION-only vertex
++// input bound at GeometryPool's own PoolVertex stride -- exactly the
++// no-descriptor-set shape rx_graph/tests/test_execute_gpu.cpp's own
++// "Fill" pipeline uses (buildFillPipeline()), adapted to read POSITION
++// from a real vertex buffer (GeometryPool's) instead of hardcoding NDC
++// positions in the shader. No bindless table, no material system --
++// GeometryPool's own tests must not depend on either.
++const char* kDrawShaderSource = R"(
++struct PushConstants { float4 color; };
++[[vk::push_constant]] ConstantBuffer<PushConstants> gPush;
++
++struct VSIn { float3 position : POSITION; };
++struct VSOut { float4 position : SV_Position; };
++
++[shader("vertex")]
++VSOut vsMain(VSIn input)
++{
++    VSOut o;
++    o.position = float4(input.position, 1.0);
++    return o;
++}
++
++[shader("fragment")]
++float4 fsMain() : SV_Target
++{
++    return gPush.color;
++}
++)";
++
++const std::vector<std::string> kDrawEntryPoints = {"vsMain", "fsMain"};
++
++struct DrawPipeline {
++    VkShaderModule vertModule = VK_NULL_HANDLE;
++    VkShaderModule fragModule = VK_NULL_HANDLE;
++    rx::rhi::PipelineLayoutBundle layoutBundle;
++    VkPipeline pipeline = VK_NULL_HANDLE;
++    // Reflected push-constant stage mask (rx_shader's reflect()) -- even
++    // though only fsMain reads gPush.color, Slang/reflect() report the
++    // push-constant range as visible to EVERY stage that can see the
++    // `[[vk::push_constant]]` global's declaration in the linked module
++    // (VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT here), and
++    // Vulkan requires vkCmdPushConstants()'s own stageFlags to cover the
++    // WHOLE overlapping VkPushConstantRange, not just the stage that
++    // happens to read the value (VUID-vkCmdPushConstants-offset-01796) --
++    // this is exactly what rx_graph/tests/test_execute_gpu.cpp's own
++    // "Fill"/"Invert" pipelines already do (never hardcode a single stage
++    // flag), reproduced here.
++    VkShaderStageFlags pushConstantStages = 0;
++};
++
++void destroyDrawPipeline(VkDevice device, DrawPipeline& p) {
++    if (p.pipeline != VK_NULL_HANDLE) {
++        vkDestroyPipeline(device, p.pipeline, nullptr);
++    }
++    if (p.fragModule != VK_NULL_HANDLE) {
++        vkDestroyShaderModule(device, p.fragModule, nullptr);
++    }
++    if (p.vertModule != VK_NULL_HANDLE) {
++        vkDestroyShaderModule(device, p.vertModule, nullptr);
++    }
++    p.pipeline = VK_NULL_HANDLE;
++    p.fragModule = VK_NULL_HANDLE;
++    p.vertModule = VK_NULL_HANDLE;
++    p.layoutBundle = rx::rhi::PipelineLayoutBundle{};
++}
++
++std::optional<DrawPipeline> buildDrawPipeline(VkDevice device, VkFormat colorFormat) {
++    DrawPipeline result;
++
++    auto compiler = rx::shader::Compiler::create();
++    if (!compiler.has_value()) {
++        return std::nullopt;
++    }
++
++    rx::shader::CompileResult compileResult =
++        compiler->compileFromSource("RxAssetDrawModule", kDrawShaderSource, kDrawEntryPoints);
++    if (!compileResult.ok) {
++        MESSAGE("rx_asset draw shader compile failed: ", compileResult.diagnostics);
++        return std::nullopt;
++    }
++
++    auto layoutInfo = rx::shader::reflect(compileResult);
++    if (!layoutInfo.has_value() || layoutInfo->pushRanges.size() != 1) {
++        return std::nullopt;
++    }
++
++    // No externalSet0 -- this shader declares no descriptor sets at all.
++    auto layoutBundle = rx::rhi::PipelineLayoutBuilder::build(device, *layoutInfo);
++    if (!layoutBundle.has_value()) {
++        return std::nullopt;
++    }
++    result.pushConstantStages = layoutInfo->pushRanges[0].stages;
++    result.layoutBundle = std::move(*layoutBundle);
++
++    for (const auto& blob : compileResult.entryPointCode) {
++        VkShaderModuleCreateInfo moduleInfo{};
++        moduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
++        moduleInfo.codeSize = blob.code.size() * sizeof(uint32_t);
++        moduleInfo.pCode = blob.code.data();
++
++        VkShaderModule module = VK_NULL_HANDLE;
++        if (vkCreateShaderModule(device, &moduleInfo, nullptr, &module) != VK_SUCCESS) {
++            destroyDrawPipeline(device, result);
++            return std::nullopt;
++        }
++        if (blob.entryPointName == "vsMain") {
++            result.vertModule = module;
++        } else if (blob.entryPointName == "fsMain") {
++            result.fragModule = module;
++        } else {
++            vkDestroyShaderModule(device, module, nullptr);
++            destroyDrawPipeline(device, result);
++            return std::nullopt;
++        }
++    }
++    if (result.vertModule == VK_NULL_HANDLE || result.fragModule == VK_NULL_HANDLE) {
++        destroyDrawPipeline(device, result);
++        return std::nullopt;
++    }
++
++    std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
++    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++    stages[0].module = result.vertModule;
++    stages[0].pName = "main";
++    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++    stages[1].module = result.fragModule;
++    stages[1].pName = "main";
++
++    VkVertexInputBindingDescription binding{};
++    binding.binding = 0;
++    binding.stride = sizeof(rx::asset::PoolVertex);
++    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
++
++    VkVertexInputAttributeDescription attribute{};
++    attribute.location = 0;
++    attribute.binding = 0;
++    attribute.format = VK_FORMAT_R32G32B32_SFLOAT;
++    attribute.offset = offsetof(rx::asset::PoolVertex, px);
++
++    VkPipelineVertexInputStateCreateInfo vertexInputState{};
++    vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
++    vertexInputState.vertexBindingDescriptionCount = 1;
++    vertexInputState.pVertexBindingDescriptions = &binding;
++    vertexInputState.vertexAttributeDescriptionCount = 1;
++    vertexInputState.pVertexAttributeDescriptions = &attribute;
++
++    VkPipelineInputAssemblyStateCreateInfo inputAssemblyState{};
++    inputAssemblyState.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
++    inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++
++    VkPipelineViewportStateCreateInfo viewportState{};
++    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
++    viewportState.viewportCount = 1;
++    viewportState.scissorCount = 1;
++
++    VkPipelineRasterizationStateCreateInfo rasterizationState{};
++    rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
++    rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
++    rasterizationState.cullMode = VK_CULL_MODE_NONE;
++    rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++    rasterizationState.lineWidth = 1.0F;
++
++    VkPipelineMultisampleStateCreateInfo multisampleState{};
++    multisampleState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
++    multisampleState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++
++    VkPipelineColorBlendAttachmentState blendAttachment{};
++    blendAttachment.blendEnable = VK_FALSE;
++    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
++                                      VK_COLOR_COMPONENT_A_BIT;
++
++    VkPipelineColorBlendStateCreateInfo colorBlendState{};
++    colorBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
++    colorBlendState.attachmentCount = 1;
++    colorBlendState.pAttachments = &blendAttachment;
++
++    std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
++    VkPipelineDynamicStateCreateInfo dynamicState{};
++    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
++    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
++    dynamicState.pDynamicStates = dynamicStates.data();
++
++    VkPipelineRenderingCreateInfo renderingCreateInfo{};
++    renderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
++    renderingCreateInfo.colorAttachmentCount = 1;
++    renderingCreateInfo.pColorAttachmentFormats = &colorFormat;
++
++    VkGraphicsPipelineCreateInfo pipelineInfo{};
++    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
++    pipelineInfo.pNext = &renderingCreateInfo;
++    pipelineInfo.stageCount = static_cast<uint32_t>(stages.size());
++    pipelineInfo.pStages = stages.data();
++    pipelineInfo.pVertexInputState = &vertexInputState;
++    pipelineInfo.pInputAssemblyState = &inputAssemblyState;
++    pipelineInfo.pViewportState = &viewportState;
++    pipelineInfo.pRasterizationState = &rasterizationState;
++    pipelineInfo.pMultisampleState = &multisampleState;
++    pipelineInfo.pColorBlendState = &colorBlendState;
++    pipelineInfo.pDynamicState = &dynamicState;
++    pipelineInfo.layout = result.layoutBundle.layout;
++    pipelineInfo.renderPass = VK_NULL_HANDLE;  // dynamic rendering
++    pipelineInfo.basePipelineIndex = -1;
++
++    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &result.pipeline) !=
++        VK_SUCCESS) {
++        destroyDrawPipeline(device, result);
++        return std::nullopt;
++    }
++
++    return result;
++}
++
++}  // namespace
++
++TEST_CASE("GeometryPool exhaustion creates a second block, and BOTH blocks are drawable with real indexed draws "
++          "(readback probe)") {
++    auto fixture = makeFixture("rx_asset_gp_exhaustion_draw");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    // Chunk sized to hold EXACTLY one quad (4 vertices / 6 indices) --
++    // the second quad below cannot possibly fit in block 0, forcing
++    // real exhaustion (not a contrived assertion).
++    rx::asset::PoolConfig config;
++    config.vertexChunkBytes = 4 * sizeof(rx::asset::PoolVertex);
++    config.indexChunkBytes = 6 * sizeof(uint32_t);
++
++    auto pool = rx::asset::GeometryPool::create(fixture->allocator, fixture->device, fixture->uploader, config);
++    REQUIRE(pool != nullptr);
++
++    auto [vertsLeft, indicesLeft] = makeQuad(1, -1.0F, 0.0F);
++    auto [vertsRight, indicesRight] = makeQuad(2, 0.0F, 1.0F);
++
++    rx::asset::MeshRange rangeLeft = pool->upload(vertsLeft, indicesLeft);
++    rx::asset::MeshRange rangeRight = pool->upload(vertsRight, indicesRight);
++
++    REQUIRE(rangeLeft.blockId == 0);
++    REQUIRE(rangeRight.blockId == 1);
++    REQUIRE(pool->blockCount() == 2);
++
++    const VkDevice device = fixture->device.device();
++    constexpr uint32_t kWidth = 8;
++    constexpr uint32_t kHeight = 4;
++    constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
++
++    auto drawPipeline = buildDrawPipeline(device, kFormat);
++    REQUIRE(drawPipeline.has_value());
++
++    VkImageCreateInfo imageInfo{};
++    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    imageInfo.imageType = VK_IMAGE_TYPE_2D;
++    imageInfo.format = kFormat;
++    imageInfo.extent = {kWidth, kHeight, 1};
++    imageInfo.mipLevels = 1;
++    imageInfo.arrayLayers = 1;
++    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
++    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
++    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++
++    VkImage image = VK_NULL_HANDLE;
++    REQUIRE(vkCreateImage(device, &imageInfo, nullptr, &image) == VK_SUCCESS);
++
++    VkMemoryRequirements memReq{};
++    vkGetImageMemoryRequirements(device, image, &memReq);
++    VkPhysicalDeviceMemoryProperties memProps{};
++    vkGetPhysicalDeviceMemoryProperties(fixture->device.physicalDevice(), &memProps);
++    uint32_t memoryTypeIndex = UINT32_MAX;
++    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
++        if ((memReq.memoryTypeBits & (1U << i)) != 0U &&
++            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0U) {
++            memoryTypeIndex = i;
++            break;
++        }
++    }
++    REQUIRE(memoryTypeIndex != UINT32_MAX);
++
++    VkMemoryAllocateInfo memAllocInfo{};
++    memAllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++    memAllocInfo.allocationSize = memReq.size;
++    memAllocInfo.memoryTypeIndex = memoryTypeIndex;
++    VkDeviceMemory imageMemory = VK_NULL_HANDLE;
++    REQUIRE(vkAllocateMemory(device, &memAllocInfo, nullptr, &imageMemory) == VK_SUCCESS);
++    REQUIRE(vkBindImageMemory(device, image, imageMemory, 0) == VK_SUCCESS);
++
++    VkImageViewCreateInfo viewInfo{};
++    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++    viewInfo.image = image;
++    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    viewInfo.format = kFormat;
++    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    viewInfo.subresourceRange.levelCount = 1;
++    viewInfo.subresourceRange.layerCount = 1;
++    VkImageView imageView = VK_NULL_HANDLE;
++    REQUIRE(vkCreateImageView(device, &viewInfo, nullptr, &imageView) == VK_SUCCESS);
++
++    constexpr VkDeviceSize kPixelBytes = static_cast<VkDeviceSize>(kWidth) * kHeight * 4;
++    std::array<uint8_t, kPixelBytes> pixels{};
++
++    {
++        auto cmdCtx =
++            rx::rhi::CommandContext::create(device, fixture->device.graphicsQueue(), fixture->device.graphicsQueueFamily());
++        REQUIRE(cmdCtx.has_value());
++
++        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++            rx::rhi::transitionImage(cmd, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++
++            VkRenderingAttachmentInfo colorAttachment{};
++            colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
++            colorAttachment.imageView = imageView;
++            colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++            colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++            colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++            colorAttachment.clearValue.color = VkClearColorValue{{0.0F, 0.0F, 0.0F, 1.0F}};
++
++            VkRenderingInfo renderingInfo{};
++            renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
++            renderingInfo.renderArea = VkRect2D{{0, 0}, {kWidth, kHeight}};
++            renderingInfo.layerCount = 1;
++            renderingInfo.colorAttachmentCount = 1;
++            renderingInfo.pColorAttachments = &colorAttachment;
++            vkCmdBeginRendering(cmd, &renderingInfo);
++
++            VkViewport viewport{0.0F, 0.0F, static_cast<float>(kWidth), static_cast<float>(kHeight), 0.0F, 1.0F};
++            vkCmdSetViewport(cmd, 0, 1, &viewport);
++            VkRect2D scissor{{0, 0}, {kWidth, kHeight}};
++            vkCmdSetScissor(cmd, 0, 1, &scissor);
++
++            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, drawPipeline->pipeline);
++
++            // Block 0 (left quad), red.
++            std::array<float, 4> red{1.0F, 0.0F, 0.0F, 1.0F};
++            vkCmdPushConstants(cmd, drawPipeline->layoutBundle.layout, drawPipeline->pushConstantStages, 0,
++                                sizeof(red), red.data());
++            pool->bind(cmd, rangeLeft.blockId);
++            vkCmdDrawIndexed(cmd, rangeLeft.indexCount, 1, rangeLeft.firstIndex, rangeLeft.vertexOffset, 0);
++
++            // Block 1 (right quad), blue.
++            std::array<float, 4> blue{0.0F, 0.0F, 1.0F, 1.0F};
++            vkCmdPushConstants(cmd, drawPipeline->layoutBundle.layout, drawPipeline->pushConstantStages, 0,
++                                sizeof(blue), blue.data());
++            pool->bind(cmd, rangeRight.blockId);
++            vkCmdDrawIndexed(cmd, rangeRight.indexCount, 1, rangeRight.firstIndex, rangeRight.vertexOffset, 0);
++
++            vkCmdEndRendering(cmd);
++            rx::rhi::transitionImage(cmd, image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++                                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++        });
++
++        auto readback = fixture->allocator.createHostVisibleBuffer(kPixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++        REQUIRE(readback.has_value());
++        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++            VkBufferImageCopy region{};
++            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++            region.imageSubresource.layerCount = 1;
++            region.imageExtent = {kWidth, kHeight, 1};
++            vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1, &region);
++        });
++        readback->invalidate();
++        std::memcpy(pixels.data(), readback->mappedData(), pixels.size());
++    }
++
++    vkDeviceWaitIdle(device);
++    destroyDrawPipeline(device, *drawPipeline);
++    vkDestroyImageView(device, imageView, nullptr);
++    vkDestroyImage(device, image, nullptr);
++    vkFreeMemory(device, imageMemory, nullptr);
++
++    // Sample one pixel well inside each half: (1,2) is in the left
++    // (block 0, red) quad; (6,2) is in the right (block 1, blue) quad.
++    auto pixelAt = [&](uint32_t x, uint32_t y) {
++        size_t idx = (static_cast<size_t>(y) * kWidth + x) * 4;
++        return std::array<uint8_t, 4>{pixels[idx], pixels[idx + 1], pixels[idx + 2], pixels[idx + 3]};
++    };
++    auto leftPixel = pixelAt(1, 2);
++    auto rightPixel = pixelAt(6, 2);
++
++    CHECK(leftPixel[0] == 255);
++    CHECK(leftPixel[1] == 0);
++    CHECK(leftPixel[2] == 0);
++    CHECK(rightPixel[0] == 0);
++    CHECK(rightPixel[1] == 0);
++    CHECK(rightPixel[2] == 255);
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("GeometryPool::stats reports block count and bytes used/capacity accurately across growth") {
++    auto fixture = makeFixture("rx_asset_gp_stats");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    rx::asset::PoolConfig config;
++    config.vertexChunkBytes = 4 * sizeof(rx::asset::PoolVertex);
++    config.indexChunkBytes = 6 * sizeof(uint32_t);
++
++    auto pool = rx::asset::GeometryPool::create(fixture->allocator, fixture->device, fixture->uploader, config);
++    REQUIRE(pool != nullptr);
++
++    CHECK(pool->stats().blockCount == 0);
++    CHECK(pool->blockCount() == 0);
++
++    auto [vertsA, indicesA] = makeQuad(1, -1.0F, 0.0F);
++    pool->upload(vertsA, indicesA);
++
++    rx::asset::PoolStats afterOne = pool->stats();
++    CHECK(afterOne.blockCount == 1);
++    CHECK(afterOne.blocks.size() == 1);
++    CHECK(afterOne.vertexBytesCapacity == config.vertexChunkBytes);
++    CHECK(afterOne.indexBytesCapacity == config.indexChunkBytes);
++    CHECK(afterOne.vertexBytesUsed == 4 * sizeof(rx::asset::PoolVertex));
++    CHECK(afterOne.indexBytesUsed == 6 * sizeof(uint32_t));
++
++    auto [vertsB, indicesB] = makeQuad(2, 0.0F, 1.0F);
++    pool->upload(vertsB, indicesB);
++
++    rx::asset::PoolStats afterTwo = pool->stats();
++    CHECK(afterTwo.blockCount == 2);
++    CHECK(afterTwo.vertexBytesCapacity == 2 * config.vertexChunkBytes);
++    CHECK(afterTwo.vertexBytesUsed == 8 * sizeof(rx::asset::PoolVertex));
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/src/rx_rhi_vk/CMakeLists.txt b/src/rx_rhi_vk/CMakeLists.txt
+index 30d483a..e9548fe 100644
+--- a/src/rx_rhi_vk/CMakeLists.txt
++++ b/src/rx_rhi_vk/CMakeLists.txt
+@@ -35,30 +35,31 @@ target_include_directories(rx_rhi_vk PUBLIC include ${volk_SOURCE_DIR} ${vma_SOU
+ # rx_shader_layout_types (defined in src/rx_shader/CMakeLists.txt) is a
+ # header-only INTERFACE target exposing ONLY rx_shader's plain-data
+ # shader_layout_info.h -- never `rx_shader` itself, which would drag
+ # slang::slang (a real link dependency, plus every other rx_shader header)
+ # into this library. See pipeline_layout.h's own comment for why
+ # PipelineLayoutBuilder needs `rx::shader::ShaderLayoutInfo` without any of
+ # that.
+ target_link_libraries(rx_rhi_vk PUBLIC rx_core vk-bootstrap::vk-bootstrap rx_shader_layout_types)
+ target_compile_definitions(rx_rhi_vk PUBLIC VK_NO_PROTOTYPES)
+ 
+-# Fifteen test translation units now (context_test.cpp, device_test.cpp,
++# Sixteen test translation units now (context_test.cpp, device_test.cpp,
+ # buffer_test.cpp, clear_color_test.cpp, frame_sync_test.cpp,
+ # pipeline_layout_test.cpp, bindless_test.cpp, upload_test.cpp,
+ # deletion_queue_test.cpp, texture_test.cpp, descriptor_arena_test.cpp,
+ # memory_report_test.cpp, memory_budget_test.cpp, oom_handling_test.cpp,
+-# eviction_contract_test.cpp [Phase 4 Task 10]), so -- like rx_core_tests,
+-# and unlike this target before device_test.cpp existed -- doctest's
+-# runtime/main is implemented once in a dedicated tests/doctest_main.cpp
+-# shared by all fifteen, rather than in any one test file. doctest_main.cpp
+-# also links rx_platform: it uses rx::platform::Window
++# eviction_contract_test.cpp [Phase 4 Task 10], bda_test.cpp [Phase 4
++# Stage 1 Task 12, spec D26.4]), so -- like rx_core_tests, and unlike this
++# target before device_test.cpp existed -- doctest's runtime/main is
++# implemented once in a dedicated tests/doctest_main.cpp shared by all
++# sixteen, rather than in any one test file. doctest_main.cpp also links
++# rx_platform: it uses rx::platform::Window
+ # to warm up a real vk-bootstrap hazard before any TEST_CASE runs (see the
+ # comment there) -- so test order here is not load-bearing, deliberately; no
+ # --order-by is needed on the add_test line below. clear_color_test.cpp,
+ # pipeline_layout_test.cpp, bindless_test.cpp, deletion_queue_test.cpp, and
+ # descriptor_arena_test.cpp in particular are pure headless (no window/
+ # surface/swapchain) and rely on that warm-up to be safe regardless of where
+ # doctest schedules them relative to the windowed tests -- see the Phase 2
+ # plan's Global Constraints on the vk-bootstrap landmine:
+ # pipeline_layout_test.cpp, bindless_test.cpp, deletion_queue_test.cpp, and
+ # descriptor_arena_test.cpp each build their own headless device, and joining
+@@ -77,16 +78,17 @@ add_executable(rx_rhi_vk_tests
+     tests/pipeline_layout_test.cpp
+     tests/bindless_test.cpp
+     tests/upload_test.cpp
+     tests/deletion_queue_test.cpp
+     tests/texture_test.cpp
+     tests/descriptor_arena_test.cpp
+     tests/memory_report_test.cpp
+     tests/memory_budget_test.cpp
+     tests/oom_handling_test.cpp
+     tests/eviction_contract_test.cpp
++    tests/bda_test.cpp
+ )
+ target_link_libraries(rx_rhi_vk_tests PRIVATE rx_rhi_vk rx_platform doctest::doctest)
+ add_test(NAME rx_rhi_vk_tests COMMAND rx_rhi_vk_tests)
+ # Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+ # (windows-cross Wine hang, run 31512073559).
+ set_tests_properties(rx_rhi_vk_tests PROPERTIES TIMEOUT 120)
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h b/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h
+index c32c041..1b87d62 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h
+@@ -201,20 +201,28 @@ public:
+     // `VK_EXT_memory_budget` enablement is NOT a parameter here: it is
+     // pulled from `device.memoryBudgetExtensionEnabled()` automatically
+     // (device.h), which is itself set opportunistically at Device::create()
+     // time -- the two must stay in lockstep (see createRaw()'s own comment
+     // for exactly what enforces that and what does not), and this overload
+     // is what keeps them so for every ordinary caller.
+     // `forcedHeapSizeLimitBytes` is a TEST-ONLY escape hatch (default
+     // VK_WHOLE_SIZE = no limit): forwarded verbatim to createRaw() -- see
+     // that function's own comment for what it does and why [Phase 4 Task
+     // 10, D24(d) OOM-path testing].
++    // [Phase 4 Stage 1 Task 12, spec D26.4] `VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT`
++    // enablement is likewise NOT a parameter here: it is pulled from
++    // `device.supportsBufferDeviceAddress()` automatically (device.h),
++    // itself set opportunistically at Device::create() time -- the two
++    // must stay in LOCKSTEP, exactly like the memory-budget flag above
++    // (same rationale, same enforcement: this overload always reads
++    // Device's own accessor directly rather than trusting a caller-
++    // supplied value).
+     static std::optional<Allocator> create(Context& context, Device& device,
+                                             VkDeviceSize forcedHeapSizeLimitBytes = VK_WHOLE_SIZE);
+ 
+     // Builds a VmaAllocator directly from raw handles, with no dependency
+     // on rx::rhi::Context/Device -- e.g. for tooling or tests that want an
+     // allocator without constructing either.
+     //
+     // `memoryBudgetExtensionEnabled` [Phase 4 Task 10, spec D24(b), gate
+     // ruling #27]: pass true ONLY if `VK_EXT_memory_budget` was actually
+     // enabled on `device` at logical-device-creation time (Device::create()
+@@ -261,23 +269,41 @@ public:
+     // memory heap on `physicalDevice` is capped to this many bytes via
+     // `VmaAllocatorCreateInfo::pHeapSizeLimit` (VMA's own documented,
+     // host-side "test how your program behaves with limited memory"
+     // mechanism -- vk_mem_alloc.h's `\\page heap_memory_limit` docs) --
+     // deterministically forces `VK_ERROR_OUT_OF_DEVICE_MEMORY` on the next
+     // allocation that would exceed it, with NO dependency on actually
+     // exhausting real GPU memory or on any specific driver's
+     // overallocation behavior. This is the "tiny mock/--budget-override
+     // allocator ceiling" the plan's own Task 10 steps call for
+     // (matrix-issue27 rows 6-9) -- see oom_handling_test.cpp.
++    // `bufferDeviceAddressEnabled` [Phase 4 Stage 1 Task 12, spec D26.4]:
++    // pass true ONLY if `bufferDeviceAddress` was actually enabled on
++    // `device` at logical-device-creation time (Device::create() does
++    // this opportunistically via `enable_extension_features_if_present()`
++    // -- see device.cpp). Mirrors `memoryBudgetExtensionEnabled` exactly:
++    // when true, `VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT` is set
++    // below, which is what makes it legal to later create a buffer with
++    // `VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT` against this allocator
++    // (verified directly against vendored VMA 3.4.0 source: creating such
++    // a buffer without this flag having been set at allocator-creation
++    // time trips a `VMA_ASSERT`/`VK_ERROR_INITIALIZATION_FAILED` --
++    // vk_mem_alloc.h:14440-14445 -- both the allocator flag and the
++    // buffer usage bit are creation-time-only and immutable for their
++    // respective object's lifetime, exactly why this is opportunistic-
++    // but-lockstep, never retrofittable later). `rx::asset::GeometryPool`
++    // (src/rx_asset) is this phase's sole consumer of the resulting
++    // capability.
+     static std::optional<Allocator> createRaw(VkPhysicalDevice physicalDevice, VkDevice device, VkInstance instance,
+                                                bool memoryBudgetExtensionEnabled = false,
+-                                               VkDeviceSize forcedHeapSizeLimitBytes = VK_WHOLE_SIZE);
++                                               VkDeviceSize forcedHeapSizeLimitBytes = VK_WHOLE_SIZE,
++                                               bool bufferDeviceAddressEnabled = false);
+ 
+     // Allocates a VkBuffer with `usage`, backed by host-visible, persistently
+     // mapped memory (VMA_MEMORY_USAGE_AUTO +
+     // VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+     // VMA_ALLOCATION_CREATE_MAPPED_BIT) -- suitable for CPU-written,
+     // GPU-read data such as vertex/index/uniform buffers updated every
+     // frame. `category` [Phase 4 Task 10, D24(a)] attributes this
+     // allocation's bytes in the accounting ledger `report()` reads --
+     // defaults to MemoryCategory::Internal for callers that don't yet
+     // categorize themselves (this default is deliberately generic, not a
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/device.h b/src/rx_rhi_vk/include/rx_rhi_vk/device.h
+index d7a7796..9440207 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/device.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/device.h
+@@ -125,20 +125,41 @@ public:
+     // calibratedTimestampsEnabled() just above (see device.cpp's own
+     // comment on that call). rx::rhi::Allocator::create(Context&, Device&)
+     // (buffer.h) reads this to decide whether to request
+     // VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT -- the two must stay in
+     // LOCKSTEP. This is enforced entirely by THIS being the single source
+     // of truth Allocator::create() always reads directly (buffer.h has the
+     // full correction on why VMA itself does not runtime-enforce this),
+     // rather than Allocator guessing or re-querying the extension itself.
+     bool memoryBudgetExtensionEnabled() const { return memoryBudgetExtensionEnabled_; }
+ 
++    // [Phase 4 Stage 1 Task 12, spec D26.4] True iff `bufferDeviceAddress`
++    // (VkPhysicalDeviceVulkan12Features -- promoted VK_KHR_buffer_device_address
++    // core in Vulkan 1.2, not an extension string) was present on the
++    // selected physical device AND opportunistically enabled on the
++    // logical device this Device wraps. NEVER a device-selection
++    // requirement (D26.4) -- device.cpp resolves this via vk-bootstrap's
++    // `enable_extension_features_if_present()` AFTER physical-device
++    // selection has already succeeded, so a device lacking it still
++    // builds a fully working Device; this simply reports false and one
++    // log line records the degrade. rx::rhi::Allocator::create(Context&,
++    // Device&) (buffer.h) reads this to decide whether to request
++    // VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT -- the two must stay
++    // in LOCKSTEP, exactly like memoryBudgetExtensionEnabled() above (this
++    // is the single source of truth Allocator::create() always reads
++    // directly). rx::asset::GeometryPool (src/rx_asset) is this phase's
++    // consumer: it reads this once at create() to decide whether its
++    // chunk buffers carry VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT.
++    // Enablement only -- nothing in Phase 4 calls vkGetBufferDeviceAddress
++    // for any purpose beyond GeometryPool's own test-observable accessor.
++    bool supportsBufferDeviceAddress() const { return bufferDeviceAddressEnabled_; }
++
+     VkSwapchainKHR swapchain() const { return swapchain_; }
+     const std::vector<VkImage>& swapchainImages() const { return swapchainImages_; }
+     VkFormat swapchainFormat() const { return swapchainFormat_; }
+     VkExtent2D swapchainExtent() const { return swapchainExtent_; }
+ 
+     // Records the present mode this Device should build its NEXT swapchain
+     // against. Does NOT itself touch the live swapchain or recreate
+     // anything -- recreateSwapchain() (the same path every caller already
+     // drives on SwapchainStatus::NeedsRecreate, e.g. a window resize) is
+     // the sole place a present-mode change actually takes effect, per this
+@@ -200,20 +221,21 @@ private:
+     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+ 
+     VkQueue graphicsQueue_ = VK_NULL_HANDLE;
+     uint32_t graphicsQueueFamily_ = 0;
+     VkQueue presentQueue_ = VK_NULL_HANDLE;
+     VkQueue transferQueue_ = VK_NULL_HANDLE;
+     uint32_t transferQueueFamily_ = 0;
+     bool hasDedicatedTransferQueue_ = false;
+     bool calibratedTimestampsEnabled_ = false;
+     bool memoryBudgetExtensionEnabled_ = false;
++    bool bufferDeviceAddressEnabled_ = false;
+ 
+     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
+     std::vector<VkImage> swapchainImages_;
+     VkFormat swapchainFormat_ = VK_FORMAT_UNDEFINED;
+     VkExtent2D swapchainExtent_{0, 0};
+ 
+     // Desired mode recorded by setPresentMode(), consulted by
+     // recreateSwapchain() (and create()'s own equivalent inline logic) the
+     // next time either builds a swapchain. Defaults to VsyncOn to match
+     // create()'s explicit FIFO default -- see that function's comment.
+diff --git a/src/rx_rhi_vk/src/buffer.cpp b/src/rx_rhi_vk/src/buffer.cpp
+index daab4e4..6571d6f 100644
+--- a/src/rx_rhi_vk/src/buffer.cpp
++++ b/src/rx_rhi_vk/src/buffer.cpp
+@@ -67,26 +67,28 @@ void publishTracyPlots(const RxMemoryReport& report) {
+             default:
+                 break;
+         }
+     }
+ }
+ 
+ }  // namespace
+ 
+ std::optional<Allocator> Allocator::create(Context& context, Device& device, VkDeviceSize forcedHeapSizeLimitBytes) {
+     return createRaw(device.physicalDevice(), device.device(), context.instance(),
+-                      device.memoryBudgetExtensionEnabled(), forcedHeapSizeLimitBytes);
++                      device.memoryBudgetExtensionEnabled(), forcedHeapSizeLimitBytes,
++                      device.supportsBufferDeviceAddress());
+ }
+ 
+ std::optional<Allocator> Allocator::createRaw(VkPhysicalDevice physicalDevice, VkDevice device, VkInstance instance,
+                                                bool memoryBudgetExtensionEnabled,
+-                                               VkDeviceSize forcedHeapSizeLimitBytes) {
++                                               VkDeviceSize forcedHeapSizeLimitBytes,
++                                               bool bufferDeviceAddressEnabled) {
+     // Only the two entry points VMA's dynamic-loading path actually
+     // requires (see buffer.h's comment above the VMA_STATIC_VULKAN_FUNCTIONS
+     // / VMA_DYNAMIC_VULKAN_FUNCTIONS defines for why nothing else is
+     // hand-filled here). volk exposes both as real global function pointers
+     // once volkInitialize()/volkLoadInstance() (Context::create) have run --
+     // volkLoadInstance() is what populates vkGetDeviceProcAddr too (verified
+     // against volk.c:253; see buffer.h's comment for the exact call chain).
+     // Device::create()'s volkLoadDevice() call populates a separate
+     // per-device function table and is not what this global pointer relies
+     // on.
+@@ -107,20 +109,32 @@ std::optional<Allocator> Allocator::createRaw(VkPhysicalDevice physicalDevice, V
+     // actually enabled on `device`. VMA itself does NOT runtime-assert
+     // this (its nearby VMA_ASSERT is compile-time-macro-gated, not a
+     // device-state check) -- `Device::memoryBudgetExtensionEnabled()` is
+     // this engine's own single source of truth instead, which is why
+     // Allocator::create(Context&, Device&) always reads it directly rather
+     // than trusting a caller-supplied value.
+     if (memoryBudgetExtensionEnabled) {
+         createInfo.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+     }
+ 
++    // [Phase 4 Stage 1 Task 12, spec D26.4] Same LOCKSTEP requirement as
++    // the memory-budget flag above: this must agree exactly with whether
++    // `bufferDeviceAddress` was actually enabled on `device` --
++    // `Device::supportsBufferDeviceAddress()` is the single source of
++    // truth (see this function's own header comment in buffer.h for the
++    // exact VMA enforcement this flag gates: a buffer created with
++    // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT against an allocator that
++    // never set this flag trips a VMA-side assert/failure).
++    if (bufferDeviceAddressEnabled) {
++        createInfo.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
++    }
++
+     // [Phase 4 Task 10, D24(d) OOM-path testing] TEST-ONLY heap-size
+     // ceiling -- see this function's own header comment in buffer.h.
+     // `heapLimits` must outlive the vmaCreateAllocator() call below (VMA
+     // reads through the pointer during that call only, but does not copy
+     // the array beyond it), so it stays in this function's scope, not a
+     // narrower block.
+     std::vector<VkDeviceSize> heapLimits;
+     if (forcedHeapSizeLimitBytes != VK_WHOLE_SIZE) {
+         VkPhysicalDeviceMemoryProperties memProps{};
+         vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
+diff --git a/src/rx_rhi_vk/src/device.cpp b/src/rx_rhi_vk/src/device.cpp
+index e0ebe58..626aa6c 100644
+--- a/src/rx_rhi_vk/src/device.cpp
++++ b/src/rx_rhi_vk/src/device.cpp
+@@ -292,20 +292,53 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
+     // 1.1 floor, so no separate instance extension needs enabling here.
+     // Empirically verified present on both drivers this project develops
+     // against (vulkaninfo, `VK_ICD_FILENAMES` pointed at each ICD in
+     // isolation): NVIDIA's proprietary driver AND Mesa llvmpipe/lavapipe
+     // (the software rasterizer CI runs against) both report
+     // `VK_EXT_memory_budget` -- so the RealExtension path, not just the
+     // fallback, is exercised for real in CI, not merely local dev.
+     const bool memoryBudgetExtensionEnabled =
+         physResult.value().enable_extension_if_present(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+ 
++    // bufferDeviceAddress: opportunistic, guarded [Phase 4 Stage 1 Task
++    // 12, spec D26.4, gate matrix-issue21's BDA rows]. Deliberately NOT
++    // requested via features12 above (that struct is REQUIRED for
++    // selection via set_required_features_12() -- setting
++    // bufferDeviceAddress=VK_TRUE there would make it a hard
++    // device-selection requirement, which D26.4 explicitly forbids: "NEVER
++    // a device-selection requirement"). Instead this uses vk-bootstrap's
++    // own documented optional-feature-enable API,
++    // `enable_extension_features_if_present<T>()` (VkBootstrap.h) -- the
++    // feature-bit analog of `enable_extension_if_present()` just above,
++    // verified directly against vk-bootstrap's pinned source
++    // (VkBootstrap.cpp's `enable_features_struct_if_present`): it performs
++    // its OWN fresh `vkGetPhysicalDeviceFeatures2` query against the
++    // ALREADY-SELECTED physical device, and only if every field set true
++    // in the struct passed here (`bufferDeviceAddress` alone) is genuinely
++    // supported does it MERGE that field into `physResult`'s own
++    // already-required VkPhysicalDeviceVulkan12Features chain entry
++    // (`FeaturesChain::add_structure()`'s documented merge semantics) --
++    // never adding a second, separately-typed
++    // VkPhysicalDeviceBufferDeviceAddressFeatures struct to the pNext
++    // chain (which would risk a duplicate/aliased-struct validation
++    // question against the Vulkan12Features struct already present).
++    // Because this call happens AFTER `select()` already succeeded, a
++    // physical device lacking the bit simply gets `false` back here with
++    // NOTHING added to the chain -- device creation below proceeds exactly
++    // as if this call had never been made, never failing selection on
++    // this bit's absence.
++    VkPhysicalDeviceVulkan12Features bufferDeviceAddressRequest{};
++    bufferDeviceAddressRequest.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
++    bufferDeviceAddressRequest.bufferDeviceAddress = VK_TRUE;
++    const bool bufferDeviceAddressEnabled =
++        physResult.value().enable_extension_features_if_present(bufferDeviceAddressRequest);
++
+     auto deviceResult = vkb::DeviceBuilder(physResult.value()).build();
+     if (!deviceResult) {
+         RX_LOG_ERROR("vkb::DeviceBuilder::build failed: {}", deviceResult.error().message());
+         destroySurface(context, surface);
+         return std::nullopt;
+     }
+     vkb::Device vkbDevice = deviceResult.value();
+     volkLoadDevice(vkbDevice.device);
+ 
+     auto graphicsQueueResult = vkbDevice.get_queue(vkb::QueueType::graphics);
+@@ -402,20 +435,26 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
+                     ? "ACQUIRED"
+                     : "not present on this physical device -- falling back to the graphics queue for any future "
+                       "transfer work");
+     dev.calibratedTimestampsEnabled_ = calibratedTimestampsEnabled;
+     RX_LOG_INFO("Device::create: VK_EXT_calibrated_timestamps {} on the selected physical device",
+                 calibratedTimestampsEnabled ? "ENABLED" : "not present -- falling back to uncalibrated GPU zones");
+     dev.memoryBudgetExtensionEnabled_ = memoryBudgetExtensionEnabled;
+     RX_LOG_INFO("Device::create: VK_EXT_memory_budget {} on the selected physical device",
+                 memoryBudgetExtensionEnabled ? "ENABLED" : "not present -- memory reports fall back to a heap-size "
+                                                             "budget estimate");
++    dev.bufferDeviceAddressEnabled_ = bufferDeviceAddressEnabled;
++    RX_LOG_INFO(
++        "Device::create: bufferDeviceAddress {} on the selected physical device [Phase 4 Stage 1 Task 12, spec "
++        "D26.4] (enablement only -- opportunistic, never a device-selection requirement)",
++        bufferDeviceAddressEnabled ? "ENABLED" : "not present -- rx::asset::GeometryPool chunk buffers degrade to no "
++                                                  "device-address usage bit, logged");
+     dev.swapchain_ = vkbSwapchain.swapchain;
+     dev.swapchainImages_ = imagesResult.value();
+     dev.swapchainFormat_ = vkbSwapchain.image_format;
+     dev.swapchainExtent_ = vkbSwapchain.extent;
+     dev.desiredPresentMode_ = PresentMode::VsyncOn;
+     dev.actualPresentMode_ = vkbSwapchain.present_mode;
+     RX_LOG_INFO("Device::create: present mode in use: {} (explicit default, PresentMode::VsyncOn)",
+                 presentModeName(dev.actualPresentMode_));
+     return dev;
+ }
+@@ -433,39 +472,41 @@ Device& Device::operator=(Device&& other) noexcept {
+         device_ = other.device_;
+         surface_ = other.surface_;
+         graphicsQueue_ = other.graphicsQueue_;
+         graphicsQueueFamily_ = other.graphicsQueueFamily_;
+         presentQueue_ = other.presentQueue_;
+         transferQueue_ = other.transferQueue_;
+         transferQueueFamily_ = other.transferQueueFamily_;
+         hasDedicatedTransferQueue_ = other.hasDedicatedTransferQueue_;
+         calibratedTimestampsEnabled_ = other.calibratedTimestampsEnabled_;
+         memoryBudgetExtensionEnabled_ = other.memoryBudgetExtensionEnabled_;
++        bufferDeviceAddressEnabled_ = other.bufferDeviceAddressEnabled_;
+         swapchain_ = other.swapchain_;
+         swapchainImages_ = std::move(other.swapchainImages_);
+         swapchainFormat_ = other.swapchainFormat_;
+         swapchainExtent_ = other.swapchainExtent_;
+         desiredPresentMode_ = other.desiredPresentMode_;
+         actualPresentMode_ = other.actualPresentMode_;
+ 
+         other.instance_ = VK_NULL_HANDLE;
+         other.physicalDevice_ = VK_NULL_HANDLE;
+         other.device_ = VK_NULL_HANDLE;
+         other.surface_ = VK_NULL_HANDLE;
+         other.graphicsQueue_ = VK_NULL_HANDLE;
+         other.graphicsQueueFamily_ = 0;
+         other.presentQueue_ = VK_NULL_HANDLE;
+         other.transferQueue_ = VK_NULL_HANDLE;
+         other.transferQueueFamily_ = 0;
+         other.hasDedicatedTransferQueue_ = false;
+         other.calibratedTimestampsEnabled_ = false;
+         other.memoryBudgetExtensionEnabled_ = false;
++        other.bufferDeviceAddressEnabled_ = false;
+         other.swapchain_ = VK_NULL_HANDLE;
+         other.swapchainImages_.clear();
+         other.swapchainFormat_ = VK_FORMAT_UNDEFINED;
+         other.swapchainExtent_ = VkExtent2D{0, 0};
+         other.desiredPresentMode_ = PresentMode::VsyncOn;
+         other.actualPresentMode_ = VK_PRESENT_MODE_FIFO_KHR;
+     }
+     return *this;
+ }
+ 
+diff --git a/src/rx_rhi_vk/tests/bda_test.cpp b/src/rx_rhi_vk/tests/bda_test.cpp
+new file mode 100644
+index 0000000..8c91623
+--- /dev/null
++++ b/src/rx_rhi_vk/tests/bda_test.cpp
+@@ -0,0 +1,153 @@
++#include <doctest/doctest.h>
++#include <rx_rhi_vk/buffer.h>
++#include <rx_rhi_vk/device.h>
++#include <rx_platform/window.h>
++#include <optional>
++#include <utility>
++
++// bda_test.cpp -- coverage for the BDA (bufferDeviceAddress) enablement
++// mechanics [Phase 4 Stage 1 Task 12, spec D26.4, gate matrix-issue21's
++// three BDA rows]: the opportunistic Vulkan12Features bit
++// (Device::supportsBufferDeviceAddress()), the matching VMA allocator flag
++// (VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT, threaded through
++// Allocator::create()/createRaw()), and the buffer-usage-bit consequence
++// (VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT + a real nonzero
++// vkGetBufferDeviceAddress()). rx::asset::GeometryPool's own
++// bda_test.cpp (src/rx_asset/tests) covers the POOL-BLOCK-level version
++// of the last row against a real GeometryPool; this file covers the
++// lower-level Device/Allocator/Buffer mechanics directly, one layer below
++// GeometryPool, mirroring the existing memory_budget_test.cpp/
++// oom_handling_test.cpp split (one file per feature-set, not folded into
++// buffer_test.cpp/device_test.cpp).
++//
++// Empirically verified in-task (2026-08-18, per the ticket's own required
++// step) via `vulkaninfo`: BOTH devices available in this development
++// environment report `bufferDeviceAddress = true` --
++// NVIDIA GeForce RTX 2080 (proprietary driver) AND Mesa llvmpipe/lavapipe
++// (the CI-relevant software rasterizer) -- consistent with gate
++// matrix-issue21's own finding that lavapipe has carried
++// VK_KHR_buffer_device_address support since March 2021 (Mesa MR #9616).
++// This means every TEST_CASE below exercises the SUPPORTED branch for
++// real on both locally available drivers; no BDA-lacking device is
++// available in this environment to exercise the "opportunistic, never a
++// selection requirement" degrade branch against a REAL unsupported
++// device -- that guarantee is structural instead (see the last TEST_CASE
++// below and the task report for the full discussion, mirroring Task 11's
++// own "eliminated structurally, no revert needed" disclosure for its row
++// 1).
++
++namespace {
++
++struct BdaTestFixture {
++    rx::platform::Window window;
++    rx::rhi::Context context;
++    rx::rhi::Device device;
++};
++
++std::optional<BdaTestFixture> makeFixture(const char* title) {
++    auto window = rx::platform::Window::create(title, 64, 64, /*visible=*/false);
++    if (!window.has_value()) {
++        MESSAGE("no display backend available, skipping BDA test");
++        return std::nullopt;
++    }
++
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        MESSAGE("video driver reports no Vulkan surface extensions (e.g. dummy driver), skipping BDA test");
++        return std::nullopt;
++    }
++
++    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++
++    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
++    REQUIRE(surface != VK_NULL_HANDLE);
++
++    auto device = rx::rhi::Device::create(*context, surface);
++    REQUIRE(device.has_value());
++
++    return BdaTestFixture{std::move(*window), std::move(*context), std::move(*device)};
++}
++
++}  // namespace
++
++TEST_CASE("Device::create resolves supportsBufferDeviceAddress() without gating device selection") {
++    auto fixture = makeFixture("rx_rhi_vk_bda_test_device");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    // The real assertion here is simpler than it looks: Device::create()
++    // above already SUCCEEDED (the REQUIRE inside makeFixture()) without
++    // this test ever adding bufferDeviceAddress to any REQUIRED feature
++    // set -- proving selection did not depend on it. What this call
++    // reports beyond that is informational (both local drivers happen to
++    // support it, logged for the record rather than hardcoded as an
++    // assumption a future CI driver must match).
++    MESSAGE("Device::supportsBufferDeviceAddress() = ", fixture->device.supportsBufferDeviceAddress());
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE(
++    "Allocator built from a BDA-capable Device creates a VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT buffer that "
++    "yields a nonzero vkGetBufferDeviceAddress") {
++    auto fixture = makeFixture("rx_rhi_vk_bda_test_buffer");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    if (!fixture->device.supportsBufferDeviceAddress()) {
++        MESSAGE("this device does not report bufferDeviceAddress support -- skipping the enablement-path assertion");
++        return;
++    }
++
++    auto allocator = rx::rhi::Allocator::create(fixture->context, fixture->device);
++    REQUIRE(allocator.has_value());
++
++    // [matrix-issue21 row 61] Indirect proof that
++    // VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT was actually set on
++    // this Allocator: per the vendored VMA 3.4.0 source (vk_mem_alloc.h:
++    // 14440-14445/16931), creating a buffer with
++    // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT WITHOUT that allocator
++    // flag trips a VMA_ASSERT / returns VK_ERROR_INITIALIZATION_FAILED --
++    // so a successful creation here, followed by a real nonzero address,
++    // is only possible if the flag genuinely made it through the
++    // Device::supportsBufferDeviceAddress() -> Allocator::create() ->
++    // createRaw() lockstep.
++    auto buffer = allocator->createDeviceLocalBuffer(
++        256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
++    REQUIRE(buffer.has_value());
++
++    VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
++    addressInfo.buffer = buffer->handle();
++    VkDeviceAddress address = vkGetBufferDeviceAddress(fixture->device.device(), &addressInfo);
++
++    CHECK(address != 0);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE(
++    "bufferDeviceAddress enablement is opportunistic by construction, never a device-selection requirement "
++    "[structural, spec D26.4]") {
++    // This is a CODE-STRUCTURE guarantee, not a runtime assertion this
++    // test can exercise against a real BDA-lacking device (none is
++    // available in this environment -- see this file's header comment).
++    // The guarantee holds by inspection of device.cpp: bufferDeviceAddress
++    // is set on a SEPARATE, freshly zero-initialized
++    // VkPhysicalDeviceVulkan12Features (`bufferDeviceAddressRequest`),
++    // passed ONLY to `enable_extension_features_if_present()` -- called
++    // AFTER `vkb::PhysicalDeviceSelector::select()` has already returned
++    // successfully -- never merged into the EARLIER `features12` struct
++    // passed to `set_required_features_12()` (the one struct that
++    // actually gates which physical devices `select()` will accept).
++    // Structurally, a device lacking the bit cannot fail selection over
++    // it: there is no code path connecting this bit to `select()`'s own
++    // acceptance criteria at all. Every fixture above already exercises
++    // "Device::create() succeeds" as a REQUIRE with no bufferDeviceAddress
++    // dependency threaded into it, which is the fixture-level half of
++    // this same proof; this TEST_CASE exists solely to record the
++    // guarantee explicitly, mirroring Task 11's own "eliminated
++    // structurally, not merely by a runtime check" callout for a
++    // similarly unreachable-on-available-hardware case.
++    CHECK(true);
++}

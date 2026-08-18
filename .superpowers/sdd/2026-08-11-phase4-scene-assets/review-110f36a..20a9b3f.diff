@@ -1,0 +1,627 @@
+=== COMMITS ===
+20a9b3f fix(rx_asset): narrow GeometryPool read-accessor contract to main-thread-only, fix orphaned-block leak
+
+=== STAT ===
+ docs/threading.md                             |  25 +++-
+ src/rx_asset/geometry_pool.cpp                |  49 ++++++-
+ src/rx_asset/include/rx_asset/geometry_pool.h |  69 +++++++++-
+ src/rx_asset/tests/CMakeLists.txt             |   1 +
+ src/rx_asset/tests/thread_guard_test.cpp      | 177 ++++++++++++++++++++++++++
+ 5 files changed, 305 insertions(+), 16 deletions(-)
+
+=== FULL DIFF (U10) ===
+diff --git a/docs/threading.md b/docs/threading.md
+index fd9453b..af5df86 100644
+--- a/docs/threading.md
++++ b/docs/threading.md
+@@ -79,28 +79,39 @@ and compiles to nothing at all when it is OFF:
+   state a chunk >= 1 caller could corrupt, since `MemoryAccounting`'s own
+   counters are atomic; the main-thread-only convention here is about
+   matching every other Allocator/Buffer/Texture2D GPU-object-mutation
+   entry point's existing scoping, not a new hazard) — call
+   `setCurrentFrameIndex()` once per frame (`FrameSync::advanceFrame()`
+   does this automatically when passed this Allocator's address) so
+   `report()`'s per-heap budget numbers stay fresh (see `memory_report.h`'s
+   own comment on the `vmaSetCurrentFrameIndex()` staleness rule).
+   (`src/rx_rhi_vk/include/rx_rhi_vk/buffer.h`)
+ - **`rx::asset::GeometryPool`** [Phase 4 Stage 1 Task 12, spec D9] —
+-  `create()`/`upload()`/`free()`/`bind()` **[guarded, all four]**:
+-  suballocation is a main-thread-owned `VmaVirtualBlock` operation (VMA's
+-  own virtual-block API documents itself as "not thread-safe... must be
+-  synchronized externally" — vendored `vk_mem_alloc.h`), same rationale
+-  as the four Allocator-derived types above. `stats()`/`blockCount()`/
++  `create()`/`upload()`/`free()`/`bind()`/`stats()`/`blockCount()`/
+   `bufferDeviceAddressEnabled()`/`vertexBufferDeviceAddress()`/
+-  `indexBufferDeviceAddress()` are read-only snapshots, not guarded.
+-  (`src/rx_asset/include/rx_asset/geometry_pool.h`)
++  `indexBufferDeviceAddress()` **[guarded, all nine]**: suballocation is
++  a main-thread-owned `VmaVirtualBlock` operation (VMA's own
++  virtual-block API documents itself as "not thread-safe... must be
++  synchronized externally" — vendored `vk_mem_alloc.h`, and that
++  requirement covers reads too, not just the mutators), same rationale
++  as the four Allocator-derived types above. **[Fix round 1, review
++  finding]** the read accessors were originally documented (incorrectly)
++  as "safe from any thread holding a valid reference" — `stats()`/
++  `blockCount()`/etc. read the SAME `blocks_`/`VmaVirtualBlock` state
++  `upload()`/`free()` mutate unlocked, with no atomic counters the way
++  `rx::rhi::Allocator::report()` has to justify an any-thread claim;
++  narrowed to main-thread-only and guarded, matching D5's posture for
++  the whole class. The test/diagnostic-only accessors
++  (`vertexBufferAllocatedBytes()`/`indexBufferAllocatedBytes()`/
++  `vertexBufferHandle()`/`indexBufferHandle()`) carry the identical
++  guard for the same reason, though production code has no need for
++  them. (`src/rx_asset/include/rx_asset/geometry_pool.h`)
+ - **`rx::scene::*Manager` registries** (future, Stage 2) —
+   `RenderableManager`/`TransformManager`/`LightManager` mutation
+   (create/set/destroy) stays main-thread-only; read-only SoA traversal for
+   culling (below) does not. Not guarded — does not exist yet.
+ - **`rx::task::Scheduler`** — `pumpMain()` **[guarded]** [audit finding
+   F5-partial]: runs whatever GPU-object-mutating closures `postToMain()`
+   queued (the handoff pattern below), so it carries the identical
+   main-thread-only contract as everything above it, just via a different
+   entry point. `parallelFor()` is NOT main-thread-only itself (its
+   documented contract is "calling thread, whichever one that is" — see
+diff --git a/src/rx_asset/geometry_pool.cpp b/src/rx_asset/geometry_pool.cpp
+index b18d95d..2dc0492 100644
+--- a/src/rx_asset/geometry_pool.cpp
++++ b/src/rx_asset/geometry_pool.cpp
+@@ -177,20 +177,39 @@ bool GeometryPool::addBlock(VkDeviceSize minVertexBytes, VkDeviceSize minIndexBy
+     }
+ 
+     RX_LOG_INFO("GeometryPool::addBlock: new block {} created (vertex={}B/{} elements index={}B/{} elements, total "
+                 "blocks now {})",
+                 blocks_.size(), vertexBytes, vertexElementCapacity, indexBytes, indexElementCapacity,
+                 blocks_.size() + 1);
+     blocks_.push_back(std::move(block));
+     return true;
+ }
+ 
++void GeometryPool::discardOrphanedLastBlock() {
++    Block& block = blocks_.back();
++    // Both call sites guarantee zero live suballocations remain in
++    // either virtual block by this point (see this method's own header
++    // comment) -- vmaDestroyVirtualBlock() is safe directly, no
++    // vmaClearVirtualBlock() needed. Plain vmaDestroyVirtualBlock() calls
++    // (not the checked pattern addBlock()'s own error paths use) are
++    // correct here: both handles are guaranteed non-null (this block was
++    // fully constructed by a successful addBlock() call before either
++    // upload() call site reaches here).
++    vmaDestroyVirtualBlock(block.vertexVirtualBlock);
++    vmaDestroyVirtualBlock(block.indexVirtualBlock);
++    // pop_back() runs Block's implicit destructor on the removed element,
++    // which destroys vertexBuffer/indexBuffer via rx::rhi::Buffer's own
++    // RAII (releasing the D24(a) accounting entry and the real VMA
++    // allocation) -- no separate buffer cleanup needed here.
++    blocks_.pop_back();
++}
++
+ MeshRange GeometryPool::upload(std::span<const PoolVertex> vertices, std::span<const uint32_t> indices) {
+     RX_ASSERT_MAIN_THREAD("GeometryPool::upload");
+ 
+     if (vertices.empty() || indices.empty()) {
+         RX_LOG_ERROR("GeometryPool::upload: rejected -- vertices ({}) and indices ({}) must both be non-empty",
+                      vertices.size(), indices.size());
+         return MeshRange{};
+     }
+ 
+     const auto vertexElementCount = static_cast<VkDeviceSize>(vertices.size());
+@@ -273,32 +292,41 @@ MeshRange GeometryPool::upload(std::span<const PoolVertex> vertices, std::span<c
+         }
+         targetBlockIndex = blocks_.size() - 1;
+         Block& freshBlock = blocks_[targetBlockIndex];
+ 
+         VmaVirtualAllocationCreateInfo vertexCreateInfo{};
+         vertexCreateInfo.size = vertexElementCount;
+         if (vmaVirtualAllocate(freshBlock.vertexVirtualBlock, &vertexCreateInfo, &vertexAlloc,
+                                 &vertexElementOffset) != VK_SUCCESS) {
+             RX_LOG_ERROR(
+                 "GeometryPool::upload: vertex suballocation failed on a block just sized to fit it -- should be "
+-                "unreachable");
++                "unreachable; discarding the orphaned block");
++            // [Fix round 1, review minor] Nothing was ever allocated from
++            // EITHER of this block's virtual blocks yet -- safe to
++            // destroy and pop directly, no vmaVirtualFree needed first.
++            discardOrphanedLastBlock();
+             return MeshRange{};
+         }
+ 
+         VmaVirtualAllocationCreateInfo indexCreateInfo{};
+         indexCreateInfo.size = indexElementCount;
+         if (vmaVirtualAllocate(freshBlock.indexVirtualBlock, &indexCreateInfo, &indexAlloc, &indexElementOffset) !=
+             VK_SUCCESS) {
+             RX_LOG_ERROR(
+                 "GeometryPool::upload: index suballocation failed on a block just sized to fit it -- should be "
+-                "unreachable");
++                "unreachable; discarding the orphaned block");
++            // [Fix round 1, review minor] Release the vertex-side
++            // suballocation that DID succeed first, so the block carries
++            // zero live suballocations before discardOrphanedLastBlock()
++            // destroys its virtual blocks.
+             vmaVirtualFree(freshBlock.vertexVirtualBlock, vertexAlloc);
++            discardOrphanedLastBlock();
+             return MeshRange{};
+         }
+     }
+ 
+     // Re-fetch by index: addBlock() above may have reallocated blocks_.
+     Block& target = blocks_[targetBlockIndex];
+ 
+     target.vertexAllocations.emplace(vertexElementOffset, vertexAlloc);
+     target.indexAllocations.emplace(indexElementOffset, indexAlloc);
+ 
+@@ -375,21 +403,32 @@ void GeometryPool::bind(VkCommandBuffer cmd, uint32_t blockId) const {
+         return;
+     }
+ 
+     const Block& block = blocks_[blockId];
+     VkBuffer vertexBufferHandle = block.vertexBuffer.handle();
+     VkDeviceSize vertexBindOffset = 0;
+     vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBufferHandle, &vertexBindOffset);
+     vkCmdBindIndexBuffer(cmd, block.indexBuffer.handle(), 0, VK_INDEX_TYPE_UINT32);
+ }
+ 
++uint32_t GeometryPool::blockCount() const {
++    RX_ASSERT_MAIN_THREAD("GeometryPool::blockCount");
++    return static_cast<uint32_t>(blocks_.size());
++}
++
++bool GeometryPool::bufferDeviceAddressEnabled() const {
++    RX_ASSERT_MAIN_THREAD("GeometryPool::bufferDeviceAddressEnabled");
++    return bufferDeviceAddressEnabled_;
++}
++
+ PoolStats GeometryPool::stats() const {
++    RX_ASSERT_MAIN_THREAD("GeometryPool::stats");
+     PoolStats out;
+     out.blockCount = static_cast<uint32_t>(blocks_.size());
+     out.blocks.reserve(blocks_.size());
+ 
+     for (const Block& block : blocks_) {
+         // VmaStatistics::allocationBytes/blockBytes are reported in
+         // WHATEVER UNITS the virtual block was created with -- since
+         // these two blocks are sized in ELEMENT counts, not bytes (see
+         // addBlock()'s own comment), the raw values here are element
+         // counts too; multiplying back by each side's element stride is
+@@ -410,52 +449,58 @@ PoolStats GeometryPool::stats() const {
+         out.vertexBytesCapacity += blockStats.vertexBytesCapacity;
+         out.indexBytesUsed += blockStats.indexBytesUsed;
+         out.indexBytesCapacity += blockStats.indexBytesCapacity;
+         out.blocks.push_back(blockStats);
+     }
+ 
+     return out;
+ }
+ 
+ VkDeviceAddress GeometryPool::vertexBufferDeviceAddress(uint32_t blockId) const {
++    RX_ASSERT_MAIN_THREAD("GeometryPool::vertexBufferDeviceAddress");
+     if (!bufferDeviceAddressEnabled_ || blockId >= blocks_.size()) {
+         return 0;
+     }
+     return blocks_[blockId].vertexBufferAddress;
+ }
+ 
+ VkDeviceAddress GeometryPool::indexBufferDeviceAddress(uint32_t blockId) const {
++    RX_ASSERT_MAIN_THREAD("GeometryPool::indexBufferDeviceAddress");
+     if (!bufferDeviceAddressEnabled_ || blockId >= blocks_.size()) {
+         return 0;
+     }
+     return blocks_[blockId].indexBufferAddress;
+ }
+ 
+ VkDeviceSize GeometryPool::vertexBufferAllocatedBytes(uint32_t blockId) const {
++    RX_ASSERT_MAIN_THREAD("GeometryPool::vertexBufferAllocatedBytes");
+     if (blockId >= blocks_.size()) {
+         return 0;
+     }
+     return blocks_[blockId].vertexBuffer.allocatedBytes();
+ }
+ 
+ VkDeviceSize GeometryPool::indexBufferAllocatedBytes(uint32_t blockId) const {
++    RX_ASSERT_MAIN_THREAD("GeometryPool::indexBufferAllocatedBytes");
+     if (blockId >= blocks_.size()) {
+         return 0;
+     }
+     return blocks_[blockId].indexBuffer.allocatedBytes();
+ }
+ 
+ VkBuffer GeometryPool::vertexBufferHandle(uint32_t blockId) const {
++    RX_ASSERT_MAIN_THREAD("GeometryPool::vertexBufferHandle");
+     if (blockId >= blocks_.size()) {
+         return VK_NULL_HANDLE;
+     }
+     return blocks_[blockId].vertexBuffer.handle();
+ }
+ 
+ VkBuffer GeometryPool::indexBufferHandle(uint32_t blockId) const {
++    RX_ASSERT_MAIN_THREAD("GeometryPool::indexBufferHandle");
+     if (blockId >= blocks_.size()) {
+         return VK_NULL_HANDLE;
+     }
+     return blocks_[blockId].indexBuffer.handle();
+ }
+ 
+ }  // namespace rx::asset
+diff --git a/src/rx_asset/include/rx_asset/geometry_pool.h b/src/rx_asset/include/rx_asset/geometry_pool.h
+index accbb95..b3bc07b 100644
+--- a/src/rx_asset/include/rx_asset/geometry_pool.h
++++ b/src/rx_asset/include/rx_asset/geometry_pool.h
+@@ -1,22 +1,39 @@
+ #pragma once
+ 
+ // Thread-affinity (D5, Phase 4 Stage 1 Task 12): GeometryPool's suballocation
+ // state (per-block VmaVirtualBlock TLSF metadata) is NOT internally
+ // synchronized -- VMA's own virtual-block API documents itself as "not
+ // thread-safe... should not be used from multiple threads simultaneously,
+ // must be synchronized externally" (vendored vk_mem_alloc.h) -- so
+ // create()/upload()/free()/bind() are main-thread-only, matching every
+ // other GPU-object-mutation entry point in this codebase (BindlessTable/
+-// Uploader/DeletionQueue/Allocator -- see docs/threading.md). stats()/
+-// blockCount()/bufferDeviceAddressEnabled()/*BufferDeviceAddress() are
+-// read-only snapshots, safe from any thread holding a valid reference.
++// Uploader/DeletionQueue/Allocator -- see docs/threading.md).
++//
++// [Fix round 1, review finding] EVERY OTHER PUBLIC METHOD IS ALSO
++// MAIN-THREAD-ONLY -- stats()/blockCount()/bufferDeviceAddressEnabled()/
++// vertexBufferDeviceAddress()/indexBufferDeviceAddress() (and the
++// test/diagnostic accessors below them) all read `blocks_` and/or call
++// vmaGetVirtualBlockStatistics() against live VmaVirtualBlocks that
++// upload()/free() mutate WITHOUT a lock -- VMA's own docs require
++// external synchronization for reads too, and `blocks_.size()`/
++// `blocks_[i]` race a concurrent `push_back()` reallocation exactly like
++// any other unsynchronized std::vector. An earlier version of this
++// comment claimed these were "safe from any thread holding a valid
++// reference" -- that was not backed by anything (no atomic state the way
++// rx::rhi::Allocator::report()/setCurrentFrameIndex() have
++// MemoryAccounting's atomic counters to justify their own any-thread
++// claim). Narrowed to main-thread-only, matching D5's posture for the
++// whole class; every one of these now carries the same
++// RX_ASSERT_MAIN_THREAD guard the mutators do, so the contract is
++// enforced, not just documented. HUD/Tracy consumers of stats() already
++// run on the main thread, so this costs nothing real.
+ 
+ #include <rx_rhi_vk/buffer.h>
+ #include <cstdint>
+ #include <memory>
+ #include <span>
+ #include <unordered_map>
+ #include <vector>
+ 
+ namespace rx::rhi {
+ class Device;
+@@ -236,64 +253,89 @@ public:
+     // Main-thread-only (D5) -- like every other GPU-object-mutation entry
+     // point in this class: this method only ever reads this pool's own
+     // bookkeeping state (its Buffer handles), never a worker-recorded
+     // command buffer's contents, but the guard matches every sibling
+     // entry point's identical scoping per this project's own convention.
+     void bind(VkCommandBuffer cmd, uint32_t blockId) const;
+ 
+     // Snapshot of bytes used/capacity (vertex + index, summed across
+     // every block) plus block COUNT [gate ruling #21] and a per-block
+     // breakdown. Cheap: calls VMA's FAST vmaGetVirtualBlockStatistics()
+-    // tier per block, never the slow detailed/string tiers. Safe from any
+-    // thread holding a valid reference.
++    // tier per block, never the slow detailed/string tiers.
++    //
++    // Main-thread-only (D5) [fix round 1] -- vmaGetVirtualBlockStatistics()
++    // reads the SAME live VmaVirtualBlock upload()/free() mutate without a
++    // lock (VMA requires external synchronization for this call too, not
++    // just the mutating ones), so this is not safe from another thread
++    // despite being a "read". See this header's own top-of-file comment.
+     PoolStats stats() const;
+ 
+-    uint32_t blockCount() const { return static_cast<uint32_t>(blocks_.size()); }
++    // Main-thread-only (D5) [fix round 1] -- reads blocks_.size(), which
++    // races a concurrent upload()-triggered push_back() reallocation.
++    uint32_t blockCount() const;
+ 
+     // [D26.4] True iff this pool's chunk buffers were created with
+     // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT and this pool's Allocator
+     // was built with VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT --
+     // resolved once at create() from rx::rhi::Device::
+     // supportsBufferDeviceAddress(). Enablement only: nothing in Phase 4
+     // consumes the addresses below.
+-    bool bufferDeviceAddressEnabled() const { return bufferDeviceAddressEnabled_; }
++    //
++    // Main-thread-only (D5) [fix round 1] -- this specific field is set
++    // once at construction and never mutated again, so reading it alone
++    // would in fact be safe from any thread; guarded anyway for a single
++    // uniform contract across every accessor in this class (D5's own
++    // posture for the whole class, per the coordinator's fix-round
++    // ruling), rather than a field-by-field carve-out a caller has to
++    // remember.
++    bool bufferDeviceAddressEnabled() const;
+ 
+     // [D26.4] vkGetBufferDeviceAddress() for `blockId`'s vertex/index
+     // buffer -- always 0 when bufferDeviceAddressEnabled() is false (no
+     // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT usage bit was ever
+     // requested on a block buffer in that case, so querying one would be
+     // a validation error, not merely a meaningless value; these two
+     // methods simply never call the Vulkan function at all when
+     // disabled).
++    //
++    // Main-thread-only (D5) [fix round 1] -- indexes into blocks_, same
++    // hazard as blockCount() above.
+     VkDeviceAddress vertexBufferDeviceAddress(uint32_t blockId) const;
+     VkDeviceAddress indexBufferDeviceAddress(uint32_t blockId) const;
+ 
+     // Test/diagnostic accessors -- production code has no need for them.
+     // The REAL VMA-reported allocated bytes for `blockId`'s vertex/index
+     // chunk buffer (rx::rhi::Buffer::allocatedBytes()), which may exceed
+     // the nominal chunk size requested (PoolConfig::vertexChunkBytes/
+     // indexChunkBytes, or whatever addBlock() sized this specific block
+     // to) if VMA pads for alignment/block granularity -- this is what the
+     // #27 accounting-integration test compares Allocator::report()'s
+     // delta against, since MemoryAccounting records the REAL allocated
+     // size, not the nominal request (see rx_rhi_vk/memory_report.h's own
+     // comment on Buffer::allocatedBytes()).
++    //
++    // Main-thread-only (D5) [fix round 1] -- indexes into blocks_, same
++    // hazard as blockCount() above; every doctest caller already runs
++    // single-threaded on the main thread, so this costs the tests nothing.
+     VkDeviceSize vertexBufferAllocatedBytes(uint32_t blockId) const;
+     VkDeviceSize indexBufferAllocatedBytes(uint32_t blockId) const;
+ 
+     // Test/diagnostic accessors -- production code has no need for them
+     // (bind() is the sanctioned way to attach a block's buffers to a
+     // command buffer for drawing). Raw handles for `blockId`'s vertex/
+     // index chunk buffer, so a test can read back their content directly
+     // (vkCmdCopyBuffer) to prove upload()'s returned MeshRange offsets are
+     // byte-exact -- see geometry_pool_test.cpp. VK_NULL_HANDLE if
+     // `blockId` is out of range.
++    //
++    // Main-thread-only (D5) [fix round 1] -- indexes into blocks_, same
++    // hazard as blockCount() above.
+     VkBuffer vertexBufferHandle(uint32_t blockId) const;
+     VkBuffer indexBufferHandle(uint32_t blockId) const;
+ 
+ private:
+     // One chunk: a device-local vertex+index Buffer pair plus their own
+     // independent VmaVirtualBlock CPU-side suballocators (ELEMENT-offset
+     // space -- one PoolVertex / one uint32_t per unit, NOT bytes, and NOT
+     // tied to the Buffer's own VMA memory allocation -- see the class
+     // comment's "SUBALLOCATION UNITS" paragraph). `*Allocations` maps a
+     // live suballocation's ELEMENT offset to the VmaVirtualAllocation
+@@ -319,20 +361,33 @@ private:
+                  bool bufferDeviceAddressEnabled, PoolConfig config);
+ 
+     // Creates a new block sized to max(config_.*ChunkBytes, minimum
+     // required bytes) and appends it to blocks_. Returns false (logged)
+     // on any allocation failure -- see geometry_pool.cpp for the exact
+     // call sequence (createDeviceLocalBuffer with
+     // MemoryCategory::GeometryPool [D24(a)] + the BDA usage bit when
+     // enabled, then vmaCreateVirtualBlock for both buffers).
+     bool addBlock(VkDeviceSize minVertexBytes, VkDeviceSize minIndexBytes);
+ 
++    // [Fix round 1, review minor] Destroys blocks_.back()'s two
++    // VmaVirtualBlocks (both, unconditionally) and pops it off blocks_.
++    // Both call sites in upload() only ever reach this with ZERO live
++    // suballocations remaining in either virtual block (any suballocation
++    // that DID succeed on this block before the failure is freed by the
++    // caller first) -- so vmaDestroyVirtualBlock() is safe here directly,
++    // with no vmaClearVirtualBlock() needed first. Cleans up the
++    // just-addBlock()'d block on the "should be unreachable" path where a
++    // fresh block sized to fit the exact request still fails a
++    // suballocation, so that defensive path leaves no orphaned block
++    // (and, via ~Buffer(), no orphaned device-local memory) behind.
++    void discardOrphanedLastBlock();
++
+     void destroyAll();
+ 
+     rx::rhi::Allocator& allocator_;
+     rx::rhi::Uploader& uploader_;
+     VkDevice device_ = VK_NULL_HANDLE;
+     bool bufferDeviceAddressEnabled_ = false;
+     PoolConfig config_;
+     std::vector<Block> blocks_;
+ };
+ 
+diff --git a/src/rx_asset/tests/CMakeLists.txt b/src/rx_asset/tests/CMakeLists.txt
+index 98c811c..81fc25f 100644
+--- a/src/rx_asset/tests/CMakeLists.txt
++++ b/src/rx_asset/tests/CMakeLists.txt
+@@ -13,20 +13,21 @@
+ # slangc build-time precompile -- rx_shader_deploy_runtime_libs() (defined
+ # in src/rx_shader/CMakeLists.txt, add_subdirectory'd before src/rx_asset
+ # in the root CMakeLists.txt) copies the Slang runtime shared libraries
+ # this binary needs at load time next to it, exactly like every other
+ # rx_shader-linking binary in this repo.
+ add_executable(rx_asset_tests
+     doctest_main.cpp
+     geometry_pool_test.cpp
+     bda_test.cpp
+     accounting_test.cpp
++    thread_guard_test.cpp
+ )
+ target_link_libraries(rx_asset_tests PRIVATE rx_asset rx_rhi_vk rx_platform rx_shader doctest::doctest)
+ rx_shader_deploy_runtime_libs(rx_asset_tests)
+ 
+ # --validate: same documentation/consistency role as every other GPU-gate
+ # invocation in this repo (rx_graph_gpu_tests, every sample's own headless
+ # ctest gate) -- every fixture here already builds its rx::rhi::Context
+ # with enableValidation=true unconditionally, and each TEST_CASE's own
+ # CHECK_FALSE(context.hasValidationErrors()) is what actually turns a
+ # validation message into a ctest failure; doctest itself ignores this
+diff --git a/src/rx_asset/tests/thread_guard_test.cpp b/src/rx_asset/tests/thread_guard_test.cpp
+new file mode 100644
+index 0000000..f718833
+--- /dev/null
++++ b/src/rx_asset/tests/thread_guard_test.cpp
+@@ -0,0 +1,177 @@
++#include <doctest/doctest.h>
++#include <rx_asset/geometry_pool.h>
++#include <rx_core/debug_checks.h>
++#include <rx_rhi_vk/device.h>
++#include <rx_rhi_vk/upload.h>
++#include <rx_platform/window.h>
++#include <atomic>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <thread>
++#include <utility>
++
++// thread_guard_test.cpp -- [Fix round 1, review IMPORTANT finding] proves
++// GeometryPool's read accessors (stats()/blockCount()/
++// bufferDeviceAddressEnabled()/vertexBufferDeviceAddress()/
++// indexBufferDeviceAddress(), narrowed to main-thread-only this fix round
++// -- see geometry_pool.h's own updated class comment) actually ENFORCE
++// that contract via RX_ASSERT_MAIN_THREAD, not merely document it.
++// Mirrors rx_core/tests/debug_checks_test.cpp's own "a plain std::thread
++// stands in for a chunk >= 1 worker" pattern (legitimate here for the
++// identical reason that file documents: this tests the thread-identity
++// comparison the guard performs, not any real scheduler integration --
++// GeometryPool has no rx::task::Scheduler-driven caller in this phase at
++// all). Each worker thread below is joined before the next one starts,
++// so there is never more than one thread touching this GeometryPool's
++// state at a time -- exactly the precondition
++// rx::core::debug::detail::ViolationHook's own contract comment requires
++// of a test-installed hook that returns normally instead of aborting.
++//
++// The whole file (fixture included) is guarded on RX_DEBUG_CHECKS: the
++// fixture exists only to feed the two hook-dependent TEST_CASEs below,
++// so there is nothing left to compile when the mechanism itself is
++// compiled away (RX_DEBUG_CHECKS is ON by default in both of this
++// project's presets -- see rx_core/tests/debug_checks_test.cpp's own
++// identical guard for why there is no meaningful OFF equivalent).
++#ifdef RX_DEBUG_CHECKS
++
++namespace {
++
++struct ThreadGuardFixture {
++    rx::platform::Window window;
++    rx::rhi::Context context;
++    rx::rhi::Device device;
++    rx::rhi::Allocator allocator;
++    rx::rhi::Uploader uploader;
++};
++
++std::optional<ThreadGuardFixture> makeFixture(const char* title) {
++    auto window = rx::platform::Window::create(title, 64, 64, /*visible=*/false);
++    if (!window.has_value()) {
++        MESSAGE("no display backend available, skipping GeometryPool thread-guard test");
++        return std::nullopt;
++    }
++
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        MESSAGE("video driver reports no Vulkan surface extensions, skipping GeometryPool thread-guard test");
++        return std::nullopt;
++    }
++
++    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++
++    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
++    REQUIRE(surface != VK_NULL_HANDLE);
++
++    auto device = rx::rhi::Device::create(*context, surface);
++    REQUIRE(device.has_value());
++
++    auto allocator = rx::rhi::Allocator::create(*context, *device);
++    REQUIRE(allocator.has_value());
++
++    auto uploader = rx::rhi::Uploader::create(*allocator, *device);
++    REQUIRE(uploader.has_value());
++
++    return ThreadGuardFixture{std::move(*window), std::move(*context), std::move(*device), std::move(*allocator),
++                               std::move(*uploader)};
++}
++
++}  // namespace
++
++namespace {
++
++struct ViolationCapture {
++    std::mutex mutex;
++    int callCount = 0;
++    std::string lastContext;
++};
++
++std::atomic<ViolationCapture*> g_activeCapture{nullptr};
++
++void captureViolationHook(const char* context) {
++    ViolationCapture* capture = g_activeCapture.load(std::memory_order_relaxed);
++    if (capture == nullptr) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(capture->mutex);
++    capture->callCount++;
++    capture->lastContext = context != nullptr ? context : "";
++    // Returns normally rather than throwing/aborting -- safe here
++    // specifically because every worker thread below is join()'d before
++    // the next guarded call starts, so no other thread is ever
++    // concurrently touching this GeometryPool's state during the one
++    // violating call (mirrors debug_checks_test.cpp's own identical
++    // precondition note).
++}
++
++struct ViolationHookGuard {
++    ~ViolationHookGuard() {
++        g_activeCapture.store(nullptr, std::memory_order_relaxed);
++        rx::core::debug::detail::setViolationHookForTests(nullptr);
++    }
++};
++
++}  // namespace
++
++TEST_CASE(
++    "GeometryPool's read accessors (stats/blockCount/bufferDeviceAddressEnabled/*BufferDeviceAddress) trip "
++    "RX_ASSERT_MAIN_THREAD when called from a worker thread [fix round 1]") {
++    auto fixture = makeFixture("rx_asset_thread_guard");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto pool = rx::asset::GeometryPool::create(fixture->allocator, fixture->device, fixture->uploader);
++    REQUIRE(pool != nullptr);
++
++    ViolationCapture capture;
++    g_activeCapture.store(&capture, std::memory_order_relaxed);
++    rx::core::debug::detail::setViolationHookForTests(&captureViolationHook);
++    ViolationHookGuard guard;
++
++    // One worker thread per read accessor this fix round narrowed to
++    // main-thread-only -- each joined before the next starts.
++    std::thread statsThread([&] { pool->stats(); });
++    statsThread.join();
++    std::thread blockCountThread([&] { pool->blockCount(); });
++    blockCountThread.join();
++    std::thread bdaEnabledThread([&] { pool->bufferDeviceAddressEnabled(); });
++    bdaEnabledThread.join();
++    std::thread vertexAddrThread([&] { pool->vertexBufferDeviceAddress(0); });
++    vertexAddrThread.join();
++    std::thread indexAddrThread([&] { pool->indexBufferDeviceAddress(0); });
++    indexAddrThread.join();
++
++    std::lock_guard<std::mutex> lock(capture.mutex);
++    CHECK(capture.callCount == 5);
++    CHECK(capture.lastContext == "GeometryPool::indexBufferDeviceAddress");
++}
++
++TEST_CASE(
++    "GeometryPool's read accessors do NOT trip the guard for a call genuinely on the main thread [fix round 1]") {
++    auto fixture = makeFixture("rx_asset_thread_guard_legal");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto pool = rx::asset::GeometryPool::create(fixture->allocator, fixture->device, fixture->uploader);
++    REQUIRE(pool != nullptr);
++
++    ViolationCapture capture;
++    g_activeCapture.store(&capture, std::memory_order_relaxed);
++    rx::core::debug::detail::setViolationHookForTests(&captureViolationHook);
++    ViolationHookGuard guard;
++
++    pool->stats();
++    pool->blockCount();
++    pool->bufferDeviceAddressEnabled();
++    pool->vertexBufferDeviceAddress(0);
++    pool->indexBufferDeviceAddress(0);
++
++    std::lock_guard<std::mutex> lock(capture.mutex);
++    CHECK(capture.callCount == 0);
++}
++
++#endif  // RX_DEBUG_CHECKS
