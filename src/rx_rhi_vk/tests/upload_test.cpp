@@ -60,17 +60,32 @@ std::optional<UploadTestFixture> makeFixture(const char* title) {
 // Copies `size` bytes out of `src` (assumed device-local, TRANSFER_SRC_BIT)
 // into a freshly allocated, invalidated, host-visible buffer -- the
 // readback half of every round-trip test below.
+//
+// [CI-red fix, matrix-issue28 follow-up] `uploaderTimeline`/`ticketValue`:
+// the Uploader::timelineSemaphore() and UploadTicket::value that cover
+// whatever GPU write populated `src`. This readback's own vkQueueSubmit
+// otherwise carries NO relationship to that write besides the caller's own
+// prior host-side Uploader::wait(ticket) -- and a host wait's visibility
+// scope covers only HOST accesses to that memory (Vulkan spec), not a
+// separate, later device queue submission with no wait of its own.
+// Threading `uploaderTimeline`/`ticketValue` through to a real GPU-side
+// wait (below) is what makes the dependency submission-visible instead of
+// relying solely on that host round-trip -- see
+// Uploader::timelineSemaphore()'s own comment for the full rationale.
 std::vector<uint8_t> readBackBuffer(rx::rhi::Allocator& allocator, VkDevice device, VkQueue queue,
-                                     uint32_t queueFamily, VkBuffer src, VkDeviceSize size) {
+                                     uint32_t queueFamily, VkBuffer src, VkDeviceSize size,
+                                     VkSemaphore uploaderTimeline, uint64_t ticketValue) {
     auto readback = allocator.createHostVisibleBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     REQUIRE(readback.has_value());
 
     auto cmdCtx = rx::rhi::CommandContext::create(device, queue, queueFamily);
     REQUIRE(cmdCtx.has_value());
-    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
-        VkBufferCopy region{0, 0, size};
-        vkCmdCopyBuffer(cmd, src, readback->handle(), 1, &region);
-    });
+    cmdCtx->runOnce(
+        [&](VkCommandBuffer cmd) {
+            VkBufferCopy region{0, 0, size};
+            vkCmdCopyBuffer(cmd, src, readback->handle(), 1, &region);
+        },
+        uploaderTimeline, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_NULL_HANDLE, ticketValue);
 
     // GPU write (the copy above) happened after this host-visible buffer
     // was mapped -- invalidate() before reading, per Buffer's own
@@ -124,14 +139,19 @@ TEST_CASE("Uploader::uploadToBuffer round-trips bytes through the staging path b
     // readback's own separate command-buffer submission has no other
     // synchronization tying it to the upload's completion (relying on
     // same-queue submission order alone would be an unstated, spec-
-    // fragile assumption, not a real guarantee).
-    uploader->wait(uploader->flush());
+    // fragile assumption, not a real guarantee). [CI-red fix] the ticket is
+    // ALSO threaded into readBackBuffer() below as a real GPU-side wait --
+    // see that function's own comment for why the host wait() above is not
+    // by itself a submission-visible dependency.
+    rx::rhi::UploadTicket ticket = uploader->flush();
+    uploader->wait(ticket);
     CHECK(uploader->everUsedStagingPath());
     CHECK_FALSE(uploader->everUsedDirectPath());
 
-    std::vector<uint8_t> readBack = readBackBuffer(fixture->allocator, fixture->device.device(),
-                                                     fixture->device.graphicsQueue(),
-                                                     fixture->device.graphicsQueueFamily(), dst->handle(), kSize);
+    std::vector<uint8_t> readBack =
+        readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
+                        fixture->device.graphicsQueueFamily(), dst->handle(), kSize, uploader->timelineSemaphore(),
+                        ticket.value);
     CHECK(std::memcmp(readBack.data(), pattern.data(), kSize) == 0);
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
@@ -189,11 +209,13 @@ TEST_CASE("Uploader::uploadToBuffer takes the direct memcpy-into-mapped-destinat
     // branch (nothing was recorded for a direct-path write, so flush()
     // returns the trivially-complete ticket and wait() is a no-op) --
     // harmless either way.
-    uploader->wait(uploader->flush());
+    rx::rhi::UploadTicket ticket = uploader->flush();
+    uploader->wait(ticket);
 
-    std::vector<uint8_t> readBack = readBackBuffer(fixture->allocator, fixture->device.device(),
-                                                     fixture->device.graphicsQueue(),
-                                                     fixture->device.graphicsQueueFamily(), dst->handle(), kSize);
+    std::vector<uint8_t> readBack =
+        readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
+                        fixture->device.graphicsQueueFamily(), dst->handle(), kSize, uploader->timelineSemaphore(),
+                        ticket.value);
     CHECK(std::memcmp(readBack.data(), pattern.data(), kSize) == 0);
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
@@ -230,11 +252,13 @@ TEST_CASE("Uploader::uploadToBuffer stages through the ring buffer when the dest
     REQUIRE(uploader->uploadToBuffer(*dst, 0, pattern.data(), kSize));
     CHECK(uploader->everUsedStagingPath());
     CHECK_FALSE(uploader->everUsedDirectPath());
-    uploader->wait(uploader->flush());
+    rx::rhi::UploadTicket ticket = uploader->flush();
+    uploader->wait(ticket);
 
-    std::vector<uint8_t> readBack = readBackBuffer(fixture->allocator, fixture->device.device(),
-                                                     fixture->device.graphicsQueue(),
-                                                     fixture->device.graphicsQueueFamily(), dst->handle(), kSize);
+    std::vector<uint8_t> readBack =
+        readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
+                        fixture->device.graphicsQueueFamily(), dst->handle(), kSize, uploader->timelineSemaphore(),
+                        ticket.value);
     CHECK(std::memcmp(readBack.data(), pattern.data(), kSize) == 0);
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
@@ -276,15 +300,21 @@ TEST_CASE("Uploader auto-flushes mid-batch when the ring buffer runs out of room
     // flush() for dstA's write: tickets from the same Uploader are
     // strictly ordered by submission (see upload.h's class comment), so
     // this final wait() transitively covers the earlier, internally
-    // flushed batch too.
-    uploader->wait(uploader->flush());
+    // flushed batch too. [CI-red fix] the same transitivity is what makes
+    // this SAME final ticket a correct GPU-side wait value for BOTH
+    // readbacks below, including dstA's -- its own (earlier, internal)
+    // ticket is guaranteed already reached once this later one is.
+    rx::rhi::UploadTicket ticket = uploader->flush();
+    uploader->wait(ticket);
 
-    std::vector<uint8_t> readA = readBackBuffer(fixture->allocator, fixture->device.device(),
-                                                  fixture->device.graphicsQueue(),
-                                                  fixture->device.graphicsQueueFamily(), dstA->handle(), kChunkSize);
-    std::vector<uint8_t> readB = readBackBuffer(fixture->allocator, fixture->device.device(),
-                                                  fixture->device.graphicsQueue(),
-                                                  fixture->device.graphicsQueueFamily(), dstB->handle(), kChunkSize);
+    std::vector<uint8_t> readA =
+        readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
+                        fixture->device.graphicsQueueFamily(), dstA->handle(), kChunkSize,
+                        uploader->timelineSemaphore(), ticket.value);
+    std::vector<uint8_t> readB =
+        readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
+                        fixture->device.graphicsQueueFamily(), dstB->handle(), kChunkSize,
+                        uploader->timelineSemaphore(), ticket.value);
     CHECK(std::memcmp(readA.data(), patternA.data(), kChunkSize) == 0);
     CHECK(std::memcmp(readB.data(), patternB.data(), kChunkSize) == 0);
     CHECK_FALSE(fixture->context.hasValidationErrors());
@@ -363,11 +393,20 @@ TEST_CASE("MeshBuffers::create uploads vertex+index data into device-local buffe
         sizeof(kVertices), VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     REQUIRE(vertexCopy.has_value());
     REQUIRE(uploader->uploadToBuffer(*vertexCopy, 0, kVertices.data(), sizeof(kVertices)));
-    uploader->wait(uploader->flush());
+    // [CI-red fix] this ticket is issued AFTER MeshBuffers::create()
+    // returned (which already did its own internal flush()+wait(), per
+    // its own header comment) -- since tickets from the same Uploader are
+    // strictly ordered by submission (upload.h's class comment), this
+    // LATER ticket's value is a correct GPU-side wait for the mesh's OWN
+    // buffers below too, transitively covering create()'s earlier,
+    // internal ticket, with no need for MeshBuffers to expose it directly.
+    rx::rhi::UploadTicket ticket = uploader->flush();
+    uploader->wait(ticket);
 
     std::vector<uint8_t> readBack =
         readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
-                        fixture->device.graphicsQueueFamily(), vertexCopy->handle(), sizeof(kVertices));
+                        fixture->device.graphicsQueueFamily(), vertexCopy->handle(), sizeof(kVertices),
+                        uploader->timelineSemaphore(), ticket.value);
     CHECK(std::memcmp(readBack.data(), kVertices.data(), sizeof(kVertices)) == 0);
 
     // The real proof that MeshBuffers' OWN vertex/index buffers actually
@@ -376,12 +415,14 @@ TEST_CASE("MeshBuffers::create uploads vertex+index data into device-local buffe
     // mesh->vertexBuffer()/indexBuffer() themselves.
     std::vector<uint8_t> meshVertexReadBack =
         readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
-                        fixture->device.graphicsQueueFamily(), mesh->vertexBuffer(), sizeof(kVertices));
+                        fixture->device.graphicsQueueFamily(), mesh->vertexBuffer(), sizeof(kVertices),
+                        uploader->timelineSemaphore(), ticket.value);
     CHECK(std::memcmp(meshVertexReadBack.data(), kVertices.data(), sizeof(kVertices)) == 0);
 
     std::vector<uint8_t> meshIndexReadBack =
         readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
-                        fixture->device.graphicsQueueFamily(), mesh->indexBuffer(), sizeof(kIndices));
+                        fixture->device.graphicsQueueFamily(), mesh->indexBuffer(), sizeof(kIndices),
+                        uploader->timelineSemaphore(), ticket.value);
     CHECK(std::memcmp(meshIndexReadBack.data(), kIndices.data(), sizeof(kIndices)) == 0);
 
     CHECK_FALSE(fixture->context.hasValidationErrors());
@@ -453,12 +494,14 @@ TEST_CASE("Uploader::flush: two overlapping flush() calls without waiting on the
     // not a side effect of ticketB's.
     CHECK(uploader->isComplete(ticketA));
 
-    std::vector<uint8_t> readA = readBackBuffer(fixture->allocator, fixture->device.device(),
-                                                  fixture->device.graphicsQueue(),
-                                                  fixture->device.graphicsQueueFamily(), dstA->handle(), kSize);
-    std::vector<uint8_t> readB = readBackBuffer(fixture->allocator, fixture->device.device(),
-                                                  fixture->device.graphicsQueue(),
-                                                  fixture->device.graphicsQueueFamily(), dstB->handle(), kSize);
+    std::vector<uint8_t> readA =
+        readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
+                        fixture->device.graphicsQueueFamily(), dstA->handle(), kSize, uploader->timelineSemaphore(),
+                        ticketA.value);
+    std::vector<uint8_t> readB =
+        readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
+                        fixture->device.graphicsQueueFamily(), dstB->handle(), kSize, uploader->timelineSemaphore(),
+                        ticketB.value);
     CHECK(std::memcmp(readA.data(), patternA.data(), kSize) == 0);
     CHECK(std::memcmp(readB.data(), patternB.data(), kSize) == 0);
 
@@ -589,10 +632,12 @@ TEST_CASE("Uploader::flush: a batch mixing a direct-path buffer upload with a st
 
     std::vector<uint8_t> readDirect =
         readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
-                        fixture->device.graphicsQueueFamily(), dstDirect->handle(), kSize);
+                        fixture->device.graphicsQueueFamily(), dstDirect->handle(), kSize,
+                        uploader->timelineSemaphore(), ticket.value);
     std::vector<uint8_t> readStaged =
         readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
-                        fixture->device.graphicsQueueFamily(), dstStaged->handle(), kSize);
+                        fixture->device.graphicsQueueFamily(), dstStaged->handle(), kSize,
+                        uploader->timelineSemaphore(), ticket.value);
     CHECK(std::memcmp(readDirect.data(), patternDirect.data(), kSize) == 0);
     CHECK(std::memcmp(readStaged.data(), patternStaged.data(), kSize) == 0);
     CHECK_FALSE(fixture->context.hasValidationErrors());
@@ -733,9 +778,10 @@ TEST_CASE("Uploader::flush()/isComplete() never block past a wall-clock threshol
         uploader->wait(ticket);
     }
     for (int i = 0; i < kFrameCount; ++i) {
-        std::vector<uint8_t> readBack = readBackBuffer(
-            fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
-            fixture->device.graphicsQueueFamily(), destinations[static_cast<size_t>(i)]->handle(), kUploadSize);
+        std::vector<uint8_t> readBack =
+            readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
+                            fixture->device.graphicsQueueFamily(), destinations[static_cast<size_t>(i)]->handle(),
+                            kUploadSize, uploader->timelineSemaphore(), tickets[static_cast<size_t>(i)].value);
         CHECK(std::memcmp(readBack.data(), payload.data(), kUploadSize) == 0);
     }
     CHECK_FALSE(fixture->context.hasValidationErrors());
@@ -829,7 +875,7 @@ TEST_CASE("Uploader ring-buffer reclamation under heavy wrap: partial reclaim en
         std::vector<uint8_t> readBack =
             readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
                             fixture->device.graphicsQueueFamily(), destinations[static_cast<size_t>(i)]->handle(),
-                            kChunkSize);
+                            kChunkSize, uploader->timelineSemaphore(), tickets[static_cast<size_t>(i)].value);
         CHECK(std::memcmp(readBack.data(), patterns[static_cast<size_t>(i)].data(), kChunkSize) == 0);
     }
     CHECK_FALSE(fixture->context.hasValidationErrors());
@@ -911,15 +957,24 @@ TEST_CASE("Uploader ring reclamation polls (never blocks) when the oldest pendin
 
     // Data correctness: A/B/C all land in the right place despite the
     // wrap reusing the ring's front the moment it was proven reclaimable.
-    std::vector<uint8_t> readA = readBackBuffer(fixture->allocator, fixture->device.device(),
-                                                  fixture->device.graphicsQueue(),
-                                                  fixture->device.graphicsQueueFamily(), dstA->handle(), kChunkSize);
-    std::vector<uint8_t> readB = readBackBuffer(fixture->allocator, fixture->device.device(),
-                                                  fixture->device.graphicsQueue(),
-                                                  fixture->device.graphicsQueueFamily(), dstB->handle(), kChunkSize);
-    std::vector<uint8_t> readC = readBackBuffer(fixture->allocator, fixture->device.device(),
-                                                  fixture->device.graphicsQueue(),
-                                                  fixture->device.graphicsQueueFamily(), dstC->handle(), kChunkSize);
+    // [CI-red fix] ticketC.value is a correct GPU-side wait for A and B's
+    // readbacks too: it is a LATER ticket on the same Uploader/timeline
+    // than the (already individually flushed+waited) tickets that covered
+    // A and B, and same-queue tickets are strictly ordered by submission
+    // (upload.h's class comment) -- waiting on the later one transitively
+    // covers the earlier ones.
+    std::vector<uint8_t> readA =
+        readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
+                        fixture->device.graphicsQueueFamily(), dstA->handle(), kChunkSize,
+                        uploader->timelineSemaphore(), ticketC.value);
+    std::vector<uint8_t> readB =
+        readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
+                        fixture->device.graphicsQueueFamily(), dstB->handle(), kChunkSize,
+                        uploader->timelineSemaphore(), ticketC.value);
+    std::vector<uint8_t> readC =
+        readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
+                        fixture->device.graphicsQueueFamily(), dstC->handle(), kChunkSize,
+                        uploader->timelineSemaphore(), ticketC.value);
     CHECK(std::memcmp(readA.data(), patternA.data(), kChunkSize) == 0);
     CHECK(std::memcmp(readB.data(), patternB.data(), kChunkSize) == 0);
     CHECK(std::memcmp(readC.data(), patternC.data(), kChunkSize) == 0);

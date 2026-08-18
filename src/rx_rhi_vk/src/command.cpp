@@ -21,7 +21,7 @@ std::optional<CommandContext> CommandContext::create(VkDevice device, VkQueue qu
 }
 
 void CommandContext::runOnce(const std::function<void(VkCommandBuffer)>& record, VkSemaphore wait,
-                              VkPipelineStageFlags waitStage, VkSemaphore signal) {
+                              VkPipelineStageFlags waitStage, VkSemaphore signal, uint64_t waitValue) {
     VkCommandBufferAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     allocInfo.commandPool = pool_;
@@ -58,10 +58,21 @@ void CommandContext::runOnce(const std::function<void(VkCommandBuffer)>& record,
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmd;
+
+    // [CI-red fix, matrix-issue28 follow-up] Chained whenever `wait` is
+    // provided so a TIMELINE semaphore's target counter value travels with
+    // the submission -- per the Vulkan spec this struct's value entry is
+    // simply ignored if `wait` turns out to be an ordinary binary
+    // semaphore instead, so no per-semaphore-type branching is needed here.
+    VkTimelineSemaphoreSubmitInfo timelineWaitInfo{};
+    timelineWaitInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
     if (wait != VK_NULL_HANDLE) {
         submitInfo.waitSemaphoreCount = 1;
         submitInfo.pWaitSemaphores = &wait;
         submitInfo.pWaitDstStageMask = &waitStage;
+        timelineWaitInfo.waitSemaphoreValueCount = 1;
+        timelineWaitInfo.pWaitSemaphoreValues = &waitValue;
+        submitInfo.pNext = &timelineWaitInfo;
     }
     if (signal != VK_NULL_HANDLE) {
         submitInfo.signalSemaphoreCount = 1;

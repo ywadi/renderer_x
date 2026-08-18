@@ -37,13 +37,28 @@ public:
     // dependency -- blocks the calling thread until the submission
     // completes (vkQueueWaitIdle), then frees the command buffer.
     //
+    // `waitValue` [CI-red fix, matrix-issue28 follow-up]: the counter value
+    // to wait for if `wait` is a TIMELINE semaphore -- e.g.
+    // rx::rhi::Uploader::timelineSemaphore(), paired with an UploadTicket's
+    // `value`, when this submission needs a real, submission-visible
+    // dependency on a specific Uploader batch rather than relying solely on
+    // a caller's own prior HOST-side Uploader::wait() (which does not, by
+    // itself, establish the availability/visibility a separate, later
+    // device queue submission needs -- see Uploader::timelineSemaphore()'s
+    // own comment). Always chained into the submission via a
+    // VkTimelineSemaphoreSubmitInfo when `wait` is non-null; harmless and
+    // ignored by the Vulkan spec if `wait` is an ordinary binary semaphore
+    // instead, so callers passing a binary `wait` need not touch this
+    // parameter. Not wired to `signal` -- no caller signals a timeline
+    // semaphore through this function today.
+    //
     // This is a synchronous setup/test utility only: vkQueueWaitIdle stalls
     // the entire queue on every call, which is unacceptable in a
     // steady-state per-frame render loop that wants multiple frames in
     // flight. The real frame loop (a later task) does not use runOnce(); it
     // manages its own command buffers and fences directly instead.
     void runOnce(const std::function<void(VkCommandBuffer)>& record, VkSemaphore wait = VK_NULL_HANDLE,
-                 VkPipelineStageFlags waitStage = 0, VkSemaphore signal = VK_NULL_HANDLE);
+                 VkPipelineStageFlags waitStage = 0, VkSemaphore signal = VK_NULL_HANDLE, uint64_t waitValue = 0);
 
 private:
     CommandContext() = default;

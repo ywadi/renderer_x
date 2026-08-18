@@ -349,6 +349,25 @@ public:
     // semaphore at all -- see isComplete()'s own comment).
     void wait(UploadTicket ticket) const;
 
+    // [CI-red fix, matrix-issue28 follow-up] The raw VkSemaphore backing
+    // every UploadTicket this Uploader ever hands out -- for a caller
+    // building its OWN VkSubmitInfo/VkSubmitInfo2 that needs a real
+    // GPU-side (submission-visible) dependency on a specific ticket's
+    // value, via VkTimelineSemaphoreSubmitInfo's pWaitSemaphoreValues,
+    // rather than relying solely on wait()/isComplete()'s HOST-side
+    // polling. A host wait's visibility scope covers only HOST accesses to
+    // the written memory (Vulkan spec); it does not, by itself, establish
+    // the availability/visibility chain a LATER, separate device queue
+    // submission needs to safely read what this Uploader wrote --
+    // Vulkan-ValidationLayers' own synchronization-validation design docs
+    // describe this exact host-vs-device-submission gap as outside its
+    // tracked feature set. See command.h's CommandContext::runOnce()
+    // `waitValue` parameter and upload_test.cpp's readBackBuffer() for the
+    // pattern this accessor exists for. Thread-affinity (D5): safe from
+    // any thread -- a plain read of an immutable-after-create() handle,
+    // same as ringCapacity()/everUsedDirectPath() below.
+    VkSemaphore timelineSemaphore() const { return timelineSemaphore_; }
+
     // How many times this Uploader's ring buffer has wrapped back to
     // offset 0 since create() -- diagnostic/test accessor (see
     // UploadTicket::ringGeneration's own comment); production code has no
