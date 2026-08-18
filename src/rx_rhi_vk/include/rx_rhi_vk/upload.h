@@ -40,6 +40,14 @@ struct UploadTicket {
     // is determined entirely by `value` against the timeline semaphore.
     // Production code has no need to read this; it exists so a test can
     // assert which "lap" of the ring a given upload landed in.
+    //
+    // NOT a safety/epoch mechanism [review fix round 1]: this field plays
+    // NO role in detecting a stale ticket, no role in ring-reclamation
+    // correctness, and nothing anywhere compares it against a "current"
+    // generation the way a generational handle (rx::core::Handle<Tag>)
+    // compares its own generation field. A ticket is valid/comparable for
+    // as long as this Uploader itself is alive, full stop -- do not add
+    // logic that assumes generation-checking exists here.
     uint32_t ringGeneration = 0;
 
     bool operator==(const UploadTicket&) const = default;

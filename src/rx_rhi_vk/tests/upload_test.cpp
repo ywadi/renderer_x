@@ -803,11 +803,36 @@ TEST_CASE("Uploader ring-buffer reclamation under heavy wrap: partial reclaim en
     // proving this is a real wrap-heavy stress case, not a vacuous one.
     CHECK(uploader->ringWrapCount() > 0);
     // THE core D3D12-pattern proof [matrix-issue28 row 5's own instrumented
-    // criterion, verbatim]: reclamation only blocks when genuinely
-    // necessary -- the blocking-wait counter stays below the number of
-    // flush() calls issued, proving partial (poll-based) reclaim actually
-    // engaged rather than degenerating into "block on every wrap."
-    CHECK(uploader->blockingRingWaitCount() < static_cast<uint32_t>(kUploadCount));
+    // criterion], TIGHTENED against `ringWrapCount()` rather than
+    // `kUploadCount` [review fix round 1: the reviewer reproduced the
+    // literal degenerate policy row 5 forbids -- whole-ring unconditional
+    // drain on every wrap, ignoring completion -- and the ORIGINAL
+    // `< kUploadCount` bound (36 blocking waits < 80 flush() calls) still
+    // passed, because it only ruled out "block on literally every single
+    // call," not "block far more than the wraps that actually needed it."
+    //
+    // This bound is provably safe against false failures on the REAL
+    // (correct) implementation for this test's own specific construction,
+    // not just empirically: every flush() here covers exactly one
+    // kChunkSize=64-byte chunk (never a multi-chunk batch), and kRingSize
+    // (512) is an exact multiple of kChunkSize -- so every PendingRegion
+    // entry this Uploader ever tracks is exactly one chunk wide, aligned
+    // to the same chunk boundaries a post-wrap request re-asks for. A
+    // single wrap's reclaim loop can therefore never need to block on
+    // more than ONE entry to clear the space a single next chunk needs,
+    // no matter how slow the driver is (CI's lavapipe included) -- so
+    // blockingRingWaitCount() can be AT MOST ringWrapCount() even in the
+    // worst case of "every wrap genuinely has to block," and this
+    // assertion can never spuriously fail the correct implementation.
+    // What it DOES catch: any policy that blocks MORE than once per wrap
+    // (e.g. a queue that never advances between wraps and re-drains a
+    // growing backlog every time -- the shape that produced the
+    // reviewer's 36-over-9-wraps result). See the dedicated test below
+    // for the complementary case this bound alone cannot catch (a policy
+    // that blocks unconditionally on wrap without ever polling first,
+    // landing at exactly one block per wrap -- structurally
+    // indistinguishable from a correct-but-unlucky run by counting alone).
+    CHECK(uploader->blockingRingWaitCount() <= uploader->ringWrapCount());
 
     for (auto& ticket : tickets) {
         uploader->wait(ticket);
@@ -823,5 +848,96 @@ TEST_CASE("Uploader ring-buffer reclamation under heavy wrap: partial reclaim en
                             kChunkSize);
         CHECK(std::memcmp(readBack.data(), patterns[static_cast<size_t>(i)].data(), kChunkSize) == 0);
     }
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("Uploader ring reclamation polls (never blocks) when the oldest pending region is already confirmed "
+          "complete BEFORE the wrap that would need it -- deterministic, hardware-speed-independent "
+          "[review fix round 1, gate matrix-issue28 row 5: the stress test's own blocking-wait counter cannot "
+          "tell 'polled and found already done' apart from 'blocked unconditionally and it happened to return "
+          "immediately' by counting alone, since a policy that blocks EVERY wrap regardless of completion also "
+          "measures at most one block per wrap on the stress test's own construction -- this test closes exactly "
+          "that gap by forcing the completion precondition explicitly, with no dependency on relative CPU/GPU "
+          "speed at all]") {
+    auto fixture = makeFixture("rx_rhi_vk_upload_test_ring_reclaim_deterministic_poll");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    // Ring holds exactly two 64-byte chunks -- the smallest shape that
+    // can force a wrap on the THIRD upload while keeping the scenario
+    // fully deterministic (no auto-flush-on-wrap needed for uploads 1/2).
+    constexpr VkDeviceSize kRingSize = 128;
+    constexpr VkDeviceSize kChunkSize = 64;
+    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device, kRingSize);
+    REQUIRE(uploader.has_value());
+
+    auto makePattern = [](uint8_t seed) {
+        std::array<uint8_t, kChunkSize> pattern{};
+        for (size_t b = 0; b < kChunkSize; ++b) {
+            pattern[b] = static_cast<uint8_t>(seed + b * 3);
+        }
+        return pattern;
+    };
+
+    auto dstA = fixture->allocator.createHostVisibleBuffer(
+        kChunkSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    auto dstB = fixture->allocator.createHostVisibleBuffer(
+        kChunkSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    auto dstC = fixture->allocator.createHostVisibleBuffer(
+        kChunkSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    REQUIRE(dstA.has_value());
+    REQUIRE(dstB.has_value());
+    REQUIRE(dstC.has_value());
+
+    const auto patternA = makePattern(11);
+    const auto patternB = makePattern(101);
+    const auto patternC = makePattern(211);
+
+    // Upload A, then B -- each explicitly flushed AND waited before the
+    // next call, so BOTH tickets are genuinely, confirmably complete
+    // (not just "probably done by now" the way the stress test's rapid
+    // back-to-back flushing leaves to chance) by the time this test
+    // reaches upload C below. Cursor lands exactly at kRingSize (128)
+    // afterward -- no wrap has happened yet.
+    REQUIRE(uploader->uploadToBuffer(*dstA, 0, patternA.data(), kChunkSize));
+    uploader->wait(uploader->flush());
+    REQUIRE(uploader->uploadToBuffer(*dstB, 0, patternB.data(), kChunkSize));
+    uploader->wait(uploader->flush());
+
+    const uint32_t blockingWaitsBeforeWrap = uploader->blockingRingWaitCount();
+    const uint32_t wrapsBeforeWrap = uploader->ringWrapCount();
+
+    // Upload C: the ring has no room left (aligned cursor == 128 ==
+    // kRingSize), so this MUST wrap. Both PendingRegion entries this
+    // wrap's reclaim needs to clear (A's and B's) are already complete,
+    // confirmed above -- a correct, poll-first implementation's
+    // reclaimCompletedRegions() pops both via a pure poll and the
+    // overlap-check loop never executes at all, so blockingRingWaitCount()
+    // must NOT change. A degenerate implementation that blocks
+    // unconditionally on wrap (never checking isComplete() first, the
+    // exact policy row 5 forbids) WOULD increment it here regardless.
+    REQUIRE(uploader->uploadToBuffer(*dstC, 0, patternC.data(), kChunkSize));
+    rx::rhi::UploadTicket ticketC = uploader->flush();
+
+    CHECK(uploader->ringWrapCount() == wrapsBeforeWrap + 1);
+    CHECK(uploader->blockingRingWaitCount() == blockingWaitsBeforeWrap);
+
+    uploader->wait(ticketC);
+
+    // Data correctness: A/B/C all land in the right place despite the
+    // wrap reusing the ring's front the moment it was proven reclaimable.
+    std::vector<uint8_t> readA = readBackBuffer(fixture->allocator, fixture->device.device(),
+                                                  fixture->device.graphicsQueue(),
+                                                  fixture->device.graphicsQueueFamily(), dstA->handle(), kChunkSize);
+    std::vector<uint8_t> readB = readBackBuffer(fixture->allocator, fixture->device.device(),
+                                                  fixture->device.graphicsQueue(),
+                                                  fixture->device.graphicsQueueFamily(), dstB->handle(), kChunkSize);
+    std::vector<uint8_t> readC = readBackBuffer(fixture->allocator, fixture->device.device(),
+                                                  fixture->device.graphicsQueue(),
+                                                  fixture->device.graphicsQueueFamily(), dstC->handle(), kChunkSize);
+    CHECK(std::memcmp(readA.data(), patternA.data(), kChunkSize) == 0);
+    CHECK(std::memcmp(readB.data(), patternB.data(), kChunkSize) == 0);
+    CHECK(std::memcmp(readC.data(), patternC.data(), kChunkSize) == 0);
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
