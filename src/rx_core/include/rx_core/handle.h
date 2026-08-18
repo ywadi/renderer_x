@@ -69,6 +69,16 @@ public:
         return &slots_[handle.index()].value;
     }
 
+    // Number of currently-live (acquired, not yet released) entries --
+    // added for tests that need to assert a pool's own internal state
+    // did NOT change across some operation (e.g. rx::asset::Registry's
+    // zero-partial-mutation-on-error criterion, Phase 4 Stage 1 Task 13),
+    // as opposed to merely inspecting what a specific call happened to
+    // report back to its own caller. O(1): every slot is either on
+    // freeList_ (released) or live, so slots_.size() - freeList_.size()
+    // is exact without a scan.
+    size_t liveCount() const { return slots_.size() - freeList_.size(); }
+
 private:
     struct Slot {
         T value;

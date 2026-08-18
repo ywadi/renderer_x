@@ -39,3 +39,26 @@ TEST_CASE("HandlePool const get() mirrors the mutable overload's liveness/genera
     CHECK(constPool.get(h1) == nullptr);
     CHECK(*constPool.get(h2) == 7);
 }
+
+TEST_CASE("HandlePool::liveCount() tracks acquire/release exactly, including index reuse") {
+    rx::core::HandlePool<MeshTag, int> pool;
+    CHECK(pool.liveCount() == 0);
+
+    auto h1 = pool.acquire(1);
+    CHECK(pool.liveCount() == 1);
+    auto h2 = pool.acquire(2);
+    CHECK(pool.liveCount() == 2);
+
+    pool.release(h1);
+    CHECK(pool.liveCount() == 1);
+
+    // Reacquiring reuses h1's freed slot -- liveCount must still read 2,
+    // not 3 (a naive slots_.size() would over-report here).
+    auto h3 = pool.acquire(3);
+    CHECK(pool.liveCount() == 2);
+    CHECK(h3.index() == h1.index());
+
+    pool.release(h2);
+    pool.release(h3);
+    CHECK(pool.liveCount() == 0);
+}

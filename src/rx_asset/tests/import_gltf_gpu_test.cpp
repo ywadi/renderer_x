@@ -308,50 +308,86 @@ TEST_CASE("importGltf: malformed-file battery -- named error, zero partial regis
         return b;
     };
 
+    // Every SUBCASE below checks BOTH r.meshes/materials.empty() (what
+    // THIS call reported back) AND registry.meshCountForTesting()/
+    // materialCountForTesting() (the registry's OWN internal live-entry
+    // count, unaffected by whatever a call chooses to report) against
+    // its pre-import baseline -- see registry.h's own comment on why
+    // these are a DIFFERENT property: a hypothetical bug that silently
+    // registered an asset without adding its handle to ImportResult
+    // would satisfy the first check while failing the second. This
+    // exact distinction was caught empirically during this task's own
+    // scratch-worktree revert testing (see the task report) -- the
+    // r.meshes.empty()-only version of this test did NOT discriminate a
+    // premature-registration injection; this version does.
     SUBCASE("not-JSON garbage") {
         Registry registry;
+        const size_t meshesBefore = registry.meshCountForTesting();
+        const size_t materialsBefore = registry.materialCountForTesting();
         auto bytes = toBytes("this is not json at all { [ garbage");
         ImportResult r = registry.importGltf(bytes, source, *fixture->pool, *fixture->scheduler);
         CHECK_FALSE(r.ok());
         CHECK(r.meshes.empty());
+        CHECK(registry.meshCountForTesting() == meshesBefore);
+        CHECK(registry.materialCountForTesting() == materialsBefore);
     }
     SUBCASE("valid JSON, invalid glTF") {
         Registry registry;
+        const size_t meshesBefore = registry.meshCountForTesting();
+        const size_t materialsBefore = registry.materialCountForTesting();
         auto bytes = toBytes(R"({"foo": "bar"})");
         ImportResult r = registry.importGltf(bytes, source, *fixture->pool, *fixture->scheduler);
         CHECK_FALSE(r.ok());
         CHECK(r.meshes.empty());
+        CHECK(registry.meshCountForTesting() == meshesBefore);
+        CHECK(registry.materialCountForTesting() == materialsBefore);
     }
     SUBCASE("truncated GLB") {
         Registry registry;
+        const size_t meshesBefore = registry.meshCountForTesting();
+        const size_t materialsBefore = registry.materialCountForTesting();
         std::vector<std::byte> bytes = readFileBytes(testAssetDir() + "/cube.glb");
         bytes.resize(bytes.size() / 2);
         ImportResult r = registry.importGltf(bytes, source, *fixture->pool, *fixture->scheduler);
         CHECK_FALSE(r.ok());
         CHECK(r.meshes.empty());
+        CHECK(registry.meshCountForTesting() == meshesBefore);
+        CHECK(registry.materialCountForTesting() == materialsBefore);
     }
     SUBCASE("wrong-magic GLB") {
         Registry registry;
+        const size_t meshesBefore = registry.meshCountForTesting();
+        const size_t materialsBefore = registry.materialCountForTesting();
         std::vector<std::byte> bytes = readFileBytes(testAssetDir() + "/cube.glb");
         bytes[0] = std::byte{0x00};
         ImportResult r = registry.importGltf(bytes, source, *fixture->pool, *fixture->scheduler);
         CHECK_FALSE(r.ok());
         CHECK(r.meshes.empty());
+        CHECK(registry.meshCountForTesting() == meshesBefore);
+        CHECK(registry.materialCountForTesting() == materialsBefore);
     }
     SUBCASE("unsupported version") {
         Registry registry;
+        const size_t meshesBefore = registry.meshCountForTesting();
+        const size_t materialsBefore = registry.materialCountForTesting();
         auto bytes = toBytes(R"({"asset":{"version":"1.0"},"scenes":[{"nodes":[]}],"scene":0})");
         ImportResult r = registry.importGltf(bytes, source, *fixture->pool, *fixture->scheduler);
         CHECK_FALSE(r.ok());
         CHECK(r.meshes.empty());
+        CHECK(registry.meshCountForTesting() == meshesBefore);
+        CHECK(registry.materialCountForTesting() == materialsBefore);
     }
     SUBCASE("missing file (path overload)") {
         Registry registry;
+        const size_t meshesBefore = registry.meshCountForTesting();
+        const size_t materialsBefore = registry.materialCountForTesting();
         ImportResult r = registry.importGltf(std::filesystem::path("/nonexistent/path/does_not_exist.gltf"), *fixture->pool,
                                                *fixture->scheduler);
         CHECK_FALSE(r.ok());
         CHECK(r.error == ImportError::ByteSourceUnavailable);
         CHECK(r.meshes.empty());
+        CHECK(registry.meshCountForTesting() == meshesBefore);
+        CHECK(registry.materialCountForTesting() == materialsBefore);
     }
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }

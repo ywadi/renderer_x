@@ -132,6 +132,18 @@ public:
     [[nodiscard]] MaterialHandle fallbackMaterialHandle() const { return fallbackMaterial_; }
     [[nodiscard]] TextureHandle fallbackTextureHandle() const { return fallbackTexture_; }
 
+    // Test/diagnostic-only: the registry's OWN internal live-entry count
+    // (rx::core::HandlePool::liveCount()) -- as opposed to inspecting
+    // what a specific importGltf() call happened to report back via
+    // ImportResult::meshes/materials. This is what a "zero registry
+    // mutation on error" test needs to assert against: an import that
+    // silently registered something WITHOUT reporting its handle back
+    // would pass a check against ImportResult::meshes.empty() while
+    // still failing this one -- see the task report's revert-testing
+    // section for the real bug this distinction caught in-task.
+    [[nodiscard]] size_t meshCountForTesting() const { return meshes_.liveCount(); }
+    [[nodiscard]] size_t materialCountForTesting() const { return materials_.liveCount(); }
+
 private:
     // import_gltf.cpp's orchestration function needs direct access to
     // registerMesh()/registerMaterial() below (and, transitively, this
