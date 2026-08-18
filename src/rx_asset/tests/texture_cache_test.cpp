@@ -1,4 +1,6 @@
 #include <doctest/doctest.h>
+#include <rx_asset/geometry_pool.h>
+#include <rx_asset/registry.h>
 #include <rx_asset/texture_cache.h>
 #include <rx_core/log.h>
 #include <rx_core/log_forward_sink.h>
@@ -10,6 +12,7 @@
 #include <rx_platform/window.h>
 #include <rx_shader/compiler.h>
 #include <rx_shader/reflection.h>
+#include <rx_task/scheduler.h>
 #include <spdlog/sinks/ostream_sink.h>
 #include <array>
 #include <cstddef>
@@ -39,6 +42,14 @@ using namespace rx::asset;
 namespace {
 
 std::string fixturePath(const std::string& name) { return std::string(RX_ASSET_ROOT_DIR) + "/assets/test/textures/" + name; }
+
+// [closure-sweep item 4] Task 13/14's glTF fixtures live directly under
+// assets/test/ (not assets/test/textures/, the KTX2-only directory
+// fixturePath() above points at) -- same directory
+// import_gltf_basisu_test.cpp's own testAssetDir() uses, duplicated here
+// rather than shared (this codebase's own established per-file fixture
+// convention, e.g. LogCapture below).
+std::string gltfFixturePath(const std::string& name) { return std::string(RX_ASSET_ROOT_DIR) + "/assets/test/" + name; }
 
 // TextureCache stores its Allocator&/Device&/Uploader&/BindlessTable&/
 // DeletionQueue& constructor arguments BY REFERENCE (matching
@@ -1116,6 +1127,85 @@ TEST_CASE("TextureCache [minor 4.5]: loading the SAME failing asset twice logs t
     // BOTH calls -- the second call's failure is silent (D11 dedup), not
     // merely coincidentally deduped by some OTHER mechanism.
     CHECK(capture.count("failed to load") == 1);
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// ===== [closure-sweep item 4] combined glTF -> TextureCache -> pixel =====
+//
+// Task 14 minor 4.6: role inference via glTF import (import_gltf_basisu_
+// test.cpp) and pixel-correct rendering of a TextureCache-resident texture
+// (the quadrant GPU test above) were each proven in ISOLATION -- no single
+// test proved the full path glTF-file -> Registry::importGltf(with a real
+// TextureCache) -> resolved bindless texture -> actually-sampled pixels.
+// This closes that gap by combining, unmodified, both existing pieces of
+// machinery already in THIS binary: import_gltf_basisu_test.cpp's own
+// Registry::importGltf(pool, scheduler, textures) call shape (duplicated
+// here per this codebase's own established per-file fixture convention --
+// see e.g. LogCapture above) feeding directly into this file's own
+// buildQuadPipeline()/renderAndReadbackQuadrants() rendering path, with
+// zero new rendering/readback machinery. cube_basisu.gltf [Task 14
+// vendoring, KHR_texture_basisu] references cube_basisu_misleading_normal
+// .ktx2 as its material's baseColorTexture -- a real, already-committed
+// fixture, deliberately misleadingly named ("_normal") but used as
+// baseColor, and (empirically confirmed via a scratch probe run of this
+// exact call chain, since no generator script records this fixture's
+// content) quadrant-colored with the SAME TL=red/TR=green/BL=blue/
+// BR=yellow layout the KTX2-only quadrant fixture above uses.
+TEST_CASE("Combined path: cube_basisu.gltf -> Registry::importGltf(TextureCache) -> resolved bindless "
+          "texture -> actual rendered pixels match the fixture's real quadrant content [Task 14 minor 4.6]") {
+    auto fixture = makeFixture("rx_asset_tc_gltf_pixel");
+    if (!fixture.has_value()) {
+        return;
+    }
+    makeCache(*fixture);
+
+    // GeometryPool/Scheduler: the two extra dependencies Registry::
+    // importGltf() needs beyond what makeFixture()/makeCache() already
+    // built -- built AFTER fixture settles into its final address, same
+    // discipline as makeCache() itself (this file's own header comment).
+    auto pool = rx::asset::GeometryPool::create(fixture->allocator, fixture->device, fixture->uploader);
+    REQUIRE(pool != nullptr);
+    auto scheduler = rx::task::Scheduler::create(2);
+    REQUIRE(scheduler != nullptr);
+
+    rx::asset::Registry registry;
+    rx::asset::ImportResult result =
+        registry.importGltf(gltfFixturePath("cube_basisu.gltf"), *pool, *scheduler, fixture->cache.get());
+    REQUIRE(result.ok());
+    REQUIRE(result.materials.size() == 1);
+
+    const rx::asset::MaterialAsset& material = registry.material(result.materials[0]);
+    REQUIRE(material.baseColorTexture.present);
+    const TextureRecord& record = fixture->cache->resolve(material.baseColorTexture.handle);
+    // Proves the full path actually resolved to a REAL texture, not a D11
+    // fallback silently substituted somewhere along the way -- the same
+    // discriminating check import_gltf_basisu_test.cpp's own role-
+    // inference test makes, extended here all the way through to pixels.
+    REQUIRE_FALSE(record.isFallback);
+    CHECK(record.width == 4);
+    CHECK(record.height == 4);
+
+    SamplerDesc nearestDesc;
+    nearestDesc.magFilter = 9728;  // NEAREST -- exact texel reads, no filtering ambiguity
+    nearestDesc.minFilter = 9728;
+    VkSampler sampler = fixture->cache->getOrCreateSampler(nearestDesc);
+    REQUIRE(sampler != VK_NULL_HANDLE);
+    rx::rhi::BindlessHandle samplerHandle = fixture->bindless.registerSampler(sampler);
+    REQUIRE(samplerHandle.isValid());
+
+    auto readback = renderAndReadbackQuadrants(*fixture, record.bindlessIndex, samplerHandle.index(), /*lod=*/0.0F);
+    REQUIRE(readback.has_value());
+
+    // Same TL=red/TR=green/BL=blue/BR=yellow layout, same zero-tolerance-
+    // appropriate primary-color reasoning as the quadrant GPU test above
+    // (empirically confirmed for THIS fixture via a scratch probe run of
+    // this exact call chain: 253/0/0, 0/253/0, 0/0/253, 255/255/0 --
+    // within tolerance 2 of each primary-color corner).
+    CHECK(approxEqual(readback->topLeft, {255, 0, 0}, 2));
+    CHECK(approxEqual(readback->topRight, {0, 255, 0}, 2));
+    CHECK(approxEqual(readback->bottomLeft, {0, 0, 255}, 2));
+    CHECK(approxEqual(readback->bottomRight, {255, 255, 0}, 2));
 
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
