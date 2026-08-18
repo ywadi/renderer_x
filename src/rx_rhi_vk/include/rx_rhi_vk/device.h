@@ -47,6 +47,15 @@ const char* presentModeName(VkPresentModeKHR mode);
 // on failure Device::create destroys the surface itself before returning
 // std::nullopt. Either way, the caller must not destroy that surface handle
 // itself once create() has been called with it.
+//
+// Thread-affinity (D5, Phase 4): create()/acquireNextImage()/present()/
+// setPresentMode()/recreateSwapchain() are main-thread-only -- this Device
+// owns the swapchain/present loop's own state, the same convention every
+// existing caller of these methods (every sample's frame loop) already
+// follows. Every other accessor (physicalDevice()/device()/queues/
+// memoryBudgetExtensionEnabled()/calibratedTimestampsEnabled()/etc.) is a
+// read-only snapshot, safe to call from any thread holding a valid
+// reference -- see docs/threading.md.
 class Device {
 public:
     Device(Device&&) noexcept;
@@ -91,9 +100,10 @@ public:
     // comment on that call). rx::rhi::Allocator::create(Context&, Device&)
     // (buffer.h) reads this to decide whether to request
     // VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT -- the two must stay in
-    // LOCKSTEP (VMA asserts otherwise), which is exactly why this Device
-    // is the single source of truth for whether the extension is really
-    // live, rather than Allocator guessing or re-querying it itself.
+    // LOCKSTEP. This is enforced entirely by THIS being the single source
+    // of truth Allocator::create() always reads directly (buffer.h has the
+    // full correction on why VMA itself does not runtime-enforce this),
+    // rather than Allocator guessing or re-querying the extension itself.
     bool memoryBudgetExtensionEnabled() const { return memoryBudgetExtensionEnabled_; }
 
     VkSwapchainKHR swapchain() const { return swapchain_; }

@@ -28,6 +28,15 @@ namespace rx::rhi {
 // Same lifetime discipline as Buffer (buffer.h): a Texture2D must not
 // outlive the Allocator (and beneath it, Device/Context) it was created
 // from.
+//
+// Thread-affinity (D5, Phase 4): create() is main-thread-only, same
+// GPU-object-mutation convention as Allocator's own factory methods
+// (buffer.h) -- see docs/threading.md. recordMipChainBlit() records onto a
+// caller-supplied VkCommandBuffer and carries whatever affinity that
+// command buffer's own recording thread already has (main thread, or a
+// chunked pass's own worker per the "Worker-allowed" section of
+// docs/threading.md) -- it touches no shared Texture2D/Allocator state
+// itself.
 class Texture2D {
 public:
     Texture2D(Texture2D&&) noexcept;

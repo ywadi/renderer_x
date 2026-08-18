@@ -53,6 +53,15 @@ class Device;
 // Declaring the owning Allocator (and Device/Context) before any Buffer
 // created from it in the same scope, per the usual RAII/reverse-destruction
 // discipline already used by Context/Device in this library, is sufficient.
+//
+// Thread-affinity (D5, Phase 4): a Buffer is always CREATED by one of
+// Allocator's main-thread-only factory methods below (same
+// GPU-object-mutation convention as BindlessTable/Uploader/DeletionQueue --
+// see docs/threading.md), so its move/destroy (which record()/release()
+// into the category ledger, memory_report.h [Phase 4 Task 10]) follow the
+// same affinity in every path this codebase has today. flush()/
+// invalidate() touch only this Buffer's own mapped memory, not shared
+// state, and carry no additional restriction beyond that.
 class Buffer {
 public:
     Buffer(Buffer&&) noexcept;
@@ -164,6 +173,20 @@ private:
 // Owns a VmaAllocator built against a specific VkInstance/VkPhysicalDevice/
 // VkDevice triple. Move-only RAII: destroys the underlying VmaAllocator via
 // vmaDestroyAllocator on destruction or move-assignment.
+//
+// Thread-affinity (D5, Phase 4): create()/createRaw()/createHostVisibleBuffer()/
+// createDeviceLocalBuffer()/createUploadRingBuffer()/setCurrentFrameIndex()/
+// noteAllocationFailure()/noteNonMemoryFailure() are main-thread-only -- see
+// docs/threading.md's `rx::rhi::Allocator` entry [Phase 4 Task 10]. Not
+// [guarded] (no RX_ASSERT_MAIN_THREAD): unlike BindlessTable/Uploader/
+// DeletionQueue, none of Allocator's own state is unsafe to touch from a
+// worker in the sense that guard exists for (MemoryAccounting's counters
+// are atomic; a chunk >= 1 caller could not corrupt them) -- the
+// main-thread-only convention here matches every other GPU-object-mutation
+// entry point's existing scoping, not a new hazard this type introduces.
+// report()/accounting()/lastAllocationFailureKind()/
+// lastAllocationFailureReport()/raw() are read-only snapshots, safe to call
+// from any thread that already has a valid reference to this Allocator.
 class Allocator {
 public:
     Allocator(Allocator&&) noexcept;
@@ -178,12 +201,13 @@ public:
     // `VK_EXT_memory_budget` enablement is NOT a parameter here: it is
     // pulled from `device.memoryBudgetExtensionEnabled()` automatically
     // (device.h), which is itself set opportunistically at Device::create()
-    // time -- the two must stay in lockstep (VMA asserts otherwise, see
-    // createRaw()'s own comment), and this overload is what keeps them so
-    // for every ordinary caller. `forcedHeapSizeLimitBytes` is a TEST-ONLY
-    // escape hatch (default VK_WHOLE_SIZE = no limit): forwarded verbatim
-    // to createRaw() -- see that function's own comment for what it does
-    // and why [Phase 4 Task 10, D24(d) OOM-path testing].
+    // time -- the two must stay in lockstep (see createRaw()'s own comment
+    // for exactly what enforces that and what does not), and this overload
+    // is what keeps them so for every ordinary caller.
+    // `forcedHeapSizeLimitBytes` is a TEST-ONLY escape hatch (default
+    // VK_WHOLE_SIZE = no limit): forwarded verbatim to createRaw() -- see
+    // that function's own comment for what it does and why [Phase 4 Task
+    // 10, D24(d) OOM-path testing].
     static std::optional<Allocator> create(Context& context, Device& device,
                                             VkDeviceSize forcedHeapSizeLimitBytes = VK_WHOLE_SIZE);
 
@@ -195,14 +219,37 @@ public:
     // ruling #27]: pass true ONLY if `VK_EXT_memory_budget` was actually
     // enabled on `device` at logical-device-creation time (Device::create()
     // does this opportunistically via `enable_extension_if_present()` --
-    // see device.cpp). This flag and
-    // `VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT` are kept in LOCKSTEP
-    // internally: passing true when the extension was NOT really enabled on
-    // `device` trips VMA's own `VMA_ASSERT` (vk_mem_alloc.h:13365-13368,
-    // verified against the vendored 3.4.0 source) the first time any budget
-    // query runs. When true, `report()` below reports
-    // MemoryBudgetSource::RealExtension and its per-heap `budgetBytes`
-    // comes from the real `vmaGetHeapBudgets()` driver query; when false,
+    // see device.cpp). This flag drives whether
+    // `VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT` is set below.
+    //
+    // CORRECTION (fix round 1, reviewer M1) -- an earlier version of this
+    // comment claimed VMA itself runtime-asserts if this flag is true but
+    // the device extension was not really enabled, citing
+    // vk_mem_alloc.h:13365-13368. Re-read directly: that `VMA_ASSERT` sits
+    // behind `#if !(VMA_MEMORY_BUDGET) || !(VMA_GET_PHYSICAL_DEVICE_PROPERTIES2)`
+    // -- a COMPILE-TIME macro gate (whether VMA's own headers detect the
+    // extension's symbols at BUILD time), not a runtime check against
+    // whether the extension was enabled on `device`. Since this project's
+    // vendored Vulkan headers are current, that macro compiles to
+    // always-true here, so the assert can never fire regardless of what
+    // this parameter is passed. There is NO VMA-side runtime enforcement of
+    // this lockstep at all: `Device::memoryBudgetExtensionEnabled()`
+    // (device.h) is the SINGLE SOURCE OF TRUTH this engine relies on
+    // instead -- `Allocator::create(Context&, Device&)` above always reads
+    // it directly rather than trusting a caller-supplied value, which is
+    // what actually keeps production callers honest. Passing a mismatched
+    // `true` here directly (only reachable via this raw, test/tooling-only
+    // overload) would not assert -- it would make VMA chain a
+    // `VkPhysicalDeviceMemoryBudgetPropertiesEXT` onto a
+    // `vkGetPhysicalDeviceMemoryProperties2` query for an extension struct
+    // the device never actually enabled, which is undefined per the Vulkan
+    // spec (and a validation-layer VUID hit under sync validation) --
+    // reason enough on its own not to pass true here without a real,
+    // verified enablement.
+    //
+    // When true, `report()` below reports MemoryBudgetSource::RealExtension
+    // and its per-heap `budgetBytes` comes from the real
+    // `vmaGetHeapBudgets()` driver query; when false,
     // MemoryBudgetSource::HeapSizeFallback and `budgetBytes` is this
     // engine's own `VkMemoryHeap::size` estimate instead (matrix-issue27
     // row 2's exact fallback wording -- deliberately NOT VMA's own internal
@@ -389,6 +436,21 @@ public:
     // safe to call unconditionally either way.
     void setCurrentFrameIndex(uint32_t frameIndex);
 
+    // [Phase 4 Task 10, fix round 1, reviewer C1] Test/diagnostic accessor
+    // -- production frame-loop code has no need for it, same carve-out
+    // convention as DeletionQueue::pendingCount() (deletion_queue.h).
+    // Cumulative count of real setCurrentFrameIndex() calls this Allocator
+    // has ever received, incremented unconditionally at the top of that
+    // method (buffer.cpp) regardless of MemoryBudgetSource. This is the
+    // DISCRIMINATING signal memory_budget_test.cpp's staleness-wiring test
+    // asserts on: unlike comparing report()'s own budget/usage numbers
+    // before and after a refresh (which can pass vacuously on a quiet
+    // driver where the real value never moves either way -- see that
+    // test's own comment), this counter proves the call fired at all,
+    // completely independent of whether the underlying VK_EXT_memory_budget
+    // query happened to return a different number.
+    uint64_t setCurrentFrameIndexCallCount() const { return setCurrentFrameIndexCallCount_; }
+
     // [Phase 4 Task 10, spec D24(d)] What kind of failure the MOST RECENT
     // createHostVisibleBuffer()/createDeviceLocalBuffer()/
     // createUploadRingBuffer() call ended in (AllocationFailureKind::None
@@ -443,6 +505,7 @@ private:
     std::shared_ptr<MemoryAccounting> accounting_;
     AllocationFailureKind lastFailureKind_ = AllocationFailureKind::None;
     RxMemoryReport lastFailureReport_;
+    uint64_t setCurrentFrameIndexCallCount_ = 0;
 };
 
 }  // namespace rx::rhi

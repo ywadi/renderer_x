@@ -102,9 +102,14 @@ std::optional<Allocator> Allocator::createRaw(VkPhysicalDevice physicalDevice, V
     createInfo.pVulkanFunctions = &vulkanFunctions;
 
     // [Phase 4 Task 10, spec D24(b)] LOCKSTEP requirement (see this
-    // function's own header comment in buffer.h): this flag must agree
-    // exactly with whether VK_EXT_memory_budget was actually enabled on
-    // `device` -- VMA asserts otherwise (vk_mem_alloc.h:13365-13368).
+    // function's own header comment in buffer.h for the full correction):
+    // this flag must agree exactly with whether VK_EXT_memory_budget was
+    // actually enabled on `device`. VMA itself does NOT runtime-assert
+    // this (its nearby VMA_ASSERT is compile-time-macro-gated, not a
+    // device-state check) -- `Device::memoryBudgetExtensionEnabled()` is
+    // this engine's own single source of truth instead, which is why
+    // Allocator::create(Context&, Device&) always reads it directly rather
+    // than trusting a caller-supplied value.
     if (memoryBudgetExtensionEnabled) {
         createInfo.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
     }
@@ -260,12 +265,14 @@ Allocator& Allocator::operator=(Allocator&& other) noexcept {
         accounting_ = std::move(other.accounting_);
         lastFailureKind_ = other.lastFailureKind_;
         lastFailureReport_ = other.lastFailureReport_;
+        setCurrentFrameIndexCallCount_ = other.setCurrentFrameIndexCallCount_;
 
         other.allocator_ = VK_NULL_HANDLE;
         other.physicalDevice_ = VK_NULL_HANDLE;
         other.budgetSource_ = MemoryBudgetSource::HeapSizeFallback;
         other.lastFailureKind_ = AllocationFailureKind::None;
         other.lastFailureReport_ = RxMemoryReport{};
+        other.setCurrentFrameIndexCallCount_ = 0;
     }
     return *this;
 }
@@ -404,6 +411,12 @@ RxMemoryReport Allocator::report() const {
 }
 
 void Allocator::setCurrentFrameIndex(uint32_t frameIndex) {
+    // [Phase 4 Task 10, fix round 1, reviewer C1] Incremented BEFORE the
+    // real VMA call, unconditionally -- this is the test-only discriminator
+    // setCurrentFrameIndexCallCount() (buffer.h) exposes; see that
+    // accessor's own comment for why report()'s own budget/usage numbers
+    // are not a reliable enough signal on their own.
+    ++setCurrentFrameIndexCallCount_;
     vmaSetCurrentFrameIndex(allocator_, frameIndex);
 }
 

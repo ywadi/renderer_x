@@ -1,8 +1,10 @@
 #include <doctest/doctest.h>
 #include <rx_rhi_vk/buffer.h>
 #include <rx_rhi_vk/context.h>
+#include <rx_rhi_vk/frame_sync.h>
 #include <rx_rhi_vk/memory_report.h>
 #include <VkBootstrap.h>
+#include <cstdint>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -12,6 +14,20 @@
 // enablement (+ the heap-size fallback path, both tested) and the
 // vmaSetCurrentFrameIndex() staleness regression guard -- "the load-bearing
 // omission" the gate ruling calls out by name.
+//
+// [Fix round 1, reviewer C1] The row-3 coverage below is TWO test cases,
+// deliberately: "vmaSetCurrentFrameIndex staleness regression" (driver-
+// observed consequence, kept for its documentation/evidence value) is NOT
+// by itself a discriminating regression guard -- the reviewer reverted
+// Allocator::setCurrentFrameIndex() to a no-op in a scratch worktree and
+// that test still passed 12/12, because on a quiet driver the real budget
+// value never moves whether or not the call fires, so "stays frozen"
+// passes vacuously either way. "FrameSync::advanceFrame(Allocator*)
+// wiring" below is the MANDATORY discriminating test: it asserts on
+// Allocator::setCurrentFrameIndexCallCount(), a counter incremented
+// unconditionally inside setCurrentFrameIndex() itself (buffer.h/.cpp),
+// completely independent of what any driver reports. See
+// task-10-report.md's fix-round-1 section for the revert-check evidence.
 
 namespace {
 
@@ -191,15 +207,18 @@ TEST_CASE("vmaSetCurrentFrameIndex staleness regression: heap usage silently sta
     rx::rhi::RxMemoryReport staleReport = allocator->report();
     REQUIRE(staleReport.heaps.size() == budgetBeforeActivity.size());
     for (size_t i = 0; i < budgetBeforeActivity.size(); ++i) {
-        // The regression guard the gate ruling calls load-bearing: budget
-        // silently stays byte-identical to its pre-activity value despite
-        // real intervening create+destroy activity, because no real
-        // driver refetch happened. A future change that accidentally drops
-        // the setCurrentFrameIndex() wiring elsewhere in the engine cannot
-        // be caught by THIS assertion (it tests the mechanism directly,
-        // not a downstream call site) -- but it proves the staleness this
-        // task's own gate finding describes is real and reproducible, not
-        // a misreading of the VMA source.
+        // Demonstrates the real driver-level consequence the gate ruling
+        // describes: budget silently stays byte-identical to its
+        // pre-activity value despite real intervening create+destroy
+        // activity, because no real driver refetch happened.
+        // NOT DISCRIMINATING ON ITS OWN [fix round 1, reviewer C1,
+        // empirically confirmed via a reverted-wiring scratch-worktree
+        // build]: on a quiet driver whose real budget value would not have
+        // moved between two fetches ANYWAY, this assertion passes whether
+        // setCurrentFrameIndex() fires or not -- it proves staleness is
+        // real, not that this suite would catch the wiring regressing. See
+        // "FrameSync::advanceFrame(Allocator*) wiring" below for the
+        // mandatory discriminating assertion.
         CHECK(staleReport.heaps[i].budgetBytes == budgetBeforeActivity[i]);
     }
 
@@ -231,6 +250,72 @@ TEST_CASE("vmaSetCurrentFrameIndex staleness regression: heap usage silently sta
 
     allocator.reset();
     vkDeviceWaitIdle(fixture->device);
+    vkb::destroy_device(fixture->vkbDevice);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("FrameSync::advanceFrame(Allocator*) wiring: Allocator::setCurrentFrameIndex() fires exactly once per "
+          "advanced frame -- the mandatory discriminating regression guard [fix round 1, reviewer C1]") {
+    auto fixture = makeFixture();
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    // Independent of whether VK_EXT_memory_budget is actually present:
+    // this test asserts on the WIRING (a call count), never on any
+    // driver-reported number, so it runs unconditionally -- unlike the two
+    // tests above, no MESSAGE/skip branch is needed here.
+    auto allocator = rx::rhi::Allocator::createRaw(fixture->physicalDevice, fixture->device, fixture->instance,
+                                                    fixture->memoryBudgetExtensionEnabled);
+    REQUIRE(allocator.has_value());
+
+    // Allocator::createRaw() itself never calls setCurrentFrameIndex()
+    // (only vmaCreateAllocator's own constructor primes VMA's internal
+    // budget cache via a private call this counter does not observe) --
+    // baseline must be exactly 0.
+    REQUIRE(allocator->setCurrentFrameIndexCallCount() == 0);
+
+    // Queue family index 0 always exists (every physical device reports at
+    // least one queue family) -- FrameSync::create() only needs a valid
+    // index to build a command pool from, never submits anything through
+    // it in this test, so no particular queue capability is required.
+    auto frameSync = rx::rhi::FrameSync::create(fixture->device, /*queueFamily=*/0, /*swapchainImageCount=*/1);
+    REQUIRE(frameSync.has_value());
+
+    // Drive N frames through the REAL production call chain --
+    // FrameSync::advanceFrame(Allocator*) -> Allocator::setCurrentFrameIndex()
+    // -> vmaSetCurrentFrameIndex() -- not a shortcut that calls
+    // Allocator::setCurrentFrameIndex() directly. This is what the reviewer
+    // asked to be exercised: the wiring, not just the leaf function.
+    constexpr int kFrames = 5;
+    for (int i = 0; i < kFrames; ++i) {
+        frameSync->advanceFrame(&*allocator);
+    }
+
+    // THE mandatory discriminating assertion: fails (4 != 5, or 0 != 5 if
+    // the call is dropped entirely) the instant
+    // FrameSync::advanceFrame()'s call into Allocator::setCurrentFrameIndex(),
+    // or that method's own call into vmaSetCurrentFrameIndex(), regresses
+    // to a no-op -- with zero dependency on any driver ever reporting a
+    // different budget/usage number. See task-10-report.md's fix-round-1
+    // section for the scratch-worktree revert-check proving this
+    // discriminates for real.
+    CHECK(allocator->setCurrentFrameIndexCallCount() == static_cast<uint64_t>(kFrames));
+
+    // The default argument (every pre-Task-10 call site: `frameSync->
+    // advanceFrame()` with no argument) must stay a true no-op -- confirms
+    // this fix did not silently change existing callers' behavior.
+    frameSync->advanceFrame();
+    CHECK(allocator->setCurrentFrameIndexCallCount() == static_cast<uint64_t>(kFrames));
+
+    // FrameSync's own destructor contract (frame_sync.h): the device must
+    // already be idle before it is destroyed. No real GPU work was ever
+    // submitted through this FrameSync (advanceFrame() alone records
+    // nothing on the GPU), so this is a formality, not a real wait -- kept
+    // anyway to honor the documented contract rather than rely on that.
+    vkDeviceWaitIdle(fixture->device);
+    frameSync.reset();
+    allocator.reset();
     vkb::destroy_device(fixture->vkbDevice);
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
