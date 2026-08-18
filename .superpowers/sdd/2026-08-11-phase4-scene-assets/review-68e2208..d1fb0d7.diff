@@ -1,0 +1,735 @@
+=== COMMITS ===
+d1fb0d7 docs: task 15 fix round 2 report -- checkerboard-destruction fix, ticket-issuance fix, test discrimination fix
+92f34d2 fix(rx_asset): close two more rollback hazards -- shared checkerboard destruction and unticketed texture release
+aef0b08 docs(rx_task): fix stale runOnWorkerThread comment (round-robin -> single lane)
+
+=== STAT ===
+ .../task-15-report.md                              |  97 +++++++++++
+ src/rx_asset/import_gltf.cpp                       |  78 ++++++++-
+ src/rx_asset/import_pipeline.h                     |  58 ++++++-
+ src/rx_asset/registry.cpp                          |  24 ++-
+ src/rx_asset/tests/async_import_test.cpp           | 186 ++++++++++++++++++---
+ src/rx_task/include/rx_task/scheduler.h            |  51 +++---
+ 6 files changed, 437 insertions(+), 57 deletions(-)
+
+=== FULL DIFF (U10) ===
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-15-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-15-report.md
+index f55ec6a..ead4e44 100644
+--- a/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-15-report.md
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-15-report.md
+@@ -228,10 +228,107 @@ Writing the cancel-mid-upload test surfaced a real defect in the *original* Task
+ - **windows-cross-zig + Wine** (device-free only, per this task's own established posture): `rx_task_tests.exe` 20/20 passed including the adversarial churn test; `rx_asset_gltf_tests.exe` 48/48 passed (device-free target, does not link `rx_rhi_vk` or exercise the async pipeline — confirms `rx_asset`'s library changes still cross-compile and run correctly).
+ - Confirmed no rebase was needed against the concurrent `7cc685f` (`rx_rhi_vk`) landing — see this section's own opening paragraph.
+ 
+ ### Self-review / concerns
+ 
+ - The design actually implemented (persistent tasks + closure queues) is the coordinator/user-preferred *stronger* variant, superseding both the initial "recycle, don't free" ruling and an interim "sequence-number-gated same-thread reclaim" design considered but not implemented once the stronger direction arrived first.
+ - TSAN evidence in this section was regenerated from scratch immediately before writing it, specifically because an earlier in-round TSAN pass was found (by its own 19-vs-20 test-case tail) to predate the adversarial churn test — see the "Honest note on evidence provenance" above. Citing that earlier pass would have been evidence for a slightly different (less adversarial) build; regenerating was the more defensible choice, not the more convenient one.
+ - The genuine rollback bug this round's own new test surfaced (previous section) was not something any review flagged explicitly — it was found by actually exercising the cancel-mid-upload path for the first time, which is itself the argument for why the mandatory-upgrade policy (no deferred fixes) is the right posture: a test written only to satisfy a checklist item ended up finding a real defect once actually run against real GPU resources.
+ - The narrower mid-registration rollback window (previous section) is left as an honestly-disclosed, untested gap rather than force-fixed within `rx_rhi_vk`'s off-limits boundary this round — flagged for a follow-up card rather than silently narrowed.
+ - Sync-path regression risk: `marshalGltfImportRollback()`/`marshalGltfImportPrepareStep()`/`marshalGltfImportUploadsComplete()` themselves are unchanged this round (only their call sites in `registry.cpp` changed, and only on the async abandon path) — the sync path (`marshalGltfImportSync()`) does not call any of this round's new code at all.
++
++## Fix round 2 — a second CRITICAL rollback bug, closing round 1's own disclosed residual, and a test that was masking its own target
++
++Base for this round: `68e2208` (round 1's own report commit). Implementer commits (in order):
++
++1. `aef0b08` — `docs(rx_task): fix stale runOnWorkerThread comment (round-robin -> single lane)`
++2. `92f34d2` — `fix(rx_asset): close two more rollback hazards -- shared checkerboard destruction and unticketed texture release`
++3. (this commit) — `docs: task 15 fix round 2 report`
++
++No AI attribution in any commit; author/committer is local git config (`Yousef Wadi <ywadi85@gmail.com>`); nothing pushed; no board/issue/plan/spec/ledger files touched. `src/rx_rhi_vk` was open to this round (the `7cc685f` CI-red fix landed and was approved before this round started) but was not touched — every fix this round landed in `rx_asset`, as the review itself anticipated was the likely outcome.
++
++### Trigger: independent re-review of round 1
++
++Re-review confirmed the CRITICAL (persistent-task/closure-queue) fix cleanly addressed — an independent 6-run TSAN pass found zero reports touching `ClosureQueue`/teardown/delete-vs-executing, corroborating this report's own categorization against a base-commit control build; destructor ordering, same-thread closure free, and the process-fatal contract were all verified against the full source. The D24 literal-overlap test was confirmed genuinely discriminating (7/7 runs, 8.79M assertions). Two new, more serious findings forced this round, plus one that turned out to be this round's own doing (item 2 below), plus a documentation nit (item 4):
++
++### ITEM 1 (CRITICAL) — cancelling mid-registration could destroy the shared checkerboard fallback
++
++**Mechanism** (review's own trace, independently reproduced here): `computeGltfImport()`'s `fillRef()` lambda (`import_gltf.cpp`) pre-sets every PRESENT texture ref's handle to the shared checkerboard fallback at COMPUTE time (worker thread) — this is the value every renderer-facing consumer would see if this import never finished. `marshalGltfImportPrepareStep()` overwrites that placeholder with a real (or failure-fallback) handle only when THIS slot's own marshal turn arrives, one slot per `pumpMain()` tick. `marshalGltfImportRollback()`, however, selected its release targets by COMPUTE-time state alone (`slot.attempted && decoded.outcome == Ready`) — with no check on whether marshal had actually reached that slot. A cancellation caught between two slot registrations (ordinary timing, any multi-texture asset, no adversarial timing needed) therefore called `TextureCache::releaseUnpublished()` on every NOT-YET-MARSHALLED present slot too, whose handle was still the shared checkerboard — releasing (and, once the deletion queue's reclaim ran, destroying) the ONE fallback texture every other still-live import and every fallback-rendered material in the whole `TextureCache` depends on.
++
++**Fix**: `PendingTextureLoad` (`import_pipeline.h`) gained a `registered` flag, set only at the actual `registerDecoded()` call site inside `marshalGltfImportPrepareStep()` — true only once marshal has genuinely reached and processed this slot. `marshalGltfImportRollback()`'s release loop now gates on `slot.registered` (not `slot.attempted`) as its PRIMARY condition, with `decoded.outcome == Ready` still required separately (a registered-but-Failed/Checkerboard-outcome slot's handle is `applyDecodeResult()`'s own shared failure/checkerboard fallback too, not a per-import allocation — both gates are independently necessary).
++
++**Covering test** (`async_import_test.cpp`, "cancelImport() after EXACTLY 1 of N texture slots has been registered..."): drives DamagedHelmet's async import (5 present, real texture slots) one `pumpMain()` tick at a time until `liveTextureCountForTesting()` first becomes EXACTLY baseline+1 (a precise, non-approximated "1 of 5 registered, 4 still ahead" checkpoint — only a `Ready`-outcome `registerDecoded()` call increments live count at all, per `TextureCache::applyDecodeResult()`), cancels, drains, and asserts `liveTextureCountForTesting()` never drops below baseline at any point and equals baseline exactly after the real reclaim; separately resolves the checkerboard handle itself afterward and checks `isFallback`/`resident`/`width`/`height` are all still exactly what they always were.
++
++**Revert evidence** (scratch, in-place edit reverted immediately after collecting evidence — `git diff` confirmed clean before and after): reverting the rollback loop's gate from `slot.registered` back to `slot.attempted` reproduced the bug on 6/6 runs. Exact assertion values from one run (`-s` verbose mode):
++
++```
++/rx_asset/tests/async_import_test.cpp:1067: ERROR: CHECK( fixture->textures->liveTextureCountForTesting() == liveTexturesBefore ) is NOT correct!
++  values: CHECK( 3 == 4 )
++
++/rx_asset/tests/async_import_test.cpp:1074: ERROR: CHECK( cb.resident ) is NOT correct!
++  values: CHECK( false )
++```
++
++Baseline 4 (checkerboard + 3 role fallbacks), dropped to 3 — one MORE release than the single real texture actually registered — and the checkerboard's own record came back non-resident, both exactly matching the mechanism above. A `VUID-vkDestroyImage`-class validation error did NOT reproduce in this repository's specific 6 additional revert runs (nothing else in this test's own scope happens to touch the destroyed bindless slot afterward) — the `liveTextureCountForTesting()`/`resident` evidence above is the reliable, deterministic proof this report relies on, not an incidental validation-layer catch; disclosed honestly rather than overclaiming a VUID that this specific reproduction did not, in fact, produce. With the fix restored: 8/8 clean runs, `--validate` included, zero `[error]`/`FATAL`/`FAILURE` lines in any of them.
++
++### ITEM 2 — the round-1 cancel-mid-upload test was not discriminating its own fix
++
++Independent review reverted `rollbackAsyncImportWhenSafe()` (round 1's own ticket-completion gate) back to an unconditional, immediate `marshalGltfImportRollback()` call and found the round-1 covering test still passed 8/8 — because that test's own `vkDeviceWaitIdle()`, called immediately before the `DeletionQueue` reclaim it was asserting against, drains EVERY in-flight GPU submission (including the still-racing old copy) regardless of what the production code did, masking the race entirely.
++
++**Fix**: removed the `vkDeviceWaitIdle()` call from the test's assertion path. Now, with the ticket-completion gate intact, `onFrameFenceSignaled(0)` runs immediately after the rollback-drain loop with NO additional wait of any kind — safe only because `rollbackAsyncImportWhenSafe()` itself already confirmed every ticket complete first. Ordinary fixture teardown (`Device::~Device()`'s own unconditional `vkDeviceWaitIdle()`) remains the safety net for anything this call does not reclaim; nothing in the test relies on a manual wait for that.
++
++**Revert evidence, both directions, freshly re-collected against the restructured test**:
++
++- Reverted (`rollbackAsyncImportWhenSafe()` bypassed, direct unconditional `marshalGltfImportRollback()` call): 6/6 runs FAILED, every one reproducing the exact original VUID:
++  ```
++  [error] [vulkan validation] Validation Error: [ VUID-vkDestroyImage-image-01000 ]
++  ... Cannot call vkDestroyImage on VkImage 0x220000000022[] that is currently in use by a command buffer.
++  /rx_asset/tests/async_import_test.cpp:940: ERROR: CHECK_FALSE( fixture->context.hasValidationErrors() ) is NOT correct!
++  [doctest] Status: FAILURE!
++  ```
++- Intact (fix restored, `git checkout` confirmed byte-identical to the committed state): 8/8 clean runs, `[doctest] Status: SUCCESS!` every time, zero validation errors.
++
++This is now the actual discriminating test the brief always intended it to be.
++
++### ITEM 3 — closing round 1's own disclosed residual for real
++
++Round 1's report explicitly disclosed, as an untested, narrower residual concern: a texture slot can be REGISTERED (`TextureCache::registerDecoded()` already called, a real GPU-side copy command recorded) without yet having a TICKET (`TextureCache::flushPendingUploads()` not yet called — `marshalGltfImportPrepareStep()` yields after each individual registration, and the texture ticket is only issued once EVERY slot is done). `marshalGltfImportUploadsComplete()` has nothing to poll in that state and reports "nothing outstanding" — incorrectly, since the recorded copy has not even been submitted yet. Independent review confirmed this half is real (not merely theoretical) and narrower than ITEM 1.
++
++**Characterization, precisely**: this window exists ONLY on the texture side. Geometry's own `marshalGltfImportPrepareStep()` branch calls `pool.uploadDeferred()` and `pool.flushPendingUploads()` together, unconditionally, inside the SAME function call with no `return`/yield between them — `pending.hasGeometry == true` and `pending.poolTicketIssued == false` can never coexist once prepare() has run at all. This IS provably unreachable by construction, not merely by observed behavior.
++
++**Empirical reproduction**: this round's own new ITEM 1 covering test (cancel after exactly 1 of 5 texture slots) lands in exactly this window by construction (the texture ticket is never issued until all 5 slots are done, so cancelling after slot 1 is ALWAYS pre-ticket) — the first attempt at that test, with ITEM 1's fix already in place but ITEM 3's not yet, reproduced a real `UNASSIGNED-CoreValidation-DrawState-InvalidCommandBuffer-VkImage` validation error ("You are adding vkEndCommandBuffer() to VkCommandBuffer ... that is invalid because bound VkImage ... was destroyed") on 6/6 runs, plus a `liveTextureCountForTesting()` mismatch caused by an unrelated bug in the TEST's own rollback-drain loop (an early-exit heuristic that could not actually tell "rollback ran" from "cancellation was merely observed" on the texture side, unlike the geometry side's own reliable `GeometryPool::stats()` signal) — both are disclosed and fixed together below, kept distinct so neither masks the other's own evidence.
++
++**Fix**: `marshalGltfImportEnsureRollbackTicketed(TextureCache*, MarshalPendingImport&)` (`import_pipeline.h`/`import_gltf.cpp`) — idempotent, called unconditionally as the FIRST step of every `rollbackAsyncImportWhenSafe()` invocation (`registry.cpp`), before the existing `marshalGltfImportUploadsComplete()` poll. If a texture batch was registered but never ticketed, it forces a real ticket into existence by calling `flushPendingUploads()` early (D25's own non-blocking flush; nothing about calling it ahead of the "normal" once-per-batch point is unsound — flush()'s contract is "submit whatever is recorded so far," not "only once, at the very end"). Once a real ticket exists, the existing poll-then-rollback machinery handles the rest unchanged.
++
++**Enforced, not just documented**: both halves of this invariant class (geometry's provably-unreachable case, texture's caller-contract-enforced case) are backed by `checkRollbackTicketInvariant()`, a loud-failure check inside `marshalGltfImportRollback()` itself — deliberately NOT a bare `assert()` (this project's presets compile with `-DNDEBUG` in every configuration including CI, which would silently compile a bare `assert()` away entirely, exactly the failure mode `rx_core/debug_checks.h`'s own top comment documents at length for the same reason `RX_ASSERT_MAIN_THREAD` is not a bare `assert()` either). Gated by `RX_DEBUG_CHECKS` instead (this engine's own always-available switch, ON by default in both dev presets, independent of `NDEBUG`): on a violation, logs and calls `std::abort()`.
++
++**Revert evidence for the enforcement itself**: temporarily commenting out the `marshalGltfImportEnsureRollbackTicketed()` call site in `rollbackAsyncImportWhenSafe()` (fix restored immediately after) reproduced an immediate, unambiguous, loud failure on 3/3 runs — not a silent corruption, not a flaky validation error, a deterministic crash with a named cause:
++
++```
++[error] rx_asset: marshalGltfImportRollback: invariant violated -- texture upload(s) registered without an
++issued ticket -- call marshalGltfImportEnsureRollbackTicketed() before marshalGltfImportRollback()
++/rx_asset/tests/async_import_test.cpp:954: FATAL ERROR: test case CRASHED: SIGABRT - Abort (abnormal termination) signal
++[doctest] test cases:   1 |   0 passed | 1 failed | 54 skipped
++```
++
++With the fix (and the test's own settle-window rewrite, see below) both restored: 8/8 clean runs of the ITEM 1 covering test, `--validate` included, zero `[error]`/`FATAL` lines.
++
++**The test's own bug, fixed alongside**: the ITEM 1 covering test's original rollback-drain loop broke out early on `cancelled == true && liveTextureCountForTesting() == baseline+1` — but on the texture side, `liveTextureCountForTesting()` does not change AT ALL until the later `onFrameFenceSignaled()` call, so that condition is true from the moment cancellation is first observed, regardless of whether `rollbackAsyncImportWhenSafe()`'s own ticket-completion poll has run even once. Replaced with a fixed, generous settle window (200 extra `pumpMain()` ticks driven after cancellation is first observed, well beyond what a single small JPEG decode's own GPU completion needs) — the geometry-side cancel-mid-upload test's own early-exit pattern remains correct as-is, since `GeometryPool::stats().vertexBytesUsed` dropping to zero IS a synchronous, reliable "`pool.free()` has now actually run" signal with no texture-side equivalent.
++
++### Item 4 (doc) — stale `runOnWorkerThread()` comment
++
++`scheduler.h`'s own doc comment for `runOnWorkerThread()` still described the PRE-fix-round-1 design (round-robin dispatch over the ordinary `parallelFor()` worker pool, "FIFO ordering across different target threads is not guaranteed", a reference to the since-deleted `IoLoopTask`) even though round 1's own commit message and `docs/threading.md` already documented the real, current mechanism. Rewritten to describe the single dedicated worker-task-lane thread, its FIFO contract, the corrected thread-count claim (`numTaskThreadsToCreate` is `workerCount()+2`, not `+1` — a new thread genuinely IS created once, at construction, contradicting the old comment's "no new thread is created" claim), and a pointer to `docs/threading.md`'s own "Pinned-task dispatch" section for the full mechanism.
++
++### Full re-verification
++
++- **linux-native, serial** (`ctest --preset linux-native --output-on-failure -R "rx_task_tests|rx_asset_gltf_gpu_tests"`, no `-j`): 100% passed, 3 runs in a row. Direct binary run: `rx_task_tests` 20/20 cases, 35,066/35,066 assertions (unchanged from round 1 — this round did not touch `scheduler.cpp`/`scheduler_test.cpp`, only a header comment); `rx_asset_gltf_gpu_tests` 55/55 cases (up from 54 — the new ITEM 1 covering test), 8,600,980/8,600,980 assertions.
++- **ASan/UBSan**: fresh full rebuild (same `-fsanitize=address,undefined -O1 -g -fno-omit-frame-pointer` configure as round 1). `rx_task_tests`: 20/20, 35,066/35,066 assertions, zero sanitizer defects. `rx_asset_gltf_gpu_tests` (`--test-case-exclude="*WALL-CLOCK*"`, same pre-existing documented sanitizer-timing exclusion as before): 54/54, 603,067/603,067 assertions, zero sanitizer defects.
++- **windows-cross-zig + Wine** (device-free only): `rx_task_tests.exe` 20/20 passed; `rx_asset_gltf_tests.exe` 48/48 passed.
++- Confirmed no new `src/rx_rhi_vk` commit landed during this round (`HEAD` unchanged from round 1's own final commit until this round's own commits landed) — no rebase needed.
++
++### Self-review / concerns
++
++- ITEM 1 is the second CRITICAL-severity rollback defect this task has now shipped-then-fixed-in-round (the first being round 1's own ticket-completion gate). Both were found by tests written specifically to exercise the abandon/rollback path with real GPU resources already registered, not by static reasoning alone — reinforcing that this path's own state space (compute-time placeholder vs. marshal-time real value, registered-vs-ticketed) is subtle enough that only executing it for real, under adversarial-but-realistic timing, reliably finds its bugs.
++- ITEM 2's own finding — that a test's own "extra safety" wait can silently defeat its discriminating purpose — is now a concrete, reproducible example worth remembering for any FUTURE GPU-resource-lifetime test in this codebase: a blanket `vkDeviceWaitIdle()` (or any device-wide barrier) placed between "the code under test does its thing" and "the assertion checks the result" should be treated as a discrimination hazard by default, not a harmless safety margin, unless the test has specifically verified (as this round now has, for this one test) that removing it does not change the pass/fail outcome for the CORRECT implementation.
++- ITEM 3's fix is deliberately narrow (texture-only, matching the precisely-characterized reachable window) rather than a broad "always flush everything eagerly" change that would have been simpler to reason about but would have reintroduced exactly the RC6 wall-clock regression this task's own original wall-clock-gate test was built to catch (an early, oversized flush is closer in shape to the reverted "register everything in one synchronous call" regression than to the time-sliced design this task shipped).
++- `checkRollbackTicketInvariant()` is new, narrowly-scoped, rx_asset-local infrastructure (not a new shared `rx_core` macro) — deliberately kept local rather than generalized into a project-wide assertion facility, since that would be a larger architectural change than this round's mandate covers; if a similar need arises elsewhere, `rx_core/debug_checks.h`'s own `RX_DEBUG_CHECKS`-gated pattern is the precedent to follow, and this function's own comment says so.
++- The narrower residual disclosed at the end of round 1's own section (mid-registration cancellation before a ticket is issued) is now CLOSED by this round's ITEM 3 fix — that disclosure is superseded, not still open.
+diff --git a/src/rx_asset/import_gltf.cpp b/src/rx_asset/import_gltf.cpp
+index debaf84..29e8d91 100644
+--- a/src/rx_asset/import_gltf.cpp
++++ b/src/rx_asset/import_gltf.cpp
+@@ -1626,20 +1626,28 @@ bool marshalGltfImportPrepareStep(GeometryPool& pool, TextureCache* textures, Ma
+                     ++pending.nextMaterialIndex;
+                     continue;
+                 }
+                 const size_t slotIdx = pending.nextSlotIndex++;
+                 PendingTextureLoad& slot = mat.textureSlots[slotIdx];
+                 if (!slot.attempted) {
+                     continue;  // free -- no GPU work, keep draining this same step
+                 }
+                 TextureHandle handle = textures->registerDecoded(slot.decoded, slot.debugName);
+                 textureRefForSlot(mat.asset, static_cast<MaterialTextureSlot>(slotIdx)).handle = handle;
++                // [Fix round 2, CRITICAL] Marks this slot as having
++                // actually reached marshal -- see PendingTextureLoad's
++                // own comment (import_pipeline.h) for why
++                // marshalGltfImportRollback() needs this, distinct from
++                // `attempted`, to avoid releasing the shared checkerboard
++                // fallback for a slot cancellation caught before its own
++                // marshal turn arrived.
++                slot.registered = true;
+                 pending.hasTextureUploads = true;
+                 return true;  // ONE real texture registered this call -- yield to the caller's own pump loop
+             }
+             pending.texturesPrepared = true;
+             if (pending.hasTextureUploads) {
+                 pending.textureTicket = textures->flushPendingUploads();
+                 pending.textureTicketIssued = true;
+             }
+         }
+         return true;  // still have the geometry step left, even if no texture work remained
+@@ -1714,33 +1722,101 @@ ImportResult marshalGltfImportFinalize(Registry& registry, std::unique_ptr<Marsh
+         result.scene.instances.push_back(rec);
+     }
+     result.scene.cameras = std::move(compute.cameras);
+     result.scene.lights = std::move(compute.lights);
+     result.scene.animations = std::move(compute.animations);
+ 
+     result.error = ImportError::None;
+     return result;
+ }
+ 
++void marshalGltfImportEnsureRollbackTicketed(TextureCache* textures, MarshalPendingImport& pending) {
++    if (textures != nullptr && pending.hasTextureUploads && !pending.textureTicketIssued) {
++        pending.textureTicket = textures->flushPendingUploads();
++        pending.textureTicketIssued = true;
++    }
++}
++
++// [Fix round 2, ITEM 3] Loud-failure backstop for the "no registered
++// upload survives into marshalGltfImportRollback() without an issued
++// ticket" invariant this file's own comments (marshalGltfImportRollback's
++// call sites) document. Deliberately NOT a bare assert() -- this
++// project's presets compile with `-DNDEBUG` in every configuration
++// (including CI), which would silently compile a bare assert() away
++// entirely (the same reasoning rx_core/debug_checks.h's own top comment
++// documents at length for RX_ASSERT_MAIN_THREAD); RX_DEBUG_CHECKS is
++// this engine's own always-available switch instead (ON by default in
++// both dev presets), independent of NDEBUG.
++void checkRollbackTicketInvariant(bool ok, const char* what) {
++#ifdef RX_DEBUG_CHECKS
++    if (!ok) {
++        RX_LOG_ERROR("rx_asset: marshalGltfImportRollback: invariant violated -- {}", what);
++        std::abort();
++    }
++#else
++    (void)ok;
++    (void)what;
++#endif
++}
++
+ void marshalGltfImportRollback(GeometryPool& pool, TextureCache* textures, std::unique_ptr<MarshalPendingImport> pendingPtr) {
+     if (!pendingPtr) {
+         return;
+     }
+     MarshalPendingImport pending = std::move(*pendingPtr);
++    // [Fix round 2, ITEM 3] Geometry-side half of the same invariant class
++    // marshalGltfImportEnsureRollbackTicketed()'s own comment documents
++    // for textures -- provably unreachable given marshalGltfImportPrepareStep()'s
++    // own geometry branch (uploadDeferred()+flushPendingUploads() issued
++    // together, no yield between them), enforced here rather than merely
++    // asserted in a comment so a future change that breaks that atomicity
++    // fails loudly instead of silently reintroducing this bug class.
++    checkRollbackTicketInvariant(!pending.hasGeometry || pending.poolTicketIssued,
++                                  "GeometryPool upload registered without an issued ticket -- rollback would free "
++                                  "an in-flight range");
+     if (pending.hasGeometry) {
+         pool.free(pending.combinedRange);
+     }
++    // [Fix round 2, ITEM 3] The texture-side half of the SAME invariant --
++    // by this point, EVERY caller must already have run
++    // marshalGltfImportEnsureRollbackTicketed() (registry.cpp's own
++    // rollbackAsyncImportWhenSafe() always does), which forces a real
++    // ticket into existence for any registered-but-unflushed texture
++    // batch. Unlike the geometry case above, this one is NOT provably
++    // unreachable by construction (registerDecoded() genuinely can yield
++    // mid-batch, unticketed) -- it is made unreachable by the caller
++    // contract instead, so this check is the loud-failure backstop for
++    // that contract specifically, not a restatement of an already-provable
++    // invariant.
++    checkRollbackTicketInvariant(!pending.hasTextureUploads || pending.textureTicketIssued,
++                                  "texture upload(s) registered without an issued ticket -- call "
++                                  "marshalGltfImportEnsureRollbackTicketed() before marshalGltfImportRollback()");
+     if (textures != nullptr) {
+         for (PendingMaterialCompute& mat : pending.compute.materials) {
+             for (size_t slotIdx = 0; slotIdx < mat.textureSlots.size(); ++slotIdx) {
+                 PendingTextureLoad& slot = mat.textureSlots[slotIdx];
+-                if (!slot.attempted || slot.decoded.outcome != TextureDecodeResult::Outcome::Ready) {
++                // [Fix round 2, CRITICAL] `registered` is the primary
++                // gate, NOT `attempted` -- an attempted-but-not-yet-
++                // registered slot's own TextureRef::handle still holds
++                // the COMPUTE-time placeholder (the shared checkerboard
++                // fallback, import_gltf.cpp's own fillRef() lambda),
++                // never a handle this rollback owns. `decoded.outcome ==
++                // Ready` still matters SEPARATELY even once registered:
++                // a registered-but-Failed/Checkerboard-outcome slot's
++                // handle is applyDecodeResult()'s own shared
++                // failure/checkerboard fallback (texture_cache.cpp), not
++                // a real per-import allocation either -- both gates are
++                // required, neither alone is sufficient (see
++                // PendingTextureLoad's own comment, import_pipeline.h,
++                // and task-15-report.md's round-2 section for the
++                // empirical reproduction this fix closes).
++                if (!slot.registered || slot.decoded.outcome != TextureDecodeResult::Outcome::Ready) {
+                     continue;
+                 }
+                 TextureHandle handle = textureRefForSlot(mat.asset, static_cast<MaterialTextureSlot>(slotIdx)).handle;
+                 textures->releaseUnpublished(handle);
+             }
+         }
+     }
+ }
+ 
+ // ---------------------------------------------------------------------
+diff --git a/src/rx_asset/import_pipeline.h b/src/rx_asset/import_pipeline.h
+index e3608dd..fe9335b 100644
+--- a/src/rx_asset/import_pipeline.h
++++ b/src/rx_asset/import_pipeline.h
+@@ -68,22 +68,37 @@ struct PendingSubmeshCompute {
+     SkinVertexData skinVertices;
+     std::vector<MorphTarget> morphTargets;
+     bool ok = false;
+ };
+ 
+ // One material-texture-slot's DECODE result, worker-computed -- registered
+ // (GPU-side) only at marshal time. `attempted == false` means this slot
+ // never needed a real load (unbound, or textures == nullptr) and
+ // `MaterialAsset`'s own TextureRef::handle already holds its final D11
+ // fallback/utility value from compute time -- marshal leaves it untouched.
++//
++// [Fix round 2, CRITICAL] `registered` -- true only once
++// marshalGltfImportPrepareStep() has actually called registerDecoded()
++// for THIS slot (main thread, marshal time). Until then, even an
++// `attempted` slot's own TextureRef::handle still holds the COMPUTE-time
++// placeholder (import_gltf.cpp's own fillRef() lambda pre-sets every
++// present slot to the SHARED checkerboard fallback, overwritten with a
++// real/failure handle only when this slot's marshal turn arrives) --
++// marshalGltfImportRollback() MUST gate on this flag, not `attempted`
++// alone, or a cancellation landing mid-registration (some slots
++// marshalled, some not yet) releases the shared checkerboard itself
++// (TextureCache::releaseUnpublished() on every other still-live import's
++// fallback handle -- confirmed empirically, see task-15-report.md's
++// round-2 section).
+ struct PendingTextureLoad {
+     bool attempted = false;
++    bool registered = false;
+     TextureRole role = TextureRole::GenericData;
+     std::string debugName;
+     TextureDecodeResult decoded;
+ };
+ 
+ // Fixed slot order -- mirrors MaterialAsset's own 5 TextureRef fields
+ // (mesh_asset.h) exactly; textureRefForSlot() (import_gltf.cpp) is the one
+ // place that mapping is spelled out.
+ enum class MaterialTextureSlot : uint8_t { BaseColor, MetallicRoughness, Normal, Occlusion, Emissive, Count };
+ 
+@@ -308,18 +323,59 @@ struct MarshalPendingImport {
+ // has returned false (fully prepared) at least once.
+ [[nodiscard]] bool marshalGltfImportUploadsComplete(const GeometryPool& pool, const TextureCache* textures,
+                                                        const MarshalPendingImport& pending);
+ 
+ // The final registry-mutation step -- ONLY safe to call once
+ // marshalGltfImportUploadsComplete() has returned true (asserted in debug
+ // builds). Performs every Registry::registerMesh()/registerMaterial() call
+ // (file order) and returns the finished ImportResult.
+ [[nodiscard]] ImportResult marshalGltfImportFinalize(Registry& registry, std::unique_ptr<MarshalPendingImport> pending);
+ 
++// [Fix round 2, ITEM 3] Closes the one gap marshalGltfImportUploadsComplete()
++// cannot see on its own: a texture slot can be REGISTERED
++// (TextureCache::registerDecoded() already called, real GPU-side copy
++// command recorded) without yet having a TICKET (TextureCache::
++// flushPendingUploads() not yet called -- marshalGltfImportPrepareStep()
++// only issues the texture ticket once EVERY slot is done, but yields
++// after each individual registration, so a cancellation observed between
++// two slot registrations lands `pending` in exactly this state:
++// `hasTextureUploads == true`, `textureTicketIssued == false`). With no
++// ticket issued, marshalGltfImportUploadsComplete() has nothing to poll
++// and (incorrectly, on its own) reports "nothing outstanding" --
++// releasing that slot's handle in that state destroys an image whose
++// copy command has been recorded but never even submitted, corrupting
++// whatever command buffer that recording lives in once anything LATER
++// ends/flushes it (reproduced empirically as a real
++// `UNASSIGNED-CoreValidation-DrawState-InvalidCommandBuffer-VkImage`
++// validation error; see task-15-report.md's round-2 section). Call this
++// BEFORE marshalGltfImportUploadsComplete() on the abandon/rollback path,
++// every time -- idempotent (a no-op once `textureTicketIssued` is
++// already true, or if nothing was ever registered), forces a REAL ticket
++// to exist for whatever has been recorded so far by calling
++// TextureCache::flushPendingUploads() early (safe: flush()'s own
++// contract is "submit whatever is recorded so far", not "only once, at
++// the very end" -- nothing about calling it earlier than usual is
++// unsound). Never calls wait() (D25's own invariant, unchanged).
++//
++// GEOMETRY has no equivalent gap: GeometryPool::uploadDeferred() and its
++// own flushPendingUploads() call are issued together, unconditionally,
++// inside the SAME marshalGltfImportPrepareStep() call with no yield in
++// between (see that function's own geometry branch) -- `pending.hasGeometry
++// == true` and `pending.poolTicketIssued == false` can never coexist once
++// prepare() has run at all. marshalGltfImportRollback() itself asserts
++// this invariant (debug builds) rather than merely documenting it, so any
++// future change that breaks the atomicity fails loudly instead of
++// silently reopening this same class of bug on the geometry side.
++void marshalGltfImportEnsureRollbackTicketed(TextureCache* textures, MarshalPendingImport& pending);
++
+ // Releases every GPU resource marshalGltfImportPrepareDeferred() already
+ // registered (TextureCache::releaseUnpublished()/GeometryPool::free()) --
+ // the cancellation/teardown rollback path for an import observed cancelled
+ // AFTER prepare() but BEFORE finalize(). Safe to call on a
+-// default/moved-from MarshalPendingImport (no-op).
++// default/moved-from MarshalPendingImport (no-op). REQUIRES
++// marshalGltfImportEnsureRollbackTicketed() to have already been called
++// (see that function's own comment) -- callers on the abandon path (this
++// library's own registry.cpp) always call it first; direct callers of
++// this function must too.
+ void marshalGltfImportRollback(GeometryPool& pool, TextureCache* textures, std::unique_ptr<MarshalPendingImport> pending);
+ 
+ }  // namespace rx::asset
+diff --git a/src/rx_asset/registry.cpp b/src/rx_asset/registry.cpp
+index bec7918..bbfe5a3 100644
+--- a/src/rx_asset/registry.cpp
++++ b/src/rx_asset/registry.cpp
+@@ -111,25 +111,41 @@ void pollAsyncImportUploads(std::shared_ptr<AsyncImportJob> job);
+ // reusable by the very next upload (a write-after-write hazard against
+ // the still-in-flight old copy), and releasing a TextureCache handle
+ // whose DeletionQueue-tagged reclaim later runs risks destroying a
+ // VkImage a still-in-flight transfer command buffer is writing into --
+ // in BOTH cases, only once marshalGltfImportUploadsComplete() confirms
+ // every ticket prepare() actually issued has genuinely finished on the
+ // GPU is it safe to free/release. Never a blocking wait (D25's own "poll,
+ // never a blocking wait" invariant, unchanged even on this abandon path)
+ // -- re-posts itself via postToMain() exactly like the non-cancelled poll
+ // loop below, until safe.
++//
++// [Fix round 2, ITEM 3] marshalGltfImportEnsureRollbackTicketed() runs
++// FIRST, every call (idempotent) -- closes the one gap
++// marshalGltfImportUploadsComplete() cannot see on its own: a texture
++// slot registered but not yet ticketed (registerDecoded() already ran,
++// but marshalGltfImportPrepareStep() yielded before this batch's own
++// flushPendingUploads() call). Without this, marshalGltfImportUploadsComplete()
++// would report "nothing outstanding" for that slot (no ticket to poll)
++// and let marshalGltfImportRollback() release a handle whose copy
++// command has been recorded but never even submitted -- see that
++// function's own comment (import_pipeline.h) for the full mechanism and
++// task-15-report.md's round-2 section for the empirical reproduction
++// this closes.
+ void rollbackAsyncImportWhenSafe(std::shared_ptr<AsyncImportJob> job) {
+-    if (job->pending && !marshalGltfImportUploadsComplete(*job->pool, job->textures, *job->pending)) {
+-        rx::task::Scheduler* scheduler = job->scheduler;
+-        scheduler->postToMain([job = std::move(job)]() mutable { rollbackAsyncImportWhenSafe(std::move(job)); });
+-        return;
++    if (job->pending) {
++        marshalGltfImportEnsureRollbackTicketed(job->textures, *job->pending);
++        if (!marshalGltfImportUploadsComplete(*job->pool, job->textures, *job->pending)) {
++            rx::task::Scheduler* scheduler = job->scheduler;
++            scheduler->postToMain([job = std::move(job)]() mutable { rollbackAsyncImportWhenSafe(std::move(job)); });
++            return;
++        }
+     }
+     marshalGltfImportRollback(*job->pool, job->textures, std::move(job->pending));
+ }
+ 
+ void runAsyncImportPrepareStep(std::shared_ptr<AsyncImportJob> job) {
+     if (job->cancelled.load(std::memory_order_acquire) || job->registry == nullptr) {
+         rollbackAsyncImportWhenSafe(std::move(job));
+         return;
+     }
+     const bool more = marshalGltfImportPrepareStep(*job->pool, job->textures, *job->pending);
+diff --git a/src/rx_asset/tests/async_import_test.cpp b/src/rx_asset/tests/async_import_test.cpp
+index d5512c1..c5d70f3 100644
+--- a/src/rx_asset/tests/async_import_test.cpp
++++ b/src/rx_asset/tests/async_import_test.cpp
+@@ -905,54 +905,186 @@ TEST_CASE("importGltfAsync: cancelImport() after >=1 real GPU resource (texture
+     // (pool.free(), vmaVirtualFree -- synchronous, CPU-side, no
+     // DeletionQueue involved for geometry).
+     const PoolStats poolStatsAfterRollback = fixture->pool->stats();
+     CHECK(poolStatsAfterRollback.vertexBytesUsed == 0);
+     CHECK(poolStatsAfterRollback.indexBytesUsed == 0);
+ 
+     // TEXTURE rollback: releaseUnpublished() only marks the entry
+     // non-resident immediately and defers the real HandlePool reclaim into
+     // DeletionQueue [D24 clause (c)] -- liveTextureCountForTesting() only
+     // reflects it once the deletion queue's own fence-gated pass runs.
+-    // DeletionQueue::onFrameFenceSignaled()'s own documented contract
+-    // (deletion_queue.h) requires the caller to have ALREADY confirmed the
+-    // tagged frame's GPU work is genuinely done before calling it --
+-    // vkDeviceWaitIdle() here is that confirmation (this rollback happens
+-    // mid-flight, before this test's own fixture has a real per-frame
+-    // fence/FrameSync of its own to poll), matching this codebase's own
+-    // existing precedent for a hard GPU-idle barrier in a test
+-    // (texture_cache_test.cpp's own render/readback fixture teardown).
+     //
+-    // [Fix round 1 finding, FIXED, not just worked around in this test]
+-    // Before registry.cpp's own rollbackAsyncImportWhenSafe() existed,
+-    // rollback called marshalGltfImportRollback() unconditionally the
+-    // instant `cancelled` was observed -- freeing GeometryPool's
+-    // suballocation (immediately reusable by the very next upload: a
+-    // write-after-write hazard against the still-in-flight old copy) and
+-    // releasing a TextureCache handle whose deferred DeletionQueue reclaim
+-    // could destroy a VkImage a still-in-flight transfer command buffer
+-    // was writing into. This exact test reproduced that as a genuine
+-    // "vkDestroyImage ... in use by a command buffer" validation error the
+-    // first time it exercised cancellation AFTER prepare() had already
+-    // issued real upload tickets. registry.cpp's rollbackAsyncImportWhenSafe()
+-    // now polls marshalGltfImportUploadsComplete() (D25's own non-blocking
+-    // poll, never a wait()) and only frees/releases once every ticket
+-    // prepare() issued has genuinely finished on the GPU -- the
+-    // vkDeviceWaitIdle() below is therefore redundant-but-cheap extra
+-    // insurance for THIS test's own subsequent DeletionQueue-driven
+-    // destroy, not a workaround for a still-open production bug.
+-    vkDeviceWaitIdle(fixture->device.device());
++    // [Fix round 2, ITEM 2] Deliberately NO vkDeviceWaitIdle() before this
++    // call -- round 1's own version had one here, and independent review
++    // proved it was masking the very race this test exists to catch:
++    // reverting registry.cpp's rollbackAsyncImportWhenSafe() back to an
++    // unconditional, immediate marshalGltfImportRollback() call still
++    // passed 8/8 with the wait in place (the wait, all on its own, drains
++    // every in-flight GPU submission -- including the still-racing old
++    // copy -- before onFrameFenceSignaled() ever gets a chance to destroy
++    // anything, regardless of whether the production code itself waited
++    // for anything). THIS is now the actual discriminating step: with
++    // rollbackAsyncImportWhenSafe() intact, every upload ticket
++    // prepare() issued is already confirmed complete (via
++    // marshalGltfImportUploadsComplete()'s own non-blocking poll) by the
++    // time marshalGltfImportRollback() ever runs, so destroying
++    // immediately afterward, with no additional wait of any kind, is
++    // safe. See task-15-report.md's round-2 section for the fresh
++    // revert-evidence pair (fails reverted / passes intact) this
++    // restructuring was verified against. Ordinary fixture teardown
++    // (Device::~Device()'s own unconditional vkDeviceWaitIdle) remains
++    // the safety net for whatever this call does NOT reclaim -- nothing
++    // in this test relies on an extra manual wait for that.
+     fixture->deletionQueue->onFrameFenceSignaled(0);
+     CHECK(fixture->textures->liveTextureCountForTesting() == liveTexturesBefore);
+ 
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
++// ---------------------------------------------------------------------
++// Cancel mid-registration [Fix round 2, ITEM 1, CRITICAL]: a cancellation
++// caught between two texture slots -- some already marshalled, some
++// not -- must never touch the ones marshal has not reached yet, whose
++// TextureRef::handle still holds the COMPUTE-time shared checkerboard
++// placeholder (import_gltf.cpp's own fillRef() lambda), not a handle this
++// import owns.
++// ---------------------------------------------------------------------
++
++TEST_CASE("importGltfAsync: cancelImport() after EXACTLY 1 of N texture slots has been registered does NOT "
++          "release the shared checkerboard fallback -- liveTextureCountForTesting() never drops below the "
++          "pre-import baseline, checkerboard stays resolvable") {
++    if (!std::filesystem::exists(damagedHelmetPath())) {
++        MESSAGE("DamagedHelmet not fetched (run tools/fetch_assets.sh) -- skipping the checkerboard-safety test");
++        return;
++    }
++    auto fixture = makeFixture("async_cancel_checkerboard_safety");
++    if (!fixture) {
++        return;
++    }
++    attachPool(*fixture);
++    // DamagedHelmet has 5 present, real (Ready-outcome) texture slots
++    // (baseColor/metallicRoughness/normal/occlusion/emissive) -- N > 1 is
++    // load-bearing here: this test needs marshal to still have slots left
++    // to reach AFTER the point it cancels, which is exactly the window
++    // the bug this test targets lives in.
++    attachTextureCache(*fixture);
++    auto scheduler = rx::task::Scheduler::create(4);
++    REQUIRE(scheduler != nullptr);
++
++    FilesystemByteSource source(std::filesystem::path(damagedHelmetPath()).parent_path());
++    std::vector<std::byte> documentBytes = readFileBytes(damagedHelmetPath());
++
++    Registry registry;
++    const size_t liveTexturesBefore = fixture->textures->liveTextureCountForTesting();
++    const TextureHandle checkerboard = fixture->textures->checkerboardHandle();
++    REQUIRE(fixture->textures->resolve(checkerboard).width == 4);  // sanity: this IS the checkerboard, its own fixed dims
++
++    bool done = false;
++    AsyncImportHandle handle = registry.importGltfAsync(documentBytes, source, *fixture->pool, *scheduler,
++                                                            fixture->textures.get(), [&](ImportResult) { done = true; });
++    REQUIRE(handle.isValid());
++
++    // Pump ONE bounded step at a time (same swap-then-run reasoning as the
++    // cancel-mid-upload test above) until liveTextureCountForTesting()
++    // first becomes EXACTLY baseline+1 -- marshalGltfImportPrepareStep()
++    // registers at most one real texture slot per call (RC6 time-slicing),
++    // and a Ready-outcome registration is the ONLY thing that increments
++    // liveCount (a Failed/Checkerboard-outcome slot's own registerDecoded()
++    // call returns a SHARED fallback handle, never a new pool acquisition
++    // -- see TextureCache::applyDecodeResult()), so this is a precise,
++    // non-guessed "exactly 1 of N slots marshalled, N-1 still ahead"
++    // checkpoint, not an approximation.
++    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
++    bool oneRegistered = false;
++    size_t minLiveObservedDuringDrive = liveTexturesBefore;
++    while (std::chrono::steady_clock::now() < deadline) {
++        scheduler->pumpMain();
++        const size_t live = fixture->textures->liveTextureCountForTesting();
++        minLiveObservedDuringDrive = std::min(minLiveObservedDuringDrive, live);
++        if (live == liveTexturesBefore + 1) {
++            oneRegistered = true;
++            break;
++        }
++        REQUIRE_FALSE(done);  // must not have finalized before this loop caught the 1-of-N window
++        REQUIRE(live <= liveTexturesBefore + 1);  // never overshoots past exactly 1
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    }
++    REQUIRE(oneRegistered);
++    // Never dropped below baseline on the way here either (the checkerboard
++    // and every role fallback are built once at TextureCache::create() and
++    // must never be touched by anything this import's own marshal does).
++    REQUIRE(minLiveObservedDuringDrive >= liveTexturesBefore);
++
++    registry.cancelImport(handle);
++
++    // Drain the rollback, watching liveTextureCountForTesting() on EVERY
++    // tick (not just at the end) -- the bug this test targets is a
++    // TRANSIENT-if-unwatched drop (releaseUnpublished() on the shared
++    // checkerboard handle marks it non-resident immediately, then
++    // DeletionQueue's own later reclaim is what would actually destroy
++    // the VkImage; watching every tick catches the non-resident marking
++    // half too, not merely the eventual destroy).
++    //
++    // Deliberately NOT an early-exit-on-first-observed-state loop like
++    // the geometry-side cancel-mid-upload test above -- GeometryPool::
++    // stats().vertexBytesUsed dropping to zero is a synchronous,
++    // reliable "pool.free() has now actually run" signal, but there is
++    // no equivalent synchronous signal on the texture side:
++    // liveTextureCountForTesting() does not change at all until
++    // onFrameFenceSignaled() below runs, so "cancelled == true" alone
++    // says nothing about whether rollbackAsyncImportWhenSafe()'s own
++    // ticket-completion poll (marshalGltfImportEnsureRollbackTicketed(),
++    // ITEM 3) has finished yet. Instead: drive a fixed, generous settle
++    // window of pumpMain() calls AFTER cancellation is first observed,
++    // long enough for that poll loop to genuinely converge (the
++    // underlying GPU work is one small JPEG decode's worth of bytes --
++    // real completion happens within a handful of frames on any GPU this
++    // test suite runs on).
++    size_t minLiveObservedDuringRollback = fixture->textures->liveTextureCountForTesting();
++    const auto rollbackDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
++    bool cancelledObserved = false;
++    int settleTicksRemaining = 200;
++    while (std::chrono::steady_clock::now() < rollbackDeadline && settleTicksRemaining > 0) {
++        scheduler->pumpMain();
++        minLiveObservedDuringRollback =
++            std::min(minLiveObservedDuringRollback, fixture->textures->liveTextureCountForTesting());
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++        if (registry.importProgress(handle).cancelled) {
++            cancelledObserved = true;
++        }
++        if (cancelledObserved) {
++            --settleTicksRemaining;
++        }
++    }
++    REQUIRE(cancelledObserved);
++    CHECK_FALSE(done);
++    CHECK(minLiveObservedDuringRollback >= liveTexturesBefore);
++
++    // Real reclaim -- deliberately no vkDeviceWaitIdle() here either, same
++    // reasoning as ITEM 2's own restructuring above: the production fix
++    // (rollbackAsyncImportWhenSafe(), plus this round's own `registered`
++    // gate in marshalGltfImportRollback()) is what must make this safe.
++    fixture->deletionQueue->onFrameFenceSignaled(0);
++    CHECK(fixture->textures->liveTextureCountForTesting() == liveTexturesBefore);
++
++    // The direct proof: the shared checkerboard itself is still exactly
++    // what it always was -- same dims, still a resident fallback record --
++    // not a destroyed/dangling handle silently substituted or corrupted.
++    const TextureRecord& cb = fixture->textures->resolve(checkerboard);
++    CHECK(cb.isFallback);
++    CHECK(cb.resident);
++    CHECK(cb.width == 4);
++    CHECK(cb.height == 4);
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
+ // ---------------------------------------------------------------------
+ // Concurrent imports: isolated, correct, and D24-safe to resolve DURING a
+ // genuine, actively-driven overlap window with another in-flight import
+ // (not merely two imports that happen to be started close together).
+ // ---------------------------------------------------------------------
+ 
+ TEST_CASE("importGltfAsync: a resolve-heavy loop against an ALREADY-COMPLETED import's handles runs correctly "
+           "and repeatedly WHILE a second, independent async import is PROVABLY still in flight [D24, "
+           "mandatory literal overlap -- not a reworded/inferred overlap]") {
+     auto fixture = makeFixture("async_concurrent");
+diff --git a/src/rx_task/include/rx_task/scheduler.h b/src/rx_task/include/rx_task/scheduler.h
+index 08476d2..19e6a43 100644
+--- a/src/rx_task/include/rx_task/scheduler.h
++++ b/src/rx_task/include/rx_task/scheduler.h
+@@ -175,34 +175,37 @@ class Scheduler {
+   // this -- see scheduler.cpp for exactly how). Safe to call from any
+   // thread, including concurrently from several threads at once and from
+   // within a parallelFor() chunk or a postToMain() callback.
+   //
+   // Intended for the D5 handoff pattern's blocking-I/O half (file reads,
+   // decode-adjacent syscalls) -- see docs/threading.md. `fn` must not
+   // block indefinitely: this Scheduler has exactly one IO thread, so a
+   // stuck `fn` stalls every runOnIoThread() call queued after it.
+   void runOnIoThread(std::function<void()> fn);
+ 
+-  // [Phase 4 Stage 1 Task 15, additive] Enqueues `fn` to run, later, on ONE
+-  // of this Scheduler's regular background parallelFor() worker threads
+-  // (round-robin over [1, workerCount()]) -- NEVER on the calling thread,
+-  // NEVER on the main thread, and NEVER on the dedicated IO thread. Unlike
+-  // runOnIoThread()'s target (a thread permanently dedicated to pinned
+-  // tasks, via IoLoopTask's own infinite Execute() loop below), the target
+-  // worker here is an ORDINARY parallelFor() participant: enkiTS's own
+-  // per-thread dispatch loop (TaskingThreadFunction) already checks for
+-  // and runs any pinned task addressed to it (TryRunTask() calls
+-  // RunPinnedTasks() first, every iteration -- verified directly against
+-  // the pinned enkiTS v1.12 source) as part of its NORMAL cycle, so this
+-  // costs nothing beyond one enkiTS pinned-task dispatch and returns the
+-  // worker to ordinary parallelFor() duty immediately after `fn` returns --
+-  // no new thread is created, and workerCount() is unchanged.
++  // [Phase 4 Stage 1 Task 15, additive; mechanism rewritten in fix round 1
++  // -- see docs/threading.md's own "Pinned-task dispatch: persistent
++  // tasks, not per-submission ones" section, which this comment
++  // summarizes] Enqueues `fn` to run, later, on this Scheduler's single
++  // dedicated WORKER-TASK-LANE thread -- a second thread permanently
++  // reserved for this purpose alone, distinct from BOTH the ordinary
++  // [1, workerCount()] parallelFor() pool AND the dedicated IO thread
++  // runOnIoThread() targets. This lane thread is created ONCE, at
++  // Scheduler::create() (`numTaskThreadsToCreate` is `workerCount() + 2`,
++  // not `+1` -- the IO thread plus this one), and is never counted in
++  // workerCount() (which still reports only the ordinary parallelFor()
++  // pool size, unchanged). Calls are executed strictly FIFO relative to
++  // each other, in the order runOnWorkerThread() was called -- exactly
++  // the same single-thread FIFO contract runOnIoThread() gives its own
++  // target, now true here too (this round's redesign eliminated the
++  // earlier round-robin-over-parallelFor-workers behavior entirely, not
++  // merely changed its ordering guarantee).
+   //
+   // WHY THIS EXISTS [documented per the repository's "don't touch rx_task
+   // unless a genuine blocking defect forces it" policy -- flagged here
+   // prominently, see docs/threading.md's own cross-reference and the
+   // task-15-report.md rationale for the full analysis]: the async import
+   // pipeline (Task 15) needs to run CPU-heavy, potentially slow decode
+   // work (parse/transcode/tangent-generation/meshopt) via parallelFor()
+   // WITHOUT blocking the main thread and WITHOUT ever touching the
+   // dedicated IO thread (which must stay free for FIFO byte-source reads).
+   // Every OTHER Scheduler primitive fails at least one of those two
+@@ -213,34 +216,34 @@ class Scheduler {
+   // callback runs ON the dedicated IO thread, and calling parallelFor()
+   // FROM one nests into that same IO thread's own WaitforTask()
+   // participation (verified directly against the pinned enkiTS source:
+   // WaitforTask()'s spin loop calls TryRunTask() on the CALLING thread,
+   // which would let the IO thread itself execute decode chunks -- exactly
+   // the invariant Task 15 must not violate); and this Scheduler
+   // deliberately refuses arbitrary foreign threads (an unregistered
+   // caller's `gtl_threadNum` collides with thread 0's own enkiTS
+   // registration -- confirmed against the vendored source, not merely
+   // asserted by the class comment above). runOnWorkerThread()'s own `fn`
+-  // runs on a genuine, ALREADY-registered enkiTS worker thread, so a
+-  // NESTED parallelFor() call from inside it is both legal (per the
+-  // paragraph above) and structurally incapable of reaching the IO thread
+-  // (IoLoopTask's own Execute() loop never returns to enkiTS's ordinary
+-  // TaskSet-stealing path at all, by construction -- see IoLoopTask below).
++  // runs on a genuine, ALREADY-registered enkiTS worker thread (this
++  // lane), so a NESTED parallelFor() call from inside it is both legal
++  // (per the paragraph above) and structurally incapable of reaching the
++  // IO thread (this lane's own persistent pinned task never touches
++  // enkiTS's ordinary TaskSet-stealing path at all -- see scheduler.cpp's
++  // `ClosureQueueLoopTask`).
+   //
+   // Safe to call from any thread (mirrors runOnIoThread()'s own contract);
+   // `fn` itself may safely call parallelFor() (nested/reentrant, exactly
+   // as any worker-thread chunk callback may -- see parallelFor()'s own doc
+-  // comment) or postToMain(). Multiple concurrent submissions are safe and
+-  // do not need to target the same worker thread to be correct -- FIFO
+-  // ordering across DIFFERENT target threads is not guaranteed (unlike
+-  // runOnIoThread()'s single-thread FIFO contract), only per-target-thread
+-  // ordering is.
++  // comment) or postToMain(). Multiple concurrent submissions are safe;
++  // with only one target thread now, per-target-thread FIFO ordering (the
++  // only ordering this API has ever promised) is simply FIFO ordering,
++  // full stop.
+   void runOnWorkerThread(std::function<void()> fn);
+ 
+   // Enqueues `fn` to run later, on whichever thread next calls pumpMain()
+   // (intended to always be this Scheduler's main thread -- see the class
+   // comment). FIFO relative to other postToMain() calls made from the
+   // SAME calling thread (a plain mutex-guarded queue -- see scheduler.cpp
+   // -- gives a single total order across every caller, but only a single
+   // thread's own sequence of calls has a meaningful "before/after" to
+   // preserve; interleavings across concurrently-calling threads settle in
+   // whatever order they acquire the queue's mutex). Safe to call from any
