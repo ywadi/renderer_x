@@ -208,6 +208,14 @@ public:
     // VK_WHOLE_SIZE = no limit): forwarded verbatim to createRaw() -- see
     // that function's own comment for what it does and why [Phase 4 Task
     // 10, D24(d) OOM-path testing].
+    // [Phase 4 Stage 1 Task 12, spec D26.4] `VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT`
+    // enablement is likewise NOT a parameter here: it is pulled from
+    // `device.supportsBufferDeviceAddress()` automatically (device.h),
+    // itself set opportunistically at Device::create() time -- the two
+    // must stay in LOCKSTEP, exactly like the memory-budget flag above
+    // (same rationale, same enforcement: this overload always reads
+    // Device's own accessor directly rather than trusting a caller-
+    // supplied value).
     static std::optional<Allocator> create(Context& context, Device& device,
                                             VkDeviceSize forcedHeapSizeLimitBytes = VK_WHOLE_SIZE);
 
@@ -268,9 +276,27 @@ public:
     // overallocation behavior. This is the "tiny mock/--budget-override
     // allocator ceiling" the plan's own Task 10 steps call for
     // (matrix-issue27 rows 6-9) -- see oom_handling_test.cpp.
+    // `bufferDeviceAddressEnabled` [Phase 4 Stage 1 Task 12, spec D26.4]:
+    // pass true ONLY if `bufferDeviceAddress` was actually enabled on
+    // `device` at logical-device-creation time (Device::create() does
+    // this opportunistically via `enable_extension_features_if_present()`
+    // -- see device.cpp). Mirrors `memoryBudgetExtensionEnabled` exactly:
+    // when true, `VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT` is set
+    // below, which is what makes it legal to later create a buffer with
+    // `VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT` against this allocator
+    // (verified directly against vendored VMA 3.4.0 source: creating such
+    // a buffer without this flag having been set at allocator-creation
+    // time trips a `VMA_ASSERT`/`VK_ERROR_INITIALIZATION_FAILED` --
+    // vk_mem_alloc.h:14440-14445 -- both the allocator flag and the
+    // buffer usage bit are creation-time-only and immutable for their
+    // respective object's lifetime, exactly why this is opportunistic-
+    // but-lockstep, never retrofittable later). `rx::asset::GeometryPool`
+    // (src/rx_asset) is this phase's sole consumer of the resulting
+    // capability.
     static std::optional<Allocator> createRaw(VkPhysicalDevice physicalDevice, VkDevice device, VkInstance instance,
                                                bool memoryBudgetExtensionEnabled = false,
-                                               VkDeviceSize forcedHeapSizeLimitBytes = VK_WHOLE_SIZE);
+                                               VkDeviceSize forcedHeapSizeLimitBytes = VK_WHOLE_SIZE,
+                                               bool bufferDeviceAddressEnabled = false);
 
     // Allocates a VkBuffer with `usage`, backed by host-visible, persistently
     // mapped memory (VMA_MEMORY_USAGE_AUTO +

@@ -74,12 +74,14 @@ void publishTracyPlots(const RxMemoryReport& report) {
 
 std::optional<Allocator> Allocator::create(Context& context, Device& device, VkDeviceSize forcedHeapSizeLimitBytes) {
     return createRaw(device.physicalDevice(), device.device(), context.instance(),
-                      device.memoryBudgetExtensionEnabled(), forcedHeapSizeLimitBytes);
+                      device.memoryBudgetExtensionEnabled(), forcedHeapSizeLimitBytes,
+                      device.supportsBufferDeviceAddress());
 }
 
 std::optional<Allocator> Allocator::createRaw(VkPhysicalDevice physicalDevice, VkDevice device, VkInstance instance,
                                                bool memoryBudgetExtensionEnabled,
-                                               VkDeviceSize forcedHeapSizeLimitBytes) {
+                                               VkDeviceSize forcedHeapSizeLimitBytes,
+                                               bool bufferDeviceAddressEnabled) {
     // Only the two entry points VMA's dynamic-loading path actually
     // requires (see buffer.h's comment above the VMA_STATIC_VULKAN_FUNCTIONS
     // / VMA_DYNAMIC_VULKAN_FUNCTIONS defines for why nothing else is
@@ -112,6 +114,18 @@ std::optional<Allocator> Allocator::createRaw(VkPhysicalDevice physicalDevice, V
     // than trusting a caller-supplied value.
     if (memoryBudgetExtensionEnabled) {
         createInfo.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+    }
+
+    // [Phase 4 Stage 1 Task 12, spec D26.4] Same LOCKSTEP requirement as
+    // the memory-budget flag above: this must agree exactly with whether
+    // `bufferDeviceAddress` was actually enabled on `device` --
+    // `Device::supportsBufferDeviceAddress()` is the single source of
+    // truth (see this function's own header comment in buffer.h for the
+    // exact VMA enforcement this flag gates: a buffer created with
+    // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT against an allocator that
+    // never set this flag trips a VMA-side assert/failure).
+    if (bufferDeviceAddressEnabled) {
+        createInfo.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
     }
 
     // [Phase 4 Task 10, D24(d) OOM-path testing] TEST-ONLY heap-size

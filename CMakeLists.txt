@@ -75,6 +75,14 @@ add_subdirectory(src/rx_platform)
 # not-yet-defined target name is otherwise fine in modern CMake.
 add_subdirectory(src/rx_shader)
 add_subdirectory(src/rx_rhi_vk)
+# rx_asset: Phase 4 Stage 1 Task 12 -- GeometryPool, pooled global vertex/
+# index storage (spec D8/D9/D26.4). Depends on rx_rhi_vk (Allocator/
+# Device/Uploader) directly; its GPU test binary additionally links
+# rx_shader + rx_platform (same windowed-device + in-process shader
+# compile pattern as rx_graph's own GPU test binary, src/rx_graph/tests/
+# CMakeLists.txt) to build a minimal draw pipeline for its readback
+# assertions -- see src/rx_asset/CMakeLists.txt.
+add_subdirectory(src/rx_asset)
 # Device-free in Task 1 (pass declarations, culling, ordering, lifetimes):
 # depends on Vulkan::Headers + rx_core only, not rx_rhi_vk -- see
 # src/rx_graph/CMakeLists.txt's own comment for why that dependency is

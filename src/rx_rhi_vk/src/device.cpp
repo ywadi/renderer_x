@@ -299,6 +299,39 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
     const bool memoryBudgetExtensionEnabled =
         physResult.value().enable_extension_if_present(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 
+    // bufferDeviceAddress: opportunistic, guarded [Phase 4 Stage 1 Task
+    // 12, spec D26.4, gate matrix-issue21's BDA rows]. Deliberately NOT
+    // requested via features12 above (that struct is REQUIRED for
+    // selection via set_required_features_12() -- setting
+    // bufferDeviceAddress=VK_TRUE there would make it a hard
+    // device-selection requirement, which D26.4 explicitly forbids: "NEVER
+    // a device-selection requirement"). Instead this uses vk-bootstrap's
+    // own documented optional-feature-enable API,
+    // `enable_extension_features_if_present<T>()` (VkBootstrap.h) -- the
+    // feature-bit analog of `enable_extension_if_present()` just above,
+    // verified directly against vk-bootstrap's pinned source
+    // (VkBootstrap.cpp's `enable_features_struct_if_present`): it performs
+    // its OWN fresh `vkGetPhysicalDeviceFeatures2` query against the
+    // ALREADY-SELECTED physical device, and only if every field set true
+    // in the struct passed here (`bufferDeviceAddress` alone) is genuinely
+    // supported does it MERGE that field into `physResult`'s own
+    // already-required VkPhysicalDeviceVulkan12Features chain entry
+    // (`FeaturesChain::add_structure()`'s documented merge semantics) --
+    // never adding a second, separately-typed
+    // VkPhysicalDeviceBufferDeviceAddressFeatures struct to the pNext
+    // chain (which would risk a duplicate/aliased-struct validation
+    // question against the Vulkan12Features struct already present).
+    // Because this call happens AFTER `select()` already succeeded, a
+    // physical device lacking the bit simply gets `false` back here with
+    // NOTHING added to the chain -- device creation below proceeds exactly
+    // as if this call had never been made, never failing selection on
+    // this bit's absence.
+    VkPhysicalDeviceVulkan12Features bufferDeviceAddressRequest{};
+    bufferDeviceAddressRequest.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    bufferDeviceAddressRequest.bufferDeviceAddress = VK_TRUE;
+    const bool bufferDeviceAddressEnabled =
+        physResult.value().enable_extension_features_if_present(bufferDeviceAddressRequest);
+
     auto deviceResult = vkb::DeviceBuilder(physResult.value()).build();
     if (!deviceResult) {
         RX_LOG_ERROR("vkb::DeviceBuilder::build failed: {}", deviceResult.error().message());
@@ -409,6 +442,12 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
     RX_LOG_INFO("Device::create: VK_EXT_memory_budget {} on the selected physical device",
                 memoryBudgetExtensionEnabled ? "ENABLED" : "not present -- memory reports fall back to a heap-size "
                                                             "budget estimate");
+    dev.bufferDeviceAddressEnabled_ = bufferDeviceAddressEnabled;
+    RX_LOG_INFO(
+        "Device::create: bufferDeviceAddress {} on the selected physical device [Phase 4 Stage 1 Task 12, spec "
+        "D26.4] (enablement only -- opportunistic, never a device-selection requirement)",
+        bufferDeviceAddressEnabled ? "ENABLED" : "not present -- rx::asset::GeometryPool chunk buffers degrade to no "
+                                                  "device-address usage bit, logged");
     dev.swapchain_ = vkbSwapchain.swapchain;
     dev.swapchainImages_ = imagesResult.value();
     dev.swapchainFormat_ = vkbSwapchain.image_format;
@@ -440,6 +479,7 @@ Device& Device::operator=(Device&& other) noexcept {
         hasDedicatedTransferQueue_ = other.hasDedicatedTransferQueue_;
         calibratedTimestampsEnabled_ = other.calibratedTimestampsEnabled_;
         memoryBudgetExtensionEnabled_ = other.memoryBudgetExtensionEnabled_;
+        bufferDeviceAddressEnabled_ = other.bufferDeviceAddressEnabled_;
         swapchain_ = other.swapchain_;
         swapchainImages_ = std::move(other.swapchainImages_);
         swapchainFormat_ = other.swapchainFormat_;
@@ -459,6 +499,7 @@ Device& Device::operator=(Device&& other) noexcept {
         other.hasDedicatedTransferQueue_ = false;
         other.calibratedTimestampsEnabled_ = false;
         other.memoryBudgetExtensionEnabled_ = false;
+        other.bufferDeviceAddressEnabled_ = false;
         other.swapchain_ = VK_NULL_HANDLE;
         other.swapchainImages_.clear();
         other.swapchainFormat_ = VK_FORMAT_UNDEFINED;

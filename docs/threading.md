@@ -85,9 +85,15 @@ and compiles to nothing at all when it is OFF:
   `report()`'s per-heap budget numbers stay fresh (see `memory_report.h`'s
   own comment on the `vmaSetCurrentFrameIndex()` staleness rule).
   (`src/rx_rhi_vk/include/rx_rhi_vk/buffer.h`)
-- **`rx::asset::GeometryPool`** (future, Stage 1) — suballocation is a
-  main-thread-owned `VmaVirtualBlock` operation, same rationale as the
-  four above. Not guarded — does not exist yet.
+- **`rx::asset::GeometryPool`** [Phase 4 Stage 1 Task 12, spec D9] —
+  `create()`/`upload()`/`free()`/`bind()` **[guarded, all four]**:
+  suballocation is a main-thread-owned `VmaVirtualBlock` operation (VMA's
+  own virtual-block API documents itself as "not thread-safe... must be
+  synchronized externally" — vendored `vk_mem_alloc.h`), same rationale
+  as the four Allocator-derived types above. `stats()`/`blockCount()`/
+  `bufferDeviceAddressEnabled()`/`vertexBufferDeviceAddress()`/
+  `indexBufferDeviceAddress()` are read-only snapshots, not guarded.
+  (`src/rx_asset/include/rx_asset/geometry_pool.h`)
 - **`rx::scene::*Manager` registries** (future, Stage 2) —
   `RenderableManager`/`TransformManager`/`LightManager` mutation
   (create/set/destroy) stays main-thread-only; read-only SoA traversal for

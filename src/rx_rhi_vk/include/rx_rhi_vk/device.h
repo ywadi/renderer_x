@@ -132,6 +132,27 @@ public:
     // rather than Allocator guessing or re-querying the extension itself.
     bool memoryBudgetExtensionEnabled() const { return memoryBudgetExtensionEnabled_; }
 
+    // [Phase 4 Stage 1 Task 12, spec D26.4] True iff `bufferDeviceAddress`
+    // (VkPhysicalDeviceVulkan12Features -- promoted VK_KHR_buffer_device_address
+    // core in Vulkan 1.2, not an extension string) was present on the
+    // selected physical device AND opportunistically enabled on the
+    // logical device this Device wraps. NEVER a device-selection
+    // requirement (D26.4) -- device.cpp resolves this via vk-bootstrap's
+    // `enable_extension_features_if_present()` AFTER physical-device
+    // selection has already succeeded, so a device lacking it still
+    // builds a fully working Device; this simply reports false and one
+    // log line records the degrade. rx::rhi::Allocator::create(Context&,
+    // Device&) (buffer.h) reads this to decide whether to request
+    // VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT -- the two must stay
+    // in LOCKSTEP, exactly like memoryBudgetExtensionEnabled() above (this
+    // is the single source of truth Allocator::create() always reads
+    // directly). rx::asset::GeometryPool (src/rx_asset) is this phase's
+    // consumer: it reads this once at create() to decide whether its
+    // chunk buffers carry VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT.
+    // Enablement only -- nothing in Phase 4 calls vkGetBufferDeviceAddress
+    // for any purpose beyond GeometryPool's own test-observable accessor.
+    bool supportsBufferDeviceAddress() const { return bufferDeviceAddressEnabled_; }
+
     VkSwapchainKHR swapchain() const { return swapchain_; }
     const std::vector<VkImage>& swapchainImages() const { return swapchainImages_; }
     VkFormat swapchainFormat() const { return swapchainFormat_; }
@@ -207,6 +228,7 @@ private:
     bool hasDedicatedTransferQueue_ = false;
     bool calibratedTimestampsEnabled_ = false;
     bool memoryBudgetExtensionEnabled_ = false;
+    bool bufferDeviceAddressEnabled_ = false;
 
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     std::vector<VkImage> swapchainImages_;
