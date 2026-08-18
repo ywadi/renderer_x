@@ -354,3 +354,155 @@ flag on every headless sample test confirms the sample-level migrations
 (including the eviction-cycle poll redesign) are exercised under
 `VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT` specifically,
 not just generic validation.
+
+## Fix round 1 (independent review, Approved-with-minors)
+
+Commit: `0eb91bf` — `fix: tighten ring-reclamation gate, add deterministic poll-first proof`.
+
+### Important (blocking): ring-reclamation stress test did not gate the regression it exists to prevent
+
+The reviewer reproduced, in their own scratch worktree, the literal
+degenerate policy matrix row 5 forbids (whole-ring unconditional drain
+on every wrap, ignoring completion state) and found the original
+`CHECK(uploader->blockingRingWaitCount() < static_cast<uint32_t>(kUploadCount))`
+assertion (36 blocking waits < 80 flush() calls issued) still passed —
+this bound only rejected "block on literally every single call," not
+"block far more than the wraps that actually needed it."
+
+**Fix, two parts:**
+
+1. Tightened the existing stress test's bound to
+   `blockingRingWaitCount() <= ringWrapCount()`. This is provably safe
+   against a false failure on the real implementation given the test's
+   own construction (every flush() there covers exactly one
+   `kChunkSize`-wide chunk, and `kRingSize` is an exact multiple of
+   `kChunkSize`, so a single wrap can never need to block on more than
+   one prior entry to clear the space a single next chunk needs — see
+   the code comment for the full argument). It rejects a policy whose
+   pending-region queue never advances between wraps and re-drains a
+   growing backlog every time.
+2. That bound alone cannot distinguish "polled first, found already
+   done" from "blocked unconditionally and it happened to return
+   immediately," because a policy that blocks exactly once per wrap
+   regardless of completion state also measures at most
+   `ringWrapCount()` on this test's own construction — structurally
+   indistinguishable from the correct implementation by counting alone.
+   Added a NEW, fully deterministic test
+   (`"...ring reclamation polls (never blocks) when the oldest pending
+   region is already confirmed complete BEFORE the wrap..."`) that
+   forces the completion precondition explicitly: two uploads are each
+   individually `flush()`ed AND `wait()`ed (so their tickets are
+   genuinely, confirmably complete, not just "probably done by now"),
+   filling the ring exactly to capacity; a third upload then forces a
+   wrap, and the test asserts `blockingRingWaitCount()` does not change
+   across that specific wrap. This has zero dependency on relative
+   CPU/GPU speed — it does not race anything, it proves the precondition
+   before the wrap even happens.
+
+**Mandatory degenerate-policy discrimination evidence** — reproduced in
+a scratch worktree (toolchain/`.deps-cache` symlinked in, checked out at
+the pre-fix-round commit `0eb91bf`, degenerate policy injected directly
+into `reserveRingSpace()`'s wrap branch: unconditionally `wait()` on
+every entry in `pendingRegions_` and pop it, without ever calling
+`reclaimCompletedRegions()` first or checking overlap):
+
+```
+[scratch worktree, degenerate whole-ring-drain-on-wrap policy]
+TEST CASE: Uploader ring-buffer reclamation under heavy wrap ...
+ring wrapped 9 times across 80 uploads into a 512-byte ring
+blocking ring-reclaim waits: 25 (flush() calls issued: 80)
+upload_test.cpp:835: ERROR: CHECK( uploader->blockingRingWaitCount() <= uploader->ringWrapCount() ) is NOT correct!
+  values: CHECK( 25 <= 9 )
+
+TEST CASE: Uploader ring reclamation polls (never blocks) when the oldest
+pending region is already confirmed complete BEFORE the wrap ...
+upload_test.cpp:924: ERROR: CHECK( uploader->blockingRingWaitCount() == blockingWaitsBeforeWrap ) is NOT correct!
+  values: CHECK( 1 == 0 )
+
+[doctest] test cases:  10 |   8 passed | 2 failed | 51 skipped
+[doctest] Status: FAILURE!
+```
+
+(25, not the reviewer's own 36 — an artifact of this being an
+independently-written reproduction of the FORBIDDEN POLICY CLASS the
+review describes, not a byte-identical copy of the reviewer's own
+implementation; both numbers are well past any legitimate bound and
+both trigger the same two assertions. The deterministic test's `1 == 0`
+is the more important signal: it proves the injected policy blocks even
+when the ticket was already confirmed complete beforehand — exactly the
+"ignoring completion" violation matrix row 5 forbids.)
+
+Both tests pass cleanly against the real (non-degenerate) implementation,
+confirmed immediately before and after the scratch-worktree run, in the
+main checkout:
+
+```
+[main checkout, real implementation]
+TEST CASE: Uploader ring-buffer reclamation under heavy wrap ...
+ring wrapped 9 times across 80 uploads into a 512-byte ring
+blocking ring-reclaim waits: 0 (flush() calls issued: 80)
+TEST CASE: Uploader ring reclamation polls (never blocks) ...
+[doctest] test cases:  10 |  10 passed | 0 failed | 51 skipped
+[doctest] Status: SUCCESS!
+```
+
+Scratch worktree discarded (`git worktree remove --force`) after
+capturing this evidence; no scratch-only code is present in the
+committed tree.
+
+### Minor 1: `UploadTicket::ringGeneration` doc comment
+
+Added an explicit sentence (`upload.h`) stating this field plays no
+safety/epoch/stale-ticket role — completion is determined entirely by
+`value`, and nothing anywhere compares `ringGeneration` against a
+"current" value the way a generational handle does.
+
+### Minor 2: erratum — "ELEVEN additional call sites" arithmetic corrected
+
+The original report's "Deviation: call-site audit widened beyond
+sample 04" section says "surfaced ELEVEN more pre-existing call sites."
+This conflated two different counts:
+
+- **11** = the total number of `wait(flush())` call sites touched
+  across the whole diff outside the ticket API itself, including
+  `MeshBuffers::create()`'s own two uploads (vertex + index — already
+  an in-scope row, matrix row 12) and sample 04's setup-time wait at
+  line 1052 (already in-scope, matrix row 11 explicitly covers sample
+  04's file audit).
+- **8** = the actual count of sites genuinely BEYOND the brief's named
+  scope (sample 04 only): `material_system.cpp` ×1
+  (`MaterialSystem::createTexture2D()`), `samples/03_bindless_mesh` ×2
+  (setup + per-frame), `samples/05_multipass` ×2 (setup + per-frame),
+  `samples/06_materials` ×2 (setup + per-frame), `samples/07_stress` ×1
+  (setup only). 1+2+2+2+1 = 8.
+
+The migration itself was already complete and correct — this corrects
+only the arithmetic/wording, not any code. The reviewer's own
+repo-wide audit independently confirmed all 12 pre-existing
+`Uploader::flush()` call sites (the 8 above + the 4 already-in-scope
+ones: MeshBuffers' 2, sample 04's 2) are accounted for.
+
+### Test evidence (fix round 1)
+
+```
+$ xvfb-run -a ./build/linux-native/src/rx_rhi_vk/rx_rhi_vk_tests -tc="*ring*"
+...
+ring wrapped 9 times across 80 uploads into a 512-byte ring
+blocking ring-reclaim waits: 0 (flush() calls issued: 80)
+[doctest] test cases:  10 |  10 passed | 0 failed | 51 skipped
+[doctest] Status: SUCCESS!
+
+$ xvfb-run -a ctest --preset linux-native --output-on-failure
+...
+100% tests passed, 0 tests failed out of 17
+Total Test time (real) =  51.88 sec
+
+$ cmake --build --preset windows-cross-zig
+... 24/24 targets touched by this fix rebuilt cleanly, no errors
+```
+
+(windows-cross-zig's own ctest subset was unaffected by this fix round
+— `upload_test.cpp` is excluded from that preset's ctest run per
+existing CI policy, same as every prior task; the build-cleanly check
+above is what's binding for this preset.)
+
