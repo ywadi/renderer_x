@@ -56,6 +56,19 @@ struct ImportResult {
     ImportedScene scene;                    // flattened instances [D12] + preserved cameras/lights/animations
     std::vector<MeshHandle> meshes;          // newly created handles, in source Mesh-array order
     std::vector<MaterialHandle> materials;   // newly created handles, in source Material-array order
+
+    // Test/diagnostic-only [fix round 1, matrix-issue02 row 12]: how many
+    // times THIS import called `GeometryPool::upload()`. GeometryPool's
+    // own landed (Task 12) contract is exactly one flush()+wait() per
+    // upload() call, so this is a direct, precise proxy for "how many
+    // times did sync import block on GPU upload completion" -- a
+    // correct one, unlike `Uploader::blockingRingWaitCount()` (which
+    // this task's own fix-round testing found measures ring-RECLAMATION
+    // blocking only, never incrementing at all for small test payloads
+    // regardless of how many separate upload() calls were made -- see
+    // the task report's fix-round section). Production code has no need
+    // for this field.
+    uint32_t poolUploadCallCountForTesting = 0;
 };
 
 class Registry {

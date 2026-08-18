@@ -161,17 +161,42 @@ TEST_CASE("importGltf: committed cube_textured.gltf imports with correct counts,
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 
-TEST_CASE("importGltf: sync import issues at most ONE blocking upload wait for a multi-primitive file") {
+TEST_CASE("importGltf: sync import issues at most ONE GeometryPool::upload() call for a multi-primitive file") {
     auto fixture = makeFixture("import_wait_count");
     if (!fixture) {
         return;
     }
     attachPoolAndScheduler(*fixture);
     Registry registry;
-    const uint32_t waitsBefore = fixture->uploader.blockingRingWaitCount();
+    // [fix round 1, TWICE over -- see the task report's fix-round
+    // section] Two independent problems in the original version of this
+    // test, both found and fixed this round:
+    //   1. Was cube_textured.gltf (1 mesh / 1 primitive) -- N=1 cannot
+    //      distinguish "once total" from "once per primitive."
+    //   2. The assertion itself used `Uploader::blockingRingWaitCount()`,
+    //      which -- empirically reproduced via a scratch-worktree revert
+    //      to a per-primitive pool.upload() loop, even AFTER fixing (1)
+    //      above to a real 2-primitive fixture -- measures ring-
+    //      RECLAMATION blocking only (Uploader's own doc comment: "how
+    //      many times reserveRingSpace() had to block... to reclaim ring
+    //      space"), which never triggers at all for this test's tiny
+    //      payload regardless of how many separate upload() calls were
+    //      made. That revert still passed against the OLD assertion --
+    //      a second, deeper vacuousness the multi-primitive fixture fix
+    //      alone did not catch.
+    // Fixed properly: `ImportResult::poolUploadCallCountForTesting`
+    // counts, directly in THIS project's own code (no rx_rhi_vk change),
+    // how many times import_gltf.cpp itself called pool.upload() --
+    // exactly the quantity matrix row 12 is about, and immune to
+    // whatever Uploader's internal ring bookkeeping happens to do for a
+    // given payload size. The SAME revert (per-primitive upload loop)
+    // now fails this assertion directly: 2, not <=1 -- see the task
+    // report.
     ImportResult result =
-        registry.importGltf(testAssetDir() + "/cube_textured.gltf", *fixture->pool, *fixture->scheduler);
+        registry.importGltf(testAssetDir() + "/cube_multi_primitive.gltf", *fixture->pool, *fixture->scheduler);
     REQUIRE(result.ok());
+    REQUIRE(result.meshes.size() == 1);
+    REQUIRE(registry.mesh(result.meshes[0]).submeshes.size() == 2);
     // GeometryPool::upload() itself does exactly one flush()+wait() per
     // call [Task 12's own contract], and this importer batches EVERY
     // submesh in the whole file into ONE combined upload() call
@@ -180,7 +205,7 @@ TEST_CASE("importGltf: sync import issues at most ONE blocking upload wait for a
     // -- see that file's comment for why this is the chosen design given
     // GeometryPool's landed per-call-wait contract [matrix-issue02 row
     // 12].
-    CHECK(fixture->uploader.blockingRingWaitCount() <= waitsBefore + 1);
+    CHECK(result.poolUploadCallCountForTesting <= 1);
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 
@@ -282,10 +307,20 @@ TEST_CASE("importGltf: three same-cube source-variant packagings deep-equal") {
 
     CHECK(a.range.indexCount == b.range.indexCount);
     CHECK(a.range.indexCount == c.range.indexCount);
-    CHECK(a.bounds.min.x == doctest::Approx(b.bounds.min.x));
-    CHECK(a.bounds.min.x == doctest::Approx(c.bounds.min.x));
-    CHECK(a.bounds.max.x == doctest::Approx(b.bounds.max.x));
-    CHECK(a.bounds.max.x == doctest::Approx(c.bounds.max.x));
+    // [fix round 1] Full 3-axis min/max deep-equal -- was X-only, which
+    // could not catch a Y/Z-axis-specific divergence between packagings
+    // (e.g. a source variant that silently swizzled or dropped an axis
+    // during resolution).
+    const auto checkBoundsEqual = [](const AABB& lhs, const AABB& rhs) {
+        CHECK(lhs.min.x == doctest::Approx(rhs.min.x));
+        CHECK(lhs.min.y == doctest::Approx(rhs.min.y));
+        CHECK(lhs.min.z == doctest::Approx(rhs.min.z));
+        CHECK(lhs.max.x == doctest::Approx(rhs.max.x));
+        CHECK(lhs.max.y == doctest::Approx(rhs.max.y));
+        CHECK(lhs.max.z == doctest::Approx(rhs.max.z));
+    };
+    checkBoundsEqual(a.bounds, b.bounds);
+    checkBoundsEqual(a.bounds, c.bounds);
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 
@@ -320,6 +355,18 @@ TEST_CASE("importGltf: malformed-file battery -- named error, zero partial regis
     // scratch-worktree revert testing (see the task report) -- the
     // r.meshes.empty()-only version of this test did NOT discriminate a
     // premature-registration injection; this version does.
+    // [fix round 1] Every subcase now asserts the SPECIFIC named
+    // ImportError (not just CHECK_FALSE(r.ok())) -- matrix row 4's own
+    // criterion is about the ERROR TAXONOMY being exhaustive and
+    // correctly mapped, which a mere ok()==false check cannot
+    // distinguish from an accidentally-different error path. Exact
+    // values below are the REAL, directly-observed fastgltf::Error this
+    // project's own mapFastgltfError() produces for each input
+    // (confirmed via this binary's own captured log output during this
+    // task, e.g. "wrong-magic GLB" maps to InvalidFileData, NOT
+    // InvalidGLB -- flipping the first magic byte makes fastgltf's
+    // determineGltfFileType() unable to recognize the buffer as GLB OR
+    // JSON at all, the generic "could not determine file type" path).
     SUBCASE("not-JSON garbage") {
         Registry registry;
         const size_t meshesBefore = registry.meshCountForTesting();
@@ -327,6 +374,7 @@ TEST_CASE("importGltf: malformed-file battery -- named error, zero partial regis
         auto bytes = toBytes("this is not json at all { [ garbage");
         ImportResult r = registry.importGltf(bytes, source, *fixture->pool, *fixture->scheduler);
         CHECK_FALSE(r.ok());
+        CHECK(r.error == ImportError::InvalidFileData);
         CHECK(r.meshes.empty());
         CHECK(registry.meshCountForTesting() == meshesBefore);
         CHECK(registry.materialCountForTesting() == materialsBefore);
@@ -338,6 +386,7 @@ TEST_CASE("importGltf: malformed-file battery -- named error, zero partial regis
         auto bytes = toBytes(R"({"foo": "bar"})");
         ImportResult r = registry.importGltf(bytes, source, *fixture->pool, *fixture->scheduler);
         CHECK_FALSE(r.ok());
+        CHECK(r.error == ImportError::InvalidOrMissingAssetField);
         CHECK(r.meshes.empty());
         CHECK(registry.meshCountForTesting() == meshesBefore);
         CHECK(registry.materialCountForTesting() == materialsBefore);
@@ -350,6 +399,7 @@ TEST_CASE("importGltf: malformed-file battery -- named error, zero partial regis
         bytes.resize(bytes.size() / 2);
         ImportResult r = registry.importGltf(bytes, source, *fixture->pool, *fixture->scheduler);
         CHECK_FALSE(r.ok());
+        CHECK(r.error == ImportError::InvalidGLB);
         CHECK(r.meshes.empty());
         CHECK(registry.meshCountForTesting() == meshesBefore);
         CHECK(registry.materialCountForTesting() == materialsBefore);
@@ -362,6 +412,7 @@ TEST_CASE("importGltf: malformed-file battery -- named error, zero partial regis
         bytes[0] = std::byte{0x00};
         ImportResult r = registry.importGltf(bytes, source, *fixture->pool, *fixture->scheduler);
         CHECK_FALSE(r.ok());
+        CHECK(r.error == ImportError::InvalidFileData);
         CHECK(r.meshes.empty());
         CHECK(registry.meshCountForTesting() == meshesBefore);
         CHECK(registry.materialCountForTesting() == materialsBefore);
@@ -373,6 +424,34 @@ TEST_CASE("importGltf: malformed-file battery -- named error, zero partial regis
         auto bytes = toBytes(R"({"asset":{"version":"1.0"},"scenes":[{"nodes":[]}],"scene":0})");
         ImportResult r = registry.importGltf(bytes, source, *fixture->pool, *fixture->scheduler);
         CHECK_FALSE(r.ok());
+        CHECK(r.error == ImportError::UnsupportedVersion);
+        CHECK(r.meshes.empty());
+        CHECK(registry.meshCountForTesting() == meshesBefore);
+        CHECK(registry.materialCountForTesting() == materialsBefore);
+    }
+    // [fix round 1, new] The matrix's own named 5th malformed-file
+    // subcase ("invalid URI") was previously silently substituted with
+    // wrong-magic/missing-file instead. Empirically determined (this
+    // task, via a standalone probe against the pinned fastgltf v0.9.0
+    // build) which malformed URI shapes actually trigger
+    // `fastgltf::Error::InvalidURI` at PARSE time (independent of this
+    // project's own byte-source resolution, which never runs for a
+    // parse-time failure): a control character embedded raw in the URI
+    // string trips JSON parsing itself (InvalidJson, a different error);
+    // a malformed percent-escape (`%zz`, a truncated `%2`) is NOT
+    // rejected by fastgltf's own decoder at all (Error::None -- it
+    // parses leniently). An EMPTY `"uri": ""` is what reliably produces
+    // InvalidURI, confirmed directly against `loadGltf()` (the exact
+    // entry point this project's own Parser call uses, not a different
+    // one) -- used here.
+    SUBCASE("invalid URI (empty uri string)") {
+        Registry registry;
+        const size_t meshesBefore = registry.meshCountForTesting();
+        const size_t materialsBefore = registry.materialCountForTesting();
+        auto bytes = toBytes(R"({"asset":{"version":"2.0"},"buffers":[{"uri":"","byteLength":4}]})");
+        ImportResult r = registry.importGltf(bytes, source, *fixture->pool, *fixture->scheduler);
+        CHECK_FALSE(r.ok());
+        CHECK(r.error == ImportError::InvalidURI);
         CHECK(r.meshes.empty());
         CHECK(registry.meshCountForTesting() == meshesBefore);
         CHECK(registry.materialCountForTesting() == materialsBefore);
@@ -496,10 +575,77 @@ TEST_CASE("importGltf: sparse accessor substitution is applied") {
     const MeshAsset& mesh = registry.mesh(result.meshes[0]);
     REQUIRE(mesh.submeshes.size() == 1);
     // Base data is implicit zero; sparse overrides corners 1,2 to
-    // (1,0,0)/(0,1,0) -- the resulting bounds must reflect the
-    // OVERRIDDEN values, not an all-zero degenerate point.
+    // (1,0,0)/(0,1,0) -- corner 0 stays at the UNOVERRIDDEN base zero.
+    // [fix round 1] Also assert min (was max-only, which could not
+    // distinguish "override applied" from "override applied AND the
+    // untouched base-zero corner 0 got corrupted too") -- min must stay
+    // exactly (0,0,0), proving the base/sparse split is real, not just
+    // "some values landed near the right ballpark."
+    CHECK(mesh.submeshes[0].bounds.min.x == doctest::Approx(0.0F));
+    CHECK(mesh.submeshes[0].bounds.min.y == doctest::Approx(0.0F));
     CHECK(mesh.submeshes[0].bounds.max.x == doctest::Approx(1.0F));
     CHECK(mesh.submeshes[0].bounds.max.y == doctest::Approx(1.0F));
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("importGltf: single-point primitive (min==max) produces a valid, zero-volume AABB [G11]") {
+    auto fixture = makeFixture("import_single_point_aabb");
+    if (!fixture) {
+        return;
+    }
+    attachPoolAndScheduler(*fixture);
+
+    // A degenerate "primitive" whose 3 corners all share the SAME
+    // position (zero-area triangle) -- exercises the matrix's own
+    // "single-point primitive (min==max) valid" row directly at the
+    // pipeline level (device-free processPrimitive() coverage already
+    // exists for degenerate UVs; this is the degenerate-POSITION analog,
+    // asserted through the real import path so the AABB that lands in
+    // MeshAsset is the one under test, not a synthetic PrimitiveOutput).
+    class MemorySource final : public ByteSource {
+    public:
+        std::optional<std::vector<std::byte>> read(const std::string&) override { return std::nullopt; }
+    };
+    MemorySource source;
+    // POSITION/NORMAL both length-3, all 3 positions identical (5,5,5);
+    // base64 payload = 3x vec3 position (all (5,5,5)) + 3x vec3 normal
+    // (all (0,0,1)) + 3x u16 index (0,1,2), packed tightly then padded.
+    const std::string json = R"({
+        "asset": {"version": "2.0"},
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0}],
+        "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1}, "indices": 2, "mode": 4}]}],
+        "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [5,5,5], "max": [5,5,5]},
+            {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3"},
+            {"bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR"}
+        ],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+            {"buffer": 0, "byteOffset": 36, "byteLength": 36},
+            {"buffer": 0, "byteOffset": 72, "byteLength": 6}
+        ],
+        "buffers": [{"uri": "data:application/octet-stream;base64,AACgQAAAoEAAAKBAAACgQAAAoEAAAKBAAACgQAAAoEAAAKBAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAABAAIA",
+                     "byteLength": 78}]
+    })";
+    std::vector<std::byte> bytes(json.size());
+    std::memcpy(bytes.data(), json.data(), json.size());
+
+    Registry registry;
+    ImportResult result = registry.importGltf(bytes, source, *fixture->pool, *fixture->scheduler);
+    REQUIRE(result.ok());
+    REQUIRE(result.meshes.size() == 1);
+    const MeshAsset& mesh = registry.mesh(result.meshes[0]);
+    REQUIRE(mesh.submeshes.size() == 1);
+    const AABB& b = mesh.submeshes[0].bounds;
+    CHECK(b.isValid());
+    CHECK(b.min.x == doctest::Approx(5.0F));
+    CHECK(b.max.x == doctest::Approx(5.0F));
+    CHECK(b.min.y == doctest::Approx(5.0F));
+    CHECK(b.max.y == doctest::Approx(5.0F));
+    CHECK(b.min.z == doctest::Approx(5.0F));
+    CHECK(b.max.z == doctest::Approx(5.0F));
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 
@@ -1112,5 +1258,163 @@ TEST_CASE("importGltf: a primitive lacking POSITION is skipped (WARN); file-leve
     CHECK(registry.mesh(result.meshes[0]).submeshes.empty());
     // Mesh 1's primitive is valid and imports normally.
     CHECK(registry.mesh(result.meshes[1]).submeshes.size() == 1);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("importGltf: KHR_materials_variants primitive mappings are WARN-logged, base material used [fix round 1]") {
+    auto fixture = makeFixture("import_variants");
+    if (!fixture) {
+        return;
+    }
+    attachPoolAndScheduler(*fixture);
+
+    Registry registry;
+    ImportResult result = registry.importGltf(testAssetDir() + "/cube_variants.gltf", *fixture->pool, *fixture->scheduler);
+    REQUIRE(result.ok());
+    REQUIRE(result.meshes.size() == 1);
+    const MeshAsset& mesh = registry.mesh(result.meshes[0]);
+    REQUIRE(mesh.submeshes.size() == 1);
+    // The primitive's own `material` (index 0, "default_mat") is used
+    // regardless of the 2 variant mappings present (which point at
+    // material 1) -- KHR_materials_variants is log-don't-drop, not
+    // consumed.
+    REQUIRE(result.materials.size() == 2);
+    CHECK(mesh.submeshes[0].material == result.materials[0]);
+    const MaterialAsset& mat = registry.material(result.materials[0]);
+    CHECK(mat.baseColorFactor.r == doctest::Approx(1.0F));  // default_mat is red
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("importGltf: KHR_materials_emissive_strength value is carried AND WARN-logged when != 1.0 [fix round 1]") {
+    auto fixture = makeFixture("import_emissive_strength");
+    if (!fixture) {
+        return;
+    }
+    attachPoolAndScheduler(*fixture);
+
+    Registry registry;
+    ImportResult result =
+        registry.importGltf(testAssetDir() + "/cube_emissive_strength.gltf", *fixture->pool, *fixture->scheduler);
+    REQUIRE(result.ok());
+    REQUIRE(result.materials.size() == 1);
+    const MaterialAsset& mat = registry.material(result.materials[0]);
+    // Carried (free field) -- the WARN itself (fires because 5.0 != 1.0)
+    // is visually confirmed in this binary's own captured log output
+    // (this project has no log-capturing test sink); the fixture's own
+    // non-default value is what makes the WARN's firing condition real
+    // rather than vacuously always-true-or-false.
+    CHECK(mat.emissiveStrength == doctest::Approx(5.0F));
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("importGltf: 3-level nested transform composition (TRS/matrix/TRS mix) matches precomputed world values [fix round 1]") {
+    auto fixture = makeFixture("import_nested_3level");
+    if (!fixture) {
+        return;
+    }
+    attachPoolAndScheduler(*fixture);
+
+    Registry registry;
+    // root(TRS translate 10,0,0) -> child(MATRIX uniform scale x2) ->
+    // grandchild(TRS translate 1,0,0), and the GRANDCHILD (the deepest
+    // node) is the one carrying the mesh -- proving composition survives
+    // more than one level AND a matrix/TRS mix, not just a single-level
+    // TRS-only or matrix-only node (both of which the pre-existing D12
+    // flattening test already covered, but neither at depth > 1).
+    // Precomputed (numpy, this task): world = T(10,0,0) * S(2,2,2) * T(1,0,0);
+    // local (0,0,0) -> world (12,0,0); local (1,0,0) -> (14,0,0); local
+    // (0,1,0) -> (12,2,0).
+    ImportResult result =
+        registry.importGltf(testAssetDir() + "/cube_nested_3level.gltf", *fixture->pool, *fixture->scheduler);
+    REQUIRE(result.ok());
+    REQUIRE(result.scene.instances.size() == 1);
+    const InstanceRecord& inst = result.scene.instances[0];
+
+    const auto worldOf = [&](const glm::vec3& local) { return glm::vec3(inst.worldTransform * glm::vec4(local, 1.0F)); };
+    const glm::vec3 w0 = worldOf({0, 0, 0});
+    const glm::vec3 w1 = worldOf({1, 0, 0});
+    const glm::vec3 w2 = worldOf({0, 1, 0});
+
+    CHECK(w0.x == doctest::Approx(12.0F));
+    CHECK(w0.y == doctest::Approx(0.0F));
+    CHECK(w0.z == doctest::Approx(0.0F));
+    CHECK(w1.x == doctest::Approx(14.0F));
+    CHECK(w1.y == doctest::Approx(0.0F));
+    CHECK(w2.x == doctest::Approx(12.0F));
+    CHECK(w2.y == doctest::Approx(2.0F));
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("importGltf: default-scene-absent (no top-level \"scene\" key, scenes[] non-empty) falls back to scene 0 [fix round 1]") {
+    auto fixture = makeFixture("import_no_default_scene");
+    if (!fixture) {
+        return;
+    }
+    attachPoolAndScheduler(*fixture);
+
+    Registry registry;
+    // cube_no_default_scene.gltf has NO top-level "scene" key at all
+    // (asserted at generation time) -- distinct from the already-tested
+    // "zero scenes" case (scenes[] itself empty). Per the matrix's own
+    // rule this must import scene 0 with an INFO log, not fail.
+    ImportResult result =
+        registry.importGltf(testAssetDir() + "/cube_no_default_scene.gltf", *fixture->pool, *fixture->scheduler);
+    REQUIRE(result.ok());
+    REQUIRE(result.meshes.size() == 1);
+    CHECK(registry.mesh(result.meshes[0]).submeshes.size() == 1);
+    REQUIRE(result.scene.instances.size() == 1);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("importGltf: non-finite (NaN) position via a REAL corrupt glTF fixture is rejected, no crash [fix round 1]") {
+    auto fixture = makeFixture("import_nan_real_fixture");
+    if (!fixture) {
+        return;
+    }
+    attachPoolAndScheduler(*fixture);
+
+    class MemorySource final : public ByteSource {
+    public:
+        std::optional<std::vector<std::byte>> read(const std::string&) override { return std::nullopt; }
+    };
+    MemorySource source;
+    // Device-free coverage (gltf_pipeline_test.cpp) already proves
+    // processPrimitive() itself rejects a synthetic NaN PrimitiveInput;
+    // this is the same defect at the OTHER end of the pipeline -- a real
+    // glTF document whose POSITION accessor data-URI payload contains an
+    // actual IEEE-754 NaN float, read through the real accessor-tools
+    // path, proving the end-to-end wiring (not just the isolated
+    // function) rejects it without crashing. Vertex 1's X coordinate is
+    // NaN (0x7fc00000); the rest of the triangle is otherwise valid.
+    const std::string json = R"({
+        "asset": {"version": "2.0"},
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0}],
+        "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1}, "indices": 2, "mode": 4}]}],
+        "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0,0,0], "max": [0,1,0]},
+            {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3"},
+            {"bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR"}
+        ],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+            {"buffer": 0, "byteOffset": 36, "byteLength": 36},
+            {"buffer": 0, "byteOffset": 72, "byteLength": 6}
+        ],
+        "buffers": [{"uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAADAfwAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAABAAIAAAA=",
+                     "byteLength": 80}]
+    })";
+    std::vector<std::byte> bytes(json.size());
+    std::memcpy(bytes.data(), json.data(), json.size());
+
+    Registry registry;
+    ImportResult result = registry.importGltf(bytes, source, *fixture->pool, *fixture->scheduler);
+    // Whole-file import still SUCCEEDS (the malformed data lives inside
+    // one primitive, not the document structure) -- but that primitive
+    // contributes no submesh.
+    REQUIRE(result.ok());
+    REQUIRE(result.meshes.size() == 1);
+    CHECK(registry.mesh(result.meshes[0]).submeshes.empty());
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }

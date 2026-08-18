@@ -731,6 +731,20 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
                 RX_LOG_WARN("rx_asset: material '{}': {} is parsed but not consumed ({})", dst.name, extName, extra);
             }
         };
+        // [fix round 1] KHR_materials_emissive_strength: the value IS
+        // carried for free (dst.emissiveStrength above, MaterialAsset's
+        // own field) -- but per the shared KHR_materials_* log-don't-drop
+        // criterion, a non-default value must ALSO produce a WARN naming
+        // the material and the value (this project's own row text: "the
+        // value is already in the parsed material if the techniques
+        // phase wants it preserved-in-parameter-set at zero cost" --
+        // "preserved at zero cost" is not the same claim as "logged";
+        // this call is what the log half actually requires, and was
+        // previously missing entirely despite the field being carried).
+        if (src.emissiveStrength != 1.0F) {
+            RX_LOG_WARN("rx_asset: material '{}': KHR_materials_emissive_strength is parsed but not consumed (value={})",
+                        dst.name, src.emissiveStrength);
+        }
         warnExt(src.specular != nullptr, "KHR_materials_specular");
         warnExt(src.ior != 1.5F, "KHR_materials_ior");
         warnExt(src.iridescence != nullptr, "KHR_materials_iridescence");
@@ -802,6 +816,22 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
                         RX_LOG_WARN("rx_asset: mesh {} primitive {}: attribute {} (set >= 1) is present but not consumed", mi, pi, jn);
                     }
                 }
+            }
+
+            // [KHR_materials_variants, log-don't-drop, matrix-issue02 §2B
+            // row -- fix round 1] `Primitive::mappings` is PRIMITIVE-level
+            // (a per-primitive variant->material override list), not
+            // material-level -- it cannot live in the material warnExt
+            // loop above (which only ever sees one Material at a time,
+            // with no notion of which primitive/variant selected it).
+            // The primitive's own `materialIndex` (already the base/
+            // default material per the extension's own spec text) is
+            // used unconditionally; only the WARN is new here.
+            if (!prim.mappings.empty()) {
+                RX_LOG_WARN(
+                    "rx_asset: mesh {} primitive {}: KHR_materials_variants present ({} variant mapping(s)) -- not "
+                    "consumed, the primitive's own default material is used for every variant",
+                    mi, pi, prim.mappings.size());
             }
         }
     }
@@ -965,6 +995,7 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
     MeshRange combinedRange;
     if (!combinedVertices.empty()) {
         combinedRange = pool.upload(combinedVertices, combinedIndices);
+        result.poolUploadCallCountForTesting += 1;
     }
 
     // ================= Assemble MeshAsset per source mesh =================
