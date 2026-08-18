@@ -99,3 +99,35 @@ ctest --preset linux-native --output-on-failure
 ```
 
 The suite includes unit tests for rx_core, rx_platform, rx_rhi_vk, shader compilation, and the headless triangle sample. Interactive `--present` mode is tested manually; see [`MANUAL_VERIFICATION.md`](MANUAL_VERIFICATION.md).
+
+### Windows-cross-zig: verify under Wine locally, not just "it builds"
+
+Any change that touches a binary CI's `windows-cross-zig` job actually **runs**
+(not merely builds) must be verified under Wine locally before it is
+considered green — matching CI's own invocation exactly, not just a build
+check:
+
+```sh
+cmake --preset windows-cross-zig && cmake --build --preset windows-cross-zig
+xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample' --output-on-failure
+```
+
+This is **not** a device-free run: `.github/workflows/ci.yml`'s own comment on
+this step documents that installing lavapipe on the runner gives Wine's
+built-in Vulkan support (`winevulkan`) a real, software Vulkan implementation
+to forward to — so every binary this filter does **not** exclude (notably
+`rx_asset_gltf_gpu_tests.exe`, and any future `*_gpu_tests` binary this
+filter does not add to its exclusion list) constructs a real `VkDevice` and
+exercises real GPU-resource lifetime under Wine, exactly like it does on
+`linux-native`. A prior local-verification gap covered only the binaries that
+are genuinely device-free under Wine (`rx_task_tests.exe`,
+`rx_asset_gltf_tests.exe`, `shader_spirv_test.exe`, `rx_core_tests.exe`,
+`rx_platform_tests.exe`, `rx_shader_tests.exe`) and treated a clean
+`windows-cross-zig` *build* as sufficient for the GPU-backed-but-not-excluded
+binaries — which let a genuine, timing-sensitive lifetime defect in the async
+import pipeline (rx_asset) reach CI-red on both `windows-cross-zig` (Wine)
+and `linux-native` before it was ever exercised under Wine locally (CI run
+32180630087; see `.superpowers/sdd/2026-08-11-phase4-scene-assets/
+wine-segfault-fix-report.md`). Closing that gap: local `windows-cross-zig`
+verification always includes the Wine run above, for every binary the CI
+filter leaves in, not just a build check.
