@@ -678,3 +678,167 @@ rx_add_cached_dependency(
 )
 find_package(draco CONFIG REQUIRED PATHS "${draco_CACHE_DIR}" NO_DEFAULT_PATH)
 set_target_properties(draco::draco PROPERTIES IMPORTED_GLOBAL TRUE)
+
+# ---------------------------------------------------------------------------
+# Phase 4 Stage 1 Task 14 -- KTX2/Basis compressed texture pipeline (spec
+# D10, gate matrix-issue03 as amended by gate/rulings-2026-08-18.md #3).
+#
+# libktx (KTX-Software): CPU-side KTX2 container parse + Basis Universal
+# (ETC1S/UASTC) transcode to block-compressed GPU formats -- upload itself
+# stays this engine's own (rx::rhi::Uploader), per D10. Pinned **v4.4.2**
+# (stable; gate ruling C2, BINDING: v5.0.0 exists only as a release
+# candidate -- v5.0.0-rc2, 2026-08-17 -- a major rework, KTX-Spec-Rev-5,
+# CMake-only; pinning a prerelease would contradict this project's own
+# vendoring discipline. Registry watch item for the v5/Spec-Rev-5
+# transition -- see task-14-report.md).
+#
+# LICENSE [gate ruling #3, BINDING: "Apache-2.0 PLUS the bundled-component
+# licenses actually compiled"] -- verified directly against the pinned
+# tag's own LICENSE.md/LICENSES/ dir and REUSE.toml:
+#   - KTX-Software's own code: Apache License 2.0 (LICENSE.md: "Files
+#     unique to this repository generally fall under the Apache 2.0
+#     license"; NOASSERTION is what GitHub's license-detector reports for
+#     this repo, precisely BECAUSE of the additional bundled licenses
+#     below -- not a licensing gap).
+#   - Basis Universal transcoder AND encoder (external/basisu/LICENSE):
+#     Apache License 2.0 -- both halves are compiled into the exported
+#     `ktx` target regardless (see the "NO DECODE/READ-ONLY BUILD OPTION"
+#     note below), so both are covered here even though this project only
+#     ever CALLS the transcoder half.
+#   - astc-encoder (external/astc-encoder/LICENSE.txt): Apache License
+#     2.0 -- pulled in transitively by KTX_FEATURE_WRITE (the astcenc
+#     static library is unconditionally part of KTX_INSTALL_TARGETS for a
+#     static build, CMakeLists.txt's own `if(NOT BUILD_SHARED_LIBS AND NOT
+#     APPLE) list(APPEND KTX_INSTALL_TARGETS ${ASTCENC_LIB_TARGET})`) even
+#     though this project never selects an ASTC transcode target.
+#   - zstd single-file decoder (external/basisu/zstd/zstd.c, BSD License
+#     per that file's own LICENSE, Copyright Facebook, Inc.): compiled
+#     UNCONDITIONALLY into KTX_MAIN_SRC (CMakeLists.txt:392, not gated by
+#     KTX_FEATURE_WRITE) -- this is the supercompression auto-inflation
+#     path the "Supercompression (zstd/zlib)" matrix row depends on (no
+#     explicit zstd call anywhere in this project's own texture_cache.cpp).
+#   - Ericsson etcdec.cxx (LicenseRef-ETCSLA.txt, a separate non-OSI
+#     Ericsson Software License Agreement) is DELIBERATELY EXCLUDED from
+#     this build via KTX_FEATURE_ETC_UNPACK=OFF below (see that flag's own
+#     comment) -- this project's target formats are BC7/BC5 only (D10;
+#     desktop + Steam Deck both support S3TC/RGTC/BPTC, verified in-task,
+#     never ETC), so the Ericsson license does NOT apply to this vendored
+#     build and is intentionally not carried forward.
+#
+# BUILD-SIZE EVALUATION [gate matrix "parse/transcode-only... encoder OFF",
+# scope summary -- evaluated in-task, both findings below verified directly
+# against the pinned tag's own CMakeLists.txt, mirroring the Draco
+# "NO DECODE-ONLY BUILD OPTION EXISTS" precedent above]:
+#   1. A read/transcode-ONLY target (`ktx_read`, `common_libktx_settings(
+#      ktx_read 0 ${LIB_TYPE})` -- the "0" is enable_write=false, meaning
+#      NO basis_encode.cpp/BASISU_ENCODER_CXX_SRC/writer1.c/writer2.c) DOES
+#      exist inside libktx's own build -- but it is used ONLY by libktx's
+#      own Emscripten/WebGL sub-targets (ktx_js_read,
+#      msc_basis_transcoder_js) and is NEVER added to `KTX_INSTALL_TARGETS`
+#      (`set(KTX_INSTALL_TARGETS ktx)`, CMakeLists.txt, unconditional --
+#      `ktx_read` never appears in that list on any platform). No
+#      `install(EXPORT ...)`/CMake package is ever generated for it, so
+#      `find_package(ktx ...)` (this project's own consumption path, same
+#      as every other dep-cache library) cannot reach it without patching
+#      libktx's own CMakeLists.txt -- and this project's dep-cache has no
+#      patch step (same "no patch step" posture as the Draco encoder
+#      finding above). CONCLUSION: the smaller, read/transcode-only build
+#      is NOT reachable through this project's standard vendoring path;
+#      this is an evaluated-and-verified negative finding, not an omitted
+#      attempt.
+#   2. The exported `ktx` target's own `enable_write` flag is hardcoded
+#      `1` at its `common_libktx_settings(ktx 1 ${LIB_TYPE})` call site --
+#      no CMake option threads through to disable it on the INSTALLED
+#      target. The mitigations actually available and applied instead:
+#      KTX_FEATURE_TOOLS/_TESTS/_DOC/_JNI/_PY=OFF (no CLI/GUI tools, no
+#      test suite, no docs, no language bindings built at all -- toktx
+#      itself is never compiled by this project; committed fixtures are
+#      generated by the official prebuilt toktx release binary per
+#      assets/test/ktx2/generate_fixtures.sh, matching D17's regeneration-
+#      script discipline without paying toktx's own build cost here),
+#      KTX_FEATURE_GL_UPLOAD/_VK_UPLOAD=OFF (D10: "upload stays ours" --
+#      neither this project's own GL-free renderer nor its own Uploader
+#      needs libktx's bundled GL/Vk upload helpers), KTX_FEATURE_ETC_UNPACK=OFF
+#      (see its own comment below).
+#
+# KTX_FEATURE_KTX1 LEFT ON (default) -- EVALUATED AND REVERTED, this task:
+# turning it OFF (this project's texture_cache.cpp calls only
+# `ktxTexture2_*` entry points, D10 is KTX2-first, so KTX 1.0 container
+# support -- lib/texture1.c/h -- looked like pure dead weight) produces an
+# internally INCONSISTENT static `ktx` library at this pinned tag,
+# reproduced directly this task: `lib/texture.c`'s generic
+# `ktxTexture_CreateFromStream`/`ktxTexture_CreateFromMemory` dispatcher
+# (compiled UNCONDITIONALLY, regardless of KTX_FEATURE_KTX1 -- it is the
+# base-class auto-detect entry point, not a KTX1-only one) references
+# `ktxTexture1_constructFromStreamAndHeader` unconditionally in its own
+# object code with NO `#ifdef KTX_FEATURE_KTX1` guard around that call
+# site -- verified directly against the pinned tag's lib/texture.c:336.
+# With KTX_FEATURE_KTX1=OFF, texture1.c (which defines that symbol) is
+# excluded from the source list entirely, leaving a real dangling
+# undefined-symbol reference baked into texture.c.o inside the installed
+# libktx.a -- invisible at libktx's OWN build/install step (nothing there
+# tries to link the archive into an executable), surfacing only once a
+# consumer's own link step pulls texture.c.o in transitively (this
+# project's own rx_asset_gltf_gpu_tests build hit
+# `ld.lld: error: undefined symbol: ktxTexture1_constructFromStreamAndHeader`
+# the first time any target actually linked libktx.a, even though this
+# project's own code never calls the generic dispatcher at all -- static
+# archives link at whole-object-file granularity, and something this
+# project DOES need pulls texture.c.o in alongside it). This project
+# never calls the generic ktxTexture_CreateFromStream/CreateFromMemory
+# dispatcher itself (texture_decode.cpp calls ktxTexture2_CreateFromMemory
+# directly), so the broken code path is never actually EXECUTED -- but an
+# undefined symbol at link time blocks the build regardless of whether the
+# function is ever called at runtime. Reverting KTX_FEATURE_KTX1 to ON
+# (its own documented default) is the minimal fix: texture1.c/h compile
+# back in (real but small dead weight -- nothing in this project's own
+# code references a ktxTexture1 symbol), the dangling reference resolves,
+# and the library links cleanly on every target that needs any part of
+# libktx.a. Recorded here so a future attempt to re-disable this flag
+# does not have to rediscover the same failure from scratch.
+#
+# `ktx::ktx` is the correct namespaced target regardless of platform --
+# `install(EXPORT KTXTargets FILE KtxTargets.cmake NAMESPACE KTX:: ...)`,
+# verified directly against the pinned tag's own CMakeLists.txt (note the
+# namespace is `KTX::`, capitalized, NOT `ktx::` -- verified exactly, a
+# real pitfall this project's own find_package() call below must match).
+set(RX_KTX_TAG "v4.4.2")
+rx_add_cached_dependency(
+  NAME ktx
+  REPO https://github.com/KhronosGroup/KTX-Software.git
+  TAG ${RX_KTX_TAG}
+  CMAKE_ARGS -DKTX_FEATURE_TESTS=OFF -DKTX_FEATURE_TOOLS=OFF -DKTX_FEATURE_DOC=OFF
+             -DKTX_FEATURE_JNI=OFF -DKTX_FEATURE_PY=OFF -DKTX_FEATURE_TOOLS_CTS=OFF
+             -DKTX_FEATURE_GL_UPLOAD=OFF -DKTX_FEATURE_VK_UPLOAD=OFF
+             # Explicit ON (not merely "omitted -> default"): this
+             # dep-cache's own sub-build directory is reused by DEP_NAME
+             # alone (cmake/DepCache.cmake's `_build_dir`, NOT keyed by
+             # the content hash), so a value once cached there from an
+             # EARLIER CMAKE_ARGS combination (this task tried
+             # KTX_FEATURE_KTX1=OFF first, see this file's own comment
+             # above) survives in that reused CMakeCache.txt unless a
+             # later configure passes an explicit -D to override it --
+             # relying on the option()'s own "default ON" is not
+             # sufficient once that cache entry already exists. Passing
+             # -DKTX_FEATURE_KTX1=ON explicitly here is what actually
+             # forces it, regardless of sub-build-directory history.
+             -DKTX_FEATURE_KTX1=ON
+             # Ericsson-licensed lib/etcdec.cxx (LicenseRef-ETCSLA, a
+             # separate non-OSI license) EXCLUDED: this project's transcode
+             # targets are BC7/BC5 only (D10), never ETC -- see this file's
+             # own LICENSE comment above.
+             -DKTX_FEATURE_ETC_UNPACK=OFF
+             -DBUILD_SHARED_LIBS=OFF
+)
+# NOTE the capitalization mismatch [verified directly against this task's
+# own build output]: the dep-cache identity above is lowercase `ktx`
+# (DEP_NAME, matching this project's own all-lowercase third-party naming
+# convention), but the installed CMake package config file is
+# `KtxConfig.cmake` (capital K, verified directly -- KTX-Software's own
+# `write_basic_package_version_file("KtxConfigVersion.cmake" ...)` /
+# `install(FILES ... KtxConfig.cmake ...)` calls use that exact
+# capitalization), so `find_package()` must be called with `Ktx` (matching
+# CMake's own <PackageName>Config.cmake resolution rule) or it silently
+# fails to locate a real, successfully-installed package.
+find_package(Ktx CONFIG REQUIRED PATHS "${ktx_CACHE_DIR}" NO_DEFAULT_PATH)
+set_target_properties(KTX::ktx PROPERTIES IMPORTED_GLOBAL TRUE)
