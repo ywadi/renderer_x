@@ -1511,7 +1511,17 @@ int runHeadless(bool enableValidation) {
         // flight cycle (kHeadlessTotalFrames + kSlotCount iterations), so
         // each iteration is a genuine rendered frame in its own right.
         RX_FRAME_MARK;
-        frameSync->advanceFrame();
+        // [Phase 4 closure-sweep item 3] `&*allocator` -- not the bare
+        // no-arg call every pre-Task-10 call site used -- wires this
+        // sample into FrameSync::advanceFrame(Allocator*)'s "once per
+        // frame, natural home" budget-refresh call (frame_sync.h's own
+        // comment on the `allocatorForBudgetRefresh` argument): this
+        // sample is the streaming/eviction sample, the natural real
+        // consumer of a LIVE memory report, previously only mechanism-
+        // tested (memory_budget_test.cpp) and never exercised by a
+        // running sample. See the pass/fail summary below for the
+        // discriminating proof this actually fired.
+        frameSync->advanceFrame(&*allocator);
     }
 
     if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
@@ -1541,6 +1551,46 @@ int runHeadless(bool enableValidation) {
     }
     RX_LOG_INFO("sample_04_streaming: {} / {} logical textures observed resident at some point",
                 kTextureCount - missingCount, kTextureCount);
+
+    // [Phase 4 closure-sweep item 3] Proves the `&*allocator` wiring above
+    // is actually live in this running sample, not merely mechanism-tested
+    // (src/rx_rhi_vk/tests/memory_budget_test.cpp's own "FrameSync::
+    // advanceFrame(Allocator*) wiring" case). Two checks, same reasoning
+    // as that test:
+    //   (a) THE discriminating signal -- Allocator::setCurrentFrameIndexCallCount(),
+    //       incremented unconditionally inside setCurrentFrameIndex()
+    //       itself (buffer.cpp), independent of what any driver reports --
+    //       must equal exactly kHeadlessTotalFrames, the number of real
+    //       (non-drain) rendered frames this loop advanced. Comparing
+    //       report()'s own budget/usage numbers before/after would NOT be
+    //       discriminating: a quiet driver can report the same number
+    //       whether or not the refresh call ever fired (see that test's
+    //       own comment on why a revert of setCurrentFrameIndex() to a
+    //       no-op still passed a naive "budget changed" check).
+    //   (b) A logged-once line showing report()'s own live per-heap
+    //       budget is genuinely nonzero -- corroborating evidence for a
+    //       human/CI-log reader, not itself the discriminating proof.
+    const uint64_t budgetRefreshCalls = allocator->setCurrentFrameIndexCallCount();
+    if (budgetRefreshCalls != kHeadlessTotalFrames) {
+        RX_LOG_ERROR(
+            "sample_04_streaming: FrameSync::advanceFrame(Allocator*) budget-refresh wiring fired {} "
+            "time(s), expected exactly {} (one per rendered frame)",
+            budgetRefreshCalls, kHeadlessTotalFrames);
+        pass = false;
+    }
+    const rx::rhi::RxMemoryReport memReport = allocator->report();
+    uint64_t liveBudgetBytes = 0;
+    for (const auto& heap : memReport.heaps) {
+        liveBudgetBytes = std::max(liveBudgetBytes, static_cast<uint64_t>(heap.budgetBytes));
+    }
+    if (liveBudgetBytes == 0) {
+        RX_LOG_ERROR("sample_04_streaming: live memory report shows a zero budget across every heap");
+        pass = false;
+    }
+    RX_LOG_INFO(
+        "sample_04_streaming: FrameSync-driven budget refresh live -- {} setCurrentFrameIndex() call(s), "
+        "max heap budget {} bytes ({})",
+        budgetRefreshCalls, liveBudgetBytes, rx::rhi::memoryBudgetSourceName(memReport.budgetSource));
 
     if (enableValidation && context->hasValidationErrors()) {
         RX_LOG_ERROR("Vulkan validation layer reported errors during this run");
@@ -1849,7 +1899,9 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode) {
         // spec D3] -- present-mode path; see the headless loop above for
         // this sample's other frame boundary.
         RX_FRAME_MARK;
-        frameSync->advanceFrame();
+        // [Phase 4 closure-sweep item 3] Same `&*allocator` wiring as the
+        // headless loop above -- see that call site's own comment.
+        frameSync->advanceFrame(&*allocator);
     }
 
     vkDeviceWaitIdle(vkDevice);
