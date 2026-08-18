@@ -1,0 +1,2753 @@
+=== COMMITS ===
+9bd5be2 feat: renderer-wide memory budget, accounting & eviction-invariant foundation (#27)
+
+=== STAT ===
+ docs/threading.md                               |  11 +
+ src/rx_rhi_vk/CMakeLists.txt                    |  19 +-
+ src/rx_rhi_vk/include/rx_rhi_vk/buffer.h        | 204 ++++++++++++++++--
+ src/rx_rhi_vk/include/rx_rhi_vk/device.h        |  14 ++
+ src/rx_rhi_vk/include/rx_rhi_vk/frame_sync.h    |  19 +-
+ src/rx_rhi_vk/include/rx_rhi_vk/memory_report.h | 266 ++++++++++++++++++++++++
+ src/rx_rhi_vk/include/rx_rhi_vk/texture.h       |  35 +++-
+ src/rx_rhi_vk/src/buffer.cpp                    | 242 +++++++++++++++++++--
+ src/rx_rhi_vk/src/device.cpp                    |  27 +++
+ src/rx_rhi_vk/src/frame_sync.cpp                |  13 ++
+ src/rx_rhi_vk/src/memory_report.cpp             | 112 ++++++++++
+ src/rx_rhi_vk/src/texture.cpp                   |  38 +++-
+ src/rx_rhi_vk/src/upload.cpp                    |   9 +-
+ src/rx_rhi_vk/tests/eviction_contract_test.cpp  | 175 ++++++++++++++++
+ src/rx_rhi_vk/tests/memory_budget_test.cpp      | 236 +++++++++++++++++++++
+ src/rx_rhi_vk/tests/memory_report_test.cpp      | 207 ++++++++++++++++++
+ src/rx_rhi_vk/tests/oom_handling_test.cpp       | 234 +++++++++++++++++++++
+ 17 files changed, 1813 insertions(+), 48 deletions(-)
+
+=== FULL DIFF (U10) ===
+diff --git a/docs/threading.md b/docs/threading.md
+index c2138ab..0df94e3 100644
+--- a/docs/threading.md
++++ b/docs/threading.md
+@@ -53,20 +53,31 @@ and compiles to nothing at all when it is OFF:
+ - **`rx::material::MaterialSystem`** — `loadMaterial()`/`getPipeline()`/
+   `reloadChanged()`/`bindInstance()` **[guarded, all four]** (and every
+   other method on this type — it is not internally synchronized at all,
+   matching `rx::graph::RenderGraph`/`Executor`'s existing scoping)
+   (`src/rx_material/include/rx_material/material_system.h`)
+ - **`rx::rhi::DeletionQueue`** — `retire()` **[guarded]**/
+   `onFrameFenceSignaled()`/`flushAll()` (not guarded — the per-frame
+   drain and shutdown paths, out of this fix round's scope; `retire()` is
+   the one enqueue-style mutator a chunk >= 1 caller could plausibly reach
+   mid-frame) (`src/rx_rhi_vk/include/rx_rhi_vk/deletion_queue.h`)
++- **`rx::rhi::Allocator`** [Phase 4 Task 10, spec D24] —
++  `setCurrentFrameIndex()`/`report()` (not guarded — no shared mutable
++  state a chunk >= 1 caller could corrupt, since `MemoryAccounting`'s own
++  counters are atomic; the main-thread-only convention here is about
++  matching every other Allocator/Buffer/Texture2D GPU-object-mutation
++  entry point's existing scoping, not a new hazard) — call
++  `setCurrentFrameIndex()` once per frame (`FrameSync::advanceFrame()`
++  does this automatically when passed this Allocator's address) so
++  `report()`'s per-heap budget numbers stay fresh (see `memory_report.h`'s
++  own comment on the `vmaSetCurrentFrameIndex()` staleness rule).
++  (`src/rx_rhi_vk/include/rx_rhi_vk/buffer.h`)
+ - **`rx::asset::GeometryPool`** (future, Stage 1) — suballocation is a
+   main-thread-owned `VmaVirtualBlock` operation, same rationale as the
+   four above. Not guarded — does not exist yet.
+ - **`rx::scene::*Manager` registries** (future, Stage 2) —
+   `RenderableManager`/`TransformManager`/`LightManager` mutation
+   (create/set/destroy) stays main-thread-only; read-only SoA traversal for
+   culling (below) does not. Not guarded — does not exist yet.
+ - **`rx::task::Scheduler`** — `pumpMain()` **[guarded]** [audit finding
+   F5-partial]: runs whatever GPU-object-mutating closures `postToMain()`
+   queued (the handoff pattern below), so it carries the identical
+diff --git a/src/rx_rhi_vk/CMakeLists.txt b/src/rx_rhi_vk/CMakeLists.txt
+index fb95678..30d483a 100644
+--- a/src/rx_rhi_vk/CMakeLists.txt
++++ b/src/rx_rhi_vk/CMakeLists.txt
+@@ -19,43 +19,46 @@ add_library(rx_rhi_vk STATIC
+     src/command.cpp
+     src/frame_sync.cpp
+     src/pipeline_layout.cpp
+     src/bindless.cpp
+     src/upload.cpp
+     src/deletion_queue.cpp
+     src/texture.cpp
+     src/mesh_buffers.cpp
+     src/descriptor_arena.cpp
+     src/tracy_gpu.cpp
++    src/memory_report.cpp
+     src/vma_impl.cpp
+     src/stb_impl.cpp
+     ${volk_SOURCE_DIR}/volk.c
+ )
+ target_include_directories(rx_rhi_vk PUBLIC include ${volk_SOURCE_DIR} ${vma_SOURCE_DIR}/include ${stb_SOURCE_DIR})
+ # rx_shader_layout_types (defined in src/rx_shader/CMakeLists.txt) is a
+ # header-only INTERFACE target exposing ONLY rx_shader's plain-data
+ # shader_layout_info.h -- never `rx_shader` itself, which would drag
+ # slang::slang (a real link dependency, plus every other rx_shader header)
+ # into this library. See pipeline_layout.h's own comment for why
+ # PipelineLayoutBuilder needs `rx::shader::ShaderLayoutInfo` without any of
+ # that.
+ target_link_libraries(rx_rhi_vk PUBLIC rx_core vk-bootstrap::vk-bootstrap rx_shader_layout_types)
+ target_compile_definitions(rx_rhi_vk PUBLIC VK_NO_PROTOTYPES)
+ 
+-# Eleven test translation units now (context_test.cpp, device_test.cpp,
++# Fifteen test translation units now (context_test.cpp, device_test.cpp,
+ # buffer_test.cpp, clear_color_test.cpp, frame_sync_test.cpp,
+ # pipeline_layout_test.cpp, bindless_test.cpp, upload_test.cpp,
+-# deletion_queue_test.cpp, texture_test.cpp, descriptor_arena_test.cpp), so
+-# -- like rx_core_tests, and unlike this target before device_test.cpp
+-# existed -- doctest's runtime/main is implemented once in a dedicated
+-# tests/doctest_main.cpp shared by all eleven, rather than in any one test
+-# file. doctest_main.cpp also links rx_platform: it uses rx::platform::Window
++# deletion_queue_test.cpp, texture_test.cpp, descriptor_arena_test.cpp,
++# memory_report_test.cpp, memory_budget_test.cpp, oom_handling_test.cpp,
++# eviction_contract_test.cpp [Phase 4 Task 10]), so -- like rx_core_tests,
++# and unlike this target before device_test.cpp existed -- doctest's
++# runtime/main is implemented once in a dedicated tests/doctest_main.cpp
++# shared by all fifteen, rather than in any one test file. doctest_main.cpp
++# also links rx_platform: it uses rx::platform::Window
+ # to warm up a real vk-bootstrap hazard before any TEST_CASE runs (see the
+ # comment there) -- so test order here is not load-bearing, deliberately; no
+ # --order-by is needed on the add_test line below. clear_color_test.cpp,
+ # pipeline_layout_test.cpp, bindless_test.cpp, deletion_queue_test.cpp, and
+ # descriptor_arena_test.cpp in particular are pure headless (no window/
+ # surface/swapchain) and rely on that warm-up to be safe regardless of where
+ # doctest schedules them relative to the windowed tests -- see the Phase 2
+ # plan's Global Constraints on the vk-bootstrap landmine:
+ # pipeline_layout_test.cpp, bindless_test.cpp, deletion_queue_test.cpp, and
+ # descriptor_arena_test.cpp each build their own headless device, and joining
+@@ -70,16 +73,20 @@ add_executable(rx_rhi_vk_tests
+     tests/device_test.cpp
+     tests/buffer_test.cpp
+     tests/clear_color_test.cpp
+     tests/frame_sync_test.cpp
+     tests/pipeline_layout_test.cpp
+     tests/bindless_test.cpp
+     tests/upload_test.cpp
+     tests/deletion_queue_test.cpp
+     tests/texture_test.cpp
+     tests/descriptor_arena_test.cpp
++    tests/memory_report_test.cpp
++    tests/memory_budget_test.cpp
++    tests/oom_handling_test.cpp
++    tests/eviction_contract_test.cpp
+ )
+ target_link_libraries(rx_rhi_vk_tests PRIVATE rx_rhi_vk rx_platform doctest::doctest)
+ add_test(NAME rx_rhi_vk_tests COMMAND rx_rhi_vk_tests)
+ # Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+ # (windows-cross Wine hang, run 31512073559).
+ set_tests_properties(rx_rhi_vk_tests PROPERTIES TIMEOUT 120)
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h b/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h
+index c62d3ff..f5b2dae 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/buffer.h
+@@ -26,20 +26,22 @@
+ //
+ // Both macros are defined here, above the only #include of
+ // <vk_mem_alloc.h> in this pair of headers, per VMA's own requirement that
+ // they be visible to every translation unit that includes the header
+ // (declarations here, VMA_IMPLEMENTATION in src/vma_impl.cpp -- see that
+ // file for why it must be the only VMA_IMPLEMENTATION TU in the program).
+ #define VMA_STATIC_VULKAN_FUNCTIONS 0
+ #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
+ #include <vk_mem_alloc.h>
+ 
++#include <rx_rhi_vk/memory_report.h>
++#include <memory>
+ #include <optional>
+ 
+ namespace rx::rhi {
+ 
+ class Context;
+ class Device;
+ 
+ // A single VkBuffer + VmaAllocation, allocated host-visible and
+ // persistently mapped (VMA_ALLOCATION_CREATE_MAPPED_BIT) by
+ // Allocator::createHostVisibleBuffer(). Move-only RAII: destroys both via
+@@ -73,20 +75,30 @@ public:
+     // the staging ring entirely. Always false for a Buffer created by
+     // createHostVisibleBuffer() (that factory never requests the
+     // ALLOW_TRANSFER_INSTEAD_BIT preference in the first place -- see its
+     // own comment) regardless of what its real memory type happens to be;
+     // this is a deliberate, hardcoded false, not a measurement, precisely
+     // so a test can force the non-direct branch deterministically without
+     // depending on any specific hardware's classification (see
+     // upload_test.cpp).
+     bool directPathCapable() const { return directPathCapable_; }
+ 
++    // [Phase 4 Task 10, spec D24(a)] The category this Buffer's allocated
++    // bytes are attributed to in whichever MemoryAccounting ledger created
++    // it -- see memory_report.h. `allocatedBytes()` is the real VMA-
++    // reported allocation size (VmaAllocationInfo::size, which may be
++    // larger than size() due to alignment/block-granularity padding) --
++    // the exact byte count record()'d at creation and release()'d at
++    // destruction, so the two always net to zero.
++    MemoryCategory category() const { return category_; }
++    VkDeviceSize allocatedBytes() const { return allocatedBytes_; }
++
+     // Wraps vmaFlushAllocation()/vmaInvalidateAllocation() -- the API gap
+     // flagged by Phase 1 Task 3's review: that task's readback test had no
+     // way to reach the underlying VmaAllocation to invalidate it, and had
+     // to fall back to verifying (once, as a test precondition) that every
+     // HOST_VISIBLE memory type on the device was also HOST_COHERENT
+     // instead. These two calls close that gap for real.
+     //
+     // Call flush() after writing to mappedData() whenever the GPU will
+     // read those bytes next (e.g. this Buffer is about to be used as a
+     // vkCmdCopyBuffer/vkCmdCopyBufferToImage source). Call invalidate()
+@@ -108,66 +120,136 @@ public:
+     // (default-constructed or moved-from). Logs (RX_LOG_ERROR) and
+     // otherwise no-ops on the rare underlying VkResult failure.
+     void flush(VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE) const;
+     void invalidate(VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE) const;
+ 
+ private:
+     friend class Allocator;
+ 
+     Buffer() = default;
+     Buffer(VmaAllocator allocator, VkBuffer buffer, VmaAllocation allocation, void* mappedData, VkDeviceSize size,
+-           bool directPathCapable = false)
++           bool directPathCapable = false, std::shared_ptr<MemoryAccounting> accounting = nullptr,
++           MemoryCategory category = MemoryCategory::Internal, VkDeviceSize allocatedBytes = 0)
+         : allocator_(allocator),
+           buffer_(buffer),
+           allocation_(allocation),
+           mappedData_(mappedData),
+           size_(size),
+-          directPathCapable_(directPathCapable) {}
++          directPathCapable_(directPathCapable),
++          accounting_(std::move(accounting)),
++          category_(category),
++          allocatedBytes_(allocatedBytes) {}
+ 
+     void destroyAll();
+ 
+     VmaAllocator allocator_ = VK_NULL_HANDLE;
+     VkBuffer buffer_ = VK_NULL_HANDLE;
+     VmaAllocation allocation_ = VK_NULL_HANDLE;
+     void* mappedData_ = nullptr;
+     VkDeviceSize size_ = 0;
+     bool directPathCapable_ = false;
++
++    // [Phase 4 Task 10] Category-attributed accounting (D24(a)) -- a
++    // Buffer holds its own shared_ptr to the ledger it recorded into so
++    // release() on destruction is correct even if the owning Allocator has
++    // since moved (the shared_ptr, not the Allocator object's own
++    // lifetime, is what the ledger's survival depends on). Null for a
++    // default-constructed or moved-from Buffer -- destroyAll() guards on
++    // buffer_ != VK_NULL_HANDLE before touching it, same as every other
++    // teardown here.
++    std::shared_ptr<MemoryAccounting> accounting_;
++    MemoryCategory category_ = MemoryCategory::Internal;
++    VkDeviceSize allocatedBytes_ = 0;
+ };
+ 
+ // Owns a VmaAllocator built against a specific VkInstance/VkPhysicalDevice/
+ // VkDevice triple. Move-only RAII: destroys the underlying VmaAllocator via
+ // vmaDestroyAllocator on destruction or move-assignment.
+ class Allocator {
+ public:
+     Allocator(Allocator&&) noexcept;
+     Allocator& operator=(Allocator&&) noexcept;
+     Allocator(const Allocator&) = delete;
+     Allocator& operator=(const Allocator&) = delete;
+     ~Allocator();
+ 
+     // Convenience overload for the common case: builds against the
+     // VkInstance/VkPhysicalDevice/VkDevice a Context+Device already own.
+     // Delegates to createRaw() below -- both share one implementation.
+-    static std::optional<Allocator> create(Context& context, Device& device);
++    // `VK_EXT_memory_budget` enablement is NOT a parameter here: it is
++    // pulled from `device.memoryBudgetExtensionEnabled()` automatically
++    // (device.h), which is itself set opportunistically at Device::create()
++    // time -- the two must stay in lockstep (VMA asserts otherwise, see
++    // createRaw()'s own comment), and this overload is what keeps them so
++    // for every ordinary caller. `forcedHeapSizeLimitBytes` is a TEST-ONLY
++    // escape hatch (default VK_WHOLE_SIZE = no limit): forwarded verbatim
++    // to createRaw() -- see that function's own comment for what it does
++    // and why [Phase 4 Task 10, D24(d) OOM-path testing].
++    static std::optional<Allocator> create(Context& context, Device& device,
++                                            VkDeviceSize forcedHeapSizeLimitBytes = VK_WHOLE_SIZE);
+ 
+     // Builds a VmaAllocator directly from raw handles, with no dependency
+     // on rx::rhi::Context/Device -- e.g. for tooling or tests that want an
+     // allocator without constructing either.
+-    static std::optional<Allocator> createRaw(VkPhysicalDevice physicalDevice, VkDevice device, VkInstance instance);
++    //
++    // `memoryBudgetExtensionEnabled` [Phase 4 Task 10, spec D24(b), gate
++    // ruling #27]: pass true ONLY if `VK_EXT_memory_budget` was actually
++    // enabled on `device` at logical-device-creation time (Device::create()
++    // does this opportunistically via `enable_extension_if_present()` --
++    // see device.cpp). This flag and
++    // `VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT` are kept in LOCKSTEP
++    // internally: passing true when the extension was NOT really enabled on
++    // `device` trips VMA's own `VMA_ASSERT` (vk_mem_alloc.h:13365-13368,
++    // verified against the vendored 3.4.0 source) the first time any budget
++    // query runs. When true, `report()` below reports
++    // MemoryBudgetSource::RealExtension and its per-heap `budgetBytes`
++    // comes from the real `vmaGetHeapBudgets()` driver query; when false,
++    // MemoryBudgetSource::HeapSizeFallback and `budgetBytes` is this
++    // engine's own `VkMemoryHeap::size` estimate instead (matrix-issue27
++    // row 2's exact fallback wording -- deliberately NOT VMA's own internal
++    // 80%-of-heap-size heuristic, which is an unversioned VMA implementation
++    // detail this engine does not want a silent dependency on).
++    //
++    // `forcedHeapSizeLimitBytes` [Phase 4 Task 10, D24(d) OOM-path testing]:
++    // TEST-ONLY. When not VK_WHOLE_SIZE (the default -- no limit), every
++    // memory heap on `physicalDevice` is capped to this many bytes via
++    // `VmaAllocatorCreateInfo::pHeapSizeLimit` (VMA's own documented,
++    // host-side "test how your program behaves with limited memory"
++    // mechanism -- vk_mem_alloc.h's `\\page heap_memory_limit` docs) --
++    // deterministically forces `VK_ERROR_OUT_OF_DEVICE_MEMORY` on the next
++    // allocation that would exceed it, with NO dependency on actually
++    // exhausting real GPU memory or on any specific driver's
++    // overallocation behavior. This is the "tiny mock/--budget-override
++    // allocator ceiling" the plan's own Task 10 steps call for
++    // (matrix-issue27 rows 6-9) -- see oom_handling_test.cpp.
++    static std::optional<Allocator> createRaw(VkPhysicalDevice physicalDevice, VkDevice device, VkInstance instance,
++                                               bool memoryBudgetExtensionEnabled = false,
++                                               VkDeviceSize forcedHeapSizeLimitBytes = VK_WHOLE_SIZE);
+ 
+     // Allocates a VkBuffer with `usage`, backed by host-visible, persistently
+     // mapped memory (VMA_MEMORY_USAGE_AUTO +
+     // VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+     // VMA_ALLOCATION_CREATE_MAPPED_BIT) -- suitable for CPU-written,
+     // GPU-read data such as vertex/index/uniform buffers updated every
+-    // frame. Returns std::nullopt on any failure (logged via RX_LOG_ERROR).
+-    std::optional<Buffer> createHostVisibleBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
++    // frame. `category` [Phase 4 Task 10, D24(a)] attributes this
++    // allocation's bytes in the accounting ledger `report()` reads --
++    // defaults to MemoryCategory::Internal for callers that don't yet
++    // categorize themselves (this default is deliberately generic, not a
++    // guess: a caller that legitimately knows its role, e.g. Uploader's
++    // staging ring buffer below, passes its real category explicitly).
++    // Returns std::nullopt on any failure (logged via RX_LOG_ERROR); on
++    // VK_ERROR_OUT_OF_DEVICE_MEMORY specifically, the failure is
++    // additionally classified and report-attached -- see
++    // lastAllocationFailureKind()/lastAllocationFailureReport() below
++    // [D24(d)].
++    std::optional<Buffer> createHostVisibleBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
++                                                   MemoryCategory category = MemoryCategory::Internal);
+ 
+     // Allocates a VkBuffer with `usage` -- intended for a real
+     // device-consuming role (VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+     // _INDEX_BUFFER_BIT, _STORAGE_BUFFER_BIT, ...; TRANSFER_DST_BIT alone
+     // does NOT count, see below) -- via VMA_MEMORY_USAGE_AUTO +
+     // VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+     // VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT |
+     // VMA_ALLOCATION_CREATE_MAPPED_BIT -- the real ReBAR-aware
+     // direct-upload pattern [R:C1], applied to the actual destination
+     // resource rather than a staging buffer (see the CRITICAL fix note
+@@ -215,56 +297,152 @@ public:
+     // measurement -- see `src/rx_rhi_vk/tests/upload_test.cpp`.
+     //
+     // On a ReBAR-enabled desktop GPU or unified-memory APU, this resolves
+     // to memory that is BOTH DEVICE_LOCAL and HOST_VISIBLE
+     // (`Buffer::directPathCapable()` true, `mappedData()` non-null) --
+     // callers (rx::rhi::Uploader::uploadToBuffer(), rx::rhi::MeshBuffers)
+     // can then write directly into it and skip a staging copy entirely.
+     // Everywhere else it resolves to plain DEVICE_LOCAL-only memory
+     // (`directPathCapable()` false, `mappedData()` null -- VMA does not
+     // map memory it cannot map), identical to this method's behavior
+-    // before this task's Critical review fix. Returns std::nullopt on any
+-    // failure (logged via RX_LOG_ERROR).
+-    std::optional<Buffer> createDeviceLocalBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
++    // before this task's Critical review fix. `category` [Phase 4 Task 10,
++    // D24(a)] -- see createHostVisibleBuffer()'s own comment above; same
++    // default and same rationale. Returns std::nullopt on any failure
++    // (logged via RX_LOG_ERROR); OOM-classified/report-attached on
++    // VK_ERROR_OUT_OF_DEVICE_MEMORY specifically [D24(d)].
++    std::optional<Buffer> createDeviceLocalBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
++                                                   MemoryCategory category = MemoryCategory::Internal);
+ 
+     // Allocates a VkBuffer with `usage` (typically just
+     // VK_BUFFER_USAGE_TRANSFER_SRC_BIT -- this is always a copy *source*,
+     // never a real destination resource) via VMA_MEMORY_USAGE_AUTO +
+     // VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+     // VMA_ALLOCATION_CREATE_MAPPED_BIT -- always resolves to plain
+     // HOST_VISIBLE memory, exactly VMA's own "Simple staging buffer"
+     // pattern [R:C1]. The resulting Buffer's directPathCapable() is
+     // always false: a TRANSFER_SRC-only usage can never make
+     // ContainsDeviceAccess() true (see createDeviceLocalBuffer()'s own
+     // comment above), so there is no point requesting
+     // ALLOW_TRANSFER_INSTEAD_BIT here at all -- an earlier version of this
+     // method did, and it was structurally inert (this task's own Critical
+     // review finding: the flag never changed which memory type this
+     // buffer landed in, on any hardware). rx::rhi::Uploader's internal
+     // staging ring buffer is exactly this: a plain, always-staging
+     // resource; the direct-upload optimization belongs on the
+-    // *destination* (createDeviceLocalBuffer() above), not here. Returns
+-    // std::nullopt on any failure (logged).
+-    std::optional<Buffer> createUploadRingBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
++    // *destination* (createDeviceLocalBuffer() above), not here. `category`
++    // [Phase 4 Task 10, D24(a)] defaults to MemoryCategory::Staging -- this
++    // buffer IS the staging ring, by construction, so unlike the two
++    // factories above there is no honest "uncategorized" default here;
++    // Uploader::create() (upload.cpp) relies on this default rather than
++    // passing it explicitly. Returns std::nullopt on any failure (logged);
++    // OOM-classified/report-attached on VK_ERROR_OUT_OF_DEVICE_MEMORY
++    // specifically [D24(d)].
++    std::optional<Buffer> createUploadRingBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
++                                                  MemoryCategory category = MemoryCategory::Staging);
+ 
+     // Raw VmaAllocator handle -- needed by rx::rhi::Texture2D::create()
+     // (texture.h, a separate header/TU) to call vmaCreateImage/
+     // vmaDestroyImage directly, mirroring what this Allocator's own
+     // createHostVisibleBuffer()/createDeviceLocalBuffer() do internally
+     // for buffers. Deliberately not wrapped in an Allocator::createImage()
+     // method here: that would make buffer.h/buffer.cpp know about
+     // Texture2D (format-feature queries, mip-level computation), which
+     // belongs entirely in texture.h/texture.cpp instead. Not intended for
+     // ordinary callers -- prefer the create*Buffer() methods above for
+     // buffers, and Texture2D::create() for images.
+     VmaAllocator raw() const { return allocator_; }
+ 
++    // Shared accounting ledger this Allocator's own create*Buffer()
++    // methods record into -- exposed so rx::rhi::Texture2D::create()
++    // (texture.h/.cpp, a separate TU that already takes `Allocator&`) can
++    // record()/release() into the SAME ledger `report()` below reads,
++    // without texture.cpp needing to befriend or duplicate any of this
++    // class's internals. Not intended for ordinary callers.
++    const std::shared_ptr<MemoryAccounting>& accounting() const { return accounting_; }
++
++    // [Phase 4 Task 10, spec D24(c)] Snapshots the current category ledger
++    // (accounting()) plus a fresh vmaGetHeapBudgets() query into one
++    // RxMemoryReport, and pushes each field to a named Tracy plot as a side
++    // effect (D24(c): "feeding HUD + Tracy plots") -- see buffer.cpp for
++    // the exact per-heap budgetBytes computation (RealExtension vs
++    // HeapSizeFallback). Cheap enough to call every frame (vmaGetHeapBudgets
++    // itself is documented O(1) -- vk_mem_alloc.h:18103-18106) but ONLY
++    // fresh if setCurrentFrameIndex() below has been kept current -- see
++    // that method's own comment for why.
++    RxMemoryReport report() const;
++
++    // [Phase 4 Task 10, gate ruling #27, matrix-issue27 row 3] Thin wrapper
++    // over vmaSetCurrentFrameIndex(). MUST be called once per rendered
++    // frame for report()'s per-heap usage/budget numbers (when
++    // MemoryBudgetSource::RealExtension) to stay fresh: verified directly
++    // against the vendored VMA 3.4.0 source that the real
++    // VK_EXT_memory_budget driver query only re-fires when this is called,
++    // or lazily once 30 allocate/free operations have accumulated since the
++    // last fetch (vk_mem_alloc.h:14787) -- a scene that goes many frames
++    // without a single VMA alloc/free would otherwise report a stale
++    // budget the whole time. FrameSync::advanceFrame() (frame_sync.h/.cpp)
++    // is the wired, once-per-frame call site: pass this Allocator's
++    // address to advanceFrame() and it calls this automatically; calling
++    // it directly is also fine for a caller that doesn't use FrameSync.
++    // No-op cost when MemoryBudgetSource::HeapSizeFallback (VMA's own
++    // non-extension budget path recomputes fresh on every
++    // vmaGetHeapBudgets() call regardless, per the same source read) --
++    // safe to call unconditionally either way.
++    void setCurrentFrameIndex(uint32_t frameIndex);
++
++    // [Phase 4 Task 10, spec D24(d)] What kind of failure the MOST RECENT
++    // createHostVisibleBuffer()/createDeviceLocalBuffer()/
++    // createUploadRingBuffer() call ended in (AllocationFailureKind::None
++    // if it succeeded, or hasn't been called yet). `lastAllocationFailureReport()`
++    // is the RxMemoryReport snapshot captured at the exact moment of that
++    // failure -- the "report attached" half of "loud, named failure with
++    // the report attached" (both are also inlined into the RX_LOG_ERROR
++    // line itself via summarizeMemoryReport(), memory_report.h). Texture2D::
++    // create()'s vmaCreateImage failure path (texture.cpp) updates these
++    // same two via noteAllocationFailure() below; its DIFFERENT
++    // vkCreateImageView failure class deliberately does NOT (see
++    // noteNonMemoryFailure() below) -- matrix-issue27 row 9's "these two
++    // failure paths must be distinguishable" requirement.
++    AllocationFailureKind lastAllocationFailureKind() const { return lastFailureKind_; }
++    const RxMemoryReport& lastAllocationFailureReport() const { return lastFailureReport_; }
++
++    // Classifies `result`, snapshots report() into lastAllocationFailureReport(),
++    // and logs one RX_LOG_ERROR naming `siteName`/the classified kind/
++    // `category`/the report summary -- the single formatting implementation
++    // every one of createHostVisibleBuffer()/createDeviceLocalBuffer()/
++    // createUploadRingBuffer()/Texture2D::create()'s vmaCreateImage branch
++    // calls on failure, so the "loud, named, report-attached" log shape
++    // (D24(d)) can never drift between call sites. Public so texture.cpp
++    // (which only holds an `Allocator&`, not friendship) can call it too.
++    void noteAllocationFailure(const char* siteName, MemoryCategory category, VkResult result);
++
++    // [Phase 4 Task 10, matrix-issue27 row 9] For a failure class that is
++    // NOT a memory-budget event -- today, only Texture2D::create()'s
++    // vkCreateImageView failure (a device/API-misuse-class error, distinct
++    // from the vmaCreateImage failure two lines earlier in that same
++    // function, which DOES go through noteAllocationFailure() above).
++    // Logs a clearly-labeled RX_LOG_ERROR naming `siteName`/`result` but
++    // deliberately does NOT touch lastAllocationFailureKind()/
++    // lastAllocationFailureReport() or the accounting ledger -- exactly
++    // what keeps the two failure classes distinguishable to a caller
++    // inspecting Allocator state after either.
++    void noteNonMemoryFailure(const char* siteName, VkResult result);
++
+ private:
+     Allocator() = default;
+-    explicit Allocator(VmaAllocator allocator) : allocator_(allocator) {}
++    explicit Allocator(VmaAllocator allocator, VkPhysicalDevice physicalDevice, MemoryBudgetSource budgetSource)
++        : allocator_(allocator),
++          physicalDevice_(physicalDevice),
++          budgetSource_(budgetSource),
++          accounting_(std::make_shared<MemoryAccounting>()) {}
+ 
+     void destroyAll();
+ 
+     VmaAllocator allocator_ = VK_NULL_HANDLE;
++    VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
++    MemoryBudgetSource budgetSource_ = MemoryBudgetSource::HeapSizeFallback;
++    std::shared_ptr<MemoryAccounting> accounting_;
++    AllocationFailureKind lastFailureKind_ = AllocationFailureKind::None;
++    RxMemoryReport lastFailureReport_;
+ };
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/device.h b/src/rx_rhi_vk/include/rx_rhi_vk/device.h
+index 229b6fd..98f7369 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/device.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/device.h
+@@ -76,20 +76,33 @@ public:
+     // True iff VK_EXT_calibrated_timestamps was present on the selected
+     // physical device AND successfully enabled on the logical device this
+     // Device wraps (see device.cpp's own comment on the optional, guarded
+     // enable_extension_if_present() call in create()) [Phase 4 Stage 0
+     // Task 3]. This class has no idea Tracy exists -- it only reports
+     // whether this one, ordinarily-optional Vulkan extension is live;
+     // rx_rhi_vk/tracy_gpu.h is the sole consumer that gives this fact any
+     // profiling meaning (TracyVkContextCalibrated vs plain TracyVkContext).
+     bool calibratedTimestampsEnabled() const { return calibratedTimestampsEnabled_; }
+ 
++    // True iff `VK_EXT_memory_budget` was present on the selected physical
++    // device AND successfully enabled on the logical device this Device
++    // wraps [Phase 4 Task 10, spec D24(b), gate ruling #27] -- same
++    // opportunistic, guarded `enable_extension_if_present()` pattern as
++    // calibratedTimestampsEnabled() just above (see device.cpp's own
++    // comment on that call). rx::rhi::Allocator::create(Context&, Device&)
++    // (buffer.h) reads this to decide whether to request
++    // VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT -- the two must stay in
++    // LOCKSTEP (VMA asserts otherwise), which is exactly why this Device
++    // is the single source of truth for whether the extension is really
++    // live, rather than Allocator guessing or re-querying it itself.
++    bool memoryBudgetExtensionEnabled() const { return memoryBudgetExtensionEnabled_; }
++
+     VkSwapchainKHR swapchain() const { return swapchain_; }
+     const std::vector<VkImage>& swapchainImages() const { return swapchainImages_; }
+     VkFormat swapchainFormat() const { return swapchainFormat_; }
+     VkExtent2D swapchainExtent() const { return swapchainExtent_; }
+ 
+     // Records the present mode this Device should build its NEXT swapchain
+     // against. Does NOT itself touch the live swapchain or recreate
+     // anything -- recreateSwapchain() (the same path every caller already
+     // drives on SwapchainStatus::NeedsRecreate, e.g. a window resize) is
+     // the sole place a present-mode change actually takes effect, per this
+@@ -147,20 +160,21 @@ private:
+ 
+     VkInstance instance_ = VK_NULL_HANDLE;
+     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
+     VkDevice device_ = VK_NULL_HANDLE;
+     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+ 
+     VkQueue graphicsQueue_ = VK_NULL_HANDLE;
+     uint32_t graphicsQueueFamily_ = 0;
+     VkQueue presentQueue_ = VK_NULL_HANDLE;
+     bool calibratedTimestampsEnabled_ = false;
++    bool memoryBudgetExtensionEnabled_ = false;
+ 
+     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
+     std::vector<VkImage> swapchainImages_;
+     VkFormat swapchainFormat_ = VK_FORMAT_UNDEFINED;
+     VkExtent2D swapchainExtent_{0, 0};
+ 
+     // Desired mode recorded by setPresentMode(), consulted by
+     // recreateSwapchain() (and create()'s own equivalent inline logic) the
+     // next time either builds a swapchain. Defaults to VsyncOn to match
+     // create()'s explicit FIFO default -- see that function's comment.
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/frame_sync.h b/src/rx_rhi_vk/include/rx_rhi_vk/frame_sync.h
+index 01692e2..efb584c 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/frame_sync.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/frame_sync.h
+@@ -1,19 +1,21 @@
+ #pragma once
+ #include <volk.h>
+ #include <array>
+ #include <cstdint>
+ #include <optional>
+ #include <vector>
+ 
+ namespace rx::rhi {
+ 
++class Allocator;
++
+ // FrameSync owns every synchronization primitive and per-frame command
+ // buffer the canonical "frames in flight" present loop needs, built once and
+ // reused for the lifetime of the loop -- never recreated per frame. This is
+ // the structural fix for the two defects an earlier, rejected design of this
+ // loop had:
+ //
+ //   1. Per-frame semaphores created AND destroyed every frame, with the
+ //      destroy happening immediately after vkQueuePresentKHR -- with no
+ //      fence or idle wait guaranteeing the presentation engine had actually
+ //      finished consuming them first. Destroying a semaphore the
+@@ -138,24 +140,33 @@ public:
+     // image. See the class-level comment for why this must be indexed by
+     // image, not by frame-in-flight slot.
+     VkSemaphore renderFinishedSemaphore(uint32_t imageIndex) const { return renderFinished_[imageIndex]; }
+ 
+     // Advances to the next frame-in-flight slot ((current + 1) % framesInFlight()).
+     // Call exactly once per loop iteration that completes a full
+     // acquire/record/submit/present cycle -- not on an iteration that bails
+     // out early via NeedsRecreate's `continue` path, since that iteration
+     // never submitted anything against the current slot. Also increments
+     // frameNumber() -- the two counters advance together, by construction.
+-    void advanceFrame() {
+-        currentFrame_ = (currentFrame_ + 1) % kFramesInFlight;
+-        ++frameNumber_;
+-    }
++    //
++    // `allocatorForBudgetRefresh` [Phase 4 Task 10, spec D24, gate ruling
++    // #27, matrix-issue27 row 3]: OPTIONAL, default nullptr (every existing
++    // zero-argument call site is unaffected). When non-null, this is the
++    // wired "once per frame, natural home: alongside FrameSync's own
++    // per-frame bookkeeping" call the gate ruling requires --
++    // Allocator::setCurrentFrameIndex() (buffer.h) is called with the new
++    // frameNumber(), which is what keeps vmaGetHeapBudgets()'s real
++    // VK_EXT_memory_budget-backed numbers from silently going stale (see
++    // that method's own comment, and memory_report.h's, for the exact
++    // staleness mechanism this closes). A caller that doesn't use
++    // Allocator::report() at all can simply keep omitting the argument.
++    void advanceFrame(Allocator* allocatorForBudgetRefresh = nullptr);
+ 
+     // Rebuilds the per-swapchain-image renderFinished semaphores for a new
+     // image count after Device::recreateSwapchain() -- the per-frame-in-
+     // flight objects (fences/imageAvailable semaphores/command pools/command
+     // buffers) are untouched, since none of them depend on how many
+     // swapchain images exist. Caller must have reached device idle first
+     // (see the class-level destructor contract; the present loop's
+     // NeedsRecreate path already guarantees this by construction). Returns
+     // false (logged) on any vkCreateSemaphore failure, leaving this
+     // FrameSync with however many of the new semaphores were successfully
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/memory_report.h b/src/rx_rhi_vk/include/rx_rhi_vk/memory_report.h
+new file mode 100644
+index 0000000..b70e147
+--- /dev/null
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/memory_report.h
+@@ -0,0 +1,266 @@
++#pragma once
++// Thread-affinity (D5, Phase 4): the plain data types below (RxMemoryReport
++// and friends) carry no thread affinity at all -- they are snapshots, safe
++// to copy/read from anywhere. MemoryAccounting's record()/release() are
++// internally thread-safe (atomic counters) but are, in practice, only ever
++// called from Buffer/Texture2D create/destroy on the main thread, per the
++// existing GPU-object-mutation contract -- see docs/threading.md.
++// Allocator::report()/setCurrentFrameIndex() (buffer.h) follow that same
++// convention (called once per frame from the main/render thread, alongside
++// FrameSync's own per-frame bookkeeping).
++//
++// volk first, for VkDeviceSize/VkResult/VK_MAX_MEMORY_HEAPS etc -- this
++// header intentionally does NOT include <vk_mem_alloc.h> (unlike buffer.h/
++// texture.h): everything declared here is meant to be a plain, VMA-free,
++// host-facing surface (D24(c): "a host-facing POD memory report... feeding
++// HUD + Tracy plots") that a caller (a sample's HUD, the future SDK caps
++// surface) can consume without pulling in VMA at all. The code that
++// actually calls vmaGetHeapBudgets()/vmaSetCurrentFrameIndex() to BUILD an
++// RxMemoryReport lives in rx_rhi_vk/buffer.h's Allocator (buffer.cpp),
++// which already depends on VMA for other reasons.
++#include <volk.h>
++#include <array>
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace rx::rhi {
++
++// [Phase 4 Task 10, spec D24(a)] Every GPU allocation this engine makes is
++// attributed to exactly one of these five categories at the point it is
++// created -- VMA itself has no category concept (verified against the
++// vendored VMA 3.4.0 header: its nearest primitive is a per-allocation
++// debug NAME string, never aggregated into anything), so this enum plus
++// MemoryAccounting below is this engine's own ledger, threaded through the
++// five VMA/Vulkan allocation choke points in buffer.cpp/texture.cpp.
++//
++// Threading (D24/D5): callers of Allocator::createHostVisibleBuffer()/
++// createDeviceLocalBuffer()/createUploadRingBuffer()/Texture2D::create()
++// pass a category explicitly (default MemoryCategory::Internal for callers
++// that don't yet care -- see buffer.h's own comment on why the default is
++// deliberately generic, not a guess at a "real" category). GeometryPool
++// (Task 12) and TextureCache (Task 14) are the two NOT-YET-BUILT
++// subsystems this ticket's own gate matrix (#27, row 10) names as the
++// intended real GeometryPool/Texture taggers; Uploader's staging ring
++// buffer (upload.cpp) is the one EXISTING call site this task itself wires
++// to MemoryCategory::Staging.
++enum class MemoryCategory : uint8_t {
++    GeometryPool = 0,
++    Texture = 1,
++    Transient = 2,
++    Staging = 3,
++    Internal = 4,
++};
++
++inline constexpr size_t kMemoryCategoryCount = 5;
++
++// Human-readable name for logging/HUD use -- covers every MemoryCategory
++// value; "UNKNOWN" is unreachable for any value produced by this enum but
++// kept as a defensive default rather than UB on an out-of-range cast.
++const char* memoryCategoryName(MemoryCategory category);
++
++// Bytes/count currently attributed to one MemoryCategory, per
++// MemoryAccounting's own ledger below.
++struct MemoryCategoryStats {
++    uint64_t bytes = 0;
++    uint32_t count = 0;
++};
++
++// [Phase 4 Task 10, gate ruling #27] Which of the two budget SOURCES a
++// report's per-heap `budgetBytes` numbers came from -- explicit, not
++// inferred by the reader from whether the numbers "look real": either the
++// genuine `VK_EXT_memory_budget` driver query (RealExtension), or this
++// engine's own heap-size estimate when that extension is unavailable or
++// was deliberately not enabled (HeapSizeFallback). See Allocator::report()
++// (buffer.cpp) for exactly how each is computed.
++enum class MemoryBudgetSource : uint8_t {
++    RealExtension,
++    HeapSizeFallback,
++};
++
++const char* memoryBudgetSourceName(MemoryBudgetSource source);
++
++// [Phase 4 Task 10, gate ruling #27] Per-heap usage/budget -- NEVER a
++// fixed-count array: RADV APUs (this project's own Steam Deck floor
++// hardware) expose multiple memory heaps by default (verified via Mesa's
++// `radv_enable_unified_heap_on_apu` driconf option, matrix-issue27 row 11
++// -- its very existence proves RADV's APU default is multi-heap), so
++// RxMemoryReport::heaps below is sized to whatever
++// VkPhysicalDeviceMemoryProperties::memoryHeapCount actually reports on
++// the running device, never assumed.
++struct MemoryHeapReport {
++    uint32_t heapIndex = 0;
++    VkDeviceSize heapSizeBytes = 0;
++    VkDeviceSize usageBytes = 0;
++    VkDeviceSize budgetBytes = 0;
++};
++
++// [Phase 4 Task 10, spec D24(c)] Host-facing POD memory report: per-category
++// bytes/counts (MemoryAccounting's ledger, snapshotted), per-heap usage/
++// budget (vmaGetHeapBudgets()), and the explicit budget-source flag above.
++// Precedent: bgfx's `struct Stats` (bgfx.h) ships an analogous flat POD
++// (textureMemoryUsed/gpuMemoryUsed/gpuMemoryMax alongside frame-timing
++// fields) read by the host once per frame -- this struct is the same shape,
++// widened to per-category (bgfx has only texture/rt/transient) and
++// per-heap (bgfx's gpuMemoryUsed/gpuMemoryMax are single aggregate
++// numbers) plus the explicit source flag bgfx's own docs flag as
++// ambiguous ("unavailable on some backends", no fallback signal) on
++// purpose. Copyable, trivially comparable field-by-field; safe to snapshot
++// and hand to a HUD or a log line without holding onto any live Vulkan
++// state.
++struct RxMemoryReport {
++    std::array<MemoryCategoryStats, kMemoryCategoryCount> categories{};
++    std::vector<MemoryHeapReport> heaps;
++    MemoryBudgetSource budgetSource = MemoryBudgetSource::HeapSizeFallback;
++
++    const MemoryCategoryStats& category(MemoryCategory cat) const {
++        return categories[static_cast<size_t>(cat)];
++    }
++};
++
++// Compact, single-line summary of `report` for a log message (used by
++// Allocator::noteAllocationFailure() below to satisfy D24(d)'s "loud, named
++// failure with the report attached" -- the report is literally inlined
++// into the same error line, plus captured verbatim for programmatic
++// inspection via Allocator::lastAllocationFailureReport()).
++std::string summarizeMemoryReport(const RxMemoryReport& report);
++
++// [Phase 4 Task 10, spec D24(a)] The ledger itself: an atomic
++// bytes/count counter per MemoryCategory. Deliberately Vulkan-free and
++// side-effect-free beyond its own counters -- record()/release() are
++// called by Buffer/Texture2D at the moment their underlying VMA allocation
++// is created/destroyed (buffer.cpp/texture.cpp), each holding a
++// std::shared_ptr<MemoryAccounting> back to the Allocator that created
++// them so the ledger survives exactly as long as any resource still
++// attributed to it -- not tied to the owning Allocator object's own
++// lifetime, which can move.
++//
++// Thread-safety: every counter is a std::atomic, so record()/release() are
++// safe to call from any thread -- defense in depth. Production code today
++// only ever creates/destroys Buffer/Texture2D from the main thread (D5,
++// existing GPU-object-mutation contract; see docs/threading.md), so this
++// is not a relaxation of that contract, just a cheap extra guarantee.
++class MemoryAccounting {
++public:
++    MemoryAccounting() = default;
++    MemoryAccounting(const MemoryAccounting&) = delete;
++    MemoryAccounting& operator=(const MemoryAccounting&) = delete;
++
++    void record(MemoryCategory category, uint64_t bytes);
++    void release(MemoryCategory category, uint64_t bytes);
++
++    MemoryCategoryStats snapshot(MemoryCategory category) const;
++
++    // True iff any category still carries a nonzero count -- the
++    // teardown leak/balance check (D24, matrix-issue27 row 16):
++    // Allocator's destructor (buffer.cpp) calls this and logs a named
++    // RX_LOG_ERROR naming every nonzero category if it is ever true at the
++    // point an Allocator is torn down, mirroring DeletionQueue's own
++    // "destroyed with N never flushed" destructor warning
++    // (deletion_queue.h/.cpp) -- the same established pattern in this
++    // codebase, not a new one.
++    bool hasOutstanding() const;
++
++private:
++    struct Counter {
++        std::atomic<uint64_t> bytes{0};
++        std::atomic<uint32_t> count{0};
++    };
++
++    std::array<Counter, kMemoryCategoryCount> counters_{};
++};
++
++// [Phase 4 Task 10, spec D24(d)] Which class of failure an allocation
++// call ended in -- named and distinguishable, replacing every allocation
++// site's previous generic "vmaCreateBuffer failed" catch-all (verified:
++// zero OOM-specific handling existed anywhere in this repository before
++// this task, buffer.cpp:59-64/90-96/126-131, texture.cpp:149-153).
++enum class AllocationFailureKind : uint8_t {
++    None,
++    OutOfDeviceMemory,
++    OutOfHostMemory,
++    Other,
++};
++
++const char* allocationFailureKindName(AllocationFailureKind kind);
++
++// Pure classification, deliberately independent of any live
++// VkDevice/Allocator -- lets AllocationFailureKind's mapping be unit
++// tested device-free (oom_handling_test.cpp) even though forcing a REAL
++// vmaCreateBuffer/vmaCreateImage failure needs a live device (see that
++// test file's own comment on `VmaAllocatorCreateInfo::pHeapSizeLimit`,
++// the mechanism this task's own GPU tests use for that).
++AllocationFailureKind classifyAllocationFailure(VkResult result);
++
++// ---------------------------------------------------------------------
++// EVICTION CONTRACT (D24(e), card #27, gate ruling 2026-08-18)
++// ---------------------------------------------------------------------
++// This task owns the CONTRACT TEXT below plus a minimal synthetic proof
++// that the mechanism composes (src/rx_rhi_vk/tests/eviction_contract_test.cpp).
++// It does NOT implement real call sites -- those are Task 13's
++// (rx::asset::Registry mesh()/material()/texture() accessors) and Task
++// 19's (DrawListBuilder's material/mesh handle resolution) acceptance
++// criteria, implemented AGAINST these exact rules:
++//
++// (1) RESIDENCY-TOLERANT RESOLVE. A resolve call on a handle whose
++//     resource has been evicted returns a DEFINED fallback (the D11
++//     fallback-asset pattern), never a dangling reference and never UB.
++//     "Evicted" here means: the handle is still a validly-issued,
++//     non-stale handle (see (3)), but the resource it names is
++//     temporarily unavailable because it was evicted and has not yet
++//     been reclaimed.
++//
++// (2) OBSERVABLE NON-RESIDENCY. The resolve call's signature makes
++//     non-residency observable to the caller -- a bool/enum
++//     out-parameter or equivalent return shape -- never a silent
++//     substitution the caller has no way to detect. (A caller that
++//     doesn't check the flag still gets a safe, defined fallback value
++//     per (1); a caller that DOES check it can react, e.g. trigger a
++//     reload.)
++//
++// (3) ONE GENERATIONAL MECHANISM, NOT TWO. Once an eviction is actually
++//     RECLAIMED (the slot freed, the handle's generation bumped -- see
++//     (c) below), a resolve against the OLD (pre-eviction) handle is
++//     caught by the SAME generational-handle staleness check the D6
++//     Handle<Tag>/HandlePool<Tag,T> pattern already uses for an
++//     ordinary dangling handle (rx_core/include/rx_core/handle.h) -- NOT
++//     a second, bespoke "was this specific handle ever evicted"
++//     side-table. The only state genuinely new to eviction is the
++//     transient "evicted but not yet reclaimed" flag a resolve consults
++//     during the deferred window between evict() and reclaim -- once
++//     that window closes, staleness detection reduces to the existing
++//     D6 mechanism with zero new bookkeeping.
++//
++// (b) HANDLE-MEDIATED REFERENCES ONLY. No new Phase-4 API surface may
++//     return or accept a raw pointer or bare integer index to a
++//     pool-resident/evictable resource for a caller to hold onto past
++//     the call that produced it -- every persisted reference to an
++//     evictable resource is a generational handle (core::Handle<Tag>).
++//     Enforced at review, not by an automated test -- this text is the
++//     exact wording Task 13/19/21/3/14 reviewers check new API surfaces
++//     against.
++//
++// (c) WORKING DEFERRED-EVICTION PATH. evict(handle) (1) immediately
++//     marks the handle's slot non-resident (so (1)/(2) above hold from
++//     that instant), (2) retires the underlying GPU resource's real
++//     destructor into the existing rx::rhi::DeletionQueue
++//     (deletion_queue.h) tagged with the current frame index, and (3)
++//     only frees the slot for reuse (bumping its generation, per (3)
++//     above) once DeletionQueue::onFrameFenceSignaled() actually runs
++//     that retired destructor -- i.e. the resource is provably NOT
++//     destroyed while a frame that may still reference it is in flight,
++//     using the exact fence-gated mechanism this codebase already ships
++//     for buffer/image teardown, not a new one.
++//
++// src/rx_rhi_vk/tests/eviction_contract_test.cpp builds a MINIMAL
++// synthetic handle table (real rx::core::HandlePool<Tag,T> + a real
++// rx::rhi::DeletionQueue, no Vulkan device needed at all) and exercises
++// resolve-while-resident, resolve-while-evicted-but-not-yet-reclaimed,
++// resolve-after-reclaim, and slot-reuse-after-reclaim end to end against
++// clauses (1)-(3)/(c) above -- this is the "contract" test this task
++// owns; Task 13/19 add their own resolve-call-site tests against real
++// assets/draw lists.
++
++}  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/texture.h b/src/rx_rhi_vk/include/rx_rhi_vk/texture.h
+index 2a41793..bbf4035 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/texture.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/texture.h
+@@ -72,30 +72,45 @@ public:
+     //
+     // `physicalDevice`/`device` are used for the format-feature query
+     // above and for vkCreateImageView/vkDestroyImageView respectively --
+     // the same kind of brief-shorthand elaboration Task 3's
+     // BindlessTable::create() made for its own capacity pre-check (see
+     // that class's own header comment and task-3-report.md), for the same
+     // reason: a clean, logged single-mip fallback cannot be implemented
+     // without a real feature query, and an Allocator alone exposes
+     // neither a VkPhysicalDevice nor a VkDevice to get one from.
+     //
+-    // Returns std::nullopt (logged) on any image/view creation failure.
++    // `category` [Phase 4 Task 10, spec D24(a)] attributes this image's
++    // allocated bytes in `allocator`'s accounting ledger (Allocator::report()
++    // reads it) -- default MemoryCategory::Internal, same rationale as
++    // Allocator::createHostVisibleBuffer()'s own default (buffer.h).
++    // Returns std::nullopt (logged) on any image/view creation failure. On
++    // the vmaCreateImage step specifically, a VK_ERROR_OUT_OF_DEVICE_MEMORY
++    // failure is classified/report-attached via `allocator`
++    // (Allocator::lastAllocationFailureKind()/lastAllocationFailureReport(),
++    // buffer.h [D24(d)]); a LATER vkCreateImageView failure (the image
++    // itself already having been created successfully) is a DIFFERENT,
++    // deliberately-not-memory-attributed failure class -- see
++    // Allocator::noteNonMemoryFailure()'s own comment for why
++    // (matrix-issue27 row 9: these two must stay distinguishable).
+     static std::optional<Texture2D> create(VkPhysicalDevice physicalDevice, VkDevice device, Allocator& allocator,
+                                             VkExtent2D extent, VkFormat format, VkImageUsageFlags usage,
+-                                            uint32_t requestedMipLevels = 0);
++                                            uint32_t requestedMipLevels = 0,
++                                            MemoryCategory category = MemoryCategory::Internal);
+ 
+     VkImage image() const { return image_; }
+     VkImageView view() const { return view_; }
+     VkExtent2D extent() const { return extent_; }
+     VkFormat format() const { return format_; }
+     uint32_t mipLevels() const { return mipLevels_; }
++    MemoryCategory category() const { return category_; }
++    VkDeviceSize allocatedBytes() const { return allocatedBytes_; }
+ 
+     // Records the full mip-chain blit for a texture whose level 0 was
+     // just written (e.g. by rx::rhi::Uploader::uploadToImage()) and is
+     // currently in VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, with every level
+     // 1..mipLevels()-1 still in its initial VK_IMAGE_LAYOUT_UNDEFINED.
+     // Issues the per-level VkImageMemoryBarrier2 + vkCmdBlitImage sequence
+     // (level 0 -> 1, barrier, 1 -> 2, barrier, ...) and leaves EVERY level
+     // in VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL on return, ready for
+     // sampling. A no-op beyond that same final transition if
+     // mipLevels() == 1 (nothing to blit; level 0 alone still needs the
+@@ -115,33 +130,45 @@ public:
+     // decode/average/re-encode compute pass: the spec's Fixed decision #8
+     // restricts Phase 2 samples to UNORM formats specifically so this
+     // caveat never actually applies to shipped content. Do not reuse this
+     // function unmodified for an SRGB-format Texture2D without accounting
+     // for it first.
+     void recordMipChainBlit(VkCommandBuffer cmd) const;
+ 
+ private:
+     Texture2D() = default;
+     Texture2D(VmaAllocator allocator, VkDevice device, VkImage image, VmaAllocation allocation, VkImageView view,
+-               VkExtent2D extent, VkFormat format, uint32_t mipLevels)
++               VkExtent2D extent, VkFormat format, uint32_t mipLevels,
++               std::shared_ptr<MemoryAccounting> accounting = nullptr,
++               MemoryCategory category = MemoryCategory::Internal, VkDeviceSize allocatedBytes = 0)
+         : allocator_(allocator),
+           device_(device),
+           image_(image),
+           allocation_(allocation),
+           view_(view),
+           extent_(extent),
+           format_(format),
+-          mipLevels_(mipLevels) {}
++          mipLevels_(mipLevels),
++          accounting_(std::move(accounting)),
++          category_(category),
++          allocatedBytes_(allocatedBytes) {}
+ 
+     void destroyAll();
+ 
+     VmaAllocator allocator_ = VK_NULL_HANDLE;
+     VkDevice device_ = VK_NULL_HANDLE;
+     VkImage image_ = VK_NULL_HANDLE;
+     VmaAllocation allocation_ = VK_NULL_HANDLE;
+     VkImageView view_ = VK_NULL_HANDLE;
+     VkExtent2D extent_{0, 0};
+     VkFormat format_ = VK_FORMAT_UNDEFINED;
+     uint32_t mipLevels_ = 1;
++
++    // [Phase 4 Task 10] Category-attributed accounting (D24(a)) -- same
++    // shape/rationale as Buffer's own accounting_/category_/allocatedBytes_
++    // (buffer.h).
++    std::shared_ptr<MemoryAccounting> accounting_;
++    MemoryCategory category_ = MemoryCategory::Internal;
++    VkDeviceSize allocatedBytes_ = 0;
+ };
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/buffer.cpp b/src/rx_rhi_vk/src/buffer.cpp
+index 6953d2d..56ef8a3 100644
+--- a/src/rx_rhi_vk/src/buffer.cpp
++++ b/src/rx_rhi_vk/src/buffer.cpp
+@@ -1,23 +1,92 @@
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_core/log.h>
++#include <rx_core/profile.h>
++#include <cstdint>
+ #include <utility>
++#include <vector>
+ 
+ namespace rx::rhi {
+ 
+-std::optional<Allocator> Allocator::create(Context& context, Device& device) {
+-    return createRaw(device.physicalDevice(), device.device(), context.instance());
++namespace {
++
++// [Phase 4 Task 10, spec D24(c), matrix-issue27 row 17] RX_PLOT() (rx_core/
++// profile.h) requires a compile-time string literal per plot -- there is no
++// runtime-named-plot variant -- so the five fixed categories get one named
++// plot each unconditionally, and heaps get a bounded, hand-unrolled set of
++// literal names (0..7; RADV APUs expose a handful, per matrix-issue27 row
++// 11 -- 8 is generous headroom over that, VK_MAX_MEMORY_HEAPS's real
++// ceiling of 16 is not worth hand-unrolling further for hardware this
++// project has never observed). A heap index beyond 7 is silently not
++// plotted (Tracy visualization is a nice-to-have, not correctness-bearing
++// -- report() itself is unaffected and still returns every heap). Compiles
++// to nothing at all when TRACY_ENABLE is off (RX_PLOT's own contract).
++void publishTracyPlots(const RxMemoryReport& report) {
++    RX_PLOT("Memory/Category/GeometryPool", static_cast<int64_t>(report.category(MemoryCategory::GeometryPool).bytes));
++    RX_PLOT("Memory/Category/Texture", static_cast<int64_t>(report.category(MemoryCategory::Texture).bytes));
++    RX_PLOT("Memory/Category/Transient", static_cast<int64_t>(report.category(MemoryCategory::Transient).bytes));
++    RX_PLOT("Memory/Category/Staging", static_cast<int64_t>(report.category(MemoryCategory::Staging).bytes));
++    RX_PLOT("Memory/Category/Internal", static_cast<int64_t>(report.category(MemoryCategory::Internal).bytes));
++
++    for (size_t i = 0; i < report.heaps.size() && i < 8; ++i) {
++        const MemoryHeapReport& heap = report.heaps[i];
++        switch (i) {
++            case 0:
++                RX_PLOT("Memory/Heap0/UsageBytes", static_cast<int64_t>(heap.usageBytes));
++                RX_PLOT("Memory/Heap0/BudgetBytes", static_cast<int64_t>(heap.budgetBytes));
++                break;
++            case 1:
++                RX_PLOT("Memory/Heap1/UsageBytes", static_cast<int64_t>(heap.usageBytes));
++                RX_PLOT("Memory/Heap1/BudgetBytes", static_cast<int64_t>(heap.budgetBytes));
++                break;
++            case 2:
++                RX_PLOT("Memory/Heap2/UsageBytes", static_cast<int64_t>(heap.usageBytes));
++                RX_PLOT("Memory/Heap2/BudgetBytes", static_cast<int64_t>(heap.budgetBytes));
++                break;
++            case 3:
++                RX_PLOT("Memory/Heap3/UsageBytes", static_cast<int64_t>(heap.usageBytes));
++                RX_PLOT("Memory/Heap3/BudgetBytes", static_cast<int64_t>(heap.budgetBytes));
++                break;
++            case 4:
++                RX_PLOT("Memory/Heap4/UsageBytes", static_cast<int64_t>(heap.usageBytes));
++                RX_PLOT("Memory/Heap4/BudgetBytes", static_cast<int64_t>(heap.budgetBytes));
++                break;
++            case 5:
++                RX_PLOT("Memory/Heap5/UsageBytes", static_cast<int64_t>(heap.usageBytes));
++                RX_PLOT("Memory/Heap5/BudgetBytes", static_cast<int64_t>(heap.budgetBytes));
++                break;
++            case 6:
++                RX_PLOT("Memory/Heap6/UsageBytes", static_cast<int64_t>(heap.usageBytes));
++                RX_PLOT("Memory/Heap6/BudgetBytes", static_cast<int64_t>(heap.budgetBytes));
++                break;
++            case 7:
++                RX_PLOT("Memory/Heap7/UsageBytes", static_cast<int64_t>(heap.usageBytes));
++                RX_PLOT("Memory/Heap7/BudgetBytes", static_cast<int64_t>(heap.budgetBytes));
++                break;
++            default:
++                break;
++        }
++    }
++}
++
++}  // namespace
++
++std::optional<Allocator> Allocator::create(Context& context, Device& device, VkDeviceSize forcedHeapSizeLimitBytes) {
++    return createRaw(device.physicalDevice(), device.device(), context.instance(),
++                      device.memoryBudgetExtensionEnabled(), forcedHeapSizeLimitBytes);
+ }
+ 
+-std::optional<Allocator> Allocator::createRaw(VkPhysicalDevice physicalDevice, VkDevice device, VkInstance instance) {
++std::optional<Allocator> Allocator::createRaw(VkPhysicalDevice physicalDevice, VkDevice device, VkInstance instance,
++                                               bool memoryBudgetExtensionEnabled,
++                                               VkDeviceSize forcedHeapSizeLimitBytes) {
+     // Only the two entry points VMA's dynamic-loading path actually
+     // requires (see buffer.h's comment above the VMA_STATIC_VULKAN_FUNCTIONS
+     // / VMA_DYNAMIC_VULKAN_FUNCTIONS defines for why nothing else is
+     // hand-filled here). volk exposes both as real global function pointers
+     // once volkInitialize()/volkLoadInstance() (Context::create) have run --
+     // volkLoadInstance() is what populates vkGetDeviceProcAddr too (verified
+     // against volk.c:253; see buffer.h's comment for the exact call chain).
+     // Device::create()'s volkLoadDevice() call populates a separate
+     // per-device function table and is not what this global pointer relies
+     // on.
+@@ -25,55 +94,93 @@ std::optional<Allocator> Allocator::createRaw(VkPhysicalDevice physicalDevice, V
+     vulkanFunctions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
+     vulkanFunctions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
+ 
+     VmaAllocatorCreateInfo createInfo{};
+     createInfo.physicalDevice = physicalDevice;
+     createInfo.device = device;
+     createInfo.instance = instance;
+     createInfo.vulkanApiVersion = VK_API_VERSION_1_3;
+     createInfo.pVulkanFunctions = &vulkanFunctions;
+ 
++    // [Phase 4 Task 10, spec D24(b)] LOCKSTEP requirement (see this
++    // function's own header comment in buffer.h): this flag must agree
++    // exactly with whether VK_EXT_memory_budget was actually enabled on
++    // `device` -- VMA asserts otherwise (vk_mem_alloc.h:13365-13368).
++    if (memoryBudgetExtensionEnabled) {
++        createInfo.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
++    }
++
++    // [Phase 4 Task 10, D24(d) OOM-path testing] TEST-ONLY heap-size
++    // ceiling -- see this function's own header comment in buffer.h.
++    // `heapLimits` must outlive the vmaCreateAllocator() call below (VMA
++    // reads through the pointer during that call only, but does not copy
++    // the array beyond it), so it stays in this function's scope, not a
++    // narrower block.
++    std::vector<VkDeviceSize> heapLimits;
++    if (forcedHeapSizeLimitBytes != VK_WHOLE_SIZE) {
++        VkPhysicalDeviceMemoryProperties memProps{};
++        vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
++        heapLimits.assign(memProps.memoryHeapCount, forcedHeapSizeLimitBytes);
++        createInfo.pHeapSizeLimit = heapLimits.data();
++    }
++
+     VmaAllocator allocator = VK_NULL_HANDLE;
+     VkResult result = vmaCreateAllocator(&createInfo, &allocator);
+     if (result != VK_SUCCESS) {
+-        RX_LOG_ERROR("vmaCreateAllocator failed: VkResult={}", static_cast<int>(result));
++        // [Phase 4 Task 10, matrix-issue27 row 5] Named and distinguishable
++        // from "some other init step failed", per this function's own
++        // header comment on why this site is NOT exercised via a forced
++        // vmaCreateAllocator failure in tests (VMA_ASSERT on a null
++        // physicalDevice/device/instance would abort the whole test
++        // process, not fail gracefully -- see oom_handling_test.cpp's own
++        // comment). classifyAllocationFailure() is still the single source
++        // of truth for the kind name here, exercised device-free by that
++        // same test file.
++        RX_LOG_ERROR("Allocator::createRaw: vmaCreateAllocator failed (site=AllocatorCreation): VkResult={} ({})",
++                     static_cast<int>(result), allocationFailureKindName(classifyAllocationFailure(result)));
+         return std::nullopt;
+     }
+ 
+-    return Allocator(allocator);
++    const MemoryBudgetSource budgetSource =
++        memoryBudgetExtensionEnabled ? MemoryBudgetSource::RealExtension : MemoryBudgetSource::HeapSizeFallback;
++    return Allocator(allocator, physicalDevice, budgetSource);
+ }
+ 
+-std::optional<Buffer> Allocator::createHostVisibleBuffer(VkDeviceSize size, VkBufferUsageFlags usage) {
++std::optional<Buffer> Allocator::createHostVisibleBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
++                                                           MemoryCategory category) {
+     VkBufferCreateInfo bufferInfo{};
+     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+     bufferInfo.size = size;
+     bufferInfo.usage = usage;
+     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+ 
+     VmaAllocationCreateInfo allocCreateInfo{};
+     allocCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
+     allocCreateInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+ 
+     VkBuffer buffer = VK_NULL_HANDLE;
+     VmaAllocation allocation = VK_NULL_HANDLE;
+     VmaAllocationInfo allocationInfo{};
+     VkResult result =
+         vmaCreateBuffer(allocator_, &bufferInfo, &allocCreateInfo, &buffer, &allocation, &allocationInfo);
+     if (result != VK_SUCCESS) {
+-        RX_LOG_ERROR("vmaCreateBuffer failed: VkResult={}", static_cast<int>(result));
++        noteAllocationFailure("Allocator::createHostVisibleBuffer", category, result);
+         return std::nullopt;
+     }
+ 
+-    return Buffer(allocator_, buffer, allocation, allocationInfo.pMappedData, size);
++    accounting_->record(category, allocationInfo.size);
++    return Buffer(allocator_, buffer, allocation, allocationInfo.pMappedData, size, /*directPathCapable=*/false,
++                  accounting_, category, allocationInfo.size);
+ }
+ 
+-std::optional<Buffer> Allocator::createDeviceLocalBuffer(VkDeviceSize size, VkBufferUsageFlags usage) {
++std::optional<Buffer> Allocator::createDeviceLocalBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
++                                                           MemoryCategory category) {
+     VkBufferCreateInfo bufferInfo{};
+     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+     bufferInfo.size = size;
+     bufferInfo.usage = usage;
+     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+ 
+     // ALLOW_TRANSFER_INSTEAD_BIT here (not on createUploadRingBuffer()'s
+     // staging buffer) is this task's Critical review fix -- see this
+     // method's own header comment in buffer.h for the exact VMA
+     // FindMemoryPreferences()/ContainsDeviceAccess() mechanics this
+@@ -83,34 +190,36 @@ std::optional<Buffer> Allocator::createDeviceLocalBuffer(VkDeviceSize size, VkBu
+     allocCreateInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                              VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT |
+                              VMA_ALLOCATION_CREATE_MAPPED_BIT;
+ 
+     VkBuffer buffer = VK_NULL_HANDLE;
+     VmaAllocation allocation = VK_NULL_HANDLE;
+     VmaAllocationInfo allocationInfo{};
+     VkResult result =
+         vmaCreateBuffer(allocator_, &bufferInfo, &allocCreateInfo, &buffer, &allocation, &allocationInfo);
+     if (result != VK_SUCCESS) {
+-        RX_LOG_ERROR("vmaCreateBuffer (device-local, direct-path-eligible) failed: VkResult={}",
+-                     static_cast<int>(result));
++        noteAllocationFailure("Allocator::createDeviceLocalBuffer", category, result);
+         return std::nullopt;
+     }
+ 
+     VkMemoryPropertyFlags memoryFlags = 0;
+     vmaGetMemoryTypeProperties(allocator_, allocationInfo.memoryType, &memoryFlags);
+     bool directPathCapable = (memoryFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 &&
+                               (memoryFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+ 
+-    return Buffer(allocator_, buffer, allocation, allocationInfo.pMappedData, size, directPathCapable);
++    accounting_->record(category, allocationInfo.size);
++    return Buffer(allocator_, buffer, allocation, allocationInfo.pMappedData, size, directPathCapable, accounting_,
++                  category, allocationInfo.size);
+ }
+ 
+-std::optional<Buffer> Allocator::createUploadRingBuffer(VkDeviceSize size, VkBufferUsageFlags usage) {
++std::optional<Buffer> Allocator::createUploadRingBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
++                                                          MemoryCategory category) {
+     VkBufferCreateInfo bufferInfo{};
+     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+     bufferInfo.size = size;
+     bufferInfo.usage = usage;
+     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+ 
+     // Deliberately NO ALLOW_TRANSFER_INSTEAD_BIT -- see this method's own
+     // header comment in buffer.h: for a TRANSFER_SRC-only usage (this
+     // buffer's real-world use, per rx::rhi::Uploader), that flag is
+     // structurally inert (verified directly against vendored VMA 3.4.0
+@@ -119,84 +228,125 @@ std::optional<Buffer> Allocator::createUploadRingBuffer(VkDeviceSize size, VkBuf
+     VmaAllocationCreateInfo allocCreateInfo{};
+     allocCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
+     allocCreateInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+ 
+     VkBuffer buffer = VK_NULL_HANDLE;
+     VmaAllocation allocation = VK_NULL_HANDLE;
+     VmaAllocationInfo allocationInfo{};
+     VkResult result =
+         vmaCreateBuffer(allocator_, &bufferInfo, &allocCreateInfo, &buffer, &allocation, &allocationInfo);
+     if (result != VK_SUCCESS) {
+-        RX_LOG_ERROR("vmaCreateBuffer (upload ring buffer) failed: VkResult={}", static_cast<int>(result));
++        noteAllocationFailure("Allocator::createUploadRingBuffer", category, result);
+         return std::nullopt;
+     }
+ 
+     // directPathCapable left at its default (false) -- this Buffer is
+     // never a direct-upload destination candidate, by construction.
+-    return Buffer(allocator_, buffer, allocation, allocationInfo.pMappedData, size);
++    accounting_->record(category, allocationInfo.size);
++    return Buffer(allocator_, buffer, allocation, allocationInfo.pMappedData, size, /*directPathCapable=*/false,
++                  accounting_, category, allocationInfo.size);
+ }
+ 
+ Allocator::Allocator(Allocator&& other) noexcept : Allocator() {
+     *this = std::move(other);
+ }
+ 
+ Allocator& Allocator::operator=(Allocator&& other) noexcept {
+     if (this != &other) {
+         destroyAll();
+ 
+         allocator_ = other.allocator_;
++        physicalDevice_ = other.physicalDevice_;
++        budgetSource_ = other.budgetSource_;
++        accounting_ = std::move(other.accounting_);
++        lastFailureKind_ = other.lastFailureKind_;
++        lastFailureReport_ = other.lastFailureReport_;
++
+         other.allocator_ = VK_NULL_HANDLE;
++        other.physicalDevice_ = VK_NULL_HANDLE;
++        other.budgetSource_ = MemoryBudgetSource::HeapSizeFallback;
++        other.lastFailureKind_ = AllocationFailureKind::None;
++        other.lastFailureReport_ = RxMemoryReport{};
+     }
+     return *this;
+ }
+ 
+ Allocator::~Allocator() {
+     destroyAll();
+ }
+ 
+ void Allocator::destroyAll() {
+     if (allocator_ != VK_NULL_HANDLE) {
++        // [Phase 4 Task 10, spec D24, matrix-issue27 row 16] Teardown
++        // leak/balance check -- mirrors DeletionQueue's own "destroyed with
++        // N never flushed" destructor warning (deletion_queue.cpp), the
++        // same established pattern in this codebase, not a new one. By the
++        // time this Allocator is torn down, every Buffer/Texture2D it
++        // created must ALREADY have been destroyed (the documented
++        // lifetime contract: neither may outlive the Allocator that
++        // created them) -- if the ledger is still nonzero here, that
++        // contract was violated somewhere, and this is the loud signal
++        // rather than a silent leak.
++        if (accounting_ && accounting_->hasOutstanding()) {
++            RxMemoryReport leaked = report();
++            RX_LOG_ERROR(
++                "Allocator::destroyAll: torn down with outstanding category-attributed allocations still recorded "
++                "(a Buffer/Texture2D created from this Allocator was never destroyed before it) -- {}",
++                summarizeMemoryReport(leaked));
++        }
+         vmaDestroyAllocator(allocator_);
+     }
+ }
+ 
+ Buffer::Buffer(Buffer&& other) noexcept : Buffer() {
+     *this = std::move(other);
+ }
+ 
+ Buffer& Buffer::operator=(Buffer&& other) noexcept {
+     if (this != &other) {
+         destroyAll();
+ 
+         allocator_ = other.allocator_;
+         buffer_ = other.buffer_;
+         allocation_ = other.allocation_;
+         mappedData_ = other.mappedData_;
+         size_ = other.size_;
+         directPathCapable_ = other.directPathCapable_;
++        accounting_ = std::move(other.accounting_);
++        category_ = other.category_;
++        allocatedBytes_ = other.allocatedBytes_;
+ 
+         other.allocator_ = VK_NULL_HANDLE;
+         other.buffer_ = VK_NULL_HANDLE;
+         other.allocation_ = VK_NULL_HANDLE;
+         other.mappedData_ = nullptr;
+         other.size_ = 0;
+         other.directPathCapable_ = false;
++        other.category_ = MemoryCategory::Internal;
++        other.allocatedBytes_ = 0;
+     }
+     return *this;
+ }
+ 
+ Buffer::~Buffer() {
+     destroyAll();
+ }
+ 
+ void Buffer::destroyAll() {
+     if (buffer_ != VK_NULL_HANDLE) {
++        // [Phase 4 Task 10, spec D24(a)] Release BEFORE vmaDestroyBuffer --
++        // order is not load-bearing here (the ledger is independent of the
++        // real VMA call), but matches "attribute the byte count for exactly
++        // as long as the real allocation is live" precisely.
++        if (accounting_) {
++            accounting_->release(category_, allocatedBytes_);
++        }
+         vmaDestroyBuffer(allocator_, buffer_, allocation_);
+     }
+ }
+ 
+ void Buffer::flush(VkDeviceSize offset, VkDeviceSize size) const {
+     if (buffer_ == VK_NULL_HANDLE) {
+         return;
+     }
+     VkResult result = vmaFlushAllocation(allocator_, allocation_, offset, size);
+     if (result != VK_SUCCESS) {
+@@ -207,11 +357,73 @@ void Buffer::flush(VkDeviceSize offset, VkDeviceSize size) const {
+ void Buffer::invalidate(VkDeviceSize offset, VkDeviceSize size) const {
+     if (buffer_ == VK_NULL_HANDLE) {
+         return;
+     }
+     VkResult result = vmaInvalidateAllocation(allocator_, allocation_, offset, size);
+     if (result != VK_SUCCESS) {
+         RX_LOG_ERROR("vmaInvalidateAllocation failed: VkResult={}", static_cast<int>(result));
+     }
+ }
+ 
++RxMemoryReport Allocator::report() const {
++    RxMemoryReport out;
++    for (size_t i = 0; i < kMemoryCategoryCount; ++i) {
++        out.categories[i] = accounting_->snapshot(static_cast<MemoryCategory>(i));
++    }
++    out.budgetSource = budgetSource_;
++
++    const VkPhysicalDeviceMemoryProperties* memProps = nullptr;
++    vmaGetMemoryProperties(allocator_, &memProps);
++    uint32_t heapCount = memProps != nullptr ? memProps->memoryHeapCount : 0;
++
++    std::vector<VmaBudget> budgets(heapCount);
++    if (heapCount > 0) {
++        vmaGetHeapBudgets(allocator_, budgets.data());
++    }
++
++    out.heaps.resize(heapCount);
++    for (uint32_t i = 0; i < heapCount; ++i) {
++        out.heaps[i].heapIndex = i;
++        out.heaps[i].heapSizeBytes = memProps->memoryHeaps[i].size;
++        out.heaps[i].usageBytes = budgets[i].usage;
++        // [Phase 4 Task 10, matrix-issue27 row 2] budgetSource_ ==
++        // HeapSizeFallback: use the raw VkMemoryHeap::size directly, NOT
++        // VMA's own internal non-extension fallback (`budgets[i].budget`
++        // would still be populated -- verified against the vendored VMA
++        // 3.4.0 source that its non-extension branch sets
++        // `budget = heapSize * 8 / 10`, an unversioned 80%-of-heap-size
++        // implementation detail this engine deliberately does not want a
++        // silent dependency on). budgetSource_ == RealExtension: use VMA's
++        // own driver-reported `budgets[i].budget` (already MIN'd against
++        // heap size internally, per the same source read).
++        out.heaps[i].budgetBytes =
++            budgetSource_ == MemoryBudgetSource::RealExtension ? budgets[i].budget : memProps->memoryHeaps[i].size;
++    }
++
++    publishTracyPlots(out);
++    return out;
++}
++
++void Allocator::setCurrentFrameIndex(uint32_t frameIndex) {
++    vmaSetCurrentFrameIndex(allocator_, frameIndex);
++}
++
++void Allocator::noteAllocationFailure(const char* siteName, MemoryCategory category, VkResult result) {
++    lastFailureKind_ = classifyAllocationFailure(result);
++    lastFailureReport_ = report();
++    RX_LOG_ERROR("{} failed: VkResult={} ({}) category={} -- memory report at failure: {}", siteName,
++                 static_cast<int>(result), allocationFailureKindName(lastFailureKind_), memoryCategoryName(category),
++                 summarizeMemoryReport(lastFailureReport_));
++}
++
++void Allocator::noteNonMemoryFailure(const char* siteName, VkResult result) {
++    // Deliberately does NOT touch lastFailureKind_/lastFailureReport_/the
++    // accounting ledger -- see this method's own header comment in
++    // buffer.h: this is what keeps a vmaCreateImage-class failure and a
++    // vkCreateImageView-class failure distinguishable to a caller
++    // inspecting Allocator state afterward (matrix-issue27 row 9).
++    RX_LOG_ERROR("{} failed: VkResult={} -- NOT a memory-budget event (device/API-misuse failure class); memory "
++                 "accounting unaffected",
++                 siteName, static_cast<int>(result));
++}
++
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/device.cpp b/src/rx_rhi_vk/src/device.cpp
+index 52f7559..4404d2c 100644
+--- a/src/rx_rhi_vk/src/device.cpp
++++ b/src/rx_rhi_vk/src/device.cpp
+@@ -252,20 +252,41 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
+     // class has no idea Tracy exists; it only reports the plain fact via
+     // calibratedTimestampsEnabled() below. Empirically checked directly on
+     // this dev machine's two available drivers as part of this task: BOTH
+     // the NVIDIA proprietary driver and Mesa's llvmpipe/lavapipe software
+     // rasterizer report `VK_EXT_calibrated_timestamps` (verified via
+     // `vulkaninfo`) -- lavapipe support was flagged [R:threading] as
+     // "unverified" going into this task; it is verified present here.
+     const bool calibratedTimestampsEnabled =
+         physResult.value().enable_extension_if_present(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+ 
++    // VK_EXT_memory_budget: optional, guarded, same pattern as
++    // calibratedTimestampsEnabled directly above [Phase 4 Task 10, spec
++    // D24(b), gate ruling #27]. A device lacking it is still fully
++    // supported -- rx::rhi::Allocator (buffer.h/.cpp) falls back to a
++    // heap-size budget estimate (MemoryBudgetSource::HeapSizeFallback)
++    // instead of the real driver-reported budget. Its instance-level
++    // dependency (VK_KHR_get_physical_device_properties2, or core Vulkan
++    // >= 1.1) is already satisfied unconditionally: this file's `selector`
++    // above requires >= 1.3 (set_minimum_version(1, 3)), and
++    // Context::create() (context.cpp) requires instance API version 1.3.0
++    // too (`require_api_version(1, 3, 0)`) -- both comfortably subsume the
++    // 1.1 floor, so no separate instance extension needs enabling here.
++    // Empirically verified present on both drivers this project develops
++    // against (vulkaninfo, `VK_ICD_FILENAMES` pointed at each ICD in
++    // isolation): NVIDIA's proprietary driver AND Mesa llvmpipe/lavapipe
++    // (the software rasterizer CI runs against) both report
++    // `VK_EXT_memory_budget` -- so the RealExtension path, not just the
++    // fallback, is exercised for real in CI, not merely local dev.
++    const bool memoryBudgetExtensionEnabled =
++        physResult.value().enable_extension_if_present(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
++
+     auto deviceResult = vkb::DeviceBuilder(physResult.value()).build();
+     if (!deviceResult) {
+         RX_LOG_ERROR("vkb::DeviceBuilder::build failed: {}", deviceResult.error().message());
+         destroySurface(context, surface);
+         return std::nullopt;
+     }
+     vkb::Device vkbDevice = deviceResult.value();
+     volkLoadDevice(vkbDevice.device);
+ 
+     auto graphicsQueueResult = vkbDevice.get_queue(vkb::QueueType::graphics);
+@@ -328,20 +349,24 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
+     dev.instance_ = context.instance();
+     dev.physicalDevice_ = vkbDevice.physical_device.physical_device;
+     dev.device_ = vkbDevice.device;
+     dev.surface_ = surface;
+     dev.graphicsQueue_ = graphicsQueueResult.value();
+     dev.graphicsQueueFamily_ = graphicsQueueIndexResult.value();
+     dev.presentQueue_ = presentQueueResult.value();
+     dev.calibratedTimestampsEnabled_ = calibratedTimestampsEnabled;
+     RX_LOG_INFO("Device::create: VK_EXT_calibrated_timestamps {} on the selected physical device",
+                 calibratedTimestampsEnabled ? "ENABLED" : "not present -- falling back to uncalibrated GPU zones");
++    dev.memoryBudgetExtensionEnabled_ = memoryBudgetExtensionEnabled;
++    RX_LOG_INFO("Device::create: VK_EXT_memory_budget {} on the selected physical device",
++                memoryBudgetExtensionEnabled ? "ENABLED" : "not present -- memory reports fall back to a heap-size "
++                                                            "budget estimate");
+     dev.swapchain_ = vkbSwapchain.swapchain;
+     dev.swapchainImages_ = imagesResult.value();
+     dev.swapchainFormat_ = vkbSwapchain.image_format;
+     dev.swapchainExtent_ = vkbSwapchain.extent;
+     dev.desiredPresentMode_ = PresentMode::VsyncOn;
+     dev.actualPresentMode_ = vkbSwapchain.present_mode;
+     RX_LOG_INFO("Device::create: present mode in use: {} (explicit default, PresentMode::VsyncOn)",
+                 presentModeName(dev.actualPresentMode_));
+     return dev;
+ }
+@@ -355,35 +380,37 @@ Device& Device::operator=(Device&& other) noexcept {
+         destroyAll();
+ 
+         instance_ = other.instance_;
+         physicalDevice_ = other.physicalDevice_;
+         device_ = other.device_;
+         surface_ = other.surface_;
+         graphicsQueue_ = other.graphicsQueue_;
+         graphicsQueueFamily_ = other.graphicsQueueFamily_;
+         presentQueue_ = other.presentQueue_;
+         calibratedTimestampsEnabled_ = other.calibratedTimestampsEnabled_;
++        memoryBudgetExtensionEnabled_ = other.memoryBudgetExtensionEnabled_;
+         swapchain_ = other.swapchain_;
+         swapchainImages_ = std::move(other.swapchainImages_);
+         swapchainFormat_ = other.swapchainFormat_;
+         swapchainExtent_ = other.swapchainExtent_;
+         desiredPresentMode_ = other.desiredPresentMode_;
+         actualPresentMode_ = other.actualPresentMode_;
+ 
+         other.instance_ = VK_NULL_HANDLE;
+         other.physicalDevice_ = VK_NULL_HANDLE;
+         other.device_ = VK_NULL_HANDLE;
+         other.surface_ = VK_NULL_HANDLE;
+         other.graphicsQueue_ = VK_NULL_HANDLE;
+         other.graphicsQueueFamily_ = 0;
+         other.presentQueue_ = VK_NULL_HANDLE;
+         other.calibratedTimestampsEnabled_ = false;
++        other.memoryBudgetExtensionEnabled_ = false;
+         other.swapchain_ = VK_NULL_HANDLE;
+         other.swapchainImages_.clear();
+         other.swapchainFormat_ = VK_FORMAT_UNDEFINED;
+         other.swapchainExtent_ = VkExtent2D{0, 0};
+         other.desiredPresentMode_ = PresentMode::VsyncOn;
+         other.actualPresentMode_ = VK_PRESENT_MODE_FIFO_KHR;
+     }
+     return *this;
+ }
+ 
+diff --git a/src/rx_rhi_vk/src/frame_sync.cpp b/src/rx_rhi_vk/src/frame_sync.cpp
+index 0d9c014..2ffed7a 100644
+--- a/src/rx_rhi_vk/src/frame_sync.cpp
++++ b/src/rx_rhi_vk/src/frame_sync.cpp
+@@ -1,16 +1,29 @@
+ #include <rx_rhi_vk/frame_sync.h>
++#include <rx_rhi_vk/buffer.h>
+ #include <rx_core/log.h>
+ #include <utility>
+ 
+ namespace rx::rhi {
+ 
++void FrameSync::advanceFrame(Allocator* allocatorForBudgetRefresh) {
++    currentFrame_ = (currentFrame_ + 1) % kFramesInFlight;
++    ++frameNumber_;
++    if (allocatorForBudgetRefresh != nullptr) {
++        // [Phase 4 Task 10, gate ruling #27] See this method's own header
++        // comment in frame_sync.h -- this is the wired, once-per-frame
++        // vmaSetCurrentFrameIndex() call the gate identified as missing
++        // everywhere in this repository before this task.
++        allocatorForBudgetRefresh->setCurrentFrameIndex(static_cast<uint32_t>(frameNumber_));
++    }
++}
++
+ std::optional<FrameSync> FrameSync::create(VkDevice device, uint32_t queueFamily, uint32_t swapchainImageCount) {
+     FrameSync sync;
+     sync.device_ = device;
+ 
+     for (uint32_t i = 0; i < kFramesInFlight; ++i) {
+         VkFenceCreateInfo fenceInfo{};
+         fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+         // Signaled at creation so the loop's first-ever wait on this slot
+         // (before anything has been submitted against it) returns
+         // immediately instead of blocking forever.
+diff --git a/src/rx_rhi_vk/src/memory_report.cpp b/src/rx_rhi_vk/src/memory_report.cpp
+new file mode 100644
+index 0000000..3ce09f6
+--- /dev/null
++++ b/src/rx_rhi_vk/src/memory_report.cpp
+@@ -0,0 +1,112 @@
++#include <rx_rhi_vk/memory_report.h>
++#include <cstdio>
++
++namespace rx::rhi {
++
++const char* memoryCategoryName(MemoryCategory category) {
++    switch (category) {
++        case MemoryCategory::GeometryPool:
++            return "GeometryPool";
++        case MemoryCategory::Texture:
++            return "Texture";
++        case MemoryCategory::Transient:
++            return "Transient";
++        case MemoryCategory::Staging:
++            return "Staging";
++        case MemoryCategory::Internal:
++            return "Internal";
++        default:
++            return "UNKNOWN";
++    }
++}
++
++const char* memoryBudgetSourceName(MemoryBudgetSource source) {
++    switch (source) {
++        case MemoryBudgetSource::RealExtension:
++            return "RealExtension";
++        case MemoryBudgetSource::HeapSizeFallback:
++            return "HeapSizeFallback";
++        default:
++            return "UNKNOWN";
++    }
++}
++
++const char* allocationFailureKindName(AllocationFailureKind kind) {
++    switch (kind) {
++        case AllocationFailureKind::None:
++            return "None";
++        case AllocationFailureKind::OutOfDeviceMemory:
++            return "OutOfDeviceMemory";
++        case AllocationFailureKind::OutOfHostMemory:
++            return "OutOfHostMemory";
++        case AllocationFailureKind::Other:
++            return "Other";
++        default:
++            return "UNKNOWN";
++    }
++}
++
++AllocationFailureKind classifyAllocationFailure(VkResult result) {
++    switch (result) {
++        case VK_SUCCESS:
++            return AllocationFailureKind::None;
++        case VK_ERROR_OUT_OF_DEVICE_MEMORY:
++            return AllocationFailureKind::OutOfDeviceMemory;
++        case VK_ERROR_OUT_OF_HOST_MEMORY:
++            return AllocationFailureKind::OutOfHostMemory;
++        default:
++            return AllocationFailureKind::Other;
++    }
++}
++
++void MemoryAccounting::record(MemoryCategory category, uint64_t bytes) {
++    Counter& counter = counters_[static_cast<size_t>(category)];
++    counter.bytes.fetch_add(bytes, std::memory_order_relaxed);
++    counter.count.fetch_add(1, std::memory_order_relaxed);
++}
++
++void MemoryAccounting::release(MemoryCategory category, uint64_t bytes) {
++    Counter& counter = counters_[static_cast<size_t>(category)];
++    counter.bytes.fetch_sub(bytes, std::memory_order_relaxed);
++    counter.count.fetch_sub(1, std::memory_order_relaxed);
++}
++
++MemoryCategoryStats MemoryAccounting::snapshot(MemoryCategory category) const {
++    const Counter& counter = counters_[static_cast<size_t>(category)];
++    return MemoryCategoryStats{counter.bytes.load(std::memory_order_relaxed),
++                                counter.count.load(std::memory_order_relaxed)};
++}
++
++bool MemoryAccounting::hasOutstanding() const {
++    for (const Counter& counter : counters_) {
++        if (counter.count.load(std::memory_order_relaxed) != 0) {
++            return true;
++        }
++    }
++    return false;
++}
++
++std::string summarizeMemoryReport(const RxMemoryReport& report) {
++    std::string out = "categories={";
++    for (size_t i = 0; i < kMemoryCategoryCount; ++i) {
++        char buf[128];
++        std::snprintf(buf, sizeof(buf), "%s%s=%llu/%u", i == 0 ? "" : ",",
++                      memoryCategoryName(static_cast<MemoryCategory>(i)),
++                      static_cast<unsigned long long>(report.categories[i].bytes), report.categories[i].count);
++        out += buf;
++    }
++    out += "} heaps={";
++    for (size_t i = 0; i < report.heaps.size(); ++i) {
++        const MemoryHeapReport& heap = report.heaps[i];
++        char buf[160];
++        std::snprintf(buf, sizeof(buf), "%s#%u:usage=%llu/budget=%llu(of %llu)", i == 0 ? "" : ",", heap.heapIndex,
++                      static_cast<unsigned long long>(heap.usageBytes), static_cast<unsigned long long>(heap.budgetBytes),
++                      static_cast<unsigned long long>(heap.heapSizeBytes));
++        out += buf;
++    }
++    out += "} budgetSource=";
++    out += memoryBudgetSourceName(report.budgetSource);
++    return out;
++}
++
++}  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/texture.cpp b/src/rx_rhi_vk/src/texture.cpp
+index aa92e59..0910d09 100644
+--- a/src/rx_rhi_vk/src/texture.cpp
++++ b/src/rx_rhi_vk/src/texture.cpp
+@@ -76,21 +76,21 @@ void transitionLevelRange(VkCommandBuffer cmd, VkImage image, uint32_t baseLevel
+     depInfo.imageMemoryBarrierCount = 1;
+     depInfo.pImageMemoryBarriers = &barrier;
+ 
+     vkCmdPipelineBarrier2(cmd, &depInfo);
+ }
+ 
+ }  // namespace
+ 
+ std::optional<Texture2D> Texture2D::create(VkPhysicalDevice physicalDevice, VkDevice device, Allocator& allocator,
+                                             VkExtent2D extent, VkFormat format, VkImageUsageFlags usage,
+-                                            uint32_t requestedMipLevels) {
++                                            uint32_t requestedMipLevels, MemoryCategory category) {
+     uint32_t maxPossible = computeMaxMipLevels(extent);
+     uint32_t mipLevels = requestedMipLevels == 0 ? maxPossible : std::min(requestedMipLevels, maxPossible);
+ 
+     if (mipLevels > 1) {
+         VkFormatProperties formatProps{};
+         vkGetPhysicalDeviceFormatProperties(physicalDevice, format, &formatProps);
+         // Three bits, not just BLIT_DST (see this method's declaration
+         // comment in texture.h for why SRC is equally required) [R:C2]:
+         // BLIT_SRC_BIT/BLIT_DST_BIT for the blit itself, PLUS
+         // SAMPLED_IMAGE_FILTER_LINEAR_BIT -- vkCmdBlitImage with
+@@ -139,46 +139,57 @@ std::optional<Texture2D> Texture2D::create(VkPhysicalDevice physicalDevice, VkDe
+     // No HOST_ACCESS_* flags requested at all -- VMA_MEMORY_USAGE_AUTO
+     // with no host-visibility request resolves to DEVICE_LOCAL memory,
+     // exactly right for an optimal-tiling sampled image nothing on the
+     // CPU side ever maps directly (mirrors Allocator::
+     // createDeviceLocalBuffer's own reasoning in buffer.cpp).
+     VmaAllocationCreateInfo allocCreateInfo{};
+     allocCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
+ 
+     VkImage image = VK_NULL_HANDLE;
+     VmaAllocation allocation = VK_NULL_HANDLE;
+-    VkResult result = vmaCreateImage(allocator.raw(), &imageInfo, &allocCreateInfo, &image, &allocation, nullptr);
++    VmaAllocationInfo allocationInfo{};
++    VkResult result = vmaCreateImage(allocator.raw(), &imageInfo, &allocCreateInfo, &image, &allocation, &allocationInfo);
+     if (result != VK_SUCCESS) {
+-        RX_LOG_ERROR("vmaCreateImage failed: VkResult={}", static_cast<int>(result));
++        // [Phase 4 Task 10, spec D24(d), matrix-issue27 row 9] Memory-budget
++        // failure class -- classified/report-attached via `allocator`.
++        allocator.noteAllocationFailure("Texture2D::create(vmaCreateImage)", category, result);
+         return std::nullopt;
+     }
+ 
+     VkImageViewCreateInfo viewInfo{};
+     viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+     viewInfo.image = image;
+     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+     viewInfo.format = format;
+     viewInfo.subresourceRange.aspectMask = aspectMaskForFormat(format);
+     viewInfo.subresourceRange.baseMipLevel = 0;
+     viewInfo.subresourceRange.levelCount = mipLevels;
+     viewInfo.subresourceRange.baseArrayLayer = 0;
+     viewInfo.subresourceRange.layerCount = 1;
+ 
+     VkImageView view = VK_NULL_HANDLE;
+     result = vkCreateImageView(device, &viewInfo, nullptr, &view);
+     if (result != VK_SUCCESS) {
+-        RX_LOG_ERROR("vkCreateImageView failed: VkResult={}", static_cast<int>(result));
++        // [Phase 4 Task 10, matrix-issue27 row 9] Deliberately a DIFFERENT,
++        // non-memory-attributed failure class from the vmaCreateImage
++        // branch above -- see Allocator::noteNonMemoryFailure()'s own
++        // comment (buffer.h) for why: this is a device/API-misuse-class
++        // failure (the image itself was already successfully allocated),
++        // not a memory-budget event.
++        allocator.noteNonMemoryFailure("Texture2D::create(vkCreateImageView)", result);
+         vmaDestroyImage(allocator.raw(), image, allocation);
+         return std::nullopt;
+     }
+ 
+-    return Texture2D(allocator.raw(), device, image, allocation, view, extent, format, mipLevels);
++    allocator.accounting()->record(category, allocationInfo.size);
++    return Texture2D(allocator.raw(), device, image, allocation, view, extent, format, mipLevels,
++                      allocator.accounting(), category, allocationInfo.size);
+ }
+ 
+ void Texture2D::recordMipChainBlit(VkCommandBuffer cmd) const {
+     if (mipLevels_ <= 1) {
+         // Nothing to blit -- level 0 alone still needs the
+         // TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL transition
+         // Uploader::uploadToImage() otherwise relies on this function for.
+         transitionLevelRange(cmd, image_, 0, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+         return;
+@@ -238,37 +249,54 @@ Texture2D& Texture2D::operator=(Texture2D&& other) noexcept {
+         destroyAll();
+ 
+         allocator_ = other.allocator_;
+         device_ = other.device_;
+         image_ = other.image_;
+         allocation_ = other.allocation_;
+         view_ = other.view_;
+         extent_ = other.extent_;
+         format_ = other.format_;
+         mipLevels_ = other.mipLevels_;
++        accounting_ = std::move(other.accounting_);
++        category_ = other.category_;
++        allocatedBytes_ = other.allocatedBytes_;
+ 
+         other.allocator_ = VK_NULL_HANDLE;
+         other.device_ = VK_NULL_HANDLE;
+         other.image_ = VK_NULL_HANDLE;
+         other.allocation_ = VK_NULL_HANDLE;
+         other.view_ = VK_NULL_HANDLE;
+         other.extent_ = VkExtent2D{0, 0};
+         other.format_ = VK_FORMAT_UNDEFINED;
+         other.mipLevels_ = 1;
++        other.category_ = MemoryCategory::Internal;
++        other.allocatedBytes_ = 0;
+     }
+     return *this;
+ }
+ 
+ Texture2D::~Texture2D() {
+     destroyAll();
+ }
+ 
+ void Texture2D::destroyAll() {
++    if (image_ != VK_NULL_HANDLE && accounting_) {
++        // [Phase 4 Task 10, spec D24(a)] Released once, guarded on image_
++        // (not view_): if construction failed after a successful
++        // vmaCreateImage but before vkCreateImageView succeeded, the
++        // partially-built Texture2D() this file's create() returns in that
++        // branch is never actually returned to a caller (create() returns
++        // std::nullopt instead, and the local `image`/`allocation` are
++        // torn down directly there, not through this destructor) -- so
++        // this guard only ever fires for a fully-constructed Texture2D
++        // that really did record() into the ledger.
++        accounting_->release(category_, allocatedBytes_);
++    }
+     if (view_ != VK_NULL_HANDLE) {
+         vkDestroyImageView(device_, view_, nullptr);
+     }
+     if (image_ != VK_NULL_HANDLE) {
+         vmaDestroyImage(allocator_, image_, allocation_);
+     }
+ }
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/upload.cpp b/src/rx_rhi_vk/src/upload.cpp
+index a4b2214..5d20b0a 100644
+--- a/src/rx_rhi_vk/src/upload.cpp
++++ b/src/rx_rhi_vk/src/upload.cpp
+@@ -64,21 +64,28 @@ std::optional<Uploader> Uploader::create(Allocator& allocator, Device& device, V
+     VkFenceCreateInfo fenceInfo{};
+     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+ 
+     VkFence fence = VK_NULL_HANDLE;
+     if (vkCreateFence(vkDevice, &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
+         RX_LOG_ERROR("Uploader::create: vkCreateFence failed");
+         vkDestroyCommandPool(vkDevice, pool, nullptr);
+         return std::nullopt;
+     }
+ 
+-    auto ringBuffer = allocator.createUploadRingBuffer(ringBufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    // MemoryCategory::Staging [Phase 4 Task 10, spec D24(a)]: this ring
++    // buffer IS the staging ring the category names -- the one real,
++    // in-scope call site this task itself categorizes explicitly (every
++    // other existing call site keeps createUploadRingBuffer()'s own
++    // Staging default anyway, so this is a documentation-of-intent change,
++    // not a behavior change).
++    auto ringBuffer =
++        allocator.createUploadRingBuffer(ringBufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemoryCategory::Staging);
+     if (!ringBuffer.has_value()) {
+         RX_LOG_ERROR("Uploader::create: failed to allocate the {}-byte staging ring buffer", ringBufferSize);
+         vkDestroyFence(vkDevice, fence, nullptr);
+         vkDestroyCommandPool(vkDevice, pool, nullptr);
+         return std::nullopt;
+     }
+ 
+     return Uploader(vkDevice, queue, pool, cmd, fence, std::move(*ringBuffer), ringBufferSize);
+ }
+ 
+diff --git a/src/rx_rhi_vk/tests/eviction_contract_test.cpp b/src/rx_rhi_vk/tests/eviction_contract_test.cpp
+new file mode 100644
+index 0000000..be09c15
+--- /dev/null
++++ b/src/rx_rhi_vk/tests/eviction_contract_test.cpp
+@@ -0,0 +1,175 @@
++#include <doctest/doctest.h>
++#include <rx_core/handle.h>
++#include <rx_rhi_vk/deletion_queue.h>
++#include <utility>
++#include <vector>
++
++// [Phase 4 Task 10, spec D24(e), card #27, gate ruling 2026-08-18] Rows
++// 13-15 of gate/matrix-issue27-memory-budget.md: the eviction INVARIANT
++// contract this task owns (CONTRACT TEXT lives in memory_report.h's own
++// "EVICTION CONTRACT" section -- read that first) plus the minimal
++// synthetic evict->fallback->reclaim wiring test this task's own plan step
++// calls for. Task 13 (Registry) and Task 19 (DrawListBuilder) implement
++// the SAME clauses at real handle-resolve call sites; this file proves the
++// mechanism composes over REAL rx::core::Handle<Tag>/HandlePool<Tag,T>
++// (the D6 pattern) and a REAL rx::rhi::DeletionQueue -- no mock/stub of
++// either -- with zero Vulkan device needed at all (pure CPU logic, exactly
++// like deletion_queue_test.cpp's own first three pure-logic TEST_CASEs).
++
++namespace {
++
++struct FakeAssetTag {};
++constexpr int kFallbackId = -1;
++
++// A MINIMAL synthetic registry -- not rx::asset::Registry (Task 13's job),
++// just enough machinery to exercise the three contract clauses end to end:
++// a real HandlePool (generational staleness, clause 3's "one mechanism"),
++// a parallel per-slot "resident" flag (the one genuinely-new bit clause 1/
++// 2's deferred window needs -- see memory_report.h's own contract text for
++// why this does not duplicate the generational mechanism), and a real
++// DeletionQueue for the deferred reclaim (clause c).
++class SyntheticEvictableRegistry {
++public:
++    rx::core::Handle<FakeAssetTag> acquire(int id) {
++        auto handle = pool_.acquire(id);
++        if (handle.index() >= resident_.size()) {
++            resident_.resize(handle.index() + 1, true);
++        }
++        resident_[handle.index()] = true;
++        return handle;
++    }
++
++    // Clause (1)/(2): resolve is defined for every handle state and makes
++    // non-residency observable via the `resident` half of the returned
++    // pair -- never a silent substitution, never UB.
++    std::pair<int, bool> resolve(rx::core::Handle<FakeAssetTag> handle) {
++        int* value = pool_.get(handle);  // nullptr on a generationally-stale/dangling handle -- the D6 mechanism,
++                                          // reused as-is, unmodified (clause 3).
++        if (value == nullptr) {
++            return {kFallbackId, false};
++        }
++        if (handle.index() < resident_.size() && !resident_[handle.index()]) {
++            return {kFallbackId, false};  // evicted, not yet reclaimed
++        }
++        return {*value, true};
++    }
++
++    // Clause (c): evict() immediately flips the resident bit (so (1)/(2)
++    // hold starting this instant), then retires the REAL reclaim -- the
++    // slot going back to the pool's free list, bumping its generation --
++    // into `deletionQueue`, tagged with `frameIndex`. `destroyedCount` is
++    // this test's stand-in for a real GPU-resource destructor (the D24(e)
++    // contract text's "the underlying GPU resource's real destructor").
++    void evict(rx::core::Handle<FakeAssetTag> handle, rx::rhi::DeletionQueue& deletionQueue, uint64_t frameIndex,
++               int* destroyedCount) {
++        if (handle.index() < resident_.size()) {
++            resident_[handle.index()] = false;
++        }
++        deletionQueue.retire(
++            [this, handle, destroyedCount] {
++                ++(*destroyedCount);
++                pool_.release(handle);
++            },
++            frameIndex);
++    }
++
++private:
++    rx::core::HandlePool<FakeAssetTag, int> pool_;
++    std::vector<bool> resident_;
++};
++
++}  // namespace
++
++TEST_CASE("Eviction contract: resolve is residency-tolerant and observable across evict->fallback->reclaim, over "
++          "a real HandlePool + a real DeletionQueue") {
++    SyntheticEvictableRegistry registry;
++    rx::rhi::DeletionQueue deletionQueue;
++    int destroyedCount = 0;
++
++    auto handle = registry.acquire(42);
++    {
++        auto [value, resident] = registry.resolve(handle);
++        CHECK(value == 42);
++        CHECK(resident);
++    }
++
++    // Clause (c) step 1: evict marks non-resident immediately but defers
++    // the real reclaim behind the DeletionQueue.
++    registry.evict(handle, deletionQueue, /*frameIndex=*/5, &destroyedCount);
++
++    // Clauses (1)/(2): between eviction and reclaim, resolve is defined
++    // and observably non-resident -- the fallback, never UB, never a
++    // silent substitution with no signal.
++    {
++        auto [value, resident] = registry.resolve(handle);
++        CHECK(value == kFallbackId);
++        CHECK_FALSE(resident);
++    }
++    // Row 15's own wording: "not destroyed before the tagged frame's fence
++    // signals".
++    CHECK(destroyedCount == 0);
++
++    deletionQueue.onFrameFenceSignaled(4);  // not yet due
++    CHECK(destroyedCount == 0);
++    {
++        auto [value, resident] = registry.resolve(handle);
++        CHECK(value == kFallbackId);
++        CHECK_FALSE(resident);
++    }
++
++    deletionQueue.onFrameFenceSignaled(5);  // now due -- the real reclaim runs
++    CHECK(destroyedCount == 1);
++
++    // Clause (3): post-reclaim, the OLD handle is caught by the SAME
++    // generational staleness check the D6 Handle<Tag>/HandlePool<Tag,T>
++    // pattern already uses for an ordinary dangling handle -- no bespoke
++    // "was this ever evicted" bookkeeping is consulted for this branch
++    // (registry.resolve()'s `pool_.get(handle) == nullptr` path, exactly
++    // the same code path an ordinary stale handle would hit).
++    {
++        auto [value, resident] = registry.resolve(handle);
++        CHECK(value == kFallbackId);
++        CHECK_FALSE(resident);
++    }
++
++    // Slot reuse: a brand-new handle for the reclaimed slot resolves
++    // correctly to its own value, while the stale pre-eviction handle
++    // continues to fail generationally -- handle-mediated references never
++    // alias a reclaimed-and-reused slot (the concrete form clause (b)'s
++    // "no raw index escapes" prohibition protects against).
++    auto handle2 = registry.acquire(99);
++    CHECK(handle2.index() == handle.index());
++    CHECK(handle2.generation() != handle.generation());
++    {
++        auto [value, resident] = registry.resolve(handle2);
++        CHECK(value == 99);
++        CHECK(resident);
++    }
++    {
++        auto [staleValue, staleResident] = registry.resolve(handle);
++        CHECK(staleValue == kFallbackId);
++        CHECK_FALSE(staleResident);
++    }
++}
++
++TEST_CASE("Eviction contract: a resolve against a handle that was never evicted at all is unaffected by an "
++          "unrelated slot's eviction (no cross-talk)") {
++    SyntheticEvictableRegistry registry;
++    rx::rhi::DeletionQueue deletionQueue;
++    int destroyedCount = 0;
++
++    auto keep = registry.acquire(7);
++    auto evictMe = registry.acquire(8);
++
++    registry.evict(evictMe, deletionQueue, /*frameIndex=*/1, &destroyedCount);
++    deletionQueue.onFrameFenceSignaled(1);
++    CHECK(destroyedCount == 1);
++
++    auto [keptValue, keptResident] = registry.resolve(keep);
++    CHECK(keptValue == 7);
++    CHECK(keptResident);
++
++    auto [evictedValue, evictedResident] = registry.resolve(evictMe);
++    CHECK(evictedValue == -1);
++    CHECK_FALSE(evictedResident);
++}
+diff --git a/src/rx_rhi_vk/tests/memory_budget_test.cpp b/src/rx_rhi_vk/tests/memory_budget_test.cpp
+new file mode 100644
+index 0000000..e429fa4
+--- /dev/null
++++ b/src/rx_rhi_vk/tests/memory_budget_test.cpp
+@@ -0,0 +1,236 @@
++#include <doctest/doctest.h>
++#include <rx_rhi_vk/buffer.h>
++#include <rx_rhi_vk/context.h>
++#include <rx_rhi_vk/memory_report.h>
++#include <VkBootstrap.h>
++#include <optional>
++#include <utility>
++#include <vector>
++
++// [Phase 4 Task 10, spec D24(b), gate ruling #27] Rows 2/3 of
++// gate/matrix-issue27-memory-budget.md: VK_EXT_memory_budget opportunistic
++// enablement (+ the heap-size fallback path, both tested) and the
++// vmaSetCurrentFrameIndex() staleness regression guard -- "the load-bearing
++// omission" the gate ruling calls out by name.
++
++namespace {
++
++// Headless fixture that ALSO reports whether VK_EXT_memory_budget was
++// actually enabled on the built device -- same shape as
++// memory_report_test.cpp's HeadlessFixture, plus the one extra step
++// Device::create() itself performs (device.cpp): a guarded
++// enable_extension_if_present() call, done by hand here since this test
++// needs a headless (no window/surface/swapchain) device and Device::create()
++// requires a real VkSurfaceKHR.
++struct MemoryBudgetFixture {
++    rx::rhi::Context context;
++    vkb::Device vkbDevice;
++    VkDevice device;
++    VkPhysicalDevice physicalDevice;
++    VkInstance instance;
++    bool memoryBudgetExtensionEnabled;
++};
++
++std::optional<MemoryBudgetFixture> makeFixture() {
++    auto context = rx::rhi::Context::create({}, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++    VkInstance instance = context->instance();
++
++    vkb::PhysicalDeviceSelector selector(context->vkbInstance());
++    auto physResult = selector.set_minimum_version(1, 3).select();
++    if (!physResult.has_value()) {
++        MESSAGE("no Vulkan 1.3 physical device available, skipping test");
++        return std::nullopt;
++    }
++
++    // Same opportunistic, guarded pattern as Device::create() (device.cpp)
++    // -- see that file's own comment on VK_EXT_memory_budget's instance-
++    // level dependency already being satisfied by this project's >= 1.3
++    // baseline.
++    bool memoryBudgetExtensionEnabled =
++        physResult.value().enable_extension_if_present(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
++
++    auto deviceResult = vkb::DeviceBuilder(physResult.value()).build();
++    REQUIRE(deviceResult.has_value());
++    vkb::Device vkbDevice = deviceResult.value();
++    volkLoadDevice(vkbDevice.device);
++
++    return MemoryBudgetFixture{std::move(*context), vkbDevice, vkbDevice.device,
++                                vkbDevice.physical_device.physical_device, instance, memoryBudgetExtensionEnabled};
++}
++
++}  // namespace
++
++TEST_CASE("Allocator::report() with VK_EXT_memory_budget enabled: RealExtension source, nonzero budget on at "
++          "least one heap") {
++    auto fixture = makeFixture();
++    if (!fixture.has_value()) {
++        return;
++    }
++    if (!fixture->memoryBudgetExtensionEnabled) {
++        MESSAGE("VK_EXT_memory_budget not present on this device, skipping the enabled-path assertions "
++                "(see the fallback-path test below for the other half)");
++        vkb::destroy_device(fixture->vkbDevice);
++        return;
++    }
++
++    auto allocator = rx::rhi::Allocator::createRaw(fixture->physicalDevice, fixture->device, fixture->instance,
++                                                    /*memoryBudgetExtensionEnabled=*/true);
++    REQUIRE(allocator.has_value());
++
++    rx::rhi::RxMemoryReport report = allocator->report();
++    CHECK(report.budgetSource == rx::rhi::MemoryBudgetSource::RealExtension);
++    REQUIRE_FALSE(report.heaps.empty());
++    bool anyNonzeroBudget = false;
++    for (const auto& heap : report.heaps) {
++        if (heap.budgetBytes > 0) {
++            anyNonzeroBudget = true;
++        }
++    }
++    CHECK(anyNonzeroBudget);
++
++    allocator.reset();
++    vkDeviceWaitIdle(fixture->device);
++    vkb::destroy_device(fixture->vkbDevice);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("Allocator::report() falls back to VkMemoryHeap::size as the budget estimate when the extension is not "
++          "enabled, with an explicit HeapSizeFallback source flag") {
++    auto fixture = makeFixture();
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    // Deliberately request memoryBudgetExtensionEnabled=false regardless of
++    // what the device actually supports -- this is what makes the fallback
++    // path deterministically testable independent of driver capability
++    // (matrix row 2's own "verify in-task, don't assume" discipline: the
++    // fallback path is asserted by a DEDICATED test case, not just inferred
++    // from whatever this machine happens to support).
++    auto allocator = rx::rhi::Allocator::createRaw(fixture->physicalDevice, fixture->device, fixture->instance,
++                                                    /*memoryBudgetExtensionEnabled=*/false);
++    REQUIRE(allocator.has_value());
++
++    VkPhysicalDeviceMemoryProperties memProps{};
++    vkGetPhysicalDeviceMemoryProperties(fixture->physicalDevice, &memProps);
++
++    rx::rhi::RxMemoryReport report = allocator->report();
++    CHECK(report.budgetSource == rx::rhi::MemoryBudgetSource::HeapSizeFallback);
++    REQUIRE(report.heaps.size() == memProps.memoryHeapCount);
++    for (uint32_t i = 0; i < memProps.memoryHeapCount; ++i) {
++        CHECK(report.heaps[i].heapIndex == i);
++        CHECK(report.heaps[i].heapSizeBytes == memProps.memoryHeaps[i].size);
++        // The exact acceptance-criterion wording (matrix-issue27 row 2):
++        // the fallback budget estimate IS the raw heap size, not VMA's own
++        // internal 80%-of-heap-size heuristic (see buffer.cpp's report()
++        // comment for why that distinction is deliberate).
++        CHECK(report.heaps[i].budgetBytes == memProps.memoryHeaps[i].size);
++    }
++
++    allocator.reset();
++    vkDeviceWaitIdle(fixture->device);
++    vkb::destroy_device(fixture->vkbDevice);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("vmaSetCurrentFrameIndex staleness regression: heap usage silently stays stale after a large allocation "
++          "without Allocator::setCurrentFrameIndex(), and refreshes once it is called") {
++    auto fixture = makeFixture();
++    if (!fixture.has_value()) {
++        return;
++    }
++    if (!fixture->memoryBudgetExtensionEnabled) {
++        MESSAGE("VK_EXT_memory_budget not present on this device -- the staleness heuristic this test exercises "
++                "only applies to the real-extension path (buffer.cpp's report() comment/VMA's own "
++                "GetHeapBudgets() -- the non-extension branch always recomputes fresh), skipping");
++        vkb::destroy_device(fixture->vkbDevice);
++        return;
++    }
++
++    auto allocator = rx::rhi::Allocator::createRaw(fixture->physicalDevice, fixture->device, fixture->instance,
++                                                    /*memoryBudgetExtensionEnabled=*/true);
++    REQUIRE(allocator.has_value());
++
++    // TECHNICAL NOTE, verified first-hand against the vendored VMA 3.4.0
++    // source (GetHeapBudgets(), vk_mem_alloc.h:14782-14834) before writing
++    // this test: `usage` is NOT a good staleness signal by itself for a
++    // SELF-caused allocation. VMA computes it as
++    // `frozen_driver_usage_at_last_fetch + (live_own_blockBytes -
++    // own_blockBytes_at_last_fetch)` -- `blockBytes` is updated
++    // immediately on every vmaCreateBuffer/vmaDestroyBuffer
++    // (VmaCurrentBudgetData::AddAllocation/RemoveAllocation,
++    // vk_mem_alloc.h:15052/15076/15095), completely independent of the
++    // 30-op/setCurrentFrameIndex refresh gate -- so `usage` ALWAYS
++    // reflects this allocator's own local allocations immediately, stale
++    // or not, by construction of that formula. It is `budget` that is the
++    // real staleness signal: `outBudgets->budget = VMA_MIN(m_VulkanBudget
++    // [heapIndex], heapSize)` applies NO local correction at all --
++    // m_VulkanBudget is touched ONLY by UpdateVulkanBudget(), which runs
++    // ONLY on setCurrentFrameIndex() or every 30 ops. This test exercises
++    // that real, verified property directly, rather than asserting
++    // something about `usage` that would not actually discriminate a
++    // silently-dropped setCurrentFrameIndex() call.
++    rx::rhi::RxMemoryReport baseline = allocator->report();
++    REQUIRE_FALSE(baseline.heaps.empty());
++    std::vector<VkDeviceSize> budgetBeforeActivity(baseline.heaps.size());
++    for (size_t i = 0; i < baseline.heaps.size(); ++i) {
++        budgetBeforeActivity[i] = baseline.heaps[i].budgetBytes;
++    }
++
++    // Real local allocation activity -- create AND destroy a 64 MiB
++    // device-local buffer, well under the 30-op lazy-refetch threshold (2
++    // ops total: create + destroy) -- and crucially no setCurrentFrameIndex()
++    // call anywhere in this block.
++    {
++        constexpr VkDeviceSize kLargeAllocBytes = 64ull * 1024ull * 1024ull;
++        auto bigBuffer = allocator->createDeviceLocalBuffer(kLargeAllocBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
++        REQUIRE(bigBuffer.has_value());
++    }
++
++    rx::rhi::RxMemoryReport staleReport = allocator->report();
++    REQUIRE(staleReport.heaps.size() == budgetBeforeActivity.size());
++    for (size_t i = 0; i < budgetBeforeActivity.size(); ++i) {
++        // The regression guard the gate ruling calls load-bearing: budget
++        // silently stays byte-identical to its pre-activity value despite
++        // real intervening create+destroy activity, because no real
++        // driver refetch happened. A future change that accidentally drops
++        // the setCurrentFrameIndex() wiring elsewhere in the engine cannot
++        // be caught by THIS assertion (it tests the mechanism directly,
++        // not a downstream call site) -- but it proves the staleness this
++        // task's own gate finding describes is real and reproducible, not
++        // a misreading of the VMA source.
++        CHECK(staleReport.heaps[i].budgetBytes == budgetBeforeActivity[i]);
++    }
++
++    // Now call the wired mechanism -- setCurrentFrameIndex() forces an
++    // immediate UpdateVulkanBudget() re-fetch regardless of the 30-op
++    // counter (verified directly against the vendored VMA source) and
++    // resets it to 0. Second-order proof the reset is real, not a
++    // one-shot fluke: repeat the exact same "real local activity leaves
++    // budget frozen absent a refresh" check a second time, now relative to
++    // the just-refreshed baseline -- if setCurrentFrameIndex() had NOT
++    // actually reset the op counter, this second round would already be
++    // past the 30-op threshold from the first round's activity and could
++    // spuriously pass for the wrong reason; starting the count over is
++    // what makes this a real, repeatable proof of the reset itself.
++    allocator->setCurrentFrameIndex(1);
++    rx::rhi::RxMemoryReport refreshedBaseline = allocator->report();
++    REQUIRE(refreshedBaseline.heaps.size() == budgetBeforeActivity.size());
++
++    {
++        constexpr VkDeviceSize kLargeAllocBytes = 32ull * 1024ull * 1024ull;
++        auto secondBuffer = allocator->createDeviceLocalBuffer(kLargeAllocBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
++        REQUIRE(secondBuffer.has_value());
++    }
++    rx::rhi::RxMemoryReport staleAgain = allocator->report();
++    REQUIRE(staleAgain.heaps.size() == refreshedBaseline.heaps.size());
++    for (size_t i = 0; i < refreshedBaseline.heaps.size(); ++i) {
++        CHECK(staleAgain.heaps[i].budgetBytes == refreshedBaseline.heaps[i].budgetBytes);
++    }
++
++    allocator.reset();
++    vkDeviceWaitIdle(fixture->device);
++    vkb::destroy_device(fixture->vkbDevice);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/src/rx_rhi_vk/tests/memory_report_test.cpp b/src/rx_rhi_vk/tests/memory_report_test.cpp
+new file mode 100644
+index 0000000..623051f
+--- /dev/null
++++ b/src/rx_rhi_vk/tests/memory_report_test.cpp
+@@ -0,0 +1,207 @@
++#include <doctest/doctest.h>
++#include <rx_rhi_vk/buffer.h>
++#include <rx_rhi_vk/context.h>
++#include <rx_rhi_vk/memory_report.h>
++#include <rx_rhi_vk/texture.h>
++#include <VkBootstrap.h>
++#include <cstddef>
++#include <optional>
++#include <string_view>
++#include <utility>
++
++// [Phase 4 Task 10, spec D24(a)/(c)] Rows 1/4/10/16 of
++// gate/matrix-issue27-memory-budget.md: category-attributed accounting
++// balance, the RxMemoryReport POD shape, the "single choke point ->
++// correct attribution" composition contract, and the teardown leak/balance
++// check. Rows 2/3 (budget extension + staleness) live in
++// memory_budget_test.cpp; rows 5-9 (OOM handling) live in
++// oom_handling_test.cpp; rows 13-15 (eviction contract) live in
++// eviction_contract_test.cpp -- deliberately split, matching the matrix's
++// own row groupings, rather than one giant file.
++
++TEST_CASE("MemoryAccounting balances bytes/counts across interleaved record/release across categories") {
++    rx::rhi::MemoryAccounting ledger;
++    CHECK_FALSE(ledger.hasOutstanding());
++
++    ledger.record(rx::rhi::MemoryCategory::GeometryPool, 100);
++    ledger.record(rx::rhi::MemoryCategory::Texture, 200);
++    ledger.record(rx::rhi::MemoryCategory::GeometryPool, 50);
++    CHECK(ledger.snapshot(rx::rhi::MemoryCategory::GeometryPool).bytes == 150);
++    CHECK(ledger.snapshot(rx::rhi::MemoryCategory::GeometryPool).count == 2);
++    CHECK(ledger.snapshot(rx::rhi::MemoryCategory::Texture).bytes == 200);
++    CHECK(ledger.snapshot(rx::rhi::MemoryCategory::Texture).count == 1);
++    CHECK(ledger.hasOutstanding());
++
++    // Interleaved release -- not just monotonic growth (matrix row 1's own
++    // wording): destroy the FIRST GeometryPool allocation while the second
++    // is still live.
++    ledger.release(rx::rhi::MemoryCategory::GeometryPool, 100);
++    CHECK(ledger.snapshot(rx::rhi::MemoryCategory::GeometryPool).bytes == 50);
++    CHECK(ledger.snapshot(rx::rhi::MemoryCategory::GeometryPool).count == 1);
++
++    ledger.record(rx::rhi::MemoryCategory::Staging, 999);
++    ledger.release(rx::rhi::MemoryCategory::Texture, 200);
++    CHECK(ledger.snapshot(rx::rhi::MemoryCategory::Texture).bytes == 0);
++    CHECK(ledger.snapshot(rx::rhi::MemoryCategory::Texture).count == 0);
++
++    ledger.release(rx::rhi::MemoryCategory::GeometryPool, 50);
++    ledger.release(rx::rhi::MemoryCategory::Staging, 999);
++    CHECK(ledger.snapshot(rx::rhi::MemoryCategory::GeometryPool).bytes == 0);
++    CHECK(ledger.snapshot(rx::rhi::MemoryCategory::GeometryPool).count == 0);
++    CHECK(ledger.snapshot(rx::rhi::MemoryCategory::Staging).bytes == 0);
++    CHECK(ledger.snapshot(rx::rhi::MemoryCategory::Staging).count == 0);
++    CHECK_FALSE(ledger.hasOutstanding());
++}
++
++TEST_CASE("RxMemoryReport: every field (category ledger + per-heap + budget-source) is independently exercised, "
++          "device-free") {
++    rx::rhi::MemoryAccounting ledger;
++    ledger.record(rx::rhi::MemoryCategory::GeometryPool, 1000);
++    ledger.record(rx::rhi::MemoryCategory::GeometryPool, 500);
++    ledger.record(rx::rhi::MemoryCategory::Texture, 2048);
++
++    rx::rhi::RxMemoryReport report;
++    for (size_t i = 0; i < rx::rhi::kMemoryCategoryCount; ++i) {
++        report.categories[i] = ledger.snapshot(static_cast<rx::rhi::MemoryCategory>(i));
++    }
++    CHECK(report.category(rx::rhi::MemoryCategory::GeometryPool).bytes == 1500);
++    CHECK(report.category(rx::rhi::MemoryCategory::GeometryPool).count == 2);
++    CHECK(report.category(rx::rhi::MemoryCategory::Texture).bytes == 2048);
++    CHECK(report.category(rx::rhi::MemoryCategory::Texture).count == 1);
++    CHECK(report.category(rx::rhi::MemoryCategory::Transient).bytes == 0);
++    CHECK(report.category(rx::rhi::MemoryCategory::Staging).count == 0);
++    CHECK(report.category(rx::rhi::MemoryCategory::Internal).count == 0);
++
++    // Per-heap/budget-source fields: hand-built, independent of any live
++    // device -- this is the struct-shape half of row 4's "every field"
++    // requirement (a real per-heap query needs a live device -- see
++    // memory_budget_test.cpp).
++    report.budgetSource = rx::rhi::MemoryBudgetSource::HeapSizeFallback;
++    report.heaps.push_back(rx::rhi::MemoryHeapReport{/*heapIndex=*/0, /*heapSizeBytes=*/1'000'000,
++                                                       /*usageBytes=*/400'000, /*budgetBytes=*/800'000});
++    report.heaps.push_back(rx::rhi::MemoryHeapReport{/*heapIndex=*/1, /*heapSizeBytes=*/2'000'000,
++                                                       /*usageBytes=*/0, /*budgetBytes=*/2'000'000});
++    REQUIRE(report.heaps.size() == 2);
++    CHECK(report.heaps[0].heapIndex == 0);
++    CHECK(report.heaps[0].heapSizeBytes == 1'000'000);
++    CHECK(report.heaps[0].usageBytes == 400'000);
++    CHECK(report.heaps[0].budgetBytes == 800'000);
++    CHECK(report.heaps[1].heapIndex == 1);
++
++    CHECK(std::string_view(rx::rhi::memoryBudgetSourceName(report.budgetSource)) == "HeapSizeFallback");
++    CHECK(std::string_view(rx::rhi::memoryBudgetSourceName(rx::rhi::MemoryBudgetSource::RealExtension)) ==
++          "RealExtension");
++
++    // summarizeMemoryReport() must not crash/throw on an arbitrary,
++    // hand-built report and must mention every category name -- the "loud,
++    // named failure with the report attached" log line (buffer.cpp's
++    // noteAllocationFailure()) depends on this never being a no-op.
++    std::string summary = rx::rhi::summarizeMemoryReport(report);
++    CHECK(summary.find("GeometryPool") != std::string::npos);
++    CHECK(summary.find("Texture") != std::string::npos);
++    CHECK(summary.find("Transient") != std::string::npos);
++    CHECK(summary.find("Staging") != std::string::npos);
++    CHECK(summary.find("Internal") != std::string::npos);
++    CHECK(summary.find("HeapSizeFallback") != std::string::npos);
++}
++
++TEST_CASE("memoryCategoryName covers every MemoryCategory value distinctly") {
++    CHECK(std::string_view(rx::rhi::memoryCategoryName(rx::rhi::MemoryCategory::GeometryPool)) == "GeometryPool");
++    CHECK(std::string_view(rx::rhi::memoryCategoryName(rx::rhi::MemoryCategory::Texture)) == "Texture");
++    CHECK(std::string_view(rx::rhi::memoryCategoryName(rx::rhi::MemoryCategory::Transient)) == "Transient");
++    CHECK(std::string_view(rx::rhi::memoryCategoryName(rx::rhi::MemoryCategory::Staging)) == "Staging");
++    CHECK(std::string_view(rx::rhi::memoryCategoryName(rx::rhi::MemoryCategory::Internal)) == "Internal");
++}
++
++namespace {
++
++// Pure headless fixture (no window/surface/swapchain) -- same shape as
++// deletion_queue_test.cpp's own HeadlessFixture, protected by
++// doctest_main.cpp's process-wide vk-bootstrap warm-up exactly like that
++// file's headless tests.
++struct HeadlessFixture {
++    rx::rhi::Context context;
++    vkb::Device vkbDevice;
++    VkDevice device;
++    VkPhysicalDevice physicalDevice;
++    VkInstance instance;
++};
++
++std::optional<HeadlessFixture> makeHeadlessFixture() {
++    auto context = rx::rhi::Context::create({}, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++    VkInstance instance = context->instance();
++
++    vkb::PhysicalDeviceSelector selector(context->vkbInstance());
++    auto physResult = selector.set_minimum_version(1, 3).select();
++    if (!physResult.has_value()) {
++        MESSAGE("no Vulkan 1.3 physical device available, skipping test");
++        return std::nullopt;
++    }
++
++    auto deviceResult = vkb::DeviceBuilder(physResult.value()).build();
++    REQUIRE(deviceResult.has_value());
++    vkb::Device vkbDevice = deviceResult.value();
++    volkLoadDevice(vkbDevice.device);
++
++    return HeadlessFixture{std::move(*context), vkbDevice, vkbDevice.device, vkbDevice.physical_device.physical_device,
++                            instance};
++}
++
++}  // namespace
++
++TEST_CASE("Allocator::report() composes real category-tagged Buffer/Texture2D allocations from a single choke "
++          "point, and returns to zero once they're destroyed (rows 1/4/10/16 integration)") {
++    auto fixture = makeHeadlessFixture();
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto allocator = rx::rhi::Allocator::createRaw(fixture->physicalDevice, fixture->device, fixture->instance);
++    REQUIRE(allocator.has_value());
++
++    {
++        auto buf = allocator->createDeviceLocalBuffer(65536, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
++                                                        rx::rhi::MemoryCategory::GeometryPool);
++        REQUIRE(buf.has_value());
++        CHECK(buf->category() == rx::rhi::MemoryCategory::GeometryPool);
++        CHECK(buf->allocatedBytes() >= 65536);
++
++        auto tex = rx::rhi::Texture2D::create(fixture->physicalDevice, fixture->device, *allocator, VkExtent2D{64, 64},
++                                               VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT,
++                                               /*requestedMipLevels=*/1, rx::rhi::MemoryCategory::Texture);
++        REQUIRE(tex.has_value());
++        CHECK(tex->category() == rx::rhi::MemoryCategory::Texture);
++        CHECK(tex->allocatedBytes() > 0);
++
++        // A synthetic Transient-tagged buffer stands in for a
++        // TransientPool-shaped caller (matrix row 10's own "mock
++        // TextureCache-shaped caller" allowance -- TransientPool/
++        // GeometryPool/TextureCache real call sites are other tasks' scope).
++        auto transientBuf = allocator->createHostVisibleBuffer(4096, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
++                                                                  rx::rhi::MemoryCategory::Transient);
++        REQUIRE(transientBuf.has_value());
++
++        rx::rhi::RxMemoryReport report = allocator->report();
++        CHECK(report.category(rx::rhi::MemoryCategory::GeometryPool).count == 1);
++        CHECK(report.category(rx::rhi::MemoryCategory::GeometryPool).bytes == buf->allocatedBytes());
++        CHECK(report.category(rx::rhi::MemoryCategory::Texture).count == 1);
++        CHECK(report.category(rx::rhi::MemoryCategory::Texture).bytes == tex->allocatedBytes());
++        CHECK(report.category(rx::rhi::MemoryCategory::Transient).count == 1);
++        CHECK_FALSE(report.heaps.empty());
++    }
++
++    // Every tagged resource above just went out of scope (destroyed) --
++    // the ledger must read exactly zero again (row 16's own "asserts the
++    // report reads all-zero at the end").
++    rx::rhi::RxMemoryReport afterReport = allocator->report();
++    for (size_t i = 0; i < rx::rhi::kMemoryCategoryCount; ++i) {
++        CHECK(afterReport.categories[i].bytes == 0);
++        CHECK(afterReport.categories[i].count == 0);
++    }
++
++    vkDeviceWaitIdle(fixture->device);
++    allocator.reset();
++    vkb::destroy_device(fixture->vkbDevice);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/src/rx_rhi_vk/tests/oom_handling_test.cpp b/src/rx_rhi_vk/tests/oom_handling_test.cpp
+new file mode 100644
+index 0000000..3e18baf
+--- /dev/null
++++ b/src/rx_rhi_vk/tests/oom_handling_test.cpp
+@@ -0,0 +1,234 @@
++#include <doctest/doctest.h>
++#include <rx_rhi_vk/buffer.h>
++#include <rx_rhi_vk/context.h>
++#include <rx_rhi_vk/memory_report.h>
++#include <rx_rhi_vk/texture.h>
++#include <VkBootstrap.h>
++#include <optional>
++#include <string_view>
++#include <utility>
++
++// [Phase 4 Task 10, spec D24(d)] VK_ERROR_OUT_OF_DEVICE_MEMORY handling at
++// the 5 enumerated allocation choke points (gate/matrix-issue27-memory-
++// budget.md rows 5-9 / the plan Task 10's own audit checklist):
++//   1. vmaCreateAllocator            (Allocator::createRaw)
++//   2. Allocator::createHostVisibleBuffer
++//   3. Allocator::createDeviceLocalBuffer
++//   4. Allocator::createUploadRingBuffer
++//   5. Texture2D::create (vmaCreateImage vs vkCreateImageView, two
++//      DISTINCT failure classes)
++//
++// Rows 6-9 are forced via VmaAllocatorCreateInfo::pHeapSizeLimit
++// (Allocator::createRaw()'s own `forcedHeapSizeLimitBytes` parameter) --
++// VMA's own documented, host-side "test how your program behaves with
++// limited memory" mechanism (vk_mem_alloc.h's `heap_memory_limit` docs):
++// deterministically returns VK_ERROR_OUT_OF_DEVICE_MEMORY on the next
++// allocation that would exceed the forced ceiling, with NO dependency on
++// actually exhausting real GPU memory or on any driver's overallocation
++// behavior -- exactly the "tiny mock/--budget-override allocator ceiling"
++// the plan's own Task 10 steps call for.
++//
++// Row 5 (vmaCreateAllocator itself) is DELIBERATELY not exercised via a
++// real forced failure: verified directly against the vendored VMA 3.4.0
++// source that vmaCreateAllocator's constructor does
++// `VMA_ASSERT(pCreateInfo->physicalDevice && pCreateInfo->device &&
++// pCreateInfo->instance)` (vk_mem_alloc.h:13343) -- passing null/invalid
++// handles to force a failure would abort() the WHOLE test process (VMA's
++// default VMA_ASSERT is a real assert(), not a soft check), not fail this
++// one test case gracefully. The matrix itself marks this row "Lower
++// priority than rows 6-9". Instead, classifyAllocationFailure() -- the
++// single source of truth Allocator::createRaw()'s own vmaCreateAllocator
++// failure branch (buffer.cpp) uses for its log message -- is exercised
++// directly, device-free.
++
++TEST_CASE("classifyAllocationFailure names OutOfDeviceMemory/OutOfHostMemory distinctly from a generic failure "
++          "(row 5's classification logic, device-free)") {
++    CHECK(rx::rhi::classifyAllocationFailure(VK_SUCCESS) == rx::rhi::AllocationFailureKind::None);
++    CHECK(rx::rhi::classifyAllocationFailure(VK_ERROR_OUT_OF_DEVICE_MEMORY) ==
++          rx::rhi::AllocationFailureKind::OutOfDeviceMemory);
++    CHECK(rx::rhi::classifyAllocationFailure(VK_ERROR_OUT_OF_HOST_MEMORY) ==
++          rx::rhi::AllocationFailureKind::OutOfHostMemory);
++    CHECK(rx::rhi::classifyAllocationFailure(VK_ERROR_INITIALIZATION_FAILED) == rx::rhi::AllocationFailureKind::Other);
++    CHECK(rx::rhi::classifyAllocationFailure(VK_ERROR_DEVICE_LOST) == rx::rhi::AllocationFailureKind::Other);
++}
++
++TEST_CASE("allocationFailureKindName covers every AllocationFailureKind value distinctly") {
++    using rx::rhi::AllocationFailureKind;
++    CHECK(std::string_view(rx::rhi::allocationFailureKindName(AllocationFailureKind::None)) == "None");
++    CHECK(std::string_view(rx::rhi::allocationFailureKindName(AllocationFailureKind::OutOfDeviceMemory)) ==
++          "OutOfDeviceMemory");
++    CHECK(std::string_view(rx::rhi::allocationFailureKindName(AllocationFailureKind::OutOfHostMemory)) ==
++          "OutOfHostMemory");
++    CHECK(std::string_view(rx::rhi::allocationFailureKindName(AllocationFailureKind::Other)) == "Other");
++}
++
++namespace {
++
++// Same headless fixture shape as memory_report_test.cpp/memory_budget_test.cpp.
++struct HeadlessFixture {
++    rx::rhi::Context context;
++    vkb::Device vkbDevice;
++    VkDevice device;
++    VkPhysicalDevice physicalDevice;
++    VkInstance instance;
++};
++
++std::optional<HeadlessFixture> makeHeadlessFixture() {
++    auto context = rx::rhi::Context::create({}, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++    VkInstance instance = context->instance();
++
++    vkb::PhysicalDeviceSelector selector(context->vkbInstance());
++    auto physResult = selector.set_minimum_version(1, 3).select();
++    if (!physResult.has_value()) {
++        MESSAGE("no Vulkan 1.3 physical device available, skipping test");
++        return std::nullopt;
++    }
++
++    auto deviceResult = vkb::DeviceBuilder(physResult.value()).build();
++    REQUIRE(deviceResult.has_value());
++    vkb::Device vkbDevice = deviceResult.value();
++    volkLoadDevice(vkbDevice.device);
++
++    return HeadlessFixture{std::move(*context), vkbDevice, vkbDevice.device, vkbDevice.physical_device.physical_device,
++                            instance};
++}
++
++// A tiny-but-nonzero forced heap ceiling: every memory heap on the device
++// is capped to this many bytes at allocator-creation time
++// (VmaAllocatorCreateInfo::pHeapSizeLimit), so ANY allocation attempt
++// larger than this deterministically fails with
++// VK_ERROR_OUT_OF_DEVICE_MEMORY -- see this file's own top comment.
++constexpr VkDeviceSize kForcedHeapCeilingBytes = 4096;
++constexpr VkDeviceSize kOversizedRequestBytes = 16ull * 1024ull * 1024ull;  // 16 MiB, far over the ceiling
++
++}  // namespace
++
++TEST_CASE("Allocator::createHostVisibleBuffer surfaces a named OutOfDeviceMemory failure, report-attached, under a "
++          "forced heap ceiling (row 6)") {
++    auto fixture = makeHeadlessFixture();
++    if (!fixture.has_value()) {
++        return;
++    }
++    auto allocator =
++        rx::rhi::Allocator::createRaw(fixture->physicalDevice, fixture->device, fixture->instance,
++                                       /*memoryBudgetExtensionEnabled=*/false, kForcedHeapCeilingBytes);
++    REQUIRE(allocator.has_value());
++
++    auto buffer = allocator->createHostVisibleBuffer(kOversizedRequestBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
++                                                       rx::rhi::MemoryCategory::Internal);
++    CHECK_FALSE(buffer.has_value());
++    CHECK(allocator->lastAllocationFailureKind() == rx::rhi::AllocationFailureKind::OutOfDeviceMemory);
++    CHECK_FALSE(allocator->lastAllocationFailureReport().heaps.empty());
++
++    allocator.reset();
++    vkb::destroy_device(fixture->vkbDevice);
++}
++
++TEST_CASE("Allocator::createDeviceLocalBuffer surfaces a named OutOfDeviceMemory failure, report-attached, under a "
++          "forced heap ceiling (row 7 -- the highest-traffic site)") {
++    auto fixture = makeHeadlessFixture();
++    if (!fixture.has_value()) {
++        return;
++    }
++    auto allocator =
++        rx::rhi::Allocator::createRaw(fixture->physicalDevice, fixture->device, fixture->instance,
++                                       /*memoryBudgetExtensionEnabled=*/false, kForcedHeapCeilingBytes);
++    REQUIRE(allocator.has_value());
++
++    auto buffer = allocator->createDeviceLocalBuffer(kOversizedRequestBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
++                                                       rx::rhi::MemoryCategory::GeometryPool);
++    CHECK_FALSE(buffer.has_value());
++    CHECK(allocator->lastAllocationFailureKind() == rx::rhi::AllocationFailureKind::OutOfDeviceMemory);
++    CHECK_FALSE(allocator->lastAllocationFailureReport().heaps.empty());
++
++    // The failed allocation must not have been recorded into the ledger --
++    // a failed create() has nothing to release() later, and the ledger
++    // must stay exactly zero.
++    CHECK(allocator->report().category(rx::rhi::MemoryCategory::GeometryPool).count == 0);
++
++    allocator.reset();
++    vkb::destroy_device(fixture->vkbDevice);
++}
++
++TEST_CASE("Allocator::createUploadRingBuffer surfaces a named OutOfDeviceMemory failure, report-attached, under a "
++          "forced heap ceiling (row 8)") {
++    auto fixture = makeHeadlessFixture();
++    if (!fixture.has_value()) {
++        return;
++    }
++    auto allocator =
++        rx::rhi::Allocator::createRaw(fixture->physicalDevice, fixture->device, fixture->instance,
++                                       /*memoryBudgetExtensionEnabled=*/false, kForcedHeapCeilingBytes);
++    REQUIRE(allocator.has_value());
++
++    auto buffer = allocator->createUploadRingBuffer(kOversizedRequestBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    CHECK_FALSE(buffer.has_value());
++    CHECK(allocator->lastAllocationFailureKind() == rx::rhi::AllocationFailureKind::OutOfDeviceMemory);
++    CHECK_FALSE(allocator->lastAllocationFailureReport().heaps.empty());
++
++    allocator.reset();
++    vkb::destroy_device(fixture->vkbDevice);
++}
++
++TEST_CASE("Texture2D::create surfaces a named OutOfDeviceMemory failure, report-attached, under a forced heap "
++          "ceiling on its vmaCreateImage step (row 9)") {
++    auto fixture = makeHeadlessFixture();
++    if (!fixture.has_value()) {
++        return;
++    }
++    auto allocator =
++        rx::rhi::Allocator::createRaw(fixture->physicalDevice, fixture->device, fixture->instance,
++                                       /*memoryBudgetExtensionEnabled=*/false, kForcedHeapCeilingBytes);
++    REQUIRE(allocator.has_value());
++
++    // A 1024x1024 RGBA8 image (4 MiB of pixel data alone) comfortably
++    // exceeds the 4 KiB forced ceiling regardless of alignment/tiling
++    // padding.
++    auto texture = rx::rhi::Texture2D::create(fixture->physicalDevice, fixture->device, *allocator,
++                                               VkExtent2D{1024, 1024}, VK_FORMAT_R8G8B8A8_UNORM,
++                                               VK_IMAGE_USAGE_SAMPLED_BIT, /*requestedMipLevels=*/1,
++                                               rx::rhi::MemoryCategory::Texture);
++    CHECK_FALSE(texture.has_value());
++    CHECK(allocator->lastAllocationFailureKind() == rx::rhi::AllocationFailureKind::OutOfDeviceMemory);
++    CHECK_FALSE(allocator->lastAllocationFailureReport().heaps.empty());
++    CHECK(allocator->report().category(rx::rhi::MemoryCategory::Texture).count == 0);
++
++    allocator.reset();
++    vkb::destroy_device(fixture->vkbDevice);
++}
++
++TEST_CASE("Texture2D::create's vmaCreateImage-failure and vkCreateImageView-failure classes are distinguishable: "
++          "the non-memory path never touches Allocator's memory-failure state (row 9)") {
++    auto fixture = makeHeadlessFixture();
++    if (!fixture.has_value()) {
++        return;
++    }
++    auto allocator = rx::rhi::Allocator::createRaw(fixture->physicalDevice, fixture->device, fixture->instance);
++    REQUIRE(allocator.has_value());
++
++    // Seed a KNOWN memory-failure state via the real OOM path first (a
++    // small, otherwise-successful allocator; force it by hand via
++    // noteAllocationFailure() directly -- this test's own point is
++    // Allocator-state isolation, not re-proving row 7's forcing mechanism
++    // again).
++    allocator->noteAllocationFailure("test-seed", rx::rhi::MemoryCategory::Texture, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++    REQUIRE(allocator->lastAllocationFailureKind() == rx::rhi::AllocationFailureKind::OutOfDeviceMemory);
++    rx::rhi::RxMemoryReport seededReport = allocator->lastAllocationFailureReport();
++
++    // A vkCreateImageView-class failure (device/API-misuse, not a memory
++    // event) must NOT overwrite that seeded state -- exactly what keeps
++    // the two failure classes distinguishable to a caller inspecting
++    // Allocator state afterward.
++    allocator->noteNonMemoryFailure("Texture2D::create(vkCreateImageView)", VK_ERROR_FORMAT_NOT_SUPPORTED);
++
++    CHECK(allocator->lastAllocationFailureKind() == rx::rhi::AllocationFailureKind::OutOfDeviceMemory);
++    CHECK(allocator->lastAllocationFailureReport().budgetSource == seededReport.budgetSource);
++    for (size_t i = 0; i < rx::rhi::kMemoryCategoryCount; ++i) {
++        CHECK(allocator->lastAllocationFailureReport().categories[i].bytes == seededReport.categories[i].bytes);
++        CHECK(allocator->lastAllocationFailureReport().categories[i].count == seededReport.categories[i].count);
++    }
++
++    allocator.reset();
++    vkb::destroy_device(fixture->vkbDevice);
++}
