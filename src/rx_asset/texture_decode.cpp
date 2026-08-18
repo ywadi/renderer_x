@@ -40,8 +40,11 @@ bool roleExpectsSrgb(TextureRole role) {
 
 // D10 role -> transcode-target table [matrix-issue03 "Role->format matrix
 // completeness" row]: TOTAL over TextureRole via an exhaustive switch with
-// NO default case -- adding an enumerator without a case here is a
-// compile ERROR (-Wswitch), not a silently-wrong runtime default. BC4_R
+// NO default case -- adding an enumerator without a case here produces a
+// compiler WARNING (-Wswitch; this project's build carries no -Werror
+// anywhere, verified directly, so this is real but non-fatal build-log
+// signal, not a hard compile error), not a silently-wrong runtime
+// default. BC4_R
 // for single-channel occlusion is D10's "recorded option" -- NOT
 // implemented here (BC7_UNORM stands for occlusion, matching D10's own
 // table verbatim); a future task may add it as a genuinely distinct

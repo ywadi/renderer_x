@@ -1,5 +1,7 @@
 #include <doctest/doctest.h>
 #include <rx_asset/texture_cache.h>
+#include <rx_core/log.h>
+#include <rx_core/log_forward_sink.h>
 #include <rx_rhi_vk/bindless.h>
 #include <rx_rhi_vk/command.h>
 #include <rx_rhi_vk/deletion_queue.h>
@@ -8,12 +10,14 @@
 #include <rx_platform/window.h>
 #include <rx_shader/compiler.h>
 #include <rx_shader/reflection.h>
+#include <spdlog/sinks/ostream_sink.h>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -536,6 +540,38 @@ bool approxEqual(const std::array<uint8_t, 4>& actual, std::array<uint8_t, 3> ex
            std::abs(static_cast<int>(actual[2]) - expectedRgb[2]) <= tolerance;
 }
 
+// [Fix round 1] Swaps spdlog's default logger for an ostream-capturing one
+// for the scope of one TEST_CASE -- the same lightweight rx_core-only
+// pattern src/rx_core/tests/log_test.cpp, texture_decode_test.cpp, and
+// import_gltf_basisu_test.cpp all already establish (duplicated per-file,
+// matching this codebase's own established precedent, not shared).
+struct LogCapture {
+    std::ostringstream stream;
+    std::shared_ptr<spdlog::logger> previousDefault;
+
+    LogCapture() {
+        rx::core::log::init();
+        previousDefault = spdlog::default_logger();
+        auto sink = std::make_shared<spdlog::sinks::ostream_sink_mt>(stream);
+        auto testLogger = std::make_shared<spdlog::logger>("texture_cache_test", sink);
+        testLogger->set_pattern("%v");
+        spdlog::set_default_logger(testLogger);
+    }
+    ~LogCapture() { spdlog::set_default_logger(previousDefault); }
+
+    std::string str() const { return stream.str(); }
+    int count(const std::string& needle) const {
+        const std::string s = str();
+        int n = 0;
+        size_t pos = 0;
+        while ((pos = s.find(needle, pos)) != std::string::npos) {
+            ++n;
+            pos += needle.size();
+        }
+        return n;
+    }
+};
+
 }  // namespace
 
 // ===== create() + D11 fallback textures =====================================
@@ -965,6 +1001,121 @@ TEST_CASE("TextureCache GPU: every mip level of a flat-color chain -- INCLUDING 
         CHECK(approxEqual(readback->topLeft, {255, 128, 0}, 6));
         CHECK(approxEqual(readback->bottomRight, {255, 128, 0}, 6));
     }
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// ===== Fix round 1, reviewer IMPORTANT-2: non-Basis KTX2 end-to-end =======
+// coverage (previously: raw_rgba8.ktx2 was never loaded through
+// TextureCache in any test -- only through the device-free decode layer
+// directly -- and srgb_mislabeled_normal.ktx2 is UASTC/Basis, so neither
+// live criterion of the non-Basis matrix row was proven end to end).
+
+TEST_CASE("TextureCache GPU [IMPORTANT-2a]: a non-Basis (raw, uncompressed) KTX2 uploads in its STORED format "
+          "-- never transcoded, never relabeled -- and its quadrant colors render correctly through the SAME "
+          "bindless-sampled draw path the Basis fixtures use, proving the non-Basis upload branch end to end "
+          "(not just format bookkeeping)") {
+    auto fixture = makeFixture("rx_asset_tc_nonbasis_e2e");
+    if (!fixture.has_value()) {
+        return;
+    }
+    makeCache(*fixture);
+
+    TextureHandle handle = fixture->cache->load(fixturePath("raw_rgba8.ktx2"), TextureRole::BaseColor);
+    REQUIRE(handle.isValid());
+    const TextureRecord& record = fixture->cache->resolve(handle);
+    REQUIRE_FALSE(record.isFallback);
+
+    // "uploaded in stored format when supported" -- raw_rgba8.ktx2's own
+    // container vkFormat (verified directly via ktxinfo at fixture-
+    // generation time, generate_fixtures.sh's own comment on this
+    // fixture) IS VK_FORMAT_R8G8B8A8_SRGB; role (BaseColor) agrees, so
+    // there is no colorspace disagreement to additionally prove here --
+    // IMPORTANT-2b below covers the disagreeing case.
+    CHECK(record.format == VK_FORMAT_R8G8B8A8_SRGB);
+    CHECK(record.width == 4);
+    CHECK(record.height == 4);
+    CHECK(record.mipLevels == 1);
+
+    SamplerDesc nearestDesc;
+    nearestDesc.magFilter = 9728;  // NEAREST -- exact texel reads
+    nearestDesc.minFilter = 9728;
+    VkSampler sampler = fixture->cache->getOrCreateSampler(nearestDesc);
+    REQUIRE(sampler != VK_NULL_HANDLE);
+    rx::rhi::BindlessHandle samplerHandle = fixture->bindless.registerSampler(sampler);
+    REQUIRE(samplerHandle.isValid());
+
+    auto readback = renderAndReadbackQuadrants(*fixture, record.bindlessIndex, samplerHandle.index(), /*lod=*/0.0F);
+    REQUIRE(readback.has_value());
+
+    // Same quadrant fixture pattern as basecolor_uastc.ktx2 (both encode
+    // quadrant4x4.png): TL=red, TR=green, BL=blue, BR=yellow.
+    CHECK(approxEqual(readback->topLeft, {255, 0, 0}, 2));
+    CHECK(approxEqual(readback->topRight, {0, 255, 0}, 2));
+    CHECK(approxEqual(readback->bottomLeft, {0, 0, 255}, 2));
+    CHECK(approxEqual(readback->bottomRight, {255, 255, 0}, 2));
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("TextureCache GPU [IMPORTANT-2b]: a non-Basis KTX2 with a container-vs-role colorspace disagreement "
+          "still fires the WARN, but its stored format is KEPT (no relabel) -- deliberately different from "
+          "the Basis path's own free relabel (srgb_mislabeled_normal.ktx2's own test)") {
+    auto fixture = makeFixture("rx_asset_tc_nonbasis_mislabel");
+    if (!fixture.has_value()) {
+        return;
+    }
+    makeCache(*fixture);
+
+    LogCapture capture;
+    // raw_srgb_mislabeled_normal.ktx2 [generate_fixtures.sh]: content is
+    // linear normal-map data (normal_flat.png), container transfer
+    // function force-assigned sRGB, NO --encode (non-Basis, KHR_DF_MODEL_
+    // RGBSDA -- verified directly via ktxinfo at generation time, so
+    // ktxTexture2_NeedsTranscoding() reports false for this fixture).
+    TextureHandle handle = fixture->cache->load(fixturePath("raw_srgb_mislabeled_normal.ktx2"), TextureRole::Normal);
+    REQUIRE(handle.isValid());
+    const TextureRecord& record = fixture->cache->resolve(handle);
+    REQUIRE_FALSE(record.isFallback);
+
+    // The WARN fires -- role (Normal, linear) disagrees with the
+    // container's own forced sRGB claim.
+    CHECK(capture.count("disagrees with the role's") == 1);
+
+    // NO RELABEL: the non-Basis path keeps the container's own stored
+    // format verbatim (VK_FORMAT_R8G8B8A8_SRGB, verified directly via
+    // ktxinfo at fixture-generation time) -- NEVER coerced to a UNORM
+    // variant the way the Basis path would (D10/gate ruling #3's
+    // "relabeling is scoped to the Basis-transcoded path only" scope
+    // decision, texture_cache.cpp's own comment on loadKtx2Bytes).
+    CHECK(record.format == VK_FORMAT_R8G8B8A8_SRGB);
+    CHECK(record.width == 8);
+    CHECK(record.height == 8);
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// ===== Fix round 1, reviewer minor 4.5: direct one-log-per-asset dedup ====
+
+TEST_CASE("TextureCache [minor 4.5]: loading the SAME failing asset twice logs the failure WARN/ERROR exactly "
+          "ONCE, not once per call -- D11's own 'no per-frame spam' dedup criterion, proven directly against "
+          "captured log output (not just the D24/accounting side effects other tests already exercise)") {
+    auto fixture = makeFixture("rx_asset_tc_logonce");
+    if (!fixture.has_value()) {
+        return;
+    }
+    makeCache(*fixture);
+
+    LogCapture capture;
+    TextureHandle first = fixture->cache->load(fixturePath("corrupt.ktx2"), TextureRole::BaseColor);
+    TextureHandle second = fixture->cache->load(fixturePath("corrupt.ktx2"), TextureRole::BaseColor);
+    CHECK(first == fixture->cache->checkerboardHandle());
+    CHECK(second == fixture->cache->checkerboardHandle());
+
+    // Exactly one "failed to load" line for this exact asset path, across
+    // BOTH calls -- the second call's failure is silent (D11 dedup), not
+    // merely coincidentally deduped by some OTHER mechanism.
+    CHECK(capture.count("failed to load") == 1);
 
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }

@@ -73,8 +73,13 @@ struct RoleFormatEntry {
 // completeness" row: "adding a role without a matrix entry fails a
 // static_assert/exhaustive-switch (compile-time completeness)"] --
 // texture_decode.cpp's own implementation is a `switch` with NO default
-// case, so an added enumerator that is not also given a case here is a
-// compile ERROR, not a silently-wrong runtime fallback.
+// case, so an added enumerator that is not also given a case here
+// produces a compiler WARNING (-Wswitch; verified directly, this project
+// has no -Werror anywhere in its build configuration -- a genuine
+// "compile ERROR" claim here would be false and was corrected during
+// this task's review), not a silently-wrong runtime fallback. The
+// warning is still real, visible build-log signal, deliberately kept
+// over adding a `default:` case that would silence it.
 const RoleFormatEntry& roleFormatTable(TextureRole role);
 
 // Caller-supplied "does this device/driver support SAMPLED_IMAGE +

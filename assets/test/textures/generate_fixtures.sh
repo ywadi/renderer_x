@@ -169,6 +169,18 @@ printf '\x89PNG\r\n\x1a\nGARBAGE-NOT-A-REAL-PNG-STREAM' > "${OUT_DIR}/corrupt.pn
 # upload as-is" branch reliably, not the fallback branch by accident.
 "${TOKTX}" --t2 --target_type RGBA --assign_oetf srgb "${OUT_DIR}/raw_rgba8.ktx2" quadrant4x4.png
 
+# [Fix round 1, reviewer IMPORTANT-2] RAW (non-Basis) sRGB-mislabeled
+# normal -- the non-Basis-path twin of srgb_mislabeled_normal.ktx2 above:
+# same linear normal-map CONTENT (normal_flat.png), same forced
+# --assign_oetf srgb container claim, but NO --encode at all, so this
+# container needs no transcoding (ktxTexture2_NeedsTranscoding() ==
+# false) and stores real RGBA8 bytes directly. Proves the non-Basis path's
+# OWN "container-vs-role WARN still fires, but the stored format is kept
+# (no relabel)" behavior -- deliberately DIFFERENT from the Basis path's
+# own free relabel (see texture_cache.cpp's own comment on why
+# relabeling is scoped to the Basis-transcoded path only).
+"${TOKTX}" --t2 --target_type RGBA --assign_oetf srgb "${OUT_DIR}/raw_srgb_mislabeled_normal.ktx2" normal_flat.png
+
 # Deliberately corrupt KTX2 -- valid 12-byte KTX2 identifier (so
 # looksLikeKtx2() routes it to the libktx path) followed by garbage, for
 # the "corrupted container -> named parse error, no crash" acceptance row.

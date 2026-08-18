@@ -767,7 +767,33 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
                 return;
             }
             ref.present = true;
-            ref.handle = registry.fallbackTextureHandle();  // [D11] overwritten below on a successful real resolve
+            ref.handle = registry.fallbackTextureHandle();  // [D11] Task-13 baseline -- the textures==nullptr contract, unchanged
+            // [Fix round 1, reviewer IMPORTANT-1] The instant a TextureCache
+            // exists, EVERY failure path below (out-of-range textureIndex,
+            // no resolvable image index, resolveImageBytes() failure --
+            // malformed bufferView, an absolute/network URI never fetched,
+            // a missing file) must leave `ref.handle` pointing into THAT
+            // TextureCache's OWN handle space, never
+            // registry.fallbackTextureHandle() -- a handle from Registry's
+            // completely separate `textures_` HandlePool. The two were
+            // never meant to be interchangeable: they only ever compared
+            // equal because BOTH classes' constructors unconditionally
+            // acquire their own single fallback entry first, into an
+            // otherwise-untouched pool (Registry's `textures_` never grows
+            // past that one acquire anywhere in this codebase), so both
+            // land on Handle(index=0, generation=1) in every reachable
+            // test today -- a structural coincidence of this task's
+            // current code, not a real cross-pool identity, and the first
+            // future change to either build order (Registry acquiring a
+            // second texture, or TextureCache::create() building its
+            // fallbacks in a different sequence) would silently start
+            // resolving to the wrong pool's entry. Set unconditionally
+            // here (before any of the resolution attempts below, all of
+            // which overwrite it again on success) so every failure path
+            // is correct by construction rather than by accident.
+            if (textures != nullptr) {
+                ref.handle = textures->checkerboardHandle();
+            }
             if (info->textureIndex < asset.textures.size()) {
                 const fastgltf::Texture& tex = asset.textures[info->textureIndex];
                 // KHR_texture_basisu [D10]: a texture's basisuImageIndex,

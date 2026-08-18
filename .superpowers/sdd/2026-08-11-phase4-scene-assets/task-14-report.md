@@ -62,7 +62,7 @@ $ grep -n "std::filesystem\|ifstream\|ofstream\|fopen\|::open(" src/rx_asset/tex
 Both hits are `std::filesystem::path` **type usage / pure path manipulation** (`parent_path()`), never I/O — the actual `ifstream` open lives in `byte_source.cpp` (a different translation unit, Task 13's own file). In-memory load test: `texture_decode_test.cpp`'s `DecodedKtx2Texture::parseAndTranscode` cases read fixture bytes via `std::ifstream` in the **test** file (not `texture_cache.cpp`) and pass the resulting `std::span<const std::byte>` straight to `loadFromBytes`/`parseAndTranscode` — `texture_cache_test.cpp`'s own "an in-memory KTX2 byte span (never touching disk inside the call)" test is explicit about this.
 
 ### Transcode target selection / role→format matrix
-`roleFormatTable()` is an exhaustive `switch` (no `default`) over `TextureRole`, TOTAL by construction (`-Wswitch` would fail to compile an unhandled case). Verified per-role: BaseColor/Emissive → `KTX_TTF_BC7_RGBA`/`VK_FORMAT_BC7_SRGB_BLOCK`; Normal → `KTX_TTF_BC5_RG`/`VK_FORMAT_BC5_UNORM_BLOCK`; MetallicRoughness/Occlusion/GenericData → `KTX_TTF_BC7_RGBA`/`VK_FORMAT_BC7_UNORM_BLOCK`. `texture_decode_test.cpp`'s `roleFormatTable is TOTAL...` test asserts every entry directly. BC4_R for single-channel occlusion is D10's own "recorded option," not implemented — matches D10's literal text, not a gap.
+`roleFormatTable()` is an exhaustive `switch` (no `default`) over `TextureRole`, TOTAL by construction (`-Wswitch` warns on an unhandled case; this project's build has no `-Werror` anywhere, verified directly, so this is real but non-fatal build-log signal, not a hard compile error — **corrected in fix round 1**, see that section below). Verified per-role: BaseColor/Emissive → `KTX_TTF_BC7_RGBA`/`VK_FORMAT_BC7_SRGB_BLOCK`; Normal → `KTX_TTF_BC5_RG`/`VK_FORMAT_BC5_UNORM_BLOCK`; MetallicRoughness/Occlusion/GenericData → `KTX_TTF_BC7_RGBA`/`VK_FORMAT_BC7_UNORM_BLOCK`. `texture_decode_test.cpp`'s `roleFormatTable is TOTAL...` test asserts every entry directly. BC4_R for single-channel occlusion is D10's own "recorded option," not implemented — matches D10's literal text, not a gap.
 
 ### Non-Basis KTX2 detection (never via KTX_INVALID_OPERATION)
 `ktxTexture2_NeedsTranscoding()` confirmed present and public at v4.4.2 (resolving the matrix's own "to verify at vendoring" flag) and is the **only** thing consulted before calling `TranscodeBasis`. Proven both positively (`raw_rgba8.ktx2` fixture: `wasBasisEncoded()==false`, `currentVkFormat()==VK_FORMAT_R8G8B8A8_SRGB`, `levels()[0].bytes.size()==64` = tightly-packed uncompressed) and by **revert evidence** (§5 below).
@@ -207,3 +207,61 @@ Per the working agreement, every one of these was **found and fixed** before thi
 - **Fixture regenerability**: `assets/test/textures/generate_fixtures.sh` documents every `toktx`/ImageMagick invocation; re-running it from a clean checkout reproduces pixel/format/layout-identical fixtures (not byte-identical — `toktx` embeds a writer/timestamp key-value pair).
 - **License discipline**: vendoring commit records Apache-2.0 plus every bundled component's own license, with exact file citations, matching the ruling's explicit "PLUS the bundled-component licenses actually compiled" requirement.
 - **What I did not do**: did not touch `docs/`, the plan, the spec, the ledger, or the project board, per this task's global constraints. Did not modify any Task 10-13 file beyond the two narrowly-scoped, additive `rx_rhi_vk` extensions and the one `import_gltf.cpp` seam (`fillRef`'s texture-resolution body) this task's own brief explicitly names as its integration point.
+
+## 8. Fix round 1 (reviewer findings)
+
+Independent review verdict: Approved-with-minors. Two Important findings addressed below; three minors folded in; one Important (destructor-time validation errors escaping the doctest exit code) is a pre-existing, project-wide harness limitation the coordinator tracks separately — not this task's to fix, and nothing in this fix round touches it.
+
+### IMPORTANT 1 — latent cross-pool handle coincidence
+
+**Finding:** when a texture ref is present and a `TextureCache` is supplied but `resolveImageBytes()` fails (malformed bufferView, an unfetched absolute URI, a missing file), `ref.handle` was left at `registry.fallbackTextureHandle()` — a handle from Registry's own `textures_` `HandlePool`, not the `TextureCache` pool that a downstream `resolve()` call is actually made against. It only "worked" because both pools' first `acquire()` deterministically yields `Handle(index=0, generation=1)`.
+
+**Fix:** `import_gltf.cpp`'s `fillRef` now sets `ref.handle = textures->checkerboardHandle();` unconditionally the instant a `TextureCache` is supplied and a texture reference is present (before any resolution attempt), so every failure path below it — out-of-range `textureIndex`, no resolvable image index, and the specific `resolveImageBytes()` failure the finding named — inherits the correct value by construction rather than by the old accidental initial assignment.
+
+**New fixture:** `assets/test/cube_basisu_missing_image.gltf` (KHR_texture_basisu texture referencing `images[0].uri = "this_file_does_not_exist_anywhere.ktx2"`, reusing `cube_textured.bin`'s geometry) — a present-but-unresolvable reference.
+
+**New test:** `import_gltf_basisu_test.cpp`'s "a PRESENT texture reference whose bytes fail to resolve... resolves through THAT SAME TextureCache's own checkerboard" — asserts the import still succeeds overall (D11: never a hard failure), the exact "bytes could not be resolved -- D11 fallback" WARN fires exactly once (proving the failure branch, not the success branch, executed), and every field of `textures->resolve(ref.handle)` matches `textures->resolve(textures->checkerboardHandle())` field-for-field (`isFallback`, `bindlessIndex`, `width`, `height`, `format`).
+
+**Discrimination — filed exactly as it empirically is, not overclaimed:** value-based old-vs-new discrimination is **structurally impossible** in this test, and this was verified empirically, not merely reasoned about. `registry.fallbackTextureHandle()` and `fixture->textures->checkerboardHandle()` are BOTH, deterministically, `Handle(0,1)` in every reachable test — Registry's constructor acquires exactly one entry into `textures_` for its whole lifetime (nothing else in this codebase ever grows that pool), and `TextureCache::create()`'s `buildFallbackTextures()` unconditionally builds the checkerboard as the first entry in its own pool. Reverting the fix (`git stash push -- src/rx_asset/import_gltf.cpp`, rebuild, re-run the exact new test, `git stash pop` to restore) and re-running the new test produced:
+```
+[doctest] test cases:  1 |  1 passed | 0 failed | 39 skipped
+[doctest] assertions: 20 | 20 passed | 0 failed |
+[doctest] Status: SUCCESS!
+```
+— i.e. the test **still passes under the reverted, buggy code**, confirming the structural analysis rather than contradicting it. Per the reviewer's own sanctioned fallback ("if impractical to simulate, assert the handle belongs to the cache's pool by construction"), the test instead asserts correctness by construction (the field-for-field record match above), which is a real, meaningful property (a caller resolving `ref.handle` through `fixture->textures` gets a correct, defined checkerboard, regardless of what Registry's unrelated pool happens to hold at the same numeric slot) even though it cannot regression-fence this exact bug via a failing assertion. `git status`/`git diff` confirmed clean before and after the revert experiment; the full suite (§9 below) is green against the restored, final code.
+
+### IMPORTANT 2 — non-Basis KTX2 path had zero end-to-end coverage
+
+**Finding:** `raw_rgba8.ktx2` was never loaded through `TextureCache` in any test (only through the device-free decode layer directly), and `srgb_mislabeled_normal.ktx2` is UASTC (Basis path), so neither live criterion of the non-Basis matrix row — (a) uploaded in stored format when supported, (b) container-vs-role WARN still fires without relabel — was proven end to end.
+
+**Fix (a):** new GPU test `texture_cache_test.cpp`'s "[IMPORTANT-2a]... uploads in its STORED format... and its quadrant colors render correctly" — loads `raw_rgba8.ktx2` (the same quadrant-pattern content as the already-tested `basecolor_uastc.ktx2`, but non-Basis/uncompressed) through `TextureCache`, asserts `record.format == VK_FORMAT_R8G8B8A8_SRGB` (the container's own stored format, kept as-is), then renders and reads back all 4 quadrant colors through the same bindless-sampled draw path the Basis fixtures use — proving `Uploader::uploadImageMips`'s non-compressed branch end to end, not just format bookkeeping.
+
+**Fix (b):** new fixture `raw_srgb_mislabeled_normal.ktx2` (generator invocation documented in `generate_fixtures.sh`: same `normal_flat.png` linear-normal content as `srgb_mislabeled_normal.ktx2`, same forced `--assign_oetf srgb`, but **no** `--encode` — verified via `ktxinfo` at generation time: `Model: KHR_DF_MODEL_RGBSDA` (non-Basis, so `ktxTexture2_NeedsTranscoding()` is false) and `Transfer: KHR_DF_TRANSFER_SRGB`/`vkFormat: VK_FORMAT_R8G8B8A8_SRGB`). New GPU test "[IMPORTANT-2b]... still fires the WARN, but its stored format is KEPT (no relabel)" — loads it with `TextureRole::Normal` (which expects linear), asserts via `LogCapture` that the exact "disagrees with the role's" WARN fires exactly once, AND that `record.format` stays `VK_FORMAT_R8G8B8A8_SRGB` (never coerced to a UNORM variant the way the Basis path would relabel it) — proving the WARN is unconditional across both paths while the no-relabel scope decision (§6/§3's D10 section) holds precisely as documented.
+
+Both new tests pass; command output in §9.
+
+### Minor 4.4 — "compile ERROR" wording corrected
+
+Verified directly (again, independently of the reviewer): `grep -rn Werror` across `CMakeLists.txt`/`cmake/`/every touched `CMakeLists.txt` returns nothing — this project has no `-Werror` anywhere. Corrected the three places that overclaimed a hard compile error for the exhaustive `TextureRole` switch (`texture_decode.h`'s `roleFormatTable()` comment, `texture_decode.cpp`'s own implementation comment, and this report's §3) to say "compiler WARNING (-Wswitch; no -Werror in this project)" instead. **Not** adding `-Werror` — build-system policy is out of this task's scope, per the reviewer's own explicit instruction.
+
+### Minor 4.5 — direct one-log-per-asset dedup test
+
+New test `texture_cache_test.cpp`'s "[minor 4.5]... loading the SAME failing asset twice logs the failure WARN/ERROR exactly ONCE" — loads `corrupt.ktx2` twice via the same `TextureCache`, captures log output via `LogCapture`, asserts `capture.count("failed to load") == 1` across both calls. Previously this dedup criterion was only exercised as a side effect of other tests (e.g. the D24/accounting tests never double-loading a failing asset); this proves it directly against captured log text.
+
+### Minor 4.6 — split glTF→cache→pixel coverage (rationale, not fixed)
+
+Not added — the two halves are each already fully, independently proven: `import_gltf_basisu_test.cpp` proves glTF → `Registry::importGltf` → `TextureCache::loadFromBytes` → `resolve()` returns a role-correct, non-fallback record (no rendering pipeline exists in that binary); `texture_cache_test.cpp` proves `TextureCache::loadFromBytes` → upload → bindless registration → rendered, pixel-correct output (no glTF import in that binary). Both paths converge on the exact same `TextureCache::loadFromBytes()`/`registerRealTexture()` implementation regardless of whether the byte span originated from `import_gltf.cpp`'s `resolveImageBytes()` or a test's own `std::ifstream` — there is no third, untested code path a combined test would exercise that isn't already covered by the union of the two. Combining them would require either duplicating `texture_cache_test.cpp`'s ~150-line pipeline-building helper into the fastgltf-linked binary, or vice versa pulling `fastgltf`/`Registry` into the GPU-pipeline binary — a nontrivial binary-boundary change for marginal additional coverage, so skipped per the reviewer's own explicit "optional" framing.
+
+## 9. Fix round 1 — verification
+
+**linux-native**, the three covering targets, run individually after all fixes:
+```
+rx_asset_gltf_tests:      48 test cases | 292 assertions | 0 failed
+rx_asset_tests:            30 test cases | 446 assertions | 0 failed  (--validate, zero validation errors)
+rx_asset_gltf_gpu_tests:   40 test cases | 706 assertions | 0 failed  (--validate, zero validation errors)
+```
+Full `ctest` re-run: `100% tests passed, 0 tests failed out of 20` (42.00 sec).
+
+**windows-cross-zig**: `cmake --build build/windows-cross-zig -j8` → `EXIT=0` against the exact final fix-round code (all 10 rebuilt objects/binaries, including every file this fix round touched).
+
+**Commits (local, no attribution, not pushed):** see the top of this file for the original 4; fix round 1 adds commit(s) listed in the coordinator-facing reply. Only files this task owns were staged — `.superpowers/sdd/.../progress.md` (coordinator-managed) and `.../review-d0e49d8..1a1d246.diff` (the reviewer's own artifact) were left untouched, matching "commit only your own files."
