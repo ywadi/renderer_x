@@ -1,0 +1,34 @@
+--- a/mikktspace.c
++++ b/mikktspace.c
+@@ -1664,7 +1664,30 @@
+
+ 	// Random
+ 	t=uSeed&31;
+-	t=(uSeed<<t)|(uSeed>>(32-t));
++	// [RendererX local patch, 2026-08-19] `uSeed>>(32-t)` is undefined
++	// behavior in C whenever t==0 (shifting a 32-bit value by 32 is out
++	// of range for the promoted operand's width) -- UBSan citation:
++	// "mikktspace.c:1667:21: runtime error: shift exponent 32 is too
++	// large for 32-bit type 'unsigned int'" (RendererX closure-sweep
++	// item 2; reproduced under both LLVM UBSan and zig's trap-based
++	// sanitizer, the latter aborting the process outright). Upstream
++	// (github.com/mmikk/MikkTSpace, pinned 3e895b49d05ea07e4c2133156cf
++	// a94369e19e409) is unmaintained -- no commits since 2020-03-25, no
++	// tags/releases to pull a fix from -- so this is patched locally.
++	// This is the well-known "rotate-left via subtract-from-width" bug
++	// shape: t is a 5-bit rotate amount (t=uSeed&31, so t in [0,31]),
++	// and rotate-left by 0 is mathematically the identity (uSeed
++	// unchanged). On every target this project actually builds for
++	// (x86-64, native and windows-cross-zig), the underlying shift
++	// instruction already masks its count to 5 bits in hardware, so the
++	// ORIGINAL expression already evaluated to `uSeed>>0 == uSeed` at
++	// runtime whenever t==0 -- this patch makes that already-happening
++	// identity explicit and UB-free instead of changing it. Verified
++	// behavior-preserving: the existing tangent-generation tests
++	// (gltf_pipeline_test.cpp's generateTangentsDeindexed/processPrimitive
++	// cases) produce byte-identical tangent output before and after this
++	// patch (see closure-sweep-report.md item 2).
++	t = (t==0) ? uSeed : ((uSeed<<t)|(uSeed>>(32-t)));
+ 	uSeed=uSeed+t+3;
+ 	// Random end
+

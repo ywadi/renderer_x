@@ -598,10 +598,32 @@ set_target_properties(meshoptimizer::meshoptimizer PROPERTIES IMPORTED_GLOBAL TR
 # rather than through the dep-cache, matching this project's own
 # established "no CMakeLists -> compile straight into the consumer"
 # convention.
+#
+# Closure-sweep item 2 (upstream unmaintained -- no commits since
+# 2020-03-25, verified above -- so a local patch is the only option):
+# UBSan (both classic LLVM ubsan and zig's own trap-based sanitizer,
+# the latter aborting the process outright) reports undefined behavior
+# at mikktspace.c:1667 inside QuickSortEdges's pivot-selection PRNG --
+# "runtime error: shift exponent 32 is too large for 32-bit type
+# 'unsigned int'" on `uSeed>>(32-t)` whenever t==0. Patched via
+# PATCH_COMMAND (CMake/ExternalProject's own standard mechanism for
+# amending a FetchContent'd source tree, applied once per population,
+# same as every other FetchContent_Populate step above -- no hand-
+# rolled patching logic) against patches/mikktspace-ubsan-shift-fix.patch,
+# which carries the full rationale plus the UBSan citation and a
+# `// [RendererX local patch]` comment block inline in the patched
+# source itself. `-i <file>` (not shell redirection) keeps this a plain
+# argv command, portable across ExternalProject's execute_process
+# invocation. Verified: patch applies cleanly (`patch -p1 --dry-run`)
+# against a fresh checkout of the exact pinned commit above; the UBSan
+# report is gone afterward; the existing tangent-generation tests
+# produce byte-identical output before/after (closure-sweep-report.md
+# item 2 has the full before/after evidence).
 set(RX_MIKKTSPACE_COMMIT "3e895b49d05ea07e4c2133156cfa94369e19e409")
 FetchContent_Declare(mikktspace
   GIT_REPOSITORY https://github.com/mmikk/MikkTSpace.git
-  GIT_TAG ${RX_MIKKTSPACE_COMMIT})
+  GIT_TAG ${RX_MIKKTSPACE_COMMIT}
+  PATCH_COMMAND patch -p1 -i "${CMAKE_CURRENT_SOURCE_DIR}/patches/mikktspace-ubsan-shift-fix.patch")
 FetchContent_GetProperties(mikktspace)
 if(NOT mikktspace_POPULATED)
   FetchContent_Populate(mikktspace)
