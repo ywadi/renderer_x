@@ -97,7 +97,29 @@ The debug-observable, load-bearing half of "decode never runs on the IO thread" 
 - **Teardown**: §7/`~Registry()`'s own comment (`registry.cpp`) — cancels every outstanding job synchronously, before returning.
 - **Tracy zones**: `RX_ZONE_NAMED` on `computeGltfImport()` (whole-function) and every `parallelFor` chunk body (materials/primitives), `marshalGltfImportSync`/`PrepareStep`/`Finalize`; `RX_PLOT` for materials count, primitives count, and geometry bytes uploaded. **MANUAL_VERIFICATION procedure** (code presence, not CI-gated, per D18): build either preset with `RX_TRACY=ON` (default), run `rx_asset_gltf_gpu_tests --test-case="*WALL-CLOCK*"` (or any async import) with a Tracy profiler client (`tracy-profiler`) connected before launch, observe the named zones nested under the worker thread's own timeline row (distinct from the main thread's `pumpMain`-driven marshal zones) and the three plots updating as the import progresses.
 
-## 7. Self-review
+## 7. Known flake condition (honestly disclosed, not CI-relevant)
+
+Running the FULL project `ctest` suite with `-j4` (four GPU-backed test
+binaries executing fully concurrently, self-imposed — not this project's
+own CI invocation) intermittently pushed the wall-clock gate's 10ms
+stall-detector assertion over threshold once in several runs (observed:
+one failure in ~6 full-suite `-j4` runs during this task's own
+verification). Root-caused to real GPU/CPU contention from the OTHER
+concurrently-running GPU test binaries (`rx_rhi_vk_tests`/
+`rx_material_gpu_tests` also construct real `VkDevice`s and submit real
+GPU work at the same moment), not to anything in this task's own code —
+confirmed by immediately re-running the exact same binary standalone
+afterward, which passed cleanly every time. **This project's own CI
+(`.github/workflows/ci.yml:208`) invokes `ctest --preset linux-native
+--output-on-failure` with no `-j` flag at all — genuinely serial**, so
+this specific contention pattern does not arise there; documented here
+rather than silently discovered-and-ignored, per this task's own
+production-quality bar. If CI parallelism is ever introduced project-wide,
+the wall-clock gate (like any wall-clock assertion) would need runner-
+aware headroom -- a pre-existing, general property of D18's own model
+(">30% shared-runner variance"), not specific to this task.
+
+## 8. Self-review
 
 - Sync-path regression risk: mitigated by running the full pre-existing 118-case sync suite after every structural change to `import_gltf.cpp`/`texture_cache.cpp`/`geometry_pool.cpp`, unchanged pass count throughout.
 - The wall-clock gate is the one test whose numbers are machine-dependent by nature (D18); this report publishes the actual dev-machine numbers observed (§5) rather than asserting an unverified target.
