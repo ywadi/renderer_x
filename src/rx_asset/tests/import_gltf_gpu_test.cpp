@@ -972,6 +972,13 @@ TEST_CASE("importGltf: KHR_texture_transform offset/scale consumed (rotation log
     CHECK(mat.disposition == MaterialDisposition::Unlit);  // [gate ruling C5]
 
     REQUIRE(mat.baseColorTexture.present);
+    // Sampler state carried per texture reference [matrix row: "sampler
+    // state carried per texture ref"] -- the fixture's own sampler is
+    // CLAMP_TO_EDGE (33071) on both axes, LINEAR (9729) both filters.
+    CHECK(mat.baseColorTexture.sampler.wrapS == 33071U);
+    CHECK(mat.baseColorTexture.sampler.wrapT == 33071U);
+    CHECK(mat.baseColorTexture.sampler.magFilter == 9729U);
+    CHECK(mat.baseColorTexture.sampler.minFilter == 9729U);
     // [gate ruling C4] offset/scale consumed -- exact fixture values.
     CHECK(mat.baseColorTexture.uvOffset.x == doctest::Approx(0.25F));
     CHECK(mat.baseColorTexture.uvOffset.y == doctest::Approx(0.5F));
