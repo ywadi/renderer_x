@@ -243,6 +243,20 @@ minimization + early-Z); **blend** sorted strictly back-to-front by
 depth. Alpha-MASK draws go in the opaque partition (their pipeline
 variant handles cutoff). Sorting is `std::sort` on u64 keys per
 partition, parallelized per-view via TaskSet when list size warrants.
+**Gate annotations (2026-08-18, matrix-issue06 verified against bgfx
+SortKey + Filament CommandKey):** the key's bit layout is documented
+with named constants + a decode() round-trip test; the depth bucket is
+derived by truncating the monotonic float32 bit pattern (reversed-Z
+depths are non-negative, so the raw IEEE-754 pattern is
+sort-order-preserving) — never a linear rescale; the low bits carry a
+deterministic tie-break (the renderable's stable creation index) so
+`std::sort`'s output is fully determined at equal keys; partition
+sort DIRECTIONS are asserted on one shared fixture (opaque
+depth-bucket decreasing, blend increasing, under reversed-Z — the
+sign-flip bug class Filament's own `~distance` negation exists for);
+a `priority` tier (u8, 0-7, default 4 — Filament precedent) sits
+above pipeline bits; per-primitive blendOrder bits are RESERVED but
+unpopulated (techniques phase, registry).
 
 ### D15 — Culling in Phase 4: frustum + shadow-caster, CPU, parallel
 
@@ -259,6 +273,21 @@ counter gates. Layer masks (seed 5): renderable `layers: u32` vs camera
 filter both lighting and shadow-caster lists; defaults all-ones
 (conventions per [R:scene]: 32-bit layers à la Unity/Godot; 8 channels
 is deliberately more generous than Unreal's 3).
+**Gate annotations (2026-08-18):** the coupled channel model
+(channels gate lighting AND shadow-casting) is Unreal's, and is a
+DELIBERATE divergence from D19's Filament precedent, whose channels
+gate lighting only (verified against Filament shader source,
+matrix-issue07) — one predictable knob while the only light is
+directional; the separable split is revisited with punctual lights
+(techniques phase). All-ones defaults likewise diverge from every
+surveyed precedent (all default to bit-0-only) — deliberate
+middleware opt-out semantics; the default-visible/default-lit test is
+the regression guard. `RenderableDesc` additionally carries
+`castsShadows: bool = true` (per-object caster opt-out, Filament
+precedent). BLEND-partition draws are excluded from shadow lists in
+Phase 4, and the depth-only caster pass has no alpha test (MASK
+casters cast full silhouettes) — both documented, tested limitations
+revisited with the cascades work.
 
 ### D16 — Test content strategy (G14)
 
@@ -289,6 +318,15 @@ are published as artifacts and in release notes from the dev machine
 (>30% shared-runner variance [R:present]). This implements CLAUDE.md's
 "performance regression blocks like a failing test" via the numbers
 that *can* block honestly.
+**Amended (gate ruling RC6, 2026-08-18):** wall-clock STALL DETECTORS
+may block CI — an assertion whose threshold sits an order of magnitude
+above runner noise and whose failure signature is a correctness bug
+(e.g. an unbounded per-frame fence wait: tens of ms vs a 10 ms
+detector threshold) is a correctness gate, not a perf trend. Perf
+TRENDS remain never-CI-blocking. Concretely: the async-import overlap
+test asserts a 2 ms per-call main-thread budget locally (published,
+trend-tracked) and a 10 ms per-call stall-detector ceiling in CI
+(blocking).
 
 ### D19 — Scene data model: render proxies via component managers (seed 11 resolved)
 
@@ -372,10 +410,22 @@ failure, not a slowdown — this is floor-hardware work, not polish.
 `vkWaitForFences(..., UINT64_MAX)` (upload.cpp:278, "synchronous by
 design" — an acceptable Phase 2 choice that Stage 1 would fossilize into
 every asset-pipeline entry point). Phase 4 changes the **contract**, not
-the queue architecture: `flush()` returns a pollable `UploadTicket`
-(fence + ring generation); `isComplete(ticket)` / `wait(ticket)` added;
-staging-ring reclamation keys off ticket completion instead of
-having-already-blocked. All Stage-1 call sites (GeometryPool upload,
+the queue architecture: `flush()` returns a pollable `UploadTicket`;
+`isComplete(ticket)` / `wait(ticket)` added; staging-ring reclamation
+keys off ticket completion instead of having-already-blocked.
+**Primitive (gate ruling RC4, 2026-08-18): one TIMELINE SEMAPHORE**
+owned by the Uploader — each work-submitting `flush()` signals a
+monotonically increasing value; `UploadTicket = {uint64 value, uint32
+ringGeneration}`; `isComplete` = one `vkGetSemaphoreCounterValue`
+compare, `wait` = `vkWaitSemaphores`. Chosen over a fence pool because
+the current single-reused-fence design is structurally incompatible
+with pollable tickets (reset-while-referenced hazard, matrix-issue28
+row 1); a monotonic counter eliminates the hazard by construction
+(core Vulkan 1.2). Direct-path-only batches (UMA/ReBAR — the Deck
+common case) return an already-complete ticket; ring reclamation
+follows the D3D12 fence-value-queue pattern (poll-reclaim completed
+entries first, block only on the oldest ticket covering the needed
+range). All Stage-1 call sites (GeometryPool upload,
 TextureCache load, importer, async import) consume tickets;
 `MeshBuffers::create` keeps blocking behavior explicitly via
 `wait(ticket)`, documented as a convenience. D5's threading deferral
@@ -438,6 +488,41 @@ first-use PSO creation into one deterministic, hoistable point — the
 warmup hook the SDK/tooling-phase PSO-stutter item (registry) will
 attach to. The resolve/record API split remains the recorded future
 path; Phase 4 does not need it.
+
+### D28 — Fixed-function pipeline-state axis on materials (gate ruling RC1, 2026-08-18)
+
+Discovered independently by the #8 and #23 gate matrices:
+`MaterialSystem::getPipeline()` hardcodes blend/cull/depth-compare
+state with no cache-key axis, and `PassSignature`'s own header comment
+disclaims carrying it — D22's BLEND/doubleSided variants are
+unbuildable without new plumbing. Decision: `MaterialRecord` carries
+the fixed-function state (alphaMode → blend enable + depth-write +
+MASK-cutoff carriage; doubleSided → cull mode), included in the
+pipeline cache key; `PipelineRequest` unchanged. alphaMode/doubleSided
+are NOT specialization constants — they are `VkPipeline`
+fixed-function fields with zero SPIR-V representation (the plan's
+earlier "specialization bits gain alphaMode/doubleSided axes" phrasing
+is corrected); MASK's cutoff is a per-instance uniform with an
+always-present conditional discard. Lands with the material library
+(first consumer); this is the reusable mechanism future
+fixed-function-state needs (wireframe, stencil effects) extend.
+Compare-op fork resolved as option (a): the scene-path shadow-caster
+pass is a depth-only pipeline built OUTSIDE MaterialSystem, so
+`getPipeline()` serves only reversed-Z main-camera pipelines from
+Stage 2 on — no compare-op axis in Phase 4.
+
+### D29 — Per-pass depth convention & clear values in the render graph (gate ruling RC2, 2026-08-18)
+
+The executor's depth clear is a process-wide 1.0 constant at two
+sites (executor.cpp:646, :1119) and `AttachmentDesc` has no
+clear-value field — the scene path cannot clear a reversed-Z main
+depth (0.0) and a standard-Z shadow map (1.0) in the same frame,
+which D13 requires from Stage 2 on. Decision: `AttachmentDesc` gains
+`DepthConvention { Standard, Reversed }` on depth attachments; the
+clear value and the pass's expected compare direction derive from it;
+the executor reads it at both sites. Lands with the shadow bridge
+(its real blocker; that task's file list widens to rx_graph), tested
+with a two-pass frame mixing both conventions.
 
 ## Stage exit criteria
 

@@ -158,7 +158,8 @@ in the same pass:**
   feature in Phase 4, but it MUST (a) **decode** whatever is needed to
   open the file at all — **compression is non-negotiable: EXT_meshopt_
   compression (gltfpack's output, the de-facto shipping format;
-  meshoptimizer's decode is already vendored), KHR_mesh_quantization,
+  meshoptimizer is the committed decode library — gate correction
+  2026-08-18: NOT yet vendored, Task 13 budgets it), KHR_mesh_quantization,
   KHR_draco_mesh_compression** — a file that won't load is not "partial
   import," it is a broken importer; (b) **preserve** what later phases
   consume — **animation channels/samplers and morph targets**, same
@@ -215,6 +216,18 @@ create/destroy; report POD layout), GPU test (budget query returns
 sane nonzero values; forced small-budget path exercises the OOM error
 path with a mock/`--budget-override`) → implement → both presets →
 commit.
+**Gate hardening (2026-08-18, BINDING):** criteria per
+`gate/matrix-issue27-memory-budget.md` as amended by
+`gate/rulings-2026-08-18.md` §#27. Key deltas: `vmaSetCurrentFrameIndex`
+wired once per frame (without it `vmaGetHeapBudgets` silently serves
+stale values for up to 30 alloc/free ops — the matrix's load-bearing
+omission), with a staleness regression test; the 5 enumerated OOM call
+sites are the audit checklist (image-create vs image-view-create
+failure classes become distinguishable); `RxMemoryReport` carries
+per-HEAP budget/usage (RADV APUs expose multiple heaps by default —
+never a heap-count assumption) + an explicit budget-source flag;
+eviction contract text + minimal synthetic evict→fallback→reclaim
+wiring test owned here, real call sites in Tasks 13/19.
 
 ### Task 11: Uploader completion tickets (D25, card #28)
 
@@ -240,6 +253,19 @@ wall-clock threshold inside `flush()` (timer around the call, not frame
 counters); ring-wrap under in-flight tickets reclaims correctly
 (stress: many small uploads > ring size); `MeshBuffers::create`
 unchanged behavior → implement → both presets → commit.
+**Gate hardening (2026-08-18, BINDING):** criteria per
+`gate/matrix-issue28-upload-tickets.md` as amended by
+`gate/rulings-2026-08-18.md` §#28 + RC4. Key deltas: the ticket
+primitive is a TIMELINE SEMAPHORE (D25 amended — the current
+single-reused-fence design cannot support pollable tickets;
+reset-while-referenced hazard); the overlapping-flush discrimination
+test (two flushes, first ticket still reports its own true status) is
+the highest-priority gate; direct-path-only batches (UMA/ReBAR)
+return already-complete tickets; the wall-clock test must FAIL against
+pre-D25 code to prove it discriminates; transfer-queue acquisition
+uses `get_dedicated_queue` (never `require_dedicated_transfer_queue`);
+sample 04's three cited call sites are audited without claiming the
+list exhaustive.
 
 ### Task 12: GeometryPool (D8/D9, D26.4)
 
@@ -272,6 +298,16 @@ class GeometryPool { // main-thread affinity (D5)
   only, because it is unpurchasable later without reallocating and
   re-uploading the entire pool.
 **Steps:** device-free tests impossible (GPU) — GPU tests: upload two meshes → distinct non-overlapping ranges; free+re-upload reuses space (stats assert); exhaustion → new block, both drawable (record real indexed draws from two blocks, readback probe); BDA assertions above; zero validation errors → implement → both presets → commit.
+**Gate hardening (2026-08-18, BINDING):** criteria per
+`gate/matrix-issue21-geometry-pool.md` as amended by
+`gate/rulings-2026-08-18.md` §#21. Key deltas: per-allocation
+`VmaVirtualAllocationCreateInfo::alignment` = 48 (vertex) / 4 (index)
+with structural divisibility asserts (VMA does not know element
+strides — offsets must convert cleanly to vertexOffset/firstIndex);
+`stats()` includes block COUNT; the checkerboard fragmentation test
+proves no-defrag is observable behavior; "geometry-pool" category
+label threaded into the D24 accounting; u32 index width stands
+(16-bit sub-pools registered for the geometry phase).
 
 ### Task 13: Import core — fastgltf + MikkTSpace + meshoptimizer (D7)
 
@@ -300,6 +336,25 @@ Pipeline per primitive: fastgltf parse → mandatory attributes (missing normals
   break under eviction; one deferred-eviction path exercised in tests.
 - Upload paths consume Task 11 tickets.
 **Steps:** unit tests on committed cube (counts, AABB, tangent presence, meshopt actually ran — index order differs from source), DamagedHelmet integration test (fetched; counts/submeshes/skin-preservation assertions), error paths (missing file → fallback + log; garbage file → error result, no crash), byte-source injection test (import from an in-memory source, no filesystem), eviction-invariant test → implement → both presets → commit(s).
+**Gate hardening (2026-08-18, BINDING):** criteria per
+`gate/matrix-issue02-gltf-import.md` (full core + 60-extension
+disposition table) as amended by `gate/rulings-2026-08-18.md` §#2.
+Key deltas/re-rulings: vendoring budget grows to fastgltf v0.9.0
+(+ embedded simdjson license) + meshoptimizer v1.2 + MikkTSpace
+(pinned commit, header-license text quoted) + Draco
+(`DRACO_GLTF_BITSTREAM=ON`); byte-source implemented via the
+matrix-specified pattern (never `Options::LoadExternal*`; renderer
+resolves every `sources::URI` itself — fastgltf has NO external-URI
+callback); image/buffer source variants (URI/data-URI/GLB) are
+CONSUME-NOW all three; KHR_texture_transform offset/scale CONSUME-NOW
+(rotation logged) — gltfpack emits it by default with quantized UVs;
+KHR_materials_unlit maps to the D22 Unlit material;
+EXT_mesh_gpu_instancing consumed at import (TRS arrays expand into
+InstanceRecords); u8/u16 index accessors widened to u32 with a value
+round-trip test; overdraw threshold 1.05; the generic
+extensionsUsed/Required surfacing mechanism (INFO summary +
+UnknownRequiredExtension → named error + fallbacks) is what makes
+log-don't-drop true for the whole registry.
 
 ### Task 14: KTX2 textures + sampler cache (D10)
 
@@ -307,11 +362,41 @@ Pipeline per primitive: fastgltf parse → mandatory attributes (missing normals
 **Interfaces:** `TextureCache::load(path, TextureRole role)` → TextureHandle (bindless idx inside); role → transcode target + colorspace per D10 table; sampler cache keyed by (wrap,filter,aniso) → VkSampler, glTF samplers honored, aniso 8× default when supported; stb path for PNG/JPG with warning; checkerboard fallback on failure (D11); mips from container (warn if absent).
 **Added (2026-08-18):** reads through the Task 13 byte-source abstraction (no direct filesystem in the load path); uploads consume Task 11 tickets; texture memory attributed in the Task 10 accounting categories.
 **Steps:** tests: role→format matrix (BC7_SRGB/BC5/BC7_UNORM assertions on lavapipe-supported... **note**: lavapipe BC support — verify in-task; if a target format is unsupported on CI's driver, transcode falls back to RGBA8 with warning and the test asserts the fallback path on that driver, exact-format path asserted locally) — sampler dedup (two identical glTF samplers → one VkSampler), quadrant pixel GPU test sampling a loaded KTX2 → implement → both presets → commit.
+**Gate hardening (2026-08-18, BINDING):** criteria per
+`gate/matrix-issue03-ktx2-textures.md` as amended by
+`gate/rulings-2026-08-18.md` §#3. Key deltas: pin libktx **v4.4.2**
+(stable; v5 is RC — registry watch item), vendoring commit records
+Apache-2.0 PLUS bundled-component licenses actually compiled; KTX2
+parse through `ktxStream`/`CreateFromMemory` (zero filesystem in
+texture_cache.cpp — grep-enforced); glTF ROLE is authoritative for
+the created format, container-DFD disagreement → one WARN (the Godot
+#99589 double-sRGB class made loud); non-Basis KTX2 detected before
+transcode (never discovered via KTX_INVALID_OPERATION); block-
+compressed upload support in `Uploader::uploadToImage` (block-row
+pitch, sub-block mip tails) is an explicit acceptance item; stb path
+uploads mip 0 only — recorded limitation + WARN; role-appropriate
+UTILITY fallbacks (flat-normal for normal slots, never checkerboard);
+per-failure single-shot logging (no per-frame spam).
 
 ### Task 15: Async import pipeline (D5 contract in action)
 
 **Files:** Modify `src/rx_asset/registry.{h,cpp}` (+`importGltfAsync(path, ..., CompletionFn)` — parse/decode/transcode/meshopt on workers via rx_task; the SYNC importGltf also parallelizes per-primitive work internally (parallelism is the default, not an async-only property), GPU uploads + registry mutation marshalled through postToMain; progress/Tracy zones), tests.
 **Steps:** test: async import of cube + DamagedHelmet completes with identical results to sync path (deep compare of counts/ranges); main-thread-affinity assertions (registry mutation thread id checks in debug); a deliberately slow decode overlapped with rendered frames (frame loop keeps presenting — test drives N frames while import in flight, asserts no stall > threshold frames on counters **AND, added 2026-08-18 per D25, a wall-clock main-thread-block assertion: no single `pumpMain()`/upload call blocks the main thread beyond threshold — the counter-only criterion cannot detect a per-frame fence stall**); GPU-side handoff consumes Task 11 tickets (poll, never blocking wait, in the frame loop) → implement → commit.
+**Gate hardening (2026-08-18, BINDING):** criteria per
+`gate/matrix-issue22-async-import.md` as amended by
+`gate/rulings-2026-08-18.md` §#22 + RC6. Key deltas: SCOPE GROWS with
+abandon-style cancellation (`cancel(handle)`: atomic flag,
+stage-boundary checks, no registry mutation after observation, defined
+callback outcome, bounded latency, ASan-clean; prioritized cancel
+stays streaming-phase) and a minimal poll-able progress snapshot
+(stage enum + items-completed/total, monotonic — internal C++ this
+phase); determinism via FILE-ORDER application at the marshal point
+(results independent of worker count, run-to-run identical);
+worker-stage bodies are exception-bounded (an exception across a chunk
+boundary is process-fatal by design); wall-clock two-tier gate per the
+amended D18 (2 ms local budget published; 10 ms CI stall detector);
+teardown-with-import-in-flight is defined, leak-clean behavior;
+concurrent imports complete isolated (no priorities, documented).
 
 ### Task 16: StandardPBR + Unlit + sample 08_gltf_viewer (D22)
 
@@ -324,6 +409,29 @@ unmodified and a future indirect path can too. Sample 07's
 push-constant-per-draw loop is the recorded anti-pattern; the material
 interface must not inherit it.
 **Steps:** material unit tests (params reflect; alpha variants produce distinct pipelines; MASK cutoff pixel test; BLEND draws blended — quadrant test) → viewer + gate → packaging → numbers in report (import ms via Tracy, first-frame ms) → commit(s).
+**Gate hardening (2026-08-18, BINDING):** criteria per
+`gate/matrix-issue08-standard-pbr.md` as amended by
+`gate/rulings-2026-08-18.md` §#8 + RC1. Key deltas: FILE LIST GROWS —
+`shaders/material/forward_entry.slang` + `material.slang` (tangent
+field + lighting surface are unlisted prerequisites for normal
+mapping); D28 lands here (MaterialRecord fixed-function state axis —
+the "specialization bits gain alphaMode/doubleSided" phrasing above
+is CORRECTED: those are pipeline fixed-function fields, not spec
+constants; MASK cutoff = per-instance uniform + always-present
+discard); D26.1 shaders use **`SV_VulkanInstanceID`** (Slang subtracts
+firstInstance from `SV_InstanceID` — verified pitfall; code comment +
+a two-draw firstInstance>0 test are mandatory); per-draw data read
+from a bindless StructuredBuffer matching Task 19's DrawPayload
+(legacy bindInstance/set-1 path retained for non-scene samples only,
+scoped explicitly); KHR_texture_transform offset/scale applied
+in-shader (per the #2 re-ruling); Lambertian diffuse +
+GGX/Smith-correlated/Schlick baseline (three first-tier references
+converge); FG1 ambient closed-form metal-probe test; `--exposure` =
+pre-tonemap 2^exposure push constant with a neutral-value regression
+guard (shared tonemap shaders untouched); BC5 Z-reconstruction with
+radicand clamp; sample 08's drag-orbit reads SDL mouse state directly
+via `Window::sdlWindow()` (sample-local; rx_platform's real input
+surface stays Task 20 — sequencing gap resolved without reordering).
 
 ### Task 17: Window edge-state hardening (FG7, card #25)
 
@@ -342,6 +450,23 @@ Occlusion + DPI policy stay SDK-phase (registry).
 resize-to-zero → restore sequence headlessly (event injection), asserts
 no validation errors and rendering resumes; manual rows for true
 minimize under a live swapchain → implement → both presets → commit.
+**Gate hardening (2026-08-18, BINDING):** criteria per
+`gate/matrix-issue25-window-hardening.md` as amended by
+`gate/rulings-2026-08-18.md` §#25. DESIGN CORRECTION: the
+suspended-present guard is **extent-query-driven, not event-driven** —
+on Wayland (SteamOS desktop mode included) SDL minimize events/flags
+do not fire on compositor-driven minimize and `currentExtent` is a
+sentinel, so events are an optimization/log layer, never the sole
+gate. Key deltas: guard gets a dependency-injection seam (extent as a
+parameter) so its logic is testable without a display that reports
+zero; two-tier tests (SDL_PushEvent state-machine tests + seam-
+injected GPU guard test; true OS minimize is MANUAL-only, honestly
+recorded); borderless = `SDL_SetWindowFullscreen(w,true)` + NULL mode
++ `SDL_SyncWindow()` before readback, double-toggle test; present
+skip asserted by CALL COUNTS (0 acquire/present over N suspended
+frames); one-shot Wayland-limitation log line; uploads NOT gated on
+presentation while suspended (D25 polling continues); hidden-window
+CI extent question resolved empirically at implementation.
 
 ---
 
@@ -364,6 +489,23 @@ class Scene { // SoA managers inside (transform pool carries prev-frame slot lay
 ```
 Reversed-Z: depth attachment usage in samples migrating in Task 22/24; Camera helpers are the single source of projection truth; unit tests assert near→1/far→0 mapping and frustum plane extraction correctness.
 **Steps:** device-free tests (handle lifecycle incl. generational failure, SoA iteration order, prev-transform slot updated on setTransform) → implement → commit.
+**Gate hardening (2026-08-18, BINDING):** criteria per
+`gate/matrix-issue05-scene-proxies.md` as amended by
+`gate/rulings-2026-08-18.md` §#5 + RC5. Key deltas: reuse
+`rx::core::Handle<Tag>` (the TYPE — not the AoS `HandlePool`; storage
+is SoA columns per D19, span-accessor test proves it);
+`RenderableDesc` gains `castsShadows: bool = true` (RC5) and
+`priority: uint8_t` (0-7, default 4 — reserved sort tier, Filament
+precedent); per-submesh material override becomes a concrete typed
+field (span of optional MaterialHandle), not a comment; reserved
+skinning/morph slots (inert, tested); `Camera` gains `cullingProj()`
+(separate FINITE culling projection — Gribb-Hartmann degenerates
+under D13's infinite far; Filament's own answer) and an inert jitter
+offset; exposure STAYS on the tonemap (D22 stands — camera exposure
+API registered for the techniques phase with physical units);
+no-dirty-tracking is itself a criterion (setTransform = O(1) SoA
+write; 30k-call benchmark published); D24 residency-tolerant resolve
+test at the proxy level.
 
 ### Task 19: DrawListBuilder — parallel culling + sort keys (D14/D15, D26, D27)
 
@@ -404,22 +546,121 @@ Frustum cull: planes from reversed-Z viewProj; AABB-vs-planes batched in paralle
 - **Zero-alloc invariant:** `build()` into reused storage performs zero
   net heap allocations across steady-state frames — asserted by test.
 **Steps:** device-free tests with synthetic scenes: known in/out AABB sets (exact counters), mask filtering matrices, sort-order assertions (opaque key monotonic, blend depth descending), instancing-collapse assertions (identical-run scene → 1 command with instanceCount=N; counters match), off-screen-caster-still-casts case, determinism across thread counts (same lists any --threads), steady-state zero-allocation assertion, pre-resolution unit test (worker chunks never hit the main-thread guard — assert under a debug hook) → implement → commit.
+**Gate hardening (2026-08-18, BINDING):** criteria per
+`gate/matrix-issue06-drawlists-culling.md` +
+`gate/matrix-issue07-layer-masks.md` as amended by
+`gate/rulings-2026-08-18.md` §#6/#7 + RC3/RC5. Key deltas: sort-key
+bit layout documented with named constants + decode() round-trip test
+(bgfx discipline); depth bucket = truncated monotonic float32 bit
+pattern (never linear rescale); deterministic low-bit tie-break =
+stable creation index; partition sort-DIRECTION test on one shared
+fixture (opaque decreasing / blend increasing under reversed-Z);
+priority tier above pipeline bits, blendOrder bits reserved
+unpopulated; fixed index-range chunks + chunk-index-ordered
+concatenation → byte-identical output across --threads; **D26.3
+lockstep criterion**: commands and payloads sort/collapse as ONE unit
+— the interleaved-scene test that catches silent payload
+desynchronization is mandatory (collapsed `[firstInstance,
+firstInstance+instanceCount)` ranges cross-checked against source
+renderables); `CullCounters` = {totalCandidates, culledByLayerMask,
+culledByFrustum, visible, recordsIn, drawsSubmitted,
+shadowCastersConsidered, shadowCastersVisible} — exact, CI-gated;
+`ShadowLists` = ViewLists shape, single partition, sorted (pipeline,
+mesh range, block), BLEND excluded (RC3); culling planes from
+`Camera::cullingProj()` (finite) + the extreme-depth never-culled
+test; degenerate/zero-extent AABB + ground-slab cases; per-block
+contiguous `BlockRange` grouping test; D27 worker-guard test reuses
+`setViolationHookForTests` + the rendezvous-barrier pattern from
+test_material_system.cpp:854-1042 verbatim; layer/channel getters +
+`setChannels` added; the five-case mask CI matrix.
 
 ### Task 20: Input expansion (seed 6) — Haiku
 
 **Files:** Modify `src/rx_platform/{include/rx_platform/window.h,window.cpp}` (+input.h if cleaner per existing layout): relative mouse mode (SDL_SetWindowRelativeMouseMode), per-frame accumulated mouse deltas from SDL_EVENT_MOUSE_MOTION xrel/yrel, cursor show/hide, gamepad: hot-plug via SDL_EVENT_GAMEPAD_ADDED/REMOVED, `GamepadState poll()` (left/right stick float2 with 8000/32768 deadzone [R:present], triggers, A/B buttons); tests where device-free (deadzone math), manual rows for the rest.
 **Steps:** per existing rx_platform test conventions → implement → both presets → commit.
+**Gate hardening (2026-08-18, BINDING):** criteria per
+`gate/matrix-issue14-input.md` as amended by
+`gate/rulings-2026-08-18.md` §#14. Key deltas: SDL3 has NO
+`SDL_GAMEPAD_BUTTON_A/_B` — the surface exposes the full discrete set
+(D-pad ×4, face ×4 SOUTH/EAST/WEST/NORTH, both shoulders, START) as a
+bitmask/bool struct; deadzone is **scaled-radial per stick** (mag =
+|stick|/32768; below 8000/32768 → zero; else normalize × rescale —
+never two per-axis clamps; the (8500,8500) discrimination case is
+mandatory) + a 1D trigger deadzone (~1000/32767, tunable); mouse
+deltas = xrel/yrel event accumulation with consume-and-reset;
+focus-loss pause + unconditional re-arm of relative mode on
+focus-gain; cursor confine via `SDL_SetWindowMouseGrab` in scope;
+hot-plug map keyed by SDL_JoystickID (close-then-erase synchronously);
+single-active rule = lowest connected ID, virtual-joystick-tested;
+TEST-COVERAGE CORRECTION: `SDL_AttachVirtualJoystick` makes hot-plug/
+axis/button paths CI-automatable (the "manual rows for the rest"
+phrasing above is superseded; a smoke run confirms virtual joysticks
+work under CI's driver first); **SCOPE GROWS: minimal keyboard
+surface** — `bool isKeyDown(SDL_Scancode)` over `SDL_GetKeyboardState`
+(sample 09's WASD fly-through requires it; its absence was an
+oversight); rumble/touchpad deferred (registry, SDK/platform); gyro =
+log-don't-drop with HasSensor + device-name logging (SDL #9148: Deck
+gyro/paddles undetectable at our pin); thread-affinity one-liners +
+RX_ASSERT_MAIN_THREAD guards per the in-repo convention; input
+accumulators gate on ImGui's WantCapture flags (Task 21 coordination
+— single event-dispatch owner in pumpEvents()).
 
 ### Task 21: `rx_debug_ui` — ImGui overlay module (D20)
 
 **Files:** Vendor imgui v1.92.x (pinned, MIT recorded; core + sdl3 + vulkan backends only); create `src/rx_debug_ui/{CMakeLists.txt,include/rx_debug_ui/overlay.h,overlay.cpp}`.
 **Interfaces:** `Overlay::create(Device&, Window&, format)` (own descriptor pool sized per [R:present]; font upload via existing Uploader; UseDynamicRendering with swapchain format); `beginFrame()` (SDL event feed already flowing through Window — overlay hooks the existing event dispatch), `addPass(RenderGraph&, targetName)` — declares a graph pass (side-effect, reads nothing) whose callback renders draw data; core libs stay ImGui-free (only samples + rx_debug_ui link it).
 **Steps:** GPU smoke test (overlay pass renders; readback shows non-empty overlay region with a forced demo window; zero validation errors) → implement → both presets → commit.
+**Gate hardening (2026-08-18, BINDING):** criteria per
+`gate/matrix-issue16-imgui-overlay.md` as amended by
+`gate/rulings-2026-08-18.md` §#16. Key deltas: pin **v1.92.9b**
+(plain tag, NOT -docking — structural exclusion); init fills the
+NESTED `PipelineInfoMain.PipelineRenderingCreateInfo` (2025-09-26
+breaking change — the flat field no longer exists); descriptor pool =
+two typed entries (SAMPLED_IMAGE ≥ 8 + SAMPLER ≥ 2,
+FREE_DESCRIPTOR_SET_BIT; 2026-04-22 breaking change); FONT-UPLOAD
+RULING: the backend's lazy internal upload (raw vkAllocateMemory +
+`vkQueueWaitIdle` inside RenderDrawData — vendored, unmodifiable) is
+a DOCUMENTED exception to D25/D24: force texture creation at init so
+the stall is one-time, assert at-most-once QueueWaitIdle across an
+N-frame run (guards against per-frame texture churn), note the D24
+accounting blind spot in the memory report's docs;
+`ImGui_ImplSDL3_SetGamepadMode(Manual, nullptr, 0)` immediately after
+init (kills the AutoFirst race with Task 20's gamepad ownership;
+gamepad HUD nav off this phase); every SDL event →
+`ImGui_ImplSDL3_ProcessEvent` FIRST, then platform input; pass
+declaration uses the REAL API chain — `addPass().addColorOutput(
+target, LOAD_OP_LOAD).setSideEffect().setExecute(...)` — LOAD-not-
+CLEAR is a named criterion with the pattern-visible-under-HUD test;
+configure-time CMake link-boundary check (imgui absent from every
+rx_* core target's transitive closure) lands here; main-thread
+one-liner per convention.
 
 ### Task 22: Shadow quality bridge (D21)
 
 **Files:** Modify `shaders/multipass/` shadow path shared pieces as needed → but primary target is the Stage-2 scene shadow path: light ortho fitted to visible bounds (from DrawListBuilder), slope-scaled depth bias (vkCmdSetDepthBias on the shadow pass), 3×3 PCF in the standard lit path (`shaders/material/forward_entry.slang` shadow helper upgrade; sample 05 keeps its own simpler shaders untouched — documented). Reversed-Z main-camera migration lands here for the scene path (clear values, compare ops via PassSignature/pipeline state).
 **Steps:** GPU test: acne scene (large ground plane at grazing light) renders without acne (probe variance check) and without peter-panning (contact probe); PCF softness probe (edge gradient spans ≥2 texels) → implement → commit.
+**Gate hardening (2026-08-18, BINDING):** criteria per
+`gate/matrix-issue23-shadow-bridge.md` as amended by
+`gate/rulings-2026-08-18.md` §#23 + RC2/RC3. Key deltas: FILE LIST
+GROWS — `src/rx_graph/{resources.h,executor.cpp}` (D29: AttachmentDesc
+`DepthConvention` + per-pass clear values at both executor sites; the
+two-convention one-frame test); the shadow pass STAYS standard-Z per
+D13, so the depth-bias sign does NOT flip — a required code comment
+prevents the plausible-but-wrong "reversed-Z fix" (main-camera
+migration lands in the same task); shadow-caster pipeline is built
+OUTSIDE MaterialSystem (RC3 option (a) — getPipeline's compare-op
+flips as one literal for the main camera; no compare-op axis);
+`VK_DYNAMIC_STATE_DEPTH_BIAS` added to the shadow pipeline's dynamic
+state (the creation-time detail the ticket omitted);
+`depthClampEnable=VK_TRUE` on casters + device-feature check;
+comparison-sampler PCF (compareEnable=TRUE, COMPARE_OP_LESS,
+SampleCmp-equivalent taps — hardware filtering, not sample 05's manual
+compare); texel snapping in scope (two-camera-position shimmer test);
+shadow vertex shader uses SV_VulkanInstanceID bindless addressing
+(never a push-constant transformIndex); 1024/D32_SFLOAT default kept
+but parameterized; acne probe = neighborhood VARIANCE check at ≥80°
+grazing, peter-panning probe = caster-base/shadow-edge continuity
+within pixel tolerance.
 
 ### Task 23: Executor per-frame allocation elimination (card #29)
 
@@ -448,11 +689,54 @@ better; zero validation errors. `compile()`/`realize()` are exempt
 (setup/resize-only paths, documented as such in the code).
 **Steps:** allocation-count test first (fails on current code) →
 implement → suite green both presets → commit.
+**Gate hardening (2026-08-18, BINDING):** criteria per
+`gate/matrix-issue29-executor-allocations.md` as amended by
+`gate/rulings-2026-08-18.md` §#29. Key deltas: methodology =
+CAPACITY-SNAPSHOT via test-only accessors (per the in-repo
+`debugChunkStats()` seam convention) — NO global operator-new
+interposition (volk/validation-layer/Tracy-rpmalloc linkage risk);
+test runs the representative Tracy-ON config, with Tracy's own
+dynamic-zone-name allocations (verified: `tracy_malloc` per
+RX_ZONE_DYNAMIC_NAME call at executor.cpp:1024/:1359) documented as
+third-party-attributed exceptions (capacity snapshots are naturally
+blind to them); the GPU-zone `VkCtxScope` allocation trace is
+completed in-task; SCOPE GROWS: `DeletionQueue::onFrameFenceSignaled`'s
+non-empty-path fresh-vector allocation (deletion_queue.cpp:40-41) is
+folded in (in-place compaction; the pending-item test variant is
+mandatory); `acquireChunkCommandBuffer` (executor.cpp:704-745) is the
+named in-repo amortization template; `nameToIndex` gains a transparent
+hash functor (documented libstdc++/libc++/MSVC string/string_view
+hash-equivalence assumption) with a hit+miss overload-selection test.
 
 ### Task 24: Sample 09_scene + stress-v2 + release prep
 
-**Files:** Create `samples/09_scene/` — loads DamagedHelmet field (headless: instanced helmets grid; present: `--scene sponza` when fetched) through Registry→Scene→DrawListBuilder→graph; fly-through camera (mouse capture + gamepad, D16 input); ImGui HUD: FPS/frame-ms, cull counters, vsync toggle, layer-mask toggles (hide/show instance groups), light-channel demo toggle, pool stats; stress-v2 mode `--stress` (same 30k-draw workload as sample 07 but through the full scene path — publishes A/B numbers vs 07 in the report + release notes); headless gate: counter assertions + tolerance pixels; MANUAL_VERIFICATION rows; packaging/CI; README/roadmap updates; `docs/superpowers/specs` layer table tick for layer 8.
+**Files:** Create `samples/09_scene/` — loads DamagedHelmet field (headless: instanced helmets grid; present: `--scene sponza` when fetched) through Registry→Scene→DrawListBuilder→graph; fly-through camera (WASD + mouse capture + gamepad via Task 20's input surface — gate correction 2026-08-18: the earlier "D16 input" citation was a mislabel, D16 is test content); ImGui HUD: FPS/frame-ms, cull counters, vsync toggle, layer-mask toggles (hide/show instance groups), light-channel demo toggle, pool stats; stress-v2 mode `--stress` (same 30k-draw workload as sample 07 but through the full scene path — publishes A/B numbers vs 07 in the report + release notes); headless gate: counter assertions + tolerance pixels; MANUAL_VERIFICATION rows; packaging/CI; README/roadmap updates; `docs/superpowers/specs` layer table tick for layer 8.
 **Steps:** TDD gate → implement → numbers (desktop; Deck rows added to MANUAL_VERIFICATION as unchecked) → packaging → commit(s).
+**Gate hardening (2026-08-18, BINDING):** criteria per
+`gate/matrix-issue15-sample09.md` (incl. the full
+subsystem-exercise checklist, rows 3-17) as amended by
+`gate/rulings-2026-08-18.md` §#15. Key deltas: **A/B comparability
+contract** — held identical vs sample 07: 30k instances, the 4
+pipeline/material variations, per-instance data, --threads/--vsync
+semantics; expected to differ: draws SUBMITTED (07 submits all 30k
+unconditionally; 09 culls+collapses) — published numbers report
+wall-clock AND draws-submitted JOINTLY (wall-clock alone would
+misrepresent the comparison; sample 07's own report format stays
+untouched); collapse-ratio formula BLESSED: `1 −
+drawsSubmitted/recordsIn` as a percentage, CI-asserted against the
+hand-computed grid expectation; HUD ships TWO visibly distinct mask
+controls (camera cullMask u32 ≠ light channels u8 — never conflated);
+vsync toggle drives the same setPresentMode+recreate path as the CLI
+flag; 60-frame rolling FPS average; headless gate asserts EXACT
+counters (imported/visible/culled/recordsIn/drawsSubmitted) + a D17
+tolerance reference via Task 16's regen script (no second mechanism);
+packaged samples ship PRE-STAGED assets (fetched at package time —
+must run standalone); `package_samples.sh` list + stale header count
+fixed to include 08 AND 09, and the missing 07_stress
+MANUAL_VERIFICATION section is added while touching that file;
+registry layer-8 row annotated "(delivered: Phase 4 — scene
+submission/culling; LOD remains deferred)" — the qualified form;
+Task 23 lands before any stress-v2 number is published.
 
 ---
 

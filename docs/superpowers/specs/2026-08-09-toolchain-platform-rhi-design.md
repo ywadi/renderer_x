@@ -206,7 +206,9 @@ it is out of scope for *this* spec only, not out of scope for the project:
     (breadcrumbs, VK_EXT_device_fault via the log sink; SDK policy +
     tooling phase); (FG5) host caps/degradation report + adapter
     enumeration/selection (SDK phase — the optionality principle's
-    reporting channel); (FG6) MSAA policy decision + resolve-attachment
+    reporting channel; amended 2026-08-18: the same channel also
+    carries a "present suspended" signal so hosts can observe the
+    Phase 4 zero-extent/minimize suspend state); (FG6) MSAA policy decision + resolve-attachment
     semantics in the graph (decide in techniques-phase spec, before
     aliasing/history ossify the resource model); (FG7) window state —
     zero-extent/minimize guard + windowed/borderless-fullscreen toggle
@@ -285,6 +287,62 @@ it is out of scope for *this* spec only, not out of scope for the project:
   D27 (draw-list main-thread pre-resolution) provides the deterministic
   enumeration hook this attaches to. Fossilize/offline exhaustive
   packaging remains separately deferred (Phase 3 D7).
+- **Primary-gate additions (2026-08-18)** — later-phase items surfaced
+  by the Phase 4 ticket-completeness gate (evidence:
+  `.superpowers/sdd/2026-08-11-phase4-scene-assets/gate/`; rulings in
+  `gate/rulings-2026-08-18.md`):
+  - 16-bit/mixed index sub-pools (geometry phase, with D8's vertex
+    packing — bgfx's 16-bit-default precedent recorded; retrofit
+    touches MeshRange + every draw-record consumer, so it travels with
+    the other packing work).
+  - Deck OOM-policy extensions (streaming phase, with eviction POLICY):
+    `VK_AMD_memory_overallocation_behavior` (explicit
+    fail-on-overcommit on AMD) and
+    `VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT` (proactive per-allocation
+    budget enforcement) — both additive, both currently unnamed.
+  - KHR_meshopt_compression (Khronos ratification-track successor to
+    EXT_meshopt_compression; NOT supported by fastgltf v0.9.0) — watch
+    item on the fastgltf pin, re-checked at each dependency refresh; if
+    gltfpack's default output migrates, the decode-to-open ruling
+    silently drifts.
+  - glTF `extras` host-preservation API (SDK phase, FG3-adjacent):
+    hosts receive their own application JSON; fastgltf's
+    setExtrasParseCallback makes it cheap; detection/logging already
+    lands in Phase 4.
+  - KHR_animation_pointer + KHR_interactivity — animation-phase watch
+    line (the animation registry entry predates both).
+  - Cubemap/array KTX2 loading (techniques phase, riding FG1 — the
+    TextureCache-side work FG1's skybox/IBL consumer needs; Phase 4
+    ships the log path only).
+  - libktx v5 / UASTC-HDR (HDR texture INPUT, distinct from FG8's HDR
+    display output) — watch item on the libktx v4.4.2 pin.
+  - Async-import host surface (SDK/profiling phase): progress-API ABI
+    projection (Phase 4's stage-enum+counts snapshot stays internal
+    C++), host-tunable upload time-slice budget (FG12-adjacent; Unity's
+    asyncUploadTimeSlice precedent); import priorities (streaming
+    phase, with residency priorities). Phase 4 ships abandon-style
+    cancellation; prioritized cancel goes here.
+  - Gamepad rumble/haptics/touchpad consumption (SDK/platform phase —
+    per-call methods on the existing handle map, retrofit-safe); gyro
+    consumption gated on SDL Deck support (libsdl-org/SDL#9148 watch:
+    gyro/paddles undetectable on Deck at the SDL3 3.4.14 pin — Phase 4
+    logs HasSensor + device identity instead).
+  - Multi-gamepad host surface (`poll(JoystickID)`/enumeration, local
+    co-op) — SDK phase; Phase 4's JoystickID-keyed internal map makes
+    it additive.
+  - Camera exposure API (techniques phase, with FG1 IBL/physical light
+    units — Filament's camera-owned exposure model; Phase 4 keeps
+    manual exposure on the tonemap per D22).
+  - Per-primitive blendOrder sort tier (techniques phase, with the
+    translucency work; Phase 4 documents reserved sort-key bits and
+    delivers determinism via the creation-index tie-break instead).
+  - Shadow-map resolution/format policy tiers (desktop/Deck) — the
+    cascades-phase spec inherits Phase 4's explicit, parameterized
+    1024/D32_SFLOAT default rather than archaeology through sample 05.
+  - Dependency-boundary configure-time check — the CMake
+    transitive-link-closure assertion landing with the ImGui module
+    ("core libs stay ImGui-free") is recorded as the reusable pattern
+    for every future layer-boundary claim.
 - **Scheduler sharing with host engines** (committed 2026-08-11, SDK
   phase): an embedding game engine must be able to make the renderer's
   task scheduler and its own job system ONE pool — via consumer-chosen
