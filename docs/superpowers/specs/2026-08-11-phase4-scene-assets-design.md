@@ -341,6 +341,104 @@ and task APIs are internal C++ this phase; their ABI projection is
 SDK-phase work. (Materials ABI evolution from Stage 0 texture wiring
 regenerates GUIDs per the documented pre-release policy.)
 
+### D24 — Renderer-wide memory budget & eviction invariant (FG9 elevation, card #27)
+
+Added 2026-08-18; carries the 2026-08-12 registry elevation and ledger
+rulings into the phase spec proper (the elevation previously lived only
+in the master registry + SDD ledger). Phase 4 delivers the memory-USAGE
+management foundation: (a) allocation **accounting** — every VMA
+allocation attributed to a category (geometry pool, textures, transients,
+staging, internal); (b) `VK_EXT_memory_budget` enablement
+(`VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT` + opportunistic device
+extension) with `vmaGetHeapBudgets` polling; (c) a host-facing POD
+memory report (per-category bytes, heap budget/usage) feeding HUD +
+Tracy plots; (d) `VK_ERROR_OUT_OF_DEVICE_MEMORY` handling at every
+allocation site — today there is zero handling anywhere (verified
+2026-08-18); loud, named failure with the report attached, never a
+crash; (e) the **eviction INVARIANT** built and tested: residency-
+tolerant handle resolve (a resolve may yield the fallback while
+nonresident), handle-mediated references everywhere (no raw
+pointer/index escapes that break under eviction), and one working
+deferred-eviction path proving the system tolerates it. The eviction
+**POLICY** (automatic what/when, streaming-in) remains streaming-phase,
+cheap later ONLY because the invariant lands now. Import/registry and
+DrawListBuilder tasks implement the invariant; the primary gate enforces
+it in acceptance criteria. The Deck's UMA makes over-commit a hard
+failure, not a slowdown — this is floor-hardware work, not polish.
+
+### D25 — Upload completion tickets: non-blocking flush invariant (card #28)
+
+`Uploader::flush()` today ends in an unconditional
+`vkWaitForFences(..., UINT64_MAX)` (upload.cpp:278, "synchronous by
+design" — an acceptable Phase 2 choice that Stage 1 would fossilize into
+every asset-pipeline entry point). Phase 4 changes the **contract**, not
+the queue architecture: `flush()` returns a pollable `UploadTicket`
+(fence + ring generation); `isComplete(ticket)` / `wait(ticket)` added;
+staging-ring reclamation keys off ticket completion instead of
+having-already-blocked. All Stage-1 call sites (GeometryPool upload,
+TextureCache load, importer, async import) consume tickets;
+`MeshBuffers::create` keeps blocking behavior explicitly via
+`wait(ticket)`, documented as a convenience. D5's threading deferral
+(main-thread-only mutation, no locks) is orthogonal and unchanged —
+the API stays main-thread-only. `Device::create` additionally acquires
+an optional dedicated transfer queue when present (graphics fallback,
+logged degrade, optionality principle) so the queue plumbing is prepaid;
+actually USING it (cross-queue ownership transfer, multi-frame staging)
+stays streaming-phase policy (registry). Async-import overlap tests
+gain a wall-clock main-thread-block assertion alongside frame counters —
+the counter-only criterion cannot detect a per-frame fence stall.
+
+### D26 — GPU-driven readiness & submission fast path (invariants now, indirect later)
+
+GPU-driven/indirect execution stays at the registered geometry-phase
+milestone — but four invariants are Phase-4-cheap and retrofit-expensive,
+so they bind Stage 1/2 designs now (CLAUDE.md fast-path-as-default):
+1. **Per-draw addressing:** scene-path shaders receive per-draw data via
+   `firstInstance`/`gl_InstanceIndex` indexing into a bindless storage
+   buffer — never per-draw push constants (structurally impossible under
+   indirect draw; sample 07's push-constant loop is the anti-pattern the
+   scene path must not inherit). Binds StandardPBR/Unlit and the
+   `recordDrawList` helper.
+2. **Draw-list layout:** `ViewLists` stores geometry fields in a
+   `VkDrawIndexedIndirectCommand`-compatible packed array with per-draw
+   payload (material index, instance index) in a parallel array — SoA,
+   GPU-uploadable, not an AoS record struct. Grouped by GeometryPool
+   `blockId`; the per-block indirect submission granularity (one future
+   MDI call per block) is the recorded, deliberate bound.
+3. **Instancing collapse:** after sorting, runs of identical
+   (pipeline, material, mesh range, block) collapse into instanced draws
+   (`instanceCount > 1`) — resolving seed 9c's instancing/batching
+   commitment that D14's sorting alone left half-delivered. Counters
+   report records-in vs draws-submitted (CI-gateable).
+4. **BDA enablement:** `bufferDeviceAddress` cannot be retrofitted —
+   VMA requires the flag at allocator creation and buffers need the
+   usage bit at creation, so Stage-1 pool blocks built without it would
+   all be reallocated at the GPU-driven milestone. Enable
+   opportunistically (never a device-selection requirement; logged
+   degrade; lavapipe support verified in-task before CI relies on it):
+   feature bit in `features12` when supported,
+   `VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT`, usage bit on
+   device-local buffers, `Device::supportsBufferDeviceAddress()`.
+   Nothing consumes addresses in Phase 4 — enablement only.
+
+### D27 — Main-thread pipeline pre-resolution before chunked fan-out
+
+`MaterialSystem::getPipeline()`/`bindInstance()` are main-thread-only
+and runtime-guarded; chunks ≥1 of a chunked pass run on workers — so the
+planned `recordDrawList` helper cannot call them off chunk 0 (the sample
+06 migration already hit this exact wall; "API split" was recorded as a
+future path). Phase 4 resolution: the DrawListBuilder pass **pre-resolves
+every distinct (material, pass-signature, specialization) pipeline and
+per-draw parameter offsets on the main thread before fan-out** — nearly
+free, because the sorted draw list already enumerates every distinct
+pair before any command is recorded. Worker chunks then consume only
+pre-resolved plain data (pipeline handles, offsets). This is a
+correctness blocker for the scene path, and it simultaneously converts
+first-use PSO creation into one deterministic, hoistable point — the
+warmup hook the SDK/tooling-phase PSO-stutter item (registry) will
+attach to. The resolve/record API split remains the recorded future
+path; Phase 4 does not need it.
+
 ## Stage exit criteria
 
 **Stage 0 — Foundations & Debt.** History resources + bounds check;
@@ -354,17 +452,24 @@ closed or explicitly re-recorded with rationale. **Exit gate
 foundation, with every finding closed or explicitly ruled before the
 stage completes** — see the plan's Stage 0 exit gate section.
 
-**Stage 1 — Asset Pipeline.** GeometryPool; import
-(fastgltf+MikkTSpace+meshopt, skin preservation, AABBs, fallbacks);
-KTX2 textures + sampler cache; async load (workers + main-thread
-handoff, Tracy-evidenced); StandardPBR/Unlit; **sample 08_gltf_viewer**
-(DamagedHelmet, orbit camera, tolerance pixel gate, import-time stats
-logged).
+**Stage 1 — Asset Pipeline.** Memory budget/accounting foundation +
+eviction invariant contract (D24); upload tickets — non-blocking flush
++ optional transfer-queue acquisition (D25); GeometryPool with BDA
+enablement (D26.4); import (fastgltf+MikkTSpace+meshopt, skin
+preservation, AABBs, fallbacks, IO-source abstraction); KTX2 textures +
+sampler cache; async load (workers + main-thread handoff,
+Tracy-evidenced, wall-clock stall assertion per D25); StandardPBR/Unlit
+(D26.1 addressing); window edge-state hardening (FG7); **sample
+08_gltf_viewer** (DamagedHelmet, orbit camera, tolerance pixel gate,
+import-time stats logged).
 
 **Stage 2 — Scene & Culling.** Proxies (D19) with layers/channels;
 parallel DrawListBuilder with sort keys + frustum & shadow-caster
-culling + counters; input expansion; rx_debug_ui; shadow bridge;
-**sample 09_scene** (fly-through with mouse+gamepad, HUD with culling
+culling + counters + indirect-ready layout/instancing collapse (D26) +
+main-thread pipeline pre-resolution (D27) + caller-owned reused
+draw-list storage; input expansion; rx_debug_ui; shadow bridge;
+executor per-frame allocation elimination (steady-state zero-alloc
+`execute()`); **sample 09_scene** (fly-through with mouse+gamepad, HUD with culling
 counters and toggles, layer/channel demo, stress-v2 numbers through the
 scene path A/B'd against sample 07's direct path). Both presets green,
 zero validation errors (sync validation active), packaged samples,
@@ -376,7 +481,13 @@ Async compute execution and intra-frame aliasing (unchanged, techniques
 phase — aliasing now correctly sequenced after Stage 0's history
 resources per the registry constraint); vertex packing; runtime
 hierarchy (animation phase); refcounted/streamed assets, concurrent
-GPU-object creation (streaming phase); COLOR_0/TEXCOORD_1; runtime
-block compression; auto-exposure; cascaded shadows; GPU culling;
+GPU-object creation, transfer-queue upload policy + eviction POLICY
+(streaming phase — the D24/D25 invariants make these additive);
+COLOR_0/TEXCOORD_1; runtime block compression; auto-exposure; cascaded
+shadows; GPU culling + indirect execution (geometry phase — D26
+invariants prepaid); compute PSO creation/dispatch capability (geometry
+phase, registry 2026-08-18); GPU particles (techniques phase, registry
+2026-08-18); PSO warmup UX (SDK/tooling phase, registry 2026-08-18 —
+supersedes the FG-audit near-miss ruling; D27 provides its hook);
 pool defragmentation; Filament-style variant filters. LICENSE file
 remains a user decision.

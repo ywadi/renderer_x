@@ -175,15 +175,73 @@ in the same pass:**
   ambient FG1 + which KHR_materials_* to support-or-log; texture pipeline
   vs all glTF image sources + colorspace correctness; input vs the full
   gamepad/keyboard/mouse surface real games need).
+- **Invariant enforcement (added 2026-08-18, claim-validation rulings):**
+  the hardened tickets must carry, as explicit acceptance criteria where
+  they apply: the D24 eviction invariant (residency-tolerant handle
+  resolve on Tasks 13 and 19), D25 UploadTicket consumption at every new
+  upload call site, the D26 GPU-driven-readiness invariants (per-draw
+  addressing on Tasks 16/19, SoA indirect-compatible ViewLists +
+  instancing collapse + caller-owned storage on Task 19, BDA enablement
+  on Task 12), and the D27 main-thread pre-resolution answer to the
+  `bindInstance`-on-workers collision — a correctness blocker Task 19
+  must resolve BEFORE dispatch, not discover during it.
 
 **Exit:** every Phase 4 ticket carries exhaustive acceptance criteria
 grounded in a cited completeness matrix; the matrices are committed to
 the SDD workspace; the feature-gap register absorbs any new findings.
-This gate is COMPLETE before Task 10 (GeometryPool) dispatches. (Tasks
-10+ below are the former Tasks 9+, renumbered by this insertion.)
+This gate is COMPLETE before Task 10 dispatches.
 
+### Task 10: Memory budget, accounting & eviction-invariant foundation (D24, card #27)
 
-### Task 9: GeometryPool (D8/D9)
+**Files:** Modify `src/rx_rhi_vk/src/buffer.cpp` (allocator creation:
+`VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT` when the extension is
+present), `src/rx_rhi_vk/src/device.cpp` (opportunistic
+`VK_EXT_memory_budget` enablement, logged either way), new
+`src/rx_rhi_vk/include/rx_rhi_vk/memory_report.h` + impl (category-
+attributed accounting + `vmaGetHeapBudgets` polling → POD
+`RxMemoryReport`: per-category bytes/counts, heap usage/budget); audit
+of every allocation site for `VK_ERROR_OUT_OF_DEVICE_MEMORY` handling
+(loud named error + report attached — today there is zero handling
+anywhere); tests.
+**Scope split (D24):** this task lands accounting + budget query + host
+report + OOM handling + the eviction CONTRACT (documented residency
+semantics future subsystems implement). The residency-tolerant handle
+resolve itself is implemented where handles live: Task 13 (registry)
+and Task 19 (draw lists) carry it as acceptance criteria; this task
+provides the contract text + report plumbing they cite. Eviction POLICY
+(automatic what/when) stays streaming-phase (registry).
+**Steps:** device-free tests (category accounting balance across
+create/destroy; report POD layout), GPU test (budget query returns
+sane nonzero values; forced small-budget path exercises the OOM error
+path with a mock/`--budget-override`) → implement → both presets →
+commit.
+
+### Task 11: Uploader completion tickets (D25, card #28)
+
+**Files:** Modify `src/rx_rhi_vk/include/rx_rhi_vk/upload.h` +
+`src/rx_rhi_vk/src/upload.cpp` (`UploadTicket flush()` — fence + ring
+generation; `bool isComplete(UploadTicket)`; `void wait(UploadTicket)`;
+ring reclamation keyed to ticket completion, not to having blocked;
+`reserveRingSpace` wrap path waits only for the oldest in-flight ticket
+covering the needed range), `mesh_buffers.h/.cpp`
+(`MeshBuffers::create` keeps blocking semantics explicitly via
+`wait(ticket)`, documented as convenience), sample 04's flush call
+sites updated to poll, `src/rx_rhi_vk/src/device.cpp` (acquire optional
+dedicated transfer queue via vk-bootstrap when present; graphics
+fallback with logged degrade; exposed as
+`Device::transferQueue()`/`hasDedicatedTransferQueue()` — acquisition
+only, NO cross-queue submission this phase per D25/registry), tests.
+**Constraints:** API stays main-thread-only (D5 unchanged); existing
+callers that immediately `wait()` are byte-identical in behavior;
+zero validation errors with sync validation.
+**Steps:** tests: ticket completes exactly once; polling upload
+overlapped with N rendered frames asserts main thread never blocks >
+wall-clock threshold inside `flush()` (timer around the call, not frame
+counters); ring-wrap under in-flight tickets reclaims correctly
+(stress: many small uploads > ring size); `MeshBuffers::create`
+unchanged behavior → implement → both presets → commit.
+
+### Task 12: GeometryPool (D8/D9, D26.4)
 
 **Files:** Create `src/rx_asset/{CMakeLists.txt,include/rx_asset/geometry_pool.h,geometry_pool.cpp,tests/...}`.
 **Interfaces (produces):**
@@ -200,9 +258,22 @@ class GeometryPool { // main-thread affinity (D5)
   PoolStats stats() const;                            // bytes used/capacity per block — Tracy plots fed by caller
 };}
 ```
-**Steps:** device-free tests impossible (GPU) — GPU tests: upload two meshes → distinct non-overlapping ranges; free+re-upload reuses space (stats assert); exhaustion → new block, both drawable (record real indexed draws from two blocks, readback probe); zero validation errors → implement → both presets → commit.
+**Added acceptance criteria (2026-08-18, D25/D26.4):**
+- `upload()` consumes the Task 11 `UploadTicket` path (no assumption of
+  synchronous flush); pool block creation carries
+  `VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT` when BDA is enabled.
+- BDA enablement (D26.4): `bufferDeviceAddress` feature bit set
+  opportunistically in `features12` (NEVER a device-selection
+  requirement; logged degrade; lavapipe support verified in-task before
+  any CI dependency), `VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT`
+  set when on, `Device::supportsBufferDeviceAddress()` exposed; test
+  asserts a pool block yields nonzero `vkGetBufferDeviceAddress` on a
+  supporting device. Nothing consumes addresses in Phase 4 — enablement
+  only, because it is unpurchasable later without reallocating and
+  re-uploading the entire pool.
+**Steps:** device-free tests impossible (GPU) — GPU tests: upload two meshes → distinct non-overlapping ranges; free+re-upload reuses space (stats assert); exhaustion → new block, both drawable (record real indexed draws from two blocks, readback probe); BDA assertions above; zero validation errors → implement → both presets → commit.
 
-### Task 10: Import core — fastgltf + MikkTSpace + meshoptimizer (D7)
+### Task 13: Import core — fastgltf + MikkTSpace + meshoptimizer (D7)
 
 **Files:** Vendor fastgltf + MikkTSpace + meshoptimizer (pinned, licenses recorded); create `src/rx_asset/{import_gltf.{h,cpp}},registry.{h,cpp},fallbacks.cpp`, `assets/test/cube_textured.gltf(+bin, committed, <20KB, hand-authored)`, `tools/fetch_assets.sh` (DamagedHelmet mandatory + `--sponza` optional; checksums; CI caches like slang-prebuilt); tests.
 **Interfaces (produces):**
@@ -213,34 +284,70 @@ struct Submesh { MeshRange range; AABB bounds; MaterialHandle material; };
 struct MeshAsset { std::vector<Submesh> submeshes; AABB bounds; SkinData skin; /* preserved, unused (seed 14) */ };
 struct ImportedScene { std::vector<InstanceRecord> instances; /* flattened world transforms (D12) + mesh handles */ };
 class Registry { // owns all assets; main-thread mutation (D5)
-  ImportResult importGltf(const std::filesystem::path&, GeometryPool&, /*Stage-1 Task 11 adds*/ TextureCache*);
+  ImportResult importGltf(const std::filesystem::path&, GeometryPool&, /*Stage-1 Task 14 adds*/ TextureCache*);
   const MeshAsset& mesh(MeshHandle) const; /* + material/texture accessors, fallback handles (D11) */
 };}
 ```
-Pipeline per primitive: fastgltf parse → mandatory attributes (missing normals → flat-generate + warn) → tangents from file else MikkTSpace → meshopt sequence (remap→cache→overdraw→fetch [R:assets]) → AABB → pool upload. Node tree flattened to world-space InstanceRecords (D12). COLOR_0/TEXCOORD_1 logged-and-skipped. Materials parsed to parameter sets (textures resolved in Task 11; until then fallback handles D11).
-**Steps:** unit tests on committed cube (counts, AABB, tangent presence, meshopt actually ran — index order differs from source), DamagedHelmet integration test (fetched; counts/submeshes/skin-preservation assertions), error paths (missing file → fallback + log; garbage file → error result, no crash) → implement → both presets → commit(s).
+Pipeline per primitive: fastgltf parse → mandatory attributes (missing normals → flat-generate + warn) → tangents from file else MikkTSpace → meshopt sequence (remap→cache→overdraw→fetch [R:assets]) → AABB → pool upload. Node tree flattened to world-space InstanceRecords (D12). COLOR_0/TEXCOORD_1 logged-and-skipped. Materials parsed to parameter sets (textures resolved in Task 14; until then fallback handles D11).
+**Added acceptance criteria (2026-08-18, per 2026-08-12 ledger rulings + D24/D25):**
+- IO-source abstraction invariant: loaders read through a
+  host-injectable byte source (fastgltf callback loading), NOT hardcoded
+  `std::filesystem` — asset packaging/VFS is host policy (the
+  path-taking convenience overload wraps the byte-source path).
+- Eviction invariant (D24): Registry handle resolve is
+  residency-tolerant (may yield fallback while nonresident);
+  handle-mediated references only — no raw pointer/index escapes that
+  break under eviction; one deferred-eviction path exercised in tests.
+- Upload paths consume Task 11 tickets.
+**Steps:** unit tests on committed cube (counts, AABB, tangent presence, meshopt actually ran — index order differs from source), DamagedHelmet integration test (fetched; counts/submeshes/skin-preservation assertions), error paths (missing file → fallback + log; garbage file → error result, no crash), byte-source injection test (import from an in-memory source, no filesystem), eviction-invariant test → implement → both presets → commit(s).
 
-### Task 11: KTX2 textures + sampler cache (D10)
+### Task 14: KTX2 textures + sampler cache (D10)
 
 **Files:** Vendor libktx (pinned; Apache-2.0 recorded); create `src/rx_asset/texture_cache.{h,cpp}`; extend importer material resolution; tests (+ tiny committed .ktx2 fixtures generated by documented `toktx` commands).
 **Interfaces:** `TextureCache::load(path, TextureRole role)` → TextureHandle (bindless idx inside); role → transcode target + colorspace per D10 table; sampler cache keyed by (wrap,filter,aniso) → VkSampler, glTF samplers honored, aniso 8× default when supported; stb path for PNG/JPG with warning; checkerboard fallback on failure (D11); mips from container (warn if absent).
+**Added (2026-08-18):** reads through the Task 13 byte-source abstraction (no direct filesystem in the load path); uploads consume Task 11 tickets; texture memory attributed in the Task 10 accounting categories.
 **Steps:** tests: role→format matrix (BC7_SRGB/BC5/BC7_UNORM assertions on lavapipe-supported... **note**: lavapipe BC support — verify in-task; if a target format is unsupported on CI's driver, transcode falls back to RGBA8 with warning and the test asserts the fallback path on that driver, exact-format path asserted locally) — sampler dedup (two identical glTF samplers → one VkSampler), quadrant pixel GPU test sampling a loaded KTX2 → implement → both presets → commit.
 
-### Task 12: Async import pipeline (D5 contract in action)
+### Task 15: Async import pipeline (D5 contract in action)
 
 **Files:** Modify `src/rx_asset/registry.{h,cpp}` (+`importGltfAsync(path, ..., CompletionFn)` — parse/decode/transcode/meshopt on workers via rx_task; the SYNC importGltf also parallelizes per-primitive work internally (parallelism is the default, not an async-only property), GPU uploads + registry mutation marshalled through postToMain; progress/Tracy zones), tests.
-**Steps:** test: async import of cube + DamagedHelmet completes with identical results to sync path (deep compare of counts/ranges); main-thread-affinity assertions (registry mutation thread id checks in debug); a deliberately slow decode overlapped with rendered frames (frame loop keeps presenting — test drives N frames while import in flight, asserts no stall > threshold frames on counters not wall-clock) → implement → commit.
+**Steps:** test: async import of cube + DamagedHelmet completes with identical results to sync path (deep compare of counts/ranges); main-thread-affinity assertions (registry mutation thread id checks in debug); a deliberately slow decode overlapped with rendered frames (frame loop keeps presenting — test drives N frames while import in flight, asserts no stall > threshold frames on counters **AND, added 2026-08-18 per D25, a wall-clock main-thread-block assertion: no single `pumpMain()`/upload call blocks the main thread beyond threshold — the counter-only criterion cannot detect a per-frame fence stall**); GPU-side handoff consumes Task 11 tickets (poll, never blocking wait, in the frame loop) → implement → commit.
 
-### Task 13: StandardPBR + Unlit + sample 08_gltf_viewer (D22)
+### Task 16: StandardPBR + Unlit + sample 08_gltf_viewer (D22)
 
-**Files:** Create `shaders/material/standard_pbr.slang`, `shaders/material/unlit.slang` (public IMaterialShader modules — zero special treatment), extend material system only via existing public/spec'd seams (specialization bits gain alphaMode/doubleSided axes; BLEND pipeline-state variant per D22 wired through PassSignature/pipeline build); create `samples/08_gltf_viewer/` (DamagedHelmet default `--scene path` override; imports ASYNCHRONOUSLY by default via Task 12's pipeline with a rendered loading state — the viewer is the async demonstration vehicle; orbit camera (drag), manual `--exposure`; forward+tonemap; reversed-Z NOT yet — camera helpers arrive Stage 2, viewer uses existing conventions with a code comment referencing D13's Stage-2 migration); tolerance pixel gate vs committed 256² lavapipe references (D17, regeneration script `tools/regen_references.sh`); packaging/CI.
+**Files:** Create `shaders/material/standard_pbr.slang`, `shaders/material/unlit.slang` (public IMaterialShader modules — zero special treatment), extend material system only via existing public/spec'd seams (specialization bits gain alphaMode/doubleSided axes; BLEND pipeline-state variant per D22 wired through PassSignature/pipeline build); create `samples/08_gltf_viewer/` (DamagedHelmet default `--scene path` override; imports ASYNCHRONOUSLY by default via Task 15's pipeline with a rendered loading state — the viewer is the async demonstration vehicle; orbit camera (drag), manual `--exposure`; forward+tonemap; reversed-Z NOT yet — camera helpers arrive Stage 2, viewer uses existing conventions with a code comment referencing D13's Stage-2 migration); tolerance pixel gate vs committed 256² lavapipe references (D17, regeneration script `tools/regen_references.sh`); packaging/CI.
+**Added acceptance criteria (2026-08-18, D26.1):** both material
+shaders receive per-draw data via `firstInstance`/`gl_InstanceIndex`
+indexing into a bindless storage buffer — never per-draw push constants
+— so the scene path (Task 19's `recordDrawList`) can drive them
+unmodified and a future indirect path can too. Sample 07's
+push-constant-per-draw loop is the recorded anti-pattern; the material
+interface must not inherit it.
 **Steps:** material unit tests (params reflect; alpha variants produce distinct pipelines; MASK cutoff pixel test; BLEND draws blended — quadrant test) → viewer + gate → packaging → numbers in report (import ms via Tracy, first-frame ms) → commit(s).
+
+### Task 17: Window edge-state hardening (FG7, card #25)
+
+**Files:** Modify `src/rx_rhi_vk/device.cpp` (`recreateSwapchain`
+zero-extent guard — 0×0 extent skips recreation and enters a
+suspended-present state, resumed on restore), `src/rx_platform/window.cpp`
+(+header) (SDL3 minimize/restore/occluded events surfaced;
+windowed/borderless-fullscreen toggle via the plain SDL3 window flag on
+the existing recreation machinery), samples gain `--fullscreen` where
+present-mode flags already exist; tests + MANUAL_VERIFICATION rows
+(minimize/restore under present, alt-tab).
+**Rationale:** FG7 (feature-gap audit): a 0×0 swapchain recreate fails
+validation or crashes; minimize is the first thing a playtester does.
+Occlusion + DPI policy stay SDK-phase (registry).
+**Steps:** device-free guard tests where possible; GPU test drives
+resize-to-zero → restore sequence headlessly (event injection), asserts
+no validation errors and rendering resumes; manual rows for true
+minimize under a live swapchain → implement → both presets → commit.
 
 ---
 
 ## STAGE 2 — Scene & Culling
 
-### Task 14: Scene proxies (`rx_scene`, D19) + reversed-Z camera (D13)
+### Task 18: Scene proxies (`rx_scene`, D19) + reversed-Z camera (D13)
 
 **Files:** Create `src/rx_scene/{CMakeLists.txt,include/rx_scene/{scene.h,camera.h},scene.cpp,tests/...}`.
 **Interfaces (produces):**
@@ -255,40 +362,94 @@ class Scene { // SoA managers inside (transform pool carries prev-frame slot lay
   void setTransform(RenderableHandle, const glm::mat4&); void setLayers(RenderableHandle, uint32_t); /* destroy, light equivalents */
 };}
 ```
-Reversed-Z: depth attachment usage in samples migrating in Task 18/19; Camera helpers are the single source of projection truth; unit tests assert near→1/far→0 mapping and frustum plane extraction correctness.
+Reversed-Z: depth attachment usage in samples migrating in Task 22/24; Camera helpers are the single source of projection truth; unit tests assert near→1/far→0 mapping and frustum plane extraction correctness.
 **Steps:** device-free tests (handle lifecycle incl. generational failure, SoA iteration order, prev-transform slot updated on setTransform) → implement → commit.
 
-### Task 15: DrawListBuilder — parallel culling + sort keys (D14/D15)
+### Task 19: DrawListBuilder — parallel culling + sort keys (D14/D15, D26, D27)
 
 **Files:** Create `src/rx_scene/draw_list.{h,cpp}` + tests.
-**Interfaces:**
+**Interfaces (amended 2026-08-18 per D26 — SoA, indirect-compatible, caller-owned storage):**
 ```cpp
-struct DrawRecord { asset::MeshRange range; uint32_t blockId; asset::MaterialHandle mat; uint32_t instanceIndex; };  // asset-level material handle (T10 Registry resolves to the bindable material instance at record time)
-struct ViewLists { std::vector<DrawRecord> opaque /*sorted FtB by u64 key: pipeline|material|depth*/, blend /*BtF*/; CullCounters counters; };
-class DrawListBuilder { ViewLists build(const Scene&, const Camera&, task::Scheduler&); ShadowLists buildShadow(const Scene&, const DirectionalLight&, const Camera&, task::Scheduler&); };
-// PLUS the engine-provided chunked submit helper (parallel recording becomes the DEFAULT for scene-driven passes):
+// Geometry fields packed VkDrawIndexedIndirectCommand-compatible; per-draw payload in a
+// parallel array (SoA). Grouped by GeometryPool blockId — the recorded per-block indirect
+// submission bound (one future MDI call per block).
+struct DrawCommand { uint32_t indexCount, instanceCount, firstIndex; int32_t vertexOffset; uint32_t firstInstance; };
+struct DrawPayload { uint32_t materialIndex; uint32_t instanceDataIndex; };  // resolved from asset::MaterialHandle (T13 Registry, residency-tolerant per D24)
+struct ViewLists { std::vector<DrawCommand> commands; std::vector<DrawPayload> payloads; std::vector<BlockRange> blocks; CullCounters counters; /* opaque FtB by u64 key pipeline|material|depth, then instancing-collapsed; blend BtF, uncollapsed */ };
+class DrawListBuilder { // caller-owned reused storage: zero net allocations in steady state
+  void build(const Scene&, const Camera&, task::Scheduler&, ViewLists& out);
+  void buildShadow(const Scene&, const DirectionalLight&, const Camera&, task::Scheduler&, ShadowLists& out);
+};
+// Engine-provided chunked submit helper (parallel recording is the DEFAULT for scene-driven passes):
 // rx::scene::recordDrawList(PassContext&, chunkIndex, chunkCount, const ViewLists&, ...) — sample 09 hand-chunks nothing.
 ```
 Frustum cull: planes from reversed-Z viewProj; AABB-vs-planes batched in parallelFor chunks (grain ~512); layer masks (camera cullMask, light channels incl. caster filtering); shadow ortho frustum fitted to camera-visible bounds + conservative caster extrusion along light dir (D15). Sort per D14. Counters exact (CI-gateable).
-**Steps:** device-free tests with synthetic scenes: known in/out AABB sets (exact counters), mask filtering matrices, sort-order assertions (opaque key monotonic, blend depth descending), off-screen-caster-still-casts case, determinism across thread counts (same lists any --threads) → implement → commit.
+**Amendments (2026-08-18):**
+- **Instancing collapse (D26.3, seed 9c):** after sorting, adjacent
+  identical (pipeline, material, mesh range, block) runs collapse into
+  one `DrawCommand` with `instanceCount > 1`; counters report
+  records-in vs draws-submitted (CI-gated in sample 09's stress-v2).
+- **Per-draw addressing (D26.1):** `recordDrawList` drives materials via
+  `firstInstance` indexing into the bindless per-draw buffer — zero
+  per-draw push constants in the scene path.
+- **Main-thread pre-resolution (D27):** before fan-out, the helper
+  pre-resolves every distinct (material, pass-signature, specialization)
+  pipeline + parameter offsets on the main thread from the sorted list;
+  worker chunks consume only pre-resolved plain data — `getPipeline`/
+  `bindInstance` are main-thread-guarded and MUST NOT be called from
+  chunks ≥ 1 (the sample-06 collision, resolved here by design).
+- **Eviction invariant (D24):** material/mesh handle resolution at
+  list-build time is residency-tolerant (fallback substitution, never a
+  crash or raw-pointer escape).
+- **Zero-alloc invariant:** `build()` into reused storage performs zero
+  net heap allocations across steady-state frames — asserted by test.
+**Steps:** device-free tests with synthetic scenes: known in/out AABB sets (exact counters), mask filtering matrices, sort-order assertions (opaque key monotonic, blend depth descending), instancing-collapse assertions (identical-run scene → 1 command with instanceCount=N; counters match), off-screen-caster-still-casts case, determinism across thread counts (same lists any --threads), steady-state zero-allocation assertion, pre-resolution unit test (worker chunks never hit the main-thread guard — assert under a debug hook) → implement → commit.
 
-### Task 16: Input expansion (seed 6) — Haiku
+### Task 20: Input expansion (seed 6) — Haiku
 
 **Files:** Modify `src/rx_platform/{include/rx_platform/window.h,window.cpp}` (+input.h if cleaner per existing layout): relative mouse mode (SDL_SetWindowRelativeMouseMode), per-frame accumulated mouse deltas from SDL_EVENT_MOUSE_MOTION xrel/yrel, cursor show/hide, gamepad: hot-plug via SDL_EVENT_GAMEPAD_ADDED/REMOVED, `GamepadState poll()` (left/right stick float2 with 8000/32768 deadzone [R:present], triggers, A/B buttons); tests where device-free (deadzone math), manual rows for the rest.
 **Steps:** per existing rx_platform test conventions → implement → both presets → commit.
 
-### Task 17: `rx_debug_ui` — ImGui overlay module (D20)
+### Task 21: `rx_debug_ui` — ImGui overlay module (D20)
 
 **Files:** Vendor imgui v1.92.x (pinned, MIT recorded; core + sdl3 + vulkan backends only); create `src/rx_debug_ui/{CMakeLists.txt,include/rx_debug_ui/overlay.h,overlay.cpp}`.
 **Interfaces:** `Overlay::create(Device&, Window&, format)` (own descriptor pool sized per [R:present]; font upload via existing Uploader; UseDynamicRendering with swapchain format); `beginFrame()` (SDL event feed already flowing through Window — overlay hooks the existing event dispatch), `addPass(RenderGraph&, targetName)` — declares a graph pass (side-effect, reads nothing) whose callback renders draw data; core libs stay ImGui-free (only samples + rx_debug_ui link it).
 **Steps:** GPU smoke test (overlay pass renders; readback shows non-empty overlay region with a forced demo window; zero validation errors) → implement → both presets → commit.
 
-### Task 18: Shadow quality bridge (D21)
+### Task 22: Shadow quality bridge (D21)
 
 **Files:** Modify `shaders/multipass/` shadow path shared pieces as needed → but primary target is the Stage-2 scene shadow path: light ortho fitted to visible bounds (from DrawListBuilder), slope-scaled depth bias (vkCmdSetDepthBias on the shadow pass), 3×3 PCF in the standard lit path (`shaders/material/forward_entry.slang` shadow helper upgrade; sample 05 keeps its own simpler shaders untouched — documented). Reversed-Z main-camera migration lands here for the scene path (clear values, compare ops via PassSignature/pipeline state).
 **Steps:** GPU test: acne scene (large ground plane at grazing light) renders without acne (probe variance check) and without peter-panning (contact probe); PCF softness probe (edge gradient spans ≥2 texels) → implement → commit.
 
-### Task 19: Sample 09_scene + stress-v2 + release prep
+### Task 23: Executor per-frame allocation elimination (card #29)
+
+**Files:** Modify `src/rx_graph/executor.cpp` (+`Impl` in its header if
+split); tests in the rx_graph targets.
+**Scope (2026-08-18 claim-validation finding — 7 verified per-frame
+heap-allocation sites in `execute()`; small, local, no public API
+change):**
+1. `execute()` performs **zero heap allocations in steady state**
+   (unchanged graph, unchanged resource count) — asserted by a counting
+   allocator hook or capacity-snapshot check across N frames.
+2. The four per-execute tracking containers (`firstBarrierSeen`,
+   `attachmentEverWritten`, `finalStageThisExecute`,
+   `finalAccessThisExecute`) become `Impl`-persistent, cleared per
+   frame; the two `unordered_map`s become index-addressed vectors
+   (physical indices are dense).
+3. Per-pass scratch (`colorPhysIdx`, `colorAttachments`, both barrier
+   vectors, chunk command-buffer vectors) becomes reusable `Impl`
+   scratch buffers.
+4. Debug-label path stops constructing a `std::string` per pass
+   (reusable null-terminated buffer); `nameToIndex` gains heterogeneous
+   `string_view` lookup so per-pass resolver calls stop allocating.
+**Constraints:** byte-identical rendering (existing GPU suite +
+sample 05/06 pixel gates prove it); sample 07 numbers unchanged or
+better; zero validation errors. `compile()`/`realize()` are exempt
+(setup/resize-only paths, documented as such in the code).
+**Steps:** allocation-count test first (fails on current code) →
+implement → suite green both presets → commit.
+
+### Task 24: Sample 09_scene + stress-v2 + release prep
 
 **Files:** Create `samples/09_scene/` — loads DamagedHelmet field (headless: instanced helmets grid; present: `--scene sponza` when fetched) through Registry→Scene→DrawListBuilder→graph; fly-through camera (mouse capture + gamepad, D16 input); ImGui HUD: FPS/frame-ms, cull counters, vsync toggle, layer-mask toggles (hide/show instance groups), light-channel demo toggle, pool stats; stress-v2 mode `--stress` (same 30k-draw workload as sample 07 but through the full scene path — publishes A/B numbers vs 07 in the report + release notes); headless gate: counter assertions + tolerance pixels; MANUAL_VERIFICATION rows; packaging/CI; README/roadmap updates; `docs/superpowers/specs` layer table tick for layer 8.
 **Steps:** TDD gate → implement → numbers (desktop; Deck rows added to MANUAL_VERIFICATION as unchecked) → packaging → commit(s).
@@ -297,7 +458,8 @@ Frustum cull: planes from reversed-Z viewProj; AABB-vs-planes batched in paralle
 
 ## Execution notes (coordinator)
 
-- Models: Tasks 8, 16 Haiku (mechanical, fully specified); all others Sonnet; reviews all Sonnet; final whole-phase review at phase end.
-- Sequencing: Stage 0: T1→T2→T3 sequential (T3 zones touch files broadly); T4/T5/T6 parallelizable in worktrees after T3 (disjoint); T7 after T2+T6; T8 anytime after T4 (Haiku, disjoint files). Stage 1: T9→T10→T11→T12→T13 (T11 parallelizable with T12 if worktree-disjoint — coordinator judges at dispatch). Stage 2: T14→T15→{T16,T17 parallel}→T18→T19.
+- Models: Stage-0 Task 8 and Task 20 (input) Haiku (mechanical, fully specified); all others Sonnet; reviews all Sonnet; final whole-phase review at phase end.
+- Sequencing: Stage 0: T1→T2→T3 sequential (T3 zones touch files broadly); T4/T5/T6 parallelizable in worktrees after T3 (disjoint); T7 after T2+T6; T8 anytime after T4 (Haiku, disjoint files). Stage 1: T9(gate)→T10→T11→T12→T13→T14→T15→T16, with T17 (window hardening) parallelizable any time after the gate (disjoint platform/present files; worktree). T10 before T11 (both touch allocator/device creation). Stage 2: T18→T19→{T20,T21 parallel}→T22→T24; T23 (executor cleanup) parallelizable with T20–T22 (rx_graph-only, worktree) but MUST land before T24's stress-v2 numbers.
+- **Task renumbering (2026-08-18):** the primary-gate insertion left two "Task 9" headings and stale references; tasks are now uniquely numbered. Mapping for older ledger/report references — old T9 (GeometryPool)→T12, old T10 (import core/registry)→T13, old T11 (KTX2)→T14, old T12 (async import)→T15, old T13 (StandardPBR/viewer)→T16, old T14 (scene proxies)→T18, old T15 (draw lists)→T19, old T16 (input)→T20, old T17 (ImGui)→T21, old T18 (shadows)→T22, old T19 (sample 09)→T24. New tasks: T10 (memory budget, card #27), T11 (upload tickets, card #28), T17 (window hardening, card #25), T23 (executor allocation elimination, card #29).
 - Each stage ends with a coordinator checkpoint: suite green both presets, stage sample packaged and run standalone, numbers recorded in ledger, board cards moved, then next stage dispatches.
 - Phase exit: final whole-phase review (fresh, most scrutiny on cross-stage seams: registry↔scene handle lifetimes, parallel recording under real scene loads, threading contract adherence), one fix wave, push, CI green, tag v0.4.0-phase4, release with both packages + published numbers, board cards closed.

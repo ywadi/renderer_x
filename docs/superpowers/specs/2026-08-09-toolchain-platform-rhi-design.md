@@ -218,7 +218,7 @@ it is out of scope for *this* spec only, not out of scope for the project:
     acquire/release + swapchain lifecycle, SDK/platform phase with a
     windowed fallback per the optionality principle; (FG8) HDR display
     output + swapchain colorspace ladder (techniques phase, with the
-    post stack); (FG9) renderer-wide memory budget + reporting + eviction-policy design ELEVATED to Phase 4 Stage 1 (scheduled ticket, 2026-08-12) — accounting/VK_EXT_memory_budget/host report/eviction-contract land in Phase 4; the eviction MECHANISM + residency pairs with the streaming phase's workloads; (FG10)
+    post stack); (FG9) renderer-wide memory budget + reporting + eviction-policy design ELEVATED to Phase 4 Stage 1 (scheduled ticket, 2026-08-12; spec'd as Phase 4 D24, 2026-08-18) — accounting/VK_EXT_memory_budget/host report/eviction-contract land in Phase 4; the eviction MECHANISM + residency pairs with the streaming phase's workloads; (FG10)
     host-provided native window embedding via SDL3 foreign-window
     properties, or a recorded rejection (SDK spec must answer).
   - *Post-V1:* (FG11) consumer screenshot/capture API (SDK/tooling);
@@ -241,6 +241,50 @@ it is out of scope for *this* spec only, not out of scope for the project:
   meshlets exist; it requires a shade-from-ID path through the material
   system's specialization model — design work to scope in that phase's
   spec, not assumed.
+- **Compute pipeline capability** (committed 2026-08-18, geometry phase,
+  sequenced FIRST among that phase's items): compute PSO creation +
+  dispatch API. The render graph's compute-class pass and barrier
+  machinery are delivered (Phase 3; compute-class barrier stages derive
+  from attachment-free signatures); the pipeline half is not —
+  MaterialSystem is vertex+fragment-only by construction
+  (kMaterialStageFlags) and getPipeline() rejects an attachment-free
+  PassSignature outright, and the repo contains zero
+  vkCreateComputePipelines/vkCmdDispatch (verified 2026-08-18). Required
+  by three already-committed consumers: compute-culling as the
+  mesh-shader baseline (above), compute pre-skinning (Phase 4 seed
+  notes), and GPU-driven culling (above). Scope includes lifting the
+  attachment-free-signature rejection. Deferral-safe by retrofit
+  economics: a NEW code path, not a change at existing call sites.
+- **GPU particles / compute-driven simulation** (committed 2026-08-18,
+  techniques phase): simulation dispatch, per-frame particle buffers,
+  sorted/instanced billboard submission. DISTINCT from FG3 — FG3 is the
+  CPU-generated dynamic-content upload contract and does not cover
+  GPU-resident simulation; before this entry, "particle" appeared
+  nowhere in the planning corpus outside FG3 (registry hole found by the
+  2026-08-18 claim validation). Depends on the compute pipeline
+  capability above and on FG3's contract for the CPU-authored spawn
+  path.
+- **Upload/transfer asynchrony policy** (committed 2026-08-18, streaming
+  phase): dedicated transfer-queue USE, queue-family ownership transfer
+  for uploaded resources, multi-frame in-flight staging. The Phase 4
+  invariant (D25: pollable UploadTicket from flush(), optional transfer
+  queue ACQUIRED at device creation with graphics fallback) makes this
+  additive. D5's Phase 4 threading deferral covers thread-safety only;
+  the formerly unconditional fence wait in flush() is the D25 item, not
+  this one.
+- **PSO warmup UX** (committed 2026-08-18, SDK/tooling phase —
+  SUPERSEDES the feature-gap audit's "near-miss" ruling on pipeline
+  pre-caching): the disk-persistent VkPipelineCache is delivered and
+  regression-tested, and Slang compilation happens at loadMaterial, not
+  draw time — but vkCreateGraphicsPipelines still runs lazily on first
+  (material, pass, specialization) use, on the main thread, with no
+  warmup, so first-run/cold-cache hitches have no strategy. Scope:
+  cold-cache warmup pass, background/parallel PSO creation (needs the
+  recorded resolve/record API split — getPipeline is main-thread-
+  guarded), and a host-facing "precompile these variants" API. Phase 4
+  D27 (draw-list main-thread pre-resolution) provides the deterministic
+  enumeration hook this attaches to. Fossilize/offline exhaustive
+  packaging remains separately deferred (Phase 3 D7).
 - **Scheduler sharing with host engines** (committed 2026-08-11, SDK
   phase): an embedding game engine must be able to make the renderer's
   task scheduler and its own job system ONE pool — via consumer-chosen
