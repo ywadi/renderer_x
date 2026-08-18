@@ -654,16 +654,33 @@ TEST_CASE("Uploader::flush()/isComplete() never block past a wall-clock threshol
         return;
     }
 
-    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device);
+    // Sized generously above kUploadSize below (its default 16 MiB does
+    // not fit even one 128 MiB payload) -- this test's ring reclamation is
+    // not what is under test here, so a comfortably oversized ring keeps
+    // every uploadToBuffer() call on the simple, no-wrap path.
+    auto uploader =
+        rx::rhi::Uploader::create(fixture->allocator, fixture->device, /*ringBufferSize=*/160u * 1024u * 1024u);
     REQUIRE(uploader.has_value());
 
-    // 2 MiB per "frame" -- large enough that a genuine blocking
-    // vkWaitForFences(..., UINT64_MAX) round trip (submit -> GPU copy ->
-    // signal -> host wait wakes) measurably exceeds kThreshold on any
-    // driver this project targets; a non-blocking flush()/isComplete()
-    // call, in contrast, is dominated by driver call overhead alone.
-    constexpr VkDeviceSize kUploadSize = 2u * 1024u * 1024u;
-    constexpr int kFrameCount = 40;
+    // 128 MiB per "frame" -- empirically sized (see the report's
+    // scratch-worktree revert evidence) so a genuine blocking
+    // vkWaitForFences(..., UINT64_MAX)-equivalent round trip (submit ->
+    // GPU copy -> signal -> host wait wakes) clears kThreshold with a
+    // comfortable margin on this project's own dev hardware (observed
+    // 14-19 ms per call when the pre-Task-11 blocking behavior was
+    // deliberately reintroduced in a scratch worktree) -- a smaller
+    // payload (2-64 MiB) round-tripped too fast on this machine's discrete
+    // GPU to reliably clear an 8 ms threshold, which would have made this
+    // test a weak discriminator on fast hardware even though it is a
+    // strong one on CI's software-rasterized lavapipe. A non-blocking
+    // flush()/isComplete() call, in contrast, is dominated by driver call
+    // overhead alone, independent of payload size (observed single- to
+    // double-digit microseconds regardless of kUploadSize) -- this is WHY
+    // increasing the payload costs this test's REAL (non-reverted) run
+    // nothing: the timed calls stay microsecond-scale either way, only
+    // the untimed final wait()+readback loop grows.
+    constexpr VkDeviceSize kUploadSize = 128u * 1024u * 1024u;
+    constexpr int kFrameCount = 8;
     constexpr auto kThreshold = std::chrono::milliseconds(8);
 
     std::vector<uint8_t> payload(kUploadSize, 0x3C);
