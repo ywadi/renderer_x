@@ -80,6 +80,60 @@ std::string_view extensionDisposition(std::string_view name) {
 }
 
 // ---------------------------------------------------------------------
+// `extras` application JSON [log-don't-drop, ruled; matrix-issue02 §2A
+// "extras" row]. fastgltf does not store extras itself ("you are
+// expected to store any data from extras yourself" -- docs/guides.rst,
+// verified directly); detection is via `Parser::setExtrasParseCallback`
+// + `setUserPointer`. This importer does not yet PRESERVE extras for a
+// host to read (registry N3: "SDK-phase ABI projection" -- a future
+// task's deliverable) -- it only detects and logs their presence, which
+// is the whole of what log-don't-drop requires for this row: "detection
+// requires... the callback"; storage is explicitly out of scope here.
+// ---------------------------------------------------------------------
+std::string_view categoryName(fastgltf::Category category) {
+    switch (category) {
+        case fastgltf::Category::Nodes:
+            return "nodes";
+        case fastgltf::Category::Meshes:
+            return "meshes";
+        case fastgltf::Category::Materials:
+            return "materials";
+        case fastgltf::Category::Animations:
+            return "animations";
+        case fastgltf::Category::Cameras:
+            return "cameras";
+        case fastgltf::Category::Skins:
+            return "skins";
+        case fastgltf::Category::Scenes:
+            return "scenes";
+        case fastgltf::Category::Textures:
+            return "textures";
+        case fastgltf::Category::Images:
+            return "images";
+        case fastgltf::Category::Samplers:
+            return "samplers";
+        case fastgltf::Category::Buffers:
+            return "buffers";
+        case fastgltf::Category::BufferViews:
+            return "bufferViews";
+        case fastgltf::Category::Accessors:
+            return "accessors";
+        case fastgltf::Category::Asset:
+            return "asset";
+        default:
+            return "other";
+    }
+}
+
+using ExtrasCounts = std::unordered_map<fastgltf::Category, size_t>;
+
+void onExtrasParsed(simdjson::dom::object* /*extras*/, std::size_t /*objectIndex*/, fastgltf::Category objectType,
+                     void* userPointer) {
+    auto* counts = static_cast<ExtrasCounts*>(userPointer);
+    (*counts)[objectType] += 1;
+}
+
+// ---------------------------------------------------------------------
 // Byte-source-mediated buffer/image resolution [the IO-source
 // abstraction invariant]. Resolves every fastgltf::sources::URI ITSELF
 // through the injected ByteSource -- Options::LoadExternalBuffers/
@@ -291,7 +345,23 @@ struct ImportBufferDataAdapter {
     const fastgltf::Asset& asset;
     ResolvedBuffers& buffers;
     const DecodedMeshoptViews& meshoptViews;
-
+    // [Fix, this task's own testing] An unresolvable bufferView (e.g. an
+    // absolute/network URI buffer, matrix row "Absolute / http(s)
+    // URIs" -- never fetched) previously made this operator() return an
+    // EMPTY span, which crashed (SIGSEGV) the moment fastgltf's own
+    // accessor tools indexed past it -- fastgltf does no bounds-checking
+    // of its own against a short adapter result. Zero-filling to the
+    // FULL declared byteLength instead keeps every read in-bounds and
+    // well-defined; the resulting geometry degrades to zero-valued (an
+    // all-origin degenerate primitive, itself rejected/skipped by
+    // gltf_pipeline.cpp's own zero-vertex/non-finite guards where
+    // applicable) rather than crashing -- the WARN naming the URI is
+    // already logged at the point resolution failed (ResolvedBuffers::
+    // bytes()). `static thread_local` (NOT a member of this struct):
+    // this adapter is shared by reference across every parallelFor
+    // worker chunk (D5/matrix row 15), and a plain member would race
+    // concurrent calls needing different fallback sizes on different
+    // threads.
     std::span<const std::byte> operator()(const fastgltf::Asset&, size_t bufferViewIndex) const {
         const fastgltf::BufferView& view = asset.bufferViews[bufferViewIndex];
         if (const std::vector<std::byte>* decoded = meshoptViews.find(bufferViewIndex)) {
@@ -299,7 +369,9 @@ struct ImportBufferDataAdapter {
         }
         std::span<const std::byte> full = buffers.bytes(view.bufferIndex);
         if (full.size() < view.byteOffset + view.byteLength) {
-            return {};
+            static thread_local std::vector<std::byte> zeroFallback;
+            zeroFallback.assign(view.byteLength, std::byte{0});
+            return std::span<const std::byte>(zeroFallback);
         }
         return full.subspan(view.byteOffset, view.byteLength);
     }
@@ -511,6 +583,9 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
     }
 
     fastgltf::Parser parser(kEnabledExtensions);
+    ExtrasCounts extrasCounts;
+    parser.setUserPointer(&extrasCounts);
+    parser.setExtrasParseCallback(&onExtrasParsed);
     // NEVER LoadExternalBuffers/LoadExternalImages -- the IO-source
     // abstraction invariant [byte_source.h]. Every sources::URI this
     // parse produces is resolved by THIS file, through `source`, never
@@ -539,6 +614,19 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
     // extensionsRequired containing anything fastgltf could not parse at
     // all already failed above (Error::UnknownRequiredExtension); every
     // entry that reaches this point was satisfiable.
+
+    // ---- `extras` presence surfacing [log-don't-drop] ----
+    if (!extrasCounts.empty()) {
+        std::string summary;
+        for (const auto& [category, count] : extrasCounts) {
+            if (!summary.empty()) {
+                summary += ", ";
+            }
+            summary += std::string(categoryName(category)) + "=" + std::to_string(count);
+        }
+        RX_LOG_INFO("rx_asset: importGltf: extras present [{}] (detected, not yet preserved for host use -- N3)",
+                     summary);
+    }
 
     ResolvedBuffers buffers(asset, source);
     // Sequential pre-pass [D5/matrix-issue02 row 15]: every buffer is

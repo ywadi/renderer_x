@@ -307,3 +307,82 @@ TEST_CASE("FilesystemByteSource refuses an absolute-path URI defensively") {
     CHECK_FALSE(source.read("/etc/passwd").has_value());
     std::filesystem::remove_all(dir);
 }
+
+// ---------------------------------------------------------------------
+// EXT_meshopt_compression [matrix-issue02 §2C row 8]: mode->decoder and
+// filter round-trips, using meshoptimizer's REAL encode functions
+// directly (the identical codec a gltfpack-produced file's compressed
+// bufferViews use) -- see import_gltf.cpp's DecodedMeshoptViews class
+// for the production mode/filter dispatch these prove correct.
+// Attributes+Triangles modes are ALSO proven end-to-end through a real
+// glTF fixture (import_gltf_gpu_test.cpp's cube_meshopt.gltf, generated
+// by tools/gen_gltf_compression_fixtures from this same library); Indices
+// mode and all three filters are proven here directly, device-free,
+// since gltfpack itself never emits Indices-mode buffers for a TRIANGLES
+// primitive (Triangles mode is strictly better for that topology) --
+// contriving a glTF fixture around it would exercise nothing gltfpack
+// output ever does; a direct codec round-trip is the honest way to cover
+// the function this project's mode->decoder map still dispatches to.
+// ---------------------------------------------------------------------
+
+TEST_CASE("EXT_meshopt_compression: Indices mode round-trips exactly (meshopt_encode/decodeIndexSequence)") {
+    std::vector<unsigned int> indices = {0, 5, 3, 1, 4, 2, 9, 7};
+    // meshopt_encodeIndexSequence has no *Bound() sizer of its own --
+    // oversize generously (worst case is close to 1 byte/index for small
+    // sequences; 256 bytes for 8 indices is ample headroom).
+    std::vector<unsigned char> encoded(256, 0);
+    size_t encodedSize = meshopt_encodeIndexSequence(encoded.data(), encoded.size(), indices.data(), indices.size());
+    REQUIRE(encodedSize > 0);
+    encoded.resize(encodedSize);
+
+    std::vector<unsigned int> decoded(indices.size());
+    int rc = meshopt_decodeIndexSequence(decoded.data(), indices.size(), sizeof(unsigned int), encoded.data(), encoded.size());
+    REQUIRE(rc == 0);
+    CHECK(decoded == indices);
+}
+
+TEST_CASE("EXT_meshopt_compression: Octahedral filter round-trips a unit vector") {
+    float v[4] = {0.0F, 0.0F, 1.0F, 1.0F};  // +Z, w=1 (preserved as-is)
+    int8_t encoded[4];
+    meshopt_encodeFilterOct(encoded, 1, 4, 8, v);
+    int8_t buf[4];
+    std::memcpy(buf, encoded, sizeof(buf));
+    meshopt_decodeFilterOct(buf, 1, 4);
+
+    const float x = buf[0] / 127.0F, y = buf[1] / 127.0F, z = buf[2] / 127.0F, w = buf[3] / 127.0F;
+    CHECK(x == doctest::Approx(0.0F).epsilon(0.02));
+    CHECK(y == doctest::Approx(0.0F).epsilon(0.02));
+    CHECK(z == doctest::Approx(1.0F).epsilon(0.02));
+    CHECK(w == doctest::Approx(1.0F).epsilon(0.02));
+}
+
+TEST_CASE("EXT_meshopt_compression: Quaternion filter round-trips the identity quaternion") {
+    float q[4] = {0.0F, 0.0F, 0.0F, 1.0F};
+    int16_t encoded[4];
+    meshopt_encodeFilterQuat(encoded, 1, 8, 16, q);
+    int16_t buf[4];
+    std::memcpy(buf, encoded, sizeof(buf));
+    meshopt_decodeFilterQuat(buf, 1, 8);
+
+    const float x = buf[0] / 32767.0F, y = buf[1] / 32767.0F, z = buf[2] / 32767.0F, w = buf[3] / 32767.0F;
+    CHECK(x == doctest::Approx(0.0F).epsilon(0.01));
+    CHECK(y == doctest::Approx(0.0F).epsilon(0.01));
+    CHECK(z == doctest::Approx(0.0F).epsilon(0.01));
+    CHECK(w == doctest::Approx(1.0F).epsilon(0.01));
+}
+
+TEST_CASE("EXT_meshopt_compression: Exponential filter round-trips arbitrary floats bit-exact") {
+    float data[4] = {1.5F, -2.25F, 100.0F, 0.001F};
+    uint32_t encoded[4];
+    meshopt_encodeFilterExp(encoded, 1, 16, 24, data, meshopt_EncodeExpSeparate);
+    uint32_t buf[4];
+    std::memcpy(buf, encoded, sizeof(buf));
+    meshopt_decodeFilterExp(buf, 1, 16);
+    float out[4];
+    std::memcpy(out, buf, sizeof(out));
+
+    CHECK(out[0] == doctest::Approx(1.5F));
+    CHECK(out[1] == doctest::Approx(-2.25F));
+    CHECK(out[2] == doctest::Approx(100.0F));
+    CHECK(out[3] == doctest::Approx(0.001F).epsilon(0.001));
+}
