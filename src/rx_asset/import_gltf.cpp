@@ -2,6 +2,7 @@
 #include "gltf_error.h"
 #include "gltf_pipeline.h"
 #include <rx_asset/geometry_pool.h>
+#include <rx_asset/texture_cache.h>
 #include <rx_core/log.h>
 #include <rx_task/scheduler.h>
 #include <fastgltf/core.hpp>
@@ -255,6 +256,60 @@ private:
     std::vector<std::optional<std::vector<std::byte>>> owned_;
     std::vector<bool> resolved_;
 };
+
+// [Task 14, matrix-issue03 "KHR_texture_basisu wiring from import" row]
+// Resolves ONE glTF `images[]` entry's full byte content through `source`
+// -- the SAME three consume-now source kinds `ResolvedBuffers::bytes()`
+// above already handles for buffers (external URI / inline data-URI /
+// GLB bufferView, gate ruling C3), just for `fastgltf::Image::data`
+// instead of `fastgltf::Buffer::data`. Unlike ResolvedBuffers, this is
+// NOT cached across calls -- an image is resolved at most once per
+// material-texture-slot reference during this whole import (no per-
+// primitive fan-out ever touches an image the way accessor reads touch
+// buffers), so the extra bookkeeping a cache would need has no payoff
+// here.
+std::optional<std::vector<std::byte>> resolveImageBytes(const fastgltf::Asset& asset, size_t imageIndex,
+                                                          ResolvedBuffers& buffers, ByteSource& source) {
+    if (imageIndex >= asset.images.size()) {
+        return std::nullopt;
+    }
+    const fastgltf::Image& image = asset.images[imageIndex];
+
+    if (const auto* uri = std::get_if<fastgltf::sources::URI>(&image.data)) {
+        if (isAbsoluteOrNetworkUri(uri->uri)) {
+            RX_LOG_WARN("rx_asset: image {} references an absolute/network URI '{}' -- fallback (no bytes), never fetched",
+                        imageIndex, uri->uri.string());
+            return std::nullopt;
+        }
+        return source.read(std::string(uri->uri.string()));
+    }
+    if (const auto* arr = std::get_if<fastgltf::sources::Array>(&image.data)) {
+        return std::vector<std::byte>(arr->bytes.begin(), arr->bytes.end());
+    }
+    if (const auto* vec = std::get_if<fastgltf::sources::Vector>(&image.data)) {
+        return vec->bytes;
+    }
+    if (const auto* bv = std::get_if<fastgltf::sources::ByteView>(&image.data)) {
+        return std::vector<std::byte>(bv->bytes.begin(), bv->bytes.end());
+    }
+    if (const auto* bufView = std::get_if<fastgltf::sources::BufferView>(&image.data)) {
+        // GLB-embedded / KHR_texture_basisu images: the overwhelmingly
+        // common non-URI case (gltfpack, toktx --outfile-with-basisu-
+        // style toolchains, and every GLB this task's own fixtures use).
+        if (bufView->bufferViewIndex >= asset.bufferViews.size()) {
+            return std::nullopt;
+        }
+        const fastgltf::BufferView& view = asset.bufferViews[bufView->bufferViewIndex];
+        std::span<const std::byte> full = buffers.bytes(view.bufferIndex);
+        if (full.size() < view.byteOffset + view.byteLength) {
+            return std::nullopt;
+        }
+        std::span<const std::byte> sub = full.subspan(view.byteOffset, view.byteLength);
+        return std::vector<std::byte>(sub.begin(), sub.end());
+    }
+    // sources::CustomBuffer/Fallback/monostate -- nothing to read.
+    return std::nullopt;
+}
 
 // ---------------------------------------------------------------------
 // EXT_meshopt_compression decode [matrix-issue02 §2C row]: pre-decodes
@@ -571,7 +626,7 @@ bool hasNegativeDeterminant(const glm::mat4& m) {
 // ---------------------------------------------------------------------
 
 ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> documentBytes, ByteSource& source, GeometryPool& pool,
-                                 rx::task::Scheduler& scheduler, TextureCache* /*textures -- Task 14*/) {
+                                 rx::task::Scheduler& scheduler, TextureCache* textures) {
     ImportResult result;
 
     auto dataBuffer = fastgltf::GltfDataBuffer::FromBytes(reinterpret_cast<const std::byte*>(documentBytes.data()),
@@ -680,16 +735,33 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
         // for NormalTextureInfo/OcclusionTextureInfo (both PUBLICLY
         // DERIVE from TextureInfo) pass `&*opt` upcast to the base
         // pointer instead of slicing a copy.
-        const auto fillRef = [&](TextureRef& ref, const fastgltf::TextureInfo* info) {
+        // [Task 14, matrix-issue03 "KHR_texture_basisu wiring from
+        // import" row] `role` is the MATERIAL SLOT this call fills --
+        // slot-driven, never filename-driven (the misleading-filename
+        // test this row calls for constructs a fixture whose file name
+        // says one thing and whose material slot says another, and
+        // asserts the SLOT wins). `textures` is nullptr-tolerant (Task
+        // 13's own existing contract, unchanged): when absent, every ref
+        // still resolves to registry.fallbackTextureHandle(), exactly as
+        // before this task.
+        const auto fillRef = [&](TextureRef& ref, const fastgltf::TextureInfo* info, TextureRole role) {
             if (info == nullptr) {
                 return;
             }
             ref.present = true;
-            ref.handle = registry.fallbackTextureHandle();  // [D11] Task 14 resolves the real texture
+            ref.handle = registry.fallbackTextureHandle();  // [D11] overwritten below on a successful real resolve
             if (info->textureIndex < asset.textures.size()) {
                 const fastgltf::Texture& tex = asset.textures[info->textureIndex];
-                if (tex.imageIndex) {
-                    ref.imageIndex = static_cast<uint32_t>(*tex.imageIndex);
+                // KHR_texture_basisu [D10]: a texture's basisuImageIndex,
+                // when present, names the KTX2 image this texture ACTUALLY
+                // uses -- takes priority over the core imageIndex per the
+                // extension's own documented fallback order (glTF spec:
+                // "clients that support this extension SHOULD use... the
+                // image referenced by this extension" -- imageIndex is the
+                // non-KTX2 fallback for viewers without the extension).
+                std::optional<size_t> effectiveImageIndex = tex.basisuImageIndex ? tex.basisuImageIndex : tex.imageIndex;
+                if (effectiveImageIndex) {
+                    ref.imageIndex = static_cast<uint32_t>(*effectiveImageIndex);
                 }
                 if (tex.samplerIndex && *tex.samplerIndex < asset.samplers.size()) {
                     const fastgltf::Sampler& s = asset.samplers[*tex.samplerIndex];
@@ -697,6 +769,19 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
                     ref.sampler.wrapT = static_cast<uint32_t>(s.wrapT);
                     ref.sampler.magFilter = s.magFilter ? static_cast<uint32_t>(*s.magFilter) : 0U;
                     ref.sampler.minFilter = s.minFilter ? static_cast<uint32_t>(*s.minFilter) : 0U;
+                }
+
+                if (textures != nullptr && effectiveImageIndex) {
+                    auto bytes = resolveImageBytes(asset, *effectiveImageIndex, buffers, source);
+                    if (bytes.has_value()) {
+                        std::string debugName = dst.name.empty()
+                                                     ? ("material#" + std::to_string(mi) + " " + textureRoleName(role))
+                                                     : (dst.name + " " + textureRoleName(role));
+                        ref.handle = textures->loadFromBytes(std::span<const std::byte>(*bytes), role, debugName);
+                    } else {
+                        RX_LOG_WARN("rx_asset: material '{}': {} texture (image #{}) bytes could not be resolved -- D11 fallback",
+                                    dst.name, textureRoleName(role), *effectiveImageIndex);
+                    }
                 }
             }
             ref.texCoordIndex = static_cast<uint32_t>(info->texCoordIndex);
@@ -713,11 +798,17 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
                 }
             }
         };
-        fillRef(dst.baseColorTexture, src.pbrData.baseColorTexture ? &*src.pbrData.baseColorTexture : nullptr);
-        fillRef(dst.metallicRoughnessTexture, src.pbrData.metallicRoughnessTexture ? &*src.pbrData.metallicRoughnessTexture : nullptr);
-        fillRef(dst.normalTexture, src.normalTexture ? static_cast<const fastgltf::TextureInfo*>(&*src.normalTexture) : nullptr);
-        fillRef(dst.occlusionTexture, src.occlusionTexture ? static_cast<const fastgltf::TextureInfo*>(&*src.occlusionTexture) : nullptr);
-        fillRef(dst.emissiveTexture, src.emissiveTexture ? &*src.emissiveTexture : nullptr);
+        fillRef(dst.baseColorTexture, src.pbrData.baseColorTexture ? &*src.pbrData.baseColorTexture : nullptr,
+                TextureRole::BaseColor);
+        fillRef(dst.metallicRoughnessTexture,
+                src.pbrData.metallicRoughnessTexture ? &*src.pbrData.metallicRoughnessTexture : nullptr,
+                TextureRole::MetallicRoughness);
+        fillRef(dst.normalTexture, src.normalTexture ? static_cast<const fastgltf::TextureInfo*>(&*src.normalTexture) : nullptr,
+                TextureRole::Normal);
+        fillRef(dst.occlusionTexture,
+                src.occlusionTexture ? static_cast<const fastgltf::TextureInfo*>(&*src.occlusionTexture) : nullptr,
+                TextureRole::Occlusion);
+        fillRef(dst.emissiveTexture, src.emissiveTexture ? &*src.emissiveTexture : nullptr, TextureRole::Emissive);
 
         // Every unimplemented KHR_materials_* [log-don't-drop, one WARN
         // per material+extension -- matrix-issue02 §2B shared criterion].

@@ -324,6 +324,87 @@ bool Uploader::uploadToImage(Texture2D& dst, const void* pixels, VkDeviceSize pi
     return true;
 }
 
+bool Uploader::uploadImageMips(Texture2D& dst, std::span<const ImageMipLevel> levels) {
+    RX_ASSERT_MAIN_THREAD("Uploader::uploadImageMips");
+    RX_ZONE;
+    if (levels.empty()) {
+        RX_LOG_ERROR("Uploader::uploadImageMips: empty `levels` span -- at least one mip level is required");
+        return false;
+    }
+    for (const ImageMipLevel& level : levels) {
+        if (level.size > ringBufferSize_) {
+            RX_LOG_ERROR(
+                "Uploader::uploadImageMips: level {} is {} bytes, exceeding the {}-byte staging ring buffer's "
+                "total capacity",
+                level.mipLevel, level.size, ringBufferSize_);
+            return false;
+        }
+    }
+
+    // Whole-resource UNDEFINED -> TRANSFER_DST_OPTIMAL transition, once,
+    // before the FIRST level with real bytes to copy -- exactly
+    // uploadToImage()'s own reasoning (every level starts UNDEFINED at
+    // image-creation time; one whole-resource transition is correct and
+    // simpler than a per-level one). Recorded lazily against whichever
+    // command-buffer slot is active AT THAT POINT -- see this method's
+    // own header comment (upload.h) for why a mid-batch ring wrap
+    // (reserveRingSpace() self-flushing and starting a new recording
+    // slot) does not require a SECOND transition: the underlying VkImage
+    // is already, really, in TRANSFER_DST_OPTIMAL by the time any later
+    // slot's commands execute (same queue, submission order preserved --
+    // the same assumption this class's own ticket-ordering guarantee
+    // already documents, class comment above).
+    bool transitionedToDst = false;
+    for (const ImageMipLevel& level : levels) {
+        if (level.size == 0) {
+            continue;
+        }
+        VkDeviceSize ringOffset = 0;
+        if (!reserveRingSpace(level.size, ringOffset)) {
+            return false;
+        }
+
+        std::memcpy(static_cast<uint8_t*>(ringBuffer_.mappedData()) + ringOffset, level.data, level.size);
+        ringBuffer_.flush(ringOffset, level.size);
+
+        beginRecordingIfNeeded();
+        VkCommandBuffer cmd = activeCmd();
+
+        if (!transitionedToDst) {
+            transitionImage(cmd, dst.image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            transitionedToDst = true;
+        }
+
+        // BLOCK-COMPRESSED ROW PITCH / SUB-BLOCK MIP TAILS -- see this
+        // method's own header comment (upload.h) for the full Vulkan-
+        // spec citation. bufferRowLength/bufferImageHeight are left at 0
+        // (the VkBufferImageCopy default-initialized value) deliberately
+        // -- "tightly packed, block-rounded" is exactly libktx's own
+        // per-level byte layout, for every level including sub-block
+        // tails.
+        VkBufferImageCopy region{};
+        region.bufferOffset = ringOffset;
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = level.mipLevel;
+        region.imageSubresource.baseArrayLayer = 0;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent = {level.extent.width, level.extent.height, 1};
+        vkCmdCopyBufferToImage(cmd, ringBuffer_.handle(), dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                                &region);
+    }
+
+    beginRecordingIfNeeded();
+    VkCommandBuffer cmd = activeCmd();
+    if (!transitionedToDst) {
+        // Every level had size == 0 (degenerate, not exercised by any
+        // Task 14 fixture, but defensively handled rather than left
+        // UNDEFINED): still transition so `dst` ends up sampleable.
+        transitionImage(cmd, dst.image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    }
+    transitionImage(cmd, dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    return true;
+}
+
 UploadTicket Uploader::flush() {
     RX_ASSERT_MAIN_THREAD("Uploader::flush");
 

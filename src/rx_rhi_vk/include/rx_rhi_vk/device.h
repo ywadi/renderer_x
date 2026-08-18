@@ -153,6 +153,23 @@ public:
     // for any purpose beyond GeometryPool's own test-observable accessor.
     bool supportsBufferDeviceAddress() const { return bufferDeviceAddressEnabled_; }
 
+    // [Phase 4 Stage 1 Task 14, spec D10/G6] True iff `samplerAnisotropy`
+    // (VkPhysicalDeviceFeatures, Vulkan 1.0 core -- NOT a features12/13
+    // bit) was ENABLED on this Device's underlying VkDevice, resolved via
+    // vk-bootstrap's `enable_features_if_present()` AFTER physical-device
+    // selection, mirroring supportsBufferDeviceAddress()'s own opportunistic
+    // pattern immediately above: a device lacking the feature still builds
+    // a fully working Device; this simply reports false. rx::asset::
+    // TextureCache::getOrCreateSampler() (src/rx_asset) is this phase's
+    // consumer -- checking ONLY VkPhysicalDeviceFeatures::samplerAnisotropy
+    // (what the hardware/driver merely ADVERTISES) without also checking
+    // this accessor (what THIS device's VkDevice actually had ENABLED at
+    // creation time) is a real, empirically-hit validation error
+    // (VUID-VkSamplerCreateInfo-anisotropyEnable-01070), not a hypothetical
+    // one -- reproduced directly by this task's own first-draft
+    // texture_cache_test.cpp run before this accessor existed.
+    bool supportsSamplerAnisotropy() const { return samplerAnisotropyEnabled_; }
+
     VkSwapchainKHR swapchain() const { return swapchain_; }
     const std::vector<VkImage>& swapchainImages() const { return swapchainImages_; }
     VkFormat swapchainFormat() const { return swapchainFormat_; }
@@ -229,6 +246,7 @@ private:
     bool calibratedTimestampsEnabled_ = false;
     bool memoryBudgetExtensionEnabled_ = false;
     bool bufferDeviceAddressEnabled_ = false;
+    bool samplerAnisotropyEnabled_ = false;
 
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     std::vector<VkImage> swapchainImages_;

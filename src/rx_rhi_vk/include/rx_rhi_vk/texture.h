@@ -106,6 +106,40 @@ public:
                                             uint32_t requestedMipLevels = 0,
                                             MemoryCategory category = MemoryCategory::Internal);
 
+    // [Phase 4 Stage 1 Task 14, gate matrix-issue03 N4/gate ruling #3]
+    // Creates a Texture2D whose FULL mip chain is supplied by the caller
+    // with real per-level data (a KTX2 container's own levels, or any
+    // other pre-mipped source) -- see Uploader::uploadImageMips() below,
+    // this factory's actual consumer. Unlike create() above,
+    // `mipLevels` is honored EXACTLY, with NO blit-format-feature probe
+    // and no fallback-to-1 clamp: that probe exists ONLY to gate whether
+    // runtime vkCmdBlitImage mip GENERATION (recordMipChainBlit()) is
+    // safe to attempt, and a Texture2D built through this factory must
+    // NEVER have recordMipChainBlit() called against it (nothing here
+    // ever needs to blit-generate a level that already has real data).
+    // Usage carries `usage | VK_IMAGE_USAGE_TRANSFER_DST_BIT` ONLY --
+    // never TRANSFER_SRC_BIT, since nothing ever blits FROM an image
+    // created this way; this also means a block-compressed format that
+    // does not support BLIT_SRC/BLIT_DST/FILTER_LINEAR under optimal
+    // tiling (common for compressed formats, irrelevant here) still
+    // creates successfully, as long as it supports SAMPLED_IMAGE +
+    // TRANSFER_DST -- the two bits this factory's own usage flags
+    // actually need.
+    //
+    // `mipLevels` must be >= 1 (a caller-side precondition, not
+    // defensively clamped here -- the KTX2 container this factory's real
+    // caller reads from always reports at least 1 level by construction).
+    //
+    // Same failure/category-attribution contract as create() above
+    // (std::nullopt + Allocator::noteAllocationFailure()/
+    // noteNonMemoryFailure() on vmaCreateImage/vkCreateImageView failure
+    // respectively).
+    static std::optional<Texture2D> createForPresuppliedMips(VkPhysicalDevice physicalDevice, VkDevice device,
+                                                               Allocator& allocator, VkExtent2D extent,
+                                                               VkFormat format, VkImageUsageFlags usage,
+                                                               uint32_t mipLevels,
+                                                               MemoryCategory category = MemoryCategory::Texture);
+
     VkImage image() const { return image_; }
     VkImageView view() const { return view_; }
     VkExtent2D extent() const { return extent_; }

@@ -15,15 +15,29 @@
 # in the root CMakeLists.txt) copies the Slang runtime shared libraries
 # this binary needs at load time next to it, exactly like every other
 # rx_shader-linking binary in this repo.
+#
+# Phase 4 Stage 1 Task 14 -- KTX2/Basis compressed texture pipeline +
+# sampler cache (spec D10/D11/D24/D25, gate matrix-issue03 as amended by
+# gate/rulings-2026-08-18.md #3): texture_cache_test.cpp joins this SAME
+# GPU-backed binary (not a new executable) -- it needs exactly this
+# fixture's real Device/Allocator/Uploader (plus BindlessTable/
+# DeletionQueue, which its own fixture adds) and the SAME rx_shader-linked
+# in-process pipeline-compile path geometry_pool_test.cpp's own
+# exhaustion-draw test already established here, for its own quadrant-
+# pixel readback GPU test.
 add_executable(rx_asset_tests
     doctest_main.cpp
     geometry_pool_test.cpp
     bda_test.cpp
     accounting_test.cpp
     thread_guard_test.cpp
+    texture_cache_test.cpp
 )
 target_link_libraries(rx_asset_tests PRIVATE rx_asset rx_rhi_vk rx_platform rx_shader doctest::doctest)
 rx_shader_deploy_runtime_libs(rx_asset_tests)
+target_compile_definitions(rx_asset_tests PRIVATE
+    RX_ASSET_ROOT_DIR="${CMAKE_SOURCE_DIR}"
+)
 
 # --validate: same documentation/consistency role as every other GPU-gate
 # invocation in this repo (rx_graph_gpu_tests, every sample's own headless
@@ -57,9 +71,20 @@ set_tests_properties(rx_asset_tests PROPERTIES TIMEOUT 300)
 add_executable(rx_asset_gltf_tests
     doctest_main_devicefree.cpp
     gltf_pipeline_test.cpp
+    # Phase 4 Stage 1 Task 14 -- texture_decode.h's parse/transcode
+    # DECISION layer (KTX2 container parse via ktxTexture2_CreateFromMemory,
+    # role->format selection, colorspace-agreement check, stb PNG/JPG
+    # decode) is genuinely device-free -- no GPU, no VkDevice -- so it
+    # joins THIS binary, matching gltf_pipeline_test.cpp's own precedent
+    # (the file header comment on this executable already documents the
+    # "device-free... none of these need a GPU" rationale this shares).
+    texture_decode_test.cpp
 )
 target_include_directories(rx_asset_gltf_tests PRIVATE ..)
 target_link_libraries(rx_asset_gltf_tests PRIVATE rx_asset meshoptimizer::meshoptimizer doctest::doctest)
+target_compile_definitions(rx_asset_gltf_tests PRIVATE
+    RX_ASSET_ROOT_DIR="${CMAKE_SOURCE_DIR}"
+)
 add_test(NAME rx_asset_gltf_tests COMMAND rx_asset_gltf_tests)
 set_tests_properties(rx_asset_gltf_tests PROPERTIES TIMEOUT 120)
 
@@ -67,6 +92,14 @@ add_executable(rx_asset_gltf_gpu_tests
     doctest_main_gltf_gpu.cpp
     import_gltf_gpu_test.cpp
     damaged_helmet_test.cpp
+    # Phase 4 Stage 1 Task 14 -- KHR_texture_basisu wiring from
+    # Registry::importGltf() THROUGH a real TextureCache (spec D10, gate
+    # matrix-issue03's own "KHR_texture_basisu wiring from import" row) --
+    # joins THIS binary since it needs the exact same fastgltf-aware
+    # import path import_gltf_gpu_test.cpp already exercises, plus a real
+    # TextureCache (BindlessTable/DeletionQueue) this binary's own
+    # rx_rhi_vk link already provides everything for.
+    import_gltf_basisu_test.cpp
 )
 target_include_directories(rx_asset_gltf_gpu_tests PRIVATE ..)
 target_link_libraries(rx_asset_gltf_gpu_tests PRIVATE rx_asset rx_rhi_vk rx_platform rx_task fastgltf::fastgltf doctest::doctest)

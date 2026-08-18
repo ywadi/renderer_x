@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <deque>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -261,6 +262,63 @@ public:
     // exceeds this Uploader's total ring-buffer capacity outright. A
     // `pixelBytes` of 0 is a no-op that returns true.
     bool uploadToImage(Texture2D& dst, const void* pixels, VkDeviceSize pixelBytes, bool generateMips);
+
+    // [Phase 4 Stage 1 Task 14, gate matrix-issue03 N4/gate ruling #3]
+    // One caller-supplied mip level to upload verbatim -- `data`/`size`
+    // is the level's own tightly-packed byte range (as reported by, e.g.,
+    // a KTX2 container's own per-level image size -- rx::asset::
+    // DecodedKtx2Texture::levels()), and `extent` is the level's TRUE
+    // texel extent (NEVER rounded up to block granularity -- a
+    // block-compressed format's sub-block mip TAIL level, e.g. 2x2 or
+    // 1x1 under a 4x4-block format, reports its real 2 or 1 here; see
+    // uploadImageMips()'s own comment for why this is still correct).
+    struct ImageMipLevel {
+        const void* data = nullptr;
+        VkDeviceSize size = 0;
+        uint32_t mipLevel = 0;
+        VkExtent2D extent{0, 0};
+    };
+
+    // Uploads a full set of caller-supplied mip levels DIRECTLY into
+    // `dst` -- one VkBufferImageCopy region per entry in `levels`, through
+    // this Uploader's own staging ring exactly like uploadToImage() above
+    // -- and transitions `dst` to VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL.
+    // NEVER calls Texture2D::recordMipChainBlit() (no mip GENERATION on
+    // this path at all -- every level's real data comes from `levels`
+    // itself): `dst` must have been created via
+    // Texture2D::createForPresuppliedMips(), not create().
+    //
+    // BLOCK-COMPRESSED ROW PITCH / SUB-BLOCK MIP TAILS [gate matrix-
+    // issue03 N4, the mip-chain matrix row's own "classic off-by-one"]:
+    // every VkBufferImageCopy region here leaves `bufferRowLength`/
+    // `bufferImageHeight` at 0 ("tightly packed" per each entry's own
+    // `extent`) rather than computing an explicit block-row pitch by
+    // hand. This is deliberately NOT a simplification that happens to
+    // work -- it is the Vulkan spec's OWN documented block-copy rule
+    // (`vkCmdCopyBufferToImage`'s "Buffer and Image Layouts" section): a
+    // 0 rowLength/imageHeight is defined to mean "computed from
+    // imageExtent, per-block, rounded UP to whole blocks" -- which is
+    // EXACTLY the KTX2 per-level byte layout libktx itself already
+    // produces (verified directly: `ktxTexture_GetImageSize()`'s own
+    // block-rounded byte count matches this formula bit-for-bit for
+    // every level, including sub-block tails, where `extent` reports the
+    // true 2x2/1x1 texel size while the region's OWN copied byte count is
+    // exactly one whole compressed block regardless). No block-width/
+    // height-aware pitch arithmetic is written by this engine at all --
+    // Vulkan's own copy semantics already do it correctly for every
+    // level in one uniform code path, compressed or not.
+    //
+    // Levels need not be sorted or cover every level of `dst`'s own
+    // mipLevels() (not exercised by any Task 14 test, but not
+    // disallowed). Returns false (logged) only if `levels` is empty or
+    // any single entry's `size` exceeds this Uploader's total ring-buffer
+    // capacity outright -- same "no partial-batch corruption" contract as
+    // uploadToImage()/uploadToBuffer() above (a batch that fails a later
+    // entry after successfully staging earlier ones still returns false;
+    // nothing from this call is submitted at flush() -- see
+    // upload_test.cpp's texture-upload tests for the equivalent
+    // uploadToImage() contract this mirrors).
+    bool uploadImageMips(Texture2D& dst, std::span<const ImageMipLevel> levels);
 
     // Submits every uploadTo*() call recorded since the last flush() (or
     // since create()) and returns a pollable UploadTicket -- see the class

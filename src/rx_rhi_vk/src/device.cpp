@@ -332,6 +332,27 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
     const bool bufferDeviceAddressEnabled =
         physResult.value().enable_extension_features_if_present(bufferDeviceAddressRequest);
 
+    // samplerAnisotropy: opportunistic, guarded [Phase 4 Stage 1 Task 14,
+    // spec D10/G6 -- "aniso 8x default when supported... cleanly off when
+    // unsupported"]. This bit lives in the BASE VkPhysicalDeviceFeatures
+    // struct (Vulkan 1.0 core), not features12/13 above, so it goes
+    // through vk-bootstrap's plain `enable_features_if_present()`
+    // overload rather than `enable_extension_features_if_present<T>()`
+    // (which targets a chained pNext extension-features struct) -- same
+    // opportunistic-AFTER-selection posture as bufferDeviceAddress
+    // immediately above (never a device-selection requirement; a device
+    // lacking it still builds a fully working Device). Merely checking
+    // VkPhysicalDeviceFeatures::samplerAnisotropy (what the driver
+    // ADVERTISES) without this enable-and-record step produces a real,
+    // empirically-hit VUID-VkSamplerCreateInfo-anisotropyEnable-01070 the
+    // first time a caller sets VkSamplerCreateInfo::anisotropyEnable=
+    // VK_TRUE against a device that advertised but never had the feature
+    // actually ENABLED at vkCreateDevice time -- reproduced directly by
+    // rx_asset's own texture_cache_test.cpp before this fix.
+    VkPhysicalDeviceFeatures samplerAnisotropyRequest{};
+    samplerAnisotropyRequest.samplerAnisotropy = VK_TRUE;
+    const bool samplerAnisotropyEnabled = physResult.value().enable_features_if_present(samplerAnisotropyRequest);
+
     auto deviceResult = vkb::DeviceBuilder(physResult.value()).build();
     if (!deviceResult) {
         RX_LOG_ERROR("vkb::DeviceBuilder::build failed: {}", deviceResult.error().message());
@@ -448,6 +469,12 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
         "D26.4] (enablement only -- opportunistic, never a device-selection requirement)",
         bufferDeviceAddressEnabled ? "ENABLED" : "not present -- rx::asset::GeometryPool chunk buffers degrade to no "
                                                   "device-address usage bit, logged");
+    dev.samplerAnisotropyEnabled_ = samplerAnisotropyEnabled;
+    RX_LOG_INFO(
+        "Device::create: samplerAnisotropy {} on the selected physical device [Phase 4 Stage 1 Task 14, spec "
+        "D10/G6] (enablement only -- opportunistic, never a device-selection requirement)",
+        samplerAnisotropyEnabled ? "ENABLED" : "not present -- rx::asset::TextureCache samplers cleanly disable "
+                                                "anisotropic filtering, logged");
     dev.swapchain_ = vkbSwapchain.swapchain;
     dev.swapchainImages_ = imagesResult.value();
     dev.swapchainFormat_ = vkbSwapchain.image_format;
@@ -480,6 +507,7 @@ Device& Device::operator=(Device&& other) noexcept {
         calibratedTimestampsEnabled_ = other.calibratedTimestampsEnabled_;
         memoryBudgetExtensionEnabled_ = other.memoryBudgetExtensionEnabled_;
         bufferDeviceAddressEnabled_ = other.bufferDeviceAddressEnabled_;
+        samplerAnisotropyEnabled_ = other.samplerAnisotropyEnabled_;
         swapchain_ = other.swapchain_;
         swapchainImages_ = std::move(other.swapchainImages_);
         swapchainFormat_ = other.swapchainFormat_;
@@ -500,6 +528,7 @@ Device& Device::operator=(Device&& other) noexcept {
         other.calibratedTimestampsEnabled_ = false;
         other.memoryBudgetExtensionEnabled_ = false;
         other.bufferDeviceAddressEnabled_ = false;
+        other.samplerAnisotropyEnabled_ = false;
         other.swapchain_ = VK_NULL_HANDLE;
         other.swapchainImages_.clear();
         other.swapchainFormat_ = VK_FORMAT_UNDEFINED;

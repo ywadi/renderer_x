@@ -185,6 +185,75 @@ std::optional<Texture2D> Texture2D::create(VkPhysicalDevice physicalDevice, VkDe
                       allocator.accounting(), category, allocationInfo.size);
 }
 
+std::optional<Texture2D> Texture2D::createForPresuppliedMips(VkPhysicalDevice physicalDevice, VkDevice device,
+                                                               Allocator& allocator, VkExtent2D extent,
+                                                               VkFormat format, VkImageUsageFlags usage,
+                                                               uint32_t mipLevels, MemoryCategory category) {
+    // NO blit-format-feature probe, NO fallback-to-1 clamp, and NEVER
+    // VK_IMAGE_USAGE_TRANSFER_SRC_BIT -- see this method's own header
+    // comment (texture.h) for why: recordMipChainBlit() is never called
+    // against a Texture2D built through this factory, so none of
+    // create()'s own mip-GENERATION machinery applies here.
+    // `physicalDevice` is unused on this path (kept in the signature for
+    // parameter-shape symmetry with create() above, and because a format-
+    // feature probe is exactly the kind of thing a FUTURE caller of this
+    // factory might legitimately need -- e.g. SAMPLED_IMAGE support
+    // itself is already checked one layer up, in TextureCache's own
+    // isFormatSupported(), not duplicated here).
+    (void)physicalDevice;
+    VkImageUsageFlags finalUsage = usage | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = format;
+    imageInfo.extent = {extent.width, extent.height, 1};
+    imageInfo.mipLevels = mipLevels;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = finalUsage;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VmaAllocationCreateInfo allocCreateInfo{};
+    allocCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
+
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation allocation = VK_NULL_HANDLE;
+    VmaAllocationInfo allocationInfo{};
+    VkResult result = vmaCreateImage(allocator.raw(), &imageInfo, &allocCreateInfo, &image, &allocation, &allocationInfo);
+    if (result != VK_SUCCESS) {
+        // [Phase 4 Task 10, spec D24(d)] Same OOM classification/report
+        // attachment as create() above.
+        allocator.noteAllocationFailure("Texture2D::createForPresuppliedMips(vmaCreateImage)", category, result);
+        return std::nullopt;
+    }
+
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = format;
+    viewInfo.subresourceRange.aspectMask = aspectMaskForFormat(format);
+    viewInfo.subresourceRange.baseMipLevel = 0;
+    viewInfo.subresourceRange.levelCount = mipLevels;
+    viewInfo.subresourceRange.baseArrayLayer = 0;
+    viewInfo.subresourceRange.layerCount = 1;
+
+    VkImageView view = VK_NULL_HANDLE;
+    result = vkCreateImageView(device, &viewInfo, nullptr, &view);
+    if (result != VK_SUCCESS) {
+        allocator.noteNonMemoryFailure("Texture2D::createForPresuppliedMips(vkCreateImageView)", result);
+        vmaDestroyImage(allocator.raw(), image, allocation);
+        return std::nullopt;
+    }
+
+    allocator.accounting()->record(category, allocationInfo.size);
+    return Texture2D(allocator.raw(), device, image, allocation, view, extent, format, mipLevels,
+                      allocator.accounting(), category, allocationInfo.size);
+}
+
 void Texture2D::recordMipChainBlit(VkCommandBuffer cmd) const {
     if (mipLevels_ <= 1) {
         // Nothing to blit -- level 0 alone still needs the

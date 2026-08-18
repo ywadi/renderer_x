@@ -37,6 +37,15 @@ add_library(rx_asset STATIC
     import_gltf.cpp
     registry.cpp
     fallbacks.cpp
+    # Phase 4 Stage 1 Task 14 -- KTX2/Basis compressed texture pipeline +
+    # sampler cache (spec D10/D11, gate matrix-issue03 as amended by
+    # gate/rulings-2026-08-18.md #3). texture_decode.{h,cpp} is the
+    # device-free parse/transcode/decode layer (mirrors gltf_pipeline.cpp's
+    # own device-free/GPU split -- see tests/CMakeLists.txt); texture_cache.
+    # {h,cpp} is the GPU-facing layer (Texture2D/Uploader/BindlessTable/
+    # DeletionQueue/sampler cache, D5 main-thread-only).
+    texture_decode.cpp
+    texture_cache.cpp
     # MikkTSpace [G2]: no CMakeLists.txt upstream (two loose files,
     # "designed to be stand-alone... copied and used as is" per its own
     # header comment) -- compiled straight into rx_asset, matching this
@@ -47,7 +56,7 @@ add_library(rx_asset STATIC
 )
 target_include_directories(rx_asset PUBLIC include)
 target_include_directories(rx_asset PRIVATE "${mikktspace_SOURCE_DIR}")
-target_link_libraries(rx_asset PUBLIC rx_rhi_vk rx_task fastgltf::fastgltf meshoptimizer::meshoptimizer draco::draco)
+target_link_libraries(rx_asset PUBLIC rx_rhi_vk rx_task fastgltf::fastgltf meshoptimizer::meshoptimizer draco::draco KTX::ktx)
 
 # Draco dead-stripping [gate matrix row 9, third_party/CMakeLists.txt's
 # own comment on Draco's vendoring]: Draco's single `draco::draco`
