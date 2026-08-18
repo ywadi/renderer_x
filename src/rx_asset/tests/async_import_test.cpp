@@ -1255,3 +1255,141 @@ TEST_CASE("importGltfAsync: destroying the WHOLE fixture (Scheduler included) wh
     }
     CHECK(true);  // reaching here at all (no crash/hang) is the assertion.
 }
+
+// ---------------------------------------------------------------------
+// [Wine/CI SIGSEGV regression, CI run 32180630087] Abandoning a job that
+// has already reached the MARSHAL/UPLOAD phase (>=1 real GPU resource
+// registered), with NO explicit cancelImport() ever called and no further
+// pumpMain() call -- registry.cpp's own ~Registry() must roll it back
+// synchronously (drainAndRollbackAbandonedAsyncJob()), not merely flag it
+// cancelled and walk away. The two teardown-race tests above never
+// exercised this: both pass textures == nullptr, so their jobs never
+// leave the compute phase and never have anything GPU-side to roll back.
+// This is exactly the state the WALL-CLOCK GATE test's own CI stall-
+// detector REQUIRE (line 748) landed in when it fired on CI's slower
+// hardware -- doctest's exception unwind skipped straight to local
+// destructors mid-upload, which is indistinguishable, from this
+// production code's own point of view, from any other reason a host
+// application might stop pumping mid-import (an unrelated fatal error, an
+// early shutdown path). Before the fix: a real
+// VUID-vkEndCommandBuffer-commandBuffer-00059 validation error followed by
+// SIGSEGV. After the fix: clean teardown, zero validation errors.
+// ---------------------------------------------------------------------
+
+TEST_CASE("importGltfAsync: abandoning a job genuinely mid-UPLOAD (>=1 real GPU resource already registered, no "
+          "explicit cancelImport(), no further pumpMain()) does not crash and raises no validation errors "
+          "[Wine/CI SIGSEGV regression, CI run 32180630087]") {
+    if (!std::filesystem::exists(damagedHelmetPath())) {
+        MESSAGE("DamagedHelmet not fetched (run tools/fetch_assets.sh) -- skipping the abandon-mid-upload "
+                "regression test");
+        return;
+    }
+    auto fixture = makeFixture("async_abandon_mid_upload");
+    if (!fixture) {
+        return;
+    }
+    attachPool(*fixture);
+    // A real TextureCache is load-bearing here -- same reason as the
+    // WALL-CLOCK GATE and cancel-mid-upload tests above: this is what
+    // actually gets this job into the marshal/upload phase with a real
+    // VkImage registered, the exact state the root cause needs to exist.
+    attachTextureCache(*fixture);
+    auto scheduler = rx::task::Scheduler::create(4);
+    REQUIRE(scheduler != nullptr);
+
+    SlowRecordingByteSource source(std::filesystem::path(damagedHelmetPath()).parent_path(),
+                                    std::chrono::milliseconds(60));
+    std::vector<std::byte> documentBytes = readFileBytes(damagedHelmetPath());
+
+    // Registry wrapped in optional so it can be destroyed explicitly,
+    // in-scope, BEFORE `scheduler` -- letting this test check
+    // `fixture->context.hasValidationErrors()` afterward, while `fixture`
+    // (and its Context) is still alive, exactly like every other test in
+    // this file does.
+    std::optional<Registry> registryOpt{std::in_place};
+    Registry& registry = *registryOpt;
+    const size_t liveTexturesBefore = fixture->textures->liveTextureCountForTesting();
+
+    bool fired = false;
+    AsyncImportHandle handle = registry.importGltfAsync(documentBytes, source, *fixture->pool, *scheduler,
+                                                            fixture->textures.get(), [&](ImportResult) { fired = true; });
+    REQUIRE(handle.isValid());
+
+    // Pump until AT LEAST ONE real texture slot has been registered -- a
+    // genuine GPU resource (a real VkImage with an upload copy command
+    // already recorded via TextureCache::registerDecoded()) -- the same
+    // observable signal the checkerboard-safety test above uses.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    bool oneRegistered = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        scheduler->pumpMain();
+        if (fixture->textures->liveTextureCountForTesting() > liveTexturesBefore) {
+            oneRegistered = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(oneRegistered);
+    REQUIRE_FALSE(fired);  // must not have finalized before this test caught the mid-upload window
+
+    // Deliberately NO cancelImport() call -- mirrors the WALL-CLOCK GATE
+    // test's own REQUIRE-failure unwind: the job is abandoned genuinely
+    // mid-upload, with nothing more ever pumping it. Registry destructs
+    // first (registry.cpp's own ~Registry() -- this is where
+    // drainAndRollbackAbandonedAsyncJob() now runs, synchronously, while
+    // fixture->pool/fixture->textures are still fully valid), then
+    // Scheduler (drains/joins its own threads; any still-queued closure
+    // referencing this job is simply dropped, now safe because Registry's
+    // destructor already released the job's real GPU resources).
+    registryOpt.reset();
+    scheduler.reset();
+
+    // Reclaim the deferred-destroy texture drainAndRollbackAbandonedAsyncJob()'s
+    // own releaseUnpublished() call handed to the DeletionQueue -- the SAME
+    // cleanup step the explicit cancel-mid-upload rollback test above
+    // performs after its own rollback (D24's own eviction contract: a
+    // caller must eventually flush a non-empty DeletionQueue; Registry has
+    // no DeletionQueue reference of its own to do this automatically, by
+    // design -- see that class's own comment).
+    fixture->deletionQueue->onFrameFenceSignaled(0);
+
+    CHECK_FALSE(fired);
+
+    // [Root-cause-accurate check] The corrupting event this regression
+    // targets -- Uploader::~Uploader()'s own auto-flush calling
+    // vkEndCommandBuffer() on a command buffer whose bound VkImage was
+    // ALREADY destroyed -- only happens once BOTH (a) the abandoned
+    // texture's VkImage has been destroyed (TextureCache's own pool_
+    // member unconditionally destroys every still-"resident" entry when
+    // TextureCache itself is destroyed) AND (b) Uploader's own recording
+    // command buffer (which still references that image, if it was never
+    // safely released) gets flushed/ended afterward. Reproducing that
+    // exact sequence explicitly -- rather than only implicitly, via
+    // `fixture`'s natural end-of-scope teardown -- keeps `fixture->context`
+    // alive afterward so this test can actually OBSERVE the result via
+    // hasValidationErrors(), instead of only proving "the process didn't
+    // crash" (empirically, revert-testing this fix: native lavapipe on
+    // this dev machine tolerates the resulting corrupted command-buffer
+    // state without crashing -- only CI's own environment, both the
+    // linux-native and windows-cross-zig/Wine jobs, actually segfaults on
+    // it, CI run 32180630087 -- so a bare "did it crash" check is too weak
+    // a discriminator locally; the validation error itself is the
+    // reliable, portable signal both before and after the fix).
+    //
+    // Before this fix: `textures.reset()` destroys a TextureCache that
+    // still holds the abandoned texture as a live, never-released entry
+    // (nothing ever called releaseUnpublished() for it) -- destroying it
+    // here, then flushing Uploader explicitly right after, reproduces
+    // CI's exact VUID-vkEndCommandBuffer-commandBuffer-00059 validation
+    // error deterministically (confirmed via this fix's own revert-test:
+    // 3/3 runs against the pre-fix registry.cpp). After this fix:
+    // Registry::~Registry() (via drainAndRollbackAbandonedAsyncJob(),
+    // registry.cpp) already safely released it through
+    // TextureCache::releaseUnpublished() + the DeletionQueue's own
+    // fence-gated reclaim (the onFrameFenceSignaled() call above), so by
+    // the time `textures.reset()` runs here, there is nothing left to
+    // corrupt.
+    fixture->textures.reset();
+    fixture->uploader.flush();
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}

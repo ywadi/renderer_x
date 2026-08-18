@@ -5,7 +5,9 @@
 #include <rx_core/debug_checks.h>
 #include <rx_core/log.h>
 #include <rx_task/scheduler.h>
+#include <chrono>
 #include <fstream>
+#include <thread>
 #include <utility>
 
 namespace rx::asset {
@@ -243,6 +245,94 @@ void startAsyncImportComputePhase(std::shared_ptr<AsyncImportJob> job) {
     scheduler->runOnWorkerThread([job = std::move(job)]() mutable { runAsyncImportComputePhase(std::move(job)); });
 }
 
+// [Wine/CI SIGSEGV fix] Synchronous, teardown-time counterpart to
+// rollbackAsyncImportWhenSafe() above -- closes the one abandonment path
+// that function's own postToMain()-repost design cannot cover: nobody is
+// guaranteed to ever call pumpMain() again once a job has entered the
+// marshal/upload phase (>=1 real GPU resource already registered via
+// TextureCache::registerDecoded()/GeometryPool::uploadDeferred()) and its
+// owning Registry is being destroyed. registry.h's own "POOL/TEXTURES/
+// SCHEDULER LIFETIME" contract already REQUIRES `job->pool`/`job->textures`
+// to outlive the job (hence outlive Registry, which may still hold a live
+// job referencing them at its own destruction), so it is always safe for
+// ~Registry() to use them directly here -- this function does not depend
+// on anything ~Registry() was not already contractually guaranteed.
+//
+// Root cause this closes: if a job's `pending` (MarshalPendingImport) is
+// destroyed by ordinary C++ member-wise destruction -- e.g. because the
+// shared_ptr<AsyncImportJob> keeping it alive was captured inside a
+// postToMain()/runOnWorkerThread() closure that Scheduler::~Scheduler()
+// later drops unexecuted (scheduler.h's own documented "postToMain() work
+// still queued when pumpMain() is never called again is simply dropped"
+// behavior) -- NOTHING ever calls TextureCache::releaseUnpublished()/
+// GeometryPool::free() for whatever it already registered. The real
+// VkImage/VkBuffer stays "resident" inside TextureCache's/GeometryPool's
+// own bookkeeping, with its upload copy command possibly still sitting
+// RECORDED-but-not-yet-submitted (or submitted-but-not-yet-complete) on
+// Uploader's own batched command buffer. Whenever that texture/geometry
+// range is LATER destroyed by ordinary object teardown (TextureCache's own
+// pool_ member destructing, GeometryPool's blocks destructing) -- which,
+// in the exact fixture/member order this project's own async tests use,
+// happens BEFORE Uploader's destructor gets a chance to end/submit that
+// still-recording command buffer -- Uploader::~Uploader()'s own auto-flush
+// (upload.cpp) calls vkEndCommandBuffer() on a command buffer that still
+// references an already-destroyed VkImage: a real
+// VUID-vkEndCommandBuffer-commandBuffer-00059 validation error, observed
+// (CI run 32180630087, both the linux-native and windows-cross-zig/Wine
+// jobs) immediately followed by SIGSEGV as the driver processes the
+// corrupted command buffer state. This is a genuine PRODUCTION-code gap in
+// the async import pipeline's exception/lifetime safety, not a test-only
+// artifact: any host that tears down its Registry (for any reason -- a
+// thrown exception, an early return, an unrelated fatal error) while an
+// async import is genuinely mid-upload, without first explicitly calling
+// cancelImport() and then continuing to pumpMain() until the rollback is
+// confirmed safe, hits this same corruption. The two existing "destroy
+// while in flight" regression tests (async_import_test.cpp) never
+// exercised this because both use `textures == nullptr` -- their jobs
+// never leave the compute phase, so they never have anything registered
+// to roll back in the first place.
+//
+// Fix: block here (a destructor/teardown-only exception to D25's "poll,
+// never block" invariant on the LIVE async path -- the exact same
+// trade-off Device::~Device()'s own unconditional vkDeviceWaitIdle()
+// already makes, and the one buildFallbackTextures() already makes via its
+// own uploader_.wait(uploader_.flush()) call for this identical failure
+// signature, texture_cache.cpp) until every upload ticket this job's
+// `pending` issued is confirmed complete, THEN run the exact same
+// marshalGltfImportRollback() the live cancellation path uses. Bounded: if
+// the GPU genuinely never completes (a hang/device-loss class of failure,
+// not anything this fix can control), give up after a generous timeout and
+// deliberately LEAK `pending` rather than risk destroying a VkImage/
+// VkBuffer a still-incomplete command buffer might reference -- a resource
+// leak is always recoverable at process exit; a use-after-free is not.
+void drainAndRollbackAbandonedAsyncJob(const std::shared_ptr<AsyncImportJob>& job) {
+    if (!job->pending) {
+        return;  // still in the compute phase (or already finalized/rolled back) -- nothing GPU-side to release.
+    }
+    marshalGltfImportEnsureRollbackTicketed(job->textures, *job->pending);
+
+    constexpr auto kAbandonDrainTimeout = std::chrono::seconds(5);
+    const auto deadline = std::chrono::steady_clock::now() + kAbandonDrainTimeout;
+    bool safe = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (marshalGltfImportUploadsComplete(*job->pool, job->textures, *job->pending)) {
+            safe = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    if (!safe) {
+        RX_LOG_ERROR(
+            "rx_asset: Registry::~Registry(): an abandoned async import's upload ticket(s) did not complete within "
+            "{}s at teardown -- leaking its GPU resources rather than risk destroying a still-in-flight VkImage/"
+            "VkBuffer (a genuine GPU hang/device-loss condition, not something this rollback can safely resolve)",
+            kAbandonDrainTimeout.count());
+        return;
+    }
+    marshalGltfImportRollback(*job->pool, job->textures, std::move(job->pending));
+}
+
 }  // namespace
 
 Registry::Registry() {
@@ -268,8 +358,23 @@ Registry::~Registry() {
     // class comment). Each job's own shared_ptr keeps it alive for as
     // long as any in-flight closure still references it, independent of
     // this Registry's own destruction completing first.
+    //
+    // [Wine/CI SIGSEGV fix] drainAndRollbackAbandonedAsyncJob() (above)
+    // additionally, and synchronously, releases any REAL GPU resource a
+    // job already registered (>=1 texture/geometry range, i.e. it has
+    // reached the marshal/upload phase) BEFORE this loop returns --
+    // closing the gap where cancelling alone left that job's `pending`
+    // to be destroyed later by ordinary C++ teardown (no `pumpMain()`
+    // call ever guaranteed to run again once this Registry is gone),
+    // which never releases GPU-owned handles through the safe,
+    // ticket-aware path and corrupts Vulkan object lifetime (see that
+    // function's own comment for the full mechanism and the CI evidence
+    // this closes). A job still purely in the compute phase has
+    // `pending == nullptr` here and this call is a no-op for it, exactly
+    // as before this fix.
     for (auto& [id, job] : asyncJobs_) {
         job->cancelled.store(true, std::memory_order_release);
+        drainAndRollbackAbandonedAsyncJob(job);
         job->registry = nullptr;
     }
     asyncJobs_.clear();
