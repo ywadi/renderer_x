@@ -6,6 +6,22 @@ on:
   pull_request:
     branches: [main]
 
+# Closure-sweep item 5(b) [build-time incident, ledgered]: close-together
+# pushes to the same ref were observed racing each other's cache save
+# ("Unable to reserve cache...") -- the loser rebuilds cold instead of
+# hitting the winner's just-saved cache. Serializing runs per ref removes
+# the race outright (only one run per group executes at a time).
+# `cancel-in-progress: true` is deliberately chosen over queuing: an
+# outdated commit's CI run has no value once a newer push to the SAME ref
+# exists (its result will never be acted on -- the newer commit is what
+# actually lands), so cancelling it immediately frees the runner instead
+# of finishing a run nobody needs. `github.ref` (not github.sha) is the
+# group key on purpose -- it is what makes pushes to the SAME branch/PR
+# serialize while a DIFFERENT branch/PR's runs stay fully independent.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 # Pinned zig 0.16.0 toolchain download, shared by both jobs below. The
 # sha256 is the real published checksum for zig-x86_64-linux-0.16.0.tar.xz,
 # taken directly from https://ziglang.org/download/index.json (the
@@ -129,11 +145,28 @@ jobs:
       # version bump self-invalidating). Sponza is intentionally never
       # fetched here (--sponza is a local-only flag this workflow never
       # passes, per D16).
+      # Closure-sweep item 5(a) [build-time incident, ledgered]: this key
+      # rotates on any tools/fetch_assets.sh edit (e.g. a version-marker
+      # bump), and without a restore-keys fallback that rotation forced a
+      # 100% cold re-fetch instead of a warm partial -- costly for
+      # DamagedHelmet specifically only in wall-clock/API-rate terms (the
+      # actual fetch is small), but the SAME pattern below matters far
+      # more for .deps-cache (see that step's own comment). Safe to fall
+      # back to a stale same-prefix cache here: fetch_assets.sh's own
+      # per-asset VERSION-named marker file (DAMAGED_HELMET_MARKER, this
+      # script's own header comment) makes a stale restore self-
+      # correcting -- either the marker matches the current pinned
+      # version (fast no-op, correct) or it doesn't (the version-specific
+      # filename simply isn't found, so the script re-fetches and re-
+      # verifies checksums from scratch) -- never a silent stale-asset
+      # reuse.
       - name: Cache fetched test assets (DamagedHelmet)
         uses: actions/cache@v5
         with:
           path: assets/fetched
           key: fetched-assets-damagedhelmet-${{ hashFiles('tools/fetch_assets.sh') }}
+          restore-keys: |
+            fetched-assets-damagedhelmet-
 
       - name: Fetch test assets (DamagedHelmet)
         run: tools/fetch_assets.sh
@@ -148,11 +181,34 @@ jobs:
       # racing on one shared key would starve whichever job loses the
       # race of ever getting its own dependencies cached. A per-preset key
       # keeps each job's cache independent.
+      #
+      # Closure-sweep item 5(a) [build-time incident, ledgered]: this key
+      # rotates on ANY third_party/CMakeLists.txt edit (adding/pinning a
+      # dependency, tweaking one's CMAKE_ARGS, etc.) -- common -- and
+      # without a restore-keys fallback, that rotation forced a ~20-minute
+      # 100% cold rebuild of EVERY dependency instead of a warm partial
+      # rebuild of only the changed one(s). Safe to fall back to a stale
+      # same-prefix cache: DepCache.cmake's own rx_add_cached_dependency()
+      # (cmake/DepCache.cmake) keys EACH dependency's own subdirectory
+      # independently on that dependency's full content/config hash
+      # (name-<hash>, this file's own header comment) and only ever
+      # CONSULTS the exact subdirectory matching the CURRENT hash -- a
+      # restored stale cache's unrelated/outdated subdirectories are
+      # simply never looked up (no ".rx-built" marker under the NEW hash
+      # means a clean [dep-cache] MISS and a real rebuild for exactly that
+      # dependency, same as a cold cache) and cost nothing but harmless
+      # extra disk space; every dependency whose hash DIDN'T change still
+      # hits its own already-built subdirectory. I.e. this mechanism
+      # cannot serve a stale/incorrect build for a changed dependency --
+      # it can only ever skip rebuilding dependencies that provably did
+      # NOT change.
       - name: Cache third-party dependency builds
         uses: actions/cache@v5
         with:
           path: .deps-cache
           key: deps-cache-linux-native-${{ hashFiles('third_party/CMakeLists.txt', 'cmake/DepCache.cmake', 'cmake/toolchains/linux-native.cmake', 'cmake/zig-wrappers/*') }}
+          restore-keys: |
+            deps-cache-linux-native-
 
       - name: Configure
         run: cmake --preset linux-native
@@ -340,20 +396,34 @@ jobs:
       # list below (same posture as the pre-existing rx_asset_tests) --
       # see the linux-native job's identically-worded step for the full
       # rationale.
+      # Closure-sweep item 5(a) -- same restore-keys fallback and the same
+      # rationale as the linux-native job's identically-worded step above
+      # (a stale same-prefix restore is safe here: fetch_assets.sh's own
+      # version-named marker file self-corrects).
       - name: Cache fetched test assets (DamagedHelmet)
         uses: actions/cache@v5
         with:
           path: assets/fetched
           key: fetched-assets-damagedhelmet-${{ hashFiles('tools/fetch_assets.sh') }}
+          restore-keys: |
+            fetched-assets-damagedhelmet-
 
       - name: Fetch test assets (DamagedHelmet)
         run: tools/fetch_assets.sh
 
+      # Closure-sweep item 5(a) -- same restore-keys fallback and the same
+      # rationale as the linux-native job's identically-worded step above
+      # (DepCache.cmake's own per-dependency content hashing makes a
+      # stale same-prefix restore safe: it can only skip rebuilding
+      # dependencies that provably did not change, never serve a stale
+      # one).
       - name: Cache third-party dependency builds
         uses: actions/cache@v5
         with:
           path: .deps-cache
           key: deps-cache-windows-cross-zig-${{ hashFiles('third_party/CMakeLists.txt', 'cmake/DepCache.cmake', 'cmake/toolchains/windows-cross-zig.cmake', 'cmake/zig-wrappers/*') }}
+          restore-keys: |
+            deps-cache-windows-cross-zig-
 
       - name: Configure
         run: cmake --preset windows-cross-zig
