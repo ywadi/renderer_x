@@ -1484,3 +1484,107 @@ TEST_CASE("importGltfAsync: abandoning a job genuinely mid-UPLOAD (>=1 real GPU 
     fixture->uploader.flush();
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
+
+// ---------------------------------------------------------------------
+// [Wine/CI SIGSEGV regression, fix round 2, CRITICAL -- reviewer-found,
+// reproduced 3/3 against fix round 1] The round-1 fix above
+// (drainAndRollbackAbandonedAsyncJob(), registry.cpp) only helps a job
+// that is STILL TRACKED in Registry's own asyncJobs_ map at ~Registry()
+// time. reapFinishedAsyncJobs() (called at the top of every
+// importGltfAsync()/cancelImport() call, pre-existing Task 15 code) used
+// to erase a job the instant `cancelled` flipped true, REGARDLESS of
+// whether its `pending` had actually been drained yet. Calling
+// cancelImport() on the SAME handle TWICE, with no pumpMain() call
+// between them, hit exactly this: the second call's own
+// reapFinishedAsyncJobs() erased the still-`pending` job from the map
+// right then -- making it INVISIBLE to ~Registry()'s own drain loop
+// (which only ever walks asyncJobs_) -- reproducing the identical
+// corrupted-command-buffer SIGSEGV round 1 was supposed to close, via a
+// different path into the same gap. registry.cpp's reapFinishedAsyncJobs()
+// now gates the cancelled case on `pending == nullptr` too -- this test
+// is the reviewer's own probe, shipped as a permanent regression test.
+// ---------------------------------------------------------------------
+
+TEST_CASE("importGltfAsync: cancelImport() called TWICE on a job genuinely mid-UPLOAD, then destroyed with no "
+          "pumpMain() between any of the three steps, does not crash and raises no validation errors "
+          "[Wine/CI SIGSEGV regression round 2, reapFinishedAsyncJobs() pending-aware gate]") {
+    if (!std::filesystem::exists(damagedHelmetPath())) {
+        MESSAGE("DamagedHelmet not fetched (run tools/fetch_assets.sh) -- skipping the double-cancel regression "
+                "test");
+        return;
+    }
+    auto fixture = makeFixture("async_double_cancel_mid_upload");
+    if (!fixture) {
+        return;
+    }
+    attachPool(*fixture);
+    attachTextureCache(*fixture);
+    auto scheduler = rx::task::Scheduler::create(4);
+    REQUIRE(scheduler != nullptr);
+
+    SlowRecordingByteSource source(std::filesystem::path(damagedHelmetPath()).parent_path(),
+                                    std::chrono::milliseconds(60));
+    std::vector<std::byte> documentBytes = readFileBytes(damagedHelmetPath());
+
+    std::optional<Registry> registryOpt{std::in_place};
+    Registry& registry = *registryOpt;
+    const size_t liveTexturesBefore = fixture->textures->liveTextureCountForTesting();
+
+    bool fired = false;
+    AsyncImportHandle handle = registry.importGltfAsync(documentBytes, source, *fixture->pool, *scheduler,
+                                                            fixture->textures.get(), [&](ImportResult) { fired = true; });
+    REQUIRE(handle.isValid());
+
+    // Pump until AT LEAST ONE real texture slot has been registered --
+    // the job is now genuinely mid-upload (`pending != nullptr`), same
+    // signal the single-cancel regression test above uses.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    bool oneRegistered = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        scheduler->pumpMain();
+        if (fixture->textures->liveTextureCountForTesting() > liveTexturesBefore) {
+            oneRegistered = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(oneRegistered);
+    REQUIRE_FALSE(fired);
+
+    // THE reviewer's probe: cancelImport() TWICE, back to back, with NO
+    // pumpMain() call between them (or after) -- the second call's own
+    // reapFinishedAsyncJobs() is where the pre-fix bug erased the
+    // still-pending job from asyncJobs_. Also proves cancelImport() is
+    // safely idempotent for an already-cancelled, not-yet-drained job
+    // (registry.h's own "documented no-op" contract for an
+    // already-cancelled job, exercised here for the FIRST time against a
+    // job still holding real GPU resources).
+    registry.cancelImport(handle);
+    registry.cancelImport(handle);
+
+    // Still no pumpMain() call anywhere -- Registry, then Scheduler,
+    // destruct with the job exactly as double-cancellation left it.
+    registryOpt.reset();
+    scheduler.reset();
+
+    fixture->deletionQueue->onFrameFenceSignaled(0);
+    CHECK_FALSE(fired);
+
+    // Same root-cause-accurate check as the single-cancel regression test
+    // above (see that test's own comment for why `fixture` must stay
+    // alive to observe this via hasValidationErrors() instead of only
+    // "did it crash"): force the exact corrupting sequence explicitly.
+    // Before this round's fix: the second cancelImport() call's own reap
+    // already erased the job, so ~Registry() drained nothing, and
+    // `textures.reset()` here destroys a TextureCache that still holds
+    // the abandoned texture as a live, never-released entry -- reproduces
+    // CI's exact VUID-vkEndCommandBuffer-commandBuffer-00059 validation
+    // error deterministically (confirmed via this fix's own revert-test:
+    // 3/3 runs with reapFinishedAsyncJobs()'s pending-aware gate reverted).
+    // After this round's fix: the second cancelImport() call's reap
+    // leaves the job tracked (pending != nullptr), so ~Registry() still
+    // finds and drains it -- nothing left to corrupt here.
+    fixture->textures.reset();
+    fixture->uploader.flush();
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}

@@ -342,6 +342,15 @@ Registry::Registry() {
 }
 
 Registry::~Registry() {
+    // [Wine/CI SIGSEGV fix round 2] Every other mutating entry point on
+    // this class carries this guard (importGltfAsync()/cancelImport()/
+    // importProgress() below); this destructor now also does blocking,
+    // cross-thread-sensitive teardown work (drainAndRollbackAbandonedAsyncJob()
+    // polls real GPU-fence state), so it gets the same guard for the same
+    // reason -- Registry's own single-main-thread contract applies to its
+    // destructor exactly as much as to every other member function.
+    RX_ASSERT_MAIN_THREAD("Registry::~Registry");
+
     // [Phase 4 Stage 1 Task 15] Teardown-with-import-in-flight: defined
     // behavior. Every outstanding job is cancelled HERE (synchronously,
     // on this Registry's own main thread -- matching every other
@@ -381,10 +390,43 @@ Registry::~Registry() {
 }
 
 void Registry::reapFinishedAsyncJobs() {
+    // [Wine/CI SIGSEGV fix round 2, CRITICAL -- reviewer-found, empirically
+    // reproduced 3/3] A cancelled job is only ACTUALLY terminal once its
+    // `pending` (if any) has been released through the safe, ticket-aware
+    // path (rollbackAsyncImportWhenSafe() during normal pumpMain()-driven
+    // operation, or drainAndRollbackAbandonedAsyncJob() at ~Registry()
+    // time). Reaping the instant `cancelled` flips true, regardless of
+    // `pending`, let a job that had already reached the marshal/upload
+    // phase (>=1 real GPU resource registered) become INVISIBLE to
+    // ~Registry()'s own drain loop -- which only ever walks asyncJobs_ --
+    // the moment a LATER importGltfAsync()/cancelImport() call's own
+    // reapFinishedAsyncJobs() ran before anything ever pumped it. Concretely:
+    // `cancelImport(h); cancelImport(h); ~Registry();` with no pumpMain()
+    // call between any of those three -- the SECOND cancelImport() call's
+    // own reap (at its top, per this method's own call sites) erases the
+    // still-`pending` job from the map right then, so ~Registry()'s drain
+    // loop never sees it again. This reproduces the EXACT same corrupted-
+    // command-buffer SIGSEGV drainAndRollbackAbandonedAsyncJob() (registry.cpp,
+    // above) exists to close, just via a different path INTO the same
+    // underlying gap -- a realistic pattern (cancel-everything loops,
+    // cancel-then-replace) this task's own original fix did not cover
+    // despite its commit message's claim to. Fix: gate the cancelled case
+    // on `pending == nullptr` too. This does NOT change when a job
+    // actually gets drained (that remains pumpMain()'s/
+    // rollbackAsyncImportWhenSafe()'s/drainAndRollbackAbandonedAsyncJob()'s
+    // job, entirely unchanged by this) -- it only stops this method from
+    // LYING about a still-undrained job's liveness. The Done/Failed cases
+    // are unaffected in practice: both are only ever set AFTER `pending`
+    // is already moved-from (see pollAsyncImportUploads()'s own ordering,
+    // and finishAsyncImportCompute()'s error branch, which sets Failed
+    // while `pending` was never assigned in the first place) -- `pending
+    // == nullptr` already holds whenever stage is Done or Failed, so this
+    // tightens ONLY the cancelled-without-pending-cleared case.
     for (auto it = asyncJobs_.begin(); it != asyncJobs_.end();) {
         const ImportStage stage = it->second->stage.load(std::memory_order_acquire);
         const bool cancelled = it->second->cancelled.load(std::memory_order_acquire);
-        const bool terminal = stage == ImportStage::Done || stage == ImportStage::Failed || cancelled;
+        const bool cancelledAndDrained = cancelled && it->second->pending == nullptr;
+        const bool terminal = stage == ImportStage::Done || stage == ImportStage::Failed || cancelledAndDrained;
         if (terminal) {
             it = asyncJobs_.erase(it);
         } else {

@@ -187,10 +187,18 @@ is always recoverable at process exit; a use-after-free is not.
   GPU-wait semantics are both left exactly as they were — this closes the gap entirely from the `rx_asset` side,
   by making the one already-safe rollback path reachable synchronously from the one place (`~Registry()`) that
   was the actual gap.
-- **Covers both known trigger shapes with one change.** It fixes not only "a driving loop's own `REQUIRE`
-  throws mid-upload" (§2.2's proximate trigger) but also the pre-existing, more general "a caller explicitly
-  calls `cancelImport()` then tears down without continuing to pump" mistake — `~Registry()` does not care
-  *why* `pending` is still non-null, only that it is.
+- **Covers the proximate trigger shape; a second, related gap survived this round and was closed in round 2
+  (§9).** This round's fix makes `~Registry()` correctly drain any job still present in its own `asyncJobs_`
+  map at destruction time, which is sufficient for "a driving loop's own `REQUIRE` throws mid-upload" (§2.2's
+  proximate trigger) — but NOT sufficient on its own for every way a caller can reach an abandoned,
+  still-`pending` job: `reapFinishedAsyncJobs()` (pre-existing Task 15 code, unchanged by this round) erased a
+  job from that same map the instant `cancelled` flipped true, regardless of whether `pending` had actually
+  been drained — so a job could be removed from `~Registry()`'s own view of the world *before* `~Registry()`
+  ever ran, via a completely ordinary-looking caller sequence (`cancelImport(h); cancelImport(h);` with no
+  `pumpMain()` between them). §9 documents that gap and its fix; the claim originally made here — that this
+  round's fix alone covered "a caller explicitly calls `cancelImport()` then tears down without continuing to
+  pump" in general — did not hold for that specific double-cancel sequence, and is corrected by this note
+  rather than silently left in the record.
 
 ## 5. Regression test
 
@@ -422,3 +430,136 @@ fix:
 
 No `rx_task`/`rx_rhi_vk` changes. No plan/spec/ledger document touched. Scratch worktree used for §9.3 was
 removed after measurement; nothing from it was committed.
+
+## 10. Addendum, round 2: reap-before-drain gap (reviewer-found CRITICAL, empirically reproduced 3/3)
+
+**Review verdict on the chain through §9:** the recalibration (§9) and the Wine-verification doc fix were
+approved outright. The `~Registry()` destructor fix (§3/§4) was found to close only the *proximate* trigger —
+an independent reviewer reproduced the exact same `vkEndCommandBuffer ... VkImage was destroyed` signature
+3/3, through a different path into the same underlying gap, and this section documents and closes it.
+
+### 10.1 The gap
+
+`Registry::reapFinishedAsyncJobs()` (`registry.cpp`, pre-existing Task 15 code, untouched by §3's own fix) is
+called at the top of every `importGltfAsync()`/`cancelImport()` call and erases any job it considers
+"terminal" from `asyncJobs_`. Before this round, "terminal" meant `stage == Done || stage == Failed ||
+cancelled` — `cancelled` ALONE, with no check on whether that job's `pending` (its real, possibly-still-live
+GPU resources) had actually been released yet.
+
+`~Registry()`'s own drain loop (§3/§4) only ever walks `asyncJobs_` — it can only rescue a job that is still
+*in* the map. Sequence, no `pumpMain()` call anywhere between any of the three steps:
+
+```
+cancelImport(h);   // sets cancelled = true; job stays in the map (this call's OWN reap ran BEFORE the store)
+cancelImport(h);   // this call's OWN reapFinishedAsyncJobs(), at ITS top, now sees cancelled == true
+                    // -- erases the job right here, even though `pending` is still non-null (nothing has
+                    // drained it -- no pumpMain() ever ran)
+~Registry();        // walks asyncJobs_ -- the job isn't there anymore. drainAndRollbackAbandonedAsyncJob()
+                    // is never called for it. Its real GPU resources are never released through the safe path.
+```
+
+This is a completely ordinary-looking, realistic caller pattern (cancel-everything loops, cancel-then-replace
+call sites) — not a contrived adversarial sequence. §4's original commit message claimed this round's fix
+covered exactly this general "cancel then tear down without pumping" case; it did not, for this specific
+double-cancel sequence, because the job was gone from Registry's own bookkeeping before `~Registry()` ever
+got a chance to look. §4 above has been reworded in place to correct the record rather than silently editing
+around the mistake.
+
+### 10.2 Fix
+
+`Registry::reapFinishedAsyncJobs()` now gates the cancelled case on `pending == nullptr` too:
+
+```cpp
+const bool cancelledAndDrained = cancelled && it->second->pending == nullptr;
+const bool terminal = stage == ImportStage::Done || stage == ImportStage::Failed || cancelledAndDrained;
+```
+
+This does not change *when* a job is actually drained — that remains `pumpMain()`'s /
+`rollbackAsyncImportWhenSafe()`'s / `drainAndRollbackAbandonedAsyncJob()`'s job, entirely unchanged. It only
+stops `reapFinishedAsyncJobs()` from reporting a still-undrained job as gone. The `Done`/`Failed` branches are
+unaffected in practice: both are only ever set *after* `pending` has already been moved-from
+(`pollAsyncImportUploads()`'s own ordering — `marshalGltfImportFinalize(..., std::move(job->pending))` runs
+before `job->stage.store(Done/Failed, ...)` — and `finishAsyncImportCompute()`'s compute-error branch, which
+sets `Failed` while `pending` was never assigned at all) — `pending == nullptr` already holds whenever stage
+is `Done`/`Failed`, so this tightens *only* the cancelled-without-pending-cleared case.
+
+**Consumer trace (per the coordinator's own requirement — confirm keeping undrained-cancelled jobs tracked
+longer breaks nothing):**
+
+- `importGltfAsync()` (both overloads) — only ever `emplace()`s with a fresh, monotonically-increasing
+  `nextAsyncImportId_`; no handle reuse is possible regardless of how long an old entry lingers.
+- `cancelImport()` — re-finding an already-cancelled-but-undrained job and re-storing `cancelled = true` is an
+  idempotent no-op; this is now exercised for the first time against a job holding real GPU resources by the
+  new regression test (§10.3), which explicitly checks this call sequence stays crash-free.
+- `importProgress()` — does not itself reap. A cancelled-but-undrained job now correctly reports
+  `progress.cancelled == true` with its real in-flight `stage` for longer (previously, once prematurely
+  reaped, a `find()` miss would report the misleading `stage == Done, cancelled == false` "not found"
+  fallback) — a strict accuracy improvement, not a behavior a caller could have been relying on.
+- `asyncImportJobCountForTesting()` — declared but not referenced by any existing test (`grep` confirmed
+  zero call sites in `src/rx_asset/tests/`); no test asserts an exact map size that this could perturb.
+- `~Registry()` (§3/§4) — this is the consumer this fix exists to serve: it can now see the job.
+
+No other reader of `asyncJobs_` exists (grep-confirmed against `registry.cpp`/`registry.h`).
+
+### 10.3 Additional minor: `~Registry()` missing `RX_ASSERT_MAIN_THREAD`
+
+Every other mutating entry point on `Registry` (`importGltfAsync()` ×2, `cancelImport()`, `importProgress()`)
+carries this guard; `~Registry()` now also performs blocking, cross-thread-sensitive teardown work
+(`drainAndRollbackAbandonedAsyncJob()` polls real GPU-fence state) and gets the same guard, as the very first
+statement, for the same reason.
+
+### 10.4 Regression test (the reviewer's own probe, shipped)
+
+`src/rx_asset/tests/async_import_test.cpp` — new `TEST_CASE`: *"importGltfAsync: cancelImport() called TWICE
+on a job genuinely mid-UPLOAD, then destroyed with no pumpMain() between any of the three steps, does not
+crash and raises no validation errors [Wine/CI SIGSEGV regression round 2, reapFinishedAsyncJobs()
+pending-aware gate]"*.
+
+Same structure as §5's single-cancel regression test (drives a real import against DamagedHelmet with a real
+`TextureCache` until ≥1 texture is confirmed registered, then reproduces the exact corrupting sequence
+explicitly so the result is observable via `hasValidationErrors()`), but calls `registry.cancelImport(handle)`
+**twice**, back to back, with no `pumpMain()` call anywhere before or after, matching the reviewer's exact
+probe.
+
+**Revert-tested** (temporarily reverted `reapFinishedAsyncJobs()`'s `pending`-aware gate back to the
+pre-round-2 `cancelled`-only condition, kept the new test):
+
+```
+=== 3/3 runs against PRE-ROUND-2 reapFinishedAsyncJobs() ===
+[error] [vulkan validation] Validation Error: [ UNASSIGNED-CoreValidation-DrawState-InvalidCommandBuffer-VkImage ]
+  ... You are adding vkEndCommandBuffer() ... invalid because bound VkImage ... was destroyed.
+CHECK_FALSE( fixture->context.hasValidationErrors() ) is NOT correct!  values: CHECK_FALSE( true )
+[doctest] test cases:  1 |  0 passed | 1 failed        (3/3 runs, deterministic)
+```
+
+```
+=== 5/5 runs against FIXED reapFinishedAsyncJobs() ===
+[doctest] test cases:  1 |  1 passed | 0 failed        (5/5 runs, zero validation errors)
+```
+
+### 10.5 Full re-verification (round 2)
+
+- **`rx_asset_gltf_gpu_tests --validate`, unconstrained:** 57/57 (56 + this round's new test), 8726556/8726556
+  assertions.
+- **Constrained 5-run loop** (`taskset -c 0,1` + `LP_NUM_THREADS=1` + forced lavapipe), full 57-test suite:
+  5/5 clean (`[doctest] test cases: 57 | 57 passed | 0 failed` every run).
+- **Full serial `ctest --preset linux-native --output-on-failure`:** 100% tests passed, 20/20, 58.16s total.
+- **`cmake --build --preset windows-cross-zig` (full):** clean.
+- **CI's exact Wine invocation** (`xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|
+  rx_material_gpu|sample' --output-on-failure`): 100% tests passed, 10/10, including `rx_asset_gltf_gpu_tests`
+  (44.60s, now 57 cases) and the two other named Wine binaries (`rx_task_tests.exe`, `rx_asset_gltf_tests.exe`),
+  114.87s total.
+
+### 10.6 Files changed (this addendum)
+
+- `src/rx_asset/registry.cpp` — `reapFinishedAsyncJobs()`'s `pending`-aware gate; `RX_ASSERT_MAIN_THREAD` added
+  to `~Registry()`.
+- `src/rx_asset/tests/async_import_test.cpp` — the reviewer's double-cancel regression test.
+- This report — §4 reworded in place (overclaiming sentence corrected); §10, this addendum.
+
+No `rx_task`/`rx_rhi_vk` changes. No plan/spec/ledger document touched.
+
+### 10.7 Recorded, no action (per coordinator)
+
+The reviewer's isolated-run contention observation was not reproducible cleanly, nor under the CI profile —
+ledgered as informational only; no code change made for it.
