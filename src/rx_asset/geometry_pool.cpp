@@ -184,6 +184,25 @@ bool GeometryPool::addBlock(VkDeviceSize minVertexBytes, VkDeviceSize minIndexBy
     return true;
 }
 
+void GeometryPool::discardOrphanedLastBlock() {
+    Block& block = blocks_.back();
+    // Both call sites guarantee zero live suballocations remain in
+    // either virtual block by this point (see this method's own header
+    // comment) -- vmaDestroyVirtualBlock() is safe directly, no
+    // vmaClearVirtualBlock() needed. Plain vmaDestroyVirtualBlock() calls
+    // (not the checked pattern addBlock()'s own error paths use) are
+    // correct here: both handles are guaranteed non-null (this block was
+    // fully constructed by a successful addBlock() call before either
+    // upload() call site reaches here).
+    vmaDestroyVirtualBlock(block.vertexVirtualBlock);
+    vmaDestroyVirtualBlock(block.indexVirtualBlock);
+    // pop_back() runs Block's implicit destructor on the removed element,
+    // which destroys vertexBuffer/indexBuffer via rx::rhi::Buffer's own
+    // RAII (releasing the D24(a) accounting entry and the real VMA
+    // allocation) -- no separate buffer cleanup needed here.
+    blocks_.pop_back();
+}
+
 MeshRange GeometryPool::upload(std::span<const PoolVertex> vertices, std::span<const uint32_t> indices) {
     RX_ASSERT_MAIN_THREAD("GeometryPool::upload");
 
@@ -280,7 +299,11 @@ MeshRange GeometryPool::upload(std::span<const PoolVertex> vertices, std::span<c
                                 &vertexElementOffset) != VK_SUCCESS) {
             RX_LOG_ERROR(
                 "GeometryPool::upload: vertex suballocation failed on a block just sized to fit it -- should be "
-                "unreachable");
+                "unreachable; discarding the orphaned block");
+            // [Fix round 1, review minor] Nothing was ever allocated from
+            // EITHER of this block's virtual blocks yet -- safe to
+            // destroy and pop directly, no vmaVirtualFree needed first.
+            discardOrphanedLastBlock();
             return MeshRange{};
         }
 
@@ -290,8 +313,13 @@ MeshRange GeometryPool::upload(std::span<const PoolVertex> vertices, std::span<c
             VK_SUCCESS) {
             RX_LOG_ERROR(
                 "GeometryPool::upload: index suballocation failed on a block just sized to fit it -- should be "
-                "unreachable");
+                "unreachable; discarding the orphaned block");
+            // [Fix round 1, review minor] Release the vertex-side
+            // suballocation that DID succeed first, so the block carries
+            // zero live suballocations before discardOrphanedLastBlock()
+            // destroys its virtual blocks.
             vmaVirtualFree(freshBlock.vertexVirtualBlock, vertexAlloc);
+            discardOrphanedLastBlock();
             return MeshRange{};
         }
     }
@@ -382,7 +410,18 @@ void GeometryPool::bind(VkCommandBuffer cmd, uint32_t blockId) const {
     vkCmdBindIndexBuffer(cmd, block.indexBuffer.handle(), 0, VK_INDEX_TYPE_UINT32);
 }
 
+uint32_t GeometryPool::blockCount() const {
+    RX_ASSERT_MAIN_THREAD("GeometryPool::blockCount");
+    return static_cast<uint32_t>(blocks_.size());
+}
+
+bool GeometryPool::bufferDeviceAddressEnabled() const {
+    RX_ASSERT_MAIN_THREAD("GeometryPool::bufferDeviceAddressEnabled");
+    return bufferDeviceAddressEnabled_;
+}
+
 PoolStats GeometryPool::stats() const {
+    RX_ASSERT_MAIN_THREAD("GeometryPool::stats");
     PoolStats out;
     out.blockCount = static_cast<uint32_t>(blocks_.size());
     out.blocks.reserve(blocks_.size());
@@ -417,6 +456,7 @@ PoolStats GeometryPool::stats() const {
 }
 
 VkDeviceAddress GeometryPool::vertexBufferDeviceAddress(uint32_t blockId) const {
+    RX_ASSERT_MAIN_THREAD("GeometryPool::vertexBufferDeviceAddress");
     if (!bufferDeviceAddressEnabled_ || blockId >= blocks_.size()) {
         return 0;
     }
@@ -424,6 +464,7 @@ VkDeviceAddress GeometryPool::vertexBufferDeviceAddress(uint32_t blockId) const 
 }
 
 VkDeviceAddress GeometryPool::indexBufferDeviceAddress(uint32_t blockId) const {
+    RX_ASSERT_MAIN_THREAD("GeometryPool::indexBufferDeviceAddress");
     if (!bufferDeviceAddressEnabled_ || blockId >= blocks_.size()) {
         return 0;
     }
@@ -431,6 +472,7 @@ VkDeviceAddress GeometryPool::indexBufferDeviceAddress(uint32_t blockId) const {
 }
 
 VkDeviceSize GeometryPool::vertexBufferAllocatedBytes(uint32_t blockId) const {
+    RX_ASSERT_MAIN_THREAD("GeometryPool::vertexBufferAllocatedBytes");
     if (blockId >= blocks_.size()) {
         return 0;
     }
@@ -438,6 +480,7 @@ VkDeviceSize GeometryPool::vertexBufferAllocatedBytes(uint32_t blockId) const {
 }
 
 VkDeviceSize GeometryPool::indexBufferAllocatedBytes(uint32_t blockId) const {
+    RX_ASSERT_MAIN_THREAD("GeometryPool::indexBufferAllocatedBytes");
     if (blockId >= blocks_.size()) {
         return 0;
     }
@@ -445,6 +488,7 @@ VkDeviceSize GeometryPool::indexBufferAllocatedBytes(uint32_t blockId) const {
 }
 
 VkBuffer GeometryPool::vertexBufferHandle(uint32_t blockId) const {
+    RX_ASSERT_MAIN_THREAD("GeometryPool::vertexBufferHandle");
     if (blockId >= blocks_.size()) {
         return VK_NULL_HANDLE;
     }
@@ -452,6 +496,7 @@ VkBuffer GeometryPool::vertexBufferHandle(uint32_t blockId) const {
 }
 
 VkBuffer GeometryPool::indexBufferHandle(uint32_t blockId) const {
+    RX_ASSERT_MAIN_THREAD("GeometryPool::indexBufferHandle");
     if (blockId >= blocks_.size()) {
         return VK_NULL_HANDLE;
     }

@@ -20,6 +20,7 @@ add_executable(rx_asset_tests
     geometry_pool_test.cpp
     bda_test.cpp
     accounting_test.cpp
+    thread_guard_test.cpp
 )
 target_link_libraries(rx_asset_tests PRIVATE rx_asset rx_rhi_vk rx_platform rx_shader doctest::doctest)
 rx_shader_deploy_runtime_libs(rx_asset_tests)

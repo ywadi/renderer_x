@@ -7,9 +7,26 @@
 // must be synchronized externally" (vendored vk_mem_alloc.h) -- so
 // create()/upload()/free()/bind() are main-thread-only, matching every
 // other GPU-object-mutation entry point in this codebase (BindlessTable/
-// Uploader/DeletionQueue/Allocator -- see docs/threading.md). stats()/
-// blockCount()/bufferDeviceAddressEnabled()/*BufferDeviceAddress() are
-// read-only snapshots, safe from any thread holding a valid reference.
+// Uploader/DeletionQueue/Allocator -- see docs/threading.md).
+//
+// [Fix round 1, review finding] EVERY OTHER PUBLIC METHOD IS ALSO
+// MAIN-THREAD-ONLY -- stats()/blockCount()/bufferDeviceAddressEnabled()/
+// vertexBufferDeviceAddress()/indexBufferDeviceAddress() (and the
+// test/diagnostic accessors below them) all read `blocks_` and/or call
+// vmaGetVirtualBlockStatistics() against live VmaVirtualBlocks that
+// upload()/free() mutate WITHOUT a lock -- VMA's own docs require
+// external synchronization for reads too, and `blocks_.size()`/
+// `blocks_[i]` race a concurrent `push_back()` reallocation exactly like
+// any other unsynchronized std::vector. An earlier version of this
+// comment claimed these were "safe from any thread holding a valid
+// reference" -- that was not backed by anything (no atomic state the way
+// rx::rhi::Allocator::report()/setCurrentFrameIndex() have
+// MemoryAccounting's atomic counters to justify their own any-thread
+// claim). Narrowed to main-thread-only, matching D5's posture for the
+// whole class; every one of these now carries the same
+// RX_ASSERT_MAIN_THREAD guard the mutators do, so the contract is
+// enforced, not just documented. HUD/Tracy consumers of stats() already
+// run on the main thread, so this costs nothing real.
 
 #include <rx_rhi_vk/buffer.h>
 #include <cstdint>
@@ -243,11 +260,18 @@ public:
     // Snapshot of bytes used/capacity (vertex + index, summed across
     // every block) plus block COUNT [gate ruling #21] and a per-block
     // breakdown. Cheap: calls VMA's FAST vmaGetVirtualBlockStatistics()
-    // tier per block, never the slow detailed/string tiers. Safe from any
-    // thread holding a valid reference.
+    // tier per block, never the slow detailed/string tiers.
+    //
+    // Main-thread-only (D5) [fix round 1] -- vmaGetVirtualBlockStatistics()
+    // reads the SAME live VmaVirtualBlock upload()/free() mutate without a
+    // lock (VMA requires external synchronization for this call too, not
+    // just the mutating ones), so this is not safe from another thread
+    // despite being a "read". See this header's own top-of-file comment.
     PoolStats stats() const;
 
-    uint32_t blockCount() const { return static_cast<uint32_t>(blocks_.size()); }
+    // Main-thread-only (D5) [fix round 1] -- reads blocks_.size(), which
+    // races a concurrent upload()-triggered push_back() reallocation.
+    uint32_t blockCount() const;
 
     // [D26.4] True iff this pool's chunk buffers were created with
     // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT and this pool's Allocator
@@ -255,7 +279,15 @@ public:
     // resolved once at create() from rx::rhi::Device::
     // supportsBufferDeviceAddress(). Enablement only: nothing in Phase 4
     // consumes the addresses below.
-    bool bufferDeviceAddressEnabled() const { return bufferDeviceAddressEnabled_; }
+    //
+    // Main-thread-only (D5) [fix round 1] -- this specific field is set
+    // once at construction and never mutated again, so reading it alone
+    // would in fact be safe from any thread; guarded anyway for a single
+    // uniform contract across every accessor in this class (D5's own
+    // posture for the whole class, per the coordinator's fix-round
+    // ruling), rather than a field-by-field carve-out a caller has to
+    // remember.
+    bool bufferDeviceAddressEnabled() const;
 
     // [D26.4] vkGetBufferDeviceAddress() for `blockId`'s vertex/index
     // buffer -- always 0 when bufferDeviceAddressEnabled() is false (no
@@ -264,6 +296,9 @@ public:
     // a validation error, not merely a meaningless value; these two
     // methods simply never call the Vulkan function at all when
     // disabled).
+    //
+    // Main-thread-only (D5) [fix round 1] -- indexes into blocks_, same
+    // hazard as blockCount() above.
     VkDeviceAddress vertexBufferDeviceAddress(uint32_t blockId) const;
     VkDeviceAddress indexBufferDeviceAddress(uint32_t blockId) const;
 
@@ -277,6 +312,10 @@ public:
     // delta against, since MemoryAccounting records the REAL allocated
     // size, not the nominal request (see rx_rhi_vk/memory_report.h's own
     // comment on Buffer::allocatedBytes()).
+    //
+    // Main-thread-only (D5) [fix round 1] -- indexes into blocks_, same
+    // hazard as blockCount() above; every doctest caller already runs
+    // single-threaded on the main thread, so this costs the tests nothing.
     VkDeviceSize vertexBufferAllocatedBytes(uint32_t blockId) const;
     VkDeviceSize indexBufferAllocatedBytes(uint32_t blockId) const;
 
@@ -287,6 +326,9 @@ public:
     // (vkCmdCopyBuffer) to prove upload()'s returned MeshRange offsets are
     // byte-exact -- see geometry_pool_test.cpp. VK_NULL_HANDLE if
     // `blockId` is out of range.
+    //
+    // Main-thread-only (D5) [fix round 1] -- indexes into blocks_, same
+    // hazard as blockCount() above.
     VkBuffer vertexBufferHandle(uint32_t blockId) const;
     VkBuffer indexBufferHandle(uint32_t blockId) const;
 
@@ -325,6 +367,19 @@ private:
     // MemoryCategory::GeometryPool [D24(a)] + the BDA usage bit when
     // enabled, then vmaCreateVirtualBlock for both buffers).
     bool addBlock(VkDeviceSize minVertexBytes, VkDeviceSize minIndexBytes);
+
+    // [Fix round 1, review minor] Destroys blocks_.back()'s two
+    // VmaVirtualBlocks (both, unconditionally) and pops it off blocks_.
+    // Both call sites in upload() only ever reach this with ZERO live
+    // suballocations remaining in either virtual block (any suballocation
+    // that DID succeed on this block before the failure is freed by the
+    // caller first) -- so vmaDestroyVirtualBlock() is safe here directly,
+    // with no vmaClearVirtualBlock() needed first. Cleans up the
+    // just-addBlock()'d block on the "should be unreachable" path where a
+    // fresh block sized to fit the exact request still fails a
+    // suballocation, so that defensive path leaves no orphaned block
+    // (and, via ~Buffer(), no orphaned device-local memory) behind.
+    void discardOrphanedLastBlock();
 
     void destroyAll();
 

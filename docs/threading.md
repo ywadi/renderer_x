@@ -86,14 +86,25 @@ and compiles to nothing at all when it is OFF:
   own comment on the `vmaSetCurrentFrameIndex()` staleness rule).
   (`src/rx_rhi_vk/include/rx_rhi_vk/buffer.h`)
 - **`rx::asset::GeometryPool`** [Phase 4 Stage 1 Task 12, spec D9] —
-  `create()`/`upload()`/`free()`/`bind()` **[guarded, all four]**:
-  suballocation is a main-thread-owned `VmaVirtualBlock` operation (VMA's
-  own virtual-block API documents itself as "not thread-safe... must be
-  synchronized externally" — vendored `vk_mem_alloc.h`), same rationale
-  as the four Allocator-derived types above. `stats()`/`blockCount()`/
+  `create()`/`upload()`/`free()`/`bind()`/`stats()`/`blockCount()`/
   `bufferDeviceAddressEnabled()`/`vertexBufferDeviceAddress()`/
-  `indexBufferDeviceAddress()` are read-only snapshots, not guarded.
-  (`src/rx_asset/include/rx_asset/geometry_pool.h`)
+  `indexBufferDeviceAddress()` **[guarded, all nine]**: suballocation is
+  a main-thread-owned `VmaVirtualBlock` operation (VMA's own
+  virtual-block API documents itself as "not thread-safe... must be
+  synchronized externally" — vendored `vk_mem_alloc.h`, and that
+  requirement covers reads too, not just the mutators), same rationale
+  as the four Allocator-derived types above. **[Fix round 1, review
+  finding]** the read accessors were originally documented (incorrectly)
+  as "safe from any thread holding a valid reference" — `stats()`/
+  `blockCount()`/etc. read the SAME `blocks_`/`VmaVirtualBlock` state
+  `upload()`/`free()` mutate unlocked, with no atomic counters the way
+  `rx::rhi::Allocator::report()` has to justify an any-thread claim;
+  narrowed to main-thread-only and guarded, matching D5's posture for
+  the whole class. The test/diagnostic-only accessors
+  (`vertexBufferAllocatedBytes()`/`indexBufferAllocatedBytes()`/
+  `vertexBufferHandle()`/`indexBufferHandle()`) carry the identical
+  guard for the same reason, though production code has no need for
+  them. (`src/rx_asset/include/rx_asset/geometry_pool.h`)
 - **`rx::scene::*Manager` registries** (future, Stage 2) —
   `RenderableManager`/`TransformManager`/`LightManager` mutation
   (create/set/destroy) stays main-thread-only; read-only SoA traversal for
