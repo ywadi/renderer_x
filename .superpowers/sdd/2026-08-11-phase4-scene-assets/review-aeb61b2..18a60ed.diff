@@ -1,0 +1,1007 @@
+=== COMMITS ===
+18a60ed fix(rx_asset): self-calibrate the WALL-CLOCK GATE's CI-tier threshold (coordinator-ruled RC6 recalibration)
+9bff3cf docs: close the windows-cross-zig local Wine-verification blind spot; wine-segfault-fix report
+01e185a fix(rx_asset): synchronously roll back an abandoned mid-upload async import at ~Registry() (Wine/CI SIGSEGV, run 32180630087)
+
+=== STAT ===
+ .../wine-segfault-fix-report.md                    | 424 +++++++++++++++++++++
+ README.md                                          |  32 ++
+ src/rx_asset/registry.cpp                          | 105 +++++
+ src/rx_asset/tests/async_import_test.cpp           | 261 ++++++++++++-
+ 4 files changed, 806 insertions(+), 16 deletions(-)
+
+=== FULL DIFF (U10) ===
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/wine-segfault-fix-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/wine-segfault-fix-report.md
+new file mode 100644
+index 0000000..11f798d
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/wine-segfault-fix-report.md
+@@ -0,0 +1,424 @@
++# CI-red fix report: rx_asset_gltf_gpu_tests SIGSEGV (CI run 32180630087)
++
++**Scope:** `rx_asset` only (`src/rx_asset/registry.cpp`, `src/rx_asset/tests/async_import_test.cpp`), plus a
++documentation addition (`README.md`). `rx_task` and `rx_rhi_vk` were investigated but **not modified** — the
++persistent-task Scheduler design (commits `da566ed`/`2ed0599`) and 7cc685f's GPU-wait semantics are untouched.
++
++**Base commit:** `aeb61b2` (HEAD at dispatch). **Regression window investigated:** `da566ed..d1fb0d7` (Task 15:
++async import pipeline, persistent-task scheduler, rollback fixes) + `7cc685f` (rx_rhi_vk GPU-wait hazard fix).
++
++## 1. Symptom (as reported)
++
++CI run [32180630087](https://github.com/ywadi/renderer_x/actions/runs/32180630087) failed on **both** jobs:
++
++- `windows-cross-zig`, step "Test under wine (xvfb; GPU tests excluded -- no Vulkan under Wine)":
++  `rx_asset_gltf_gpu_tests.exe` SIGSEGV.
++- `linux-native`, step "Test (xvfb + lavapipe)": `rx_asset_gltf_gpu_tests` SIGSEGV, 13.83s in, test #9,
++  19/20 otherwise green (confirms `7cc685f`'s own GPU-wait fix: zero SYNC-HAZARD lines in the `rx_rhi_vk_tests`
++  run).
++
++This binary passed on Wine at Task 13/14 heads (`27b530d`, `55b4822`) and failed at `aeb61b2` — narrowing the
++regression to the window above.
++
++## 2. Repro transcript
++
++### 2.1 Local Wine repro — did not reproduce as originally framed
++
++The dev machine (8 cores, native lavapipe, wine-11.0) ran `rx_asset_gltf_gpu_tests.exe --validate` under
++`xvfb-run -a wine` (mirroring CI's invocation) repeatedly, including under `taskset -c 0,1` (2-core, matching
++GitHub's runner class), forced lavapipe (`VK_ICD_FILENAMES`), `LP_NUM_THREADS=1`, and artificial CPU
++oversubscription (4-6 busy-loop processes pinned to the same 2 cores). Every run: 55/55, exit 0. Wine itself
++turned out **not** to be device-free here — CI installs `mesa-vulkan-drivers`/`vulkan-tools`/`libvulkan-dev`
++alongside Wine specifically so `winevulkan` has a real (software) Vulkan implementation to forward to (see
++`.github/workflows/ci.yml`'s own comment on that job's "Install system packages" step) — confirmed directly:
++the local Wine run's own log shows real `Device::create:` lines, not a skip guard. So this binary genuinely
++exercises the real async-import/GPU pipeline under Wine, same as `linux-native` — Wine's overhead just widens
++whatever timing window the real bug needs, exactly like CI's own weaker/shared hardware does.
++
++### 2.2 Pivot: pulled the actual CI logs (`gh run view --log`)
++
++```
++9/20 Test  #9: rx_asset_gltf_gpu_tests ............***Exception: SegFault 13.83 sec
++...
++/home/runner/work/renderer_x/renderer_x/src/rx_asset/tests/async_import_test.cpp:646:
++TEST CASE:  importGltfAsync: WALL-CLOCK GATE -- deliberately slow decode + a real (DamagedHelmet-scale) payload
++in flight, >=300 driven frames, every pumpMain() call bounded (2ms local budget, 10ms CI stall detector),
++zero wait-calls-from-async-path, ring never exhausts
++
++/home/runner/work/renderer_x/renderer_x/src/rx_asset/tests/async_import_test.cpp:748: FATAL ERROR:
++REQUIRE( pumpDuration < kCiStallDetector ) is NOT correct!
++  values: REQUIRE( 12633µs <  10000µs )
++
++[2026-08-18 20:22:14.644] [error] [vulkan validation] Validation Error:
++[ VUID-vkEndCommandBuffer-commandBuffer-00059 ] ... vkEndCommandBuffer(): was called in VkCommandBuffer ...
++which is invalid because bound VkImage ... was destroyed.
++.../async_import_test.cpp:646: FATAL ERROR: test case CRASHED: SIGSEGV - Segmentation violation signal
++```
++
++This is the real signal the task brief's "two InvalidFileData lines" description was pointing near (an
++earlier, unrelated pair of `InvalidFileData` errors from the *previous* test case, `importGltfAsync:
++garbage-bytes import...`, happen to sit a few lines above in the raw log) — the actual crashing test is the
++**WALL-CLOCK GATE** (`async_import_test.cpp:644-798`), and the actual trigger is its own hard CI-stall-detector
++`REQUIRE` firing on CI's slower hardware (one `pumpMain()` call — registering DamagedHelmet's first real JPEG
++texture — took 12.6ms against a 10ms ceiling; the task's own report for the introducing task, section 7 of
++`task-15-report.md`, already disclosed this exact assertion is timing-sensitive under contention, just did not
++anticipate it firing without `-j4` contention, purely from CI's own weaker single-core throughput).
++
++### 2.3 Isolation
++
++`--test-case`-filtered runs plus a from-scratch ASan/UBSan build (`-fsanitize=address,undefined -O1 -g`,
++mirroring Task 15's own methodology) confirmed: every one of the 55 pre-existing test cases passes cleanly and
++ASan-clean in isolation. The crash is not "test case N is broken" — it is what happens to a **specific runtime
++state** (an async import job abandoned mid-upload) when the surrounding objects unwind, which the
++WALL-CLOCK GATE test's own `REQUIRE` failure happens to produce by interrupting its drive loop mid-flight, but
++which is not specific to that `REQUIRE` at all (see §3).
++
++## 3. Root cause
++
++**File:line:** `src/rx_asset/registry.cpp:344-383` (`Registry::~Registry()`, pre-fix), interacting with
++`src/rx_rhi_vk/src/upload.cpp:615-632` (`Uploader::~Uploader()`) and `src/rx_asset/texture_cache.cpp:106-118`
++(`TextureCache::~TextureCache()` — more precisely, its implicit `pool_` member destructor, which unconditionally
++destroys every still-"resident" `Texture2D`).
++
++**This is a genuine PRODUCTION-code defect, not a test-only artifact.** Severity is elevated accordingly: any
++real host application (Windows included — nothing about the mechanism is Wine- or Linux-specific) that tears
++down its `Registry` (for any reason: a thrown exception, an early return, an unrelated fatal error, or simply
++choosing to shut down) while an `importGltfAsync()` job is genuinely mid-**upload** (≥1 real GPU resource
++already registered via `TextureCache::registerDecoded()`/`GeometryPool::uploadDeferred()`), **without** first
++explicitly calling `cancelImport()` and then continuing to call `pumpMain()` until the rollback is confirmed
++safe, hits this same corruption. On a fast machine the corrupted-command-buffer state happens to not crash
++(confirmed empirically, §5) — it silently produces a `UNASSIGNED-CoreValidation-DrawState-InvalidCommandBuffer-
++VkImage` validation error and moves on. On CI's weaker/software-rasterizer/Wine-translated environment, the
++driver processing that corrupted state segfaults instead.
++
++### The mechanism
++
++1. `Registry::importGltfAsync()` creates an `AsyncImportJob` (`registry.cpp:29-70`) holding raw
++   `pool`/`textures`/`scheduler` pointers and (once compute finishes) a `std::unique_ptr<MarshalPendingImport>
++   pending` (`import_pipeline.h:261-291`) — the live handle to whatever real GPU resources
++   `marshalGltfImportPrepareStep()` has already registered.
++2. Every step of the marshal/upload phase (`runAsyncImportPrepareStep`, `pollAsyncImportUploads`,
++   `rollbackAsyncImportWhenSafe`, `registry.cpp:91-194`, pre-fix) advances **only** via
++   `Scheduler::postToMain()` closures, drained by `pumpMain()`. There is no other clock driving this state
++   machine forward.
++3. `Scheduler::~Scheduler()` (`src/rx_task/scheduler.cpp:284-343`) documents, explicitly, that "postToMain()
++   work still queued when `pumpMain()` is never called again is simply dropped (its captured closure destroyed
++   as an ordinary side effect)" — this is by design, and correct for the Scheduler's own contract in isolation.
++4. Before this fix, `Registry::~Registry()` (`registry.cpp:254-276`, pre-fix) only ever set
++   `cancelled = true` / `registry = nullptr` on each outstanding job and walked away. It never checked
++   whether that job's `pending` still held real, unreleased GPU resources. If nothing ever pumps again
++   (§2.2's `REQUIRE` failure is one way this happens; a caller that cancels and then tears down without
++   continuing to pump is another, pre-existing way — see §4), the queued rollback closure referenced in step 3
++   is simply dropped, and `AsyncImportJob`'s (and its `MarshalPendingImport`'s) plain C++ destructor runs
++   instead — which does **not** call `TextureCache::releaseUnpublished()`/`GeometryPool::free()`. The
++   texture stays "resident" inside `TextureCache`'s own bookkeeping, indefinitely, with its upload copy command
++   still sitting on `Uploader`'s batched, not-yet-ended command buffer.
++5. Eventually, the owning `TextureCache` is destroyed. Its own destructor body (`texture_cache.cpp:106-118`)
++   only explicitly destroys `VkSampler`s — the actual `Texture2D`/`VkImage` objects live inside its `pool_`
++   member, which the compiler-generated implicit destructor tears down unconditionally, including the
++   still-"resident", never-released entry from step 4.
++6. Later still (in every fixture this project's own tests use, `TextureCache`/`GeometryPool` are declared,
++   hence destructed, **before** `Uploader`), `Uploader::~Uploader()` (`upload.cpp:615-632`) runs its own
++   documented "auto-flush pending... work" — calling `vkEndCommandBuffer()` on the command buffer that step 4
++   left open, which still references the VkImage step 5 just destroyed:
++   `VUID-vkEndCommandBuffer-commandBuffer-00059`. The driver then processes this corrupted state; on CI's
++   environment, that segfaults.
++
++**This is the identical failure signature `texture_cache.cpp:328-343` (`buildFallbackTextures()`) already hit
++and fixed once before** ("A TextureCache that is constructed and then torn down without ever loading a REAL
++texture ... would otherwise reach `~TextureCache()` with those 4 images destroyed while Uploader's OWN
++destructor still auto-flushes ... reproduced directly, empirically, as a real
++`UNASSIGNED-CoreValidation-DrawState-InvalidCommandBuffer-VkImage` validation error") — for a **different**,
++narrower code path (the four D11 fallback textures). Task 15's async pipeline reintroduced the same failure
++class for its own, much more general, "abandon a job with real GPU resources already registered" path, and it
++was never covered by a test that actually reaches that state without the caller performing an explicit,
++fully-drained `cancelImport()` first.
++
++**This bug was already sighted once, out of scope, and misdiagnosed as flakiness.** `.superpowers/sdd/
++2026-08-11-phase4-scene-assets/ci-red-fix-report.md` §5 (the report for the immediately-preceding `7cc685f` fix)
++records: *"`rx_asset_gltf_gpu_tests` ... failed once locally with the same `CHECK_FALSE(fixture->context.
++hasValidationErrors())` shape, at a completely different assertion (`async_import_test.cpp:918`) ... it did
++not reproduce consistently either with or without my change — consistent with pre-existing flakiness in that
++concurrently-developed code, not something this fix caused."* That is this exact bug, seen once, months before
++this CI run, and correctly flagged as out-of-scope for that task — but never independently investigated.
++
++### Registry's own documented contract already promised this was safe
++
++`src/rx_asset/include/rx_asset/registry.h:117-125` ("POOL/TEXTURES/SCHEDULER LIFETIME"): *"destroying the
++REGISTRY specifically while one of its own async imports is in flight is safe and defined."* The pre-fix
++`~Registry()` only actually delivered on that promise for jobs still in the **compute** phase (nothing
++GPU-side registered yet) — exactly the two cases the pre-existing "destroy while in flight" regression tests
++cover (`async_import_test.cpp`, both pass `textures == nullptr`, so their jobs never leave the compute phase).
++For a job already in the **marshal/upload** phase, the promise was not upheld. This fix makes `~Registry()`
++actually honor its own documented contract for every job state, not just the two that happened to be tested.
++
++## 4. Fix
++
++`src/rx_asset/registry.cpp:308-342` adds `drainAndRollbackAbandonedAsyncJob()`: for a job whose `pending` is
++still non-null when `Registry::~Registry()` runs, it (a) calls the existing
++`marshalGltfImportEnsureRollbackTicketed()` to force a real ticket for anything recorded-but-not-yet-flushed,
++(b) polls (bounded, 5s, 1ms sleep — the same idiom every test in this file already uses) the existing
++`marshalGltfImportUploadsComplete()` until the GPU confirms every issued ticket is actually done, then
++(c) calls the existing `marshalGltfImportRollback()` — the exact same three functions the **live**
++`rollbackAsyncImportWhenSafe()` cancellation path already uses, just driven synchronously instead of via
++`postToMain()` reposts, because at destructor time nothing is guaranteed to ever pump again. If the bounded
++wait times out (a genuine GPU hang/device-loss condition, not something this fix can resolve), it logs loudly
++and **leaks** `pending` rather than risk destroying a still-in-flight `VkImage`/`VkBuffer` — a resource leak
++is always recoverable at process exit; a use-after-free is not.
++
++`registry.cpp:377` calls it from `Registry::~Registry()`'s existing per-job loop, once, before clearing
++`asyncJobs_`.
++
++### Why this is safe, and why it is the minimal, correctly-scoped fix
++
++- **No new assumption.** `registry.h`'s own "POOL/TEXTURES/SCHEDULER LIFETIME" contract already *requires*
++  `pool`/`textures`/`scheduler` to outlive any job referencing them — hence to outlive `Registry`, which may
++  still hold a live job at its own destruction. `~Registry()` using them directly relies on nothing beyond
++  what was already a documented caller obligation.
++- **Blocking here is a deliberate, precedented, narrowly-scoped exception to D25's "poll, never block"
++  invariant** — the exact same trade-off `Device::~Device()`'s own unconditional `vkDeviceWaitIdle()` already
++  makes, and the one `buildFallbackTextures()` already makes (`uploader_.wait(uploader_.flush())`,
++  `texture_cache.cpp:343`/`440`) for this identical failure signature. It only ever fires on the **abandonment**
++  path (a job whose `pending` was never consumed by a normal finalize/rollback) — never on the live,
++  wall-clock-gated async path the existing "zero `wait()` calls" counters (`waitCallCountForTesting()`) verify.
++  Confirmed: the fix changes zero counted call sites in `GeometryPool`/`TextureCache`, so every existing
++  D25-related assertion is untouched (§5).
++- **No `rx_task`/`rx_rhi_vk` changes.** The persistent-task Scheduler design (`2ed0599`) and `7cc685f`'s
++  GPU-wait semantics are both left exactly as they were — this closes the gap entirely from the `rx_asset` side,
++  by making the one already-safe rollback path reachable synchronously from the one place (`~Registry()`) that
++  was the actual gap.
++- **Covers both known trigger shapes with one change.** It fixes not only "a driving loop's own `REQUIRE`
++  throws mid-upload" (§2.2's proximate trigger) but also the pre-existing, more general "a caller explicitly
++  calls `cancelImport()` then tears down without continuing to pump" mistake — `~Registry()` does not care
++  *why* `pending` is still non-null, only that it is.
++
++## 5. Regression test
++
++`src/rx_asset/tests/async_import_test.cpp:1279` — new `TEST_CASE`: *"importGltfAsync: abandoning a job
++genuinely mid-UPLOAD (>=1 real GPU resource already registered, no explicit cancelImport(), no further
++pumpMain()) does not crash and raises no validation errors [Wine/CI SIGSEGV regression, CI run 32180630087]"*.
++
++Drives a real `importGltfAsync()` against DamagedHelmet with a real `TextureCache` until at least one texture
++slot is confirmed registered (`liveTextureCountForTesting()` increases — the same observable signal the
++pre-existing cancel-mid-upload test uses), then deliberately abandons the job (no `cancelImport()`, no further
++`pumpMain()` calls) and explicitly reproduces the exact corrupting sequence (destroy `TextureCache`, then flush
++`Uploader`) while `Context` is still alive, so the result is observable via `hasValidationErrors()` rather than
++only "did the process crash" (native lavapipe on the dev machine does **not** crash on the corrupted state —
++only CI's own environment does, confirmed empirically below — so a bare crash check is too weak a local
++discriminator; the validation error itself is the reliable, portable signal both before and after the fix).
++
++**Revert-tested** (temporarily reverted `registry.cpp` to the base-commit version, kept the new test):
++
++```
++=== 3/3 runs against PRE-FIX registry.cpp ===
++[error] [vulkan validation] Validation Error: [ UNASSIGNED-CoreValidation-DrawState-InvalidCommandBuffer-VkImage ]
++  ... You are adding vkEndCommandBuffer() ... invalid because bound VkImage ... was destroyed.
++CHECK_FALSE( fixture->context.hasValidationErrors() ) is NOT correct!  values: CHECK_FALSE( true )
++[doctest] test cases:  1 |  0 passed | 1 failed        (3/3 runs, deterministic)
++```
++
++```
++=== 5/5 runs against FIXED registry.cpp ===
++[doctest] test cases:  1 |  1 passed | 0 failed        (5/5 runs, zero validation errors, zero DeletionQueue
++                                                          "never flushed" warnings)
++```
++
++## 6. Documentation
++
++`README.md`'s "Testing" section gained a new "Windows-cross-zig: verify under Wine locally, not just 'it
++builds'" subsection: local verification for any change touching a binary `windows-cross-zig`'s CI job actually
++*runs* now always includes the exact CI Wine invocation
++(`xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample' --output-on-
++failure`) for **every** binary that filter does not exclude — not just the genuinely device-free ones
++(`rx_task_tests.exe`, `rx_asset_gltf_tests.exe`, etc.) — closing the exact blind spot this bug slipped through
++(CI's filter includes `rx_asset_gltf_gpu_tests.exe`, which constructs a real `VkDevice` under Wine via
++`winevulkan`→lavapipe passthrough; a clean *build* was previously treated as sufficient local verification for
++it). No plan/spec/ledger document was touched — MANUAL_VERIFICATION.md was left alone (it is scoped to
++human-observed `--present` visual checks, a different category from this ctest-under-Wine convention).
++
++## 7. Full verification
++
++All of the following ran on the base checkout (`aeb61b2` + this fix), from-scratch or incremental builds as
++noted:
++
++**`rx_asset_gltf_gpu_tests --validate`, linux-native, native lavapipe:**
++```
++[doctest] test cases:      56 |      56 passed | 0 failed | 0 skipped
++[doctest] assertions: 8716302 | 8716302 passed | 0 failed |
++[doctest] Status: SUCCESS!
++```
++(55 pre-existing + 1 new regression test, all passing; was 55/55 before this task.)
++
++**Full serial `ctest --preset linux-native --output-on-failure`:**
++```
++100% tests passed, 0 tests failed out of 20
++Total Test time (real) =  55.86 sec
++```
++
++**`cmake --build --preset windows-cross-zig` (full):** clean, zero errors/warnings introduced.
++
++**`xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample' --output-on-
++failure` (CI's exact invocation, under Wine):**
++```
++ 1/10 Test  #1: shader_spirv_test ................   Passed    0.05 sec
++ 2/10 Test  #2: rx_core_tests ....................   Passed   66.76 sec
++ 3/10 Test  #3: rx_task_tests ....................   Passed    0.86 sec
++ 4/10 Test  #4: rx_platform_tests ................   Passed    1.60 sec
++ 5/10 Test  #5: rx_shader_tests ..................   Passed    0.32 sec
++ 6/10 Test  #6: rx_asset_tests ...................   Passed   10.92 sec
++ 7/10 Test  #7: rx_asset_gltf_tests ..............   Passed    0.08 sec
++ 8/10 Test  #8: rx_asset_gltf_gpu_tests ..........   Passed   43.63 sec
++ 9/10 Test  #9: rx_graph_tests ...................   Passed    0.05 sec
++10/10 Test #10: rx_material_tests ................   Passed    0.08 sec
++100% tests passed, 0 tests failed out of 10
++```
++`rx_task_tests.exe` and `rx_asset_gltf_tests.exe` (the two other Wine-run binaries the brief named) both clean.
++
++**Fresh ASan/UBSan build** (`-fsanitize=address,undefined -O1 -g -fno-omit-frame-pointer`, mirroring Task 15's
++own methodology, `linux-native` toolchain, excluding only the pre-existing, separately-documented
++timing-sensitive `*WALL-CLOCK*` case per Task 15's own sanitizer-timing exclusion):
++```
++[doctest] test cases:     55 |     55 passed | 0 failed | 1 skipped
++[doctest] assertions: 379672 | 379672 passed | 0 failed |
++[doctest] Status: SUCCESS!
++```
++Zero new sanitizer defects from this fix.
++
++## 8. Concerns / residual risk
++
++- **The WALL-CLOCK GATE's 12.6ms spike (§2.2) is itself a separate, minor, already-partially-disclosed
++  finding**, not fixed by this task (out of scope: it is a timing assertion, not a lifetime bug) — CI's own
++  hardware is now known to occasionally exceed the 10ms hard ceiling on a single texture registration purely
++  from its own throughput, without any `-j4` contention (the `task-15-report.md` §7/8 disclosure only
++  anticipated the contention case). This fix makes that spike harmless (no crash, clean rollback) rather than
++  catastrophic, but the assertion itself could still intermittently fail the WALL-CLOCK GATE test on weak CI
++  hardware. That is a pre-existing, disclosed, separate concern for a future task to size a CI-aware budget for
++  (D18's own "runner-aware headroom" model already anticipates this class of issue) — not something this fix's
++  scope covers or should paper over.
++- **GeometryPool has the analogous risk** (an abandoned mid-upload geometry range, not just textures) —
++  `drainAndRollbackAbandonedAsyncJob()` covers it identically (`marshalGltfImportRollback()` always handles both
++  halves together), but no dedicated regression test isolates the geometry-only case specifically, since the
++  CI evidence (§2.2) showed the crash triggering on the very first texture slot, before geometry was ever
++  reached. The fix's coverage is not narrower than the bug, only the new test's specific reproduction path is.
++
++## 9. Addendum: WALL-CLOCK GATE CI-tier threshold recalibration (coordinator-ruled)
++
++**Why this addendum exists.** §8's concern (1) above was correctly escalated by the coordinator before this
++task closed: with the SIGSEGV fixed, the WALL-CLOCK GATE's own 10ms CI-stall-detector `REQUIRE`
++(`async_import_test.cpp:748` at the time of the original crash) would now fail as an ordinary assertion on the
++next CI run instead of segfaulting — CI stays red either way. RC6's own two-tier design intends the CI tier as
++a stall *detector* whose threshold sits an order of magnitude above legitimate per-environment noise and below
++the defect-class signature (a reintroduced pre-D25 blocking flush); 10ms was calibrated against fast-dev-
++hardware noise and CI's real 2-core/single-thread-lavapipe environment legitimately reached 12.6ms once
++(§2.2). This addendum closes that gap via the coordinator's required measure-don't-guess procedure.
++
++### 9.1 Measurement 1 — legitimate max, constrained repro
++
++`rx_asset_gltf_gpu_tests --test-case="*WALL-CLOCK*"`, `taskset -c 0,1` + `LP_NUM_THREADS=1` + forced lavapipe
++(`VK_ICD_FILENAMES`), 22 total runs across two batches (temporarily relaxed the CI-tier `REQUIRE` to `CHECK` so
++a slow run completes and reports its true max instead of aborting early — reverted before shipping):
++
++- Batch A (12 runs, WALL-CLOCK-only filter, calibration probe present): in-loop max pumpMain() 9166–9856 µs.
++- Batch B (10 runs, full 56-test suite, same constraint): in-loop max pumpMain() 9479–10288 µs.
++
++**Legit max across all 22 runs: 10288 µs** (Batch B run 3).
++
++### 9.2 Measurement 2 — calibration-probe baseline, same runs
++
++Same 22 runs, timing ONE `TextureCache::registerDecoded()` call against a synthetic 2048×2048 RGBA8 payload
++(sized like DamagedHelmet's own real textures — every one of its 5 JPGs decodes to exactly this size; an
++earlier attempt at a tiny 4×4 synthetic payload measured only fixed per-call overhead, 53–93 µs, two orders of
++magnitude too small to be representative, and was discarded before this measurement), taken immediately before
++the real import starts:
++
++**Calibration baseline range: 5634–6202 µs.** Worst-case per-run ratio (legit max ÷ calibration, same run):
++**1.771×** (Batch B run 10: 9993/5642 — the single worst pairing across all 22 runs was actually Batch B run 3
++at legit=10288/calib=5972=1.723; the 1.771 cited in-code is the true max over all 22 per-run ratios, from run
++10 of Batch B).
++
++### 9.3 Measurement 3 — blocking-defect signature, scratch worktree
++
++Per the coordinator's explicit procedure: `git worktree add` at the fix's own HEAD (`9bff3cf`), pre-RC6
++whole-batch shape reintroduced in `import_gltf.cpp`'s `marshalGltfImportPrepareStep()` — the early `return true`
++after registering exactly one texture slot (the RC6 fix itself, task-15) removed, so all 5 real DamagedHelmet
++textures register inside a single call again, the same revert shape Task 15's own report cites for its
++"registering all 5 textures in one synchronous call measured 15.8ms" evidence. Same constrained repro, 5 runs:
++
++**Blocking signature range: 39399–40812 µs.** Worst case toward a tight margin (smallest observed): 39399 µs.
++
++Worktree removed after measurement (`git worktree remove`); no residue in the main tree.
++
++### 9.4 Band computation and the self-calibration decision
++
++Total available separation on this hardware class: 39399 / 10288 ≈ **3.83×** — not the order-of-magnitude
++RC6's original prose assumed. A strict ≥2× margin on both sides simultaneously requires ≥4× total separation
++(2×2), which 3.83× does not comfortably clear, and using a FIXED threshold computed from
++`(legit_max × 2, blocking_min ÷ 2)` produces `(20576, 19700)` — **the lower bound exceeds the upper bound: the
++bands overlap**, exactly the coordinator-anticipated "unexpected" outcome. Per the coordinator's own ruling,
++no fixed number was picked; self-calibration was implemented instead.
++
++**Design:** `async_import_test.cpp`'s WALL-CLOCK GATE now measures a live calibration op (§9.2) at test start,
++then sets `kCiStallDetector = max(kLocalBudget, 4 × calibDuration)` — the CI tier scales with whatever
++hardware/environment the test happens to run on, rather than encoding one machine's snapshot. Multiplier = 4,
++chosen to bias toward legit-side safety (avoiding a false-positive CI-red is the entire reason for this
++addendum) while keeping a real margin toward the defect signature:
++
++- vs. legit max: `4 ÷ 1.771 = 2.26×` margin — clears the coordinator's ≥2× bar.
++- vs. blocking signature: `4×` calibration (~23–25ms typical) sits ~1.6–1.7× below the 39.4–40.8ms blocking
++  signature — short of a full 2× margin (the ~3.8× total separation does not allow both margins to be a full
++  2× with zero slack), but still a clean, unambiguous, always-observed fail for the defect class this tier
++  exists to catch (§9.5), not a coin flip.
++
++The 2ms local/published trend tier (`kLocalBudget`) is unchanged, per instruction.
++
++### 9.5 Verification, both directions
++
++**≥10 clean runs of the full suite, constrained (taskset -c 0,1 + LP_NUM_THREADS=1 + lavapipe), new threshold**
++(10 runs shown; also the same 22 runs from §9.1/9.2 all passed at their own live-calibrated threshold):
++
++```
++Run 1:  calibration=5956us, threshold(4x)≈23824us, gate max=9552us   -> 56/56 SUCCESS
++Run 2:  calibration=5943us, threshold(4x)≈23772us, gate max=9619us   -> 56/56 SUCCESS
++Run 3:  calibration=5972us, threshold(4x)≈23888us, gate max=10288us  -> 56/56 SUCCESS
++Run 4:  calibration=6202us, threshold(4x)≈24808us, gate max=9841us   -> 56/56 SUCCESS
++Run 5:  calibration=5984us, threshold(4x)≈23936us, gate max=9552us   -> 56/56 SUCCESS
++Run 6:  calibration=5798us, threshold(4x)≈23192us, gate max=9479us   -> 56/56 SUCCESS
++Run 7:  calibration=5761us, threshold(4x)≈23044us, gate max=9625us   -> 56/56 SUCCESS
++Run 8:  calibration=5696us, threshold(4x)≈22784us, gate max=9708us   -> 56/56 SUCCESS
++Run 9:  calibration=5789us, threshold(4x)≈23156us, gate max=9796us   -> 56/56 SUCCESS
++Run 10: calibration=5642us, threshold(4x)≈22568us, gate max=9993us   -> 56/56 SUCCESS
++```
++10/10 clean, every run's own live threshold comfortably clears its own run's gate max (all 56 test cases pass
++each time, not just the WALL-CLOCK GATE).
++
++**Blocking-revert still fails the gate at the new threshold** (same scratch worktree, 3 runs):
++
++```
++Run 1: calibration=5761us, threshold(4x)≈23044us -> FATAL ERROR: REQUIRE( pumpDuration < kCiStallDetector ) is NOT correct!
++Run 2: calibration=6019us, threshold(4x)≈24076us -> FATAL ERROR: REQUIRE( pumpDuration < kCiStallDetector ) is NOT correct!
++Run 3: calibration=5745us, threshold(4x)≈22980us -> FATAL ERROR: REQUIRE( pumpDuration < kCiStallDetector ) is NOT correct!
++```
++3/3 deterministic fail — the self-calibrated gate still reliably catches the blocking-defect class.
++
++### 9.6 Final-commit re-verification (unconstrained)
++
++Re-run once more at the final commit, since the threshold change touches the same test file as the earlier
++fix:
++
++- **Full unconstrained `rx_asset_gltf_gpu_tests --validate`:** 56/56 (part of the full-suite runs below).
++- **Full serial `ctest --preset linux-native --output-on-failure`:** 100% tests passed, 20/20, 54.18s total.
++- **`cmake --build --preset windows-cross-zig` (full):** clean.
++- **`xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample' --output-on-failure`
++  (CI's exact Wine invocation):** 100% tests passed, 10/10, including `rx_asset_gltf_gpu_tests` (43.50s, the
++  WALL-CLOCK GATE included) and the two other named Wine binaries (`rx_task_tests.exe`, `rx_asset_gltf_tests.exe`),
++  126.75s total.
++
++### 9.7 Files changed (this addendum)
++
++- `src/rx_asset/tests/async_import_test.cpp` — WALL-CLOCK GATE's CI-tier threshold: fixed 10ms constant →
++  self-calibrated `max(2ms, 4 × live calibration probe)`, plus the calibration probe itself and the
++  MULTIPLIER DERIVATION comment documenting §9.1–9.4 in place at the definition site.
++- This report (§9, this addendum).
++
++No `rx_task`/`rx_rhi_vk` changes. No plan/spec/ledger document touched. Scratch worktree used for §9.3 was
++removed after measurement; nothing from it was committed.
+diff --git a/README.md b/README.md
+index 43dcdb3..f5435ef 100644
+--- a/README.md
++++ b/README.md
+@@ -92,10 +92,42 @@ For detailed build and run instructions per platform, including Steam Deck and m
+ 
+ ## Testing
+ 
+ Run the full test suite (including headless triangle correctness gate):
+ 
+ ```sh
+ ctest --preset linux-native --output-on-failure
+ ```
+ 
+ The suite includes unit tests for rx_core, rx_platform, rx_rhi_vk, shader compilation, and the headless triangle sample. Interactive `--present` mode is tested manually; see [`MANUAL_VERIFICATION.md`](MANUAL_VERIFICATION.md).
++
++### Windows-cross-zig: verify under Wine locally, not just "it builds"
++
++Any change that touches a binary CI's `windows-cross-zig` job actually **runs**
++(not merely builds) must be verified under Wine locally before it is
++considered green — matching CI's own invocation exactly, not just a build
++check:
++
++```sh
++cmake --preset windows-cross-zig && cmake --build --preset windows-cross-zig
++xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample' --output-on-failure
++```
++
++This is **not** a device-free run: `.github/workflows/ci.yml`'s own comment on
++this step documents that installing lavapipe on the runner gives Wine's
++built-in Vulkan support (`winevulkan`) a real, software Vulkan implementation
++to forward to — so every binary this filter does **not** exclude (notably
++`rx_asset_gltf_gpu_tests.exe`, and any future `*_gpu_tests` binary this
++filter does not add to its exclusion list) constructs a real `VkDevice` and
++exercises real GPU-resource lifetime under Wine, exactly like it does on
++`linux-native`. A prior local-verification gap covered only the binaries that
++are genuinely device-free under Wine (`rx_task_tests.exe`,
++`rx_asset_gltf_tests.exe`, `shader_spirv_test.exe`, `rx_core_tests.exe`,
++`rx_platform_tests.exe`, `rx_shader_tests.exe`) and treated a clean
++`windows-cross-zig` *build* as sufficient for the GPU-backed-but-not-excluded
++binaries — which let a genuine, timing-sensitive lifetime defect in the async
++import pipeline (rx_asset) reach CI-red on both `windows-cross-zig` (Wine)
++and `linux-native` before it was ever exercised under Wine locally (CI run
++32180630087; see `.superpowers/sdd/2026-08-11-phase4-scene-assets/
++wine-segfault-fix-report.md`). Closing that gap: local `windows-cross-zig`
++verification always includes the Wine run above, for every binary the CI
++filter leaves in, not just a build check.
+diff --git a/src/rx_asset/registry.cpp b/src/rx_asset/registry.cpp
+index bbfe5a3..d3c4ac3 100644
+--- a/src/rx_asset/registry.cpp
++++ b/src/rx_asset/registry.cpp
+@@ -1,18 +1,20 @@
+ #include <rx_asset/registry.h>
+ #include "fallbacks.h"
+ #include "import_gltf.h"
+ #include "import_pipeline.h"
+ #include <rx_core/debug_checks.h>
+ #include <rx_core/log.h>
+ #include <rx_task/scheduler.h>
++#include <chrono>
+ #include <fstream>
++#include <thread>
+ #include <utility>
+ 
+ namespace rx::asset {
+ 
+ namespace {
+ 
+ uint64_t packHandle(uint32_t index, uint32_t generation) { return (static_cast<uint64_t>(index) << 32) | generation; }
+ 
+ template <typename Tag>
+ uint64_t packHandle(rx::core::Handle<Tag> handle) {
+@@ -236,20 +238,108 @@ void runAsyncImportComputePhase(std::shared_ptr<AsyncImportJob> job) {
+ }
+ 
+ void startAsyncImportComputePhase(std::shared_ptr<AsyncImportJob> job) {
+     if (job->cancelled.load(std::memory_order_acquire)) {
+         return;
+     }
+     rx::task::Scheduler* scheduler = job->scheduler;
+     scheduler->runOnWorkerThread([job = std::move(job)]() mutable { runAsyncImportComputePhase(std::move(job)); });
+ }
+ 
++// [Wine/CI SIGSEGV fix] Synchronous, teardown-time counterpart to
++// rollbackAsyncImportWhenSafe() above -- closes the one abandonment path
++// that function's own postToMain()-repost design cannot cover: nobody is
++// guaranteed to ever call pumpMain() again once a job has entered the
++// marshal/upload phase (>=1 real GPU resource already registered via
++// TextureCache::registerDecoded()/GeometryPool::uploadDeferred()) and its
++// owning Registry is being destroyed. registry.h's own "POOL/TEXTURES/
++// SCHEDULER LIFETIME" contract already REQUIRES `job->pool`/`job->textures`
++// to outlive the job (hence outlive Registry, which may still hold a live
++// job referencing them at its own destruction), so it is always safe for
++// ~Registry() to use them directly here -- this function does not depend
++// on anything ~Registry() was not already contractually guaranteed.
++//
++// Root cause this closes: if a job's `pending` (MarshalPendingImport) is
++// destroyed by ordinary C++ member-wise destruction -- e.g. because the
++// shared_ptr<AsyncImportJob> keeping it alive was captured inside a
++// postToMain()/runOnWorkerThread() closure that Scheduler::~Scheduler()
++// later drops unexecuted (scheduler.h's own documented "postToMain() work
++// still queued when pumpMain() is never called again is simply dropped"
++// behavior) -- NOTHING ever calls TextureCache::releaseUnpublished()/
++// GeometryPool::free() for whatever it already registered. The real
++// VkImage/VkBuffer stays "resident" inside TextureCache's/GeometryPool's
++// own bookkeeping, with its upload copy command possibly still sitting
++// RECORDED-but-not-yet-submitted (or submitted-but-not-yet-complete) on
++// Uploader's own batched command buffer. Whenever that texture/geometry
++// range is LATER destroyed by ordinary object teardown (TextureCache's own
++// pool_ member destructing, GeometryPool's blocks destructing) -- which,
++// in the exact fixture/member order this project's own async tests use,
++// happens BEFORE Uploader's destructor gets a chance to end/submit that
++// still-recording command buffer -- Uploader::~Uploader()'s own auto-flush
++// (upload.cpp) calls vkEndCommandBuffer() on a command buffer that still
++// references an already-destroyed VkImage: a real
++// VUID-vkEndCommandBuffer-commandBuffer-00059 validation error, observed
++// (CI run 32180630087, both the linux-native and windows-cross-zig/Wine
++// jobs) immediately followed by SIGSEGV as the driver processes the
++// corrupted command buffer state. This is a genuine PRODUCTION-code gap in
++// the async import pipeline's exception/lifetime safety, not a test-only
++// artifact: any host that tears down its Registry (for any reason -- a
++// thrown exception, an early return, an unrelated fatal error) while an
++// async import is genuinely mid-upload, without first explicitly calling
++// cancelImport() and then continuing to pumpMain() until the rollback is
++// confirmed safe, hits this same corruption. The two existing "destroy
++// while in flight" regression tests (async_import_test.cpp) never
++// exercised this because both use `textures == nullptr` -- their jobs
++// never leave the compute phase, so they never have anything registered
++// to roll back in the first place.
++//
++// Fix: block here (a destructor/teardown-only exception to D25's "poll,
++// never block" invariant on the LIVE async path -- the exact same
++// trade-off Device::~Device()'s own unconditional vkDeviceWaitIdle()
++// already makes, and the one buildFallbackTextures() already makes via its
++// own uploader_.wait(uploader_.flush()) call for this identical failure
++// signature, texture_cache.cpp) until every upload ticket this job's
++// `pending` issued is confirmed complete, THEN run the exact same
++// marshalGltfImportRollback() the live cancellation path uses. Bounded: if
++// the GPU genuinely never completes (a hang/device-loss class of failure,
++// not anything this fix can control), give up after a generous timeout and
++// deliberately LEAK `pending` rather than risk destroying a VkImage/
++// VkBuffer a still-incomplete command buffer might reference -- a resource
++// leak is always recoverable at process exit; a use-after-free is not.
++void drainAndRollbackAbandonedAsyncJob(const std::shared_ptr<AsyncImportJob>& job) {
++    if (!job->pending) {
++        return;  // still in the compute phase (or already finalized/rolled back) -- nothing GPU-side to release.
++    }
++    marshalGltfImportEnsureRollbackTicketed(job->textures, *job->pending);
++
++    constexpr auto kAbandonDrainTimeout = std::chrono::seconds(5);
++    const auto deadline = std::chrono::steady_clock::now() + kAbandonDrainTimeout;
++    bool safe = false;
++    while (std::chrono::steady_clock::now() < deadline) {
++        if (marshalGltfImportUploadsComplete(*job->pool, job->textures, *job->pending)) {
++            safe = true;
++            break;
++        }
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    }
++
++    if (!safe) {
++        RX_LOG_ERROR(
++            "rx_asset: Registry::~Registry(): an abandoned async import's upload ticket(s) did not complete within "
++            "{}s at teardown -- leaking its GPU resources rather than risk destroying a still-in-flight VkImage/"
++            "VkBuffer (a genuine GPU hang/device-loss condition, not something this rollback can safely resolve)",
++            kAbandonDrainTimeout.count());
++        return;
++    }
++    marshalGltfImportRollback(*job->pool, job->textures, std::move(job->pending));
++}
++
+ }  // namespace
+ 
+ Registry::Registry() {
+     fallbackMesh_ = meshes_.acquire(makeFallbackMeshAsset());
+     fallbackMaterial_ = materials_.acquire(makeFallbackMaterialAsset());
+     fallbackTexture_ = textures_.acquire(makeFallbackTextureAsset());
+ }
+ 
+ Registry::~Registry() {
+     // [Phase 4 Stage 1 Task 15] Teardown-with-import-in-flight: defined
+@@ -261,22 +351,37 @@ Registry::~Registry() {
+     // `cancelled == true` at its very first check and never touches this
+     // Registry again -- `registry = nullptr` is defense-in-depth on top
+     // of that, not the primary mechanism (see AsyncImportJob's own
+     // pollAsyncImportUploads()/finishAsyncImportCompute() call sites,
+     // which check cancelled first, before ever dereferencing `registry`).
+     // No callback fires for any of these jobs (the SAME single documented
+     // outcome as an explicit cancelImport() call -- registry.h's own
+     // class comment). Each job's own shared_ptr keeps it alive for as
+     // long as any in-flight closure still references it, independent of
+     // this Registry's own destruction completing first.
++    //
++    // [Wine/CI SIGSEGV fix] drainAndRollbackAbandonedAsyncJob() (above)
++    // additionally, and synchronously, releases any REAL GPU resource a
++    // job already registered (>=1 texture/geometry range, i.e. it has
++    // reached the marshal/upload phase) BEFORE this loop returns --
++    // closing the gap where cancelling alone left that job's `pending`
++    // to be destroyed later by ordinary C++ teardown (no `pumpMain()`
++    // call ever guaranteed to run again once this Registry is gone),
++    // which never releases GPU-owned handles through the safe,
++    // ticket-aware path and corrupts Vulkan object lifetime (see that
++    // function's own comment for the full mechanism and the CI evidence
++    // this closes). A job still purely in the compute phase has
++    // `pending == nullptr` here and this call is a no-op for it, exactly
++    // as before this fix.
+     for (auto& [id, job] : asyncJobs_) {
+         job->cancelled.store(true, std::memory_order_release);
++        drainAndRollbackAbandonedAsyncJob(job);
+         job->registry = nullptr;
+     }
+     asyncJobs_.clear();
+ }
+ 
+ void Registry::reapFinishedAsyncJobs() {
+     for (auto it = asyncJobs_.begin(); it != asyncJobs_.end();) {
+         const ImportStage stage = it->second->stage.load(std::memory_order_acquire);
+         const bool cancelled = it->second->cancelled.load(std::memory_order_acquire);
+         const bool terminal = stage == ImportStage::Done || stage == ImportStage::Failed || cancelled;
+diff --git a/src/rx_asset/tests/async_import_test.cpp b/src/rx_asset/tests/async_import_test.cpp
+index c5d70f3..e3432bf 100644
+--- a/src/rx_asset/tests/async_import_test.cpp
++++ b/src/rx_asset/tests/async_import_test.cpp
+@@ -699,33 +699,120 @@ TEST_CASE("importGltfAsync: WALL-CLOCK GATE -- deliberately slow decode + a real
+     const size_t textureWaitCallsBefore = fixture->textures->waitCallCountForTesting();
+     // [Fix round 1, IMPORTANT item] Direct ring/pool no-exhaustion check --
+     // a fresh pool starts at zero blocks/zero bytes used; the assertion
+     // after the loop below is that the import's own geometry upload
+     // succeeded WITHIN a single block's capacity (real progress, no silent
+     // stall/overflow), not that the pool never grows at all.
+     const PoolStats poolStatsBefore = fixture->pool->stats();
+     REQUIRE(poolStatsBefore.blockCount == 0);
+     REQUIRE(poolStatsBefore.vertexBytesUsed == 0);
+ 
++    // [RC6 recalibration, coordinator-ruled, CI incident 32180630087 --
++    // see wine-segfault-fix-report.md's own addendum for the full
++    // measurement writeup this comment summarizes] The CI-tier threshold
++    // below used to be a fixed 10ms constant, calibrated against fast-
++    // dev-hardware noise. CI's own 2-core + single-thread-lavapipe
++    // environment legitimately reached 12.6ms on a single real texture
++    // registration during the incident this citation names -- a real,
++    // slow-but-correct call, not the pre-D25 blocking-defect class RC6's
++    // stall detector exists to catch. A fixed number recalibrated against
++    // this one incident would still be exactly as fragile the next time
++    // CI's own throughput drifts, so this tier is now SELF-CALIBRATING
++    // instead: it times ONE real TextureCache::registerDecoded() call,
++    // right here, against a synthetic payload sized like this fixture's
++    // own real textures (2048x2048 RGBA8 -- every one of DamagedHelmet's
++    // 5 JPGs decodes to exactly this size; the calibration op's cost is
++    // otherwise dominated by payload-size-dependent memcpy/copy-recording
++    // cost, not fixed per-call overhead -- an earlier 4x4 probe measured
++    // only that fixed overhead and was two orders of magnitude too small
++    // to be a representative baseline, see the report), on THIS machine,
++    // THIS run, immediately before the real gate below -- then derives
++    // the CI-tier ceiling as a multiple of that live measurement, so it
++    // scales automatically with whatever hardware this test happens to
++    // run on instead of encoding one machine's snapshot forever.
++    //
++    // MULTIPLIER DERIVATION (measured, not guessed -- 3 measurement sets,
++    // 22 total runs, constrained repro: taskset -c 0,1 + LP_NUM_THREADS=1
++    // + forced lavapipe, matching CI's own 2-vCPU/software-rasterizer
++    // class; full per-run numbers in wine-segfault-fix-report.md's own
++    // addendum):
++    //   1. LEGIT max (this exact gate, 22 runs across two batches -- 12
++    //      WALL-CLOCK-only + 10 full-suite): in-loop max pumpMain()
++    //      duration 9166-10288us (worst observed: 10288us).
++    //   2. CALIBRATION baseline (this exact probe, same 22 runs):
++    //      5634-6202us. Worst-case per-run ratio (legit max / calibration,
++    //      SAME run): 1.771x -- i.e. a real single-texture registration on
++    //      this class of hardware can cost up to ~1.77x this calibration
++    //      op.
++    //   3. BLOCKING-DEFECT signature (scratch worktree, pre-RC6 whole-
++    //      batch shape reintroduced -- the same revert shape as Task
++    //      11/15's own evidence: marshalGltfImportPrepareStep()'s early
++    //      `return true` after ONE texture slot removed, so all 5 real
++    //      textures register in a single call -- 5 runs): 39399-40812us
++    //      (worst case toward a tight margin: 39399us, the SMALLEST
++    //      observed).
++    //   Total available separation (blocking / legit) on this hardware
++    //   class is ~3.8-4.0x (39399/10288 = 3.83) -- NOT the order-of-
++    //   magnitude RC6's original prose assumed, so a strict >=2x margin on
++    //   BOTH sides simultaneously is only barely mathematically possible
++    //   (2x * 2x = 4x) and leaves zero slack against the worst-case
++    //   numbers above -- this is the coordinator-anticipated "bands
++    //   overlap" outcome for a naive FIXED threshold in that band, which
++    //   is exactly why this tier is self-calibrating rather than a
++    //   constant. Multiplier = 4 (of the live calibration measurement)
++    //   biases toward legit-side safety (avoiding a false-positive CI-red
++    //   is the whole reason this recalibration exists) while keeping a
++    //   real, meaningful margin toward the defect signature:
++    //     - vs. legit max: 4 / 1.771(worst-case ratio) = 2.26x margin --
++    //       clears the >=2x bar with room to spare.
++    //     - vs. blocking signature: on this hardware, 4x calibration
++    //       (~23-25ms) sits ~1.6-1.7x below the 39.4-40.8ms blocking
++    //       signature -- short of a full 2x margin (the ~3.8-4x total
++    //       separation does not allow both margins to be a full 2x with
++    //       any slack), but still a clean, unambiguous fail for the
++    //       defect class this tier exists to catch, not a coin flip.
++    //   A floor of kLocalBudget below prevents a degenerate near-zero
++    //   threshold if calibration ever reads implausibly small.
++    constexpr int64_t kCiStallMultiplier = 4;
++
++    TextureDecodeResult calibrationPayload;
++    calibrationPayload.outcome = TextureDecodeResult::Outcome::Ready;
++    calibrationPayload.format = VK_FORMAT_R8G8B8A8_UNORM;
++    calibrationPayload.width = 2048;
++    calibrationPayload.height = 2048;
++    DecodedTextureLevel calibrationLevel0;
++    calibrationLevel0.level = 0;
++    calibrationLevel0.width = 2048;
++    calibrationLevel0.height = 2048;
++    calibrationLevel0.bytes.assign(static_cast<size_t>(2048) * 2048 * 4, std::byte{0xFF});
++    calibrationPayload.levels.push_back(std::move(calibrationLevel0));
++    const auto calibStart = std::chrono::steady_clock::now();
++    TextureHandle calibrationHandle = fixture->textures->registerDecoded(calibrationPayload, "wallclock-gate-calibration-probe");
++    const auto calibDuration =
++        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - calibStart);
++    REQUIRE(calibrationHandle.isValid());
++    MESSAGE("wall-clock gate: calibration probe (2048x2048 synthetic registerDecoded()) took ", calibDuration.count(),
++            " us on this run -- CI-tier threshold derived as ", kCiStallMultiplier, "x this value");
++
+     Registry registry;
+     ImportResult result;
+     bool done = false;
+     AsyncImportHandle handle = registry.importGltfAsync(
+         documentBytes, source, *fixture->pool, *scheduler, fixture->textures.get(),
+         [&](ImportResult r) {
+             result = std::move(r);
+             done = true;
+         });
+     REQUIRE(handle.isValid());
+ 
+-    constexpr auto kLocalBudget = std::chrono::microseconds(2000);   // 2 ms, published/trend-tracked
+-    constexpr auto kCiStallDetector = std::chrono::microseconds(10000);  // 10 ms, CI-blocking (RC6)
++    constexpr auto kLocalBudget = std::chrono::microseconds(2000);   // 2 ms, published/trend-tracked -- unchanged
++    const auto kCiStallDetector = std::max(kLocalBudget, kCiStallMultiplier * calibDuration);  // self-calibrated (see above)
+ 
+     uint64_t framesWhileInFlight = 0;
+     std::chrono::microseconds maxPumpDuration{0};
+     uint32_t overLocalBudgetCount = 0;
+ 
+     const auto testDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+     while (!done) {
+         ImportProgress before = registry.importProgress(handle);
+         const bool wasInFlight = before.stage != ImportStage::Done && before.stage != ImportStage::Failed;
+ 
+@@ -734,50 +821,54 @@ TEST_CASE("importGltfAsync: WALL-CLOCK GATE -- deliberately slow decode + a real
+         const auto pumpDuration =
+             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - pumpStart);
+ 
+         if (wasInFlight) {
+             ++framesWhileInFlight;
+         }
+         maxPumpDuration = std::max(maxPumpDuration, pumpDuration);
+         if (pumpDuration > kLocalBudget) {
+             ++overLocalBudgetCount;
+         }
+-        // The CI stall-detector tier (RC6): this IS asserted hard, every
+-        // single call -- a defect here (e.g. a reintroduced blocking
+-        // wait()) would show up as tens of milliseconds, an order of
+-        // magnitude above this ceiling, per RC6's own reasoning.
++        // The CI stall-detector tier (RC6, self-calibrated -- see this
++        // function's own comment above kCiStallDetector's definition):
++        // this IS asserted hard, every single call -- a defect here (e.g.
++        // a reintroduced blocking wait()) would show up as several times
++        // the live per-run calibration baseline, clearing this threshold
++        // with room to spare (see the multiplier-derivation comment).
+         REQUIRE(pumpDuration < kCiStallDetector);
+ 
+         REQUIRE(std::chrono::steady_clock::now() < testDeadline);
+     }
+ 
+     REQUIRE(done);
+     REQUIRE(result.ok());
+     // >= 300 rendered frames while genuinely in flight -- proves real
+     // overlap (the import did not simply complete on the first pump).
+     CHECK(framesWhileInFlight >= 300);
+ 
+     // Published number [D18/RC6]: the 2ms figure is a TREND metric,
+     // explicitly "never CI-blocking" (D18's own wording, amended by RC6
+-    // only for the SEPARATE 10ms stall-detector tier asserted above via
+-    // REQUIRE) -- reported via MESSAGE only, deliberately never a CHECK/
+-    // REQUIRE, so a real but small overage (this task's own dev-machine
+-    // run: DamagedHelmet's largest single JPEG texture, ~1.3MB decoded to
+-    // RGBA8, occasionally costs a few ms of real memcpy+copy-recording
+-    // time for ONE texture's own registerDecoded() step -- see
+-    // task-15-report.md's own performance-numbers section) is visible in
+-    // the log without flaking CI, exactly matching D18's own posture for
+-    // every other wall-clock number in this codebase.
++    // only for the SEPARATE, now self-calibrated stall-detector tier
++    // asserted above via REQUIRE) -- reported via MESSAGE only,
++    // deliberately never a CHECK/REQUIRE, so a real but small overage
++    // (this task's own dev-machine run: DamagedHelmet's largest single
++    // JPEG texture, ~1.3MB decoded to RGBA8, occasionally costs a few ms
++    // of real memcpy+copy-recording time for ONE texture's own
++    // registerDecoded() step -- see task-15-report.md's own
++    // performance-numbers section) is visible in the log without flaking
++    // CI, exactly matching D18's own posture for every other wall-clock
++    // number in this codebase.
+     MESSAGE("wall-clock gate: max single pumpMain() call = ", maxPumpDuration.count(), " us across ",
+             framesWhileInFlight, " in-flight frame(s); ", overLocalBudgetCount,
+             " call(s) exceeded the 2ms local/published budget (trend-tracked, never CI-blocking per D18/RC6) -- "
+-            "hard CI stall-detector ceiling is 10ms (REQUIRE'd above, every call)");
++            "self-calibrated CI-tier ceiling this run was ", kCiStallDetector.count(),
++            " us (REQUIRE'd above, every call, see kCiStallDetector's own comment)");
+ 
+     // [Fix round 1, IMPORTANT item] D25 direct proof, not just a wall-clock
+     // proxy: the async path never called Uploader::wait() through EITHER
+     // GeometryPool or TextureCache -- both counters must be unchanged from
+     // their pre-import baseline.
+     CHECK(fixture->pool->waitCallCountForTesting() == poolWaitCallsBefore);
+     CHECK(fixture->textures->waitCallCountForTesting() == textureWaitCallsBefore);
+ 
+     // [Fix round 1, IMPORTANT item] Direct ring/pool no-exhaustion check:
+     // the import's combined geometry landed in exactly one block, used
+@@ -1248,10 +1339,148 @@ TEST_CASE("importGltfAsync: destroying the WHOLE fixture (Scheduler included) wh
+         // task was doing has actually finished, observing `cancelled`
+         // already true and touching neither the (already-destroyed)
+         // Registry nor the pool/textures pointers it still carries (both
+         // of which remain valid a while longer, until `fixture` itself
+         // unwinds last) -- safe regardless of which of the two teardown
+         // orderings (Registry-first, as here, or Scheduler-first, the
+         // previous TEST_CASE) a caller happens to use.
+     }
+     CHECK(true);  // reaching here at all (no crash/hang) is the assertion.
+ }
++
++// ---------------------------------------------------------------------
++// [Wine/CI SIGSEGV regression, CI run 32180630087] Abandoning a job that
++// has already reached the MARSHAL/UPLOAD phase (>=1 real GPU resource
++// registered), with NO explicit cancelImport() ever called and no further
++// pumpMain() call -- registry.cpp's own ~Registry() must roll it back
++// synchronously (drainAndRollbackAbandonedAsyncJob()), not merely flag it
++// cancelled and walk away. The two teardown-race tests above never
++// exercised this: both pass textures == nullptr, so their jobs never
++// leave the compute phase and never have anything GPU-side to roll back.
++// This is exactly the state the WALL-CLOCK GATE test's own CI stall-
++// detector REQUIRE (line 748) landed in when it fired on CI's slower
++// hardware -- doctest's exception unwind skipped straight to local
++// destructors mid-upload, which is indistinguishable, from this
++// production code's own point of view, from any other reason a host
++// application might stop pumping mid-import (an unrelated fatal error, an
++// early shutdown path). Before the fix: a real
++// VUID-vkEndCommandBuffer-commandBuffer-00059 validation error followed by
++// SIGSEGV. After the fix: clean teardown, zero validation errors.
++// ---------------------------------------------------------------------
++
++TEST_CASE("importGltfAsync: abandoning a job genuinely mid-UPLOAD (>=1 real GPU resource already registered, no "
++          "explicit cancelImport(), no further pumpMain()) does not crash and raises no validation errors "
++          "[Wine/CI SIGSEGV regression, CI run 32180630087]") {
++    if (!std::filesystem::exists(damagedHelmetPath())) {
++        MESSAGE("DamagedHelmet not fetched (run tools/fetch_assets.sh) -- skipping the abandon-mid-upload "
++                "regression test");
++        return;
++    }
++    auto fixture = makeFixture("async_abandon_mid_upload");
++    if (!fixture) {
++        return;
++    }
++    attachPool(*fixture);
++    // A real TextureCache is load-bearing here -- same reason as the
++    // WALL-CLOCK GATE and cancel-mid-upload tests above: this is what
++    // actually gets this job into the marshal/upload phase with a real
++    // VkImage registered, the exact state the root cause needs to exist.
++    attachTextureCache(*fixture);
++    auto scheduler = rx::task::Scheduler::create(4);
++    REQUIRE(scheduler != nullptr);
++
++    SlowRecordingByteSource source(std::filesystem::path(damagedHelmetPath()).parent_path(),
++                                    std::chrono::milliseconds(60));
++    std::vector<std::byte> documentBytes = readFileBytes(damagedHelmetPath());
++
++    // Registry wrapped in optional so it can be destroyed explicitly,
++    // in-scope, BEFORE `scheduler` -- letting this test check
++    // `fixture->context.hasValidationErrors()` afterward, while `fixture`
++    // (and its Context) is still alive, exactly like every other test in
++    // this file does.
++    std::optional<Registry> registryOpt{std::in_place};
++    Registry& registry = *registryOpt;
++    const size_t liveTexturesBefore = fixture->textures->liveTextureCountForTesting();
++
++    bool fired = false;
++    AsyncImportHandle handle = registry.importGltfAsync(documentBytes, source, *fixture->pool, *scheduler,
++                                                            fixture->textures.get(), [&](ImportResult) { fired = true; });
++    REQUIRE(handle.isValid());
++
++    // Pump until AT LEAST ONE real texture slot has been registered -- a
++    // genuine GPU resource (a real VkImage with an upload copy command
++    // already recorded via TextureCache::registerDecoded()) -- the same
++    // observable signal the checkerboard-safety test above uses.
++    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
++    bool oneRegistered = false;
++    while (std::chrono::steady_clock::now() < deadline) {
++        scheduler->pumpMain();
++        if (fixture->textures->liveTextureCountForTesting() > liveTexturesBefore) {
++            oneRegistered = true;
++            break;
++        }
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    }
++    REQUIRE(oneRegistered);
++    REQUIRE_FALSE(fired);  // must not have finalized before this test caught the mid-upload window
++
++    // Deliberately NO cancelImport() call -- mirrors the WALL-CLOCK GATE
++    // test's own REQUIRE-failure unwind: the job is abandoned genuinely
++    // mid-upload, with nothing more ever pumping it. Registry destructs
++    // first (registry.cpp's own ~Registry() -- this is where
++    // drainAndRollbackAbandonedAsyncJob() now runs, synchronously, while
++    // fixture->pool/fixture->textures are still fully valid), then
++    // Scheduler (drains/joins its own threads; any still-queued closure
++    // referencing this job is simply dropped, now safe because Registry's
++    // destructor already released the job's real GPU resources).
++    registryOpt.reset();
++    scheduler.reset();
++
++    // Reclaim the deferred-destroy texture drainAndRollbackAbandonedAsyncJob()'s
++    // own releaseUnpublished() call handed to the DeletionQueue -- the SAME
++    // cleanup step the explicit cancel-mid-upload rollback test above
++    // performs after its own rollback (D24's own eviction contract: a
++    // caller must eventually flush a non-empty DeletionQueue; Registry has
++    // no DeletionQueue reference of its own to do this automatically, by
++    // design -- see that class's own comment).
++    fixture->deletionQueue->onFrameFenceSignaled(0);
++
++    CHECK_FALSE(fired);
++
++    // [Root-cause-accurate check] The corrupting event this regression
++    // targets -- Uploader::~Uploader()'s own auto-flush calling
++    // vkEndCommandBuffer() on a command buffer whose bound VkImage was
++    // ALREADY destroyed -- only happens once BOTH (a) the abandoned
++    // texture's VkImage has been destroyed (TextureCache's own pool_
++    // member unconditionally destroys every still-"resident" entry when
++    // TextureCache itself is destroyed) AND (b) Uploader's own recording
++    // command buffer (which still references that image, if it was never
++    // safely released) gets flushed/ended afterward. Reproducing that
++    // exact sequence explicitly -- rather than only implicitly, via
++    // `fixture`'s natural end-of-scope teardown -- keeps `fixture->context`
++    // alive afterward so this test can actually OBSERVE the result via
++    // hasValidationErrors(), instead of only proving "the process didn't
++    // crash" (empirically, revert-testing this fix: native lavapipe on
++    // this dev machine tolerates the resulting corrupted command-buffer
++    // state without crashing -- only CI's own environment, both the
++    // linux-native and windows-cross-zig/Wine jobs, actually segfaults on
++    // it, CI run 32180630087 -- so a bare "did it crash" check is too weak
++    // a discriminator locally; the validation error itself is the
++    // reliable, portable signal both before and after the fix).
++    //
++    // Before this fix: `textures.reset()` destroys a TextureCache that
++    // still holds the abandoned texture as a live, never-released entry
++    // (nothing ever called releaseUnpublished() for it) -- destroying it
++    // here, then flushing Uploader explicitly right after, reproduces
++    // CI's exact VUID-vkEndCommandBuffer-commandBuffer-00059 validation
++    // error deterministically (confirmed via this fix's own revert-test:
++    // 3/3 runs against the pre-fix registry.cpp). After this fix:
++    // Registry::~Registry() (via drainAndRollbackAbandonedAsyncJob(),
++    // registry.cpp) already safely released it through
++    // TextureCache::releaseUnpublished() + the DeletionQueue's own
++    // fence-gated reclaim (the onFrameFenceSignaled() call above), so by
++    // the time `textures.reset()` runs here, there is nothing left to
++    // corrupt.
++    fixture->textures.reset();
++    fixture->uploader.flush();
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
