@@ -300,3 +300,125 @@ Zero new sanitizer defects from this fix.
   halves together), but no dedicated regression test isolates the geometry-only case specifically, since the
   CI evidence (§2.2) showed the crash triggering on the very first texture slot, before geometry was ever
   reached. The fix's coverage is not narrower than the bug, only the new test's specific reproduction path is.
+
+## 9. Addendum: WALL-CLOCK GATE CI-tier threshold recalibration (coordinator-ruled)
+
+**Why this addendum exists.** §8's concern (1) above was correctly escalated by the coordinator before this
+task closed: with the SIGSEGV fixed, the WALL-CLOCK GATE's own 10ms CI-stall-detector `REQUIRE`
+(`async_import_test.cpp:748` at the time of the original crash) would now fail as an ordinary assertion on the
+next CI run instead of segfaulting — CI stays red either way. RC6's own two-tier design intends the CI tier as
+a stall *detector* whose threshold sits an order of magnitude above legitimate per-environment noise and below
+the defect-class signature (a reintroduced pre-D25 blocking flush); 10ms was calibrated against fast-dev-
+hardware noise and CI's real 2-core/single-thread-lavapipe environment legitimately reached 12.6ms once
+(§2.2). This addendum closes that gap via the coordinator's required measure-don't-guess procedure.
+
+### 9.1 Measurement 1 — legitimate max, constrained repro
+
+`rx_asset_gltf_gpu_tests --test-case="*WALL-CLOCK*"`, `taskset -c 0,1` + `LP_NUM_THREADS=1` + forced lavapipe
+(`VK_ICD_FILENAMES`), 22 total runs across two batches (temporarily relaxed the CI-tier `REQUIRE` to `CHECK` so
+a slow run completes and reports its true max instead of aborting early — reverted before shipping):
+
+- Batch A (12 runs, WALL-CLOCK-only filter, calibration probe present): in-loop max pumpMain() 9166–9856 µs.
+- Batch B (10 runs, full 56-test suite, same constraint): in-loop max pumpMain() 9479–10288 µs.
+
+**Legit max across all 22 runs: 10288 µs** (Batch B run 3).
+
+### 9.2 Measurement 2 — calibration-probe baseline, same runs
+
+Same 22 runs, timing ONE `TextureCache::registerDecoded()` call against a synthetic 2048×2048 RGBA8 payload
+(sized like DamagedHelmet's own real textures — every one of its 5 JPGs decodes to exactly this size; an
+earlier attempt at a tiny 4×4 synthetic payload measured only fixed per-call overhead, 53–93 µs, two orders of
+magnitude too small to be representative, and was discarded before this measurement), taken immediately before
+the real import starts:
+
+**Calibration baseline range: 5634–6202 µs.** Worst-case per-run ratio (legit max ÷ calibration, same run):
+**1.771×** (Batch B run 10: 9993/5642 — the single worst pairing across all 22 runs was actually Batch B run 3
+at legit=10288/calib=5972=1.723; the 1.771 cited in-code is the true max over all 22 per-run ratios, from run
+10 of Batch B).
+
+### 9.3 Measurement 3 — blocking-defect signature, scratch worktree
+
+Per the coordinator's explicit procedure: `git worktree add` at the fix's own HEAD (`9bff3cf`), pre-RC6
+whole-batch shape reintroduced in `import_gltf.cpp`'s `marshalGltfImportPrepareStep()` — the early `return true`
+after registering exactly one texture slot (the RC6 fix itself, task-15) removed, so all 5 real DamagedHelmet
+textures register inside a single call again, the same revert shape Task 15's own report cites for its
+"registering all 5 textures in one synchronous call measured 15.8ms" evidence. Same constrained repro, 5 runs:
+
+**Blocking signature range: 39399–40812 µs.** Worst case toward a tight margin (smallest observed): 39399 µs.
+
+Worktree removed after measurement (`git worktree remove`); no residue in the main tree.
+
+### 9.4 Band computation and the self-calibration decision
+
+Total available separation on this hardware class: 39399 / 10288 ≈ **3.83×** — not the order-of-magnitude
+RC6's original prose assumed. A strict ≥2× margin on both sides simultaneously requires ≥4× total separation
+(2×2), which 3.83× does not comfortably clear, and using a FIXED threshold computed from
+`(legit_max × 2, blocking_min ÷ 2)` produces `(20576, 19700)` — **the lower bound exceeds the upper bound: the
+bands overlap**, exactly the coordinator-anticipated "unexpected" outcome. Per the coordinator's own ruling,
+no fixed number was picked; self-calibration was implemented instead.
+
+**Design:** `async_import_test.cpp`'s WALL-CLOCK GATE now measures a live calibration op (§9.2) at test start,
+then sets `kCiStallDetector = max(kLocalBudget, 4 × calibDuration)` — the CI tier scales with whatever
+hardware/environment the test happens to run on, rather than encoding one machine's snapshot. Multiplier = 4,
+chosen to bias toward legit-side safety (avoiding a false-positive CI-red is the entire reason for this
+addendum) while keeping a real margin toward the defect signature:
+
+- vs. legit max: `4 ÷ 1.771 = 2.26×` margin — clears the coordinator's ≥2× bar.
+- vs. blocking signature: `4×` calibration (~23–25ms typical) sits ~1.6–1.7× below the 39.4–40.8ms blocking
+  signature — short of a full 2× margin (the ~3.8× total separation does not allow both margins to be a full
+  2× with zero slack), but still a clean, unambiguous, always-observed fail for the defect class this tier
+  exists to catch (§9.5), not a coin flip.
+
+The 2ms local/published trend tier (`kLocalBudget`) is unchanged, per instruction.
+
+### 9.5 Verification, both directions
+
+**≥10 clean runs of the full suite, constrained (taskset -c 0,1 + LP_NUM_THREADS=1 + lavapipe), new threshold**
+(10 runs shown; also the same 22 runs from §9.1/9.2 all passed at their own live-calibrated threshold):
+
+```
+Run 1:  calibration=5956us, threshold(4x)≈23824us, gate max=9552us   -> 56/56 SUCCESS
+Run 2:  calibration=5943us, threshold(4x)≈23772us, gate max=9619us   -> 56/56 SUCCESS
+Run 3:  calibration=5972us, threshold(4x)≈23888us, gate max=10288us  -> 56/56 SUCCESS
+Run 4:  calibration=6202us, threshold(4x)≈24808us, gate max=9841us   -> 56/56 SUCCESS
+Run 5:  calibration=5984us, threshold(4x)≈23936us, gate max=9552us   -> 56/56 SUCCESS
+Run 6:  calibration=5798us, threshold(4x)≈23192us, gate max=9479us   -> 56/56 SUCCESS
+Run 7:  calibration=5761us, threshold(4x)≈23044us, gate max=9625us   -> 56/56 SUCCESS
+Run 8:  calibration=5696us, threshold(4x)≈22784us, gate max=9708us   -> 56/56 SUCCESS
+Run 9:  calibration=5789us, threshold(4x)≈23156us, gate max=9796us   -> 56/56 SUCCESS
+Run 10: calibration=5642us, threshold(4x)≈22568us, gate max=9993us   -> 56/56 SUCCESS
+```
+10/10 clean, every run's own live threshold comfortably clears its own run's gate max (all 56 test cases pass
+each time, not just the WALL-CLOCK GATE).
+
+**Blocking-revert still fails the gate at the new threshold** (same scratch worktree, 3 runs):
+
+```
+Run 1: calibration=5761us, threshold(4x)≈23044us -> FATAL ERROR: REQUIRE( pumpDuration < kCiStallDetector ) is NOT correct!
+Run 2: calibration=6019us, threshold(4x)≈24076us -> FATAL ERROR: REQUIRE( pumpDuration < kCiStallDetector ) is NOT correct!
+Run 3: calibration=5745us, threshold(4x)≈22980us -> FATAL ERROR: REQUIRE( pumpDuration < kCiStallDetector ) is NOT correct!
+```
+3/3 deterministic fail — the self-calibrated gate still reliably catches the blocking-defect class.
+
+### 9.6 Final-commit re-verification (unconstrained)
+
+Re-run once more at the final commit, since the threshold change touches the same test file as the earlier
+fix:
+
+- **Full unconstrained `rx_asset_gltf_gpu_tests --validate`:** 56/56 (part of the full-suite runs below).
+- **Full serial `ctest --preset linux-native --output-on-failure`:** 100% tests passed, 20/20, 54.18s total.
+- **`cmake --build --preset windows-cross-zig` (full):** clean.
+- **`xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample' --output-on-failure`
+  (CI's exact Wine invocation):** 100% tests passed, 10/10, including `rx_asset_gltf_gpu_tests` (43.50s, the
+  WALL-CLOCK GATE included) and the two other named Wine binaries (`rx_task_tests.exe`, `rx_asset_gltf_tests.exe`),
+  126.75s total.
+
+### 9.7 Files changed (this addendum)
+
+- `src/rx_asset/tests/async_import_test.cpp` — WALL-CLOCK GATE's CI-tier threshold: fixed 10ms constant →
+  self-calibrated `max(2ms, 4 × live calibration probe)`, plus the calibration probe itself and the
+  MULTIPLIER DERIVATION comment documenting §9.1–9.4 in place at the definition site.
+- This report (§9, this addendum).
+
+No `rx_task`/`rx_rhi_vk` changes. No plan/spec/ledger document touched. Scratch worktree used for §9.3 was
+removed after measurement; nothing from it was committed.

@@ -706,6 +706,93 @@ TEST_CASE("importGltfAsync: WALL-CLOCK GATE -- deliberately slow decode + a real
     REQUIRE(poolStatsBefore.blockCount == 0);
     REQUIRE(poolStatsBefore.vertexBytesUsed == 0);
 
+    // [RC6 recalibration, coordinator-ruled, CI incident 32180630087 --
+    // see wine-segfault-fix-report.md's own addendum for the full
+    // measurement writeup this comment summarizes] The CI-tier threshold
+    // below used to be a fixed 10ms constant, calibrated against fast-
+    // dev-hardware noise. CI's own 2-core + single-thread-lavapipe
+    // environment legitimately reached 12.6ms on a single real texture
+    // registration during the incident this citation names -- a real,
+    // slow-but-correct call, not the pre-D25 blocking-defect class RC6's
+    // stall detector exists to catch. A fixed number recalibrated against
+    // this one incident would still be exactly as fragile the next time
+    // CI's own throughput drifts, so this tier is now SELF-CALIBRATING
+    // instead: it times ONE real TextureCache::registerDecoded() call,
+    // right here, against a synthetic payload sized like this fixture's
+    // own real textures (2048x2048 RGBA8 -- every one of DamagedHelmet's
+    // 5 JPGs decodes to exactly this size; the calibration op's cost is
+    // otherwise dominated by payload-size-dependent memcpy/copy-recording
+    // cost, not fixed per-call overhead -- an earlier 4x4 probe measured
+    // only that fixed overhead and was two orders of magnitude too small
+    // to be a representative baseline, see the report), on THIS machine,
+    // THIS run, immediately before the real gate below -- then derives
+    // the CI-tier ceiling as a multiple of that live measurement, so it
+    // scales automatically with whatever hardware this test happens to
+    // run on instead of encoding one machine's snapshot forever.
+    //
+    // MULTIPLIER DERIVATION (measured, not guessed -- 3 measurement sets,
+    // 22 total runs, constrained repro: taskset -c 0,1 + LP_NUM_THREADS=1
+    // + forced lavapipe, matching CI's own 2-vCPU/software-rasterizer
+    // class; full per-run numbers in wine-segfault-fix-report.md's own
+    // addendum):
+    //   1. LEGIT max (this exact gate, 22 runs across two batches -- 12
+    //      WALL-CLOCK-only + 10 full-suite): in-loop max pumpMain()
+    //      duration 9166-10288us (worst observed: 10288us).
+    //   2. CALIBRATION baseline (this exact probe, same 22 runs):
+    //      5634-6202us. Worst-case per-run ratio (legit max / calibration,
+    //      SAME run): 1.771x -- i.e. a real single-texture registration on
+    //      this class of hardware can cost up to ~1.77x this calibration
+    //      op.
+    //   3. BLOCKING-DEFECT signature (scratch worktree, pre-RC6 whole-
+    //      batch shape reintroduced -- the same revert shape as Task
+    //      11/15's own evidence: marshalGltfImportPrepareStep()'s early
+    //      `return true` after ONE texture slot removed, so all 5 real
+    //      textures register in a single call -- 5 runs): 39399-40812us
+    //      (worst case toward a tight margin: 39399us, the SMALLEST
+    //      observed).
+    //   Total available separation (blocking / legit) on this hardware
+    //   class is ~3.8-4.0x (39399/10288 = 3.83) -- NOT the order-of-
+    //   magnitude RC6's original prose assumed, so a strict >=2x margin on
+    //   BOTH sides simultaneously is only barely mathematically possible
+    //   (2x * 2x = 4x) and leaves zero slack against the worst-case
+    //   numbers above -- this is the coordinator-anticipated "bands
+    //   overlap" outcome for a naive FIXED threshold in that band, which
+    //   is exactly why this tier is self-calibrating rather than a
+    //   constant. Multiplier = 4 (of the live calibration measurement)
+    //   biases toward legit-side safety (avoiding a false-positive CI-red
+    //   is the whole reason this recalibration exists) while keeping a
+    //   real, meaningful margin toward the defect signature:
+    //     - vs. legit max: 4 / 1.771(worst-case ratio) = 2.26x margin --
+    //       clears the >=2x bar with room to spare.
+    //     - vs. blocking signature: on this hardware, 4x calibration
+    //       (~23-25ms) sits ~1.6-1.7x below the 39.4-40.8ms blocking
+    //       signature -- short of a full 2x margin (the ~3.8-4x total
+    //       separation does not allow both margins to be a full 2x with
+    //       any slack), but still a clean, unambiguous fail for the
+    //       defect class this tier exists to catch, not a coin flip.
+    //   A floor of kLocalBudget below prevents a degenerate near-zero
+    //   threshold if calibration ever reads implausibly small.
+    constexpr int64_t kCiStallMultiplier = 4;
+
+    TextureDecodeResult calibrationPayload;
+    calibrationPayload.outcome = TextureDecodeResult::Outcome::Ready;
+    calibrationPayload.format = VK_FORMAT_R8G8B8A8_UNORM;
+    calibrationPayload.width = 2048;
+    calibrationPayload.height = 2048;
+    DecodedTextureLevel calibrationLevel0;
+    calibrationLevel0.level = 0;
+    calibrationLevel0.width = 2048;
+    calibrationLevel0.height = 2048;
+    calibrationLevel0.bytes.assign(static_cast<size_t>(2048) * 2048 * 4, std::byte{0xFF});
+    calibrationPayload.levels.push_back(std::move(calibrationLevel0));
+    const auto calibStart = std::chrono::steady_clock::now();
+    TextureHandle calibrationHandle = fixture->textures->registerDecoded(calibrationPayload, "wallclock-gate-calibration-probe");
+    const auto calibDuration =
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - calibStart);
+    REQUIRE(calibrationHandle.isValid());
+    MESSAGE("wall-clock gate: calibration probe (2048x2048 synthetic registerDecoded()) took ", calibDuration.count(),
+            " us on this run -- CI-tier threshold derived as ", kCiStallMultiplier, "x this value");
+
     Registry registry;
     ImportResult result;
     bool done = false;
@@ -717,8 +804,8 @@ TEST_CASE("importGltfAsync: WALL-CLOCK GATE -- deliberately slow decode + a real
         });
     REQUIRE(handle.isValid());
 
-    constexpr auto kLocalBudget = std::chrono::microseconds(2000);   // 2 ms, published/trend-tracked
-    constexpr auto kCiStallDetector = std::chrono::microseconds(10000);  // 10 ms, CI-blocking (RC6)
+    constexpr auto kLocalBudget = std::chrono::microseconds(2000);   // 2 ms, published/trend-tracked -- unchanged
+    const auto kCiStallDetector = std::max(kLocalBudget, kCiStallMultiplier * calibDuration);  // self-calibrated (see above)
 
     uint64_t framesWhileInFlight = 0;
     std::chrono::microseconds maxPumpDuration{0};
@@ -741,10 +828,12 @@ TEST_CASE("importGltfAsync: WALL-CLOCK GATE -- deliberately slow decode + a real
         if (pumpDuration > kLocalBudget) {
             ++overLocalBudgetCount;
         }
-        // The CI stall-detector tier (RC6): this IS asserted hard, every
-        // single call -- a defect here (e.g. a reintroduced blocking
-        // wait()) would show up as tens of milliseconds, an order of
-        // magnitude above this ceiling, per RC6's own reasoning.
+        // The CI stall-detector tier (RC6, self-calibrated -- see this
+        // function's own comment above kCiStallDetector's definition):
+        // this IS asserted hard, every single call -- a defect here (e.g.
+        // a reintroduced blocking wait()) would show up as several times
+        // the live per-run calibration baseline, clearing this threshold
+        // with room to spare (see the multiplier-derivation comment).
         REQUIRE(pumpDuration < kCiStallDetector);
 
         REQUIRE(std::chrono::steady_clock::now() < testDeadline);
@@ -758,19 +847,21 @@ TEST_CASE("importGltfAsync: WALL-CLOCK GATE -- deliberately slow decode + a real
 
     // Published number [D18/RC6]: the 2ms figure is a TREND metric,
     // explicitly "never CI-blocking" (D18's own wording, amended by RC6
-    // only for the SEPARATE 10ms stall-detector tier asserted above via
-    // REQUIRE) -- reported via MESSAGE only, deliberately never a CHECK/
-    // REQUIRE, so a real but small overage (this task's own dev-machine
-    // run: DamagedHelmet's largest single JPEG texture, ~1.3MB decoded to
-    // RGBA8, occasionally costs a few ms of real memcpy+copy-recording
-    // time for ONE texture's own registerDecoded() step -- see
-    // task-15-report.md's own performance-numbers section) is visible in
-    // the log without flaking CI, exactly matching D18's own posture for
-    // every other wall-clock number in this codebase.
+    // only for the SEPARATE, now self-calibrated stall-detector tier
+    // asserted above via REQUIRE) -- reported via MESSAGE only,
+    // deliberately never a CHECK/REQUIRE, so a real but small overage
+    // (this task's own dev-machine run: DamagedHelmet's largest single
+    // JPEG texture, ~1.3MB decoded to RGBA8, occasionally costs a few ms
+    // of real memcpy+copy-recording time for ONE texture's own
+    // registerDecoded() step -- see task-15-report.md's own
+    // performance-numbers section) is visible in the log without flaking
+    // CI, exactly matching D18's own posture for every other wall-clock
+    // number in this codebase.
     MESSAGE("wall-clock gate: max single pumpMain() call = ", maxPumpDuration.count(), " us across ",
             framesWhileInFlight, " in-flight frame(s); ", overLocalBudgetCount,
             " call(s) exceeded the 2ms local/published budget (trend-tracked, never CI-blocking per D18/RC6) -- "
-            "hard CI stall-detector ceiling is 10ms (REQUIRE'd above, every call)");
+            "self-calibrated CI-tier ceiling this run was ", kCiStallDetector.count(),
+            " us (REQUIRE'd above, every call, see kCiStallDetector's own comment)");
 
     // [Fix round 1, IMPORTANT item] D25 direct proof, not just a wall-clock
     // proxy: the async path never called Uploader::wait() through EITHER
