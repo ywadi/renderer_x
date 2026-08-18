@@ -205,6 +205,14 @@ struct InstanceRecord {
     MeshHandle mesh;
     glm::mat4 worldTransform{1.0F};
 
+    // [G11] World-space AABB: the source mesh's own LOCAL-space bounds
+    // (MeshAsset::bounds, from final post-meshoptimizer positions),
+    // transformed by worldTransform -- all 8 corners, via AABB::
+    // transformed() (correct under rotation and negative scale; never a
+    // naive min/max-only transform, which is wrong the moment
+    // worldTransform rotates).
+    AABB worldBounds;
+
     // [D12 amendment] true iff worldTransform's upper-left 3x3 has a
     // negative determinant (a winding flip -- e.g. one negative scale
     // axis). Flagged and WARNed at import (matrix-issue02 row "Negative /

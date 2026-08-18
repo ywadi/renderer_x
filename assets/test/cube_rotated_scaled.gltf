@@ -1,0 +1,107 @@
+{
+  "asset": {
+    "version": "2.0",
+    "generator": "rx_asset hand-authored rotated(45deg)+negative-scale world-AABB test fixture (Task 13, G11) -- 45deg chosen deliberately over the matrix-suggested 90deg: verified empirically (this task) that a 90deg rotation of an axis-aligned rectangle does not actually discriminate a naive 2-corner (min/max-point-only) AABB transform from the correct 8-corner one, since a 90/180/270-degree rotation maps an axis-aligned box onto another axis-aligned box exactly; 45deg does discriminate."
+  },
+  "scene": 0,
+  "scenes": [
+    {
+      "nodes": [
+        0
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "mesh": 0,
+      "name": "rotated_scaled_quad",
+      "translation": [
+        10,
+        0,
+        0
+      ],
+      "rotation": [
+        0,
+        0,
+        0.38268343,
+        0.92387953
+      ],
+      "scale": [
+        -1,
+        1,
+        1
+      ]
+    }
+  ],
+  "meshes": [
+    {
+      "name": "quad",
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 0,
+            "NORMAL": 1
+          },
+          "indices": 2,
+          "mode": 4
+        }
+      ]
+    }
+  ],
+  "accessors": [
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "count": 4,
+      "type": "VEC3",
+      "min": [
+        -1,
+        -0.25,
+        0
+      ],
+      "max": [
+        1,
+        0.25,
+        0
+      ]
+    },
+    {
+      "bufferView": 1,
+      "componentType": 5126,
+      "count": 4,
+      "type": "VEC3"
+    },
+    {
+      "bufferView": 2,
+      "componentType": 5123,
+      "count": 6,
+      "type": "SCALAR"
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 48,
+      "target": 34962
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 48,
+      "byteLength": 48,
+      "target": 34962
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 96,
+      "byteLength": 12,
+      "target": 34963
+    }
+  ],
+  "buffers": [
+    {
+      "uri": "cube_rotated_scaled.bin",
+      "byteLength": 108
+    }
+  ]
+}

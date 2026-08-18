@@ -827,3 +827,155 @@ TEST_CASE("importGltf: u8 index accessor widens to u32 with a VALUE round-trip, 
     }
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
+
+TEST_CASE("importGltf: multi-primitive mesh yields distinct submeshes, materials, ranges, and AABBs [G8]") {
+    auto fixture = makeFixture("import_multi_primitive");
+    if (!fixture) {
+        return;
+    }
+    attachPoolAndScheduler(*fixture);
+
+    Registry registry;
+    ImportResult result =
+        registry.importGltf(testAssetDir() + "/cube_multi_primitive.gltf", *fixture->pool, *fixture->scheduler);
+    REQUIRE(result.ok());
+    REQUIRE(result.meshes.size() == 1);
+    REQUIRE(result.materials.size() == 2);
+
+    const MeshAsset& mesh = registry.mesh(result.meshes[0]);
+    REQUIRE(mesh.submeshes.size() == 2);
+    const Submesh& subA = mesh.submeshes[0];
+    const Submesh& subB = mesh.submeshes[1];
+
+    CHECK(subA.material != subB.material);
+    CHECK(subA.material == result.materials[0]);
+    CHECK(subB.material == result.materials[1]);
+    // Distinct, non-overlapping pool ranges within the same combined
+    // upload (D25's "one combined upload" design -- see import_gltf.cpp).
+    CHECK(subA.range.blockId == subB.range.blockId);
+    CHECK(subA.range.firstIndex != subB.range.firstIndex);
+    CHECK(subA.range.vertexOffset != subB.range.vertexOffset);
+
+    CHECK(subA.bounds.min.x == doctest::Approx(0.0F));
+    CHECK(subA.bounds.max.x == doctest::Approx(1.0F));
+    CHECK(subB.bounds.min.x == doctest::Approx(2.0F));
+    CHECK(subB.bounds.max.x == doctest::Approx(3.0F));
+
+    // Mesh-level bounds = union of both submeshes.
+    CHECK(mesh.bounds.min.x == doctest::Approx(0.0F));
+    CHECK(mesh.bounds.max.x == doctest::Approx(3.0F));
+
+    const MaterialAsset& matA = registry.material(result.materials[0]);
+    const MaterialAsset& matB = registry.material(result.materials[1]);
+    CHECK(matA.baseColorFactor.r == doctest::Approx(1.0F));
+    CHECK(matB.baseColorFactor.g == doctest::Approx(1.0F));
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("importGltf: non-TRIANGLES primitive is skipped (WARN); its TRIANGLES sibling still imports") {
+    auto fixture = makeFixture("import_mixed_modes");
+    if (!fixture) {
+        return;
+    }
+    attachPoolAndScheduler(*fixture);
+
+    Registry registry;
+    ImportResult result = registry.importGltf(testAssetDir() + "/cube_mixed_modes.gltf", *fixture->pool, *fixture->scheduler);
+    REQUIRE(result.ok());
+    REQUIRE(result.meshes.size() == 1);
+    const MeshAsset& mesh = registry.mesh(result.meshes[0]);
+    // Only the TRIANGLES primitive produced a submesh -- the LINES (mode
+    // 1) sibling was skipped, not silently absent (WARN observed in this
+    // test's own log output) and not a file-level failure.
+    REQUIRE(mesh.submeshes.size() == 1);
+    CHECK(mesh.submeshes[0].range.indexCount == 3);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("importGltf: EXT_mesh_gpu_instancing expands into one InstanceRecord per instance [N2]") {
+    auto fixture = makeFixture("import_gpu_instancing");
+    if (!fixture) {
+        return;
+    }
+    attachPoolAndScheduler(*fixture);
+
+    Registry registry;
+    ImportResult result = registry.importGltf(testAssetDir() + "/cube_instancing.gltf", *fixture->pool, *fixture->scheduler);
+    REQUIRE(result.ok());
+    REQUIRE(result.meshes.size() == 1);
+    // 3 TRANSLATION entries in the fixture -- ONE node produces THREE
+    // instances, not one (the silently-wrong-looking case the N2 ruling
+    // specifically calls out).
+    REQUIRE(result.scene.instances.size() == 3);
+
+    std::vector<float> xs;
+    for (const auto& inst : result.scene.instances) {
+        CHECK(inst.mesh == result.meshes[0]);
+        xs.push_back(inst.worldTransform[3][0]);
+    }
+    std::sort(xs.begin(), xs.end());
+    CHECK(xs[0] == doctest::Approx(0.0F));
+    CHECK(xs[1] == doctest::Approx(5.0F));
+    CHECK(xs[2] == doctest::Approx(10.0F));
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("importGltf: instance world AABB is correct under rotation + negative scale (8-corner transform, G11)") {
+    auto fixture = makeFixture("import_world_aabb");
+    if (!fixture) {
+        return;
+    }
+    attachPoolAndScheduler(*fixture);
+
+    Registry registry;
+    ImportResult result = registry.importGltf(testAssetDir() + "/cube_rotated_scaled.gltf", *fixture->pool, *fixture->scheduler);
+    REQUIRE(result.ok());
+    REQUIRE(result.scene.instances.size() == 1);
+    const InstanceRecord& inst = result.scene.instances[0];
+    CHECK(inst.negativeDeterminant);
+
+    // Local rectangle: x in [-1,1], y in [-0.25,0.25]. Transform =
+    // translate(10,0,0) * rotate(45 deg about Z) * scale(-1,1,1). 45
+    // degrees is deliberately used INSTEAD of the matrix's literally-
+    // suggested 90 degrees: empirically verified (this task, via a real
+    // scratch-worktree revert of AABB::transformed() to a naive "only
+    // transform the min and max POINTS, not all 8 corners" version) that
+    // a 90/180/270-degree rotation of an axis-aligned box maps it onto
+    // ANOTHER axis-aligned box exactly, so the naive 2-point version
+    // produces the textbook-correct answer purely by coincidence at
+    // those specific angles -- it does NOT discriminate the bug the
+    // criterion is about. 45 degrees does (verified: the naive version
+    // fails this exact assertion, off in Y by min instance ~0.35). See
+    // the task report's revert-testing section.
+    CHECK(inst.worldBounds.isValid());
+    CHECK(inst.worldBounds.min.x == doctest::Approx(9.116117F));
+    CHECK(inst.worldBounds.max.x == doctest::Approx(10.883883F));
+    CHECK(inst.worldBounds.min.y == doctest::Approx(-0.883883F));
+    CHECK(inst.worldBounds.max.y == doctest::Approx(0.883883F));
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("importGltf: KHR_texture_transform offset/scale consumed (rotation logged); KHR_materials_unlit maps to Unlit") {
+    auto fixture = makeFixture("import_texture_transform_unlit");
+    if (!fixture) {
+        return;
+    }
+    attachPoolAndScheduler(*fixture);
+
+    Registry registry;
+    ImportResult result =
+        registry.importGltf(testAssetDir() + "/cube_texture_transform_unlit.gltf", *fixture->pool, *fixture->scheduler);
+    REQUIRE(result.ok());
+    REQUIRE(result.materials.size() == 1);
+    const MaterialAsset& mat = registry.material(result.materials[0]);
+
+    CHECK(mat.disposition == MaterialDisposition::Unlit);  // [gate ruling C5]
+
+    REQUIRE(mat.baseColorTexture.present);
+    // [gate ruling C4] offset/scale consumed -- exact fixture values.
+    CHECK(mat.baseColorTexture.uvOffset.x == doctest::Approx(0.25F));
+    CHECK(mat.baseColorTexture.uvOffset.y == doctest::Approx(0.5F));
+    CHECK(mat.baseColorTexture.uvScale.x == doctest::Approx(2.0F));
+    CHECK(mat.baseColorTexture.uvScale.y == doctest::Approx(3.0F));
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}

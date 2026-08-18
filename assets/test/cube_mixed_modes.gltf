@@ -1,0 +1,132 @@
+{
+  "asset": {
+    "version": "2.0",
+    "generator": "rx_asset hand-authored non-triangle-mode test fixture (Task 13)"
+  },
+  "scene": 0,
+  "scenes": [
+    {
+      "nodes": [
+        0
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "mesh": 0,
+      "name": "mixed_modes"
+    }
+  ],
+  "meshes": [
+    {
+      "name": "tri_and_line",
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 0,
+            "NORMAL": 1
+          },
+          "indices": 2,
+          "mode": 4
+        },
+        {
+          "attributes": {
+            "POSITION": 3
+          },
+          "indices": 4,
+          "mode": 1
+        }
+      ]
+    }
+  ],
+  "accessors": [
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "count": 3,
+      "type": "VEC3",
+      "min": [
+        0,
+        0,
+        0
+      ],
+      "max": [
+        1,
+        1,
+        0
+      ]
+    },
+    {
+      "bufferView": 1,
+      "componentType": 5126,
+      "count": 3,
+      "type": "VEC3"
+    },
+    {
+      "bufferView": 2,
+      "componentType": 5123,
+      "count": 3,
+      "type": "SCALAR"
+    },
+    {
+      "bufferView": 3,
+      "componentType": 5126,
+      "count": 2,
+      "type": "VEC3",
+      "min": [
+        0,
+        0,
+        0
+      ],
+      "max": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "bufferView": 4,
+      "componentType": 5123,
+      "count": 2,
+      "type": "SCALAR"
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 36,
+      "target": 34962
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 36,
+      "byteLength": 36,
+      "target": 34962
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 72,
+      "byteLength": 8,
+      "target": 34963
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 80,
+      "byteLength": 24,
+      "target": 34962
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 104,
+      "byteLength": 4,
+      "target": 34963
+    }
+  ],
+  "buffers": [
+    {
+      "uri": "cube_mixed_modes.bin",
+      "byteLength": 108
+    }
+  ]
+}

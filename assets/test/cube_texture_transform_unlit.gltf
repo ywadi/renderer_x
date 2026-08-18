@@ -1,0 +1,153 @@
+{
+  "asset": {
+    "version": "2.0",
+    "generator": "rx_asset hand-authored KHR_texture_transform + KHR_materials_unlit test fixture (Task 13)"
+  },
+  "extensionsUsed": [
+    "KHR_texture_transform",
+    "KHR_materials_unlit"
+  ],
+  "scene": 0,
+  "scenes": [
+    {
+      "nodes": [
+        0
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "mesh": 0,
+      "name": "transformed_unlit_tri"
+    }
+  ],
+  "images": [
+    {
+      "uri": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"
+    }
+  ],
+  "samplers": [
+    {
+      "wrapS": 33071,
+      "wrapT": 33071,
+      "magFilter": 9729,
+      "minFilter": 9729
+    }
+  ],
+  "textures": [
+    {
+      "source": 0,
+      "sampler": 0
+    }
+  ],
+  "materials": [
+    {
+      "name": "unlit_transformed",
+      "extensions": {
+        "KHR_materials_unlit": {}
+      },
+      "pbrMetallicRoughness": {
+        "baseColorTexture": {
+          "index": 0,
+          "extensions": {
+            "KHR_texture_transform": {
+              "offset": [
+                0.25,
+                0.5
+              ],
+              "scale": [
+                2.0,
+                3.0
+              ],
+              "rotation": 0
+            }
+          }
+        }
+      }
+    }
+  ],
+  "meshes": [
+    {
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 0,
+            "NORMAL": 1,
+            "TEXCOORD_0": 2
+          },
+          "indices": 3,
+          "material": 0,
+          "mode": 4
+        }
+      ]
+    }
+  ],
+  "accessors": [
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "count": 3,
+      "type": "VEC3",
+      "min": [
+        0,
+        0,
+        0
+      ],
+      "max": [
+        1,
+        1,
+        0
+      ]
+    },
+    {
+      "bufferView": 1,
+      "componentType": 5126,
+      "count": 3,
+      "type": "VEC3"
+    },
+    {
+      "bufferView": 2,
+      "componentType": 5126,
+      "count": 3,
+      "type": "VEC2"
+    },
+    {
+      "bufferView": 3,
+      "componentType": 5123,
+      "count": 3,
+      "type": "SCALAR"
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 36,
+      "target": 34962
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 36,
+      "byteLength": 36,
+      "target": 34962
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 72,
+      "byteLength": 24,
+      "target": 34962
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 96,
+      "byteLength": 6,
+      "target": 34963
+    }
+  ],
+  "buffers": [
+    {
+      "uri": "cube_texture_transform_unlit.bin",
+      "byteLength": 104
+    }
+  ]
+}

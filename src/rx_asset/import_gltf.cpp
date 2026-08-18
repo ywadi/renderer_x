@@ -952,6 +952,9 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
                     rec.worldTransform = instanceWorld;
                     rec.negativeDeterminant = hasNegativeDeterminant(instanceWorld);
                     rec.sourceNodeIndex = static_cast<int32_t>(nodeIndex);
+                    if (const MeshAsset* meshAsset = registry.meshes_.get(rec.mesh)) {
+                        rec.worldBounds = meshAsset->bounds.transformed(instanceWorld);
+                    }
                     if (rec.negativeDeterminant) {
                         RX_LOG_WARN("rx_asset: node {} instance {}: negative-determinant transform (winding flip)", nodeIndex, inst);
                     }
@@ -963,6 +966,9 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
                 rec.worldTransform = world;
                 rec.negativeDeterminant = hasNegativeDeterminant(world);
                 rec.sourceNodeIndex = static_cast<int32_t>(nodeIndex);
+                if (const MeshAsset* meshAsset = registry.meshes_.get(rec.mesh)) {
+                    rec.worldBounds = meshAsset->bounds.transformed(world);
+                }
                 if (rec.negativeDeterminant) {
                     RX_LOG_WARN("rx_asset: node {} ('{}'): negative-determinant transform (winding flip)", nodeIndex,
                                 std::string(node.name));
