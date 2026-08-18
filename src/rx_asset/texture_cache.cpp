@@ -344,99 +344,31 @@ bool TextureCache::buildFallbackTextures() {
     return true;
 }
 
-TextureHandle TextureCache::loadKtx2Bytes(std::span<const std::byte> bytes, TextureRole role,
-                                            std::string_view debugName) {
-    TranscodePlan plan = planTranscodeFormat(role, [this](VkFormat f) { return isFormatSupported(f); });
+TextureDecodeResult TextureCache::decodeForUpload(std::span<const std::byte> bytes, TextureRole role) const {
+    // Thread-affinity: NONE -- see this method's own header comment.
+    // Deliberately does NOT carry RX_ASSERT_MAIN_THREAD: unlike every
+    // other method in this class, calling this from a worker thread is
+    // the whole point (the async import pipeline's texture-decode stage).
+    return decodeTextureForUpload(bytes, role, maxImageDimension2D_, [this](VkFormat f) { return isFormatSupported(f); });
+}
 
-    Ktx2ParseError parseError = Ktx2ParseError::None;
-    auto decoded = DecodedKtx2Texture::parseAndTranscode(bytes, plan, parseError);
-    if (!decoded.has_value()) {
-        return failureFallback(debugName, std::string("KTX2 parse/transcode failed: ") + ktx2ParseErrorName(parseError));
+TextureHandle TextureCache::applyDecodeResult(const TextureDecodeResult& decoded, std::string_view debugName) {
+    for (const DecodedTextureWarning& w : decoded.warnings) {
+        if (shouldLogOnce(debugName, w.category)) {
+            RX_LOG_WARN("rx_asset: TextureCache: '{}' {}", debugName, w.message);
+        }
     }
 
-    if (decoded->isUnsupportedLayout()) {
-        // [matrix "Cubemap/array/3D KTX2" row] WARN naming the layout +
-        // fallback, never a silently-wrong 2D slice; names FG1 as the
-        // scheduled consumer.
-        if (shouldLogOnce(debugName, "unsupported-layout")) {
-            RX_LOG_WARN(
-                "rx_asset: TextureCache: '{}' is a cubemap/array/non-2D KTX2 container -- unsupported in Phase 4 "
-                "(FG1, the registered techniques-phase skybox/IBL consumer, is the scheduled loader for this "
-                "layout); falling back to checkerboard",
-                debugName);
-        }
+    if (decoded.outcome == TextureDecodeResult::Outcome::Failed) {
+        return failureFallback(debugName, decoded.failureReason);
+    }
+    if (decoded.outcome == TextureDecodeResult::Outcome::Checkerboard) {
         return checkerboard_;
-    }
-
-    if (exceedsDimensionLimit(decoded->width(), decoded->height(), maxImageDimension2D_)) {
-        if (shouldLogOnce(debugName, "oversized")) {
-            RX_LOG_WARN(
-                "rx_asset: TextureCache: '{}' is {}x{}, exceeding this device's maxImageDimension2D={} -- falling "
-                "back to checkerboard",
-                debugName, decoded->width(), decoded->height(), maxImageDimension2D_);
-        }
-        return checkerboard_;
-    }
-
-    // [D10/gate ruling #3, Godot #99589 class] Container-DFD-vs-role
-    // colorspace disagreement -- WARN only; the ROLE still wins for the
-    // created format either way (finalFormat below), on both the
-    // Basis-transcoded path (already relabeled inside
-    // DecodedKtx2Texture::parseAndTranscode()) and this non-Basis path
-    // (the container's own stored format, taken as-is -- see this
-    // function's own comment below on why non-Basis relabeling is out of
-    // scope).
-    ColorspaceCheck colorCheck = checkColorspaceAgreement(role, decoded->containerTransferFunction());
-    if (colorCheck.disagrees && shouldLogOnce(debugName, "colorspace")) {
-        RX_LOG_WARN(
-            "rx_asset: TextureCache: '{}' role={} container DFD transfer function={} disagrees with the role's "
-            "own expectation={} -- glTF role is authoritative for the created format (D10); the container's own "
-            "self-reported transfer function is ignored (Godot #99589 double-sRGB-decode class made loud, not "
-            "silently wrong)",
-            debugName, textureRoleName(role), static_cast<int>(colorCheck.containerTransfer),
-            static_cast<int>(colorCheck.expectedTransfer));
-    }
-
-    VkFormat finalFormat = decoded->currentVkFormat();
-    if (!decoded->wasBasisEncoded()) {
-        // [matrix "ETC1S vs UASTC input; non-Basis KTX2 input" row]
-        // "uploadable-as-stored when format supported, else fallback +
-        // WARN" -- role-authority relabeling is scoped to the Basis-
-        // transcode path only (see DecodedKtx2Texture::parseAndTranscode()
-        // 's own comment: relabeling a Basis-transcoded block's SRGB/UNORM
-        // variant is FREE -- this project controls the transcode target
-        // directly; a non-Basis container's own stored format was
-        // authored as real, final data this project did not itself
-        // produce, so blindly reinterpreting an arbitrary already-
-        // compressed format under a different label is out of this
-        // task's verified-safe scope).
-        if (!isFormatSupported(finalFormat)) {
-            if (shouldLogOnce(debugName, "unsupported-stored-format")) {
-                RX_LOG_WARN(
-                    "rx_asset: TextureCache: '{}' is a non-Basis KTX2 stored as format {}, unsupported for "
-                    "sampling on this device -- falling back to checkerboard",
-                    debugName, static_cast<int>(finalFormat));
-            }
-            return checkerboard_;
-        }
-    }
-
-    std::vector<MipLevelData> levels = decoded->levels();
-    if (levels.empty()) {
-        return failureFallback(debugName, "KTX2 container reported zero usable mip levels");
-    }
-    if (levels.size() == 1 && shouldLogOnce(debugName, "no-mips")) {
-        // [D10: "if a KTX2 lacks mips the importer warns... no runtime
-        // mip generation for compressed formats"]
-        RX_LOG_WARN(
-            "rx_asset: TextureCache: '{}' has no mip chain (1 level) -- recommend regenerating with `toktx "
-            "--genmipmap` (D10; no runtime mip generation for block-compressed formats)",
-            debugName);
     }
 
     std::vector<rx::rhi::Uploader::ImageMipLevel> uploadLevels;
-    uploadLevels.reserve(levels.size());
-    for (const MipLevelData& lvl : levels) {
+    uploadLevels.reserve(decoded.levels.size());
+    for (const DecodedTextureLevel& lvl : decoded.levels) {
         rx::rhi::Uploader::ImageMipLevel u{};
         u.data = lvl.bytes.data();
         u.size = static_cast<VkDeviceSize>(lvl.bytes.size());
@@ -445,57 +377,30 @@ TextureHandle TextureCache::loadKtx2Bytes(std::span<const std::byte> bytes, Text
         uploadLevels.push_back(u);
     }
 
-    TextureHandle handle = registerRealTexture(role, finalFormat, decoded->width(), decoded->height(),
-                                                static_cast<uint32_t>(levels.size()), uploadLevels);
+    TextureHandle handle = registerRealTexture(decoded.role, decoded.format, decoded.width, decoded.height,
+                                                static_cast<uint32_t>(decoded.levels.size()), uploadLevels);
     if (!handle.isValid()) {
         return failureFallback(debugName, "GPU upload/bindless registration failed");
     }
     return handle;
 }
 
-TextureHandle TextureCache::loadStbBytes(std::span<const std::byte> bytes, TextureRole role,
-                                           std::string_view debugName) {
-    std::string failureReason;
-    auto decoded = decodeStbImage(bytes, &failureReason);
-    if (!decoded.has_value()) {
-        return failureFallback(debugName, std::string("stb decode failed: ") + failureReason);
-    }
+TextureHandle TextureCache::registerDecoded(const TextureDecodeResult& decoded, std::string_view debugName) {
+    RX_ASSERT_MAIN_THREAD("TextureCache::registerDecoded");
+    RX_ZONE;
+    // No flush()/wait() here -- see this method's own header comment
+    // (D25's "poll, never a blocking wait" invariant).
+    return applyDecodeResult(decoded, debugName);
+}
 
-    if (shouldLogOnce(debugName, "stb-recommend-ktx2")) {
-        RX_LOG_WARN(
-            "rx_asset: TextureCache: '{}' loaded via stb (PNG/JPG) -- recommend converting to KTX2 for GPU block-"
-            "compressed upload + a full mip chain (D10); this path uploads mip 0 ONLY (recorded limitation)",
-            debugName);
-    }
-    if (decoded->was16Bit && shouldLogOnce(debugName, "stb-16bit")) {
-        RX_LOG_WARN("rx_asset: TextureCache: '{}' is a 16-bit-per-channel source image -- stb_image downconverts "
-                    "to 8-bit on decode",
-                    debugName);
-    }
+rx::rhi::UploadTicket TextureCache::flushPendingUploads() {
+    RX_ASSERT_MAIN_THREAD("TextureCache::flushPendingUploads");
+    return uploader_.flush();
+}
 
-    if (exceedsDimensionLimit(decoded->width, decoded->height, maxImageDimension2D_)) {
-        if (shouldLogOnce(debugName, "oversized")) {
-            RX_LOG_WARN(
-                "rx_asset: TextureCache: '{}' is {}x{}, exceeding this device's maxImageDimension2D={} -- falling "
-                "back to checkerboard",
-                debugName, decoded->width, decoded->height, maxImageDimension2D_);
-        }
-        return checkerboard_;
-    }
-
-    VkFormat format = stbRgba8Format(role);
-    rx::rhi::Uploader::ImageMipLevel level{};
-    level.data = decoded->rgba8.data();
-    level.size = static_cast<VkDeviceSize>(decoded->rgba8.size());
-    level.mipLevel = 0;
-    level.extent = VkExtent2D{decoded->width, decoded->height};
-
-    TextureHandle handle = registerRealTexture(role, format, decoded->width, decoded->height, 1,
-                                                std::span<const rx::rhi::Uploader::ImageMipLevel>(&level, 1));
-    if (!handle.isValid()) {
-        return failureFallback(debugName, "GPU upload/bindless registration failed (stb path)");
-    }
-    return handle;
+bool TextureCache::isUploadComplete(rx::rhi::UploadTicket ticket) const {
+    RX_ASSERT_MAIN_THREAD("TextureCache::isUploadComplete");
+    return uploader_.isComplete(ticket);
 }
 
 TextureHandle TextureCache::loadFromBytes(std::span<const std::byte> bytes, TextureRole role,
@@ -503,12 +408,14 @@ TextureHandle TextureCache::loadFromBytes(std::span<const std::byte> bytes, Text
     RX_ASSERT_MAIN_THREAD("TextureCache::loadFromBytes");
     RX_ZONE;
 
-    if (bytes.empty()) {
-        return failureFallback(debugName, "empty byte span");
-    }
-
-    TextureHandle result =
-        looksLikeKtx2(bytes) ? loadKtx2Bytes(bytes, role, debugName) : loadStbBytes(bytes, role, debugName);
+    // [Task 15] Same decode function the async import pipeline calls from
+    // a worker thread (decodeForUpload() above) -- called here inline, on
+    // whichever thread this call itself runs on (main, by this method's
+    // own guard), immediately followed by the identical GPU-registration
+    // tail (applyDecodeResult()) registerDecoded() also uses. One shared
+    // implementation for both completion styles, no forked logic.
+    TextureDecodeResult decoded = decodeForUpload(bytes, role);
+    TextureHandle result = applyDecodeResult(decoded, debugName);
 
     // [D25] One flush()+wait() per load() call, never per-mip -- makes
     // the returned handle immediately safe to bind/draw (the same "sync
@@ -634,7 +541,15 @@ size_t TextureCache::liveTextureCountForTesting() const {
 
 void TextureCache::evictForTesting(TextureHandle handle, uint64_t frameIndex) {
     RX_ASSERT_MAIN_THREAD("TextureCache::evictForTesting");
+    releaseInternal(handle, frameIndex);
+}
 
+void TextureCache::releaseUnpublished(TextureHandle handle, uint64_t frameIndex) {
+    RX_ASSERT_MAIN_THREAD("TextureCache::releaseUnpublished");
+    releaseInternal(handle, frameIndex);
+}
+
+void TextureCache::releaseInternal(TextureHandle handle, uint64_t frameIndex) {
     Entry* entry = pool_.get(handle);
     if (entry == nullptr) {
         return;  // dead handle already -- nothing to evict

@@ -156,6 +156,68 @@ public:
     [[nodiscard]] TextureHandle loadFromBytes(std::span<const std::byte> bytes, TextureRole role,
                                                std::string_view debugName);
 
+    // [Phase 4 Stage 1 Task 15] Thread-affinity: NONE -- worker-safe (see
+    // texture_decode.h's own decodeTextureForUpload() comment, which this
+    // is a thin wrapper over, supplying this cache's own
+    // maxImageDimension2D_/isFormatSupported() as the two device-specific
+    // parameters that pure function needs). Touches no mutable
+    // TextureCache state: isFormatSupported() is a read-only physical-
+    // device query (Vulkan spec permits this from any thread with no
+    // external synchronization) and maxImageDimension2D_ is set once at
+    // create() and never mutated again. This is the "decode" half of
+    // loadFromBytes()'s own two-step contract, split out so the async
+    // import pipeline can run it on a compute worker
+    // (Scheduler::parallelFor()) while registerDecoded() below stays
+    // main-thread-only for the GPU-facing half -- the SAME decode
+    // function loadFromBytes() itself now calls, not a fork.
+    [[nodiscard]] TextureDecodeResult decodeForUpload(std::span<const std::byte> bytes, TextureRole role) const;
+
+    // [Task 15] Main-thread-only: registers the GPU-side result of a PRIOR
+    // decodeForUpload() call (run on any thread, including a worker) --
+    // the second half of loadFromBytes()'s own contract. Applies the same
+    // once-per-(debugName,category) deferred-warning log dedup
+    // loadFromBytes() itself applies (see TextureDecodeResult::warnings'
+    // own comment), then, for a Ready decode, does exactly what
+    // loadFromBytes() does GPU-side (Texture2D creation, Uploader
+    // submission, BindlessTable registration) -- EXCEPT it does NOT call
+    // flush()/wait() itself: the caller batches via flushPendingUploads()
+    // below and polls isUploadComplete() (D25's "poll, never a blocking
+    // wait" invariant -- the async import path must never reach this
+    // class's own wait()-based loadFromBytes()/load()).
+    //
+    // Main-thread-only (D5).
+    [[nodiscard]] TextureHandle registerDecoded(const TextureDecodeResult& decoded, std::string_view debugName);
+
+    // [Task 15] Forwards to this cache's own Uploader::flush() -- submits
+    // every registerDecoded() batch recorded since the last flush and
+    // returns a pollable UploadTicket (D25).
+    //
+    // Main-thread-only (D5).
+    rx::rhi::UploadTicket flushPendingUploads();
+
+    // [Task 15] Forwards to this cache's own Uploader::isComplete() --
+    // pure poll, never blocks.
+    //
+    // Main-thread-only (D5).
+    [[nodiscard]] bool isUploadComplete(rx::rhi::UploadTicket ticket) const;
+
+    // [Task 15] Production-named release path for a texture
+    // registerDecoded() created whose OWNING async import was cancelled
+    // (or failed) before the registry ever exposed a handle referencing
+    // it -- e.g. abandon-style cancel() observed between registerDecoded()
+    // and the import's own final registry-commit step (no registry
+    // mutation applied after observation -- the cancellation contract).
+    // Same underlying mechanism as evictForTesting() below (D24: mark
+    // nonresident immediately, retire the real GPU resource -- Texture2D
+    // destruction + BindlessTable slot release -- into DeletionQueue
+    // tagged `frameIndex`) -- given a non-test name here because a
+    // cancelled async import is a genuine PRODUCTION caller of this exact
+    // release path, unlike evictForTesting()'s own test/diagnostic-only
+    // callers.
+    //
+    // Main-thread-only (D5).
+    void releaseUnpublished(TextureHandle handle, uint64_t frameIndex = 0);
+
     // Convenience: filesystem-backed, wraps a FilesystemByteSource (same
     // pattern as Registry::importGltf's path overload) -- zero
     // std::filesystem/fopen touched in texture_cache.cpp ITSELF (grep-
@@ -296,10 +358,16 @@ private:
     // warning about the same asset.
     [[nodiscard]] bool shouldLogOnce(std::string_view debugName, std::string_view category);
 
-    [[nodiscard]] TextureHandle loadKtx2Bytes(std::span<const std::byte> bytes, TextureRole role,
-                                               std::string_view debugName);
-    [[nodiscard]] TextureHandle loadStbBytes(std::span<const std::byte> bytes, TextureRole role,
-                                              std::string_view debugName);
+    // [Task 15] Shared tail for loadFromBytes() (sync) and
+    // registerDecoded() (async, no forked logic) -- applies `decoded`'s
+    // deferred warnings through shouldLogOnce(), then either falls back
+    // (Failed/Checkerboard) or performs the real GPU registration
+    // (registerRealTexture()) for a Ready decode. Never flushes/waits --
+    // that stays each caller's own job (loadFromBytes() flushes+waits
+    // unconditionally; registerDecoded() never does).
+    [[nodiscard]] TextureHandle applyDecodeResult(const TextureDecodeResult& decoded, std::string_view debugName);
+
+    void releaseInternal(TextureHandle handle, uint64_t frameIndex);
 
     bool buildFallbackTextures();
     [[nodiscard]] std::optional<TextureHandle> uploadSolidColor(TextureRole role, std::array<uint8_t, 4> rgba,

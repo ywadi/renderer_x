@@ -29,6 +29,7 @@
 // run on the main thread, so this costs nothing real.
 
 #include <rx_rhi_vk/buffer.h>
+#include <rx_rhi_vk/upload.h>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -234,6 +235,38 @@ public:
     // Main-thread-only (D5).
     MeshRange upload(std::span<const PoolVertex> vertices, std::span<const uint32_t> indices);
 
+    // [Phase 4 Stage 1 Task 15, spec D25/RC6] Non-blocking sibling of
+    // upload() above: suballocates and RECORDS the copy identically (same
+    // shared private helper -- no forked logic), but does NOT call
+    // flush()/wait() itself. The returned MeshRange's offsets are valid
+    // immediately (suballocation is a pure CPU-side VMA-virtual-block
+    // operation with no GPU dependency), but the underlying bytes are only
+    // guaranteed present on the GPU once the caller has separately called
+    // flushPendingUploads() and observed the returned ticket complete (via
+    // isUploadComplete() or this pool's own Uploader) -- exists so the
+    // async import pipeline's main-thread marshal step can record work
+    // without ever blocking (D25's own "poll, never a blocking wait"
+    // invariant; the async path must never call upload()'s own wait()).
+    // Same failure contract as upload() (a default MeshRange, logged).
+    //
+    // Main-thread-only (D5).
+    MeshRange uploadDeferred(std::span<const PoolVertex> vertices, std::span<const uint32_t> indices);
+
+    // [Task 15] Forwards to this pool's own Uploader::flush() -- submits
+    // every uploadDeferred() batch recorded since the last flush and
+    // returns a pollable UploadTicket (D25). A caller that only ever uses
+    // upload() (never uploadDeferred()) has no need to call this directly.
+    //
+    // Main-thread-only (D5).
+    rx::rhi::UploadTicket flushPendingUploads();
+
+    // [Task 15] Forwards to this pool's own Uploader::isComplete() -- pure
+    // poll, never blocks. Pairs with flushPendingUploads()/
+    // uploadDeferred() above for the async, never-wait() path.
+    //
+    // Main-thread-only (D5).
+    [[nodiscard]] bool isUploadComplete(rx::rhi::UploadTicket ticket) const;
+
     // Releases `range`'s vertex and index suballocations back to their
     // block's TLSF metadata (vmaVirtualFree) for future reuse -- no
     // defragmentation, no data movement (D9). `range` must be a value
@@ -359,6 +392,12 @@ private:
 
     GeometryPool(rx::rhi::Allocator& allocator, rx::rhi::Uploader& uploader, VkDevice device,
                  bool bufferDeviceAddressEnabled, PoolConfig config);
+
+    // [Task 15] Shared suballocation + record-only tail for both upload()
+    // and uploadDeferred() above -- literally the same code either way
+    // (no forked logic); the two public entry points differ ONLY in
+    // whether they also flush()+wait() afterward.
+    MeshRange suballocateAndRecord(std::span<const PoolVertex> vertices, std::span<const uint32_t> indices);
 
     // Creates a new block sized to max(config_.*ChunkBytes, minimum
     // required bytes) and appends it to blocks_. Returns false (logged)

@@ -284,4 +284,72 @@ std::optional<DecodedStbImage> decodeStbImage(std::span<const std::byte> bytes, 
 // returning the UNCOMPRESSED equivalent this path actually uploads.
 VkFormat stbRgba8Format(TextureRole role);
 
+// ---------------------------------------------------------------------
+// [Phase 4 Stage 1 Task 15] Combined KTX2/stb decode -- worker-safe
+// (thread-affinity: NONE, same as every other function in this header):
+// consolidates exactly the branch logic TextureCache::loadKtx2Bytes()/
+// loadStbBytes() (texture_cache.cpp) already ran, MINUS the GPU-facing
+// tail (Texture2D creation / Uploader submission / BindlessTable
+// registration, all main-thread-only per D5) -- this is the "decode" half
+// of the sync path's own loadFromBytes(), reused verbatim by BOTH the sync
+// TextureCache::loadFromBytes() (decode here, then register on the SAME
+// calling thread, back to back) and the async import pipeline (decode on
+// a compute worker via Scheduler::parallelFor(), register later on the
+// main thread) -- one shared implementation, per D5/Task 15's "no forked
+// logic" rule.
+// ---------------------------------------------------------------------
+
+// One already-decoded mip level, OWNED (not aliasing anything else) --
+// unlike MipLevelData/DecodedKtx2Texture::levels() above, this type must
+// survive a hand-off to a different thread (worker -> main), so it copies
+// its bytes out rather than returning a span into a container this
+// function's own caller may not keep alive.
+struct DecodedTextureLevel {
+    uint32_t level = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<std::byte> bytes;
+};
+
+// A single log line this function decided was warranted but could not
+// safely emit itself (this function is thread-affinity-NONE and must not
+// touch TextureCache's own `loggedFailures_` dedup set, which is
+// main-thread-only state) -- `category` is the SAME dedup category
+// TextureCache::shouldLogOnce() already uses internally (e.g.
+// "unsupported-layout", "oversized", "colorspace", "no-mips",
+// "stb-recommend-ktx2", "stb-16bit") so the caller can apply the identical
+// once-per-(debugName,category) dedup this function's own synchronous
+// sibling (loadKtx2Bytes()/loadStbBytes()) already provides.
+struct DecodedTextureWarning {
+    std::string category;
+    std::string message;  // RX_LOG_WARN-ready; %s-free, already formatted
+};
+
+struct TextureDecodeResult {
+    enum class Outcome : uint8_t {
+        Ready,         // levels/format/width/height populated -- safe to register as a real texture
+        Checkerboard,  // decode succeeded structurally but this content is not uploadable (unsupported
+                       // layout/oversized/unsupported stored format) -- caller falls back, no register() call
+        Failed,        // decode itself failed (corrupt container, stb failure, empty bytes)
+    };
+    Outcome outcome = Outcome::Failed;
+    std::string failureReason;  // meaningful for Failed/Checkerboard only
+
+    std::vector<DecodedTextureWarning> warnings;
+
+    TextureRole role = TextureRole::GenericData;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<DecodedTextureLevel> levels;
+};
+
+// `maxImageDimension2D`: the device's VkPhysicalDeviceLimits field (or a
+// synthetic test value) -- same role as TextureCache's own stored
+// `maxImageDimension2D_`, passed explicitly since this function has no
+// TextureCache instance to read it from. `isFormatSupported`: same
+// FormatSupportQuery contract as planTranscodeFormat() above.
+TextureDecodeResult decodeTextureForUpload(std::span<const std::byte> bytes, TextureRole role,
+                                            uint32_t maxImageDimension2D, const FormatSupportQuery& isFormatSupported);
+
 }  // namespace rx::asset

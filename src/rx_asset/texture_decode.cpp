@@ -344,4 +344,161 @@ VkFormat stbRgba8Format(TextureRole role) {
     return roleExpectsSrgb(role) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
 }
 
+// ---------------------------------------------------------------------
+// [Phase 4 Stage 1 Task 15] decodeTextureForUpload()
+// ---------------------------------------------------------------------
+
+namespace {
+
+TextureDecodeResult decodeKtx2ForUpload(std::span<const std::byte> bytes, TextureRole role,
+                                          uint32_t maxImageDimension2D, const FormatSupportQuery& isFormatSupported) {
+    TextureDecodeResult result;
+    result.role = role;
+
+    TranscodePlan plan = planTranscodeFormat(role, isFormatSupported);
+
+    Ktx2ParseError parseError = Ktx2ParseError::None;
+    auto decoded = DecodedKtx2Texture::parseAndTranscode(bytes, plan, parseError);
+    if (!decoded.has_value()) {
+        result.outcome = TextureDecodeResult::Outcome::Failed;
+        result.failureReason = std::string("KTX2 parse/transcode failed: ") + ktx2ParseErrorName(parseError);
+        return result;
+    }
+
+    if (decoded->isUnsupportedLayout()) {
+        result.outcome = TextureDecodeResult::Outcome::Checkerboard;
+        result.failureReason = "cubemap/array/non-2D KTX2 container";
+        result.warnings.push_back(
+            {"unsupported-layout",
+             "is a cubemap/array/non-2D KTX2 container -- unsupported in Phase 4 (FG1, the registered "
+             "techniques-phase skybox/IBL consumer, is the scheduled loader for this layout); falling back to "
+             "checkerboard"});
+        return result;
+    }
+
+    if (exceedsDimensionLimit(decoded->width(), decoded->height(), maxImageDimension2D)) {
+        result.outcome = TextureDecodeResult::Outcome::Checkerboard;
+        result.failureReason = "exceeds maxImageDimension2D";
+        result.warnings.push_back(
+            {"oversized", "is " + std::to_string(decoded->width()) + "x" + std::to_string(decoded->height()) +
+                              ", exceeding this device's maxImageDimension2D=" + std::to_string(maxImageDimension2D) +
+                              " -- falling back to checkerboard"});
+        return result;
+    }
+
+    ColorspaceCheck colorCheck = checkColorspaceAgreement(role, decoded->containerTransferFunction());
+    if (colorCheck.disagrees) {
+        result.warnings.push_back(
+            {"colorspace",
+             std::string("role=") + textureRoleName(role) +
+                 " container DFD transfer function=" + std::to_string(static_cast<int>(colorCheck.containerTransfer)) +
+                 " disagrees with the role's own expectation=" +
+                 std::to_string(static_cast<int>(colorCheck.expectedTransfer)) +
+                 " -- glTF role is authoritative for the created format (D10); the container's own self-reported "
+                 "transfer function is ignored (Godot #99589 double-sRGB-decode class made loud, not silently "
+                 "wrong)"});
+    }
+
+    VkFormat finalFormat = decoded->currentVkFormat();
+    if (!decoded->wasBasisEncoded()) {
+        if (!isFormatSupported || !isFormatSupported(finalFormat)) {
+            result.outcome = TextureDecodeResult::Outcome::Checkerboard;
+            result.failureReason = "non-Basis KTX2 stored format unsupported for sampling";
+            result.warnings.push_back(
+                {"unsupported-stored-format",
+                 "is a non-Basis KTX2 stored as format " + std::to_string(static_cast<int>(finalFormat)) +
+                     ", unsupported for sampling on this device -- falling back to checkerboard"});
+            return result;
+        }
+    }
+
+    std::vector<MipLevelData> levels = decoded->levels();
+    if (levels.empty()) {
+        result.outcome = TextureDecodeResult::Outcome::Failed;
+        result.failureReason = "KTX2 container reported zero usable mip levels";
+        return result;
+    }
+    if (levels.size() == 1) {
+        result.warnings.push_back(
+            {"no-mips", "has no mip chain (1 level) -- recommend regenerating with `toktx --genmipmap` (D10; no "
+                        "runtime mip generation for block-compressed formats)"});
+    }
+
+    result.outcome = TextureDecodeResult::Outcome::Ready;
+    result.format = finalFormat;
+    result.width = decoded->width();
+    result.height = decoded->height();
+    result.levels.reserve(levels.size());
+    for (const MipLevelData& lvl : levels) {
+        DecodedTextureLevel out;
+        out.level = lvl.level;
+        out.width = lvl.width;
+        out.height = lvl.height;
+        out.bytes.assign(lvl.bytes.begin(), lvl.bytes.end());
+        result.levels.push_back(std::move(out));
+    }
+    return result;
+}
+
+TextureDecodeResult decodeStbForUpload(std::span<const std::byte> bytes, TextureRole role,
+                                         uint32_t maxImageDimension2D) {
+    TextureDecodeResult result;
+    result.role = role;
+
+    std::string failureReason;
+    auto decoded = decodeStbImage(bytes, &failureReason);
+    if (!decoded.has_value()) {
+        result.outcome = TextureDecodeResult::Outcome::Failed;
+        result.failureReason = std::string("stb decode failed: ") + failureReason;
+        return result;
+    }
+
+    result.warnings.push_back(
+        {"stb-recommend-ktx2",
+         "loaded via stb (PNG/JPG) -- recommend converting to KTX2 for GPU block-compressed upload + a full mip "
+         "chain (D10); this path uploads mip 0 ONLY (recorded limitation)"});
+    if (decoded->was16Bit) {
+        result.warnings.push_back(
+            {"stb-16bit", "is a 16-bit-per-channel source image -- stb_image downconverts to 8-bit on decode"});
+    }
+
+    if (exceedsDimensionLimit(decoded->width, decoded->height, maxImageDimension2D)) {
+        result.outcome = TextureDecodeResult::Outcome::Checkerboard;
+        result.failureReason = "exceeds maxImageDimension2D";
+        result.warnings.push_back(
+            {"oversized", "is " + std::to_string(decoded->width) + "x" + std::to_string(decoded->height) +
+                              ", exceeding this device's maxImageDimension2D=" + std::to_string(maxImageDimension2D) +
+                              " -- falling back to checkerboard"});
+        return result;
+    }
+
+    result.outcome = TextureDecodeResult::Outcome::Ready;
+    result.format = stbRgba8Format(role);
+    result.width = decoded->width;
+    result.height = decoded->height;
+    DecodedTextureLevel level;
+    level.level = 0;
+    level.width = decoded->width;
+    level.height = decoded->height;
+    level.bytes.resize(decoded->rgba8.size());
+    std::memcpy(level.bytes.data(), decoded->rgba8.data(), decoded->rgba8.size());
+    result.levels.push_back(std::move(level));
+    return result;
+}
+
+}  // namespace
+
+TextureDecodeResult decodeTextureForUpload(std::span<const std::byte> bytes, TextureRole role,
+                                            uint32_t maxImageDimension2D, const FormatSupportQuery& isFormatSupported) {
+    if (bytes.empty()) {
+        TextureDecodeResult result;
+        result.role = role;
+        result.outcome = TextureDecodeResult::Outcome::Failed;
+        result.failureReason = "empty byte span";
+        return result;
+    }
+    return looksLikeKtx2(bytes) ? decodeKtx2ForUpload(bytes, role, maxImageDimension2D, isFormatSupported)
+                                 : decodeStbForUpload(bytes, role, maxImageDimension2D);
+}
+
 }  // namespace rx::asset

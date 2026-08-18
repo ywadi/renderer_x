@@ -203,9 +203,7 @@ void GeometryPool::discardOrphanedLastBlock() {
     blocks_.pop_back();
 }
 
-MeshRange GeometryPool::upload(std::span<const PoolVertex> vertices, std::span<const uint32_t> indices) {
-    RX_ASSERT_MAIN_THREAD("GeometryPool::upload");
-
+MeshRange GeometryPool::suballocateAndRecord(std::span<const PoolVertex> vertices, std::span<const uint32_t> indices) {
     if (vertices.empty() || indices.empty()) {
         RX_LOG_ERROR("GeometryPool::upload: rejected -- vertices ({}) and indices ({}) must both be non-empty",
                      vertices.size(), indices.size());
@@ -331,11 +329,10 @@ MeshRange GeometryPool::upload(std::span<const PoolVertex> vertices, std::span<c
     target.indexAllocations.emplace(indexElementOffset, indexAlloc);
 
     // [D25] Consumes the Task 11 UploadTicket path -- never assumes the
-    // old synchronous-flush contract. Both spans share ONE flush()+wait()
-    // (never a separate wait per suballocation, per the brief's own
-    // wording) -- the documented sync convenience mirroring
-    // rx::rhi::MeshBuffers::create()'s identical contract, so the range
-    // returned below is always immediately safe to bind/draw.
+    // old synchronous-flush contract. RECORDS the copy only (records onto
+    // this pool's Uploader's active command buffer) -- neither flush() nor
+    // wait() happen here; see this method's two callers (upload()/
+    // uploadDeferred() below) for who owns each half of that contract.
     //
     // uploadToBuffer() needs a BYTE destination offset -- the
     // multiplication below (element offset * element stride) can never
@@ -345,7 +342,6 @@ MeshRange GeometryPool::upload(std::span<const PoolVertex> vertices, std::span<c
     const VkDeviceSize indexByteOffset = indexElementOffset * sizeof(uint32_t);
     uploader_.uploadToBuffer(target.vertexBuffer, vertexByteOffset, vertices.data(), vertexBytes);
     uploader_.uploadToBuffer(target.indexBuffer, indexByteOffset, indices.data(), indexBytes);
-    uploader_.wait(uploader_.flush());
 
     // Element offsets, exact by construction (see above) -- NOT a byte
     // offset divided down. `vertexOffset`/`firstIndex` are the plain
@@ -357,6 +353,47 @@ MeshRange GeometryPool::upload(std::span<const PoolVertex> vertices, std::span<c
     range.indexCount = static_cast<uint32_t>(indices.size());
     range.vertexOffset = static_cast<int32_t>(vertexElementOffset);
     return range;
+}
+
+MeshRange GeometryPool::upload(std::span<const PoolVertex> vertices, std::span<const uint32_t> indices) {
+    RX_ASSERT_MAIN_THREAD("GeometryPool::upload");
+
+    // Per D25's documented sync convenience, this call does exactly ONE
+    // flush()+wait() for its own batch before returning -- both spans
+    // share that one flush, never a separate wait per suballocation --
+    // mirroring rx::rhi::MeshBuffers::create()'s identical "convenience
+    // wrapper" contract, so the range this call returns is always
+    // immediately safe to bind/draw.
+    MeshRange range = suballocateAndRecord(vertices, indices);
+    if (range.indexCount == 0) {
+        // Nothing was recorded (empty input, already logged there, or a
+        // real suballocation failure, also already logged there) -- per
+        // this class's own contract, GeometryPool never returns a
+        // zero-indexCount range for a request that actually succeeded, so
+        // this is a reliable "nothing to flush" signal. Skipping matters:
+        // flushing/waiting here anyway would not be meaningless in the
+        // sense of no-op -- it would flush/wait on whatever a PRIOR caller
+        // already recorded but had not yet flushed on this same Uploader,
+        // which is not this call's job to do.
+        return range;
+    }
+    uploader_.wait(uploader_.flush());
+    return range;
+}
+
+MeshRange GeometryPool::uploadDeferred(std::span<const PoolVertex> vertices, std::span<const uint32_t> indices) {
+    RX_ASSERT_MAIN_THREAD("GeometryPool::uploadDeferred");
+    return suballocateAndRecord(vertices, indices);
+}
+
+rx::rhi::UploadTicket GeometryPool::flushPendingUploads() {
+    RX_ASSERT_MAIN_THREAD("GeometryPool::flushPendingUploads");
+    return uploader_.flush();
+}
+
+bool GeometryPool::isUploadComplete(rx::rhi::UploadTicket ticket) const {
+    RX_ASSERT_MAIN_THREAD("GeometryPool::isUploadComplete");
+    return uploader_.isComplete(ticket);
 }
 
 void GeometryPool::free(const MeshRange& range) {
