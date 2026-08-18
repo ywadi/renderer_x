@@ -6,6 +6,8 @@
 #include <rx_rhi_vk/context.h>
 #include <rx_platform/window.h>
 
+#include <cstdio>
+
 // This is where every future rx_rhi_vk test file's code joins this binary,
 // so this is where a real vk-bootstrap hazard gets a permanent, structural
 // fix rather than a per-test-file workaround: see the WARNING on
@@ -78,6 +80,33 @@ int main(int argc, char** argv) {
     doctest::Context context;
     context.applyCommandLine(argc, argv);
     int res = context.run();
+
+    // Harness gap fix: every fixture's CHECK_FALSE(context.hasValidationErrors())
+    // only observes validation errors raised BEFORE that line runs -- an
+    // error raised while the fixture's OWN destructor chain tears down
+    // afterward (the sampler-leak / unflushed-upload class -- VUID-
+    // vkDestroyDevice-device-00378 and friends) prints but was never
+    // re-checked by anything, so this binary could still exit 0. By the
+    // time context.run() returns here, doctest has already destroyed every
+    // TEST_CASE's fixture, including the very last one, so re-checking the
+    // PROCESS-lifetime tally now (rx::rhi::Context::processValidationErrorCount(),
+    // see its own comment in rx_rhi_vk/context.h) catches exactly that
+    // teardown-time class of error without changing what counts as a known
+    // false positive -- debugCallback()'s own filter list (context.cpp)
+    // remains the sole authority on that; this only re-reads its tally.
+    const std::size_t processErrors = rx::rhi::Context::processValidationErrorCount();
+    if (processErrors > 0) {
+        std::fprintf(stderr,
+                      "[rx_rhi_vk_tests] FAILED: %zu unfiltered Vulkan validation error(s) "
+                      "observed during this run (possibly raised during a fixture's own "
+                      "teardown, after that TEST_CASE's CHECK_FALSE(hasValidationErrors()) "
+                      "already ran) -- see the \"[vulkan validation]\" ERROR line(s) above.\n",
+                      processErrors);
+        if (res == 0) {
+            res = 1;
+        }
+    }
+
     if (context.shouldExit()) {
         return res;
     }

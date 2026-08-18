@@ -4,6 +4,7 @@
 // required here -- a forward declaration is not possible for a by-value
 // member.
 #include <VkBootstrap.h>
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -56,6 +57,28 @@ public:
     VkDebugUtilsMessengerEXT debugMessenger() const { return vkbInstance_.debug_messenger; }
     const vkb::Instance& vkbInstance() const { return vkbInstance_; }
     bool hasValidationErrors() const { return *errorCount_ > 0; }
+
+    // Process-lifetime tally of unfiltered validation errors observed from
+    // debugCallback() across EVERY Context ever created in this process --
+    // deliberately NOT scoped to any one Context/errorCount_ instance the
+    // way hasValidationErrors() above is. A GPU test fixture's own
+    // CHECK_FALSE(fixture->context.hasValidationErrors()) only observes
+    // errors raised before that line runs; a validation error raised while
+    // the fixture's OWN destructor chain tears down afterward (the
+    // sampler-leak / unflushed-upload class -- VUID-vkDestroyDevice-
+    // device-00378 and friends) still prints via debugCallback's
+    // RX_LOG_ERROR, but nothing re-checks THAT Context's (now-dying)
+    // errorCount_ again, and once the fixture is fully destroyed
+    // errorCount_ itself is gone. This counter survives that: it is read
+    // by every GPU test binary's main() (each doctest_main*.cpp under
+    // src/*/tests/) AFTER doctest::Context::run() returns -- i.e. after
+    // every TEST_CASE's fixture, including the very last one, has already
+    // been fully destroyed -- to catch exactly that class of teardown-time
+    // error and force a nonzero process exit code. Filtering (what counts
+    // as a known false positive vs. a real error) is unchanged: this only
+    // tallies the SAME real-error branch that already increments a
+    // per-Context errorCount_ in context.cpp's debugCallback().
+    static std::size_t processValidationErrorCount();
 
 private:
     Context(vkb::Instance vkbInstance, std::shared_ptr<int> errorCount)

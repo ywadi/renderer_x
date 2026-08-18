@@ -1,12 +1,21 @@
 #include <rx_rhi_vk/context.h>
 #include <rx_core/log.h>
 #include <VkBootstrap.h>
+#include <atomic>
+#include <cstddef>
 #include <memory>
 #include <string_view>
 
 namespace rx::rhi {
 
 namespace {
+
+// Backing store for Context::processValidationErrorCount() -- see that
+// declaration's own comment (rx_rhi_vk/context.h) for why this is
+// process-lifetime instead of per-Context. One TU (this file), one
+// instance for the whole process regardless of whether rx_rhi_vk links
+// static or shared into a given test binary.
+std::atomic<std::size_t> gProcessValidationErrorCount{0};
 
 // Known false positive, narrowly scoped: vk-bootstrap's InstanceBuilder
 // unconditionally enables VK_KHR_portability_enumeration (the extension and
@@ -193,6 +202,7 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBits
         } else {
             RX_LOG_ERROR("[vulkan validation] {}", data->pMessage);
             (*errorCount)++;
+            gProcessValidationErrorCount.fetch_add(1, std::memory_order_relaxed);
         }
     } else {
         RX_LOG_INFO("[vulkan validation] {}", data->pMessage);
@@ -296,6 +306,10 @@ std::optional<Context> Context::create(std::vector<const char*> requiredExtensio
     volkLoadInstance(vkbInstance.instance);
 
     return Context(std::move(vkbInstance), errorCount);
+}
+
+std::size_t Context::processValidationErrorCount() {
+    return gProcessValidationErrorCount.load(std::memory_order_relaxed);
 }
 
 Context::Context(Context&& other) noexcept

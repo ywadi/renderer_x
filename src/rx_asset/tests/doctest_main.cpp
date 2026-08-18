@@ -14,6 +14,7 @@
 #include <rx_rhi_vk/context.h>
 #include <rx_platform/window.h>
 
+#include <cstdio>
 #include <vector>
 
 namespace {
@@ -40,6 +41,32 @@ int main(int argc, char** argv) {
     doctest::Context context;
     context.applyCommandLine(argc, argv);
     int res = context.run();
+
+    // Harness gap fix -- see rx_rhi_vk/tests/doctest_main.cpp's identical
+    // block for the full rationale: a validation error raised while a
+    // fixture's OWN destructor chain tears down (after that TEST_CASE's own
+    // CHECK_FALSE(hasValidationErrors()) already ran) previously printed but
+    // never failed the run. Re-checking the PROCESS-lifetime tally here,
+    // after context.run() has already destroyed every fixture including the
+    // last one, closes that gap without touching debugCallback()'s own
+    // known-false-positive filter list (context.cpp), which stays
+    // authoritative. This is exactly the class of bug TextureCache::
+    // ~TextureCache()'s own [G6] sampler-cache cleanup loop (texture_cache.cpp)
+    // was added to fix -- this binary's own texture_cache_test.cpp cases
+    // are what would regress it.
+    const std::size_t processErrors = rx::rhi::Context::processValidationErrorCount();
+    if (processErrors > 0) {
+        std::fprintf(stderr,
+                      "[rx_asset_tests] FAILED: %zu unfiltered Vulkan validation error(s) "
+                      "observed during this run (possibly raised during a fixture's own "
+                      "teardown, after that TEST_CASE's CHECK_FALSE(hasValidationErrors()) "
+                      "already ran) -- see the \"[vulkan validation]\" ERROR line(s) above.\n",
+                      processErrors);
+        if (res == 0) {
+            res = 1;
+        }
+    }
+
     if (context.shouldExit()) {
         return res;
     }
