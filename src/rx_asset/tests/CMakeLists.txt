@@ -100,6 +100,13 @@ add_executable(rx_asset_gltf_gpu_tests
     # TextureCache (BindlessTable/DeletionQueue) this binary's own
     # rx_rhi_vk link already provides everything for.
     import_gltf_basisu_test.cpp
+    # Phase 4 Stage 1 Task 15 -- Registry::importGltfAsync() (spec D5/
+    # D18-RC6/D24/D25, gate matrix-issue22). Joins THIS binary for the
+    # same reason import_gltf_basisu_test.cpp does: the exact same
+    # fastgltf-aware Registry/GeometryPool/Scheduler fixture shape, plus
+    # rx_task's Scheduler::runOnWorkerThread()/runOnIoThread()/pumpMain()
+    # this binary's own rx_task link already provides everything for.
+    async_import_test.cpp
 )
 target_include_directories(rx_asset_gltf_gpu_tests PRIVATE ..)
 target_link_libraries(rx_asset_gltf_gpu_tests PRIVATE rx_asset rx_rhi_vk rx_platform rx_task fastgltf::fastgltf doctest::doctest)

@@ -1,9 +1,11 @@
 #include "import_gltf.h"
 #include "gltf_error.h"
 #include "gltf_pipeline.h"
+#include "import_pipeline.h"
 #include <rx_asset/geometry_pool.h>
 #include <rx_asset/texture_cache.h>
 #include <rx_core/log.h>
+#include <rx_core/profile.h>
 #include <rx_task/scheduler.h>
 #include <fastgltf/core.hpp>
 #include <fastgltf/glm_element_traits.hpp>
@@ -14,6 +16,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <algorithm>
+#include <cassert>
 #include <cstring>
 #include <functional>
 #include <mutex>
@@ -139,6 +142,28 @@ void onExtrasParsed(simdjson::dom::object* /*extras*/, std::size_t /*objectIndex
 // abstraction invariant]. Resolves every fastgltf::sources::URI ITSELF
 // through the injected ByteSource -- Options::LoadExternalBuffers/
 // LoadExternalImages are NEVER set (see importGltfPipeline below).
+//
+// [Phase 4 Stage 1 Task 15 scope note] For the ASYNC import path, this
+// resolution (including the ByteSource::read() calls it makes) runs on
+// the SAME background worker thread as the rest of computeGltfImport()
+// below, NOT on the dedicated IO thread runOnIoThread() otherwise owns --
+// a deliberate, documented scope simplification (task-15-report.md's own
+// deviations section has the full rationale): correctly staging fastgltf
+// parsing itself (which determines WHICH buffer/image URIs even exist)
+// across an IO-thread/worker-thread boundary while preserving
+// ResolvedBuffers' own lazy-cached design was judged materially riskier,
+// for materially less correctness benefit, than accepting that a worker
+// thread occasionally blocks on a file read -- worker threads doing
+// occasional blocking I/O is an ordinary, defensible engine pattern,
+// whereas CPU decode work running on the one dedicated IO thread (the
+// invariant this task's debug thread-id assert DOES enforce, strictly,
+// around every real decode/transcode/tangent-generation/meshopt call
+// below) would defeat that thread's entire purpose for every OTHER
+// in-flight IO request. The dedicated IO thread is still exercised for
+// real, for the one read every async import unconditionally needs before
+// any of this can run at all: the main glTF/GLB document's own bytes
+// (registry.cpp's async orchestration issues that one read via
+// runOnIoThread() before ever calling computeGltfImport()).
 // ---------------------------------------------------------------------
 
 // Absolute or non-file-scheme (e.g. http/https) URIs are never handed to
@@ -619,21 +644,80 @@ bool hasNegativeDeterminant(const glm::mat4& m) {
     return glm::determinant(upper3x3) < 0.0F;
 }
 
+// [Task 15] Maps a MaterialTextureSlot to the corresponding TextureRef
+// field on a MaterialAsset -- the ONE place that mapping is spelled out,
+// shared by every caller that needs to patch a slot's handle after
+// registerDecoded() (import_gltf.cpp's own compute/marshal code, never
+// exposed outside this file).
+TextureRef& textureRefForSlot(MaterialAsset& mat, MaterialTextureSlot slot) {
+    switch (slot) {
+        case MaterialTextureSlot::BaseColor:
+            return mat.baseColorTexture;
+        case MaterialTextureSlot::MetallicRoughness:
+            return mat.metallicRoughnessTexture;
+        case MaterialTextureSlot::Normal:
+            return mat.normalTexture;
+        case MaterialTextureSlot::Occlusion:
+            return mat.occlusionTexture;
+        case MaterialTextureSlot::Emissive:
+        case MaterialTextureSlot::Count:
+        default:
+            return mat.emissiveTexture;
+    }
+}
+
+void setStage(std::atomic<ImportStage>* stageOut, ImportStage stage) {
+    if (stageOut != nullptr) {
+        stageOut->store(stage, std::memory_order_release);
+    }
+}
+
+bool isCancelled(const std::atomic<bool>* cancelled) {
+    return cancelled != nullptr && cancelled->load(std::memory_order_acquire);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------
-// The orchestration entry point
+// The compute-phase entry point [Task 15] -- see import_pipeline.h's own
+// top comment for the full compute/marshal split rationale.
 // ---------------------------------------------------------------------
 
-ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> documentBytes, ByteSource& source, GeometryPool& pool,
-                                 rx::task::Scheduler& scheduler, TextureCache* textures) {
-    ImportResult result;
+TextureFallbackHandles snapshotTextureFallbackHandles(TextureCache* textures) {
+    TextureFallbackHandles snapshot;
+    if (textures == nullptr) {
+        return snapshot;
+    }
+    snapshot.checkerboard = textures->checkerboardHandle();
+    for (size_t i = 0; i < snapshot.byRole.size(); ++i) {
+        snapshot.byRole[i] = textures->fallbackHandle(static_cast<TextureRole>(i));
+    }
+    return snapshot;
+}
+
+ImportComputeResult computeGltfImport(std::span<const std::byte> documentBytes, ByteSource& source,
+                                       rx::task::Scheduler& scheduler, TextureCache* textures,
+                                       TextureHandle fallbackTextureHandleForUncached,
+                                       const TextureFallbackHandles& textureFallbacks,
+                                       const std::atomic<bool>* cancelled, std::atomic<uint32_t>* itemsCompleted,
+                                       std::atomic<uint32_t>* itemsTotalOut, std::atomic<ImportStage>* stageOut) {
+    // [Task 15] Tracy zone coverage -- one named zone for the whole
+    // compute phase (this function runs on a worker thread for the async
+    // path, capturing exactly the "off-main-thread decode work" span a
+    // manual capture is meant to show) plus one per major stage below
+    // (parse, materials/texture-decode, primitives). See
+    // task-15-report.md's own MANUAL_VERIFICATION section for the capture
+    // procedure -- code presence + procedure, not CI-gated (D18).
+    RX_ZONE_NAMED("computeGltfImport");
+    ImportComputeResult result;
+    setStage(stageOut, ImportStage::Parsing);
 
     auto dataBuffer = fastgltf::GltfDataBuffer::FromBytes(reinterpret_cast<const std::byte*>(documentBytes.data()),
                                                             documentBytes.size());
     if (dataBuffer.error() != fastgltf::Error::None) {
         result.error = mapFastgltfError(dataBuffer.error());
         RX_LOG_ERROR("rx_asset: importGltf: failed to wrap document bytes: {}", importErrorName(result.error));
+        setStage(stageOut, ImportStage::Failed);
         return result;
     }
 
@@ -651,6 +735,7 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
         result.error = mapFastgltfError(assetExpected.error());
         RX_LOG_ERROR("rx_asset: importGltf: parse failed: {} ({})", importErrorName(result.error),
                      fastgltf::getErrorMessage(assetExpected.error()));
+        setStage(stageOut, ImportStage::Failed);
         return result;
     }
     fastgltf::Asset asset = std::move(assetExpected.get());
@@ -683,229 +768,195 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
                      summary);
     }
 
+    if (isCancelled(cancelled)) {
+        result.cancelled = true;
+        return result;
+    }
+
     ResolvedBuffers buffers(asset, source);
     // Sequential pre-pass [D5/matrix-issue02 row 15]: every buffer is
-    // resolved once, HERE, on the calling (main) thread -- see
-    // ResolvedBuffers::bytes()'s own comment for why this is required
+    // resolved once, HERE, on whichever thread called this function --
+    // see ResolvedBuffers::bytes()'s own comment for why this is required
     // before the parallelFor fan-out below touches the same cache from
-    // multiple worker threads.
+    // multiple worker threads. [Task 15 scope note -- see this file's own
+    // anonymous-namespace comment above ResolvedBuffers] this is real
+    // ByteSource I/O, run on whichever thread computeGltfImport() itself
+    // runs on (a background worker for the async path) -- NOT the
+    // dedicated IO thread, a documented scope simplification.
     buffers.resolveAllBuffersSequentially();
     DecodedMeshoptViews meshoptViews(asset, buffers);
     ImportBufferDataAdapter adapter{asset, buffers, meshoptViews};
 
+    setStage(stageOut, ImportStage::Decoding);
+
     // ================= Materials =================
-    std::vector<MaterialAsset> materials(asset.materials.size());
-    for (size_t mi = 0; mi < asset.materials.size(); ++mi) {
-        const fastgltf::Material& src = asset.materials[mi];
-        MaterialAsset& dst = materials[mi];
-        dst.name = std::string(src.name);
-        dst.disposition = src.unlit ? MaterialDisposition::Unlit : MaterialDisposition::StandardPBR;  // [gate ruling C5]
+    result.materials.resize(asset.materials.size());
+    // grain=1: material count is typically small (dozens, not thousands)
+    // and each unit of work (a handful of texture transcodes) is
+    // meaningfully heavier than autoGrainSize()'s own floor would assume
+    // -- explicit grain=1 fans every material out to its own chunk,
+    // matching this project's own established "measurement affordance"
+    // carve-out (scheduler.h) for a workload shape autoGrainSize() was
+    // not designed around.
+    std::mutex materialLogMutex;
+    RX_PLOT("async import: materials", static_cast<int64_t>(asset.materials.size()));
+    scheduler.parallelFor(static_cast<uint32_t>(asset.materials.size()), 1,
+                           [&](uint32_t begin, uint32_t end, uint32_t) {
+        RX_ZONE_NAMED("material texture decode chunk");
+        for (uint32_t mi = begin; mi < end; ++mi) {
+            const fastgltf::Material& src = asset.materials[mi];
+            PendingMaterialCompute& pendingMat = result.materials[mi];
+            MaterialAsset& dst = pendingMat.asset;
+            dst.name = std::string(src.name);
+            dst.disposition = src.unlit ? MaterialDisposition::Unlit : MaterialDisposition::StandardPBR;  // [gate ruling C5]
 
-        dst.baseColorFactor = glm::vec4(src.pbrData.baseColorFactor[0], src.pbrData.baseColorFactor[1], src.pbrData.baseColorFactor[2],
-                                         src.pbrData.baseColorFactor[3]);
-        dst.metallicFactor = src.pbrData.metallicFactor;
-        dst.roughnessFactor = src.pbrData.roughnessFactor;
-        dst.emissiveFactor = glm::vec3(src.emissiveFactor[0], src.emissiveFactor[1], src.emissiveFactor[2]);
-        dst.emissiveStrength = src.emissiveStrength;
-        dst.alphaCutoff = src.alphaCutoff;
-        dst.doubleSided = src.doubleSided;
-        switch (src.alphaMode) {
-            case fastgltf::AlphaMode::Opaque:
-                dst.alphaMode = AlphaMode::Opaque;
-                break;
-            case fastgltf::AlphaMode::Mask:
-                dst.alphaMode = AlphaMode::Mask;
-                break;
-            case fastgltf::AlphaMode::Blend:
-                dst.alphaMode = AlphaMode::Blend;
-                break;
-        }
-        if (src.normalTexture) {
-            dst.normalScale = src.normalTexture->scale;
-        }
-        if (src.occlusionTexture) {
-            dst.occlusionStrength = src.occlusionTexture->strength;
-        }
+            dst.baseColorFactor = glm::vec4(src.pbrData.baseColorFactor[0], src.pbrData.baseColorFactor[1],
+                                             src.pbrData.baseColorFactor[2], src.pbrData.baseColorFactor[3]);
+            dst.metallicFactor = src.pbrData.metallicFactor;
+            dst.roughnessFactor = src.pbrData.roughnessFactor;
+            dst.emissiveFactor = glm::vec3(src.emissiveFactor[0], src.emissiveFactor[1], src.emissiveFactor[2]);
+            dst.emissiveStrength = src.emissiveStrength;
+            dst.alphaCutoff = src.alphaCutoff;
+            dst.doubleSided = src.doubleSided;
+            switch (src.alphaMode) {
+                case fastgltf::AlphaMode::Opaque:
+                    dst.alphaMode = AlphaMode::Opaque;
+                    break;
+                case fastgltf::AlphaMode::Mask:
+                    dst.alphaMode = AlphaMode::Mask;
+                    break;
+                case fastgltf::AlphaMode::Blend:
+                    dst.alphaMode = AlphaMode::Blend;
+                    break;
+            }
+            if (src.normalTexture) {
+                dst.normalScale = src.normalTexture->scale;
+            }
+            if (src.occlusionTexture) {
+                dst.occlusionStrength = src.occlusionTexture->strength;
+            }
 
-        // Takes a raw (non-owning) pointer rather than the Optional<T>
-        // wrapper directly: fastgltf::TextureInfo carries a
-        // std::unique_ptr<TextureTransform> member (move-only), so it
-        // cannot be copied into a by-value/by-reference-to-Optional
-        // parameter of a DIFFERENT Optional specialization -- callers
-        // for NormalTextureInfo/OcclusionTextureInfo (both PUBLICLY
-        // DERIVE from TextureInfo) pass `&*opt` upcast to the base
-        // pointer instead of slicing a copy.
-        // [Task 14, matrix-issue03 "KHR_texture_basisu wiring from
-        // import" row] `role` is the MATERIAL SLOT this call fills --
-        // slot-driven, never filename-driven (the misleading-filename
-        // test this row calls for constructs a fixture whose file name
-        // says one thing and whose material slot says another, and
-        // asserts the SLOT wins). `textures` is nullptr-tolerant (Task
-        // 13's own existing contract, unchanged): when absent, every ref
-        // still resolves to registry.fallbackTextureHandle(), exactly as
-        // before this task.
-        const auto fillRef = [&](TextureRef& ref, const fastgltf::TextureInfo* info, TextureRole role) {
-            if (info == nullptr) {
-                // [D11] UNBOUND slot -- the source material carries no
-                // texture reference for this role AT ALL (`ref.present`
-                // stays false, unchanged from its default -- a consumer
-                // is expected to check that first). Still points
-                // `ref.handle` at the role-appropriate UTILITY texture
-                // (never the checkerboard -- matrix's own "a magenta
-                // normal map would shade garbage" reasoning) rather than
-                // leaving it at an invalid default: a shader that always
-                // samples every slot (D26.1's per-draw-addressing,
-                // branchless pattern -- multiply the sampled value by the
-                // slot's own factor, texture*factor==factor when the
-                // texture is neutral) needs a resolvable handle here
-                // regardless of whether every future consumer remembers
-                // to special-case `!present` itself. No-op when no
-                // TextureCache was supplied (nothing to resolve against).
+            // [D24/D11] Slot-driven texture resolution -- WORKER-SAFE
+            // decode only (TextureCache::decodeForUpload()); GPU
+            // registration is deferred to marshal time (main thread).
+            const auto fillRef = [&](TextureRef& ref, PendingTextureLoad& pending, const fastgltf::TextureInfo* info,
+                                      TextureRole role) {
+                if (info == nullptr) {
+                    // [D11] UNBOUND slot -- final value already, no
+                    // texture-cache round-trip needed at all. Reads the
+                    // main-thread-snapshotted value (textureFallbacks),
+                    // NEVER TextureCache::fallbackHandle() directly --
+                    // see TextureFallbackHandles' own comment
+                    // (import_pipeline.h) for why: that accessor is
+                    // RX_ASSERT_MAIN_THREAD-guarded and this lambda runs
+                    // on a worker thread for the async path.
+                    if (textures != nullptr) {
+                        ref.handle = textureFallbacks.byRole[static_cast<size_t>(role)];
+                    }
+                    return;
+                }
+                ref.present = true;
+                ref.handle = fallbackTextureHandleForUncached;  // [D11] Task-13 baseline -- the textures==nullptr contract, unchanged
                 if (textures != nullptr) {
-                    ref.handle = textures->fallbackHandle(role);
+                    ref.handle = textureFallbacks.checkerboard;  // see the comment just above
                 }
-                return;
-            }
-            ref.present = true;
-            ref.handle = registry.fallbackTextureHandle();  // [D11] Task-13 baseline -- the textures==nullptr contract, unchanged
-            // [Fix round 1, reviewer IMPORTANT-1] The instant a TextureCache
-            // exists, EVERY failure path below (out-of-range textureIndex,
-            // no resolvable image index, resolveImageBytes() failure --
-            // malformed bufferView, an absolute/network URI never fetched,
-            // a missing file) must leave `ref.handle` pointing into THAT
-            // TextureCache's OWN handle space, never
-            // registry.fallbackTextureHandle() -- a handle from Registry's
-            // completely separate `textures_` HandlePool. The two were
-            // never meant to be interchangeable: they only ever compared
-            // equal because BOTH classes' constructors unconditionally
-            // acquire their own single fallback entry first, into an
-            // otherwise-untouched pool (Registry's `textures_` never grows
-            // past that one acquire anywhere in this codebase), so both
-            // land on Handle(index=0, generation=1) in every reachable
-            // test today -- a structural coincidence of this task's
-            // current code, not a real cross-pool identity, and the first
-            // future change to either build order (Registry acquiring a
-            // second texture, or TextureCache::create() building its
-            // fallbacks in a different sequence) would silently start
-            // resolving to the wrong pool's entry. Set unconditionally
-            // here (before any of the resolution attempts below, all of
-            // which overwrite it again on success) so every failure path
-            // is correct by construction rather than by accident.
-            if (textures != nullptr) {
-                ref.handle = textures->checkerboardHandle();
-            }
-            if (info->textureIndex < asset.textures.size()) {
-                const fastgltf::Texture& tex = asset.textures[info->textureIndex];
-                // KHR_texture_basisu [D10]: a texture's basisuImageIndex,
-                // when present, names the KTX2 image this texture ACTUALLY
-                // uses -- takes priority over the core imageIndex per the
-                // extension's own documented fallback order (glTF spec:
-                // "clients that support this extension SHOULD use... the
-                // image referenced by this extension" -- imageIndex is the
-                // non-KTX2 fallback for viewers without the extension).
-                std::optional<size_t> effectiveImageIndex = tex.basisuImageIndex ? tex.basisuImageIndex : tex.imageIndex;
-                if (effectiveImageIndex) {
-                    ref.imageIndex = static_cast<uint32_t>(*effectiveImageIndex);
-                }
-                if (tex.samplerIndex && *tex.samplerIndex < asset.samplers.size()) {
-                    const fastgltf::Sampler& s = asset.samplers[*tex.samplerIndex];
-                    ref.sampler.wrapS = static_cast<uint32_t>(s.wrapS);
-                    ref.sampler.wrapT = static_cast<uint32_t>(s.wrapT);
-                    ref.sampler.magFilter = s.magFilter ? static_cast<uint32_t>(*s.magFilter) : 0U;
-                    ref.sampler.minFilter = s.minFilter ? static_cast<uint32_t>(*s.minFilter) : 0U;
-                }
+                if (info->textureIndex < asset.textures.size()) {
+                    const fastgltf::Texture& tex = asset.textures[info->textureIndex];
+                    std::optional<size_t> effectiveImageIndex = tex.basisuImageIndex ? tex.basisuImageIndex : tex.imageIndex;
+                    if (effectiveImageIndex) {
+                        ref.imageIndex = static_cast<uint32_t>(*effectiveImageIndex);
+                    }
+                    if (tex.samplerIndex && *tex.samplerIndex < asset.samplers.size()) {
+                        const fastgltf::Sampler& s = asset.samplers[*tex.samplerIndex];
+                        ref.sampler.wrapS = static_cast<uint32_t>(s.wrapS);
+                        ref.sampler.wrapT = static_cast<uint32_t>(s.wrapT);
+                        ref.sampler.magFilter = s.magFilter ? static_cast<uint32_t>(*s.magFilter) : 0U;
+                        ref.sampler.minFilter = s.minFilter ? static_cast<uint32_t>(*s.minFilter) : 0U;
+                    }
 
-                if (textures != nullptr && effectiveImageIndex) {
-                    auto bytes = resolveImageBytes(asset, *effectiveImageIndex, buffers, source);
-                    if (bytes.has_value()) {
-                        std::string debugName = dst.name.empty()
-                                                     ? ("material#" + std::to_string(mi) + " " + textureRoleName(role))
-                                                     : (dst.name + " " + textureRoleName(role));
-                        ref.handle = textures->loadFromBytes(std::span<const std::byte>(*bytes), role, debugName);
-                    } else {
-                        RX_LOG_WARN("rx_asset: material '{}': {} texture (image #{}) bytes could not be resolved -- D11 fallback",
-                                    dst.name, textureRoleName(role), *effectiveImageIndex);
+                    if (textures != nullptr && effectiveImageIndex) {
+                        auto bytes = resolveImageBytes(asset, *effectiveImageIndex, buffers, source);
+                        if (bytes.has_value()) {
+                            std::string debugName = dst.name.empty()
+                                                         ? ("material#" + std::to_string(mi) + " " + textureRoleName(role))
+                                                         : (dst.name + " " + textureRoleName(role));
+                            // WORKER-SAFE decode ONLY -- see
+                            // TextureCache::decodeForUpload()'s own
+                            // comment. Registration happens at marshal
+                            // time, main thread.
+                            pending.attempted = true;
+                            pending.role = role;
+                            pending.debugName = std::move(debugName);
+                            pending.decoded = textures->decodeForUpload(std::span<const std::byte>(*bytes), role);
+                            if (itemsCompleted != nullptr) {
+                                itemsCompleted->fetch_add(1, std::memory_order_relaxed);
+                            }
+                        } else {
+                            std::lock_guard<std::mutex> lock(materialLogMutex);
+                            RX_LOG_WARN(
+                                "rx_asset: material '{}': {} texture (image #{}) bytes could not be resolved -- D11 fallback",
+                                dst.name, textureRoleName(role), *effectiveImageIndex);
+                        }
                     }
                 }
-            }
-            ref.texCoordIndex = static_cast<uint32_t>(info->texCoordIndex);
-            if (info->transform) {
-                // [gate ruling C4] offset/scale consume-now; rotation
-                // stays log-don't-drop.
-                ref.uvOffset = glm::vec2(info->transform->uvOffset.x(), info->transform->uvOffset.y());
-                ref.uvScale = glm::vec2(info->transform->uvScale.x(), info->transform->uvScale.y());
-                if (info->transform->rotation != 0.0F) {
-                    RX_LOG_WARN(
-                        "rx_asset: material '{}': KHR_texture_transform rotation={} radians is not applied (log-don't-drop; "
-                        "offset/scale are consumed)",
-                        dst.name, info->transform->rotation);
+                ref.texCoordIndex = static_cast<uint32_t>(info->texCoordIndex);
+                if (info->transform) {
+                    ref.uvOffset = glm::vec2(info->transform->uvOffset.x(), info->transform->uvOffset.y());
+                    ref.uvScale = glm::vec2(info->transform->uvScale.x(), info->transform->uvScale.y());
+                    if (info->transform->rotation != 0.0F) {
+                        std::lock_guard<std::mutex> lock(materialLogMutex);
+                        RX_LOG_WARN(
+                            "rx_asset: material '{}': KHR_texture_transform rotation={} radians is not applied "
+                            "(log-don't-drop; offset/scale are consumed)",
+                            dst.name, info->transform->rotation);
+                    }
                 }
-            }
-        };
-        fillRef(dst.baseColorTexture, src.pbrData.baseColorTexture ? &*src.pbrData.baseColorTexture : nullptr,
-                TextureRole::BaseColor);
-        fillRef(dst.metallicRoughnessTexture,
-                src.pbrData.metallicRoughnessTexture ? &*src.pbrData.metallicRoughnessTexture : nullptr,
-                TextureRole::MetallicRoughness);
-        fillRef(dst.normalTexture, src.normalTexture ? static_cast<const fastgltf::TextureInfo*>(&*src.normalTexture) : nullptr,
-                TextureRole::Normal);
-        fillRef(dst.occlusionTexture,
-                src.occlusionTexture ? static_cast<const fastgltf::TextureInfo*>(&*src.occlusionTexture) : nullptr,
-                TextureRole::Occlusion);
-        fillRef(dst.emissiveTexture, src.emissiveTexture ? &*src.emissiveTexture : nullptr, TextureRole::Emissive);
+            };
+            fillRef(dst.baseColorTexture, pendingMat.textureSlots[static_cast<size_t>(MaterialTextureSlot::BaseColor)],
+                    src.pbrData.baseColorTexture ? &*src.pbrData.baseColorTexture : nullptr, TextureRole::BaseColor);
+            fillRef(dst.metallicRoughnessTexture,
+                    pendingMat.textureSlots[static_cast<size_t>(MaterialTextureSlot::MetallicRoughness)],
+                    src.pbrData.metallicRoughnessTexture ? &*src.pbrData.metallicRoughnessTexture : nullptr,
+                    TextureRole::MetallicRoughness);
+            fillRef(dst.normalTexture, pendingMat.textureSlots[static_cast<size_t>(MaterialTextureSlot::Normal)],
+                    src.normalTexture ? static_cast<const fastgltf::TextureInfo*>(&*src.normalTexture) : nullptr,
+                    TextureRole::Normal);
+            fillRef(dst.occlusionTexture, pendingMat.textureSlots[static_cast<size_t>(MaterialTextureSlot::Occlusion)],
+                    src.occlusionTexture ? static_cast<const fastgltf::TextureInfo*>(&*src.occlusionTexture) : nullptr,
+                    TextureRole::Occlusion);
+            fillRef(dst.emissiveTexture, pendingMat.textureSlots[static_cast<size_t>(MaterialTextureSlot::Emissive)],
+                    src.emissiveTexture ? &*src.emissiveTexture : nullptr, TextureRole::Emissive);
 
-        // Every unimplemented KHR_materials_* [log-don't-drop, one WARN
-        // per material+extension -- matrix-issue02 §2B shared criterion].
-        const auto warnExt = [&](bool present, std::string_view extName, std::string_view extra = {}) {
-            if (!present) {
-                return;
+            const auto warnExt = [&](bool present, std::string_view extName, std::string_view extra = {}) {
+                if (!present) {
+                    return;
+                }
+                std::lock_guard<std::mutex> lock(materialLogMutex);
+                if (extra.empty()) {
+                    RX_LOG_WARN("rx_asset: material '{}': {} is parsed but not consumed (log-don't-drop)", dst.name, extName);
+                } else {
+                    RX_LOG_WARN("rx_asset: material '{}': {} is parsed but not consumed ({})", dst.name, extName, extra);
+                }
+            };
+            if (src.emissiveStrength != 1.0F) {
+                std::lock_guard<std::mutex> lock(materialLogMutex);
+                RX_LOG_WARN("rx_asset: material '{}': KHR_materials_emissive_strength is parsed but not consumed (value={})",
+                            dst.name, src.emissiveStrength);
             }
-            if (extra.empty()) {
-                RX_LOG_WARN("rx_asset: material '{}': {} is parsed but not consumed (log-don't-drop)", dst.name, extName);
-            } else {
-                RX_LOG_WARN("rx_asset: material '{}': {} is parsed but not consumed ({})", dst.name, extName, extra);
-            }
-        };
-        // [fix round 1] KHR_materials_emissive_strength: the value IS
-        // carried for free (dst.emissiveStrength above, MaterialAsset's
-        // own field) -- but per the shared KHR_materials_* log-don't-drop
-        // criterion, a non-default value must ALSO produce a WARN naming
-        // the material and the value (this project's own row text: "the
-        // value is already in the parsed material if the techniques
-        // phase wants it preserved-in-parameter-set at zero cost" --
-        // "preserved at zero cost" is not the same claim as "logged";
-        // this call is what the log half actually requires, and was
-        // previously missing entirely despite the field being carried).
-        if (src.emissiveStrength != 1.0F) {
-            RX_LOG_WARN("rx_asset: material '{}': KHR_materials_emissive_strength is parsed but not consumed (value={})",
-                        dst.name, src.emissiveStrength);
+            warnExt(src.specular != nullptr, "KHR_materials_specular");
+            warnExt(src.ior != 1.5F, "KHR_materials_ior");
+            warnExt(src.iridescence != nullptr, "KHR_materials_iridescence");
+            warnExt(src.volume != nullptr, "KHR_materials_volume");
+            warnExt(src.transmission != nullptr, "KHR_materials_transmission", "material will render OPAQUE (transmission ignored)");
+            warnExt(src.sheen != nullptr, "KHR_materials_sheen");
+            warnExt(src.clearcoat != nullptr, "KHR_materials_clearcoat");
+            warnExt(src.anisotropy != nullptr, "KHR_materials_anisotropy");
+            warnExt(src.dispersion != 0.0F, "KHR_materials_dispersion");
+            warnExt(src.diffuseTransmission != nullptr, "KHR_materials_diffuse_transmission");
         }
-        warnExt(src.specular != nullptr, "KHR_materials_specular");
-        warnExt(src.ior != 1.5F, "KHR_materials_ior");
-        warnExt(src.iridescence != nullptr, "KHR_materials_iridescence");
-        warnExt(src.volume != nullptr, "KHR_materials_volume");
-        warnExt(src.transmission != nullptr, "KHR_materials_transmission", "material will render OPAQUE (transmission ignored)");
-        warnExt(src.sheen != nullptr, "KHR_materials_sheen");
-        warnExt(src.clearcoat != nullptr, "KHR_materials_clearcoat");
-        warnExt(src.anisotropy != nullptr, "KHR_materials_anisotropy");
-        warnExt(src.dispersion != 0.0F, "KHR_materials_dispersion");
-        warnExt(src.diffuseTransmission != nullptr, "KHR_materials_diffuse_transmission");
-    }
+    });
 
     // ================= Meshes / primitives =================
-    struct PendingSubmesh {
-        size_t meshIndex = 0;
-        PrimitiveOutput output;
-        std::optional<size_t> materialSourceIndex;
-        MaterialHandle material;
-        SkinVertexData skinVertices;
-        std::vector<MorphTarget> morphTargets;
-    };
-
-    // One flattened (meshIndex, primitiveIndex) work-list entry per
-    // TRIANGLES primitive with a POSITION attribute -- everything else
-    // is filtered out (WARNed) before the parallel fan-out so worker
-    // chunks never need to reason about skip conditions.
     struct WorkItem {
         size_t meshIndex;
         size_t primitiveIndex;
@@ -934,7 +985,6 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
             }
             workItems.push_back({mi, pi});
 
-            // [log-don't-drop] unconsumed attribute sets.
             for (auto* extra : {"COLOR_0"}) {
                 if (prim.findAttribute(extra) != prim.attributes.end()) {
                     RX_LOG_WARN("rx_asset: mesh {} primitive {}: attribute {} is present but not consumed", mi, pi, extra);
@@ -953,15 +1003,6 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
                 }
             }
 
-            // [KHR_materials_variants, log-don't-drop, matrix-issue02 §2B
-            // row -- fix round 1] `Primitive::mappings` is PRIMITIVE-level
-            // (a per-primitive variant->material override list), not
-            // material-level -- it cannot live in the material warnExt
-            // loop above (which only ever sees one Material at a time,
-            // with no notion of which primitive/variant selected it).
-            // The primitive's own `materialIndex` (already the base/
-            // default material per the extension's own spec text) is
-            // used unconditionally; only the WARN is new here.
             if (!prim.mappings.empty()) {
                 RX_LOG_WARN(
                     "rx_asset: mesh {} primitive {}: KHR_materials_variants present ({} variant mapping(s)) -- not "
@@ -971,9 +1012,41 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
         }
     }
 
-    std::vector<PendingSubmesh> pending(workItems.size());
+    result.itemsTotal = static_cast<uint32_t>(workItems.size());
+    for (const auto& mat : result.materials) {
+        for (const auto& slot : mat.textureSlots) {
+            if (slot.attempted) {
+                ++result.itemsTotal;
+            }
+        }
+    }
+    if (itemsTotalOut != nullptr) {
+        itemsTotalOut->store(result.itemsTotal, std::memory_order_release);
+    }
+
+    setStage(stageOut, ImportStage::Optimizing);
+
+    if (isCancelled(cancelled)) {
+        result.cancelled = true;
+        return result;
+    }
+
+    // pending[w] mirrors today's per-primitive processing exactly --
+    // written by INDEX (never appended), so file order survives
+    // regardless of worker completion order (the ordering-rule
+    // determinism criterion).
+    struct PendingPrimitive {
+        size_t meshIndex = 0;
+        PrimitiveOutput output;
+        std::optional<size_t> materialSourceIndex;
+        SkinVertexData skinVertices;
+        std::vector<MorphTarget> morphTargets;
+    };
+    std::vector<PendingPrimitive> pending(workItems.size());
     std::mutex logMutex;
+    RX_PLOT("async import: primitives", static_cast<int64_t>(workItems.size()));
     scheduler.parallelFor(static_cast<uint32_t>(workItems.size()), [&](uint32_t begin, uint32_t end, uint32_t) {
+        RX_ZONE_NAMED("primitive decode/optimize chunk");
         for (uint32_t w = begin; w < end; ++w) {
             const size_t mi = workItems[w].meshIndex;
             const size_t pi = workItems[w].primitiveIndex;
@@ -1014,18 +1087,12 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
                 if (prim.indicesAccessor) {
                     indices = readAccessor<uint32_t>(asset, asset.accessors[*prim.indicesAccessor], adapter);
                 }
-                // [seed 14, preserve-later] JOINTS_0/WEIGHTS_0, in SOURCE order.
                 if (auto j = prim.findAttribute("JOINTS_0"); j != prim.attributes.end()) {
                     skinVertices.joints = readAccessor<glm::u16vec4>(asset, asset.accessors[j->accessorIndex], adapter);
                 }
                 if (auto wgt = prim.findAttribute("WEIGHTS_0"); wgt != prim.attributes.end()) {
                     skinVertices.weights = readAccessor<glm::vec4>(asset, asset.accessors[wgt->accessorIndex], adapter);
                 }
-                // [preserve-later] Morph targets, in SOURCE order (see
-                // mesh_asset.h's own comment). One MorphTarget per
-                // primitive.targets[] entry; each target's own
-                // POSITION/NORMAL/TANGENT sub-attribute is independently
-                // optional per the glTF spec.
                 for (const auto& targetAttrs : prim.targets) {
                     MorphTarget target;
                     for (const auto& attr : targetAttrs) {
@@ -1048,15 +1115,12 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
             input.tangents = tangents;
             input.indices = indices;
 
-            PendingSubmesh& out = pending[w];
+            PendingPrimitive& out = pending[w];
             out.meshIndex = mi;
             out.output = processPrimitive(input);
             out.skinVertices = std::move(skinVertices);
             out.morphTargets = std::move(morphTargets);
             if (prim.materialIndex) {
-                // Resolved to a real MaterialHandle in the sequential
-                // pass just after this parallelFor() call, once
-                // materials are registered (main-thread-only, D5).
                 out.materialSourceIndex = *prim.materialIndex;
             }
 
@@ -1079,25 +1143,20 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
                                 mi, pi);
                 }
             }
+            if (itemsCompleted != nullptr) {
+                itemsCompleted->fetch_add(1, std::memory_order_relaxed);
+            }
         }
     });
 
-    // ================= Register materials (must happen before mesh
-    // registration resolves the stashed handles above) =================
-    for (auto& mat : materials) {
-        result.materials.push_back(registry.registerMaterial(mat));
-    }
-    // Resolve the stashed source material indices from the parallel
-    // section above into real MaterialHandles now that materials are
-    // registered.
-    for (auto& p : pending) {
-        p.material = (p.materialSourceIndex && *p.materialSourceIndex < result.materials.size())
-                         ? result.materials[*p.materialSourceIndex]
-                         : registry.fallbackMaterialHandle();
+    if (isCancelled(cancelled)) {
+        result.cancelled = true;
+        return result;
     }
 
-    // ================= ONE combined GeometryPool upload for the whole
-    // file [matrix row 12: sync import waits ONCE, never per-primitive] =================
+    // ================= ONE combined vertex/index array for the whole
+    // file [matrix row 12: sync import waits ONCE, never per-primitive;
+    // the async path uploads ONCE too -- same combined-buffer shape] ====
     size_t totalVertices = 0, totalIndices = 0;
     for (const auto& p : pending) {
         if (p.output.ok) {
@@ -1105,58 +1164,49 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
             totalIndices += p.output.indices.size();
         }
     }
+    result.combinedVertices.reserve(totalVertices);
+    result.combinedIndices.reserve(totalIndices);
 
-    std::vector<PoolVertex> combinedVertices;
-    std::vector<uint32_t> combinedIndices;
-    combinedVertices.reserve(totalVertices);
-    combinedIndices.reserve(totalIndices);
-
-    struct SubmeshOffset {
-        size_t vertexStart, vertexCount, indexStart, indexCount;
-    };
-    std::vector<SubmeshOffset> offsets(pending.size());
+    result.submeshes.resize(pending.size());
     for (size_t i = 0; i < pending.size(); ++i) {
-        if (!pending[i].output.ok) {
+        PendingSubmeshCompute& sub = result.submeshes[i];
+        sub.meshIndex = pending[i].meshIndex;
+        sub.ok = pending[i].output.ok;
+        if (!sub.ok) {
             continue;
         }
-        offsets[i].vertexStart = combinedVertices.size();
-        offsets[i].vertexCount = pending[i].output.vertices.size();
-        offsets[i].indexStart = combinedIndices.size();
-        offsets[i].indexCount = pending[i].output.indices.size();
-        combinedVertices.insert(combinedVertices.end(), pending[i].output.vertices.begin(), pending[i].output.vertices.end());
-        combinedIndices.insert(combinedIndices.end(), pending[i].output.indices.begin(), pending[i].output.indices.end());
+        sub.vertexStart = result.combinedVertices.size();
+        sub.vertexCount = pending[i].output.vertices.size();
+        sub.indexStart = result.combinedIndices.size();
+        sub.indexCount = pending[i].output.indices.size();
+        sub.bounds = pending[i].output.bounds;
+        sub.materialIndex = pending[i].materialSourceIndex.value_or(SIZE_MAX);
+        sub.skinVertices = std::move(pending[i].skinVertices);
+        sub.morphTargets = std::move(pending[i].morphTargets);
+        result.combinedVertices.insert(result.combinedVertices.end(), pending[i].output.vertices.begin(),
+                                        pending[i].output.vertices.end());
+        result.combinedIndices.insert(result.combinedIndices.end(), pending[i].output.indices.begin(),
+                                       pending[i].output.indices.end());
     }
 
-    MeshRange combinedRange;
-    if (!combinedVertices.empty()) {
-        combinedRange = pool.upload(combinedVertices, combinedIndices);
-        result.poolUploadCallCountForTesting += 1;
-    }
-
-    // ================= Assemble MeshAsset per source mesh =================
-    result.meshes.resize(asset.meshes.size());
+    // ================= Per-mesh LOCAL bounds (needed by node-flatten
+    // below, computed WITHOUT any registry access -- unlike the old
+    // single-pipeline code, which read this back from an already-
+    // registered MeshAsset) + morph weights =================
+    result.meshCount = asset.meshes.size();
+    result.meshMorphWeights.resize(result.meshCount);
+    result.meshSkins.resize(result.meshCount);
+    std::vector<AABB> meshBoundsLocal(result.meshCount);
     for (size_t mi = 0; mi < asset.meshes.size(); ++mi) {
-        MeshAsset meshAsset;
         for (float w : asset.meshes[mi].weights) {
-            meshAsset.morphWeights.push_back(w);
+            result.meshMorphWeights[mi].push_back(w);
         }
-        for (size_t i = 0; i < pending.size(); ++i) {
-            if (pending[i].meshIndex != mi || !pending[i].output.ok) {
-                continue;
-            }
-            Submesh sub;
-            sub.range.blockId = combinedRange.blockId;
-            sub.range.vertexOffset = combinedRange.vertexOffset + static_cast<int32_t>(offsets[i].vertexStart);
-            sub.range.firstIndex = combinedRange.firstIndex + static_cast<uint32_t>(offsets[i].indexStart);
-            sub.range.indexCount = static_cast<uint32_t>(offsets[i].indexCount);
-            sub.bounds = pending[i].output.bounds;
-            sub.material = pending[i].material;
-            sub.skinVertices = std::move(pending[i].skinVertices);
-            sub.morphTargets = std::move(pending[i].morphTargets);
-            meshAsset.bounds = AABB::unionOf(meshAsset.bounds, sub.bounds);
-            meshAsset.submeshes.push_back(std::move(sub));
+    }
+    for (const PendingSubmeshCompute& sub : result.submeshes) {
+        if (!sub.ok) {
+            continue;
         }
-        result.meshes[mi] = registry.registerMesh(std::move(meshAsset));
+        meshBoundsLocal[sub.meshIndex] = AABB::unionOf(meshBoundsLocal[sub.meshIndex], sub.bounds);
     }
 
     // ================= D12: node-graph flattening + preserved cameras/lights =================
@@ -1171,6 +1221,7 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
 
         if (node.meshIndex) {
             const size_t mi = *node.meshIndex;
+            const AABB& localBounds = mi < meshBoundsLocal.size() ? meshBoundsLocal[mi] : AABB{};
             if (!node.instancingAttributes.empty()) {
                 // [N2 ADOPTED] EXT_mesh_gpu_instancing: expand into one
                 // InstanceRecord per instance.
@@ -1201,33 +1252,29 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
                         glm::translate(glm::mat4(1.0F), t) * glm::mat4_cast(r) * glm::scale(glm::mat4(1.0F), s);
                     const glm::mat4 instanceWorld = world * instanceLocal;
 
-                    InstanceRecord rec;
-                    rec.mesh = result.meshes[mi];
+                    PendingInstance rec;
+                    rec.meshIndex = mi;
                     rec.worldTransform = instanceWorld;
                     rec.negativeDeterminant = hasNegativeDeterminant(instanceWorld);
                     rec.sourceNodeIndex = static_cast<int32_t>(nodeIndex);
-                    if (const MeshAsset* meshAsset = registry.meshes_.get(rec.mesh)) {
-                        rec.worldBounds = meshAsset->bounds.transformed(instanceWorld);
-                    }
+                    rec.worldBounds = localBounds.transformed(instanceWorld);
                     if (rec.negativeDeterminant) {
                         RX_LOG_WARN("rx_asset: node {} instance {}: negative-determinant transform (winding flip)", nodeIndex, inst);
                     }
-                    result.scene.instances.push_back(rec);
+                    result.instances.push_back(rec);
                 }
             } else {
-                InstanceRecord rec;
-                rec.mesh = result.meshes[mi];
+                PendingInstance rec;
+                rec.meshIndex = mi;
                 rec.worldTransform = world;
                 rec.negativeDeterminant = hasNegativeDeterminant(world);
                 rec.sourceNodeIndex = static_cast<int32_t>(nodeIndex);
-                if (const MeshAsset* meshAsset = registry.meshes_.get(rec.mesh)) {
-                    rec.worldBounds = meshAsset->bounds.transformed(world);
-                }
+                rec.worldBounds = localBounds.transformed(world);
                 if (rec.negativeDeterminant) {
                     RX_LOG_WARN("rx_asset: node {} ('{}'): negative-determinant transform (winding flip)", nodeIndex,
                                 std::string(node.name));
                 }
-                result.scene.instances.push_back(rec);
+                result.instances.push_back(rec);
             }
         }
 
@@ -1255,7 +1302,7 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
                 cd.znear = ortho.znear;
                 cd.zfar = ortho.zfar;
             }
-            result.scene.cameras.push_back(cd);
+            result.cameras.push_back(cd);
         }
 
         if (node.lightIndex) {
@@ -1286,7 +1333,7 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
                     ld.type = LightData::Type::Point;
                     break;
             }
-            result.scene.lights.push_back(ld);
+            result.lights.push_back(ld);
         }
 
         for (size_t child : node.children) {
@@ -1330,14 +1377,6 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
             sd.inputTimes = readAccessor<float>(asset, asset.accessors[samp.inputAccessor], adapter);
             const fastgltf::Accessor& outAcc = asset.accessors[samp.outputAccessor];
 
-            // Animation sampler outputs are SCALAR (Weights path -- a
-            // flat "morphTargetCount per keyframe" list, per the glTF
-            // spec's own animation.sampler schema), VEC3 (Translation/
-            // Scale), or VEC4 (Rotation quaternions). Dispatch on the
-            // accessor's OWN declared type and flatten via the normal
-            // accessor tools -- never a raw byte poke -- matching
-            // AnimationSamplerData::outputFlat's documented "glTF-native
-            // on-disk layout verbatim" contract (mesh_asset.h).
             switch (outAcc.type) {
                 case fastgltf::AccessorType::Scalar: {
                     sd.elementStride = 1;
@@ -1396,21 +1435,22 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
             }
             clip.channels.push_back(cd);
         }
-        result.scene.animations.push_back(std::move(clip));
+        result.animations.push_back(std::move(clip));
     }
 
-    // Attach skin data [seed 14] to each mesh from whichever node
-    // referenced (mesh, skin) together.
+    // Attach skin data [seed 14] to each mesh's LOCAL compute-side record
+    // (no registry access -- unlike the old single-pipeline code, which
+    // mutated an already-registered MeshAsset* in place).
     for (size_t nodeIdx = 0; nodeIdx < asset.nodes.size(); ++nodeIdx) {
         const fastgltf::Node& node = asset.nodes[nodeIdx];
         if (!node.meshIndex || !node.skinIndex) {
             continue;
         }
-        const fastgltf::Skin& skin = asset.skins[*node.skinIndex];
-        MeshAsset* meshAsset = registry.meshes_.get(result.meshes[*node.meshIndex]);
-        if (meshAsset == nullptr || meshAsset->skin.present) {
+        const size_t mi = *node.meshIndex;
+        if (mi >= result.meshSkins.size() || result.meshSkins[mi].present) {
             continue;
         }
+        const fastgltf::Skin& skin = asset.skins[*node.skinIndex];
         SkinData sd;
         sd.present = true;
         sd.name = std::string(skin.name);
@@ -1423,11 +1463,302 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
         if (skin.inverseBindMatrices) {
             sd.inverseBindMatrices = readAccessor<glm::mat4>(asset, asset.accessors[*skin.inverseBindMatrices], adapter);
         }
-        meshAsset->skin = std::move(sd);
+        result.meshSkins[mi] = std::move(sd);
+    }
+
+    if (isCancelled(cancelled)) {
+        result.cancelled = true;
+        return result;
     }
 
     result.error = ImportError::None;
     return result;
+}
+
+// ---------------------------------------------------------------------
+// The marshal-phase entry points [Task 15] -- MarshalPendingImport itself
+// is fully defined in import_pipeline.h (not here): it is held as a
+// std::unique_ptr<MarshalPendingImport> MEMBER of registry.cpp's own
+// AsyncImportJob, which needs the complete type to generate its own
+// destructor in THAT translation unit -- the classic reason a pImpl-style
+// forward declaration alone does not suffice once a unique_ptr to it
+// becomes a data member elsewhere.
+// ---------------------------------------------------------------------
+
+namespace {
+
+// Shared by marshalGltfImportSync() and marshalGltfImportPrepareDeferred()
+// -- registers every decoded texture (main-thread GPU registration) and
+// every material, then patches submesh ranges against `combinedRange` and
+// assembles the final per-mesh MeshAsset array. Does NOT touch Registry at
+// all (mesh/material REGISTRATION is the caller's own job, since the sync
+// and deferred paths differ in exactly when that is safe to do -- sync:
+// immediately; deferred: only after upload tickets complete).
+void registerDecodedTexturesAndPatchMaterials(TextureCache* textures, ImportComputeResult& compute) {
+    if (textures == nullptr) {
+        return;
+    }
+    for (PendingMaterialCompute& mat : compute.materials) {
+        for (size_t slotIdx = 0; slotIdx < mat.textureSlots.size(); ++slotIdx) {
+            PendingTextureLoad& slot = mat.textureSlots[slotIdx];
+            if (!slot.attempted) {
+                continue;
+            }
+            TextureHandle handle = textures->registerDecoded(slot.decoded, slot.debugName);
+            textureRefForSlot(mat.asset, static_cast<MaterialTextureSlot>(slotIdx)).handle = handle;
+        }
+    }
+}
+
+std::vector<MeshAsset> assembleMeshAssets(ImportComputeResult& compute, const MeshRange& combinedRange,
+                                           const std::vector<MaterialHandle>& materialHandles) {
+    std::vector<MeshAsset> meshAssets(compute.meshCount);
+    for (size_t mi = 0; mi < compute.meshCount; ++mi) {
+        meshAssets[mi].morphWeights = compute.meshMorphWeights[mi];
+        meshAssets[mi].skin = compute.meshSkins[mi];
+    }
+    for (PendingSubmeshCompute& sub : compute.submeshes) {
+        if (!sub.ok) {
+            continue;
+        }
+        Submesh out;
+        out.range.blockId = combinedRange.blockId;
+        out.range.vertexOffset = combinedRange.vertexOffset + static_cast<int32_t>(sub.vertexStart);
+        out.range.firstIndex = combinedRange.firstIndex + static_cast<uint32_t>(sub.indexStart);
+        out.range.indexCount = static_cast<uint32_t>(sub.indexCount);
+        out.bounds = sub.bounds;
+        out.material = (sub.materialIndex != SIZE_MAX && sub.materialIndex < materialHandles.size())
+                           ? materialHandles[sub.materialIndex]
+                           : MaterialHandle{};
+        out.skinVertices = std::move(sub.skinVertices);
+        out.morphTargets = std::move(sub.morphTargets);
+        MeshAsset& meshAsset = meshAssets[sub.meshIndex];
+        meshAsset.bounds = AABB::unionOf(meshAsset.bounds, out.bounds);
+        meshAsset.submeshes.push_back(std::move(out));
+    }
+    return meshAssets;
+}
+
+}  // namespace
+
+ImportResult marshalGltfImportSync(Registry& registry, GeometryPool& pool, TextureCache* textures,
+                                    ImportComputeResult&& computeIn) {
+    RX_ZONE_NAMED("marshalGltfImportSync (upload-marshal + registry-commit)");
+    ImportComputeResult compute = std::move(computeIn);
+    ImportResult result;
+    if (compute.error != ImportError::None || compute.cancelled) {
+        result.error = compute.error != ImportError::None ? compute.error : ImportError::None;
+        return result;
+    }
+
+    // Textures + materials.
+    registerDecodedTexturesAndPatchMaterials(textures, compute);
+    result.materials.reserve(compute.materials.size());
+    for (PendingMaterialCompute& mat : compute.materials) {
+        result.materials.push_back(registry.registerMaterial(std::move(mat.asset)));
+    }
+
+    // Geometry: ONE blocking upload, matching the pre-Task-15 contract
+    // exactly (GeometryPool::upload() flushes+waits internally).
+    MeshRange combinedRange;
+    if (!compute.combinedVertices.empty()) {
+        combinedRange = pool.upload(compute.combinedVertices, compute.combinedIndices);
+        result.poolUploadCallCountForTesting += 1;
+    }
+
+    std::vector<MeshAsset> meshAssets = assembleMeshAssets(compute, combinedRange, result.materials);
+    result.meshes.reserve(meshAssets.size());
+    for (MeshAsset& meshAsset : meshAssets) {
+        result.meshes.push_back(registry.registerMesh(std::move(meshAsset)));
+    }
+
+    result.scene.instances.reserve(compute.instances.size());
+    for (const PendingInstance& pi : compute.instances) {
+        InstanceRecord rec;
+        rec.mesh = (pi.meshIndex != SIZE_MAX && pi.meshIndex < result.meshes.size()) ? result.meshes[pi.meshIndex]
+                                                                                       : MeshHandle{};
+        rec.worldTransform = pi.worldTransform;
+        rec.worldBounds = pi.worldBounds;
+        rec.negativeDeterminant = pi.negativeDeterminant;
+        rec.sourceNodeIndex = pi.sourceNodeIndex;
+        result.scene.instances.push_back(rec);
+    }
+    result.scene.cameras = std::move(compute.cameras);
+    result.scene.lights = std::move(compute.lights);
+    result.scene.animations = std::move(compute.animations);
+
+    result.error = ImportError::None;
+    return result;
+}
+
+std::unique_ptr<MarshalPendingImport> marshalGltfImportBeginDeferred(ImportComputeResult&& computeIn) {
+    auto pending = std::make_unique<MarshalPendingImport>();
+    pending->compute = std::move(computeIn);
+    if (pending->compute.error != ImportError::None || pending->compute.cancelled) {
+        pending->texturesPrepared = true;
+        pending->geometryPrepared = true;
+    }
+    return pending;
+}
+
+bool marshalGltfImportPrepareStep(GeometryPool& pool, TextureCache* textures, MarshalPendingImport& pending) {
+    RX_ZONE_NAMED("marshalGltfImportPrepareStep (upload-marshal)");
+    ImportComputeResult& compute = pending.compute;
+
+    // Texture slots, ONE at a time, in (material, slot) file order --
+    // registered NOW (main thread), but neither flushed nor waited on --
+    // see TextureCache::registerDecoded()'s own comment. Nothing outside
+    // this MarshalPendingImport can reach the freshly-registered handles
+    // yet (Registry mutation -- the only thing that WOULD expose them --
+    // happens strictly later, in marshalGltfImportFinalize(), only once
+    // every ticket below is confirmed complete), so registering slightly
+    // ahead of GPU completion is safe: no renderer can sample an
+    // in-flight transfer's destination through a handle nothing has
+    // published yet.
+    if (!pending.texturesPrepared) {
+        if (textures == nullptr) {
+            pending.texturesPrepared = true;
+        } else {
+            while (pending.nextMaterialIndex < compute.materials.size()) {
+                PendingMaterialCompute& mat = compute.materials[pending.nextMaterialIndex];
+                if (pending.nextSlotIndex >= mat.textureSlots.size()) {
+                    pending.nextSlotIndex = 0;
+                    ++pending.nextMaterialIndex;
+                    continue;
+                }
+                const size_t slotIdx = pending.nextSlotIndex++;
+                PendingTextureLoad& slot = mat.textureSlots[slotIdx];
+                if (!slot.attempted) {
+                    continue;  // free -- no GPU work, keep draining this same step
+                }
+                TextureHandle handle = textures->registerDecoded(slot.decoded, slot.debugName);
+                textureRefForSlot(mat.asset, static_cast<MaterialTextureSlot>(slotIdx)).handle = handle;
+                pending.hasTextureUploads = true;
+                return true;  // ONE real texture registered this call -- yield to the caller's own pump loop
+            }
+            pending.texturesPrepared = true;
+            if (pending.hasTextureUploads) {
+                pending.textureTicket = textures->flushPendingUploads();
+                pending.textureTicketIssued = true;
+            }
+        }
+        return true;  // still have the geometry step left, even if no texture work remained
+    }
+
+    // Geometry: ONE combined upload for the whole file (matching the
+    // sync path's own "upload once" contract) -- cheap enough relative to
+    // the texture case above (this task's own wall-clock-gate testing
+    // found the texture batch, not geometry, was what blew the budget)
+    // that it does not need its own further slicing.
+    if (!pending.geometryPrepared) {
+        if (!compute.combinedVertices.empty()) {
+            RX_PLOT("async import: bytes uploaded (geometry)",
+                    static_cast<int64_t>(compute.combinedVertices.size() * sizeof(PoolVertex) +
+                                          compute.combinedIndices.size() * sizeof(uint32_t)));
+            pending.combinedRange = pool.uploadDeferred(compute.combinedVertices, compute.combinedIndices);
+            pending.hasGeometry = pending.combinedRange.indexCount > 0;
+        }
+        if (pending.hasGeometry) {
+            pending.poolTicket = pool.flushPendingUploads();
+            pending.poolTicketIssued = true;
+        }
+        pending.geometryPrepared = true;
+        return true;
+    }
+
+    return false;  // fully prepared -- caller now polls ticket completion
+}
+
+bool marshalGltfImportUploadsComplete(const GeometryPool& pool, const TextureCache* textures,
+                                       const MarshalPendingImport& pending) {
+    if (pending.poolTicketIssued && !pool.isUploadComplete(pending.poolTicket)) {
+        return false;
+    }
+    if (pending.textureTicketIssued && textures != nullptr && !textures->isUploadComplete(pending.textureTicket)) {
+        return false;
+    }
+    return true;
+}
+
+ImportResult marshalGltfImportFinalize(Registry& registry, std::unique_ptr<MarshalPendingImport> pendingPtr) {
+    RX_ZONE_NAMED("marshalGltfImportFinalize (registry-commit)");
+    MarshalPendingImport pending = std::move(*pendingPtr);
+    ImportComputeResult& compute = pending.compute;
+    ImportResult result;
+    if (compute.error != ImportError::None || compute.cancelled) {
+        result.error = compute.error;
+        return result;
+    }
+
+    result.materials.reserve(compute.materials.size());
+    for (PendingMaterialCompute& mat : compute.materials) {
+        result.materials.push_back(registry.registerMaterial(std::move(mat.asset)));
+    }
+
+    std::vector<MeshAsset> meshAssets = assembleMeshAssets(compute, pending.combinedRange, result.materials);
+    result.meshes.reserve(meshAssets.size());
+    for (MeshAsset& meshAsset : meshAssets) {
+        result.meshes.push_back(registry.registerMesh(std::move(meshAsset)));
+    }
+    result.poolUploadCallCountForTesting = pending.hasGeometry ? 1 : 0;
+
+    result.scene.instances.reserve(compute.instances.size());
+    for (const PendingInstance& pi : compute.instances) {
+        InstanceRecord rec;
+        rec.mesh = (pi.meshIndex != SIZE_MAX && pi.meshIndex < result.meshes.size()) ? result.meshes[pi.meshIndex]
+                                                                                       : MeshHandle{};
+        rec.worldTransform = pi.worldTransform;
+        rec.worldBounds = pi.worldBounds;
+        rec.negativeDeterminant = pi.negativeDeterminant;
+        rec.sourceNodeIndex = pi.sourceNodeIndex;
+        result.scene.instances.push_back(rec);
+    }
+    result.scene.cameras = std::move(compute.cameras);
+    result.scene.lights = std::move(compute.lights);
+    result.scene.animations = std::move(compute.animations);
+
+    result.error = ImportError::None;
+    return result;
+}
+
+void marshalGltfImportRollback(GeometryPool& pool, TextureCache* textures, std::unique_ptr<MarshalPendingImport> pendingPtr) {
+    if (!pendingPtr) {
+        return;
+    }
+    MarshalPendingImport pending = std::move(*pendingPtr);
+    if (pending.hasGeometry) {
+        pool.free(pending.combinedRange);
+    }
+    if (textures != nullptr) {
+        for (PendingMaterialCompute& mat : pending.compute.materials) {
+            for (size_t slotIdx = 0; slotIdx < mat.textureSlots.size(); ++slotIdx) {
+                PendingTextureLoad& slot = mat.textureSlots[slotIdx];
+                if (!slot.attempted || slot.decoded.outcome != TextureDecodeResult::Outcome::Ready) {
+                    continue;
+                }
+                TextureHandle handle = textureRefForSlot(mat.asset, static_cast<MaterialTextureSlot>(slotIdx)).handle;
+                textures->releaseUnpublished(handle);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// The pre-Task-15 sync orchestration entry point -- now a thin wrapper.
+// ---------------------------------------------------------------------
+
+ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> documentBytes, ByteSource& source, GeometryPool& pool,
+                                 rx::task::Scheduler& scheduler, TextureCache* textures) {
+    ImportComputeResult compute =
+        computeGltfImport(documentBytes, source, scheduler, textures, registry.fallbackTextureHandle(),
+                           snapshotTextureFallbackHandles(textures), /*cancelled=*/nullptr, /*itemsCompleted=*/nullptr,
+                           /*itemsTotalOut=*/nullptr, /*stageOut=*/nullptr);
+    if (compute.error != ImportError::None) {
+        ImportResult result;
+        result.error = compute.error;
+        return result;
+    }
+    return marshalGltfImportSync(registry, pool, textures, std::move(compute));
 }
 
 }  // namespace rx::asset
