@@ -1,0 +1,2908 @@
+=== COMMITS ===
+b570603 docs: Task 11 completion report
+ee01d7d fix: size the wall-clock non-blocking test to actually discriminate
+37d9466 feat: Uploader completion tickets -- non-blocking flush via timeline semaphore
+
+=== STAT ===
+ .../task-11-report.md                              | 356 ++++++++++++++++
+ docs/threading.md                                  |  20 +-
+ samples/03_bindless_mesh/main.cpp                  |  16 +-
+ samples/04_streaming/main.cpp                      |  52 ++-
+ samples/05_multipass/main.cpp                      |  14 +-
+ samples/06_materials/main.cpp                      |  12 +-
+ samples/07_stress/main.cpp                         |   7 +-
+ src/rx_material/material_system.cpp                |   8 +-
+ src/rx_rhi_vk/include/rx_rhi_vk/device.h           |  29 ++
+ src/rx_rhi_vk/include/rx_rhi_vk/mesh_buffers.h     |  20 +-
+ src/rx_rhi_vk/include/rx_rhi_vk/upload.h           | 310 +++++++++++---
+ src/rx_rhi_vk/src/device.cpp                       |  55 +++
+ src/rx_rhi_vk/src/mesh_buffers.cpp                 |  41 +-
+ src/rx_rhi_vk/src/upload.cpp                       | 331 ++++++++++++---
+ src/rx_rhi_vk/tests/device_test.cpp                |  45 ++
+ src/rx_rhi_vk/tests/texture_test.cpp               |   8 +-
+ src/rx_rhi_vk/tests/upload_test.cpp                | 470 ++++++++++++++++++++-
+ 17 files changed, 1609 insertions(+), 185 deletions(-)
+
+=== FULL DIFF (U10) ===
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-11-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-11-report.md
+new file mode 100644
+index 0000000..0c8dd0b
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-11-report.md
+@@ -0,0 +1,356 @@
++# Task 11 report — Uploader completion tickets: non-blocking flush invariant (card #28)
++
++Implementer: Sonnet, main checkout, base `2e1b55d`.
++
++Commits:
++- `37d9466` — `feat: Uploader completion tickets -- non-blocking flush via timeline semaphore`
++- `ee01d7d` — `fix: size the wall-clock non-blocking test to actually discriminate`
++
++## Summary
++
++`Uploader::flush()` now returns a pollable `UploadTicket` (timeline-
++semaphore value + ring generation) instead of blocking, per spec D25 as
++amended by gate ruling RC4. `isComplete(ticket)`/`wait(ticket)` added.
++Ring reclamation now keys off ticket completion (D3D12-pattern
++poll-reclaim-then-block-only-on-the-oldest-in-flight-ticket), not off
++having already blocked. `Device::create()` acquires an optional
++dedicated transfer queue via `get_dedicated_queue` (never `require_`),
++acquisition only. Every existing `Uploader::flush()` call site in the
++tree (samples 03/04/05/06/07, `rx_material`) was audited and migrated —
++most to an explicit `wait(ticket)` (preserving byte-identical blocking
++behavior, out of this task's primary scope), sample 04's eviction cycle
++to genuine `isComplete()` polling (the demonstrated non-blocking
++migration target, per plan Task 11's own text and matrix row 11).
++
++A structural hazard not named in the matrix, but necessary to fix for the
++redesign to be correct at all, is called out under **Self-review findings**
++below: reusing a single command buffer across un-awaited `flush()` calls
++is the same class of hazard as the fence-reuse one row 1 names, just for
++the command buffer. Fixed with a lazily-grown command-buffer rotation.
++
++## Files
++
++Modified (no new files):
++- `src/rx_rhi_vk/include/rx_rhi_vk/upload.h` / `src/upload.cpp` —
++  `UploadTicket`; `flush()` returns it instead of `void`;
++  `isComplete()`/`wait()` added; one `VK_SEMAPHORE_TYPE_TIMELINE`
++  semaphore replaces the single reused `VkFence`; a lazily-grown
++  command-buffer rotation (`CmdSlot`) replaces the single reused command
++  buffer; `pendingRegions_` FIFO (D3D12-pattern) drives ring reclamation;
++  `ringWrapCount()`/`blockingRingWaitCount()`/`ringCapacity()`
++  test/diagnostic accessors added.
++- `src/rx_rhi_vk/include/rx_rhi_vk/device.h` / `src/device.cpp` —
++  `features12.timelineSemaphore = VK_TRUE` (required unconditionally —
++  see **Technical finding** below); optional dedicated transfer queue
++  acquisition (`hasDedicatedTransferQueue()`/`transferQueue()`/
++  `transferQueueFamily()`), logged either way.
++- `src/rx_rhi_vk/include/rx_rhi_vk/mesh_buffers.h` / `src/mesh_buffers.cpp`
++  — `MeshBuffers::create()` keeps its blocking contract explicitly via
++  `wait(flush())` after each of its two uploads.
++- `src/rx_material/material_system.cpp` — `MaterialSystem::createTexture2D()`
++  (the public, synchronous ABI entry point) keeps its blocking contract
++  the same way — see **Deviation: call-site audit widened beyond sample
++  04** below for why this was in scope.
++- `samples/{03_bindless_mesh,04_streaming,05_multipass,06_materials,
++  07_stress}/main.cpp` — every discovered `Uploader::flush()` call site
++  migrated (see the same Deviation section).
++- `docs/threading.md` — `Uploader` entry: `flush()`/`isComplete()`/`wait()`
++  now `[guarded]`.
++- `src/rx_rhi_vk/tests/{upload_test.cpp,device_test.cpp,texture_test.cpp}`
++  — new tests (below) + existing readback-dependent tests updated to
++  `wait(flush())` explicitly (see **Deviation: existing upload_test.cpp/
++  texture_test.cpp assertions touched**).
++
++## Per matrix row: how satisfied + which test proves it
++
++| Row | What | Proof |
++|---|---|---|
++| 1 | Reused-fence hazard eliminated; overlapping flush(), first ticket reports its own true status | `upload_test.cpp`: `"...two overlapping flush() calls without waiting on the first ticket..."` — distinct/monotonic ticket values, `wait(ticketA)` succeeds independent of `ticketB`, `isComplete(ticketA)` stays true after `ticketB` also completes, zero validation errors. Eliminated **structurally** (no reset step exists for a timeline semaphore at all), not just by a runtime check — see below for why this specific row has no scratch-worktree revert (the pre-existing API shape, `void flush()`, cannot host this test at all) |
++| 2 | Primitive choice: timeline semaphore | RC4 ruling adopted verbatim; `upload.h`/`upload.cpp` |
++| 3 | `vkGetFenceStatus`-equivalent poll semantics (row 3 describes the fence variant; row 4 the chosen timeline variant) | N/A — fence variant not chosen |
++| 4 | `vkGetSemaphoreCounterValue` poll primitive, one call, no spin-loop | `Uploader::isComplete()` — one call, `current >= ticket.value` |
++| 5 | Ring reclamation, D3D12 (ticket, ring-offset) queue pattern, partial reclaim proven | `upload_test.cpp`: `"...ring-buffer reclamation under heavy wrap..."` — `blockingRingWaitCount() < flush() calls issued` (observed 0-4 blocking waits across 80 flush() calls issued, run-to-run — see Test evidence) |
++| 6 | Ring exhaustion: block-on-oldest, never silent growth | Same test: `ringCapacity()` asserted constant every iteration; `ringWrapCount() > 0` (observed 9 wraps into a 512-byte ring across 80×64-byte uploads) |
++| 7 | Image-only ticket never trivially complete, incomplete until GPU copy finishes | `upload_test.cpp`: `"...a ticket covering ONLY an image upload is never the trivially-complete sentinel..."` — `ticket.value != 0` deterministically; `CHECK_FALSE(isComplete(ticket))` immediately after `flush()` on a 16 MiB upload (best-effort timing probe, not load-bearing — see the test's own comment) |
++| 8 | Direct-path-only batch = already-complete ticket, zero semaphore machinery touched | `upload_test.cpp`: `"...a direct-path-only batch...returns an already-complete ticket..."` — `ticket.value == 0`, `isComplete()` true with no Vulkan call made (see `isComplete()`'s own `value == 0` short-circuit); also the empty-flush test |
++| 9 | Mixed batch: ticket covers only recorded work | `upload_test.cpp`: `"...mixing a direct-path buffer upload with a staging-path upload..."` — one nonzero ticket, both destinations readback-correct once it completes |
++| 10 | Transfer-queue acquisition via `get_dedicated_queue`, never `require_` | `device_test.cpp`: `"...acquires an optional dedicated transfer queue via get_dedicated_queue..."` — this dev machine's discrete GPU exposed a dedicated family (`hasDedicatedTransferQueue()==true`, distinct family index asserted); the `else` branch (graceful degrade) is exercised on hardware without one, per the test's own documented either-way assertions |
++| 11 | Sample 04 call-site migration, list not claimed exhaustive | Audited the whole file (`grep -n "flush("`): only two `flush()` sites exist (919, 1052), not three — line 1281/1580 are `Uploader::create()` sites with no local `flush()` call of their own. Line 919 (eviction cycle) migrated to genuine `isComplete()` polling; line 1052 (initial fill, pre-frame-loop) migrated to explicit `wait(flush())`, documented as deliberate |
++| 12 | `MeshBuffers::create()` blocking convenience via `wait(ticket)` | `mesh_buffers.cpp`; existing MeshBuffers-specific assertions in `upload_test.cpp` (`indexCount()`, buffer sizes, `mesh->vertexBuffer()`/`indexBuffer()` readbacks) are byte-for-byte unmodified — see the Deviation section for the one line in the SAME test case that did change (unrelated to `MeshBuffers::create()` itself) |
++| 13 | Wall-clock methodology: timer around the call, must fail against pre-D25 code | `upload_test.cpp`: `"...never block past a wall-clock threshold..."` + **mandatory scratch-worktree revert evidence**, below |
++| 14 | Validation-layer #5997 false positive cannot trigger under D5 | Not applicable by construction (main-thread-only, single-threaded test suite) — zero validation errors observed across the entire suite, every run |
++| 15 | Cross-queue submission out of scope | Verified: `grep -rn "transferQueue()"` across `src/`/`samples/` shows only the accessor definition/test — no call site submits to it |
++
++## Revert-discrimination evidence (mandatory, row 13)
++
++Per the brief: "the wall-clock test must FAIL against pre-D25 code to
++prove it discriminates." Done via a scratch git worktree (toolchain/
++`.deps-cache` symlinked in, not copied) checked out at commit `37d9466`
++(the real fix), with the pre-D25 defect **reintroduced surgically**
++inside `flush()`'s real submission path — a `vkWaitSemaphores` call
++right before the ticket is returned, simulating the old
++always-blocking contract on top of the new ticket-shaped API (the old
++`void flush()` signature cannot host the new test at all, so a literal
++"check out the pre-Task-11 commit" revert does not apply here — this is
++the mechanically closest equivalent, and it is what the wall-clock test
++actually needs to prove: that ITS OWN measured invariant fails when the
++underlying block is reintroduced).
++
++Sizing the payload took iteration: this dev machine's discrete GPU is
++fast enough that a genuine blocking round trip for 2 MiB only cost
++~670 µs, and even 32 MiB only ~4.2 ms — both under an 8 ms threshold,
++i.e. the test would have PASSED against the reverted code too (a false
++negative). Final sizing (128 MiB × 8 frames) was found empirically in
++the scratch worktree until the reverted case failed cleanly:
++
++```
++[scratch, reverted flush() blocks]
++TEST CASE: Uploader::flush()/isComplete() never block past a wall-clock
++threshold across many overlapped batches ...
++upload_test.cpp:692: ERROR: CHECK( flushDuration < kThreshold ) is NOT correct!
++  values: CHECK( 14054280ns <  8ms )
++  ... (8 of 8 iterations failed, worst-case 19135 us)
++worst-case flush() duration: 19135 us over 8 overlapped frames
++worst-case isComplete() duration: 17 us
++[doctest] test cases:  1 |  0 passed | 1 failed | 59 skipped
++[doctest] Status: FAILURE!
++```
++
++Same sizing against the real (non-reverted) implementation in the main
++worktree:
++
++```
++[main worktree, real non-blocking flush()]
++TEST CASE: Uploader::flush()/isComplete() never block past a wall-clock
++threshold across many overlapped batches ...
++worst-case flush() duration: 47 us over 8 overlapped frames
++worst-case isComplete() duration: 3 us
++[doctest] test cases:  1 |  1 passed | 0 failed | 59 skipped
++[doctest] Status: SUCCESS!
++```
++
++47 µs vs. 14-19 ms — roughly a 300-400× margin, non-flaky, and it
++directly demonstrates why `flush()`'s wall-clock cost is now
++independent of upload size (isComplete() stayed at 3-17 µs in both runs
++regardless of payload — only `flush()`'s own reintroduced block scaled
++with data). The scratch worktree was discarded (`git worktree remove
++--force`) after capturing this evidence; no scratch-only code is present
++in the committed tree.
++
++The overlapping-flush test (row 1, the single highest-priority gate) has
++no equivalent revert run: its discrimination is structural, not
++timing-based — the pre-Task-11 `void flush()` signature cannot host a
++ticket-returning test at all, so there is no mechanical way to run this
++exact test body against the old API. Its proof is the design argument
++itself (a timeline semaphore has no reset step, eliminating the
++reset-while-referenced hazard by construction) plus zero validation
++errors under `VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT`
++(confirmed active — `context.cpp:281`, every test fixture passes
++`enableValidation=true`).
++
++## Technical finding beyond the matrix's own wording
++
++`VkPhysicalDeviceVulkan12Features::timelineSemaphore` is a feature BIT
++that must be explicitly requested at device-creation time — despite
++`VK_KHR_timeline_semaphore`'s functionality being fully promoted into
++Vulkan 1.2 core, a device is not required to expose it just because API
++version ≥ 1.2 is requested. This was not caught until the first test run:
++`VkCreateSemaphore` hard-failed every fixture with
++`VUID-VkSemaphoreTypeCreateInfo-timelineSemaphore-03252` until
++`features12.timelineSemaphore = VK_TRUE` was added alongside this
++project's other required Vulkan 1.2 feature bits in `device.cpp`.
++Verified present on both this project's own dev drivers (NVIDIA
++proprietary and Mesa llvmpipe/lavapipe via `vulkaninfo`, both showing
++`VkPhysicalDeviceTimelineSemaphoreFeatures.timelineSemaphore = true`) and
++mandated by the Vulkan Roadmap 2022 profile this project's Steam Deck
++RADV floor hardware already targets — required unconditionally, no
++optional/fallback path needed (unlike `VK_EXT_calibrated_timestamps`/
++`VK_EXT_memory_budget`, genuinely optional extensions, not core-promoted
++feature bits).
++
++## Deviation: call-site audit widened beyond sample 04
++
++The brief/matrix explicitly scope call-site migration to sample 04
++(matrix row 11). Auditing the whole tree for `Uploader::flush()` (not
++just sample 04) surfaced ELEVEN more pre-existing call sites relying on
++the old always-blocking contract: `src/rx_material/material_system.cpp`
++(`MaterialSystem::createTexture2D()`, a public synchronous ABI entry
++point — Task 4's own GPU test depends on the texture being fully
++uploaded the instant this call returns) and one setup-time + one
++per-frame call site each in `samples/03_bindless_mesh`,
++`samples/05_multipass`, `samples/06_materials`, plus one setup-time site
++in `samples/07_stress`. Left as bare `flush()` (discarding the ticket),
++these would have silently regressed: the per-frame ones upload data a
++SAME-frame draw immediately reads, and without an explicit `wait()` or a
++GPU-side semaphore wait wired into that draw's own submission, this
++becomes a genuine Vulkan memory-visibility hazard (not just a timing
++race) that sync validation is specifically designed to catch — leaving
++them unfixed risked exactly the kind of regression this task's own
++"zero validation errors with sync validation" global constraint forbids,
++in code Task 11 did not author but does affect by changing
++`flush()`'s contract underneath it.
++
++All eleven were migrated to explicit `wait(flush())` — preserving their
++EXACT prior (already-blocking) behavior byte-identically, matching the
++plan's own "existing callers that immediately wait() are byte-identical
++in behavior" text — except sample 04's eviction cycle (line 919), which
++is the one call site the sources explicitly name as the non-blocking
++migration target. The full test suite (all 17 ctest entries, including
++every headless sample gate with `--validate`) passes unchanged after
++this — see Test evidence.
++
++## Deviation: existing upload_test.cpp/texture_test.cpp assertions touched
++
++Six pre-existing `upload_test.cpp`/`texture_test.cpp` test cases called
++`uploader->flush()` directly, then immediately read back GPU-written data
++in a SEPARATE command-buffer submission with no other synchronization.
++Before this task, this was safe because `flush()` blocked (a host fence
++wait establishes a real memory-availability guarantee for anything
++submitted after it). Once `flush()` stops blocking, relying on
++same-queue submission order alone for memory visibility is an unstated,
++spec-fragile assumption — not a real Vulkan guarantee (only execution
++START order is guaranteed per-queue; visibility needs an explicit
++wait/barrier). All six were updated to `uploader->wait(uploader->flush())`
++before their readback. The ONE line inside the `"MeshBuffers::create..."`
++test case that changed is a STANDALONE Uploader call used for a separate
++correctness check (not part of `MeshBuffers::create()`'s own call or its
++own assertions, which remain byte-for-byte unmodified) — flagging this
++explicitly since plan Task 11's text says "existing tests pass
++UNMODIFIED" for `MeshBuffers::create()`'s own behavior specifically.
++
++## Deviation: TDD process note
++
++For a redesign this architecturally interconnected (the ticket type, the
++new `flush()` signature, the command-buffer rotation, and the ring
++reclamation FIFO are all mutually dependent), a strict file-by-file
++red-green-refactor cadence was impractical — e.g. no test asserting
++ticket behavior can compile before `UploadTicket`/the new `flush()`
++signature exist. What was actually done: design the whole mechanism
++first, implement it, write the full test set against it, THEN verify
++discrimination empirically via the scratch-worktree revert (above) —
++substituting "prove the tests fail without the fix" for literal
++"write the failing test first." Flagging this honestly rather than
++claiming strict TDD literalism.
++
++## Self-review findings
++
++- **Command-buffer reuse hazard (not named in the matrix, found and
++  fixed during implementation)**: reusing a single command buffer across
++  un-awaited `flush()` calls is the same class of defect as the
++  fence-reuse hazard matrix row 1 names, just for the command buffer
++  instead of the completion primitive — `vkResetCommandBuffer`/re-record
++  into a buffer whose previous submission may still be pending on the
++  GPU is a hard Vulkan violation the moment `flush()` stops blocking.
++  Fixed with a lazily-grown rotation of command buffers
++  (`beginRecordingIfNeeded()` picks any slot whose last ticket
++  `isComplete()`, or allocates a fresh one rather than block) — grow,
++  never block, matching the timeline semaphore's own "no artificial
++  in-flight depth" character. The overlapping-flush test exercises this
++  directly (two flushes with no wait between them force two DIFFERENT
++  command buffers to be in flight simultaneously); zero validation
++  errors confirm no reset-while-pending violation.
++- `activeCmd()` returns `VK_NULL_HANDLE` (not an out-of-bounds vector
++  index) on the rare `beginRecordingIfNeeded()` allocation-failure path
++  — checked deliberately after noticing the naive `cmdSlots_[activeSlot_]`
++  form would be UB when `activeSlot_` stays `kInvalidSlot`.
++  `vkQueueSubmit` failure inside `flush()` deliberately does NOT roll
++  `lastQueuedValue_` back (documented in the code: simpler and equally
++  correct to skip a value than risk reusing one).
++- Confirmed `~Uploader()` waits on `lastQueuedValue_` (the highest ticket
++  ever queued), not merely the ticket its own final `flush()` call
++  returns — the latter could be the trivially-complete sentinel even
++  while an earlier, never-waited-on batch is still genuinely running,
++  which would have left teardown racing real GPU work.
++- Confirmed move constructor/assignment carry every new member
++  (`timelineSemaphore_`, `lastQueuedValue_`, `cmdSlots_`, `activeSlot_`,
++  `lastFlushRingCursor_`, `pendingRegions_`, `ringGeneration_`,
++  `blockingRingWaitCount_`) and null/reset the source — a dropped field
++  here would have silently corrupted ticket bookkeeping after any move.
++- Confirmed `MemoryCategory::Staging` tagging on the ring buffer
++  (Task 10 lockstep, brief's own note) is unchanged — `createUploadRingBuffer`
++  call site in `Uploader::create()` was not touched beyond formatting.
++- `logDescriptorIndexingFeatureGaps()` was deliberately NOT extended to
++  name `timelineSemaphore` gaps specifically — it is scoped to
++  descriptor-indexing per its own existing design (Phase 2), and every
++  other required Vulkan 1.1/1.2/1.3 bit (`shaderDrawParameters`,
++  `dynamicRendering`, `synchronization2`, etc.) already goes through the
++  same generic vk-bootstrap error path without individual diagnosis —
++  `timelineSemaphore` verified present on both dev drivers, consistent
++  with that existing risk profile, so no new precedent was introduced.
++- No AI attribution anywhere in new/modified files or commit messages
++  (grepped case-insensitively for `claude|anthropic|co-authored|generated
++  by|ai-generated` across the full diff — zero matches).
++- `.superpowers/sdd/.../task-11-brief.md` and the plan/spec/matrix/rulings
++  files are untouched (out of write scope per the brief).
++- Local environment note (not a code issue): the FIRST `windows-cross-zig`
++  configure attempt failed with a vk-bootstrap dispatch-table compile
++  error (`unknown type name 'PFN_vkShutdownLatencyDeviceLegacyNV'`) —
++  traced to a STALE `build/windows-cross-zig` directory left over from a
++  prior, unrelated session on this machine (confirmed via a scratch
++  worktree at the base commit: a fresh configure there succeeded
++  immediately, building vk-bootstrap from a MISS with no errors). Deleting
++  `build/windows-cross-zig` and reconfiguring fresh in the main worktree
++  resolved it; unrelated to this task's changes (`git diff` against
++  `third_party/CMakeLists.txt`/`CMakePresets.json` is empty).
++
++## Test evidence
++
++Full `rx_rhi_vk_tests` binary, Uploader/MeshBuffers/transfer-queue subset
++(16 test cases; the other 44 are skipped windowed-fixture guards that
++route through the same binary per this target's own doctest_main.cpp
++convention):
++
++```
++$ xvfb-run -a ./build/linux-native/src/rx_rhi_vk/rx_rhi_vk_tests -tc="*Uploader*,*MeshBuffers*,*transfer*"
++...
++ring wrapped 9 times across 80 uploads into a 512-byte ring
++blocking ring-reclaim waits: 0 (flush() calls issued: 80)
++[doctest] test cases:  16 |  16 passed | 0 failed | 44 skipped
++[doctest] assertions: 830 | 830 passed | 0 failed |
++[doctest] Status: SUCCESS!
++```
++
++(`blockingRingWaitCount()` varies 0-4 run to run depending on how far
++ahead the GPU stays of the CPU issuing loop; always well below the
++80 flush() calls issued, satisfying matrix row 5's own instrumented
++criterion every run observed.)
++
++Full linux-native suite:
++
++```
++$ xvfb-run -a ctest --preset linux-native --output-on-failure
++...
++100% tests passed, 0 tests failed out of 17
++Total Test time (real) =  52.65 sec
++```
++
++windows-cross-zig, full build then the CI's own ctest subset:
++
++```
++$ cmake --build --preset windows-cross-zig
++... 115/115, no errors
++
++$ xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample'
++...
++100% tests passed, 0 tests failed out of 7
++Total Test time (real) =  88.37 sec
++```
++
++(`rx_rhi_vk_tests`/GPU-backed/sample targets excluded from ctest under
++`windows-cross-zig` per this project's own CI — Wine has no real Vulkan
++device; the full binary set, including every sample and `rx_rhi_vk_tests.exe`,
++still cross-compiles and links cleanly, confirmed in the build log above.)
++
++Compiler warnings: touched every modified `rx_rhi_vk`/`rx_material` source
++and test file's mtime and rebuilt `rx_rhi_vk`, `rx_rhi_vk_tests`, and
++`rx_material` from a forced recompile — zero `warning`/`error` lines in
++the build output (grepped, excluding the pre-existing documented
++"known false positive" validation-layer log lines).
++
++Validation errors: `grep`-verified zero un-filtered `[vulkan validation]`
++lines across every run above; every new test's own
++`CHECK_FALSE(hasValidationErrors())` passed, and CI's own `--validate`
++flag on every headless sample test confirms the sample-level migrations
++(including the eviction-cycle poll redesign) are exercised under
++`VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT` specifically,
++not just generic validation.
+diff --git a/docs/threading.md b/docs/threading.md
+index 0df94e3..78b4ce7 100644
+--- a/docs/threading.md
++++ b/docs/threading.md
+@@ -39,23 +39,37 @@ thread logs an ERROR naming the API and calls `std::abort()` rather than
+ silently mutating shared state from the wrong thread. The guard is compiled
+ in whenever `RX_DEBUG_CHECKS` is ON (default in both dev presets,
+ independent of `NDEBUG` — see `rx_core/include/rx_core/debug_checks.h`'s
+ own header comment for why a bare `assert()` would not have worked here)
+ and compiles to nothing at all when it is OFF:
+ 
+ - **`rx::rhi::BindlessTable`** — `registerSampledImage()`/
+   `registerSampler()`/`registerStorageBuffer()`/`release()` **[guarded, all
+   four]**
+   (`src/rx_rhi_vk/include/rx_rhi_vk/bindless.h`)
+-- **`rx::rhi::Uploader`** — `uploadToBuffer()`/`uploadToImage()` **[guarded,
+-  both]**/`flush()` (not guarded — always called from within an already-
+-  guarded uploadTo*() call in every path this codebase has today)
++- **`rx::rhi::Uploader`** — `uploadToBuffer()`/`uploadToImage()`/`flush()`/
++  `isComplete()`/`wait()` **[guarded, all five]** [Phase 4 Task 11, spec
++  D25 as amended by gate ruling RC4]: `flush()` gained its guard this task
++  because it is no longer reachable only via an already-guarded
++  uploadTo*() call — `flush()` with nothing recorded (returning an
++  already-complete `UploadTicket`) is now a legitimate standalone call, so
++  the old "always called from within an already-guarded call" reasoning no
++  longer holds. `isComplete()`/`wait()` are new this task; both poll/wait
++  on this Uploader's own timeline semaphore, which the Vulkan spec itself
++  permits from any thread with no external synchronization
++  (`vkGetSemaphoreCounterValue`/`vkWaitSemaphores` need none) — the guard
++  here is this project's own D5 policy scoping, matching every other
++  Uploader entry point's identical scoping, not a hazard these two
++  introduce. `flush()` now returns a pollable `UploadTicket` instead of
++  blocking; existing callers that need the old always-blocking contract
++  (e.g. `MeshBuffers::create()`) call `wait()` on the returned ticket
++  explicitly.
+   (`src/rx_rhi_vk/include/rx_rhi_vk/upload.h`)
+ - **`rx::material::MaterialSystem`** — `loadMaterial()`/`getPipeline()`/
+   `reloadChanged()`/`bindInstance()` **[guarded, all four]** (and every
+   other method on this type — it is not internally synchronized at all,
+   matching `rx::graph::RenderGraph`/`Executor`'s existing scoping)
+   (`src/rx_material/include/rx_material/material_system.h`)
+ - **`rx::rhi::DeletionQueue`** — `retire()` **[guarded]**/
+   `onFrameFenceSignaled()`/`flushAll()` (not guarded — the per-frame
+   drain and shutdown paths, out of this fix round's scope; `retire()` is
+   the one enqueue-style mutator a chunk >= 1 caller could plausibly reach
+diff --git a/samples/03_bindless_mesh/main.cpp b/samples/03_bindless_mesh/main.cpp
+index 2e4a6af..3168474 100644
+--- a/samples/03_bindless_mesh/main.cpp
++++ b/samples/03_bindless_mesh/main.cpp
+@@ -769,21 +769,27 @@ std::optional<Scene> createScene(VkPhysicalDevice physicalDevice, VkDevice devic
+     if (!pngTexture.has_value()) {
+         RX_LOG_ERROR("sample_03_bindless_mesh: Texture2D::create failed for the decoded PNG");
+         return std::nullopt;
+     }
+     if (!uploader.uploadToImage(*pngTexture, pngPixelData.data(), pngPixelData.size(), /*generateMips=*/true)) {
+         RX_LOG_ERROR("sample_03_bindless_mesh: uploadToImage failed for the decoded PNG");
+         return std::nullopt;
+     }
+     scene.textures.push_back(std::move(*pngTexture));
+ 
+-    uploader.flush();  // every mesh/texture upload above is now on the GPU.
++    // [Phase 4 Task 11, spec D25] Uploader::flush() no longer blocks on
++    // its own -- wait() explicitly to preserve this setup path's original
++    // "every mesh/texture upload above is now on the GPU" guarantee
++    // byte-identically before the descriptor registrations below (which
++    // this sample stays outside Task 11's primary migration scope for --
++    // sample 04 is the named vehicle for the new poll-based pattern).
++    uploader.wait(uploader.flush());
+ 
+     for (auto& texture : scene.textures) {
+         auto handle = scene.bindlessTable.registerSampledImage(texture.view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+         if (!handle.isValid()) {
+             RX_LOG_ERROR("sample_03_bindless_mesh: BindlessTable::registerSampledImage failed");
+             return std::nullopt;
+         }
+     }
+ 
+     // --- Samplers: linear+repeat, nearest+clamp ----------------------
+@@ -885,21 +891,27 @@ void updateTransforms(rx::rhi::Uploader& uploader, rx::rhi::Buffer& transformBuf
+         // symptom of a transposed 4x4 transform reaching a perspective
+         // divide). Transposing here, once, on the host, is simpler and
+         // cheaper than fighting Slang's packing-qualifier syntax for a
+         // storage buffer element type.
+         mvps[i] = glm::transpose(viewProj * model);
+     }
+ 
+     VkDeviceSize rowBytes = sizeof(glm::mat4);
+     VkDeviceSize dstOffset = static_cast<VkDeviceSize>(frameInFlightIndex) * kObjectCount * rowBytes;
+     uploader.uploadToBuffer(transformBuffer, dstOffset, mvps.data(), kObjectCount * rowBytes);
+-    uploader.flush();
++    // [Phase 4 Task 11, spec D25] wait() explicitly: this per-frame
++    // transform upload's data is read by this SAME frame's draw commands,
++    // which is exactly the dependency Uploader::flush()'s old blocking
++    // contract used to guarantee implicitly. Preserved byte-identically
++    // here (out of this task's primary migration scope -- sample 04 is
++    // the named vehicle for the new poll-based pattern).
++    uploader.wait(uploader.flush());
+ }
+ 
+ // Records the draws for every object in `kObjects` into `cmd`, which must
+ // already be inside a vkCmdBeginRendering scope with `scene.pipeline`'s
+ // viewport/scissor already set via the caller. `frameInFlightIndex`
+ // selects which row range of the transform buffer this frame's push
+ // constants index into (see this file's header comment).
+ void recordSceneDraws(VkCommandBuffer cmd, const Scene& scene, uint32_t frameInFlightIndex) {
+     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scene.pipeline);
+ 
+diff --git a/samples/04_streaming/main.cpp b/samples/04_streaming/main.cpp
+index f1a22f1..f0b18c6 100644
+--- a/samples/04_streaming/main.cpp
++++ b/samples/04_streaming/main.cpp
+@@ -896,49 +896,78 @@ bool evictOldestAndStreamInNext(VkPhysicalDevice physicalDevice, VkDevice device
+     scene.bindlessTable.release(scene.textures[victim].handle);
+     std::shared_ptr<rx::rhi::Texture2D> victimTexture = std::move(scene.textures[victim].texture);
+     scene.textures[victim].texture = nullptr;
+     scene.textures[victim].handle = rx::rhi::BindlessHandle{};
+ 
+     // Create + upload the incoming texture's Texture2D immediately: a
+     // brand-new VkImage has no descriptor slot assigned to it at all yet,
+     // so there is no in-flight hazard here whatsoever -- only the
+     // eventual registerSampledImage() call (which WRITES a descriptor
+     // slot -- deterministically the one just released above, see
+-    // "DESCRIPTOR REWRITE SAFETY") needs to wait.
++    // "DESCRIPTOR REWRITE SAFETY") needs the upload to be genuinely done
++    // first.
+     auto newTexture = rx::rhi::Texture2D::create(physicalDevice, device, allocator,
+                                                   VkExtent2D{kTextureSize, kTextureSize}, kTextureFormat,
+                                                   VK_IMAGE_USAGE_SAMPLED_BIT, /*requestedMipLevels=*/1);
+     if (!newTexture.has_value()) {
+         RX_LOG_ERROR("sample_04_streaming: Texture2D::create failed for logical texture {}", incoming);
+         return false;
+     }
+     std::vector<uint8_t> pixels = makeFlatColorTexture(kTextureSize, expectedColors[incoming]);
+     if (!uploader.uploadToImage(*newTexture, pixels.data(), pixels.size(), /*generateMips=*/false)) {
+         RX_LOG_ERROR("sample_04_streaming: uploadToImage failed for logical texture {}", incoming);
+         return false;
+     }
+-    uploader.flush();
++    // [Phase 4 Task 11, spec D25] THE migration this sample exists to
++    // demonstrate: flush() no longer blocks here -- it returns a pollable
++    // UploadTicket immediately (this call used to stall the main/render
++    // thread for the whole GPU copy, per claim-validation-2026-08-18's
++    // claim 1, the origin of this ticket). The eviction-cycle's
++    // completion-dependent step (the descriptor rewrite below) becomes an
++    // EXPLICIT poll-or-wait choice instead of an accidental block: this
++    // callback polls isComplete() first (see below) rather than assuming
++    // completion the way the old blocking flush() made implicit.
++    rx::rhi::UploadTicket uploadTicket = uploader.flush();
+     std::shared_ptr<rx::rhi::Texture2D> incomingTexture = std::make_shared<rx::rhi::Texture2D>(std::move(*newTexture));
+ 
+     // THE fix: both halves of this eviction cycle -- destroying the
+     // victim's old resource, and writing the incoming resource into the
+     // slot that (deterministically) just freed up -- are deferred into
+     // ONE DeletionQueue retirement tagged with the CURRENT frame number,
+     // run only once that frame's fence is confirmed signaled (i.e. once
+     // frame N-1, and everything before it, is also guaranteed complete --
+-    // see this file's header comment). `scene` is captured by raw pointer:
+-    // safe because this callback only ever runs from inside
+-    // onFrameFenceSignaled()/flushAll(), both called on `scene`'s owning
+-    // frame loop / destroyScene() while `scene` itself is still alive.
++    // see this file's header comment). `scene`/`uploader` are captured by
++    // raw pointer: safe because this callback only ever runs from inside
++    // onFrameFenceSignaled()/flushAll(), both called on `scene`'s/
++    // `uploader`'s owning frame loop / destroyScene() while both are
++    // still alive.
+     Scene* scenePtr = &scene;
++    rx::rhi::Uploader* uploaderPtr = &uploader;
+     scene.deletionQueue.retire(
+-        [scenePtr, victimTexture, incomingTexture, incoming]() {
++        [scenePtr, uploaderPtr, uploadTicket, victimTexture, incomingTexture, incoming]() {
++            // [Phase 4 Task 11] Poll first -- the expected, common case:
++            // by the time this callback runs (at least kFramesInFlight
++            // frames after the upload was issued, on the SAME queue as
++            // every frame's own submission -- see this file's header
++            // comment), the copy is essentially always already complete,
++            // so isComplete() here is a cheap, non-blocking confirmation,
++            // not a stall. wait() is a defensive fallback for the
++            // vanishingly rare case it somehow is not -- logged loudly so
++            // a genuine stall here is visible, not silently eaten.
++            if (!uploaderPtr->isComplete(uploadTicket)) {
++                RX_LOG_WARN(
++                    "sample_04_streaming: incoming texture {} not yet complete at deferred descriptor-rewrite "
++                    "time -- falling back to an explicit wait()",
++                    incoming);
++                uploaderPtr->wait(uploadTicket);
++            }
++
+             // victimTexture's Texture2D is destroyed as an ordinary side
+             // effect of this closure (and its captured shared_ptr) being
+             // destroyed once DeletionQueue removes this entry -- nothing
+             // to do here for it explicitly, same pattern as every other
+             // retire() call in this codebase.
+             auto handle = scenePtr->bindlessTable.registerSampledImage(incomingTexture->view(),
+                                                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+             if (!handle.isValid()) {
+                 // DOCUMENTED ACCEPTANCE: this is effectively unreachable,
+                 // not merely rare. createScene() sizes
+@@ -1042,21 +1071,28 @@ std::optional<Scene> createScene(VkPhysicalDevice physicalDevice, VkDevice devic
+     // before the first frame is ever recorded -- immediate registration
+     // is safe here specifically because no frame has been recorded yet
+     // (see loadLogicalTextureImmediate()'s own comment).
+     for (uint32_t i = 0; i < kResidentBudget; ++i) {
+         if (!loadLogicalTextureImmediate(physicalDevice, device, allocator, uploader, scene, expectedColors, i)) {
+             destroyScene(device, scene);
+             return std::nullopt;
+         }
+         scene.residencyOrder.push_back(i);
+     }
+-    uploader.flush();
++    // [Phase 4 Task 11, spec D25] Uploader::flush() no longer blocks on
++    // its own -- wait() explicitly here (setup time, before the frame
++    // loop and before any registerSampledImage() call above reads
++    // texture data, so blocking has zero per-frame cost): a deliberate,
++    // reviewable choice, matching MeshBuffers::create()'s own documented
++    // convenience -- the eviction cycle below (evictOldestAndStreamInNext())
++    // is this sample's real per-frame migration target instead.
++    uploader.wait(uploader.flush());
+ 
+     if (!buildScenePipeline(device, scene.bindlessTable, colorFormat, scene)) {
+         destroyScene(device, scene);
+         return std::nullopt;
+     }
+ 
+     return scene;
+ }
+ 
+ // Records one draw per currently-resident grid cell into `cmd` (already
+diff --git a/samples/05_multipass/main.cpp b/samples/05_multipass/main.cpp
+index 64a33a7..2638d73 100644
+--- a/samples/05_multipass/main.cpp
++++ b/samples/05_multipass/main.cpp
+@@ -1248,21 +1248,27 @@ std::optional<Scene> createScene(VkPhysicalDevice physicalDevice, VkDevice devic
+     auto planeMesh = uploadMesh(planeHost);
+     auto cubeMesh = uploadMesh(cubeHost);
+     auto sphereMesh = uploadMesh(sphereHost);
+     if (!planeMesh.has_value() || !cubeMesh.has_value() || !sphereMesh.has_value()) {
+         RX_LOG_ERROR("sample_05_multipass: MeshBuffers::create failed for one or more shapes");
+         return std::nullopt;
+     }
+     scene.meshes[static_cast<size_t>(Shape::Plane)] = std::move(*planeMesh);
+     scene.meshes[static_cast<size_t>(Shape::Cube)] = std::move(*cubeMesh);
+     scene.meshes[static_cast<size_t>(Shape::Sphere)] = std::move(*sphereMesh);
+-    uploader.flush();
++    // [Phase 4 Task 11, spec D25] Uploader::flush() no longer blocks on
++    // its own -- wait() explicitly to preserve this setup path's prior
++    // guarantee byte-identically (out of this task's primary migration
++    // scope; MeshBuffers::create() above already waits on its own two
++    // uploads internally, so this call has nothing left to cover in
++    // practice, but stays explicit for any future upload added here).
++    uploader.wait(uploader.flush());
+ 
+     // --- Sampler: shared by both the shadow-map lookup (lit.frag.slang's
+     // manual single-tap compare -- NEAREST avoids blending raw depth
+     // values, which a linear filter would do incorrectly for a depth
+     // comparison [coordinator ambiguity resolution]) and the tonemap
+     // pass's 1:1 HDR sample (a plain full-resolution copy, for which
+     // NEAREST is exact and cheaper than LINEAR). CLAMP_TO_EDGE: a shadow
+     // lookup that lands just outside [0,1] (see lit.frag.slang's own
+     // explicit bounds check, which handles the case fully out of frustum)
+     // still gets a well-defined edge-texel value rather than wrapping.
+@@ -1554,21 +1560,25 @@ void updateFrame(rx::rhi::Uploader& uploader, Scene& scene, uint32_t frameInFlig
+         // albedo/lightDirWorld below are plain vec4s, no layout gotcha.)
+         transforms[i].mvp = glm::transpose(cameraViewProj * model);
+         transforms[i].lightMvp = glm::transpose(lightViewProj * model);
+         transforms[i].albedo = glm::vec4(kObjects[i].albedo, 0.0F);
+         transforms[i].lightDirWorld = glm::vec4(lightDir, 0.0F);
+     }
+ 
+     const VkDeviceSize rowBytes = sizeof(ObjectTransform);
+     const VkDeviceSize dstOffset = static_cast<VkDeviceSize>(frameInFlightIndex) * kObjectCount * rowBytes;
+     uploader.uploadToBuffer(*scene.transformBuffer, dstOffset, transforms.data(), kObjectCount * rowBytes);
+-    uploader.flush();
++    // [Phase 4 Task 11, spec D25] wait() explicitly: this per-frame
++    // transform upload's data is read by this SAME frame's draw commands
++    // (both the shadow and lit passes) -- preserved byte-identically, out
++    // of this task's primary migration scope.
++    uploader.wait(uploader.flush());
+ }
+ 
+ std::optional<uint32_t> findMemoryTypeIndex(const VkPhysicalDeviceMemoryProperties& memProps, uint32_t typeBits,
+                                              VkMemoryPropertyFlags required) {
+     for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+         if ((typeBits & (1U << i)) != 0U && (memProps.memoryTypes[i].propertyFlags & required) == required) {
+             return i;
+         }
+     }
+     return std::nullopt;
+diff --git a/samples/06_materials/main.cpp b/samples/06_materials/main.cpp
+index 9a6d7f4..d5d7bfc 100644
+--- a/samples/06_materials/main.cpp
++++ b/samples/06_materials/main.cpp
+@@ -848,21 +848,25 @@ bool createScene(Scene& scene, VkPhysicalDevice physicalDevice, rx::rhi::Device&
+     auto sphereIndexBuffer = uploadIndexBuffer(scene.sphereHostMesh);
+     if (!cubeIndexBuffer.has_value() || !sphereIndexBuffer.has_value()) {
+         RX_LOG_ERROR("sample_06_materials: createDeviceLocalBuffer/uploadToBuffer failed for an index buffer");
+         destroyScene(scene);
+         return false;
+     }
+     scene.cubeIndexBuffer = std::move(cubeIndexBuffer);
+     scene.sphereIndexBuffer = std::move(sphereIndexBuffer);
+     scene.cubeIndexCount = static_cast<uint32_t>(scene.cubeHostMesh.indices.size());
+     scene.sphereIndexCount = static_cast<uint32_t>(scene.sphereHostMesh.indices.size());
+-    uploader.flush();
++    // [Phase 4 Task 11, spec D25] Uploader::flush() no longer blocks on
++    // its own -- wait() explicitly to preserve this setup path's prior
++    // guarantee byte-identically (out of this task's primary migration
++    // scope).
++    uploader.wait(uploader.flush());
+ 
+     for (size_t i = 0; i < kObjectSpecs.size(); ++i) {
+         const ObjectSpec& spec = kObjectSpecs[i];
+         ObjectGpu& obj = scene.objects[i];
+         obj.shape = spec.shape;
+         obj.position = spec.position;
+         obj.material = (spec.materialKind == MaterialKind::Checker) ? scene.checkerMaterial : scene.rimMaterial;
+ 
+         if (obj.material->createInstance(&obj.instance) != RX_OK) {
+             RX_LOG_ERROR("sample_06_materials: createInstance failed for object {}", i);
+@@ -939,21 +943,25 @@ void transformAndUploadObjectVertices(rx::rhi::Uploader& uploader, const HostMes
+ 
+ void updateFrame(rx::rhi::Uploader& uploader, Scene& scene, uint32_t frameInFlightIndex, float azimuthRadians,
+                   uint32_t viewportWidth, uint32_t viewportHeight) {
+     scene.currentFrameInFlightIndex = frameInFlightIndex;
+     const CameraPose pose = makeCameraPose(azimuthRadians, viewportWidth, viewportHeight);
+     for (size_t i = 0; i < kObjectSpecs.size(); ++i) {
+         ObjectGpu& obj = scene.objects[i];
+         const HostMesh& hostMesh = (obj.shape == Shape::Cube) ? scene.cubeHostMesh : scene.sphereHostMesh;
+         transformAndUploadObjectVertices(uploader, hostMesh, obj, frameInFlightIndex, pose);
+     }
+-    uploader.flush();
++    // [Phase 4 Task 11, spec D25] wait() explicitly: this per-frame vertex
++    // upload's data is read by this SAME frame's draw commands --
++    // preserved byte-identically, out of this task's primary migration
++    // scope.
++    uploader.wait(uploader.flush());
+ }
+ 
+ // --- Render-graph declaration + draw recording ------------------------------
+ 
+ rx::graph::AttachmentDesc swapchainRelativeDesc(VkFormat format) {
+     rx::graph::AttachmentDesc desc;
+     desc.format = format;
+     desc.sizeClass = rx::graph::SizeClass::SwapchainRelative;
+     desc.width = 1.0F;
+     desc.height = 1.0F;
+diff --git a/samples/07_stress/main.cpp b/samples/07_stress/main.cpp
+index 792de13..b3031f8 100644
+--- a/samples/07_stress/main.cpp
++++ b/samples/07_stress/main.cpp
+@@ -968,21 +968,26 @@ std::optional<Scene> createScene(VkPhysicalDevice physicalDevice, VkDevice devic
+         RX_LOG_ERROR("sample_07_stress: createDeviceLocalBuffer failed for the instance buffer");
+         destroyScene(device, scene);
+         return std::nullopt;
+     }
+     scene.instanceBuffer = std::move(instanceBuffer);
+     if (!uploader.uploadToBuffer(*scene.instanceBuffer, 0, instances.data(), instanceBufferSize)) {
+         RX_LOG_ERROR("sample_07_stress: uploadToBuffer failed for the instance buffer");
+         destroyScene(device, scene);
+         return std::nullopt;
+     }
+-    uploader.flush();
++    // [Phase 4 Task 11, spec D25] Uploader::flush() no longer blocks on
++    // its own -- wait() explicitly to preserve this setup path's prior
++    // guarantee byte-identically (out of this task's primary migration
++    // scope; instance data is uploaded ONCE, before the frame loop, so
++    // blocking here has no per-frame cost).
++    uploader.wait(uploader.flush());
+     scene.instanceBufferHandle =
+         scene.bindlessTable.registerStorageBuffer(scene.instanceBuffer->handle(), instanceBufferSize);
+     if (!scene.instanceBufferHandle.isValid()) {
+         RX_LOG_ERROR("sample_07_stress: BindlessTable::registerStorageBuffer failed");
+         destroyScene(device, scene);
+         return std::nullopt;
+     }
+ 
+     scene.viewProj = makeCameraViewProj(drawCount, kHeadlessWidth, kHeadlessHeight);
+ 
+diff --git a/src/rx_material/material_system.cpp b/src/rx_material/material_system.cpp
+index 3eab9d0..f927042 100644
+--- a/src/rx_material/material_system.cpp
++++ b/src/rx_material/material_system.cpp
+@@ -1843,21 +1843,27 @@ TextureHandle MaterialSystem::createTexture2D(const TextureCreateInfo& info) {
+                                                VK_IMAGE_USAGE_SAMPLED_BIT,
+                                                /*requestedMipLevels=*/info.generateMips ? 0 : 1);
+     if (!texture.has_value()) {
+         throw std::runtime_error("rx_material: MaterialSystem::createTexture2D: rx::rhi::Texture2D::create failed");
+     }
+ 
+     if (!impl.uploader->uploadToImage(*texture, info.pixels, static_cast<VkDeviceSize>(info.pixelBytes),
+                                        info.generateMips)) {
+         throw std::runtime_error("rx_material: MaterialSystem::createTexture2D: Uploader::uploadToImage failed");
+     }
+-    impl.uploader->flush();
++    // [Phase 4 Task 11, spec D25] Uploader::flush() no longer blocks on its
++    // own -- createTexture2D() is a public, synchronous API contract
++    // (`rx_material/rx_api.h`: the returned handle is immediately safe to
++    // bind/sample), so this call site explicitly wait()s on the ticket to
++    // preserve that contract byte-identically, exactly like
++    // MeshBuffers::create()'s own documented choice.
++    impl.uploader->wait(impl.uploader->flush());
+ 
+     rx::rhi::BindlessHandle bindlessHandle =
+         impl.bindless->registerSampledImage(texture->view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+     if (!bindlessHandle.isValid()) {
+         throw std::runtime_error(
+             "rx_material: MaterialSystem::createTexture2D: BindlessTable::registerSampledImage failed (capacity "
+             "exhausted)");
+     }
+ 
+     TextureRecord record{std::move(*texture), bindlessHandle};
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/device.h b/src/rx_rhi_vk/include/rx_rhi_vk/device.h
+index e6f9432..d7a7796 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/device.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/device.h
+@@ -75,20 +75,46 @@ public:
+     // every other accessor on this class already exposes exactly this
+     // kind of already-stored handle (physicalDevice(), device(), ...) the
+     // same trivial way.
+     VkInstance instance() const { return instance_; }
+     VkPhysicalDevice physicalDevice() const { return physicalDevice_; }
+     VkDevice device() const { return device_; }
+     VkQueue graphicsQueue() const { return graphicsQueue_; }
+     uint32_t graphicsQueueFamily() const { return graphicsQueueFamily_; }
+     VkQueue presentQueue() const { return presentQueue_; }
+ 
++    // Optional DEDICATED transfer queue [Phase 4 Task 11, spec D25, gate
++    // ruling #28 row 10]: acquired via vk-bootstrap's
++    // `get_dedicated_queue(QueueType::transfer)` -- NEVER
++    // `require_dedicated_transfer_queue()`, which would make PHYSICAL
++    // DEVICE SELECTION itself fail outright on hardware lacking one (the
++    // wrong primitive for an optional/fallback feature; verified against
++    // vk-bootstrap's own `has_dedicated_transfer_queue()` definition: a
++    // family that supports transfer but NOT graphics/compute, which many
++    // devices -- including this project's own dev/CI hardware -- simply
++    // do not expose). A missing dedicated queue is not a Device::create()
++    // failure; it is a graceful, logged degrade (see create()) --
++    // `hasDedicatedTransferQueue()` reports which case this Device landed
++    // in; `transferQueue()`/`transferQueueFamily()` are only meaningful
++    // when it returns true (VK_NULL_HANDLE/0 otherwise -- callers must
++    // check the flag first, not assume a nonzero handle).
++    //
++    // ACQUISITION ONLY this phase -- nothing in this codebase submits to
++    // transferQueue() yet (cross-queue submission and queue-family
++    // ownership-transfer barriers stay streaming-phase policy, per the
++    // toolchain-platform-rhi-design registry's "Upload/transfer asynchrony
++    // policy" entry). The accessor existing and being correctly populated
++    // (or correctly absent) is this phase's entire acceptance bar.
++    bool hasDedicatedTransferQueue() const { return hasDedicatedTransferQueue_; }
++    VkQueue transferQueue() const { return transferQueue_; }
++    uint32_t transferQueueFamily() const { return transferQueueFamily_; }
++
+     // True iff VK_EXT_calibrated_timestamps was present on the selected
+     // physical device AND successfully enabled on the logical device this
+     // Device wraps (see device.cpp's own comment on the optional, guarded
+     // enable_extension_if_present() call in create()) [Phase 4 Stage 0
+     // Task 3]. This class has no idea Tracy exists -- it only reports
+     // whether this one, ordinarily-optional Vulkan extension is live;
+     // rx_rhi_vk/tracy_gpu.h is the sole consumer that gives this fact any
+     // profiling meaning (TracyVkContextCalibrated vs plain TracyVkContext).
+     bool calibratedTimestampsEnabled() const { return calibratedTimestampsEnabled_; }
+ 
+@@ -169,20 +195,23 @@ private:
+     void destroyAll();
+ 
+     VkInstance instance_ = VK_NULL_HANDLE;
+     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
+     VkDevice device_ = VK_NULL_HANDLE;
+     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+ 
+     VkQueue graphicsQueue_ = VK_NULL_HANDLE;
+     uint32_t graphicsQueueFamily_ = 0;
+     VkQueue presentQueue_ = VK_NULL_HANDLE;
++    VkQueue transferQueue_ = VK_NULL_HANDLE;
++    uint32_t transferQueueFamily_ = 0;
++    bool hasDedicatedTransferQueue_ = false;
+     bool calibratedTimestampsEnabled_ = false;
+     bool memoryBudgetExtensionEnabled_ = false;
+ 
+     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
+     std::vector<VkImage> swapchainImages_;
+     VkFormat swapchainFormat_ = VK_FORMAT_UNDEFINED;
+     VkExtent2D swapchainExtent_{0, 0};
+ 
+     // Desired mode recorded by setPresentMode(), consulted by
+     // recreateSwapchain() (and create()'s own equivalent inline logic) the
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/mesh_buffers.h b/src/rx_rhi_vk/include/rx_rhi_vk/mesh_buffers.h
+index 82ed282..41beab5 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/mesh_buffers.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/mesh_buffers.h
+@@ -31,28 +31,32 @@ public:
+     MeshBuffers& operator=(MeshBuffers&&) noexcept = default;
+     MeshBuffers(const MeshBuffers&) = delete;
+     MeshBuffers& operator=(const MeshBuffers&) = delete;
+     ~MeshBuffers() = default;
+ 
+     // Allocates a device-local vertex buffer (`vertexBytes`, usage
+     // VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+     // and index buffer (`indexBytes`, usage
+     // VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+     // via `allocator`, then uploads `vertexData`/`indexData` into them
+-    // through `uploader` and calls `uploader.flush()` itself before
+-    // returning -- so by the time this call returns, both buffers are
+-    // already fully populated and safe to bind/draw from immediately
+-    // (no separate flush() needed by the caller for just this call).
+-    // `indexCount` is stored verbatim for indexCount() below (this class
+-    // does not infer it from indexBytes/index-type size, since a caller
+-    // already knows it and a stored value is unambiguous regardless of
+-    // index type).
++    // through `uploader` and calls `uploader.wait(uploader.flush())`
++    // itself before returning -- so by the time this call returns, both
++    // buffers are already fully populated and safe to bind/draw from
++    // immediately (no separate flush()/wait() needed by the caller for
++    // just this call). [Phase 4 Task 11, spec D25] `Uploader::flush()`
++    // itself no longer blocks; this factory keeps its OWN pre-Task-11
++    // blocking contract on purpose, via that explicit wait(ticket) --
++    // documented as a deliberate convenience, per plan Task 11's own
++    // text, not an accidental holdover. `indexCount` is stored verbatim
++    // for indexCount() below (this class does not infer it from
++    // indexBytes/index-type size, since a caller already knows it and a
++    // stored value is unambiguous regardless of index type).
+     //
+     // Returns std::nullopt (logged) if either buffer allocation or either
+     // upload fails.
+     static std::optional<MeshBuffers> create(Allocator& allocator, Uploader& uploader, const void* vertexData,
+                                               VkDeviceSize vertexBytes, const void* indexData,
+                                               VkDeviceSize indexBytes, uint32_t indexCount,
+                                               VkIndexType indexType = VK_INDEX_TYPE_UINT32);
+ 
+     VkBuffer vertexBuffer() const { return vertexBuffer_.handle(); }
+     VkBuffer indexBuffer() const { return indexBuffer_.handle(); }
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/upload.h b/src/rx_rhi_vk/include/rx_rhi_vk/upload.h
+index d9cd7ff..d0a2a9b 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/upload.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/upload.h
+@@ -1,43 +1,119 @@
+ #pragma once
+ #include <rx_rhi_vk/buffer.h>
+ #include <cstdint>
++#include <deque>
+ #include <optional>
+ #include <utility>
++#include <vector>
+ 
+ namespace rx::rhi {
+ 
+ class Device;
+ class Texture2D;
+ 
++// [Phase 4 Task 11, spec D25 as amended by gate ruling RC4] A pollable
++// handle to the GPU work a specific `Uploader::flush()` call submitted --
++// `value` is the counter value this Uploader's own timeline semaphore
++// reaches once that work (and, by construction, every earlier submission
++// on the same queue -- see flush()'s own comment) has completed.
++//
++// `value == 0` is the reserved "already complete" sentinel: the timeline
++// semaphore starts at counter value 0 and only ever counts up, so
++// `currentValue >= 0` is unconditionally true without ever touching the
++// semaphore -- exactly the ticket a `flush()` call with nothing new to
++// submit (nothing recorded since the last flush, or a batch that only
++// ever took the direct memcpy path -- see uploadToBuffer()'s own comment)
++// returns, matching this class's pre-Task-11 no-op-flush behavior with no
++// fence/semaphore machinery touched at all [matrix-issue28 rows 8/9].
++//
++// Comparable/copyable POD; safe to store, copy, and query long after the
++// `flush()` call that produced it, independent of how many LATER flush()
++// calls have since been issued (this is the whole point of the redesign --
++// see the class comment on Uploader below).
++struct UploadTicket {
++    uint64_t value = 0;
++
++    // Diagnostic-only: Uploader::ringWrapCount() at the moment this ticket
++    // was issued. Carried over from this ticket's originally proposed
++    // shape (issue #28 body: "fence + ring generation") even though
++    // neither isComplete() nor wait() below ever consult it -- completion
++    // is determined entirely by `value` against the timeline semaphore.
++    // Production code has no need to read this; it exists so a test can
++    // assert which "lap" of the ring a given upload landed in.
++    uint32_t ringGeneration = 0;
++
++    bool operator==(const UploadTicket&) const = default;
++};
++
+ // Gets CPU-side bytes into GPU-visible/device-local Vulkan resources:
+ // uploadToBuffer() for a destination rx::rhi::Buffer, uploadToImage() for
+ // a Texture2D (optionally generating its full mip chain via
+ // Texture2D::recordMipChainBlit() in the same submission) [spec Fixed
+ // decision #7, R:C1].
+ //
+-// SYNCHRONOUS, BATCHED FLUSH -- read before assuming per-call semantics:
+-// every upload that goes through the staging ring (see below) only
+-// RECORDS a command (a vkCmdCopyBuffer/vkCmdCopyBufferToImage, plus any
+-// mip-chain blit) onto this Uploader's own internal command buffer;
+-// nothing touches the GPU until flush() actually submits everything
+-// recorded so far and BLOCKS the calling thread on a fence wait until it
+-// completes. This lets several uploads share one submission (cheaper
+-// than one submit-and-wait per resource) while keeping this phase's API
+-// deliberately simple: a fully synchronous flush() is an explicitly
+-// acceptable Phase 2 choice [R:C1] -- "Synchronous flush API is
+-// acceptable this phase ... per-frame async batching is a later
+-// optimization." A future Uploader revision replacing this with a fence
+-// the caller polls (instead of blocking on) would change flush()'s
+-// contract but not uploadToBuffer()/uploadToImage()'s. (A direct-path
+-// buffer upload, below, has no command to record at all -- see its own
+-// paragraph.)
++// BATCHED, POLLABLE FLUSH [Phase 4 Task 11, spec D25 as amended by gate
++// ruling RC4] -- read before assuming per-call semantics: every upload
++// that goes through the staging ring (see below) only RECORDS a command
++// (a vkCmdCopyBuffer/vkCmdCopyBufferToImage, plus any mip-chain blit) onto
++// one of this Uploader's own internal command buffers; nothing touches the
++// GPU until flush() submits everything recorded so far. Unlike this
++// class's pre-Task-11 shape, flush() no longer BLOCKS the calling thread
++// on that submission: it returns an UploadTicket immediately, and
++// isComplete(ticket)/wait(ticket) below let a caller check or block on
++// that specific batch's completion whenever it actually needs to (not
++// necessarily right away, or ever, if it never needs to know). This lets
++// several uploads share one submission (cheaper than one submit-and-wait
++// per resource) while letting a caller overlap many frames' worth of
++// uploads without ever stalling its own main thread inside flush() itself.
++//
++// TICKET PRIMITIVE: ONE TIMELINE SEMAPHORE, owned by this Uploader for its
++// whole lifetime. Every work-submitting flush() call signals the NEXT
++// monotonically increasing counter value and returns
++// UploadTicket{thatValue, ringWrapCount()}; isComplete(ticket) is one
++// vkGetSemaphoreCounterValue compare (current >= ticket.value); wait(ticket)
++// is vkWaitSemaphores for that value (returns immediately if already
++// reached). Chosen over a fence (pool or single-reused) specifically
++// because a REUSED fence is structurally incompatible with a pollable
++// ticket: resetting fence F to submit ticket N+1's work while a caller
++// might still be querying/waiting on ticket N (which used the SAME fence
++// object) either corrupts ticket N's reported status or is an outright
++// Vulkan validation error (vkResetFences while a wait on that fence is
++// still meaningful elsewhere) -- the exact hazard gate matrix-issue28's
++// row 1 traces to this class's original single-`VkFence` design. A
++// monotonic timeline-semaphore counter has no reset step at all (core
++// Vulkan 1.2, no extension gating needed on this project's 1.3 baseline),
++// eliminating the hazard by construction: two overlapping flush() calls
++// with no wait on the first one in between is the NORMAL case, not a
++// hazard -- see upload_test.cpp's dedicated overlapping-flush test, the
++// single highest-priority correctness gate for this class.
++//
++// TWO tickets from two DIFFERENT flush() calls are ordered exactly like
++// their counter values: ticket N+1's value is always > ticket N's, and
++// because both are signaled by submissions to the SAME queue in the SAME
++// order they were issued, waiting on the LATER ticket also guarantees the
++// earlier one's work has completed (this is what lets ~Uploader() below
++// wait on only the single most-recently-queued value at teardown, rather
++// than tracking every outstanding ticket it ever handed out).
++//
++// COMMAND-BUFFER ROTATION: a direct consequence of the same "flush() no
++// longer blocks" change -- reusing a single command buffer the way this
++// class did before Task 11 (vkResetCommandBuffer on every new batch) is
++// now the SAME class of hazard as the fence-reuse one above, just for the
++// command buffer instead of the completion primitive: resetting/
++// re-recording into a buffer whose previous submission may still be
++// pending on the GPU is a hard Vulkan violation. This class now keeps a
++// small, lazily-grown ROTATION of command buffers (all allocated from one
++// pool) and picks any buffer whose last submission is confirmed complete
++// (or allocates a fresh one if none is free) every time a new batch starts
++// recording -- never blocking to reclaim one, matching the timeline
++// semaphore's own "no artificial in-flight depth limit" character.
+ //
+ // DIRECT UPLOAD (BUFFERS ONLY) VS. STAGING RING [R:C1] -- CORRECTED THIS
+ // TASK'S REVIEW CYCLE, read before assuming the mechanism below: the
+ // ReBAR-aware "direct" fast path applies to the DESTINATION buffer's OWN
+ // allocation, not to this Uploader's internal staging ring. The first
+ // version of this class got this backwards -- it applied
+ // ALLOW_TRANSFER_INSTEAD_BIT to the ring buffer (which only ever has
+ // VK_BUFFER_USAGE_TRANSFER_SRC_BIT usage), and verified directly against
+ // vendored VMA 3.4.0 source that this is structurally inert: VMA's
+ // FindMemoryPreferences() only adds DEVICE_LOCAL to its preferred flags
+@@ -48,74 +124,104 @@ class Texture2D;
+ // ReBAR-capable desktop GPU (the direct path never engaged once). The
+ // fix: rx::rhi::Allocator::createDeviceLocalBuffer() (buffer.h) is what
+ // now requests ALLOW_TRANSFER_INSTEAD_BIT, applied to a buffer with its
+ // REAL device-consuming usage (VERTEX_BUFFER_BIT, INDEX_BUFFER_BIT, ...)
+ // -- exactly the resource this "direct" path is supposed to describe.
+ // uploadToBuffer() checks `dst.directPathCapable() && dst.mappedData() !=
+ // nullptr` per call: when true (ReBAR-enabled desktop GPU, or a
+ // unified-memory APU like Steam Deck, landed `dst`'s own memory in
+ // something BOTH DEVICE_LOCAL and HOST_VISIBLE), it memcpy's straight
+ // into `dst.mappedData()` and calls `dst.flush()` -- no staging copy, no
+-// command recorded, no ring buffer touched at all. Otherwise it falls
+-// back to exactly the staging-ring mechanism this class always had:
+-// memcpy into the ring, Buffer::flush() it (correct even on a
+-// hypothetical non-coherent HOST_VISIBLE memory type, not just the
+-// coherent-in-practice hardware this engine has been tested against),
+-// record a vkCmdCopyBuffer from the ring into `dst`. Which branch a given
+-// call took is logged once per outcome (RX_LOG_INFO, the first time each
+-// is observed -- not per call) and exposed for tests via
+-// everUsedDirectPath()/everUsedStagingPath().
++// command recorded, no ring buffer touched at all, and (per the ticket
++// design above) no fence/semaphore machinery touched by the flush() call
++// that later covers it either, if nothing else in that batch needed real
++// GPU work [matrix-issue28 row 8]. Otherwise it falls back to exactly the
++// staging-ring mechanism this class always had: memcpy into the ring,
++// Buffer::flush() it (correct even on a hypothetical non-coherent
++// HOST_VISIBLE memory type, not just the coherent-in-practice hardware
++// this engine has been tested against), record a vkCmdCopyBuffer from the
++// ring into `dst`. Which branch a given call took is logged once per
++// outcome (RX_LOG_INFO, the first time each is observed -- not per call)
++// and exposed for tests via everUsedDirectPath()/everUsedStagingPath().
+ //
+ // IMAGES ALWAYS STAGE -- this is the honest shape of [R:C1]'s guidance,
+ // not a cop-out: a VkImage cannot be written from the host at all without
+ // VK_EXT_host_image_copy, which is not in this project's baseline
+ // (Vulkan 1.3 core + the descriptor-indexing feature set [spec Fixed
+ // decision #5] -- no host-image-copy anywhere in that list). There is no
+ // "direct" branch for uploadToImage() to take, on any hardware, by
+ // construction of the Vulkan API itself -- every image upload goes
+ // through the staging ring, unconditionally, exactly as this class
+-// always did for images.
++// always did for images; its ticket is therefore never the trivially-
++// complete sentinel [matrix-issue28 row 7].
++//
++// RING RECLAMATION KEYED TO TICKET COMPLETION, NOT TO HAVING BLOCKED
++// [matrix-issue28 rows 5/6, the D3D12 fence-gated-ring-buffer pattern]:
++// this Uploader tracks a FIFO queue of (ticket, ring-byte-range) entries,
++// one per work-submitting flush() call. Reclaiming ring space (needed
++// only when a write would wrap past the buffer's end) first pops every
++// entry at the FRONT of that queue whose ticket is already complete
++// (a pure poll, never blocking) and, only if the requested range still
++// overlaps the oldest remaining entry, blocks on THAT SPECIFIC ticket
++// (never a whole-ring flush-and-wait) before trying again. The ring
++// buffer itself is fixed-size (set once at create(), never grown) --
++// exhaustion under many in-flight tickets blocks on the oldest one
++// covering the needed range, exactly the D3D12-precedented
++// block-on-oldest policy, not silent growth.
+ //
+ // If a single ring-staged upload's write position would run past the
+ // ring buffer's end before the pending batch is flushed, this Uploader
+-// transparently calls flush() itself first (submitting + waiting on
+-// everything recorded so far, which frees the whole ring buffer for
+-// reuse since flush() is synchronous) and then continues writing from
+-// offset 0 -- callers never need to reason about ring-buffer capacity
+-// themselves unless a single upload's size exceeds the ring buffer's
+-// total capacity, which fails cleanly (logged, returns false) rather
+-// than silently corrupting anything. This never applies to a
+-// direct-path buffer upload, which never touches the ring at all.
++// transparently flushes what is already recorded (submitting it, and
++// tracking its ring range per the paragraph above -- not waiting on it)
++// and then continues writing from offset 0 once enough of the ring's
++// front is confirmed reclaimable -- callers never need to reason about
++// ring-buffer capacity themselves unless a single upload's size exceeds
++// the ring buffer's total capacity, which fails cleanly (logged, returns
++// false) rather than silently corrupting anything. This never applies to
++// a direct-path buffer upload, which never touches the ring at all.
+ //
+-// Thread-affinity (D5, Phase 4): uploadToBuffer()/uploadToImage()/flush()
+-// are main-thread-only -- see docs/threading.md. uploadToBuffer()/
+-// uploadToImage() carry a dev-time RX_ASSERT_MAIN_THREAD guard [Phase 4
+-// Task 7 fix round 1] that fails loudly on a chunk >= 1 violation instead
+-// of corrupting the shared ring buffer/command-recording state silently.
++// Thread-affinity (D5, Phase 4): uploadToBuffer()/uploadToImage()/flush()/
++// isComplete()/wait() are main-thread-only -- see docs/threading.md.
++// uploadToBuffer()/uploadToImage()/flush()/isComplete()/wait() all carry a
++// dev-time RX_ASSERT_MAIN_THREAD guard [Phase 4 Task 7 fix round 1;
++// extended to flush()/isComplete()/wait() in Task 11, since flush() can
++// now be a legitimate standalone call -- e.g. on nothing recorded -- no
++// longer reachable only via an already-guarded uploadTo*() call] that
++// fails loudly on a chunk >= 1 violation instead of corrupting shared
++// state silently. isComplete()/wait() poll/wait on this Uploader's own
++// timeline semaphore, which the Vulkan spec itself permits from any
++// thread with no external synchronization -- the guard here is this
++// project's own D5 policy scoping, matching every other Uploader entry
++// point's identical scoping, not a hazard these two introduce.
+ class Uploader {
+ public:
+     Uploader(Uploader&&) noexcept;
+     Uploader& operator=(Uploader&&) noexcept;
+     Uploader(const Uploader&) = delete;
+     Uploader& operator=(const Uploader&) = delete;
+ 
+     // Auto-flushes any pending (recorded-but-not-yet-submitted) uploads
+-    // before tearing down the ring buffer/command pool/fence, so a
+-    // caller that forgets an explicit final flush() never silently loses
+-    // work -- see flush()'s own comment for why this is safe to do here
+-    // unconditionally (it blocks on the same fence wait flush() always
+-    // does).
++    // and then WAITS for every ticket this Uploader ever queued --
++    // including ones from earlier flush() calls a caller never itself
++    // waited/polled on -- before tearing down the timeline semaphore/
++    // command pool/ring buffer, so a caller that never explicitly waited
++    // on a ticket never silently loses work or destroys a resource the
++    // GPU is still using. Waiting on only the single most-recently-queued
++    // value is sufficient (see the class comment's paragraph on ticket
++    // ordering above) -- it transitively covers every earlier ticket too.
+     ~Uploader();
+ 
+     static constexpr VkDeviceSize kDefaultRingBufferSize = 16u * 1024u * 1024u;  // 16 MiB
+ 
+-    // Builds this Uploader's internal command pool/buffer/fence against
++    // Builds this Uploader's internal command pool (command buffers are
++    // allocated from it lazily, on demand -- see the class comment's
++    // "COMMAND-BUFFER ROTATION" paragraph) and timeline semaphore against
+     // `device`'s graphics queue, and its staging ring buffer (`usage`
+     // VK_BUFFER_USAGE_TRANSFER_SRC_BIT only -- this buffer is always a
+     // copy source, never a real destination) of `ringBufferSize` bytes
+     // via `allocator`. Returns std::nullopt (logged) on any failure.
+     static std::optional<Uploader> create(Allocator& allocator, Device& device,
+                                            VkDeviceSize ringBufferSize = kDefaultRingBufferSize);
+ 
+     // Copies `size` bytes from `data` into `dst` at `dstOffset`. Takes
+     // `dst` by reference (not a bare VkBuffer) specifically so this
+     // method can inspect `dst.directPathCapable()`/`dst.mappedData()` to
+@@ -142,72 +248,156 @@ public:
+     // NOT additionally gated on `dst.mipLevels() > 1`: recordMipChainBlit()
+     // already handles a single-mip `dst` correctly and cheaply via its
+     // own early-return branch, so `generateMips` alone decides which of
+     // the two branches runs. As with uploadToBuffer(), nothing reaches
+     // the GPU until flush(). Returns false (logged) only if `pixelBytes`
+     // exceeds this Uploader's total ring-buffer capacity outright. A
+     // `pixelBytes` of 0 is a no-op that returns true.
+     bool uploadToImage(Texture2D& dst, const void* pixels, VkDeviceSize pixelBytes, bool generateMips);
+ 
+     // Submits every uploadTo*() call recorded since the last flush() (or
+-    // since create()), waits (via this Uploader's own dedicated fence)
+-    // for the GPU to finish, then resets the ring buffer's write cursor
+-    // back to 0 and the command buffer for reuse. Safe to call with
+-    // nothing pending (no-op).
+-    void flush();
++    // since create()) and returns a pollable UploadTicket -- see the class
++    // comment above for the full ticket design. Does NOT block: a caller
++    // that needs the old always-blocking behavior calls wait() on the
++    // returned ticket explicitly (see MeshBuffers::create() for exactly
++    // this pattern). If nothing was recorded since the last flush() (no
++    // uploadTo*() call happened, or every call in this batch took the
++    // direct memcpy path with zero real GPU work queued), returns the
++    // trivially-complete UploadTicket{0, ringWrapCount()} without
++    // touching the timeline semaphore or submitting anything at all --
++    // matching this class's pre-Task-11 no-op-flush() behavior exactly.
++    UploadTicket flush();
++
++    // Pure poll, no blocking: true iff this Uploader's timeline semaphore
++    // has reached (or passed) `ticket.value`. A `ticket.value` of 0
++    // (the trivially-complete sentinel) is always true without querying
++    // the semaphore at all. On the rare vkGetSemaphoreCounterValue
++    // failure, logs a named RX_LOG_ERROR (never silently treated as
++    // either state) and conservatively returns false.
++    bool isComplete(UploadTicket ticket) const;
++
++    // Blocks the calling thread until this Uploader's timeline semaphore
++    // reaches `ticket.value` (vkWaitSemaphores, UINT64_MAX timeout) --
++    // the direct analog of this class's pre-Task-11 always-blocking
++    // flush(). Returns immediately if `ticket` is already complete
++    // (including the ticket.value == 0 sentinel, which never touches the
++    // semaphore at all -- see isComplete()'s own comment).
++    void wait(UploadTicket ticket) const;
++
++    // How many times this Uploader's ring buffer has wrapped back to
++    // offset 0 since create() -- diagnostic/test accessor (see
++    // UploadTicket::ringGeneration's own comment); production code has no
++    // need for it.
++    uint32_t ringWrapCount() const { return ringGeneration_; }
++
++    // How many times reserveRingSpace() had to block (wait() on a
++    // specific in-flight ticket) to reclaim ring space, across this
++    // Uploader's whole lifetime -- test/diagnostic accessor proving the
++    // D3D12-pattern partial reclaim in the class comment above actually
++    // engages (a stress test asserts this stays below the number of
++    // flush() calls issued, per matrix-issue28 row 5). Production code
++    // has no need for it.
++    uint32_t blockingRingWaitCount() const { return blockingRingWaitCount_; }
++
++    // This Uploader's fixed ring-buffer capacity, exactly as passed to
++    // create() -- never changes for this Uploader's lifetime (this class
++    // never silently grows the ring; see the class comment's ring-
++    // reclamation paragraph). Test/diagnostic accessor.
++    VkDeviceSize ringCapacity() const { return ringBufferSize_; }
+ 
+     // True once at least one uploadToBuffer() call has taken the direct
+     // (memcpy-straight-into-`dst`) branch / the staging-ring branch,
+     // respectively, at any point in this Uploader's lifetime. Test/
+     // diagnostic accessors -- production code has no need for them
+     // (uploadToBuffer()'s return value already reports success/failure
+     // uniformly regardless of which branch ran).
+     bool everUsedDirectPath() const { return everUsedDirectPath_; }
+     bool everUsedStagingPath() const { return everUsedStagingPath_; }
+ 
+ private:
+     // No plain default constructor: `ringBuffer_` is a real
+     // rx::rhi::Buffer, whose own default constructor is private to Buffer
+     // (friends only, see buffer.h) -- Uploader is not a friend of Buffer
+     // and does not need to be. create() builds every member's real value
+     // up front and constructs this Uploader directly via this
+     // parameterized constructor instead (mirroring
+     // rx::rhi::MeshBuffers/Texture2D's own equivalent constructors, for
+     // the same reason). The move constructor/assignment below are
+     // hand-written rather than `= default` for the opposite reason: this
+-    // class also owns several *raw* Vulkan handles (pool_/cmd_/fence_),
+-    // which a defaulted move would copy without nulling the source --
+-    // exactly the double-destroy hazard every other RAII type in this
+-    // library's move operations are hand-written to avoid.
+-    Uploader(VkDevice device, VkQueue queue, VkCommandPool pool, VkCommandBuffer cmd, VkFence fence,
+-             Buffer ringBuffer, VkDeviceSize ringBufferSize)
++    // class also owns several *raw* Vulkan handles (pool_/timelineSemaphore_/
++    // every VkCommandBuffer inside cmdSlots_), which a defaulted move
++    // would copy without nulling the source -- exactly the double-destroy
++    // hazard every other RAII type in this library's move operations are
++    // hand-written to avoid.
++    Uploader(VkDevice device, VkQueue queue, VkCommandPool pool, VkSemaphore timelineSemaphore, Buffer ringBuffer,
++             VkDeviceSize ringBufferSize)
+         : device_(device),
+           queue_(queue),
+           pool_(pool),
+-          cmd_(cmd),
+-          fence_(fence),
++          timelineSemaphore_(timelineSemaphore),
+           ringBuffer_(std::move(ringBuffer)),
+           ringBufferSize_(ringBufferSize) {}
+ 
++    // [Phase 4 Task 11] One rotating recorded-command-buffer slot -- see
++    // the class comment's "COMMAND-BUFFER ROTATION" paragraph for why a
++    // single reused buffer is no longer safe once flush() stops blocking.
++    struct CmdSlot {
++        VkCommandBuffer cmd = VK_NULL_HANDLE;
++        UploadTicket lastTicket{};
++        bool everSubmitted = false;
++    };
++
++    // [Phase 4 Task 11] One entry in the ring-reclamation FIFO -- see the
++    // class comment's "RING RECLAMATION" paragraph. `[start, end)` is the
++    // half-open byte range, within one "lap" of the ring, that `ticket`'s
++    // flush() call submitted staging/image copies out of.
++    struct PendingRegion {
++        UploadTicket ticket;
++        VkDeviceSize start = 0;
++        VkDeviceSize end = 0;
++    };
++
++    static constexpr size_t kInvalidSlot = static_cast<size_t>(-1);
++
+     void beginRecordingIfNeeded();
+     bool reserveRingSpace(VkDeviceSize size, VkDeviceSize& outOffset);
++    void reclaimCompletedRegions();
++    // VK_NULL_HANDLE (not an out-of-bounds index) when beginRecordingIfNeeded()
++    // itself failed to allocate/begin a slot -- the caller (uploadToBuffer()/
++    // uploadToImage()) still unconditionally records into whatever this
++    // returns on that rare path, exactly like this class's pre-Task-11
++    // behavior against its single `cmd_` member; a VK_NULL_HANDLE command
++    // buffer fails loudly (validation error) rather than corrupting memory.
++    VkCommandBuffer activeCmd() const {
++        return activeSlot_ == kInvalidSlot ? VK_NULL_HANDLE : cmdSlots_[activeSlot_].cmd;
++    }
+     void destroyAll();
+ 
+     VkDevice device_ = VK_NULL_HANDLE;
+     VkQueue queue_ = VK_NULL_HANDLE;
+     VkCommandPool pool_ = VK_NULL_HANDLE;
+-    VkCommandBuffer cmd_ = VK_NULL_HANDLE;
+-    VkFence fence_ = VK_NULL_HANDLE;
++    VkSemaphore timelineSemaphore_ = VK_NULL_HANDLE;
++    uint64_t lastQueuedValue_ = 0;
++
++    std::vector<CmdSlot> cmdSlots_;
++    size_t activeSlot_ = kInvalidSlot;
+ 
+     Buffer ringBuffer_;
+     VkDeviceSize ringBufferSize_ = 0;
+     VkDeviceSize ringCursor_ = 0;
++    // Boundary between "already pushed into pendingRegions_ by a previous
++    // flush()" and "written since then, not yet tracked" -- see flush()'s
++    // own comment.
++    VkDeviceSize lastFlushRingCursor_ = 0;
++    std::deque<PendingRegion> pendingRegions_;
++    uint32_t ringGeneration_ = 0;
++    uint32_t blockingRingWaitCount_ = 0;
+ 
+     bool recording_ = false;
+ 
+     bool everUsedDirectPath_ = false;
+     bool everUsedStagingPath_ = false;
+     bool loggedDirectPathOnce_ = false;
+     bool loggedStagingPathOnce_ = false;
+ };
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/device.cpp b/src/rx_rhi_vk/src/device.cpp
+index 4404d2c..e0ebe58 100644
+--- a/src/rx_rhi_vk/src/device.cpp
++++ b/src/rx_rhi_vk/src/device.cpp
+@@ -218,20 +218,39 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
+     features12.descriptorIndexing = VK_TRUE;
+     features12.runtimeDescriptorArray = VK_TRUE;
+     features12.descriptorBindingPartiallyBound = VK_TRUE;
+     features12.descriptorBindingVariableDescriptorCount = VK_TRUE;
+     features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+     features12.descriptorBindingStorageImageUpdateAfterBind = VK_TRUE;
+     features12.descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE;
+     features12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
+     features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+     features12.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
++    // timelineSemaphore [Phase 4 Task 11, spec D25 as amended by gate
++    // ruling RC4]: rx::rhi::Uploader's ticket-completion primitive
++    // (upload.cpp) needs VK_SEMAPHORE_TYPE_TIMELINE, which -- despite
++    // `VK_KHR_timeline_semaphore`'s functionality being fully promoted
++    // into Vulkan 1.2 core, confirmed against the Khronos registry man
++    // page -- is still a FEATURE BIT that must be explicitly requested at
++    // device-creation time, not something API version alone turns on
++    // (`vkCreateSemaphore` with `VK_SEMAPHORE_TYPE_TIMELINE` otherwise
++    // hard-fails VUID-VkSemaphoreTypeCreateInfo-timelineSemaphore-03252 --
++    // caught empirically by this task's own test suite before this line
++    // existed). Required unconditionally, matching every other bit in this
++    // struct: verified present on both this project's own dev drivers
++    // (NVIDIA proprietary and Mesa llvmpipe/lavapipe, `vulkaninfo`) and
++    // mandated by the Vulkan Roadmap 2022 profile this project's Steam
++    // Deck RADV floor hardware already targets -- no optionality/fallback
++    // needed the way VK_EXT_calibrated_timestamps/VK_EXT_memory_budget
++    // (genuinely optional extensions, not core-promoted feature bits) get
++    // below.
++    features12.timelineSemaphore = VK_TRUE;
+ 
+     vkb::PhysicalDeviceSelector selector(context.vkbInstance());
+     auto physResult = selector.set_surface(surface)
+                           .set_minimum_version(1, 3)
+                           .set_required_features_11(features11)
+                           .set_required_features_12(features12)
+                           .set_required_features_13(features13)
+                           .select();
+     if (!physResult) {
+         RX_LOG_ERROR("vkb::PhysicalDeviceSelector::select failed: {}", physResult.error().message());
+@@ -306,20 +325,41 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
+     }
+ 
+     auto presentQueueResult = vkbDevice.get_queue(vkb::QueueType::present);
+     if (!presentQueueResult) {
+         RX_LOG_ERROR("vkb::Device::get_queue(present) failed: {}", presentQueueResult.error().message());
+         vkb::destroy_device(vkbDevice);
+         destroySurface(context, surface);
+         return std::nullopt;
+     }
+ 
++    // Optional dedicated transfer queue [Phase 4 Task 11, spec D25, gate
++    // ruling #28 row 10]: `get_dedicated_queue()` fails gracefully via its
++    // own `Result` (not a hard PhysicalDeviceSelector-level requirement,
++    // unlike `require_dedicated_transfer_queue()`, which this task
++    // deliberately never calls) on hardware with no queue family that
++    // supports transfer but NOT graphics/compute. A missing dedicated
++    // queue is not a Device::create() failure -- it is a graceful, logged
++    // degrade (below); every caller falls back to graphicsQueue() for any
++    // future transfer work, not exercised this phase (acquisition only --
++    // see device.h's own comment on hasDedicatedTransferQueue()).
++    VkQueue transferQueue = VK_NULL_HANDLE;
++    uint32_t transferQueueFamily = 0;
++    bool hasDedicatedTransferQueue = false;
++    auto transferQueueResult = vkbDevice.get_dedicated_queue(vkb::QueueType::transfer);
++    auto transferQueueIndexResult = vkbDevice.get_dedicated_queue_index(vkb::QueueType::transfer);
++    if (transferQueueResult && transferQueueIndexResult) {
++        transferQueue = transferQueueResult.value();
++        transferQueueFamily = transferQueueIndexResult.value();
++        hasDedicatedTransferQueue = true;
++    }
++
+     vkb::SwapchainBuilder swapchainBuilder(vkbDevice, surface);
+     // Present-mode control [Phase 4 Task 6, spec seed 1]: explicit FIFO
+     // default (PresentMode::VsyncOn), not vk-bootstrap's own implicit
+     // preference (MAILBOX if the surface supports it, else FIFO). This is
+     // a BEHAVIORAL CHANGE from every Device built before this task: a
+     // sample that happened to run against a MAILBOX-capable surface
+     // previously got MAILBOX with no code anywhere having chosen it; now
+     // it gets FIFO unless something explicitly opts out via
+     // setPresentMode(PresentMode::VsyncOff) + recreateSwapchain() (see
+     // those methods' own comments) -- e.g. a sample's --vsync off flag.
+@@ -346,20 +386,29 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
+     }
+ 
+     Device dev;
+     dev.instance_ = context.instance();
+     dev.physicalDevice_ = vkbDevice.physical_device.physical_device;
+     dev.device_ = vkbDevice.device;
+     dev.surface_ = surface;
+     dev.graphicsQueue_ = graphicsQueueResult.value();
+     dev.graphicsQueueFamily_ = graphicsQueueIndexResult.value();
+     dev.presentQueue_ = presentQueueResult.value();
++    dev.transferQueue_ = transferQueue;
++    dev.transferQueueFamily_ = transferQueueFamily;
++    dev.hasDedicatedTransferQueue_ = hasDedicatedTransferQueue;
++    RX_LOG_INFO("Device::create: dedicated transfer queue {} [Phase 4 Task 11, spec D25] (acquisition only -- "
++                "nothing submits to it this phase)",
++                hasDedicatedTransferQueue
++                    ? "ACQUIRED"
++                    : "not present on this physical device -- falling back to the graphics queue for any future "
++                      "transfer work");
+     dev.calibratedTimestampsEnabled_ = calibratedTimestampsEnabled;
+     RX_LOG_INFO("Device::create: VK_EXT_calibrated_timestamps {} on the selected physical device",
+                 calibratedTimestampsEnabled ? "ENABLED" : "not present -- falling back to uncalibrated GPU zones");
+     dev.memoryBudgetExtensionEnabled_ = memoryBudgetExtensionEnabled;
+     RX_LOG_INFO("Device::create: VK_EXT_memory_budget {} on the selected physical device",
+                 memoryBudgetExtensionEnabled ? "ENABLED" : "not present -- memory reports fall back to a heap-size "
+                                                             "budget estimate");
+     dev.swapchain_ = vkbSwapchain.swapchain;
+     dev.swapchainImages_ = imagesResult.value();
+     dev.swapchainFormat_ = vkbSwapchain.image_format;
+@@ -379,36 +428,42 @@ Device& Device::operator=(Device&& other) noexcept {
+     if (this != &other) {
+         destroyAll();
+ 
+         instance_ = other.instance_;
+         physicalDevice_ = other.physicalDevice_;
+         device_ = other.device_;
+         surface_ = other.surface_;
+         graphicsQueue_ = other.graphicsQueue_;
+         graphicsQueueFamily_ = other.graphicsQueueFamily_;
+         presentQueue_ = other.presentQueue_;
++        transferQueue_ = other.transferQueue_;
++        transferQueueFamily_ = other.transferQueueFamily_;
++        hasDedicatedTransferQueue_ = other.hasDedicatedTransferQueue_;
+         calibratedTimestampsEnabled_ = other.calibratedTimestampsEnabled_;
+         memoryBudgetExtensionEnabled_ = other.memoryBudgetExtensionEnabled_;
+         swapchain_ = other.swapchain_;
+         swapchainImages_ = std::move(other.swapchainImages_);
+         swapchainFormat_ = other.swapchainFormat_;
+         swapchainExtent_ = other.swapchainExtent_;
+         desiredPresentMode_ = other.desiredPresentMode_;
+         actualPresentMode_ = other.actualPresentMode_;
+ 
+         other.instance_ = VK_NULL_HANDLE;
+         other.physicalDevice_ = VK_NULL_HANDLE;
+         other.device_ = VK_NULL_HANDLE;
+         other.surface_ = VK_NULL_HANDLE;
+         other.graphicsQueue_ = VK_NULL_HANDLE;
+         other.graphicsQueueFamily_ = 0;
+         other.presentQueue_ = VK_NULL_HANDLE;
++        other.transferQueue_ = VK_NULL_HANDLE;
++        other.transferQueueFamily_ = 0;
++        other.hasDedicatedTransferQueue_ = false;
+         other.calibratedTimestampsEnabled_ = false;
+         other.memoryBudgetExtensionEnabled_ = false;
+         other.swapchain_ = VK_NULL_HANDLE;
+         other.swapchainImages_.clear();
+         other.swapchainFormat_ = VK_FORMAT_UNDEFINED;
+         other.swapchainExtent_ = VkExtent2D{0, 0};
+         other.desiredPresentMode_ = PresentMode::VsyncOn;
+         other.actualPresentMode_ = VK_PRESENT_MODE_FIFO_KHR;
+     }
+     return *this;
+diff --git a/src/rx_rhi_vk/src/mesh_buffers.cpp b/src/rx_rhi_vk/src/mesh_buffers.cpp
+index 773290b..ada1817 100644
+--- a/src/rx_rhi_vk/src/mesh_buffers.cpp
++++ b/src/rx_rhi_vk/src/mesh_buffers.cpp
+@@ -35,37 +35,42 @@ std::optional<MeshBuffers> MeshBuffers::create(Allocator& allocator, Uploader& u
+     // (VERTEX_BUFFER_BIT/INDEX_BUFFER_BIT) on top of TRANSFER_DST_BIT --
+     // exactly what Uploader::uploadToBuffer()'s direct-path check needs
+     // Allocator::createDeviceLocalBuffer() to have requested
+     // ALLOW_TRANSFER_INSTEAD_BIT against (see that method's own comment).
+     // On a ReBAR-enabled/unified-memory device, both uploads below skip
+     // the staging ring entirely.
+     if (!uploader.uploadToBuffer(*vertexBuffer, 0, vertexData, vertexBytes)) {
+         RX_LOG_ERROR("MeshBuffers::create: vertex upload failed");
+         return std::nullopt;
+     }
+-    // REAL BUG FIX: flush immediately after the vertex upload succeeds,
+-    // rather than deferring to a single flush() call at the very end
+-    // after both uploads. If the vertex upload took the staging path, it
+-    // only RECORDED a copy into Uploader's command buffer -- nothing
+-    // touches the GPU until flush() submits it. Without this early
+-    // flush(), a subsequent index-upload failure below hits `return
+-    // std::nullopt` before flush() ever runs, so `vertexBuffer`'s RAII
+-    // destructor fires (destroying its VkBuffer) while that copy is still
+-    // only recorded, never submitted -- and once flush() eventually runs
+-    // on some *later* Uploader use, it would submit a copy command
+-    // referencing an already-destroyed buffer. Flushing here makes the
+-    // vertex copy submitted and (per Uploader::flush()'s synchronous
+-    // contract) complete before vertexBuffer can ever be destroyed,
+-    // independent of whether the index upload below succeeds. flush() is
+-    // a safe no-op if the vertex upload took the direct (non-staging)
+-    // path instead (nothing was recorded, so there is nothing to submit).
+-    uploader.flush();
++    // REAL BUG FIX: flush+WAIT immediately after the vertex upload
++    // succeeds, rather than deferring to a single flush() call at the
++    // very end after both uploads. If the vertex upload took the staging
++    // path, it only RECORDED a copy into Uploader's command buffer --
++    // nothing touches the GPU until flush() submits it. Without this
++    // early flush()+wait(), a subsequent index-upload failure below hits
++    // `return std::nullopt` before the copy is confirmed complete, so
++    // `vertexBuffer`'s RAII destructor fires (destroying its VkBuffer)
++    // while that copy may still be running on the GPU -- corrupting or
++    // crashing whenever it eventually completes against an
++    // already-destroyed buffer. [Phase 4 Task 11, spec D25] flush() alone
++    // no longer blocks -- MeshBuffers::create() is exactly the
++    // "convenience wrapper" plan Task 11 names explicitly: it keeps its
++    // OWN pre-Task-11 blocking contract on purpose (the whole point of
++    // this factory is "both buffers are already fully populated and safe
++    // to bind/draw from immediately" by the time it returns), via an
++    // explicit wait(ticket) right after flush() -- byte-identical
++    // external behavior to before, just no longer implicit. wait() is a
++    // safe no-op if the vertex upload took the direct (non-staging) path
++    // instead (nothing was recorded, so flush() returns the trivially-
++    // complete ticket and wait() returns immediately).
++    uploader.wait(uploader.flush());
+     if (!uploader.uploadToBuffer(*indexBuffer, 0, indexData, indexBytes)) {
+         RX_LOG_ERROR("MeshBuffers::create: index upload failed");
+         return std::nullopt;
+     }
+-    uploader.flush();
++    uploader.wait(uploader.flush());
+ 
+     return MeshBuffers(std::move(*vertexBuffer), std::move(*indexBuffer), indexCount, indexType);
+ }
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/upload.cpp b/src/rx_rhi_vk/src/upload.cpp
+index 5d20b0a..43a3c04 100644
+--- a/src/rx_rhi_vk/src/upload.cpp
++++ b/src/rx_rhi_vk/src/upload.cpp
+@@ -17,123 +17,193 @@ namespace {
+ // has no such requirement but aligning every reservation uniformly is
+ // simpler than special-casing buffer-vs-image copies here. 16 covers every
+ // texel block size this engine's Phase 2 formats use (RGBA8 = 4 bytes,
+ // RGBA16F = 8 bytes, etc.) with room to spare.
+ constexpr VkDeviceSize kRingAlignment = 16;
+ 
+ VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment) {
+     return (value + alignment - 1) & ~(alignment - 1);
+ }
+ 
++// Half-open interval overlap test -- used by reserveRingSpace() to decide
++// whether a candidate write range would stomp on a still-unreclaimed
++// PendingRegion [matrix-issue28 rows 5/6].
++bool regionsOverlap(VkDeviceSize start, VkDeviceSize size, VkDeviceSize otherStart, VkDeviceSize otherEnd) {
++    return !(start + size <= otherStart || otherEnd <= start);
++}
++
+ }  // namespace
+ 
+ std::optional<Uploader> Uploader::create(Allocator& allocator, Device& device, VkDeviceSize ringBufferSize) {
+     VkDevice vkDevice = device.device();
+     VkQueue queue = device.graphicsQueue();
+ 
+     VkCommandPoolCreateInfo poolInfo{};
+     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+-    // RESET_COMMAND_BUFFER_BIT: beginRecordingIfNeeded() re-begins the same
+-    // single command buffer every flush() cycle for this Uploader's whole
+-    // lifetime, via an explicit vkResetCommandBuffer -- same reasoning as
+-    // rx::rhi::CommandContext's own pool (command.cpp).
++    // RESET_COMMAND_BUFFER_BIT: beginRecordingIfNeeded() individually
++    // resets whichever command-buffer slot it picks (never the whole pool
++    // at once) every time a new batch starts recording -- see the class
++    // comment's "COMMAND-BUFFER ROTATION" paragraph in upload.h.
+     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+     poolInfo.queueFamilyIndex = device.graphicsQueueFamily();
+ 
+     VkCommandPool pool = VK_NULL_HANDLE;
+     if (vkCreateCommandPool(vkDevice, &poolInfo, nullptr, &pool) != VK_SUCCESS) {
+         RX_LOG_ERROR("Uploader::create: vkCreateCommandPool failed");
+         return std::nullopt;
+     }
+ 
+-    VkCommandBufferAllocateInfo cmdAllocInfo{};
+-    cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+-    cmdAllocInfo.commandPool = pool;
+-    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+-    cmdAllocInfo.commandBufferCount = 1;
+-
+-    VkCommandBuffer cmd = VK_NULL_HANDLE;
+-    if (vkAllocateCommandBuffers(vkDevice, &cmdAllocInfo, &cmd) != VK_SUCCESS) {
+-        RX_LOG_ERROR("Uploader::create: vkAllocateCommandBuffers failed");
+-        vkDestroyCommandPool(vkDevice, pool, nullptr);
+-        return std::nullopt;
+-    }
+-
+-    // Created unsignaled -- flush() always submits before it ever waits on
+-    // this fence, so there is no "first wait must return immediately"
+-    // requirement the way FrameSync's per-slot fences have.
+-    VkFenceCreateInfo fenceInfo{};
+-    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+-
+-    VkFence fence = VK_NULL_HANDLE;
+-    if (vkCreateFence(vkDevice, &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
+-        RX_LOG_ERROR("Uploader::create: vkCreateFence failed");
++    // Timeline semaphore [Phase 4 Task 11, spec D25 as amended by gate
++    // ruling RC4]: the ticket-completion primitive for this Uploader's
++    // whole lifetime, replacing the single reused VkFence every flush()
++    // used to vkResetFences()+resubmit into (matrix-issue28 row 1 --
++    // reset-while-referenced hazard the moment flush() stops blocking).
++    // Core Vulkan 1.2 (VK_KHR_timeline_semaphore's functionality is fully
++    // subsumed into 1.2 core, confirmed against the Khronos registry man
++    // page), no extension gating needed on this project's Vulkan 1.3
++    // baseline. Starts at counter value 0 -- see UploadTicket's own
++    // comment on why that makes value == 0 a safe "always complete"
++    // sentinel with no special-casing needed in isComplete()/wait().
++    VkSemaphoreTypeCreateInfo timelineTypeInfo{};
++    timelineTypeInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
++    timelineTypeInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
++    timelineTypeInfo.initialValue = 0;
++
++    VkSemaphoreCreateInfo semaphoreInfo{};
++    semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
++    semaphoreInfo.pNext = &timelineTypeInfo;
++
++    VkSemaphore timelineSemaphore = VK_NULL_HANDLE;
++    if (vkCreateSemaphore(vkDevice, &semaphoreInfo, nullptr, &timelineSemaphore) != VK_SUCCESS) {
++        RX_LOG_ERROR("Uploader::create: vkCreateSemaphore (timeline) failed");
+         vkDestroyCommandPool(vkDevice, pool, nullptr);
+         return std::nullopt;
+     }
+ 
+     // MemoryCategory::Staging [Phase 4 Task 10, spec D24(a)]: this ring
+     // buffer IS the staging ring the category names -- the one real,
+     // in-scope call site this task itself categorizes explicitly (every
+     // other existing call site keeps createUploadRingBuffer()'s own
+     // Staging default anyway, so this is a documentation-of-intent change,
+-    // not a behavior change).
++    // not a behavior change). Unchanged by Task 11.
+     auto ringBuffer =
+         allocator.createUploadRingBuffer(ringBufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemoryCategory::Staging);
+     if (!ringBuffer.has_value()) {
+         RX_LOG_ERROR("Uploader::create: failed to allocate the {}-byte staging ring buffer", ringBufferSize);
+-        vkDestroyFence(vkDevice, fence, nullptr);
++        vkDestroySemaphore(vkDevice, timelineSemaphore, nullptr);
+         vkDestroyCommandPool(vkDevice, pool, nullptr);
+         return std::nullopt;
+     }
+ 
+-    return Uploader(vkDevice, queue, pool, cmd, fence, std::move(*ringBuffer), ringBufferSize);
++    return Uploader(vkDevice, queue, pool, timelineSemaphore, std::move(*ringBuffer), ringBufferSize);
+ }
+ 
+ void Uploader::beginRecordingIfNeeded() {
+     if (recording_) {
+         return;
+     }
+ 
+-    vkResetCommandBuffer(cmd_, 0);
++    // Pick any command-buffer slot whose last submission (if any) is
++    // already confirmed complete; grow the rotation with a freshly
++    // allocated buffer if none is free rather than block -- see the class
++    // comment's "COMMAND-BUFFER ROTATION" paragraph in upload.h for why a
++    // single reused buffer is unsafe once flush() no longer blocks, and
++    // why "grow, never block" is the deliberate policy here (blocking
++    // inside a call this class does not time-bound -- unlike flush()/
++    // isComplete(), which the wall-clock test does bound -- would just
++    // relocate the hazard rather than remove it).
++    size_t freeSlot = kInvalidSlot;
++    for (size_t i = 0; i < cmdSlots_.size(); ++i) {
++        if (!cmdSlots_[i].everSubmitted || isComplete(cmdSlots_[i].lastTicket)) {
++            freeSlot = i;
++            break;
++        }
++    }
++
++    if (freeSlot == kInvalidSlot) {
++        VkCommandBufferAllocateInfo cmdAllocInfo{};
++        cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
++        cmdAllocInfo.commandPool = pool_;
++        cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++        cmdAllocInfo.commandBufferCount = 1;
++
++        VkCommandBuffer newCmd = VK_NULL_HANDLE;
++        if (vkAllocateCommandBuffers(device_, &cmdAllocInfo, &newCmd) != VK_SUCCESS) {
++            RX_LOG_ERROR("Uploader: vkAllocateCommandBuffers failed while growing the command-buffer rotation");
++            return;
++        }
++        cmdSlots_.push_back(CmdSlot{newCmd, UploadTicket{}, false});
++        freeSlot = cmdSlots_.size() - 1;
++    }
++
++    vkResetCommandBuffer(cmdSlots_[freeSlot].cmd, 0);
+ 
+     VkCommandBufferBeginInfo beginInfo{};
+     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+-    if (vkBeginCommandBuffer(cmd_, &beginInfo) != VK_SUCCESS) {
++    if (vkBeginCommandBuffer(cmdSlots_[freeSlot].cmd, &beginInfo) != VK_SUCCESS) {
+         RX_LOG_ERROR("Uploader: vkBeginCommandBuffer failed");
+         return;
+     }
++    activeSlot_ = freeSlot;
+     recording_ = true;
+ }
+ 
++void Uploader::reclaimCompletedRegions() {
++    while (!pendingRegions_.empty() && isComplete(pendingRegions_.front().ticket)) {
++        pendingRegions_.pop_front();
++    }
++}
++
+ bool Uploader::reserveRingSpace(VkDeviceSize size, VkDeviceSize& outOffset) {
+     if (size == 0) {
+         outOffset = 0;
+         return true;
+     }
+     if (size > ringBufferSize_) {
+         RX_LOG_ERROR("Uploader: upload of {} bytes exceeds the {}-byte staging ring buffer's total capacity", size,
+                      ringBufferSize_);
+         return false;
+     }
+ 
+     VkDeviceSize aligned = alignUp(ringCursor_, kRingAlignment);
+     if (aligned + size > ringBufferSize_) {
+         // Not enough room left before the ring buffer's end -- flush what
+-        // is already recorded (submits + waits, per the class comment),
+-        // which resets ringCursor_ back to 0, then restart there. Already
+-        // known to fit: `size <= ringBufferSize_` was just checked above.
++        // is already recorded (submits it and tracks its ring range in
++        // pendingRegions_, per flush()'s own comment; does NOT wait) and
++        // start a new "lap" at offset 0. Already known to fit: `size <=
++        // ringBufferSize_` was just checked above.
+         flush();
++        ringCursor_ = 0;
++        lastFlushRingCursor_ = 0;
++        ++ringGeneration_;
+         aligned = 0;
+     }
+ 
++    // D3D12-pattern ring reclamation [matrix-issue28 rows 5/6]: poll-
++    // reclaim every already-complete entry at the front of the queue
++    // first (never blocks); only if the requested range still overlaps
++    // the OLDEST remaining entry, block on THAT SPECIFIC ticket (never a
++    // whole-ring flush-and-wait) and retry. In steady state (a ring sized
++    // comfortably above the working set) this loop's body never runs --
++    // see upload_test.cpp's ring-wrap stress test, which asserts
++    // blockingRingWaitCount() stays below the number of flush() calls
++    // issued, proving partial reclaim actually engages rather than
++    // degenerating into "block every time."
++    reclaimCompletedRegions();
++    while (!pendingRegions_.empty() &&
++           regionsOverlap(aligned, size, pendingRegions_.front().start, pendingRegions_.front().end)) {
++        ++blockingRingWaitCount_;
++        wait(pendingRegions_.front().ticket);
++        reclaimCompletedRegions();
++    }
++
+     outOffset = aligned;
+     ringCursor_ = aligned + size;
+     return true;
+ }
+ 
+ bool Uploader::uploadToBuffer(Buffer& dst, VkDeviceSize dstOffset, const void* data, VkDeviceSize size) {
+     RX_ASSERT_MAIN_THREAD("Uploader::uploadToBuffer");
+     RX_ZONE;
+     if (size == 0) {
+         return true;
+@@ -184,191 +254,312 @@ bool Uploader::uploadToBuffer(Buffer& dst, VkDeviceSize dstOffset, const void* d
+ 
+     std::memcpy(static_cast<uint8_t*>(ringBuffer_.mappedData()) + ringOffset, data, size);
+     ringBuffer_.flush(ringOffset, size);
+ 
+     beginRecordingIfNeeded();
+ 
+     VkBufferCopy region{};
+     region.srcOffset = ringOffset;
+     region.dstOffset = dstOffset;
+     region.size = size;
+-    vkCmdCopyBuffer(cmd_, ringBuffer_.handle(), dst.handle(), 1, &region);
++    vkCmdCopyBuffer(activeCmd(), ringBuffer_.handle(), dst.handle(), 1, &region);
+     return true;
+ }
+ 
+ bool Uploader::uploadToImage(Texture2D& dst, const void* pixels, VkDeviceSize pixelBytes, bool generateMips) {
+     RX_ASSERT_MAIN_THREAD("Uploader::uploadToImage");
+     RX_ZONE;
+     if (pixelBytes == 0) {
+         return true;
+     }
+ 
+     VkDeviceSize ringOffset = 0;
+     if (!reserveRingSpace(pixelBytes, ringOffset)) {
+         return false;
+     }
+ 
+     std::memcpy(static_cast<uint8_t*>(ringBuffer_.mappedData()) + ringOffset, pixels, pixelBytes);
+     ringBuffer_.flush(ringOffset, pixelBytes);
+ 
+     beginRecordingIfNeeded();
++    VkCommandBuffer cmd = activeCmd();
+ 
+     // Every level starts VK_IMAGE_LAYOUT_UNDEFINED (image creation's
+     // initialLayout) -- transitioning the whole resource at once via the
+     // existing whole-image helper is correct and simpler than a
+     // level-0-only transition here, since every level but 0 needs this
+     // exact same UNDEFINED -> TRANSFER_DST_OPTIMAL step before
+     // recordMipChainBlit() below can transition them again individually.
+-    transitionImage(cmd_, dst.image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    transitionImage(cmd, dst.image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+ 
+     VkBufferImageCopy region{};
+     region.bufferOffset = ringOffset;
+     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+     region.imageSubresource.mipLevel = 0;
+     region.imageSubresource.baseArrayLayer = 0;
+     region.imageSubresource.layerCount = 1;
+     region.imageExtent = {dst.extent().width, dst.extent().height, 1};
+-    vkCmdCopyBufferToImage(cmd_, ringBuffer_.handle(), dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++    vkCmdCopyBufferToImage(cmd, ringBuffer_.handle(), dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+ 
+     if (generateMips) {
+         // Handles every level's per-level barriers + blits, and leaves
+         // every level (including 0) in SHADER_READ_ONLY_OPTIMAL --
+         // including the level-0 TRANSFER_DST_OPTIMAL -> TRANSFER_SRC_OPTIMAL
+         // step this copy's destination layout above sets up for.
+         //
+         // No `&& dst.mipLevels() > 1` guard here (an earlier version of
+         // this code had one): recordMipChainBlit() already handles
+         // mipLevels() == 1 correctly and cheaply via its own early
+         // return (a single transitionLevelRange() call, identical to
+         // this method's own `else` branch below) -- adding a redundant
+         // guard here would just be duplicated logic with no behavioral
+         // difference, and it made recordMipChainBlit()'s early-return
+         // branch unreachable through this public API at all (flagged in
+         // this task's own review; see texture_test.cpp's dedicated
+         // single-mip test).
+-        dst.recordMipChainBlit(cmd_);
++        dst.recordMipChainBlit(cmd);
+     } else {
+-        transitionImage(cmd_, dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++        transitionImage(cmd, dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+     }
+     return true;
+ }
+ 
+-void Uploader::flush() {
++UploadTicket Uploader::flush() {
++    RX_ASSERT_MAIN_THREAD("Uploader::flush");
++
+     if (!recording_) {
+-        return;
++        // Nothing recorded since the last flush() (or since create()) --
++        // matches this class's pre-Task-11 no-op flush() exactly, and per
++        // matrix-issue28 rows 8/9 this is ALSO the correct ticket for a
++        // batch that only ever took the direct memcpy path: zero fence/
++        // semaphore machinery touched, ticket reports complete on this
++        // same call stack, no waiting required.
++        return UploadTicket{0, ringGeneration_};
+     }
+ 
+-    if (vkEndCommandBuffer(cmd_) != VK_SUCCESS) {
++    CmdSlot& slot = cmdSlots_[activeSlot_];
++    if (vkEndCommandBuffer(slot.cmd) != VK_SUCCESS) {
+         RX_LOG_ERROR("Uploader::flush: vkEndCommandBuffer failed");
+         recording_ = false;
+-        ringCursor_ = 0;
+-        return;
++        activeSlot_ = kInvalidSlot;
++        return UploadTicket{0, ringGeneration_};
+     }
+ 
++    // Monotonically increasing counter value this submission signals --
++    // never reused, never reset (the whole point of the timeline-
++    // semaphore redesign; see the class comment's "TICKET PRIMITIVE"
++    // paragraph). A value is consumed here even if the submit below fails,
++    // deliberately: no caller can be holding a ticket for a value that was
++    // never actually signaled (flush() only ever returns the trivially-
++    // complete sentinel on failure, below), so skipping a value on failure
++    // is simpler and just as correct as trying to roll the counter back.
++    const uint64_t ticketValue = ++lastQueuedValue_;
++
++    VkTimelineSemaphoreSubmitInfo timelineInfo{};
++    timelineInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
++    timelineInfo.signalSemaphoreValueCount = 1;
++    timelineInfo.pSignalSemaphoreValues = &ticketValue;
++
+     VkSubmitInfo submitInfo{};
+     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
++    submitInfo.pNext = &timelineInfo;
+     submitInfo.commandBufferCount = 1;
+-    submitInfo.pCommandBuffers = &cmd_;
++    submitInfo.pCommandBuffers = &slot.cmd;
++    submitInfo.signalSemaphoreCount = 1;
++    submitInfo.pSignalSemaphores = &timelineSemaphore_;
+ 
+-    if (vkResetFences(device_, 1, &fence_) != VK_SUCCESS) {
+-        RX_LOG_ERROR("Uploader::flush: vkResetFences failed");
+-    }
+-    if (vkQueueSubmit(queue_, 1, &submitInfo, fence_) != VK_SUCCESS) {
++    if (vkQueueSubmit(queue_, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS) {
+         RX_LOG_ERROR("Uploader::flush: vkQueueSubmit failed");
+         recording_ = false;
+-        ringCursor_ = 0;
+-        return;
++        activeSlot_ = kInvalidSlot;
++        return UploadTicket{0, ringGeneration_};
+     }
+ 
+-    // Synchronous by design -- see the class comment in upload.h for why
+-    // this is an acceptable Phase 2 choice.
+-    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
++    UploadTicket ticket{ticketValue, ringGeneration_};
++    slot.lastTicket = ticket;
++    slot.everSubmitted = true;
++
++    // Track the ring range this batch actually wrote (buffer staging
++    // and/or image staging both advance ringCursor_ identically) so
++    // reserveRingSpace()'s reclamation loop can poll/wait on it later --
++    // see the class comment's "RING RECLAMATION" paragraph. A batch that
++    // recorded real GPU work but never touched the ring at all is not
++    // possible: uploadToImage() always reserves ring space, and
++    // uploadToBuffer()'s staging branch (the only branch that calls
++    // beginRecordingIfNeeded()) does too -- so `recording_` being true
++    // here guarantees ringCursor_ > lastFlushRingCursor_.
++    if (ringCursor_ > lastFlushRingCursor_) {
++        pendingRegions_.push_back(PendingRegion{ticket, lastFlushRingCursor_, ringCursor_});
++        lastFlushRingCursor_ = ringCursor_;
++    }
+ 
+     recording_ = false;
+-    ringCursor_ = 0;
++    activeSlot_ = kInvalidSlot;
++    return ticket;
++}
++
++bool Uploader::isComplete(UploadTicket ticket) const {
++    RX_ASSERT_MAIN_THREAD("Uploader::isComplete");
++
++    // The trivially-complete sentinel (see UploadTicket's own comment):
++    // the timeline semaphore starts at 0 and only ever counts up, so
++    // `current >= 0` is unconditionally true -- skip the Vulkan call
++    // entirely rather than spending one just to confirm the obvious.
++    if (ticket.value == 0) {
++        return true;
++    }
++
++    uint64_t current = 0;
++    VkResult result = vkGetSemaphoreCounterValue(device_, timelineSemaphore_, &current);
++    if (result != VK_SUCCESS) {
++        // Loud and named, never silently treated as either complete or
++        // incomplete [plan Task 11 scope summary] -- this is genuinely
++        // exceptional (device loss / out-of-memory territory, per the
++        // vkGetSemaphoreCounterValue man page), not a normal "not yet"
++        // outcome, so it gets its own ERROR line distinct from a plain
++        // `false` return.
++        RX_LOG_ERROR("Uploader::isComplete: vkGetSemaphoreCounterValue failed (VkResult {})",
++                     static_cast<int>(result));
++        return false;
++    }
++    return current >= ticket.value;
++}
++
++void Uploader::wait(UploadTicket ticket) const {
++    RX_ASSERT_MAIN_THREAD("Uploader::wait");
++
++    if (ticket.value == 0) {
++        return;
++    }
++
++    VkSemaphoreWaitInfo waitInfo{};
++    waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
++    waitInfo.semaphoreCount = 1;
++    waitInfo.pSemaphores = &timelineSemaphore_;
++    waitInfo.pValues = &ticket.value;
++    VkResult result = vkWaitSemaphores(device_, &waitInfo, UINT64_MAX);
++    if (result != VK_SUCCESS) {
++        RX_LOG_ERROR("Uploader::wait: vkWaitSemaphores failed (VkResult {})", static_cast<int>(result));
++    }
+ }
+ 
+ Uploader::Uploader(Uploader&& other) noexcept
+     : device_(other.device_),
+       queue_(other.queue_),
+       pool_(other.pool_),
+-      cmd_(other.cmd_),
+-      fence_(other.fence_),
++      timelineSemaphore_(other.timelineSemaphore_),
++      lastQueuedValue_(other.lastQueuedValue_),
++      cmdSlots_(std::move(other.cmdSlots_)),
++      activeSlot_(other.activeSlot_),
+       ringBuffer_(std::move(other.ringBuffer_)),
+       ringBufferSize_(other.ringBufferSize_),
+       ringCursor_(other.ringCursor_),
++      lastFlushRingCursor_(other.lastFlushRingCursor_),
++      pendingRegions_(std::move(other.pendingRegions_)),
++      ringGeneration_(other.ringGeneration_),
++      blockingRingWaitCount_(other.blockingRingWaitCount_),
+       recording_(other.recording_),
+       everUsedDirectPath_(other.everUsedDirectPath_),
+       everUsedStagingPath_(other.everUsedStagingPath_),
+       loggedDirectPathOnce_(other.loggedDirectPathOnce_),
+       loggedStagingPathOnce_(other.loggedStagingPathOnce_) {
+     other.device_ = VK_NULL_HANDLE;
+     other.queue_ = VK_NULL_HANDLE;
+     other.pool_ = VK_NULL_HANDLE;
+-    other.cmd_ = VK_NULL_HANDLE;
+-    other.fence_ = VK_NULL_HANDLE;
++    other.timelineSemaphore_ = VK_NULL_HANDLE;
++    other.lastQueuedValue_ = 0;
++    other.cmdSlots_.clear();
++    other.activeSlot_ = kInvalidSlot;
+     other.ringBufferSize_ = 0;
+     other.ringCursor_ = 0;
++    other.lastFlushRingCursor_ = 0;
++    other.pendingRegions_.clear();
++    other.ringGeneration_ = 0;
++    other.blockingRingWaitCount_ = 0;
+     other.recording_ = false;
+     other.everUsedDirectPath_ = false;
+     other.everUsedStagingPath_ = false;
+     other.loggedDirectPathOnce_ = false;
+     other.loggedStagingPathOnce_ = false;
+ }
+ 
+ Uploader& Uploader::operator=(Uploader&& other) noexcept {
+     if (this != &other) {
+         destroyAll();
+ 
+         device_ = other.device_;
+         queue_ = other.queue_;
+         pool_ = other.pool_;
+-        cmd_ = other.cmd_;
+-        fence_ = other.fence_;
++        timelineSemaphore_ = other.timelineSemaphore_;
++        lastQueuedValue_ = other.lastQueuedValue_;
++        cmdSlots_ = std::move(other.cmdSlots_);
++        activeSlot_ = other.activeSlot_;
+         // Buffer's own move-assignment destroys ringBuffer_'s previous
+         // contents (if any) before taking over other.ringBuffer_'s.
+         ringBuffer_ = std::move(other.ringBuffer_);
+         ringBufferSize_ = other.ringBufferSize_;
+         ringCursor_ = other.ringCursor_;
++        lastFlushRingCursor_ = other.lastFlushRingCursor_;
++        pendingRegions_ = std::move(other.pendingRegions_);
++        ringGeneration_ = other.ringGeneration_;
++        blockingRingWaitCount_ = other.blockingRingWaitCount_;
+         recording_ = other.recording_;
+         everUsedDirectPath_ = other.everUsedDirectPath_;
+         everUsedStagingPath_ = other.everUsedStagingPath_;
+         loggedDirectPathOnce_ = other.loggedDirectPathOnce_;
+         loggedStagingPathOnce_ = other.loggedStagingPathOnce_;
+ 
+         other.device_ = VK_NULL_HANDLE;
+         other.queue_ = VK_NULL_HANDLE;
+         other.pool_ = VK_NULL_HANDLE;
+-        other.cmd_ = VK_NULL_HANDLE;
+-        other.fence_ = VK_NULL_HANDLE;
++        other.timelineSemaphore_ = VK_NULL_HANDLE;
++        other.lastQueuedValue_ = 0;
++        other.cmdSlots_.clear();
++        other.activeSlot_ = kInvalidSlot;
+         other.ringBufferSize_ = 0;
+         other.ringCursor_ = 0;
++        other.lastFlushRingCursor_ = 0;
++        other.pendingRegions_.clear();
++        other.ringGeneration_ = 0;
++        other.blockingRingWaitCount_ = 0;
+         other.recording_ = false;
+         other.everUsedDirectPath_ = false;
+         other.everUsedStagingPath_ = false;
+         other.loggedDirectPathOnce_ = false;
+         other.loggedStagingPathOnce_ = false;
+     }
+     return *this;
+ }
+ 
+ Uploader::~Uploader() {
+-    // Auto-flush pending (recorded-but-not-yet-submitted) work before
+-    // tearing anything down -- see the class comment in upload.h. Safe
+-    // unconditionally: flush() itself no-ops if nothing is recording.
++    // Auto-flush pending (recorded-but-not-yet-submitted) work, then wait
++    // for EVERY ticket this Uploader ever queued -- not just the one this
++    // final flush() itself returns, which could be the trivially-complete
++    // sentinel even while an earlier, still-outstanding batch a caller
++    // never waited/polled on is genuinely still running on the GPU. See
++    // the class comment's paragraph on ticket ordering: waiting on the
++    // single highest value ever queued transitively covers every earlier
++    // one too, since they all signal the same monotonic counter in
++    // submission order. Safe unconditionally on a moved-from Uploader:
++    // flush() itself no-ops (recording_ is false), and
++    // lastQueuedValue_ == 0 skips the wait below.
+     flush();
++    if (lastQueuedValue_ > 0) {
++        wait(UploadTicket{lastQueuedValue_, ringGeneration_});
++    }
+     destroyAll();
+ }
+ 
+ void Uploader::destroyAll() {
+-    if (fence_ != VK_NULL_HANDLE) {
+-        vkDestroyFence(device_, fence_, nullptr);
++    if (timelineSemaphore_ != VK_NULL_HANDLE) {
++        vkDestroySemaphore(device_, timelineSemaphore_, nullptr);
+     }
+     if (pool_ != VK_NULL_HANDLE) {
+-        // Implicitly frees cmd_ (allocated from this pool) -- no separate
+-        // vkFreeCommandBuffers call needed, same as FrameSync's pools.
++        // Implicitly frees every command buffer ever allocated from it
++        // (every cmdSlots_ entry) -- no separate vkFreeCommandBuffers call
++        // needed, same as FrameSync's own pools.
+         vkDestroyCommandPool(device_, pool_, nullptr);
+     }
+ }
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/tests/device_test.cpp b/src/rx_rhi_vk/tests/device_test.cpp
+index bdf2671..4ee1efd 100644
+--- a/src/rx_rhi_vk/tests/device_test.cpp
++++ b/src/rx_rhi_vk/tests/device_test.cpp
+@@ -339,10 +339,55 @@ TEST_CASE("Device present-mode ladder: VsyncOn is FIFO; VsyncOff recreates clean
+     // idle/fence guarantee first.
+     vkDeviceWaitIdle(vkDevice);
+ 
+     vkDestroyCommandPool(vkDevice, commandPool, nullptr);
+     vkDestroyFence(vkDevice, submitFence, nullptr);
+     vkDestroySemaphore(vkDevice, renderFinishedSemaphore, nullptr);
+     vkDestroySemaphore(vkDevice, acquireSemaphore, nullptr);
+ 
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
++
++// [Phase 4 Task 11, spec D25, gate ruling #28 row 10] Optional dedicated
++// transfer-queue ACQUISITION -- never `require_dedicated_transfer_queue()`
++// (which would fail physical-device SELECTION outright on hardware lacking
++// one, the wrong primitive for an optional/fallback feature). This test
++// does not assume which outcome this machine's driver lands in (a
++// dedicated transfer-only family may or may not exist) -- it asserts the
++// two outcomes are mutually exclusive and internally consistent either
++// way, which is the entire acceptance bar per the gate matrix: "the
++// accessor existing and being correctly populated (or correctly absent)".
++TEST_CASE("Device::create acquires an optional dedicated transfer queue via get_dedicated_queue, "
++          "never require_dedicated_transfer_queue -- consistent either way") {
++    auto fixture = makeFixture("rx_rhi_vk_device_test_transfer_queue");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto device = rx::rhi::Device::create(fixture->context, fixture->surface);
++    REQUIRE(device.has_value());
++
++    if (device->hasDedicatedTransferQueue()) {
++        CHECK(device->transferQueue() != VK_NULL_HANDLE);
++        // A DEDICATED transfer family (get_dedicated_queue's own contract:
++        // transfer-capable but NOT graphics/compute-capable) must be a
++        // DIFFERENT family than the graphics queue's -- if it were the
++        // same family, it would not be "dedicated" at all.
++        CHECK(device->transferQueueFamily() != device->graphicsQueueFamily());
++    } else {
++        // The documented graceful-degrade outcome (device.cpp logs this
++        // case at RX_LOG_INFO) -- this project's own CI/dev drivers are
++        // NOT guaranteed to expose a dedicated transfer-only family (many
++        // GPUs, including several verified against this exact codebase,
++        // only expose a universal graphics+compute+transfer queue family),
++        // so this branch is exercised for real, not merely theoretical.
++        MESSAGE("this device has no dedicated transfer-only queue family -- graceful degrade exercised");
++        CHECK(device->transferQueue() == VK_NULL_HANDLE);
++    }
++
++    // Acquisition only [D25's own explicit scope] -- Device::create()
++    // itself never fails due to a missing dedicated transfer queue, and
++    // nothing else this test touches submits to transferQueue() (matching
++    // "NOTHING submits to it this phase" -- the code-review criterion the
++    // brief names explicitly).
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/src/rx_rhi_vk/tests/texture_test.cpp b/src/rx_rhi_vk/tests/texture_test.cpp
+index e099cc8..3f8a89c 100644
+--- a/src/rx_rhi_vk/tests/texture_test.cpp
++++ b/src/rx_rhi_vk/tests/texture_test.cpp
+@@ -87,21 +87,23 @@ TEST_CASE("Texture2D + Uploader::uploadToImage: 64x64 upload with generated mips
+                                                fixture->allocator, kExtent, kFormat, VK_IMAGE_USAGE_SAMPLED_BIT,
+                                                /*requestedMipLevels=*/0);
+     REQUIRE(texture.has_value());
+     // floor(log2(64)) + 1 == 7 -- the full chain down to a 1x1 level.
+     CHECK(texture->mipLevels() == 7);
+     CHECK(texture->image() != VK_NULL_HANDLE);
+     CHECK(texture->view() != VK_NULL_HANDLE);
+ 
+     std::vector<uint8_t> pixels = makeGradientPixels(kExtent.width, kExtent.height);
+     REQUIRE(uploader->uploadToImage(*texture, pixels.data(), pixels.size(), /*generateMips=*/true));
+-    uploader->flush();
++    // [Phase 4 Task 11, spec D25] flush() no longer blocks -- wait()
++    // explicitly before this readback's own separate submission.
++    uploader->wait(uploader->flush());
+ 
+     // Readback: transition (back) to a copy source, then copy level 0
+     // out to a host-visible buffer -- transitionImage() covers every
+     // level via VK_REMAINING_MIP_LEVELS, which is harmless here since the
+     // copy itself only ever reads level 0.
+     auto readback = fixture->allocator.createHostVisibleBuffer(pixels.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+     REQUIRE(readback.has_value());
+ 
+     auto cmdCtx = rx::rhi::CommandContext::create(fixture->device.device(), fixture->device.graphicsQueue(),
+                                                     fixture->device.graphicsQueueFamily());
+@@ -180,39 +182,39 @@ TEST_CASE("Texture2D + Uploader::uploadToImage: a single-mip-level texture round
+         // needs to be a blit source in production), but this test's own
+         // readback helper needs it to run vkCmdCopyImageToBuffer.
+         auto textureA = rx::rhi::Texture2D::create(fixture->device.physicalDevice(), fixture->device.device(),
+                                                      fixture->allocator, kExtent, kFormat,
+                                                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                                      /*requestedMipLevels=*/1);
+         REQUIRE(textureA.has_value());
+         REQUIRE(textureA->mipLevels() == 1);
+ 
+         REQUIRE(uploader->uploadToImage(*textureA, pixels.data(), pixels.size(), /*generateMips=*/true));
+-        uploader->flush();
++        uploader->wait(uploader->flush());
+ 
+         std::vector<uint8_t> readBack = readBackLevel0(*textureA);
+         CHECK(std::memcmp(readBack.data(), pixels.data(), pixels.size()) == 0);
+     }
+ 
+     // Sub-case 2: generateMips=false on the same kind of texture --
+     // uploadToImage()'s plain single-transition `else` branch (never
+     // calls recordMipChainBlit() at all).
+     {
+         auto textureB = rx::rhi::Texture2D::create(fixture->device.physicalDevice(), fixture->device.device(),
+                                                      fixture->allocator, kExtent, kFormat,
+                                                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                                      /*requestedMipLevels=*/1);
+         REQUIRE(textureB.has_value());
+         REQUIRE(textureB->mipLevels() == 1);
+ 
+         REQUIRE(uploader->uploadToImage(*textureB, pixels.data(), pixels.size(), /*generateMips=*/false));
+-        uploader->flush();
++        uploader->wait(uploader->flush());
+ 
+         std::vector<uint8_t> readBack = readBackLevel0(*textureB);
+         CHECK(std::memcmp(readBack.data(), pixels.data(), pixels.size()) == 0);
+     }
+ 
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
+ TEST_CASE("Texture2D::create honors an explicit requestedMipLevels below the auto-computed maximum") {
+     auto fixture = makeFixture("rx_rhi_vk_texture_test_explicit_miplevels");
+diff --git a/src/rx_rhi_vk/tests/upload_test.cpp b/src/rx_rhi_vk/tests/upload_test.cpp
+index 8484098..28c5af5 100644
+--- a/src/rx_rhi_vk/tests/upload_test.cpp
++++ b/src/rx_rhi_vk/tests/upload_test.cpp
+@@ -1,17 +1,20 @@
+ #include <doctest/doctest.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/mesh_buffers.h>
++#include <rx_rhi_vk/texture.h>
+ #include <rx_rhi_vk/upload.h>
+ #include <rx_platform/window.h>
++#include <algorithm>
+ #include <array>
++#include <chrono>
+ #include <cstdint>
+ #include <cstring>
+ #include <optional>
+ #include <utility>
+ #include <vector>
+ 
+ namespace {
+ 
+ // Same skip-guarded windowed-device fixture pattern as buffer_test.cpp/
+ // device_test.cpp -- Uploader::create() takes a real rx::rhi::Device&
+@@ -109,21 +112,27 @@ TEST_CASE("Uploader::uploadToBuffer round-trips bytes through the staging path b
+     // exposes no non-host-visible DEVICE_LOCAL memory type at all, so
+     // even a transfer-only buffer measures directPathCapable()==true
+     // there) -- see createDeviceLocalBuffer()'s corrected header comment
+     // in buffer.h for the full mechanism.
+     auto dst = fixture->allocator.createHostVisibleBuffer(
+         kSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+     REQUIRE(dst.has_value());
+     REQUIRE_FALSE(dst->directPathCapable());
+ 
+     REQUIRE(uploader->uploadToBuffer(*dst, 0, pattern.data(), kSize));
+-    uploader->flush();
++    // [Phase 4 Task 11, spec D25] flush() no longer blocks -- explicitly
++    // wait() on the ticket it returns before reading back, since this
++    // readback's own separate command-buffer submission has no other
++    // synchronization tying it to the upload's completion (relying on
++    // same-queue submission order alone would be an unstated, spec-
++    // fragile assumption, not a real guarantee).
++    uploader->wait(uploader->flush());
+     CHECK(uploader->everUsedStagingPath());
+     CHECK_FALSE(uploader->everUsedDirectPath());
+ 
+     std::vector<uint8_t> readBack = readBackBuffer(fixture->allocator, fixture->device.device(),
+                                                      fixture->device.graphicsQueue(),
+                                                      fixture->device.graphicsQueueFamily(), dst->handle(), kSize);
+     CHECK(std::memcmp(readBack.data(), pattern.data(), kSize) == 0);
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
+@@ -169,23 +178,25 @@ TEST_CASE("Uploader::uploadToBuffer takes the direct memcpy-into-mapped-destinat
+         // DEVICE_LOCAL and HOST_VISIBLE for this usage combination (e.g.
+         // a discrete GPU with ReBAR unavailable/disabled) -- still a
+         // correct outcome, just not the one this test is named for; the
+         // staging branch must have engaged instead.
+         MESSAGE(
+             "this device's VERTEX_BUFFER_BIT|TRANSFER_DST_BIT allocation did not land DEVICE_LOCAL+HOST_VISIBLE -- "
+             "staging path exercised instead, which is still correct");
+         CHECK(uploader->everUsedStagingPath());
+     }
+ 
+-    // flush() only matters for the staging branch (nothing was recorded
+-    // for a direct-path write) -- harmless/no-op otherwise either way.
+-    uploader->flush();
++    // [Phase 4 Task 11] flush()+wait() only matters for the staging
++    // branch (nothing was recorded for a direct-path write, so flush()
++    // returns the trivially-complete ticket and wait() is a no-op) --
++    // harmless either way.
++    uploader->wait(uploader->flush());
+ 
+     std::vector<uint8_t> readBack = readBackBuffer(fixture->allocator, fixture->device.device(),
+                                                      fixture->device.graphicsQueue(),
+                                                      fixture->device.graphicsQueueFamily(), dst->handle(), kSize);
+     CHECK(std::memcmp(readBack.data(), pattern.data(), kSize) == 0);
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
+ TEST_CASE("Uploader::uploadToBuffer stages through the ring buffer when the destination is not direct-path-"
+           "capable, deterministically (hardware-independent)") {
+@@ -212,21 +223,21 @@ TEST_CASE("Uploader::uploadToBuffer stages through the ring buffer when the dest
+     // availability, exactly what this task's review asked for ("assert
+     // the mechanism, not the hardware").
+     auto dst = fixture->allocator.createHostVisibleBuffer(kSize,
+                                                             VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+     REQUIRE(dst.has_value());
+     REQUIRE_FALSE(dst->directPathCapable());
+ 
+     REQUIRE(uploader->uploadToBuffer(*dst, 0, pattern.data(), kSize));
+     CHECK(uploader->everUsedStagingPath());
+     CHECK_FALSE(uploader->everUsedDirectPath());
+-    uploader->flush();
++    uploader->wait(uploader->flush());
+ 
+     std::vector<uint8_t> readBack = readBackBuffer(fixture->allocator, fixture->device.device(),
+                                                      fixture->device.graphicsQueue(),
+                                                      fixture->device.graphicsQueueFamily(), dst->handle(), kSize);
+     CHECK(std::memcmp(readBack.data(), pattern.data(), kSize) == 0);
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
+ TEST_CASE("Uploader auto-flushes mid-batch when the ring buffer runs out of room, and every upload stays "
+           "byte-exact") {
+@@ -253,21 +264,27 @@ TEST_CASE("Uploader auto-flushes mid-batch when the ring buffer runs out of room
+ 
+     auto dstA = fixture->allocator.createDeviceLocalBuffer(
+         kChunkSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+     REQUIRE(dstA.has_value());
+     auto dstB = fixture->allocator.createDeviceLocalBuffer(
+         kChunkSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+     REQUIRE(dstB.has_value());
+ 
+     REQUIRE(uploader->uploadToBuffer(*dstA, 0, patternA.data(), kChunkSize));
+     REQUIRE(uploader->uploadToBuffer(*dstB, 0, patternB.data(), kChunkSize));
+-    uploader->flush();
++    // [Phase 4 Task 11] waiting on the FINAL ticket is sufficient even
++    // though the wrap above triggered its own internal (non-blocking)
++    // flush() for dstA's write: tickets from the same Uploader are
++    // strictly ordered by submission (see upload.h's class comment), so
++    // this final wait() transitively covers the earlier, internally
++    // flushed batch too.
++    uploader->wait(uploader->flush());
+ 
+     std::vector<uint8_t> readA = readBackBuffer(fixture->allocator, fixture->device.device(),
+                                                   fixture->device.graphicsQueue(),
+                                                   fixture->device.graphicsQueueFamily(), dstA->handle(), kChunkSize);
+     std::vector<uint8_t> readB = readBackBuffer(fixture->allocator, fixture->device.device(),
+                                                   fixture->device.graphicsQueue(),
+                                                   fixture->device.graphicsQueueFamily(), dstB->handle(), kChunkSize);
+     CHECK(std::memcmp(readA.data(), patternA.data(), kChunkSize) == 0);
+     CHECK(std::memcmp(readB.data(), patternB.data(), kChunkSize) == 0);
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+@@ -339,21 +356,21 @@ TEST_CASE("MeshBuffers::create uploads vertex+index data into device-local buffe
+     // buffer's usage (it only ever needs to be a transfer *destination*
+     // in production) -- readBackBuffer() below needs a fresh pair of
+     // TRANSFER_SRC-capable device-local buffers instead, populated
+     // through the same Uploader, purely so this test can verify the
+     // upload path independently of MeshBuffers' own accessors already
+     // returning correct handles/sizes above.
+     auto vertexCopy = fixture->allocator.createDeviceLocalBuffer(
+         sizeof(kVertices), VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+     REQUIRE(vertexCopy.has_value());
+     REQUIRE(uploader->uploadToBuffer(*vertexCopy, 0, kVertices.data(), sizeof(kVertices)));
+-    uploader->flush();
++    uploader->wait(uploader->flush());
+ 
+     std::vector<uint8_t> readBack =
+         readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
+                         fixture->device.graphicsQueueFamily(), vertexCopy->handle(), sizeof(kVertices));
+     CHECK(std::memcmp(readBack.data(), kVertices.data(), sizeof(kVertices)) == 0);
+ 
+     // The real proof that MeshBuffers' OWN vertex/index buffers actually
+     // contain the right bytes (not just that Uploader in isolation works,
+     // which the copy above already showed): copy straight out of
+     // mesh->vertexBuffer()/indexBuffer() themselves.
+@@ -362,10 +379,449 @@ TEST_CASE("MeshBuffers::create uploads vertex+index data into device-local buffe
+                         fixture->device.graphicsQueueFamily(), mesh->vertexBuffer(), sizeof(kVertices));
+     CHECK(std::memcmp(meshVertexReadBack.data(), kVertices.data(), sizeof(kVertices)) == 0);
+ 
+     std::vector<uint8_t> meshIndexReadBack =
+         readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
+                         fixture->device.graphicsQueueFamily(), mesh->indexBuffer(), sizeof(kIndices));
+     CHECK(std::memcmp(meshIndexReadBack.data(), kIndices.data(), sizeof(kIndices)) == 0);
+ 
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
++
++// ===========================================================================
++// [Phase 4 Task 11, spec D25 as amended by gate ruling RC4] UploadTicket /
++// non-blocking flush() tests below -- see upload.h's class comment for the
++// full design this section exercises against.
++// ===========================================================================
++
++TEST_CASE("Uploader::flush: two overlapping flush() calls without waiting on the first ticket in between -- the "
++          "first ticket still reports its own true status, independent of the second, zero validation errors "
++          "[gate matrix-issue28 row 1, the highest-priority correctness gate for this ticket]") {
++    auto fixture = makeFixture("rx_rhi_vk_upload_test_overlapping_flush");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device);
++    REQUIRE(uploader.has_value());
++
++    constexpr VkDeviceSize kSize = 4096;
++    std::array<uint8_t, kSize> patternA{};
++    std::array<uint8_t, kSize> patternB{};
++    for (size_t i = 0; i < kSize; ++i) {
++        patternA[i] = static_cast<uint8_t>((i * 3 + 1) & 0xFF);
++        patternB[i] = static_cast<uint8_t>((i * 7 + 5) & 0xFF);
++    }
++
++    // Deterministic staging-path destinations (createHostVisibleBuffer's
++    // hardcoded directPathCapable()==false) -- forces real GPU work, real
++    // ring bytes, and a real timeline-semaphore signal per batch, not a
++    // trivially-complete ticket; the reused-single-fence design's row 1
++    // hazard specifically concerned reset-while-referenced fences backing
++    // real, in-flight submissions like these.
++    auto dstA = fixture->allocator.createHostVisibleBuffer(
++        kSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    REQUIRE(dstA.has_value());
++    auto dstB = fixture->allocator.createHostVisibleBuffer(
++        kSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    REQUIRE(dstB.has_value());
++
++    REQUIRE(uploader->uploadToBuffer(*dstA, 0, patternA.data(), kSize));
++    rx::rhi::UploadTicket ticketA = uploader->flush();
++
++    // THE overlapping call: issued WITHOUT waiting or even polling
++    // ticketA first -- exactly the scenario the reused-single-fence
++    // design could not survive (matrix-issue28 row 1: resetting that
++    // fence to submit this second batch would corrupt or invalidate
++    // ticketA's own completion signal, or trip a validation error).
++    REQUIRE(uploader->uploadToBuffer(*dstB, 0, patternB.data(), kSize));
++    rx::rhi::UploadTicket ticketB = uploader->flush();
++
++    CHECK(ticketA.value != 0);
++    CHECK(ticketB.value != 0);
++    CHECK(ticketB.value > ticketA.value);
++
++    // ticketA must still be independently queryable/waitable on its own
++    // terms -- not entangled with, superseded by, or corrupted by
++    // ticketB having since been issued.
++    uploader->wait(ticketA);
++    CHECK(uploader->isComplete(ticketA));
++
++    uploader->wait(ticketB);
++    CHECK(uploader->isComplete(ticketB));
++    // ticketA must STILL report complete after ticketB is also confirmed
++    // done -- proving its status genuinely reflects its OWN submission,
++    // not a side effect of ticketB's.
++    CHECK(uploader->isComplete(ticketA));
++
++    std::vector<uint8_t> readA = readBackBuffer(fixture->allocator, fixture->device.device(),
++                                                  fixture->device.graphicsQueue(),
++                                                  fixture->device.graphicsQueueFamily(), dstA->handle(), kSize);
++    std::vector<uint8_t> readB = readBackBuffer(fixture->allocator, fixture->device.device(),
++                                                  fixture->device.graphicsQueue(),
++                                                  fixture->device.graphicsQueueFamily(), dstB->handle(), kSize);
++    CHECK(std::memcmp(readA.data(), patternA.data(), kSize) == 0);
++    CHECK(std::memcmp(readB.data(), patternB.data(), kSize) == 0);
++
++    // The reused-single-fence design's specific failure mode: a
++    // vkResetFences-while-referenced validation error, or (worse) a
++    // silently wrong completion status. Neither is possible here by
++    // construction (timeline semaphore, no reset step at all) -- this
++    // assertion is the empirical proof.
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("Uploader::flush: a direct-path-only batch (no GPU work recorded) returns an already-complete ticket on "
++          "the same call stack, zero fence/semaphore machinery touched [gate matrix-issue28 row 8]") {
++    auto fixture = makeFixture("rx_rhi_vk_upload_test_direct_path_ticket");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device);
++    REQUIRE(uploader.has_value());
++
++    constexpr VkDeviceSize kSize = 256;
++    std::array<uint8_t, kSize> pattern{};
++    for (size_t i = 0; i < kSize; ++i) {
++        pattern[i] = static_cast<uint8_t>((i * 13 + 2) & 0xFF);
++    }
++
++    auto dst = fixture->allocator.createDeviceLocalBuffer(
++        kSize,
++        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    REQUIRE(dst.has_value());
++
++    REQUIRE(uploader->uploadToBuffer(*dst, 0, pattern.data(), kSize));
++
++    if (!dst->directPathCapable()) {
++        // Hardware without a memory type that is both DEVICE_LOCAL and
++        // HOST_VISIBLE for this usage combination -- the staging branch
++        // engaged instead, so the trivially-complete-ticket case this
++        // test is named for cannot be exercised on this machine. Still
++        // assert the complementary fact (a staging batch's ticket is
++        // real/nonzero, matching row 9's composition) rather than
++        // silently skipping every assertion.
++        MESSAGE(
++            "this device's VERTEX_BUFFER_BIT|TRANSFER_DST_BIT allocation did not land DEVICE_LOCAL+HOST_VISIBLE -- "
++            "cannot exercise the direct-path-only ticket case here; asserting the staging-path ticket is real "
++            "instead");
++        rx::rhi::UploadTicket ticket = uploader->flush();
++        CHECK(ticket.value != 0);
++        uploader->wait(ticket);
++        CHECK_FALSE(fixture->context.hasValidationErrors());
++        return;
++    }
++
++    CHECK(uploader->everUsedDirectPath());
++    rx::rhi::UploadTicket ticket = uploader->flush();
++    // The direct-path memcpy already fully happened, synchronously, on
++    // the calling thread, by the time uploadToBuffer() returned -- there
++    // is no outstanding GPU work for flush() to submit, so this ticket is
++    // the trivially-complete sentinel, reported complete on this SAME
++    // call stack (no wait() needed at all).
++    CHECK(ticket.value == 0);
++    CHECK(uploader->isComplete(ticket));
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("Uploader::flush with nothing recorded since the last flush() returns an already-complete ticket, "
++          "matching this class's pre-Task-11 no-op flush() behavior [gate matrix-issue28 row 8]") {
++    auto fixture = makeFixture("rx_rhi_vk_upload_test_empty_flush");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device);
++    REQUIRE(uploader.has_value());
++
++    rx::rhi::UploadTicket ticket = uploader->flush();
++    CHECK(ticket.value == 0);
++    CHECK(uploader->isComplete(ticket));
++    // A second consecutive empty flush() behaves identically.
++    rx::rhi::UploadTicket ticket2 = uploader->flush();
++    CHECK(ticket2.value == 0);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("Uploader::flush: a batch mixing a direct-path buffer upload with a staging-path upload produces one "
++          "ticket covering ONLY the recorded (staging) work -- both destinations correct once it completes "
++          "[gate matrix-issue28 row 9]") {
++    auto fixture = makeFixture("rx_rhi_vk_upload_test_mixed_batch");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device);
++    REQUIRE(uploader.has_value());
++
++    constexpr VkDeviceSize kSize = 256;
++    std::array<uint8_t, kSize> patternDirect{};
++    std::array<uint8_t, kSize> patternStaged{};
++    for (size_t i = 0; i < kSize; ++i) {
++        patternDirect[i] = static_cast<uint8_t>((i * 11 + 1) & 0xFF);
++        patternStaged[i] = static_cast<uint8_t>((i * 19 + 4) & 0xFF);
++    }
++
++    // dstDirect MAY or may not actually land direct-path-capable
++    // (hardware-dependent, per uploadToBuffer()'s own comment) -- either
++    // way, dstStaged (createHostVisibleBuffer, hardcoded
++    // directPathCapable()==false) always forces real GPU work into this
++    // batch, so the resulting ticket is never trivially complete
++    // regardless of what dstDirect measured as.
++    auto dstDirect = fixture->allocator.createDeviceLocalBuffer(
++        kSize,
++        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    REQUIRE(dstDirect.has_value());
++    auto dstStaged = fixture->allocator.createHostVisibleBuffer(
++        kSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    REQUIRE(dstStaged.has_value());
++    REQUIRE_FALSE(dstStaged->directPathCapable());
++
++    REQUIRE(uploader->uploadToBuffer(*dstDirect, 0, patternDirect.data(), kSize));
++    REQUIRE(uploader->uploadToBuffer(*dstStaged, 0, patternStaged.data(), kSize));
++    CHECK(uploader->everUsedStagingPath());
++    MESSAGE("dstDirect landed direct-path-capable: ", dstDirect->directPathCapable() ? "yes" : "no");
++
++    rx::rhi::UploadTicket ticket = uploader->flush();
++    CHECK(ticket.value != 0);
++    uploader->wait(ticket);
++    CHECK(uploader->isComplete(ticket));
++
++    std::vector<uint8_t> readDirect =
++        readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
++                        fixture->device.graphicsQueueFamily(), dstDirect->handle(), kSize);
++    std::vector<uint8_t> readStaged =
++        readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
++                        fixture->device.graphicsQueueFamily(), dstStaged->handle(), kSize);
++    CHECK(std::memcmp(readDirect.data(), patternDirect.data(), kSize) == 0);
++    CHECK(std::memcmp(readStaged.data(), patternStaged.data(), kSize) == 0);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("Uploader::flush: a ticket covering ONLY an image upload is never the trivially-complete sentinel (no "
++          "'accidentally done' shortcut leaks into the image path), and is complete only once the GPU copy is "
++          "confirmed finished [gate matrix-issue28 row 7]") {
++    auto fixture = makeFixture("rx_rhi_vk_upload_test_image_only_ticket");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device);
++    REQUIRE(uploader.has_value());
++
++    // Large enough (16 MiB) that the real GPU copy behind this ticket
++    // cannot plausibly have already finished by the time flush() returns
++    // and this test's very next line queries isComplete() -- a handful of
++    // CPU instructions cannot outrun a multi-megabyte host-to-device copy
++    // plus its submission/signal round trip on any driver this project
++    // targets. Images ALWAYS stage (upload.h's class comment) -- there is
++    // no direct path to race against here at all.
++    constexpr VkExtent2D kExtent{2048, 2048};
++    constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
++    auto texture = rx::rhi::Texture2D::create(fixture->device.physicalDevice(), fixture->device.device(),
++                                               fixture->allocator, kExtent, kFormat, VK_IMAGE_USAGE_SAMPLED_BIT,
++                                               /*requestedMipLevels=*/1);
++    REQUIRE(texture.has_value());
++
++    std::vector<uint8_t> pixels(static_cast<size_t>(kExtent.width) * kExtent.height * 4, 0x5A);
++    REQUIRE(uploader->uploadToImage(*texture, pixels.data(), pixels.size(), /*generateMips=*/false));
++
++    rx::rhi::UploadTicket ticket = uploader->flush();
++    // Deterministic regardless of timing: an image ticket is NEVER the
++    // trivially-complete sentinel -- uploadToImage() always reserves ring
++    // space and records real commands (row 7's "no trivially-done
++    // shortcut" requirement).
++    CHECK(ticket.value != 0);
++
++    // Best-effort timing probe (not the load-bearing assertion): on every
++    // driver observed while writing this test, a 16 MiB copy is not yet
++    // done on the very next host instruction after flush() returns.
++    // CHECK (not REQUIRE) because an exotic, extremely fast path is not
++    // this test's correctness concern -- the deterministic assertions
++    // above and below are.
++    CHECK_FALSE(uploader->isComplete(ticket));
++
++    uploader->wait(ticket);
++    CHECK(uploader->isComplete(ticket));
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("Uploader::flush()/isComplete() never block past a wall-clock threshold across many overlapped "
++          "batches -- timer around the call itself, not frame counters [gate matrix-issue28 row 13; per the "
++          "report's scratch-worktree revert evidence, this test FAILS against the pre-Task-11 blocking flush()]") {
++    auto fixture = makeFixture("rx_rhi_vk_upload_test_wallclock_nonblocking");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    // Sized generously above kUploadSize below (its default 16 MiB does
++    // not fit even one 128 MiB payload) -- this test's ring reclamation is
++    // not what is under test here, so a comfortably oversized ring keeps
++    // every uploadToBuffer() call on the simple, no-wrap path.
++    auto uploader =
++        rx::rhi::Uploader::create(fixture->allocator, fixture->device, /*ringBufferSize=*/160u * 1024u * 1024u);
++    REQUIRE(uploader.has_value());
++
++    // 128 MiB per "frame" -- empirically sized (see the report's
++    // scratch-worktree revert evidence) so a genuine blocking
++    // vkWaitForFences(..., UINT64_MAX)-equivalent round trip (submit ->
++    // GPU copy -> signal -> host wait wakes) clears kThreshold with a
++    // comfortable margin on this project's own dev hardware (observed
++    // 14-19 ms per call when the pre-Task-11 blocking behavior was
++    // deliberately reintroduced in a scratch worktree) -- a smaller
++    // payload (2-64 MiB) round-tripped too fast on this machine's discrete
++    // GPU to reliably clear an 8 ms threshold, which would have made this
++    // test a weak discriminator on fast hardware even though it is a
++    // strong one on CI's software-rasterized lavapipe. A non-blocking
++    // flush()/isComplete() call, in contrast, is dominated by driver call
++    // overhead alone, independent of payload size (observed single- to
++    // double-digit microseconds regardless of kUploadSize) -- this is WHY
++    // increasing the payload costs this test's REAL (non-reverted) run
++    // nothing: the timed calls stay microsecond-scale either way, only
++    // the untimed final wait()+readback loop grows.
++    constexpr VkDeviceSize kUploadSize = 128u * 1024u * 1024u;
++    constexpr int kFrameCount = 8;
++    constexpr auto kThreshold = std::chrono::milliseconds(8);
++
++    std::vector<uint8_t> payload(kUploadSize, 0x3C);
++
++    std::vector<std::optional<rx::rhi::Buffer>> destinations;
++    destinations.reserve(static_cast<size_t>(kFrameCount));
++    for (int i = 0; i < kFrameCount; ++i) {
++        destinations.push_back(fixture->allocator.createHostVisibleBuffer(
++            kUploadSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT));
++        REQUIRE(destinations.back().has_value());
++    }
++
++    std::vector<rx::rhi::UploadTicket> tickets;
++    tickets.reserve(static_cast<size_t>(kFrameCount));
++
++    std::chrono::steady_clock::duration worstFlush{};
++    std::chrono::steady_clock::duration worstIsComplete{};
++
++    for (int i = 0; i < kFrameCount; ++i) {
++        REQUIRE(uploader->uploadToBuffer(*destinations[static_cast<size_t>(i)], 0, payload.data(), kUploadSize));
++
++        auto beforeFlush = std::chrono::steady_clock::now();
++        rx::rhi::UploadTicket ticket = uploader->flush();
++        auto flushDuration = std::chrono::steady_clock::now() - beforeFlush;
++        worstFlush = std::max(worstFlush, flushDuration);
++        CHECK(flushDuration < kThreshold);
++
++        auto beforeIsComplete = std::chrono::steady_clock::now();
++        bool complete = uploader->isComplete(ticket);
++        auto isCompleteDuration = std::chrono::steady_clock::now() - beforeIsComplete;
++        worstIsComplete = std::max(worstIsComplete, isCompleteDuration);
++        CHECK(isCompleteDuration < kThreshold);
++        (void)complete;  // not asserted true/false here -- pure non-blocking poll timing probe
++
++        tickets.push_back(ticket);
++        // Deliberately NEVER wait()/poll-to-completion before the next
++        // frame's own flush() -- N overlapped frames in flight, none of
++        // them drained, is exactly the scenario this invariant must hold
++        // under.
++    }
++
++    MESSAGE("worst-case flush() duration: ",
++            std::chrono::duration_cast<std::chrono::microseconds>(worstFlush).count(), " us over ", kFrameCount,
++            " overlapped frames");
++    MESSAGE("worst-case isComplete() duration: ",
++            std::chrono::duration_cast<std::chrono::microseconds>(worstIsComplete).count(), " us");
++
++    // Drain everything before readback/teardown -- correctness, not timed.
++    for (auto& ticket : tickets) {
++        uploader->wait(ticket);
++    }
++    for (int i = 0; i < kFrameCount; ++i) {
++        std::vector<uint8_t> readBack = readBackBuffer(
++            fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
++            fixture->device.graphicsQueueFamily(), destinations[static_cast<size_t>(i)]->handle(), kUploadSize);
++        CHECK(std::memcmp(readBack.data(), payload.data(), kUploadSize) == 0);
++    }
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("Uploader ring-buffer reclamation under heavy wrap: partial reclaim engages (blocking-wait count stays "
++          "below flush() calls issued), the ring never silently grows, and every upload lands correctly despite "
++          "many wraps [gate matrix-issue28 rows 5/6]") {
++    auto fixture = makeFixture("rx_rhi_vk_upload_test_ring_reclaim_stress");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    constexpr VkDeviceSize kRingSize = 512;  // deliberately tiny
++    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device, kRingSize);
++    REQUIRE(uploader.has_value());
++    CHECK(uploader->ringCapacity() == kRingSize);
++
++    constexpr VkDeviceSize kChunkSize = 64;  // several chunks per ring "lap"
++    constexpr int kUploadCount = 80;         // many multiples of the ring's total capacity
++
++    std::vector<std::optional<rx::rhi::Buffer>> destinations;
++    std::vector<std::array<uint8_t, kChunkSize>> patterns;
++    destinations.reserve(static_cast<size_t>(kUploadCount));
++    patterns.reserve(static_cast<size_t>(kUploadCount));
++
++    for (int i = 0; i < kUploadCount; ++i) {
++        // createHostVisibleBuffer(): hardcoded directPathCapable()==false
++        // -- deterministically forces every one of these through the
++        // ring, regardless of hardware (see the staging-path test above
++        // for the same reasoning).
++        destinations.push_back(fixture->allocator.createHostVisibleBuffer(
++            kChunkSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT));
++        REQUIRE(destinations.back().has_value());
++        REQUIRE_FALSE(destinations.back()->directPathCapable());
++
++        std::array<uint8_t, kChunkSize> pattern{};
++        for (size_t b = 0; b < kChunkSize; ++b) {
++            pattern[b] = static_cast<uint8_t>((i * 37 + static_cast<int>(b) * 5 + 3) & 0xFF);
++        }
++        patterns.push_back(pattern);
++    }
++
++    std::vector<rx::rhi::UploadTicket> tickets;
++    tickets.reserve(static_cast<size_t>(kUploadCount));
++
++    for (int i = 0; i < kUploadCount; ++i) {
++        REQUIRE(uploader->uploadToBuffer(*destinations[static_cast<size_t>(i)], 0,
++                                          patterns[static_cast<size_t>(i)].data(), kChunkSize));
++        // Flush every single upload individually, NEVER waiting in
++        // between -- maximizes overlap and forces the ring to wrap many
++        // times over while several tickets are still genuinely in flight,
++        // exactly the stress shape the plan's own steps call for ("many
++        // small uploads > ring size").
++        tickets.push_back(uploader->flush());
++        CHECK(uploader->ringCapacity() == kRingSize);  // never silently grown, any iteration
++    }
++
++    MESSAGE("ring wrapped ", uploader->ringWrapCount(), " times across ", kUploadCount, " uploads into a ",
++            kRingSize, "-byte ring");
++    MESSAGE("blocking ring-reclaim waits: ", uploader->blockingRingWaitCount(),
++            " (flush() calls issued: ", kUploadCount, ")");
++
++    // The ring genuinely wrapped many times over its own capacity --
++    // proving this is a real wrap-heavy stress case, not a vacuous one.
++    CHECK(uploader->ringWrapCount() > 0);
++    // THE core D3D12-pattern proof [matrix-issue28 row 5's own instrumented
++    // criterion, verbatim]: reclamation only blocks when genuinely
++    // necessary -- the blocking-wait counter stays below the number of
++    // flush() calls issued, proving partial (poll-based) reclaim actually
++    // engaged rather than degenerating into "block on every wrap."
++    CHECK(uploader->blockingRingWaitCount() < static_cast<uint32_t>(kUploadCount));
++
++    for (auto& ticket : tickets) {
++        uploader->wait(ticket);
++    }
++
++    // Data correctness under heavy wrap -- readback EVERY destination,
++    // not just a sample, per the plan's own "readback, not just no-crash"
++    // requirement.
++    for (int i = 0; i < kUploadCount; ++i) {
++        std::vector<uint8_t> readBack =
++            readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
++                            fixture->device.graphicsQueueFamily(), destinations[static_cast<size_t>(i)]->handle(),
++                            kChunkSize);
++        CHECK(std::memcmp(readBack.data(), patterns[static_cast<size_t>(i)].data(), kChunkSize) == 0);
++    }
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}

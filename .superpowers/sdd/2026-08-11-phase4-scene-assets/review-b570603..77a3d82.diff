@@ -1,0 +1,369 @@
+=== COMMITS ===
+77a3d82 docs: Task 11 fix round 1 report (ring-reclamation gate, minors)
+0eb91bf fix: tighten ring-reclamation gate, add deterministic poll-first proof
+
+=== STAT ===
+ .../task-11-report.md                              | 152 +++++++++++++++++++++
+ src/rx_rhi_vk/include/rx_rhi_vk/upload.h           |   8 ++
+ src/rx_rhi_vk/tests/upload_test.cpp                | 126 ++++++++++++++++-
+ 3 files changed, 281 insertions(+), 5 deletions(-)
+
+=== FULL DIFF (U10) ===
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-11-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-11-report.md
+index 0c8dd0b..7b3cabb 100644
+--- a/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-11-report.md
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-11-report.md
+@@ -347,10 +347,162 @@ and test file's mtime and rebuilt `rx_rhi_vk`, `rx_rhi_vk_tests`, and
+ the build output (grepped, excluding the pre-existing documented
+ "known false positive" validation-layer log lines).
+ 
+ Validation errors: `grep`-verified zero un-filtered `[vulkan validation]`
+ lines across every run above; every new test's own
+ `CHECK_FALSE(hasValidationErrors())` passed, and CI's own `--validate`
+ flag on every headless sample test confirms the sample-level migrations
+ (including the eviction-cycle poll redesign) are exercised under
+ `VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT` specifically,
+ not just generic validation.
++
++## Fix round 1 (independent review, Approved-with-minors)
++
++Commit: `0eb91bf` — `fix: tighten ring-reclamation gate, add deterministic poll-first proof`.
++
++### Important (blocking): ring-reclamation stress test did not gate the regression it exists to prevent
++
++The reviewer reproduced, in their own scratch worktree, the literal
++degenerate policy matrix row 5 forbids (whole-ring unconditional drain
++on every wrap, ignoring completion state) and found the original
++`CHECK(uploader->blockingRingWaitCount() < static_cast<uint32_t>(kUploadCount))`
++assertion (36 blocking waits < 80 flush() calls issued) still passed —
++this bound only rejected "block on literally every single call," not
++"block far more than the wraps that actually needed it."
++
++**Fix, two parts:**
++
++1. Tightened the existing stress test's bound to
++   `blockingRingWaitCount() <= ringWrapCount()`. This is provably safe
++   against a false failure on the real implementation given the test's
++   own construction (every flush() there covers exactly one
++   `kChunkSize`-wide chunk, and `kRingSize` is an exact multiple of
++   `kChunkSize`, so a single wrap can never need to block on more than
++   one prior entry to clear the space a single next chunk needs — see
++   the code comment for the full argument). It rejects a policy whose
++   pending-region queue never advances between wraps and re-drains a
++   growing backlog every time.
++2. That bound alone cannot distinguish "polled first, found already
++   done" from "blocked unconditionally and it happened to return
++   immediately," because a policy that blocks exactly once per wrap
++   regardless of completion state also measures at most
++   `ringWrapCount()` on this test's own construction — structurally
++   indistinguishable from the correct implementation by counting alone.
++   Added a NEW, fully deterministic test
++   (`"...ring reclamation polls (never blocks) when the oldest pending
++   region is already confirmed complete BEFORE the wrap..."`) that
++   forces the completion precondition explicitly: two uploads are each
++   individually `flush()`ed AND `wait()`ed (so their tickets are
++   genuinely, confirmably complete, not just "probably done by now"),
++   filling the ring exactly to capacity; a third upload then forces a
++   wrap, and the test asserts `blockingRingWaitCount()` does not change
++   across that specific wrap. This has zero dependency on relative
++   CPU/GPU speed — it does not race anything, it proves the precondition
++   before the wrap even happens.
++
++**Mandatory degenerate-policy discrimination evidence** — reproduced in
++a scratch worktree (toolchain/`.deps-cache` symlinked in, checked out at
++the pre-fix-round commit `0eb91bf`, degenerate policy injected directly
++into `reserveRingSpace()`'s wrap branch: unconditionally `wait()` on
++every entry in `pendingRegions_` and pop it, without ever calling
++`reclaimCompletedRegions()` first or checking overlap):
++
++```
++[scratch worktree, degenerate whole-ring-drain-on-wrap policy]
++TEST CASE: Uploader ring-buffer reclamation under heavy wrap ...
++ring wrapped 9 times across 80 uploads into a 512-byte ring
++blocking ring-reclaim waits: 25 (flush() calls issued: 80)
++upload_test.cpp:835: ERROR: CHECK( uploader->blockingRingWaitCount() <= uploader->ringWrapCount() ) is NOT correct!
++  values: CHECK( 25 <= 9 )
++
++TEST CASE: Uploader ring reclamation polls (never blocks) when the oldest
++pending region is already confirmed complete BEFORE the wrap ...
++upload_test.cpp:924: ERROR: CHECK( uploader->blockingRingWaitCount() == blockingWaitsBeforeWrap ) is NOT correct!
++  values: CHECK( 1 == 0 )
++
++[doctest] test cases:  10 |   8 passed | 2 failed | 51 skipped
++[doctest] Status: FAILURE!
++```
++
++(25, not the reviewer's own 36 — an artifact of this being an
++independently-written reproduction of the FORBIDDEN POLICY CLASS the
++review describes, not a byte-identical copy of the reviewer's own
++implementation; both numbers are well past any legitimate bound and
++both trigger the same two assertions. The deterministic test's `1 == 0`
++is the more important signal: it proves the injected policy blocks even
++when the ticket was already confirmed complete beforehand — exactly the
++"ignoring completion" violation matrix row 5 forbids.)
++
++Both tests pass cleanly against the real (non-degenerate) implementation,
++confirmed immediately before and after the scratch-worktree run, in the
++main checkout:
++
++```
++[main checkout, real implementation]
++TEST CASE: Uploader ring-buffer reclamation under heavy wrap ...
++ring wrapped 9 times across 80 uploads into a 512-byte ring
++blocking ring-reclaim waits: 0 (flush() calls issued: 80)
++TEST CASE: Uploader ring reclamation polls (never blocks) ...
++[doctest] test cases:  10 |  10 passed | 0 failed | 51 skipped
++[doctest] Status: SUCCESS!
++```
++
++Scratch worktree discarded (`git worktree remove --force`) after
++capturing this evidence; no scratch-only code is present in the
++committed tree.
++
++### Minor 1: `UploadTicket::ringGeneration` doc comment
++
++Added an explicit sentence (`upload.h`) stating this field plays no
++safety/epoch/stale-ticket role — completion is determined entirely by
++`value`, and nothing anywhere compares `ringGeneration` against a
++"current" value the way a generational handle does.
++
++### Minor 2: erratum — "ELEVEN additional call sites" arithmetic corrected
++
++The original report's "Deviation: call-site audit widened beyond
++sample 04" section says "surfaced ELEVEN more pre-existing call sites."
++This conflated two different counts:
++
++- **11** = the total number of `wait(flush())` call sites touched
++  across the whole diff outside the ticket API itself, including
++  `MeshBuffers::create()`'s own two uploads (vertex + index — already
++  an in-scope row, matrix row 12) and sample 04's setup-time wait at
++  line 1052 (already in-scope, matrix row 11 explicitly covers sample
++  04's file audit).
++- **8** = the actual count of sites genuinely BEYOND the brief's named
++  scope (sample 04 only): `material_system.cpp` ×1
++  (`MaterialSystem::createTexture2D()`), `samples/03_bindless_mesh` ×2
++  (setup + per-frame), `samples/05_multipass` ×2 (setup + per-frame),
++  `samples/06_materials` ×2 (setup + per-frame), `samples/07_stress` ×1
++  (setup only). 1+2+2+2+1 = 8.
++
++The migration itself was already complete and correct — this corrects
++only the arithmetic/wording, not any code. The reviewer's own
++repo-wide audit independently confirmed all 12 pre-existing
++`Uploader::flush()` call sites (the 8 above + the 4 already-in-scope
++ones: MeshBuffers' 2, sample 04's 2) are accounted for.
++
++### Test evidence (fix round 1)
++
++```
++$ xvfb-run -a ./build/linux-native/src/rx_rhi_vk/rx_rhi_vk_tests -tc="*ring*"
++...
++ring wrapped 9 times across 80 uploads into a 512-byte ring
++blocking ring-reclaim waits: 0 (flush() calls issued: 80)
++[doctest] test cases:  10 |  10 passed | 0 failed | 51 skipped
++[doctest] Status: SUCCESS!
++
++$ xvfb-run -a ctest --preset linux-native --output-on-failure
++...
++100% tests passed, 0 tests failed out of 17
++Total Test time (real) =  51.88 sec
++
++$ cmake --build --preset windows-cross-zig
++... 24/24 targets touched by this fix rebuilt cleanly, no errors
++```
++
++(windows-cross-zig's own ctest subset was unaffected by this fix round
++— `upload_test.cpp` is excluded from that preset's ctest run per
++existing CI policy, same as every prior task; the build-cleanly check
++above is what's binding for this preset.)
++
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/upload.h b/src/rx_rhi_vk/include/rx_rhi_vk/upload.h
+index d0a2a9b..53669cd 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/upload.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/upload.h
+@@ -33,20 +33,28 @@ class Texture2D;
+ struct UploadTicket {
+     uint64_t value = 0;
+ 
+     // Diagnostic-only: Uploader::ringWrapCount() at the moment this ticket
+     // was issued. Carried over from this ticket's originally proposed
+     // shape (issue #28 body: "fence + ring generation") even though
+     // neither isComplete() nor wait() below ever consult it -- completion
+     // is determined entirely by `value` against the timeline semaphore.
+     // Production code has no need to read this; it exists so a test can
+     // assert which "lap" of the ring a given upload landed in.
++    //
++    // NOT a safety/epoch mechanism [review fix round 1]: this field plays
++    // NO role in detecting a stale ticket, no role in ring-reclamation
++    // correctness, and nothing anywhere compares it against a "current"
++    // generation the way a generational handle (rx::core::Handle<Tag>)
++    // compares its own generation field. A ticket is valid/comparable for
++    // as long as this Uploader itself is alive, full stop -- do not add
++    // logic that assumes generation-checking exists here.
+     uint32_t ringGeneration = 0;
+ 
+     bool operator==(const UploadTicket&) const = default;
+ };
+ 
+ // Gets CPU-side bytes into GPU-visible/device-local Vulkan resources:
+ // uploadToBuffer() for a destination rx::rhi::Buffer, uploadToImage() for
+ // a Texture2D (optionally generating its full mip chain via
+ // Texture2D::recordMipChainBlit() in the same submission) [spec Fixed
+ // decision #7, R:C1].
+diff --git a/src/rx_rhi_vk/tests/upload_test.cpp b/src/rx_rhi_vk/tests/upload_test.cpp
+index 28c5af5..5f5273d 100644
+--- a/src/rx_rhi_vk/tests/upload_test.cpp
++++ b/src/rx_rhi_vk/tests/upload_test.cpp
+@@ -796,32 +796,148 @@ TEST_CASE("Uploader ring-buffer reclamation under heavy wrap: partial reclaim en
+ 
+     MESSAGE("ring wrapped ", uploader->ringWrapCount(), " times across ", kUploadCount, " uploads into a ",
+             kRingSize, "-byte ring");
+     MESSAGE("blocking ring-reclaim waits: ", uploader->blockingRingWaitCount(),
+             " (flush() calls issued: ", kUploadCount, ")");
+ 
+     // The ring genuinely wrapped many times over its own capacity --
+     // proving this is a real wrap-heavy stress case, not a vacuous one.
+     CHECK(uploader->ringWrapCount() > 0);
+     // THE core D3D12-pattern proof [matrix-issue28 row 5's own instrumented
+-    // criterion, verbatim]: reclamation only blocks when genuinely
+-    // necessary -- the blocking-wait counter stays below the number of
+-    // flush() calls issued, proving partial (poll-based) reclaim actually
+-    // engaged rather than degenerating into "block on every wrap."
+-    CHECK(uploader->blockingRingWaitCount() < static_cast<uint32_t>(kUploadCount));
++    // criterion], TIGHTENED against `ringWrapCount()` rather than
++    // `kUploadCount` [review fix round 1: the reviewer reproduced the
++    // literal degenerate policy row 5 forbids -- whole-ring unconditional
++    // drain on every wrap, ignoring completion -- and the ORIGINAL
++    // `< kUploadCount` bound (36 blocking waits < 80 flush() calls) still
++    // passed, because it only ruled out "block on literally every single
++    // call," not "block far more than the wraps that actually needed it."
++    //
++    // This bound is provably safe against false failures on the REAL
++    // (correct) implementation for this test's own specific construction,
++    // not just empirically: every flush() here covers exactly one
++    // kChunkSize=64-byte chunk (never a multi-chunk batch), and kRingSize
++    // (512) is an exact multiple of kChunkSize -- so every PendingRegion
++    // entry this Uploader ever tracks is exactly one chunk wide, aligned
++    // to the same chunk boundaries a post-wrap request re-asks for. A
++    // single wrap's reclaim loop can therefore never need to block on
++    // more than ONE entry to clear the space a single next chunk needs,
++    // no matter how slow the driver is (CI's lavapipe included) -- so
++    // blockingRingWaitCount() can be AT MOST ringWrapCount() even in the
++    // worst case of "every wrap genuinely has to block," and this
++    // assertion can never spuriously fail the correct implementation.
++    // What it DOES catch: any policy that blocks MORE than once per wrap
++    // (e.g. a queue that never advances between wraps and re-drains a
++    // growing backlog every time -- the shape that produced the
++    // reviewer's 36-over-9-wraps result). See the dedicated test below
++    // for the complementary case this bound alone cannot catch (a policy
++    // that blocks unconditionally on wrap without ever polling first,
++    // landing at exactly one block per wrap -- structurally
++    // indistinguishable from a correct-but-unlucky run by counting alone).
++    CHECK(uploader->blockingRingWaitCount() <= uploader->ringWrapCount());
+ 
+     for (auto& ticket : tickets) {
+         uploader->wait(ticket);
+     }
+ 
+     // Data correctness under heavy wrap -- readback EVERY destination,
+     // not just a sample, per the plan's own "readback, not just no-crash"
+     // requirement.
+     for (int i = 0; i < kUploadCount; ++i) {
+         std::vector<uint8_t> readBack =
+             readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
+                             fixture->device.graphicsQueueFamily(), destinations[static_cast<size_t>(i)]->handle(),
+                             kChunkSize);
+         CHECK(std::memcmp(readBack.data(), patterns[static_cast<size_t>(i)].data(), kChunkSize) == 0);
+     }
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
++
++TEST_CASE("Uploader ring reclamation polls (never blocks) when the oldest pending region is already confirmed "
++          "complete BEFORE the wrap that would need it -- deterministic, hardware-speed-independent "
++          "[review fix round 1, gate matrix-issue28 row 5: the stress test's own blocking-wait counter cannot "
++          "tell 'polled and found already done' apart from 'blocked unconditionally and it happened to return "
++          "immediately' by counting alone, since a policy that blocks EVERY wrap regardless of completion also "
++          "measures at most one block per wrap on the stress test's own construction -- this test closes exactly "
++          "that gap by forcing the completion precondition explicitly, with no dependency on relative CPU/GPU "
++          "speed at all]") {
++    auto fixture = makeFixture("rx_rhi_vk_upload_test_ring_reclaim_deterministic_poll");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    // Ring holds exactly two 64-byte chunks -- the smallest shape that
++    // can force a wrap on the THIRD upload while keeping the scenario
++    // fully deterministic (no auto-flush-on-wrap needed for uploads 1/2).
++    constexpr VkDeviceSize kRingSize = 128;
++    constexpr VkDeviceSize kChunkSize = 64;
++    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device, kRingSize);
++    REQUIRE(uploader.has_value());
++
++    auto makePattern = [](uint8_t seed) {
++        std::array<uint8_t, kChunkSize> pattern{};
++        for (size_t b = 0; b < kChunkSize; ++b) {
++            pattern[b] = static_cast<uint8_t>(seed + b * 3);
++        }
++        return pattern;
++    };
++
++    auto dstA = fixture->allocator.createHostVisibleBuffer(
++        kChunkSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    auto dstB = fixture->allocator.createHostVisibleBuffer(
++        kChunkSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    auto dstC = fixture->allocator.createHostVisibleBuffer(
++        kChunkSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    REQUIRE(dstA.has_value());
++    REQUIRE(dstB.has_value());
++    REQUIRE(dstC.has_value());
++
++    const auto patternA = makePattern(11);
++    const auto patternB = makePattern(101);
++    const auto patternC = makePattern(211);
++
++    // Upload A, then B -- each explicitly flushed AND waited before the
++    // next call, so BOTH tickets are genuinely, confirmably complete
++    // (not just "probably done by now" the way the stress test's rapid
++    // back-to-back flushing leaves to chance) by the time this test
++    // reaches upload C below. Cursor lands exactly at kRingSize (128)
++    // afterward -- no wrap has happened yet.
++    REQUIRE(uploader->uploadToBuffer(*dstA, 0, patternA.data(), kChunkSize));
++    uploader->wait(uploader->flush());
++    REQUIRE(uploader->uploadToBuffer(*dstB, 0, patternB.data(), kChunkSize));
++    uploader->wait(uploader->flush());
++
++    const uint32_t blockingWaitsBeforeWrap = uploader->blockingRingWaitCount();
++    const uint32_t wrapsBeforeWrap = uploader->ringWrapCount();
++
++    // Upload C: the ring has no room left (aligned cursor == 128 ==
++    // kRingSize), so this MUST wrap. Both PendingRegion entries this
++    // wrap's reclaim needs to clear (A's and B's) are already complete,
++    // confirmed above -- a correct, poll-first implementation's
++    // reclaimCompletedRegions() pops both via a pure poll and the
++    // overlap-check loop never executes at all, so blockingRingWaitCount()
++    // must NOT change. A degenerate implementation that blocks
++    // unconditionally on wrap (never checking isComplete() first, the
++    // exact policy row 5 forbids) WOULD increment it here regardless.
++    REQUIRE(uploader->uploadToBuffer(*dstC, 0, patternC.data(), kChunkSize));
++    rx::rhi::UploadTicket ticketC = uploader->flush();
++
++    CHECK(uploader->ringWrapCount() == wrapsBeforeWrap + 1);
++    CHECK(uploader->blockingRingWaitCount() == blockingWaitsBeforeWrap);
++
++    uploader->wait(ticketC);
++
++    // Data correctness: A/B/C all land in the right place despite the
++    // wrap reusing the ring's front the moment it was proven reclaimable.
++    std::vector<uint8_t> readA = readBackBuffer(fixture->allocator, fixture->device.device(),
++                                                  fixture->device.graphicsQueue(),
++                                                  fixture->device.graphicsQueueFamily(), dstA->handle(), kChunkSize);
++    std::vector<uint8_t> readB = readBackBuffer(fixture->allocator, fixture->device.device(),
++                                                  fixture->device.graphicsQueue(),
++                                                  fixture->device.graphicsQueueFamily(), dstB->handle(), kChunkSize);
++    std::vector<uint8_t> readC = readBackBuffer(fixture->allocator, fixture->device.device(),
++                                                  fixture->device.graphicsQueue(),
++                                                  fixture->device.graphicsQueueFamily(), dstC->handle(), kChunkSize);
++    CHECK(std::memcmp(readA.data(), patternA.data(), kChunkSize) == 0);
++    CHECK(std::memcmp(readB.data(), patternB.data(), kChunkSize) == 0);
++    CHECK(std::memcmp(readC.data(), patternC.data(), kChunkSize) == 0);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
