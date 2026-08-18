@@ -83,6 +83,19 @@ public:
     // profiling meaning (TracyVkContextCalibrated vs plain TracyVkContext).
     bool calibratedTimestampsEnabled() const { return calibratedTimestampsEnabled_; }
 
+    // True iff `VK_EXT_memory_budget` was present on the selected physical
+    // device AND successfully enabled on the logical device this Device
+    // wraps [Phase 4 Task 10, spec D24(b), gate ruling #27] -- same
+    // opportunistic, guarded `enable_extension_if_present()` pattern as
+    // calibratedTimestampsEnabled() just above (see device.cpp's own
+    // comment on that call). rx::rhi::Allocator::create(Context&, Device&)
+    // (buffer.h) reads this to decide whether to request
+    // VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT -- the two must stay in
+    // LOCKSTEP (VMA asserts otherwise), which is exactly why this Device
+    // is the single source of truth for whether the extension is really
+    // live, rather than Allocator guessing or re-querying it itself.
+    bool memoryBudgetExtensionEnabled() const { return memoryBudgetExtensionEnabled_; }
+
     VkSwapchainKHR swapchain() const { return swapchain_; }
     const std::vector<VkImage>& swapchainImages() const { return swapchainImages_; }
     VkFormat swapchainFormat() const { return swapchainFormat_; }
@@ -154,6 +167,7 @@ private:
     uint32_t graphicsQueueFamily_ = 0;
     VkQueue presentQueue_ = VK_NULL_HANDLE;
     bool calibratedTimestampsEnabled_ = false;
+    bool memoryBudgetExtensionEnabled_ = false;
 
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     std::vector<VkImage> swapchainImages_;

@@ -33,6 +33,8 @@
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
 #include <vk_mem_alloc.h>
 
+#include <rx_rhi_vk/memory_report.h>
+#include <memory>
 #include <optional>
 
 namespace rx::rhi {
@@ -80,6 +82,16 @@ public:
     // upload_test.cpp).
     bool directPathCapable() const { return directPathCapable_; }
 
+    // [Phase 4 Task 10, spec D24(a)] The category this Buffer's allocated
+    // bytes are attributed to in whichever MemoryAccounting ledger created
+    // it -- see memory_report.h. `allocatedBytes()` is the real VMA-
+    // reported allocation size (VmaAllocationInfo::size, which may be
+    // larger than size() due to alignment/block-granularity padding) --
+    // the exact byte count record()'d at creation and release()'d at
+    // destruction, so the two always net to zero.
+    MemoryCategory category() const { return category_; }
+    VkDeviceSize allocatedBytes() const { return allocatedBytes_; }
+
     // Wraps vmaFlushAllocation()/vmaInvalidateAllocation() -- the API gap
     // flagged by Phase 1 Task 3's review: that task's readback test had no
     // way to reach the underlying VmaAllocation to invalidate it, and had
@@ -115,13 +127,17 @@ private:
 
     Buffer() = default;
     Buffer(VmaAllocator allocator, VkBuffer buffer, VmaAllocation allocation, void* mappedData, VkDeviceSize size,
-           bool directPathCapable = false)
+           bool directPathCapable = false, std::shared_ptr<MemoryAccounting> accounting = nullptr,
+           MemoryCategory category = MemoryCategory::Internal, VkDeviceSize allocatedBytes = 0)
         : allocator_(allocator),
           buffer_(buffer),
           allocation_(allocation),
           mappedData_(mappedData),
           size_(size),
-          directPathCapable_(directPathCapable) {}
+          directPathCapable_(directPathCapable),
+          accounting_(std::move(accounting)),
+          category_(category),
+          allocatedBytes_(allocatedBytes) {}
 
     void destroyAll();
 
@@ -131,6 +147,18 @@ private:
     void* mappedData_ = nullptr;
     VkDeviceSize size_ = 0;
     bool directPathCapable_ = false;
+
+    // [Phase 4 Task 10] Category-attributed accounting (D24(a)) -- a
+    // Buffer holds its own shared_ptr to the ledger it recorded into so
+    // release() on destruction is correct even if the owning Allocator has
+    // since moved (the shared_ptr, not the Allocator object's own
+    // lifetime, is what the ledger's survival depends on). Null for a
+    // default-constructed or moved-from Buffer -- destroyAll() guards on
+    // buffer_ != VK_NULL_HANDLE before touching it, same as every other
+    // teardown here.
+    std::shared_ptr<MemoryAccounting> accounting_;
+    MemoryCategory category_ = MemoryCategory::Internal;
+    VkDeviceSize allocatedBytes_ = 0;
 };
 
 // Owns a VmaAllocator built against a specific VkInstance/VkPhysicalDevice/
@@ -147,20 +175,74 @@ public:
     // Convenience overload for the common case: builds against the
     // VkInstance/VkPhysicalDevice/VkDevice a Context+Device already own.
     // Delegates to createRaw() below -- both share one implementation.
-    static std::optional<Allocator> create(Context& context, Device& device);
+    // `VK_EXT_memory_budget` enablement is NOT a parameter here: it is
+    // pulled from `device.memoryBudgetExtensionEnabled()` automatically
+    // (device.h), which is itself set opportunistically at Device::create()
+    // time -- the two must stay in lockstep (VMA asserts otherwise, see
+    // createRaw()'s own comment), and this overload is what keeps them so
+    // for every ordinary caller. `forcedHeapSizeLimitBytes` is a TEST-ONLY
+    // escape hatch (default VK_WHOLE_SIZE = no limit): forwarded verbatim
+    // to createRaw() -- see that function's own comment for what it does
+    // and why [Phase 4 Task 10, D24(d) OOM-path testing].
+    static std::optional<Allocator> create(Context& context, Device& device,
+                                            VkDeviceSize forcedHeapSizeLimitBytes = VK_WHOLE_SIZE);
 
     // Builds a VmaAllocator directly from raw handles, with no dependency
     // on rx::rhi::Context/Device -- e.g. for tooling or tests that want an
     // allocator without constructing either.
-    static std::optional<Allocator> createRaw(VkPhysicalDevice physicalDevice, VkDevice device, VkInstance instance);
+    //
+    // `memoryBudgetExtensionEnabled` [Phase 4 Task 10, spec D24(b), gate
+    // ruling #27]: pass true ONLY if `VK_EXT_memory_budget` was actually
+    // enabled on `device` at logical-device-creation time (Device::create()
+    // does this opportunistically via `enable_extension_if_present()` --
+    // see device.cpp). This flag and
+    // `VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT` are kept in LOCKSTEP
+    // internally: passing true when the extension was NOT really enabled on
+    // `device` trips VMA's own `VMA_ASSERT` (vk_mem_alloc.h:13365-13368,
+    // verified against the vendored 3.4.0 source) the first time any budget
+    // query runs. When true, `report()` below reports
+    // MemoryBudgetSource::RealExtension and its per-heap `budgetBytes`
+    // comes from the real `vmaGetHeapBudgets()` driver query; when false,
+    // MemoryBudgetSource::HeapSizeFallback and `budgetBytes` is this
+    // engine's own `VkMemoryHeap::size` estimate instead (matrix-issue27
+    // row 2's exact fallback wording -- deliberately NOT VMA's own internal
+    // 80%-of-heap-size heuristic, which is an unversioned VMA implementation
+    // detail this engine does not want a silent dependency on).
+    //
+    // `forcedHeapSizeLimitBytes` [Phase 4 Task 10, D24(d) OOM-path testing]:
+    // TEST-ONLY. When not VK_WHOLE_SIZE (the default -- no limit), every
+    // memory heap on `physicalDevice` is capped to this many bytes via
+    // `VmaAllocatorCreateInfo::pHeapSizeLimit` (VMA's own documented,
+    // host-side "test how your program behaves with limited memory"
+    // mechanism -- vk_mem_alloc.h's `\\page heap_memory_limit` docs) --
+    // deterministically forces `VK_ERROR_OUT_OF_DEVICE_MEMORY` on the next
+    // allocation that would exceed it, with NO dependency on actually
+    // exhausting real GPU memory or on any specific driver's
+    // overallocation behavior. This is the "tiny mock/--budget-override
+    // allocator ceiling" the plan's own Task 10 steps call for
+    // (matrix-issue27 rows 6-9) -- see oom_handling_test.cpp.
+    static std::optional<Allocator> createRaw(VkPhysicalDevice physicalDevice, VkDevice device, VkInstance instance,
+                                               bool memoryBudgetExtensionEnabled = false,
+                                               VkDeviceSize forcedHeapSizeLimitBytes = VK_WHOLE_SIZE);
 
     // Allocates a VkBuffer with `usage`, backed by host-visible, persistently
     // mapped memory (VMA_MEMORY_USAGE_AUTO +
     // VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
     // VMA_ALLOCATION_CREATE_MAPPED_BIT) -- suitable for CPU-written,
     // GPU-read data such as vertex/index/uniform buffers updated every
-    // frame. Returns std::nullopt on any failure (logged via RX_LOG_ERROR).
-    std::optional<Buffer> createHostVisibleBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
+    // frame. `category` [Phase 4 Task 10, D24(a)] attributes this
+    // allocation's bytes in the accounting ledger `report()` reads --
+    // defaults to MemoryCategory::Internal for callers that don't yet
+    // categorize themselves (this default is deliberately generic, not a
+    // guess: a caller that legitimately knows its role, e.g. Uploader's
+    // staging ring buffer below, passes its real category explicitly).
+    // Returns std::nullopt on any failure (logged via RX_LOG_ERROR); on
+    // VK_ERROR_OUT_OF_DEVICE_MEMORY specifically, the failure is
+    // additionally classified and report-attached -- see
+    // lastAllocationFailureKind()/lastAllocationFailureReport() below
+    // [D24(d)].
+    std::optional<Buffer> createHostVisibleBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
+                                                   MemoryCategory category = MemoryCategory::Internal);
 
     // Allocates a VkBuffer with `usage` -- intended for a real
     // device-consuming role (VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
@@ -222,9 +304,13 @@ public:
     // Everywhere else it resolves to plain DEVICE_LOCAL-only memory
     // (`directPathCapable()` false, `mappedData()` null -- VMA does not
     // map memory it cannot map), identical to this method's behavior
-    // before this task's Critical review fix. Returns std::nullopt on any
-    // failure (logged via RX_LOG_ERROR).
-    std::optional<Buffer> createDeviceLocalBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
+    // before this task's Critical review fix. `category` [Phase 4 Task 10,
+    // D24(a)] -- see createHostVisibleBuffer()'s own comment above; same
+    // default and same rationale. Returns std::nullopt on any failure
+    // (logged via RX_LOG_ERROR); OOM-classified/report-attached on
+    // VK_ERROR_OUT_OF_DEVICE_MEMORY specifically [D24(d)].
+    std::optional<Buffer> createDeviceLocalBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
+                                                   MemoryCategory category = MemoryCategory::Internal);
 
     // Allocates a VkBuffer with `usage` (typically just
     // VK_BUFFER_USAGE_TRANSFER_SRC_BIT -- this is always a copy *source*,
@@ -242,9 +328,16 @@ public:
     // buffer landed in, on any hardware). rx::rhi::Uploader's internal
     // staging ring buffer is exactly this: a plain, always-staging
     // resource; the direct-upload optimization belongs on the
-    // *destination* (createDeviceLocalBuffer() above), not here. Returns
-    // std::nullopt on any failure (logged).
-    std::optional<Buffer> createUploadRingBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
+    // *destination* (createDeviceLocalBuffer() above), not here. `category`
+    // [Phase 4 Task 10, D24(a)] defaults to MemoryCategory::Staging -- this
+    // buffer IS the staging ring, by construction, so unlike the two
+    // factories above there is no honest "uncategorized" default here;
+    // Uploader::create() (upload.cpp) relies on this default rather than
+    // passing it explicitly. Returns std::nullopt on any failure (logged);
+    // OOM-classified/report-attached on VK_ERROR_OUT_OF_DEVICE_MEMORY
+    // specifically [D24(d)].
+    std::optional<Buffer> createUploadRingBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
+                                                  MemoryCategory category = MemoryCategory::Staging);
 
     // Raw VmaAllocator handle -- needed by rx::rhi::Texture2D::create()
     // (texture.h, a separate header/TU) to call vmaCreateImage/
@@ -258,13 +351,98 @@ public:
     // buffers, and Texture2D::create() for images.
     VmaAllocator raw() const { return allocator_; }
 
+    // Shared accounting ledger this Allocator's own create*Buffer()
+    // methods record into -- exposed so rx::rhi::Texture2D::create()
+    // (texture.h/.cpp, a separate TU that already takes `Allocator&`) can
+    // record()/release() into the SAME ledger `report()` below reads,
+    // without texture.cpp needing to befriend or duplicate any of this
+    // class's internals. Not intended for ordinary callers.
+    const std::shared_ptr<MemoryAccounting>& accounting() const { return accounting_; }
+
+    // [Phase 4 Task 10, spec D24(c)] Snapshots the current category ledger
+    // (accounting()) plus a fresh vmaGetHeapBudgets() query into one
+    // RxMemoryReport, and pushes each field to a named Tracy plot as a side
+    // effect (D24(c): "feeding HUD + Tracy plots") -- see buffer.cpp for
+    // the exact per-heap budgetBytes computation (RealExtension vs
+    // HeapSizeFallback). Cheap enough to call every frame (vmaGetHeapBudgets
+    // itself is documented O(1) -- vk_mem_alloc.h:18103-18106) but ONLY
+    // fresh if setCurrentFrameIndex() below has been kept current -- see
+    // that method's own comment for why.
+    RxMemoryReport report() const;
+
+    // [Phase 4 Task 10, gate ruling #27, matrix-issue27 row 3] Thin wrapper
+    // over vmaSetCurrentFrameIndex(). MUST be called once per rendered
+    // frame for report()'s per-heap usage/budget numbers (when
+    // MemoryBudgetSource::RealExtension) to stay fresh: verified directly
+    // against the vendored VMA 3.4.0 source that the real
+    // VK_EXT_memory_budget driver query only re-fires when this is called,
+    // or lazily once 30 allocate/free operations have accumulated since the
+    // last fetch (vk_mem_alloc.h:14787) -- a scene that goes many frames
+    // without a single VMA alloc/free would otherwise report a stale
+    // budget the whole time. FrameSync::advanceFrame() (frame_sync.h/.cpp)
+    // is the wired, once-per-frame call site: pass this Allocator's
+    // address to advanceFrame() and it calls this automatically; calling
+    // it directly is also fine for a caller that doesn't use FrameSync.
+    // No-op cost when MemoryBudgetSource::HeapSizeFallback (VMA's own
+    // non-extension budget path recomputes fresh on every
+    // vmaGetHeapBudgets() call regardless, per the same source read) --
+    // safe to call unconditionally either way.
+    void setCurrentFrameIndex(uint32_t frameIndex);
+
+    // [Phase 4 Task 10, spec D24(d)] What kind of failure the MOST RECENT
+    // createHostVisibleBuffer()/createDeviceLocalBuffer()/
+    // createUploadRingBuffer() call ended in (AllocationFailureKind::None
+    // if it succeeded, or hasn't been called yet). `lastAllocationFailureReport()`
+    // is the RxMemoryReport snapshot captured at the exact moment of that
+    // failure -- the "report attached" half of "loud, named failure with
+    // the report attached" (both are also inlined into the RX_LOG_ERROR
+    // line itself via summarizeMemoryReport(), memory_report.h). Texture2D::
+    // create()'s vmaCreateImage failure path (texture.cpp) updates these
+    // same two via noteAllocationFailure() below; its DIFFERENT
+    // vkCreateImageView failure class deliberately does NOT (see
+    // noteNonMemoryFailure() below) -- matrix-issue27 row 9's "these two
+    // failure paths must be distinguishable" requirement.
+    AllocationFailureKind lastAllocationFailureKind() const { return lastFailureKind_; }
+    const RxMemoryReport& lastAllocationFailureReport() const { return lastFailureReport_; }
+
+    // Classifies `result`, snapshots report() into lastAllocationFailureReport(),
+    // and logs one RX_LOG_ERROR naming `siteName`/the classified kind/
+    // `category`/the report summary -- the single formatting implementation
+    // every one of createHostVisibleBuffer()/createDeviceLocalBuffer()/
+    // createUploadRingBuffer()/Texture2D::create()'s vmaCreateImage branch
+    // calls on failure, so the "loud, named, report-attached" log shape
+    // (D24(d)) can never drift between call sites. Public so texture.cpp
+    // (which only holds an `Allocator&`, not friendship) can call it too.
+    void noteAllocationFailure(const char* siteName, MemoryCategory category, VkResult result);
+
+    // [Phase 4 Task 10, matrix-issue27 row 9] For a failure class that is
+    // NOT a memory-budget event -- today, only Texture2D::create()'s
+    // vkCreateImageView failure (a device/API-misuse-class error, distinct
+    // from the vmaCreateImage failure two lines earlier in that same
+    // function, which DOES go through noteAllocationFailure() above).
+    // Logs a clearly-labeled RX_LOG_ERROR naming `siteName`/`result` but
+    // deliberately does NOT touch lastAllocationFailureKind()/
+    // lastAllocationFailureReport() or the accounting ledger -- exactly
+    // what keeps the two failure classes distinguishable to a caller
+    // inspecting Allocator state after either.
+    void noteNonMemoryFailure(const char* siteName, VkResult result);
+
 private:
     Allocator() = default;
-    explicit Allocator(VmaAllocator allocator) : allocator_(allocator) {}
+    explicit Allocator(VmaAllocator allocator, VkPhysicalDevice physicalDevice, MemoryBudgetSource budgetSource)
+        : allocator_(allocator),
+          physicalDevice_(physicalDevice),
+          budgetSource_(budgetSource),
+          accounting_(std::make_shared<MemoryAccounting>()) {}
 
     void destroyAll();
 
     VmaAllocator allocator_ = VK_NULL_HANDLE;
+    VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
+    MemoryBudgetSource budgetSource_ = MemoryBudgetSource::HeapSizeFallback;
+    std::shared_ptr<MemoryAccounting> accounting_;
+    AllocationFailureKind lastFailureKind_ = AllocationFailureKind::None;
+    RxMemoryReport lastFailureReport_;
 };
 
 }  // namespace rx::rhi

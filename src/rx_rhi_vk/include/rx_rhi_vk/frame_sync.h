@@ -7,6 +7,8 @@
 
 namespace rx::rhi {
 
+class Allocator;
+
 // FrameSync owns every synchronization primitive and per-frame command
 // buffer the canonical "frames in flight" present loop needs, built once and
 // reused for the lifetime of the loop -- never recreated per frame. This is
@@ -145,10 +147,19 @@ public:
     // out early via NeedsRecreate's `continue` path, since that iteration
     // never submitted anything against the current slot. Also increments
     // frameNumber() -- the two counters advance together, by construction.
-    void advanceFrame() {
-        currentFrame_ = (currentFrame_ + 1) % kFramesInFlight;
-        ++frameNumber_;
-    }
+    //
+    // `allocatorForBudgetRefresh` [Phase 4 Task 10, spec D24, gate ruling
+    // #27, matrix-issue27 row 3]: OPTIONAL, default nullptr (every existing
+    // zero-argument call site is unaffected). When non-null, this is the
+    // wired "once per frame, natural home: alongside FrameSync's own
+    // per-frame bookkeeping" call the gate ruling requires --
+    // Allocator::setCurrentFrameIndex() (buffer.h) is called with the new
+    // frameNumber(), which is what keeps vmaGetHeapBudgets()'s real
+    // VK_EXT_memory_budget-backed numbers from silently going stale (see
+    // that method's own comment, and memory_report.h's, for the exact
+    // staleness mechanism this closes). A caller that doesn't use
+    // Allocator::report() at all can simply keep omitting the argument.
+    void advanceFrame(Allocator* allocatorForBudgetRefresh = nullptr);
 
     // Rebuilds the per-swapchain-image renderFinished semaphores for a new
     // image count after Device::recreateSwapchain() -- the per-frame-in-

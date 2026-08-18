@@ -60,6 +60,17 @@ and compiles to nothing at all when it is OFF:
   drain and shutdown paths, out of this fix round's scope; `retire()` is
   the one enqueue-style mutator a chunk >= 1 caller could plausibly reach
   mid-frame) (`src/rx_rhi_vk/include/rx_rhi_vk/deletion_queue.h`)
+- **`rx::rhi::Allocator`** [Phase 4 Task 10, spec D24] —
+  `setCurrentFrameIndex()`/`report()` (not guarded — no shared mutable
+  state a chunk >= 1 caller could corrupt, since `MemoryAccounting`'s own
+  counters are atomic; the main-thread-only convention here is about
+  matching every other Allocator/Buffer/Texture2D GPU-object-mutation
+  entry point's existing scoping, not a new hazard) — call
+  `setCurrentFrameIndex()` once per frame (`FrameSync::advanceFrame()`
+  does this automatically when passed this Allocator's address) so
+  `report()`'s per-heap budget numbers stay fresh (see `memory_report.h`'s
+  own comment on the `vmaSetCurrentFrameIndex()` staleness rule).
+  (`src/rx_rhi_vk/include/rx_rhi_vk/buffer.h`)
 - **`rx::asset::GeometryPool`** (future, Stage 1) — suballocation is a
   main-thread-owned `VmaVirtualBlock` operation, same rationale as the
   four above. Not guarded — does not exist yet.

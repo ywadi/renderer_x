@@ -1,8 +1,21 @@
 #include <rx_rhi_vk/frame_sync.h>
+#include <rx_rhi_vk/buffer.h>
 #include <rx_core/log.h>
 #include <utility>
 
 namespace rx::rhi {
+
+void FrameSync::advanceFrame(Allocator* allocatorForBudgetRefresh) {
+    currentFrame_ = (currentFrame_ + 1) % kFramesInFlight;
+    ++frameNumber_;
+    if (allocatorForBudgetRefresh != nullptr) {
+        // [Phase 4 Task 10, gate ruling #27] See this method's own header
+        // comment in frame_sync.h -- this is the wired, once-per-frame
+        // vmaSetCurrentFrameIndex() call the gate identified as missing
+        // everywhere in this repository before this task.
+        allocatorForBudgetRefresh->setCurrentFrameIndex(static_cast<uint32_t>(frameNumber_));
+    }
+}
 
 std::optional<FrameSync> FrameSync::create(VkDevice device, uint32_t queueFamily, uint32_t swapchainImageCount) {
     FrameSync sync;

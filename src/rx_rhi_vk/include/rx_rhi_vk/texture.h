@@ -79,16 +79,31 @@ public:
     // without a real feature query, and an Allocator alone exposes
     // neither a VkPhysicalDevice nor a VkDevice to get one from.
     //
-    // Returns std::nullopt (logged) on any image/view creation failure.
+    // `category` [Phase 4 Task 10, spec D24(a)] attributes this image's
+    // allocated bytes in `allocator`'s accounting ledger (Allocator::report()
+    // reads it) -- default MemoryCategory::Internal, same rationale as
+    // Allocator::createHostVisibleBuffer()'s own default (buffer.h).
+    // Returns std::nullopt (logged) on any image/view creation failure. On
+    // the vmaCreateImage step specifically, a VK_ERROR_OUT_OF_DEVICE_MEMORY
+    // failure is classified/report-attached via `allocator`
+    // (Allocator::lastAllocationFailureKind()/lastAllocationFailureReport(),
+    // buffer.h [D24(d)]); a LATER vkCreateImageView failure (the image
+    // itself already having been created successfully) is a DIFFERENT,
+    // deliberately-not-memory-attributed failure class -- see
+    // Allocator::noteNonMemoryFailure()'s own comment for why
+    // (matrix-issue27 row 9: these two must stay distinguishable).
     static std::optional<Texture2D> create(VkPhysicalDevice physicalDevice, VkDevice device, Allocator& allocator,
                                             VkExtent2D extent, VkFormat format, VkImageUsageFlags usage,
-                                            uint32_t requestedMipLevels = 0);
+                                            uint32_t requestedMipLevels = 0,
+                                            MemoryCategory category = MemoryCategory::Internal);
 
     VkImage image() const { return image_; }
     VkImageView view() const { return view_; }
     VkExtent2D extent() const { return extent_; }
     VkFormat format() const { return format_; }
     uint32_t mipLevels() const { return mipLevels_; }
+    MemoryCategory category() const { return category_; }
+    VkDeviceSize allocatedBytes() const { return allocatedBytes_; }
 
     // Records the full mip-chain blit for a texture whose level 0 was
     // just written (e.g. by rx::rhi::Uploader::uploadToImage()) and is
@@ -122,7 +137,9 @@ public:
 private:
     Texture2D() = default;
     Texture2D(VmaAllocator allocator, VkDevice device, VkImage image, VmaAllocation allocation, VkImageView view,
-               VkExtent2D extent, VkFormat format, uint32_t mipLevels)
+               VkExtent2D extent, VkFormat format, uint32_t mipLevels,
+               std::shared_ptr<MemoryAccounting> accounting = nullptr,
+               MemoryCategory category = MemoryCategory::Internal, VkDeviceSize allocatedBytes = 0)
         : allocator_(allocator),
           device_(device),
           image_(image),
@@ -130,7 +147,10 @@ private:
           view_(view),
           extent_(extent),
           format_(format),
-          mipLevels_(mipLevels) {}
+          mipLevels_(mipLevels),
+          accounting_(std::move(accounting)),
+          category_(category),
+          allocatedBytes_(allocatedBytes) {}
 
     void destroyAll();
 
@@ -142,6 +162,13 @@ private:
     VkExtent2D extent_{0, 0};
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     uint32_t mipLevels_ = 1;
+
+    // [Phase 4 Task 10] Category-attributed accounting (D24(a)) -- same
+    // shape/rationale as Buffer's own accounting_/category_/allocatedBytes_
+    // (buffer.h).
+    std::shared_ptr<MemoryAccounting> accounting_;
+    MemoryCategory category_ = MemoryCategory::Internal;
+    VkDeviceSize allocatedBytes_ = 0;
 };
 
 }  // namespace rx::rhi

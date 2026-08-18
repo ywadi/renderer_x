@@ -83,7 +83,7 @@ void transitionLevelRange(VkCommandBuffer cmd, VkImage image, uint32_t baseLevel
 
 std::optional<Texture2D> Texture2D::create(VkPhysicalDevice physicalDevice, VkDevice device, Allocator& allocator,
                                             VkExtent2D extent, VkFormat format, VkImageUsageFlags usage,
-                                            uint32_t requestedMipLevels) {
+                                            uint32_t requestedMipLevels, MemoryCategory category) {
     uint32_t maxPossible = computeMaxMipLevels(extent);
     uint32_t mipLevels = requestedMipLevels == 0 ? maxPossible : std::min(requestedMipLevels, maxPossible);
 
@@ -146,9 +146,12 @@ std::optional<Texture2D> Texture2D::create(VkPhysicalDevice physicalDevice, VkDe
 
     VkImage image = VK_NULL_HANDLE;
     VmaAllocation allocation = VK_NULL_HANDLE;
-    VkResult result = vmaCreateImage(allocator.raw(), &imageInfo, &allocCreateInfo, &image, &allocation, nullptr);
+    VmaAllocationInfo allocationInfo{};
+    VkResult result = vmaCreateImage(allocator.raw(), &imageInfo, &allocCreateInfo, &image, &allocation, &allocationInfo);
     if (result != VK_SUCCESS) {
-        RX_LOG_ERROR("vmaCreateImage failed: VkResult={}", static_cast<int>(result));
+        // [Phase 4 Task 10, spec D24(d), matrix-issue27 row 9] Memory-budget
+        // failure class -- classified/report-attached via `allocator`.
+        allocator.noteAllocationFailure("Texture2D::create(vmaCreateImage)", category, result);
         return std::nullopt;
     }
 
@@ -166,12 +169,20 @@ std::optional<Texture2D> Texture2D::create(VkPhysicalDevice physicalDevice, VkDe
     VkImageView view = VK_NULL_HANDLE;
     result = vkCreateImageView(device, &viewInfo, nullptr, &view);
     if (result != VK_SUCCESS) {
-        RX_LOG_ERROR("vkCreateImageView failed: VkResult={}", static_cast<int>(result));
+        // [Phase 4 Task 10, matrix-issue27 row 9] Deliberately a DIFFERENT,
+        // non-memory-attributed failure class from the vmaCreateImage
+        // branch above -- see Allocator::noteNonMemoryFailure()'s own
+        // comment (buffer.h) for why: this is a device/API-misuse-class
+        // failure (the image itself was already successfully allocated),
+        // not a memory-budget event.
+        allocator.noteNonMemoryFailure("Texture2D::create(vkCreateImageView)", result);
         vmaDestroyImage(allocator.raw(), image, allocation);
         return std::nullopt;
     }
 
-    return Texture2D(allocator.raw(), device, image, allocation, view, extent, format, mipLevels);
+    allocator.accounting()->record(category, allocationInfo.size);
+    return Texture2D(allocator.raw(), device, image, allocation, view, extent, format, mipLevels,
+                      allocator.accounting(), category, allocationInfo.size);
 }
 
 void Texture2D::recordMipChainBlit(VkCommandBuffer cmd) const {
@@ -245,6 +256,9 @@ Texture2D& Texture2D::operator=(Texture2D&& other) noexcept {
         extent_ = other.extent_;
         format_ = other.format_;
         mipLevels_ = other.mipLevels_;
+        accounting_ = std::move(other.accounting_);
+        category_ = other.category_;
+        allocatedBytes_ = other.allocatedBytes_;
 
         other.allocator_ = VK_NULL_HANDLE;
         other.device_ = VK_NULL_HANDLE;
@@ -254,6 +268,8 @@ Texture2D& Texture2D::operator=(Texture2D&& other) noexcept {
         other.extent_ = VkExtent2D{0, 0};
         other.format_ = VK_FORMAT_UNDEFINED;
         other.mipLevels_ = 1;
+        other.category_ = MemoryCategory::Internal;
+        other.allocatedBytes_ = 0;
     }
     return *this;
 }
@@ -263,6 +279,18 @@ Texture2D::~Texture2D() {
 }
 
 void Texture2D::destroyAll() {
+    if (image_ != VK_NULL_HANDLE && accounting_) {
+        // [Phase 4 Task 10, spec D24(a)] Released once, guarded on image_
+        // (not view_): if construction failed after a successful
+        // vmaCreateImage but before vkCreateImageView succeeded, the
+        // partially-built Texture2D() this file's create() returns in that
+        // branch is never actually returned to a caller (create() returns
+        // std::nullopt instead, and the local `image`/`allocation` are
+        // torn down directly there, not through this destructor) -- so
+        // this guard only ever fires for a fully-constructed Texture2D
+        // that really did record() into the ledger.
+        accounting_->release(category_, allocatedBytes_);
+    }
     if (view_ != VK_NULL_HANDLE) {
         vkDestroyImageView(device_, view_, nullptr);
     }

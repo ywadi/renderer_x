@@ -71,7 +71,14 @@ std::optional<Uploader> Uploader::create(Allocator& allocator, Device& device, V
         return std::nullopt;
     }
 
-    auto ringBuffer = allocator.createUploadRingBuffer(ringBufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    // MemoryCategory::Staging [Phase 4 Task 10, spec D24(a)]: this ring
+    // buffer IS the staging ring the category names -- the one real,
+    // in-scope call site this task itself categorizes explicitly (every
+    // other existing call site keeps createUploadRingBuffer()'s own
+    // Staging default anyway, so this is a documentation-of-intent change,
+    // not a behavior change).
+    auto ringBuffer =
+        allocator.createUploadRingBuffer(ringBufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemoryCategory::Staging);
     if (!ringBuffer.has_value()) {
         RX_LOG_ERROR("Uploader::create: failed to allocate the {}-byte staging ring buffer", ringBufferSize);
         vkDestroyFence(vkDevice, fence, nullptr);

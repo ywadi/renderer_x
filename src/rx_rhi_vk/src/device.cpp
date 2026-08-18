@@ -259,6 +259,27 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
     const bool calibratedTimestampsEnabled =
         physResult.value().enable_extension_if_present(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
 
+    // VK_EXT_memory_budget: optional, guarded, same pattern as
+    // calibratedTimestampsEnabled directly above [Phase 4 Task 10, spec
+    // D24(b), gate ruling #27]. A device lacking it is still fully
+    // supported -- rx::rhi::Allocator (buffer.h/.cpp) falls back to a
+    // heap-size budget estimate (MemoryBudgetSource::HeapSizeFallback)
+    // instead of the real driver-reported budget. Its instance-level
+    // dependency (VK_KHR_get_physical_device_properties2, or core Vulkan
+    // >= 1.1) is already satisfied unconditionally: this file's `selector`
+    // above requires >= 1.3 (set_minimum_version(1, 3)), and
+    // Context::create() (context.cpp) requires instance API version 1.3.0
+    // too (`require_api_version(1, 3, 0)`) -- both comfortably subsume the
+    // 1.1 floor, so no separate instance extension needs enabling here.
+    // Empirically verified present on both drivers this project develops
+    // against (vulkaninfo, `VK_ICD_FILENAMES` pointed at each ICD in
+    // isolation): NVIDIA's proprietary driver AND Mesa llvmpipe/lavapipe
+    // (the software rasterizer CI runs against) both report
+    // `VK_EXT_memory_budget` -- so the RealExtension path, not just the
+    // fallback, is exercised for real in CI, not merely local dev.
+    const bool memoryBudgetExtensionEnabled =
+        physResult.value().enable_extension_if_present(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+
     auto deviceResult = vkb::DeviceBuilder(physResult.value()).build();
     if (!deviceResult) {
         RX_LOG_ERROR("vkb::DeviceBuilder::build failed: {}", deviceResult.error().message());
@@ -335,6 +356,10 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
     dev.calibratedTimestampsEnabled_ = calibratedTimestampsEnabled;
     RX_LOG_INFO("Device::create: VK_EXT_calibrated_timestamps {} on the selected physical device",
                 calibratedTimestampsEnabled ? "ENABLED" : "not present -- falling back to uncalibrated GPU zones");
+    dev.memoryBudgetExtensionEnabled_ = memoryBudgetExtensionEnabled;
+    RX_LOG_INFO("Device::create: VK_EXT_memory_budget {} on the selected physical device",
+                memoryBudgetExtensionEnabled ? "ENABLED" : "not present -- memory reports fall back to a heap-size "
+                                                            "budget estimate");
     dev.swapchain_ = vkbSwapchain.swapchain;
     dev.swapchainImages_ = imagesResult.value();
     dev.swapchainFormat_ = vkbSwapchain.image_format;
@@ -362,6 +387,7 @@ Device& Device::operator=(Device&& other) noexcept {
         graphicsQueueFamily_ = other.graphicsQueueFamily_;
         presentQueue_ = other.presentQueue_;
         calibratedTimestampsEnabled_ = other.calibratedTimestampsEnabled_;
+        memoryBudgetExtensionEnabled_ = other.memoryBudgetExtensionEnabled_;
         swapchain_ = other.swapchain_;
         swapchainImages_ = std::move(other.swapchainImages_);
         swapchainFormat_ = other.swapchainFormat_;
@@ -377,6 +403,7 @@ Device& Device::operator=(Device&& other) noexcept {
         other.graphicsQueueFamily_ = 0;
         other.presentQueue_ = VK_NULL_HANDLE;
         other.calibratedTimestampsEnabled_ = false;
+        other.memoryBudgetExtensionEnabled_ = false;
         other.swapchain_ = VK_NULL_HANDLE;
         other.swapchainImages_.clear();
         other.swapchainFormat_ = VK_FORMAT_UNDEFINED;
