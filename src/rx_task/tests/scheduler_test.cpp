@@ -582,20 +582,31 @@ TEST_CASE("Scheduler::runOnWorkerThread's own fn may legally call parallelFor() 
               ids.size(), mainId == ids.front() ? "participated" : "did not participate");
 }
 
-TEST_CASE("Scheduler::runOnWorkerThread round-robins across every worker thread and survives many concurrent "
-          "submissions without dropping or double-running any of them") {
+TEST_CASE("Scheduler::runOnWorkerThread [fix round 1 redesign] dispatches every closure on the ONE dedicated "
+          "worker-task-lane thread, in FIFO order, and survives many concurrent submissions without dropping or "
+          "double-running any of them") {
+  // [Fix round 1] Post-redesign contract: runOnWorkerThread() no longer
+  // round-robins across the ordinary worker pool (the CRITICAL fix's own
+  // persistent-task-plus-closure-queue design serializes the OUTER
+  // dispatch point onto one dedicated lane thread -- see scheduler.cpp's
+  // own Scheduler::Scheduler() comment for why). Genuine multi-worker
+  // fan-out is still fully available to a closure's OWN body via a nested
+  // parallelFor() call -- proven by the barrier test directly above this
+  // one, unaffected by this redesign.
   auto scheduler = rx::task::Scheduler::create(4);
   REQUIRE(scheduler != nullptr);
 
   constexpr int kCount = 500;
   std::atomic<int> completed{0};
-  std::mutex idsMutex;
+  std::mutex resultsMutex;
+  std::vector<int> order;
   std::vector<std::thread::id> ids;
 
   for (int i = 0; i < kCount; ++i) {
-    scheduler->runOnWorkerThread([&] {
+    scheduler->runOnWorkerThread([&resultsMutex, &order, &ids, &completed, i] {
       {
-        std::lock_guard<std::mutex> lock(idsMutex);
+        std::lock_guard<std::mutex> lock(resultsMutex);
+        order.push_back(i);
         ids.push_back(std::this_thread::get_id());
       }
       completed.fetch_add(1, std::memory_order_release);
@@ -604,16 +615,68 @@ TEST_CASE("Scheduler::runOnWorkerThread round-robins across every worker thread 
 
   REQUIRE(waitUntil([&] { return completed.load(std::memory_order_acquire) == kCount; }, std::chrono::seconds(30)));
   CHECK(completed.load() == kCount);
-  CHECK(ids.size() == static_cast<size_t>(kCount));
+  REQUIRE(order.size() == static_cast<size_t>(kCount));
+  for (int i = 0; i < kCount; ++i) {
+    CHECK(order[static_cast<size_t>(i)] == i);
+  }
 
-  std::sort(ids.begin(), ids.end());
-  ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
-  // Round-robin over 4 workers with 500 submissions should touch more than
-  // one of them (not a hard architectural guarantee under adversarial
-  // scheduling, but overwhelmingly true in practice -- informative, not
-  // load-bearing on its own; the barrier test above is the deterministic
-  // proof of genuine multi-worker participation).
-  CHECK(ids.size() >= 2);
+  REQUIRE(!ids.empty());
+  for (const auto& id : ids) {
+    CHECK(id == ids.front());
+  }
+}
+
+// [Fix round 1, CRITICAL, permanent regression test] Adversarial churn
+// harness -- repeated construct -> burst-submit-both-primitives (from
+// MULTIPLE concurrent submitter threads) -> destroy cycles, with the
+// destroy deliberately racing whatever submitted work has not yet
+// executed. This is the exact shape that reproduced the pre-fix-round UAF
+// 100% of the time under TSAN (both this project's own harness and the
+// independent reviewing coordinator's own harness, per task-15-report.md's
+// fix-round-1 section) -- kept here permanently, not just run once during
+// the fix, so a future regression in the ClosureQueue/ClosureQueueLoopTask
+// design (scheduler.cpp's own top-of-file comment) gets caught the same
+// way. Passing under a normal (non-TSAN) build proves nothing crashes;
+// the actual data-race proof is the documented manual TSAN procedure
+// (docs/threading.md) run against this exact TEST_CASE.
+TEST_CASE("Scheduler: adversarial churn -- repeated construct/burst-submit-both-primitives/destroy cycles with "
+          "multiple concurrent submitter threads (TSAN harness; permanent regression test)") {
+  constexpr int kRounds = 100;
+  constexpr int kSubmitterThreads = 8;
+  constexpr int kSubmissionsPerThreadPerPrimitive = 20;
+
+  for (int round = 0; round < kRounds; ++round) {
+    auto scheduler = rx::task::Scheduler::create(2);
+    REQUIRE(scheduler != nullptr);
+
+    std::atomic<int> ioCompleted{0};
+    std::atomic<int> workerCompleted{0};
+
+    std::vector<std::thread> submitters;
+    submitters.reserve(kSubmitterThreads);
+    for (int t = 0; t < kSubmitterThreads; ++t) {
+      submitters.emplace_back([&scheduler, &ioCompleted, &workerCompleted] {
+        for (int i = 0; i < kSubmissionsPerThreadPerPrimitive; ++i) {
+          scheduler->runOnIoThread([&ioCompleted] { ioCompleted.fetch_add(1, std::memory_order_relaxed); });
+          scheduler->runOnWorkerThread([&workerCompleted] { workerCompleted.fetch_add(1, std::memory_order_relaxed); });
+        }
+      });
+    }
+    // Joining only waits for every SUBMISSION call to have returned --
+    // deliberately NOT for the submitted closures to have executed. The
+    // scheduler destructs immediately after this loop (end of scope),
+    // racing WaitforAllAndShutdown() against whatever is still queued or
+    // mid-execution on either ClosureQueue -- the adversarial shape.
+    for (auto& th : submitters) {
+      th.join();
+    }
+  }
+  // Reaching here at all, kRounds times, with every Scheduler destroyed
+  // mid-churn, is the assertion for a normal build; TSAN-clean (zero
+  // data-race reports attributable to this code) is verified separately
+  // via the documented manual procedure (docs/threading.md) and recorded
+  // in task-15-report.md's own fix-round-1 evidence section.
+  CHECK(true);
 }
 
 TEST_CASE("Scheduler teardown lets several already-queued runOnWorkerThread() tasks all run to completion, "

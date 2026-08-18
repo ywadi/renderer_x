@@ -129,7 +129,14 @@ main-thread-only surface, but a violation there is caught just as loudly.
 ## Worker-allowed
 
 Safe to run on any `rx::task::Scheduler` worker (inside a `parallelFor()`
-chunk) or the dedicated IO thread (`runOnIoThread()`):
+chunk), the dedicated IO thread (`runOnIoThread()`), or the dedicated
+worker-task lane thread (`runOnWorkerThread()`, [Phase 4 Stage 1 Task 15]
+— see that method's own doc comment, `scheduler.h`, and "Pinned-task
+dispatch" below for exactly why a THIRD dedicated thread exists and what
+it is for: async-import-style background work that must run off both the
+main thread and the IO thread, with a closure's own body still free to
+fan out across the ordinary `[1, workerCount()]` pool via a nested
+`parallelFor()` call):
 
 - Pure CPU transforms (matrix math, AABB computation, skinning-data
   parsing/preservation).
@@ -299,11 +306,102 @@ scheduler->pumpMain();
 blocking-I/O side specifically (file reads, decode-adjacent syscalls that
 would otherwise stall a `parallelFor()` worker): it runs `fn` on the
 scheduler's one dedicated IO thread, FIFO, off the main thread and off
-every `parallelFor()` worker — see `scheduler.h`'s own doc comments for
-exactly how enkiTS's `IPinnedTask` mechanism backs it. A worker (or the IO
-thread itself) doing I/O-adjacent work still finishes by calling
-`postToMain()` for whatever step actually needs to touch the GPU-object
-APIs above.
+every `parallelFor()` worker. A worker (or the IO thread itself) doing
+I/O-adjacent work still finishes by calling `postToMain()` for whatever
+step actually needs to touch the GPU-object APIs above.
+
+`runOnWorkerThread()` [Phase 4 Stage 1 Task 15] is a THIRD variant of the
+same handoff shape, for CPU-heavy work (async-import decode/transcode)
+that must run off both the main thread and the dedicated IO thread at
+once — see "Pinned-task dispatch" immediately below for the mechanism and
+exactly why it exists.
+
+## Pinned-task dispatch: persistent tasks, not per-submission ones
+
+[Phase 4 Stage 1 Task 15, fix round 1 — CRITICAL fix, TSAN-confirmed]
+`runOnIoThread()` and `runOnWorkerThread()` do **not** create a new
+enkiTS task per call. Exactly two `enki::IPinnedTask` objects exist for
+this Scheduler's entire lifetime — one pinned to the dedicated IO thread,
+one pinned to a second dedicated "worker task lane" thread — each
+allocated once at `Scheduler::create()` and freed only in `~Scheduler()`,
+strictly after `WaitforAllAndShutdown()` returns. Both permanently loop,
+draining their own `ClosureQueue` (a plain `std::mutex` +
+`std::condition_variable`-guarded FIFO of `std::function<void()>`,
+the same shape as this file's own pre-existing `postToMain()`/
+`pumpMain()` queue) and invoking each closure directly, same-thread, one
+at a time — `runOnIoThread(fn)`/`runOnWorkerThread(fn)` just push `fn`
+onto the relevant queue and return; nothing is ever registered with
+enkiTS per submission, and nothing per-submission is ever reclaimed,
+reaped, or freed by anyone.
+
+**Why this exists (the bug it replaces):** the original design (Task 2's
+own `IoTask`, later reused for Task 15's `runOnWorkerThread()`) allocated
+one `enki::IPinnedTask` per submission and tried to safely `delete` it
+once "done". Both gates tried (first `isPublished()` alone, Task 2's own
+F1 fix; then `isPublished() && GetIsComplete()`, an interim Task 15 fix)
+are provably unsafe: verified directly against the vendored enkiTS v1.12
+source, `TaskScheduler::RunPinnedTasks(threadNum_, priority_)` does
+`Execute(); m_RunningCount.fetch_sub(...); TaskComplete(pTask_, ...)` —
+and `TaskComplete()` keeps reading/writing `pTask_` (`m_WaitingForTaskCount`,
+`m_pDependents`, a redundant `m_RunningCount` store) for several more
+instructions *after* the `fetch_sub` that makes `GetIsComplete()` observe
+`true`. A reaper thread gated on that signal can delete the object while
+the executing thread is still inside `TaskComplete()` — a genuine
+use-after-free, 100% reproducible under `-fsanitize=thread` by an
+adversarial construct→burst-submit→destroy churn harness
+(`rx_task/tests/scheduler_test.cpp`'s own permanent
+`PinnedTaskChurnTest`-shaped `TEST_CASE`) — see `task-15-report.md`'s
+fix-round-1 section for the full before/after TSAN evidence, including
+confirmation the SAME race class already existed, at comparable density,
+in the pre-Task-15 `runOnIoThread()`-only design (base commit, this
+repository's own Stage 0 work) — inherited, not introduced.
+
+**Why the fix is structurally different, not a fourth gate:** no
+per-object signal read from a *different* thread can ever safely answer
+"has enkiTS fully finished touching this object" mid-lifetime — every
+signal enkiTS's own pinned-task machinery exposes (`GetIsComplete()`, our
+own `isPublished()`) can observe "looks done" strictly *before*
+`TaskComplete()`'s own tail actually finishes. The only race-free signal
+enkiTS provides at all is `WaitforAllAndShutdown()` itself — a *global*
+barrier, not a per-object poll. Eliminating per-submission enkiTS tasks
+entirely (persistent loop + our own mutex-guarded queue) sidesteps the
+question altogether: a closure's only "objects" are its own captured
+state and the local `std::function` holding it, both destroyed on the
+SAME thread that invoked them, by ordinary RAII — nothing else ever
+touches them, so there is no completion signal to get right or wrong.
+
+**Manual TSAN verification procedure** [Stage 0 audit precedent,
+task-2-report.md]: this is a genuine data-race class, not something
+ASan/UBSan can catch (ASan's redzone/quarantine poisoning is routinely
+defeated by fast allocator reuse under churn; TSAN's own happens-before
+tracking is not). To re-verify by hand:
+
+```sh
+# Compile scheduler.cpp + scheduler_test.cpp + doctest_main.cpp with
+# -fsanitize=thread (swap in for the normal -O2 -DNDEBUG flags; keep
+# everything else -- include paths, defines -- identical to a normal
+# linux-native compile_commands.json entry for these three files), link
+# against the existing non-instrumented rx_core/spdlog/glm/Tracy/enkiTS
+# static libraries (TSAN's runtime intercepts pthread/atomics process-wide
+# regardless of which translation units were instrumented), then:
+TSAN_OPTIONS="halt_on_error=0" ./rx_task_tests_tsan
+```
+
+Run at least 10 times. Categorize every `WARNING: ThreadSanitizer` report
+by its stack frames: anything whose frames are entirely inside
+`enki::TaskSet`/`Scheduler::parallelFor`/`AddTaskSetToPipe`/`WaitforTask`
+(the `parallelFor()` publish path) or
+`ClosureQueueLoopTask::Execute`/`AddPinnedTask`/`RunPinnedTasks`/
+`WaitForNewPinnedTasks` (the two persistent loop tasks' own one-time
+registration at construction) is the known, pre-existing enkiTS-internal
+publish-synchronization noise class this section's own "why the fix is
+structurally different" paragraph already accounts for (confirmed, not
+assumed: build the exact base-commit `scheduler.cpp`/`scheduler_test.cpp`
+under the identical TSAN flags and observe the same two categories at
+comparable density). A report whose frames instead touch `ClosureQueue`'s
+own methods (`push`/`waitAndDrain`/`requestShutdown`) — or anything else
+outside those two known categories — is a genuine regression and blocks
+the change that introduced it.
 
 ## Every new public header carries a one-line thread-affinity note
 
