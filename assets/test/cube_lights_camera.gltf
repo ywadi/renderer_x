@@ -1,0 +1,140 @@
+{
+  "asset": {
+    "version": "2.0",
+    "generator": "rx_asset hand-authored lights+camera test fixture (Task 13)"
+  },
+  "extensionsUsed": [
+    "KHR_lights_punctual"
+  ],
+  "extensions": {
+    "KHR_lights_punctual": {
+      "lights": [
+        {
+          "type": "directional",
+          "color": [
+            1.0,
+            0.9,
+            0.8
+          ],
+          "intensity": 3.0,
+          "name": "sun"
+        },
+        {
+          "type": "point",
+          "color": [
+            1.0,
+            0.0,
+            0.0
+          ],
+          "intensity": 500.0,
+          "range": 10.0,
+          "name": "point0"
+        },
+        {
+          "type": "spot",
+          "color": [
+            0.0,
+            1.0,
+            0.0
+          ],
+          "intensity": 200.0,
+          "range": 5.0,
+          "name": "spot0",
+          "spot": {
+            "innerConeAngle": 0.2,
+            "outerConeAngle": 0.6
+          }
+        }
+      ]
+    }
+  },
+  "scene": 0,
+  "scenes": [
+    {
+      "nodes": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "camera": 0,
+      "translation": [
+        0,
+        0,
+        5
+      ],
+      "name": "persp_cam_infinite"
+    },
+    {
+      "camera": 1,
+      "translation": [
+        0,
+        5,
+        0
+      ],
+      "name": "ortho_cam"
+    },
+    {
+      "translation": [
+        1,
+        1,
+        1
+      ],
+      "extensions": {
+        "KHR_lights_punctual": {
+          "light": 0
+        }
+      },
+      "name": "sun_node"
+    },
+    {
+      "translation": [
+        2,
+        2,
+        2
+      ],
+      "extensions": {
+        "KHR_lights_punctual": {
+          "light": 1
+        }
+      },
+      "name": "point_node"
+    },
+    {
+      "translation": [
+        3,
+        3,
+        3
+      ],
+      "extensions": {
+        "KHR_lights_punctual": {
+          "light": 2
+        }
+      },
+      "name": "spot_node"
+    }
+  ],
+  "cameras": [
+    {
+      "type": "perspective",
+      "perspective": {
+        "yfov": 0.8,
+        "znear": 0.1
+      }
+    },
+    {
+      "type": "orthographic",
+      "orthographic": {
+        "xmag": 2.0,
+        "ymag": 2.0,
+        "znear": 0.1,
+        "zfar": 100.0
+      }
+    }
+  ]
+}

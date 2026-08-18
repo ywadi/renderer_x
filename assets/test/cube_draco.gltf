@@ -1,0 +1,20 @@
+{
+  "asset": {"version": "2.0", "generator": "rx_asset gen_gltf_compression_fixtures (Task 13, Draco v1.5.7 real encode)"},
+  "extensionsUsed": ["KHR_draco_mesh_compression"],
+  "extensionsRequired": ["KHR_draco_mesh_compression"],
+  "scene": 0,
+  "scenes": [{"nodes": [0]}],
+  "nodes": [{"mesh": 0, "name": "draco_quad"}],
+  "meshes": [{"name": "quad", "primitives": [{
+    "attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2}, "indices": 3, "mode": 4,
+    "extensions": {"KHR_draco_mesh_compression": {"bufferView": 0, "attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2}}}
+  }]}],
+  "accessors": [
+    {"componentType": 5126, "count": 4, "type": "VEC3", "min": [0,0,0], "max": [1,1,0]},
+    {"componentType": 5126, "count": 4, "type": "VEC3"},
+    {"componentType": 5126, "count": 4, "type": "VEC2"},
+    {"componentType": 5125, "count": 6, "type": "SCALAR"}
+  ],
+  "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 169}],
+  "buffers": [{"uri": "cube_draco.bin", "byteLength": 169}]
+}

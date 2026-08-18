@@ -7,3 +7,9 @@ build-*/
 .claude/
 rendererx-samples-*.zip
 ctest-results-*.xml
+
+# Phase 4 Stage 1 Task 13: tools/fetch_assets.sh downloads Khronos
+# glTF-Sample-Assets test content (DamagedHelmet mandatory, Sponza
+# --sponza-only) here -- never committed (D16), fetched/checksum-verified
+# on demand for local/CI testing only.
+assets/fetched/

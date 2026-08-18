@@ -36,3 +36,43 @@ add_test(NAME rx_asset_tests COMMAND rx_asset_tests --validate)
 # Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
 # (windows-cross Wine hang, run 31512073559).
 set_tests_properties(rx_asset_tests PROPERTIES TIMEOUT 300)
+
+# ---------------------------------------------------------------------
+# Phase 4 Stage 1 Task 13 -- glTF import (spec D7/D11/D12/D16, gate
+# matrix-issue02). Two binaries, mirroring rx_graph's device-free/GPU
+# split (src/rx_graph/tests/CMakeLists.txt):
+#
+#   rx_asset_gltf_tests (device-free): gltf_pipeline.h's per-primitive
+#   CPU pipeline, mikktspace_bridge.h, byte_source.h -- none of these
+#   need a GPU or even fastgltf itself (see gltf_pipeline_test.cpp's own
+#   comment). Links straight against meshoptimizer::meshoptimizer for
+#   its own independent position-only-weld comparison.
+#
+#   rx_asset_gltf_gpu_tests: the fastgltf-aware end-to-end path
+#   (Registry::importGltf -> GeometryPool::upload), which cannot be
+#   device-free -- every successful import ends in a real GPU upload.
+#   Needs rx_task (Scheduler, D5's internal-parallelism requirement) in
+#   addition to geometry_pool_test.cpp's own fixture dependencies.
+# ---------------------------------------------------------------------
+add_executable(rx_asset_gltf_tests
+    doctest_main_devicefree.cpp
+    gltf_pipeline_test.cpp
+)
+target_include_directories(rx_asset_gltf_tests PRIVATE ..)
+target_link_libraries(rx_asset_gltf_tests PRIVATE rx_asset meshoptimizer::meshoptimizer doctest::doctest)
+add_test(NAME rx_asset_gltf_tests COMMAND rx_asset_gltf_tests)
+set_tests_properties(rx_asset_gltf_tests PROPERTIES TIMEOUT 120)
+
+add_executable(rx_asset_gltf_gpu_tests
+    doctest_main_gltf_gpu.cpp
+    import_gltf_gpu_test.cpp
+    damaged_helmet_test.cpp
+)
+target_include_directories(rx_asset_gltf_gpu_tests PRIVATE ..)
+target_link_libraries(rx_asset_gltf_gpu_tests PRIVATE rx_asset rx_rhi_vk rx_platform rx_task fastgltf::fastgltf doctest::doctest)
+target_compile_definitions(rx_asset_gltf_gpu_tests PRIVATE
+    RX_ASSET_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    RX_ASSET_ROOT_DIR="${CMAKE_SOURCE_DIR}"
+)
+add_test(NAME rx_asset_gltf_gpu_tests COMMAND rx_asset_gltf_gpu_tests --validate)
+set_tests_properties(rx_asset_gltf_gpu_tests PROPERTIES TIMEOUT 300)

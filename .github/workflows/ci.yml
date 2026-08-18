@@ -122,6 +122,22 @@ jobs:
           path: third_party/slang-prebuilt
           key: slang-prebuilt-linux-native-${{ hashFiles('tools/fetch_slang.cmake') }}
 
+      # Phase 4 Stage 1 Task 13 [spec D16]: DamagedHelmet is the
+      # mandatory glTF import gate asset (rx_asset_gltf_gpu_tests'
+      # damaged_helmet_test.cpp) -- cached exactly like Slang above
+      # (tools/fetch_assets.sh's own versioned marker file makes a
+      # version bump self-invalidating). Sponza is intentionally never
+      # fetched here (--sponza is a local-only flag this workflow never
+      # passes, per D16).
+      - name: Cache fetched test assets (DamagedHelmet)
+        uses: actions/cache@v5
+        with:
+          path: assets/fetched
+          key: fetched-assets-damagedhelmet-${{ hashFiles('tools/fetch_assets.sh') }}
+
+      - name: Fetch test assets (DamagedHelmet)
+        run: tools/fetch_assets.sh
+
       # Unlike the Slang cache above, this key is job-specific
       # (deps-cache-linux-native-..., not shared with windows-cross-zig):
       # DepCache.cmake's own cache key already includes the target triple
@@ -318,6 +334,20 @@ jobs:
         with:
           path: third_party/slang-prebuilt
           key: slang-prebuilt-windows-cross-zig-${{ hashFiles('tools/fetch_slang.cmake') }}
+
+      # Phase 4 Stage 1 Task 13: rx_asset_gltf_gpu_tests (including
+      # damaged_helmet_test.cpp) is not in this job's GPU-test exclusion
+      # list below (same posture as the pre-existing rx_asset_tests) --
+      # see the linux-native job's identically-worded step for the full
+      # rationale.
+      - name: Cache fetched test assets (DamagedHelmet)
+        uses: actions/cache@v5
+        with:
+          path: assets/fetched
+          key: fetched-assets-damagedhelmet-${{ hashFiles('tools/fetch_assets.sh') }}
+
+      - name: Fetch test assets (DamagedHelmet)
+        run: tools/fetch_assets.sh
 
       - name: Cache third-party dependency builds
         uses: actions/cache@v5

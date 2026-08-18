@@ -96,6 +96,9 @@ add_subdirectory(src/rx_graph)
 add_subdirectory(src/rx_material)
 add_subdirectory(tools/dep_cache_smoketest)
 add_subdirectory(tools/toolchain_check)
+# Phase 4 Stage 1 Task 13: host-only fixture regenerator (assets/test/
+# cube_meshopt.*/cube_draco.*) -- see its own CMakeLists.txt comment.
+add_subdirectory(tools/gen_gltf_compression_fixtures)
 add_subdirectory(samples/01_triangle)
 add_subdirectory(samples/02_hotreload)
 add_subdirectory(samples/03_bindless_mesh)
