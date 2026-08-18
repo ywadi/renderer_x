@@ -746,6 +746,24 @@ ImportResult importGltfPipeline(Registry& registry, std::span<const std::byte> d
         // before this task.
         const auto fillRef = [&](TextureRef& ref, const fastgltf::TextureInfo* info, TextureRole role) {
             if (info == nullptr) {
+                // [D11] UNBOUND slot -- the source material carries no
+                // texture reference for this role AT ALL (`ref.present`
+                // stays false, unchanged from its default -- a consumer
+                // is expected to check that first). Still points
+                // `ref.handle` at the role-appropriate UTILITY texture
+                // (never the checkerboard -- matrix's own "a magenta
+                // normal map would shade garbage" reasoning) rather than
+                // leaving it at an invalid default: a shader that always
+                // samples every slot (D26.1's per-draw-addressing,
+                // branchless pattern -- multiply the sampled value by the
+                // slot's own factor, texture*factor==factor when the
+                // texture is neutral) needs a resolvable handle here
+                // regardless of whether every future consumer remembers
+                // to special-case `!present` itself. No-op when no
+                // TextureCache was supplied (nothing to resolve against).
+                if (textures != nullptr) {
+                    ref.handle = textures->fallbackHandle(role);
+                }
                 return;
             }
             ref.present = true;

@@ -147,6 +147,50 @@ TEST_CASE("Registry::importGltf with textures=nullptr (Task 13's original, still
     const MaterialAsset& material = registry.material(result.materials[0]);
     REQUIRE(material.baseColorTexture.present);
     CHECK(material.baseColorTexture.handle == registry.fallbackTextureHandle());
+}
+
+TEST_CASE("Registry::importGltf with a real TextureCache: UNBOUND material slots (no texture reference in "
+          "the source file at all, distinct from a present-but-failed one) resolve to the role-appropriate "
+          "D11 UTILITY texture -- flat-normal for the normal slot, never the checkerboard -- even though "
+          "TextureRef::present correctly stays false [D11, matrix's own 'a magenta normal map would shade "
+          "garbage' reasoning]") {
+    auto fixture = makeFixture("rx_asset_unbound_slots");
+    if (!fixture.has_value()) {
+        return;
+    }
+    attachDependents(*fixture);
+
+    Registry registry;
+    // cube_textured.gltf [Task 13's own fixture]: pbrMetallicRoughness
+    // carries factors only -- baseColorTexture/metallicRoughnessTexture/
+    // normalTexture/occlusionTexture/emissiveTexture are ALL absent from
+    // the source JSON, exercising every one of the 5 TextureRef slots'
+    // unbound path in one import.
+    ImportResult result = registry.importGltf(testAssetDir() + "/cube_textured.gltf", *fixture->pool,
+                                                *fixture->scheduler, fixture->textures.get());
+    REQUIRE(result.ok());
+    REQUIRE(result.materials.size() == 1);
+
+    const MaterialAsset& material = registry.material(result.materials[0]);
+
+    CHECK_FALSE(material.baseColorTexture.present);
+    CHECK(material.baseColorTexture.handle == fixture->textures->fallbackHandle(TextureRole::BaseColor));
+
+    CHECK_FALSE(material.normalTexture.present);
+    CHECK(material.normalTexture.handle == fixture->textures->fallbackHandle(TextureRole::Normal));
+    // The flat-normal handle is NEVER the checkerboard.
+    CHECK_FALSE(material.normalTexture.handle == fixture->textures->checkerboardHandle());
+
+    CHECK_FALSE(material.metallicRoughnessTexture.present);
+    CHECK(material.metallicRoughnessTexture.handle == fixture->textures->fallbackHandle(TextureRole::MetallicRoughness));
+
+    CHECK_FALSE(material.occlusionTexture.present);
+    CHECK(material.occlusionTexture.handle == fixture->textures->fallbackHandle(TextureRole::Occlusion));
+
+    CHECK_FALSE(material.emissiveTexture.present);
+    CHECK(material.emissiveTexture.handle == fixture->textures->fallbackHandle(TextureRole::Emissive));
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
 
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
