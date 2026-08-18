@@ -54,6 +54,21 @@ public:
         return &slots_[handle.index()].value;
     }
 
+    // Const counterpart of get() above -- added for read-mostly registry
+    // patterns (e.g. rx::asset::Registry, Phase 4 Stage 1 Task 13) whose
+    // own public accessors are themselves const (a registry lookup does
+    // not conceptually mutate the registry). Identical liveness/generation
+    // semantics to the mutable overload; duplicating isLive()'s tiny body
+    // here rather than const_cast'ing through the mutable overload keeps
+    // both trivially inlinable and avoids any const-correctness sleight of
+    // hand.
+    const T* get(Handle<Tag> handle) const {
+        if (!isLive(handle)) {
+            return nullptr;
+        }
+        return &slots_[handle.index()].value;
+    }
+
 private:
     struct Slot {
         T value;

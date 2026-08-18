@@ -408,3 +408,273 @@ if(RX_TRACY)
     # directory) to link.
     set_target_properties(Tracy::TracyClient PROPERTIES IMPORTED_GLOBAL TRUE)
 endif()
+
+# ---------------------------------------------------------------------------
+# Phase 4 Stage 1 Task 13 -- glTF import: fastgltf + meshoptimizer +
+# MikkTSpace + Draco (spec D7, gate matrix-issue02 as amended by
+# gate/rulings-2026-08-18.md §#2). Gate ruling #2 CONFIRMED matrix Conflict
+# C1: contrary to the plan's original text, none of these were vendored
+# before this task -- `third_party/CMakeLists.txt` up to this point
+# enumerates spdlog/doctest/glm/Vulkan-Headers/SDL3/volk/VMA/stb/
+# vk-bootstrap/enkiTS/Tracy only.
+
+# fastgltf: the glTF 2.0 parser [spec D7 -- "5-7x faster than cgltf, full
+# KHR extension surface"]. MIT license (LICENSE.md: "Copyright (c) 2022 -
+# 2025 Sean Apeler", verified directly at the pinned tag). Pinned v0.9.0
+# (2025-07-08 -- current latest tag; no v0.10 exists as of this task, gate
+# matrix C7). Exports a real CMake package (fastgltf-config.cmake via
+# `install(EXPORT fastgltf-targets ... NAMESPACE fastgltf::)`, verified
+# directly against the pinned tag's CMakeLists.txt) -- routed through the
+# dep-cache like spdlog/SDL3/Vulkan-Headers/vk-bootstrap/enkiTS/Tracy
+# above, not hand-vendored as loose source.
+#
+# FASTGLTF_COMPILE_AS_CPP20=ON [gate matrix row 1, BINDING]: this repo is
+# C++20 throughout (root CMakeLists.txt: CMAKE_CXX_STANDARD 20); fastgltf
+# defaults to C++17 (`cxx_std_17` via its own FASTGLTF_COMPILE_TARGET
+# variable) unless this option is set, in which case
+# target_compile_features(fastgltf PUBLIC cxx_std_20) is used instead --
+# verified directly against the pinned tag's top-level CMakeLists.txt.
+# FASTGLTF_ENABLE_TESTS/EXAMPLES/DOCS=OFF: this project never builds
+# fastgltf's own Catch2 test suite or GL/GLFW-based example viewer.
+# FASTGLTF_ENABLE_DEPRECATED_EXT=OFF (fastgltf's own default -- set
+# explicitly here per gate matrix §2B's Archived-extensions row: "Build
+# fastgltf with the deprecated gate OFF" -- KHR_materials_pbrSpecularGlossiness
+# and friends hit the generic unknown-extension logging path instead of a
+# silently-parsed struct).
+#
+# EMBEDDED SIMDJSON (Apache-2.0) -- NOT a separate vendoring step: fastgltf
+# has no `simdjson::simdjson` target visible at its own configure time (it
+# is built in total isolation by rx_add_cached_dependency's own `cmake -S
+# -B` subprocess, see DepCache.cmake), so its own `cmake/dependencies.cmake`
+# (verified directly against the pinned tag) takes its embedded-copy
+# fallback path: `file(DOWNLOAD ...)` fetches simdjson's single-header
+# amalgamation (simdjson.h/simdjson.cpp) directly from
+# `raw.githubusercontent.com/simdjson/simdjson/v3.12.3/singleheader/` --
+# note SIMDJSON_TARGET_VERSION="3.12.3" is hardcoded in fastgltf v0.9.0's
+# own dependencies.cmake, so this is pinned transitively through the
+# fastgltf pin above, not a separate moving target this project tracks --
+# and compiles it straight into the `fastgltf` target
+# (fastgltf_add_source_directory). simdjson is Apache License 2.0 (see
+# https://github.com/simdjson/simdjson/blob/v3.12.3/LICENSE, verified
+# directly) -- recorded here per the gate ruling's "+ embedded simdjson
+# license" requirement. Both licenses (fastgltf MIT + simdjson Apache-2.0)
+# apply to the resulting `fastgltf::fastgltf` static library this project
+# links.
+# TOOLCHAIN FIX [this task, verified directly against the zig-bundled
+# Clang 21.1.0 both presets' zig-cxx-* wrappers invoke -- see
+# cmake/zig-wrappers/zig-cxx-linux: even "linux-native" compiles through
+# `zig c++ -target x86_64-linux-gnu`, not the system compiler]: a plain
+# `cmake --build` of this dependency fails to compile TWO unrelated
+# always_inline/target-attribute mismatches under this Clang version,
+# neither fixable without patching vendored source (this project's
+# dep-cache has no patch step, and neither is worth adding one for):
+#   1. simdjson v3.12.3's "icelake" (AVX-512) kernel marks its per-function
+#      `__attribute__((target("avx512f,avx512bw,avx512vbmi2,...")))` regions
+#      without the separate "evex512" feature LLVM now tracks independently
+#      (added between the LLVM version simdjson 3.12.3 targeted and
+#      Clang 21) -- always_inline AVX-512 intrinsics inside those regions
+#      fail to compile ("requires target feature 'evex512'... compiled
+#      without support for 'evex512'"). Fixed by
+#      `-DSIMDJSON_IMPLEMENTATION_ICELAKE=0` (simdjson's own documented
+#      opt-out, simdjson.h:9452 `#ifndef` guard verified directly) --
+#      simdjson still runtime-dispatches to its haswell(AVX2)/westmere
+#      (SSE4.2)/fallback kernels, all of which compile and run cleanly.
+#      Zero correctness impact, and no measured performance impact on any
+#      hardware this project targets: neither desktop CI/dev machines nor
+#      the Steam Deck's Zen 2 APU expose AVX-512 at all, so the icelake
+#      kernel would never be SELECTED at runtime on this project's actual
+#      hardware floor even if it did compile.
+#   2. fastgltf.cpp's own `sse_crc32c` (src/fastgltf.cpp, verified
+#      directly) is marked `[[gnu::target("sse4.2")]]` and calls
+#      always_inline `_mm_crc32_u32`/`_mm_crc32_u16`/`_mm_crc32_u8`, which
+#      Clang's own intrinsic headers mark as requiring the SEPARATE
+#      "crc32" target feature -- this Clang version does not imply crc32
+#      from sse4.2 within a function `target()` attribute string (real
+#      Intel silicon bundles both, but LLVM models them as independent
+#      feature bits). Per Clang's own documented semantics, a per-function
+#      `target()` attribute is ADDITIVE to the translation unit's
+#      command-line baseline features, so passing `-mcrc32` as an ordinary
+#      compile flag (harmless on any x86_64 target regardless of runtime
+#      support -- this only affects what the COMPILER is willing to
+#      generate, and `sse_crc32c` is itself only ever CALLED after an
+#      explicit `sse4::supported_by_runtime_system()` runtime check,
+#      verified directly in fastgltf.cpp's `initialiseCrc()`) gives every
+#      `target("sse4.2")`-attributed function crc32 too, resolving the
+#      mismatch with no source patch.
+# Both flags apply to every file the fastgltf sub-build compiles
+# (simdjson.cpp + fastgltf's own .cpp files); harmless everywhere the
+# specific macro/feature does not apply.
+set(RX_FASTGLTF_TAG "v0.9.0")
+rx_add_cached_dependency(
+  NAME fastgltf
+  REPO https://github.com/spnda/fastgltf.git
+  TAG ${RX_FASTGLTF_TAG}
+  CMAKE_ARGS -DFASTGLTF_COMPILE_AS_CPP20=ON -DFASTGLTF_ENABLE_TESTS=OFF -DFASTGLTF_ENABLE_EXAMPLES=OFF
+             -DFASTGLTF_ENABLE_DOCS=OFF -DFASTGLTF_ENABLE_DEPRECATED_EXT=OFF
+             "-DCMAKE_CXX_FLAGS=-mcrc32 -DSIMDJSON_IMPLEMENTATION_ICELAKE=0"
+             "-DCMAKE_C_FLAGS=-mcrc32 -DSIMDJSON_IMPLEMENTATION_ICELAKE=0"
+)
+find_package(fastgltf CONFIG REQUIRED PATHS "${fastgltf_CACHE_DIR}" NO_DEFAULT_PATH)
+
+# Same CMake 3.22 limitation as every other cached dependency above:
+# promote to global scope for src/rx_asset (a sibling directory) to link.
+set_target_properties(fastgltf::fastgltf PROPERTIES IMPORTED_GLOBAL TRUE)
+
+# meshoptimizer: mesh optimization (remap/cache/overdraw/fetch, spec D7)
+# AND the decode side of EXT_meshopt_compression (gate matrix §2C) -- ONE
+# dependency serves both. MIT license (LICENSE.md, verified directly).
+# Pinned v1.2 (2026-06-30 per the GitHub API, verified directly -- gate
+# matrix Conflicts C1/C7: the plan's "already vendored" claim was false,
+# and an in-repo research file's stale June-2024 date must not be
+# propagated). NOT header-only (gate matrix row 7): `src/meshoptimizer.h` +
+# 20 `.cpp` files. Exports a real CMake package
+# (`install(EXPORT meshoptimizerTargets ... NAMESPACE meshoptimizer::)`,
+# verified directly) -- routed through the dep-cache like fastgltf above.
+#
+# MESHOPT_BUILD_GLTFPACK=OFF: gltfpack (meshoptimizer's own CLI, gate
+# matrix's cited fixture-generation precedent) additionally pulls in the
+# Binomial Basis Universal texture encoder as a source-only dependency
+# (`gltf/README.md`'s own build instructions; `gltf/CMakeLists.txt`'s
+# `BASISU_PATH` handling) purely to encode KHR_texture_basisu textures --
+# irrelevant to this task (Task 14 owns textures) and an avoidable extra
+# transitive dependency to cross-compile through zig for zero decode-path
+# benefit. This task's fixtures that need meshoptimizer-encoded buffers
+# (EXT_meshopt_compression) are instead generated by
+# `tools/gen_meshopt_fixture.cpp`, a small host tool linked directly
+# against this SAME `meshoptimizer::meshoptimizer` target and calling its
+# real `meshopt_encodeVertexBuffer`/`meshopt_encodeIndexBuffer`/
+# `meshopt_encodeFilterOct` functions -- i.e. the identical codec gltfpack
+# itself calls, without gltfpack's own CLI or its Basis Universal
+# dependency. See that tool's own header comment and
+# `tools/fetch_assets.sh` for the documented invocation this substitutes
+# for a gltfpack call. MESHOPT_BUILD_DEMO=OFF: this project never builds
+# meshoptimizer's own SDL2-based demo viewer.
+set(RX_MESHOPTIMIZER_TAG "v1.2")
+rx_add_cached_dependency(
+  NAME meshoptimizer
+  REPO https://github.com/zeux/meshoptimizer.git
+  TAG ${RX_MESHOPTIMIZER_TAG}
+  CMAKE_ARGS -DMESHOPT_BUILD_DEMO=OFF -DMESHOPT_BUILD_GLTFPACK=OFF -DMESHOPT_BUILD_SHARED_LIBS=OFF
+)
+find_package(meshoptimizer CONFIG REQUIRED PATHS "${meshoptimizer_CACHE_DIR}" NO_DEFAULT_PATH)
+set_target_properties(meshoptimizer::meshoptimizer PROPERTIES IMPORTED_GLOBAL TRUE)
+
+# MikkTSpace: the reference tangent-space generator [spec D7/G2 -- "the
+# industry-standard reference implementation"]. NO TAGS OR RELEASES EXIST
+# in github.com/mmikk/MikkTSpace (verified directly: `git ls-remote --tags`
+# returns nothing; last commit 2020-03-25) and there is no LICENSE file --
+# the license is a zlib-style grant embedded ONLY in the header's own
+# comment block (mikktspace.h, verified directly against the pinned
+# commit):
+#
+#   "Copyright (C) 2011 by Morten S. Mikkelsen
+#
+#    This software is provided 'as-is', without any express or implied
+#    warranty. In no event will the authors be held liable for any damages
+#    arising from the use of this software.
+#
+#    Permission is granted to anyone to use this software for any purpose,
+#    including commercial applications, and to alter it and redistribute it
+#    freely, subject to the following restrictions:
+#
+#    1. The origin of this software must not be misrepresented; you must
+#       not claim that you wrote the original software. If you use this
+#       software in a product, an acknowledgment in the product
+#       documentation would be appreciated but is not required.
+#    2. Altered source versions must be plainly marked as such, and must
+#       not be misrepresented as being the original software.
+#    3. This notice may not be removed or altered from any source
+#       distribution."
+#
+# Pinned at commit `3e895b49d05ea07e4c2133156cfa94369e19e409` (`master`
+# HEAD as of this task's vendoring, verified directly via
+# `git ls-remote https://github.com/mmikk/MikkTSpace.git HEAD`) -- a
+# commit hash, not a tag, since none exists (gate matrix row 5). No
+# CMakeLists.txt exists in this repo either (it is two loose files,
+# mikktspace.h/mikktspace.c, "designed to be stand-alone... copied and
+# used as is into any tool" per the header's own doc comment) -- fetched
+# source-only via FetchContent_Populate, exactly like volk/VMA/stb above,
+# and compiled directly into src/rx_asset (see src/rx_asset/CMakeLists.txt)
+# rather than through the dep-cache, matching this project's own
+# established "no CMakeLists -> compile straight into the consumer"
+# convention.
+set(RX_MIKKTSPACE_COMMIT "3e895b49d05ea07e4c2133156cfa94369e19e409")
+FetchContent_Declare(mikktspace
+  GIT_REPOSITORY https://github.com/mmikk/MikkTSpace.git
+  GIT_TAG ${RX_MIKKTSPACE_COMMIT})
+FetchContent_GetProperties(mikktspace)
+if(NOT mikktspace_POPULATED)
+  FetchContent_Populate(mikktspace)
+endif()
+# Same CMake 3.22 sibling-scope reason as volk/VMA/stb above: propagate to
+# root scope for src/rx_asset (a sibling directory) to locate
+# mikktspace.c/mikktspace.h.
+set(mikktspace_SOURCE_DIR "${mikktspace_SOURCE_DIR}" PARENT_SCOPE)
+
+# Draco: KHR_draco_mesh_compression decode [gate matrix §2B -- fastgltf
+# parses only the extension's metadata, "does NOT decode... zero draco::
+# calls in fastgltf.cpp"]. Apache License 2.0 (LICENSE, verified
+# directly). Pinned v1.5.7 (github.com/google/draco's newest tag as of
+# this task, verified via `git ls-remote --tags`). Exports a real CMake
+# package (`draco-config.cmake` via `cmake/draco_install.cmake`'s
+# `configure_package_config_file`/`install(EXPORT dracoExport ...
+# NAMESPACE draco::)`, verified directly) -- routed through the dep-cache
+# like fastgltf/meshoptimizer above. The internal library target Draco's
+# own CMakeLists.txt builds on a non-MSVC compiler (both this project's
+# presets: native GCC on linux-native, zig's bundled Clang/LLD on
+# windows-cross-zig) is named `draco_static`, but the INSTALLED/EXPORTED
+# imported target is `draco::draco` regardless -- verified directly
+# against this task's own build output (`draco-targets.cmake`'s
+# `add_library(draco::draco STATIC IMPORTED)`): Draco's export machinery
+# renames the target via its `EXPORT_NAME` property at install time, so
+# `draco::draco` is the correct (and only) name to link against on every
+# toolchain here, not `draco::draco_static`.
+#
+# DRACO_GLTF_BITSTREAM=ON [gate matrix row 9, BINDING]: "restricts feature
+# set to the glTF Draco profile" -- verified directly against
+# cmake/draco_options.cmake's `draco_set_optional_features()`: this flag
+# enables ONLY DRACO_MESH_COMPRESSION_SUPPORTED/
+# DRACO_NORMAL_ENCODING_SUPPORTED/DRACO_STANDARD_EDGEBREAKER_SUPPORTED --
+# no point-cloud compression, no predictive edgebreaker, no attribute
+# deduplication -- exactly glTF's own Draco profile, nothing broader.
+# DRACO_TESTS=OFF (already Draco's own default; set explicitly for
+# documentation) disables Draco's gtest suite. DRACO_TRANSCODER_SUPPORTED=OFF
+# (already default) keeps the eigen/tinygltf transcoder dependency chain
+# out entirely -- verified directly: `Decoder::DecodeMeshFromBuffer` (the
+# only Draco API this task calls, decode.h) needs neither.
+# DRACO_UNITY_PLUGIN/DRACO_MAYA_PLUGIN/DRACO_JS_GLUE/DRACO_WASM=OFF: this
+# project links none of Draco's engine-integration plugin targets.
+#
+# NO DECODE-ONLY BUILD OPTION EXISTS [gate matrix row 9, verified directly
+# against the full `draco_options.cmake` option list above]: Draco's
+# `draco_static` library target unconditionally contains BOTH encoder and
+# decoder object code, and its `draco_decoder`/`draco_encoder` CLI
+# executables (cmake/../CMakeLists.txt's `draco_add_executable(NAME
+# draco_decoder ...)` / `draco_encoder`) build with no guarding option at
+# all -- they exist inside Draco's OWN dep-cache subbuild only (never
+# installed into anything this project's own targets reference or ship;
+# `draco_install.cmake` installs them as loose binaries this project's
+# `find_package(draco ...)` never looks at). The accepted mitigation (gate
+# ruling #2) is dead-stripping the unused ENCODER half out of this
+# project's OWN linked binaries: `-ffunction-sections -fdata-sections`
+# passed to Draco's own compile (via CMAKE_CXX_FLAGS/CMAKE_C_FLAGS below,
+# since Draco's own cmake/draco_flags.cmake sets neither, verified
+# directly) gives every function/global its own linker section, and
+# src/rx_asset/CMakeLists.txt applies `-Wl,--gc-sections` PUBLICLY (so it
+# reaches every executable that transitively links rx_asset -- gc-sections
+# only prunes anything at a real executable/shared-library link step, not
+# a static-library archive step) -- the measured binary-size delta this
+# produces is recorded in the task report.
+set(RX_DRACO_TAG "1.5.7")
+rx_add_cached_dependency(
+  NAME draco
+  REPO https://github.com/google/draco.git
+  TAG ${RX_DRACO_TAG}
+  CMAKE_ARGS -DDRACO_GLTF_BITSTREAM=ON -DDRACO_TESTS=OFF -DDRACO_TRANSCODER_SUPPORTED=OFF
+             -DDRACO_UNITY_PLUGIN=OFF -DDRACO_MAYA_PLUGIN=OFF -DDRACO_JS_GLUE=OFF -DDRACO_WASM=OFF
+             -DBUILD_SHARED_LIBS=OFF
+             "-DCMAKE_CXX_FLAGS=-ffunction-sections -fdata-sections"
+             "-DCMAKE_C_FLAGS=-ffunction-sections -fdata-sections"
+)
+find_package(draco CONFIG REQUIRED PATHS "${draco_CACHE_DIR}" NO_DEFAULT_PATH)
+set_target_properties(draco::draco PROPERTIES IMPORTED_GLOBAL TRUE)
