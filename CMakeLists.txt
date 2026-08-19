@@ -106,3 +106,7 @@ add_subdirectory(samples/04_streaming)
 add_subdirectory(samples/05_multipass)
 add_subdirectory(samples/06_materials)
 add_subdirectory(samples/07_stress)
+# samples/common: D17's reusable reference-PNG gate -- add_subdirectory'd
+# before 08_gltf_viewer (the first sample to link it).
+add_subdirectory(samples/common)
+add_subdirectory(samples/08_gltf_viewer)
