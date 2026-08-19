@@ -6,6 +6,45 @@
 
 namespace rx::rhi {
 
+class DeletionQueue;
+
+namespace detail {
+
+// [Phase 4 Task 23, gate ruling #29] Test-only seam -- NOT part of the
+// stable public contract, mirroring rx::graph::detail::debugChunkStats()/
+// rx::scene::detail::capacitiesForTesting()'s own carve-out convention.
+// Returns `queue`'s own private Item-vector `.capacity()` as of the moment
+// it is called -- pendingCount() above only exposes `.size()`, which the
+// zero-alloc regression proof for onFrameFenceSignaled()'s in-place
+// compaction needs to distinguish from actual reallocation.
+[[nodiscard]] size_t itemCapacityForTesting(const DeletionQueue& queue);
+
+// [Phase 4 Task 23] `queue`'s own private Item-vector `.data()` pointer, as
+// an opaque `const void*` (identity comparison only -- the pointed-to
+// `Item` type is private to DeletionQueue, so no caller outside this class
+// could dereference it anyway). A REAL, EMPIRICALLY VERIFIED limitation of
+// `itemCapacityForTesting()` alone this task's own revert-probe found: for
+// a queue whose pending-item COUNT is identical every call (this test's own
+// steady-state shape), a buggy "build a fresh vector every call" version
+// reserves/ends up at the exact SAME final capacity every time too (a
+// from-empty `reserve(n)`/vector-of-size-n allocates EXACTLY capacity n,
+// with no extra headroom to differ by) -- capacity alone cannot distinguish
+// "genuinely reused storage" from "freshly reconstructed to an identical
+// final size," so pointer identity is checked ALONGSIDE capacity as a
+// second, independent signal (matching rx_scene::DrawListBuilder's own
+// zero-alloc test precedent, draw_list_test.cpp, which checks both for the
+// identical reason -- "capacity equality and .data() pointer identity are
+// both checked... but neither is sufficient on its own"). Still not
+// airtight on its own either (a freed-then-immediately-reallocated
+// same-size block can legitimately land on the same address under some
+// allocators/workloads) -- see this task's own report for the full,
+// honest accounting of what this combined signal can and cannot prove
+// without the global operator-new interposition the gate ruling bars for
+// this binary's own volk/validation-layer linkage.
+[[nodiscard]] const void* itemDataForTesting(const DeletionQueue& queue);
+
+}  // namespace detail
+
 // Fence-gated deferred-destruction queue [spec Fixed decision #9]. A
 // resource retired while it might still be referenced by an in-flight
 // command buffer must not actually be destroyed until the GPU has
@@ -117,6 +156,9 @@ public:
     size_t pendingCount() const { return items_.size(); }
 
 private:
+    friend size_t detail::itemCapacityForTesting(const DeletionQueue&);
+    friend const void* detail::itemDataForTesting(const DeletionQueue&);
+
     struct Item {
         uint64_t frameIndex = 0;
         std::function<void()> destructor;

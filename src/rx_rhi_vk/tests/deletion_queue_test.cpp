@@ -90,6 +90,72 @@ TEST_CASE("DeletionQueue::flushAll runs every pending destructor regardless of f
     CHECK(count == 2);
 }
 
+// [Phase 4 Task 23, gate ruling #29 -- "the pending-item test variant is
+// mandatory"] onFrameFenceSignaled()'s OWN fast path (items_.empty() ->
+// return) is trivially zero-alloc and proves nothing about the real fix --
+// this test deliberately keeps something pending across EVERY single call,
+// the realistic "steady state" for a scene with in-flight deferred
+// resource retirement (streaming/hot-reload workloads), exercising the
+// in-place compaction path itself. Same bound methodology as Task 23's
+// rx_graph zero-alloc test (capacity-snapshot via a test-only accessor,
+// not global operator-new interposition -- this binary links Vulkan/volk
+// too, via rx_rhi_vk, so the same linkage-risk reasoning applies).
+TEST_CASE("DeletionQueue::onFrameFenceSignaled compacts items_ IN PLACE -- capacity never grows once something "
+          "stays pending across many repeated calls [Task 23]") {
+    rx::rhi::DeletionQueue queue;
+    constexpr int kSlots = 2;
+    int destroyCount = 0;
+
+    // Warm-up: same frame-in-flight-style retire/signal cadence
+    // rx_graph's Executor itself drives this queue with (retire tagged at
+    // the current tick, signal `kSlots` ticks behind) -- settles into a
+    // steady "exactly kSlots items always pending" shape and lets items_'s
+    // own capacity reach its peak.
+    for (int i = 0; i < kSlots * 4; ++i) {
+        queue.retire([&destroyCount] { ++destroyCount; }, static_cast<uint64_t>(i));
+        if (i >= kSlots) {
+            queue.onFrameFenceSignaled(static_cast<uint64_t>(i - kSlots));
+        }
+    }
+    REQUIRE(queue.pendingCount() == static_cast<size_t>(kSlots));
+    CHECK(destroyCount == kSlots * 4 - kSlots);
+
+    const size_t peakCapacity = rx::rhi::detail::itemCapacityForTesting(queue);
+    REQUIRE(peakCapacity > 0);
+    // Second, independent signal alongside capacity -- see
+    // itemDataForTesting()'s own doc comment (deletion_queue.h) for why
+    // capacity ALONE is empirically insufficient here: this task's own
+    // revert-probe found that a buggy "fresh vector every call" version
+    // reaches this exact same STABLE capacity too, once the pending-item
+    // COUNT itself is steady (a from-empty reserve(n) allocates capacity
+    // == n exactly, with no headroom to differ by) -- pointer identity
+    // catches what capacity alone provably cannot in that scenario.
+    const void* peakData = rx::rhi::detail::itemDataForTesting(queue);
+    // Never empty at the top of any of these calls -- genuinely exercising
+    // the compaction path itself, never onFrameFenceSignaled()'s own
+    // separate items_.empty() fast return.
+    REQUIRE(queue.pendingCount() > 0);
+
+    constexpr int kSteadyIterations = 30;
+    const int baseI = kSlots * 4;
+    for (int step = 0; step < kSteadyIterations; ++step) {
+        const int i = baseI + step;
+        REQUIRE_FALSE(queue.pendingCount() == 0);
+        queue.retire([&destroyCount] { ++destroyCount; }, static_cast<uint64_t>(i));
+        queue.onFrameFenceSignaled(static_cast<uint64_t>(i - kSlots));
+
+        INFO("step=", step);
+        CHECK(rx::rhi::detail::itemCapacityForTesting(queue) == peakCapacity);
+        CHECK(rx::rhi::detail::itemDataForTesting(queue) == peakData);
+        CHECK(queue.pendingCount() == static_cast<size_t>(kSlots));
+    }
+
+    // Drain the remaining kSlots pending items so the destructor's own
+    // "destroyed with items never flushed" RX_LOG_ERROR guard stays quiet.
+    queue.flushAll();
+    CHECK(destroyCount == kSlots * 4 + kSteadyIterations);
+}
+
 namespace {
 
 // Pure headless fixture -- no window/surface/swapchain -- matching
