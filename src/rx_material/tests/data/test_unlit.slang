@@ -59,10 +59,20 @@ struct Unlit : IMaterialShader {
         // interpolated data, so the compiler cannot prove it away) does
         // not. The `1e-4` terms are numerically negligible for any normal
         // input -- this material's actual color is still tint-driven.
+        //
+        // [Phase 4 Task 16] Extended to the four fields MaterialVertex
+        // gained (tangent, lightDirWorld, lightColor, ambientColor) --
+        // same dead-code-elimination-avoidance rationale, now covering
+        // every field forward_entry.slang's vertexMain writes.
         float4 tint = gParams.tint;
         tint.x += v.worldPos.x * 1e-4;
         tint.y += v.normal.y * 1e-4;
         tint.z += v.uv.x * 1e-4;
+        tint.w += v.tangent.x * 1e-4;
+        tint.x += v.lightDirWorld.x * 1e-4;
+        tint.y += v.lightColor.x * 1e-4;
+        tint.z += v.ambientColor.x * 1e-4;
+        tint.w += v.cameraPosWorld.x * 1e-4;
         return tint;
     }
 };

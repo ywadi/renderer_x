@@ -48,7 +48,11 @@ using MaterialHandle = rx::core::Handle<struct MaterialTag>;
 // specialization axis bits. `getPipeline()` derives the actual cache key
 // from `material`'s own content hash (not the handle's index/generation,
 // which is process-local and meaningless across a hot-reload rebuild) +
-// `pass.hash()` + `specializationBits` verbatim.
+// `pass.hash()` + `specializationBits` verbatim + (D28, below) the
+// material's own OWN fixed-function state, read from its MaterialRecord --
+// PipelineRequest ITSELF gains no new field for this: see D28's own
+// comment on AlphaMode/MaterialFixedFunctionState just below for why the
+// fixed-function axis lives on the loaded material, not on this request.
 struct PipelineRequest {
     MaterialHandle material;
     PassSignature pass;
@@ -58,6 +62,51 @@ struct PipelineRequest {
     // always 0 in Phase 3's material core, but already part of the cache
     // key so a future axis doesn't need an ABI/cache-format break.
     uint32_t specializationBits = 0;
+};
+
+// --- D28 (gate ruling RC1, 2026-08-18): the fixed-function pipeline-state
+// axis -----------------------------------------------------------------
+// glTF's `alphaMode`/`doubleSided` are `VkPipeline` FIXED-FUNCTION fields
+// (blend enable, depth-write enable, cull mode) with zero SPIR-V
+// representation -- NOT specialization constants (the plan's earlier
+// "specialization bits gain alphaMode/doubleSided axes" phrasing is
+// corrected by D22/D28/this gate ruling). This is the reusable mechanism
+// future fixed-function-state needs (wireframe, stencil effects, ...)
+// extends: a loaded material (MaterialRecord, material_system.cpp) carries
+// this state, and it is folded into getPipeline()'s own pipeline-variant
+// cache key alongside the module's content hash/pass hash/specialization
+// bits -- so two materials built from the byte-identical .slang module but
+// different AlphaMode/doubleSided values are two independent MaterialHandles
+// (two loadMaterial() calls -- see the AlphaMode-taking overload below) that
+// yield two independently-cached VkPipelines. `PipelineRequest` above is
+// deliberately UNCHANGED: the state travels with the MaterialHandle, not
+// the per-getPipeline()-call request, matching how the module's own content
+// hash already travels with the handle rather than being passed at every
+// getPipeline() call site.
+//
+// MASK's `alphaCutoff` is explicitly NOT part of this fixed-function state
+// (it has no VkPipeline representation at all): it is an ordinary
+// per-instance TParams uniform (ParameterBlock<TParams> gParams, D6/D8),
+// read by an ALWAYS-PRESENT conditional discard in a material's own
+// fragment shader code -- the same shader code path runs for every
+// AlphaMode; only the DATA differs (OPAQUE/BLEND materials are expected to
+// bind a cutoff of 0.0, which never trips the discard since alpha is never
+// negative -- see standard_pbr.slang's own header comment). This keeps the
+// discard branch itself out of MaterialSystem/D28 entirely.
+enum class AlphaMode : uint8_t { Opaque, Mask, Blend };
+
+// The fixed-function state D28 attaches to a loaded material. Default
+// value (Opaque, single-sided) is BYTE-IDENTICAL to every getPipeline()
+// call's pre-D28 hardcoded behavior (`material_system.cpp`'s old fixed
+// `blendEnable=VK_FALSE`/`depthWriteEnable=hasDepth`/
+// `cullMode=VK_CULL_MODE_BACK_BIT` literals) -- so every existing
+// loadMaterial() call site (test fixtures, sample 06, the public ABI
+// bridge) that does not pass one keeps behaving exactly as before.
+struct MaterialFixedFunctionState {
+    AlphaMode alphaMode = AlphaMode::Opaque;
+    bool doubleSided = false;
+
+    bool operator==(const MaterialFixedFunctionState&) const = default;
 };
 
 // A generational handle into MaterialSystem's own internal texture
@@ -235,7 +284,23 @@ public:
     // it is not the one rx_shader::reflect() itself relies on for an
     // ordinary flat resource global); or a
     // PipelineLayoutBuilder::build()/vkCreateShaderModule failure.
-    MaterialHandle loadMaterial(const std::filesystem::path& slangModulePath);
+    //
+    // [D28] `fixedFunctionState` is attached to the returned handle's own
+    // MaterialRecord verbatim and folded into every subsequent
+    // getPipeline() call's cache key for this handle (see
+    // MaterialFixedFunctionState's own comment above) -- it is NOT
+    // reflected from the module, so two loadMaterial() calls against the
+    // SAME `slangModulePath` bytes with two different
+    // MaterialFixedFunctionState values are two fully independent
+    // MaterialHandles (independent MaterialRecords, independent
+    // getPipeline() cache entries), by design: this is exactly how one
+    // shared StandardPBR module backs many glTF materials that differ only
+    // in alphaMode/doubleSided (each becomes its own loadMaterial() call).
+    // Defaults to `MaterialFixedFunctionState{}` (Opaque, single-sided) --
+    // see that struct's own comment for why this preserves every existing
+    // call site's behavior byte-for-byte.
+    MaterialHandle loadMaterial(const std::filesystem::path& slangModulePath,
+                                 MaterialFixedFunctionState fixedFunctionState = {});
 
     // Content hash of `handle`'s module source bytes, as loaded --
     // FNV-1a-64, matching pass_signature.h's own algorithm choice for the
@@ -255,20 +320,34 @@ public:
     // of caller error.
     [[nodiscard]] uint64_t moduleHash(MaterialHandle handle) const;
 
+    // [D28] `handle`'s own fixed-function state, exactly as passed to the
+    // loadMaterial() call that produced it -- the value getPipeline() folds
+    // into that handle's pipeline-variant cache key. Throws
+    // std::out_of_range for an invalid/unknown `handle`.
+    [[nodiscard]] MaterialFixedFunctionState fixedFunctionState(MaterialHandle handle) const;
+
     // Lazily compiles (builds a real VkPipeline from `req.material`'s
     // already-linked SPIR-V; never re-invokes Slang -- see
     // detail::debugCompileCount()'s own comment) and caches one
     // `VkPipeline` per unique (material content hash, pass signature hash,
-    // specializationBits) key [D7]; a repeated call with an
-    // already-cached key returns the same handle immediately. Every
-    // VkPipeline this creates uses fixed rasterization/multisample/
-    // blend/depth-stencil state (opaque, back-face culling with
-    // counter-clockwise front-face, depth test+write enabled iff
-    // `req.pass.depthFormat != VK_FORMAT_UNDEFINED`) and the fixed
-    // position/normal/uv vertex-input layout forward_entry.slang's own
-    // header comment documents -- there are no other fixed-function axes
-    // for a Phase 3 material pipeline to vary on, so none of that state is
-    // itself part of the cache key.
+    // specializationBits, [D28] fixed-function state) key [D7, D28]; a
+    // repeated call with an already-cached key returns the same handle
+    // immediately. Every VkPipeline this creates uses fixed rasterization/
+    // multisample/depth-compare state (back-face culling with
+    // counter-clockwise front-face UNLESS `req.material`'s own
+    // MaterialFixedFunctionState::doubleSided is true, in which case
+    // VK_CULL_MODE_NONE; depth test enabled iff `req.pass.depthFormat !=
+    // VK_FORMAT_UNDEFINED`, depth WRITE additionally gated on
+    // `fixedFunctionState.alphaMode != AlphaMode::Blend` per D22's own
+    // "BLEND: blending on, depth-write off, cull off" text -- doubleSided
+    // and BLEND's cull-off are independent axes that happen to compose:
+    // a double-sided BLEND material is still cull-none either way) and the
+    // fixed position/normal/tangent/uv vertex-input layout forward_entry.
+    // slang's own header comment documents -- blend state (blendEnable +
+    // standard source-alpha/one-minus-source-alpha factors) is the fourth
+    // D28 axis, enabled iff `alphaMode == AlphaMode::Blend`. See D28's own
+    // header comment (material_system.h) for why none of this is part of
+    // `PipelineRequest` itself.
     //
     // Throws std::out_of_range for an invalid/unknown `req.material`.
     // Throws std::runtime_error if `req.pass` declares neither a color nor

@@ -192,9 +192,21 @@ bool isDocumentedResult(RxResult result) {
 constexpr uint32_t kQuadrantProbeExtent = 64;
 constexpr VkFormat kQuadrantProbeColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
 
+// [Phase 4 Task 16, D8] Grew by one field (`tangent`, float4, w =
+// handedness) to match forward_entry.slang's own updated vertexMain
+// parameter list / material_system.cpp's own updated MaterialVertexLayout
+// (48 bytes, position+normal+tangent+uv) -- a stride mismatch here would
+// make the GPU read garbage position/normal/uv data (this test's own
+// original 32-byte layout, uploaded against the new 48-byte-stride pipeline
+// vertex-input state, IS exactly what broke this test when the D8 tangent
+// field first landed: bytes past the third vertex's `uv` silently became
+// the fourth vertex's `position`, etc.). The tangent value itself is inert
+// for this test (a flat-shaded checkerboard-sampling quad, no normal
+// mapping) -- an arbitrary, valid unit tangent (+X, handedness +1).
 struct QuadTestVertex {
     float position[3];
     float normal[3];
+    float tangent[4];
     float uv[2];
 };
 
@@ -321,10 +333,10 @@ std::optional<QuadrantPixels> renderQuadAndReadbackQuadrants(rx::rhi::Device& de
     // THAT sample's own Y-flipped-projection setup, not this transform-free
     // one.
     constexpr std::array<QuadTestVertex, 4> kVertices{{
-        {{-1.0F, -1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 0.0F}},  // A: top-left
-        {{1.0F, -1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 0.0F}},   // B: top-right
-        {{1.0F, 1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 1.0F}},    // C: bottom-right
-        {{-1.0F, 1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F}},   // D: bottom-left
+        {{-1.0F, -1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 0.0F, 0.0F, 1.0F}, {0.0F, 0.0F}},  // A: top-left
+        {{1.0F, -1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 0.0F, 0.0F, 1.0F}, {1.0F, 0.0F}},   // B: top-right
+        {{1.0F, 1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 0.0F, 0.0F, 1.0F}, {1.0F, 1.0F}},    // C: bottom-right
+        {{-1.0F, 1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 0.0F, 0.0F, 1.0F}, {0.0F, 1.0F}},   // D: bottom-left
     }};
     constexpr std::array<uint32_t, 6> kIndices{0, 2, 1, 0, 3, 2};
 
@@ -1009,6 +1021,11 @@ struct Unlit : IMaterialShader {
         tint.x += v.worldPos.x * 1e-4;
         tint.y += v.normal.y * 1e-4;
         tint.z += v.uv.x * 1e-4;
+        tint.w += v.tangent.x * 1e-4;
+        tint.x += v.lightDirWorld.x * 1e-4;
+        tint.y += v.lightColor.x * 1e-4;
+        tint.z += v.ambientColor.x * 1e-4;
+        tint.w += v.cameraPosWorld.x * 1e-4;
         return tint;
     }
 };
@@ -1043,6 +1060,11 @@ struct Unlit : IMaterialShader {
         tint.x += v.worldPos.x * 1e-4;
         tint.y += v.normal.y * 1e-4;
         tint.z += v.uv.x * 1e-4;
+        tint.w += v.tangent.x * 1e-4;
+        tint.x += v.lightDirWorld.x * 1e-4;
+        tint.y += v.lightColor.x * 1e-4;
+        tint.z += v.ambientColor.x * 1e-4;
+        tint.w += v.cameraPosWorld.x * 1e-4;
         return tint;
     }
 };
@@ -1219,6 +1241,11 @@ struct TexturedSample : IMaterialShader {
         float4 sampled = rx_sampleTexture(gParams.albedoIndex, v.uv);
         sampled.x += v.worldPos.x * 1e-6;
         sampled.y += v.normal.y * 1e-6;
+        sampled.z += v.tangent.x * 1e-6;
+        sampled.w += v.lightDirWorld.x * 1e-6;
+        sampled.x += v.lightColor.x * 1e-6;
+        sampled.y += v.ambientColor.x * 1e-6;
+        sampled.z += v.cameraPosWorld.x * 1e-6;
         return sampled;
     }
 };
@@ -1237,6 +1264,11 @@ struct TexturedSample : IMaterialShader {
         float4 sampled = rx_sampleTexture(gParams.albedoIndex, v.uv);
         sampled.x += v.worldPos.x * 1e-6;
         sampled.y += v.normal.y * 1e-6;
+        sampled.z += v.tangent.x * 1e-6;
+        sampled.w += v.lightDirWorld.x * 1e-6;
+        sampled.x += v.lightColor.x * 1e-6;
+        sampled.y += v.ambientColor.x * 1e-6;
+        sampled.z += v.cameraPosWorld.x * 1e-6;
         sampled.z += 0.0;
         return sampled;
     }

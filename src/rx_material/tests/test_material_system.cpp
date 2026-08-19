@@ -1,4 +1,5 @@
 #include <doctest/doctest.h>
+#include <rx_material/draw_data.h>
 #include <rx_material/material_system.h>
 #include <rx_platform/window.h>
 #include <rx_rhi_vk/bindless.h>
@@ -85,7 +86,13 @@ std::optional<MaterialTestFixture> makeFixture(const char* title) {
     rx::rhi::BindlessTable::Capacities capacities;
     capacities.sampledImages = 4;
     capacities.samplers = 2;
-    capacities.storageBuffers = 1;
+    // [Phase 4 Task 16, D26.1] MaterialSystem::create() itself now
+    // registers ONE storage buffer (its own default per-draw
+    // DrawDataGpu row -- Impl::defaultDrawDataBuffer's own comment) before
+    // any test gets a chance to register one of its own -- bumped from 1 so
+    // a D26.1 test building its own real per-draw buffer still has a free
+    // slot.
+    capacities.storageBuffers = 2;
     auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
     REQUIRE(bindless.has_value());
 
@@ -139,6 +146,14 @@ struct Unlit : IMaterialShader {
         tint.x += v.worldPos.x * 1e-4;
         tint.y += v.normal.y * 1e-4;
         tint.z += v.uv.x * 1e-4;
+        // [Phase 4 Task 16] Extended to tangent/lightDirWorld/lightColor/
+        // ambientColor -- same dead-code-elimination-avoidance rationale
+        // as the three original fields above.
+        tint.w += v.tangent.x * 1e-4;
+        tint.x += v.lightDirWorld.x * 1e-4;
+        tint.y += v.lightColor.x * 1e-4;
+        tint.z += v.ambientColor.x * 1e-4;
+        tint.w += v.cameraPosWorld.x * 1e-4;
         return tint;
     }
 };
@@ -162,6 +177,11 @@ struct Unlit : IMaterialShader {
         tint.x += v.worldPos.x * 1e-4;
         tint.y += v.normal.y * 1e-4;
         tint.z += v.uv.x * 1e-4;
+        tint.w += v.tangent.x * 1e-4;
+        tint.x += v.lightDirWorld.x * 1e-4;
+        tint.y += v.lightColor.x * 1e-4;
+        tint.z += v.ambientColor.x * 1e-4;
+        tint.w += v.cameraPosWorld.x * 1e-4;
         return tint;
     }
 };
@@ -355,7 +375,12 @@ TEST_CASE("MaterialSystem::loadMaterial reflects the set-1 parameter block and b
     CHECK(handle.isValid());
 
     const rx::shader::ShaderLayoutInfo& layout = system->layoutInfo(handle);
-    REQUIRE(layout.bindings.size() == 3);
+    // [Phase 4 Task 16, D26.1] grew from 3 to 4: material.slang's new
+    // `gDrawData` bindless storage-buffer array joins gParams/gTextures/
+    // gSamplers -- see this file's own header comment for why every
+    // material reflects all of material.slang's set-0 globals regardless
+    // of whether its own evaluate() touches them.
+    REQUIRE(layout.bindings.size() == 4);
 
     const auto& paramBlock = findBinding(layout, 1, 0);
     CHECK(paramBlock.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
@@ -370,10 +395,18 @@ TEST_CASE("MaterialSystem::loadMaterial reflects the set-1 parameter block and b
     CHECK(samplers.type == VK_DESCRIPTOR_TYPE_SAMPLER);
     CHECK(samplers.unboundedArray);
 
-    // [Task 4] gMaterialGlobals -- same "always present regardless of use"
-    // reasoning as the two bindings above.
+    // [Phase 4 Task 16, D26.1] gDrawData -- the new bindless per-draw
+    // StructuredBuffer<RxDrawData> array.
+    const auto& drawData = findBinding(layout, 0, rx::rhi::BindlessTable::kStorageBufferBinding);
+    CHECK(drawData.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+    CHECK(drawData.unboundedArray);
+
+    // [Task 4, Phase 4 Task 16] gMaterialGlobals -- same "always present
+    // regardless of use" reasoning as the three bindings above; grew from
+    // one `uint` to `rx::material::MaterialGlobalsPush`'s three scalar
+    // fields (D26.1's `drawDataBufferIndex` + sample 08's `exposure`).
     REQUIRE(layout.pushRanges.size() == 1);
-    CHECK(layout.pushRanges[0].size == sizeof(uint32_t));
+    CHECK(layout.pushRanges[0].size == sizeof(rx::material::MaterialGlobalsPush));
 
     CHECK(system->pipelineLayout(handle) != VK_NULL_HANDLE);
     CHECK_FALSE(fixture->context.hasValidationErrors());

@@ -18,10 +18,45 @@
 // `#language slang 2026`, so fields need their own explicit `public` too)
 // [Slang user guide, "Modules and Access Control" -- Access Control].
 
+// [Phase 4 Task 16, D8/D26.1] Gained `tangent` (the D8 pooled-vertex tangent
+// field, w = handedness -- see forward_entry.slang's own "VERTEX INPUT
+// LAYOUT" comment: this was a prerequisite normal mapping needs that no
+// earlier task's file list named) and the "lighting surface"
+// (`lightDirWorld`/`lightColor`/`ambientColor`) -- per-pass values resolved
+// once in forward_entry.slang's vertexMain (from the D26.1 bindless
+// DrawData row, see RxDrawData below) and carried through as plain
+// (constant-per-triangle, so interpolation is a no-op) fragment-stage
+// inputs, rather than re-fetched by every material's own evaluate(). This
+// mirrors shaders/multipass/lit.vert.slang's own established "per-pass
+// constant travels via the vertex-output struct" idiom.
+//
+// [D7/matrix-issue08 deferral] Deliberately NOT carrying a second UV set
+// (TEXCOORD_1) or a vertex-color (COLOR_0) field -- D7 defers both at
+// IMPORT time (log-don't-drop; the importer's own diagnostic is the
+// extension point), and this Phase-4 vertex format has nowhere to carry
+// them even if a material wanted to consume one (D8's pooled vertex layout
+// itself has no uv1/color0 attribute). This comment is the code-location a
+// future implementer adding either attribute needs to extend, matching
+// D13's own "code comment referencing the Stage-2 migration" precedent for
+// reversed-Z.
 public struct MaterialVertex {
     public float3 worldPos;
     public float3 normal;
+    public float4 tangent;   // xyz = tangent direction (world space), w = handedness sign (+-1).
     public float2 uv;
+    public float3 lightDirWorld;  // unit vector FROM the surface TOWARD the light.
+    public float3 lightColor;     // rgb = light color * intensity.
+    public float3 ambientColor;   // [FG1] interim flat ambient/environment term.
+
+    // [BRDF baseline] World-space camera/eye position -- the one piece of
+    // per-pass (not per-vertex) data StandardPBR's specular term genuinely
+    // needs and neither `worldPos` nor any field above supplies: Schlick
+    // Fresnel/GGX both need a view direction (`normalize(cameraPosWorld -
+    // worldPos)`), which cannot be reconstructed from `normal`/`worldPos`
+    // alone. Resolved once in vertexMain from the SAME RxDrawData row as
+    // lightDirWorld/lightColor/ambientColor above (see that struct's own
+    // `cameraPosWorld` field) and carried through identically.
+    public float3 cameraPosWorld;
 }
 
 // Every material module (e.g. a material's own .slang file, loaded via
@@ -124,12 +159,99 @@ SamplerState gSamplers[];
 // sampler/wrap-mode selection yet -- a real, supportable future case for a
 // material that genuinely wants tiling, not exercised by any test this
 // task writes, so not built speculatively here).
-struct RxMaterialGlobals {
-    uint defaultSamplerIndex;
+// --- D26.1 per-draw addressing [Phase 4 Task 16, gate ruling RC1/#8] -----
+// One bindless StructuredBuffer<RxDrawData> array at
+// BindlessTable::kStorageBufferBinding (binding 2, the SAME external set-0
+// slot every other bindless storage-buffer consumer in this engine already
+// uses -- shaders/stress/instanced.vert.slang's `gInstances`/shaders/
+// multipass/lit.vert.slang's `gTransforms` are the exact same shape, just
+// declared per-pass in THOSE samples' own shader files instead of here,
+// since neither of them shares an entry point with any other material the
+// way forward_entry.slang's vertexMain does). `gDrawData[bufferIndex][row]`
+// -- the OUTER index selects WHICH registered storage buffer (this
+// engine's `defaultSamplerIndex`-style "read the real registered bindless
+// index from a push constant, never assume slot 0" discipline --
+// rx_sampleTexture's own header comment explains why a hardcoded outer
+// index would be a landmine the instant two subsystems share one
+// BindlessTable instance); the INNER index is `SV_VulkanInstanceID`
+// (forward_entry.slang's vertexMain) -- NOT `SV_InstanceID`: Slang
+// SUBTRACTS `firstInstance` back out of `SV_InstanceID` to preserve
+// D3D-compatible semantics (verified against Slang's own SPIR-V-target
+// docs before relying on this -- gate matrix-issue08's own verified
+// finding), so an ordinary SV_InstanceID read would silently give a
+// per-draw-RELATIVE (always-0-on-a-single-draw) index instead of the
+// absolute row D26.1's bindless addressing requires. This is the
+// "never per-draw push constants" mechanism D26.1 mandates -- see
+// samples/07_stress/main.cpp's own `gPush.instanceIndex` for the anti-
+// pattern this replaces (a push-constant-carried per-draw INDEX). Field
+// layout mirrors `rx::material::DrawDataGpu`
+// (rx_material/include/rx_material/draw_data.h) EXACTLY -- see that
+// header's own comment for the cross-file drift risk and why both sides
+// must be edited together.
+// `public` on both the struct and the global is load-bearing here (unlike
+// gTextures/gSamplers/gMaterialGlobals below, which stayed module-internal
+// under the pre-Task-16 design since only THIS module's own
+// rx_sampleTexture() ever named them): forward_entry.slang's vertexMain
+// now reads `gDrawData`/`RxDrawData` BY NAME directly, from a DIFFERENT
+// Slang module -- Slang's access control defaults an unmodified top-level
+// declaration to `internal` (module-local) visibility, exactly the same
+// rule MaterialVertex/IMaterialShader's own header comment documents.
+public struct RxDrawData {
+    public float4x4 model;
+    public float4x4 normalMatrix;
+    public float4x4 viewProj;
+    public float4 lightDirWorld;
+    public float4 lightColor;
+    public float4 ambientColor;
+
+    // [BRDF baseline] World-space camera/eye position, xyz (w unused
+    // padding, matching every other vector field in this struct) --
+    // per-pass, repeated per row, same "simpler than a second bindless
+    // buffer" precedent as viewProj/light/ambient above. See
+    // MaterialVertex's own `cameraPosWorld` comment (this file, above) for
+    // why this is unavoidable: Fresnel/specular need a real view direction,
+    // not derivable from worldPos/normal alone.
+    public float4 cameraPosWorld;
+
+    public uint materialIndex;
+    public uint _pad0;
+    public uint _pad1;
+    public uint _pad2;
+}
+
+[[vk::binding(2, 0)]]
+public StructuredBuffer<RxDrawData> gDrawData[];
+
+// [Phase 4 Task 16] Gained `drawDataBufferIndex` (the D26.1 bindless
+// STORAGE BUFFER index -- see RxDrawData/gDrawData above) and `exposure`
+// (the sample 08 `--exposure` CLI flag's pre-tonemap `2^exposure`
+// multiplier, applied in forward_entry.slang's fragmentMain immediately
+// after a material's own evaluate() returns -- BEFORE the value ever
+// reaches the separate, UNTOUCHED shared tonemap pass; exposure=0.0 is the
+// neutral value, `2^0 == 1`, a byte-identical no-op regression guard for
+// every sample that does not care about exposure). Kept ALL-SCALAR
+// (uint/float only, no vector/matrix field) deliberately -- see
+// shaders/multipass/lit.vert.slang's own header comment for the
+// empirically-verified reason this project avoids vector/matrix fields
+// inside a push-constant block; every genuinely vector-shaped per-pass
+// value (viewProj, light/ambient) lives in RxDrawData above instead,
+// reached indirectly via `drawDataBufferIndex`. Field layout mirrors
+// `rx::material::MaterialGlobalsPush` (draw_data.h) EXACTLY.
+//
+// `public` is now load-bearing here too (grew from module-internal under
+// the pre-Task-16 design): forward_entry.slang's vertexMain/fragmentMain
+// both read `gMaterialGlobals` BY NAME directly now (`drawDataBufferIndex`,
+// `exposure`), not just indirectly through this module's own
+// rx_sampleTexture() -- same access-control rule as RxDrawData/gDrawData
+// above.
+public struct RxMaterialGlobals {
+    public uint defaultSamplerIndex;
+    public uint drawDataBufferIndex;
+    public float exposure;
 }
 
 [[vk::push_constant]]
-ConstantBuffer<RxMaterialGlobals> gMaterialGlobals;
+public ConstantBuffer<RxMaterialGlobals> gMaterialGlobals;
 
 // Public entry point every material's `evaluate()` calls to sample a
 // bindless-indexed texture (`gParams`'s own `uint` field, per this engine's

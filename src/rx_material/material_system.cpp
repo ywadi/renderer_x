@@ -4,6 +4,8 @@
 #include <rx_core/handle.h>
 #include <rx_core/log.h>
 #include <rx_core/profile.h>
+#include <rx_material/draw_data.h>
+#include <rx_rhi_vk/buffer.h>
 #include <rx_rhi_vk/deletion_queue.h>
 #include <rx_rhi_vk/device.h>
 #include <rx_rhi_vk/pipeline_layout.h>
@@ -121,21 +123,31 @@ constexpr VkShaderStageFlags kMaterialStageFlags = VK_SHADER_STAGE_VERTEX_BIT | 
 // forward_entry.slang's own "VERTEX INPUT LAYOUT" header comment for why
 // this is fixed here rather than derived from anything Phase 2 already
 // established (nothing in Phase 2 fixed one canonical host-side Vertex
-// layout across samples). position/normal float3, uv float2, tightly
-// packed, one interleaved binding -- matching that entry point's own
-// vertexMain(float3 position, float3 normal, float2 uv) parameter list
-// and the attribute locations Slang's SPIR-V backend assigns them
-// (verified directly via spirv-dis before writing this: locations 0/1/2
-// in declaration order -- see task-5-report.md).
+// layout across samples). [Phase 4 Task 16, D8] GREW BY ONE FIELD:
+// `tangent` (float4, w = handedness) -- position/normal/tangent/uv,
+// tightly packed, one interleaved binding, byte-identical to D8's pooled
+// vertex format (`rx::asset::PoolVertex`, geometry_pool.h -- see that
+// header's own `static_assert(sizeof(PoolVertex) == 48)`, matched here by
+// construction since both list the same four fields in the same order).
+// Matches forward_entry.slang's own
+// vertexMain(float3 position, float3 normal, float4 tangent, float2 uv,
+// uint instanceId) parameter list and the attribute locations Slang's
+// SPIR-V backend assigns them (verified directly via spirv-dis before
+// writing this for the original three-field layout -- see task-5-report.md;
+// locations remain declaration-order, 0/1/2/3, for the same reason with a
+// fourth field appended).
 struct MaterialVertexLayout {
     float position[3];
     float normal[3];
+    float tangent[4];
     float uv[2];
 };
+static_assert(sizeof(MaterialVertexLayout) == 48,
+              "MaterialVertexLayout must stay exactly 48 bytes -- must match rx::asset::PoolVertex (D8) byte-for-byte");
 
 struct VertexInputState {
     VkVertexInputBindingDescription binding{};
-    std::array<VkVertexInputAttributeDescription, 3> attributes{};
+    std::array<VkVertexInputAttributeDescription, 4> attributes{};
 };
 
 VertexInputState makeVertexInputState() {
@@ -156,8 +168,13 @@ VertexInputState makeVertexInputState() {
 
     state.attributes[2].location = 2;
     state.attributes[2].binding = 0;
-    state.attributes[2].format = VK_FORMAT_R32G32_SFLOAT;
-    state.attributes[2].offset = offsetof(MaterialVertexLayout, uv);
+    state.attributes[2].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    state.attributes[2].offset = offsetof(MaterialVertexLayout, tangent);
+
+    state.attributes[3].location = 3;
+    state.attributes[3].binding = 0;
+    state.attributes[3].format = VK_FORMAT_R32G32_SFLOAT;
+    state.attributes[3].offset = offsetof(MaterialVertexLayout, uv);
     return state;
 }
 
@@ -254,12 +271,17 @@ constexpr uint32_t kBindlessTextureArraySet = 0;
 // Classifies a `DescriptorTableSlot`-category top-level global's element
 // type -- mirrors rx_shader::reflect()'s own `mapElementType()` (same
 // shipped Slang build, same verified masking technique for
-// `SlangResourceShape`), narrowed to exactly the two shapes material.slang
+// `SlangResourceShape`), narrowed to exactly the shapes material.slang
 // declares (this file's own established discipline: reject anything this
 // task's test list does not exercise rather than generalize speculatively
 // -- see reflectMaterialLayout()'s own header comment on the identical
-// choice for the ParameterBlock walk).
-enum class BindlessArrayElementKind { SampledImageArray, SamplerArray, Other };
+// choice for the ParameterBlock walk). [Phase 4 Task 16, D26.1] gained
+// `StorageBufferArray` for material.slang's new `gDrawData` global
+// (`StructuredBuffer<RxDrawData>[]`, unbounded, at
+// BindlessTable::kStorageBufferBinding) -- SLANG_STRUCTURED_BUFFER is the
+// same base-shape masking technique the two pre-existing cases already use,
+// just a different `SlangResourceShape` value.
+enum class BindlessArrayElementKind { SampledImageArray, SamplerArray, StorageBufferArray, Other };
 
 BindlessArrayElementKind classifyBindlessArrayElement(slang::TypeReflection* elemType) {
     if (elemType == nullptr) {
@@ -274,6 +296,9 @@ BindlessArrayElementKind classifyBindlessArrayElement(slang::TypeReflection* ele
         bool combinedSampler = (shape & SLANG_TEXTURE_COMBINED_FLAG) != 0;
         if (baseShape == SLANG_TEXTURE_2D && !combinedSampler) {
             return BindlessArrayElementKind::SampledImageArray;
+        }
+        if (baseShape == SLANG_STRUCTURED_BUFFER) {
+            return BindlessArrayElementKind::StorageBufferArray;
         }
     }
     return BindlessArrayElementKind::Other;
@@ -375,6 +400,7 @@ std::optional<MaterialReflection> reflectMaterialLayout(slang::ProgramLayout* la
     bool foundParamBlock = false;
     bool foundTextureArray = false;
     bool foundSamplerArray = false;
+    bool foundDrawDataArray = false;
     bool foundMaterialGlobalsPushConstant = false;
 
     // [Task 4] Needed only by the DescriptorTableSlot branch below, for
@@ -498,6 +524,26 @@ std::optional<MaterialReflection> reflectMaterialLayout(slang::ProgramLayout* la
                 foundSamplerArray = true;
                 continue;
             }
+            // [Phase 4 Task 16, D26.1] material.slang's own `gDrawData`
+            // bindless storage-buffer array -- SAME "handled as optional,
+            // present for every material in practice" posture as
+            // gTextures/gSamplers above (forward_entry.slang's vertexMain
+            // reads it unconditionally, so every material composite pulls
+            // it in regardless of whether the material's own evaluate()
+            // ever touches it).
+            if (set == kBindlessTextureArraySet && bindingIndex == rx::rhi::BindlessTable::kStorageBufferBinding &&
+                kind == BindlessArrayElementKind::StorageBufferArray && unbounded && !foundDrawDataArray) {
+                rx::shader::ShaderLayoutInfo::Binding binding;
+                binding.set = set;
+                binding.binding = bindingIndex;
+                binding.count = 0;
+                binding.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                binding.stages = kMaterialStageFlags;
+                binding.unboundedArray = true;
+                result.shaderLayout.bindings.push_back(binding);
+                foundDrawDataArray = true;
+                continue;
+            }
 
             error = "material module '" + moduleLabel + "' declares an unsupported bindless global '" + name +
                     "' at set " + std::to_string(set) + " binding " + std::to_string(bindingIndex) +
@@ -505,7 +551,10 @@ std::optional<MaterialReflection> reflectMaterialLayout(slang::ProgramLayout* la
                     std::to_string(kBindlessTextureArraySet) + ", binding " +
                     std::to_string(rx::rhi::BindlessTable::kSampledImageBinding) +
                     "] / `gSamplers` [unbounded SamplerState[], set " + std::to_string(kBindlessTextureArraySet) +
-                    ", binding " + std::to_string(rx::rhi::BindlessTable::kSamplerBinding) + "] shape)";
+                    ", binding " + std::to_string(rx::rhi::BindlessTable::kSamplerBinding) +
+                    "] / `gDrawData` [unbounded StructuredBuffer<RxDrawData>[], set " +
+                    std::to_string(kBindlessTextureArraySet) + ", binding " +
+                    std::to_string(rx::rhi::BindlessTable::kStorageBufferBinding) + "] shape)";
             return std::nullopt;
         }
 
@@ -535,19 +584,29 @@ std::optional<MaterialReflection> reflectMaterialLayout(slang::ProgramLayout* la
                 elementLayout != nullptr ? elementLayout->getSize(slang::ParameterCategory::Uniform) : 0;
             size_t offset = param->getOffset(slang::ParameterCategory::PushConstantBuffer);
 
-            // bindInstance() (below) pushes exactly `sizeof(uint32_t)` bytes
-            // from a local `uint32_t` for this range -- a mismatch here
-            // would make that call read past the end of that local
-            // variable. RxMaterialGlobals declares exactly one `uint`
-            // field, so this is expected to hold always; reject loudly
-            // (rather than let vkCmdPushConstants silently over-read) if a
-            // future edit to material.slang's struct shape ever changes it
-            // without updating bindInstance() to match.
-            if (elementSize != sizeof(uint32_t)) {
+            // [Phase 4 Task 16] bindInstance() (below) pushes exactly
+            // `sizeof(rx::material::MaterialGlobalsPush)` bytes from a real
+            // local of that type for this range -- a mismatch here would
+            // make that call read past the end of that local. Reject loudly
+            // (rather than let vkCmdPushConstants silently over/under-read)
+            // if a future edit to material.slang's `RxMaterialGlobals`
+            // struct shape ever changes its Slang-reflected size without
+            // updating `rx::material::MaterialGlobalsPush` (draw_data.h) to
+            // match byte-for-byte -- see that header's own comment on why
+            // this drift risk is real and how both sides must move
+            // together. All-scalar (uint/uint/float, 12 bytes) is expected
+            // to reflect with zero padding, matching this project's own
+            // empirically-verified "plain scalar push-constant fields pack
+            // with zero padding" finding (shaders/multipass/lit.vert.slang's
+            // own header comment) -- but this check verifies that against
+            // the REAL shipped Slang build rather than assuming it, exactly
+            // like the pre-Task-16 single-`uint` version of this check did.
+            if (elementSize != sizeof(rx::material::MaterialGlobalsPush)) {
                 error = "material module '" + moduleLabel +
                         "' links against a `RxMaterialGlobals` whose reflected size is " +
                         std::to_string(elementSize) + " bytes; this engine's bindInstance() only knows how to "
-                        "push exactly " + std::to_string(sizeof(uint32_t)) + " bytes (one `uint`) for it";
+                        "push exactly " + std::to_string(sizeof(rx::material::MaterialGlobalsPush)) +
+                        " bytes (rx::material::MaterialGlobalsPush) for it";
                 return std::nullopt;
             }
 
@@ -578,10 +637,18 @@ std::optional<MaterialReflection> reflectMaterialLayout(slang::ProgramLayout* la
 }
 
 // --- Pipeline variant cache key ------------------------------------------
+// [D28, gate ruling RC1] `fixedFunctionState` joins the key alongside the
+// three pre-D28 axes -- two materials sharing an identical module content
+// hash, pass, and specialization bits but DIFFERENT AlphaMode/doubleSided
+// values (i.e. two loadMaterial() calls against the same .slang bytes with
+// two different MaterialFixedFunctionState arguments -- see that struct's
+// own header comment) must yield two independently-cached VkPipelines.
 struct PipelineKey {
     uint64_t moduleHash = 0;
     uint64_t passHash = 0;
     uint32_t specializationBits = 0;
+    AlphaMode alphaMode = AlphaMode::Opaque;
+    bool doubleSided = false;
 
     bool operator==(const PipelineKey&) const = default;
 };
@@ -592,6 +659,8 @@ struct PipelineKeyHash {
         fnv1aMix64(h, key.moduleHash);
         fnv1aMix64(h, key.passHash);
         fnv1aMix32(h, key.specializationBits);
+        fnv1aMix32(h, static_cast<uint32_t>(key.alphaMode));
+        fnv1aMix32(h, key.doubleSided ? 1U : 0U);
         return static_cast<size_t>(h);
     }
 };
@@ -610,6 +679,14 @@ struct PipelineKeyHash {
 struct MaterialRecord {
     std::filesystem::path path;
     uint64_t contentHash = 0;
+
+    // [Phase 4 Task 16, D28] The fixed-function pipeline-state axis this
+    // material's loadMaterial() call was given (default: Opaque,
+    // single-sided -- see MaterialFixedFunctionState's own header comment
+    // for why that default is byte-identical to this class's pre-D28
+    // hardcoded pipeline state). Read by getPipeline() below to build the
+    // PipelineKey and the real VkPipeline blend/depth-write/cull state.
+    MaterialFixedFunctionState fixedFunctionState;
 
     // [Task 7] Best-effort mtime baseline for reloadChanged()'s change
     // detection -- std::nullopt until the first successful stat (set at
@@ -747,6 +824,30 @@ struct MaterialSystem::Impl {
     // GPU object it tears down).
     VkSampler defaultSampler = VK_NULL_HANDLE;
     rx::rhi::BindlessHandle defaultSamplerHandle;
+
+    // [Phase 4 Task 16, D26.1] This MaterialSystem's own single default
+    // per-draw StructuredBuffer<RxDrawData> row (one identity-valued
+    // DrawDataGpu -- model/normalMatrix/viewProj all identity,
+    // light/ambient at neutral defaults) -- the SAME "process-wide default,
+    // real bindless index carried via a push constant" idiom
+    // `defaultSampler`/`defaultSamplerHandle` just above already
+    // establishes, applied to material.slang's OTHER always-present set-0
+    // global (`gDrawData`). Exists so bindInstance() below (the pre-D26.1
+    // legacy path 06/07's own test materials still use) can push a real,
+    // valid `drawDataBufferIndex` unconditionally -- forward_entry.slang's
+    // vertexMain now ALWAYS reads `gDrawData[...][SV_VulkanInstanceID]`,
+    // and every one of THOSE samples' draws has `firstInstance == 0`, so
+    // this one identity row is exactly what keeps their pre-existing
+    // CPU-pretransformed-position behavior byte-for-byte unchanged (see
+    // forward_entry.slang's own header comment). Host-visible + persistently
+    // mapped (Allocator::createHostVisibleBuffer()) -- written once, here,
+    // via a direct memcpy + flush(), never through the Uploader (a single
+    // 256-byte one-time setup write does not need staging-ring/ticket
+    // machinery). Released/destroyed in ~MaterialSystem(), same
+    // "vkDeviceWaitIdle() has already run, so an unconditional immediate
+    // teardown is safe" discipline as defaultSampler/defaultSamplerHandle.
+    std::optional<rx::rhi::Buffer> defaultDrawDataBuffer;
+    rx::rhi::BindlessHandle defaultDrawDataBufferHandle;
 
     // Fence-gated deferred destruction for VkPipeline (reloadChanged()'s
     // own retirements) and rx::rhi::Texture2D (releaseTexture()'s own) --
@@ -1168,6 +1269,19 @@ MaterialSystem::~MaterialSystem() {
     if (impl.defaultSamplerHandle.isValid()) {
         impl.bindless->release(impl.defaultSamplerHandle);
     }
+    // [Phase 4 Task 16, D26.1] Same discipline, same safety justification
+    // (vkDeviceWaitIdle() above), for the default draw-data buffer:
+    // `reset()` explicitly destroys the contained rx::rhi::Buffer HERE
+    // (vmaDestroyBuffer against its own stored VmaAllocator handle -- a
+    // Buffer is self-contained, unlike Texture2D, so this does not depend
+    // on `impl.allocator`'s own member-destruction order either way, but
+    // resetting explicitly here keeps every GPU-object teardown in this
+    // destructor visibly in one place rather than split between explicit
+    // and implicit).
+    if (impl.defaultDrawDataBufferHandle.isValid()) {
+        impl.bindless->release(impl.defaultDrawDataBufferHandle);
+    }
+    impl.defaultDrawDataBuffer.reset();
     if (impl.defaultSampler != VK_NULL_HANDLE) {
         vkDestroySampler(impl.device, impl.defaultSampler, nullptr);
     }
@@ -1369,6 +1483,31 @@ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device, 
         return nullptr;
     }
 
+    // [Phase 4 Task 16, D26.1] The default per-draw StructuredBuffer row --
+    // see Impl::defaultDrawDataBuffer's own comment for why this exists and
+    // why every field below is left at its identity/neutral default.
+    auto defaultDrawDataBuffer = allocator->createHostVisibleBuffer(
+        sizeof(DrawDataGpu), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
+    if (!defaultDrawDataBuffer.has_value()) {
+        RX_LOG_ERROR("rx_material: Allocator::createHostVisibleBuffer (default draw-data buffer) failed");
+        vkDestroySampler(device.device(), defaultSampler, nullptr);
+        vkDestroyPipelineCache(device.device(), pipelineCache, nullptr);
+        return nullptr;
+    }
+    {
+        DrawDataGpu identityRow{};
+        std::memcpy(defaultDrawDataBuffer->mappedData(), &identityRow, sizeof(identityRow));
+        defaultDrawDataBuffer->flush();
+    }
+    rx::rhi::BindlessHandle defaultDrawDataBufferHandle =
+        bindless.registerStorageBuffer(defaultDrawDataBuffer->handle(), sizeof(DrawDataGpu));
+    if (!defaultDrawDataBufferHandle.isValid()) {
+        RX_LOG_ERROR("rx_material: BindlessTable::registerStorageBuffer (default draw-data buffer) failed");
+        vkDestroySampler(device.device(), defaultSampler, nullptr);
+        vkDestroyPipelineCache(device.device(), pipelineCache, nullptr);
+        return nullptr;
+    }
+
     auto impl = std::make_unique<Impl>();
     impl->physicalDevice = device.physicalDevice();
     impl->device = device.device();
@@ -1386,11 +1525,14 @@ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device, 
     impl->paramArena = std::move(paramArena);
     impl->defaultSampler = defaultSampler;
     impl->defaultSamplerHandle = defaultSamplerHandle;
+    impl->defaultDrawDataBuffer = std::move(defaultDrawDataBuffer);
+    impl->defaultDrawDataBufferHandle = defaultDrawDataBufferHandle;
 
     return std::unique_ptr<MaterialSystem>(new MaterialSystem(std::move(impl)));
 }
 
-MaterialHandle MaterialSystem::loadMaterial(const std::filesystem::path& slangModulePath) {
+MaterialHandle MaterialSystem::loadMaterial(const std::filesystem::path& slangModulePath,
+                                             MaterialFixedFunctionState fixedFunctionState) {
     RX_ASSERT_MAIN_THREAD("MaterialSystem::loadMaterial");
     RX_ZONE;
     Impl& impl = *impl_;
@@ -1416,6 +1558,7 @@ MaterialHandle MaterialSystem::loadMaterial(const std::filesystem::path& slangMo
     MaterialRecord record;
     record.path = slangModulePath;
     record.contentHash = compiled->contentHash;
+    record.fixedFunctionState = fixedFunctionState;
     record.ownerSession = std::move(compiled->session);
     record.linkedProgram = std::move(compiled->linkedProgram);
     record.layoutInfo = std::move(compiled->layoutInfo);
@@ -1442,6 +1585,14 @@ uint64_t MaterialSystem::moduleHash(MaterialHandle handle) const {
         throw std::out_of_range("rx_material: MaterialSystem::moduleHash: invalid or stale MaterialHandle");
     }
     return record->contentHash;
+}
+
+MaterialFixedFunctionState MaterialSystem::fixedFunctionState(MaterialHandle handle) const {
+    MaterialRecord* record = impl_->materials.get(handle);
+    if (record == nullptr) {
+        throw std::out_of_range("rx_material: MaterialSystem::fixedFunctionState: invalid or stale MaterialHandle");
+    }
+    return record->fixedFunctionState;
 }
 
 VkPipelineLayout MaterialSystem::pipelineLayout(MaterialHandle handle) const {
@@ -1509,8 +1660,8 @@ void MaterialSystem::bindInstance(VkCommandBuffer cmd, const rx::graph::PassCont
     VkPipeline pipeline = getPipeline(req);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
-    // [Task 4] Guarded on the reflected layout actually declaring this
-    // push range -- true for every material in practice (see
+    // [Task 4, Phase 4 Task 16] Guarded on the reflected layout actually
+    // declaring this push range -- true for every material in practice (see
     // reflectMaterialLayout()'s own header comment), but this still checks
     // rather than assumes it: pushing unconditionally against a pipeline
     // layout that turned out to have NO matching VkPushConstantRange would
@@ -1518,14 +1669,24 @@ void MaterialSystem::bindInstance(VkCommandBuffer cmd, const rx::graph::PassCont
     // the bound layout), and this material's own reflected
     // `record->layoutInfo` is the authoritative source for whether that
     // range exists on THIS material's pipeline layout specifically -- not
-    // an assumption this function should hardcode. See material.slang's
-    // own header comment for why this value (not a fixed slot) is the real
-    // registered index of MaterialSystem's own default sampler.
+    // an assumption this function should hardcode. See material.slang's own
+    // header comment for why `defaultSamplerIndex` (not a fixed slot) is
+    // the real registered index of MaterialSystem's own default sampler,
+    // and Impl::defaultDrawDataBuffer's own comment for why
+    // `drawDataBufferIndex` here is always this instance's own DEFAULT
+    // (identity) row -- bindInstance() is the pre-D26.1 LEGACY path (06/07's
+    // own simple test materials); a real D26.1 caller (StandardPBR/Unlit,
+    // samples/08_gltf_viewer) drives its OWN real per-draw buffer and pushes
+    // this same push-constant range itself, never through this method.
+    // `exposure` stays 0.0 (neutral, `2^0 == 1`) here for the identical
+    // reason -- bindInstance() callers never asked for exposure control.
     if (!record->layoutInfo.pushRanges.empty()) {
         const rx::shader::ShaderLayoutInfo::PushRange& range = record->layoutInfo.pushRanges[0];
-        uint32_t defaultSamplerIndex = impl.defaultSamplerHandle.index();
-        vkCmdPushConstants(cmd, record->layoutBundle.layout, range.stages, range.offset, range.size,
-                            &defaultSamplerIndex);
+        MaterialGlobalsPush push;
+        push.defaultSamplerIndex = impl.defaultSamplerHandle.index();
+        push.drawDataBufferIndex = impl.defaultDrawDataBufferHandle.index();
+        push.exposure = 0.0F;
+        vkCmdPushConstants(cmd, record->layoutBundle.layout, range.stages, range.offset, range.size, &push);
     }
 
     if (record->layoutBundle.setLayouts.size() <= kMaterialParamBlockSet) {
@@ -1709,7 +1870,8 @@ VkPipeline MaterialSystem::getPipeline(const PipelineRequest& req) {
             "attachment; rejecting (no use case in Phase 3)");
     }
 
-    PipelineKey key{record->contentHash, req.pass.hash(), req.specializationBits};
+    PipelineKey key{record->contentHash, req.pass.hash(), req.specializationBits,
+                     record->fixedFunctionState.alphaMode, record->fixedFunctionState.doubleSided};
     auto it = impl.pipelines.find(key);
     if (it != impl.pipelines.end()) {
         return it->second;
@@ -1752,10 +1914,15 @@ VkPipeline MaterialSystem::getPipeline(const PipelineRequest& req) {
     viewportState.viewportCount = 1;
     viewportState.scissorCount = 1;
 
+    // [D28] cullMode: doubleSided -> VK_CULL_MODE_NONE (glTF core spec,
+    // quoted directly in the gate matrix: "back-face culling is disabled
+    // and double sided lighting is enabled"); single-sided (the default)
+    // keeps this class's original VK_CULL_MODE_BACK_BIT literal.
+    const bool doubleSided = record->fixedFunctionState.doubleSided;
     VkPipelineRasterizationStateCreateInfo rasterizationState{};
     rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
-    rasterizationState.cullMode = VK_CULL_MODE_BACK_BIT;
+    rasterizationState.cullMode = doubleSided ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
     rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rasterizationState.lineWidth = 1.0F;
 
@@ -1763,16 +1930,34 @@ VkPipeline MaterialSystem::getPipeline(const PipelineRequest& req) {
     multisampleState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     multisampleState.rasterizationSamples = req.pass.samples;
 
+    // [D28] alphaMode drives TWO of the three fixed-function axes here:
+    // BLEND disables depth-write (D22's own text: "BLEND: blending on,
+    // depth-write off, cull off" -- the "cull off" third of that triple is
+    // handled by `doubleSided` above per this ticket's own gate ruling,
+    // which keeps doubleSided and alphaMode as independent, composable
+    // axes rather than forcing every BLEND material double-sided) and
+    // enables standard straight-alpha (source-alpha,
+    // one-minus-source-alpha) blending on every color attachment; OPAQUE
+    // and MASK are pipeline-state-IDENTICAL to each other (MASK's cutoff
+    // is a shader-side discard, D28's own header comment) and to this
+    // class's pre-D28 hardcoded behavior.
+    const bool blend = record->fixedFunctionState.alphaMode == AlphaMode::Blend;
     const bool hasDepth = req.pass.depthFormat != VK_FORMAT_UNDEFINED;
     VkPipelineDepthStencilStateCreateInfo depthStencilState{};
     depthStencilState.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     depthStencilState.depthTestEnable = hasDepth ? VK_TRUE : VK_FALSE;
-    depthStencilState.depthWriteEnable = hasDepth ? VK_TRUE : VK_FALSE;
+    depthStencilState.depthWriteEnable = (hasDepth && !blend) ? VK_TRUE : VK_FALSE;
     depthStencilState.depthCompareOp = VK_COMPARE_OP_LESS;
 
     std::vector<VkPipelineColorBlendAttachmentState> blendAttachments(req.pass.colorCount);
     for (auto& blendAttachment : blendAttachments) {
-        blendAttachment.blendEnable = VK_FALSE;
+        blendAttachment.blendEnable = blend ? VK_TRUE : VK_FALSE;
+        blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+        blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
         blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
     }

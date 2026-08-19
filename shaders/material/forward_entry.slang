@@ -28,15 +28,32 @@
 // compiles, links, and produces correct SPIR-V for the concrete type's
 // `evaluate()` body -- see task-5-report.md for the probe.
 //
-// PHASE 3 SCOPE NOTE -- no camera/transform system exists yet (that is a
-// samples-05/06-and-later concern, not this task's): `vertexMain` below
-// treats its incoming `position` attribute AS the world-space position
-// verbatim (no model/view/projection transform anywhere in this file), and
-// clip-space output is the same untransformed value with w=1. A real
-// sample wires an actual transform in before this stage; MaterialSystem's
-// own tests (src/rx_material/tests/test_material_system.cpp) only exercise
-// pipeline creation/reflection/caching, never rasterization, so this
-// simplification is invisible to them.
+// PHASE 4 TASK 16 UPDATE -- superseding the "PHASE 3 SCOPE NOTE" this
+// comment used to carry verbatim (kept below, struck through in spirit, for
+// the historical "why no transform" context): `vertexMain` now reads a REAL
+// model/view/projection transform, per D26.1's bindless-per-draw addressing
+// -- see material.slang's own `RxDrawData`/`gDrawData` header comment for
+// the full mechanism. `MaterialSystem::create()` registers a small DEFAULT
+// draw-data buffer (one row, every field at its identity/neutral default --
+// model/normalMatrix/viewProj all identity, so `mul(identity, mul(identity,
+// float4(position,1))) == float4(position,1)` EXACTLY) so every pre-D26.1
+// caller (samples 06/07's own test materials, which never issue a draw with
+// `firstInstance != 0` and therefore always read that one default row) is
+// UNAFFECTED byte-for-byte -- this is not a breaking change to
+// forward_entry.slang's existing callers, just a superset. A real per-draw
+// caller (StandardPBR/Unlit, samples/08_gltf_viewer) registers its OWN
+// StructuredBuffer<RxDrawData> (one row per submesh instance) and pushes
+// its real bindless index via `gMaterialGlobals.drawDataBufferIndex`.
+//
+// ORIGINAL PHASE 3 SCOPE NOTE, for archaeology: "no camera/transform system
+// exists yet... vertexMain treats its incoming `position` attribute AS the
+// world-space position verbatim... A real sample wires an actual transform
+// in before this stage" -- samples/06_materials/main.cpp's own
+// `transformAndUploadObjectVertices()` is exactly that CPU-side workaround,
+// pre-baking its own view-proj into vertex positions on the CPU BEFORE this
+// stage existed; it still works unchanged today only because the identity
+// draw-data row above makes this stage's own GPU-side transform a no-op for
+// it.
 import material;
 
 // The link-time-resolved concrete material type -- see this file's header
@@ -47,6 +64,26 @@ import material;
 // engine -- every MaterialSystem::getPipeline() call always supplies one.
 extern struct MaterialImpl : IMaterialShader;
 
+// [Phase 4 Task 16, hardening] `normalize()` of an exact zero vector is a
+// 0/0 NaN, silent at the point it happens and only visible once it
+// propagates into a material's own output color -- reproduced directly
+// during this task's own development (samples/06_materials's procedural
+// sphere/cube generators originally left `tangent` zero-initialized;
+// forward_entry.slang's own unconditional `normalize(mul(modelMat3,
+// tangent.xyz))` turned that into NaN, which every material here reads
+// back via a `v.tangent.x * ...` epsilon term for an unrelated reason --
+// see MaterialVertex's own header comment -- corrupting the whole pixel).
+// Real imported content (D8's pooled vertex format, MikkTSpace-generated at
+// import time) never produces a degenerate zero tangent/normal, but a
+// hand-authored procedural mesh (any current or future sample) can, by a
+// simple omission that costs nothing to guard against here, once, for
+// every material this engine will ever load -- cheaper and more robust
+// than trusting every vertex-data producer to remember it independently.
+float3 safeNormalize(float3 v) {
+    float lenSq = dot(v, v);
+    return (lenSq > 1e-12) ? (v * rsqrt(lenSq)) : float3(0.0, 0.0, 1.0);
+}
+
 // VERTEX INPUT LAYOUT -- read before touching MaterialSystem's pipeline
 // vertex-input state (material_system.cpp): Phase 2 never fixed one
 // canonical host-side `Vertex` struct in a shared library header (each
@@ -56,33 +93,67 @@ extern struct MaterialImpl : IMaterialShader;
 // layout-agnostic (two raw device-local buffers, vertex layout supplied
 // entirely by the caller's own VkVertexInputBindingDescription/
 // VkVertexInputAttributeDescription at pipeline-creation time). Task 5
-// therefore defines ITS OWN fixed vertex layout, chosen to carry exactly
-// what `MaterialVertex` (material.slang) needs and nothing else: three
-// attributes, `position`/`normal`/`uv`, matching this entry point's own
+// therefore defined ITS OWN fixed vertex layout, chosen to carry exactly
+// what `MaterialVertex` (material.slang) needs -- [Phase 4 Task 16, D8]
+// GREW BY ONE FIELD: `tangent` (float4, w = handedness), matching D8's
+// pooled `position f32x3 | normal f32x3 | tangent f32x4 | uv0 f32x2`
+// vertex format exactly (`rx::asset::PoolVertex`, geometry_pool.h) -- this
+// was a prerequisite for normal mapping no earlier task's file list named
+// (see material.slang's own MaterialVertex comment). Four attributes,
+// `position`/`normal`/`tangent`/`uv`, matching this entry point's own
 // parameter list one-to-one and bound as a single interleaved
-// vertex-buffer stream (binding 0) at locations 0/1/2 respectively. See
+// vertex-buffer stream (binding 0) at locations 0/1/2/3 respectively. See
 // material_system.cpp's pipeline-building code for the exact
 // VkVertexInputAttributeDescription table this assumes (offsetof-style
-// float3+float3+float2, tightly packed, no padding) -- a future sample
-// wiring real mesh geometry through this material system must upload
-// vertex data in that exact interleaving.
+// float3+float3+float4+float2, tightly packed, no padding, 48 bytes total
+// -- D8 pins this exact stride) -- a sample wiring real mesh geometry
+// through this material system must upload vertex data in that exact
+// interleaving (`rx::asset::GeometryPool`'s own pooled buffers already do).
 struct VertexStageOutput {
     float4 clipPosition : SV_Position;
     float3 worldPos;
     float3 normal;
+    float4 tangent;
     float2 uv;
+    float3 lightDirWorld;
+    float3 lightColor;
+    float3 ambientColor;
+    float3 cameraPosWorld;
 };
 
+// `instanceId` binds to `SV_VulkanInstanceID`, NOT `SV_InstanceID` -- see
+// material.slang's own `RxDrawData`/`gDrawData` header comment (D26.1,
+// gate ruling RC1/#8) for the full, verified Slang/SPIR-V/D3D semantic
+// mismatch this is deliberately sidestepping: Slang's `SV_InstanceID`
+// SUBTRACTS `firstInstance` back out (D3D-compatible semantics), which
+// would silently break the moment a real caller issues a draw with
+// `firstInstance > 0` (the SoA per-draw addressing D26.1 exists for) --
+// `SV_VulkanInstanceID` is the raw, `firstInstance`-INCLUSIVE index this
+// engine's bindless per-draw buffer is indexed by.
 [shader("vertex")]
-VertexStageOutput vertexMain(float3 position : POSITION, float3 normal : NORMAL, float2 uv : TEXCOORD0) {
+VertexStageOutput vertexMain(float3 position : POSITION, float3 normal : NORMAL, float4 tangent : TANGENT,
+                              float2 uv : TEXCOORD0, uint instanceId : SV_VulkanInstanceID) {
+    RxDrawData draw = gDrawData[gMaterialGlobals.drawDataBufferIndex][instanceId];
+
+    float4 worldPos4 = mul(draw.model, float4(position, 1.0));
+    float3x3 normalMat3 = (float3x3)draw.normalMatrix;
+    // Tangents (like positions) transform with the ordinary model matrix,
+    // NOT its inverse-transpose -- only normals need the inverse-transpose
+    // treatment to stay perpendicular to the surface under non-uniform
+    // scale. Renormalized here (a non-uniform-scaled model matrix does not
+    // preserve length); handedness (`tangent.w`) is a sign, never scaled.
+    float3x3 modelMat3 = (float3x3)draw.model;
+
     VertexStageOutput output;
-    // See this file's header "PHASE 3 SCOPE NOTE": no transform exists yet,
-    // so object space, world space, and (homogeneous, w=1) clip space are
-    // all the same value at this point in the pipeline.
-    output.clipPosition = float4(position, 1.0);
-    output.worldPos = position;
-    output.normal = normal;
+    output.clipPosition = mul(draw.viewProj, worldPos4);
+    output.worldPos = worldPos4.xyz;
+    output.normal = safeNormalize(mul(normalMat3, normal));
+    output.tangent = float4(safeNormalize(mul(modelMat3, tangent.xyz)), tangent.w);
     output.uv = uv;
+    output.lightDirWorld = draw.lightDirWorld.xyz;
+    output.lightColor = draw.lightColor.xyz;
+    output.ambientColor = draw.ambientColor.xyz;
+    output.cameraPosWorld = draw.cameraPosWorld.xyz;
     return output;
 }
 
@@ -90,8 +161,13 @@ VertexStageOutput vertexMain(float3 position : POSITION, float3 normal : NORMAL,
 float4 fragmentMain(VertexStageOutput input) : SV_Target {
     MaterialVertex v;
     v.worldPos = input.worldPos;
-    v.normal = input.normal;
+    v.normal = safeNormalize(input.normal);
+    v.tangent = float4(safeNormalize(input.tangent.xyz), input.tangent.w);
     v.uv = input.uv;
+    v.lightDirWorld = input.lightDirWorld;
+    v.lightColor = input.lightColor;
+    v.ambientColor = input.ambientColor;
+    v.cameraPosWorld = input.cameraPosWorld;
 
     // Default-constructed: every conforming material struct this engine
     // links against is data-free by convention (its bound parameters live
@@ -99,5 +175,15 @@ float4 fragmentMain(VertexStageOutput input) : SV_Target {
     // see material.slang's header comment and test_unlit.slang for the
     // worked example), so there is no instance state to initialize here.
     MaterialImpl material;
-    return material.evaluate(v);
+    float4 color = material.evaluate(v);
+
+    // [Phase 4 Task 16] `--exposure` (samples/08_gltf_viewer): a pre-
+    // tonemap linear-HDR multiply, applied here (the forward material
+    // pass) rather than inside the SHARED, UNTOUCHED tonemap shaders
+    // (shaders/multipass/tonemap.frag.slang) -- see gMaterialGlobals' own
+    // header comment for why exposure=0.0 (2^0 == 1) is a byte-identical
+    // no-op regression guard. Alpha is left untouched (exposure is a
+    // radiometric HDR scale, not a coverage/blend value).
+    color.rgb *= exp2(gMaterialGlobals.exposure);
+    return color;
 }

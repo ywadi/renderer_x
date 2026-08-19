@@ -25,11 +25,18 @@ struct Textured : IMaterialShader {
         // MaterialVertex field genuinely (if negligibly) read, plus a
         // non-constant-foldable read of `gParams.albedoIndex` so this
         // field is not itself optimized away as unused.
+        // [Phase 4 Task 16] Extended to tangent/lightDirWorld/lightColor/
+        // ambientColor -- same dead-code-elimination-avoidance rationale.
         float4 color = float4(0.0, 0.0, 0.0, 1.0);
         color.x += v.worldPos.x * 1e-4;
         color.y += v.normal.y * 1e-4;
         color.z += v.uv.x * 1e-4;
         color.w += float(gParams.albedoIndex) * 1e-4;
+        color.x += v.tangent.x * 1e-4;
+        color.y += v.lightDirWorld.x * 1e-4;
+        color.z += v.lightColor.x * 1e-4;
+        color.w += v.ambientColor.x * 1e-4;
+        color.x += v.cameraPosWorld.x * 1e-4;
         return color;
     }
 };

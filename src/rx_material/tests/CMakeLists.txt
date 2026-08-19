@@ -31,12 +31,26 @@ add_executable(rx_material_gpu_tests
     # RenderGraph needed, matching rx_rhi_vk/tests/descriptor_arena_test.cpp's
     # own minimal headless fixture pattern.
     test_param_arena.cpp
+    # Phase 4 Stage 1 Task 16 [D22, D26.1, D28, gate ruling #8/RC1]:
+    # standard_pbr.slang/unlit.slang GPU tests (real vkCmdDrawIndexed +
+    # pixel readback -- the first tests in this binary to actually draw
+    # and read back, not just prove a bind/pipeline-build is
+    # validation-clean), the D28 pipeline-cache-counter test, and the
+    # D26.1 two-draw SV_VulkanInstanceID test.
+    test_standard_pbr_unlit.cpp
 )
 target_link_libraries(rx_material_gpu_tests PRIVATE rx_material rx_rhi_vk rx_platform doctest::doctest)
 rx_shader_deploy_runtime_libs(rx_material_gpu_tests)
 
 target_compile_definitions(rx_material_gpu_tests PRIVATE
   RX_MATERIAL_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
+  # [Phase 4 Stage 1 Task 16] test_standard_pbr_unlit.cpp loads the REAL
+  # shipped shaders/material/{standard_pbr,unlit}.slang (not this
+  # directory's own data/ test fixtures) -- rx_material's own
+  # RX_MATERIAL_SHADER_DIR (src/rx_material/CMakeLists.txt) is PRIVATE to
+  # that library target and does not propagate to this executable, so it
+  # is redeclared here, verbatim, for the one test file that needs it.
+  RX_MATERIAL_SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders/material"
 )
 
 # --validate: same developer/CI-gate opt-in every other GPU-backed test

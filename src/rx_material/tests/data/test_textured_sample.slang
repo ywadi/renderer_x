@@ -26,9 +26,16 @@ struct TexturedSample : IMaterialShader {
         // header comments) so this fixture keeps the same "every
         // MaterialVertex field genuinely read" convention; the real content
         // of the returned color is the actual bindless-sampled texel.
+        // [Phase 4 Task 16] Extended to tangent/lightDirWorld/lightColor/
+        // ambientColor -- same dead-code-elimination-avoidance rationale.
         float4 sampled = rx_sampleTexture(gParams.albedoIndex, v.uv);
         sampled.x += v.worldPos.x * 1e-6;
         sampled.y += v.normal.y * 1e-6;
+        sampled.z += v.tangent.x * 1e-6;
+        sampled.w += v.lightDirWorld.x * 1e-6;
+        sampled.x += v.lightColor.x * 1e-6;
+        sampled.y += v.ambientColor.x * 1e-6;
+        sampled.z += v.cameraPosWorld.x * 1e-6;
         return sampled;
     }
 };
