@@ -14,6 +14,8 @@
 #include <rx_graph/pass_signature.h>
 #include <rx_graph/render_graph.h>
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string_view>
@@ -123,6 +125,69 @@ struct ExecutorChunkDebugStats {
     uint64_t totalPoolAllocations = 0;
 };
 [[nodiscard]] ExecutorChunkDebugStats debugChunkStats(const Executor& executor);
+
+// [Phase 4 Task 23, gate ruling #29] Test/debug-only seam -- NOT part of
+// the stable public contract, same carve-out convention as
+// debugLastFrameFinalStages()/debugChunkStats() above. Snapshots the
+// `.capacity()` AND `.data()` pointer of every Impl-persistent scratch/
+// tracking buffer Task 23 converted Executor::execute()'s own former
+// per-call heap allocations into (executor.cpp) -- the bound zero-alloc-
+// test methodology for this ticket (capacity-snapshot via a test-only
+// accessor, NOT global operator-new interposition, which
+// rx_graph_gpu_tests' own Vulkan/validation-layer/Tracy-rpmalloc linkage
+// makes unsafe to install process-wide). `chunkBuffersScratch`/
+// `validChunkBuffersScratch` are frame-slot indexed
+// (rx::rhi::FrameSync::kFramesInFlight entries each), matching
+// Executor::Impl's own [frameSlot] scratch shape.
+//
+// BOTH capacity and pointer identity are captured -- an EMPIRICALLY
+// VERIFIED necessity, not belt-and-suspenders caution (this task's own
+// revert-probe against the sibling DeletionQueue fix, see the task report):
+// for a buffer whose final element COUNT is identical every call (this
+// task's own "unchanged graph" steady-state premise), a buggy "freshly
+// reconstruct every call" version can reach the exact same STABLE capacity
+// every time too (a from-empty allocation of a fixed size N has no
+// geometric-growth headroom to differ by), so capacity alone is
+// insufficient; `.data()` pointer identity is the second, independent
+// signal (mirroring rx_scene::DrawListBuilder's own zero-alloc test
+// precedent, draw_list_test.cpp, which checks both for the identical
+// reason). `*Data` fields are `const void*` (identity comparison only).
+struct ExecutorAllocationCapacitiesForTesting {
+    size_t firstBarrierSeen = 0;
+    size_t attachmentEverWritten = 0;
+    size_t touchedThisExecute = 0;
+    size_t finalStageThisExecute = 0;
+    size_t finalAccessThisExecute = 0;
+    size_t colorPhysIdxScratch = 0;
+    size_t colorAttachmentsScratch = 0;
+    size_t vkImageBarriersScratch = 0;
+    size_t vkBufferBarriersScratch = 0;
+    size_t combinedAccessScratch = 0;
+    size_t debugLabelScratch = 0;
+    std::array<size_t, 2> chunkBuffersScratch{};
+    std::array<size_t, 2> validChunkBuffersScratch{};
+
+    // firstBarrierSeen/attachmentEverWritten/touchedThisExecute have no
+    // pointer-identity companion field: all three are std::vector<bool>,
+    // the bit-packed standard-library specialization with NO `.data()`
+    // member at all (not merely inconvenient -- genuinely absent from the
+    // standard interface) -- capacity is the only signal available for
+    // them, an accepted, disclosed gap in coverage for exactly these three
+    // fields (the matrix's own binding acceptance criterion for sites 1-2
+    // names `std::vector<bool>` explicitly, so changing their element type
+    // just to gain a `.data()` pointer is not this task's call to make).
+    const void* finalStageThisExecuteData = nullptr;
+    const void* finalAccessThisExecuteData = nullptr;
+    const void* colorPhysIdxScratchData = nullptr;
+    const void* colorAttachmentsScratchData = nullptr;
+    const void* vkImageBarriersScratchData = nullptr;
+    const void* vkBufferBarriersScratchData = nullptr;
+    const void* combinedAccessScratchData = nullptr;
+    const void* debugLabelScratchData = nullptr;
+    std::array<const void*, 2> chunkBuffersScratchData{};
+    std::array<const void*, 2> validChunkBuffersScratchData{};
+};
+[[nodiscard]] ExecutorAllocationCapacitiesForTesting allocationCapacitiesForTesting(const Executor& executor);
 
 }  // namespace detail
 
@@ -407,6 +472,7 @@ private:
     friend class PassContext;
     friend VkPipelineStageFlags2 detail::debugLastFrameFinalStages(const Executor&, std::string_view);
     friend detail::ExecutorChunkDebugStats detail::debugChunkStats(const Executor&);
+    friend detail::ExecutorAllocationCapacitiesForTesting detail::allocationCapacitiesForTesting(const Executor&);
 
     explicit Executor(std::unique_ptr<Impl> impl);
 

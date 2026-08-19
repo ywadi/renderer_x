@@ -2110,3 +2110,246 @@ TEST_CASE("D29: ONE frame mixes Standard and Reversed depth conventions across t
     destroyDepthProbePipeline(device, *pipeline);
     destroyOffscreenImage(device, *offscreen);
 }
+
+// [Task 23, gate ticket/matrix/ruling #29] lookupResolvedIndex()'s
+// heterogeneous `nameToIndex.find(name)` lookup (executor.cpp) must resolve
+// a REAL name exactly like the old `find(std::string(name))` did (a HIT),
+// and still throw std::out_of_range, naming the resource, for a name that
+// was never one of CompiledGraph::resources()' own entries at all (a MISS)
+// -- matrix's own proposed test shape for the transparent-hash fix.
+TEST_CASE("PassContext resolvers: nameToIndex's transparent string_view lookup resolves a real name (hit) and "
+          "throws std::out_of_range naming a nonexistent one (miss), same as the old std::string-keyed lookup did "
+          "[Task 23]") {
+    auto fixture = makeFixture("rx_graph_gpu_name_lookup");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    const VkDevice device = fixture->device.device();
+
+    bool ran = false;
+    VkFormat resolvedFormat = VK_FORMAT_UNDEFINED;
+
+    RenderGraph graph;
+    graph.addPass("fill").addColorOutput("bb", absoluteColorDesc(kExtent, kExtent)).setExecute([&](PassContext& ctx) {
+        ran = true;
+
+        // HIT: "bb" is a real, realized resource name.
+        resolvedFormat = ctx.imageFormat("bb");
+        CHECK(ctx.imageView("bb") != VK_NULL_HANDLE);
+
+        // MISS: never a CompiledGraph::resources() entry at all -- must
+        // throw std::out_of_range, naming the resource, not silently
+        // resolve to a meaningless handle or crash.
+        try {
+            static_cast<void>(ctx.imageView("does_not_exist"));
+            FAIL("expected ctx.imageView(\"does_not_exist\") to throw std::out_of_range");
+        } catch (const std::out_of_range& e) {
+            const std::string what = e.what();
+            CHECK(what.find("no realized resource named") != std::string::npos);
+            CHECK(what.find("does_not_exist") != std::string::npos);
+        }
+    });
+    graph.setBackbufferSource("bb");
+
+    CompileInfo info;
+    info.swapchainWidth = kExtent;
+    info.swapchainHeight = kExtent;
+    info.swapchainFormat = kFormat;
+    info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    graph.compile(info);
+    fixture->executor->realize(graph);
+
+    auto offscreen = createOffscreenImage(device, fixture->device.physicalDevice(), kFormat, VkExtent2D{kExtent, kExtent});
+    REQUIRE(offscreen.has_value());
+    auto cmdCtx =
+        rx::rhi::CommandContext::create(device, fixture->device.graphicsQueue(), fixture->device.graphicsQueueFamily());
+    REQUIRE(cmdCtx.has_value());
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
+    });
+
+    CHECK(ran);
+    CHECK(resolvedFormat == kFormat);
+
+    vkDeviceWaitIdle(device);
+    destroyOffscreenImage(device, *offscreen);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// [Task 23, gate ticket #29 / gate matrix issue29-executor-allocations.md /
+// rulings-2026-08-18.md §#29] THE zero-alloc acceptance-criterion test:
+// Executor::execute() performs zero heap allocations in steady state
+// (unchanged graph, unchanged resource count). Methodology is BOUND by the
+// gate ruling: capacity-snapshot via the test-only
+// detail::allocationCapacitiesForTesting() accessor, NOT global
+// operator-new interposition (this binary links volk, the Vulkan
+// validation layers, and -- via rx_shader_deploy_runtime_libs() -- Slang's
+// own runtime; a process-wide operator-new/delete override risks
+// interacting with all three in ways this task cannot verify are safe
+// without a dedicated spike, per the ruling's own reasoning). A capacity
+// staying bit-for-bit identical across N further steady-state frames after
+// a warm-up is, per that same ruling, a deliberately accepted limitation
+// (blind to a same-sized reallocation, astronomically unlikely for
+// std::vector's own deterministic doubling growth) rather than a true
+// allocation COUNT -- see this task's own report for the revert-probe that
+// establishes this methodology's actual discriminating power.
+//
+// The graph below is deliberately representative of every site this task
+// touched, in ONE frame: "produce" (a bare AsyncCompute storage-buffer
+// producer -- exercises the pooled-buffer first-use synthesis path,
+// combinedAccessScratch), "fillWhole" (an ordinary whole-pass color
+// output -- colorPhysIdx/colorAttachments/barrier scratch), "probe" (a
+// bare pass resolving TWO real names via PassContext, exercising
+// lookupResolvedIndex()'s transparent lookup on the hot path -- see the
+// dedicated hit/miss test above for that site's own correctness proof),
+// and "fillChunked" (a CHUNKED pass into the backbuffer -- debug-label
+// scratch, both chunk-command-buffer scratch arrays). Tracy's own
+// dynamic-zone-name allocations (RX_ZONE_DYNAMIC_NAME/RX_GPU_ZONE_DYNAMIC,
+// both hit every pass this graph runs) are a documented third-party
+// exception this methodology is naturally blind to either way -- see
+// combineAccessesByResource()/profile.h/tracy_gpu.h's own comments; this
+// project's `-DTRACY_ON_DEMAND=ON` build additionally means neither macro
+// reaches its own allocating path at all while no profiler is connected
+// (verified this task by tracing TracyVulkan.hpp's transient VkCtxScope
+// constructor to Profiler::AllocSourceLocation(), gated by
+// `is_active && GetProfiler().IsConnected()` -- the same gate
+// profile.h's own RX_ZONE_DYNAMIC_NAME comment already documents for the
+// CPU-side macro), which is the representative configuration this test
+// (and every ctest run in this repo) actually exercises.
+TEST_CASE("Executor::execute performs zero heap allocations in steady state -- every Impl-persistent scratch "
+          "buffer's capacity stays bit-for-bit unchanged across many further execute() calls after a warm-up "
+          "[Task 23, gate ticket/matrix/ruling #29]") {
+    auto fixture = makeFixture("rx_graph_gpu_zero_alloc");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    const VkDevice device = fixture->device.device();
+    const VkPhysicalDevice physicalDevice = fixture->device.physicalDevice();
+
+    auto fillPipeline = buildFillPipeline(device, kFormat);
+    REQUIRE(fillPipeline.has_value());
+
+    auto offscreen = createOffscreenImage(device, physicalDevice, kFormat, VkExtent2D{kExtent, kExtent});
+    REQUIRE(offscreen.has_value());
+
+    BufferDesc dataDesc;
+    dataDesc.size = 256;
+    dataDesc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+
+    RenderGraph graph;
+    graph.addPass("produce", QueueClass::AsyncCompute).addStorageBufferOutput("data", dataDesc).setSideEffect();
+    graph.addPass("fillWhole")
+        .addColorOutput("colorA", absoluteColorDesc(kExtent, kExtent))
+        .setExecute([&](PassContext& ctx) { recordCells(ctx.cmd, *fillPipeline, kExtent, 0, kCellCount); });
+    graph.addPass("probe")
+        .addTextureInput("colorA")
+        .addStorageBufferInput("data")
+        .setSideEffect()
+        .setExecute([&](PassContext& ctx) {
+            CHECK(ctx.imageView("colorA") != VK_NULL_HANDLE);
+            CHECK(ctx.buffer("data") != VK_NULL_HANDLE);
+        });
+    graph.addPass("fillChunked")
+        .addColorOutput("bb", absoluteColorDesc(kExtent, kExtent))
+        .setExecuteChunked([&](PassContext& ctx, uint32_t chunkIndex, uint32_t chunkCount) {
+            const uint32_t cellsPerChunk = (kCellCount + chunkCount - 1) / chunkCount;
+            const uint32_t begin = std::min(chunkIndex * cellsPerChunk, kCellCount);
+            const uint32_t end = std::min(begin + cellsPerChunk, kCellCount);
+            recordCells(ctx.chunkCommandBuffer(), *fillPipeline, kExtent, begin, end);
+        });
+    graph.setBackbufferSource("bb");
+
+    CompileInfo info;
+    info.swapchainWidth = kExtent;
+    info.swapchainHeight = kExtent;
+    info.swapchainFormat = kFormat;
+    info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    graph.compile(info);
+    fixture->executor->realize(graph);
+
+    auto cmdCtx =
+        rx::rhi::CommandContext::create(device, fixture->device.graphicsQueue(), fixture->device.graphicsQueueFamily());
+    REQUIRE(cmdCtx.has_value());
+
+    auto runOneFrame = [&] {
+        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+            fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
+        });
+    };
+
+    // Warm-up: enough execute() calls for every Impl-persistent buffer to
+    // reach its steady-state peak capacity, including BOTH chunk
+    // command-buffer frame slots (chunkFrameSlot alternates 0/1 every
+    // call -- see Executor::execute()'s own comment) -- matches
+    // acquireChunkCommandBuffer()'s own documented "stabilizes after the
+    // first kFramesInFlight execute() calls" budget, doubled here for
+    // margin.
+    constexpr int kWarmupFrames = 4;
+    for (int i = 0; i < kWarmupFrames; ++i) {
+        runOneFrame();
+    }
+
+    const rx::graph::detail::ExecutorAllocationCapacitiesForTesting before =
+        rx::graph::detail::allocationCapacitiesForTesting(*fixture->executor);
+    // A completely untouched capacity struct (every field still 0) would
+    // make every CHECK below trivially, uselessly pass -- assert the graph
+    // genuinely exercised at least the always-present per-execute tracking
+    // vectors before trusting the steady-state comparison that follows.
+    REQUIRE(before.firstBarrierSeen > 0);
+    REQUIRE(before.finalStageThisExecute > 0);
+
+    constexpr int kSteadyFrames = 10;
+    for (int frame = 0; frame < kSteadyFrames; ++frame) {
+        runOneFrame();
+        const rx::graph::detail::ExecutorAllocationCapacitiesForTesting after =
+            rx::graph::detail::allocationCapacitiesForTesting(*fixture->executor);
+
+        INFO("frame=", frame);
+        CHECK(after.firstBarrierSeen == before.firstBarrierSeen);
+        CHECK(after.attachmentEverWritten == before.attachmentEverWritten);
+        CHECK(after.touchedThisExecute == before.touchedThisExecute);
+        CHECK(after.finalStageThisExecute == before.finalStageThisExecute);
+        CHECK(after.finalAccessThisExecute == before.finalAccessThisExecute);
+        CHECK(after.colorPhysIdxScratch == before.colorPhysIdxScratch);
+        CHECK(after.colorAttachmentsScratch == before.colorAttachmentsScratch);
+        CHECK(after.vkImageBarriersScratch == before.vkImageBarriersScratch);
+        CHECK(after.vkBufferBarriersScratch == before.vkBufferBarriersScratch);
+        CHECK(after.combinedAccessScratch == before.combinedAccessScratch);
+        CHECK(after.debugLabelScratch == before.debugLabelScratch);
+        for (uint32_t slot = 0; slot < 2; ++slot) {
+            CAPTURE(slot);
+            CHECK(after.chunkBuffersScratch[slot] == before.chunkBuffersScratch[slot]);
+            CHECK(after.validChunkBuffersScratch[slot] == before.validChunkBuffersScratch[slot]);
+        }
+
+        // Second, independent signal alongside capacity -- see
+        // ExecutorAllocationCapacitiesForTesting's own doc comment
+        // (executor.h) for why capacity ALONE is empirically insufficient
+        // for a fixed-size-every-call buffer (this task's own revert-probe
+        // against the sibling DeletionQueue fix found exactly this gap).
+        // std::vector<bool> fields (firstBarrierSeen/attachmentEverWritten/
+        // touchedThisExecute) have no `.data()` companion -- see that same
+        // comment.
+        CHECK(after.finalStageThisExecuteData == before.finalStageThisExecuteData);
+        CHECK(after.finalAccessThisExecuteData == before.finalAccessThisExecuteData);
+        CHECK(after.colorPhysIdxScratchData == before.colorPhysIdxScratchData);
+        CHECK(after.colorAttachmentsScratchData == before.colorAttachmentsScratchData);
+        CHECK(after.vkImageBarriersScratchData == before.vkImageBarriersScratchData);
+        CHECK(after.vkBufferBarriersScratchData == before.vkBufferBarriersScratchData);
+        CHECK(after.combinedAccessScratchData == before.combinedAccessScratchData);
+        CHECK(after.debugLabelScratchData == before.debugLabelScratchData);
+        for (uint32_t slot = 0; slot < 2; ++slot) {
+            CAPTURE(slot);
+            CHECK(after.chunkBuffersScratchData[slot] == before.chunkBuffersScratchData[slot]);
+            CHECK(after.validChunkBuffersScratchData[slot] == before.validChunkBuffersScratchData[slot]);
+        }
+    }
+
+    vkDeviceWaitIdle(device);
+    destroyFillPipeline(device, *fillPipeline);
+    destroyOffscreenImage(device, *offscreen);
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}

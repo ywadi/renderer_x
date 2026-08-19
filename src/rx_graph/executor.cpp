@@ -15,10 +15,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -103,20 +105,78 @@ struct CombinedAccess {
     VkAccessFlags2 access = 0;
 };
 
-std::vector<std::pair<uint32_t, CombinedAccess>> combineAccessesByResource(std::span<const ResourceAccess> accesses) {
-    std::vector<std::pair<uint32_t, CombinedAccess>> combined;
+// [Task 23, gate matrix #29] `outCombined` is a caller-supplied, reusable
+// scratch buffer rather than a return value -- this function is called
+// TWICE per pass, every pass, every execute() call (once from
+// synthesizeFirstUseBufferBarrierIfNeeded(), once from execute()'s own
+// per-pass "union every pass's stage" step below), so returning a freshly
+// heap-allocated std::vector by value here was one of this file's own
+// hidden per-pass allocation sites -- not one of the ticket's 7 NAMED
+// sites, but squarely inside execute()'s own call graph (both call sites
+// are reached directly from Executor::execute()'s per-pass loop), so it is
+// in scope for the SAME "zero heap allocations in steady state" criterion
+// [repo CLAUDE.md: "no deferred fixes... every finding closes in-round"].
+// Both call sites use ONE shared Impl-owned buffer (Executor::Impl::
+// combinedAccessScratch) -- safe because the two calls never overlap: this
+// function's caller always fully consumes `outCombined` before the other
+// call site runs again, within the same serial (never reentrant, never
+// called from a chunked-pass worker thread) per-pass loop iteration.
+void combineAccessesByResource(std::span<const ResourceAccess> accesses,
+                                std::vector<std::pair<uint32_t, CombinedAccess>>& outCombined) {
+    outCombined.clear();
     for (const ResourceAccess& access : accesses) {
-        auto it = std::find_if(combined.begin(), combined.end(),
+        auto it = std::find_if(outCombined.begin(), outCombined.end(),
                                 [&](const auto& entry) { return entry.first == access.physicalIndex; });
-        if (it == combined.end()) {
-            combined.emplace_back(access.physicalIndex, CombinedAccess{access.stages, access.access});
+        if (it == outCombined.end()) {
+            outCombined.emplace_back(access.physicalIndex, CombinedAccess{access.stages, access.access});
         } else {
             it->second.stages |= access.stages;
             it->second.access |= access.access;
         }
     }
-    return combined;
 }
+
+// [Task 23, gate matrix #29 "Heterogeneous string_view map lookup"]
+// Transparent hash functor for Impl::nameToIndex -- makes `find(name)`
+// callable directly with a std::string_view (the type every PassContext
+// resolver already carries `name` as) without first materializing a
+// temporary std::string, which lookupResolvedIndex() below used to do on
+// EVERY named-resource resolve (potentially several per pass -- see the
+// matrix's own frequency correction on this site). `std::equal_to<>`
+// (transparent since C++14) already covers the KeyEqual half; this functor
+// is the missing Hash half -- `unordered_map` requires BOTH template
+// parameters to expose `is_transparent` before its heterogeneous
+// `find`/`count`/`contains` overload set becomes callable at all
+// (cppreference.com/w/cpp/container/unordered_map/find), so omitting this
+// would leave the map exactly as non-transparent as before.
+//
+// One overload, taking std::string_view: `std::string` converts to
+// `std::string_view` implicitly (the reverse is NOT implicit --
+// std::string's own std::string_view-taking constructor is `explicit`,
+// C++17 [string.cons] -- see lookupResolvedIndex()'s own comment for why
+// that asymmetry is exactly what makes a silent regression back to a
+// temporary-std::string call site impossible to reintroduce without a
+// compile error), so this single signature already serves both the map's
+// real `std::string` keys (nameToIndex.emplace(physical.name, i) in
+// realize() -- `physical.name` implicitly converts to string_view when
+// passed here) and every heterogeneous string_view lookup.
+//
+// STRONGER than the gate matrix's own proposed shape, and deliberately so:
+// the matrix's row floats a DIFFERENT design (hash `std::string` keys via
+// `std::hash<std::string>`, hash lookup keys via `std::hash<std::string_view>`,
+// relying on the two specializations agreeing for equal byte sequences --
+// a real, if practically-universal, cross-type assumption). Because this
+// functor has exactly ONE overload, EVERY key this map ever hashes --
+// whether inserted as a real std::string or looked up as a string_view --
+// is converted to std::string_view FIRST and hashed with the exact SAME
+// `std::hash<std::string_view>` call. There is no cross-type hash-equivalence
+// assumption to rely on at all: a std::string key and an equal-content
+// string_view lookup are, by construction, hashed by literally the same
+// function.
+struct TransparentStringHash {
+    using is_transparent = void;
+    size_t operator()(std::string_view s) const noexcept { return std::hash<std::string_view>{}(s); }
+};
 
 }  // namespace
 
@@ -216,7 +276,107 @@ struct Executor::Impl {
     // Rebuilt by every realize() call; indexed identically to whatever
     // CompiledGraph::resources() looked like as of that call.
     std::vector<ResolvedResource> resources;
-    std::unordered_map<std::string, uint32_t> nameToIndex;
+    // [Task 23, gate matrix #29] Transparent Hash+KeyEqual -- see
+    // TransparentStringHash's own comment above for why this is what makes
+    // lookupResolvedIndex() below callable with a bare std::string_view,
+    // with no temporary std::string construction on the lookup side.
+    std::unordered_map<std::string, uint32_t, TransparentStringHash, std::equal_to<>> nameToIndex;
+
+    // ---------------------------------------------------------------
+    // [Task 23, gate matrix #29 / ticket #29 / rulings-2026-08-18 §#29]
+    // Impl-persistent, reused-per-execute() scratch storage -- every one of
+    // these used to be a LOCAL variable, freshly constructed (and heap-
+    // allocated once it held any elements) by every Executor::execute()
+    // call, or by every per-pass/per-barrier-call/per-chunk iteration
+    // inside one -- see this task's own report for the full before/after
+    // site list. Every field below follows the SAME discipline
+    // rx_scene::DrawListBuilder::Impl already established for Phase 4's
+    // sibling zero-alloc case (draw_list.cpp's own "reused private scratch
+    // storage" comment) and this file's own pre-existing
+    // acquireChunkCommandBuffer() amortized-growth arena [gate ruling
+    // #29's own named in-repo template]: `.assign()`/`.clear()`/`.resize()`
+    // at the top of whatever scope used to freshly construct the
+    // equivalent local -- never reassigned wholesale, never reconstructed
+    // -- so capacity only ever grows on a genuine new peak (a structurally
+    // bigger graph, a longer pass/resource name, ...) and stays flat
+    // otherwise. `compile()`/`realize()` remain exempt (setup/resize-only
+    // paths, per the ticket) -- nothing here is touched by either.
+    // ---------------------------------------------------------------
+
+    // Per-execute tracking (was: 4 locals freshly constructed at the top of
+    // every Executor::execute() call, incl. two node-based
+    // std::unordered_maps -- ticket sites 1-4). All four are sized
+    // (`.assign(resources.size(), ...)`) at the top of every execute()
+    // call and indexed directly by physicalIndex -- physical indices are
+    // dense (0..resources.size()), so no hashing is needed at all here,
+    // unlike nameToIndex above (keyed by name, not by a dense index).
+    std::vector<bool> firstBarrierSeen;
+    std::vector<bool> attachmentEverWritten;
+    // Replaces "is this physicalIndex present as a key in
+    // finalStageThisExecute/finalAccessThisExecute" (the old maps' own
+    // implicit signal for "did any pass touch this resource THIS call") --
+    // a dense std::vector<bool> has no equivalent "absent key" state, so
+    // this explicit companion flag is what execute()'s own tail loop
+    // (Task 3 ambiguity resolution #2's cross-frame carry-forward) checks
+    // instead, preserving the exact same "only touchImage()/touchBuffer()
+    // a resource some pass this call actually accessed" semantics
+    // TransientPool::sweepStale() depends on (see transient_pool.h's own
+    // touchImage()/touchBuffer() doc comment) -- untouched-this-call
+    // resources must NOT look freshly used to the staleness sweep.
+    std::vector<bool> touchedThisExecute;
+    std::vector<VkPipelineStageFlags2> finalStageThisExecute;
+    std::vector<VkAccessFlags2> finalAccessThisExecute;
+
+    // Per-pass scratch (was: 2 locals freshly constructed inside
+    // execute()'s per-pass loop body -- ticket sites 5-6). `.clear()`d at
+    // the top of every pass iteration; `depthPhysIdx`/`renderArea`/
+    // `depthAttachment`/`renderingInfo` stay plain per-pass stack locals in
+    // execute() itself -- none of them are containers that ever heap-
+    // allocate (a std::optional<uint32_t>/VkExtent2D/VkRenderingAttachmentInfo/
+    // VkRenderingInfo are all fixed-size value types), so there is nothing
+    // for THIS scratch-reuse discipline to do for them.
+    std::vector<uint32_t> colorPhysIdxScratch;
+    std::vector<VkRenderingAttachmentInfo> colorAttachmentsScratch;
+
+    // Barrier-emission scratch for applyBarriers() (was: 2 locals freshly
+    // constructed on every applyBarriers() call -- ticket sites 7-8; called
+    // once per pass position plus once more for finalBarriers() at the end
+    // of every execute() call). The two calls never overlap (applyBarriers()
+    // is never reentrant/concurrent), so one shared pair suffices.
+    std::vector<VkImageMemoryBarrier2> vkImageBarriersScratch;
+    std::vector<VkBufferMemoryBarrier2> vkBufferBarriersScratch;
+
+    // combineAccessesByResource()'s own out-parameter buffer (was: that
+    // function's own by-value return -- not one of the ticket's 7 NAMED
+    // sites, but a real per-pass allocation found directly in execute()'s
+    // own call graph while implementing this task -- see that function's
+    // own comment above for the full reasoning). Shared by both of its call
+    // sites (synthesizeFirstUseBufferBarrierIfNeeded() and execute()'s own
+    // per-pass union step) for the same non-overlapping-calls reason as the
+    // barrier-scratch pair above.
+    std::vector<std::pair<uint32_t, CombinedAccess>> combinedAccessScratch;
+
+    // beginDebugLabel()'s own reusable, null-terminated name buffer (was: a
+    // freshly constructed std::string per pass -- ticket site 9). Only
+    // ever written to (and only ever exercised at all) when
+    // debugUtilsAvailable is true; see that function's own comment for the
+    // "valid only for the duration of one vkCmd*Label call" contract that
+    // makes reusing/overwriting this same buffer every pass safe.
+    std::vector<char> debugLabelScratch;
+
+    // Chunk command-buffer scratch for recordChunkedPass() (was: 2 locals
+    // freshly constructed on every recordChunkedPass() call -- ticket sites
+    // 10-11). Frame-slot indexed [gate ruling #29: "per-frame-slot, since
+    // chunked recording is concurrent with other frame-in-flight state"],
+    // the same [frameSlot] shape `chunkPools` above already uses -- a
+    // defensive match for a caller that ever overlaps two execute() calls'
+    // own CPU-side recording across different frame-in-flight slots (this
+    // Executor's own documented, unenforced caller-discipline bound --
+    // executor.h's own "CALLER-DISCIPLINE BOUND, UNENFORCED" note), even
+    // though every in-tree caller today only ever has one recordChunkedPass()
+    // call active at a time.
+    std::array<std::vector<VkCommandBuffer>, rx::rhi::FrameSync::kFramesInFlight> chunkBuffersScratch;
+    std::array<std::vector<VkCommandBuffer>, rx::rhi::FrameSync::kFramesInFlight> validChunkBuffersScratch;
 
     // Phase 4 Task 7 [spec D4 amendment]: non-owning -- `scheduler` must
     // outlive this Executor (executor.h's create() doc comment). Every
@@ -262,12 +422,21 @@ void beginDebugLabel(Executor::Impl& impl, VkCommandBuffer cmd, std::string_view
     }
     // VkDebugUtilsLabelEXT::pLabelName must stay valid only for the
     // duration of this call -- vkCmdBeginDebugUtilsLabelEXT copies/consumes
-    // it immediately, so a local std::string on this function's own stack
-    // is sufficient (no need to keep it alive past the call).
-    const std::string label(name);
+    // it immediately -- so overwriting the SAME Impl-owned buffer every
+    // pass [Task 23, gate matrix #29 site 9] is safe: nothing needs it to
+    // outlive this one call, unlike a genuine per-pass std::string that
+    // would need constructing fresh every time. `.resize()` only
+    // reallocates on a new peak `name.size() + 1` (the null terminator);
+    // std::memcpy + a manual terminator write, rather than
+    // std::vector<char>::assign()+push_back(), keeps this to exactly ONE
+    // amortized-growth call instead of two independently-growing ones.
+    impl.debugLabelScratch.resize(name.size() + 1);
+    std::memcpy(impl.debugLabelScratch.data(), name.data(), name.size());
+    impl.debugLabelScratch[name.size()] = '\0';
+
     VkDebugUtilsLabelEXT info{};
     info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
-    info.pLabelName = label.c_str();
+    info.pLabelName = impl.debugLabelScratch.data();
     vkCmdBeginDebugUtilsLabelEXT(cmd, &info);
 }
 
@@ -298,7 +467,13 @@ void applyBarriers(Executor::Impl& impl, const CompiledGraph& compiled, VkComman
         return;
     }
 
-    std::vector<VkImageMemoryBarrier2> vkImageBarriers;
+    // [Task 23, gate matrix #29 sites 7-8] Impl-persistent, reused across
+    // every applyBarriers() call this execute() makes (and every future
+    // one) -- see Executor::Impl's own comment on this pair. `.clear()`
+    // keeps whatever capacity a past call already grew; `.reserve()` right
+    // after only allocates on a genuine new peak.
+    std::vector<VkImageMemoryBarrier2>& vkImageBarriers = impl.vkImageBarriersScratch;
+    vkImageBarriers.clear();
     vkImageBarriers.reserve(barriers.imageBarriers.size());
     for (const ImageBarrier& b : barriers.imageBarriers) {
         const PhysicalResource& physical = compiled.resources()[b.physicalIndex];
@@ -362,7 +537,8 @@ void applyBarriers(Executor::Impl& impl, const CompiledGraph& compiled, VkComman
         vkImageBarriers.push_back(vkBarrier);
     }
 
-    std::vector<VkBufferMemoryBarrier2> vkBufferBarriers;
+    std::vector<VkBufferMemoryBarrier2>& vkBufferBarriers = impl.vkBufferBarriersScratch;
+    vkBufferBarriers.clear();
     vkBufferBarriers.reserve(barriers.bufferBarriers.size());
     for (const BufferBarrier& b : barriers.bufferBarriers) {
         const ResolvedResource& resolved = impl.resources.at(b.physicalIndex);
@@ -432,7 +608,8 @@ void synthesizeFirstUseBufferBarrierIfNeeded(Executor::Impl& impl, const Compile
                                               std::span<const ResourceAccess> accesses, size_t pos,
                                               std::vector<bool>& firstBarrierSeen) {
     const std::span<const PhysicalResource> resources = compiled.resources();
-    for (const auto& [physIdx, combined] : combineAccessesByResource(accesses)) {
+    combineAccessesByResource(accesses, impl.combinedAccessScratch);
+    for (const auto& [physIdx, combined] : impl.combinedAccessScratch) {
         const PhysicalResource& physical = resources[physIdx];
         if (!physical.isBuffer || firstBarrierSeen[physIdx] || physical.firstUsePass != pos) {
             continue;
@@ -874,7 +1051,11 @@ void Executor::realize(const RenderGraph& graph) {
     impl.pool.beginRealizeBatch();
 
     std::vector<ResolvedResource> resolved(resources.size());
-    std::unordered_map<std::string, uint32_t> nameToIndex;
+    // realize() is a setup/resize-only path, exempt from this task's
+    // zero-alloc scope [ticket #29] -- rebuilt from scratch here every
+    // call, unchanged. Declared type must still match Impl::nameToIndex's
+    // (transparent Hash+KeyEqual) for the std::move() below to compile.
+    std::unordered_map<std::string, uint32_t, TransparentStringHash, std::equal_to<>> nameToIndex;
     nameToIndex.reserve(resources.size());
 
     for (uint32_t i = 0; i < resources.size(); ++i) {
@@ -1012,10 +1193,22 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
         }
     }
 
-    std::vector<bool> firstBarrierSeen(resources.size(), false);
-    std::vector<bool> attachmentEverWritten(resources.size(), false);
-    std::unordered_map<uint32_t, VkPipelineStageFlags2> finalStageThisExecute;
-    std::unordered_map<uint32_t, VkAccessFlags2> finalAccessThisExecute;
+    // [Task 23, gate matrix #29 sites 1-4] Impl-persistent, `.assign()`d
+    // (not reconstructed) every call -- `.assign(n, v)` only reallocates on
+    // a genuine new peak `resources.size()` (a structurally different
+    // graph), matching rx_scene::DrawListBuilder::cullView()'s own
+    // `cullReasons.assign(n, ...)` precedent exactly. `touchedThisExecute`
+    // replaces the two old std::unordered_maps' own "is physIdx present as
+    // a key" signal -- see its own field comment on Executor::Impl for why
+    // that distinction is load-bearing (TransientPool::sweepStale()'s
+    // staleness clock).
+    impl.firstBarrierSeen.assign(resources.size(), false);
+    impl.attachmentEverWritten.assign(resources.size(), false);
+    impl.touchedThisExecute.assign(resources.size(), false);
+    impl.finalStageThisExecute.assign(resources.size(), VkPipelineStageFlags2{0});
+    impl.finalAccessThisExecute.assign(resources.size(), VkAccessFlags2{0});
+    std::vector<bool>& firstBarrierSeen = impl.firstBarrierSeen;
+    std::vector<bool>& attachmentEverWritten = impl.attachmentEverWritten;
 
     const std::span<const uint32_t> order = compiled.executionOrder();
     const std::span<const PassBarriers> allBarriers = compiled.passBarriers();
@@ -1078,7 +1271,12 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
         // nor DEPTH_ATTACHMENT_OPTIMAL (see pass.h's Pass::resolveAccess
         // table), so this is an exhaustive, unambiguous classification,
         // not a heuristic.
-        std::vector<uint32_t> colorPhysIdx;
+        // [Task 23, gate matrix #29 sites 5-6] Impl-persistent per-pass
+        // scratch, `.clear()`d at the top of every pass iteration -- see
+        // Executor::Impl's own comment on this pair. `depthPhysIdx` stays a
+        // plain stack local: std::optional<uint32_t> never heap-allocates.
+        std::vector<uint32_t>& colorPhysIdx = impl.colorPhysIdxScratch;
+        colorPhysIdx.clear();
         std::optional<uint32_t> depthPhysIdx;
         for (const ResourceAccess& access : accesses) {
             if (access.layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
@@ -1094,7 +1292,10 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
         const bool isGraphicsPass = !colorPhysIdx.empty() || depthPhysIdx.has_value();
 
         VkExtent2D renderArea{0, 0};
-        std::vector<VkRenderingAttachmentInfo> colorAttachments;
+        // [Task 23, gate matrix #29 sites 5-6] Same Impl-persistent
+        // treatment as colorPhysIdx above.
+        std::vector<VkRenderingAttachmentInfo>& colorAttachments = impl.colorAttachmentsScratch;
+        colorAttachments.clear();
         VkRenderingAttachmentInfo depthAttachment{};
         // Phase 4 Task 7: hoisted out of the `if (isGraphicsPass)` block
         // below (it used to be a block-local) so a CHUNKED graphics pass can
@@ -1252,11 +1453,24 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
         // above (PinnedHistorySlot::barrierState persists across
         // execute() calls on its own -- there is nothing left for this
         // generic mechanism to do for them at all).
-        for (const auto& [physIdx, combined] : combineAccessesByResource(accesses)) {
+        // [Task 23, gate matrix #29 -- hidden per-pass allocation found
+        // while implementing this task, see combineAccessesByResource()'s
+        // own comment] Writes into impl.combinedAccessScratch rather than
+        // returning a fresh vector.
+        combineAccessesByResource(accesses, impl.combinedAccessScratch);
+        for (const auto& [physIdx, combined] : impl.combinedAccessScratch) {
             const ResolvedResource& combinedRes = impl.resources.at(physIdx);
             if (!combinedRes.isBackbuffer && !combinedRes.isHistory) {
-                finalStageThisExecute[physIdx] |= combined.stages;
-                finalAccessThisExecute[physIdx] |= combined.access & kPoolWriteAccessMask;
+                // [Task 23, gate matrix #29 sites 3-4] Dense, physicalIndex-
+                // addressed vectors instead of the old node-based
+                // std::unordered_maps -- `touchedThisExecute` is this
+                // resource's explicit "some pass touched it THIS call"
+                // marker, replacing the maps' own implicit
+                // "key present" signal (see Executor::Impl's own comment on
+                // why that distinction must survive the switch).
+                impl.touchedThisExecute[physIdx] = true;
+                impl.finalStageThisExecute[physIdx] |= combined.stages;
+                impl.finalAccessThisExecute[physIdx] |= combined.access & kPoolWriteAccessMask;
             }
         }
     }
@@ -1268,9 +1482,18 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
     // execute() call's first-use-of-frame override (applyBarriers() above)
     // chains off the real value instead of staying pinned at
     // ALL_COMMANDS forever.
-    for (const auto& [physIdx, stage] : finalStageThisExecute) {
+    // [Task 23, gate matrix #29 sites 3-4] Walks every physicalIndex,
+    // skipping every one `touchedThisExecute` did not mark this call --
+    // the exact same population the old maps' own key set covered (see
+    // above), preserving TransientPool::sweepStale()'s "only a genuinely
+    // accessed-this-call resource looks freshly used" contract.
+    for (uint32_t physIdx = 0; physIdx < resources.size(); ++physIdx) {
+        if (!impl.touchedThisExecute[physIdx]) {
+            continue;
+        }
         const ResolvedResource& resolvedRes = impl.resources.at(physIdx);
-        const VkAccessFlags2 access = finalAccessThisExecute[physIdx];
+        const VkPipelineStageFlags2 stage = impl.finalStageThisExecute[physIdx];
+        const VkAccessFlags2 access = impl.finalAccessThisExecute[physIdx];
         if (resources[physIdx].isBuffer) {
             impl.pool.buffer(resolvedRes.poolIndex).lastFrameFinalStages = stage;
             impl.pool.buffer(resolvedRes.poolIndex).lastFrameFinalAccess = access;
@@ -1366,7 +1589,12 @@ void Executor::recordChunkedPass(const Pass& pass, PassContext& ctx, VkCommandBu
 
     const uint32_t chunkCount = detail::chunkCountForWorkerCount(impl.scheduler->workerCount());
     impl.lastChunkCount = chunkCount;
-    std::vector<VkCommandBuffer> chunkBuffers(chunkCount, VK_NULL_HANDLE);
+    // [Task 23, gate matrix #29 sites 10-11] Impl-persistent, frame-slot
+    // indexed -- see Executor::Impl's own comment on this pair.
+    // `.assign()` (not reconstructed) reuses whatever capacity a past call
+    // for this same frameSlot already grew.
+    std::vector<VkCommandBuffer>& chunkBuffers = impl.chunkBuffersScratch[frameSlot];
+    chunkBuffers.assign(chunkCount, VK_NULL_HANDLE);
 
     // Records chunk `chunkIndex`'s own secondary command buffer, acquiring
     // it from `workerIndex`'s own (frameSlot, threadIndex) arena -- shared
@@ -1483,7 +1711,8 @@ void Executor::recordChunkedPass(const Pass& pass, PassContext& ctx, VkCommandBu
     // valid, so a defensive, logged degrade here is "this pass drew less
     // than it should have" (already logged, per-chunk, above), never a
     // crash or a validation error from handing it a null handle.
-    std::vector<VkCommandBuffer> validChunkBuffers;
+    std::vector<VkCommandBuffer>& validChunkBuffers = impl.validChunkBuffersScratch[frameSlot];
+    validChunkBuffers.clear();
     validChunkBuffers.reserve(chunkBuffers.size());
     for (VkCommandBuffer buf : chunkBuffers) {
         if (buf != VK_NULL_HANDLE) {
@@ -1506,7 +1735,19 @@ void Executor::recordChunkedPass(const Pass& pass, PassContext& ctx, VkCommandBu
 namespace {
 
 uint32_t lookupResolvedIndex(const Executor::Impl& impl, std::string_view name) {
-    auto it = impl.nameToIndex.find(std::string(name));
+    // [Task 23, gate matrix #29 site 12] `impl.nameToIndex`'s transparent
+    // Hash+KeyEqual (TransparentStringHash, above) is what makes THIS
+    // overload resolution possible at all: `find()` here binds directly to
+    // unordered_map's templated heterogeneous-lookup overload with `name`'s
+    // own std::string_view -- no `std::string(name)` temporary. A future
+    // edit that silently reverted `nameToIndex`'s declared type back to
+    // plain `std::unordered_map<std::string, uint32_t>` would not silently
+    // reintroduce the old allocation here either: std::string_view has NO
+    // implicit conversion to std::string (std::string's string_view-taking
+    // constructor is `explicit`, C++17 [string.cons]), so this exact call
+    // would simply fail to COMPILE against a non-transparent map, not
+    // silently regress at runtime.
+    auto it = impl.nameToIndex.find(name);
     if (it == impl.nameToIndex.end()) {
         throw std::out_of_range("rx_graph: PassContext: no realized resource named '" + std::string(name) + "'");
     }
@@ -1635,6 +1876,68 @@ VkPipelineStageFlags2 debugLastFrameFinalStages(const Executor& executor, std::s
         return impl.pool.buffer(resolved.poolIndex).lastFrameFinalStages;
     }
     return impl.pool.image(resolved.poolIndex).lastFrameFinalStages;
+}
+
+// [Task 23, gate ruling #29] Test/debug-only seam -- NOT part of the
+// stable public contract, mirroring debugChunkStats()/
+// debugLastFrameFinalStages()'s own carve-out convention immediately
+// above and rx::scene::detail::capacitiesForTesting()'s identical
+// zero-alloc-test seam (draw_list.h, Phase 4 Task 19/D26's own precedent).
+// Snapshots the `.capacity()` of every Impl-persistent buffer this task
+// converted execute()'s own former per-call heap allocations into --
+// gate ruling #29's own bound methodology (capacity-snapshot via
+// test-only accessors, NOT global operator-new interposition, since
+// rx_graph_gpu_tests links volk/the Vulkan validation layers/Tracy's own
+// rpmalloc). A steady-state zero-alloc claim across N execute() calls is
+// exactly "every one of these stays bit-for-bit unchanged after a
+// warm-up call" -- see test_execute_gpu.cpp's own zero-alloc TEST_CASE.
+ExecutorAllocationCapacitiesForTesting allocationCapacitiesForTesting(const Executor& executor) {
+    // executor.h cannot include rx_rhi_vk/frame_sync.h (device-free-header
+    // discipline, this file's own top comment) so
+    // ExecutorAllocationCapacitiesForTesting's two per-frame-slot arrays are
+    // hardcoded to size 2 there -- this guards that literal against ever
+    // silently drifting from the real rx::rhi::FrameSync::kFramesInFlight
+    // this .cpp builds impl.chunkBuffersScratch/validChunkBuffersScratch
+    // against.
+    static_assert(rx::rhi::FrameSync::kFramesInFlight == 2,
+                  "ExecutorAllocationCapacitiesForTesting's chunk-scratch arrays are hardcoded to size 2 in "
+                  "executor.h -- update both if kFramesInFlight ever changes");
+    const Executor::Impl& impl = *executor.impl_;
+    ExecutorAllocationCapacitiesForTesting result;
+    result.firstBarrierSeen = impl.firstBarrierSeen.capacity();
+    result.attachmentEverWritten = impl.attachmentEverWritten.capacity();
+    result.touchedThisExecute = impl.touchedThisExecute.capacity();
+    result.finalStageThisExecute = impl.finalStageThisExecute.capacity();
+    result.finalAccessThisExecute = impl.finalAccessThisExecute.capacity();
+    result.colorPhysIdxScratch = impl.colorPhysIdxScratch.capacity();
+    result.colorAttachmentsScratch = impl.colorAttachmentsScratch.capacity();
+    result.vkImageBarriersScratch = impl.vkImageBarriersScratch.capacity();
+    result.vkBufferBarriersScratch = impl.vkBufferBarriersScratch.capacity();
+    result.combinedAccessScratch = impl.combinedAccessScratch.capacity();
+    result.debugLabelScratch = impl.debugLabelScratch.capacity();
+    for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
+        result.chunkBuffersScratch[slot] = impl.chunkBuffersScratch[slot].capacity();
+        result.validChunkBuffersScratch[slot] = impl.validChunkBuffersScratch[slot].capacity();
+    }
+
+    // Pointer-identity companions -- see the struct's own doc comment for
+    // why this second signal is necessary, not merely corroborating,
+    // alongside capacity. No std::vector<bool>::data() exists at all (see
+    // the struct's own comment on that gap), so firstBarrierSeen/
+    // attachmentEverWritten/touchedThisExecute have no pointer field.
+    result.finalStageThisExecuteData = impl.finalStageThisExecute.data();
+    result.finalAccessThisExecuteData = impl.finalAccessThisExecute.data();
+    result.colorPhysIdxScratchData = impl.colorPhysIdxScratch.data();
+    result.colorAttachmentsScratchData = impl.colorAttachmentsScratch.data();
+    result.vkImageBarriersScratchData = impl.vkImageBarriersScratch.data();
+    result.vkBufferBarriersScratchData = impl.vkBufferBarriersScratch.data();
+    result.combinedAccessScratchData = impl.combinedAccessScratch.data();
+    result.debugLabelScratchData = impl.debugLabelScratch.data();
+    for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
+        result.chunkBuffersScratchData[slot] = impl.chunkBuffersScratch[slot].data();
+        result.validChunkBuffersScratchData[slot] = impl.validChunkBuffersScratch[slot].data();
+    }
+    return result;
 }
 
 }  // namespace detail
