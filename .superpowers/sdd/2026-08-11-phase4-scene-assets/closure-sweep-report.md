@@ -10,8 +10,13 @@ order:
 | 3 | `25bf348` | fix(samples): wire FrameSync::advanceFrame(Allocator\*) into sample 04's frame loop |
 | 4 | `1d07330` | test(rx_asset): combined glTF-import -> TextureCache -> pixel test (Task 14 minor 4.6) |
 | 5 | `5a10901` | ci: add restore-keys cache fallback and per-ref concurrency serialization |
+| docs | `ffff2f5` | closure-sweep report (original five-item evidence) |
+| fix-round Critical | `b6f3e2f` | fix(third_party): make mikktspace PATCH_COMMAND idempotent across reconfigures |
+| fix-round minor | `6468294` | ci: prune stale .deps-cache entries before save |
 
-Final CI-equivalent gate, run after all five commits:
+Final CI-equivalent gate, run after all five original commits (see the
+"Final re-verification after the fix round" section below for the gate
+re-run after the two fix-round commits above):
 
 - linux-native: full `cmake --build --preset linux-native` clean, then
   `ctest --preset linux-native --output-on-failure` — **20/20 passed**,
@@ -362,16 +367,215 @@ instruction.
 
 ---
 
+# Fix round — review findings
+
+Independent review approved items 1/3/4/5 with re-verification (harness-
+gate revert reproduced exit-1 on the reviewer's own hardware; sample-04
+numbers matched exactly; the combined test confirmed genuinely executing
+with per-quadrant asserts; DepCache/fetch_assets staleness-safety proven
+structurally). One Critical (item 2's `PATCH_COMMAND` not idempotent
+across reconfigures) and one minor (`.deps-cache` unbounded accumulation
+under the new `restore-keys` fallback) were sent back. Both closed below.
+
+Commits: `b6f3e2f` (Critical), `6468294` (minor).
+
+## Critical — item 2's PATCH_COMMAND is not idempotent
+
+**Reproduction** (exactly as the reviewer described — no manual state
+tampering): on an already-configured `linux-native` tree with item 2's
+original commit (`27926ec`) in place, a second, completely ordinary
+`cmake --preset linux-native` failed:
+
+```
+[0/7] Performing update step for 'mikktspace-populate'
+[2/7] Performing patch step for 'mikktspace-populate'
+FAILED: .../mikktspace-populate-stamp/mikktspace-populate-patch
+cd .../mikktspace-src && patch -p1 -i .../mikktspace-ubsan-shift-fix.patch && ...
+patching file mikktspace.c
+Reversed (or previously applied) patch detected!  Assume -R? [n]
+Apply anyway? [n]
+Skipping patch.
+1 out of 1 hunk ignored -- saving rejects to file mikktspace.c.rej
+ninja: build stopped: subcommand failed.
+
+CMake Error at /usr/share/cmake-3.22/Modules/FetchContent.cmake:1087 (message):
+  Build step for mikktspace failed: 1
+```
+
+**Root cause.** FetchContent's underlying ExternalProject-style UPDATE
+step reruns on every fresh `cmake` process (the `mikktspace_POPULATED`
+guard in `third_party/CMakeLists.txt` is an in-memory global property
+that resets on every new `cmake` invocation — only the on-disk
+ExternalProject stamp files persist), and a rerun UPDATE step
+unconditionally reruns PATCH too. Confirmed this is NOT unique to
+mikktspace: reconfiguring with `-DFETCHCONTENT_QUIET=OFF` (which
+suppresses normal populate-step output by default — confirmed via
+`grep -n FETCHCONTENT_QUIET /usr/share/cmake-3.22/Modules/FetchContent.cmake`)
+shows every OTHER `FetchContent_Populate`'d dependency in this file
+(`doctest`, `glm`, `volk`, `vma`, `stb`) silently repeating
+`"Performing update step"` / `"No patch step"` on every single
+reconfigure too — they were never actually broken by this only because
+none of them carries a `PATCH_COMMAND`, so there is nothing to reapply;
+`git checkout` of an already-checked-out pinned commit is a genuine
+no-op. mikktspace is the ONLY dependency anywhere in this repository with
+a `PATCH_COMMAND` (confirmed: `grep -rn PATCH_COMMAND third_party/
+CMakeLists.txt` — one match, the mikktspace declaration itself).
+
+**Fix.** Added `UPDATE_DISCONNECTED TRUE` to the mikktspace
+`FetchContent_Declare` — CMake's own documented mechanism for a
+commit-hash-pinned dependency that is never expected to move: it makes
+the update step run only as part of the initial population (nothing to
+update yet, so download+patch proceed normally), then skips it entirely
+on every later configure. Not `patch -N` (tested: `patch -p1 -N -i
+<file>` on the already-patched tree still exits nonzero on this GNU
+patch version, `patch: **** malformed patch...` / reject, not a clean
+skip) and not a `|| true` swallow (would silently hide a genuinely
+broken patch on a real content change).
+
+**Verification matrix, both presets, all sequential foreground runs (no
+backgrounding, per the coordinator's process correction after an
+earlier attempt raced two concurrent background `cmake` invocations and
+produced one unrelated, environment-specific "compiler path changed"
+failure unrelated to this fix — resolved by wiping and re-running
+sequentially; see "Process note" below):**
+
+| Step | linux-native | windows-cross-zig |
+|---|---|---|
+| (a) fresh configure, wiped build dir | pass — patch applied once (`[1/8] download → [3/8] patch`, step 2/update genuinely absent from the DAG under UPDATE_DISCONNECTED) | pass — identical sequence |
+| (b) second ordinary configure, no changes | pass — `ninja: no work to do.` for mikktspace, patch still applied, no `.rej` | pass — reproduced 3 consecutive times after the process correction (`ninja: no work to do.` every time) |
+| (c) third configure after a comment-only edit to `third_party/CMakeLists.txt` | pass — patch still applied, no `.rej` | pass — patch still applied, no `.rej` |
+| (d) full build | 149/149 targets clean | 147/147 targets clean |
+| (e) other FetchContent deps | see below | see below |
+
+(e) **Other FetchContent deps' exposure.** `doctest`/`glm`/`volk`/`vma`/
+`stb` share the identical structural exposure (silent update-step rerun
+on every configure, confirmed above) but are NOT broken by it and did
+NOT need fixing: none carries a `PATCH_COMMAND` or any other
+non-idempotent step (confirmed both by `grep -rn PATCH_COMMAND` across
+the whole repo — one match, mikktspace's own, now fixed — and by dozens
+of successful reconfigures across this whole task with zero failures for
+any of them). `rx_add_cached_dependency`-based deps (spdlog,
+Vulkan-Headers, SDL3, vk-bootstrap, enkiTS, tracy, fastgltf,
+meshoptimizer, draco, ktx) are structurally outside this exposure class
+entirely — `cmake/DepCache.cmake`'s own `.rx-built` marker check gates
+the ENTIRE clone/build/install sequence, so an already-built dependency
+does zero work of any kind on reconfigure (confirmed directly: these
+never appear in the FETCHCONTENT_QUIET=OFF trace at all, only
+`[dep-cache] HIT` messages).
+
+**Process note (non-blocking, for the record).** One reconfigure attempt
+right after the coordinator's "stop backgrounding" correction reproduced
+the reversed-patch failure on windows-cross-zig's SECOND configure, even
+with the fix in place. Investigated rather than dismissed: this
+coincided with a stray earlier background `cmake --preset
+windows-cross-zig` run that had itself failed with an unrelated
+"CMAKE_C_COMPILER changed, cache must be deleted" error (traced to this
+sandbox exposing the same physical repository at two bind-mounted paths,
+`/media/ywadi/second/renderer_x` and `/home/ywadi/d2/renderer_x` --
+confirmed same device+inode via `stat`) after having been launched
+CONCURRENTLY alongside the linux-native background configure — a race
+the coordinator's process correction was specifically meant to
+eliminate. A full wipe (`rm -rf build/windows-cross-zig`) plus a
+carefully sequential, single-process reproduction of the exact same
+(a)/(b)/(c)/(d) sequence immediately afterward succeeded cleanly and
+repeatably (3 consecutive clean second-configures, shown in the table
+above) — the fix itself is sound; the one anomalous failure is
+attributed to leftover state from concurrent background execution, not
+a flaw in UPDATE_DISCONNECTED.
+
+## Minor — .deps-cache unbounded accumulation under restore-keys
+
+**Problem.** The `restore-keys` fallback (item 5(a), original sweep)
+means a cache restore can carry forward hash-keyed subdirectories from
+an older configure that the current one no longer references (a removed
+dependency, a re-pinned tag, a changed `CMAKE_ARGS`/toolchain hash).
+Nothing previously deleted them, so the saved `.deps-cache` cache entry
+would grow monotonically across many `third_party/CMakeLists.txt` edits,
+eventually approaching GitHub Actions' 10GB total cache limit.
+
+**Fix (pruning, not merely documenting — closed per the no-deferral
+policy).** `cmake/DepCache.cmake`'s `rx_add_cached_dependency()` now
+writes every key it resolves this configure to
+`${CMAKE_BINARY_DIR}/deps-cache-manifest.txt` (build-dir-local, never
+itself cached/restored — always freshly and completely regenerated by a
+real configure). Safety argument: this function only reaches the point
+of recording a key AFTER computing it; if that dependency's own
+clone/build/install subsequently fails, `FATAL_ERROR` aborts the whole
+configure (and the job) before the manifest is ever read downstream — so
+by construction, every key present in a manifest that survives to the
+prune step names a dependency that is genuinely built and installed.
+`ci.yml` adds a "Prune stale dependency cache entries" step (both jobs,
+immediately after Configure) that deletes any `.deps-cache/` subdirectory
+NOT listed in that job's own manifest, before the cache-save (an
+implicit post-job step of the existing "Cache third-party dependency
+builds" step) uploads whatever remains.
+
+**Verification.** Dry-run against this session's own real,
+locally-accumulated `.deps-cache` (114 subdirectories, 1.8GB, built up
+by many manual reconfigures across this whole closure-sweep task):
+
+```
+=== .deps-cache dirs BEFORE prune ===
+114
+1.8G	.deps-cache
+=== manifest (authoritative current set) ===
+spdlog-e2c63655474c23af
+Vulkan-Headers-e7a4bc77264ec07b
+SDL3-4b365ff3c972099c
+vk-bootstrap-7a3bfdb6b0730102
+enkiTS-cb6775641402d1e2
+tracy-d3259c11d7efada2
+fastgltf-555a6d6653d57030
+meshoptimizer-fe36010e0c110beb
+draco-a43087e6ee3db89f
+ktx-6e7e780595aa2b62
+would remove: 104, would keep: 10
+```
+
+The 10 "keep" entries matched the manifest exactly, byte for byte; the
+104 "remove" entries were every subdirectory NOT in it. This was a
+**dry run only** — the destructive `rm -rf` was deliberately not executed
+against the real local `.deps-cache`, since this checkout's cache
+directory is shared between BOTH presets locally (unlike CI, where each
+job restores its own isolated `deps-cache-<preset>-*` cache entry into a
+fresh checkout) — pruning by only the linux-native manifest here would
+have incorrectly deleted windows-cross-zig's own currently-needed
+entries, a local-environment artifact that does not apply to CI's actual
+per-job isolation. `actionlint` (1.7.12) reports zero findings against
+the final `ci.yml` with both prune steps added.
+
+## Final re-verification after the fix round
+
+- linux-native: full `cmake --build --preset linux-native` clean
+  (149/149 targets — 2 more than the original sweep's 147, since the
+  DepCache.cmake edit invalidated every dependency's own cache key one
+  time, forcing a full one-time dependency rebuild cascade, expected and
+  documented behavior per that file's own header comment), then
+  `ctest --preset linux-native --output-on-failure` — **20/20 passed**,
+  101.40s total.
+- windows-cross-zig: full `cmake --build --preset windows-cross-zig`
+  clean (147/147 targets), then the exact CI ctest invocation under
+  `xvfb-run -a` + Wine — **10/10 passed**, 108.68s total.
+
+---
+
 ## Concerns / notes for the coordinator
 
-- None blocking. All five items closed, verified, and green on both CI
-  presets locally (build clean + full ctest pass, matching CI's exact
-  invocations, including under Wine for windows-cross-zig).
+- None blocking. All five original items plus both fix-round findings
+  closed, verified, and green on both CI presets locally (build clean +
+  full ctest pass, matching CI's exact invocations, including under Wine
+  for windows-cross-zig).
 - Item 5's `actionlint` binary was fetched ad hoc into `/tmp` for this
   session (not installed system-wide, not added to the repo or CI) —
   purely a local verification aid; CI itself does not run actionlint.
+- The fix round's minor (deps-cache pruning) is verified by dry run, not
+  a real local execution, for the environment-specific reason explained
+  above (shared local `.deps-cache` across presets) — CI's own per-job
+  isolation means this is not a caveat on the mechanism itself, only on
+  how thoroughly it could be exercised locally.
 - Two untracked SDD files were present in the working tree at start
-  (`closure-sweep-brief.md`, `task-16-brief.md`) and one other in-flight
+  (`closure-sweep-brief.md`, `task-16-brief.md`), one other in-flight
   agent's own worktree modifications to `progress.md`/the toolchain spec
-  doc — none of these were touched by this sweep, per the "only your own
-  files" constraint.
+  doc, and a new untracked review diff file appeared during this fix
+  round (`review-55410f0..ffff2f5.diff`, not authored by this sweep) —
+  none of these were touched, per the "only your own files" constraint.
