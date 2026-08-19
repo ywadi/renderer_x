@@ -159,11 +159,11 @@ including gamepad hot-plug/axis/button paths, which SDL3's
 `src/rx_platform/tests/window_test.cpp`) — but a few things are genuinely
 NOT automatable headlessly, matching this file's own established
 "screenshot/human-observed, not scriptable" carve-out (see e.g. row 3's own
-acceptance criterion in the gate matrix for this ticket). **No sample yet
-consumes this surface** — Task 24 (`09_fly_through`) is the first real
-consumer (mouse-look + gamepad + WASD fly-through camera); the rows below
-are the raw platform-level checks, independent of that sample, and the
-sample itself will carry its own MANUAL_VERIFICATION section once it lands.
+acceptance criterion in the gate matrix for this ticket). **`09_scene`
+(Task 24) is now the first real consumer** (mouse-look + gamepad + WASD
+fly-through camera — see this file's own `## 09_scene` section below for
+its end-to-end checklist); the rows below remain the raw platform-level
+checks, independent of that sample.
 
 - [ ] Relative mouse mode: call `setRelativeMouseMode(true)` in a real
       (non-hidden) window session — cursor visibly disappears and stays
@@ -192,11 +192,10 @@ sample itself will carry its own MANUAL_VERIFICATION section once it lands.
       `SDL_AttachVirtualJoystick` instead; this row is the real-USB-event
       analogue.)
 - [ ] Steam Deck: the ticket's own stated acceptance bar ("Steam Deck pad
-      drivability") — run on real Deck hardware (or via a real gamepad on
-      desktop as a stand-in until Deck hardware is available) once Task 24
-      lands a sample that actually consumes stick/trigger/button input;
-      confirm the built-in controls (or an attached pad) drive the
-      fly-through camera as expected, and check the log for the
+      drivability") — run `09_scene --present` on real Deck hardware (or
+      via a real gamepad on desktop as a stand-in until Deck hardware is
+      available); confirm the built-in controls (or an attached pad) drive
+      the fly-through camera as expected, and check the log for the
       gyro/device-name diagnostic line this ticket adds
       (`rx_platform: gamepad connected id=... name="..." hasGyroSensor=...`)
       — SDL issue #9148 predicts a Steam Deck's own gyro reports
@@ -204,12 +203,13 @@ sample itself will carry its own MANUAL_VERIFICATION section once it lands.
       confirms that diagnostic actually appears on real Deck hardware,
       not just in the virtual-joystick test.
 
-**Last run:** not yet performed — this task (Task 20) implemented and
-automated-tested the platform-level surface only; no sample exists yet to
-drive an end-to-end human-observed session against. Fill in the checkboxes
-above once Task 24's `09_fly_through` sample lands and this section can be
-run for real (on desktop first, then Steam Deck hardware before any release
-claiming Deck gamepad support).
+**Last run:** not yet performed on real hardware — this task (Task 20)
+implemented and automated-tested the platform-level surface; `09_scene`
+(Task 24) now drives it end to end (see this file's own `## 09_scene`
+section), but a real human-observed session (desktop mouse/keyboard/
+gamepad, then Steam Deck) has not yet been performed. Fill in the
+checkboxes above the first time this is actually run, before any release
+claiming Deck gamepad support.
 
 ## rx_debug_ui overlay (Phase 4 Stage 2 Task 21, spec D20, gate ruling #16)
 
@@ -219,12 +219,12 @@ event dispatch, LOAD-not-CLEAR pattern-preservation, at-most-once
 offscreen readback target (`src/rx_debug_ui/tests/test_overlay_gpu.cpp`,
 `rx_debug_ui_gpu_tests`) under lavapipe + validation, both CI presets
 (GPU test excluded on windows-cross-zig/Wine — no real Vulkan device
-there, same posture as `rx_rhi_vk_tests`/`rx_graph_gpu_tests`). **No
-sample yet consumes this module** — Task 24 (`09_fly_through`) is
-expected to be the first real HUD consumer; the rows below are genuinely
-not automatable headlessly and are routed here per the gate matrix's own
-text (row 6: "a headless test cannot exercise the 'camera stops moving'
-half of this rule directly, so that half is a MANUAL_VERIFICATION row").
+there, same posture as `rx_rhi_vk_tests`/`rx_graph_gpu_tests`). **`09_scene`
+(Task 24) is now the first real HUD consumer** (see this file's own
+`## 09_scene` section below); the rows below are genuinely not automatable
+headlessly and are routed here per the gate matrix's own text (row 6: "a
+headless test cannot exercise the 'camera stops moving' half of this rule
+directly, so that half is a MANUAL_VERIFICATION row").
 
 - [ ] Visual HUD sanity in a REAL windowed session (not the offscreen
       readback target the automated test uses): the overlay renders
@@ -253,11 +253,12 @@ half of this rule directly, so that half is a MANUAL_VERIFICATION row").
       NOT implemented this phase, per gate ruling #16 row 7 — Manual
       gamepad mode means the HUD is not gamepad-navigable at all yet).
 
-**Last run:** not yet performed — this task (Task 21) implemented and
-automated-tested the module against an offscreen readback target only; no
-sample exists yet to drive an end-to-end human-observed session against.
-Fill in the checkboxes above once a sample (Task 24 or earlier) actually
-wires this overlay into a live windowed present loop.
+**Last run:** not yet performed on real hardware — this task (Task 21)
+implemented and automated-tested the module against an offscreen readback
+target; `09_scene` (Task 24) now wires this overlay into a live windowed
+present loop (see this file's own `## 09_scene` section), but a real
+human-observed session has not yet been performed. Fill in the checkboxes
+above the first time this is actually run.
 
 ## 05_multipass (`--present` mode)
 
@@ -348,6 +349,60 @@ hardware check this file otherwise tracks. Fill in the checkboxes and
 hardware/driver details above the first time `--present` is actually
 watched running on a real display.
 
+## 07_stress (`--present` mode)
+
+`sample_07_stress` needs the Slang runtime libraries + its own four
+on-disk shader sources deployed next to it — see `samples/README.md`'s own
+"Redistribution" section for the full manifest; it is not statically
+linked like 01_triangle. [Phase 4 Stage 2 Task 24 — this section was
+missing; added while touching this file per that task's own binding
+scope.]
+
+### What "pass" means, every platform
+
+- The window opens and shows a large, non-overlapping grid of red/green/
+  blue/magenta cubes and spheres (the sample's 4 mesh/pipeline-state
+  variants), viewed from directly above through a fixed, non-orbiting
+  camera — the field never moves or animates (a deliberate experimental-
+  design choice, see `samples/07_stress/main.cpp`'s own header comment).
+- `--draws N` (default 30000) controls the field's own instance count;
+  `--threads N` overrides the sample's own `Scheduler` worker count (a
+  measurement instrument, not an engine-wide switch — `--threads 1`
+  collapses the forward pass to genuinely serial recording, the A/B
+  baseline the default multi-worker count is compared against).
+- Closing the window exits promptly, with no crash/hang, and logs
+  `--present: window closed cleanly`.
+- On Linux, run with `--validate` and confirm no `[error]`-level validation
+  output beyond this codebase's documented false-positive guards (see the
+  "What 'pass' means" section at the top of this file for the exact
+  mechanism).
+
+### Linux (native, `linux-native` preset)
+
+- [ ] Build: `cmake --preset linux-native && cmake --build --preset linux-native`
+- [ ] Run: `./build/linux-native/samples/07_stress/sample_07_stress --present --validate`
+- [ ] The full instanced field renders correctly (all 4 variant colors
+      visible, no z-fighting/corruption), with zero unexpected validation
+      errors
+- [ ] `--threads 1` vs the default worker count both run without error
+      (visually identical output — `--threads` affects CPU recording cost
+      only, never the rendered result)
+- [ ] Closes cleanly; headless mode still exits 0
+
+**Last run:** not yet performed as a real, human-observed run on real
+display hardware. Functionally verified during this and later tasks' own
+development via an offscreen X server (Xvfb) against lavapipe:
+`sample_07_stress_headless`'s own analytic pixel-dominance probes pass
+under `ctest` on every CI run (`.github/workflows/ci.yml`), and the
+`--present` path has been exercised under Xvfb (window opens, renders,
+`SIGTERM` → `SDL_EVENT_QUIT` → clean exit) as part of Task 24's own
+end-to-end verification of the render-graph/executor path 09_scene shares
+with this sample. This is real functional verification, not a
+placeholder — but it is not the human-observed-on-real-hardware check this
+file otherwise tracks. Fill in the checkboxes and hardware/driver details
+above the first time `--present` is actually watched running on a real
+display.
+
 ## 08_gltf_viewer (`--present` mode)
 
 `sample_08_gltf_viewer` needs the Slang runtime libraries + its own
@@ -402,3 +457,125 @@ verification, not a placeholder — but it is not the human-observed-on-real-
 hardware, real-mouse-drag check this file otherwise tracks. Fill in the
 checkboxes and hardware/driver details above the first time `--present` is
 actually watched (and dragged) on a real display.
+
+## 09_scene (`--present` mode, the Phase 4 phase-exit sample)
+
+`sample_09_scene` needs the Slang runtime libraries + its own
+`material_shaders/`/`shadow_shaders/`/`references/` subdirectories + a
+pre-staged `assets/DamagedHelmet/glTF/` deployed next to it — see
+`samples/README.md`'s own "Redistribution" section for the full manifest.
+
+### What "pass" means, every platform
+
+- The window opens showing the default DamagedHelmet grid (4 rows x 4
+  columns; the fixed startup camera frames the two default-visible rows —
+  8 helmets — plus a directional-light shadow on the ground) rendered
+  through the full Registry → Scene → DrawListBuilder → render-graph path.
+  `--scene sponza` (after `tools/fetch_assets.sh --sponza`) loads Sponza
+  instead; without that fetch it fails loudly with a named "run
+  `tools/fetch_assets.sh --sponza` first" error rather than hanging or
+  crashing.
+- WASD + mouse-look (relative mouse mode) + gamepad (left stick move,
+  right stick look) fly the camera through the scene smoothly, with no
+  jump/snap and no drift.
+- The ImGui HUD shows FPS/frame-ms (60-frame rolling average), cull
+  counters (visible/culled/recordsIn/drawsSubmitted + the instancing-
+  collapse-ratio percentage), a vsync checkbox, TWO VISIBLY DISTINCT mask
+  controls — one row of layer-mask checkboxes (toggling a row's checkbox
+  hides/shows that whole row of helmets outright) and a SEPARATE light-
+  channel checkbox (toggling it only changes whether row 0 is lit/casts a
+  shadow — the helmets in row 0 never disappear when this is toggled,
+  unlike the layer checkboxes) — pool stats, and the #27 memory report.
+- The vsync checkbox visibly changes tearing/frame-pacing behavior and logs
+  the same "present mode in use" line the `--vsync` CLI flag produces.
+- `--stress` (optionally with `--stress-draws N`/`--threads N`) replaces
+  the scene with a large Registry-free instanced field (30000 instances by
+  default) through the same scene path, for the stress-v2 A/B comparison
+  against `07_stress` (see this task's own report for the published
+  numbers).
+- Closing the window exits promptly, with no crash/hang, and logs
+  `sample_09_scene: window closed cleanly`.
+- On Linux, run with `--validate` and confirm no `[error]`-level validation
+  output beyond this codebase's documented false-positive guards.
+
+### Linux (native, `linux-native` preset)
+
+- [ ] Build: `cmake --preset linux-native && cmake --build --preset linux-native`
+- [ ] Fetch the default asset once: `tools/fetch_assets.sh`
+- [ ] Run: `./build/linux-native/samples/09_scene/sample_09_scene --present --validate`
+- [ ] Default helmet grid renders correctly; fly-through (WASD + mouse-look)
+      feels smooth and correctly oriented
+- [ ] HUD shows FPS/cull-counters/vsync/layer-mask row toggles/light-channel
+      toggle/pool stats/memory report; layer-mask toggles hide/show whole
+      rows, the light-channel toggle only changes row 0's lighting/shadow
+      (never its visibility) — confirms the two controls are genuinely
+      independent, not one shared control
+- [ ] vsync checkbox visibly changes present behavior and logs the same
+      line the `--vsync` CLI flag does
+- [ ] `--scene sponza` (after `tools/fetch_assets.sh --sponza`) loads and
+      renders Sponza; without the fetch it fails loudly with a named error
+- [ ] `--stress` renders the large instanced field smoothly
+- [ ] Closes cleanly; headless mode (`--validate`, no `--present`) still
+      exits 0 with `headless gate PASSED`
+
+**Last run:** not yet performed as a real, human-observed run on real
+display hardware. Functionally verified during this task's own development
+via an offscreen X server (Xvfb) against lavapipe (forced via
+`VK_ICD_FILENAMES`, the same driver CI's own headless gates run against):
+the default helmet grid renders through the full scene path (shadow pass +
+chunked forward pass + tonemap + HUD overlay pass, all real render-graph
+passes), the headless gate's own EXACT counter assertions pass
+(imported=16, visible=8, culled=8 — by layer mask, deterministic —
+recordsIn=8, drawsSubmitted=1, collapse ratio 87.5%), the D17 tolerance-
+pixel gate passes at 0 failing pixels against the committed
+`references/grid_scene.png`, the HUD overlay pass produces real non-empty
+ImGui draw data (a separate, non-pixel-gated headless frame proves this,
+since FPS/frame-ms text is inherently non-deterministic run-to-run), the
+`--stress` path (Registry-free, 30000 instances by default) runs cleanly
+under `--present` with `--threads 2`, and a real `SIGTERM` (translated by
+SDL3 into `SDL_EVENT_QUIT`) exits the present loop cleanly with
+`window closed cleanly` logged and zero unfiltered validation errors, both
+for the default grid and the `--stress` path. `--scene sponza` was
+implemented per the same fetch-and-fail-loudly contract sample 08's own
+Sponza-adjacent code follows, but was NOT exercised against a real fetched
+Sponza asset in this environment (Sponza is present-mode-only, never
+CI-fetched, and fetching the ~53 MB asset was outside this task's
+available session time) — this is a disclosed scope gap, not a claimed
+pass. This is real functional verification, not a placeholder — but it is
+not the human-observed-on-real-hardware, real-mouse-and-gamepad-drive check
+this file otherwise tracks. Fill in the checkboxes and hardware/driver
+details above the first time `--present` is actually watched (and driven)
+on a real display.
+
+## Steam Deck (09_scene, `linux-native` preset)
+
+Same posture as every other sample's own Steam Deck subsection (see
+01_triangle's own, above): SteamOS Desktop Mode uses the identical
+`linux-native` preset and binary, no Deck-specific build variant.
+
+- [ ] Build directly on the Deck in Desktop Mode, or copy the packaged
+      `09_scene/` directory over (see `tools/package_samples.sh`)
+- [ ] Run: `./sample_09_scene --present` from Konsole (or Gamescope)
+- [ ] Fly-through camera is drivable via the Deck's own built-in gamepad
+      controls (left stick move, right stick look) — the ticket's own
+      stated "Steam Deck pad drivability" acceptance bar
+- [ ] HUD renders legibly at the Deck's own display resolution; touch/
+      trackpad-driven toggle interaction remains usable (gamepad HUD
+      navigation is explicitly NOT implemented this phase — Manual gamepad
+      mode, gate ruling #16 row 7 — so HUD toggles need mouse/trackpad,
+      not the pad's own face buttons)
+- [ ] Check the log for the gyro/device-name diagnostic line
+      (`rx_platform: gamepad connected id=... name="..." hasGyroSensor=...`)
+      — SDL issue #9148 predicts `hasGyroSensor=false` on a real Deck at
+      this project's pinned SDL3 version
+- [ ] Closes cleanly via the window's close button, no crash/hang
+
+**Last run:** not yet performed on real Steam Deck hardware — this
+repository was developed and verified on a Linux desktop only; nothing in
+this sample depends on desktop-only APIs (SDL3 + Vulkan 1.3 dynamic
+rendering/synchronization2 both run under SteamOS's RADV driver, and this
+sample uses no capability beyond what every earlier Phase 4 sample already
+exercises there), but that has not yet been confirmed on an actual Deck.
+Fill in the checkboxes and record the SteamOS version/RADV (Mesa) driver
+version above the first time this is actually run on a Deck, before the
+next release that claims Steam Deck support for this sample.

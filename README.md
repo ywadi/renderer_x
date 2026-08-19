@@ -69,15 +69,24 @@ For detailed build and run instructions per platform, including Steam Deck and m
 - **src/rx_shader/** — Runtime Slang-to-SPIR-V compilation and shader reflection (descriptor/push-constant layout)
 - **src/rx_graph/** — Render graph: declarative passes, automatic barrier derivation, transient pooling, dynamic rendering execution
 - **src/rx_material/** — Material system: Slang-module materials, pipeline caching, COM-lite public API, material hot-reload
+- **src/rx_task/** — Job system: `rx::task::Scheduler`, an enkiTS-backed worker pool + main-thread post/pump queue
+- **src/rx_asset/** — Asset pipeline: glTF import (`rx::asset::Registry`), pooled geometry (`GeometryPool`), KTX2/texture streaming (`TextureCache`)
+- **src/rx_scene/** — Scene submission: no-ECS render-proxy layer (`rx::scene::Scene`), reversed-Z `Camera`, frustum/shadow-caster culling + instancing collapse (`DrawListBuilder`)
+- **src/rx_shadow/** — Shadow quality bridge: fitted-ortho shadow frustum, slope-scaled bias, comparison-sampler PCF
+- **src/rx_debug_ui/** — Dear ImGui debug overlay as a declarative render-graph pass
 - **shaders/multipass/** — Shader sources for 05_multipass sample (Slang)
 - **shaders/material/** — Shared material-system shaders (Slang)
+- **shaders/shadow/** — Shared shadow-caster shader (Slang)
 - **samples/01_triangle/** — Hardcoded white triangle via dynamic rendering, headless and present modes
 - **samples/02_hotreload/** — Fullscreen triangle with a runtime-compiled (Slang, not offline slangc) fragment shader and a reflection-driven pipeline layout; live shader hot-reload in present mode
 - **samples/03_bindless_mesh/** — Procedural meshes and textures driven entirely through one bindless descriptor table and a reflection-derived pipeline layout
 - **samples/04_streaming/** — Texture streaming into a fixed bindless residency budget, exercising deferred eviction/re-registration safety while frames are in flight
 - **samples/05_multipass/** — Multipass render graph (shadow map, forward shading, tonemap) demonstrating declarative passes and automatic barrier derivation
 - **samples/06_materials/** — Material-system showcase using the public COM-lite API with hot-reload support and parameter overrides
-- **tools/** — Utilities: dependency cache, Slang prebuilt fetch, build-budget checker
+- **samples/07_stress/** — Parallel-recording stress benchmark: a large procedural instanced field driven through a chunked render-graph pass, single-thread vs. default-worker-count A/B
+- **samples/08_gltf_viewer/** — Real glTF asset import (async), StandardPBR/Unlit rendering via the material system, orbit camera
+- **samples/09_scene/** — Phase 4 phase-exit sample: Registry → Scene → DrawListBuilder → render-graph fly-through, ImGui HUD (cull counters, layer/light-channel toggles, pool/memory stats), `--stress` scene-path A/B benchmark vs. 07_stress
+- **tools/** — Utilities: dependency cache, Slang prebuilt fetch, build-budget checker, test-asset fetch/reference-regeneration, sample packaging
 - **third_party/** — Vendored dependencies (volk, vk-bootstrap, VMA, SDL3, GLM, spdlog)
 
 ## Roadmap
@@ -88,7 +97,9 @@ For detailed build and run instructions per platform, including Steam Deck and m
 
 **Phase 3 (complete):** Render graph (`src/rx_graph/`, declarative passes, derived sync2 barriers, transient pooling, dynamic rendering); material system (`src/rx_material/`, Slang-module materials, lazy pipeline cache, COM-lite public API, hot reload); two new samples (05_multipass, 06_materials) with corresponding shader directories (`shaders/multipass/`, `shaders/material/`); expanded test coverage; CI + packaging for all six samples.
 
-**Phase 4 and beyond:** Asset pipeline (mesh/texture import); scene submission (cameras, lights, culling); rendering techniques (shadows, post-processing, upscaling); tooling (GPU markers, profiling, validation). See [`docs/superpowers/specs/`](docs/superpowers/specs/) for design documents.
+**Phase 4 (complete):** Job system (`src/rx_task/`) and a zero-per-frame-allocation chunked executor for parallel command recording; asset pipeline (`src/rx_asset/`, glTF import via fastgltf/meshoptimizer/Draco/MikkTSpace, pooled geometry, KTX2 textures); scene submission (`src/rx_scene/`, no-ECS render proxies, reversed-Z camera, frustum + shadow-caster culling with GPU instancing collapse); shadow quality bridge (`src/rx_shadow/`); an ImGui debug overlay (`src/rx_debug_ui/`); expanded platform input (mouse capture, gamepad, keyboard); three new samples (07_stress, 08_gltf_viewer, 09_scene — the phase-exit fly-through + stress-v2 benchmark) with corresponding shader directories; expanded test coverage; CI + packaging for all nine samples. Tag `v0.4.0-phase4`.
+
+**Phase 5 and beyond:** Rendering techniques (shadows beyond the single-map baseline, post-processing, upscaling); LOD/meshlet geometry processing; public SDK/DLL surface; tooling (GPU markers, profiling, validation). See [`docs/superpowers/specs/`](docs/superpowers/specs/) for design documents.
 
 ## Testing
 

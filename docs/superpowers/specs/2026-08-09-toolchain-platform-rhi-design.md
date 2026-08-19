@@ -31,7 +31,7 @@ The full system decomposes into these layers, bottom to top:
 | 5 | Resource Management | Buffer/texture lifetime, staging, bindless tables |
 | 6 | Render Graph | Declarative passes/resources, auto barriers, transient aliasing (delivered: Phase 3) |
 | 7 | Material / Shading Abstraction | `IMaterial`, `IShaderModule`, `ITexture`, `IMesh` (delivered: Phase 3) |
-| 8 | Scene Submission | Render items, transforms, cameras, lights; culling/LOD |
+| 8 | Scene Submission | Render items, transforms, cameras, lights; culling/LOD (delivered: Phase 4 — scene submission/culling; LOD remains deferred) |
 | 9 | Rendering Techniques | Shadows, lighting, post stack, upscaling |
 | 10 | Asset Import (offline) | Mesh/texture import & baking tooling |
 | 11 | Public SDK / DLL Surface | The interface game devs link against |
