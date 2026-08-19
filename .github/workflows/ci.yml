@@ -236,7 +236,19 @@ jobs:
       - name: Prune stale dependency cache entries
         run: |
           manifest="build/linux-native/deps-cache-manifest.txt"
-          test -f "${manifest}"
+          # `-s` (exists AND non-empty), not `-f` (exists only): an EMPTY
+          # manifest is not a real failure mode under the current call
+          # graph (rx_add_cached_dependency() always appends at least one
+          # key before Configure can succeed), but relying on that stays
+          # implicit -- an empty file would make every `grep -qxF` below
+          # miss, so the loop would delete every subdirectory instead of
+          # nothing. `-s` fails this step outright (bash runs with
+          # -eo pipefail here, so a bare failing `test` aborts the step,
+          # same fail-hard behavior the missing-file case already had)
+          # before the loop is ever reached, for both missing AND empty --
+          # verified directly for all three cases (missing/empty/
+          # populated) under `bash --noprofile --norc -eo pipefail`.
+          test -s "${manifest}"
           for dir in .deps-cache/*/; do
             key="$(basename "${dir}")"
             if ! grep -qxF "${key}" "${manifest}"; then
@@ -467,7 +479,11 @@ jobs:
       - name: Prune stale dependency cache entries
         run: |
           manifest="build/windows-cross-zig/deps-cache-manifest.txt"
-          test -f "${manifest}"
+          # `-s` (exists AND non-empty), not `-f` -- see the linux-native
+          # job's identically-worded step above for the full rationale
+          # (an empty manifest must fail this step outright, not silently
+          # let the loop below delete every subdirectory).
+          test -s "${manifest}"
           for dir in .deps-cache/*/; do
             key="$(basename "${dir}")"
             if ! grep -qxF "${key}" "${manifest}"; then
