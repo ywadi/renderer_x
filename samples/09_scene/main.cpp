@@ -806,13 +806,28 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
     }
     app->uploader.emplace(std::move(*uploader));
 
-    // Bindless capacities -- generous headroom for the helmet's 5 PBR
-    // textures + samplers, the shadow map + comparison sampler, the
-    // per-pass DrawDataGpu/ShadowDrawData storage buffers, and ImGui's own
-    // font atlas (registered by the vendored backend, NOT through this
+    // Bindless capacities [fix round, Finding H1(a)]: sized for the LARGEST
+    // scene this file actually loads, not just the default DamagedHelmet
+    // grid -- `--scene sponza` (present-mode) goes through this SAME
+    // BindlessTable, and Sponza's own ~25 materials x up to ~3 textures
+    // each exhausted a previous, helmet-only-justified 64 partway through
+    // import (an independent review reproduced this directly: real
+    // capacity-exhaustion errors starting at material#20, which then
+    // exposed a separate TextureCache lifecycle bug on the failure path --
+    // see texture_cache.cpp's own registerRealTexture() fix). Mirrors
+    // samples/08_gltf_viewer's own identical 256 (that sample's own
+    // largest supported scene is likewise arbitrary imported glTF content,
+    // not just its own default asset) rather than inventing a smaller,
+    // scene-specific number that would need re-justifying every time this
+    // sample's own `--scene` surface grows. `samplers` bumped from 16 to
+    // 32 for the same reason (more distinct materials plausibly means more
+    // distinct wrap/filter combinations, even after TextureCache's own
+    // per-descriptor sampler dedup) -- shadow map + comparison sampler,
+    // the per-pass DrawDataGpu/ShadowDrawData storage buffers, and ImGui's
+    // own font atlas (registered by the vendored backend, NOT through this
     // table -- see rx_debug_ui/overlay.h's own FONT/TEXTURE UPLOAD
-    // section).
-    rx::rhi::BindlessTable::Capacities capacities{/*sampledImages=*/64, /*samplers=*/16, /*storageBuffers=*/8};
+    // section) round out the remaining headroom.
+    rx::rhi::BindlessTable::Capacities capacities{/*sampledImages=*/256, /*samplers=*/32, /*storageBuffers=*/8};
     capacities.comparisonSamplers = 1;
     auto bindless = rx::rhi::BindlessTable::create(app->device->physicalDevice(), app->device->device(), capacities);
     if (!bindless.has_value()) {
@@ -960,6 +975,16 @@ void destroyApp(App& app) {
     app.overlay.reset();  // must precede bindless/device teardown -- owns its own descriptor pool/pipeline/font texture.
     destroyShadowResources(app);
     for (MaterialGpuBinding& binding : app.stressMaterialBindings) {
+        binding.paramBuffer.reset();
+    }
+    // [Fix round] `customMaterialBindings` (--scene <path> present-mode
+    // overrides, e.g. Sponza's own 25 materials) was never torn down here
+    // -- a real resource leak an independent review's own end-to-end
+    // Sponza run surfaced directly: VUID-vkDestroyDevice-device-00378
+    // ("child objects... has not been destroyed") fired once per leaked
+    // material param VkBuffer at process exit. helmetMaterial/
+    // stressMaterialBindings above were both handled; this one was missed.
+    for (MaterialGpuBinding& binding : app.customMaterialBindings) {
         binding.paramBuffer.reset();
     }
     app.helmetMaterial.paramBuffer.reset();
@@ -1349,11 +1374,33 @@ bool setupImportedMaterials(App& app, const rx::asset::Registry& registry, const
 // every instance keeps its DEFAULT layers(~0u)/channels(0xFF) (no
 // grid-row-style demo grouping; that is the deterministic default
 // composition's own feature, not a property of arbitrary imported
-// content).
-bool populateImportedInstances(App& app, const rx::asset::ImportedScene& scene) {
+// content). `registry` is needed to size the D26.1 draw-data buffer
+// correctly [fix round: a real bug an independent review's own end-to-end
+// Sponza run surfaced -- see this function's own drawDataCapacityRows
+// comment below].
+bool populateImportedInstances(App& app, const rx::asset::Registry& registry, const rx::asset::ImportedScene& scene) {
     app.renderableHandles.clear();
     app.renderableHandles.reserve(scene.instances.size());
+    // [Fix round] Total SUBMESH count across every instance, NOT the
+    // renderable (instance) count -- `ViewLists::payloads` gets one row
+    // PER SUBMESH-INSTANCE PAIRING (D26.1), and a single renderable's own
+    // mesh can carry many submeshes (Sponza: 1 renderable, 25 submeshes,
+    // one per material -- confirmed directly against a real fetched
+    // Sponza import). Sizing `drawDataCapacityRows` off
+    // `renderableHandles.size()` alone (1, for Sponza) let
+    // updateSceneFrame() write up to 25 DrawDataGpu rows into a
+    // 1-row-capacity buffer every frame -- a real heap buffer overflow,
+    // reproduced directly as a validation-layer-internal segfault inside
+    // vkCmdDrawIndexed (the corrupted heap state manifesting several
+    // allocations later, not at the write itself) the first time this
+    // task's own review ran `--scene sponza --present --validate` against
+    // real content. The default DamagedHelmet grid and the procedural
+    // --stress field both happen to have exactly 1 submesh per instance,
+    // which is why this was never hit before a real multi-submesh mesh
+    // (Sponza) was actually imported through this code path.
+    uint32_t totalSubmeshCount = 0;
     for (const rx::asset::InstanceRecord& instance : scene.instances) {
+        totalSubmeshCount += static_cast<uint32_t>(registry.mesh(instance.mesh).submeshes.size());
         rx::scene::RenderableDesc desc;
         desc.mesh = instance.mesh;
         desc.transform = instance.worldTransform;
@@ -1385,7 +1432,7 @@ bool populateImportedInstances(App& app, const rx::asset::ImportedScene& scene) 
     app.flyCamera.camera.cullMask = ~0u;
     app.moveSpeed = std::max(radius * 0.5F, 1.0F);
 
-    app.drawDataCapacityRows = static_cast<uint32_t>(app.renderableHandles.size());
+    app.drawDataCapacityRows = std::max<uint32_t>(totalSubmeshCount, 1);
     app.drawDataRows.assign(app.drawDataCapacityRows, rx::material::DrawDataGpu{});
     const VkDeviceSize bytes = static_cast<VkDeviceSize>(app.drawDataCapacityRows) * sizeof(rx::material::DrawDataGpu);
     app.drawDataBuffer = app.allocator->createHostVisibleBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
@@ -1732,7 +1779,18 @@ bool setupShadow(App& app) {
     const float depthPadding = 0.5F * glm::length(totalBounds.max - totalBounds.min) + 1.0F;
     app.shadowFit = rx::shadow::fitShadowFrustum(totalBounds.min, totalBounds.max, lightView, kShadowMapResolution, depthPadding);
 
-    app.shadowDrawDataCapacityRows = static_cast<uint32_t>(app.scene->renderableCount());
+    // [Fix round] Reuse the SAME (already-computed, submesh-count-correct
+    // -- see populateImportedInstances()'s own comment) capacity the
+    // forward pass's own drawDataCapacityRows uses, NOT
+    // scene->renderableCount() -- ShadowLists::payloads is bounded by the
+    // identical "one row per submesh-instance pairing" shape ViewLists::
+    // payloads is (shadow casters are a SUBSET of all renderables), so the
+    // same undercount bug (renderable count != submesh count for a
+    // multi-submesh mesh like Sponza) applies here too. setupShadow() is
+    // always called AFTER populateHelmetGrid()/populateImportedInstances()
+    // in every call site, so `app.drawDataCapacityRows` is already correct
+    // by this point.
+    app.shadowDrawDataCapacityRows = app.drawDataCapacityRows;
     app.shadowDrawDataRows.assign(app.shadowDrawDataCapacityRows, rx::shadow::ShadowDrawData{});
     const VkDeviceSize shadowBytes = static_cast<VkDeviceSize>(app.shadowDrawDataCapacityRows) * sizeof(rx::shadow::ShadowDrawData);
     app.shadowDrawDataBuffer =
@@ -2701,7 +2759,8 @@ int runPresent(const Args& args) {
         app->scene.emplace(rx::scene::meshBoundsFromRegistry(*app->registry));
         app->drawListBuilder.emplace(rx::scene::meshSubmeshesFromRegistry(*app->registry),
                                       rx::scene::materialResolveFromRegistry(*app->registry));
-        if (!setupImportedMaterials(*app, *app->registry, result.materials) || !populateImportedInstances(*app, result.scene)) {
+        if (!setupImportedMaterials(*app, *app->registry, result.materials) ||
+            !populateImportedInstances(*app, *app->registry, result.scene)) {
             frameSync.reset();
             destroyApp(*app);
             return 1;
