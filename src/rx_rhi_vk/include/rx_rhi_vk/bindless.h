@@ -17,6 +17,7 @@ enum class BindlessResourceKind : uint8_t {
     SampledImage,
     Sampler,
     StorageBuffer,
+    ComparisonSampler,
 };
 
 namespace detail {
@@ -32,6 +33,7 @@ namespace detail {
 struct SampledImageSlotTag {};
 struct SamplerSlotTag {};
 struct StorageBufferSlotTag {};
+struct ComparisonSamplerSlotTag {};
 struct EmptyPayload {};
 
 }  // namespace detail
@@ -157,11 +159,31 @@ public:
         uint32_t sampledImages = 0;
         uint32_t samplers = 0;
         uint32_t storageBuffers = 0;
+
+        // [Phase 4 Stage 2 Task 22 fix round, F1/spec D21] Comparison
+        // samplers (`compareEnable=VK_TRUE` `VkSampler`s, consumed by a
+        // shader's `SamplerComparisonState` global -- the hardware-PCF
+        // shadow-sampling mechanism, NOT a manual depth compare) -- a
+        // FOURTH, OPTIONAL binding: 0 (the default) means "this table
+        // declares no binding 3 at all," byte-identical to this table's
+        // pre-Task-22 three-binding layout, so every EXISTING caller that
+        // never sets this field keeps compiling and behaving exactly as
+        // before. A nonzero value adds `kComparisonSamplerBinding` to the
+        // set-0 layout this table builds -- required by every
+        // MaterialSystem-driven pipeline from Task 22 on (material.slang
+        // now unconditionally declares `gShadowCompareSamplers` at that
+        // binding, and Slang does not dead-strip unused globals -- see
+        // that file's own header comment), but irrelevant to any
+        // non-material bindless consumer (samples 01-05/07, this
+        // library's own tests), which never sets it and gets the
+        // unchanged 3-binding shape.
+        uint32_t comparisonSamplers = 0;
     };
 
     static constexpr uint32_t kSampledImageBinding = 0;
     static constexpr uint32_t kSamplerBinding = 1;
     static constexpr uint32_t kStorageBufferBinding = 2;
+    static constexpr uint32_t kComparisonSamplerBinding = 3;
 
     BindlessTable(BindlessTable&&) noexcept;
     BindlessTable& operator=(BindlessTable&&) noexcept;
@@ -214,6 +236,18 @@ public:
     // already fully occupied.
     BindlessHandle registerStorageBuffer(VkBuffer buffer, VkDeviceSize range, VkDeviceSize offset = 0);
 
+    // [Phase 4 Stage 2 Task 22 fix round, F1] Registers `sampler` (a
+    // `compareEnable=VK_TRUE` `VkSampler` -- this method does not itself
+    // validate that; a non-comparison sampler registered here would
+    // simply produce nonsensical `SampleCmp` results, not a Vulkan
+    // error) at a free index in binding 3 (`kComparisonSamplerBinding`),
+    // written immediately. Returns an invalid handle (and logs an error)
+    // if this table's comparison-sampler capacity is already fully
+    // occupied OR if this table was created with `capacities.
+    // comparisonSamplers == 0` (binding 3 does not exist at all -- see
+    // `Capacities::comparisonSamplers`'s own comment).
+    BindlessHandle registerComparisonSampler(VkSampler sampler);
+
     // Returns `handle`'s slot to the relevant resource class's free list
     // for future reuse. See the RELEASE-SAFETY CONTRACT above -- this does
     // NOT touch the descriptor's current GPU-visible contents, and does
@@ -236,6 +270,7 @@ private:
     rx::core::HandlePool<detail::SampledImageSlotTag, detail::EmptyPayload> sampledImages_;
     rx::core::HandlePool<detail::SamplerSlotTag, detail::EmptyPayload> samplers_;
     rx::core::HandlePool<detail::StorageBufferSlotTag, detail::EmptyPayload> storageBuffers_;
+    rx::core::HandlePool<detail::ComparisonSamplerSlotTag, detail::EmptyPayload> comparisonSamplers_;
 };
 
 }  // namespace rx::rhi

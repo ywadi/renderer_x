@@ -43,10 +43,18 @@ struct ExpectedBindlessSlot {
     VkDescriptorType type;
 };
 
-constexpr std::array<ExpectedBindlessSlot, 3> kExpectedExternalSet0Shape{{
+// [Phase 4 Stage 2 Task 22 fix round, F1] Grew from 3 to 4 slots: binding 3
+// (kComparisonSamplerBinding) is BindlessTable's own OPTIONAL fourth slot
+// (Capacities::comparisonSamplers -- see that field's own header comment).
+// Recognizing it here is additive and backward-compatible: a shader that
+// never declares a set-0 binding 3 (every non-material shader in this
+// codebase) is unaffected, since this list is only ever walked against
+// bindings the shader's OWN reflection actually produced.
+constexpr std::array<ExpectedBindlessSlot, 4> kExpectedExternalSet0Shape{{
     {BindlessTable::kSampledImageBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE},
     {BindlessTable::kSamplerBinding, VK_DESCRIPTOR_TYPE_SAMPLER},
     {BindlessTable::kStorageBufferBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
+    {BindlessTable::kComparisonSamplerBinding, VK_DESCRIPTOR_TYPE_SAMPLER},
 }};
 
 // See build()'s comment for exactly what "subset-compatible shape" means
@@ -65,10 +73,10 @@ bool validateExternalSet0Shape(const std::vector<const rx::shader::ShaderLayoutI
         if (expected == nullptr) {
             RX_LOG_ERROR(
                 "rx_rhi_vk::PipelineLayoutBuilder::build: reflected set-0 binding {} has no counterpart in the "
-                "external bindless-table layout (known slots: {}=SAMPLED_IMAGE, {}=SAMPLER, {}=STORAGE_BUFFER); "
-                "rejecting",
+                "external bindless-table layout (known slots: {}=SAMPLED_IMAGE, {}=SAMPLER, {}=STORAGE_BUFFER, "
+                "{}=COMPARISON_SAMPLER); rejecting",
                 binding->binding, BindlessTable::kSampledImageBinding, BindlessTable::kSamplerBinding,
-                BindlessTable::kStorageBufferBinding);
+                BindlessTable::kStorageBufferBinding, BindlessTable::kComparisonSamplerBinding);
             return false;
         }
         if (binding->type != expected->type) {

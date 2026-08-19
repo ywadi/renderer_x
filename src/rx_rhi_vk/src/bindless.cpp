@@ -5,6 +5,7 @@
 
 #include <array>
 #include <utility>
+#include <vector>
 
 namespace rx::rhi {
 
@@ -50,6 +51,7 @@ BindlessTable& BindlessTable::operator=(BindlessTable&& other) noexcept {
         sampledImages_ = std::move(other.sampledImages_);
         samplers_ = std::move(other.samplers_);
         storageBuffers_ = std::move(other.storageBuffers_);
+        comparisonSamplers_ = std::move(other.comparisonSamplers_);
 
         other.device_ = VK_NULL_HANDLE;
         other.setLayout_ = VK_NULL_HANDLE;
@@ -118,7 +120,22 @@ std::optional<BindlessTable> BindlessTable::create(VkPhysicalDevice physicalDevi
     }
 
     // --- Set layout ------------------------------------------------------
-    std::array<VkDescriptorSetLayoutBinding, 3> bindings{};
+    // [Phase 4 Stage 2 Task 22 fix round, F1] Binding 3
+    // (kComparisonSamplerBinding) is CONDITIONAL: present only when
+    // `capacities.comparisonSamplers > 0` -- see that field's own header
+    // comment for why (every pre-Task-22 caller leaves it at 0 and gets
+    // this table's original, byte-identical 3-binding layout). Only the
+    // LAST declared binding may carry VK_DESCRIPTOR_BINDING_VARIABLE_
+    // DESCRIPTOR_COUNT_BIT [Vulkan spec constraint] -- when binding 3
+    // exists, IT becomes the variable-count binding instead of binding 2
+    // (which still gets a real, fixed `descriptorCount` matching its own
+    // requested capacity either way; only the FLAG and the allocate-time
+    // `VkDescriptorSetVariableDescriptorCountAllocateInfo::
+    // pDescriptorCounts` entry move).
+    const bool hasComparisonSamplers = capacities.comparisonSamplers > 0;
+    const uint32_t bindingCount = hasComparisonSamplers ? 4 : 3;
+
+    std::vector<VkDescriptorSetLayoutBinding> bindings(bindingCount);
     bindings[0].binding = kSampledImageBinding;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     bindings[0].descriptorCount = capacities.sampledImages;
@@ -134,8 +151,16 @@ std::optional<BindlessTable> BindlessTable::create(VkPhysicalDevice physicalDevi
     bindings[2].descriptorCount = capacities.storageBuffers;
     bindings[2].stageFlags = VK_SHADER_STAGE_ALL;
 
-    std::array<VkDescriptorBindingFlags, 3> bindingFlags{
-        kCommonBindingFlags, kCommonBindingFlags, kCommonBindingFlags | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT};
+    std::vector<VkDescriptorBindingFlags> bindingFlags(bindingCount, kCommonBindingFlags);
+    if (hasComparisonSamplers) {
+        bindings[3].binding = kComparisonSamplerBinding;
+        bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        bindings[3].descriptorCount = capacities.comparisonSamplers;
+        bindings[3].stageFlags = VK_SHADER_STAGE_ALL;
+        bindingFlags[3] |= VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
+    } else {
+        bindingFlags[2] |= VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
+    }
 
     VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo{};
     flagsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
@@ -158,10 +183,21 @@ std::optional<BindlessTable> BindlessTable::create(VkPhysicalDevice physicalDevi
     }
 
     // --- Update-after-bind pool ------------------------------------------
-    std::array<VkDescriptorPoolSize, 3> poolSizes{};
-    poolSizes[0] = {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, capacities.sampledImages};
-    poolSizes[1] = {VK_DESCRIPTOR_TYPE_SAMPLER, capacities.samplers};
-    poolSizes[2] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, capacities.storageBuffers};
+    std::vector<VkDescriptorPoolSize> poolSizes;
+    poolSizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, capacities.sampledImages});
+    poolSizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLER, capacities.samplers});
+    poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, capacities.storageBuffers});
+    if (hasComparisonSamplers) {
+        // Same descriptor TYPE as binding 1 (VK_DESCRIPTOR_TYPE_SAMPLER --
+        // Vulkan draws no type-level distinction between a comparison and
+        // an ordinary sampler; only the underlying VkSampler's own
+        // `compareEnable` and the consuming shader's `SamplerComparisonState`
+        // vs `SamplerState` declaration differ) -- a SEPARATE pool-size
+        // entry, not folded into binding 1's, since each
+        // VkDescriptorPoolSize is scoped to the (type, count) pair a pool
+        // must reserve, and this table tracks the two counts independently.
+        poolSizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLER, capacities.comparisonSamplers});
+    }
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -180,10 +216,11 @@ std::optional<BindlessTable> BindlessTable::create(VkPhysicalDevice physicalDevi
     }
 
     // --- Descriptor set (variable count on the last binding) -------------
+    const uint32_t variableCount = hasComparisonSamplers ? capacities.comparisonSamplers : capacities.storageBuffers;
     VkDescriptorSetVariableDescriptorCountAllocateInfo variableCountInfo{};
     variableCountInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO;
     variableCountInfo.descriptorSetCount = 1;
-    variableCountInfo.pDescriptorCounts = &capacities.storageBuffers;
+    variableCountInfo.pDescriptorCounts = &variableCount;
 
     VkDescriptorSetAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -303,6 +340,43 @@ BindlessHandle BindlessTable::registerStorageBuffer(VkBuffer buffer, VkDeviceSiz
     return BindlessHandle(BindlessResourceKind::StorageBuffer, internal.index(), internal.generation());
 }
 
+BindlessHandle BindlessTable::registerComparisonSampler(VkSampler sampler) {
+    RX_ASSERT_MAIN_THREAD("BindlessTable::registerComparisonSampler");
+    if (capacities_.comparisonSamplers == 0) {
+        RX_LOG_ERROR(
+            "rx::rhi::BindlessTable::registerComparisonSampler: this table was created with "
+            "capacities.comparisonSamplers == 0 -- binding 3 does not exist; rejecting");
+        return BindlessHandle{};
+    }
+    auto internal = comparisonSamplers_.acquire(detail::EmptyPayload{});
+    if (internal.index() >= capacities_.comparisonSamplers) {
+        RX_LOG_ERROR(
+            "rx::rhi::BindlessTable::registerComparisonSampler: comparison-sampler capacity ({}) already fully "
+            "occupied; rejecting",
+            capacities_.comparisonSamplers);
+        comparisonSamplers_.release(internal);
+        return BindlessHandle{};
+    }
+
+    VkDescriptorImageInfo imageInfo{};
+    imageInfo.sampler = sampler;
+    imageInfo.imageView = VK_NULL_HANDLE;
+    imageInfo.imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = set_;
+    write.dstBinding = kComparisonSamplerBinding;
+    write.dstArrayElement = internal.index();
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    write.pImageInfo = &imageInfo;
+
+    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+
+    return BindlessHandle(BindlessResourceKind::ComparisonSampler, internal.index(), internal.generation());
+}
+
 void BindlessTable::release(BindlessHandle handle) {
     RX_ASSERT_MAIN_THREAD("BindlessTable::release");
     if (!handle.isValid()) {
@@ -318,6 +392,10 @@ void BindlessTable::release(BindlessHandle handle) {
         case BindlessResourceKind::StorageBuffer:
             storageBuffers_.release(
                 rx::core::Handle<detail::StorageBufferSlotTag>(handle.index(), handle.generation()));
+            break;
+        case BindlessResourceKind::ComparisonSampler:
+            comparisonSamplers_.release(
+                rx::core::Handle<detail::ComparisonSamplerSlotTag>(handle.index(), handle.generation()));
             break;
     }
 }
