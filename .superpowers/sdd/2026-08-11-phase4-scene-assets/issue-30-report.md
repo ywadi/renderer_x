@@ -113,6 +113,31 @@ the full suite via ctest) also produced exactly 1239/1239 — the fixed count
 holds across both platforms this repo builds for, not just one throttled
 environment.
 
+**[Round 2 amendment — scoping this claim honestly, per independent review]**
+The framing above ("1239/1239 assertions... now bit-for-bit identical
+across every run") is accurate for every run in the batch actually captured
+and for what issue #30 itself targets, but reads as fully load-independent,
+which overstates it. Precisely: **the assertion COUNT is deterministic on
+every PASSING run** — that is the defect #30 describes ("passes green
+today, different assertion count each run") and it is fixed, unconditionally,
+by construction (the six sites no longer have a wall-clock-derived number of
+assertion evaluations, full stop, regardless of host load). It is a
+SEPARATE property that **the WALL-CLOCK GATE's stall-detector gate can still
+FAIL** (not silently pass with a different count — actually red) under
+genuinely heavy external GPU/CPU contention: it is a live-timing pass/fail
+check by design (RC6, self-calibrated, `max(2ms, 4x live probe)`), and this
+fix's own stated scope never touches that calibration formula. The
+independent reviewer's 40-run reproduction under real contention (a
+leftover competing GPU-rendering process) saw exactly this: 31/31 *passing*
+runs read bit-for-bit 1239/1239 (zero exceptions — the count-determinism
+claim held perfectly), while 3/40 runs failed outright on tight
+wall-clock-gate margins or a separate pre-existing race (see the Round 2
+section below) — contention that produces a red run, not a silently
+different green count, which is a materially different (and much less
+severe) failure mode than the one issue #30 was filed against. See the
+Round 2 section below for the reviewer's full reproduction and this
+addendum's disposition.
+
 **Process note for the reviewer:** an earlier attempt at this same 10-run
 proof, run while a separate Wine-based ctest invocation of this same
 GPU-backed binary was running concurrently on the same machine (my own
@@ -245,14 +270,198 @@ before any further verification or the final ctest/commit steps below.
   under criterion 2 above) — a stale contaminated attempt, discarded; the
   final 10-run proof was captured cleanly.
 
+## Round 2 — independent review findings, closed in-round
+
+Independent review (`issue-30-review.md`, spec ✅ / Approved, 1 Medium + 2
+Low) verified all five criteria and the six-site rework itself line-by-line
+("No vacuousness, averaging-away, or predicate-weakening found in any of
+the six reworked sites"). Three items closed this round, per project policy
+(no deferred fixes; pre-existing defects close when found unless a named
+prerequisite blocks — none did here).
+
+### Item 1 (Medium, part A) — report accuracy
+
+Addressed above, in Criterion 2, via the "[Round 2 amendment]" paragraph:
+the "1239/1239 every run" claim now explicitly scopes to "deterministic on
+every passing run" and separately documents that the WALL-CLOCK GATE's
+self-calibrated margin remains a live-timing pass/fail property, not
+load-proof, by design and by explicit out-of-scope declaration in this
+fix's own Criterion 3. No code change was needed or made for this part (the
+finding was about report framing, not behavior).
+
+### Item 2 (Medium, part B) — `pumpUntilTerminal()`/callback race (newly surfaced, pre-existing, fixed)
+
+**Diagnosis.** The reviewer's RUN 34 failure (`async_import_test.cpp:592`
+at the time, `REQUIRE(done)` in the "garbage-bytes import" TEST_CASE — one
+of the file's ten call sites of the shared `pumpUntilTerminal()` helper,
+untouched by the six-site rework) traced to a genuine, pre-existing product
+race, not test infrastructure:
+
+- `pumpUntilTerminal()` returns as soon as `registry.importProgress(handle)`
+  reports a terminal `stage` (Done/Failed/cancelled). Every TEST_CASE in
+  this file (and any real host application following the same documented
+  pattern) then assumes the paired completion callback has already fired.
+- True for every terminal transition **except** a compute-phase PARSE
+  failure: `computeGltfImport()` (`import_gltf.cpp`) used to call
+  `setStage(stageOut, ImportStage::Failed)` **directly on the worker
+  thread**, in both its `dataBuffer`-wrap and `parser.loadGltf` early-return
+  paths — fully decoupled from, and racing ahead of, the completion
+  callback, which only fires later when that same worker's own
+  `postToMain(finishAsyncImportCompute)` closure is actually drained by a
+  `pumpMain()` call on the main thread.
+- Every OTHER terminal transition sets `stage` and fires the callback in
+  the SAME synchronous call (`pollAsyncImportUploads()`'s Done path,
+  `finishAsyncImportCompute()`'s own `compute.error` branch, and all three
+  IO-thread-read-failure closures in the path-based `importGltfAsync()`
+  overload, `registry.cpp`) — no window exists there. Confirmed by reading
+  every `job->stage.store(...)`/`setStage(...)` call site in both files
+  (`grep -n` inventory, 7 total sites: 2 racy, 5 already-correctly-paired).
+- Verdict: **product defect**, not test infrastructure. `pumpUntilTerminal()`
+  itself is correct — it faithfully polls the documented public API; the API
+  itself briefly lied about being terminal on this one path.
+
+**Fix.** `src/rx_asset/import_gltf.cpp`: deleted both direct
+`setStage(stageOut, ImportStage::Failed)` calls. `finishAsyncImportCompute()`
+(`registry.cpp:207`) already authoritatively sets `stage = Failed` in the
+exact same synchronous call as firing the completion callback for a
+compute-phase error — the deleted stores were pure redundant writes with
+zero functional purpose beyond creating the race. This makes the race
+**structurally impossible**, not merely less likely: after the fix there is
+exactly one write site for a compute-phase `Failed` transition, and it is
+permanently paired with the callback by construction.
+
+**Reproduction and regression test (stress harness, per the review's own
+suggestion).** Added a new permanent TEST_CASE, `"importGltfAsync: [race
+regression] repeated garbage-bytes imports never observe a terminal stage
+before the paired completion callback has fired"` (`async_import_test.cpp`),
+running the exact garbage-bytes-async-import pattern in a fixed
+(non-wall-clock-derived) loop, tracking a single `raceHits` counter, one
+aggregated `REQUIRE(raceHits == 0)` after the loop (same discipline as the
+six original sites — no per-iteration assertion, no issue-#30-class count
+variance of its own):
+
+1. **Pre-fix, unwidened, quiet host** (nothing else running,
+   `taskset -c 0,1`, 5000 iterations): **0/5000** — the natural window is
+   too narrow to hit reliably without contention on this machine, consistent
+   with the reviewer's own 2/40-under-real-contention rate and explaining
+   why it was never noticed before.
+2. **Pre-fix, artificially widened** (temporary, since-removed
+   `std::this_thread::sleep_for(500us)` inserted immediately after the
+   direct `setStage(Failed)` store, to force the same window the reviewer
+   hit via real scheduling contention): **31/5000**, `taskset -c 0,1`:
+   ```
+   race regression: 31 / 5000 iterations observed stage-terminal before the completion callback fired (0 separate timeout(s))
+   /home/ywadi/d2/renderer_x/src/rx_asset/tests/async_import_test.cpp:676: FATAL ERROR: REQUIRE( raceHits == 0 ) is NOT correct!
+     values: REQUIRE( 31 == 0 )
+   [doctest] test cases: 1 | 0 passed | 1 failed | 57 skipped
+   [doctest] Status: FAILURE!
+   ```
+   Confirms both the mechanism (real, exploitable) and that the stress
+   harness genuinely detects it.
+3. **Fix applied, artificial delay removed, same harness, same host**
+   (`taskset -c 0,1`, 5000 iterations — later right-sized to 2000 for the
+   permanent version, see the test's own comment): **0/5000**:
+   ```
+   race regression: 0 / 5000 iterations observed stage-terminal before the completion callback fired (0 separate timeout(s))
+   [doctest] test cases: 1 | 1 passed | 0 failed | 57 skipped
+   [doctest] Status: SUCCESS!
+   ```
+
+No BLOCKED — no missing product seam; the fix needed only to delete two
+redundant, racy lines.
+
+### Item 3 (Low) — restore `REQUIRE` semantics at sites 4/5
+
+`async_import_test.cpp`: the post-loop aggregated assertions at site 4
+(mid-upload rollback, `finalizedBeforeGeometryObserved`) and site 5
+(checkerboard-safety, `finalizedBeforeOneRegistered` / `overshotPastOne`)
+were `CHECK_FALSE`; restored to `REQUIRE_FALSE`, matching the original
+per-iteration `REQUIRE_FALSE`/`REQUIRE` abort-on-violation semantics the
+six-site rework had (unintentionally) downgraded. Aggregation shape
+(latching flag, single post-loop assertion) is unchanged — this is a
+severity-of-failure fix (abort vs. keep running against invalidated state),
+not a discrimination change.
+
+### Round 2 re-verification
+
+Full binary now 58 TEST_CASEs (57 original + 1 new race-regression stress
+test), 1248 assertions (1239 + 9 new).
+
+**Fresh 10-run determinism proof**, `taskset -c 0,1`, quiet host (the
+coordinator killed the reviewer's leftover contending process beforehand;
+confirmed via `ps aux`/`uptime` immediately before running), three
+foreground batches:
+
+```
+RUN 1  (exit 0): test cases: 58 | 58 passed | 0 failed | 0 skipped | assertions: 1248 | 1248 passed | 0 failed | | Status: SUCCESS!
+RUN 2  (exit 0): test cases: 58 | 58 passed | 0 failed | 0 skipped | assertions: 1248 | 1248 passed | 0 failed | | Status: SUCCESS!
+RUN 3  (exit 0): test cases: 58 | 58 passed | 0 failed | 0 skipped | assertions: 1248 | 1248 passed | 0 failed | | Status: SUCCESS!
+RUN 4  (exit 0): test cases: 58 | 58 passed | 0 failed | 0 skipped | assertions: 1248 | 1248 passed | 0 failed | | Status: SUCCESS!
+RUN 5  (exit 0): test cases: 58 | 58 passed | 0 failed | 0 skipped | assertions: 1248 | 1248 passed | 0 failed | | Status: SUCCESS!
+RUN 6  (exit 0): test cases: 58 | 58 passed | 0 failed | 0 skipped | assertions: 1248 | 1248 passed | 0 failed | | Status: SUCCESS!
+RUN 7  (exit 0): test cases: 58 | 58 passed | 0 failed | 0 skipped | assertions: 1248 | 1248 passed | 0 failed | | Status: SUCCESS!
+RUN 8  (exit 0): test cases: 58 | 58 passed | 0 failed | 0 skipped | assertions: 1248 | 1248 passed | 0 failed | | Status: SUCCESS!
+RUN 9  (exit 0): test cases: 58 | 58 passed | 0 failed | 0 skipped | assertions: 1248 | 1248 passed | 0 failed | | Status: SUCCESS!
+RUN 10 (exit 0): test cases: 58 | 58 passed | 0 failed | 0 skipped | assertions: 1248 | 1248 passed | 0 failed | | Status: SUCCESS!
+```
+
+All 10 runs identical, 0 failed. This time, unlike the (honestly-scoped, per
+item 1 above) round-1 claim, this determinism proof was captured on a
+verified-quiet host with no known contention source — the strongest form of
+the proof available.
+
+**Full verification, post round-2 changes:**
+
+- Serial linux ctest (`xvfb-run -a ctest --output-on-failure -j1`):
+  **22/22 passed**, 138.73s total (`rx_asset_gltf_gpu_tests` 43.96s).
+- windows-cross-zig: clean rebuild (`import_gltf.cpp` +
+  `async_import_test.cpp` recompiled, static lib + 4 dependent executables
+  relinked, no warnings/errors). ctest under Wine, CI's own filter
+  (`-E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample'`): **10/10 passed**,
+  127.98s total; `rx_asset_gltf_gpu_tests` itself:
+  `test cases: 58 | 58 passed | 0 failed | 0 skipped` /
+  `assertions: 1248 | 1248 passed | 0 failed` — exact count parity with
+  linux-native.
+- Zero unfiltered validation errors: every run above reports
+  `Status: SUCCESS!`; no new validation-layer lines beyond the two
+  pre-existing known-false-positives.
+
+### Round 2 diff footprint
+
+- `src/rx_asset/import_gltf.cpp`: 2 lines deleted (`setStage(stageOut,
+  ImportStage::Failed)` in `computeGltfImport()`'s two early-return
+  compute-phase-failure paths), replaced with explanatory comments. `git
+  diff` reviewed directly — no stray whitespace changes, no other lines
+  touched.
+- `src/rx_asset/tests/async_import_test.cpp`: +1 new permanent TEST_CASE
+  (the race-regression stress harness) and the 4 `CHECK_FALSE` →
+  `REQUIRE_FALSE` restorations (item 3). No other test case touched.
+- No board/issue/plan/spec/ledger files touched
+  (`.superpowers/sdd/2026-08-11-phase4-scene-assets/progress.md` still
+  carries the same pre-existing, not-mine local modification noted in
+  round 1 — left as found).
+
 ## Commits
 
+Round 1:
 - `45936cf` — `test(rx_asset): make rx_asset_gltf_gpu_tests assertion
   counts deterministic (issue #30)`, pathspec-scoped to
   `src/rx_asset/tests/async_import_test.cpp` only.
+- `adaa4b3` — `docs: issue #30 fix report...`, pathspec-scoped to the
+  report file only.
 
-No production code diff ships (both revert-test edits to
-`import_gltf.cpp`/`texture_cache.cpp` were restored before committing,
-confirmed via `git diff --stat`), no board/issue/plan/spec/ledger files
-touched (`.superpowers/sdd/2026-08-11-phase4-scene-assets/progress.md` had
-a pre-existing unrelated local modification at task start, left as found).
+Round 2:
+- `07a2474` — `fix(rx_asset): close pumpUntilTerminal()/completion-callback
+  race on async parse failure (issue #30 round 2)`, pathspec-scoped to
+  `src/rx_asset/import_gltf.cpp` + `src/rx_asset/tests/async_import_test.cpp`
+  (the production fix and its paired regression test/REQUIRE-restoration,
+  committed together).
+- This report amendment: a separate, following commit, pathspec-scoped to
+  `issue-30-report.md` only.
+
+No production code diff ships uncommitted or unexplained — the round-1
+revert-test edits to `import_gltf.cpp`/`texture_cache.cpp` were restored
+before committing (confirmed via `git diff --stat`); round 2's
+`import_gltf.cpp` change is a real, permanent, committed production fix
+(the two-line deletion above), independent of and unrelated to round 1's
+revert-test probes (different lines, different function branches).
