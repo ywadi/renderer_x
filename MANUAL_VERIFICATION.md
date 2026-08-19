@@ -149,6 +149,68 @@ checkboxes and record the SteamOS version/RADV (Mesa) driver version above
 the first time this is actually run on a Deck, before the next release that
 claims Steam Deck support.
 
+## rx_platform input surface (Phase 4 Task 20, gate ruling #14)
+
+`rx::platform::Window`'s new input surface (relative mouse mode + mouse
+deltas, cursor show/hide/confine, gamepad hot-plug + stick/trigger/button
+polling with deadzones, minimal keyboard) is exercised automatically —
+including gamepad hot-plug/axis/button paths, which SDL3's
+`SDL_AttachVirtualJoystick` makes CI-testable without real hardware (see
+`src/rx_platform/tests/window_test.cpp`) — but a few things are genuinely
+NOT automatable headlessly, matching this file's own established
+"screenshot/human-observed, not scriptable" carve-out (see e.g. row 3's own
+acceptance criterion in the gate matrix for this ticket). **No sample yet
+consumes this surface** — Task 24 (`09_fly_through`) is the first real
+consumer (mouse-look + gamepad + WASD fly-through camera); the rows below
+are the raw platform-level checks, independent of that sample, and the
+sample itself will carry its own MANUAL_VERIFICATION section once it lands.
+
+- [ ] Relative mouse mode: call `setRelativeMouseMode(true)` in a real
+      (non-hidden) window session — cursor visibly disappears and stays
+      centered/locked to the window regardless of how far the mouse is
+      moved; `setRelativeMouseMode(false)` visibly restores the normal
+      cursor at a sane position.
+- [ ] Cursor `setCursorVisible(false)`/`(true)` — cursor visibly
+      disappears/reappears over the window.
+- [ ] Cursor `setCursorConfined(true)`/`(false)` — cursor is visibly
+      unable to leave the window's bounds while confined, and free to
+      leave once un-confined.
+- [ ] Focus-loss/regain: alt-tab away from the window while
+      `setRelativeMouseMode(true)` is active, then alt-tab back — no
+      crash, and mouse-look resumes correctly on refocus (this is the
+      real-OS analogue of `window_test.cpp`'s synthetic
+      `SDL_PushEvent`-driven FOCUS_LOST/FOCUS_GAINED test).
+- [ ] Keyboard: `isKeyDown(SDL_SCANCODE_W)` (etc.) reflects a REAL physical
+      key press/release — device-free tests can only prove the bounds-check
+      and at-rest (`false`) behavior (SDL provides no public API to inject
+      synthetic keyboard STATE, only events, which don't move
+      `SDL_GetKeyboardState()`'s own array — see `window_test.cpp`'s
+      comment on this).
+- [ ] Gamepad, REAL hardware hot-plug: plug in a physical gamepad while the
+      app is running — connects and becomes `poll()`-active; unplug —
+      disconnects cleanly, no crash/hang. (Automated coverage uses
+      `SDL_AttachVirtualJoystick` instead; this row is the real-USB-event
+      analogue.)
+- [ ] Steam Deck: the ticket's own stated acceptance bar ("Steam Deck pad
+      drivability") — run on real Deck hardware (or via a real gamepad on
+      desktop as a stand-in until Deck hardware is available) once Task 24
+      lands a sample that actually consumes stick/trigger/button input;
+      confirm the built-in controls (or an attached pad) drive the
+      fly-through camera as expected, and check the log for the
+      gyro/device-name diagnostic line this ticket adds
+      (`rx_platform: gamepad connected id=... name="..." hasGyroSensor=...`)
+      — SDL issue #9148 predicts a Steam Deck's own gyro reports
+      `hasGyroSensor=false` at this project's pinned SDL3 version; this row
+      confirms that diagnostic actually appears on real Deck hardware,
+      not just in the virtual-joystick test.
+
+**Last run:** not yet performed — this task (Task 20) implemented and
+automated-tested the platform-level surface only; no sample exists yet to
+drive an end-to-end human-observed session against. Fill in the checkboxes
+above once Task 24's `09_fly_through` sample lands and this section can be
+run for real (on desktop first, then Steam Deck hardware before any release
+claiming Deck gamepad support).
+
 ## 05_multipass (`--present` mode)
 
 `sample_05_multipass` needs the Slang runtime libraries (+ its six on-disk

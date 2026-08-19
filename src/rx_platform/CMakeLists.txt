@@ -8,6 +8,7 @@
 
 add_library(rx_platform STATIC
     src/window.cpp
+    src/input.cpp
 )
 target_include_directories(rx_platform PUBLIC include)
 # SDL3::SDL3 is an ALIAS (to SDL3::SDL3-static, since third_party builds

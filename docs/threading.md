@@ -109,6 +109,23 @@ and compiles to nothing at all when it is OFF:
   `RenderableManager`/`TransformManager`/`LightManager` mutation
   (create/set/destroy) stays main-thread-only; read-only SoA traversal for
   culling (below) does not. Not guarded — does not exist yet.
+- **`rx::platform::Window`** [Phase 4 Task 20, gate ruling #14] —
+  `pumpEvents()`/`setRelativeMouseMode()`/`relativeMouseModeWanted()`/
+  `consumeMouseDelta()`/`setCursorVisible()`/`cursorVisible()`/
+  `setCursorConfined()`/`cursorConfined()`/`poll()`/`isKeyDown()`
+  **[guarded, all ten]** — the full input surface this task added, plus
+  `pumpEvents()` itself (pre-existing, previously documented as
+  main-thread-only only by comment, never enforced — now backed by the
+  same runtime check as every other entry here). Matches D5's whole-class
+  posture (`rx::asset::GeometryPool`'s precedent above): several of these
+  (`isKeyDown()`, the gamepad axis/button reads inside `poll()`) are
+  individually documented safe-from-any-thread by SDL3's own header, but
+  the guard here is this project's own D5 policy scoping for one
+  predictable contract across the whole class, not a hazard those
+  particular calls introduce on their own — the same reasoning
+  `rx::rhi::Uploader::isComplete()`/`wait()` already established above.
+  `setFullscreen()`/`isFullscreen()` (Task 17) are NOT guarded — out of
+  this task's touched-surface scope, unchanged. (`src/rx_platform/include/rx_platform/window.h`)
 - **`rx::task::Scheduler`** — `pumpMain()` **[guarded]** [audit finding
   F5-partial]: runs whatever GPU-object-mutating closures `postToMain()`
   queued (the handoff pattern below), so it carries the identical

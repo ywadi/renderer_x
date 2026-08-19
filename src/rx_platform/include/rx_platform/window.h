@@ -1,7 +1,9 @@
 #pragma once
 #include <SDL3/SDL.h>
 #include <vulkan/vulkan.h>
+#include <rx_platform/input.h>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 namespace rx::platform {
@@ -19,13 +21,121 @@ public:
     SDL_Window* sdlWindow() const { return window_; }
 
     // Drains SDL's process-wide event queue (SDL_PollEvent) -- callers that
-    // also need to react to OTHER event types (quit, input, ...) still poll
-    // those themselves; this only owns draining the queue's window-state
-    // events into the observed state below [Phase 4 Task 17, FG7, gate
-    // ruling #25]. Thread-affinity (D5): main-thread-only, matching every
-    // other SDL-touching method here -- SDL's own event queue is itself
-    // main-thread-affine on most backends.
+    // also need to react to OTHER event types (quit, ImGui, ...) still poll
+    // those themselves; this owns draining the queue's window-state events
+    // into the observed state below [Phase 4 Task 17, FG7, gate ruling #25],
+    // AND [Phase 4 Task 20, gate ruling #14] the mouse-delta accumulation
+    // (SDL_EVENT_MOUSE_MOTION), gamepad hot-plug lifecycle
+    // (SDL_EVENT_GAMEPAD_ADDED/REMOVED), and the focus-loss/gain handling
+    // that pauses mouse-delta accumulation and unconditionally re-arms
+    // relative mouse mode on focus regain -- see consumeMouseDelta()/
+    // setRelativeMouseMode()/poll()'s own comments below for exactly what
+    // each does. This is this engine's single event-dispatch owner: Task
+    // 21's ImGui overlay feeds every event to
+    // ImGui_ImplSDL3_ProcessEvent() FIRST at this same call site, then lets
+    // this class's own handling run, and the platform-input accumulators
+    // gate on ImGui's WantCaptureMouse/WantCaptureKeyboard flags at the
+    // CALLER level (rulings-2026-08-18.md #14/#16) -- pumpEvents() itself
+    // has no ImGui dependency.
+    // Thread-affinity (D5, Phase 4): main-thread-only -- see
+    // docs/threading.md. SDL's own event queue is itself main-thread-affine
+    // on most backends; this method now also carries a dev-time
+    // RX_ASSERT_MAIN_THREAD guard [Phase 4 Task 20], matching every other
+    // guarded main-thread-only mutator in this codebase.
     void pumpEvents();
+
+    // ---- Relative mouse mode + mouse-delta accumulation [Phase 4 Task 20,
+    // gate ruling #14, matrix rows 1/2] ------------------------------------
+    // setRelativeMouseMode(true) hides+captures the cursor and puts SDL
+    // into continuous relative-motion reporting
+    // (SDL_SetWindowRelativeMouseMode). The ENABLED intent is tracked
+    // independently of whatever SDL/the OS did internally -- gate ruling:
+    // "track the app-requested relative-mode state independently of SDL's"
+    // -- relativeMouseModeWanted() below reflects THIS engine's own last
+    // request, never a live SDL_GetWindowRelativeMouseMode() query. Returns
+    // SDL_SetWindowRelativeMouseMode()'s own success/failure (logged on
+    // failure, matching setFullscreen()'s established best-effort
+    // convention) -- relativeModeWanted_ is updated regardless of that
+    // result, because pumpEvents()'s FOCUS_GAINED handling below needs to
+    // know what the app WANTS independent of whether SDL granted it the
+    // last time it was asked.
+    //
+    // On SDL_EVENT_WINDOW_FOCUS_LOST (handled inside pumpEvents()),
+    // mouse-delta accumulation is paused -- no assumption is made about
+    // what SDL/the window manager did to the OS-level capture (SDL's own
+    // docs never state relative mode auto-clears on focus loss, unlike
+    // SDL_CaptureMouse, which explicitly does -- gate matrix row 1's own
+    // documented gap). On SDL_EVENT_WINDOW_FOCUS_GAINED, if the app still
+    // wants relative mode (relativeModeWanted_), SDL_SetWindowRelativeMouseMode(
+    // window, true) is unconditionally RE-issued -- idempotent, safe
+    // whether or not SDL had silently cleared it, and correct regardless of
+    // which OS/compositor answer is true.
+    // Thread-affinity (D5, Phase 4): main-thread-only -- see docs/threading.md.
+    bool setRelativeMouseMode(bool enabled);
+    bool relativeMouseModeWanted() const;
+
+    // Consumes (returns, then resets to {0,0}) the mouse motion accumulated
+    // from every SDL_EVENT_MOUSE_MOTION event (targeting THIS window --
+    // same cross-window isolation as the Task 17 window-state events)
+    // drained by pumpEvents() since the last call to this method -- never
+    // leaks across frames (gate matrix row 2's consume-and-reset
+    // algorithm: `accumX += event.motion.xrel` etc. inside pumpEvents()'s
+    // existing full-drain loop; correctness rests on that loop draining the
+    // queue completely before this is ever called, already true today).
+    // While this window has been focus-lost and not yet focus-regained (see
+    // setRelativeMouseMode()'s comment above), motion events are still
+    // drained from the queue but NOT accumulated -- this call still resets
+    // the accumulator to {0,0} regardless.
+    // Thread-affinity (D5, Phase 4): main-thread-only -- see docs/threading.md.
+    MouseDelta consumeMouseDelta();
+
+    // ---- Cursor visibility / confinement [Phase 4 Task 20, gate ruling
+    // #14, matrix row 3] ---------------------------------------------------
+    // setCursorVisible wraps SDL_ShowCursor()/SDL_HideCursor() -- process-
+    // global, not per-window (SDL3's own scoping, not a limitation this
+    // class introduces). setCursorConfined wraps SDL_SetWindowMouseGrab --
+    // confines the OS cursor to this window WITHOUT altering visibility or
+    // motion semantics; a DISTINCT primitive from relative mode above (per
+    // SDL_video.h's own doc: "this does NOT grab the cursor" is
+    // SDL_SetWindowMouseRect's caveat, but SDL_SetWindowMouseGrab genuinely
+    // does grab/confine without touching cursor visibility or capture-mode
+    // motion reporting). Both return SDL's own success/failure (logged on
+    // failure).
+    // Thread-affinity (D5, Phase 4): main-thread-only -- see docs/threading.md.
+    bool setCursorVisible(bool visible);
+    bool cursorVisible() const;
+    bool setCursorConfined(bool confined);
+    bool cursorConfined() const;
+
+    // ---- Gamepad [Phase 4 Task 20, gate ruling #14, matrix rows 4-9]
+    // ----------------------------------------------------------------------
+    // Hot-plug lifecycle is owned entirely by pumpEvents(): on
+    // SDL_EVENT_GAMEPAD_ADDED, SDL_OpenGamepad() then insert into an
+    // internal SDL_JoystickID-keyed map; on SDL_EVENT_GAMEPAD_REMOVED,
+    // SDL_CloseGamepad() THEN erase, synchronously, in the same event-
+    // handling step (never deferred to a later frame -- a stale handle
+    // outliving its REMOVED event is exactly the hazard gate matrix row 4
+    // documents). poll() reads a single "active" gamepad, selected as the
+    // LOWEST currently-connected SDL_JoystickID among every tracked device
+    // (gate matrix row 9's single-active rule) -- deterministic, and the
+    // active pad only changes when it itself disconnects. Every stick/
+    // trigger field in the returned GamepadState has ALREADY had
+    // applyStickDeadzone()/applyTriggerDeadzone() (input.h) applied --
+    // never raw SDL axis values. GamepadState{connected=false} (every other
+    // field zeroed) when no gamepad is attached at all.
+    // Thread-affinity (D5, Phase 4): main-thread-only -- see docs/threading.md.
+    GamepadState poll() const;
+
+    // ---- Keyboard [Phase 4 Task 20, gate ruling #14, NEW SCOPE] ----------
+    // Minimal keyboard surface over SDL_GetKeyboardState() -- added this
+    // task specifically because sample 09's WASD fly-through camera needs
+    // it (gate ruling: its absence from the entire Phase 4 planning
+    // universe up to this point was an oversight, now closed). Bounds-
+    // checked against SDL_GetKeyboardState()'s own reported array length --
+    // an out-of-range SDL_Scancode value returns false rather than reading
+    // out of bounds.
+    // Thread-affinity (D5, Phase 4): main-thread-only -- see docs/threading.md.
+    bool isKeyDown(SDL_Scancode key) const;
 
     // ---- Window-event-observed state [Phase 4 Task 17, FG7, gate ruling
     // #25] -- OPTIMIZATION/LOGGING SIGNAL ONLY. Read this comment before
@@ -99,6 +209,31 @@ private:
     // lastPixelSizeEvent()'s own comments above.
     bool minimizedEventObserved_ = false;
     VkExtent2D lastPixelSizeEvent_{0, 0};
+
+    // [Phase 4 Task 20, gate ruling #14] See setRelativeMouseMode()/
+    // consumeMouseDelta()'s own comments above. relativeModeWanted_ is the
+    // APP's own last-requested intent (never a live SDL query);
+    // focusLost_ gates mouse-delta accumulation while true.
+    bool relativeModeWanted_ = false;
+    bool focusLost_ = false;
+    float accumMouseDeltaX_ = 0.0f;
+    float accumMouseDeltaY_ = 0.0f;
+
+    // [Phase 4 Task 20, gate ruling #14, matrix row 4] Owned handle table,
+    // keyed by SDL_JoystickID -- see poll()'s own comment above for the
+    // open-on-ADDED/close-then-erase-on-REMOVED lifecycle pumpEvents()
+    // maintains. Every SDL_Gamepad* here was returned by a successful
+    // SDL_OpenGamepad() and is closed exactly once, either by
+    // pumpEvents()'s own REMOVED handling or by closeAllGamepads() below
+    // (move/destroy paths).
+    std::unordered_map<SDL_JoystickID, SDL_Gamepad*> gamepads_;
+
+    // SDL_CloseGamepad() on every entry still in gamepads_, then clears the
+    // map -- shared by the destructor and move-assignment's "destroy what
+    // this object currently owns before taking over `other`'s state" step
+    // (mirrors the existing `if (window_) SDL_DestroyWindow(window_);`
+    // pattern immediately below move-assignment's own call site).
+    void closeAllGamepads();
 };
 
 // [Phase 4 Task 17, FG7, gate ruling #25 row 3] One-shot (per PROCESS, not
