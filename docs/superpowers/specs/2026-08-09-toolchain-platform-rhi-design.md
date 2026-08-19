@@ -500,3 +500,13 @@ it is out of scope for *this* spec only, not out of scope for the project:
   optional thin "runner" convenience (window + per-frame callback, e.g.
   over SDL3's callback mode) may ship later for quick starts, built ON the
   library API and never required by it.
+
+- **Phase 4 exit-review registry items (2026-08-20):** (a) D27
+  pre-resolution's "resolve once per distinct key" currently holds only
+  for the opaque partition — blend-partition interleaving re-fires
+  resolution per run (cost, not correctness); revisit with the
+  techniques phase's transparency work. (b) Sample-recorder worker-side
+  per-frame vector allocations (`splitByBlockAndGroup`/
+  `resolveDrawGroups` return values) — extend the zero-alloc discipline
+  to the sample/consumer recording path when the scene path is next
+  reworked (geometry or techniques phase).
