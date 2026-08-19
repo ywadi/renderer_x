@@ -619,10 +619,39 @@ set_target_properties(meshoptimizer::meshoptimizer PROPERTIES IMPORTED_GLOBAL TR
 # report is gone afterward; the existing tangent-generation tests
 # produce byte-identical output before/after (closure-sweep-report.md
 # item 2 has the full before/after evidence).
+#
+# UPDATE_DISCONNECTED TRUE [closure-sweep fix round, Critical]: without
+# this, FetchContent's underlying ExternalProject-style UPDATE step reruns
+# on EVERY fresh `cmake` configure process (the `mikktspace_POPULATED`
+# guard just below is an in-memory property that does not survive across
+# separate cmake invocations -- only the on-disk stamp files do), and an
+# UPDATE rerun unconditionally reruns PATCH too. `git checkout` of the
+# SAME pinned commit is idempotent (a harmless no-op) for every other
+# FetchContent_Populate'd dependency in this file (volk/VMA/stb, none of
+# which carry a PATCH_COMMAND), but re-applying THIS dependency's patch
+# against an already-patched tree is not: `patch` detects the hunk is
+# already applied and exits nonzero (non-interactively, no controlling
+# tty to answer its "Assume -R?" prompt), which FetchContent surfaces as
+# a hard configure failure -- "Build step for mikktspace failed: 1" --
+# reproduced directly by a second, completely ordinary `cmake --preset
+# linux-native` on an already-configured tree (no manual state tampering
+# needed). UPDATE_DISCONNECTED TRUE is CMake's own documented mechanism
+# for exactly a commit-hash-pinned dependency that is never expected to
+# move: it makes the update step run ONLY as part of the initial
+# population (there's nothing to "update" yet, so download+patch proceed
+# normally), then skips it entirely on every later configure, relying
+# solely on the on-disk stamp files -- not a `patch -N`-style guard
+# (tested: `-N` alone still exits nonzero on this GNU patch version) and
+# not a `|| true` swallow (would silently hide a genuinely broken patch).
+# Verified against the full matrix in closure-sweep-report.md's fix-round
+# section: fresh configure, a second immediate re-configure, and a third
+# re-configure after an unrelated comment-only edit to this very file, on
+# both presets.
 set(RX_MIKKTSPACE_COMMIT "3e895b49d05ea07e4c2133156cfa94369e19e409")
 FetchContent_Declare(mikktspace
   GIT_REPOSITORY https://github.com/mmikk/MikkTSpace.git
   GIT_TAG ${RX_MIKKTSPACE_COMMIT}
+  UPDATE_DISCONNECTED TRUE
   PATCH_COMMAND patch -p1 -i "${CMAKE_CURRENT_SOURCE_DIR}/patches/mikktspace-ubsan-shift-fix.patch")
 FetchContent_GetProperties(mikktspace)
 if(NOT mikktspace_POPULATED)
