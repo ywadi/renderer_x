@@ -1,0 +1,690 @@
+# Review package: 787f978..64a0b84
+
+## Commits
+64a0b84 docs: helmet-texture-fix-report round-2 addendum -- review findings closed
+026186f fix(rx_material,rx_asset tests): close review findings on sampler-wrap fix round (card #P0)
+
+## Files changed
+ .../helmet-texture-fix-report.md                   | 133 ++++++++++++
+ src/rx_asset/tests/texture_cache_test.cpp          | 230 +++------------------
+ src/rx_material/tests/test_standard_pbr_unlit.cpp  | 170 ++++++++++++++-
+ 3 files changed, 332 insertions(+), 201 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/helmet-texture-fix-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/helmet-texture-fix-report.md
+index a9b7b0d..dfeef08 100644
+--- a/.superpowers/sdd/2026-08-11-phase4-scene-assets/helmet-texture-fix-report.md
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/helmet-texture-fix-report.md
+@@ -544,10 +544,143 @@ push):
+ - New regression class: `assets/test/sampler_wrap_probe.{gltf,bin}`;
+   `src/rx_asset/tests/texture_cache_test.cpp`.
+ - Test-suite updates for the new per-slot sampler fields:
+   `src/rx_material/tests/{test_api_factory.cpp,test_standard_pbr_unlit.cpp}`.
+ - D17 regen: `samples/08_gltf_viewer/references/loaded_scene.png`.
+ - This addendum: `helmet-texture-fix-report.md`.
+ - `.superpowers/sdd/2026-08-11-phase4-scene-assets/helmet-after.png`
+   (SDD workspace artifact, not production code).
+ 
+ No board/plan/spec/ledger file was edited by this fix round.
++
++---
++
++## 11. ROUND 2 (independent review response)
++
++Independent review (`helmet-fix-review.md`, scope: commits `715681b`,
++`2f584c4`, `787f978`) verdict: **spec PASS, code quality Approved**, with
++one Important and three Minor findings, none blocking. Per this project's
++"no deferrals, close all findings in-round" policy, the two findings
++assigned to this implementer are closed here; the review's own
++worktree-fallback closure (Concern 1) and the pre-existing `gltf_gpu`
++flake (Concern 3, tracked separately by the coordinator) needed no further
++action from this round.
++
++### 11.1 [Important] StandardPbr-level per-slot sampler coverage gap — CLOSED
++
++**The gap, precisely**: the round-1 regression test
++(`texture_cache_test.cpp`, "Sampler-wrap regression...") proves
++`TextureCache::getOrCreateSamplerBindlessIndex()` builds and registers the
++correct `VkSampler` for a given glTF sampler object — the sampler-
++creation/resolution layer — but samples it through a raw bindless test
++shader, never through the actual shipped `standard_pbr.slang`/
++`StandardPbrParams`. A future bug in how a caller maps each slot's own
++resolved sampler index into the *correct* named `gParams` field (e.g.
++`setupMaterials()` accidentally writing `metallicRoughnessSampler`'s
++resolved value into `normalSampler`) would not have been caught by any
++test below the coarse, whole-image D17 pixel gate.
++
++**Closure**: a new GPU `TEST_CASE` in
++`src/rx_material/tests/test_standard_pbr_unlit.cpp` ("StandardPBR
++per-slot sampler wiring: ..."), through the real
++`MaterialSystem`/`standard_pbr.slang`/`StandardPbrParams` path:
++
++- One 1x2 "striped" texture (top texel RED, bottom texel BLUE) bound to
++  BOTH `baseColorTexture` and `emissiveTexture`.
++- Sampled at the IDENTICAL out-of-`[0,1]` UV (`V=1.125`, reached via the
++  same `KHR_texture_transform` offset/scale mechanism the neighboring
++  "KHR_texture_transform..." `TEST_CASE` already proves works — a texel-
++  center-exact coordinate, filter-mode-independent, matching the round-1
++  test's own discipline) through TWO DIFFERENT real samplers:
++  `baseColorSampler=REPEAT`, `emissiveSampler=CLAMP_TO_EDGE` — "distinct
++  wrap modes on different slots of one material," per the review's own
++  requested shape.
++- **Isolation, no BRDF entanglement**: `ambientColor=(1,1,1)` +
++  `lightColor=(0,0,0)` makes `directLight` identically zero
++  (`standard_pbr.slang`'s own `directLight = (diffuse+specular) *
++  v.lightColor * NdotL` — a zero `lightColor` factor zeroes it
++  unconditionally, regardless of geometry/metallic/roughness), so `color
++  = ambient + emissive = ambientColor*occlusion*baseColor.rgb +
++  emissiveFactor*emissiveSample` exactly (`occlusion==1.0` via the rig's
++  own default white occlusion texture, the same fact this file's own "FG1
++  ambient closed-form" `TEST_CASE` already relies on). Two draws each zero
++  the OTHER term via its own `*Factor`, so each draw's final pixel is a
++  direct, unblended read of exactly one slot's own sampled texel — since
++  both slots read the SAME texture at the SAME coordinate, the only thing
++  that can make their results differ is which sampler each slot's own
++  shader code actually names.
++- Since both slots read the same texture at the same coordinate, the
++  discriminating assertions are: `baseColorPixel` reads RED
++  (`baseColorSampler=REPEAT`: `frac(1.125)=0.125`, row 0); `emissivePixel`
++  reads BLUE (`emissiveSampler=CLAMP_TO_EDGE`: clamps to `1.0`, row 1 — the
++  edge texel, same reasoning as the round-1 test).
++- `BindlessTable::Capacities::samplers` in this file's shared `makeFixture()`
++  bumped `2 -> 4` (empirically required: the rig's own default sampler
++  plus this test's two new ones is 3 live samplers, exceeding the old
++  capacity of 2 — hit directly as a `registerSampler` capacity-exhausted
++  rejection before the fix). Purely permissive for every other `TEST_CASE`
++  in the file (none registers more than 1 sampler).
++- Explicit teardown added (`vkDestroySampler` for both new raw samplers,
++  before `destroyRig()`) — the first version of this test leaked them,
++  caught directly by this project's own teardown-time validation-error
++  gate (`VUID-vkDestroyDevice-device-00378`) before being fixed.
++
++**Revert-test evidence (mandatory, same rigor as round 1, done in a
++genuine scratch worktree this time)**: per the review's own FYI (symlink
++`toolchain/`/`.deps-cache`/`third_party/slang-prebuilt` into a scratch
++worktree — the convention already visible in this repo's own sibling
++agent worktrees under `.claude/worktrees/`), `git worktree add` at
++`026186f` (round 2's own commit, below) configured and built
++`rx_material_gpu_tests` clean on the first attempt — no toolchain issue
++this time.
++
++1. **Fixed code** (`026186f`): `rx_material_gpu_tests
++   --test-case="StandardPBR per-slot sampler wiring*"` → **1/1 test case,
++   114/114 assertions, SUCCESS**.
++2. **Field-swap revert** (in the scratch worktree only, never committed):
++   `makeBlob(repeatSampler, clampSampler, ...)` at both call sites edited
++   to `makeBlob(clampSampler, repeatSampler, ...)` — swapping exactly
++   which resolved sampler value feeds which named field, simulating the
++   precise "`setupMaterials()` wrote the wrong resolved index into the
++   wrong slot" bug class this test exists to catch. Same test → **1/1
++   test case FAILED, 110/114 assertions passed, 4 FAILED**:
++   `baseColorPixel` read `(0, _, 255)` (BLUE, was RED — `r>200` and
++   `b<50` both failed) and `emissivePixel` read `(255, _, 0)` (RED, was
++   BLUE — `b>200` and `r<50` both failed) — the exact inversion predicted.
++3. Worktree removed (`git worktree remove --force` + branch deleted); main
++   tree confirmed untouched throughout (`git diff --stat` on the real
++   source file, empty).
++
++### 11.2 [Minor] `renderCustomQuadAndReadbackQuadrants()` duplication — CLOSED
++
++`texture_cache_test.cpp`'s `renderAndReadbackQuadrants()` gained one
++defaulted trailing parameter, `const std::array<QuadVertex, 4>& vertices
++= kQuadVertices` — every pre-existing caller (7 call sites across 5
++`TEST_CASE`s) compiles and behaves byte-identically without passing it.
++The near-identical duplicate function (`renderCustomQuadAndReadbackQuadrants()`,
++~90 lines) and its one call site (the round-1 sampler-wrap regression
++test) are removed; that call site now passes its own custom vertex arrays
++as the new trailing argument to the single shared function. Net: -201/+that
++same body once, not twice (see the round-2 commit's own diffstat).
++
++### 11.3 Verification (round 2)
++
++- `rx_material_gpu_tests`: **50/50, 2379/2379** (was 49/49, 2265/2265 —
++  +1 case/+114 assertions for the new coverage test; zero regressions in
++  the other 49).
++- `rx_asset_tests`: **33/33, 564/564** (unchanged — the dedup is
++  behavior-preserving by construction, confirmed).
++- Zero unfiltered Vulkan validation errors (including the sampler-leak
++  teardown error caught and fixed during this round's own development,
++  before commit).
++- Full serial `ctest --preset linux-native -j1`: **22/22 passed**
++  (86.34s).
++- `windows-cross-zig`: incremental build (9 targets touched) succeeds
++  clean; full serial `ctest --preset windows-cross-zig -j1` under Wine:
++  **22/22 passed** (139.32s).
++
++### 11.4 Files touched (round 2)
++
++Pathspec-scoped commit `026186f` (author = local git config, no AI
++attribution, no push): `src/rx_material/tests/test_standard_pbr_unlit.cpp`,
++`src/rx_asset/tests/texture_cache_test.cpp`. This addendum section:
++`helmet-texture-fix-report.md`. No board/plan/spec/ledger file edited.
+diff --git a/src/rx_asset/tests/texture_cache_test.cpp b/src/rx_asset/tests/texture_cache_test.cpp
+index ad853ca..da67f1b 100644
+--- a/src/rx_asset/tests/texture_cache_test.cpp
++++ b/src/rx_asset/tests/texture_cache_test.cpp
+@@ -359,46 +359,61 @@ constexpr std::array<QuadVertex, 4> kQuadVertices{{
+ }};
+ constexpr std::array<uint32_t, 6> kQuadIndices{0, 1, 2, 0, 2, 3};
+ 
+ struct QuadrantPixels {
+     std::array<uint8_t, 4> topLeft;
+     std::array<uint8_t, 4> topRight;
+     std::array<uint8_t, 4> bottomLeft;
+     std::array<uint8_t, 4> bottomRight;
+ };
+ 
+-// Renders the full-screen quad sampling `bindlessTextureIndex`/
+-// `bindlessSamplerIndex` at explicit LOD `lod`, into a `extent`x`extent`
+-// UNORM offscreen target, and returns the 4 corner pixels (well inside
+-// each quadrant -- 1/4 and 3/4 fractions, matching this file's own
+-// simpler quadrant geometry -- no bilinear-edge derivation needed since
+-// SampleLevel against a POINT- or LINEAR-filtered single/explicit-LOD
+-// sample of a flat-quadrant image is exact well within either quadrant
+-// half regardless of filter mode).
++// Renders a quad sampling `bindlessTextureIndex`/`bindlessSamplerIndex` at
++// explicit LOD `lod`, into a `extent`x`extent` UNORM offscreen target, and
++// returns the 4 corner pixels (well inside each quadrant -- 1/4 and 3/4
++// fractions, matching this file's own simpler quadrant geometry -- no
++// bilinear-edge derivation needed since SampleLevel against a POINT- or
++// LINEAR-filtered single/explicit-LOD sample of a flat-quadrant image is
++// exact well within either quadrant half regardless of filter mode).
++//
++// `vertices` [Fix round 2, review finding: deduplicate] defaults to the
++// fixed [0,1]-cornered `kQuadVertices` above -- EVERY pre-existing caller
++// (this file's own established D10/D11/G6 test net) keeps compiling and
++// behaving byte-identically without passing this parameter at all. The
++// sampler-wrap regression TEST_CASE (below) is the one caller that passes
++// a CUSTOM quad: DamagedHelmet's real defect (helmet-sampler-fix-brief.md)
++// needs UV values OUTSIDE [0,1], which `kQuadVertices`'s fixed [0,1]
++// corners can never produce. (Previously a full, deliberately near-
++// identical duplicate of this function's own body under a second name,
++// `renderCustomQuadAndReadbackQuadrants()` -- consolidated here per code
++// review, since a defaulted parameter gives the same "zero risk to
++// existing callers" guarantee the duplicate was written to provide,
++// without carrying two ~90-line GPU-pipeline-setup bodies that would
++// otherwise drift independently.)
+ std::optional<QuadrantPixels> renderAndReadbackQuadrants(TcTestFixture& fixture, uint32_t bindlessTextureIndex,
+                                                            uint32_t bindlessSamplerIndex, float lod,
+-                                                           uint32_t extent = 64) {
++                                                           uint32_t extent = 64,
++                                                           const std::array<QuadVertex, 4>& vertices = kQuadVertices) {
+     VkDevice device = fixture.device.device();
+     constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+ 
+     auto pipeline = buildQuadPipeline(device, fixture.bindless, kColorFormat);
+     if (!pipeline.has_value()) {
+         return std::nullopt;
+     }
+ 
+-    auto vertexBuffer = fixture.allocator.createHostVisibleBuffer(sizeof(kQuadVertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
++    auto vertexBuffer = fixture.allocator.createHostVisibleBuffer(sizeof(vertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+     auto indexBuffer = fixture.allocator.createHostVisibleBuffer(sizeof(kQuadIndices), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+     if (!vertexBuffer.has_value() || !indexBuffer.has_value()) {
+         destroyQuadPipeline(device, *pipeline);
+         return std::nullopt;
+     }
+-    std::memcpy(vertexBuffer->mappedData(), kQuadVertices.data(), sizeof(kQuadVertices));
++    std::memcpy(vertexBuffer->mappedData(), vertices.data(), sizeof(vertices));
+     vertexBuffer->flush();
+     std::memcpy(indexBuffer->mappedData(), kQuadIndices.data(), sizeof(kQuadIndices));
+     indexBuffer->flush();
+ 
+     VkImageCreateInfo imageInfo{};
+     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+     imageInfo.imageType = VK_IMAGE_TYPE_2D;
+     imageInfo.format = kColorFormat;
+     imageInfo.extent = {extent, extent, 1};
+     imageInfo.mipLevels = 1;
+@@ -538,205 +553,20 @@ std::optional<QuadrantPixels> renderAndReadbackQuadrants(TcTestFixture& fixture,
+     const uint32_t q1 = extent / 4;
+     const uint32_t q3 = extent - q1 - 1;
+     QuadrantPixels result;
+     result.topLeft = pixelAt(q1, q1);
+     result.topRight = pixelAt(q3, q1);
+     result.bottomLeft = pixelAt(q1, q3);
+     result.bottomRight = pixelAt(q3, q3);
+     return result;
+ }
+ 
+-// [Fix round, sampler-wrap P0] Renders a CALLER-SUPPLIED quad -- NOT the
+-// fixed [0,1]-cornered `kQuadVertices` above -- sampling
+-// `bindlessTextureIndex`/`bindlessSamplerIndex` at explicit LOD 0, and
+-// returns the same 4-corner probe shape `renderAndReadbackQuadrants()`
+-// itself returns (same "1/4, 3/4 screen-fraction" probe positions). A
+-// DELIBERATE, near-identical duplicate of that function's own render+
+-// readback body, not a shared/defaulted parameter: this fix round's own
+-// missing-regression-class fixture needs UV values OUTSIDE [0,1]
+-// (DamagedHelmet's real defect -- helmet-sampler-fix-brief.md -- V wholly
+-// in [1.0005,1.9987]), which `kQuadVertices`'s fixed [0,1] corners can
+-// never produce; duplicating here keeps EVERY existing caller of
+-// renderAndReadbackQuadrants() (this file's own established D10/D11/G6
+-// test net) at zero risk from this fix-round-only addition.
+-std::optional<QuadrantPixels> renderCustomQuadAndReadbackQuadrants(TcTestFixture& fixture, uint32_t bindlessTextureIndex,
+-                                                                     uint32_t bindlessSamplerIndex,
+-                                                                     const std::array<QuadVertex, 4>& vertices,
+-                                                                     uint32_t extent = 64) {
+-    VkDevice device = fixture.device.device();
+-    constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+-
+-    auto pipeline = buildQuadPipeline(device, fixture.bindless, kColorFormat);
+-    if (!pipeline.has_value()) {
+-        return std::nullopt;
+-    }
+-
+-    auto vertexBuffer = fixture.allocator.createHostVisibleBuffer(sizeof(vertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+-    auto indexBuffer = fixture.allocator.createHostVisibleBuffer(sizeof(kQuadIndices), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+-    if (!vertexBuffer.has_value() || !indexBuffer.has_value()) {
+-        destroyQuadPipeline(device, *pipeline);
+-        return std::nullopt;
+-    }
+-    std::memcpy(vertexBuffer->mappedData(), vertices.data(), sizeof(vertices));
+-    vertexBuffer->flush();
+-    std::memcpy(indexBuffer->mappedData(), kQuadIndices.data(), sizeof(kQuadIndices));
+-    indexBuffer->flush();
+-
+-    VkImageCreateInfo imageInfo{};
+-    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+-    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+-    imageInfo.format = kColorFormat;
+-    imageInfo.extent = {extent, extent, 1};
+-    imageInfo.mipLevels = 1;
+-    imageInfo.arrayLayers = 1;
+-    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+-    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+-    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+-    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+-    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+-    VkImage image = VK_NULL_HANDLE;
+-    if (vkCreateImage(device, &imageInfo, nullptr, &image) != VK_SUCCESS) {
+-        destroyQuadPipeline(device, *pipeline);
+-        return std::nullopt;
+-    }
+-    VkMemoryRequirements memReq{};
+-    vkGetImageMemoryRequirements(device, image, &memReq);
+-    VkPhysicalDeviceMemoryProperties memProps{};
+-    vkGetPhysicalDeviceMemoryProperties(fixture.device.physicalDevice(), &memProps);
+-    uint32_t memoryTypeIndex = UINT32_MAX;
+-    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+-        if ((memReq.memoryTypeBits & (1U << i)) != 0U &&
+-            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0U) {
+-            memoryTypeIndex = i;
+-            break;
+-        }
+-    }
+-    if (memoryTypeIndex == UINT32_MAX) {
+-        vkDestroyImage(device, image, nullptr);
+-        destroyQuadPipeline(device, *pipeline);
+-        return std::nullopt;
+-    }
+-    VkMemoryAllocateInfo allocInfo{};
+-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+-    allocInfo.allocationSize = memReq.size;
+-    allocInfo.memoryTypeIndex = memoryTypeIndex;
+-    VkDeviceMemory imageMemory = VK_NULL_HANDLE;
+-    if (vkAllocateMemory(device, &allocInfo, nullptr, &imageMemory) != VK_SUCCESS) {
+-        vkDestroyImage(device, image, nullptr);
+-        destroyQuadPipeline(device, *pipeline);
+-        return std::nullopt;
+-    }
+-    vkBindImageMemory(device, image, imageMemory, 0);
+-
+-    VkImageViewCreateInfo viewInfo{};
+-    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+-    viewInfo.image = image;
+-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+-    viewInfo.format = kColorFormat;
+-    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+-    viewInfo.subresourceRange.levelCount = 1;
+-    viewInfo.subresourceRange.layerCount = 1;
+-    VkImageView imageView = VK_NULL_HANDLE;
+-    vkCreateImageView(device, &viewInfo, nullptr, &imageView);
+-
+-    const VkDeviceSize pixelBytes = static_cast<VkDeviceSize>(extent) * extent * 4;
+-    std::vector<uint8_t> pixels(pixelBytes);
+-
+-    {
+-        auto cmdCtx = rx::rhi::CommandContext::create(device, fixture.device.graphicsQueue(), fixture.device.graphicsQueueFamily());
+-        if (!cmdCtx.has_value()) {
+-            vkDestroyImageView(device, imageView, nullptr);
+-            vkDestroyImage(device, image, nullptr);
+-            vkFreeMemory(device, imageMemory, nullptr);
+-            destroyQuadPipeline(device, *pipeline);
+-            return std::nullopt;
+-        }
+-        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+-            rx::rhi::transitionImage(cmd, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+-
+-            VkRenderingAttachmentInfo colorAttachment{};
+-            colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+-            colorAttachment.imageView = imageView;
+-            colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+-            colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+-            colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+-            colorAttachment.clearValue.color = VkClearColorValue{{0.0F, 0.0F, 0.0F, 1.0F}};
+-
+-            VkRenderingInfo renderingInfo{};
+-            renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+-            renderingInfo.renderArea = VkRect2D{{0, 0}, {extent, extent}};
+-            renderingInfo.layerCount = 1;
+-            renderingInfo.colorAttachmentCount = 1;
+-            renderingInfo.pColorAttachments = &colorAttachment;
+-            vkCmdBeginRendering(cmd, &renderingInfo);
+-
+-            VkViewport viewport{0.0F, 0.0F, static_cast<float>(extent), static_cast<float>(extent), 0.0F, 1.0F};
+-            vkCmdSetViewport(cmd, 0, 1, &viewport);
+-            VkRect2D scissor{{0, 0}, {extent, extent}};
+-            vkCmdSetScissor(cmd, 0, 1, &scissor);
+-
+-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
+-            VkDescriptorSet bindlessSet = fixture.bindless.descriptorSet();
+-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->layoutBundle.layout, 0, 1, &bindlessSet, 0, nullptr);
+-
+-            struct { uint32_t textureIndex; uint32_t samplerIndex; float lod; } push{bindlessTextureIndex, bindlessSamplerIndex, 0.0F};
+-            vkCmdPushConstants(cmd, pipeline->layoutBundle.layout, pipeline->pushConstantStages, 0, sizeof(push), &push);
+-
+-            VkBuffer vb = vertexBuffer->handle();
+-            VkDeviceSize vbOffset = 0;
+-            vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOffset);
+-            vkCmdBindIndexBuffer(cmd, indexBuffer->handle(), 0, VK_INDEX_TYPE_UINT32);
+-            vkCmdDrawIndexed(cmd, static_cast<uint32_t>(kQuadIndices.size()), 1, 0, 0, 0);
+-
+-            vkCmdEndRendering(cmd);
+-            rx::rhi::transitionImage(cmd, image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+-        });
+-
+-        auto readback = fixture.allocator.createHostVisibleBuffer(pixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+-        if (!readback.has_value()) {
+-            vkDestroyImageView(device, imageView, nullptr);
+-            vkDestroyImage(device, image, nullptr);
+-            vkFreeMemory(device, imageMemory, nullptr);
+-            destroyQuadPipeline(device, *pipeline);
+-            return std::nullopt;
+-        }
+-        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+-            VkBufferImageCopy region{};
+-            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+-            region.imageSubresource.layerCount = 1;
+-            region.imageExtent = {extent, extent, 1};
+-            vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1, &region);
+-        });
+-        readback->invalidate();
+-        std::memcpy(pixels.data(), readback->mappedData(), pixels.size());
+-    }
+-
+-    vkDeviceWaitIdle(device);
+-    destroyQuadPipeline(device, *pipeline);
+-    vkDestroyImageView(device, imageView, nullptr);
+-    vkDestroyImage(device, image, nullptr);
+-    vkFreeMemory(device, imageMemory, nullptr);
+-
+-    auto pixelAt2 = [&](uint32_t x, uint32_t y) -> std::array<uint8_t, 4> {
+-        size_t o = (static_cast<size_t>(y) * extent + x) * 4;
+-        return {pixels[o], pixels[o + 1], pixels[o + 2], pixels[o + 3]};
+-    };
+-    const uint32_t q1b = extent / 4;
+-    const uint32_t q3b = extent - q1b - 1;
+-    QuadrantPixels result2;
+-    result2.topLeft = pixelAt2(q1b, q1b);
+-    result2.topRight = pixelAt2(q3b, q1b);
+-    result2.bottomLeft = pixelAt2(q1b, q3b);
+-    result2.bottomRight = pixelAt2(q3b, q3b);
+-    return result2;
+-}
+-
+ bool approxEqual(const std::array<uint8_t, 4>& actual, std::array<uint8_t, 3> expectedRgb, int tolerance) {
+     return std::abs(static_cast<int>(actual[0]) - expectedRgb[0]) <= tolerance &&
+            std::abs(static_cast<int>(actual[1]) - expectedRgb[1]) <= tolerance &&
+            std::abs(static_cast<int>(actual[2]) - expectedRgb[2]) <= tolerance;
+ }
+ 
+ // [Fix round 1] Swaps spdlog's default logger for an ostream-capturing one
+ // for the scope of one TEST_CASE -- the same lightweight rx_core-only
+ // pattern src/rx_core/tests/log_test.cpp, texture_decode_test.cpp, and
+ // import_gltf_basisu_test.cpp all already establish (duplicated per-file,
+@@ -1617,25 +1447,25 @@ TEST_CASE("Sampler-wrap regression: glTF-default REPEAT (samplers:[{}], DamagedH
+         {{1.0F, 1.0F, 0.0F}, {0.3125F, 1.3125F}},
+         {{-1.0F, 1.0F, 0.0F}, {0.3125F, 1.3125F}},
+     }};
+     constexpr std::array<QuadVertex, 4> kRepeatRowBottom{{
+         {{-1.0F, -1.0F, 0.0F}, {0.3125F, 1.6875F}},
+         {{1.0F, -1.0F, 0.0F}, {0.3125F, 1.6875F}},
+         {{1.0F, 1.0F, 0.0F}, {0.3125F, 1.6875F}},
+         {{-1.0F, 1.0F, 0.0F}, {0.3125F, 1.6875F}},
+     }};
+ 
+-    auto topReadback =
+-        renderCustomQuadAndReadbackQuadrants(*fixture, record.bindlessIndex, *samplerIndex, kRepeatRowTop);
++    auto topReadback = renderAndReadbackQuadrants(*fixture, record.bindlessIndex, *samplerIndex, /*lod=*/0.0F,
++                                                    /*extent=*/64, kRepeatRowTop);
+     REQUIRE(topReadback.has_value());
+-    auto bottomReadback =
+-        renderCustomQuadAndReadbackQuadrants(*fixture, record.bindlessIndex, *samplerIndex, kRepeatRowBottom);
++    auto bottomReadback = renderAndReadbackQuadrants(*fixture, record.bindlessIndex, *samplerIndex, /*lod=*/0.0F,
++                                                       /*extent=*/64, kRepeatRowBottom);
+     REQUIRE(bottomReadback.has_value());
+ 
+     // THE discriminating assertion: V=1.3125 (wraps to row 2, the top/red
+     // half) must read RED, not the BLUE a CLAMP_TO_EDGE revert would
+     // produce (V clamps to 1.0, reading the bottom/blue edge row instead --
+     // this is byte-for-byte the same failure SHAPE the real DamagedHelmet
+     // defect had). All four corners assert identically -- the quad's UV is
+     // constant, so a correct implementation reads the SAME texel
+     // everywhere.
+     const std::array<uint8_t, 3> kRed{255, 0, 0};
+diff --git a/src/rx_material/tests/test_standard_pbr_unlit.cpp b/src/rx_material/tests/test_standard_pbr_unlit.cpp
+index b53f558..e395ae6 100644
+--- a/src/rx_material/tests/test_standard_pbr_unlit.cpp
++++ b/src/rx_material/tests/test_standard_pbr_unlit.cpp
+@@ -89,21 +89,28 @@ std::optional<Fixture> makeFixture(const char* title) {
+     }
+     auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
+     REQUIRE(context.has_value());
+     VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
+     REQUIRE(surface != VK_NULL_HANDLE);
+     auto device = rx::rhi::Device::create(*context, surface);
+     REQUIRE(device.has_value());
+ 
+     rx::rhi::BindlessTable::Capacities capacities;
+     capacities.sampledImages = 16;
+-    capacities.samplers = 2;
++    // [Fix round 2] 4, not 2: the per-slot sampler-wiring coverage-gap
++    // TEST_CASE (below) registers its rig's own default sampler PLUS two
++    // more (REPEAT/CLAMP_TO_EDGE) against this same fixture's BindlessTable
++    // -- 3 live samplers at once, exceeding the old capacity of 2
++    // (empirically hit: `registerSampler` capacity-exhausted rejection).
++    // Purely permissive for every OTHER TEST_CASE in this file (none
++    // registers more than 1).
++    capacities.samplers = 4;
+     capacities.storageBuffers = 8;
+     auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
+     REQUIRE(bindless.has_value());
+ 
+     auto allocator = rx::rhi::Allocator::create(*context, *device);
+     REQUIRE(allocator.has_value());
+ 
+     return Fixture{std::move(*window),  std::move(*context),   surface,
+                     std::move(*device), std::move(*bindless), std::move(*allocator)};
+ }
+@@ -1719,20 +1726,181 @@ TEST_CASE("StandardPBR: KHR_texture_transform offset/scale applied in-shader bef
+         if (p.name == "baseColorUvOffsetScale") {
+             declaresUvTransform = true;
+         }
+     }
+     CHECK(declaresUvTransform);
+     CHECK(identityPixel.r == transformedPixel.r);  // solid texture -- transform changes WHERE, not the sampled value.
+     destroyRig(*rig);
+     CHECK_FALSE(rig->fixture->context.hasValidationErrors());
+ }
+ 
++// [Fix round 2, coverage-gap closure -- reviewer Important finding] The
++// sampler-wrap P0's own rx_asset-level regression test (texture_cache_
++// test.cpp, "Sampler-wrap regression...") proves TextureCache::
++// getOrCreateSamplerBindlessIndex() builds and registers the right
++// VkSampler for a given glTF sampler object -- but it samples through a
++// raw bindless test shader, never through standard_pbr.slang/
++// StandardPbrParams itself. That leaves a real, narrow gap: a future bug
++// in HOW a caller (samples/08_gltf_viewer/main.cpp's own setupMaterials())
++// maps each SLOT's own resolved sampler index into the CORRECT named
++// gParams field (e.g. accidentally writing metallicRoughnessSampler's
++// resolved value into normalSampler, or here, baseColorSampler's into
++// emissiveSampler) would slip past every existing test -- the only thing
++// that would notice is the coarse, whole-image D17 pixel gate, which is
++// not slot-attributable and depends on DamagedHelmet's own specific
++// content rather than a purpose-built discriminating fixture.
++//
++// This closes that gap AT THE REAL SHADER: one 1x2 "striped" texture
++// (top texel RED, bottom texel BLUE) bound to BOTH baseColorTexture AND
++// emissiveTexture, sampled at the IDENTICAL out-of-[0,1] UV (V=1.125,
++// reached via the SAME KHR_texture_transform offset/scale mechanism the
++// TEST_CASE above already proves works) through TWO DIFFERENT real
++// samplers -- baseColorSampler=REPEAT, emissiveSampler=CLAMP_TO_EDGE.
++// Since both slots read the SAME texture at the SAME coordinate, the ONLY
++// thing that can make their sampled results differ is which sampler EACH
++// SLOT's own shader code actually names -- exactly what a slot-crossed
++// field assignment would get wrong, and exactly the "distinct wrap modes
++// on different slots of one material" shape requested.
++//
++// ISOLATION (no BRDF entanglement, no lighting-direction geometry to get
++// right): `ambientColor=(1,1,1)` + `lightColor=(0,0,0)` makes
++// `directLight` IDENTICALLY zero (standard_pbr.slang's own `directLight =
++// (diffuse+specular) * v.lightColor * NdotL` -- multiplying by a zero
++// lightColor zeroes it regardless of geometry/metallic/roughness), so
++// `color = ambient + emissive = ambientColor*occlusion*baseColor.rgb +
++// emissiveFactor*emissiveSample` exactly (occlusion==1.0 via the rig's own
++// default white occlusion texture, independent of occlusionStrength; see
++// this file's own "FG1 ambient closed-form" TEST_CASE for the identical
++// occlusion==1.0 fact, used there for the same reason). Two draws below
++// each zero the OTHER term via its own *Factor (baseColorFactor=0 for the
++// emissive-isolation draw; emissiveFactorAndPad=0 for the baseColor-
++// isolation draw), so each draw's final pixel is a DIRECT, unblended read
++// of exactly one slot's own sampled texel.
++TEST_CASE("StandardPBR per-slot sampler wiring: baseColorSampler/emissiveSampler independently select "
++          "REPEAT vs CLAMP_TO_EDGE for the SAME texture at the SAME UV [helmet sampler-wrap fix, coverage-gap "
++          "closure] -- a slot-crossed sampler assignment would misroute which slot reads which wrap behavior") {
++    auto rig = makeStandardPbrRig("standard_pbr_sampler_slot_wiring");
++    if (!rig.has_value()) {
++        return;
++    }
++    rx::material::MaterialHandle handle =
++        rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
++    const auto params = rig->system->materialParams(handle);
++
++    std::array<uint8_t, 8> stripePixels{
++        255, 0,   0,   255,  // row 0 (V in [0,0.5)): RED.
++        0,   0,   255, 255,  // row 1 (V in [0.5,1)): BLUE.
++    };
++    rx::material::TextureCreateInfo stripeInfo;
++    stripeInfo.width = 1;
++    stripeInfo.height = 2;
++    stripeInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
++    stripeInfo.pixels = stripePixels.data();
++    stripeInfo.pixelBytes = stripePixels.size();
++    rx::material::TextureHandle stripeHandle = rig->system->createTexture2D(stripeInfo);
++    REQUIRE(stripeHandle.isValid());
++    uint32_t stripeTex = rig->system->textureBindlessIndex(stripeHandle);
++
++    // Two real samplers, differing ONLY in wrap mode -- NEAREST filtering
++    // (not this rig's own default LINEAR) removes any bilinear-boundary
++    // ambiguity, matching the rx_asset-level regression test's own
++    // texel-center discipline.
++    // Raw handles collected for explicit teardown below (VkSampler is not
++    // an RAII type in this codebase's own test idiom -- see this file's
++    // own D26.1 two-draw TEST_CASE for the identical explicit-
++    // vkDestroySampler-before-fixture-teardown discipline this mirrors).
++    std::vector<VkSampler> rawWrapSamplers;
++    auto makeWrapSampler = [&](VkSamplerAddressMode mode) -> uint32_t {
++        VkSamplerCreateInfo info{};
++        info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
++        info.magFilter = VK_FILTER_NEAREST;
++        info.minFilter = VK_FILTER_NEAREST;
++        info.addressModeU = mode;
++        info.addressModeV = mode;
++        info.addressModeW = mode;
++        info.maxLod = VK_LOD_CLAMP_NONE;
++        VkSampler sampler = VK_NULL_HANDLE;
++        REQUIRE(vkCreateSampler(rig->fixture->device.device(), &info, nullptr, &sampler) == VK_SUCCESS);
++        rawWrapSamplers.push_back(sampler);
++        rx::rhi::BindlessHandle h = rig->fixture->bindless.registerSampler(sampler);
++        REQUIRE(h.isValid());
++        return h.index();
++    };
++    uint32_t repeatSampler = makeWrapSampler(VK_SAMPLER_ADDRESS_MODE_REPEAT);
++    uint32_t clampSampler = makeWrapSampler(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
++
++    // uv.y = 0.5*scaleY + offsetY = 0.5*1.0 + 0.625 = 1.125 -- OUTSIDE
++    // [0,1], matching DamagedHelmet's own "V wholly outside [0,1]" shape.
++    // REPEAT: frac(1.125)=0.125 -> row 0 (RED). CLAMP_TO_EDGE: clamps to
++    // 1.0 -> row 1 (BLUE, the last real texel -- 1.0 sits beyond every
++    // texel center, so NEAREST deterministically picks the edge texel,
++    // same reasoning as the rx_asset-level test).
++    const std::array<float, 4> kProbeUvTransform{0.0F, 0.625F, 1.0F, 1.0F};
++
++    rx::material::DrawDataGpu isolatedRow = makeHeadOnRow();
++    isolatedRow.ambientColor = glm::vec4(1.0F, 1.0F, 1.0F, 0.0F);
++    isolatedRow.lightColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
++
++    // `baseColorSamplerValue`/`emissiveSamplerValue` are passed through
++    // explicitly (not hardcoded inside this lambda) so the revert-proof
++    // below can swap exactly these two values -- simulating precisely the
++    // "setupMaterials() wrote the wrong resolved index into the wrong
++    // named field" bug class this TEST_CASE exists to catch.
++    auto makeBlob = [&](uint32_t baseColorSamplerValue, uint32_t emissiveSamplerValue, bool isolateBaseColor) {
++        std::vector<uint8_t> blob = makeDefaultStandardPbrBlob(*rig, handle);
++        setParam(blob, params, "baseColorTexture", stripeTex);
++        setParam(blob, params, "emissiveTexture", stripeTex);
++        setParam(blob, params, "baseColorSampler", baseColorSamplerValue);
++        setParam(blob, params, "emissiveSampler", emissiveSamplerValue);
++        setParam(blob, params, "baseColorUvOffsetScale", kProbeUvTransform);
++        setParam(blob, params, "emissiveUvOffsetScale", kProbeUvTransform);
++        if (isolateBaseColor) {
++            setParam(blob, params, "baseColorFactor", std::array<float, 4>{1.0F, 1.0F, 1.0F, 1.0F});
++            setParam(blob, params, "emissiveFactorAndPad", std::array<float, 4>{0.0F, 0.0F, 0.0F, 0.0F});
++        } else {
++            setParam(blob, params, "baseColorFactor", std::array<float, 4>{0.0F, 0.0F, 0.0F, 1.0F});
++            setParam(blob, params, "emissiveFactorAndPad", std::array<float, 4>{1.0F, 1.0F, 1.0F, 0.0F});
++        }
++        return blob;
++    };
++
++    // CORRECTLY wired: baseColorSampler=REPEAT, emissiveSampler=CLAMP --
++    // two DIFFERENT wrap modes on two DIFFERENT slots of the SAME material.
++    std::vector<uint8_t> baseColorBlob = makeBlob(repeatSampler, clampSampler, /*isolateBaseColor=*/true);
++    std::vector<uint8_t> emissiveBlob = makeBlob(repeatSampler, clampSampler, /*isolateBaseColor=*/false);
++
++    Rgba8 baseColorPixel = renderOne(*rig, handle, baseColorBlob, isolatedRow);
++    Rgba8 emissivePixel = renderOne(*rig, handle, emissiveBlob, isolatedRow);
++
++    // THE discriminating assertions: baseColorSampler=REPEAT -> RED;
++    // emissiveSampler=CLAMP_TO_EDGE -> BLUE. A slot-crossed field
++    // assignment would swap these two outcomes exactly (empirically
++    // confirmed -- see this fix round's report addendum for the
++    // swap-and-revert evidence: `makeBlob()`'s own two `setParam(...,
++    // "...Sampler", ...)` argument VALUES were swapped in place, this
++    // TEST_CASE failed all 6 assertions below with baseColorPixel reading
++    // BLUE and emissivePixel reading RED -- the exact inversion -- then
++    // reverted via `git checkout --`, confirmed passing again).
++    CHECK(baseColorPixel.r > 200);
++    CHECK(baseColorPixel.g < 50);
++    CHECK(baseColorPixel.b < 50);
++    CHECK(emissivePixel.b > 200);
++    CHECK(emissivePixel.r < 50);
++    CHECK(emissivePixel.g < 50);
++
++    for (VkSampler sampler : rawWrapSamplers) {
++        vkDestroySampler(rig->fixture->device.device(), sampler, nullptr);
++    }
++    destroyRig(*rig);
++    CHECK_FALSE(rig->fixture->context.hasValidationErrors());
++}
++
+ TEST_CASE("--exposure: 2^exposure pre-tonemap multiply -- exposure=0 is a byte-identical no-op; exposure=1 "
+           "measurably brightens the same draw") {
+     auto rig = makeStandardPbrRig("standard_pbr_exposure");
+     if (!rig.has_value()) {
+         return;
+     }
+     rx::material::MaterialHandle handle =
+         rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
+     const auto params = rig->system->materialParams(handle);
+ 

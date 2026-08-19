@@ -1,0 +1,2427 @@
+# Review package: f67de3d..787f978
+
+## Commits
+787f978 docs: helmet-texture-fix-report addendum -- sampler-wrap P0 supersede
+2f584c4 test(samples): regenerate D17 loaded_scene reference post sampler-wrap fix
+715681b fix(rx_material,rx_asset,samples): per-slot sampler wiring closes the DamagedHelmet sampler-wrap P0 (card #P0)
+
+## Files changed
+ .../helmet-after.png                               | Bin 21425 -> 56763 bytes
+ .../helmet-texture-fix-report.md                   | 306 +++++++++++++++++++
+ assets/test/sampler_wrap_probe.bin                 | Bin 0 -> 204 bytes
+ assets/test/sampler_wrap_probe.gltf                | 158 ++++++++++
+ samples/01_triangle/CMakeLists.txt                 |  19 +-
+ samples/02_hotreload/CMakeLists.txt                |  14 +-
+ samples/05_multipass/CMakeLists.txt                |  13 +-
+ samples/06_materials/CMakeLists.txt                |  43 ++-
+ samples/07_stress/CMakeLists.txt                   |  13 +-
+ samples/08_gltf_viewer/CMakeLists.txt              |  44 ++-
+ samples/08_gltf_viewer/main.cpp                    |  98 ++++++-
+ samples/08_gltf_viewer/references/loaded_scene.png | Bin 21400 -> 21025 bytes
+ shaders/material/material.slang                    |  96 ++++--
+ shaders/material/standard_pbr.slang                |  34 ++-
+ shaders/material/unlit.slang                       |  11 +-
+ src/rx_asset/include/rx_asset/texture_cache.h      |  48 +++
+ src/rx_asset/tests/texture_cache_test.cpp          | 323 +++++++++++++++++++++
+ src/rx_asset/texture_cache.cpp                     |  32 ++
+ src/rx_material/include/rx_material/draw_data.h    |   7 +-
+ .../include/rx_material/material_system.h          |  24 +-
+ src/rx_material/material_system.cpp                |  74 +++--
+ src/rx_material/tests/test_api_factory.cpp         |  25 +-
+ src/rx_material/tests/test_standard_pbr_unlit.cpp  |  37 +++
+ 23 files changed, 1314 insertions(+), 105 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/helmet-after.png b/.superpowers/sdd/2026-08-11-phase4-scene-assets/helmet-after.png
+index 6badfe7..bf7f3f6 100644
+Binary files a/.superpowers/sdd/2026-08-11-phase4-scene-assets/helmet-after.png and b/.superpowers/sdd/2026-08-11-phase4-scene-assets/helmet-after.png differ
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/helmet-texture-fix-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/helmet-texture-fix-report.md
+index 40658d3..a9b7b0d 100644
+--- a/.superpowers/sdd/2026-08-11-phase4-scene-assets/helmet-texture-fix-report.md
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/helmet-texture-fix-report.md
+@@ -238,10 +238,316 @@ less). Flagging for the coordinator's awareness; a future interactive
+ rebase/history cleanup, if desired, is a coordinator decision.
+ 
+ ## 9. Recommendation
+ 
+ Close this P0 as **not reproducible as a texture-identity defect** at
+ `ad9a5e6`. If the visual result is still considered unacceptable, the next
+ productive step is almost certainly on the lighting side (FG1 ambient
+ tuning, or fast-tracking IBL) rather than further material-resolution
+ investigation — but that is explicitly out of this task's scope and a
+ separate decision for the coordinator/roadmap.
++
++---
++
++## 10. SUPERSEDE ADDENDUM (fix round, sampler-wrap P0)
++
++**This section corrects Section 4-9 above. The original text above is left
++unedited (per instruction) — read it as the record of what the first
++investigation could see, not as the current verdict.**
++
++### 10.1 The no-bug verdict is REFUTED
++
++Adversarial verification (a separate task, after this report) found the
++real defect one layer below everything this investigation audited:
++`shaders/material/material.slang`'s `rx_sampleTexture()` sampled **every**
++material texture slot through **one hardcoded, process-wide
++`CLAMP_TO_EDGE` sampler** (`material_system.cpp`'s `defaultSamplerInfo`,
++the documented Task 4 seam-bleed choice), regardless of that texture's own
++glTF wrap mode. DamagedHelmet's `TEXCOORD_0` V coordinate lies **entirely**
++in `[1.0005, 1.9987]` — spec-legal, relying on glTF's own default REPEAT
++wrap for UVs outside `[0,1]`. Under CLAMP_TO_EDGE every fragment's V
++clamped to `1.0`, so the whole mesh sampled each texture's bottom edge
++texel row: a near-black dome (the albedo's bottom-row content), a flat
++green blob (the metallicRoughness bottom row bleeding through the visor
++region), and an emissive term that read as **exactly** zero (the emissive
++map's bottom row happens to be unlit) — not a camera-framing coincidence,
++as §3.2 above concluded. `TextureCache::getOrCreateSampler()` had already
++built the *correct* per-texture sampler, honoring each texture's real glTF
++wrap mode — it was simply never wired to anything the shader could reach.
++
++Proof chain (adversarial verifier, reproduced independently before this
++fix round started): a build-tree `frac()` probe on the sampled UV flipped
++the render to teal-visor/silver-panels matching an independent Blender
++no-IBL render (`helmet-reference-noibl.png`, this directory); a `v -> 3-v`
++flip test was byte-identical to the *bug* (clamp eats a flip the same way
++it eats the real UVs — this is what disambiguated "sampler clamp" from
++"someone flipped V somewhere," the coordinator's own alternate hypothesis);
++no flip transform exists anywhere in the actual pipeline; the colorspace/
++decode layer (already verified correct by §2.1 above) stayed clean; the
++committed D17 reference PNG **encodes the bug** (it was generated against
++the same broken code, so the self-referential D17 gate could never have
++caught this); and no fixture in `assets/test/` had UVs outside `[0,1]`,
++which is exactly why nothing in the existing suite (including this
++report's own new slot-swap discriminator, §5 above) was structurally
++capable of exercising this code path at all.
++
++**Why this investigation's own methodology missed it, precisely**: the
++UV-gradient probe (§2.2) visualizes UV *before* the sampler ever runs — a
++smooth, correct UV gradient says nothing about what wrap mode the sampler
++then applies to it. The color-mean/quadrant checks (§2.2, §5) validate
++"this slot's content is present and distinct from its siblings" — a
++content-exists check, not a content-is-at-the-right-screen-position check.
++Both classes of check are still correct and still worth having; neither
++was ever capable of seeing a sampler-address-mode defect, because both
++sit either upstream or orthogonal to where the bug actually lived.
++
++### 10.2 The fix
++
++Per-slot sampler wiring, analogous to the existing per-slot texture-index
++wiring:
++
++- `shaders/material/material.slang`: `rx_sampleTexture()` gained a
++  three-argument overload (`textureIndex, samplerIndex, uv`) that samples
++  through an **explicit** bindless sampler index; the original two-argument
++  form is now a thin wrapper over it using
++  `gMaterialGlobals.defaultSamplerIndex` (unchanged shape, now genuinely
++  just a fallback).
++- `shaders/material/standard_pbr.slang` / `unlit.slang`: `StandardPbrParams`
++  gained one bindless sampler index per texture slot (`baseColorSampler`,
++  `metallicRoughnessSampler`, `normalSampler`, `occlusionSampler`,
++  `emissiveSampler`); `UnlitParams` gained `baseColorSampler`. Every
++  `rx_sampleTexture()` call site in both files switched to the new
++  three-argument form.
++- `src/rx_asset/texture_cache.{h,cpp}`: new
++  `TextureCache::getOrCreateSamplerBindlessIndex(const SamplerDesc&)` —
++  gets-or-creates the deduplicated `VkSampler` (via the pre-existing
++  `getOrCreateSampler()`, unchanged), then gets-or-creates its OWN
++  bindless-table registration (a second cache keyed by the already-
++  deduplicated `VkSampler` handle, so the mapping logic is not
++  duplicated). Released in `~TextureCache()`, symmetric with the existing
++  `vkDestroySampler` loop.
++- `samples/08_gltf_viewer/main.cpp`: new `resolveSamplerIndex()` (mirrors
++  `resolveTextureIndex()`) resolves each slot's real sampler through
++  `TextureCache`, falling back to the app's own default sampler only on a
++  genuine `TextureCache` failure. `setupMaterials()` wires it for every
++  StandardPBR/Unlit texture slot. `SamplerDesc`'s own default-constructed
++  values (glTF's documented "sampler unspecified" default: REPEAT wrap,
++  auto filtering) are passed straight through for both an ABSENT slot and
++  a present slot whose glTF texture referenced no sampler object at all —
++  no special-casing needed, since that default IS the spec-correct answer
++  either way.
++- **Absent-sampler default flipped from CLAMP to REPEAT**: both the app's
++  own hand-rolled default sampler (`samples/08_gltf_viewer/main.cpp`) and
++  `MaterialSystem`'s own internal default sampler
++  (`material_system.cpp`'s `defaultSamplerInfo`) now default to
++  `VK_SAMPLER_ADDRESS_MODE_REPEAT` — glTF's own documented default for
++  "sampler unspecified," and the honest choice now that real per-slot
++  sampling handles wrap-sensitive content; this default is reached only as
++  a fallback (the two-argument `rx_sampleTexture()` overload; a genuine
++  `getOrCreateSamplerBindlessIndex()` failure).
++  `MaterialSystem::create()` gained a `defaultSamplerAddressMode`
++  parameter (default `REPEAT`) precisely so a caller that still needs
++  CLAMP_TO_EDGE can request it explicitly, rather than depending on a
++  process-wide default that no longer defaults to it.
++- **Task 4's own seam-bleed test updated honestly, not weakened**: the two
++  `test_api_factory.cpp` `TEST_CASE`s that motivated CLAMP_TO_EDGE in the
++  first place (`"IRxMaterialInstance::setTexture's bound texture actually
++  changes the rendered image..."` and the hot-reload sibling) now call
++  `MaterialSystem::create(..., VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)`
++  explicitly. Same byte-exact quadrant assertions as before — this test's
++  own deliberately non-tiled 2x2 texture genuinely does need CLAMP_TO_EDGE
++  to avoid REPEAT's wrong-neighbor bleed; it now says so explicitly instead
++  of inheriting it silently.
++- Every `StandardPbr`/`Unlit` param-blob builder in
++  `src/rx_material/tests/test_standard_pbr_unlit.cpp` (one shared helper,
++  `makeDefaultStandardPbrBlob()`, plus 7 manually-built Unlit blobs at
++  individual `TEST_CASE`s) now populates the new sampler field(s), pointed
++  at that file's own rig-local CLAMP_TO_EDGE sampler — byte-identical
++  behavior to before this fix round, since no test in that suite exercises
++  UVs outside `[0,1]`.
++
++### 10.3 The missing regression class (item 2)
++
++New, committed: `assets/test/sampler_wrap_probe.gltf` +
++`assets/test/sampler_wrap_probe.bin` — a single quad whose one material's
++`baseColorTexture` references the already-committed
++`assets/test/textures/quadrant.png` (8x8, TL=red/TR=green/BL=blue/
++BR=yellow) through `"samplers": [{}]` (an explicit-but-EMPTY glTF sampler
++object) referenced by `"textures":[{"source":0,"sampler":0}]` —
++byte-for-byte the same shape DamagedHelmet's own real glTF file uses.
++
++New `TEST_CASE` in `src/rx_asset/tests/texture_cache_test.cpp`
++("Sampler-wrap regression: ..."): imports the fixture through the real
++`Registry::importGltf()` with a real `TextureCache`, asserts the imported
++material's parsed `SamplerDesc` is REPEAT (`wrapS`/`wrapT == 10497`),
++resolves the REAL bindless sampler index via
++`TextureCache::getOrCreateSamplerBindlessIndex()` (the exact call
++`resolveSamplerIndex()` makes in production), and renders two constant-UV
++quads through a raw bindless-sampling shader (this file's own established
++`buildQuadPipeline()`/`kQuadShaderSource` infrastructure, extended with a
++new `renderCustomQuadAndReadbackQuadrants()` helper that accepts caller-
++supplied vertices instead of the existing helper's fixed `[0,1]`
++corners — added rather than modifying the existing helper, so every
++pre-existing caller is unaffected). Both probe UVs sit **wholly outside
++`[0,1]`** in V (`1.3125` and `1.6875`, matching DamagedHelmet's own "V
++wholly outside `[0,1]`" shape) and land exactly on a `quadrant.png` texel
++CENTER post-wrap, so the assertion is filter-mode-independent:
++
++- `V=1.3125` (wraps to texel row 2, the texture's RED half): the
++  discriminating probe. Expects RED under the fix; a CLAMP_TO_EDGE revert
++  clamps V to exactly `1.0`, deterministically reading the LAST row
++  (texture's BLUE half) instead — the identical failure *shape* the real
++  DamagedHelmet defect had.
++- `V=1.6875` (wraps to texel row 5, BLUE): non-discriminating sanity probe
++  (both fix and bug read BLUE here) — proves the texture/pipeline are real
++  and not degenerate.
++
++**Revert-test evidence (mandatory, empirical, not asserted):** a literal
++scratch `git worktree` (`git worktree add ... 715681b`) was attempted
++first, per instruction; it hit a reproducible, DIAGNOSED, and unrelated
++zig/mikktspace toolchain quirk — `mikktspace.c` compiled through the
++project's `zig cc` wrapper links clean (0 `__ubsan_handle_*` references)
++from the main tree's own absolute path, but the identical source, same
++compiler flags, compiled from the worktree's own (necessarily different)
++absolute path pulled in 11 unresolved `__ubsan_handle_*` symbols at link
++time — confirmed NOT a path-alone effect (a manual, minimal `zig cc`
++invocation against a plain copy at an alternate path linked clean), most
++likely a `~/.cache/zig` content-addressed-cache interaction specific to
++this environment, entirely unrelated to any file this fix round touched.
++Given the project's own established precedent for exactly this situation
++(§5 above, this same report: "A literal second git worktree was not used
++for this specific proof... git's index gave an equally strong... revert
++guarantee"), the proof was completed instead as an in-tree revert-and-
++restore against the already-committed fix (`715681b`), which gives an
++identical safety guarantee (the fix was safely committed before the revert
++edit, and `git diff`/`git checkout --` confirm a byte-exact restore):
++
++1. **Fixed code** (`715681b`, `getOrCreateSampler()` uses
++   `mapWrap(desc.wrapS/wrapT)`): `rx_asset_tests
++   --test-case="Sampler-wrap regression*"` → **1/1 test case, 26/26
++   assertions, SUCCESS**.
++2. **Re-hardcoded-clamp revert** (`getOrCreateSampler()`'s `key.wrapS`/
++   `key.wrapT` forced to `VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE`
++   regardless of `desc`, in-tree, uncommitted): same test →
++   **1/1 test case FAILED, 21/26 assertions passed, 5 FAILED** — every one
++   of the 5 discriminating assertions (`topLeft`/`topRight`/`bottomLeft`/
++   `bottomRight` all reading BLUE instead of RED, plus the explicit
++   `CHECK_FALSE(...kBlue...)` also failing) failed exactly as predicted.
++3. **Restore** (`git checkout -- src/rx_asset/texture_cache.cpp`,
++   confirmed byte-exact via empty `git diff --stat`): same test →
++   **1/1 test case, 26/26 assertions, SUCCESS** again.
++
++### 10.4 Shader-deploy DEPENDS (item 3)
++
++Confirmed in-session: a clean-HEAD `sample_08_gltf_viewer_headless` run
++produced `UNASSIGNED-CoreValidation-Shader-OutputNotConsumed` against
++`standard_pbr.slang`'s vertex outputs — a stale DEPLOYED shader copy left
++over from this fix round's own in-place shader edits, exactly the
++class of bug this report's own §3.1 flagged as a follow-up and never
++fixed. Root cause confirmed: every sample's shader-deploy step used a bare
++`add_custom_command(TARGET ... POST_BUILD ...)`, which CMake only re-runs
++when the TARGET itself relinks — `add_custom_command(TARGET ...)` has no
++`DEPENDS` keyword at all (only the `OUTPUT` form does), so a `.slang`-only
++edit left the deployed copy silently stale.
++
++Fixed by converting every such step to the `OUTPUT` + stamp-file +
++`add_custom_target` + `add_dependencies` pattern this same file
++(`samples/08_gltf_viewer/CMakeLists.txt`) already used for its own D17
++reference-PNG deploy — across every sample that had the gap:
++`samples/01_triangle` (the precompiled-SPIR-V deploy — same staleness
++class, one layer removed: editing the `.slang` source regenerates the
++`.spv` via its own tracked custom command, but the COPY next to the binary
++was still untracked), `02_hotreload`, `05_multipass`, `06_materials`
++(both its own `materials/*.slang` deploy and the shared
++`material.slang`/`forward_entry.slang` deploy), `07_stress`, and
++`08_gltf_viewer` (both the `material_shaders/` deploy and the tonemap-
++shader deploy — the two the brief named explicitly). `04_streaming` and
++`03_bindless_mesh`'s own `texture.png` deploy (not a shader) were out of
++scope. Verified: a full clean rebuild (§10.6 below) shows every one of
++these stamp-generating custom commands firing exactly once, and
++`sample_08_gltf_viewer_headless` passes clean from that same clean build.
++
++### 10.5 D17 references regenerated (item 4)
++
++Regenerated via the documented, never-auto-run `tools/regen_references.sh
++linux-native`, from the CLEAN rebuilt (§10.6) + freshly redeployed build
++directory (per that script's own header comment: lavapipe-only,
++`VK_ICD_FILENAMES` forced to the real system ICD). Only
++`samples/08_gltf_viewer/references/loaded_scene.png` changed
++(`loading_state.png` — the pre-import placeholder frame — is untouched by
++this fix, as expected). Rebuilt `sample_08_gltf_viewer` (picks up the new
++PNG via its own tracked deploy step) and re-ran the headless gate:
++
++```
++sample_08_gltf_viewer: D17 loading_state gate: failingPixels=0/65536 (0.0000%) pass=true
++sample_08_gltf_viewer: D17 loaded_scene gate: failingPixels=0/65536 (0.0000%) pass=true
++sample_08_gltf_viewer: headless gate PASSED
++```
++
++`helmet-after.png` (this directory) refreshed: captured via
++`--write-references` from the same clean build (confirmed byte-identical
++to the newly committed D17 `loaded_scene.png` reference via `cmp`), then
++upscaled 256x256 → 512x512 (Lanczos, presentation-only — this sample's
++headless capture has no resolution flag, so there is no native 512px
++render; the upscale is documented here rather than silently presented as
++one). Visually: teal visor, silver/white panels, gold accent at the
++mouth-guard, and the dark-green dome pattern with cyan vent lights —
++matching `helmet-reference-noibl.png`'s own independent Blender no-IBL
++render. `helmet-before.png` (the original bug capture) is left untouched
++for comparison.
++
++### 10.6 Verification, clean rebuild (item 6)
++
++`rm -rf build/linux-native`, then `cmake --preset linux-native && cmake
++--build --preset linux-native` (full project, all 164 targets, ~57s) —
++genuinely clean, not incremental; this is the build the D17 regen and
++every suite below ran from.
++
++- `rx_asset_tests`: **33/33 test cases, 564/564 assertions** (was 32/32,
++  538/538 before this fix round — +1 case for the new sampler-wrap
++  regression test, +26 assertions).
++- `rx_asset_gltf_tests`: **48/48, 292/292** (unchanged).
++- `rx_asset_gltf_gpu_tests`: **57/57, 8,401,735/8,401,735** — clean this
++  run (the wall-clock/iteration-budget flake §6 flagged before is
++  pre-existing and unrelated to this fix; not chased further, same as
++  before).
++- `rx_material_tests`: **14/14, 75/75**.
++- `rx_material_gpu_tests`: **49/49, 2265/2265** (was 49/49, 2156/2156
++  before — the new per-slot sampler `setParam()` calls this fix round
++  added to every StandardPbr/Unlit blob-builder account for the increase;
++  zero behavior change to any existing assertion).
++- Full serial `ctest --preset linux-native -j1`: **22/22 passed**
++  (73.56s), including `sample_08_gltf_viewer_headless` — the
++  OutputNotConsumed contamination from this fix round's own in-session
++  shader edits is gone, confirming §10.4's fix.
++- `windows-cross-zig`: full incremental build (existing build directory,
++  40 targets touched/relinked) succeeds clean; full serial `ctest
++  --preset windows-cross-zig -j1` under Wine: **22/22 passed** (139.77s),
++  including `sample_08_gltf_viewer_headless`.
++- Zero unfiltered Vulkan validation errors in any run — only the two
++  already-documented, pre-existing false-positive categories fire
++  (`SPIR-V SourceLanguage=Slang`, and the separate-sampler
++  `SYNC-HAZARD-READ_AFTER_WRITE` misclassification), both named as such
++  in-code before this fix round and unrelated to it.
++
++### 10.7 Files touched (fix round, final state)
++
++Pathspec-scoped commits (author = local git config, no AI attribution, no
++push):
++
++- Production fix: `shaders/material/{material,standard_pbr,unlit}.slang`;
++  `src/rx_asset/{texture_cache.h,texture_cache.cpp}`;
++  `src/rx_material/include/rx_material/{material_system.h,draw_data.h}`;
++  `src/rx_material/material_system.cpp`;
++  `samples/08_gltf_viewer/{main.cpp,CMakeLists.txt}`.
++- Shader-deploy DEPENDS sweep:
++  `samples/{01_triangle,02_hotreload,05_multipass,06_materials,07_stress}/CMakeLists.txt`.
++- New regression class: `assets/test/sampler_wrap_probe.{gltf,bin}`;
++  `src/rx_asset/tests/texture_cache_test.cpp`.
++- Test-suite updates for the new per-slot sampler fields:
++  `src/rx_material/tests/{test_api_factory.cpp,test_standard_pbr_unlit.cpp}`.
++- D17 regen: `samples/08_gltf_viewer/references/loaded_scene.png`.
++- This addendum: `helmet-texture-fix-report.md`.
++- `.superpowers/sdd/2026-08-11-phase4-scene-assets/helmet-after.png`
++  (SDD workspace artifact, not production code).
++
++No board/plan/spec/ledger file was edited by this fix round.
+diff --git a/assets/test/sampler_wrap_probe.bin b/assets/test/sampler_wrap_probe.bin
+new file mode 100644
+index 0000000..9904d57
+Binary files /dev/null and b/assets/test/sampler_wrap_probe.bin differ
+diff --git a/assets/test/sampler_wrap_probe.gltf b/assets/test/sampler_wrap_probe.gltf
+new file mode 100644
+index 0000000..9bad2c8
+--- /dev/null
++++ b/assets/test/sampler_wrap_probe.gltf
+@@ -0,0 +1,158 @@
++{
++  "asset": {
++    "version": "2.0",
++    "generator": "rx_asset hand-authored test fixture (helmet sampler-wrap fix, P0 regression class)"
++  },
++  "scene": 0,
++  "scenes": [
++    {
++      "nodes": [
++        0
++      ]
++    }
++  ],
++  "nodes": [
++    {
++      "mesh": 0,
++      "name": "quad"
++    }
++  ],
++  "meshes": [
++    {
++      "name": "quad",
++      "primitives": [
++        {
++          "attributes": {
++            "POSITION": 0,
++            "NORMAL": 1,
++            "TANGENT": 2,
++            "TEXCOORD_0": 3
++          },
++          "indices": 4,
++          "material": 0,
++          "mode": 4
++        }
++      ]
++    }
++  ],
++  "materials": [
++    {
++      "name": "sampler_wrap_probe_material",
++      "pbrMetallicRoughness": {
++        "baseColorFactor": [
++          1.0,
++          1.0,
++          1.0,
++          1.0
++        ],
++        "baseColorTexture": {
++          "index": 0
++        },
++        "metallicFactor": 1.0,
++        "roughnessFactor": 1.0
++      },
++      "doubleSided": false,
++      "alphaMode": "OPAQUE"
++    }
++  ],
++  "images": [
++    {
++      "uri": "textures/quadrant.png",
++      "name": "quadrant"
++    }
++  ],
++  "samplers": [
++    {}
++  ],
++  "textures": [
++    {
++      "source": 0,
++      "sampler": 0
++    }
++  ],
++  "accessors": [
++    {
++      "bufferView": 0,
++      "byteOffset": 0,
++      "componentType": 5126,
++      "count": 4,
++      "type": "VEC3",
++      "min": [
++        -0.5,
++        -0.5,
++        0.0
++      ],
++      "max": [
++        0.5,
++        0.5,
++        0.0
++      ]
++    },
++    {
++      "bufferView": 1,
++      "byteOffset": 0,
++      "componentType": 5126,
++      "count": 4,
++      "type": "VEC3"
++    },
++    {
++      "bufferView": 2,
++      "byteOffset": 0,
++      "componentType": 5126,
++      "count": 4,
++      "type": "VEC4"
++    },
++    {
++      "bufferView": 3,
++      "byteOffset": 0,
++      "componentType": 5126,
++      "count": 4,
++      "type": "VEC2"
++    },
++    {
++      "bufferView": 4,
++      "byteOffset": 0,
++      "componentType": 5123,
++      "count": 6,
++      "type": "SCALAR"
++    }
++  ],
++  "bufferViews": [
++    {
++      "buffer": 0,
++      "byteOffset": 0,
++      "byteLength": 48,
++      "target": 34962
++    },
++    {
++      "buffer": 0,
++      "byteOffset": 48,
++      "byteLength": 48,
++      "target": 34962
++    },
++    {
++      "buffer": 0,
++      "byteOffset": 96,
++      "byteLength": 64,
++      "target": 34962
++    },
++    {
++      "buffer": 0,
++      "byteOffset": 160,
++      "byteLength": 32,
++      "target": 34962
++    },
++    {
++      "buffer": 0,
++      "byteOffset": 192,
++      "byteLength": 12,
++      "target": 34963
++    }
++  ],
++  "buffers": [
++    {
++      "uri": "sampler_wrap_probe.bin",
++      "byteLength": 204
++    }
++  ]
++}
+diff --git a/samples/01_triangle/CMakeLists.txt b/samples/01_triangle/CMakeLists.txt
+index e9853fc..27f760f 100644
+--- a/samples/01_triangle/CMakeLists.txt
++++ b/samples/01_triangle/CMakeLists.txt
+@@ -15,27 +15,44 @@ add_dependencies(sample_01_triangle triangle_shaders)
+ # (redistribution fix, Task 8): main.cpp's resolveSpvPath() looks for them
+ # exe-relative first (via SDL_GetBasePath()) before falling back to the
+ # compile-time absolute build-tree path above -- without this copy step, a
+ # redistributed copy of just this build-output directory would have nothing
+ # there to find, and the compile-time fallback path (which points inside
+ # THIS machine's build tree, under shaders/) would not exist on a different
+ # machine either. This sample ships no Slang runtime libraries [D2] -- its
+ # shaders are precompiled offline by slangc at build time, not compiled
+ # in-process -- so these two files are the entire redistribution surface a
+ # copy of this sample's directory needs beyond the binary itself.
+-add_custom_command(TARGET sample_01_triangle POST_BUILD
++#
++# [Fix round, item 3] OUTPUT/DEPENDS-tracked, NOT a bare
++# `add_custom_command(TARGET ... POST_BUILD)` -- that form only re-runs when
++# the TARGET ITSELF relinks, so a `triangle_shaders` recompile (edit
++# triangle.vert.slang/triangle.frag.slang -> shaders/CMakeLists.txt's own
++# tracked slangc custom command regenerates RX_TRIANGLE_VERT_SPV/
++# RX_TRIANGLE_FRAG_SPV) would leave THIS deployed copy stale until an
++# unrelated relink -- the identical class of hazard samples/08_gltf_viewer/
++# CMakeLists.txt's own material_shaders/tonemap deploy steps had (see that
++# file's own comment for the full mechanism, including the in-session
++# incident that made this fix mandatory project-wide).
++add_custom_command(
++  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/triangle_shaders_deploy.stamp"
+   COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+           "${RX_TRIANGLE_VERT_SPV}" "${RX_TRIANGLE_FRAG_SPV}"
+           "$<TARGET_FILE_DIR:sample_01_triangle>/"
++  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/triangle_shaders_deploy.stamp"
++  DEPENDS "${RX_TRIANGLE_VERT_SPV}" "${RX_TRIANGLE_FRAG_SPV}"
+   COMMENT "sample_01_triangle: deploying precompiled SPIR-V next to the binary"
+   VERBATIM
+ )
++add_custom_target(sample_01_triangle_shaders_deploy
++  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/triangle_shaders_deploy.stamp")
++add_dependencies(sample_01_triangle sample_01_triangle_shaders_deploy)
+ 
+ # Runs the binary in headless mode with --validate: ctest is the developer/CI
+ # gate, so it explicitly opts into the Vulkan validation layers (requires the
+ # Vulkan SDK / validation layers installed -- see samples/README.md) on top
+ # of the default end-user behavior, which is headless with validation OFF.
+ # The binary also supports --present mode for interactive windowed rendering.
+ add_test(NAME sample_01_triangle_headless COMMAND sample_01_triangle --validate)
+ # Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+ # (windows-cross Wine hang, run 31512073559).
+ set_tests_properties(sample_01_triangle_headless PROPERTIES TIMEOUT 300)
+diff --git a/samples/02_hotreload/CMakeLists.txt b/samples/02_hotreload/CMakeLists.txt
+index 6db9e27..57c33e6 100644
+--- a/samples/02_hotreload/CMakeLists.txt
++++ b/samples/02_hotreload/CMakeLists.txt
+@@ -24,27 +24,39 @@ target_link_libraries(sample_02_hotreload PRIVATE rx_rhi_vk rx_platform rx_shade
+ # deployment mechanism [R:D2, spec Fixed decision #11].
+ rx_shader_deploy_runtime_libs(sample_02_hotreload)
+ 
+ # Deploys the live-reloadable shader source next to the binary at build
+ # time, so --present mode's on-disk mtime-poll loop (main.cpp,
+ # resolveShaderPath()) has something to watch and edit without needing to
+ # run from this source directory -- and so a redistributed copy of just
+ # this build output directory (binary + hotreload.slang + the Slang
+ # runtime libs above) works identically, which is the whole point of the
+ # redistribution proof.
+-add_custom_command(TARGET sample_02_hotreload POST_BUILD
++#
++# [Fix round, item 3] OUTPUT/DEPENDS-tracked, NOT a bare
++# `add_custom_command(TARGET ... POST_BUILD)` -- see samples/08_gltf_viewer/
++# CMakeLists.txt's own material_shaders deploy comment for the full
++# mechanism this avoids (a POST_BUILD recipe only re-runs when the TARGET
++# itself relinks, leaving an edited .slang source's deployed copy stale).
++add_custom_command(
++  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/hotreload_shader_deploy.stamp"
+   COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+           "${CMAKE_CURRENT_SOURCE_DIR}/hotreload.slang"
+           "$<TARGET_FILE_DIR:sample_02_hotreload>/hotreload.slang"
++  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/hotreload_shader_deploy.stamp"
++  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/hotreload.slang"
+   COMMENT "sample_02_hotreload: deploying hotreload.slang next to the binary"
+   VERBATIM
+ )
++add_custom_target(sample_02_hotreload_shader_deploy
++  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/hotreload_shader_deploy.stamp")
++add_dependencies(sample_02_hotreload sample_02_hotreload_shader_deploy)
+ 
+ # Runs the binary in headless mode with --validate: ctest is the developer/CI
+ # gate, so it explicitly opts into the Vulkan validation layers (requires the
+ # Vulkan SDK / validation layers installed -- see samples/README.md) on top
+ # of the default end-user behavior, which is headless with validation OFF.
+ # The binary also supports --present mode for interactive windowed
+ # rendering with live shader editing (see main.cpp / samples/README.md).
+ add_test(NAME sample_02_hotreload_headless COMMAND sample_02_hotreload --validate)
+ # Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+ # (windows-cross Wine hang, run 31512073559).
+diff --git a/samples/05_multipass/CMakeLists.txt b/samples/05_multipass/CMakeLists.txt
+index 6be334d..c3a278d 100644
+--- a/samples/05_multipass/CMakeLists.txt
++++ b/samples/05_multipass/CMakeLists.txt
+@@ -25,25 +25,36 @@ rx_shader_deploy_runtime_libs(sample_05_multipass)
+ # reason every other file in this list does: it must be readable from disk
+ # at runtime, next to the binary, for either build-tree or packaged runs.
+ set(RX_MULTIPASS_SHADERS
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/scene_types.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/shadow.vert.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/lit.vert.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/lit.frag.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/tonemap.vert.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/tonemap.frag.slang"
+ )
+-add_custom_command(TARGET sample_05_multipass POST_BUILD
++# [Fix round, item 3] OUTPUT/DEPENDS-tracked, NOT a bare
++# `add_custom_command(TARGET ... POST_BUILD)` -- see samples/08_gltf_viewer/
++# CMakeLists.txt's own material_shaders deploy comment for the full
++# mechanism this avoids (a POST_BUILD recipe only re-runs when the TARGET
++# itself relinks, leaving an edited .slang source's deployed copy stale).
++add_custom_command(
++  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/multipass_shaders_deploy.stamp"
+   COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_MULTIPASS_SHADERS} "$<TARGET_FILE_DIR:sample_05_multipass>/"
++  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/multipass_shaders_deploy.stamp"
++  DEPENDS ${RX_MULTIPASS_SHADERS}
+   COMMENT "sample_05_multipass: deploying shaders/multipass/*.slang next to the binary"
+   VERBATIM
+ )
++add_custom_target(sample_05_multipass_shaders_deploy
++  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/multipass_shaders_deploy.stamp")
++add_dependencies(sample_05_multipass sample_05_multipass_shaders_deploy)
+ 
+ # Runs the binary in headless mode with --validate: ctest is the developer/CI
+ # gate, so it explicitly opts into the Vulkan validation layers (requires the
+ # Vulkan SDK / validation layers installed -- see samples/README.md) on top
+ # of the default end-user behavior, which is headless with validation OFF.
+ # The binary also supports --present mode for interactive windowed
+ # rendering with an orbiting light (see main.cpp / samples/README.md).
+ add_test(NAME sample_05_multipass_headless COMMAND sample_05_multipass --validate)
+ # Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+ # (windows-cross Wine hang, run 31512073559).
+diff --git a/samples/06_materials/CMakeLists.txt b/samples/06_materials/CMakeLists.txt
+index bf5db2d..2eb2371 100644
+--- a/samples/06_materials/CMakeLists.txt
++++ b/samples/06_materials/CMakeLists.txt
+@@ -11,53 +11,80 @@ target_link_libraries(sample_06_materials PRIVATE rx_graph rx_rhi_vk rx_platform
+ # checker.slang/rim.slang, plus the shared material.slang/forward_entry.slang
+ # every material composes against) -- needs the Slang runtime libs deployed
+ # next to it, same as 02_hotreload/03_bindless_mesh/04_streaming/05_multipass.
+ rx_shader_deploy_runtime_libs(sample_06_materials)
+ 
+ # Deploys this sample's OWN materials -- checker.slang/rim.slang -- into a
+ # materials/ subdirectory next to the binary, mirroring this source
+ # directory's own layout, so main.cpp's SDL_GetBasePath()-relative
+ # loadMaterial() calls find them identically in the build tree and in a
+ # redistributed copy of this directory.
+-add_custom_command(TARGET sample_06_materials POST_BUILD
++#
++# [Fix round, item 3] OUTPUT/DEPENDS-tracked, NOT a bare
++# `add_custom_command(TARGET ... POST_BUILD)` -- see samples/08_gltf_viewer/
++# CMakeLists.txt's own material_shaders deploy comment for the full
++# mechanism this avoids (a POST_BUILD recipe only re-runs when the TARGET
++# itself relinks, leaving an edited .slang source's deployed copy stale).
++set(RX_MATERIALS_OWN_SHADERS
++  "${CMAKE_CURRENT_SOURCE_DIR}/materials/checker.slang"
++  "${CMAKE_CURRENT_SOURCE_DIR}/materials/rim.slang"
++)
++add_custom_command(
++  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/materials_own_deploy.stamp"
+   COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sample_06_materials>/materials"
+-  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+-          "${CMAKE_CURRENT_SOURCE_DIR}/materials/checker.slang"
+-          "${CMAKE_CURRENT_SOURCE_DIR}/materials/rim.slang"
++  COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_MATERIALS_OWN_SHADERS}
+           "$<TARGET_FILE_DIR:sample_06_materials>/materials/"
++  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/materials_own_deploy.stamp"
++  DEPENDS ${RX_MATERIALS_OWN_SHADERS}
+   COMMENT "sample_06_materials: deploying materials/*.slang next to the binary"
+   VERBATIM
+ )
++add_custom_target(sample_06_materials_own_deploy
++  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/materials_own_deploy.stamp")
++add_dependencies(sample_06_materials sample_06_materials_own_deploy)
+ 
+ # Deploys the SHARED rx_material shaders (shaders/material/material.slang +
+ # forward_entry.slang) into a SIBLING material_shaders/ directory next to
+ # the binary [Task 8 ledger item carried from Task 5]: rx_material's own
+ # MaterialSystem::create() previously located these two files exclusively
+ # via RX_MATERIAL_SHADER_DIR, a compile-time absolute path anchored at this
+ # checked-out repository's own CMAKE_SOURCE_DIR -- correct for a build-tree
+ # run but meaningless for a redistributed binary, which has no
+ # CMAKE_SOURCE_DIR at all. main.cpp resolves this material_shaders/
+ # directory at runtime (SDL_GetBasePath()-relative, same mechanism as its
+ # own materials/ directory above) and passes it as
+ # MaterialSystem::create()'s new `sharedShaderDir` parameter
+ # (src/rx_material/include/rx_material/material_system.h) -- RX_MATERIAL_
+ # SHADER_DIR stays the default for every OTHER caller (rx_material's own
+ # unit/GPU tests), unchanged.
+-add_custom_command(TARGET sample_06_materials POST_BUILD
++# [Fix round, item 3] OUTPUT/DEPENDS-tracked, NOT a bare
++# `add_custom_command(TARGET ... POST_BUILD)` -- see samples/08_gltf_viewer/
++# CMakeLists.txt's own material_shaders deploy comment for the full
++# mechanism this avoids (a POST_BUILD recipe only re-runs when the TARGET
++# itself relinks, leaving an edited .slang source's deployed copy stale).
++set(RX_MATERIALS_SHARED_SHADERS
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/material.slang"
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/forward_entry.slang"
++)
++add_custom_command(
++  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/materials_shared_shader_deploy.stamp"
+   COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sample_06_materials>/material_shaders"
+-  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+-          "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/material.slang"
+-          "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/forward_entry.slang"
++  COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_MATERIALS_SHARED_SHADERS}
+           "$<TARGET_FILE_DIR:sample_06_materials>/material_shaders/"
++  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/materials_shared_shader_deploy.stamp"
++  DEPENDS ${RX_MATERIALS_SHARED_SHADERS}
+   COMMENT "sample_06_materials: deploying the shared rx_material shaders next to the binary"
+   VERBATIM
+ )
++add_custom_target(sample_06_materials_shared_shader_deploy
++  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/materials_shared_shader_deploy.stamp")
++add_dependencies(sample_06_materials sample_06_materials_shared_shader_deploy)
+ 
+ # Runs the binary in headless mode with --validate: ctest is the developer/CI
+ # gate, so it explicitly opts into the Vulkan validation layers on top of the
+ # default end-user behavior (headless with validation OFF). The binary also
+ # supports --present mode for interactive windowed rendering with an
+ # orbiting camera and material hot-reload polling (see main.cpp /
+ # samples/README.md).
+ add_test(NAME sample_06_materials_headless COMMAND sample_06_materials --validate)
+ # Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+ # (windows-cross Wine hang, run 31512073559).
+diff --git a/samples/07_stress/CMakeLists.txt b/samples/07_stress/CMakeLists.txt
+index bbe4fc3..4c576fb 100644
+--- a/samples/07_stress/CMakeLists.txt
++++ b/samples/07_stress/CMakeLists.txt
+@@ -19,25 +19,36 @@ rx_shader_deploy_runtime_libs(sample_07_stress)
+ # 05_multipass's own shader deployment already established), so main.cpp's
+ # resolveAssetPath() (SDL_GetBasePath() + filename) finds them identically
+ # whether run from the build tree or a redistributed copy of just this
+ # directory's build output.
+ set(RX_STRESS_SHADERS
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/stress/instanced.vert.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/stress/instanced.frag.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/stress/tonemap.vert.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/stress/tonemap.frag.slang"
+ )
+-add_custom_command(TARGET sample_07_stress POST_BUILD
++# [Fix round, item 3] OUTPUT/DEPENDS-tracked, NOT a bare
++# `add_custom_command(TARGET ... POST_BUILD)` -- see samples/08_gltf_viewer/
++# CMakeLists.txt's own material_shaders deploy comment for the full
++# mechanism this avoids (a POST_BUILD recipe only re-runs when the TARGET
++# itself relinks, leaving an edited .slang source's deployed copy stale).
++add_custom_command(
++  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/stress_shaders_deploy.stamp"
+   COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_STRESS_SHADERS} "$<TARGET_FILE_DIR:sample_07_stress>/"
++  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/stress_shaders_deploy.stamp"
++  DEPENDS ${RX_STRESS_SHADERS}
+   COMMENT "sample_07_stress: deploying shaders/stress/*.slang next to the binary"
+   VERBATIM
+ )
++add_custom_target(sample_07_stress_shaders_deploy
++  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/stress_shaders_deploy.stamp")
++add_dependencies(sample_07_stress sample_07_stress_shaders_deploy)
+ 
+ # Headless correctness gate: --draws 16 (a 4x4 grid), NOT the interactive
+ # --draws 30000 default [task-7-brief.md: "3 frames, then assert EXACT
+ # counters ... plus 4 analytic pixel probes"] -- deliberately small so the
+ # whole grid fits cleanly inside the fixed 256x256 headless framebuffer with
+ # every instance's own screen footprint individually resolvable (see
+ # main.cpp's own header comment on why a non-overlapping top-down grid is
+ # what makes the four analytic probes tractable at all). This does NOT
+ # reduce parallel-recording coverage: chunk count is derived purely from
+ # the scheduler's own worker count (rx::graph::detail::
+diff --git a/samples/08_gltf_viewer/CMakeLists.txt b/samples/08_gltf_viewer/CMakeLists.txt
+index 120f4b0..ea78d96 100644
+--- a/samples/08_gltf_viewer/CMakeLists.txt
++++ b/samples/08_gltf_viewer/CMakeLists.txt
+@@ -26,48 +26,78 @@ target_compile_definitions(sample_08_gltf_viewer PRIVATE
+ rx_shader_deploy_runtime_libs(sample_08_gltf_viewer)
+ 
+ # Deploys the SHARED rx_material shaders this sample's own materials are --
+ # material.slang/forward_entry.slang (D6's link-time-specialization
+ # machinery) + standard_pbr.slang/unlit.slang (D22's shipped material
+ # library, ordinary IMaterialShader modules, zero special treatment) -- into
+ # a material_shaders/ directory next to the binary, mirroring samples/
+ # 06_materials/CMakeLists.txt's own identical deployment for the identical
+ # reason (MaterialSystem::create()'s `sharedShaderDir` parameter, resolved
+ # at runtime via SDL_GetBasePath() in main.cpp's basePathDirectory()).
+-add_custom_command(TARGET sample_08_gltf_viewer POST_BUILD
++#
++# [Fix round, item 3 -- mandatory, the hazard already bit this exact
++# workstream in-session] OUTPUT/DEPENDS-tracked (a real custom_command +
++# custom_target), NOT a bare `add_custom_command(TARGET ... POST_BUILD)` --
++# that form runs ONLY when the TARGET ITSELF relinks, so editing just a
++# shared .slang file (no C++ source touched) leaves the deployed copy
++# stale until something unrelated forces a relink, and the sample silently
++# keeps running the OLD shader (Ninja reports "no work to do") -- exactly
++# the mechanism that produced a clean-HEAD sample_08 OutputNotConsumed
++# failure this fix round's own in-session development. Same OUTPUT+stamp+
++# custom_target+add_dependencies shape as this file's own
++# `references.stamp`/`sample_08_gltf_viewer_references` block below --
++# see that block's own comment for the full mechanism.
++set(RX_GLTF_VIEWER_MATERIAL_SHADERS
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/material.slang"
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/forward_entry.slang"
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/standard_pbr.slang"
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/unlit.slang"
++)
++add_custom_command(
++  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/material_shaders_deploy.stamp"
+   COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sample_08_gltf_viewer>/material_shaders"
+-  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+-          "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/material.slang"
+-          "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/forward_entry.slang"
+-          "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/standard_pbr.slang"
+-          "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/unlit.slang"
++  COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_GLTF_VIEWER_MATERIAL_SHADERS}
+           "$<TARGET_FILE_DIR:sample_08_gltf_viewer>/material_shaders/"
++  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/material_shaders_deploy.stamp"
++  DEPENDS ${RX_GLTF_VIEWER_MATERIAL_SHADERS}
+   COMMENT "sample_08_gltf_viewer: deploying the shared rx_material shaders next to the binary"
+   VERBATIM
+ )
++add_custom_target(sample_08_gltf_viewer_material_shaders
++  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/material_shaders_deploy.stamp")
++add_dependencies(sample_08_gltf_viewer sample_08_gltf_viewer_material_shaders)
+ 
+ # The forward pass's own tonemap half reuses shaders/multipass/tonemap.{vert,
+ # frag}.slang VERBATIM (this task's own binding constraint: "you may NOT
+ # touch shaders/multipass/" -- --exposure is applied inside the material
+ # pass instead, see forward_entry.slang's own fragmentMain) -- deployed next
+ # to the binary exactly like samples/05_multipass's own two files (flat, no
+ # "multipass/" subdirectory in the deployed layout).
++#
++# [Fix round, item 3] Same OUTPUT/DEPENDS conversion as the material_shaders
++# block just above -- see that block's own comment for the full rationale.
+ set(RX_GLTF_VIEWER_TONEMAP_SHADERS
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/tonemap.vert.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/tonemap.frag.slang"
+ )
+-add_custom_command(TARGET sample_08_gltf_viewer POST_BUILD
++add_custom_command(
++  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/tonemap_shaders_deploy.stamp"
+   COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_GLTF_VIEWER_TONEMAP_SHADERS}
+           "$<TARGET_FILE_DIR:sample_08_gltf_viewer>/"
++  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/tonemap_shaders_deploy.stamp"
++  DEPENDS ${RX_GLTF_VIEWER_TONEMAP_SHADERS}
+   COMMENT "sample_08_gltf_viewer: deploying the shared tonemap shaders next to the binary"
+   VERBATIM
+ )
++add_custom_target(sample_08_gltf_viewer_tonemap_shaders
++  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/tonemap_shaders_deploy.stamp")
++add_dependencies(sample_08_gltf_viewer sample_08_gltf_viewer_tonemap_shaders)
+ 
+ # D17 committed reference PNGs (256x256, lavapipe-rendered) -- deployed next
+ # to the binary so main.cpp's basePathDirectory()-relative resolution finds
+ # them identically in the build tree and any redistributed copy. Regenerated
+ # only via tools/regen_references.sh (documented, never auto-run -- see that
+ # script's own header comment).
+ #
+ # OUTPUT/DEPENDS-tracked (a real custom_command + custom_target), NOT a bare
+ # `add_custom_command(TARGET ... POST_BUILD)` like the shader-deploy steps
+ # above: a POST_BUILD recipe only re-runs when the TARGET ITSELF is
+diff --git a/samples/08_gltf_viewer/main.cpp b/samples/08_gltf_viewer/main.cpp
+index 12426fb..b612d3a 100644
+--- a/samples/08_gltf_viewer/main.cpp
++++ b/samples/08_gltf_viewer/main.cpp
+@@ -625,20 +625,48 @@ rx::material::AlphaMode toMaterialAlphaMode(rx::asset::AlphaMode mode) {
+ // D11 fallback ... Task 14 resolve[s] the real texture") for why this is
+ // belt-and-suspenders, not a workaround for a known gap.
+ uint32_t resolveTextureIndex(rx::asset::TextureCache& textures, const rx::asset::TextureRef& ref,
+                               rx::asset::TextureRole role) {
+     if (!ref.present) {
+         return textures.resolve(textures.fallbackHandle(role)).bindlessIndex;
+     }
+     return textures.resolve(ref.handle).bindlessIndex;
+ }
+ 
++// [Fix round, sampler-wrap P0] Resolves `ref`'s bindless SAMPLER through
++// `textures`'s own per-texture sampler cache (TextureCache::
++// getOrCreateSamplerBindlessIndex()) -- THE actual fix for the shipped
++// sampler-wrap defect (helmet-sampler-fix-brief.md): every texture slot
++// used to sample through ONE hardcoded process-wide CLAMP_TO_EDGE sampler
++// (`app.defaultSampler`, above) regardless of that texture's own glTF wrap
++// mode. `ref.sampler` is passed straight through, present or not: for a
++// PRESENT slot it is either the real glTF sampler object import_gltf.cpp's
++// own fillRef() parsed (honoring that texture's real wrap/filter state) or,
++// if the glTF texture referenced no sampler object at all, `SamplerDesc`'s
++// own default-constructed values -- which ARE glTF's documented "sampler
++// unspecified" default (REPEAT wrap, auto filtering), NOT an engine-chosen
++// fallback. For an ABSENT slot (`!ref.present`) `ref.sampler` is that SAME
++// default-constructed value: the slot samples a role-neutral D11 fallback
++// texture (resolveTextureIndex() above), whose wrap mode is irrelevant, so
++// the spec-correct REPEAT default is exactly as harmless there as any
++// other choice would be, with no special-casing needed. `fallbackIndex`
++// (the caller's own already-resolved bindless index for `app.
++// defaultSampler`) is used ONLY on a genuine
++// getOrCreateSamplerBindlessIndex() failure (vkCreateSampler failure /
++// bindless sampler-capacity exhaustion) -- belt-and-suspenders, mirroring
++// resolveTextureIndex()'s own fallback philosophy above.
++uint32_t resolveSamplerIndex(rx::asset::TextureCache& textures, const rx::asset::TextureRef& ref,
++                              uint32_t fallbackIndex) {
++    std::optional<uint32_t> index = textures.getOrCreateSamplerBindlessIndex(ref.sampler);
++    return index.value_or(fallbackIndex);
++}
++
+ std::array<float, 4> uvTransformParam(const rx::asset::TextureRef& ref) {
+     return {ref.uvOffset.x, ref.uvOffset.y, ref.uvScale.x, ref.uvScale.y};
+ }
+ 
+ // --- Application state -----------------------------------------------------
+ // EVERY GPU-object-owning member below is constructed IN PLACE, directly
+ // into this struct's own fields, via a heap-allocated `std::unique_ptr<App>`
+ // (see makeApp() below) -- NEVER built as a local variable first and then
+ // moved/aggregate-constructed into a returned struct. This is load-bearing,
+ // not stylistic: MaterialSystem::create()/GeometryPool::create()/
+@@ -831,36 +859,52 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
+     if (app->scheduler == nullptr) {
+         RX_LOG_ERROR("sample_08_gltf_viewer: Scheduler::create failed");
+         return nullptr;
+     }
+     app->executor = rx::graph::Executor::create(*app->device, *app->scheduler);
+     if (app->executor == nullptr) {
+         RX_LOG_ERROR("sample_08_gltf_viewer: Executor::create failed");
+         return nullptr;
+     }
+ 
+-    // Default LINEAR/CLAMP_TO_EDGE sampler -- shared by the tonemap pass's
+-    // own HDR read and (via MaterialSystem's own internal default sampler,
+-    // used for material albedo/etc reads) every material's rx_sampleTexture
+-    // -- matching the general "one process-wide default sampler" idiom
+-    // material.slang's own header comment documents. Registered directly
+-    // here (not through MaterialSystem, which already creates its OWN
+-    // internal default sampler for material reads) since the TONEMAP pass
+-    // is entirely outside MaterialSystem and needs its own registered
+-    // index.
++    // Default LINEAR/REPEAT sampler -- shared by the tonemap pass's own HDR
++    // read (wrap mode irrelevant there: the fullscreen tonemap quad's own
++    // UVs never leave [0,1]) and, via `push.defaultSamplerIndex`
++    // (recordSceneDraws() below), `rx_sampleTexture`'s two-argument
++    // fallback overload and resolveSamplerIndex()'s own belt-and-
++    // suspenders fallback. Registered directly here (not through
++    // MaterialSystem, which creates its OWN internal default sampler,
++    // unused by this sample's D26.1 draw path -- see recordSceneDraws()'s
++    // own header comment) since the TONEMAP pass is entirely outside
++    // MaterialSystem and needs its own registered index.
++    //
++    // [Fix round, sampler-wrap P0] REPEAT, NOT the CLAMP_TO_EDGE this used
++    // to be hardcoded to: this WAS the actual sampler standard_pbr.slang/
++    // unlit.slang sampled EVERY texture slot through, unconditionally
++    // (via `rx_sampleTexture`'s old two-argument-only signature) --
++    // DamagedHelmet's own TEXCOORD_0 V lies wholly in [1.0005, 1.9987]
++    // (glTF-spec-legal, relying on glTF-default REPEAT), so every fragment
++    // clamped to V=1.0 and the whole mesh sampled each texture's bottom
++    // edge row. Real per-slot sampler wiring (setupMaterials()'s own
++    // resolveSamplerIndex(), StandardPbrParams/UnlitParams' new `*Sampler`
++    // fields) is the actual fix; this default's own wrap mode only matters
++    // as a fallback now, but REPEAT (glTF's OWN "sampler unspecified"
++    // default) is still the honest, spec-correct choice for it, matching
++    // MaterialSystem::create()'s own new default (material_system.cpp's
++    // `defaultSamplerInfo` comment has the full account).
+     VkSamplerCreateInfo samplerInfo{};
+     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+     samplerInfo.magFilter = VK_FILTER_LINEAR;
+     samplerInfo.minFilter = VK_FILTER_LINEAR;
+-    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+-    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+-    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
++    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
++    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+     samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
+     if (vkCreateSampler(app->device->device(), &samplerInfo, nullptr, &app->defaultSampler) != VK_SUCCESS) {
+         RX_LOG_ERROR("sample_08_gltf_viewer: vkCreateSampler (default sampler) failed");
+         return nullptr;
+     }
+     app->defaultSamplerHandle = app->bindless->registerSampler(app->defaultSampler);
+     if (!app->defaultSamplerHandle.isValid()) {
+         RX_LOG_ERROR("sample_08_gltf_viewer: BindlessTable::registerSampler (default sampler) failed");
+         return nullptr;
+     }
+@@ -1015,20 +1059,27 @@ bool setupMaterials(App& app, const rx::asset::Registry& registry,
+         const float appliedAlphaCutoff = asset.alphaMode == rx::asset::AlphaMode::Mask ? asset.alphaCutoff : 0.0F;
+         const std::array<float, 4> baseColorFactor{asset.baseColorFactor.x, asset.baseColorFactor.y,
+                                                      asset.baseColorFactor.z, asset.baseColorFactor.w};
+ 
+         bool ok = true;
+         if (isUnlit) {
+             ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorFactor", baseColorFactor);
+             ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorTexture",
+                                         resolveTextureIndex(*app.textureCache, asset.baseColorTexture,
+                                                               rx::asset::TextureRole::BaseColor));
++            // [Fix round, sampler-wrap P0] real per-texture sampler --
++            // resolveSamplerIndex()'s own header comment has the full
++            // account; app.defaultSamplerHandle.index() is only reached on
++            // a genuine TextureCache failure (belt-and-suspenders).
++            ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorSampler",
++                                        resolveSamplerIndex(*app.textureCache, asset.baseColorTexture,
++                                                              app.defaultSamplerHandle.index()));
+             ok = ok && setMaterialParam(binding.paramBlob, params, "alphaCutoff", appliedAlphaCutoff);
+             ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorUvOffsetScale",
+                                         uvTransformParam(asset.baseColorTexture));
+         } else {
+             const std::array<float, 4> emissiveFactorAndPad{asset.emissiveFactor.x * asset.emissiveStrength,
+                                                                asset.emissiveFactor.y * asset.emissiveStrength,
+                                                                asset.emissiveFactor.z * asset.emissiveStrength, 0.0F};
+             ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorFactor", baseColorFactor);
+             ok = ok && setMaterialParam(binding.paramBlob, params, "metallicFactor", asset.metallicFactor);
+             ok = ok && setMaterialParam(binding.paramBlob, params, "roughnessFactor", asset.roughnessFactor);
+@@ -1044,20 +1095,43 @@ bool setupMaterials(App& app, const rx::asset::Registry& registry,
+                                                               rx::asset::TextureRole::MetallicRoughness));
+             ok = ok && setMaterialParam(binding.paramBlob, params, "normalTexture",
+                                         resolveTextureIndex(*app.textureCache, asset.normalTexture,
+                                                               rx::asset::TextureRole::Normal));
+             ok = ok && setMaterialParam(binding.paramBlob, params, "occlusionTexture",
+                                         resolveTextureIndex(*app.textureCache, asset.occlusionTexture,
+                                                               rx::asset::TextureRole::Occlusion));
+             ok = ok && setMaterialParam(binding.paramBlob, params, "emissiveTexture",
+                                         resolveTextureIndex(*app.textureCache, asset.emissiveTexture,
+                                                               rx::asset::TextureRole::Emissive));
++            // [Fix round, sampler-wrap P0] one real per-texture sampler per
++            // slot -- see resolveSamplerIndex()'s own header comment (this
++            // file, above) for the full account. This is THE fix for
++            // DamagedHelmet's own broken render: its 5 texture slots all
++            // share the SAME glTF sampler object (an empty `{}`, i.e. glTF-
++            // default REPEAT/auto), so all 5 calls below dedupe to one real
++            // REPEAT-wrapping VkSampler/bindless index -- exactly what its
++            // TEXCOORD_0 V range ([1.0005,1.9987]) requires.
++            ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorSampler",
++                                        resolveSamplerIndex(*app.textureCache, asset.baseColorTexture,
++                                                              app.defaultSamplerHandle.index()));
++            ok = ok && setMaterialParam(binding.paramBlob, params, "metallicRoughnessSampler",
++                                        resolveSamplerIndex(*app.textureCache, asset.metallicRoughnessTexture,
++                                                              app.defaultSamplerHandle.index()));
++            ok = ok && setMaterialParam(binding.paramBlob, params, "normalSampler",
++                                        resolveSamplerIndex(*app.textureCache, asset.normalTexture,
++                                                              app.defaultSamplerHandle.index()));
++            ok = ok && setMaterialParam(binding.paramBlob, params, "occlusionSampler",
++                                        resolveSamplerIndex(*app.textureCache, asset.occlusionTexture,
++                                                              app.defaultSamplerHandle.index()));
++            ok = ok && setMaterialParam(binding.paramBlob, params, "emissiveSampler",
++                                        resolveSamplerIndex(*app.textureCache, asset.emissiveTexture,
++                                                              app.defaultSamplerHandle.index()));
+             ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorUvOffsetScale",
+                                         uvTransformParam(asset.baseColorTexture));
+             ok = ok && setMaterialParam(binding.paramBlob, params, "metallicRoughnessUvOffsetScale",
+                                         uvTransformParam(asset.metallicRoughnessTexture));
+             ok = ok && setMaterialParam(binding.paramBlob, params, "normalUvOffsetScale",
+                                         uvTransformParam(asset.normalTexture));
+             ok = ok && setMaterialParam(binding.paramBlob, params, "occlusionUvOffsetScale",
+                                         uvTransformParam(asset.occlusionTexture));
+             ok = ok && setMaterialParam(binding.paramBlob, params, "emissiveUvOffsetScale",
+                                         uvTransformParam(asset.emissiveTexture));
+diff --git a/samples/08_gltf_viewer/references/loaded_scene.png b/samples/08_gltf_viewer/references/loaded_scene.png
+index d7e2924..bcf981e 100644
+Binary files a/samples/08_gltf_viewer/references/loaded_scene.png and b/samples/08_gltf_viewer/references/loaded_scene.png differ
+diff --git a/shaders/material/material.slang b/shaders/material/material.slang
+index 997d065..88a7930 100644
+--- a/shaders/material/material.slang
++++ b/shaders/material/material.slang
+@@ -117,55 +117,73 @@ public interface IMaterialShader {
+ // asserts exactly this for test_unlit.slang, which never references any of
+ // them. This is harmless either way: the same external BindlessTable is
+ // substituted into set 0 regardless of which of its three slots a given
+ // material's own SPIR-V happens to touch.
+ [[vk::binding(0, 0)]]
+ Texture2D gTextures[];
+ 
+ [[vk::binding(1, 0)]]
+ SamplerState gSamplers[];
+ 
+-// DEFAULT SAMPLER INDEX -- `rx_sampleTexture` below takes only a texture
+-// index (its signature is fixed by this task's brief: `rx_sampleTexture
+-// (uint textureIndex, float2 uv)`, no sampler-index parameter), so the
+-// bindless SAMPLER slot it reads has to come from somewhere else. A
+-// compile-time-fixed slot number (e.g. "sampler 0") was deliberately
+-// rejected: `rx::rhi::BindlessTable` is this engine's single PROCESS-WIDE
+-// bindless set (bindless.h's own class comment), so nothing guarantees
+-// MaterialSystem's own default sampler is the first one ever registered
+-// against a table other subsystems (present/future: shadow maps, a KTX2
+-// sampler cache, ImGui, ...) also register samplers into -- baking in
+-// index 0 would be a correctness landmine the instant two subsystems share
+-// one table in any order other than "MaterialSystem first".
++// DEFAULT SAMPLER INDEX -- the bindless SAMPLER slot `rx_sampleTexture`'s
++// two-argument overload (below) reads has to come from somewhere at
++// runtime, since a compile-time-fixed slot number (e.g. "sampler 0") was
++// deliberately rejected: `rx::rhi::BindlessTable` is this engine's single
++// PROCESS-WIDE bindless set (bindless.h's own class comment), so nothing
++// guarantees MaterialSystem's own default sampler is the first one ever
++// registered against a table other subsystems (present/future: shadow
++// maps, a KTX2 sampler cache, ImGui, ...) also register samplers into --
++// baking in index 0 would be a correctness landmine the instant two
++// subsystems share one table in any order other than "MaterialSystem
++// first".
+ //
+ // Instead this follows the SAME idiom shaders/multipass/lit.vert.slang and
+ // tonemap.vert.slang already use for a bindless index that is not known
+ // until runtime: a push constant. `MaterialSystem` (material_system.cpp)
+ // creates and registers exactly one default LINEAR-filtering sampler
+ // against the real `BindlessTable` once, in `create()`, and
+ // `bindInstance()` writes that sampler's REAL registered bindless index
+ // into this push-constant range on every draw-time bind -- so this works
+ // correctly no matter which index the table actually assigns. LINEAR (not
+ // NEAREST, unlike sample 05's shadow/tonemap sampler, which has its own
+ // depth-comparison/1:1-copy reasons to use NEAREST) is this engine's
+-// chosen default for ordinary material albedo/color-map sampling -- the
+-// conventional choice for a general-purpose texture lookup. CLAMP_TO_EDGE
+-// (not REPEAT): this is one process-wide default shared by every material,
+-// and a material sampling right up to UV 0/1 at a mesh seam gets a well-
+-// defined edge-duplicated result under CLAMP_TO_EDGE rather than
+-// wrong-neighbor bleed from REPEAT's wraparound (empirically confirmed via
+-// this task's own GPU test -- see material_system.cpp's own comment on
+-// `defaultSamplerInfo` for the full reasoning). There is exactly one such
+-// sampler per MaterialSystem instance for this phase (no per-material
+-// sampler/wrap-mode selection yet -- a real, supportable future case for a
+-// material that genuinely wants tiling, not exercised by any test this
+-// task writes, so not built speculatively here).
++// chosen default for ordinary material albedo/color-map sampling.
++//
++// [Fix round, sampler-wrap P0] THIS IS NO LONGER "the one sampler every
++// material's every texture slot samples through" -- that was exactly the
++// bug (a real, shipped defect, not a hypothetical): DamagedHelmet's own
++// TEXCOORD_0 V legally lies in [1.0005, 1.9987] (glTF-spec-legal, relies
++// on the glTF-default REPEAT wrap), and this process-wide default was
++// hardcoded CLAMP_TO_EDGE, so every fragment's V clamped to 1.0 and the
++// whole mesh sampled each texture's bottom edge row. `rx_sampleTexture`
++// now has a THREE-argument overload taking an explicit per-slot sampler
++// index (see below) -- StandardPbrParams/UnlitParams (standard_pbr.slang/
++// unlit.slang) carry one bindless sampler index per texture slot,
++// populated at material-resolution time from `TextureCache::
++// getOrCreateSamplerBindlessIndex()` (src/rx_asset/texture_cache.h),
++// which builds the REAL per-texture VkSampler honoring that texture's own
++// glTF wrap/filter state -- exactly the mechanism this comment used to say
++// was "real, supportable future work... not built speculatively here".
++// `MaterialSystem::create()`'s own default sampler (this push-constant
++// field) is now REPEAT by default -- glTF's OWN documented default
++// ("sampler unspecified" -> repeat wrapping, auto filtering) -- and
++// exists only as (a) the two-argument overload's sampler for a material
++// that does not wire per-slot sampling at all, and (b) resolveSamplerIndex
++// ()'s own belt-and-suspenders fallback (samples/08_gltf_viewer/main.cpp)
++// if a real per-texture sampler somehow fails to build. A caller that
++// genuinely wants a NON-default wrap mode for this fallback (Task 4's own
++// seam-bleed GPU test, which samples a deliberately non-tiled 2x2 test
++// texture right up to its UV 0/1 edge and needs CLAMP_TO_EDGE to avoid
++// wrong-neighbor bleed) now requests it EXPLICITLY via `MaterialSystem::
++// create()`'s own `defaultSamplerAddressMode` parameter -- see that
++// method's header comment and test_api_factory.cpp's own seam-bleed
++// TEST_CASEs.
+ // --- D26.1 per-draw addressing [Phase 4 Task 16, gate ruling RC1/#8] -----
+ // One bindless StructuredBuffer<RxDrawData> array at
+ // BindlessTable::kStorageBufferBinding (binding 2, the SAME external set-0
+ // slot every other bindless storage-buffer consumer in this engine already
+ // uses -- shaders/stress/instanced.vert.slang's `gInstances`/shaders/
+ // multipass/lit.vert.slang's `gTransforms` are the exact same shape, just
+ // declared per-pass in THOSE samples' own shader files instead of here,
+ // since neither of them shares an entry point with any other material the
+ // way forward_entry.slang's vertexMain does). `gDrawData[bufferIndex][row]`
+ // -- the OUTER index selects WHICH registered storage buffer (this
+@@ -246,20 +264,34 @@ public StructuredBuffer<RxDrawData> gDrawData[];
+ // above.
+ public struct RxMaterialGlobals {
+     public uint defaultSamplerIndex;
+     public uint drawDataBufferIndex;
+     public float exposure;
+ }
+ 
+ [[vk::push_constant]]
+ public ConstantBuffer<RxMaterialGlobals> gMaterialGlobals;
+ 
+-// Public entry point every material's `evaluate()` calls to sample a
+-// bindless-indexed texture (`gParams`'s own `uint` field, per this engine's
+-// D8 bindless-index convention -- see e.g. test_textured.slang) with this
+-// engine's single default LINEAR sampler. `uv` is passed straight through
+-// to `Texture2D.Sample()` with no wrapping/clamping decision of this
+-// function's own -- that is the SAMPLER's job (fixed at MaterialSystem
+-// construction time), not a per-call concern here.
++// [Fix round, sampler-wrap P0] Primary entry point every PER-SLOT-sampler-
++// aware material's `evaluate()` calls (StandardPbr/Unlit -- standard_pbr.
++// slang/unlit.slang) to sample a bindless-indexed texture through an
++// EXPLICIT bindless-indexed sampler -- both `gParams`'s own `uint` fields,
++// per this engine's D8 bindless-index convention. `uv` is passed straight
++// through to `Texture2D.Sample()` with no wrapping/clamping decision of
++// this function's own -- that is entirely `samplerIndex`'s own real,
++// per-texture VkSampler's job (built by `TextureCache::
++// getOrCreateSamplerBindlessIndex()`, honoring that texture's own glTF
++// wrap/filter state), not a per-call concern here.
++public float4 rx_sampleTexture(uint textureIndex, uint samplerIndex, float2 uv) {
++    return gTextures[textureIndex].Sample(gSamplers[samplerIndex], uv);
++}
++
++// Two-argument overload, UNCHANGED signature from before this fix round --
++// every existing caller that does not wire its own per-slot sampler (the
++// test-only test_textured.slang/test_textured_sample.slang fixtures, any
++// future material that genuinely wants "one shared sampler for every
++// slot") keeps compiling and behaving exactly as documented: samples
++// through `gMaterialGlobals.defaultSamplerIndex`, the ONE process-wide
++// default this file's own header comment (above) now describes in full.
+ public float4 rx_sampleTexture(uint textureIndex, float2 uv) {
+-    return gTextures[textureIndex].Sample(gSamplers[gMaterialGlobals.defaultSamplerIndex], uv);
++    return rx_sampleTexture(textureIndex, gMaterialGlobals.defaultSamplerIndex, uv);
+ }
+diff --git a/shaders/material/standard_pbr.slang b/shaders/material/standard_pbr.slang
+index 53652f3..4df2e48 100644
+--- a/shaders/material/standard_pbr.slang
++++ b/shaders/material/standard_pbr.slang
+@@ -57,20 +57,42 @@ struct StandardPbrParams {
+     // extension per the gate matrix's own disposition). w unused (padding).
+     float4 emissiveFactorAndPad;
+ 
+     // D11 bindless indices -- see this file's own header comment.
+     uint baseColorTexture;
+     uint metallicRoughnessTexture;
+     uint normalTexture;
+     uint occlusionTexture;
+     uint emissiveTexture;
+ 
++    // [Fix round, sampler-wrap P0] One bindless SAMPLER index per texture
++    // slot above -- the actual fix for the shipped sampler-wrap defect
++    // (material.slang's own rx_sampleTexture header comment has the full
++    // account): every slot used to sample through ONE hardcoded
++    // process-wide CLAMP_TO_EDGE sampler regardless of that texture's own
++    // glTF wrap mode, which silently broke any asset relying on
++    // glTF-default REPEAT for UVs outside [0,1] (DamagedHelmet's own
++    // TEXCOORD_0 V, wholly in [1.0005,1.9987]). Populated at material-
++    // resolution time (samples/08_gltf_viewer/main.cpp's own
++    // resolveSamplerIndex()) from `TextureCache::
++    // getOrCreateSamplerBindlessIndex()` -- the REAL per-texture sampler
++    // this engine already built and bindless-registered from each
++    // texture's own glTF sampler object (or the glTF spec's own
++    // "unspecified" default -- REPEAT wrap, auto filtering -- when a
++    // texture references no sampler object at all), analogous to the
++    // texture-index fields immediately above.
++    uint baseColorSampler;
++    uint metallicRoughnessSampler;
++    uint normalSampler;
++    uint occlusionSampler;
++    uint emissiveSampler;
++
+     // KHR_texture_transform per texture slot [consume-now, gate ruling C4]:
+     // xy = UV offset, zw = UV scale. Neutral default (0,0,1,1) per slot.
+     float4 baseColorUvOffsetScale;
+     float4 metallicRoughnessUvOffsetScale;
+     float4 normalUvOffsetScale;
+     float4 occlusionUvOffsetScale;
+     float4 emissiveUvOffsetScale;
+ };
+ 
+ [[vk::binding(0, 1)]]
+@@ -85,41 +107,42 @@ static const float kPi = 3.14159265358979323846;
+ // would return NaN/Inf for a perfectly smooth mirror surface. 0.045 is the
+ // Filament-precedent minimum perceptual roughness (documented in Filament's
+ // own PBR chapter as the smallest value its own implementation clamps to
+ // for the identical reason).
+ static const float kMinRoughness = 0.045;
+ 
+ struct StandardPbr : IMaterialShader {
+     float4 evaluate(MaterialVertex v) {
+         // --- Base color ---------------------------------------------------
+         float2 baseColorUv = v.uv * gParams.baseColorUvOffsetScale.zw + gParams.baseColorUvOffsetScale.xy;
+-        float4 baseColor = gParams.baseColorFactor * rx_sampleTexture(gParams.baseColorTexture, baseColorUv);
++        float4 baseColor = gParams.baseColorFactor *
++                            rx_sampleTexture(gParams.baseColorTexture, gParams.baseColorSampler, baseColorUv);
+ 
+         // [D28] Always-present conditional discard -- see
+         // StandardPbrParams::alphaCutoff's own comment above.
+         if (baseColor.a < gParams.alphaCutoff) {
+             discard;
+         }
+ 
+         // --- Metallic-roughness [core spec, quoted in the gate matrix:
+         // "green channel contains roughness... blue channel contains
+         // metalness"] --------------------------------------------------
+         float2 mrUv = v.uv * gParams.metallicRoughnessUvOffsetScale.zw + gParams.metallicRoughnessUvOffsetScale.xy;
+-        float4 mrSample = rx_sampleTexture(gParams.metallicRoughnessTexture, mrUv);
++        float4 mrSample = rx_sampleTexture(gParams.metallicRoughnessTexture, gParams.metallicRoughnessSampler, mrUv);
+         float roughness = clamp(gParams.roughnessFactor * mrSample.g, kMinRoughness, 1.0);
+         float metallic = clamp(gParams.metallicFactor * mrSample.b, 0.0, 1.0);
+ 
+         // --- Tangent-space normal mapping, BC5 two-channel + Z
+         // reconstruction [D10: normal -> BC5_UNORM, "Z reconstructed in
+         // shader"] -----------------------------------------------------
+         float2 nUv = v.uv * gParams.normalUvOffsetScale.zw + gParams.normalUvOffsetScale.xy;
+-        float4 nSample = rx_sampleTexture(gParams.normalTexture, nUv);
++        float4 nSample = rx_sampleTexture(gParams.normalTexture, gParams.normalSampler, nUv);
+         // [0,1] texel -> [-1,1] tangent-space XY, scaled by normalScale
+         // BEFORE reconstruction (standard convention: scale perturbs the
+         // tangent-plane offset, not the reconstructed unit length).
+         float2 tangentXY = (nSample.rg * 2.0 - 1.0) * gParams.normalScale;
+         // Radicand clamp [acceptance criterion]: a known BC5 artifact can
+         // push a decoded (x,y) marginally outside the unit circle, which
+         // would otherwise produce a negative radicand (NaN via sqrt) --
+         // max(0, ...) clamps it to the equator (z=0) instead of failing.
+         float radicand = max(0.0, 1.0 - dot(tangentXY, tangentXY));
+         float3 tangentSpaceNormal = float3(tangentXY, sqrt(radicand));
+@@ -137,26 +160,27 @@ struct StandardPbr : IMaterialShader {
+         // vector against M's own rows as basis vectors -- i.e. this computes
+         // exactly `tangentSpaceNormal.x * T + tangentSpaceNormal.y * B +
+         // tangentSpaceNormal.z * N`, the standard TBN transform, tangent- ->
+         // world-space.
+         float3x3 tbn = float3x3(tangent, bitangent, geometricNormal);
+         float3 N = normalize(mul(tangentSpaceNormal, tbn));
+ 
+         // --- Occlusion [core spec closed-form formula, quoted in the gate
+         // matrix: "1.0 + strength * (occlusionTexture - 1.0)"] ----------
+         float2 occUv = v.uv * gParams.occlusionUvOffsetScale.zw + gParams.occlusionUvOffsetScale.xy;
+-        float occSample = rx_sampleTexture(gParams.occlusionTexture, occUv).r;
++        float occSample = rx_sampleTexture(gParams.occlusionTexture, gParams.occlusionSampler, occUv).r;
+         float occlusion = 1.0 + gParams.occlusionStrength * (occSample - 1.0);
+ 
+         // --- Emissive -------------------------------------------------
+         float2 emUv = v.uv * gParams.emissiveUvOffsetScale.zw + gParams.emissiveUvOffsetScale.xy;
+-        float3 emissive = gParams.emissiveFactorAndPad.xyz * rx_sampleTexture(gParams.emissiveTexture, emUv).rgb;
++        float3 emissive = gParams.emissiveFactorAndPad.xyz *
++                           rx_sampleTexture(gParams.emissiveTexture, gParams.emissiveSampler, emUv).rgb;
+ 
+         // --- Lambertian diffuse + GGX/Smith-correlated/Schlick specular,
+         // one directional light [BRDF baseline, this file's own header
+         // comment] --------------------------------------------------
+         float3 viewDir = normalize(v.cameraPosWorld - v.worldPos);
+         float3 lightDir = normalize(v.lightDirWorld);
+         float3 halfVec = normalize(viewDir + lightDir);
+         float NdotL = max(dot(N, lightDir), 0.0);
+         float NdotV = max(dot(N, viewDir), 1e-4);  // clamped away from 0, not 0-able geometry (grazing/back-facing).
+         float NdotH = max(dot(N, halfVec), 0.0);
+diff --git a/shaders/material/unlit.slang b/shaders/material/unlit.slang
+index a00c28c..ad6fe2a 100644
+--- a/shaders/material/unlit.slang
++++ b/shaders/material/unlit.slang
+@@ -45,20 +45,28 @@ import material;
+ struct UnlitParams {
+     // Universal glTF default [core spec, fetched 2026-08-18]: [1,1,1,1].
+     float4 baseColorFactor;
+ 
+     // D11 bindless-index convention: ALWAYS a valid, real texture (the
+     // white 1x1 utility texture when the source glTF material has no
+     // baseColorTexture at all) -- no separate "has texture" flag needed,
+     // since sampling white multiplies baseColorFactor by exactly 1.0.
+     uint baseColorTexture;
+ 
++    // [Fix round, sampler-wrap P0] The bindless SAMPLER index for
++    // `baseColorTexture` above -- see standard_pbr.slang's own
++    // `StandardPbrParams::baseColorSampler` comment for the full account
++    // of the defect this closes and where this value comes from
++    // (TextureCache::getOrCreateSamplerBindlessIndex(), resolved by
++    // samples/08_gltf_viewer/main.cpp's own resolveSamplerIndex()).
++    uint baseColorSampler;
++
+     // [D28] MASK's cutoff -- a per-instance uniform with an ALWAYS-PRESENT
+     // conditional discard below, per MaterialFixedFunctionState's own
+     // header comment (material_system.h): alphaMode itself lives entirely
+     // in the VkPipeline fixed-function state (D28), never here. Callers
+     // binding an OPAQUE/BLEND instance set this to 0.0 (alpha is never
+     // negative, so a 0.0 cutoff never discards); a MASK instance sets the
+     // glTF-parsed `alphaCutoff` (spec default 0.5).
+     float alphaCutoff;
+ 
+     // KHR_texture_transform [consume-now per gate ruling C4]: xy = UV
+@@ -68,21 +76,22 @@ struct UnlitParams {
+     // materials that do not use the extension.
+     float4 baseColorUvOffsetScale;
+ };
+ 
+ [[vk::binding(0, 1)]]
+ ParameterBlock<UnlitParams> gParams;
+ 
+ struct Unlit : IMaterialShader {
+     float4 evaluate(MaterialVertex v) {
+         float2 uv = v.uv * gParams.baseColorUvOffsetScale.zw + gParams.baseColorUvOffsetScale.xy;
+-        float4 color = gParams.baseColorFactor * rx_sampleTexture(gParams.baseColorTexture, uv);
++        float4 color = gParams.baseColorFactor *
++                       rx_sampleTexture(gParams.baseColorTexture, gParams.baseColorSampler, uv);
+ 
+         // [D28] Always-present conditional discard -- see UnlitParams::
+         // alphaCutoff's own comment above.
+         if (color.a < gParams.alphaCutoff) {
+             discard;
+         }
+ 
+         // See this file's own header comment: every field below is read
+         // through a negligible (1e-6) additive epsilon -- an exact `* 0.0`
+         // does NOT survive Slang's interface-elimination pass for a vertex
+diff --git a/src/rx_asset/include/rx_asset/texture_cache.h b/src/rx_asset/include/rx_asset/texture_cache.h
+index 8c6380e..d9cb4f9 100644
+--- a/src/rx_asset/include/rx_asset/texture_cache.h
++++ b/src/rx_asset/include/rx_asset/texture_cache.h
+@@ -286,20 +286,56 @@ public:
+     // Anisotropy: 8x requested when the device's VkPhysicalDeviceFeatures
+     // ::samplerAnisotropy is supported (clamped to
+     // VkPhysicalDeviceLimits::maxSamplerAnisotropy), cleanly OFF
+     // (anisotropyEnable=VK_FALSE) otherwise -- verified in-task against
+     // the CI driver alongside the BC format-support dump (task-14-report.
+     // md).
+     //
+     // Main-thread-only (D5) -- vkCreateSampler is GPU-object mutation.
+     [[nodiscard]] VkSampler getOrCreateSampler(const SamplerDesc& desc);
+ 
++    // [Fix round, sampler-wrap P0] Bindless-INDEX counterpart to
++    // getOrCreateSampler() above -- the actual real fix for the shipped
++    // sampler-wrap defect (helmet-sampler-fix-brief.md's own root-cause
++    // account): every material texture slot used to sample through ONE
++    // hardcoded process-wide CLAMP_TO_EDGE sampler regardless of that
++    // texture's own glTF wrap mode, silently breaking any asset relying on
++    // glTF-default REPEAT for UVs outside [0,1] (DamagedHelmet's own
++    // TEXCOORD_0 V, wholly in [1.0005,1.9987]) -- this class ALREADY built
++    // the correct per-texture VkSampler (getOrCreateSampler() above,
++    // honoring `desc`'s real glTF wrap/filter state) but never registered
++    // it against the real bindless SAMPLER table, so no shader could ever
++    // reach it. This method closes exactly that gap: gets-or-creates the
++    // deduplicated VkSampler (via getOrCreateSampler() -- same dedup
++    // granularity, same cache), then gets-or-creates its OWN bindless
++    // registration (a second, VkSampler-keyed cache -- one BindlessTable
++    // registration per unique dedup'd VkSampler, not per call), and
++    // returns the real, shader-visible bindless index. `desc` left at its
++    // own default-constructed values (SamplerDesc's own REPEAT-wrap/
++    // auto-filter defaults, mesh_asset.h) reproduces the glTF spec's own
++    // "sampler unspecified" default -- correct to pass verbatim for BOTH
++    // an absent texture slot (samples a role-neutral D11 fallback texture,
++    // wrap mode irrelevant) and a present slot whose glTF texture
++    // referenced no sampler object at all (spec REPEAT/auto is the exactly
++    // correct answer, not a fallback-of-last-resort).
++    //
++    // Returns std::nullopt (logged) on a genuine failure (vkCreateSampler
++    // failure inside getOrCreateSampler(), or BindlessTable::
++    // registerSampler() capacity exhaustion) -- callers fall back to
++    // whatever process-wide default sampler they already carry (belt-and-
++    // suspenders, mirroring resolveTextureIndex()'s own fallback
++    // philosophy in samples/08_gltf_viewer/main.cpp), never a crash or a
++    // silently-wrong index.
++    //
++    // Main-thread-only (D5) -- registerSampler() is GPU-object mutation.
++    [[nodiscard]] std::optional<uint32_t> getOrCreateSamplerBindlessIndex(const SamplerDesc& desc);
++
+     // [FG9] Resident bytes/count by role -- balances to zero across
+     // load/evict/teardown (Task 10 accounting-test pattern). Main-thread-
+     // only (D5), matching every other read accessor on this class.
+     [[nodiscard]] TextureCacheStats stats() const;
+ 
+     // [D24] Test-only deferred-eviction path: immediately marks
+     // `handle`'s record non-resident (resolve() substitutes the
+     // checkerboard from this instant), then retires the REAL GPU
+     // resource's destructor (Texture2D destruction + BindlessTable slot
+     // release) into this cache's DeletionQueue tagged `frameIndex` --
+@@ -405,20 +441,32 @@ private:
+         VkFilter minFilter;
+         VkSamplerMipmapMode mipmapMode;
+         int32_t anisotropyTimes100;  // maxAnisotropy*100, rounded -- exact float equality is not a safe map key
+         bool operator==(const SamplerKey&) const = default;
+     };
+     struct SamplerKeyHash {
+         size_t operator()(const SamplerKey& key) const;
+     };
+     std::unordered_map<SamplerKey, VkSampler, SamplerKeyHash> samplerCache_;
+ 
++    // [Fix round, sampler-wrap P0] getOrCreateSamplerBindlessIndex()'s own
++    // second-level cache -- keyed by the ALREADY-DEDUPLICATED VkSampler
++    // handle from samplerCache_ above (not a second SamplerKey lookup: a
++    // VkSampler is trivially hashable, and every unique SamplerKey maps to
++    // exactly one VkSampler, so keying on the sampler itself avoids
++    // recomputing/duplicating SamplerKey's own glTF-enum -> Vulkan mapping
++    // logic here) -- one BindlessTable registration per unique dedup'd
++    // sampler, never one per call. Released (bindless_.release()) in
++    // ~TextureCache(), symmetric with the vkDestroySampler loop just below
++    // this member in that destructor.
++    std::unordered_map<VkSampler, rx::rhi::BindlessHandle> samplerBindlessCache_;
++
+     bool anisotropySupported_ = false;
+     float maxAnisotropy_ = 1.0F;
+     uint32_t maxImageDimension2D_ = 0;
+     size_t waitCallCountForTesting_ = 0;
+ 
+     // [FG9] Incrementally maintained by registerRealTexture() (+1) and
+     // evictForTesting()'s deferred reclaim callback (-1) -- HandlePool
+     // deliberately exposes no by-index iteration (rx_core/handle.h's own
+     // class comment), so stats() cannot walk `pool_` itself; this is the
+     // cache's own running ledger instead, mirroring GeometryPool::stats()
+diff --git a/src/rx_asset/tests/texture_cache_test.cpp b/src/rx_asset/tests/texture_cache_test.cpp
+index 672075b..ad853ca 100644
+--- a/src/rx_asset/tests/texture_cache_test.cpp
++++ b/src/rx_asset/tests/texture_cache_test.cpp
+@@ -538,20 +538,205 @@ std::optional<QuadrantPixels> renderAndReadbackQuadrants(TcTestFixture& fixture,
+     const uint32_t q1 = extent / 4;
+     const uint32_t q3 = extent - q1 - 1;
+     QuadrantPixels result;
+     result.topLeft = pixelAt(q1, q1);
+     result.topRight = pixelAt(q3, q1);
+     result.bottomLeft = pixelAt(q1, q3);
+     result.bottomRight = pixelAt(q3, q3);
+     return result;
+ }
+ 
++// [Fix round, sampler-wrap P0] Renders a CALLER-SUPPLIED quad -- NOT the
++// fixed [0,1]-cornered `kQuadVertices` above -- sampling
++// `bindlessTextureIndex`/`bindlessSamplerIndex` at explicit LOD 0, and
++// returns the same 4-corner probe shape `renderAndReadbackQuadrants()`
++// itself returns (same "1/4, 3/4 screen-fraction" probe positions). A
++// DELIBERATE, near-identical duplicate of that function's own render+
++// readback body, not a shared/defaulted parameter: this fix round's own
++// missing-regression-class fixture needs UV values OUTSIDE [0,1]
++// (DamagedHelmet's real defect -- helmet-sampler-fix-brief.md -- V wholly
++// in [1.0005,1.9987]), which `kQuadVertices`'s fixed [0,1] corners can
++// never produce; duplicating here keeps EVERY existing caller of
++// renderAndReadbackQuadrants() (this file's own established D10/D11/G6
++// test net) at zero risk from this fix-round-only addition.
++std::optional<QuadrantPixels> renderCustomQuadAndReadbackQuadrants(TcTestFixture& fixture, uint32_t bindlessTextureIndex,
++                                                                     uint32_t bindlessSamplerIndex,
++                                                                     const std::array<QuadVertex, 4>& vertices,
++                                                                     uint32_t extent = 64) {
++    VkDevice device = fixture.device.device();
++    constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
++
++    auto pipeline = buildQuadPipeline(device, fixture.bindless, kColorFormat);
++    if (!pipeline.has_value()) {
++        return std::nullopt;
++    }
++
++    auto vertexBuffer = fixture.allocator.createHostVisibleBuffer(sizeof(vertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
++    auto indexBuffer = fixture.allocator.createHostVisibleBuffer(sizeof(kQuadIndices), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
++    if (!vertexBuffer.has_value() || !indexBuffer.has_value()) {
++        destroyQuadPipeline(device, *pipeline);
++        return std::nullopt;
++    }
++    std::memcpy(vertexBuffer->mappedData(), vertices.data(), sizeof(vertices));
++    vertexBuffer->flush();
++    std::memcpy(indexBuffer->mappedData(), kQuadIndices.data(), sizeof(kQuadIndices));
++    indexBuffer->flush();
++
++    VkImageCreateInfo imageInfo{};
++    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    imageInfo.imageType = VK_IMAGE_TYPE_2D;
++    imageInfo.format = kColorFormat;
++    imageInfo.extent = {extent, extent, 1};
++    imageInfo.mipLevels = 1;
++    imageInfo.arrayLayers = 1;
++    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
++    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
++    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    VkImage image = VK_NULL_HANDLE;
++    if (vkCreateImage(device, &imageInfo, nullptr, &image) != VK_SUCCESS) {
++        destroyQuadPipeline(device, *pipeline);
++        return std::nullopt;
++    }
++    VkMemoryRequirements memReq{};
++    vkGetImageMemoryRequirements(device, image, &memReq);
++    VkPhysicalDeviceMemoryProperties memProps{};
++    vkGetPhysicalDeviceMemoryProperties(fixture.device.physicalDevice(), &memProps);
++    uint32_t memoryTypeIndex = UINT32_MAX;
++    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
++        if ((memReq.memoryTypeBits & (1U << i)) != 0U &&
++            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0U) {
++            memoryTypeIndex = i;
++            break;
++        }
++    }
++    if (memoryTypeIndex == UINT32_MAX) {
++        vkDestroyImage(device, image, nullptr);
++        destroyQuadPipeline(device, *pipeline);
++        return std::nullopt;
++    }
++    VkMemoryAllocateInfo allocInfo{};
++    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++    allocInfo.allocationSize = memReq.size;
++    allocInfo.memoryTypeIndex = memoryTypeIndex;
++    VkDeviceMemory imageMemory = VK_NULL_HANDLE;
++    if (vkAllocateMemory(device, &allocInfo, nullptr, &imageMemory) != VK_SUCCESS) {
++        vkDestroyImage(device, image, nullptr);
++        destroyQuadPipeline(device, *pipeline);
++        return std::nullopt;
++    }
++    vkBindImageMemory(device, image, imageMemory, 0);
++
++    VkImageViewCreateInfo viewInfo{};
++    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++    viewInfo.image = image;
++    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    viewInfo.format = kColorFormat;
++    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    viewInfo.subresourceRange.levelCount = 1;
++    viewInfo.subresourceRange.layerCount = 1;
++    VkImageView imageView = VK_NULL_HANDLE;
++    vkCreateImageView(device, &viewInfo, nullptr, &imageView);
++
++    const VkDeviceSize pixelBytes = static_cast<VkDeviceSize>(extent) * extent * 4;
++    std::vector<uint8_t> pixels(pixelBytes);
++
++    {
++        auto cmdCtx = rx::rhi::CommandContext::create(device, fixture.device.graphicsQueue(), fixture.device.graphicsQueueFamily());
++        if (!cmdCtx.has_value()) {
++            vkDestroyImageView(device, imageView, nullptr);
++            vkDestroyImage(device, image, nullptr);
++            vkFreeMemory(device, imageMemory, nullptr);
++            destroyQuadPipeline(device, *pipeline);
++            return std::nullopt;
++        }
++        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++            rx::rhi::transitionImage(cmd, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++
++            VkRenderingAttachmentInfo colorAttachment{};
++            colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
++            colorAttachment.imageView = imageView;
++            colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++            colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++            colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++            colorAttachment.clearValue.color = VkClearColorValue{{0.0F, 0.0F, 0.0F, 1.0F}};
++
++            VkRenderingInfo renderingInfo{};
++            renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
++            renderingInfo.renderArea = VkRect2D{{0, 0}, {extent, extent}};
++            renderingInfo.layerCount = 1;
++            renderingInfo.colorAttachmentCount = 1;
++            renderingInfo.pColorAttachments = &colorAttachment;
++            vkCmdBeginRendering(cmd, &renderingInfo);
++
++            VkViewport viewport{0.0F, 0.0F, static_cast<float>(extent), static_cast<float>(extent), 0.0F, 1.0F};
++            vkCmdSetViewport(cmd, 0, 1, &viewport);
++            VkRect2D scissor{{0, 0}, {extent, extent}};
++            vkCmdSetScissor(cmd, 0, 1, &scissor);
++
++            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
++            VkDescriptorSet bindlessSet = fixture.bindless.descriptorSet();
++            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->layoutBundle.layout, 0, 1, &bindlessSet, 0, nullptr);
++
++            struct { uint32_t textureIndex; uint32_t samplerIndex; float lod; } push{bindlessTextureIndex, bindlessSamplerIndex, 0.0F};
++            vkCmdPushConstants(cmd, pipeline->layoutBundle.layout, pipeline->pushConstantStages, 0, sizeof(push), &push);
++
++            VkBuffer vb = vertexBuffer->handle();
++            VkDeviceSize vbOffset = 0;
++            vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOffset);
++            vkCmdBindIndexBuffer(cmd, indexBuffer->handle(), 0, VK_INDEX_TYPE_UINT32);
++            vkCmdDrawIndexed(cmd, static_cast<uint32_t>(kQuadIndices.size()), 1, 0, 0, 0);
++
++            vkCmdEndRendering(cmd);
++            rx::rhi::transitionImage(cmd, image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++        });
++
++        auto readback = fixture.allocator.createHostVisibleBuffer(pixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++        if (!readback.has_value()) {
++            vkDestroyImageView(device, imageView, nullptr);
++            vkDestroyImage(device, image, nullptr);
++            vkFreeMemory(device, imageMemory, nullptr);
++            destroyQuadPipeline(device, *pipeline);
++            return std::nullopt;
++        }
++        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++            VkBufferImageCopy region{};
++            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++            region.imageSubresource.layerCount = 1;
++            region.imageExtent = {extent, extent, 1};
++            vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1, &region);
++        });
++        readback->invalidate();
++        std::memcpy(pixels.data(), readback->mappedData(), pixels.size());
++    }
++
++    vkDeviceWaitIdle(device);
++    destroyQuadPipeline(device, *pipeline);
++    vkDestroyImageView(device, imageView, nullptr);
++    vkDestroyImage(device, image, nullptr);
++    vkFreeMemory(device, imageMemory, nullptr);
++
++    auto pixelAt2 = [&](uint32_t x, uint32_t y) -> std::array<uint8_t, 4> {
++        size_t o = (static_cast<size_t>(y) * extent + x) * 4;
++        return {pixels[o], pixels[o + 1], pixels[o + 2], pixels[o + 3]};
++    };
++    const uint32_t q1b = extent / 4;
++    const uint32_t q3b = extent - q1b - 1;
++    QuadrantPixels result2;
++    result2.topLeft = pixelAt2(q1b, q1b);
++    result2.topRight = pixelAt2(q3b, q1b);
++    result2.bottomLeft = pixelAt2(q1b, q3b);
++    result2.bottomRight = pixelAt2(q3b, q3b);
++    return result2;
++}
++
+ bool approxEqual(const std::array<uint8_t, 4>& actual, std::array<uint8_t, 3> expectedRgb, int tolerance) {
+     return std::abs(static_cast<int>(actual[0]) - expectedRgb[0]) <= tolerance &&
+            std::abs(static_cast<int>(actual[1]) - expectedRgb[1]) <= tolerance &&
+            std::abs(static_cast<int>(actual[2]) - expectedRgb[2]) <= tolerance;
+ }
+ 
+ // [Fix round 1] Swaps spdlog's default logger for an ostream-capturing one
+ // for the scope of one TEST_CASE -- the same lightweight rx_core-only
+ // pattern src/rx_core/tests/log_test.cpp, texture_decode_test.cpp, and
+ // import_gltf_basisu_test.cpp all already establish (duplicated per-file,
+@@ -1328,10 +1513,148 @@ TEST_CASE("Slot-swap discrimination: five distinct StandardPBR texture slots on
+         for (const std::array<uint8_t, 3>& other : kAllColors) {
+             if (other == probe.expected) {
+                 continue;
+             }
+             CHECK_FALSE(approxEqual(readback->topLeft, other, 2));
+         }
+     }
+ 
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
++
++// [Fix round, sampler-wrap P0 -- the missing regression class the helmet
++// investigation named] `sampler_wrap_probe.gltf` (assets/test/, new,
++// committed) is a single quad whose ONE material's baseColorTexture
++// references `textures/quadrant.png` (already-committed, 8x8, TL=red/
++// TR=green/BL=blue/BR=yellow -- see this file's own generate_fixtures.sh)
++// through an EXPLICIT-BUT-EMPTY glTF sampler object (`"samplers": [{}]`,
++// referenced by `"textures":[{"source":0,"sampler":0}]`) -- byte-for-byte
++// the SAME shape DamagedHelmet's own real glTF file uses (`samplers:
++// [{}]`, every one of its 5 textures referencing that one empty sampler),
++// which fastgltf/this importer resolve to glTF's documented "sampler
++// unspecified" default: REPEAT wrap, auto (LINEAR) filtering.
++//
++// This exercises the REAL, full production path the original helmet
++// investigation's own probes never touched (its own UV-gradient/color-
++// mean checks were structurally blind at the sampler layer -- see this
++// task's own report addendum): import_gltf.cpp's fillRef() parses this
++// texture's glTF sampler into `TextureRef::sampler`
++// (mesh_asset.h's SamplerDesc) -> THIS test resolves it through
++// TextureCache::getOrCreateSamplerBindlessIndex() (the fix round's own new
++// method -- the exact one samples/08_gltf_viewer/main.cpp's own
++// resolveSamplerIndex() calls in production) -> a real bindless
++// Texture2D/SamplerState pair is sampled by a real GPU shader.
++//
++// DISCRIMINATION: the probe quad's own UV is deliberately OUTSIDE [0,1] in
++// V (constant per draw, matching DamagedHelmet's own "V wholly outside
++// [0,1]" shape exactly, not just "some UVs wrap"), landing EXACTLY on a
++// quadrant.png texel CENTER post-wrap so the assertion is filter-mode-
++// independent (no bilinear-boundary ambiguity, no reliance on any specific
++// interpolated screen fraction): V=1.3125 -- under REPEAT, frac(1.3125) =
++// 0.3125, the exact center of texel row 2 (quadrant.png's TOP/red half,
++// rows 0-3) -- expects RED. Under CLAMP_TO_EDGE (a re-hardcoded-clamp
++// revert), V=1.3125 clamps to exactly 1.0 -- beyond every real texel
++// center, so CLAMP_TO_EDGE deterministically reads the LAST row's texel
++// (row 7, quadrant.png's BOTTOM/blue half) -- expects BLUE instead. This
++// is the discriminating probe: RED-under-fix vs. BLUE-under-bug, the exact
++// signature class the real DamagedHelmet defect had (the whole mesh
++// reading its texture's bottom edge row). A second probe (V=1.6875, wraps
++// to row 5's own texel center, BLUE either way) is a non-discriminating
++// sanity check only -- proves the texture/pipeline are not simply
++// degenerate, not proof of the fix on its own.
++TEST_CASE("Sampler-wrap regression: glTF-default REPEAT (samplers:[{}], DamagedHelmet's own shape) resolved through "
++          "TextureCache::getOrCreateSamplerBindlessIndex() and sampled through the FULL import path -- UVs outside "
++          "[0,1] read the WRAPPED texel, not the CLAMP_TO_EDGE bottom-edge row [helmet sampler-wrap fix, missing "
++          "regression class]") {
++    auto fixture = makeFixture("rx_asset_tc_sampler_wrap");
++    if (!fixture.has_value()) {
++        return;
++    }
++    makeCache(*fixture);
++
++    auto pool = rx::asset::GeometryPool::create(fixture->allocator, fixture->device, fixture->uploader);
++    REQUIRE(pool != nullptr);
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++
++    rx::asset::Registry registry;
++    rx::asset::ImportResult result =
++        registry.importGltf(gltfFixturePath("sampler_wrap_probe.gltf"), *pool, *scheduler, fixture->cache.get());
++    REQUIRE(result.ok());
++    REQUIRE(result.materials.size() == 1);
++
++    const rx::asset::MaterialAsset& material = registry.material(result.materials[0]);
++    REQUIRE(material.baseColorTexture.present);
++    const TextureRecord& record = fixture->cache->resolve(material.baseColorTexture.handle);
++    REQUIRE_FALSE(record.isFallback);
++
++    // `material.baseColorTexture.sampler` is import_gltf.cpp's own parsed
++    // glTF sampler -- for this fixture's empty `samplers:[{}]` object, that
++    // is `SamplerDesc`'s own default-constructed values (mesh_asset.h),
++    // which the fixture's OWN JSON comment (and this TEST_CASE's own
++    // header comment) already establishes ARE glTF's documented "sampler
++    // unspecified" default (REPEAT/auto) -- asserted here directly so a
++    // FUTURE regression in fillRef()'s own sampler-parsing (import_gltf.cpp
++    // :869-874) that started leaving `wrapS`/`wrapT` at some OTHER,
++    // non-REPEAT value would be caught structurally, not just visually.
++    CHECK(material.baseColorTexture.sampler.wrapS == 10497);  // glTF Wrap::Repeat.
++    CHECK(material.baseColorTexture.sampler.wrapT == 10497);
++
++    // THE fix under test: resolve the REAL per-texture bindless sampler
++    // index through TextureCache -- exactly samples/08_gltf_viewer/
++    // main.cpp's own resolveSamplerIndex() call.
++    std::optional<uint32_t> samplerIndex =
++        fixture->cache->getOrCreateSamplerBindlessIndex(material.baseColorTexture.sampler);
++    REQUIRE(samplerIndex.has_value());
++
++    // Two CONSTANT-UV quads (every vertex shares the identical (u,v) --
++    // removes any dependency on interpolation/rasterization precision at a
++    // specific screen fraction; the sampled texel is the same at every
++    // point on the quad by construction) -- see this TEST_CASE's own
++    // header comment for the exact texel-center arithmetic.
++    constexpr std::array<QuadVertex, 4> kRepeatRowTop{{
++        {{-1.0F, -1.0F, 0.0F}, {0.3125F, 1.3125F}},
++        {{1.0F, -1.0F, 0.0F}, {0.3125F, 1.3125F}},
++        {{1.0F, 1.0F, 0.0F}, {0.3125F, 1.3125F}},
++        {{-1.0F, 1.0F, 0.0F}, {0.3125F, 1.3125F}},
++    }};
++    constexpr std::array<QuadVertex, 4> kRepeatRowBottom{{
++        {{-1.0F, -1.0F, 0.0F}, {0.3125F, 1.6875F}},
++        {{1.0F, -1.0F, 0.0F}, {0.3125F, 1.6875F}},
++        {{1.0F, 1.0F, 0.0F}, {0.3125F, 1.6875F}},
++        {{-1.0F, 1.0F, 0.0F}, {0.3125F, 1.6875F}},
++    }};
++
++    auto topReadback =
++        renderCustomQuadAndReadbackQuadrants(*fixture, record.bindlessIndex, *samplerIndex, kRepeatRowTop);
++    REQUIRE(topReadback.has_value());
++    auto bottomReadback =
++        renderCustomQuadAndReadbackQuadrants(*fixture, record.bindlessIndex, *samplerIndex, kRepeatRowBottom);
++    REQUIRE(bottomReadback.has_value());
++
++    // THE discriminating assertion: V=1.3125 (wraps to row 2, the top/red
++    // half) must read RED, not the BLUE a CLAMP_TO_EDGE revert would
++    // produce (V clamps to 1.0, reading the bottom/blue edge row instead --
++    // this is byte-for-byte the same failure SHAPE the real DamagedHelmet
++    // defect had). All four corners assert identically -- the quad's UV is
++    // constant, so a correct implementation reads the SAME texel
++    // everywhere.
++    const std::array<uint8_t, 3> kRed{255, 0, 0};
++    const std::array<uint8_t, 3> kBlue{0, 0, 255};
++    CHECK(approxEqual(topReadback->topLeft, kRed, 2));
++    CHECK(approxEqual(topReadback->topRight, kRed, 2));
++    CHECK(approxEqual(topReadback->bottomLeft, kRed, 2));
++    CHECK(approxEqual(topReadback->bottomRight, kRed, 2));
++    // Explicit negative half, mirroring the slot-swap TEST_CASE's own
++    // "make the failure mode explicit" discipline above.
++    CHECK_FALSE(approxEqual(topReadback->topLeft, kBlue, 2));
++
++    // Sanity probe (non-discriminating alone -- both fix and bug read BLUE
++    // here, since V=1.6875 already wraps to the SAME row a CLAMP_TO_EDGE
++    // revert would also land on): proves the texture/pipeline are real and
++    // not degenerate, and that BOTH quadrant.png halves are genuinely
++    // reachable through this exact code path.
++    CHECK(approxEqual(bottomReadback->topLeft, kBlue, 2));
++    CHECK(approxEqual(bottomReadback->bottomRight, kBlue, 2));
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/src/rx_asset/texture_cache.cpp b/src/rx_asset/texture_cache.cpp
+index 32d2191..1a65fc5 100644
+--- a/src/rx_asset/texture_cache.cpp
++++ b/src/rx_asset/texture_cache.cpp
+@@ -97,20 +97,28 @@ size_t TextureCache::SamplerKeyHash::operator()(const SamplerKey& key) const {
+     h ^= std::hash<int>()(static_cast<int>(key.mipmapMode)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+     h ^= std::hash<int32_t>()(key.anisotropyTimes100) + 0x9e3779b9 + (h << 6) + (h >> 2);
+     return h;
+ }
+ 
+ TextureCache::TextureCache(rx::rhi::Allocator& allocator, rx::rhi::Device& device, rx::rhi::Uploader& uploader,
+                             rx::rhi::BindlessTable& bindless, rx::rhi::DeletionQueue& deletionQueue)
+     : allocator_(allocator), device_(device), uploader_(uploader), bindless_(bindless), deletionQueue_(deletionQueue) {}
+ 
+ TextureCache::~TextureCache() {
++    // [Fix round, sampler-wrap P0] Release every bindless SAMPLER slot
++    // getOrCreateSamplerBindlessIndex() registered, BEFORE destroying the
++    // underlying VkSampler objects just below -- symmetric with
++    // releaseInternal()'s own bindless-release-before-GPU-resource-
++    // teardown ordering elsewhere in this file.
++    for (const auto& [sampler, handle] : samplerBindlessCache_) {
++        bindless_.release(handle);
++    }
+     // [G6] Sampler cache cleanup -- VkSampler is a bare handle, not an
+     // RAII type, so nothing else in this class destroys these; skipping
+     // this loop is a real, empirically-hit VUID-vkDestroyDevice-device-
+     // 00378 ("child objects... must have been destroyed prior to
+     // destroying device") the first time this task's own test suite tore
+     // a TextureCache down with any sampler still cached.
+     for (const auto& [key, sampler] : samplerCache_) {
+         if (sampler != VK_NULL_HANDLE) {
+             vkDestroySampler(device_.device(), sampler, nullptr);
+         }
+@@ -529,20 +537,44 @@ VkSampler TextureCache::getOrCreateSampler(const SamplerDesc& desc) {
+     VkSampler sampler = VK_NULL_HANDLE;
+     if (vkCreateSampler(device_.device(), &info, nullptr, &sampler) != VK_SUCCESS) {
+         RX_LOG_ERROR("rx_asset: TextureCache::getOrCreateSampler: vkCreateSampler failed");
+         return VK_NULL_HANDLE;
+     }
+ 
+     samplerCache_.emplace(key, sampler);
+     return sampler;
+ }
+ 
++std::optional<uint32_t> TextureCache::getOrCreateSamplerBindlessIndex(const SamplerDesc& desc) {
++    RX_ASSERT_MAIN_THREAD("TextureCache::getOrCreateSamplerBindlessIndex");
++
++    VkSampler sampler = getOrCreateSampler(desc);
++    if (sampler == VK_NULL_HANDLE) {
++        // getOrCreateSampler() already logged the vkCreateSampler failure.
++        return std::nullopt;
++    }
++
++    if (auto it = samplerBindlessCache_.find(sampler); it != samplerBindlessCache_.end()) {
++        return it->second.index();
++    }
++
++    rx::rhi::BindlessHandle handle = bindless_.registerSampler(sampler);
++    if (!handle.isValid()) {
++        RX_LOG_ERROR(
++            "rx_asset: TextureCache::getOrCreateSamplerBindlessIndex: BindlessTable::registerSampler failed "
++            "(capacity exhausted?)");
++        return std::nullopt;
++    }
++    samplerBindlessCache_.emplace(sampler, handle);
++    return handle.index();
++}
++
+ TextureCacheStats TextureCache::stats() const {
+     RX_ASSERT_MAIN_THREAD("TextureCache::stats");
+     return stats_;
+ }
+ 
+ size_t TextureCache::samplerCountForTesting() const {
+     RX_ASSERT_MAIN_THREAD("TextureCache::samplerCountForTesting");
+     return samplerCache_.size();
+ }
+ 
+diff --git a/src/rx_material/include/rx_material/draw_data.h b/src/rx_material/include/rx_material/draw_data.h
+index d559554..ad6a493 100644
+--- a/src/rx_material/include/rx_material/draw_data.h
++++ b/src/rx_material/include/rx_material/draw_data.h
+@@ -118,19 +118,24 @@ static_assert(sizeof(DrawDataGpu) == 272, "DrawDataGpu must stay exactly 272 byt
+ // Mirrors material.slang's `RxMaterialGlobals` push-constant struct
+ // (`[[vk::push_constant]] ConstantBuffer<RxMaterialGlobals> gMaterialGlobals;`)
+ // field-for-field. Deliberately ALL-SCALAR (no vec/mat fields) -- see
+ // lit.vert.slang's own header comment for the empirically-verified reason
+ // this project avoids vector/matrix fields inside a push-constant block
+ // (Slang's push-constant packing rules are not the predictable std430 rules
+ // a StructuredBuffer gets); every genuinely vector-shaped per-pass value
+ // (viewProj, light/ambient) lives in DrawDataGpu above instead, reached
+ // indirectly via `drawDataBufferIndex`.
+ struct MaterialGlobalsPush {
+-    uint32_t defaultSamplerIndex = 0;  // bindless SAMPLER index -- material.slang's pre-D26.1 field, unchanged.
++    uint32_t defaultSamplerIndex = 0;  // bindless SAMPLER index -- material.slang's pre-D26.1 field, unchanged in
++                                        // shape. [Fix round, sampler-wrap P0] StandardPbr/Unlit no longer sample
++                                        // through this for real texture slots (they carry their own per-slot
++                                        // sampler indices in gParams) -- this is now only the two-argument
++                                        // rx_sampleTexture() overload's fallback; see material.slang's own header
++                                        // comment.
+     uint32_t drawDataBufferIndex = 0;  // bindless STORAGE BUFFER index of the DrawDataGpu[] this draw reads.
+     float exposure = 0.0F;             // pre-tonemap 2^exposure multiplier (0.0 = neutral, no-op: 2^0 == 1).
+ };
+ static_assert(sizeof(MaterialGlobalsPush) == 12,
+               "MaterialGlobalsPush must stay exactly 12 bytes (3 packed 4-byte scalars) -- mirrors material.slang's "
+               "RxMaterialGlobals, and bindInstance() (material_system.cpp) pushes exactly this many bytes for it");
+ 
+ }  // namespace rx::material
+diff --git a/src/rx_material/include/rx_material/material_system.h b/src/rx_material/include/rx_material/material_system.h
+index cd3e647..ae9237f 100644
+--- a/src/rx_material/include/rx_material/material_system.h
++++ b/src/rx_material/include/rx_material/material_system.h
+@@ -245,23 +245,45 @@ public:
+     // (this method's ORIGINAL, unchanged behavior) -- every existing
+     // caller (test_material_system.cpp, test_api_factory.cpp,
+     // test_api_contract.cpp, api_impl.cpp) keeps compiling and behaving
+     // identically without passing this parameter at all. A non-empty path
+     // is used verbatim (not validated against RX_MATERIAL_SHADER_DIR in any
+     // way) as both the shared-module read directory and the session search
+     // path; a caller passing one that does not actually contain
+     // material.slang/forward_entry.slang gets the exact same "file could
+     // not be read" nullptr-and-RX_LOG_ERROR failure this method already
+     // documents for that case.
++    //
++    // `defaultSamplerAddressMode` [Fix round, sampler-wrap P0]: the wrap
++    // mode of this instance's ONE process-wide default sampler --
++    // material.slang's own `gMaterialGlobals.defaultSamplerIndex` /
++    // `rx_sampleTexture`'s two-argument overload (material.slang's own
++    // header comment has the full account of what this sampler is for
++    // post-fix: a fallback for a material that does not wire its own
++    // per-slot sampler, NOT the one sampler every texture slot samples
++    // through -- that was the shipped defect this fix round closes).
++    // Defaults to `VK_SAMPLER_ADDRESS_MODE_REPEAT`, glTF's OWN documented
++    // default ("sampler unspecified" -> repeat wrapping) -- every existing
++    // caller keeps compiling and gets the spec-correct default without
++    // passing this parameter at all. Task 4's own seam-bleed GPU test
++    // (test_api_factory.cpp, a deliberately non-tiled 2x2 test texture
++    // sampled right up to its UV 0/1 edge) is the one caller that passes
++    // `VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE` explicitly here -- see that
++    // test's own header comment for why CLAMP_TO_EDGE is still the right
++    // choice for THAT specific non-tiling content, now requested
++    // explicitly rather than inherited from a process-wide default that no
++    // longer defaults to it.
+     static std::unique_ptr<MaterialSystem> create(rx::rhi::Device& device, rx::rhi::BindlessTable& bindless,
+                                                     const std::filesystem::path& pipelineCachePath,
+-                                                    const std::filesystem::path& sharedShaderDir = {});
++                                                    const std::filesystem::path& sharedShaderDir = {},
++                                                    VkSamplerAddressMode defaultSamplerAddressMode =
++                                                        VK_SAMPLER_ADDRESS_MODE_REPEAT);
+ 
+     // Loads the Slang module at `slangModulePath` as a material: reads its
+     // bytes (moduleHash() below), compiles+composes+links it against the
+     // shared forward_entry.slang entry points [D6, and see
+     // shaders/material/forward_entry.slang's own header comment for the
+     // exact link-time-specialization mechanism], reflects its
+     // `ParameterBlock<TParams> gParams` global into a
+     // `rx::shader::ShaderLayoutInfo` (layoutInfo() below), and builds this
+     // material's `VkPipelineLayout` (pipelineLayout() below) against
+     // `bindless`'s set-0 layout -- all of this happens here, eagerly, not
+diff --git a/src/rx_material/material_system.cpp b/src/rx_material/material_system.cpp
+index a2783a9..1b7f074 100644
+--- a/src/rx_material/material_system.cpp
++++ b/src/rx_material/material_system.cpp
+@@ -1315,21 +1315,22 @@ MaterialSystem::~MaterialSystem() {
+             }
+         } else {
+             RX_LOG_WARN("rx_material: vkGetPipelineCacheData reported zero bytes; not writing pipeline cache file");
+         }
+         vkDestroyPipelineCache(impl.device, impl.pipelineCache, nullptr);
+     }
+ }
+ 
+ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device, rx::rhi::BindlessTable& bindless,
+                                                          const std::filesystem::path& pipelineCachePath,
+-                                                         const std::filesystem::path& sharedShaderDir) {
++                                                         const std::filesystem::path& sharedShaderDir,
++                                                         VkSamplerAddressMode defaultSamplerAddressMode) {
+     rx::core::log::init();
+ 
+     // [Task 8] Resolve ONCE, here: `sharedShaderDir` if the caller passed a
+     // real one, else the original compile-time RX_MATERIAL_SHADER_DIR
+     // default -- see this method's own header comment (material_system.h)
+     // for the redistribution problem this solves. Every use of "the shared-
+     // shader directory" below and in reloadChanged() (via
+     // impl->sharedShaderDir) flows from this one resolution.
+     const std::filesystem::path effectiveShaderDir =
+         !sharedShaderDir.empty() ? sharedShaderDir : std::filesystem::path(RX_MATERIAL_SHADER_DIR);
+@@ -1425,56 +1426,67 @@ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device,
+         vkDestroyPipelineCache(device.device(), pipelineCache, nullptr);
+         return nullptr;
+     }
+     auto paramArena = rx::material::ParamArena::create(device.device(), *allocator, MaterialSystem::kFramesInFlight);
+     if (!paramArena.has_value()) {
+         RX_LOG_ERROR("rx_material: rx::material::ParamArena::create failed");
+         vkDestroyPipelineCache(device.device(), pipelineCache, nullptr);
+         return nullptr;
+     }
+ 
+-    // [Task 4] The single default LINEAR-filtering sampler every material's
+-    // rx_sampleTexture() call samples with -- see material.slang's own
+-    // header comment, and Impl::defaultSampler's, for why this is created
+-    // and registered exactly once here rather than per-material or
+-    // per-texture. LINEAR + no LOD clamp matches this codebase's own
+-    // already-established "general-purpose color texture" sampler recipe
+-    // (samples/03_bindless_mesh's own `linearInfo`) -- as opposed to sample
+-    // 05's own NEAREST + CLAMP_TO_EDGE shadow/tonemap sampler, which has its
+-    // own depth-comparison/1:1-copy reasons to differ.
++    // [Task 4, superseded -- Fix round sampler-wrap P0] The single default
++    // LINEAR-filtering sampler `rx_sampleTexture()`'s TWO-ARGUMENT overload
++    // samples with (material.slang's own header comment has the current,
++    // correct account) -- created and registered exactly once here.
++    // LINEAR + no LOD clamp matches this codebase's own already-established
++    // "general-purpose color texture" sampler recipe (samples/
++    // 03_bindless_mesh's own `linearInfo`) -- as opposed to sample 05's own
++    // NEAREST + CLAMP_TO_EDGE shadow/tonemap sampler, which has its own
++    // depth-comparison/1:1-copy reasons to differ.
+     //
+-    // CLAMP_TO_EDGE, not sample 03's own REPEAT: this is this engine's ONE
+-    // process-wide DEFAULT sampler (per-material sampler selection is
+-    // explicit future work -- see this file's own header comment), used for
+-    // whatever a material's own UV parameterization happens to be. A
+-    // material sampling right up to UV 0/1 at a mesh seam (the common case
+-    // for a unique, non-tiled albedo map -- exactly this task's own GPU
+-    // test fixture, a 2x2 texture covering one quad with no tiling intent
+-    // at all) gets WRONG-NEIGHBOR bleed under REPEAT (the opposite edge
+-    // wraps into the filter's blend) but a well-defined, edge-duplicated
+-    // result under CLAMP_TO_EDGE -- verified directly by hand and by this
+-    // task's own GPU test (see task-4-report.md): REPEAT was tried first
+-    // and produced exactly this 4-way-blended-corner artifact at this
+-    // task's own quadrant probes, which is not a test-tuning problem but a
+-    // real default-sampler-shape choice this task got to make. A material
+-    // that genuinely wants tiling can still get it (a future per-material/
+-    // per-texture sampler selection is real, supportable future work, not
+-    // built speculatively here since nothing tests it yet); CLAMP_TO_EDGE
+-    // is the safer default absent that.
++    // WRAP MODE -- `defaultSamplerAddressMode` (this method's own
++    // parameter, default `VK_SAMPLER_ADDRESS_MODE_REPEAT`), NOT the
++    // CLAMP_TO_EDGE this used to be hardcoded to: this WAS a real, shipped
++    // defect (not a hypothetical) -- this was this engine's ONE
++    // process-wide sampler EVERY material's EVERY texture slot sampled
++    // through, unconditionally, regardless of that texture's own glTF wrap
++    // mode. DamagedHelmet's own TEXCOORD_0 V lies wholly in
++    // [1.0005, 1.9987] (glTF-spec-legal, relying on the glTF-default REPEAT
++    // wrap) -- under the old hardcoded CLAMP_TO_EDGE, every fragment's V
++    // clamped to 1.0 and the whole mesh sampled each texture's bottom edge
++    // row (black dome, green jaw blob, zero emissive -- see
++    // helmet-texture-fix-report.md's supersede section for the full
++    // account). REPEAT is also glTF's OWN documented default ("sampler
++    // unspecified" -> repeat wrapping, auto filtering) -- the spec-correct
++    // choice for this fallback now that real per-slot sampler wiring
++    // (StandardPbrParams/UnlitParams' own `*Sampler` fields,
++    // TextureCache::getOrCreateSamplerBindlessIndex()) is what every
++    // shipped material actually samples through; this process-wide default
++    // is now ONLY the two-argument overload's fallback and
++    // resolveSamplerIndex()'s own belt-and-suspenders fallback (samples/
++    // 08_gltf_viewer/main.cpp), never the sole sampler for real content.
++    //
++    // Task 4's own seam-bleed GPU test (test_api_factory.cpp) still needs
++    // CLAMP_TO_EDGE for its own deliberately non-tiled 2x2 test texture
++    // (REPEAT's wraparound blends the wrong-edge neighbor into any sample
++    // near a UV boundary -- empirically confirmed, task-4-report.md's own
++    // "What went wrong once" section) -- it now passes
++    // `VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE` explicitly via this
++    // parameter instead of inheriting it from this no-longer-CLAMP default.
+     VkSamplerCreateInfo defaultSamplerInfo{};
+     defaultSamplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+     defaultSamplerInfo.magFilter = VK_FILTER_LINEAR;
+     defaultSamplerInfo.minFilter = VK_FILTER_LINEAR;
+     defaultSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+-    defaultSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+-    defaultSamplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+-    defaultSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    defaultSamplerInfo.addressModeU = defaultSamplerAddressMode;
++    defaultSamplerInfo.addressModeV = defaultSamplerAddressMode;
++    defaultSamplerInfo.addressModeW = defaultSamplerAddressMode;
+     defaultSamplerInfo.maxLod = VK_LOD_CLAMP_NONE;
+     VkSampler defaultSampler = VK_NULL_HANDLE;
+     if (vkCreateSampler(device.device(), &defaultSamplerInfo, nullptr, &defaultSampler) != VK_SUCCESS) {
+         RX_LOG_ERROR("rx_material: vkCreateSampler (default material sampler) failed");
+         vkDestroyPipelineCache(device.device(), pipelineCache, nullptr);
+         return nullptr;
+     }
+     rx::rhi::BindlessHandle defaultSamplerHandle = bindless.registerSampler(defaultSampler);
+     if (!defaultSamplerHandle.isValid()) {
+         RX_LOG_ERROR("rx_material: BindlessTable::registerSampler (default material sampler) failed");
+diff --git a/src/rx_material/tests/test_api_factory.cpp b/src/rx_material/tests/test_api_factory.cpp
+index e153c35..a7f3200 100644
+--- a/src/rx_material/tests/test_api_factory.cpp
++++ b/src/rx_material/tests/test_api_factory.cpp
+@@ -1131,22 +1131,35 @@ void checkQuadrantPixels(const QuadrantPixels& readback) {
+ }
+ }  // namespace
+ 
+ TEST_CASE("IRxMaterialInstance::setTexture's bound texture actually changes the rendered image via "
+           "rx_sampleTexture (public API up to the internal draw-time bridge)") {
+     auto fixture = makeFixture("rx_api_factory_sample_texture");
+     if (!fixture.has_value()) {
+         return;
+     }
+ 
+-    auto internal = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+-                                                            freshCachePath("api_sample_texture"));
++    // [Fix round, sampler-wrap P0] CLAMP_TO_EDGE requested EXPLICITLY, not
++    // inherited from MaterialSystem::create()'s own default (now REPEAT,
++    // glTF's spec default -- see that method's own header comment and
++    // material_system.cpp's `defaultSamplerInfo` comment for the full
++    // account of the defect this closes). This test's own 2x2 test
++    // texture (test_textured_sample.slang's `evaluate()`, sampled via the
++    // TWO-argument rx_sampleTexture() overload -- this is the ORIGINAL
++    // Task 4 seam-bleed regression: the quadrant probes sit right up to
++    // UV 0/1, and a deliberately non-tiled texture like this one needs
++    // CLAMP_TO_EDGE to avoid REPEAT's wrong-neighbor bleed (task-4-report.
++    // md's own "What went wrong once" section) -- unchanged assertions,
++    // now reached via an explicit request instead of an implicit default.
++    auto internal =
++        rx::material::MaterialSystem::create(fixture->device, fixture->bindless, freshCachePath("api_sample_texture"),
++                                              /*sharedShaderDir=*/{}, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+     REQUIRE(internal != nullptr);
+ 
+     RxMaterialSystemDesc desc{internal.get()};
+     IRxMaterialSystem* system = nullptr;
+     REQUIRE(rxCreateMaterialSystem(&desc, &system) == RX_OK);
+ 
+     std::vector<uint8_t> pixels = makeQuadTestPixels();
+     RxTextureDesc textureDesc{};
+     textureDesc.pixels = pixels.data();
+     textureDesc.pixelBytes = pixels.size();
+@@ -1188,22 +1201,28 @@ TEST_CASE("IRxMaterialInstance::setTexture's bound texture actually changes the
+ // correctly across reloadChanged() (D9) -- not merely keeping SOME
+ // last-good pipeline (Task 7's own general reload machinery already
+ // covers that thoroughly), but specifically that the re-rendered image
+ // still shows the real texture content after a genuine recompile.
+ TEST_CASE("hot-reload of a textured material keeps sampling correctly (reloadChanged() then re-render)") {
+     auto fixture = makeFixture("rx_api_factory_sample_texture_reload");
+     if (!fixture.has_value()) {
+         return;
+     }
+ 
++    // [Fix round, sampler-wrap P0] CLAMP_TO_EDGE requested EXPLICITLY -- see
++    // the sibling "setTexture's bound texture..." TEST_CASE above for the
++    // full account (same quadrant-probe/non-tiled-texture reasoning; this
++    // test reuses the identical fixture shape across a reload).
+     auto internal = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+-                                                            freshCachePath("api_sample_texture_reload"));
++                                                            freshCachePath("api_sample_texture_reload"),
++                                                            /*sharedShaderDir=*/{},
++                                                            VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+     REQUIRE(internal != nullptr);
+ 
+     RxMaterialSystemDesc desc{internal.get()};
+     IRxMaterialSystem* system = nullptr;
+     REQUIRE(rxCreateMaterialSystem(&desc, &system) == RX_OK);
+ 
+     std::vector<uint8_t> pixels = makeQuadTestPixels();
+     RxTextureDesc textureDesc{};
+     textureDesc.pixels = pixels.data();
+     textureDesc.pixelBytes = pixels.size();
+diff --git a/src/rx_material/tests/test_standard_pbr_unlit.cpp b/src/rx_material/tests/test_standard_pbr_unlit.cpp
+index 59e6302..b53f558 100644
+--- a/src/rx_material/tests/test_standard_pbr_unlit.cpp
++++ b/src/rx_material/tests/test_standard_pbr_unlit.cpp
+@@ -684,26 +684,33 @@ TEST_CASE("D26.1: two draws in one command buffer, the second at firstInstance>0
+         REQUIRE(h.isValid());
+         defaultSamplerIndex = h.index();
+     }
+ 
+     uint32_t blockSize = system->paramBlockSize(unlit);
+     const auto params = system->materialParams(unlit);
+ 
+     std::vector<uint8_t> redBlob(blockSize, 0);
+     setParam(redBlob, params, "baseColorFactor", std::array<float, 4>{1.0F, 0.0F, 0.0F, 1.0F});
+     setParam(redBlob, params, "baseColorTexture", whiteIndex);
++    // [Fix round, sampler-wrap P0] unlit.slang now samples through an
++    // EXPLICIT gParams.baseColorSampler -- this rig's own real, registered
++    // CLAMP_TO_EDGE sampler (defaultSamplerIndex, just above) is correct
++    // here (byte-identical to this test's pre-fix behavior; no wrap-mode
++    // semantics exercised by this test).
++    setParam(redBlob, params, "baseColorSampler", defaultSamplerIndex);
+     setParam(redBlob, params, "alphaCutoff", 0.0F);
+     setParam(redBlob, params, "baseColorUvOffsetScale", std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
+ 
+     std::vector<uint8_t> greenBlob(blockSize, 0);
+     setParam(greenBlob, params, "baseColorFactor", std::array<float, 4>{0.0F, 1.0F, 0.0F, 1.0F});
+     setParam(greenBlob, params, "baseColorTexture", whiteIndex);
++    setParam(greenBlob, params, "baseColorSampler", defaultSamplerIndex);
+     setParam(greenBlob, params, "alphaCutoff", 0.0F);
+     setParam(greenBlob, params, "baseColorUvOffsetScale", std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
+ 
+     uint32_t pushSize = system->layoutInfo(unlit).pushRanges[0].size;
+     VkDescriptorSetLayout paramSetLayout = system->layoutInfo(unlit).bindings.empty()
+                                                 ? VK_NULL_HANDLE
+                                                 : VK_NULL_HANDLE;  // filled below via the real set layout.
+     (void)paramSetLayout;
+     // The real set-1 layout comes from MaterialSystem's own built
+     // layoutBundle, not layoutInfo() (which is the plain reflected shape) --
+@@ -905,20 +912,35 @@ std::vector<uint8_t> makeDefaultStandardPbrBlob(StandardPbrRig& rig, rx::materia
+     setParam(blob, params, "roughnessFactor", 1.0F);
+     setParam(blob, params, "normalScale", 1.0F);
+     setParam(blob, params, "occlusionStrength", 1.0F);
+     setParam(blob, params, "alphaCutoff", 0.0F);
+     setParam(blob, params, "emissiveFactorAndPad", std::array<float, 4>{0.0F, 0.0F, 0.0F, 0.0F});
+     setParam(blob, params, "baseColorTexture", rig.whiteTex);
+     setParam(blob, params, "metallicRoughnessTexture", rig.whiteTex);
+     setParam(blob, params, "normalTexture", rig.flatNormalTex);
+     setParam(blob, params, "occlusionTexture", rig.whiteTex);
+     setParam(blob, params, "emissiveTexture", rig.whiteTex);
++    // [Fix round, sampler-wrap P0] Every slot's own bindless SAMPLER index --
++    // standard_pbr.slang's evaluate() now samples through gParams.*Sampler
++    // explicitly (no more implicit process-wide default), so every one of
++    // these MUST be a real, valid registered index. This rig's own
++    // CLAMP_TO_EDGE sampler is correct for every test in this file (none of
++    // them exercise wrap-mode/out-of-[0,1]-UV semantics -- that is the
++    // dedicated regression test's own job, texture_cache_test.cpp) and
++    // reproduces this suite's pre-fix behavior byte-for-byte (every slot
++    // sampled through this exact sampler before too, just implicitly via
++    // gMaterialGlobals.defaultSamplerIndex).
++    setParam(blob, params, "baseColorSampler", rig.defaultSamplerIndex);
++    setParam(blob, params, "metallicRoughnessSampler", rig.defaultSamplerIndex);
++    setParam(blob, params, "normalSampler", rig.defaultSamplerIndex);
++    setParam(blob, params, "occlusionSampler", rig.defaultSamplerIndex);
++    setParam(blob, params, "emissiveSampler", rig.defaultSamplerIndex);
+     std::array<float, 4> neutralUv{0.0F, 0.0F, 1.0F, 1.0F};
+     setParam(blob, params, "baseColorUvOffsetScale", neutralUv);
+     setParam(blob, params, "metallicRoughnessUvOffsetScale", neutralUv);
+     setParam(blob, params, "normalUvOffsetScale", neutralUv);
+     setParam(blob, params, "occlusionUvOffsetScale", neutralUv);
+     setParam(blob, params, "emissiveUvOffsetScale", neutralUv);
+     return blob;
+ }
+ 
+ rx::graph::PassSignature makeQuadPassSignature() {
+@@ -1428,20 +1450,25 @@ TEST_CASE("StandardPBR: alphaMode=MASK discards below cutoff, renders opaque abo
+     // A background quad, OPAQUE, farther from the camera (z=-1, behind the
+     // MASK quad at z=0) -- pushed there via its own DrawDataGpu row's model
+     // matrix, not moved in the mesh itself.
+     rx::material::MaterialHandle backgroundHandle =
+         rig->system->loadMaterial(shaderDataPath("unlit.slang"), rx::material::MaterialFixedFunctionState{});
+     uint32_t greenTex = makeTexture(*rig->system, {0, 255, 0, 255});
+     std::vector<uint8_t> backgroundBlob(rig->system->paramBlockSize(backgroundHandle), 0);
+     setParam(backgroundBlob, rig->system->materialParams(backgroundHandle), "baseColorFactor",
+               std::array<float, 4>{0.0F, 1.0F, 0.0F, 1.0F});
+     setParam(backgroundBlob, rig->system->materialParams(backgroundHandle), "baseColorTexture", greenTex);
++    // [Fix round, sampler-wrap P0] see makeDefaultStandardPbrBlob()'s own
++    // comment on rig.defaultSamplerIndex -- identical reasoning for Unlit's
++    // one baseColorSampler field.
++    setParam(backgroundBlob, rig->system->materialParams(backgroundHandle), "baseColorSampler",
++              rig->defaultSamplerIndex);
+     setParam(backgroundBlob, rig->system->materialParams(backgroundHandle), "alphaCutoff", 0.0F);
+     setParam(backgroundBlob, rig->system->materialParams(backgroundHandle), "baseColorUvOffsetScale",
+               std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
+ 
+     std::vector<rx::material::DrawDataGpu> rows;
+     rows.push_back(makeHeadOnRow(glm::translate(glm::mat4(1.0F), glm::vec3(0.0F, 0.0F, -1.0F))));  // row 0: background, behind.
+     rows.push_back(makeHeadOnRow());                                                                  // row 1: the MASK quad, in front.
+     auto drawDataBuffer = createDrawDataBuffer(rig->fixture->allocator, rig->fixture->bindless, rows);
+     REQUIRE(drawDataBuffer.has_value());
+ 
+@@ -1495,37 +1522,41 @@ TEST_CASE("D28: alphaMode=BLEND composites over an opaque background and does no
+     blendState.alphaMode = rx::material::AlphaMode::Blend;
+     rx::material::MaterialHandle handle = rig->system->loadMaterial(shaderDataPath("unlit.slang"), blendState);
+     rx::material::MaterialHandle opaqueHandle =
+         rig->system->loadMaterial(shaderDataPath("unlit.slang"), rx::material::MaterialFixedFunctionState{});
+ 
+     uint32_t redTex = makeTexture(*rig->system, {255, 0, 0, 255});
+     std::vector<uint8_t> backgroundBlob(rig->system->paramBlockSize(opaqueHandle), 0);
+     const auto opaqueParams = rig->system->materialParams(opaqueHandle);
+     setParam(backgroundBlob, opaqueParams, "baseColorFactor", std::array<float, 4>{1.0F, 0.0F, 0.0F, 1.0F});
+     setParam(backgroundBlob, opaqueParams, "baseColorTexture", redTex);
++    // [Fix round, sampler-wrap P0] see makeDefaultStandardPbrBlob()'s own comment.
++    setParam(backgroundBlob, opaqueParams, "baseColorSampler", rig->defaultSamplerIndex);
+     setParam(backgroundBlob, opaqueParams, "alphaCutoff", 0.0F);
+     setParam(backgroundBlob, opaqueParams, "baseColorUvOffsetScale", std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
+ 
+     // 50% blue, alpha=0.5, drawn IN FRONT of the opaque red background.
+     // Unlit's own evaluate() is `baseColorFactor * baseColorTexture` (core
+     // glTF spec, correctly implemented) -- the texture's own alpha channel
+     // is FULLY OPAQUE (255) here so `baseColorFactor.a` is the ONLY alpha
+     // source; an earlier version of this test set BOTH the texture alpha
+     // AND baseColorFactor.a to ~0.5, which multiplied together to an
+     // effective alpha of ~0.25 (0.502*0.502), not the intended 0.5 --
+     // reproduced directly (result read back as (191,0,64) instead of the
+     // intended (127,0,128) compositing) before this fix.
+     uint32_t blueHalfTex = makeTexture(*rig->system, {0, 0, 255, 255});
+     std::vector<uint8_t> blendBlob(rig->system->paramBlockSize(handle), 0);
+     const auto blendParams = rig->system->materialParams(handle);
+     setParam(blendBlob, blendParams, "baseColorFactor", std::array<float, 4>{0.0F, 0.0F, 1.0F, 0.502F});
+     setParam(blendBlob, blendParams, "baseColorTexture", blueHalfTex);
++    // [Fix round, sampler-wrap P0] see makeDefaultStandardPbrBlob()'s own comment.
++    setParam(blendBlob, blendParams, "baseColorSampler", rig->defaultSamplerIndex);
+     setParam(blendBlob, blendParams, "alphaCutoff", 0.0F);
+     setParam(blendBlob, blendParams, "baseColorUvOffsetScale", std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
+ 
+     // Row 2 (the depth-write-off proof's own "third draw", below) sits at
+     // z=-0.9 -- STRICTLY BETWEEN the background (z=-1, farther) and the
+     // BLEND quad (z=0, closer) -- deliberately NOT the background's own
+     // exact depth: `getPipeline()`'s fixed `depthCompareOp =
+     // VK_COMPARE_OP_LESS` never passes for a fragment at EXACTLY the
+     // depth already in the buffer (LESS is strict), so comparing the third
+     // draw against the background's own unchanged depth at an EQUAL value
+@@ -1570,20 +1601,22 @@ TEST_CASE("D28: alphaMode=BLEND composites over an opaque background and does no
+     // second, closer to camera) had wrongly written depth, this third draw
+     // (recorded LAST) would fail the depth test against BLEND's own closer
+     // depth and never appear; since BLEND must NOT write depth, this draw
+     // instead competes against the background's own still-there (farther)
+     // depth, passes, and its color (yellow) reaches the target, composited
+     // over the blend result.
+     uint32_t yellowTex = makeTexture(*rig->system, {255, 255, 0, 255});
+     std::vector<uint8_t> thirdBlob(rig->system->paramBlockSize(opaqueHandle), 0);
+     setParam(thirdBlob, opaqueParams, "baseColorFactor", std::array<float, 4>{1.0F, 1.0F, 0.0F, 1.0F});
+     setParam(thirdBlob, opaqueParams, "baseColorTexture", yellowTex);
++    // [Fix round, sampler-wrap P0] see makeDefaultStandardPbrBlob()'s own comment.
++    setParam(thirdBlob, opaqueParams, "baseColorSampler", rig->defaultSamplerIndex);
+     setParam(thirdBlob, opaqueParams, "alphaCutoff", 0.0F);
+     setParam(thirdBlob, opaqueParams, "baseColorUvOffsetScale", std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
+     std::vector<DrawRequest> withThird = draws;
+     withThird.push_back(DrawRequest{backgroundPipeline, rig->system->pipelineLayout(opaqueHandle),
+                                       rig->paramSetLayout, thirdBlob.data(), thirdBlob.size(), backgroundPush,
+                                       /*drawDataRow=*/2, 0.0F});
+     Rgba8 thirdResult = renderQuad(rig->fixture->device, rig->fixture->allocator, rig->fixture->bindless,
+                                     drawDataBuffer->handle, rig->defaultSamplerIndex, rig->mesh, withThird);
+     CHECK(thirdResult.r > 200);
+     CHECK(thirdResult.g > 200);  // yellow reached the target -- proof BLEND's first draw never wrote depth at z=-1's own equal-depth comparison.
+@@ -1602,20 +1635,22 @@ TEST_CASE("D28: doubleSided disables back-face culling -- a single-sided quad vi
+     rx::material::MaterialFixedFunctionState doubleSidedState;
+     doubleSidedState.doubleSided = true;
+     rx::material::MaterialHandle doubleSided = rig->system->loadMaterial(shaderDataPath("unlit.slang"), doubleSidedState);
+ 
+     uint32_t redTex = makeTexture(*rig->system, {255, 0, 0, 255});
+     auto makeBlob = [&](rx::material::MaterialHandle h) {
+         std::vector<uint8_t> blob(rig->system->paramBlockSize(h), 0);
+         const auto& p = rig->system->materialParams(h);
+         setParam(blob, p, "baseColorFactor", std::array<float, 4>{1.0F, 0.0F, 0.0F, 1.0F});
+         setParam(blob, p, "baseColorTexture", redTex);
++        // [Fix round, sampler-wrap P0] see makeDefaultStandardPbrBlob()'s own comment.
++        setParam(blob, p, "baseColorSampler", rig->defaultSamplerIndex);
+         setParam(blob, p, "alphaCutoff", 0.0F);
+         setParam(blob, p, "baseColorUvOffsetScale", std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
+         return blob;
+     };
+ 
+     // Rotate the quad 180 degrees around Y -- its normal now points -Z
+     // (AWAY from the camera at +Z), presenting its BACK face (CW winding
+     // as seen from the camera) -- the exact scenario back-face culling
+     // exists to cull.
+     glm::mat4 rotated = glm::rotate(glm::mat4(1.0F), glm::radians(180.0F), glm::vec3(0.0F, 1.0F, 0.0F));
+@@ -1727,20 +1762,22 @@ TEST_CASE("Unlit: evaluate() == baseColorFactor x baseColorTexture exactly, zero
+         return;
+     }
+     rx::material::MaterialHandle handle =
+         rig->system->loadMaterial(shaderDataPath("unlit.slang"), rx::material::MaterialFixedFunctionState{});
+     const auto params = rig->system->materialParams(handle);
+ 
+     uint32_t tex = makeTexture(*rig->system, {200, 100, 50, 255});  // an arbitrary, non-white, non-trivial texel.
+     std::vector<uint8_t> blob(rig->system->paramBlockSize(handle), 0);
+     setParam(blob, params, "baseColorFactor", std::array<float, 4>{0.5F, 1.0F, 0.8F, 1.0F});
+     setParam(blob, params, "baseColorTexture", tex);
++    // [Fix round, sampler-wrap P0] see makeDefaultStandardPbrBlob()'s own comment.
++    setParam(blob, params, "baseColorSampler", rig->defaultSamplerIndex);
+     setParam(blob, params, "alphaCutoff", 0.0F);
+     setParam(blob, params, "baseColorUvOffsetScale", std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
+ 
+     rx::material::DrawDataGpu forwardLight = makeHeadOnRow();
+     forwardLight.lightColor = glm::vec4(0.1F, 0.9F, 0.3F, 0.0F);  // an arbitrary, non-neutral light color too.
+     Rgba8 forwardPixel = renderOne(*rig, handle, blob, forwardLight);
+ 
+     // Expected EXACT: baseColorFactor * texel = (0.5,1.0,0.8) *
+     // (200,100,50)/255 -> (0.5*200, 1.0*100, 0.8*50) = (100, 100, 40).
+     CHECK(near8(forwardPixel.r, 100, 2));
