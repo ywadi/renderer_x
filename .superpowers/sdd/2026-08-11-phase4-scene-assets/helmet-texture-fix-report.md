@@ -245,3 +245,309 @@ productive step is almost certainly on the lighting side (FG1 ambient
 tuning, or fast-tracking IBL) rather than further material-resolution
 investigation — but that is explicitly out of this task's scope and a
 separate decision for the coordinator/roadmap.
+
+---
+
+## 10. SUPERSEDE ADDENDUM (fix round, sampler-wrap P0)
+
+**This section corrects Section 4-9 above. The original text above is left
+unedited (per instruction) — read it as the record of what the first
+investigation could see, not as the current verdict.**
+
+### 10.1 The no-bug verdict is REFUTED
+
+Adversarial verification (a separate task, after this report) found the
+real defect one layer below everything this investigation audited:
+`shaders/material/material.slang`'s `rx_sampleTexture()` sampled **every**
+material texture slot through **one hardcoded, process-wide
+`CLAMP_TO_EDGE` sampler** (`material_system.cpp`'s `defaultSamplerInfo`,
+the documented Task 4 seam-bleed choice), regardless of that texture's own
+glTF wrap mode. DamagedHelmet's `TEXCOORD_0` V coordinate lies **entirely**
+in `[1.0005, 1.9987]` — spec-legal, relying on glTF's own default REPEAT
+wrap for UVs outside `[0,1]`. Under CLAMP_TO_EDGE every fragment's V
+clamped to `1.0`, so the whole mesh sampled each texture's bottom edge
+texel row: a near-black dome (the albedo's bottom-row content), a flat
+green blob (the metallicRoughness bottom row bleeding through the visor
+region), and an emissive term that read as **exactly** zero (the emissive
+map's bottom row happens to be unlit) — not a camera-framing coincidence,
+as §3.2 above concluded. `TextureCache::getOrCreateSampler()` had already
+built the *correct* per-texture sampler, honoring each texture's real glTF
+wrap mode — it was simply never wired to anything the shader could reach.
+
+Proof chain (adversarial verifier, reproduced independently before this
+fix round started): a build-tree `frac()` probe on the sampled UV flipped
+the render to teal-visor/silver-panels matching an independent Blender
+no-IBL render (`helmet-reference-noibl.png`, this directory); a `v -> 3-v`
+flip test was byte-identical to the *bug* (clamp eats a flip the same way
+it eats the real UVs — this is what disambiguated "sampler clamp" from
+"someone flipped V somewhere," the coordinator's own alternate hypothesis);
+no flip transform exists anywhere in the actual pipeline; the colorspace/
+decode layer (already verified correct by §2.1 above) stayed clean; the
+committed D17 reference PNG **encodes the bug** (it was generated against
+the same broken code, so the self-referential D17 gate could never have
+caught this); and no fixture in `assets/test/` had UVs outside `[0,1]`,
+which is exactly why nothing in the existing suite (including this
+report's own new slot-swap discriminator, §5 above) was structurally
+capable of exercising this code path at all.
+
+**Why this investigation's own methodology missed it, precisely**: the
+UV-gradient probe (§2.2) visualizes UV *before* the sampler ever runs — a
+smooth, correct UV gradient says nothing about what wrap mode the sampler
+then applies to it. The color-mean/quadrant checks (§2.2, §5) validate
+"this slot's content is present and distinct from its siblings" — a
+content-exists check, not a content-is-at-the-right-screen-position check.
+Both classes of check are still correct and still worth having; neither
+was ever capable of seeing a sampler-address-mode defect, because both
+sit either upstream or orthogonal to where the bug actually lived.
+
+### 10.2 The fix
+
+Per-slot sampler wiring, analogous to the existing per-slot texture-index
+wiring:
+
+- `shaders/material/material.slang`: `rx_sampleTexture()` gained a
+  three-argument overload (`textureIndex, samplerIndex, uv`) that samples
+  through an **explicit** bindless sampler index; the original two-argument
+  form is now a thin wrapper over it using
+  `gMaterialGlobals.defaultSamplerIndex` (unchanged shape, now genuinely
+  just a fallback).
+- `shaders/material/standard_pbr.slang` / `unlit.slang`: `StandardPbrParams`
+  gained one bindless sampler index per texture slot (`baseColorSampler`,
+  `metallicRoughnessSampler`, `normalSampler`, `occlusionSampler`,
+  `emissiveSampler`); `UnlitParams` gained `baseColorSampler`. Every
+  `rx_sampleTexture()` call site in both files switched to the new
+  three-argument form.
+- `src/rx_asset/texture_cache.{h,cpp}`: new
+  `TextureCache::getOrCreateSamplerBindlessIndex(const SamplerDesc&)` —
+  gets-or-creates the deduplicated `VkSampler` (via the pre-existing
+  `getOrCreateSampler()`, unchanged), then gets-or-creates its OWN
+  bindless-table registration (a second cache keyed by the already-
+  deduplicated `VkSampler` handle, so the mapping logic is not
+  duplicated). Released in `~TextureCache()`, symmetric with the existing
+  `vkDestroySampler` loop.
+- `samples/08_gltf_viewer/main.cpp`: new `resolveSamplerIndex()` (mirrors
+  `resolveTextureIndex()`) resolves each slot's real sampler through
+  `TextureCache`, falling back to the app's own default sampler only on a
+  genuine `TextureCache` failure. `setupMaterials()` wires it for every
+  StandardPBR/Unlit texture slot. `SamplerDesc`'s own default-constructed
+  values (glTF's documented "sampler unspecified" default: REPEAT wrap,
+  auto filtering) are passed straight through for both an ABSENT slot and
+  a present slot whose glTF texture referenced no sampler object at all —
+  no special-casing needed, since that default IS the spec-correct answer
+  either way.
+- **Absent-sampler default flipped from CLAMP to REPEAT**: both the app's
+  own hand-rolled default sampler (`samples/08_gltf_viewer/main.cpp`) and
+  `MaterialSystem`'s own internal default sampler
+  (`material_system.cpp`'s `defaultSamplerInfo`) now default to
+  `VK_SAMPLER_ADDRESS_MODE_REPEAT` — glTF's own documented default for
+  "sampler unspecified," and the honest choice now that real per-slot
+  sampling handles wrap-sensitive content; this default is reached only as
+  a fallback (the two-argument `rx_sampleTexture()` overload; a genuine
+  `getOrCreateSamplerBindlessIndex()` failure).
+  `MaterialSystem::create()` gained a `defaultSamplerAddressMode`
+  parameter (default `REPEAT`) precisely so a caller that still needs
+  CLAMP_TO_EDGE can request it explicitly, rather than depending on a
+  process-wide default that no longer defaults to it.
+- **Task 4's own seam-bleed test updated honestly, not weakened**: the two
+  `test_api_factory.cpp` `TEST_CASE`s that motivated CLAMP_TO_EDGE in the
+  first place (`"IRxMaterialInstance::setTexture's bound texture actually
+  changes the rendered image..."` and the hot-reload sibling) now call
+  `MaterialSystem::create(..., VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)`
+  explicitly. Same byte-exact quadrant assertions as before — this test's
+  own deliberately non-tiled 2x2 texture genuinely does need CLAMP_TO_EDGE
+  to avoid REPEAT's wrong-neighbor bleed; it now says so explicitly instead
+  of inheriting it silently.
+- Every `StandardPbr`/`Unlit` param-blob builder in
+  `src/rx_material/tests/test_standard_pbr_unlit.cpp` (one shared helper,
+  `makeDefaultStandardPbrBlob()`, plus 7 manually-built Unlit blobs at
+  individual `TEST_CASE`s) now populates the new sampler field(s), pointed
+  at that file's own rig-local CLAMP_TO_EDGE sampler — byte-identical
+  behavior to before this fix round, since no test in that suite exercises
+  UVs outside `[0,1]`.
+
+### 10.3 The missing regression class (item 2)
+
+New, committed: `assets/test/sampler_wrap_probe.gltf` +
+`assets/test/sampler_wrap_probe.bin` — a single quad whose one material's
+`baseColorTexture` references the already-committed
+`assets/test/textures/quadrant.png` (8x8, TL=red/TR=green/BL=blue/
+BR=yellow) through `"samplers": [{}]` (an explicit-but-EMPTY glTF sampler
+object) referenced by `"textures":[{"source":0,"sampler":0}]` —
+byte-for-byte the same shape DamagedHelmet's own real glTF file uses.
+
+New `TEST_CASE` in `src/rx_asset/tests/texture_cache_test.cpp`
+("Sampler-wrap regression: ..."): imports the fixture through the real
+`Registry::importGltf()` with a real `TextureCache`, asserts the imported
+material's parsed `SamplerDesc` is REPEAT (`wrapS`/`wrapT == 10497`),
+resolves the REAL bindless sampler index via
+`TextureCache::getOrCreateSamplerBindlessIndex()` (the exact call
+`resolveSamplerIndex()` makes in production), and renders two constant-UV
+quads through a raw bindless-sampling shader (this file's own established
+`buildQuadPipeline()`/`kQuadShaderSource` infrastructure, extended with a
+new `renderCustomQuadAndReadbackQuadrants()` helper that accepts caller-
+supplied vertices instead of the existing helper's fixed `[0,1]`
+corners — added rather than modifying the existing helper, so every
+pre-existing caller is unaffected). Both probe UVs sit **wholly outside
+`[0,1]`** in V (`1.3125` and `1.6875`, matching DamagedHelmet's own "V
+wholly outside `[0,1]`" shape) and land exactly on a `quadrant.png` texel
+CENTER post-wrap, so the assertion is filter-mode-independent:
+
+- `V=1.3125` (wraps to texel row 2, the texture's RED half): the
+  discriminating probe. Expects RED under the fix; a CLAMP_TO_EDGE revert
+  clamps V to exactly `1.0`, deterministically reading the LAST row
+  (texture's BLUE half) instead — the identical failure *shape* the real
+  DamagedHelmet defect had.
+- `V=1.6875` (wraps to texel row 5, BLUE): non-discriminating sanity probe
+  (both fix and bug read BLUE here) — proves the texture/pipeline are real
+  and not degenerate.
+
+**Revert-test evidence (mandatory, empirical, not asserted):** a literal
+scratch `git worktree` (`git worktree add ... 715681b`) was attempted
+first, per instruction; it hit a reproducible, DIAGNOSED, and unrelated
+zig/mikktspace toolchain quirk — `mikktspace.c` compiled through the
+project's `zig cc` wrapper links clean (0 `__ubsan_handle_*` references)
+from the main tree's own absolute path, but the identical source, same
+compiler flags, compiled from the worktree's own (necessarily different)
+absolute path pulled in 11 unresolved `__ubsan_handle_*` symbols at link
+time — confirmed NOT a path-alone effect (a manual, minimal `zig cc`
+invocation against a plain copy at an alternate path linked clean), most
+likely a `~/.cache/zig` content-addressed-cache interaction specific to
+this environment, entirely unrelated to any file this fix round touched.
+Given the project's own established precedent for exactly this situation
+(§5 above, this same report: "A literal second git worktree was not used
+for this specific proof... git's index gave an equally strong... revert
+guarantee"), the proof was completed instead as an in-tree revert-and-
+restore against the already-committed fix (`715681b`), which gives an
+identical safety guarantee (the fix was safely committed before the revert
+edit, and `git diff`/`git checkout --` confirm a byte-exact restore):
+
+1. **Fixed code** (`715681b`, `getOrCreateSampler()` uses
+   `mapWrap(desc.wrapS/wrapT)`): `rx_asset_tests
+   --test-case="Sampler-wrap regression*"` → **1/1 test case, 26/26
+   assertions, SUCCESS**.
+2. **Re-hardcoded-clamp revert** (`getOrCreateSampler()`'s `key.wrapS`/
+   `key.wrapT` forced to `VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE`
+   regardless of `desc`, in-tree, uncommitted): same test →
+   **1/1 test case FAILED, 21/26 assertions passed, 5 FAILED** — every one
+   of the 5 discriminating assertions (`topLeft`/`topRight`/`bottomLeft`/
+   `bottomRight` all reading BLUE instead of RED, plus the explicit
+   `CHECK_FALSE(...kBlue...)` also failing) failed exactly as predicted.
+3. **Restore** (`git checkout -- src/rx_asset/texture_cache.cpp`,
+   confirmed byte-exact via empty `git diff --stat`): same test →
+   **1/1 test case, 26/26 assertions, SUCCESS** again.
+
+### 10.4 Shader-deploy DEPENDS (item 3)
+
+Confirmed in-session: a clean-HEAD `sample_08_gltf_viewer_headless` run
+produced `UNASSIGNED-CoreValidation-Shader-OutputNotConsumed` against
+`standard_pbr.slang`'s vertex outputs — a stale DEPLOYED shader copy left
+over from this fix round's own in-place shader edits, exactly the
+class of bug this report's own §3.1 flagged as a follow-up and never
+fixed. Root cause confirmed: every sample's shader-deploy step used a bare
+`add_custom_command(TARGET ... POST_BUILD ...)`, which CMake only re-runs
+when the TARGET itself relinks — `add_custom_command(TARGET ...)` has no
+`DEPENDS` keyword at all (only the `OUTPUT` form does), so a `.slang`-only
+edit left the deployed copy silently stale.
+
+Fixed by converting every such step to the `OUTPUT` + stamp-file +
+`add_custom_target` + `add_dependencies` pattern this same file
+(`samples/08_gltf_viewer/CMakeLists.txt`) already used for its own D17
+reference-PNG deploy — across every sample that had the gap:
+`samples/01_triangle` (the precompiled-SPIR-V deploy — same staleness
+class, one layer removed: editing the `.slang` source regenerates the
+`.spv` via its own tracked custom command, but the COPY next to the binary
+was still untracked), `02_hotreload`, `05_multipass`, `06_materials`
+(both its own `materials/*.slang` deploy and the shared
+`material.slang`/`forward_entry.slang` deploy), `07_stress`, and
+`08_gltf_viewer` (both the `material_shaders/` deploy and the tonemap-
+shader deploy — the two the brief named explicitly). `04_streaming` and
+`03_bindless_mesh`'s own `texture.png` deploy (not a shader) were out of
+scope. Verified: a full clean rebuild (§10.6 below) shows every one of
+these stamp-generating custom commands firing exactly once, and
+`sample_08_gltf_viewer_headless` passes clean from that same clean build.
+
+### 10.5 D17 references regenerated (item 4)
+
+Regenerated via the documented, never-auto-run `tools/regen_references.sh
+linux-native`, from the CLEAN rebuilt (§10.6) + freshly redeployed build
+directory (per that script's own header comment: lavapipe-only,
+`VK_ICD_FILENAMES` forced to the real system ICD). Only
+`samples/08_gltf_viewer/references/loaded_scene.png` changed
+(`loading_state.png` — the pre-import placeholder frame — is untouched by
+this fix, as expected). Rebuilt `sample_08_gltf_viewer` (picks up the new
+PNG via its own tracked deploy step) and re-ran the headless gate:
+
+```
+sample_08_gltf_viewer: D17 loading_state gate: failingPixels=0/65536 (0.0000%) pass=true
+sample_08_gltf_viewer: D17 loaded_scene gate: failingPixels=0/65536 (0.0000%) pass=true
+sample_08_gltf_viewer: headless gate PASSED
+```
+
+`helmet-after.png` (this directory) refreshed: captured via
+`--write-references` from the same clean build (confirmed byte-identical
+to the newly committed D17 `loaded_scene.png` reference via `cmp`), then
+upscaled 256x256 → 512x512 (Lanczos, presentation-only — this sample's
+headless capture has no resolution flag, so there is no native 512px
+render; the upscale is documented here rather than silently presented as
+one). Visually: teal visor, silver/white panels, gold accent at the
+mouth-guard, and the dark-green dome pattern with cyan vent lights —
+matching `helmet-reference-noibl.png`'s own independent Blender no-IBL
+render. `helmet-before.png` (the original bug capture) is left untouched
+for comparison.
+
+### 10.6 Verification, clean rebuild (item 6)
+
+`rm -rf build/linux-native`, then `cmake --preset linux-native && cmake
+--build --preset linux-native` (full project, all 164 targets, ~57s) —
+genuinely clean, not incremental; this is the build the D17 regen and
+every suite below ran from.
+
+- `rx_asset_tests`: **33/33 test cases, 564/564 assertions** (was 32/32,
+  538/538 before this fix round — +1 case for the new sampler-wrap
+  regression test, +26 assertions).
+- `rx_asset_gltf_tests`: **48/48, 292/292** (unchanged).
+- `rx_asset_gltf_gpu_tests`: **57/57, 8,401,735/8,401,735** — clean this
+  run (the wall-clock/iteration-budget flake §6 flagged before is
+  pre-existing and unrelated to this fix; not chased further, same as
+  before).
+- `rx_material_tests`: **14/14, 75/75**.
+- `rx_material_gpu_tests`: **49/49, 2265/2265** (was 49/49, 2156/2156
+  before — the new per-slot sampler `setParam()` calls this fix round
+  added to every StandardPbr/Unlit blob-builder account for the increase;
+  zero behavior change to any existing assertion).
+- Full serial `ctest --preset linux-native -j1`: **22/22 passed**
+  (73.56s), including `sample_08_gltf_viewer_headless` — the
+  OutputNotConsumed contamination from this fix round's own in-session
+  shader edits is gone, confirming §10.4's fix.
+- `windows-cross-zig`: full incremental build (existing build directory,
+  40 targets touched/relinked) succeeds clean; full serial `ctest
+  --preset windows-cross-zig -j1` under Wine: **22/22 passed** (139.77s),
+  including `sample_08_gltf_viewer_headless`.
+- Zero unfiltered Vulkan validation errors in any run — only the two
+  already-documented, pre-existing false-positive categories fire
+  (`SPIR-V SourceLanguage=Slang`, and the separate-sampler
+  `SYNC-HAZARD-READ_AFTER_WRITE` misclassification), both named as such
+  in-code before this fix round and unrelated to it.
+
+### 10.7 Files touched (fix round, final state)
+
+Pathspec-scoped commits (author = local git config, no AI attribution, no
+push):
+
+- Production fix: `shaders/material/{material,standard_pbr,unlit}.slang`;
+  `src/rx_asset/{texture_cache.h,texture_cache.cpp}`;
+  `src/rx_material/include/rx_material/{material_system.h,draw_data.h}`;
+  `src/rx_material/material_system.cpp`;
+  `samples/08_gltf_viewer/{main.cpp,CMakeLists.txt}`.
+- Shader-deploy DEPENDS sweep:
+  `samples/{01_triangle,02_hotreload,05_multipass,06_materials,07_stress}/CMakeLists.txt`.
+- New regression class: `assets/test/sampler_wrap_probe.{gltf,bin}`;
+  `src/rx_asset/tests/texture_cache_test.cpp`.
+- Test-suite updates for the new per-slot sampler fields:
+  `src/rx_material/tests/{test_api_factory.cpp,test_standard_pbr_unlit.cpp}`.
+- D17 regen: `samples/08_gltf_viewer/references/loaded_scene.png`.
+- This addendum: `helmet-texture-fix-report.md`.
+- `.superpowers/sdd/2026-08-11-phase4-scene-assets/helmet-after.png`
+  (SDD workspace artifact, not production code).
+
+No board/plan/spec/ledger file was edited by this fix round.
