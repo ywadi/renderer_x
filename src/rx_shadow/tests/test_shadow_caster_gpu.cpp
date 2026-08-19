@@ -497,6 +497,72 @@ PixelCoord worldToPixel(const glm::mat4& viewProj, const glm::vec3& world, uint3
 
 const glm::vec3 kLightDir = glm::normalize(glm::vec3(0.7F, -0.12F, 0.1F));
 
+// --- [Task 22 fix round, F2] Depth-clamp regression: a scene whose
+// caster geometry GENUINELY crosses the fitted light frustum's near
+// plane -- worked out numerically against this exact lightSpaceView()/
+// fitShadowFrustum() formula (not guessed): a thin vertical pole whose
+// BASE sits comfortably inside the fitted [near,far] depth range and
+// whose TOP sits well BEYOND the near plane (all 4 top corners land at
+// light-space depth ~0.3-0.6, against a near boundary of ~1.33 -- a
+// >=0.7 unit margin) while remaining fully inside the shadow map's own
+// light-space X/Y (screen) bounds (so the difference is a NEAR-PLANE
+// depth-clip/clamp effect specifically, not an unrelated viewport-XY
+// clip). A MODERATE (not grazing) light angle is used here deliberately
+// -- separate from the acne probe's own >=80-degree grazing requirement,
+// which this test does not need -- because it decouples the near-plane
+// depth axis from the screen-XY axes enough to make this geometry
+// tractable by hand (see task-22-report.md's fix-round delta for the
+// derivation).
+constexpr float kClampPoleX = -0.5F;
+constexpr float kClampPoleZ = 0.6667F;
+constexpr float kClampPoleHalfWidth = 0.15F;
+constexpr float kClampPoleHeight = 7.25F;  // Crosses the near plane; see derivation above.
+constexpr float kClampGroundHalf = 5.0F;   // The fit AABB below matches this EXACTLY (see its own comment).
+const glm::vec3 kClampTestLightDir = glm::normalize(glm::vec3(0.4F, -0.6F, 0.3F));
+
+SceneGeometry buildClampTestGeometry() {
+    SceneGeometry g;
+    g.vertices.push_back(v(-kClampGroundHalf, 0.0F, -kClampGroundHalf));  // 0
+    g.vertices.push_back(v(kClampGroundHalf, 0.0F, -kClampGroundHalf));   // 1
+    g.vertices.push_back(v(kClampGroundHalf, 0.0F, kClampGroundHalf));    // 2
+    g.vertices.push_back(v(-kClampGroundHalf, 0.0F, kClampGroundHalf));   // 3
+    g.indices = {0, 1, 2, 0, 2, 3};
+
+    const float minX = kClampPoleX - kClampPoleHalfWidth;
+    const float maxX = kClampPoleX + kClampPoleHalfWidth;
+    const float minZ = kClampPoleZ - kClampPoleHalfWidth;
+    const float maxZ = kClampPoleZ + kClampPoleHalfWidth;
+    const uint32_t base = static_cast<uint32_t>(g.vertices.size());
+    const std::array<glm::vec3, 8> corners{{
+        {minX, 0.0F, minZ},
+        {maxX, 0.0F, minZ},
+        {maxX, 0.0F, maxZ},
+        {minX, 0.0F, maxZ},
+        {minX, kClampPoleHeight, minZ},
+        {maxX, kClampPoleHeight, minZ},
+        {maxX, kClampPoleHeight, maxZ},
+        {minX, kClampPoleHeight, maxZ},
+    }};
+    for (const glm::vec3& c : corners) {
+        g.vertices.push_back(v(c.x, c.y, c.z));
+    }
+    auto quad = [&](uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+        g.indices.push_back(base + a);
+        g.indices.push_back(base + b);
+        g.indices.push_back(base + c);
+        g.indices.push_back(base + a);
+        g.indices.push_back(base + c);
+        g.indices.push_back(base + d);
+    };
+    quad(0, 1, 5, 4);  // -Z face
+    quad(1, 2, 6, 5);  // +X face
+    quad(2, 3, 7, 6);  // +Z face
+    quad(3, 0, 4, 7);  // -X face
+    quad(4, 5, 6, 7);  // top
+    quad(3, 2, 1, 0);  // bottom
+    return g;
+}
+
 // --- The full probe rig: builds the shadow map (with a caller-supplied
 // depth bias) then renders the receiver pass, returning the RGBA8
 // visibility image (R channel == visibility, 0..255) plus the fit's own
@@ -815,6 +881,326 @@ std::optional<ProbeResult> runProbe(GpuFixture& fixture, float depthBiasConstant
     return result;
 }
 
+// [Task 22 fix round, F2] Same two-pass (shadow-caster + receiver)
+// structure as runProbe() above, but built against buildClampTestGeometry()'s
+// near-plane-crossing pole and its own tight-fitted frustum (see that
+// scene's own header comment for the derivation) -- `depthClampEnable`
+// is REQUIRED here (not an optional override), since this probe's whole
+// point is to render the SAME geometry once with it forced true and once
+// forced false and compare the two RENDERED shadows directly.
+std::optional<ProbeResult> runClampRegressionProbe(GpuFixture& fixture, bool depthClampEnable) {
+    const VkDevice device = fixture.device.device();
+    const VkPhysicalDevice physicalDevice = fixture.device.physicalDevice();
+
+    auto bindless = rx::rhi::BindlessTable::create(physicalDevice, device, rx::rhi::BindlessTable::Capacities{4, 4, 2});
+    if (!bindless.has_value()) {
+        return std::nullopt;
+    }
+
+    ShadowCasterPipelineDesc casterDesc;
+    casterDesc.depthClampEnableOverrideForTesting = depthClampEnable;
+    auto caster = ShadowCasterPipeline::create(fixture.device, *bindless, casterDesc);
+    if (!caster) {
+        return std::nullopt;
+    }
+
+    auto receiver = buildReceiverPipeline(device, VK_FORMAT_R8G8B8A8_UNORM, bindless->descriptorSetLayout());
+    if (!receiver.has_value()) {
+        return std::nullopt;
+    }
+
+    const SceneGeometry scene = buildClampTestGeometry();
+    const VkDeviceSize vertexBytes = scene.vertices.size() * sizeof(PoolVertexLike);
+    const VkDeviceSize indexBytes = scene.indices.size() * sizeof(uint32_t);
+    auto vertexBuffer =
+        fixture.allocator.createHostVisibleBuffer(vertexBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
+    auto indexBuffer =
+        fixture.allocator.createHostVisibleBuffer(indexBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
+    if (!vertexBuffer.has_value() || !indexBuffer.has_value()) {
+        return std::nullopt;
+    }
+    std::memcpy(vertexBuffer->mappedData(), scene.vertices.data(), static_cast<size_t>(vertexBytes));
+    vertexBuffer->flush();
+    std::memcpy(indexBuffer->mappedData(), scene.indices.data(), static_cast<size_t>(indexBytes));
+    indexBuffer->flush();
+
+    // Fit AABB [F2's own derivation] matches the GROUND PLANE's own
+    // extent EXACTLY (X/Z in [-kClampGroundHalf, kClampGroundHalf]) --
+    // guaranteeing (by convexity of a linear functional over a box) that
+    // EVERY ground receiver point's own light-space depth AND screen X/Y
+    // land inside this fit's [near,far] and [left,right]x[bottom,top],
+    // so no receiver query ever falls outside the shadow map's valid
+    // coverage (the earlier version of this test's own bug: an
+    // undersized fit left most of the ground's receiver queries
+    // out-of-range, producing a wide band of meaningless
+    // edge-clamped-sampler noise having nothing to do with the pole's
+    // own shadow). The fit's own Y range ([0, 0.6]) deliberately does
+    // NOT cover the pole's real height (kClampPoleHeight=7.25) -- see
+    // buildClampTestGeometry()'s own header comment for why the pole's
+    // top genuinely falls outside the resulting depth range while its
+    // base and every ground point stay inside it. ZERO depth padding:
+    // padding exists specifically to avoid the near/far clip this test
+    // wants to trigger.
+    const glm::mat4 lightView = lightSpaceView(kClampTestLightDir);
+    constexpr uint32_t kShadowMapResolution = 256;
+    const ShadowFrustumFit fit = fitShadowFrustum(glm::vec3(-kClampGroundHalf, 0.0F, -kClampGroundHalf),
+                                                    glm::vec3(kClampGroundHalf, 0.6F, kClampGroundHalf), lightView,
+                                                    kShadowMapResolution, /*depthPaddingWorldUnits=*/0.0F);
+
+    ShadowDrawData casterRow;
+    casterRow.model = glm::transpose(glm::mat4(1.0F));
+    casterRow.lightViewProj = glm::transpose(fit.lightViewProj);
+    auto casterDataBuffer = fixture.allocator.createHostVisibleBuffer(sizeof(ShadowDrawData), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                                                         rx::rhi::MemoryCategory::Internal);
+    if (!casterDataBuffer.has_value()) {
+        return std::nullopt;
+    }
+    std::memcpy(casterDataBuffer->mappedData(), &casterRow, sizeof(casterRow));
+    casterDataBuffer->flush();
+    rx::rhi::BindlessHandle casterDataHandle = bindless->registerStorageBuffer(casterDataBuffer->handle(), sizeof(ShadowDrawData));
+    if (!casterDataHandle.isValid()) {
+        return std::nullopt;
+    }
+
+    auto shadowMap = createImage(device, physicalDevice, VK_FORMAT_D32_SFLOAT, VkExtent2D{kShadowMapResolution, kShadowMapResolution},
+                                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+    if (!shadowMap.has_value()) {
+        return std::nullopt;
+    }
+
+    auto cmdCtx = rx::rhi::CommandContext::create(device, fixture.device.graphicsQueue(), fixture.device.graphicsQueueFamily());
+    if (!cmdCtx.has_value()) {
+        return std::nullopt;
+    }
+
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        VkImageMemoryBarrier2 toDepthAttachment{};
+        toDepthAttachment.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        toDepthAttachment.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+        toDepthAttachment.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+        toDepthAttachment.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        toDepthAttachment.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        toDepthAttachment.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        toDepthAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDepthAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDepthAttachment.image = shadowMap->image;
+        toDepthAttachment.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        VkDependencyInfo dep{};
+        dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep.imageMemoryBarrierCount = 1;
+        dep.pImageMemoryBarriers = &toDepthAttachment;
+        vkCmdPipelineBarrier2(cmd, &dep);
+
+        VkRenderingAttachmentInfo depthAttachment{};
+        depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        depthAttachment.imageView = shadowMap->view;
+        depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        depthAttachment.clearValue.depthStencil = {1.0F, 0};
+
+        VkRenderingInfo renderingInfo{};
+        renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        renderingInfo.renderArea = {{0, 0}, {kShadowMapResolution, kShadowMapResolution}};
+        renderingInfo.layerCount = 1;
+        renderingInfo.pDepthAttachment = &depthAttachment;
+        vkCmdBeginRendering(cmd, &renderingInfo);
+
+        VkViewport viewport{0.0F, 0.0F, static_cast<float>(kShadowMapResolution), static_cast<float>(kShadowMapResolution), 0.0F, 1.0F};
+        VkRect2D scissor{{0, 0}, {kShadowMapResolution, kShadowMapResolution}};
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        // A fixed, modest bias -- not this test's own concern (F2, not
+        // F3/the acne probe) -- just avoiding unrelated ground self-acne
+        // at the sampled receiver points.
+        caster->bindAndSetDepthBias(cmd, 2.0F, 1.5F);
+
+        VkDescriptorSet set = bindless->descriptorSet();
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, caster->pipelineLayout(), 0, 1, &set, 0, nullptr);
+        ShadowCasterPushConstants push{casterDataHandle.index()};
+        vkCmdPushConstants(cmd, caster->pipelineLayout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
+
+        VkDeviceSize offset = 0;
+        VkBuffer vb = vertexBuffer->handle();
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &offset);
+        vkCmdBindIndexBuffer(cmd, indexBuffer->handle(), 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cmd, static_cast<uint32_t>(scene.indices.size()), 1, 0, 0, 0);
+
+        vkCmdEndRendering(cmd);
+
+        VkImageMemoryBarrier2 toShaderRead{};
+        toShaderRead.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        toShaderRead.srcStageMask = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+        toShaderRead.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        toShaderRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        toShaderRead.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        toShaderRead.oldLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        toShaderRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        toShaderRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toShaderRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toShaderRead.image = shadowMap->image;
+        toShaderRead.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        VkDependencyInfo dep2{};
+        dep2.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep2.imageMemoryBarrierCount = 1;
+        dep2.pImageMemoryBarriers = &toShaderRead;
+        vkCmdPipelineBarrier2(cmd, &dep2);
+    });
+
+    VkSamplerCreateInfo compareSamplerInfo{};
+    compareSamplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    compareSamplerInfo.magFilter = VK_FILTER_LINEAR;
+    compareSamplerInfo.minFilter = VK_FILTER_LINEAR;
+    compareSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    compareSamplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    compareSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    compareSamplerInfo.compareEnable = VK_TRUE;
+    compareSamplerInfo.compareOp = VK_COMPARE_OP_LESS;
+    compareSamplerInfo.maxLod = VK_LOD_CLAMP_NONE;
+    VkSampler compareSampler = VK_NULL_HANDLE;
+    if (vkCreateSampler(device, &compareSamplerInfo, nullptr, &compareSampler) != VK_SUCCESS) {
+        return std::nullopt;
+    }
+    rx::rhi::BindlessHandle compareSamplerHandle = bindless->registerSampler(compareSampler);
+    if (!compareSamplerHandle.isValid()) {
+        vkDestroySampler(device, compareSampler, nullptr);
+        return std::nullopt;
+    }
+    rx::rhi::BindlessHandle shadowMapHandle = bindless->registerSampledImage(shadowMap->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (!shadowMapHandle.isValid()) {
+        vkDestroySampler(device, compareSampler, nullptr);
+        return std::nullopt;
+    }
+
+    ReceiverDrawData receiverRow;
+    receiverRow.cameraViewProj = glm::transpose(topDownCameraViewProj());
+    receiverRow.lightViewProj = glm::transpose(fit.lightViewProj);
+    auto receiverDataBuffer = fixture.allocator.createHostVisibleBuffer(sizeof(ReceiverDrawData), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                                                           rx::rhi::MemoryCategory::Internal);
+    if (!receiverDataBuffer.has_value()) {
+        vkDestroySampler(device, compareSampler, nullptr);
+        return std::nullopt;
+    }
+    std::memcpy(receiverDataBuffer->mappedData(), &receiverRow, sizeof(receiverRow));
+    receiverDataBuffer->flush();
+    rx::rhi::BindlessHandle receiverDataHandle = bindless->registerStorageBuffer(receiverDataBuffer->handle(), sizeof(ReceiverDrawData));
+    if (!receiverDataHandle.isValid()) {
+        vkDestroySampler(device, compareSampler, nullptr);
+        return std::nullopt;
+    }
+
+    auto colorTarget = createImage(device, physicalDevice, VK_FORMAT_R8G8B8A8_UNORM, VkExtent2D{kExtent, kExtent},
+                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+    if (!colorTarget.has_value()) {
+        vkDestroySampler(device, compareSampler, nullptr);
+        return std::nullopt;
+    }
+
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        VkImageMemoryBarrier2 toColorAttachment{};
+        toColorAttachment.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        toColorAttachment.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+        toColorAttachment.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        toColorAttachment.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        toColorAttachment.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        toColorAttachment.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        toColorAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toColorAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toColorAttachment.image = colorTarget->image;
+        toColorAttachment.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkDependencyInfo dep{};
+        dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep.imageMemoryBarrierCount = 1;
+        dep.pImageMemoryBarriers = &toColorAttachment;
+        vkCmdPipelineBarrier2(cmd, &dep);
+
+        VkRenderingAttachmentInfo colorAttachment{};
+        colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        colorAttachment.imageView = colorTarget->view;
+        colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        colorAttachment.clearValue.color = VkClearColorValue{{1.0F, 1.0F, 1.0F, 1.0F}};
+
+        VkRenderingInfo renderingInfo{};
+        renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        renderingInfo.renderArea = {{0, 0}, {kExtent, kExtent}};
+        renderingInfo.layerCount = 1;
+        renderingInfo.colorAttachmentCount = 1;
+        renderingInfo.pColorAttachments = &colorAttachment;
+        vkCmdBeginRendering(cmd, &renderingInfo);
+
+        VkViewport viewport{0.0F, 0.0F, static_cast<float>(kExtent), static_cast<float>(kExtent), 0.0F, 1.0F};
+        VkRect2D scissor{{0, 0}, {kExtent, kExtent}};
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, receiver->pipeline);
+        VkDescriptorSet set = bindless->descriptorSet();
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, receiver->layoutBundle.layout, 0, 1, &set, 0, nullptr);
+        ReceiverPushConstants push{receiverDataHandle.index(), shadowMapHandle.index(), compareSamplerHandle.index(),
+                                    1.0F / static_cast<float>(kShadowMapResolution)};
+        vkCmdPushConstants(cmd, receiver->layoutBundle.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                            sizeof(push), &push);
+
+        VkDeviceSize offset = 0;
+        VkBuffer vb = vertexBuffer->handle();
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &offset);
+        vkCmdBindIndexBuffer(cmd, indexBuffer->handle(), 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cmd, static_cast<uint32_t>(scene.indices.size()), 1, 0, 0, 0);
+
+        vkCmdEndRendering(cmd);
+
+        VkImageMemoryBarrier2 toTransferSrc{};
+        toTransferSrc.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        toTransferSrc.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        toTransferSrc.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        toTransferSrc.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        toTransferSrc.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        toTransferSrc.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        toTransferSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toTransferSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransferSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransferSrc.image = colorTarget->image;
+        toTransferSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkDependencyInfo dep2{};
+        dep2.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep2.imageMemoryBarrierCount = 1;
+        dep2.pImageMemoryBarriers = &toTransferSrc;
+        vkCmdPipelineBarrier2(cmd, &dep2);
+    });
+
+    const VkDeviceSize pixelBytes = static_cast<VkDeviceSize>(kExtent) * kExtent * 4;
+    auto readback = fixture.allocator.createHostVisibleBuffer(pixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    if (!readback.has_value()) {
+        vkDestroySampler(device, compareSampler, nullptr);
+        return std::nullopt;
+    }
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        VkBufferImageCopy region{};
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent = {kExtent, kExtent, 1};
+        vkCmdCopyImageToBuffer(cmd, colorTarget->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1, &region);
+    });
+    readback->invalidate();
+
+    ProbeResult result;
+    result.pixels.resize(static_cast<size_t>(pixelBytes));
+    std::memcpy(result.pixels.data(), readback->mappedData(), result.pixels.size());
+    result.worldTexelSize = fit.worldTexelSize;
+    result.depthClampEnabled = caster->depthClampEnabled();
+
+    vkDeviceWaitIdle(device);
+    vkDestroySampler(device, compareSampler, nullptr);
+    destroyImage(device, *colorTarget);
+    destroyImage(device, *shadowMap);
+    destroyReceiverPipeline(device, *receiver);
+
+    return result;
+}
+
 uint8_t redAt(const ProbeResult& probe, int x, int y) {
     const size_t idx = (static_cast<size_t>(y) * kExtent + static_cast<size_t>(x)) * 4;
     return probe.pixels[idx];
@@ -839,29 +1225,221 @@ TEST_CASE("ShadowCasterPipeline::create builds successfully; depthClampEnabled()
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 
-TEST_CASE("Slope-scaled depth bias is genuinely wired: two different bias values produce measurably different shadow-map depths") {
+namespace {
+
+// [Task 22 fix round, F3] Renders JUST the shadow-caster pass (no
+// receiver) with `depthBiasConstantFactor`/`depthBiasSlopeFactor` and
+// reads back the RAW stored D32_SFLOAT depth at one specific shadow-map
+// texel -- the texel a KNOWN world point on the box caster's own TOP
+// face projects to. Unlike `runProbe()` (which measures a downstream
+// RECEIVER-side visibility consequence), this reads the shadow map's own
+// stored depth value directly, the most direct possible proof that
+// `vkCmdSetDepthBias` is wired to something real: under this pipeline's
+// own standard-Z/LESS convention, a positive bias pushes the STORED
+// depth value LARGER (farther from the light) -- see
+// ShadowCasterPipeline::create()'s own D13 comment.
+std::optional<float> readShadowMapDepthAtBoxTop(GpuFixture& fixture, float depthBiasConstantFactor,
+                                                 float depthBiasSlopeFactor, glm::vec3 worldPoint) {
+    const VkDevice device = fixture.device.device();
+    const VkPhysicalDevice physicalDevice = fixture.device.physicalDevice();
+
+    auto bindless = rx::rhi::BindlessTable::create(physicalDevice, device, rx::rhi::BindlessTable::Capacities{4, 4, 2});
+    if (!bindless.has_value()) {
+        return std::nullopt;
+    }
+    auto caster = ShadowCasterPipeline::create(fixture.device, *bindless);
+    if (!caster) {
+        return std::nullopt;
+    }
+
+    const SceneGeometry scene = buildSceneGeometry();
+    auto vertexBuffer = fixture.allocator.createHostVisibleBuffer(scene.vertices.size() * sizeof(PoolVertexLike),
+                                                                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
+    auto indexBuffer = fixture.allocator.createHostVisibleBuffer(scene.indices.size() * sizeof(uint32_t),
+                                                                   VK_BUFFER_USAGE_INDEX_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
+    if (!vertexBuffer.has_value() || !indexBuffer.has_value()) {
+        return std::nullopt;
+    }
+    std::memcpy(vertexBuffer->mappedData(), scene.vertices.data(), scene.vertices.size() * sizeof(PoolVertexLike));
+    vertexBuffer->flush();
+    std::memcpy(indexBuffer->mappedData(), scene.indices.data(), scene.indices.size() * sizeof(uint32_t));
+    indexBuffer->flush();
+
+    const glm::mat4 lightView = lightSpaceView(kLightDir);
+    constexpr uint32_t kShadowMapResolution = 256;
+    const ShadowFrustumFit fit =
+        fitShadowFrustum(glm::vec3(-kGroundHalf, 0.0F, -kGroundHalf), glm::vec3(kGroundHalf, kBoxHeight, kGroundHalf),
+                          lightView, kShadowMapResolution, /*depthPaddingWorldUnits=*/2.0F);
+
+    ShadowDrawData casterRow;
+    casterRow.model = glm::transpose(glm::mat4(1.0F));
+    casterRow.lightViewProj = glm::transpose(fit.lightViewProj);
+    auto casterDataBuffer = fixture.allocator.createHostVisibleBuffer(sizeof(ShadowDrawData), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                                                         rx::rhi::MemoryCategory::Internal);
+    if (!casterDataBuffer.has_value()) {
+        return std::nullopt;
+    }
+    std::memcpy(casterDataBuffer->mappedData(), &casterRow, sizeof(casterRow));
+    casterDataBuffer->flush();
+    rx::rhi::BindlessHandle casterDataHandle = bindless->registerStorageBuffer(casterDataBuffer->handle(), sizeof(ShadowDrawData));
+    if (!casterDataHandle.isValid()) {
+        return std::nullopt;
+    }
+
+    // TRANSFER_SRC_BIT (unlike runProbe()'s own shadow map) -- this test's
+    // whole point is a direct raw-depth readback.
+    auto shadowMap = createImage(device, physicalDevice, VK_FORMAT_D32_SFLOAT, VkExtent2D{kShadowMapResolution, kShadowMapResolution},
+                                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                  VK_IMAGE_ASPECT_DEPTH_BIT);
+    if (!shadowMap.has_value()) {
+        return std::nullopt;
+    }
+
+    auto cmdCtx = rx::rhi::CommandContext::create(device, fixture.device.graphicsQueue(), fixture.device.graphicsQueueFamily());
+    if (!cmdCtx.has_value()) {
+        return std::nullopt;
+    }
+
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        VkImageMemoryBarrier2 toDepthAttachment{};
+        toDepthAttachment.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        toDepthAttachment.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+        toDepthAttachment.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+        toDepthAttachment.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        toDepthAttachment.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        toDepthAttachment.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        toDepthAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDepthAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDepthAttachment.image = shadowMap->image;
+        toDepthAttachment.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        VkDependencyInfo dep{};
+        dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep.imageMemoryBarrierCount = 1;
+        dep.pImageMemoryBarriers = &toDepthAttachment;
+        vkCmdPipelineBarrier2(cmd, &dep);
+
+        VkRenderingAttachmentInfo depthAttachment{};
+        depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        depthAttachment.imageView = shadowMap->view;
+        depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        depthAttachment.clearValue.depthStencil = {1.0F, 0};
+
+        VkRenderingInfo renderingInfo{};
+        renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        renderingInfo.renderArea = {{0, 0}, {kShadowMapResolution, kShadowMapResolution}};
+        renderingInfo.layerCount = 1;
+        renderingInfo.pDepthAttachment = &depthAttachment;
+        vkCmdBeginRendering(cmd, &renderingInfo);
+
+        VkViewport viewport{0.0F, 0.0F, static_cast<float>(kShadowMapResolution), static_cast<float>(kShadowMapResolution), 0.0F, 1.0F};
+        VkRect2D scissor{{0, 0}, {kShadowMapResolution, kShadowMapResolution}};
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        caster->bindAndSetDepthBias(cmd, depthBiasConstantFactor, depthBiasSlopeFactor);
+        VkDescriptorSet set = bindless->descriptorSet();
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, caster->pipelineLayout(), 0, 1, &set, 0, nullptr);
+        ShadowCasterPushConstants push{casterDataHandle.index()};
+        vkCmdPushConstants(cmd, caster->pipelineLayout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
+
+        VkDeviceSize offset = 0;
+        VkBuffer vb = vertexBuffer->handle();
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &offset);
+        vkCmdBindIndexBuffer(cmd, indexBuffer->handle(), 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cmd, static_cast<uint32_t>(scene.indices.size()), 1, 0, 0, 0);
+
+        vkCmdEndRendering(cmd);
+
+        VkImageMemoryBarrier2 toTransferSrc{};
+        toTransferSrc.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        toTransferSrc.srcStageMask = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+        toTransferSrc.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        toTransferSrc.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        toTransferSrc.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        toTransferSrc.oldLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        toTransferSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toTransferSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransferSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransferSrc.image = shadowMap->image;
+        toTransferSrc.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        VkDependencyInfo dep2{};
+        dep2.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep2.imageMemoryBarrierCount = 1;
+        dep2.pImageMemoryBarriers = &toTransferSrc;
+        vkCmdPipelineBarrier2(cmd, &dep2);
+    });
+
+    // World point -> shadow-map texel, via the SAME fitted light matrix
+    // the caster pass itself rendered with.
+    const glm::vec4 lightClip = fit.lightViewProj * glm::vec4(worldPoint, 1.0F);
+    const glm::vec3 lightNdc = glm::vec3(lightClip) / lightClip.w;
+    const glm::vec2 uv = glm::vec2(lightNdc) * 0.5F + 0.5F;
+    const int texelX = std::clamp(static_cast<int>(uv.x * static_cast<float>(kShadowMapResolution)), 0,
+                                    static_cast<int>(kShadowMapResolution) - 1);
+    const int texelY = std::clamp(static_cast<int>(uv.y * static_cast<float>(kShadowMapResolution)), 0,
+                                    static_cast<int>(kShadowMapResolution) - 1);
+
+    auto readback = fixture.allocator.createHostVisibleBuffer(sizeof(float), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    if (!readback.has_value()) {
+        return std::nullopt;
+    }
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        VkBufferImageCopy region{};
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageOffset = {texelX, texelY, 0};
+        region.imageExtent = {1, 1, 1};
+        vkCmdCopyImageToBuffer(cmd, shadowMap->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1, &region);
+    });
+    readback->invalidate();
+
+    float depthValue = -1.0F;
+    std::memcpy(&depthValue, readback->mappedData(), sizeof(float));
+
+    vkDeviceWaitIdle(device);
+    destroyImage(device, *shadowMap);
+
+    return depthValue;
+}
+
+}  // namespace
+
+TEST_CASE("Slope-scaled depth bias is genuinely wired: two different bias values produce measurably different "
+          "RAW shadow-map depth at the same known caster texel") {
     auto fixture = makeFixture("rx_shadow_gpu_bias_wiring");
     if (!fixture.has_value()) {
         return;
     }
-    // Zero bias vs a large bias -- if vkCmdSetDepthBias were a no-op, the
-    // acne probe below (which relies on exactly this mechanism) would be
-    // vacuous. This case isolates that one mechanism directly: the acne
-    // probe's own neighborhood variance is a downstream CONSEQUENCE,
-    // this is the wiring proof itself.
-    auto unbiased = runProbe(*fixture, 0.0F, 0.0F);
-    auto biased = runProbe(*fixture, 4.0F, 3.0F);
-    REQUIRE(unbiased.has_value());
-    REQUIRE(biased.has_value());
 
-    // A point on the ground FAR from the caster/shadow (e.g. (-8,-8)) is
-    // lit under BOTH configurations (nothing occludes it) -- not a useful
-    // discriminator. The bias affects whether NEAR-GRAZING, unoccluded
-    // ground self-shadows (acne) -- see the dedicated acne-probe case
-    // below for the full neighborhood-variance proof; this case only
-    // proves bias is not a no-op via the GPU test infrastructure being
-    // exercised without asserting a specific pixel value here (see the
-    // acne-probe case for the real assertion).
+    // The box caster's own TOP-face center -- a point on the caster
+    // itself, guaranteed to be rasterized into the shadow map (unlike a
+    // ground-plane point, which the caster never occludes at this
+    // specific texel) so this test reads a REAL caster depth, not a
+    // background clear value.
+    const glm::vec3 boxTopCenter(0.5F * (kBoxMinX + kBoxMaxX), kBoxHeight, 0.5F * (kBoxMinZ + kBoxMaxZ));
+
+    auto unbiasedDepth = readShadowMapDepthAtBoxTop(*fixture, 0.0F, 0.0F, boxTopCenter);
+    auto biasedDepth = readShadowMapDepthAtBoxTop(*fixture, 8.0F, 6.0F, boxTopCenter);
+    REQUIRE(unbiasedDepth.has_value());
+    REQUIRE(biasedDepth.has_value());
+
+    CAPTURE(*unbiasedDepth);
+    CAPTURE(*biasedDepth);
+    // Standard-Z/LESS [D13]: a positive depthBias pushes the STORED depth
+    // value LARGER (farther from the light) -- see
+    // ShadowCasterPipeline::create()'s own required D13 comment. Both
+    // values must also be real, in-range depths (not the 1.0 clear
+    // value), proving the caster genuinely rasterized at this texel in
+    // BOTH runs -- a bias so large it pushed the value all the way to (or
+    // past) the far plane would be silently vacuous the same way F3's
+    // original version was.
+    CHECK(*unbiasedDepth < 1.0F);
+    CHECK(*unbiasedDepth >= 0.0F);
+    CHECK(*biasedDepth > *unbiasedDepth);
+    CHECK(*biasedDepth <= 1.0F);
+
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 
@@ -994,7 +1572,8 @@ TEST_CASE("PCF softness probe: the shadow edge's visibility gradient spans at le
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 
-TEST_CASE("Depth clamp regression: a caster crossing the light's near plane keeps its full silhouette with clamp ON, and is truncated with clamp OFF") {
+TEST_CASE("Depth clamp regression: a caster genuinely crossing the light's near plane casts its full shadow with "
+          "clamp ON, and that same far reach of the shadow disappears with clamp OFF") {
     auto fixture = makeFixture("rx_shadow_gpu_depth_clamp_regression");
     if (!fixture.has_value()) {
         return;
@@ -1004,25 +1583,84 @@ TEST_CASE("Depth clamp regression: a caster crossing the light's near plane keep
         return;
     }
 
-    // A synthetic near-plane-crossing scenario: this scene's own
-    // fitShadowFrustum() call already pads the depth range by 2 world
-    // units, comfortably containing every real caster -- to exercise the
-    // clamp/no-clamp CONTRAST directly (per the gate's own required
-    // "regression variant... demonstrates the defect"), this probe reuses
-    // the SAME rig with depthClampEnableOverrideForTesting forced false,
-    // proving the override seam itself: the OFF variant's caster
-    // pipeline still builds and draws (a caster fully within the padded
-    // depth range is unaffected either way for THIS scene -- the
-    // assertion below is on the pipeline's own reported state, the
-    // mechanism this ticket's own acceptance criterion is about, not a
-    // pixel-level near-plane-clip repro this bounded ortho scene has no
-    // near-plane geometry to trigger).
-    auto clampOn = runProbe(*fixture, 4.0F, 3.0F, /*depthClampOverride=*/true);
-    auto clampOff = runProbe(*fixture, 4.0F, 3.0F, /*depthClampOverride=*/false);
+    // [Task 22 fix round, F2] buildClampTestGeometry()'s pole GENUINELY
+    // crosses the fitted near plane (worked out numerically against the
+    // real lightSpaceView()/fitShadowFrustum() formulas, not asserted --
+    // see that function's own header comment): the pole's base stays
+    // safely inside [near,far], but its top's light-space depth (~0.3 to
+    // 0.6) sits comfortably below the fitted near boundary (~1.33). This
+    // is the matrix's own required "regression variant with clamp
+    // disabled demonstrates the defect this setting fixes", not the
+    // pipeline-accessor-only check the earlier version of this test
+    // wrongly substituted for it.
+    auto clampOn = runClampRegressionProbe(*fixture, /*depthClampEnable=*/true);
+    auto clampOff = runClampRegressionProbe(*fixture, /*depthClampEnable=*/false);
     REQUIRE(clampOn.has_value());
     REQUIRE(clampOff.has_value());
     CHECK(clampOn->depthClampEnabled == true);
     CHECK(clampOff->depthClampEnabled == false);
+
+    const glm::mat4 cameraViewProj = topDownCameraViewProj();
+    // The pole's own TOP casts a ray landing near world (4.33, 0, 4.29)
+    // [worked out from kClampPoleHeight/kClampTestLightDir -- see
+    // buildClampTestGeometry()'s own header comment] -- reachable ONLY
+    // by the near-plane-crossing portion of the pole, i.e. only when
+    // that portion is preserved (clamped) rather than clipped away. This
+    // samples partway between the "clip point" (~3.79, 3.88, still cast
+    // by the surviving lower segment either way) and the true top-shadow
+    // point, comfortably inside the clamp-ON shadow and comfortably
+    // outside the clamp-OFF (truncated) one.
+    const PixelCoord farShadowPoint = worldToPixel(cameraViewProj, glm::vec3(4.2F, 0.0F, 4.15F), kExtent);
+    // The pole's own BASE footprint -- within [near,far] regardless of
+    // clamp -- must stay shadowed in BOTH variants, i.e. clamp does not
+    // spuriously remove or add shadow near the caster's own footprint,
+    // only at the far, near-plane-crossing reach.
+    const PixelCoord nearShadowPoint = worldToPixel(cameraViewProj, glm::vec3(kClampPoleX, 0.0F, kClampPoleZ), kExtent);
+    // A ground point on the OPPOSITE side of the pole from where its
+    // shadow travels (kClampTestLightDir's own +X/+Z push) -- never
+    // shadowed by this caster in either variant, an always-lit sanity
+    // baseline.
+    const PixelCoord unshadowedPoint = worldToPixel(cameraViewProj, glm::vec3(-2.0F, 0.0F, -0.5333F), kExtent);
+
+    REQUIRE(farShadowPoint.x >= 0);
+    REQUIRE(farShadowPoint.x < static_cast<int>(kExtent));
+    REQUIRE(farShadowPoint.y >= 0);
+    REQUIRE(farShadowPoint.y < static_cast<int>(kExtent));
+
+    const int farOn = redAt(*clampOn, farShadowPoint.x, farShadowPoint.y);
+    const int farOff = redAt(*clampOff, farShadowPoint.x, farShadowPoint.y);
+    const int nearOn = redAt(*clampOn, nearShadowPoint.x, nearShadowPoint.y);
+    const int nearOff = redAt(*clampOff, nearShadowPoint.x, nearShadowPoint.y);
+    const int refOn = redAt(*clampOn, unshadowedPoint.x, unshadowedPoint.y);
+    const int refOff = redAt(*clampOff, unshadowedPoint.x, unshadowedPoint.y);
+
+
+    CAPTURE(farOn);
+    CAPTURE(farOff);
+    CAPTURE(nearOn);
+    CAPTURE(nearOff);
+    CAPTURE(refOn);
+    CAPTURE(refOff);
+
+    // THE DEFECT AND ITS FIX, non-vacuously: the far reach of the shadow
+    // (only cast by the pole's near-plane-crossing top) is dark with
+    // clamp ON and measurably brighter -- i.e. the shadow is GONE --
+    // with clamp OFF, because that portion of the caster's geometry was
+    // near-plane clipped away instead of clamped.
+    CHECK(farOn < 96);
+    CHECK(farOff > farOn + 64);
+
+    // clamp-ON correctness: both the caster's own base-region shadow and
+    // its near-plane-crossing top's far shadow are present when clamp is
+    // enabled (the "full silhouette" the matrix's acceptance criterion
+    // describes), and the always-lit reference point stays lit.
+    CHECK(nearOn < 96);
+    CHECK(refOn > 160);
+
+    // The base-region shadow is NOT affected by clamp (only the
+    // crossing top is) -- both variants agree here.
+    CHECK(nearOff < 96);
+    CHECK(refOff > 160);
 
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
