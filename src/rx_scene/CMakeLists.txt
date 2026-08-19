@@ -15,11 +15,19 @@
 # PUBLIC link is still against the whole rx_asset target, since
 # RenderableDesc's own public fields need MeshHandle/MaterialHandle/AABB
 # from mesh_asset.h regardless.
+#
+# [Phase 4 Stage 2 Task 19] rx_task PUBLIC: DrawListBuilder::build()/
+# buildShadow()/recordDrawList() all take `rx::task::Scheduler&` directly
+# in their own public signatures (draw_list.h) -- the parallel AABB-cull
+# fan-out D15 requires. Still device-free (rx_task itself has no VkDevice
+# dependency -- it is a thin enkiTS wrapper, matching this library's own
+# "no VkDevice, no rx_rhi_vk" posture verbatim).
 add_library(rx_scene STATIC
     camera.cpp
     scene.cpp
+    draw_list.cpp
 )
 target_include_directories(rx_scene PUBLIC include)
-target_link_libraries(rx_scene PUBLIC rx_core rx_asset)
+target_link_libraries(rx_scene PUBLIC rx_core rx_asset rx_task)
 
 add_subdirectory(tests)

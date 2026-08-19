@@ -10,6 +10,7 @@ add_executable(rx_scene_tests
     camera_test.cpp
     scene_test.cpp
     thread_guard_test.cpp
+    draw_list_test.cpp
 )
 target_link_libraries(rx_scene_tests PRIVATE rx_scene doctest::doctest)
 add_test(NAME rx_scene_tests COMMAND rx_scene_tests)

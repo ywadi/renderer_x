@@ -233,6 +233,16 @@ std::span<const asset::MeshHandle> Scene::meshSpan() const {
     return mesh_;
 }
 
+std::span<const uint8_t> Scene::aliveSpan() const {
+    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::aliveSpan");
+    return alive_;
+}
+
+std::span<const uint32_t> Scene::generationsSpan() const {
+    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::generationsSpan");
+    return generation_;
+}
+
 // ---------------------------------------------------------------------
 // Lights
 // ---------------------------------------------------------------------

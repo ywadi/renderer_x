@@ -341,6 +341,28 @@ public:
     [[nodiscard]] std::span<const uint8_t> prioritySpan() const;
     [[nodiscard]] std::span<const asset::MeshHandle> meshSpan() const;
 
+    // [Task 19 addition, necessary -- see the task report] `aliveSpan()`
+    // (0/1 per slot, same uint8_t-not-vector<bool> convention as
+    // castsShadowsSpan() above) and `generationsSpan()` are the two pieces
+    // DrawListBuilder's bulk SoA culling loop needs that no existing
+    // accessor provides: every OTHER accessor above requires a full,
+    // correctly-generationed RenderableHandle (isRenderableAlive(handle),
+    // submeshMaterialOverrides(handle), ...), but a consumer iterating the
+    // span columns directly only ever has a bare SLOT INDEX, with no way
+    // to (a) know whether that slot is a live renderable or a
+    // destroyRenderable()d hole still holding its last occupant's stale
+    // column values (destroyRenderable() marks `alive_[idx] = false` but
+    // deliberately does NOT re-zero every other column -- see scene.cpp --
+    // so e.g. a freed slot's `layers_[idx]` cannot be used as an implicit
+    // "dead" sentinel), or (b) reconstruct a valid RenderableHandle(idx,
+    // generation) to call a per-handle accessor like
+    // submeshMaterialOverrides() for that slot. Both spans are read-only,
+    // additive, and follow the exact same "index i addresses the same
+    // underlying slot across every span" contract documented on this
+    // class's own SoA span-accessor block above.
+    [[nodiscard]] std::span<const uint8_t> aliveSpan() const;
+    [[nodiscard]] std::span<const uint32_t> generationsSpan() const;
+
     // --- Lights ----------------------------------------------------------
 
     // Main-thread-only (D5).
@@ -375,7 +397,11 @@ private:
 
     // --- Renderable SoA columns (index-parallel with generation_/alive_)
     std::vector<uint32_t> generation_;
-    std::vector<bool> alive_;  // internal bookkeeping only -- never span-exposed, see castsShadowsSpan()'s own comment
+    // [Task 19] uint8_t, not vector<bool> -- was internal-bookkeeping-only
+    // (comment now stale: aliveSpan() above spans it directly, so it needs
+    // the same contiguous-bool-as-uint8_t representation every other
+    // boolean column already uses, per castsShadowsSpan()'s own comment).
+    std::vector<uint8_t> alive_;
     std::vector<uint32_t> freeList_;
 
     std::vector<asset::MeshHandle> mesh_;
