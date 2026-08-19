@@ -280,6 +280,16 @@ copy_required "$STAGE_DIR/08_gltf_viewer/assets/DamagedHelmet/glTF" \
 # incorporates) apply, not plain CC BY as the original planning documents
 # assumed) -- written into the packaged asset's own directory so it travels
 # with the redistributed files rather than living only in a build script.
+#
+# [Fix round, item 4 -- coordinator ruling] This notice is the human-
+# readable SUMMARY only, not the whole legal grant -- a public release zip
+# ships the FULL legal texts too (fetched once from creativecommons.org and
+# vendored, committed, into this sample's own licenses/ directory --
+# licenses/CC-BY-4.0.txt / CC-BY-NC-4.0.txt -- rather than fetched at
+# package time, so packaging never gains a network dependency it did not
+# have before; a small, static legal document is exactly the kind of
+# third-party content this project already commits directly, unlike
+# assets/fetched/'s own large, versioned binary content).
 cat >"$STAGE_DIR/08_gltf_viewer/assets/DamagedHelmet/LICENSE.txt" <<'RX_DAMAGED_HELMET_LICENSE'
 DamagedHelmet -- CC-BY-4.0 AND CC-BY-NC-4.0
 
@@ -290,9 +300,13 @@ DamagedHelmet -- CC-BY-4.0 AND CC-BY-NC-4.0
 
 The combination of these two licenses means the whole asset carries the
 Non-Commercial restriction forward (CC-BY-NC-4.0), not a plain CC BY grant.
-See the license texts at https://creativecommons.org/licenses/by/4.0/ and
-https://creativecommons.org/licenses/by-nc/4.0/ for the full terms.
+The full legal text of both licenses is bundled alongside this file:
+CC-BY-4.0.txt and CC-BY-NC-4.0.txt (fetched verbatim from
+creativecommons.org/licenses/{by,by-nc}/4.0/legalcode.txt).
 RX_DAMAGED_HELMET_LICENSE
+copy_required "$STAGE_DIR/08_gltf_viewer/assets/DamagedHelmet" \
+  "$REPO_ROOT/samples/08_gltf_viewer/licenses/CC-BY-4.0.txt" \
+  "$REPO_ROOT/samples/08_gltf_viewer/licenses/CC-BY-NC-4.0.txt"
 
 mkdir -p "$(dirname "$RX_OUT_ZIP")"
 RX_OUT_ZIP_ABS="$(cd "$(dirname "$RX_OUT_ZIP")" && pwd)/$(basename "$RX_OUT_ZIP")"

@@ -767,12 +767,17 @@ content: `tools/fetch_assets.sh`'s own DamagedHelmet download is pre-staged
 into `assets/DamagedHelmet/glTF/` next to the binary (this sample's own
 `resolveDefaultScenePath()` looks there first, falling back to this
 repository's own `assets/fetched/` copy only for an unpackaged build-tree
-run), together with that asset's own dual CC-BY-4.0/CC-BY-NC-4.0
-attribution text (`assets/DamagedHelmet/LICENSE.txt` — see
-`tools/fetch_assets.sh`'s own header comment for the verified license
-finding). Verified directly: this sample's packaged `.zip` output, unzipped
-to a directory outside the build tree entirely, passes its own headless
-gate unmodified.
+run), together with that asset's own dual CC-BY-4.0/CC-BY-NC-4.0 attribution
+notice (`assets/DamagedHelmet/LICENSE.txt` — see `tools/fetch_assets.sh`'s
+own header comment for the verified license finding) **and the full legal
+text of both licenses** (`assets/DamagedHelmet/CC-BY-4.0.txt` /
+`CC-BY-NC-4.0.txt`, vendored verbatim from creativecommons.org into
+`samples/08_gltf_viewer/licenses/` and copied in by `tools/
+package_samples.sh` — the notice is a human-readable summary, not a
+substitute for the actual grant). Verified directly: this sample's
+packaged `.zip` output, unzipped to a directory outside the build tree
+entirely, passes its own headless gate unmodified, and both license texts
+extract byte-identical to their vendored source.
 
 ## Building and running
 
