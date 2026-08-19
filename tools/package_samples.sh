@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Packages this project's eight sample binaries into a single per-platform
+# Packages this project's nine sample binaries into a single per-platform
 # .zip laid out exactly as a user would unzip-and-run it: one subdirectory
 # per sample, containing that sample's binary plus everything IT needs to
 # run standalone -- nothing more, nothing missing [R:D2].
@@ -77,6 +77,24 @@
 #                     header comment covers the exact same dual-license
 #                     finding; this script prints/writes the identical
 #                     attribution, not a fresh derivation of it).
+#   09_scene          binary + material_shaders/ (material.slang/
+#                     forward_entry.slang/standard_pbr.slang/unlit.slang,
+#                     same convention as 08) + shadow_shaders/
+#                     (shaders/shadow/shadow_caster.vert.slang -- this
+#                     sample's own first runtime-deployed consumer of
+#                     rx_shadow's shader) + tonemap.vert.slang/
+#                     tonemap.frag.slang (flat, same convention as 05/07/08)
+#                     + references/ (grid_scene.png, this sample's own D17
+#                     committed lavapipe reference) + Slang runtime libs +
+#                     LICENSE + a PRE-STAGED copy of the DamagedHelmet glTF
+#                     asset (this sample's own default scene, same
+#                     packaged-first lookup convention as 08's
+#                     resolveHelmetScenePath()) plus its own dual
+#                     CC-BY-4.0/CC-BY-NC-4.0 attribution text -- the SAME
+#                     asset 08 already stages, staged again here since each
+#                     sample's own packaged subdirectory is self-contained
+#                     (no cross-sample sharing in the redistribution
+#                     layout).
 #
 # This script does NOT build anything -- it assumes `cmake --build
 # --preset <preset>` already ran and each sample's build-output directory
@@ -169,7 +187,7 @@ copy_required "$SAMPLE_DIR" \
 # hardcoded to the pinned version string, same posture as
 # rx_shader_deploy_runtime_libs() in src/rx_shader/CMakeLists.txt: Linux
 # filenames embed the Slang version, Windows filenames don't [R:A1/A6/D2].
-for RX_SAMPLE in 02_hotreload 03_bindless_mesh 04_streaming 05_multipass 06_materials 07_stress 08_gltf_viewer; do
+for RX_SAMPLE in 02_hotreload 03_bindless_mesh 04_streaming 05_multipass 06_materials 07_stress 08_gltf_viewer 09_scene; do
   SAMPLE_DIR="$STAGE_DIR/$RX_SAMPLE"
   mkdir -p "$SAMPLE_DIR"
   copy_required "$SAMPLE_DIR" "$SAMPLES_BUILD_DIR/$RX_SAMPLE/sample_${RX_SAMPLE}${RX_EXE_SUFFIX}"
@@ -308,12 +326,60 @@ copy_required "$STAGE_DIR/08_gltf_viewer/assets/DamagedHelmet" \
   "$REPO_ROOT/samples/08_gltf_viewer/licenses/CC-BY-4.0.txt" \
   "$REPO_ROOT/samples/08_gltf_viewer/licenses/CC-BY-NC-4.0.txt"
 
+# 09_scene: material_shaders/ (rx_material's shared files + D22's
+# StandardPBR/Unlit pair, same as 08) + shadow_shaders/ (rx_shadow's own
+# shadow_caster.vert.slang) + the shared tonemap shaders (flat) + this
+# sample's own D17 reference PNG -- see this script's own header comment.
+mkdir -p "$STAGE_DIR/09_scene/material_shaders" "$STAGE_DIR/09_scene/shadow_shaders" "$STAGE_DIR/09_scene/references"
+copy_required "$STAGE_DIR/09_scene/material_shaders" \
+  "$SAMPLES_BUILD_DIR/09_scene/material_shaders/material.slang" \
+  "$SAMPLES_BUILD_DIR/09_scene/material_shaders/forward_entry.slang" \
+  "$SAMPLES_BUILD_DIR/09_scene/material_shaders/standard_pbr.slang" \
+  "$SAMPLES_BUILD_DIR/09_scene/material_shaders/unlit.slang"
+copy_required "$STAGE_DIR/09_scene/shadow_shaders" \
+  "$SAMPLES_BUILD_DIR/09_scene/shadow_shaders/shadow_caster.vert.slang"
+copy_required "$STAGE_DIR/09_scene" \
+  "$SAMPLES_BUILD_DIR/09_scene/tonemap.vert.slang" \
+  "$SAMPLES_BUILD_DIR/09_scene/tonemap.frag.slang"
+copy_required "$STAGE_DIR/09_scene/references" \
+  "$SAMPLES_BUILD_DIR/09_scene/references/grid_scene.png"
+
+# 09_scene's own default scene asset -- the SAME pre-staged DamagedHelmet
+# copy 08 ships, staged again here (each packaged sample subdirectory is
+# self-contained -- see this script's own header comment).
+mkdir -p "$STAGE_DIR/09_scene/assets/DamagedHelmet/glTF"
+copy_required "$STAGE_DIR/09_scene/assets/DamagedHelmet/glTF" \
+  "$DAMAGED_HELMET_SRC/DamagedHelmet.gltf" \
+  "$DAMAGED_HELMET_SRC/DamagedHelmet.bin" \
+  "$DAMAGED_HELMET_SRC/Default_albedo.jpg" \
+  "$DAMAGED_HELMET_SRC/Default_AO.jpg" \
+  "$DAMAGED_HELMET_SRC/Default_emissive.jpg" \
+  "$DAMAGED_HELMET_SRC/Default_metalRoughness.jpg" \
+  "$DAMAGED_HELMET_SRC/Default_normal.jpg"
+cat >"$STAGE_DIR/09_scene/assets/DamagedHelmet/LICENSE.txt" <<'RX_DAMAGED_HELMET_LICENSE'
+DamagedHelmet -- CC-BY-4.0 AND CC-BY-NC-4.0
+
+  (c) 2018 ctxwing (rebuild and glTF conversion, CC-BY-4.0)
+  (c) 2016 theblueturtle_ (earlier model, CC-BY-NC-4.0)
+
+  Source: https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/DamagedHelmet
+
+The combination of these two licenses means the whole asset carries the
+Non-Commercial restriction forward (CC-BY-NC-4.0), not a plain CC BY grant.
+The full legal text of both licenses is bundled alongside this file:
+CC-BY-4.0.txt and CC-BY-NC-4.0.txt (fetched verbatim from
+creativecommons.org/licenses/{by,by-nc}/4.0/legalcode.txt).
+RX_DAMAGED_HELMET_LICENSE
+copy_required "$STAGE_DIR/09_scene/assets/DamagedHelmet" \
+  "$REPO_ROOT/samples/09_scene/licenses/CC-BY-4.0.txt" \
+  "$REPO_ROOT/samples/09_scene/licenses/CC-BY-NC-4.0.txt"
+
 mkdir -p "$(dirname "$RX_OUT_ZIP")"
 RX_OUT_ZIP_ABS="$(cd "$(dirname "$RX_OUT_ZIP")" && pwd)/$(basename "$RX_OUT_ZIP")"
 rm -f "$RX_OUT_ZIP_ABS"
 
 echo "package_samples: zipping into '$RX_OUT_ZIP_ABS' ..."
-(cd "$STAGE_DIR" && zip -r -X -q "$RX_OUT_ZIP_ABS" 01_triangle 02_hotreload 03_bindless_mesh 04_streaming 05_multipass 06_materials 07_stress 08_gltf_viewer)
+(cd "$STAGE_DIR" && zip -r -X -q "$RX_OUT_ZIP_ABS" 01_triangle 02_hotreload 03_bindless_mesh 04_streaming 05_multipass 06_materials 07_stress 08_gltf_viewer 09_scene)
 
 echo "package_samples: done. Contents:"
 unzip -l "$RX_OUT_ZIP_ABS"
