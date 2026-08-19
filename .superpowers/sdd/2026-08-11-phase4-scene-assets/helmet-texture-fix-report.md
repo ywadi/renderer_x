@@ -551,3 +551,136 @@ push):
   (SDD workspace artifact, not production code).
 
 No board/plan/spec/ledger file was edited by this fix round.
+
+---
+
+## 11. ROUND 2 (independent review response)
+
+Independent review (`helmet-fix-review.md`, scope: commits `715681b`,
+`2f584c4`, `787f978`) verdict: **spec PASS, code quality Approved**, with
+one Important and three Minor findings, none blocking. Per this project's
+"no deferrals, close all findings in-round" policy, the two findings
+assigned to this implementer are closed here; the review's own
+worktree-fallback closure (Concern 1) and the pre-existing `gltf_gpu`
+flake (Concern 3, tracked separately by the coordinator) needed no further
+action from this round.
+
+### 11.1 [Important] StandardPbr-level per-slot sampler coverage gap — CLOSED
+
+**The gap, precisely**: the round-1 regression test
+(`texture_cache_test.cpp`, "Sampler-wrap regression...") proves
+`TextureCache::getOrCreateSamplerBindlessIndex()` builds and registers the
+correct `VkSampler` for a given glTF sampler object — the sampler-
+creation/resolution layer — but samples it through a raw bindless test
+shader, never through the actual shipped `standard_pbr.slang`/
+`StandardPbrParams`. A future bug in how a caller maps each slot's own
+resolved sampler index into the *correct* named `gParams` field (e.g.
+`setupMaterials()` accidentally writing `metallicRoughnessSampler`'s
+resolved value into `normalSampler`) would not have been caught by any
+test below the coarse, whole-image D17 pixel gate.
+
+**Closure**: a new GPU `TEST_CASE` in
+`src/rx_material/tests/test_standard_pbr_unlit.cpp` ("StandardPBR
+per-slot sampler wiring: ..."), through the real
+`MaterialSystem`/`standard_pbr.slang`/`StandardPbrParams` path:
+
+- One 1x2 "striped" texture (top texel RED, bottom texel BLUE) bound to
+  BOTH `baseColorTexture` and `emissiveTexture`.
+- Sampled at the IDENTICAL out-of-`[0,1]` UV (`V=1.125`, reached via the
+  same `KHR_texture_transform` offset/scale mechanism the neighboring
+  "KHR_texture_transform..." `TEST_CASE` already proves works — a texel-
+  center-exact coordinate, filter-mode-independent, matching the round-1
+  test's own discipline) through TWO DIFFERENT real samplers:
+  `baseColorSampler=REPEAT`, `emissiveSampler=CLAMP_TO_EDGE` — "distinct
+  wrap modes on different slots of one material," per the review's own
+  requested shape.
+- **Isolation, no BRDF entanglement**: `ambientColor=(1,1,1)` +
+  `lightColor=(0,0,0)` makes `directLight` identically zero
+  (`standard_pbr.slang`'s own `directLight = (diffuse+specular) *
+  v.lightColor * NdotL` — a zero `lightColor` factor zeroes it
+  unconditionally, regardless of geometry/metallic/roughness), so `color
+  = ambient + emissive = ambientColor*occlusion*baseColor.rgb +
+  emissiveFactor*emissiveSample` exactly (`occlusion==1.0` via the rig's
+  own default white occlusion texture, the same fact this file's own "FG1
+  ambient closed-form" `TEST_CASE` already relies on). Two draws each zero
+  the OTHER term via its own `*Factor`, so each draw's final pixel is a
+  direct, unblended read of exactly one slot's own sampled texel — since
+  both slots read the SAME texture at the SAME coordinate, the only thing
+  that can make their results differ is which sampler each slot's own
+  shader code actually names.
+- Since both slots read the same texture at the same coordinate, the
+  discriminating assertions are: `baseColorPixel` reads RED
+  (`baseColorSampler=REPEAT`: `frac(1.125)=0.125`, row 0); `emissivePixel`
+  reads BLUE (`emissiveSampler=CLAMP_TO_EDGE`: clamps to `1.0`, row 1 — the
+  edge texel, same reasoning as the round-1 test).
+- `BindlessTable::Capacities::samplers` in this file's shared `makeFixture()`
+  bumped `2 -> 4` (empirically required: the rig's own default sampler
+  plus this test's two new ones is 3 live samplers, exceeding the old
+  capacity of 2 — hit directly as a `registerSampler` capacity-exhausted
+  rejection before the fix). Purely permissive for every other `TEST_CASE`
+  in the file (none registers more than 1 sampler).
+- Explicit teardown added (`vkDestroySampler` for both new raw samplers,
+  before `destroyRig()`) — the first version of this test leaked them,
+  caught directly by this project's own teardown-time validation-error
+  gate (`VUID-vkDestroyDevice-device-00378`) before being fixed.
+
+**Revert-test evidence (mandatory, same rigor as round 1, done in a
+genuine scratch worktree this time)**: per the review's own FYI (symlink
+`toolchain/`/`.deps-cache`/`third_party/slang-prebuilt` into a scratch
+worktree — the convention already visible in this repo's own sibling
+agent worktrees under `.claude/worktrees/`), `git worktree add` at
+`026186f` (round 2's own commit, below) configured and built
+`rx_material_gpu_tests` clean on the first attempt — no toolchain issue
+this time.
+
+1. **Fixed code** (`026186f`): `rx_material_gpu_tests
+   --test-case="StandardPBR per-slot sampler wiring*"` → **1/1 test case,
+   114/114 assertions, SUCCESS**.
+2. **Field-swap revert** (in the scratch worktree only, never committed):
+   `makeBlob(repeatSampler, clampSampler, ...)` at both call sites edited
+   to `makeBlob(clampSampler, repeatSampler, ...)` — swapping exactly
+   which resolved sampler value feeds which named field, simulating the
+   precise "`setupMaterials()` wrote the wrong resolved index into the
+   wrong slot" bug class this test exists to catch. Same test → **1/1
+   test case FAILED, 110/114 assertions passed, 4 FAILED**:
+   `baseColorPixel` read `(0, _, 255)` (BLUE, was RED — `r>200` and
+   `b<50` both failed) and `emissivePixel` read `(255, _, 0)` (RED, was
+   BLUE — `b>200` and `r<50` both failed) — the exact inversion predicted.
+3. Worktree removed (`git worktree remove --force` + branch deleted); main
+   tree confirmed untouched throughout (`git diff --stat` on the real
+   source file, empty).
+
+### 11.2 [Minor] `renderCustomQuadAndReadbackQuadrants()` duplication — CLOSED
+
+`texture_cache_test.cpp`'s `renderAndReadbackQuadrants()` gained one
+defaulted trailing parameter, `const std::array<QuadVertex, 4>& vertices
+= kQuadVertices` — every pre-existing caller (7 call sites across 5
+`TEST_CASE`s) compiles and behaves byte-identically without passing it.
+The near-identical duplicate function (`renderCustomQuadAndReadbackQuadrants()`,
+~90 lines) and its one call site (the round-1 sampler-wrap regression
+test) are removed; that call site now passes its own custom vertex arrays
+as the new trailing argument to the single shared function. Net: -201/+that
+same body once, not twice (see the round-2 commit's own diffstat).
+
+### 11.3 Verification (round 2)
+
+- `rx_material_gpu_tests`: **50/50, 2379/2379** (was 49/49, 2265/2265 —
+  +1 case/+114 assertions for the new coverage test; zero regressions in
+  the other 49).
+- `rx_asset_tests`: **33/33, 564/564** (unchanged — the dedup is
+  behavior-preserving by construction, confirmed).
+- Zero unfiltered Vulkan validation errors (including the sampler-leak
+  teardown error caught and fixed during this round's own development,
+  before commit).
+- Full serial `ctest --preset linux-native -j1`: **22/22 passed**
+  (86.34s).
+- `windows-cross-zig`: incremental build (9 targets touched) succeeds
+  clean; full serial `ctest --preset windows-cross-zig -j1` under Wine:
+  **22/22 passed** (139.32s).
+
+### 11.4 Files touched (round 2)
+
+Pathspec-scoped commit `026186f` (author = local git config, no AI
+attribution, no push): `src/rx_material/tests/test_standard_pbr_unlit.cpp`,
+`src/rx_asset/tests/texture_cache_test.cpp`. This addendum section:
+`helmet-texture-fix-report.md`. No board/plan/spec/ledger file edited.
