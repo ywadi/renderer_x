@@ -340,23 +340,49 @@ jobs:
           path: stress-numbers.txt
           if-no-files-found: error
 
+      # Phase 4 Stage 2 Task 24 [gate ruling #15, matrix row 23]:
+      # sample_09_scene's own `--stress` mode through the FULL scene path --
+      # same two-tier treatment as sample 07 above (the ctest-registered
+      # sample_09_scene_stress_headless gate, already run as part of the
+      # Test step, asserts COUNTERS only at a small --stress-draws value;
+      # this is the SEPARATE, non-blocking wall-clock step at the real
+      # 30000-instance default). Published as its OWN stress-v2-numbers.txt
+      # artifact, alongside (never replacing) sample 07's own
+      # stress-numbers.txt -- the A/B comparability contract's own "sample
+      # 07's report format stays untouched" instruction.
+      - name: Stress-v2 sample wall-clock numbers (published, non-blocking)
+        run: >-
+          { echo "=== sample_09_scene --stress --stress-draws 30000 --threads 1 (single-thread baseline) ===";
+            xvfb-run -a build/linux-native/samples/09_scene/sample_09_scene --stress --stress-draws 30000 --threads 1;
+            echo;
+            echo "=== sample_09_scene --stress --stress-draws 30000 (default worker count) ===";
+            xvfb-run -a build/linux-native/samples/09_scene/sample_09_scene --stress --stress-draws 30000; } | tee stress-v2-numbers.txt
+
+      - name: Upload stress-v2 numbers artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: stress-v2-numbers
+          path: stress-v2-numbers.txt
+          if-no-files-found: error
+
       # Real incremental-rebuild timing, not a no-op: tools/check_build_budget.sh
       # touches src/rx_core/src/log.cpp itself before timing.
       - name: Build budget check
         run: tools/check_build_budget.sh linux-native 60
 
-      # Packages all eight samples into the exact unzip-and-run layout a user
+      # Packages all nine samples into the exact unzip-and-run layout a user
       # gets [R:D2]: one subdirectory per sample with that sample's binary
       # plus everything IT needs (01_triangle: just its two precompiled
-      # .spv files, no Slang libs; 02/03/04/05/06/07/08: the Slang runtime
-      # libs + LICENSE deployed next to each at build time, plus 02's
-      # hotreload.slang / 03's texture.png / 05's six on-disk shader
+      # .spv files, no Slang libs; 02/03/04/05/06/07/08/09: the Slang
+      # runtime libs + LICENSE deployed next to each at build time, plus
+      # 02's hotreload.slang / 03's texture.png / 05's six on-disk shader
       # sources / 06's materials/+material_shaders/ subdirectories / 07's
       # four on-disk shader sources / 08's material_shaders/+references/
       # subdirectories plus a pre-staged DamagedHelmet asset + its own
-      # dual-license attribution text). See
-      # tools/package_samples.sh for the full per-sample manifest and why
-      # each file is there.
+      # dual-license attribution text / 09's material_shaders/+
+      # shadow_shaders/+references/ subdirectories plus the same pre-staged
+      # DamagedHelmet asset). See tools/package_samples.sh for the full
+      # per-sample manifest and why each file is there.
       - name: Package samples for redistribution
         run: tools/package_samples.sh linux-native linux-x86_64 rendererx-samples-linux-x86_64.zip
 
