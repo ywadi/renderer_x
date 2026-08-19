@@ -79,7 +79,9 @@ struct TcTestFixture {
     std::unique_ptr<TextureCache> cache;
 };
 
-std::optional<TcTestFixture> makeFixture(const char* title) {
+std::optional<TcTestFixture> makeFixture(
+    const char* title,
+    rx::rhi::BindlessTable::Capacities capacities = {/*sampledImages=*/64, /*samplers=*/8, /*storageBuffers=*/1}) {
     auto window = rx::platform::Window::create(title, 64, 64, /*visible=*/false);
     if (!window.has_value()) {
         MESSAGE("no display backend available, skipping TextureCache test");
@@ -101,7 +103,11 @@ std::optional<TcTestFixture> makeFixture(const char* title) {
     auto uploader = rx::rhi::Uploader::create(*allocator, *device);
     REQUIRE(uploader.has_value());
 
-    rx::rhi::BindlessTable::Capacities capacities{/*sampledImages=*/64, /*samplers=*/8, /*storageBuffers=*/1};
+    // `capacities` defaults to the pre-existing hardcoded value every
+    // TEST_CASE in this file relied on before this parameter existed --
+    // byte-identical behavior for every caller that doesn't pass one
+    // explicitly. [Fix round, Finding H1(b)] The capacity-exhaustion
+    // regression TEST_CASE below is the one caller that does.
     auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
     REQUIRE(bindless.has_value());
 
@@ -822,6 +828,67 @@ TEST_CASE("TextureCache: a real JPEG loads via stb to a real, non-fallback textu
     TextureHandle handle = fixture->cache->load(fixturePath("quadrant.jpg"), TextureRole::BaseColor);
     REQUIRE(handle.isValid());
     CHECK_FALSE(fixture->cache->resolve(handle).isFallback);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// ===== Bindless capacity exhaustion (fix round, Finding H1(b)) ==============
+//
+// An independent review of samples/09_scene fetched real Sponza content
+// (~25 materials) against that sample's own too-small BindlessTable
+// (sampledImages=64) and reproduced a genuine crash: registerRealTexture()
+// (texture_cache.cpp) already calls Uploader::uploadImageMips() -- which
+// RECORDS real GPU commands referencing the new Texture2D's own VkImage --
+// BEFORE attempting BindlessTable::registerSampledImage(); when THAT call
+// fails (capacity exhausted), the function returned immediately, letting
+// the local Texture2D's destructor destroy a VkImage its own
+// already-recorded (not yet flushed/awaited) upload commands still
+// reference -- "UNASSIGNED-CoreValidation-DrawState-InvalidCommandBuffer-
+// VkImage: ... bound VkImage ... was destroyed", then a segfault. No
+// earlier test ever drove bindless sampled-image capacity to genuine
+// exhaustion during a real registerRealTexture() call, so this path had
+// never been exercised. This TEST_CASE reproduces the exact failure mode
+// in isolation (no Sponza/network fetch needed): a fixture whose
+// sampledImages capacity is EXACTLY the D11 fallback-texture count (4:
+// checkerboard + white + flat-normal + neutral-MR, see
+// buildFallbackTextures()'s own comment) -- TextureCache::create() itself
+// must still succeed (it consumes exactly 4, zero spare), but the very
+// NEXT real texture load is guaranteed to hit
+// BindlessTable::registerSampledImage()'s own capacity-exhaustion
+// rejection deterministically, every run, on any device.
+TEST_CASE("TextureCache: bindless sampled-image capacity exhaustion at registerRealTexture() -- checkerboard "
+          "fallback, no crash, zero validation errors [fix round, Finding H1(b), independent review of #15]") {
+    rx::rhi::BindlessTable::Capacities tightCapacities{/*sampledImages=*/4, /*samplers=*/8, /*storageBuffers=*/1};
+    auto fixture = makeFixture("rx_asset_tc_capexhaust", tightCapacities);
+    if (!fixture.has_value()) {
+        return;
+    }
+    // TextureCache::create() -> buildFallbackTextures() consumes exactly 4
+    // sampled-image slots (checkerboard + white + flat-normal +
+    // neutral-MR) -- this must still succeed against a capacity of
+    // exactly 4, proving the fixture itself is sized precisely, not
+    // accidentally too small to even construct a cache.
+    makeCache(*fixture);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+
+    // The 5th sampled-image registration attempt: capacity is already
+    // fully, deterministically exhausted. Before the fix, this crashed
+    // (destroy-while-upload-commands-still-reference-the-image); after
+    // the fix, registerRealTexture() flushes+awaits the already-recorded
+    // upload commands before the doomed Texture2D is destroyed, and
+    // load() falls back to the checkerboard handle via its own
+    // established failure-path convention (same as every other
+    // load-failure TEST_CASE above).
+    TextureHandle handle = fixture->cache->load(fixturePath("quadrant.png"), TextureRole::BaseColor);
+    CHECK(handle == fixture->cache->checkerboardHandle());
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+
+    // A SECOND exhausted-capacity load, immediately after the first --
+    // proves the fix doesn't merely survive ONE failure by accident (e.g.
+    // some residual GPU idle state from fixture construction happening to
+    // paper over the hazard) but genuinely leaves the Uploader/BindlessTable
+    // in a consistent, reusable state.
+    TextureHandle secondHandle = fixture->cache->load(fixturePath("quadrant.jpg"), TextureRole::Normal);
+    CHECK(secondHandle == fixture->cache->checkerboardHandle());
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 

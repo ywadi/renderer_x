@@ -200,6 +200,20 @@ TextureHandle TextureCache::registerRealTexture(TextureRole role, VkFormat forma
     if (!uploader_.uploadImageMips(*texture, uploadLevels)) {
         RX_LOG_ERROR("rx_asset: TextureCache: Uploader::uploadImageMips failed ({}x{}, {} levels)", width, height,
                      uploadLevels.size());
+        // [Fix round, Finding H1(b)] `uploadImageMips()` may already have
+        // recorded partial GPU commands referencing `texture`'s own VkImage
+        // before reporting failure -- ensure they are flushed and their
+        // completion awaited before this scope's own destructor destroys
+        // that image at the `return` below, matching this SAME class's own
+        // established "flush()+wait() before an upload-recorded resource
+        // is safe to destroy" precedent (see uploadFallbacks()'s own header
+        // comment, above, which names the identical validation error --
+        // UNASSIGNED-CoreValidation-DrawState-InvalidCommandBuffer-VkImage,
+        // "bound VkImage ... was destroyed" -- this exact omission
+        // reproduces on this branch too). `flush()`/`wait()` are both
+        // no-ops-but-safe when nothing was actually recorded (Uploader's
+        // own documented "trivially-complete ticket" contract).
+        uploader_.wait(uploader_.flush());
         return TextureHandle{};
     }
 
@@ -207,6 +221,15 @@ TextureHandle TextureCache::registerRealTexture(TextureRole role, VkFormat forma
         bindless_.registerSampledImage(texture->view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     if (!bindlessHandle.isValid()) {
         RX_LOG_ERROR("rx_asset: TextureCache: BindlessTable::registerSampledImage failed (capacity exhausted?)");
+        // [Fix round, Finding H1(b) -- the defect an independent review
+        // reproduced against real Sponza content, capacity-exhaustion
+        // mid-import] `uploadImageMips()` above already succeeded on this
+        // branch, meaning `texture`'s own upload commands are DEFINITELY
+        // recorded -- the SAME reasoning as the branch above applies with
+        // even more force here (this is the branch that actually crashed):
+        // flush()+wait() before `texture`'s destructor runs at `return`,
+        // never destroy-while-possibly-in-flight.
+        uploader_.wait(uploader_.flush());
         return TextureHandle{};
     }
 
