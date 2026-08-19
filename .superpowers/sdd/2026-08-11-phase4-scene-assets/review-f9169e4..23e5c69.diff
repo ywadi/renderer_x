@@ -1,0 +1,1695 @@
+# Review package: f9169e4..23e5c69
+
+## Commits
+23e5c69 docs: Task 23 report -- executor allocation elimination per-criterion proof, revert evidence
+1197d7b perf(rx_graph): eliminate Executor::execute()'s per-frame heap allocations (#29)
+477a511 perf(rx_rhi_vk): compact DeletionQueue::onFrameFenceSignaled in place (#29)
+
+## Files changed
+ .../task-23-report.md                              | 284 ++++++++++++++++
+ src/rx_graph/executor.cpp                          | 361 +++++++++++++++++++--
+ src/rx_graph/include/rx_graph/executor.h           |  66 ++++
+ src/rx_graph/tests/test_execute_gpu.cpp            | 243 ++++++++++++++
+ src/rx_rhi_vk/include/rx_rhi_vk/deletion_queue.h   |  42 +++
+ src/rx_rhi_vk/src/deletion_queue.cpp               |  53 ++-
+ src/rx_rhi_vk/tests/deletion_queue_test.cpp        |  66 ++++
+ 7 files changed, 1074 insertions(+), 41 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-23-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-23-report.md
+new file mode 100644
+index 0000000..0ff27da
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-23-report.md
+@@ -0,0 +1,284 @@
++# Task 23 report — Executor per-frame allocation elimination (card #29)
++
++BASE=f9169e4. Order of authority followed: rulings-2026-08-18.md §#29 >
++task-23-brief.md > gate/matrix-issue29-executor-allocations.md > `gh issue
++view 29`.
++
++## Per-criterion proof
++
++### Criterion 1 — `execute()` performs zero heap allocations in steady state
++
++Methodology (bound by ruling): capacity-snapshot via a test-only accessor
++(`rx::graph::detail::allocationCapacitiesForTesting`), **not** global
++operator-new interposition — this project's `rx_graph_gpu_tests` /
++`rx_rhi_vk_tests` binaries link volk, the Vulkan validation layers, and (via
++`rx_shader_deploy_runtime_libs`) Slang's runtime, matching the ruling's own
++stated linkage-risk reasoning.
++
++New GPU test: `src/rx_graph/tests/test_execute_gpu.cpp`, `"Executor::execute
++performs zero heap allocations in steady state..."`. Graph: `produce`
++(AsyncCompute storage-buffer producer), `fillWhole` (whole-pass color
++output), `probe` (bare pass resolving two real names via `PassContext`),
++`fillChunked` (chunked pass into the backbuffer) — one instance of every
++site this task touched, in one frame. 4 warm-up `execute()` calls, then 10
++further steady-state calls, snapshotting `.capacity()` **and** `.data()`
++pointer identity of every Impl-persistent buffer before/after each. All
++`CHECK`s pass; `rx_graph_gpu_tests` green both presets.
++
++### Criterion 2 — sites 1-4 (per-execute tracking, incl. the two maps)
++
++`firstBarrierSeen`/`attachmentEverWritten` → `Executor::Impl`-persistent
++`std::vector<bool>`, `.assign(resources.size(), false)` at the top of every
++`execute()` call. `finalStageThisExecute`/`finalAccessThisExecute` →
++`Executor::Impl`-persistent `std::vector<VkPipelineStageFlags2>`/
++`std::vector<VkAccessFlags2>`, dense-indexed by `physicalIndex` (no hashing
++needed — matrix's own point). A new `touchedThisExecute` `std::vector<bool>`
++replaces the two old maps' implicit "key present" signal, load-bearing for
++`TransientPool::sweepStale()`'s "only a genuinely-accessed-this-call
++resource looks freshly used" contract (`executor.cpp:1482-1508`).
++
++### Criterion 3 — sites 5-8 (per-pass scratch, barrier vectors)
++
++`colorPhysIdx`/`colorAttachments` (`executor.cpp` per-pass loop) and
++`vkImageBarriers`/`vkBufferBarriers` (`applyBarriers()`) all became
++`Executor::Impl`-persistent, `.clear()`d at the top of their own scope,
++referenced via a local `&` alias at each call site to minimize the diff
++against the surrounding logic (unchanged).
++
++### Criterion 4 — site 9 (debug-label string)
++
++`beginDebugLabel()` now writes into `Impl::debugLabelScratch`
++(`std::vector<char>`, `.resize(name.size()+1)` + `memcpy` + manual null
++terminator) instead of constructing a `std::string` per pass.
++
++### Criterion 5 — sites 10-11 (chunk command-buffer vectors)
++
++`chunkBuffers`/`validChunkBuffers` in `recordChunkedPass()` →
++`Impl::chunkBuffersScratch[frameSlot]`/`validChunkBuffersScratch[frameSlot]`,
++frame-slot indexed (`std::array<..., rx::rhi::FrameSync::kFramesInFlight>`)
++per the ruling's explicit instruction ("per-frame-slot, since chunked
++recording is concurrent with other frame-in-flight state") — a defensive
++match for `ChunkCommandPool`'s own `[frameSlot]` shape, even though every
++in-tree caller only ever has one `recordChunkedPass()` call active at a
++time (documented in the field comment).
++
++### Criterion 6 — site 12 (`nameToIndex` transparent lookup)
++
++`Executor::Impl::nameToIndex` is now
++`std::unordered_map<std::string, uint32_t, TransparentStringHash,
++std::equal_to<>>`. `TransparentStringHash` has **one** overload
++(`operator()(std::string_view)`), so every key — real `std::string` (via
++implicit conversion) or a heterogeneous `std::string_view` lookup — hashes
++through the identical call; this is **stronger** than the matrix's own
++proposed shape (two separate `std::hash` specializations relying on
++cross-type hash-equivalence) — see Deviations.
++
++`lookupResolvedIndex()` now calls `impl.nameToIndex.find(name)` directly,
++no `std::string(name)` temporary. Regression-guard is **compile-time**, not
++merely test-observed: `std::string_view` has no implicit conversion to
++`std::string` (that constructor is `explicit`, C++17 [string.cons]), so a
++future edit that silently reverted `nameToIndex`'s type back to
++non-transparent would make this exact call **fail to compile**, not
++silently reintroduce the allocation. New correctness test: `"PassContext
++resolvers: nameToIndex's transparent string_view lookup resolves a real
++name (hit) and throws std::out_of_range naming a nonexistent one (miss)"`
++(`test_execute_gpu.cpp`).
++
++### Criterion 7 — hidden site found in-task: `combineAccessesByResource()`
++
++Not one of the ticket's 7 named sites: this free function returned a fresh
++`std::vector<std::pair<uint32_t, CombinedAccess>>` by value, called TWICE
++per pass every `execute()` call (from `synthesizeFirstUseBufferBarrierIfNeeded()`
++and from `execute()`'s own per-pass union step) — squarely inside
++`execute()`'s call graph. Per CLAUDE.md's "no deferred fixes" rule, fixed
++in-round: now takes an out-parameter, backed by
++`Impl::combinedAccessScratch`.
++
++### Criterion 8 — `DeletionQueue::onFrameFenceSignaled` (ruling: scope grows)
++
++`src/rx_rhi_vk/src/deletion_queue.cpp`: replaced the "build a fresh
++`remaining` vector every call" two-pass with in-place compaction (classic
++erase-remove idiom, per-element side effect run by hand since
++`std::remove_if`/`std::erase_if`'s predicate isn't guaranteed exactly-once).
++`items_.resize(writeIndex)` only ever shrinks size, never capacity.
++Mandatory pending-item test variant: `deletion_queue_test.cpp`,
++`"DeletionQueue::onFrameFenceSignaled compacts items_ IN PLACE..."` — a
++steady "kSlots=2 items always pending" retire/signal cadence (mirrors how
++`Executor::execute()` itself drives this queue), never touching the
++`items_.empty()` fast path.
++
++### Criterion 9 — GPU-zone (`VkCtxScope`) allocation trace (matrix's open question)
++
++Completed this task, as required. Traced `RX_GPU_ZONE_DYNAMIC` →
++`TracyVkZoneTransient` → the dynamic-name `VkCtxScope` constructor in the
++**actually-linked** vendored copy (`.deps-cache/tracy-d3259c11d7efada2`,
++confirmed via `Tracy_DIR` in `build/linux-native/CMakeCache.txt`, not the
++matrix's own citation of a different cache hash) — it calls
++`Profiler::AllocSourceLocation(...)`, a real allocation path, gated
++identically to the CPU-side `ZoneName()` macro: `m_active = is_active &&
++GetProfiler().IsConnected()` under `TRACY_ON_DEMAND` (this project's build
++flag). With no profiler connected — the state every test run in this repo
++is actually in — the constructor returns before ever reaching
++`AllocSourceLocation()`. Documented in `executor.cpp`'s new zero-alloc
++test's own top comment.
++
++### Constraints
++
++- Byte-identical rendering: full `rx_graph_gpu_tests` suite (2 new cases +
++  all pre-existing, incl. the Task 22 D29 mixed-convention test) green both
++  presets; sample 05/06 headless pixel gates green both presets.
++- `compile()`/`realize()` exempt: unchanged except `nameToIndex`'s local
++  declared type (must match `Impl`'s for the `std::move()` to compile).
++- No public API change: `Executor`'s public surface is untouched; every new
++  symbol lives in `detail::`, documented "NOT part of the stable public
++  contract," matching `debugChunkStats()`/`capacitiesForTesting()` precedent.
++- Zero validation errors: every touched/new test case asserts
++  `CHECK_FALSE(hasValidationErrors())`; full suites green with `--validate`.
++
++## Before/after (capacity-snapshot proof)
++
++Ran with the fix: `rx_graph_gpu_tests` zero-alloc case — 10 steady frames,
++every capacity **and** pointer-identity field bit-for-bit unchanged after
++warm-up. `rx_rhi_vk_tests` pending-item case — 30 steady iterations, same
++result.
++
++## Revert-probe evidence (TDD discrimination)
++
++Capacity-snapshot cannot be written against the literal pre-fix code (the
++`Impl` fields it snapshots don't exist there) — TDD discrimination was
++proven via **temporary, git-stash-backed revert probes** instead, exactly
++matching this repo's own established discipline for allocation/behavior
++regressions the acceptance test itself defines (D26/Task 19 precedent).
++Every probe was reverted immediately after capturing the failing run; final
++`git status`/`git diff` (below) confirm the tree matches only the intended
++fix.
++
++**Probe 1 — `DeletionQueue::onFrameFenceSignaled` reverted to the old
++fresh-vector version.** Capacity-only assertion: **passed** (a genuine,
++empirically-discovered methodology gap — see Deviations). Adding a
++`.data()` pointer-identity check (`itemDataForTesting`) then caught it: 15
++of 30 steady iterations failed (`doctest`: `1 |  0 passed |  1 failed`,
++`125 assertions: 110 passed | 15 failed`).
++
++**Probe 2 — `executor.cpp` sites 1-4 reverted to fresh-reconstruct-into-
++the-same-field every call.** Capacity-only assertion on the two
++`std::vector<bool>` fields did **not** discriminate (documented, disclosed
++gap — see Deviations); the pointer-identity check on
++`finalStageThisExecute`/`finalAccessThisExecute` (real element types, real
++`.data()`) caught it on **every** steady frame: `310 assertions: 290 passed
++| 20 failed`.
++
++Both probes were reverted immediately after capture; `diff -q` against the
++pre-probe backup confirmed byte-identical restoration before proceeding.
++
++## sample 07 numbers (measured, not asserted)
++
++Machine: this dev container (shared/virtualized — not the Deck hardware
++floor CLAUDE.md's phase-exit policy ultimately wants; no dedicated
++benchmark rig available in this environment. Numbers below are a
++same-machine, same-run-methodology A/B, not an absolute performance claim).
++`--draws 30000`, `cpu_record_ms` at headless frame 2 (the closest to
++steady-state the sample's 3-frame headless loop offers), 5 repetitions
++each, BASE=f9169e4 vs. this fix (via `git stash`/`git stash pop`, rebuilt
++between each side):
++
++| config | BASE avg (ms) | fix avg (ms) | BASE range | fix range |
++|---|---|---|---|---|
++| `--threads 1` | 9.031 | 9.170 | 8.75–9.24 | 8.91–9.77 |
++| default (7 workers) | 3.660 | 3.528 | 2.74–5.11 | 3.44–3.69 |
++
++Single-thread: statistically unchanged (within this machine's own ~10%
++run-to-run noise). Multi-thread: fix averages ~3.6% **faster** and is
++markedly **more consistent** (BASE's spread is ~2x; fix's is ~7%) —
++mechanistically expected, since eliminating cross-thread heap churn during
++chunked recording reduces allocator-lock contention. `draws`/`chunkCount`
++identical in every run (rendering unaffected, only CPU timing measured).
++Both configurations' `stress headless gate PASSED` in every run.
++"Unchanged or better" is satisfied; a dedicated-hardware/Deck re-measurement
++is recommended before the phase-exit publication (registry note, not this
++task's own gate).
++
++## Command tails
++
++```
++$ ctest -R "rx_graph_tests|rx_graph_gpu_tests|rx_rhi_vk_tests"   # linux-native
++100% tests passed, 0 tests failed out of 3
++
++$ ctest -R "rx_graph_tests|rx_graph_gpu_tests|rx_rhi_vk_tests"   # windows-cross-zig (Wine)
++100% tests passed, 0 tests failed out of 3
++
++$ ctest   # linux-native, full suite
++100% tests passed, 0 tests failed out of 26
++
++$ ctest   # windows-cross-zig, full suite (Wine)
++100% tests passed, 0 tests failed out of 26
++```
++
++Both presets built with zero compiler warnings on the 4 touched
++translation units (force-recompiled + grepped for `warning|error`).
++
++## Deviations from the matrix's literal proposed shapes
++
++1. **`TransparentStringHash`**: matrix proposed two separate `std::hash`
++   specializations relying on `std::hash<std::string>`/
++   `std::hash<std::string_view>` agreeing for equal content (a real,
++   practically-universal but still cross-type assumption). Shipped design
++   uses ONE overload (`std::string_view`), so every key — inserted or
++   looked-up — hashes through the identical function; no cross-type
++   assumption exists at all. Stronger, not weaker, than what was asked.
++2. **`combineAccessesByResource()`**: not one of the 7 named sites; found
++   directly in `execute()`'s call graph while implementing this task and
++   fixed in-round (CLAUDE.md's "no deferred fixes").
++3. **Pointer-identity strengthening**: the ruling's methodology
++   (capacity-snapshot alone) is a **documented, binding-approved**
++   limitation ("blind to a same-sized reallocation... not a realistic
++   false-negative risk in practice"). This task's own revert-probes
++   (above) found that limitation is NOT merely theoretical for a
++   fixed-element-count-every-call scenario (this ticket's own "unchanged
++   graph" steady-state premise) — capacity alone provably cannot
++   distinguish genuine reuse from "freshly reconstruct to the identical
++   final size" for exactly that shape. Added `.data()` pointer-identity as
++   a second, independent signal everywhere a real (non-`vector<bool>`)
++   element type allows it, matching `rx_scene::DrawListBuilder`'s own
++   "both checked, neither sufficient alone" test precedent. **Disclosed,
++   not fully closed**: `std::vector<bool>`'s 3 fields
++   (`firstBarrierSeen`/`attachmentEverWritten`/`touchedThisExecute`) have
++   no `.data()` at all (absent from the standard, not merely
++   inconvenient) — capacity is their only available signal, and per
++   Probe 2, is not proven discriminating for that specific fixed-count
++   shape. This is flagged, not silently assumed away, exactly as the
++   ruling's own text requires. Changing those 3 fields off
++   `std::vector<bool>` was judged out of this task's authority (the
++   matrix's own acceptance criterion for sites 1-2 names `std::vector<bool>`
++   explicitly as the binding shape).
++
++## Self-review
++
++- Read every one of the 4 binding documents in the specified order before
++  writing any code; re-verified the GPU-zone trace against the ACTUAL
++  vendored Tracy copy this build links (`Tracy_DIR` in CMakeCache), not
++  the matrix's own (different-hash) citation — a genuine independent
++  re-verification, not a trust-the-matrix pass-through.
++- TDD: capacity-snapshot cannot be written against literal pre-fix code
++  (fields don't exist yet); satisfied the "fails on current code" intent
++  via two targeted, git-stash-isolated revert probes instead, each
++  captured and immediately reverted, with an honest accounting of where
++  the bound methodology genuinely does and does not discriminate.
++- Found and fixed one additional per-pass allocation site
++  (`combineAccessesByResource`) not in the original 7 — did not defer it.
++- No public API change; every new symbol is `detail::`-scoped and
++  documented as a test-only seam, matching this codebase's own
++  established carve-out convention exactly (3 precedents cited by name in
++  the code comments: `debugChunkStats`, `debugLastFrameFinalStages`,
++  `rx::scene::detail::capacitiesForTesting`).
++- No AI attribution anywhere in code, comments, or commit messages;
++  author left as local git config (Yousef Wadi).
++- Did not touch `.superpowers/sdd/.../progress.md` (pre-existing
++  modification, not mine) or any board/issue/plan/spec/ledger file.
++- Concern carried forward openly (not hidden): the 3 `std::vector<bool>`
++  fields' capacity-only signal is not proven discriminating for a
++  fixed-element-count-every-call regression shape; recommend this as a
++  registry watch-item if a future reviewer wants it fully closed (would
++  require either accepting a `std::vector<uint8_t>` type change to those
++  3 fields — a call outside this task's own binding acceptance criterion
++  — or a different methodology entirely).
+diff --git a/src/rx_graph/executor.cpp b/src/rx_graph/executor.cpp
+index f310249..15e641b 100644
+--- a/src/rx_graph/executor.cpp
++++ b/src/rx_graph/executor.cpp
+@@ -8,24 +8,26 @@
+ #include <rx_rhi_vk/deletion_queue.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/frame_sync.h>
+ #include <rx_rhi_vk/tracy_gpu.h>
+ #include <rx_task/scheduler.h>
+ #include <volk.h>
+ 
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <cstring>
+ #include <optional>
+ #include <span>
+ #include <stdexcept>
+ #include <string>
++#include <string_view>
+ #include <unordered_map>
+ #include <utility>
+ #include <vector>
+ 
+ // Task 3's executor: turns a compiled, device-free rx::graph::RenderGraph
+ // into real Vulkan work -- transient_pool.h's TransientPool for physical
+ // resource realization, sync2 vkCmdPipelineBarrier2 for every
+ // CompiledGraph::passBarriers()/finalBarriers() entry, and one
+ // vkCmdBeginRendering/vkCmdEndRendering scope per graphics pass [spec
+ // Phase 3 design, D2 -- fresh design, not a Granite renderpass-object
+@@ -96,35 +98,93 @@ VkClearDepthStencilValue depthClearValueFor(DepthConvention convention) {
+ constexpr VkAccessFlags2 kPoolWriteAccessMask =
+     VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+     VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
+     VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+ 
+ struct CombinedAccess {
+     VkPipelineStageFlags2 stages = 0;
+     VkAccessFlags2 access = 0;
+ };
+ 
+-std::vector<std::pair<uint32_t, CombinedAccess>> combineAccessesByResource(std::span<const ResourceAccess> accesses) {
+-    std::vector<std::pair<uint32_t, CombinedAccess>> combined;
++// [Task 23, gate matrix #29] `outCombined` is a caller-supplied, reusable
++// scratch buffer rather than a return value -- this function is called
++// TWICE per pass, every pass, every execute() call (once from
++// synthesizeFirstUseBufferBarrierIfNeeded(), once from execute()'s own
++// per-pass "union every pass's stage" step below), so returning a freshly
++// heap-allocated std::vector by value here was one of this file's own
++// hidden per-pass allocation sites -- not one of the ticket's 7 NAMED
++// sites, but squarely inside execute()'s own call graph (both call sites
++// are reached directly from Executor::execute()'s per-pass loop), so it is
++// in scope for the SAME "zero heap allocations in steady state" criterion
++// [repo CLAUDE.md: "no deferred fixes... every finding closes in-round"].
++// Both call sites use ONE shared Impl-owned buffer (Executor::Impl::
++// combinedAccessScratch) -- safe because the two calls never overlap: this
++// function's caller always fully consumes `outCombined` before the other
++// call site runs again, within the same serial (never reentrant, never
++// called from a chunked-pass worker thread) per-pass loop iteration.
++void combineAccessesByResource(std::span<const ResourceAccess> accesses,
++                                std::vector<std::pair<uint32_t, CombinedAccess>>& outCombined) {
++    outCombined.clear();
+     for (const ResourceAccess& access : accesses) {
+-        auto it = std::find_if(combined.begin(), combined.end(),
++        auto it = std::find_if(outCombined.begin(), outCombined.end(),
+                                 [&](const auto& entry) { return entry.first == access.physicalIndex; });
+-        if (it == combined.end()) {
+-            combined.emplace_back(access.physicalIndex, CombinedAccess{access.stages, access.access});
++        if (it == outCombined.end()) {
++            outCombined.emplace_back(access.physicalIndex, CombinedAccess{access.stages, access.access});
+         } else {
+             it->second.stages |= access.stages;
+             it->second.access |= access.access;
+         }
+     }
+-    return combined;
+ }
+ 
++// [Task 23, gate matrix #29 "Heterogeneous string_view map lookup"]
++// Transparent hash functor for Impl::nameToIndex -- makes `find(name)`
++// callable directly with a std::string_view (the type every PassContext
++// resolver already carries `name` as) without first materializing a
++// temporary std::string, which lookupResolvedIndex() below used to do on
++// EVERY named-resource resolve (potentially several per pass -- see the
++// matrix's own frequency correction on this site). `std::equal_to<>`
++// (transparent since C++14) already covers the KeyEqual half; this functor
++// is the missing Hash half -- `unordered_map` requires BOTH template
++// parameters to expose `is_transparent` before its heterogeneous
++// `find`/`count`/`contains` overload set becomes callable at all
++// (cppreference.com/w/cpp/container/unordered_map/find), so omitting this
++// would leave the map exactly as non-transparent as before.
++//
++// One overload, taking std::string_view: `std::string` converts to
++// `std::string_view` implicitly (the reverse is NOT implicit --
++// std::string's own std::string_view-taking constructor is `explicit`,
++// C++17 [string.cons] -- see lookupResolvedIndex()'s own comment for why
++// that asymmetry is exactly what makes a silent regression back to a
++// temporary-std::string call site impossible to reintroduce without a
++// compile error), so this single signature already serves both the map's
++// real `std::string` keys (nameToIndex.emplace(physical.name, i) in
++// realize() -- `physical.name` implicitly converts to string_view when
++// passed here) and every heterogeneous string_view lookup.
++//
++// STRONGER than the gate matrix's own proposed shape, and deliberately so:
++// the matrix's row floats a DIFFERENT design (hash `std::string` keys via
++// `std::hash<std::string>`, hash lookup keys via `std::hash<std::string_view>`,
++// relying on the two specializations agreeing for equal byte sequences --
++// a real, if practically-universal, cross-type assumption). Because this
++// functor has exactly ONE overload, EVERY key this map ever hashes --
++// whether inserted as a real std::string or looked up as a string_view --
++// is converted to std::string_view FIRST and hashed with the exact SAME
++// `std::hash<std::string_view>` call. There is no cross-type hash-equivalence
++// assumption to rely on at all: a std::string key and an equal-content
++// string_view lookup are, by construction, hashed by literally the same
++// function.
++struct TransparentStringHash {
++    using is_transparent = void;
++    size_t operator()(std::string_view s) const noexcept { return std::hash<std::string_view>{}(s); }
++};
++
+ }  // namespace
+ 
+ // One CompiledGraph::resources() entry's real, device-side binding, as of
+ // the most recent Executor::realize() call. Rebuilt from scratch by every
+ // realize() call (see Executor::realize()); PassContext's name-based
+ // resolvers (imageView()/image()/buffer()/imageFormat()) read straight out
+ // of whatever the CURRENT vector holds.
+ struct ResolvedResource {
+     bool isBuffer = false;
+     bool isBackbuffer = false;
+@@ -209,21 +269,121 @@ struct Executor::Impl {
+     // Phase 4 Task 1: also the ping-pong parity clock -- a history
+     // resource's write slot for a given execute() call is
+     // `frameCounter % 2`, its read slot `(frameCounter + 1) % 2` [design
+     // contract point 2], read by every history-aware function below
+     // directly off this same field, never a separate counter.
+     uint64_t frameCounter = 0;
+ 
+     // Rebuilt by every realize() call; indexed identically to whatever
+     // CompiledGraph::resources() looked like as of that call.
+     std::vector<ResolvedResource> resources;
+-    std::unordered_map<std::string, uint32_t> nameToIndex;
++    // [Task 23, gate matrix #29] Transparent Hash+KeyEqual -- see
++    // TransparentStringHash's own comment above for why this is what makes
++    // lookupResolvedIndex() below callable with a bare std::string_view,
++    // with no temporary std::string construction on the lookup side.
++    std::unordered_map<std::string, uint32_t, TransparentStringHash, std::equal_to<>> nameToIndex;
++
++    // ---------------------------------------------------------------
++    // [Task 23, gate matrix #29 / ticket #29 / rulings-2026-08-18 §#29]
++    // Impl-persistent, reused-per-execute() scratch storage -- every one of
++    // these used to be a LOCAL variable, freshly constructed (and heap-
++    // allocated once it held any elements) by every Executor::execute()
++    // call, or by every per-pass/per-barrier-call/per-chunk iteration
++    // inside one -- see this task's own report for the full before/after
++    // site list. Every field below follows the SAME discipline
++    // rx_scene::DrawListBuilder::Impl already established for Phase 4's
++    // sibling zero-alloc case (draw_list.cpp's own "reused private scratch
++    // storage" comment) and this file's own pre-existing
++    // acquireChunkCommandBuffer() amortized-growth arena [gate ruling
++    // #29's own named in-repo template]: `.assign()`/`.clear()`/`.resize()`
++    // at the top of whatever scope used to freshly construct the
++    // equivalent local -- never reassigned wholesale, never reconstructed
++    // -- so capacity only ever grows on a genuine new peak (a structurally
++    // bigger graph, a longer pass/resource name, ...) and stays flat
++    // otherwise. `compile()`/`realize()` remain exempt (setup/resize-only
++    // paths, per the ticket) -- nothing here is touched by either.
++    // ---------------------------------------------------------------
++
++    // Per-execute tracking (was: 4 locals freshly constructed at the top of
++    // every Executor::execute() call, incl. two node-based
++    // std::unordered_maps -- ticket sites 1-4). All four are sized
++    // (`.assign(resources.size(), ...)`) at the top of every execute()
++    // call and indexed directly by physicalIndex -- physical indices are
++    // dense (0..resources.size()), so no hashing is needed at all here,
++    // unlike nameToIndex above (keyed by name, not by a dense index).
++    std::vector<bool> firstBarrierSeen;
++    std::vector<bool> attachmentEverWritten;
++    // Replaces "is this physicalIndex present as a key in
++    // finalStageThisExecute/finalAccessThisExecute" (the old maps' own
++    // implicit signal for "did any pass touch this resource THIS call") --
++    // a dense std::vector<bool> has no equivalent "absent key" state, so
++    // this explicit companion flag is what execute()'s own tail loop
++    // (Task 3 ambiguity resolution #2's cross-frame carry-forward) checks
++    // instead, preserving the exact same "only touchImage()/touchBuffer()
++    // a resource some pass this call actually accessed" semantics
++    // TransientPool::sweepStale() depends on (see transient_pool.h's own
++    // touchImage()/touchBuffer() doc comment) -- untouched-this-call
++    // resources must NOT look freshly used to the staleness sweep.
++    std::vector<bool> touchedThisExecute;
++    std::vector<VkPipelineStageFlags2> finalStageThisExecute;
++    std::vector<VkAccessFlags2> finalAccessThisExecute;
++
++    // Per-pass scratch (was: 2 locals freshly constructed inside
++    // execute()'s per-pass loop body -- ticket sites 5-6). `.clear()`d at
++    // the top of every pass iteration; `depthPhysIdx`/`renderArea`/
++    // `depthAttachment`/`renderingInfo` stay plain per-pass stack locals in
++    // execute() itself -- none of them are containers that ever heap-
++    // allocate (a std::optional<uint32_t>/VkExtent2D/VkRenderingAttachmentInfo/
++    // VkRenderingInfo are all fixed-size value types), so there is nothing
++    // for THIS scratch-reuse discipline to do for them.
++    std::vector<uint32_t> colorPhysIdxScratch;
++    std::vector<VkRenderingAttachmentInfo> colorAttachmentsScratch;
++
++    // Barrier-emission scratch for applyBarriers() (was: 2 locals freshly
++    // constructed on every applyBarriers() call -- ticket sites 7-8; called
++    // once per pass position plus once more for finalBarriers() at the end
++    // of every execute() call). The two calls never overlap (applyBarriers()
++    // is never reentrant/concurrent), so one shared pair suffices.
++    std::vector<VkImageMemoryBarrier2> vkImageBarriersScratch;
++    std::vector<VkBufferMemoryBarrier2> vkBufferBarriersScratch;
++
++    // combineAccessesByResource()'s own out-parameter buffer (was: that
++    // function's own by-value return -- not one of the ticket's 7 NAMED
++    // sites, but a real per-pass allocation found directly in execute()'s
++    // own call graph while implementing this task -- see that function's
++    // own comment above for the full reasoning). Shared by both of its call
++    // sites (synthesizeFirstUseBufferBarrierIfNeeded() and execute()'s own
++    // per-pass union step) for the same non-overlapping-calls reason as the
++    // barrier-scratch pair above.
++    std::vector<std::pair<uint32_t, CombinedAccess>> combinedAccessScratch;
++
++    // beginDebugLabel()'s own reusable, null-terminated name buffer (was: a
++    // freshly constructed std::string per pass -- ticket site 9). Only
++    // ever written to (and only ever exercised at all) when
++    // debugUtilsAvailable is true; see that function's own comment for the
++    // "valid only for the duration of one vkCmd*Label call" contract that
++    // makes reusing/overwriting this same buffer every pass safe.
++    std::vector<char> debugLabelScratch;
++
++    // Chunk command-buffer scratch for recordChunkedPass() (was: 2 locals
++    // freshly constructed on every recordChunkedPass() call -- ticket sites
++    // 10-11). Frame-slot indexed [gate ruling #29: "per-frame-slot, since
++    // chunked recording is concurrent with other frame-in-flight state"],
++    // the same [frameSlot] shape `chunkPools` above already uses -- a
++    // defensive match for a caller that ever overlaps two execute() calls'
++    // own CPU-side recording across different frame-in-flight slots (this
++    // Executor's own documented, unenforced caller-discipline bound --
++    // executor.h's own "CALLER-DISCIPLINE BOUND, UNENFORCED" note), even
++    // though every in-tree caller today only ever has one recordChunkedPass()
++    // call active at a time.
++    std::array<std::vector<VkCommandBuffer>, rx::rhi::FrameSync::kFramesInFlight> chunkBuffersScratch;
++    std::array<std::vector<VkCommandBuffer>, rx::rhi::FrameSync::kFramesInFlight> validChunkBuffersScratch;
+ 
+     // Phase 4 Task 7 [spec D4 amendment]: non-owning -- `scheduler` must
+     // outlive this Executor (executor.h's create() doc comment). Every
+     // chunked pass's fan-out goes through this pointer; never null once
+     // construction succeeds (create() always supplies a real reference).
+     rx::task::Scheduler* scheduler = nullptr;
+ 
+     // Indexed [frameSlot][threadIndex] -- see ChunkCommandPool's own
+     // comment above and chunkFrameSlotForThisExecute()'s comment below for
+     // exactly what each index means. Sized to scheduler->workerCount() + 1
+@@ -255,26 +415,35 @@ struct Executor::Impl {
+ };
+ 
+ namespace {
+ 
+ void beginDebugLabel(Executor::Impl& impl, VkCommandBuffer cmd, std::string_view name) {
+     if (!impl.debugUtilsAvailable) {
+         return;
+     }
+     // VkDebugUtilsLabelEXT::pLabelName must stay valid only for the
+     // duration of this call -- vkCmdBeginDebugUtilsLabelEXT copies/consumes
+-    // it immediately, so a local std::string on this function's own stack
+-    // is sufficient (no need to keep it alive past the call).
+-    const std::string label(name);
++    // it immediately -- so overwriting the SAME Impl-owned buffer every
++    // pass [Task 23, gate matrix #29 site 9] is safe: nothing needs it to
++    // outlive this one call, unlike a genuine per-pass std::string that
++    // would need constructing fresh every time. `.resize()` only
++    // reallocates on a new peak `name.size() + 1` (the null terminator);
++    // std::memcpy + a manual terminator write, rather than
++    // std::vector<char>::assign()+push_back(), keeps this to exactly ONE
++    // amortized-growth call instead of two independently-growing ones.
++    impl.debugLabelScratch.resize(name.size() + 1);
++    std::memcpy(impl.debugLabelScratch.data(), name.data(), name.size());
++    impl.debugLabelScratch[name.size()] = '\0';
++
+     VkDebugUtilsLabelEXT info{};
+     info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+-    info.pLabelName = label.c_str();
++    info.pLabelName = impl.debugLabelScratch.data();
+     vkCmdBeginDebugUtilsLabelEXT(cmd, &info);
+ }
+ 
+ void endDebugLabel(Executor::Impl& impl, VkCommandBuffer cmd) {
+     if (!impl.debugUtilsAvailable) {
+         return;
+     }
+     vkCmdEndDebugUtilsLabelEXT(cmd);
+ }
+ 
+@@ -291,21 +460,27 @@ void endDebugLabel(Executor::Impl& impl, VkCommandBuffer cmd) {
+ // real stage the GPU may still be finishing from the LAST execute() call
+ // that touched this same physical allocation. Every later barrier against
+ // the same physicalIndex, THIS call, is left exactly as compile() derived
+ // it (already correctly chained within this one topological walk).
+ void applyBarriers(Executor::Impl& impl, const CompiledGraph& compiled, VkCommandBuffer cmd,
+                     const PassBarriers& barriers, std::vector<bool>& firstBarrierSeen) {
+     if (barriers.imageBarriers.empty() && barriers.bufferBarriers.empty()) {
+         return;
+     }
+ 
+-    std::vector<VkImageMemoryBarrier2> vkImageBarriers;
++    // [Task 23, gate matrix #29 sites 7-8] Impl-persistent, reused across
++    // every applyBarriers() call this execute() makes (and every future
++    // one) -- see Executor::Impl's own comment on this pair. `.clear()`
++    // keeps whatever capacity a past call already grew; `.reserve()` right
++    // after only allocates on a genuine new peak.
++    std::vector<VkImageMemoryBarrier2>& vkImageBarriers = impl.vkImageBarriersScratch;
++    vkImageBarriers.clear();
+     vkImageBarriers.reserve(barriers.imageBarriers.size());
+     for (const ImageBarrier& b : barriers.imageBarriers) {
+         const PhysicalResource& physical = compiled.resources()[b.physicalIndex];
+         const ResolvedResource& resolved = impl.resources.at(b.physicalIndex);
+ 
+         // Phase 4 Task 1: a history resource never has a single real
+         // VkImage this compile-time-derived barrier could apply to (its
+         // `resolved.image` is left at its default, VK_NULL_HANDLE -- see
+         // ResolvedResource's own comment) -- applyHistoryAccesses() (called
+         // separately, from Executor::execute()) computes and applies its
+@@ -355,21 +530,22 @@ void applyBarriers(Executor::Impl& impl, const CompiledGraph& compiled, VkComman
+         vkBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+         vkBarrier.image = resolved.image;
+         vkBarrier.subresourceRange.aspectMask = aspectMaskForFormat(physical.attachment.format);
+         vkBarrier.subresourceRange.baseMipLevel = 0;
+         vkBarrier.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+         vkBarrier.subresourceRange.baseArrayLayer = 0;
+         vkBarrier.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+         vkImageBarriers.push_back(vkBarrier);
+     }
+ 
+-    std::vector<VkBufferMemoryBarrier2> vkBufferBarriers;
++    std::vector<VkBufferMemoryBarrier2>& vkBufferBarriers = impl.vkBufferBarriersScratch;
++    vkBufferBarriers.clear();
+     vkBufferBarriers.reserve(barriers.bufferBarriers.size());
+     for (const BufferBarrier& b : barriers.bufferBarriers) {
+         const ResolvedResource& resolved = impl.resources.at(b.physicalIndex);
+ 
+         VkPipelineStageFlags2 srcStage = b.srcStage;
+         VkAccessFlags2 srcAccess = b.srcAccess;
+         if (!resolved.isBackbuffer && !firstBarrierSeen[b.physicalIndex]) {
+             srcStage = impl.pool.buffer(resolved.poolIndex).lastFrameFinalStages;
+             // Same availability contract as the image path above.
+             srcAccess = impl.pool.buffer(resolved.poolIndex).lastFrameFinalAccess;
+@@ -425,21 +601,22 @@ void applyBarriers(Executor::Impl& impl, const CompiledGraph& compiled, VkComman
+ // `firstBarrierSeen` (i.e. compile() genuinely emitted none for it, the
+ // buffer-first-use case above -- an already-barriered resource, or one
+ // whose true first use is a different pass, is left untouched). Never
+ // applies to the backbuffer (always an image, never pooled). See
+ // test_execute_gpu.cpp's dedicated "pooled storage buffer... across two
+ // consecutive execute() calls" case for the regression this covers.
+ void synthesizeFirstUseBufferBarrierIfNeeded(Executor::Impl& impl, const CompiledGraph& compiled, VkCommandBuffer cmd,
+                                               std::span<const ResourceAccess> accesses, size_t pos,
+                                               std::vector<bool>& firstBarrierSeen) {
+     const std::span<const PhysicalResource> resources = compiled.resources();
+-    for (const auto& [physIdx, combined] : combineAccessesByResource(accesses)) {
++    combineAccessesByResource(accesses, impl.combinedAccessScratch);
++    for (const auto& [physIdx, combined] : impl.combinedAccessScratch) {
+         const PhysicalResource& physical = resources[physIdx];
+         if (!physical.isBuffer || firstBarrierSeen[physIdx] || physical.firstUsePass != pos) {
+             continue;
+         }
+ 
+         const ResolvedResource& resolved = impl.resources.at(physIdx);
+ 
+         VkBufferMemoryBarrier2 vkBarrier{};
+         vkBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+         vkBarrier.srcStageMask = impl.pool.buffer(resolved.poolIndex).lastFrameFinalStages;
+@@ -867,21 +1044,25 @@ Executor::~Executor() {
+ }
+ 
+ void Executor::realize(const RenderGraph& graph) {
+     Impl& impl = *impl_;
+     const CompiledGraph& compiled = graph.compiled();
+     const std::span<const PhysicalResource> resources = compiled.resources();
+ 
+     impl.pool.beginRealizeBatch();
+ 
+     std::vector<ResolvedResource> resolved(resources.size());
+-    std::unordered_map<std::string, uint32_t> nameToIndex;
++    // realize() is a setup/resize-only path, exempt from this task's
++    // zero-alloc scope [ticket #29] -- rebuilt from scratch here every
++    // call, unchanged. Declared type must still match Impl::nameToIndex's
++    // (transparent Hash+KeyEqual) for the std::move() below to compile.
++    std::unordered_map<std::string, uint32_t, TransparentStringHash, std::equal_to<>> nameToIndex;
+     nameToIndex.reserve(resources.size());
+ 
+     for (uint32_t i = 0; i < resources.size(); ++i) {
+         const PhysicalResource& physical = resources[i];
+         nameToIndex.emplace(physical.name, i);
+ 
+         ResolvedResource& entry = resolved[i];
+         entry.isBuffer = physical.isBuffer;
+         entry.isBackbuffer = physical.isBackbuffer;
+         entry.isHistory = physical.isHistory;
+@@ -1005,24 +1186,36 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
+     for (uint32_t i = 0; i < resources.size(); ++i) {
+         if (resources[i].isBackbuffer) {
+             ResolvedResource& entry = impl.resources.at(i);
+             entry.image = backbufferImage;
+             entry.view = backbufferView;
+             entry.extent = backbufferExtent;
+             break;
+         }
+     }
+ 
+-    std::vector<bool> firstBarrierSeen(resources.size(), false);
+-    std::vector<bool> attachmentEverWritten(resources.size(), false);
+-    std::unordered_map<uint32_t, VkPipelineStageFlags2> finalStageThisExecute;
+-    std::unordered_map<uint32_t, VkAccessFlags2> finalAccessThisExecute;
++    // [Task 23, gate matrix #29 sites 1-4] Impl-persistent, `.assign()`d
++    // (not reconstructed) every call -- `.assign(n, v)` only reallocates on
++    // a genuine new peak `resources.size()` (a structurally different
++    // graph), matching rx_scene::DrawListBuilder::cullView()'s own
++    // `cullReasons.assign(n, ...)` precedent exactly. `touchedThisExecute`
++    // replaces the two old std::unordered_maps' own "is physIdx present as
++    // a key" signal -- see its own field comment on Executor::Impl for why
++    // that distinction is load-bearing (TransientPool::sweepStale()'s
++    // staleness clock).
++    impl.firstBarrierSeen.assign(resources.size(), false);
++    impl.attachmentEverWritten.assign(resources.size(), false);
++    impl.touchedThisExecute.assign(resources.size(), false);
++    impl.finalStageThisExecute.assign(resources.size(), VkPipelineStageFlags2{0});
++    impl.finalAccessThisExecute.assign(resources.size(), VkAccessFlags2{0});
++    std::vector<bool>& firstBarrierSeen = impl.firstBarrierSeen;
++    std::vector<bool>& attachmentEverWritten = impl.attachmentEverWritten;
+ 
+     const std::span<const uint32_t> order = compiled.executionOrder();
+     const std::span<const PassBarriers> allBarriers = compiled.passBarriers();
+ 
+     for (size_t pos = 0; pos < order.size(); ++pos) {
+         const uint32_t rawIndex = order[pos];
+         const Pass& pass = graph.passAt(rawIndex);
+         const std::span<const ResourceAccess> accesses = compiled.passAccesses(rawIndex);
+ 
+         // Per-pass CPU zone, named dynamically from the pass's own
+@@ -1071,37 +1264,45 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
+         synthesizeFirstUseBufferBarrierIfNeeded(impl, compiled, cmd, accesses, pos, firstBarrierSeen);
+         applyHistoryAccesses(impl, compiled, cmd, accesses);
+ 
+         // Classify this pass's own declared accesses into color/depth
+         // attachment outputs [spec Phase 3 design, D2] -- every other
+         // declared AccessKind (TextureInput, StorageBufferOutput/Input)
+         // resolves to a layout that is neither COLOR_ATTACHMENT_OPTIMAL
+         // nor DEPTH_ATTACHMENT_OPTIMAL (see pass.h's Pass::resolveAccess
+         // table), so this is an exhaustive, unambiguous classification,
+         // not a heuristic.
+-        std::vector<uint32_t> colorPhysIdx;
++        // [Task 23, gate matrix #29 sites 5-6] Impl-persistent per-pass
++        // scratch, `.clear()`d at the top of every pass iteration -- see
++        // Executor::Impl's own comment on this pair. `depthPhysIdx` stays a
++        // plain stack local: std::optional<uint32_t> never heap-allocates.
++        std::vector<uint32_t>& colorPhysIdx = impl.colorPhysIdxScratch;
++        colorPhysIdx.clear();
+         std::optional<uint32_t> depthPhysIdx;
+         for (const ResourceAccess& access : accesses) {
+             if (access.layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
+                 if (std::find(colorPhysIdx.begin(), colorPhysIdx.end(), access.physicalIndex) ==
+                     colorPhysIdx.end()) {
+                     colorPhysIdx.push_back(access.physicalIndex);
+                 }
+             } else if (access.layout == VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL) {
+                 depthPhysIdx = access.physicalIndex;
+             }
+         }
+ 
+         const bool isGraphicsPass = !colorPhysIdx.empty() || depthPhysIdx.has_value();
+ 
+         VkExtent2D renderArea{0, 0};
+-        std::vector<VkRenderingAttachmentInfo> colorAttachments;
++        // [Task 23, gate matrix #29 sites 5-6] Same Impl-persistent
++        // treatment as colorPhysIdx above.
++        std::vector<VkRenderingAttachmentInfo>& colorAttachments = impl.colorAttachmentsScratch;
++        colorAttachments.clear();
+         VkRenderingAttachmentInfo depthAttachment{};
+         // Phase 4 Task 7: hoisted out of the `if (isGraphicsPass)` block
+         // below (it used to be a block-local) so a CHUNKED graphics pass can
+         // still reach it after the block closes -- see recordChunkedPass()'s
+         // own comment for why its vkCmdBeginRendering() call (with
+         // VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT set into this
+         // same struct's `flags`) happens AFTER every chunk has already
+         // finished recording, not here.
+         VkRenderingInfo renderingInfo{};
+ 
+@@ -1245,39 +1446,61 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
+         // write causes an actual over-synchronization problem worth
+         // special-casing.
+         // Phase 4 Task 1: history physicalIndex entries are deliberately
+         // excluded here -- their poolIndex addresses Impl::pool's pinned_
+         // vector, not images_/buffers_ (the two the loop just below this
+         // one indexes into), and their cross-frame carry-forward is
+         // already handled per-slot, inline, by applyHistoryAccesses()
+         // above (PinnedHistorySlot::barrierState persists across
+         // execute() calls on its own -- there is nothing left for this
+         // generic mechanism to do for them at all).
+-        for (const auto& [physIdx, combined] : combineAccessesByResource(accesses)) {
++        // [Task 23, gate matrix #29 -- hidden per-pass allocation found
++        // while implementing this task, see combineAccessesByResource()'s
++        // own comment] Writes into impl.combinedAccessScratch rather than
++        // returning a fresh vector.
++        combineAccessesByResource(accesses, impl.combinedAccessScratch);
++        for (const auto& [physIdx, combined] : impl.combinedAccessScratch) {
+             const ResolvedResource& combinedRes = impl.resources.at(physIdx);
+             if (!combinedRes.isBackbuffer && !combinedRes.isHistory) {
+-                finalStageThisExecute[physIdx] |= combined.stages;
+-                finalAccessThisExecute[physIdx] |= combined.access & kPoolWriteAccessMask;
++                // [Task 23, gate matrix #29 sites 3-4] Dense, physicalIndex-
++                // addressed vectors instead of the old node-based
++                // std::unordered_maps -- `touchedThisExecute` is this
++                // resource's explicit "some pass touched it THIS call"
++                // marker, replacing the maps' own implicit
++                // "key present" signal (see Executor::Impl's own comment on
++                // why that distinction must survive the switch).
++                impl.touchedThisExecute[physIdx] = true;
++                impl.finalStageThisExecute[physIdx] |= combined.stages;
++                impl.finalAccessThisExecute[physIdx] |= combined.access & kPoolWriteAccessMask;
+             }
+         }
+     }
+ 
+     applyBarriers(impl, compiled, cmd, compiled.finalBarriers(), firstBarrierSeen);
+ 
+     // Task 3 ambiguity resolution #2: record what stage each pooled
+     // resource this call actually touched was left at, so the NEXT
+     // execute() call's first-use-of-frame override (applyBarriers() above)
+     // chains off the real value instead of staying pinned at
+     // ALL_COMMANDS forever.
+-    for (const auto& [physIdx, stage] : finalStageThisExecute) {
++    // [Task 23, gate matrix #29 sites 3-4] Walks every physicalIndex,
++    // skipping every one `touchedThisExecute` did not mark this call --
++    // the exact same population the old maps' own key set covered (see
++    // above), preserving TransientPool::sweepStale()'s "only a genuinely
++    // accessed-this-call resource looks freshly used" contract.
++    for (uint32_t physIdx = 0; physIdx < resources.size(); ++physIdx) {
++        if (!impl.touchedThisExecute[physIdx]) {
++            continue;
++        }
+         const ResolvedResource& resolvedRes = impl.resources.at(physIdx);
+-        const VkAccessFlags2 access = finalAccessThisExecute[physIdx];
++        const VkPipelineStageFlags2 stage = impl.finalStageThisExecute[physIdx];
++        const VkAccessFlags2 access = impl.finalAccessThisExecute[physIdx];
+         if (resources[physIdx].isBuffer) {
+             impl.pool.buffer(resolvedRes.poolIndex).lastFrameFinalStages = stage;
+             impl.pool.buffer(resolvedRes.poolIndex).lastFrameFinalAccess = access;
+             impl.pool.touchBuffer(resolvedRes.poolIndex, impl.frameCounter);
+         } else {
+             impl.pool.image(resolvedRes.poolIndex).lastFrameFinalStages = stage;
+             impl.pool.image(resolvedRes.poolIndex).lastFrameFinalAccess = access;
+             impl.pool.touchImage(resolvedRes.poolIndex, impl.frameCounter);
+         }
+     }
+@@ -1359,21 +1582,26 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
+ // for chunkCount == 1 (samples/07_stress's `--threads 1` A/B baseline)
+ // EXACTLY the fully-serial recording path that baseline needs, with no
+ // parallelFor()/enkiTS task-submission overhead at all.
+ void Executor::recordChunkedPass(const Pass& pass, PassContext& ctx, VkCommandBuffer cmd, bool isGraphicsPass,
+                                   VkRenderingInfo& renderingInfo, const PassSignature& signature,
+                                   uint32_t frameSlot) {
+     Impl& impl = *impl_;
+ 
+     const uint32_t chunkCount = detail::chunkCountForWorkerCount(impl.scheduler->workerCount());
+     impl.lastChunkCount = chunkCount;
+-    std::vector<VkCommandBuffer> chunkBuffers(chunkCount, VK_NULL_HANDLE);
++    // [Task 23, gate matrix #29 sites 10-11] Impl-persistent, frame-slot
++    // indexed -- see Executor::Impl's own comment on this pair.
++    // `.assign()` (not reconstructed) reuses whatever capacity a past call
++    // for this same frameSlot already grew.
++    std::vector<VkCommandBuffer>& chunkBuffers = impl.chunkBuffersScratch[frameSlot];
++    chunkBuffers.assign(chunkCount, VK_NULL_HANDLE);
+ 
+     // Records chunk `chunkIndex`'s own secondary command buffer, acquiring
+     // it from `workerIndex`'s own (frameSlot, threadIndex) arena -- shared
+     // verbatim by the guaranteed-synchronous chunk 0 call and every
+     // parallelFor()-dispatched chunk [1, chunkCount) below, so the two
+     // paths cannot silently drift apart.
+     auto recordOneChunk = [&](uint32_t chunkIndex, uint32_t workerIndex) {
+         // Per-chunk CPU zone [task-7-brief.md item 3: "RX_ZONE per
+         // chunk-record (worker side)"] -- recorded on whichever thread
+         // actually runs this chunk (always the calling thread for chunk 0 --
+@@ -1476,21 +1704,22 @@ void Executor::recordChunkedPass(const Pass& pass, PassContext& ctx, VkCommandBu
+                                          recordOneChunk(begin + 1, workerIndex);
+                                      });
+     }
+ 
+     // Filter out any chunk that failed to record at all (see the
+     // VK_NULL_HANDLE early-returns above) -- vkCmdExecuteCommands() requires
+     // commandBufferCount > 0 and every handle in pCommandBuffers to be
+     // valid, so a defensive, logged degrade here is "this pass drew less
+     // than it should have" (already logged, per-chunk, above), never a
+     // crash or a validation error from handing it a null handle.
+-    std::vector<VkCommandBuffer> validChunkBuffers;
++    std::vector<VkCommandBuffer>& validChunkBuffers = impl.validChunkBuffersScratch[frameSlot];
++    validChunkBuffers.clear();
+     validChunkBuffers.reserve(chunkBuffers.size());
+     for (VkCommandBuffer buf : chunkBuffers) {
+         if (buf != VK_NULL_HANDLE) {
+             validChunkBuffers.push_back(buf);
+         }
+     }
+ 
+     if (isGraphicsPass) {
+         renderingInfo.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+         vkCmdBeginRendering(cmd, &renderingInfo);
+@@ -1499,21 +1728,33 @@ void Executor::recordChunkedPass(const Pass& pass, PassContext& ctx, VkCommandBu
+         vkCmdExecuteCommands(cmd, static_cast<uint32_t>(validChunkBuffers.size()), validChunkBuffers.data());
+     }
+     if (isGraphicsPass) {
+         vkCmdEndRendering(cmd);
+     }
+ }
+ 
+ namespace {
+ 
+ uint32_t lookupResolvedIndex(const Executor::Impl& impl, std::string_view name) {
+-    auto it = impl.nameToIndex.find(std::string(name));
++    // [Task 23, gate matrix #29 site 12] `impl.nameToIndex`'s transparent
++    // Hash+KeyEqual (TransparentStringHash, above) is what makes THIS
++    // overload resolution possible at all: `find()` here binds directly to
++    // unordered_map's templated heterogeneous-lookup overload with `name`'s
++    // own std::string_view -- no `std::string(name)` temporary. A future
++    // edit that silently reverted `nameToIndex`'s declared type back to
++    // plain `std::unordered_map<std::string, uint32_t>` would not silently
++    // reintroduce the old allocation here either: std::string_view has NO
++    // implicit conversion to std::string (std::string's string_view-taking
++    // constructor is `explicit`, C++17 [string.cons]), so this exact call
++    // would simply fail to COMPILE against a non-transparent map, not
++    // silently regress at runtime.
++    auto it = impl.nameToIndex.find(name);
+     if (it == impl.nameToIndex.end()) {
+         throw std::out_of_range("rx_graph: PassContext: no realized resource named '" + std::string(name) + "'");
+     }
+     return it->second;
+ }
+ 
+ // [Fix round 1, Minor finding + its supplemental follow-up]: a resolved
+ // resource's image-only fields (view/image/format) are never set to
+ // anything but their defaults (VK_NULL_HANDLE/VK_FORMAT_UNDEFINED) for a
+ // buffer resource, and vice versa for `buffer` on an image resource --
+@@ -1630,13 +1871,75 @@ ExecutorChunkDebugStats debugChunkStats(const Executor& executor) {
+ VkPipelineStageFlags2 debugLastFrameFinalStages(const Executor& executor, std::string_view name) {
+     const Executor::Impl& impl = *executor.impl_;
+     const uint32_t idx = lookupResolvedIndex(impl, name);
+     const ResolvedResource& resolved = impl.resources.at(idx);
+     if (resolved.isBuffer) {
+         return impl.pool.buffer(resolved.poolIndex).lastFrameFinalStages;
+     }
+     return impl.pool.image(resolved.poolIndex).lastFrameFinalStages;
+ }
+ 
++// [Task 23, gate ruling #29] Test/debug-only seam -- NOT part of the
++// stable public contract, mirroring debugChunkStats()/
++// debugLastFrameFinalStages()'s own carve-out convention immediately
++// above and rx::scene::detail::capacitiesForTesting()'s identical
++// zero-alloc-test seam (draw_list.h, Phase 4 Task 19/D26's own precedent).
++// Snapshots the `.capacity()` of every Impl-persistent buffer this task
++// converted execute()'s own former per-call heap allocations into --
++// gate ruling #29's own bound methodology (capacity-snapshot via
++// test-only accessors, NOT global operator-new interposition, since
++// rx_graph_gpu_tests links volk/the Vulkan validation layers/Tracy's own
++// rpmalloc). A steady-state zero-alloc claim across N execute() calls is
++// exactly "every one of these stays bit-for-bit unchanged after a
++// warm-up call" -- see test_execute_gpu.cpp's own zero-alloc TEST_CASE.
++ExecutorAllocationCapacitiesForTesting allocationCapacitiesForTesting(const Executor& executor) {
++    // executor.h cannot include rx_rhi_vk/frame_sync.h (device-free-header
++    // discipline, this file's own top comment) so
++    // ExecutorAllocationCapacitiesForTesting's two per-frame-slot arrays are
++    // hardcoded to size 2 there -- this guards that literal against ever
++    // silently drifting from the real rx::rhi::FrameSync::kFramesInFlight
++    // this .cpp builds impl.chunkBuffersScratch/validChunkBuffersScratch
++    // against.
++    static_assert(rx::rhi::FrameSync::kFramesInFlight == 2,
++                  "ExecutorAllocationCapacitiesForTesting's chunk-scratch arrays are hardcoded to size 2 in "
++                  "executor.h -- update both if kFramesInFlight ever changes");
++    const Executor::Impl& impl = *executor.impl_;
++    ExecutorAllocationCapacitiesForTesting result;
++    result.firstBarrierSeen = impl.firstBarrierSeen.capacity();
++    result.attachmentEverWritten = impl.attachmentEverWritten.capacity();
++    result.touchedThisExecute = impl.touchedThisExecute.capacity();
++    result.finalStageThisExecute = impl.finalStageThisExecute.capacity();
++    result.finalAccessThisExecute = impl.finalAccessThisExecute.capacity();
++    result.colorPhysIdxScratch = impl.colorPhysIdxScratch.capacity();
++    result.colorAttachmentsScratch = impl.colorAttachmentsScratch.capacity();
++    result.vkImageBarriersScratch = impl.vkImageBarriersScratch.capacity();
++    result.vkBufferBarriersScratch = impl.vkBufferBarriersScratch.capacity();
++    result.combinedAccessScratch = impl.combinedAccessScratch.capacity();
++    result.debugLabelScratch = impl.debugLabelScratch.capacity();
++    for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
++        result.chunkBuffersScratch[slot] = impl.chunkBuffersScratch[slot].capacity();
++        result.validChunkBuffersScratch[slot] = impl.validChunkBuffersScratch[slot].capacity();
++    }
++
++    // Pointer-identity companions -- see the struct's own doc comment for
++    // why this second signal is necessary, not merely corroborating,
++    // alongside capacity. No std::vector<bool>::data() exists at all (see
++    // the struct's own comment on that gap), so firstBarrierSeen/
++    // attachmentEverWritten/touchedThisExecute have no pointer field.
++    result.finalStageThisExecuteData = impl.finalStageThisExecute.data();
++    result.finalAccessThisExecuteData = impl.finalAccessThisExecute.data();
++    result.colorPhysIdxScratchData = impl.colorPhysIdxScratch.data();
++    result.colorAttachmentsScratchData = impl.colorAttachmentsScratch.data();
++    result.vkImageBarriersScratchData = impl.vkImageBarriersScratch.data();
++    result.vkBufferBarriersScratchData = impl.vkBufferBarriersScratch.data();
++    result.combinedAccessScratchData = impl.combinedAccessScratch.data();
++    result.debugLabelScratchData = impl.debugLabelScratch.data();
++    for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
++        result.chunkBuffersScratchData[slot] = impl.chunkBuffersScratch[slot].data();
++        result.validChunkBuffersScratchData[slot] = impl.validChunkBuffersScratch[slot].data();
++    }
++    return result;
++}
++
+ }  // namespace detail
+ 
+ }  // namespace rx::graph
+diff --git a/src/rx_graph/include/rx_graph/executor.h b/src/rx_graph/include/rx_graph/executor.h
+index d518fc4..6f65aa9 100644
+--- a/src/rx_graph/include/rx_graph/executor.h
++++ b/src/rx_graph/include/rx_graph/executor.h
+@@ -7,20 +7,22 @@
+ // device-free-header discipline barriers.h's ImageBarrier/BufferBarrier
+ // already established for Task 2, just with real (caller-supplied or
+ // Executor-resolved) handles this time instead of a bare physicalIndex.
+ // Task 3 is the first thing in rx_graph that touches a real VkDevice, but
+ // "touches a real device" happens in executor.cpp/transient_pool.cpp, not
+ // in this public header: volk usage (and every raw vkFoo call) stays out
+ // of every rx_graph header, matching this task's own binding constraint.
+ #include <rx_graph/pass_signature.h>
+ #include <rx_graph/render_graph.h>
+ 
++#include <array>
++#include <cstddef>
+ #include <cstdint>
+ #include <memory>
+ #include <string_view>
+ 
+ namespace rx::rhi {
+ class Device;
+ }  // namespace rx::rhi
+ 
+ // Phase 4 Task 7 [spec D4 amendment]: only forward-declared here -- executor.h
+ // itself never calls a Scheduler method, only names a reference in
+@@ -117,20 +119,83 @@ struct ExecutorChunkDebugStats {
+     // see executor.cpp's own comment on the per-(frame-slot, thread-index)
+     // command-buffer arena for why this is expected to reach a steady
+     // state (stop growing) after at most kFramesInFlight execute() calls
+     // that all exercise the same chunked pass(es): every later frame reuses
+     // an already-allocated buffer from the same slot instead of allocating
+     // a new one.
+     uint64_t totalPoolAllocations = 0;
+ };
+ [[nodiscard]] ExecutorChunkDebugStats debugChunkStats(const Executor& executor);
+ 
++// [Phase 4 Task 23, gate ruling #29] Test/debug-only seam -- NOT part of
++// the stable public contract, same carve-out convention as
++// debugLastFrameFinalStages()/debugChunkStats() above. Snapshots the
++// `.capacity()` AND `.data()` pointer of every Impl-persistent scratch/
++// tracking buffer Task 23 converted Executor::execute()'s own former
++// per-call heap allocations into (executor.cpp) -- the bound zero-alloc-
++// test methodology for this ticket (capacity-snapshot via a test-only
++// accessor, NOT global operator-new interposition, which
++// rx_graph_gpu_tests' own Vulkan/validation-layer/Tracy-rpmalloc linkage
++// makes unsafe to install process-wide). `chunkBuffersScratch`/
++// `validChunkBuffersScratch` are frame-slot indexed
++// (rx::rhi::FrameSync::kFramesInFlight entries each), matching
++// Executor::Impl's own [frameSlot] scratch shape.
++//
++// BOTH capacity and pointer identity are captured -- an EMPIRICALLY
++// VERIFIED necessity, not belt-and-suspenders caution (this task's own
++// revert-probe against the sibling DeletionQueue fix, see the task report):
++// for a buffer whose final element COUNT is identical every call (this
++// task's own "unchanged graph" steady-state premise), a buggy "freshly
++// reconstruct every call" version can reach the exact same STABLE capacity
++// every time too (a from-empty allocation of a fixed size N has no
++// geometric-growth headroom to differ by), so capacity alone is
++// insufficient; `.data()` pointer identity is the second, independent
++// signal (mirroring rx_scene::DrawListBuilder's own zero-alloc test
++// precedent, draw_list_test.cpp, which checks both for the identical
++// reason). `*Data` fields are `const void*` (identity comparison only).
++struct ExecutorAllocationCapacitiesForTesting {
++    size_t firstBarrierSeen = 0;
++    size_t attachmentEverWritten = 0;
++    size_t touchedThisExecute = 0;
++    size_t finalStageThisExecute = 0;
++    size_t finalAccessThisExecute = 0;
++    size_t colorPhysIdxScratch = 0;
++    size_t colorAttachmentsScratch = 0;
++    size_t vkImageBarriersScratch = 0;
++    size_t vkBufferBarriersScratch = 0;
++    size_t combinedAccessScratch = 0;
++    size_t debugLabelScratch = 0;
++    std::array<size_t, 2> chunkBuffersScratch{};
++    std::array<size_t, 2> validChunkBuffersScratch{};
++
++    // firstBarrierSeen/attachmentEverWritten/touchedThisExecute have no
++    // pointer-identity companion field: all three are std::vector<bool>,
++    // the bit-packed standard-library specialization with NO `.data()`
++    // member at all (not merely inconvenient -- genuinely absent from the
++    // standard interface) -- capacity is the only signal available for
++    // them, an accepted, disclosed gap in coverage for exactly these three
++    // fields (the matrix's own binding acceptance criterion for sites 1-2
++    // names `std::vector<bool>` explicitly, so changing their element type
++    // just to gain a `.data()` pointer is not this task's call to make).
++    const void* finalStageThisExecuteData = nullptr;
++    const void* finalAccessThisExecuteData = nullptr;
++    const void* colorPhysIdxScratchData = nullptr;
++    const void* colorAttachmentsScratchData = nullptr;
++    const void* vkImageBarriersScratchData = nullptr;
++    const void* vkBufferBarriersScratchData = nullptr;
++    const void* combinedAccessScratchData = nullptr;
++    const void* debugLabelScratchData = nullptr;
++    std::array<const void*, 2> chunkBuffersScratchData{};
++    std::array<const void*, 2> validChunkBuffersScratchData{};
++};
++[[nodiscard]] ExecutorAllocationCapacitiesForTesting allocationCapacitiesForTesting(const Executor& executor);
++
+ }  // namespace detail
+ 
+ // The device-side handle Executor::execute() hands to a pass's recorded
+ // execute() callback (pass.h's Pass::setExecute), once that pass's turn
+ // comes up in CompiledGraph::executionOrder(). This is the complete
+ // definition pass.h's own forward declaration anticipates -- see that
+ // header's comment on class PassContext.
+ //
+ // `cmd`/`renderArea` are plain public data (not accessors) because every
+ // pass callback needs both unconditionally and there is nothing to
+@@ -400,20 +465,21 @@ public:
+     // to compile; nothing about making the mere NAME public exposes any
+     // actual state -- create()/the constructor/impl_ below stay private,
+     // so no caller can ever construct, copy, or reach a real Impl through
+     // Executor's own public surface.
+     struct Impl;
+ 
+ private:
+     friend class PassContext;
+     friend VkPipelineStageFlags2 detail::debugLastFrameFinalStages(const Executor&, std::string_view);
+     friend detail::ExecutorChunkDebugStats detail::debugChunkStats(const Executor&);
++    friend detail::ExecutorAllocationCapacitiesForTesting detail::allocationCapacitiesForTesting(const Executor&);
+ 
+     explicit Executor(std::unique_ptr<Impl> impl);
+ 
+     [[nodiscard]] VkImageView resolveImageView(std::string_view name) const;
+     [[nodiscard]] VkImage resolveImage(std::string_view name) const;
+     [[nodiscard]] VkBuffer resolveBuffer(std::string_view name) const;
+     [[nodiscard]] VkFormat resolveImageFormat(std::string_view name) const;
+     [[nodiscard]] bool resolveHistoryValid(std::string_view name) const;
+     // Phase 4 Task 7: backs PassContext::chunkCommandBuffer() -- see that
+     // method's own doc comment.
+diff --git a/src/rx_graph/tests/test_execute_gpu.cpp b/src/rx_graph/tests/test_execute_gpu.cpp
+index 6f04c57..8500ea0 100644
+--- a/src/rx_graph/tests/test_execute_gpu.cpp
++++ b/src/rx_graph/tests/test_execute_gpu.cpp
+@@ -2103,10 +2103,253 @@ TEST_CASE("D29: ONE frame mixes Standard and Reversed depth conventions across t
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+     vkDeviceWaitIdle(device);
+     for (rx::rhi::BindlessHandle handle : probeHandles) {
+         bindlessTable->release(handle);
+     }
+     bindlessTable->release(samplerHandle);
+     vkDestroySampler(device, sampler, nullptr);
+     destroyDepthProbePipeline(device, *pipeline);
+     destroyOffscreenImage(device, *offscreen);
+ }
++
++// [Task 23, gate ticket/matrix/ruling #29] lookupResolvedIndex()'s
++// heterogeneous `nameToIndex.find(name)` lookup (executor.cpp) must resolve
++// a REAL name exactly like the old `find(std::string(name))` did (a HIT),
++// and still throw std::out_of_range, naming the resource, for a name that
++// was never one of CompiledGraph::resources()' own entries at all (a MISS)
++// -- matrix's own proposed test shape for the transparent-hash fix.
++TEST_CASE("PassContext resolvers: nameToIndex's transparent string_view lookup resolves a real name (hit) and "
++          "throws std::out_of_range naming a nonexistent one (miss), same as the old std::string-keyed lookup did "
++          "[Task 23]") {
++    auto fixture = makeFixture("rx_graph_gpu_name_lookup");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    const VkDevice device = fixture->device.device();
++
++    bool ran = false;
++    VkFormat resolvedFormat = VK_FORMAT_UNDEFINED;
++
++    RenderGraph graph;
++    graph.addPass("fill").addColorOutput("bb", absoluteColorDesc(kExtent, kExtent)).setExecute([&](PassContext& ctx) {
++        ran = true;
++
++        // HIT: "bb" is a real, realized resource name.
++        resolvedFormat = ctx.imageFormat("bb");
++        CHECK(ctx.imageView("bb") != VK_NULL_HANDLE);
++
++        // MISS: never a CompiledGraph::resources() entry at all -- must
++        // throw std::out_of_range, naming the resource, not silently
++        // resolve to a meaningless handle or crash.
++        try {
++            static_cast<void>(ctx.imageView("does_not_exist"));
++            FAIL("expected ctx.imageView(\"does_not_exist\") to throw std::out_of_range");
++        } catch (const std::out_of_range& e) {
++            const std::string what = e.what();
++            CHECK(what.find("no realized resource named") != std::string::npos);
++            CHECK(what.find("does_not_exist") != std::string::npos);
++        }
++    });
++    graph.setBackbufferSource("bb");
++
++    CompileInfo info;
++    info.swapchainWidth = kExtent;
++    info.swapchainHeight = kExtent;
++    info.swapchainFormat = kFormat;
++    info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    graph.compile(info);
++    fixture->executor->realize(graph);
++
++    auto offscreen = createOffscreenImage(device, fixture->device.physicalDevice(), kFormat, VkExtent2D{kExtent, kExtent});
++    REQUIRE(offscreen.has_value());
++    auto cmdCtx =
++        rx::rhi::CommandContext::create(device, fixture->device.graphicsQueue(), fixture->device.graphicsQueueFamily());
++    REQUIRE(cmdCtx.has_value());
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
++    });
++
++    CHECK(ran);
++    CHECK(resolvedFormat == kFormat);
++
++    vkDeviceWaitIdle(device);
++    destroyOffscreenImage(device, *offscreen);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++// [Task 23, gate ticket #29 / gate matrix issue29-executor-allocations.md /
++// rulings-2026-08-18.md §#29] THE zero-alloc acceptance-criterion test:
++// Executor::execute() performs zero heap allocations in steady state
++// (unchanged graph, unchanged resource count). Methodology is BOUND by the
++// gate ruling: capacity-snapshot via the test-only
++// detail::allocationCapacitiesForTesting() accessor, NOT global
++// operator-new interposition (this binary links volk, the Vulkan
++// validation layers, and -- via rx_shader_deploy_runtime_libs() -- Slang's
++// own runtime; a process-wide operator-new/delete override risks
++// interacting with all three in ways this task cannot verify are safe
++// without a dedicated spike, per the ruling's own reasoning). A capacity
++// staying bit-for-bit identical across N further steady-state frames after
++// a warm-up is, per that same ruling, a deliberately accepted limitation
++// (blind to a same-sized reallocation, astronomically unlikely for
++// std::vector's own deterministic doubling growth) rather than a true
++// allocation COUNT -- see this task's own report for the revert-probe that
++// establishes this methodology's actual discriminating power.
++//
++// The graph below is deliberately representative of every site this task
++// touched, in ONE frame: "produce" (a bare AsyncCompute storage-buffer
++// producer -- exercises the pooled-buffer first-use synthesis path,
++// combinedAccessScratch), "fillWhole" (an ordinary whole-pass color
++// output -- colorPhysIdx/colorAttachments/barrier scratch), "probe" (a
++// bare pass resolving TWO real names via PassContext, exercising
++// lookupResolvedIndex()'s transparent lookup on the hot path -- see the
++// dedicated hit/miss test above for that site's own correctness proof),
++// and "fillChunked" (a CHUNKED pass into the backbuffer -- debug-label
++// scratch, both chunk-command-buffer scratch arrays). Tracy's own
++// dynamic-zone-name allocations (RX_ZONE_DYNAMIC_NAME/RX_GPU_ZONE_DYNAMIC,
++// both hit every pass this graph runs) are a documented third-party
++// exception this methodology is naturally blind to either way -- see
++// combineAccessesByResource()/profile.h/tracy_gpu.h's own comments; this
++// project's `-DTRACY_ON_DEMAND=ON` build additionally means neither macro
++// reaches its own allocating path at all while no profiler is connected
++// (verified this task by tracing TracyVulkan.hpp's transient VkCtxScope
++// constructor to Profiler::AllocSourceLocation(), gated by
++// `is_active && GetProfiler().IsConnected()` -- the same gate
++// profile.h's own RX_ZONE_DYNAMIC_NAME comment already documents for the
++// CPU-side macro), which is the representative configuration this test
++// (and every ctest run in this repo) actually exercises.
++TEST_CASE("Executor::execute performs zero heap allocations in steady state -- every Impl-persistent scratch "
++          "buffer's capacity stays bit-for-bit unchanged across many further execute() calls after a warm-up "
++          "[Task 23, gate ticket/matrix/ruling #29]") {
++    auto fixture = makeFixture("rx_graph_gpu_zero_alloc");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    const VkDevice device = fixture->device.device();
++    const VkPhysicalDevice physicalDevice = fixture->device.physicalDevice();
++
++    auto fillPipeline = buildFillPipeline(device, kFormat);
++    REQUIRE(fillPipeline.has_value());
++
++    auto offscreen = createOffscreenImage(device, physicalDevice, kFormat, VkExtent2D{kExtent, kExtent});
++    REQUIRE(offscreen.has_value());
++
++    BufferDesc dataDesc;
++    dataDesc.size = 256;
++    dataDesc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
++
++    RenderGraph graph;
++    graph.addPass("produce", QueueClass::AsyncCompute).addStorageBufferOutput("data", dataDesc).setSideEffect();
++    graph.addPass("fillWhole")
++        .addColorOutput("colorA", absoluteColorDesc(kExtent, kExtent))
++        .setExecute([&](PassContext& ctx) { recordCells(ctx.cmd, *fillPipeline, kExtent, 0, kCellCount); });
++    graph.addPass("probe")
++        .addTextureInput("colorA")
++        .addStorageBufferInput("data")
++        .setSideEffect()
++        .setExecute([&](PassContext& ctx) {
++            CHECK(ctx.imageView("colorA") != VK_NULL_HANDLE);
++            CHECK(ctx.buffer("data") != VK_NULL_HANDLE);
++        });
++    graph.addPass("fillChunked")
++        .addColorOutput("bb", absoluteColorDesc(kExtent, kExtent))
++        .setExecuteChunked([&](PassContext& ctx, uint32_t chunkIndex, uint32_t chunkCount) {
++            const uint32_t cellsPerChunk = (kCellCount + chunkCount - 1) / chunkCount;
++            const uint32_t begin = std::min(chunkIndex * cellsPerChunk, kCellCount);
++            const uint32_t end = std::min(begin + cellsPerChunk, kCellCount);
++            recordCells(ctx.chunkCommandBuffer(), *fillPipeline, kExtent, begin, end);
++        });
++    graph.setBackbufferSource("bb");
++
++    CompileInfo info;
++    info.swapchainWidth = kExtent;
++    info.swapchainHeight = kExtent;
++    info.swapchainFormat = kFormat;
++    info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    graph.compile(info);
++    fixture->executor->realize(graph);
++
++    auto cmdCtx =
++        rx::rhi::CommandContext::create(device, fixture->device.graphicsQueue(), fixture->device.graphicsQueueFamily());
++    REQUIRE(cmdCtx.has_value());
++
++    auto runOneFrame = [&] {
++        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++            fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
++        });
++    };
++
++    // Warm-up: enough execute() calls for every Impl-persistent buffer to
++    // reach its steady-state peak capacity, including BOTH chunk
++    // command-buffer frame slots (chunkFrameSlot alternates 0/1 every
++    // call -- see Executor::execute()'s own comment) -- matches
++    // acquireChunkCommandBuffer()'s own documented "stabilizes after the
++    // first kFramesInFlight execute() calls" budget, doubled here for
++    // margin.
++    constexpr int kWarmupFrames = 4;
++    for (int i = 0; i < kWarmupFrames; ++i) {
++        runOneFrame();
++    }
++
++    const rx::graph::detail::ExecutorAllocationCapacitiesForTesting before =
++        rx::graph::detail::allocationCapacitiesForTesting(*fixture->executor);
++    // A completely untouched capacity struct (every field still 0) would
++    // make every CHECK below trivially, uselessly pass -- assert the graph
++    // genuinely exercised at least the always-present per-execute tracking
++    // vectors before trusting the steady-state comparison that follows.
++    REQUIRE(before.firstBarrierSeen > 0);
++    REQUIRE(before.finalStageThisExecute > 0);
++
++    constexpr int kSteadyFrames = 10;
++    for (int frame = 0; frame < kSteadyFrames; ++frame) {
++        runOneFrame();
++        const rx::graph::detail::ExecutorAllocationCapacitiesForTesting after =
++            rx::graph::detail::allocationCapacitiesForTesting(*fixture->executor);
++
++        INFO("frame=", frame);
++        CHECK(after.firstBarrierSeen == before.firstBarrierSeen);
++        CHECK(after.attachmentEverWritten == before.attachmentEverWritten);
++        CHECK(after.touchedThisExecute == before.touchedThisExecute);
++        CHECK(after.finalStageThisExecute == before.finalStageThisExecute);
++        CHECK(after.finalAccessThisExecute == before.finalAccessThisExecute);
++        CHECK(after.colorPhysIdxScratch == before.colorPhysIdxScratch);
++        CHECK(after.colorAttachmentsScratch == before.colorAttachmentsScratch);
++        CHECK(after.vkImageBarriersScratch == before.vkImageBarriersScratch);
++        CHECK(after.vkBufferBarriersScratch == before.vkBufferBarriersScratch);
++        CHECK(after.combinedAccessScratch == before.combinedAccessScratch);
++        CHECK(after.debugLabelScratch == before.debugLabelScratch);
++        for (uint32_t slot = 0; slot < 2; ++slot) {
++            CAPTURE(slot);
++            CHECK(after.chunkBuffersScratch[slot] == before.chunkBuffersScratch[slot]);
++            CHECK(after.validChunkBuffersScratch[slot] == before.validChunkBuffersScratch[slot]);
++        }
++
++        // Second, independent signal alongside capacity -- see
++        // ExecutorAllocationCapacitiesForTesting's own doc comment
++        // (executor.h) for why capacity ALONE is empirically insufficient
++        // for a fixed-size-every-call buffer (this task's own revert-probe
++        // against the sibling DeletionQueue fix found exactly this gap).
++        // std::vector<bool> fields (firstBarrierSeen/attachmentEverWritten/
++        // touchedThisExecute) have no `.data()` companion -- see that same
++        // comment.
++        CHECK(after.finalStageThisExecuteData == before.finalStageThisExecuteData);
++        CHECK(after.finalAccessThisExecuteData == before.finalAccessThisExecuteData);
++        CHECK(after.colorPhysIdxScratchData == before.colorPhysIdxScratchData);
++        CHECK(after.colorAttachmentsScratchData == before.colorAttachmentsScratchData);
++        CHECK(after.vkImageBarriersScratchData == before.vkImageBarriersScratchData);
++        CHECK(after.vkBufferBarriersScratchData == before.vkBufferBarriersScratchData);
++        CHECK(after.combinedAccessScratchData == before.combinedAccessScratchData);
++        CHECK(after.debugLabelScratchData == before.debugLabelScratchData);
++        for (uint32_t slot = 0; slot < 2; ++slot) {
++            CAPTURE(slot);
++            CHECK(after.chunkBuffersScratchData[slot] == before.chunkBuffersScratchData[slot]);
++            CHECK(after.validChunkBuffersScratchData[slot] == before.validChunkBuffersScratchData[slot]);
++        }
++    }
++
++    vkDeviceWaitIdle(device);
++    destroyFillPipeline(device, *fillPipeline);
++    destroyOffscreenImage(device, *offscreen);
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/deletion_queue.h b/src/rx_rhi_vk/include/rx_rhi_vk/deletion_queue.h
+index ed1c635..52e1d23 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/deletion_queue.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/deletion_queue.h
+@@ -1,18 +1,57 @@
+ #pragma once
+ #include <cstddef>
+ #include <cstdint>
+ #include <functional>
+ #include <vector>
+ 
+ namespace rx::rhi {
+ 
++class DeletionQueue;
++
++namespace detail {
++
++// [Phase 4 Task 23, gate ruling #29] Test-only seam -- NOT part of the
++// stable public contract, mirroring rx::graph::detail::debugChunkStats()/
++// rx::scene::detail::capacitiesForTesting()'s own carve-out convention.
++// Returns `queue`'s own private Item-vector `.capacity()` as of the moment
++// it is called -- pendingCount() above only exposes `.size()`, which the
++// zero-alloc regression proof for onFrameFenceSignaled()'s in-place
++// compaction needs to distinguish from actual reallocation.
++[[nodiscard]] size_t itemCapacityForTesting(const DeletionQueue& queue);
++
++// [Phase 4 Task 23] `queue`'s own private Item-vector `.data()` pointer, as
++// an opaque `const void*` (identity comparison only -- the pointed-to
++// `Item` type is private to DeletionQueue, so no caller outside this class
++// could dereference it anyway). A REAL, EMPIRICALLY VERIFIED limitation of
++// `itemCapacityForTesting()` alone this task's own revert-probe found: for
++// a queue whose pending-item COUNT is identical every call (this test's own
++// steady-state shape), a buggy "build a fresh vector every call" version
++// reserves/ends up at the exact SAME final capacity every time too (a
++// from-empty `reserve(n)`/vector-of-size-n allocates EXACTLY capacity n,
++// with no extra headroom to differ by) -- capacity alone cannot distinguish
++// "genuinely reused storage" from "freshly reconstructed to an identical
++// final size," so pointer identity is checked ALONGSIDE capacity as a
++// second, independent signal (matching rx_scene::DrawListBuilder's own
++// zero-alloc test precedent, draw_list_test.cpp, which checks both for the
++// identical reason -- "capacity equality and .data() pointer identity are
++// both checked... but neither is sufficient on its own"). Still not
++// airtight on its own either (a freed-then-immediately-reallocated
++// same-size block can legitimately land on the same address under some
++// allocators/workloads) -- see this task's own report for the full,
++// honest accounting of what this combined signal can and cannot prove
++// without the global operator-new interposition the gate ruling bars for
++// this binary's own volk/validation-layer linkage.
++[[nodiscard]] const void* itemDataForTesting(const DeletionQueue& queue);
++
++}  // namespace detail
++
+ // Fence-gated deferred-destruction queue [spec Fixed decision #9]. A
+ // resource retired while it might still be referenced by an in-flight
+ // command buffer must not actually be destroyed until the GPU has
+ // finished with it -- retire() tags a destructor closure with the frame
+ // index the resource was last used in; onFrameFenceSignaled(frameIndex)
+ // runs (and permanently removes) every retired destructor whose tagged
+ // frame index is <= the frame index the caller has just confirmed
+ // completed on the GPU.
+ //
+ // This class deliberately owns NO Vulkan state at all -- no VkDevice, no
+@@ -110,19 +149,22 @@ public:
+     // never runs a destructor while the GPU could still be using the
+     // resource it frees. Safe to call on an already-empty queue (still
+     // invokes `waitIdleFirst` if provided, then no-ops).
+     void flushAll(const std::function<void()>& waitIdleFirst = {});
+ 
+     // Number of retired destructors not yet run. Test/diagnostic
+     // accessor -- production frame-loop code has no need for it.
+     size_t pendingCount() const { return items_.size(); }
+ 
+ private:
++    friend size_t detail::itemCapacityForTesting(const DeletionQueue&);
++    friend const void* detail::itemDataForTesting(const DeletionQueue&);
++
+     struct Item {
+         uint64_t frameIndex = 0;
+         std::function<void()> destructor;
+     };
+ 
+     std::vector<Item> items_;
+ };
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/deletion_queue.cpp b/src/rx_rhi_vk/src/deletion_queue.cpp
+index d0491e5..8c32b64 100644
+--- a/src/rx_rhi_vk/src/deletion_queue.cpp
++++ b/src/rx_rhi_vk/src/deletion_queue.cpp
+@@ -1,17 +1,22 @@
+ #include <rx_rhi_vk/deletion_queue.h>
+ #include <rx_core/debug_checks.h>
+ #include <rx_core/log.h>
+ #include <utility>
+ 
+ namespace rx::rhi {
+ 
++namespace detail {
++size_t itemCapacityForTesting(const DeletionQueue& queue) { return queue.items_.capacity(); }
++const void* itemDataForTesting(const DeletionQueue& queue) { return queue.items_.data(); }
++}  // namespace detail
++
+ DeletionQueue::~DeletionQueue() {
+     if (!items_.empty()) {
+         RX_LOG_ERROR(
+             "DeletionQueue destroyed with {} destructor(s) never flushed -- call flushAll() before destruction; "
+             "their captured resources are being destroyed now, with no device-idle guarantee",
+             items_.size());
+     }
+ }
+ 
+ void DeletionQueue::retire(std::function<void()> destructor, uint64_t frameIndex) {
+@@ -23,39 +28,63 @@ void DeletionQueue::retire(std::function<void()> destructor, uint64_t frameIndex
+     // chunk >= 1 caller could plausibly reach mid-frame).
+     RX_ASSERT_MAIN_THREAD("DeletionQueue::retire");
+     items_.push_back(Item{frameIndex, std::move(destructor)});
+ }
+ 
+ void DeletionQueue::onFrameFenceSignaled(uint64_t completedFrameIndex) {
+     if (items_.empty()) {
+         return;
+     }
+ 
+-    // Two-pass rather than an erase-remove-with-side-effects idiom: the
+-    // predicate in std::remove_if/std::erase_if is not guaranteed to be
+-    // invoked exactly once per element, which would make "call the
+-    // destructor as a side effect of the predicate" unsafe. Building a
+-    // fresh `remaining` vector, running due destructors in their original
+-    // retire() order along the way, keeps both guarantees ("runs each due
+-    // destructor exactly once" and "preserves order") simple and correct.
+-    std::vector<Item> remaining;
+-    remaining.reserve(items_.size());
+-    for (auto& item : items_) {
++    // In-place compaction [Phase 4 Task 23, gate ruling #29 -- "SCOPE
++    // GROWS": this non-empty-path fresh-vector allocation was a genuine,
++    // repeatable per-call heap allocation whenever anything is retired,
++    // folded into Task 23's zero-alloc scope even though this file lives
++    // outside rx_graph/executor.cpp (Executor::execute() calls directly
++    // into this function every call -- see executor.cpp's own
++    // sweepStale()/onFrameFenceSignaled() comment)] -- replaces the old
++    // "build a fresh `remaining` vector every call" two-pass with the
++    // classic erase-remove idiom, its per-element side effect run BY HAND
++    // rather than folded into the predicate: std::remove_if/std::erase_if's
++    // own predicate is not guaranteed to be invoked exactly once per
++    // element, which would make "run the destructor as a side effect of
++    // the predicate" unsafe (the same reasoning the old comment here
++    // already gave for avoiding that idiom -- still correct, just paired
++    // with a different, allocation-free compaction mechanism now).
++    // `writeIndex` tracks where the next SURVIVING item belongs;
++    // `items_[readIndex]`'s destructor still runs exactly once, in
++    // original retire() order, for every DUE item, and `items_`'s own
++    // storage/capacity is reused in place -- never replaced -- so a queue
++    // that always has something pending (the realistic "steady state" for
++    // any scene with in-flight deferred resource retirement) makes this
++    // function genuinely zero-alloc after its first call ever needed to
++    // grow `items_` to its peak size.
++    size_t writeIndex = 0;
++    for (size_t readIndex = 0; readIndex < items_.size(); ++readIndex) {
++        Item& item = items_[readIndex];
+         if (item.frameIndex <= completedFrameIndex) {
+             if (item.destructor) {
+                 item.destructor();
+             }
+         } else {
+-            remaining.push_back(std::move(item));
++            if (writeIndex != readIndex) {
++                items_[writeIndex] = std::move(item);
++            }
++            ++writeIndex;
+         }
+     }
+-    items_ = std::move(remaining);
++    // Only ever shrinks `items_`'s SIZE (every survivor already occupies
++    // [0, writeIndex) after the loop above) -- never its capacity, so this
++    // is the same "no allocation on the shrink path" guarantee
++    // std::vector::resize() always gives when the new size is <= the
++    // current size.
++    items_.resize(writeIndex);
+ }
+ 
+ void DeletionQueue::flushAll(const std::function<void()>& waitIdleFirst) {
+     if (waitIdleFirst) {
+         waitIdleFirst();
+     }
+     for (auto& item : items_) {
+         if (item.destructor) {
+             item.destructor();
+         }
+diff --git a/src/rx_rhi_vk/tests/deletion_queue_test.cpp b/src/rx_rhi_vk/tests/deletion_queue_test.cpp
+index 8323c03..1be5dde 100644
+--- a/src/rx_rhi_vk/tests/deletion_queue_test.cpp
++++ b/src/rx_rhi_vk/tests/deletion_queue_test.cpp
+@@ -83,20 +83,86 @@ TEST_CASE("DeletionQueue::flushAll runs every pending destructor regardless of f
+     CHECK(queue.pendingCount() == 0);
+ 
+     // Safe (and a true no-op beyond invoking waitIdleFirst again) on an
+     // already-empty queue.
+     bool waitedAgain = false;
+     queue.flushAll([&waitedAgain] { waitedAgain = true; });
+     CHECK(waitedAgain);
+     CHECK(count == 2);
+ }
+ 
++// [Phase 4 Task 23, gate ruling #29 -- "the pending-item test variant is
++// mandatory"] onFrameFenceSignaled()'s OWN fast path (items_.empty() ->
++// return) is trivially zero-alloc and proves nothing about the real fix --
++// this test deliberately keeps something pending across EVERY single call,
++// the realistic "steady state" for a scene with in-flight deferred
++// resource retirement (streaming/hot-reload workloads), exercising the
++// in-place compaction path itself. Same bound methodology as Task 23's
++// rx_graph zero-alloc test (capacity-snapshot via a test-only accessor,
++// not global operator-new interposition -- this binary links Vulkan/volk
++// too, via rx_rhi_vk, so the same linkage-risk reasoning applies).
++TEST_CASE("DeletionQueue::onFrameFenceSignaled compacts items_ IN PLACE -- capacity never grows once something "
++          "stays pending across many repeated calls [Task 23]") {
++    rx::rhi::DeletionQueue queue;
++    constexpr int kSlots = 2;
++    int destroyCount = 0;
++
++    // Warm-up: same frame-in-flight-style retire/signal cadence
++    // rx_graph's Executor itself drives this queue with (retire tagged at
++    // the current tick, signal `kSlots` ticks behind) -- settles into a
++    // steady "exactly kSlots items always pending" shape and lets items_'s
++    // own capacity reach its peak.
++    for (int i = 0; i < kSlots * 4; ++i) {
++        queue.retire([&destroyCount] { ++destroyCount; }, static_cast<uint64_t>(i));
++        if (i >= kSlots) {
++            queue.onFrameFenceSignaled(static_cast<uint64_t>(i - kSlots));
++        }
++    }
++    REQUIRE(queue.pendingCount() == static_cast<size_t>(kSlots));
++    CHECK(destroyCount == kSlots * 4 - kSlots);
++
++    const size_t peakCapacity = rx::rhi::detail::itemCapacityForTesting(queue);
++    REQUIRE(peakCapacity > 0);
++    // Second, independent signal alongside capacity -- see
++    // itemDataForTesting()'s own doc comment (deletion_queue.h) for why
++    // capacity ALONE is empirically insufficient here: this task's own
++    // revert-probe found that a buggy "fresh vector every call" version
++    // reaches this exact same STABLE capacity too, once the pending-item
++    // COUNT itself is steady (a from-empty reserve(n) allocates capacity
++    // == n exactly, with no headroom to differ by) -- pointer identity
++    // catches what capacity alone provably cannot in that scenario.
++    const void* peakData = rx::rhi::detail::itemDataForTesting(queue);
++    // Never empty at the top of any of these calls -- genuinely exercising
++    // the compaction path itself, never onFrameFenceSignaled()'s own
++    // separate items_.empty() fast return.
++    REQUIRE(queue.pendingCount() > 0);
++
++    constexpr int kSteadyIterations = 30;
++    const int baseI = kSlots * 4;
++    for (int step = 0; step < kSteadyIterations; ++step) {
++        const int i = baseI + step;
++        REQUIRE_FALSE(queue.pendingCount() == 0);
++        queue.retire([&destroyCount] { ++destroyCount; }, static_cast<uint64_t>(i));
++        queue.onFrameFenceSignaled(static_cast<uint64_t>(i - kSlots));
++
++        INFO("step=", step);
++        CHECK(rx::rhi::detail::itemCapacityForTesting(queue) == peakCapacity);
++        CHECK(rx::rhi::detail::itemDataForTesting(queue) == peakData);
++        CHECK(queue.pendingCount() == static_cast<size_t>(kSlots));
++    }
++
++    // Drain the remaining kSlots pending items so the destructor's own
++    // "destroyed with items never flushed" RX_LOG_ERROR guard stays quiet.
++    queue.flushAll();
++    CHECK(destroyCount == kSlots * 4 + kSteadyIterations);
++}
++
+ namespace {
+ 
+ // Pure headless fixture -- no window/surface/swapchain -- matching
+ // bindless_test.cpp's own HeadlessBindlessFixture pattern exactly, minus
+ // anything this test doesn't need (descriptor indexing, sync2). This
+ // test's real Vulkan resources are host-visible/device-local buffers and
+ // a plain vkCmdCopyBuffer, so a minimum-1.3-version device with no extra
+ // feature structs is enough.
+ struct HeadlessFixture {
+     rx::rhi::Context context;
