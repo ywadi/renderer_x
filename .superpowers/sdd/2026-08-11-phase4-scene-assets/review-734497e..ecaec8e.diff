@@ -1,0 +1,1734 @@
+=== COMMITS ===
+ecaec8e docs: fix-round report -- coordinator review items 1-7 (card #8)
+8334803 chore(tools,samples): vendor full CC-BY-4.0/CC-BY-NC-4.0 legal texts into the redistribution zip (fix round item 4)
+9e0fcf8 feat(samples): 08_gltf_viewer perf instrumentation + orbit-camera comment fix (fix round items 6, 7)
+23837ca chore(samples): regenerate 08_gltf_viewer D17 reference after the occlusion fix (fix round item 5a)
+00cd0ff test(rx_material): fix-round test corrections (coordinator review items 1, 2, 5b)
+9a53922 fix(rx_material): occlusion applies to ambient only, not direct light (fix round item 5)
+
+=== STAT ===
+ .../task-16-report.md                              | 116 +++++-
+ samples/08_gltf_viewer/licenses/CC-BY-4.0.txt      | 396 ++++++++++++++++++++
+ samples/08_gltf_viewer/licenses/CC-BY-NC-4.0.txt   | 408 +++++++++++++++++++++
+ samples/08_gltf_viewer/main.cpp                    |  67 +++-
+ samples/08_gltf_viewer/references/loaded_scene.png | Bin 21255 -> 21400 bytes
+ samples/README.md                                  |  17 +-
+ shaders/material/standard_pbr.slang                |  15 +-
+ src/rx_material/tests/test_standard_pbr_unlit.cpp  | 261 +++++++++++--
+ tools/package_samples.sh                           |  18 +-
+ 9 files changed, 1246 insertions(+), 52 deletions(-)
+
+=== FULL DIFF (U10) ===
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-16-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-16-report.md
+index 9f7772f..2769195 100644
+--- a/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-16-report.md
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-16-report.md
+@@ -100,17 +100,131 @@ Five load-bearing mechanisms, each empirically defeated in place (never committe
+ ## 7. Environment note: locating lavapipe locally
+ 
+ This dev machine's default Vulkan device is a real (NVIDIA) GPU, not lavapipe, so `--validate` runs and the D17 gate both needed `VK_ICD_FILENAMES` forced to the system's real lavapipe ICD to match CI's own only-driver-available posture. `mesa-vulkan-drivers` was already installed system-wide (`/usr/share/vulkan/icd.d/lvp_icd.json` + `/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so`) — used directly; a separately-extracted, glibc-incompatible `.deb` payload found in this session's own scratchpad directory (apparently left over from an earlier, abandoned attempt) was not usable and was not relied on. `tools/regen_references.sh` bakes this same ICD path in and fails loudly if it is not present, rather than silently regenerating against whatever driver happens to be default.
+ 
+ ## 8. Deviations from a literal reading of the brief
+ 
+ - **`MaterialSystem::bindInstance()` is not used by `08_gltf_viewer`.** The brief's plan text does not explicitly forbid it, but `material_system.cpp`'s own `bindInstance()` doc comment (already present before this task touched it, extended in commit 1) states in so many words that a real D26.1 caller drives its own draw-data buffer and pushes the range itself, "never through this method" — I followed that documented contract rather than the more superficially-convenient `bindInstance()` call, and built the sample's own manual bind sequence (pipeline resolve via the same `getPipeline()`, a real `MaterialGlobalsPush`, a hand-built but pipeline-layout-*compatible* set-1 descriptor layout per the Vulkan spec's own "identically defined" rule). This is the only way the sample's own `--exposure` and real per-scene draw-data buffer can reach the shader at all.
+ - **Light/ambient tuning is a sample-level judgment call, not a spec value.** D22/FG1 fix the *mechanism* (Lambertian + GGX + a flat ambient term) but not specific brightness constants. The shipped defaults (`lightColor=(5,5,5)`, `ambientColor=0.18`) were chosen empirically against DamagedHelmet's own genuinely-dark base-color texture so the showcase sample's default render is legible without IBL (deferred to the techniques phase per D22's own scope) — documented in `updateDrawDataPerPassFields()`'s own comment, including the precedent (`shaders/multipass/lit.frag.slang`'s `kAmbient=0.08`) these values were nudged brighter from.
+ - **Pre-existing `samples/README.md`/`.github/workflows/ci.yml` staleness beyond sample 08 itself was also fixed while already touching those files** (07_stress had never been added to `samples/README.md`'s top-of-file bundle listing or its "Running the automated test suite" section) — a small, low-risk, in-scope-adjacent cleanup rather than leaving a doubly-stale list behind.
+ 
+-## 9. Self-review
++## 9. Fix round (coordinator review, two independent reviewers)
++
++Commits (in order, after the base report's own `734497e`):
++
++1. `9a53922` — `fix(rx_material): occlusion applies to ambient only, not direct light (fix round item 5)`
++2. `00cd0ff` — `test(rx_material): fix-round test corrections (coordinator review items 1, 2, 5b)`
++3. `23837ca` — `chore(samples): regenerate 08_gltf_viewer D17 reference after the occlusion fix (fix round item 5a)`
++4. `9e0fcf8` — `feat(samples): 08_gltf_viewer perf instrumentation + orbit-camera comment fix (fix round items 6, 7)`
++5. `8334803` — `chore(tools,samples): vendor full CC-BY-4.0/CC-BY-NC-4.0 legal texts into the redistribution zip (fix round item 4)`
++
++Same rules as the base report: no AI attribution, local commits only (not pushed), only files this fix round produced were committed.
++
++### Item 1 (Important) — D26.1 two-draw test was depth-tie-masked; reworked and revert-proven
++
++**Root cause, confirmed by a second, independent reviewer's own SPIR-V disassembly**: `SV_InstanceID` genuinely emits `OpISub InstanceIndex, BaseInstance` on this project's pinned Slang/SPIR-V target (my own earlier flagged "contradiction" in the base report was wrong — settled with ground truth, not touched further; the three header comments asserting this were correct all along). The ORIGINAL test's own failure to catch this was a **test bug**, not a false claim about Slang: row 1's quad was placed fully OFF the ortho frustum, so under the `SV_InstanceID` revert bug, draw 2's mis-addressed fragments (reading row 0's IDENTITY transform) landed exactly on top of row 0's own already-written, identical-depth quad — this project's fixed `VK_COMPARE_OP_LESS` (strict) depth-compare state then rejected every one of those fragments as a depth tie, so the framebuffer read back identical to the CORRECT-behavior case either way. The single-center-pixel probe could not distinguish "row 1 correctly off-frustum, nothing to see" from "row 1 wrongly on top of row 0, rejected by a depth tie."
++
++**Fix**: `makeHeadOnRow()` gained an optional `orthoHalfExtent` parameter (default `0.5F`, unchanged for all 46 other call sites); the D26.1 test now widens the frustum to `3.0` and places row 1's quad at a genuinely separate, on-screen, non-overlapping world location (`+2` in X) instead of off-frustum. `renderQuad()`'s single-pixel-readback body was split into a shared `renderQuadPixels()` (returns the full raw RGBA8 buffer for an arbitrary extent) + `pixelAt()` (extracts one texel) — `renderQuad()` itself is now a thin wrapper, unchanged in signature/behavior for its other 46 callers. The test now probes row 0's location (must read RED) and row 1's own, separate location (must read GREEN — the real discriminator).
++
++**Revert evidence** (scratch, in place, never committed):
++
++```
++$ # baseline (SV_VulkanInstanceID, correct):
++[doctest] test cases:  1 |  1 passed | 0 failed | 46 skipped
++[doctest] assertions: 42 | 42 passed | 0 failed |
++
++$ # reverted forward_entry.slang: SV_VulkanInstanceID -> SV_InstanceID
++.../test_standard_pbr_unlit.cpp:773: ERROR: CHECK( row1Pixel.g > 200 ) is NOT correct!
++  values: CHECK( 0 >  200 )
++[doctest] test cases:  1 |  0 passed | 1 failed | 46 skipped
++[doctest] assertions: 42 | 41 passed | 1 failed |
++
++$ # restored SV_VulkanInstanceID -> full suite green again (see §3 below)
++```
++
++`row1Pixel.g == 0` under the revert is exactly the predicted mechanism: the buggy second draw never reaches row 1's own real, separate screen location at all (its fragments land on row 0's, where the depth tie silently swallows them), so that location reads back the plain background clear color instead of green — unambiguous, with no depth-tie possible between two draws that no longer even hit the same pixels.
++
++### Item 2 (Important) — dedicated emissive probe added; report erratum corrected
++
++Two new `TEST_CASE`s: a factor-only probe (`emissiveFactorAndPad=(0.2,0.4,0.6)`, light+ambient zeroed on the row, expects an exact `(51,102,153)` byte readback) and a textured variant (`emissiveFactor=(1,1,1)` × a `(100,150,200)` texel, same isolation technique, expects an exact product). Both isolate emissive by zeroing `lightColor`/`ambientColor` (not `baseColor`, which would still leave a real, nonzero dielectric `F0=0.04` specular term reachable) — `color = directLight + ambient + emissive` collapses to exactly `emissive` regardless of `baseColor`/`metallic`/`roughness`, which are deliberately left at their ordinary neutral defaults rather than special-cased, to prove independence from them too.
++
++**§2 table erratum** (this report, base version): the row claiming emissive coverage was added post-hoc and is now actually true; at the time it was written, `emissiveFactorAndPad` was set to `{0,0,0,0}` at exactly one call site in the whole file (the shared neutral-default blob builder) and never overridden anywhere — no test exercised a nonzero value. Corrected by this fix round's own new test cases, not by editing the prose of an already-committed report (this section is the correction of record).
++
++### Item 3 (Minor) — report erratum: TEST_CASE count
++
++The base report's own file list said "47 TEST_CASEs / 1982 assertions" for `test_standard_pbr_unlit.cpp` specifically. That was **the whole `rx_material_gpu_tests` binary's own total** (across `test_material_system.cpp`, `test_api_factory.cpp`, `test_param_arena.cpp`, and this file combined), not this file's own count. Corrected, counted directly (`grep -c '^TEST_CASE'` per file, summed and cross-checked against the doctest-reported binary total):
++
++| File | TEST_CASEs |
++|---|---|
++| `test_material_system.cpp` | 17 |
++| `test_api_factory.cpp` | 13 |
++| `test_param_arena.cpp` | 2 |
++| `test_standard_pbr_unlit.cpp` | **17** (15 at the base report's own commit `4cb7562`; +2 this fix round, item 2) |
++| **Binary total** | **49** (`49 | 49 passed | 0 failed`, `2156 | 2156 passed | 0 failed` — see §3 below) |
++
++### Item 4 (Minor, coordinator-ruled) — full CC-BY-4.0/CC-BY-NC-4.0 legal texts now shipped
++
++Fetched verbatim (`curl` against `creativecommons.org/licenses/{by,by-nc}/4.0/legalcode.txt`, 396 and 408 lines respectively, each a complete, well-formed legal document from its own title through "Creative Commons may be contacted at creativecommons.org.") and vendored as committed files (`samples/08_gltf_viewer/licenses/CC-BY-4.0.txt` / `CC-BY-NC-4.0.txt`) rather than fetched at package time — a small, static legal document is exactly the kind of third-party content this project already commits directly (unlike `assets/fetched/`'s own large, gitignored binary content), and vendoring keeps `tools/package_samples.sh` network-free, matching its own pre-existing posture. `LICENSE.txt` (the human-readable attribution notice) stays, now explicitly pointing at the two bundled full texts instead of external URLs.
++
++**Verified**: re-ran `tools/package_samples.sh` for both `linux-native` and `windows-cross-zig`; `unzip -l` on both output `.zip`s shows all three files (`LICENSE.txt`, `CC-BY-4.0.txt` 18657 bytes, `CC-BY-NC-4.0.txt` 19347 bytes) under `08_gltf_viewer/assets/DamagedHelmet/`; extracted both license files from the `linux-native` zip to a scratch directory and `diff`'d them against the vendored source -- byte-identical (`CC-BY-4.0 identical` / `CC-BY-NC-4.0 identical`).
++
++### Item 5 (Important, shipped-shader fix) — occlusion no longer attenuates direct light
++
++**Fix**: `standard_pbr.slang`'s `color = directLight * occlusion + ambient + emissive` became `color = directLight + ambient + emissive` — occlusion now applies exclusively to the ambient term, matching the glTF spec's own occlusionTexture text, all three first-tier references this task's own matrix cites, and the gate matrix's own occlusion acceptance criterion (scoped to the ambient contribution alone). Prevents double-darkening a directly-lit, occluded surface today, and prevents double-counting against a real direct-light visibility term (shadow maps) once Task 22 lands one.
++
++**Test extension + revert evidence**: the existing occlusion closed-form `TEST_CASE` gained a third case — a direct-lit (default head-on rig, `NdotL=1`), ambient-zeroed comparison between an unoccluded (`occlusion=1`) and heavily-occluded (`occlusion=0`, the same `blackOcclusionTex` the existing ambient-only cases already use) render of an otherwise-identical material, asserting the two read back identical (occlusion must not touch direct light at all when ambient contributes nothing).
++
++```
++$ # reverted: color = directLight * occlusion + ambient + emissive (the old, spec-incorrect form)
++.../test_standard_pbr_unlit.cpp:1126: ERROR: CHECK( near8(directOccludedPixel.r, directUnoccludedPixel.r, 2) ) is NOT correct!
++  values: CHECK( false )
++.../test_standard_pbr_unlit.cpp:1127: ERROR: CHECK( near8(directOccludedPixel.g, directUnoccludedPixel.g, 2) ) is NOT correct!
++  values: CHECK( false )
++.../test_standard_pbr_unlit.cpp:1128: ERROR: CHECK( near8(directOccludedPixel.b, directUnoccludedPixel.b, 2) ) is NOT correct!
++  values: CHECK( false )
++[doctest] test cases:   1 |   0 passed | 1 failed | 48 skipped
++[doctest] assertions: 162 | 159 passed | 3 failed |
++
++$ # restored -> full suite green again (see §3 below)
++```
++
++The two PRE-EXISTING assertions in this same `TEST_CASE` (ambient-only closed-form, R=0/strength=1 and strength=0.5) were unaffected by either the fix or the revert either way: both already used a light pointed AWAY from the surface (`NdotL=0`), so `directLight` was already zero in both branches regardless of the occlusion multiply — confirmed by inspection (no regression risk) and by the full-suite pass count staying at 49/49 both before and after this item.
++
++**D17 reference regeneration** (the sanctioned case, sequenced once, after every shader change in this fix round landed — commit `23837ca`): `tools/regen_references.sh linux-native` under the forced system lavapipe ICD. `loading_state.png` is byte-unchanged (that D17 frame never reaches the material shader). `loaded_scene.png` changed (21255 → 21400 bytes) — DamagedHelmet's own occlusion texture now legitimately brightens its directly-lit surface slightly. Visually inspected (still a recognizable, correctly-shaded helmet, no regression). Re-ran the headless gate against the new reference: `D17 loading_state gate: failingPixels=0/65536 pass=true`, `D17 loaded_scene gate: failingPixels=0/65536 pass=true`, `headless gate PASSED`.
++
++### Item 6 (Important) — measured performance numbers
++
++**Capture method** (disclosed per the measured-claims rule): direct `std::chrono::steady_clock` wall-clock instrumentation added to `runHeadless()` in `samples/08_gltf_viewer/main.cpp`, printed via a real, greppable `RX_LOG_INFO("sample08: perf ...")` line (matching `sample_07_stress`'s own `"stress:"` stats-line convention) in a real run under the system's own lavapipe ICD, Xvfb. **Not** a live Tracy GUI/network capture — this dev environment has no Tracy GUI attached, and this project's own build graph does not build Tracy's own separate `tracy-capture` CLI tool (a real, but materially larger, undertaking than this fix round's own scope called for). Task 15's own `RX_ZONE` Tracy zones around the async-import pipeline remain fully present, unaffected, and available for a real interactive Tracy GUI session (`RX_TRACY=ON` in the `linux-native` preset, `CMakePresets.json`) — this is a second, independent, always-on measurement, not a replacement for them.
++
++`import_ms`: wall-clock from the `importGltfAsync()` kickoff to its completion callback confirming `setupMaterials()`/`buildDrawList()` both succeeded. `first_frame_ms`: wall-clock from `runHeadless()`'s own first instruction (before Window/Context/Device/Allocator/MaterialSystem/GeometryPool/TextureCache/Executor construction, the tonemap pipeline build, and the loading-state frame) through the first fully rendered, GPU-readback-confirmed POST-IMPORT frame -- genuine cold-start time to a real, correct pixel on screen, not import alone.
++
++Three consecutive runs, DamagedHelmet, `linux-native`, system lavapipe (`/usr/share/vulkan/icd.d/lvp_icd.json`), Xvfb:
++
++```
++sample08: perf scene='.../DamagedHelmet.gltf' import_ms=349.872 first_frame_ms=855.580
++sample08: perf scene='.../DamagedHelmet.gltf' import_ms=350.358 first_frame_ms=858.292
++sample08: perf scene='.../DamagedHelmet.gltf' import_ms=356.609 first_frame_ms=852.581
++```
++
++`import_ms` ≈ 350ms, `first_frame_ms` ≈ 855ms, consistent across runs (< 2% spread). Both include lavapipe's own software-rasterizer/CPU-decode overhead (this is a software Vulkan implementation, not representative of a real GPU's own timing) and this specific dev machine's own CPU. **Steam Deck hardware was not available in this environment** — no number to report there; flagging rather than fabricating one, per this project's own measured-claims discipline. A real-GPU/Steam-Deck capture is follow-up work for whichever task/gate actually owns Phase 4's stage-exit performance-number requirement (this task-level ask was for `import_ms`/`first_frame_ms` numbers to exist in this report at all, which they now do).
++
++### Item 7 (Minor) — stale comment corrected
++
++Three comments in `samples/08_gltf_viewer/main.cpp` claimed the mouse-drag orbit camera reads state "via `Window::sdlWindow()`" — the actual code (unchanged, always correct) calls SDL3's global `SDL_GetMouseState()` directly, which takes no window argument at all in SDL3 (it queries OS-level cursor state, not scoped through any specific `SDL_Window*`). This already satisfies gate ruling #8's own underlying intent (sample-local, no `rx_platform` input surface pulled forward) without actually needing `Window::sdlWindow()` for this specific query. Comments corrected to describe the real call; no behavior change.
++
++### Suite status after the full fix round
++
++**linux-native**, full `ctest` (serial, lavapipe forced): `100% tests passed, 0 tests failed out of 22` (64.50s). `rx_material_gpu_tests` alone: `49 | 49 passed | 0 failed`, `2156 | 2156 passed | 0 failed`.
++
++**windows-cross-zig**: full `cmake --build` (all targets) exits 0. `ctest -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample'` (CI's own exact filter) under Wine: `100% tests passed, 0 tests failed out of 10` (101.38s).
++
++**Packaging**: `tools/package_samples.sh` re-run for both presets; both output `.zip`s carry the full license texts (§ item 4) and the regenerated D17 reference (§ item 5); the `linux-native` zip's own `08_gltf_viewer/` was unzipped to a scratch directory outside the build tree and its headless gate re-run standalone -- `headless gate PASSED`, 0 failing pixels on both frames.
++
++## 10. Self-review (base report) / fix-round self-review addendum
++
++Fix-round addendum: every one of the seven coordinator-review items above has direct empirical evidence (two real reverts with pasted failure output for items 1 and 5; a byte-identical diff for item 4; three consecutive measured runs for item 6; a direct file-count grep for item 3) rather than an assertion. The one open item from the base report (§ "Known gaps") — the `SV_InstanceID` documentation-vs-observed-behavior discrepancy — is now fully resolved by the coordinator's own independent SPIR-V disassembly and standalone Vulkan repro: the three header comments were correct, my own base-report flag was a false alarm caused by the depth-tie test bug fixed in item 1 above, and no code or comment changes were needed for that claim itself.
+ 
+ - Every acceptance-criterion row in the completeness matrix has a dedicated, passing GPU test (§2); the five most safety-critical mechanisms additionally have empirical revert-testing evidence (§6), with one genuine unresolved discrepancy flagged rather than hidden.
+ - Both presets build clean; both presets' full applicable test suites are green; the packaged, standalone `.zip` output was actually unzipped and run outside the build tree.
+ - Four real, non-trivial bugs were root-caused and fixed during this task (§5), one of them (the `cmdCtx`/`frameSync` teardown-ordering bug) directly matching this stage's own standing "abandon/teardown paths need real-GPU-resource tests" review lesson — found specifically *because* I insisted on driving a real SDL-delivered quit signal under Xvfb rather than accepting the sample's own headless-mode-only green ctest run as sufficient evidence for present-mode's own teardown path.
+ - No AI attribution anywhere in history; only my own files committed, verified directly via `git status --short` after the final commit (not merely assumed).
+ - Known gaps for a future task/follow-up: the `SV_InstanceID` documentation-vs-observed-behavior discrepancy (§6) is unresolved; `--present` mode's own mouse-drag orbit and visual quality have not been watched by a human on real display hardware (only functionally verified under Xvfb+lavapipe, `MANUAL_VERIFICATION.md`'s own checkboxes left unchecked pending that).
+diff --git a/samples/08_gltf_viewer/licenses/CC-BY-4.0.txt b/samples/08_gltf_viewer/licenses/CC-BY-4.0.txt
+new file mode 100644
+index 0000000..da6ab6c
+--- /dev/null
++++ b/samples/08_gltf_viewer/licenses/CC-BY-4.0.txt
+@@ -0,0 +1,396 @@
++Attribution 4.0 International
++
++=======================================================================
++
++Creative Commons Corporation ("Creative Commons") is not a law firm and
++does not provide legal services or legal advice. Distribution of
++Creative Commons public licenses does not create a lawyer-client or
++other relationship. Creative Commons makes its licenses and related
++information available on an "as-is" basis. Creative Commons gives no
++warranties regarding its licenses, any material licensed under their
++terms and conditions, or any related information. Creative Commons
++disclaims all liability for damages resulting from their use to the
++fullest extent possible.
++
++Using Creative Commons Public Licenses
++
++Creative Commons public licenses provide a standard set of terms and
++conditions that creators and other rights holders may use to share
++original works of authorship and other material subject to copyright
++and certain other rights specified in the public license below. The
++following considerations are for informational purposes only, are not
++exhaustive, and do not form part of our licenses.
++
++     Considerations for licensors: Our public licenses are
++     intended for use by those authorized to give the public
++     permission to use material in ways otherwise restricted by
++     copyright and certain other rights. Our licenses are
++     irrevocable. Licensors should read and understand the terms
++     and conditions of the license they choose before applying it.
++     Licensors should also secure all rights necessary before
++     applying our licenses so that the public can reuse the
++     material as expected. Licensors should clearly mark any
++     material not subject to the license. This includes other CC-
++     licensed material, or material used under an exception or
++     limitation to copyright. More considerations for licensors:
++    wiki.creativecommons.org/Considerations_for_licensors
++
++     Considerations for the public: By using one of our public
++     licenses, a licensor grants the public permission to use the
++     licensed material under specified terms and conditions. If
++     the licensor's permission is not necessary for any reason--for
++     example, because of any applicable exception or limitation to
++     copyright--then that use is not regulated by the license. Our
++     licenses grant only permissions under copyright and certain
++     other rights that a licensor has authority to grant. Use of
++     the licensed material may still be restricted for other
++     reasons, including because others have copyright or other
++     rights in the material. A licensor may make special requests,
++     such as asking that all changes be marked or described.
++     Although not required by our licenses, you are encouraged to
++     respect those requests where reasonable. More considerations
++     for the public:
++    wiki.creativecommons.org/Considerations_for_licensees
++
++=======================================================================
++
++Creative Commons Attribution 4.0 International Public License
++
++By exercising the Licensed Rights (defined below), You accept and agree
++to be bound by the terms and conditions of this Creative Commons
++Attribution 4.0 International Public License ("Public License"). To the
++extent this Public License may be interpreted as a contract, You are
++granted the Licensed Rights in consideration of Your acceptance of
++these terms and conditions, and the Licensor grants You such rights in
++consideration of benefits the Licensor receives from making the
++Licensed Material available under these terms and conditions.
++
++
++Section 1 -- Definitions.
++
++  a. Adapted Material means material subject to Copyright and Similar
++     Rights that is derived from or based upon the Licensed Material
++     and in which the Licensed Material is translated, altered,
++     arranged, transformed, or otherwise modified in a manner requiring
++     permission under the Copyright and Similar Rights held by the
++     Licensor. For purposes of this Public License, where the Licensed
++     Material is a musical work, performance, or sound recording,
++     Adapted Material is always produced where the Licensed Material is
++     synched in timed relation with a moving image.
++
++  b. Adapter's License means the license You apply to Your Copyright
++     and Similar Rights in Your contributions to Adapted Material in
++     accordance with the terms and conditions of this Public License.
++
++  c. Copyright and Similar Rights means copyright and/or similar rights
++     closely related to copyright including, without limitation,
++     performance, broadcast, sound recording, and Sui Generis Database
++     Rights, without regard to how the rights are labeled or
++     categorized. For purposes of this Public License, the rights
++     specified in Section 2(b)(1)-(2) are not Copyright and Similar
++     Rights.
++
++  d. Effective Technological Measures means those measures that, in the
++     absence of proper authority, may not be circumvented under laws
++     fulfilling obligations under Article 11 of the WIPO Copyright
++     Treaty adopted on December 20, 1996, and/or similar international
++     agreements.
++
++  e. Exceptions and Limitations means fair use, fair dealing, and/or
++     any other exception or limitation to Copyright and Similar Rights
++     that applies to Your use of the Licensed Material.
++
++  f. Licensed Material means the artistic or literary work, database,
++     or other material to which the Licensor applied this Public
++     License.
++
++  g. Licensed Rights means the rights granted to You subject to the
++     terms and conditions of this Public License, which are limited to
++     all Copyright and Similar Rights that apply to Your use of the
++     Licensed Material and that the Licensor has authority to license.
++
++  h. Licensor means the individual(s) or entity(ies) granting rights
++     under this Public License.
++
++  i. Share means to provide material to the public by any means or
++     process that requires permission under the Licensed Rights, such
++     as reproduction, public display, public performance, distribution,
++     dissemination, communication, or importation, and to make material
++     available to the public including in ways that members of the
++     public may access the material from a place and at a time
++     individually chosen by them.
++
++  j. Sui Generis Database Rights means rights other than copyright
++     resulting from Directive 96/9/EC of the European Parliament and of
++     the Council of 11 March 1996 on the legal protection of databases,
++     as amended and/or succeeded, as well as other essentially
++     equivalent rights anywhere in the world.
++
++  k. You means the individual or entity exercising the Licensed Rights
++     under this Public License. Your has a corresponding meaning.
++
++
++Section 2 -- Scope.
++
++  a. License grant.
++
++       1. Subject to the terms and conditions of this Public License,
++          the Licensor hereby grants You a worldwide, royalty-free,
++          non-sublicensable, non-exclusive, irrevocable license to
++          exercise the Licensed Rights in the Licensed Material to:
++
++            a. reproduce and Share the Licensed Material, in whole or
++               in part; and
++
++            b. produce, reproduce, and Share Adapted Material.
++
++       2. Exceptions and Limitations. For the avoidance of doubt, where
++          Exceptions and Limitations apply to Your use, this Public
++          License does not apply, and You do not need to comply with
++          its terms and conditions.
++
++       3. Term. The term of this Public License is specified in Section
++          6(a).
++
++       4. Media and formats; technical modifications allowed. The
++          Licensor authorizes You to exercise the Licensed Rights in
++          all media and formats whether now known or hereafter created,
++          and to make technical modifications necessary to do so. The
++          Licensor waives and/or agrees not to assert any right or
++          authority to forbid You from making technical modifications
++          necessary to exercise the Licensed Rights, including
++          technical modifications necessary to circumvent Effective
++          Technological Measures. For purposes of this Public License,
++          simply making modifications authorized by this Section 2(a)
++          (4) never produces Adapted Material.
++
++       5. Downstream recipients.
++
++            a. Offer from the Licensor -- Licensed Material. Every
++               recipient of the Licensed Material automatically
++               receives an offer from the Licensor to exercise the
++               Licensed Rights under the terms and conditions of this
++               Public License.
++
++            b. No downstream restrictions. You may not offer or impose
++               any additional or different terms or conditions on, or
++               apply any Effective Technological Measures to, the
++               Licensed Material if doing so restricts exercise of the
++               Licensed Rights by any recipient of the Licensed
++               Material.
++
++       6. No endorsement. Nothing in this Public License constitutes or
++          may be construed as permission to assert or imply that You
++          are, or that Your use of the Licensed Material is, connected
++          with, or sponsored, endorsed, or granted official status by,
++          the Licensor or others designated to receive attribution as
++          provided in Section 3(a)(1)(A)(i).
++
++  b. Other rights.
++
++       1. Moral rights, such as the right of integrity, are not
++          licensed under this Public License, nor are publicity,
++          privacy, and/or other similar personality rights; however, to
++          the extent possible, the Licensor waives and/or agrees not to
++          assert any such rights held by the Licensor to the limited
++          extent necessary to allow You to exercise the Licensed
++          Rights, but not otherwise.
++
++       2. Patent and trademark rights are not licensed under this
++          Public License.
++
++       3. To the extent possible, the Licensor waives any right to
++          collect royalties from You for the exercise of the Licensed
++          Rights, whether directly or through a collecting society
++          under any voluntary or waivable statutory or compulsory
++          licensing scheme. In all other cases the Licensor expressly
++          reserves any right to collect such royalties.
++
++
++Section 3 -- License Conditions.
++
++Your exercise of the Licensed Rights is expressly made subject to the
++following conditions.
++
++  a. Attribution.
++
++       1. If You Share the Licensed Material (including in modified
++          form), You must:
++
++            a. retain the following if it is supplied by the Licensor
++               with the Licensed Material:
++
++                 i. identification of the creator(s) of the Licensed
++                    Material and any others designated to receive
++                    attribution, in any reasonable manner requested by
++                    the Licensor (including by pseudonym if
++                    designated);
++
++                ii. a copyright notice;
++
++               iii. a notice that refers to this Public License;
++
++                iv. a notice that refers to the disclaimer of
++                    warranties;
++
++                 v. a URI or hyperlink to the Licensed Material to the
++                    extent reasonably practicable;
++
++            b. indicate if You modified the Licensed Material and
++               retain an indication of any previous modifications; and
++
++            c. indicate the Licensed Material is licensed under this
++               Public License, and include the text of, or the URI or
++               hyperlink to, this Public License.
++
++       2. You may satisfy the conditions in Section 3(a)(1) in any
++          reasonable manner based on the medium, means, and context in
++          which You Share the Licensed Material. For example, it may be
++          reasonable to satisfy the conditions by providing a URI or
++          hyperlink to a resource that includes the required
++          information.
++
++       3. If requested by the Licensor, You must remove any of the
++          information required by Section 3(a)(1)(A) to the extent
++          reasonably practicable.
++
++       4. If You Share Adapted Material You produce, the Adapter's
++          License You apply must not prevent recipients of the Adapted
++          Material from complying with this Public License.
++
++
++Section 4 -- Sui Generis Database Rights.
++
++Where the Licensed Rights include Sui Generis Database Rights that
++apply to Your use of the Licensed Material:
++
++  a. for the avoidance of doubt, Section 2(a)(1) grants You the right
++     to extract, reuse, reproduce, and Share all or a substantial
++     portion of the contents of the database;
++
++  b. if You include all or a substantial portion of the database
++     contents in a database in which You have Sui Generis Database
++     Rights, then the database in which You have Sui Generis Database
++     Rights (but not its individual contents) is Adapted Material; and
++
++  c. You must comply with the conditions in Section 3(a) if You Share
++     all or a substantial portion of the contents of the database.
++
++For the avoidance of doubt, this Section 4 supplements and does not
++replace Your obligations under this Public License where the Licensed
++Rights include other Copyright and Similar Rights.
++
++
++Section 5 -- Disclaimer of Warranties and Limitation of Liability.
++
++  a. UNLESS OTHERWISE SEPARATELY UNDERTAKEN BY THE LICENSOR, TO THE
++     EXTENT POSSIBLE, THE LICENSOR OFFERS THE LICENSED MATERIAL AS-IS
++     AND AS-AVAILABLE, AND MAKES NO REPRESENTATIONS OR WARRANTIES OF
++     ANY KIND CONCERNING THE LICENSED MATERIAL, WHETHER EXPRESS,
++     IMPLIED, STATUTORY, OR OTHER. THIS INCLUDES, WITHOUT LIMITATION,
++     WARRANTIES OF TITLE, MERCHANTABILITY, FITNESS FOR A PARTICULAR
++     PURPOSE, NON-INFRINGEMENT, ABSENCE OF LATENT OR OTHER DEFECTS,
++     ACCURACY, OR THE PRESENCE OR ABSENCE OF ERRORS, WHETHER OR NOT
++     KNOWN OR DISCOVERABLE. WHERE DISCLAIMERS OF WARRANTIES ARE NOT
++     ALLOWED IN FULL OR IN PART, THIS DISCLAIMER MAY NOT APPLY TO YOU.
++
++  b. TO THE EXTENT POSSIBLE, IN NO EVENT WILL THE LICENSOR BE LIABLE
++     TO YOU ON ANY LEGAL THEORY (INCLUDING, WITHOUT LIMITATION,
++     NEGLIGENCE) OR OTHERWISE FOR ANY DIRECT, SPECIAL, INDIRECT,
++     INCIDENTAL, CONSEQUENTIAL, PUNITIVE, EXEMPLARY, OR OTHER LOSSES,
++     COSTS, EXPENSES, OR DAMAGES ARISING OUT OF THIS PUBLIC LICENSE OR
++     USE OF THE LICENSED MATERIAL, EVEN IF THE LICENSOR HAS BEEN
++     ADVISED OF THE POSSIBILITY OF SUCH LOSSES, COSTS, EXPENSES, OR
++     DAMAGES. WHERE A LIMITATION OF LIABILITY IS NOT ALLOWED IN FULL OR
++     IN PART, THIS LIMITATION MAY NOT APPLY TO YOU.
++
++  c. The disclaimer of warranties and limitation of liability provided
++     above shall be interpreted in a manner that, to the extent
++     possible, most closely approximates an absolute disclaimer and
++     waiver of all liability.
++
++
++Section 6 -- Term and Termination.
++
++  a. This Public License applies for the term of the Copyright and
++     Similar Rights licensed here. However, if You fail to comply with
++     this Public License, then Your rights under this Public License
++     terminate automatically.
++
++  b. Where Your right to use the Licensed Material has terminated under
++     Section 6(a), it reinstates:
++
++       1. automatically as of the date the violation is cured, provided
++          it is cured within 30 days of Your discovery of the
++          violation; or
++
++       2. upon express reinstatement by the Licensor.
++
++     For the avoidance of doubt, this Section 6(b) does not affect any
++     right the Licensor may have to seek remedies for Your violations
++     of this Public License.
++
++  c. For the avoidance of doubt, the Licensor may also offer the
++     Licensed Material under separate terms or conditions or stop
++     distributing the Licensed Material at any time; however, doing so
++     will not terminate this Public License.
++
++  d. Sections 1, 5, 6, 7, and 8 survive termination of this Public
++     License.
++
++
++Section 7 -- Other Terms and Conditions.
++
++  a. The Licensor shall not be bound by any additional or different
++     terms or conditions communicated by You unless expressly agreed.
++
++  b. Any arrangements, understandings, or agreements regarding the
++     Licensed Material not stated herein are separate from and
++     independent of the terms and conditions of this Public License.
++
++
++Section 8 -- Interpretation.
++
++  a. For the avoidance of doubt, this Public License does not, and
++     shall not be interpreted to, reduce, limit, restrict, or impose
++     conditions on any use of the Licensed Material that could lawfully
++     be made without permission under this Public License.
++
++  b. To the extent possible, if any provision of this Public License is
++     deemed unenforceable, it shall be automatically reformed to the
++     minimum extent necessary to make it enforceable. If the provision
++     cannot be reformed, it shall be severed from this Public License
++     without affecting the enforceability of the remaining terms and
++     conditions.
++
++  c. No term or condition of this Public License will be waived and no
++     failure to comply consented to unless expressly agreed to by the
++     Licensor.
++
++  d. Nothing in this Public License constitutes or may be interpreted
++     as a limitation upon, or waiver of, any privileges and immunities
++     that apply to the Licensor or You, including from the legal
++     processes of any jurisdiction or authority.
++
++
++=======================================================================
++
++Creative Commons is not a party to its public
++licenses. Notwithstanding, Creative Commons may elect to apply one of
++its public licenses to material it publishes and in those instances
++will be considered the “Licensor.” The text of the Creative Commons
++public licenses is dedicated to the public domain under the CC0 Public
++Domain Dedication. Except for the limited purpose of indicating that
++material is shared under a Creative Commons public license or as
++otherwise permitted by the Creative Commons policies published at
++creativecommons.org/policies, Creative Commons does not authorize the
++use of the trademark "Creative Commons" or any other trademark or logo
++of Creative Commons without its prior written consent including,
++without limitation, in connection with any unauthorized modifications
++to any of its public licenses or any other arrangements,
++understandings, or agreements concerning use of licensed material. For
++the avoidance of doubt, this paragraph does not form part of the
++public licenses.
++
++Creative Commons may be contacted at creativecommons.org.
++
+diff --git a/samples/08_gltf_viewer/licenses/CC-BY-NC-4.0.txt b/samples/08_gltf_viewer/licenses/CC-BY-NC-4.0.txt
+new file mode 100644
+index 0000000..fe463e0
+--- /dev/null
++++ b/samples/08_gltf_viewer/licenses/CC-BY-NC-4.0.txt
+@@ -0,0 +1,408 @@
++Attribution-NonCommercial 4.0 International
++
++=======================================================================
++
++Creative Commons Corporation ("Creative Commons") is not a law firm and
++does not provide legal services or legal advice. Distribution of
++Creative Commons public licenses does not create a lawyer-client or
++other relationship. Creative Commons makes its licenses and related
++information available on an "as-is" basis. Creative Commons gives no
++warranties regarding its licenses, any material licensed under their
++terms and conditions, or any related information. Creative Commons
++disclaims all liability for damages resulting from their use to the
++fullest extent possible.
++
++Using Creative Commons Public Licenses
++
++Creative Commons public licenses provide a standard set of terms and
++conditions that creators and other rights holders may use to share
++original works of authorship and other material subject to copyright
++and certain other rights specified in the public license below. The
++following considerations are for informational purposes only, are not
++exhaustive, and do not form part of our licenses.
++
++     Considerations for licensors: Our public licenses are
++     intended for use by those authorized to give the public
++     permission to use material in ways otherwise restricted by
++     copyright and certain other rights. Our licenses are
++     irrevocable. Licensors should read and understand the terms
++     and conditions of the license they choose before applying it.
++     Licensors should also secure all rights necessary before
++     applying our licenses so that the public can reuse the
++     material as expected. Licensors should clearly mark any
++     material not subject to the license. This includes other CC-
++     licensed material, or material used under an exception or
++     limitation to copyright. More considerations for licensors:
++    wiki.creativecommons.org/Considerations_for_licensors
++
++     Considerations for the public: By using one of our public
++     licenses, a licensor grants the public permission to use the
++     licensed material under specified terms and conditions. If
++     the licensor's permission is not necessary for any reason--for
++     example, because of any applicable exception or limitation to
++     copyright--then that use is not regulated by the license. Our
++     licenses grant only permissions under copyright and certain
++     other rights that a licensor has authority to grant. Use of
++     the licensed material may still be restricted for other
++     reasons, including because others have copyright or other
++     rights in the material. A licensor may make special requests,
++     such as asking that all changes be marked or described.
++     Although not required by our licenses, you are encouraged to
++     respect those requests where reasonable. More considerations
++     for the public:
++    wiki.creativecommons.org/Considerations_for_licensees
++
++=======================================================================
++
++Creative Commons Attribution-NonCommercial 4.0 International Public
++License
++
++By exercising the Licensed Rights (defined below), You accept and agree
++to be bound by the terms and conditions of this Creative Commons
++Attribution-NonCommercial 4.0 International Public License ("Public
++License"). To the extent this Public License may be interpreted as a
++contract, You are granted the Licensed Rights in consideration of Your
++acceptance of these terms and conditions, and the Licensor grants You
++such rights in consideration of benefits the Licensor receives from
++making the Licensed Material available under these terms and
++conditions.
++
++
++Section 1 -- Definitions.
++
++  a. Adapted Material means material subject to Copyright and Similar
++     Rights that is derived from or based upon the Licensed Material
++     and in which the Licensed Material is translated, altered,
++     arranged, transformed, or otherwise modified in a manner requiring
++     permission under the Copyright and Similar Rights held by the
++     Licensor. For purposes of this Public License, where the Licensed
++     Material is a musical work, performance, or sound recording,
++     Adapted Material is always produced where the Licensed Material is
++     synched in timed relation with a moving image.
++
++  b. Adapter's License means the license You apply to Your Copyright
++     and Similar Rights in Your contributions to Adapted Material in
++     accordance with the terms and conditions of this Public License.
++
++  c. Copyright and Similar Rights means copyright and/or similar rights
++     closely related to copyright including, without limitation,
++     performance, broadcast, sound recording, and Sui Generis Database
++     Rights, without regard to how the rights are labeled or
++     categorized. For purposes of this Public License, the rights
++     specified in Section 2(b)(1)-(2) are not Copyright and Similar
++     Rights.
++  d. Effective Technological Measures means those measures that, in the
++     absence of proper authority, may not be circumvented under laws
++     fulfilling obligations under Article 11 of the WIPO Copyright
++     Treaty adopted on December 20, 1996, and/or similar international
++     agreements.
++
++  e. Exceptions and Limitations means fair use, fair dealing, and/or
++     any other exception or limitation to Copyright and Similar Rights
++     that applies to Your use of the Licensed Material.
++
++  f. Licensed Material means the artistic or literary work, database,
++     or other material to which the Licensor applied this Public
++     License.
++
++  g. Licensed Rights means the rights granted to You subject to the
++     terms and conditions of this Public License, which are limited to
++     all Copyright and Similar Rights that apply to Your use of the
++     Licensed Material and that the Licensor has authority to license.
++
++  h. Licensor means the individual(s) or entity(ies) granting rights
++     under this Public License.
++
++  i. NonCommercial means not primarily intended for or directed towards
++     commercial advantage or monetary compensation. For purposes of
++     this Public License, the exchange of the Licensed Material for
++     other material subject to Copyright and Similar Rights by digital
++     file-sharing or similar means is NonCommercial provided there is
++     no payment of monetary compensation in connection with the
++     exchange.
++
++  j. Share means to provide material to the public by any means or
++     process that requires permission under the Licensed Rights, such
++     as reproduction, public display, public performance, distribution,
++     dissemination, communication, or importation, and to make material
++     available to the public including in ways that members of the
++     public may access the material from a place and at a time
++     individually chosen by them.
++
++  k. Sui Generis Database Rights means rights other than copyright
++     resulting from Directive 96/9/EC of the European Parliament and of
++     the Council of 11 March 1996 on the legal protection of databases,
++     as amended and/or succeeded, as well as other essentially
++     equivalent rights anywhere in the world.
++
++  l. You means the individual or entity exercising the Licensed Rights
++     under this Public License. Your has a corresponding meaning.
++
++
++Section 2 -- Scope.
++
++  a. License grant.
++
++       1. Subject to the terms and conditions of this Public License,
++          the Licensor hereby grants You a worldwide, royalty-free,
++          non-sublicensable, non-exclusive, irrevocable license to
++          exercise the Licensed Rights in the Licensed Material to:
++
++            a. reproduce and Share the Licensed Material, in whole or
++               in part, for NonCommercial purposes only; and
++
++            b. produce, reproduce, and Share Adapted Material for
++               NonCommercial purposes only.
++
++       2. Exceptions and Limitations. For the avoidance of doubt, where
++          Exceptions and Limitations apply to Your use, this Public
++          License does not apply, and You do not need to comply with
++          its terms and conditions.
++
++       3. Term. The term of this Public License is specified in Section
++          6(a).
++
++       4. Media and formats; technical modifications allowed. The
++          Licensor authorizes You to exercise the Licensed Rights in
++          all media and formats whether now known or hereafter created,
++          and to make technical modifications necessary to do so. The
++          Licensor waives and/or agrees not to assert any right or
++          authority to forbid You from making technical modifications
++          necessary to exercise the Licensed Rights, including
++          technical modifications necessary to circumvent Effective
++          Technological Measures. For purposes of this Public License,
++          simply making modifications authorized by this Section 2(a)
++          (4) never produces Adapted Material.
++
++       5. Downstream recipients.
++
++            a. Offer from the Licensor -- Licensed Material. Every
++               recipient of the Licensed Material automatically
++               receives an offer from the Licensor to exercise the
++               Licensed Rights under the terms and conditions of this
++               Public License.
++
++            b. No downstream restrictions. You may not offer or impose
++               any additional or different terms or conditions on, or
++               apply any Effective Technological Measures to, the
++               Licensed Material if doing so restricts exercise of the
++               Licensed Rights by any recipient of the Licensed
++               Material.
++
++       6. No endorsement. Nothing in this Public License constitutes or
++          may be construed as permission to assert or imply that You
++          are, or that Your use of the Licensed Material is, connected
++          with, or sponsored, endorsed, or granted official status by,
++          the Licensor or others designated to receive attribution as
++          provided in Section 3(a)(1)(A)(i).
++
++  b. Other rights.
++
++       1. Moral rights, such as the right of integrity, are not
++          licensed under this Public License, nor are publicity,
++          privacy, and/or other similar personality rights; however, to
++          the extent possible, the Licensor waives and/or agrees not to
++          assert any such rights held by the Licensor to the limited
++          extent necessary to allow You to exercise the Licensed
++          Rights, but not otherwise.
++
++       2. Patent and trademark rights are not licensed under this
++          Public License.
++
++       3. To the extent possible, the Licensor waives any right to
++          collect royalties from You for the exercise of the Licensed
++          Rights, whether directly or through a collecting society
++          under any voluntary or waivable statutory or compulsory
++          licensing scheme. In all other cases the Licensor expressly
++          reserves any right to collect such royalties, including when
++          the Licensed Material is used other than for NonCommercial
++          purposes.
++
++
++Section 3 -- License Conditions.
++
++Your exercise of the Licensed Rights is expressly made subject to the
++following conditions.
++
++  a. Attribution.
++
++       1. If You Share the Licensed Material (including in modified
++          form), You must:
++
++            a. retain the following if it is supplied by the Licensor
++               with the Licensed Material:
++
++                 i. identification of the creator(s) of the Licensed
++                    Material and any others designated to receive
++                    attribution, in any reasonable manner requested by
++                    the Licensor (including by pseudonym if
++                    designated);
++
++                ii. a copyright notice;
++
++               iii. a notice that refers to this Public License;
++
++                iv. a notice that refers to the disclaimer of
++                    warranties;
++
++                 v. a URI or hyperlink to the Licensed Material to the
++                    extent reasonably practicable;
++
++            b. indicate if You modified the Licensed Material and
++               retain an indication of any previous modifications; and
++
++            c. indicate the Licensed Material is licensed under this
++               Public License, and include the text of, or the URI or
++               hyperlink to, this Public License.
++
++       2. You may satisfy the conditions in Section 3(a)(1) in any
++          reasonable manner based on the medium, means, and context in
++          which You Share the Licensed Material. For example, it may be
++          reasonable to satisfy the conditions by providing a URI or
++          hyperlink to a resource that includes the required
++          information.
++
++       3. If requested by the Licensor, You must remove any of the
++          information required by Section 3(a)(1)(A) to the extent
++          reasonably practicable.
++
++       4. If You Share Adapted Material You produce, the Adapter's
++          License You apply must not prevent recipients of the Adapted
++          Material from complying with this Public License.
++
++
++Section 4 -- Sui Generis Database Rights.
++
++Where the Licensed Rights include Sui Generis Database Rights that
++apply to Your use of the Licensed Material:
++
++  a. for the avoidance of doubt, Section 2(a)(1) grants You the right
++     to extract, reuse, reproduce, and Share all or a substantial
++     portion of the contents of the database for NonCommercial purposes
++     only;
++
++  b. if You include all or a substantial portion of the database
++     contents in a database in which You have Sui Generis Database
++     Rights, then the database in which You have Sui Generis Database
++     Rights (but not its individual contents) is Adapted Material; and
++
++  c. You must comply with the conditions in Section 3(a) if You Share
++     all or a substantial portion of the contents of the database.
++
++For the avoidance of doubt, this Section 4 supplements and does not
++replace Your obligations under this Public License where the Licensed
++Rights include other Copyright and Similar Rights.
++
++
++Section 5 -- Disclaimer of Warranties and Limitation of Liability.
++
++  a. UNLESS OTHERWISE SEPARATELY UNDERTAKEN BY THE LICENSOR, TO THE
++     EXTENT POSSIBLE, THE LICENSOR OFFERS THE LICENSED MATERIAL AS-IS
++     AND AS-AVAILABLE, AND MAKES NO REPRESENTATIONS OR WARRANTIES OF
++     ANY KIND CONCERNING THE LICENSED MATERIAL, WHETHER EXPRESS,
++     IMPLIED, STATUTORY, OR OTHER. THIS INCLUDES, WITHOUT LIMITATION,
++     WARRANTIES OF TITLE, MERCHANTABILITY, FITNESS FOR A PARTICULAR
++     PURPOSE, NON-INFRINGEMENT, ABSENCE OF LATENT OR OTHER DEFECTS,
++     ACCURACY, OR THE PRESENCE OR ABSENCE OF ERRORS, WHETHER OR NOT
++     KNOWN OR DISCOVERABLE. WHERE DISCLAIMERS OF WARRANTIES ARE NOT
++     ALLOWED IN FULL OR IN PART, THIS DISCLAIMER MAY NOT APPLY TO YOU.
++
++  b. TO THE EXTENT POSSIBLE, IN NO EVENT WILL THE LICENSOR BE LIABLE
++     TO YOU ON ANY LEGAL THEORY (INCLUDING, WITHOUT LIMITATION,
++     NEGLIGENCE) OR OTHERWISE FOR ANY DIRECT, SPECIAL, INDIRECT,
++     INCIDENTAL, CONSEQUENTIAL, PUNITIVE, EXEMPLARY, OR OTHER LOSSES,
++     COSTS, EXPENSES, OR DAMAGES ARISING OUT OF THIS PUBLIC LICENSE OR
++     USE OF THE LICENSED MATERIAL, EVEN IF THE LICENSOR HAS BEEN
++     ADVISED OF THE POSSIBILITY OF SUCH LOSSES, COSTS, EXPENSES, OR
++     DAMAGES. WHERE A LIMITATION OF LIABILITY IS NOT ALLOWED IN FULL OR
++     IN PART, THIS LIMITATION MAY NOT APPLY TO YOU.
++
++  c. The disclaimer of warranties and limitation of liability provided
++     above shall be interpreted in a manner that, to the extent
++     possible, most closely approximates an absolute disclaimer and
++     waiver of all liability.
++
++
++Section 6 -- Term and Termination.
++
++  a. This Public License applies for the term of the Copyright and
++     Similar Rights licensed here. However, if You fail to comply with
++     this Public License, then Your rights under this Public License
++     terminate automatically.
++
++  b. Where Your right to use the Licensed Material has terminated under
++     Section 6(a), it reinstates:
++
++       1. automatically as of the date the violation is cured, provided
++          it is cured within 30 days of Your discovery of the
++          violation; or
++
++       2. upon express reinstatement by the Licensor.
++
++     For the avoidance of doubt, this Section 6(b) does not affect any
++     right the Licensor may have to seek remedies for Your violations
++     of this Public License.
++
++  c. For the avoidance of doubt, the Licensor may also offer the
++     Licensed Material under separate terms or conditions or stop
++     distributing the Licensed Material at any time; however, doing so
++     will not terminate this Public License.
++
++  d. Sections 1, 5, 6, 7, and 8 survive termination of this Public
++     License.
++
++
++Section 7 -- Other Terms and Conditions.
++
++  a. The Licensor shall not be bound by any additional or different
++     terms or conditions communicated by You unless expressly agreed.
++
++  b. Any arrangements, understandings, or agreements regarding the
++     Licensed Material not stated herein are separate from and
++     independent of the terms and conditions of this Public License.
++
++
++Section 8 -- Interpretation.
++
++  a. For the avoidance of doubt, this Public License does not, and
++     shall not be interpreted to, reduce, limit, restrict, or impose
++     conditions on any use of the Licensed Material that could lawfully
++     be made without permission under this Public License.
++
++  b. To the extent possible, if any provision of this Public License is
++     deemed unenforceable, it shall be automatically reformed to the
++     minimum extent necessary to make it enforceable. If the provision
++     cannot be reformed, it shall be severed from this Public License
++     without affecting the enforceability of the remaining terms and
++     conditions.
++
++  c. No term or condition of this Public License will be waived and no
++     failure to comply consented to unless expressly agreed to by the
++     Licensor.
++
++  d. Nothing in this Public License constitutes or may be interpreted
++     as a limitation upon, or waiver of, any privileges and immunities
++     that apply to the Licensor or You, including from the legal
++     processes of any jurisdiction or authority.
++
++=======================================================================
++
++Creative Commons is not a party to its public
++licenses. Notwithstanding, Creative Commons may elect to apply one of
++its public licenses to material it publishes and in those instances
++will be considered the “Licensor.” The text of the Creative Commons
++public licenses is dedicated to the public domain under the CC0 Public
++Domain Dedication. Except for the limited purpose of indicating that
++material is shared under a Creative Commons public license or as
++otherwise permitted by the Creative Commons policies published at
++creativecommons.org/policies, Creative Commons does not authorize the
++use of the trademark "Creative Commons" or any other trademark or logo
++of Creative Commons without its prior written consent including,
++without limitation, in connection with any unauthorized modifications
++to any of its public licenses or any other arrangements,
++understandings, or agreements concerning use of licensed material. For
++the avoidance of doubt, this paragraph does not form part of the
++public licenses.
++
++Creative Commons may be contacted at creativecommons.org.
++
+diff --git a/samples/08_gltf_viewer/main.cpp b/samples/08_gltf_viewer/main.cpp
+index 0894e2f..5b453b2 100644
+--- a/samples/08_gltf_viewer/main.cpp
++++ b/samples/08_gltf_viewer/main.cpp
+@@ -10,26 +10,34 @@
+ // with a mouse-drag orbit camera and a manual `--exposure` control.
+ //
+ // D28: each glTF material's alphaMode/doubleSided become MaterialSystem's
+ // own fixed-function pipeline-state axis (MaterialFixedFunctionState) --
+ // StandardPBR/Unlit are loaded ONCE PER DISTINCT (module, alphaMode,
+ // doubleSided) COMBINATION, not once per shader file; two glTF materials
+ // sharing standard_pbr.slang's bytes but differing only in alphaMode/
+ // doubleSided are two independent loadMaterial() calls (see
+ // setupMaterial() below), yielding two independently-cached VkPipelines.
+ //
+-// ORBIT CAMERA: reads SDL mouse state directly via `Window::sdlWindow()`
+-// [gate ruling #8: "sample 08 reads SDL mouse state directly via
+-// Window::sdlWindow() -- the exposed escape hatch -- no rx_platform scope
+-// pulled forward, no reordering"] -- sample-local, not a new rx_platform
+-// input surface (Task 20, Stage 2, is that real surface; sample 09
+-// migrates to it then).
++// ORBIT CAMERA [Fix round, item 7: corrected to match the actual code --
++// see below for what changed]: reads SDL mouse state directly via SDL3's
++// own global `SDL_GetMouseState()` (takes no window argument at all in
++// SDL3 -- it queries OS-level cursor state directly, not scoped through
++// any particular `SDL_Window*`), satisfying gate ruling #8's own intent
++// ("sample 08 reads SDL mouse state directly... the exposed escape hatch
++// -- no rx_platform scope pulled forward, no reordering") without actually
++// needing `Window::sdlWindow()` at all for this specific query -- that
++// accessor exists on `rx::platform::Window` for a caller that DOES need a
++// window-scoped SDL call (event polling, cursor confinement, ...) and
++// remains this sample's own escape hatch for that; this one query simply
++// doesn't require it. Still sample-local either way, not a new
++// rx_platform input surface (Task 20, Stage 2, is that real surface;
++// sample 09 migrates to it then).
+ //
+ // REVERSED-Z: NOT yet -- D13's reversed-Z camera convention arrives with
+ // rx::scene::Camera in Stage 2 (Task 18). This sample uses the SAME
+ // standard-Z convention (near=0/far=1, depth cleared to 1.0, compare-op
+ // LESS) every earlier sample already relies on via MaterialSystem's own
+ // fixed `depthCompareOp` -- a future Stage-2 migration point, not
+ // reproduced here as a TODO beyond this comment.
+ //
+ // TONEMAP: reuses shaders/multipass/tonemap.{vert,frag}.slang VERBATIM
+ // (this task's own binding constraint: "you may NOT touch
+@@ -214,21 +222,22 @@ std::filesystem::path resolveDefaultScenePath() {
+     std::filesystem::path packaged = basePathDirectory() / "assets" / "DamagedHelmet" / "glTF" / "DamagedHelmet.gltf";
+     if (std::filesystem::exists(packaged)) {
+         return packaged;
+     }
+     std::filesystem::path devTree =
+         std::filesystem::path(RX_REPO_ROOT_DIR) / "assets" / "fetched" / "DamagedHelmet" / "glTF" / "DamagedHelmet.gltf";
+     return devTree;
+ }
+ 
+ // --- Orbit camera [gate ruling #8: SDL mouse state read directly via
+-// Window::sdlWindow(), sample-local] -------------------------------------
++// SDL3's own global SDL_GetMouseState(), sample-local -- see this file's
++// own header comment] -----------------------------------------------------
+ struct OrbitCamera {
+     float azimuthRadians = glm::radians(45.0F);
+     float elevationRadians = glm::radians(20.0F);
+     float distance = 3.0F;
+     glm::vec3 target{0.0F, 0.0F, 0.0F};
+ 
+     static constexpr float kMinElevation = glm::radians(-85.0F);
+     static constexpr float kMaxElevation = glm::radians(85.0F);
+     static constexpr float kMinDistanceFraction = 0.15F;  // relative to the distance the scene AABB derived.
+     static constexpr float kMaxDistanceFraction = 6.0F;
+@@ -1511,20 +1520,36 @@ bool isLavapipeDevice(VkPhysicalDevice physicalDevice) {
+ // loaded-scene frame (once it reaches a terminal state), and gates each
+ // against its own committed D17 reference PNG. `--write-references <dir>`
+ // (undocumented escape hatch, Args' own comment) writes the two captures
+ // instead of comparing them -- the only way tools/regen_references.sh
+ // (never auto-run) produces a new reference pair. `--quit-during-load`
+ // starts the import, lets it run for a small BOUNDED number of pumped steps
+ // (enough for >=1 real GPU resource to plausibly have landed), cancels it,
+ // and tears down immediately -- this whole stage's own standing lesson:
+ // abandon/teardown paths get real-GPU-resource tests, never a mock.
+ int runHeadless(const Args& args) {
++    // [Fix round, item 6] Direct std::chrono wall-clock instrumentation --
++    // see the "sample08: perf" log line below (this function's own tail)
++    // for the CAPTURE METHOD this task report's own performance numbers
++    // actually came from: real, timed wall-clock durations from a live
++    // headless run, printed here, NOT a live Tracy GUI/network capture
++    // (this dev environment has no Tracy GUI and this project does not
++    // build Tracy's own separate `tracy-capture` CLI tool as part of its
++    // normal build graph -- a real, but materially larger, undertaking
++    // this fix round's own scope did not call for). Task 15's own
++    // RX_ZONE/Tracy zones around the async-import pipeline remain fully
++    // present and unaffected -- they are what a real interactive Tracy
++    // GUI session profiles when one IS connected (RX_TRACY=ON in this
++    // preset, per CMakePresets.json) -- this is a second, independent,
++    // always-on measurement, not a replacement for them.
++    const auto processStart = std::chrono::steady_clock::now();
++
+     auto app = makeApp("RendererX -- 08_gltf_viewer (headless)", kHeadlessWidth, kHeadlessHeight, /*visible=*/false,
+                         args.validate);
+     if (app == nullptr) {
+         return 1;
+     }
+     app->exposure = args.exposure;
+ 
+     const std::filesystem::path scenePath =
+         args.scenePath.empty() ? resolveDefaultScenePath() : std::filesystem::path(args.scenePath);
+     if (!std::filesystem::exists(scenePath)) {
+@@ -1675,37 +1700,41 @@ int runHeadless(const Args& args) {
+     // -- the scene is guaranteed not-yet-ready) -- exercises the graph's own
+     // automatic clear + this sample's own D17 loading-color override.
+     app->sceneReady = false;
+     std::vector<uint8_t> loadingPixels = captureFrame();
+     bool gateOk = !loadingPixels.empty();
+ 
+     // --- Start the async import [Task 15's own pipeline -- this sample IS
+     // the async-import demonstration vehicle, per the plan's own text].
+     bool importFinished = false;
+     bool importOk = false;
++    const auto importStart = std::chrono::steady_clock::now();
++    double importMs = 0.0;
+     rx::asset::AsyncImportHandle importHandle = app->registry->importGltfAsync(
+         scenePath, *app->geometryPool, *app->scheduler, app->textureCache.get(),
+         [&](rx::asset::ImportResult result) {
+             importFinished = true;
+             importOk = result.ok();
+             if (!importOk) {
+                 RX_LOG_ERROR("sample_08_gltf_viewer: import of '{}' failed: {}", scenePath.string(),
+                              rx::asset::importErrorName(result.error));
+                 return;
+             }
+             if (!setupMaterials(*app, *app->registry, result.materials) ||
+                 !buildDrawList(*app, *app->registry, result.scene)) {
+                 importOk = false;
+                 return;
+             }
+             frameCameraToScene(*app);
+             app->sceneReady = true;
++            importMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - importStart)
++                           .count();
+         });
+ 
+     if (args.quitDuringLoad) {
+         // Pump a small BOUNDED number of steps (never until terminal --
+         // that would defeat the point of a "quit DURING load" test), with a
+         // short sleep between each so background workers get real wall-
+         // clock time to land >=1 real GPU resource (a texture or geometry
+         // upload) before cancellation -- matches async_import_test.cpp's
+         // own pump-one-bounded-step-at-a-time idiom.
+         for (int i = 0; i < 30 && !importFinished; ++i) {
+@@ -1765,20 +1794,39 @@ int runHeadless(const Args& args) {
+ 
+     // --- Loaded-scene capture.
+     std::vector<uint8_t> loadedPixels;
+     if (app->sceneReady) {
+         const float aspect = static_cast<float>(kHeadlessWidth) / static_cast<float>(kHeadlessHeight);
+         const glm::mat4 viewProj = computeViewProj(app->camera, aspect);
+         updateDrawDataPerPassFields(*app, viewProj, app->camera.eye());
+         loadedPixels = captureFrame();
+         if (loadedPixels.empty()) {
+             gateOk = false;
++        } else {
++            // [Fix round, item 6] "sample08: perf" -- greppable, matching
++            // this project's own established per-sample stats-line
++            // convention (sample07's own "stress:" prefix). `import_ms`:
++            // wall-clock from the importGltfAsync() kickoff to the
++            // completion callback confirming setupMaterials()/
++            // buildDrawList() both succeeded (real, measured -- see this
++            // function's own header comment on method). `first_frame_ms`:
++            // wall-clock from THIS FUNCTION's own first instruction
++            // (before Window/Context/Device/Allocator/MaterialSystem/
++            // GeometryPool/TextureCache/Executor construction, the tonemap
++            // pipeline build, and the loading-state frame) through this
++            // exact point -- the first fully rendered, GPU-readback-
++            // confirmed post-import frame -- i.e. genuine cold-start time
++            // to a real, correct pixel on screen, not just import alone.
++            const double firstFrameMs =
++                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - processStart).count();
++            RX_LOG_INFO("sample08: perf scene='{}' import_ms={:.3f} first_frame_ms={:.3f}", scenePath.string(),
++                        importMs, firstFrameMs);
+         }
+     } else {
+         gateOk = false;
+     }
+ 
+     // --- --write-references escape hatch [D17] -- see Args' own comment.
+     if (!args.writeReferencesDir.empty()) {
+         const std::filesystem::path outDir(args.writeReferencesDir);
+         bool wroteOk = true;
+         if (!loadingPixels.empty()) {
+@@ -1850,22 +1898,23 @@ int runHeadless(const Args& args) {
+ 
+     if (gateOk) {
+         RX_LOG_INFO("sample_08_gltf_viewer: headless gate PASSED");
+         return 0;
+     }
+     RX_LOG_ERROR("sample_08_gltf_viewer: headless gate FAILED");
+     return 1;
+ }
+ 
+ // --- Present mode: interactive window, real FrameSync loop, mouse-drag
+-// orbit camera [gate ruling #8: SDL mouse state read directly via
+-// Window::sdlWindow()] --------------------------------------------------
++// orbit camera [gate ruling #8: SDL mouse state read directly via SDL3's
++// own global SDL_GetMouseState() -- see this file's own header comment]
++// --------------------------------------------------------------------
+ int runPresent(const Args& args) {
+     auto app = makeApp("RendererX -- 08_gltf_viewer", kPresentWidth, kPresentHeight, /*visible=*/true, args.validate);
+     if (app == nullptr) {
+         return 1;
+     }
+     app->exposure = args.exposure;
+ 
+     // --vsync off, applied before any per-swapchain-image resource is built
+     // -- same ordering samples/05_multipass/06_materials/07_stress already
+     // establish.
+diff --git a/samples/08_gltf_viewer/references/loaded_scene.png b/samples/08_gltf_viewer/references/loaded_scene.png
+index ff251df..d7e2924 100644
+Binary files a/samples/08_gltf_viewer/references/loaded_scene.png and b/samples/08_gltf_viewer/references/loaded_scene.png differ
+diff --git a/samples/README.md b/samples/README.md
+index 5acdf05..289f0e5 100644
+--- a/samples/README.md
++++ b/samples/README.md
+@@ -760,26 +760,31 @@ establishes, extended with a second shared pair
+ library) alongside the same `material.slang` / `forward_entry.slang`, plus
+ the shared tonemap shaders (`tonemap.{vert,frag}.slang`, deployed flat next
+ to the binary, same convention as 05_multipass/07_stress's own copies) and
+ the two committed `references/` PNGs (so a redistributed binary's own
+ `--validate` headless gate is self-contained too). **Unlike every other
+ sample in this list**, this one genuinely redistributes third-party
+ content: `tools/fetch_assets.sh`'s own DamagedHelmet download is pre-staged
+ into `assets/DamagedHelmet/glTF/` next to the binary (this sample's own
+ `resolveDefaultScenePath()` looks there first, falling back to this
+ repository's own `assets/fetched/` copy only for an unpackaged build-tree
+-run), together with that asset's own dual CC-BY-4.0/CC-BY-NC-4.0
+-attribution text (`assets/DamagedHelmet/LICENSE.txt` — see
+-`tools/fetch_assets.sh`'s own header comment for the verified license
+-finding). Verified directly: this sample's packaged `.zip` output, unzipped
+-to a directory outside the build tree entirely, passes its own headless
+-gate unmodified.
++run), together with that asset's own dual CC-BY-4.0/CC-BY-NC-4.0 attribution
++notice (`assets/DamagedHelmet/LICENSE.txt` — see `tools/fetch_assets.sh`'s
++own header comment for the verified license finding) **and the full legal
++text of both licenses** (`assets/DamagedHelmet/CC-BY-4.0.txt` /
++`CC-BY-NC-4.0.txt`, vendored verbatim from creativecommons.org into
++`samples/08_gltf_viewer/licenses/` and copied in by `tools/
++package_samples.sh` — the notice is a human-readable summary, not a
++substitute for the actual grant). Verified directly: this sample's
++packaged `.zip` output, unzipped to a directory outside the build tree
++entirely, passes its own headless gate unmodified, and both license texts
++extract byte-identical to their vendored source.
+ 
+ ## Building and running
+ 
+ Both sample modes and both build presets work identically on Linux and
+ Steam Deck (Desktop Mode is just Linux) — Windows only differs in how you
+ run the already-cross-compiled binary. There is no `samples`-specific
+ configure step; building the preset builds every sample.
+ 
+ ### Linux (native) — including Steam Deck Desktop Mode
+ 
+diff --git a/shaders/material/standard_pbr.slang b/shaders/material/standard_pbr.slang
+index 6b43f94..53652f3 100644
+--- a/shaders/material/standard_pbr.slang
++++ b/shaders/material/standard_pbr.slang
+@@ -184,25 +184,38 @@ struct StandardPbr : IMaterialShader {
+         float lambdaL = NdotV * sqrt(NdotL * NdotL * (1.0 - alpha2) + alpha2);
+         float vis = 0.5 / max(lambdaV + lambdaL, 1e-5);
+ 
+         // F_Schlick.
+         float3 oneMinusF0 = float3(1.0, 1.0, 1.0) - F0;
+         float3 fresnel = F0 + oneMinusF0 * pow(clamp(1.0 - VdotH, 0.0, 1.0), 5.0);
+ 
+         float3 specular = D * vis * fresnel;
+         float3 diffuse = diffuseColor / kPi;
+ 
++        // [Fix round, coordinator ruling] `occlusion` deliberately does NOT
++        // multiply direct light: the glTF spec's own occlusionTexture text
++        // and all three first-tier engine references (Filament/glTF-
++        // Sample-Renderer/three.js) treat ambient occlusion as an
++        // INDIRECT-only term, and the gate matrix's own occlusion row
++        // scopes the acceptance criterion to exactly the ambient
++        // contribution below ("ambientColor x occlusionValue x
++        // baseColor... the ONLY contribution"). An earlier version of this
++        // file multiplied `directLight` by `occlusion` too -- spec-
++        // incorrect (double-darkens a direct-lit, occluded surface) and,
++        // forward-looking, would have doubled up with Task 22's own future
++        // shadow maps (a REAL direct-light visibility term) once that
++        // lands. Direct light is governed by NdotL/shadowing alone.
+         float3 directLight = (diffuse + specular) * v.lightColor * NdotL;
+ 
+         // [FG1] Interim flat ambient/environment term -- uniform color x
+         // occlusion x baseColor, the EXACT closed-form the acceptance
+         // criterion's non-black-metal probe checks, independent of
+         // metallic/NdotL (a fully-metallic surface has zero diffuse but
+         // still gets this contribution -- the whole point of FG1).
+         float3 ambient = v.ambientColor * occlusion * baseColor.rgb;
+ 
+-        float3 color = directLight * occlusion + ambient + emissive;
++        float3 color = directLight + ambient + emissive;
+         return float4(color, baseColor.a);
+     }
+ };
+ 
+ export struct MaterialImpl : IMaterialShader = StandardPbr;
+diff --git a/src/rx_material/tests/test_standard_pbr_unlit.cpp b/src/rx_material/tests/test_standard_pbr_unlit.cpp
+index 75fc49e..59e6302 100644
+--- a/src/rx_material/tests/test_standard_pbr_unlit.cpp
++++ b/src/rx_material/tests/test_standard_pbr_unlit.cpp
+@@ -164,24 +164,31 @@ std::optional<QuadMesh> createQuadMesh(rx::rhi::Allocator& allocator) {
+     return QuadMesh{std::move(*vb), std::move(*ib)};
+ }
+ 
+ // The default head-on rig this file's own header comment documents: camera
+ // at (0,0,2) looking at the origin, orthographic projection with
+ // half-extents exactly matching the quad (so it fills the whole render
+ // target -- every pixel probes the same analytic point), light arriving
+ // along +Z. [MATRIX LAYOUT] Every matrix here is glm::transpose()'d before
+ // upload -- see rx_material/draw_data.h's own MATRIX LAYOUT paragraph for
+ // why (MaterialSystem's Slang session is ROW-major; GLM is column-major).
+-rx::material::DrawDataGpu makeHeadOnRow(glm::mat4 model = glm::mat4(1.0F)) {
++// [Fix round, item 1] `orthoHalfExtent` defaults to 0.5 -- the ORIGINAL,
++// unchanged frustum every existing call site relies on (exactly matching
++// the quad's own object-space extent, filling the whole viewport). A
++// multi-probe test that needs more than one on-screen, non-overlapping
++// quad location at once (D26.1's own two-draw case, below) passes a wider
++// value so a translated quad stays clipped-visible instead of falling
++// outside the frustum entirely.
++rx::material::DrawDataGpu makeHeadOnRow(glm::mat4 model = glm::mat4(1.0F), float orthoHalfExtent = 0.5F) {
+     rx::material::DrawDataGpu row;
+     glm::mat4 view = glm::lookAt(glm::vec3(0.0F, 0.0F, 2.0F), glm::vec3(0.0F, 0.0F, 0.0F), glm::vec3(0.0F, 1.0F, 0.0F));
+-    glm::mat4 proj = glm::orthoZO(-0.5F, 0.5F, -0.5F, 0.5F, 0.1F, 10.0F);
++    glm::mat4 proj = glm::orthoZO(-orthoHalfExtent, orthoHalfExtent, -orthoHalfExtent, orthoHalfExtent, 0.1F, 10.0F);
+     // Vulkan's clip-space Y axis points DOWN; GLM's `orthoZO` (like every
+     // other GLM projection helper) is written for the OpenGL convention (Y
+     // UP) and does not know about that difference on its own -- negating
+     // row 1 (GLM is column-major storage, so this is `proj[1][1] *= -1`,
+     // the well-known "GLM-for-Vulkan" fix, matching samples/06_materials'
+     // own `applyVulkanYFlip()`) is required for this project's fixed
+     // rasterization state (getPipeline()'s own `frontFace =
+     // VK_FRONT_FACE_COUNTER_CLOCKWISE`) to see the SAME winding this file's
+     // own `kQuadVertices` comment claims ("counter-clockwise as seen from
+     // +Z"). Reproduced directly during this task's own development:
+@@ -284,24 +291,33 @@ struct DrawRequest {
+ // earlier ones, exercising BLEND's own over-compositing test) into a fresh
+ // 8x8 color+depth offscreen target and reads back ONE pixel (the center,
+ // (4,4) -- every draw fills the whole viewport per this file's own
+ // head-on-rig comment) as RGBA8. Builds its OWN set-1 UBO/descriptor set
+ // per draw directly (rx::rhi::Allocator + vkAllocateDescriptorSets) --
+ // deliberately NOT MaterialSystem::bindInstance() (that method is the
+ // pre-D26.1 LEGACY path, per its own header comment: "a real D26.1 caller
+ // drives its own real per-draw buffer and pushes this push-constant range
+ // itself, never through this method") -- this is exactly the manual
+ // sequence samples/08_gltf_viewer's own real per-draw code follows.
+-Rgba8 renderQuad(rx::rhi::Device& device, rx::rhi::Allocator& allocator, rx::rhi::BindlessTable& bindless,
+-                  rx::rhi::BindlessHandle drawDataBufferHandle, uint32_t defaultSamplerBindlessIndex,
+-                  const QuadMesh& mesh, const std::vector<DrawRequest>& draws) {
+-    constexpr VkExtent2D kExtent{8, 8};
++// [Fix round, item 1] Shared core: renders `draws` into an `extent`-sized
++// offscreen target and returns the RAW row-major RGBA8 pixel buffer --
++// renderQuad() below is a thin wrapper extracting the single center pixel
++// (unchanged behavior/signature for every one of its 46 existing callers);
++// a multi-probe test that needs to sample more than one independent screen
++// location (the D26.1 two-draw case below, once its own depth-tie masking
++// bug was found -- see that TEST_CASE's own header comment) calls this
++// directly instead.
++std::vector<uint8_t> renderQuadPixels(rx::rhi::Device& device, rx::rhi::Allocator& allocator,
++                                       rx::rhi::BindlessTable& bindless, rx::rhi::BindlessHandle drawDataBufferHandle,
++                                       uint32_t defaultSamplerBindlessIndex, const QuadMesh& mesh,
++                                       const std::vector<DrawRequest>& draws, VkExtent2D extent) {
++    const VkExtent2D kExtent = extent;
+     constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+     constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
+ 
+     auto scheduler = rx::task::Scheduler::create();
+     REQUIRE(scheduler != nullptr);
+     auto executor = rx::graph::Executor::create(device, *scheduler);
+     REQUIRE(executor != nullptr);
+ 
+     rx::graph::RenderGraph graph;
+     rx::graph::Pass& pass = graph.addPass("standard_pbr_test");
+@@ -485,32 +501,52 @@ Rgba8 renderQuad(rx::rhi::Device& device, rx::rhi::Allocator& allocator, rx::rhi
+             [&](VkCommandBuffer cmd) { executor->execute(graph, cmd, image, view, kExtent); });
+         cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+             VkBufferImageCopy region{};
+             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+             region.imageExtent = {kExtent.width, kExtent.height, 1};
+             vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1, &region);
+         });
+     }
+     readback->invalidate();
+ 
+-    const auto* pixels = static_cast<const uint8_t*>(readback->mappedData());
+-    size_t centerIndex = (static_cast<size_t>(kExtent.height / 2) * kExtent.width + (kExtent.width / 2)) * 4;
+-    Rgba8 result{pixels[centerIndex], pixels[centerIndex + 1], pixels[centerIndex + 2], pixels[centerIndex + 3]};
++    const auto* rawPixels = static_cast<const uint8_t*>(readback->mappedData());
++    std::vector<uint8_t> result(rawPixels,
++                                 rawPixels + static_cast<size_t>(kExtent.width) * kExtent.height * 4);
+ 
+     vkDestroyImageView(device.device(), view, nullptr);
+     vkDestroyImage(device.device(), image, nullptr);
+     vkFreeMemory(device.device(), imageMemory, nullptr);
+     vkDestroyDescriptorPool(device.device(), descriptorPool, nullptr);
+ 
+     return result;
+ }
+ 
++// Extracts one texel from a `renderQuadPixels()` result -- shared by
++// renderQuad() (below, the single-center-pixel legacy shape) and any
++// multi-probe caller.
++Rgba8 pixelAt(const std::vector<uint8_t>& pixels, VkExtent2D extent, uint32_t x, uint32_t y) {
++    const size_t index = (static_cast<size_t>(y) * extent.width + x) * 4;
++    return Rgba8{pixels[index], pixels[index + 1], pixels[index + 2], pixels[index + 3]};
++}
++
++// The original, single-center-pixel shape every other test in this file
++// uses -- unchanged signature and behavior, now a thin wrapper over
++// renderQuadPixels()/pixelAt() above.
++Rgba8 renderQuad(rx::rhi::Device& device, rx::rhi::Allocator& allocator, rx::rhi::BindlessTable& bindless,
++                  rx::rhi::BindlessHandle drawDataBufferHandle, uint32_t defaultSamplerBindlessIndex,
++                  const QuadMesh& mesh, const std::vector<DrawRequest>& draws) {
++    constexpr VkExtent2D kExtent{8, 8};
++    std::vector<uint8_t> pixels = renderQuadPixels(device, allocator, bindless, drawDataBufferHandle,
++                                                     defaultSamplerBindlessIndex, mesh, draws, kExtent);
++    return pixelAt(pixels, kExtent, kExtent.width / 2, kExtent.height / 2);
++}
++
+ // Builds a StandardPbrParams-shaped blob with every field at its glTF/D28
+ // neutral default (baseColorFactor=(1,1,1,1), metallic=1, roughness=1,
+ // every texture slot = the white fallback texture created by
+ // makeWhiteTexture() below, every UV offset/scale = (0,0,1,1)) --
+ // individual tests override exactly the fields they're probing.
+ struct StandardPbrHandles {
+     rx::material::MaterialHandle material;
+     std::vector<rx::material::MaterialParamInfo> params;
+     uint32_t paramBlockSize = 0;
+ };
+@@ -588,31 +624,52 @@ TEST_CASE("D26.1: two draws in one command buffer, the second at firstInstance>0
+         texInfo.height = 1;
+         texInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+         std::array<uint8_t, 4> whitePixel{255, 255, 255, 255};
+         texInfo.pixels = whitePixel.data();
+         texInfo.pixelBytes = whitePixel.size();
+         rx::material::TextureHandle tex = system->createTexture2D(texInfo);
+         REQUIRE(tex.isValid());
+         whiteIndex = system->textureBindlessIndex(tex);
+     }
+ 
+-    // ROW 0: red tint, at the ORIGIN (model = identity, matching the
+-    // default head-on rig). ROW 1: green tint, translated +X by 2 units --
+-    // pushed entirely off the ortho frustum's [-0.5,0.5] visible range, so
+-    // if the SECOND draw's own transform (firstInstance=1's row) were
+-    // WRONGLY read as row 0 (the SV_InstanceID-relative-index bug D26.1's
+-    // own matrix row names), it would render red-at-origin AGAIN instead of
+-    // green-off-frustum -- exactly the discriminating case a
+-    // single-draw-only test cannot catch.
++    // [Fix round, item 1 -- see this file's own git history for the
++    // superseded, depth-tie-masked version] ROW 0: red tint, at the ORIGIN
++    // (model = identity). ROW 1: green tint, translated +X by 2 world
++    // units, under a WIDENED ortho frustum (orthoHalfExtent=3.0, vs. the
++    // 0.5 every other test's default head-on rig uses) so row 1's quad
++    // stays genuinely ON-SCREEN, at a SEPARATE, NON-OVERLAPPING location
++    // from row 0's -- not clipped away entirely, the way the original
++    // version of this test placed it. This is load-bearing, not cosmetic:
++    // the original off-frustum placement was PROVEN (this fix round) to be
++    // a discrimination hole -- under the SV_InstanceID revert bug, row 1's
++    // own draw misreads row 0's IDENTITY transform, so its fragments land
++    // EXACTLY on top of row 0's own already-written, IDENTICAL-depth quad;
++    // Vulkan's spec-mandated `VK_COMPARE_OP_LESS` (strict, this project's
++    // own fixed depth-compare state, material_system.cpp) then REJECTS
++    // every one of the buggy draw's fragments as a depth-tie, so the
++    // framebuffer silently reads back IDENTICAL to the correct-behavior
++    // case (a lone red quad, no visible green anywhere) regardless of
++    // whether the addressing bug is actually present -- reproduced
++    // directly this fix round: an empirical SV_InstanceID revert did NOT
++    // fail this test's own OLD single-center-pixel assertion (see the task
++    // report's fix-round section for the full paste). Probing row 1's OWN
++    // real, non-overlapping screen location closes that hole: under the
++    // bug, row 1's real location gets NO fragments at all (the buggy draw
++    // never reaches it), reading back as the plain background clear color
++    // -- unambiguously distinct from GREEN, with no depth-tie possible
++    // between two draws that no longer even hit the same pixels.
++    constexpr float kWideOrthoHalfExtent = 3.0F;
++    constexpr glm::vec3 kRow1Translation{2.0F, 0.0F, 0.0F};
+     std::vector<rx::material::DrawDataGpu> rows;
+-    rows.push_back(makeHeadOnRow());
+-    rows.push_back(makeHeadOnRow(glm::translate(glm::mat4(1.0F), glm::vec3(2.0F, 0.0F, 0.0F))));
++    rows.push_back(makeHeadOnRow(glm::mat4(1.0F), kWideOrthoHalfExtent));
++    rows.push_back(
++        makeHeadOnRow(glm::translate(glm::mat4(1.0F), kRow1Translation), kWideOrthoHalfExtent));
+     auto drawDataBuffer = createDrawDataBuffer(fixture->allocator, fixture->bindless, rows);
+     REQUIRE(drawDataBuffer.has_value());
+ 
+     uint32_t defaultSamplerIndex = 0;
+     VkSampler rawSampler = VK_NULL_HANDLE;
+     {
+         // A real registered sampler -- rx_sampleTexture's own default-
+         // sampler-index push-constant field needs a real, valid index.
+         VkSamplerCreateInfo samplerInfo{};
+         samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+@@ -668,34 +725,60 @@ TEST_CASE("D26.1: two draws in one command buffer, the second at firstInstance>0
+     VkDescriptorSetLayout realParamLayout = VK_NULL_HANDLE;
+     REQUIRE(vkCreateDescriptorSetLayout(fixture->device.device(), &setLayoutInfo, nullptr, &realParamLayout) ==
+             VK_SUCCESS);
+ 
+     std::vector<DrawRequest> draws;
+     draws.push_back(DrawRequest{pipeline, system->pipelineLayout(unlit), realParamLayout, redBlob.data(),
+                                  redBlob.size(), pushSize, /*drawDataRow=*/0, 0.0F});
+     draws.push_back(DrawRequest{pipeline, system->pipelineLayout(unlit), realParamLayout, greenBlob.data(),
+                                  greenBlob.size(), pushSize, /*drawDataRow=*/1, 0.0F});
+ 
+-    Rgba8 pixel = renderQuad(fixture->device, fixture->allocator, fixture->bindless, drawDataBuffer->handle,
+-                              defaultSamplerIndex, *mesh, draws);
+-
+-    // Row 0 (identity transform, on-frustum) draws RED at the probed
+-    // center pixel; row 1 (translated off-frustum) draws nothing visible
+-    // there. If SV_VulkanInstanceID's own row addressing were broken (e.g.
+-    // reading SV_InstanceID instead, which the Slang docs confirm
+-    // subtracts firstInstance back out -- always 0 for THIS draw regardless
+-    // of its real firstInstance=1), the second draw would ALSO read row 0
+-    // (identity, on-frustum) and incorrectly paint GREEN over the red,
+-    // since it is recorded second -- this is exactly what this assertion
+-    // catches.
+-    CHECK(pixel.r > 200);
+-    CHECK(pixel.g < 50);
++    // [Fix round, item 1] A 48x48 target (vs. the 8x8 every single-quad
++    // test uses) and the widened orthoHalfExtent=3.0 frustum above give
++    // exactly 8 texels per world unit -- world x=0 (row 0's quad center)
++    // maps to texel x=(0+3)*8=24; world x=2 (row 1's quad center, after
++    // its own +2 translation) maps to texel x=(2+3)*8=40. Both probes sit
++    // comfortably inside their own quad's own footprint (each quad spans a
++    // full world unit, i.e. 8 texels, centered on its own probe point) and
++    // nowhere near the other quad's footprint (a >=8-texel gap either way)
++    // or the frustum edge.
++    constexpr VkExtent2D kProbeExtent{48, 48};
++    constexpr uint32_t kRow0ProbeX = 24;
++    constexpr uint32_t kRow1ProbeX = 40;
++    constexpr uint32_t kProbeY = 24;
++    std::vector<uint8_t> pixels = renderQuadPixels(fixture->device, fixture->allocator, fixture->bindless,
++                                                     drawDataBuffer->handle, defaultSamplerIndex, *mesh, draws,
++                                                     kProbeExtent);
++    Rgba8 row0Pixel = pixelAt(pixels, kProbeExtent, kRow0ProbeX, kProbeY);
++    Rgba8 row1Pixel = pixelAt(pixels, kProbeExtent, kRow1ProbeX, kProbeY);
++
++    // Row 0's own location must read RED (its own draw, correctly
++    // addressed via SV_VulkanInstanceID==0, i.e. no addressing distinction
++    // possible there at all -- this assertion alone is NOT the
++    // discriminating one, kept only as a basic sanity check).
++    CHECK(row0Pixel.r > 200);
++    CHECK(row0Pixel.g < 50);
++    // Row 1's own, SEPARATE location is the real discriminator: it must
++    // read GREEN. If SV_VulkanInstanceID's own row addressing were broken
++    // (e.g. reading SV_InstanceID instead -- Slang's own documented,
++    // independently-verified behavior for it, per this codebase's own
++    // material.slang/forward_entry.slang/draw_data.h header comments:
++    // gl_InstanceIndex minus gl_BaseInstance, i.e. always 0 for a draw
++    // whose firstInstance IS its own gl_BaseInstance, regardless of the
++    // real firstInstance value), the second draw would misread row 0's
++    // OWN transform instead of its real row 1 -- its fragments would land
++    // on row 0's location (where they lose the depth tie, invisibly) and
++    // NEVER reach row 1's real, separate location at all, which would
++    // therefore read back as the plain background clear color instead of
++    // green.
++    CHECK(row1Pixel.g > 200);
++    CHECK(row1Pixel.r < 50);
+ 
+     vkDestroyDescriptorSetLayout(fixture->device.device(), realParamLayout, nullptr);
+     vkDestroySampler(fixture->device.device(), rawSampler, nullptr);
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
+ namespace {
+ 
+ // --- Shared StandardPBR test rig ------------------------------------------
+ // Bundles everything most StandardPBR tests below need: a fixture, a quad
+@@ -998,20 +1081,132 @@ TEST_CASE("StandardPBR: occlusion closed-form -- R=0,strength=1 zeroes ambient e
+     setParam(halfStrengthBlob, params, "occlusionTexture", blackOcclusionTex);
+     setParam(halfStrengthBlob, params, "occlusionStrength", 0.5F);
+     setParam(halfStrengthBlob, params, "metallicFactor", 1.0F);
+     Rgba8 halfStrengthPixel = renderOne(*rig, handle, halfStrengthBlob, row);
+ 
+     // occlusion = 1.0 + 0.5*(0-1.0) = 0.5 exactly -> ambient = 0.5*0.5*1 =
+     // 0.25 -> 0.25*255 ~= 64.
+     CHECK(near8(halfStrengthPixel.r, 64, 8));
+     CHECK(near8(halfStrengthPixel.g, 64, 8));
+     CHECK(near8(halfStrengthPixel.b, 64, 8));
++
++    // [Fix round, item 5b -- coordinator ruling] Occlusion is
++    // INDIRECT-only: it must NOT attenuate direct light at all (an earlier
++    // version of standard_pbr.slang multiplied `directLight * occlusion`
++    // too -- spec-incorrect; fixed this same fix round, see that file's own
++    // header comment on `directLight`). Isolates direct light by zeroing
++    // `ambientColor` (removing the only place `occlusion` legitimately
++    // participates) and using the DEFAULT head-on rig (NdotL=1, a real,
++    // nonzero direct contribution) -- then compares an UNOCCLUDED
++    // (occlusion=1, white texture) render against a HEAVILY OCCLUDED
++    // (occlusion=0, R=0 texture, strength=1 -- the same `blackOcclusionTex`
++    // used above) render of the OTHERWISE IDENTICAL material: with ambient
++    // zeroed, the two must read back IDENTICAL (direct light is the only
++    // remaining contributor, and occlusion must not touch it), unlike the
++    // ambient-only cases above where occlusion legitimately changes the
++    // result.
++    rx::material::DrawDataGpu directOnlyRow = makeHeadOnRow();
++    directOnlyRow.ambientColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
++
++    std::vector<uint8_t> directUnoccludedBlob = makeDefaultStandardPbrBlob(*rig, handle);
++    setParam(directUnoccludedBlob, params, "metallicFactor", 0.0F);
++    Rgba8 directUnoccludedPixel = renderOne(*rig, handle, directUnoccludedBlob, directOnlyRow);
++
++    std::vector<uint8_t> directOccludedBlob = makeDefaultStandardPbrBlob(*rig, handle);
++    setParam(directOccludedBlob, params, "metallicFactor", 0.0F);
++    setParam(directOccludedBlob, params, "occlusionTexture", blackOcclusionTex);
++    setParam(directOccludedBlob, params, "occlusionStrength", 1.0F);
++    Rgba8 directOccludedPixel = renderOne(*rig, handle, directOccludedBlob, directOnlyRow);
++
++    // Sanity: direct light is genuinely present and visible (not
++    // accidentally zero for some unrelated reason), so the equality
++    // assertions below are actually discriminating something real.
++    CHECK(directUnoccludedPixel.r > 50);
++    // The real assertion: occlusion=0 (fully "occluded") must NOT have
++    // changed the direct-lit result at all.
++    CHECK(near8(directOccludedPixel.r, directUnoccludedPixel.r, 2));
++    CHECK(near8(directOccludedPixel.g, directUnoccludedPixel.g, 2));
++    CHECK(near8(directOccludedPixel.b, directUnoccludedPixel.b, 2));
++
++    destroyRig(*rig);
++    CHECK_FALSE(rig->fixture->context.hasValidationErrors());
++}
++
++// [Fix round, item 2] The matrix's own emissive acceptance criterion (a
++// dedicated probe proving emissive bypasses lighting entirely) had no
++// TEST_CASE at all -- makeDefaultStandardPbrBlob()'s own
++// `emissiveFactorAndPad={0,0,0,0}` neutral default meant no existing test
++// ever exercised a NONZERO value. Isolates emissive by zeroing BOTH
++// `lightColor` AND `ambientColor` on the row (not by zeroing baseColor,
++// which would still leave a real, nonzero dielectric F0=0.04 specular
++// term reachable if any light/ambient were present) -- with both light
++// terms zero, standard_pbr.slang's own `color = directLight*occlusion +
++// ambient + emissive` collapses to exactly `emissive`, regardless of
++// baseColor/metallic/roughness (left at makeDefaultStandardPbrBlob()'s own
++// neutral defaults, deliberately not special-cased, to prove emissive is
++// independent of them too).
++TEST_CASE("StandardPBR: emissiveFactor (no texture) renders EXACTLY that color pre-tonemap, independent of "
++          "lighting (light+ambient zeroed)") {
++    auto rig = makeStandardPbrRig("standard_pbr_emissive_factor");
++    if (!rig.has_value()) {
++        return;
++    }
++    rx::material::MaterialHandle handle =
++        rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
++    const auto params = rig->system->materialParams(handle);
++
++    rx::material::DrawDataGpu row = makeHeadOnRow();
++    row.lightColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
++    row.ambientColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
++
++    std::vector<uint8_t> blob = makeDefaultStandardPbrBlob(*rig, handle);
++    // 0.2/0.4/0.6 -> exact byte values (51/102/153, no rounding ambiguity)
++    // once multiplied by 255, so this can assert near-exact rather than a
++    // wide tolerance band.
++    setParam(blob, params, "emissiveFactorAndPad", std::array<float, 4>{0.2F, 0.4F, 0.6F, 0.0F});
++    Rgba8 pixel = renderOne(*rig, handle, blob, row);
++
++    CHECK(near8(pixel.r, 51, 3));
++    CHECK(near8(pixel.g, 102, 3));
++    CHECK(near8(pixel.b, 153, 3));
++    destroyRig(*rig);
++    CHECK_FALSE(rig->fixture->context.hasValidationErrors());
++}
++
++// [Fix round, item 2] Textured variant -- emissiveFactor x emissiveTexture,
++// same lighting-isolation technique as the factor-only probe above.
++TEST_CASE("StandardPBR: emissiveFactor x emissiveTexture renders their exact product pre-tonemap, independent of "
++          "lighting (light+ambient zeroed)") {
++    auto rig = makeStandardPbrRig("standard_pbr_emissive_texture");
++    if (!rig.has_value()) {
++        return;
++    }
++    rx::material::MaterialHandle handle =
++        rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
++    const auto params = rig->system->materialParams(handle);
++
++    uint32_t emissiveTex = makeTexture(*rig->system, {100, 150, 200, 255});
++
++    rx::material::DrawDataGpu row = makeHeadOnRow();
++    row.lightColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
++    row.ambientColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
++
++    std::vector<uint8_t> blob = makeDefaultStandardPbrBlob(*rig, handle);
++    // factor=1 passes the texel through unscaled -> expected EXACTLY the
++    // texture's own (100,150,200).
++    setParam(blob, params, "emissiveFactorAndPad", std::array<float, 4>{1.0F, 1.0F, 1.0F, 0.0F});
++    setParam(blob, params, "emissiveTexture", emissiveTex);
++    Rgba8 pixel = renderOne(*rig, handle, blob, row);
++
++    CHECK(near8(pixel.r, 100, 3));
++    CHECK(near8(pixel.g, 150, 3));
++    CHECK(near8(pixel.b, 200, 3));
+     destroyRig(*rig);
+     CHECK_FALSE(rig->fixture->context.hasValidationErrors());
+ }
+ 
+ TEST_CASE("StandardPBR: Lambertian diffuse matches NdotL x baseColor / pi within tolerance (1/pi normalization "
+           "present)") {
+     auto rig = makeStandardPbrRig("standard_pbr_lambertian");
+     if (!rig.has_value()) {
+         return;
+     }
+diff --git a/tools/package_samples.sh b/tools/package_samples.sh
+index dd73fea..2aba444 100755
+--- a/tools/package_samples.sh
++++ b/tools/package_samples.sh
+@@ -273,33 +273,47 @@ copy_required "$STAGE_DIR/08_gltf_viewer/assets/DamagedHelmet/glTF" \
+   "$DAMAGED_HELMET_SRC/Default_metalRoughness.jpg" \
+   "$DAMAGED_HELMET_SRC/Default_normal.jpg"
+ 
+ # DamagedHelmet's own dual-license attribution -- verified text, identical
+ # to tools/fetch_assets.sh's own printed lines (that script's own header
+ # comment has the full LICENSE.md-sourced finding: BOTH CC-BY-4.0 (the
+ # glTF rebuild/conversion) AND CC-BY-NC-4.0 (the earlier model this rebuild
+ # incorporates) apply, not plain CC BY as the original planning documents
+ # assumed) -- written into the packaged asset's own directory so it travels
+ # with the redistributed files rather than living only in a build script.
++#
++# [Fix round, item 4 -- coordinator ruling] This notice is the human-
++# readable SUMMARY only, not the whole legal grant -- a public release zip
++# ships the FULL legal texts too (fetched once from creativecommons.org and
++# vendored, committed, into this sample's own licenses/ directory --
++# licenses/CC-BY-4.0.txt / CC-BY-NC-4.0.txt -- rather than fetched at
++# package time, so packaging never gains a network dependency it did not
++# have before; a small, static legal document is exactly the kind of
++# third-party content this project already commits directly, unlike
++# assets/fetched/'s own large, versioned binary content).
+ cat >"$STAGE_DIR/08_gltf_viewer/assets/DamagedHelmet/LICENSE.txt" <<'RX_DAMAGED_HELMET_LICENSE'
+ DamagedHelmet -- CC-BY-4.0 AND CC-BY-NC-4.0
+ 
+   (c) 2018 ctxwing (rebuild and glTF conversion, CC-BY-4.0)
+   (c) 2016 theblueturtle_ (earlier model, CC-BY-NC-4.0)
+ 
+   Source: https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/DamagedHelmet
+ 
+ The combination of these two licenses means the whole asset carries the
+ Non-Commercial restriction forward (CC-BY-NC-4.0), not a plain CC BY grant.
+-See the license texts at https://creativecommons.org/licenses/by/4.0/ and
+-https://creativecommons.org/licenses/by-nc/4.0/ for the full terms.
++The full legal text of both licenses is bundled alongside this file:
++CC-BY-4.0.txt and CC-BY-NC-4.0.txt (fetched verbatim from
++creativecommons.org/licenses/{by,by-nc}/4.0/legalcode.txt).
+ RX_DAMAGED_HELMET_LICENSE
++copy_required "$STAGE_DIR/08_gltf_viewer/assets/DamagedHelmet" \
++  "$REPO_ROOT/samples/08_gltf_viewer/licenses/CC-BY-4.0.txt" \
++  "$REPO_ROOT/samples/08_gltf_viewer/licenses/CC-BY-NC-4.0.txt"
+ 
+ mkdir -p "$(dirname "$RX_OUT_ZIP")"
+ RX_OUT_ZIP_ABS="$(cd "$(dirname "$RX_OUT_ZIP")" && pwd)/$(basename "$RX_OUT_ZIP")"
+ rm -f "$RX_OUT_ZIP_ABS"
+ 
+ echo "package_samples: zipping into '$RX_OUT_ZIP_ABS' ..."
+ (cd "$STAGE_DIR" && zip -r -X -q "$RX_OUT_ZIP_ABS" 01_triangle 02_hotreload 03_bindless_mesh 04_streaming 05_multipass 06_materials 07_stress 08_gltf_viewer)
+ 
+ echo "package_samples: done. Contents:"
+ unzip -l "$RX_OUT_ZIP_ABS"
