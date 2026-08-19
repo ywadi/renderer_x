@@ -17,12 +17,20 @@
 // doubleSided are two independent loadMaterial() calls (see
 // setupMaterial() below), yielding two independently-cached VkPipelines.
 //
-// ORBIT CAMERA: reads SDL mouse state directly via `Window::sdlWindow()`
-// [gate ruling #8: "sample 08 reads SDL mouse state directly via
-// Window::sdlWindow() -- the exposed escape hatch -- no rx_platform scope
-// pulled forward, no reordering"] -- sample-local, not a new rx_platform
-// input surface (Task 20, Stage 2, is that real surface; sample 09
-// migrates to it then).
+// ORBIT CAMERA [Fix round, item 7: corrected to match the actual code --
+// see below for what changed]: reads SDL mouse state directly via SDL3's
+// own global `SDL_GetMouseState()` (takes no window argument at all in
+// SDL3 -- it queries OS-level cursor state directly, not scoped through
+// any particular `SDL_Window*`), satisfying gate ruling #8's own intent
+// ("sample 08 reads SDL mouse state directly... the exposed escape hatch
+// -- no rx_platform scope pulled forward, no reordering") without actually
+// needing `Window::sdlWindow()` at all for this specific query -- that
+// accessor exists on `rx::platform::Window` for a caller that DOES need a
+// window-scoped SDL call (event polling, cursor confinement, ...) and
+// remains this sample's own escape hatch for that; this one query simply
+// doesn't require it. Still sample-local either way, not a new
+// rx_platform input surface (Task 20, Stage 2, is that real surface;
+// sample 09 migrates to it then).
 //
 // REVERSED-Z: NOT yet -- D13's reversed-Z camera convention arrives with
 // rx::scene::Camera in Stage 2 (Task 18). This sample uses the SAME
@@ -221,7 +229,8 @@ std::filesystem::path resolveDefaultScenePath() {
 }
 
 // --- Orbit camera [gate ruling #8: SDL mouse state read directly via
-// Window::sdlWindow(), sample-local] -------------------------------------
+// SDL3's own global SDL_GetMouseState(), sample-local -- see this file's
+// own header comment] -----------------------------------------------------
 struct OrbitCamera {
     float azimuthRadians = glm::radians(45.0F);
     float elevationRadians = glm::radians(20.0F);
@@ -1518,6 +1527,22 @@ bool isLavapipeDevice(VkPhysicalDevice physicalDevice) {
 // and tears down immediately -- this whole stage's own standing lesson:
 // abandon/teardown paths get real-GPU-resource tests, never a mock.
 int runHeadless(const Args& args) {
+    // [Fix round, item 6] Direct std::chrono wall-clock instrumentation --
+    // see the "sample08: perf" log line below (this function's own tail)
+    // for the CAPTURE METHOD this task report's own performance numbers
+    // actually came from: real, timed wall-clock durations from a live
+    // headless run, printed here, NOT a live Tracy GUI/network capture
+    // (this dev environment has no Tracy GUI and this project does not
+    // build Tracy's own separate `tracy-capture` CLI tool as part of its
+    // normal build graph -- a real, but materially larger, undertaking
+    // this fix round's own scope did not call for). Task 15's own
+    // RX_ZONE/Tracy zones around the async-import pipeline remain fully
+    // present and unaffected -- they are what a real interactive Tracy
+    // GUI session profiles when one IS connected (RX_TRACY=ON in this
+    // preset, per CMakePresets.json) -- this is a second, independent,
+    // always-on measurement, not a replacement for them.
+    const auto processStart = std::chrono::steady_clock::now();
+
     auto app = makeApp("RendererX -- 08_gltf_viewer (headless)", kHeadlessWidth, kHeadlessHeight, /*visible=*/false,
                         args.validate);
     if (app == nullptr) {
@@ -1682,6 +1707,8 @@ int runHeadless(const Args& args) {
     // the async-import demonstration vehicle, per the plan's own text].
     bool importFinished = false;
     bool importOk = false;
+    const auto importStart = std::chrono::steady_clock::now();
+    double importMs = 0.0;
     rx::asset::AsyncImportHandle importHandle = app->registry->importGltfAsync(
         scenePath, *app->geometryPool, *app->scheduler, app->textureCache.get(),
         [&](rx::asset::ImportResult result) {
@@ -1699,6 +1726,8 @@ int runHeadless(const Args& args) {
             }
             frameCameraToScene(*app);
             app->sceneReady = true;
+            importMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - importStart)
+                           .count();
         });
 
     if (args.quitDuringLoad) {
@@ -1772,6 +1801,25 @@ int runHeadless(const Args& args) {
         loadedPixels = captureFrame();
         if (loadedPixels.empty()) {
             gateOk = false;
+        } else {
+            // [Fix round, item 6] "sample08: perf" -- greppable, matching
+            // this project's own established per-sample stats-line
+            // convention (sample07's own "stress:" prefix). `import_ms`:
+            // wall-clock from the importGltfAsync() kickoff to the
+            // completion callback confirming setupMaterials()/
+            // buildDrawList() both succeeded (real, measured -- see this
+            // function's own header comment on method). `first_frame_ms`:
+            // wall-clock from THIS FUNCTION's own first instruction
+            // (before Window/Context/Device/Allocator/MaterialSystem/
+            // GeometryPool/TextureCache/Executor construction, the tonemap
+            // pipeline build, and the loading-state frame) through this
+            // exact point -- the first fully rendered, GPU-readback-
+            // confirmed post-import frame -- i.e. genuine cold-start time
+            // to a real, correct pixel on screen, not just import alone.
+            const double firstFrameMs =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - processStart).count();
+            RX_LOG_INFO("sample08: perf scene='{}' import_ms={:.3f} first_frame_ms={:.3f}", scenePath.string(),
+                        importMs, firstFrameMs);
         }
     } else {
         gateOk = false;
@@ -1857,8 +1905,9 @@ int runHeadless(const Args& args) {
 }
 
 // --- Present mode: interactive window, real FrameSync loop, mouse-drag
-// orbit camera [gate ruling #8: SDL mouse state read directly via
-// Window::sdlWindow()] --------------------------------------------------
+// orbit camera [gate ruling #8: SDL mouse state read directly via SDL3's
+// own global SDL_GetMouseState() -- see this file's own header comment]
+// --------------------------------------------------------------------
 int runPresent(const Args& args) {
     auto app = makeApp("RendererX -- 08_gltf_viewer", kPresentWidth, kPresentHeight, /*visible=*/true, args.validate);
     if (app == nullptr) {
