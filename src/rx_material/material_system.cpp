@@ -1959,7 +1959,26 @@ VkPipeline MaterialSystem::getPipeline(const PipelineRequest& req) {
     depthStencilState.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     depthStencilState.depthTestEnable = hasDepth ? VK_TRUE : VK_FALSE;
     depthStencilState.depthWriteEnable = (hasDepth && !blend) ? VK_TRUE : VK_FALSE;
-    depthStencilState.depthCompareOp = VK_COMPARE_OP_LESS;
+    // [D13, gate ruling RC3 -- "compare-op fork resolved as option (a)":
+    // GREATER_OR_EQUAL, not LESS. From Phase 4 Stage 2 on, every
+    // MaterialSystem-built pipeline is a MAIN-CAMERA pipeline (reversed-Z:
+    // near=1, far=0, per D13) -- the scene path's depth-only SHADOW-caster
+    // pass is a SEPARATE pipeline built OUTSIDE MaterialSystem entirely
+    // (Task 22, the shadow bridge: see its own shadow-caster pipeline
+    // creation, which deliberately keeps VK_COMPARE_OP_LESS + a clear
+    // value of 1.0 -- shadow maps stay STANDARD-Z per D13's own text,
+    // "the cascades work in the techniques phase revisits" -- do NOT
+    // "fix" that call site's compare op to match this one; they are
+    // intentionally different conventions, not a shared bug). This is the
+    // single literal flip RC3's own text names: "getPipeline() serves
+    // only reversed-Z main-camera pipelines from Stage 2 on, so its
+    // compare-op flips as one literal in Task 22 -- no compare-op cache
+    // axis is built in Phase 4." Every caller of getPipeline() must pair
+    // this with a Reversed-convention depth attachment (D29's
+    // AttachmentDesc::depthConvention, clear=0.0) -- a Standard-convention
+    // depth attachment used with a MaterialSystem pipeline from this point
+    // on fails every depth test trivially (nothing ever draws).
+    depthStencilState.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
 
     std::vector<VkPipelineColorBlendAttachmentState> blendAttachments(req.pass.colorCount);
     for (auto& blendAttachment : blendAttachments) {

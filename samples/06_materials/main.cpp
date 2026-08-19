@@ -330,6 +330,29 @@ glm::mat4 applyVulkanYFlip(glm::mat4 proj) {
     return proj;
 }
 
+// [D13, gate ruling RC3] MaterialSystem::getPipeline() builds every
+// pipeline GREATER_OR_EQUAL from Phase 4 Stage 2 on (the shadow bridge's
+// own one-literal compare-op flip -- material_system.cpp) -- this sample
+// draws exclusively through MaterialSystem, so its own projection must
+// match (near=1, far=0) or its depth test rejects everything, every
+// frame. Unlike a PERSPECTIVE reversed-Z remap (which restates the whole
+// A/B coefficient pair for its float-precision benefit -- see
+// rx::scene::Camera::proj()'s own derivation, camera.cpp), an
+// ORTHOGRAPHIC projection has no precision nonlinearity to fix in the
+// first place (clip.w is always 1) -- reversing it is exactly the affine
+// remap `z' = 1 - z`, applied here as a row operation on the ALREADY-
+// Y-flipped matrix (new row 2 = row 3 minus old row 2; GLM stores
+// column-major, so this iterates `m[col][2]` against `m[col][3]`'s own
+// 0/0/0/1 shape) -- correctness-only, not a precision optimization, for
+// this sample's own orthographic camera.
+glm::mat4 reverseOrthoZ(glm::mat4 proj) {
+    for (int col = 0; col < 4; ++col) {
+        const float row3 = (col == 3) ? 1.0F : 0.0F;
+        proj[col][2] = row3 - proj[col][2];
+    }
+    return proj;
+}
+
 glm::vec3 cameraEyeForAzimuth(float azimuthRadians) {
     return glm::vec3(std::sin(azimuthRadians) * kOrbitRadius, 0.0F, std::cos(azimuthRadians) * kOrbitRadius);
 }
@@ -359,7 +382,8 @@ CameraPose makeCameraPose(float azimuthRadians, uint32_t viewportWidth, uint32_t
     } else {
         halfHeight = halfWidth / aspect;
     }
-    const glm::mat4 proj = applyVulkanYFlip(glm::ortho(-halfWidth, halfWidth, -halfHeight, halfHeight, kOrbitNear, kOrbitFar));
+    const glm::mat4 proj =
+        reverseOrthoZ(applyVulkanYFlip(glm::ortho(-halfWidth, halfWidth, -halfHeight, halfHeight, kOrbitNear, kOrbitFar)));
 
     CameraPose pose;
     pose.viewProj = proj * view;
@@ -1016,6 +1040,18 @@ rx::graph::AttachmentDesc swapchainRelativeDesc(VkFormat format) {
     return desc;
 }
 
+// [D29/RC3] The main depth attachment's clear value (0.0, not the pre-D29
+// default 1.0) must match MaterialSystem::getPipeline()'s own
+// GREATER_OR_EQUAL flip and makeCameraPose()'s own reverseOrthoZ() --
+// three independent call sites that must all agree on ONE convention, per
+// D29's own text ("the clear value and the pass's expected compare
+// direction derive from it").
+rx::graph::AttachmentDesc swapchainRelativeReversedDepthDesc(VkFormat format) {
+    rx::graph::AttachmentDesc desc = swapchainRelativeDesc(format);
+    desc.depthConvention = rx::graph::DepthConvention::Reversed;
+    return desc;
+}
+
 // Phase 4 Task 7 [spec D4 amendment]: CHUNKED -- migrated from a single
 // whole-pass setExecute() callback to setExecuteChunked() (declareGraph()
 // below), but with ALL of its real work deliberately kept in chunk 0 alone
@@ -1112,7 +1148,7 @@ void recordDrawsChunked(rx::graph::PassContext& ctx, Scene& scene, uint32_t chun
 void declareGraph(rx::graph::RenderGraph& graph, Scene& scene, VkFormat backbufferFormat) {
     graph.addPass("forward")
         .addColorOutput("backbuffer", swapchainRelativeDesc(backbufferFormat))
-        .setDepthStencilOutput("depth", swapchainRelativeDesc(kDepthFormat))
+        .setDepthStencilOutput("depth", swapchainRelativeReversedDepthDesc(kDepthFormat))
         .setExecuteChunked([&scene](rx::graph::PassContext& ctx, uint32_t chunkIndex, uint32_t chunkCount) {
             recordDrawsChunked(ctx, scene, chunkIndex, chunkCount);
         });

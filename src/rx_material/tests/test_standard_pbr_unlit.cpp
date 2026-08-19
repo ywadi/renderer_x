@@ -206,6 +206,19 @@ rx::material::DrawDataGpu makeHeadOnRow(glm::mat4 model = glm::mat4(1.0F), float
     // validation error to flag it, since a culled triangle is
     // spec-legal, not a Vulkan usage error.
     proj[1][1] *= -1.0F;
+    // [D13, gate ruling RC3, Task 22] MaterialSystem::getPipeline() now
+    // hardcodes GREATER_OR_EQUAL (reversed-Z, near=1/far=0) for every
+    // pipeline it builds -- an orthographic projection has no perspective
+    // nonlinearity to restate for reversed-Z's PRECISION benefit (clip.w
+    // is always 1), so the correctness-only fix is the affine remap
+    // `z' = 1 - z`, applied as a row operation (new row 2 = row 3 minus
+    // old row 2; GLM stores column-major, so this iterates `proj[col][2]`
+    // against row 3's own 0/0/0/1 shape) -- same technique/rationale as
+    // samples/06_materials' own `reverseOrthoZ()`.
+    for (int col = 0; col < 4; ++col) {
+        const float row3 = (col == 3) ? 1.0F : 0.0F;
+        proj[col][2] = row3 - proj[col][2];
+    }
     glm::mat4 viewProj = proj * view;
     glm::mat3 normalMat3 = glm::transpose(glm::inverse(glm::mat3(model)));
 
@@ -333,6 +346,12 @@ std::vector<uint8_t> renderQuadPixels(rx::rhi::Device& device, rx::rhi::Allocato
     pass.addColorOutput("color", colorDesc);
     rx::graph::AttachmentDesc depthDesc;
     depthDesc.format = kDepthFormat;
+    // [D13, gate ruling RC3, Task 22] MaterialSystem::getPipeline() now
+    // hardcodes GREATER_OR_EQUAL (reversed-Z main-camera convention) --
+    // this harness's own draws go through that same getPipeline(), so its
+    // depth attachment must clear to 0.0 (Reversed), matching
+    // makeHeadOnRow()'s own reversed-Z ortho projection below.
+    depthDesc.depthConvention = rx::graph::DepthConvention::Reversed;
     pass.setDepthStencilOutput("depth", depthDesc);
     graph.setBackbufferSource("color");
 

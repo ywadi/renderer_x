@@ -86,6 +86,7 @@
 #include <rx_rhi_vk/frame_sync.h>
 #include <rx_rhi_vk/pipeline_layout.h>
 #include <rx_rhi_vk/upload.h>
+#include <rx_scene/camera.h>
 #include <rx_shader/compiler.h>
 #include <rx_shader/reflection.h>
 #include <rx_task/scheduler.h>
@@ -255,22 +256,16 @@ struct OrbitCamera {
     }
 };
 
-// Vulkan's clip-space Y axis points DOWN; GLM's `perspective`/`ortho` are
-// written for the OpenGL convention (Y UP) -- negating row 1 (GLM is
-// column-major, so `proj[1][1] *= -1`) is required for
-// MaterialSystem::getPipeline()'s fixed `frontFace =
-// VK_FRONT_FACE_COUNTER_CLOCKWISE` to see the SAME winding glTF's own
-// right-handed, CCW-front convention authors meshes in. Reproduced
-// directly during this task's own development (src/rx_material/tests/
-// test_standard_pbr_unlit.cpp's own makeHeadOnRow() hit the identical
-// omission first) -- omitting this silently back-face-culls every
-// single-sided draw, which reads as "nothing rendered" with zero
-// validation error to flag it.
-glm::mat4 vulkanPerspective(float fovYRadians, float aspect, float nearZ, float farZ) {
-    glm::mat4 proj = glm::perspective(fovYRadians, aspect, nearZ, farZ);
-    proj[1][1] *= -1.0F;
-    return proj;
-}
+// [Task 22, D13/RC3 migration] The hand-rolled `vulkanPerspective()`
+// helper this comment used to document (a plain `glm::perspective()` +
+// row-1 Y-flip, standard-Z) is GONE -- superseded by `computeViewProj()`'s
+// own `rx::scene::Camera::cullingProj()` call below, which already bakes
+// in the identical Vulkan Y-flip internally (camera.cpp's own
+// `reversedZPerspective()`: `m[1][1] = -fY`) AND the D13 reversed-Z
+// convention `MaterialSystem::getPipeline()` now requires -- see that
+// method's own comment for why front-face winding (CCW, glTF's own
+// convention) is unaffected by either the Y-flip or the reversed-Z
+// migration (neither touches handedness/winding, only depth).
 
 // --- Tonemap pass [shaders/multipass/tonemap.{vert,frag}.slang, VERBATIM --
 // see this file's own header comment] -- byte-identical machinery to
@@ -1321,6 +1316,25 @@ void frameCameraToScene(App& app) {
     app.camera.distance = std::max(radius / std::sin(halfFovRadians) * 1.6F, 0.01F);
 }
 
+// [D13, gate ruling RC3 -- "reversed-Z main-camera migration lands here
+// for the scene path", Task 22] `rx::scene::Camera` is D13's own
+// projection-helpers source of truth ("rx::scene::Camera owns the
+// projection helpers so samples cannot get it inconsistently wrong") --
+// this is the Stage-2 migration this sample's own header comment (Task
+// 16's "reversed-Z NOT yet -- camera helpers arrive Stage 2") promised:
+// sample 08 draws exclusively through
+// MaterialSystem, whose getPipeline() now hardcodes GREATER_OR_EQUAL
+// (material_system.cpp's own D13/RC3 comment) for every pipeline it
+// builds -- so this sample's projection must be reversed-Z too, or its
+// depth test rejects every fragment. Reuses `Camera::cullingProj()`
+// specifically (FINITE far, reversed-Z -- see camera.h's own "TWO
+// PROJECTIONS, ON PURPOSE" comment), not `Camera::proj()` (INFINITE far):
+// this sample's own near/far are content-derived per-scene finite values
+// (immediately below), which is exactly cullingProj()'s own shape, not
+// proj()'s. Only the PROJECTION half is reused -- `view` stays this
+// sample's own `glm::lookAt()`-based orbit-camera construction verbatim
+// (Camera's `position`/`orientation` fields are left at their unused
+// defaults; nothing here ever calls `Camera::view()`).
 glm::mat4 computeViewProj(const OrbitCamera& camera, float aspect) {
     const glm::mat4 view = glm::lookAt(camera.eye(), camera.target, glm::vec3(0.0F, 1.0F, 0.0F));
     // Near/far derived from the camera's own distance (not a fixed pair of
@@ -1330,7 +1344,13 @@ glm::mat4 computeViewProj(const OrbitCamera& camera, float aspect) {
     // depth-buffer's precision on an asset 1000x smaller than DamagedHelmet.
     const float nearZ = std::max(0.01F, camera.distance * 0.01F);
     const float farZ = camera.distance * 50.0F + 10.0F;
-    const glm::mat4 proj = vulkanPerspective(glm::radians(45.0F), aspect, nearZ, farZ);
+
+    rx::scene::Camera reversedZCamera;
+    reversedZCamera.verticalFovRadians = glm::radians(45.0F);
+    reversedZCamera.aspectRatio = aspect;
+    reversedZCamera.nearPlane = nearZ;
+    reversedZCamera.cullingFarPlane = farZ;
+    const glm::mat4 proj = reversedZCamera.cullingProj();
     return proj * view;
 }
 
@@ -1520,10 +1540,20 @@ rx::graph::AttachmentDesc swapchainRelativeDesc(VkFormat format) {
     return desc;
 }
 
+// [D29/RC3] Must agree with MaterialSystem::getPipeline()'s own
+// GREATER_OR_EQUAL flip and computeViewProj()'s own reversed-Z
+// `Camera::cullingProj()` -- three independent call sites, one
+// convention, per D29's own text.
+rx::graph::AttachmentDesc swapchainRelativeReversedDepthDesc(VkFormat format) {
+    rx::graph::AttachmentDesc desc = swapchainRelativeDesc(format);
+    desc.depthConvention = rx::graph::DepthConvention::Reversed;
+    return desc;
+}
+
 void declareGraph(rx::graph::RenderGraph& graph, App& app, VkFormat backbufferFormat) {
     graph.addPass("forward")
         .addColorOutput("hdr", swapchainRelativeDesc(kHdrFormat))
-        .setDepthStencilOutput("depth", swapchainRelativeDesc(kDepthFormat))
+        .setDepthStencilOutput("depth", swapchainRelativeReversedDepthDesc(kDepthFormat))
         .setExecute([&app](rx::graph::PassContext& ctx) { recordForward(ctx, app); });
 
     graph.addPass("tonemap")

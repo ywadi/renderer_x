@@ -4,7 +4,7 @@
 
 add_executable(sample_08_gltf_viewer main.cpp)
 target_link_libraries(sample_08_gltf_viewer PRIVATE
-    rx_graph rx_rhi_vk rx_platform rx_material rx_asset rx_task rx_shader sample_common
+    rx_graph rx_rhi_vk rx_platform rx_material rx_asset rx_scene rx_task rx_shader sample_common
 )
 
 # RX_REPO_ROOT_DIR: the same "bake an absolute CMAKE_SOURCE_DIR-relative
