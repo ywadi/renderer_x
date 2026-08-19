@@ -125,7 +125,8 @@ TEST_CASE("fitShadowFrustum: worldTexelSize is the square footprint's side lengt
 // tiny amount, exactly what a moving camera's own visible-bounds
 // computation would produce frame to frame for an otherwise-static
 // scene) and lightViewProj IS the "shadow edge" -- a texel-snapped
-// lightViewProj that is BIT-IDENTICAL across a sub-texel shift proves no
+// lightViewProj that is identical (to float round-off, doctest::Approx
+// epsilon=1e-6 -- not bitwise ==) across a sub-texel shift proves no
 // shimmer can occur; the same test's second half (a shift LARGER than one
 // texel producing a genuinely different, but still snapped, result)
 // proves this is real quantization, not an accidental no-op.
@@ -154,9 +155,9 @@ TEST_CASE("fitShadowFrustum: texel snapping makes lightViewProj invariant to a s
     const ShadowFrustumFit shifted =
         fitShadowFrustum(worldMin + subTexelShift, worldMax + subTexelShift, lightView, kResolution);
 
-    // Bit-identical (not merely "close") -- the whole point of snapping:
-    // the shadow-map texel grid did not move at all for this sub-texel
-    // camera jitter.
+    // Identical to float round-off (doctest::Approx, epsilon=1e-6 -- not
+    // bitwise ==) -- the whole point of snapping: the shadow-map texel
+    // grid did not move at all for this sub-texel camera jitter.
     for (int col = 0; col < 4; ++col) {
         for (int row = 0; row < 4; ++row) {
             CAPTURE(col);
