@@ -517,7 +517,10 @@ jobs:
       # tests -- same GPU-backed reason as rx_rhi_vk_tests, added when that
       # target was introduced), rx_material_gpu_tests (Task 5's
       # MaterialSystem tests -- every one of them builds a real
-      # VkGraphicsPipeline, same GPU-backed reason), and every
+      # VkGraphicsPipeline, same GPU-backed reason), rx_debug_ui_gpu_tests
+      # [Phase 4 Stage 2 Task 21 -- Overlay::create() builds a real
+      # VkGraphicsPipeline/descriptor pool/font-atlas texture through the
+      # vendored ImGui Vulkan backend, same GPU-backed reason], and every
       # sample_*_headless gate are excluded: Wine in CI has no real Vulkan
       # device to hand them, and that is a real, documented environment
       # limitation -- not a silent pass. rx_core, rx_platform,
@@ -534,10 +537,12 @@ jobs:
       # not just the development machine that first checked it.
       # rx_platform's window tests hit their own existing skip guards
       # gracefully when Wine's video backend can't produce Vulkan surface
-      # extensions, exactly as they do on any other display-less machine.
+      # extensions, exactly as they do on any other display-less machine --
+      # this now also covers window_test.cpp's new preDispatch coverage
+      # [Task 21], which needs no GPU at all and is device-free by design.
       - name: Test under wine (xvfb; GPU tests excluded -- no Vulkan under Wine)
         run: >-
-          xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample' --output-on-failure
+          xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_debug_ui_gpu|sample' --output-on-failure
           --output-junit ${{ github.workspace }}/ctest-results-windows-cross-zig.xml
 
       - name: Build budget check

@@ -126,6 +126,14 @@ and compiles to nothing at all when it is OFF:
   `rx::rhi::Uploader::isComplete()`/`wait()` already established above.
   `setFullscreen()`/`isFullscreen()` (Task 17) are NOT guarded — out of
   this task's touched-surface scope, unchanged. (`src/rx_platform/include/rx_platform/window.h`)
+- **`rx::debug_ui::Overlay`** [Phase 4 Stage 2 Task 21, spec D20, gate
+  ruling #16] — `create()`/`processEvent()`/`beginFrame()`/`addPass()`
+  **[guarded, all four]**. Stricter than the usual "GPU-object mutation"
+  framing above: this whole class wraps a single, process-global
+  `ImGuiContext` (Dear ImGui is single-threaded by design, no internal
+  synchronization at all), so every entry point is main-thread-only, not
+  just the ones that touch a `VkDevice` directly.
+  (`src/rx_debug_ui/include/rx_debug_ui/overlay.h`)
 - **`rx::task::Scheduler`** — `pumpMain()` **[guarded]** [audit finding
   F5-partial]: runs whatever GPU-object-mutating closures `postToMain()`
   queued (the handoff pattern below), so it carries the identical

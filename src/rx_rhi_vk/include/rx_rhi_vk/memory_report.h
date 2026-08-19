@@ -18,6 +18,19 @@
 // actually calls vmaGetHeapBudgets()/vmaSetCurrentFrameIndex() to BUILD an
 // RxMemoryReport lives in rx_rhi_vk/buffer.h's Allocator (buffer.cpp),
 // which already depends on VMA for other reasons.
+//
+// SCOPE NOTE -- a documented, bounded blind spot, not an oversight [Phase
+// 4 Stage 2 Task 21, gate ruling #16, FONT-UPLOAD RULING]: `rx_debug_ui`'s
+// vendored Dear ImGui Vulkan backend does its OWN raw vkCreateImage/
+// vkAllocateMemory/vkCreateBuffer calls for the font atlas (and any later-
+// registered HUD texture) -- entirely bypassing VMA, and therefore
+// entirely invisible to this report's per-category accounting and to
+// vmaGetHeapBudgets() alike. This is small and bounded by construction (a
+// font atlas plus a handful of HUD textures, never scene-scale data), not
+// a correctness gap -- but a reader relying on this report as an
+// EXHAUSTIVE account of this process's GPU memory should not assume it
+// covers that one vendored, unmodifiable code path. See rx_debug_ui/
+// overlay.h's own FONT/TEXTURE UPLOAD section for the full rationale.
 #include <volk.h>
 #include <array>
 #include <atomic>

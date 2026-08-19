@@ -101,6 +101,31 @@ add_subdirectory(src/rx_graph)
 # target only), and rx_rhi_vk (PipelineLayoutBuilder/BindlessTable/Device),
 # so it is add_subdirectory'd after all three.
 add_subdirectory(src/rx_material)
+
+# Phase 4 Stage 2 Task 21 -- rx_debug_ui: Dear ImGui overlay module (spec
+# D20). Depends on rx_platform (Window)/rx_rhi_vk (Device/Uploader)/
+# rx_graph (RenderGraph pass declaration) plus the vendored `imgui` target
+# (third_party/CMakeLists.txt) -- added here, after every rx_* CORE
+# library above, so the dependency-boundary check immediately below can
+# assert none of THOSE core targets pulled it in transitively, and before
+# the samples that will (Task 24) become its first real consumer.
+add_subdirectory(src/rx_debug_ui)
+
+# Configure-time link-boundary check [Phase 4 Stage 2 Task 21, gate matrix-
+# issue16 row 12 as amended by gate/rulings-2026-08-18.md #16; see
+# cmake/DependencyBoundaryCheck.cmake for the full mechanism comment]: every
+# rx_* CORE library defined above (deliberately excludes rx_debug_ui
+# itself, which is SUPPOSED to depend on imgui, and excludes samples/tools,
+# which are hosts, not core libraries) must not transitively link the
+# vendored `imgui` target -- the "core libraries and public ABI stay
+# ImGui-free" hard boundary D20/ticket #16 both restate. Runs once, right
+# here, so a violation fails THIS configure step before any compilation
+# starts.
+include(cmake/DependencyBoundaryCheck.cmake)
+foreach(_rx_core_target rx_core rx_rhi_vk rx_graph rx_material rx_platform rx_task rx_shader rx_asset rx_scene)
+    rx_assert_target_excludes_dependency(${_rx_core_target} imgui)
+endforeach()
+
 add_subdirectory(tools/dep_cache_smoketest)
 add_subdirectory(tools/toolchain_check)
 # Phase 4 Stage 1 Task 13: host-only fixture regenerator (assets/test/

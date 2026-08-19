@@ -10,6 +10,7 @@
 #include <rx_platform/window.h>
 #include <SDL3/SDL.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -574,6 +575,94 @@ TEST_CASE("Window::pumpEvents() ignores window events targeting a different SDL_
     window->pumpEvents();
 
     CHECK_FALSE(window->minimizedEventObserved());
+}
+
+// [Phase 4 Task 21, gate ruling #16] Device-free proof of the `preDispatch`
+// seam pumpEvents() gained for the ImGui overlay: (a) it fires exactly once
+// per drained event, in drain order, and (b) it genuinely runs BEFORE this
+// class's own handling of that SAME event -- not merely "at some point
+// during the same pumpEvents() call". (b) is the load-bearing half (matches
+// ImGui_ImplSDL3_ProcessEvent()'s own real requirement: its IO state must be
+// current before anything downstream reads WantCaptureMouse/Keyboard this
+// frame) and is proven directly, not inferred: the callback reads
+// minimizedEventObserved() for the very MINIMIZED event it was just handed
+// and asserts it is STILL false at that moment, only becoming true once
+// pumpEvents() itself returns.
+TEST_CASE("Window::pumpEvents(preDispatch) invokes the callback once per drained event, strictly BEFORE this "
+          "class's own handling of that same event") {
+    auto window = rx::platform::Window::create("rx_platform_predispatch_test", 64, 64, /*visible=*/false);
+    REQUIRE(window.has_value());
+    const SDL_WindowID windowId = SDL_GetWindowID(window->sdlWindow());
+    REQUIRE(windowId != 0);
+
+    // Drain whatever the platform/WM enqueued on its own first (see
+    // drainUntilQuiescent()'s own comment above) so the synthetic events
+    // pushed below are the only ones this test's own assertions reason
+    // about.
+    (void)drainUntilQuiescent(*window);
+
+    std::vector<Uint32> observedEventTypes;
+    bool minimizedObservedInsideCallback = true;  // deliberately wrong-default: only false proves the ordering.
+    auto preDispatch = [&](const SDL_Event& event) {
+        observedEventTypes.push_back(event.type);
+        if (event.type == SDL_EVENT_WINDOW_MINIMIZED) {
+            minimizedObservedInsideCallback = window->minimizedEventObserved();
+        }
+    };
+
+    SDL_Event minimizedEvent{};
+    minimizedEvent.window.type = SDL_EVENT_WINDOW_MINIMIZED;
+    minimizedEvent.window.windowID = windowId;
+    REQUIRE(SDL_PushEvent(&minimizedEvent));
+
+    SDL_Event sizeEvent{};
+    sizeEvent.window.type = SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED;
+    sizeEvent.window.windowID = windowId;
+    sizeEvent.window.data1 = 99;
+    sizeEvent.window.data2 = 88;
+    REQUIRE(SDL_PushEvent(&sizeEvent));
+
+    window->pumpEvents(preDispatch);
+
+    // Both synthetic events reached the callback, in the order they were
+    // drained (SDL_PollEvent is FIFO).
+    REQUIRE(observedEventTypes.size() >= 2);
+    auto minimizedPos = std::find(observedEventTypes.begin(), observedEventTypes.end(), SDL_EVENT_WINDOW_MINIMIZED);
+    auto sizePos =
+        std::find(observedEventTypes.begin(), observedEventTypes.end(), SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED);
+    REQUIRE(minimizedPos != observedEventTypes.end());
+    REQUIRE(sizePos != observedEventTypes.end());
+    CHECK(minimizedPos < sizePos);
+
+    // The ordering proof: at the moment the callback saw the MINIMIZED
+    // event, Window's OWN handling of that same event had not run yet.
+    CHECK_FALSE(minimizedObservedInsideCallback);
+    // ... but by the time pumpEvents() returns, it has.
+    CHECK(window->minimizedEventObserved());
+    CHECK(window->lastPixelSizeEvent().width == 99);
+    CHECK(window->lastPixelSizeEvent().height == 88);
+}
+
+// Regression guard: every call site written before this task calls
+// pumpEvents() with no argument at all -- the default `nullptr` callback
+// must behave as a plain no-op check per event (never crash, never alter
+// any existing behavior). Reuses the exact MINIMIZED/RESTORED assertions
+// from the very first TEST_CASE in this file as a smoke check.
+TEST_CASE("Window::pumpEvents() with no preDispatch argument behaves exactly as before (default nullptr is a "
+          "no-op)") {
+    auto window = rx::platform::Window::create("rx_platform_predispatch_default_test", 64, 64, /*visible=*/false);
+    REQUIRE(window.has_value());
+    const SDL_WindowID windowId = SDL_GetWindowID(window->sdlWindow());
+    REQUIRE(windowId != 0);
+    (void)drainUntilQuiescent(*window);
+
+    SDL_Event minimizedEvent{};
+    minimizedEvent.window.type = SDL_EVENT_WINDOW_MINIMIZED;
+    minimizedEvent.window.windowID = windowId;
+    REQUIRE(SDL_PushEvent(&minimizedEvent));
+    window->pumpEvents();  // no preDispatch argument -- must not crash or misbehave.
+
+    CHECK(window->minimizedEventObserved());
 }
 
 // ===== logWaylandMinimizeLimitationOnce [gate ruling #25 row 3] ===========

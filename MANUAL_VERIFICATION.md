@@ -211,6 +211,54 @@ above once Task 24's `09_fly_through` sample lands and this section can be
 run for real (on desktop first, then Steam Deck hardware before any release
 claiming Deck gamepad support).
 
+## rx_debug_ui overlay (Phase 4 Stage 2 Task 21, spec D20, gate ruling #16)
+
+`rx::debug_ui::Overlay` (font upload, descriptor pool, render-graph pass,
+event dispatch, LOAD-not-CLEAR pattern-preservation, at-most-once
+`vkQueueWaitIdle`) is exercised automatically end-to-end against an
+offscreen readback target (`src/rx_debug_ui/tests/test_overlay_gpu.cpp`,
+`rx_debug_ui_gpu_tests`) under lavapipe + validation, both CI presets
+(GPU test excluded on windows-cross-zig/Wine — no real Vulkan device
+there, same posture as `rx_rhi_vk_tests`/`rx_graph_gpu_tests`). **No
+sample yet consumes this module** — Task 24 (`09_fly_through`) is
+expected to be the first real HUD consumer; the rows below are genuinely
+not automatable headlessly and are routed here per the gate matrix's own
+text (row 6: "a headless test cannot exercise the 'camera stops moving'
+half of this rule directly, so that half is a MANUAL_VERIFICATION row").
+
+- [ ] Visual HUD sanity in a REAL windowed session (not the offscreen
+      readback target the automated test uses): the overlay renders
+      crisp, correctly-composited text/widgets over live rendered content,
+      with no flicker, tearing, or misplaced geometry across several
+      seconds of continuous frames.
+- [ ] Gamepad ownership orthogonality: with a REAL physical gamepad
+      connected, confirm ImGui's own SDL3 backend never itself opens/
+      closes it (`ImGui_ImplSDL3_SetGamepadMode(Manual, nullptr, 0)`,
+      called immediately after `ImGui_ImplSDL3_InitForVulkan()` —
+      `overlay.cpp`) — Task 20/#14's own gamepad hot-plug log line
+      (`rx_platform: gamepad connected id=...`) should fire exactly once
+      per physical connect, with no second, ImGui-driven open/close
+      racing it (the hazard gate ruling #16 row 7 names).
+- [ ] "Camera stops moving while the HUD has focus" (gate matrix row 6's
+      second half): with a sample driving both a fly-through camera
+      (Task 20's mouse-look) and this overlay, click/drag inside an open
+      HUD panel — the camera must NOT respond to that mouse motion while
+      `ImGui::GetIO().WantCaptureMouse` is true (the automated GPU test
+      proves `WantCaptureMouse` itself flips correctly; it cannot drive a
+      real camera to observe the consuming half of the contract).
+- [ ] Steam Deck: confirm the HUD renders and is legible/usable at Deck's
+      actual display resolution and, if the HUD ever grows touch-target
+      sizing considerations, that mouse/keyboard-driven toggles remain
+      operable via Deck's trackpads (gamepad HUD navigation is explicitly
+      NOT implemented this phase, per gate ruling #16 row 7 — Manual
+      gamepad mode means the HUD is not gamepad-navigable at all yet).
+
+**Last run:** not yet performed — this task (Task 21) implemented and
+automated-tested the module against an offscreen readback target only; no
+sample exists yet to drive an end-to-end human-observed session against.
+Fill in the checkboxes above once a sample (Task 24 or earlier) actually
+wires this overlay into a live windowed present loop.
+
 ## 05_multipass (`--present` mode)
 
 `sample_05_multipass` needs the Slang runtime libraries (+ its six on-disk

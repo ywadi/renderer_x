@@ -893,3 +893,143 @@ rx_add_cached_dependency(
 # fails to locate a real, successfully-installed package.
 find_package(Ktx CONFIG REQUIRED PATHS "${ktx_CACHE_DIR}" NO_DEFAULT_PATH)
 set_target_properties(KTX::ktx PROPERTIES IMPORTED_GLOBAL TRUE)
+
+# ---------------------------------------------------------------------------
+# Phase 4 Stage 2 Task 21 -- Dear ImGui debug overlay (spec D20, gate
+# matrix-issue16 as amended by gate/rulings-2026-08-18.md #16). Vendors
+# core + sdl3 + vulkan backends ONLY (no docking/multi-viewport -- see the
+# tag choice below). Consumed by src/rx_debug_ui and (later) samples ONLY --
+# every rx_* CORE target's transitive link closure is asserted free of this
+# target by cmake/DependencyBoundaryCheck.cmake (called from the root
+# CMakeLists.txt after every core target below is defined) -- the "core
+# libs and public ABI stay ImGui-free" hard boundary D20/the ticket both
+# restate.
+#
+# PINNED TAG [gate ruling #16, BINDING]: v1.92.9b -- the PLAIN tag, not
+# v1.92.9b-docking. Verified directly this task (`git ls-remote --tags
+# https://github.com/ocornut/imgui.git`): the real current v1.92.x line
+# runs v1.92.0 through v1.92.9, plus a v1.92.9b patch, each with a matching
+# `-docking` variant as a genuinely SEPARATE git ref -- pinning the plain
+# tag excludes ImGuiConfigFlags_DockingEnable/ViewportsEnable and the whole
+# multi-viewport platform-window-creation machinery at the SOURCE level
+# (D20: "Docking excluded (tooling phase)"), not merely by never setting
+# those flags on a build that technically has them available. Resolved
+# commit: f1cc2ae15e53a861a874c3034aae6798fde194ab (verified directly
+# against the same ls-remote output).
+#
+# LICENSE: MIT (LICENSE.txt at the pinned tag, verified directly this task
+# -- "Copyright (c) 2014-2026 Omar Cornut", the standard MIT grant, no
+# additional bundled-component licenses -- unlike libktx/fastgltf above,
+# Dear ImGui vendors no third-party code of its own).
+#
+# NO CMakeLists.txt EXISTS in this repository at any tag (verified directly
+# this task: the tag's own root listing has none) -- Dear ImGui ships as
+# loose source files "designed to be usable in your engine without any
+# modification" (imgui_impl_vulkan.h's own header comment), not a buildable
+# CMake project, so this follows the SAME "no CMakeLists -> FetchContent
+# source-only, PARENT_SCOPE-propagate *_SOURCE_DIR" convention this file
+# already established for volk/VMA/stb/MikkTSpace above -- NOT
+# rx_add_cached_dependency (that path assumes a real upstream CMake
+# package to build/install/find_package() against, which does not exist
+# here). UNLIKE those four precedents, though, this dependency needs a
+# real, REUSABLE CMake library target of its own (defined directly below,
+# not through the dep-cache): every prior FetchContent_Populate'd
+# no-CMakeLists dependency here is compiled straight into exactly ONE
+# consumer's own sources (volk.c into rx_rhi_vk, mikktspace.c into
+# rx_asset, stb_image.h's implementation into rx_rhi_vk's own
+# stb_impl.cpp) -- Dear ImGui is different: BOTH src/rx_debug_ui AND
+# (Task 24, sample 09) samples are expected to link it, so compiling it
+# into just one of those would either duplicate the compile or leak
+# ImGui's own symbols across a library boundary in an ad hoc way. A plain
+# `add_library(imgui STATIC ...)` target here, alongside every other
+# vendoring decision this file records, is the natural fit.
+set(RX_IMGUI_TAG "v1.92.9b")
+FetchContent_Declare(imgui
+  GIT_REPOSITORY https://github.com/ocornut/imgui.git
+  GIT_TAG ${RX_IMGUI_TAG}
+  GIT_SHALLOW TRUE)
+FetchContent_GetProperties(imgui)
+if(NOT imgui_POPULATED)
+  FetchContent_Populate(imgui)
+endif()
+# Same CMake 3.22 sibling-scope reason as volk/VMA/stb/MikkTSpace above:
+# FetchContent_Populate() sets imgui_SOURCE_DIR as a normal variable
+# scoped only to THIS directory; src/rx_debug_ui (a sibling of this
+# directory under the root CMakeLists.txt, not a descendant of it) needs
+# it too if it ever wants the raw source tree directly -- propagate to
+# root scope for consistency with every other vendored dependency here,
+# even though this task's own consumers only ever need the `imgui` target
+# below, not the raw directory.
+set(imgui_SOURCE_DIR "${imgui_SOURCE_DIR}" PARENT_SCOPE)
+
+# CORE ONLY -- imgui.cpp/imgui_draw.cpp/imgui_tables.cpp/imgui_widgets.cpp.
+# Deliberately EXCLUDES imgui_demo.cpp: nothing in this project's own
+# smoke test or (future) HUD content needs ImGui::ShowDemoWindow(), and
+# the demo window's own internal layout is not a stable, version-pinned
+# contract this project wants a GPU pixel-readback test coupled to (a
+# purpose-built minimal window, defined in rx_debug_ui's own GPU test, is
+# more robust against a future ImGui patch reflowing the demo window's
+# contents than probing a fixed pixel offset inside it would be) --
+# smaller vendored/compiled surface for zero lost functionality this
+# project actually uses.
+add_library(imgui STATIC
+  ${imgui_SOURCE_DIR}/imgui.cpp
+  ${imgui_SOURCE_DIR}/imgui_draw.cpp
+  ${imgui_SOURCE_DIR}/imgui_tables.cpp
+  ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+  ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+  ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
+)
+target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+
+# VK_NO_PROTOTYPES PUBLIC [gate matrix row 3's own "include Vulkan-Headers/
+# volk before imgui_impl_vulkan.h" note, resolved concretely here]: this
+# project already links no real Vulkan LOADER import library at all
+# (rx_rhi_vk's own PUBLIC VK_NO_PROTOTYPES, third_party/CMakeLists.txt's
+# volk block above) -- imgui_impl_vulkan.h/.cpp's OWN documented
+# alternative to `#define IMGUI_IMPL_VULKAN_USE_VOLK` is exactly this:
+# build with VK_NO_PROTOTYPES and call `ImGui_ImplVulkan_LoadFunctions()`
+# with a caller-supplied loader (imgui_impl_vulkan.h's own "[Configuration]
+# in order to use a custom Vulkan function loader" comment, verified
+# directly against the pinned tag). rx_debug_ui/overlay.cpp is that
+# caller (see its own comment for why this is ALSO the natural, zero-
+# extra-machinery seam the GPU smoke test's at-most-once-vkQueueWaitIdle
+# assertion hooks through -- imgui_impl_vulkan.cpp's own internal function
+# table this way is a TU-local static array populated once via that one
+# loader call, not a shared global volk pointer this project's every other
+# Vulkan call site also reads). PUBLIC here (not PRIVATE) because it must
+# also be visible to any consumer that #includes imgui_impl_vulkan.h
+# itself (rx_debug_ui/overlay.cpp does, for ImGui_ImplVulkan_InitInfo) --
+# imgui_impl_vulkan.h's own struct/function declarations shift shape
+# slightly under this macro (the file's own comment: "Add
+# IMGUI_IMPL_VULKAN_NO_PROTOTYPES in your imconfig.h... Call
+# ImGui_ImplVulkan_LoadFunctions() before ImGui_ImplVulkan_Init()"), so
+# every translation unit that sees this header must see the SAME value.
+target_compile_definitions(imgui PUBLIC VK_NO_PROTOTYPES)
+
+# Vulkan::Headers PUBLIC: imgui_impl_vulkan.h's own public API surface
+# (ImGui_ImplVulkan_InitInfo, ImGui_ImplVulkan_PipelineInfo, ...) is built
+# entirely from real Vulkan types -- every consumer of this header needs
+# them visible too. SDL3::SDL3-static PRIVATE (not PUBLIC): unlike the
+# Vulkan backend header, imgui_impl_sdl3.h forward-declares every SDL type
+# it names (`struct SDL_Window; typedef union SDL_Event SDL_Event;` --
+# verified directly against the pinned tag) rather than including
+# <SDL3/SDL.h> itself, so only THIS target's own .cpp (which does include
+# the real header to implement those functions) needs the real SDL3
+# target -- a consumer of imgui_impl_sdl3.h alone does not need SDL3 on
+# its own include path.
+target_link_libraries(imgui PUBLIC Vulkan::Headers)
+target_link_libraries(imgui PRIVATE SDL3::SDL3-static)
+
+# NOTE: unlike every find_package()-imported target elsewhere in this file
+# (spdlog::spdlog, Vulkan::Headers, SDL3::SDL3-static, vk-bootstrap::
+# vk-bootstrap, enkiTS::enkiTS, Tracy::TracyClient, fastgltf::fastgltf,
+# meshoptimizer::meshoptimizer, draco::draco, KTX::ktx), `imgui` above is
+# an ORDINARY (non-IMPORTED) target from a plain add_library() call --
+# CMake's "imported targets are directory-scoped by default" limitation
+# (this file's own recurring comment on every one of those) does not apply
+# to it at all: an ordinary target's name is visible to
+# target_link_libraries() from ANY directory in the same build, with no
+# IMPORTED_GLOBAL promotion needed or even legal to request (that property
+# may only be set on an IMPORTED target). src/rx_debug_ui (and, later,
+# samples) link this target directly by its plain name, `imgui`.

@@ -2,6 +2,7 @@
 #include <SDL3/SDL.h>
 #include <vulkan/vulkan.h>
 #include <rx_platform/input.h>
+#include <functional>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -42,7 +43,26 @@ public:
     // on most backends; this method now also carries a dev-time
     // RX_ASSERT_MAIN_THREAD guard [Phase 4 Task 20], matching every other
     // guarded main-thread-only mutator in this codebase.
-    void pumpEvents();
+    //
+    // `preDispatch` [Phase 4 Task 21, gate ruling #16]: an optional callback
+    // invoked once per drained SDL_Event, BEFORE this method's own
+    // switch-based handling for that same event runs -- the seam the class
+    // comment above already promised ("Task 21's ImGui overlay feeds every
+    // event to ImGui_ImplSDL3_ProcessEvent() FIRST at this same call
+    // site"). Deliberately a generic `std::function<void(const SDL_Event&)>`
+    // (no ImGui type anywhere in this signature) so THIS header/module stays
+    // ImGui-free (the "core libs stay ImGui-free" hard boundary, D20) while
+    // still letting `rx::debug_ui::Overlay` (or any other event observer)
+    // see the full, unfiltered event stream -- not a copy, not a subset --
+    // ahead of Window's own accumulators. `nullptr` (the default) is a
+    // plain no-op check per event; every existing caller (every sample/test
+    // written before this task) keeps compiling and behaving identically
+    // with no argument at all. This method itself never inspects/depends on
+    // what `preDispatch` does with an event -- gating platform-input
+    // consumption on e.g. ImGui's own `WantCaptureMouse`/`WantCaptureKeyboard`
+    // is a CALLER-level concern (gate ruling #14/#16), not something
+    // pumpEvents() arbitrates.
+    void pumpEvents(const std::function<void(const SDL_Event&)>& preDispatch = nullptr);
 
     // ---- Relative mouse mode + mouse-delta accumulation [Phase 4 Task 20,
     // gate ruling #14, matrix rows 1/2] ------------------------------------

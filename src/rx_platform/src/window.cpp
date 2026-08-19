@@ -163,7 +163,7 @@ void Window::closeAllGamepads() {
     gamepads_.clear();
 }
 
-void Window::pumpEvents() {
+void Window::pumpEvents(const std::function<void(const SDL_Event&)>& preDispatch) {
     RX_ASSERT_MAIN_THREAD("Window::pumpEvents");
 
     // [Phase 4 Task 17, FG7, gate ruling #25] Filtered to THIS window's own
@@ -183,6 +183,16 @@ void Window::pumpEvents() {
 
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
+        // [Phase 4 Task 21, gate ruling #16] Every drained event reaches
+        // `preDispatch` FIRST, unconditionally, before any of this method's
+        // own case handling below -- see pumpEvents()'s own header comment
+        // (window.h) for why this order is load-bearing (ImGui's own
+        // internal IO state, e.g. WantCaptureMouse, must already be current
+        // by the time anything downstream reads it this frame).
+        if (preDispatch) {
+            preDispatch(event);
+        }
+
         // Size is read ONLY from SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED's
         // data1/data2 -- the one window event whose payload SDL3's own
         // SDL_events.h header comment documents AS a size (gate
