@@ -410,3 +410,108 @@ green (68/68, 1990/1990 and 6/6, 33/33) before moving to the next.
    run by a human** — MANUAL_VERIFICATION.md rows are honestly unchecked,
    per the matrix's own row 16 conclusion that this is not reproducible
    headlessly on any driver this repo's fixtures use.
+
+## Fix round 1 (coordinator review)
+
+Review verdict: structural design (guard, events-logging-only discipline,
+DI seam, all-8-sample wiring incl. `03_bindless_mesh`'s
+`rebuildDepthAndViews` extraction) independently verified and approved,
+including an independent reproduction of the acquire/present
+short-circuit revert (SIGSEGV + both VUIDs, exact match to my own
+evidence above). Concerns 1/2/4 adjudicated closed (commit-split: a
+ledger record suffices; row-8: resolved clean, the regression `CHECK`s
+passed in the CI run the reviewer cites; OS-minimize: correct as stated).
+Concern 3 (fullscreen test's conditional design) ruled NOT vacuous — the
+unconditional floor is itself load-bearing — but the review found two
+genuinely CI-red items:
+
+**Item 1 (Critical, CI-red, test-only).**
+`window_state_test.cpp`'s fullscreen double-toggle test asserted
+`isFullscreen()`/`SDL_GetWindowFullscreenMode()` **unconditionally**
+right after `setFullscreen(true)` succeeding. On CI's bare Xvfb (no
+window manager), `SDL_SetWindowFullscreen(true)` reports success (there
+is no WM to reject the request against) but the fullscreen state is
+never actually granted — `isFullscreen()` stays false — reproduced by
+the reviewer deterministically (3/3 locally, CI run 32219272890) and
+independently reproduced by me under `xvfb-run` (see below). This is the
+exact same "environment can't grant fullscreen" class my own
+resize-parity gating already handled one line later, just not extended
+far enough back.
+
+**Fix:** computed `fullscreenGranted = window.isFullscreen()` once after
+a successful `setFullscreen(true)`, and gated the fullscreen-state checks
+(`isFullscreen()`/`GetWindowFullscreenMode()`) AND the resize-parity
+checks behind it — an honest `MESSAGE` explains the skip when not
+granted. The **unconditional floor** (`recreateSwapchain()` success,
+`isSuspended()==false`, accumulated `hasValidationErrors()==false`) is
+untouched and still runs every cycle regardless.
+
+Verification — the binding CI-representative gate:
+```
+$ xvfb-run -a ctest --preset linux-native --output-on-failure
+...
+100% tests passed, 0 tests failed out of 22
+Total Test time (real) = 137.59 sec
+```
+Confirmed the fix is actually exercising the new branch (not just
+accidentally passing) via a direct verbose run under the same `xvfb-run`
+environment:
+```
+$ xvfb-run -a ./build/linux-native/src/rx_rhi_vk/rx_rhi_vk_tests -tc="Window::setFullscreen() double-toggle*" -s
+window_state_test.cpp:248: MESSAGE: SDL_SetWindowFullscreen(true) reported success but this video
+  driver/window-manager never actually granted fullscreen (isFullscreen() stayed false) -- e.g. CI's
+  bare Xvfb backend, no window manager to honor the request. Skipping the fullscreen-state and
+  resize-parity assertions for this half-cycle; the unconditional floor (recreateSwapchain() success,
+  isSuspended()==false, accumulated zero validation errors) is still exercised below.
+window_state_test.cpp:272: SUCCESS: CHECK_FALSE( fixture->window.isFullscreen() )
+... (repeats for cycle 2)
+window_state_test.cpp:292: MESSAGE: this video driver never actually resized the window on a
+  fullscreen toggle ... recreateSwapchain() itself was still exercised after every toggle with zero
+  validation errors
+[doctest] test cases:  1 |  1 passed | 0 failed | 67 skipped
+[doctest] assertions: 16 | 16 passed | 0 failed |
+[doctest] Status: SUCCESS!
+```
+And confirmed the full (WM-capable) assertion set still runs on this
+dev machine's own real desktop session, unaffected by the new gating —
+same test case, no `xvfb-run` wrapper:
+```
+$ ./build/linux-native/src/rx_rhi_vk/rx_rhi_vk_tests -tc="Window::setFullscreen() double-toggle*" -s
+window_state_test.cpp:240: SUCCESS: CHECK( fixture->window.isFullscreen() )
+window_state_test.cpp:242: SUCCESS: CHECK( SDL_GetWindowFullscreenMode(...) == nullptr )
+window_state_test.cpp:266: SUCCESS: CHECK( device->swapchainExtent().width == static_cast<uint32_t>(fsW) )
+  values: CHECK( 3840 == 3840 )
+window_state_test.cpp:267: SUCCESS: CHECK( device->swapchainExtent().height == static_cast<uint32_t>(fsH) )
+  values: CHECK( 1080 == 1080 )
+... (both cycles, both directions)
+[doctest] test cases:  1 |  1 passed | 0 failed | 67 skipped
+[doctest] assertions: 28 | 28 passed | 0 failed |
+[doctest] Status: SUCCESS!
+```
+
+**Item 2 (Minor).** `Device::create()` and `Device::setPresentMode()` are
+documented main-thread-only (device.h's class comment already said so)
+but, unlike the three methods touched in the original pass
+(`acquireNextImage`/`present`/`recreateSwapchain`), lacked the
+`RX_ASSERT_MAIN_THREAD` guard. Added `RX_ASSERT_MAIN_THREAD("Device::
+create")` as the first statement of `create()` and
+`RX_ASSERT_MAIN_THREAD("Device::setPresentMode")` as the first statement
+of `setPresentMode()`, matching the existing pattern exactly (same file,
+no new include needed — `rx_core/debug_checks.h` was already included
+for the original three).
+
+**Full verification, both presets, this fix round:**
+- `rx_rhi_vk_tests` (local, WM-capable session): 68/68 test cases,
+  1990/1990 assertions, 0 failed.
+- `xvfb-run -a ctest --preset linux-native` (binding CI-representative
+  gate): **22/22, 100% passed**, 137.59s.
+- `windows-cross-zig`: `rx_rhi_vk_tests`/`rx_platform_tests` rebuild
+  clean (device.cpp's two new guard lines compile fine there too); Wine
+  run (`xvfb-run -a ctest --preset windows-cross-zig -E
+  'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample'`) still 10/10, 100%
+  passed, 118.30s (this fix round touched no `rx_platform` file, so the
+  Wine-covered `rx_platform_tests` binary is unchanged from the original
+  pass's own green run — re-confirmed anyway).
+
+No new `REVERT-TEST`/`TEMP DIAG`/`TODO`/`FIXME` markers introduced
+(grepped both changed files).
