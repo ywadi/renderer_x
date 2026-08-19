@@ -425,10 +425,16 @@ TEST_CASE("importGltfAsync: buffer/image byte-source reads happen off BOTH the m
         ioThreadIdKnown.store(true, std::memory_order_release);
     });
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (!ioThreadIdKnown.load(std::memory_order_acquire)) {
-        REQUIRE(std::chrono::steady_clock::now() < deadline);
+    while (!ioThreadIdKnown.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::yield();
     }
+    // [Issue #30] Single deterministic assertion after the wait, instead of a
+    // REQUIRE evaluated once per spin above -- the spin count is itself
+    // wall-clock/scheduler dependent, so a per-iteration REQUIRE made the
+    // doctest ASSERTION COUNT a function of live timing (issue #30's defect
+    // class). A timeout still fails this REQUIRE exactly like the
+    // per-iteration form it replaces did.
+    REQUIRE(ioThreadIdKnown.load(std::memory_order_acquire));
     const std::thread::id mainThreadId = std::this_thread::get_id();
 
     SlowRecordingByteSource source(std::filesystem::path(damagedHelmetPath()).parent_path(),
@@ -501,20 +507,36 @@ TEST_CASE("importGltfAsync: progress is monotonic (stage never regresses, itemsC
 
     int lastRank = 0;
     uint32_t lastItemsCompleted = 0;
+    bool rankRegressed = false;
+    bool itemsRegressed = false;
     bool sawTerminal = false;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    while (!sawTerminal) {
+    while (!sawTerminal && std::chrono::steady_clock::now() < deadline) {
         scheduler->pumpMain();
         ImportProgress p = registry.importProgress(handle);
-        CHECK(rank(p.stage) >= lastRank);
+        if (rank(p.stage) < lastRank) {
+            rankRegressed = true;
+        }
         lastRank = rank(p.stage);
-        CHECK(p.itemsCompleted >= lastItemsCompleted);
+        if (p.itemsCompleted < lastItemsCompleted) {
+            itemsRegressed = true;
+        }
         lastItemsCompleted = p.itemsCompleted;
         if (p.stage == ImportStage::Done || p.stage == ImportStage::Failed) {
             sawTerminal = true;
         }
-        REQUIRE(std::chrono::steady_clock::now() < deadline);
     }
+    // [Issue #30] Deterministic assertion count: the loop above may run a
+    // wall-clock/scheduling-dependent number of times, but the CLAIMS --
+    // stage rank and itemsCompleted never regress across ANY observed tick,
+    // and a terminal stage is reached before the deadline -- are now exactly
+    // 3 fixed assertions regardless of iteration count, instead of up to 2
+    // CHECKs + 1 REQUIRE PER iteration. A regression on any single tick still
+    // flips one of these flags permanently (same discriminating power as the
+    // per-iteration CHECKs they replace).
+    REQUIRE(sawTerminal);
+    CHECK_FALSE(rankRegressed);
+    CHECK_FALSE(itemsRegressed);
     CHECK(completionCount.load() == 1);
     // Extra pumps after completion must never fire the callback again.
     for (int i = 0; i < 50; ++i) {
@@ -811,8 +833,27 @@ TEST_CASE("importGltfAsync: WALL-CLOCK GATE -- deliberately slow decode + a real
     std::chrono::microseconds maxPumpDuration{0};
     uint32_t overLocalBudgetCount = 0;
 
+    // [Issue #30] The loop below no longer asserts inside the loop body. It
+    // used to REQUIRE(pumpDuration < kCiStallDetector) AND
+    // REQUIRE(now < testDeadline) on EVERY iteration -- but how many
+    // iterations run before `done` flips true is itself a direct function of
+    // live wall-clock/scheduler timing (this is deliberately a real,
+    // overlapping async import against real GPU work), so the doctest
+    // ASSERTION COUNT for this one test case varied run to run (confirmed:
+    // baseline 10-run/4-core measurement for this whole binary showed
+    // 8203599 vs 8153987 total assertions across otherwise-identical 57/57
+    // passes -- this loop is the dominant contributor). Aggregating the
+    // per-iteration measurement into `maxPumpDuration` and asserting ONCE
+    // after the loop (below) makes the assertion count for this claim fixed
+    // (exactly 1) regardless of iteration count, while preserving the exact
+    // same discriminating power: a reintroduced blocking wait() still shows
+    // up as an outlier this max captures, clearing kCiStallDetector by the
+    // same margin the multiplier-derivation comment above already
+    // establishes (a spike on any single iteration cannot be diluted by
+    // however many fast iterations happen to run alongside it, since max()
+    // ignores everything but the worst observed value).
     const auto testDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
-    while (!done) {
+    while (!done && std::chrono::steady_clock::now() < testDeadline) {
         ImportProgress before = registry.importProgress(handle);
         const bool wasInFlight = before.stage != ImportStage::Done && before.stage != ImportStage::Failed;
 
@@ -828,22 +869,23 @@ TEST_CASE("importGltfAsync: WALL-CLOCK GATE -- deliberately slow decode + a real
         if (pumpDuration > kLocalBudget) {
             ++overLocalBudgetCount;
         }
-        // The CI stall-detector tier (RC6, self-calibrated -- see this
-        // function's own comment above kCiStallDetector's definition):
-        // this IS asserted hard, every single call -- a defect here (e.g.
-        // a reintroduced blocking wait()) would show up as several times
-        // the live per-run calibration baseline, clearing this threshold
-        // with room to spare (see the multiplier-derivation comment).
-        REQUIRE(pumpDuration < kCiStallDetector);
-
-        REQUIRE(std::chrono::steady_clock::now() < testDeadline);
     }
 
+    // The timeout safety net now surfaces here (done stays false if
+    // testDeadline was hit) instead of via a per-iteration REQUIRE inside
+    // the loop -- same failure outcome, fixed assertion count.
     REQUIRE(done);
     REQUIRE(result.ok());
     // >= 300 rendered frames while genuinely in flight -- proves real
     // overlap (the import did not simply complete on the first pump).
     CHECK(framesWhileInFlight >= 300);
+
+    // The CI stall-detector tier (RC6, self-calibrated -- see
+    // kCiStallDetector's own comment above): THE load-bearing assertion for
+    // this whole test case, asserted once, hard, against the worst pumpMain()
+    // observed across the entire run -- see the [Issue #30] comment above the
+    // loop for why this replaced a per-iteration REQUIRE.
+    REQUIRE(maxPumpDuration < kCiStallDetector);
 
     // Published number [D18/RC6]: the 2ms figure is a TREND metric,
     // explicitly "never CI-blocking" (D18's own wording, amended by RC6
@@ -861,7 +903,7 @@ TEST_CASE("importGltfAsync: WALL-CLOCK GATE -- deliberately slow decode + a real
             framesWhileInFlight, " in-flight frame(s); ", overLocalBudgetCount,
             " call(s) exceeded the 2ms local/published budget (trend-tracked, never CI-blocking per D18/RC6) -- "
             "self-calibrated CI-tier ceiling this run was ", kCiStallDetector.count(),
-            " us (REQUIRE'd above, every call, see kCiStallDetector's own comment)");
+            " us (REQUIRE'd once above, aggregated over every call, see kCiStallDetector's own comment)");
 
     // [Fix round 1, IMPORTANT item] D25 direct proof, not just a wall-clock
     // proxy: the async path never called Uploader::wait() through EITHER
@@ -950,16 +992,25 @@ TEST_CASE("importGltfAsync: cancelImport() after >=1 real GPU resource (texture 
     // order, per registry.cpp's own postToMain chain).
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
     bool geometryRegistered = false;
+    bool finalizedBeforeGeometryObserved = false;
     while (std::chrono::steady_clock::now() < deadline) {
         scheduler->pumpMain();
         if (fixture->pool->stats().blockCount > 0) {
             geometryRegistered = true;
             break;
         }
-        REQUIRE_FALSE(done);  // must not have finalized before this loop caught the mid-upload window
+        if (done) {
+            finalizedBeforeGeometryObserved = true;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     REQUIRE(geometryRegistered);
+    // [Issue #30] Aggregated to a single deterministic assertion -- this was
+    // a REQUIRE_FALSE(done) evaluated once per loop spin above (an iteration
+    // count that is itself wall-clock/scheduling-dependent). Same
+    // discriminating power: the flag latches permanently the first time
+    // `done` is observed true before the mid-upload window is caught.
+    CHECK_FALSE(finalizedBeforeGeometryObserved);
 
     REQUIRE(fixture->textures->liveTextureCountForTesting() > liveTexturesBefore);
     const PoolStats poolStatsMidUpload = fixture->pool->stats();
@@ -1087,6 +1138,8 @@ TEST_CASE("importGltfAsync: cancelImport() after EXACTLY 1 of N texture slots ha
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
     bool oneRegistered = false;
     size_t minLiveObservedDuringDrive = liveTexturesBefore;
+    bool finalizedBeforeOneRegistered = false;
+    bool overshotPastOne = false;
     while (std::chrono::steady_clock::now() < deadline) {
         scheduler->pumpMain();
         const size_t live = fixture->textures->liveTextureCountForTesting();
@@ -1095,11 +1148,22 @@ TEST_CASE("importGltfAsync: cancelImport() after EXACTLY 1 of N texture slots ha
             oneRegistered = true;
             break;
         }
-        REQUIRE_FALSE(done);  // must not have finalized before this loop caught the 1-of-N window
-        REQUIRE(live <= liveTexturesBefore + 1);  // never overshoots past exactly 1
+        if (done) {
+            finalizedBeforeOneRegistered = true;
+        }
+        if (live > liveTexturesBefore + 1) {
+            overshotPastOne = true;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     REQUIRE(oneRegistered);
+    // [Issue #30] Both claims aggregated to single deterministic assertions --
+    // previously a REQUIRE_FALSE(done)/REQUIRE(live<=+1) pair evaluated once
+    // per loop spin (a wall-clock/scheduling-dependent count). Same
+    // discriminating power: either flag latches permanently on the first
+    // violating tick.
+    CHECK_FALSE(finalizedBeforeOneRegistered);  // must not have finalized before this loop caught the 1-of-N window
+    CHECK_FALSE(overshotPastOne);  // never overshoots past exactly 1
     // Never dropped below baseline on the way here either (the checkerboard
     // and every role fallback are built once at TextureCache::create() and
     // must never be touched by anything this import's own marshal does).
@@ -1236,26 +1300,43 @@ TEST_CASE("importGltfAsync: a resolve-heavy loop against an ALREADY-COMPLETED im
     // the same instant B is mutating its OWN in-flight compute/upload
     // state on other threads.
     uint64_t overlapResolves = 0;
+    bool submeshCountWrong = false;
+    bool dataCorrupted = false;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    while (!doneB) {
+    while (!doneB && std::chrono::steady_clock::now() < deadline) {
         const ImportProgress progressB = registry.importProgress(handleB);
         const bool bStillInFlight =
             progressB.stage != ImportStage::Done && progressB.stage != ImportStage::Failed && !progressB.cancelled;
         if (bStillInFlight) {
             const MeshAsset& meshA = registry.mesh(resultA.meshes[0]);
-            REQUIRE(meshA.submeshes.size() == 1);
-            const Submesh& subA = meshA.submeshes[0];
-            CHECK(subA.range.blockId == expectedRangeA.blockId);
-            CHECK(subA.range.firstIndex == expectedRangeA.firstIndex);
-            CHECK(subA.range.vertexOffset == expectedRangeA.vertexOffset);
-            CHECK(subA.range.indexCount == expectedRangeA.indexCount);
-            CHECK(subA.bounds.min.x == doctest::Approx(expectedBoundsA.min.x));
-            CHECK(subA.bounds.max.x == doctest::Approx(expectedBoundsA.max.x));
+            if (meshA.submeshes.size() != 1) {
+                submeshCountWrong = true;
+            } else {
+                const Submesh& subA = meshA.submeshes[0];
+                const bool matches = subA.range.blockId == expectedRangeA.blockId &&
+                                      subA.range.firstIndex == expectedRangeA.firstIndex &&
+                                      subA.range.vertexOffset == expectedRangeA.vertexOffset &&
+                                      subA.range.indexCount == expectedRangeA.indexCount &&
+                                      subA.bounds.min.x == doctest::Approx(expectedBoundsA.min.x) &&
+                                      subA.bounds.max.x == doctest::Approx(expectedBoundsA.max.x);
+                if (!matches) {
+                    dataCorrupted = true;
+                }
+            }
             ++overlapResolves;
         }
         scheduler->pumpMain();
-        REQUIRE(std::chrono::steady_clock::now() < deadline);
     }
+
+    // [Issue #30] Deterministic assertion count: the per-iteration REQUIRE +
+    // 6x CHECK block above (however many ticks the wall-clock/scheduling
+    // race happened to land while B was in flight -- itself timing-
+    // dependent) is now 2 fixed assertions, aggregated across the whole
+    // overlap window. Same discriminating power: a stale/torn/corrupted
+    // resolve on ANY tick still latches dataCorrupted (or submeshCountWrong)
+    // permanently.
+    REQUIRE_FALSE(submeshCountWrong);
+    CHECK_FALSE(dataCorrupted);
 
     // Proof this was a genuine, sustained overlap, not one lucky
     // iteration: many resolve-loop passes against A landed while B's own
