@@ -1877,9 +1877,12 @@ TEST_CASE("StandardPBR per-slot sampler wiring: baseColorSampler/emissiveSampler
     // confirmed -- see this fix round's report addendum for the
     // swap-and-revert evidence: `makeBlob()`'s own two `setParam(...,
     // "...Sampler", ...)` argument VALUES were swapped in place, this
-    // TEST_CASE failed all 6 assertions below with baseColorPixel reading
+    // TEST_CASE failed 4 of the 6 assertions below with baseColorPixel reading
     // BLUE and emissivePixel reading RED -- the exact inversion -- then
-    // reverted via `git checkout --`, confirmed passing again).
+    // reverted via `git checkout --`, confirmed passing again). The two
+    // green-channel checks (baseColorPixel.g < 50 and emissivePixel.g < 50)
+    // do not discriminate: both RED and BLUE have near-zero green values,
+    // so these assertions pass regardless of the sampler swap.
     CHECK(baseColorPixel.r > 200);
     CHECK(baseColorPixel.g < 50);
     CHECK(baseColorPixel.b < 50);
