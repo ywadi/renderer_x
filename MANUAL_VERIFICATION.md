@@ -199,3 +199,58 @@ verification, not a placeholder — but it is not the human-observed-on-real-
 hardware check this file otherwise tracks. Fill in the checkboxes and
 hardware/driver details above the first time `--present` is actually
 watched running on a real display.
+
+## 08_gltf_viewer (`--present` mode)
+
+`sample_08_gltf_viewer` needs the Slang runtime libraries + its own
+`material_shaders/`/`references/` subdirectories + (for the default scene)
+a pre-staged `assets/DamagedHelmet/glTF/` deployed next to it — see
+`samples/README.md`'s own "Redistribution" section for the full manifest.
+
+### What "pass" means, every platform
+
+- The window opens showing a distinct dark-navy "loading" screen (never
+  pure black) while the default DamagedHelmet asset imports
+  asynchronously, then transitions to the rendered helmet once the import
+  completes (no stall, no frozen window during the load).
+- Left-click-dragging orbits the camera around the helmet smoothly; no
+  jump/snap on mouse-down, no drift after release.
+- `--scene <path/to/other.gltf>` loads a different glTF asset instead of
+  DamagedHelmet; `--exposure <n>` visibly brightens (positive) or darkens
+  (negative) the rendered scene, pre-tonemap.
+- Closing the window exits promptly, with no crash/hang, and logs
+  `sample_08_gltf_viewer: window closed cleanly`.
+- On Linux, run with `--validate` and confirm no `[error]`-level validation
+  output beyond this codebase's documented false-positive guards.
+
+### Linux (native, `linux-native` preset)
+
+- [ ] Build: `cmake --preset linux-native && cmake --build --preset linux-native`
+- [ ] Fetch the default asset once: `tools/fetch_assets.sh`
+- [ ] Run: `./build/linux-native/samples/08_gltf_viewer/sample_08_gltf_viewer --present --validate`
+- [ ] Loading screen shows briefly, then the helmet renders; mouse-drag
+      orbit feels smooth and centered on the helmet
+- [ ] `--scene`/`--exposure` both visibly change the render as described
+      above
+- [ ] Closes cleanly; headless mode (`--validate`, no `--present`) still
+      exits 0 with `headless gate PASSED`
+
+**Last run:** not yet performed as a real, human-observed run on real
+display hardware. Functionally verified during this task's own development
+via an offscreen X server (Xvfb) against lavapipe (forced via
+`VK_ICD_FILENAMES`, the same driver CI's own headless gate runs against):
+the loading-state clear renders, the async import completes and the
+helmet's own forward-shaded render replaces it, `--quit-during-load`
+cancels mid-import (after >=1 real texture upload had already landed) and
+tears down with zero unfiltered validation errors, and a real
+SDL-delivered quit (`SIGINT` under Xvfb, which SDL3 translates into a
+normal `SDL_EVENT_QUIT`) exits the present loop cleanly — logging
+`sample_08_gltf_viewer: window closed cleanly` with zero
+`VUID-vkDestroyDevice-*` "child object not destroyed" errors (a real
+teardown-ordering bug this task's own development hit, root-caused, and
+fixed: `FrameSync`'s owned command pool/fences/semaphores were being torn
+down AFTER the `VkDevice` that owned them). This is real functional
+verification, not a placeholder — but it is not the human-observed-on-real-
+hardware, real-mouse-drag check this file otherwise tracks. Fill in the
+checkboxes and hardware/driver details above the first time `--present` is
+actually watched (and dragged) on a real display.

@@ -40,12 +40,24 @@ step involved:
                                     #   material_shaders/forward_entry.slang
                                     #   (rx_material's own shared files), the
                                     #   Slang runtime libs below, and LICENSE
+07_stress/
+  sample_07_stress[.exe]           # + shaders/stress/*.slang (4 files), the
+                                    #   Slang runtime libs below, and LICENSE
+08_gltf_viewer/
+  sample_08_gltf_viewer[.exe]      # + material_shaders/{material,
+                                    #   forward_entry,standard_pbr,unlit}.slang,
+                                    #   tonemap.{vert,frag}.slang,
+                                    #   references/{loading_state,
+                                    #   loaded_scene}.png, a pre-staged
+                                    #   assets/DamagedHelmet/glTF/ (+ its own
+                                    #   LICENSE.txt), the Slang runtime libs
+                                    #   below, and LICENSE
 ```
 
 `01_triangle` is the one exception to "needs the Slang runtime libs": its
 shaders are precompiled offline by `slangc` at build time, so it ships only
 its two `.spv` files and nothing Slang-related at all [D2] — see its own
-"Redistribution" section below. The other five do real in-process Slang
+"Redistribution" section below. The other seven do real in-process Slang
 compilation at startup, so each of their directories additionally carries
 `libslang-compiler.so*`/`slang-compiler.dll` plus the `slang-glslang`/
 `slang-glsl-module`/`slang-rt` plugins it dlopens on demand, and the Slang
@@ -648,6 +660,120 @@ unzipped to a directory outside the build tree entirely, passes its own
 headless gate unmodified on both `linux-native` and (via Wine)
 `windows-cross-zig`.
 
+## 08_gltf_viewer
+
+`samples/08_gltf_viewer/main.cpp` — Phase 4 Stage 1's user-facing showcase
+sample: a real glTF asset (DamagedHelmet by default, `--scene <path>`
+override), imported **asynchronously** (Task 15's own async-import
+pipeline — this is the sample built specifically to demonstrate it, with a
+rendered loading state visible while the import runs) and rendered through
+D22's shipped material library (`shaders/material/standard_pbr.slang` /
+`unlit.slang`) driven entirely via D26.1's bindless per-draw addressing
+(`SV_VulkanInstanceID` indexing a real bindless `StructuredBuffer<RxDrawData>`
+this sample builds and uploads itself — never a per-draw push constant;
+`samples/07_stress`'s own `gPush.instanceIndex` is the named anti-pattern
+this does not repeat). A mouse-drag orbit camera (left-click-drag; reads SDL
+mouse state directly via `Window::sdlWindow()` — sample-local, not a new
+`rx_platform` input surface) and `--exposure` (a pre-tonemap `2^exposure`
+multiplier applied inside the material forward pass — the shared
+`shaders/multipass/tonemap.{vert,frag}.slang` shaders this sample reuses
+verbatim are byte-for-byte untouched) round out the interactive half.
+
+**D28**: each glTF material's `alphaMode`/`doubleSided` become
+`MaterialSystem`'s own fixed-function pipeline-state axis
+(`MaterialFixedFunctionState`) — blend/depth-write/cull-mode fields on the
+`VkPipeline` itself, not a specialization constant. Two glTF materials that
+happen to share `standard_pbr.slang`'s own bytes but differ in
+`alphaMode`/`doubleSided` are two independent `loadMaterial()` calls,
+yielding two independently-cached `VkPipeline`s.
+
+**No `MaterialSystem::bindInstance()`**: that method is the documented
+pre-D26.1 legacy path (it always pushes `MaterialSystem`'s own default
+identity draw-data row and `exposure=0.0`) — this sample drives its own
+real per-scene draw-data buffer and `--exposure` value by hand
+(`recordSceneDraws()` in `main.cpp`): resolve the pipeline
+(`getPipeline()`, pre-resolved once per material at load time per D27, so
+the very first real draw never stalls on a cold Slang-to-`VkPipeline`
+compile), push a real `MaterialGlobalsPush`, bind set 1 against a
+hand-built (but pipeline-layout-**compatible**, per the Vulkan spec's own
+"identically defined" rule) descriptor-set layout.
+
+**D17 headless correctness gate**: captures a loading-state frame (before
+the async import can possibly have completed) and a loaded-scene frame
+(once it reaches a terminal state), compares each against its own committed
+256×256 lavapipe-rendered reference PNG (`references/loading_state.png` /
+`loaded_scene.png`) via a tolerance gate (±4/255 per channel, <0.5%
+failing-pixel budget) — enforced as a hard PASS/FAIL only when the running
+device actually is lavapipe (`isLavapipeDevice()`); any other driver's own
+divergence is logged as INFO only. `tools/regen_references.sh` (documented,
+never auto-run) is the only sanctioned way to update the two committed
+PNGs.
+
+- **Headless (default, no flags)** — the `ctest` correctness gate
+  (`sample_08_gltf_viewer_headless`, run with `--validate`): imports the
+  default scene asynchronously, captures + gates both frames as described
+  above.
+- **`--quit-during-load`** — starts the async import, lets it run for a
+  short bounded window (long enough for ≥1 real GPU resource — a texture or
+  geometry upload — to plausibly have landed), cancels it, and tears down
+  immediately with zero unfiltered validation errors — registered as
+  `sample_08_gltf_viewer_quit_during_load`. The standing lesson this whole
+  stage's review history keeps finding rollback bugs in: abandon/teardown
+  paths get real-GPU-resource tests, never a mock.
+- **`--present`** — opens a real window; left-click-drag orbits the camera.
+  Not part of `ctest` — see `MANUAL_VERIFICATION.md`.
+- **`--scene <path>`** — imports a different glTF/GLB file instead of
+  DamagedHelmet.
+- **`--exposure <n>`** — pre-tonemap `2^n` multiplier (`0` — the default —
+  is neutral, `2^0 == 1`).
+- **`--vsync on|off`** (default `on`) — same present-mode control as
+  01_triangle's `--vsync` section above.
+
+### Expected output
+
+**Headless mode**:
+
+```
+[info] sample_08_gltf_viewer: D17 loading_state gate: failingPixels=0/65536 (0.0000%) pass=true
+[info] sample_08_gltf_viewer: D17 loaded_scene gate: failingPixels=0/65536 (0.0000%) pass=true
+[info] sample_08_gltf_viewer: headless gate PASSED
+```
+
+**`--present` mode** opens a 1280×720 window showing a distinct dark-navy
+loading screen (never pure black) while DamagedHelmet imports
+asynchronously, then transitions to the rendered helmet — a dark,
+gunmetal-plated combat helmet with a gold-tinted visor, lit by a single
+fixed key light plus a small flat ambient term (D22's own scope for this
+stage: full image-based lighting is a techniques-phase concern, not built
+here). Left-click-dragging orbits the camera around it. Closing the window
+exits with status 0 and logs:
+
+```
+[info] sample_08_gltf_viewer: window closed cleanly
+```
+
+### Redistribution
+
+Same Slang-runtime-lib + `sharedShaderDir` mechanism 06_materials
+establishes, extended with a second shared pair
+(`material_shaders/standard_pbr.slang` / `unlit.slang`, D22's shipped
+library) alongside the same `material.slang` / `forward_entry.slang`, plus
+the shared tonemap shaders (`tonemap.{vert,frag}.slang`, deployed flat next
+to the binary, same convention as 05_multipass/07_stress's own copies) and
+the two committed `references/` PNGs (so a redistributed binary's own
+`--validate` headless gate is self-contained too). **Unlike every other
+sample in this list**, this one genuinely redistributes third-party
+content: `tools/fetch_assets.sh`'s own DamagedHelmet download is pre-staged
+into `assets/DamagedHelmet/glTF/` next to the binary (this sample's own
+`resolveDefaultScenePath()` looks there first, falling back to this
+repository's own `assets/fetched/` copy only for an unpackaged build-tree
+run), together with that asset's own dual CC-BY-4.0/CC-BY-NC-4.0
+attribution text (`assets/DamagedHelmet/LICENSE.txt` — see
+`tools/fetch_assets.sh`'s own header comment for the verified license
+finding). Verified directly: this sample's packaged `.zip` output, unzipped
+to a directory outside the build tree entirely, passes its own headless
+gate unmodified.
+
 ## Building and running
 
 Both sample modes and both build presets work identically on Linux and
@@ -836,14 +962,18 @@ ctest --preset linux-native --output-on-failure
 
 This runs `sample_01_triangle_headless`, `sample_02_hotreload_headless`,
 `sample_03_bindless_mesh_headless`, `sample_04_streaming_headless`,
-`sample_05_multipass_headless`, and `sample_06_materials_headless` alongside
-every other project test (`rx_core_tests`, `rx_platform_tests`,
-`rx_shader_tests`, `rx_rhi_vk_tests`, `rx_graph_tests`, `rx_graph_gpu_tests`,
-`rx_material_tests`, `rx_material_gpu_tests`, `shader_spirv_test`) —
-`--present` mode is intentionally excluded from `ctest` (it blocks on a
-real window and user/OS interaction) and is exercised manually instead.
+`sample_05_multipass_headless`, `sample_06_materials_headless`,
+`sample_07_stress_headless`, `sample_08_gltf_viewer_headless`, and
+`sample_08_gltf_viewer_quit_during_load` alongside every other project test
+(`rx_core_tests`, `rx_platform_tests`, `rx_shader_tests`, `rx_rhi_vk_tests`,
+`rx_asset_tests`, `rx_asset_gltf_tests`, `rx_asset_gltf_gpu_tests`,
+`rx_graph_tests`, `rx_graph_gpu_tests`, `rx_material_tests`,
+`rx_material_gpu_tests`, `shader_spirv_test`) — `--present` mode is
+intentionally excluded from `ctest` (it blocks on a real window and user/OS
+interaction) and is exercised manually instead.
 
-Each of the six `*_headless` `ctest` cases passes `--validate` (see each
+Each of the `*_headless`/`*_quit_during_load` `ctest` cases passes
+`--validate` (see each
 sample's own section above) — a developer/CI flag that turns on the Vulkan
 validation layers, requiring the Vulkan SDK (or an equivalent
 `VK_LAYER_KHRONOS_validation` install) to be present on the machine running

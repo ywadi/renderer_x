@@ -341,14 +341,16 @@ jobs:
       - name: Build budget check
         run: tools/check_build_budget.sh linux-native 60
 
-      # Packages all seven samples into the exact unzip-and-run layout a user
+      # Packages all eight samples into the exact unzip-and-run layout a user
       # gets [R:D2]: one subdirectory per sample with that sample's binary
       # plus everything IT needs (01_triangle: just its two precompiled
-      # .spv files, no Slang libs; 02/03/04/05/06/07: the Slang runtime libs +
-      # LICENSE deployed next to each at build time, plus 02's
+      # .spv files, no Slang libs; 02/03/04/05/06/07/08: the Slang runtime
+      # libs + LICENSE deployed next to each at build time, plus 02's
       # hotreload.slang / 03's texture.png / 05's six on-disk shader
       # sources / 06's materials/+material_shaders/ subdirectories / 07's
-      # four on-disk shader sources). See
+      # four on-disk shader sources / 08's material_shaders/+references/
+      # subdirectories plus a pre-staged DamagedHelmet asset + its own
+      # dual-license attribution text). See
       # tools/package_samples.sh for the full per-sample manifest and why
       # each file is there.
       - name: Package samples for redistribution
