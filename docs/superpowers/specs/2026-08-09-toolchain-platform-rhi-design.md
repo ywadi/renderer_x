@@ -424,10 +424,28 @@ it is out of scope for *this* spec only, not out of scope for the project:
     alternative; spot = shadow atlas; point = cubemap or
     dual-paraboloid atlas; screen-space contact shadows. (Extends the
     existing cascades registry line with the technique ladder.)
+  - **True volumetrics (committed 2026-08-19):** froxel-marched
+    participating media (Frostbite/id-style volume fog), riding the
+    SAME camera-frustum froxel grid the clustered light assignment
+    already builds — per-froxel scattering/extinction accumulation
+    fed by the clustered light lists (shadowed sun + local lights),
+    temporal reprojection for stability, then a full-screen apply.
+    Deliverables ladder: (a) screen-space radial god rays (cheap
+    post pass, expressible against the Phase 3 graph today) as the
+    entry tier, (b) froxel volume fog with shadowed directional
+    in-scattering (the "physical god rays" tier), (c) local fog
+    volumes/height fog fed by the same grid. Sequenced with/after
+    clustered Forward+ (priority 3) since it consumes that
+    infrastructure; exact priority slot decided at techniques-phase
+    spec time. Motivating consumer case noted 2026-08-19: retro-
+    hybrid art direction (low-res PSX-style presentation with modern
+    volumetric lighting) — the aesthetic depends on (b), not just
+    screen-space rays.
   - **Frame pipeline target:** depth → shadows → clustered light
-    assignment → opaque lighting → SSR → scene-color mip chain →
-    glass/transmission → particles/transparency → bloom → tone
-    mapping (AgX/ACES-class, ties FG8 HDR output) → TAA.
+    assignment → opaque lighting → volumetrics (froxel march +
+    apply) → SSR → scene-color mip chain → glass/transmission →
+    particles/transparency → bloom → tone mapping (AgX/ACES-class,
+    ties FG8 HDR output) → TAA.
   - **Priority order (binding):** (1) Filament-quality GGX PBR,
     (2) excellent HDR IBL, (3) physical light units + clustered
     Forward+, (4) good shadow filtering, (5) clearcoat + anisotropy,
