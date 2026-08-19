@@ -1,0 +1,2315 @@
+# Review package: 736ed84..1a69c31
+
+## Commits
+1a69c31 feat(rx_platform): input expansion -- mouse capture, gamepad, keyboard (#14)
+
+## Files changed
+ .../task-20-report.md                              | 420 ++++++++++
+ MANUAL_VERIFICATION.md                             |  62 ++
+ docs/threading.md                                  |  17 +
+ src/rx_platform/CMakeLists.txt                     |   1 +
+ src/rx_platform/include/rx_platform/input.h        | 115 +++
+ src/rx_platform/include/rx_platform/window.h       | 147 +++-
+ src/rx_platform/src/input.cpp                      |  43 ++
+ src/rx_platform/src/window.cpp                     | 260 ++++++-
+ src/rx_platform/tests/window_test.cpp              | 849 ++++++++++++++++++++-
+ 9 files changed, 1881 insertions(+), 33 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-20-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-20-report.md
+new file mode 100644
+index 0000000..7121186
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-20-report.md
+@@ -0,0 +1,420 @@
++# Task 20 report — Input expansion (mouse capture + gamepad, card #14)
++
++Base commit: `736ed84`. Implementer: this session. Requirements read in
++order per the brief: `task-20-brief.md` (task text + BINDING gate block),
++`gate/matrix-issue14-input.md`, `gate/rulings-2026-08-18.md` §#14, `gh issue
++view 14`. Order of authority followed: rulings > spec > matrix > ticket.
++
++## Files changed (mine only)
++
++- `src/rx_platform/include/rx_platform/input.h` (new) — dependency-free
++  value types (`Vec2f`, `MouseDelta`, `GamepadButtons`, `GamepadState`) +
++  deadzone free functions (`applyStickDeadzone`/`applyTriggerDeadzone`).
++- `src/rx_platform/src/input.cpp` (new) — deadzone math implementation.
++- `src/rx_platform/include/rx_platform/window.h` — new `Window` public
++  surface (relative mouse mode, mouse delta, cursor, gamepad, keyboard) +
++  new private members.
++- `src/rx_platform/src/window.cpp` — implementation, `pumpEvents()`
++  additions (FOCUS_LOST/GAINED, MOUSE_MOTION, GAMEPAD_ADDED/REMOVED),
++  `SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS` fix (see "Production bug
++  found and fixed" below).
++- `src/rx_platform/CMakeLists.txt` — added `src/input.cpp`.
++- `src/rx_platform/tests/window_test.cpp` — full new test suite (deadzone
++  math, mouse/cursor, gamepad, keyboard, thread-affinity guard).
++- `docs/threading.md` — new `rx::platform::Window` entry in the
++  Main-thread-only registry.
++- `MANUAL_VERIFICATION.md` — new "rx_platform input surface" section
++  (honest, unchecked rows for what genuinely cannot be automated).
++
++`.superpowers/sdd/2026-08-11-phase4-scene-assets/progress.md` shows
++modified in `git status` but is **not mine** (a concurrent coordinator
++ledger entry) — excluded from my commit via explicit pathspec.
++
++## Design summary
++
++- **Mouse**: `setRelativeMouseMode(bool)` tracks the app's own intent
++  (`relativeModeWanted_`) independently of SDL's query, per gate ruling
++  #14/matrix row 1. `pumpEvents()` handles `SDL_EVENT_WINDOW_FOCUS_LOST`
++  (pauses delta accumulation, no assumption about SDL's own capture state)
++  and `SDL_EVENT_WINDOW_FOCUS_GAINED` (unconditionally re-issues
++  `SDL_SetWindowRelativeMouseMode(window, true)` if still wanted).
++  `consumeMouseDelta()` is consume-and-reset over `accumMouseDeltaX_/Y_`,
++  summed from `SDL_EVENT_MOUSE_MOTION.xrel/yrel` inside `pumpEvents()`'s
++  existing full-drain loop, filtered to this window's own ID.
++- **Cursor**: `setCursorVisible`/`cursorVisible` wrap
++  `SDL_ShowCursor`/`HideCursor`/`CursorVisible`; `setCursorConfined`/
++  `cursorConfined` wrap `SDL_SetWindowMouseGrab`/`GetWindowMouseGrab` — a
++  distinct primitive from relative mode, per matrix row 3.
++- **Gamepad**: `std::unordered_map<SDL_JoystickID, SDL_Gamepad*> gamepads_`
++  owned by `Window`; `GAMEPAD_ADDED` opens+inserts (+ gyro log-don't-drop:
++  `SDL_GamepadHasSensor(gamepad, SDL_SENSOR_GYRO)` + device name logged at
++  open time); `GAMEPAD_REMOVED` closes-then-erases synchronously in the
++  same event-handling step. `poll()` selects the lowest connected
++  `SDL_JoystickID` (matrix row 9's single-active rule) and returns a
++  `GamepadState` with deadzone-applied sticks/triggers and the full
++  discrete button surface (D-pad ×4, SOUTH/EAST/WEST/NORTH, both
++  shoulders, START — no `_A`/`_B`, per the naming correction).
++- **Deadzone math** (`input.cpp`, dependency-free): `applyStickDeadzone`
++  is 2D scaled-radial (`mag = |stick|/32768`; below threshold → `{0,0}`;
++  else `normalize(stick) * ((mag-deadzone)/(1-deadzone))`, magnitude
++  clamped to 1) — never two independent per-axis clamps.
++  `applyTriggerDeadzone` is the 1D analogue over `[0,32767]`.
++- **Keyboard**: `isKeyDown(SDL_Scancode)` wraps `SDL_GetKeyboardState`,
++  bounds-checked against SDL's own reported `numkeys` (not a hardcoded
++  constant) — an out-of-range scancode returns `false`, not UB.
++- **Thread-affinity**: `pumpEvents()` (pre-existing, now enforced) +
++  every new public method (`setRelativeMouseMode`/
++  `relativeMouseModeWanted`/`consumeMouseDelta`/`setCursorVisible`/
++  `cursorVisible`/`setCursorConfined`/`cursorConfined`/`poll`/
++  `isKeyDown`) carry `RX_ASSERT_MAIN_THREAD`, matching the whole-class
++  posture `GeometryPool`/`Uploader` already established (ruling row 11
++  named `pumpEvents()`/`consumeMouseDelta()`/`poll()`/the cursor and
++  relative-mode setters explicitly; I extended the same guard to the
++  getters and `isKeyDown()` too, for one predictable contract across the
++  class — several of these are individually "safe from any thread" per
++  SDL's own doc, but this project's own D5 policy scopes the whole class
++  uniformly, same reasoning as `Uploader::isComplete()`/`wait()`).
++  `docs/threading.md` updated with the new registry entry.
++
++## Production bug found and fixed (not just a test artifact)
++
++While building the virtual-joystick test suite I hit a real, 100%-
++reproducible failure: `SDL_GetGamepadButton`/`SDL_GetGamepadAxis` (and
++even the lower-level `SDL_GetJoystickButton`) never reflected
++`SDL_SetJoystickVirtualButton`/`Axis`-driven state changes **whenever a
++real `SDL_Window` existed in the process** — reproduced with a from-
++scratch standalone repro isolating every other variable (video-subsystem-
++only-no-window: correct; window without the Vulkan flag: still wrong;
++20×20ms pump+delay retries: still wrong). Root cause, found via
++`SDL_hints.h`: `SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS` **defaults to
++`"0"`** — SDL disables joystick/gamepad input processing while the app is
++"in the background" (no window holding OS input focus), and every window
++this test suite (and every headless CI run) creates is `visible=false`,
++i.e. permanently unfocused.
++
++This is not a test-only problem: a real game window that ever loses OS
++focus — trivially true under Gamescope/Steam's own overlay on the actual
++Steam Deck, the ticket's stated acceptance bar — would go **silently
++gamepad-dead** at SDL's own default. `Window::create()` now calls
++`SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1")`
++unconditionally before `SDL_INIT_GAMEPAD` comes up (`window.cpp`, with the
++full repro narrative in the code comment). Verified fix: before, an
++isolated repro with a real hidden window showed `south=0` after driving it
++`true` and pumping (20 retries, 400ms); after, `south=1` on the very first
++read.
++
++## Gate-mandated virtual-joystick smoke check
++
++Per the brief: confirm `SDL_AttachVirtualJoystick` works under this
++project's CI-representative headless driver **before** relying on it for
++load-bearing tests.
++
++```
++$ xvfb-run -a ./build/linux-native/src/rx_platform/rx_platform_tests -tc="*SMOKE*" -s
++...
++[doctest] test cases: 1 | 1 passed | 0 failed | 6 skipped
++[doctest] assertions: 6 | 6 passed | 0 failed |
++[doctest] Status: SUCCESS!
++```
++
++Result: **works cleanly**, both under `xvfb-run -a` (native Linux) and
++under `xvfb-run -a wine ...rx_platform_tests.exe` (Windows-cross target) —
++confirmed separately, full test-case output in both cases. Matrix
++Conflict #3's CI-automation claim holds; no fallback to manual-only rows
++was needed. A second smoke check (real SDL calls, no `Window`) confirmed
++the less-obvious fact that a virtual joystick's raw axis/button INDEX
++equals the `SDL_GamepadAxis`/`SDL_GamepadButton` enum value directly for a
++`SDL_JOYSTICK_TYPE_GAMEPAD`-typed device, **and** that
++`SDL_SetJoystickVirtualAxis`/`Button` values are not visible until the
++next `SDL_PumpEvents()`/`SDL_UpdateJoysticks()` (documented, but easy to
++miss) — both load-bearing findings for the test design, both folded into
++`VirtualGamepad`'s own comment in `window_test.cpp`.
++
++## Environmental confound found and neutralized: a real gamepad
++
++This dev machine has a **physically-connected USB Xbox-compatible
++controller** (`/proc/bus/input/devices`: `"Generic X-Box pad"`,
++`usb-0000:00:14.0-10`, VID `0x3537` PID `0x1012` — confirmed via sysfs,
++not assumed). Since `poll()`'s single-active rule always selects the
++lowest connected `SDL_JoystickID`, and SDL's instance-ID counter is
++monotonic (a real device discovered at subsystem-init time always beats a
++virtual pad attached later), this device wins selection over every test's
++own virtual pad, starving the poll()-mediated assertions.
++
++Tests are written to be **correct regardless of this**, not to assume a
++clean environment: `foreignGamepadIds()` (top of `window_test.cpp`) checks
++`SDL_GetGamepads()` for anything not owned by the current test and, when
++present, logs an honest `MESSAGE` and skips only the specific assertions
++that genuinely cannot be observed with a foreign device present — mirrors
++this file's own pre-existing WM/driver-conditional convention (Task 17's
++fullscreen tests). Confirmed this is not theoretical: a fix-round-1-style
++re-verification with the real device temporarily neutralized via
++`SDL_JOYSTICK_BLACKLIST_DEVICES=0x3537/0x1012` (an SDL hint, VID/PID
++supplied as an env var for verification only — never hardcoded into the
++shipped test file, since it's specific to this one machine) shows **every
++assertion runs for real and passes**: 312/312 vs. 123/123 with the device
++present (the smaller count reflects the same test cases correctly taking
++their honest-skip branches). Both scenarios are 27/27 test cases, 0
++failed.
++
++## Per-criterion proof (matrix rows / gate ruling #14)
++
++**Row 1 (relative mode + focus-loss).** `setRelativeMouseMode`/
++`relativeMouseModeWanted` track app intent independent of SDL's query;
++`pumpEvents()`'s FOCUS_LOST/GAINED handling per the design above.
++Device-free test (`window_test.cpp`, "FOCUS_LOST pauses...") drives the
++full pause→resume cycle via `SDL_PushEvent`; a separate test round-trips
++`relativeMouseModeWanted()`/`SDL_GetWindowRelativeMouseMode()` with an
++honest skip when the driver doesn't actually grant it (same pattern as
++Task 17's fullscreen test). Confirmed load-bearing (revert evidence below).
++
++**Row 2 (mouse-delta accumulation).** Exact algorithm from the matrix:
++`accumX/Y += event.motion.xrel/yrel` inside the existing full-drain loop;
++`consumeMouseDelta()` returns-and-resets. Device-free test pushes 3
++synthetic `MOUSE_MOTION` events with known `xrel/yrel`, asserts the exact
++float sum, then asserts a second call returns `{0,0}`; a second test
++proves cross-window isolation. Confirmed load-bearing.
++
++**Row 3 (cursor show/hide/confine).** `setCursorVisible`/`cursorVisible`
++round-trip `SDL_CursorVisible()`; `setCursorConfined`/`cursorConfined`
++round-trip `SDL_GetWindowMouseGrab()` with the same "request succeeded but
++the driver didn't actually grant it" gating Task 17's fullscreen test
++established (found live: `SDL_SetWindowMouseGrab(true)` reports success
++under this dev machine's own `xvfb-run` session without actually granting
++the grab). Visual confirmation is MANUAL_VERIFICATION-only (new section,
++unchecked, honest).
++
++**Row 4 (gamepad hot-plug lifecycle).** Owned
++`unordered_map<SDL_JoystickID, SDL_Gamepad*>`; open-on-ADDED,
++close-then-erase-on-REMOVED, synchronously. Automated via
++`SDL_AttachVirtualJoystick` (hot-plug lifecycle test + rapid
++attach-detach-attach test, both environment-robust per above). Confirmed
++load-bearing (revert evidence below).
++
++**Row 5 (scaled-radial deadzone, incl. mandatory (8500,8500) case).**
++`applyStickDeadzone` per the matrix's exact formula. Pure-math tests:
++below-threshold-zero, centered-stick-no-NaN, the diagonal-snap
++discrimination case ((6000,6000): magnitude clears the radial deadzone
++but a naive per-axis clamp would zero both axes), and the **mandatory**
++(8500,8500) case asserting the exact scaled output value
++(`(0.11480, 0.11480)`, magnitude `0.16235`) against a naive-unscaled-
++per-axis-clamp comparator computed inline (`(0.25940, 0.25940)`) — proving
++a bare zero/non-zero check cannot discriminate the two implementations at
++this point, only the exact value can (per the gate hardening block's own
++framing). Also exercised end-to-end via a real virtual joystick through
++`Window::poll()` (environment-conditional). Confirmed load-bearing
++(revert evidence below).
++
++**Row 6 (1D trigger deadzone).** `applyTriggerDeadzone` per the matrix
++formula, default ~1000/32767. Pure-math test: zero below threshold, 1.0
++at max, exact mid-range rescale value. End-to-end virtual-joystick test
++additionally found and documented a real SDL gotcha: a virtual trigger's
++REST value at the raw joystick-axis level is `SDL_JOYSTICK_AXIS_MIN`
++(-32768), not 0 — SDL's gamepad-mapping layer translates that to the
++documented 0=released convention `poll()` consumes. Confirmed load-bearing.
++
++**Row 7 (full button surface, no A/B).** `GamepadButtons` exposes D-pad
++×4, SOUTH/EAST/WEST/NORTH, both shoulders, START. Test drives each of the
++11 buttons individually via `SDL_SetJoystickVirtualButton`, asserting the
++target field is true and every OTHER field stays false (proves no
++stuck-true vacuous pass), then asserts release. Confirmed load-bearing
++(revert evidence below, swapped SOUTH/EAST).
++
++**Row 8/10 (gyro log-don't-drop, Deck quirk diagnostics).**
++`SDL_GamepadHasSensor(gamepad, SDL_SENSOR_GYRO)` + `SDL_GetGamepadName`
++logged at GAMEPAD_ADDED time. Test captures the real log line via the
++same `LogForwardSink` mechanism the Wayland test uses (extended to search
++the full accumulated capture, not just the last message, since a real
++foreign gamepad's own connect-log can interleave with this test's own —
++found live on this dev machine, fixed by searching for the specific pad's
++own line rather than assuming ordering). Confirmed the log line reflects
++a REAL query result (virtual pads declare zero sensors →
++`hasGyroSensor=false` genuinely computed, not hardcoded).
++
++**Row 9 (single-active = lowest ID).** `poll()` selects
++`std::min_element` over `gamepads_` by `SDL_JoystickID`. Test attaches two
++virtual pads with distinguishable button state, asserts the lower-ID one
++is active, detaches it, asserts reselection to the higher-ID one with ITS
++OWN state. Confirmed load-bearing (revert evidence below).
++
++**Row 11 (thread-affinity).** All ten new/touched public methods carry
++`RX_ASSERT_MAIN_THREAD`. Test mirrors `rx_asset/tests/thread_guard_test.cpp`'s
++established "plain `std::thread` stands in for a chunk≥1 worker" pattern
++(no `rx::task::Scheduler` integration exists for `rx_platform` this
++phase): 4 guarded calls from 4 sequential worker threads all trip the
++hook; the same 4 calls on the main thread trip nothing. Confirmed
++load-bearing (revert evidence below).
++
++**NEW SCOPE — keyboard.** `isKeyDown(SDL_Scancode)` wraps
++`SDL_GetKeyboardState`, bounds-checked. Device-free test: every scancode
++at rest reports `false`; an absurdly out-of-range value
++(`static_cast<SDL_Scancode>(99999)`, and `-1`) returns `false` rather than
++reading out of bounds. Confirmed load-bearing — reverting the bounds
++check **crashes** (SIGSEGV), not just fails an assertion (revert evidence
++below). Real key-press confirmation is MANUAL_VERIFICATION-only (SDL
++provides no public API to inject synthetic keyboard STATE — only events,
++which per `SDL_PushEvent`'s own doc and this file's own existing comment
++on that point, don't move `SDL_GetKeyboardState()`'s array).
++
++## Build & test evidence (both presets, CI-representative invocation)
++
++**linux-native**, full suite:
++```
++$ xvfb-run -a ctest --preset linux-native --output-on-failure
++...
++100% tests passed, 0 tests failed out of 23
++Total Test time (real) = 150.76 sec
++```
++
++**windows-cross-zig**, Wine, matching CI's own exclusion convention:
++```
++$ xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample' --output-on-failure
++...
++100% tests passed, 0 tests failed out of 11
++Total Test time (real) = 131.92 sec
++```
++`rx_platform_tests` (containing every new test in this task) passed under
++real Wine in 2.90s, all 27 test cases including the gamepad ones (verified
++directly with `-s`; the environment-conditional skip logic correctly fired
++there too — Wine surfaces the same real USB device through its own
++joystick emulation).
++
++`rx_platform_tests` standalone, both environment scenarios:
++```
++$ SDL_JOYSTICK_BLACKLIST_DEVICES="0x3537/0x1012" xvfb-run -a ./build/linux-native/src/rx_platform/rx_platform_tests
++[doctest] test cases:  27 |  27 passed | 0 failed | 0 skipped
++[doctest] assertions: 312 | 312 passed | 0 failed |
++
++$ xvfb-run -a ./build/linux-native/src/rx_platform/rx_platform_tests
++[doctest] test cases:  27 |  27 passed | 0 failed | 0 skipped
++[doctest] assertions: 123 | 123 passed | 0 failed |
++```
++
++## Revert evidence (load-bearing, in-tree revert-and-restore — disable →
++rebuild → run failing test → restore → rebuild → confirm green;
++`grep -rn "REVERT-TEST" src/rx_platform/` confirms zero leftover markers
++in the final tree)
++
++1. **Scaled-radial deadzone → naive per-axis clamp** (`input.cpp`,
++   `applyStickDeadzone` body replaced with the exact anti-pattern the
++   ruling rejects): diagonal-snap test fails (`result.x/y` both 0 instead
++   of non-zero); MANDATORY (8500,8500) test fails on all 4 assertions
++   (`0.259399` vs. expected `≈0.1148`/`0.16235`, and the "NOT equivalent"
++   assertion itself fails since the naive and buggy outputs now match).
++2. **Mouse-delta accumulation short-circuited** (`if (false && ...)`):
++   `consumeMouseDelta()` sums test fails (`0 == Approx(7.75)` etc.).
++3. **Focus-pause condition dropped** (kept windowID filter, removed
++   `&& !focusLost_`): FOCUS_LOST test fails — motion during focus-loss
++   IS accumulated (`100 == 0` mismatch) when it must not be.
++4. **GAMEPAD_REMOVED erase skipped**: hot-plug lifecycle test fails
++   (device stays reported `connected` after detach).
++5. **Single-active rule flipped to highest ID** (`std::max_element`):
++   single-active test fails (south/east both wrong — the higher-ID pad's
++   state leaks into what should be the lower-ID pad's turn).
++6. **SOUTH/EAST swapped** in `poll()`'s button assignment: button-surface
++   test fails (4 assertions — south field reads east's driven value and
++   vice versa).
++7. **Trigger deadzone bypassed** (`state.rightTrigger` = raw
++   `SDL_GetGamepadAxis` value, no `applyTriggerDeadzone`): trigger test
++   fails (`32767 == Approx(1.0)` mismatch).
++8. **`RX_ASSERT_MAIN_THREAD` removed from `poll()`**: thread-guard test
++   fails (`capture.callCount` 3 instead of 4; `lastContext` stale).
++9. **`isKeyDown`'s bounds check removed**: test **CRASHES** — `SIGSEGV`
++   reading `state[key]` for the out-of-range scancode, doctest reports
++   `test case CRASHED`, not merely failed. This is the live UB the check
++   exists to close.
++
++All 9 disable→fail→restore→pass cycles independently rebuilt and re-ran
++the specific affected test green again before moving to the next; the
++final full suite (both presets, both real-device environment scenarios)
++is green as shown above.
++
++## Deviations (disclosed)
++
++1. **`SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS` fix** — not requested by
++   the brief/matrix/rulings text explicitly, but a genuine correctness
++   requirement discovered while implementing (see "Production bug found
++   and fixed" above); without it, the gamepad surface is unusable on any
++   unfocused window, which is the Steam Deck's OWN normal operating
++   condition under Gamescope. Judged in-scope, not deferred: it is a
++   one-line fix inside this exact ticket's own `Window::create()` change
++   surface, and this ticket's own acceptance bar names Steam Deck
++   drivability explicitly.
++2. **Guard extended beyond the ruling's literal list.** Ruling row 11
++   names `pumpEvents()`/`consumeMouseDelta()`/`poll()`/the cursor and
++   relative-mode SETTERS. I additionally guarded the GETTERS
++   (`relativeMouseModeWanted`/`cursorVisible`/`cursorConfined`) and
++   `isKeyDown()` for one predictable whole-class contract, matching
++   `GeometryPool`'s established precedent (`docs/threading.md` already
++   documents this reasoning for that class). Not scope creep on the
++   ticket's own subject matter — same 10 methods this ticket adds, same
++   file.
++3. **`docs/threading.md` registry entry added** for `rx::platform::Window`
++   — Task 17 documented its own thread-affinity by comment only, never
++   added a registry entry despite the doc's own stated purpose ("what
++   every new public header's one-line thread-affinity note... points back
++   to"). This task's ruling explicitly requires the guard convention, so
++   I closed that pre-existing gap for the methods this task touches
++   (did NOT add an entry/guard for Task 17's `setFullscreen`/
++   `isFullscreen`, out of this task's touched-surface scope).
++4. **`+input.h` used** (brief's own "if cleaner" option) — kept the
++   deadzone math and value types dependency-free from SDL entirely, so
++   `applyStickDeadzone`/`applyTriggerDeadzone` are unit-testable with
++   zero SDL initialization (matrix row 5's own suggestion, "if the math
++   is factored out testably").
++5. **Local-machine-only verification aid, never shipped**:
++   `SDL_JOYSTICK_BLACKLIST_DEVICES=0x3537/0x1012` (this dev machine's
++   real controller's VID/PID) was used as an env var during my own
++   verification runs to get a foreign-device-free baseline for the
++   revert-discrimination cycles; it appears nowhere in the committed test
++   file (which is written to be correct with OR without a foreign device
++   present, via `foreignGamepadIds()`) — disclosed here only so the
++   coordinator/reviewer understands why some of my terminal transcripts
++   show that env var and can reproduce the clean-environment runs
++   locally if desired.
++
++## Self-review
++
++- Grepped the full diff for `REVERT-TEST`, `TEMP`, `TODO`, `FIXME`, `XXX`
++  — clean (zero matches in the final tree).
++- Verified `Window`'s move constructor/assignment/destructor correctly
++  carry the 4 new scalar members (`relativeModeWanted_`/`focusLost_`/
++  `accumMouseDeltaX_`/`Y_`) and move (not copy) `gamepads_`, with
++  `closeAllGamepads()` shared between move-assignment's "destroy what I
++  currently own" step and the destructor (mirrors the existing
++  `SDL_DestroyWindow` pattern).
++- Confirmed `pumpEvents()`'s cross-window isolation (existing
++  `windowID`-filtering convention) extends correctly to
++  `SDL_EVENT_MOUSE_MOTION`; gamepad device events are correctly left
++  UNfiltered (gamepads are process-global, not per-window).
++- Confirmed `SDL_GAMEPAD_BUTTON_SOUTH`/`EAST`/`WEST`/`NORTH` are the real
++  SDL3 3.4.14 identifiers (grepped the vendored header directly, zero
++  `_A`/`_B` hits) before writing a single line of `GamepadButtons`.
++- `git diff` of every file I claim as mine reviewed before staging;
++  confirmed `.superpowers/sdd/2026-08-11-phase4-scene-assets/progress.md`
++  (a concurrent coordinator ledger entry, not mine) is excluded via
++  explicit pathspec.
++
++## Concerns for the coordinator
++
++1. **The `SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS` fix is real and
++   important but was NOT explicitly named anywhere in the brief/matrix/
++   rulings** — flagging in case the coordinator wants to fold a one-line
++   note into the ledger/registry (e.g. "gamepad input requires this hint;
++   `Window::create()` sets it unconditionally") so a future task touching
++   gamepad/focus code doesn't rediscover it the hard way.
++2. **This dev machine's own physically-connected gamepad** is a real,
++   disclosed environmental fact (not a fabricated test scenario) — every
++   gamepad test is written to behave correctly with or without it, and
++   both scenarios were independently verified green, but a reviewer
++   running these tests on a THIRD machine with a DIFFERENT foreign
++   gamepad will see the same honest-skip behavior (by design) rather than
++   the full 312-assertion run, unless they similarly neutralize their own
++   device via `SDL_JOYSTICK_BLACKLIST_DEVICES=<their VID>/<their PID>`
++   (found via `cat /proc/bus/input/devices`).
++3. **Real-hardware rows in `MANUAL_VERIFICATION.md`'s new section are
++   honestly unchecked** — no sample exists yet to drive an end-to-end
++   human-observed session (Task 24 is the first consumer); Steam Deck
++   drivability specifically (the ticket's own stated acceptance bar)
++   cannot be confirmed until that sample lands and runs on real Deck
++   hardware.
+diff --git a/MANUAL_VERIFICATION.md b/MANUAL_VERIFICATION.md
+index bccab38..353bb38 100644
+--- a/MANUAL_VERIFICATION.md
++++ b/MANUAL_VERIFICATION.md
+@@ -142,20 +142,82 @@ other Linux machine.
+ repository was developed and verified on a Linux desktop only. The
+ `linux-native` preset (same one the Deck would use) is confirmed green on
+ that desktop machine's own AMD/NVIDIA-equivalent Vulkan/validation stack;
+ nothing in this codebase depends on desktop-only APIs (SDL3 + Vulkan 1.3
+ dynamic rendering/synchronization2 both run under SteamOS's RADV driver),
+ but that has not yet been confirmed on an actual Deck. Fill in the
+ checkboxes and record the SteamOS version/RADV (Mesa) driver version above
+ the first time this is actually run on a Deck, before the next release that
+ claims Steam Deck support.
+ 
++## rx_platform input surface (Phase 4 Task 20, gate ruling #14)
++
++`rx::platform::Window`'s new input surface (relative mouse mode + mouse
++deltas, cursor show/hide/confine, gamepad hot-plug + stick/trigger/button
++polling with deadzones, minimal keyboard) is exercised automatically —
++including gamepad hot-plug/axis/button paths, which SDL3's
++`SDL_AttachVirtualJoystick` makes CI-testable without real hardware (see
++`src/rx_platform/tests/window_test.cpp`) — but a few things are genuinely
++NOT automatable headlessly, matching this file's own established
++"screenshot/human-observed, not scriptable" carve-out (see e.g. row 3's own
++acceptance criterion in the gate matrix for this ticket). **No sample yet
++consumes this surface** — Task 24 (`09_fly_through`) is the first real
++consumer (mouse-look + gamepad + WASD fly-through camera); the rows below
++are the raw platform-level checks, independent of that sample, and the
++sample itself will carry its own MANUAL_VERIFICATION section once it lands.
++
++- [ ] Relative mouse mode: call `setRelativeMouseMode(true)` in a real
++      (non-hidden) window session — cursor visibly disappears and stays
++      centered/locked to the window regardless of how far the mouse is
++      moved; `setRelativeMouseMode(false)` visibly restores the normal
++      cursor at a sane position.
++- [ ] Cursor `setCursorVisible(false)`/`(true)` — cursor visibly
++      disappears/reappears over the window.
++- [ ] Cursor `setCursorConfined(true)`/`(false)` — cursor is visibly
++      unable to leave the window's bounds while confined, and free to
++      leave once un-confined.
++- [ ] Focus-loss/regain: alt-tab away from the window while
++      `setRelativeMouseMode(true)` is active, then alt-tab back — no
++      crash, and mouse-look resumes correctly on refocus (this is the
++      real-OS analogue of `window_test.cpp`'s synthetic
++      `SDL_PushEvent`-driven FOCUS_LOST/FOCUS_GAINED test).
++- [ ] Keyboard: `isKeyDown(SDL_SCANCODE_W)` (etc.) reflects a REAL physical
++      key press/release — device-free tests can only prove the bounds-check
++      and at-rest (`false`) behavior (SDL provides no public API to inject
++      synthetic keyboard STATE, only events, which don't move
++      `SDL_GetKeyboardState()`'s own array — see `window_test.cpp`'s
++      comment on this).
++- [ ] Gamepad, REAL hardware hot-plug: plug in a physical gamepad while the
++      app is running — connects and becomes `poll()`-active; unplug —
++      disconnects cleanly, no crash/hang. (Automated coverage uses
++      `SDL_AttachVirtualJoystick` instead; this row is the real-USB-event
++      analogue.)
++- [ ] Steam Deck: the ticket's own stated acceptance bar ("Steam Deck pad
++      drivability") — run on real Deck hardware (or via a real gamepad on
++      desktop as a stand-in until Deck hardware is available) once Task 24
++      lands a sample that actually consumes stick/trigger/button input;
++      confirm the built-in controls (or an attached pad) drive the
++      fly-through camera as expected, and check the log for the
++      gyro/device-name diagnostic line this ticket adds
++      (`rx_platform: gamepad connected id=... name="..." hasGyroSensor=...`)
++      — SDL issue #9148 predicts a Steam Deck's own gyro reports
++      `hasGyroSensor=false` at this project's pinned SDL3 version; this row
++      confirms that diagnostic actually appears on real Deck hardware,
++      not just in the virtual-joystick test.
++
++**Last run:** not yet performed — this task (Task 20) implemented and
++automated-tested the platform-level surface only; no sample exists yet to
++drive an end-to-end human-observed session against. Fill in the checkboxes
++above once Task 24's `09_fly_through` sample lands and this section can be
++run for real (on desktop first, then Steam Deck hardware before any release
++claiming Deck gamepad support).
++
+ ## 05_multipass (`--present` mode)
+ 
+ `sample_05_multipass` needs the Slang runtime libraries (+ its six on-disk
+ shader sources) deployed next to it — see `samples/README.md`'s own
+ "Redistribution" section for the full manifest; it is not statically linked
+ like 01_triangle.
+ 
+ ### What "pass" means, every platform
+ 
+ - The window opens and shows a reddish cube and a bluish sphere on a
+diff --git a/docs/threading.md b/docs/threading.md
+index b3194d8..6c5c350 100644
+--- a/docs/threading.md
++++ b/docs/threading.md
+@@ -102,20 +102,37 @@ and compiles to nothing at all when it is OFF:
+   narrowed to main-thread-only and guarded, matching D5's posture for
+   the whole class. The test/diagnostic-only accessors
+   (`vertexBufferAllocatedBytes()`/`indexBufferAllocatedBytes()`/
+   `vertexBufferHandle()`/`indexBufferHandle()`) carry the identical
+   guard for the same reason, though production code has no need for
+   them. (`src/rx_asset/include/rx_asset/geometry_pool.h`)
+ - **`rx::scene::*Manager` registries** (future, Stage 2) —
+   `RenderableManager`/`TransformManager`/`LightManager` mutation
+   (create/set/destroy) stays main-thread-only; read-only SoA traversal for
+   culling (below) does not. Not guarded — does not exist yet.
++- **`rx::platform::Window`** [Phase 4 Task 20, gate ruling #14] —
++  `pumpEvents()`/`setRelativeMouseMode()`/`relativeMouseModeWanted()`/
++  `consumeMouseDelta()`/`setCursorVisible()`/`cursorVisible()`/
++  `setCursorConfined()`/`cursorConfined()`/`poll()`/`isKeyDown()`
++  **[guarded, all ten]** — the full input surface this task added, plus
++  `pumpEvents()` itself (pre-existing, previously documented as
++  main-thread-only only by comment, never enforced — now backed by the
++  same runtime check as every other entry here). Matches D5's whole-class
++  posture (`rx::asset::GeometryPool`'s precedent above): several of these
++  (`isKeyDown()`, the gamepad axis/button reads inside `poll()`) are
++  individually documented safe-from-any-thread by SDL3's own header, but
++  the guard here is this project's own D5 policy scoping for one
++  predictable contract across the whole class, not a hazard those
++  particular calls introduce on their own — the same reasoning
++  `rx::rhi::Uploader::isComplete()`/`wait()` already established above.
++  `setFullscreen()`/`isFullscreen()` (Task 17) are NOT guarded — out of
++  this task's touched-surface scope, unchanged. (`src/rx_platform/include/rx_platform/window.h`)
+ - **`rx::task::Scheduler`** — `pumpMain()` **[guarded]** [audit finding
+   F5-partial]: runs whatever GPU-object-mutating closures `postToMain()`
+   queued (the handoff pattern below), so it carries the identical
+   main-thread-only contract as everything above it, just via a different
+   entry point. `parallelFor()` is NOT main-thread-only itself (its
+   documented contract is "calling thread, whichever one that is" — see
+   `scheduler.h`); this guard is specifically about the pump point workers
+   hand GPU mutation back through, not about `Scheduler` in general.
+   (`src/rx_task/include/rx_task/scheduler.h`)
+ 
+diff --git a/src/rx_platform/CMakeLists.txt b/src/rx_platform/CMakeLists.txt
+index b854f4e..8d388a6 100644
+--- a/src/rx_platform/CMakeLists.txt
++++ b/src/rx_platform/CMakeLists.txt
+@@ -1,20 +1,21 @@
+ # Vulkan::Headers comes from third_party/CMakeLists.txt's dependency-cache
+ # install of KhronosGroup/Vulkan-Headers, found via find_package(VulkanHeaders
+ # CONFIG ...) and promoted to IMPORTED_GLOBAL there so it's visible here.
+ # Deliberately NOT found via find_package(Vulkan): that would additionally
+ # require locating the platform's Vulkan loader import library, which this
+ # project never links against (see comment in third_party/CMakeLists.txt)
+ # and which does not exist when cross-compiling to Windows on a Linux host.
+ 
+ add_library(rx_platform STATIC
+     src/window.cpp
++    src/input.cpp
+ )
+ target_include_directories(rx_platform PUBLIC include)
+ # SDL3::SDL3 is an ALIAS (to SDL3::SDL3-static, since third_party builds
+ # SDL3 static-only) created inside third_party/CMakeLists.txt's directory
+ # scope. Promoting the real underlying imported target to IMPORTED_GLOBAL
+ # (done in third_party/CMakeLists.txt) does not make the ALIAS name itself
+ # resolvable from this sibling directory -- CMake ALIAS targets are not
+ # global just because the target they point to is. Link the real global
+ # target name directly instead.
+ target_link_libraries(rx_platform PUBLIC SDL3::SDL3-static Vulkan::Headers rx_core)
+diff --git a/src/rx_platform/include/rx_platform/input.h b/src/rx_platform/include/rx_platform/input.h
+new file mode 100644
+index 0000000..73576ed
+--- /dev/null
++++ b/src/rx_platform/include/rx_platform/input.h
+@@ -0,0 +1,115 @@
++#pragma once
++
++// input.h -- value types + deadzone math for rx_platform's input surface
++// [Phase 4 Task 20, gate ruling #14]. Split out of window.h (brief's own
++// "+input.h if cleaner" option) because the deadzone math below is
++// deliberately dependency-free (no SDL type anywhere in this file) so it
++// is unit-testable with ZERO SDL initialization at all -- gate
++// matrix-issue14-input.md row 5's own "pure math unit tests... if the
++// math is factored out testably" request. rx::platform::Window
++// (window.h) owns translating real SDL_GetGamepadAxis()/
++// SDL_GetGamepadButton() reads into these types; this file owns only the
++// shapes and the deadzone formulas themselves.
++
++namespace rx::platform {
++
++// A dependency-free 2D vector -- used both for the deadzone math's output
++// and (via MouseDelta below) for accumulated mouse motion. Deliberately
++// NOT glm::vec2/SDL type: this header has zero includes on purpose.
++struct Vec2f {
++    float x = 0.0f;
++    float y = 0.0f;
++};
++
++// Per-frame accumulated mouse motion, returned (and reset to zero) by
++// Window::consumeMouseDelta() [gate matrix-issue14 row 2's consume-and-
++// reset algorithm]. A distinct type from Vec2f purely for call-site
++// clarity -- a delta is not a direction or a position.
++struct MouseDelta {
++    float x = 0.0f;
++    float y = 0.0f;
++};
++
++// Full discrete gamepad button surface [gate ruling #14 (rulings-2026-08-
++// 18.md #14) + matrix row 7: SDL3's real SDL_GamepadButton enum
++// (SDL_gamepad.h:154-182, this project's pinned release-3.4.14) has NO
++// `SDL_GAMEPAD_BUTTON_A`/`_B` member at all -- grepped, zero hits, see
++// the matrix's own Conflict #1]. This struct exposes the D-pad (x4), the
++// four face buttons under their REAL SDL3 identifiers (SOUTH/EAST/WEST/
++// NORTH -- the header's own doc comments gloss SOUTH as "e.g. Xbox A
++// button" etc., but the enum member itself is never named that way),
++// both shoulders, and START -- a bool-struct surface, per the ruling,
++// not "two buttons."
++struct GamepadButtons {
++    bool dpadUp = false;
++    bool dpadDown = false;
++    bool dpadLeft = false;
++    bool dpadRight = false;
++    bool south = false;   // e.g. Xbox A / PlayStation Cross
++    bool east = false;    // e.g. Xbox B / PlayStation Circle
++    bool west = false;    // e.g. Xbox X / PlayStation Square
++    bool north = false;   // e.g. Xbox Y / PlayStation Triangle
++    bool leftShoulder = false;
++    bool rightShoulder = false;
++    bool start = false;
++};
++
++// Snapshot returned by Window::poll() [gate matrix-issue14 row 9]: the
++// single "active" gamepad, selected as the lowest currently-connected
++// SDL_JoystickID among every hot-plugged device Window::pumpEvents() is
++// tracking (deterministic; re-selected only when that pad disconnects).
++// `connected == false` (every other field left zero-initialized) when no
++// gamepad is attached at all. Stick/trigger fields have ALREADY had the
++// scaled-radial / 1D deadzone applied (applyStickDeadzone()/
++// applyTriggerDeadzone() below) -- Window::poll() never hands back raw
++// SDL axis values.
++struct GamepadState {
++    bool connected = false;
++    Vec2f leftStick;
++    Vec2f rightStick;
++    float leftTrigger = 0.0f;
++    float rightTrigger = 0.0f;
++    GamepadButtons buttons;
++};
++
++// SDL's own thumbstick-centering precedent (~8000 of a 32768-magnitude
++// range -- SDL_gamepad.h's own SDL_GamepadAxis doc comment) expressed as
++// a ratio of that range. The SAME ratio Microsoft's XInput reference
++// deadzone constants (7849/8689 of 32768) approximate, and what gate
++// ruling #14 (matrix row 5) retains as "the radius." Tunable per-call;
++// this is only the default.
++inline constexpr float kDefaultStickDeadzone = 8000.0f / 32768.0f;
++
++// Small analog floor for resting trigger noise -- a DIFFERENT constant
++// and formula from the stick deadzone (this is 1D, not the 2D-radial
++// check below; see applyTriggerDeadzone()). Matches gate ruling #14's
++// proposed default (~1000/32767, tunable).
++inline constexpr float kDefaultTriggerDeadzone = 1000.0f / 32767.0f;
++
++// Scaled-radial deadzone [gate ruling #14, matrix row 5 -- RESOLVED in
++// favor of scaled-radial over two independent per-axis clamps, which
++// snap diagonal stick motion to the cardinal axes ("Doing Thumbstick
++// Dead Zones Right", Josh Sutphin; Microsoft's own XInput reference
++// sample -- both fetched and cited in the matrix]. `rawX`/`rawY` are raw
++// SDL_GetGamepadAxis() values (each in [-32768, 32767]); `deadzone` is
++// expressed as a fraction of the 32768 axis-magnitude scale.
++//
++// Below the deadzone radius: {0,0} exactly. At or above it: the input's
++// own direction, scaled to a magnitude that sweeps [0,1] linearly as the
++// raw magnitude sweeps [deadzone*32768, max] -- never a bare pass-
++// through, which would produce a discontinuous "jump" right at the
++// deadzone boundary. This is a genuinely 2D check: two points with the
++// SAME per-axis values can cross the deadzone differently depending on
++// their combined magnitude (see window_test.cpp's mandatory (8500,8500)
++// discrimination case, gate hardening block).
++Vec2f applyStickDeadzone(float rawX, float rawY, float deadzone = kDefaultStickDeadzone);
++
++// 1D analog deadzone for a single trigger axis [gate ruling #14, matrix
++// row 6]. `raw` is SDL_GetGamepadAxis()'s trigger range, [0, 32767] (SDL3
++// guarantees triggers never report negative -- SDL_gamepad.h's own doc,
++// distinct from the signed stick range). Returns a rescaled [0,1] value,
++// never a boolean "pressed" threshold -- this ticket's triggers stay
++// analog (e.g. feeding sample 09's fly-through speed multiplier).
++float applyTriggerDeadzone(float raw, float deadzone = kDefaultTriggerDeadzone);
++
++}  // namespace rx::platform
+diff --git a/src/rx_platform/include/rx_platform/window.h b/src/rx_platform/include/rx_platform/window.h
+index fd67629..a459831 100644
+--- a/src/rx_platform/include/rx_platform/window.h
++++ b/src/rx_platform/include/rx_platform/window.h
+@@ -1,39 +1,149 @@
+ #pragma once
+ #include <SDL3/SDL.h>
+ #include <vulkan/vulkan.h>
++#include <rx_platform/input.h>
+ #include <optional>
++#include <unordered_map>
+ #include <vector>
+ 
+ namespace rx::platform {
+ 
+ class Window {
+ public:
+     Window(Window&&) noexcept;
+     Window& operator=(Window&&) noexcept;
+     Window(const Window&) = delete;
+     Window& operator=(const Window&) = delete;
+     ~Window();
+ 
+     static std::optional<Window> create(const char* title, int width, int height, bool visible);
+ 
+     SDL_Window* sdlWindow() const { return window_; }
+ 
+     // Drains SDL's process-wide event queue (SDL_PollEvent) -- callers that
+-    // also need to react to OTHER event types (quit, input, ...) still poll
+-    // those themselves; this only owns draining the queue's window-state
+-    // events into the observed state below [Phase 4 Task 17, FG7, gate
+-    // ruling #25]. Thread-affinity (D5): main-thread-only, matching every
+-    // other SDL-touching method here -- SDL's own event queue is itself
+-    // main-thread-affine on most backends.
++    // also need to react to OTHER event types (quit, ImGui, ...) still poll
++    // those themselves; this owns draining the queue's window-state events
++    // into the observed state below [Phase 4 Task 17, FG7, gate ruling #25],
++    // AND [Phase 4 Task 20, gate ruling #14] the mouse-delta accumulation
++    // (SDL_EVENT_MOUSE_MOTION), gamepad hot-plug lifecycle
++    // (SDL_EVENT_GAMEPAD_ADDED/REMOVED), and the focus-loss/gain handling
++    // that pauses mouse-delta accumulation and unconditionally re-arms
++    // relative mouse mode on focus regain -- see consumeMouseDelta()/
++    // setRelativeMouseMode()/poll()'s own comments below for exactly what
++    // each does. This is this engine's single event-dispatch owner: Task
++    // 21's ImGui overlay feeds every event to
++    // ImGui_ImplSDL3_ProcessEvent() FIRST at this same call site, then lets
++    // this class's own handling run, and the platform-input accumulators
++    // gate on ImGui's WantCaptureMouse/WantCaptureKeyboard flags at the
++    // CALLER level (rulings-2026-08-18.md #14/#16) -- pumpEvents() itself
++    // has no ImGui dependency.
++    // Thread-affinity (D5, Phase 4): main-thread-only -- see
++    // docs/threading.md. SDL's own event queue is itself main-thread-affine
++    // on most backends; this method now also carries a dev-time
++    // RX_ASSERT_MAIN_THREAD guard [Phase 4 Task 20], matching every other
++    // guarded main-thread-only mutator in this codebase.
+     void pumpEvents();
+ 
++    // ---- Relative mouse mode + mouse-delta accumulation [Phase 4 Task 20,
++    // gate ruling #14, matrix rows 1/2] ------------------------------------
++    // setRelativeMouseMode(true) hides+captures the cursor and puts SDL
++    // into continuous relative-motion reporting
++    // (SDL_SetWindowRelativeMouseMode). The ENABLED intent is tracked
++    // independently of whatever SDL/the OS did internally -- gate ruling:
++    // "track the app-requested relative-mode state independently of SDL's"
++    // -- relativeMouseModeWanted() below reflects THIS engine's own last
++    // request, never a live SDL_GetWindowRelativeMouseMode() query. Returns
++    // SDL_SetWindowRelativeMouseMode()'s own success/failure (logged on
++    // failure, matching setFullscreen()'s established best-effort
++    // convention) -- relativeModeWanted_ is updated regardless of that
++    // result, because pumpEvents()'s FOCUS_GAINED handling below needs to
++    // know what the app WANTS independent of whether SDL granted it the
++    // last time it was asked.
++    //
++    // On SDL_EVENT_WINDOW_FOCUS_LOST (handled inside pumpEvents()),
++    // mouse-delta accumulation is paused -- no assumption is made about
++    // what SDL/the window manager did to the OS-level capture (SDL's own
++    // docs never state relative mode auto-clears on focus loss, unlike
++    // SDL_CaptureMouse, which explicitly does -- gate matrix row 1's own
++    // documented gap). On SDL_EVENT_WINDOW_FOCUS_GAINED, if the app still
++    // wants relative mode (relativeModeWanted_), SDL_SetWindowRelativeMouseMode(
++    // window, true) is unconditionally RE-issued -- idempotent, safe
++    // whether or not SDL had silently cleared it, and correct regardless of
++    // which OS/compositor answer is true.
++    // Thread-affinity (D5, Phase 4): main-thread-only -- see docs/threading.md.
++    bool setRelativeMouseMode(bool enabled);
++    bool relativeMouseModeWanted() const;
++
++    // Consumes (returns, then resets to {0,0}) the mouse motion accumulated
++    // from every SDL_EVENT_MOUSE_MOTION event (targeting THIS window --
++    // same cross-window isolation as the Task 17 window-state events)
++    // drained by pumpEvents() since the last call to this method -- never
++    // leaks across frames (gate matrix row 2's consume-and-reset
++    // algorithm: `accumX += event.motion.xrel` etc. inside pumpEvents()'s
++    // existing full-drain loop; correctness rests on that loop draining the
++    // queue completely before this is ever called, already true today).
++    // While this window has been focus-lost and not yet focus-regained (see
++    // setRelativeMouseMode()'s comment above), motion events are still
++    // drained from the queue but NOT accumulated -- this call still resets
++    // the accumulator to {0,0} regardless.
++    // Thread-affinity (D5, Phase 4): main-thread-only -- see docs/threading.md.
++    MouseDelta consumeMouseDelta();
++
++    // ---- Cursor visibility / confinement [Phase 4 Task 20, gate ruling
++    // #14, matrix row 3] ---------------------------------------------------
++    // setCursorVisible wraps SDL_ShowCursor()/SDL_HideCursor() -- process-
++    // global, not per-window (SDL3's own scoping, not a limitation this
++    // class introduces). setCursorConfined wraps SDL_SetWindowMouseGrab --
++    // confines the OS cursor to this window WITHOUT altering visibility or
++    // motion semantics; a DISTINCT primitive from relative mode above (per
++    // SDL_video.h's own doc: "this does NOT grab the cursor" is
++    // SDL_SetWindowMouseRect's caveat, but SDL_SetWindowMouseGrab genuinely
++    // does grab/confine without touching cursor visibility or capture-mode
++    // motion reporting). Both return SDL's own success/failure (logged on
++    // failure).
++    // Thread-affinity (D5, Phase 4): main-thread-only -- see docs/threading.md.
++    bool setCursorVisible(bool visible);
++    bool cursorVisible() const;
++    bool setCursorConfined(bool confined);
++    bool cursorConfined() const;
++
++    // ---- Gamepad [Phase 4 Task 20, gate ruling #14, matrix rows 4-9]
++    // ----------------------------------------------------------------------
++    // Hot-plug lifecycle is owned entirely by pumpEvents(): on
++    // SDL_EVENT_GAMEPAD_ADDED, SDL_OpenGamepad() then insert into an
++    // internal SDL_JoystickID-keyed map; on SDL_EVENT_GAMEPAD_REMOVED,
++    // SDL_CloseGamepad() THEN erase, synchronously, in the same event-
++    // handling step (never deferred to a later frame -- a stale handle
++    // outliving its REMOVED event is exactly the hazard gate matrix row 4
++    // documents). poll() reads a single "active" gamepad, selected as the
++    // LOWEST currently-connected SDL_JoystickID among every tracked device
++    // (gate matrix row 9's single-active rule) -- deterministic, and the
++    // active pad only changes when it itself disconnects. Every stick/
++    // trigger field in the returned GamepadState has ALREADY had
++    // applyStickDeadzone()/applyTriggerDeadzone() (input.h) applied --
++    // never raw SDL axis values. GamepadState{connected=false} (every other
++    // field zeroed) when no gamepad is attached at all.
++    // Thread-affinity (D5, Phase 4): main-thread-only -- see docs/threading.md.
++    GamepadState poll() const;
++
++    // ---- Keyboard [Phase 4 Task 20, gate ruling #14, NEW SCOPE] ----------
++    // Minimal keyboard surface over SDL_GetKeyboardState() -- added this
++    // task specifically because sample 09's WASD fly-through camera needs
++    // it (gate ruling: its absence from the entire Phase 4 planning
++    // universe up to this point was an oversight, now closed). Bounds-
++    // checked against SDL_GetKeyboardState()'s own reported array length --
++    // an out-of-range SDL_Scancode value returns false rather than reading
++    // out of bounds.
++    // Thread-affinity (D5, Phase 4): main-thread-only -- see docs/threading.md.
++    bool isKeyDown(SDL_Scancode key) const;
++
+     // ---- Window-event-observed state [Phase 4 Task 17, FG7, gate ruling
+     // #25] -- OPTIMIZATION/LOGGING SIGNAL ONLY. Read this comment before
+     // using either accessor below: the AUTHORITATIVE suspended-present
+     // decision is rx::rhi::Device::recreateSwapchain()'s own
+     // extent-query-driven guard (device.h), never these two -- per the
+     // design correction recorded in gate/rulings-2026-08-18.md #25 (matrix
+     // conflict 1). On Wayland, SDL3 does not fire
+     // SDL_EVENT_WINDOW_MINIMIZED/RESTORED on a real, compositor-driven
+     // minimize AT ALL -- verified directly against SDL issue
+     // github.com/libsdl-org/SDL/issues/13473 and
+@@ -92,20 +202,45 @@ public:
+     VkSurfaceKHR createVulkanSurface(VkInstance instance) const;
+ 
+ private:
+     explicit Window(SDL_Window* window) : window_(window) {}
+     SDL_Window* window_ = nullptr;
+ 
+     // [Phase 4 Task 17, FG7] See minimizedEventObserved()/
+     // lastPixelSizeEvent()'s own comments above.
+     bool minimizedEventObserved_ = false;
+     VkExtent2D lastPixelSizeEvent_{0, 0};
++
++    // [Phase 4 Task 20, gate ruling #14] See setRelativeMouseMode()/
++    // consumeMouseDelta()'s own comments above. relativeModeWanted_ is the
++    // APP's own last-requested intent (never a live SDL query);
++    // focusLost_ gates mouse-delta accumulation while true.
++    bool relativeModeWanted_ = false;
++    bool focusLost_ = false;
++    float accumMouseDeltaX_ = 0.0f;
++    float accumMouseDeltaY_ = 0.0f;
++
++    // [Phase 4 Task 20, gate ruling #14, matrix row 4] Owned handle table,
++    // keyed by SDL_JoystickID -- see poll()'s own comment above for the
++    // open-on-ADDED/close-then-erase-on-REMOVED lifecycle pumpEvents()
++    // maintains. Every SDL_Gamepad* here was returned by a successful
++    // SDL_OpenGamepad() and is closed exactly once, either by
++    // pumpEvents()'s own REMOVED handling or by closeAllGamepads() below
++    // (move/destroy paths).
++    std::unordered_map<SDL_JoystickID, SDL_Gamepad*> gamepads_;
++
++    // SDL_CloseGamepad() on every entry still in gamepads_, then clears the
++    // map -- shared by the destructor and move-assignment's "destroy what
++    // this object currently owns before taking over `other`'s state" step
++    // (mirrors the existing `if (window_) SDL_DestroyWindow(window_);`
++    // pattern immediately below move-assignment's own call site).
++    void closeAllGamepads();
+ };
+ 
+ // [Phase 4 Task 17, FG7, gate ruling #25 row 3] One-shot (per PROCESS, not
+ // per Window), diagnosable-not-silent acknowledgment of a real platform
+ // gap: on Wayland, this engine has NO reliable way to detect a real,
+ // compositor-driven window minimize -- not via SDL_EVENT_WINDOW_MINIMIZED/
+ // RESTORED (verified: they only fire for SDL_MinimizeWindow()'s OWN calls
+ // there, never a real window-manager-driven minimize -- SDL issue #13473),
+ // not via SDL_GetWindowFlags()'s MINIMIZED bit (same root cause, same
+ // verified source), and not via the Vulkan surface's own currentExtent
+diff --git a/src/rx_platform/src/input.cpp b/src/rx_platform/src/input.cpp
+new file mode 100644
+index 0000000..e8f7cc4
+--- /dev/null
++++ b/src/rx_platform/src/input.cpp
+@@ -0,0 +1,43 @@
++#include <rx_platform/input.h>
++
++#include <algorithm>
++#include <cmath>
++
++namespace rx::platform {
++
++Vec2f applyStickDeadzone(float rawX, float rawY, float deadzone) {
++    const float rawMagnitude = std::sqrt(rawX * rawX + rawY * rawY);
++    // Guards the division below regardless of `deadzone`'s value (a
++    // caller-supplied 0.0f deadzone must still not divide by zero for a
++    // genuinely centered stick) -- functionally a no-op for any positive
++    // deadzone, since mag < deadzone already returns {0,0} first below.
++    if (rawMagnitude <= 0.0f) {
++        return {0.0f, 0.0f};
++    }
++
++    const float mag = rawMagnitude / 32768.0f;
++    if (mag < deadzone) {
++        return {0.0f, 0.0f};
++    }
++
++    // Rescale so the OUTPUT magnitude sweeps [0,1] linearly across
++    // [deadzone, 1] of the input's own magnitude range -- never a bare
++    // pass-through past the threshold (that would jump discontinuously
++    // from 0 to `mag` right at the boundary). Clamped to 1: a diagonal
++    // raw input can exceed the nominal 32768 unit-circle magnitude (e.g.
++    // (32767,32767)'s magnitude is ~1.414), which must not produce an
++    // output magnitude above 1.
++    float scaledMag = (mag - deadzone) / (1.0f - deadzone);
++    scaledMag = std::min(scaledMag, 1.0f);
++
++    const float invRawMagnitude = 1.0f / rawMagnitude;
++    return Vec2f{rawX * invRawMagnitude * scaledMag, rawY * invRawMagnitude * scaledMag};
++}
++
++float applyTriggerDeadzone(float raw, float deadzone) {
++    const float t = raw / 32767.0f;
++    const float scaled = std::max(t - deadzone, 0.0f) / (1.0f - deadzone);
++    return std::clamp(scaled, 0.0f, 1.0f);
++}
++
++}  // namespace rx::platform
+diff --git a/src/rx_platform/src/window.cpp b/src/rx_platform/src/window.cpp
+index 2a5b6d6..5c8516a 100644
+--- a/src/rx_platform/src/window.cpp
++++ b/src/rx_platform/src/window.cpp
+@@ -1,19 +1,22 @@
+ #include <rx_platform/window.h>
++#include <rx_core/debug_checks.h>
+ #include <rx_core/log.h>
+ // SDL3/SDL.h does not pull in the Vulkan-interop declarations
+ // (SDL_Vulkan_GetInstanceExtensions, SDL_Vulkan_CreateSurface); SDL3 keeps
+ // those in their own header.
+ #include <SDL3/SDL_vulkan.h>
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <string_view>
++#include <utility>
+ 
+ namespace rx::platform {
+ 
+ void logWaylandMinimizeLimitationOnce(const char* platformName) {
+     // See this function's own header comment (window.h) for the full
+     // rationale. Only a "Wayland" match ever flips this -- an X11/Windows
+     // call never consumes the one-shot budget, so a later genuine Wayland
+     // call (regardless of how many non-Wayland calls preceded it, e.g. in
+     // a multi-platform test binary) still logs exactly once.
+     static std::atomic<bool> alreadyLogged{false};
+@@ -36,20 +39,53 @@ void logWaylandMinimizeLimitationOnce(const char* platformName) {
+     }
+ }
+ 
+ std::optional<Window> Window::create(const char* title, int width, int height, bool visible) {
+     if (!SDL_WasInit(SDL_INIT_VIDEO)) {
+         if (!SDL_Init(SDL_INIT_VIDEO)) {
+             RX_LOG_WARN("SDL_Init(SDL_INIT_VIDEO) failed: {}", SDL_GetError());
+             return std::nullopt;
+         }
+     }
++    // [Phase 4 Task 20, gate ruling #14] SDL3's joystick/gamepad subsystem
++    // SILENTLY DROPS input state updates while the app is "in the
++    // background" (no window has OS input focus) -- SDL_hints.h's own doc
++    // for this hint: default "0" = "Disable joystick & gamecontroller
++    // input events when the application is in the background." This is
++    // NOT a corner case for this engine: (a) every headless/CI test
++    // window in this codebase is created hidden (never focused) --
++    // reproduced directly this task: a real SDL_Joystick's virtual-button
++    // state changes were invisible through SDL_GetJoystickButton() with
++    // this hint at its default, and became visible immediately once set
++    // to "1", with the ONLY variable changed being this hint; (b) the
++    // ticket's own acceptance bar is Steam Deck drivability, where
++    // Gamescope/Steam's overlay routinely steals focus from a running
++    // game -- shipping this at SDL's default would make gamepad input go
++    // silently dead on exactly that platform. Set unconditionally, before
++    // SDL_INIT_GAMEPAD comes up, so this class's gamepad surface behaves
++    // identically focused or not on every platform.
++    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
++
++    // SDL_INIT_GAMEPAD implies SDL_INIT_JOYSTICK (SDL_init.h's own doc) --
++    // one call brings up both subsystems poll()/pumpEvents()'s hot-plug
++    // handling need. Best-effort: logged, not fatal to Window::create() --
++    // a platform/driver without a joystick backend still gets a fully
++    // working window, just with poll() permanently reporting
++    // GamepadState{connected=false} (the same degrade-gracefully shape
++    // the rest of this class already uses for e.g. a video driver that
++    // reports no Vulkan surface extensions).
++    if (!SDL_WasInit(SDL_INIT_GAMEPAD)) {
++        if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
++            RX_LOG_WARN("SDL_InitSubSystem(SDL_INIT_GAMEPAD) failed: {} -- gamepad input will be unavailable",
++                        SDL_GetError());
++        }
++    }
+ 
+     // [Phase 4 Task 17, FG7, gate ruling #25 row 3] One-shot, process-wide
+     // -- see logWaylandMinimizeLimitationOnce()'s own comment (window.h).
+     // SDL_GetPlatform() is valid to call once SDL_INIT_VIDEO has succeeded
+     // above (it is documented safe to call before SDL_Init() too, but this
+     // keeps the call site right where video is known to be up).
+     logWaylandMinimizeLimitationOnce(SDL_GetPlatform());
+ 
+     SDL_WindowFlags flags = SDL_WINDOW_VULKAN;
+     if (!visible) {
+@@ -60,57 +96,96 @@ std::optional<Window> Window::create(const char* title, int width, int height, b
+     if (!window) {
+         RX_LOG_WARN("SDL_CreateWindow failed: {}", SDL_GetError());
+         return std::nullopt;
+     }
+     return Window(window);
+ }
+ 
+ Window::Window(Window&& other) noexcept
+     : window_(other.window_),
+       minimizedEventObserved_(other.minimizedEventObserved_),
+-      lastPixelSizeEvent_(other.lastPixelSizeEvent_) {
++      lastPixelSizeEvent_(other.lastPixelSizeEvent_),
++      relativeModeWanted_(other.relativeModeWanted_),
++      focusLost_(other.focusLost_),
++      accumMouseDeltaX_(other.accumMouseDeltaX_),
++      accumMouseDeltaY_(other.accumMouseDeltaY_),
++      gamepads_(std::move(other.gamepads_)) {
+     other.window_ = nullptr;
+     other.minimizedEventObserved_ = false;
+     other.lastPixelSizeEvent_ = VkExtent2D{0, 0};
++    other.relativeModeWanted_ = false;
++    other.focusLost_ = false;
++    other.accumMouseDeltaX_ = 0.0f;
++    other.accumMouseDeltaY_ = 0.0f;
++    // gamepads_ ownership moved out via std::move above -- other.gamepads_
++    // is left in its moved-from (empty, per std::unordered_map's own
++    // guarantee) state, so other's eventual destructor closes nothing this
++    // Window now owns.
+ }
+ 
+ Window& Window::operator=(Window&& other) noexcept {
+     if (this != &other) {
+         if (window_) {
+             SDL_DestroyWindow(window_);
+         }
++        closeAllGamepads();
+         window_ = other.window_;
+         minimizedEventObserved_ = other.minimizedEventObserved_;
+         lastPixelSizeEvent_ = other.lastPixelSizeEvent_;
++        relativeModeWanted_ = other.relativeModeWanted_;
++        focusLost_ = other.focusLost_;
++        accumMouseDeltaX_ = other.accumMouseDeltaX_;
++        accumMouseDeltaY_ = other.accumMouseDeltaY_;
++        gamepads_ = std::move(other.gamepads_);
+         other.window_ = nullptr;
+         other.minimizedEventObserved_ = false;
+         other.lastPixelSizeEvent_ = VkExtent2D{0, 0};
++        other.relativeModeWanted_ = false;
++        other.focusLost_ = false;
++        other.accumMouseDeltaX_ = 0.0f;
++        other.accumMouseDeltaY_ = 0.0f;
++        // other.gamepads_ already emptied by std::move above.
+     }
+     return *this;
+ }
+ 
+ Window::~Window() {
++    closeAllGamepads();
+     if (window_) {
+         SDL_DestroyWindow(window_);
+     }
+ }
+ 
++void Window::closeAllGamepads() {
++    for (auto& [id, gamepad] : gamepads_) {
++        (void)id;
++        SDL_CloseGamepad(gamepad);
++    }
++    gamepads_.clear();
++}
++
+ void Window::pumpEvents() {
++    RX_ASSERT_MAIN_THREAD("Window::pumpEvents");
++
+     // [Phase 4 Task 17, FG7, gate ruling #25] Filtered to THIS window's own
+     // SDL_WindowID -- an event for a different window (only possible if the
+     // embedding process opened more than one) is still drained from SDL's
+     // process-wide queue (SDL_PollEvent always pops the front of that
+     // single queue, regardless of which window it targets) but never
+     // touches this Window's own observed state. The `event.window.windowID`
+     // read only ever happens INSIDE a case already known (by `event.type`)
+     // to be one of SDL_WindowEvent's own variants, never against an
+-    // arbitrary/unrelated event's union member.
++    // arbitrary/unrelated event's union member. [Phase 4 Task 20] The same
++    // isolation now applies to SDL_EVENT_MOUSE_MOTION's own `windowID`
++    // field. Gamepad device events carry no windowID at all (gamepads are
++    // process-global, not per-window) so GAMEPAD_ADDED/REMOVED are handled
++    // unconditionally.
+     const SDL_WindowID thisWindowId = SDL_GetWindowID(window_);
+ 
+     SDL_Event event;
+     while (SDL_PollEvent(&event)) {
+         // Size is read ONLY from SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED's
+         // data1/data2 -- the one window event whose payload SDL3's own
+         // SDL_events.h header comment documents AS a size (gate
+         // matrix-issue25 row 1). SDL_EVENT_WINDOW_MINIMIZED/RESTORED carry
+         // no size payload at all and must never be treated as one -- see
+         // window_test.cpp's device-free test asserting exactly this.
+@@ -124,26 +199,207 @@ void Window::pumpEvents() {
+                 if (event.window.windowID == thisWindowId) {
+                     minimizedEventObserved_ = false;
+                 }
+                 break;
+             case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+                 if (event.window.windowID == thisWindowId) {
+                     lastPixelSizeEvent_.width = static_cast<uint32_t>(event.window.data1);
+                     lastPixelSizeEvent_.height = static_cast<uint32_t>(event.window.data2);
+                 }
+                 break;
++
++            // [Phase 4 Task 20, gate ruling #14, matrix row 1] Pauses
++            // mouse-delta accumulation without assuming anything about
++            // what SDL/the OS did to relative-mode capture on its own --
++            // see setRelativeMouseMode()'s header comment.
++            case SDL_EVENT_WINDOW_FOCUS_LOST:
++                if (event.window.windowID == thisWindowId) {
++                    focusLost_ = true;
++                }
++                break;
++
++            // Unconditional re-arm: if the app still wants relative mode,
++            // ask SDL for it again regardless of whether SDL silently
++            // cleared it on its own during the just-ended focus loss --
++            // idempotent and safe either way (gate matrix row 1).
++            case SDL_EVENT_WINDOW_FOCUS_GAINED:
++                if (event.window.windowID == thisWindowId) {
++                    focusLost_ = false;
++                    if (relativeModeWanted_) {
++                        if (!SDL_SetWindowRelativeMouseMode(window_, true)) {
++                            RX_LOG_WARN("SDL_SetWindowRelativeMouseMode(true) re-arm on focus-gain failed: {}",
++                                        SDL_GetError());
++                        }
++                    }
++                }
++                break;
++
++            // [Phase 4 Task 20, gate ruling #14, matrix row 2] Raw
++            // per-event delta summation -- consumeMouseDelta() is the
++            // consume-and-reset read side. Never accumulated while
++            // focus-lost (see FOCUS_LOST/FOCUS_GAINED above) -- the event
++            // is still drained from the queue either way, just not summed.
++            case SDL_EVENT_MOUSE_MOTION:
++                if (event.motion.windowID == thisWindowId && !focusLost_) {
++                    accumMouseDeltaX_ += event.motion.xrel;
++                    accumMouseDeltaY_ += event.motion.yrel;
++                }
++                break;
++
++            // [Phase 4 Task 20, gate ruling #14, matrix row 4] Open-on-
++            // ADDED -- inserted into gamepads_ keyed by SDL_JoystickID.
++            // Also the gyro log-don't-drop probe (matrix row 8/10, SDL
++            // issue #9148): queried and logged once per gamepad-open, not
++            // consumed anywhere -- purely diagnosable-not-silent.
++            case SDL_EVENT_GAMEPAD_ADDED: {
++                const SDL_JoystickID id = event.gdevice.which;
++                SDL_Gamepad* gamepad = SDL_OpenGamepad(id);
++                if (gamepad == nullptr) {
++                    RX_LOG_WARN("SDL_OpenGamepad({}) failed: {}", id, SDL_GetError());
++                    break;
++                }
++                gamepads_[id] = gamepad;
++                const char* name = SDL_GetGamepadName(gamepad);
++                const bool hasGyro = SDL_GamepadHasSensor(gamepad, SDL_SENSOR_GYRO);
++                RX_LOG_INFO(
++                    "rx_platform: gamepad connected id={} name=\"{}\" hasGyroSensor={} [Phase 4 Task 20, gate "
++                    "ruling #14 -- gyro is log-don't-drop this phase, SDL issue #9148: undetectable on Steam Deck "
++                    "at this project's pinned SDL3 version]",
++                    id, name != nullptr ? name : "<unknown>", hasGyro);
++                break;
++            }
++
++            // Close-then-erase, synchronously, in this same event-handling
++            // step -- never deferred (gate matrix row 4's own hazard
++            // note: a stale handle outliving its REMOVED event risks a
++            // future SDL_JoystickID reuse colliding with it).
++            case SDL_EVENT_GAMEPAD_REMOVED: {
++                const SDL_JoystickID id = event.gdevice.which;
++                auto it = gamepads_.find(id);
++                if (it != gamepads_.end()) {
++                    SDL_CloseGamepad(it->second);
++                    gamepads_.erase(it);
++                }
++                break;
++            }
++
+             default:
+                 break;
+         }
+     }
+ }
+ 
++bool Window::setRelativeMouseMode(bool enabled) {
++    RX_ASSERT_MAIN_THREAD("Window::setRelativeMouseMode");
++    // Tracked regardless of the SDL call's own success -- see this
++    // method's header comment: pumpEvents()'s FOCUS_GAINED handling needs
++    // to know what the app WANTS, independent of whether SDL granted the
++    // last request.
++    relativeModeWanted_ = enabled;
++    if (!SDL_SetWindowRelativeMouseMode(window_, enabled)) {
++        RX_LOG_WARN("SDL_SetWindowRelativeMouseMode({}) failed: {}", enabled, SDL_GetError());
++        return false;
++    }
++    return true;
++}
++
++bool Window::relativeMouseModeWanted() const {
++    RX_ASSERT_MAIN_THREAD("Window::relativeMouseModeWanted");
++    return relativeModeWanted_;
++}
++
++MouseDelta Window::consumeMouseDelta() {
++    RX_ASSERT_MAIN_THREAD("Window::consumeMouseDelta");
++    MouseDelta delta{accumMouseDeltaX_, accumMouseDeltaY_};
++    accumMouseDeltaX_ = 0.0f;
++    accumMouseDeltaY_ = 0.0f;
++    return delta;
++}
++
++bool Window::setCursorVisible(bool visible) {
++    RX_ASSERT_MAIN_THREAD("Window::setCursorVisible");
++    const bool ok = visible ? SDL_ShowCursor() : SDL_HideCursor();
++    if (!ok) {
++        RX_LOG_WARN("{}() failed: {}", visible ? "SDL_ShowCursor" : "SDL_HideCursor", SDL_GetError());
++    }
++    return ok;
++}
++
++bool Window::cursorVisible() const {
++    RX_ASSERT_MAIN_THREAD("Window::cursorVisible");
++    return SDL_CursorVisible();
++}
++
++bool Window::setCursorConfined(bool confined) {
++    RX_ASSERT_MAIN_THREAD("Window::setCursorConfined");
++    if (!SDL_SetWindowMouseGrab(window_, confined)) {
++        RX_LOG_WARN("SDL_SetWindowMouseGrab({}) failed: {}", confined, SDL_GetError());
++        return false;
++    }
++    return true;
++}
++
++bool Window::cursorConfined() const {
++    RX_ASSERT_MAIN_THREAD("Window::cursorConfined");
++    return SDL_GetWindowMouseGrab(window_);
++}
++
++GamepadState Window::poll() const {
++    RX_ASSERT_MAIN_THREAD("Window::poll");
++    GamepadState state{};
++    if (gamepads_.empty()) {
++        return state;
++    }
++
++    // [Phase 4 Task 20, gate ruling #14, matrix row 9] Single-active rule:
++    // the LOWEST currently-connected SDL_JoystickID -- deterministic, and
++    // re-selected only when that specific pad disconnects (gamepads_ is
++    // maintained exclusively by pumpEvents()'s ADDED/REMOVED handling, so
++    // a disconnected pad's key is already gone by the time poll() runs).
++    auto activeIt =
++        std::min_element(gamepads_.begin(), gamepads_.end(),
++                          [](const auto& a, const auto& b) { return a.first < b.first; });
++    SDL_Gamepad* gamepad = activeIt->second;
++
++    state.connected = true;
++    state.leftStick = applyStickDeadzone(SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFTX),
++                                          SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFTY));
++    state.rightStick = applyStickDeadzone(SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_RIGHTX),
++                                           SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_RIGHTY));
++    state.leftTrigger = applyTriggerDeadzone(SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
++    state.rightTrigger = applyTriggerDeadzone(SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
++
++    state.buttons.dpadUp = SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_DPAD_UP);
++    state.buttons.dpadDown = SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    state.buttons.dpadLeft = SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_DPAD_LEFT);
++    state.buttons.dpadRight = SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_DPAD_RIGHT);
++    state.buttons.south = SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_SOUTH);
++    state.buttons.east = SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_EAST);
++    state.buttons.west = SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_WEST);
++    state.buttons.north = SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_NORTH);
++    state.buttons.leftShoulder = SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER);
++    state.buttons.rightShoulder = SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER);
++    state.buttons.start = SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_START);
++
++    return state;
++}
++
++bool Window::isKeyDown(SDL_Scancode key) const {
++    RX_ASSERT_MAIN_THREAD("Window::isKeyDown");
++    int numKeys = 0;
++    const bool* state = SDL_GetKeyboardState(&numKeys);
++    if (state == nullptr || key < 0 || key >= numKeys) {
++        return false;
++    }
++    return state[key];
++}
++
+ bool Window::setFullscreen(bool fullscreen) {
+     if (!SDL_SetWindowFullscreen(window_, fullscreen)) {
+         RX_LOG_WARN("SDL_SetWindowFullscreen({}) failed: {}", fullscreen, SDL_GetError());
+         return false;
+     }
+     // See this method's own header comment (window.h): the request is
+     // documented asynchronous on some platforms -- sync before returning so
+     // a caller's immediate readback (flags, size, or a swapchain
+     // recreation) sees the already-settled state.
+     if (!SDL_SyncWindow(window_)) {
+diff --git a/src/rx_platform/tests/window_test.cpp b/src/rx_platform/tests/window_test.cpp
+index 2bf2eff..52c679b 100644
+--- a/src/rx_platform/tests/window_test.cpp
++++ b/src/rx_platform/tests/window_test.cpp
+@@ -1,25 +1,30 @@
+ // This is the only test translation unit in rx_platform_tests (unlike
+ // rx_core_tests, which shares a separate tests/doctest_main.cpp across
+ // several test files), so it both implements doctest's runtime and
+ // provides main() directly.
+ #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+ #include <doctest/doctest.h>
+-#include <rx_platform/window.h>
++#include <rx_core/debug_checks.h>
+ #include <rx_core/log.h>
+ #include <rx_core/log_forward_sink.h>
++#include <rx_platform/window.h>
+ #include <SDL3/SDL.h>
+ 
++#include <atomic>
+ #include <chrono>
++#include <cmath>
++#include <initializer_list>
+ #include <mutex>
+ #include <string>
+ #include <thread>
++#include <vector>
+ 
+ namespace {
+ 
+ // A real desktop's window manager (this repo's own dev machine, not just
+ // CI's bare Xvfb) delivers genuine SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED
+ // events for a just-created window ASYNCHRONOUSLY -- with real, observed
+ // latency across more than one pumpEvents() call, not necessarily all
+ // present by the very first drain (reproduced directly during this task's
+ // own development: a single upfront pumpEvents() call was not sufficient
+ // to observe a stable baseline). Repolls until two consecutive drains
+@@ -33,20 +38,168 @@ VkExtent2D drainUntilQuiescent(rx::platform::Window& window) {
+         window.pumpEvents();
+         VkExtent2D current = window.lastPixelSizeEvent();
+         if (current.width == previous.width && current.height == previous.height) {
+             return current;
+         }
+         previous = current;
+     }
+     return previous;
+ }
+ 
++// [Phase 4 Task 20, gate ruling #14] Attaches a fully-populated virtual
++// gamepad and owns its lifecycle. axis_mask/button_mask use the
++// SDL_GamepadAxis/SDL_GamepadButton enum values directly as bit indices
++// (SDL_joystick.h's own doc comment); this task additionally confirmed
++// EMPIRICALLY (the gate-mandated smoke check, see task-20-report.md) that
++// a virtual joystick's raw axis/button INDEX equals the corresponding
++// SDL_GamepadAxis/SDL_GamepadButton enum value for a device declared
++// SDL_JOYSTICK_TYPE_GAMEPAD -- not just assumed from the doc comment.
++// setAxis()/setButton() both call the real SDL_PumpEvents() themselves:
++// SDL_SetJoystickVirtualAxis()'s own doc states values are "not applied
++// until the next call to SDL_UpdateJoysticks" (which SDL_PumpEvents calls
++// internally) -- a real, non-obvious gotcha this task's smoke check
++// found. Calling raw SDL_PumpEvents() here is safe with respect to a
++// caller's own Window::pumpEvents() sequencing: SDL_PumpEvents() only
++// GATHERS new events into the queue, it never DEQUEUES anything (that is
++// SDL_PollEvent's job, which only Window::pumpEvents() calls) -- so it
++// cannot cause a GAMEPAD_ADDED/REMOVED event sitting in the queue to be
++// lost out from under a Window that hasn't drained it yet.
++struct VirtualGamepad {
++    SDL_JoystickID id = 0;
++    SDL_Joystick* joystick = nullptr;
++
++    explicit VirtualGamepad(const char* name = "rx_platform_test_pad") {
++        // [Fix round, found during this task's own smoke checking] SDL3's
++        // gamepad-mapping cache keys its NAME lookup by (VID, PID, ...),
++        // not by SDL_VirtualJoystickDesc.name alone -- every VirtualGamepad
++        // in this file left vendor_id/product_id at their SDL_INIT_INTERFACE
++        // zero default, so a SECOND virtual pad attached in the same
++        // process reused the FIRST one's cached mapping-string name via
++        // SDL_GetGamepadName(), silently ignoring its own `name` field
++        // (reproduced directly: every gamepad test after the first in a
++        // full-suite run logged the FIRST test's pad name, never its own).
++        // A per-instance unique product_id keeps each attached pad's own
++        // mapping-cache entry (and therefore its own name) distinct. This
++        // is purely a virtual-joystick TEST artifact of sharing one
++        // process across many attach/detach cycles -- production callers
++        // read SDL_GetGamepadName() against real hardware, which always
++        // has genuine distinct VID/PID values.
++        static std::atomic<Uint16> nextProductId{1};
++        SDL_VirtualJoystickDesc desc;
++        SDL_INIT_INTERFACE(&desc);
++        desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
++        desc.vendor_id = 0x0001;
++        desc.product_id = nextProductId.fetch_add(1, std::memory_order_relaxed);
++        desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
++        desc.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
++        desc.axis_mask = (1u << SDL_GAMEPAD_AXIS_COUNT) - 1u;
++        desc.button_mask = (1u << SDL_GAMEPAD_BUTTON_COUNT) - 1u;
++        desc.name = name;
++        id = SDL_AttachVirtualJoystick(&desc);
++        if (id != 0) {
++            joystick = SDL_OpenJoystick(id);
++        }
++    }
++    VirtualGamepad(const VirtualGamepad&) = delete;
++    VirtualGamepad& operator=(const VirtualGamepad&) = delete;
++    ~VirtualGamepad() { reset(); }
++
++    // Detaches early (on demand, e.g. to test a specific device
++    // disconnecting mid-test) -- idempotent, so the destructor's own call
++    // is always safe even after an explicit reset() already ran.
++    void reset() {
++        if (joystick != nullptr) {
++            SDL_CloseJoystick(joystick);
++            joystick = nullptr;
++        }
++        if (id != 0) {
++            SDL_DetachVirtualJoystick(id);
++            id = 0;
++        }
++    }
++
++    void setAxis(SDL_GamepadAxis axis, Sint16 value) const {
++        REQUIRE(SDL_SetJoystickVirtualAxis(joystick, static_cast<int>(axis), value));
++        SDL_PumpEvents();
++    }
++    void setButton(SDL_GamepadButton button, bool down) const {
++        REQUIRE(SDL_SetJoystickVirtualButton(joystick, static_cast<int>(button), down));
++        SDL_PumpEvents();
++    }
++};
++
++// [Phase 4 Task 20] Some environments -- this project's own dev machine
++// included, discovered empirically during this task -- have a REAL
++// gamepad already connected before any test runs (this dev machine has a
++// physically-plugged-in USB "Generic X-Box pad", confirmed via
++// /proc/bus/input/devices -- not a test artifact). CI's own bare runner
++// is not expected to have one, but these tests are written to be CORRECT
++// regardless of that, never assuming a clean gamepad environment --
++// mirrors this file's own existing "delta-based, not absolute-baseline"
++// WM/driver-conditional convention (see e.g. the borderless-fullscreen
++// and cursor-confine tests). Window::poll()'s single-active rule (gate
++// matrix row 9) selects the LOWEST connected SDL_JoystickID process-wide
++// -- a real device discovered before this test's own virtual pad(s)
++// ALWAYS has a lower ID (SDL's instance-ID counter is monotonic and never
++// reused within a process), so it would win selection every time,
++// starving this test's own driven values out of poll()'s output entirely.
++// Returns every SDL_JoystickID SDL_GetGamepads() currently reports that
++// is NOT one of `mine`.
++std::vector<SDL_JoystickID> foreignGamepadIds(std::initializer_list<SDL_JoystickID> mine) {
++    int count = 0;
++    SDL_JoystickID* ids = SDL_GetGamepads(&count);
++    std::vector<SDL_JoystickID> foreign;
++    for (int i = 0; i < count; ++i) {
++        bool isMine = false;
++        for (SDL_JoystickID m : mine) {
++            if (ids[i] == m) {
++                isMine = true;
++                break;
++            }
++        }
++        if (!isMine) {
++            foreign.push_back(ids[i]);
++        }
++    }
++    SDL_free(ids);
++    return foreign;
++}
++
++// [gate ruling #25 row 3 / Phase 4 Task 20] Shared LogForwardSink capture
++// helper -- used by both logWaylandMinimizeLimitationOnce's own test
++// (Task 17) and the gamepad gyro log-don't-drop test (Task 20) below.
++// `allMessages` (not just `lastMessage`) exists specifically because the
++// gyro test can race a real foreign gamepad's OWN "gamepad connected" log
++// line (see foreignGamepadIds()'s own comment) -- searching the full
++// accumulated capture is robust to interleaving order; `lastMessage` is
++// kept for the Wayland test's own single-expected-call usage.
++struct CapturedLog {
++    std::mutex mutex;
++    int callCount = 0;
++    std::string lastMessage;
++    std::string allMessages;
++};
++
++void captureLogCallback(int32_t /*severity*/, const char* /*category*/, const char* message, void* userData) {
++    auto* captured = static_cast<CapturedLog*>(userData);
++    std::lock_guard<std::mutex> lock(captured->mutex);
++    captured->callCount++;
++    captured->lastMessage = message != nullptr ? message : "";
++    captured->allMessages += captured->lastMessage;
++    captured->allMessages += '\n';
++}
++
++struct ForwardCallbackGuard {
++    std::shared_ptr<rx::core::log::LogForwardSink> sink;
++    ~ForwardCallbackGuard() { (void)sink->set(nullptr, nullptr); }
++};
++
+ }  // namespace
+ 
+ TEST_CASE("Window::create/destroy lifecycle succeeds under any video driver") {
+     auto window = rx::platform::Window::create("rx_platform_test", 64, 64, /*visible=*/false);
+     REQUIRE(window.has_value());
+     CHECK(window->sdlWindow() != nullptr);
+     window->pumpEvents();
+ }
+ 
+ TEST_CASE("Window reports Vulkan instance extensions when a real display backend is present") {
+@@ -56,20 +209,278 @@ TEST_CASE("Window reports Vulkan instance extensions when a real display backend
+         return;
+     }
+     auto extensions = window->requiredVulkanInstanceExtensions();
+     if (extensions.empty()) {
+         MESSAGE("video driver reports no Vulkan surface extensions (e.g. dummy driver), skipping");
+         return;
+     }
+     CHECK(extensions.size() > 0);
+ }
+ 
++// ===== Deadzone math [Phase 4 Task 20, gate ruling #14, matrix rows 5/6]
++// =========================================================================
++// Pure math, zero SDL dependency at all (rx_platform/input.h has no SDL
++// include) -- device-free by construction, not merely "runs under a dummy
++// driver."
++TEST_CASE("applyStickDeadzone(): below-threshold on-axis point is exactly zero") {
++    // 4000 raw on one axis alone: mag = 4000/32768 ~= 0.1221, well under
++    // the default deadzone ratio (8000/32768 ~= 0.2441).
++    auto result = rx::platform::applyStickDeadzone(4000.0f, 0.0f);
++    CHECK(result.x == doctest::Approx(0.0f));
++    CHECK(result.y == doctest::Approx(0.0f));
++}
++
++TEST_CASE("applyStickDeadzone(): centered stick (0,0) is exactly zero -- no NaN/div-by-zero") {
++    auto result = rx::platform::applyStickDeadzone(0.0f, 0.0f);
++    CHECK(result.x == 0.0f);
++    CHECK(result.y == 0.0f);
++}
++
++TEST_CASE("applyStickDeadzone(): diagonal-snap discrimination -- a point whose PER-AXIS values are both below "
++          "the naive 8000 per-axis threshold, but whose COMBINED radial magnitude exceeds the deadzone radius, "
++          "is non-zero under the correct radial formula -- proving a naive independent-per-axis-clamp check "
++          "(which would zero BOTH axes here) is wrong") {
++    // (6000, 6000): magnitude = 6000*sqrt(2) ~= 8485.28, /32768 ~= 0.2589
++    // -- ABOVE the 0.2441 deadzone ratio, so the radial formula's output
++    // must be non-zero. A naive per-axis clamp ("if abs(axis) < 8000:
++    // axis = 0", applied independently per axis) would zero BOTH axes
++    // here (6000 < 8000 on each) -- the exact "snap to cardinal
++    // directions" anti-pattern the matrix's first-tier precedent
++    // (Sutphin, Microsoft XInput) names.
++    auto result = rx::platform::applyStickDeadzone(6000.0f, 6000.0f);
++    CHECK(result.x > 0.0f);
++    CHECK(result.y > 0.0f);
++    const bool naivePerAxisWouldZeroBoth = (std::fabs(6000.0f) < 8000.0f) && (std::fabs(6000.0f) < 8000.0f);
++    CHECK(naivePerAxisWouldZeroBoth);  // documents exactly what the (wrong) naive check would conclude here
++}
++
++TEST_CASE("applyStickDeadzone(): MANDATORY (8500,8500) discrimination case [gate hardening block] -- a naive "
++          "unscaled-per-axis-clamp implementation ALSO calls this point non-zero (8500 clears the naive 8000 "
++          "per-axis threshold on both axes), so a bare zero/non-zero test cannot tell the two implementations "
++          "apart; only the exact scaled OUTPUT VALUE can") {
++    // (8500, 8500): raw magnitude = 8500*sqrt(2) ~= 12020.815, mag ~=
++    // 0.36685. Correct scaled-radial formula: scaledMag =
++    // (0.36685 - 0.24414) / (1 - 0.24414) ~= 0.16235, direction
++    // (0.70711, 0.70711) -> output ~= (0.11480, 0.11480), output
++    // magnitude ~= 0.16235.
++    auto result = rx::platform::applyStickDeadzone(8500.0f, 8500.0f);
++    CHECK(result.x == doctest::Approx(0.11480f).epsilon(0.002));
++    CHECK(result.y == doctest::Approx(0.11480f).epsilon(0.002));
++    const float outputMagnitude = std::sqrt(result.x * result.x + result.y * result.y);
++    CHECK(outputMagnitude == doctest::Approx(0.16235f).epsilon(0.002));
++
++    // The naive-unscaled-per-axis-clamp comparator this case discriminates
++    // against, spelled out explicitly (never actually used by
++    // applyStickDeadzone() -- documents what a WRONG implementation would
++    // have produced at this exact point: raw/32768 per axis, unscaled,
++    // since neither axis individually trips the naive 8000 threshold).
++    const float naiveX = (std::fabs(8500.0f) < 8000.0f) ? 0.0f : 8500.0f / 32768.0f;
++    CHECK(naiveX == doctest::Approx(0.25940f).epsilon(0.002));
++    CHECK(result.x != doctest::Approx(naiveX).epsilon(0.02));  // NOT equivalent -- the whole point of this case
++}
++
++TEST_CASE("applyTriggerDeadzone(): below-threshold is exactly zero; max reports 1.0; a mid-range value rescales "
++          "linearly") {
++    CHECK(rx::platform::applyTriggerDeadzone(0.0f) == doctest::Approx(0.0f));
++    CHECK(rx::platform::applyTriggerDeadzone(500.0f) == doctest::Approx(0.0f));  // below default ~1000/32767
++    CHECK(rx::platform::applyTriggerDeadzone(32767.0f) == doctest::Approx(1.0f));
++    // raw=16000: t=16000/32767, deadzone=1000/32767 -> scaled =
++    // (16000-1000)/(32767-1000) = 15000/31767 ~= 0.47219.
++    CHECK(rx::platform::applyTriggerDeadzone(16000.0f) == doctest::Approx(0.47219f).epsilon(0.002));
++}
++
++// ===== Mouse: relative mode, delta accumulation, cursor [Phase 4 Task 20,
++// gate ruling #14, matrix rows 1-3] ========================================
++TEST_CASE("Window::consumeMouseDelta() sums xrel/yrel across N synthetic MOUSE_MOTION events (consume-and-reset, "
++          "gate matrix row 2)") {
++    auto window = rx::platform::Window::create("rx_platform_mouse_delta_test", 64, 64, /*visible=*/false);
++    REQUIRE(window.has_value());
++    const SDL_WindowID windowId = SDL_GetWindowID(window->sdlWindow());
++    REQUIRE(windowId != 0);
++    window->pumpEvents();               // drain any stray leftover events first.
++    (void)window->consumeMouseDelta();  // reset baseline to {0,0} regardless of what drained above.
++
++    struct Sample {
++        float xrel;
++        float yrel;
++    };
++    const Sample samples[] = {{1.5f, -2.25f}, {10.0f, 0.0f}, {-3.75f, 4.0f}};
++    float expectedX = 0.0f;
++    float expectedY = 0.0f;
++    for (const auto& s : samples) {
++        SDL_Event event{};
++        event.motion.type = SDL_EVENT_MOUSE_MOTION;
++        event.motion.windowID = windowId;
++        event.motion.xrel = s.xrel;
++        event.motion.yrel = s.yrel;
++        REQUIRE(SDL_PushEvent(&event));
++        expectedX += s.xrel;
++        expectedY += s.yrel;
++    }
++    window->pumpEvents();
++
++    auto delta = window->consumeMouseDelta();
++    CHECK(delta.x == doctest::Approx(expectedX));
++    CHECK(delta.y == doctest::Approx(expectedY));
++
++    // Consume-and-reset: a second call with no new events returns {0,0}.
++    auto second = window->consumeMouseDelta();
++    CHECK(second.x == 0.0f);
++    CHECK(second.y == 0.0f);
++}
++
++TEST_CASE("Window::consumeMouseDelta() ignores MOUSE_MOTION events targeting a different SDL_WindowID") {
++    auto window = rx::platform::Window::create("rx_platform_mouse_delta_isolation_test", 64, 64, false);
++    REQUIRE(window.has_value());
++    window->pumpEvents();
++    (void)window->consumeMouseDelta();
++
++    constexpr SDL_WindowID kBogusWindowId = 0xFFFFFFFEu;
++    SDL_Event event{};
++    event.motion.type = SDL_EVENT_MOUSE_MOTION;
++    event.motion.windowID = kBogusWindowId;
++    event.motion.xrel = 500.0f;
++    event.motion.yrel = 500.0f;
++    REQUIRE(SDL_PushEvent(&event));
++    window->pumpEvents();
++
++    auto delta = window->consumeMouseDelta();
++    CHECK(delta.x == 0.0f);
++    CHECK(delta.y == 0.0f);
++}
++
++TEST_CASE("Window::pumpEvents(): FOCUS_LOST pauses mouse-delta accumulation; FOCUS_GAINED resumes it and "
++          "unconditionally re-arms relative mode if the app still wants it [gate matrix row 1]") {
++    auto window = rx::platform::Window::create("rx_platform_focus_pause_test", 64, 64, false);
++    REQUIRE(window.has_value());
++    const SDL_WindowID windowId = SDL_GetWindowID(window->sdlWindow());
++    window->pumpEvents();
++    (void)window->consumeMouseDelta();
++
++    window->setRelativeMouseMode(true);  // best-effort; relativeModeWanted_ tracks true regardless of grant.
++    CHECK(window->relativeMouseModeWanted());
++
++    // Baseline: motion accumulates normally before any focus-loss.
++    SDL_Event motionBefore{};
++    motionBefore.motion.type = SDL_EVENT_MOUSE_MOTION;
++    motionBefore.motion.windowID = windowId;
++    motionBefore.motion.xrel = 5.0f;
++    motionBefore.motion.yrel = 5.0f;
++    REQUIRE(SDL_PushEvent(&motionBefore));
++    window->pumpEvents();
++    auto beforeDelta = window->consumeMouseDelta();
++    CHECK(beforeDelta.x == doctest::Approx(5.0f));
++    CHECK(beforeDelta.y == doctest::Approx(5.0f));
++
++    // FOCUS_LOST -> motion is drained but NOT accumulated.
++    SDL_Event focusLost{};
++    focusLost.window.type = SDL_EVENT_WINDOW_FOCUS_LOST;
++    focusLost.window.windowID = windowId;
++    REQUIRE(SDL_PushEvent(&focusLost));
++    window->pumpEvents();
++
++    SDL_Event motionDuring{};
++    motionDuring.motion.type = SDL_EVENT_MOUSE_MOTION;
++    motionDuring.motion.windowID = windowId;
++    motionDuring.motion.xrel = 100.0f;
++    motionDuring.motion.yrel = 100.0f;
++    REQUIRE(SDL_PushEvent(&motionDuring));
++    window->pumpEvents();
++    auto duringDelta = window->consumeMouseDelta();
++    CHECK(duringDelta.x == 0.0f);
++    CHECK(duringDelta.y == 0.0f);
++
++    // FOCUS_GAINED -> resumes; a later motion event accumulates again.
++    SDL_Event focusGained{};
++    focusGained.window.type = SDL_EVENT_WINDOW_FOCUS_GAINED;
++    focusGained.window.windowID = windowId;
++    REQUIRE(SDL_PushEvent(&focusGained));
++    window->pumpEvents();
++
++    SDL_Event motionAfter{};
++    motionAfter.motion.type = SDL_EVENT_MOUSE_MOTION;
++    motionAfter.motion.windowID = windowId;
++    motionAfter.motion.xrel = 7.0f;
++    motionAfter.motion.yrel = 7.0f;
++    REQUIRE(SDL_PushEvent(&motionAfter));
++    window->pumpEvents();
++    auto afterDelta = window->consumeMouseDelta();
++    CHECK(afterDelta.x == doctest::Approx(7.0f));
++    CHECK(afterDelta.y == doctest::Approx(7.0f));
++}
++
++TEST_CASE("Window::setRelativeMouseMode()/relativeMouseModeWanted() track APP intent independent of SDL's own "
++          "query; SDL_GetWindowRelativeMouseMode() round-trips where the driver actually grants it [gate matrix "
++          "row 1]") {
++    auto window = rx::platform::Window::create("rx_platform_relative_mode_test", 64, 64, false);
++    REQUIRE(window.has_value());
++    CHECK_FALSE(window->relativeMouseModeWanted());
++
++    const bool enabledOk = window->setRelativeMouseMode(true);
++    CHECK(window->relativeMouseModeWanted());  // app intent updates regardless of SDL's own success.
++    if (!enabledOk || !SDL_GetWindowRelativeMouseMode(window->sdlWindow())) {
++        MESSAGE(
++            "this video driver never actually granted relative mouse mode (e.g. CI's bare Xvfb, no window "
++            "manager) -- app-intent tracking (relativeMouseModeWanted()), the unconditional floor this test "
++            "already checked above, is still correct regardless; skipping the SDL-level round-trip assertion.");
++    } else {
++        CHECK(SDL_GetWindowRelativeMouseMode(window->sdlWindow()));
++    }
++
++    const bool disabledOk = window->setRelativeMouseMode(false);
++    CHECK_FALSE(window->relativeMouseModeWanted());
++    if (disabledOk) {
++        CHECK_FALSE(SDL_GetWindowRelativeMouseMode(window->sdlWindow()));
++    }
++}
++
++TEST_CASE("Window::setCursorVisible()/cursorVisible() round-trip through SDL_CursorVisible() [gate matrix row "
++          "3]") {
++    auto window = rx::platform::Window::create("rx_platform_cursor_visible_test", 64, 64, false);
++    REQUIRE(window.has_value());
++
++    REQUIRE(window->setCursorVisible(false));
++    CHECK_FALSE(window->cursorVisible());
++    CHECK_FALSE(SDL_CursorVisible());
++
++    REQUIRE(window->setCursorVisible(true));
++    CHECK(window->cursorVisible());
++    CHECK(SDL_CursorVisible());
++}
++
++TEST_CASE("Window::setCursorConfined()/cursorConfined() round-trip through SDL_GetWindowMouseGrab() [gate matrix "
++          "row 3]") {
++    auto window = rx::platform::Window::create("rx_platform_cursor_confined_test", 64, 64, false);
++    REQUIRE(window.has_value());
++    CHECK_FALSE(window->cursorConfined());
++
++    // Mirrors Task 17's own established "request succeeded but the driver
++    // never actually granted it" gating (window_state_test.cpp's
++    // fullscreen double-toggle fix round 1): SDL_SetWindowMouseGrab(true)
++    // can report success on CI's bare Xvfb (no window manager to reject
++    // the request against) while the grab is never actually applied --
++    // reproduced directly under xvfb-run during this task. Check the
++    // ACTUAL resulting state, not just the call's own return value.
++    const bool requestOk = window->setCursorConfined(true);
++    if (!requestOk || !window->cursorConfined()) {
++        MESSAGE(
++            "SDL_SetWindowMouseGrab(true) either failed outright or reported success without this "
++            "driver/window-manager actually granting the grab (e.g. CI's bare Xvfb) -- skipping the rest of "
++            "this check.");
++        return;
++    }
++    CHECK(SDL_GetWindowMouseGrab(window->sdlWindow()));
++
++    CHECK(window->setCursorConfined(false));
++    CHECK_FALSE(window->cursorConfined());
++}
++
+ // ===== Window-event-observed state [Phase 4 Task 17, FG7, gate ruling #25]
+ // =========================================================================
+ // Device-free, two-tier test design's TIER 1 (matrix row 6): SDL_PushEvent
+ // synthesizes a MINIMIZED/RESTORED/PIXEL_SIZE_CHANGED sequence that flows
+ // through Window::pumpEvents() exactly like a real one -- per SDL3's own
+ // SDL_PushEvent doc ("pushing device input events onto the queue doesn't
+ // modify the state of the device within SDL"), this exercises
+ // Window's OWN state machine built on top of these events in complete
+ // isolation, with no Vulkan/Device object anywhere in this file. The
+ // AUTHORITATIVE suspended-present guard (extent-query-driven) lives in
+@@ -161,44 +572,23 @@ TEST_CASE("Window::pumpEvents() ignores window events targeting a different SDL_
+     event.window.windowID = kBogusWindowId;
+     REQUIRE(SDL_PushEvent(&event));
+     window->pumpEvents();
+ 
+     CHECK_FALSE(window->minimizedEventObserved());
+ }
+ 
+ // ===== logWaylandMinimizeLimitationOnce [gate ruling #25 row 3] ===========
+ // Device-free: no live Wayland session needed. platformName is a caller-
+ // supplied parameter specifically so this is testable this way (see
+-// window.h's own comment) -- captures the forwarded log via the same
+-// LogForwardSink mechanism rx_core/tests/log_test.cpp already uses.
+-namespace {
+-
+-struct CapturedLog {
+-    std::mutex mutex;
+-    int callCount = 0;
+-    std::string lastMessage;
+-};
+-
+-void captureLogCallback(int32_t /*severity*/, const char* /*category*/, const char* message, void* userData) {
+-    auto* captured = static_cast<CapturedLog*>(userData);
+-    std::lock_guard<std::mutex> lock(captured->mutex);
+-    captured->callCount++;
+-    captured->lastMessage = message != nullptr ? message : "";
+-}
+-
+-struct ForwardCallbackGuard {
+-    std::shared_ptr<rx::core::log::LogForwardSink> sink;
+-    ~ForwardCallbackGuard() { (void)sink->set(nullptr, nullptr); }
+-};
+-
+-}  // namespace
+-
++// window.h's own comment) -- captures the forwarded log via the shared
++// LogForwardSink helper above (also used by Task 20's gyro log-don't-drop
++// test below).
+ TEST_CASE("logWaylandMinimizeLimitationOnce fires exactly once for a mocked \"Wayland\" platform name and never "
+           "for X11/Windows") {
+     rx::core::log::init();
+     auto sink = rx::core::log::forwardSink();
+     CapturedLog captured;
+     REQUIRE(sink->set(&captureLogCallback, &captured));
+     ForwardCallbackGuard guard{sink};
+ 
+     // Non-Wayland platform names never consume the one-shot budget and
+     // never log.
+@@ -247,10 +637,419 @@ TEST_CASE("Window::setFullscreen(true) enters borderless-desktop fullscreen (SDL
+     }
+     CHECK(window->isFullscreen());
+     // Borderless, not exclusive [gate ruling #25 row 4's own acceptance
+     // criterion]: setFullscreen() never calls SDL_SetWindowFullscreenMode(),
+     // so SDL3's own documented borderless-desktop signal is a nullptr mode.
+     CHECK(SDL_GetWindowFullscreenMode(window->sdlWindow()) == nullptr);
+ 
+     CHECK(window->setFullscreen(false));
+     CHECK_FALSE(window->isFullscreen());
+ }
++
++// ===== Gamepad [Phase 4 Task 20, gate ruling #14, matrix rows 4-10] =======
++// Every test below drives a REAL SDL_Gamepad through SDL_AttachVirtualJoystick
++// (VirtualGamepad helper, top of this file) -- CI-automatable per the gate
++// hardening block's TEST-COVERAGE CORRECTION (matrix Conflict #3),
++// confirmed working under this project's CI-representative headless driver
++// (xvfb-run -a) by this task's own smoke check (task-20-report.md). Tests
++// that need to read THIS test's own driven values back through
++// Window::poll() first check foreignGamepadIds() (top of file) and skip
++// with an honest MESSAGE if a real gamepad is already connected in this
++// environment -- see that helper's own comment for why (this dev machine
++// itself has one plugged in, discovered during this task).
++TEST_CASE("Window::poll(): hot-plug lifecycle -- GAMEPAD_ADDED opens+tracks, GAMEPAD_REMOVED closes+untracks, "
++          "synchronously via pumpEvents() [gate matrix row 4]") {
++    auto window = rx::platform::Window::create("rx_platform_gamepad_hotplug_test", 64, 64, false);
++    REQUIRE(window.has_value());
++    window->pumpEvents();
++
++    if (!foreignGamepadIds({}).empty()) {
++        MESSAGE(
++            "a real gamepad is already connected in this environment (see foreignGamepadIds()'s own comment) "
++            "-- Window::poll()'s single-active 'lowest ID' rule always selects it over this test's own virtual "
++            "pad, so the connected/disconnected TOGGLE this test wants to observe cannot be reproduced here. "
++            "The open-on-ADDED/close-then-erase-on-REMOVED mechanics are still exercised below unconditionally "
++            "and are independently proven correct by this task's own gate-mandated smoke check "
++            "(task-20-report.md).");
++        VirtualGamepad pad("rx_platform_hotplug_pad");
++        REQUIRE(pad.id != 0);
++        window->pumpEvents();
++        pad.reset();
++        window->pumpEvents();
++        return;
++    }
++
++    CHECK_FALSE(window->poll().connected);
++    {
++        VirtualGamepad pad("rx_platform_hotplug_pad");
++        REQUIRE(pad.id != 0);
++        window->pumpEvents();
++        CHECK(window->poll().connected);
++    }
++    window->pumpEvents();  // drains the REMOVED event pushed by ~VirtualGamepad() above.
++    CHECK_FALSE(window->poll().connected);
++}
++
++TEST_CASE("Window::poll(): rapid attach-detach-attach leaves no stale-handle/stale-value confusion [gate matrix "
++          "row 4]") {
++    auto window = rx::platform::Window::create("rx_platform_gamepad_rapid_test", 64, 64, false);
++    REQUIRE(window.has_value());
++    window->pumpEvents();
++
++    if (!foreignGamepadIds({}).empty()) {
++        MESSAGE(
++            "a real gamepad is already connected in this environment -- skipping (see foreignGamepadIds()'s "
++            "own comment); the hot-plug open/close mechanics this test would otherwise re-exercise are already "
++            "covered unconditionally by the hot-plug lifecycle test above.");
++        return;
++    }
++
++    CHECK_FALSE(window->poll().connected);
++
++    {
++        VirtualGamepad first("rx_platform_rapid_pad_1");
++        REQUIRE(first.id != 0);
++        window->pumpEvents();
++        first.setButton(SDL_GAMEPAD_BUTTON_SOUTH, true);
++        CHECK(window->poll().connected);
++        CHECK(window->poll().buttons.south);
++    }
++    window->pumpEvents();
++    CHECK_FALSE(window->poll().connected);
++
++    {
++        VirtualGamepad second("rx_platform_rapid_pad_2");
++        REQUIRE(second.id != 0);
++        window->pumpEvents();
++        // A freshly-attached device starts with south NOT pressed --
++        // proves this isn't reading a stale cached value left over from
++        // `first`'s handle/state.
++        CHECK(window->poll().connected);
++        CHECK_FALSE(window->poll().buttons.south);
++    }
++    window->pumpEvents();
++    CHECK_FALSE(window->poll().connected);
++}
++
++TEST_CASE("Window::poll(): single-active-gamepad rule selects the LOWEST connected SDL_JoystickID; disconnecting "
++          "it re-selects the next-lowest [gate matrix row 9]") {
++    auto window = rx::platform::Window::create("rx_platform_gamepad_active_test", 64, 64, false);
++    REQUIRE(window.has_value());
++    window->pumpEvents();
++
++    VirtualGamepad podA("rx_platform_active_pad_a");
++    REQUIRE(podA.id != 0);
++    window->pumpEvents();
++    VirtualGamepad podB("rx_platform_active_pad_b");
++    REQUIRE(podB.id != 0);
++    window->pumpEvents();
++    REQUIRE(podA.id != podB.id);
++
++    if (!foreignGamepadIds({podA.id, podB.id}).empty()) {
++        MESSAGE(
++            "a real gamepad is already connected in this environment -- it always has a LOWER SDL_JoystickID "
++            "than these freshly-attached virtual pads (SDL's instance-ID counter is monotonic and never reused "
++            "within a process), so it -- not either of this test's own pads -- would win poll()'s 'lowest ID' "
++            "selection every time, making this test's assertions unobservable here. Skipping (see "
++            "foreignGamepadIds()'s own comment).");
++        return;
++    }
++
++    VirtualGamepad& lowerPad = (podA.id < podB.id) ? podA : podB;
++    VirtualGamepad& higherPad = (podA.id < podB.id) ? podB : podA;
++
++    lowerPad.setButton(SDL_GAMEPAD_BUTTON_SOUTH, true);
++    higherPad.setButton(SDL_GAMEPAD_BUTTON_SOUTH, false);
++    higherPad.setButton(SDL_GAMEPAD_BUTTON_EAST, true);
++    {
++        auto state = window->poll();
++        CHECK(state.connected);
++        CHECK(state.buttons.south);  // active == lower-ID pad
++        CHECK_FALSE(state.buttons.east);
++    }
++
++    // Detach the active (lower-ID) pad -- the higher-ID one must become
++    // active, reflecting ITS OWN (deliberately different) button state.
++    lowerPad.reset();
++    window->pumpEvents();
++    {
++        auto state = window->poll();
++        CHECK(state.connected);
++        CHECK_FALSE(state.buttons.south);
++        CHECK(state.buttons.east);
++    }
++}
++
++TEST_CASE("Window::poll(): stick axes go through applyStickDeadzone() end-to-end, including the MANDATORY "
++          "(8500,8500) discrimination case, via a real virtual joystick [gate hardening block]") {
++    auto window = rx::platform::Window::create("rx_platform_gamepad_axis_test", 64, 64, false);
++    REQUIRE(window.has_value());
++    window->pumpEvents();
++
++    VirtualGamepad pad("rx_platform_axis_pad");
++    REQUIRE(pad.id != 0);
++    window->pumpEvents();
++
++    if (!foreignGamepadIds({pad.id}).empty()) {
++        MESSAGE(
++            "a real gamepad is already connected in this environment and outranks this test's own virtual pad "
++            "for poll()'s 'lowest ID' selection -- skipping the poll()-mediated assertions (see "
++            "foreignGamepadIds()'s own comment). The deadzone MATH itself, including this exact (8500,8500) "
++            "case, is unconditionally covered by the pure-math applyStickDeadzone() tests above, and the "
++            "SDL_GetGamepadAxis() wiring/index-mapping was independently confirmed by this task's own smoke "
++            "check (task-20-report.md).");
++        return;
++    }
++
++    pad.setAxis(SDL_GAMEPAD_AXIS_LEFTX, 8500);
++    pad.setAxis(SDL_GAMEPAD_AXIS_LEFTY, 8500);
++    {
++        auto state = window->poll();
++        REQUIRE(state.connected);
++        CHECK(state.leftStick.x == doctest::Approx(0.11480f).epsilon(0.01));
++        CHECK(state.leftStick.y == doctest::Approx(0.11480f).epsilon(0.01));
++    }
++
++    pad.setAxis(SDL_GAMEPAD_AXIS_RIGHTX, 4000);
++    pad.setAxis(SDL_GAMEPAD_AXIS_RIGHTY, 0);
++    {
++        auto state = window->poll();
++        CHECK(state.rightStick.x == 0.0f);
++        CHECK(state.rightStick.y == 0.0f);
++    }
++}
++
++TEST_CASE("Window::poll(): trigger axes go through applyTriggerDeadzone() end-to-end -- SDL's own RAW "
++          "joystick-axis trigger rest value is SDL_JOYSTICK_AXIS_MIN, not 0 [gate matrix row 6]") {
++    auto window = rx::platform::Window::create("rx_platform_gamepad_trigger_test", 64, 64, false);
++    REQUIRE(window.has_value());
++    window->pumpEvents();
++
++    VirtualGamepad pad("rx_platform_trigger_pad");
++    REQUIRE(pad.id != 0);
++    window->pumpEvents();
++
++    if (!foreignGamepadIds({pad.id}).empty()) {
++        MESSAGE(
++            "a real gamepad is already connected in this environment and outranks this test's own virtual pad "
++            "for poll()'s 'lowest ID' selection -- skipping (see foreignGamepadIds()'s own comment). The "
++            "deadzone math itself is unconditionally covered by the pure-math applyTriggerDeadzone() tests "
++            "above.");
++        return;
++    }
++
++    // Per SDL_SetJoystickVirtualAxis()'s own doc: "when sending trigger
++    // axes... a trigger at rest would have the value of
++    // SDL_JOYSTICK_AXIS_MIN" at the RAW joystick-axis level -- SDL's
++    // gamepad mapping layer translates that to SDL_GetGamepadAxis()'s
++    // documented 0=released convention this project's poll() consumes.
++    pad.setAxis(SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_JOYSTICK_AXIS_MIN);
++    CHECK(window->poll().leftTrigger == doctest::Approx(0.0f));
++
++    pad.setAxis(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, SDL_JOYSTICK_AXIS_MAX);
++    CHECK(window->poll().rightTrigger == doctest::Approx(1.0f));
++}
++
++TEST_CASE("Window::poll(): the full discrete button surface (D-pad x4, four face buttons, both shoulders, "
++          "START) reflects each button independently -- SOUTH/EAST/WEST/NORTH, never A/B [gate ruling #14, "
++          "matrix row 7]") {
++    auto window = rx::platform::Window::create("rx_platform_gamepad_buttons_test", 64, 64, false);
++    REQUIRE(window.has_value());
++    window->pumpEvents();
++
++    VirtualGamepad pad("rx_platform_buttons_pad");
++    REQUIRE(pad.id != 0);
++    window->pumpEvents();
++
++    if (!foreignGamepadIds({pad.id}).empty()) {
++        MESSAGE(
++            "a real gamepad is already connected in this environment and outranks this test's own virtual pad "
++            "for poll()'s 'lowest ID' selection -- skipping (see foreignGamepadIds()'s own comment). The "
++            "SDL_GetGamepadButton()/SDL_GamepadButton enum wiring was independently confirmed by this task's "
++            "own smoke check (task-20-report.md).");
++        return;
++    }
++
++    struct Case {
++        SDL_GamepadButton sdlButton;
++        const char* name;
++        bool rx::platform::GamepadButtons::*field;
++    };
++    const Case cases[] = {
++        {SDL_GAMEPAD_BUTTON_DPAD_UP, "dpadUp", &rx::platform::GamepadButtons::dpadUp},
++        {SDL_GAMEPAD_BUTTON_DPAD_DOWN, "dpadDown", &rx::platform::GamepadButtons::dpadDown},
++        {SDL_GAMEPAD_BUTTON_DPAD_LEFT, "dpadLeft", &rx::platform::GamepadButtons::dpadLeft},
++        {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, "dpadRight", &rx::platform::GamepadButtons::dpadRight},
++        {SDL_GAMEPAD_BUTTON_SOUTH, "south", &rx::platform::GamepadButtons::south},
++        {SDL_GAMEPAD_BUTTON_EAST, "east", &rx::platform::GamepadButtons::east},
++        {SDL_GAMEPAD_BUTTON_WEST, "west", &rx::platform::GamepadButtons::west},
++        {SDL_GAMEPAD_BUTTON_NORTH, "north", &rx::platform::GamepadButtons::north},
++        {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, "leftShoulder", &rx::platform::GamepadButtons::leftShoulder},
++        {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, "rightShoulder", &rx::platform::GamepadButtons::rightShoulder},
++        {SDL_GAMEPAD_BUTTON_START, "start", &rx::platform::GamepadButtons::start},
++    };
++
++    for (const auto& underTest : cases) {
++        pad.setButton(underTest.sdlButton, true);
++        auto state = window->poll();
++        INFO("button under test: ", underTest.name);
++        CHECK(state.buttons.*underTest.field);
++        // Every OTHER field in the struct stays false -- proves this
++        // isn't a stuck-true bug that would make every CHECK above pass
++        // vacuously.
++        for (const auto& other : cases) {
++            if (other.field == underTest.field) {
++                continue;
++            }
++            CHECK_FALSE(state.buttons.*other.field);
++        }
++        pad.setButton(underTest.sdlButton, false);
++        CHECK_FALSE((window->poll().buttons.*underTest.field));
++    }
++}
++
++TEST_CASE("Window::pumpEvents(): GAMEPAD_ADDED logs the gamepad's name + SDL_GamepadHasSensor(GYRO) result "
++          "[gate ruling #14, log-don't-drop, SDL issue #9148]") {
++    rx::core::log::init();
++    auto sink = rx::core::log::forwardSink();
++    CapturedLog captured;
++    REQUIRE(sink->set(&captureLogCallback, &captured));
++    ForwardCallbackGuard guard{sink};
++
++    auto window = rx::platform::Window::create("rx_platform_gamepad_gyro_log_test", 64, 64, false);
++    REQUIRE(window.has_value());
++    window->pumpEvents();
++
++    VirtualGamepad pad("rx_platform_gyro_log_pad");
++    REQUIRE(pad.id != 0);
++    window->pumpEvents();
++
++    std::lock_guard<std::mutex> lock(captured.mutex);
++    CHECK(captured.callCount >= 1);
++    // Searches the full accumulated capture (not just the LAST message):
++    // a real, already-connected gamepad in this environment (see
++    // foreignGamepadIds()'s own comment -- this dev machine has one) logs
++    // its OWN "gamepad connected" line too, and queue/drain ordering
++    // between the two is not guaranteed -- this test cares specifically
++    // about the ONE LINE naming this test's own pad, not whichever
++    // happened to log last.
++    const auto podLineStart = captured.allMessages.find("rx_platform_gyro_log_pad");
++    REQUIRE(podLineStart != std::string::npos);
++    const auto lineStart = captured.allMessages.rfind('\n', podLineStart) + 1;  // npos+1 == 0: start-of-string
++    const auto lineEnd = captured.allMessages.find('\n', podLineStart);
++    const std::string podLine = captured.allMessages.substr(lineStart, lineEnd - lineStart);
++    CHECK(podLine.find("gamepad connected") != std::string::npos);
++    // A virtual joystick declares zero sensors (VirtualGamepad's desc
++    // above never sets nsensors/sensors) -- SDL_GamepadHasSensor(GYRO)
++    // genuinely reports false for it, so this also proves the log line
++    // reflects a REAL query result, not a hardcoded string.
++    CHECK(podLine.find("hasGyroSensor=false") != std::string::npos);
++}
++
++// ===== Keyboard [Phase 4 Task 20, gate ruling #14, NEW SCOPE] =============
++TEST_CASE("Window::isKeyDown(): with no real key pressed, every scancode reports false; an out-of-range "
++          "SDL_Scancode is bounds-checked, not UB") {
++    auto window = rx::platform::Window::create("rx_platform_keyboard_test", 64, 64, false);
++    REQUIRE(window.has_value());
++    window->pumpEvents();
++
++    CHECK_FALSE(window->isKeyDown(SDL_SCANCODE_UNKNOWN));
++    CHECK_FALSE(window->isKeyDown(SDL_SCANCODE_A));
++    CHECK_FALSE(window->isKeyDown(SDL_SCANCODE_W));
++    CHECK_FALSE(window->isKeyDown(SDL_SCANCODE_SPACE));
++    CHECK_FALSE(window->isKeyDown(static_cast<SDL_Scancode>(SDL_SCANCODE_COUNT - 1)));
++
++    // Out-of-range: an absurdly out-of-range value must not read out of
++    // SDL_GetKeyboardState()'s own reported array bounds.
++    CHECK_FALSE(window->isKeyDown(static_cast<SDL_Scancode>(99999)));
++    CHECK_FALSE(window->isKeyDown(static_cast<SDL_Scancode>(-1)));
++}
++
++// ===== Thread-affinity guard [Phase 4 Task 20, gate ruling #14 row 11]
++// =========================================================================
++// Mirrors rx_asset/tests/thread_guard_test.cpp's own documented "a plain
++// std::thread stands in for a chunk >= 1 worker" pattern -- legitimate here
++// for the identical reason that file gives: rx::platform::Window has no
++// rx::task::Scheduler-driven caller in this phase at all, so this tests the
++// thread-identity comparison the guard performs, not any real scheduler
++// integration. Each worker thread is joined before the next one starts, so
++// there is never more than one thread touching this Window's state at a
++// time -- the precondition rx::core::debug::detail::ViolationHook's own
++// contract comment requires of a test-installed hook that returns normally
++// instead of aborting.
++#ifdef RX_DEBUG_CHECKS
++
++namespace {
++
++struct GuardViolationCapture {
++    std::mutex mutex;
++    int callCount = 0;
++    std::string lastContext;
++};
++
++std::atomic<GuardViolationCapture*> g_activeGuardCapture{nullptr};
++
++void captureGuardViolationHook(const char* context) {
++    GuardViolationCapture* capture = g_activeGuardCapture.load(std::memory_order_relaxed);
++    if (capture == nullptr) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(capture->mutex);
++    capture->callCount++;
++    capture->lastContext = context != nullptr ? context : "";
++    // Returns normally rather than aborting -- safe here specifically
++    // because every worker thread below is join()'d before the next
++    // guarded call starts (see this section's own banner comment).
++}
++
++struct GuardHookGuard {
++    ~GuardHookGuard() {
++        g_activeGuardCapture.store(nullptr, std::memory_order_relaxed);
++        rx::core::debug::detail::setViolationHookForTests(nullptr);
++    }
++};
++
++}  // namespace
++
++TEST_CASE("Window's new input surface (pumpEvents/consumeMouseDelta/poll/setCursorVisible) trips "
++          "RX_ASSERT_MAIN_THREAD when called from a worker thread [gate ruling #14 row 11]") {
++    auto window = rx::platform::Window::create("rx_platform_thread_guard_test", 64, 64, false);
++    REQUIRE(window.has_value());
++
++    GuardViolationCapture capture;
++    g_activeGuardCapture.store(&capture, std::memory_order_relaxed);
++    rx::core::debug::detail::setViolationHookForTests(&captureGuardViolationHook);
++    GuardHookGuard guard;
++
++    std::thread pumpThread([&] { window->pumpEvents(); });
++    pumpThread.join();
++    std::thread consumeThread([&] { window->consumeMouseDelta(); });
++    consumeThread.join();
++    std::thread pollThread([&] { window->poll(); });
++    pollThread.join();
++    std::thread cursorThread([&] { window->setCursorVisible(true); });
++    cursorThread.join();
++
++    std::lock_guard<std::mutex> lock(capture.mutex);
++    CHECK(capture.callCount == 4);
++    CHECK(capture.lastContext == "Window::setCursorVisible");
++}
++
++TEST_CASE("Window's new input surface does NOT trip the guard for a call genuinely on the main thread") {
++    auto window = rx::platform::Window::create("rx_platform_thread_guard_legal_test", 64, 64, false);
++    REQUIRE(window.has_value());
++
++    GuardViolationCapture capture;
++    g_activeGuardCapture.store(&capture, std::memory_order_relaxed);
++    rx::core::debug::detail::setViolationHookForTests(&captureGuardViolationHook);
++    GuardHookGuard guard;
++
++    window->pumpEvents();
++    window->consumeMouseDelta();
++    window->poll();
++    window->setCursorVisible(true);
++
++    std::lock_guard<std::mutex> lock(capture.mutex);
++    CHECK(capture.callCount == 0);
++}
++
++#endif  // RX_DEBUG_CHECKS
