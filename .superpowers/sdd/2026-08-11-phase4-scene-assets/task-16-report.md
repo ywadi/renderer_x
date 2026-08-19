@@ -107,7 +107,121 @@ This dev machine's default Vulkan device is a real (NVIDIA) GPU, not lavapipe, s
 - **Light/ambient tuning is a sample-level judgment call, not a spec value.** D22/FG1 fix the *mechanism* (Lambertian + GGX + a flat ambient term) but not specific brightness constants. The shipped defaults (`lightColor=(5,5,5)`, `ambientColor=0.18`) were chosen empirically against DamagedHelmet's own genuinely-dark base-color texture so the showcase sample's default render is legible without IBL (deferred to the techniques phase per D22's own scope) — documented in `updateDrawDataPerPassFields()`'s own comment, including the precedent (`shaders/multipass/lit.frag.slang`'s `kAmbient=0.08`) these values were nudged brighter from.
 - **Pre-existing `samples/README.md`/`.github/workflows/ci.yml` staleness beyond sample 08 itself was also fixed while already touching those files** (07_stress had never been added to `samples/README.md`'s top-of-file bundle listing or its "Running the automated test suite" section) — a small, low-risk, in-scope-adjacent cleanup rather than leaving a doubly-stale list behind.
 
-## 9. Self-review
+## 9. Fix round (coordinator review, two independent reviewers)
+
+Commits (in order, after the base report's own `734497e`):
+
+1. `9a53922` — `fix(rx_material): occlusion applies to ambient only, not direct light (fix round item 5)`
+2. `00cd0ff` — `test(rx_material): fix-round test corrections (coordinator review items 1, 2, 5b)`
+3. `23837ca` — `chore(samples): regenerate 08_gltf_viewer D17 reference after the occlusion fix (fix round item 5a)`
+4. `9e0fcf8` — `feat(samples): 08_gltf_viewer perf instrumentation + orbit-camera comment fix (fix round items 6, 7)`
+5. `8334803` — `chore(tools,samples): vendor full CC-BY-4.0/CC-BY-NC-4.0 legal texts into the redistribution zip (fix round item 4)`
+
+Same rules as the base report: no AI attribution, local commits only (not pushed), only files this fix round produced were committed.
+
+### Item 1 (Important) — D26.1 two-draw test was depth-tie-masked; reworked and revert-proven
+
+**Root cause, confirmed by a second, independent reviewer's own SPIR-V disassembly**: `SV_InstanceID` genuinely emits `OpISub InstanceIndex, BaseInstance` on this project's pinned Slang/SPIR-V target (my own earlier flagged "contradiction" in the base report was wrong — settled with ground truth, not touched further; the three header comments asserting this were correct all along). The ORIGINAL test's own failure to catch this was a **test bug**, not a false claim about Slang: row 1's quad was placed fully OFF the ortho frustum, so under the `SV_InstanceID` revert bug, draw 2's mis-addressed fragments (reading row 0's IDENTITY transform) landed exactly on top of row 0's own already-written, identical-depth quad — this project's fixed `VK_COMPARE_OP_LESS` (strict) depth-compare state then rejected every one of those fragments as a depth tie, so the framebuffer read back identical to the CORRECT-behavior case either way. The single-center-pixel probe could not distinguish "row 1 correctly off-frustum, nothing to see" from "row 1 wrongly on top of row 0, rejected by a depth tie."
+
+**Fix**: `makeHeadOnRow()` gained an optional `orthoHalfExtent` parameter (default `0.5F`, unchanged for all 46 other call sites); the D26.1 test now widens the frustum to `3.0` and places row 1's quad at a genuinely separate, on-screen, non-overlapping world location (`+2` in X) instead of off-frustum. `renderQuad()`'s single-pixel-readback body was split into a shared `renderQuadPixels()` (returns the full raw RGBA8 buffer for an arbitrary extent) + `pixelAt()` (extracts one texel) — `renderQuad()` itself is now a thin wrapper, unchanged in signature/behavior for its other 46 callers. The test now probes row 0's location (must read RED) and row 1's own, separate location (must read GREEN — the real discriminator).
+
+**Revert evidence** (scratch, in place, never committed):
+
+```
+$ # baseline (SV_VulkanInstanceID, correct):
+[doctest] test cases:  1 |  1 passed | 0 failed | 46 skipped
+[doctest] assertions: 42 | 42 passed | 0 failed |
+
+$ # reverted forward_entry.slang: SV_VulkanInstanceID -> SV_InstanceID
+.../test_standard_pbr_unlit.cpp:773: ERROR: CHECK( row1Pixel.g > 200 ) is NOT correct!
+  values: CHECK( 0 >  200 )
+[doctest] test cases:  1 |  0 passed | 1 failed | 46 skipped
+[doctest] assertions: 42 | 41 passed | 1 failed |
+
+$ # restored SV_VulkanInstanceID -> full suite green again (see §3 below)
+```
+
+`row1Pixel.g == 0` under the revert is exactly the predicted mechanism: the buggy second draw never reaches row 1's own real, separate screen location at all (its fragments land on row 0's, where the depth tie silently swallows them), so that location reads back the plain background clear color instead of green — unambiguous, with no depth-tie possible between two draws that no longer even hit the same pixels.
+
+### Item 2 (Important) — dedicated emissive probe added; report erratum corrected
+
+Two new `TEST_CASE`s: a factor-only probe (`emissiveFactorAndPad=(0.2,0.4,0.6)`, light+ambient zeroed on the row, expects an exact `(51,102,153)` byte readback) and a textured variant (`emissiveFactor=(1,1,1)` × a `(100,150,200)` texel, same isolation technique, expects an exact product). Both isolate emissive by zeroing `lightColor`/`ambientColor` (not `baseColor`, which would still leave a real, nonzero dielectric `F0=0.04` specular term reachable) — `color = directLight + ambient + emissive` collapses to exactly `emissive` regardless of `baseColor`/`metallic`/`roughness`, which are deliberately left at their ordinary neutral defaults rather than special-cased, to prove independence from them too.
+
+**§2 table erratum** (this report, base version): the row claiming emissive coverage was added post-hoc and is now actually true; at the time it was written, `emissiveFactorAndPad` was set to `{0,0,0,0}` at exactly one call site in the whole file (the shared neutral-default blob builder) and never overridden anywhere — no test exercised a nonzero value. Corrected by this fix round's own new test cases, not by editing the prose of an already-committed report (this section is the correction of record).
+
+### Item 3 (Minor) — report erratum: TEST_CASE count
+
+The base report's own file list said "47 TEST_CASEs / 1982 assertions" for `test_standard_pbr_unlit.cpp` specifically. That was **the whole `rx_material_gpu_tests` binary's own total** (across `test_material_system.cpp`, `test_api_factory.cpp`, `test_param_arena.cpp`, and this file combined), not this file's own count. Corrected, counted directly (`grep -c '^TEST_CASE'` per file, summed and cross-checked against the doctest-reported binary total):
+
+| File | TEST_CASEs |
+|---|---|
+| `test_material_system.cpp` | 17 |
+| `test_api_factory.cpp` | 13 |
+| `test_param_arena.cpp` | 2 |
+| `test_standard_pbr_unlit.cpp` | **17** (15 at the base report's own commit `4cb7562`; +2 this fix round, item 2) |
+| **Binary total** | **49** (`49 | 49 passed | 0 failed`, `2156 | 2156 passed | 0 failed` — see §3 below) |
+
+### Item 4 (Minor, coordinator-ruled) — full CC-BY-4.0/CC-BY-NC-4.0 legal texts now shipped
+
+Fetched verbatim (`curl` against `creativecommons.org/licenses/{by,by-nc}/4.0/legalcode.txt`, 396 and 408 lines respectively, each a complete, well-formed legal document from its own title through "Creative Commons may be contacted at creativecommons.org.") and vendored as committed files (`samples/08_gltf_viewer/licenses/CC-BY-4.0.txt` / `CC-BY-NC-4.0.txt`) rather than fetched at package time — a small, static legal document is exactly the kind of third-party content this project already commits directly (unlike `assets/fetched/`'s own large, gitignored binary content), and vendoring keeps `tools/package_samples.sh` network-free, matching its own pre-existing posture. `LICENSE.txt` (the human-readable attribution notice) stays, now explicitly pointing at the two bundled full texts instead of external URLs.
+
+**Verified**: re-ran `tools/package_samples.sh` for both `linux-native` and `windows-cross-zig`; `unzip -l` on both output `.zip`s shows all three files (`LICENSE.txt`, `CC-BY-4.0.txt` 18657 bytes, `CC-BY-NC-4.0.txt` 19347 bytes) under `08_gltf_viewer/assets/DamagedHelmet/`; extracted both license files from the `linux-native` zip to a scratch directory and `diff`'d them against the vendored source -- byte-identical (`CC-BY-4.0 identical` / `CC-BY-NC-4.0 identical`).
+
+### Item 5 (Important, shipped-shader fix) — occlusion no longer attenuates direct light
+
+**Fix**: `standard_pbr.slang`'s `color = directLight * occlusion + ambient + emissive` became `color = directLight + ambient + emissive` — occlusion now applies exclusively to the ambient term, matching the glTF spec's own occlusionTexture text, all three first-tier references this task's own matrix cites, and the gate matrix's own occlusion acceptance criterion (scoped to the ambient contribution alone). Prevents double-darkening a directly-lit, occluded surface today, and prevents double-counting against a real direct-light visibility term (shadow maps) once Task 22 lands one.
+
+**Test extension + revert evidence**: the existing occlusion closed-form `TEST_CASE` gained a third case — a direct-lit (default head-on rig, `NdotL=1`), ambient-zeroed comparison between an unoccluded (`occlusion=1`) and heavily-occluded (`occlusion=0`, the same `blackOcclusionTex` the existing ambient-only cases already use) render of an otherwise-identical material, asserting the two read back identical (occlusion must not touch direct light at all when ambient contributes nothing).
+
+```
+$ # reverted: color = directLight * occlusion + ambient + emissive (the old, spec-incorrect form)
+.../test_standard_pbr_unlit.cpp:1126: ERROR: CHECK( near8(directOccludedPixel.r, directUnoccludedPixel.r, 2) ) is NOT correct!
+  values: CHECK( false )
+.../test_standard_pbr_unlit.cpp:1127: ERROR: CHECK( near8(directOccludedPixel.g, directUnoccludedPixel.g, 2) ) is NOT correct!
+  values: CHECK( false )
+.../test_standard_pbr_unlit.cpp:1128: ERROR: CHECK( near8(directOccludedPixel.b, directUnoccludedPixel.b, 2) ) is NOT correct!
+  values: CHECK( false )
+[doctest] test cases:   1 |   0 passed | 1 failed | 48 skipped
+[doctest] assertions: 162 | 159 passed | 3 failed |
+
+$ # restored -> full suite green again (see §3 below)
+```
+
+The two PRE-EXISTING assertions in this same `TEST_CASE` (ambient-only closed-form, R=0/strength=1 and strength=0.5) were unaffected by either the fix or the revert either way: both already used a light pointed AWAY from the surface (`NdotL=0`), so `directLight` was already zero in both branches regardless of the occlusion multiply — confirmed by inspection (no regression risk) and by the full-suite pass count staying at 49/49 both before and after this item.
+
+**D17 reference regeneration** (the sanctioned case, sequenced once, after every shader change in this fix round landed — commit `23837ca`): `tools/regen_references.sh linux-native` under the forced system lavapipe ICD. `loading_state.png` is byte-unchanged (that D17 frame never reaches the material shader). `loaded_scene.png` changed (21255 → 21400 bytes) — DamagedHelmet's own occlusion texture now legitimately brightens its directly-lit surface slightly. Visually inspected (still a recognizable, correctly-shaded helmet, no regression). Re-ran the headless gate against the new reference: `D17 loading_state gate: failingPixels=0/65536 pass=true`, `D17 loaded_scene gate: failingPixels=0/65536 pass=true`, `headless gate PASSED`.
+
+### Item 6 (Important) — measured performance numbers
+
+**Capture method** (disclosed per the measured-claims rule): direct `std::chrono::steady_clock` wall-clock instrumentation added to `runHeadless()` in `samples/08_gltf_viewer/main.cpp`, printed via a real, greppable `RX_LOG_INFO("sample08: perf ...")` line (matching `sample_07_stress`'s own `"stress:"` stats-line convention) in a real run under the system's own lavapipe ICD, Xvfb. **Not** a live Tracy GUI/network capture — this dev environment has no Tracy GUI attached, and this project's own build graph does not build Tracy's own separate `tracy-capture` CLI tool (a real, but materially larger, undertaking than this fix round's own scope called for). Task 15's own `RX_ZONE` Tracy zones around the async-import pipeline remain fully present, unaffected, and available for a real interactive Tracy GUI session (`RX_TRACY=ON` in the `linux-native` preset, `CMakePresets.json`) — this is a second, independent, always-on measurement, not a replacement for them.
+
+`import_ms`: wall-clock from the `importGltfAsync()` kickoff to its completion callback confirming `setupMaterials()`/`buildDrawList()` both succeeded. `first_frame_ms`: wall-clock from `runHeadless()`'s own first instruction (before Window/Context/Device/Allocator/MaterialSystem/GeometryPool/TextureCache/Executor construction, the tonemap pipeline build, and the loading-state frame) through the first fully rendered, GPU-readback-confirmed POST-IMPORT frame -- genuine cold-start time to a real, correct pixel on screen, not import alone.
+
+Three consecutive runs, DamagedHelmet, `linux-native`, system lavapipe (`/usr/share/vulkan/icd.d/lvp_icd.json`), Xvfb:
+
+```
+sample08: perf scene='.../DamagedHelmet.gltf' import_ms=349.872 first_frame_ms=855.580
+sample08: perf scene='.../DamagedHelmet.gltf' import_ms=350.358 first_frame_ms=858.292
+sample08: perf scene='.../DamagedHelmet.gltf' import_ms=356.609 first_frame_ms=852.581
+```
+
+`import_ms` ≈ 350ms, `first_frame_ms` ≈ 855ms, consistent across runs (< 2% spread). Both include lavapipe's own software-rasterizer/CPU-decode overhead (this is a software Vulkan implementation, not representative of a real GPU's own timing) and this specific dev machine's own CPU. **Steam Deck hardware was not available in this environment** — no number to report there; flagging rather than fabricating one, per this project's own measured-claims discipline. A real-GPU/Steam-Deck capture is follow-up work for whichever task/gate actually owns Phase 4's stage-exit performance-number requirement (this task-level ask was for `import_ms`/`first_frame_ms` numbers to exist in this report at all, which they now do).
+
+### Item 7 (Minor) — stale comment corrected
+
+Three comments in `samples/08_gltf_viewer/main.cpp` claimed the mouse-drag orbit camera reads state "via `Window::sdlWindow()`" — the actual code (unchanged, always correct) calls SDL3's global `SDL_GetMouseState()` directly, which takes no window argument at all in SDL3 (it queries OS-level cursor state, not scoped through any specific `SDL_Window*`). This already satisfies gate ruling #8's own underlying intent (sample-local, no `rx_platform` input surface pulled forward) without actually needing `Window::sdlWindow()` for this specific query. Comments corrected to describe the real call; no behavior change.
+
+### Suite status after the full fix round
+
+**linux-native**, full `ctest` (serial, lavapipe forced): `100% tests passed, 0 tests failed out of 22` (64.50s). `rx_material_gpu_tests` alone: `49 | 49 passed | 0 failed`, `2156 | 2156 passed | 0 failed`.
+
+**windows-cross-zig**: full `cmake --build` (all targets) exits 0. `ctest -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample'` (CI's own exact filter) under Wine: `100% tests passed, 0 tests failed out of 10` (101.38s).
+
+**Packaging**: `tools/package_samples.sh` re-run for both presets; both output `.zip`s carry the full license texts (§ item 4) and the regenerated D17 reference (§ item 5); the `linux-native` zip's own `08_gltf_viewer/` was unzipped to a scratch directory outside the build tree and its headless gate re-run standalone -- `headless gate PASSED`, 0 failing pixels on both frames.
+
+## 10. Self-review (base report) / fix-round self-review addendum
+
+Fix-round addendum: every one of the seven coordinator-review items above has direct empirical evidence (two real reverts with pasted failure output for items 1 and 5; a byte-identical diff for item 4; three consecutive measured runs for item 6; a direct file-count grep for item 3) rather than an assertion. The one open item from the base report (§ "Known gaps") — the `SV_InstanceID` documentation-vs-observed-behavior discrepancy — is now fully resolved by the coordinator's own independent SPIR-V disassembly and standalone Vulkan repro: the three header comments were correct, my own base-report flag was a false alarm caused by the depth-tie test bug fixed in item 1 above, and no code or comment changes were needed for that claim itself.
 
 - Every acceptance-criterion row in the completeness matrix has a dedicated, passing GPU test (§2); the five most safety-critical mechanisms additionally have empirical revert-testing evidence (§6), with one genuine unresolved discrepancy flagged rather than hidden.
 - Both presets build clean; both presets' full applicable test suites are green; the packaged, standalone `.zip` output was actually unzipped and run outside the build tree.
