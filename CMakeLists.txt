@@ -102,6 +102,14 @@ add_subdirectory(src/rx_graph)
 # so it is add_subdirectory'd after all three.
 add_subdirectory(src/rx_material)
 
+# Phase 4 Stage 2 Task 22 -- rx_shadow: the scene shadow quality bridge
+# (spec D21; gate matrix-issue23-shadow-bridge.md as amended by gate/
+# rulings-2026-08-18.md's #23 + RC2/RC3). Depends on rx_rhi_vk (Device/
+# BindlessTable/PipelineLayoutBuilder) and rx_shader (Compiler/reflect) --
+# NOT rx_material: its own shadow-caster pipeline is built OUTSIDE
+# MaterialSystem entirely (RC3), so it has no dependency on that library.
+add_subdirectory(src/rx_shadow)
+
 # Phase 4 Stage 2 Task 21 -- rx_debug_ui: Dear ImGui overlay module (spec
 # D20). Depends on rx_platform (Window)/rx_rhi_vk (Device/Uploader)/
 # rx_graph (RenderGraph pass declaration) plus the vendored `imgui` target

@@ -355,6 +355,18 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
     samplerAnisotropyRequest.samplerAnisotropy = VK_TRUE;
     const bool samplerAnisotropyEnabled = physResult.value().enable_features_if_present(samplerAnisotropyRequest);
 
+    // depthClamp: opportunistic, guarded [Phase 4 Stage 2 Task 22, spec
+    // D21/gate ruling #23 -- "depthClampEnable=VK_TRUE on casters + device-
+    // feature check"]. Same base-VkPhysicalDeviceFeatures, same
+    // opportunistic-AFTER-selection posture as samplerAnisotropy
+    // immediately above (never a device-selection requirement; a device
+    // lacking it still builds a fully working Device -- the shadow-caster
+    // pipeline degrades to depthClampEnable=VK_FALSE, logged, per
+    // Device::supportsDepthClamp()'s own header comment).
+    VkPhysicalDeviceFeatures depthClampRequest{};
+    depthClampRequest.depthClamp = VK_TRUE;
+    const bool depthClampEnabled = physResult.value().enable_features_if_present(depthClampRequest);
+
     auto deviceResult = vkb::DeviceBuilder(physResult.value()).build();
     if (!deviceResult) {
         RX_LOG_ERROR("vkb::DeviceBuilder::build failed: {}", deviceResult.error().message());
@@ -477,6 +489,12 @@ std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
         "D10/G6] (enablement only -- opportunistic, never a device-selection requirement)",
         samplerAnisotropyEnabled ? "ENABLED" : "not present -- rx::asset::TextureCache samplers cleanly disable "
                                                 "anisotropic filtering, logged");
+    dev.depthClampEnabled_ = depthClampEnabled;
+    RX_LOG_INFO(
+        "Device::create: depthClamp {} on the selected physical device [Phase 4 Stage 2 Task 22, spec D21/gate "
+        "ruling #23] (enablement only -- opportunistic, never a device-selection requirement)",
+        depthClampEnabled ? "ENABLED" : "not present -- rx::shadow::ShadowCasterPipeline degrades to "
+                                         "depthClampEnable=VK_FALSE, logged");
     dev.swapchain_ = vkbSwapchain.swapchain;
     dev.swapchainImages_ = imagesResult.value();
     dev.swapchainFormat_ = vkbSwapchain.image_format;
@@ -510,6 +528,7 @@ Device& Device::operator=(Device&& other) noexcept {
         memoryBudgetExtensionEnabled_ = other.memoryBudgetExtensionEnabled_;
         bufferDeviceAddressEnabled_ = other.bufferDeviceAddressEnabled_;
         samplerAnisotropyEnabled_ = other.samplerAnisotropyEnabled_;
+        depthClampEnabled_ = other.depthClampEnabled_;
         swapchain_ = other.swapchain_;
         swapchainImages_ = std::move(other.swapchainImages_);
         swapchainFormat_ = other.swapchainFormat_;
@@ -534,6 +553,7 @@ Device& Device::operator=(Device&& other) noexcept {
         other.memoryBudgetExtensionEnabled_ = false;
         other.bufferDeviceAddressEnabled_ = false;
         other.samplerAnisotropyEnabled_ = false;
+        other.depthClampEnabled_ = false;
         other.swapchain_ = VK_NULL_HANDLE;
         other.swapchainImages_.clear();
         other.swapchainFormat_ = VK_FORMAT_UNDEFINED;

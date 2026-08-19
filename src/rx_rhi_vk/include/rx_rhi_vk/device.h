@@ -183,6 +183,26 @@ public:
     // texture_cache_test.cpp run before this accessor existed.
     bool supportsSamplerAnisotropy() const { return samplerAnisotropyEnabled_; }
 
+    // [Phase 4 Stage 2 Task 22, spec D21/gate ruling #23] True iff
+    // `depthClamp` (VkPhysicalDeviceFeatures, Vulkan 1.0 core) was
+    // ENABLED on this Device's underlying VkDevice -- same opportunistic,
+    // never-a-device-selection-requirement pattern as
+    // supportsSamplerAnisotropy() immediately above. The scene-path
+    // shadow-caster pipeline (rx::shadow::ShadowCasterPipeline) sets
+    // `depthClampEnable=VK_TRUE` (so a caster whose geometry crosses the
+    // light's near plane still casts its full silhouette instead of being
+    // clipped away -- the matrix's own acceptance criterion) ONLY when
+    // this accessor is true; a device lacking the feature gets
+    // `depthClampEnable=VK_FALSE` instead (a caster crossing the near
+    // plane can vanish/truncate on that device -- a real, documented
+    // Phase-4 limitation of running on such hardware, not a crash or a
+    // validation error: VUID-VkPipelineRasterizationStateCreateInfo-
+    // depthClampEnable-00782 requires the feature for
+    // depthClampEnable=VK_TRUE, so checking this accessor before setting
+    // it is load-bearing, exactly like samplerAnisotropy's own cited VUID
+    // immediately above).
+    bool supportsDepthClamp() const { return depthClampEnabled_; }
+
     VkSwapchainKHR swapchain() const { return swapchain_; }
     const std::vector<VkImage>& swapchainImages() const { return swapchainImages_; }
     VkFormat swapchainFormat() const { return swapchainFormat_; }
@@ -333,6 +353,7 @@ private:
     bool memoryBudgetExtensionEnabled_ = false;
     bool bufferDeviceAddressEnabled_ = false;
     bool samplerAnisotropyEnabled_ = false;
+    bool depthClampEnabled_ = false;
 
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     std::vector<VkImage> swapchainImages_;
