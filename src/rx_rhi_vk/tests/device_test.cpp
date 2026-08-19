@@ -64,6 +64,10 @@ TEST_CASE("Device::create builds device, queues, and swapchain against a real su
     CHECK(device->swapchainFormat() != VK_FORMAT_UNDEFINED);
     CHECK(device->swapchainExtent().width > 0);
     CHECK(device->swapchainExtent().height > 0);
+    // [Phase 4 Task 17, FG7, gate matrix-issue25 row 8 regression CHECK] A
+    // normal 64x64 hidden window is never a zero-extent surface -- the
+    // suspended-present guard must never have engaged just from create().
+    CHECK_FALSE(device->isSuspended());
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 

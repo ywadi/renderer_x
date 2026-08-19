@@ -1,4 +1,5 @@
 #include <rx_rhi_vk/device.h>
+#include <rx_core/debug_checks.h>
 #include <rx_core/log.h>
 #include <rx_core/profile.h>
 #include <VkBootstrap.h>
@@ -514,6 +515,9 @@ Device& Device::operator=(Device&& other) noexcept {
         swapchainExtent_ = other.swapchainExtent_;
         desiredPresentMode_ = other.desiredPresentMode_;
         actualPresentMode_ = other.actualPresentMode_;
+        suspended_ = other.suspended_;
+        acquireCallCount_ = other.acquireCallCount_;
+        presentCallCount_ = other.presentCallCount_;
 
         other.instance_ = VK_NULL_HANDLE;
         other.physicalDevice_ = VK_NULL_HANDLE;
@@ -535,6 +539,9 @@ Device& Device::operator=(Device&& other) noexcept {
         other.swapchainExtent_ = VkExtent2D{0, 0};
         other.desiredPresentMode_ = PresentMode::VsyncOn;
         other.actualPresentMode_ = VK_PRESENT_MODE_FIFO_KHR;
+        other.suspended_ = false;
+        other.acquireCallCount_ = 0;
+        other.presentCallCount_ = 0;
     }
     return *this;
 }
@@ -562,9 +569,22 @@ AcquireResult Device::acquireNextImage(VkSemaphore signal) {
     // of its own; these two Device functions are the real acquire/present
     // calls every sample's present loop drives its FrameSync fences/
     // semaphores around].
+    RX_ASSERT_MAIN_THREAD("Device::acquireNextImage");
     RX_ZONE;
+
+    // [Phase 4 Task 17, FG7, gate ruling #25] Suspended-present short
+    // circuit: skip-acquire-ENTIRELY (never call vkAcquireNextImageKHR at
+    // all) while there is no live swapchain to acquire from -- see
+    // recreateSwapchain()'s own comment for how this state is entered/
+    // cleared. acquireCallCount_ deliberately does NOT increment here, so
+    // a test can assert "zero real acquires" by call count.
+    if (suspended_) {
+        return AcquireResult{SwapchainStatus::Suspended, 0};
+    }
+
     uint32_t imageIndex = 0;
     VkResult result = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, signal, VK_NULL_HANDLE, &imageIndex);
+    ++acquireCallCount_;
     switch (result) {
         case VK_SUCCESS:
         case VK_SUBOPTIMAL_KHR:
@@ -583,7 +603,21 @@ AcquireResult Device::acquireNextImage(VkSemaphore signal) {
 SwapchainStatus Device::present(uint32_t imageIndex, VkSemaphore wait) {
     // See acquireNextImage()'s own comment -- the matching "present" half
     // of FrameSync's own acquire/present zone pair.
+    RX_ASSERT_MAIN_THREAD("Device::present");
     RX_ZONE;
+
+    // [Phase 4 Task 17, FG7] Same suspended short circuit as
+    // acquireNextImage() above -- see that function's comment. In the
+    // documented usage (acquire, then present the SAME frame) this branch
+    // is reached only defensively: a caller that already saw
+    // SwapchainStatus::Suspended from acquireNextImage() has no valid
+    // imageIndex to present and is expected to skip straight to the next
+    // iteration instead of calling this at all (every sample this task
+    // touches does exactly that).
+    if (suspended_) {
+        return SwapchainStatus::Suspended;
+    }
+
     VkPresentInfoKHR presentInfo{};
     presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     if (wait != VK_NULL_HANDLE) {
@@ -595,6 +629,7 @@ SwapchainStatus Device::present(uint32_t imageIndex, VkSemaphore wait) {
     presentInfo.pImageIndices = &imageIndex;
 
     VkResult result = vkQueuePresentKHR(presentQueue_, &presentInfo);
+    ++presentCallCount_;
     switch (result) {
         case VK_SUCCESS:
             return SwapchainStatus::Ok;
@@ -617,7 +652,8 @@ void Device::setPresentMode(PresentMode mode) {
     desiredPresentMode_ = mode;
 }
 
-bool Device::recreateSwapchain(VkSurfaceKHR surface) {
+bool Device::recreateSwapchain(VkSurfaceKHR surface, std::optional<VkExtent2D> extentOverride) {
+    RX_ASSERT_MAIN_THREAD("Device::recreateSwapchain");
     if (surface != surface_) {
         // Not necessarily wrong (a caller could legitimately be handing
         // this Device a brand-new surface), but the intended/expected usage
@@ -638,6 +674,57 @@ bool Device::recreateSwapchain(VkSurfaceKHR surface) {
         swapchain_ = VK_NULL_HANDLE;
     }
     swapchainImages_.clear();
+    surface_ = surface;
+
+    // ZERO-EXTENT/MINIMIZE GUARD [Phase 4 Task 17, FG7, gate ruling #25 --
+    // design correction, matrix conflict 1]: the suspended-present decision
+    // is driven by the ACTUALLY-QUERIED surface extent, never an SDL event/
+    // flag -- see this function's own header comment in device.h for the
+    // full rationale (Wayland never fires a real minimize event/flag, and
+    // its currentExtent is a (0xFFFFFFFF,...) sentinel, never (0,0), so this
+    // check correctly never fires there). `extentOverride` is the
+    // dependency-injection seam a GPU test uses to exercise this guard
+    // without a display server that will actually report a zero-sized
+    // surface (matrix row 6) -- every production call site leaves it at the
+    // default (std::nullopt) and gets the real query below.
+    VkExtent2D queriedExtent{0, 0};
+    if (extentOverride.has_value()) {
+        queriedExtent = *extentOverride;
+    } else {
+        VkSurfaceCapabilitiesKHR caps{};
+        VkResult capsResult = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice_, surface, &caps);
+        if (capsResult != VK_SUCCESS) {
+            RX_LOG_ERROR("Device::recreateSwapchain: vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed: VkResult={}",
+                         static_cast<int>(capsResult));
+            return false;
+        }
+        queriedExtent = caps.currentExtent;
+    }
+
+    if (queriedExtent.width == 0 || queriedExtent.height == 0) {
+        // Skip vkb::SwapchainBuilder::build() ENTIRELY -- no swapchain
+        // object is created or touched (matches the Khronos-tutorial
+        // "minimization results in a frame buffer size of 0" pattern:
+        // skip-acquire-entirely, not acquire-then-discard). swapchain_
+        // stays VK_NULL_HANDLE / swapchainImages_ stays empty from above;
+        // swapchainExtent_ is recorded as the queried (possibly
+        // partially-zero) extent so callers reading it back see reality.
+        swapchainExtent_ = queriedExtent;
+        if (!suspended_) {
+            RX_LOG_INFO(
+                "Device::recreateSwapchain: surface extent is {}x{} -- entering suspended-present state (no "
+                "acquire/present until a real extent returns) [Phase 4 Task 17, FG7]",
+                queriedExtent.width, queriedExtent.height);
+        }
+        suspended_ = true;
+        return true;
+    }
+
+    if (suspended_) {
+        RX_LOG_INFO("Device::recreateSwapchain: surface extent is {}x{} -- resuming presentation [Phase 4 Task 17]",
+                    queriedExtent.width, queriedExtent.height);
+    }
+    suspended_ = false;
 
     // Present-mode control [Phase 4 Task 6]: resolve the mode most
     // recently recorded via setPresentMode() (VsyncOn by default, matching
@@ -672,7 +759,8 @@ bool Device::recreateSwapchain(VkSurfaceKHR surface) {
     swapchainImages_ = imagesResult.value();
     swapchainFormat_ = vkbSwapchain.image_format;
     swapchainExtent_ = vkbSwapchain.extent;
-    surface_ = surface;
+    // surface_ already set to `surface` above, before the zero-extent guard
+    // ran -- not repeated here.
     actualPresentMode_ = vkbSwapchain.present_mode;
     RX_LOG_INFO("Device::recreateSwapchain: present mode in use: {} ({})", presentModeName(actualPresentMode_),
                 desiredPresentMode_ == PresentMode::VsyncOn ? "PresentMode::VsyncOn" : "PresentMode::VsyncOff");

@@ -1209,3 +1209,129 @@ TEST_CASE("Combined path: cube_basisu.gltf -> Registry::importGltf(TextureCache)
 
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
+
+// ===== [helmet-texture-fix investigation] Slot-swap discrimination =========
+//
+// The us-vs-us gap this closes: every existing GPU test in this binary
+// (the "Combined path" test just above included) proves ONE material
+// slot resolves to a REAL, non-fallback, correctly-shaped texture -- none
+// of them prove that FIVE slots resolved SIMULTANEOUSLY each carry ONLY
+// their OWN slot's content, distinct from every other slot's. A bug that
+// swaps which decoded image lands in which MaterialAsset::TextureRef
+// field (e.g. textureRefForSlot() misrouting a role, or a fillRef() call
+// site in import_gltf.cpp being wired to the wrong TextureRole/slot pair)
+// would still pass every existing single-slot test -- each slot would
+// still resolve to SOME real, correctly-shaped, non-fallback texture,
+// just the WRONG one -- and would still bake identically into a
+// self-generated D17 reference PNG (the exact blind spot the helmet
+// texture investigation's own report documents). This test's fixture
+// (cube_slot_swap_probe.gltf, assets/test/textures/generate_fixtures.sh)
+// binds all five StandardPBR texture slots on ONE material to five
+// mutually distinct, pure primary/secondary colors -- baseColor=red,
+// metallicRoughness=green, normal=blue, occlusion=magenta,
+// emissive=cyan -- so a swap between any two slots is not just wrong, it
+// reads back as a DIFFERENT, unmistakable, already-known color (the
+// sibling slot's own), never a subtle shift a tolerance band could
+// absorb either way.
+//
+// REVERT PROOF [documented here, not committed as scaffolding]: this
+// test was confirmed to actually discriminate by temporarily swapping
+// the baseColorTexture/metallicRoughnessTexture `index` values in
+// cube_slot_swap_probe.gltf's own material block (0<->1, the exact
+// baseColor<->metallicRoughness pair the helmet bug report's own
+// green-panel symptom points at) in a scratch git worktree, re-running
+// this exact TEST_CASE, and observing it FAIL (baseColorTexture read back
+// green, not red) before reverting -- see the task's own report for the
+// full transcript.
+TEST_CASE("Slot-swap discrimination: five distinct StandardPBR texture slots on ONE material import to FIVE "
+          "correctly-distinct textures -- baseColor/metallicRoughness/normal/occlusion/emissive never "
+          "cross-contaminate, and swapping any two slot indices is provably caught by this same test "
+          "[helmet-texture-fix verification gap]") {
+    auto fixture = makeFixture("rx_asset_tc_slot_swap");
+    if (!fixture.has_value()) {
+        return;
+    }
+    makeCache(*fixture);
+
+    auto pool = rx::asset::GeometryPool::create(fixture->allocator, fixture->device, fixture->uploader);
+    REQUIRE(pool != nullptr);
+    auto scheduler = rx::task::Scheduler::create(2);
+    REQUIRE(scheduler != nullptr);
+
+    rx::asset::Registry registry;
+    rx::asset::ImportResult result =
+        registry.importGltf(gltfFixturePath("cube_slot_swap_probe.gltf"), *pool, *scheduler, fixture->cache.get());
+    REQUIRE(result.ok());
+    REQUIRE(result.materials.size() == 1);
+
+    const rx::asset::MaterialAsset& material = registry.material(result.materials[0]);
+    REQUIRE(material.baseColorTexture.present);
+    REQUIRE(material.metallicRoughnessTexture.present);
+    REQUIRE(material.normalTexture.present);
+    REQUIRE(material.occlusionTexture.present);
+    REQUIRE(material.emissiveTexture.present);
+
+    SamplerDesc nearestDesc;
+    nearestDesc.magFilter = 9728;  // NEAREST -- exact texel reads, no filtering ambiguity.
+    nearestDesc.minFilter = 9728;
+    VkSampler sampler = fixture->cache->getOrCreateSampler(nearestDesc);
+    REQUIRE(sampler != VK_NULL_HANDLE);
+    rx::rhi::BindlessHandle samplerHandle = fixture->bindless.registerSampler(sampler);
+    REQUIRE(samplerHandle.isValid());
+
+    // One (name, TextureRef, expected color) tuple per slot -- the
+    // per-slot loop below asserts BOTH halves of the discrimination:
+    // reads back as its OWN color (the "correct" half) AND does not read
+    // back as any sibling's color (the "a swap would be caught" half,
+    // made explicit rather than merely implied by the first half
+    // passing).
+    struct SlotProbe {
+        const char* name;
+        const rx::asset::TextureRef* ref;
+        std::array<uint8_t, 3> expected;
+    };
+    const std::array<uint8_t, 3> kRed{255, 0, 0};
+    const std::array<uint8_t, 3> kGreen{0, 255, 0};
+    const std::array<uint8_t, 3> kBlue{0, 0, 255};
+    const std::array<uint8_t, 3> kMagenta{255, 0, 255};
+    const std::array<uint8_t, 3> kCyan{0, 255, 255};
+    const std::array<SlotProbe, 5> probes{{
+        {"baseColor", &material.baseColorTexture, kRed},
+        {"metallicRoughness", &material.metallicRoughnessTexture, kGreen},
+        {"normal", &material.normalTexture, kBlue},
+        {"occlusion", &material.occlusionTexture, kMagenta},
+        {"emissive", &material.emissiveTexture, kCyan},
+    }};
+    const std::array<std::array<uint8_t, 3>, 5> kAllColors{kRed, kGreen, kBlue, kMagenta, kCyan};
+
+    for (const SlotProbe& probe : probes) {
+        CAPTURE(probe.name);
+        const TextureRecord& record = fixture->cache->resolve(probe.ref->handle);
+        REQUIRE_FALSE(record.isFallback);  // a real, distinct texture was actually registered for this slot.
+
+        auto readback = renderAndReadbackQuadrants(*fixture, record.bindlessIndex, samplerHandle.index(), /*lod=*/0.0F);
+        REQUIRE(readback.has_value());
+
+        // The "correct" half: this slot's own color, everywhere (the
+        // fixture is flat -- all four quadrant corners read identically).
+        CHECK(approxEqual(readback->topLeft, probe.expected, 2));
+        CHECK(approxEqual(readback->topRight, probe.expected, 2));
+        CHECK(approxEqual(readback->bottomLeft, probe.expected, 2));
+        CHECK(approxEqual(readback->bottomRight, probe.expected, 2));
+
+        // The "a swap would be caught" half: NOT any sibling slot's own
+        // color. A material-resolution bug that swapped this slot's
+        // handle with a DIFFERENT slot's would make exactly one of these
+        // five probes' "correct" half above fail, reading back as the
+        // wrong-but-already-known sibling color instead -- these checks
+        // make that failure mode explicit rather than merely implied.
+        for (const std::array<uint8_t, 3>& other : kAllColors) {
+            if (other == probe.expected) {
+                continue;
+            }
+            CHECK_FALSE(approxEqual(readback->topLeft, other, 2));
+        }
+    }
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}

@@ -10,6 +10,19 @@ enum class SwapchainStatus {
     Ok,
     NeedsRecreate,
     DeviceLost,
+    // [Phase 4 Task 17, FG7, gate ruling #25] The EXTENT-QUERY-DRIVEN
+    // suspended-present state: acquireNextImage()/present() return this
+    // WITHOUT ever calling vkAcquireNextImageKHR/vkQueuePresentKHR --
+    // there is no live VkSwapchainKHR to acquire/present against while
+    // suspended (see Device::recreateSwapchain()'s own comment on the
+    // zero-extent guard). A caller sees this exactly when
+    // Device::isSuspended() is true; it never overlaps with NeedsRecreate/
+    // DeviceLost in the same call. The design-corrected trigger (matrix
+    // conflict 1 / rulings-2026-08-18.md #25) is the QUERIED surface
+    // extent being 0x0 -- not an SDL minimize event/flag, which never
+    // fires on a real Wayland compositor-driven minimize (SDL issue
+    // #13473) and is therefore never sufficient on its own.
+    Suspended,
 };
 
 struct AcquireResult {
@@ -208,10 +221,23 @@ public:
     // it is safe to render into it. VK_SUBOPTIMAL_KHR is treated as success
     // here: the image is still valid to render into and present, so
     // recreation is deferred to present()'s return value instead.
+    //
+    // [Phase 4 Task 17, FG7] While isSuspended() is true, this returns
+    // AcquireResult{SwapchainStatus::Suspended, 0} WITHOUT calling
+    // vkAcquireNextImageKHR at all (skip-acquire-entirely, the
+    // Khronos-tutorial pattern -- there is no live swapchain to acquire
+    // against). acquireCallCount() only increments on the branch that
+    // actually issues the real Vulkan call, so a caller/test can assert
+    // "zero acquires while suspended" by call count, not by inference.
     AcquireResult acquireNextImage(VkSemaphore signal);
 
     // Presents `imageIndex`, waiting on `wait` first unless it is
     // VK_NULL_HANDLE.
+    //
+    // [Phase 4 Task 17, FG7] Same suspended short-circuit as
+    // acquireNextImage() above: while isSuspended() is true, returns
+    // SwapchainStatus::Suspended without calling vkQueuePresentKHR
+    // (presentCallCount() likewise only counts the real call).
     SwapchainStatus present(uint32_t imageIndex, VkSemaphore wait);
 
     // Waits for the device to go idle, destroys the current swapchain, and
@@ -225,7 +251,67 @@ public:
     // caller of this function (resize/NeedsRecreate handling, or a sample
     // applying --vsync at startup) gets that behavior for free, with no
     // separate "apply present mode" path to call.
-    bool recreateSwapchain(VkSurfaceKHR surface);
+    //
+    // ZERO-EXTENT/MINIMIZE GUARD [Phase 4 Task 17, FG7, gate ruling #25]:
+    // after destroying the existing swapchain (as above), this function
+    // queries the surface's CURRENT extent -- via `extentOverride` if the
+    // caller supplied one, otherwise via a real
+    // vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice_, surface,
+    // ...) call against `surface` itself. If that extent has width==0 ||
+    // height==0, this function skips vkb::SwapchainBuilder::build() ENTIRELY
+    // (no swapchain object created or touched), enters the suspended-present
+    // state (isSuspended() becomes true -- see acquireNextImage()/present()
+    // above), and returns true (this IS the successful outcome: "no work to
+    // do yet" is not a failure). Once a later call observes a nonzero
+    // extent, the normal build path below runs and isSuspended() clears --
+    // "resume on restore".
+    //
+    // `extentOverride` is a dependency-injection seam [gate ruling #25,
+    // matrix row 6] added specifically so this guard's LOGIC is unit-testable
+    // without a display server that will actually report a zero-sized
+    // surface: a GPU test can call recreateSwapchain(surface,
+    // VkExtent2D{0, 0}) directly. Production call sites never pass this
+    // (std::nullopt, the default) -- every real call (resize-driven
+    // NeedsRecreate, a --vsync/--fullscreen startup application, or the
+    // present loop's own suspended-retry call) always re-queries the real
+    // surface, which is what lets a genuine OS-level minimize on X11/Win32
+    // (VkSurfaceCapabilitiesKHR::currentExtent literally becomes (0,0) --
+    // Khronos WSI spec, Win32/Xcb/Xlib surfaces) get caught here BEFORE ever
+    // reaching the VUID-VkSwapchainCreateInfoKHR-imageExtent-01689
+    // violation this guard exists to prevent -- with NO special-casing
+    // needed at any call site.
+    //
+    // WAYLAND NOTE (design correction, matrix conflict 1): on Wayland,
+    // `currentExtent` is the (0xFFFFFFFF, 0xFFFFFFFF) "surface determines
+    // its own size" sentinel, never a real (0,0) -- this guard's
+    // width==0||height==0 check correctly never fires for that sentinel
+    // (0xFFFFFFFF != 0), so a Wayland surface always falls through to the
+    // normal build path exactly as it did before this task. This engine has
+    // NO reliable zero-extent signal on Wayland at all (matrix row 3) --
+    // see Window::logWaylandMinimizeLimitationOnce() for the one-shot,
+    // diagnosable-not-silent acknowledgment of that gap.
+    bool recreateSwapchain(VkSurfaceKHR surface, std::optional<VkExtent2D> extentOverride = std::nullopt);
+
+    // True while this Device is in the suspended-present state (the most
+    // recent recreateSwapchain() call observed a 0x0 extent and skipped
+    // building a real swapchain). swapchain()/swapchainImages() are
+    // VK_NULL_HANDLE/empty for the whole duration. Cleared the next time
+    // recreateSwapchain() observes a nonzero extent.
+    bool isSuspended() const { return suspended_; }
+
+    // Test/diagnostic accessors [Phase 4 Task 17, gate ruling #25: "present
+    // skip asserted by CALL COUNTS, never wall-clock"] -- mirror
+    // rx::rhi::Uploader's everUsedDirectPath()/ringWrapCount() convention
+    // (upload.h): production code has no need for these. Count the number
+    // of times this Device has actually issued the real
+    // vkAcquireNextImageKHR/vkQueuePresentKHR call respectively, across its
+    // whole lifetime -- NOT the number of times acquireNextImage()/
+    // present() were merely CALLED (a call made while suspended returns
+    // early and does not increment either counter). A test drives N
+    // suspended frames and asserts these stay exactly at their pre-loop
+    // values.
+    uint64_t acquireCallCount() const { return acquireCallCount_; }
+    uint64_t presentCallCount() const { return presentCallCount_; }
 
 private:
     Device() = default;
@@ -261,6 +347,12 @@ private:
     // What the ladder actually resolved `desiredPresentMode_` to, as
     // reported back by vk-bootstrap. Returned by presentMode().
     VkPresentModeKHR actualPresentMode_ = VK_PRESENT_MODE_FIFO_KHR;
+
+    // [Phase 4 Task 17, FG7] See recreateSwapchain()/isSuspended()'s own
+    // comments above.
+    bool suspended_ = false;
+    uint64_t acquireCallCount_ = 0;
+    uint64_t presentCallCount_ = 0;
 };
 
 }  // namespace rx::rhi

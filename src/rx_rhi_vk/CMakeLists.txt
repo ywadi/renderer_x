@@ -42,13 +42,17 @@ target_include_directories(rx_rhi_vk PUBLIC include ${volk_SOURCE_DIR} ${vma_SOU
 target_link_libraries(rx_rhi_vk PUBLIC rx_core vk-bootstrap::vk-bootstrap rx_shader_layout_types)
 target_compile_definitions(rx_rhi_vk PUBLIC VK_NO_PROTOTYPES)
 
-# Sixteen test translation units now (context_test.cpp, device_test.cpp,
+# Seventeen test translation units now (context_test.cpp, device_test.cpp,
 # buffer_test.cpp, clear_color_test.cpp, frame_sync_test.cpp,
 # pipeline_layout_test.cpp, bindless_test.cpp, upload_test.cpp,
 # deletion_queue_test.cpp, texture_test.cpp, descriptor_arena_test.cpp,
 # memory_report_test.cpp, memory_budget_test.cpp, oom_handling_test.cpp,
 # eviction_contract_test.cpp [Phase 4 Task 10], bda_test.cpp [Phase 4
-# Stage 1 Task 12, spec D26.4]), so -- like rx_core_tests, and unlike this
+# Stage 1 Task 12, spec D26.4], window_state_test.cpp [Phase 4 Stage 1
+# Task 17, FG7 -- the zero-extent-guard DI seam, present-skip call counts,
+# the D25 uploads-not-gated interaction, and the borderless-fullscreen
+# double-toggle, all against a real Device]), so -- like rx_core_tests, and
+# unlike this
 # target before device_test.cpp existed -- doctest's runtime/main is
 # implemented once in a dedicated tests/doctest_main.cpp shared by all
 # sixteen, rather than in any one test file. doctest_main.cpp also links
@@ -86,6 +90,7 @@ add_executable(rx_rhi_vk_tests
     tests/oom_handling_test.cpp
     tests/eviction_contract_test.cpp
     tests/bda_test.cpp
+    tests/window_state_test.cpp
 )
 target_link_libraries(rx_rhi_vk_tests PRIVATE rx_rhi_vk rx_platform doctest::doctest)
 add_test(NAME rx_rhi_vk_tests COMMAND rx_rhi_vk_tests)

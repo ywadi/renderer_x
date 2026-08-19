@@ -86,6 +86,13 @@ TEST_CASE("FrameSync runs a real frames-in-flight acquire/submit/present loop") 
         REQUIRE(vkWaitForFences(vkDevice, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS);
 
         auto acquire = device->acquireNextImage(frameSync->currentImageAvailableSemaphore());
+        // [Phase 4 Task 17, FG7, gate matrix-issue25 row 8 regression CHECK]
+        // A normal 64x64 HIDDEN window's queried surface extent is never
+        // (0, 0) -- the zero-extent guard must never engage during this
+        // fixture's own run, proving it is not silently absorbing/masking
+        // the pre-existing NeedsRecreate tolerance documented above rather
+        // than genuinely never triggering.
+        CHECK_FALSE(device->isSuspended());
         if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
             REQUIRE(vkDeviceWaitIdle(vkDevice) == VK_SUCCESS);
             REQUIRE(device->recreateSwapchain(surface));
@@ -93,6 +100,7 @@ TEST_CASE("FrameSync runs a real frames-in-flight acquire/submit/present loop") 
             continue;
         }
         REQUIRE(acquire.status != rx::rhi::SwapchainStatus::DeviceLost);
+        REQUIRE(acquire.status != rx::rhi::SwapchainStatus::Suspended);
 
         REQUIRE(vkResetFences(vkDevice, 1, &fence) == VK_SUCCESS);
 
@@ -149,6 +157,8 @@ TEST_CASE("FrameSync runs a real frames-in-flight acquire/submit/present loop") 
     // production present loop's shutdown sequence does.
     REQUIRE(vkDeviceWaitIdle(vkDevice) == VK_SUCCESS);
 
+    // [gate matrix-issue25 row 8] Still false after the whole run.
+    CHECK_FALSE(device->isSuspended());
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 

@@ -99,6 +99,28 @@ convert quadrant4x4.png -filter point -resize 8x8 quadrant8x8.png
 cp quadrant8x8.png "${OUT_DIR}/quadrant.png"
 convert quadrant8x8.png -quality 95 "${OUT_DIR}/quadrant.jpg"
 
+# --- Slot-swap discrimination fixture set [helmet-texture-fix verification
+# gap] -- five DISTINCT, pure-primary/secondary colors (every channel
+# either 0 or 255 -- deliberately, so a baseColor/emissive readback is
+# byte-exact regardless of whether the render pipeline used to read it
+# back applies an sRGB<->linear round-trip: the sRGB transfer function is
+# the identity at both 0 and 255), one per StandardPBR texture slot
+# (baseColor/metallicRoughness/normal/occlusion/emissive), consumed by
+# cube_slot_swap_probe.gltf (texture_cache_test.cpp's own "slot-swap
+# discrimination" TEST_CASE). Every color is chosen so that landing in the
+# WRONG slot is unmistakable from landing in its own -- in particular
+# slot_swap_metalrough.png is pure GREEN so a baseColor<->
+# metallicRoughness swap (the failure pattern this fixture exists to
+# catch -- reproduced directly in that test's own revert-and-confirm
+# procedure) reads as an obviously wrong green baseColor. Flat 4x4 (not a
+# quadrant pattern): the assertion this fixture backs is "this whole
+# texture is exactly color X", which only a flat fixture makes exact.
+convert -size 4x4 xc:"#FF0000" "${OUT_DIR}/slot_swap_basecolor.png"    # baseColor: red.
+convert -size 4x4 xc:"#00FF00" "${OUT_DIR}/slot_swap_metalrough.png"   # metallicRoughness: green.
+convert -size 4x4 xc:"#0000FF" "${OUT_DIR}/slot_swap_normal.png"       # normal: blue.
+convert -size 4x4 xc:"#FF00FF" "${OUT_DIR}/slot_swap_occlusion.png"    # occlusion: magenta.
+convert -size 4x4 xc:"#00FFFF" "${OUT_DIR}/slot_swap_emissive.png"     # emissive: cyan.
+
 # 16-bit-per-channel PNG [D10 "16-bit PNG downconvert documented"] --
 # ImageMagick's -depth 16 on a PNG output produces a genuine 16-bit PNG
 # (verified via `identify` below the generation block).

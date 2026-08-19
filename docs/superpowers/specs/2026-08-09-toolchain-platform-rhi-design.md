@@ -322,6 +322,18 @@ it is out of scope for *this* spec only, not out of scope for the project:
     asyncUploadTimeSlice precedent); import priorities (streaming
     phase, with residency priorities). Phase 4 ships abandon-style
     cancellation; prioritized cancel goes here.
+  - Byte-source IO routing for sub-resource reads (streaming/VFS
+    phase, recorded 2026-08-18 from Task 15's adjudicated deviation):
+    Phase 4 routes only the glTF DOCUMENT bytes through the pinned IO
+    thread; buffer/image byte-source reads run on compute workers —
+    zero practical risk for in-memory/filesystem sources, but a slow
+    host byte source (VFS/network — the abstraction's purpose) would
+    block compute workers on IO. When the streaming/VFS phase makes
+    slow sources real, ALL byte-source reads move to IO-pool routing
+    (background IO pool per Godot/Unreal precedent, not necessarily
+    the single pinned thread). The debug thread-id assertion
+    ("decode never runs on the IO thread") already guards the other
+    half and carries forward.
   - Gamepad rumble/haptics/touchpad consumption (SDK/platform phase —
     per-call methods on the existing handle map, retrofit-safe); gyro
     consumption gated on SDL Deck support (libsdl-org/SDL#9148 watch:
@@ -343,6 +355,91 @@ it is out of scope for *this* spec only, not out of scope for the project:
     transitive-link-closure assertion landing with the ImGui module
     ("core libs stay ImGui-free") is recorded as the reusable pattern
     for every future layer-boundary claim.
+- **Techniques-phase charter: advanced material & lighting renderer**
+  (user-directed 2026-08-19; a CHARTER, not a frozen spec — the
+  techniques-phase spec refines it, but the direction, sources, and
+  priority order below are binding starting points; supersedes-by-
+  consolidation the individual FG1/FG2/FG8 lines above, which remain
+  valid and fold into this program). Objective: a serious modern
+  material renderer, not a basic metallic+roughness+GGX implementation.
+  - **Reference sources (per the port-don't-reinvent rule; licenses
+    recorded at adoption):** Google **Filament** (Apache-2.0) as the
+    canonical core-PBR source — Cook-Torrance/GGX/Smith with energy
+    compensation for single-scattering (matters on rough metals),
+    clearcoat, anisotropy, sheen/cloth, IBL, refraction/absorption,
+    froxel-based clustered lighting, shadow techniques, HDR post.
+    IMPORTANT: port from Filament's CURRENT `shaders/` implementation
+    as canonical, never from its documentation prose — a clearcoat
+    documentation discrepancy (identified June 2026) is resolved
+    correctly only in the shader code. Khronos **glTF Sample Viewer**
+    (Apache-2.0) as the material-vocabulary + reference-conformance
+    source (its full extension set: clearcoat, sheen, anisotropy,
+    specular, IOR, transmission, volume, dispersion, iridescence,
+    diffuse transmission, emissive strength). NVIDIA **Falcor**
+    (BSD-class; bundled NVIDIA SDKs like RTXDI/NRD/DLSS carry their
+    own licenses — adopt Falcor patterns, not those SDKs, without a
+    separate license decision) as the how-to-express-it-in-Slang
+    reference. LTC area-light reference code from the original
+    authors (permissive redistribution).
+  - **Shader architecture:** ported PBR core organized as composable
+    Slang modules (BRDF / StandardMaterial / ClearCoat / Sheen /
+    Anisotropy / Transmission / IBL / Lighting / Shadows) with the
+    lobe structure diffuse(Lambert) + specular(GGX/Smith+Fresnel) +
+    clearcoat(GGX), each lobe fed by both direct lighting and IBL.
+    The flagship material grows toward the full glTF-extension
+    parameter set (baseColor, metallic, roughness, ior, specular,
+    clearcoat+roughness, anisotropy, sheen, transmission, thickness,
+    attenuationColor/Distance, dispersion, iridescence+thickness,
+    diffuseTransmission, emissive) — with feature permutation via the
+    existing specialization-bit system / Slang generics so materials
+    only pay for the features they use (D28's axis + Phase-3 D8
+    variant machinery are the prepaid seams).
+  - **Glass is REAL transmission, never alpha blending:** transmissive
+    BTDF keeping the Fresnel surface reflection; thin-surface mode
+    (IOR/transmission/roughness/tint — windows, spectacles) and
+    thick-volume mode (thickness map + Beer-Lambert absorption
+    `T = exp(-absorption·distance)` via attenuationColor/Distance —
+    bottles, liquids; per the Khronos thickness-approximation design
+    for raster). Refraction samples a scene-color source:
+    screen-space refraction first, environment/probe fallback on
+    miss. **Frosted glass:** the opaque scene color renders into an
+    HDR mip chain and transmission roughness selects the mip
+    (sharp→blurred→frosted) — Filament's refractive-scatter model.
+  - **Lighting: clustered Forward+** (Filament froxel reference — its
+    compute-shader light-assignment is published; translate GLSL→
+    Slang): camera-frustum froxels with per-cluster light lists;
+    directional/point/spot/area at hundreds-to-thousands of local
+    lights. Physical light intensities/units. **Area lights via LTC**
+    (rect panels/screens/softboxes — the "suddenly looks AAA"
+    feature). Punctual-light import consumption (KHR_lights_punctual,
+    preserved since Phase 4) turns on here.
+  - **Environment/indirect (at least as important as the BRDF):** HDR
+    environment → SH (or irradiance-cubemap) diffuse + prefiltered
+    specular cubemap with roughness-selected mips + BRDF-integration
+    LUT; probes as the SSR fallback. SSR itself lands with the
+    scene-color chain. GI proper stays the last step (existing
+    layer-9 probes entry).
+  - **Shadows:** sun = cascaded shadow maps, first-quality filter =
+    **PCSS** (visible varying penumbra), EVSM later as the scalable
+    alternative; spot = shadow atlas; point = cubemap or
+    dual-paraboloid atlas; screen-space contact shadows. (Extends the
+    existing cascades registry line with the technique ladder.)
+  - **Frame pipeline target:** depth → shadows → clustered light
+    assignment → opaque lighting → SSR → scene-color mip chain →
+    glass/transmission → particles/transparency → bloom → tone
+    mapping (AgX/ACES-class, ties FG8 HDR output) → TAA.
+  - **Priority order (binding):** (1) Filament-quality GGX PBR,
+    (2) excellent HDR IBL, (3) physical light units + clustered
+    Forward+, (4) good shadow filtering, (5) clearcoat + anisotropy,
+    (6) real transmission/IOR/thickness glass, (7) SSR + probe
+    fallback, (8) LTC area lights, (9) sheen/cloth, (10) iridescence
+    + dispersion, (11) diffuse transmission (leaves/wax), (12) then
+    GI.
+  - Import-side note: every listed material extension is already
+    parsed and preserved/logged by the Phase 4 importer (gate
+    dispositions) — consumption here requires no importer rework;
+    TEXCOORD_1/COLOR_0 vertex-layout growth rides the first
+    sub-item that needs it.
 - **Scheduler sharing with host engines** (committed 2026-08-11, SDK
   phase): an embedding game engine must be able to make the renderer's
   task scheduler and its own job system ONE pool — via consumer-chosen
