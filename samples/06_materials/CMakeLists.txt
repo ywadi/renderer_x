@@ -18,15 +18,29 @@ rx_shader_deploy_runtime_libs(sample_06_materials)
 # directory's own layout, so main.cpp's SDL_GetBasePath()-relative
 # loadMaterial() calls find them identically in the build tree and in a
 # redistributed copy of this directory.
-add_custom_command(TARGET sample_06_materials POST_BUILD
+#
+# [Fix round, item 3] OUTPUT/DEPENDS-tracked, NOT a bare
+# `add_custom_command(TARGET ... POST_BUILD)` -- see samples/08_gltf_viewer/
+# CMakeLists.txt's own material_shaders deploy comment for the full
+# mechanism this avoids (a POST_BUILD recipe only re-runs when the TARGET
+# itself relinks, leaving an edited .slang source's deployed copy stale).
+set(RX_MATERIALS_OWN_SHADERS
+  "${CMAKE_CURRENT_SOURCE_DIR}/materials/checker.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/materials/rim.slang"
+)
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/materials_own_deploy.stamp"
   COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sample_06_materials>/materials"
-  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-          "${CMAKE_CURRENT_SOURCE_DIR}/materials/checker.slang"
-          "${CMAKE_CURRENT_SOURCE_DIR}/materials/rim.slang"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_MATERIALS_OWN_SHADERS}
           "$<TARGET_FILE_DIR:sample_06_materials>/materials/"
+  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/materials_own_deploy.stamp"
+  DEPENDS ${RX_MATERIALS_OWN_SHADERS}
   COMMENT "sample_06_materials: deploying materials/*.slang next to the binary"
   VERBATIM
 )
+add_custom_target(sample_06_materials_own_deploy
+  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/materials_own_deploy.stamp")
+add_dependencies(sample_06_materials sample_06_materials_own_deploy)
 
 # Deploys the SHARED rx_material shaders (shaders/material/material.slang +
 # forward_entry.slang) into a SIBLING material_shaders/ directory next to
@@ -42,15 +56,28 @@ add_custom_command(TARGET sample_06_materials POST_BUILD
 # (src/rx_material/include/rx_material/material_system.h) -- RX_MATERIAL_
 # SHADER_DIR stays the default for every OTHER caller (rx_material's own
 # unit/GPU tests), unchanged.
-add_custom_command(TARGET sample_06_materials POST_BUILD
+# [Fix round, item 3] OUTPUT/DEPENDS-tracked, NOT a bare
+# `add_custom_command(TARGET ... POST_BUILD)` -- see samples/08_gltf_viewer/
+# CMakeLists.txt's own material_shaders deploy comment for the full
+# mechanism this avoids (a POST_BUILD recipe only re-runs when the TARGET
+# itself relinks, leaving an edited .slang source's deployed copy stale).
+set(RX_MATERIALS_SHARED_SHADERS
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/material.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/forward_entry.slang"
+)
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/materials_shared_shader_deploy.stamp"
   COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sample_06_materials>/material_shaders"
-  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-          "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/material.slang"
-          "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/forward_entry.slang"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_MATERIALS_SHARED_SHADERS}
           "$<TARGET_FILE_DIR:sample_06_materials>/material_shaders/"
+  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/materials_shared_shader_deploy.stamp"
+  DEPENDS ${RX_MATERIALS_SHARED_SHADERS}
   COMMENT "sample_06_materials: deploying the shared rx_material shaders next to the binary"
   VERBATIM
 )
+add_custom_target(sample_06_materials_shared_shader_deploy
+  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/materials_shared_shader_deploy.stamp")
+add_dependencies(sample_06_materials sample_06_materials_shared_shader_deploy)
 
 # Runs the binary in headless mode with --validate: ctest is the developer/CI
 # gate, so it explicitly opts into the Vulkan validation layers on top of the

@@ -52,6 +52,14 @@ struct UnlitParams {
     // since sampling white multiplies baseColorFactor by exactly 1.0.
     uint baseColorTexture;
 
+    // [Fix round, sampler-wrap P0] The bindless SAMPLER index for
+    // `baseColorTexture` above -- see standard_pbr.slang's own
+    // `StandardPbrParams::baseColorSampler` comment for the full account
+    // of the defect this closes and where this value comes from
+    // (TextureCache::getOrCreateSamplerBindlessIndex(), resolved by
+    // samples/08_gltf_viewer/main.cpp's own resolveSamplerIndex()).
+    uint baseColorSampler;
+
     // [D28] MASK's cutoff -- a per-instance uniform with an ALWAYS-PRESENT
     // conditional discard below, per MaterialFixedFunctionState's own
     // header comment (material_system.h): alphaMode itself lives entirely
@@ -75,7 +83,8 @@ ParameterBlock<UnlitParams> gParams;
 struct Unlit : IMaterialShader {
     float4 evaluate(MaterialVertex v) {
         float2 uv = v.uv * gParams.baseColorUvOffsetScale.zw + gParams.baseColorUvOffsetScale.xy;
-        float4 color = gParams.baseColorFactor * rx_sampleTexture(gParams.baseColorTexture, uv);
+        float4 color = gParams.baseColorFactor *
+                       rx_sampleTexture(gParams.baseColorTexture, gParams.baseColorSampler, uv);
 
         // [D28] Always-present conditional discard -- see UnlitParams::
         // alphaCutoff's own comment above.

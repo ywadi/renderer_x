@@ -31,13 +31,25 @@ rx_shader_deploy_runtime_libs(sample_02_hotreload)
 # this build output directory (binary + hotreload.slang + the Slang
 # runtime libs above) works identically, which is the whole point of the
 # redistribution proof.
-add_custom_command(TARGET sample_02_hotreload POST_BUILD
+#
+# [Fix round, item 3] OUTPUT/DEPENDS-tracked, NOT a bare
+# `add_custom_command(TARGET ... POST_BUILD)` -- see samples/08_gltf_viewer/
+# CMakeLists.txt's own material_shaders deploy comment for the full
+# mechanism this avoids (a POST_BUILD recipe only re-runs when the TARGET
+# itself relinks, leaving an edited .slang source's deployed copy stale).
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/hotreload_shader_deploy.stamp"
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different
           "${CMAKE_CURRENT_SOURCE_DIR}/hotreload.slang"
           "$<TARGET_FILE_DIR:sample_02_hotreload>/hotreload.slang"
+  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/hotreload_shader_deploy.stamp"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/hotreload.slang"
   COMMENT "sample_02_hotreload: deploying hotreload.slang next to the binary"
   VERBATIM
 )
+add_custom_target(sample_02_hotreload_shader_deploy
+  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/hotreload_shader_deploy.stamp")
+add_dependencies(sample_02_hotreload sample_02_hotreload_shader_deploy)
 
 # Runs the binary in headless mode with --validate: ctest is the developer/CI
 # gate, so it explicitly opts into the Vulkan validation layers (requires the

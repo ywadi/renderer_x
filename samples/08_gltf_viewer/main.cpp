@@ -632,6 +632,34 @@ uint32_t resolveTextureIndex(rx::asset::TextureCache& textures, const rx::asset:
     return textures.resolve(ref.handle).bindlessIndex;
 }
 
+// [Fix round, sampler-wrap P0] Resolves `ref`'s bindless SAMPLER through
+// `textures`'s own per-texture sampler cache (TextureCache::
+// getOrCreateSamplerBindlessIndex()) -- THE actual fix for the shipped
+// sampler-wrap defect (helmet-sampler-fix-brief.md): every texture slot
+// used to sample through ONE hardcoded process-wide CLAMP_TO_EDGE sampler
+// (`app.defaultSampler`, above) regardless of that texture's own glTF wrap
+// mode. `ref.sampler` is passed straight through, present or not: for a
+// PRESENT slot it is either the real glTF sampler object import_gltf.cpp's
+// own fillRef() parsed (honoring that texture's real wrap/filter state) or,
+// if the glTF texture referenced no sampler object at all, `SamplerDesc`'s
+// own default-constructed values -- which ARE glTF's documented "sampler
+// unspecified" default (REPEAT wrap, auto filtering), NOT an engine-chosen
+// fallback. For an ABSENT slot (`!ref.present`) `ref.sampler` is that SAME
+// default-constructed value: the slot samples a role-neutral D11 fallback
+// texture (resolveTextureIndex() above), whose wrap mode is irrelevant, so
+// the spec-correct REPEAT default is exactly as harmless there as any
+// other choice would be, with no special-casing needed. `fallbackIndex`
+// (the caller's own already-resolved bindless index for `app.
+// defaultSampler`) is used ONLY on a genuine
+// getOrCreateSamplerBindlessIndex() failure (vkCreateSampler failure /
+// bindless sampler-capacity exhaustion) -- belt-and-suspenders, mirroring
+// resolveTextureIndex()'s own fallback philosophy above.
+uint32_t resolveSamplerIndex(rx::asset::TextureCache& textures, const rx::asset::TextureRef& ref,
+                              uint32_t fallbackIndex) {
+    std::optional<uint32_t> index = textures.getOrCreateSamplerBindlessIndex(ref.sampler);
+    return index.value_or(fallbackIndex);
+}
+
 std::array<float, 4> uvTransformParam(const rx::asset::TextureRef& ref) {
     return {ref.uvOffset.x, ref.uvOffset.y, ref.uvScale.x, ref.uvScale.y};
 }
@@ -838,22 +866,38 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
         return nullptr;
     }
 
-    // Default LINEAR/CLAMP_TO_EDGE sampler -- shared by the tonemap pass's
-    // own HDR read and (via MaterialSystem's own internal default sampler,
-    // used for material albedo/etc reads) every material's rx_sampleTexture
-    // -- matching the general "one process-wide default sampler" idiom
-    // material.slang's own header comment documents. Registered directly
-    // here (not through MaterialSystem, which already creates its OWN
-    // internal default sampler for material reads) since the TONEMAP pass
-    // is entirely outside MaterialSystem and needs its own registered
-    // index.
+    // Default LINEAR/REPEAT sampler -- shared by the tonemap pass's own HDR
+    // read (wrap mode irrelevant there: the fullscreen tonemap quad's own
+    // UVs never leave [0,1]) and, via `push.defaultSamplerIndex`
+    // (recordSceneDraws() below), `rx_sampleTexture`'s two-argument
+    // fallback overload and resolveSamplerIndex()'s own belt-and-
+    // suspenders fallback. Registered directly here (not through
+    // MaterialSystem, which creates its OWN internal default sampler,
+    // unused by this sample's D26.1 draw path -- see recordSceneDraws()'s
+    // own header comment) since the TONEMAP pass is entirely outside
+    // MaterialSystem and needs its own registered index.
+    //
+    // [Fix round, sampler-wrap P0] REPEAT, NOT the CLAMP_TO_EDGE this used
+    // to be hardcoded to: this WAS the actual sampler standard_pbr.slang/
+    // unlit.slang sampled EVERY texture slot through, unconditionally
+    // (via `rx_sampleTexture`'s old two-argument-only signature) --
+    // DamagedHelmet's own TEXCOORD_0 V lies wholly in [1.0005, 1.9987]
+    // (glTF-spec-legal, relying on glTF-default REPEAT), so every fragment
+    // clamped to V=1.0 and the whole mesh sampled each texture's bottom
+    // edge row. Real per-slot sampler wiring (setupMaterials()'s own
+    // resolveSamplerIndex(), StandardPbrParams/UnlitParams' new `*Sampler`
+    // fields) is the actual fix; this default's own wrap mode only matters
+    // as a fallback now, but REPEAT (glTF's OWN "sampler unspecified"
+    // default) is still the honest, spec-correct choice for it, matching
+    // MaterialSystem::create()'s own new default (material_system.cpp's
+    // `defaultSamplerInfo` comment has the full account).
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     samplerInfo.magFilter = VK_FILTER_LINEAR;
     samplerInfo.minFilter = VK_FILTER_LINEAR;
-    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
     if (vkCreateSampler(app->device->device(), &samplerInfo, nullptr, &app->defaultSampler) != VK_SUCCESS) {
         RX_LOG_ERROR("sample_08_gltf_viewer: vkCreateSampler (default sampler) failed");
@@ -1022,6 +1066,13 @@ bool setupMaterials(App& app, const rx::asset::Registry& registry,
             ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorTexture",
                                         resolveTextureIndex(*app.textureCache, asset.baseColorTexture,
                                                               rx::asset::TextureRole::BaseColor));
+            // [Fix round, sampler-wrap P0] real per-texture sampler --
+            // resolveSamplerIndex()'s own header comment has the full
+            // account; app.defaultSamplerHandle.index() is only reached on
+            // a genuine TextureCache failure (belt-and-suspenders).
+            ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorSampler",
+                                        resolveSamplerIndex(*app.textureCache, asset.baseColorTexture,
+                                                              app.defaultSamplerHandle.index()));
             ok = ok && setMaterialParam(binding.paramBlob, params, "alphaCutoff", appliedAlphaCutoff);
             ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorUvOffsetScale",
                                         uvTransformParam(asset.baseColorTexture));
@@ -1051,6 +1102,29 @@ bool setupMaterials(App& app, const rx::asset::Registry& registry,
             ok = ok && setMaterialParam(binding.paramBlob, params, "emissiveTexture",
                                         resolveTextureIndex(*app.textureCache, asset.emissiveTexture,
                                                               rx::asset::TextureRole::Emissive));
+            // [Fix round, sampler-wrap P0] one real per-texture sampler per
+            // slot -- see resolveSamplerIndex()'s own header comment (this
+            // file, above) for the full account. This is THE fix for
+            // DamagedHelmet's own broken render: its 5 texture slots all
+            // share the SAME glTF sampler object (an empty `{}`, i.e. glTF-
+            // default REPEAT/auto), so all 5 calls below dedupe to one real
+            // REPEAT-wrapping VkSampler/bindless index -- exactly what its
+            // TEXCOORD_0 V range ([1.0005,1.9987]) requires.
+            ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorSampler",
+                                        resolveSamplerIndex(*app.textureCache, asset.baseColorTexture,
+                                                              app.defaultSamplerHandle.index()));
+            ok = ok && setMaterialParam(binding.paramBlob, params, "metallicRoughnessSampler",
+                                        resolveSamplerIndex(*app.textureCache, asset.metallicRoughnessTexture,
+                                                              app.defaultSamplerHandle.index()));
+            ok = ok && setMaterialParam(binding.paramBlob, params, "normalSampler",
+                                        resolveSamplerIndex(*app.textureCache, asset.normalTexture,
+                                                              app.defaultSamplerHandle.index()));
+            ok = ok && setMaterialParam(binding.paramBlob, params, "occlusionSampler",
+                                        resolveSamplerIndex(*app.textureCache, asset.occlusionTexture,
+                                                              app.defaultSamplerHandle.index()));
+            ok = ok && setMaterialParam(binding.paramBlob, params, "emissiveSampler",
+                                        resolveSamplerIndex(*app.textureCache, asset.emissiveTexture,
+                                                              app.defaultSamplerHandle.index()));
             ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorUvOffsetScale",
                                         uvTransformParam(asset.baseColorTexture));
             ok = ok && setMaterialParam(binding.paramBlob, params, "metallicRoughnessUvOffsetScale",

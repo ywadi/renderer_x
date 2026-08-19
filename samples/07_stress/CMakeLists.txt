@@ -26,11 +26,22 @@ set(RX_STRESS_SHADERS
   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/stress/tonemap.vert.slang"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/stress/tonemap.frag.slang"
 )
-add_custom_command(TARGET sample_07_stress POST_BUILD
+# [Fix round, item 3] OUTPUT/DEPENDS-tracked, NOT a bare
+# `add_custom_command(TARGET ... POST_BUILD)` -- see samples/08_gltf_viewer/
+# CMakeLists.txt's own material_shaders deploy comment for the full
+# mechanism this avoids (a POST_BUILD recipe only re-runs when the TARGET
+# itself relinks, leaving an edited .slang source's deployed copy stale).
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/stress_shaders_deploy.stamp"
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_STRESS_SHADERS} "$<TARGET_FILE_DIR:sample_07_stress>/"
+  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/stress_shaders_deploy.stamp"
+  DEPENDS ${RX_STRESS_SHADERS}
   COMMENT "sample_07_stress: deploying shaders/stress/*.slang next to the binary"
   VERBATIM
 )
+add_custom_target(sample_07_stress_shaders_deploy
+  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/stress_shaders_deploy.stamp")
+add_dependencies(sample_07_stress sample_07_stress_shaders_deploy)
 
 # Headless correctness gate: --draws 16 (a 4x4 grid), NOT the interactive
 # --draws 30000 default [task-7-brief.md: "3 frames, then assert EXACT

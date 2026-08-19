@@ -125,7 +125,12 @@ static_assert(sizeof(DrawDataGpu) == 272, "DrawDataGpu must stay exactly 272 byt
 // (viewProj, light/ambient) lives in DrawDataGpu above instead, reached
 // indirectly via `drawDataBufferIndex`.
 struct MaterialGlobalsPush {
-    uint32_t defaultSamplerIndex = 0;  // bindless SAMPLER index -- material.slang's pre-D26.1 field, unchanged.
+    uint32_t defaultSamplerIndex = 0;  // bindless SAMPLER index -- material.slang's pre-D26.1 field, unchanged in
+                                        // shape. [Fix round, sampler-wrap P0] StandardPbr/Unlit no longer sample
+                                        // through this for real texture slots (they carry their own per-slot
+                                        // sampler indices in gParams) -- this is now only the two-argument
+                                        // rx_sampleTexture() overload's fallback; see material.slang's own header
+                                        // comment.
     uint32_t drawDataBufferIndex = 0;  // bindless STORAGE BUFFER index of the DrawDataGpu[] this draw reads.
     float exposure = 0.0F;             // pre-tonemap 2^exposure multiplier (0.0 = neutral, no-op: 2^0 == 1).
 };

@@ -64,6 +64,28 @@ struct StandardPbrParams {
     uint occlusionTexture;
     uint emissiveTexture;
 
+    // [Fix round, sampler-wrap P0] One bindless SAMPLER index per texture
+    // slot above -- the actual fix for the shipped sampler-wrap defect
+    // (material.slang's own rx_sampleTexture header comment has the full
+    // account): every slot used to sample through ONE hardcoded
+    // process-wide CLAMP_TO_EDGE sampler regardless of that texture's own
+    // glTF wrap mode, which silently broke any asset relying on
+    // glTF-default REPEAT for UVs outside [0,1] (DamagedHelmet's own
+    // TEXCOORD_0 V, wholly in [1.0005,1.9987]). Populated at material-
+    // resolution time (samples/08_gltf_viewer/main.cpp's own
+    // resolveSamplerIndex()) from `TextureCache::
+    // getOrCreateSamplerBindlessIndex()` -- the REAL per-texture sampler
+    // this engine already built and bindless-registered from each
+    // texture's own glTF sampler object (or the glTF spec's own
+    // "unspecified" default -- REPEAT wrap, auto filtering -- when a
+    // texture references no sampler object at all), analogous to the
+    // texture-index fields immediately above.
+    uint baseColorSampler;
+    uint metallicRoughnessSampler;
+    uint normalSampler;
+    uint occlusionSampler;
+    uint emissiveSampler;
+
     // KHR_texture_transform per texture slot [consume-now, gate ruling C4]:
     // xy = UV offset, zw = UV scale. Neutral default (0,0,1,1) per slot.
     float4 baseColorUvOffsetScale;
@@ -92,7 +114,8 @@ struct StandardPbr : IMaterialShader {
     float4 evaluate(MaterialVertex v) {
         // --- Base color ---------------------------------------------------
         float2 baseColorUv = v.uv * gParams.baseColorUvOffsetScale.zw + gParams.baseColorUvOffsetScale.xy;
-        float4 baseColor = gParams.baseColorFactor * rx_sampleTexture(gParams.baseColorTexture, baseColorUv);
+        float4 baseColor = gParams.baseColorFactor *
+                            rx_sampleTexture(gParams.baseColorTexture, gParams.baseColorSampler, baseColorUv);
 
         // [D28] Always-present conditional discard -- see
         // StandardPbrParams::alphaCutoff's own comment above.
@@ -104,7 +127,7 @@ struct StandardPbr : IMaterialShader {
         // "green channel contains roughness... blue channel contains
         // metalness"] --------------------------------------------------
         float2 mrUv = v.uv * gParams.metallicRoughnessUvOffsetScale.zw + gParams.metallicRoughnessUvOffsetScale.xy;
-        float4 mrSample = rx_sampleTexture(gParams.metallicRoughnessTexture, mrUv);
+        float4 mrSample = rx_sampleTexture(gParams.metallicRoughnessTexture, gParams.metallicRoughnessSampler, mrUv);
         float roughness = clamp(gParams.roughnessFactor * mrSample.g, kMinRoughness, 1.0);
         float metallic = clamp(gParams.metallicFactor * mrSample.b, 0.0, 1.0);
 
@@ -112,7 +135,7 @@ struct StandardPbr : IMaterialShader {
         // reconstruction [D10: normal -> BC5_UNORM, "Z reconstructed in
         // shader"] -----------------------------------------------------
         float2 nUv = v.uv * gParams.normalUvOffsetScale.zw + gParams.normalUvOffsetScale.xy;
-        float4 nSample = rx_sampleTexture(gParams.normalTexture, nUv);
+        float4 nSample = rx_sampleTexture(gParams.normalTexture, gParams.normalSampler, nUv);
         // [0,1] texel -> [-1,1] tangent-space XY, scaled by normalScale
         // BEFORE reconstruction (standard convention: scale perturbs the
         // tangent-plane offset, not the reconstructed unit length).
@@ -144,12 +167,13 @@ struct StandardPbr : IMaterialShader {
         // --- Occlusion [core spec closed-form formula, quoted in the gate
         // matrix: "1.0 + strength * (occlusionTexture - 1.0)"] ----------
         float2 occUv = v.uv * gParams.occlusionUvOffsetScale.zw + gParams.occlusionUvOffsetScale.xy;
-        float occSample = rx_sampleTexture(gParams.occlusionTexture, occUv).r;
+        float occSample = rx_sampleTexture(gParams.occlusionTexture, gParams.occlusionSampler, occUv).r;
         float occlusion = 1.0 + gParams.occlusionStrength * (occSample - 1.0);
 
         // --- Emissive -------------------------------------------------
         float2 emUv = v.uv * gParams.emissiveUvOffsetScale.zw + gParams.emissiveUvOffsetScale.xy;
-        float3 emissive = gParams.emissiveFactorAndPad.xyz * rx_sampleTexture(gParams.emissiveTexture, emUv).rgb;
+        float3 emissive = gParams.emissiveFactorAndPad.xyz *
+                           rx_sampleTexture(gParams.emissiveTexture, gParams.emissiveSampler, emUv).rgb;
 
         // --- Lambertian diffuse + GGX/Smith-correlated/Schlick specular,
         // one directional light [BRDF baseline, this file's own header

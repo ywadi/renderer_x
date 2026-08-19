@@ -33,17 +33,38 @@ rx_shader_deploy_runtime_libs(sample_08_gltf_viewer)
 # 06_materials/CMakeLists.txt's own identical deployment for the identical
 # reason (MaterialSystem::create()'s `sharedShaderDir` parameter, resolved
 # at runtime via SDL_GetBasePath() in main.cpp's basePathDirectory()).
-add_custom_command(TARGET sample_08_gltf_viewer POST_BUILD
+#
+# [Fix round, item 3 -- mandatory, the hazard already bit this exact
+# workstream in-session] OUTPUT/DEPENDS-tracked (a real custom_command +
+# custom_target), NOT a bare `add_custom_command(TARGET ... POST_BUILD)` --
+# that form runs ONLY when the TARGET ITSELF relinks, so editing just a
+# shared .slang file (no C++ source touched) leaves the deployed copy
+# stale until something unrelated forces a relink, and the sample silently
+# keeps running the OLD shader (Ninja reports "no work to do") -- exactly
+# the mechanism that produced a clean-HEAD sample_08 OutputNotConsumed
+# failure this fix round's own in-session development. Same OUTPUT+stamp+
+# custom_target+add_dependencies shape as this file's own
+# `references.stamp`/`sample_08_gltf_viewer_references` block below --
+# see that block's own comment for the full mechanism.
+set(RX_GLTF_VIEWER_MATERIAL_SHADERS
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/material.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/forward_entry.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/standard_pbr.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/unlit.slang"
+)
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/material_shaders_deploy.stamp"
   COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sample_08_gltf_viewer>/material_shaders"
-  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-          "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/material.slang"
-          "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/forward_entry.slang"
-          "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/standard_pbr.slang"
-          "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/unlit.slang"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_GLTF_VIEWER_MATERIAL_SHADERS}
           "$<TARGET_FILE_DIR:sample_08_gltf_viewer>/material_shaders/"
+  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/material_shaders_deploy.stamp"
+  DEPENDS ${RX_GLTF_VIEWER_MATERIAL_SHADERS}
   COMMENT "sample_08_gltf_viewer: deploying the shared rx_material shaders next to the binary"
   VERBATIM
 )
+add_custom_target(sample_08_gltf_viewer_material_shaders
+  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/material_shaders_deploy.stamp")
+add_dependencies(sample_08_gltf_viewer sample_08_gltf_viewer_material_shaders)
 
 # The forward pass's own tonemap half reuses shaders/multipass/tonemap.{vert,
 # frag}.slang VERBATIM (this task's own binding constraint: "you may NOT
@@ -51,16 +72,25 @@ add_custom_command(TARGET sample_08_gltf_viewer POST_BUILD
 # pass instead, see forward_entry.slang's own fragmentMain) -- deployed next
 # to the binary exactly like samples/05_multipass's own two files (flat, no
 # "multipass/" subdirectory in the deployed layout).
+#
+# [Fix round, item 3] Same OUTPUT/DEPENDS conversion as the material_shaders
+# block just above -- see that block's own comment for the full rationale.
 set(RX_GLTF_VIEWER_TONEMAP_SHADERS
   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/tonemap.vert.slang"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/tonemap.frag.slang"
 )
-add_custom_command(TARGET sample_08_gltf_viewer POST_BUILD
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/tonemap_shaders_deploy.stamp"
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_GLTF_VIEWER_TONEMAP_SHADERS}
           "$<TARGET_FILE_DIR:sample_08_gltf_viewer>/"
+  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/tonemap_shaders_deploy.stamp"
+  DEPENDS ${RX_GLTF_VIEWER_TONEMAP_SHADERS}
   COMMENT "sample_08_gltf_viewer: deploying the shared tonemap shaders next to the binary"
   VERBATIM
 )
+add_custom_target(sample_08_gltf_viewer_tonemap_shaders
+  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/tonemap_shaders_deploy.stamp")
+add_dependencies(sample_08_gltf_viewer sample_08_gltf_viewer_tonemap_shaders)
 
 # D17 committed reference PNGs (256x256, lavapipe-rendered) -- deployed next
 # to the binary so main.cpp's basePathDirectory()-relative resolution finds

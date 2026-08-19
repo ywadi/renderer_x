@@ -22,13 +22,30 @@ add_dependencies(sample_01_triangle triangle_shaders)
 # shaders are precompiled offline by slangc at build time, not compiled
 # in-process -- so these two files are the entire redistribution surface a
 # copy of this sample's directory needs beyond the binary itself.
-add_custom_command(TARGET sample_01_triangle POST_BUILD
+#
+# [Fix round, item 3] OUTPUT/DEPENDS-tracked, NOT a bare
+# `add_custom_command(TARGET ... POST_BUILD)` -- that form only re-runs when
+# the TARGET ITSELF relinks, so a `triangle_shaders` recompile (edit
+# triangle.vert.slang/triangle.frag.slang -> shaders/CMakeLists.txt's own
+# tracked slangc custom command regenerates RX_TRIANGLE_VERT_SPV/
+# RX_TRIANGLE_FRAG_SPV) would leave THIS deployed copy stale until an
+# unrelated relink -- the identical class of hazard samples/08_gltf_viewer/
+# CMakeLists.txt's own material_shaders/tonemap deploy steps had (see that
+# file's own comment for the full mechanism, including the in-session
+# incident that made this fix mandatory project-wide).
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/triangle_shaders_deploy.stamp"
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different
           "${RX_TRIANGLE_VERT_SPV}" "${RX_TRIANGLE_FRAG_SPV}"
           "$<TARGET_FILE_DIR:sample_01_triangle>/"
+  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/triangle_shaders_deploy.stamp"
+  DEPENDS "${RX_TRIANGLE_VERT_SPV}" "${RX_TRIANGLE_FRAG_SPV}"
   COMMENT "sample_01_triangle: deploying precompiled SPIR-V next to the binary"
   VERBATIM
 )
+add_custom_target(sample_01_triangle_shaders_deploy
+  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/triangle_shaders_deploy.stamp")
+add_dependencies(sample_01_triangle sample_01_triangle_shaders_deploy)
 
 # Runs the binary in headless mode with --validate: ctest is the developer/CI
 # gate, so it explicitly opts into the Vulkan validation layers (requires the

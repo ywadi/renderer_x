@@ -252,9 +252,31 @@ public:
     // material.slang/forward_entry.slang gets the exact same "file could
     // not be read" nullptr-and-RX_LOG_ERROR failure this method already
     // documents for that case.
+    //
+    // `defaultSamplerAddressMode` [Fix round, sampler-wrap P0]: the wrap
+    // mode of this instance's ONE process-wide default sampler --
+    // material.slang's own `gMaterialGlobals.defaultSamplerIndex` /
+    // `rx_sampleTexture`'s two-argument overload (material.slang's own
+    // header comment has the full account of what this sampler is for
+    // post-fix: a fallback for a material that does not wire its own
+    // per-slot sampler, NOT the one sampler every texture slot samples
+    // through -- that was the shipped defect this fix round closes).
+    // Defaults to `VK_SAMPLER_ADDRESS_MODE_REPEAT`, glTF's OWN documented
+    // default ("sampler unspecified" -> repeat wrapping) -- every existing
+    // caller keeps compiling and gets the spec-correct default without
+    // passing this parameter at all. Task 4's own seam-bleed GPU test
+    // (test_api_factory.cpp, a deliberately non-tiled 2x2 test texture
+    // sampled right up to its UV 0/1 edge) is the one caller that passes
+    // `VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE` explicitly here -- see that
+    // test's own header comment for why CLAMP_TO_EDGE is still the right
+    // choice for THAT specific non-tiling content, now requested
+    // explicitly rather than inherited from a process-wide default that no
+    // longer defaults to it.
     static std::unique_ptr<MaterialSystem> create(rx::rhi::Device& device, rx::rhi::BindlessTable& bindless,
                                                     const std::filesystem::path& pipelineCachePath,
-                                                    const std::filesystem::path& sharedShaderDir = {});
+                                                    const std::filesystem::path& sharedShaderDir = {},
+                                                    VkSamplerAddressMode defaultSamplerAddressMode =
+                                                        VK_SAMPLER_ADDRESS_MODE_REPEAT);
 
     // Loads the Slang module at `slangModulePath` as a material: reads its
     // bytes (moduleHash() below), compiles+composes+links it against the

@@ -1322,7 +1322,8 @@ MaterialSystem::~MaterialSystem() {
 
 std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device, rx::rhi::BindlessTable& bindless,
                                                          const std::filesystem::path& pipelineCachePath,
-                                                         const std::filesystem::path& sharedShaderDir) {
+                                                         const std::filesystem::path& sharedShaderDir,
+                                                         VkSamplerAddressMode defaultSamplerAddressMode) {
     rx::core::log::init();
 
     // [Task 8] Resolve ONCE, here: `sharedShaderDir` if the caller passed a
@@ -1432,42 +1433,53 @@ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device, 
         return nullptr;
     }
 
-    // [Task 4] The single default LINEAR-filtering sampler every material's
-    // rx_sampleTexture() call samples with -- see material.slang's own
-    // header comment, and Impl::defaultSampler's, for why this is created
-    // and registered exactly once here rather than per-material or
-    // per-texture. LINEAR + no LOD clamp matches this codebase's own
-    // already-established "general-purpose color texture" sampler recipe
-    // (samples/03_bindless_mesh's own `linearInfo`) -- as opposed to sample
-    // 05's own NEAREST + CLAMP_TO_EDGE shadow/tonemap sampler, which has its
-    // own depth-comparison/1:1-copy reasons to differ.
+    // [Task 4, superseded -- Fix round sampler-wrap P0] The single default
+    // LINEAR-filtering sampler `rx_sampleTexture()`'s TWO-ARGUMENT overload
+    // samples with (material.slang's own header comment has the current,
+    // correct account) -- created and registered exactly once here.
+    // LINEAR + no LOD clamp matches this codebase's own already-established
+    // "general-purpose color texture" sampler recipe (samples/
+    // 03_bindless_mesh's own `linearInfo`) -- as opposed to sample 05's own
+    // NEAREST + CLAMP_TO_EDGE shadow/tonemap sampler, which has its own
+    // depth-comparison/1:1-copy reasons to differ.
     //
-    // CLAMP_TO_EDGE, not sample 03's own REPEAT: this is this engine's ONE
-    // process-wide DEFAULT sampler (per-material sampler selection is
-    // explicit future work -- see this file's own header comment), used for
-    // whatever a material's own UV parameterization happens to be. A
-    // material sampling right up to UV 0/1 at a mesh seam (the common case
-    // for a unique, non-tiled albedo map -- exactly this task's own GPU
-    // test fixture, a 2x2 texture covering one quad with no tiling intent
-    // at all) gets WRONG-NEIGHBOR bleed under REPEAT (the opposite edge
-    // wraps into the filter's blend) but a well-defined, edge-duplicated
-    // result under CLAMP_TO_EDGE -- verified directly by hand and by this
-    // task's own GPU test (see task-4-report.md): REPEAT was tried first
-    // and produced exactly this 4-way-blended-corner artifact at this
-    // task's own quadrant probes, which is not a test-tuning problem but a
-    // real default-sampler-shape choice this task got to make. A material
-    // that genuinely wants tiling can still get it (a future per-material/
-    // per-texture sampler selection is real, supportable future work, not
-    // built speculatively here since nothing tests it yet); CLAMP_TO_EDGE
-    // is the safer default absent that.
+    // WRAP MODE -- `defaultSamplerAddressMode` (this method's own
+    // parameter, default `VK_SAMPLER_ADDRESS_MODE_REPEAT`), NOT the
+    // CLAMP_TO_EDGE this used to be hardcoded to: this WAS a real, shipped
+    // defect (not a hypothetical) -- this was this engine's ONE
+    // process-wide sampler EVERY material's EVERY texture slot sampled
+    // through, unconditionally, regardless of that texture's own glTF wrap
+    // mode. DamagedHelmet's own TEXCOORD_0 V lies wholly in
+    // [1.0005, 1.9987] (glTF-spec-legal, relying on the glTF-default REPEAT
+    // wrap) -- under the old hardcoded CLAMP_TO_EDGE, every fragment's V
+    // clamped to 1.0 and the whole mesh sampled each texture's bottom edge
+    // row (black dome, green jaw blob, zero emissive -- see
+    // helmet-texture-fix-report.md's supersede section for the full
+    // account). REPEAT is also glTF's OWN documented default ("sampler
+    // unspecified" -> repeat wrapping, auto filtering) -- the spec-correct
+    // choice for this fallback now that real per-slot sampler wiring
+    // (StandardPbrParams/UnlitParams' own `*Sampler` fields,
+    // TextureCache::getOrCreateSamplerBindlessIndex()) is what every
+    // shipped material actually samples through; this process-wide default
+    // is now ONLY the two-argument overload's fallback and
+    // resolveSamplerIndex()'s own belt-and-suspenders fallback (samples/
+    // 08_gltf_viewer/main.cpp), never the sole sampler for real content.
+    //
+    // Task 4's own seam-bleed GPU test (test_api_factory.cpp) still needs
+    // CLAMP_TO_EDGE for its own deliberately non-tiled 2x2 test texture
+    // (REPEAT's wraparound blends the wrong-edge neighbor into any sample
+    // near a UV boundary -- empirically confirmed, task-4-report.md's own
+    // "What went wrong once" section) -- it now passes
+    // `VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE` explicitly via this
+    // parameter instead of inheriting it from this no-longer-CLAMP default.
     VkSamplerCreateInfo defaultSamplerInfo{};
     defaultSamplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     defaultSamplerInfo.magFilter = VK_FILTER_LINEAR;
     defaultSamplerInfo.minFilter = VK_FILTER_LINEAR;
     defaultSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-    defaultSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    defaultSamplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    defaultSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    defaultSamplerInfo.addressModeU = defaultSamplerAddressMode;
+    defaultSamplerInfo.addressModeV = defaultSamplerAddressMode;
+    defaultSamplerInfo.addressModeW = defaultSamplerAddressMode;
     defaultSamplerInfo.maxLod = VK_LOD_CLAMP_NONE;
     VkSampler defaultSampler = VK_NULL_HANDLE;
     if (vkCreateSampler(device.device(), &defaultSamplerInfo, nullptr, &defaultSampler) != VK_SUCCESS) {

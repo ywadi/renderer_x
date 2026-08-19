@@ -545,6 +545,191 @@ std::optional<QuadrantPixels> renderAndReadbackQuadrants(TcTestFixture& fixture,
     return result;
 }
 
+// [Fix round, sampler-wrap P0] Renders a CALLER-SUPPLIED quad -- NOT the
+// fixed [0,1]-cornered `kQuadVertices` above -- sampling
+// `bindlessTextureIndex`/`bindlessSamplerIndex` at explicit LOD 0, and
+// returns the same 4-corner probe shape `renderAndReadbackQuadrants()`
+// itself returns (same "1/4, 3/4 screen-fraction" probe positions). A
+// DELIBERATE, near-identical duplicate of that function's own render+
+// readback body, not a shared/defaulted parameter: this fix round's own
+// missing-regression-class fixture needs UV values OUTSIDE [0,1]
+// (DamagedHelmet's real defect -- helmet-sampler-fix-brief.md -- V wholly
+// in [1.0005,1.9987]), which `kQuadVertices`'s fixed [0,1] corners can
+// never produce; duplicating here keeps EVERY existing caller of
+// renderAndReadbackQuadrants() (this file's own established D10/D11/G6
+// test net) at zero risk from this fix-round-only addition.
+std::optional<QuadrantPixels> renderCustomQuadAndReadbackQuadrants(TcTestFixture& fixture, uint32_t bindlessTextureIndex,
+                                                                     uint32_t bindlessSamplerIndex,
+                                                                     const std::array<QuadVertex, 4>& vertices,
+                                                                     uint32_t extent = 64) {
+    VkDevice device = fixture.device.device();
+    constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+
+    auto pipeline = buildQuadPipeline(device, fixture.bindless, kColorFormat);
+    if (!pipeline.has_value()) {
+        return std::nullopt;
+    }
+
+    auto vertexBuffer = fixture.allocator.createHostVisibleBuffer(sizeof(vertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    auto indexBuffer = fixture.allocator.createHostVisibleBuffer(sizeof(kQuadIndices), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    if (!vertexBuffer.has_value() || !indexBuffer.has_value()) {
+        destroyQuadPipeline(device, *pipeline);
+        return std::nullopt;
+    }
+    std::memcpy(vertexBuffer->mappedData(), vertices.data(), sizeof(vertices));
+    vertexBuffer->flush();
+    std::memcpy(indexBuffer->mappedData(), kQuadIndices.data(), sizeof(kQuadIndices));
+    indexBuffer->flush();
+
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = kColorFormat;
+    imageInfo.extent = {extent, extent, 1};
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImage image = VK_NULL_HANDLE;
+    if (vkCreateImage(device, &imageInfo, nullptr, &image) != VK_SUCCESS) {
+        destroyQuadPipeline(device, *pipeline);
+        return std::nullopt;
+    }
+    VkMemoryRequirements memReq{};
+    vkGetImageMemoryRequirements(device, image, &memReq);
+    VkPhysicalDeviceMemoryProperties memProps{};
+    vkGetPhysicalDeviceMemoryProperties(fixture.device.physicalDevice(), &memProps);
+    uint32_t memoryTypeIndex = UINT32_MAX;
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+        if ((memReq.memoryTypeBits & (1U << i)) != 0U &&
+            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0U) {
+            memoryTypeIndex = i;
+            break;
+        }
+    }
+    if (memoryTypeIndex == UINT32_MAX) {
+        vkDestroyImage(device, image, nullptr);
+        destroyQuadPipeline(device, *pipeline);
+        return std::nullopt;
+    }
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memReq.size;
+    allocInfo.memoryTypeIndex = memoryTypeIndex;
+    VkDeviceMemory imageMemory = VK_NULL_HANDLE;
+    if (vkAllocateMemory(device, &allocInfo, nullptr, &imageMemory) != VK_SUCCESS) {
+        vkDestroyImage(device, image, nullptr);
+        destroyQuadPipeline(device, *pipeline);
+        return std::nullopt;
+    }
+    vkBindImageMemory(device, image, imageMemory, 0);
+
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = kColorFormat;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.layerCount = 1;
+    VkImageView imageView = VK_NULL_HANDLE;
+    vkCreateImageView(device, &viewInfo, nullptr, &imageView);
+
+    const VkDeviceSize pixelBytes = static_cast<VkDeviceSize>(extent) * extent * 4;
+    std::vector<uint8_t> pixels(pixelBytes);
+
+    {
+        auto cmdCtx = rx::rhi::CommandContext::create(device, fixture.device.graphicsQueue(), fixture.device.graphicsQueueFamily());
+        if (!cmdCtx.has_value()) {
+            vkDestroyImageView(device, imageView, nullptr);
+            vkDestroyImage(device, image, nullptr);
+            vkFreeMemory(device, imageMemory, nullptr);
+            destroyQuadPipeline(device, *pipeline);
+            return std::nullopt;
+        }
+        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+            rx::rhi::transitionImage(cmd, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+            VkRenderingAttachmentInfo colorAttachment{};
+            colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            colorAttachment.imageView = imageView;
+            colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            colorAttachment.clearValue.color = VkClearColorValue{{0.0F, 0.0F, 0.0F, 1.0F}};
+
+            VkRenderingInfo renderingInfo{};
+            renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+            renderingInfo.renderArea = VkRect2D{{0, 0}, {extent, extent}};
+            renderingInfo.layerCount = 1;
+            renderingInfo.colorAttachmentCount = 1;
+            renderingInfo.pColorAttachments = &colorAttachment;
+            vkCmdBeginRendering(cmd, &renderingInfo);
+
+            VkViewport viewport{0.0F, 0.0F, static_cast<float>(extent), static_cast<float>(extent), 0.0F, 1.0F};
+            vkCmdSetViewport(cmd, 0, 1, &viewport);
+            VkRect2D scissor{{0, 0}, {extent, extent}};
+            vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
+            VkDescriptorSet bindlessSet = fixture.bindless.descriptorSet();
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->layoutBundle.layout, 0, 1, &bindlessSet, 0, nullptr);
+
+            struct { uint32_t textureIndex; uint32_t samplerIndex; float lod; } push{bindlessTextureIndex, bindlessSamplerIndex, 0.0F};
+            vkCmdPushConstants(cmd, pipeline->layoutBundle.layout, pipeline->pushConstantStages, 0, sizeof(push), &push);
+
+            VkBuffer vb = vertexBuffer->handle();
+            VkDeviceSize vbOffset = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOffset);
+            vkCmdBindIndexBuffer(cmd, indexBuffer->handle(), 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cmd, static_cast<uint32_t>(kQuadIndices.size()), 1, 0, 0, 0);
+
+            vkCmdEndRendering(cmd);
+            rx::rhi::transitionImage(cmd, image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        });
+
+        auto readback = fixture.allocator.createHostVisibleBuffer(pixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        if (!readback.has_value()) {
+            vkDestroyImageView(device, imageView, nullptr);
+            vkDestroyImage(device, image, nullptr);
+            vkFreeMemory(device, imageMemory, nullptr);
+            destroyQuadPipeline(device, *pipeline);
+            return std::nullopt;
+        }
+        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+            VkBufferImageCopy region{};
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent = {extent, extent, 1};
+            vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1, &region);
+        });
+        readback->invalidate();
+        std::memcpy(pixels.data(), readback->mappedData(), pixels.size());
+    }
+
+    vkDeviceWaitIdle(device);
+    destroyQuadPipeline(device, *pipeline);
+    vkDestroyImageView(device, imageView, nullptr);
+    vkDestroyImage(device, image, nullptr);
+    vkFreeMemory(device, imageMemory, nullptr);
+
+    auto pixelAt2 = [&](uint32_t x, uint32_t y) -> std::array<uint8_t, 4> {
+        size_t o = (static_cast<size_t>(y) * extent + x) * 4;
+        return {pixels[o], pixels[o + 1], pixels[o + 2], pixels[o + 3]};
+    };
+    const uint32_t q1b = extent / 4;
+    const uint32_t q3b = extent - q1b - 1;
+    QuadrantPixels result2;
+    result2.topLeft = pixelAt2(q1b, q1b);
+    result2.topRight = pixelAt2(q3b, q1b);
+    result2.bottomLeft = pixelAt2(q1b, q3b);
+    result2.bottomRight = pixelAt2(q3b, q3b);
+    return result2;
+}
+
 bool approxEqual(const std::array<uint8_t, 4>& actual, std::array<uint8_t, 3> expectedRgb, int tolerance) {
     return std::abs(static_cast<int>(actual[0]) - expectedRgb[0]) <= tolerance &&
            std::abs(static_cast<int>(actual[1]) - expectedRgb[1]) <= tolerance &&
@@ -1332,6 +1517,144 @@ TEST_CASE("Slot-swap discrimination: five distinct StandardPBR texture slots on 
             CHECK_FALSE(approxEqual(readback->topLeft, other, 2));
         }
     }
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// [Fix round, sampler-wrap P0 -- the missing regression class the helmet
+// investigation named] `sampler_wrap_probe.gltf` (assets/test/, new,
+// committed) is a single quad whose ONE material's baseColorTexture
+// references `textures/quadrant.png` (already-committed, 8x8, TL=red/
+// TR=green/BL=blue/BR=yellow -- see this file's own generate_fixtures.sh)
+// through an EXPLICIT-BUT-EMPTY glTF sampler object (`"samplers": [{}]`,
+// referenced by `"textures":[{"source":0,"sampler":0}]`) -- byte-for-byte
+// the SAME shape DamagedHelmet's own real glTF file uses (`samplers:
+// [{}]`, every one of its 5 textures referencing that one empty sampler),
+// which fastgltf/this importer resolve to glTF's documented "sampler
+// unspecified" default: REPEAT wrap, auto (LINEAR) filtering.
+//
+// This exercises the REAL, full production path the original helmet
+// investigation's own probes never touched (its own UV-gradient/color-
+// mean checks were structurally blind at the sampler layer -- see this
+// task's own report addendum): import_gltf.cpp's fillRef() parses this
+// texture's glTF sampler into `TextureRef::sampler`
+// (mesh_asset.h's SamplerDesc) -> THIS test resolves it through
+// TextureCache::getOrCreateSamplerBindlessIndex() (the fix round's own new
+// method -- the exact one samples/08_gltf_viewer/main.cpp's own
+// resolveSamplerIndex() calls in production) -> a real bindless
+// Texture2D/SamplerState pair is sampled by a real GPU shader.
+//
+// DISCRIMINATION: the probe quad's own UV is deliberately OUTSIDE [0,1] in
+// V (constant per draw, matching DamagedHelmet's own "V wholly outside
+// [0,1]" shape exactly, not just "some UVs wrap"), landing EXACTLY on a
+// quadrant.png texel CENTER post-wrap so the assertion is filter-mode-
+// independent (no bilinear-boundary ambiguity, no reliance on any specific
+// interpolated screen fraction): V=1.3125 -- under REPEAT, frac(1.3125) =
+// 0.3125, the exact center of texel row 2 (quadrant.png's TOP/red half,
+// rows 0-3) -- expects RED. Under CLAMP_TO_EDGE (a re-hardcoded-clamp
+// revert), V=1.3125 clamps to exactly 1.0 -- beyond every real texel
+// center, so CLAMP_TO_EDGE deterministically reads the LAST row's texel
+// (row 7, quadrant.png's BOTTOM/blue half) -- expects BLUE instead. This
+// is the discriminating probe: RED-under-fix vs. BLUE-under-bug, the exact
+// signature class the real DamagedHelmet defect had (the whole mesh
+// reading its texture's bottom edge row). A second probe (V=1.6875, wraps
+// to row 5's own texel center, BLUE either way) is a non-discriminating
+// sanity check only -- proves the texture/pipeline are not simply
+// degenerate, not proof of the fix on its own.
+TEST_CASE("Sampler-wrap regression: glTF-default REPEAT (samplers:[{}], DamagedHelmet's own shape) resolved through "
+          "TextureCache::getOrCreateSamplerBindlessIndex() and sampled through the FULL import path -- UVs outside "
+          "[0,1] read the WRAPPED texel, not the CLAMP_TO_EDGE bottom-edge row [helmet sampler-wrap fix, missing "
+          "regression class]") {
+    auto fixture = makeFixture("rx_asset_tc_sampler_wrap");
+    if (!fixture.has_value()) {
+        return;
+    }
+    makeCache(*fixture);
+
+    auto pool = rx::asset::GeometryPool::create(fixture->allocator, fixture->device, fixture->uploader);
+    REQUIRE(pool != nullptr);
+    auto scheduler = rx::task::Scheduler::create(2);
+    REQUIRE(scheduler != nullptr);
+
+    rx::asset::Registry registry;
+    rx::asset::ImportResult result =
+        registry.importGltf(gltfFixturePath("sampler_wrap_probe.gltf"), *pool, *scheduler, fixture->cache.get());
+    REQUIRE(result.ok());
+    REQUIRE(result.materials.size() == 1);
+
+    const rx::asset::MaterialAsset& material = registry.material(result.materials[0]);
+    REQUIRE(material.baseColorTexture.present);
+    const TextureRecord& record = fixture->cache->resolve(material.baseColorTexture.handle);
+    REQUIRE_FALSE(record.isFallback);
+
+    // `material.baseColorTexture.sampler` is import_gltf.cpp's own parsed
+    // glTF sampler -- for this fixture's empty `samplers:[{}]` object, that
+    // is `SamplerDesc`'s own default-constructed values (mesh_asset.h),
+    // which the fixture's OWN JSON comment (and this TEST_CASE's own
+    // header comment) already establishes ARE glTF's documented "sampler
+    // unspecified" default (REPEAT/auto) -- asserted here directly so a
+    // FUTURE regression in fillRef()'s own sampler-parsing (import_gltf.cpp
+    // :869-874) that started leaving `wrapS`/`wrapT` at some OTHER,
+    // non-REPEAT value would be caught structurally, not just visually.
+    CHECK(material.baseColorTexture.sampler.wrapS == 10497);  // glTF Wrap::Repeat.
+    CHECK(material.baseColorTexture.sampler.wrapT == 10497);
+
+    // THE fix under test: resolve the REAL per-texture bindless sampler
+    // index through TextureCache -- exactly samples/08_gltf_viewer/
+    // main.cpp's own resolveSamplerIndex() call.
+    std::optional<uint32_t> samplerIndex =
+        fixture->cache->getOrCreateSamplerBindlessIndex(material.baseColorTexture.sampler);
+    REQUIRE(samplerIndex.has_value());
+
+    // Two CONSTANT-UV quads (every vertex shares the identical (u,v) --
+    // removes any dependency on interpolation/rasterization precision at a
+    // specific screen fraction; the sampled texel is the same at every
+    // point on the quad by construction) -- see this TEST_CASE's own
+    // header comment for the exact texel-center arithmetic.
+    constexpr std::array<QuadVertex, 4> kRepeatRowTop{{
+        {{-1.0F, -1.0F, 0.0F}, {0.3125F, 1.3125F}},
+        {{1.0F, -1.0F, 0.0F}, {0.3125F, 1.3125F}},
+        {{1.0F, 1.0F, 0.0F}, {0.3125F, 1.3125F}},
+        {{-1.0F, 1.0F, 0.0F}, {0.3125F, 1.3125F}},
+    }};
+    constexpr std::array<QuadVertex, 4> kRepeatRowBottom{{
+        {{-1.0F, -1.0F, 0.0F}, {0.3125F, 1.6875F}},
+        {{1.0F, -1.0F, 0.0F}, {0.3125F, 1.6875F}},
+        {{1.0F, 1.0F, 0.0F}, {0.3125F, 1.6875F}},
+        {{-1.0F, 1.0F, 0.0F}, {0.3125F, 1.6875F}},
+    }};
+
+    auto topReadback =
+        renderCustomQuadAndReadbackQuadrants(*fixture, record.bindlessIndex, *samplerIndex, kRepeatRowTop);
+    REQUIRE(topReadback.has_value());
+    auto bottomReadback =
+        renderCustomQuadAndReadbackQuadrants(*fixture, record.bindlessIndex, *samplerIndex, kRepeatRowBottom);
+    REQUIRE(bottomReadback.has_value());
+
+    // THE discriminating assertion: V=1.3125 (wraps to row 2, the top/red
+    // half) must read RED, not the BLUE a CLAMP_TO_EDGE revert would
+    // produce (V clamps to 1.0, reading the bottom/blue edge row instead --
+    // this is byte-for-byte the same failure SHAPE the real DamagedHelmet
+    // defect had). All four corners assert identically -- the quad's UV is
+    // constant, so a correct implementation reads the SAME texel
+    // everywhere.
+    const std::array<uint8_t, 3> kRed{255, 0, 0};
+    const std::array<uint8_t, 3> kBlue{0, 0, 255};
+    CHECK(approxEqual(topReadback->topLeft, kRed, 2));
+    CHECK(approxEqual(topReadback->topRight, kRed, 2));
+    CHECK(approxEqual(topReadback->bottomLeft, kRed, 2));
+    CHECK(approxEqual(topReadback->bottomRight, kRed, 2));
+    // Explicit negative half, mirroring the slot-swap TEST_CASE's own
+    // "make the failure mode explicit" discipline above.
+    CHECK_FALSE(approxEqual(topReadback->topLeft, kBlue, 2));
+
+    // Sanity probe (non-discriminating alone -- both fix and bug read BLUE
+    // here, since V=1.6875 already wraps to the SAME row a CLAMP_TO_EDGE
+    // revert would also land on): proves the texture/pipeline are real and
+    // not degenerate, and that BOTH quadrant.png halves are genuinely
+    // reachable through this exact code path.
+    CHECK(approxEqual(bottomReadback->topLeft, kBlue, 2));
+    CHECK(approxEqual(bottomReadback->bottomRight, kBlue, 2));
 
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }

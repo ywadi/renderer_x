@@ -1138,8 +1138,21 @@ TEST_CASE("IRxMaterialInstance::setTexture's bound texture actually changes the 
         return;
     }
 
-    auto internal = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
-                                                            freshCachePath("api_sample_texture"));
+    // [Fix round, sampler-wrap P0] CLAMP_TO_EDGE requested EXPLICITLY, not
+    // inherited from MaterialSystem::create()'s own default (now REPEAT,
+    // glTF's spec default -- see that method's own header comment and
+    // material_system.cpp's `defaultSamplerInfo` comment for the full
+    // account of the defect this closes). This test's own 2x2 test
+    // texture (test_textured_sample.slang's `evaluate()`, sampled via the
+    // TWO-argument rx_sampleTexture() overload -- this is the ORIGINAL
+    // Task 4 seam-bleed regression: the quadrant probes sit right up to
+    // UV 0/1, and a deliberately non-tiled texture like this one needs
+    // CLAMP_TO_EDGE to avoid REPEAT's wrong-neighbor bleed (task-4-report.
+    // md's own "What went wrong once" section) -- unchanged assertions,
+    // now reached via an explicit request instead of an implicit default.
+    auto internal =
+        rx::material::MaterialSystem::create(fixture->device, fixture->bindless, freshCachePath("api_sample_texture"),
+                                              /*sharedShaderDir=*/{}, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
     REQUIRE(internal != nullptr);
 
     RxMaterialSystemDesc desc{internal.get()};
@@ -1195,8 +1208,14 @@ TEST_CASE("hot-reload of a textured material keeps sampling correctly (reloadCha
         return;
     }
 
+    // [Fix round, sampler-wrap P0] CLAMP_TO_EDGE requested EXPLICITLY -- see
+    // the sibling "setTexture's bound texture..." TEST_CASE above for the
+    // full account (same quadrant-probe/non-tiled-texture reasoning; this
+    // test reuses the identical fixture shape across a reload).
     auto internal = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
-                                                            freshCachePath("api_sample_texture_reload"));
+                                                            freshCachePath("api_sample_texture_reload"),
+                                                            /*sharedShaderDir=*/{},
+                                                            VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
     REQUIRE(internal != nullptr);
 
     RxMaterialSystemDesc desc{internal.get()};

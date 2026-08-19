@@ -124,18 +124,17 @@ Texture2D gTextures[];
 [[vk::binding(1, 0)]]
 SamplerState gSamplers[];
 
-// DEFAULT SAMPLER INDEX -- `rx_sampleTexture` below takes only a texture
-// index (its signature is fixed by this task's brief: `rx_sampleTexture
-// (uint textureIndex, float2 uv)`, no sampler-index parameter), so the
-// bindless SAMPLER slot it reads has to come from somewhere else. A
-// compile-time-fixed slot number (e.g. "sampler 0") was deliberately
-// rejected: `rx::rhi::BindlessTable` is this engine's single PROCESS-WIDE
-// bindless set (bindless.h's own class comment), so nothing guarantees
-// MaterialSystem's own default sampler is the first one ever registered
-// against a table other subsystems (present/future: shadow maps, a KTX2
-// sampler cache, ImGui, ...) also register samplers into -- baking in
-// index 0 would be a correctness landmine the instant two subsystems share
-// one table in any order other than "MaterialSystem first".
+// DEFAULT SAMPLER INDEX -- the bindless SAMPLER slot `rx_sampleTexture`'s
+// two-argument overload (below) reads has to come from somewhere at
+// runtime, since a compile-time-fixed slot number (e.g. "sampler 0") was
+// deliberately rejected: `rx::rhi::BindlessTable` is this engine's single
+// PROCESS-WIDE bindless set (bindless.h's own class comment), so nothing
+// guarantees MaterialSystem's own default sampler is the first one ever
+// registered against a table other subsystems (present/future: shadow
+// maps, a KTX2 sampler cache, ImGui, ...) also register samplers into --
+// baking in index 0 would be a correctness landmine the instant two
+// subsystems share one table in any order other than "MaterialSystem
+// first".
 //
 // Instead this follows the SAME idiom shaders/multipass/lit.vert.slang and
 // tonemap.vert.slang already use for a bindless index that is not known
@@ -147,18 +146,37 @@ SamplerState gSamplers[];
 // correctly no matter which index the table actually assigns. LINEAR (not
 // NEAREST, unlike sample 05's shadow/tonemap sampler, which has its own
 // depth-comparison/1:1-copy reasons to use NEAREST) is this engine's
-// chosen default for ordinary material albedo/color-map sampling -- the
-// conventional choice for a general-purpose texture lookup. CLAMP_TO_EDGE
-// (not REPEAT): this is one process-wide default shared by every material,
-// and a material sampling right up to UV 0/1 at a mesh seam gets a well-
-// defined edge-duplicated result under CLAMP_TO_EDGE rather than
-// wrong-neighbor bleed from REPEAT's wraparound (empirically confirmed via
-// this task's own GPU test -- see material_system.cpp's own comment on
-// `defaultSamplerInfo` for the full reasoning). There is exactly one such
-// sampler per MaterialSystem instance for this phase (no per-material
-// sampler/wrap-mode selection yet -- a real, supportable future case for a
-// material that genuinely wants tiling, not exercised by any test this
-// task writes, so not built speculatively here).
+// chosen default for ordinary material albedo/color-map sampling.
+//
+// [Fix round, sampler-wrap P0] THIS IS NO LONGER "the one sampler every
+// material's every texture slot samples through" -- that was exactly the
+// bug (a real, shipped defect, not a hypothetical): DamagedHelmet's own
+// TEXCOORD_0 V legally lies in [1.0005, 1.9987] (glTF-spec-legal, relies
+// on the glTF-default REPEAT wrap), and this process-wide default was
+// hardcoded CLAMP_TO_EDGE, so every fragment's V clamped to 1.0 and the
+// whole mesh sampled each texture's bottom edge row. `rx_sampleTexture`
+// now has a THREE-argument overload taking an explicit per-slot sampler
+// index (see below) -- StandardPbrParams/UnlitParams (standard_pbr.slang/
+// unlit.slang) carry one bindless sampler index per texture slot,
+// populated at material-resolution time from `TextureCache::
+// getOrCreateSamplerBindlessIndex()` (src/rx_asset/texture_cache.h),
+// which builds the REAL per-texture VkSampler honoring that texture's own
+// glTF wrap/filter state -- exactly the mechanism this comment used to say
+// was "real, supportable future work... not built speculatively here".
+// `MaterialSystem::create()`'s own default sampler (this push-constant
+// field) is now REPEAT by default -- glTF's OWN documented default
+// ("sampler unspecified" -> repeat wrapping, auto filtering) -- and
+// exists only as (a) the two-argument overload's sampler for a material
+// that does not wire per-slot sampling at all, and (b) resolveSamplerIndex
+// ()'s own belt-and-suspenders fallback (samples/08_gltf_viewer/main.cpp)
+// if a real per-texture sampler somehow fails to build. A caller that
+// genuinely wants a NON-default wrap mode for this fallback (Task 4's own
+// seam-bleed GPU test, which samples a deliberately non-tiled 2x2 test
+// texture right up to its UV 0/1 edge and needs CLAMP_TO_EDGE to avoid
+// wrong-neighbor bleed) now requests it EXPLICITLY via `MaterialSystem::
+// create()`'s own `defaultSamplerAddressMode` parameter -- see that
+// method's header comment and test_api_factory.cpp's own seam-bleed
+// TEST_CASEs.
 // --- D26.1 per-draw addressing [Phase 4 Task 16, gate ruling RC1/#8] -----
 // One bindless StructuredBuffer<RxDrawData> array at
 // BindlessTable::kStorageBufferBinding (binding 2, the SAME external set-0
@@ -253,13 +271,27 @@ public struct RxMaterialGlobals {
 [[vk::push_constant]]
 public ConstantBuffer<RxMaterialGlobals> gMaterialGlobals;
 
-// Public entry point every material's `evaluate()` calls to sample a
-// bindless-indexed texture (`gParams`'s own `uint` field, per this engine's
-// D8 bindless-index convention -- see e.g. test_textured.slang) with this
-// engine's single default LINEAR sampler. `uv` is passed straight through
-// to `Texture2D.Sample()` with no wrapping/clamping decision of this
-// function's own -- that is the SAMPLER's job (fixed at MaterialSystem
-// construction time), not a per-call concern here.
+// [Fix round, sampler-wrap P0] Primary entry point every PER-SLOT-sampler-
+// aware material's `evaluate()` calls (StandardPbr/Unlit -- standard_pbr.
+// slang/unlit.slang) to sample a bindless-indexed texture through an
+// EXPLICIT bindless-indexed sampler -- both `gParams`'s own `uint` fields,
+// per this engine's D8 bindless-index convention. `uv` is passed straight
+// through to `Texture2D.Sample()` with no wrapping/clamping decision of
+// this function's own -- that is entirely `samplerIndex`'s own real,
+// per-texture VkSampler's job (built by `TextureCache::
+// getOrCreateSamplerBindlessIndex()`, honoring that texture's own glTF
+// wrap/filter state), not a per-call concern here.
+public float4 rx_sampleTexture(uint textureIndex, uint samplerIndex, float2 uv) {
+    return gTextures[textureIndex].Sample(gSamplers[samplerIndex], uv);
+}
+
+// Two-argument overload, UNCHANGED signature from before this fix round --
+// every existing caller that does not wire its own per-slot sampler (the
+// test-only test_textured.slang/test_textured_sample.slang fixtures, any
+// future material that genuinely wants "one shared sampler for every
+// slot") keeps compiling and behaving exactly as documented: samples
+// through `gMaterialGlobals.defaultSamplerIndex`, the ONE process-wide
+// default this file's own header comment (above) now describes in full.
 public float4 rx_sampleTexture(uint textureIndex, float2 uv) {
-    return gTextures[textureIndex].Sample(gSamplers[gMaterialGlobals.defaultSamplerIndex], uv);
+    return rx_sampleTexture(textureIndex, gMaterialGlobals.defaultSamplerIndex, uv);
 }

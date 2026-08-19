@@ -293,6 +293,42 @@ public:
     // Main-thread-only (D5) -- vkCreateSampler is GPU-object mutation.
     [[nodiscard]] VkSampler getOrCreateSampler(const SamplerDesc& desc);
 
+    // [Fix round, sampler-wrap P0] Bindless-INDEX counterpart to
+    // getOrCreateSampler() above -- the actual real fix for the shipped
+    // sampler-wrap defect (helmet-sampler-fix-brief.md's own root-cause
+    // account): every material texture slot used to sample through ONE
+    // hardcoded process-wide CLAMP_TO_EDGE sampler regardless of that
+    // texture's own glTF wrap mode, silently breaking any asset relying on
+    // glTF-default REPEAT for UVs outside [0,1] (DamagedHelmet's own
+    // TEXCOORD_0 V, wholly in [1.0005,1.9987]) -- this class ALREADY built
+    // the correct per-texture VkSampler (getOrCreateSampler() above,
+    // honoring `desc`'s real glTF wrap/filter state) but never registered
+    // it against the real bindless SAMPLER table, so no shader could ever
+    // reach it. This method closes exactly that gap: gets-or-creates the
+    // deduplicated VkSampler (via getOrCreateSampler() -- same dedup
+    // granularity, same cache), then gets-or-creates its OWN bindless
+    // registration (a second, VkSampler-keyed cache -- one BindlessTable
+    // registration per unique dedup'd VkSampler, not per call), and
+    // returns the real, shader-visible bindless index. `desc` left at its
+    // own default-constructed values (SamplerDesc's own REPEAT-wrap/
+    // auto-filter defaults, mesh_asset.h) reproduces the glTF spec's own
+    // "sampler unspecified" default -- correct to pass verbatim for BOTH
+    // an absent texture slot (samples a role-neutral D11 fallback texture,
+    // wrap mode irrelevant) and a present slot whose glTF texture
+    // referenced no sampler object at all (spec REPEAT/auto is the exactly
+    // correct answer, not a fallback-of-last-resort).
+    //
+    // Returns std::nullopt (logged) on a genuine failure (vkCreateSampler
+    // failure inside getOrCreateSampler(), or BindlessTable::
+    // registerSampler() capacity exhaustion) -- callers fall back to
+    // whatever process-wide default sampler they already carry (belt-and-
+    // suspenders, mirroring resolveTextureIndex()'s own fallback
+    // philosophy in samples/08_gltf_viewer/main.cpp), never a crash or a
+    // silently-wrong index.
+    //
+    // Main-thread-only (D5) -- registerSampler() is GPU-object mutation.
+    [[nodiscard]] std::optional<uint32_t> getOrCreateSamplerBindlessIndex(const SamplerDesc& desc);
+
     // [FG9] Resident bytes/count by role -- balances to zero across
     // load/evict/teardown (Task 10 accounting-test pattern). Main-thread-
     // only (D5), matching every other read accessor on this class.
@@ -411,6 +447,18 @@ private:
         size_t operator()(const SamplerKey& key) const;
     };
     std::unordered_map<SamplerKey, VkSampler, SamplerKeyHash> samplerCache_;
+
+    // [Fix round, sampler-wrap P0] getOrCreateSamplerBindlessIndex()'s own
+    // second-level cache -- keyed by the ALREADY-DEDUPLICATED VkSampler
+    // handle from samplerCache_ above (not a second SamplerKey lookup: a
+    // VkSampler is trivially hashable, and every unique SamplerKey maps to
+    // exactly one VkSampler, so keying on the sampler itself avoids
+    // recomputing/duplicating SamplerKey's own glTF-enum -> Vulkan mapping
+    // logic here) -- one BindlessTable registration per unique dedup'd
+    // sampler, never one per call. Released (bindless_.release()) in
+    // ~TextureCache(), symmetric with the vkDestroySampler loop just below
+    // this member in that destructor.
+    std::unordered_map<VkSampler, rx::rhi::BindlessHandle> samplerBindlessCache_;
 
     bool anisotropySupported_ = false;
     float maxAnisotropy_ = 1.0F;

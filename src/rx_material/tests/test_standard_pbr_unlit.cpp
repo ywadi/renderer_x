@@ -691,12 +691,19 @@ TEST_CASE("D26.1: two draws in one command buffer, the second at firstInstance>0
     std::vector<uint8_t> redBlob(blockSize, 0);
     setParam(redBlob, params, "baseColorFactor", std::array<float, 4>{1.0F, 0.0F, 0.0F, 1.0F});
     setParam(redBlob, params, "baseColorTexture", whiteIndex);
+    // [Fix round, sampler-wrap P0] unlit.slang now samples through an
+    // EXPLICIT gParams.baseColorSampler -- this rig's own real, registered
+    // CLAMP_TO_EDGE sampler (defaultSamplerIndex, just above) is correct
+    // here (byte-identical to this test's pre-fix behavior; no wrap-mode
+    // semantics exercised by this test).
+    setParam(redBlob, params, "baseColorSampler", defaultSamplerIndex);
     setParam(redBlob, params, "alphaCutoff", 0.0F);
     setParam(redBlob, params, "baseColorUvOffsetScale", std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
 
     std::vector<uint8_t> greenBlob(blockSize, 0);
     setParam(greenBlob, params, "baseColorFactor", std::array<float, 4>{0.0F, 1.0F, 0.0F, 1.0F});
     setParam(greenBlob, params, "baseColorTexture", whiteIndex);
+    setParam(greenBlob, params, "baseColorSampler", defaultSamplerIndex);
     setParam(greenBlob, params, "alphaCutoff", 0.0F);
     setParam(greenBlob, params, "baseColorUvOffsetScale", std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
 
@@ -912,6 +919,21 @@ std::vector<uint8_t> makeDefaultStandardPbrBlob(StandardPbrRig& rig, rx::materia
     setParam(blob, params, "normalTexture", rig.flatNormalTex);
     setParam(blob, params, "occlusionTexture", rig.whiteTex);
     setParam(blob, params, "emissiveTexture", rig.whiteTex);
+    // [Fix round, sampler-wrap P0] Every slot's own bindless SAMPLER index --
+    // standard_pbr.slang's evaluate() now samples through gParams.*Sampler
+    // explicitly (no more implicit process-wide default), so every one of
+    // these MUST be a real, valid registered index. This rig's own
+    // CLAMP_TO_EDGE sampler is correct for every test in this file (none of
+    // them exercise wrap-mode/out-of-[0,1]-UV semantics -- that is the
+    // dedicated regression test's own job, texture_cache_test.cpp) and
+    // reproduces this suite's pre-fix behavior byte-for-byte (every slot
+    // sampled through this exact sampler before too, just implicitly via
+    // gMaterialGlobals.defaultSamplerIndex).
+    setParam(blob, params, "baseColorSampler", rig.defaultSamplerIndex);
+    setParam(blob, params, "metallicRoughnessSampler", rig.defaultSamplerIndex);
+    setParam(blob, params, "normalSampler", rig.defaultSamplerIndex);
+    setParam(blob, params, "occlusionSampler", rig.defaultSamplerIndex);
+    setParam(blob, params, "emissiveSampler", rig.defaultSamplerIndex);
     std::array<float, 4> neutralUv{0.0F, 0.0F, 1.0F, 1.0F};
     setParam(blob, params, "baseColorUvOffsetScale", neutralUv);
     setParam(blob, params, "metallicRoughnessUvOffsetScale", neutralUv);
@@ -1435,6 +1457,11 @@ TEST_CASE("StandardPBR: alphaMode=MASK discards below cutoff, renders opaque abo
     setParam(backgroundBlob, rig->system->materialParams(backgroundHandle), "baseColorFactor",
               std::array<float, 4>{0.0F, 1.0F, 0.0F, 1.0F});
     setParam(backgroundBlob, rig->system->materialParams(backgroundHandle), "baseColorTexture", greenTex);
+    // [Fix round, sampler-wrap P0] see makeDefaultStandardPbrBlob()'s own
+    // comment on rig.defaultSamplerIndex -- identical reasoning for Unlit's
+    // one baseColorSampler field.
+    setParam(backgroundBlob, rig->system->materialParams(backgroundHandle), "baseColorSampler",
+              rig->defaultSamplerIndex);
     setParam(backgroundBlob, rig->system->materialParams(backgroundHandle), "alphaCutoff", 0.0F);
     setParam(backgroundBlob, rig->system->materialParams(backgroundHandle), "baseColorUvOffsetScale",
               std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
@@ -1502,6 +1529,8 @@ TEST_CASE("D28: alphaMode=BLEND composites over an opaque background and does no
     const auto opaqueParams = rig->system->materialParams(opaqueHandle);
     setParam(backgroundBlob, opaqueParams, "baseColorFactor", std::array<float, 4>{1.0F, 0.0F, 0.0F, 1.0F});
     setParam(backgroundBlob, opaqueParams, "baseColorTexture", redTex);
+    // [Fix round, sampler-wrap P0] see makeDefaultStandardPbrBlob()'s own comment.
+    setParam(backgroundBlob, opaqueParams, "baseColorSampler", rig->defaultSamplerIndex);
     setParam(backgroundBlob, opaqueParams, "alphaCutoff", 0.0F);
     setParam(backgroundBlob, opaqueParams, "baseColorUvOffsetScale", std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
 
@@ -1519,6 +1548,8 @@ TEST_CASE("D28: alphaMode=BLEND composites over an opaque background and does no
     const auto blendParams = rig->system->materialParams(handle);
     setParam(blendBlob, blendParams, "baseColorFactor", std::array<float, 4>{0.0F, 0.0F, 1.0F, 0.502F});
     setParam(blendBlob, blendParams, "baseColorTexture", blueHalfTex);
+    // [Fix round, sampler-wrap P0] see makeDefaultStandardPbrBlob()'s own comment.
+    setParam(blendBlob, blendParams, "baseColorSampler", rig->defaultSamplerIndex);
     setParam(blendBlob, blendParams, "alphaCutoff", 0.0F);
     setParam(blendBlob, blendParams, "baseColorUvOffsetScale", std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
 
@@ -1577,6 +1608,8 @@ TEST_CASE("D28: alphaMode=BLEND composites over an opaque background and does no
     std::vector<uint8_t> thirdBlob(rig->system->paramBlockSize(opaqueHandle), 0);
     setParam(thirdBlob, opaqueParams, "baseColorFactor", std::array<float, 4>{1.0F, 1.0F, 0.0F, 1.0F});
     setParam(thirdBlob, opaqueParams, "baseColorTexture", yellowTex);
+    // [Fix round, sampler-wrap P0] see makeDefaultStandardPbrBlob()'s own comment.
+    setParam(thirdBlob, opaqueParams, "baseColorSampler", rig->defaultSamplerIndex);
     setParam(thirdBlob, opaqueParams, "alphaCutoff", 0.0F);
     setParam(thirdBlob, opaqueParams, "baseColorUvOffsetScale", std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
     std::vector<DrawRequest> withThird = draws;
@@ -1609,6 +1642,8 @@ TEST_CASE("D28: doubleSided disables back-face culling -- a single-sided quad vi
         const auto& p = rig->system->materialParams(h);
         setParam(blob, p, "baseColorFactor", std::array<float, 4>{1.0F, 0.0F, 0.0F, 1.0F});
         setParam(blob, p, "baseColorTexture", redTex);
+        // [Fix round, sampler-wrap P0] see makeDefaultStandardPbrBlob()'s own comment.
+        setParam(blob, p, "baseColorSampler", rig->defaultSamplerIndex);
         setParam(blob, p, "alphaCutoff", 0.0F);
         setParam(blob, p, "baseColorUvOffsetScale", std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
         return blob;
@@ -1734,6 +1769,8 @@ TEST_CASE("Unlit: evaluate() == baseColorFactor x baseColorTexture exactly, zero
     std::vector<uint8_t> blob(rig->system->paramBlockSize(handle), 0);
     setParam(blob, params, "baseColorFactor", std::array<float, 4>{0.5F, 1.0F, 0.8F, 1.0F});
     setParam(blob, params, "baseColorTexture", tex);
+    // [Fix round, sampler-wrap P0] see makeDefaultStandardPbrBlob()'s own comment.
+    setParam(blob, params, "baseColorSampler", rig->defaultSamplerIndex);
     setParam(blob, params, "alphaCutoff", 0.0F);
     setParam(blob, params, "baseColorUvOffsetScale", std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
 

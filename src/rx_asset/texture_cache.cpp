@@ -104,6 +104,14 @@ TextureCache::TextureCache(rx::rhi::Allocator& allocator, rx::rhi::Device& devic
     : allocator_(allocator), device_(device), uploader_(uploader), bindless_(bindless), deletionQueue_(deletionQueue) {}
 
 TextureCache::~TextureCache() {
+    // [Fix round, sampler-wrap P0] Release every bindless SAMPLER slot
+    // getOrCreateSamplerBindlessIndex() registered, BEFORE destroying the
+    // underlying VkSampler objects just below -- symmetric with
+    // releaseInternal()'s own bindless-release-before-GPU-resource-
+    // teardown ordering elsewhere in this file.
+    for (const auto& [sampler, handle] : samplerBindlessCache_) {
+        bindless_.release(handle);
+    }
     // [G6] Sampler cache cleanup -- VkSampler is a bare handle, not an
     // RAII type, so nothing else in this class destroys these; skipping
     // this loop is a real, empirically-hit VUID-vkDestroyDevice-device-
@@ -534,6 +542,30 @@ VkSampler TextureCache::getOrCreateSampler(const SamplerDesc& desc) {
 
     samplerCache_.emplace(key, sampler);
     return sampler;
+}
+
+std::optional<uint32_t> TextureCache::getOrCreateSamplerBindlessIndex(const SamplerDesc& desc) {
+    RX_ASSERT_MAIN_THREAD("TextureCache::getOrCreateSamplerBindlessIndex");
+
+    VkSampler sampler = getOrCreateSampler(desc);
+    if (sampler == VK_NULL_HANDLE) {
+        // getOrCreateSampler() already logged the vkCreateSampler failure.
+        return std::nullopt;
+    }
+
+    if (auto it = samplerBindlessCache_.find(sampler); it != samplerBindlessCache_.end()) {
+        return it->second.index();
+    }
+
+    rx::rhi::BindlessHandle handle = bindless_.registerSampler(sampler);
+    if (!handle.isValid()) {
+        RX_LOG_ERROR(
+            "rx_asset: TextureCache::getOrCreateSamplerBindlessIndex: BindlessTable::registerSampler failed "
+            "(capacity exhausted?)");
+        return std::nullopt;
+    }
+    samplerBindlessCache_.emplace(sampler, handle);
+    return handle.index();
 }
 
 TextureCacheStats TextureCache::stats() const {

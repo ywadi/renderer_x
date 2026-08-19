@@ -32,11 +32,22 @@ set(RX_MULTIPASS_SHADERS
   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/tonemap.vert.slang"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/multipass/tonemap.frag.slang"
 )
-add_custom_command(TARGET sample_05_multipass POST_BUILD
+# [Fix round, item 3] OUTPUT/DEPENDS-tracked, NOT a bare
+# `add_custom_command(TARGET ... POST_BUILD)` -- see samples/08_gltf_viewer/
+# CMakeLists.txt's own material_shaders deploy comment for the full
+# mechanism this avoids (a POST_BUILD recipe only re-runs when the TARGET
+# itself relinks, leaving an edited .slang source's deployed copy stale).
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/multipass_shaders_deploy.stamp"
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_MULTIPASS_SHADERS} "$<TARGET_FILE_DIR:sample_05_multipass>/"
+  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/multipass_shaders_deploy.stamp"
+  DEPENDS ${RX_MULTIPASS_SHADERS}
   COMMENT "sample_05_multipass: deploying shaders/multipass/*.slang next to the binary"
   VERBATIM
 )
+add_custom_target(sample_05_multipass_shaders_deploy
+  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/multipass_shaders_deploy.stamp")
+add_dependencies(sample_05_multipass sample_05_multipass_shaders_deploy)
 
 # Runs the binary in headless mode with --validate: ctest is the developer/CI
 # gate, so it explicitly opts into the Vulkan validation layers (requires the
