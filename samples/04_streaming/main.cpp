@@ -199,6 +199,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1606,12 +1607,23 @@ int runHeadless(bool enableValidation) {
 }
 
 // --- --present mode: real window, continuously cycling grid ----------------
-int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode) {
+int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fullscreen) {
     auto window = rx::platform::Window::create("rx_streaming_sample (--present)", static_cast<int>(kPresentWidth),
                                                  static_cast<int>(kPresentHeight), /*visible=*/true);
     if (!window.has_value()) {
         RX_LOG_ERROR("Window::create failed: no display backend available");
         return 1;
+    }
+
+    // --fullscreen [Phase 4 Task 17, FG7]: applied immediately after window
+    // creation, before Device::create() below builds the initial swapchain
+    // -- see samples/01_triangle/main.cpp's runPresent() for the full
+    // rationale (same pattern, every --present sample).
+    if (fullscreen) {
+        if (!window->setFullscreen(true)) {
+            RX_LOG_ERROR("Window::setFullscreen(true) failed while applying --fullscreen");
+            return 1;
+        }
     }
 
     auto extensions = window->requiredVulkanInstanceExtensions();
@@ -1757,6 +1769,27 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode) {
         }
 
         auto acquire = device->acquireNextImage(frameSync->currentImageAvailableSemaphore());
+        if (acquire.status == rx::rhi::SwapchainStatus::Suspended) {
+            // Zero-extent/minimize guard [Phase 4 Task 17, FG7]: see
+            // samples/01_triangle/main.cpp's runPresent() for the full
+            // rationale (same pattern, every --present sample).
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            if (!device->recreateSwapchain(surface)) {
+                RX_LOG_ERROR("Device::recreateSwapchain failed while suspended (zero-extent retry)");
+                ok = false;
+                break;
+            }
+            if (!device->isSuspended()) {
+                destroySwapchainViews();
+                if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
+                    !createSwapchainViews()) {
+                    RX_LOG_ERROR("swapchain view rebuild failed after resuming from suspended state");
+                    ok = false;
+                    break;
+                }
+            }
+            continue;
+        }
         if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
             if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
                 RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
@@ -1933,6 +1966,9 @@ int main(int argc, char** argv) {
     // there; the flag is still parsed like any other (no error on it) but
     // simply has no effect in that path.
     rx::rhi::PresentMode vsyncMode = rx::rhi::PresentMode::VsyncOn;
+    // --fullscreen [Phase 4 Task 17, FG7] -- forwarded to runPresent() only,
+    // same rationale as --vsync above.
+    bool fullscreen = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--present") {
             presentMode = true;
@@ -1947,11 +1983,13 @@ int main(int argc, char** argv) {
             } else {
                 RX_LOG_ERROR("--vsync expects 'on' or 'off', got '{}' -- defaulting to on", value);
             }
+        } else if (std::string_view(argv[i]) == "--fullscreen") {
+            fullscreen = true;
         }
     }
 
     if (presentMode) {
-        return runPresent(enableValidation, vsyncMode);
+        return runPresent(enableValidation, vsyncMode, fullscreen);
     }
     return runHeadless(enableValidation);
 }

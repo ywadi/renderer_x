@@ -68,12 +68,14 @@
 #include <volk.h>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <optional>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -675,12 +677,27 @@ int runHeadless(bool enableValidation) {
 // is the same wait-before-acquire/reset-after-acquire-succeeds ordering used
 // by every mainstream Vulkan frames-in-flight reference (e.g.
 // vulkan-tutorial.com's "Frames in flight" chapter) for exactly this reason.
-int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode) {
+int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fullscreen) {
     auto window = rx::platform::Window::create("rx_triangle_sample (--present)", static_cast<int>(kPresentWidth),
                                                  static_cast<int>(kPresentHeight), /*visible=*/true);
     if (!window.has_value()) {
         RX_LOG_ERROR("Window::create failed: no display backend available");
         return 1;
+    }
+
+    // --fullscreen [Phase 4 Task 17, FG7]: applied immediately after window
+    // creation, before Device::create() below builds the initial swapchain
+    // -- Device::create() always sizes that first swapchain off whatever
+    // the window's CURRENT extent already is, so entering fullscreen here
+    // (rather than forcing a second recreateSwapchain() call the way
+    // --vsync below has to) reuses that existing "build against the live
+    // window size" behavior instead of adding a second recreation path
+    // [gate ruling #25 row 5: exactly one recreation call site].
+    if (fullscreen) {
+        if (!window->setFullscreen(true)) {
+            RX_LOG_ERROR("Window::setFullscreen(true) failed while applying --fullscreen");
+            return 1;
+        }
     }
 
     auto extensions = window->requiredVulkanInstanceExtensions();
@@ -773,6 +790,38 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode) {
         }
 
         auto acquire = device->acquireNextImage(frameSync->currentImageAvailableSemaphore());
+        if (acquire.status == rx::rhi::SwapchainStatus::Suspended) {
+            // Zero-extent/minimize guard [Phase 4 Task 17, FG7]: Device
+            // itself refused to call vkAcquireNextImageKHR against a 0x0
+            // surface -- skip this frame entirely (no command recording,
+            // no present; the fence stays signaled for the next
+            // iteration's wait, exactly like the NeedsRecreate branch's own
+            // `continue` below). The short sleep keeps this from
+            // busy-spinning the CPU while suspended (no vsync/present call
+            // throttles the loop during this span); recreateSwapchain()
+            // re-queries the real surface extent every iteration to detect
+            // when a real size returns -- "idle until restored, no
+            // swapchain churn" (no vkb::SwapchainBuilder::build() call
+            // happens again until the extent is genuinely nonzero).
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            if (!device->recreateSwapchain(surface)) {
+                RX_LOG_ERROR("Device::recreateSwapchain failed while suspended (zero-extent retry)");
+                ok = false;
+                break;
+            }
+            if (!device->isSuspended()) {
+                // Resumed this iteration -- rebuild the per-swapchain-image
+                // resources exactly like the NeedsRecreate branch does.
+                destroySwapchainViews(vkDevice, swapchainViews);
+                if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
+                    !createSwapchainViews(vkDevice, *device, swapchainViews)) {
+                    RX_LOG_ERROR("swapchain view rebuild failed after resuming from suspended state");
+                    ok = false;
+                    break;
+                }
+            }
+            continue;
+        }
         if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
             if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
                 RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
@@ -959,6 +1008,9 @@ int main(int argc, char** argv) {
     // simply has no effect in that path.
     rx::rhi::PresentMode vsyncMode = rx::rhi::PresentMode::VsyncOn;
     bool logCallback = false;
+    // --fullscreen [Phase 4 Task 17, FG7] -- forwarded to runPresent() only,
+    // same rationale as --vsync above (headless mode never shows a window).
+    bool fullscreen = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--present") {
             presentMode = true;
@@ -973,6 +1025,8 @@ int main(int argc, char** argv) {
             } else {
                 RX_LOG_ERROR("--vsync expects 'on' or 'off', got '{}' -- defaulting to on", value);
             }
+        } else if (std::string_view(argv[i]) == "--fullscreen") {
+            fullscreen = true;
         } else if (std::string_view(argv[i]) == "--log-callback") {
             logCallback = true;
         }
@@ -989,7 +1043,7 @@ int main(int argc, char** argv) {
     }
 
     if (presentMode) {
-        return runPresent(enableValidation, vsyncMode);
+        return runPresent(enableValidation, vsyncMode, fullscreen);
     }
     return runHeadless(enableValidation);
 }

@@ -217,6 +217,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1536,12 +1537,23 @@ int runHeadless(bool enableValidation) {
 }
 
 // --- --present mode: real window, orbiting camera, hot-reload polling ------
-int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode) {
+int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fullscreen) {
     auto window = rx::platform::Window::create("rx_materials_sample (--present)", static_cast<int>(kPresentWidth),
                                                  static_cast<int>(kPresentHeight), /*visible=*/true);
     if (!window.has_value()) {
         RX_LOG_ERROR("Window::create failed: no display backend available");
         return 1;
+    }
+
+    // --fullscreen [Phase 4 Task 17, FG7]: applied immediately after window
+    // creation, before Device::create() below builds the initial swapchain
+    // -- see samples/01_triangle/main.cpp's runPresent() for the full
+    // rationale (same pattern, every --present sample).
+    if (fullscreen) {
+        if (!window->setFullscreen(true)) {
+            RX_LOG_ERROR("Window::setFullscreen(true) failed while applying --fullscreen");
+            return 1;
+        }
     }
 
     auto extensions = window->requiredVulkanInstanceExtensions();
@@ -1734,6 +1746,33 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode) {
         }
 
         auto acquire = device->acquireNextImage(frameSync->currentImageAvailableSemaphore());
+        if (acquire.status == rx::rhi::SwapchainStatus::Suspended) {
+            // Zero-extent/minimize guard [Phase 4 Task 17, FG7]: see
+            // samples/01_triangle/main.cpp's runPresent() for the full
+            // rationale (same pattern, every --present sample).
+            // compileForExtent() (below/above) calls graph.compile() with
+            // the LIVE swapchain extent -- unlike executor->realize() alone,
+            // this WOULD create an invalid 0x0 transient image if run while
+            // still suspended, so it only runs once isSuspended() is
+            // confirmed false, exactly like the NeedsRecreate branch below.
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            if (!device->recreateSwapchain(surface)) {
+                RX_LOG_ERROR("Device::recreateSwapchain failed while suspended (zero-extent retry)");
+                ok = false;
+                break;
+            }
+            if (!device->isSuspended()) {
+                destroySwapchainViews();
+                if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
+                    !createSwapchainViews()) {
+                    RX_LOG_ERROR("swapchain view rebuild failed after resuming from suspended state");
+                    ok = false;
+                    break;
+                }
+                compileForExtent(device->swapchainExtent());
+            }
+            continue;
+        }
         if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
             if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
                 RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
@@ -1748,7 +1787,14 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode) {
                 ok = false;
                 break;
             }
-            compileForExtent(device->swapchainExtent());
+            // [Phase 4 Task 17, FG7] A genuinely zero-extent resize (real
+            // minimize on X11/Win32) lands HERE too -- recreateSwapchain()
+            // above still returns true (it entered the suspended state
+            // successfully), but compileForExtent() must not run against a
+            // 0x0 extent.
+            if (!device->isSuspended()) {
+                compileForExtent(device->swapchainExtent());
+            }
             continue;
         }
         if (acquire.status == rx::rhi::SwapchainStatus::DeviceLost) {
@@ -1832,7 +1878,11 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode) {
                 ok = false;
                 break;
             }
-            compileForExtent(device->swapchainExtent());
+            // [Phase 4 Task 17, FG7] Same zero-extent guard as the acquire
+            // branch above.
+            if (!device->isSuspended()) {
+                compileForExtent(device->swapchainExtent());
+            }
         } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
             RX_LOG_ERROR("device lost during present; exiting present loop");
             ok = false;
@@ -1880,6 +1930,9 @@ int main(int argc, char** argv) {
     // there; the flag is still parsed like any other (no error on it) but
     // simply has no effect in that path.
     rx::rhi::PresentMode vsyncMode = rx::rhi::PresentMode::VsyncOn;
+    // --fullscreen [Phase 4 Task 17, FG7] -- forwarded to runPresent() only,
+    // same rationale as --vsync above.
+    bool fullscreen = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--present") {
             presentMode = true;
@@ -1894,11 +1947,13 @@ int main(int argc, char** argv) {
             } else {
                 RX_LOG_ERROR("--vsync expects 'on' or 'off', got '{}' -- defaulting to on", value);
             }
+        } else if (std::string_view(argv[i]) == "--fullscreen") {
+            fullscreen = true;
         }
     }
 
     if (presentMode) {
-        return runPresent(enableValidation, vsyncMode);
+        return runPresent(enableValidation, vsyncMode, fullscreen);
     }
     return runHeadless(enableValidation);
 }

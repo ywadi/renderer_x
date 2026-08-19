@@ -145,6 +145,10 @@ struct Args {
     bool validate = false;
     bool present = false;
     bool quitDuringLoad = false;
+    // [Phase 4 Task 17, FG7] Borderless-desktop fullscreen, applied at
+    // startup only (no in-sample runtime hotkey) -- same present-mode-flag
+    // convention --vsync above already follows.
+    bool fullscreen = false;
     // [D17] Undocumented-to-users, documented-to-maintainers escape hatch:
     // when non-empty, runHeadless() WRITES its two captured frames
     // (loading_state.png/loaded_scene.png) into this directory instead of
@@ -188,6 +192,8 @@ std::optional<Args> parseArgs(int argc, char** argv) {
                 RX_LOG_ERROR("sample_08_gltf_viewer: --vsync expects 'on' or 'off', got '{}' -- defaulting to on",
                              value);
             }
+        } else if (arg == "--fullscreen") {
+            args.fullscreen = true;
         } else {
             RX_LOG_ERROR("sample_08_gltf_viewer: unrecognized argument '{}'", arg);
             return std::nullopt;
@@ -1926,6 +1932,24 @@ int runPresent(const Args& args) {
             return 1;
         }
     }
+
+    // --fullscreen [Phase 4 Task 17, FG7]: makeApp() above already created
+    // the window (and Device::create() already built the first swapchain
+    // against its pre-fullscreen size), so this reuses the SAME
+    // recreateSwapchain(surface) call the --vsync block above just used --
+    // never a second/bespoke recreation path [gate ruling #25 row 5].
+    if (args.fullscreen) {
+        if (!app->window->setFullscreen(true)) {
+            RX_LOG_ERROR("sample_08_gltf_viewer: Window::setFullscreen(true) failed while applying --fullscreen");
+            destroyApp(*app);
+            return 1;
+        }
+        if (!app->device->recreateSwapchain(app->surface)) {
+            RX_LOG_ERROR("sample_08_gltf_viewer: Device::recreateSwapchain failed while applying --fullscreen");
+            destroyApp(*app);
+            return 1;
+        }
+    }
     RX_LOG_INFO("sample_08_gltf_viewer: --present: present mode in use: {}",
                 rx::rhi::presentModeName(app->device->presentMode()));
 
@@ -2053,6 +2077,35 @@ int runPresent(const Args& args) {
         vkWaitForFences(vkDevice, 1, &fence, VK_TRUE, UINT64_MAX);
 
         auto acquire = app->device->acquireNextImage(frameSync->currentImageAvailableSemaphore());
+        if (acquire.status == rx::rhi::SwapchainStatus::Suspended) {
+            // Zero-extent/minimize guard [Phase 4 Task 17, FG7]: see
+            // samples/01_triangle/main.cpp's runPresent() for the full
+            // rationale (same pattern, every --present sample).
+            // app->executor->realize(graph) is safe to call unconditionally
+            // here (this sample never re-runs graph.compile() on resize --
+            // realize() only rebuilds resources sized off the ORIGINAL,
+            // startup-time compile, never the live swapchain extent), so no
+            // extra isSuspended() guard is needed around it beyond the
+            // rebuild-only-once-resumed shape used below.
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            if (!app->device->recreateSwapchain(app->surface)) {
+                RX_LOG_ERROR("sample_08_gltf_viewer: Device::recreateSwapchain failed while suspended (zero-extent "
+                             "retry)");
+                ok = false;
+                break;
+            }
+            if (!app->device->isSuspended()) {
+                if (!rebuildSwapchainViews() ||
+                    !frameSync->onSwapchainRecreated(static_cast<uint32_t>(app->device->swapchainImages().size()))) {
+                    RX_LOG_ERROR("sample_08_gltf_viewer: swapchain view rebuild failed after resuming from "
+                                 "suspended state");
+                    ok = false;
+                    break;
+                }
+                app->executor->realize(graph);
+            }
+            continue;
+        }
         if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
             vkDeviceWaitIdle(vkDevice);
             if (!app->device->recreateSwapchain(app->surface) || !rebuildSwapchainViews() ||

@@ -59,6 +59,32 @@ copying that one binary; nothing else from the build tree is needed.
 - Driver: NVIDIA proprietary 580.82.07 (Vulkan 1.4.312 reported)
 - Result: **PASS** — no unexpected validation output on any run.
 
+**[Phase 4 Task 17, FG7] Zero-extent/minimize + fullscreen rows (added
+2026-08-18, gate ruling #25 row 16) — NOT covered by the 2026-08-10 PASS
+run above, which predates this feature. Own checklist, own "Last run"
+below.**
+- [ ] Minimize the window (taskbar/dock, or the OS shortcut) and restore it
+      at least twice; the process does not crash/hang, and `--validate`
+      shows zero unexpected `[error]` lines across the whole minimize/
+      restore sequence.
+- [ ] Toggle borderless fullscreen on/off (`--fullscreen` at startup; there
+      is no in-sample runtime hotkey — use the OS's own fullscreen/restore
+      window controls to toggle back) at least twice; the window fills the
+      display with no borders in fullscreen, returns to its prior windowed
+      size/position on toggle-off, and `--validate` shows zero unexpected
+      `[error]` lines.
+
+**Last run:** not yet performed on real hardware — the automated GPU test
+suite (`rx_rhi_vk_tests`'s `window_state_test.cpp`, this task's own report)
+exercises the zero-extent guard via a dependency-injection seam (no real
+display can be made to report a genuinely zero-sized surface headlessly —
+see that report's own disclosure) and the real windowed↔fullscreen toggle
+against this development machine's real desktop (not a minimize, which
+this same desktop session cannot script safely). A TRUE OS-level minimize
+under a live, real `--present` session has not yet been performed by a
+human. Fill in the checkboxes and record hardware/driver/result above the
+first time this is actually run.
+
 ## Windows (binary cross-compiled via `windows-cross-zig`, run natively)
 
 - [ ] Build on Linux: `cmake --preset windows-cross-zig && cmake --build --preset windows-cross-zig`
@@ -71,6 +97,12 @@ copying that one binary; nothing else from the build tree is needed.
 - [ ] Closes cleanly via the window's close button, no crash/hang
 - [ ] Headless mode still exits 0: `sample_01_triangle.exe` (check
       `echo %ERRORLEVEL%` after it returns) → `triangle readback PASSED`
+- [ ] [Phase 4 Task 17, FG7] Minimize the window (taskbar) and restore it at
+      least twice; no crash/hang.
+- [ ] [Phase 4 Task 17, FG7] Toggle borderless fullscreen on/off
+      (`--fullscreen` at startup) at least twice via the OS's own window
+      controls; fills the display with no borders, returns cleanly to
+      windowed size on toggle-off.
 
 **Last run:** not yet performed on real Windows hardware — this repository
 was developed and verified on Linux only. `windows-cross-zig` is confirmed
@@ -99,6 +131,12 @@ other Linux machine.
       controls) with no visual corruption
 - [ ] Closes cleanly via the window's close button, no crash/hang
 - [ ] Headless mode still exits 0: `./sample_01_triangle`
+- [ ] [Phase 4 Task 17, FG7] Minimize the window and restore it at least
+      twice (Gamescope/Desktop Mode taskbar); no crash/hang.
+- [ ] [Phase 4 Task 17, FG7] Toggle borderless fullscreen on/off
+      (`--fullscreen` at startup) at least twice via KDE's own window
+      controls; fills the display with no borders, returns cleanly to
+      windowed size on toggle-off.
 
 **Last run:** not yet performed on real Steam Deck hardware — this
 repository was developed and verified on a Linux desktop only. The

@@ -128,6 +128,40 @@ exact same pipeline-construction code and draw call:
   mode has anything to apply it to — a plain headless run parses `--vsync`
   like any other flag but has no visible swapchain for it to affect, so it
   is silently ignored there.
+- **`--fullscreen`** — enters borderless-desktop fullscreen at startup
+  (`rx::platform::Window::setFullscreen()`: `SDL_SetWindowFullscreen(window,
+  true)` with no exclusive display mode set — SDL3's own documented meaning
+  of "borderless fullscreen desktop", not `VK_EXT_full_screen_exclusive`,
+  which this codebase does not use). In this sample (and 02-07), it's
+  applied immediately after the window is created but before the first
+  swapchain is built, so it costs no extra recreation; 08_gltf_viewer's
+  window/device setup is bundled into one helper, so it applies this the
+  same way `--vsync off` already does there — one explicit
+  `recreateSwapchain()` call right after. There is no runtime hotkey to
+  toggle it back off in this sample — close the window (or resize/
+  un-fullscreen via the OS's own window controls) to exit fullscreen. Only
+  `--present` mode has a window for this to affect; a headless run parses
+  it like any other flag but ignores it, same as `--vsync` above. Related:
+  minimizing the window while `--present` is running (any sample) is also
+  handled — see "Zero-extent/minimize handling" below.
+
+### Zero-extent/minimize handling
+
+Every sample's `--present` mode tolerates the window being minimized (or
+resized down to 0×0, which amounts to the same thing at the Vulkan level):
+`rx::rhi::Device::recreateSwapchain()` queries the surface's real extent
+before rebuilding anything, and — instead of handing a 0×0 size to
+`vkb::SwapchainBuilder` (a validation error, `VUID-VkSwapchainCreateInfoKHR-
+imageExtent-01689`) — enters a suspended-present state: no swapchain is
+built, and `acquireNextImage()`/`present()` return `SwapchainStatus::
+Suspended` without issuing the underlying Vulkan calls at all. Every
+sample's present loop checks for this status and skips rendering that frame
+(polling for a real extent to resume on) instead of crashing. This is
+driven entirely by the queried surface extent, not by SDL's minimize
+event/flag — on Wayland, SDL3 cannot reliably detect a real,
+compositor-driven minimize via either of those (see
+`rx::platform::logWaylandMinimizeLimitationOnce()`'s own comment), so the
+extent query is what actually keeps this safe there too.
 
 ### Expected output
 
@@ -222,6 +256,11 @@ path:
 - **`--vsync on|off`** (default `on`) — same present-mode control as
   01_triangle's `--vsync` section above; only `--present` mode has a
   swapchain for it to affect.
+- **`--fullscreen`** — same borderless-desktop fullscreen toggle as
+  01_triangle's `--fullscreen` section above; only `--present` mode has a
+  window for it to affect. Minimize handling during `--present` is the same
+  extent-query-driven guard described in 01_triangle's "Zero-extent/minimize
+  handling" section.
 
 ### Editing the shader live
 
@@ -332,6 +371,11 @@ never uploaded to) enables correct depth testing across the 5 objects.
 - **`--vsync on|off`** (default `on`) — same present-mode control as
   01_triangle's `--vsync` section above; only `--present` mode has a
   swapchain for it to affect.
+- **`--fullscreen`** — same borderless-desktop fullscreen toggle as
+  01_triangle's `--fullscreen` section above; only `--present` mode has a
+  window for it to affect. Minimize handling during `--present` is the same
+  extent-query-driven guard described in 01_triangle's "Zero-extent/minimize
+  handling" section.
 
 ### Expected output
 
@@ -422,6 +466,11 @@ instead, since the grid and camera never move), which
 - **`--vsync on|off`** (default `on`) — same present-mode control as
   01_triangle's `--vsync` section above; only `--present` mode has a
   swapchain for it to affect.
+- **`--fullscreen`** — same borderless-desktop fullscreen toggle as
+  01_triangle's `--fullscreen` section above; only `--present` mode has a
+  window for it to affect. Minimize handling during `--present` is the same
+  extent-query-driven guard described in 01_triangle's "Zero-extent/minimize
+  handling" section.
 
 ### Expected output
 
@@ -496,6 +545,11 @@ mirroring `04_streaming`'s own `cellProbePixel()` derivation.
 - **`--vsync on|off`** (default `on`) — same present-mode control as
   01_triangle's `--vsync` section above; only `--present` mode has a
   swapchain for it to affect.
+- **`--fullscreen`** — same borderless-desktop fullscreen toggle as
+  01_triangle's `--fullscreen` section above; only `--present` mode has a
+  window for it to affect. Minimize handling during `--present` is the same
+  extent-query-driven guard described in 01_triangle's "Zero-extent/minimize
+  handling" section.
 
 ### Expected output
 
@@ -588,6 +642,11 @@ derivations this makes possible.
 - **`--vsync on|off`** (default `on`) — same present-mode control as
   01_triangle's `--vsync` section above; only `--present` mode has a
   swapchain for it to affect.
+- **`--fullscreen`** — same borderless-desktop fullscreen toggle as
+  01_triangle's `--fullscreen` section above; only `--present` mode has a
+  window for it to affect. Minimize handling during `--present` is the same
+  extent-query-driven guard described in 01_triangle's "Zero-extent/minimize
+  handling" section.
 
 ### Expected output
 
@@ -728,6 +787,10 @@ PNGs.
   is neutral, `2^0 == 1`).
 - **`--vsync on|off`** (default `on`) — same present-mode control as
   01_triangle's `--vsync` section above.
+- **`--fullscreen`** — same borderless-desktop fullscreen toggle as
+  01_triangle's `--fullscreen` section above. Minimize handling during
+  `--present` is the same extent-query-driven guard described in
+  01_triangle's "Zero-extent/minimize handling" section.
 
 ### Expected output
 

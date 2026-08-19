@@ -107,6 +107,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -158,6 +159,10 @@ struct Args {
     rx::rhi::PresentMode vsyncMode = rx::rhi::PresentMode::VsyncOn;
     bool validate = false;
     bool present = false;
+    // [Phase 4 Task 17, FG7] Borderless-desktop fullscreen, applied at
+    // startup only (no in-sample runtime hotkey) -- same present-mode-flag
+    // convention every other flag here already follows.
+    bool fullscreen = false;
 };
 
 std::optional<Args> parseArgs(int argc, char** argv) {
@@ -195,6 +200,8 @@ std::optional<Args> parseArgs(int argc, char** argv) {
             } else {
                 RX_LOG_ERROR("sample_07_stress: --vsync expects 'on' or 'off', got '{}' -- defaulting to on", value);
             }
+        } else if (arg == "--fullscreen") {
+            args.fullscreen = true;
         } else {
             RX_LOG_ERROR("sample_07_stress: unrecognized argument '{}'", arg);
             return std::nullopt;
@@ -1508,6 +1515,16 @@ int runPresent(const Args& args) {
         RX_LOG_ERROR("Window::create failed: no display backend available");
         return 1;
     }
+    // --fullscreen [Phase 4 Task 17, FG7]: applied immediately after window
+    // creation, before Device::create() below builds the initial swapchain
+    // -- see samples/01_triangle/main.cpp's runPresent() for the full
+    // rationale (same pattern, every --present sample).
+    if (args.fullscreen) {
+        if (!window->setFullscreen(true)) {
+            RX_LOG_ERROR("Window::setFullscreen(true) failed while applying --fullscreen");
+            return 1;
+        }
+    }
     auto extensions = window->requiredVulkanInstanceExtensions();
     if (extensions.empty()) {
         RX_LOG_ERROR("video driver reports no Vulkan surface extensions (e.g. dummy driver)");
@@ -1642,6 +1659,36 @@ int runPresent(const Args& args) {
         vkWaitForFences(vkDevice, 1, &fence, VK_TRUE, UINT64_MAX);
 
         auto acquire = device->acquireNextImage(frameSync->currentImageAvailableSemaphore());
+        if (acquire.status == rx::rhi::SwapchainStatus::Suspended) {
+            // Zero-extent/minimize guard [Phase 4 Task 17, FG7]: see
+            // samples/01_triangle/main.cpp's runPresent() for the full
+            // rationale (same pattern, every --present sample).
+            // executor->realize(graph) is safe to call unconditionally here
+            // (unlike samples/05_multipass/06_materials, this sample never
+            // re-runs graph.compile() on resize -- realize() only rebuilds
+            // resources sized off the ORIGINAL, startup-time compile, never
+            // the live swapchain extent), so no extra isSuspended() guard
+            // is needed around it beyond the rebuild-only-once-resumed
+            // shape every other guard in this file already uses.
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            if (!device->recreateSwapchain(surface)) {
+                RX_LOG_ERROR("Device::recreateSwapchain failed while suspended (zero-extent retry)");
+                ok = false;
+                break;
+            }
+            if (!device->isSuspended()) {
+                if (!rebuildSwapchainViews() ||
+                    !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size()))) {
+                    RX_LOG_ERROR("swapchain view rebuild failed after resuming from suspended state");
+                    ok = false;
+                    break;
+                }
+                executor->realize(graph);
+                scene->viewProj = makeCameraViewProj(args.draws, device->swapchainExtent().width,
+                                                      device->swapchainExtent().height);
+            }
+            continue;
+        }
         if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
             vkDeviceWaitIdle(vkDevice);
             if (!device->recreateSwapchain(surface) || !rebuildSwapchainViews() ||
