@@ -437,10 +437,7 @@ it is out of scope for *this* spec only, not out of scope for the project:
     volumes/height fog fed by the same grid. Sequenced with/after
     clustered Forward+ (priority 3) since it consumes that
     infrastructure; exact priority slot decided at techniques-phase
-    spec time. Motivating consumer case noted 2026-08-19: retro-
-    hybrid art direction (low-res PSX-style presentation with modern
-    volumetric lighting) — the aesthetic depends on (b), not just
-    screen-space rays.
+    spec time.
   - **Frame pipeline target:** depth → shadows → clustered light
     assignment → opaque lighting → volumetrics (froxel march +
     apply) → SSR → scene-color mip chain → glass/transmission →
