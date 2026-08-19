@@ -191,6 +191,19 @@ struct StandardPbr : IMaterialShader {
         float3 specular = D * vis * fresnel;
         float3 diffuse = diffuseColor / kPi;
 
+        // [Fix round, coordinator ruling] `occlusion` deliberately does NOT
+        // multiply direct light: the glTF spec's own occlusionTexture text
+        // and all three first-tier engine references (Filament/glTF-
+        // Sample-Renderer/three.js) treat ambient occlusion as an
+        // INDIRECT-only term, and the gate matrix's own occlusion row
+        // scopes the acceptance criterion to exactly the ambient
+        // contribution below ("ambientColor x occlusionValue x
+        // baseColor... the ONLY contribution"). An earlier version of this
+        // file multiplied `directLight` by `occlusion` too -- spec-
+        // incorrect (double-darkens a direct-lit, occluded surface) and,
+        // forward-looking, would have doubled up with Task 22's own future
+        // shadow maps (a REAL direct-light visibility term) once that
+        // lands. Direct light is governed by NdotL/shadowing alone.
         float3 directLight = (diffuse + specular) * v.lightColor * NdotL;
 
         // [FG1] Interim flat ambient/environment term -- uniform color x
@@ -200,7 +213,7 @@ struct StandardPbr : IMaterialShader {
         // still gets this contribution -- the whole point of FG1).
         float3 ambient = v.ambientColor * occlusion * baseColor.rgb;
 
-        float3 color = directLight * occlusion + ambient + emissive;
+        float3 color = directLight + ambient + emissive;
         return float4(color, baseColor.a);
     }
 };
