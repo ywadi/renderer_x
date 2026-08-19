@@ -171,10 +171,17 @@ std::optional<QuadMesh> createQuadMesh(rx::rhi::Allocator& allocator) {
 // along +Z. [MATRIX LAYOUT] Every matrix here is glm::transpose()'d before
 // upload -- see rx_material/draw_data.h's own MATRIX LAYOUT paragraph for
 // why (MaterialSystem's Slang session is ROW-major; GLM is column-major).
-rx::material::DrawDataGpu makeHeadOnRow(glm::mat4 model = glm::mat4(1.0F)) {
+// [Fix round, item 1] `orthoHalfExtent` defaults to 0.5 -- the ORIGINAL,
+// unchanged frustum every existing call site relies on (exactly matching
+// the quad's own object-space extent, filling the whole viewport). A
+// multi-probe test that needs more than one on-screen, non-overlapping
+// quad location at once (D26.1's own two-draw case, below) passes a wider
+// value so a translated quad stays clipped-visible instead of falling
+// outside the frustum entirely.
+rx::material::DrawDataGpu makeHeadOnRow(glm::mat4 model = glm::mat4(1.0F), float orthoHalfExtent = 0.5F) {
     rx::material::DrawDataGpu row;
     glm::mat4 view = glm::lookAt(glm::vec3(0.0F, 0.0F, 2.0F), glm::vec3(0.0F, 0.0F, 0.0F), glm::vec3(0.0F, 1.0F, 0.0F));
-    glm::mat4 proj = glm::orthoZO(-0.5F, 0.5F, -0.5F, 0.5F, 0.1F, 10.0F);
+    glm::mat4 proj = glm::orthoZO(-orthoHalfExtent, orthoHalfExtent, -orthoHalfExtent, orthoHalfExtent, 0.1F, 10.0F);
     // Vulkan's clip-space Y axis points DOWN; GLM's `orthoZO` (like every
     // other GLM projection helper) is written for the OpenGL convention (Y
     // UP) and does not know about that difference on its own -- negating
@@ -291,10 +298,19 @@ struct DrawRequest {
 // drives its own real per-draw buffer and pushes this push-constant range
 // itself, never through this method") -- this is exactly the manual
 // sequence samples/08_gltf_viewer's own real per-draw code follows.
-Rgba8 renderQuad(rx::rhi::Device& device, rx::rhi::Allocator& allocator, rx::rhi::BindlessTable& bindless,
-                  rx::rhi::BindlessHandle drawDataBufferHandle, uint32_t defaultSamplerBindlessIndex,
-                  const QuadMesh& mesh, const std::vector<DrawRequest>& draws) {
-    constexpr VkExtent2D kExtent{8, 8};
+// [Fix round, item 1] Shared core: renders `draws` into an `extent`-sized
+// offscreen target and returns the RAW row-major RGBA8 pixel buffer --
+// renderQuad() below is a thin wrapper extracting the single center pixel
+// (unchanged behavior/signature for every one of its 46 existing callers);
+// a multi-probe test that needs to sample more than one independent screen
+// location (the D26.1 two-draw case below, once its own depth-tie masking
+// bug was found -- see that TEST_CASE's own header comment) calls this
+// directly instead.
+std::vector<uint8_t> renderQuadPixels(rx::rhi::Device& device, rx::rhi::Allocator& allocator,
+                                       rx::rhi::BindlessTable& bindless, rx::rhi::BindlessHandle drawDataBufferHandle,
+                                       uint32_t defaultSamplerBindlessIndex, const QuadMesh& mesh,
+                                       const std::vector<DrawRequest>& draws, VkExtent2D extent) {
+    const VkExtent2D kExtent = extent;
     constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
     constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
 
@@ -492,9 +508,9 @@ Rgba8 renderQuad(rx::rhi::Device& device, rx::rhi::Allocator& allocator, rx::rhi
     }
     readback->invalidate();
 
-    const auto* pixels = static_cast<const uint8_t*>(readback->mappedData());
-    size_t centerIndex = (static_cast<size_t>(kExtent.height / 2) * kExtent.width + (kExtent.width / 2)) * 4;
-    Rgba8 result{pixels[centerIndex], pixels[centerIndex + 1], pixels[centerIndex + 2], pixels[centerIndex + 3]};
+    const auto* rawPixels = static_cast<const uint8_t*>(readback->mappedData());
+    std::vector<uint8_t> result(rawPixels,
+                                 rawPixels + static_cast<size_t>(kExtent.width) * kExtent.height * 4);
 
     vkDestroyImageView(device.device(), view, nullptr);
     vkDestroyImage(device.device(), image, nullptr);
@@ -502,6 +518,26 @@ Rgba8 renderQuad(rx::rhi::Device& device, rx::rhi::Allocator& allocator, rx::rhi
     vkDestroyDescriptorPool(device.device(), descriptorPool, nullptr);
 
     return result;
+}
+
+// Extracts one texel from a `renderQuadPixels()` result -- shared by
+// renderQuad() (below, the single-center-pixel legacy shape) and any
+// multi-probe caller.
+Rgba8 pixelAt(const std::vector<uint8_t>& pixels, VkExtent2D extent, uint32_t x, uint32_t y) {
+    const size_t index = (static_cast<size_t>(y) * extent.width + x) * 4;
+    return Rgba8{pixels[index], pixels[index + 1], pixels[index + 2], pixels[index + 3]};
+}
+
+// The original, single-center-pixel shape every other test in this file
+// uses -- unchanged signature and behavior, now a thin wrapper over
+// renderQuadPixels()/pixelAt() above.
+Rgba8 renderQuad(rx::rhi::Device& device, rx::rhi::Allocator& allocator, rx::rhi::BindlessTable& bindless,
+                  rx::rhi::BindlessHandle drawDataBufferHandle, uint32_t defaultSamplerBindlessIndex,
+                  const QuadMesh& mesh, const std::vector<DrawRequest>& draws) {
+    constexpr VkExtent2D kExtent{8, 8};
+    std::vector<uint8_t> pixels = renderQuadPixels(device, allocator, bindless, drawDataBufferHandle,
+                                                     defaultSamplerBindlessIndex, mesh, draws, kExtent);
+    return pixelAt(pixels, kExtent, kExtent.width / 2, kExtent.height / 2);
 }
 
 // Builds a StandardPbrParams-shaped blob with every field at its glTF/D28
@@ -595,17 +631,38 @@ TEST_CASE("D26.1: two draws in one command buffer, the second at firstInstance>0
         whiteIndex = system->textureBindlessIndex(tex);
     }
 
-    // ROW 0: red tint, at the ORIGIN (model = identity, matching the
-    // default head-on rig). ROW 1: green tint, translated +X by 2 units --
-    // pushed entirely off the ortho frustum's [-0.5,0.5] visible range, so
-    // if the SECOND draw's own transform (firstInstance=1's row) were
-    // WRONGLY read as row 0 (the SV_InstanceID-relative-index bug D26.1's
-    // own matrix row names), it would render red-at-origin AGAIN instead of
-    // green-off-frustum -- exactly the discriminating case a
-    // single-draw-only test cannot catch.
+    // [Fix round, item 1 -- see this file's own git history for the
+    // superseded, depth-tie-masked version] ROW 0: red tint, at the ORIGIN
+    // (model = identity). ROW 1: green tint, translated +X by 2 world
+    // units, under a WIDENED ortho frustum (orthoHalfExtent=3.0, vs. the
+    // 0.5 every other test's default head-on rig uses) so row 1's quad
+    // stays genuinely ON-SCREEN, at a SEPARATE, NON-OVERLAPPING location
+    // from row 0's -- not clipped away entirely, the way the original
+    // version of this test placed it. This is load-bearing, not cosmetic:
+    // the original off-frustum placement was PROVEN (this fix round) to be
+    // a discrimination hole -- under the SV_InstanceID revert bug, row 1's
+    // own draw misreads row 0's IDENTITY transform, so its fragments land
+    // EXACTLY on top of row 0's own already-written, IDENTICAL-depth quad;
+    // Vulkan's spec-mandated `VK_COMPARE_OP_LESS` (strict, this project's
+    // own fixed depth-compare state, material_system.cpp) then REJECTS
+    // every one of the buggy draw's fragments as a depth-tie, so the
+    // framebuffer silently reads back IDENTICAL to the correct-behavior
+    // case (a lone red quad, no visible green anywhere) regardless of
+    // whether the addressing bug is actually present -- reproduced
+    // directly this fix round: an empirical SV_InstanceID revert did NOT
+    // fail this test's own OLD single-center-pixel assertion (see the task
+    // report's fix-round section for the full paste). Probing row 1's OWN
+    // real, non-overlapping screen location closes that hole: under the
+    // bug, row 1's real location gets NO fragments at all (the buggy draw
+    // never reaches it), reading back as the plain background clear color
+    // -- unambiguously distinct from GREEN, with no depth-tie possible
+    // between two draws that no longer even hit the same pixels.
+    constexpr float kWideOrthoHalfExtent = 3.0F;
+    constexpr glm::vec3 kRow1Translation{2.0F, 0.0F, 0.0F};
     std::vector<rx::material::DrawDataGpu> rows;
-    rows.push_back(makeHeadOnRow());
-    rows.push_back(makeHeadOnRow(glm::translate(glm::mat4(1.0F), glm::vec3(2.0F, 0.0F, 0.0F))));
+    rows.push_back(makeHeadOnRow(glm::mat4(1.0F), kWideOrthoHalfExtent));
+    rows.push_back(
+        makeHeadOnRow(glm::translate(glm::mat4(1.0F), kRow1Translation), kWideOrthoHalfExtent));
     auto drawDataBuffer = createDrawDataBuffer(fixture->allocator, fixture->bindless, rows);
     REQUIRE(drawDataBuffer.has_value());
 
@@ -675,20 +732,46 @@ TEST_CASE("D26.1: two draws in one command buffer, the second at firstInstance>0
     draws.push_back(DrawRequest{pipeline, system->pipelineLayout(unlit), realParamLayout, greenBlob.data(),
                                  greenBlob.size(), pushSize, /*drawDataRow=*/1, 0.0F});
 
-    Rgba8 pixel = renderQuad(fixture->device, fixture->allocator, fixture->bindless, drawDataBuffer->handle,
-                              defaultSamplerIndex, *mesh, draws);
+    // [Fix round, item 1] A 48x48 target (vs. the 8x8 every single-quad
+    // test uses) and the widened orthoHalfExtent=3.0 frustum above give
+    // exactly 8 texels per world unit -- world x=0 (row 0's quad center)
+    // maps to texel x=(0+3)*8=24; world x=2 (row 1's quad center, after
+    // its own +2 translation) maps to texel x=(2+3)*8=40. Both probes sit
+    // comfortably inside their own quad's own footprint (each quad spans a
+    // full world unit, i.e. 8 texels, centered on its own probe point) and
+    // nowhere near the other quad's footprint (a >=8-texel gap either way)
+    // or the frustum edge.
+    constexpr VkExtent2D kProbeExtent{48, 48};
+    constexpr uint32_t kRow0ProbeX = 24;
+    constexpr uint32_t kRow1ProbeX = 40;
+    constexpr uint32_t kProbeY = 24;
+    std::vector<uint8_t> pixels = renderQuadPixels(fixture->device, fixture->allocator, fixture->bindless,
+                                                     drawDataBuffer->handle, defaultSamplerIndex, *mesh, draws,
+                                                     kProbeExtent);
+    Rgba8 row0Pixel = pixelAt(pixels, kProbeExtent, kRow0ProbeX, kProbeY);
+    Rgba8 row1Pixel = pixelAt(pixels, kProbeExtent, kRow1ProbeX, kProbeY);
 
-    // Row 0 (identity transform, on-frustum) draws RED at the probed
-    // center pixel; row 1 (translated off-frustum) draws nothing visible
-    // there. If SV_VulkanInstanceID's own row addressing were broken (e.g.
-    // reading SV_InstanceID instead, which the Slang docs confirm
-    // subtracts firstInstance back out -- always 0 for THIS draw regardless
-    // of its real firstInstance=1), the second draw would ALSO read row 0
-    // (identity, on-frustum) and incorrectly paint GREEN over the red,
-    // since it is recorded second -- this is exactly what this assertion
-    // catches.
-    CHECK(pixel.r > 200);
-    CHECK(pixel.g < 50);
+    // Row 0's own location must read RED (its own draw, correctly
+    // addressed via SV_VulkanInstanceID==0, i.e. no addressing distinction
+    // possible there at all -- this assertion alone is NOT the
+    // discriminating one, kept only as a basic sanity check).
+    CHECK(row0Pixel.r > 200);
+    CHECK(row0Pixel.g < 50);
+    // Row 1's own, SEPARATE location is the real discriminator: it must
+    // read GREEN. If SV_VulkanInstanceID's own row addressing were broken
+    // (e.g. reading SV_InstanceID instead -- Slang's own documented,
+    // independently-verified behavior for it, per this codebase's own
+    // material.slang/forward_entry.slang/draw_data.h header comments:
+    // gl_InstanceIndex minus gl_BaseInstance, i.e. always 0 for a draw
+    // whose firstInstance IS its own gl_BaseInstance, regardless of the
+    // real firstInstance value), the second draw would misread row 0's
+    // OWN transform instead of its real row 1 -- its fragments would land
+    // on row 0's location (where they lose the depth tie, invisibly) and
+    // NEVER reach row 1's real, separate location at all, which would
+    // therefore read back as the plain background clear color instead of
+    // green.
+    CHECK(row1Pixel.g > 200);
+    CHECK(row1Pixel.r < 50);
 
     vkDestroyDescriptorSetLayout(fixture->device.device(), realParamLayout, nullptr);
     vkDestroySampler(fixture->device.device(), rawSampler, nullptr);
@@ -1005,6 +1088,118 @@ TEST_CASE("StandardPBR: occlusion closed-form -- R=0,strength=1 zeroes ambient e
     CHECK(near8(halfStrengthPixel.r, 64, 8));
     CHECK(near8(halfStrengthPixel.g, 64, 8));
     CHECK(near8(halfStrengthPixel.b, 64, 8));
+
+    // [Fix round, item 5b -- coordinator ruling] Occlusion is
+    // INDIRECT-only: it must NOT attenuate direct light at all (an earlier
+    // version of standard_pbr.slang multiplied `directLight * occlusion`
+    // too -- spec-incorrect; fixed this same fix round, see that file's own
+    // header comment on `directLight`). Isolates direct light by zeroing
+    // `ambientColor` (removing the only place `occlusion` legitimately
+    // participates) and using the DEFAULT head-on rig (NdotL=1, a real,
+    // nonzero direct contribution) -- then compares an UNOCCLUDED
+    // (occlusion=1, white texture) render against a HEAVILY OCCLUDED
+    // (occlusion=0, R=0 texture, strength=1 -- the same `blackOcclusionTex`
+    // used above) render of the OTHERWISE IDENTICAL material: with ambient
+    // zeroed, the two must read back IDENTICAL (direct light is the only
+    // remaining contributor, and occlusion must not touch it), unlike the
+    // ambient-only cases above where occlusion legitimately changes the
+    // result.
+    rx::material::DrawDataGpu directOnlyRow = makeHeadOnRow();
+    directOnlyRow.ambientColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
+
+    std::vector<uint8_t> directUnoccludedBlob = makeDefaultStandardPbrBlob(*rig, handle);
+    setParam(directUnoccludedBlob, params, "metallicFactor", 0.0F);
+    Rgba8 directUnoccludedPixel = renderOne(*rig, handle, directUnoccludedBlob, directOnlyRow);
+
+    std::vector<uint8_t> directOccludedBlob = makeDefaultStandardPbrBlob(*rig, handle);
+    setParam(directOccludedBlob, params, "metallicFactor", 0.0F);
+    setParam(directOccludedBlob, params, "occlusionTexture", blackOcclusionTex);
+    setParam(directOccludedBlob, params, "occlusionStrength", 1.0F);
+    Rgba8 directOccludedPixel = renderOne(*rig, handle, directOccludedBlob, directOnlyRow);
+
+    // Sanity: direct light is genuinely present and visible (not
+    // accidentally zero for some unrelated reason), so the equality
+    // assertions below are actually discriminating something real.
+    CHECK(directUnoccludedPixel.r > 50);
+    // The real assertion: occlusion=0 (fully "occluded") must NOT have
+    // changed the direct-lit result at all.
+    CHECK(near8(directOccludedPixel.r, directUnoccludedPixel.r, 2));
+    CHECK(near8(directOccludedPixel.g, directUnoccludedPixel.g, 2));
+    CHECK(near8(directOccludedPixel.b, directUnoccludedPixel.b, 2));
+
+    destroyRig(*rig);
+    CHECK_FALSE(rig->fixture->context.hasValidationErrors());
+}
+
+// [Fix round, item 2] The matrix's own emissive acceptance criterion (a
+// dedicated probe proving emissive bypasses lighting entirely) had no
+// TEST_CASE at all -- makeDefaultStandardPbrBlob()'s own
+// `emissiveFactorAndPad={0,0,0,0}` neutral default meant no existing test
+// ever exercised a NONZERO value. Isolates emissive by zeroing BOTH
+// `lightColor` AND `ambientColor` on the row (not by zeroing baseColor,
+// which would still leave a real, nonzero dielectric F0=0.04 specular
+// term reachable if any light/ambient were present) -- with both light
+// terms zero, standard_pbr.slang's own `color = directLight*occlusion +
+// ambient + emissive` collapses to exactly `emissive`, regardless of
+// baseColor/metallic/roughness (left at makeDefaultStandardPbrBlob()'s own
+// neutral defaults, deliberately not special-cased, to prove emissive is
+// independent of them too).
+TEST_CASE("StandardPBR: emissiveFactor (no texture) renders EXACTLY that color pre-tonemap, independent of "
+          "lighting (light+ambient zeroed)") {
+    auto rig = makeStandardPbrRig("standard_pbr_emissive_factor");
+    if (!rig.has_value()) {
+        return;
+    }
+    rx::material::MaterialHandle handle =
+        rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
+    const auto params = rig->system->materialParams(handle);
+
+    rx::material::DrawDataGpu row = makeHeadOnRow();
+    row.lightColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
+    row.ambientColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
+
+    std::vector<uint8_t> blob = makeDefaultStandardPbrBlob(*rig, handle);
+    // 0.2/0.4/0.6 -> exact byte values (51/102/153, no rounding ambiguity)
+    // once multiplied by 255, so this can assert near-exact rather than a
+    // wide tolerance band.
+    setParam(blob, params, "emissiveFactorAndPad", std::array<float, 4>{0.2F, 0.4F, 0.6F, 0.0F});
+    Rgba8 pixel = renderOne(*rig, handle, blob, row);
+
+    CHECK(near8(pixel.r, 51, 3));
+    CHECK(near8(pixel.g, 102, 3));
+    CHECK(near8(pixel.b, 153, 3));
+    destroyRig(*rig);
+    CHECK_FALSE(rig->fixture->context.hasValidationErrors());
+}
+
+// [Fix round, item 2] Textured variant -- emissiveFactor x emissiveTexture,
+// same lighting-isolation technique as the factor-only probe above.
+TEST_CASE("StandardPBR: emissiveFactor x emissiveTexture renders their exact product pre-tonemap, independent of "
+          "lighting (light+ambient zeroed)") {
+    auto rig = makeStandardPbrRig("standard_pbr_emissive_texture");
+    if (!rig.has_value()) {
+        return;
+    }
+    rx::material::MaterialHandle handle =
+        rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
+    const auto params = rig->system->materialParams(handle);
+
+    uint32_t emissiveTex = makeTexture(*rig->system, {100, 150, 200, 255});
+
+    rx::material::DrawDataGpu row = makeHeadOnRow();
+    row.lightColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
+    row.ambientColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
+
+    std::vector<uint8_t> blob = makeDefaultStandardPbrBlob(*rig, handle);
+    // factor=1 passes the texel through unscaled -> expected EXACTLY the
+    // texture's own (100,150,200).
+    setParam(blob, params, "emissiveFactorAndPad", std::array<float, 4>{1.0F, 1.0F, 1.0F, 0.0F});
+    setParam(blob, params, "emissiveTexture", emissiveTex);
+    Rgba8 pixel = renderOne(*rig, handle, blob, row);
+
+    CHECK(near8(pixel.r, 100, 3));
+    CHECK(near8(pixel.g, 150, 3));
+    CHECK(near8(pixel.b, 200, 3));
     destroyRig(*rig);
     CHECK_FALSE(rig->fixture->context.hasValidationErrors());
 }
