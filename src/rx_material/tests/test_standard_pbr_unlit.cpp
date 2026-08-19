@@ -105,6 +105,12 @@ std::optional<Fixture> makeFixture(const char* title) {
     // registers more than 1).
     capacities.samplers = 4;
     capacities.storageBuffers = 8;
+    // [Phase 4 Stage 2 Task 22 fix round, F1] material.slang now
+    // unconditionally declares `gShadowCompareSamplers` at binding 3;
+    // headroom for 2 (the new real-lit-path shadow probe test below
+    // registers its own comparison sampler alongside whatever the rest
+    // of this file's existing tests already leave live).
+    capacities.comparisonSamplers = 2;
     auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
     REQUIRE(bindless.has_value());
 

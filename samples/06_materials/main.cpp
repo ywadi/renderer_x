@@ -840,7 +840,18 @@ void destroyScene(Scene& scene) {
 bool createScene(Scene& scene, VkPhysicalDevice physicalDevice, rx::rhi::Device& device, rx::rhi::Allocator& allocator,
                   rx::rhi::Uploader& uploader, const std::filesystem::path& sharedShaderDir,
                   const std::filesystem::path& materialsDir, const std::filesystem::path& pipelineCachePath) {
+    // [Phase 4 Stage 2 Task 22 fix round, F1] comparisonSamplers=1: this
+    // sample draws through MaterialSystem, and material.slang now
+    // unconditionally declares `gShadowCompareSamplers` at binding 3
+    // (Slang does not dead-strip unused globals) -- every MaterialSystem
+    // pipeline this sample builds needs that binding to exist, even
+    // though this sample never populates a real shadow map (its own
+    // DrawDataGpu rows leave shadowMapTextureIndex at its sentinel
+    // default, so rx_sampleShadowPCF() never actually reads through this
+    // slot -- but the DESCRIPTOR SET LAYOUT itself must still match the
+    // SPIR-V's own declared shape for pipeline creation to succeed).
     rx::rhi::BindlessTable::Capacities capacities{/*sampledImages=*/4, /*samplers=*/1, /*storageBuffers=*/1};
+    capacities.comparisonSamplers = 1;
     auto bindlessTable = rx::rhi::BindlessTable::create(physicalDevice, device.device(), capacities);
     if (!bindlessTable.has_value()) {
         RX_LOG_ERROR("sample_06_materials: BindlessTable::create failed");

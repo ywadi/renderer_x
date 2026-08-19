@@ -112,8 +112,24 @@ struct DrawDataGpu {
     uint32_t _pad0 = 0;
     uint32_t _pad1 = 0;
     uint32_t _pad2 = 0;
+
+    // [Phase 4 Stage 2 Task 22 fix round, F1, spec D21] Mirrors
+    // material.slang's RxDrawData shadow fields EXACTLY (added at the same
+    // struct-tail position on both sides). `shadowMapTextureIndex`
+    // defaults to the "no shadow map bound" sentinel (0xFFFFFFFF) --
+    // every EXISTING producer of a DrawDataGpu row (MaterialSystem's own
+    // default single-row buffer, samples 06/08's own per-draw buffers,
+    // this library's own GPU test fixtures) that never sets this field
+    // gets BYTE-IDENTICAL pre-Task-22 shading (rx_sampleShadowPCF()
+    // returns 1.0 unconditionally for the sentinel -- see material.slang's
+    // own comment).
+    glm::mat4 lightViewProj{1.0F};  // world -> light clip, STANDARD-Z [D13]. Transposed before upload, same MATRIX LAYOUT convention as every other matrix field above.
+    uint32_t shadowMapTextureIndex = 0xFFFFFFFFu;  // bindless SAMPLED_IMAGE index of the shadow map; sentinel = shadows disabled for this draw.
+    uint32_t shadowCompareSamplerIndex = 0;        // bindless COMPARISON-SAMPLER index (BindlessTable::kComparisonSamplerBinding).
+    float shadowTexelSize = 0.0F;                  // UV-space PCF tap step (1.0 / shadow map resolution).
+    uint32_t _padShadow = 0;
 };
-static_assert(sizeof(DrawDataGpu) == 272, "DrawDataGpu must stay exactly 272 bytes -- mirrors material.slang's RxDrawData");
+static_assert(sizeof(DrawDataGpu) == 352, "DrawDataGpu must stay exactly 352 bytes -- mirrors material.slang's RxDrawData");
 
 // Mirrors material.slang's `RxMaterialGlobals` push-constant struct
 // (`[[vk::push_constant]] ConstantBuffer<RxMaterialGlobals> gMaterialGlobals;`)

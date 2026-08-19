@@ -124,6 +124,25 @@ Texture2D gTextures[];
 [[vk::binding(1, 0)]]
 SamplerState gSamplers[];
 
+// [Phase 4 Stage 2 Task 22 fix round, F1, spec D21/gate ruling #23] The
+// scene-shadow-map comparison sampler array -- `SamplerComparisonState`,
+// NOT `SamplerState`: Vulkan requires a `compareEnable=VK_TRUE` VkSampler
+// be sampled via a depth-comparison instruction
+// (`OpImageSampleDrefImplicitLod`/`SampleCmp` in Slang/HLSL terms), which
+// only a `SamplerComparisonState`-typed global can legally emit -- an
+// ordinary `Texture2D.Sample()` against a compare-enabled sampler is a
+// real VUID violation, not merely stylistically wrong. Bound at
+// `[[vk::binding(3, 0)]]` -- `rx::rhi::BindlessTable::
+// kComparisonSamplerBinding`, this table's own FOURTH, OPTIONAL slot
+// (`BindlessTable::Capacities::comparisonSamplers` -- see that field's own
+// header comment for why every pre-Task-22 non-material bindless consumer
+// is unaffected by this addition). Declared here (not forward_entry.slang)
+// for the SAME reason `gTextures`/`gSamplers` above are: every material
+// module already `import material;`, and `rx_sampleShadowPCF()` below
+// (the only thing that touches this global) lives in this module too.
+[[vk::binding(3, 0)]]
+SamplerComparisonState gShadowCompareSamplers[];
+
 // DEFAULT SAMPLER INDEX -- the bindless SAMPLER slot `rx_sampleTexture`'s
 // two-argument overload (below) reads has to come from somewhere at
 // runtime, since a compile-time-fixed slot number (e.g. "sampler 0") was
@@ -235,10 +254,67 @@ public struct RxDrawData {
     public uint _pad0;
     public uint _pad1;
     public uint _pad2;
+
+    // [Phase 4 Stage 2 Task 22 fix round, F1, spec D21] The scene shadow
+    // map's own light-space view-proj (STANDARD-Z, D13 -- shadow maps do
+    // NOT reverse) -- per-pass, repeated per row, same precedent as
+    // `viewProj`/`lightDirWorld` above. `shadowMapTextureIndex ==
+    // 0xFFFFFFFF` is the "no shadow map bound for this draw" sentinel --
+    // every pre-Task-22 producer of a DrawDataGpu row (MaterialSystem's
+    // own default single-row buffer, samples 06/08's own per-draw
+    // buffers) leaves this at its default (0xFFFFFFFF, see draw_data.h's
+    // own `DrawDataGpu::shadowMapTextureIndex` default) and is therefore
+    // BYTE-IDENTICAL to pre-Task-22 behavior: `rx_sampleShadowPCF()`
+    // below returns 1.0 (fully lit, no shadow test) unconditionally for
+    // the sentinel, never touching `gTextures`/`gShadowCompareSamplers`
+    // at all.
+    public float4x4 lightViewProj;
+    public uint shadowMapTextureIndex;
+    public uint shadowCompareSamplerIndex;
+    public float shadowTexelSize;
+    public uint _padShadow;
 }
 
 [[vk::binding(2, 0)]]
 public StructuredBuffer<RxDrawData> gDrawData[];
+
+// [Phase 4 Stage 2 Task 22 fix round, F1, spec D21/gate ruling #23]
+// Hardware comparison-sampler 3x3 PCF -- 9 real `SampleCmp` taps against a
+// `compareEnable=VK_TRUE`/`compareOp=VK_COMPARE_OP_LESS` `VkSampler`
+// (hardware-filtered per-tap, NOT a manual `if (depth > stored)` compare
+// the way `shaders/multipass/lit.frag.slang` does), matching this
+// project's own fast-path-as-default policy. `worldPos` is the SHADED
+// fragment's own world-space position; `lightViewProj`/`shadowMap*Index`/
+// `texelSize` come from the calling material's own `RxDrawData` row
+// (forward_entry.slang's fragmentMain re-reads it -- see that file's own
+// comment for why). Returns 1.0 (fully lit) immediately, WITHOUT touching
+// either bindless array, when `shadowMapTextureIndex` is the
+// `RxDrawData::shadowMapTextureIndex` sentinel (0xFFFFFFFF) -- the
+// "no shadow map bound" case every pre-Task-22 draw-data producer
+// naturally falls into (see that field's own comment).
+public float rx_sampleShadowPCF(uint shadowMapTextureIndex, uint shadowCompareSamplerIndex, float3 worldPos,
+                                 float4x4 lightViewProj, float texelSize) {
+    if (shadowMapTextureIndex == 0xFFFFFFFFu) {
+        return 1.0;
+    }
+
+    float4 lightClip = mul(lightViewProj, float4(worldPos, 1.0));
+    float3 lightNdc = lightClip.xyz / lightClip.w;
+    float2 shadowUv = lightNdc.xy * 0.5 + 0.5;
+    // Standard-Z [D13]: 0.0 == near, 1.0 == far -- the exact convention
+    // the shadow-caster pipeline's own VK_COMPARE_OP_LESS assumes
+    // (rx_shadow/shadow_caster_pipeline.cpp's own required code comment).
+    float compareDepth = lightNdc.z;
+
+    float visibility = 0.0;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            float2 tapUv = shadowUv + float2(float(dx), float(dy)) * texelSize;
+            visibility += gTextures[shadowMapTextureIndex].SampleCmp(gShadowCompareSamplers[shadowCompareSamplerIndex], tapUv, compareDepth);
+        }
+    }
+    return visibility / 9.0;
+}
 
 // [Phase 4 Task 16] Gained `drawDataBufferIndex` (the D26.1 bindless
 // STORAGE BUFFER index -- see RxDrawData/gDrawData above) and `exposure`

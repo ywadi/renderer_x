@@ -93,6 +93,10 @@ std::optional<MaterialTestFixture> makeFixture(const char* title) {
     // a D26.1 test building its own real per-draw buffer still has a free
     // slot.
     capacities.storageBuffers = 2;
+    // [Phase 4 Stage 2 Task 22 fix round, F1] material.slang now
+    // unconditionally declares `gShadowCompareSamplers` at binding 3 --
+    // every MaterialSystem pipeline this fixture builds needs it present.
+    capacities.comparisonSamplers = 1;
     auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
     REQUIRE(bindless.has_value());
 
@@ -380,7 +384,11 @@ TEST_CASE("MaterialSystem::loadMaterial reflects the set-1 parameter block and b
     // gSamplers -- see this file's own header comment for why every
     // material reflects all of material.slang's set-0 globals regardless
     // of whether its own evaluate() touches them.
-    REQUIRE(layout.bindings.size() == 4);
+    // [Phase 4 Stage 2 Task 22 fix round, F1, spec D21] grew from 4 to 5:
+    // material.slang's new `gShadowCompareSamplers` bindless comparison-
+    // sampler array (the hardware-PCF shadow-sampling mechanism) joins
+    // the other four, same "always present" reasoning.
+    REQUIRE(layout.bindings.size() == 5);
 
     const auto& paramBlock = findBinding(layout, 1, 0);
     CHECK(paramBlock.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
@@ -400,6 +408,16 @@ TEST_CASE("MaterialSystem::loadMaterial reflects the set-1 parameter block and b
     const auto& drawData = findBinding(layout, 0, rx::rhi::BindlessTable::kStorageBufferBinding);
     CHECK(drawData.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
     CHECK(drawData.unboundedArray);
+
+    // [Phase 4 Stage 2 Task 22 fix round, F1] gShadowCompareSamplers --
+    // the new bindless comparison-sampler array, VK_DESCRIPTOR_TYPE_SAMPLER
+    // (Vulkan draws no descriptor-type distinction between a comparison
+    // and an ordinary sampler; only the real VkSampler's own
+    // compareEnable and the shader-side SamplerComparisonState type
+    // differ).
+    const auto& compareSamplers = findBinding(layout, 0, rx::rhi::BindlessTable::kComparisonSamplerBinding);
+    CHECK(compareSamplers.type == VK_DESCRIPTOR_TYPE_SAMPLER);
+    CHECK(compareSamplers.unboundedArray);
 
     // [Task 4, Phase 4 Task 16] gMaterialGlobals -- same "always present
     // regardless of use" reasoning as the three bindings above; grew from

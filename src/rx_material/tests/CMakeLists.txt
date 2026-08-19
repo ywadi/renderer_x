@@ -38,8 +38,18 @@ add_executable(rx_material_gpu_tests
     # validation-clean), the D28 pipeline-cache-counter test, and the
     # D26.1 two-draw SV_VulkanInstanceID test.
     test_standard_pbr_unlit.cpp
+    # Phase 4 Stage 2 Task 22 fix round [F1, spec D21]: the comparison-
+    # sampler 3x3 PCF mechanism (material.slang's own gShadowCompareSamplers/
+    # rx_sampleShadowPCF, forward_entry.slang's fragmentMain re-read/
+    # shadowFactor wiring) exercised through the REAL production lit path
+    # (MaterialSystem::getPipeline() against standard_pbr.slang), not a
+    # standalone probe rig -- links rx_shadow for its
+    # ShadowCasterPipeline/fitShadowFrustum (device-free math + the real
+    # shadow-caster pipeline building the shadow map this test's receiver
+    # draws sample).
+    test_standard_pbr_shadow_gpu.cpp
 )
-target_link_libraries(rx_material_gpu_tests PRIVATE rx_material rx_rhi_vk rx_platform doctest::doctest)
+target_link_libraries(rx_material_gpu_tests PRIVATE rx_material rx_shadow rx_rhi_vk rx_platform doctest::doctest)
 rx_shader_deploy_runtime_libs(rx_material_gpu_tests)
 
 target_compile_definitions(rx_material_gpu_tests PRIVATE

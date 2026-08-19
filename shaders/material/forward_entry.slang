@@ -119,6 +119,17 @@ struct VertexStageOutput {
     float3 lightColor;
     float3 ambientColor;
     float3 cameraPosWorld;
+    // [Phase 4 Stage 2 Task 22 fix round, F1, spec D21] The draw's own
+    // bindless row index -- carried through so fragmentMain can re-read
+    // THIS SAME `RxDrawData` row for its shadow fields
+    // (`lightViewProj`/`shadowMapTextureIndex`/...), which vertexMain
+    // does not otherwise forward individually. An integer varying is
+    // implicitly flat/`nointerpolation` (SPIR-V has no linear-interpolation
+    // decoration for integer types) -- exactly the same per-draw-constant-
+    // travels-through-the-vertex-output idiom `lightDirWorld`/`lightColor`/
+    // `ambientColor` above already use, just for an index instead of a
+    // value.
+    nointerpolation uint drawDataRow;
 };
 
 // `instanceId` binds to `SV_VulkanInstanceID`, NOT `SV_InstanceID` -- see
@@ -154,18 +165,40 @@ VertexStageOutput vertexMain(float3 position : POSITION, float3 normal : NORMAL,
     output.lightColor = draw.lightColor.xyz;
     output.ambientColor = draw.ambientColor.xyz;
     output.cameraPosWorld = draw.cameraPosWorld.xyz;
+    output.drawDataRow = instanceId;
     return output;
 }
 
 [shader("fragment")]
 float4 fragmentMain(VertexStageOutput input) : SV_Target {
+    // [Phase 4 Stage 2 Task 22 fix round, F1, spec D21] Re-read THIS
+    // draw's own RxDrawData row for its shadow fields -- vertexMain
+    // already read the SAME row once (for model/viewProj/light*), but
+    // fragmentMain has no direct access to that local; re-reading by the
+    // row index forwarded via `input.drawDataRow` is one extra
+    // StructuredBuffer fetch per fragment, the same cost class as any
+    // other per-fragment bindless read this shader already performs
+    // (rx_sampleTexture's own gTextures[]/gSamplers[] indexing).
+    RxDrawData draw = gDrawData[gMaterialGlobals.drawDataBufferIndex][input.drawDataRow];
+    float shadowFactor = rx_sampleShadowPCF(draw.shadowMapTextureIndex, draw.shadowCompareSamplerIndex, input.worldPos,
+                                             draw.lightViewProj, draw.shadowTexelSize);
+
     MaterialVertex v;
     v.worldPos = input.worldPos;
     v.normal = safeNormalize(input.normal);
     v.tangent = float4(safeNormalize(input.tangent.xyz), input.tangent.w);
     v.uv = input.uv;
     v.lightDirWorld = input.lightDirWorld;
-    v.lightColor = input.lightColor;
+    // Shadow attenuates DIRECT light ONLY -- scaling `lightColor` here
+    // (not the material's own final returned color) means every
+    // conforming material's own `directContribution = NdotL * lightColor
+    // * brdf(...)`-shaped term (standard_pbr.slang's own `directLight`)
+    // is correctly attenuated while ambient/emissive terms (driven by
+    // `ambientColor`, untouched) are not -- exactly D21's own "a REAL
+    // direct-light visibility term" framing (standard_pbr.slang's own
+    // occlusion-vs-shadow comment, written when this shader-side half of
+    // Task 22 was still future work, now landed here).
+    v.lightColor = input.lightColor * shadowFactor;
     v.ambientColor = input.ambientColor;
     v.cameraPosWorld = input.cameraPosWorld;
 

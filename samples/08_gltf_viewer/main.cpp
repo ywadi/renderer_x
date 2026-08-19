@@ -813,7 +813,16 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
 
     // Everything from here on takes a REFERENCE into `app`'s own now-stable
     // fields -- see this struct's own header comment.
+    // [Phase 4 Stage 2 Task 22 fix round, F1] Same requirement as sample
+    // 06's own identical comment: material.slang unconditionally declares
+    // `gShadowCompareSamplers` at binding 3 now, so every BindlessTable
+    // feeding MaterialSystem needs it. This sample's own DrawDataGpu rows
+    // (buildDrawList()) leave shadowMapTextureIndex at its "no shadow"
+    // sentinel default -- this viewer does not build a real shadow map
+    // (that is Task 24/sample 09's own scene-path job) -- so 1 slot is
+    // enough (never more than one comparison sampler live at once).
     rx::rhi::BindlessTable::Capacities capacities{/*sampledImages=*/256, /*samplers=*/16, /*storageBuffers=*/4};
+    capacities.comparisonSamplers = 1;
     auto bindless =
         rx::rhi::BindlessTable::create(app->device->physicalDevice(), app->device->device(), capacities);
     if (!bindless.has_value()) {

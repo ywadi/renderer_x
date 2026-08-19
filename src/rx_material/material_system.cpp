@@ -401,6 +401,7 @@ std::optional<MaterialReflection> reflectMaterialLayout(slang::ProgramLayout* la
     bool foundTextureArray = false;
     bool foundSamplerArray = false;
     bool foundDrawDataArray = false;
+    bool foundComparisonSamplerArray = false;
     bool foundMaterialGlobalsPushConstant = false;
 
     // [Task 4] Needed only by the DescriptorTableSlot branch below, for
@@ -544,6 +545,33 @@ std::optional<MaterialReflection> reflectMaterialLayout(slang::ProgramLayout* la
                 foundDrawDataArray = true;
                 continue;
             }
+            // [Phase 4 Stage 2 Task 22 fix round, F1, spec D21] material.
+            // slang's own `gShadowCompareSamplers` bindless comparison-
+            // sampler array. Slang's reflection API does NOT distinguish
+            // `SamplerComparisonState` from `SamplerState` by `TypeReflection::
+            // Kind` -- both report `Kind::SamplerState` (verified directly
+            // against this project's shipped slang.h: there is exactly one
+            // `SLANG_TYPE_KIND_SAMPLER_STATE` value, no separate comparison-
+            // sampler kind) -- so this case is keyed by BINDING NUMBER alone
+            // (`kComparisonSamplerBinding`, 3), exactly like `gTextures`/
+            // `gSamplers`/`gDrawData` above are each keyed by their own
+            // fixed binding number. Vulkan itself draws no descriptor-TYPE
+            // distinction either (VK_DESCRIPTOR_TYPE_SAMPLER either way) --
+            // only the real `VkSampler`'s own `compareEnable` and this
+            // shader-side type differ.
+            if (set == kBindlessTextureArraySet && bindingIndex == rx::rhi::BindlessTable::kComparisonSamplerBinding &&
+                kind == BindlessArrayElementKind::SamplerArray && unbounded && !foundComparisonSamplerArray) {
+                rx::shader::ShaderLayoutInfo::Binding binding;
+                binding.set = set;
+                binding.binding = bindingIndex;
+                binding.count = 0;
+                binding.type = VK_DESCRIPTOR_TYPE_SAMPLER;
+                binding.stages = kMaterialStageFlags;
+                binding.unboundedArray = true;
+                result.shaderLayout.bindings.push_back(binding);
+                foundComparisonSamplerArray = true;
+                continue;
+            }
 
             error = "material module '" + moduleLabel + "' declares an unsupported bindless global '" + name +
                     "' at set " + std::to_string(set) + " binding " + std::to_string(bindingIndex) +
@@ -554,7 +582,10 @@ std::optional<MaterialReflection> reflectMaterialLayout(slang::ProgramLayout* la
                     ", binding " + std::to_string(rx::rhi::BindlessTable::kSamplerBinding) +
                     "] / `gDrawData` [unbounded StructuredBuffer<RxDrawData>[], set " +
                     std::to_string(kBindlessTextureArraySet) + ", binding " +
-                    std::to_string(rx::rhi::BindlessTable::kStorageBufferBinding) + "] shape)";
+                    std::to_string(rx::rhi::BindlessTable::kStorageBufferBinding) +
+                    "] / `gShadowCompareSamplers` [unbounded SamplerComparisonState[], set " +
+                    std::to_string(kBindlessTextureArraySet) + ", binding " +
+                    std::to_string(rx::rhi::BindlessTable::kComparisonSamplerBinding) + "] shape)";
             return std::nullopt;
         }
 

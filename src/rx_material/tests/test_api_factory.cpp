@@ -84,6 +84,9 @@ std::optional<ApiTestFixture> makeFixture(const char* title) {
     capacities.sampledImages = 4;
     capacities.samplers = 2;
     capacities.storageBuffers = 1;
+    // [Phase 4 Stage 2 Task 22 fix round, F1] Same requirement as
+    // test_material_system.cpp's own identical comment.
+    capacities.comparisonSamplers = 1;
     auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
     REQUIRE(bindless.has_value());
 
