@@ -83,6 +83,13 @@ add_subdirectory(src/rx_rhi_vk)
 # CMakeLists.txt) to build a minimal draw pipeline for its readback
 # assertions -- see src/rx_asset/CMakeLists.txt.
 add_subdirectory(src/rx_asset)
+# rx_scene: Phase 4 Stage 2 Task 18 -- Scene (D19 render-proxy submission,
+# no ECS) + Camera (D13 reversed-Z projection source of truth). Entirely
+# device-free; depends on rx_asset (MeshHandle/MaterialHandle/AABB types,
+# and Registry via scene.cpp's meshBoundsFromRegistry() adapter). Added
+# here, right after rx_asset, since it is Stage 2's first library and
+# nothing in Stage 1 (rx_graph/rx_material) depends on it.
+add_subdirectory(src/rx_scene)
 # Device-free in Task 1 (pass declarations, culling, ordering, lifetimes):
 # depends on Vulkan::Headers + rx_core only, not rx_rhi_vk -- see
 # src/rx_graph/CMakeLists.txt's own comment for why that dependency is
