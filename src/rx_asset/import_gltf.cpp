@@ -717,7 +717,17 @@ ImportComputeResult computeGltfImport(std::span<const std::byte> documentBytes, 
     if (dataBuffer.error() != fastgltf::Error::None) {
         result.error = mapFastgltfError(dataBuffer.error());
         RX_LOG_ERROR("rx_asset: importGltf: failed to wrap document bytes: {}", importErrorName(result.error));
-        setStage(stageOut, ImportStage::Failed);
+        // [Issue #30 round 2] Deliberately NOT setStage(stageOut, Failed)
+        // here -- see this function's own header comment. The async path's
+        // finishAsyncImportCompute() (registry.cpp) is the SOLE place that
+        // sets `stage = Failed` for a compute-phase error, in the exact
+        // same synchronous call as firing the completion callback, exactly
+        // mirroring the Done transition in pollAsyncImportUploads(). A
+        // direct store here, on the WORKER thread, raced ahead of that
+        // main-thread pairing: a poller could observe stage==Failed before
+        // the callback had fired (reviewer-found, round 2; regression test:
+        // the "[race regression] repeated garbage-bytes imports" TEST_CASE,
+        // async_import_test.cpp).
         return result;
     }
 
@@ -735,7 +745,10 @@ ImportComputeResult computeGltfImport(std::span<const std::byte> documentBytes, 
         result.error = mapFastgltfError(assetExpected.error());
         RX_LOG_ERROR("rx_asset: importGltf: parse failed: {} ({})", importErrorName(result.error),
                      fastgltf::getErrorMessage(assetExpected.error()));
-        setStage(stageOut, ImportStage::Failed);
+        // [Issue #30 round 2] Deliberately NOT setStage(stageOut, Failed)
+        // here -- see the dataBuffer-wrap failure branch above (same
+        // rationale, same regression test); this is the path the round-2
+        // review's reproduction actually hit (malformed JSON).
         return result;
     }
     fastgltf::Asset asset = std::move(assetExpected.get());

@@ -598,6 +598,106 @@ TEST_CASE("importGltfAsync: garbage-bytes import yields the SAME named ImportErr
 }
 
 // ---------------------------------------------------------------------
+// [Issue #30, round 2 -- reviewer-found, pre-existing, out of the six-site
+// rework's scope] `pumpUntilTerminal()` (this file's shared helper, defined
+// above, unmodified by this fix) polls `registry.importProgress(handle)`
+// and returns as soon as `stage` reads Done/Failed/cancelled. Callers
+// (every TEST_CASE in this file, and any real host application following
+// the same documented pattern) then assume the paired completion callback
+// has ALREADY fired by that point -- true for every terminal transition
+// EXCEPT one: a compute-phase PARSE failure (malformed/corrupt document
+// bytes) used to call setStage(stageOut, ImportStage::Failed) DIRECTLY on
+// the WORKER thread, inside computeGltfImport() (import_gltf.cpp, the
+// dataBuffer-wrap and parser.loadGltf early-return paths) -- a store fully
+// decoupled from, and racing ahead of, the completion callback, which only
+// fires later when that same worker thread's OWN postToMain(finishAsync-
+// ImportCompute) closure is actually drained by a pumpMain() call on the
+// main thread. Every OTHER terminal transition (Done via
+// pollAsyncImportUploads(), Failed via finishAsyncImportCompute()'s own
+// compute.error branch, Failed via the three IO-thread-read-failure
+// closures in Registry::importGltfAsync(path, ...)) sets `stage` and fires
+// the callback in the SAME synchronous call, so no such window exists
+// there -- this was narrow (worker-thread instruction count between the
+// store and its own postToMain() call, typically far under a microsecond)
+// and reviewer-reproduced only 2/40 full-suite runs under real GPU
+// contention (a competing process widening the scheduling window). Own
+// reproduction during this fix, on a quiet host: 0/5000 naturally (the
+// window is too narrow to hit without contention here), 31/5000 once an
+// artificial 500us delay was inserted right after the direct store (a
+// TEMPORARY, since-removed diagnostic -- see the fix's own report
+// addendum) -- confirming both the mechanism and that this loop detects
+// it. Fixed in import_gltf.cpp by deleting both redundant direct stores --
+// finishAsyncImportCompute() (registry.cpp) already authoritatively sets
+// `stage = Failed` in the exact same call as firing the callback, mirroring
+// every other terminal-transition site, which makes the race structurally
+// impossible rather than merely less likely. Fixed number of iterations
+// (not wall-clock-derived), so this loop carries no issue-#30-class
+// assertion-count variance of its own; the loop itself performs no
+// REQUIRE/CHECK, only the single aggregated REQUIRE after it.
+// ---------------------------------------------------------------------
+
+TEST_CASE("importGltfAsync: [race regression] repeated garbage-bytes imports never observe a terminal stage "
+          "before the paired completion callback has fired") {
+    auto fixture = makeFixture("async_garbage_race_stress");
+    if (!fixture) {
+        return;
+    }
+    attachPool(*fixture);
+    auto scheduler = rx::task::Scheduler::create(2);
+    REQUIRE(scheduler != nullptr);
+
+    const std::string garbage = "this is not json at all { [ garbage";
+    std::vector<std::byte> bytes(garbage.size());
+    std::memcpy(bytes.data(), garbage.data(), garbage.size());
+
+    class NullSource final : public ByteSource {
+    public:
+        std::optional<std::vector<std::byte>> read(const std::string&) override { return std::nullopt; }
+    };
+    NullSource source;
+
+    // [Issue #30 round 2] 2000, not the 5000 used during this fix's own
+    // diagnosis: the fix (see import_gltf.cpp's own comment at both
+    // deleted call sites) makes the race STRUCTURALLY impossible, not
+    // merely less likely -- `job->stage` now has exactly one write site for
+    // a compute-phase failure (finishAsyncImportCompute(), registry.cpp),
+    // always in the same synchronous call as firing the completion
+    // callback -- so this loop's only remaining job is guarding against a
+    // FUTURE regression reintroducing a similarly racy direct store
+    // elsewhere. On this quiet host the ORIGINAL (pre-fix) bug did not
+    // reproduce naturally at 5000 iterations either (0/5000; it only
+    // reproduced once an artificial delay was inserted to widen the
+    // window, matching the reviewer's own finding that this needs real
+    // scheduling contention to surface) -- so a higher count buys little
+    // real-world guard strength against ambient noise; 2000 is cheap
+    // insurance, not a probability play.
+    constexpr int kIterations = 2000;
+    int terminalTimeouts = 0;
+    int raceHits = 0;
+    for (int i = 0; i < kIterations; ++i) {
+        Registry registry;
+        bool done = false;
+        AsyncImportHandle handle = registry.importGltfAsync(bytes, source, *fixture->pool, *scheduler, nullptr,
+                                                              [&](ImportResult) { done = true; });
+        const bool reachedTerminal =
+            pumpUntilTerminal(*scheduler, registry, handle, std::chrono::milliseconds(2000));
+        if (!reachedTerminal) {
+            ++terminalTimeouts;  // should never happen either -- counted separately for diagnosis
+            continue;
+        }
+        if (!done) {
+            ++raceHits;
+        }
+    }
+    MESSAGE("race regression: ", raceHits, " / ", kIterations,
+            " iterations observed stage-terminal before the completion callback fired (", terminalTimeouts,
+            " separate timeout(s))");
+    REQUIRE(terminalTimeouts == 0);
+    REQUIRE(raceHits == 0);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// ---------------------------------------------------------------------
 // Cancellation (abandon semantics).
 // ---------------------------------------------------------------------
 
@@ -1010,7 +1110,12 @@ TEST_CASE("importGltfAsync: cancelImport() after >=1 real GPU resource (texture 
     // count that is itself wall-clock/scheduling-dependent). Same
     // discriminating power: the flag latches permanently the first time
     // `done` is observed true before the mid-upload window is caught.
-    CHECK_FALSE(finalizedBeforeGeometryObserved);
+    // [Round 2, LOW finding] REQUIRE, not CHECK -- restores the original
+    // abort-on-violation semantics: a caught violation here means the rest
+    // of this test case's own state (post-cancel mesh/material/pool
+    // assertions below) can no longer be trusted, so it must not keep
+    // running against data the violation may have already invalidated.
+    REQUIRE_FALSE(finalizedBeforeGeometryObserved);
 
     REQUIRE(fixture->textures->liveTextureCountForTesting() > liveTexturesBefore);
     const PoolStats poolStatsMidUpload = fixture->pool->stats();
@@ -1161,9 +1266,12 @@ TEST_CASE("importGltfAsync: cancelImport() after EXACTLY 1 of N texture slots ha
     // previously a REQUIRE_FALSE(done)/REQUIRE(live<=+1) pair evaluated once
     // per loop spin (a wall-clock/scheduling-dependent count). Same
     // discriminating power: either flag latches permanently on the first
-    // violating tick.
-    CHECK_FALSE(finalizedBeforeOneRegistered);  // must not have finalized before this loop caught the 1-of-N window
-    CHECK_FALSE(overshotPastOne);  // never overshoots past exactly 1
+    // violating tick. [Round 2, LOW finding] REQUIRE, not CHECK -- restores
+    // the original abort-on-violation semantics (a caught violation here
+    // means the rest of this test case's own state can no longer be
+    // trusted).
+    REQUIRE_FALSE(finalizedBeforeOneRegistered);  // must not have finalized before this loop caught the 1-of-N window
+    REQUIRE_FALSE(overshotPastOne);  // never overshoots past exactly 1
     // Never dropped below baseline on the way here either (the checkerboard
     // and every role fallback are built once at TextureCache::create() and
     // must never be touched by anything this import's own marshal does).
