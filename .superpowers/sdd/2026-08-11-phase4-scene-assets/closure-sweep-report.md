@@ -13,6 +13,8 @@ order:
 | docs | `ffff2f5` | closure-sweep report (original five-item evidence) |
 | fix-round Critical | `b6f3e2f` | fix(third_party): make mikktspace PATCH_COMMAND idempotent across reconfigures |
 | fix-round minor | `6468294` | ci: prune stale .deps-cache entries before save |
+| fix-round docs | `3dfaf31` | closure-sweep fix-round evidence |
+| micro-item | `d2aab5d` | ci: fail-safe both prune steps against an empty deps-cache manifest |
 
 Final CI-equivalent gate, run after all five original commits (see the
 "Final re-verification after the fix round" section below for the gate
@@ -556,6 +558,26 @@ the final `ci.yml` with both prune steps added.
 - windows-cross-zig: full `cmake --build --preset windows-cross-zig`
   clean (147/147 targets), then the exact CI ctest invocation under
   `xvfb-run -a` + Wine — **10/10 passed**, 108.68s total.
+
+## Micro-item — empty-manifest fail-safe for both prune steps
+
+Final re-review flagged one latent edge, closed per the no-deferral
+policy (commit `d2aab5d`): both prune steps' `test -f "${manifest}"`
+guard caught a MISSING manifest but not an EMPTY-but-existing one, which
+would have passed that check and fallen through to the loop, where every
+`grep -qxF` lookup misses against an empty file — deleting every
+`.deps-cache/` subdirectory instead of none. Unreachable under the
+current call graph (`rx_add_cached_dependency()` always appends at least
+one key before Configure can succeed), but made structurally impossible
+rather than left implicit: changed to `test -s "${manifest}"` (exists
+AND non-empty) in both jobs, one line each, with a comment explaining the
+distinction. Verified directly under `bash --noprofile --norc -eo
+pipefail` (GitHub Actions' own `run:` shell) for all three cases against
+a real `.deps-cache` with two subdirectories: missing manifest → exit 1,
+both dirs untouched; empty manifest → exit 1, both dirs untouched;
+populated manifest listing one of the two keys → exit 0, the unlisted
+dir removed, the listed one kept. `actionlint` 1.7.12: zero findings on
+the resulting `ci.yml`.
 
 ---
 
