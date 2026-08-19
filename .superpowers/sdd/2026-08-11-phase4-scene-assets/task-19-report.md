@@ -12,8 +12,8 @@ BASE = a178969 (post Task 18, CI green).
   `xFromRegistry()` production adapters, `DrawListBuilder`, and the
   `recordDrawList`/`resolveDrawGroups` D27 mechanism.
 - `src/rx_scene/draw_list.cpp` (887 lines) — implementation.
-- `src/rx_scene/tests/draw_list_test.cpp` (1453 lines, 61 test cases) —
-  device-free coverage.
+- `src/rx_scene/tests/draw_list_test.cpp` (32 `TEST_CASE`s as of fix round
+  1 — see "Fix round 1" section below) — device-free coverage.
 
 ## Files modified (necessary, documented deviations — see below)
 
@@ -118,6 +118,31 @@ check (exactly what the gate matrix's own D27 row asks for). A production
 future-task work; this task proves the seam and its guard are load-bearing
 (see revert-discrimination evidence below).
 
+**Fix round 1 correction (review finding 3, Medium):** the FIRST cut of
+this seam shaped `PipelineResolveFn` as `std::function<uint32_t(uint32_t
+materialIndex)>` and `ResolvedDrawGroup::pipelineToken` as `uint32_t` —
+independently reviewed and found genuinely wrong, not just narrow:
+`VkPipeline` is a `VK_DEFINE_NON_DISPATCHABLE_HANDLE` (vendored
+`vulkan_core.h`), 8 bytes on every platform this project targets
+regardless of the `VK_USE_64_BIT_PTR_DEFINES` branch, so a `uint32_t`
+token could never actually carry one; and `MaterialSystem::getPipeline()`
+takes a `PipelineRequest{MaterialHandle material; PassSignature pass;
+uint32_t specializationBits;}`, not a bare material index, so the seam's
+INPUT shape was also incomplete. Fixed (still device-free, no
+`rx::material`/`rx::graph` dependency added): a new `PipelineRequestKey{
+uint32_t materialIndex; uint64_t passSignatureHash; uint32_t
+specializationBits; }` mirrors `PipelineRequest`'s three fields exactly
+(`passSignatureHash`'s type matches `PassSignature::hash()`'s own
+`uint64_t` return type field-for-field); `PipelineResolveFn` now takes a
+`const PipelineRequestKey&` and returns `uint64_t`;
+`ResolvedDrawGroup::pipelineToken` is `uint64_t`; `resolveDrawGroups()`/
+`recordDrawList()` both gained `passSignatureHash`/`specializationBits`
+parameters (caller-supplied — the pass signature is a per-CALLER, not
+per-`ViewLists`, concern, since one built draw list may legitimately feed
+more than one pass). All three D27 tests updated to the new signature
+in place; see "Fix round 1" section below for the full delta and
+re-verification.
+
 ### Zero-alloc test mechanism: scoped global `operator new`/`delete`, not capacity/pointer checks
 
 Tried first: `.capacity()` equality and `.data()` pointer-identity checks
@@ -155,12 +180,15 @@ unrelated failures.
 | blendOrder bits reserved, unpopulated | `...decodeBlend...` asserts `reservedBlendOrder == 0` | PASS |
 | Fixed index-range chunks + chunk-order concatenation → byte-identical across `--threads` | `build() produces byte-identical ViewLists across --threads 1/2/8` | PASS — see design note: achieved via embarrassingly-parallel per-index writes + fixed slot-order serial compaction (a simpler mechanism giving the identical guarantee — documented in `cullView()`'s own comment) |
 | D26.3 lockstep (commands/payloads as one unit; interleaved-desync test mandatory) | `D26.3 lockstep criterion: an interleaved-creation-order scene...` + Revert 3 | PASS — cross-checks every collapsed command's payload range against source-renderable identity, not just counts |
+| Cross-group depth ordering (not a matrix row; added fix round 1, finding 2, to document an intentional design tradeoff the review flagged as under-tested) | `Cross-group depth ordering: representative-depth (nearest-member) comparison, not a flattened per-instance merge` | PASS — pins down and asserts the group-representative-vs-flattened-merge tradeoff on a hand-computed interleaved-depth fixture; code comment added at `collapseAndSortOpaque()` stating D14 front-to-back is an early-Z rejection-rate optimization, not an ordering guarantee (opaque correctness comes from the per-fragment depth test, submission-order-independent by construction) |
 | `CullCounters` exact field list, CI-gated | `CullCounters are EXACT across a mixed layer/frustum/visible scene` + counters asserted in nearly every other test | PASS |
 | `ShadowLists` = ViewLists shape, single partition, sorted (pipeline, mesh range, block), BLEND excluded | `buildShadow(): BLEND-partition renderables are EXCLUDED...` | PASS |
 | Culling planes from `Camera::cullingProj()` (finite) + extreme-depth-never-culled | `An object at extreme depth (100,000 units)...` | PASS — both directions tested (legitimately included AND legitimately excluded by a smaller far plane) |
 | Degenerate/zero-extent AABB + ground-slab | `build() never culls a degenerate (single-point, min==max) AABB...`, `...never culls a ground-slab AABB...` | PASS |
 | Per-block contiguous `BlockRange` grouping | `ViewLists.blocks groups commands contiguously by blockId...` | PASS — adversarial fixture interleaves 2 blocks × 2 pipeline variants |
-| D27 worker-guard test, `setViolationHookForTests` + rendezvous barrier | `recordDrawList()'s RecordChunkFn callback... NEVER triggers the main-thread guard` + adversarial control test + Revert 2 | PASS — see deviation note (adapted to `task::Scheduler`'s own barrier precedent, device-free) |
+| D27 worker-guard test, `setViolationHookForTests` + rendezvous barrier | `recordDrawList()'s RecordChunkFn callback... NEVER triggers the main-thread guard` + adversarial control test + Revert 2 | PASS — see deviation note (adapted to `task::Scheduler`'s own barrier precedent, device-free); seam shape widened fix round 1 (finding 3), tests updated in place |
+| D26.1 per-draw addressing — data-layout requirement (firstInstance indexing, zero per-draw push-constant fields in `DrawPayload`) | Implicit across every D26.2/D26.3 test (`DrawPayload` has no push-constant-shaped field at all; `firstInstance` is the only addressing mechanism) | PASS (data layout) |
+| D26.1 — literal GPU-observable criterion ("a GPU test... counting `vkCmdPushConstants` calls... O(1) per pass, not O(draws)") | — | **N/A — device-free-unsatisfiable in this task's own scope** (no `VkCommandBuffer` exists in this library; matches how the layer-masks table below marks its own analogous `getLayers`/`getChannels` row). Becomes satisfiable once Task 22/24's real `RecordChunkFn` binds to actual `vkCmdDrawIndexed*`/`vkCmdPushConstants` recording — that binding, and its own validation-layer/call-count proof, is explicitly out of this task's file list (`draw_list.{h,cpp}` only) and this task's own device-free brief |
 | D26.2 `VkDrawIndexedIndirectCommand` compatibility | `DrawCommand is byte-for-byte VkDrawIndexedIndirectCommand-compatible...` | PASS — `static_assert(sizeof(...)==...)` + per-field `offsetof` + reinterpret-cast upload proof |
 | Instancing collapse, records-in vs draws-submitted | `An identical-run scene (1000 identical renderables) collapses into ONE DrawCommand...` | PASS — exact `recordsIn==1000`, `drawsSubmitted==1` |
 | Off-screen-caster-still-casts + conservative exclusion | `buildShadow(): a caster fully OUTSIDE the camera frustum...` | PASS — both the include AND the exclude case, independently confirmed off-camera via a separate `build()` call |
@@ -251,19 +279,27 @@ sorting/collapse separately.
 **linux-native, serial `ctest` (matching CI's own invocation):**
 ```
 100% tests passed, 0 tests failed out of 23
-Total Test time (real) = 155.42 sec
+Total Test time (real) = 155.42 sec   [pre-fix-round-1 run; 148.16 sec post-fix-round-1, see below]
 ```
-`rx_scene_tests` alone: 61 test cases (57 unconditional + 4 gated behind
-`RX_DEBUG_CHECKS`, which is ON in both dev presets), 6199 assertions, 0
-failures, stable across 5 repeated runs (no flakiness observed in the
-barrier-based D27/determinism tests).
+`rx_scene_tests` alone (post-fix-round-1 figures; see "Fix round 1"
+section for the corrected count — this line originally, incorrectly,
+read "61 test cases (57 unconditional + 4 gated)", a reviewer-caught
+arithmetic error, see Finding 3 below): **58 total `TEST_CASE`s** across
+the whole `rx_scene` suite (32 in `draw_list_test.cpp`, 16 in
+`scene_test.cpp`, 8 in `camera_test.cpp`, 2 in `thread_guard_test.cpp`),
+of which 4 (2 in `draw_list_test.cpp`, 2 pre-existing in
+`thread_guard_test.cpp`) are compiled behind `#ifdef RX_DEBUG_CHECKS` --
+INCLUDED in the 58, not additional. `RX_DEBUG_CHECKS=ON` in both dev
+presets, so all 58 compile and run; doctest reports `test cases: 58 | 58
+passed`, 6205 assertions, 0 failures, stable across repeated runs (no
+flakiness observed in the barrier-based D27/determinism tests).
 
 **windows-cross-zig, under Wine (per README's own documented local-
 verification convention — `xvfb-run -a ctest --preset windows-cross-zig -E
 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample'`):**
 ```
 100% tests passed, 0 tests failed out of 11
-Total Test time (real) = 119.82 sec
+Total Test time (real) = 119.82 sec   [pre-fix-round-1; 116.71 sec post-fix-round-1, both 100%/11-of-11]
 ```
 `rx_scene_tests.exe`: 0.08s, all cases passed (device-free, as expected —
 matches the README's own list of binaries genuinely device-free under
@@ -292,7 +328,11 @@ so every `RX_ASSERT_MAIN_THREAD` guard was live in both runs.
    `PipelineResolveFn`/`RecordChunkFn` rather than hard-bound to
    `rx::material::MaterialSystem`/`rx::graph::PassContext` — the real GPU
    binding is explicitly Task 22/24 scope per the plan; this task delivers
-   the mechanism + its guard, proven via revert-discrimination.
+   the mechanism + its guard, proven via revert-discrimination. Fix round 1
+   (review finding 3) widened the seam SHAPE to genuinely carry a real
+   `VkPipeline` (`PipelineRequestKey` mirroring `PipelineRequest`'s three
+   fields, `uint64_t` token) without adding a hard dependency — see the
+   design-decisions section and the "Fix round 1" section below.
 5. D27 guard test adapted to `rx::task::Scheduler::parallelFor()`'s own
    n-way barrier precedent (`rx_task/tests/scheduler_test.cpp`) rather than
    literally reusing `test_material_system.cpp`'s `rx_graph::Executor`/live-
@@ -361,3 +401,115 @@ rather than patched around.
   benchmark numbers vs. sample 07 (desktop + Steam Deck), consuming this
   task's `DrawListBuilder` end to end through `Registry→Scene→
   DrawListBuilder→graph`.
+
+## Fix round 1 (independent review, `task-19-review.md`)
+
+Verdict: spec PASS, quality Approved, 4 findings (1 Medium, 3 Low), no
+blockers. All 4 closed in-round per project policy.
+
+**Finding 1 [Low] — report's own test-count arithmetic wrong ("61
+(57+4)").** Confirmed: the suite was 57 total `TEST_CASE`s, of which 4
+(RX_DEBUG_CHECKS-gated) are INCLUDED in that 57, not additional — the
+report's own "61" figure double-counted them. Fixed throughout the report
+(the "Files created"/"Test suite results" sections above are corrected in
+place, not left as a separate erratum, since the wrong figure appeared in
+more than one place). The suite is now 58 total (57 pre-existing + 1 new
+test added for finding 2 below), same discipline: 4 gated, included not
+additional. Re-verified directly this round: `grep -c '^TEST_CASE'
+src/rx_scene/tests/*.cpp` → `draw_list_test.cpp:32 scene_test.cpp:16
+camera_test.cpp:8 thread_guard_test.cpp:2` = 58; `./rx_scene_tests` →
+`test cases: 58 | 58 passed`, `assertions: 6205 | 6205 passed`.
+
+**Finding 2 [Low] — missing adversarial cross-group depth-ordering
+test.** Added `TEST_CASE("Cross-group depth ordering: representative-depth
+(nearest-member) comparison, not a flattened per-instance merge...")` to
+`draw_list_test.cpp` (after the D26.3 lockstep test): two collapse-groups
+(distinct meshes, same pipeline/material) with genuinely interleaved
+per-instance depths (group A: world z -0.5 and -50; group B: world z -1
+and -80; near=0.1 camera) — hand-computed representative depths (A=0.2,
+B=0.1, via `ndc = near/distance`) predict group A's WHOLE collapsed
+command (2 instances, including its own far member at true depth 0.002)
+sorts entirely before group B's (2 instances, including B's near member
+at true depth 0.1 — nearer than A's own far member). Test asserts exactly
+this; ran and matched the hand computation exactly on the first attempt
+(no debugging needed — the design's own arithmetic is what the review
+predicted). Added a code comment at `collapseAndSortOpaque()` (immediately
+above the phase-1/phase-2 description) stating the reviewer's own framing
+verbatim in substance: D14 front-to-back is an early-Z rejection-rate
+OPTIMIZATION, not an ordering guarantee — opaque correctness comes from
+the per-fragment depth TEST, which is submission-order-independent by
+construction; group-level (not flattened per-instance) ordering is the
+only way to keep D26.3's collapse guarantee unconditional.
+
+**Finding 3 [Medium] — `PipelineResolveFn`'s `uint32_t` return cannot
+carry a real `VkPipeline`; resolver input shape didn't mirror
+`PipelineRequest`.** Both confirmed against source, not just the review's
+word: `vulkan_core.h`'s `VK_DEFINE_NON_DISPATCHABLE_HANDLE` macro (both
+branches — pointer-typed and raw-`uint64_t`) resolves to an 8-byte type on
+every platform this project targets; `MaterialSystem::getPipeline()`
+(`material_system.h:381`) takes `PipelineRequest{MaterialHandle material;
+PassSignature pass; uint32_t specializationBits;}`, confirmed by direct
+read this round. Fixed at the shape level, not patched:
+- New `struct PipelineRequestKey { uint32_t materialIndex; uint64_t
+  passSignatureHash; uint32_t specializationBits; }` in `draw_list.h` —
+  field-for-field mirror of `PipelineRequest`'s three inputs, with
+  `passSignatureHash` typed to match `PassSignature::hash()`'s own
+  `uint64_t` return exactly (confirmed via direct read of
+  `rx_graph/pass_signature.h`). No `rx::material`/`rx::graph` dependency
+  added — `PipelineRequestKey` is this library's own device-free type.
+- `PipelineResolveFn` is now `std::function<uint64_t(const
+  PipelineRequestKey&)>`; `ResolvedDrawGroup::pipelineToken` is `uint64_t`.
+- `resolveDrawGroups()`/`recordDrawList()` both gained
+  `passSignatureHash`/`specializationBits` parameters — CALLER-supplied
+  (constant for one call, folded into every group's `PipelineRequestKey`
+  alongside that group's own resolved `materialIndex`), since a built
+  `ViewLists` is pass-agnostic and may legitimately feed more than one
+  pass with different signatures; `ViewLists` itself gained no new field.
+- All three D27 tests (`resolveDrawGroups()`'s own linear-scan test, the
+  legal-path worker-guard test, the adversarial illegal-call test) updated
+  to the new signature in place; the linear-scan test was additionally
+  STRENGTHENED (not just recompiled) to assert `passSignatureHash`/
+  `specializationBits` are threaded into every resolve call unchanged,
+  proving the new fields actually flow through, not just compile.
+- Re-verified: `rx_scene`/`rx_scene_tests` rebuilt clean (zero warnings),
+  full suite green (58/58, 6205/6205) on `linux-native`; both presets'
+  full `ctest` runs re-executed after the fix (see below).
+
+**Finding 4 [Low] — D26.1's device-free-unsatisfiable
+`vkCmdPushConstants`-count row missing from the proof table.** Added an
+explicit N/A row to the matrix-issue06 proof table, immediately above the
+existing D26.2 row, mirroring exactly how the layer-masks table already
+handles its own analogous `getLayers`/`getChannels` row: states the
+criterion is unsatisfiable in a `VkCommandBuffer`-free binary, names where
+it becomes satisfiable (Task 22/24's real `RecordChunkFn` binding), and
+adds a companion row confirming the underlying DATA-LAYOUT requirement
+(zero push-constant-shaped fields in `DrawPayload`, `firstInstance`-only
+addressing) IS delivered and covered, implicitly, by the D26.2/D26.3 rows
+already in the table.
+
+**Full re-verification after all four fixes (both presets, foreground,
+matching the exact commands the original report used):**
+```
+linux-native, serial ctest:
+100% tests passed, 0 tests failed out of 23
+Total Test time (real) = 148.16 sec
+
+windows-cross-zig, under Wine (xvfb-run -a ctest --preset windows-cross-zig
+-E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample'):
+100% tests passed, 0 tests failed out of 11
+Total Test time (real) = 116.71 sec
+```
+`rx_scene_tests`/`rx_scene_tests.exe` both green in these runs (58/58
+cases, 6205/6205 assertions on linux-native; Wine run confirms the
+`.exe` builds and runs identically under the cross-compiled target).
+
+No new revert-and-restore probe was run for finding 2's own new test this
+round (not requested; the test's correctness is independently grounded in
+the hand-computed `ndc = near/distance` arithmetic matching the observed
+result exactly, which is itself a form of falsifiable evidence — a wrong
+implementation would not have matched the prediction). Findings 1 and 4
+were pure documentation corrections with no code path to revert-probe.
+Finding 3's shape widening was verified by full clean rebuild + full suite
+re-run on both presets (above), not a revert-probe (there is no "narrower
+seam" bug to revert to — the old shape simply could not compile against a
+real `VkPipeline`, which is exactly the point).
