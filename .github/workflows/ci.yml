@@ -99,9 +99,13 @@ jobs:
       # run's other, unrelated finding (DescriptorArena's exhaustion
       # contract relying on driver-optional VkDescriptorPool enforcement).
       - name: Install system packages
+        # timeout-minutes + Acquire::Retries: runner apt mirrors stall
+        # indefinitely on bad days (3 observed 2026-08-19, 20-47 min
+        # hangs) — fail fast so a rerun costs minutes, not an hour.
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y \
             ninja-build mesa-vulkan-drivers vulkan-tools libvulkan-dev \
             vulkan-validationlayers xvfb \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
@@ -413,9 +417,11 @@ jobs:
       # passthrough is a materially bigger claim than "window creation
       # succeeds" and is not verified here.
       - name: Install system packages
+        # Same stall guard as the linux-native job (see comment there).
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y \
             ninja-build wine xvfb mesa-vulkan-drivers vulkan-tools libvulkan-dev
 
       - name: Install pinned zig toolchain (checksum-verified)
