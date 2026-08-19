@@ -689,6 +689,63 @@ TEST_CASE("D26.3 lockstep criterion: an interleaved-creation-order scene collaps
     }
 }
 
+TEST_CASE("Cross-group depth ordering: representative-depth (nearest-member) comparison, not a flattened "
+          "per-instance merge -- a group whose FAR member is farther than another group's NEAR member can "
+          "still be submitted entirely first, because its NEAREST member out-ranks the other group's nearest "
+          "[review round 1, finding 2 -- pins down and asserts the design's own documented tradeoff; opaque "
+          "correctness is guaranteed by the per-fragment depth TEST, submission-order-independent by "
+          "construction -- D14 front-to-back is an early-Z rejection-rate optimization, not an ordering "
+          "guarantee]") {
+    FakeAssetSource assets;
+    MaterialHandle mat = assets.addMaterial(opaqueMaterial());
+
+    // Group A (mesh A, firstIndex=300): a NEAR instance (z=-0.5) and a FAR
+    // instance (z=-50). Group B (mesh B, firstIndex=400): a
+    // moderately-near instance (z=-1, nearer than A's far member but
+    // farther than A's near member -- genuinely interleaved with A in true
+    // per-instance depth order) and a very-far instance (z=-80).
+    MeshHandle meshA = assets.addMesh({makeSubmesh(0, 300, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
+    MeshHandle meshB = assets.addMesh({makeSubmesh(0, 400, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
+    Scene scene(assets.meshBoundsFn());
+
+    RenderableDesc nearA;
+    nearA.mesh = meshA;
+    nearA.transform = glm::translate(glm::mat4(1.0F), glm::vec3(0.0F, 0.0F, 9.5F));  // world z = -10 + 9.5 = -0.5
+    static_cast<void>(scene.createRenderable(nearA));
+    RenderableDesc farA;
+    farA.mesh = meshA;
+    farA.transform = glm::translate(glm::mat4(1.0F), glm::vec3(0.0F, 0.0F, -40.0F));  // world z = -10 - 40 = -50
+    static_cast<void>(scene.createRenderable(farA));
+
+    RenderableDesc nearB;
+    nearB.mesh = meshB;
+    nearB.transform = glm::translate(glm::mat4(1.0F), glm::vec3(0.0F, 0.0F, 9.0F));  // world z = -1
+    static_cast<void>(scene.createRenderable(nearB));
+    RenderableDesc farB;
+    farB.mesh = meshB;
+    farB.transform = glm::translate(glm::mat4(1.0F), glm::vec3(0.0F, 0.0F, -70.0F));  // world z = -80
+    static_cast<void>(scene.createRenderable(farB));
+
+    auto scheduler = rx::task::Scheduler::create(2);
+    REQUIRE(scheduler != nullptr);
+    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
+    ViewLists lists;
+    // near=0.1: ndc(-0.5)=0.2, ndc(-50)=0.002 (group A representative=0.2);
+    // ndc(-1)=0.1, ndc(-80)=0.00125 (group B representative=0.1). A's
+    // representative (0.2) is nearer than B's (0.1), so A's WHOLE
+    // collapsed command (including its far member, true depth 0.002)
+    // sorts entirely before B's (including B's near member, true depth
+    // 0.1 -- nearer than A's far member) -- the documented, intentional
+    // cross-group ordering this test pins down.
+    builder.build(scene, testCamera(/*nearPlane=*/0.1F, /*farPlane=*/1000.0F), *scheduler, lists);
+
+    REQUIRE(lists.commands.size() == 2);
+    CHECK(lists.commands[0].firstIndex == 300);  // group A entirely first
+    CHECK(lists.commands[0].instanceCount == 2);
+    CHECK(lists.commands[1].firstIndex == 400);  // group B entirely second
+    CHECK(lists.commands[1].instanceCount == 2);
+}
+
 // =======================================================================
 // Per-block contiguous BlockRange grouping [D26.2].
 // =======================================================================
@@ -1234,17 +1291,24 @@ TEST_CASE("resolveDrawGroups(): a single linear scan calls the resolver exactly 
         lists.payloads.push_back(DrawPayload{mat, 0});
     }
 
-    std::vector<uint32_t> resolveCalls;
-    auto resolver = [&](uint32_t materialIndex) -> uint32_t {
-        resolveCalls.push_back(materialIndex);
-        return materialIndex * 100;
+    // Caller-supplied, constant-for-this-call inputs [review round 1,
+    // finding 3] -- mirrors rx::material::PipelineRequest's own
+    // pass/specialization fields; asserted below to be threaded into
+    // EVERY resolve call unchanged, alongside that run's own materialIndex.
+    constexpr uint64_t kPassSignatureHash = 0xC0FFEEULL;
+    constexpr uint32_t kSpecializationBits = 7U;
+
+    std::vector<rx::scene::PipelineRequestKey> resolveCalls;
+    auto resolver = [&](const rx::scene::PipelineRequestKey& key) -> uint64_t {
+        resolveCalls.push_back(key);
+        return static_cast<uint64_t>(key.materialIndex) * 100;
     };
-    const auto groups = rx::scene::resolveDrawGroups(lists, resolver);
+    const auto groups = rx::scene::resolveDrawGroups(lists, kPassSignatureHash, kSpecializationBits, resolver);
 
     REQUIRE(resolveCalls.size() == 3);  // {1},{2},{1} -- three contiguous runs, three calls
-    CHECK(resolveCalls[0] == 1);
-    CHECK(resolveCalls[1] == 2);
-    CHECK(resolveCalls[2] == 1);
+    CHECK(resolveCalls[0] == rx::scene::PipelineRequestKey{1, kPassSignatureHash, kSpecializationBits});
+    CHECK(resolveCalls[1] == rx::scene::PipelineRequestKey{2, kPassSignatureHash, kSpecializationBits});
+    CHECK(resolveCalls[2] == rx::scene::PipelineRequestKey{1, kPassSignatureHash, kSpecializationBits});
 
     REQUIRE(groups.size() == 3);
     CHECK(groups[0] == rx::scene::ResolvedDrawGroup{0, 2, 100});
@@ -1301,9 +1365,9 @@ TEST_CASE("recordDrawList()'s RecordChunkFn callback -- proven to run on genuine
     rx::core::debug::detail::setViolationHookForTests(&captureRecordDrawListViolation);
     ViolationHookGuard hookGuard;
 
-    auto resolver = [](uint32_t materialIndex) -> uint32_t {
+    auto resolver = [](const rx::scene::PipelineRequestKey& key) -> uint64_t {
         RX_ASSERT_MAIN_THREAD("test resolvePipeline (legal path)");
-        return materialIndex;
+        return key.materialIndex;
     };
 
     constexpr uint32_t kWorkerCount = 6;
@@ -1344,7 +1408,8 @@ TEST_CASE("recordDrawList()'s RecordChunkFn callback -- proven to run on genuine
         }
     };
 
-    rx::scene::recordDrawList(lists, *scheduler, kChunkCount, resolver, recordChunk);
+    rx::scene::recordDrawList(lists, *scheduler, kChunkCount, /*passSignatureHash=*/0xC0FFEEULL, /*specializationBits=*/0,
+                               resolver, recordChunk);
 
     REQUIRE(timeouts.load() == 0);
     CHECK(arrived.load() == kChunkCount);
@@ -1356,9 +1421,9 @@ TEST_CASE("Adversarial control: a chunk callback that DELIBERATELY calls the gua
           "PROVEN (two-chunk rendezvous barrier, same construction as test_material_system.cpp:1042-1168) to "
           "be a genuine non-main worker DOES trip RX_ASSERT_MAIN_THREAD -- proves the guard mechanism itself "
           "would have caught the bug the test above proves absent, not merely that nothing was ever tried") {
-    auto resolver = [](uint32_t materialIndex) -> uint32_t {
+    auto resolver = [](const rx::scene::PipelineRequestKey& key) -> uint64_t {
         RX_ASSERT_MAIN_THREAD("test resolvePipeline (deliberately illegal call site)");
-        return materialIndex;
+        return key.materialIndex;
     };
     std::vector<std::string> capture;
     g_recordDrawListCapture.store(&capture, std::memory_order_relaxed);
@@ -1404,7 +1469,7 @@ TEST_CASE("Adversarial control: a chunk callback that DELIBERATELY calls the gua
             return;
         }
         illegalCalls.fetch_add(1, std::memory_order_relaxed);
-        static_cast<void>(resolver(0));  // deliberately illegal: calling the guarded resolver off the main thread.
+        static_cast<void>(resolver(rx::scene::PipelineRequestKey{}));  // deliberately illegal: calling the guarded resolver off the main thread.
     });
 
     REQUIRE_FALSE(barrierTimedOut.load());

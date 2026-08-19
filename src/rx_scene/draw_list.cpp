@@ -574,6 +574,24 @@ struct DrawListBuilder::Impl {
     // (blockId, encodeOpaque(priority, pipeline, material, depth,
     // tieBreak)) -- D14's own front-to-back contract, now applied to
     // whole draws instead of individual records.
+    //
+    // CROSS-GROUP ORDERING [review round 1, finding 2]: per-INSTANCE
+    // front-to-back order is NOT preserved across a group boundary --
+    // group A's own far member can still be submitted before group B's
+    // near member if group A's NEAREST member out-ranks group B's nearest
+    // member (representative-depth comparison is group-vs-group, not a
+    // flattened per-instance merge). This is intentional, not a
+    // correctness gap: D14's front-to-back ordering exists as an early-Z
+    // REJECTION-RATE optimization (drawing nearer geometry first lets the
+    // depth test reject more hidden fragments in later draws) -- opaque
+    // rendering correctness itself is guaranteed by the per-fragment depth
+    // TEST, which is fully submission-order-independent by construction
+    // (Vulkan's depth test does not care what order draws were recorded
+    // in). Sacrificing global per-instance ordering for group-level
+    // ordering is the ONLY way to keep D26.3's collapse guarantee
+    // unconditional (see the interleaved-depths cross-group test in
+    // draw_list_test.cpp, which pins down and asserts exactly this
+    // tradeoff rather than leaving it implicit).
     void collapseAndSortOpaque() {
         std::sort(opaqueRecords.begin(), opaqueRecords.end(), [](const PendingRecord& a, const PendingRecord& b) {
             if (a.blockId != b.blockId) {
@@ -825,7 +843,8 @@ void DrawListBuilder::buildShadow(const Scene& scene, LightHandle light, const C
 // recordDrawList [D27].
 // ---------------------------------------------------------------------
 
-std::vector<ResolvedDrawGroup> resolveDrawGroups(const ViewLists& lists, const PipelineResolveFn& resolvePipeline) {
+std::vector<ResolvedDrawGroup> resolveDrawGroups(const ViewLists& lists, uint64_t passSignatureHash,
+                                                    uint32_t specializationBits, const PipelineResolveFn& resolvePipeline) {
     RX_ASSERT_MAIN_THREAD("rx::scene::resolveDrawGroups");
     RX_ZONE;
     std::vector<ResolvedDrawGroup> groups;
@@ -837,10 +856,18 @@ std::vector<ResolvedDrawGroup> resolveDrawGroups(const ViewLists& lists, const P
     auto materialOf = [&](size_t commandIndex) -> uint32_t {
         return lists.payloads[lists.commands[commandIndex].firstInstance].materialIndex;
     };
+    // `passSignatureHash`/`specializationBits` are constant for this whole
+    // call (the caller's own pass, not per-group) -- folded into every key
+    // alongside that group's own materialIndex, mirroring
+    // rx::material::PipelineRequest's three fields exactly (see this
+    // header's own top comment).
+    auto keyFor = [&](uint32_t materialIndex) {
+        return PipelineRequestKey{materialIndex, passSignatureHash, specializationBits};
+    };
 
     uint32_t groupStart = 0;
     uint32_t currentMaterial = materialOf(0);
-    uint32_t currentToken = resolvePipeline(currentMaterial);
+    uint64_t currentToken = resolvePipeline(keyFor(currentMaterial));
     for (size_t i = 1; i <= n; ++i) {
         const bool atEnd = (i == n);
         const uint32_t mat = atEnd ? 0 : materialOf(i);
@@ -849,17 +876,18 @@ std::vector<ResolvedDrawGroup> resolveDrawGroups(const ViewLists& lists, const P
             if (!atEnd) {
                 groupStart = static_cast<uint32_t>(i);
                 currentMaterial = mat;
-                currentToken = resolvePipeline(currentMaterial);
+                currentToken = resolvePipeline(keyFor(currentMaterial));
             }
         }
     }
     return groups;
 }
 
-void recordDrawList(const ViewLists& lists, task::Scheduler& scheduler, uint32_t chunkCount,
-                     const PipelineResolveFn& resolvePipeline, const RecordChunkFn& recordChunk) {
+void recordDrawList(const ViewLists& lists, task::Scheduler& scheduler, uint32_t chunkCount, uint64_t passSignatureHash,
+                     uint32_t specializationBits, const PipelineResolveFn& resolvePipeline,
+                     const RecordChunkFn& recordChunk) {
     RX_ZONE;
-    const std::vector<ResolvedDrawGroup> groups = resolveDrawGroups(lists, resolvePipeline);
+    const std::vector<ResolvedDrawGroup> groups = resolveDrawGroups(lists, passSignatureHash, specializationBits, resolvePipeline);
     const uint32_t effectiveChunkCount = (chunkCount == 0) ? 1 : chunkCount;
     scheduler.parallelFor(effectiveChunkCount, /*grainSize=*/1, [&](uint32_t begin, uint32_t end, uint32_t) {
         for (uint32_t c = begin; c < end; ++c) {

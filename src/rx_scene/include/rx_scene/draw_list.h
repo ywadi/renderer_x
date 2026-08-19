@@ -497,15 +497,55 @@ private:
 // signature never receives `PipelineResolveFn` at all, a
 // compile-time-adjacent guarantee stronger than a runtime-only check (gate
 // ruling #6's own "D27 -- parameter-offset pre-computation" row).
+//
+// SEAM SHAPE [review round 1, finding 3 -- fixed here, not deferred]:
+// mirrors `rx::material::PipelineRequest`'s own three cache-key inputs
+// (`material_system.h`: `MaterialHandle material; PassSignature pass;
+// uint32_t specializationBits;`) field-for-field, WITHOUT taking a hard
+// dependency on `rx::material`/`rx::graph` types (this library stays
+// device-free) -- `materialIndex` stands in for `MaterialHandle` (already
+// this seam's own resolved index), `passSignatureHash` stands in for
+// `PassSignature` via its own `hash()` method's exact return type
+// (`rx_graph/pass_signature.h`: `[[nodiscard]] uint64_t hash() const`),
+// and `specializationBits` is spelled identically. The CALLER of
+// `recordDrawList()`/`resolveDrawGroups()` supplies
+// `passSignatureHash`/`specializationBits` (whoever is recording a
+// specific pass knows its own `PassSignature::hash()`) -- `ViewLists`
+// itself stays pass-agnostic (one built draw list may legitimately feed
+// more than one pass, e.g. a depth prepass and a forward pass, with
+// different pass signatures) and never carries either field.
+//
+// The resolved TOKEN is a plain `uint64_t`, not `uint32_t`: `VkPipeline`
+// is a `VK_DEFINE_NON_DISPATCHABLE_HANDLE` (vendored `vulkan_core.h`),
+// which resolves to either a `uint64_t` or an 8-byte pointer-typed handle
+// depending on `VK_USE_64_BIT_PTR_DEFINES` -- 8 bytes either way on every
+// platform this project targets -- so a real `VkPipeline` bit-cast
+// directly into this token (the production binding's own job; this
+// device-free library never interprets it) round-trips exactly, with no
+// truncation. `ResolvedDrawGroup::pipelineToken` is widened to match.
 // ---------------------------------------------------------------------
 
+// Device-free mirror of `rx::material::PipelineRequest`'s cache-key
+// inputs -- see this section's own top comment for the field-by-field
+// correspondence. A plain, trivially-comparable value type (matches this
+// codebase's own `PassSignature`/`MaterialFixedFunctionState` convention
+// for such keys).
+struct PipelineRequestKey {
+    uint32_t materialIndex = 0;
+    uint64_t passSignatureHash = 0;
+    uint32_t specializationBits = 0;
+
+    bool operator==(const PipelineRequestKey&) const = default;
+};
+
 // One contiguous run of `ViewLists::commands` sharing the same resolved
-// materialIndex (and therefore, in production, the same real VkPipeline) --
-// the ONLY thing a `RecordChunkFn` chunk callback ever sees.
+// `PipelineRequestKey` (and therefore, in production, the same real
+// `VkPipeline`) -- the ONLY thing a `RecordChunkFn` chunk callback ever
+// sees.
 struct ResolvedDrawGroup {
     uint32_t firstCommand = 0;
     uint32_t commandCount = 0;
-    uint32_t pipelineToken = 0;  // opaque; whatever PipelineResolveFn returned for this group
+    uint64_t pipelineToken = 0;  // opaque 64-bit; whatever PipelineResolveFn returned for this group -- wide enough for a real VkPipeline, see this section's own top comment
 
     bool operator==(const ResolvedDrawGroup&) const = default;
 };
@@ -513,10 +553,11 @@ struct ResolvedDrawGroup {
 // MAIN-THREAD-ONLY by contract (D27/D5) -- called exactly once per distinct
 // `DrawPayload::materialIndex` boundary encountered in `resolveDrawGroups()`'s
 // single linear scan, NEVER from a worker chunk. A production binding
-// mirrors `MaterialSystem::getPipeline()`'s own signature shape (material ->
-// VkPipeline, encoded into the opaque `uint32_t` token here); this
-// device-free library never names `MaterialSystem` itself.
-using PipelineResolveFn = std::function<uint32_t(uint32_t materialIndex)>;
+// mirrors `MaterialSystem::getPipeline(PipelineRequest)`'s own signature
+// shape exactly (material+pass+specialization -> VkPipeline, encoded into
+// the opaque `uint64_t` token here); this device-free library never names
+// `MaterialSystem`/`PipelineRequest` itself.
+using PipelineResolveFn = std::function<uint64_t(const PipelineRequestKey& key)>;
 
 // Worker-safe: receives ONLY plain, pre-resolved data (`groups`) -- never
 // `PipelineResolveFn`, never `lists.payloads` (a chunk records commands
@@ -527,11 +568,16 @@ using RecordChunkFn = std::function<void(uint32_t chunkIndex, uint32_t chunkCoun
 
 // The single linear scan [D27]: groups `lists.commands` into contiguous
 // materialIndex-identical runs, calling `resolvePipeline` exactly once per
-// run (main-thread-guarded internally via RX_ASSERT_MAIN_THREAD -- see
-// draw_list.cpp). O(commands.size()) -- one pass, no second grouping sort.
+// run -- with `passSignatureHash`/`specializationBits` (constant for this
+// one call, supplied by the caller -- see this section's own top comment)
+// folded into every `PipelineRequestKey` alongside that run's own
+// materialIndex -- main-thread-guarded internally via
+// RX_ASSERT_MAIN_THREAD (see draw_list.cpp). O(commands.size()) -- one
+// pass, no second grouping sort.
 //
 // Main-thread-only (D5/D27).
-[[nodiscard]] std::vector<ResolvedDrawGroup> resolveDrawGroups(const ViewLists& lists,
+[[nodiscard]] std::vector<ResolvedDrawGroup> resolveDrawGroups(const ViewLists& lists, uint64_t passSignatureHash,
+                                                                  uint32_t specializationBits,
                                                                   const PipelineResolveFn& resolvePipeline);
 
 // Pre-resolves (see resolveDrawGroups() above, called internally, on the
@@ -545,8 +591,9 @@ using RecordChunkFn = std::function<void(uint32_t chunkIndex, uint32_t chunkCoun
 // calling thread; the fan-out half is `scheduler.parallelFor()`'s own
 // documented any-thread-safe-to-call-from contract (may itself be called
 // from within an outer chunk, matching `parallelFor()`'s own nesting rule).
-void recordDrawList(const ViewLists& lists, task::Scheduler& scheduler, uint32_t chunkCount,
-                     const PipelineResolveFn& resolvePipeline, const RecordChunkFn& recordChunk);
+void recordDrawList(const ViewLists& lists, task::Scheduler& scheduler, uint32_t chunkCount, uint64_t passSignatureHash,
+                     uint32_t specializationBits, const PipelineResolveFn& resolvePipeline,
+                     const RecordChunkFn& recordChunk);
 
 namespace detail {
 
