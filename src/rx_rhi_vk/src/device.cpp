@@ -173,6 +173,7 @@ VkPresentModeKHR selectPresentMode(VkPhysicalDevice physicalDevice, VkSurfaceKHR
 }  // namespace
 
 std::optional<Device> Device::create(Context& context, VkSurfaceKHR surface) {
+    RX_ASSERT_MAIN_THREAD("Device::create");
     // shaderDrawParameters (promoted from VK_KHR_shader_draw_parameters to
     // Vulkan 1.1 core) is required by any HLSL/Slang vertex shader that
     // reads SV_VertexID: to reproduce HLSL's zero-based SV_VertexID exactly
@@ -646,6 +647,7 @@ SwapchainStatus Device::present(uint32_t imageIndex, VkSemaphore wait) {
 }
 
 void Device::setPresentMode(PresentMode mode) {
+    RX_ASSERT_MAIN_THREAD("Device::setPresentMode");
     // See this method's own header comment: this only records `mode` for
     // the next recreateSwapchain() call to apply -- no swapchain touched
     // here, no second recreation flow invented.

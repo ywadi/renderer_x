@@ -217,30 +217,55 @@ TEST_CASE("Window::setFullscreen() double-toggle routes through the SAME Device:
         int beforeH = 0;
         SDL_GetWindowSizeInPixels(fixture->window.sdlWindow(), &beforeW, &beforeH);
 
-        if (!fixture->window.setFullscreen(true)) {
+        const bool setFullscreenOk = fixture->window.setFullscreen(true);
+        if (!setFullscreenOk) {
             MESSAGE("SDL_SetWindowFullscreen(true) failed on this video driver, skipping the remainder of this "
                      "cycle");
             continue;
         }
-        CHECK(fixture->window.isFullscreen());
-        // Borderless, not exclusive [gate ruling #25 row 4].
-        CHECK(SDL_GetWindowFullscreenMode(fixture->window.sdlWindow()) == nullptr);
+        // [Fix round 1, reviewer-specified] On a bare Xvfb backend (no
+        // window manager -- CI's own linux-native environment,
+        // .github/workflows/ci.yml) SDL_SetWindowFullscreen(true) reports
+        // SUCCESS (there is no WM to reject the request against) but the
+        // fullscreen state is never actually granted: isFullscreen()
+        // stays false. This is the SAME "environment can't grant
+        // fullscreen" class as an outright setFullscreen() failure just
+        // above -- both gate the SAME set of environment-dependent
+        // assertions (the fullscreen-state checks below AND the
+        // resize-parity checks), never the UNCONDITIONAL floor
+        // (recreateSwapchain() success, isSuspended()==false, accumulated
+        // zero validation errors), which is exercised either way.
+        const bool fullscreenGranted = fixture->window.isFullscreen();
+        if (fullscreenGranted) {
+            CHECK(fixture->window.isFullscreen());
+            // Borderless, not exclusive [gate ruling #25 row 4].
+            CHECK(SDL_GetWindowFullscreenMode(fixture->window.sdlWindow()) == nullptr);
+        } else {
+            MESSAGE("SDL_SetWindowFullscreen(true) reported success but this video driver/window-manager never "
+                     "actually granted fullscreen (isFullscreen() stayed false) -- e.g. CI's bare Xvfb backend, no "
+                     "window manager to honor the request. Skipping the fullscreen-state and resize-parity "
+                     "assertions for this half-cycle; the unconditional floor (recreateSwapchain() success, "
+                     "isSuspended()==false, accumulated zero validation errors) is still exercised below.");
+        }
 
         // Exactly one recreation call site [matrix row 5]: the SAME
         // Device::recreateSwapchain(surface) a real resize's NeedsRecreate
         // handling already drives -- no bespoke
         // "recreateSwapchainForFullscreen" function exists to call
-        // instead.
+        // instead. Unconditional -- must succeed regardless of whether the
+        // environment actually granted fullscreen.
         REQUIRE(device->recreateSwapchain(fixture->surface));
         CHECK_FALSE(device->isSuspended());
 
-        int fsW = 0;
-        int fsH = 0;
-        SDL_GetWindowSizeInPixels(fixture->window.sdlWindow(), &fsW, &fsH);
-        if (fsW != beforeW || fsH != beforeH) {
-            anyRealResizeObserved = true;
-            CHECK(device->swapchainExtent().width == static_cast<uint32_t>(fsW));
-            CHECK(device->swapchainExtent().height == static_cast<uint32_t>(fsH));
+        if (fullscreenGranted) {
+            int fsW = 0;
+            int fsH = 0;
+            SDL_GetWindowSizeInPixels(fixture->window.sdlWindow(), &fsW, &fsH);
+            if (fsW != beforeW || fsH != beforeH) {
+                anyRealResizeObserved = true;
+                CHECK(device->swapchainExtent().width == static_cast<uint32_t>(fsW));
+                CHECK(device->swapchainExtent().height == static_cast<uint32_t>(fsH));
+            }
         }
 
         REQUIRE(fixture->window.setFullscreen(false));
@@ -249,12 +274,14 @@ TEST_CASE("Window::setFullscreen() double-toggle routes through the SAME Device:
         REQUIRE(device->recreateSwapchain(fixture->surface));
         CHECK_FALSE(device->isSuspended());
 
-        int windowedW = 0;
-        int windowedH = 0;
-        SDL_GetWindowSizeInPixels(fixture->window.sdlWindow(), &windowedW, &windowedH);
-        if (windowedW == beforeW && windowedH == beforeH) {
-            CHECK(device->swapchainExtent().width == static_cast<uint32_t>(windowedW));
-            CHECK(device->swapchainExtent().height == static_cast<uint32_t>(windowedH));
+        if (fullscreenGranted) {
+            int windowedW = 0;
+            int windowedH = 0;
+            SDL_GetWindowSizeInPixels(fixture->window.sdlWindow(), &windowedW, &windowedH);
+            if (windowedW == beforeW && windowedH == beforeH) {
+                CHECK(device->swapchainExtent().width == static_cast<uint32_t>(windowedW));
+                CHECK(device->swapchainExtent().height == static_cast<uint32_t>(windowedH));
+            }
         }
     }
 
