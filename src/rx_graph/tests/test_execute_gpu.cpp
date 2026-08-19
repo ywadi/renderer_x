@@ -2295,10 +2295,27 @@ TEST_CASE("Executor::execute performs zero heap allocations in steady state -- e
         rx::graph::detail::allocationCapacitiesForTesting(*fixture->executor);
     // A completely untouched capacity struct (every field still 0) would
     // make every CHECK below trivially, uselessly pass -- assert the graph
-    // genuinely exercised at least the always-present per-execute tracking
-    // vectors before trusting the steady-state comparison that follows.
+    // genuinely exercised EVERY ONE of the 13 tracked fields (11 scalars +
+    // 2 frame-slot arrays, both slots each) before trusting the
+    // steady-state comparison that follows [Task 23 review fix-round:
+    // the original 2-field guard left 11 fields' own vacuousness
+    // unpinned -- durably closed here, not just spot-checked].
     REQUIRE(before.firstBarrierSeen > 0);
+    REQUIRE(before.attachmentEverWritten > 0);
+    REQUIRE(before.touchedThisExecute > 0);
     REQUIRE(before.finalStageThisExecute > 0);
+    REQUIRE(before.finalAccessThisExecute > 0);
+    REQUIRE(before.colorPhysIdxScratch > 0);
+    REQUIRE(before.colorAttachmentsScratch > 0);
+    REQUIRE(before.vkImageBarriersScratch > 0);
+    REQUIRE(before.vkBufferBarriersScratch > 0);
+    REQUIRE(before.combinedAccessScratch > 0);
+    REQUIRE(before.debugLabelScratch > 0);
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+        CAPTURE(slot);
+        REQUIRE(before.chunkBuffersScratch[slot] > 0);
+        REQUIRE(before.validChunkBuffersScratch[slot] > 0);
+    }
 
     constexpr int kSteadyFrames = 10;
     for (int frame = 0; frame < kSteadyFrames; ++frame) {
