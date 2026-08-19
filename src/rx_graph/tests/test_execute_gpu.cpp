@@ -1904,7 +1904,40 @@ std::optional<DepthProbePipeline> buildDepthProbePipeline(VkDevice device, VkFor
 }  // namespace
 
 
-TEST_CASE("D29: a two-pass frame mixing Standard and Reversed depth conventions clears each to its own value") {
+TEST_CASE("D29: ONE frame mixes Standard and Reversed depth conventions across two simultaneous depth-bearing "
+          "passes, and the pinned-history init-clear site independently honors its own AttachmentDesc's "
+          "convention too") {
+    // [Task 22 fix round, F4] The earlier version of this test ran TWO
+    // SEPARATE single-convention graphs, one after another -- exactly
+    // what the review flagged as insufficient: that does not prove
+    // depthClearValueFor() is derived PER-PASS/PER-ATTACHMENT within a
+    // single frame (a process-wide "current convention" variable
+    // toggled between two whole-graph runs could have passed the same
+    // way). This version builds ONE graph with FOUR passes and drives it
+    // through exactly ONE Executor::execute() call:
+    //   "depthStandard" / "depthReversed" -- two ordinary depth outputs,
+    //     Standard and Reversed, both cleared within the SAME frame (the
+    //     gate's own "ordinary per-pass site", executor.cpp's dynamic-
+    //     rendering attachment loop).
+    //   "historyWrite" -- setHistoryOutput() of a THIRD, Reversed-
+    //     convention depth resource, draw-less (setSideEffect() only) --
+    //     establishes the history resource's TWO ping-ponged physical
+    //     slots. Per Pass::setHistoryOutput()'s own documented contract,
+    //     this pass's write touches only SLOT 1 this (the first) frame;
+    //     SLOT 0 is "never written by any real pass" and its contents
+    //     are whatever Executor::realize()'s ONE-TIME
+    //     initializePinnedHistoryEntry() init-clear left there -- the
+    //     PINNED-HISTORY site the review flagged as empirically unproven
+    //     (only reachable via a depth-FORMAT history resource; the
+    //     existing Task 1 history GPU test above only ever uses a COLOR
+    //     one, which exercises depthClearValueFor()'s sibling
+    //     VkClearColorValue branch instead).
+    //   "probe" -- samples all three (addTextureInput() x2 +
+    //     addHistoryInput()) with three scissored draws of the SAME
+    //     depth-probe pipeline into three thirds of the one backbuffer,
+    //     writing each raw stored depth as greyscale.
+    // A single readback of the one backbuffer then proves all three
+    // clear values in one shot, from one frame.
     auto fixture = makeFixture("rx_graph_gpu_d29_depth_convention");
     if (!fixture.has_value()) {
         return;
@@ -1939,108 +1972,141 @@ TEST_CASE("D29: a two-pass frame mixing Standard and Reversed depth conventions 
     auto offscreen = createOffscreenImage(device, physicalDevice, kFormat, VkExtent2D{kExtent, kExtent});
     REQUIRE(offscreen.has_value());
 
-    // Runs ONE full graph -- "depth" (declares a depth attachment with
-    // `convention`, cleared by Executor's own LOAD_OP_CLEAR) -> "probe"
-    // (samples that depth attachment bindlessly, ordinary non-comparison
-    // `.Sample()`, and writes its raw stored value as greyscale straight
-    // into the backbuffer "bb") -- and returns the backbuffer's own R
-    // channel byte after readback. Two DISTINCT graphs (one per
-    // convention), not two passes sharing one graph's single backbuffer
-    // slot, exactly like this file's own "resize-rerealize" case
-    // (createOffscreenImage-backed, `fixture->executor->realize()`
-    // called twice against the SAME Executor -- proven safe by that
-    // earlier case already).
-    auto runOneConvention = [&](DepthConvention convention) -> uint8_t {
-        RenderGraph graph;
-        graph.addPass("depth")
-            .setDepthStencilOutput("depth", absoluteDepthDesc(kExtent, kExtent, convention))
-            .setSideEffect();
-        graph.addPass("probe")
-            .addTextureInput("depth")
-            .addColorOutput("bb", absoluteColorDesc(kExtent, kExtent))
-            .setExecute([&](PassContext& ctx) {
-                rx::rhi::BindlessHandle depthHandle =
-                    bindlessTable->registerSampledImage(ctx.imageView("depth"), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                REQUIRE(depthHandle.isValid());
+    bool observedHistoryValid = true;  // must flip to false inside the probe callback.
 
-                vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
-                VkDescriptorSet set = bindlessTable->descriptorSet();
-                vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->layoutBundle.layout, 0, 1,
-                                         &set, 0, nullptr);
-                struct {
-                    uint32_t textureIndex;
-                    uint32_t samplerIndex;
-                } push{depthHandle.index(), samplerHandle.index()};
-                vkCmdPushConstants(ctx.cmd, pipeline->layoutBundle.layout, pipeline->pushConstantStages,
-                                    pipeline->pushConstantOffset, pipeline->pushConstantSize, &push);
+    // Three vertical thirds of the one kExtent x kExtent backbuffer.
+    const uint32_t thirdWidth = kExtent / 3;
+    auto scissorFor = [&](uint32_t slot) {
+        return VkRect2D{{static_cast<int32_t>(slot * thirdWidth), 0}, {thirdWidth, kExtent}};
+    };
+    std::vector<rx::rhi::BindlessHandle> probeHandles;
+    auto sampleThird = [&](VkCommandBuffer cmd, VkImageView view, uint32_t slot) {
+        rx::rhi::BindlessHandle handle =
+            bindlessTable->registerSampledImage(view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        REQUIRE(handle.isValid());
+        probeHandles.push_back(handle);
 
-                VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.renderArea.width),
-                                     static_cast<float>(ctx.renderArea.height), 0.0F, 1.0F};
-                VkRect2D scissor{{0, 0}, ctx.renderArea};
-                vkCmdSetViewport(ctx.cmd, 0, 1, &viewport);
-                vkCmdSetScissor(ctx.cmd, 0, 1, &scissor);
-                vkCmdDraw(ctx.cmd, 3, 1, 0, 0);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
+        VkDescriptorSet set = bindlessTable->descriptorSet();
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->layoutBundle.layout, 0, 1, &set, 0,
+                                 nullptr);
+        struct {
+            uint32_t textureIndex;
+            uint32_t samplerIndex;
+        } push{handle.index(), samplerHandle.index()};
+        vkCmdPushConstants(cmd, pipeline->layoutBundle.layout, pipeline->pushConstantStages,
+                            pipeline->pushConstantOffset, pipeline->pushConstantSize, &push);
 
-                // Deferred release, per bindless.h's own RELEASE-SAFETY
-                // CONTRACT -- this is a test with only one in-flight
-                // submission at a time (runOnce() waits idle), so an
-                // eager release AFTER the vkQueueWaitIdle() below is
-                // equally safe; keeping the release outside this
-                // callback (see below) avoids a dangling reference to a
-                // handle whose slot this SAME callback still needs while
-                // recording.
-                (void)depthHandle;
-            });
-        graph.setBackbufferSource("bb");
+        VkViewport viewport{0.0F, 0.0F, static_cast<float>(kExtent), static_cast<float>(kExtent), 0.0F, 1.0F};
+        VkRect2D scissor = scissorFor(slot);
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
 
-        CompileInfo info;
-        info.swapchainWidth = kExtent;
-        info.swapchainHeight = kExtent;
-        info.swapchainFormat = kFormat;
-        // Task 3 ambiguity resolution #1: this offscreen "backbuffer" is
-        // never presented -- readback needs it left in TRANSFER_SRC_OPTIMAL,
-        // not the default PRESENT_SRC_KHR (same override the "invert" case
-        // above makes for the identical reason).
-        info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        graph.compile(info);
-        fixture->executor->realize(graph);
-
-        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
-            fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
-        });
-
-        const VkDeviceSize pixelBytes = static_cast<VkDeviceSize>(kExtent) * kExtent * 4;
-        auto readback = fixture->allocator.createHostVisibleBuffer(pixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        REQUIRE(readback.has_value());
-        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
-            VkBufferImageCopy region{};
-            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            region.imageSubresource.layerCount = 1;
-            region.imageExtent = {kExtent, kExtent, 1};
-            vkCmdCopyImageToBuffer(cmd, offscreen->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1,
-                                    &region);
-        });
-        readback->invalidate();
-        uint8_t redChannel = 0;
-        std::memcpy(&redChannel, readback->mappedData(), sizeof(uint8_t));
-        return redChannel;
+        // Deferred release (bindless.h's own RELEASE-SAFETY CONTRACT) --
+        // this test has only one in-flight submission at a time
+        // (runOnce() waits idle), so releasing all three collected
+        // handles after the readback below (once nothing can still be
+        // sampling them) is safe -- see `probeHandles` below.
     };
 
-    const uint8_t standardRed = runOneConvention(DepthConvention::Standard);
-    const uint8_t reversedRed = runOneConvention(DepthConvention::Reversed);
+    RenderGraph graph;
+    graph.addPass("depthStandard")
+        .setDepthStencilOutput("depthA", absoluteDepthDesc(kExtent, kExtent, DepthConvention::Standard))
+        .setSideEffect();
+    graph.addPass("depthReversed")
+        .setDepthStencilOutput("depthB", absoluteDepthDesc(kExtent, kExtent, DepthConvention::Reversed))
+        .setSideEffect();
+    // Draw-less: this pass exists purely to establish "depthHist"'s two
+    // pinned physical slots. It writes slot 1 this (first) frame --
+    // slot 0 stays whatever initializePinnedHistoryEntry() init-cleared
+    // it to, which "probe" below reads via addHistoryInput().
+    graph.addPass("historyWrite")
+        .setHistoryOutput("depthHist", absoluteDepthDesc(kExtent, kExtent, DepthConvention::Reversed))
+        .setSideEffect();
+    graph.addPass("probe")
+        .addTextureInput("depthA")
+        .addTextureInput("depthB")
+        .addHistoryInput("depthHist")
+        .addColorOutput("bb", absoluteColorDesc(kExtent, kExtent))
+        .setExecute([&](PassContext& ctx) {
+            observedHistoryValid = ctx.historyValid("depthHist");
+            sampleThird(ctx.cmd, ctx.imageView("depthA"), 0);
+            sampleThird(ctx.cmd, ctx.imageView("depthB"), 1);
+            sampleThird(ctx.cmd, ctx.imageView("depthHist"), 2);
+        });
+    graph.setBackbufferSource("bb");
 
-    // The whole point of D29: two runs, each declaring ITS OWN
-    // DepthConvention, clear to two DIFFERENT values -- proving the
-    // executor reads AttachmentDesc::depthConvention per-attachment
-    // rather than the old process-wide 1.0 constant. UNORM8 round-trips
-    // 0.0/1.0 exactly: Standard's clear (1.0) reads back as 255;
-    // Reversed's clear (0.0) reads back as 0.
+    CompileInfo info;
+    info.swapchainWidth = kExtent;
+    info.swapchainHeight = kExtent;
+    info.swapchainFormat = kFormat;
+    // Task 3 ambiguity resolution #1: this offscreen "backbuffer" is
+    // never presented -- readback needs it left in TRANSFER_SRC_OPTIMAL,
+    // not the default PRESENT_SRC_KHR (same override the "invert" case
+    // above makes for the identical reason).
+    info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    graph.compile(info);
+    fixture->executor->realize(graph);
+
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
+    });
+
+    const VkDeviceSize pixelBytes = static_cast<VkDeviceSize>(kExtent) * kExtent * 4;
+    auto readback = fixture->allocator.createHostVisibleBuffer(pixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    REQUIRE(readback.has_value());
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        VkBufferImageCopy region{};
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent = {kExtent, kExtent, 1};
+        vkCmdCopyImageToBuffer(cmd, offscreen->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1,
+                                &region);
+    });
+    readback->invalidate();
+
+    auto redAtThirdCenter = [&](uint32_t slot) -> uint8_t {
+        const uint32_t x = slot * thirdWidth + thirdWidth / 2;
+        const uint32_t y = kExtent / 2;
+        const size_t idx = (static_cast<size_t>(y) * kExtent + x) * 4;
+        uint8_t value = 0;
+        std::memcpy(&value, static_cast<const uint8_t*>(readback->mappedData()) + idx, sizeof(uint8_t));
+        return value;
+    };
+
+    const uint8_t standardRed = redAtThirdCenter(0);
+    const uint8_t reversedRed = redAtThirdCenter(1);
+    const uint8_t historyRed = redAtThirdCenter(2);
+
+    // The ordinary per-pass site [depthA/depthB, cleared within the SAME
+    // frame as each other]: UNORM8 round-trips 0.0/1.0 exactly --
+    // Standard's clear (1.0) reads back as 255; Reversed's (0.0) as 0.
+    CAPTURE(static_cast<int>(standardRed));
+    CAPTURE(static_cast<int>(reversedRed));
     CHECK(static_cast<int>(standardRed) == 255);
     CHECK(static_cast<int>(reversedRed) == 0);
 
+    // The pinned-history init-clear site [depthHist's untouched slot 0]:
+    // this is a REVERSED-convention history resource, so its own
+    // initializePinnedHistoryEntry() clear (executor.cpp's depth branch)
+    // must ALSO read back 0, independently proving that site derives
+    // from AttachmentDesc::depthConvention too, not only the ordinary
+    // site above.
+    CAPTURE(static_cast<int>(historyRed));
+    CHECK(static_cast<int>(historyRed) == 0);
+    // Slot 0 was genuinely never written by any real pass this frame --
+    // the same "never written" contract the existing color history test
+    // above already proves, now also exercised for a depth resource.
+    CHECK_FALSE(observedHistoryValid);
+
     CHECK_FALSE(fixture->context.hasValidationErrors());
     vkDeviceWaitIdle(device);
-    destroyDepthProbePipeline(device, *pipeline);
+    for (rx::rhi::BindlessHandle handle : probeHandles) {
+        bindlessTable->release(handle);
+    }
+    bindlessTable->release(samplerHandle);
     vkDestroySampler(device, sampler, nullptr);
+    destroyDepthProbePipeline(device, *pipeline);
     destroyOffscreenImage(device, *offscreen);
 }
