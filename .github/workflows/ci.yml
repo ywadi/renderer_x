@@ -213,6 +213,38 @@ jobs:
       - name: Configure
         run: cmake --preset linux-native
 
+      # Closure-sweep item 5 minor [no-deferral: closed, not merely
+      # documented]: the restore-keys fallback above (added for the SAME
+      # reason as the .deps-cache step's own comment) means a restored
+      # cache can carry forward hash-keyed subdirectories from an OLDER
+      # configure that this run no longer references at all (a removed
+      # dependency, a re-pinned tag, a changed CMAKE_ARGS/toolchain
+      # hash) -- nothing else ever deletes them, so the saved cache would
+      # otherwise grow monotonically across many third_party edits,
+      # eventually approaching GitHub's 10GB total cache limit. The
+      # Configure step just above (cmake/DepCache.cmake's own
+      # rx_add_cached_dependency(), see that file's own header comment)
+      # writes the exact, authoritative set of cache-dir keys THIS
+      # configure actually needs to build/linux-native/deps-cache-
+      # manifest.txt -- and since a FATAL_ERROR during that step would
+      # already have aborted the job before reaching here, every key in
+      # that manifest names a dependency that is genuinely built and
+      # installed. Anything under .deps-cache/ NOT in that manifest is
+      # therefore provably stale -- delete it now, before the cache-save
+      # (an implicit post-job step of the "Cache third-party dependency
+      # builds" step above) uploads whatever is left.
+      - name: Prune stale dependency cache entries
+        run: |
+          manifest="build/linux-native/deps-cache-manifest.txt"
+          test -f "${manifest}"
+          for dir in .deps-cache/*/; do
+            key="$(basename "${dir}")"
+            if ! grep -qxF "${key}" "${manifest}"; then
+              echo "[prune] removing stale dependency cache entry: ${key}"
+              rm -rf "${dir}"
+            fi
+          done
+
       - name: Build
         run: cmake --build --preset linux-native
 
@@ -427,6 +459,22 @@ jobs:
 
       - name: Configure
         run: cmake --preset windows-cross-zig
+
+      # Closure-sweep item 5 minor -- same prune step and the same
+      # rationale as the linux-native job's identically-worded step above
+      # (cmake/DepCache.cmake's own manifest write, this job's own build
+      # dir).
+      - name: Prune stale dependency cache entries
+        run: |
+          manifest="build/windows-cross-zig/deps-cache-manifest.txt"
+          test -f "${manifest}"
+          for dir in .deps-cache/*/; do
+            key="$(basename "${dir}")"
+            if ! grep -qxF "${key}" "${manifest}"; then
+              echo "[prune] removing stale dependency cache entry: ${key}"
+              rm -rf "${dir}"
+            fi
+          done
 
       - name: Build
         run: cmake --build --preset windows-cross-zig
