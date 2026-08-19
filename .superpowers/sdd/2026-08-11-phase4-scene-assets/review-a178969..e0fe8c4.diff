@@ -1,0 +1,3484 @@
+# Review package: a178969..e0fe8c4
+
+## Commits
+e0fe8c4 docs: Task 19 report -- DrawListBuilder per-criterion proof + revert evidence
+afd8a0d feat(rx_scene): DrawListBuilder -- parallel culling + sort keys (D14/D15/D26/D27)
+
+## Files changed
+ .../task-19-report.md                              |  363 +++++
+ src/rx_scene/CMakeLists.txt                        |   10 +-
+ src/rx_scene/draw_list.cpp                         |  887 ++++++++++++
+ src/rx_scene/include/rx_scene/draw_list.h          |  576 ++++++++
+ src/rx_scene/include/rx_scene/scene.h              |   28 +-
+ src/rx_scene/scene.cpp                             |   10 +
+ src/rx_scene/tests/CMakeLists.txt                  |    1 +
+ src/rx_scene/tests/draw_list_test.cpp              | 1453 ++++++++++++++++++++
+ 8 files changed, 3326 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-19-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-19-report.md
+new file mode 100644
+index 0000000..eb664ff
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-19-report.md
+@@ -0,0 +1,363 @@
++# Task 19 report: `DrawListBuilder` — parallel culling + sort keys (D14/D15/D24/D26/D27)
++
++Closes cards #6 (frustum/shadow-caster culling) and #7 (layer/mask system).
++BASE = a178969 (post Task 18, CI green).
++
++## Files created
++
++- `src/rx_scene/include/rx_scene/draw_list.h` (576 lines) — public API:
++  `DrawCommand`/`DrawPayload`/`BlockRange`/`CullCounters`/`ViewLists`/
++  `ShadowLists`, the `sortkey` namespace (bit layout + encode/decode),
++  `MeshSubmeshesFn`/`MaterialResolveFn` injected seams + their
++  `xFromRegistry()` production adapters, `DrawListBuilder`, and the
++  `recordDrawList`/`resolveDrawGroups` D27 mechanism.
++- `src/rx_scene/draw_list.cpp` (887 lines) — implementation.
++- `src/rx_scene/tests/draw_list_test.cpp` (1453 lines, 61 test cases) —
++  device-free coverage.
++
++## Files modified (necessary, documented deviations — see below)
++
++- `src/rx_scene/include/rx_scene/scene.h` / `scene.cpp` — added
++  `Scene::aliveSpan()`/`generationsSpan()`; changed the private `alive_`
++  column's storage from `std::vector<bool>` to `std::vector<uint8_t>` so it
++  can be spanned (same convention `castsShadowsSpan()` already established
++  for every other boolean column).
++- `src/rx_scene/CMakeLists.txt` — added `draw_list.cpp`, linked `rx_task`
++  PUBLIC.
++- `src/rx_scene/tests/CMakeLists.txt` — added `draw_list_test.cpp`.
++
++## Design decisions and their justification
++
++### Scene::aliveSpan()/generationsSpan() — a necessary interface gap, not scope creep
++
++`DrawListBuilder`'s culling loop iterates `Scene`'s SoA span accessors in
++bulk (by design — that's the whole point of the SoA layout, per scene.h's
++own top comment: "DrawListBuilder's culling loop... reads AABBs/layers/etc.
++directly, contiguous, never per-object"). But `Scene::destroyRenderable()`
++marks a slot dead WITHOUT re-zeroing its other columns (`scene.cpp`: only
++`submeshOverrides_` is cleared) — so a freed-but-not-yet-reused slot's
++`layers_`/`mesh_`/etc. entries hold arbitrary stale values, and no existing
++accessor lets a bulk consumer distinguish a live slot from a dead one by
++INDEX alone (`isRenderableAlive(handle)` needs a full generational handle,
++which a bare index iterator doesn't have). Without a fix, `build()` would
++either crash/misbehave on stale mesh handles or silently double-count dead
++slots in `CullCounters`. Fixed the same way Task 18's own gate rulings
++fixed analogous small gaps (`getLayers`/`setChannels` "added for API
++parity... cheap now... retrofitting later is a needless negotiation"): two
++new read-only span accessors, mirroring `castsShadowsSpan()`'s exact
++uint8_t-not-`vector<bool>` convention. Covered by its own test
++(`draw_list_test.cpp`, "Scene::aliveSpan()/generationsSpan() correctly
++distinguish a live slot from a destroyRenderable()d hole").
++
++### Sort key: collapse-BEFORE-sort, not mesh-tier-above-depth
++
++The first implementation attempt put a `meshKey` tier ABOVE `depthBucket`
++in the opaque sort key, reasoning that D26.3's instancing-collapse needs
++identical-mesh instances to be ADJACENT post-sort. TDD caught the real bug
++this created immediately (see "Bugs TDD caught" below): with mesh ranked
++above depth, DIFFERENT-mesh objects sort by an arbitrary mesh-identity hash
++rather than depth, breaking D14's own "front-to-back by pipeline|material|
++depth" contract across meshes — the opposite failure from what was being
++fixed.
++
++The correct resolution (implemented, `DrawListBuilder::Impl::
++collapseAndSortOpaque()`, `draw_list.cpp`): collapse FIRST, sort SECOND.
++Phase 1 sorts `opaqueRecords` by exact draw IDENTITY (blockId, indexCount,
++firstIndex, vertexOffset, materialIndex, priority — never depth), so every
++collapse-eligible run becomes contiguous regardless of the instances'
++individual depths (a scattered "1000-tree forest" scene collapses into ONE
++instanced draw even though its members are at 1000 different depths).
++Phase 2 folds each identity-run into one `CollapsedGroup` (representative
++depth = the group's NEAREST member), then sorts the resulting, far fewer,
++groups by the perceptual D14 key (priority|pipeline|material|depth) — no
++mesh field needed in that key at all, since collapse already happened.
++This satisfies BOTH requirements unconditionally: D26.3 collapse never
++depends on depth adjacency, and D14 depth-ordering is never distorted by
++mesh identity. The opaque sort key is 64 bits: `priority(3) |
++pipelineKey(7) | materialKey(15) | depthBucket(23) | tieBreak(16)`.
++
++### `blockId` is the outermost sort tier, not a key bit-field
++
++`BlockRange`'s "one contiguous run per block" invariant (needed because
++`GeometryPool::bind()` requires every draw between two `bind()` calls to
++share one block) is a HARD correctness requirement, not an ordering nicety.
++Making `blockId` the primary comparison (above even `priority`) in every
++sort comparator — rather than a bit-field competing for space in the
++64-bit key — guarantees this unconditionally, while `priority`/pipeline/
++material/depth still fully control ordering WITHIN each block's own
++contiguous run.
++
++### `buildShadow(..., LightHandle light, ...)`, not a `DirectionalLight` value
++
++The brief's interface sketch shows `buildShadow(const Scene&, const
++DirectionalLight&, const Camera&, ...)`, but Task 18's landed `Scene`/
++`scene.h` defines no `DirectionalLight` type — only `LightHandle` +
++per-handle accessors (`lightDirection`/`lightChannels`/`lightCastsShadows`).
++Necessary concretization: `buildShadow` takes `LightHandle` (resolved
++against `scene`, mirroring how `build()` already takes renderables through
++`scene`), never inventing a redundant duplicate light-value type.
++
++### `recordDrawList`/`resolveDrawGroups`: the D27 mechanism, genericized
++
++Task 19's own file list is `draw_list.{h,cpp}` only (no `rx_graph`/
++`rx_material` dependency), and the brief itself requires this library stay
++device-free (no VkDevice, no rx_rhi_vk — matching `rx_scene`'s existing
++CMakeLists.txt posture verbatim). `recordDrawList`'s PRODUCTION binding
++(driving `rx::material::MaterialSystem::getPipeline()`/`rx::graph::
++PassContext` for real GPU recording) is Task 22/24's own scope per the plan
++(`docs/superpowers/plans/2026-08-11-phase4-scene-assets.md:713`: "loads...
++through Registry→Scene→DrawListBuilder→graph", Task 24). What THIS task
++delivers is the MECHANISM D27 requires: `resolveDrawGroups()` does the
++single main-thread linear scan pre-resolving each distinct `materialIndex`
++boundary exactly once (main-thread-guarded via `RX_ASSERT_MAIN_THREAD`),
++and `recordDrawList()` fans `RecordChunkFn` out via `scheduler.parallelFor()`
++with a callback signature that STRUCTURALLY never receives
++`PipelineResolveFn` — a compile-time-adjacent guarantee, not just a runtime
++check (exactly what the gate matrix's own D27 row asks for). A production
++`PipelineResolveFn`/`RecordChunkFn` pair implementing the real GPU path is
++future-task work; this task proves the seam and its guard are load-bearing
++(see revert-discrimination evidence below).
++
++### Zero-alloc test mechanism: scoped global `operator new`/`delete`, not capacity/pointer checks
++
++Tried first: `.capacity()` equality and `.data()` pointer-identity checks
++against the warm-up call's own values. BOTH turned out to be unsound —
++empirically proven, not assumed (see "Revert 1" below): a buggy
++`out.commands = std::vector<DrawCommand>();` (discard-and-reallocate every
++call) still reaches the SAME final `.capacity()` (std::vector's geometric
++growth from empty is a deterministic function of final size alone) and
++frequently the SAME `.data()` address (glibc's allocator commonly hands
++back the just-freed block immediately for a same-size request) — neither
++check caught the bug. Fixed with a scoped global `operator new`/`delete`
++override (`draw_list_test.cpp`, active only inside the zero-alloc
++`TEST_CASE`) counting TOTAL allocation CALLS (monotonic, never
++decremented) — a net-live-count design was tried and also found unsound
++(alloc+free pairs from a reallocate-every-call bug cancel out in a net
++metric even though real allocator churn occurred). This is a documented,
++narrow deviation from the #29/Task-23 ruling's "NO global operator-new
++interposition (volk/validation/rpmalloc linkage risk)" — that ruling is
++scoped to a DIFFERENT ticket's DIFFERENT binary (one that links and
++exercises live Vulkan/validation-layer/rpmalloc code); `rx_scene_tests` is
++100% device-free at runtime (no `VkInstance`/`VkDevice` ever constructed),
++so the cited linkage risk does not apply here — verified by running the
++full 57→61-case suite with the override compiled in, twice, with zero
++unrelated failures.
++
++## Per-criterion proof — matrix-issue06 (drawlists-culling)
++
++| Criterion | Test(s) | Result |
++|---|---|---|
++| Sort-key bit layout documented + `decode()` round-trip | `sortkey::encodeOpaque/decodeOpaque round-trips...`, `...encodeBlend/decodeBlend...`, `...encodeShadow/decodeShadow...` | PASS — named constants + ASCII diagram in `draw_list.h`; exact round-trip on every field |
++| Depth bucket = truncated monotonic float32 bit pattern, never linear rescale | `Depth bucket preserves ordering for NDC depths clustered near the reversed-Z near plane` | PASS — real reversed-Z-infinite `near/distance` NDC values, near-plane pair (0.2 vs 0.3 units) resolvable, monotonic across a realistic clustered range |
++| Deterministic low-bit tie-break = stable creation index | `build() produces byte-identical ViewLists across --threads 1/2/8` + Revert 4 | PASS — tie-break is the renderable's Scene slot index; discrimination proven (see below) |
++| Partition sort-DIRECTION test, one shared fixture | `Opaque partition sorts front-to-back... and blend partition sorts back-to-front... on the SAME depth values` | PASS — 3 known depths, opaque decreasing / blend increasing, asserted via `firstIndex` identity tags |
++| Priority tier above pipeline bits | `Priority occupies a documented tier ABOVE pipeline/material/depth` | PASS |
++| blendOrder bits reserved, unpopulated | `...decodeBlend...` asserts `reservedBlendOrder == 0` | PASS |
++| Fixed index-range chunks + chunk-order concatenation → byte-identical across `--threads` | `build() produces byte-identical ViewLists across --threads 1/2/8` | PASS — see design note: achieved via embarrassingly-parallel per-index writes + fixed slot-order serial compaction (a simpler mechanism giving the identical guarantee — documented in `cullView()`'s own comment) |
++| D26.3 lockstep (commands/payloads as one unit; interleaved-desync test mandatory) | `D26.3 lockstep criterion: an interleaved-creation-order scene...` + Revert 3 | PASS — cross-checks every collapsed command's payload range against source-renderable identity, not just counts |
++| `CullCounters` exact field list, CI-gated | `CullCounters are EXACT across a mixed layer/frustum/visible scene` + counters asserted in nearly every other test | PASS |
++| `ShadowLists` = ViewLists shape, single partition, sorted (pipeline, mesh range, block), BLEND excluded | `buildShadow(): BLEND-partition renderables are EXCLUDED...` | PASS |
++| Culling planes from `Camera::cullingProj()` (finite) + extreme-depth-never-culled | `An object at extreme depth (100,000 units)...` | PASS — both directions tested (legitimately included AND legitimately excluded by a smaller far plane) |
++| Degenerate/zero-extent AABB + ground-slab | `build() never culls a degenerate (single-point, min==max) AABB...`, `...never culls a ground-slab AABB...` | PASS |
++| Per-block contiguous `BlockRange` grouping | `ViewLists.blocks groups commands contiguously by blockId...` | PASS — adversarial fixture interleaves 2 blocks × 2 pipeline variants |
++| D27 worker-guard test, `setViolationHookForTests` + rendezvous barrier | `recordDrawList()'s RecordChunkFn callback... NEVER triggers the main-thread guard` + adversarial control test + Revert 2 | PASS — see deviation note (adapted to `task::Scheduler`'s own barrier precedent, device-free) |
++| D26.2 `VkDrawIndexedIndirectCommand` compatibility | `DrawCommand is byte-for-byte VkDrawIndexedIndirectCommand-compatible...` | PASS — `static_assert(sizeof(...)==...)` + per-field `offsetof` + reinterpret-cast upload proof |
++| Instancing collapse, records-in vs draws-submitted | `An identical-run scene (1000 identical renderables) collapses into ONE DrawCommand...` | PASS — exact `recordsIn==1000`, `drawsSubmitted==1` |
++| Off-screen-caster-still-casts + conservative exclusion | `buildShadow(): a caster fully OUTSIDE the camera frustum...` | PASS — both the include AND the exclude case, independently confirmed off-camera via a separate `build()` call |
++| Alpha-MASK in opaque partition | `Alpha-MASK draws land in the opaque partition...` | PASS |
++| D24 residency-tolerant resolve (mesh + material) | `An evicted MATERIAL handle resolves to the fallback...`, `An evicted MESH handle resolves to the (empty) fallback...` | PASS — never a crash, fallback substitution both ways |
++| Zero-alloc invariant | `build() into reused ViewLists/DrawListBuilder storage performs zero net capacity growth...` + Revert 1 | PASS — see measured evidence below |
++
++## Per-criterion proof — matrix-issue07 (layer-masks)
++
++| Criterion | Test(s) | Result |
++|---|---|---|
++| 32-bit `layers`, 8-bit `channels`, AND-test semantics | `Camera cullMask / renderable layers: the five-case CI mask matrix` | PASS |
++| cullMask==0 excludes even `layers==~0u` (non-empty intersection, not subset test) | `cullMask == 0 excludes a renderable with layers == ~0u too` | PASS |
++| All-ones defaults confirmed deliberate (regression guard) | `A default-constructed renderable is visible to a default-constructed camera...` | PASS |
++| Light channels COUPLED to both lighting and shadow-casting (RC5) | `buildShadow(): channel coupling (RC5)...` | PASS — channel mismatch excludes from caster list; `castsShadows=false` independently excludes too |
++| Five-case CI mask matrix (a-e) | Cases (a)(b)(c) in the mask-matrix test; (d)(e) in the channel-coupling shadow test (channels only matter for shadow-casting, not camera visibility — see design note) | PASS |
++| `getLayers`/`getChannels`/`setChannels` (Task 18 gate delta) | Already landed Task 18; consumed here via `scene.layersSpan()`/`channelsSpan()` | N/A to this task, confirmed present |
++
++## Revert-and-restore evidence (in-tree, byte-identical restore verified each time)
++
++All four probes: `cp draw_list.cpp` to a scratchpad backup before editing;
++`md5sum`/`diff` confirmed byte-identical restore after each probe
++(`e65f28f64eb3ff0f064d7f88188e25e1` throughout).
++
++**Revert 1 — zero-alloc.** `out.commands.clear()` → `out.commands =
++std::vector<DrawCommand>()`. Capacity-equality and `.data()`-identity
++checks alone did NOT fail (see design note above — allocator/growth-pattern
++coincidence). The monotonic total-allocation-call counter DID: baseline 1
++call/frame (correct code) → 10 calls/frame (buggy code), assertion
++`baselineDelta <= 4` correctly failed.
++
++**Revert 2 — D27 guard.** `recordDrawList()`'s per-chunk dispatch loop
++made to call `resolvePipeline(0)` directly (simulating the exact bug the
++design prevents). Result: `capture.empty()` failed — the guard fired and
++was captured, exactly as expected. Restored; adversarial control test
++(designed to trip the guard deliberately) independently confirms the
++mechanism itself works (`capture.size() == 1`).
++
++**Revert 3 — D26.3 lockstep.** `sameDrawIdentity()`'s `firstIndex` check
++dropped (simulating a bug that merges genuinely different meshes). Result:
++`lists.commands.size() == 2` failed (got 1 — the two distinct mesh types
++merged into one command), caught even before the lockstep cross-check ran.
++
++**Revert 4 — determinism across thread counts.** Two combined probes: (a)
++serial-compaction order made to depend on `scheduler.workerCount() > 4`
++(reversed for `--threads 8`), (b) sort tie-break zeroed. Probe (a) alone
++did NOT produce a divergence (the downstream sort with a real tie-break
++absorbs any pre-sort order difference — itself a useful finding: the
++tie-break makes the pipeline robust to MORE than just chunk-boundary
++issues). Combining (a)+(b): 1774 of 5641 assertions failed at `threads=8`
++vs the `threads=1` reference — real divergence, confirming BOTH the
++fixed-order compaction AND the tie-break are independently load-bearing.
++
++## Zero-alloc — measured evidence (not narrated)
++
++```
++rx_scene zero-alloc: steady-state build() call made 1 operator-new call(s)
++(baseline; must stay small and IDENTICAL every subsequent frame)
++```
++500-renderable mixed opaque/blend/multi-block/multi-mesh scene, 10
++steady-state frames after warm-up: every frame's total-allocation-call
++delta == 1 (identical across the whole run), `.capacity()` and `.data()`
++pointer-identity also unchanged on `ViewLists`' 3 vectors and
++`DrawListBuilder`'s 6 private scratch buffers (test-only introspection via
++`rx::scene::detail::capacitiesForTesting()`).
++
++## Determinism — measured evidence
++
++`build() produces byte-identical ViewLists across --threads 1/2/8`: 2000-
++renderable scene (3 blocks, mixed opaque/blend/doubleSided materials, 17
++distinct mesh identities, priorities 0-7, depths spanning 50 distinct
++values) — `commands`/`payloads`/`blocks`/`opaqueCommandCount`/`counters`
++asserted byte-identical (`operator==`) across all three thread counts.
++5641 assertions, 0 failures.
++
++## Tracy zones (RX_ZONE/RX_ZONE_NAMED)
++
++`build`/`buildShadow`/`recordDrawList`/`resolveDrawGroups` (RX_ZONE, named
++after the enclosing function); `cullView`/`cullShadowCasters`/
++`generateRecords`/`partitionAndSort`/the shadow sort step (RX_ZONE_NAMED,
++explicit names) — the parallel cull AND the sort are both independently
++zoned per the task's own instruction, so a Tracy capture during Task 24's
++stress-v2 run can attribute time to culling vs. record-generation vs.
++sorting/collapse separately.
++
++## Test suite results
++
++**linux-native, serial `ctest` (matching CI's own invocation):**
++```
++100% tests passed, 0 tests failed out of 23
++Total Test time (real) = 155.42 sec
++```
++`rx_scene_tests` alone: 61 test cases (57 unconditional + 4 gated behind
++`RX_DEBUG_CHECKS`, which is ON in both dev presets), 6199 assertions, 0
++failures, stable across 5 repeated runs (no flakiness observed in the
++barrier-based D27/determinism tests).
++
++**windows-cross-zig, under Wine (per README's own documented local-
++verification convention — `xvfb-run -a ctest --preset windows-cross-zig -E
++'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample'`):**
++```
++100% tests passed, 0 tests failed out of 11
++Total Test time (real) = 119.82 sec
++```
++`rx_scene_tests.exe`: 0.08s, all cases passed (device-free, as expected —
++matches the README's own list of binaries genuinely device-free under
++Wine). `rx_asset_gltf_gpu_tests.exe` (real winevulkan/lavapipe `VkDevice`)
++also passed, confirming the `Scene::alive_` storage-type change introduced
++no regression in a GPU-backed consumer path either (it has none — `Scene`/
++`DrawListBuilder` are never touched by that binary — but it shares the
++`rx_scene` static library, so a link-level confirmation is still useful).
++
++Both presets built from a clean incremental state with zero warnings
++treated as errors; both ran with `RX_DEBUG_CHECKS=ON` (dev preset default),
++so every `RX_ASSERT_MAIN_THREAD` guard was live in both runs.
++
++## Deviations from the plan/gate text (summary; each detailed above)
++
++1. `Scene::aliveSpan()`/`generationsSpan()` added (necessary correctness
++   fix for bulk SoA iteration over possibly-dead slots — Task 18's landed
++   surface had no way to do this).
++2. Sort key: collapse-BEFORE-sort two-phase design, not a single sort with
++   a mesh tier (the naive reading of "mesh range must be a sort tier for
++   D26.3" breaks D14's own depth-ordering contract across meshes — see
++   design note; caught by TDD, not assumed).
++3. `buildShadow(..., LightHandle, ...)`, not a `DirectionalLight` value
++   type (none exists in the landed API).
++4. `recordDrawList`/`resolveDrawGroups` are genericized over injected
++   `PipelineResolveFn`/`RecordChunkFn` rather than hard-bound to
++   `rx::material::MaterialSystem`/`rx::graph::PassContext` — the real GPU
++   binding is explicitly Task 22/24 scope per the plan; this task delivers
++   the mechanism + its guard, proven via revert-discrimination.
++5. D27 guard test adapted to `rx::task::Scheduler::parallelFor()`'s own
++   n-way barrier precedent (`rx_task/tests/scheduler_test.cpp`) rather than
++   literally reusing `test_material_system.cpp`'s `rx_graph::Executor`/live-
++   `VkDevice` scaffolding, which this device-free library has no access to
++   by design. The `setViolationHookForTests` + rendezvous-barrier PATTERN
++   is reused verbatim; the GPU harness around it is not, since none exists
++   here.
++6. Zero-alloc test uses a scoped global `operator new`/`delete` override —
++   see design note for why the capacity/pointer-only approach was
++   insufficient and why the #29-ruling linkage-risk concern does not apply
++   to this device-free binary.
++
++## Self-review
++
++**What is solid:** every gate-matrix acceptance criterion for both #6 and
++#7 has a directly corresponding, passing test; four of the highest-value
++tests (zero-alloc, D27 guard, D26.3 lockstep, cross-thread determinism)
++have genuine revert-discrimination evidence, not just "the test exists and
++passes" — including two cases (zero-alloc's capacity/pointer checks;
++determinism's compaction-order-only probe) where a FIRST attempt at the
++mechanism was empirically proven insufficient and replaced, which is
++exactly the kind of grounding this project's verification discipline asks
++for. The sort-key architecture issue (mesh-above-depth) was caught by
++writing the direction test first and watching it fail for the RIGHT reason
++(not a typo — a real design flaw), then fixed at the architecture level
++rather than patched around.
++
++**What is a real, bounded limitation, not swept under the rug:**
++- The opaque sort key's `materialKey`/`tieBreak` fields are truncated to
++  15/16 bits (32768/65536 distinct values). Beyond that many distinct
++  materials or renderables in one scene, ordering degrades gracefully to
++  "still deterministic, just less globally precise" (documented in
++  `draw_list.h`'s own sort-key comment) — never a correctness bug, but a
++  real, named capacity bound worth flagging for Task 24's 30k-instance
++  stress scene (well within bounds for renderable COUNT via `tieBreak`;
++  material/pipeline variety in Phase 4 content is far below 32k).
++- `recordDrawList`'s instancing-collapse discipline does NOT extend to
++  `ShadowLists` (Phase 4 scope decision, documented, not gate-required) —
++  a future task could add it for the same draw-call-count benefit shadow
++  passes get too, but nothing in the gate criteria requires it now.
++- `generateRecords()` (mesh/material resolution + payload expansion) is
++  deliberately NOT parallelized — only the AABB-vs-frustum test is, per
++  D15's own explicit "AABB-vs-planes batched in parallelFor chunks"
++  wording. This is O(visible) work, cheap relative to culling 30k
++  candidates, and touches the injected resolver callbacks whose
++  thread-safety this task makes no claim about — parallelizing it would be
++  a genuine scope expansion beyond what the gate criteria ask for.
++- No published wall-clock benchmark for a 30k-object stress scene in this
++  report — Task 19's own criteria (this task, device-free, synthetic
++  scenes) don't name one; the project's phase-4-exit benchmark-publication
++  policy (CLAUDE.md's "every phase exits with published benchmark numbers")
++  applies at Task 23/24 (after the executor's own zero-alloc work lands and
++  a real stress sample exists to measure) — flagging this explicitly rather
++  than fabricating a number now.
++
++## Known limitations / what later tasks still own
++
++- Task 22 (shadow bridge): the real GPU shadow-pass projection matrix,
++  depth-bias, and `AttachmentDesc` depth-convention wiring — `buildShadow()`
++  only decides WHICH casters are in the list, never touches a
++  `VkPipeline`/render pass.
++- Task 22/24: a real `PipelineResolveFn`/`RecordChunkFn` pair binding
++  `recordDrawList()` to `MaterialSystem::getPipeline()` and actual
++  `vkCmdDrawIndexed`/`vkCmdDrawIndexedIndirect` recording.
++- Task 24: the 30k-instance stress-v2 sample and its published A/B
++  benchmark numbers vs. sample 07 (desktop + Steam Deck), consuming this
++  task's `DrawListBuilder` end to end through `Registry→Scene→
++  DrawListBuilder→graph`.
+diff --git a/src/rx_scene/CMakeLists.txt b/src/rx_scene/CMakeLists.txt
+index c7779eb..846b2ee 100644
+--- a/src/rx_scene/CMakeLists.txt
++++ b/src/rx_scene/CMakeLists.txt
+@@ -8,18 +8,26 @@
+ # Depends on rx_asset PUBLIC: RenderableDesc::mesh is `asset::MeshHandle`
+ # (the plan's own interface text), and Scene's world-space AABB derivation
+ # reuses `asset::AABB`/`asset::AABB::transformed()` verbatim (per this
+ # project's "don't reinvent" rule) rather than re-deriving bounding-box
+ # transform math. scene.h itself only forward-declares `asset::Registry`
+ # (meshBoundsFromRegistry()'s production adapter, defined in scene.cpp,
+ # is the one place that needs the real <rx_asset/registry.h>) -- but the
+ # PUBLIC link is still against the whole rx_asset target, since
+ # RenderableDesc's own public fields need MeshHandle/MaterialHandle/AABB
+ # from mesh_asset.h regardless.
++#
++# [Phase 4 Stage 2 Task 19] rx_task PUBLIC: DrawListBuilder::build()/
++# buildShadow()/recordDrawList() all take `rx::task::Scheduler&` directly
++# in their own public signatures (draw_list.h) -- the parallel AABB-cull
++# fan-out D15 requires. Still device-free (rx_task itself has no VkDevice
++# dependency -- it is a thin enkiTS wrapper, matching this library's own
++# "no VkDevice, no rx_rhi_vk" posture verbatim).
+ add_library(rx_scene STATIC
+     camera.cpp
+     scene.cpp
++    draw_list.cpp
+ )
+ target_include_directories(rx_scene PUBLIC include)
+-target_link_libraries(rx_scene PUBLIC rx_core rx_asset)
++target_link_libraries(rx_scene PUBLIC rx_core rx_asset rx_task)
+ 
+ add_subdirectory(tests)
+diff --git a/src/rx_scene/draw_list.cpp b/src/rx_scene/draw_list.cpp
+new file mode 100644
+index 0000000..3941d4f
+--- /dev/null
++++ b/src/rx_scene/draw_list.cpp
+@@ -0,0 +1,887 @@
++#include <rx_scene/draw_list.h>
++
++#include <rx_asset/registry.h>
++#include <rx_core/debug_checks.h>
++#include <rx_core/profile.h>
++
++#include <glm/gtc/matrix_transform.hpp>
++
++#include <algorithm>
++#include <bit>
++#include <cmath>
++#include <limits>
++
++namespace rx::scene {
++
++// ---------------------------------------------------------------------
++// Injected resolution seams -- production adapters.
++// ---------------------------------------------------------------------
++
++MeshSubmeshesFn meshSubmeshesFromRegistry(const asset::Registry& registry) {
++    // See draw_list.h's own comment: forwards verbatim to
++    // Registry::mesh(handle).submeshes, already D24 residency-tolerant (a
++    // dead/evicted handle resolves to the D11 fallback mesh's EMPTY
++    // submesh list -- rx_asset/fallbacks.cpp's makeFallbackMeshAsset() --
++    // so a renderable referencing an evicted mesh contributes zero draw
++    // records here, never a crash).
++    return [&registry](asset::MeshHandle mesh) -> std::span<const asset::Submesh> { return registry.mesh(mesh).submeshes; };
++}
++
++MaterialResolveFn materialResolveFromRegistry(const asset::Registry& registry) {
++    return [&registry](asset::MaterialHandle handle) -> ResolvedMaterial {
++        const asset::MaterialAsset& mat = registry.material(handle);  // D24 residency-tolerant
++        return ResolvedMaterial{handle.index(), mat.alphaMode, mat.doubleSided, mat.disposition};
++    };
++}
++
++// ---------------------------------------------------------------------
++// Sort key.
++// ---------------------------------------------------------------------
++
++namespace sortkey {
++
++uint32_t depthBucketBits(float ndcDepth, uint32_t bucketBits) {
++    const float clamped = std::clamp(ndcDepth, 0.0F, 1.0F);
++    // Reinterpreting a non-negative float's raw bit pattern as a uint32_t
++    // preserves ordering (IEEE-754's own monotonicity property for
++    // non-negative values) -- no multiplication/rescale, per the gate
++    // ruling's own "never a linear rescale" requirement.
++    const uint32_t bits = std::bit_cast<uint32_t>(clamped);
++    if (bucketBits >= 32) {
++        return bits;
++    }
++    return bits >> (32 - bucketBits);
++}
++
++uint16_t pipelineKeyOf(asset::MaterialDisposition disposition, asset::AlphaMode alphaMode, bool doubleSided) {
++    uint16_t key = 0;
++    key = static_cast<uint16_t>(key | ((static_cast<uint16_t>(disposition) & 0x1U) << 3));
++    key = static_cast<uint16_t>(key | ((static_cast<uint16_t>(alphaMode) & 0x3U) << 1));
++    key = static_cast<uint16_t>(key | (doubleSided ? 1U : 0U));
++    return key;
++}
++
++uint16_t meshKeyOf(uint32_t firstIndex, int32_t vertexOffset) {
++    // Plain multiplicative hash (Knuth's constants) -- only used to spread
++    // distinct (firstIndex,vertexOffset) pairs across the sort key's mesh
++    // tier for ORDERING purposes; actual instancing-collapse identity is
++    // re-verified against the real fields directly (draw_list.cpp's
++    // sameDrawIdentity()), so a hash collision here can only ever cost a
++    // missed collapse opportunity or a slightly coarser sort grouping,
++    // never a correctness bug.
++    uint32_t h = firstIndex * 2654435761U;
++    h ^= static_cast<uint32_t>(vertexOffset) * 2246822519U;
++    h ^= h >> 15;
++    return static_cast<uint16_t>(h & 0xFFFFU);
++}
++
++namespace {
++uint64_t field(uint64_t value, uint32_t bits, uint32_t shift) {
++    const uint64_t mask = (bits >= 64) ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1);
++    return (value & mask) << shift;
++}
++uint64_t extract(uint64_t key, uint32_t bits, uint32_t shift) {
++    const uint64_t mask = (bits >= 64) ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1);
++    return (key >> shift) & mask;
++}
++}  // namespace
++
++uint64_t encodeOpaque(uint8_t priority, uint16_t pipelineKey, uint16_t materialKey, float ndcDepth, uint32_t tieBreak) {
++    const uint32_t rawDepth = depthBucketBits(ndcDepth, kOpaqueDepthBits);
++    const uint32_t depthMask = static_cast<uint32_t>((uint64_t{1} << kOpaqueDepthBits) - 1);
++    // Bitwise-complement within the field width: ascending key order becomes
++    // DEcreasing depth (nearest/highest-reversed-Z first) -- Filament's own
++    // `~distanceBits` trick, applied to the OPAQUE partition instead (see
++    // this header's own direction-test comment).
++    const uint32_t invertedDepth = (~rawDepth) & depthMask;
++
++    uint64_t key = 0;
++    key |= field(priority, kOpaquePriorityBits, kOpaquePriorityShift);
++    key |= field(pipelineKey, kOpaquePipelineKeyBits, kOpaquePipelineKeyShift);
++    key |= field(materialKey, kOpaqueMaterialKeyBits, kOpaqueMaterialKeyShift);
++    key |= field(invertedDepth, kOpaqueDepthBits, kOpaqueDepthShift);
++    key |= field(tieBreak, kOpaqueTieBreakBits, kOpaqueTieBreakShift);
++    return key;
++}
++
++uint64_t encodeBlend(uint8_t priority, float ndcDepth, uint32_t tieBreak) {
++    // NOT inverted: ascending key order is INcreasing depth
++    // (farthest/lowest-reversed-Z first) -- strict back-to-front, D14.
++    const uint32_t depth = depthBucketBits(ndcDepth, kBlendDepthBits);
++
++    uint64_t key = 0;
++    key |= field(priority, kBlendPriorityBits, kBlendPriorityShift);
++    // reservedBlendOrder [RC5/#5]: always 0 in Phase 4 -- no write (bits
++    // already zero-initialized); a future per-primitive override lands
++    // here with no ABI break.
++    key |= field(depth, kBlendDepthBits, kBlendDepthShift);
++    key |= field(tieBreak, kBlendTieBreakBits, kBlendTieBreakShift);
++    return key;
++}
++
++uint64_t encodeShadow(uint16_t pipelineKey, uint16_t meshKey, uint32_t tieBreak) {
++    uint64_t key = 0;
++    key |= field(pipelineKey, kShadowPipelineKeyBits, kShadowPipelineKeyShift);
++    key |= field(meshKey, kShadowMeshKeyBits, kShadowMeshKeyShift);
++    key |= field(tieBreak, kShadowTieBreakBits, kShadowTieBreakShift);
++    return key;
++}
++
++DecodedOpaque decodeOpaque(uint64_t key) {
++    DecodedOpaque d;
++    d.tieBreak = static_cast<uint32_t>(extract(key, kOpaqueTieBreakBits, kOpaqueTieBreakShift));
++    d.invertedDepthBucket = static_cast<uint32_t>(extract(key, kOpaqueDepthBits, kOpaqueDepthShift));
++    d.materialKey = static_cast<uint16_t>(extract(key, kOpaqueMaterialKeyBits, kOpaqueMaterialKeyShift));
++    d.pipelineKey = static_cast<uint16_t>(extract(key, kOpaquePipelineKeyBits, kOpaquePipelineKeyShift));
++    d.priority = static_cast<uint8_t>(extract(key, kOpaquePriorityBits, kOpaquePriorityShift));
++    return d;
++}
++
++DecodedBlend decodeBlend(uint64_t key) {
++    DecodedBlend d;
++    d.tieBreak = static_cast<uint32_t>(extract(key, kBlendTieBreakBits, kBlendTieBreakShift));
++    d.depthBucket = static_cast<uint32_t>(extract(key, kBlendDepthBits, kBlendDepthShift));
++    d.reservedBlendOrder = static_cast<uint32_t>(extract(key, kBlendReservedBlendOrderBits, kBlendReservedBlendOrderShift));
++    d.priority = static_cast<uint8_t>(extract(key, kBlendPriorityBits, kBlendPriorityShift));
++    return d;
++}
++
++DecodedShadow decodeShadow(uint64_t key) {
++    DecodedShadow d;
++    d.tieBreak = static_cast<uint32_t>(extract(key, kShadowTieBreakBits, kShadowTieBreakShift));
++    d.meshKey = static_cast<uint16_t>(extract(key, kShadowMeshKeyBits, kShadowMeshKeyShift));
++    d.pipelineKey = static_cast<uint16_t>(extract(key, kShadowPipelineKeyBits, kShadowPipelineKeyShift));
++    return d;
++}
++
++}  // namespace sortkey
++
++namespace {
++
++// ---------------------------------------------------------------------
++// Small, free helpers -- pure functions, no DrawListBuilder state.
++// ---------------------------------------------------------------------
++
++// p-vertex (positive-vertex) AABB-vs-frustum test [Real-Time Rendering,
++// 4th ed.]: for each plane, the AABB corner most aligned with the plane's
++// own normal sign per axis is the corner LEAST likely to be rejected; if
++// even THAT corner is outside, the whole box is outside. One dot product
++// per plane instead of testing all 8 corners. `box.isValid() == false`
++// (a never-expanded AABB, e.g. a renderable whose mesh resolved to the D24
++// fallback's empty submesh list) is treated as never-visible -- nothing to
++// draw regardless, and there is no sensible corner to test.
++bool aabbOutsidePlane(const asset::AABB& box, const glm::vec4& plane) {
++    const glm::vec3 p(plane.x >= 0.0F ? box.max.x : box.min.x, plane.y >= 0.0F ? box.max.y : box.min.y,
++                       plane.z >= 0.0F ? box.max.z : box.min.z);
++    return (plane.x * p.x + plane.y * p.y + plane.z * p.z + plane.w) < 0.0F;
++}
++
++bool aabbVisible(const asset::AABB& box, const FrustumPlanes& planes) {
++    if (!box.isValid()) {
++        return false;
++    }
++    for (const glm::vec4& plane : planes) {
++        if (aabbOutsidePlane(box, plane)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++// Standard AABB-vs-AABB overlap test. `orthoBox.max.z == +infinity`
++// (buildShadow()'s own conservative extrusion -- see that method's
++// comment for the full worked-example derivation) makes the
++// Z-upper-bound half of the test trivially true, so a caster arbitrarily
++// far upstream of the light's own travel direction is never excluded on
++// that account -- without any special-casing here.
++bool aabbOverlaps(const asset::AABB& a, const asset::AABB& b) {
++    if (!a.isValid() || !b.isValid()) {
++        return false;
++    }
++    return a.min.x <= b.max.x && a.max.x >= b.min.x && a.min.y <= b.max.y && a.max.y >= b.min.y && a.min.z <= b.max.z &&
++           a.max.z >= b.min.z;
++}
++
++float computeNdcDepth(const glm::mat4& viewProj, const glm::vec3& worldPos) {
++    const glm::vec4 clip = viewProj * glm::vec4(worldPos, 1.0F);
++    if (clip.w <= 1e-6F) {
++        // Defensive only: nothing that survived frustum culling should
++        // reach here with a non-positive clip.w. Treat as "nearest"
++        // (depth 1.0 under reversed-Z) rather than dividing by a
++        // near-zero/negative denominator.
++        return 1.0F;
++    }
++    return std::clamp(clip.z / clip.w, 0.0F, 1.0F);
++}
++
++// An arbitrary, consistent orthonormal basis with `forward` as its Z axis
++// -- used only to fit/extrude the shadow ortho box (buildShadow()), never
++// to bind a real GPU shadow-pass projection (Task 22's own scope). `eye`
++// is irrelevant for a DIRECTIONAL light (only orientation matters), so the
++// origin is used; the up-hint falls back to +Z when `forward` is
++// near-parallel to the default +Y up axis, avoiding glm::lookAt()'s own
++// degenerate (cross-product-near-zero) case.
++glm::mat4 lightSpaceView(const glm::vec3& lightDir) {
++    const glm::vec3 forward = glm::normalize(lightDir);
++    glm::vec3 upHint(0.0F, 1.0F, 0.0F);
++    if (std::abs(glm::dot(forward, upHint)) > 0.99F) {
++        upHint = glm::vec3(0.0F, 0.0F, 1.0F);
++    }
++    return glm::lookAt(glm::vec3(0.0F), forward, upHint);
++}
++
++asset::AABB unionOfBounds(std::span<const asset::AABB> allBounds, std::span<const uint32_t> indices) {
++    asset::AABB result;
++    for (uint32_t idx : indices) {
++        result = asset::AABB::unionOf(result, allBounds[idx]);
++    }
++    return result;
++}
++
++// Tracks contiguous [firstCommand, firstCommand+commandCount) runs of a
++// single blockId as commands are appended in final sorted order, emitting
++// one `BlockRange` each time the block changes (or emit()/emitShadow()
++// explicitly close the run at partition end) -- see BlockRange's own
++// header comment for why this invariant matters (GeometryPool::bind()'s
++// one-block-per-MDI-submission contract).
++class BlockRunTracker {
++public:
++    explicit BlockRunTracker(std::vector<BlockRange>& blocks) : blocks_(blocks) {}
++
++    void note(uint32_t blockId, uint32_t commandIndex) {
++        if (have_ && blockId == currentBlockId_) {
++            return;
++        }
++        close(commandIndex);
++        currentBlockId_ = blockId;
++        currentFirst_ = commandIndex;
++        have_ = true;
++    }
++
++    void close(uint32_t endExclusiveCommandIndex) {
++        if (have_) {
++            blocks_.push_back(BlockRange{currentBlockId_, currentFirst_, endExclusiveCommandIndex - currentFirst_});
++        }
++        have_ = false;
++    }
++
++private:
++    std::vector<BlockRange>& blocks_;
++    uint32_t currentBlockId_ = 0;
++    uint32_t currentFirst_ = 0;
++    bool have_ = false;
++};
++
++}  // namespace
++
++// ---------------------------------------------------------------------
++// DrawListBuilder::Impl -- reused private scratch storage [zero-alloc].
++// ---------------------------------------------------------------------
++
++struct DrawListBuilder::Impl {
++    MeshSubmeshesFn meshSubmeshes;
++    MaterialResolveFn materialResolve;
++
++    enum class CullReason : uint8_t { Dead, Layer, Frustum, Visible };
++
++    // One row per SCENE SLOT (dead slots included -- see this class's own
++    // aliveSpan()/generationsSpan() comment on scene.h) -- reused, resized
++    // (never reassigned) every call; only grows on a new peak slot count.
++    std::vector<CullReason> cullReasons;
++    std::vector<uint32_t> visibleIndices;        // build()'s visible set, or buildShadow()'s caster set
++    std::vector<uint32_t> cameraVisibleIndices;  // buildShadow()'s own camera-visible-bounds sub-step
++
++    // Pre-sort per-submesh draw record, expanded from `visibleIndices` --
++    // one entry per (visible renderable, submesh) pair.
++    struct PendingRecord {
++        uint32_t indexCount = 0;
++        uint32_t firstIndex = 0;
++        int32_t vertexOffset = 0;
++        uint32_t blockId = 0;
++        uint32_t materialIndex = 0;
++        uint32_t instanceDataIndex = 0;
++        uint16_t pipelineKey = 0;
++        uint16_t meshKey = 0;
++        uint8_t priority = 0;
++        bool isBlend = false;
++        float ndcDepth = 0.0F;
++        uint32_t tieBreak = 0;
++        uint64_t sortKey = 0;
++    };
++    std::vector<PendingRecord> pending;
++    std::vector<PendingRecord> opaqueRecords;
++    std::vector<PendingRecord> blendRecords;
++
++    // One instancing-collapsed [D26.3] opaque draw, formed from a
++    // contiguous identity-run of `opaqueRecords` (see collapseAndSortOpaque()
++    // below) -- `[firstMember, firstMember+memberCount)` indexes directly
++    // into `opaqueRecords`, whose relative order within that range is FIXED
++    // once the identity sort runs and never touched again (only the GROUPS
++    // themselves are re-sorted afterward, by depth/pipeline/material).
++    struct CollapsedGroup {
++        uint32_t indexCount = 0;
++        uint32_t firstIndex = 0;
++        int32_t vertexOffset = 0;
++        uint32_t blockId = 0;
++        uint8_t priority = 0;
++        uint16_t pipelineKey = 0;
++        uint32_t materialIndex = 0;
++        float representativeDepth = 0.0F;  // the NEAREST member's NDC depth -- this run's own best early-Z position
++        uint32_t tieBreak = 0;             // the smallest member tieBreak -- deterministic regardless of std::sort internals
++        uint32_t firstMember = 0;
++        uint32_t memberCount = 0;
++        uint64_t sortKey = 0;
++    };
++    std::vector<CollapsedGroup> opaqueGroups;
++
++    static bool sameDrawIdentity(const PendingRecord& a, const PendingRecord& b) {
++        // The REAL (pipeline, material, mesh range, block) identity check
++        // D26.3 requires for collapse -- deliberately independent of the
++        // sort key's own (hashed/truncated) pipelineKey/materialKey fields,
++        // which exist only to influence the FINAL depth-ordering, never to
++        // decide collapse eligibility (a hash collision there can only ever
++        // cost a slightly coarser sort grouping, never a correctness bug).
++        // `priority` is checked separately by collapseAndSortOpaque()'s own
++        // run-detection loop, not folded in here, so this function stays a
++        // pure statement of "these two draws are GPU-identical."
++        return a.blockId == b.blockId && a.indexCount == b.indexCount && a.firstIndex == b.firstIndex &&
++               a.vertexOffset == b.vertexOffset && a.materialIndex == b.materialIndex;
++    }
++
++    // Frustum + camera cullMask culling [D15] -- the parallel AABB-batch
++    // pass (gate ruling: fixed index-range chunks; the DETERMINISTIC
++    // mechanism here is simpler than "concatenate chunk outputs in
++    // chunk-index order" while giving the identical guarantee -- see this
++    // method's own comment below).
++    void cullView(const Scene& scene, const Camera& camera, task::Scheduler& scheduler,
++                  std::vector<uint32_t>& outVisibleIndices, CullCounters& counters) {
++        RX_ZONE_NAMED("DrawListBuilder::cullView");
++        const std::span<const uint8_t> alive = scene.aliveSpan();
++        const std::span<const asset::AABB> bounds = scene.worldBoundsSpan();
++        const std::span<const uint32_t> layers = scene.layersSpan();
++        const uint32_t n = static_cast<uint32_t>(alive.size());
++
++        // Reused (never reassigned) -- resize() only allocates when `n`
++        // exceeds this vector's current capacity (a new peak), matching the
++        // zero-alloc-in-steady-state policy every reused buffer in this
++        // class follows.
++        cullReasons.assign(n, CullReason::Dead);
++
++        const FrustumPlanes planes = camera.cullingFrustumPlanes();
++        const uint32_t cullMask = camera.cullMask;
++
++        if (n > 0) {
++            // DETERMINISM [gate ruling #6]: the ruling's own named
++            // mechanism is "fixed index-range chunks, cull into per-chunk
++            // buffers, concatenate in chunk-index order." This pass
++            // achieves the SAME guarantee (byte-identical output regardless
++            // of --threads) via an even simpler construction: each index's
++            // written CullReason depends ONLY on that index's own data
++            // (embarrassingly parallel, no shared mutable ordering state
++            // written here), and the SERIAL compaction pass below always
++            // scans slot-index order 0..n-1 -- a fixed, thread-count-
++            // independent order by construction, with no chunk-boundary
++            // bookkeeping to get wrong.
++            scheduler.parallelFor(n, /*grainSize=*/512, [&](uint32_t begin, uint32_t end, uint32_t) {
++                for (uint32_t i = begin; i < end; ++i) {
++                    if (alive[i] == 0) {
++                        cullReasons[i] = CullReason::Dead;
++                        continue;
++                    }
++                    if ((layers[i] & cullMask) == 0) {
++                        cullReasons[i] = CullReason::Layer;
++                        continue;
++                    }
++                    cullReasons[i] = aabbVisible(bounds[i], planes) ? CullReason::Visible : CullReason::Frustum;
++                }
++            });
++        }
++
++        outVisibleIndices.clear();
++        counters = CullCounters{};
++        for (uint32_t i = 0; i < n; ++i) {
++            switch (cullReasons[i]) {
++                case CullReason::Dead:
++                    break;
++                case CullReason::Layer:
++                    ++counters.totalCandidates;
++                    ++counters.culledByLayerMask;
++                    break;
++                case CullReason::Frustum:
++                    ++counters.totalCandidates;
++                    ++counters.culledByFrustum;
++                    break;
++                case CullReason::Visible:
++                    ++counters.totalCandidates;
++                    ++counters.visible;
++                    outVisibleIndices.push_back(i);
++                    break;
++            }
++        }
++    }
++
++    // Shadow-caster eligibility + extruded-ortho-box culling [D15/RC5].
++    // `orthoBoxExtruded` is already light-space with its near (Z-minus)
++    // side unbounded -- see buildShadow()'s own comment for the derivation.
++    void cullShadowCasters(const Scene& scene, const asset::AABB& orthoBoxExtruded, uint8_t lightChannels,
++                            const glm::mat4& lightView, task::Scheduler& scheduler, std::vector<uint32_t>& outVisibleIndices,
++                            CullCounters& counters) {
++        RX_ZONE_NAMED("DrawListBuilder::cullShadowCasters");
++        const std::span<const uint8_t> alive = scene.aliveSpan();
++        const std::span<const asset::AABB> bounds = scene.worldBoundsSpan();
++        const std::span<const uint8_t> channels = scene.channelsSpan();
++        const std::span<const uint8_t> castsShadows = scene.castsShadowsSpan();
++        const uint32_t n = static_cast<uint32_t>(alive.size());
++
++        cullReasons.assign(n, CullReason::Dead);
++
++        if (n > 0) {
++            scheduler.parallelFor(n, /*grainSize=*/512, [&](uint32_t begin, uint32_t end, uint32_t) {
++                for (uint32_t i = begin; i < end; ++i) {
++                    if (alive[i] == 0) {
++                        cullReasons[i] = CullReason::Dead;
++                        continue;
++                    }
++                    // "Layer" reused as "caster-eligibility failed" [RC5
++                    // coupled model: castsShadows opt-out (RC5's NEW field)
++                    // OR a channel mismatch excludes a renderable from THIS
++                    // light's caster list entirely -- same AND-test shape
++                    // as camera cullMask, just against light channels].
++                    if (castsShadows[i] == 0 || (channels[i] & lightChannels) == 0) {
++                        cullReasons[i] = CullReason::Layer;
++                        continue;
++                    }
++                    const asset::AABB lightSpaceBox = bounds[i].transformed(lightView);
++                    cullReasons[i] = aabbOverlaps(lightSpaceBox, orthoBoxExtruded) ? CullReason::Visible : CullReason::Frustum;
++                }
++            });
++        }
++
++        outVisibleIndices.clear();
++        counters = CullCounters{};
++        for (uint32_t i = 0; i < n; ++i) {
++            switch (cullReasons[i]) {
++                case CullReason::Dead:
++                    break;
++                case CullReason::Layer:
++                    ++counters.totalCandidates;
++                    ++counters.culledByLayerMask;
++                    break;
++                case CullReason::Frustum:
++                    ++counters.totalCandidates;
++                    ++counters.culledByFrustum;
++                    break;
++                case CullReason::Visible:
++                    ++counters.totalCandidates;
++                    ++counters.visible;
++                    outVisibleIndices.push_back(i);
++                    break;
++            }
++        }
++    }
++
++    // Serial (main-thread) expansion of `indices` into per-submesh draw
++    // records -- see draw_list.h's own class comment for why this stage is
++    // not itself parallelized (variable-length-per-object work, and it
++    // touches `scene`/the injected resolvers, which are not asserted safe
++    // for concurrent worker access the way the immutable snapshot spans
++    // cullView()/cullShadowCasters() use are).
++    void generateRecords(const Scene& scene, const Camera& camera, std::span<const uint32_t> indices,
++                          std::vector<PendingRecord>& outPending) {
++        RX_ZONE_NAMED("DrawListBuilder::generateRecords");
++        outPending.clear();
++        const std::span<const asset::AABB> bounds = scene.worldBoundsSpan();
++        const std::span<const asset::MeshHandle> meshes = scene.meshSpan();
++        const std::span<const uint8_t> priorities = scene.prioritySpan();
++        const std::span<const uint32_t> generations = scene.generationsSpan();
++        const glm::mat4 viewProj = camera.viewProj();
++
++        for (uint32_t idx : indices) {
++            const RenderableHandle handle(idx, generations[idx]);
++            const std::span<const asset::Submesh> submeshes = meshSubmeshes(meshes[idx]);
++            if (submeshes.empty()) {
++                continue;  // D24: evicted/empty mesh contributes zero records, never a crash.
++            }
++            const std::span<const std::optional<asset::MaterialHandle>> overrides = scene.submeshMaterialOverrides(handle);
++            const asset::AABB& box = bounds[idx];
++            const glm::vec3 center = box.isValid() ? (box.min + box.max) * 0.5F : glm::vec3(0.0F);
++            const float ndcDepth = computeNdcDepth(viewProj, center);
++            const uint8_t priority = priorities[idx];
++
++            for (size_t s = 0; s < submeshes.size(); ++s) {
++                const asset::Submesh& sub = submeshes[s];
++                asset::MaterialHandle matHandle = sub.material;
++                if (s < overrides.size() && overrides[s].has_value()) {
++                    matHandle = *overrides[s];
++                }
++                const ResolvedMaterial resolved = materialResolve(matHandle);
++
++                PendingRecord rec;
++                rec.indexCount = sub.range.indexCount;
++                rec.firstIndex = sub.range.firstIndex;
++                rec.vertexOffset = sub.range.vertexOffset;
++                rec.blockId = sub.range.blockId;
++                rec.materialIndex = resolved.materialIndex;
++                rec.instanceDataIndex = idx;
++                rec.priority = priority;
++                rec.isBlend = (resolved.alphaMode == asset::AlphaMode::Blend);
++                rec.pipelineKey = sortkey::pipelineKeyOf(resolved.disposition, resolved.alphaMode, resolved.doubleSided);
++                rec.meshKey = sortkey::meshKeyOf(rec.firstIndex, rec.vertexOffset);
++                rec.ndcDepth = ndcDepth;
++                rec.tieBreak = idx;
++                outPending.push_back(rec);
++            }
++        }
++    }
++
++    // Splits `pending` into opaque(+MASK)/blend, then applies each
++    // partition's own discipline: opaque COLLAPSES first (D26.3), then
++    // sorts the resulting groups by the perceptual D14 key; blend is never
++    // collapsed and sorts directly by (blockId, encodeBlend(...)) -- see
++    // draw_list.h's own "COLLAPSE BEFORE SORT" comment for why these are
++    // NOT the same two-step shape.
++    void partitionAndSort() {
++        RX_ZONE_NAMED("DrawListBuilder::partitionAndSort");
++        opaqueRecords.clear();
++        blendRecords.clear();
++        for (const PendingRecord& rec : pending) {
++            (rec.isBlend ? blendRecords : opaqueRecords).push_back(rec);
++        }
++
++        collapseAndSortOpaque();
++
++        for (PendingRecord& rec : blendRecords) {
++            rec.sortKey = sortkey::encodeBlend(rec.priority, rec.ndcDepth, rec.tieBreak);
++        }
++        std::sort(blendRecords.begin(), blendRecords.end(), [](const PendingRecord& a, const PendingRecord& b) {
++            if (a.blockId != b.blockId) {
++                return a.blockId < b.blockId;
++            }
++            return a.sortKey < b.sortKey;
++        });
++    }
++
++    // [D26.3] Phase 1: sort `opaqueRecords` by exact draw IDENTITY (blockId,
++    // indexCount, firstIndex, vertexOffset, materialIndex, priority -- NEVER
++    // by depth) so every collapse-eligible run becomes contiguous
++    // regardless of the instances' individual depths (a scattered
++    // "identical-mesh forest" scene collapses into ONE instanced draw even
++    // though its members are at wildly different depths) -- the final
++    // `tieBreak` tier makes the WITHIN-group member order deterministic
++    // too, regardless of std::sort's own internals. Phase 2: fold each
++    // identity-run into one CollapsedGroup (representative depth = the
++    // NEAREST member), then sort the resulting, far-fewer, groups by
++    // (blockId, encodeOpaque(priority, pipeline, material, depth,
++    // tieBreak)) -- D14's own front-to-back contract, now applied to
++    // whole draws instead of individual records.
++    void collapseAndSortOpaque() {
++        std::sort(opaqueRecords.begin(), opaqueRecords.end(), [](const PendingRecord& a, const PendingRecord& b) {
++            if (a.blockId != b.blockId) {
++                return a.blockId < b.blockId;
++            }
++            if (a.indexCount != b.indexCount) {
++                return a.indexCount < b.indexCount;
++            }
++            if (a.firstIndex != b.firstIndex) {
++                return a.firstIndex < b.firstIndex;
++            }
++            if (a.vertexOffset != b.vertexOffset) {
++                return a.vertexOffset < b.vertexOffset;
++            }
++            if (a.materialIndex != b.materialIndex) {
++                return a.materialIndex < b.materialIndex;
++            }
++            if (a.priority != b.priority) {
++                return a.priority < b.priority;
++            }
++            return a.tieBreak < b.tieBreak;
++        });
++
++        opaqueGroups.clear();
++        size_t i = 0;
++        while (i < opaqueRecords.size()) {
++            size_t j = i + 1;
++            while (j < opaqueRecords.size() && sameDrawIdentity(opaqueRecords[i], opaqueRecords[j]) &&
++                   opaqueRecords[i].priority == opaqueRecords[j].priority) {
++                ++j;
++            }
++
++            CollapsedGroup group;
++            group.indexCount = opaqueRecords[i].indexCount;
++            group.firstIndex = opaqueRecords[i].firstIndex;
++            group.vertexOffset = opaqueRecords[i].vertexOffset;
++            group.blockId = opaqueRecords[i].blockId;
++            group.priority = opaqueRecords[i].priority;
++            group.pipelineKey = opaqueRecords[i].pipelineKey;
++            group.materialIndex = opaqueRecords[i].materialIndex;
++            group.firstMember = static_cast<uint32_t>(i);
++            group.memberCount = static_cast<uint32_t>(j - i);
++            float nearest = opaqueRecords[i].ndcDepth;
++            uint32_t minTieBreak = opaqueRecords[i].tieBreak;
++            for (size_t k = i; k < j; ++k) {
++                nearest = std::max(nearest, opaqueRecords[k].ndcDepth);
++                minTieBreak = std::min(minTieBreak, opaqueRecords[k].tieBreak);
++            }
++            group.representativeDepth = nearest;
++            group.tieBreak = minTieBreak;
++            opaqueGroups.push_back(group);
++            i = j;
++        }
++
++        const uint32_t materialKeyMask = static_cast<uint32_t>((uint64_t{1} << sortkey::kOpaqueMaterialKeyBits) - 1);
++        for (CollapsedGroup& g : opaqueGroups) {
++            const uint16_t materialKey = static_cast<uint16_t>(g.materialIndex & materialKeyMask);
++            g.sortKey = sortkey::encodeOpaque(g.priority, g.pipelineKey, materialKey, g.representativeDepth, g.tieBreak);
++        }
++        std::sort(opaqueGroups.begin(), opaqueGroups.end(), [](const CollapsedGroup& a, const CollapsedGroup& b) {
++            if (a.blockId != b.blockId) {
++                return a.blockId < b.blockId;
++            }
++            return a.sortKey < b.sortKey;
++        });
++    }
++
++    // Emits `out.commands`/`out.payloads`/`out.blocks` from the already
++    // sorted opaque groups + blend records: opaque groups already carry
++    // their collapsed instanceCount ([D26.3]; one payload entry per member,
++    // in the member order collapseAndSortOpaque()'s identity sort fixed --
++    // keeping commands/payloads in lockstep by construction, since
++    // `firstInstance` is recorded as the payload array's size() at the
++    // exact moment each group's own members are about to be appended).
++    // Blend is never collapsed [D14].
++    void emit(ViewLists& out) {
++        BlockRunTracker tracker(out.blocks);
++
++        for (const CollapsedGroup& g : opaqueGroups) {
++            DrawCommand cmd;
++            cmd.indexCount = g.indexCount;
++            cmd.firstIndex = g.firstIndex;
++            cmd.vertexOffset = g.vertexOffset;
++            cmd.instanceCount = g.memberCount;
++            cmd.firstInstance = static_cast<uint32_t>(out.payloads.size());
++            out.commands.push_back(cmd);
++            tracker.note(g.blockId, static_cast<uint32_t>(out.commands.size() - 1));
++            for (uint32_t k = g.firstMember; k < g.firstMember + g.memberCount; ++k) {
++                out.payloads.push_back(DrawPayload{opaqueRecords[k].materialIndex, opaqueRecords[k].instanceDataIndex});
++            }
++        }
++        tracker.close(static_cast<uint32_t>(out.commands.size()));
++        out.opaqueCommandCount = static_cast<uint32_t>(out.commands.size());
++
++        for (const PendingRecord& rec : blendRecords) {
++            DrawCommand cmd;
++            cmd.indexCount = rec.indexCount;
++            cmd.firstIndex = rec.firstIndex;
++            cmd.vertexOffset = rec.vertexOffset;
++            cmd.instanceCount = 1;
++            cmd.firstInstance = static_cast<uint32_t>(out.payloads.size());
++            out.commands.push_back(cmd);
++            tracker.note(rec.blockId, static_cast<uint32_t>(out.commands.size() - 1));
++            out.payloads.push_back(DrawPayload{rec.materialIndex, rec.instanceDataIndex});
++        }
++        tracker.close(static_cast<uint32_t>(out.commands.size()));
++
++        out.counters.drawsSubmitted = static_cast<uint32_t>(out.commands.size());
++    }
++
++    // Shadow variant: single partition, no collapse [Phase 4 scope -- see
++    // draw_list.h's own ShadowLists comment], sorted by (blockId,
++    // pipeline|meshRange).
++    void emitShadow(ShadowLists& out) {
++        BlockRunTracker tracker(out.blocks);
++        for (const PendingRecord& rec : pending) {
++            DrawCommand cmd;
++            cmd.indexCount = rec.indexCount;
++            cmd.firstIndex = rec.firstIndex;
++            cmd.vertexOffset = rec.vertexOffset;
++            cmd.instanceCount = 1;
++            cmd.firstInstance = static_cast<uint32_t>(out.payloads.size());
++            out.commands.push_back(cmd);
++            tracker.note(rec.blockId, static_cast<uint32_t>(out.commands.size() - 1));
++            out.payloads.push_back(DrawPayload{rec.materialIndex, rec.instanceDataIndex});
++        }
++        tracker.close(static_cast<uint32_t>(out.commands.size()));
++        out.opaqueCommandCount = static_cast<uint32_t>(out.commands.size());
++        out.counters.drawsSubmitted = static_cast<uint32_t>(out.commands.size());
++    }
++};
++
++DrawListBuilder::DrawListBuilder(MeshSubmeshesFn meshSubmeshes, MaterialResolveFn materialResolve)
++    : impl_(std::make_unique<Impl>()) {
++    impl_->meshSubmeshes = std::move(meshSubmeshes);
++    impl_->materialResolve = std::move(materialResolve);
++}
++
++DrawListBuilder::~DrawListBuilder() = default;
++
++void DrawListBuilder::build(const Scene& scene, const Camera& camera, task::Scheduler& scheduler, ViewLists& out) {
++    RX_ZONE;
++    // [Zero-alloc, caller-owned storage -- D26] .clear() retains capacity;
++    // never reassigned/shrink_to_fit'd.
++    out.commands.clear();
++    out.payloads.clear();
++    out.blocks.clear();
++    out.opaqueCommandCount = 0;
++    out.counters = CullCounters{};
++
++    impl_->cullView(scene, camera, scheduler, impl_->visibleIndices, out.counters);
++    impl_->generateRecords(scene, camera, impl_->visibleIndices, impl_->pending);
++    out.counters.recordsIn = static_cast<uint32_t>(impl_->pending.size());
++
++    impl_->partitionAndSort();
++    impl_->emit(out);
++}
++
++void DrawListBuilder::buildShadow(const Scene& scene, LightHandle light, const Camera& camera, task::Scheduler& scheduler,
++                                   ShadowLists& out) {
++    RX_ZONE;
++    out.commands.clear();
++    out.payloads.clear();
++    out.blocks.clear();
++    out.opaqueCommandCount = 0;
++    out.counters = CullCounters{};
++
++    // A dead handle or a light with shadows disabled produces an empty,
++    // well-formed ShadowLists -- a per-frame QUERY, not a mutator, so this
++    // is documented as a defined no-op rather than a throw (draw_list.h's
++    // own buildShadow() comment).
++    if (!scene.isLightAlive(light) || !scene.lightCastsShadows(light)) {
++        return;
++    }
++
++    const glm::vec3 lightDir = scene.lightDirection(light);
++    const uint8_t lightChannels = scene.lightChannels(light);
++    const glm::mat4 lightView = lightSpaceView(lightDir);
++
++    // Step 1: camera-visible bounds -- reuses the exact same cull pass
++    // build() uses (camera cullMask + camera frustum only); its own
++    // per-object COUNTERS are discarded here (buildShadow() reports its own
++    // shadow-shaped counters below, not the camera's).
++    CullCounters cameraCounters;
++    impl_->cullView(scene, camera, scheduler, impl_->cameraVisibleIndices, cameraCounters);
++    const asset::AABB visibleBoundsWorld = unionOfBounds(scene.worldBoundsSpan(), impl_->cameraVisibleIndices);
++    if (!visibleBoundsWorld.isValid()) {
++        return;  // nothing visible from the camera -> nothing to shadow.
++    }
++
++    // Step 2: fit + conservatively extrude the ortho box [D15]. The
++    // cross-section (X/Y in light space) is exactly the camera-visible
++    // bounds' own light-space footprint. For the extrusion axis: in
++    // `lightView` (an eye-at-origin glm::lookAt() basis with `forward =
++    // lightDir`), a world point X's view-space Z is `dot(X, -lightDir)`
++    // (glm::lookAt's own zaxis = -forward) -- i.e. view-Z DEcreases the
++    // further X sits DOWNSTREAM along lightDir (deeper into where the light
++    // is travelling TOWARD). A caster C can shadow a point P (P = C +
++    // t*lightDir, t>=0) iff C sits upstream of SOME point in the visible
++    // box, i.e. iff `C.viewZ >= visBoxLS.min.z` (the box's own most-
++    // downstream extent; NO upper bound -- a caster can be arbitrarily far
++    // upstream/"behind" the light's own path and still cast into the box).
++    // So the extrusion widens `max.z` to +infinity and leaves `min.z` at
++    // the visible bounds' own tight value -- verified against a concrete
++    // overhead-sun worked example (light dir (0,-1,0): a caster ABOVE the
++    // ground, viewZ = world Y directly under that basis, correctly passes
++    // `caster.viewZ >= groundMinViewZ`; a caster BELOW the ground correctly
++    // fails it) before writing this, not asserted from intuition alone.
++    const asset::AABB visBoxLS = visibleBoundsWorld.transformed(lightView);
++    asset::AABB orthoBoxExtruded = visBoxLS;
++    orthoBoxExtruded.max.z = std::numeric_limits<float>::infinity();
++
++    // Step 3: caster candidates.
++    impl_->cullShadowCasters(scene, orthoBoxExtruded, lightChannels, lightView, scheduler, impl_->visibleIndices, out.counters);
++    out.counters.shadowCastersConsidered = out.counters.visible + out.counters.culledByFrustum;
++    out.counters.shadowCastersVisible = out.counters.visible;
++
++    // Step 4: record generation, BLEND excluded [RC3].
++    impl_->generateRecords(scene, camera, impl_->visibleIndices, impl_->pending);
++    size_t writeIdx = 0;
++    for (size_t r = 0; r < impl_->pending.size(); ++r) {
++        if (!impl_->pending[r].isBlend) {
++            impl_->pending[writeIdx++] = impl_->pending[r];
++        }
++    }
++    impl_->pending.resize(writeIdx);
++    out.counters.recordsIn = static_cast<uint32_t>(impl_->pending.size());
++
++    // Step 5: sort -- single partition, (blockId, pipeline|meshRange).
++    {
++        RX_ZONE_NAMED("DrawListBuilder::buildShadow sort");
++        for (Impl::PendingRecord& rec : impl_->pending) {
++            rec.sortKey = sortkey::encodeShadow(rec.pipelineKey, rec.meshKey, rec.tieBreak);
++        }
++        std::sort(impl_->pending.begin(), impl_->pending.end(),
++                  [](const Impl::PendingRecord& a, const Impl::PendingRecord& b) {
++                      if (a.blockId != b.blockId) {
++                          return a.blockId < b.blockId;
++                      }
++                      return a.sortKey < b.sortKey;
++                  });
++    }
++
++    // Step 6: emit, no collapse [Phase 4 scope].
++    impl_->emitShadow(out);
++}
++
++// ---------------------------------------------------------------------
++// recordDrawList [D27].
++// ---------------------------------------------------------------------
++
++std::vector<ResolvedDrawGroup> resolveDrawGroups(const ViewLists& lists, const PipelineResolveFn& resolvePipeline) {
++    RX_ASSERT_MAIN_THREAD("rx::scene::resolveDrawGroups");
++    RX_ZONE;
++    std::vector<ResolvedDrawGroup> groups;
++    const size_t n = lists.commands.size();
++    if (n == 0) {
++        return groups;
++    }
++
++    auto materialOf = [&](size_t commandIndex) -> uint32_t {
++        return lists.payloads[lists.commands[commandIndex].firstInstance].materialIndex;
++    };
++
++    uint32_t groupStart = 0;
++    uint32_t currentMaterial = materialOf(0);
++    uint32_t currentToken = resolvePipeline(currentMaterial);
++    for (size_t i = 1; i <= n; ++i) {
++        const bool atEnd = (i == n);
++        const uint32_t mat = atEnd ? 0 : materialOf(i);
++        if (atEnd || mat != currentMaterial) {
++            groups.push_back(ResolvedDrawGroup{groupStart, static_cast<uint32_t>(i) - groupStart, currentToken});
++            if (!atEnd) {
++                groupStart = static_cast<uint32_t>(i);
++                currentMaterial = mat;
++                currentToken = resolvePipeline(currentMaterial);
++            }
++        }
++    }
++    return groups;
++}
++
++void recordDrawList(const ViewLists& lists, task::Scheduler& scheduler, uint32_t chunkCount,
++                     const PipelineResolveFn& resolvePipeline, const RecordChunkFn& recordChunk) {
++    RX_ZONE;
++    const std::vector<ResolvedDrawGroup> groups = resolveDrawGroups(lists, resolvePipeline);
++    const uint32_t effectiveChunkCount = (chunkCount == 0) ? 1 : chunkCount;
++    scheduler.parallelFor(effectiveChunkCount, /*grainSize=*/1, [&](uint32_t begin, uint32_t end, uint32_t) {
++        for (uint32_t c = begin; c < end; ++c) {
++            recordChunk(c, effectiveChunkCount, groups);
++        }
++    });
++}
++
++namespace detail {
++
++DrawListBuilderCapacitiesForTesting capacitiesForTesting(const DrawListBuilder& builder) {
++    DrawListBuilderCapacitiesForTesting result;
++    result.cullReasons = builder.impl_->cullReasons.capacity();
++    result.visibleIndices = builder.impl_->visibleIndices.capacity();
++    result.cameraVisibleIndices = builder.impl_->cameraVisibleIndices.capacity();
++    result.pending = builder.impl_->pending.capacity();
++    result.opaqueRecords = builder.impl_->opaqueRecords.capacity();
++    result.blendRecords = builder.impl_->blendRecords.capacity();
++    result.opaqueGroups = builder.impl_->opaqueGroups.capacity();
++    return result;
++}
++
++}  // namespace detail
++
++}  // namespace rx::scene
+diff --git a/src/rx_scene/include/rx_scene/draw_list.h b/src/rx_scene/include/rx_scene/draw_list.h
+new file mode 100644
+index 0000000..4c5798a
+--- /dev/null
++++ b/src/rx_scene/include/rx_scene/draw_list.h
+@@ -0,0 +1,576 @@
++#pragma once
++
++// rx_scene/draw_list.h -- rx::scene::DrawListBuilder: parallel frustum +
++// shadow-caster culling and u64 sort-key draw-list construction [spec
++// D14/D15/D24/D26/D27; Phase 4 Stage 2 Task 19; gate
++// matrix-issue06-drawlists-culling.md + matrix-issue07-layer-masks.md as
++// amended by gate/rulings-2026-08-18.md's #6/#7 sections + RC3/RC5]. Entirely
++// device-free: no VkDevice, no rx_rhi_vk -- like rx_scene's own
++// Scene/Camera, every algorithm here is plain CPU-side math + std::sort over
++// `rx::task::Scheduler`-parallelized culling. Mesh/material CONTENT is never
++// touched directly: `MeshSubmeshesFn`/`MaterialResolveFn` are the SAME kind
++// of injected-callback seam Task 18's `MeshBoundsFn` established (see
++// scene.h's own "MESH BOUNDS RESOLUTION" comment) -- production callers bind
++// `meshSubmeshesFromRegistry()`/`materialResolveFromRegistry()` below (both
++// one-line forwards inheriting `asset::Registry::mesh()`/`material()`'s own
++// D24 residency-tolerant contract with zero duplicated logic); this
++// library's own tests bind trivial in-test callables instead.
++//
++// Thread-affinity (D5): `DrawListBuilder::build()`/`buildShadow()` are
++// MAIN-THREAD-ONLY (they read `Scene`'s own main-thread-only accessors, and
++// mutate this builder's private reused scratch storage with no internal
++// synchronization) -- the PARALLEL portion (AABB-vs-frustum culling) fans
++// out via `scheduler.parallelFor()` over data already snapshotted from
++// `Scene` on the calling thread before fan-out, so worker chunks never call
++// a `Scene`/`MaterialResolveFn`/`MeshSubmeshesFn` accessor themselves, only
++// index into already-captured spans -- see this header's own "D27" section
++// below for the analogous, EXPLICIT guard covering `recordDrawList()`'s own
++// pre-resolution step.
++//
++// ZERO-ALLOC, CALLER-OWNED STORAGE [D26 amendment]: `ViewLists`/`ShadowLists`
++// are caller-owned -- `build()`/`buildShadow()` `.clear()` (never
++// reassign/`shrink_to_fit`) their vectors and write into them, so repeated
++// calls against a STEADY scene (same or fewer visible objects than any
++// prior call) perform zero net heap allocations after a warm-up call
++// establishes peak capacity -- see draw_list_test.cpp's own
++// capacity-snapshot test. `DrawListBuilder` itself owns identically-reused
++// private scratch buffers (cull reasons, visible-index list, pending
++// records) for the exact same reason -- these are per-BUILDER, not
++// per-ViewLists, state.
++
++#include <rx_asset/mesh_asset.h>
++#include <rx_scene/camera.h>
++#include <rx_scene/scene.h>
++#include <rx_task/scheduler.h>
++
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <span>
++#include <vector>
++
++namespace rx::asset {
++class Registry;
++}  // namespace rx::asset
++
++namespace rx::scene {
++
++// ---------------------------------------------------------------------
++// D26.2: SoA, VkDrawIndexedIndirectCommand-compatible command array (a
++// packed upload target, not an AoS record struct) + a parallel per-draw
++// payload array. Field names/order/types match Vulkan's own
++// VkDrawIndexedIndirectCommand exactly (vulkan_core.h: `{uint32_t
++// indexCount; uint32_t instanceCount; uint32_t firstIndex; int32_t
++// vertexOffset; uint32_t firstInstance;}`) -- draw_list_test.cpp's own
++// static_assert(sizeof(DrawCommand) == sizeof(VkDrawIndexedIndirectCommand))
++// plus a reinterpret-cast upload test proves this is a real, exercised
++// invariant, not merely structural coincidence (that test lives in the
++// TEST binary, not this header, so this device-free library never itself
++// names a Vulkan type -- see this header's own top comment).
++// ---------------------------------------------------------------------
++struct DrawCommand {
++    uint32_t indexCount = 0;
++    uint32_t instanceCount = 0;
++    uint32_t firstIndex = 0;
++    int32_t vertexOffset = 0;
++    uint32_t firstInstance = 0;
++
++    bool operator==(const DrawCommand&) const = default;
++};
++
++// [D26.1] Per-draw payload, indexed by `firstInstance + gl_InstanceIndex`
++// (Slang/`SV_VulkanInstanceID` specifics are Task 16's own concern; this
++// struct only defines the CPU-side shape) -- `materialIndex` is resolved
++// from `asset::MaterialHandle` via `MaterialResolveFn` (D24
++// residency-tolerant: a nonresident handle resolves through the SAME
++// fallback-substitution `asset::Registry::material()` already performs, see
++// `materialResolveFromRegistry()` below), `instanceDataIndex` is the
++// renderable's own `Scene` SLOT INDEX -- directly usable to index
++// `Scene::transformsSpan()`/a future per-instance transform buffer built in
++// the same index space, with zero extra bookkeeping on this class's part.
++struct DrawPayload {
++    uint32_t materialIndex = 0;
++    uint32_t instanceDataIndex = 0;
++
++    bool operator==(const DrawPayload&) const = default;
++};
++
++// [D26.2] One contiguous run of `ViewLists::commands` sharing the same
++// GeometryPool `blockId` -- the recorded per-block indirect submission
++// bound (one future MDI call per block; `GeometryPool::bind()`'s own
++// contract requires every draw between two `bind()` calls to share one
++// block, so this contiguity is a REAL correctness requirement of the
++// eventual GPU-driven submission, not a diagnostic nicety). `blockId` is
++// the OUTERMOST sort tier `build()`/`buildShadow()` apply (see this
++// header's own "SORT KEY" section below for why) specifically so this
++// invariant holds by construction -- draw_list_test.cpp asserts it directly
++// for a synthetic multi-block scene.
++struct BlockRange {
++    uint32_t blockId = 0;
++    uint32_t firstCommand = 0;
++    uint32_t commandCount = 0;
++
++    bool operator==(const BlockRange&) const = default;
++};
++
++// [D18/matrix-issue06 "Exact counter definitions" row, gate ruling #6]
++// Exact, CI-gateable per-`build()`/`buildShadow()` call counters -- every
++// field below is unambiguous enough for a unit test to assert an EXACT
++// integer, never a range. ONE shared struct serves both `ViewLists` (view
++// culling: every field except `shadowCasters*` is populated,
++// `shadowCastersConsidered`/`shadowCastersVisible` stay 0) and
++// `ShadowLists` (shadow culling: every field is populated using the
++// shadow-appropriate mapping documented on `DrawListBuilder::buildShadow()`
++// below -- `culledByLayerMask`/`culledByFrustum` are reused, DOCUMENTED as
++// "excluded by the caster-eligibility test (castsShadows/channel coupling,
++// RC5)"/"excluded by the light's extruded ortho frustum" respectively,
++// rather than inventing a second, parallel counter struct for a
++// single-partition variant of the exact same culling shape).
++struct CullCounters {
++    uint32_t totalCandidates = 0;    // alive renderables considered, before any filter
++    uint32_t culledByLayerMask = 0;  // view: camera cullMask AND-test failed. shadow: caster-eligibility test failed (castsShadows==false or channel mismatch, RC5)
++    uint32_t culledByFrustum = 0;    // view: AABB-vs-camera-frustum failed. shadow: AABB-vs-light's-extruded-ortho-box failed
++    uint32_t visible = 0;            // totalCandidates - culledByLayerMask - culledByFrustum
++    uint32_t recordsIn = 0;          // draw records generated from `visible`, pre-collapse (one per submesh-instance pairing)
++    uint32_t drawsSubmitted = 0;     // post-D26.3-collapse DrawCommand count (== ViewLists::commands.size())
++    uint32_t shadowCastersConsidered = 0;  // shadow-eligible candidates (== visible + culledByFrustum, shadow build only)
++    uint32_t shadowCastersVisible = 0;     // == visible, shadow build only (mirrored here per the gate's named-field requirement)
++
++    bool operator==(const CullCounters&) const = default;
++};
++
++// [D26.2/D26.3] The sorted, (optionally) instancing-collapsed draw list for
++// one view (camera). `commands`/`payloads` are ALWAYS kept in lockstep
++// (D26.3's own binding lockstep criterion -- see draw_list.cpp's collapse
++// pass): `commands[k].firstInstance` is the index into `payloads` where
++// that command's `[firstInstance, firstInstance+instanceCount)` contiguous
++// instance-payload range begins. Two partitions, concatenated:
++// `[0, opaqueCommandCount)` is the OPAQUE+MASK partition (sorted
++// front-to-back, instancing-collapsed); `[opaqueCommandCount,
++// commands.size())` is the BLEND partition (sorted strictly
++// back-to-front, NEVER collapsed -- D14). `blocks` groups `commands`
++// contiguously by `blockId`, scoped per (block-run-within-a-partition) --
++// see `BlockRange`'s own comment for why the SAME blockId can legitimately
++// appear as two separate entries when both partitions use it (they are, by
++// construction, two independent MDI submissions regardless).
++struct ViewLists {
++    std::vector<DrawCommand> commands;
++    std::vector<DrawPayload> payloads;
++    std::vector<BlockRange> blocks;
++    uint32_t opaqueCommandCount = 0;
++    CullCounters counters;
++};
++
++// [gate ruling #6, "ShadowLists' concrete field layout"] Same shape as
++// `ViewLists` -- a single partition (`opaqueCommandCount == commands.size()`
++// always; BLEND-partition casters are EXCLUDED per RC3), sorted
++// (blockId-outer, then pipeline|mesh-range), never instancing-collapsed
++// (Phase 4 scope: not required by the gate criteria; a documented,
++// non-required optimization for a later task).
++using ShadowLists = ViewLists;
++
++// ---------------------------------------------------------------------
++// Injected resolution seams [mirrors Scene's own MeshBoundsFn precedent --
++// see this header's own top comment]. Both are residency-tolerant BY
++// CONSTRUCTION when bound to their `xFromRegistry()` production adapter:
++// `asset::Registry::mesh()`/`material()` already substitute the D11
++// fallback asset for a dead/nonresident handle, and these adapters forward
++// to them verbatim with zero additional logic -- exactly
++// `meshBoundsFromRegistry()`'s own documented contract (scene.h).
++// ---------------------------------------------------------------------
++
++// A mesh's submesh list (geometry range + default material per submesh) --
++// `std::span<const asset::Submesh>`, so the production adapter below
++// returns `asset::Registry`'s own storage directly (zero copy, zero
++// allocation): `asset::MeshAsset::submeshes` IS the exact shape this needs.
++using MeshSubmeshesFn = std::function<std::span<const asset::Submesh>(asset::MeshHandle)>;
++
++// Production adapter: binds a live `asset::Registry&` (must outlive every
++// call through the returned callable, same by-reference lifetime discipline
++// as `meshBoundsFromRegistry()`). Forwards to `registry.mesh(handle).submeshes`
++// -- inherits `Registry::mesh()`'s D24 residency-tolerant contract verbatim
++// (a dead/evicted handle resolves to the D11 fallback mesh's EMPTY submesh
++// list -- see `rx_asset/fallbacks.cpp`'s `makeFallbackMeshAsset()` -- so a
++// renderable referencing an evicted mesh contributes zero draw records,
++// never a crash). Defined in draw_list.cpp (the one translation unit that
++// includes the real, heavier-weight `<rx_asset/registry.h>`).
++[[nodiscard]] MeshSubmeshesFn meshSubmeshesFromRegistry(const asset::Registry& registry);
++
++// One material's pipeline-relevant content, resolved from a MaterialHandle.
++// `materialIndex` is the handle's own stable slot INDEX (`handle.index()`)
++// -- never re-derived to point at a different slot on eviction: the
++// SUBSTITUTION itself happens at CONTENT resolution (the three fields
++// below, read from `registry.material(handle)`, which is ALREADY
++// D24-tolerant), not at the index -- a later, real GPU-side per-draw
++// material buffer is populated from `registry.material(handle)` at that
++// SAME index, so using the raw index unconditionally is itself safe (an
++// integer, never a dereferenced pointer) and automatically consistent with
++// whatever content ends up bound there.
++struct ResolvedMaterial {
++    uint32_t materialIndex = 0;
++    asset::AlphaMode alphaMode = asset::AlphaMode::Opaque;
++    bool doubleSided = false;
++    asset::MaterialDisposition disposition = asset::MaterialDisposition::StandardPBR;
++};
++
++using MaterialResolveFn = std::function<ResolvedMaterial(asset::MaterialHandle)>;
++
++// Production adapter -- see `ResolvedMaterial`'s own comment. Defined in
++// draw_list.cpp.
++[[nodiscard]] MaterialResolveFn materialResolveFromRegistry(const asset::Registry& registry);
++
++// ---------------------------------------------------------------------
++// SORT KEY [gate ruling #6; bgfx `SortKey` (bgfx_p.h) + Filament
++// `RenderPass::CommandKey` (RenderPass.h) discipline: document the full bit
++// layout with named constants + a comment diagram, provide a decode() that
++// round-trips, exactly like bgfx's own `SortKey::decode()` exists as a
++// correctness check on itself]. THREE distinct 64-bit key shapes, one per
++// consumer -- bgfx precedent for "one uint64_t, several shapes depending on
++// what's being sorted," not an invented pattern:
++//
++//   OPAQUE (+MASK) partition -- state-minimization dominant, per D14
++//   ("front-to-back by pipeline|material|depth"): NO mesh-identity tier in
++//   this key at all, deliberately -- see this namespace's own "COLLAPSE
++//   BEFORE SORT" note below for why putting mesh-range identity ABOVE
++//   depth (an earlier revision of this design did exactly that, to force
++//   D26.3 collapse-adjacency) is WRONG: it would make a scattered
++//   instanced group's relative position depend on an arbitrary mesh-hash
++//   rather than depth, breaking D14's own front-to-back guarantee across
++//   different meshes/materials. Collapse instead happens BEFORE this key
++//   is ever computed, so this key only ever needs to order the resulting
++//   (already-collapsed) draw GROUPS by pipeline/material/depth, exactly as
++//   D14 states, no mesh field required.
++//
++//     bit  63........61 60............54 53..........39 38...........16 15.........0
++//          [priority: 3] [pipelineKey:7] [materialKey:15][depthBucket:23][tieBreak:16]
++//
++//   COLLAPSE BEFORE SORT [D26.3]: `DrawListBuilder::Impl::collapseAndSort()`
++//   (draw_list.cpp) runs the opaque partition through TWO passes, not one:
++//   (1) sort `pending` records by their exact draw IDENTITY (blockId,
++//   indexCount, firstIndex, vertexOffset, materialIndex, priority -- the
++//   same tuple `sameDrawIdentity()` checks) so every collapse-eligible run
++//   becomes contiguous REGARDLESS of the instances' individual depths (a
++//   scattered "forest of identical trees" scene collapses into ONE
++//   instanced draw exactly as D26.3 requires, even though its 1000
++//   instances are at 1000 different depths); (2) fold each identity-run
++//   into ONE `CollapsedGroup` (instanceCount = run length, representative
++//   depth = the NEAREST member's NDC depth -- the run's own best early-Z
++//   position), THEN sort the resulting (far fewer) groups by THIS key
++//   (priority|pipeline|material|depth). The direction/priority-tier tests
++//   below operate on scenes with no two objects sharing draw identity
++//   (distinct meshes), so each is its own trivial one-member "group" and
++//   this key's pure depth-ordering behavior is directly, simply
++//   observable -- exactly D14's own stated contract.
++//
++//   BLEND partition -- depth-dominant (bgfx's own "Draw Key 1... reordered
++//   so depth dominates" precedent), strict back-to-front correctness over
++//   state minimization; pipeline/material/mesh are NOT sort tiers here
++//   (blend draws are never instancing-collapsed, D14, so there is no
++//   adjacency requirement to serve). `reservedBlendOrder` is present,
++//   ALWAYS ZERO in Phase 4 (RC5/#5 ruling: "per-primitive blendOrder is NOT
++//   added... reserved bits documented in the key layout") -- a future
++//   per-primitive override lands here with no ABI break.
++//
++//     bit  63........61 60..................48 47..............16 15.........0
++//          [priority: 3] [reservedBlendOrder:13] [depthBucket:32]  [tieBreak:16]
++//
++//   SHADOW partition (ShadowLists) -- no depth/priority tier at all (a
++//   depth-only pass has no early-Z-order OR blend-order concern); sorted
++//   purely for state minimization, per gate ruling #6: "sorted (pipeline,
++//   mesh range, block)".
++//
++//     bit  63................54 53................32 31.........0
++//          [pipelineKey: 10]    [meshKey: 22]         [tieBreak: 32]
++//
++//   `blockId` is NOT a bit-field in any shape above -- it is the OUTERMOST
++//   sort tier, applied as an explicit primary comparison ABOVE the 64-bit
++//   key (see draw_list.cpp's own sort comparators) so `BlockRange`'s own
++//   "one contiguous run per block" invariant holds unconditionally,
++//   independent of everything else in this key.
++//
++//   DEPTH BUCKET [gate ruling #6]: never a linear rescale of NDC depth --
++//   reversed-Z's whole precision benefit comes from the raw IEEE-754 bit
++//   pattern already being densely, monotonically distributed near the near
++//   plane (depth->1.0); this key reinterprets the (non-negative, [0,1]
++//   clamped) depth float's raw bits and keeps only the top N bits (bgfx's
++//   own technique, since it stores the near-full float depth directly).
++//   OPAQUE inverts the truncated bucket (`~bucket & mask`, Filament's own
++//   `~distanceBits` bit-negation trick, RenderPass.h:103) so ascending key
++//   order is DEcreasing depth (nearest/highest-reversed-Z-value first,
++//   front-to-back); BLEND stores the bucket UNINVERTED so ascending key
++//   order is INcreasing depth (farthest/lowest-reversed-Z-value first,
++//   back-to-front) -- see draw_list_test.cpp's shared-fixture direction
++//   test, which asserts both directions against the SAME depth values so a
++//   sign-flip bug in either partition fails immediately.
++//
++//   TIE-BREAK [gate ruling #6]: the renderable's own Scene SLOT INDEX (its
++//   "stable creation index" for as long as this exact scene state persists
++//   -- see draw_list.cpp for why slot index, not a separate monotonic
++//   counter, satisfies the binding requirement: `std::sort`'s output
++//   becomes fully determined by the key alone, regardless of algorithm
++//   internals, independent of whether that index also reflects TRUE
++//   historical creation order across destroy/recreate churn).
++// ---------------------------------------------------------------------
++namespace sortkey {
++
++// --- OPAQUE shape --------------------------------------------------------
++inline constexpr uint32_t kOpaqueTieBreakBits = 16;
++inline constexpr uint32_t kOpaqueDepthBits = 23;
++inline constexpr uint32_t kOpaqueMaterialKeyBits = 15;
++inline constexpr uint32_t kOpaquePipelineKeyBits = 7;
++inline constexpr uint32_t kOpaquePriorityBits = 3;
++static_assert(
++    kOpaqueTieBreakBits + kOpaqueDepthBits + kOpaqueMaterialKeyBits + kOpaquePipelineKeyBits + kOpaquePriorityBits == 64,
++    "opaque sort key must occupy exactly 64 bits");
++
++inline constexpr uint32_t kOpaqueTieBreakShift = 0;
++inline constexpr uint32_t kOpaqueDepthShift = kOpaqueTieBreakShift + kOpaqueTieBreakBits;
++inline constexpr uint32_t kOpaqueMaterialKeyShift = kOpaqueDepthShift + kOpaqueDepthBits;
++inline constexpr uint32_t kOpaquePipelineKeyShift = kOpaqueMaterialKeyShift + kOpaqueMaterialKeyBits;
++inline constexpr uint32_t kOpaquePriorityShift = kOpaquePipelineKeyShift + kOpaquePipelineKeyBits;
++
++// --- BLEND shape -----------------------------------------------------------
++inline constexpr uint32_t kBlendTieBreakBits = 16;
++inline constexpr uint32_t kBlendDepthBits = 32;
++inline constexpr uint32_t kBlendReservedBlendOrderBits = 13;
++inline constexpr uint32_t kBlendPriorityBits = 3;
++static_assert(kBlendTieBreakBits + kBlendDepthBits + kBlendReservedBlendOrderBits + kBlendPriorityBits == 64,
++              "blend sort key must occupy exactly 64 bits");
++
++inline constexpr uint32_t kBlendTieBreakShift = 0;
++inline constexpr uint32_t kBlendDepthShift = kBlendTieBreakShift + kBlendTieBreakBits;
++inline constexpr uint32_t kBlendReservedBlendOrderShift = kBlendDepthShift + kBlendDepthBits;
++inline constexpr uint32_t kBlendPriorityShift = kBlendReservedBlendOrderShift + kBlendReservedBlendOrderBits;
++
++// --- SHADOW shape ------------------------------------------------------
++inline constexpr uint32_t kShadowTieBreakBits = 32;
++inline constexpr uint32_t kShadowMeshKeyBits = 22;
++inline constexpr uint32_t kShadowPipelineKeyBits = 10;
++static_assert(kShadowTieBreakBits + kShadowMeshKeyBits + kShadowPipelineKeyBits == 64,
++              "shadow sort key must occupy exactly 64 bits");
++
++inline constexpr uint32_t kShadowTieBreakShift = 0;
++inline constexpr uint32_t kShadowMeshKeyShift = kShadowTieBreakShift + kShadowTieBreakBits;
++inline constexpr uint32_t kShadowPipelineKeyShift = kShadowMeshKeyShift + kShadowMeshKeyBits;
++
++// Raw depth-bucket bits from an NDC depth in [0,1] -- the top `bucketBits`
++// bits of the depth float's own IEEE-754 bit pattern (monotonic for
++// non-negative floats: reinterpreting preserves ordering, no multiplication
++// or rescale involved). `bucketBits` must be in [1,32].
++[[nodiscard]] uint32_t depthBucketBits(float ndcDepth, uint32_t bucketBits);
++
++// Coarse, device-free pipeline-variant proxy derived from the
++// fixed-function-relevant material fields available at build() time (D28's
++// own axis: alphaMode -> blend/depth-write, doubleSided -> cull mode).
++// This is NOT a real VkPipeline identity -- that is resolved LATER, per
++// D27, by `resolveDrawGroups()`'s main-thread pre-resolution pass, keyed by
++// (at minimum) materialIndex boundaries this sort already produces. It
++// exists so distinct fixed-function pipeline VARIANTS sort into separate,
++// contiguous groups even device-free, before any real MaterialSystem
++// exists to ask.
++[[nodiscard]] uint16_t pipelineKeyOf(asset::MaterialDisposition disposition, asset::AlphaMode alphaMode,
++                                      bool doubleSided);
++
++// Coarse hash of a submesh's geometry identity within its own block
++// (firstIndex/vertexOffset uniquely identify a suballocation within one
++// block; block identity itself is the OUTER sort tier, not part of this
++// hash -- see this namespace's own top comment).
++[[nodiscard]] uint16_t meshKeyOf(uint32_t firstIndex, int32_t vertexOffset);
++
++[[nodiscard]] uint64_t encodeOpaque(uint8_t priority, uint16_t pipelineKey, uint16_t materialKey, float ndcDepth,
++                                     uint32_t tieBreak);
++[[nodiscard]] uint64_t encodeBlend(uint8_t priority, float ndcDepth, uint32_t tieBreak);
++[[nodiscard]] uint64_t encodeShadow(uint16_t pipelineKey, uint16_t meshKey, uint32_t tieBreak);
++
++struct DecodedOpaque {
++    uint8_t priority = 0;
++    uint16_t pipelineKey = 0;
++    uint16_t materialKey = 0;
++    uint32_t invertedDepthBucket = 0;  // the STORED bits (already inverted -- see encodeOpaque()) -- round-trip only, not un-inverted
++    uint32_t tieBreak = 0;
++};
++struct DecodedBlend {
++    uint8_t priority = 0;
++    uint32_t reservedBlendOrder = 0;  // always 0 in Phase 4 -- round-trip proves nothing else leaks into these bits
++    uint32_t depthBucket = 0;
++    uint32_t tieBreak = 0;
++};
++struct DecodedShadow {
++    uint16_t pipelineKey = 0;
++    uint16_t meshKey = 0;
++    uint32_t tieBreak = 0;
++};
++
++[[nodiscard]] DecodedOpaque decodeOpaque(uint64_t key);
++[[nodiscard]] DecodedBlend decodeBlend(uint64_t key);
++[[nodiscard]] DecodedShadow decodeShadow(uint64_t key);
++
++}  // namespace sortkey
++
++class DrawListBuilder;
++
++namespace detail {
++// Forward-declared here (full definition + doc comment near the bottom of
++// this header, alongside recordDrawList()'s own detail:: seam) purely so
++// DrawListBuilder's own `friend` declaration below can name it -- mirrors
++// this codebase's usual forward-declare-for-friendship pattern (see
++// scene.h's own detail::createLightRecordForTesting friend declarations).
++struct DrawListBuilderCapacitiesForTesting;
++[[nodiscard]] DrawListBuilderCapacitiesForTesting capacitiesForTesting(const DrawListBuilder& builder);
++}  // namespace detail
++
++// ---------------------------------------------------------------------
++// DrawListBuilder [D14/D15/D26/D27]
++// ---------------------------------------------------------------------
++class DrawListBuilder {
++public:
++    // `meshSubmeshes`/`materialResolve` are stored and invoked on every
++    // build()/buildShadow() call for as long as this builder exists --
++    // whatever they close over (typically a `const asset::Registry&` via
++    // the two `xFromRegistry()` adapters above) must outlive this builder,
++    // matching Scene's own MeshBoundsFn lifetime discipline.
++    DrawListBuilder(MeshSubmeshesFn meshSubmeshes, MaterialResolveFn materialResolve);
++    ~DrawListBuilder();
++
++    DrawListBuilder(const DrawListBuilder&) = delete;
++    DrawListBuilder& operator=(const DrawListBuilder&) = delete;
++    DrawListBuilder(DrawListBuilder&&) = delete;
++    DrawListBuilder& operator=(DrawListBuilder&&) = delete;
++
++    // Frustum-culls every alive `scene` renderable against `camera`
++    // (`Camera::cullingFrustumPlanes()` -- the FINITE culling projection,
++    // never the infinite-far render one, per matrix-issue05/06's shared
++    // Conflict #1 resolution), applies the camera `cullMask`/renderable
++    // `layers` AND-test, resolves visible renderables into draw records via
++    // this builder's injected `MeshSubmeshesFn`/`MaterialResolveFn`
++    // (D24-tolerant), sorts + instancing-collapses per D14/D26.3, and
++    // writes the result into `out` (caller-owned, reused storage -- see
++    // this header's own top comment).
++    //
++    // Main-thread-only (D5): reads `scene`'s own main-thread-only
++    // accessors before fanning any work out to `scheduler`'s workers; the
++    // parallel AABB-vs-frustum pass itself touches only already-captured
++    // plain spans, never `scene` again, from a worker thread.
++    void build(const Scene& scene, const Camera& camera, task::Scheduler& scheduler, ViewLists& out);
++
++    // Shadow-caster culling for one directional light [D15]: an ortho box
++    // fitted to `camera`'s own visible-bounds cross-section, extruded
++    // conservatively so that the side UPSTREAM of the light (where a
++    // caster must sit to shadow something in the visible region) is
++    // unbounded, while the downstream side stays at the visible bounds' own
++    // tight extent (see draw_list.cpp's own worked-example derivation) so
++    // off-screen casters whose shadow could still reach the visible region
++    // are included. `light` must be a currently-alive `LightHandle` on `scene`;
++    // a dead/stale handle or a light with `castsShadows == false` produces
++    // an EMPTY `out` (cleared, zeroed counters), never a throw (this is a
++    // per-frame query, not a mutator with a "handle must be live"
++    // contract). BLEND-partition casters are EXCLUDED (RC3); MASK casters
++    // are included, rendered as full opaque silhouettes in Phase 4
++    // (documented limitation, RC3 -- no alpha-cutoff test in the depth-only
++    // pass this feeds). Channel coupling (RC5): a renderable whose
++    // `channels` do not overlap `light`'s own `channels` is excluded from
++    // caster consideration entirely, same AND-test as camera cullMask.
++    //
++    // Main-thread-only (D5), same rationale as build().
++    void buildShadow(const Scene& scene, LightHandle light, const Camera& camera, task::Scheduler& scheduler,
++                      ShadowLists& out);
++
++private:
++    friend detail::DrawListBuilderCapacitiesForTesting detail::capacitiesForTesting(const DrawListBuilder&);
++
++    struct Impl;
++    std::unique_ptr<Impl> impl_;
++};
++
++// ---------------------------------------------------------------------
++// recordDrawList [D27] -- the chunked submit helper Task 22/24's real
++// GPU-side pass recording binds to (via `PipelineResolveFn`/`RecordChunkFn`
++// implementations that DO touch `rx::material::MaterialSystem`/
++// `rx::graph::PassContext`, out of THIS device-free library's own scope).
++// What this library delivers is the MECHANISM: a single main-thread linear
++// scan over the already-sorted list that pre-resolves every distinct
++// materialIndex boundary EXACTLY ONCE (D27's own "nearly free... the sorted
++// draw list already enumerates every distinct pair" argument), producing
++// plain `ResolvedDrawGroup` data with NO reachable path back to whatever
++// main-thread-guarded resolver produced it -- `RecordChunkFn`'s own
++// signature never receives `PipelineResolveFn` at all, a
++// compile-time-adjacent guarantee stronger than a runtime-only check (gate
++// ruling #6's own "D27 -- parameter-offset pre-computation" row).
++// ---------------------------------------------------------------------
++
++// One contiguous run of `ViewLists::commands` sharing the same resolved
++// materialIndex (and therefore, in production, the same real VkPipeline) --
++// the ONLY thing a `RecordChunkFn` chunk callback ever sees.
++struct ResolvedDrawGroup {
++    uint32_t firstCommand = 0;
++    uint32_t commandCount = 0;
++    uint32_t pipelineToken = 0;  // opaque; whatever PipelineResolveFn returned for this group
++
++    bool operator==(const ResolvedDrawGroup&) const = default;
++};
++
++// MAIN-THREAD-ONLY by contract (D27/D5) -- called exactly once per distinct
++// `DrawPayload::materialIndex` boundary encountered in `resolveDrawGroups()`'s
++// single linear scan, NEVER from a worker chunk. A production binding
++// mirrors `MaterialSystem::getPipeline()`'s own signature shape (material ->
++// VkPipeline, encoded into the opaque `uint32_t` token here); this
++// device-free library never names `MaterialSystem` itself.
++using PipelineResolveFn = std::function<uint32_t(uint32_t materialIndex)>;
++
++// Worker-safe: receives ONLY plain, pre-resolved data (`groups`) -- never
++// `PipelineResolveFn`, never `lists.payloads` (a chunk records commands
++// purely from `groups`' command-index ranges plus whatever else the
++// production binding closes over that is itself worker-safe, e.g. a
++// `VkCommandBuffer` slice).
++using RecordChunkFn = std::function<void(uint32_t chunkIndex, uint32_t chunkCount, std::span<const ResolvedDrawGroup> groups)>;
++
++// The single linear scan [D27]: groups `lists.commands` into contiguous
++// materialIndex-identical runs, calling `resolvePipeline` exactly once per
++// run (main-thread-guarded internally via RX_ASSERT_MAIN_THREAD -- see
++// draw_list.cpp). O(commands.size()) -- one pass, no second grouping sort.
++//
++// Main-thread-only (D5/D27).
++[[nodiscard]] std::vector<ResolvedDrawGroup> resolveDrawGroups(const ViewLists& lists,
++                                                                  const PipelineResolveFn& resolvePipeline);
++
++// Pre-resolves (see resolveDrawGroups() above, called internally, on the
++// calling/main thread, BEFORE any fan-out) then fans `recordChunk` out
++// across exactly `chunkCount` chunks via `scheduler.parallelFor()` --
++// `recordChunk` may run on any of `scheduler`'s worker threads (or the
++// calling thread, per `Scheduler::parallelFor()`'s own contract) and never
++// touches `resolvePipeline` again.
++//
++// Main-thread-only entry (D5) -- the pre-resolution half runs on the
++// calling thread; the fan-out half is `scheduler.parallelFor()`'s own
++// documented any-thread-safe-to-call-from contract (may itself be called
++// from within an outer chunk, matching `parallelFor()`'s own nesting rule).
++void recordDrawList(const ViewLists& lists, task::Scheduler& scheduler, uint32_t chunkCount,
++                     const PipelineResolveFn& resolvePipeline, const RecordChunkFn& recordChunk);
++
++namespace detail {
++
++// Test-only seam -- NOT part of the stable public contract, mirroring
++// `rx::material::detail::debugCompileCount()`'s own carve-out convention.
++// `ViewLists`'s OWN vectors are directly inspectable by any test (public
++// fields); `DrawListBuilder`'s PRIVATE reused scratch storage (cull
++// reasons/visible-index lists/pending draw records) is not otherwise
++// observable from outside, so the zero-alloc test needs this one seam to
++// cover the full `build()`/`buildShadow()` call, not just its public
++// output struct.
++struct DrawListBuilderCapacitiesForTesting {
++    size_t cullReasons = 0;
++    size_t visibleIndices = 0;
++    size_t cameraVisibleIndices = 0;
++    size_t pending = 0;
++    size_t opaqueRecords = 0;
++    size_t blendRecords = 0;
++    size_t opaqueGroups = 0;
++};
++// (capacitiesForTesting() itself is forward-declared above, right before
++// `class DrawListBuilder` -- not re-declared here, just defined in
++// draw_list.cpp.)
++
++}  // namespace detail
++
++}  // namespace rx::scene
+diff --git a/src/rx_scene/include/rx_scene/scene.h b/src/rx_scene/include/rx_scene/scene.h
+index 606f738..26106b6 100644
+--- a/src/rx_scene/include/rx_scene/scene.h
++++ b/src/rx_scene/include/rx_scene/scene.h
+@@ -334,20 +334,42 @@ public:
+     // 0/1 per slot, NOT std::vector<bool> -- std::vector<bool>'s
+     // bit-packed specialization is not std::span<const T>-compatible
+     // (there is no contiguous bool[] to span over), so every boolean
+     // column meant to be span-accessible uses uint8_t internally instead;
+     // castsShadows(handle) above converts to a real bool at the per-handle
+     // accessor boundary.
+     [[nodiscard]] std::span<const uint8_t> castsShadowsSpan() const;
+     [[nodiscard]] std::span<const uint8_t> prioritySpan() const;
+     [[nodiscard]] std::span<const asset::MeshHandle> meshSpan() const;
+ 
++    // [Task 19 addition, necessary -- see the task report] `aliveSpan()`
++    // (0/1 per slot, same uint8_t-not-vector<bool> convention as
++    // castsShadowsSpan() above) and `generationsSpan()` are the two pieces
++    // DrawListBuilder's bulk SoA culling loop needs that no existing
++    // accessor provides: every OTHER accessor above requires a full,
++    // correctly-generationed RenderableHandle (isRenderableAlive(handle),
++    // submeshMaterialOverrides(handle), ...), but a consumer iterating the
++    // span columns directly only ever has a bare SLOT INDEX, with no way
++    // to (a) know whether that slot is a live renderable or a
++    // destroyRenderable()d hole still holding its last occupant's stale
++    // column values (destroyRenderable() marks `alive_[idx] = false` but
++    // deliberately does NOT re-zero every other column -- see scene.cpp --
++    // so e.g. a freed slot's `layers_[idx]` cannot be used as an implicit
++    // "dead" sentinel), or (b) reconstruct a valid RenderableHandle(idx,
++    // generation) to call a per-handle accessor like
++    // submeshMaterialOverrides() for that slot. Both spans are read-only,
++    // additive, and follow the exact same "index i addresses the same
++    // underlying slot across every span" contract documented on this
++    // class's own SoA span-accessor block above.
++    [[nodiscard]] std::span<const uint8_t> aliveSpan() const;
++    [[nodiscard]] std::span<const uint32_t> generationsSpan() const;
++
+     // --- Lights ----------------------------------------------------------
+ 
+     // Main-thread-only (D5).
+     [[nodiscard]] LightHandle createDirectionalLight(const DirectionalLightDesc& desc);
+     void destroyLight(LightHandle handle);
+     void setLightChannels(LightHandle handle, uint8_t channels);
+ 
+     [[nodiscard]] bool isLightAlive(LightHandle handle) const;
+     [[nodiscard]] glm::vec3 lightDirection(LightHandle handle) const;
+     [[nodiscard]] glm::vec3 lightColorLux(LightHandle handle) const;
+@@ -368,21 +390,25 @@ private:
+     // and the detail:: test-only seam (both just build a different-shaped
+     // LightRecord and hand it here).
+     [[nodiscard]] LightHandle insertLightRecord(const LightRecord& record);
+ 
+     void recomputeWorldBounds(uint32_t index);
+ 
+     MeshBoundsFn meshBounds_;
+ 
+     // --- Renderable SoA columns (index-parallel with generation_/alive_)
+     std::vector<uint32_t> generation_;
+-    std::vector<bool> alive_;  // internal bookkeeping only -- never span-exposed, see castsShadowsSpan()'s own comment
++    // [Task 19] uint8_t, not vector<bool> -- was internal-bookkeeping-only
++    // (comment now stale: aliveSpan() above spans it directly, so it needs
++    // the same contiguous-bool-as-uint8_t representation every other
++    // boolean column already uses, per castsShadowsSpan()'s own comment).
++    std::vector<uint8_t> alive_;
+     std::vector<uint32_t> freeList_;
+ 
+     std::vector<asset::MeshHandle> mesh_;
+     std::vector<std::vector<std::optional<asset::MaterialHandle>>> submeshOverrides_;
+     std::vector<glm::mat4> transform_;
+     std::vector<asset::AABB> worldBounds_;
+     std::vector<uint32_t> layers_;
+     std::vector<uint8_t> channels_;
+     std::vector<uint8_t> castsShadows_;
+     std::vector<uint8_t> priority_;
+diff --git a/src/rx_scene/scene.cpp b/src/rx_scene/scene.cpp
+index beb0696..cd0b244 100644
+--- a/src/rx_scene/scene.cpp
++++ b/src/rx_scene/scene.cpp
+@@ -226,20 +226,30 @@ std::span<const uint8_t> Scene::castsShadowsSpan() const {
+ std::span<const uint8_t> Scene::prioritySpan() const {
+     RX_ASSERT_MAIN_THREAD("rx::scene::Scene::prioritySpan");
+     return priority_;
+ }
+ 
+ std::span<const asset::MeshHandle> Scene::meshSpan() const {
+     RX_ASSERT_MAIN_THREAD("rx::scene::Scene::meshSpan");
+     return mesh_;
+ }
+ 
++std::span<const uint8_t> Scene::aliveSpan() const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::aliveSpan");
++    return alive_;
++}
++
++std::span<const uint32_t> Scene::generationsSpan() const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::generationsSpan");
++    return generation_;
++}
++
+ // ---------------------------------------------------------------------
+ // Lights
+ // ---------------------------------------------------------------------
+ 
+ bool Scene::isLiveLightIndex(LightHandle handle) const {
+     return handle.index() < lightGeneration_.size() && lightAlive_[handle.index()] &&
+            lightGeneration_[handle.index()] == handle.generation();
+ }
+ 
+ uint32_t Scene::requireLiveLight(LightHandle handle, const char* context) const {
+diff --git a/src/rx_scene/tests/CMakeLists.txt b/src/rx_scene/tests/CMakeLists.txt
+index cfce814..f05f193 100644
+--- a/src/rx_scene/tests/CMakeLists.txt
++++ b/src/rx_scene/tests/CMakeLists.txt
+@@ -3,16 +3,17 @@
+ # src/rx_graph/tests/CMakeLists.txt's identical device-free binary
+ # convention. thread_guard_test.cpp needs no fixture beyond a plain
+ # rx::scene::Scene (unlike rx_asset/tests/thread_guard_test.cpp's
+ # GeometryPool case, which needs a real window/device) -- Scene owns no
+ # Vulkan object at all.
+ add_executable(rx_scene_tests
+     doctest_main.cpp
+     camera_test.cpp
+     scene_test.cpp
+     thread_guard_test.cpp
++    draw_list_test.cpp
+ )
+ target_link_libraries(rx_scene_tests PRIVATE rx_scene doctest::doctest)
+ add_test(NAME rx_scene_tests COMMAND rx_scene_tests)
+ # Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+ # (windows-cross Wine hang, run 31512073559).
+ set_tests_properties(rx_scene_tests PROPERTIES TIMEOUT 120)
+diff --git a/src/rx_scene/tests/draw_list_test.cpp b/src/rx_scene/tests/draw_list_test.cpp
+new file mode 100644
+index 0000000..93dbd13
+--- /dev/null
++++ b/src/rx_scene/tests/draw_list_test.cpp
+@@ -0,0 +1,1453 @@
++#include <doctest/doctest.h>
++#include <rx_scene/draw_list.h>
++
++#include <rx_core/debug_checks.h>
++#include <rx_task/scheduler.h>
++
++#include <glm/gtc/matrix_transform.hpp>
++#include <glm/gtc/quaternion.hpp>
++
++#include <atomic>
++#include <chrono>
++#include <cstddef>
++#include <cstdlib>
++#include <mutex>
++#include <new>
++#include <optional>
++#include <string>
++#include <thread>
++#include <unordered_set>
++#include <vector>
++
++// [D26.2] volk.h (project convention: "volk.h, not vulkan/vulkan.h") pulled
++// in ONLY here, in the TEST binary -- see draw_list.h's own top comment for
++// why the PRODUCTION library (draw_list.{h,cpp}) never names a Vulkan type
++// itself. Reachable transitively (rx_scene PUBLIC-links rx_asset, which
++// PUBLIC-links rx_rhi_vk, whose own CMakeLists.txt exposes volk's include
++// dir PUBLIC) with no new link dependency added for this test binary.
++#if __has_include(<volk.h>)
++#include <volk.h>
++#define RX_SCENE_TEST_HAS_VOLK 1
++#else
++#define RX_SCENE_TEST_HAS_VOLK 0
++#endif
++
++// draw_list_test.cpp -- device-free coverage for rx::scene::DrawListBuilder
++// [spec D14/D15/D24/D26/D27; Phase 4 Stage 2 Task 19; gate
++// matrix-issue06-drawlists-culling.md + matrix-issue07-layer-masks.md as
++// amended by gate/rulings-2026-08-18.md's #6/#7 sections + RC3/RC5]. Every
++// case here uses trivial, in-test MeshSubmeshesFn/MaterialResolveFn
++// providers (a `FakeAssetSource` below) -- never a real asset::Registry,
++// same rationale as scene_test.cpp's own device-free convention.
++
++using rx::asset::AABB;
++using rx::asset::AlphaMode;
++using rx::asset::MaterialAsset;
++using rx::asset::MaterialDisposition;
++using rx::asset::MaterialHandle;
++using rx::asset::MeshHandle;
++using rx::asset::MeshRange;
++using rx::asset::Submesh;
++using rx::scene::BlockRange;
++using rx::scene::Camera;
++using rx::scene::CullCounters;
++using rx::scene::DirectionalLightDesc;
++using rx::scene::DrawCommand;
++using rx::scene::DrawListBuilder;
++using rx::scene::DrawPayload;
++using rx::scene::LightHandle;
++using rx::scene::RenderableDesc;
++using rx::scene::RenderableHandle;
++using rx::scene::ResolvedMaterial;
++using rx::scene::Scene;
++using rx::scene::ShadowLists;
++using rx::scene::ViewLists;
++
++namespace {
++
++// ---------------------------------------------------------------------
++// Fixtures.
++// ---------------------------------------------------------------------
++
++AABB boxAt(glm::vec3 center, glm::vec3 halfExtent) {
++    AABB box;
++    box.expand(center - halfExtent);
++    box.expand(center + halfExtent);
++    return box;
++}
++
++AABB unitCubeAt(glm::vec3 center) { return boxAt(center, glm::vec3(0.5F)); }
++
++Submesh makeSubmesh(uint32_t blockId, uint32_t firstIndex, uint32_t indexCount, int32_t vertexOffset, MaterialHandle material) {
++    Submesh s;
++    s.range.blockId = blockId;
++    s.range.firstIndex = firstIndex;
++    s.range.indexCount = indexCount;
++    s.range.vertexOffset = vertexOffset;
++    s.material = material;
++    return s;
++}
++
++// A tiny in-test asset source -- mirrors asset::Registry's own D24
++// fallback-substitution SHAPE (evict -> fallback content, never a crash)
++// without needing a real GPU-backed Registry. Bound to Scene's
++// MeshBoundsFn and DrawListBuilder's MeshSubmeshesFn/MaterialResolveFn.
++class FakeAssetSource {
++public:
++    static constexpr uint32_t kFallbackMaterialIndex = 999'999U;
++
++    MeshHandle addMesh(std::vector<Submesh> submeshes, AABB localBounds = unitCubeAt(glm::vec3(0.0F))) {
++        const uint32_t idx = static_cast<uint32_t>(meshes_.size());
++        meshes_.push_back(std::move(submeshes));
++        bounds_.push_back(localBounds);
++        return MeshHandle(idx, 1);
++    }
++
++    MaterialHandle addMaterial(MaterialAsset mat) {
++        const uint32_t idx = static_cast<uint32_t>(materials_.size());
++        materials_.push_back(mat);
++        return MaterialHandle(idx, 1);
++    }
++
++    void evictMesh(MeshHandle h) { evictedMeshes_.insert(h.index()); }
++    void evictMaterial(MaterialHandle h) { evictedMaterials_.insert(h.index()); }
++
++    rx::scene::MeshBoundsFn meshBoundsFn() const {
++        return [this](MeshHandle h) -> AABB {
++            if (evictedMeshes_.count(h.index()) != 0 || h.index() >= bounds_.size()) {
++                return AABB{};  // fallback shape: invalid/empty, mirrors makeFallbackMeshAsset().
++            }
++            return bounds_[h.index()];
++        };
++    }
++
++    rx::scene::MeshSubmeshesFn meshSubmeshesFn() const {
++        return [this](MeshHandle h) -> std::span<const Submesh> {
++            static const std::vector<Submesh> kEmpty;
++            if (evictedMeshes_.count(h.index()) != 0 || h.index() >= meshes_.size()) {
++                return kEmpty;  // fallback shape: empty submesh list.
++            }
++            return meshes_[h.index()];
++        };
++    }
++
++    rx::scene::MaterialResolveFn materialResolveFn() const {
++        return [this](MaterialHandle h) -> ResolvedMaterial {
++            if (evictedMaterials_.count(h.index()) != 0 || h.index() >= materials_.size()) {
++                return ResolvedMaterial{kFallbackMaterialIndex, AlphaMode::Opaque, false, MaterialDisposition::Unlit};
++            }
++            const MaterialAsset& mat = materials_[h.index()];
++            return ResolvedMaterial{h.index(), mat.alphaMode, mat.doubleSided, mat.disposition};
++        };
++    }
++
++private:
++    std::vector<std::vector<Submesh>> meshes_;
++    std::vector<AABB> bounds_;
++    std::vector<MaterialAsset> materials_;
++    std::unordered_set<uint32_t> evictedMeshes_;
++    std::unordered_set<uint32_t> evictedMaterials_;
++};
++
++MaterialAsset opaqueMaterial() {
++    MaterialAsset mat;
++    mat.alphaMode = AlphaMode::Opaque;
++    return mat;
++}
++MaterialAsset maskMaterial() {
++    MaterialAsset mat;
++    mat.alphaMode = AlphaMode::Mask;
++    return mat;
++}
++MaterialAsset blendMaterial() {
++    MaterialAsset mat;
++    mat.alphaMode = AlphaMode::Blend;
++    return mat;
++}
++
++// Camera at the world origin, identity orientation (forward = -Z, up = +Y,
++// right = +X), 90-degree vertical FOV, square aspect -- chosen so the
++// frustum's half-extent at depth `d` (world Z = -d) is exactly `d`
++// (tan(45 deg) == 1), making every test AABB placement below reason about
++// with plain arithmetic instead of trigonometry.
++Camera testCamera(float nearPlane = 1.0F, float farPlane = 100.0F) {
++    Camera cam;
++    cam.verticalFovRadians = glm::radians(90.0F);
++    cam.aspectRatio = 1.0F;
++    cam.nearPlane = nearPlane;
++    cam.cullingFarPlane = farPlane;
++    return cam;
++}
++
++RenderableHandle addRenderable(Scene& scene, MeshHandle mesh, uint32_t layers = ~0U, uint8_t channels = 0xFF,
++                                bool castsShadows = true, uint8_t priority = 4) {
++    RenderableDesc desc;
++    desc.mesh = mesh;
++    desc.layers = layers;
++    desc.channels = channels;
++    desc.castsShadows = castsShadows;
++    desc.priority = priority;
++    return scene.createRenderable(desc);
++}
++
++}  // namespace
++
++// =======================================================================
++// Frustum culling: known in/out AABB battery [Task 19's own "known in/out
++// AABB sets (exact counters)" step, concretized into the p-vertex test's
++// classic case battery per matrix-issue06's own acceptance criterion].
++// =======================================================================
++
++TEST_CASE("build() frustum-culls a battery of known in/out AABB placements with EXACT counters "
++          "[p-vertex test case battery, gate matrix-issue06]") {
++    FakeAssetSource assets;
++    MaterialHandle mat = assets.addMaterial(opaqueMaterial());
++
++    // At depth d=10 (world Z=-10), the 90deg/aspect-1 frustum's half-extent
++    // is exactly 10 in X and Y.
++    struct Case {
++        const char* name;
++        glm::vec3 center;
++        glm::vec3 halfExtent;
++        bool expectedVisible;
++    };
++    const std::vector<Case> cases = {
++        {"fully inside", {0.0F, 0.0F, -10.0F}, {1.0F, 1.0F, 1.0F}, true},
++        {"fully outside RIGHT", {30.0F, 0.0F, -10.0F}, {1.0F, 1.0F, 1.0F}, false},
++        {"fully outside LEFT", {-30.0F, 0.0F, -10.0F}, {1.0F, 1.0F, 1.0F}, false},
++        {"fully outside TOP", {0.0F, 30.0F, -10.0F}, {1.0F, 1.0F, 1.0F}, false},
++        {"fully outside BOTTOM", {0.0F, -30.0F, -10.0F}, {1.0F, 1.0F, 1.0F}, false},
++        {"fully outside NEAR (closer than near=1)", {0.0F, 0.0F, -0.5F}, {0.1F, 0.1F, 0.1F}, false},
++        {"fully outside FAR (beyond cullingFarPlane=100)", {0.0F, 0.0F, -150.0F}, {1.0F, 1.0F, 1.0F}, false},
++        {"straddling ONE plane (right)", {10.0F, 0.0F, -10.0F}, {15.0F, 0.5F, 0.5F}, true},
++        {"straddling MULTIPLE planes (huge box around camera)", {0.0F, 0.0F, 0.0F}, {1000.0F, 1000.0F, 1000.0F}, true},
++    };
++
++    Scene scene(assets.meshBoundsFn());
++    std::vector<bool> expected;
++    for (const Case& c : cases) {
++        MeshHandle mesh = assets.addMesh({makeSubmesh(0, 0, 3, 0, mat)}, boxAt(c.center, c.halfExtent));
++        static_cast<void>(addRenderable(scene, mesh));
++        expected.push_back(c.expectedVisible);
++    }
++
++    auto scheduler = rx::task::Scheduler::create(4);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++    ViewLists lists;
++    builder.build(scene, testCamera(), *scheduler, lists);
++
++    uint32_t expectedVisibleCount = 0;
++    for (bool v : expected) {
++        if (v) {
++            ++expectedVisibleCount;
++        }
++    }
++    CHECK(lists.counters.totalCandidates == cases.size());
++    CHECK(lists.counters.culledByLayerMask == 0);
++    CHECK(lists.counters.visible == expectedVisibleCount);
++    CHECK(lists.counters.culledByFrustum == cases.size() - expectedVisibleCount);
++
++    // Cross-check WHICH renderables survived, not just the count: every
++    // surviving draw's payload carries `instanceDataIndex` == the
++    // renderable's own Scene slot index (created in the SAME order as
++    // `cases`, so index i corresponds to cases[i]).
++    std::unordered_set<uint32_t> visibleIndices;
++    for (const DrawPayload& p : lists.payloads) {
++        visibleIndices.insert(p.instanceDataIndex);
++    }
++    for (uint32_t i = 0; i < cases.size(); ++i) {
++        INFO("case: ", cases[i].name);
++        CHECK(visibleIndices.count(i) == (expected[i] ? 1U : 0U));
++    }
++}
++
++TEST_CASE("build() never culls a degenerate (single-point, min==max) AABB fully inside the frustum, and correctly "
++          "culls one fully outside -- no NaN/UB [gate 'Degenerate / zero-extent AABB' row]") {
++    FakeAssetSource assets;
++    MaterialHandle mat = assets.addMaterial(opaqueMaterial());
++    Scene scene(assets.meshBoundsFn());
++
++    AABB insidePoint;
++    insidePoint.expand(glm::vec3(0.0F, 0.0F, -10.0F));  // min == max
++    AABB outsidePoint;
++    outsidePoint.expand(glm::vec3(1000.0F, 0.0F, -10.0F));
++
++    MeshHandle meshIn = assets.addMesh({makeSubmesh(0, 0, 3, 0, mat)}, insidePoint);
++    MeshHandle meshOut = assets.addMesh({makeSubmesh(0, 3, 3, 0, mat)}, outsidePoint);
++    static_cast<void>(addRenderable(scene, meshIn));
++    static_cast<void>(addRenderable(scene, meshOut));
++
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++    ViewLists lists;
++    builder.build(scene, testCamera(), *scheduler, lists);
++
++    CHECK(lists.counters.visible == 1);
++    REQUIRE(lists.commands.size() == 1);
++    CHECK(lists.commands[0].firstIndex == 0);  // the inside point's submesh
++}
++
++TEST_CASE("build() never culls a ground-slab AABB whose horizontal extent vastly exceeds the frustum's footprint "
++          "[gate 'Very large objects (ground planes)' row]") {
++    FakeAssetSource assets;
++    MaterialHandle mat = assets.addMaterial(opaqueMaterial());
++    Scene scene(assets.meshBoundsFn());
++
++    // A gigantic, thin horizontal slab straddling every plane at once.
++    AABB slab = boxAt(glm::vec3(0.0F, 0.0F, -10.0F), glm::vec3(100000.0F, 0.1F, 100000.0F));
++    MeshHandle mesh = assets.addMesh({makeSubmesh(0, 0, 3, 0, mat)}, slab);
++    static_cast<void>(addRenderable(scene, mesh));
++
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++    ViewLists lists;
++    builder.build(scene, testCamera(), *scheduler, lists);
++
++    CHECK(lists.counters.visible == 1);
++    CHECK(lists.counters.culledByFrustum == 0);
++}
++
++TEST_CASE("An object at extreme depth (100,000 units), still inside the side/top/bottom cone and within a "
++          "sufficiently large cullingFarPlane, is NEVER culled -- proves the FAR-plane test is correct at large "
++          "distances, not merely a degenerate always-true no-op or an accidental always-reject "
++          "[gate 'Objects spanning far=infinity' row, adopted per RC/#5 as the finite-cullingProj() version]") {
++    FakeAssetSource assets;
++    MaterialHandle mat = assets.addMaterial(opaqueMaterial());
++    Scene scene(assets.meshBoundsFn());
++
++    MeshHandle mesh = assets.addMesh({makeSubmesh(0, 0, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -100000.0F)));
++    static_cast<void>(addRenderable(scene, mesh));
++
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++    ViewLists lists;
++    // cullingFarPlane wide enough to legitimately contain the object.
++    builder.build(scene, testCamera(/*nearPlane=*/1.0F, /*farPlane=*/200000.0F), *scheduler, lists);
++
++    CHECK(lists.counters.visible == 1);
++    CHECK(lists.counters.culledByFrustum == 0);
++
++    // And the SAME object, at the SAME depth, with a far plane that
++    // legitimately excludes it -- proves the far test is not simply
++    // "never rejects anything" (a sign-flipped or always-true plane would
++    // pass BOTH halves of this test; only a correct one passes both).
++    ViewLists lists2;
++    builder.build(scene, testCamera(/*nearPlane=*/1.0F, /*farPlane=*/1000.0F), *scheduler, lists2);
++    CHECK(lists2.counters.visible == 0);
++    CHECK(lists2.counters.culledByFrustum == 1);
++}
++
++// =======================================================================
++// Layer-mask filtering [issue #7's own five-case CI matrix, gate ruling
++// #7].
++// =======================================================================
++
++TEST_CASE("Camera cullMask / renderable layers: the five-case CI mask matrix [gate matrix-issue07]") {
++    FakeAssetSource assets;
++    MaterialHandle mat = assets.addMaterial(opaqueMaterial());
++    Scene scene(assets.meshBoundsFn());
++
++    // Four renderables, each on a distinct layer bit, all comfortably
++    // inside the test camera's frustum.
++    std::vector<RenderableHandle> handles;
++    for (uint32_t bit = 0; bit < 4; ++bit) {
++        MeshHandle mesh = assets.addMesh({makeSubmesh(0, bit, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++        handles.push_back(addRenderable(scene, mesh, /*layers=*/1U << bit));
++    }
++
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++
++    // (a) single-bit cullMask: only the matching-layer object visible.
++    {
++        ViewLists lists;
++        Camera cam = testCamera();
++        cam.cullMask = 1U << 2;
++        builder.build(scene, cam, *scheduler, lists);
++        CHECK(lists.counters.visible == 1);
++        REQUIRE(lists.commands.size() == 1);
++        CHECK(lists.commands[0].firstIndex == 2);
++    }
++    // (b) cullMask == 0: zero visible, even for layers == ~0u objects
++    // (there are none here, but the AND-test with 0 must reject everyone).
++    {
++        ViewLists lists;
++        Camera cam = testCamera();
++        cam.cullMask = 0;
++        builder.build(scene, cam, *scheduler, lists);
++        CHECK(lists.counters.visible == 0);
++        CHECK(lists.counters.culledByLayerMask == 4);
++    }
++    // (c) cullMask == all-ones: all visible.
++    {
++        ViewLists lists;
++        builder.build(scene, testCamera(), *scheduler, lists);  // default cullMask = ~0u
++        CHECK(lists.counters.visible == 4);
++    }
++}
++
++TEST_CASE("cullMask == 0 excludes a renderable with layers == ~0u too -- a non-empty intersection is required, "
++          "never a subset test [gate matrix-issue07 row]") {
++    FakeAssetSource assets;
++    MaterialHandle mat = assets.addMaterial(opaqueMaterial());
++    Scene scene(assets.meshBoundsFn());
++    MeshHandle mesh = assets.addMesh({makeSubmesh(0, 0, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++    static_cast<void>(addRenderable(scene, mesh, /*layers=*/~0U));
++
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++    ViewLists lists;
++    Camera cam = testCamera();
++    cam.cullMask = 0;
++    builder.build(scene, cam, *scheduler, lists);
++    CHECK(lists.counters.visible == 0);
++}
++
++TEST_CASE("A default-constructed renderable is visible to a default-constructed camera with zero explicit "
++          "layer/mask configuration -- the all-ones-default regression guard [gate matrix-issue07 'Default "
++          "values' row]") {
++    FakeAssetSource assets;
++    MaterialHandle mat = assets.addMaterial(opaqueMaterial());
++    Scene scene(assets.meshBoundsFn());
++    MeshHandle mesh = assets.addMesh({makeSubmesh(0, 0, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++    RenderableDesc desc;  // fully default: layers = ~0u
++    desc.mesh = mesh;
++    static_cast<void>(scene.createRenderable(desc));
++
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++    ViewLists lists;
++    builder.build(scene, Camera{}, *scheduler, lists);  // fully default camera: cullMask = ~0u
++    // (default Camera looks down -Z with a 60deg fov/16:9 aspect -- the
++    // object at z=-10 is comfortably inside it.)
++    CHECK(lists.counters.visible == 1);
++}
++
++// (d)/(e): light-channel filtering + the "independent of layers" combined
++// case are covered by the shadow-caster section below, where channels are
++// actually consumed.
++
++// =======================================================================
++// Sort key: bit layout + decode() round trip [bgfx/Filament discipline,
++// gate ruling #6].
++// =======================================================================
++
++TEST_CASE("sortkey::encodeOpaque/decodeOpaque round-trips every field exactly, and reservedBlendOrder in the "
++          "blend shape decodes to zero when never written [gate ruling #6: named constants + decode() test]") {
++    using namespace rx::scene::sortkey;
++
++    const uint8_t priority = 5;
++    const uint16_t pipelineKey = 0x3F;      // fits in 7 bits
++    const uint16_t materialKey = 0x2AAA;    // fits in 15 bits
++    const uint32_t tieBreak = 0xFFFF;       // fits in 16 bits
++    const float ndcDepth = 0.75F;
++
++    const uint64_t key = encodeOpaque(priority, pipelineKey, materialKey, ndcDepth, tieBreak);
++    const DecodedOpaque d = decodeOpaque(key);
++    CHECK(d.priority == priority);
++    CHECK(d.pipelineKey == pipelineKey);
++    CHECK(d.materialKey == materialKey);
++    CHECK(d.tieBreak == tieBreak);
++    // The depth field round-trips as STORED (already direction-inverted --
++    // see encodeOpaque()'s own comment); re-inverting it recovers the raw
++    // bucket, which must equal depthBucketBits() computed directly.
++    const uint32_t mask = static_cast<uint32_t>((uint64_t{1} << kOpaqueDepthBits) - 1);
++    const uint32_t recoveredRawBucket = (~d.invertedDepthBucket) & mask;
++    CHECK(recoveredRawBucket == depthBucketBits(ndcDepth, kOpaqueDepthBits));
++}
++
++TEST_CASE("sortkey::encodeBlend/decodeBlend round-trips exactly; reservedBlendOrder is always zero [RC5/#5: "
++          "'blendOrder bits reserved, unpopulated']") {
++    using namespace rx::scene::sortkey;
++    const uint8_t priority = 3;
++    const uint32_t tieBreak = 12345;
++    const float ndcDepth = 0.25F;
++
++    const uint64_t key = encodeBlend(priority, ndcDepth, tieBreak);
++    const DecodedBlend d = decodeBlend(key);
++    CHECK(d.priority == priority);
++    CHECK(d.tieBreak == tieBreak);
++    CHECK(d.reservedBlendOrder == 0);  // never written -- proves nothing else leaks into these bits
++    CHECK(d.depthBucket == depthBucketBits(ndcDepth, kBlendDepthBits));
++}
++
++TEST_CASE("sortkey::encodeShadow/decodeShadow round-trips exactly") {
++    using namespace rx::scene::sortkey;
++    const uint16_t pipelineKey = 0x3AA;
++    const uint16_t meshKey = 0xABCD;
++    const uint32_t tieBreak = 0xDEADBEEFU;
++
++    const uint64_t key = encodeShadow(pipelineKey, meshKey, tieBreak);
++    const DecodedShadow d = decodeShadow(key);
++    CHECK(d.pipelineKey == (pipelineKey & ((1U << kShadowPipelineKeyBits) - 1)));
++    CHECK(d.meshKey == meshKey);
++    CHECK(d.tieBreak == tieBreak);
++}
++
++TEST_CASE("Priority occupies a documented tier ABOVE pipeline/material/depth: a lower-priority record sorts "
++          "before a higher-priority one regardless of every other field [RC5/#5 ruling]") {
++    using namespace rx::scene::sortkey;
++    // priority=0 with the WORST depth/pipeline/material vs priority=7 with
++    // the BEST -- priority must still dominate.
++    const uint64_t low = encodeOpaque(/*priority=*/0, 0x7F, 0x7FFF, /*ndcDepth=*/0.0F, /*tieBreak=*/0xFFFF);
++    const uint64_t high = encodeOpaque(/*priority=*/7, 0, 0, /*ndcDepth=*/1.0F, /*tieBreak=*/0);
++    CHECK(low < high);
++}
++
++TEST_CASE("Depth bucket preserves ordering for NDC depths clustered near the reversed-Z near plane (1.0) -- "
++          "truncated float32 bit-pattern, never a linear rescale [gate ruling #6]") {
++    using namespace rx::scene::sortkey;
++
++    // Real reversed-Z-infinite-far NDC depths (ndc = near/distance --
++    // Camera::proj()'s own formula, D13) for a near=0.1 camera: two pairs
++    // with the SAME 0.1-world-unit absolute gap, one pair close to the
++    // near plane, one pair far away -- the exact property reversed-Z
++    // exists to exploit (precision concentrates near depth=1.0, not
++    // uniformly across distance).
++    constexpr float kNear = 0.1F;
++    auto ndc = [&](float distance) { return kNear / distance; };
++
++    const uint32_t nearPairA = depthBucketBits(ndc(0.2F), kOpaqueDepthBits);
++    const uint32_t nearPairB = depthBucketBits(ndc(0.3F), kOpaqueDepthBits);
++    CHECK(nearPairA != nearPairB);  // resolvable near the near plane
++    CHECK(nearPairA > nearPairB);   // distance 0.2 is nearer -> larger ndc depth -> larger raw bucket
++
++    // Monotonicity across a realistic clustered range near the near plane.
++    const std::vector<float> distances = {0.15F, 0.2F, 0.3F, 0.5F, 1.0F, 2.0F, 5.0F};
++    std::vector<uint32_t> buckets;
++    for (float d : distances) {
++        buckets.push_back(depthBucketBits(ndc(d), kOpaqueDepthBits));
++    }
++    for (size_t i = 1; i < buckets.size(); ++i) {
++        INFO("comparing distance=", distances[i - 1], " vs distance=", distances[i]);
++        CHECK(buckets[i - 1] > buckets[i]);  // nearer (smaller distance) -> larger ndc depth -> larger raw bucket
++    }
++}
++
++// =======================================================================
++// Sort ORDER + DIRECTION [shared fixture, gate ruling #6: opaque
++// decreasing / blend increasing under reversed-Z].
++// =======================================================================
++
++TEST_CASE("Opaque partition sorts front-to-back (DEcreasing depth) and blend partition sorts back-to-front "
++          "(INcreasing depth) on the SAME depth values, via ONE shared fixture [gate ruling #6 direction test]") {
++    FakeAssetSource assets;
++    MaterialHandle opaqueMat = assets.addMaterial(opaqueMaterial());
++    MaterialHandle blendMat = assets.addMaterial(blendMaterial());
++
++    // Three known depths -- nearest (z=-5) to farthest (z=-30).
++    const std::vector<float> depthsZ = {-5.0F, -30.0F, -15.0F};  // deliberately out-of-order creation
++
++    // --- Opaque scene ---
++    {
++        Scene scene(assets.meshBoundsFn());
++        for (uint32_t i = 0; i < depthsZ.size(); ++i) {
++            MeshHandle mesh =
++                assets.addMesh({makeSubmesh(0, /*firstIndex=*/100 + i, 3, 0, opaqueMat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, depthsZ[i])));
++            static_cast<void>(addRenderable(scene, mesh));
++        }
++        auto scheduler = rx::task::Scheduler::create(2);
++        REQUIRE(scheduler != nullptr);
++        DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++        ViewLists lists;
++        builder.build(scene, testCamera(0.1F, 1000.0F), *scheduler, lists);
++        REQUIRE(lists.commands.size() == 3);
++        // Nearest (index 0, z=-5) first; farthest (index 1, z=-30) last.
++        CHECK(lists.commands[0].firstIndex == 100 + 0);
++        CHECK(lists.commands[1].firstIndex == 100 + 2);
++        CHECK(lists.commands[2].firstIndex == 100 + 1);
++    }
++    // --- Blend scene: SAME depths, opposite order expected ---
++    {
++        Scene scene(assets.meshBoundsFn());
++        for (uint32_t i = 0; i < depthsZ.size(); ++i) {
++            MeshHandle mesh =
++                assets.addMesh({makeSubmesh(0, /*firstIndex=*/200 + i, 3, 0, blendMat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, depthsZ[i])));
++            static_cast<void>(addRenderable(scene, mesh));
++        }
++        auto scheduler = rx::task::Scheduler::create(2);
++        REQUIRE(scheduler != nullptr);
++        DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++        ViewLists lists;
++        builder.build(scene, testCamera(0.1F, 1000.0F), *scheduler, lists);
++        REQUIRE(lists.commands.size() == 3);
++        CHECK(lists.opaqueCommandCount == 0);  // pure blend scene -- entire list is the blend partition
++        // Farthest (index 1, z=-30) first; nearest (index 0, z=-5) last.
++        CHECK(lists.commands[0].firstIndex == 200 + 1);
++        CHECK(lists.commands[1].firstIndex == 200 + 2);
++        CHECK(lists.commands[2].firstIndex == 200 + 0);
++    }
++}
++
++TEST_CASE("Alpha-MASK draws land in the opaque partition, front-to-back, never in the blend partition "
++          "[D14, gate matrix-issue06 'Alpha-MASK draws in the opaque partition' row]") {
++    FakeAssetSource assets;
++    MaterialHandle opaqueMat = assets.addMaterial(opaqueMaterial());
++    MaterialHandle maskMat = assets.addMaterial(maskMaterial());
++    MaterialHandle blendMat = assets.addMaterial(blendMaterial());
++    Scene scene(assets.meshBoundsFn());
++
++    MeshHandle mo = assets.addMesh({makeSubmesh(0, 0, 3, 0, opaqueMat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++    MeshHandle mm = assets.addMesh({makeSubmesh(0, 1, 3, 0, maskMat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -12.0F)));
++    MeshHandle mb = assets.addMesh({makeSubmesh(0, 2, 3, 0, blendMat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -14.0F)));
++    static_cast<void>(addRenderable(scene, mo));
++    static_cast<void>(addRenderable(scene, mm));
++    static_cast<void>(addRenderable(scene, mb));
++
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++    ViewLists lists;
++    builder.build(scene, testCamera(0.1F, 1000.0F), *scheduler, lists);
++
++    REQUIRE(lists.commands.size() == 3);
++    CHECK(lists.opaqueCommandCount == 2);  // opaque + MASK
++    for (uint32_t i = 0; i < lists.opaqueCommandCount; ++i) {
++        CHECK(lists.commands[i].firstIndex != 2);  // blend's firstIndex never appears in the opaque region
++    }
++    CHECK(lists.commands[lists.opaqueCommandCount].firstIndex == 2);
++}
++
++// =======================================================================
++// D26.3 -- instancing collapse + the D26.3 lockstep criterion.
++// =======================================================================
++
++TEST_CASE("An identical-run scene (1000 identical renderables) collapses into ONE DrawCommand with "
++          "instanceCount==1000; recordsIn==1000, drawsSubmitted==1 [D26.3, Task 19's own named step]") {
++    FakeAssetSource assets;
++    MaterialHandle mat = assets.addMaterial(opaqueMaterial());
++    MeshHandle mesh = assets.addMesh({makeSubmesh(0, 0, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++    Scene scene(assets.meshBoundsFn());
++
++    constexpr uint32_t kCount = 1000;
++    for (uint32_t i = 0; i < kCount; ++i) {
++        static_cast<void>(addRenderable(scene, mesh));
++    }
++
++    auto scheduler = rx::task::Scheduler::create(4);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++    ViewLists lists;
++    builder.build(scene, testCamera(0.1F, 1000.0F), *scheduler, lists);
++
++    CHECK(lists.counters.recordsIn == kCount);
++    CHECK(lists.counters.drawsSubmitted == 1);
++    REQUIRE(lists.commands.size() == 1);
++    CHECK(lists.commands[0].instanceCount == kCount);
++    CHECK(lists.payloads.size() == kCount);
++}
++
++TEST_CASE("D26.3 lockstep criterion: an interleaved-creation-order scene collapses into per-identity groups "
++          "whose payload ranges [firstInstance, firstInstance+instanceCount) contain ONLY payload entries "
++          "belonging to that exact source-renderable identity -- catches silent commands/payloads "
++          "desynchronization [gate ruling #6, D26.3 lockstep criterion, mandatory]") {
++    FakeAssetSource assets;
++    MaterialHandle mat = assets.addMaterial(opaqueMaterial());
++    // Two distinct mesh identities (different firstIndex), same material/block.
++    MeshHandle meshA = assets.addMesh({makeSubmesh(0, 100, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++    MeshHandle meshB = assets.addMesh({makeSubmesh(0, 200, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++    Scene scene(assets.meshBoundsFn());
++
++    // Interleaved A,B,A,B,A,B creation order -- a naive independent sort of
++    // commands vs. payloads (or a collapse pass that merges commands
++    // without moving payloads to match) would desynchronize here.
++    std::unordered_set<uint32_t> typeAIndices;
++    std::unordered_set<uint32_t> typeBIndices;
++    for (uint32_t i = 0; i < 6; ++i) {
++        const bool isA = (i % 2 == 0);
++        RenderableHandle h = addRenderable(scene, isA ? meshA : meshB);
++        (isA ? typeAIndices : typeBIndices).insert(h.index());
++    }
++
++    auto scheduler = rx::task::Scheduler::create(4);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++    ViewLists lists;
++    builder.build(scene, testCamera(0.1F, 1000.0F), *scheduler, lists);
++
++    CHECK(lists.counters.recordsIn == 6);
++    REQUIRE(lists.commands.size() == 2);  // exactly two collapsed groups: A and B
++    CHECK(lists.counters.drawsSubmitted == 2);
++
++    for (const DrawCommand& cmd : lists.commands) {
++        CHECK(cmd.instanceCount == 3);
++        const bool isTypeACommand = (cmd.firstIndex == 100);
++        const bool isTypeBCommand = (cmd.firstIndex == 200);
++        REQUIRE((isTypeACommand || isTypeBCommand));
++        const std::unordered_set<uint32_t>& expectedSet = isTypeACommand ? typeAIndices : typeBIndices;
++        for (uint32_t k = cmd.firstInstance; k < cmd.firstInstance + cmd.instanceCount; ++k) {
++            REQUIRE(k < lists.payloads.size());
++            CHECK(expectedSet.count(lists.payloads[k].instanceDataIndex) == 1);
++        }
++    }
++}
++
++// =======================================================================
++// Per-block contiguous BlockRange grouping [D26.2].
++// =======================================================================
++
++TEST_CASE("ViewLists.blocks groups commands contiguously by blockId -- each block occupies exactly ONE "
++          "contiguous BlockRange for a synthetic multi-block scene [gate matrix-issue06 D26.2 row]") {
++    FakeAssetSource assets;
++    MaterialHandle matA = assets.addMaterial(opaqueMaterial());
++    MaterialAsset matBAsset = opaqueMaterial();
++    matBAsset.doubleSided = true;  // distinct pipelineKey from matA, so sorting interleaves pipeline groups
++    MaterialHandle matB = assets.addMaterial(matBAsset);
++
++    Scene scene(assets.meshBoundsFn());
++    // Renderables alternate block 0/block 1 AND material A/B, so a
++    // correct implementation must still produce one contiguous run per
++    // block despite the pipeline/material tiers wanting to interleave them.
++    for (uint32_t i = 0; i < 8; ++i) {
++        const uint32_t blockId = i % 2;
++        MaterialHandle mat = (i % 4 < 2) ? matA : matB;
++        MeshHandle mesh =
++            assets.addMesh({makeSubmesh(blockId, i * 10, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F - static_cast<float>(i))));
++        static_cast<void>(addRenderable(scene, mesh));
++    }
++
++    auto scheduler = rx::task::Scheduler::create(4);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++    ViewLists lists;
++    builder.build(scene, testCamera(0.1F, 1000.0F), *scheduler, lists);
++
++    CHECK(lists.counters.visible == 8);
++    // Exactly one BlockRange per distinct blockId (2 blocks -> 2 ranges).
++    std::unordered_set<uint32_t> seenBlockIds;
++    for (const BlockRange& br : lists.blocks) {
++        CHECK(seenBlockIds.count(br.blockId) == 0);  // never split across two ranges
++        seenBlockIds.insert(br.blockId);
++        // Every command in [firstCommand, firstCommand+commandCount) must
++        // actually belong to this block -- cross-checked via firstIndex's
++        // own block-encoding scheme (i*10 -> block i%2) is indirect, so
++        // instead assert contiguity + coverage below.
++        CHECK(br.commandCount > 0);
++    }
++    CHECK(seenBlockIds.size() == 2);
++    uint32_t totalCovered = 0;
++    for (const BlockRange& br : lists.blocks) {
++        totalCovered += br.commandCount;
++    }
++    CHECK(totalCovered == lists.commands.size());
++}
++
++// =======================================================================
++// D26.2: VkDrawIndexedIndirectCommand-compatible layout.
++// =======================================================================
++
++TEST_CASE("DrawCommand is byte-for-byte VkDrawIndexedIndirectCommand-compatible: same size, and a "
++          "std::vector<DrawCommand> reinterpret-casts directly into an indirect-draw-shaped upload with no "
++          "copy/transform step [D26.2, gate matrix-issue06 acceptance criterion]") {
++#if RX_SCENE_TEST_HAS_VOLK
++    static_assert(sizeof(DrawCommand) == sizeof(VkDrawIndexedIndirectCommand),
++                  "DrawCommand must stay byte-compatible with VkDrawIndexedIndirectCommand");
++    static_assert(offsetof(DrawCommand, indexCount) == offsetof(VkDrawIndexedIndirectCommand, indexCount));
++    static_assert(offsetof(DrawCommand, instanceCount) == offsetof(VkDrawIndexedIndirectCommand, instanceCount));
++    static_assert(offsetof(DrawCommand, firstIndex) == offsetof(VkDrawIndexedIndirectCommand, firstIndex));
++    static_assert(offsetof(DrawCommand, vertexOffset) == offsetof(VkDrawIndexedIndirectCommand, vertexOffset));
++    static_assert(offsetof(DrawCommand, firstInstance) == offsetof(VkDrawIndexedIndirectCommand, firstInstance));
++
++    std::vector<DrawCommand> commands(3);
++    commands[0] = DrawCommand{10, 2, 20, 5, 30};
++    commands[1] = DrawCommand{11, 3, 21, 6, 31};
++    commands[2] = DrawCommand{12, 4, 22, 7, 32};
++
++    // The reinterpret-cast upload path: no transform, no copy, exactly
++    // what an MDI upload does with this array.
++    const auto* asIndirect = reinterpret_cast<const VkDrawIndexedIndirectCommand*>(commands.data());
++    for (size_t i = 0; i < commands.size(); ++i) {
++        CHECK(asIndirect[i].indexCount == commands[i].indexCount);
++        CHECK(asIndirect[i].instanceCount == commands[i].instanceCount);
++        CHECK(asIndirect[i].firstIndex == commands[i].firstIndex);
++        CHECK(asIndirect[i].vertexOffset == commands[i].vertexOffset);
++        CHECK(asIndirect[i].firstInstance == commands[i].firstInstance);
++    }
++#else
++    WARN("volk.h not on the include path -- VkDrawIndexedIndirectCommand compatibility not checked this build");
++#endif
++}
++
++// =======================================================================
++// D24 -- residency-tolerant handle resolution at list-build time.
++// =======================================================================
++
++TEST_CASE("An evicted MATERIAL handle resolves to the fallback material's content/index at build() time -- "
++          "never a crash, never a stale index; the draw still records via its (valid) mesh [D24]") {
++    FakeAssetSource assets;
++    MaterialHandle mat = assets.addMaterial(opaqueMaterial());
++    MeshHandle mesh = assets.addMesh({makeSubmesh(0, 0, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++    Scene scene(assets.meshBoundsFn());
++    static_cast<void>(addRenderable(scene, mesh));
++
++    assets.evictMaterial(mat);  // simulate eviction BEFORE build()
++
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++    ViewLists lists;
++    CHECK_NOTHROW(builder.build(scene, testCamera(0.1F, 1000.0F), *scheduler, lists));
++
++    REQUIRE(lists.commands.size() == 1);
++    REQUIRE(lists.payloads.size() == 1);
++    CHECK(lists.payloads[0].materialIndex == FakeAssetSource::kFallbackMaterialIndex);
++}
++
++TEST_CASE("An evicted MESH handle resolves to the (empty) fallback submesh list at build() time -- zero draw "
++          "records for that renderable, never a crash [D24]") {
++    FakeAssetSource assets;
++    MaterialHandle mat = assets.addMaterial(opaqueMaterial());
++    MeshHandle liveMesh = assets.addMesh({makeSubmesh(0, 0, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++    MeshHandle evictedMesh = assets.addMesh({makeSubmesh(0, 1, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -12.0F)));
++    Scene scene(assets.meshBoundsFn());
++    static_cast<void>(addRenderable(scene, liveMesh));
++    static_cast<void>(addRenderable(scene, evictedMesh));
++
++    assets.evictMesh(evictedMesh);
++
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++    ViewLists lists;
++    CHECK_NOTHROW(builder.build(scene, testCamera(0.1F, 1000.0F), *scheduler, lists));
++
++    // The evicted mesh's worldBounds ALSO collapses to the fallback's
++    // invalid/empty shape (Scene's own D24-at-the-proxy-level mechanism,
++    // Task 18), so it is culled upstream too -- either way, zero draw
++    // records, never a crash.
++    CHECK(lists.commands.size() == 1);
++    CHECK(lists.commands[0].firstIndex == 0);
++}
++
++// =======================================================================
++// Shadow-caster culling [D15]: off-screen-caster-still-casts, conservative
++// exclusion, BLEND exclusion (RC3), channel coupling (RC5).
++// =======================================================================
++
++TEST_CASE("buildShadow(): a caster fully OUTSIDE the camera frustum, whose shadow (extruded along the light "
++          "direction) still reaches the camera-visible ground, appears in ShadowLists; a second caster outside "
++          "BOTH the camera frustum AND the light's extruded bounds is absent [D15, gate ruling #6, Task 19's "
++          "own named 'off-screen-caster-still-casts' step]") {
++    FakeAssetSource assets;
++    MaterialHandle mat = assets.addMaterial(opaqueMaterial());
++    Scene scene(assets.meshBoundsFn());
++
++    // Ground: a thin slab at depth -10, comfortably inside the camera
++    // frustum (half-extent at depth 10 is 10).
++    MeshHandle groundMesh =
++        assets.addMesh({makeSubmesh(0, 0, 3, 0, mat)}, boxAt(glm::vec3(0.0F, 0.0F, -10.0F), glm::vec3(5.0F, 0.5F, 5.0F)));
++    RenderableHandle ground = addRenderable(scene, groundMesh);
++    static_cast<void>(ground);
++
++    // Caster A: off-camera (x=-50, well beyond the frustum's half-width of
++    // 10 at depth 10), same Y/Z footprint as the ground -- upstream of a
++    // mostly-+X-travelling light, so its shadow should still reach the
++    // ground (see buildShadow()'s own worked-example derivation).
++    MeshHandle casterAMesh = assets.addMesh({makeSubmesh(0, 1, 3, 0, mat)}, boxAt(glm::vec3(-50.0F, 0.0F, -10.0F), glm::vec3(0.5F)));
++    RenderableHandle casterA = addRenderable(scene, casterAMesh);
++
++    // Caster B: off-camera AND off the light's cross-section (huge Y
++    // offset, far beyond the ground's tiny +-0.5 Y extent) -- should be
++    // excluded by the extruded-box test (proving the extrusion is
++    // conservative, not "cast everything").
++    MeshHandle casterBMesh =
++        assets.addMesh({makeSubmesh(0, 2, 3, 0, mat)}, boxAt(glm::vec3(-50.0F, 2000.0F, -10.0F), glm::vec3(0.5F)));
++    RenderableHandle casterB = addRenderable(scene, casterBMesh);
++    static_cast<void>(casterB);
++
++    DirectionalLightDesc lightDesc;
++    lightDesc.dir = glm::normalize(glm::vec3(1.0F, 0.0F, 0.0F));  // travels toward +X
++    LightHandle light = scene.createDirectionalLight(lightDesc);
++
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++    ShadowLists shadowLists;
++    builder.buildShadow(scene, light, testCamera(0.1F, 1000.0F), *scheduler, shadowLists);
++
++    // Independently confirm both casters are genuinely off-screen (not a
++    // vacuous test): a separate camera-only build() must exclude them.
++    ViewLists cameraLists;
++    builder.build(scene, testCamera(0.1F, 1000.0F), *scheduler, cameraLists);
++    CHECK(cameraLists.counters.visible == 1);  // ground only
++
++    std::unordered_set<uint32_t> shadowFirstIndices;
++    for (const DrawCommand& cmd : shadowLists.commands) {
++        shadowFirstIndices.insert(cmd.firstIndex);
++    }
++    CHECK(shadowFirstIndices.count(0) == 1);  // ground casts its own shadow (a valid caster too)
++    CHECK(shadowFirstIndices.count(1) == 1);  // caster A: off-screen but still casts
++    CHECK(shadowFirstIndices.count(2) == 0);  // caster B: excluded -- conservative, not "cast everything"
++    static_cast<void>(casterA);
++}
++
++TEST_CASE("buildShadow(): BLEND-partition renderables are EXCLUDED from ShadowLists entirely [RC3]; "
++          "opaque+MASK renderables are included; ShadowLists is a single partition") {
++    FakeAssetSource assets;
++    MaterialHandle opaqueMat = assets.addMaterial(opaqueMaterial());
++    MaterialHandle maskMat = assets.addMaterial(maskMaterial());
++    MaterialHandle blendMat = assets.addMaterial(blendMaterial());
++    Scene scene(assets.meshBoundsFn());
++
++    MeshHandle mo = assets.addMesh({makeSubmesh(0, 0, 3, 0, opaqueMat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++    MeshHandle mm = assets.addMesh({makeSubmesh(0, 1, 3, 0, maskMat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++    MeshHandle mb = assets.addMesh({makeSubmesh(0, 2, 3, 0, blendMat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++    static_cast<void>(addRenderable(scene, mo));
++    static_cast<void>(addRenderable(scene, mm));
++    static_cast<void>(addRenderable(scene, mb));
++
++    DirectionalLightDesc lightDesc;
++    LightHandle light = scene.createDirectionalLight(lightDesc);
++
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++    ShadowLists shadowLists;
++    builder.buildShadow(scene, light, testCamera(0.1F, 1000.0F), *scheduler, shadowLists);
++
++    CHECK(shadowLists.opaqueCommandCount == shadowLists.commands.size());  // single partition
++    std::unordered_set<uint32_t> firstIndices;
++    for (const DrawCommand& cmd : shadowLists.commands) {
++        firstIndices.insert(cmd.firstIndex);
++    }
++    CHECK(firstIndices.count(0) == 1);  // opaque included
++    CHECK(firstIndices.count(1) == 1);  // MASK included
++    CHECK(firstIndices.count(2) == 0);  // BLEND excluded
++}
++
++TEST_CASE("buildShadow(): channel coupling (RC5) -- a renderable whose channels don't overlap the light's own "
++          "channels is excluded from the caster list; castsShadows=false independently excludes too") {
++    FakeAssetSource assets;
++    MaterialHandle mat = assets.addMaterial(opaqueMaterial());
++    Scene scene(assets.meshBoundsFn());
++
++    MeshHandle mA = assets.addMesh({makeSubmesh(0, 0, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++    MeshHandle mB = assets.addMesh({makeSubmesh(0, 1, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++    MeshHandle mC = assets.addMesh({makeSubmesh(0, 2, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++    static_cast<void>(addRenderable(scene, mA, ~0U, /*channels=*/0x1U));                              // matches light
++    static_cast<void>(addRenderable(scene, mB, ~0U, /*channels=*/0x2U));                              // does NOT match light
++    static_cast<void>(addRenderable(scene, mC, ~0U, /*channels=*/0x1U, /*castsShadows=*/false));      // opted out
++
++    DirectionalLightDesc lightDesc;
++    lightDesc.channels = 0x1U;
++    LightHandle light = scene.createDirectionalLight(lightDesc);
++
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++    ShadowLists shadowLists;
++    builder.buildShadow(scene, light, testCamera(0.1F, 1000.0F), *scheduler, shadowLists);
++
++    std::unordered_set<uint32_t> firstIndices;
++    for (const DrawCommand& cmd : shadowLists.commands) {
++        firstIndices.insert(cmd.firstIndex);
++    }
++    CHECK(firstIndices.count(0) == 1);
++    CHECK(firstIndices.count(1) == 0);
++    CHECK(firstIndices.count(2) == 0);
++    CHECK(shadowLists.counters.shadowCastersConsidered >= 1);
++    CHECK(shadowLists.counters.shadowCastersVisible == 1);
++}
++
++TEST_CASE("buildShadow() on a dead or shadow-disabled light produces an empty, well-formed ShadowLists rather "
++          "than a throw") {
++    FakeAssetSource assets;
++    Scene scene(assets.meshBoundsFn());
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++
++    DirectionalLightDesc desc;
++    desc.castsShadows = false;
++    LightHandle disabledLight = scene.createDirectionalLight(desc);
++    ShadowLists lists;
++    CHECK_NOTHROW(builder.buildShadow(scene, disabledLight, testCamera(), *scheduler, lists));
++    CHECK(lists.commands.empty());
++
++    LightHandle deadLight = scene.createDirectionalLight(DirectionalLightDesc{});
++    scene.destroyLight(deadLight);
++    ShadowLists lists2;
++    CHECK_NOTHROW(builder.buildShadow(scene, deadLight, testCamera(), *scheduler, lists2));
++    CHECK(lists2.commands.empty());
++}
++
++// =======================================================================
++// Exact CullCounters [D18, gate ruling #6].
++// =======================================================================
++
++TEST_CASE("CullCounters are EXACT across a mixed layer/frustum/visible scene") {
++    FakeAssetSource assets;
++    MaterialHandle mat = assets.addMaterial(opaqueMaterial());
++    Scene scene(assets.meshBoundsFn());
++
++    // 2 layer-culled, 3 frustum-culled, 5 visible.
++    for (int i = 0; i < 2; ++i) {
++        MeshHandle mesh = assets.addMesh({makeSubmesh(0, 0, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++        static_cast<void>(addRenderable(scene, mesh, /*layers=*/0x2U));  // won't match cullMask below
++    }
++    for (int i = 0; i < 3; ++i) {
++        MeshHandle mesh = assets.addMesh({makeSubmesh(0, 0, 3, 0, mat)}, unitCubeAt(glm::vec3(500.0F, 0.0F, -10.0F)));
++        static_cast<void>(addRenderable(scene, mesh));
++    }
++    for (int i = 0; i < 5; ++i) {
++        MeshHandle mesh = assets.addMesh({makeSubmesh(0, 0, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++        static_cast<void>(addRenderable(scene, mesh));
++    }
++
++    auto scheduler = rx::task::Scheduler::create(4);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++    ViewLists lists;
++    Camera cam = testCamera();
++    cam.cullMask = 0x1U;
++    builder.build(scene, cam, *scheduler, lists);
++
++    CHECK(lists.counters.totalCandidates == 10);
++    CHECK(lists.counters.culledByLayerMask == 2);
++    CHECK(lists.counters.culledByFrustum == 3);
++    CHECK(lists.counters.visible == 5);
++    CHECK(lists.counters.recordsIn == 5);
++    CHECK(lists.counters.drawsSubmitted == 1);  // all 5 identical -> collapsed to one instanced draw
++}
++
++// =======================================================================
++// Determinism across thread counts [gate ruling #6].
++// =======================================================================
++
++TEST_CASE("build() produces byte-identical ViewLists across --threads 1/2/8 for the same scene [gate ruling #6 "
++          "'Determinism across thread counts' -- fixed index-range chunks + deterministic serial compaction]") {
++    FakeAssetSource assets;
++    MaterialHandle matA = assets.addMaterial(opaqueMaterial());
++    MaterialAsset matBAsset = opaqueMaterial();
++    matBAsset.doubleSided = true;
++    MaterialHandle matB = assets.addMaterial(matBAsset);
++    MaterialHandle blendMat = assets.addMaterial(blendMaterial());
++
++    Scene scene(assets.meshBoundsFn());
++    constexpr uint32_t kCount = 2000;
++    for (uint32_t i = 0; i < kCount; ++i) {
++        const uint32_t blockId = i % 3;
++        MaterialHandle mat = (i % 5 == 0) ? blendMat : ((i % 2 == 0) ? matA : matB);
++        const float z = -1.0F - static_cast<float>(i % 50);
++        // A handful of shared mesh identities (i % 17) so collapse runs are
++        // real and exercised too, not just the trivial "everyone unique"
++        // case that would make this test weaker.
++        MeshHandle mesh =
++            assets.addMesh({makeSubmesh(blockId, (i % 17) * 4, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, z)));
++        static_cast<void>(addRenderable(scene, mesh, /*layers=*/~0U, /*channels=*/0xFFU, /*castsShadows=*/true,
++                                          static_cast<uint8_t>(i % 8)));
++    }
++
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++    Camera cam = testCamera(0.1F, 1000.0F);
++
++    std::optional<ViewLists> reference;
++    for (uint32_t threads : {1U, 2U, 8U}) {
++        auto scheduler = rx::task::Scheduler::create(threads);
++        REQUIRE(scheduler != nullptr);
++        ViewLists lists;
++        builder.build(scene, cam, *scheduler, lists);
++        if (!reference.has_value()) {
++            reference = lists;
++            continue;
++        }
++        INFO("threads=", threads);
++        REQUIRE(lists.commands.size() == reference->commands.size());
++        for (size_t i = 0; i < lists.commands.size(); ++i) {
++            CHECK(lists.commands[i] == reference->commands[i]);
++        }
++        REQUIRE(lists.payloads.size() == reference->payloads.size());
++        for (size_t i = 0; i < lists.payloads.size(); ++i) {
++            CHECK(lists.payloads[i] == reference->payloads[i]);
++        }
++        REQUIRE(lists.blocks.size() == reference->blocks.size());
++        for (size_t i = 0; i < lists.blocks.size(); ++i) {
++            CHECK(lists.blocks[i] == reference->blocks[i]);
++        }
++        CHECK(lists.opaqueCommandCount == reference->opaqueCommandCount);
++        CHECK(lists.counters == reference->counters);
++    }
++}
++
++// =======================================================================
++// Zero-alloc, caller-owned storage [D26 amendment].
++//
++// COUNTING MECHANISM: a scoped global operator new/delete override, active
++// ONLY while `g_countingAllocations` is set. Counts TOTAL allocation
++// CALLS (monotonic, never decremented on free) -- deliberately NOT a net
++// (allocs-minus-frees) live count, a NET-count design this task tried
++// FIRST and empirically found unsound (kept here as the documented reason,
++// not a hypothetical): a buggy "discard and reallocate from empty every
++// call" implementation still ends each call with exactly ONE live buffer
++// for a given vector (same as a correctly-reused one), so a net-count
++// delta across the call is ZERO either way -- the regrowth's own
++// alloc/free PAIRS cancel out in a net metric even though real allocator
++// traffic genuinely occurred. A MONOTONIC total-calls counter cannot be
++// fooled the same way: every real `operator new` invocation during the
++// window increments it permanently, so a call that reallocates ANYTHING
++// shows a nonzero delta even though its net live-count change is zero.
++// Verified directly, this task: a deliberate revert-probe (reassigning
++// `out.commands = std::vector<DrawCommand>();` instead of `.clear()`)
++// passed BOTH the capacity-equality and net-live-count checks, and only
++// this monotonic counter caught it -- see the task report's
++// revert-discrimination section for the full account.
++// =======================================================================
++
++namespace {
++std::atomic<int64_t> g_totalAllocationCalls{0};
++std::atomic<bool> g_countingAllocations{false};
++}  // namespace
++
++void* operator new(size_t size) {
++    void* p = std::malloc(size == 0 ? 1 : size);
++    if (p == nullptr) {
++        throw std::bad_alloc();
++    }
++    if (g_countingAllocations.load(std::memory_order_relaxed)) {
++        g_totalAllocationCalls.fetch_add(1, std::memory_order_relaxed);
++    }
++    return p;
++}
++void operator delete(void* p) noexcept { std::free(p); }
++void operator delete(void* p, size_t) noexcept { std::free(p); }
++void* operator new[](size_t size) { return operator new(size); }
++void operator delete[](void* p) noexcept { std::free(p); }
++void operator delete[](void* p, size_t) noexcept { std::free(p); }
++
++TEST_CASE("build() into reused ViewLists/DrawListBuilder storage performs zero net capacity growth across "
++          "steady-state frames after a warm-up call [D26 zero-alloc invariant]") {
++    FakeAssetSource assets;
++    MaterialHandle mat = assets.addMaterial(opaqueMaterial());
++    MaterialHandle blendMat = assets.addMaterial(blendMaterial());
++    Scene scene(assets.meshBoundsFn());
++    constexpr uint32_t kCount = 500;
++    for (uint32_t i = 0; i < kCount; ++i) {
++        MaterialHandle m = (i % 4 == 0) ? blendMat : mat;
++        MeshHandle mesh = assets.addMesh({makeSubmesh(i % 2, (i % 9) * 4, 3, 0, m)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++        static_cast<void>(addRenderable(scene, mesh));
++    }
++
++    auto scheduler = rx::task::Scheduler::create(4);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++    Camera cam = testCamera(0.1F, 1000.0F);
++
++    ViewLists lists;
++    builder.build(scene, cam, *scheduler, lists);  // warm-up: establishes peak capacity
++
++    const size_t commandsCap = lists.commands.capacity();
++    const size_t payloadsCap = lists.payloads.capacity();
++    const size_t blocksCap = lists.blocks.capacity();
++    // Capacity equality and `.data()` pointer identity are BOTH checked
++    // below too, but neither is sufficient ON ITS OWN (verified directly,
++    // this task, via a deliberate revert-probe -- see the task report's
++    // revert-discrimination section): a buggy "discard and reallocate from
++    // empty every call" implementation can still coincidentally reach the
++    // SAME final `.capacity()` (std::vector's geometric growth from empty
++    // is a deterministic function of final size alone) AND the SAME
++    // `.data()` address (glibc's allocator commonly hands back the
++    // just-freed block immediately for a same-size request). The
++    // g_totalAllocationCalls monotonic counter below (captured after this
++    // point) is the mechanism that actually catches it; capacity/pointer
++    // checks are kept as cheap, corroborating signals, not the primary
++    // proof.
++    const DrawCommand* commandsData = lists.commands.data();
++    const DrawPayload* payloadsData = lists.payloads.data();
++    const BlockRange* blocksData = lists.blocks.data();
++    const rx::scene::detail::DrawListBuilderCapacitiesForTesting builderCaps1 =
++        rx::scene::detail::capacitiesForTesting(builder);
++
++    // Baseline: the FIRST post-warm-up call's own total-allocation-call
++    // delta. Any incidental, legitimate per-call churn this class does not
++    // own (e.g. rx_task's own std::function/task-node bookkeeping inside
++    // parallelFor(), which this test makes no claim about) shows up here
++    // too -- captured once and required to be small AND stable across
++    // every subsequent steady-state call, rather than assumed to be
++    // exactly zero.
++    int64_t baselineDelta = -1;
++    constexpr int kSteadyFrames = 10;
++    for (int frame = 0; frame < kSteadyFrames; ++frame) {
++        const int64_t before = g_totalAllocationCalls.load(std::memory_order_relaxed);
++        g_countingAllocations.store(true, std::memory_order_relaxed);
++        builder.build(scene, cam, *scheduler, lists);
++        g_countingAllocations.store(false, std::memory_order_relaxed);
++        const int64_t delta = g_totalAllocationCalls.load(std::memory_order_relaxed) - before;
++
++        INFO("frame=", frame, " allocation-call delta=", delta);
++        if (frame == 0) {
++            baselineDelta = delta;
++            MESSAGE("rx_scene zero-alloc: steady-state build() call made ", delta,
++                    " operator-new call(s) (baseline; must stay small and IDENTICAL every subsequent frame)");
++            // A ceiling, not a guess: the revert-probe this task ran (see
++            // the task report) showed a buggy reallocate-from-empty
++            // implementation needs double-digit operator-new calls just to
++            // regrow ONE 500-entry vector back to its steady size via
++            // geometric doubling -- far above this ceiling, which only
++            // needs to be generous enough for whatever legitimate,
++            // unrelated-to-this-class churn rx_task's own parallelFor()
++            // bookkeeping performs.
++            CHECK(baselineDelta <= 4);
++        } else {
++            CHECK(delta == baselineDelta);
++        }
++        CHECK(lists.commands.capacity() == commandsCap);
++        CHECK(lists.payloads.capacity() == payloadsCap);
++        CHECK(lists.blocks.capacity() == blocksCap);
++        CHECK(lists.commands.data() == commandsData);
++        CHECK(lists.payloads.data() == payloadsData);
++        CHECK(lists.blocks.data() == blocksData);
++
++        const auto builderCapsN = rx::scene::detail::capacitiesForTesting(builder);
++        CHECK(builderCapsN.cullReasons == builderCaps1.cullReasons);
++        CHECK(builderCapsN.visibleIndices == builderCaps1.visibleIndices);
++        CHECK(builderCapsN.pending == builderCaps1.pending);
++        CHECK(builderCapsN.opaqueRecords == builderCaps1.opaqueRecords);
++        CHECK(builderCapsN.blendRecords == builderCaps1.blendRecords);
++        CHECK(builderCapsN.opaqueGroups == builderCaps1.opaqueGroups);
++    }
++}
++
++// =======================================================================
++// D27 -- main-thread pre-resolution + worker-guard.
++// =======================================================================
++
++TEST_CASE("resolveDrawGroups(): a single linear scan calls the resolver exactly once per distinct materialIndex "
++          "boundary in the sorted list, never a second grouping pass [D27]") {
++    ViewLists lists;
++    // 4 commands: material 1, 1, 2, 1 (non-adjacent repeat of material 1 --
++    // a correct implementation still resolves material 1 TWICE, once per
++    // contiguous run, never memoizing across non-adjacent runs, and never
++    // re-scanning already-grouped commands).
++    const std::vector<uint32_t> materialSequence = {1, 1, 2, 1};
++    for (uint32_t mat : materialSequence) {
++        DrawCommand cmd;
++        cmd.firstInstance = static_cast<uint32_t>(lists.payloads.size());
++        cmd.instanceCount = 1;
++        lists.commands.push_back(cmd);
++        lists.payloads.push_back(DrawPayload{mat, 0});
++    }
++
++    std::vector<uint32_t> resolveCalls;
++    auto resolver = [&](uint32_t materialIndex) -> uint32_t {
++        resolveCalls.push_back(materialIndex);
++        return materialIndex * 100;
++    };
++    const auto groups = rx::scene::resolveDrawGroups(lists, resolver);
++
++    REQUIRE(resolveCalls.size() == 3);  // {1},{2},{1} -- three contiguous runs, three calls
++    CHECK(resolveCalls[0] == 1);
++    CHECK(resolveCalls[1] == 2);
++    CHECK(resolveCalls[2] == 1);
++
++    REQUIRE(groups.size() == 3);
++    CHECK(groups[0] == rx::scene::ResolvedDrawGroup{0, 2, 100});
++    CHECK(groups[1] == rx::scene::ResolvedDrawGroup{2, 1, 200});
++    CHECK(groups[2] == rx::scene::ResolvedDrawGroup{3, 1, 100});
++}
++
++#ifdef RX_DEBUG_CHECKS
++namespace {
++
++std::atomic<std::vector<std::string>*> g_recordDrawListCapture{nullptr};
++std::mutex g_recordDrawListCaptureMutex;
++
++void captureRecordDrawListViolation(const char* context) {
++    auto* capture = g_recordDrawListCapture.load(std::memory_order_relaxed);
++    if (capture == nullptr) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(g_recordDrawListCaptureMutex);
++    capture->emplace_back(context != nullptr ? context : "");
++}
++
++struct ViolationHookGuard {
++    ~ViolationHookGuard() {
++        g_recordDrawListCapture.store(nullptr, std::memory_order_relaxed);
++        rx::core::debug::detail::setViolationHookForTests(nullptr);
++    }
++};
++
++ViewLists makeSimpleLists(uint32_t commandCount) {
++    ViewLists lists;
++    for (uint32_t i = 0; i < commandCount; ++i) {
++        DrawCommand cmd;
++        cmd.firstInstance = static_cast<uint32_t>(lists.payloads.size());
++        cmd.instanceCount = 1;
++        lists.commands.push_back(cmd);
++        lists.payloads.push_back(DrawPayload{i, 0});  // every command a distinct materialIndex -> N groups
++    }
++    return lists;
++}
++
++}  // namespace
++
++TEST_CASE("recordDrawList()'s RecordChunkFn callback -- proven to run on genuine background worker threads via "
++          "a deterministic rendezvous barrier -- NEVER triggers the main-thread guard the pre-resolution "
++          "resolver carries: the chunk callback structurally never sees PipelineResolveFn at all [D27; gate "
++          "ruling #6 'D27 worker-guard test reuses setViolationHookForTests + the rendezvous-barrier pattern "
++          "from test_material_system.cpp:854-1042'; adapted here to rx::task::Scheduler::parallelFor's own "
++          "documented n-way barrier precedent (rx_task/tests/scheduler_test.cpp), since this device-free "
++          "library has no rx_graph::Executor/live VkDevice to bind the ORIGINAL test's own GPU scaffolding to]") {
++    const ViewLists lists = makeSimpleLists(6);
++    std::vector<std::string> capture;
++    g_recordDrawListCapture.store(&capture, std::memory_order_relaxed);
++    rx::core::debug::detail::setViolationHookForTests(&captureRecordDrawListViolation);
++    ViolationHookGuard hookGuard;
++
++    auto resolver = [](uint32_t materialIndex) -> uint32_t {
++        RX_ASSERT_MAIN_THREAD("test resolvePipeline (legal path)");
++        return materialIndex;
++    };
++
++    constexpr uint32_t kWorkerCount = 6;
++    auto scheduler = rx::task::Scheduler::create(kWorkerCount);
++    REQUIRE(scheduler != nullptr);
++
++    // Deterministic n-way barrier [rx_task/tests/scheduler_test.cpp's own
++    // precedent, cited above]: `chunkCount` chunks, grainSize 1, each
++    // increments `arrived` then busy-waits for ALL to arrive. This can
++    // ONLY resolve if every chunk is alive and making progress
++    // CONCURRENTLY -- if parallelFor() ever ran the whole range
++    // sequentially on one thread, the first chunk's wait would spin to
++    // its own timeout with nothing else able to bump the counter.
++    constexpr uint32_t kChunkCount = kWorkerCount;
++    std::atomic<uint32_t> arrived{0};
++    std::atomic<uint32_t> timeouts{0};
++
++    rx::scene::RecordChunkFn recordChunk = [&](uint32_t /*chunkIndex*/, uint32_t chunkCount,
++                                                  std::span<const rx::scene::ResolvedDrawGroup> groups) {
++        CHECK(chunkCount == kChunkCount);
++        // Touch the pre-resolved plain data ONLY -- never the resolver
++        // (structurally unreachable: RecordChunkFn's own signature never
++        // receives PipelineResolveFn -- see draw_list.h's own comment).
++        uint32_t total = 0;
++        for (const auto& g : groups) {
++            total += g.commandCount;
++        }
++        CHECK(total == 6);
++
++        arrived.fetch_add(1, std::memory_order_acq_rel);
++        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
++        while (arrived.load(std::memory_order_acquire) < kChunkCount) {
++            if (std::chrono::steady_clock::now() >= deadline) {
++                timeouts.fetch_add(1, std::memory_order_acq_rel);
++                return;
++            }
++            std::this_thread::yield();
++        }
++    };
++
++    rx::scene::recordDrawList(lists, *scheduler, kChunkCount, resolver, recordChunk);
++
++    REQUIRE(timeouts.load() == 0);
++    CHECK(arrived.load() == kChunkCount);
++    std::lock_guard<std::mutex> lock(g_recordDrawListCaptureMutex);
++    CHECK(capture.empty());  // the (proven-concurrent) chunk callbacks never touched the guarded resolver.
++}
++
++TEST_CASE("Adversarial control: a chunk callback that DELIBERATELY calls the guarded resolver from a thread "
++          "PROVEN (two-chunk rendezvous barrier, same construction as test_material_system.cpp:1042-1168) to "
++          "be a genuine non-main worker DOES trip RX_ASSERT_MAIN_THREAD -- proves the guard mechanism itself "
++          "would have caught the bug the test above proves absent, not merely that nothing was ever tried") {
++    auto resolver = [](uint32_t materialIndex) -> uint32_t {
++        RX_ASSERT_MAIN_THREAD("test resolvePipeline (deliberately illegal call site)");
++        return materialIndex;
++    };
++    std::vector<std::string> capture;
++    g_recordDrawListCapture.store(&capture, std::memory_order_relaxed);
++    rx::core::debug::detail::setViolationHookForTests(&captureRecordDrawListViolation);
++    ViolationHookGuard hookGuard;
++
++    constexpr uint32_t kWorkerCount = 6;
++    auto scheduler = rx::task::Scheduler::create(kWorkerCount);
++    REQUIRE(scheduler != nullptr);
++
++    const std::thread::id mainThreadId = std::this_thread::get_id();
++    std::atomic<uint32_t> barrierArrived{0};
++    std::atomic<bool> barrierTimedOut{false};
++    std::atomic<bool> claimed{false};
++    std::atomic<uint32_t> illegalCalls{0};
++    constexpr auto kBarrierTimeout = std::chrono::seconds(10);
++
++    // Two designated participants (chunks 0 and 1, out of >=3 total) form
++    // the mutual barrier; every other chunk is a no-op -- same "a single
++    // thread cannot satisfy a mutual wait with itself" argument
++    // test_material_system.cpp's own comment spells out in full: at most
++    // one of {chunk 0, chunk 1} can be mainThreadId, so at least one
++    // reaching the post-barrier code is unconditionally a genuine worker.
++    scheduler->parallelFor(6, 1, [&](uint32_t begin, uint32_t /*end*/, uint32_t) {
++        const uint32_t chunkIndex = begin;
++        if (chunkIndex != 0 && chunkIndex != 1) {
++            return;
++        }
++        barrierArrived.fetch_add(1, std::memory_order_acq_rel);
++        const auto waitStart = std::chrono::steady_clock::now();
++        while (barrierArrived.load(std::memory_order_acquire) < 2) {
++            if (std::chrono::steady_clock::now() - waitStart > kBarrierTimeout) {
++                barrierTimedOut.store(true, std::memory_order_relaxed);
++                return;
++            }
++            std::this_thread::yield();
++        }
++        if (std::this_thread::get_id() == mainThreadId) {
++            return;  // legal either way -- the other participant proves the worker case.
++        }
++        bool expected = false;
++        if (!claimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
++            return;
++        }
++        illegalCalls.fetch_add(1, std::memory_order_relaxed);
++        static_cast<void>(resolver(0));  // deliberately illegal: calling the guarded resolver off the main thread.
++    });
++
++    REQUIRE_FALSE(barrierTimedOut.load());
++    REQUIRE(illegalCalls.load() == 1);
++    std::lock_guard<std::mutex> lock(g_recordDrawListCaptureMutex);
++    REQUIRE(capture.size() == 1);
++    CHECK(capture[0] == "test resolvePipeline (deliberately illegal call site)");
++}
++#endif  // RX_DEBUG_CHECKS
++
++// =======================================================================
++// Scene::aliveSpan()/generationsSpan() [Task 19 addition -- see the task
++// report for why these were necessary].
++// =======================================================================
++
++TEST_CASE("Scene::aliveSpan()/generationsSpan() correctly distinguish a live slot from a destroyRenderable()d "
++          "hole still holding stale column values -- build() must never treat a freed slot as a candidate "
++          "[Task 19 addition, necessary correctness fix]") {
++    FakeAssetSource assets;
++    MaterialHandle mat = assets.addMaterial(opaqueMaterial());
++    MeshHandle mesh = assets.addMesh({makeSubmesh(0, 0, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++    Scene scene(assets.meshBoundsFn());
++
++    RenderableHandle h0 = addRenderable(scene, mesh);
++    RenderableHandle h1 = addRenderable(scene, mesh);
++    RenderableHandle h2 = addRenderable(scene, mesh);
++    static_cast<void>(h0);
++    static_cast<void>(h2);
++
++    REQUIRE(scene.aliveSpan().size() == 3);
++    REQUIRE(scene.generationsSpan().size() == 3);
++    CHECK(scene.aliveSpan()[1] != 0);
++
++    scene.destroyRenderable(h1);  // leaves layers_[1]/mesh_[1]/etc. at their stale last values (scene.cpp's own contract)
++    CHECK(scene.aliveSpan()[1] == 0);
++
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++    ViewLists lists;
++    builder.build(scene, testCamera(0.1F, 1000.0F), *scheduler, lists);
++
++    CHECK(lists.counters.totalCandidates == 2);  // the freed slot is NOT a candidate
++    CHECK(lists.counters.visible == 2);
++    CHECK(lists.counters.recordsIn == 2);
++}

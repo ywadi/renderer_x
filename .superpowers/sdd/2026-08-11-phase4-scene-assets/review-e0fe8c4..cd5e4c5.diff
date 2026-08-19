@@ -1,0 +1,785 @@
+# Review package: e0fe8c4..cd5e4c5
+
+## Commits
+cd5e4c5 docs: Task 19 report fix-round-1 delta -- all 4 review findings closed
+969fe55 fix(rx_scene): widen D27 pipeline-resolve seam to carry a real VkPipeline
+
+## Files changed
+ .../task-19-report.md                              | 172 +++++++++++++++++++--
+ src/rx_scene/draw_list.cpp                         |  40 ++++-
+ src/rx_scene/include/rx_scene/draw_list.h          |  71 +++++++--
+ src/rx_scene/tests/draw_list_test.cpp              |  93 +++++++++--
+ 4 files changed, 334 insertions(+), 42 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-19-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-19-report.md
+index eb664ff..81592f9 100644
+--- a/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-19-report.md
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-19-report.md
+@@ -5,22 +5,22 @@ BASE = a178969 (post Task 18, CI green).
+ 
+ ## Files created
+ 
+ - `src/rx_scene/include/rx_scene/draw_list.h` (576 lines) — public API:
+   `DrawCommand`/`DrawPayload`/`BlockRange`/`CullCounters`/`ViewLists`/
+   `ShadowLists`, the `sortkey` namespace (bit layout + encode/decode),
+   `MeshSubmeshesFn`/`MaterialResolveFn` injected seams + their
+   `xFromRegistry()` production adapters, `DrawListBuilder`, and the
+   `recordDrawList`/`resolveDrawGroups` D27 mechanism.
+ - `src/rx_scene/draw_list.cpp` (887 lines) — implementation.
+-- `src/rx_scene/tests/draw_list_test.cpp` (1453 lines, 61 test cases) —
+-  device-free coverage.
++- `src/rx_scene/tests/draw_list_test.cpp` (32 `TEST_CASE`s as of fix round
++  1 — see "Fix round 1" section below) — device-free coverage.
+ 
+ ## Files modified (necessary, documented deviations — see below)
+ 
+ - `src/rx_scene/include/rx_scene/scene.h` / `scene.cpp` — added
+   `Scene::aliveSpan()`/`generationsSpan()`; changed the private `alive_`
+   column's storage from `std::vector<bool>` to `std::vector<uint8_t>` so it
+   can be spanned (same convention `castsShadowsSpan()` already established
+   for every other boolean column).
+ - `src/rx_scene/CMakeLists.txt` — added `draw_list.cpp`, linked `rx_task`
+   PUBLIC.
+@@ -111,20 +111,45 @@ delivers is the MECHANISM D27 requires: `resolveDrawGroups()` does the
+ single main-thread linear scan pre-resolving each distinct `materialIndex`
+ boundary exactly once (main-thread-guarded via `RX_ASSERT_MAIN_THREAD`),
+ and `recordDrawList()` fans `RecordChunkFn` out via `scheduler.parallelFor()`
+ with a callback signature that STRUCTURALLY never receives
+ `PipelineResolveFn` — a compile-time-adjacent guarantee, not just a runtime
+ check (exactly what the gate matrix's own D27 row asks for). A production
+ `PipelineResolveFn`/`RecordChunkFn` pair implementing the real GPU path is
+ future-task work; this task proves the seam and its guard are load-bearing
+ (see revert-discrimination evidence below).
+ 
++**Fix round 1 correction (review finding 3, Medium):** the FIRST cut of
++this seam shaped `PipelineResolveFn` as `std::function<uint32_t(uint32_t
++materialIndex)>` and `ResolvedDrawGroup::pipelineToken` as `uint32_t` —
++independently reviewed and found genuinely wrong, not just narrow:
++`VkPipeline` is a `VK_DEFINE_NON_DISPATCHABLE_HANDLE` (vendored
++`vulkan_core.h`), 8 bytes on every platform this project targets
++regardless of the `VK_USE_64_BIT_PTR_DEFINES` branch, so a `uint32_t`
++token could never actually carry one; and `MaterialSystem::getPipeline()`
++takes a `PipelineRequest{MaterialHandle material; PassSignature pass;
++uint32_t specializationBits;}`, not a bare material index, so the seam's
++INPUT shape was also incomplete. Fixed (still device-free, no
++`rx::material`/`rx::graph` dependency added): a new `PipelineRequestKey{
++uint32_t materialIndex; uint64_t passSignatureHash; uint32_t
++specializationBits; }` mirrors `PipelineRequest`'s three fields exactly
++(`passSignatureHash`'s type matches `PassSignature::hash()`'s own
++`uint64_t` return type field-for-field); `PipelineResolveFn` now takes a
++`const PipelineRequestKey&` and returns `uint64_t`;
++`ResolvedDrawGroup::pipelineToken` is `uint64_t`; `resolveDrawGroups()`/
++`recordDrawList()` both gained `passSignatureHash`/`specializationBits`
++parameters (caller-supplied — the pass signature is a per-CALLER, not
++per-`ViewLists`, concern, since one built draw list may legitimately feed
++more than one pass). All three D27 tests updated to the new signature
++in place; see "Fix round 1" section below for the full delta and
++re-verification.
++
+ ### Zero-alloc test mechanism: scoped global `operator new`/`delete`, not capacity/pointer checks
+ 
+ Tried first: `.capacity()` equality and `.data()` pointer-identity checks
+ against the warm-up call's own values. BOTH turned out to be unsound —
+ empirically proven, not assumed (see "Revert 1" below): a buggy
+ `out.commands = std::vector<DrawCommand>();` (discard-and-reallocate every
+ call) still reaches the SAME final `.capacity()` (std::vector's geometric
+ growth from empty is a deterministic function of final size alone) and
+ frequently the SAME `.data()` address (glibc's allocator commonly hands
+ back the just-freed block immediately for a same-size request) — neither
+@@ -148,26 +173,29 @@ unrelated failures.
+ | Criterion | Test(s) | Result |
+ |---|---|---|
+ | Sort-key bit layout documented + `decode()` round-trip | `sortkey::encodeOpaque/decodeOpaque round-trips...`, `...encodeBlend/decodeBlend...`, `...encodeShadow/decodeShadow...` | PASS — named constants + ASCII diagram in `draw_list.h`; exact round-trip on every field |
+ | Depth bucket = truncated monotonic float32 bit pattern, never linear rescale | `Depth bucket preserves ordering for NDC depths clustered near the reversed-Z near plane` | PASS — real reversed-Z-infinite `near/distance` NDC values, near-plane pair (0.2 vs 0.3 units) resolvable, monotonic across a realistic clustered range |
+ | Deterministic low-bit tie-break = stable creation index | `build() produces byte-identical ViewLists across --threads 1/2/8` + Revert 4 | PASS — tie-break is the renderable's Scene slot index; discrimination proven (see below) |
+ | Partition sort-DIRECTION test, one shared fixture | `Opaque partition sorts front-to-back... and blend partition sorts back-to-front... on the SAME depth values` | PASS — 3 known depths, opaque decreasing / blend increasing, asserted via `firstIndex` identity tags |
+ | Priority tier above pipeline bits | `Priority occupies a documented tier ABOVE pipeline/material/depth` | PASS |
+ | blendOrder bits reserved, unpopulated | `...decodeBlend...` asserts `reservedBlendOrder == 0` | PASS |
+ | Fixed index-range chunks + chunk-order concatenation → byte-identical across `--threads` | `build() produces byte-identical ViewLists across --threads 1/2/8` | PASS — see design note: achieved via embarrassingly-parallel per-index writes + fixed slot-order serial compaction (a simpler mechanism giving the identical guarantee — documented in `cullView()`'s own comment) |
+ | D26.3 lockstep (commands/payloads as one unit; interleaved-desync test mandatory) | `D26.3 lockstep criterion: an interleaved-creation-order scene...` + Revert 3 | PASS — cross-checks every collapsed command's payload range against source-renderable identity, not just counts |
++| Cross-group depth ordering (not a matrix row; added fix round 1, finding 2, to document an intentional design tradeoff the review flagged as under-tested) | `Cross-group depth ordering: representative-depth (nearest-member) comparison, not a flattened per-instance merge` | PASS — pins down and asserts the group-representative-vs-flattened-merge tradeoff on a hand-computed interleaved-depth fixture; code comment added at `collapseAndSortOpaque()` stating D14 front-to-back is an early-Z rejection-rate optimization, not an ordering guarantee (opaque correctness comes from the per-fragment depth test, submission-order-independent by construction) |
+ | `CullCounters` exact field list, CI-gated | `CullCounters are EXACT across a mixed layer/frustum/visible scene` + counters asserted in nearly every other test | PASS |
+ | `ShadowLists` = ViewLists shape, single partition, sorted (pipeline, mesh range, block), BLEND excluded | `buildShadow(): BLEND-partition renderables are EXCLUDED...` | PASS |
+ | Culling planes from `Camera::cullingProj()` (finite) + extreme-depth-never-culled | `An object at extreme depth (100,000 units)...` | PASS — both directions tested (legitimately included AND legitimately excluded by a smaller far plane) |
+ | Degenerate/zero-extent AABB + ground-slab | `build() never culls a degenerate (single-point, min==max) AABB...`, `...never culls a ground-slab AABB...` | PASS |
+ | Per-block contiguous `BlockRange` grouping | `ViewLists.blocks groups commands contiguously by blockId...` | PASS — adversarial fixture interleaves 2 blocks × 2 pipeline variants |
+-| D27 worker-guard test, `setViolationHookForTests` + rendezvous barrier | `recordDrawList()'s RecordChunkFn callback... NEVER triggers the main-thread guard` + adversarial control test + Revert 2 | PASS — see deviation note (adapted to `task::Scheduler`'s own barrier precedent, device-free) |
++| D27 worker-guard test, `setViolationHookForTests` + rendezvous barrier | `recordDrawList()'s RecordChunkFn callback... NEVER triggers the main-thread guard` + adversarial control test + Revert 2 | PASS — see deviation note (adapted to `task::Scheduler`'s own barrier precedent, device-free); seam shape widened fix round 1 (finding 3), tests updated in place |
++| D26.1 per-draw addressing — data-layout requirement (firstInstance indexing, zero per-draw push-constant fields in `DrawPayload`) | Implicit across every D26.2/D26.3 test (`DrawPayload` has no push-constant-shaped field at all; `firstInstance` is the only addressing mechanism) | PASS (data layout) |
++| D26.1 — literal GPU-observable criterion ("a GPU test... counting `vkCmdPushConstants` calls... O(1) per pass, not O(draws)") | — | **N/A — device-free-unsatisfiable in this task's own scope** (no `VkCommandBuffer` exists in this library; matches how the layer-masks table below marks its own analogous `getLayers`/`getChannels` row). Becomes satisfiable once Task 22/24's real `RecordChunkFn` binds to actual `vkCmdDrawIndexed*`/`vkCmdPushConstants` recording — that binding, and its own validation-layer/call-count proof, is explicitly out of this task's file list (`draw_list.{h,cpp}` only) and this task's own device-free brief |
+ | D26.2 `VkDrawIndexedIndirectCommand` compatibility | `DrawCommand is byte-for-byte VkDrawIndexedIndirectCommand-compatible...` | PASS — `static_assert(sizeof(...)==...)` + per-field `offsetof` + reinterpret-cast upload proof |
+ | Instancing collapse, records-in vs draws-submitted | `An identical-run scene (1000 identical renderables) collapses into ONE DrawCommand...` | PASS — exact `recordsIn==1000`, `drawsSubmitted==1` |
+ | Off-screen-caster-still-casts + conservative exclusion | `buildShadow(): a caster fully OUTSIDE the camera frustum...` | PASS — both the include AND the exclude case, independently confirmed off-camera via a separate `build()` call |
+ | Alpha-MASK in opaque partition | `Alpha-MASK draws land in the opaque partition...` | PASS |
+ | D24 residency-tolerant resolve (mesh + material) | `An evicted MATERIAL handle resolves to the fallback...`, `An evicted MESH handle resolves to the (empty) fallback...` | PASS — never a crash, fallback substitution both ways |
+ | Zero-alloc invariant | `build() into reused ViewLists/DrawListBuilder storage performs zero net capacity growth...` + Revert 1 | PASS — see measured evidence below |
+ 
+ ## Per-criterion proof — matrix-issue07 (layer-masks)
+ 
+ | Criterion | Test(s) | Result |
+@@ -244,33 +272,41 @@ after the enclosing function); `cullView`/`cullShadowCasters`/
+ explicit names) — the parallel cull AND the sort are both independently
+ zoned per the task's own instruction, so a Tracy capture during Task 24's
+ stress-v2 run can attribute time to culling vs. record-generation vs.
+ sorting/collapse separately.
+ 
+ ## Test suite results
+ 
+ **linux-native, serial `ctest` (matching CI's own invocation):**
+ ```
+ 100% tests passed, 0 tests failed out of 23
+-Total Test time (real) = 155.42 sec
++Total Test time (real) = 155.42 sec   [pre-fix-round-1 run; 148.16 sec post-fix-round-1, see below]
+ ```
+-`rx_scene_tests` alone: 61 test cases (57 unconditional + 4 gated behind
+-`RX_DEBUG_CHECKS`, which is ON in both dev presets), 6199 assertions, 0
+-failures, stable across 5 repeated runs (no flakiness observed in the
+-barrier-based D27/determinism tests).
++`rx_scene_tests` alone (post-fix-round-1 figures; see "Fix round 1"
++section for the corrected count — this line originally, incorrectly,
++read "61 test cases (57 unconditional + 4 gated)", a reviewer-caught
++arithmetic error, see Finding 3 below): **58 total `TEST_CASE`s** across
++the whole `rx_scene` suite (32 in `draw_list_test.cpp`, 16 in
++`scene_test.cpp`, 8 in `camera_test.cpp`, 2 in `thread_guard_test.cpp`),
++of which 4 (2 in `draw_list_test.cpp`, 2 pre-existing in
++`thread_guard_test.cpp`) are compiled behind `#ifdef RX_DEBUG_CHECKS` --
++INCLUDED in the 58, not additional. `RX_DEBUG_CHECKS=ON` in both dev
++presets, so all 58 compile and run; doctest reports `test cases: 58 | 58
++passed`, 6205 assertions, 0 failures, stable across repeated runs (no
++flakiness observed in the barrier-based D27/determinism tests).
+ 
+ **windows-cross-zig, under Wine (per README's own documented local-
+ verification convention — `xvfb-run -a ctest --preset windows-cross-zig -E
+ 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample'`):**
+ ```
+ 100% tests passed, 0 tests failed out of 11
+-Total Test time (real) = 119.82 sec
++Total Test time (real) = 119.82 sec   [pre-fix-round-1; 116.71 sec post-fix-round-1, both 100%/11-of-11]
+ ```
+ `rx_scene_tests.exe`: 0.08s, all cases passed (device-free, as expected —
+ matches the README's own list of binaries genuinely device-free under
+ Wine). `rx_asset_gltf_gpu_tests.exe` (real winevulkan/lavapipe `VkDevice`)
+ also passed, confirming the `Scene::alive_` storage-type change introduced
+ no regression in a GPU-backed consumer path either (it has none — `Scene`/
+ `DrawListBuilder` are never touched by that binary — but it shares the
+ `rx_scene` static library, so a link-level confirmation is still useful).
+ 
+ Both presets built from a clean incremental state with zero warnings
+@@ -285,21 +321,25 @@ so every `RX_ASSERT_MAIN_THREAD` guard was live in both runs.
+ 2. Sort key: collapse-BEFORE-sort two-phase design, not a single sort with
+    a mesh tier (the naive reading of "mesh range must be a sort tier for
+    D26.3" breaks D14's own depth-ordering contract across meshes — see
+    design note; caught by TDD, not assumed).
+ 3. `buildShadow(..., LightHandle, ...)`, not a `DirectionalLight` value
+    type (none exists in the landed API).
+ 4. `recordDrawList`/`resolveDrawGroups` are genericized over injected
+    `PipelineResolveFn`/`RecordChunkFn` rather than hard-bound to
+    `rx::material::MaterialSystem`/`rx::graph::PassContext` — the real GPU
+    binding is explicitly Task 22/24 scope per the plan; this task delivers
+-   the mechanism + its guard, proven via revert-discrimination.
++   the mechanism + its guard, proven via revert-discrimination. Fix round 1
++   (review finding 3) widened the seam SHAPE to genuinely carry a real
++   `VkPipeline` (`PipelineRequestKey` mirroring `PipelineRequest`'s three
++   fields, `uint64_t` token) without adding a hard dependency — see the
++   design-decisions section and the "Fix round 1" section below.
+ 5. D27 guard test adapted to `rx::task::Scheduler::parallelFor()`'s own
+    n-way barrier precedent (`rx_task/tests/scheduler_test.cpp`) rather than
+    literally reusing `test_material_system.cpp`'s `rx_graph::Executor`/live-
+    `VkDevice` scaffolding, which this device-free library has no access to
+    by design. The `setViolationHookForTests` + rendezvous-barrier PATTERN
+    is reused verbatim; the GPU harness around it is not, since none exists
+    here.
+ 6. Zero-alloc test uses a scoped global `operator new`/`delete` override —
+    see design note for why the capacity/pointer-only approach was
+    insufficient and why the #29-ruling linkage-risk concern does not apply
+@@ -354,10 +394,122 @@ rather than patched around.
+   depth-bias, and `AttachmentDesc` depth-convention wiring — `buildShadow()`
+   only decides WHICH casters are in the list, never touches a
+   `VkPipeline`/render pass.
+ - Task 22/24: a real `PipelineResolveFn`/`RecordChunkFn` pair binding
+   `recordDrawList()` to `MaterialSystem::getPipeline()` and actual
+   `vkCmdDrawIndexed`/`vkCmdDrawIndexedIndirect` recording.
+ - Task 24: the 30k-instance stress-v2 sample and its published A/B
+   benchmark numbers vs. sample 07 (desktop + Steam Deck), consuming this
+   task's `DrawListBuilder` end to end through `Registry→Scene→
+   DrawListBuilder→graph`.
++
++## Fix round 1 (independent review, `task-19-review.md`)
++
++Verdict: spec PASS, quality Approved, 4 findings (1 Medium, 3 Low), no
++blockers. All 4 closed in-round per project policy.
++
++**Finding 1 [Low] — report's own test-count arithmetic wrong ("61
++(57+4)").** Confirmed: the suite was 57 total `TEST_CASE`s, of which 4
++(RX_DEBUG_CHECKS-gated) are INCLUDED in that 57, not additional — the
++report's own "61" figure double-counted them. Fixed throughout the report
++(the "Files created"/"Test suite results" sections above are corrected in
++place, not left as a separate erratum, since the wrong figure appeared in
++more than one place). The suite is now 58 total (57 pre-existing + 1 new
++test added for finding 2 below), same discipline: 4 gated, included not
++additional. Re-verified directly this round: `grep -c '^TEST_CASE'
++src/rx_scene/tests/*.cpp` → `draw_list_test.cpp:32 scene_test.cpp:16
++camera_test.cpp:8 thread_guard_test.cpp:2` = 58; `./rx_scene_tests` →
++`test cases: 58 | 58 passed`, `assertions: 6205 | 6205 passed`.
++
++**Finding 2 [Low] — missing adversarial cross-group depth-ordering
++test.** Added `TEST_CASE("Cross-group depth ordering: representative-depth
++(nearest-member) comparison, not a flattened per-instance merge...")` to
++`draw_list_test.cpp` (after the D26.3 lockstep test): two collapse-groups
++(distinct meshes, same pipeline/material) with genuinely interleaved
++per-instance depths (group A: world z -0.5 and -50; group B: world z -1
++and -80; near=0.1 camera) — hand-computed representative depths (A=0.2,
++B=0.1, via `ndc = near/distance`) predict group A's WHOLE collapsed
++command (2 instances, including its own far member at true depth 0.002)
++sorts entirely before group B's (2 instances, including B's near member
++at true depth 0.1 — nearer than A's own far member). Test asserts exactly
++this; ran and matched the hand computation exactly on the first attempt
++(no debugging needed — the design's own arithmetic is what the review
++predicted). Added a code comment at `collapseAndSortOpaque()` (immediately
++above the phase-1/phase-2 description) stating the reviewer's own framing
++verbatim in substance: D14 front-to-back is an early-Z rejection-rate
++OPTIMIZATION, not an ordering guarantee — opaque correctness comes from
++the per-fragment depth TEST, which is submission-order-independent by
++construction; group-level (not flattened per-instance) ordering is the
++only way to keep D26.3's collapse guarantee unconditional.
++
++**Finding 3 [Medium] — `PipelineResolveFn`'s `uint32_t` return cannot
++carry a real `VkPipeline`; resolver input shape didn't mirror
++`PipelineRequest`.** Both confirmed against source, not just the review's
++word: `vulkan_core.h`'s `VK_DEFINE_NON_DISPATCHABLE_HANDLE` macro (both
++branches — pointer-typed and raw-`uint64_t`) resolves to an 8-byte type on
++every platform this project targets; `MaterialSystem::getPipeline()`
++(`material_system.h:381`) takes `PipelineRequest{MaterialHandle material;
++PassSignature pass; uint32_t specializationBits;}`, confirmed by direct
++read this round. Fixed at the shape level, not patched:
++- New `struct PipelineRequestKey { uint32_t materialIndex; uint64_t
++  passSignatureHash; uint32_t specializationBits; }` in `draw_list.h` —
++  field-for-field mirror of `PipelineRequest`'s three inputs, with
++  `passSignatureHash` typed to match `PassSignature::hash()`'s own
++  `uint64_t` return exactly (confirmed via direct read of
++  `rx_graph/pass_signature.h`). No `rx::material`/`rx::graph` dependency
++  added — `PipelineRequestKey` is this library's own device-free type.
++- `PipelineResolveFn` is now `std::function<uint64_t(const
++  PipelineRequestKey&)>`; `ResolvedDrawGroup::pipelineToken` is `uint64_t`.
++- `resolveDrawGroups()`/`recordDrawList()` both gained
++  `passSignatureHash`/`specializationBits` parameters — CALLER-supplied
++  (constant for one call, folded into every group's `PipelineRequestKey`
++  alongside that group's own resolved `materialIndex`), since a built
++  `ViewLists` is pass-agnostic and may legitimately feed more than one
++  pass with different signatures; `ViewLists` itself gained no new field.
++- All three D27 tests (`resolveDrawGroups()`'s own linear-scan test, the
++  legal-path worker-guard test, the adversarial illegal-call test) updated
++  to the new signature in place; the linear-scan test was additionally
++  STRENGTHENED (not just recompiled) to assert `passSignatureHash`/
++  `specializationBits` are threaded into every resolve call unchanged,
++  proving the new fields actually flow through, not just compile.
++- Re-verified: `rx_scene`/`rx_scene_tests` rebuilt clean (zero warnings),
++  full suite green (58/58, 6205/6205) on `linux-native`; both presets'
++  full `ctest` runs re-executed after the fix (see below).
++
++**Finding 4 [Low] — D26.1's device-free-unsatisfiable
++`vkCmdPushConstants`-count row missing from the proof table.** Added an
++explicit N/A row to the matrix-issue06 proof table, immediately above the
++existing D26.2 row, mirroring exactly how the layer-masks table already
++handles its own analogous `getLayers`/`getChannels` row: states the
++criterion is unsatisfiable in a `VkCommandBuffer`-free binary, names where
++it becomes satisfiable (Task 22/24's real `RecordChunkFn` binding), and
++adds a companion row confirming the underlying DATA-LAYOUT requirement
++(zero push-constant-shaped fields in `DrawPayload`, `firstInstance`-only
++addressing) IS delivered and covered, implicitly, by the D26.2/D26.3 rows
++already in the table.
++
++**Full re-verification after all four fixes (both presets, foreground,
++matching the exact commands the original report used):**
++```
++linux-native, serial ctest:
++100% tests passed, 0 tests failed out of 23
++Total Test time (real) = 148.16 sec
++
++windows-cross-zig, under Wine (xvfb-run -a ctest --preset windows-cross-zig
++-E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample'):
++100% tests passed, 0 tests failed out of 11
++Total Test time (real) = 116.71 sec
++```
++`rx_scene_tests`/`rx_scene_tests.exe` both green in these runs (58/58
++cases, 6205/6205 assertions on linux-native; Wine run confirms the
++`.exe` builds and runs identically under the cross-compiled target).
++
++No new revert-and-restore probe was run for finding 2's own new test this
++round (not requested; the test's correctness is independently grounded in
++the hand-computed `ndc = near/distance` arithmetic matching the observed
++result exactly, which is itself a form of falsifiable evidence — a wrong
++implementation would not have matched the prediction). Findings 1 and 4
++were pure documentation corrections with no code path to revert-probe.
++Finding 3's shape widening was verified by full clean rebuild + full suite
++re-run on both presets (above), not a revert-probe (there is no "narrower
++seam" bug to revert to — the old shape simply could not compile against a
++real `VkPipeline`, which is exactly the point).
+diff --git a/src/rx_scene/draw_list.cpp b/src/rx_scene/draw_list.cpp
+index 3941d4f..cf8e0dd 100644
+--- a/src/rx_scene/draw_list.cpp
++++ b/src/rx_scene/draw_list.cpp
+@@ -567,20 +567,38 @@ struct DrawListBuilder::Impl {
+     // regardless of the instances' individual depths (a scattered
+     // "identical-mesh forest" scene collapses into ONE instanced draw even
+     // though its members are at wildly different depths) -- the final
+     // `tieBreak` tier makes the WITHIN-group member order deterministic
+     // too, regardless of std::sort's own internals. Phase 2: fold each
+     // identity-run into one CollapsedGroup (representative depth = the
+     // NEAREST member), then sort the resulting, far-fewer, groups by
+     // (blockId, encodeOpaque(priority, pipeline, material, depth,
+     // tieBreak)) -- D14's own front-to-back contract, now applied to
+     // whole draws instead of individual records.
++    //
++    // CROSS-GROUP ORDERING [review round 1, finding 2]: per-INSTANCE
++    // front-to-back order is NOT preserved across a group boundary --
++    // group A's own far member can still be submitted before group B's
++    // near member if group A's NEAREST member out-ranks group B's nearest
++    // member (representative-depth comparison is group-vs-group, not a
++    // flattened per-instance merge). This is intentional, not a
++    // correctness gap: D14's front-to-back ordering exists as an early-Z
++    // REJECTION-RATE optimization (drawing nearer geometry first lets the
++    // depth test reject more hidden fragments in later draws) -- opaque
++    // rendering correctness itself is guaranteed by the per-fragment depth
++    // TEST, which is fully submission-order-independent by construction
++    // (Vulkan's depth test does not care what order draws were recorded
++    // in). Sacrificing global per-instance ordering for group-level
++    // ordering is the ONLY way to keep D26.3's collapse guarantee
++    // unconditional (see the interleaved-depths cross-group test in
++    // draw_list_test.cpp, which pins down and asserts exactly this
++    // tradeoff rather than leaving it implicit).
+     void collapseAndSortOpaque() {
+         std::sort(opaqueRecords.begin(), opaqueRecords.end(), [](const PendingRecord& a, const PendingRecord& b) {
+             if (a.blockId != b.blockId) {
+                 return a.blockId < b.blockId;
+             }
+             if (a.indexCount != b.indexCount) {
+                 return a.indexCount < b.indexCount;
+             }
+             if (a.firstIndex != b.firstIndex) {
+                 return a.firstIndex < b.firstIndex;
+@@ -818,55 +836,65 @@ void DrawListBuilder::buildShadow(const Scene& scene, LightHandle light, const C
+     }
+ 
+     // Step 6: emit, no collapse [Phase 4 scope].
+     impl_->emitShadow(out);
+ }
+ 
+ // ---------------------------------------------------------------------
+ // recordDrawList [D27].
+ // ---------------------------------------------------------------------
+ 
+-std::vector<ResolvedDrawGroup> resolveDrawGroups(const ViewLists& lists, const PipelineResolveFn& resolvePipeline) {
++std::vector<ResolvedDrawGroup> resolveDrawGroups(const ViewLists& lists, uint64_t passSignatureHash,
++                                                    uint32_t specializationBits, const PipelineResolveFn& resolvePipeline) {
+     RX_ASSERT_MAIN_THREAD("rx::scene::resolveDrawGroups");
+     RX_ZONE;
+     std::vector<ResolvedDrawGroup> groups;
+     const size_t n = lists.commands.size();
+     if (n == 0) {
+         return groups;
+     }
+ 
+     auto materialOf = [&](size_t commandIndex) -> uint32_t {
+         return lists.payloads[lists.commands[commandIndex].firstInstance].materialIndex;
+     };
++    // `passSignatureHash`/`specializationBits` are constant for this whole
++    // call (the caller's own pass, not per-group) -- folded into every key
++    // alongside that group's own materialIndex, mirroring
++    // rx::material::PipelineRequest's three fields exactly (see this
++    // header's own top comment).
++    auto keyFor = [&](uint32_t materialIndex) {
++        return PipelineRequestKey{materialIndex, passSignatureHash, specializationBits};
++    };
+ 
+     uint32_t groupStart = 0;
+     uint32_t currentMaterial = materialOf(0);
+-    uint32_t currentToken = resolvePipeline(currentMaterial);
++    uint64_t currentToken = resolvePipeline(keyFor(currentMaterial));
+     for (size_t i = 1; i <= n; ++i) {
+         const bool atEnd = (i == n);
+         const uint32_t mat = atEnd ? 0 : materialOf(i);
+         if (atEnd || mat != currentMaterial) {
+             groups.push_back(ResolvedDrawGroup{groupStart, static_cast<uint32_t>(i) - groupStart, currentToken});
+             if (!atEnd) {
+                 groupStart = static_cast<uint32_t>(i);
+                 currentMaterial = mat;
+-                currentToken = resolvePipeline(currentMaterial);
++                currentToken = resolvePipeline(keyFor(currentMaterial));
+             }
+         }
+     }
+     return groups;
+ }
+ 
+-void recordDrawList(const ViewLists& lists, task::Scheduler& scheduler, uint32_t chunkCount,
+-                     const PipelineResolveFn& resolvePipeline, const RecordChunkFn& recordChunk) {
++void recordDrawList(const ViewLists& lists, task::Scheduler& scheduler, uint32_t chunkCount, uint64_t passSignatureHash,
++                     uint32_t specializationBits, const PipelineResolveFn& resolvePipeline,
++                     const RecordChunkFn& recordChunk) {
+     RX_ZONE;
+-    const std::vector<ResolvedDrawGroup> groups = resolveDrawGroups(lists, resolvePipeline);
++    const std::vector<ResolvedDrawGroup> groups = resolveDrawGroups(lists, passSignatureHash, specializationBits, resolvePipeline);
+     const uint32_t effectiveChunkCount = (chunkCount == 0) ? 1 : chunkCount;
+     scheduler.parallelFor(effectiveChunkCount, /*grainSize=*/1, [&](uint32_t begin, uint32_t end, uint32_t) {
+         for (uint32_t c = begin; c < end; ++c) {
+             recordChunk(c, effectiveChunkCount, groups);
+         }
+     });
+ }
+ 
+ namespace detail {
+ 
+diff --git a/src/rx_scene/include/rx_scene/draw_list.h b/src/rx_scene/include/rx_scene/draw_list.h
+index 4c5798a..e927af0 100644
+--- a/src/rx_scene/include/rx_scene/draw_list.h
++++ b/src/rx_scene/include/rx_scene/draw_list.h
+@@ -490,70 +490,117 @@ private:
+ // `rx::graph::PassContext`, out of THIS device-free library's own scope).
+ // What this library delivers is the MECHANISM: a single main-thread linear
+ // scan over the already-sorted list that pre-resolves every distinct
+ // materialIndex boundary EXACTLY ONCE (D27's own "nearly free... the sorted
+ // draw list already enumerates every distinct pair" argument), producing
+ // plain `ResolvedDrawGroup` data with NO reachable path back to whatever
+ // main-thread-guarded resolver produced it -- `RecordChunkFn`'s own
+ // signature never receives `PipelineResolveFn` at all, a
+ // compile-time-adjacent guarantee stronger than a runtime-only check (gate
+ // ruling #6's own "D27 -- parameter-offset pre-computation" row).
++//
++// SEAM SHAPE [review round 1, finding 3 -- fixed here, not deferred]:
++// mirrors `rx::material::PipelineRequest`'s own three cache-key inputs
++// (`material_system.h`: `MaterialHandle material; PassSignature pass;
++// uint32_t specializationBits;`) field-for-field, WITHOUT taking a hard
++// dependency on `rx::material`/`rx::graph` types (this library stays
++// device-free) -- `materialIndex` stands in for `MaterialHandle` (already
++// this seam's own resolved index), `passSignatureHash` stands in for
++// `PassSignature` via its own `hash()` method's exact return type
++// (`rx_graph/pass_signature.h`: `[[nodiscard]] uint64_t hash() const`),
++// and `specializationBits` is spelled identically. The CALLER of
++// `recordDrawList()`/`resolveDrawGroups()` supplies
++// `passSignatureHash`/`specializationBits` (whoever is recording a
++// specific pass knows its own `PassSignature::hash()`) -- `ViewLists`
++// itself stays pass-agnostic (one built draw list may legitimately feed
++// more than one pass, e.g. a depth prepass and a forward pass, with
++// different pass signatures) and never carries either field.
++//
++// The resolved TOKEN is a plain `uint64_t`, not `uint32_t`: `VkPipeline`
++// is a `VK_DEFINE_NON_DISPATCHABLE_HANDLE` (vendored `vulkan_core.h`),
++// which resolves to either a `uint64_t` or an 8-byte pointer-typed handle
++// depending on `VK_USE_64_BIT_PTR_DEFINES` -- 8 bytes either way on every
++// platform this project targets -- so a real `VkPipeline` bit-cast
++// directly into this token (the production binding's own job; this
++// device-free library never interprets it) round-trips exactly, with no
++// truncation. `ResolvedDrawGroup::pipelineToken` is widened to match.
+ // ---------------------------------------------------------------------
+ 
++// Device-free mirror of `rx::material::PipelineRequest`'s cache-key
++// inputs -- see this section's own top comment for the field-by-field
++// correspondence. A plain, trivially-comparable value type (matches this
++// codebase's own `PassSignature`/`MaterialFixedFunctionState` convention
++// for such keys).
++struct PipelineRequestKey {
++    uint32_t materialIndex = 0;
++    uint64_t passSignatureHash = 0;
++    uint32_t specializationBits = 0;
++
++    bool operator==(const PipelineRequestKey&) const = default;
++};
++
+ // One contiguous run of `ViewLists::commands` sharing the same resolved
+-// materialIndex (and therefore, in production, the same real VkPipeline) --
+-// the ONLY thing a `RecordChunkFn` chunk callback ever sees.
++// `PipelineRequestKey` (and therefore, in production, the same real
++// `VkPipeline`) -- the ONLY thing a `RecordChunkFn` chunk callback ever
++// sees.
+ struct ResolvedDrawGroup {
+     uint32_t firstCommand = 0;
+     uint32_t commandCount = 0;
+-    uint32_t pipelineToken = 0;  // opaque; whatever PipelineResolveFn returned for this group
++    uint64_t pipelineToken = 0;  // opaque 64-bit; whatever PipelineResolveFn returned for this group -- wide enough for a real VkPipeline, see this section's own top comment
+ 
+     bool operator==(const ResolvedDrawGroup&) const = default;
+ };
+ 
+ // MAIN-THREAD-ONLY by contract (D27/D5) -- called exactly once per distinct
+ // `DrawPayload::materialIndex` boundary encountered in `resolveDrawGroups()`'s
+ // single linear scan, NEVER from a worker chunk. A production binding
+-// mirrors `MaterialSystem::getPipeline()`'s own signature shape (material ->
+-// VkPipeline, encoded into the opaque `uint32_t` token here); this
+-// device-free library never names `MaterialSystem` itself.
+-using PipelineResolveFn = std::function<uint32_t(uint32_t materialIndex)>;
++// mirrors `MaterialSystem::getPipeline(PipelineRequest)`'s own signature
++// shape exactly (material+pass+specialization -> VkPipeline, encoded into
++// the opaque `uint64_t` token here); this device-free library never names
++// `MaterialSystem`/`PipelineRequest` itself.
++using PipelineResolveFn = std::function<uint64_t(const PipelineRequestKey& key)>;
+ 
+ // Worker-safe: receives ONLY plain, pre-resolved data (`groups`) -- never
+ // `PipelineResolveFn`, never `lists.payloads` (a chunk records commands
+ // purely from `groups`' command-index ranges plus whatever else the
+ // production binding closes over that is itself worker-safe, e.g. a
+ // `VkCommandBuffer` slice).
+ using RecordChunkFn = std::function<void(uint32_t chunkIndex, uint32_t chunkCount, std::span<const ResolvedDrawGroup> groups)>;
+ 
+ // The single linear scan [D27]: groups `lists.commands` into contiguous
+ // materialIndex-identical runs, calling `resolvePipeline` exactly once per
+-// run (main-thread-guarded internally via RX_ASSERT_MAIN_THREAD -- see
+-// draw_list.cpp). O(commands.size()) -- one pass, no second grouping sort.
++// run -- with `passSignatureHash`/`specializationBits` (constant for this
++// one call, supplied by the caller -- see this section's own top comment)
++// folded into every `PipelineRequestKey` alongside that run's own
++// materialIndex -- main-thread-guarded internally via
++// RX_ASSERT_MAIN_THREAD (see draw_list.cpp). O(commands.size()) -- one
++// pass, no second grouping sort.
+ //
+ // Main-thread-only (D5/D27).
+-[[nodiscard]] std::vector<ResolvedDrawGroup> resolveDrawGroups(const ViewLists& lists,
++[[nodiscard]] std::vector<ResolvedDrawGroup> resolveDrawGroups(const ViewLists& lists, uint64_t passSignatureHash,
++                                                                  uint32_t specializationBits,
+                                                                   const PipelineResolveFn& resolvePipeline);
+ 
+ // Pre-resolves (see resolveDrawGroups() above, called internally, on the
+ // calling/main thread, BEFORE any fan-out) then fans `recordChunk` out
+ // across exactly `chunkCount` chunks via `scheduler.parallelFor()` --
+ // `recordChunk` may run on any of `scheduler`'s worker threads (or the
+ // calling thread, per `Scheduler::parallelFor()`'s own contract) and never
+ // touches `resolvePipeline` again.
+ //
+ // Main-thread-only entry (D5) -- the pre-resolution half runs on the
+ // calling thread; the fan-out half is `scheduler.parallelFor()`'s own
+ // documented any-thread-safe-to-call-from contract (may itself be called
+ // from within an outer chunk, matching `parallelFor()`'s own nesting rule).
+-void recordDrawList(const ViewLists& lists, task::Scheduler& scheduler, uint32_t chunkCount,
+-                     const PipelineResolveFn& resolvePipeline, const RecordChunkFn& recordChunk);
++void recordDrawList(const ViewLists& lists, task::Scheduler& scheduler, uint32_t chunkCount, uint64_t passSignatureHash,
++                     uint32_t specializationBits, const PipelineResolveFn& resolvePipeline,
++                     const RecordChunkFn& recordChunk);
+ 
+ namespace detail {
+ 
+ // Test-only seam -- NOT part of the stable public contract, mirroring
+ // `rx::material::detail::debugCompileCount()`'s own carve-out convention.
+ // `ViewLists`'s OWN vectors are directly inspectable by any test (public
+ // fields); `DrawListBuilder`'s PRIVATE reused scratch storage (cull
+ // reasons/visible-index lists/pending draw records) is not otherwise
+ // observable from outside, so the zero-alloc test needs this one seam to
+ // cover the full `build()`/`buildShadow()` call, not just its public
+diff --git a/src/rx_scene/tests/draw_list_test.cpp b/src/rx_scene/tests/draw_list_test.cpp
+index 93dbd13..a03b624 100644
+--- a/src/rx_scene/tests/draw_list_test.cpp
++++ b/src/rx_scene/tests/draw_list_test.cpp
+@@ -682,20 +682,77 @@ TEST_CASE("D26.3 lockstep criterion: an interleaved-creation-order scene collaps
+         const bool isTypeBCommand = (cmd.firstIndex == 200);
+         REQUIRE((isTypeACommand || isTypeBCommand));
+         const std::unordered_set<uint32_t>& expectedSet = isTypeACommand ? typeAIndices : typeBIndices;
+         for (uint32_t k = cmd.firstInstance; k < cmd.firstInstance + cmd.instanceCount; ++k) {
+             REQUIRE(k < lists.payloads.size());
+             CHECK(expectedSet.count(lists.payloads[k].instanceDataIndex) == 1);
+         }
+     }
+ }
+ 
++TEST_CASE("Cross-group depth ordering: representative-depth (nearest-member) comparison, not a flattened "
++          "per-instance merge -- a group whose FAR member is farther than another group's NEAR member can "
++          "still be submitted entirely first, because its NEAREST member out-ranks the other group's nearest "
++          "[review round 1, finding 2 -- pins down and asserts the design's own documented tradeoff; opaque "
++          "correctness is guaranteed by the per-fragment depth TEST, submission-order-independent by "
++          "construction -- D14 front-to-back is an early-Z rejection-rate optimization, not an ordering "
++          "guarantee]") {
++    FakeAssetSource assets;
++    MaterialHandle mat = assets.addMaterial(opaqueMaterial());
++
++    // Group A (mesh A, firstIndex=300): a NEAR instance (z=-0.5) and a FAR
++    // instance (z=-50). Group B (mesh B, firstIndex=400): a
++    // moderately-near instance (z=-1, nearer than A's far member but
++    // farther than A's near member -- genuinely interleaved with A in true
++    // per-instance depth order) and a very-far instance (z=-80).
++    MeshHandle meshA = assets.addMesh({makeSubmesh(0, 300, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++    MeshHandle meshB = assets.addMesh({makeSubmesh(0, 400, 3, 0, mat)}, unitCubeAt(glm::vec3(0.0F, 0.0F, -10.0F)));
++    Scene scene(assets.meshBoundsFn());
++
++    RenderableDesc nearA;
++    nearA.mesh = meshA;
++    nearA.transform = glm::translate(glm::mat4(1.0F), glm::vec3(0.0F, 0.0F, 9.5F));  // world z = -10 + 9.5 = -0.5
++    static_cast<void>(scene.createRenderable(nearA));
++    RenderableDesc farA;
++    farA.mesh = meshA;
++    farA.transform = glm::translate(glm::mat4(1.0F), glm::vec3(0.0F, 0.0F, -40.0F));  // world z = -10 - 40 = -50
++    static_cast<void>(scene.createRenderable(farA));
++
++    RenderableDesc nearB;
++    nearB.mesh = meshB;
++    nearB.transform = glm::translate(glm::mat4(1.0F), glm::vec3(0.0F, 0.0F, 9.0F));  // world z = -1
++    static_cast<void>(scene.createRenderable(nearB));
++    RenderableDesc farB;
++    farB.mesh = meshB;
++    farB.transform = glm::translate(glm::mat4(1.0F), glm::vec3(0.0F, 0.0F, -70.0F));  // world z = -80
++    static_cast<void>(scene.createRenderable(farB));
++
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++    DrawListBuilder builder(assets.meshSubmeshesFn(), assets.materialResolveFn());
++    ViewLists lists;
++    // near=0.1: ndc(-0.5)=0.2, ndc(-50)=0.002 (group A representative=0.2);
++    // ndc(-1)=0.1, ndc(-80)=0.00125 (group B representative=0.1). A's
++    // representative (0.2) is nearer than B's (0.1), so A's WHOLE
++    // collapsed command (including its far member, true depth 0.002)
++    // sorts entirely before B's (including B's near member, true depth
++    // 0.1 -- nearer than A's far member) -- the documented, intentional
++    // cross-group ordering this test pins down.
++    builder.build(scene, testCamera(/*nearPlane=*/0.1F, /*farPlane=*/1000.0F), *scheduler, lists);
++
++    REQUIRE(lists.commands.size() == 2);
++    CHECK(lists.commands[0].firstIndex == 300);  // group A entirely first
++    CHECK(lists.commands[0].instanceCount == 2);
++    CHECK(lists.commands[1].firstIndex == 400);  // group B entirely second
++    CHECK(lists.commands[1].instanceCount == 2);
++}
++
+ // =======================================================================
+ // Per-block contiguous BlockRange grouping [D26.2].
+ // =======================================================================
+ 
+ TEST_CASE("ViewLists.blocks groups commands contiguously by blockId -- each block occupies exactly ONE "
+           "contiguous BlockRange for a synthetic multi-block scene [gate matrix-issue06 D26.2 row]") {
+     FakeAssetSource assets;
+     MaterialHandle matA = assets.addMaterial(opaqueMaterial());
+     MaterialAsset matBAsset = opaqueMaterial();
+     matBAsset.doubleSided = true;  // distinct pipelineKey from matA, so sorting interleaves pipeline groups
+@@ -1227,31 +1284,38 @@ TEST_CASE("resolveDrawGroups(): a single linear scan calls the resolver exactly
+     // re-scanning already-grouped commands).
+     const std::vector<uint32_t> materialSequence = {1, 1, 2, 1};
+     for (uint32_t mat : materialSequence) {
+         DrawCommand cmd;
+         cmd.firstInstance = static_cast<uint32_t>(lists.payloads.size());
+         cmd.instanceCount = 1;
+         lists.commands.push_back(cmd);
+         lists.payloads.push_back(DrawPayload{mat, 0});
+     }
+ 
+-    std::vector<uint32_t> resolveCalls;
+-    auto resolver = [&](uint32_t materialIndex) -> uint32_t {
+-        resolveCalls.push_back(materialIndex);
+-        return materialIndex * 100;
++    // Caller-supplied, constant-for-this-call inputs [review round 1,
++    // finding 3] -- mirrors rx::material::PipelineRequest's own
++    // pass/specialization fields; asserted below to be threaded into
++    // EVERY resolve call unchanged, alongside that run's own materialIndex.
++    constexpr uint64_t kPassSignatureHash = 0xC0FFEEULL;
++    constexpr uint32_t kSpecializationBits = 7U;
++
++    std::vector<rx::scene::PipelineRequestKey> resolveCalls;
++    auto resolver = [&](const rx::scene::PipelineRequestKey& key) -> uint64_t {
++        resolveCalls.push_back(key);
++        return static_cast<uint64_t>(key.materialIndex) * 100;
+     };
+-    const auto groups = rx::scene::resolveDrawGroups(lists, resolver);
++    const auto groups = rx::scene::resolveDrawGroups(lists, kPassSignatureHash, kSpecializationBits, resolver);
+ 
+     REQUIRE(resolveCalls.size() == 3);  // {1},{2},{1} -- three contiguous runs, three calls
+-    CHECK(resolveCalls[0] == 1);
+-    CHECK(resolveCalls[1] == 2);
+-    CHECK(resolveCalls[2] == 1);
++    CHECK(resolveCalls[0] == rx::scene::PipelineRequestKey{1, kPassSignatureHash, kSpecializationBits});
++    CHECK(resolveCalls[1] == rx::scene::PipelineRequestKey{2, kPassSignatureHash, kSpecializationBits});
++    CHECK(resolveCalls[2] == rx::scene::PipelineRequestKey{1, kPassSignatureHash, kSpecializationBits});
+ 
+     REQUIRE(groups.size() == 3);
+     CHECK(groups[0] == rx::scene::ResolvedDrawGroup{0, 2, 100});
+     CHECK(groups[1] == rx::scene::ResolvedDrawGroup{2, 1, 200});
+     CHECK(groups[2] == rx::scene::ResolvedDrawGroup{3, 1, 100});
+ }
+ 
+ #ifdef RX_DEBUG_CHECKS
+ namespace {
+ 
+@@ -1294,23 +1358,23 @@ TEST_CASE("recordDrawList()'s RecordChunkFn callback -- proven to run on genuine
+           "ruling #6 'D27 worker-guard test reuses setViolationHookForTests + the rendezvous-barrier pattern "
+           "from test_material_system.cpp:854-1042'; adapted here to rx::task::Scheduler::parallelFor's own "
+           "documented n-way barrier precedent (rx_task/tests/scheduler_test.cpp), since this device-free "
+           "library has no rx_graph::Executor/live VkDevice to bind the ORIGINAL test's own GPU scaffolding to]") {
+     const ViewLists lists = makeSimpleLists(6);
+     std::vector<std::string> capture;
+     g_recordDrawListCapture.store(&capture, std::memory_order_relaxed);
+     rx::core::debug::detail::setViolationHookForTests(&captureRecordDrawListViolation);
+     ViolationHookGuard hookGuard;
+ 
+-    auto resolver = [](uint32_t materialIndex) -> uint32_t {
++    auto resolver = [](const rx::scene::PipelineRequestKey& key) -> uint64_t {
+         RX_ASSERT_MAIN_THREAD("test resolvePipeline (legal path)");
+-        return materialIndex;
++        return key.materialIndex;
+     };
+ 
+     constexpr uint32_t kWorkerCount = 6;
+     auto scheduler = rx::task::Scheduler::create(kWorkerCount);
+     REQUIRE(scheduler != nullptr);
+ 
+     // Deterministic n-way barrier [rx_task/tests/scheduler_test.cpp's own
+     // precedent, cited above]: `chunkCount` chunks, grainSize 1, each
+     // increments `arrived` then busy-waits for ALL to arrive. This can
+     // ONLY resolve if every chunk is alive and making progress
+@@ -1337,35 +1401,36 @@ TEST_CASE("recordDrawList()'s RecordChunkFn callback -- proven to run on genuine
+         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+         while (arrived.load(std::memory_order_acquire) < kChunkCount) {
+             if (std::chrono::steady_clock::now() >= deadline) {
+                 timeouts.fetch_add(1, std::memory_order_acq_rel);
+                 return;
+             }
+             std::this_thread::yield();
+         }
+     };
+ 
+-    rx::scene::recordDrawList(lists, *scheduler, kChunkCount, resolver, recordChunk);
++    rx::scene::recordDrawList(lists, *scheduler, kChunkCount, /*passSignatureHash=*/0xC0FFEEULL, /*specializationBits=*/0,
++                               resolver, recordChunk);
+ 
+     REQUIRE(timeouts.load() == 0);
+     CHECK(arrived.load() == kChunkCount);
+     std::lock_guard<std::mutex> lock(g_recordDrawListCaptureMutex);
+     CHECK(capture.empty());  // the (proven-concurrent) chunk callbacks never touched the guarded resolver.
+ }
+ 
+ TEST_CASE("Adversarial control: a chunk callback that DELIBERATELY calls the guarded resolver from a thread "
+           "PROVEN (two-chunk rendezvous barrier, same construction as test_material_system.cpp:1042-1168) to "
+           "be a genuine non-main worker DOES trip RX_ASSERT_MAIN_THREAD -- proves the guard mechanism itself "
+           "would have caught the bug the test above proves absent, not merely that nothing was ever tried") {
+-    auto resolver = [](uint32_t materialIndex) -> uint32_t {
++    auto resolver = [](const rx::scene::PipelineRequestKey& key) -> uint64_t {
+         RX_ASSERT_MAIN_THREAD("test resolvePipeline (deliberately illegal call site)");
+-        return materialIndex;
++        return key.materialIndex;
+     };
+     std::vector<std::string> capture;
+     g_recordDrawListCapture.store(&capture, std::memory_order_relaxed);
+     rx::core::debug::detail::setViolationHookForTests(&captureRecordDrawListViolation);
+     ViolationHookGuard hookGuard;
+ 
+     constexpr uint32_t kWorkerCount = 6;
+     auto scheduler = rx::task::Scheduler::create(kWorkerCount);
+     REQUIRE(scheduler != nullptr);
+ 
+@@ -1397,21 +1462,21 @@ TEST_CASE("Adversarial control: a chunk callback that DELIBERATELY calls the gua
+             std::this_thread::yield();
+         }
+         if (std::this_thread::get_id() == mainThreadId) {
+             return;  // legal either way -- the other participant proves the worker case.
+         }
+         bool expected = false;
+         if (!claimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+             return;
+         }
+         illegalCalls.fetch_add(1, std::memory_order_relaxed);
+-        static_cast<void>(resolver(0));  // deliberately illegal: calling the guarded resolver off the main thread.
++        static_cast<void>(resolver(rx::scene::PipelineRequestKey{}));  // deliberately illegal: calling the guarded resolver off the main thread.
+     });
+ 
+     REQUIRE_FALSE(barrierTimedOut.load());
+     REQUIRE(illegalCalls.load() == 1);
+     std::lock_guard<std::mutex> lock(g_recordDrawListCaptureMutex);
+     REQUIRE(capture.size() == 1);
+     CHECK(capture[0] == "test resolvePipeline (deliberately illegal call site)");
+ }
+ #endif  // RX_DEBUG_CHECKS
+ 
