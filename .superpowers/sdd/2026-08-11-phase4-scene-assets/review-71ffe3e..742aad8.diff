@@ -1,0 +1,2285 @@
+# Review package: 71ffe3e..742aad8
+
+## Commits
+742aad8 docs: Task 18 report -- rx_scene per-criterion proof, benchmark, revert evidence
+5565e66 feat(rx_scene): add Scene render-proxy submission layer + reversed-Z Camera (Task 18)
+
+## Files changed
+ .../task-18-report.md                              | 263 ++++++++++++
+ CMakeLists.txt                                     |   7 +
+ src/rx_scene/CMakeLists.txt                        |  25 ++
+ src/rx_scene/camera.cpp                            | 150 +++++++
+ src/rx_scene/include/rx_scene/camera.h             | 186 +++++++++
+ src/rx_scene/include/rx_scene/scene.h              | 405 ++++++++++++++++++
+ src/rx_scene/scene.cpp                             | 344 ++++++++++++++++
+ src/rx_scene/tests/CMakeLists.txt                  |  18 +
+ src/rx_scene/tests/camera_test.cpp                 | 219 ++++++++++
+ src/rx_scene/tests/doctest_main.cpp                |   8 +
+ src/rx_scene/tests/scene_test.cpp                  | 451 +++++++++++++++++++++
+ src/rx_scene/tests/thread_guard_test.cpp           |  96 +++++
+ 12 files changed, 2172 insertions(+)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-18-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-18-report.md
+new file mode 100644
+index 0000000..13b705f
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-18-report.md
+@@ -0,0 +1,263 @@
++# Task 18 report: `rx_scene` (Scene proxies, D19) + reversed-Z Camera (D13)
++
++**Ticket:** #5 "Scene submission layer". **Plan task:** Task 18. **Gate:**
++`gate/matrix-issue05-scene-proxies.md` as amended by
++`gate/rulings-2026-08-18.md` §#5 + RC5. BASE=71ffe3e.
++
++Order of authority followed: rulings > spec (matrix citations of D12/D13/
++D19/D24/D26/D27) > matrix > ticket (`gh issue view 5`).
++
++## Files created
++
++- `src/rx_scene/CMakeLists.txt`
++- `src/rx_scene/include/rx_scene/scene.h`, `src/rx_scene/include/rx_scene/camera.h`
++- `src/rx_scene/scene.cpp`, `src/rx_scene/camera.cpp`
++- `src/rx_scene/tests/CMakeLists.txt`, `doctest_main.cpp`, `scene_test.cpp`,
++  `camera_test.cpp`, `thread_guard_test.cpp`
++- `CMakeLists.txt` (one line: `add_subdirectory(src/rx_scene)`, placed
++  right after `add_subdirectory(src/rx_asset)`)
++
++Entirely device-free: no `VkDevice`, no `rx::platform::Window`. 1,902 lines
++total (headers+impl+tests+CMake).
++
++## Design decisions and their justification
++
++### Handles: `rx::core::Handle<Tag>` type, hand-rolled SoA slot bookkeeping
++
++`RenderableHandle`/`LightHandle` are `rx::core::Handle<struct RenderableTag>`/
++`<struct LightTag>` (the generational index+generation TYPE, `rx_core/handle.h:1-24`)
++per the gate ruling. `rx::core::HandlePool<Tag,T>` (the AoS container,
++`handle.h:26-97`) is deliberately NOT reused — it stores one whole `T` per
++slot in a single `std::vector<Slot>`, which would force an AoS
++`RenderableDesc`-shaped row per slot, directly contradicting D19. `Scene`
++instead hand-rolls the identical generational index/freelist algorithm
++(`isLiveRenderableIndex`/`requireLiveRenderable`, `scene.cpp:29-40`) once
++per SLOT, applied uniformly across every SoA column.
++
++### MeshBoundsFn: the one necessary interface deviation
++
++**This is the one place this task's design diverges from a literal reading
++of the plan/gate text, and it needs its own explanation up front.**
++
++The gate's "per-instance bounding-box override" row requires
++`createRenderable()`/`setTransform()` to populate/refresh a renderable's
++world-space AABB from "the mesh's stored bounds" — i.e.
++`asset::MeshAsset::bounds`, resolvable only via `asset::Registry::mesh()`.
++A hard `Scene` → `asset::Registry&` dependency was considered and rejected:
++`Registry::registerMesh()` (the only way to put NON-fallback `MeshAsset`
++content into a Registry) is `private`, friend-scoped to `import_gltf.cpp`'s
++two orchestration functions, reachable only through a GPU-backed
++`importGltf()` call. Task 18 is a device-free task end to end (brief's own
++"Steps: device-free tests... → implement → commit") — a hard Registry
++dependency would leave this library's own tests only ever able to exercise
++the Registry's always-empty/invalid FALLBACK mesh, never real nonzero-volume
++AABB transform math, device-free.
++
++`MeshBoundsFn = std::function<asset::AABB(asset::MeshHandle)>` (scene.h) is
++the minimal seam that avoids that, mirroring this codebase's own existing
++`std::function`-as-injected-callback precedent (`rx::asset::
++ImportCompletionFn`, registry.h) rather than inventing a new abstraction
++style. `meshBoundsFromRegistry(const asset::Registry&)` (scene.h/scene.cpp)
++is the one-line production adapter — it forwards VERBATIM to
++`registry.mesh(handle).bounds`, inheriting that method's own D24
++residency-tolerant contract with zero duplicated logic. This is the same
++class of "necessary, not incidental" deviation this codebase already
++documents elsewhere (GeometryPool::create()'s `Allocator&` addition,
++Registry::importGltf()'s `Scheduler&` addition) — flagged here explicitly
++per that convention.
++
++Consequence: `Scene::setTransform()` re-invokes the SAME `MeshBoundsFn`
++every call (never caches an `AABB`/`MeshAsset*` across calls) — this is
++also exactly the mechanism the brief's "D24 residency-tolerant resolve test
++at the proxy level" needs: a mesh that becomes nonresident between two
++`setTransform()` calls is reflected automatically the next call, with zero
++extra Scene-side logic (see `scene_test.cpp`'s eviction-proxy test, and the
++revert-discrimination evidence below).
++
++### Aspect ratio / culling far plane on Camera
++
++The plan's illustrative `Camera` text ("pos/orientation, vfov, near") names
++no aspect-ratio field, but a perspective matrix cannot be built without one
++— `Camera::aspectRatio` is added, documented as a necessary deviation
++(camera.h). `cullingFarPlane` is the gate-mandated finite far distance for
++`cullingProj()`.
++
++### Light storage: plain `std::vector<LightRecord>`, not column-split
++
++D19's SoA emphasis is specifically about the 30k+-renderable culling hot
++path (DrawListBuilder, Task 19); Phase 4 has no light-count-at-scale hot
++loop (a scene has a handful of lights). Documented explicitly in scene.h so
++this isn't mistaken for an inconsistency with the renderable columns.
++
++## Per-criterion proof (gate matrix + rulings)
++
++| Criterion | Where | Proof |
++|---|---|---|
++| Reuse `Handle<Tag>` type, not AoS `HandlePool`; SoA columns, span-accessor test | scene.h/.cpp | `transformsSpan()`/`worldBoundsSpan()`/`layersSpan()`/`channelsSpan()`/`castsShadowsSpan()`/`prioritySpan()`/`meshSpan()`; `scene_test.cpp` "SoA columns are real, contiguous..." test asserts per-field byte stride == `sizeof(T)` |
++| Handle lifecycle / generational failure | scene.cpp | `scene_test.cpp` "handle lifecycle" test: create/destroy/reuse with bumped generation, stale handle throws `std::out_of_range` on every accessor/mutator; double-destroy is a safe no-op |
++| Per-instance bounding-box override (mesh-derived default) | scene.cpp `recomputeWorldBounds` | `scene_test.cpp` "populates world-space AABB..." + "setTransform updates worldBounds..." tests |
++| D24 residency-tolerant resolve at the proxy level | scene.cpp (MeshBoundsFn re-invoked every call) | `scene_test.cpp` "Scene re-resolves... D24 at the proxy level" test (simulated eviction, no crash, reflects fallback-shaped bounds) |
++| No-dirty-tracking (O(1) `setTransform`) | scene.cpp | No dirty-bit/two-pass API exists anywhere on `Scene` (absence verified by inspection of scene.h's public surface); 30k-call benchmark below |
++| `castsShadows: bool = true` (RC5) | scene.h `RenderableDesc` | `scene_test.cpp` "castsShadows defaults true" test |
++| `priority: uint8_t` 0-7 default 4 (Filament precedent) | scene.h/.cpp (clamped in `createRenderable`) | `scene_test.cpp` "priority is clamped" test |
++| Per-submesh material override, concrete typed field | scene.h `RenderableDesc::submeshMaterialOverrides` | `scene_test.cpp` "concrete typed field" test |
++| Reserved skinning/morph slots (inert, tested) | scene.h `RenderableDesc` | `scene_test.cpp` "round-trip exactly with no truncation" test |
++| LightManager forward-compat sizing (FG2) | scene.h `LightRecord`/`detail::` seam | `scene_test.cpp` "sized/typed for punctual fields" test (Point-type row round-trips exactly via `detail::createLightRecordForTesting`/`lightRecordForTesting`) |
++| Transform-pool prev-frame-slot layout note | scene.h/`transformsSpan()` | `scene_test.cpp` "accepts a same-shaped 'previous transforms' copy" test |
++| `getLayers`/`getChannels`/`setChannels` API parity (matrix-issue07) | scene.h/.cpp | `scene_test.cpp` "API parity" test; `setLayers(h,0)` hides without touching destroy, own test |
++| Camera reversed-Z infinite-far `proj()`/`viewProj()` | camera.h/.cpp | `camera_test.cpp` near→1.0, far→~0.0 monotonic tests |
++| Camera `cullingProj()` (finite, separate) | camera.h/.cpp | `camera_test.cpp` finite-far exact-0.0-at-far test; `cullingFrustumPlanes()` non-degenerate-6-planes test |
++| Frustum plane extraction (Gribb-Hartmann) | camera.cpp `extractFrustumPlanes` | `camera_test.cpp` classification test (inside/outside on all 6 sides) + degenerate-Far-under-infinite-far documentation test |
++| Camera jitter (inert, preserve-later) | camera.h/.cpp | `camera_test.cpp` jitter-threading test (exact delta on the two documented matrix terms; `cullingProj()` unaffected) |
++| Exposure stays on tonemap (D22) | camera.h (no field) | Verified by absence + documented rationale in camera.h's top comment |
++
++## Bug the tests caught during TDD (organic revert-discrimination evidence)
++
++The first `cullingFrustumPlanes()` implementation assigned `Top = row3 -
++row1` / `Bottom = row3 + row1` (the naive, non-Y-flip-aware pairing). The
++classification test (`camera_test.cpp`) failed immediately:
++
++```
++CHECK( planeDot(planes[topIdx], glm::vec3(0.0F, 6.0F, -5.0F)) < 0.0F ) is NOT correct!
++  values: CHECK( 7.77817 <  0 )
++CHECK( planeDot(planes[bottomIdx], glm::vec3(0.0F, -6.0F, -5.0F)) < 0.0F ) is NOT correct!
++  values: CHECK( 7.77817 <  0 )
++```
++
++Root cause: `proj()`/`cullingProj()` bake in Vulkan's Y-flip (`m[1][1] =
++-fY`), so row1's sign is inverted relative to row0's — `row3 + row1` is
++actually the boundary that rejects a point too far ABOVE (+Y), and `row3 -
++row1` rejects one too far BELOW. Fixed in `camera.cpp` (`Top = row3 +
++row1`, `Bottom = row3 - row1`), with the derivation recorded as a code
++comment so this doesn't get "fixed" back to the naive pairing later. This
++is real, not staged, evidence the plane-classification test discriminates
++correct from incorrect frustum math.
++
++## Deliberate revert-and-restore evidence (in-tree)
++
++Two additional probes, run and then reverted, on top of the organic one above:
++
++**Probe 1 — drop the AABB recompute in `setTransform()`:**
++```diff
++-    transform_[idx] = transform;
++-    recomputeWorldBounds(idx);
+++    transform_[idx] = transform;
+++    // (recomputeWorldBounds(idx) call removed)
++```
++Result: exactly 2 test cases / 3 assertions failed (`setTransform updates
++worldBounds...`, `D24 at the proxy level`) — every other test (including
++all handle-lifecycle/priority/skinning/light tests) stayed green. Restored;
++re-verified 26/26 test cases, 228/228 assertions green on `linux-native`
++AND under Wine (`windows-cross-zig`).
++
++**Probe 2 — drop the generation check in `isLiveRenderableIndex()`:**
++```diff
++-    return handle.index() < generation_.size() && alive_[handle.index()] && generation_[handle.index()] == handle.generation();
+++    return handle.index() < generation_.size() && alive_[handle.index()];
++```
++Result: exactly 1 test case / 5 assertions failed (the "handle lifecycle...
++loud failure for a stale handle" test — stale-handle accessors stopped
++throwing). Every other test stayed green. Restored; re-verified 26/26 /
++228/228 green on both platforms again.
++
++No probe artifacts remain (`grep -rn "REVERT-DISCRIMINATION PROBE" src/rx_scene` → no matches).
++
++## Benchmark (published, MEASURED — Tracy-zoned via `RX_ZONE` in
++`createRenderable`/`setTransform`)
++
++30,000 `Scene::setTransform()` calls, wall-clock (`std::chrono::steady_clock`),
++against a trivial O(1) mesh-bounds provider (isolates Scene's own
++mechanism from whatever a real `asset::Registry` lookup would cost):
++
++| Platform | Total (30k calls) | Per-call average | Throughput |
++|---|---|---|---|
++| linux-native (native x86_64, this session's runs) | 1,074-1,141 us | ~0.036-0.038 us | ~26.3-27.9M calls/sec |
++| windows-cross-zig under Wine | 1,074-1,106 us | ~0.036 us | ~27.6-27.9M calls/sec |
++
++No dirty-bit or two-pass update API exists anywhere on `Scene`'s public
++surface (verified by inspection of `scene.h`) — `setTransform()` is a
++single O(1) SoA write plus one `AABB::transformed()` call, consistent with
++D12's flat (no-hierarchy) transform model. These numbers are a **trend
++metric per D18** (not a CI-blocking gate) — no dedicated Steam Deck
++hardware was available in this environment; both desktop-class numbers
++above are two to three orders of magnitude under the informal 2-second
++stall-detector bound asserted in the benchmark test itself
++(`scene_test.cpp`).
++
++## Test suite results
++
++**linux-native**, full serial `ctest --output-on-failure -j1` (23 tests,
++run BEFORE the revert probes, then `rx_scene_tests` re-verified green
++after each probe/restore):
++```
++100% tests passed, 0 tests failed out of 23
++Total Test time (real) = 153.61 sec
++```
++`rx_scene_tests` alone: `26 | 26 passed | 0 failed`, `228 | 228 passed | 0 failed`.
++
++**windows-cross-zig under Wine** (`xvfb-run -a ctest -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample' --output-on-failure`,
++11 tests — the project's own documented exclusion set for GPU-backed
++binaries Wine cannot run):
++```
++100% tests passed, 0 tests failed out of 11
++Total Test time (real) = 145.55 sec
++```
++`rx_scene_tests` alone under `wine ... rx_scene_tests.exe`:
++`26 | 26 passed | 0 failed`, `228 | 228 passed | 0 failed`.
++
++Zero compiler warnings on either preset after the two `[[nodiscard]]`
++warnings caught in the first build (fixed with `static_cast<void>(...)` at
++the two test-only discard sites, `scene_test.cpp`).
++
++Zero validation-layer/Vulkan involvement (this library touches no GPU
++object at all) — the "zero unfiltered validation errors" gate is satisfied
++vacuously and by construction, not tested directly (nothing here could
++produce one).
++
++## Deviations from the plan/gate text (summary; each detailed above)
++
++1. `MeshBoundsFn` seam instead of a hard `asset::Registry&` dependency on
++   `Scene` — necessary for device-free testability of real AABB math; the
++   production path (`meshBoundsFromRegistry`) is a byte-for-byte forward to
++   `Registry::mesh()`, inheriting its D24 contract.
++2. `Camera::aspectRatio` field added (perspective matrix requires it; the
++   plan text didn't name it).
++3. `detail::createLightRecordForTesting`/`lightRecordForTesting` test-only
++   seam added (mirrors `rx_material`'s `detail::debugCompileCount()`
++   convention) so the FG2 forward-compat-sizing criterion can be proven
++   against a Point-shaped row without exposing Point/Spot creation on the
++   Phase-4 public surface.
++
++None of these touch any file outside `src/rx_scene/` or the single
++`add_subdirectory` line in the top-level `CMakeLists.txt`.
++
++## Self-review
++
++- Every public `Scene`/light method carries `RX_ASSERT_MAIN_THREAD` (D5) —
++  verified enforced, not just documented, by `thread_guard_test.cpp`
++  (worker-thread call trips the hook; main-thread call does not).
++- Every per-handle mutator/accessor throws `std::out_of_range` for a
++  dead/unknown/stale handle (Registry/MaterialSystem's own established
++  convention); `destroyRenderable`/`destroyLight` are the one deliberate
++  exception (idempotent no-op, matching `HandlePool::release()`'s own
++  convention) — documented at each call site.
++- No AI attribution anywhere in code, comments, or this report.
++- No file outside `src/rx_scene/` was touched except the single
++  `add_subdirectory(src/rx_scene)` line in the top-level `CMakeLists.txt`;
++  `.superpowers/sdd/.../progress.md`'s own concurrent modification (from
++  another active session in this shared tree) was left untouched and is
++  excluded from this task's commit via explicit pathspecs.
++- No board/issue/plan/spec/ledger file was touched.
++- Commits are local only (not pushed).
++
++## Known limitations / what Task 19 (DrawListBuilder) still owns
++
++- The "five-case CI mask matrix" (camera `cullMask` AND renderable
++  `layers`) is a culling-behavior test — Scene only provides the storage
++  and accessors; the AND-test itself has no consumer until DrawListBuilder
++  exists.
++- `extractFrustumPlanes()` applied to `Camera::viewProj()` (infinite far)
++  yields a documented-degenerate `Far` plane (near-zero normal, always
++  "inside") — `cullingFrustumPlanes()` is the sanctioned non-degenerate
++  entry point; DrawListBuilder must use it, not `viewProj()`'s planes,
++  for real culling.
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cc97987..75bc1f4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -76,20 +76,27 @@ add_subdirectory(src/rx_platform)
+ add_subdirectory(src/rx_shader)
+ add_subdirectory(src/rx_rhi_vk)
+ # rx_asset: Phase 4 Stage 1 Task 12 -- GeometryPool, pooled global vertex/
+ # index storage (spec D8/D9/D26.4). Depends on rx_rhi_vk (Allocator/
+ # Device/Uploader) directly; its GPU test binary additionally links
+ # rx_shader + rx_platform (same windowed-device + in-process shader
+ # compile pattern as rx_graph's own GPU test binary, src/rx_graph/tests/
+ # CMakeLists.txt) to build a minimal draw pipeline for its readback
+ # assertions -- see src/rx_asset/CMakeLists.txt.
+ add_subdirectory(src/rx_asset)
++# rx_scene: Phase 4 Stage 2 Task 18 -- Scene (D19 render-proxy submission,
++# no ECS) + Camera (D13 reversed-Z projection source of truth). Entirely
++# device-free; depends on rx_asset (MeshHandle/MaterialHandle/AABB types,
++# and Registry via scene.cpp's meshBoundsFromRegistry() adapter). Added
++# here, right after rx_asset, since it is Stage 2's first library and
++# nothing in Stage 1 (rx_graph/rx_material) depends on it.
++add_subdirectory(src/rx_scene)
+ # Device-free in Task 1 (pass declarations, culling, ordering, lifetimes):
+ # depends on Vulkan::Headers + rx_core only, not rx_rhi_vk -- see
+ # src/rx_graph/CMakeLists.txt's own comment for why that dependency is
+ # deferred to the tasks that actually need a VkDevice.
+ add_subdirectory(src/rx_graph)
+ # Materials as Slang modules, pass signatures, and the lazy content-hash-
+ # keyed pipeline cache [spec Phase 3 design, D6-D8] -- depends on rx_graph
+ # (PassSignature), rx_shader (ShaderLayoutInfo's slang-free layout-types
+ # target only), and rx_rhi_vk (PipelineLayoutBuilder/BindlessTable/Device),
+ # so it is add_subdirectory'd after all three.
+diff --git a/src/rx_scene/CMakeLists.txt b/src/rx_scene/CMakeLists.txt
+new file mode 100644
+index 0000000..c7779eb
+--- /dev/null
++++ b/src/rx_scene/CMakeLists.txt
+@@ -0,0 +1,25 @@
++# rx_scene: the engine's no-ECS render-proxy submission layer (Scene,
++# spec D19) plus the reversed-Z Camera projection source of truth (spec
++# D13) [Phase 4 Stage 2 Task 18, gate matrix-issue05-scene-proxies.md as
++# amended by gate/rulings-2026-08-18.md #5 + RC5]. Entirely device-free:
++# no VkDevice, no rx_rhi_vk -- Scene's own SoA columns are plain
++# std::vectors and Camera's projection helpers are pure GLM math.
++#
++# Depends on rx_asset PUBLIC: RenderableDesc::mesh is `asset::MeshHandle`
++# (the plan's own interface text), and Scene's world-space AABB derivation
++# reuses `asset::AABB`/`asset::AABB::transformed()` verbatim (per this
++# project's "don't reinvent" rule) rather than re-deriving bounding-box
++# transform math. scene.h itself only forward-declares `asset::Registry`
++# (meshBoundsFromRegistry()'s production adapter, defined in scene.cpp,
++# is the one place that needs the real <rx_asset/registry.h>) -- but the
++# PUBLIC link is still against the whole rx_asset target, since
++# RenderableDesc's own public fields need MeshHandle/MaterialHandle/AABB
++# from mesh_asset.h regardless.
++add_library(rx_scene STATIC
++    camera.cpp
++    scene.cpp
++)
++target_include_directories(rx_scene PUBLIC include)
++target_link_libraries(rx_scene PUBLIC rx_core rx_asset)
++
++add_subdirectory(tests)
+diff --git a/src/rx_scene/camera.cpp b/src/rx_scene/camera.cpp
+new file mode 100644
+index 0000000..97c67f4
+--- /dev/null
++++ b/src/rx_scene/camera.cpp
+@@ -0,0 +1,150 @@
++#include <rx_scene/camera.h>
++
++#include <glm/gtc/matrix_transform.hpp>
++
++#include <cmath>
++
++namespace rx::scene {
++
++glm::mat4 Camera::view() const {
++    // inverse(T(position) * R(orientation)) = R(orientation)^-1 * T(-position)
++    // -- conjugate(orientation) is the inverse of a unit quaternion's
++    // rotation, and translate(-position) is the inverse of T(position);
++    // composing the two known inverses is exact and cheaper than a
++    // general glm::inverse(mat4).
++    const glm::mat4 invRotation = glm::mat4_cast(glm::conjugate(orientation));
++    const glm::mat4 invTranslation = glm::translate(glm::mat4(1.0F), -position);
++    return invRotation * invTranslation;
++}
++
++namespace {
++
++// Shared reversed-Z perspective builder. `far` is std::nullopt for the
++// infinite-far case (D13's proj()); a real value for the finite-far
++// culling case (cullingProj()) -- see this file's own header comment
++// (camera.h) for the full A/B-coefficient derivation both branches below
++// implement. `jitterX`/`jitterY` are added to the z-coefficient terms of
++// the x/y rows (camera.h's own proj() comment); pass {0,0} for
++// cullingProj(), which is never jittered.
++glm::mat4 reversedZPerspective(float verticalFovRadians, float aspectRatio, float nearZ, const float* far,
++                                float jitterX, float jitterY) {
++    const float fY = 1.0F / std::tan(verticalFovRadians * 0.5F);
++    const float fX = fY / aspectRatio;
++
++    glm::mat4 m(0.0F);
++    m[0][0] = fX;
++    // Vulkan's clip-space Y axis points down the screen; GLM's own
++    // projection helpers (and this hand-written matrix, which follows the
++    // same OpenGL-style Y-up convention GLM assumes) need the same
++    // `-f` row-1 flip every sample in this repo already applies to
++    // glm::perspective()'s own output (see e.g. samples/03_bindless_mesh/
++    // main.cpp's makeProjection()) -- baked in directly here rather than
++    // left for a caller to apply.
++    m[1][1] = -fY;
++
++    if (far == nullptr) {
++        // Infinite far [D13]: A = 0, B = nearZ (camera.h's own derivation).
++        m[2][2] = 0.0F;
++        m[3][2] = nearZ;
++    } else {
++        // Finite far (cullingProj()): A = near / (far - near),
++        // B = near * far / (far - near) -- the standard reversed-Z
++        // finite-far matrix (Reed, "Depth Precision Visualized").
++        const float farZ = *far;
++        const float a = nearZ / (farZ - nearZ);
++        m[2][2] = a;
++        m[3][2] = a * farZ;
++    }
++    m[2][3] = -1.0F;
++
++    // Jitter [preserve-later, TAA]: added to the z-coefficients of the
++    // x/y rows -- see camera.h's own proj() comment. {0,0} (every Phase 4
++    // call) leaves this a no-op.
++    m[2][0] += jitterX;
++    m[2][1] += jitterY;
++
++    return m;
++}
++
++}  // namespace
++
++glm::mat4 Camera::proj() const {
++    return reversedZPerspective(verticalFovRadians, aspectRatio, nearPlane, /*far=*/nullptr, jitter.x, jitter.y);
++}
++
++glm::mat4 Camera::viewProj() const { return proj() * view(); }
++
++glm::mat4 Camera::cullingProj() const {
++    return reversedZPerspective(verticalFovRadians, aspectRatio, nearPlane, &cullingFarPlane, 0.0F, 0.0F);
++}
++
++glm::mat4 Camera::cullingViewProj() const { return cullingProj() * view(); }
++
++FrustumPlanes Camera::cullingFrustumPlanes() const { return extractFrustumPlanes(cullingViewProj()); }
++
++namespace {
++
++// Row i (0-indexed) of `m` as a math row-vector: (m[0][i], m[1][i],
++// m[2][i], m[3][i]) -- GLM stores mat4 column-major (`m[col][row]`), so
++// this is the one place that layout is spelled out explicitly, per
++// extractFrustumPlanes()'s own algorithm (Gribb-Hartmann operates on the
++// combined matrix's rows).
++glm::vec4 matrixRow(const glm::mat4& m, int row) { return glm::vec4(m[0][row], m[1][row], m[2][row], m[3][row]); }
++
++// Normalizes a plane (a,b,c,d) by dividing through by length(a,b,c) so `d`
++// becomes a true signed distance offset. Leaves a near-zero-normal plane
++// (the documented degenerate case for extractFrustumPlanes() called on an
++// infinite-far viewProj() -- see that function's own header comment)
++// UNCHANGED rather than dividing by (near-)zero: an unnormalized-but-finite
++// plane with a ~0 xyz normal still reads as "always inside" for any
++// `dot(plane.xyz, p) + plane.w >= 0` test, which is the correct behavior
++// for a degenerate far plane under infinite far (there is no real far
++// plane to cull against), just not a numerically "normalized" one.
++glm::vec4 normalizePlane(const glm::vec4& plane) {
++    const float lengthSq = plane.x * plane.x + plane.y * plane.y + plane.z * plane.z;
++    if (lengthSq < 1e-12F) {
++        return plane;
++    }
++    return plane / std::sqrt(lengthSq);
++}
++
++}  // namespace
++
++FrustumPlanes extractFrustumPlanes(const glm::mat4& viewProj) {
++    const glm::vec4 row0 = matrixRow(viewProj, 0);
++    const glm::vec4 row1 = matrixRow(viewProj, 1);
++    const glm::vec4 row2 = matrixRow(viewProj, 2);
++    const glm::vec4 row3 = matrixRow(viewProj, 3);
++
++    FrustumPlanes planes{};
++    planes[static_cast<size_t>(FrustumPlaneIndex::Left)] = normalizePlane(row3 + row0);
++    planes[static_cast<size_t>(FrustumPlaneIndex::Right)] = normalizePlane(row3 - row0);
++    // Top/Bottom are `row3 +/- row1`, the OPPOSITE pairing from Left/Right's
++    // `row3 +/- row0` -- not a copy-paste inconsistency. proj()/cullingProj()
++    // bake in Vulkan's Y-flip (`m[1][1] = -fY`, reversedZPerspective() in
++    // this file), so row1's sign is already inverted relative to row0's: a
++    // view-space point ABOVE the camera (+Y) produces a NEGATIVE clip.y, not
++    // positive. `row3 + row1` is therefore the one that goes negative for a
++    // point too far ABOVE (the intuitive "Top" boundary: a point beyond it
++    // is rejected), and `row3 - row1` is the one that goes negative for a
++    // point too far BELOW ("Bottom") -- verified directly in
++    // camera_test.cpp's own classification test against concrete
++    // above/below points, not assumed from the X-axis pairing.
++    planes[static_cast<size_t>(FrustumPlaneIndex::Top)] = normalizePlane(row3 + row1);
++    planes[static_cast<size_t>(FrustumPlaneIndex::Bottom)] = normalizePlane(row3 - row1);
++    // Vulkan clip-space depth range is [0, w] (z >= 0 test, "near" boundary
++    // of the depth range -- NOT the camera's own near plane; see this
++    // header's own top comment for why this specific row is the one that
++    // degenerates under an infinite-far projection) and (z <= w, "far"
++    // boundary of the depth range). D13's reversed-Z convention maps the
++    // camera's geometric NEAR plane to depth=1 (the z<=w / row3-row2
++    // test) and the geometric FAR plane to depth=0 (the z>=0 / row2 test)
++    // -- so FrustumPlaneIndex::Far below is genuinely the row2 test, and
++    // FrustumPlaneIndex::Near is genuinely the row3-row2 test, matching
++    // Filament's own six-plane ordering by NAME as well as by position.
++    planes[static_cast<size_t>(FrustumPlaneIndex::Far)] = normalizePlane(row2);
++    planes[static_cast<size_t>(FrustumPlaneIndex::Near)] = normalizePlane(row3 - row2);
++    return planes;
++}
++
++}  // namespace rx::scene
+diff --git a/src/rx_scene/include/rx_scene/camera.h b/src/rx_scene/include/rx_scene/camera.h
+new file mode 100644
+index 0000000..a892182
+--- /dev/null
++++ b/src/rx_scene/include/rx_scene/camera.h
+@@ -0,0 +1,186 @@
++#pragma once
++
++// rx_scene/camera.h -- rx::scene::Camera, the single source of projection
++// truth for the whole engine [spec D13, Phase 4 Stage 2 Task 18; gate
++// matrix-issue05-scene-proxies.md's Camera rows, as amended by
++// gate/rulings-2026-08-18.md's #5 section]. Every sample/pass that needs a
++// view or projection matrix goes through this type -- "rx::scene::Camera
++// owns the projection helpers so samples cannot get it inconsistently
++// wrong" (D13's own text, quoted in the matrix's Conflict #1).
++//
++// Thread-affinity (D5): none. Camera is a plain, copyable value type with
++// no shared/owned resource and no internal synchronization concern of its
++// own -- every method below is a pure function of its own fields, safe to
++// call from any thread, matching rx_asset/mesh_asset.h's AABB (also a
++// plain value type with no thread-affinity comment).
++//
++// REVERSED-Z, INFINITE FAR [D13]: proj() maps world-space depth so that
++// the near plane lands at NDC depth 1.0 and depth decreases monotonically
++// toward 0.0 as distance grows without bound (far = infinity baked into
++// the matrix itself, never a finite parameter) -- the standard
++// "reversed-Z infinite far" projection (Reed, N., "Depth Precision
++// Visualized", https://www.reedbeta.com/blog/depth-precision-visualized/;
++// cross-checked against the community GLM formula at
++// https://gist.github.com/pezcode/1609b61a1eedd207ec8c5acf6f94f53a per the
++// matrix's own Sources section). This needs no external library -- GLM
++// (already vendored) supplies every primitive the hand-written matrix
++// below uses; GLM itself has no built-in reversed-Z/infinite-far helper to
++// reuse instead.
++//
++// TWO PROJECTIONS, ON PURPOSE [gate ruling, matrix Conflict #1 resolved as
++// option (a)]: proj()'s infinite far makes its own "far" row degenerate
++// under Gribb-Hartmann plane extraction (see this header's own comment on
++// extractFrustumPlanes() below for the exact algebra) -- Filament's
++// answer, adopted here, is a SEPARATE finite-far projection
++// (cullingProj(), Camera.h:159-162/292-309's `projectionForCulling`
++// precedent) used ONLY to derive real, non-degenerate culling planes.
++// DrawListBuilder (Task 19) is the intended consumer of cullingProj()/
++// cullingFrustumPlanes(); proj()/viewProj() remain what the render pass
++// itself binds.
++//
++// EXPOSURE: deliberately absent from this type. D22 places the manual
++// exposure parameter on the tonemap pass, not Camera (gate ruling: "stays
++// on the tonemap for Phase 4 -- D22 stands; a Camera exposure API becomes
++// meaningful with physical light units/IBL -- registry, techniques
++// phase"), even though Filament itself owns exposure on Camera -- see the
++// matrix's Conflict #2 for the full precedent-vs-spec discussion this
++// ruling resolves.
++//
++// JITTER [preserve-later, TAA]: `jitter` is threaded through proj()'s
++// translation terms (see proj()'s own comment) but is `{0,0}` (inert) in
++// every Phase 4 call site -- reserved so the temporal cluster (techniques
++// phase) does not need to change this type's call signature later
++// (Filament places jitter on `View::TemporalAntiAliasingOptions`, not
++// Camera -- RendererX has no separate View type in the Task 18 interface,
++// so Camera is the correct analog by elimination, not a precedent match;
++// see the matrix's own "Camera: jitter hook" row).
++
++#include <glm/glm.hpp>
++#include <glm/gtc/quaternion.hpp>
++
++#include <array>
++#include <cstdint>
++
++namespace rx::scene {
++
++// Six frustum planes, Filament's own `Frustum::getNormalizedPlane(s)`
++// ordering (Frustum.h:78-89: "left, right, bottom, top, far, near") --
++// matched deliberately (not RendererX's own invention) so anyone
++// cross-referencing that precedent finds the same order here. Each
++// glm::vec4 is a normalized plane (`dot(plane.xyz, worldPos) + plane.w >=
++// 0` for "inside"), per extractFrustumPlanes()'s own comment.
++enum class FrustumPlaneIndex : uint8_t { Left = 0, Right = 1, Bottom = 2, Top = 3, Far = 4, Near = 5 };
++inline constexpr size_t kFrustumPlaneCount = 6;
++using FrustumPlanes = std::array<glm::vec4, kFrustumPlaneCount>;
++
++// Gribb-Hartmann plane extraction [Gribb, G. & Hartmann, K., "Fast
++// Extraction of Viewing Frustum Planes from the World-View-Projection
++// Matrix", http://graphics.cs.ucf.edu/cap4720/fall2008/plane_extraction.pdf]
++// from an already-combined world-to-clip matrix (`viewProj`, i.e.
++// `proj * view` -- see Camera::viewProj()/cullingViewProj() below): six
++// planes read directly off `viewProj`'s own rows, no separate geometric
++// computation. Assumes Vulkan's clip-space depth range (`0 <= z <= w`,
++// `GLM_FORCE_DEPTH_ZERO_TO_ONE`'s convention) and `-w <= x,y <= w` -- both
++// baked into Camera::proj()/cullingProj()'s own matrices below, so this
++// function is correct for either one's output without a flag.
++//
++// FINITE FAR REQUIRED for a non-degenerate result [gate ruling, matrix
++// Conflict #1]: `viewProj`'s row2 (the "z >= 0" test, FrustumPlaneIndex::Far
++// below -- see the derivation in this header's own top comment) reduces to
++// a WORLD-space-independent constant when built from an infinite-far
++// projection (Camera::proj()), because that matrix's own z-row is `(0, 0,
++// 0, near)` in view space and every affine view matrix's bottom row is
++// `(0, 0, 0, 1)` -- multiplying the two never touches the view matrix's
++// real (non-trivial) rows. The result is a plane with a zero xyz normal:
++// this function does NOT special-case that (dividing a near-zero-length
++// normal is left as-is, not corrected), so calling it on
++// Camera::viewProj() yields 5 usable planes and one always-"true" one at
++// FrustumPlaneIndex::Far. Call it on Camera::cullingProj()'s combined
++// matrix (Camera::cullingFrustumPlanes(), the sanctioned entry point)
++// for all 6 planes to be real.
++[[nodiscard]] FrustumPlanes extractFrustumPlanes(const glm::mat4& viewProj);
++
++// The single projection source of truth for the whole engine [D13]. A
++// plain value type: default-constructed looks straight down -Z from the
++// world origin (identity orientation, GLM/glTF's own right-handed
++// convention -- forward = -Z, up = +Y, right = +X), a 60-degree vertical
++// FOV, 16:9 aspect, and a 0.1-unit near plane.
++struct Camera {
++    glm::vec3 position{0.0F, 0.0F, 0.0F};
++    glm::quat orientation{1.0F, 0.0F, 0.0F, 0.0F};  // identity: forward -Z, up +Y, right +X
++
++    float verticalFovRadians = glm::radians(60.0F);
++
++    // [Deviation from the plan's illustrative interface sketch --
++    // necessary, not incidental, matching this codebase's own established
++    // convention for documenting such gaps (see e.g. GeometryPool::create's
++    // Allocator& addition): a perspective matrix cannot be built without an
++    // aspect ratio, and the plan's "vfov, near" text did not name a field
++    // for it.] Width / height of the camera's own render target.
++    float aspectRatio = 16.0F / 9.0F;
++
++    float nearPlane = 0.1F;
++
++    // [Gate ruling, matrix "Camera: separate finite culling-frustum
++    // matrix" row] The FINITE far distance cullingProj() below uses --
++    // proj()/viewProj() never read this field (their far is always
++    // infinity, per D13). Has no effect on rendering; only on which
++    // world-space distance cullingFrustumPlanes()'s Far plane sits at.
++    float cullingFarPlane = 1000.0F;
++
++    // [preserve-later, TAA] See this header's own top comment. Inert
++    // ({0,0}) in every Phase 4 call site; threaded through proj()'s own
++    // translation terms so a later temporal-AA consumer does not need to
++    // change this type's call signature.
++    glm::vec2 jitter{0.0F, 0.0F};
++
++    // [D19/matrix-issue07] Camera-side visibility mask, ANDed against a
++    // renderable's own RenderableDesc::layers by DrawListBuilder (Task 19)
++    // -- all-ones default per Unity/Godot's own "opt-out, not opt-in"
++    // convention (matrix-issue07's own "all-ones defaults CONFIRMED as
++    // deliberate" ruling).
++    uint32_t cullMask = ~0u;
++
++    [[nodiscard]] glm::vec3 forward() const { return orientation * glm::vec3(0.0F, 0.0F, -1.0F); }
++    [[nodiscard]] glm::vec3 up() const { return orientation * glm::vec3(0.0F, 1.0F, 0.0F); }
++    [[nodiscard]] glm::vec3 right() const { return orientation * glm::vec3(1.0F, 0.0F, 0.0F); }
++
++    // World-to-view matrix: inverse(translate(position) * mat4_cast(orientation)),
++    // computed directly (conjugate rotation, then translate) rather than via
++    // glm::inverse() -- both this camera's rotation and translation are
++    // individually trivial to invert, so there is no reason to pay for a
++    // general 4x4 inverse.
++    [[nodiscard]] glm::mat4 view() const;
++
++    // Reversed-Z, INFINITE far [D13] render projection -- see this
++    // header's own top comment for the full derivation and the jitter/
++    // exposure notes. `jitter` (in NDC-fraction units) is added to the
++    // matrix's own x/y translation-of-z terms (`m[2][0]`/`m[2][1]` in
++    // GLM's column-major storage -- the coefficients of view-space Z in
++    // computing clip.x/clip.y), the standard depth-independent
++    // screen-space-jitter technique multiple TAA implementations use;
++    // `{0,0}` (Phase 4's only value) leaves the matrix byte-identical to
++    // the unjittered form.
++    [[nodiscard]] glm::mat4 proj() const;
++
++    // proj() * view() -- what every Phase 4 render pass actually binds.
++    [[nodiscard]] glm::mat4 viewProj() const;
++
++    // Reversed-Z, FINITE far (cullingFarPlane) projection -- see this
++    // header's own top comment ("TWO PROJECTIONS, ON PURPOSE"). Never
++    // jittered (jitter is a rendering-only concern; the culling frustum
++    // must reflect the camera's true, unjittered extent).
++    [[nodiscard]] glm::mat4 cullingProj() const;
++
++    // cullingProj() * view() -- the matrix extractFrustumPlanes() needs a
++    // non-degenerate result from.
++    [[nodiscard]] glm::mat4 cullingViewProj() const;
++
++    // extractFrustumPlanes(cullingViewProj()) -- the sanctioned,
++    // non-degenerate entry point (see extractFrustumPlanes()'s own
++    // comment for why proj()/viewProj() are NOT interchangeable with this
++    // for plane extraction).
++    [[nodiscard]] FrustumPlanes cullingFrustumPlanes() const;
++};
++
++}  // namespace rx::scene
+diff --git a/src/rx_scene/include/rx_scene/scene.h b/src/rx_scene/include/rx_scene/scene.h
+new file mode 100644
+index 0000000..606f738
+--- /dev/null
++++ b/src/rx_scene/include/rx_scene/scene.h
+@@ -0,0 +1,405 @@
++#pragma once
++
++// rx_scene/scene.h -- rx::scene::Scene: the engine's no-ECS render-proxy
++// submission layer [spec D19; Phase 4 Stage 2 Task 18; gate
++// matrix-issue05-scene-proxies.md as amended by
++// gate/rulings-2026-08-18.md's #5 section + RC5]. See issue #5's own
++// "consumer-boundary contract" text: this is NOT an ECS and imposes none
++// -- RenderableHandle/LightHandle are plain values a HOST stores inside
++// its OWN representation (an ECS component, a scene-graph node, a flat
++// array); the create/set/destroy surface below is exactly what a host's
++// own per-frame sync system (e.g. an ECS RenderSyncSystem iterating dirty
++// transforms) drives. The internal SoA storage is ECS-SHAPED for
++// cache-friendly batch iteration (DrawListBuilder's culling loop, Task 19
++// -- D15 reads AABBs/layers/etc. directly, contiguous, never per-object),
++// never exposed as an ECS framework itself.
++//
++// Thread-affinity (D5): every public method on Scene is main-thread-only
++// (RX_ASSERT_MAIN_THREAD-guarded) -- this class's SoA columns are plain
++// `std::vector`s with no internal synchronization, matching every other
++// GPU-adjacent-state-owning type in this codebase (Registry/GeometryPool/
++// MaterialSystem -- see docs/threading.md). Scene itself never touches the
++// GPU directly, but its data feeds DrawListBuilder's per-frame build(),
++// which does, so the same single-writer-thread discipline applies from
++// day one rather than being retrofitted once a real multi-threaded host
++// shows up.
++//
++// HANDLES [gate ruling, matrix "Handle lifecycle" + "SoA storage vs
++// HandlePool" rows]: RenderableHandle/LightHandle reuse
++// `rx::core::Handle<Tag>` -- the TYPE (generational index+generation pair,
++// `handle.h:1-24`) -- but NOT `rx::core::HandlePool<Tag,T>` (the AoS
++// container, `handle.h:26-97`, which stores one whole `T` per slot in a
++// single `std::vector<Slot>`). Reusing HandlePool wholesale here would
++// force an AoS `RenderableDesc`-shaped row per slot, directly
++// contradicting D19's SoA requirement (30k+-object contiguous-column
++// iteration) -- so Scene hand-rolls the identical generational
++// index/freelist bookkeeping HandlePool already implements (acquire:
++// reuse-from-freelist-with-bumped-generation, or grow; release: mark dead,
++// push the freed index), just applied once per SLOT and shared across
++// every SoA column, instead of once per boxed value.
++//
++// MESH BOUNDS RESOLUTION -- MeshBoundsFn [necessary, documented deviation
++// from the plan's illustrative interface sketch, matching this codebase's
++// own established convention for such gaps]: the gate's "per-instance
++// bounding-box override" row requires createRenderable()/setTransform() to
++// populate/refresh a renderable's world-space AABB from "the mesh's stored
++// bounds" -- i.e. `asset::MeshAsset::bounds`, which only `asset::Registry`
++// (via its own D24 residency-tolerant `mesh()` accessor) can resolve a
++// `MeshHandle` to. Scene does NOT take a hard `asset::Registry&`
++// dependency for this: `asset::Registry::registerMesh()` (the only way to
++// get NON-fallback `MeshAsset` content into a Registry) is private,
++// friend-scoped to import_gltf.cpp's own two orchestration functions, and
++// is only ever reachable through a GPU-backed `importGltf()` call (a real
++// `GeometryPool`/`Device` is required) -- meaning a hard Registry
++// dependency would make this library's own device-free unit tests unable
++// to exercise real, nonzero-volume AABB transform math at all (only the
++// registry's always-empty/invalid fallback mesh would be reachable
++// device-free). `MeshBoundsFn` is the minimal seam that avoids that:
++// Scene depends on "a function from MeshHandle to that mesh's local-space
++// AABB", not on the concrete Registry type -- production callers bind one
++// via meshBoundsFromRegistry() below (a one-line forward to
++// `asset::Registry::mesh(handle).bounds`, inheriting that method's own
++// D24 residency-tolerant contract with zero duplicated logic: a
++// dead/evicted handle already resolves to the registry's fallback mesh's
++// zero-volume bounds THROUGH Registry itself); this library's own tests
++// bind a trivial in-test callable instead. This mirrors this codebase's
++// existing `std::function`-as-injected-callback precedent
++// (`rx::asset::ImportCompletionFn`, registry.h) rather than inventing a
++// new abstraction style.
++//
++// D24 AT THE PROXY LEVEL: because setTransform() re-invokes the SAME
++// MeshBoundsFn every call (never caches a `MeshAsset*`/`AABB*` across
++// calls), a mesh that becomes nonresident BETWEEN two setTransform() calls
++// is reflected automatically the next time setTransform() runs (the
++// callback's own residency-tolerant behavior propagates through with zero
++// extra Scene-side logic) -- see scene_test.cpp's own eviction-proxy test.
++//
++// NO DIRTY TRACKING [gate ruling, matrix "Dirty-tracking / update cost"
++// row]: D12 flattens the whole node hierarchy at import time, so every
++// stored transform is already a WORLD transform with nothing above it to
++// recompose against (there is no parent to propagate through) --
++// setTransform() is therefore a single O(1) direct write into a dense SoA
++// slot plus one AABB recompute, full stop. No dirty bit, no two-pass
++// update API exists anywhere on this class ON PURPOSE (its absence IS the
++// criterion, per the gate ruling) -- see the task report for the
++// published 30k-call wall-clock benchmark this criterion also requires.
++
++#include <rx_asset/mesh_asset.h>
++#include <rx_core/handle.h>
++
++#include <glm/glm.hpp>
++
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <optional>
++#include <span>
++#include <vector>
++
++namespace rx::asset {
++class Registry;
++}  // namespace rx::asset
++
++namespace rx::scene {
++
++using RenderableHandle = rx::core::Handle<struct RenderableTag>;
++using LightHandle = rx::core::Handle<struct LightTag>;
++
++// A `MeshHandle -> that mesh's LOCAL-space AABB` resolver -- see this
++// header's own "MESH BOUNDS RESOLUTION" comment above for the full
++// rationale. Returned BY VALUE (asset::AABB is 24 bytes, two glm::vec3) --
++// deliberately not `const AABB&`, so a caller's own lambda/adapter never
++// has to reason about a returned reference's lifetime.
++using MeshBoundsFn = std::function<asset::AABB(asset::MeshHandle)>;
++
++// Production adapter: binds a live `asset::Registry&` (must outlive every
++// call through the returned callable -- the same by-reference lifetime
++// discipline this codebase's other injected dependencies already follow,
++// e.g. GeometryPool::create()'s Allocator&/Uploader&). Forwards verbatim
++// to `registry.mesh(handle).bounds` -- see this header's own top comment
++// for why this inherits Registry::mesh()'s D24 residency-tolerant
++// contract with no additional logic. Defined in scene.cpp (the one
++// translation unit in this library that includes the real,
++// heavier-weight <rx_asset/registry.h>; this public header only
++// forward-declares `asset::Registry`, matching this codebase's own
++// header-hygiene convention of not pulling a dependency's full surface
++// into a public header that only needs one type name).
++[[nodiscard]] MeshBoundsFn meshBoundsFromRegistry(const asset::Registry& registry);
++
++// One renderable's creation-time description [D19; gate ruling #5].
++struct RenderableDesc {
++    asset::MeshHandle mesh;
++
++    // [Gate ruling, "Per-submesh material override field" row] A concrete,
++    // typed override list -- Filament's `setMaterialInstanceAt(instance,
++    // primitiveIndex, materialInstance)` precedent, not a doc comment.
++    // Indexed by submesh; `std::nullopt` at index i means "use submesh i's
++    // own MeshAsset::Submesh::material verbatim" (no override). Length is
++    // NOT validated against the mesh's real submesh count here (Scene has
++    // no submesh-count-bearing dependency -- only MeshBoundsFn's AABB;
++    // Registry itself is the source of truth for submesh count, so that
++    // validation belongs to whichever consumer actually enumerates
++    // submeshes, i.e. DrawListBuilder, Task 19) -- copied verbatim into
++    // this renderable's own storage at createRenderable() time (the span
++    // itself need not outlive this call).
++    std::span<const std::optional<asset::MaterialHandle>> submeshMaterialOverrides = {};
++
++    glm::mat4 transform{1.0F};
++
++    // [D19/matrix-issue07] All-ones default -- opt-out, not opt-in
++    // (Unity/Godot precedent; matrix-issue07's own "all-ones defaults
++    // CONFIRMED as deliberate" ruling). ANDed against Camera::cullMask by
++    // DrawListBuilder (Task 19).
++    uint32_t layers = ~0u;
++
++    // [D15/RC5] Coupled to shadow-casting per RC5 ("Light channels stay
++    // COUPLED... D15 stands"): a renderable whose channels don't overlap a
++    // light's own channels is neither lit NOR shadow-tested by that light.
++    uint8_t channels = 0xFF;
++
++    // [RC5, NEW field] Filament-precedent per-object shadow opt-out,
++    // independent of the channels mask above -- "the channels mask is not
++    // the only way to exclude a caster" (RC5's own text).
++    bool castsShadows = true;
++
++    // [Gate ruling, "Priority" row, Filament `Builder::priority(uint8_t)`
++    // precedent] Coarse draw-order override, orthogonal to the
++    // pipeline/material/depth sort key -- clamped to [0,7] by
++    // createRenderable() below (a value outside that range is clamped and
++    // logged, never silently truncated by integer overflow). Default 4
++    // (Filament's own default, "the middle tier").
++    uint8_t priority = 4;
++
++    // [preserve-later, seed 14/Filament `Builder::skinning()` precedent]
++    // Reserved skinning attach point -- `std::nullopt` ("none") is the
++    // only value any Phase 4 code path produces or consumes; present so
++    // the animation phase adds population, not a struct/ABI reshape (the
++    // same retrofit-economics argument the issue's own LightManager
++    // comment already accepts for point/spot lights).
++    std::optional<uint32_t> skinningBufferIndex;
++
++    // [preserve-later, Filament `Builder::morphing()` precedent] Reserved
++    // morph-target attach point -- same reasoning as skinningBufferIndex
++    // above.
++    std::optional<uint32_t> morphTargetBufferIndex;
++};
++
++// [FG2, preserve-later] Punctual-light forward-compatible type tag --
++// `Directional` is the only value any Phase 4 code path produces; `Point`/
++// `Spot` exist so LightManager's own SoA columns are sized/typed for
++// punctual fields (position, range, cone angles) from day one, per issue
++// #5's 2026-08-11 comment: "LightManager's storage admits future
++// point/spot types structurally... even though only directional is
++// consumed until the techniques phase."
++enum class LightType : uint8_t { Directional, Point, Spot };
++
++// Internal light-row shape -- NOT constructible through any public Scene
++// API in Phase 4 (createDirectionalLight() below is the only public
++// producer, and it always emits `type == Directional` with
++// position/range/cone left at their inert defaults). Declared here, not
++// hidden inside scene.cpp, purely so the detail:: test-only seam further
++// below can construct/inspect a full Point/Spot-shaped row directly --
++// proving LightManager's storage does not truncate or reinterpret
++// punctual fields nothing yet populates for real (FG2's own acceptance
++// criterion) -- mirroring rx_material's `detail::debugCompileCount()`
++// carve-out convention (material_system.h) for "a fact only reachable
++// through a deliberately non-public seam."
++struct LightRecord {
++    LightType type = LightType::Directional;
++    glm::vec3 direction{0.0F, -1.0F, 0.0F};  // Directional, Spot
++    glm::vec3 position{0.0F, 0.0F, 0.0F};    // Point, Spot [reserved, Phase 4 inert]
++    glm::vec3 colorLux{1.0F, 1.0F, 1.0F};
++    float range = 0.0F;             // Point, Spot falloff radius [reserved, Phase 4 inert]
++    float innerConeAngle = 0.0F;    // Spot [reserved, Phase 4 inert]
++    float outerConeAngle = 0.0F;    // Spot [reserved, Phase 4 inert]
++    bool castsShadows = true;
++    uint8_t channels = 0xFF;
++
++    bool operator==(const LightRecord&) const = default;
++};
++
++// The only light creation surface Phase 4 exposes publicly [D19; brief:
++// "struct DirectionalLightDesc { glm::vec3 dir; glm::vec3 colorLux; bool
++// castsShadows; uint8_t channels = 0xFF; }"].
++struct DirectionalLightDesc {
++    glm::vec3 dir{0.0F, -1.0F, 0.0F};
++    glm::vec3 colorLux{1.0F, 1.0F, 1.0F};
++    bool castsShadows = true;
++    uint8_t channels = 0xFF;
++};
++
++class Scene;
++
++namespace detail {
++
++// Test-only seam -- see LightRecord's own comment above for why this
++// exists. NOT part of the stable public contract.
++[[nodiscard]] LightHandle createLightRecordForTesting(Scene& scene, const LightRecord& record);
++[[nodiscard]] const LightRecord& lightRecordForTesting(const Scene& scene, LightHandle handle);
++
++}  // namespace detail
++
++// SoA render-proxy submission layer [D19]. See this header's own top
++// comment for the full thread-affinity/handle/MeshBoundsFn/no-dirty-
++// tracking rationale.
++class Scene {
++public:
++    // `meshBounds` is stored and invoked on every createRenderable()/
++    // setTransform() call for as long as this Scene exists -- whatever it
++    // closes over (typically a `const asset::Registry&` via
++    // meshBoundsFromRegistry() above) must outlive this Scene.
++    explicit Scene(MeshBoundsFn meshBounds);
++    ~Scene();
++
++    Scene(const Scene&) = delete;
++    Scene& operator=(const Scene&) = delete;
++    Scene(Scene&&) = delete;
++    Scene& operator=(Scene&&) = delete;
++
++    // --- Renderables ----------------------------------------------------
++
++    // Acquires a slot (reusing the LIFO freelist's most-recently-freed
++    // entry with a bumped generation, or growing every SoA column by one
++    // row) and populates every column from `desc`. `priority` is clamped
++    // to [0,7] (logged if `desc.priority` was out of range).
++    // `worldBounds(handle)` is populated immediately, from
++    // `meshBoundsFn(desc.mesh).transformed(desc.transform)` (D24
++    // residency-tolerant by construction -- see this header's own top
++    // comment).
++    //
++    // Main-thread-only (D5).
++    [[nodiscard]] RenderableHandle createRenderable(const RenderableDesc& desc);
++
++    // Marks `handle`'s slot dead and returns its index to the freelist for
++    // reuse (bumped generation on the next createRenderable()). A no-op,
++    // logged, for an already-dead or never-live handle -- mirrors
++    // `rx::core::HandlePool::release()`'s own forgiving double-destroy
++    // convention (GeometryPool::free()'s "a double-free... is a logged
++    // error, not UB" posture), not `MaterialSystem`'s throwing convention,
++    // since a destroy-style API being idempotent is the more usable
++    // contract for a host that may race its own bookkeeping.
++    //
++    // Main-thread-only (D5).
++    void destroyRenderable(RenderableHandle handle);
++
++    // O(1) direct SoA write [no dirty tracking -- see this header's own
++    // top comment] -- also recomputes worldBounds(handle) from the SAME
++    // MeshBoundsFn every call (the D24-at-the-proxy-level mechanism this
++    // header's own top comment documents). Throws std::out_of_range for a
++    // dead/unknown/stale `handle` (loud failure, matching
++    // MaterialSystem/Registry's own convention for a mutator that expects
++    // an already-live handle -- see the "Handle lifecycle" gate row: "a
++    // stale handle... fails every accessor loudly").
++    //
++    // Main-thread-only (D5).
++    void setTransform(RenderableHandle handle, const glm::mat4& transform);
++    void setLayers(RenderableHandle handle, uint32_t layers);
++    // [matrix-issue07 API-parity ruling: "getLayers/getChannels/
++    // setChannels added for API parity"]
++    void setChannels(RenderableHandle handle, uint8_t channels);
++
++    [[nodiscard]] bool isRenderableAlive(RenderableHandle handle) const;
++    [[nodiscard]] const glm::mat4& transform(RenderableHandle handle) const;
++    [[nodiscard]] const asset::AABB& worldBounds(RenderableHandle handle) const;
++    [[nodiscard]] uint32_t layers(RenderableHandle handle) const;
++    [[nodiscard]] uint8_t channels(RenderableHandle handle) const;
++    [[nodiscard]] bool castsShadows(RenderableHandle handle) const;
++    [[nodiscard]] uint8_t priority(RenderableHandle handle) const;
++    [[nodiscard]] asset::MeshHandle mesh(RenderableHandle handle) const;
++    [[nodiscard]] std::span<const std::optional<asset::MaterialHandle>> submeshMaterialOverrides(
++        RenderableHandle handle) const;
++    [[nodiscard]] std::optional<uint32_t> skinningBufferIndex(RenderableHandle handle) const;
++    [[nodiscard]] std::optional<uint32_t> morphTargetBufferIndex(RenderableHandle handle) const;
++
++    // Live renderable count (dead/freed slots excluded) -- test/diagnostic
++    // and legitimate host-facing (e.g. HUD) use alike, mirroring
++    // GeometryPool::PoolStats::blockCount's dual audience.
++    [[nodiscard]] size_t renderableCount() const;
++
++    // --- SoA span accessors [gate ruling, "SoA storage vs HandlePool" row]
++    // ---------------------------------------------------------------------
++    // Contiguous, per-field, index-parallel storage -- the direct proof
++    // this is real SoA (one std::vector<T> per field), not one
++    // std::vector<RenderableDesc>-shaped AoS row per slot. Index i in
++    // every span below addresses the SAME underlying slot across every
++    // span (whether that slot is currently alive or not -- a dead slot's
++    // entry holds whatever its last occupant left; createRenderable()
++    // overwrites every column on reuse, so nothing needs to be
++    // proactively zeroed on destroy). DrawListBuilder's culling loop
++    // (Task 19) is the intended high-frequency consumer of these.
++    [[nodiscard]] std::span<const glm::mat4> transformsSpan() const;
++    [[nodiscard]] std::span<const asset::AABB> worldBoundsSpan() const;
++    [[nodiscard]] std::span<const uint32_t> layersSpan() const;
++    [[nodiscard]] std::span<const uint8_t> channelsSpan() const;
++    // 0/1 per slot, NOT std::vector<bool> -- std::vector<bool>'s
++    // bit-packed specialization is not std::span<const T>-compatible
++    // (there is no contiguous bool[] to span over), so every boolean
++    // column meant to be span-accessible uses uint8_t internally instead;
++    // castsShadows(handle) above converts to a real bool at the per-handle
++    // accessor boundary.
++    [[nodiscard]] std::span<const uint8_t> castsShadowsSpan() const;
++    [[nodiscard]] std::span<const uint8_t> prioritySpan() const;
++    [[nodiscard]] std::span<const asset::MeshHandle> meshSpan() const;
++
++    // --- Lights ----------------------------------------------------------
++
++    // Main-thread-only (D5).
++    [[nodiscard]] LightHandle createDirectionalLight(const DirectionalLightDesc& desc);
++    void destroyLight(LightHandle handle);
++    void setLightChannels(LightHandle handle, uint8_t channels);
++
++    [[nodiscard]] bool isLightAlive(LightHandle handle) const;
++    [[nodiscard]] glm::vec3 lightDirection(LightHandle handle) const;
++    [[nodiscard]] glm::vec3 lightColorLux(LightHandle handle) const;
++    [[nodiscard]] bool lightCastsShadows(LightHandle handle) const;
++    [[nodiscard]] uint8_t lightChannels(LightHandle handle) const;
++    [[nodiscard]] size_t lightCount() const;
++
++private:
++    friend LightHandle detail::createLightRecordForTesting(Scene&, const LightRecord&);
++    friend const LightRecord& detail::lightRecordForTesting(const Scene&, LightHandle);
++
++    [[nodiscard]] bool isLiveRenderableIndex(RenderableHandle handle) const;
++    [[nodiscard]] uint32_t requireLiveRenderable(RenderableHandle handle, const char* context) const;
++    [[nodiscard]] bool isLiveLightIndex(LightHandle handle) const;
++    [[nodiscard]] uint32_t requireLiveLight(LightHandle handle, const char* context) const;
++
++    // Shared acquire-a-light-slot logic between createDirectionalLight()
++    // and the detail:: test-only seam (both just build a different-shaped
++    // LightRecord and hand it here).
++    [[nodiscard]] LightHandle insertLightRecord(const LightRecord& record);
++
++    void recomputeWorldBounds(uint32_t index);
++
++    MeshBoundsFn meshBounds_;
++
++    // --- Renderable SoA columns (index-parallel with generation_/alive_)
++    std::vector<uint32_t> generation_;
++    std::vector<bool> alive_;  // internal bookkeeping only -- never span-exposed, see castsShadowsSpan()'s own comment
++    std::vector<uint32_t> freeList_;
++
++    std::vector<asset::MeshHandle> mesh_;
++    std::vector<std::vector<std::optional<asset::MaterialHandle>>> submeshOverrides_;
++    std::vector<glm::mat4> transform_;
++    std::vector<asset::AABB> worldBounds_;
++    std::vector<uint32_t> layers_;
++    std::vector<uint8_t> channels_;
++    std::vector<uint8_t> castsShadows_;
++    std::vector<uint8_t> priority_;
++    std::vector<std::optional<uint32_t>> skinningBufferIndex_;
++    std::vector<std::optional<uint32_t>> morphTargetBufferIndex_;
++
++    // --- Light storage. Plain AoS (one std::vector<LightRecord>), not
++    // column-split -- D19's SoA emphasis is specifically about the
++    // 30k+-renderable culling hot path (DrawListBuilder, Task 19); Phase 4
++    // has no light-count-at-scale hot loop that would benefit from
++    // per-field columns (a scene has a handful of lights, not tens of
++    // thousands), so this deliberately does not mirror the renderable
++    // columns above.
++    std::vector<uint32_t> lightGeneration_;
++    std::vector<bool> lightAlive_;
++    std::vector<uint32_t> lightFreeList_;
++    std::vector<LightRecord> lightRecords_;
++};
++
++}  // namespace rx::scene
+diff --git a/src/rx_scene/scene.cpp b/src/rx_scene/scene.cpp
+new file mode 100644
+index 0000000..beb0696
+--- /dev/null
++++ b/src/rx_scene/scene.cpp
+@@ -0,0 +1,344 @@
++#include <rx_scene/scene.h>
++
++#include <rx_asset/registry.h>
++#include <rx_core/debug_checks.h>
++#include <rx_core/log.h>
++#include <rx_core/profile.h>
++
++#include <stdexcept>
++
++namespace rx::scene {
++
++MeshBoundsFn meshBoundsFromRegistry(const asset::Registry& registry) {
++    // See scene.h's own "MESH BOUNDS RESOLUTION" comment: forwards
++    // verbatim to Registry::mesh(handle).bounds, which is ALREADY D24
++    // residency-tolerant (a dead/evicted handle resolves to the fallback
++    // mesh's own [zero-volume] bounds through Registry itself, never a
++    // null dereference and never an assert) -- no logic duplicated here.
++    return [&registry](asset::MeshHandle mesh) -> asset::AABB { return registry.mesh(mesh).bounds; };
++}
++
++Scene::Scene(MeshBoundsFn meshBounds) : meshBounds_(std::move(meshBounds)) {}
++
++Scene::~Scene() = default;
++
++// ---------------------------------------------------------------------
++// Renderables
++// ---------------------------------------------------------------------
++
++bool Scene::isLiveRenderableIndex(RenderableHandle handle) const {
++    return handle.index() < generation_.size() && alive_[handle.index()] && generation_[handle.index()] == handle.generation();
++}
++
++uint32_t Scene::requireLiveRenderable(RenderableHandle handle, const char* context) const {
++    if (!isLiveRenderableIndex(handle)) {
++        RX_LOG_ERROR("{}: unknown or stale RenderableHandle (index={}, generation={})", context, handle.index(),
++                      handle.generation());
++        throw std::out_of_range(context);
++    }
++    return handle.index();
++}
++
++void Scene::recomputeWorldBounds(uint32_t index) {
++    // D24-at-the-proxy-level: re-invokes meshBounds_ fresh every call --
++    // see scene.h's own top comment. `transformed()` (rx_asset/mesh_asset.h)
++    // transforms all 8 corners of the local AABB, correct under rotation
++    // and negative scale.
++    worldBounds_[index] = meshBounds_(mesh_[index]).transformed(transform_[index]);
++}
++
++RenderableHandle Scene::createRenderable(const RenderableDesc& desc) {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::createRenderable");
++    RX_ZONE;
++
++    uint32_t idx = 0;
++    uint32_t generation = 0;
++    if (!freeList_.empty()) {
++        idx = freeList_.back();
++        freeList_.pop_back();
++        generation = ++generation_[idx];
++    } else {
++        idx = static_cast<uint32_t>(generation_.size());
++        generation = 1;
++        generation_.push_back(generation);
++        alive_.push_back(false);
++        mesh_.emplace_back();
++        submeshOverrides_.emplace_back();
++        transform_.emplace_back(1.0F);
++        worldBounds_.emplace_back();
++        layers_.push_back(0);
++        channels_.push_back(0);
++        castsShadows_.push_back(0);
++        priority_.push_back(0);
++        skinningBufferIndex_.emplace_back();
++        morphTargetBufferIndex_.emplace_back();
++    }
++    alive_[idx] = true;
++
++    uint8_t clampedPriority = desc.priority;
++    if (clampedPriority > 7) {
++        RX_LOG_WARN("rx::scene::Scene::createRenderable: priority {} out of [0,7], clamped to 7",
++                     static_cast<int>(desc.priority));
++        clampedPriority = 7;
++    }
++
++    mesh_[idx] = desc.mesh;
++    submeshOverrides_[idx].assign(desc.submeshMaterialOverrides.begin(), desc.submeshMaterialOverrides.end());
++    transform_[idx] = desc.transform;
++    layers_[idx] = desc.layers;
++    channels_[idx] = desc.channels;
++    castsShadows_[idx] = desc.castsShadows ? 1 : 0;
++    priority_[idx] = clampedPriority;
++    skinningBufferIndex_[idx] = desc.skinningBufferIndex;
++    morphTargetBufferIndex_[idx] = desc.morphTargetBufferIndex;
++
++    recomputeWorldBounds(idx);
++
++    return RenderableHandle(idx, generation);
++}
++
++void Scene::destroyRenderable(RenderableHandle handle) {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::destroyRenderable");
++    if (!isLiveRenderableIndex(handle)) {
++        RX_LOG_WARN("rx::scene::Scene::destroyRenderable: handle (index={}, generation={}) already dead or unknown, ignored",
++                     handle.index(), handle.generation());
++        return;
++    }
++    const uint32_t idx = handle.index();
++    alive_[idx] = false;
++    freeList_.push_back(idx);
++    // Release the one heap-allocating column promptly rather than waiting
++    // for reuse to overwrite it -- every other column is a fixed-size POD
++    // row with nothing to free.
++    submeshOverrides_[idx].clear();
++    submeshOverrides_[idx].shrink_to_fit();
++}
++
++void Scene::setTransform(RenderableHandle handle, const glm::mat4& transform) {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::setTransform");
++    RX_ZONE;
++    const uint32_t idx = requireLiveRenderable(handle, "rx::scene::Scene::setTransform");
++    // O(1) direct SoA write -- see scene.h's own "NO DIRTY TRACKING"
++    // comment; no dirty bit, no propagation pass.
++    transform_[idx] = transform;
++    recomputeWorldBounds(idx);
++}
++
++void Scene::setLayers(RenderableHandle handle, uint32_t layers) {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::setLayers");
++    const uint32_t idx = requireLiveRenderable(handle, "rx::scene::Scene::setLayers");
++    layers_[idx] = layers;
++}
++
++void Scene::setChannels(RenderableHandle handle, uint8_t channels) {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::setChannels");
++    const uint32_t idx = requireLiveRenderable(handle, "rx::scene::Scene::setChannels");
++    channels_[idx] = channels;
++}
++
++bool Scene::isRenderableAlive(RenderableHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::isRenderableAlive");
++    return isLiveRenderableIndex(handle);
++}
++
++const glm::mat4& Scene::transform(RenderableHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::transform");
++    return transform_[requireLiveRenderable(handle, "rx::scene::Scene::transform")];
++}
++
++const asset::AABB& Scene::worldBounds(RenderableHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::worldBounds");
++    return worldBounds_[requireLiveRenderable(handle, "rx::scene::Scene::worldBounds")];
++}
++
++uint32_t Scene::layers(RenderableHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::layers");
++    return layers_[requireLiveRenderable(handle, "rx::scene::Scene::layers")];
++}
++
++uint8_t Scene::channels(RenderableHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::channels");
++    return channels_[requireLiveRenderable(handle, "rx::scene::Scene::channels")];
++}
++
++bool Scene::castsShadows(RenderableHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::castsShadows");
++    return castsShadows_[requireLiveRenderable(handle, "rx::scene::Scene::castsShadows")] != 0;
++}
++
++uint8_t Scene::priority(RenderableHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::priority");
++    return priority_[requireLiveRenderable(handle, "rx::scene::Scene::priority")];
++}
++
++asset::MeshHandle Scene::mesh(RenderableHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::mesh");
++    return mesh_[requireLiveRenderable(handle, "rx::scene::Scene::mesh")];
++}
++
++std::span<const std::optional<asset::MaterialHandle>> Scene::submeshMaterialOverrides(RenderableHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::submeshMaterialOverrides");
++    return submeshOverrides_[requireLiveRenderable(handle, "rx::scene::Scene::submeshMaterialOverrides")];
++}
++
++std::optional<uint32_t> Scene::skinningBufferIndex(RenderableHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::skinningBufferIndex");
++    return skinningBufferIndex_[requireLiveRenderable(handle, "rx::scene::Scene::skinningBufferIndex")];
++}
++
++std::optional<uint32_t> Scene::morphTargetBufferIndex(RenderableHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::morphTargetBufferIndex");
++    return morphTargetBufferIndex_[requireLiveRenderable(handle, "rx::scene::Scene::morphTargetBufferIndex")];
++}
++
++size_t Scene::renderableCount() const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::renderableCount");
++    // Every slot is either on freeList_ (released) or live -- mirrors
++    // rx::core::HandlePool::liveCount()'s own identical O(1) derivation.
++    return generation_.size() - freeList_.size();
++}
++
++std::span<const glm::mat4> Scene::transformsSpan() const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::transformsSpan");
++    return transform_;
++}
++
++std::span<const asset::AABB> Scene::worldBoundsSpan() const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::worldBoundsSpan");
++    return worldBounds_;
++}
++
++std::span<const uint32_t> Scene::layersSpan() const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::layersSpan");
++    return layers_;
++}
++
++std::span<const uint8_t> Scene::channelsSpan() const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::channelsSpan");
++    return channels_;
++}
++
++std::span<const uint8_t> Scene::castsShadowsSpan() const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::castsShadowsSpan");
++    return castsShadows_;
++}
++
++std::span<const uint8_t> Scene::prioritySpan() const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::prioritySpan");
++    return priority_;
++}
++
++std::span<const asset::MeshHandle> Scene::meshSpan() const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::meshSpan");
++    return mesh_;
++}
++
++// ---------------------------------------------------------------------
++// Lights
++// ---------------------------------------------------------------------
++
++bool Scene::isLiveLightIndex(LightHandle handle) const {
++    return handle.index() < lightGeneration_.size() && lightAlive_[handle.index()] &&
++           lightGeneration_[handle.index()] == handle.generation();
++}
++
++uint32_t Scene::requireLiveLight(LightHandle handle, const char* context) const {
++    if (!isLiveLightIndex(handle)) {
++        RX_LOG_ERROR("{}: unknown or stale LightHandle (index={}, generation={})", context, handle.index(),
++                      handle.generation());
++        throw std::out_of_range(context);
++    }
++    return handle.index();
++}
++
++LightHandle Scene::insertLightRecord(const LightRecord& record) {
++    uint32_t idx = 0;
++    uint32_t generation = 0;
++    if (!lightFreeList_.empty()) {
++        idx = lightFreeList_.back();
++        lightFreeList_.pop_back();
++        generation = ++lightGeneration_[idx];
++    } else {
++        idx = static_cast<uint32_t>(lightGeneration_.size());
++        generation = 1;
++        lightGeneration_.push_back(generation);
++        lightAlive_.push_back(false);
++        lightRecords_.emplace_back();
++    }
++    lightAlive_[idx] = true;
++    lightRecords_[idx] = record;
++    return LightHandle(idx, generation);
++}
++
++LightHandle Scene::createDirectionalLight(const DirectionalLightDesc& desc) {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::createDirectionalLight");
++    LightRecord record;
++    record.type = LightType::Directional;
++    record.direction = desc.dir;
++    record.colorLux = desc.colorLux;
++    record.castsShadows = desc.castsShadows;
++    record.channels = desc.channels;
++    // position/range/innerConeAngle/outerConeAngle stay at LightRecord's
++    // own inert defaults [FG2] -- this is the only public light-creation
++    // path in Phase 4, and it never populates the punctual-only fields.
++    return insertLightRecord(record);
++}
++
++void Scene::destroyLight(LightHandle handle) {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::destroyLight");
++    if (!isLiveLightIndex(handle)) {
++        RX_LOG_WARN("rx::scene::Scene::destroyLight: handle (index={}, generation={}) already dead or unknown, ignored",
++                     handle.index(), handle.generation());
++        return;
++    }
++    const uint32_t idx = handle.index();
++    lightAlive_[idx] = false;
++    lightFreeList_.push_back(idx);
++}
++
++void Scene::setLightChannels(LightHandle handle, uint8_t channels) {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::setLightChannels");
++    lightRecords_[requireLiveLight(handle, "rx::scene::Scene::setLightChannels")].channels = channels;
++}
++
++bool Scene::isLightAlive(LightHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::isLightAlive");
++    return isLiveLightIndex(handle);
++}
++
++glm::vec3 Scene::lightDirection(LightHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightDirection");
++    return lightRecords_[requireLiveLight(handle, "rx::scene::Scene::lightDirection")].direction;
++}
++
++glm::vec3 Scene::lightColorLux(LightHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightColorLux");
++    return lightRecords_[requireLiveLight(handle, "rx::scene::Scene::lightColorLux")].colorLux;
++}
++
++bool Scene::lightCastsShadows(LightHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightCastsShadows");
++    return lightRecords_[requireLiveLight(handle, "rx::scene::Scene::lightCastsShadows")].castsShadows;
++}
++
++uint8_t Scene::lightChannels(LightHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightChannels");
++    return lightRecords_[requireLiveLight(handle, "rx::scene::Scene::lightChannels")].channels;
++}
++
++size_t Scene::lightCount() const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightCount");
++    return lightGeneration_.size() - lightFreeList_.size();
++}
++
++namespace detail {
++
++LightHandle createLightRecordForTesting(Scene& scene, const LightRecord& record) { return scene.insertLightRecord(record); }
++
++const LightRecord& lightRecordForTesting(const Scene& scene, LightHandle handle) {
++    return scene.lightRecords_[scene.requireLiveLight(handle, "rx::scene::detail::lightRecordForTesting")];
++}
++
++}  // namespace detail
++
++}  // namespace rx::scene
+diff --git a/src/rx_scene/tests/CMakeLists.txt b/src/rx_scene/tests/CMakeLists.txt
+new file mode 100644
+index 0000000..cfce814
+--- /dev/null
++++ b/src/rx_scene/tests/CMakeLists.txt
+@@ -0,0 +1,18 @@
++# Device-free (no VkDevice, no rx::platform::Window) -- rx_scene has no
++# GPU-touching code at all, matching src/rx_task/tests/CMakeLists.txt's/
++# src/rx_graph/tests/CMakeLists.txt's identical device-free binary
++# convention. thread_guard_test.cpp needs no fixture beyond a plain
++# rx::scene::Scene (unlike rx_asset/tests/thread_guard_test.cpp's
++# GeometryPool case, which needs a real window/device) -- Scene owns no
++# Vulkan object at all.
++add_executable(rx_scene_tests
++    doctest_main.cpp
++    camera_test.cpp
++    scene_test.cpp
++    thread_guard_test.cpp
++)
++target_link_libraries(rx_scene_tests PRIVATE rx_scene doctest::doctest)
++add_test(NAME rx_scene_tests COMMAND rx_scene_tests)
++# Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
++# (windows-cross Wine hang, run 31512073559).
++set_tests_properties(rx_scene_tests PROPERTIES TIMEOUT 120)
+diff --git a/src/rx_scene/tests/camera_test.cpp b/src/rx_scene/tests/camera_test.cpp
+new file mode 100644
+index 0000000..bab37af
+--- /dev/null
++++ b/src/rx_scene/tests/camera_test.cpp
+@@ -0,0 +1,219 @@
++#include <doctest/doctest.h>
++#include <rx_scene/camera.h>
++
++#include <glm/glm.hpp>
++
++#include <cmath>
++
++// camera_test.cpp -- device-free coverage for rx::scene::Camera [spec D13,
++// Phase 4 Stage 2 Task 18; gate matrix-issue05-scene-proxies.md's Camera
++// rows]. Every case here is pure GLM math with no GPU/window dependency,
++// matching this binary's own doctest_main.cpp comment.
++
++namespace {
++
++// dot(plane.xyz, p) + plane.w -- ">= 0" means "p is on the inside side of
++// this plane" (extractFrustumPlanes()'s own documented convention).
++// Written out manually rather than via GLM's optional .xyz swizzle (not
++// enabled in this project's GLM configuration -- grep confirms no
++// GLM_FORCE_SWIZZLE anywhere in this codebase).
++float planeDot(const glm::vec4& plane, const glm::vec3& p) {
++    return plane.x * p.x + plane.y * p.y + plane.z * p.z + plane.w;
++}
++
++float xyzLength(const glm::vec4& plane) { return std::sqrt(plane.x * plane.x + plane.y * plane.y + plane.z * plane.z); }
++
++}  // namespace
++
++TEST_CASE("Camera defaults match D13's documented values") {
++    rx::scene::Camera cam;
++    CHECK(cam.position == glm::vec3(0.0F, 0.0F, 0.0F));
++    CHECK(cam.nearPlane == doctest::Approx(0.1F));
++    CHECK(cam.cullMask == ~0U);
++    CHECK(cam.jitter == glm::vec2(0.0F, 0.0F));
++    CHECK(cam.forward() == glm::vec3(0.0F, 0.0F, -1.0F));
++    CHECK(cam.up() == glm::vec3(0.0F, 1.0F, 0.0F));
++    CHECK(cam.right() == glm::vec3(1.0F, 0.0F, 0.0F));
++}
++
++TEST_CASE("Camera::proj() maps the near plane to NDC depth 1.0 [D13]") {
++    rx::scene::Camera cam;
++    cam.nearPlane = 1.0F;
++    // Identity position/orientation -> view() is identity -> world space
++    // == view space for this test, so a world point at (0,0,-near) sits
++    // exactly on the near plane along the view axis.
++    const glm::mat4 vp = cam.viewProj();
++    const glm::vec4 clip = vp * glm::vec4(0.0F, 0.0F, -cam.nearPlane, 1.0F);
++    REQUIRE(clip.w != 0.0F);
++    CHECK(clip.z / clip.w == doctest::Approx(1.0F).epsilon(0.0001));
++}
++
++TEST_CASE("Camera::proj() depth approaches 0.0 as distance grows without bound [D13, infinite far]") {
++    rx::scene::Camera cam;
++    cam.nearPlane = 1.0F;
++    const glm::mat4 vp = cam.viewProj();
++
++    float previousDepth = 1.0F;
++    for (float distance : {1.0F, 10.0F, 1'000.0F, 1'000'000.0F, 1e9F}) {
++        const glm::vec4 clip = vp * glm::vec4(0.0F, 0.0F, -distance, 1.0F);
++        REQUIRE(clip.w != 0.0F);
++        const float depth = clip.z / clip.w;
++        // Monotonically decreasing with distance (reversed-Z: near->1,
++        // far-> 0).
++        CHECK(depth <= previousDepth + 1e-6F);
++        CHECK(depth >= 0.0F);
++        previousDepth = depth;
++    }
++    // At a huge distance, depth is negligibly close to 0 -- proves the
++    // matrix's far plane is genuinely unbounded, not merely "very large".
++    CHECK(previousDepth < 1e-5F);
++}
++
++TEST_CASE("Camera::cullingProj() maps the FINITE culling far plane to depth 0.0 exactly [gate ruling]") {
++    rx::scene::Camera cam;
++    cam.nearPlane = 1.0F;
++    cam.cullingFarPlane = 100.0F;
++    const glm::mat4 cvp = cam.cullingViewProj();
++
++    const glm::vec4 nearClip = cvp * glm::vec4(0.0F, 0.0F, -cam.nearPlane, 1.0F);
++    CHECK(nearClip.z / nearClip.w == doctest::Approx(1.0F).epsilon(0.0001));
++
++    const glm::vec4 farClip = cvp * glm::vec4(0.0F, 0.0F, -cam.cullingFarPlane, 1.0F);
++    REQUIRE(farClip.w != 0.0F);
++    CHECK(farClip.z / farClip.w == doctest::Approx(0.0F).epsilon(0.0001));
++}
++
++TEST_CASE("Camera::cullingFrustumPlanes() classifies points correctly [Gribb-Hartmann]") {
++    rx::scene::Camera cam;
++    cam.verticalFovRadians = glm::radians(90.0F);  // tan(45deg) == 1 -> half-extent == distance, simple arithmetic
++    cam.aspectRatio = 1.0F;
++    cam.nearPlane = 1.0F;
++    cam.cullingFarPlane = 10.0F;
++    // Identity position/orientation: view space == world space for every
++    // point below.
++
++    const rx::scene::FrustumPlanes planes = cam.cullingFrustumPlanes();
++
++    // Every plane is non-degenerate (finite far -- see the header's own
++    // comment on why this differs from viewProj()'s infinite-far case,
++    // covered by a separate TEST_CASE below).
++    for (const glm::vec4& plane : planes) {
++        CHECK(xyzLength(plane) == doctest::Approx(1.0F).epsilon(0.001));
++    }
++
++    auto inside = [&](const glm::vec3& p) {
++        for (const glm::vec4& plane : planes) {
++            if (planeDot(plane, p) < -1e-4F) {
++                return false;
++            }
++        }
++        return true;
++    };
++
++    // Center of the frustum at half-depth: clearly inside every plane.
++    CHECK(inside(glm::vec3(0.0F, 0.0F, -5.0F)));
++
++    // At distance 5, the 90-degree-vfov/1:1-aspect half-extent is exactly
++    // 5 in both X and Y (tan(45deg) == 1) -- 6 is just outside.
++    const size_t leftIdx = static_cast<size_t>(rx::scene::FrustumPlaneIndex::Left);
++    const size_t rightIdx = static_cast<size_t>(rx::scene::FrustumPlaneIndex::Right);
++    const size_t topIdx = static_cast<size_t>(rx::scene::FrustumPlaneIndex::Top);
++    const size_t bottomIdx = static_cast<size_t>(rx::scene::FrustumPlaneIndex::Bottom);
++    const size_t nearIdx = static_cast<size_t>(rx::scene::FrustumPlaneIndex::Near);
++    const size_t farIdx = static_cast<size_t>(rx::scene::FrustumPlaneIndex::Far);
++
++    CHECK(planeDot(planes[rightIdx], glm::vec3(6.0F, 0.0F, -5.0F)) < 0.0F);
++    CHECK(planeDot(planes[leftIdx], glm::vec3(-6.0F, 0.0F, -5.0F)) < 0.0F);
++    CHECK(planeDot(planes[topIdx], glm::vec3(0.0F, 6.0F, -5.0F)) < 0.0F);
++    CHECK(planeDot(planes[bottomIdx], glm::vec3(0.0F, -6.0F, -5.0F)) < 0.0F);
++
++    // Closer than the near plane (0.5 < nearPlane 1.0).
++    CHECK(planeDot(planes[nearIdx], glm::vec3(0.0F, 0.0F, -0.5F)) < 0.0F);
++    // Beyond the culling far plane (11 > cullingFarPlane 10.0).
++    CHECK(planeDot(planes[farIdx], glm::vec3(0.0F, 0.0F, -11.0F)) < 0.0F);
++
++    // And the boundary-inside counterparts genuinely pass.
++    CHECK(inside(glm::vec3(4.0F, 4.0F, -5.0F)));
++    CHECK(planeDot(planes[nearIdx], glm::vec3(0.0F, 0.0F, -1.5F)) >= 0.0F);
++    CHECK(planeDot(planes[farIdx], glm::vec3(0.0F, 0.0F, -9.0F)) >= 0.0F);
++}
++
++TEST_CASE(
++    "extractFrustumPlanes(viewProj()) yields a degenerate Far plane under D13's infinite far, documented not fixed "
++    "[gate matrix Conflict #1]") {
++    rx::scene::Camera cam;
++    cam.verticalFovRadians = glm::radians(90.0F);
++    cam.aspectRatio = 1.0F;
++    cam.nearPlane = 1.0F;
++
++    const rx::scene::FrustumPlanes planes = rx::scene::extractFrustumPlanes(cam.viewProj());
++
++    const size_t farIdx = static_cast<size_t>(rx::scene::FrustumPlaneIndex::Far);
++    // The degenerate plane: near-zero xyz normal (see camera.cpp's own
++    // normalizePlane() comment -- left unnormalized/unchanged rather than
++    // divided by ~0).
++    CHECK(xyzLength(planes[farIdx]) < 1e-4F);
++    // A near-zero-normal plane with a positive w reads as "always inside"
++    // for any point -- exactly the documented "no real far plane under
++    // infinite far" behavior.
++    CHECK(planeDot(planes[farIdx], glm::vec3(0.0F, 0.0F, -1e12F)) > 0.0F);
++
++    // Every OTHER plane stays real/non-degenerate -- only Far collapses.
++    const size_t leftIdx = static_cast<size_t>(rx::scene::FrustumPlaneIndex::Left);
++    const size_t rightIdx = static_cast<size_t>(rx::scene::FrustumPlaneIndex::Right);
++    const size_t topIdx = static_cast<size_t>(rx::scene::FrustumPlaneIndex::Top);
++    const size_t bottomIdx = static_cast<size_t>(rx::scene::FrustumPlaneIndex::Bottom);
++    const size_t nearIdx = static_cast<size_t>(rx::scene::FrustumPlaneIndex::Near);
++    CHECK(xyzLength(planes[leftIdx]) == doctest::Approx(1.0F).epsilon(0.001));
++    CHECK(xyzLength(planes[rightIdx]) == doctest::Approx(1.0F).epsilon(0.001));
++    CHECK(xyzLength(planes[topIdx]) == doctest::Approx(1.0F).epsilon(0.001));
++    CHECK(xyzLength(planes[bottomIdx]) == doctest::Approx(1.0F).epsilon(0.001));
++    CHECK(xyzLength(planes[nearIdx]) == doctest::Approx(1.0F).epsilon(0.001));
++}
++
++TEST_CASE("Camera::jitter is threaded through proj()'s translation terms and is inert by default [preserve-later]") {
++    rx::scene::Camera cam;
++    cam.nearPlane = 0.5F;
++    const glm::mat4 unjittered = cam.proj();
++
++    cam.jitter = glm::vec2(0.125F, -0.375F);
++    const glm::mat4 jittered = cam.proj();
++
++    // Only the two documented translation terms differ, by exactly the
++    // jitter offset.
++    CHECK(jittered[2][0] == doctest::Approx(unjittered[2][0] + 0.125F));
++    CHECK(jittered[2][1] == doctest::Approx(unjittered[2][1] - 0.375F));
++    for (int col = 0; col < 4; ++col) {
++        for (int row = 0; row < 4; ++row) {
++            if (col == 2 && (row == 0 || row == 1)) {
++                continue;  // the two jittered terms, checked above
++            }
++            CHECK(jittered[col][row] == doctest::Approx(unjittered[col][row]));
++        }
++    }
++
++    // cullingProj() is never jittered (a jittered culling frustum would be
++    // wrong -- see camera.h's own comment).
++    rx::scene::Camera unjitteredCam = cam;
++    unjitteredCam.jitter = glm::vec2(0.0F, 0.0F);
++    CHECK(cam.cullingProj() == unjitteredCam.cullingProj());
++}
++
++TEST_CASE("Camera::view() places the camera at its own local origin looking down its own forward axis") {
++    rx::scene::Camera cam;
++    cam.position = glm::vec3(3.0F, 4.0F, 5.0F);
++    const glm::mat4 v = cam.view();
++    // The camera's own position transforms to the view-space origin.
++    const glm::vec4 viewSpaceOrigin = v * glm::vec4(cam.position, 1.0F);
++    CHECK(viewSpaceOrigin.x == doctest::Approx(0.0F).epsilon(0.0001));
++    CHECK(viewSpaceOrigin.y == doctest::Approx(0.0F).epsilon(0.0001));
++    CHECK(viewSpaceOrigin.z == doctest::Approx(0.0F).epsilon(0.0001));
++
++    // A world point 10 units along the camera's own forward axis lands on
++    // -Z in view space (this engine's view-space convention).
++    const glm::vec3 aheadWorld = cam.position + cam.forward() * 10.0F;
++    const glm::vec4 aheadView = v * glm::vec4(aheadWorld, 1.0F);
++    CHECK(aheadView.x == doctest::Approx(0.0F).epsilon(0.0001));
++    CHECK(aheadView.y == doctest::Approx(0.0F).epsilon(0.0001));
++    CHECK(aheadView.z == doctest::Approx(-10.0F).epsilon(0.0001));
++}
+diff --git a/src/rx_scene/tests/doctest_main.cpp b/src/rx_scene/tests/doctest_main.cpp
+new file mode 100644
+index 0000000..71498f7
+--- /dev/null
++++ b/src/rx_scene/tests/doctest_main.cpp
+@@ -0,0 +1,8 @@
++// Device-free -- no VkDevice, no rx::platform::Window (matching
++// src/rx_task/tests/doctest_main.cpp's/src/rx_graph/tests/doctest_main.cpp's
++// identical plain-main convention for their own device-free binaries).
++// rx_scene has no GPU-touching code at all -- Scene's SoA columns are
++// plain std::vectors and Camera's projection helpers are pure GLM math --
++// so this binary needs no warm-up before its first TEST_CASE runs.
++#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
++#include <doctest/doctest.h>
+diff --git a/src/rx_scene/tests/scene_test.cpp b/src/rx_scene/tests/scene_test.cpp
+new file mode 100644
+index 0000000..527c0bb
+--- /dev/null
++++ b/src/rx_scene/tests/scene_test.cpp
+@@ -0,0 +1,451 @@
++#include <doctest/doctest.h>
++#include <rx_scene/scene.h>
++
++#include <glm/gtc/matrix_transform.hpp>
++
++#include <chrono>
++#include <cstddef>
++#include <stdexcept>
++#include <vector>
++
++// scene_test.cpp -- device-free coverage for rx::scene::Scene [spec D19,
++// Phase 4 Stage 2 Task 18; gate matrix-issue05-scene-proxies.md as
++// amended by gate/rulings-2026-08-18.md's #5 section + RC5]. Every case
++// here uses a trivial, in-test MeshBoundsFn (never a real
++// asset::Registry) -- see scene.h's own "MESH BOUNDS RESOLUTION" comment
++// for why: Registry's only way to hold NON-fallback MeshAsset content is
++// GPU-backed importGltf(), which this device-free binary must not touch.
++
++namespace {
++
++rx::asset::AABB unitCubeBounds() {
++    rx::asset::AABB box;
++    box.expand(glm::vec3(-1.0F, -1.0F, -1.0F));
++    box.expand(glm::vec3(1.0F, 1.0F, 1.0F));
++    return box;
++}
++
++// A provider that always resolves to an invalid (never-expanded) AABB --
++// the exact shape rx_asset's own makeFallbackMeshAsset() produces for a
++// dead/evicted MeshHandle (see rx_asset/fallbacks.h's own comment: "zero
++// submeshes -> invalid bounds").
++rx::asset::AABB fallbackShapedBounds(rx::asset::MeshHandle) { return rx::asset::AABB{}; }
++
++}  // namespace
++
++TEST_CASE(
++    "Scene renderable handle lifecycle: creation, generational reuse, and loud failure for a stale handle "
++    "[gate 'Handle lifecycle' row]") {
++    rx::scene::Scene scene(&fallbackShapedBounds);
++
++    rx::scene::RenderableDesc desc;
++    rx::scene::RenderableHandle h0 = scene.createRenderable(desc);
++    rx::scene::RenderableHandle h1 = scene.createRenderable(desc);
++    rx::scene::RenderableHandle h2 = scene.createRenderable(desc);
++    CHECK(h0.generation() == 1);
++    CHECK(h1.generation() == 1);
++    CHECK(h2.generation() == 1);
++    CHECK(scene.renderableCount() == 3);
++
++    // Destroy the middle slot and re-create: LIFO freelist reuse with a
++    // bumped generation -- mirrors rx::core::HandlePool's own convention
++    // (see rx_rhi_vk/tests/bindless_test.cpp's identical
++    // "register/release/re-register... reuse indices with bumped
++    // generations" precedent, per the gate ruling's own instruction to
++    // match that test shape).
++    scene.destroyRenderable(h1);
++    CHECK(scene.renderableCount() == 2);
++    CHECK_FALSE(scene.isRenderableAlive(h1));
++
++    rx::scene::RenderableHandle h1Again = scene.createRenderable(desc);
++    CHECK(h1Again.index() == h1.index());
++    CHECK(h1Again.generation() == 2);
++    CHECK(scene.renderableCount() == 3);
++
++    // The STALE handle (same index, superseded generation) fails EVERY
++    // accessor loudly -- never silently resolves to the new occupant.
++    CHECK_THROWS_AS(static_cast<void>(scene.transform(h1)), std::out_of_range);
++    CHECK_THROWS_AS(scene.setTransform(h1, glm::mat4(1.0F)), std::out_of_range);
++    CHECK_THROWS_AS(static_cast<void>(scene.layers(h1)), std::out_of_range);
++    CHECK_THROWS_AS(scene.setLayers(h1, 1U), std::out_of_range);
++    CHECK_FALSE(scene.isRenderableAlive(h1));
++
++    // The NEW handle at the same index behaves normally.
++    CHECK(scene.isRenderableAlive(h1Again));
++    CHECK_NOTHROW(scene.setTransform(h1Again, glm::mat4(1.0F)));
++
++    // A fresh registration after the reuse lands on a brand-new index.
++    rx::scene::RenderableHandle h3 = scene.createRenderable(desc);
++    CHECK(h3.index() != h0.index());
++    CHECK(h3.index() != h1.index());
++    CHECK(h3.index() != h2.index());
++    CHECK(h3.generation() == 1);
++
++    // Double-destroy and an entirely unknown handle are safe, idempotent
++    // no-ops for destroy() specifically (mirrors
++    // rx::core::HandlePool::release()'s own forgiving convention) --
++    // every OTHER accessor/mutator still throws for the same unknown
++    // handle.
++    CHECK_NOTHROW(scene.destroyRenderable(h1));
++    rx::scene::RenderableHandle bogus(999, 1);
++    CHECK_NOTHROW(scene.destroyRenderable(bogus));
++    CHECK_THROWS_AS(static_cast<void>(scene.transform(bogus)), std::out_of_range);
++}
++
++TEST_CASE("Scene renderable SoA columns are real, contiguous, index-parallel std::span<const T> per field [D19]") {
++    rx::scene::Scene scene(&fallbackShapedBounds);
++
++    for (uint32_t i = 0; i < 8; ++i) {
++        rx::scene::RenderableDesc desc;
++        desc.transform = glm::translate(glm::mat4(1.0F), glm::vec3(static_cast<float>(i), 0.0F, 0.0F));
++        desc.layers = 1U << (i % 32);
++        desc.channels = static_cast<uint8_t>(i);
++        desc.priority = static_cast<uint8_t>(i % 8);
++        desc.castsShadows = (i % 2) == 0;
++        static_cast<void>(scene.createRenderable(desc));
++    }
++
++    REQUIRE(scene.transformsSpan().size() == 8);
++    REQUIRE(scene.layersSpan().size() == 8);
++    REQUIRE(scene.channelsSpan().size() == 8);
++    REQUIRE(scene.prioritySpan().size() == 8);
++    REQUIRE(scene.castsShadowsSpan().size() == 8);
++    REQUIRE(scene.worldBoundsSpan().size() == 8);
++    REQUIRE(scene.meshSpan().size() == 8);
++
++    for (uint32_t i = 0; i < 8; ++i) {
++        CHECK(scene.transformsSpan()[i][3][0] == doctest::Approx(static_cast<float>(i)));
++        CHECK(scene.layersSpan()[i] == (1U << (i % 32)));
++        CHECK(scene.channelsSpan()[i] == i);
++        CHECK(scene.prioritySpan()[i] == i % 8);
++        CHECK((scene.castsShadowsSpan()[i] != 0) == ((i % 2) == 0));
++    }
++
++    // Direct proof this is real per-field SoA (one std::vector<T> per
++    // column), not one std::vector<RenderableDesc>-shaped AoS row per
++    // slot: the byte stride between two consecutive elements of a span
++    // equals sizeof(T) exactly, never sizeof(some larger aggregate row).
++    CHECK(reinterpret_cast<const std::byte*>(&scene.transformsSpan()[1]) -
++              reinterpret_cast<const std::byte*>(&scene.transformsSpan()[0]) ==
++          static_cast<std::ptrdiff_t>(sizeof(glm::mat4)));
++    CHECK(reinterpret_cast<const std::byte*>(&scene.layersSpan()[1]) -
++              reinterpret_cast<const std::byte*>(&scene.layersSpan()[0]) ==
++          static_cast<std::ptrdiff_t>(sizeof(uint32_t)));
++}
++
++TEST_CASE(
++    "Transform SoA column accepts a same-shaped 'previous transforms' copy with zero reshaping "
++    "[transform-pool prev-frame-slot design note, issue #5 2026-08-10]") {
++    rx::scene::Scene scene(&fallbackShapedBounds);
++    for (int i = 0; i < 5; ++i) {
++        rx::scene::RenderableDesc desc;
++        desc.transform = glm::translate(glm::mat4(1.0F), glm::vec3(static_cast<float>(i), 0.0F, 0.0F));
++        static_cast<void>(scene.createRenderable(desc));
++    }
++
++    // A stub "previous transforms" array, built ENTIRELY in this test --
++    // no new production API added for it. Proves transformsSpan()'s
++    // existing contiguous layout is already sufficient for a future
++    // double-buffered/copyable-row addition to bolt onto, with zero
++    // reshaping of the live column or its accessor signature.
++    std::vector<glm::mat4> previousTransforms(scene.transformsSpan().begin(), scene.transformsSpan().end());
++    REQUIRE(previousTransforms.size() == scene.transformsSpan().size());
++    for (size_t i = 0; i < previousTransforms.size(); ++i) {
++        CHECK(previousTransforms[i] == scene.transformsSpan()[i]);
++    }
++}
++
++TEST_CASE(
++    "Scene::createRenderable populates world-space AABB from the mesh's stored bounds transformed by the initial "
++    "transform [gate 'Per-instance bounding-box override' row]") {
++    auto bounds = [](rx::asset::MeshHandle) { return unitCubeBounds(); };
++    rx::scene::Scene scene(bounds);
++
++    rx::scene::RenderableDesc desc;
++    desc.transform = glm::translate(glm::mat4(1.0F), glm::vec3(5.0F, 0.0F, 0.0F));
++    rx::scene::RenderableHandle h = scene.createRenderable(desc);
++
++    const rx::asset::AABB& wb = scene.worldBounds(h);
++    REQUIRE(wb.isValid());
++    CHECK(wb.min.x == doctest::Approx(4.0F));
++    CHECK(wb.max.x == doctest::Approx(6.0F));
++    CHECK(wb.min.y == doctest::Approx(-1.0F));
++    CHECK(wb.max.y == doctest::Approx(1.0F));
++    CHECK(wb.min.z == doctest::Approx(-1.0F));
++    CHECK(wb.max.z == doctest::Approx(1.0F));
++}
++
++TEST_CASE(
++    "Scene::setTransform updates worldBounds (not just the matrix) before the next build() call [D15, gate row]") {
++    auto bounds = [](rx::asset::MeshHandle) { return unitCubeBounds(); };
++    rx::scene::Scene scene(bounds);
++
++    rx::scene::RenderableDesc desc;
++    rx::scene::RenderableHandle h = scene.createRenderable(desc);
++    CHECK(scene.worldBounds(h).min.x == doctest::Approx(-1.0F));
++
++    scene.setTransform(h, glm::translate(glm::mat4(1.0F), glm::vec3(0.0F, 0.0F, 20.0F)));
++
++    const rx::asset::AABB& wb = scene.worldBounds(h);
++    CHECK(wb.min.z == doctest::Approx(19.0F));
++    CHECK(wb.max.z == doctest::Approx(21.0F));
++    CHECK(wb.min.x == doctest::Approx(-1.0F));
++    CHECK(scene.transform(h)[3][2] == doctest::Approx(20.0F));
++}
++
++TEST_CASE(
++    "Scene re-resolves a renderable's mesh bounds through the SAME provider on every setTransform() call -- D24 "
++    "at the proxy level [brief's own gate-hardening block]") {
++    rx::asset::AABB currentBounds = unitCubeBounds();
++    // Captured by reference: stands in for asset::Registry::mesh()'s own
++    // D24 residency-tolerant behavior swapping to the fallback mesh's
++    // bounds on eviction -- meshBoundsFromRegistry()'s production adapter
++    // would observe the identical swap transparently, since it forwards
++    // straight through Registry::mesh() with no caching of its own (see
++    // scene.h's own "MESH BOUNDS RESOLUTION"/"D24 AT THE PROXY LEVEL"
++    // comments).
++    auto bounds = [&currentBounds](rx::asset::MeshHandle) { return currentBounds; };
++    rx::scene::Scene scene(bounds);
++
++    rx::scene::RenderableDesc desc;
++    rx::scene::RenderableHandle h = scene.createRenderable(desc);
++    REQUIRE(scene.worldBounds(h).isValid());
++    CHECK(scene.worldBounds(h).min.x == doctest::Approx(-1.0F));
++
++    // Simulate eviction: the provider now resolves to the fallback mesh's
++    // own [zero-submesh, invalid] bounds shape.
++    currentBounds = rx::asset::AABB{};
++
++    // No dedicated "refresh" API exists on Scene -- setTransform() is
++    // ALREADY the re-resolution point (its own O(1) SoA write always
++    // recomputes worldBounds from a fresh provider call); a no-op
++    // identity transform still exercises it.
++    scene.setTransform(h, glm::mat4(1.0F));
++
++    CHECK_FALSE(scene.worldBounds(h).isValid());  // reflects the fallback -- never a crash, never a stale value
++}
++
++TEST_CASE("RenderableDesc::priority is clamped to [0,7], default 4 [Filament precedent, gate 'Priority' row]") {
++    rx::scene::RenderableDesc defaultDesc;
++    CHECK(defaultDesc.priority == 4);
++
++    rx::scene::Scene scene(&fallbackShapedBounds);
++    rx::scene::RenderableHandle h0 = scene.createRenderable(defaultDesc);
++    CHECK(scene.priority(h0) == 4);
++
++    rx::scene::RenderableDesc tooHigh;
++    tooHigh.priority = 250;
++    rx::scene::RenderableHandle h1 = scene.createRenderable(tooHigh);
++    CHECK(scene.priority(h1) == 7);
++
++    rx::scene::RenderableDesc atMax;
++    atMax.priority = 7;
++    rx::scene::RenderableHandle h2 = scene.createRenderable(atMax);
++    CHECK(scene.priority(h2) == 7);
++}
++
++TEST_CASE("RenderableDesc::castsShadows defaults true [RC5] and round-trips per-object") {
++    rx::scene::RenderableDesc desc;
++    CHECK(desc.castsShadows);
++
++    rx::scene::Scene scene(&fallbackShapedBounds);
++    rx::scene::RenderableHandle h = scene.createRenderable(desc);
++    CHECK(scene.castsShadows(h));
++
++    rx::scene::RenderableDesc noShadow;
++    noShadow.castsShadows = false;
++    rx::scene::RenderableHandle h2 = scene.createRenderable(noShadow);
++    CHECK_FALSE(scene.castsShadows(h2));
++}
++
++TEST_CASE("Reserved skinning/morph attach points round-trip exactly with no truncation [preserve-later]") {
++    rx::scene::RenderableDesc desc;
++    CHECK_FALSE(desc.skinningBufferIndex.has_value());
++    CHECK_FALSE(desc.morphTargetBufferIndex.has_value());
++
++    desc.skinningBufferIndex = 424'242U;
++    desc.morphTargetBufferIndex = 7U;
++
++    rx::scene::Scene scene(&fallbackShapedBounds);
++    rx::scene::RenderableHandle h = scene.createRenderable(desc);
++
++    REQUIRE(scene.skinningBufferIndex(h).has_value());
++    CHECK(scene.skinningBufferIndex(h).value() == 424'242U);
++    REQUIRE(scene.morphTargetBufferIndex(h).has_value());
++    CHECK(scene.morphTargetBufferIndex(h).value() == 7U);
++
++    // A renderable that never sets them stays inert (nullopt) -- never a
++    // stale value leaking in from a reused slot.
++    rx::scene::RenderableHandle h2 = scene.createRenderable(rx::scene::RenderableDesc{});
++    CHECK_FALSE(scene.skinningBufferIndex(h2).has_value());
++    CHECK_FALSE(scene.morphTargetBufferIndex(h2).has_value());
++}
++
++TEST_CASE("Per-submesh material override is a concrete typed field [gate row, not a doc comment]") {
++    using rx::asset::MaterialHandle;
++    const MaterialHandle mat42(42, 1);
++    const std::vector<std::optional<MaterialHandle>> overrides = {std::nullopt, mat42, std::nullopt};
++
++    rx::scene::RenderableDesc desc;
++    desc.submeshMaterialOverrides = overrides;
++
++    rx::scene::Scene scene(&fallbackShapedBounds);
++    rx::scene::RenderableHandle h = scene.createRenderable(desc);
++
++    const auto stored = scene.submeshMaterialOverrides(h);
++    REQUIRE(stored.size() == 3);
++    CHECK_FALSE(stored[0].has_value());
++    REQUIRE(stored[1].has_value());
++    CHECK(stored[1].value() == mat42);
++    CHECK_FALSE(stored[2].has_value());
++}
++
++TEST_CASE("layers/channels get/set API parity [matrix-issue07 ruling]") {
++    rx::scene::RenderableDesc desc;
++    CHECK(desc.layers == ~0U);
++    CHECK(desc.channels == 0xFFU);
++
++    rx::scene::Scene scene(&fallbackShapedBounds);
++    rx::scene::RenderableHandle h = scene.createRenderable(desc);
++    CHECK(scene.layers(h) == ~0U);
++    CHECK(scene.channels(h) == 0xFFU);
++
++    scene.setLayers(h, 0x1U);
++    CHECK(scene.layers(h) == 0x1U);
++    scene.setChannels(h, 0x2U);
++    CHECK(scene.channels(h) == 0x2U);
++}
++
++TEST_CASE("setLayers(handle, 0) hides a renderable without touching destroy()/handle validity [gate row]") {
++    rx::scene::Scene scene(&fallbackShapedBounds);
++    rx::scene::RenderableHandle h = scene.createRenderable(rx::scene::RenderableDesc{});
++
++    scene.setLayers(h, 0U);
++    CHECK(scene.layers(h) == 0U);
++    CHECK(scene.isRenderableAlive(h));
++    CHECK_NOTHROW(static_cast<void>(scene.transform(h)));
++
++    scene.destroyRenderable(h);
++    CHECK_FALSE(scene.isRenderableAlive(h));
++}
++
++TEST_CASE("Benchmark: 30,000 Scene::setTransform() calls, wall-clock published [no-dirty-tracking criterion]") {
++    // A trivial O(1) provider isolates Scene's OWN setTransform overhead
++    // from whatever a real asset::Registry lookup would cost -- production
++    // wiring is meshBoundsFromRegistry(); this measures Scene's own
++    // mechanism.
++    const rx::asset::AABB fixed = unitCubeBounds();
++    auto bounds = [&fixed](rx::asset::MeshHandle) { return fixed; };
++    rx::scene::Scene scene(bounds);
++
++    constexpr uint32_t kCount = 30'000;
++    std::vector<rx::scene::RenderableHandle> handles;
++    handles.reserve(kCount);
++    const rx::scene::RenderableDesc desc;
++    for (uint32_t i = 0; i < kCount; ++i) {
++        handles.push_back(scene.createRenderable(desc));
++    }
++
++    const auto start = std::chrono::steady_clock::now();
++    for (uint32_t i = 0; i < kCount; ++i) {
++        const glm::mat4 t = glm::translate(glm::mat4(1.0F), glm::vec3(static_cast<float>(i), 0.0F, 0.0F));
++        scene.setTransform(handles[i], t);
++    }
++    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
++
++    // Published trend number [D18] -- MESSAGE only, never CI-blocking on
++    // its own, matching rx_asset/tests/async_import_test.cpp's identical
++    // "trend metric... reported via MESSAGE only" posture.
++    const double usPerCall = static_cast<double>(elapsed.count()) / static_cast<double>(kCount);
++    const double callsPerSec = usPerCall > 0.0 ? 1'000'000.0 / usPerCall : 0.0;
++    MESSAGE("rx_scene benchmark: ", kCount, " Scene::setTransform() calls took ", elapsed.count(), " us total (",
++            usPerCall, " us/call average, ", callsPerSec, " calls/sec)");
++
++    // Stall detector only [RC6 two-tier pattern], not a tight perf gate:
++    // a real O(1)-per-call implementation clears this by roughly two
++    // orders of magnitude on any machine this runs on -- the defect class
++    // this catches (an accidental O(n) or O(n^2) full-scene rescan hidden
++    // inside setTransform()) blows through it by design.
++    CHECK(elapsed < std::chrono::seconds(2));
++}
++
++TEST_CASE(
++    "Scene light handle lifecycle mirrors renderables: creation, generational reuse, loud stale-handle failure") {
++    rx::scene::Scene scene(&fallbackShapedBounds);
++
++    rx::scene::DirectionalLightDesc desc;
++    rx::scene::LightHandle l0 = scene.createDirectionalLight(desc);
++    rx::scene::LightHandle l1 = scene.createDirectionalLight(desc);
++    CHECK(l0.generation() == 1);
++    CHECK(l1.generation() == 1);
++    CHECK(scene.lightCount() == 2);
++
++    scene.destroyLight(l0);
++    CHECK(scene.lightCount() == 1);
++    CHECK_FALSE(scene.isLightAlive(l0));
++
++    rx::scene::LightHandle l0Again = scene.createDirectionalLight(desc);
++    CHECK(l0Again.index() == l0.index());
++    CHECK(l0Again.generation() == 2);
++
++    CHECK_THROWS_AS(static_cast<void>(scene.lightDirection(l0)), std::out_of_range);
++    CHECK_NOTHROW(static_cast<void>(scene.lightDirection(l0Again)));
++    CHECK_NOTHROW(scene.destroyLight(l0));  // idempotent double-destroy
++}
++
++TEST_CASE("DirectionalLightDesc defaults and field round-trip; setLightChannels [matrix-issue07 API parity]") {
++    rx::scene::DirectionalLightDesc desc;
++    CHECK(desc.dir == glm::vec3(0.0F, -1.0F, 0.0F));
++    CHECK(desc.colorLux == glm::vec3(1.0F, 1.0F, 1.0F));
++    CHECK(desc.castsShadows);
++    CHECK(desc.channels == 0xFFU);
++
++    desc.dir = glm::vec3(1.0F, 0.0F, 0.0F);
++    desc.colorLux = glm::vec3(2.0F, 3.0F, 4.0F);
++    desc.castsShadows = false;
++    desc.channels = 0x3U;
++
++    rx::scene::Scene scene(&fallbackShapedBounds);
++    rx::scene::LightHandle h = scene.createDirectionalLight(desc);
++    CHECK(scene.lightDirection(h) == glm::vec3(1.0F, 0.0F, 0.0F));
++    CHECK(scene.lightColorLux(h) == glm::vec3(2.0F, 3.0F, 4.0F));
++    CHECK_FALSE(scene.lightCastsShadows(h));
++    CHECK(scene.lightChannels(h) == 0x3U);
++
++    scene.setLightChannels(h, 0x7U);
++    CHECK(scene.lightChannels(h) == 0x7U);
++}
++
++TEST_CASE(
++    "LightManager's SoA storage is sized/typed for punctual (Point/Spot) fields without truncation or "
++    "reinterpretation [FG2, issue #5 2026-08-11 comment]") {
++    rx::scene::Scene scene(&fallbackShapedBounds);
++
++    rx::scene::LightRecord pointLight;
++    pointLight.type = rx::scene::LightType::Point;
++    pointLight.position = glm::vec3(1.5F, -2.5F, 3.5F);
++    pointLight.colorLux = glm::vec3(10.0F, 20.0F, 30.0F);
++    pointLight.range = 12.25F;
++    pointLight.innerConeAngle = 0.1F;
++    pointLight.outerConeAngle = 0.7F;
++    pointLight.castsShadows = false;
++    pointLight.channels = 0x5U;
++
++    rx::scene::LightHandle h = rx::scene::detail::createLightRecordForTesting(scene, pointLight);
++    const rx::scene::LightRecord& stored = rx::scene::detail::lightRecordForTesting(scene, h);
++
++    // Exact, field-for-field round trip -- no truncation, no
++    // reinterpretation.
++    CHECK(stored == pointLight);
++    CHECK(stored.type == rx::scene::LightType::Point);
++    CHECK(stored.position.x == doctest::Approx(1.5F));
++    CHECK(stored.range == doctest::Approx(12.25F));
++    CHECK(stored.innerConeAngle == doctest::Approx(0.1F));
++    CHECK(stored.outerConeAngle == doctest::Approx(0.7F));
++
++    // Coexists cleanly, in the SAME storage, alongside a real, publicly
++    // created Directional light.
++    rx::scene::LightHandle dirHandle = scene.createDirectionalLight(rx::scene::DirectionalLightDesc{});
++    CHECK(scene.lightCount() == 2);
++    CHECK(rx::scene::detail::lightRecordForTesting(scene, dirHandle).type == rx::scene::LightType::Directional);
++}
+diff --git a/src/rx_scene/tests/thread_guard_test.cpp b/src/rx_scene/tests/thread_guard_test.cpp
+new file mode 100644
+index 0000000..6e008ea
+--- /dev/null
++++ b/src/rx_scene/tests/thread_guard_test.cpp
+@@ -0,0 +1,96 @@
++#include <doctest/doctest.h>
++#include <rx_core/debug_checks.h>
++#include <rx_scene/scene.h>
++
++#include <atomic>
++#include <mutex>
++#include <string>
++#include <thread>
++
++// thread_guard_test.cpp -- proves Scene's RX_ASSERT_MAIN_THREAD guards
++// (D5) actually ENFORCE the main-thread-only contract scene.h documents on
++// every public method, not merely document it. Device-free, no GPU fixture
++// needed (unlike rx_asset/tests/thread_guard_test.cpp's GeometryPool
++// case): mirrors rx_core/tests/debug_checks_test.cpp's own "a plain
++// std::thread stands in for a chunk >= 1 worker" pattern, legitimate here
++// for the identical reason that file documents -- this tests the
++// thread-identity comparison the guard performs, not any real scheduler
++// integration (Scene has no rx::task::Scheduler-driven caller in this
++// phase at all).
++//
++// The whole file is guarded on RX_DEBUG_CHECKS, matching both precedent
++// files' own identical guard (there is nothing left to compile when the
++// mechanism itself is compiled away).
++#ifdef RX_DEBUG_CHECKS
++
++namespace {
++
++rx::asset::AABB fallbackShapedBounds(rx::asset::MeshHandle) { return rx::asset::AABB{}; }
++
++struct ViolationCapture {
++    std::mutex mutex;
++    int callCount = 0;
++    std::string lastContext;
++};
++
++std::atomic<ViolationCapture*> g_activeCapture{nullptr};
++
++void captureViolationHook(const char* context) {
++    ViolationCapture* capture = g_activeCapture.load(std::memory_order_relaxed);
++    if (capture == nullptr) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(capture->mutex);
++    capture->callCount++;
++    capture->lastContext = context != nullptr ? context : "";
++    // Returns normally rather than throwing/aborting -- safe here
++    // specifically because every worker thread below is join()'d before
++    // the next guarded call starts (mirrors debug_checks_test.cpp's own
++    // identical precondition note).
++}
++
++struct ViolationHookGuard {
++    ~ViolationHookGuard() {
++        g_activeCapture.store(nullptr, std::memory_order_relaxed);
++        rx::core::debug::detail::setViolationHookForTests(nullptr);
++    }
++};
++
++}  // namespace
++
++TEST_CASE("Scene::setTransform/transformsSpan trip RX_ASSERT_MAIN_THREAD when called from a worker thread") {
++    rx::scene::Scene scene(&fallbackShapedBounds);
++    rx::scene::RenderableHandle handle = scene.createRenderable(rx::scene::RenderableDesc{});
++
++    ViolationCapture capture;
++    g_activeCapture.store(&capture, std::memory_order_relaxed);
++    rx::core::debug::detail::setViolationHookForTests(&captureViolationHook);
++    ViolationHookGuard guard;
++
++    std::thread setTransformThread([&] { scene.setTransform(handle, glm::mat4(1.0F)); });
++    setTransformThread.join();
++    std::thread spanThread([&] { static_cast<void>(scene.transformsSpan()); });
++    spanThread.join();
++
++    std::lock_guard<std::mutex> lock(capture.mutex);
++    CHECK(capture.callCount == 2);
++    CHECK(capture.lastContext == "rx::scene::Scene::transformsSpan");
++}
++
++TEST_CASE("Scene::setTransform/transformsSpan do NOT trip the guard for a call genuinely on the main thread") {
++    rx::scene::Scene scene(&fallbackShapedBounds);
++    rx::scene::RenderableHandle handle = scene.createRenderable(rx::scene::RenderableDesc{});
++
++    ViolationCapture capture;
++    g_activeCapture.store(&capture, std::memory_order_relaxed);
++    rx::core::debug::detail::setViolationHookForTests(&captureViolationHook);
++    ViolationHookGuard guard;
++
++    scene.setTransform(handle, glm::mat4(1.0F));
++    static_cast<void>(scene.transformsSpan());
++
++    std::lock_guard<std::mutex> lock(capture.mutex);
++    CHECK(capture.callCount == 0);
++}
++
++#endif  // RX_DEBUG_CHECKS
