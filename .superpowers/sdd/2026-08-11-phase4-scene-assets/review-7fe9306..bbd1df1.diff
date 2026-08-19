@@ -1,0 +1,2550 @@
+# Review package: 7fe9306..bbd1df1
+
+## Commits
+bbd1df1 feat(rx_debug_ui): add Dear ImGui debug overlay module (#16)
+
+## Files changed
+ .github/workflows/ci.yml                           |  11 +-
+ .../task-21-report.md                              | 363 ++++++++++++
+ CMakeLists.txt                                     |  25 +
+ MANUAL_VERIFICATION.md                             |  48 ++
+ cmake/DependencyBoundaryCheck.cmake                | 143 +++++
+ docs/threading.md                                  |   8 +
+ src/rx_debug_ui/CMakeLists.txt                     |  47 ++
+ src/rx_debug_ui/include/rx_debug_ui/overlay.h      | 245 +++++++++
+ src/rx_debug_ui/overlay.cpp                        | 361 ++++++++++++
+ src/rx_debug_ui/tests/doctest_main_gpu.cpp         |  57 ++
+ src/rx_debug_ui/tests/test_overlay_gpu.cpp         | 611 +++++++++++++++++++++
+ src/rx_platform/include/rx_platform/window.h       |  22 +-
+ src/rx_platform/src/window.cpp                     |  12 +-
+ src/rx_platform/tests/window_test.cpp              |  89 +++
+ src/rx_rhi_vk/include/rx_rhi_vk/memory_report.h    |  13 +
+ third_party/CMakeLists.txt                         | 140 +++++
+ 16 files changed, 2190 insertions(+), 5 deletions(-)
+
+## Diff
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index ac8cc90..8bb7c24 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -510,41 +510,46 @@ jobs:
+             -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DRX_TRACY=ON -DRX_DEBUG_CHECKS=ON
+           cmake --build build/windows-tracy-buildcheck
+ 
+       - name: Wine toolchain smoke check
+         run: wine build/windows-cross-zig/tools/toolchain_check/toolchain_check.exe
+ 
+       # rx_rhi_vk (GPU-backed), rx_graph_gpu_tests (Task 3's Executor GPU
+       # tests -- same GPU-backed reason as rx_rhi_vk_tests, added when that
+       # target was introduced), rx_material_gpu_tests (Task 5's
+       # MaterialSystem tests -- every one of them builds a real
+-      # VkGraphicsPipeline, same GPU-backed reason), and every
++      # VkGraphicsPipeline, same GPU-backed reason), rx_debug_ui_gpu_tests
++      # [Phase 4 Stage 2 Task 21 -- Overlay::create() builds a real
++      # VkGraphicsPipeline/descriptor pool/font-atlas texture through the
++      # vendored ImGui Vulkan backend, same GPU-backed reason], and every
+       # sample_*_headless gate are excluded: Wine in CI has no real Vulkan
+       # device to hand them, and that is a real, documented environment
+       # limitation -- not a silent pass. rx_core, rx_platform,
+       # shader_spirv_test, AND rx_shader_tests all run for real under Wine
+       # and are NOT excluded here -- rx_shader_tests does real in-process
+       # Slang compilation (slang::createGlobalSession etc.) via the
+       # MSVC-built slang-compiler.dll cross-linked through zig/LLD
+       # [R:A6/D2], which needs no GPU at all (SPIR-V codegen is pure CPU
+       # work), and this was investigated rather than assumed: Task 1
+       # verified directly that Slang's Windows DLLs (slang-compiler.dll +
+       # its slang-glslang/slang-glsl-module/slang-rt plugins) load correctly
+       # under Wine and the full compiler test suite passes there -- this CI
+       # run is what proves that holds on the actual GitHub Actions runner,
+       # not just the development machine that first checked it.
+       # rx_platform's window tests hit their own existing skip guards
+       # gracefully when Wine's video backend can't produce Vulkan surface
+-      # extensions, exactly as they do on any other display-less machine.
++      # extensions, exactly as they do on any other display-less machine --
++      # this now also covers window_test.cpp's new preDispatch coverage
++      # [Task 21], which needs no GPU at all and is device-free by design.
+       - name: Test under wine (xvfb; GPU tests excluded -- no Vulkan under Wine)
+         run: >-
+-          xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample' --output-on-failure
++          xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_debug_ui_gpu|sample' --output-on-failure
+           --output-junit ${{ github.workspace }}/ctest-results-windows-cross-zig.xml
+ 
+       - name: Build budget check
+         run: tools/check_build_budget.sh windows-cross-zig 60
+ 
+       # Same packaging mechanism as the linux-native job -- see
+       # tools/package_samples.sh and that job's identically-worded comment
+       # above its own packaging step for the full per-sample manifest.
+       - name: Package samples for redistribution
+         run: tools/package_samples.sh windows-cross-zig windows-x86_64 rendererx-samples-windows-x86_64.zip
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-21-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-21-report.md
+new file mode 100644
+index 0000000..2cc8d9d
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-21-report.md
+@@ -0,0 +1,363 @@
++# Task 21 report — `rx_debug_ui` ImGui overlay module (card #16, spec D20)
++
++Base commit: `7fe9306`. Implementer: this session. Requirements read in
++order per the brief: `task-21-brief.md` (task text + BINDING gate block),
++`gate/matrix-issue16-imgui-overlay.md`, `gate/rulings-2026-08-18.md` §#16,
++`gh issue view 16`. Order of authority followed: rulings > spec > matrix >
++ticket.
++
++## Files changed (mine only)
++
++- `third_party/CMakeLists.txt` — vendors Dear ImGui v1.92.9b (plain tag,
++  source-only `FetchContent_Populate`, no upstream CMakeLists.txt exists)
++  and defines a new, reusable `imgui` STATIC library target (core
++  imgui.cpp/imgui_draw.cpp/imgui_tables.cpp/imgui_widgets.cpp — deliberately
++  NOT imgui_demo.cpp — plus backends/imgui_impl_sdl3.cpp/imgui_impl_vulkan.cpp),
++  `VK_NO_PROTOTYPES` PUBLIC, linking `Vulkan::Headers` PUBLIC + `SDL3::SDL3-static`
++  PRIVATE.
++- `cmake/DependencyBoundaryCheck.cmake` (new) — the configure-time
++  link-boundary assertion mechanism (`rx_assert_target_excludes_dependency`),
++  a genuinely new pattern in this repo (gate matrix row 12/"New gaps").
++- `CMakeLists.txt` (root) — `add_subdirectory(src/rx_debug_ui)` + the
++  9-core-target boundary-check loop right after it.
++- `src/rx_debug_ui/` (new module) — `CMakeLists.txt`, `include/rx_debug_ui/overlay.h`,
++  `overlay.cpp`, `tests/doctest_main_gpu.cpp`, `tests/test_overlay_gpu.cpp`.
++- `src/rx_platform/include/rx_platform/window.h` /
++  `src/rx_platform/src/window.cpp` — `pumpEvents()` gained an optional
++  `const std::function<void(const SDL_Event&)>& preDispatch = nullptr`
++  parameter, invoked once per drained event BEFORE this method's own
++  handling — the seam `Overlay::processEvent()` hooks through. Generic
++  (no ImGui type anywhere in the signature) — `rx_platform` stays
++  ImGui-free.
++- `src/rx_platform/tests/window_test.cpp` — three new device-free
++  `TEST_CASE`s for the `preDispatch` seam (fires once per event, strictly
++  BEFORE this class's own handling of that same event — proven directly,
++  not inferred; default-nullptr regression guard).
++- `src/rx_rhi_vk/include/rx_rhi_vk/memory_report.h` — doc-only note on the
++  D24 accounting blind spot this module's font/HUD-texture allocations
++  are.
++- `docs/threading.md` — new `rx::debug_ui::Overlay` main-thread-only
++  registry entry.
++- `MANUAL_VERIFICATION.md` — new "rx_debug_ui overlay" section (visual HUD
++  sanity, gamepad-ownership orthogonality with real hardware, the "camera
++  stops moving" half of row 6, Deck legibility — none automatable
++  headlessly, none has a consuming sample yet).
++- `.github/workflows/ci.yml` — added `rx_debug_ui_gpu` to the
++  windows-cross-zig job's ctest exclusion regex (no real Vulkan under
++  Wine in CI, same posture as `rx_rhi_vk`/`rx_graph_gpu`/`rx_material_gpu`).
++
++`.superpowers/sdd/2026-08-11-phase4-scene-assets/progress.md` shows
++modified in `git status` but is **not mine** (the coordinator's own
++dispatch-ledger entry, already present before this session started) —
++excluded from my commit via explicit pathspec, matching Task 20's own
++precedent.
++
++## Design summary
++
++- **Vendoring**: `v1.92.9b` pinned exactly (commit
++  `f1cc2ae15e53a861a874c3034aae6798fde194ab`, verified directly via
++  `git ls-remote --tags` and by inspecting the actual populated source
++  tree's own `git describe --tags` after fetch — see "Vendored-version
++  provenance" below). MIT (`LICENSE.txt` at the pinned tag). No upstream
++  CMakeLists.txt exists (verified: the tag's own root file listing has
++  none), so this follows the same "no CMakeLists → `FetchContent_Populate`
++  source-only, `PARENT_SCOPE`-propagate `*_SOURCE_DIR`" convention as
++  volk/VMA/stb/MikkTSpace — but unlike those four (each compiled straight
++  into exactly one consumer), ImGui needs a real, reusable `imgui` library
++  target since both `rx_debug_ui` and (Task 24) samples will link it.
++- **`VK_NO_PROTOTYPES`, not `IMGUI_IMPL_VULKAN_USE_VOLK`**: verified
++  directly against the fetched `imgui_impl_vulkan.cpp` that
++  `IMGUI_IMPL_VULKAN_USE_VOLK` would make every Vulkan call inside it
++  resolve through the SAME global volk function pointers every other TU
++  in this project shares (`#if defined(VK_NO_PROTOTYPES) &&
++  !defined(VOLK_H_)` — false once volk.h is included, so the backend's
++  own indirection table never gets built). Choosing the OTHER documented
++  path instead — `VK_NO_PROTOTYPES` (already this project's own PUBLIC
++  define on `rx_rhi_vk`) + an explicit `ImGui_ImplVulkan_LoadFunctions()`
++  call with a custom loader (`overlay.cpp`'s `imguiVulkanFunctionLoader`,
++  which just calls `vkGetInstanceProcAddr` per symbol) — gives the
++  backend its OWN TU-local static function-pointer table, entirely
++  separate from the shared global one. This is what makes the
++  at-most-once-`vkQueueWaitIdle` GPU test's interception seam
++  (`rx::debug_ui::detail::setQueueWaitIdleHookForTests`) clean: it only
++  ever affects ImGui's own internal resolution of that one symbol, never
++  any other Vulkan call in the process (e.g.
++  `rx::rhi::CommandContext::runOnce()`'s own, unrelated `vkQueueWaitIdle`
++  call stays untouched by the hook).
++- **Nested `PipelineInfoMain.PipelineRenderingCreateInfo`** (the
++  2025-09-26 breaking change): filled exactly as the gate ruling
++  specifies. The struct's `pColorAttachmentFormats` pointer is backed by
++  process-lifetime static storage
++  (`g_pipelineColorFormatStorage`), not a stack local — the vendored
++  backend copies the WHOLE `InitInfo` by value into its own persistent
++  state (`bd->VulkanInitInfo = *info;`), so the pointee must outlive the
++  `Init()` call itself, not just its duration. Documented at both the
++  storage variable's own definition and `colorFormat_`'s header comment.
++- **Descriptor pool**: own pool (`InitInfo.DescriptorPool`, NOT the
++  `DescriptorPoolSize` convenience path), two typed entries —
++  `VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE` × 16 (2× the vendored backend's own
++  stated per-atlas minimum of 8, headroom for HUD textures beyond the
++  font atlas) and `VK_DESCRIPTOR_TYPE_SAMPLER` × 2 (exactly the stated
++  minimum — the backend only ever creates linear+nearest, never more) —
++  `VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT` set.
++  `MinImageCount`/`ImageCount` both set to `rx::rhi::FrameSync::kFramesInFlight`
++  (2) — sizes the backend's own vertex/index render-buffer rotation to
++  this project's real frames-in-flight discipline, independent of
++  whatever a real swapchain's own image count happens to be.
++- **Font/texture upload — documented D25/D24 exception**: `create()`
++  forces the font atlas's one-time upload synchronously, via a real
++  one-shot `NewFrame → build a glyph-referencing UI → Render →
++  RenderDrawData` cycle recorded through
++  `rx::rhi::CommandContext::runOnce()`, BEFORE returning — the one
++  unavoidable full-queue stall (the vendored backend's own internal
++  `vkQueueWaitIdle`, `imgui_impl_vulkan.cpp`'s own "FIXME-OPT: Suboptimal!"
++  comment) is a one-time startup cost, not a per-frame one. Fully
++  documented (rationale, D25/D24 interaction, the at-most-once bound) in
++  `overlay.h`'s own class comment and `memory_report.h`'s new scope note.
++- **Gamepad ownership**: `ImGui_ImplSDL3_SetGamepadMode(Manual, nullptr, 0)`
++  called immediately after `ImGui_ImplSDL3_InitForVulkan()`, before
++  `ImGui_ImplVulkan_LoadFunctions()`/`Init()` — kills the AutoFirst
++  default race against Task 20's own gamepad lifecycle (`rx::platform::Window`).
++  Gamepad HUD navigation is not enabled this phase, as a direct
++  consequence.
++- **Event dispatch**: `Window::pumpEvents(preDispatch)`'s new parameter is
++  the single seam; `Overlay::processEvent()` wraps
++  `ImGui_ImplSDL3_ProcessEvent()`. `Window::pumpEvents()` itself gained no
++  ImGui dependency (the parameter type is a plain
++  `std::function<void(const SDL_Event&)>`).
++- **Graph pass**: the REAL API chain —
++  `graph.addPass("imgui_overlay").addColorOutput(targetName,
++  desc).setSideEffect().setExecute(fn)`. LOAD-not-CLEAR is NOT a
++  parameter anywhere in this class's own surface: verified directly
++  against `render_graph.cpp` (step 1, "write-after-write chains... the
++  later-declared pass depends on the immediately preceding one for the
++  same name" — a REAL, enforced ordering, not a convention) and
++  `executor.cpp:1101` (`attachmentEverWritten[physIdx] ?
++  VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR`) that
++  declaring this pass AFTER a caller's own scene pass against the same
++  `targetName` is both necessary and sufficient for LOAD — the framework
++  itself enforces the resulting ordering via a real `dependsOn` edge, not
++  merely "if declared in the right order, it happens to work."
++- **Core-libs-stay-ImGui-free**: a new, reusable CMake mechanism
++  (`cmake/DependencyBoundaryCheck.cmake`) walks the transitive
++  `LINK_LIBRARIES`/`INTERFACE_LINK_LIBRARIES` closure of `rx_core`,
++  `rx_rhi_vk`, `rx_graph`, `rx_material`, `rx_platform`, `rx_task`,
++  `rx_shader`, `rx_asset`, `rx_scene` at configure time and
++  `FATAL_ERROR`s, naming the full dependency chain, on any match against
++  `imgui`.
++
++## Per-criterion proof (gate matrix rows)
++
++| Row | Criterion | Evidence |
++|---|---|---|
++| 1 | Pin v1.92.9b, plain tag | `third_party/CMakeLists.txt`'s `RX_IMGUI_TAG`; fetched tree's own `git describe --tags` = `v1.92.9b` at commit `f1cc2ae15e5...`, verified this session (see below). |
++| 2 | Init call shape + bool checks; invalid-config fails loudly | `overlay.cpp`: `InitForVulkan` before `LoadFunctions`/`Init`, every bool checked; `create()` validates `colorFormat != VK_FORMAT_UNDEFINED` and Device handles itself (the ONE real caller-tunable input this class's minimal surface exposes) since the vendored backend's own `IM_ASSERT`s compile to nothing under this project's NDEBUG-defined RelWithDebInfo builds. `TEST_CASE "Overlay::create() fails loudly ... on a deliberately-invalid colorFormat"` — PASSED, zero validation errors. |
++| 3 | Nested `PipelineInfoMain.PipelineRenderingCreateInfo` | `overlay.cpp` fills exactly this shape; compiles against the real fetched header (a stale flat-field write would not compile at all) — build succeeds on both presets. |
++| 4 | Descriptor pool: two typed entries + FREE_DESCRIPTOR_SET_BIT, exercised with font + 1 extra texture | `overlay.cpp`'s pool creation; `TEST_CASE "...LOAD-not-CLEAR... plus a second registered texture..."` registers a real dummy texture via `ImGui_ImplVulkan_AddTexture()` — PASSED, zero validation errors. |
++| 5 | D25/D24 exception documented; at-most-once `vkQueueWaitIdle` across N frames | `overlay.h`/`memory_report.h` doc sections; `TEST_CASE "...vkQueueWaitIdle exactly once..."` — installs `detail::setQueueWaitIdleHookForTests`, asserts count == 1 after `create()` AND after 5 further steady-state frames — PASSED. Real discrimination trail during development (see below), not merely a passing assertion. |
++| 6 | ProcessEvent first; WantCaptureMouse reacts | `Window::pumpEvents(preDispatch)` + `Overlay::processEvent()`; `TEST_CASE "...WantCaptureMouse..."` — 2-frame sequence (commit layout, process a synthetic click, recompute on next `beginFrame()`) — PASSED. The "camera stops moving" half is routed to `MANUAL_VERIFICATION.md`, per the matrix's own text. |
++| 7 | Gamepad Manual mode | `overlay.cpp`'s explicit call, immediately after SDL3 backend init; verified by code inspection (no automated mechanism exists to prove "SDL never opens a gamepad" without a real device, matching the matrix's own framing) — real-hardware row added to `MANUAL_VERIFICATION.md`. |
++| 8 | Frame lifecycle ordering | `beginFrame()`'s three-call sequence; `addPass()`'s execute callback's `Render()` + `RenderDrawData()` — every GPU test's own successful `Render()` output is itself proof this ordering is correct (a wrong order would produce empty/garbage draw data). |
++| 9 | Real `rx_graph::Pass` API chain | `overlay.cpp`'s `addPass()` body — literal chain match. |
++| 10 | Docking excluded | Plain tag pinned (row 1) — `-docking` variant never fetched; `imgui_demo.cpp` (docking's usual entry point in examples) not even vendored. |
++| 11 | Readback methodology | `test_overlay_gpu.cpp`'s `renderAndReadBack()` — identical `createHostVisibleBuffer` + `vkCmdCopyImageToBuffer` + `invalidate()` + `mappedData()` pattern as `rx_graph/tests/test_execute_gpu.cpp:754-768`. |
++| 12 | Configure-time link-boundary check | `cmake/DependencyBoundaryCheck.cmake` + root `CMakeLists.txt` loop over all 9 core targets — passes on the real tree; FATAL_ERRORs with the exact chain (`rx_core -> imgui`) when a violation is injected (see "Revert-discrimination evidence"). |
++| 13 | D5 one-liner | `overlay.h`'s top-of-file thread-affinity comment + `docs/threading.md`'s new registry entry. |
++| 14 | D24-D27 | D25 (row 5) + D24 (`memory_report.h`) — both documented, log-don't-drop. D26/D27: N/A-Phase-4, correctly untouched (ImGui submits no scene draws, never calls `MaterialSystem`). |
++
++## Command tails
++
++Configure (linux-native, imgui fetched fresh):
++```
++-- [dep-cache] HIT for ktx (key=ktx-6e7e780595aa2b62) - reusing cached install, no compilation
++-- [fetch_slang] Slang 2026.14.1 prebuilt already present ... - skipping download
++-- Configuring done
++-- Generating done
++-- Build files have been written to: .../build/linux-native
++```
++Fetched tree provenance:
++```
++$ git -C build/linux-native/_deps/imgui-src log -1 --format='%H %d'
++f1cc2ae15e53a861a874c3034aae6798fde194ab  (grafted, HEAD, tag: v1.92.9b)
++$ git -C build/linux-native/_deps/imgui-src describe --tags
++v1.92.9b
++```
++Full `xvfb-run -a ctest --preset linux-native --output-on-failure` (final run):
++```
++100% tests passed, 0 tests failed out of 24
++Total Test time (real) = 139.71 sec
++```
++(`rx_debug_ui_gpu_tests` at position 15, `1.76 sec`, zero validation
++errors.)
++
++`rx_debug_ui_gpu_tests --validate` standalone:
++```
++[doctest] test cases:  4 |  4 passed | 0 failed | 0 skipped
++[doctest] assertions: 48 | 48 passed | 0 failed |
++[doctest] Status: SUCCESS!
++```
++
++windows-cross-zig: full build succeeds (`184/184` build steps, `imgui`/
++`rx_debug_ui`/`rx_debug_ui_gpu_tests.exe` all cross-compile cleanly, zero
++warnings from any of this task's own files). `xvfb-run -a ctest --preset
++windows-cross-zig -E '...rx_debug_ui_gpu...' --output-on-failure`:
++```
++100% tests passed, 0 tests failed out of 11
++Total Test time (real) = 168.26 sec
++```
++(`rx_platform_tests` — including the three new `preDispatch` cases —
++PASSED under Wine.) A throwaway `RX_TRACY=ON` cross-compile-only configure
++(mirroring `ci.yml`'s own dedicated step) also builds `rx_debug_ui`/
++`rx_debug_ui_gpu_tests.exe` cleanly. As a bonus (not required, not relied
++upon): `rx_debug_ui_gpu_tests.exe` run directly under
++`xvfb-run -a wine ...` on this dev machine's own fuller Wine/Vulkan
++package set also passed all 4 cases for real — CI's own leaner Windows-job
++package set is NOT expected to reproduce this, which is why the ctest
++exclusion stands (matches `rx_rhi_vk`/`rx_graph_gpu`/`rx_material_gpu`'s
++own documented posture in `ci.yml`).
++
++## Revert-discrimination evidence
++
++**Dependency-boundary check** (in-tree revert-and-restore, byte-identical
++restore verified): temporarily added
++`target_link_libraries(rx_core PRIVATE imgui)` to
++`src/rx_core/CMakeLists.txt`, reconfigured —
++```
++CMake Error at cmake/DependencyBoundaryCheck.cmake:138 (message):
++  [dependency-boundary-check] 'rx_core' transitively depends on something
++  matching 'imgui' -- this violates the core-libraries-stay-ImGui-free hard
++  boundary (spec D20, gate ruling #16).  Dependency chain: rx_core -> imgui
++Call Stack (most recent call first):
++  CMakeLists.txt:126 (rx_assert_target_excludes_dependency)
++```
++Reverted (`cp` from a pre-edit backup; `diff` confirmed byte-identical);
++reconfigure succeeded cleanly again; full `ctest` suite re-run green
++(24/24).
++
++**LOAD-not-CLEAR** (in-tree revert-and-restore, byte-identical restore
++verified): temporarily swapped the two `addPass()` call lines in the main
++smoke `TEST_CASE` (declared `overlay->addPass()` BEFORE
++`addPatternPass()`, inverting the write-after-write chain so the overlay
++pass becomes the FIRST writer of `"bb"` and gets CLEARed, then the pattern
++pass's own `vkCmdClearAttachments` overwrites the WHOLE render area on
++top of it). Rebuilt, ran:
++```
++/.../test_overlay_gpu.cpp:378: ERROR: CHECK( approxEqual(inside, expectedWhite, 8) ) is NOT correct!
++  values: CHECK( false )
++/.../test_overlay_gpu.cpp:381: ERROR: CHECK_FALSE( approxEqual(inside, expectedPattern, 8) ) is NOT correct!
++  values: CHECK_FALSE( true )
++[doctest] test cases:  1 |  0 passed | 1 failed | 3 skipped
++```
++Reverted (byte-identical restore verified via `diff`); rebuilt; full
++`ctest` suite re-run green (24/24).
++
++**At-most-once `vkQueueWaitIdle`** (real discrimination trail during
++development, not a separately staged probe): the FIRST version of the
++steady-state loop used `ImGui::Text("frame %d", frame)` — observed
++`waitIdleCount == 6` (one per newly-seen digit glyph across 5 frames,
++plus `create()`'s own). A second attempt fixed the text but left the
++steady-state window's title bar enabled — observed `== 2` (one extra from
++the title's own never-before-seen glyphs, stable afterward, never 3+).
++The final, correct version reuses ONLY glyphs `create()`'s own priming
++frame already packed (`NoDecoration` + `TextUnformatted("rx_debug_ui")`)
++— `== 1`, stable across all 5 steady-state frames. All three states are
++documented inline in `test_overlay_gpu.cpp`'s own comment on the loop, so
++a future reader does not have to rediscover this from scratch. This
++IS the discrimination evidence for the assertion's real sensitivity — the
++test genuinely caught two different real regressions (each an authentic
++ImGui v1.92.x dynamic-font-atlas interaction, not a test bug) before
++landing in its final form.
++
++## Vendored-version provenance
++
++- Repo: `github.com/ocornut/imgui`. Tag: `v1.92.9b` (plain, NOT
++  `-docking`). Commit: `f1cc2ae15e53a861a874c3034aae6798fde194ab`.
++  Verified twice: (a) `git ls-remote --tags
++  https://github.com/ocornut/imgui.git` this session, confirming the tag
++  resolves to this exact commit and that `v1.92.9b-docking` is a
++  genuinely separate ref; (b) the actual `FetchContent`-populated source
++  tree's own `git describe --tags`/`git log -1` after a real fetch,
++  matching exactly.
++- License: MIT (`LICENSE.txt` at the pinned tag, fetched and read this
++  session — "Copyright (c) 2014-2026 Omar Cornut").
++- API-surface claims (nested `PipelineInfoMain`, descriptor-pool minimums,
++  `ImGui_ImplVulkan_LoadFunctions`'s loader-function contract, the
++  `IMGUI_VULKAN_FUNC_MAP`/`IMGUI_IMPL_VULKAN_USE_LOADER` dispatch
++  mechanism, `ImGui_ImplVulkan_UpdateTexture`'s internal
++  `vkQueueWaitIdle` call site, `ImGui_ImplSDL3_GamepadMode`,
++  `ImGui_ImplSDL3_ProcessEvent`) were all verified this session by
++  fetching and reading the REAL `imgui_impl_vulkan.h`/`.cpp` (full 2000
++  lines) and `imgui_impl_sdl3.h` at this exact pinned tag via `gh api
++  repos/ocornut/imgui/contents/...?ref=v1.92.9b` — not carried over from
++  the gate matrix's own citations unverified, and not assumed from
++  general ImGui familiarity.
++
++## Deviations from the brief/matrix (all reasoned, none silent)
++
++1. **No device-free `rx_debug_ui_tests` binary.** This module's own logic
++   is inherently GPU-bound (wrapping the vendored Vulkan/SDL3 backends);
++   the one genuinely device-free seam this task added
++   (`Window::pumpEvents()`'s `preDispatch` parameter) is tested where it
++   lives, `rx_platform/tests/window_test.cpp`, not duplicated into an
++   empty placeholder binary here. Matches the brief's own "TDD where
++   device-free logic exists" — there is none beyond that one seam.
++2. **Row 2's "invalid MinImageCount" criterion reinterpreted.**
++   `MinImageCount`/`ImageCount` are NOT parameters of this class's own
++   minimal `create(Device&, Window&, format)` surface (both hardcoded to
++   `FrameSync::kFramesInFlight` internally) — there is no way for an
++   external caller to construct that specific invalid config through this
++   API at all. The device-free-adjacent test instead validates the ONE
++   real caller-tunable input this surface exposes (`colorFormat`),
++   which is the honest, applicable reading of "fail loudly on a
++   deliberately-invalid config" given this class's actual (correctly
++   minimal, per the brief) shape.
++3. **`imgui_demo.cpp` not vendored.** The brief's Steps line mentions "a
++   forced demo window"; the matrix's own row 11 explicitly prefers "a
++   purpose-built minimal window... more robust against a future ImGui
++   version reflowing the demo window's contents" over the literal demo
++   window. Followed the matrix's own stated preference — smaller vendored
++   surface, zero lost test coverage.
++4. **`vkQueueWaitIdle` interception via `ImGui_ImplVulkan_LoadFunctions()`,
++   not `IMGUI_IMPL_VULKAN_USE_VOLK`.** The matrix's row 3 quote mentions
++   volk as "this project's Vulkan loader, relevant to the backend's own
++   `IMGUI_IMPL_VULKAN_USE_VOLK` convenience define" without mandating
++   that specific path. Verified directly (see Design summary) that the
++   `VK_NO_PROTOTYPES`+`LoadFunctions()` path is both consistent with this
++   project's existing `VK_NO_PROTOTYPES` convention (`rx_rhi_vk`'s own
++   PUBLIC define) AND gives the at-most-once test a clean, non-global
++   interception seam — a strictly better fit than the alternative, not a
++   shortcut.
++
++## Self-review
++
++- Re-read `overlay.h`/`overlay.cpp` end to end against the gate matrix's
++  own per-row citations (struct field names, function signatures,
++  constants) — every one matches the REAL fetched source, not a
++  paraphrase.
++- Confirmed the WAW-dependency reasoning behind LOAD-not-CLEAR against
++  `render_graph.cpp`'s real source (not assumed from the matrix's own
++  prose) before writing the test, then confirmed it experimentally via
++  the revert-discrimination swap above.
++- Confirmed IM_ASSERT compiles to nothing in this project's actual build
++  config (NDEBUG via RelWithDebInfo, both presets) before relying on that
++  fact to justify `Overlay::create()`'s own validation — did not just
++  assume it from the debug_checks.h precedent's own identical finding for
++  bare `assert()`.
++- Ran the full suite fresh on both presets from a genuine reconfigure (not
++  just an incremental build) as the final check, after an unrelated
++  build-cache hiccup (a stale `CTestTestfile.cmake` after a manual
++  `rm -rf` of build artifacts mid-session) briefly hid
++  `rx_debug_ui_gpu_tests` from `ctest -N` — reconfigured and reconfirmed
++  24/24 before treating the suite as green. Also hit and resolved a
++  pre-existing, unrelated `.deps-cache` key/`mikktspace` patch-idempotency
++  environment issue (a mismatch between invoking cmake via the
++  `/home/ywadi/d2/renderer_x` symlink vs. the real
++  `/media/ywadi/second/renderer_x` path changes a downstream dep-cache
++  key's literal string, forcing a spurious `mikktspace` FetchContent
++  re-populate/re-patch that fails on an already-patched tree) — resolved
++  by invoking consistently through the symlink path and clearing the
++  stale `_deps/mikktspace-*` state once; not a defect in anything this
++  task touched.
++- No stray debug/diagnostic code left in the committed files (a temporary
++  `MESSAGE("DIAG ...")` line used during the vkQueueWaitIdle
++  investigation was removed before finalizing `test_overlay_gpu.cpp`).
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 75bc1f4..87e2a81 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -94,20 +94,45 @@ add_subdirectory(src/rx_scene)
+ # depends on Vulkan::Headers + rx_core only, not rx_rhi_vk -- see
+ # src/rx_graph/CMakeLists.txt's own comment for why that dependency is
+ # deferred to the tasks that actually need a VkDevice.
+ add_subdirectory(src/rx_graph)
+ # Materials as Slang modules, pass signatures, and the lazy content-hash-
+ # keyed pipeline cache [spec Phase 3 design, D6-D8] -- depends on rx_graph
+ # (PassSignature), rx_shader (ShaderLayoutInfo's slang-free layout-types
+ # target only), and rx_rhi_vk (PipelineLayoutBuilder/BindlessTable/Device),
+ # so it is add_subdirectory'd after all three.
+ add_subdirectory(src/rx_material)
++
++# Phase 4 Stage 2 Task 21 -- rx_debug_ui: Dear ImGui overlay module (spec
++# D20). Depends on rx_platform (Window)/rx_rhi_vk (Device/Uploader)/
++# rx_graph (RenderGraph pass declaration) plus the vendored `imgui` target
++# (third_party/CMakeLists.txt) -- added here, after every rx_* CORE
++# library above, so the dependency-boundary check immediately below can
++# assert none of THOSE core targets pulled it in transitively, and before
++# the samples that will (Task 24) become its first real consumer.
++add_subdirectory(src/rx_debug_ui)
++
++# Configure-time link-boundary check [Phase 4 Stage 2 Task 21, gate matrix-
++# issue16 row 12 as amended by gate/rulings-2026-08-18.md #16; see
++# cmake/DependencyBoundaryCheck.cmake for the full mechanism comment]: every
++# rx_* CORE library defined above (deliberately excludes rx_debug_ui
++# itself, which is SUPPOSED to depend on imgui, and excludes samples/tools,
++# which are hosts, not core libraries) must not transitively link the
++# vendored `imgui` target -- the "core libraries and public ABI stay
++# ImGui-free" hard boundary D20/ticket #16 both restate. Runs once, right
++# here, so a violation fails THIS configure step before any compilation
++# starts.
++include(cmake/DependencyBoundaryCheck.cmake)
++foreach(_rx_core_target rx_core rx_rhi_vk rx_graph rx_material rx_platform rx_task rx_shader rx_asset rx_scene)
++    rx_assert_target_excludes_dependency(${_rx_core_target} imgui)
++endforeach()
++
+ add_subdirectory(tools/dep_cache_smoketest)
+ add_subdirectory(tools/toolchain_check)
+ # Phase 4 Stage 1 Task 13: host-only fixture regenerator (assets/test/
+ # cube_meshopt.*/cube_draco.*) -- see its own CMakeLists.txt comment.
+ add_subdirectory(tools/gen_gltf_compression_fixtures)
+ add_subdirectory(samples/01_triangle)
+ add_subdirectory(samples/02_hotreload)
+ add_subdirectory(samples/03_bindless_mesh)
+ add_subdirectory(samples/04_streaming)
+ add_subdirectory(samples/05_multipass)
+diff --git a/MANUAL_VERIFICATION.md b/MANUAL_VERIFICATION.md
+index 353bb38..5f6a4a0 100644
+--- a/MANUAL_VERIFICATION.md
++++ b/MANUAL_VERIFICATION.md
+@@ -204,20 +204,68 @@ sample itself will carry its own MANUAL_VERIFICATION section once it lands.
+       confirms that diagnostic actually appears on real Deck hardware,
+       not just in the virtual-joystick test.
+ 
+ **Last run:** not yet performed — this task (Task 20) implemented and
+ automated-tested the platform-level surface only; no sample exists yet to
+ drive an end-to-end human-observed session against. Fill in the checkboxes
+ above once Task 24's `09_fly_through` sample lands and this section can be
+ run for real (on desktop first, then Steam Deck hardware before any release
+ claiming Deck gamepad support).
+ 
++## rx_debug_ui overlay (Phase 4 Stage 2 Task 21, spec D20, gate ruling #16)
++
++`rx::debug_ui::Overlay` (font upload, descriptor pool, render-graph pass,
++event dispatch, LOAD-not-CLEAR pattern-preservation, at-most-once
++`vkQueueWaitIdle`) is exercised automatically end-to-end against an
++offscreen readback target (`src/rx_debug_ui/tests/test_overlay_gpu.cpp`,
++`rx_debug_ui_gpu_tests`) under lavapipe + validation, both CI presets
++(GPU test excluded on windows-cross-zig/Wine — no real Vulkan device
++there, same posture as `rx_rhi_vk_tests`/`rx_graph_gpu_tests`). **No
++sample yet consumes this module** — Task 24 (`09_fly_through`) is
++expected to be the first real HUD consumer; the rows below are genuinely
++not automatable headlessly and are routed here per the gate matrix's own
++text (row 6: "a headless test cannot exercise the 'camera stops moving'
++half of this rule directly, so that half is a MANUAL_VERIFICATION row").
++
++- [ ] Visual HUD sanity in a REAL windowed session (not the offscreen
++      readback target the automated test uses): the overlay renders
++      crisp, correctly-composited text/widgets over live rendered content,
++      with no flicker, tearing, or misplaced geometry across several
++      seconds of continuous frames.
++- [ ] Gamepad ownership orthogonality: with a REAL physical gamepad
++      connected, confirm ImGui's own SDL3 backend never itself opens/
++      closes it (`ImGui_ImplSDL3_SetGamepadMode(Manual, nullptr, 0)`,
++      called immediately after `ImGui_ImplSDL3_InitForVulkan()` —
++      `overlay.cpp`) — Task 20/#14's own gamepad hot-plug log line
++      (`rx_platform: gamepad connected id=...`) should fire exactly once
++      per physical connect, with no second, ImGui-driven open/close
++      racing it (the hazard gate ruling #16 row 7 names).
++- [ ] "Camera stops moving while the HUD has focus" (gate matrix row 6's
++      second half): with a sample driving both a fly-through camera
++      (Task 20's mouse-look) and this overlay, click/drag inside an open
++      HUD panel — the camera must NOT respond to that mouse motion while
++      `ImGui::GetIO().WantCaptureMouse` is true (the automated GPU test
++      proves `WantCaptureMouse` itself flips correctly; it cannot drive a
++      real camera to observe the consuming half of the contract).
++- [ ] Steam Deck: confirm the HUD renders and is legible/usable at Deck's
++      actual display resolution and, if the HUD ever grows touch-target
++      sizing considerations, that mouse/keyboard-driven toggles remain
++      operable via Deck's trackpads (gamepad HUD navigation is explicitly
++      NOT implemented this phase, per gate ruling #16 row 7 — Manual
++      gamepad mode means the HUD is not gamepad-navigable at all yet).
++
++**Last run:** not yet performed — this task (Task 21) implemented and
++automated-tested the module against an offscreen readback target only; no
++sample exists yet to drive an end-to-end human-observed session against.
++Fill in the checkboxes above once a sample (Task 24 or earlier) actually
++wires this overlay into a live windowed present loop.
++
+ ## 05_multipass (`--present` mode)
+ 
+ `sample_05_multipass` needs the Slang runtime libraries (+ its six on-disk
+ shader sources) deployed next to it — see `samples/README.md`'s own
+ "Redistribution" section for the full manifest; it is not statically linked
+ like 01_triangle.
+ 
+ ### What "pass" means, every platform
+ 
+ - The window opens and shows a reddish cube and a bluish sphere on a
+diff --git a/cmake/DependencyBoundaryCheck.cmake b/cmake/DependencyBoundaryCheck.cmake
+new file mode 100644
+index 0000000..e9b6174
+--- /dev/null
++++ b/cmake/DependencyBoundaryCheck.cmake
+@@ -0,0 +1,143 @@
++# Configure-time dependency-boundary assertion [Phase 4 Stage 2 Task 21,
++# gate matrix-issue16 row 12 as amended by gate/rulings-2026-08-18.md #16;
++# recorded as a reusable pattern, registry item 14]. Nothing like this
++# existed anywhere in this repository before this task (verified directly:
++# .github/workflows/ci.yml and every existing CMakeLists.txt in this repo
++# were checked for an analogous "assert target X does not link target Y"
++# mechanism -- none found; boundary discipline before this task was
++# convention + code review only).
++#
++# Fails the CONFIGURE step (before any compilation starts) if a named
++# target's transitive LINK_LIBRARIES/INTERFACE_LINK_LIBRARIES closure
++# contains a target/library name matching a forbidden substring -- this
++# ticket's own concrete use is `rx_assert_target_excludes_dependency(rx_core
++# "imgui")` (and the same for every other rx_* CORE target), enforcing the
++# "core libraries and public ABI stay ImGui-free" hard boundary D20/the
++# #16 ticket both restate at the point a violation is CHEAPEST to catch --
++# before compiling anything, not at review time or via a runtime symbol
++# audit after the fact.
++#
++# Deliberately NOT a CI-only step: this is plain CMake, called from the
++# root CMakeLists.txt itself, so a local `cmake --preset ...` configure on
++# any developer's machine catches a violation immediately, exactly like
++# every other configure-time FATAL_ERROR this project's build already
++# relies on (e.g. cmake/DepCache.cmake's own dep-cache failures).
++
++# _rx_dep_closure_contains(<target> <forbidden> <depth> <out_found> <out_chain>)
++#
++# Recursive walk, depth-limited (not visited-set-deduplicated -- see below)
++# rather than the more usual visited-set design: CMake function scoping
++# does not support passing a mutable accumulator "by reference" through a
++# chain of recursive calls the way a real programming language would (a
++# variable NAME passed as an argument does not let a callee mutate the
++# CALLER's variable except via the one-level-up PARENT_SCOPE mechanism,
++# which only reaches the immediate caller, not an arbitrary ancestor) --
++# threading a shared visited-set through recursion this way was tried
++# first, this task, and does not work correctly. Given this project's own
++# real target graph is small (under two dozen targets total, each with a
++# handful of direct dependencies), an unmemoized walk that may revisit a
++# shared dependency (e.g. rx_core) once per path reaching it costs nothing
++# observable at configure time -- correctness (finding a real match if one
++# exists) does not depend on deduplication, only performance would, and
++# performance is a non-issue at this scale. The depth cap below is a purely
++# defensive guard against a pathological/self-referential entry, not a
++# realistic ceiling this project's own graph could ever approach.
++function(_rx_dep_closure_contains _target _forbidden _depth _out_found _out_chain)
++  if(_depth GREATER 64)
++    message(FATAL_ERROR
++      "[dependency-boundary-check] recursion depth exceeded walking '${_target}' -- likely a cyclic or "
++      "self-referential LINK_LIBRARIES entry; investigate before raising this limit.")
++  endif()
++
++  # Substring match on the dependency NAME itself first -- catches both a
++  # real target (e.g. a hypothetical `imgui` target) AND a plain, not-yet-
++  # (or never-)defined library-name string that merely mentions the
++  # forbidden name (e.g. "imgui_impl_vulkan" typed directly into some
++  # future target_link_libraries() call before any such target exists) --
++  # either way, a core target's own build-graph declaration naming
++  # something ImGui-flavored is the violation this check exists to catch,
++  # independent of whether that name currently resolves to a real target.
++  string(TOLOWER "${_target}" _targetLower)
++  string(TOLOWER "${_forbidden}" _forbiddenLower)
++  string(FIND "${_targetLower}" "${_forbiddenLower}" _selfMatch)
++  if(NOT _selfMatch EQUAL -1)
++    set(${_out_found} TRUE PARENT_SCOPE)
++    set(${_out_chain} "${_target}" PARENT_SCOPE)
++    return()
++  endif()
++
++  if(NOT TARGET ${_target})
++    # Not a real target (an interface/system library name like "m",
++    # "dl", or a generator-expression fragment this walk could not
++    # resolve) -- nothing further to walk, and no match already found
++    # above, so this branch is clean.
++    set(${_out_found} FALSE PARENT_SCOPE)
++    return()
++  endif()
++
++  math(EXPR _childDepth "${_depth} + 1")
++
++  set(_deps "")
++  foreach(_prop LINK_LIBRARIES INTERFACE_LINK_LIBRARIES)
++    get_target_property(_val ${_target} ${_prop})
++    if(_val)
++      list(APPEND _deps ${_val})
++    endif()
++  endforeach()
++
++  foreach(_dep ${_deps})
++    # Strip the generator-expression wrappers this project's own
++    # dependency graph can plausibly emit ($<LINK_ONLY:tgt> from a
++    # PRIVATE/INTERFACE usage-requirement propagation; $<BUILD_INTERFACE:
++    # tgt>/$<INSTALL_INTERFACE:tgt> from an exported package's own
++    # generated targets, e.g. fastgltf/draco/KTX above) so the walk can
++    # still recurse into the real target name underneath. Any OTHER,
++    # unrecognized generator expression is left alone and simply skipped
++    # below -- configure-time analysis cannot evaluate an arbitrary
++    # generator expression's final value anyway (it may depend on
++    # $<CONFIG:...> or similar, resolved only at generate time).
++    string(REGEX REPLACE "^\\$<LINK_ONLY:(.*)>$" "\\1" _dep "${_dep}")
++    string(REGEX REPLACE "^\\$<BUILD_INTERFACE:(.*)>$" "\\1" _dep "${_dep}")
++    string(REGEX REPLACE "^\\$<INSTALL_INTERFACE:(.*)>$" "\\1" _dep "${_dep}")
++    if(_dep MATCHES "\\$<")
++      continue()
++    endif()
++    if("${_dep}" STREQUAL "${_target}")
++      continue()  # a self-referential entry -- skip rather than recurse forever.
++    endif()
++
++    _rx_dep_closure_contains("${_dep}" "${_forbidden}" "${_childDepth}" _childFound _childChain)
++    if(_childFound)
++      set(${_out_found} TRUE PARENT_SCOPE)
++      set(${_out_chain} "${_target} -> ${_childChain}" PARENT_SCOPE)
++      return()
++    endif()
++  endforeach()
++
++  set(${_out_found} FALSE PARENT_SCOPE)
++endfunction()
++
++# rx_assert_target_excludes_dependency(<target-name> <forbidden-substring>)
++#
++# Public entry point. `<target-name>` must already be a real, defined
++# target (a target that does not exist yet is an ordering bug in the
++# caller, not a vacuously-passing check -- fails loudly rather than
++# silently skipping). Case-insensitive substring match against every name
++# in `<target-name>`'s transitive link closure; FATAL_ERRORs, naming the
++# full dependency chain, on any match.
++function(rx_assert_target_excludes_dependency TARGET_NAME FORBIDDEN)
++  if(NOT TARGET ${TARGET_NAME})
++    message(FATAL_ERROR
++      "[dependency-boundary-check] target '${TARGET_NAME}' does not exist at the point this check runs -- "
++      "this is a root CMakeLists.txt add_subdirectory-ordering bug (the check must run AFTER every target "
++      "it examines is defined), not a passing check.")
++  endif()
++
++  _rx_dep_closure_contains("${TARGET_NAME}" "${FORBIDDEN}" 0 _rx_found _rx_chain)
++  if(_rx_found)
++    message(FATAL_ERROR
++      "[dependency-boundary-check] '${TARGET_NAME}' transitively depends on something matching "
++      "'${FORBIDDEN}' -- this violates the core-libraries-stay-ImGui-free hard boundary (spec D20, gate "
++      "ruling #16). Dependency chain: ${_rx_chain}")
++  endif()
++endfunction()
+diff --git a/docs/threading.md b/docs/threading.md
+index 6c5c350..041f07e 100644
+--- a/docs/threading.md
++++ b/docs/threading.md
+@@ -119,20 +119,28 @@ and compiles to nothing at all when it is OFF:
+   same runtime check as every other entry here). Matches D5's whole-class
+   posture (`rx::asset::GeometryPool`'s precedent above): several of these
+   (`isKeyDown()`, the gamepad axis/button reads inside `poll()`) are
+   individually documented safe-from-any-thread by SDL3's own header, but
+   the guard here is this project's own D5 policy scoping for one
+   predictable contract across the whole class, not a hazard those
+   particular calls introduce on their own — the same reasoning
+   `rx::rhi::Uploader::isComplete()`/`wait()` already established above.
+   `setFullscreen()`/`isFullscreen()` (Task 17) are NOT guarded — out of
+   this task's touched-surface scope, unchanged. (`src/rx_platform/include/rx_platform/window.h`)
++- **`rx::debug_ui::Overlay`** [Phase 4 Stage 2 Task 21, spec D20, gate
++  ruling #16] — `create()`/`processEvent()`/`beginFrame()`/`addPass()`
++  **[guarded, all four]**. Stricter than the usual "GPU-object mutation"
++  framing above: this whole class wraps a single, process-global
++  `ImGuiContext` (Dear ImGui is single-threaded by design, no internal
++  synchronization at all), so every entry point is main-thread-only, not
++  just the ones that touch a `VkDevice` directly.
++  (`src/rx_debug_ui/include/rx_debug_ui/overlay.h`)
+ - **`rx::task::Scheduler`** — `pumpMain()` **[guarded]** [audit finding
+   F5-partial]: runs whatever GPU-object-mutating closures `postToMain()`
+   queued (the handoff pattern below), so it carries the identical
+   main-thread-only contract as everything above it, just via a different
+   entry point. `parallelFor()` is NOT main-thread-only itself (its
+   documented contract is "calling thread, whichever one that is" — see
+   `scheduler.h`); this guard is specifically about the pump point workers
+   hand GPU mutation back through, not about `Scheduler` in general.
+   (`src/rx_task/include/rx_task/scheduler.h`)
+ 
+diff --git a/src/rx_debug_ui/CMakeLists.txt b/src/rx_debug_ui/CMakeLists.txt
+new file mode 100644
+index 0000000..bac5dee
+--- /dev/null
++++ b/src/rx_debug_ui/CMakeLists.txt
+@@ -0,0 +1,47 @@
++# Phase 4 Stage 2 Task 21 -- rx_debug_ui: Dear ImGui debug overlay (spec
++# D20, gate matrix-issue16 as amended by gate/rulings-2026-08-18.md #16).
++# The vendored `imgui` target (third_party/CMakeLists.txt) is PUBLIC on
++# this library -- deliberately: this is the one, documented seam ImGui
++# symbols are meant to cross into a consumer (samples, this module's own
++# tests) through, unlike every rx_* CORE library, whose link closure is
++# asserted free of it at configure time (cmake/DependencyBoundaryCheck.cmake,
++# called from the root CMakeLists.txt right after this module is added).
++add_library(rx_debug_ui STATIC
++    overlay.cpp
++)
++target_include_directories(rx_debug_ui PUBLIC include)
++target_link_libraries(rx_debug_ui PUBLIC imgui rx_platform rx_rhi_vk rx_graph rx_core)
++
++# GPU smoke test [Task 21 brief's own Steps line: "GPU smoke test (overlay
++# pass renders; readback shows non-empty overlay region with a forced demo
++# window; zero validation errors)"] -- same windowed-device fixture pattern
++# and warm-up-before-any-TEST_CASE main() as rx_graph/tests/test_execute_gpu.
++# cpp/doctest_main_gpu.cpp (copied, not shared -- see that file's own
++# comment). No device-free rx_debug_ui_tests target exists: this module's
++# own logic is inherently GPU-bound (wrapping the vendored Vulkan/SDL3
++# backends) -- the one genuinely device-free seam this task added
++# (rx::platform::Window::pumpEvents()'s new `preDispatch` parameter) is
++# tested where it lives, src/rx_platform/tests/window_test.cpp, not
++# duplicated here.
++add_executable(rx_debug_ui_gpu_tests
++    tests/doctest_main_gpu.cpp
++    tests/test_overlay_gpu.cpp
++)
++target_link_libraries(rx_debug_ui_gpu_tests PRIVATE rx_debug_ui rx_task doctest::doctest)
++
++# --validate: same reason every other GPU-gate ctest invocation in this
++# repo appends it (samples/*/CMakeLists.txt, rx_graph/tests/CMakeLists.txt)
++# -- this binary's fixtures already build every rx::rhi::Context with
++# enableValidation=true unconditionally; the flag documents/keeps this
++# invocation consistent with the rest of this repo's GPU gates (doctest
++# itself ignores it).
++add_test(NAME rx_debug_ui_gpu_tests COMMAND rx_debug_ui_gpu_tests --validate)
++# Hang guard: a wedged test fails in minutes with output, instead of
++# stalling CI for hours (windows-cross Wine hang, run 31512073559) --
++# same convention as every other GPU-test binary's own ctest registration
++# in this repo. This target is EXCLUDED from the windows-cross-zig job's
++# ctest invocation entirely (.github/workflows/ci.yml, same reason
++# rx_rhi_vk_tests/rx_graph_gpu_tests/rx_material_gpu_tests already are:
++# Wine has no real Vulkan device to hand it), so this timeout only ever
++# matters on linux-native + a local `xvfb-run -a ctest` run.
++set_tests_properties(rx_debug_ui_gpu_tests PROPERTIES TIMEOUT 120)
+diff --git a/src/rx_debug_ui/include/rx_debug_ui/overlay.h b/src/rx_debug_ui/include/rx_debug_ui/overlay.h
+new file mode 100644
+index 0000000..a8ba9b7
+--- /dev/null
++++ b/src/rx_debug_ui/include/rx_debug_ui/overlay.h
+@@ -0,0 +1,245 @@
++#pragma once
++// Thread-affinity (D5, Phase 4): main-thread-only, in full -- `Overlay`
++// wraps a single, PROCESS-GLOBAL `ImGuiContext` (Dear ImGui is single-
++// threaded by design: one global context, no internal synchronization,
++// well-established public knowledge of the library -- gate matrix-issue16
++// row 13). `create()`, `processEvent()`, `beginFrame()`, and the graph
++// pass's own execute callback (installed by `addPass()`) must all run on
++// the SAME thread that called `create()`. At most one live `Overlay`
++// should exist per process for the same reason (a second concurrently-live
++// instance would silently share/stomp the first one's global ImGui
++// context) -- this is a documented usage contract, not something this
++// class enforces at runtime.
++//
++// FONT/TEXTURE UPLOAD -- DOCUMENTED D25/D24 EXCEPTION [gate ruling #16,
++// 2026-08-18, BINDING]: this class's font atlas (and any later-registered
++// HUD texture, e.g. via ImGui_ImplVulkan_AddTexture) does NOT go through
++// rx::rhi::Uploader/UploadTicket -- unlike every Stage-1 call site D25
++// lists (GeometryPool upload, TextureCache load, importer, async import).
++// It structurally cannot: the vendored, unmodified Vulkan backend
++// (imgui_impl_vulkan.cpp's ImGui_ImplVulkan_UpdateTexture(), called
++// internally from ImGui_ImplVulkan_RenderDrawData()) does its OWN raw
++// vkCreateImage/vkAllocateMemory/vkCreateBuffer calls -- entirely
++// bypassing VMA -- on its own internal one-shot command pool, and BLOCKS
++// the graphics queue with its own `vkQueueWaitIdle` (imgui_impl_vulkan.cpp,
++// upstream's own "// FIXME-OPT: Suboptimal!" comment) until that upload
++// completes. This project's "prefer unmodified vendored deps" posture
++// (Global Constraints) and the header's own "You can use unmodified
++// imgui_impl_* files in your project" comment both argue against patching
++// it to route through Uploader instead. Two consequences, both load-
++// bearing:
++//   (a) `create()` FORCES this upload to happen once, synchronously,
++//       during construction (before any real per-frame rendering begins)
++//       so the one unavoidable full-queue stall this vendored path incurs
++//       is a one-time startup cost, not a steady-state one -- see
++//       overlay.cpp's own comment at the call site for exactly how.
++//   (b) The font atlas (and any HUD textures registered once, near
++//       startup) are created ONCE; a HUD design that later causes
++//       per-frame texture churn (e.g. a dynamically-regenerated icon
++//       atlas) would silently reintroduce this same full-queue stall on
++//       every affected frame -- rx_debug_ui's own GPU test asserts
++//       `vkQueueWaitIdle` fires AT MOST ONCE across a fixed N-frame
++//       steady-state run specifically to catch that regression class.
++//   (c) This class's own raw Vulkan allocations (the font atlas image +
++//       memory, the vertex/index buffer rotation ImGui_ImplVulkan_
++//       RenderDrawData() manages internally) are INVISIBLE to D24's
++//       per-category VMA/vmaGetHeapBudgets() accounting
++//       (rx_rhi_vk/memory_report.h) -- see that header's own comment for
++//       the matching note on the report's documented scope. Bounded and
++//       small (a font atlas + a handful of HUD textures, never scene-scale
++//       data), not a correctness gap, but a real blind spot a reader of
++//       the memory report should not mistake for exhaustive coverage.
++#include <SDL3/SDL.h>  // SDL_Event -- matches rx_platform/window.h's own direct-include convention (input.h is deliberately SDL-free).
++#include <vulkan/vulkan_core.h>
++
++#include <optional>
++#include <string_view>
++
++namespace rx::rhi {
++class Device;
++}  // namespace rx::rhi
++
++namespace rx::platform {
++class Window;
++}  // namespace rx::platform
++
++namespace rx::graph {
++class RenderGraph;
++}  // namespace rx::graph
++
++namespace rx::debug_ui {
++
++// Dear ImGui v1.92.9b [spec D20, gate ruling #16] as a normal declared
++// render-graph pass. Vendored (third_party/CMakeLists.txt) core + sdl3 +
++// vulkan backends only -- no docking/multi-viewport (the plain, non-
++// `-docking` tag structurally excludes that whole code path, not merely a
++// runtime flag discipline). This is the ONLY public seam through which
++// ImGui symbols are meant to reach a consumer outside this module and
++// samples -- every rx_* CORE library's link closure is asserted free of
++// the vendored `imgui` target at CMake configure time
++// (cmake/DependencyBoundaryCheck.cmake, called from the root
++// CMakeLists.txt) [gate ruling #16 row 12].
++class Overlay {
++public:
++    Overlay(Overlay&&) noexcept;
++    Overlay& operator=(Overlay&&) noexcept;
++    Overlay(const Overlay&) = delete;
++    Overlay& operator=(const Overlay&) = delete;
++
++    // See the class-level comment above: the caller must have already
++    // brought `device` to a real idle point (no in-flight frame still
++    // referencing this overlay's pipeline/descriptor pool/font texture)
++    // before this runs -- the SAME documented contract
++    // rx::rhi::FrameSync's own destructor states, not a new convention.
++    ~Overlay();
++
++    // Builds the overlay against `device`/`window`, targeting `colorFormat`
++    // (the render-graph target's own attachment format this overlay's pass
++    // will write -- typically `device.swapchainFormat()`) via
++    // UseDynamicRendering. Order of operations, all inside this one call:
++    // creates this overlay's OWN VkDescriptorPool (two typed pool-size
++    // entries -- VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE and
++    // VK_DESCRIPTOR_TYPE_SAMPLER, VK_DESCRIPTOR_POOL_CREATE_FREE_
++    // DESCRIPTOR_SET_BIT set -- sized per the vendored backend's own
++    // stated minimums with headroom for HUD textures beyond the font atlas
++    // alone, see overlay.cpp); calls ImGui::CreateContext(); calls
++    // `ImGui_ImplSDL3_InitForVulkan(window.sdlWindow())` THEN
++    // `ImGui_ImplVulkan_Init(...)` (platform backend before renderer
++    // backend, matching every upstream ImGui example's own ordering);
++    // immediately calls `ImGui_ImplSDL3_SetGamepadMode(Manual, nullptr, 0)`
++    // (kills the backend's own default AutoFirst gamepad-ownership race
++    // against rx_platform::Window's own gamepad lifecycle -- gate ruling
++    // #16 row 7; gamepad HUD navigation is deliberately NOT enabled this
++    // phase as a direct consequence); forces the font atlas's one-time GPU
++    // upload synchronously (see class comment's FONT/TEXTURE UPLOAD
++    // section). Returns std::nullopt (logged via RX_LOG_ERROR) on any
++    // failure -- including a deliberately-invalid caller-supplied
++    // configuration this function validates itself before ever calling
++    // into the vendored backend (see overlay.cpp: the vendored backend's
++    // own `IM_ASSERT` preconditions compile to nothing in this project's
++    // actual NDEBUG-defined RelWithDebInfo builds -- both this project's
++    // presets -- so relying on them alone would silently let a bad config
++    // proceed; this function's own checks are what actually make "fail
++    // loudly, not silently proceed" true in the builds this project ships).
++    static std::optional<Overlay> create(rx::rhi::Device& device, rx::platform::Window& window, VkFormat colorFormat);
++
++    // The event-dispatch seam [gate ruling #16]: wraps
++    // `ImGui_ImplSDL3_ProcessEvent(&event)`. Pass this directly as
++    // `rx::platform::Window::pumpEvents()`'s `preDispatch` argument (the
++    // seam that method gained specifically for this -- see its own header
++    // comment), or call it yourself once per drained SDL event, BEFORE any
++    // other code this frame reads `ImGui::GetIO().WantCaptureMouse`/
++    // `WantCaptureKeyboard` (gate ruling #14/#16: those flags must already
++    // be current by the time platform-input accumulation gates on them).
++    void processEvent(const SDL_Event& event);
++
++    // Frame-start sequencing: `ImGui_ImplVulkan_NewFrame()` +
++    // `ImGui_ImplSDL3_NewFrame()` (both backend NewFrames, in that order)
++    // + `ImGui::NewFrame()` (core, last) -- the exact ordering every
++    // upstream ImGui example uses. Call once per frame, before any UI-
++    // building code (including whatever the graph pass's own execute
++    // callback, installed by addPass() below, will end up rendering).
++    void beginFrame();
++
++    // Declares this overlay's render-graph pass against `graph`: a
++    // side-effect pass (rx_graph::Pass::setSideEffect() -- no downstream
++    // consumer reads its output, so it would otherwise be culled) with no
++    // resource reads (ImGui reads its own internal draw-data state, not a
++    // graph-tracked resource) and one color output on `targetName`. LOAD-
++    // not-CLEAR is a named acceptance criterion [gate ruling #16]: whether
++    // this pass's own attachment load-op is LOAD or CLEAR is NOT a
++    // parameter this method exposes -- rx_graph::Executor derives it
++    // automatically from whether an EARLIER pass in the same frame already
++    // wrote `targetName` (LOAD) or this is that name's first write this
++    // frame (CLEAR) -- so a caller that wants the underlying scene to
++    // remain visible under the HUD simply declares its own scene pass(es)
++    // against the SAME `targetName` BEFORE calling this method each frame;
++    // getting that ordering wrong (declaring this pass first, or against a
++    // name nothing else writes) silently blanks the scene under the HUD
++    // rather than failing loudly, so callers must get the ordering right,
++    // not merely call this method somewhere. The execute callback records
++    // `ImGui::Render()` then `ImGui_ImplVulkan_RenderDrawData(ImGui::
++    // GetDrawData(), ctx.cmd)` into the pass's own command buffer -- no
++    // separate `ImGui::EndFrame()` call is needed (`Render()` calls it
++    // internally, per ImGui's own documented contract). Call once per
++    // frame, after beginFrame() and every UI-building call.
++    void addPass(rx::graph::RenderGraph& graph, std::string_view targetName);
++
++private:
++    // Plain-member RAII, no PImpl: mirrors every other GPU-resource-owning
++    // class in this codebase (rx::platform::Window, rx::rhi::Device/
++    // Uploader) rather than introducing a new pattern for this one class.
++    // Everything ELSE this class touches (the ImGui backends' own init
++    // state, the font atlas, the vertex/index buffer rotation) is owned by
++    // Dear ImGui's own global/static state, not by this object -- `device_`
++    // doubling as the "do I own a live context to tear down" sentinel
++    // (VK_NULL_HANDLE after a move-from or default-construction, matching
++    // Window's own `window_`-as-sentinel convention) is sufficient.
++    explicit Overlay(VkDevice device, VkDescriptorPool descriptorPool, VkFormat colorFormat)
++        : device_(device), descriptorPool_(descriptorPool), colorFormat_(colorFormat) {}
++
++    void destroyAll();
++
++    VkDevice device_ = VK_NULL_HANDLE;
++    VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
++
++    // The format `create()` was called with -- re-supplied to addColorOutput()
++    // below rather than re-derived: RenderGraph::compile() takes the LAST
++    // (execution-order) ColorOutput declaration's own AttachmentDesc as a
++    // resource's canonical shape (render_graph.cpp: `resource.attachment =
++    // decl.attachment;`, unconditionally overwritten by every writer) --
++    // since this overlay's own pass is meant to be declared AFTER the
++    // scene pass(es) that establish `targetName` (see addPass()'s own
++    // comment), this class's own declaration is exactly the one whose
++    // AttachmentDesc "wins" that overwrite, so it must describe the SAME
++    // shape the earlier pass(es) already established, not an arbitrary
++    // one. A NON-backbuffer `targetName` sized differently than the
++    // swapchain (SizeClass::Absolute, or a non-1.0 SwapchainRelative
++    // multiplier) is outside this task's scope -- addPass() always
++    // declares SwapchainRelative 1.0x1.0 (resources.h's own stated common
++    // case), which is exactly right for `targetName == backbufferSource`
++    // regardless (RenderGraph::compile() overrides a backbuffer resource's
++    // shape from the swapchain unconditionally, ignoring every writer's
++    // own AttachmentDesc) and for any other same-size HUD target.
++    VkFormat colorFormat_ = VK_FORMAT_UNDEFINED;
++};
++
++namespace detail {
++
++// Test-only seam -- NOT part of the stable public contract [gate ruling
++// #16 row 5, matrix's "at-most-once QueueWaitIdle" acceptance criterion].
++// Mirrors rx::core::debug::detail::setViolationHookForTests's own carve-out
++// convention (rx_core/debug_checks.h): a plain function pointer, never
++// std::function, installed once before the code under test runs and
++// restored to nullptr (the default -- real production behavior) once the
++// test is done, typically via an RAII scope guard at the call site.
++//
++// Overlay::create() loads every Vulkan function the vendored ImGui backend
++// calls through its OWN loader function (imguiVulkanFunctionLoader,
++// overlay.cpp), rather than the direct-prototype/volk-global path most of
++// this codebase's own Vulkan calls use -- see third_party/CMakeLists.txt's
++// own comment on the vendored `imgui` target's VK_NO_PROTOTYPES choice for
++// why. That loader is this class's OWN code, so it is the natural,
++// zero-extra-machinery seam for a GPU test to intercept specifically
++// "vkQueueWaitIdle" -- and ONLY that one symbol, resolved ONLY for the
++// vendored ImGui backend's own internal, TU-local static function-pointer
++// table, never the shared global `vkQueueWaitIdle` this project's own
++// engine-side code (e.g. rx::rhi::CommandContext::runOnce()) calls through
++// volk. Installing a non-null hook here means the NEXT
++// Overlay::create() call's internal ImGui_ImplVulkan_LoadFunctions() call
++// resolves "vkQueueWaitIdle" to `hook` instead of the real
++// vkGetInstanceProcAddr()-resolved function; `hook` itself is responsible
++// for forwarding to the real function (typically the same global
++// `vkQueueWaitIdle` volk symbol every other Vulkan call in this project
++// already uses) -- this seam only lets a test COUNT calls, never skip the
++// real wait (skipping it would leave the font atlas upload genuinely
++// incomplete when later code reads from it, a correctness bug, not a test
++// convenience). `nullptr` (the default) restores the real,
++// vkGetInstanceProcAddr()-resolved function for every symbol, including
++// this one.
++using QueueWaitIdleFn = VkResult (*)(VkQueue);
++void setQueueWaitIdleHookForTests(QueueWaitIdleFn hook);
++
++}  // namespace detail
++
++}  // namespace rx::debug_ui
+diff --git a/src/rx_debug_ui/overlay.cpp b/src/rx_debug_ui/overlay.cpp
+new file mode 100644
+index 0000000..4a23bdb
+--- /dev/null
++++ b/src/rx_debug_ui/overlay.cpp
+@@ -0,0 +1,361 @@
++#include <rx_debug_ui/overlay.h>
++
++#include <rx_core/debug_checks.h>
++#include <rx_core/log.h>
++#include <rx_graph/executor.h>
++#include <rx_graph/render_graph.h>
++#include <rx_platform/window.h>
++#include <rx_rhi_vk/command.h>
++#include <rx_rhi_vk/device.h>
++#include <rx_rhi_vk/frame_sync.h>
++
++#include <volk.h>
++
++#include <imgui.h>
++#include <imgui_impl_sdl3.h>
++#include <imgui_impl_vulkan.h>
++
++#include <array>
++#include <cstring>
++
++namespace rx::debug_ui {
++
++namespace {
++
++// ---- vkQueueWaitIdle test-interception state [gate ruling #16 row 5,
++// overlay.h's own detail::setQueueWaitIdleHookForTests comment] -----------
++detail::QueueWaitIdleFn g_queueWaitIdleHookForTests = nullptr;
++
++VkResult interceptedQueueWaitIdle(VkQueue queue) { return g_queueWaitIdleHookForTests(queue); }
++
++// Loader function handed to ImGui_ImplVulkan_LoadFunctions() -- see
++// third_party/CMakeLists.txt's own comment on the vendored `imgui` target's
++// VK_NO_PROTOTYPES choice for why this project uses this path (rather than
++// IMGUI_IMPL_VULKAN_USE_VOLK) at all. `userData` is the VkInstance passed
++// at the call site below (create()). Every symbol resolves through the
++// real `vkGetInstanceProcAddr` (itself a volk-loaded global -- this
++// project's own loader strategy, rx_rhi_vk's PUBLIC VK_NO_PROTOTYPES
++// define) -- Vulkan's own spec permits resolving device-level commands
++// through the instance-level query too (a slightly less direct dispatch,
++// irrelevant here: every symbol this backend loads is resolved exactly
++// once, at init, never on a hot path), and this backend's own
++// LoadDynamicRenderingFunctions() (imgui_impl_vulkan.cpp) already tries
++// the CORE (non-KHR) "vkCmdBeginRendering"/"vkCmdEndRendering" names FIRST
++// -- both real, core-promoted Vulkan 1.3 entry points on this project's
++// own Vulkan 1.3 baseline, resolvable this way with no extension
++// enablement needed at all -- exactly matching how rx_graph/executor.cpp's
++// own vkCmdBeginRendering() calls already work.
++//
++// EXCEPT "vkQueueWaitIdle" when a test hook is installed
++// (rx::debug_ui::detail::setQueueWaitIdleHookForTests) -- see overlay.h's
++// own comment on why this loader function is the natural interception
++// seam for the "at-most-once vkQueueWaitIdle" GPU test assertion [gate
++// ruling #16 row 5].
++PFN_vkVoidFunction imguiVulkanFunctionLoader(const char* functionName, void* userData) {
++    if (g_queueWaitIdleHookForTests != nullptr && std::strcmp(functionName, "vkQueueWaitIdle") == 0) {
++        return reinterpret_cast<PFN_vkVoidFunction>(&interceptedQueueWaitIdle);
++    }
++    VkInstance instance = static_cast<VkInstance>(userData);
++    return vkGetInstanceProcAddr(instance, functionName);
++}
++
++// Wired into ImGui_ImplVulkan_InitInfo::CheckVkResultFn -- left null by
++// default (a silent no-op, per imgui_impl_vulkan.cpp's own check_vk_result()),
++// which would swallow a real Vulkan failure inside the vendored backend
++// entirely. Logged, not fatal: matches this project's own "log, don't
++// crash the caller" convention for a best-effort/degrade-gracefully path
++// elsewhere in this codebase (e.g. rx::platform::Window's own SDL-call
++// failure handling) -- a genuinely fatal Vulkan error surfaces anyway,
++// downstream, as a real validation error or a subsequent call's own
++// failure, which this project's GPU tests already gate on.
++void checkVkResult(VkResult err) {
++    if (err != VK_SUCCESS) {
++        RX_LOG_ERROR("rx_debug_ui: a Vulkan call inside the vendored ImGui Vulkan backend failed: VkResult={}",
++                     static_cast<int>(err));
++    }
++}
++
++// See overlay.h's own comment on `colorFormat_`: ImGui_ImplVulkan_InitInfo's
++// nested PipelineInfoMain.PipelineRenderingCreateInfo.pColorAttachmentFormats
++// is a POINTER the backend copies BY VALUE into its own persistent
++// bd->VulkanInitInfo (imgui_impl_vulkan.cpp: `bd->VulkanInitInfo = *info;`,
++// verified directly against the pinned tag) -- the POINTEE must therefore
++// outlive the ImGui_ImplVulkan_Init() call itself, not just its duration.
++// A function-local (stack) variable inside create() would dangle the
++// moment create() returns; process-lifetime static storage sidesteps this
++// entirely, consistent with this class's own documented "at most one live
++// Overlay per process" contract (a second Overlay's create() call simply
++// overwrites this same storage with ITS OWN colorFormat -- never a
++// problem, since only one Overlay may be alive at a time regardless).
++VkFormat g_pipelineColorFormatStorage = VK_FORMAT_UNDEFINED;
++
++}  // namespace
++
++namespace detail {
++void setQueueWaitIdleHookForTests(QueueWaitIdleFn hook) { g_queueWaitIdleHookForTests = hook; }
++}  // namespace detail
++
++Overlay::Overlay(Overlay&& other) noexcept
++    : device_(other.device_), descriptorPool_(other.descriptorPool_), colorFormat_(other.colorFormat_) {
++    other.device_ = VK_NULL_HANDLE;
++    other.descriptorPool_ = VK_NULL_HANDLE;
++    other.colorFormat_ = VK_FORMAT_UNDEFINED;
++}
++
++Overlay& Overlay::operator=(Overlay&& other) noexcept {
++    if (this != &other) {
++        destroyAll();
++        device_ = other.device_;
++        descriptorPool_ = other.descriptorPool_;
++        colorFormat_ = other.colorFormat_;
++        other.device_ = VK_NULL_HANDLE;
++        other.descriptorPool_ = VK_NULL_HANDLE;
++        other.colorFormat_ = VK_FORMAT_UNDEFINED;
++    }
++    return *this;
++}
++
++Overlay::~Overlay() { destroyAll(); }
++
++void Overlay::destroyAll() {
++    if (device_ == VK_NULL_HANDLE) {
++        return;  // default-constructed-by-move-from -- nothing owned, nothing to tear down.
++    }
++    // Order matches every upstream ImGui example: renderer backend, then
++    // platform backend, then the context both were built against, then
++    // this class's own resources the backends never took ownership of
++    // (the descriptor pool -- see create()'s own comment: DescriptorPool
++    // was supplied by us, not DescriptorPoolSize, so
++    // ImGui_ImplVulkan_Shutdown() never destroys it itself).
++    ImGui_ImplVulkan_Shutdown();
++    ImGui_ImplSDL3_Shutdown();
++    ImGui::DestroyContext();
++    if (descriptorPool_ != VK_NULL_HANDLE) {
++        vkDestroyDescriptorPool(device_, descriptorPool_, nullptr);
++    }
++    device_ = VK_NULL_HANDLE;
++    descriptorPool_ = VK_NULL_HANDLE;
++    colorFormat_ = VK_FORMAT_UNDEFINED;
++}
++
++std::optional<Overlay> Overlay::create(rx::rhi::Device& device, rx::platform::Window& window, VkFormat colorFormat) {
++    RX_ASSERT_MAIN_THREAD("Overlay::create");
++
++    // ---- own precondition checks, BEFORE calling into the vendored
++    // backend [gate matrix row 2] -- see this class's own header comment:
++    // the vendored backend's IM_ASSERT preconditions (e.g.
++    // `IM_ASSERT(info->MinImageCount >= 2)`) compile to nothing in this
++    // project's actual NDEBUG-defined RelWithDebInfo builds (both
++    // presets), so relying on them alone would silently let a bad
++    // configuration proceed instead of failing loudly. `colorFormat` is
++    // the one caller-tunable input this class's own minimal
++    // `create(Device&, Window&, format)` surface exposes at all (every
++    // other ImGui_ImplVulkan_InitInfo field below is derived internally,
++    // never caller-supplied) -- validating it is what makes "fail loudly,
++    // not silently proceed" a real, testable property of THIS class's own
++    // actual public surface, not merely something the matrix's cited
++    // library-level example (an out-of-range MinImageCount) illustrates.
++    if (colorFormat == VK_FORMAT_UNDEFINED) {
++        RX_LOG_ERROR("rx_debug_ui: Overlay::create() called with VK_FORMAT_UNDEFINED colorFormat");
++        return std::nullopt;
++    }
++    if (device.instance() == VK_NULL_HANDLE || device.physicalDevice() == VK_NULL_HANDLE ||
++        device.device() == VK_NULL_HANDLE || device.graphicsQueue() == VK_NULL_HANDLE) {
++        RX_LOG_ERROR("rx_debug_ui: Overlay::create() called with an incompletely-initialized Device");
++        return std::nullopt;
++    }
++
++    // ---- own descriptor pool [gate ruling #16, BINDING: two typed pool-
++    // size entries, VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT] ----
++    // SAMPLED_IMAGE sized to double the vendored backend's own stated
++    // per-atlas minimum (IMGUI_IMPL_VULKAN_MINIMUM_SAMPLED_IMAGE_POOL_SIZE
++    // == 8, imgui_impl_vulkan.h) -- modest headroom for HUD textures a
++    // future sample registers beyond the font atlas alone (e.g. icon
++    // atlases), not the bare minimum. SAMPLER stays at the exact minimum
++    // (IMGUI_IMPL_VULKAN_MINIMUM_SAMPLER_POOL_SIZE == 2, "linear +
++    // nearest") -- the backend itself creates exactly these two samplers,
++    // never more, regardless of how many textures get registered.
++    constexpr uint32_t kSampledImagePoolSize = 16;
++    constexpr uint32_t kSamplerPoolSize = 2;
++    std::array<VkDescriptorPoolSize, 2> poolSizes{{
++        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kSampledImagePoolSize},
++        {VK_DESCRIPTOR_TYPE_SAMPLER, kSamplerPoolSize},
++    }};
++    VkDescriptorPoolCreateInfo poolInfo{};
++    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
++    poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
++    poolInfo.maxSets = kSampledImagePoolSize + kSamplerPoolSize;
++    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
++    poolInfo.pPoolSizes = poolSizes.data();
++    VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
++    VkResult poolResult = vkCreateDescriptorPool(device.device(), &poolInfo, nullptr, &descriptorPool);
++    if (poolResult != VK_SUCCESS) {
++        RX_LOG_ERROR("rx_debug_ui: vkCreateDescriptorPool failed: VkResult={}", static_cast<int>(poolResult));
++        return std::nullopt;
++    }
++
++    ImGui::CreateContext();
++    ImGuiIO& io = ImGui::GetIO();
++    // Middleware posture: never write an imgui.ini/imgui_log.txt file next
++    // to whatever a host process's current working directory happens to
++    // be -- HUD-layout persistence/logging is a host concern (a future
++    // SDK surface could opt back in explicitly), not this module's own
++    // default behavior.
++    io.IniFilename = nullptr;
++    io.LogFilename = nullptr;
++
++    if (!ImGui_ImplSDL3_InitForVulkan(window.sdlWindow())) {
++        RX_LOG_ERROR("rx_debug_ui: ImGui_ImplSDL3_InitForVulkan failed");
++        ImGui::DestroyContext();
++        vkDestroyDescriptorPool(device.device(), descriptorPool, nullptr);
++        return std::nullopt;
++    }
++
++    // [gate ruling #16 row 7, BINDING] Immediately after the SDL3 backend's
++    // own init -- kills the backend's default AutoFirst gamepad-open race
++    // against rx_platform::Window's own gamepad lifecycle (Task 20): zero
++    // manually-provided gamepads, Manual mode, so this backend NEVER
++    // itself calls SDL_OpenGamepad/SDL_CloseGamepad. Gamepad HUD
++    // navigation (ImGuiConfigFlags_NavEnableGamepad) is deliberately NOT
++    // enabled this phase as a direct consequence.
++    ImGui_ImplSDL3_SetGamepadMode(ImGui_ImplSDL3_GamepadMode_Manual, nullptr, 0);
++
++    if (!ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_3, &imguiVulkanFunctionLoader,
++                                         reinterpret_cast<void*>(device.instance()))) {
++        RX_LOG_ERROR("rx_debug_ui: ImGui_ImplVulkan_LoadFunctions failed");
++        ImGui_ImplSDL3_Shutdown();
++        ImGui::DestroyContext();
++        vkDestroyDescriptorPool(device.device(), descriptorPool, nullptr);
++        return std::nullopt;
++    }
++
++    g_pipelineColorFormatStorage = colorFormat;
++
++    ImGui_ImplVulkan_InitInfo initInfo{};
++    initInfo.ApiVersion = VK_API_VERSION_1_3;
++    initInfo.Instance = device.instance();
++    initInfo.PhysicalDevice = device.physicalDevice();
++    initInfo.Device = device.device();
++    initInfo.QueueFamily = device.graphicsQueueFamily();
++    initInfo.Queue = device.graphicsQueue();
++    initInfo.DescriptorPool = descriptorPool;  // own pool, NOT the DescriptorPoolSize convenience path -- see class comment.
++    initInfo.DescriptorPoolSize = 0;
++    initInfo.MinImageCount = rx::rhi::FrameSync::kFramesInFlight;
++    initInfo.ImageCount = rx::rhi::FrameSync::kFramesInFlight;
++    initInfo.PipelineCache = VK_NULL_HANDLE;
++    initInfo.MinAllocationSize = 1024 * 1024;  // the header's own documented "satisfy zealous best-practices validation" default.
++    initInfo.CheckVkResultFn = &checkVkResult;
++    initInfo.UseDynamicRendering = true;
++    // [gate ruling #16, BINDING: 2025-09-26 breaking change] the NESTED
++    // PipelineInfoMain.PipelineRenderingCreateInfo -- the flat top-level
++    // field the plan's pseudocode/an earlier research doc assumed no
++    // longer exists at this pinned tag (imgui_impl_vulkan.h:120-123 keeps
++    // it only as a commented-out migration breadcrumb, verified directly).
++    initInfo.PipelineInfoMain.PipelineRenderingCreateInfo.sType =
++        VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
++    initInfo.PipelineInfoMain.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
++    initInfo.PipelineInfoMain.PipelineRenderingCreateInfo.pColorAttachmentFormats = &g_pipelineColorFormatStorage;
++
++    if (!ImGui_ImplVulkan_Init(&initInfo)) {
++        // Unreachable in practice at this pinned tag (ImGui_ImplVulkan_Init()
++        // always returns true barring an IM_ASSERT trip, which compiles to
++        // nothing in this project's builds -- see class comment) -- handled
++        // anyway per "both return bool and must be checked" [gate matrix
++        // row 2].
++        RX_LOG_ERROR("rx_debug_ui: ImGui_ImplVulkan_Init failed");
++        ImGui_ImplSDL3_Shutdown();
++        ImGui::DestroyContext();
++        vkDestroyDescriptorPool(device.device(), descriptorPool, nullptr);
++        return std::nullopt;
++    }
++
++    // ---- force the font atlas's one-time GPU upload [gate ruling #16,
++    // FONT-UPLOAD RULING, BINDING; see overlay.h's own FONT/TEXTURE UPLOAD
++    // section for the full rationale] -----------------------------------
++    // The vendored backend uploads textures LAZILY, inside
++    // ImGui_ImplVulkan_RenderDrawData() itself (via ImGui_ImplVulkan_
++    // UpdateTexture(), iterating ImGui::GetPlatformIO().Textures[]) -- so
++    // the only way to force it to happen HERE, at construction, rather
++    // than on whatever frame the caller's own first ImGui::Render() call
++    // happens to land, is to run one full, real NewFrame -> build a UI ->
++    // Render -> RenderDrawData cycle ourselves, right now, synchronously.
++    // A single glyph-referencing draw command (a plain text label, in an
++    // otherwise invisible/no-input/no-background window) guarantees the
++    // font atlas is unambiguously part of THIS frame's draw data. Uses a
++    // throwaway, real one-shot command buffer (rx::rhi::CommandContext::
++    // runOnce(), the SAME synchronous setup/test-utility this codebase
++    // already uses everywhere a one-off submit-and-wait is needed) --
++    // whatever draw commands ImGui_ImplVulkan_RenderDrawData() records
++    // into it are harmless (this priming frame is never presented; its
++    // whole purpose is triggering the upload path, not producing visible
++    // output), but a REAL, validly-begun command buffer is still required
++    // (an unbegun/null one would fail validation the moment
++    // ImGui_ImplVulkan_RenderDrawData() records a vkCmdBindPipeline into
++    // it, if any glyph is actually drawn -- which this priming frame
++    // deliberately ensures).
++    auto cmdCtx =
++        rx::rhi::CommandContext::create(device.device(), device.graphicsQueue(), device.graphicsQueueFamily());
++    if (!cmdCtx.has_value()) {
++        RX_LOG_ERROR("rx_debug_ui: CommandContext::create failed while forcing the font atlas upload");
++        ImGui_ImplVulkan_Shutdown();
++        ImGui_ImplSDL3_Shutdown();
++        ImGui::DestroyContext();
++        vkDestroyDescriptorPool(device.device(), descriptorPool, nullptr);
++        return std::nullopt;
++    }
++
++    ImGui_ImplVulkan_NewFrame();
++    ImGui_ImplSDL3_NewFrame();
++    ImGui::NewFrame();
++    ImGui::Begin("##rx_debug_ui_font_prime", nullptr,
++                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoBackground |
++                      ImGuiWindowFlags_NoSavedSettings);
++    ImGui::TextUnformatted("rx_debug_ui");
++    ImGui::End();
++    ImGui::Render();
++    cmdCtx->runOnce([](VkCommandBuffer cmd) { ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd); });
++
++    return Overlay(device.device(), descriptorPool, colorFormat);
++}
++
++void Overlay::processEvent(const SDL_Event& event) {
++    RX_ASSERT_MAIN_THREAD("Overlay::processEvent");
++    ImGui_ImplSDL3_ProcessEvent(&event);
++}
++
++void Overlay::beginFrame() {
++    RX_ASSERT_MAIN_THREAD("Overlay::beginFrame");
++    ImGui_ImplVulkan_NewFrame();
++    ImGui_ImplSDL3_NewFrame();
++    ImGui::NewFrame();
++}
++
++void Overlay::addPass(rx::graph::RenderGraph& graph, std::string_view targetName) {
++    RX_ASSERT_MAIN_THREAD("Overlay::addPass");
++
++    rx::graph::AttachmentDesc desc;
++    desc.format = colorFormat_;
++    // sizeClass/width/height/samples left at AttachmentDesc's own defaults
++    // (SwapchainRelative, 1.0x1.0, 1 sample) -- see colorFormat_'s own
++    // header comment for why this is the correct, and only supported,
++    // choice for this class.
++
++    // LOAD-not-CLEAR [gate ruling #16, named criterion]: this is NOT a
++    // parameter here -- rx_graph::Executor derives the real
++    // VkAttachmentLoadOp automatically from whether `targetName` was
++    // already written by an earlier pass THIS frame (executor.cpp: `info.
++    // loadOp = attachmentEverWritten[physIdx] ? VK_ATTACHMENT_LOAD_OP_LOAD
++    // : VK_ATTACHMENT_LOAD_OP_CLEAR`). Declaring THIS pass (below) after
++    // the caller's own scene pass(es) against the SAME `targetName` is
++    // what makes that resolve to LOAD -- see this method's own header
++    // comment (overlay.h) for the full contract.
++    graph.addPass("imgui_overlay")
++        .addColorOutput(targetName, desc)
++        .setSideEffect()
++        .setExecute([](rx::graph::PassContext& ctx) {
++            ImGui::Render();
++            ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), ctx.cmd);
++        });
++}
++
++}  // namespace rx::debug_ui
+diff --git a/src/rx_debug_ui/tests/doctest_main_gpu.cpp b/src/rx_debug_ui/tests/doctest_main_gpu.cpp
+new file mode 100644
+index 0000000..3c1c0ca
+--- /dev/null
++++ b/src/rx_debug_ui/tests/doctest_main_gpu.cpp
+@@ -0,0 +1,57 @@
++// Same warm-up pattern as src/rx_graph/tests/doctest_main_gpu.cpp (copied,
++// not shared -- see that file's own comment for the full rationale): this
++// binary's tests build their own headless/windowed rx::rhi::Context+Device
++// instances directly, exposed to the same process-wide vk-bootstrap
++// instance-function-pointer-caching hazard rx::rhi::Context::create()'s own
++// WARNING documents (rx_rhi_vk/context.h).
++#define DOCTEST_CONFIG_IMPLEMENT
++#include <doctest/doctest.h>
++#include <rx_platform/window.h>
++#include <rx_rhi_vk/context.h>
++
++#include <cstdio>
++#include <vector>
++
++namespace {
++
++void warmUpVkBootstrapInstanceFunctionCache() {
++    std::vector<const char*> extensions;
++    auto window = rx::platform::Window::create("rx_debug_ui_gpu_tests_warmup", 64, 64, /*visible=*/false);
++    if (window.has_value()) {
++        extensions = window->requiredVulkanInstanceExtensions();
++    }
++    rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    warmUpVkBootstrapInstanceFunctionCache();
++
++    doctest::Context context;
++    context.applyCommandLine(argc, argv);
++    int res = context.run();
++
++    // Harness gap fix -- same rationale/mechanism as rx_rhi_vk/tests/
++    // doctest_main.cpp and rx_graph/tests/doctest_main_gpu.cpp: a
++    // validation error raised during a fixture's own teardown (after that
++    // TEST_CASE's own CHECK_FALSE(hasValidationErrors()) already ran) must
++    // still fail the run, not merely print.
++    const std::size_t processErrors = rx::rhi::Context::processValidationErrorCount();
++    if (processErrors > 0) {
++        std::fprintf(stderr,
++                      "[rx_debug_ui_gpu_tests] FAILED: %zu unfiltered Vulkan validation error(s) observed during "
++                      "this run (possibly raised during a fixture's own teardown, after that TEST_CASE's "
++                      "CHECK_FALSE(hasValidationErrors()) already ran) -- see the \"[vulkan validation]\" ERROR "
++                      "line(s) above.\n",
++                      processErrors);
++        if (res == 0) {
++            res = 1;
++        }
++    }
++
++    if (context.shouldExit()) {
++        return res;
++    }
++    return res;
++}
+diff --git a/src/rx_debug_ui/tests/test_overlay_gpu.cpp b/src/rx_debug_ui/tests/test_overlay_gpu.cpp
+new file mode 100644
+index 0000000..86b951a
+--- /dev/null
++++ b/src/rx_debug_ui/tests/test_overlay_gpu.cpp
+@@ -0,0 +1,611 @@
++// GPU smoke test for rx::debug_ui::Overlay [Phase 4 Stage 2 Task 21, spec
++// D20, gate matrix-issue16 as amended by gate/rulings-2026-08-18.md #16].
++// Same windowed-but-headless fixture pattern as rx_graph/tests/
++// test_execute_gpu.cpp/rx_rhi_vk's own GPU tests -- a real, validated
++// rx::rhi::Device via rx::platform::Window (needs a real VkSurfaceKHR even
++// though nothing here ever presents to it).
++//
++// Coverage, mapped to the gate matrix's own rows:
++//   - row 2:  Overlay::create() fails loudly (returns std::nullopt, zero
++//             validation errors) on a deliberately-invalid colorFormat.
++//   - row 4:  the descriptor pool is exercised with the font atlas PLUS a
++//             second, explicitly-registered texture (ImGui_ImplVulkan_
++//             AddTexture) -- pool creation with the two-typed-entry shape
++//             succeeds and produces zero validation errors under that
++//             load.
++//   - row 5/FONT-UPLOAD RULING: `Overlay::create()`'s forced init-time
++//     upload trips the vendored backend's internal vkQueueWaitIdle exactly
++//     once; a fixed N-frame steady-state run (no further texture churn)
++//     adds zero more.
++//   - row 6: a synthetic mouse click over a known HUD widget position sets
++//     `ImGui::GetIO().WantCaptureMouse` (the device-free HALF of that row's
++//     criterion this GPU test CAN exercise -- the "camera stops moving"
++//     half is explicitly routed to #15/sample 09 as MANUAL_VERIFICATION,
++//     per the matrix's own text).
++//   - row 9/11: the overlay pass renders as a real declared rx_graph pass
++//     (side-effect, addColorOutput, setExecute) against a known non-black
++//     pattern already written by an earlier pass THIS frame -- readback
++//     proves LOAD (not CLEAR): the pattern survives OUTSIDE the HUD's own
++//     drawn pixels, and the HUD's own content is visible INSIDE them.
++//   - zero unfiltered Vulkan validation errors, every case.
++#include <doctest/doctest.h>
++#include <rx_debug_ui/overlay.h>
++
++#include <rx_graph/executor.h>
++#include <rx_graph/render_graph.h>
++#include <rx_platform/window.h>
++#include <rx_rhi_vk/buffer.h>
++#include <rx_rhi_vk/command.h>
++#include <rx_rhi_vk/context.h>
++#include <rx_rhi_vk/device.h>
++#include <rx_task/scheduler.h>
++
++#include <imgui.h>
++#include <imgui_impl_vulkan.h>
++
++#include <SDL3/SDL.h>
++
++#include <array>
++#include <atomic>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <memory>
++#include <optional>
++#include <vector>
++
++using namespace rx::graph;
++
++namespace {
++
++constexpr uint32_t kExtentPx = 128;
++constexpr VkExtent2D kExtent{kExtentPx, kExtentPx};
++constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
++
++// Same skip-guarded windowed-device fixture pattern as rx_graph/tests/
++// test_execute_gpu.cpp's own GpuFixture.
++struct GpuFixture {
++    rx::platform::Window window;
++    rx::rhi::Context context;
++    rx::rhi::Device device;
++    rx::rhi::Allocator allocator;
++    std::unique_ptr<rx::task::Scheduler> scheduler;
++    std::unique_ptr<Executor> executor;
++};
++
++std::optional<GpuFixture> makeFixture(const char* title) {
++    auto window = rx::platform::Window::create(title, 64, 64, /*visible=*/false);
++    if (!window.has_value()) {
++        MESSAGE("no display backend available, skipping rx_debug_ui GPU test");
++        return std::nullopt;
++    }
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        MESSAGE("video driver reports no Vulkan surface extensions (e.g. dummy driver), skipping rx_debug_ui GPU "
++                 "test");
++        return std::nullopt;
++    }
++
++    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++
++    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
++    REQUIRE(surface != VK_NULL_HANDLE);
++
++    auto device = rx::rhi::Device::create(*context, surface);
++    REQUIRE(device.has_value());
++
++    auto allocator = rx::rhi::Allocator::create(*context, *device);
++    REQUIRE(allocator.has_value());
++
++    auto scheduler = rx::task::Scheduler::create();
++    REQUIRE(scheduler != nullptr);
++
++    auto executor = Executor::create(*device, *scheduler);
++    REQUIRE(executor != nullptr);
++
++    return GpuFixture{std::move(*window),    std::move(*context),  std::move(*device),
++                       std::move(*allocator), std::move(scheduler), std::move(executor)};
++}
++
++// --- Offscreen "backbuffer" -- same non-RAII, manual-teardown pattern as
++// rx_graph/tests/test_execute_gpu.cpp's own OffscreenImage. -----------------
++struct OffscreenImage {
++    VkImage image = VK_NULL_HANDLE;
++    VkDeviceMemory memory = VK_NULL_HANDLE;
++    VkImageView view = VK_NULL_HANDLE;
++};
++
++std::optional<OffscreenImage> createImage(VkDevice device, VkPhysicalDevice physicalDevice, VkFormat format,
++                                           VkExtent2D extent, VkImageUsageFlags usage) {
++    OffscreenImage result;
++
++    VkImageCreateInfo imageInfo{};
++    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    imageInfo.imageType = VK_IMAGE_TYPE_2D;
++    imageInfo.format = format;
++    imageInfo.extent = {extent.width, extent.height, 1};
++    imageInfo.mipLevels = 1;
++    imageInfo.arrayLayers = 1;
++    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
++    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
++    imageInfo.usage = usage;
++    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    if (vkCreateImage(device, &imageInfo, nullptr, &result.image) != VK_SUCCESS) {
++        return std::nullopt;
++    }
++
++    VkMemoryRequirements memReq{};
++    vkGetImageMemoryRequirements(device, result.image, &memReq);
++    VkPhysicalDeviceMemoryProperties memProps{};
++    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
++
++    uint32_t memoryTypeIndex = UINT32_MAX;
++    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
++        if ((memReq.memoryTypeBits & (1U << i)) != 0U &&
++            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0U) {
++            memoryTypeIndex = i;
++            break;
++        }
++    }
++    if (memoryTypeIndex == UINT32_MAX) {
++        vkDestroyImage(device, result.image, nullptr);
++        return std::nullopt;
++    }
++
++    VkMemoryAllocateInfo allocInfo{};
++    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++    allocInfo.allocationSize = memReq.size;
++    allocInfo.memoryTypeIndex = memoryTypeIndex;
++    if (vkAllocateMemory(device, &allocInfo, nullptr, &result.memory) != VK_SUCCESS) {
++        vkDestroyImage(device, result.image, nullptr);
++        return std::nullopt;
++    }
++    if (vkBindImageMemory(device, result.image, result.memory, 0) != VK_SUCCESS) {
++        vkFreeMemory(device, result.memory, nullptr);
++        vkDestroyImage(device, result.image, nullptr);
++        return std::nullopt;
++    }
++
++    VkImageViewCreateInfo viewInfo{};
++    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++    viewInfo.image = result.image;
++    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    viewInfo.format = format;
++    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    viewInfo.subresourceRange.levelCount = 1;
++    viewInfo.subresourceRange.layerCount = 1;
++    if (vkCreateImageView(device, &viewInfo, nullptr, &result.view) != VK_SUCCESS) {
++        vkFreeMemory(device, result.memory, nullptr);
++        vkDestroyImage(device, result.image, nullptr);
++        return std::nullopt;
++    }
++
++    return result;
++}
++
++void destroyImage(VkDevice device, OffscreenImage& img) {
++    if (img.view != VK_NULL_HANDLE) {
++        vkDestroyImageView(device, img.view, nullptr);
++    }
++    if (img.image != VK_NULL_HANDLE) {
++        vkDestroyImage(device, img.image, nullptr);
++    }
++    if (img.memory != VK_NULL_HANDLE) {
++        vkFreeMemory(device, img.memory, nullptr);
++    }
++    img = OffscreenImage{};
++}
++
++// A known, non-black, non-white solid pattern -- the "scene" content the
++// HUD must be drawn LOAD-not-CLEAR on top of [gate matrix row 9]. Uses
++// vkCmdClearAttachments (legal INSIDE an active dynamic-rendering scope,
++// unlike vkCmdClearColorImage) rather than a real pipeline -- this pass's
++// entire job is producing a known, verifiable color, not exercising a
++// draw call.
++constexpr VkClearColorValue kPatternColor{{0.2F, 0.6F, 0.9F, 1.0F}};
++
++void addPatternPass(RenderGraph& graph, std::string_view targetName) {
++    AttachmentDesc desc;
++    desc.format = kFormat;
++    graph.addPass("pattern").addColorOutput(targetName, desc).setExecute([](PassContext& ctx) {
++        VkClearAttachment clearAttachment{};
++        clearAttachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        clearAttachment.colorAttachment = 0;
++        clearAttachment.clearValue.color = kPatternColor;
++        VkClearRect clearRect{};
++        clearRect.rect = VkRect2D{{0, 0}, ctx.renderArea};
++        clearRect.layerCount = 1;
++        vkCmdClearAttachments(ctx.cmd, 1, &clearAttachment, 1, &clearRect);
++    });
++}
++
++std::array<uint8_t, 4> pixelAt(const uint8_t* pixels, uint32_t width, uint32_t x, uint32_t y) {
++    std::array<uint8_t, 4> px{};
++    std::memcpy(px.data(), pixels + (static_cast<size_t>(y) * width + x) * 4, px.size());
++    return px;
++}
++
++bool approxEqual(const std::array<uint8_t, 4>& a, const std::array<uint8_t, 4>& b, int tolerance) {
++    for (size_t i = 0; i < a.size(); ++i) {
++        if (std::abs(static_cast<int>(a[i]) - static_cast<int>(b[i])) > tolerance) {
++            return false;
++        }
++    }
++    return true;
++}
++
++// Renders `graph` (already compiled + realized against `executor`) into
++// `target` and reads the whole thing back to a host-visible buffer --
++// same readback machinery as rx_graph/tests/test_execute_gpu.cpp:754-768.
++std::vector<uint8_t> renderAndReadBack(rx::rhi::Device& device, rx::rhi::Allocator& allocator, Executor& executor,
++                                        RenderGraph& graph, rx::rhi::CommandContext& cmdCtx,
++                                        const OffscreenImage& target) {
++    cmdCtx.runOnce(
++        [&](VkCommandBuffer cmd) { executor.execute(graph, cmd, target.image, target.view, kExtent); });
++
++    const VkDeviceSize pixelBytes = static_cast<VkDeviceSize>(kExtent.width) * kExtent.height * 4;
++    auto readback = allocator.createHostVisibleBuffer(pixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    REQUIRE(readback.has_value());
++
++    cmdCtx.runOnce([&](VkCommandBuffer cmd) {
++        VkBufferImageCopy region{};
++        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        region.imageSubresource.layerCount = 1;
++        region.imageExtent = {kExtent.width, kExtent.height, 1};
++        vkCmdCopyImageToBuffer(cmd, target.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1,
++                                &region);
++    });
++    readback->invalidate();
++
++    std::vector<uint8_t> pixels(static_cast<size_t>(pixelBytes));
++    std::memcpy(pixels.data(), readback->mappedData(), pixels.size());
++    (void)device;
++    return pixels;
++}
++
++CompileInfo makeCompileInfo() {
++    CompileInfo info;
++    info.swapchainWidth = kExtent.width;
++    info.swapchainHeight = kExtent.height;
++    info.swapchainFormat = kFormat;
++    // Offscreen, never-presented target -- same Task 3 ambiguity
++    // resolution #1 reasoning as test_execute_gpu.cpp: this test's own
++    // readback needs TRANSFER_SRC_OPTIMAL, not PRESENT_SRC_KHR.
++    info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    return info;
++}
++
++// A 1x1 SAMPLED texture, already in SHADER_READ_ONLY_OPTIMAL -- content is
++// irrelevant (never sampled by anything this test draws); its only job is
++// giving ImGui_ImplVulkan_AddTexture() a real VkImageView to register,
++// exercising the descriptor pool with a texture beyond the font atlas
++// [gate matrix row 4].
++std::optional<OffscreenImage> createDummySampledTexture(rx::rhi::Device& device, rx::rhi::CommandContext& cmdCtx) {
++    auto tex = createImage(device.device(), device.physicalDevice(), kFormat, VkExtent2D{1, 1},
++                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
++    if (!tex.has_value()) {
++        return std::nullopt;
++    }
++    cmdCtx.runOnce([&](VkCommandBuffer cmd) {
++        rx::rhi::transitionImage(cmd, tex->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    });
++    return tex;
++}
++
++}  // namespace
++
++TEST_CASE("Overlay::create() fails loudly (returns nullopt, zero validation errors) on a deliberately-invalid "
++          "colorFormat [gate matrix row 2]") {
++    auto fixture = makeFixture("rx_debug_ui_invalid_format");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto overlay = rx::debug_ui::Overlay::create(fixture->device, fixture->window, VK_FORMAT_UNDEFINED);
++    CHECK_FALSE(overlay.has_value());
++
++    vkDeviceWaitIdle(fixture->device.device());
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("Overlay renders as a declared rx_graph pass: LOAD-not-CLEAR preserves an earlier pass's pattern, the "
++          "HUD's own content is visible, the descriptor pool serves the font atlas plus a second registered "
++          "texture, and zero validation errors [gate matrix rows 4, 9, 11]") {
++    auto fixture = makeFixture("rx_debug_ui_render_smoke");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto offscreen = createImage(fixture->device.device(), fixture->device.physicalDevice(), kFormat, kExtent,
++                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
++    REQUIRE(offscreen.has_value());
++
++    auto cmdCtx = rx::rhi::CommandContext::create(fixture->device.device(), fixture->device.graphicsQueue(),
++                                                    fixture->device.graphicsQueueFamily());
++    REQUIRE(cmdCtx.has_value());
++
++    auto overlay = rx::debug_ui::Overlay::create(fixture->device, fixture->window, kFormat);
++    REQUIRE(overlay.has_value());
++
++    auto dummyTexture = createDummySampledTexture(fixture->device, *cmdCtx);
++    REQUIRE(dummyTexture.has_value());
++    VkDescriptorSet dummyTextureId = ImGui_ImplVulkan_AddTexture(dummyTexture->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    REQUIRE(dummyTextureId != VK_NULL_HANDLE);
++
++    // Deterministic layout: no window rounding/AA fringe near the sampled
++    // probe pixels below.
++    ImGui::GetStyle().WindowRounding = 0.0F;
++    ImGui::GetStyle().WindowBorderSize = 0.0F;
++
++    overlay->beginFrame();
++    ImGui::SetNextWindowPos(ImVec2(10.0F, 10.0F));
++    ImGui::SetNextWindowSize(ImVec2(60.0F, 40.0F));
++    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(1.0F, 1.0F, 1.0F, 1.0F));
++    ImGui::Begin("hud", nullptr,
++                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
++                      ImGuiWindowFlags_NoResize);
++    ImGui::Button("X", ImVec2(30.0F, 20.0F));
++    ImGui::End();
++    ImGui::PopStyleColor();
++
++    RenderGraph graph;
++    addPatternPass(graph, "bb");
++    overlay->addPass(graph, "bb");
++    graph.setBackbufferSource("bb");
++    CompileInfo info = makeCompileInfo();
++    graph.compile(info);
++    fixture->executor->realize(graph);
++
++    std::vector<uint8_t> pixels =
++        renderAndReadBack(fixture->device, fixture->allocator, *fixture->executor, graph, *cmdCtx, *offscreen);
++
++    // OUTSIDE the (10,10)-(70,50) HUD window -- LOAD, not CLEAR, must have
++    // preserved the pattern pass's own solid color.
++    const std::array<uint8_t, 4> outside = pixelAt(pixels.data(), kExtent.width, 100, 100);
++    const std::array<uint8_t, 4> expectedPattern{
++        static_cast<uint8_t>(std::lround(kPatternColor.float32[0] * 255.0)),
++        static_cast<uint8_t>(std::lround(kPatternColor.float32[1] * 255.0)),
++        static_cast<uint8_t>(std::lround(kPatternColor.float32[2] * 255.0)),
++        static_cast<uint8_t>(std::lround(kPatternColor.float32[3] * 255.0))};
++    CHECK(approxEqual(outside, expectedPattern, 8));
++
++    // INSIDE the HUD window's own body -- the overlay pass genuinely
++    // rendered its white background over the pattern here.
++    const std::array<uint8_t, 4> inside = pixelAt(pixels.data(), kExtent.width, 30, 25);
++    const std::array<uint8_t, 4> expectedWhite{255, 255, 255, 255};
++    CHECK(approxEqual(inside, expectedWhite, 8));
++    // ... and the same pixel must NOT be the pattern color -- the two
++    // regions are genuinely distinct, not a coincidental readback bug.
++    CHECK_FALSE(approxEqual(inside, expectedPattern, 8));
++
++    ImGui_ImplVulkan_RemoveTexture(dummyTextureId);
++
++    vkDeviceWaitIdle(fixture->device.device());
++    overlay.reset();
++    destroyImage(fixture->device.device(), *dummyTexture);
++    destroyImage(fixture->device.device(), *offscreen);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("A synthetic mouse click over a known HUD widget position sets ImGui::GetIO().WantCaptureMouse [gate "
++          "matrix row 6, the device-free-exercisable half]") {
++    auto fixture = makeFixture("rx_debug_ui_want_capture_mouse");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto offscreen = createImage(fixture->device.device(), fixture->device.physicalDevice(), kFormat, kExtent,
++                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
++    REQUIRE(offscreen.has_value());
++
++    auto cmdCtx = rx::rhi::CommandContext::create(fixture->device.device(), fixture->device.graphicsQueue(),
++                                                    fixture->device.graphicsQueueFamily());
++    REQUIRE(cmdCtx.has_value());
++
++    auto overlay = rx::debug_ui::Overlay::create(fixture->device, fixture->window, kFormat);
++    REQUIRE(overlay.has_value());
++
++    ImGui::GetStyle().WindowRounding = 0.0F;
++
++    // Frame 1: establish a real window's layout at a KNOWN position/size
++    // and fully render it -- ImGui's own hover/capture test
++    // (UpdateHoveredWindowAndCaptureFlags, run at the START of the NEXT
++    // NewFrame()) compares the mouse position against the PREVIOUS
++    // frame's committed window layout, per ImGui's own documented,
++    // well-established one-frame-lagged design -- not this frame's.
++    overlay->beginFrame();
++    ImGui::SetNextWindowPos(ImVec2(10.0F, 10.0F));
++    ImGui::SetNextWindowSize(ImVec2(60.0F, 40.0F));
++    ImGui::Begin("hud", nullptr,
++                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
++                      ImGuiWindowFlags_NoResize);
++    ImGui::Button("X", ImVec2(30.0F, 20.0F));
++    ImGui::End();
++
++    RenderGraph graph1;
++    addPatternPass(graph1, "bb");
++    overlay->addPass(graph1, "bb");
++    graph1.setBackbufferSource("bb");
++    CompileInfo info = makeCompileInfo();
++    graph1.compile(info);
++    fixture->executor->realize(graph1);
++    cmdCtx->runOnce(
++        [&](VkCommandBuffer cmd) { fixture->executor->execute(graph1, cmd, offscreen->image, offscreen->view, kExtent); });
++
++    // Baseline: before any click has been processed, the mouse has never
++    // moved into the window -- WantCaptureMouse must be false.
++    CHECK_FALSE(ImGui::GetIO().WantCaptureMouse);
++
++    // A synthetic left-button-down at (20, 20) -- comfortably inside the
++    // (10,10)-(70,50) window frame 1 just committed -- fed through
++    // Overlay::processEvent() exactly like Window::pumpEvents()'s
++    // preDispatch seam would (gate ruling #16).
++    const SDL_WindowID windowId = SDL_GetWindowID(fixture->window.sdlWindow());
++    SDL_Event motionEvent{};
++    motionEvent.motion.type = SDL_EVENT_MOUSE_MOTION;
++    motionEvent.motion.windowID = windowId;
++    motionEvent.motion.x = 20.0F;
++    motionEvent.motion.y = 20.0F;
++    overlay->processEvent(motionEvent);
++
++    SDL_Event clickEvent{};
++    clickEvent.button.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
++    clickEvent.button.windowID = windowId;
++    clickEvent.button.button = SDL_BUTTON_LEFT;
++    clickEvent.button.down = true;
++    clickEvent.button.x = 20.0F;
++    clickEvent.button.y = 20.0F;
++    overlay->processEvent(clickEvent);
++
++    // Frame 2: NewFrame() recomputes hover/capture against frame 1's
++    // window layout + the just-processed mouse position.
++    overlay->beginFrame();
++    CHECK(ImGui::GetIO().WantCaptureMouse);
++
++    // Close frame 2 out cleanly (Begin the same window again, matching
++    // ImGui's own "call Begin/End every frame a window should stay alive"
++    // contract) rather than leaving a NewFrame() dangling with no Render().
++    ImGui::SetNextWindowPos(ImVec2(10.0F, 10.0F));
++    ImGui::SetNextWindowSize(ImVec2(60.0F, 40.0F));
++    ImGui::Begin("hud", nullptr,
++                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
++                      ImGuiWindowFlags_NoResize);
++    ImGui::Button("X", ImVec2(30.0F, 20.0F));
++    ImGui::End();
++
++    RenderGraph graph2;
++    addPatternPass(graph2, "bb");
++    overlay->addPass(graph2, "bb");
++    graph2.setBackbufferSource("bb");
++    graph2.compile(info);
++    fixture->executor->realize(graph2);
++    cmdCtx->runOnce(
++        [&](VkCommandBuffer cmd) { fixture->executor->execute(graph2, cmd, offscreen->image, offscreen->view, kExtent); });
++
++    vkDeviceWaitIdle(fixture->device.device());
++    overlay.reset();
++    destroyImage(fixture->device.device(), *offscreen);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++namespace {
++// [gate ruling #16 row 5, FONT-UPLOAD RULING] Test-only interception hook
++// -- see rx_debug_ui/overlay.h's own detail::setQueueWaitIdleHookForTests
++// comment for the full contract. A plain, captureless free function
++// (required: the hook type is a bare function pointer, not std::function)
++// forwarding to the REAL global `vkQueueWaitIdle` (this project's own
++// volk-loaded symbol, already visible in this TU via rx_rhi_vk/command.h's
++// own <volk.h> include) after recording the call -- never skips the real
++// wait (skipping it would leave the font atlas upload genuinely
++// incomplete, corrupting later reads of it, not merely a test shortcut).
++std::atomic<uint32_t>* g_queueWaitIdleCounterForTest = nullptr;
++
++VkResult countingQueueWaitIdleHook(VkQueue queue) {
++    if (g_queueWaitIdleCounterForTest != nullptr) {
++        g_queueWaitIdleCounterForTest->fetch_add(1, std::memory_order_relaxed);
++    }
++    return vkQueueWaitIdle(queue);
++}
++
++// RAII guard restoring the production default (nullptr -- real,
++// unintercepted vkQueueWaitIdle resolution) on scope exit regardless of
++// how the TEST_CASE exits -- same convention as rx_material/tests/
++// test_material_system.cpp's own BindInstanceGuardHookScope.
++struct QueueWaitIdleHookGuard {
++    ~QueueWaitIdleHookGuard() {
++        rx::debug_ui::detail::setQueueWaitIdleHookForTests(nullptr);
++        g_queueWaitIdleCounterForTest = nullptr;
++    }
++};
++}  // namespace
++
++TEST_CASE("Overlay's forced init-time font upload trips the vendored backend's internal vkQueueWaitIdle exactly "
++          "once, and zero additional times across a fixed N-frame steady-state run with no further texture churn "
++          "[gate ruling #16, FONT-UPLOAD RULING -- guards the D25/D24 documented exception's bound]") {
++    auto fixture = makeFixture("rx_debug_ui_queue_wait_idle_bound");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto offscreen = createImage(fixture->device.device(), fixture->device.physicalDevice(), kFormat, kExtent,
++                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
++    REQUIRE(offscreen.has_value());
++
++    auto cmdCtx = rx::rhi::CommandContext::create(fixture->device.device(), fixture->device.graphicsQueue(),
++                                                    fixture->device.graphicsQueueFamily());
++    REQUIRE(cmdCtx.has_value());
++
++    std::atomic<uint32_t> waitIdleCount{0};
++    g_queueWaitIdleCounterForTest = &waitIdleCount;
++    // Installed BEFORE create() so create()'s own forced-upload call is
++    // counted -- the guard is declared BEFORE `overlay` below so it is
++    // destroyed AFTER `overlay` (reverse declaration order), keeping the
++    // hook installed through Overlay's own teardown too.
++    rx::debug_ui::detail::setQueueWaitIdleHookForTests(&countingQueueWaitIdleHook);
++    QueueWaitIdleHookGuard hookGuard;
++
++    auto overlay = rx::debug_ui::Overlay::create(fixture->device, fixture->window, kFormat);
++    REQUIRE(overlay.has_value());
++    CHECK(waitIdleCount.load(std::memory_order_relaxed) == 1);
++
++    // DELIBERATELY IDENTICAL content on every iteration, reusing ONLY
++    // glyphs create()'s own priming frame already packed -- see the two
++    // findings below, both reproduced directly this task and both real,
++    // correct-per-upstream behavior (not bugs in Overlay): ImGui v1.92.x's
++    // dynamic font atlas (ImGuiBackendFlags_RendererHasTextures) packs
++    // GLYPHS lazily, on first use, not the whole font upfront, and marks
++    // the atlas ImTextureStatus_WantUpdates -- re-triggering
++    // UpdateTexture()'s own vkQueueWaitIdle -- the MOMENT any new
++    // character is drawn for the first time, wherever that happens:
++    //   1. A first attempt used "frame %d" (a new digit -- '1'/'2'/'3'/'4'
++    //      -- first appearing on a DIFFERENT steady-state iteration each
++    //      time) -- observed 6 total waitIdle calls, one per newly-seen
++    //      digit, not just the one from create().
++    //   2. A second attempt fixed the text but left the window's title
++    //      bar enabled (no ImGuiWindowFlags_NoDecoration) -- "steady" is
++    //      NOT a substring of the priming frame's own "rx_debug_ui" text,
++    //      so its title bar's OWN glyphs ('s','t','a' -- not otherwise
++    //      used) were new on the FIRST steady-state frame only --
++    //      observed exactly 2 total (1 + 1), stable afterward, never 3+:
++    //      this by itself already proved the acceptance criterion's real
++    //      concern (no ONGOING per-frame churn) but was strictly more
++    //      than the "== 1" this test asserts, for a reason unrelated to
++    //      Overlay itself.
++    // NoDecoration below (hiding the title bar entirely) plus reusing the
++    // exact "rx_debug_ui" text is what makes every steady-state frame
++    // touch ZERO characters the priming frame did not already pack.
++    constexpr int kSteadyStateFrames = 5;
++    for (int frame = 0; frame < kSteadyStateFrames; ++frame) {
++        overlay->beginFrame();
++        ImGui::Begin("##steady", nullptr,
++                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoBackground |
++                          ImGuiWindowFlags_NoSavedSettings);
++        ImGui::TextUnformatted("rx_debug_ui");
++        ImGui::End();
++        (void)frame;
++
++        RenderGraph graph;
++        addPatternPass(graph, "bb");
++        overlay->addPass(graph, "bb");
++        graph.setBackbufferSource("bb");
++        CompileInfo info = makeCompileInfo();
++        graph.compile(info);
++        fixture->executor->realize(graph);
++        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++            fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, kExtent);
++        });
++    }
++
++    // The bound this whole test exists to guard: steady-state frames with
++    // no NEW texture registered/updated must add ZERO further
++    // vkQueueWaitIdle calls -- still exactly the one from create()'s own
++    // forced upload.
++    CHECK(waitIdleCount.load(std::memory_order_relaxed) == 1);
++
++    vkDeviceWaitIdle(fixture->device.device());
++    overlay.reset();
++    destroyImage(fixture->device.device(), *offscreen);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/src/rx_platform/include/rx_platform/window.h b/src/rx_platform/include/rx_platform/window.h
+index a459831..8d5e81d 100644
+--- a/src/rx_platform/include/rx_platform/window.h
++++ b/src/rx_platform/include/rx_platform/window.h
+@@ -1,14 +1,15 @@
+ #pragma once
+ #include <SDL3/SDL.h>
+ #include <vulkan/vulkan.h>
+ #include <rx_platform/input.h>
++#include <functional>
+ #include <optional>
+ #include <unordered_map>
+ #include <vector>
+ 
+ namespace rx::platform {
+ 
+ class Window {
+ public:
+     Window(Window&&) noexcept;
+     Window& operator=(Window&&) noexcept;
+@@ -35,21 +36,40 @@ public:
+     // ImGui_ImplSDL3_ProcessEvent() FIRST at this same call site, then lets
+     // this class's own handling run, and the platform-input accumulators
+     // gate on ImGui's WantCaptureMouse/WantCaptureKeyboard flags at the
+     // CALLER level (rulings-2026-08-18.md #14/#16) -- pumpEvents() itself
+     // has no ImGui dependency.
+     // Thread-affinity (D5, Phase 4): main-thread-only -- see
+     // docs/threading.md. SDL's own event queue is itself main-thread-affine
+     // on most backends; this method now also carries a dev-time
+     // RX_ASSERT_MAIN_THREAD guard [Phase 4 Task 20], matching every other
+     // guarded main-thread-only mutator in this codebase.
+-    void pumpEvents();
++    //
++    // `preDispatch` [Phase 4 Task 21, gate ruling #16]: an optional callback
++    // invoked once per drained SDL_Event, BEFORE this method's own
++    // switch-based handling for that same event runs -- the seam the class
++    // comment above already promised ("Task 21's ImGui overlay feeds every
++    // event to ImGui_ImplSDL3_ProcessEvent() FIRST at this same call
++    // site"). Deliberately a generic `std::function<void(const SDL_Event&)>`
++    // (no ImGui type anywhere in this signature) so THIS header/module stays
++    // ImGui-free (the "core libs stay ImGui-free" hard boundary, D20) while
++    // still letting `rx::debug_ui::Overlay` (or any other event observer)
++    // see the full, unfiltered event stream -- not a copy, not a subset --
++    // ahead of Window's own accumulators. `nullptr` (the default) is a
++    // plain no-op check per event; every existing caller (every sample/test
++    // written before this task) keeps compiling and behaving identically
++    // with no argument at all. This method itself never inspects/depends on
++    // what `preDispatch` does with an event -- gating platform-input
++    // consumption on e.g. ImGui's own `WantCaptureMouse`/`WantCaptureKeyboard`
++    // is a CALLER-level concern (gate ruling #14/#16), not something
++    // pumpEvents() arbitrates.
++    void pumpEvents(const std::function<void(const SDL_Event&)>& preDispatch = nullptr);
+ 
+     // ---- Relative mouse mode + mouse-delta accumulation [Phase 4 Task 20,
+     // gate ruling #14, matrix rows 1/2] ------------------------------------
+     // setRelativeMouseMode(true) hides+captures the cursor and puts SDL
+     // into continuous relative-motion reporting
+     // (SDL_SetWindowRelativeMouseMode). The ENABLED intent is tracked
+     // independently of whatever SDL/the OS did internally -- gate ruling:
+     // "track the app-requested relative-mode state independently of SDL's"
+     // -- relativeMouseModeWanted() below reflects THIS engine's own last
+     // request, never a live SDL_GetWindowRelativeMouseMode() query. Returns
+diff --git a/src/rx_platform/src/window.cpp b/src/rx_platform/src/window.cpp
+index 5c8516a..6175895 100644
+--- a/src/rx_platform/src/window.cpp
++++ b/src/rx_platform/src/window.cpp
+@@ -156,40 +156,50 @@ Window::~Window() {
+ }
+ 
+ void Window::closeAllGamepads() {
+     for (auto& [id, gamepad] : gamepads_) {
+         (void)id;
+         SDL_CloseGamepad(gamepad);
+     }
+     gamepads_.clear();
+ }
+ 
+-void Window::pumpEvents() {
++void Window::pumpEvents(const std::function<void(const SDL_Event&)>& preDispatch) {
+     RX_ASSERT_MAIN_THREAD("Window::pumpEvents");
+ 
+     // [Phase 4 Task 17, FG7, gate ruling #25] Filtered to THIS window's own
+     // SDL_WindowID -- an event for a different window (only possible if the
+     // embedding process opened more than one) is still drained from SDL's
+     // process-wide queue (SDL_PollEvent always pops the front of that
+     // single queue, regardless of which window it targets) but never
+     // touches this Window's own observed state. The `event.window.windowID`
+     // read only ever happens INSIDE a case already known (by `event.type`)
+     // to be one of SDL_WindowEvent's own variants, never against an
+     // arbitrary/unrelated event's union member. [Phase 4 Task 20] The same
+     // isolation now applies to SDL_EVENT_MOUSE_MOTION's own `windowID`
+     // field. Gamepad device events carry no windowID at all (gamepads are
+     // process-global, not per-window) so GAMEPAD_ADDED/REMOVED are handled
+     // unconditionally.
+     const SDL_WindowID thisWindowId = SDL_GetWindowID(window_);
+ 
+     SDL_Event event;
+     while (SDL_PollEvent(&event)) {
++        // [Phase 4 Task 21, gate ruling #16] Every drained event reaches
++        // `preDispatch` FIRST, unconditionally, before any of this method's
++        // own case handling below -- see pumpEvents()'s own header comment
++        // (window.h) for why this order is load-bearing (ImGui's own
++        // internal IO state, e.g. WantCaptureMouse, must already be current
++        // by the time anything downstream reads it this frame).
++        if (preDispatch) {
++            preDispatch(event);
++        }
++
+         // Size is read ONLY from SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED's
+         // data1/data2 -- the one window event whose payload SDL3's own
+         // SDL_events.h header comment documents AS a size (gate
+         // matrix-issue25 row 1). SDL_EVENT_WINDOW_MINIMIZED/RESTORED carry
+         // no size payload at all and must never be treated as one -- see
+         // window_test.cpp's device-free test asserting exactly this.
+         switch (event.type) {
+             case SDL_EVENT_WINDOW_MINIMIZED:
+                 if (event.window.windowID == thisWindowId) {
+                     minimizedEventObserved_ = true;
+diff --git a/src/rx_platform/tests/window_test.cpp b/src/rx_platform/tests/window_test.cpp
+index 52c679b..ffafde3 100644
+--- a/src/rx_platform/tests/window_test.cpp
++++ b/src/rx_platform/tests/window_test.cpp
+@@ -3,20 +3,21 @@
+ // several test files), so it both implements doctest's runtime and
+ // provides main() directly.
+ #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+ #include <doctest/doctest.h>
+ #include <rx_core/debug_checks.h>
+ #include <rx_core/log.h>
+ #include <rx_core/log_forward_sink.h>
+ #include <rx_platform/window.h>
+ #include <SDL3/SDL.h>
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <cmath>
+ #include <initializer_list>
+ #include <mutex>
+ #include <string>
+ #include <thread>
+ #include <vector>
+ 
+ namespace {
+@@ -569,20 +570,108 @@ TEST_CASE("Window::pumpEvents() ignores window events targeting a different SDL_
+     constexpr SDL_WindowID kBogusWindowId = 0xFFFFFFFEu;
+     SDL_Event event{};
+     event.window.type = SDL_EVENT_WINDOW_MINIMIZED;
+     event.window.windowID = kBogusWindowId;
+     REQUIRE(SDL_PushEvent(&event));
+     window->pumpEvents();
+ 
+     CHECK_FALSE(window->minimizedEventObserved());
+ }
+ 
++// [Phase 4 Task 21, gate ruling #16] Device-free proof of the `preDispatch`
++// seam pumpEvents() gained for the ImGui overlay: (a) it fires exactly once
++// per drained event, in drain order, and (b) it genuinely runs BEFORE this
++// class's own handling of that SAME event -- not merely "at some point
++// during the same pumpEvents() call". (b) is the load-bearing half (matches
++// ImGui_ImplSDL3_ProcessEvent()'s own real requirement: its IO state must be
++// current before anything downstream reads WantCaptureMouse/Keyboard this
++// frame) and is proven directly, not inferred: the callback reads
++// minimizedEventObserved() for the very MINIMIZED event it was just handed
++// and asserts it is STILL false at that moment, only becoming true once
++// pumpEvents() itself returns.
++TEST_CASE("Window::pumpEvents(preDispatch) invokes the callback once per drained event, strictly BEFORE this "
++          "class's own handling of that same event") {
++    auto window = rx::platform::Window::create("rx_platform_predispatch_test", 64, 64, /*visible=*/false);
++    REQUIRE(window.has_value());
++    const SDL_WindowID windowId = SDL_GetWindowID(window->sdlWindow());
++    REQUIRE(windowId != 0);
++
++    // Drain whatever the platform/WM enqueued on its own first (see
++    // drainUntilQuiescent()'s own comment above) so the synthetic events
++    // pushed below are the only ones this test's own assertions reason
++    // about.
++    (void)drainUntilQuiescent(*window);
++
++    std::vector<Uint32> observedEventTypes;
++    bool minimizedObservedInsideCallback = true;  // deliberately wrong-default: only false proves the ordering.
++    auto preDispatch = [&](const SDL_Event& event) {
++        observedEventTypes.push_back(event.type);
++        if (event.type == SDL_EVENT_WINDOW_MINIMIZED) {
++            minimizedObservedInsideCallback = window->minimizedEventObserved();
++        }
++    };
++
++    SDL_Event minimizedEvent{};
++    minimizedEvent.window.type = SDL_EVENT_WINDOW_MINIMIZED;
++    minimizedEvent.window.windowID = windowId;
++    REQUIRE(SDL_PushEvent(&minimizedEvent));
++
++    SDL_Event sizeEvent{};
++    sizeEvent.window.type = SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED;
++    sizeEvent.window.windowID = windowId;
++    sizeEvent.window.data1 = 99;
++    sizeEvent.window.data2 = 88;
++    REQUIRE(SDL_PushEvent(&sizeEvent));
++
++    window->pumpEvents(preDispatch);
++
++    // Both synthetic events reached the callback, in the order they were
++    // drained (SDL_PollEvent is FIFO).
++    REQUIRE(observedEventTypes.size() >= 2);
++    auto minimizedPos = std::find(observedEventTypes.begin(), observedEventTypes.end(), SDL_EVENT_WINDOW_MINIMIZED);
++    auto sizePos =
++        std::find(observedEventTypes.begin(), observedEventTypes.end(), SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED);
++    REQUIRE(minimizedPos != observedEventTypes.end());
++    REQUIRE(sizePos != observedEventTypes.end());
++    CHECK(minimizedPos < sizePos);
++
++    // The ordering proof: at the moment the callback saw the MINIMIZED
++    // event, Window's OWN handling of that same event had not run yet.
++    CHECK_FALSE(minimizedObservedInsideCallback);
++    // ... but by the time pumpEvents() returns, it has.
++    CHECK(window->minimizedEventObserved());
++    CHECK(window->lastPixelSizeEvent().width == 99);
++    CHECK(window->lastPixelSizeEvent().height == 88);
++}
++
++// Regression guard: every call site written before this task calls
++// pumpEvents() with no argument at all -- the default `nullptr` callback
++// must behave as a plain no-op check per event (never crash, never alter
++// any existing behavior). Reuses the exact MINIMIZED/RESTORED assertions
++// from the very first TEST_CASE in this file as a smoke check.
++TEST_CASE("Window::pumpEvents() with no preDispatch argument behaves exactly as before (default nullptr is a "
++          "no-op)") {
++    auto window = rx::platform::Window::create("rx_platform_predispatch_default_test", 64, 64, /*visible=*/false);
++    REQUIRE(window.has_value());
++    const SDL_WindowID windowId = SDL_GetWindowID(window->sdlWindow());
++    REQUIRE(windowId != 0);
++    (void)drainUntilQuiescent(*window);
++
++    SDL_Event minimizedEvent{};
++    minimizedEvent.window.type = SDL_EVENT_WINDOW_MINIMIZED;
++    minimizedEvent.window.windowID = windowId;
++    REQUIRE(SDL_PushEvent(&minimizedEvent));
++    window->pumpEvents();  // no preDispatch argument -- must not crash or misbehave.
++
++    CHECK(window->minimizedEventObserved());
++}
++
+ // ===== logWaylandMinimizeLimitationOnce [gate ruling #25 row 3] ===========
+ // Device-free: no live Wayland session needed. platformName is a caller-
+ // supplied parameter specifically so this is testable this way (see
+ // window.h's own comment) -- captures the forwarded log via the shared
+ // LogForwardSink helper above (also used by Task 20's gyro log-don't-drop
+ // test below).
+ TEST_CASE("logWaylandMinimizeLimitationOnce fires exactly once for a mocked \"Wayland\" platform name and never "
+           "for X11/Windows") {
+     rx::core::log::init();
+     auto sink = rx::core::log::forwardSink();
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/memory_report.h b/src/rx_rhi_vk/include/rx_rhi_vk/memory_report.h
+index b70e147..42ad84d 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/memory_report.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/memory_report.h
+@@ -11,20 +11,33 @@
+ //
+ // volk first, for VkDeviceSize/VkResult/VK_MAX_MEMORY_HEAPS etc -- this
+ // header intentionally does NOT include <vk_mem_alloc.h> (unlike buffer.h/
+ // texture.h): everything declared here is meant to be a plain, VMA-free,
+ // host-facing surface (D24(c): "a host-facing POD memory report... feeding
+ // HUD + Tracy plots") that a caller (a sample's HUD, the future SDK caps
+ // surface) can consume without pulling in VMA at all. The code that
+ // actually calls vmaGetHeapBudgets()/vmaSetCurrentFrameIndex() to BUILD an
+ // RxMemoryReport lives in rx_rhi_vk/buffer.h's Allocator (buffer.cpp),
+ // which already depends on VMA for other reasons.
++//
++// SCOPE NOTE -- a documented, bounded blind spot, not an oversight [Phase
++// 4 Stage 2 Task 21, gate ruling #16, FONT-UPLOAD RULING]: `rx_debug_ui`'s
++// vendored Dear ImGui Vulkan backend does its OWN raw vkCreateImage/
++// vkAllocateMemory/vkCreateBuffer calls for the font atlas (and any later-
++// registered HUD texture) -- entirely bypassing VMA, and therefore
++// entirely invisible to this report's per-category accounting and to
++// vmaGetHeapBudgets() alike. This is small and bounded by construction (a
++// font atlas plus a handful of HUD textures, never scene-scale data), not
++// a correctness gap -- but a reader relying on this report as an
++// EXHAUSTIVE account of this process's GPU memory should not assume it
++// covers that one vendored, unmodifiable code path. See rx_debug_ui/
++// overlay.h's own FONT/TEXTURE UPLOAD section for the full rationale.
+ #include <volk.h>
+ #include <array>
+ #include <atomic>
+ #include <cstddef>
+ #include <cstdint>
+ #include <string>
+ #include <vector>
+ 
+ namespace rx::rhi {
+ 
+diff --git a/third_party/CMakeLists.txt b/third_party/CMakeLists.txt
+index 0e04489..eb14928 100644
+--- a/third_party/CMakeLists.txt
++++ b/third_party/CMakeLists.txt
+@@ -886,10 +886,150 @@ rx_add_cached_dependency(
+ # (DEP_NAME, matching this project's own all-lowercase third-party naming
+ # convention), but the installed CMake package config file is
+ # `KtxConfig.cmake` (capital K, verified directly -- KTX-Software's own
+ # `write_basic_package_version_file("KtxConfigVersion.cmake" ...)` /
+ # `install(FILES ... KtxConfig.cmake ...)` calls use that exact
+ # capitalization), so `find_package()` must be called with `Ktx` (matching
+ # CMake's own <PackageName>Config.cmake resolution rule) or it silently
+ # fails to locate a real, successfully-installed package.
+ find_package(Ktx CONFIG REQUIRED PATHS "${ktx_CACHE_DIR}" NO_DEFAULT_PATH)
+ set_target_properties(KTX::ktx PROPERTIES IMPORTED_GLOBAL TRUE)
++
++# ---------------------------------------------------------------------------
++# Phase 4 Stage 2 Task 21 -- Dear ImGui debug overlay (spec D20, gate
++# matrix-issue16 as amended by gate/rulings-2026-08-18.md #16). Vendors
++# core + sdl3 + vulkan backends ONLY (no docking/multi-viewport -- see the
++# tag choice below). Consumed by src/rx_debug_ui and (later) samples ONLY --
++# every rx_* CORE target's transitive link closure is asserted free of this
++# target by cmake/DependencyBoundaryCheck.cmake (called from the root
++# CMakeLists.txt after every core target below is defined) -- the "core
++# libs and public ABI stay ImGui-free" hard boundary D20/the ticket both
++# restate.
++#
++# PINNED TAG [gate ruling #16, BINDING]: v1.92.9b -- the PLAIN tag, not
++# v1.92.9b-docking. Verified directly this task (`git ls-remote --tags
++# https://github.com/ocornut/imgui.git`): the real current v1.92.x line
++# runs v1.92.0 through v1.92.9, plus a v1.92.9b patch, each with a matching
++# `-docking` variant as a genuinely SEPARATE git ref -- pinning the plain
++# tag excludes ImGuiConfigFlags_DockingEnable/ViewportsEnable and the whole
++# multi-viewport platform-window-creation machinery at the SOURCE level
++# (D20: "Docking excluded (tooling phase)"), not merely by never setting
++# those flags on a build that technically has them available. Resolved
++# commit: f1cc2ae15e53a861a874c3034aae6798fde194ab (verified directly
++# against the same ls-remote output).
++#
++# LICENSE: MIT (LICENSE.txt at the pinned tag, verified directly this task
++# -- "Copyright (c) 2014-2026 Omar Cornut", the standard MIT grant, no
++# additional bundled-component licenses -- unlike libktx/fastgltf above,
++# Dear ImGui vendors no third-party code of its own).
++#
++# NO CMakeLists.txt EXISTS in this repository at any tag (verified directly
++# this task: the tag's own root listing has none) -- Dear ImGui ships as
++# loose source files "designed to be usable in your engine without any
++# modification" (imgui_impl_vulkan.h's own header comment), not a buildable
++# CMake project, so this follows the SAME "no CMakeLists -> FetchContent
++# source-only, PARENT_SCOPE-propagate *_SOURCE_DIR" convention this file
++# already established for volk/VMA/stb/MikkTSpace above -- NOT
++# rx_add_cached_dependency (that path assumes a real upstream CMake
++# package to build/install/find_package() against, which does not exist
++# here). UNLIKE those four precedents, though, this dependency needs a
++# real, REUSABLE CMake library target of its own (defined directly below,
++# not through the dep-cache): every prior FetchContent_Populate'd
++# no-CMakeLists dependency here is compiled straight into exactly ONE
++# consumer's own sources (volk.c into rx_rhi_vk, mikktspace.c into
++# rx_asset, stb_image.h's implementation into rx_rhi_vk's own
++# stb_impl.cpp) -- Dear ImGui is different: BOTH src/rx_debug_ui AND
++# (Task 24, sample 09) samples are expected to link it, so compiling it
++# into just one of those would either duplicate the compile or leak
++# ImGui's own symbols across a library boundary in an ad hoc way. A plain
++# `add_library(imgui STATIC ...)` target here, alongside every other
++# vendoring decision this file records, is the natural fit.
++set(RX_IMGUI_TAG "v1.92.9b")
++FetchContent_Declare(imgui
++  GIT_REPOSITORY https://github.com/ocornut/imgui.git
++  GIT_TAG ${RX_IMGUI_TAG}
++  GIT_SHALLOW TRUE)
++FetchContent_GetProperties(imgui)
++if(NOT imgui_POPULATED)
++  FetchContent_Populate(imgui)
++endif()
++# Same CMake 3.22 sibling-scope reason as volk/VMA/stb/MikkTSpace above:
++# FetchContent_Populate() sets imgui_SOURCE_DIR as a normal variable
++# scoped only to THIS directory; src/rx_debug_ui (a sibling of this
++# directory under the root CMakeLists.txt, not a descendant of it) needs
++# it too if it ever wants the raw source tree directly -- propagate to
++# root scope for consistency with every other vendored dependency here,
++# even though this task's own consumers only ever need the `imgui` target
++# below, not the raw directory.
++set(imgui_SOURCE_DIR "${imgui_SOURCE_DIR}" PARENT_SCOPE)
++
++# CORE ONLY -- imgui.cpp/imgui_draw.cpp/imgui_tables.cpp/imgui_widgets.cpp.
++# Deliberately EXCLUDES imgui_demo.cpp: nothing in this project's own
++# smoke test or (future) HUD content needs ImGui::ShowDemoWindow(), and
++# the demo window's own internal layout is not a stable, version-pinned
++# contract this project wants a GPU pixel-readback test coupled to (a
++# purpose-built minimal window, defined in rx_debug_ui's own GPU test, is
++# more robust against a future ImGui patch reflowing the demo window's
++# contents than probing a fixed pixel offset inside it would be) --
++# smaller vendored/compiled surface for zero lost functionality this
++# project actually uses.
++add_library(imgui STATIC
++  ${imgui_SOURCE_DIR}/imgui.cpp
++  ${imgui_SOURCE_DIR}/imgui_draw.cpp
++  ${imgui_SOURCE_DIR}/imgui_tables.cpp
++  ${imgui_SOURCE_DIR}/imgui_widgets.cpp
++  ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
++  ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
++)
++target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
++
++# VK_NO_PROTOTYPES PUBLIC [gate matrix row 3's own "include Vulkan-Headers/
++# volk before imgui_impl_vulkan.h" note, resolved concretely here]: this
++# project already links no real Vulkan LOADER import library at all
++# (rx_rhi_vk's own PUBLIC VK_NO_PROTOTYPES, third_party/CMakeLists.txt's
++# volk block above) -- imgui_impl_vulkan.h/.cpp's OWN documented
++# alternative to `#define IMGUI_IMPL_VULKAN_USE_VOLK` is exactly this:
++# build with VK_NO_PROTOTYPES and call `ImGui_ImplVulkan_LoadFunctions()`
++# with a caller-supplied loader (imgui_impl_vulkan.h's own "[Configuration]
++# in order to use a custom Vulkan function loader" comment, verified
++# directly against the pinned tag). rx_debug_ui/overlay.cpp is that
++# caller (see its own comment for why this is ALSO the natural, zero-
++# extra-machinery seam the GPU smoke test's at-most-once-vkQueueWaitIdle
++# assertion hooks through -- imgui_impl_vulkan.cpp's own internal function
++# table this way is a TU-local static array populated once via that one
++# loader call, not a shared global volk pointer this project's every other
++# Vulkan call site also reads). PUBLIC here (not PRIVATE) because it must
++# also be visible to any consumer that #includes imgui_impl_vulkan.h
++# itself (rx_debug_ui/overlay.cpp does, for ImGui_ImplVulkan_InitInfo) --
++# imgui_impl_vulkan.h's own struct/function declarations shift shape
++# slightly under this macro (the file's own comment: "Add
++# IMGUI_IMPL_VULKAN_NO_PROTOTYPES in your imconfig.h... Call
++# ImGui_ImplVulkan_LoadFunctions() before ImGui_ImplVulkan_Init()"), so
++# every translation unit that sees this header must see the SAME value.
++target_compile_definitions(imgui PUBLIC VK_NO_PROTOTYPES)
++
++# Vulkan::Headers PUBLIC: imgui_impl_vulkan.h's own public API surface
++# (ImGui_ImplVulkan_InitInfo, ImGui_ImplVulkan_PipelineInfo, ...) is built
++# entirely from real Vulkan types -- every consumer of this header needs
++# them visible too. SDL3::SDL3-static PRIVATE (not PUBLIC): unlike the
++# Vulkan backend header, imgui_impl_sdl3.h forward-declares every SDL type
++# it names (`struct SDL_Window; typedef union SDL_Event SDL_Event;` --
++# verified directly against the pinned tag) rather than including
++# <SDL3/SDL.h> itself, so only THIS target's own .cpp (which does include
++# the real header to implement those functions) needs the real SDL3
++# target -- a consumer of imgui_impl_sdl3.h alone does not need SDL3 on
++# its own include path.
++target_link_libraries(imgui PUBLIC Vulkan::Headers)
++target_link_libraries(imgui PRIVATE SDL3::SDL3-static)
++
++# NOTE: unlike every find_package()-imported target elsewhere in this file
++# (spdlog::spdlog, Vulkan::Headers, SDL3::SDL3-static, vk-bootstrap::
++# vk-bootstrap, enkiTS::enkiTS, Tracy::TracyClient, fastgltf::fastgltf,
++# meshoptimizer::meshoptimizer, draco::draco, KTX::ktx), `imgui` above is
++# an ORDINARY (non-IMPORTED) target from a plain add_library() call --
++# CMake's "imported targets are directory-scoped by default" limitation
++# (this file's own recurring comment on every one of those) does not apply
++# to it at all: an ordinary target's name is visible to
++# target_link_libraries() from ANY directory in the same build, with no
++# IMPORTED_GLOBAL promotion needed or even legal to request (that property
++# may only be set on an IMPORTED target). src/rx_debug_ui (and, later,
++# samples) link this target directly by its plain name, `imgui`.
