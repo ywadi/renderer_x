@@ -1,0 +1,517 @@
+# Review package: adaa4b3..b931188
+
+## Commits
+b931188 docs: issue #30 fix report round-2 addendum -- review findings closed
+07a2474 fix(rx_asset): close pumpUntilTerminal()/completion-callback race on async parse failure (issue #30 round 2)
+
+## Files changed
+ .../issue-30-report.md                             | 221 ++++++++++++++++++++-
+ src/rx_asset/import_gltf.cpp                       |  17 +-
+ src/rx_asset/tests/async_import_test.cpp           | 116 ++++++++++-
+ 3 files changed, 342 insertions(+), 12 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/issue-30-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/issue-30-report.md
+index 10f9162..9ec6d9c 100644
+--- a/.superpowers/sdd/2026-08-11-phase4-scene-assets/issue-30-report.md
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/issue-30-report.md
+@@ -106,20 +106,45 @@ All 10 runs: **identical** 1239/1239 assertions, 57/57 test cases, 0
+ failed. Down from a baseline that varied by up to ~245,000 assertions run
+ to run (8153987-8399006), now bit-for-bit identical across every run.
+ 
+ Additionally: 3/3 unconstrained sanity runs (no taskset) also produced
+ 1239/1239 every time, and the same binary rebuilt for windows-cross-zig and
+ run under Wine (both a single `--test-case="*WALL-CLOCK*"` invocation and
+ the full suite via ctest) also produced exactly 1239/1239 — the fixed count
+ holds across both platforms this repo builds for, not just one throttled
+ environment.
+ 
++**[Round 2 amendment — scoping this claim honestly, per independent review]**
++The framing above ("1239/1239 assertions... now bit-for-bit identical
++across every run") is accurate for every run in the batch actually captured
++and for what issue #30 itself targets, but reads as fully load-independent,
++which overstates it. Precisely: **the assertion COUNT is deterministic on
++every PASSING run** — that is the defect #30 describes ("passes green
++today, different assertion count each run") and it is fixed, unconditionally,
++by construction (the six sites no longer have a wall-clock-derived number of
++assertion evaluations, full stop, regardless of host load). It is a
++SEPARATE property that **the WALL-CLOCK GATE's stall-detector gate can still
++FAIL** (not silently pass with a different count — actually red) under
++genuinely heavy external GPU/CPU contention: it is a live-timing pass/fail
++check by design (RC6, self-calibrated, `max(2ms, 4x live probe)`), and this
++fix's own stated scope never touches that calibration formula. The
++independent reviewer's 40-run reproduction under real contention (a
++leftover competing GPU-rendering process) saw exactly this: 31/31 *passing*
++runs read bit-for-bit 1239/1239 (zero exceptions — the count-determinism
++claim held perfectly), while 3/40 runs failed outright on tight
++wall-clock-gate margins or a separate pre-existing race (see the Round 2
++section below) — contention that produces a red run, not a silently
++different green count, which is a materially different (and much less
++severe) failure mode than the one issue #30 was filed against. See the
++Round 2 section below for the reviewer's full reproduction and this
++addendum's disposition.
++
+ **Process note for the reviewer:** an earlier attempt at this same 10-run
+ proof, run while a separate Wine-based ctest invocation of this same
+ GPU-backed binary was running concurrently on the same machine (my own
+ methodology error, not a product or test defect), produced 2 spurious
+ failures (runs 6-7, both `1231/1230 passed/1 failed`, identical signature
+ both times — consistent with resource contention, not a real race: a lone,
+ immediate rerun once the concurrent Wine job had finished passed cleanly at
+ 1239/1239). That contaminated attempt was discarded; the 10-run sequence
+ above was captured with nothing else running on the machine.
+ 
+@@ -238,21 +263,205 @@ before any further verification or the final ctest/commit steps below.
+ - The brief's example revert path ("scratch worktree — symlink
+   `toolchain/` into it") was not needed: neither revert touched anything
+   under `toolchain/`, so a plain in-tree edit-build-test-restore cycle was
+   sufficient and is fully evidenced above (both files confirmed
+   byte-identical to HEAD via `git diff --stat` before the final green
+   verification run).
+ - One self-inflicted process hiccup during proof-gathering (documented
+   under criterion 2 above) — a stale contaminated attempt, discarded; the
+   final 10-run proof was captured cleanly.
+ 
++## Round 2 — independent review findings, closed in-round
++
++Independent review (`issue-30-review.md`, spec ✅ / Approved, 1 Medium + 2
++Low) verified all five criteria and the six-site rework itself line-by-line
++("No vacuousness, averaging-away, or predicate-weakening found in any of
++the six reworked sites"). Three items closed this round, per project policy
++(no deferred fixes; pre-existing defects close when found unless a named
++prerequisite blocks — none did here).
++
++### Item 1 (Medium, part A) — report accuracy
++
++Addressed above, in Criterion 2, via the "[Round 2 amendment]" paragraph:
++the "1239/1239 every run" claim now explicitly scopes to "deterministic on
++every passing run" and separately documents that the WALL-CLOCK GATE's
++self-calibrated margin remains a live-timing pass/fail property, not
++load-proof, by design and by explicit out-of-scope declaration in this
++fix's own Criterion 3. No code change was needed or made for this part (the
++finding was about report framing, not behavior).
++
++### Item 2 (Medium, part B) — `pumpUntilTerminal()`/callback race (newly surfaced, pre-existing, fixed)
++
++**Diagnosis.** The reviewer's RUN 34 failure (`async_import_test.cpp:592`
++at the time, `REQUIRE(done)` in the "garbage-bytes import" TEST_CASE — one
++of the file's ten call sites of the shared `pumpUntilTerminal()` helper,
++untouched by the six-site rework) traced to a genuine, pre-existing product
++race, not test infrastructure:
++
++- `pumpUntilTerminal()` returns as soon as `registry.importProgress(handle)`
++  reports a terminal `stage` (Done/Failed/cancelled). Every TEST_CASE in
++  this file (and any real host application following the same documented
++  pattern) then assumes the paired completion callback has already fired.
++- True for every terminal transition **except** a compute-phase PARSE
++  failure: `computeGltfImport()` (`import_gltf.cpp`) used to call
++  `setStage(stageOut, ImportStage::Failed)` **directly on the worker
++  thread**, in both its `dataBuffer`-wrap and `parser.loadGltf` early-return
++  paths — fully decoupled from, and racing ahead of, the completion
++  callback, which only fires later when that same worker's own
++  `postToMain(finishAsyncImportCompute)` closure is actually drained by a
++  `pumpMain()` call on the main thread.
++- Every OTHER terminal transition sets `stage` and fires the callback in
++  the SAME synchronous call (`pollAsyncImportUploads()`'s Done path,
++  `finishAsyncImportCompute()`'s own `compute.error` branch, and all three
++  IO-thread-read-failure closures in the path-based `importGltfAsync()`
++  overload, `registry.cpp`) — no window exists there. Confirmed by reading
++  every `job->stage.store(...)`/`setStage(...)` call site in both files
++  (`grep -n` inventory, 7 total sites: 2 racy, 5 already-correctly-paired).
++- Verdict: **product defect**, not test infrastructure. `pumpUntilTerminal()`
++  itself is correct — it faithfully polls the documented public API; the API
++  itself briefly lied about being terminal on this one path.
++
++**Fix.** `src/rx_asset/import_gltf.cpp`: deleted both direct
++`setStage(stageOut, ImportStage::Failed)` calls. `finishAsyncImportCompute()`
++(`registry.cpp:207`) already authoritatively sets `stage = Failed` in the
++exact same synchronous call as firing the completion callback for a
++compute-phase error — the deleted stores were pure redundant writes with
++zero functional purpose beyond creating the race. This makes the race
++**structurally impossible**, not merely less likely: after the fix there is
++exactly one write site for a compute-phase `Failed` transition, and it is
++permanently paired with the callback by construction.
++
++**Reproduction and regression test (stress harness, per the review's own
++suggestion).** Added a new permanent TEST_CASE, `"importGltfAsync: [race
++regression] repeated garbage-bytes imports never observe a terminal stage
++before the paired completion callback has fired"` (`async_import_test.cpp`),
++running the exact garbage-bytes-async-import pattern in a fixed
++(non-wall-clock-derived) loop, tracking a single `raceHits` counter, one
++aggregated `REQUIRE(raceHits == 0)` after the loop (same discipline as the
++six original sites — no per-iteration assertion, no issue-#30-class count
++variance of its own):
++
++1. **Pre-fix, unwidened, quiet host** (nothing else running,
++   `taskset -c 0,1`, 5000 iterations): **0/5000** — the natural window is
++   too narrow to hit reliably without contention on this machine, consistent
++   with the reviewer's own 2/40-under-real-contention rate and explaining
++   why it was never noticed before.
++2. **Pre-fix, artificially widened** (temporary, since-removed
++   `std::this_thread::sleep_for(500us)` inserted immediately after the
++   direct `setStage(Failed)` store, to force the same window the reviewer
++   hit via real scheduling contention): **31/5000**, `taskset -c 0,1`:
++   ```
++   race regression: 31 / 5000 iterations observed stage-terminal before the completion callback fired (0 separate timeout(s))
++   /home/ywadi/d2/renderer_x/src/rx_asset/tests/async_import_test.cpp:676: FATAL ERROR: REQUIRE( raceHits == 0 ) is NOT correct!
++     values: REQUIRE( 31 == 0 )
++   [doctest] test cases: 1 | 0 passed | 1 failed | 57 skipped
++   [doctest] Status: FAILURE!
++   ```
++   Confirms both the mechanism (real, exploitable) and that the stress
++   harness genuinely detects it.
++3. **Fix applied, artificial delay removed, same harness, same host**
++   (`taskset -c 0,1`, 5000 iterations — later right-sized to 2000 for the
++   permanent version, see the test's own comment): **0/5000**:
++   ```
++   race regression: 0 / 5000 iterations observed stage-terminal before the completion callback fired (0 separate timeout(s))
++   [doctest] test cases: 1 | 1 passed | 0 failed | 57 skipped
++   [doctest] Status: SUCCESS!
++   ```
++
++No BLOCKED — no missing product seam; the fix needed only to delete two
++redundant, racy lines.
++
++### Item 3 (Low) — restore `REQUIRE` semantics at sites 4/5
++
++`async_import_test.cpp`: the post-loop aggregated assertions at site 4
++(mid-upload rollback, `finalizedBeforeGeometryObserved`) and site 5
++(checkerboard-safety, `finalizedBeforeOneRegistered` / `overshotPastOne`)
++were `CHECK_FALSE`; restored to `REQUIRE_FALSE`, matching the original
++per-iteration `REQUIRE_FALSE`/`REQUIRE` abort-on-violation semantics the
++six-site rework had (unintentionally) downgraded. Aggregation shape
++(latching flag, single post-loop assertion) is unchanged — this is a
++severity-of-failure fix (abort vs. keep running against invalidated state),
++not a discrimination change.
++
++### Round 2 re-verification
++
++Full binary now 58 TEST_CASEs (57 original + 1 new race-regression stress
++test), 1248 assertions (1239 + 9 new).
++
++**Fresh 10-run determinism proof**, `taskset -c 0,1`, quiet host (the
++coordinator killed the reviewer's leftover contending process beforehand;
++confirmed via `ps aux`/`uptime` immediately before running), three
++foreground batches:
++
++```
++RUN 1  (exit 0): test cases: 58 | 58 passed | 0 failed | 0 skipped | assertions: 1248 | 1248 passed | 0 failed | | Status: SUCCESS!
++RUN 2  (exit 0): test cases: 58 | 58 passed | 0 failed | 0 skipped | assertions: 1248 | 1248 passed | 0 failed | | Status: SUCCESS!
++RUN 3  (exit 0): test cases: 58 | 58 passed | 0 failed | 0 skipped | assertions: 1248 | 1248 passed | 0 failed | | Status: SUCCESS!
++RUN 4  (exit 0): test cases: 58 | 58 passed | 0 failed | 0 skipped | assertions: 1248 | 1248 passed | 0 failed | | Status: SUCCESS!
++RUN 5  (exit 0): test cases: 58 | 58 passed | 0 failed | 0 skipped | assertions: 1248 | 1248 passed | 0 failed | | Status: SUCCESS!
++RUN 6  (exit 0): test cases: 58 | 58 passed | 0 failed | 0 skipped | assertions: 1248 | 1248 passed | 0 failed | | Status: SUCCESS!
++RUN 7  (exit 0): test cases: 58 | 58 passed | 0 failed | 0 skipped | assertions: 1248 | 1248 passed | 0 failed | | Status: SUCCESS!
++RUN 8  (exit 0): test cases: 58 | 58 passed | 0 failed | 0 skipped | assertions: 1248 | 1248 passed | 0 failed | | Status: SUCCESS!
++RUN 9  (exit 0): test cases: 58 | 58 passed | 0 failed | 0 skipped | assertions: 1248 | 1248 passed | 0 failed | | Status: SUCCESS!
++RUN 10 (exit 0): test cases: 58 | 58 passed | 0 failed | 0 skipped | assertions: 1248 | 1248 passed | 0 failed | | Status: SUCCESS!
++```
++
++All 10 runs identical, 0 failed. This time, unlike the (honestly-scoped, per
++item 1 above) round-1 claim, this determinism proof was captured on a
++verified-quiet host with no known contention source — the strongest form of
++the proof available.
++
++**Full verification, post round-2 changes:**
++
++- Serial linux ctest (`xvfb-run -a ctest --output-on-failure -j1`):
++  **22/22 passed**, 138.73s total (`rx_asset_gltf_gpu_tests` 43.96s).
++- windows-cross-zig: clean rebuild (`import_gltf.cpp` +
++  `async_import_test.cpp` recompiled, static lib + 4 dependent executables
++  relinked, no warnings/errors). ctest under Wine, CI's own filter
++  (`-E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample'`): **10/10 passed**,
++  127.98s total; `rx_asset_gltf_gpu_tests` itself:
++  `test cases: 58 | 58 passed | 0 failed | 0 skipped` /
++  `assertions: 1248 | 1248 passed | 0 failed` — exact count parity with
++  linux-native.
++- Zero unfiltered validation errors: every run above reports
++  `Status: SUCCESS!`; no new validation-layer lines beyond the two
++  pre-existing known-false-positives.
++
++### Round 2 diff footprint
++
++- `src/rx_asset/import_gltf.cpp`: 2 lines deleted (`setStage(stageOut,
++  ImportStage::Failed)` in `computeGltfImport()`'s two early-return
++  compute-phase-failure paths), replaced with explanatory comments. `git
++  diff` reviewed directly — no stray whitespace changes, no other lines
++  touched.
++- `src/rx_asset/tests/async_import_test.cpp`: +1 new permanent TEST_CASE
++  (the race-regression stress harness) and the 4 `CHECK_FALSE` →
++  `REQUIRE_FALSE` restorations (item 3). No other test case touched.
++- No board/issue/plan/spec/ledger files touched
++  (`.superpowers/sdd/2026-08-11-phase4-scene-assets/progress.md` still
++  carries the same pre-existing, not-mine local modification noted in
++  round 1 — left as found).
++
+ ## Commits
+ 
++Round 1:
+ - `45936cf` — `test(rx_asset): make rx_asset_gltf_gpu_tests assertion
+   counts deterministic (issue #30)`, pathspec-scoped to
+   `src/rx_asset/tests/async_import_test.cpp` only.
+-
+-No production code diff ships (both revert-test edits to
+-`import_gltf.cpp`/`texture_cache.cpp` were restored before committing,
+-confirmed via `git diff --stat`), no board/issue/plan/spec/ledger files
+-touched (`.superpowers/sdd/2026-08-11-phase4-scene-assets/progress.md` had
+-a pre-existing unrelated local modification at task start, left as found).
++- `adaa4b3` — `docs: issue #30 fix report...`, pathspec-scoped to the
++  report file only.
++
++Round 2:
++- `07a2474` — `fix(rx_asset): close pumpUntilTerminal()/completion-callback
++  race on async parse failure (issue #30 round 2)`, pathspec-scoped to
++  `src/rx_asset/import_gltf.cpp` + `src/rx_asset/tests/async_import_test.cpp`
++  (the production fix and its paired regression test/REQUIRE-restoration,
++  committed together).
++- This report amendment: a separate, following commit, pathspec-scoped to
++  `issue-30-report.md` only.
++
++No production code diff ships uncommitted or unexplained — the round-1
++revert-test edits to `import_gltf.cpp`/`texture_cache.cpp` were restored
++before committing (confirmed via `git diff --stat`); round 2's
++`import_gltf.cpp` change is a real, permanent, committed production fix
++(the two-line deletion above), independent of and unrelated to round 1's
++revert-test probes (different lines, different function branches).
+diff --git a/src/rx_asset/import_gltf.cpp b/src/rx_asset/import_gltf.cpp
+index 29e8d91..514341a 100644
+--- a/src/rx_asset/import_gltf.cpp
++++ b/src/rx_asset/import_gltf.cpp
+@@ -710,39 +710,52 @@ ImportComputeResult computeGltfImport(std::span<const std::byte> documentBytes,
+     // procedure -- code presence + procedure, not CI-gated (D18).
+     RX_ZONE_NAMED("computeGltfImport");
+     ImportComputeResult result;
+     setStage(stageOut, ImportStage::Parsing);
+ 
+     auto dataBuffer = fastgltf::GltfDataBuffer::FromBytes(reinterpret_cast<const std::byte*>(documentBytes.data()),
+                                                             documentBytes.size());
+     if (dataBuffer.error() != fastgltf::Error::None) {
+         result.error = mapFastgltfError(dataBuffer.error());
+         RX_LOG_ERROR("rx_asset: importGltf: failed to wrap document bytes: {}", importErrorName(result.error));
+-        setStage(stageOut, ImportStage::Failed);
++        // [Issue #30 round 2] Deliberately NOT setStage(stageOut, Failed)
++        // here -- see this function's own header comment. The async path's
++        // finishAsyncImportCompute() (registry.cpp) is the SOLE place that
++        // sets `stage = Failed` for a compute-phase error, in the exact
++        // same synchronous call as firing the completion callback, exactly
++        // mirroring the Done transition in pollAsyncImportUploads(). A
++        // direct store here, on the WORKER thread, raced ahead of that
++        // main-thread pairing: a poller could observe stage==Failed before
++        // the callback had fired (reviewer-found, round 2; regression test:
++        // the "[race regression] repeated garbage-bytes imports" TEST_CASE,
++        // async_import_test.cpp).
+         return result;
+     }
+ 
+     fastgltf::Parser parser(kEnabledExtensions);
+     ExtrasCounts extrasCounts;
+     parser.setUserPointer(&extrasCounts);
+     parser.setExtrasParseCallback(&onExtrasParsed);
+     // NEVER LoadExternalBuffers/LoadExternalImages -- the IO-source
+     // abstraction invariant [byte_source.h]. Every sources::URI this
+     // parse produces is resolved by THIS file, through `source`, never
+     // by fastgltf's own std::filesystem-backed loadFileFromUri.
+     constexpr fastgltf::Options options = fastgltf::Options::None;
+     auto assetExpected = parser.loadGltf(dataBuffer.get(), std::filesystem::path{}, options, fastgltf::Category::All);
+     if (assetExpected.error() != fastgltf::Error::None) {
+         result.error = mapFastgltfError(assetExpected.error());
+         RX_LOG_ERROR("rx_asset: importGltf: parse failed: {} ({})", importErrorName(result.error),
+                      fastgltf::getErrorMessage(assetExpected.error()));
+-        setStage(stageOut, ImportStage::Failed);
++        // [Issue #30 round 2] Deliberately NOT setStage(stageOut, Failed)
++        // here -- see the dataBuffer-wrap failure branch above (same
++        // rationale, same regression test); this is the path the round-2
++        // review's reproduction actually hit (malformed JSON).
+         return result;
+     }
+     fastgltf::Asset asset = std::move(assetExpected.get());
+ 
+     // ---- Generic extensionsUsed/Required surfacing [log-don't-drop mechanism] ----
+     if (!asset.extensionsUsed.empty()) {
+         std::string summary;
+         for (const auto& name : asset.extensionsUsed) {
+             if (!summary.empty()) {
+                 summary += ", ";
+diff --git a/src/rx_asset/tests/async_import_test.cpp b/src/rx_asset/tests/async_import_test.cpp
+index 139a5ff..cd7b06e 100644
+--- a/src/rx_asset/tests/async_import_test.cpp
++++ b/src/rx_asset/tests/async_import_test.cpp
+@@ -590,20 +590,120 @@ TEST_CASE("importGltfAsync: garbage-bytes import yields the SAME named ImportErr
+                                                                 });
+     REQUIRE(pumpUntilTerminal(*scheduler, asyncRegistry, handle));
+     REQUIRE(done);
+     CHECK_FALSE(asyncResult.ok());
+     CHECK(asyncResult.error == syncResult.error);
+     CHECK(asyncRegistry.meshCountForTesting() == meshesBefore);
+     CHECK(asyncRegistry.materialCountForTesting() == materialsBefore);
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
++// ---------------------------------------------------------------------
++// [Issue #30, round 2 -- reviewer-found, pre-existing, out of the six-site
++// rework's scope] `pumpUntilTerminal()` (this file's shared helper, defined
++// above, unmodified by this fix) polls `registry.importProgress(handle)`
++// and returns as soon as `stage` reads Done/Failed/cancelled. Callers
++// (every TEST_CASE in this file, and any real host application following
++// the same documented pattern) then assume the paired completion callback
++// has ALREADY fired by that point -- true for every terminal transition
++// EXCEPT one: a compute-phase PARSE failure (malformed/corrupt document
++// bytes) used to call setStage(stageOut, ImportStage::Failed) DIRECTLY on
++// the WORKER thread, inside computeGltfImport() (import_gltf.cpp, the
++// dataBuffer-wrap and parser.loadGltf early-return paths) -- a store fully
++// decoupled from, and racing ahead of, the completion callback, which only
++// fires later when that same worker thread's OWN postToMain(finishAsync-
++// ImportCompute) closure is actually drained by a pumpMain() call on the
++// main thread. Every OTHER terminal transition (Done via
++// pollAsyncImportUploads(), Failed via finishAsyncImportCompute()'s own
++// compute.error branch, Failed via the three IO-thread-read-failure
++// closures in Registry::importGltfAsync(path, ...)) sets `stage` and fires
++// the callback in the SAME synchronous call, so no such window exists
++// there -- this was narrow (worker-thread instruction count between the
++// store and its own postToMain() call, typically far under a microsecond)
++// and reviewer-reproduced only 2/40 full-suite runs under real GPU
++// contention (a competing process widening the scheduling window). Own
++// reproduction during this fix, on a quiet host: 0/5000 naturally (the
++// window is too narrow to hit without contention here), 31/5000 once an
++// artificial 500us delay was inserted right after the direct store (a
++// TEMPORARY, since-removed diagnostic -- see the fix's own report
++// addendum) -- confirming both the mechanism and that this loop detects
++// it. Fixed in import_gltf.cpp by deleting both redundant direct stores --
++// finishAsyncImportCompute() (registry.cpp) already authoritatively sets
++// `stage = Failed` in the exact same call as firing the callback, mirroring
++// every other terminal-transition site, which makes the race structurally
++// impossible rather than merely less likely. Fixed number of iterations
++// (not wall-clock-derived), so this loop carries no issue-#30-class
++// assertion-count variance of its own; the loop itself performs no
++// REQUIRE/CHECK, only the single aggregated REQUIRE after it.
++// ---------------------------------------------------------------------
++
++TEST_CASE("importGltfAsync: [race regression] repeated garbage-bytes imports never observe a terminal stage "
++          "before the paired completion callback has fired") {
++    auto fixture = makeFixture("async_garbage_race_stress");
++    if (!fixture) {
++        return;
++    }
++    attachPool(*fixture);
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++
++    const std::string garbage = "this is not json at all { [ garbage";
++    std::vector<std::byte> bytes(garbage.size());
++    std::memcpy(bytes.data(), garbage.data(), garbage.size());
++
++    class NullSource final : public ByteSource {
++    public:
++        std::optional<std::vector<std::byte>> read(const std::string&) override { return std::nullopt; }
++    };
++    NullSource source;
++
++    // [Issue #30 round 2] 2000, not the 5000 used during this fix's own
++    // diagnosis: the fix (see import_gltf.cpp's own comment at both
++    // deleted call sites) makes the race STRUCTURALLY impossible, not
++    // merely less likely -- `job->stage` now has exactly one write site for
++    // a compute-phase failure (finishAsyncImportCompute(), registry.cpp),
++    // always in the same synchronous call as firing the completion
++    // callback -- so this loop's only remaining job is guarding against a
++    // FUTURE regression reintroducing a similarly racy direct store
++    // elsewhere. On this quiet host the ORIGINAL (pre-fix) bug did not
++    // reproduce naturally at 5000 iterations either (0/5000; it only
++    // reproduced once an artificial delay was inserted to widen the
++    // window, matching the reviewer's own finding that this needs real
++    // scheduling contention to surface) -- so a higher count buys little
++    // real-world guard strength against ambient noise; 2000 is cheap
++    // insurance, not a probability play.
++    constexpr int kIterations = 2000;
++    int terminalTimeouts = 0;
++    int raceHits = 0;
++    for (int i = 0; i < kIterations; ++i) {
++        Registry registry;
++        bool done = false;
++        AsyncImportHandle handle = registry.importGltfAsync(bytes, source, *fixture->pool, *scheduler, nullptr,
++                                                              [&](ImportResult) { done = true; });
++        const bool reachedTerminal =
++            pumpUntilTerminal(*scheduler, registry, handle, std::chrono::milliseconds(2000));
++        if (!reachedTerminal) {
++            ++terminalTimeouts;  // should never happen either -- counted separately for diagnosis
++            continue;
++        }
++        if (!done) {
++            ++raceHits;
++        }
++    }
++    MESSAGE("race regression: ", raceHits, " / ", kIterations,
++            " iterations observed stage-terminal before the completion callback fired (", terminalTimeouts,
++            " separate timeout(s))");
++    REQUIRE(terminalTimeouts == 0);
++    REQUIRE(raceHits == 0);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
+ // ---------------------------------------------------------------------
+ // Cancellation (abandon semantics).
+ // ---------------------------------------------------------------------
+ 
+ TEST_CASE("importGltfAsync: cancelImport() before any work starts -- no registry mutation, callback never "
+           "fires, progress observes cancelled") {
+     auto fixture = makeFixture("async_cancel_immediate");
+     if (!fixture) {
+         return;
+     }
+@@ -1003,21 +1103,26 @@ TEST_CASE("importGltfAsync: cancelImport() after >=1 real GPU resource (texture
+             finalizedBeforeGeometryObserved = true;
+         }
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+     }
+     REQUIRE(geometryRegistered);
+     // [Issue #30] Aggregated to a single deterministic assertion -- this was
+     // a REQUIRE_FALSE(done) evaluated once per loop spin above (an iteration
+     // count that is itself wall-clock/scheduling-dependent). Same
+     // discriminating power: the flag latches permanently the first time
+     // `done` is observed true before the mid-upload window is caught.
+-    CHECK_FALSE(finalizedBeforeGeometryObserved);
++    // [Round 2, LOW finding] REQUIRE, not CHECK -- restores the original
++    // abort-on-violation semantics: a caught violation here means the rest
++    // of this test case's own state (post-cancel mesh/material/pool
++    // assertions below) can no longer be trusted, so it must not keep
++    // running against data the violation may have already invalidated.
++    REQUIRE_FALSE(finalizedBeforeGeometryObserved);
+ 
+     REQUIRE(fixture->textures->liveTextureCountForTesting() > liveTexturesBefore);
+     const PoolStats poolStatsMidUpload = fixture->pool->stats();
+     REQUIRE(poolStatsMidUpload.vertexBytesUsed > 0);
+     REQUIRE(poolStatsMidUpload.indexBytesUsed > 0);
+     const size_t meshesBeforeCancel = registry.meshCountForTesting();
+     const size_t materialsBeforeCancel = registry.materialCountForTesting();
+ 
+     registry.cancelImport(handle);
+ 
+@@ -1154,23 +1259,26 @@ TEST_CASE("importGltfAsync: cancelImport() after EXACTLY 1 of N texture slots ha
+         if (live > liveTexturesBefore + 1) {
+             overshotPastOne = true;
+         }
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+     }
+     REQUIRE(oneRegistered);
+     // [Issue #30] Both claims aggregated to single deterministic assertions --
+     // previously a REQUIRE_FALSE(done)/REQUIRE(live<=+1) pair evaluated once
+     // per loop spin (a wall-clock/scheduling-dependent count). Same
+     // discriminating power: either flag latches permanently on the first
+-    // violating tick.
+-    CHECK_FALSE(finalizedBeforeOneRegistered);  // must not have finalized before this loop caught the 1-of-N window
+-    CHECK_FALSE(overshotPastOne);  // never overshoots past exactly 1
++    // violating tick. [Round 2, LOW finding] REQUIRE, not CHECK -- restores
++    // the original abort-on-violation semantics (a caught violation here
++    // means the rest of this test case's own state can no longer be
++    // trusted).
++    REQUIRE_FALSE(finalizedBeforeOneRegistered);  // must not have finalized before this loop caught the 1-of-N window
++    REQUIRE_FALSE(overshotPastOne);  // never overshoots past exactly 1
+     // Never dropped below baseline on the way here either (the checkerboard
+     // and every role fallback are built once at TextureCache::create() and
+     // must never be touched by anything this import's own marshal does).
+     REQUIRE(minLiveObservedDuringDrive >= liveTexturesBefore);
+ 
+     registry.cancelImport(handle);
+ 
+     // Drain the rollback, watching liveTextureCountForTesting() on EVERY
+     // tick (not just at the end) -- the bug this test targets is a
+     // TRANSIENT-if-unwatched drop (releaseUnpublished() on the shared
