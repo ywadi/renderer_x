@@ -1,5 +1,6 @@
 #include <rx_shadow/shadow_caster_pipeline.h>
 
+#include <rx_core/debug_checks.h>
 #include <rx_core/log.h>
 #include <rx_rhi_vk/bindless.h>
 #include <rx_rhi_vk/device.h>
@@ -37,6 +38,12 @@ std::unique_ptr<ShadowCasterPipeline> ShadowCasterPipeline::create(rx::rhi::Devi
                                                                      rx::rhi::BindlessTable& bindless,
                                                                      const ShadowCasterPipelineDesc& desc,
                                                                      const std::filesystem::path& shaderDir) {
+    // [Task 22 fix round, F5] Same runtime-guarded main-thread-only
+    // convention every ordinary-Vulkan-object-factory in this codebase
+    // uses (Device::create(), MaterialSystem's own ongoing-use methods) --
+    // this class's own header comment already claims this contract; this
+    // is what actually enforces it.
+    RX_ASSERT_MAIN_THREAD("ShadowCasterPipeline::create");
     const std::filesystem::path effectiveShaderDir = !shaderDir.empty() ? shaderDir : std::filesystem::path(RX_SHADOW_SHADER_DIR);
     const std::filesystem::path shaderPath = effectiveShaderDir / "shadow_caster.vert.slang";
 
@@ -241,6 +248,10 @@ ShadowCasterPipeline::~ShadowCasterPipeline() {
     if (device_ == VK_NULL_HANDLE) {
         return;
     }
+    // [Task 22 fix round, F5] Destruction is main-thread-only too (this
+    // class's own header comment) -- ordinary Vulkan object teardown,
+    // same rationale as create()'s own guard just above.
+    RX_ASSERT_MAIN_THREAD("ShadowCasterPipeline::~ShadowCasterPipeline");
     if (pipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, pipeline_, nullptr);
     }
