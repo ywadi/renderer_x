@@ -239,9 +239,8 @@ bool approxEqual(const std::array<uint8_t, 4>& a, const std::array<uint8_t, 4>& 
 // Renders `graph` (already compiled + realized against `executor`) into
 // `target` and reads the whole thing back to a host-visible buffer --
 // same readback machinery as rx_graph/tests/test_execute_gpu.cpp:754-768.
-std::vector<uint8_t> renderAndReadBack(rx::rhi::Device& device, rx::rhi::Allocator& allocator, Executor& executor,
-                                        RenderGraph& graph, rx::rhi::CommandContext& cmdCtx,
-                                        const OffscreenImage& target) {
+std::vector<uint8_t> renderAndReadBack(rx::rhi::Allocator& allocator, Executor& executor, RenderGraph& graph,
+                                        rx::rhi::CommandContext& cmdCtx, const OffscreenImage& target) {
     cmdCtx.runOnce(
         [&](VkCommandBuffer cmd) { executor.execute(graph, cmd, target.image, target.view, kExtent); });
 
@@ -261,7 +260,6 @@ std::vector<uint8_t> renderAndReadBack(rx::rhi::Device& device, rx::rhi::Allocat
 
     std::vector<uint8_t> pixels(static_cast<size_t>(pixelBytes));
     std::memcpy(pixels.data(), readback->mappedData(), pixels.size());
-    (void)device;
     return pixels;
 }
 
@@ -359,7 +357,7 @@ TEST_CASE("Overlay renders as a declared rx_graph pass: LOAD-not-CLEAR preserves
     fixture->executor->realize(graph);
 
     std::vector<uint8_t> pixels =
-        renderAndReadBack(fixture->device, fixture->allocator, *fixture->executor, graph, *cmdCtx, *offscreen);
+        renderAndReadBack(fixture->allocator, *fixture->executor, graph, *cmdCtx, *offscreen);
 
     // OUTSIDE the (10,10)-(70,50) HUD window -- LOAD, not CLEAR, must have
     // preserved the pattern pass's own solid color.
