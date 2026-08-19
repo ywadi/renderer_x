@@ -455,6 +455,17 @@ it is out of scope for *this* spec only, not out of scope for the project:
     dispositions) — consumption here requires no importer rework;
     TEXCOORD_1/COLOR_0 vertex-layout growth rides the first
     sub-item that needs it.
+  - **Showcase/benchmark scene (committed 2026-08-19): Amazon
+    Lumberyard Bistro** (NVIDIA ORCA distribution, CC-BY 4.0) as the
+    techniques-phase hero scene — its glass storefronts, emissive
+    signage, many local lights, and alpha-masked foliage exercise the
+    charter's transmission/clustered-Forward+/emissive/alpha features
+    directly, and its exterior+interior scale carries the phase
+    benchmarks. Requires a one-time curated FBX/USD→glTF conversion
+    (no official glTF exists; conversion fidelity — alpha modes,
+    normal-map orientation — is part of the task). Khronos Sponza
+    remains Phase 4's fly-through scene (`--scene` takes any glTF, so
+    no engine change is involved in the swap).
 - **Scheduler sharing with host engines** (committed 2026-08-11, SDK
   phase): an embedding game engine must be able to make the renderer's
   task scheduler and its own job system ONE pool — via consumer-chosen
