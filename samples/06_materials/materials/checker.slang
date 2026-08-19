@@ -85,6 +85,14 @@ struct Checker : IMaterialShader {
         // under this project's --validate gate.
         color.x += v.worldPos.x * 1e-6;
         color.y += v.normal.y * 1e-6;
+        // [Phase 4 Task 16] MaterialVertex grew tangent/lightDirWorld/
+        // lightColor/ambientColor -- same dead-code-elimination-avoidance
+        // rationale as worldPos/normal above.
+        color.z += v.tangent.x * 1e-6;
+        color.w += v.lightDirWorld.x * 1e-6;
+        color.x += v.lightColor.x * 1e-6;
+        color.y += v.ambientColor.x * 1e-6;
+        color.z += v.cameraPosWorld.x * 1e-6;
         return color;
     }
 };

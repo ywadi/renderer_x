@@ -395,15 +395,24 @@ PixelCoord projectToPixel(glm::vec3 worldPos, const glm::mat4& viewProj, uint32_
 // VkVertexInputAttributeDescription table internally, from this exact
 // struct shape, not from anything this file declares to it directly. ------
 
+// [Phase 4 Task 16, D8] Grew by one field (`tangent`, float4, w =
+// handedness) to match rx_material's own updated MaterialVertexLayout/
+// forward_entry.slang vertexMain parameter list (position/normal/tangent/uv,
+// 48 bytes -- D8's pooled vertex format). Neither checker.slang nor
+// rim.slang does normal mapping, so this sample's own tangent value is
+// inert (any valid unit vector satisfies the pipeline's vertex-input
+// contract); an arbitrary, fixed +X tangent with handedness +1 is used
+// uniformly across every face.
 struct Vertex {
     float position[3];
     float normal[3];
+    float tangent[4];
     float uv[2];
 };
-static_assert(sizeof(Vertex) == 32,
+static_assert(sizeof(Vertex) == 48,
               "Vertex must byte-match rx_material's internal MaterialVertexLayout (material_system.cpp) exactly -- "
-              "tightly packed float3 position + float3 normal + float2 uv, no padding, matching forward_entry.slang's "
-              "own vertexMain(position, normal, uv) parameter list.");
+              "tightly packed float3 position + float3 normal + float4 tangent + float2 uv, no padding, matching "
+              "forward_entry.slang's own vertexMain(position, normal, tangent, uv, instanceId) parameter list.");
 
 struct HostMesh {
     std::vector<Vertex> vertices;
@@ -426,6 +435,10 @@ void addQuad(HostMesh& mesh, glm::vec3 a, glm::vec3 b, glm::vec3 c, glm::vec3 d,
         v.normal[0] = normal.x;
         v.normal[1] = normal.y;
         v.normal[2] = normal.z;
+        v.tangent[0] = 1.0F;
+        v.tangent[1] = 0.0F;
+        v.tangent[2] = 0.0F;
+        v.tangent[3] = 1.0F;
         v.uv[0] = kCornerUv[i][0];
         v.uv[1] = kCornerUv[i][1];
         mesh.vertices.push_back(v);
@@ -500,6 +513,21 @@ HostMesh generateSphere(float radius, uint32_t rings, uint32_t segments) {
             vert.normal[0] = dir.x;
             vert.normal[1] = dir.y;
             vert.normal[2] = dir.z;
+            // [Phase 4 Task 16, D8] A fixed, arbitrary non-zero tangent --
+            // same rationale as addQuad()'s own identical literal: rim.slang
+            // does no normal mapping, so tangent-space correctness is moot,
+            // but it MUST be non-zero (a real per-vertex longitude tangent
+            // degenerates to exactly (0,0,0) at the two poles, where
+            // sinTheta == 0) -- forward_entry.slang's vertexMain normalizes
+            // this value unconditionally, and normalize((0,0,0)) is a 0/0
+            // NaN that silently corrupts every material's output through
+            // this project's own dead-interpolant-avoidance epsilon reads
+            // (see transformAndUploadObjectVertices()'s own comment for the
+            // full root-cause account).
+            vert.tangent[0] = 1.0F;
+            vert.tangent[1] = 0.0F;
+            vert.tangent[2] = 0.0F;
+            vert.tangent[3] = 1.0F;
             vert.uv[0] = u;
             vert.uv[1] = v;
             mesh.vertices.push_back(vert);
@@ -934,6 +962,25 @@ void transformAndUploadObjectVertices(rx::rhi::Uploader& uploader, const HostMes
         dst.normal[0] = viewNormal.x;
         dst.normal[1] = viewNormal.y;
         dst.normal[2] = viewNormal.z;
+        // [Phase 4 Task 16, D8] Copy `tangent` straight through (untransformed
+        // -- this sample does no normal mapping, so an object-space tangent
+        // is as good as any other valid one; only its NON-ZERO-ness matters).
+        // Load-bearing, not cosmetic: `transformed` is default-constructed
+        // above (std::vector<Vertex>(count) value-initializes every element,
+        // zeroing `tangent`), and forward_entry.slang's vertexMain
+        // unconditionally computes `normalize(mul(modelMat3, tangent.xyz))`
+        // -- normalize() of a zero vector is a 0/0 NaN, which this sample's
+        // own materials (checker.slang/rim.slang) then multiply into their
+        // output color via a `v.tangent.x * 1e-6` epsilon read (present to
+        // avoid an unrelated dead-interpolant validation warning -- see
+        // those files' own header comments), corrupting every channel that
+        // NaN propagates through. Reproduced and root-caused directly: this
+        // omission is exactly what produced this sample's own headless gate
+        // failure when D8's tangent field first landed.
+        dst.tangent[0] = src.tangent[0];
+        dst.tangent[1] = src.tangent[1];
+        dst.tangent[2] = src.tangent[2];
+        dst.tangent[3] = src.tangent[3];
         dst.uv[0] = src.uv[0];
         dst.uv[1] = src.uv[1];
     }

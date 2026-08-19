@@ -66,6 +66,14 @@ struct Rim : IMaterialShader {
         // harmless, vertex-output-not-consumed validation warning).
         color.x += v.worldPos.x * 1e-6;
         color.y += v.uv.x * 1e-6;
+        // [Phase 4 Task 16] MaterialVertex grew tangent/lightDirWorld/
+        // lightColor/ambientColor -- same dead-code-elimination-avoidance
+        // rationale as worldPos/uv above.
+        color.z += v.tangent.x * 1e-6;
+        color.x += v.lightDirWorld.x * 1e-6;
+        color.y += v.lightColor.x * 1e-6;
+        color.z += v.ambientColor.x * 1e-6;
+        color.x += v.cameraPosWorld.x * 1e-6;
         return float4(color, 1.0);
     }
 };
