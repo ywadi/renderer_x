@@ -261,3 +261,32 @@ None of these touch any file outside `src/rx_scene/` or the single
   "inside") — `cullingFrustumPlanes()` is the sanctioned non-degenerate
   entry point; DrawListBuilder must use it, not `viewProj()`'s planes,
   for real culling.
+
+## Review round 1 (independent reviewer, `task-18-review.md`)
+
+**Verdict:** spec PASS, quality Approved. One actionable Minor, closed
+in-round per policy (the reviewer's other Minor — the prev-frame-slot
+self-equality test — was ruled compliant by design, matching the gate
+matrix's own prescribed stub shape; no change made for it).
+
+**Minor closed:** the `priority` clamp test (`scene_test.cpp`, "priority is
+clamped to [0,7]...") asserted the default (4) and two AT/ABOVE-ceiling
+cases (250→7, 7→7) but no representative IN-RANGE value — those two cases
+alone cannot distinguish "clamps correctly at the boundary" from "always
+clamps to 7 regardless of input." Added a third case:
+`RenderableDesc.priority = 2` → `scene.priority(handle) == 2` (verbatim,
+no clamping), in the same `TEST_CASE`.
+
+**Re-verification after the fix** (both presets, full `rx_scene_tests`
+rebuild + run):
+```
+linux-native:        [doctest] test cases: 26 | 26 passed | 0 failed
+                      [doctest] assertions: 229 | 229 passed | 0 failed
+                      benchmark: 30000 calls took 1118 us (0.0373 us/call, 2.68e7 calls/sec)
+windows-cross-zig
+  (under Wine):       [doctest] test cases: 26 | 26 passed | 0 failed
+                      [doctest] assertions: 229 | 229 passed | 0 failed
+                      benchmark: 30000 calls took 1046 us (0.0349 us/call, 2.87e7 calls/sec)
+```
+Assertion count rose from 228 to 229 (exactly the one new `CHECK` added),
+consistent with the change being additive-only. No other file touched.

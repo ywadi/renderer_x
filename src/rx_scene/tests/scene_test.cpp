@@ -242,6 +242,16 @@ TEST_CASE("RenderableDesc::priority is clamped to [0,7], default 4 [Filament pre
     atMax.priority = 7;
     rx::scene::RenderableHandle h2 = scene.createRenderable(atMax);
     CHECK(scene.priority(h2) == 7);
+
+    // [Review round 1, Minor] A representative IN-RANGE, non-default,
+    // non-boundary value must pass through verbatim -- the two cases
+    // above only prove clamping at/above the ceiling; this proves
+    // createRenderable() does not also clamp/rewrite a value that never
+    // needed clamping in the first place.
+    rx::scene::RenderableDesc inRange;
+    inRange.priority = 2;
+    rx::scene::RenderableHandle h3 = scene.createRenderable(inRange);
+    CHECK(scene.priority(h3) == 2);
 }
 
 TEST_CASE("RenderableDesc::castsShadows defaults true [RC5] and round-trips per-object") {
