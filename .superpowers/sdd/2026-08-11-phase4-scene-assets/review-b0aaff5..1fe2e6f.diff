@@ -1,0 +1,641 @@
+# Review package: b0aaff5..1fe2e6f
+
+## Commits
+1fe2e6f docs: Task 24 review fix-round -- L1/L2 corrections + delta (#15)
+1ea8a01 fix(samples): 09_scene bindless capacity + multi-submesh draw-data sizing + leak (#15 H1)
+c4dce74 fix(rx_asset): destroy-while-upload-in-flight on bindless registration failure
+
+## Files changed
+ .../task-24-report.md                              | 154 ++++++++++++++++++++-
+ README.md                                          |   2 +-
+ samples/09_scene/main.cpp                          |  81 +++++++++--
+ src/rx_asset/tests/texture_cache_test.cpp          |  71 +++++++++-
+ src/rx_asset/texture_cache.cpp                     |  23 +++
+ 5 files changed, 316 insertions(+), 15 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-24-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-24-report.md
+index 7286eff..9f52e7a 100644
+--- a/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-24-report.md
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/task-24-report.md
+@@ -39,21 +39,21 @@ standing practice.
+ | 2 | `--scene sponza` fails loudly when absent; loads when present | **PASS (loud-failure path); NOT independently verified against a real fetched Sponza** | `resolveSponzaScenePath()` + the same `std::filesystem::exists` check pattern as 08; code-reviewed correct, but fetching the ~53 MB asset was outside this session's time budget — disclosed in MANUAL_VERIFICATION.md's own `## 09_scene` "Last run" note, not silently claimed |
+ | 3 | Full-pipeline import counts printed + asserted | **PASS** | `sample_09_scene: import counts meshes=1 submeshes=1 materials=1 grid_instances=16` (real log line, §2) |
+ | 4 | Pool-stats HUD panel, real accessor, non-mock | **PASS** | `drawHud()` reads `GeometryPool::stats()` live every frame (main.cpp) |
+ | 5 | Uploader tickets — no unconditional `vkWaitForFences` in the frame loop | **PASS** | Sample never calls `Uploader::wait()` inside the per-frame path (only once at the single sync `importGltf()`/`GeometryPool::upload()` setup, matching sample 08's own precedent) |
+ | 6 | KTX2/TextureCache — DamagedHelmet textures visibly affect render | **PASS** | Same `resolveTextureIndex`/`resolveSamplerIndex` wiring as sample 08 (helmet material setup reuses that exact code path); D17 reference PNG shows the real textured helmet |
+ | 7 | StandardPBR/Unlit + alphaMode — MASK/BLEND untested by DamagedHelmet | **DISCLOSED GAP (pre-existing, not this task's to close)** | DamagedHelmet is OPAQUE-only (verified: `damaged_helmet_test.cpp`); Sponza (present-mode only, not fetched this session) is the documented MASK/BLEND exercise vehicle. `--stress` mode DOES exercise a real Mask/Opaque split (2 of 4 variants) through the real D28 fixed-function axis. |
+ | 8 | Scene proxies — renderable count matches import count | **PASS** | `Scene::renderableCount() == 16` after `populateHelmetGrid()`; `totalCandidates == 16` every frame |
+ | 9 | Reversed-Z main camera | **PASS** | Forward pass declares `DepthConvention::Reversed` (D29); `MaterialSystem::getPipeline()` (unmodified, existing D13/RC3 GREATER_OR_EQUAL) drives depth compare; zero validation errors |
+ | 10 | Culled counter nonzero for the fixed startup camera | **PASS (via layer mask, not frustum — a deliberate, documented, more robust design choice)** | `culledByLayerMask=8` every frame; see main.cpp's own header comment for why frustum-boundary math was rejected as the gate's deterministic source |
+ | 11 | Instancing-collapse ratio, blessed formula, CI-asserted | **PASS** | `1 - drawsSubmitted/recordsIn` computed both in-binary and cross-checked against a hand-computed grid expectation (`1 - 1/8 = 0.875`); exact-equality assertion (`std::abs(actual-expected) > 1e-9` fails the gate) |
+-| 12 | D27 main-thread pre-resolution — worker-guard test under `--threads>1` | **PASS** | `rx::core::debug::detail::setViolationHookForTests()` wrapped around one real chunked-recording frame under 7 workers; zero violations captured (structural guarantee: `RecordChunkFn`'s own signature never receives the resolver — see draw_recording.h) |
++| 12 | D27 main-thread pre-resolution — worker-guard test under `--threads>1` | **PASS** | **[Corrected in fix-round — see §9]** The `setViolationHookForTests()` check itself is real infrastructure but, as exercised against the default grid (one collapsed draw, entirely handled by chunk 0), is a near-tautology — `resolvePipeline()` is structurally only ever called from `updateSceneFrame()` on the main thread regardless of whether the guard holds. The mechanism that ACTUALLY pins this fix is `RX_ASSERT_MAIN_THREAD`'s own abort under `sample_09_scene_stress_headless` (drawsSubmitted=4, spread across multiple non-empty worker chunks) — a revert of the `GeometryPool::bind()` fix (finding #2, §4) SIGABRTs there immediately, a real, already-registered ctest target. |
+ | 13 | Shadow quality bridge visibly exercised | **PASS** | Real `ShadowCasterPipeline` + `fitShadowFrustum` + comparison-sampler PCF wired into every DrawDataGpu row; visible in `references/grid_scene.png` (ground shadow under the helmets) |
+ | 14 | #27 memory report HUD panel, real accessor | **PASS** | `drawHud()` reads `Allocator::report()` live every frame |
+ | 15 | Input surface consumed | **PASS** | `Window::isKeyDown`/`consumeMouseDelta`/`setRelativeMouseMode`/`poll()` (gamepad) all real calls in `updateFlyCamera()` |
+ | 16 | ImGui overlay — real render-graph pass, non-empty draw data | **PASS** | Separate, non-pixel-gated headless frame proves `ImGui::GetDrawData()->CmdListsCount>0 && TotalVtxCount>0` (see §4 for the ImGui first-appearance-window-sizing bug this surfaced and fixed) |
+ | 17 | Task 23 lands before stress-v2 numbers published | **PASS** | BASE=270de94 already includes Task 23 (commits 477a511/1197d7b/23e5c69/b641e46); §5 cites its own report numbers as the measurement precedent |
+ | 18 | 60-frame rolling FPS/frame-ms | **PASS** | `HudState::pushFrameTime`/`rollingAverageMs`/`rollingFps`, `kRollingWindow=60` |
+ | 19 | HUD surfaces cull counters + collapse ratio + pool stats + memory report in one panel | **PASS** | `drawHud()`, single `ImGui::Begin("sample_09_scene")` window |
+ | 20 | TWO visibly distinct mask controls (cullMask u32 vs channels u8) | **PASS** | 4 layer-row checkboxes → `camera.cullMask` (visibility only); 1 separate light-channel checkbox → `light.channels` via `Scene::setLightChannels` (lighting/shadow only) — different SoA columns, never conflated (see main.cpp header comment + HudState comment) |
+ | 21 | vsync toggle drives the same setPresentMode+recreateSwapchain path as CLI | **PASS (present-mode only, MANUAL_VERIFICATION per the matrix's own routing)** | `drawHud()`'s vsync checkbox calls `device.setPresentMode()` + `device.recreateSwapchain()` — the identical two calls `--vsync` uses; same "present mode in use" log line |
+ | 22 | Stress-v2 A/B comparability contract | **PASS** | §5 — 30k instances, 4 pipeline/material variations (D28 axis), `--threads`/`--vsync` semantics held identical; wall-clock AND draws-submitted published jointly; sample 07's own report format untouched |
+@@ -316,10 +316,162 @@ uses a SYNC import, no async loading-state concept).
+ - The mid-task concurrent-writer incident (§0) is recorded honestly,
+   including that I removed the rogue forks' work rather than attempting
+   to reconcile inconsistent partial output — full ownership of every
+   delivered line rests with this session.
+ - Revert-discrimination evidence is captured for the one NEW,
+   correctness-critical algorithm this task introduces
+   (`splitByBlockAndGroup()`, §4 finding 3) per the binding constraint;
+   the D27 worker-guard check (§1 row 12) is a structural (compile-time-
+   adjacent) guarantee per draw_recording.h's own design, matching
+   rx_scene's own established precedent for that exact property.
++
++## 9. Fix-round delta (independent review response)
++
++Independent review (`.superpowers/sdd/2026-08-11-phase4-scene-assets/task-24-review.md`)
++found spec compliance **❌** on one binding criterion (matrix row 2) and 2
++Low doc-accuracy findings. All addressed in this round; verdicts below
++reflect the state AFTER these fixes, not the original submission.
++
++### H1(a) — BindlessTable sampledImages capacity too small for Sponza
++
++`samples/09_scene/main.cpp`: `sampledImages` raised from 64 to 256
++(matching sample 08's own identical justification — "sized for the
++largest scene this file actually loads, not just the default asset");
++`samplers` raised from 16 to 32 for the same reason. Comment rewritten to
++explicitly name Sponza and the review that found the gap, so a future
++reader doesn't have to rediscover the reasoning.
++
++### H1(b) — TextureCache::registerRealTexture() destroy-while-in-flight (shared rx_asset bug)
++
++`src/rx_asset/texture_cache.cpp`: both failure branches AFTER
++`uploader_.uploadImageMips()` succeeds (the `uploadImageMips()` failure
++branch itself, defensively, and the `registerSampledImage()` failure
++branch — the one that actually crashed) now call `uploader_.wait(
++uploader_.flush())` before returning, so the doomed `Texture2D`'s
++destructor never runs while its own already-recorded upload commands
++might still be in-flight. Mirrors this SAME class's own pre-existing
++`uploadFallbacks()` precedent (texture_cache.cpp, cites the identical
++validation error) byte-for-byte in spirit.
++
++**New discriminating regression test** (`src/rx_asset/tests/
++texture_cache_test.cpp`, `rx_asset_tests` binary — no Sponza/network fetch
++needed): `makeFixture()` gained an optional `Capacities` parameter
++(default unchanged, byte-identical for every pre-existing caller); a new
++fixture pins `sampledImages=4` — exactly the D11 fallback-texture count,
++zero spare — so `TextureCache::create()` itself still succeeds (consumes
++exactly 4) but the very next real `load()` call deterministically hits
++capacity exhaustion. Two loads in a row both fall back to the checkerboard
++handle, zero validation errors.
++
++**Revert-discrimination evidence** (required, captured directly): with the
++fix reverted, this exact test:
++```
++[error] [vulkan validation] Validation Error: [ UNASSIGNED-CoreValidation-DrawState-InvalidCommandBuffer-VkImage ]
++  ... bound VkImage ... was destroyed.
++[doctest] ... FATAL ERROR: test case CRASHED: SIGSEGV - Segmentation violation signal
++test cases: 2 | 1 passed | 1 failed
++```
++— the exact validation-error class and crash the review's own Finding H1
++describes, reproduced in isolation. Restored (`diff` against the pre-probe
++copy: empty); rebuilt; `rx_asset_tests`: 34/34 passed again (full suite,
++not just this one case).
++
++### Two additional bugs found while proving H1 end-to-end (not present in the original report)
++
++Fixing H1(a)+H1(b) was necessary but not sufficient — running the exact
++command the review specified (`sample_09_scene --scene sponza --present
++--validate` against the real fetched asset) surfaced two MORE real bugs,
++both specific to the custom-scene (`--scene <path>`) code path and never
++exercised by the default DamagedHelmet grid or the procedural `--stress`
++field (both of which happen to have exactly 1 submesh per instance):
++
++1. **D26.1 draw-data buffer undersized** (`populateImportedInstances()`):
++   sized `drawDataCapacityRows` off `renderableHandles.size()` (renderable
++   /instance count) instead of the TOTAL SUBMESH count across all
++   instances. Sponza imports as **1 renderable with 25 submeshes** (one
++   mesh, 25 materials) — `ViewLists::payloads` gets one row per
++   submesh-instance pairing (D26.1), so `updateSceneFrame()` wrote up to
++   25 `DrawDataGpu` rows into a 1-row-capacity buffer every frame: a real
++   heap buffer overflow. Symptom was NOT an immediate crash at the
++   overflow itself but a SIGSEGV several allocations later, inside
++   `libVkLayer_khronos_validation.so`, called from `recordForwardChunk()`'s
++   own `vkCmdDrawIndexed` — traced via `gdb -batch -x` (full backtrace in
++   this session's own working notes). Fixed: `populateImportedInstances()`
++   now takes `const rx::asset::Registry&` and sums
++   `registry.mesh(instance.mesh).submeshes.size()` over every instance.
++   `setupShadow()`'s own `shadowDrawDataCapacityRows` had the identical bug
++   (sized off `scene->renderableCount()`) — fixed to reuse the already-
++   correct `app.drawDataCapacityRows` instead (shadow casters are a subset
++   of all renderables, so the same upper bound applies).
++2. **`destroyApp()` never released `customMaterialBindings`' param
++   buffers**: `helmetMaterial`/`stressMaterialBindings` were both torn
++   down; the `--scene <path>` custom-materials vector (25 entries for
++   Sponza) was not. Symptom: `VUID-vkDestroyDevice-device-00378` ("child
++   objects... has not been destroyed"), 25 unfiltered validation errors at
++   process exit, `sample_09_scene: Vulkan validation layer reported errors
++   during the present loop` — caught by this task's own `--validate`
++   convention, not silently missed. Fixed: a loop mirroring the existing
++   `stressMaterialBindings` one, added to `destroyApp()`.
++
++Both found via direct `gdb`/log inspection against the real Sponza run,
++not guessed — see the raw log tails below.
++
++### End-to-end criterion proof (matrix row 2, after all 4 fixes)
++
++Sponza already on disk from the review's own fetch (verified:
++`assets/fetched/Sponza/glTF/`, 71 files). Command exactly as specified:
++
++```
++$ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json xvfb-run -a \
++    timeout --signal=TERM 12 build/linux-native/samples/09_scene/sample_09_scene \
++    --scene sponza --present --validate
++
++[info] sample_09_scene: '.../assets/fetched/Sponza/glTF/Sponza.gltf' loaded -- 1 renderable(s), 25 material(s)
++[info] rx_platform: gamepad connected id=... hasGyroSensor=false [...]
++[info] rx_material: saved 32 bytes of pipeline cache data to '...'
++[info] sample_09_scene: window closed cleanly
++```
++
++Unfiltered `Validation Error` count (grep -v the codebase's own documented
++false-positive guards): **0**. No `Vulkan validation layer reported
++errors` line (the process's own end-of-run check). No segfault, no
++SIGABRT, ran continuously until the 12s `timeout` sent `SIGTERM`, exited
++via the sample's own real `SDL_EVENT_QUIT` handling (`window closed
++cleanly`), not a raw kill. Matrix row 2 now genuinely **PASS**, not merely
++"reviewed correct" — actually run against real content, clean.
++
++### Full re-verification, both presets, after all 4 fixes
++
++- `linux-native`: full rebuild, zero compiler warnings; `ctest`: **29/29
++  PASSED** (77.4s) — includes `rx_asset_tests` at 34/34 (was 32 pre-fix;
++  +2 assertions from the new regression test's own 2 loads), and all 3
++  `sample_09_scene_*` targets.
++- `windows-cross-zig`: full rebuild, zero compiler warnings; `ctest -E
++  '...|sample'`: **13/13 PASSED** (110.8s) — `rx_asset_tests` (including
++  the new regression test) passes under Wine too.
++- `tools/package_samples.sh linux-native ...`: re-verified end-to-end,
++  zero `copy_required()` failures (09_scene's own binary is larger now
++  due to the capacity/materials changes; packaging itself is unaffected).
++
++### L1 — row-12 evidence citation corrected
++
++§1 row 12's table cell above now correctly cites the
++`sample_09_scene_stress_headless` `RX_ASSERT_MAIN_THREAD` abort (the
++mechanism that actually pins the `GeometryPool::bind()` D5 fix) instead of
++the near-tautological default-grid `setViolationHookForTests()` check,
++per the review's own finding.
++
++### L2 — README tag claim removed
++
++`README.md`'s "Phase 4 (complete)" paragraph no longer states
++`Tag \`v0.4.0-phase4\`.` as an accomplished fact (no such tag exists;
++tagging is a coordinator phase-exit action). Matches Phases 1-3's own
++paragraph style — no tag mentioned at all.
++
++### Files touched this round
++
++`samples/09_scene/main.cpp` (BindlessTable capacities; submesh-count-
++correct `drawDataCapacityRows`/`shadowDrawDataCapacityRows`; `destroyApp()`
++leak fix), `src/rx_asset/texture_cache.cpp` (the shared H1(b) fix),
++`src/rx_asset/tests/texture_cache_test.cpp` (new regression test +
++`makeFixture()` parameterization), `README.md` (L2), this report (L1 +
++this section).
+diff --git a/README.md b/README.md
+index 12917af..5656d53 100644
+--- a/README.md
++++ b/README.md
+@@ -90,21 +90,21 @@ For detailed build and run instructions per platform, including Steam Deck and m
+ - **third_party/** — Vendored dependencies (volk, vk-bootstrap, VMA, SDL3, GLM, spdlog)
+ 
+ ## Roadmap
+ 
+ **Phase 1 (complete):** Toolchain, platform abstraction, core library, RHI foundation, first triangle sample with both headless and present-mode rendering.
+ 
+ **Phase 2 (complete):** Runtime Slang compilation and shader reflection (`src/rx_shader/`); bindless descriptor management (`rx::rhi::BindlessTable`); reflection-driven pipeline layouts; three new samples (02_hotreload, 03_bindless_mesh, 04_streaming) plus expanded test coverage; CI + packaging for all four samples.
+ 
+ **Phase 3 (complete):** Render graph (`src/rx_graph/`, declarative passes, derived sync2 barriers, transient pooling, dynamic rendering); material system (`src/rx_material/`, Slang-module materials, lazy pipeline cache, COM-lite public API, hot reload); two new samples (05_multipass, 06_materials) with corresponding shader directories (`shaders/multipass/`, `shaders/material/`); expanded test coverage; CI + packaging for all six samples.
+ 
+-**Phase 4 (complete):** Job system (`src/rx_task/`) and a zero-per-frame-allocation chunked executor for parallel command recording; asset pipeline (`src/rx_asset/`, glTF import via fastgltf/meshoptimizer/Draco/MikkTSpace, pooled geometry, KTX2 textures); scene submission (`src/rx_scene/`, no-ECS render proxies, reversed-Z camera, frustum + shadow-caster culling with GPU instancing collapse); shadow quality bridge (`src/rx_shadow/`); an ImGui debug overlay (`src/rx_debug_ui/`); expanded platform input (mouse capture, gamepad, keyboard); three new samples (07_stress, 08_gltf_viewer, 09_scene — the phase-exit fly-through + stress-v2 benchmark) with corresponding shader directories; expanded test coverage; CI + packaging for all nine samples. Tag `v0.4.0-phase4`.
++**Phase 4 (complete):** Job system (`src/rx_task/`) and a zero-per-frame-allocation chunked executor for parallel command recording; asset pipeline (`src/rx_asset/`, glTF import via fastgltf/meshoptimizer/Draco/MikkTSpace, pooled geometry, KTX2 textures); scene submission (`src/rx_scene/`, no-ECS render proxies, reversed-Z camera, frustum + shadow-caster culling with GPU instancing collapse); shadow quality bridge (`src/rx_shadow/`); an ImGui debug overlay (`src/rx_debug_ui/`); expanded platform input (mouse capture, gamepad, keyboard); three new samples (07_stress, 08_gltf_viewer, 09_scene — the phase-exit fly-through + stress-v2 benchmark) with corresponding shader directories; expanded test coverage; CI + packaging for all nine samples.
+ 
+ **Phase 5 and beyond:** Rendering techniques (shadows beyond the single-map baseline, post-processing, upscaling); LOD/meshlet geometry processing; public SDK/DLL surface; tooling (GPU markers, profiling, validation). See [`docs/superpowers/specs/`](docs/superpowers/specs/) for design documents.
+ 
+ ## Testing
+ 
+ Run the full test suite (including headless triangle correctness gate):
+ 
+ ```sh
+ ctest --preset linux-native --output-on-failure
+ ```
+diff --git a/samples/09_scene/main.cpp b/samples/09_scene/main.cpp
+index 375e815..115a095 100644
+--- a/samples/09_scene/main.cpp
++++ b/samples/09_scene/main.cpp
+@@ -799,27 +799,42 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
+     }
+     app->allocator.emplace(std::move(*allocator));
+ 
+     auto uploader = rx::rhi::Uploader::create(*app->allocator, *app->device);
+     if (!uploader.has_value()) {
+         RX_LOG_ERROR("sample_09_scene: Uploader::create failed");
+         return nullptr;
+     }
+     app->uploader.emplace(std::move(*uploader));
+ 
+-    // Bindless capacities -- generous headroom for the helmet's 5 PBR
+-    // textures + samplers, the shadow map + comparison sampler, the
+-    // per-pass DrawDataGpu/ShadowDrawData storage buffers, and ImGui's own
+-    // font atlas (registered by the vendored backend, NOT through this
++    // Bindless capacities [fix round, Finding H1(a)]: sized for the LARGEST
++    // scene this file actually loads, not just the default DamagedHelmet
++    // grid -- `--scene sponza` (present-mode) goes through this SAME
++    // BindlessTable, and Sponza's own ~25 materials x up to ~3 textures
++    // each exhausted a previous, helmet-only-justified 64 partway through
++    // import (an independent review reproduced this directly: real
++    // capacity-exhaustion errors starting at material#20, which then
++    // exposed a separate TextureCache lifecycle bug on the failure path --
++    // see texture_cache.cpp's own registerRealTexture() fix). Mirrors
++    // samples/08_gltf_viewer's own identical 256 (that sample's own
++    // largest supported scene is likewise arbitrary imported glTF content,
++    // not just its own default asset) rather than inventing a smaller,
++    // scene-specific number that would need re-justifying every time this
++    // sample's own `--scene` surface grows. `samplers` bumped from 16 to
++    // 32 for the same reason (more distinct materials plausibly means more
++    // distinct wrap/filter combinations, even after TextureCache's own
++    // per-descriptor sampler dedup) -- shadow map + comparison sampler,
++    // the per-pass DrawDataGpu/ShadowDrawData storage buffers, and ImGui's
++    // own font atlas (registered by the vendored backend, NOT through this
+     // table -- see rx_debug_ui/overlay.h's own FONT/TEXTURE UPLOAD
+-    // section).
+-    rx::rhi::BindlessTable::Capacities capacities{/*sampledImages=*/64, /*samplers=*/16, /*storageBuffers=*/8};
++    // section) round out the remaining headroom.
++    rx::rhi::BindlessTable::Capacities capacities{/*sampledImages=*/256, /*samplers=*/32, /*storageBuffers=*/8};
+     capacities.comparisonSamplers = 1;
+     auto bindless = rx::rhi::BindlessTable::create(app->device->physicalDevice(), app->device->device(), capacities);
+     if (!bindless.has_value()) {
+         RX_LOG_ERROR("sample_09_scene: BindlessTable::create failed");
+         return nullptr;
+     }
+     app->bindless.emplace(std::move(*bindless));
+     app->deletionQueue.emplace();
+ 
+     const std::filesystem::path basePath = basePathDirectory();
+@@ -955,20 +970,30 @@ void destroyShadowResources(App& app) {
+ 
+ void destroyApp(App& app) {
+     if (app.device.has_value() && app.device->device() != VK_NULL_HANDLE) {
+         vkDeviceWaitIdle(app.device->device());
+     }
+     app.overlay.reset();  // must precede bindless/device teardown -- owns its own descriptor pool/pipeline/font texture.
+     destroyShadowResources(app);
+     for (MaterialGpuBinding& binding : app.stressMaterialBindings) {
+         binding.paramBuffer.reset();
+     }
++    // [Fix round] `customMaterialBindings` (--scene <path> present-mode
++    // overrides, e.g. Sponza's own 25 materials) was never torn down here
++    // -- a real resource leak an independent review's own end-to-end
++    // Sponza run surfaced directly: VUID-vkDestroyDevice-device-00378
++    // ("child objects... has not been destroyed") fired once per leaked
++    // material param VkBuffer at process exit. helmetMaterial/
++    // stressMaterialBindings above were both handled; this one was missed.
++    for (MaterialGpuBinding& binding : app.customMaterialBindings) {
++        binding.paramBuffer.reset();
++    }
+     app.helmetMaterial.paramBuffer.reset();
+     if (app.materialParamPool != VK_NULL_HANDLE) {
+         vkDestroyDescriptorPool(app.device->device(), app.materialParamPool, nullptr);
+         app.materialParamPool = VK_NULL_HANDLE;
+     }
+     if (app.materialParamSetLayout != VK_NULL_HANDLE) {
+         vkDestroyDescriptorSetLayout(app.device->device(), app.materialParamSetLayout, nullptr);
+         app.materialParamSetLayout = VK_NULL_HANDLE;
+     }
+     if (app.drawDataBufferHandle.isValid() && app.bindless.has_value()) {
+@@ -1342,25 +1367,47 @@ bool setupImportedMaterials(App& app, const rx::asset::Registry& registry, const
+                                                               : app.customMaterialBindings.front().handle;
+     };
+     return true;
+ }
+ 
+ // Populates `scene`/`drawListBuilder` from a real ImportResult's own
+ // `scene.instances` (--scene <path> present-mode override, e.g. Sponza) --
+ // every instance keeps its DEFAULT layers(~0u)/channels(0xFF) (no
+ // grid-row-style demo grouping; that is the deterministic default
+ // composition's own feature, not a property of arbitrary imported
+-// content).
+-bool populateImportedInstances(App& app, const rx::asset::ImportedScene& scene) {
++// content). `registry` is needed to size the D26.1 draw-data buffer
++// correctly [fix round: a real bug an independent review's own end-to-end
++// Sponza run surfaced -- see this function's own drawDataCapacityRows
++// comment below].
++bool populateImportedInstances(App& app, const rx::asset::Registry& registry, const rx::asset::ImportedScene& scene) {
+     app.renderableHandles.clear();
+     app.renderableHandles.reserve(scene.instances.size());
++    // [Fix round] Total SUBMESH count across every instance, NOT the
++    // renderable (instance) count -- `ViewLists::payloads` gets one row
++    // PER SUBMESH-INSTANCE PAIRING (D26.1), and a single renderable's own
++    // mesh can carry many submeshes (Sponza: 1 renderable, 25 submeshes,
++    // one per material -- confirmed directly against a real fetched
++    // Sponza import). Sizing `drawDataCapacityRows` off
++    // `renderableHandles.size()` alone (1, for Sponza) let
++    // updateSceneFrame() write up to 25 DrawDataGpu rows into a
++    // 1-row-capacity buffer every frame -- a real heap buffer overflow,
++    // reproduced directly as a validation-layer-internal segfault inside
++    // vkCmdDrawIndexed (the corrupted heap state manifesting several
++    // allocations later, not at the write itself) the first time this
++    // task's own review ran `--scene sponza --present --validate` against
++    // real content. The default DamagedHelmet grid and the procedural
++    // --stress field both happen to have exactly 1 submesh per instance,
++    // which is why this was never hit before a real multi-submesh mesh
++    // (Sponza) was actually imported through this code path.
++    uint32_t totalSubmeshCount = 0;
+     for (const rx::asset::InstanceRecord& instance : scene.instances) {
++        totalSubmeshCount += static_cast<uint32_t>(registry.mesh(instance.mesh).submeshes.size());
+         rx::scene::RenderableDesc desc;
+         desc.mesh = instance.mesh;
+         desc.transform = instance.worldTransform;
+         app.renderableHandles.push_back(app.scene->createRenderable(desc));
+     }
+     if (app.renderableHandles.empty()) {
+         RX_LOG_ERROR("sample_09_scene: imported scene produced zero renderables");
+         return false;
+     }
+     app.lightHandle = app.scene->createDirectionalLight(
+@@ -1378,21 +1425,21 @@ bool populateImportedInstances(App& app, const rx::asset::ImportedScene& scene)
+     app.flyCamera.camera.position = center + glm::vec3(0.0F, radius * 0.4F, radius * 1.6F);
+     const glm::vec3 lookDir = glm::normalize(center - app.flyCamera.camera.position);
+     app.flyCamera.pitchRadians = std::asin(std::clamp(lookDir.y, -1.0F, 1.0F));
+     app.flyCamera.yawRadians = std::atan2(-lookDir.x, -lookDir.z);
+     app.flyCamera.syncOrientation();
+     app.flyCamera.camera.nearPlane = std::max(0.01F, radius * 0.01F);
+     app.flyCamera.camera.cullingFarPlane = radius * 8.0F;
+     app.flyCamera.camera.cullMask = ~0u;
+     app.moveSpeed = std::max(radius * 0.5F, 1.0F);
+ 
+-    app.drawDataCapacityRows = static_cast<uint32_t>(app.renderableHandles.size());
++    app.drawDataCapacityRows = std::max<uint32_t>(totalSubmeshCount, 1);
+     app.drawDataRows.assign(app.drawDataCapacityRows, rx::material::DrawDataGpu{});
+     const VkDeviceSize bytes = static_cast<VkDeviceSize>(app.drawDataCapacityRows) * sizeof(rx::material::DrawDataGpu);
+     app.drawDataBuffer = app.allocator->createHostVisibleBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
+     if (!app.drawDataBuffer.has_value()) {
+         RX_LOG_ERROR("sample_09_scene: createHostVisibleBuffer (imported-scene draw data) failed");
+         return false;
+     }
+     app.drawDataBufferHandle = app.bindless->registerStorageBuffer(app.drawDataBuffer->handle(), bytes);
+     if (!app.drawDataBufferHandle.isValid()) {
+         RX_LOG_ERROR("sample_09_scene: registerStorageBuffer (imported-scene draw data) failed");
+@@ -1725,21 +1772,32 @@ bool setupShadow(App& app) {
+     for (const rx::asset::AABB& b : app.scene->worldBoundsSpan()) {
+         totalBounds = rx::asset::AABB::unionOf(totalBounds, b);
+     }
+     if (!totalBounds.isValid()) {
+         totalBounds = rx::asset::AABB{glm::vec3(-1.0F), glm::vec3(1.0F)};
+     }
+     const glm::mat4 lightView = rx::shadow::lightSpaceView(glm::normalize(app.lightDirWorld));
+     const float depthPadding = 0.5F * glm::length(totalBounds.max - totalBounds.min) + 1.0F;
+     app.shadowFit = rx::shadow::fitShadowFrustum(totalBounds.min, totalBounds.max, lightView, kShadowMapResolution, depthPadding);
+ 
+-    app.shadowDrawDataCapacityRows = static_cast<uint32_t>(app.scene->renderableCount());
++    // [Fix round] Reuse the SAME (already-computed, submesh-count-correct
++    // -- see populateImportedInstances()'s own comment) capacity the
++    // forward pass's own drawDataCapacityRows uses, NOT
++    // scene->renderableCount() -- ShadowLists::payloads is bounded by the
++    // identical "one row per submesh-instance pairing" shape ViewLists::
++    // payloads is (shadow casters are a SUBSET of all renderables), so the
++    // same undercount bug (renderable count != submesh count for a
++    // multi-submesh mesh like Sponza) applies here too. setupShadow() is
++    // always called AFTER populateHelmetGrid()/populateImportedInstances()
++    // in every call site, so `app.drawDataCapacityRows` is already correct
++    // by this point.
++    app.shadowDrawDataCapacityRows = app.drawDataCapacityRows;
+     app.shadowDrawDataRows.assign(app.shadowDrawDataCapacityRows, rx::shadow::ShadowDrawData{});
+     const VkDeviceSize shadowBytes = static_cast<VkDeviceSize>(app.shadowDrawDataCapacityRows) * sizeof(rx::shadow::ShadowDrawData);
+     app.shadowDrawDataBuffer =
+         app.allocator->createHostVisibleBuffer(std::max<VkDeviceSize>(shadowBytes, sizeof(rx::shadow::ShadowDrawData)),
+                                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
+     if (!app.shadowDrawDataBuffer.has_value()) {
+         RX_LOG_ERROR("sample_09_scene: createHostVisibleBuffer (shadow draw data) failed");
+         return false;
+     }
+     app.shadowDrawDataBufferHandle = app.bindless->registerStorageBuffer(
+@@ -2694,21 +2752,22 @@ int runPresent(const Args& args) {
+             app->registry->importGltf(scenePath, *app->geometryPool, *app->scheduler, app->textureCache.get());
+         if (!result.ok()) {
+             RX_LOG_ERROR("sample_09_scene: import of '{}' failed: {}", scenePath.string(), rx::asset::importErrorName(result.error));
+             frameSync.reset();
+             destroyApp(*app);
+             return 1;
+         }
+         app->scene.emplace(rx::scene::meshBoundsFromRegistry(*app->registry));
+         app->drawListBuilder.emplace(rx::scene::meshSubmeshesFromRegistry(*app->registry),
+                                       rx::scene::materialResolveFromRegistry(*app->registry));
+-        if (!setupImportedMaterials(*app, *app->registry, result.materials) || !populateImportedInstances(*app, result.scene)) {
++        if (!setupImportedMaterials(*app, *app->registry, result.materials) ||
++            !populateImportedInstances(*app, *app->registry, result.scene)) {
+             frameSync.reset();
+             destroyApp(*app);
+             return 1;
+         }
+         buildPipelineTokenMap(*app, app->customMaterialBindings);
+         if (!setupShadow(*app)) {
+             frameSync.reset();
+             destroyApp(*app);
+             return 1;
+         }
+diff --git a/src/rx_asset/tests/texture_cache_test.cpp b/src/rx_asset/tests/texture_cache_test.cpp
+index da67f1b..84ca876 100644
+--- a/src/rx_asset/tests/texture_cache_test.cpp
++++ b/src/rx_asset/tests/texture_cache_test.cpp
+@@ -72,21 +72,23 @@ struct TcTestFixture {
+     rx::platform::Window window;
+     rx::rhi::Context context;
+     rx::rhi::Device device;
+     rx::rhi::Allocator allocator;
+     rx::rhi::Uploader uploader;
+     rx::rhi::BindlessTable bindless;
+     rx::rhi::DeletionQueue deletionQueue;
+     std::unique_ptr<TextureCache> cache;
+ };
+ 
+-std::optional<TcTestFixture> makeFixture(const char* title) {
++std::optional<TcTestFixture> makeFixture(
++    const char* title,
++    rx::rhi::BindlessTable::Capacities capacities = {/*sampledImages=*/64, /*samplers=*/8, /*storageBuffers=*/1}) {
+     auto window = rx::platform::Window::create(title, 64, 64, /*visible=*/false);
+     if (!window.has_value()) {
+         MESSAGE("no display backend available, skipping TextureCache test");
+         return std::nullopt;
+     }
+     auto extensions = window->requiredVulkanInstanceExtensions();
+     if (extensions.empty()) {
+         MESSAGE("video driver reports no Vulkan surface extensions (e.g. dummy driver), skipping TextureCache test");
+         return std::nullopt;
+     }
+@@ -94,21 +96,25 @@ std::optional<TcTestFixture> makeFixture(const char* title) {
+     REQUIRE(context.has_value());
+     VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
+     REQUIRE(surface != VK_NULL_HANDLE);
+     auto device = rx::rhi::Device::create(*context, surface);
+     REQUIRE(device.has_value());
+     auto allocator = rx::rhi::Allocator::create(*context, *device);
+     REQUIRE(allocator.has_value());
+     auto uploader = rx::rhi::Uploader::create(*allocator, *device);
+     REQUIRE(uploader.has_value());
+ 
+-    rx::rhi::BindlessTable::Capacities capacities{/*sampledImages=*/64, /*samplers=*/8, /*storageBuffers=*/1};
++    // `capacities` defaults to the pre-existing hardcoded value every
++    // TEST_CASE in this file relied on before this parameter existed --
++    // byte-identical behavior for every caller that doesn't pass one
++    // explicitly. [Fix round, Finding H1(b)] The capacity-exhaustion
++    // regression TEST_CASE below is the one caller that does.
+     auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
+     REQUIRE(bindless.has_value());
+ 
+     rx::rhi::DeletionQueue deletionQueue;
+ 
+     // `cache` stays null here -- see this struct's own comment.
+     return TcTestFixture{std::move(*window),      std::move(*context),   std::move(*device),
+                           std::move(*allocator),    std::move(*uploader),  std::move(*bindless),
+                           std::move(deletionQueue), nullptr};
+ }
+@@ -818,20 +824,81 @@ TEST_CASE("TextureCache: a real JPEG loads via stb to a real, non-fallback textu
+     if (!fixture.has_value()) {
+         return;
+     }
+     makeCache(*fixture);
+     TextureHandle handle = fixture->cache->load(fixturePath("quadrant.jpg"), TextureRole::BaseColor);
+     REQUIRE(handle.isValid());
+     CHECK_FALSE(fixture->cache->resolve(handle).isFallback);
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
++// ===== Bindless capacity exhaustion (fix round, Finding H1(b)) ==============
++//
++// An independent review of samples/09_scene fetched real Sponza content
++// (~25 materials) against that sample's own too-small BindlessTable
++// (sampledImages=64) and reproduced a genuine crash: registerRealTexture()
++// (texture_cache.cpp) already calls Uploader::uploadImageMips() -- which
++// RECORDS real GPU commands referencing the new Texture2D's own VkImage --
++// BEFORE attempting BindlessTable::registerSampledImage(); when THAT call
++// fails (capacity exhausted), the function returned immediately, letting
++// the local Texture2D's destructor destroy a VkImage its own
++// already-recorded (not yet flushed/awaited) upload commands still
++// reference -- "UNASSIGNED-CoreValidation-DrawState-InvalidCommandBuffer-
++// VkImage: ... bound VkImage ... was destroyed", then a segfault. No
++// earlier test ever drove bindless sampled-image capacity to genuine
++// exhaustion during a real registerRealTexture() call, so this path had
++// never been exercised. This TEST_CASE reproduces the exact failure mode
++// in isolation (no Sponza/network fetch needed): a fixture whose
++// sampledImages capacity is EXACTLY the D11 fallback-texture count (4:
++// checkerboard + white + flat-normal + neutral-MR, see
++// buildFallbackTextures()'s own comment) -- TextureCache::create() itself
++// must still succeed (it consumes exactly 4, zero spare), but the very
++// NEXT real texture load is guaranteed to hit
++// BindlessTable::registerSampledImage()'s own capacity-exhaustion
++// rejection deterministically, every run, on any device.
++TEST_CASE("TextureCache: bindless sampled-image capacity exhaustion at registerRealTexture() -- checkerboard "
++          "fallback, no crash, zero validation errors [fix round, Finding H1(b), independent review of #15]") {
++    rx::rhi::BindlessTable::Capacities tightCapacities{/*sampledImages=*/4, /*samplers=*/8, /*storageBuffers=*/1};
++    auto fixture = makeFixture("rx_asset_tc_capexhaust", tightCapacities);
++    if (!fixture.has_value()) {
++        return;
++    }
++    // TextureCache::create() -> buildFallbackTextures() consumes exactly 4
++    // sampled-image slots (checkerboard + white + flat-normal +
++    // neutral-MR) -- this must still succeed against a capacity of
++    // exactly 4, proving the fixture itself is sized precisely, not
++    // accidentally too small to even construct a cache.
++    makeCache(*fixture);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++
++    // The 5th sampled-image registration attempt: capacity is already
++    // fully, deterministically exhausted. Before the fix, this crashed
++    // (destroy-while-upload-commands-still-reference-the-image); after
++    // the fix, registerRealTexture() flushes+awaits the already-recorded
++    // upload commands before the doomed Texture2D is destroyed, and
++    // load() falls back to the checkerboard handle via its own
++    // established failure-path convention (same as every other
++    // load-failure TEST_CASE above).
++    TextureHandle handle = fixture->cache->load(fixturePath("quadrant.png"), TextureRole::BaseColor);
++    CHECK(handle == fixture->cache->checkerboardHandle());
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++
++    // A SECOND exhausted-capacity load, immediately after the first --
++    // proves the fix doesn't merely survive ONE failure by accident (e.g.
++    // some residual GPU idle state from fixture construction happening to
++    // paper over the hazard) but genuinely leaves the Uploader/BindlessTable
++    // in a consistent, reusable state.
++    TextureHandle secondHandle = fixture->cache->load(fixturePath("quadrant.jpg"), TextureRole::Normal);
++    CHECK(secondHandle == fixture->cache->checkerboardHandle());
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
+ // ===== Sampler cache (G6): dedup + negative test ============================
+ 
+ TEST_CASE("TextureCache::getOrCreateSampler: two identical glTF samplers dedup to ONE VkSampler; distinct "
+           "state yields distinct samplers [G6 dedup + negative test]") {
+     auto fixture = makeFixture("rx_asset_tc_samplercache");
+     if (!fixture.has_value()) {
+         return;
+     }
+     makeCache(*fixture);
+ 
+diff --git a/src/rx_asset/texture_cache.cpp b/src/rx_asset/texture_cache.cpp
+index 1a65fc5..0f17745 100644
+--- a/src/rx_asset/texture_cache.cpp
++++ b/src/rx_asset/texture_cache.cpp
+@@ -193,27 +193,50 @@ TextureHandle TextureCache::registerRealTexture(TextureRole role, VkFormat forma
+         VK_IMAGE_USAGE_SAMPLED_BIT, mipLevels, rx::rhi::MemoryCategory::Texture);
+     if (!texture.has_value()) {
+         RX_LOG_ERROR("rx_asset: TextureCache: Texture2D::createForPresuppliedMips failed ({}x{}, {} levels, format={})",
+                      width, height, mipLevels, static_cast<int>(format));
+         return TextureHandle{};
+     }
+ 
+     if (!uploader_.uploadImageMips(*texture, uploadLevels)) {
+         RX_LOG_ERROR("rx_asset: TextureCache: Uploader::uploadImageMips failed ({}x{}, {} levels)", width, height,
+                      uploadLevels.size());
++        // [Fix round, Finding H1(b)] `uploadImageMips()` may already have
++        // recorded partial GPU commands referencing `texture`'s own VkImage
++        // before reporting failure -- ensure they are flushed and their
++        // completion awaited before this scope's own destructor destroys
++        // that image at the `return` below, matching this SAME class's own
++        // established "flush()+wait() before an upload-recorded resource
++        // is safe to destroy" precedent (see uploadFallbacks()'s own header
++        // comment, above, which names the identical validation error --
++        // UNASSIGNED-CoreValidation-DrawState-InvalidCommandBuffer-VkImage,
++        // "bound VkImage ... was destroyed" -- this exact omission
++        // reproduces on this branch too). `flush()`/`wait()` are both
++        // no-ops-but-safe when nothing was actually recorded (Uploader's
++        // own documented "trivially-complete ticket" contract).
++        uploader_.wait(uploader_.flush());
+         return TextureHandle{};
+     }
+ 
+     rx::rhi::BindlessHandle bindlessHandle =
+         bindless_.registerSampledImage(texture->view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+     if (!bindlessHandle.isValid()) {
+         RX_LOG_ERROR("rx_asset: TextureCache: BindlessTable::registerSampledImage failed (capacity exhausted?)");
++        // [Fix round, Finding H1(b) -- the defect an independent review
++        // reproduced against real Sponza content, capacity-exhaustion
++        // mid-import] `uploadImageMips()` above already succeeded on this
++        // branch, meaning `texture`'s own upload commands are DEFINITELY
++        // recorded -- the SAME reasoning as the branch above applies with
++        // even more force here (this is the branch that actually crashed):
++        // flush()+wait() before `texture`'s destructor runs at `return`,
++        // never destroy-while-possibly-in-flight.
++        uploader_.wait(uploader_.flush());
+         return TextureHandle{};
+     }
+ 
+     // [FG9] Real VMA-reported bytes (Texture2D::allocatedBytes(), NOT the
+     // nominal width*height*bpp request -- may exceed it for alignment/
+     // block-granularity padding, matching this codebase's existing
+     // accounting convention, e.g. GeometryPool's own vertexBufferAllocatedBytes()
+     // comment) -- captured BEFORE `texture` is moved into the Entry below.
+     uint64_t allocatedBytes = texture->allocatedBytes();
+ 
