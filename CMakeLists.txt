@@ -150,3 +150,4 @@ add_subdirectory(samples/07_stress)
 # before 08_gltf_viewer (the first sample to link it).
 add_subdirectory(samples/common)
 add_subdirectory(samples/08_gltf_viewer)
+add_subdirectory(samples/09_scene)
