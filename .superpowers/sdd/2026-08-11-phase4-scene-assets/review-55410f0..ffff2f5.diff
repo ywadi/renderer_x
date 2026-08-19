@@ -1,0 +1,1420 @@
+=== COMMITS ===
+ffff2f5 docs: closure-sweep report -- five-item no-deferral conversion evidence
+5a10901 ci: add restore-keys cache fallback and per-ref concurrency serialization
+1d07330 test(rx_asset): combined glTF-import -> TextureCache -> pixel test (Task 14 minor 4.6)
+25bf348 fix(samples): wire FrameSync::advanceFrame(Allocator*) into sample 04's frame loop
+27926ec fix(third_party): patch vendored MikkTSpace shift-by-32 UB (mikktspace.c:1667)
+b1a304f fix(rx_rhi_vk): make GPU test binaries fail on teardown-time validation errors
+
+=== STAT ===
+ .github/workflows/ci.yml                           |  70 ++++
+ .../closure-sweep-report.md                        | 377 +++++++++++++++++++++
+ samples/04_streaming/main.cpp                      |  56 ++-
+ src/rx_asset/tests/doctest_main.cpp                |  27 ++
+ src/rx_asset/tests/doctest_main_gltf_gpu.cpp       |  24 ++
+ src/rx_asset/tests/texture_cache_test.cpp          |  90 +++++
+ src/rx_graph/tests/doctest_main_gpu.cpp            |  24 ++
+ src/rx_material/tests/doctest_main.cpp             |  24 ++
+ src/rx_rhi_vk/include/rx_rhi_vk/context.h          |  23 ++
+ src/rx_rhi_vk/src/context.cpp                      |  14 +
+ src/rx_rhi_vk/tests/doctest_main.cpp               |  29 ++
+ third_party/CMakeLists.txt                         |  24 +-
+ .../patches/mikktspace-ubsan-shift-fix.patch       |  34 ++
+ 13 files changed, 813 insertions(+), 3 deletions(-)
+
+=== FULL DIFF (U10) ===
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index d8c4c6d..2825567 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -1,18 +1,34 @@
+ name: CI
+ 
+ on:
+   push:
+     branches: [main]
+   pull_request:
+     branches: [main]
+ 
++# Closure-sweep item 5(b) [build-time incident, ledgered]: close-together
++# pushes to the same ref were observed racing each other's cache save
++# ("Unable to reserve cache...") -- the loser rebuilds cold instead of
++# hitting the winner's just-saved cache. Serializing runs per ref removes
++# the race outright (only one run per group executes at a time).
++# `cancel-in-progress: true` is deliberately chosen over queuing: an
++# outdated commit's CI run has no value once a newer push to the SAME ref
++# exists (its result will never be acted on -- the newer commit is what
++# actually lands), so cancelling it immediately frees the runner instead
++# of finishing a run nobody needs. `github.ref` (not github.sha) is the
++# group key on purpose -- it is what makes pushes to the SAME branch/PR
++# serialize while a DIFFERENT branch/PR's runs stay fully independent.
++concurrency:
++  group: ci-${{ github.ref }}
++  cancel-in-progress: true
++
+ # Pinned zig 0.16.0 toolchain download, shared by both jobs below. The
+ # sha256 is the real published checksum for zig-x86_64-linux-0.16.0.tar.xz,
+ # taken directly from https://ziglang.org/download/index.json (the
+ # "0.16.0" -> "x86_64-linux" -> "shasum" field) -- never invented. It was
+ # additionally cross-checked by downloading the tarball, verifying this
+ # checksum against it, extracting it, and confirming the extracted `zig`
+ # binary's own sha256 is byte-for-byte identical to this repository's
+ # already-in-use toolchain/zig/zig (gitignored; fetched once by a
+ # developer) on the machine this workflow was authored on.
+ env:
+@@ -122,44 +138,84 @@ jobs:
+           path: third_party/slang-prebuilt
+           key: slang-prebuilt-linux-native-${{ hashFiles('tools/fetch_slang.cmake') }}
+ 
+       # Phase 4 Stage 1 Task 13 [spec D16]: DamagedHelmet is the
+       # mandatory glTF import gate asset (rx_asset_gltf_gpu_tests'
+       # damaged_helmet_test.cpp) -- cached exactly like Slang above
+       # (tools/fetch_assets.sh's own versioned marker file makes a
+       # version bump self-invalidating). Sponza is intentionally never
+       # fetched here (--sponza is a local-only flag this workflow never
+       # passes, per D16).
++      # Closure-sweep item 5(a) [build-time incident, ledgered]: this key
++      # rotates on any tools/fetch_assets.sh edit (e.g. a version-marker
++      # bump), and without a restore-keys fallback that rotation forced a
++      # 100% cold re-fetch instead of a warm partial -- costly for
++      # DamagedHelmet specifically only in wall-clock/API-rate terms (the
++      # actual fetch is small), but the SAME pattern below matters far
++      # more for .deps-cache (see that step's own comment). Safe to fall
++      # back to a stale same-prefix cache here: fetch_assets.sh's own
++      # per-asset VERSION-named marker file (DAMAGED_HELMET_MARKER, this
++      # script's own header comment) makes a stale restore self-
++      # correcting -- either the marker matches the current pinned
++      # version (fast no-op, correct) or it doesn't (the version-specific
++      # filename simply isn't found, so the script re-fetches and re-
++      # verifies checksums from scratch) -- never a silent stale-asset
++      # reuse.
+       - name: Cache fetched test assets (DamagedHelmet)
+         uses: actions/cache@v5
+         with:
+           path: assets/fetched
+           key: fetched-assets-damagedhelmet-${{ hashFiles('tools/fetch_assets.sh') }}
++          restore-keys: |
++            fetched-assets-damagedhelmet-
+ 
+       - name: Fetch test assets (DamagedHelmet)
+         run: tools/fetch_assets.sh
+ 
+       # Unlike the Slang cache above, this key is job-specific
+       # (deps-cache-linux-native-..., not shared with windows-cross-zig):
+       # DepCache.cmake's own cache key already includes the target triple
+       # and zig version, so this preset's .deps-cache/ subdirectories never
+       # collide with the other job's -- but actions/cache treats an exact
+       # key match across concurrent jobs as a single cache *entry*, and
+       # only the first job to finish successfully saves it. Two jobs
+       # racing on one shared key would starve whichever job loses the
+       # race of ever getting its own dependencies cached. A per-preset key
+       # keeps each job's cache independent.
++      #
++      # Closure-sweep item 5(a) [build-time incident, ledgered]: this key
++      # rotates on ANY third_party/CMakeLists.txt edit (adding/pinning a
++      # dependency, tweaking one's CMAKE_ARGS, etc.) -- common -- and
++      # without a restore-keys fallback, that rotation forced a ~20-minute
++      # 100% cold rebuild of EVERY dependency instead of a warm partial
++      # rebuild of only the changed one(s). Safe to fall back to a stale
++      # same-prefix cache: DepCache.cmake's own rx_add_cached_dependency()
++      # (cmake/DepCache.cmake) keys EACH dependency's own subdirectory
++      # independently on that dependency's full content/config hash
++      # (name-<hash>, this file's own header comment) and only ever
++      # CONSULTS the exact subdirectory matching the CURRENT hash -- a
++      # restored stale cache's unrelated/outdated subdirectories are
++      # simply never looked up (no ".rx-built" marker under the NEW hash
++      # means a clean [dep-cache] MISS and a real rebuild for exactly that
++      # dependency, same as a cold cache) and cost nothing but harmless
++      # extra disk space; every dependency whose hash DIDN'T change still
++      # hits its own already-built subdirectory. I.e. this mechanism
++      # cannot serve a stale/incorrect build for a changed dependency --
++      # it can only ever skip rebuilding dependencies that provably did
++      # NOT change.
+       - name: Cache third-party dependency builds
+         uses: actions/cache@v5
+         with:
+           path: .deps-cache
+           key: deps-cache-linux-native-${{ hashFiles('third_party/CMakeLists.txt', 'cmake/DepCache.cmake', 'cmake/toolchains/linux-native.cmake', 'cmake/zig-wrappers/*') }}
++          restore-keys: |
++            deps-cache-linux-native-
+ 
+       - name: Configure
+         run: cmake --preset linux-native
+ 
+       - name: Build
+         run: cmake --build --preset linux-native
+ 
+       # lavapipe provides the Vulkan device; Xvfb provides the display SDL3
+       # needs to initialize a (hidden) window. This is not a soft/best-effort
+       # run: verified locally (forcing VK_ICD_FILENAMES to lavapipe only, and
+@@ -333,34 +389,48 @@ jobs:
+         uses: actions/cache@v5
+         with:
+           path: third_party/slang-prebuilt
+           key: slang-prebuilt-windows-cross-zig-${{ hashFiles('tools/fetch_slang.cmake') }}
+ 
+       # Phase 4 Stage 1 Task 13: rx_asset_gltf_gpu_tests (including
+       # damaged_helmet_test.cpp) is not in this job's GPU-test exclusion
+       # list below (same posture as the pre-existing rx_asset_tests) --
+       # see the linux-native job's identically-worded step for the full
+       # rationale.
++      # Closure-sweep item 5(a) -- same restore-keys fallback and the same
++      # rationale as the linux-native job's identically-worded step above
++      # (a stale same-prefix restore is safe here: fetch_assets.sh's own
++      # version-named marker file self-corrects).
+       - name: Cache fetched test assets (DamagedHelmet)
+         uses: actions/cache@v5
+         with:
+           path: assets/fetched
+           key: fetched-assets-damagedhelmet-${{ hashFiles('tools/fetch_assets.sh') }}
++          restore-keys: |
++            fetched-assets-damagedhelmet-
+ 
+       - name: Fetch test assets (DamagedHelmet)
+         run: tools/fetch_assets.sh
+ 
++      # Closure-sweep item 5(a) -- same restore-keys fallback and the same
++      # rationale as the linux-native job's identically-worded step above
++      # (DepCache.cmake's own per-dependency content hashing makes a
++      # stale same-prefix restore safe: it can only skip rebuilding
++      # dependencies that provably did not change, never serve a stale
++      # one).
+       - name: Cache third-party dependency builds
+         uses: actions/cache@v5
+         with:
+           path: .deps-cache
+           key: deps-cache-windows-cross-zig-${{ hashFiles('third_party/CMakeLists.txt', 'cmake/DepCache.cmake', 'cmake/toolchains/windows-cross-zig.cmake', 'cmake/zig-wrappers/*') }}
++          restore-keys: |
++            deps-cache-windows-cross-zig-
+ 
+       - name: Configure
+         run: cmake --preset windows-cross-zig
+ 
+       - name: Build
+         run: cmake --build --preset windows-cross-zig
+ 
+       # The windows-cross-zig preset builds with RX_TRACY=OFF (Tracy's profiler
+       # thread hangs at process exit under CI cold-prefix Wine; profiling has no
+       # value through Wine anyway -- see CMakeLists.txt's RX_TRACY note). This
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/closure-sweep-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/closure-sweep-report.md
+new file mode 100644
+index 0000000..9a02a4a
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/closure-sweep-report.md
+@@ -0,0 +1,377 @@
++# Closure-sweep report — no-deferral conversions (Stage 1)
++
++Base commit `55410f0`. All five items closed, one commit each, in this
++order:
++
++| Item | Commit | Subject |
++|---|---|---|
++| 1 | `b1a304f` | fix(rx_rhi_vk): make GPU test binaries fail on teardown-time validation errors |
++| 2 | `27926ec` | fix(third_party): patch vendored MikkTSpace shift-by-32 UB (mikktspace.c:1667) |
++| 3 | `25bf348` | fix(samples): wire FrameSync::advanceFrame(Allocator\*) into sample 04's frame loop |
++| 4 | `1d07330` | test(rx_asset): combined glTF-import -> TextureCache -> pixel test (Task 14 minor 4.6) |
++| 5 | `5a10901` | ci: add restore-keys cache fallback and per-ref concurrency serialization |
++
++Final CI-equivalent gate, run after all five commits:
++
++- linux-native: full `cmake --build --preset linux-native` clean, then
++  `ctest --preset linux-native --output-on-failure` — **20/20 passed**,
++  106.36s total.
++- windows-cross-zig: full `cmake --build --preset windows-cross-zig`
++  clean (147/147 targets), then the exact CI ctest invocation
++  (`ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|sample' --output-on-failure`)
++  under `xvfb-run -a` + Wine — **10/10 passed**, 108.00s total.
++
++All five commits verified author `Yousef Wadi <ywadi85@gmail.com>` (local
++git config), zero AI-attribution strings in any commit message.
++
++---
++
++## Item 1 — Harness gap: destructor-time validation errors escape the exit code
++
++**Root cause.** `rx::rhi::Context::errorCount_` (`context.h`/`context.cpp`)
++is a per-`Context` `shared_ptr<int>`, fresh per `Context::create()` call.
++Every GPU test fixture's `CHECK_FALSE(context.hasValidationErrors())`
++reads that per-instance counter, but the check line runs *before* the
++fixture's own destructor chain — any validation error raised while
++tearing down the fixture's other members (after the `CHECK_FALSE` line,
++still inside the same `TEST_CASE` scope) was never re-checked, and once
++the fixture (and its `Context`) is destroyed the counter is gone too. The
++binary still exited 0.
++
++**Fix.** Added a process-lifetime tally,
++`Context::processValidationErrorCount()`, backed by a single
++`std::atomic<std::size_t>` in `context.cpp`'s anonymous namespace, fed by
++the *same* real-error branch of `debugCallback()` that already increments
++a `Context`'s own `errorCount_` (the known-false-positive filter list —
++`isKnownPortabilityEnumerationLayerBug()` and its three siblings — is
++untouched and stays authoritative). Every GPU test binary's `main()`
++(`doctest_main.cpp`/`doctest_main_gpu.cpp`/`doctest_main_gltf_gpu.cpp`
++across `rx_rhi_vk`, `rx_graph`, `rx_material`, `rx_asset`'s two GPU
++binaries — 5 files total) now reads that tally *after*
++`doctest::Context::run()` returns, i.e. after every fixture including the
++last one has been fully destroyed, and forces the process exit nonzero
++if it is ever nonzero, printing a named `FAILED` line.
++
++**Happy-path verification** (all 5 binaries, `--validate`, real Vulkan
++device):
++
++```
++rx_rhi_vk_tests:        64 test cases, 1738 assertions, SUCCESS, exit 0
++rx_graph_gpu_tests:      8 test cases,  614 assertions, SUCCESS, exit 0
++rx_material_gpu_tests:  32 test cases,  978 assertions, SUCCESS, exit 0
++rx_asset_tests:         30 test cases,  446 assertions, SUCCESS, exit 0
++rx_asset_gltf_gpu_tests:57 test cases, 8644419 assertions, SUCCESS, exit 0
++```
++
++**Deliberate regression proof (scratch worktree, not shipped).** Built a
++`git worktree` at commit `b1a304f` (this item's own fix already applied),
++reverted `TextureCache::~TextureCache()`'s `[G6]` sampler-cache cleanup
++loop (`src/rx_asset/texture_cache.cpp`) to an empty body — the exact
++teardown-time leak class this item's evidence cites
++(`VUID-vkDestroyDevice-device-00378`) — rebuilt `rx_asset_tests` only,
++and ran it:
++
++```
++[doctest] test cases:  30 |  30 passed | 0 failed | 0 skipped
++[doctest] assertions: 446 | 446 passed | 0 failed |
++[doctest] Status: SUCCESS!
++[rx_asset_tests] FAILED: 6 unfiltered Vulkan validation error(s) observed during this run (possibly raised during a fixture's own
++teardown, after that TEST_CASE's CHECK_FALSE(hasValidationErrors()) already ran) -- see the "[vulkan validation]" ERROR line(s) above.
++```
++
++Exit code: **1** (confirmed via a separate un-piped run: `echo $? -> 1`).
++`grep -c VUID-vkDestroyDevice-device-00378` on the captured log: **6**,
++matching the reported tally exactly — every individual `TEST_CASE`'s own
++`CHECK_FALSE` still passed (doctest itself says `SUCCESS!`), and the
++binary *still* exits nonzero because of the new post-run check. This is
++the exact defect the brief's evidence describes ("reviewer reproduced
++`VUID-vkDestroyDevice-device-00378` 3x with a green exit") — now closed.
++Worktree removed afterward (`git worktree remove --force`); no trace left
++in the main tree (only the build-generated `volk.c` object was touched
++there, not a tracked file).
++
++---
++
++## Item 2 — MikkTSpace vendored UB patch
++
++**Reproduction (before).** Configured a throwaway build
++(`build/ubsan-mikkt`, not committed) with
++`CMAKE_C_FLAGS="-fsanitize=undefined -O1 -g -fno-omit-frame-pointer"`
++(matching Task 15's own UBSan recipe) and ran the full
++`rx_asset_gltf_gpu_tests` suite (`--test-case-exclude="*WALL-CLOCK*"`):
++
++```
++thread 751619 panic: shift exponent 32 is too large for 32-bit type 'unsigned int'
++_deps/mikktspace-src/mikktspace.c:1667:21: 0x13c6773 in QuickSortEdges (.../mikktspace.c)
++	t=(uSeed<<t)|(uSeed>>(32-t));
++                    ^
++_deps/mikktspace-src/mikktspace.c:1697:3: ... (7 recursive QuickSortEdges frames)
++_deps/mikktspace-src/mikktspace.c:1517:2: 0x13bad2c in BuildNeighborsFast (...)
++_deps/mikktspace-src/mikktspace.c:307:2: 0x13b5b9b in genTangSpace (...)
++src/rx_asset/mikktspace_bridge.cpp:101:5: 0x139e7e6 in generateTangentsDeindexed (...)
++```
++
++Under zig's trap-based sanitizer this panic is **fatal** (not merely a
++printed diagnostic) — it aborted the whole process mid-suite
++(`test cases: 5 | 4 passed | 1 failed ... FATAL ERROR: test case CRASHED: SIGABRT`,
++`timeout: the monitored command dumped core`), confirming the class of
++real-world consumer risk, not a cosmetic warning.
++
++**Root cause.** `t = uSeed & 31` (so `t ∈ [0,31]`) followed by
++`t = (uSeed<<t) | (uSeed>>(32-t))` — a naive rotate-left. When `t==0`,
++`32-t == 32`, and a 32-bit shift by 32 is undefined behavior in C (out of
++range for the promoted operand's width). On every target this project
++actually builds for (x86-64, native and windows-cross-zig), the
++underlying shift instruction already masks its count to 5 bits in
++hardware, so the *original* expression already evaluated to
++`uSeed>>0 == uSeed` at runtime whenever `t==0` — i.e. the correct
++rotate-left-by-0 identity was already the observed behavior; only its
++formal legality was wrong.
++
++**Fix.** Upstream (`github.com/mmikk/MikkTSpace`, pinned
++`3e895b49d05ea07e4c2133156cfa94369e19e409`) has had no commits since
++2020-03-25 and no tags/releases, so patched locally. Since MikkTSpace is
++`FetchContent_Populate`'d (not physically vendored into the repo tree,
++matching this project's existing volk/VMA/stb convention), the patch had
++to be durable across a fresh fetch, not a one-off edit of the populated
++build-tree copy. Added a `PATCH_COMMAND patch -p1 -i
++<repo>/third_party/patches/mikktspace-ubsan-shift-fix.patch` to the
++existing `FetchContent_Declare(mikktspace ...)` call
++(`third_party/CMakeLists.txt`) — CMake/ExternalProject's own standard
++patch mechanism, applied once per population, no hand-rolled patching
++logic. The patch file carries the `// [RendererX local patch, 2026-08-19]`
++comment block inline (UBSan citation, root-cause explanation, upstream
++status) plus the one-line fix:
++`t = (t==0) ? uSeed : ((uSeed<<t)|(uSeed>>(32-t)));`
++
++Verified end-to-end: wiped the populated `_deps/mikktspace-src` in both
++`build/linux-native` and the throwaway UBSan build dir, reconfigured
++(triggering a fresh clone + patch), and confirmed
++`grep "RendererX local patch" .../mikktspace.c` finds the patched line in
++the freshly-fetched copy in both build trees, and again after a full
++`windows-cross-zig` reconfigure (three independent re-populations, all
++patched correctly).
++
++**Behavior-preservation (byte-identical).** Added a temporary bit-exact
++dump (`std::memcpy` a `float` into a `uint32_t`, printed as hex) to two
++of the existing tangent tests in `gltf_pipeline_test.cpp`
++("tangent-less-but-UV'd primitive generates tangents via MikkTSpace" —
++the 6-corner shared-edge quad — and "a simple unit-square triangle
++produces a sane tangent aligned with +U" — a single triangle), captured
++BEFORE the patch (unpatched vendored source) and AFTER (patched), and
++diffed:
++
++```
++$ diff /tmp/mikkt_before_dumps.txt /tmp/mikkt_after_dumps.txt && echo "TANGENT OUTPUT IS BYTE-IDENTICAL BEFORE/AFTER PATCH"
++TANGENT OUTPUT IS BYTE-IDENTICAL BEFORE/AFTER PATCH
++```
++
++(16 tangent components across both fixtures, every one bit-for-bit
++identical: `0x3f800000`/`0x00000000` pairs, i.e. exact `1.0F`/`0.0F`.)
++The device-free `rx_asset_gltf_tests` suite: 48/48 test cases, 292/292
++assertions, both before and after. The debug dump was reverted
++(`git checkout`) before committing — not part of the shipped diff.
++
++**Re-run UBSan after the patch (full `rx_asset_gltf_gpu_tests` suite,
++same recipe, same exclusion):**
++
++```
++[doctest] test cases:     56 |     56 passed | 0 failed | 1 skipped
++[doctest] assertions: 590906 | 590906 passed | 0 failed |
++[doctest] Status: SUCCESS!
++```
++
++Zero UBSan findings (`grep -c "runtime error\|panic: shift\|mikktspace"` on
++the captured log: 0), exit 0 — and the suite now *completes* (56/56)
++where it previously aborted mid-run. Also re-confirmed on the ordinary
++(non-sanitizer) `linux-native` preset: `rx_asset_gltf_gpu_tests` 899,855
++assertions, 0 failed.
++
++---
++
++## Item 3 — FrameSync::advanceFrame(Allocator\*) live wiring
++
++**Fix.** Sample 04 (`samples/04_streaming/main.cpp`) is the
++streaming/eviction sample — the natural real consumer of a live memory
++report. Both its frame loops (`runHeadless()` and `runPresent()`, the two
++existing `frameSync->advanceFrame();` call sites) now pass `&*allocator`,
++matching `memory_budget_test.cpp`'s own established
++`frameSync->advanceFrame(&*allocator)` idiom for the mechanism test this
++closes the gap for.
++
++**Headless-gate verification.** Added the same discriminating check that
++test already established — `Allocator::setCurrentFrameIndexCallCount()`
++must equal exactly `kHeadlessTotalFrames` (60), never a comparison of
++`report()`'s own budget/usage numbers, which a quiet driver can report
++identically whether or not the refresh call ever fired. Real run:
++
++```
++[info] sample_04_streaming: FrameSync-driven budget refresh live -- 60 setCurrentFrameIndex() call(s), max heap budget 50494949376 bytes (RealExtension)
++[info] streaming headless gate PASSED
++```
++Exit 0.
++
++**Discrimination proof (temporary local revert, restored after).**
++Reverted just the headless call site back to the bare `frameSync->advanceFrame();`
++(no argument), rebuilt, ran:
++
++```
++[error] sample_04_streaming: FrameSync::advanceFrame(Allocator*) budget-refresh wiring fired 0 time(s), expected exactly 60 (one per rendered frame)
++[info] sample_04_streaming: FrameSync-driven budget refresh live -- 0 setCurrentFrameIndex() call(s), max heap budget 50494949376 bytes (RealExtension)
++[error] streaming headless gate FAILED
++```
++Exit code (un-piped): **1**. Note the max-heap-budget number stayed
++identical (50494949376) with 0 calls — direct, empirical confirmation
++that report()'s own budget number is NOT a discriminating signal on this
++runner (a quiet driver reports the same number either way), and that
++`setCurrentFrameIndexCallCount()` — the assertion actually used — is what
++catches the regression. File restored from backup, rebuilt, re-confirmed
++PASSED/exit 0 before committing.
++
++---
++
++## Item 4 — Combined glTF→TextureCache→pixel test (Task 14 minor 4.6)
++
++**Fix.** Added one `TEST_CASE` to `texture_cache_test.cpp` (joins the
++`rx_asset_tests` binary, which already has the rendering/readback
++machinery this reuses verbatim — `buildQuadPipeline()`/
++`renderAndReadbackQuadrants()`/`approxEqual()`) combining, unmodified:
++
++- `import_gltf_basisu_test.cpp`'s own `Registry::importGltf(pool,
++  scheduler, textures)` call shape (`GeometryPool::create()` +
++  `rx::task::Scheduler::create()` + a real `TextureCache`), against the
++  already-committed `assets/test/cube_basisu.gltf` fixture
++  (`KHR_texture_basisu`, references `cube_basisu_misleading_normal.ktx2`
++  as its material's `baseColorTexture`).
++- This file's own `renderAndReadbackQuadrants()` rendering path, sampling
++  the resolved `TextureRecord::bindlessIndex` through a real bindless
++  descriptor set.
++
++Zero new rendering/readback/import machinery — only two new `#include`s
++(`rx_asset/geometry_pool.h`, `rx_asset/registry.h`, `rx_task/scheduler.h`)
++and a small `gltfFixturePath()` helper (duplicating
++`import_gltf_basisu_test.cpp`'s own `testAssetDir()`, this codebase's
++established per-file fixture convention). No CMakeLists.txt changes were
++needed: `rx_asset_tests` already transitively links `rx_task`/`fastgltf`
++through `rx_asset`'s own `PUBLIC` dependency on both.
++
++**Fixture content (previously undocumented — no generator script records
++it).** A scratch probe run of the exact combined call chain (kept only
++long enough to read the values, then replaced with the real assertions)
++found `cube_basisu_misleading_normal.ktx2` decodes to the SAME
++`TL=red/TR=green/BL=blue/BR=yellow` quadrant layout the other KTX2-only
++quadrant fixture already uses: `253,0,0` / `0,253,0` / `0,0,253` /
++`255,255,0` (within tolerance 2 of each primary color).
++
++**Result:**
++
++```
++record.width=4 record.height=4 bindlessIndex=4   (non-fallback, real texture)
++CHECK(approxEqual(readback->topLeft,     {255,   0,   0}, 2))  -- pass
++CHECK(approxEqual(readback->topRight,    {  0, 255,   0}, 2))  -- pass
++CHECK(approxEqual(readback->bottomLeft,  {  0,   0, 255}, 2))  -- pass
++CHECK(approxEqual(readback->bottomRight, {255, 255,   0}, 2))  -- pass
++```
++
++Full `rx_asset_tests` binary: **31/31 test cases, 469/469 assertions,
++SUCCESS**, exit 0 (up from 30/30 pre-existing).
++
++**Discrimination proof (temporary edit, restored after).** Swapped the
++rendered bindless index for `checkerboardHandle()`'s own (the D11
++fallback texture) instead of the resolved real texture's index, rebuilt,
++ran:
++
++```
++ERROR: CHECK( approxEqual(readback->topLeft, {255, 0, 0}, 2) ) is NOT correct!
++ERROR: CHECK( approxEqual(readback->topRight, {0, 255, 0}, 2) ) is NOT correct!
++ERROR: CHECK( approxEqual(readback->bottomLeft, {0, 0, 255}, 2) ) is NOT correct!
++ERROR: CHECK( approxEqual(readback->bottomRight, {255, 255, 0}, 2) ) is NOT correct!
++[doctest] test cases:  1 |  0 passed | 1 failed | 30 skipped
++```
++
++All four quadrant assertions fail loud — confirms the test is
++discriminating, not vacuous. Reverted from backup before committing.
++
++Also confirmed passing under the `windows-cross-zig` Wine ctest run
++(`rx_asset_tests` is one of the 10 tests exercised there, not in the
++GPU-exclusion list) as part of the final CI-equivalent gate.
++
++---
++
++## Item 5 — CI cache hardening (ci.yml)
++
++**(a) restore-keys fallback.** Added a same-prefix `restore-keys:` entry
++to all four `.deps-cache`/`assets/fetched` cache steps (both jobs) — the
++two steps the brief calls out by name; the `slang-prebuilt` cache was
++deliberately left alone (its key only rotates on `fetch_slang.cmake`
++edits, which are rare, unlike `third_party/CMakeLists.txt`/
++`fetch_assets.sh` edits, which are common).
++
++Verified the fallback is safe (a stale seed cannot serve an incorrect
++build), not merely assumed:
++- `.deps-cache`: read `cmake/DepCache.cmake`'s
++  `rx_add_cached_dependency()` directly — each dependency's own
++  subdirectory is keyed independently on `SHA256(name|tag|triple|
++  zig-version|build-type|CMAKE_ARGS|config-file-hashes)`, and the build
++  only ever consults the exact subdirectory matching the *current* hash
++  (`if(NOT EXISTS "${_marker}")` — a `[dep-cache] MISS`, i.e. a real
++  rebuild, exactly like a cold cache, for any dependency whose hash
++  changed). A restored stale cache's unrelated/outdated subdirectories
++  are simply never looked up. This mechanism can only ever skip
++  rebuilding dependencies that provably did not change; it cannot serve
++  a stale build for one that did.
++- `assets/fetched`: read `tools/fetch_assets.sh` directly — each asset's
++  marker file is VERSION-named (`.rx-fetched-damagedhelmet-<VERSION>`),
++  so a stale restore either has the current version's marker (fast
++  no-op, correct) or doesn't (re-fetches and re-verifies checksums from
++  scratch, since the version-specific filename simply isn't found).
++
++**(b) concurrency serialization.** Added a workflow-level `concurrency`
++block:
++
++```yaml
++concurrency:
++  group: ci-${{ github.ref }}
++  cancel-in-progress: true
++```
++
++with an inline comment stating the `cancel-in-progress: true` choice
++explicitly: an outdated commit's run has no value once a newer push to
++the same ref exists, so cancelling frees the runner instead of finishing
++a run nobody needs (per the brief's own sanctioned rationale).
++
++**Syntax validation.** `actionlint` was not preinstalled; downloaded the
++prebuilt release binary (v1.7.12, `github.com/rhysd/actionlint`) and ran
++it directly against `ci.yml`:
++
++```
++$ actionlint .github/workflows/ci.yml
++$ echo $?
++0
++```
++
++Zero findings, both before this change (baseline `HEAD:ci.yml`, sanity
++check) and after (the edited file) — confirms this is real schema-aware
++validation, not a vacuous pass. Also parsed with PyYAML as a basic
++structural sanity check (parses cleanly, `concurrency` block present with
++the intended keys).
++
++**Not pushed** (per global constraints) — coordinator to confirm via
++`gh workflow view`/a real run after push, per the brief's own
++instruction.
++
++---
++
++## Concerns / notes for the coordinator
++
++- None blocking. All five items closed, verified, and green on both CI
++  presets locally (build clean + full ctest pass, matching CI's exact
++  invocations, including under Wine for windows-cross-zig).
++- Item 5's `actionlint` binary was fetched ad hoc into `/tmp` for this
++  session (not installed system-wide, not added to the repo or CI) —
++  purely a local verification aid; CI itself does not run actionlint.
++- Two untracked SDD files were present in the working tree at start
++  (`closure-sweep-brief.md`, `task-16-brief.md`) and one other in-flight
++  agent's own worktree modifications to `progress.md`/the toolchain spec
++  doc — none of these were touched by this sweep, per the "only your own
++  files" constraint.
+diff --git a/samples/04_streaming/main.cpp b/samples/04_streaming/main.cpp
+index f0b18c6..afcc4ba 100644
+--- a/samples/04_streaming/main.cpp
++++ b/samples/04_streaming/main.cpp
+@@ -1504,21 +1504,31 @@ int runHeadless(bool enableValidation) {
+ 
+         slot.frameNumber = thisFrameNumber;
+         slot.everUsed = true;
+ 
+         // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3,
+         // spec D3] -- headless-mode path: unlike this sample's siblings,
+         // this headless loop drives a real rx::rhi::FrameSync frames-in-
+         // flight cycle (kHeadlessTotalFrames + kSlotCount iterations), so
+         // each iteration is a genuine rendered frame in its own right.
+         RX_FRAME_MARK;
+-        frameSync->advanceFrame();
++        // [Phase 4 closure-sweep item 3] `&*allocator` -- not the bare
++        // no-arg call every pre-Task-10 call site used -- wires this
++        // sample into FrameSync::advanceFrame(Allocator*)'s "once per
++        // frame, natural home" budget-refresh call (frame_sync.h's own
++        // comment on the `allocatorForBudgetRefresh` argument): this
++        // sample is the streaming/eviction sample, the natural real
++        // consumer of a LIVE memory report, previously only mechanism-
++        // tested (memory_budget_test.cpp) and never exercised by a
++        // running sample. See the pass/fail summary below for the
++        // discriminating proof this actually fired.
++        frameSync->advanceFrame(&*allocator);
+     }
+ 
+     if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
+         RX_LOG_ERROR("vkDeviceWaitIdle failed at headless streaming shutdown");
+         ok = false;
+     }
+     for (auto& slot : slots) {
+         destroyOffscreenSlot(vkDevice, *slot);
+     }
+     // destroyScene() itself drains the DeletionQueue (flushAll with its
+@@ -1535,20 +1545,60 @@ int runHeadless(bool enableValidation) {
+     for (uint32_t k = 0; k < kTextureCount; ++k) {
+         if (!observedResident[k]) {
+             RX_LOG_ERROR("sample_04_streaming: logical texture {} was never observed resident on screen", k);
+             ++missingCount;
+             pass = false;
+         }
+     }
+     RX_LOG_INFO("sample_04_streaming: {} / {} logical textures observed resident at some point",
+                 kTextureCount - missingCount, kTextureCount);
+ 
++    // [Phase 4 closure-sweep item 3] Proves the `&*allocator` wiring above
++    // is actually live in this running sample, not merely mechanism-tested
++    // (src/rx_rhi_vk/tests/memory_budget_test.cpp's own "FrameSync::
++    // advanceFrame(Allocator*) wiring" case). Two checks, same reasoning
++    // as that test:
++    //   (a) THE discriminating signal -- Allocator::setCurrentFrameIndexCallCount(),
++    //       incremented unconditionally inside setCurrentFrameIndex()
++    //       itself (buffer.cpp), independent of what any driver reports --
++    //       must equal exactly kHeadlessTotalFrames, the number of real
++    //       (non-drain) rendered frames this loop advanced. Comparing
++    //       report()'s own budget/usage numbers before/after would NOT be
++    //       discriminating: a quiet driver can report the same number
++    //       whether or not the refresh call ever fired (see that test's
++    //       own comment on why a revert of setCurrentFrameIndex() to a
++    //       no-op still passed a naive "budget changed" check).
++    //   (b) A logged-once line showing report()'s own live per-heap
++    //       budget is genuinely nonzero -- corroborating evidence for a
++    //       human/CI-log reader, not itself the discriminating proof.
++    const uint64_t budgetRefreshCalls = allocator->setCurrentFrameIndexCallCount();
++    if (budgetRefreshCalls != kHeadlessTotalFrames) {
++        RX_LOG_ERROR(
++            "sample_04_streaming: FrameSync::advanceFrame(Allocator*) budget-refresh wiring fired {} "
++            "time(s), expected exactly {} (one per rendered frame)",
++            budgetRefreshCalls, kHeadlessTotalFrames);
++        pass = false;
++    }
++    const rx::rhi::RxMemoryReport memReport = allocator->report();
++    uint64_t liveBudgetBytes = 0;
++    for (const auto& heap : memReport.heaps) {
++        liveBudgetBytes = std::max(liveBudgetBytes, static_cast<uint64_t>(heap.budgetBytes));
++    }
++    if (liveBudgetBytes == 0) {
++        RX_LOG_ERROR("sample_04_streaming: live memory report shows a zero budget across every heap");
++        pass = false;
++    }
++    RX_LOG_INFO(
++        "sample_04_streaming: FrameSync-driven budget refresh live -- {} setCurrentFrameIndex() call(s), "
++        "max heap budget {} bytes ({})",
++        budgetRefreshCalls, liveBudgetBytes, rx::rhi::memoryBudgetSourceName(memReport.budgetSource));
++
+     if (enableValidation && context->hasValidationErrors()) {
+         RX_LOG_ERROR("Vulkan validation layer reported errors during this run");
+         pass = false;
+     }
+ 
+     if (pass) {
+         RX_LOG_INFO("streaming headless gate PASSED");
+         return 0;
+     }
+     RX_LOG_ERROR("streaming headless gate FAILED");
+@@ -1842,21 +1892,23 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode) {
+         } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("device lost during present; exiting present loop");
+             ok = false;
+             break;
+         }
+ 
+         // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3,
+         // spec D3] -- present-mode path; see the headless loop above for
+         // this sample's other frame boundary.
+         RX_FRAME_MARK;
+-        frameSync->advanceFrame();
++        // [Phase 4 closure-sweep item 3] Same `&*allocator` wiring as the
++        // headless loop above -- see that call site's own comment.
++        frameSync->advanceFrame(&*allocator);
+     }
+ 
+     vkDeviceWaitIdle(vkDevice);
+     destroySwapchainViews();
+     destroyScene(vkDevice, *scene);  // drains the DeletionQueue (flushAll) before tearing down.
+ 
+     if (enableValidation && context->hasValidationErrors()) {
+         RX_LOG_ERROR("Vulkan validation layer reported errors during the present loop");
+         return 1;
+     }
+diff --git a/src/rx_asset/tests/doctest_main.cpp b/src/rx_asset/tests/doctest_main.cpp
+index 119a152..eae6bd4 100644
+--- a/src/rx_asset/tests/doctest_main.cpp
++++ b/src/rx_asset/tests/doctest_main.cpp
+@@ -7,20 +7,21 @@
+ // instances directly, and are exposed to the exact same vk-bootstrap
+ // process-wide instance-function-pointer-caching hazard documented on
+ // rx::rhi::Context::create()'s own WARNING (rx_rhi_vk/context.h): building
+ // a narrower (e.g. headless-only) instance first would poison a later,
+ // broader (windowed) one with null function pointers.
+ #define DOCTEST_CONFIG_IMPLEMENT
+ #include <doctest/doctest.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_platform/window.h>
+ 
++#include <cstdio>
+ #include <vector>
+ 
+ namespace {
+ 
+ void warmUpVkBootstrapInstanceFunctionCache() {
+     std::vector<const char*> extensions;
+     auto window = rx::platform::Window::create("rx_asset_tests_warmup", 64, 64, /*visible=*/false);
+     if (window.has_value()) {
+         extensions = window->requiredVulkanInstanceExtensions();
+     }
+@@ -33,15 +34,41 @@ void warmUpVkBootstrapInstanceFunctionCache() {
+ }
+ 
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+     warmUpVkBootstrapInstanceFunctionCache();
+ 
+     doctest::Context context;
+     context.applyCommandLine(argc, argv);
+     int res = context.run();
++
++    // Harness gap fix -- see rx_rhi_vk/tests/doctest_main.cpp's identical
++    // block for the full rationale: a validation error raised while a
++    // fixture's OWN destructor chain tears down (after that TEST_CASE's own
++    // CHECK_FALSE(hasValidationErrors()) already ran) previously printed but
++    // never failed the run. Re-checking the PROCESS-lifetime tally here,
++    // after context.run() has already destroyed every fixture including the
++    // last one, closes that gap without touching debugCallback()'s own
++    // known-false-positive filter list (context.cpp), which stays
++    // authoritative. This is exactly the class of bug TextureCache::
++    // ~TextureCache()'s own [G6] sampler-cache cleanup loop (texture_cache.cpp)
++    // was added to fix -- this binary's own texture_cache_test.cpp cases
++    // are what would regress it.
++    const std::size_t processErrors = rx::rhi::Context::processValidationErrorCount();
++    if (processErrors > 0) {
++        std::fprintf(stderr,
++                      "[rx_asset_tests] FAILED: %zu unfiltered Vulkan validation error(s) "
++                      "observed during this run (possibly raised during a fixture's own "
++                      "teardown, after that TEST_CASE's CHECK_FALSE(hasValidationErrors()) "
++                      "already ran) -- see the \"[vulkan validation]\" ERROR line(s) above.\n",
++                      processErrors);
++        if (res == 0) {
++            res = 1;
++        }
++    }
++
+     if (context.shouldExit()) {
+         return res;
+     }
+     return res;
+ }
+diff --git a/src/rx_asset/tests/doctest_main_gltf_gpu.cpp b/src/rx_asset/tests/doctest_main_gltf_gpu.cpp
+index 24ad360..a794a07 100644
+--- a/src/rx_asset/tests/doctest_main_gltf_gpu.cpp
++++ b/src/rx_asset/tests/doctest_main_gltf_gpu.cpp
+@@ -1,19 +1,20 @@
+ // DOCTEST_CONFIG_IMPLEMENT (not _WITH_MAIN): see rx_asset_tests'
+ // doctest_main.cpp for the full warm-up rationale (copied here, not
+ // shared -- each GPU-backed test binary in this repo owns its own copy,
+ // matching rx_graph_gpu_tests' own doctest_main_gpu.cpp precedent).
+ #define DOCTEST_CONFIG_IMPLEMENT
+ #include <doctest/doctest.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_platform/window.h>
+ 
++#include <cstdio>
+ #include <vector>
+ 
+ namespace {
+ 
+ void warmUpVkBootstrapInstanceFunctionCache() {
+     std::vector<const char*> extensions;
+     auto window = rx::platform::Window::create("rx_asset_gltf_gpu_tests_warmup", 64, 64, /*visible=*/false);
+     if (window.has_value()) {
+         extensions = window->requiredVulkanInstanceExtensions();
+     }
+@@ -21,15 +22,38 @@ void warmUpVkBootstrapInstanceFunctionCache() {
+ }
+ 
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+     warmUpVkBootstrapInstanceFunctionCache();
+ 
+     doctest::Context context;
+     context.applyCommandLine(argc, argv);
+     int res = context.run();
++
++    // Harness gap fix -- see rx_rhi_vk/tests/doctest_main.cpp's identical
++    // block for the full rationale: a validation error raised while a
++    // fixture's OWN destructor chain tears down (after that TEST_CASE's own
++    // CHECK_FALSE(hasValidationErrors()) already ran) previously printed but
++    // never failed the run. Re-checking the PROCESS-lifetime tally here,
++    // after context.run() has already destroyed every fixture including the
++    // last one, closes that gap without touching debugCallback()'s own
++    // known-false-positive filter list (context.cpp), which stays
++    // authoritative.
++    const std::size_t processErrors = rx::rhi::Context::processValidationErrorCount();
++    if (processErrors > 0) {
++        std::fprintf(stderr,
++                      "[rx_asset_gltf_gpu_tests] FAILED: %zu unfiltered Vulkan validation error(s) "
++                      "observed during this run (possibly raised during a fixture's own "
++                      "teardown, after that TEST_CASE's CHECK_FALSE(hasValidationErrors()) "
++                      "already ran) -- see the \"[vulkan validation]\" ERROR line(s) above.\n",
++                      processErrors);
++        if (res == 0) {
++            res = 1;
++        }
++    }
++
+     if (context.shouldExit()) {
+         return res;
+     }
+     return res;
+ }
+diff --git a/src/rx_asset/tests/texture_cache_test.cpp b/src/rx_asset/tests/texture_cache_test.cpp
+index 808ad87..e55a446 100644
+--- a/src/rx_asset/tests/texture_cache_test.cpp
++++ b/src/rx_asset/tests/texture_cache_test.cpp
+@@ -1,22 +1,25 @@
+ #include <doctest/doctest.h>
++#include <rx_asset/geometry_pool.h>
++#include <rx_asset/registry.h>
+ #include <rx_asset/texture_cache.h>
+ #include <rx_core/log.h>
+ #include <rx_core/log_forward_sink.h>
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/deletion_queue.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/pipeline_layout.h>
+ #include <rx_platform/window.h>
+ #include <rx_shader/compiler.h>
+ #include <rx_shader/reflection.h>
++#include <rx_task/scheduler.h>
+ #include <spdlog/sinks/ostream_sink.h>
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
+ #include <fstream>
+ #include <optional>
+ #include <sstream>
+ #include <string>
+ #include <utility>
+@@ -33,20 +36,28 @@
+ // (upload, bindless registration, sampler cache, D24 eviction, D25
+ // ticket consumption, FG9 accounting) against REAL fixtures on a real
+ // device.
+ 
+ using namespace rx::asset;
+ 
+ namespace {
+ 
+ std::string fixturePath(const std::string& name) { return std::string(RX_ASSET_ROOT_DIR) + "/assets/test/textures/" + name; }
+ 
++// [closure-sweep item 4] Task 13/14's glTF fixtures live directly under
++// assets/test/ (not assets/test/textures/, the KTX2-only directory
++// fixturePath() above points at) -- same directory
++// import_gltf_basisu_test.cpp's own testAssetDir() uses, duplicated here
++// rather than shared (this codebase's own established per-file fixture
++// convention, e.g. LogCapture below).
++std::string gltfFixturePath(const std::string& name) { return std::string(RX_ASSET_ROOT_DIR) + "/assets/test/" + name; }
++
+ // TextureCache stores its Allocator&/Device&/Uploader&/BindlessTable&/
+ // DeletionQueue& constructor arguments BY REFERENCE (matching
+ // GeometryPool::create()'s own established lifetime discipline,
+ // geometry_pool.h's own comment) -- it must be built AFTER every one of
+ // those objects has settled into its FINAL, stable address, never against
+ // a local variable this function is about to std::move() out of. Building
+ // it INSIDE this function (against `*device`/`*allocator`'s own
+ // still-local addresses, then moving those same objects into the
+ // returned aggregate) was this test file's own first-draft bug, caught
+ // directly by a real SIGABRT ("Invalid physicalDevice") the first time this file
+@@ -1112,10 +1123,89 @@ TEST_CASE("TextureCache [minor 4.5]: loading the SAME failing asset twice logs t
+     CHECK(first == fixture->cache->checkerboardHandle());
+     CHECK(second == fixture->cache->checkerboardHandle());
+ 
+     // Exactly one "failed to load" line for this exact asset path, across
+     // BOTH calls -- the second call's failure is silent (D11 dedup), not
+     // merely coincidentally deduped by some OTHER mechanism.
+     CHECK(capture.count("failed to load") == 1);
+ 
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
++
++// ===== [closure-sweep item 4] combined glTF -> TextureCache -> pixel =====
++//
++// Task 14 minor 4.6: role inference via glTF import (import_gltf_basisu_
++// test.cpp) and pixel-correct rendering of a TextureCache-resident texture
++// (the quadrant GPU test above) were each proven in ISOLATION -- no single
++// test proved the full path glTF-file -> Registry::importGltf(with a real
++// TextureCache) -> resolved bindless texture -> actually-sampled pixels.
++// This closes that gap by combining, unmodified, both existing pieces of
++// machinery already in THIS binary: import_gltf_basisu_test.cpp's own
++// Registry::importGltf(pool, scheduler, textures) call shape (duplicated
++// here per this codebase's own established per-file fixture convention --
++// see e.g. LogCapture above) feeding directly into this file's own
++// buildQuadPipeline()/renderAndReadbackQuadrants() rendering path, with
++// zero new rendering/readback machinery. cube_basisu.gltf [Task 14
++// vendoring, KHR_texture_basisu] references cube_basisu_misleading_normal
++// .ktx2 as its material's baseColorTexture -- a real, already-committed
++// fixture, deliberately misleadingly named ("_normal") but used as
++// baseColor, and (empirically confirmed via a scratch probe run of this
++// exact call chain, since no generator script records this fixture's
++// content) quadrant-colored with the SAME TL=red/TR=green/BL=blue/
++// BR=yellow layout the KTX2-only quadrant fixture above uses.
++TEST_CASE("Combined path: cube_basisu.gltf -> Registry::importGltf(TextureCache) -> resolved bindless "
++          "texture -> actual rendered pixels match the fixture's real quadrant content [Task 14 minor 4.6]") {
++    auto fixture = makeFixture("rx_asset_tc_gltf_pixel");
++    if (!fixture.has_value()) {
++        return;
++    }
++    makeCache(*fixture);
++
++    // GeometryPool/Scheduler: the two extra dependencies Registry::
++    // importGltf() needs beyond what makeFixture()/makeCache() already
++    // built -- built AFTER fixture settles into its final address, same
++    // discipline as makeCache() itself (this file's own header comment).
++    auto pool = rx::asset::GeometryPool::create(fixture->allocator, fixture->device, fixture->uploader);
++    REQUIRE(pool != nullptr);
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++
++    rx::asset::Registry registry;
++    rx::asset::ImportResult result =
++        registry.importGltf(gltfFixturePath("cube_basisu.gltf"), *pool, *scheduler, fixture->cache.get());
++    REQUIRE(result.ok());
++    REQUIRE(result.materials.size() == 1);
++
++    const rx::asset::MaterialAsset& material = registry.material(result.materials[0]);
++    REQUIRE(material.baseColorTexture.present);
++    const TextureRecord& record = fixture->cache->resolve(material.baseColorTexture.handle);
++    // Proves the full path actually resolved to a REAL texture, not a D11
++    // fallback silently substituted somewhere along the way -- the same
++    // discriminating check import_gltf_basisu_test.cpp's own role-
++    // inference test makes, extended here all the way through to pixels.
++    REQUIRE_FALSE(record.isFallback);
++    CHECK(record.width == 4);
++    CHECK(record.height == 4);
++
++    SamplerDesc nearestDesc;
++    nearestDesc.magFilter = 9728;  // NEAREST -- exact texel reads, no filtering ambiguity
++    nearestDesc.minFilter = 9728;
++    VkSampler sampler = fixture->cache->getOrCreateSampler(nearestDesc);
++    REQUIRE(sampler != VK_NULL_HANDLE);
++    rx::rhi::BindlessHandle samplerHandle = fixture->bindless.registerSampler(sampler);
++    REQUIRE(samplerHandle.isValid());
++
++    auto readback = renderAndReadbackQuadrants(*fixture, record.bindlessIndex, samplerHandle.index(), /*lod=*/0.0F);
++    REQUIRE(readback.has_value());
++
++    // Same TL=red/TR=green/BL=blue/BR=yellow layout, same zero-tolerance-
++    // appropriate primary-color reasoning as the quadrant GPU test above
++    // (empirically confirmed for THIS fixture via a scratch probe run of
++    // this exact call chain: 253/0/0, 0/253/0, 0/0/253, 255/255/0 --
++    // within tolerance 2 of each primary-color corner).
++    CHECK(approxEqual(readback->topLeft, {255, 0, 0}, 2));
++    CHECK(approxEqual(readback->topRight, {0, 255, 0}, 2));
++    CHECK(approxEqual(readback->bottomLeft, {0, 0, 255}, 2));
++    CHECK(approxEqual(readback->bottomRight, {255, 255, 0}, 2));
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/src/rx_graph/tests/doctest_main_gpu.cpp b/src/rx_graph/tests/doctest_main_gpu.cpp
+index ba34af5..5da4db7 100644
+--- a/src/rx_graph/tests/doctest_main_gpu.cpp
++++ b/src/rx_graph/tests/doctest_main_gpu.cpp
+@@ -9,20 +9,21 @@
+ // binary's tests build their own headless/windowed rx::rhi::Context+Device
+ // instances directly, and are exposed to the exact same vk-bootstrap
+ // process-wide instance-function-pointer-caching hazard documented on that
+ // original file: see rx::rhi::Context::create()'s own WARNING (rx_rhi_vk/
+ // context.h) for the full defect this warm-up exists to avoid.
+ #define DOCTEST_CONFIG_IMPLEMENT
+ #include <doctest/doctest.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_platform/window.h>
+ 
++#include <cstdio>
+ #include <vector>
+ 
+ namespace {
+ 
+ void warmUpVkBootstrapInstanceFunctionCache() {
+     std::vector<const char*> extensions;
+     auto window = rx::platform::Window::create("rx_graph_gpu_tests_warmup", 64, 64, /*visible=*/false);
+     if (window.has_value()) {
+         extensions = window->requiredVulkanInstanceExtensions();
+     }
+@@ -35,15 +36,38 @@ void warmUpVkBootstrapInstanceFunctionCache() {
+ }
+ 
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+     warmUpVkBootstrapInstanceFunctionCache();
+ 
+     doctest::Context context;
+     context.applyCommandLine(argc, argv);
+     int res = context.run();
++
++    // Harness gap fix -- see rx_rhi_vk/tests/doctest_main.cpp's identical
++    // block for the full rationale: a validation error raised while a
++    // fixture's OWN destructor chain tears down (after that TEST_CASE's own
++    // CHECK_FALSE(hasValidationErrors()) already ran) previously printed but
++    // never failed the run. Re-checking the PROCESS-lifetime tally here,
++    // after context.run() has already destroyed every fixture including the
++    // last one, closes that gap without touching debugCallback()'s own
++    // known-false-positive filter list (context.cpp), which stays
++    // authoritative.
++    const std::size_t processErrors = rx::rhi::Context::processValidationErrorCount();
++    if (processErrors > 0) {
++        std::fprintf(stderr,
++                      "[rx_graph_gpu_tests] FAILED: %zu unfiltered Vulkan validation error(s) "
++                      "observed during this run (possibly raised during a fixture's own "
++                      "teardown, after that TEST_CASE's CHECK_FALSE(hasValidationErrors()) "
++                      "already ran) -- see the \"[vulkan validation]\" ERROR line(s) above.\n",
++                      processErrors);
++        if (res == 0) {
++            res = 1;
++        }
++    }
++
+     if (context.shouldExit()) {
+         return res;
+     }
+     return res;
+ }
+diff --git a/src/rx_material/tests/doctest_main.cpp b/src/rx_material/tests/doctest_main.cpp
+index 033b25e..4988f28 100644
+--- a/src/rx_material/tests/doctest_main.cpp
++++ b/src/rx_material/tests/doctest_main.cpp
+@@ -12,20 +12,21 @@
+ // pointers process-wide from whichever vkb::Instance is built FIRST,
+ // forever, with no reset. Warming the cache with the BROADEST instance
+ // this binary will ever need (real window extensions when available,
+ // enableValidation=true unconditionally) before any TEST_CASE runs makes
+ // that hazard's precondition impossible to hit, regardless of test order.
+ #define DOCTEST_CONFIG_IMPLEMENT
+ #include <doctest/doctest.h>
+ #include <rx_platform/window.h>
+ #include <rx_rhi_vk/context.h>
+ 
++#include <cstdio>
+ #include <vector>
+ 
+ namespace {
+ 
+ void warmUpVkBootstrapInstanceFunctionCache() {
+     std::vector<const char*> extensions;
+     auto window = rx::platform::Window::create("rx_material_gpu_tests_warmup", 64, 64, /*visible=*/false);
+     if (window.has_value()) {
+         extensions = window->requiredVulkanInstanceExtensions();
+     }
+@@ -38,15 +39,38 @@ void warmUpVkBootstrapInstanceFunctionCache() {
+ }
+ 
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+     warmUpVkBootstrapInstanceFunctionCache();
+ 
+     doctest::Context context;
+     context.applyCommandLine(argc, argv);
+     int res = context.run();
++
++    // Harness gap fix -- see rx_rhi_vk/tests/doctest_main.cpp's identical
++    // block for the full rationale: a validation error raised while a
++    // fixture's OWN destructor chain tears down (after that TEST_CASE's own
++    // CHECK_FALSE(hasValidationErrors()) already ran) previously printed but
++    // never failed the run. Re-checking the PROCESS-lifetime tally here,
++    // after context.run() has already destroyed every fixture including the
++    // last one, closes that gap without touching debugCallback()'s own
++    // known-false-positive filter list (context.cpp), which stays
++    // authoritative.
++    const std::size_t processErrors = rx::rhi::Context::processValidationErrorCount();
++    if (processErrors > 0) {
++        std::fprintf(stderr,
++                      "[rx_material_gpu_tests] FAILED: %zu unfiltered Vulkan validation error(s) "
++                      "observed during this run (possibly raised during a fixture's own "
++                      "teardown, after that TEST_CASE's CHECK_FALSE(hasValidationErrors()) "
++                      "already ran) -- see the \"[vulkan validation]\" ERROR line(s) above.\n",
++                      processErrors);
++        if (res == 0) {
++            res = 1;
++        }
++    }
++
+     if (context.shouldExit()) {
+         return res;
+     }
+     return res;
+ }
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/context.h b/src/rx_rhi_vk/include/rx_rhi_vk/context.h
+index 4b8fa5b..a58441f 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/context.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/context.h
+@@ -1,16 +1,17 @@
+ #pragma once
+ #include <volk.h>
+ // vkb::Instance is stored by value below, so its full definition is
+ // required here -- a forward declaration is not possible for a by-value
+ // member.
+ #include <VkBootstrap.h>
++#include <cstddef>
+ #include <memory>
+ #include <optional>
+ #include <vector>
+ 
+ namespace rx::rhi {
+ 
+ class Context {
+ public:
+     Context(Context&&) noexcept;
+     Context& operator=(Context&&) noexcept;
+@@ -50,19 +51,41 @@ public:
+     // lifetime) needs to either keep every Context's capabilities
+     // (extensions *and* enableValidation) consistent, or replicate that
+     // same warm-up-with-the-broadest-instance-first pattern.
+     static std::optional<Context> create(std::vector<const char*> requiredExtensions, bool enableValidation);
+ 
+     VkInstance instance() const { return vkbInstance_.instance; }
+     VkDebugUtilsMessengerEXT debugMessenger() const { return vkbInstance_.debug_messenger; }
+     const vkb::Instance& vkbInstance() const { return vkbInstance_; }
+     bool hasValidationErrors() const { return *errorCount_ > 0; }
+ 
++    // Process-lifetime tally of unfiltered validation errors observed from
++    // debugCallback() across EVERY Context ever created in this process --
++    // deliberately NOT scoped to any one Context/errorCount_ instance the
++    // way hasValidationErrors() above is. A GPU test fixture's own
++    // CHECK_FALSE(fixture->context.hasValidationErrors()) only observes
++    // errors raised before that line runs; a validation error raised while
++    // the fixture's OWN destructor chain tears down afterward (the
++    // sampler-leak / unflushed-upload class -- VUID-vkDestroyDevice-
++    // device-00378 and friends) still prints via debugCallback's
++    // RX_LOG_ERROR, but nothing re-checks THAT Context's (now-dying)
++    // errorCount_ again, and once the fixture is fully destroyed
++    // errorCount_ itself is gone. This counter survives that: it is read
++    // by every GPU test binary's main() (each doctest_main*.cpp under
++    // src/*/tests/) AFTER doctest::Context::run() returns -- i.e. after
++    // every TEST_CASE's fixture, including the very last one, has already
++    // been fully destroyed -- to catch exactly that class of teardown-time
++    // error and force a nonzero process exit code. Filtering (what counts
++    // as a known false positive vs. a real error) is unchanged: this only
++    // tallies the SAME real-error branch that already increments a
++    // per-Context errorCount_ in context.cpp's debugCallback().
++    static std::size_t processValidationErrorCount();
++
+ private:
+     Context(vkb::Instance vkbInstance, std::shared_ptr<int> errorCount)
+         : vkbInstance_(std::move(vkbInstance)), errorCount_(std::move(errorCount)) {}
+ 
+     vkb::Instance vkbInstance_{};
+     std::shared_ptr<int> errorCount_;
+ };
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/context.cpp b/src/rx_rhi_vk/src/context.cpp
+index cdb48a2..ca3d6c3 100644
+--- a/src/rx_rhi_vk/src/context.cpp
++++ b/src/rx_rhi_vk/src/context.cpp
+@@ -1,20 +1,29 @@
+ #include <rx_rhi_vk/context.h>
+ #include <rx_core/log.h>
+ #include <VkBootstrap.h>
++#include <atomic>
++#include <cstddef>
+ #include <memory>
+ #include <string_view>
+ 
+ namespace rx::rhi {
+ 
+ namespace {
+ 
++// Backing store for Context::processValidationErrorCount() -- see that
++// declaration's own comment (rx_rhi_vk/context.h) for why this is
++// process-lifetime instead of per-Context. One TU (this file), one
++// instance for the whole process regardless of whether rx_rhi_vk links
++// static or shared into a given test binary.
++std::atomic<std::size_t> gProcessValidationErrorCount{0};
++
+ // Known false positive, narrowly scoped: vk-bootstrap's InstanceBuilder
+ // unconditionally enables VK_KHR_portability_enumeration (the extension and
+ // the corresponding VkInstanceCreateInfo::flags bit) whenever the Vulkan
+ // *loader* reports it available, with no InstanceBuilder API to opt out
+ // (checked directly against vk-bootstrap's header: only
+ // PhysicalDeviceSelector::disable_portability_subset() exists, a different,
+ // device-level knob -- nothing at the instance level). On a host whose
+ // installed VK_LAYER_KHRONOS_validation predates that extension (verified:
+ // this machine's apt-packaged layer is 1.3.204, with no newer apt candidate
+ // available), the layer doesn't recognize it and reports two messages for
+@@ -186,20 +195,21 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBits
+             RX_LOG_WARN("[vulkan validation] (known false positive: validation layer predates VK_KHR_portability_enumeration) {}", data->pMessage);
+         } else if (isKnownUnrecognizedSlangSourceLanguageBug(data->pMessage)) {
+             RX_LOG_WARN("[vulkan validation] (known false positive: validation layer predates SPIR-V SourceLanguage=Slang) {}", data->pMessage);
+         } else if (isKnownSyncValidationSeparateSamplerMisclassification(data->pMessage)) {
+             RX_LOG_WARN("[vulkan validation] (known false positive: validation layer's sync validation misclassifies a separate-sampler Texture2D.Sample() read; verified clean against a newer layer build) {}", data->pMessage);
+         } else if (isKnownSyncValidationSeparateSamplerMisclassificationViaExecuteCommands(data->pMessage)) {
+             RX_LOG_WARN("[vulkan validation] (known false positive: same separate-sampler misclassification as above, reported via vkCmdExecuteCommands for a chunked pass's secondary command buffer; verified clean against a newer layer build) {}", data->pMessage);
+         } else {
+             RX_LOG_ERROR("[vulkan validation] {}", data->pMessage);
+             (*errorCount)++;
++            gProcessValidationErrorCount.fetch_add(1, std::memory_order_relaxed);
+         }
+     } else {
+         RX_LOG_INFO("[vulkan validation] {}", data->pMessage);
+     }
+     return VK_FALSE;
+ }
+ 
+ }  // namespace
+ 
+ std::optional<Context> Context::create(std::vector<const char*> requiredExtensions, bool enableValidation) {
+@@ -291,20 +301,24 @@ std::optional<Context> Context::create(std::vector<const char*> requiredExtensio
+         RX_LOG_ERROR("vkb::InstanceBuilder::build failed: {}", result.error().message());
+         return std::nullopt;
+     }
+ 
+     vkb::Instance vkbInstance = result.value();
+     volkLoadInstance(vkbInstance.instance);
+ 
+     return Context(std::move(vkbInstance), errorCount);
+ }
+ 
++std::size_t Context::processValidationErrorCount() {
++    return gProcessValidationErrorCount.load(std::memory_order_relaxed);
++}
++
+ Context::Context(Context&& other) noexcept
+     : vkbInstance_(std::move(other.vkbInstance_)), errorCount_(std::move(other.errorCount_)) {
+     other.vkbInstance_.instance = VK_NULL_HANDLE;
+ }
+ 
+ Context& Context::operator=(Context&& other) noexcept {
+     if (this != &other) {
+         if (vkbInstance_.instance != VK_NULL_HANDLE) {
+             // destroy_instance() tears down both the debug messenger (if
+             // any) and the instance itself, in that order.
+diff --git a/src/rx_rhi_vk/tests/doctest_main.cpp b/src/rx_rhi_vk/tests/doctest_main.cpp
+index ecc327c..8fdb8ba 100644
+--- a/src/rx_rhi_vk/tests/doctest_main.cpp
++++ b/src/rx_rhi_vk/tests/doctest_main.cpp
+@@ -1,18 +1,20 @@
+ // DOCTEST_CONFIG_IMPLEMENT (not _WITH_MAIN): main() below needs to run code
+ // before any TEST_CASE executes, so it constructs and drives the
+ // doctest::Context itself instead of using doctest's generated main().
+ #define DOCTEST_CONFIG_IMPLEMENT
+ #include <doctest/doctest.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_platform/window.h>
+ 
++#include <cstdio>
++
+ // This is where every future rx_rhi_vk test file's code joins this binary,
+ // so this is where a real vk-bootstrap hazard gets a permanent, structural
+ // fix rather than a per-test-file workaround: see the WARNING on
+ // rx::rhi::Context::create() (rx_rhi_vk/context.h) for the full defect.
+ // Short version -- the pinned vk-bootstrap commit caches instance-level
+ // Vulkan function pointers process-wide from whichever vkb::Instance is
+ // built *first*, forever, with no reset. If any test in this binary ever
+ // builds a Context with narrower capabilities (fewer extensions -- e.g.
+ // headless -- or enableValidation=false) before another test builds one
+ // with broader capabilities (e.g. windowed and/or validated, needed by
+@@ -71,15 +73,42 @@ void warmUpVkBootstrapInstanceFunctionCache() {
+ }
+ 
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+     warmUpVkBootstrapInstanceFunctionCache();
+ 
+     doctest::Context context;
+     context.applyCommandLine(argc, argv);
+     int res = context.run();
++
++    // Harness gap fix: every fixture's CHECK_FALSE(context.hasValidationErrors())
++    // only observes validation errors raised BEFORE that line runs -- an
++    // error raised while the fixture's OWN destructor chain tears down
++    // afterward (the sampler-leak / unflushed-upload class -- VUID-
++    // vkDestroyDevice-device-00378 and friends) prints but was never
++    // re-checked by anything, so this binary could still exit 0. By the
++    // time context.run() returns here, doctest has already destroyed every
++    // TEST_CASE's fixture, including the very last one, so re-checking the
++    // PROCESS-lifetime tally now (rx::rhi::Context::processValidationErrorCount(),
++    // see its own comment in rx_rhi_vk/context.h) catches exactly that
++    // teardown-time class of error without changing what counts as a known
++    // false positive -- debugCallback()'s own filter list (context.cpp)
++    // remains the sole authority on that; this only re-reads its tally.
++    const std::size_t processErrors = rx::rhi::Context::processValidationErrorCount();
++    if (processErrors > 0) {
++        std::fprintf(stderr,
++                      "[rx_rhi_vk_tests] FAILED: %zu unfiltered Vulkan validation error(s) "
++                      "observed during this run (possibly raised during a fixture's own "
++                      "teardown, after that TEST_CASE's CHECK_FALSE(hasValidationErrors()) "
++                      "already ran) -- see the \"[vulkan validation]\" ERROR line(s) above.\n",
++                      processErrors);
++        if (res == 0) {
++            res = 1;
++        }
++    }
++
+     if (context.shouldExit()) {
+         return res;
+     }
+     return res;
+ }
+diff --git a/third_party/CMakeLists.txt b/third_party/CMakeLists.txt
+index 6a48516..99fcb05 100644
+--- a/third_party/CMakeLists.txt
++++ b/third_party/CMakeLists.txt
+@@ -591,24 +591,46 @@ set_target_properties(meshoptimizer::meshoptimizer PROPERTIES IMPORTED_GLOBAL TR
+ # `git ls-remote https://github.com/mmikk/MikkTSpace.git HEAD`) -- a
+ # commit hash, not a tag, since none exists (gate matrix row 5). No
+ # CMakeLists.txt exists in this repo either (it is two loose files,
+ # mikktspace.h/mikktspace.c, "designed to be stand-alone... copied and
+ # used as is into any tool" per the header's own doc comment) -- fetched
+ # source-only via FetchContent_Populate, exactly like volk/VMA/stb above,
+ # and compiled directly into src/rx_asset (see src/rx_asset/CMakeLists.txt)
+ # rather than through the dep-cache, matching this project's own
+ # established "no CMakeLists -> compile straight into the consumer"
+ # convention.
++#
++# Closure-sweep item 2 (upstream unmaintained -- no commits since
++# 2020-03-25, verified above -- so a local patch is the only option):
++# UBSan (both classic LLVM ubsan and zig's own trap-based sanitizer,
++# the latter aborting the process outright) reports undefined behavior
++# at mikktspace.c:1667 inside QuickSortEdges's pivot-selection PRNG --
++# "runtime error: shift exponent 32 is too large for 32-bit type
++# 'unsigned int'" on `uSeed>>(32-t)` whenever t==0. Patched via
++# PATCH_COMMAND (CMake/ExternalProject's own standard mechanism for
++# amending a FetchContent'd source tree, applied once per population,
++# same as every other FetchContent_Populate step above -- no hand-
++# rolled patching logic) against patches/mikktspace-ubsan-shift-fix.patch,
++# which carries the full rationale plus the UBSan citation and a
++# `// [RendererX local patch]` comment block inline in the patched
++# source itself. `-i <file>` (not shell redirection) keeps this a plain
++# argv command, portable across ExternalProject's execute_process
++# invocation. Verified: patch applies cleanly (`patch -p1 --dry-run`)
++# against a fresh checkout of the exact pinned commit above; the UBSan
++# report is gone afterward; the existing tangent-generation tests
++# produce byte-identical output before/after (closure-sweep-report.md
++# item 2 has the full before/after evidence).
+ set(RX_MIKKTSPACE_COMMIT "3e895b49d05ea07e4c2133156cfa94369e19e409")
+ FetchContent_Declare(mikktspace
+   GIT_REPOSITORY https://github.com/mmikk/MikkTSpace.git
+-  GIT_TAG ${RX_MIKKTSPACE_COMMIT})
++  GIT_TAG ${RX_MIKKTSPACE_COMMIT}
++  PATCH_COMMAND patch -p1 -i "${CMAKE_CURRENT_SOURCE_DIR}/patches/mikktspace-ubsan-shift-fix.patch")
+ FetchContent_GetProperties(mikktspace)
+ if(NOT mikktspace_POPULATED)
+   FetchContent_Populate(mikktspace)
+ endif()
+ # Same CMake 3.22 sibling-scope reason as volk/VMA/stb above: propagate to
+ # root scope for src/rx_asset (a sibling directory) to locate
+ # mikktspace.c/mikktspace.h.
+ set(mikktspace_SOURCE_DIR "${mikktspace_SOURCE_DIR}" PARENT_SCOPE)
+ 
+ # Draco: KHR_draco_mesh_compression decode [gate matrix §2B -- fastgltf
+diff --git a/third_party/patches/mikktspace-ubsan-shift-fix.patch b/third_party/patches/mikktspace-ubsan-shift-fix.patch
+new file mode 100644
+index 0000000..46bf9e4
+--- /dev/null
++++ b/third_party/patches/mikktspace-ubsan-shift-fix.patch
+@@ -0,0 +1,34 @@
++--- a/mikktspace.c
+++++ b/mikktspace.c
++@@ -1664,7 +1664,30 @@
++
++ 	// Random
++ 	t=uSeed&31;
++-	t=(uSeed<<t)|(uSeed>>(32-t));
+++	// [RendererX local patch, 2026-08-19] `uSeed>>(32-t)` is undefined
+++	// behavior in C whenever t==0 (shifting a 32-bit value by 32 is out
+++	// of range for the promoted operand's width) -- UBSan citation:
+++	// "mikktspace.c:1667:21: runtime error: shift exponent 32 is too
+++	// large for 32-bit type 'unsigned int'" (RendererX closure-sweep
+++	// item 2; reproduced under both LLVM UBSan and zig's trap-based
+++	// sanitizer, the latter aborting the process outright). Upstream
+++	// (github.com/mmikk/MikkTSpace, pinned 3e895b49d05ea07e4c2133156cf
+++	// a94369e19e409) is unmaintained -- no commits since 2020-03-25, no
+++	// tags/releases to pull a fix from -- so this is patched locally.
+++	// This is the well-known "rotate-left via subtract-from-width" bug
+++	// shape: t is a 5-bit rotate amount (t=uSeed&31, so t in [0,31]),
+++	// and rotate-left by 0 is mathematically the identity (uSeed
+++	// unchanged). On every target this project actually builds for
+++	// (x86-64, native and windows-cross-zig), the underlying shift
+++	// instruction already masks its count to 5 bits in hardware, so the
+++	// ORIGINAL expression already evaluated to `uSeed>>0 == uSeed` at
+++	// runtime whenever t==0 -- this patch makes that already-happening
+++	// identity explicit and UB-free instead of changing it. Verified
+++	// behavior-preserving: the existing tangent-generation tests
+++	// (gltf_pipeline_test.cpp's generateTangentsDeindexed/processPrimitive
+++	// cases) produce byte-identical tangent output before and after this
+++	// patch (see closure-sweep-report.md item 2).
+++	t = (t==0) ? uSeed : ((uSeed<<t)|(uSeed>>(32-t)));
++ 	uSeed=uSeed+t+3;
++ 	// Random end
++
