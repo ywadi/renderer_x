@@ -64,6 +64,18 @@ VkExtent2D toExtent(const AttachmentDesc& attachment) {
     return VkExtent2D{static_cast<uint32_t>(attachment.width + 0.5F), static_cast<uint32_t>(attachment.height + 0.5F)};
 }
 
+// [D29, gate ruling RC2] The one place both of executor.cpp's depth
+// clear-value sites derive their VkClearDepthStencilValue from --
+// Standard (D13's pre-Stage-2 default, and every non-main-camera pass
+// today: shadow maps stay standard-Z per D13 itself) clears to 1.0 (the
+// far plane, in the LESS-family convention); Reversed (D13's main-camera
+// convention from Stage 2 on) clears to 0.0 (the far plane, in the
+// GREATER_OR_EQUAL-family convention) -- both leave stencil at 0
+// (unused by any depth-only attachment this engine builds today).
+VkClearDepthStencilValue depthClearValueFor(DepthConvention convention) {
+    return convention == DepthConvention::Reversed ? VkClearDepthStencilValue{0.0F, 0} : VkClearDepthStencilValue{1.0F, 0};
+}
+
 // Every declared ResourceAccess a single pass makes against one physical
 // resource, combined into that resource's union of declared pipeline
 // stages/access bits -- an independent copy of barriers.cpp's own (private,
@@ -586,7 +598,7 @@ VkImageView resolveAttachmentView(Executor::Impl& impl, const ResolvedResource& 
 // ever": srcStage/srcAccess = NONE, oldLayout = UNDEFINED) -- hand-writing
 // it and then hand-seeding the resulting state as a real write is both
 // more precise and no more code than routing around the mask gap.
-void initializePinnedHistoryEntry(Executor::Impl& impl, uint32_t pinnedIndex) {
+void initializePinnedHistoryEntry(Executor::Impl& impl, uint32_t pinnedIndex, DepthConvention depthConvention) {
     detail::PinnedHistoryEntry& entry = impl.pool.pinned(pinnedIndex);
 
     auto cmdCtx = rx::rhi::CommandContext::create(impl.device, impl.graphicsQueue, impl.graphicsQueueFamily);
@@ -643,7 +655,9 @@ void initializePinnedHistoryEntry(Executor::Impl& impl, uint32_t pinnedIndex) {
             range.baseArrayLayer = 0;
             range.layerCount = VK_REMAINING_ARRAY_LAYERS;
             if (isDepthOrStencil) {
-                VkClearDepthStencilValue clearValue{1.0F, 0};
+                // [D29, gate ruling RC2] Per-pass, not a hardcoded 1.0 --
+                // see depthClearValueFor()'s own comment.
+                const VkClearDepthStencilValue clearValue = depthClearValueFor(depthConvention);
                 vkCmdClearDepthStencilImage(cmd, slot.texture->image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                              &clearValue, 1, &range);
             } else {
@@ -904,7 +918,13 @@ void Executor::realize(const RenderGraph& graph) {
             entry.format = physical.attachment.format;
             entry.extent = extent;
             if (freshlyCreated) {
-                initializePinnedHistoryEntry(impl, *pinnedIndex);
+                // [D29, gate ruling RC2] `physical.attachment.depthConvention`
+                // is in scope here (this is realize(), not
+                // initializePinnedHistoryEntry() itself) precisely because
+                // that function needs to know which clear value to use for
+                // a freshly-created history depth attachment too -- see its
+                // own comment.
+                initializePinnedHistoryEntry(impl, *pinnedIndex, physical.attachment.depthConvention);
             }
             continue;
         }
@@ -1116,7 +1136,10 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
                 depthAttachment.loadOp =
                     attachmentEverWritten[*depthPhysIdx] ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
                 depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-                depthAttachment.clearValue.depthStencil = VkClearDepthStencilValue{1.0F, 0};
+                // [D29, gate ruling RC2] Per-pass, not a process-wide 1.0
+                // constant -- see depthClearValueFor()'s own comment.
+                depthAttachment.clearValue.depthStencil =
+                    depthClearValueFor(compiled.resources()[*depthPhysIdx].attachment.depthConvention);
                 attachmentEverWritten[*depthPhysIdx] = true;
 
                 if (colorAttachments.empty()) {

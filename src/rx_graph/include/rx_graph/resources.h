@@ -34,6 +34,35 @@ enum class SizeClass : uint8_t {
     Absolute,
 };
 
+// [D29, gate ruling RC2, 2026-08-18] Which depth convention a depth/
+// depth-stencil AttachmentDesc's pass expects -- Standard (near=0, far=1,
+// VK_COMPARE_OP_LESS family, clear=1.0) is Vulkan's/this codebase's
+// original, pre-D13 default; Reversed (near=1, far=0,
+// VK_COMPARE_OP_GREATER_OR_EQUAL family, clear=0.0) is D13's main-camera
+// convention. Meaningless (left at its default, Standard) for a
+// color-only AttachmentDesc -- Executor only ever reads this field off a
+// pass's DEPTH attachment (see executor.cpp's two clear-value sites,
+// design doc D29's own citation: executor.cpp:646 and :1119 as of the
+// decision's own writing).
+//
+// Why a field on AttachmentDesc, not a second PassSignature/Pass axis: the
+// clear value AND the pass's own expected compare direction both derive
+// from the SAME one bit of information (which way "closer" reads on this
+// attachment) -- D29's own text: "the clear value and the pass's expected
+// compare direction derive from it". `PassSignature` (pass_signature.h)
+// deliberately stays attachment-SHAPE-only (format/count/samples) and this
+// convention is not part of it, matching that header's own documented
+// scope; a pass's fixed-function depth-compare-op is a `VkPipeline`-level
+// concern (D28, MaterialSystem::getPipeline()), entirely separate from
+// what this field governs (Executor's own clear-value selection).
+//
+// Default is Standard -- BYTE-IDENTICAL to this field's absence pre-D29:
+// every existing Pass::setDepthStencilOutput() call across every sample/
+// test in this codebase constructs an AttachmentDesc without ever naming
+// this field, and gets the exact clear value (1.0) Executor has always
+// used, unchanged.
+enum class DepthConvention : uint8_t { Standard, Reversed };
+
 // One image resource's declared shape, as written by the pass that
 // establishes it (addColorOutput/setDepthStencilOutput). `width`/`height`
 // are a multiplier of RenderGraph::compile()'s CompileInfo::swapchainWidth/
@@ -52,6 +81,10 @@ struct AttachmentDesc {
     float width = 1.0F;
     float height = 1.0F;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+
+    // [D29] See DepthConvention's own comment above. Ignored for a
+    // color-only attachment.
+    DepthConvention depthConvention = DepthConvention::Standard;
 };
 
 // One buffer resource's declared shape, as written by the pass that

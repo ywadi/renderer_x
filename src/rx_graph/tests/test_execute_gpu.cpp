@@ -1646,3 +1646,401 @@ TEST_CASE("Executor::execute chunks a BARE (compute-class, no attachment output)
 
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
+
+// ---------------------------------------------------------------------
+// D29 [gate ruling RC2, Task 22's real rx_graph blocker]: AttachmentDesc::
+// depthConvention drives Executor's own clear-value selection at the
+// ordinary per-pass site (executor.cpp's dynamic-rendering attachment
+// loop) -- the pinned-history init-clear site is a second, independent
+// call site (Task 1's own history GPU test already covers that clear
+// path structurally); this ticket's own acceptance criterion is "a
+// two-pass frame mixing both conventions", which the case below
+// satisfies directly with real GPU readback, not an assumption.
+// ---------------------------------------------------------------------
+namespace {
+
+constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
+
+AttachmentDesc absoluteDepthDesc(uint32_t width, uint32_t height, DepthConvention convention) {
+    AttachmentDesc desc;
+    desc.format = kDepthFormat;
+    desc.sizeClass = SizeClass::Absolute;
+    desc.width = static_cast<float>(width);
+    desc.height = static_cast<float>(height);
+    desc.depthConvention = convention;
+    return desc;
+}
+
+// A pooled depth attachment never gets VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+// (PhysicalResource::imageUsage is a union of DECLARED access kinds only
+// -- resources.h's own comment: "Task 1's Pass API has no readback/
+// screenshot declaration... there is nothing to union it from"), so this
+// test cannot vkCmdCopyImageToBuffer a pooled depth image directly --
+// exactly the same reason the "invert" case above never copies its own
+// pooled "color" resource straight out, instead SAMPLING it bindlessly
+// from a later pass and writing the result into the externally-owned,
+// copy-friendly backbuffer. This shader is that same idiom applied to a
+// depth attachment: reuses kInvertShaderSource's own fullscreen-triangle
+// vsMain verbatim (SV_VertexID trick, no vertex buffer) and an ordinary
+// (non-comparison) ".Sample()" fragment body -- proven legal for a
+// depth-only VK_FORMAT_D32_SFLOAT image view in THIS codebase already
+// (shaders/multipass/lit.frag.slang samples sample 05's own shadow map
+// the identical way, manual-compare included) -- outputting the raw
+// stored depth as a greyscale color so the EXISTING kFormat (R8G8B8A8_
+// UNORM) offscreen readback helpers above can read it back unchanged.
+// UNORM8 round-trips 0.0/1.0 exactly (no rounding), which is all this
+// test's own two clear values ever need.
+constexpr const char* kDepthProbeShaderSource = R"(
+struct PushConstants {
+    uint textureIndex;
+    uint samplerIndex;
+};
+
+[[vk::push_constant]]
+ConstantBuffer<PushConstants> gPush;
+
+[[vk::binding(0, 0)]]
+Texture2D gTextures[];
+
+[[vk::binding(1, 0)]]
+SamplerState gSamplers[];
+
+struct VSOut {
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+[shader("vertex")]
+VSOut vsMain(uint vertexID : SV_VertexID)
+{
+    float2 positions[3] = float2[3](
+        float2(-1.0, -1.0),
+        float2(3.0, -1.0),
+        float2(-1.0, 3.0)
+    );
+    float2 p = positions[vertexID];
+
+    VSOut o;
+    o.position = float4(p, 0.0, 1.0);
+    o.uv = p * 0.5 + 0.5;
+    return o;
+}
+
+[shader("fragment")]
+float4 fsMain(VSOut input) : SV_Target
+{
+    float depthValue = gTextures[gPush.textureIndex].Sample(gSamplers[gPush.samplerIndex], input.uv).r;
+    return float4(depthValue, depthValue, depthValue, 1.0);
+}
+)";
+
+const std::vector<std::string> kDepthProbeEntryPoints = {"vsMain", "fsMain"};
+
+struct DepthProbePipeline {
+    VkShaderModule vertModule = VK_NULL_HANDLE;
+    VkShaderModule fragModule = VK_NULL_HANDLE;
+    rx::rhi::PipelineLayoutBundle layoutBundle;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    uint32_t pushConstantOffset = 0;
+    uint32_t pushConstantSize = 0;
+    VkShaderStageFlags pushConstantStages = 0;
+};
+
+void destroyDepthProbePipeline(VkDevice device, DepthProbePipeline& p) {
+    if (p.pipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device, p.pipeline, nullptr);
+    }
+    if (p.fragModule != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, p.fragModule, nullptr);
+    }
+    if (p.vertModule != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, p.vertModule, nullptr);
+    }
+    p.pipeline = VK_NULL_HANDLE;
+    p.fragModule = VK_NULL_HANDLE;
+    p.vertModule = VK_NULL_HANDLE;
+    p.layoutBundle = rx::rhi::PipelineLayoutBundle{};
+}
+
+// Byte-for-byte the same shape as buildInvertPipeline() above (compile via
+// rx::shader::Compiler, reflect, PipelineLayoutBuilder's externalSet0
+// substitution, one color-only dynamic-rendering pipeline) -- not shared
+// because this file's own convention is per-case-local pipeline builders
+// (buildInvertPipeline/buildFillPipeline above are equally not shared with
+// each other).
+std::optional<DepthProbePipeline> buildDepthProbePipeline(VkDevice device, VkFormat colorFormat,
+                                                            VkDescriptorSetLayout bindlessSetLayout) {
+    DepthProbePipeline result;
+
+    auto compiler = rx::shader::Compiler::create();
+    if (!compiler.has_value()) {
+        return std::nullopt;
+    }
+
+    rx::shader::CompileResult compileResult =
+        compiler->compileFromSource("RxGraphDepthProbeModule", kDepthProbeShaderSource, kDepthProbeEntryPoints);
+    if (!compileResult.ok) {
+        MESSAGE("rx_graph depth-probe shader compile failed: ", compileResult.diagnostics);
+        return std::nullopt;
+    }
+
+    auto layoutInfo = rx::shader::reflect(compileResult);
+    if (!layoutInfo.has_value() || layoutInfo->pushRanges.size() != 1) {
+        return std::nullopt;
+    }
+    result.pushConstantOffset = layoutInfo->pushRanges[0].offset;
+    result.pushConstantSize = layoutInfo->pushRanges[0].size;
+    result.pushConstantStages = layoutInfo->pushRanges[0].stages;
+
+    auto layoutBundle = rx::rhi::PipelineLayoutBuilder::build(device, *layoutInfo, bindlessSetLayout);
+    if (!layoutBundle.has_value()) {
+        return std::nullopt;
+    }
+    result.layoutBundle = std::move(*layoutBundle);
+
+    for (const auto& blob : compileResult.entryPointCode) {
+        VkShaderModuleCreateInfo moduleInfo{};
+        moduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        moduleInfo.codeSize = blob.code.size() * sizeof(uint32_t);
+        moduleInfo.pCode = blob.code.data();
+
+        VkShaderModule module = VK_NULL_HANDLE;
+        if (vkCreateShaderModule(device, &moduleInfo, nullptr, &module) != VK_SUCCESS) {
+            destroyDepthProbePipeline(device, result);
+            return std::nullopt;
+        }
+        if (blob.entryPointName == "vsMain") {
+            result.vertModule = module;
+        } else if (blob.entryPointName == "fsMain") {
+            result.fragModule = module;
+        } else {
+            vkDestroyShaderModule(device, module, nullptr);
+            destroyDepthProbePipeline(device, result);
+            return std::nullopt;
+        }
+    }
+    if (result.vertModule == VK_NULL_HANDLE || result.fragModule == VK_NULL_HANDLE) {
+        destroyDepthProbePipeline(device, result);
+        return std::nullopt;
+    }
+
+    std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = result.vertModule;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = result.fragModule;
+    stages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo vertexInputState{};
+    vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssemblyState{};
+    inputAssemblyState.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rasterizationState{};
+    rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizationState.cullMode = VK_CULL_MODE_NONE;
+    rasterizationState.lineWidth = 1.0F;
+
+    VkPipelineMultisampleStateCreateInfo multisampleState{};
+    multisampleState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampleState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineColorBlendAttachmentState blendAttachment{};
+    blendAttachment.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+    VkPipelineColorBlendStateCreateInfo colorBlendState{};
+    colorBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlendState.attachmentCount = 1;
+    colorBlendState.pAttachments = &blendAttachment;
+
+    std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState{};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+    dynamicState.pDynamicStates = dynamicStates.data();
+
+    VkPipelineRenderingCreateInfo renderingCreateInfo{};
+    renderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    renderingCreateInfo.colorAttachmentCount = 1;
+    renderingCreateInfo.pColorAttachmentFormats = &colorFormat;
+
+    VkGraphicsPipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.pNext = &renderingCreateInfo;
+    pipelineInfo.stageCount = static_cast<uint32_t>(stages.size());
+    pipelineInfo.pStages = stages.data();
+    pipelineInfo.pVertexInputState = &vertexInputState;
+    pipelineInfo.pInputAssemblyState = &inputAssemblyState;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterizationState;
+    pipelineInfo.pMultisampleState = &multisampleState;
+    pipelineInfo.pColorBlendState = &colorBlendState;
+    pipelineInfo.pDynamicState = &dynamicState;
+    pipelineInfo.layout = result.layoutBundle.layout;
+    pipelineInfo.renderPass = VK_NULL_HANDLE;  // dynamic rendering
+    pipelineInfo.basePipelineIndex = -1;
+
+    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &result.pipeline) !=
+        VK_SUCCESS) {
+        destroyDepthProbePipeline(device, result);
+        return std::nullopt;
+    }
+
+    return result;
+}
+
+}  // namespace
+
+
+TEST_CASE("D29: a two-pass frame mixing Standard and Reversed depth conventions clears each to its own value") {
+    auto fixture = makeFixture("rx_graph_gpu_d29_depth_convention");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    const VkDevice device = fixture->device.device();
+    const VkPhysicalDevice physicalDevice = fixture->device.physicalDevice();
+
+    auto bindlessTable =
+        rx::rhi::BindlessTable::create(physicalDevice, device, rx::rhi::BindlessTable::Capacities{4, 2, 1});
+    REQUIRE(bindlessTable.has_value());
+
+    auto pipeline = buildDepthProbePipeline(device, kFormat, bindlessTable->descriptorSetLayout());
+    REQUIRE(pipeline.has_value());
+
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_NEAREST;
+    samplerInfo.minFilter = VK_FILTER_NEAREST;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    REQUIRE(vkCreateSampler(device, &samplerInfo, nullptr, &sampler) == VK_SUCCESS);
+    auto samplerHandle = bindlessTable->registerSampler(sampler);
+    REQUIRE(samplerHandle.isValid());
+
+    auto cmdCtx =
+        rx::rhi::CommandContext::create(device, fixture->device.graphicsQueue(), fixture->device.graphicsQueueFamily());
+    REQUIRE(cmdCtx.has_value());
+
+    auto offscreen = createOffscreenImage(device, physicalDevice, kFormat, VkExtent2D{kExtent, kExtent});
+    REQUIRE(offscreen.has_value());
+
+    // Runs ONE full graph -- "depth" (declares a depth attachment with
+    // `convention`, cleared by Executor's own LOAD_OP_CLEAR) -> "probe"
+    // (samples that depth attachment bindlessly, ordinary non-comparison
+    // `.Sample()`, and writes its raw stored value as greyscale straight
+    // into the backbuffer "bb") -- and returns the backbuffer's own R
+    // channel byte after readback. Two DISTINCT graphs (one per
+    // convention), not two passes sharing one graph's single backbuffer
+    // slot, exactly like this file's own "resize-rerealize" case
+    // (createOffscreenImage-backed, `fixture->executor->realize()`
+    // called twice against the SAME Executor -- proven safe by that
+    // earlier case already).
+    auto runOneConvention = [&](DepthConvention convention) -> uint8_t {
+        RenderGraph graph;
+        graph.addPass("depth")
+            .setDepthStencilOutput("depth", absoluteDepthDesc(kExtent, kExtent, convention))
+            .setSideEffect();
+        graph.addPass("probe")
+            .addTextureInput("depth")
+            .addColorOutput("bb", absoluteColorDesc(kExtent, kExtent))
+            .setExecute([&](PassContext& ctx) {
+                rx::rhi::BindlessHandle depthHandle =
+                    bindlessTable->registerSampledImage(ctx.imageView("depth"), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                REQUIRE(depthHandle.isValid());
+
+                vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
+                VkDescriptorSet set = bindlessTable->descriptorSet();
+                vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->layoutBundle.layout, 0, 1,
+                                         &set, 0, nullptr);
+                struct {
+                    uint32_t textureIndex;
+                    uint32_t samplerIndex;
+                } push{depthHandle.index(), samplerHandle.index()};
+                vkCmdPushConstants(ctx.cmd, pipeline->layoutBundle.layout, pipeline->pushConstantStages,
+                                    pipeline->pushConstantOffset, pipeline->pushConstantSize, &push);
+
+                VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.renderArea.width),
+                                     static_cast<float>(ctx.renderArea.height), 0.0F, 1.0F};
+                VkRect2D scissor{{0, 0}, ctx.renderArea};
+                vkCmdSetViewport(ctx.cmd, 0, 1, &viewport);
+                vkCmdSetScissor(ctx.cmd, 0, 1, &scissor);
+                vkCmdDraw(ctx.cmd, 3, 1, 0, 0);
+
+                // Deferred release, per bindless.h's own RELEASE-SAFETY
+                // CONTRACT -- this is a test with only one in-flight
+                // submission at a time (runOnce() waits idle), so an
+                // eager release AFTER the vkQueueWaitIdle() below is
+                // equally safe; keeping the release outside this
+                // callback (see below) avoids a dangling reference to a
+                // handle whose slot this SAME callback still needs while
+                // recording.
+                (void)depthHandle;
+            });
+        graph.setBackbufferSource("bb");
+
+        CompileInfo info;
+        info.swapchainWidth = kExtent;
+        info.swapchainHeight = kExtent;
+        info.swapchainFormat = kFormat;
+        // Task 3 ambiguity resolution #1: this offscreen "backbuffer" is
+        // never presented -- readback needs it left in TRANSFER_SRC_OPTIMAL,
+        // not the default PRESENT_SRC_KHR (same override the "invert" case
+        // above makes for the identical reason).
+        info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        graph.compile(info);
+        fixture->executor->realize(graph);
+
+        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+            fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
+        });
+
+        const VkDeviceSize pixelBytes = static_cast<VkDeviceSize>(kExtent) * kExtent * 4;
+        auto readback = fixture->allocator.createHostVisibleBuffer(pixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        REQUIRE(readback.has_value());
+        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+            VkBufferImageCopy region{};
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent = {kExtent, kExtent, 1};
+            vkCmdCopyImageToBuffer(cmd, offscreen->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1,
+                                    &region);
+        });
+        readback->invalidate();
+        uint8_t redChannel = 0;
+        std::memcpy(&redChannel, readback->mappedData(), sizeof(uint8_t));
+        return redChannel;
+    };
+
+    const uint8_t standardRed = runOneConvention(DepthConvention::Standard);
+    const uint8_t reversedRed = runOneConvention(DepthConvention::Reversed);
+
+    // The whole point of D29: two runs, each declaring ITS OWN
+    // DepthConvention, clear to two DIFFERENT values -- proving the
+    // executor reads AttachmentDesc::depthConvention per-attachment
+    // rather than the old process-wide 1.0 constant. UNORM8 round-trips
+    // 0.0/1.0 exactly: Standard's clear (1.0) reads back as 255;
+    // Reversed's clear (0.0) reads back as 0.
+    CHECK(static_cast<int>(standardRed) == 255);
+    CHECK(static_cast<int>(reversedRed) == 0);
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+    vkDeviceWaitIdle(device);
+    destroyDepthProbePipeline(device, *pipeline);
+    vkDestroySampler(device, sampler, nullptr);
+    destroyOffscreenImage(device, *offscreen);
+}
