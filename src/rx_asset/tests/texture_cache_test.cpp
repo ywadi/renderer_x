@@ -366,17 +366,32 @@ struct QuadrantPixels {
     std::array<uint8_t, 4> bottomRight;
 };
 
-// Renders the full-screen quad sampling `bindlessTextureIndex`/
-// `bindlessSamplerIndex` at explicit LOD `lod`, into a `extent`x`extent`
-// UNORM offscreen target, and returns the 4 corner pixels (well inside
-// each quadrant -- 1/4 and 3/4 fractions, matching this file's own
-// simpler quadrant geometry -- no bilinear-edge derivation needed since
-// SampleLevel against a POINT- or LINEAR-filtered single/explicit-LOD
-// sample of a flat-quadrant image is exact well within either quadrant
-// half regardless of filter mode).
+// Renders a quad sampling `bindlessTextureIndex`/`bindlessSamplerIndex` at
+// explicit LOD `lod`, into a `extent`x`extent` UNORM offscreen target, and
+// returns the 4 corner pixels (well inside each quadrant -- 1/4 and 3/4
+// fractions, matching this file's own simpler quadrant geometry -- no
+// bilinear-edge derivation needed since SampleLevel against a POINT- or
+// LINEAR-filtered single/explicit-LOD sample of a flat-quadrant image is
+// exact well within either quadrant half regardless of filter mode).
+//
+// `vertices` [Fix round 2, review finding: deduplicate] defaults to the
+// fixed [0,1]-cornered `kQuadVertices` above -- EVERY pre-existing caller
+// (this file's own established D10/D11/G6 test net) keeps compiling and
+// behaving byte-identically without passing this parameter at all. The
+// sampler-wrap regression TEST_CASE (below) is the one caller that passes
+// a CUSTOM quad: DamagedHelmet's real defect (helmet-sampler-fix-brief.md)
+// needs UV values OUTSIDE [0,1], which `kQuadVertices`'s fixed [0,1]
+// corners can never produce. (Previously a full, deliberately near-
+// identical duplicate of this function's own body under a second name,
+// `renderCustomQuadAndReadbackQuadrants()` -- consolidated here per code
+// review, since a defaulted parameter gives the same "zero risk to
+// existing callers" guarantee the duplicate was written to provide,
+// without carrying two ~90-line GPU-pipeline-setup bodies that would
+// otherwise drift independently.)
 std::optional<QuadrantPixels> renderAndReadbackQuadrants(TcTestFixture& fixture, uint32_t bindlessTextureIndex,
                                                            uint32_t bindlessSamplerIndex, float lod,
-                                                           uint32_t extent = 64) {
+                                                           uint32_t extent = 64,
+                                                           const std::array<QuadVertex, 4>& vertices = kQuadVertices) {
     VkDevice device = fixture.device.device();
     constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
 
@@ -385,13 +400,13 @@ std::optional<QuadrantPixels> renderAndReadbackQuadrants(TcTestFixture& fixture,
         return std::nullopt;
     }
 
-    auto vertexBuffer = fixture.allocator.createHostVisibleBuffer(sizeof(kQuadVertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    auto vertexBuffer = fixture.allocator.createHostVisibleBuffer(sizeof(vertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     auto indexBuffer = fixture.allocator.createHostVisibleBuffer(sizeof(kQuadIndices), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
     if (!vertexBuffer.has_value() || !indexBuffer.has_value()) {
         destroyQuadPipeline(device, *pipeline);
         return std::nullopt;
     }
-    std::memcpy(vertexBuffer->mappedData(), kQuadVertices.data(), sizeof(kQuadVertices));
+    std::memcpy(vertexBuffer->mappedData(), vertices.data(), sizeof(vertices));
     vertexBuffer->flush();
     std::memcpy(indexBuffer->mappedData(), kQuadIndices.data(), sizeof(kQuadIndices));
     indexBuffer->flush();
@@ -543,191 +558,6 @@ std::optional<QuadrantPixels> renderAndReadbackQuadrants(TcTestFixture& fixture,
     result.bottomLeft = pixelAt(q1, q3);
     result.bottomRight = pixelAt(q3, q3);
     return result;
-}
-
-// [Fix round, sampler-wrap P0] Renders a CALLER-SUPPLIED quad -- NOT the
-// fixed [0,1]-cornered `kQuadVertices` above -- sampling
-// `bindlessTextureIndex`/`bindlessSamplerIndex` at explicit LOD 0, and
-// returns the same 4-corner probe shape `renderAndReadbackQuadrants()`
-// itself returns (same "1/4, 3/4 screen-fraction" probe positions). A
-// DELIBERATE, near-identical duplicate of that function's own render+
-// readback body, not a shared/defaulted parameter: this fix round's own
-// missing-regression-class fixture needs UV values OUTSIDE [0,1]
-// (DamagedHelmet's real defect -- helmet-sampler-fix-brief.md -- V wholly
-// in [1.0005,1.9987]), which `kQuadVertices`'s fixed [0,1] corners can
-// never produce; duplicating here keeps EVERY existing caller of
-// renderAndReadbackQuadrants() (this file's own established D10/D11/G6
-// test net) at zero risk from this fix-round-only addition.
-std::optional<QuadrantPixels> renderCustomQuadAndReadbackQuadrants(TcTestFixture& fixture, uint32_t bindlessTextureIndex,
-                                                                     uint32_t bindlessSamplerIndex,
-                                                                     const std::array<QuadVertex, 4>& vertices,
-                                                                     uint32_t extent = 64) {
-    VkDevice device = fixture.device.device();
-    constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
-
-    auto pipeline = buildQuadPipeline(device, fixture.bindless, kColorFormat);
-    if (!pipeline.has_value()) {
-        return std::nullopt;
-    }
-
-    auto vertexBuffer = fixture.allocator.createHostVisibleBuffer(sizeof(vertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-    auto indexBuffer = fixture.allocator.createHostVisibleBuffer(sizeof(kQuadIndices), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-    if (!vertexBuffer.has_value() || !indexBuffer.has_value()) {
-        destroyQuadPipeline(device, *pipeline);
-        return std::nullopt;
-    }
-    std::memcpy(vertexBuffer->mappedData(), vertices.data(), sizeof(vertices));
-    vertexBuffer->flush();
-    std::memcpy(indexBuffer->mappedData(), kQuadIndices.data(), sizeof(kQuadIndices));
-    indexBuffer->flush();
-
-    VkImageCreateInfo imageInfo{};
-    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    imageInfo.imageType = VK_IMAGE_TYPE_2D;
-    imageInfo.format = kColorFormat;
-    imageInfo.extent = {extent, extent, 1};
-    imageInfo.mipLevels = 1;
-    imageInfo.arrayLayers = 1;
-    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImage image = VK_NULL_HANDLE;
-    if (vkCreateImage(device, &imageInfo, nullptr, &image) != VK_SUCCESS) {
-        destroyQuadPipeline(device, *pipeline);
-        return std::nullopt;
-    }
-    VkMemoryRequirements memReq{};
-    vkGetImageMemoryRequirements(device, image, &memReq);
-    VkPhysicalDeviceMemoryProperties memProps{};
-    vkGetPhysicalDeviceMemoryProperties(fixture.device.physicalDevice(), &memProps);
-    uint32_t memoryTypeIndex = UINT32_MAX;
-    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
-        if ((memReq.memoryTypeBits & (1U << i)) != 0U &&
-            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0U) {
-            memoryTypeIndex = i;
-            break;
-        }
-    }
-    if (memoryTypeIndex == UINT32_MAX) {
-        vkDestroyImage(device, image, nullptr);
-        destroyQuadPipeline(device, *pipeline);
-        return std::nullopt;
-    }
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = memReq.size;
-    allocInfo.memoryTypeIndex = memoryTypeIndex;
-    VkDeviceMemory imageMemory = VK_NULL_HANDLE;
-    if (vkAllocateMemory(device, &allocInfo, nullptr, &imageMemory) != VK_SUCCESS) {
-        vkDestroyImage(device, image, nullptr);
-        destroyQuadPipeline(device, *pipeline);
-        return std::nullopt;
-    }
-    vkBindImageMemory(device, image, imageMemory, 0);
-
-    VkImageViewCreateInfo viewInfo{};
-    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    viewInfo.image = image;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    viewInfo.format = kColorFormat;
-    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    viewInfo.subresourceRange.levelCount = 1;
-    viewInfo.subresourceRange.layerCount = 1;
-    VkImageView imageView = VK_NULL_HANDLE;
-    vkCreateImageView(device, &viewInfo, nullptr, &imageView);
-
-    const VkDeviceSize pixelBytes = static_cast<VkDeviceSize>(extent) * extent * 4;
-    std::vector<uint8_t> pixels(pixelBytes);
-
-    {
-        auto cmdCtx = rx::rhi::CommandContext::create(device, fixture.device.graphicsQueue(), fixture.device.graphicsQueueFamily());
-        if (!cmdCtx.has_value()) {
-            vkDestroyImageView(device, imageView, nullptr);
-            vkDestroyImage(device, image, nullptr);
-            vkFreeMemory(device, imageMemory, nullptr);
-            destroyQuadPipeline(device, *pipeline);
-            return std::nullopt;
-        }
-        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
-            rx::rhi::transitionImage(cmd, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-
-            VkRenderingAttachmentInfo colorAttachment{};
-            colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-            colorAttachment.imageView = imageView;
-            colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-            colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-            colorAttachment.clearValue.color = VkClearColorValue{{0.0F, 0.0F, 0.0F, 1.0F}};
-
-            VkRenderingInfo renderingInfo{};
-            renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-            renderingInfo.renderArea = VkRect2D{{0, 0}, {extent, extent}};
-            renderingInfo.layerCount = 1;
-            renderingInfo.colorAttachmentCount = 1;
-            renderingInfo.pColorAttachments = &colorAttachment;
-            vkCmdBeginRendering(cmd, &renderingInfo);
-
-            VkViewport viewport{0.0F, 0.0F, static_cast<float>(extent), static_cast<float>(extent), 0.0F, 1.0F};
-            vkCmdSetViewport(cmd, 0, 1, &viewport);
-            VkRect2D scissor{{0, 0}, {extent, extent}};
-            vkCmdSetScissor(cmd, 0, 1, &scissor);
-
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
-            VkDescriptorSet bindlessSet = fixture.bindless.descriptorSet();
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->layoutBundle.layout, 0, 1, &bindlessSet, 0, nullptr);
-
-            struct { uint32_t textureIndex; uint32_t samplerIndex; float lod; } push{bindlessTextureIndex, bindlessSamplerIndex, 0.0F};
-            vkCmdPushConstants(cmd, pipeline->layoutBundle.layout, pipeline->pushConstantStages, 0, sizeof(push), &push);
-
-            VkBuffer vb = vertexBuffer->handle();
-            VkDeviceSize vbOffset = 0;
-            vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOffset);
-            vkCmdBindIndexBuffer(cmd, indexBuffer->handle(), 0, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(cmd, static_cast<uint32_t>(kQuadIndices.size()), 1, 0, 0, 0);
-
-            vkCmdEndRendering(cmd);
-            rx::rhi::transitionImage(cmd, image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        });
-
-        auto readback = fixture.allocator.createHostVisibleBuffer(pixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        if (!readback.has_value()) {
-            vkDestroyImageView(device, imageView, nullptr);
-            vkDestroyImage(device, image, nullptr);
-            vkFreeMemory(device, imageMemory, nullptr);
-            destroyQuadPipeline(device, *pipeline);
-            return std::nullopt;
-        }
-        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
-            VkBufferImageCopy region{};
-            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            region.imageSubresource.layerCount = 1;
-            region.imageExtent = {extent, extent, 1};
-            vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1, &region);
-        });
-        readback->invalidate();
-        std::memcpy(pixels.data(), readback->mappedData(), pixels.size());
-    }
-
-    vkDeviceWaitIdle(device);
-    destroyQuadPipeline(device, *pipeline);
-    vkDestroyImageView(device, imageView, nullptr);
-    vkDestroyImage(device, image, nullptr);
-    vkFreeMemory(device, imageMemory, nullptr);
-
-    auto pixelAt2 = [&](uint32_t x, uint32_t y) -> std::array<uint8_t, 4> {
-        size_t o = (static_cast<size_t>(y) * extent + x) * 4;
-        return {pixels[o], pixels[o + 1], pixels[o + 2], pixels[o + 3]};
-    };
-    const uint32_t q1b = extent / 4;
-    const uint32_t q3b = extent - q1b - 1;
-    QuadrantPixels result2;
-    result2.topLeft = pixelAt2(q1b, q1b);
-    result2.topRight = pixelAt2(q3b, q1b);
-    result2.bottomLeft = pixelAt2(q1b, q3b);
-    result2.bottomRight = pixelAt2(q3b, q3b);
-    return result2;
 }
 
 bool approxEqual(const std::array<uint8_t, 4>& actual, std::array<uint8_t, 3> expectedRgb, int tolerance) {
@@ -1624,11 +1454,11 @@ TEST_CASE("Sampler-wrap regression: glTF-default REPEAT (samplers:[{}], DamagedH
         {{-1.0F, 1.0F, 0.0F}, {0.3125F, 1.6875F}},
     }};
 
-    auto topReadback =
-        renderCustomQuadAndReadbackQuadrants(*fixture, record.bindlessIndex, *samplerIndex, kRepeatRowTop);
+    auto topReadback = renderAndReadbackQuadrants(*fixture, record.bindlessIndex, *samplerIndex, /*lod=*/0.0F,
+                                                    /*extent=*/64, kRepeatRowTop);
     REQUIRE(topReadback.has_value());
-    auto bottomReadback =
-        renderCustomQuadAndReadbackQuadrants(*fixture, record.bindlessIndex, *samplerIndex, kRepeatRowBottom);
+    auto bottomReadback = renderAndReadbackQuadrants(*fixture, record.bindlessIndex, *samplerIndex, /*lod=*/0.0F,
+                                                       /*extent=*/64, kRepeatRowBottom);
     REQUIRE(bottomReadback.has_value());
 
     // THE discriminating assertion: V=1.3125 (wraps to row 2, the top/red

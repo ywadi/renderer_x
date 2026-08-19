@@ -96,7 +96,14 @@ std::optional<Fixture> makeFixture(const char* title) {
 
     rx::rhi::BindlessTable::Capacities capacities;
     capacities.sampledImages = 16;
-    capacities.samplers = 2;
+    // [Fix round 2] 4, not 2: the per-slot sampler-wiring coverage-gap
+    // TEST_CASE (below) registers its rig's own default sampler PLUS two
+    // more (REPEAT/CLAMP_TO_EDGE) against this same fixture's BindlessTable
+    // -- 3 live samplers at once, exceeding the old capacity of 2
+    // (empirically hit: `registerSampler` capacity-exhausted rejection).
+    // Purely permissive for every OTHER TEST_CASE in this file (none
+    // registers more than 1).
+    capacities.samplers = 4;
     capacities.storageBuffers = 8;
     auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
     REQUIRE(bindless.has_value());
@@ -1722,6 +1729,167 @@ TEST_CASE("StandardPBR: KHR_texture_transform offset/scale applied in-shader bef
     }
     CHECK(declaresUvTransform);
     CHECK(identityPixel.r == transformedPixel.r);  // solid texture -- transform changes WHERE, not the sampled value.
+    destroyRig(*rig);
+    CHECK_FALSE(rig->fixture->context.hasValidationErrors());
+}
+
+// [Fix round 2, coverage-gap closure -- reviewer Important finding] The
+// sampler-wrap P0's own rx_asset-level regression test (texture_cache_
+// test.cpp, "Sampler-wrap regression...") proves TextureCache::
+// getOrCreateSamplerBindlessIndex() builds and registers the right
+// VkSampler for a given glTF sampler object -- but it samples through a
+// raw bindless test shader, never through standard_pbr.slang/
+// StandardPbrParams itself. That leaves a real, narrow gap: a future bug
+// in HOW a caller (samples/08_gltf_viewer/main.cpp's own setupMaterials())
+// maps each SLOT's own resolved sampler index into the CORRECT named
+// gParams field (e.g. accidentally writing metallicRoughnessSampler's
+// resolved value into normalSampler, or here, baseColorSampler's into
+// emissiveSampler) would slip past every existing test -- the only thing
+// that would notice is the coarse, whole-image D17 pixel gate, which is
+// not slot-attributable and depends on DamagedHelmet's own specific
+// content rather than a purpose-built discriminating fixture.
+//
+// This closes that gap AT THE REAL SHADER: one 1x2 "striped" texture
+// (top texel RED, bottom texel BLUE) bound to BOTH baseColorTexture AND
+// emissiveTexture, sampled at the IDENTICAL out-of-[0,1] UV (V=1.125,
+// reached via the SAME KHR_texture_transform offset/scale mechanism the
+// TEST_CASE above already proves works) through TWO DIFFERENT real
+// samplers -- baseColorSampler=REPEAT, emissiveSampler=CLAMP_TO_EDGE.
+// Since both slots read the SAME texture at the SAME coordinate, the ONLY
+// thing that can make their sampled results differ is which sampler EACH
+// SLOT's own shader code actually names -- exactly what a slot-crossed
+// field assignment would get wrong, and exactly the "distinct wrap modes
+// on different slots of one material" shape requested.
+//
+// ISOLATION (no BRDF entanglement, no lighting-direction geometry to get
+// right): `ambientColor=(1,1,1)` + `lightColor=(0,0,0)` makes
+// `directLight` IDENTICALLY zero (standard_pbr.slang's own `directLight =
+// (diffuse+specular) * v.lightColor * NdotL` -- multiplying by a zero
+// lightColor zeroes it regardless of geometry/metallic/roughness), so
+// `color = ambient + emissive = ambientColor*occlusion*baseColor.rgb +
+// emissiveFactor*emissiveSample` exactly (occlusion==1.0 via the rig's own
+// default white occlusion texture, independent of occlusionStrength; see
+// this file's own "FG1 ambient closed-form" TEST_CASE for the identical
+// occlusion==1.0 fact, used there for the same reason). Two draws below
+// each zero the OTHER term via its own *Factor (baseColorFactor=0 for the
+// emissive-isolation draw; emissiveFactorAndPad=0 for the baseColor-
+// isolation draw), so each draw's final pixel is a DIRECT, unblended read
+// of exactly one slot's own sampled texel.
+TEST_CASE("StandardPBR per-slot sampler wiring: baseColorSampler/emissiveSampler independently select "
+          "REPEAT vs CLAMP_TO_EDGE for the SAME texture at the SAME UV [helmet sampler-wrap fix, coverage-gap "
+          "closure] -- a slot-crossed sampler assignment would misroute which slot reads which wrap behavior") {
+    auto rig = makeStandardPbrRig("standard_pbr_sampler_slot_wiring");
+    if (!rig.has_value()) {
+        return;
+    }
+    rx::material::MaterialHandle handle =
+        rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
+    const auto params = rig->system->materialParams(handle);
+
+    std::array<uint8_t, 8> stripePixels{
+        255, 0,   0,   255,  // row 0 (V in [0,0.5)): RED.
+        0,   0,   255, 255,  // row 1 (V in [0.5,1)): BLUE.
+    };
+    rx::material::TextureCreateInfo stripeInfo;
+    stripeInfo.width = 1;
+    stripeInfo.height = 2;
+    stripeInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    stripeInfo.pixels = stripePixels.data();
+    stripeInfo.pixelBytes = stripePixels.size();
+    rx::material::TextureHandle stripeHandle = rig->system->createTexture2D(stripeInfo);
+    REQUIRE(stripeHandle.isValid());
+    uint32_t stripeTex = rig->system->textureBindlessIndex(stripeHandle);
+
+    // Two real samplers, differing ONLY in wrap mode -- NEAREST filtering
+    // (not this rig's own default LINEAR) removes any bilinear-boundary
+    // ambiguity, matching the rx_asset-level regression test's own
+    // texel-center discipline.
+    // Raw handles collected for explicit teardown below (VkSampler is not
+    // an RAII type in this codebase's own test idiom -- see this file's
+    // own D26.1 two-draw TEST_CASE for the identical explicit-
+    // vkDestroySampler-before-fixture-teardown discipline this mirrors).
+    std::vector<VkSampler> rawWrapSamplers;
+    auto makeWrapSampler = [&](VkSamplerAddressMode mode) -> uint32_t {
+        VkSamplerCreateInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        info.magFilter = VK_FILTER_NEAREST;
+        info.minFilter = VK_FILTER_NEAREST;
+        info.addressModeU = mode;
+        info.addressModeV = mode;
+        info.addressModeW = mode;
+        info.maxLod = VK_LOD_CLAMP_NONE;
+        VkSampler sampler = VK_NULL_HANDLE;
+        REQUIRE(vkCreateSampler(rig->fixture->device.device(), &info, nullptr, &sampler) == VK_SUCCESS);
+        rawWrapSamplers.push_back(sampler);
+        rx::rhi::BindlessHandle h = rig->fixture->bindless.registerSampler(sampler);
+        REQUIRE(h.isValid());
+        return h.index();
+    };
+    uint32_t repeatSampler = makeWrapSampler(VK_SAMPLER_ADDRESS_MODE_REPEAT);
+    uint32_t clampSampler = makeWrapSampler(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+
+    // uv.y = 0.5*scaleY + offsetY = 0.5*1.0 + 0.625 = 1.125 -- OUTSIDE
+    // [0,1], matching DamagedHelmet's own "V wholly outside [0,1]" shape.
+    // REPEAT: frac(1.125)=0.125 -> row 0 (RED). CLAMP_TO_EDGE: clamps to
+    // 1.0 -> row 1 (BLUE, the last real texel -- 1.0 sits beyond every
+    // texel center, so NEAREST deterministically picks the edge texel,
+    // same reasoning as the rx_asset-level test).
+    const std::array<float, 4> kProbeUvTransform{0.0F, 0.625F, 1.0F, 1.0F};
+
+    rx::material::DrawDataGpu isolatedRow = makeHeadOnRow();
+    isolatedRow.ambientColor = glm::vec4(1.0F, 1.0F, 1.0F, 0.0F);
+    isolatedRow.lightColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
+
+    // `baseColorSamplerValue`/`emissiveSamplerValue` are passed through
+    // explicitly (not hardcoded inside this lambda) so the revert-proof
+    // below can swap exactly these two values -- simulating precisely the
+    // "setupMaterials() wrote the wrong resolved index into the wrong
+    // named field" bug class this TEST_CASE exists to catch.
+    auto makeBlob = [&](uint32_t baseColorSamplerValue, uint32_t emissiveSamplerValue, bool isolateBaseColor) {
+        std::vector<uint8_t> blob = makeDefaultStandardPbrBlob(*rig, handle);
+        setParam(blob, params, "baseColorTexture", stripeTex);
+        setParam(blob, params, "emissiveTexture", stripeTex);
+        setParam(blob, params, "baseColorSampler", baseColorSamplerValue);
+        setParam(blob, params, "emissiveSampler", emissiveSamplerValue);
+        setParam(blob, params, "baseColorUvOffsetScale", kProbeUvTransform);
+        setParam(blob, params, "emissiveUvOffsetScale", kProbeUvTransform);
+        if (isolateBaseColor) {
+            setParam(blob, params, "baseColorFactor", std::array<float, 4>{1.0F, 1.0F, 1.0F, 1.0F});
+            setParam(blob, params, "emissiveFactorAndPad", std::array<float, 4>{0.0F, 0.0F, 0.0F, 0.0F});
+        } else {
+            setParam(blob, params, "baseColorFactor", std::array<float, 4>{0.0F, 0.0F, 0.0F, 1.0F});
+            setParam(blob, params, "emissiveFactorAndPad", std::array<float, 4>{1.0F, 1.0F, 1.0F, 0.0F});
+        }
+        return blob;
+    };
+
+    // CORRECTLY wired: baseColorSampler=REPEAT, emissiveSampler=CLAMP --
+    // two DIFFERENT wrap modes on two DIFFERENT slots of the SAME material.
+    std::vector<uint8_t> baseColorBlob = makeBlob(repeatSampler, clampSampler, /*isolateBaseColor=*/true);
+    std::vector<uint8_t> emissiveBlob = makeBlob(repeatSampler, clampSampler, /*isolateBaseColor=*/false);
+
+    Rgba8 baseColorPixel = renderOne(*rig, handle, baseColorBlob, isolatedRow);
+    Rgba8 emissivePixel = renderOne(*rig, handle, emissiveBlob, isolatedRow);
+
+    // THE discriminating assertions: baseColorSampler=REPEAT -> RED;
+    // emissiveSampler=CLAMP_TO_EDGE -> BLUE. A slot-crossed field
+    // assignment would swap these two outcomes exactly (empirically
+    // confirmed -- see this fix round's report addendum for the
+    // swap-and-revert evidence: `makeBlob()`'s own two `setParam(...,
+    // "...Sampler", ...)` argument VALUES were swapped in place, this
+    // TEST_CASE failed all 6 assertions below with baseColorPixel reading
+    // BLUE and emissivePixel reading RED -- the exact inversion -- then
+    // reverted via `git checkout --`, confirmed passing again).
+    CHECK(baseColorPixel.r > 200);
+    CHECK(baseColorPixel.g < 50);
+    CHECK(baseColorPixel.b < 50);
+    CHECK(emissivePixel.b > 200);
+    CHECK(emissivePixel.r < 50);
+    CHECK(emissivePixel.g < 50);
+
+    for (VkSampler sampler : rawWrapSamplers) {
+        vkDestroySampler(rig->fixture->device.device(), sampler, nullptr);
+    }
     destroyRig(*rig);
     CHECK_FALSE(rig->fixture->context.hasValidationErrors());
 }
