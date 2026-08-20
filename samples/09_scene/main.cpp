@@ -98,6 +98,7 @@
 
 #include "draw_recording.h"
 #include "fly_camera.h"
+#include "grid_layout.h"
 #include "mouse_capture.h"
 #include <reference_gate.h>
 
@@ -1604,17 +1605,39 @@ bool populateImportedInstances(App& app, const rx::asset::Registry& registry, co
 }
 
 // --- Grid layout [deterministic layer-mask culling -- see this file's own
-// header comment] ---------------------------------------------------------
-glm::mat4 gridTransform(uint32_t row, uint32_t col, float spacing) {
-    const float x = (static_cast<float>(col) - 0.5F * static_cast<float>(kGridCols - 1)) * spacing;
-    const float z = -(static_cast<float>(row) * spacing);
-    return glm::translate(glm::mat4(1.0F), glm::vec3(x, 0.0F, z));
+// header comment] -- gridTransform()/gridInstanceTransform() themselves
+// live in grid_layout.h now [Issue #35] -- see that header's own top
+// comment for why (device-free, test-seam extraction, same precedent as
+// fly_camera.h/mouse_capture.h/draw_recording.h). ------------------------
+
+// [Issue #35] The single root-node transform DamagedHelmet.gltf's own
+// import produces -- both populateHelmetGrid() call sites (runHeadless()/
+// runPresent()) feed this into gridInstanceTransform() so the grid
+// composes the SAME node rotation the --scene import path
+// (populateImportedInstances(), InstanceRecord::worldTransform) and sample
+// 08's own single-helmet view already apply. Defensive fallback to
+// identity + a loud warning if the import ever produces zero instances for
+// this asset (never observed against the real fetched DamagedHelmet, which
+// has exactly one root node) -- silently rendering with no rotation is
+// exactly this issue's own regression class, so this path is never silent.
+glm::mat4 helmetAssetNodeTransform(const rx::asset::ImportResult& result) {
+    if (result.scene.instances.empty()) {
+        RX_LOG_WARN("sample_09_scene: DamagedHelmet import produced zero scene instances -- grid falling back to an "
+                    "identity node transform (helmets may render in the WRONG orientation)");
+        return glm::mat4(1.0F);
+    }
+    return result.scene.instances[0].worldTransform;
 }
 
 // Populates the helmet grid's Scene/DrawListBuilder/renderables given the
 // real imported MeshHandle (Registry already holds the MeshAsset by the
 // time this runs -- see runHeadless()/runPresent()'s own import call).
-bool populateHelmetGrid(App& app, rx::asset::MeshHandle helmetMesh) {
+// `assetNodeTransform` is the imported DamagedHelmet's own single root-node
+// transform (result.scene.instances[0].worldTransform at both call sites
+// -- see grid_layout.h's own top comment for why the grid must compose
+// this in, matching the --scene import path's orientation instead of
+// dropping it).
+bool populateHelmetGrid(App& app, rx::asset::MeshHandle helmetMesh, const glm::mat4& assetNodeTransform) {
     const glm::vec3 size = app.helmetLocalBounds.isValid() ? (app.helmetLocalBounds.max - app.helmetLocalBounds.min)
                                                              : glm::vec3(1.0F);
     const float radius = std::max(0.5F * glm::length(size), 0.01F);
@@ -1630,7 +1653,7 @@ bool populateHelmetGrid(App& app, rx::asset::MeshHandle helmetMesh) {
         for (uint32_t col = 0; col < kGridCols; ++col) {
             rx::scene::RenderableDesc desc;
             desc.mesh = helmetMesh;
-            desc.transform = gridTransform(row, col, spacing);
+            desc.transform = rx::samples9::gridInstanceTransform(row, col, spacing, kGridCols, assetNodeTransform);
             desc.layers = (1u << row);
             // Row 0 alone carries the highlight channel EXCLUSIVELY (never
             // 0xFF) -- see HudState's own comment for why this isolates
@@ -2623,7 +2646,7 @@ int runHeadless(const Args& args) {
             destroyApp(*app);
             return 1;
         }
-        if (!populateHelmetGrid(*app, result.meshes[0])) {
+        if (!populateHelmetGrid(*app, result.meshes[0], helmetAssetNodeTransform(result))) {
             destroyApp(*app);
             return 1;
         }
@@ -3140,7 +3163,8 @@ int runPresent(const Args& args) {
             destroyApp(*app);
             return 1;
         }
-        if (!setupHelmetMaterial(*app, app->registry->material(result.materials[0])) || !populateHelmetGrid(*app, result.meshes[0])) {
+        if (!setupHelmetMaterial(*app, app->registry->material(result.materials[0])) ||
+            !populateHelmetGrid(*app, result.meshes[0], helmetAssetNodeTransform(result))) {
             frameSync.reset();
             destroyApp(*app);
             return 1;

@@ -17,10 +17,18 @@
 # composes with the toggle state" requirement, and why this needs the real
 # Window rather than re-mocking window.cpp's own already-tested
 # (src/rx_platform/tests/window_test.cpp) FOCUS_LOST/FOCUS_GAINED logic.
+#
+# test_grid_layout.cpp covers ../grid_layout.h (also device-free,
+# header-only -- no matching .cpp to add) -- Issue #35's dropped-asset-
+# node-rotation regression coverage (the default DamagedHelmet grid
+# rendered every helmet lying on its back; the D17 pixel-diff gate alone
+# proved blind to it, since the committed reference was itself baked FROM
+# the buggy render -- see that test file's own top comment).
 add_executable(sample_09_scene_tests
     doctest_main.cpp
     test_draw_recording.cpp
     test_fly_camera.cpp
+    test_grid_layout.cpp
     test_mouse_capture.cpp
     test_mouse_capture_focus_composition.cpp
     "${CMAKE_CURRENT_SOURCE_DIR}/../draw_recording.cpp"
