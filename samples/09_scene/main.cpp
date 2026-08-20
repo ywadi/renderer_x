@@ -684,6 +684,16 @@ struct App {
     };
     std::unordered_map<uint32_t, BlockBuffers> blockBufferCache;
 
+    // [Phase 4 exit fix wave, I3] Main-thread-cached, exactly like
+    // blockBufferCache above (same rationale: MaterialSystem::
+    // pipelineLayout() is now guarded main-thread-only -- docs/threading.md
+    // -- so a worker chunk cannot call it directly). Set once, at setup,
+    // by buildPipelineTokenMap() -- every participating material shares
+    // the identical pipeline-layout SHAPE (Vulkan spec 14.2.2
+    // set-compatibility), so caching any one binding's layout here is
+    // valid for the whole run, not just one frame.
+    VkPipelineLayout cachedAnyMaterialLayout = VK_NULL_HANDLE;
+
     // Mode-agnostic materialIndex -> real MaterialHandle resolver, bound
     // once at setup depending on which scene kind is active (grid/stress/
     // custom-import via --scene) -- lets updateSceneFrame()'s D27
@@ -710,30 +720,88 @@ struct App {
     std::array<MaterialGpuBinding, kStressVariantCount> stressMaterialBindings;
     std::array<bool, kStressVariantCount> stressVariantDoubleSided{};
 
-    // D26.1 per-pass draw-data buffer -- sized ONCE, generously
-    // (scene->renderableCount() at setup time -- see makeDrawDataBuffer())
-    // so the buffer never needs live Vulkan recreation even though
+    // D26.1 per-pass draw-data buffer -- capacity sized ONCE, generously,
+    // from the ACTUAL submesh-instance total each populate*() function
+    // computes for its own mode (kGridInstanceCount for the grid;
+    // `totalSubmeshCount` across every instance's own submesh count for an
+    // imported scene -- see populateImportedInstances()'s own comment for
+    // why `scene->renderableCount()` alone undercounts a multi-submesh mesh
+    // like Sponza; that undercount was the H1 heap-overflow bug 1ea8a01
+    // fixed) so the buffer never needs live Vulkan recreation even though
     // `ViewLists::payloads.size()` legitimately varies frame to frame
-    // (culling/collapse). Re-written (mapped host-visible memcpy) every
-    // frame from resolveDrawGroups()'s own output order.
-    std::optional<rx::rhi::Buffer> drawDataBuffer;
-    rx::rhi::BindlessHandle drawDataBufferHandle;
+    // (culling/collapse).
+    //
+    // [Phase 4 exit fix wave, I1] TWO physical buffers per logical buffer,
+    // one per `rx::rhi::FrameSync::kFramesInFlight` slot -- NOT one shared
+    // buffer -- selected each frame by `currentFrameSlot` below. A single
+    // shared buffer rewritten every frame races frame N-1's GPU reads of
+    // it (frame N's CPU write can land while frame N-1's vertex/fragment
+    // shaders are still reading the SAME buffer, with FramesInFlight==2 and
+    // no synchronization between the two): the present loop only proves,
+    // via its own slot fence wait, that frame N-2 (the last frame that used
+    // THIS SAME slot's buffer) has completed -- frame N-1 always used the
+    // OTHER slot, so per-slot buffers make that proof sufficient. Mirrors
+    // `rx::material::MaterialSystem`'s own `ParamArena` FIF discipline (the
+    // named precedent: `material_system.h`'s `beginFrame()` documents the
+    // identical "only after the caller's own fence wait for this slot"
+    // contract). `currentFrameSlot`-th buffer is memcpy'd + flushed by
+    // `uploadSceneFrameGpuBuffers()`, called AFTER the present loop's own
+    // `vkWaitForFences(currentFence)` -- `updateSceneFrame()` below only
+    // builds/populates the CPU-side row mirrors (list-building can safely
+    // stay before the fence wait; only the GPU-visible write cannot).
+    std::array<std::optional<rx::rhi::Buffer>, rx::rhi::FrameSync::kFramesInFlight> drawDataBuffers;
+    std::array<rx::rhi::BindlessHandle, rx::rhi::FrameSync::kFramesInFlight> drawDataBufferHandles;
     std::vector<rx::material::DrawDataGpu> drawDataRows;  // CPU staging mirror, reused capacity.
     uint32_t drawDataCapacityRows = 0;
+
+    // [Phase 4 exit fix wave, I1] Which of the two FIF buffer slots this
+    // frame's GPU-visible draw data lives in -- set exactly once per frame,
+    // on the main thread, before `executor->execute()` (present mode: right
+    // after the slot fence wait, alongside `uploadSceneFrameGpuBuffers()`;
+    // headless mode: always 0, since `captureFrame()`'s `runOnce()` is
+    // fully synchronous with zero cross-frame GPU overlap to race). Read
+    // (never written) by `recordForwardChunk()`'s worker chunks and
+    // `recordShadowPass()` -- safe because the write above always
+    // happens-before `executor->execute()`'s chunk fan-out, the same
+    // established precedent `App::blockBufferCache`'s own comment documents.
+    uint32_t currentFrameSlot = 0;
 
     // Shadow pass state [D21, RC3] -- built only when NOT --stress (see
     // this file's own header comment: stress-v2's own A/B comparability
     // contract never mentions shadows, so it skips the pass entirely for a
     // leaner, more directly comparable workload).
+    //
+    // [Phase 4 exit fix wave, C1] NO sample-owned VkImage/VkDeviceMemory/
+    // VkImageView here anymore -- "shadowmap" is a genuine rx_graph
+    // TRANSIENT resource now (declareGraph()'s "shadow" pass writes it,
+    // "forward" reads it via addTextureInput()), so its physical image is
+    // owned and lifetime-tracked by the Executor's own TransientPool, not
+    // this sample. `lastShadowMapView`/`shadowMapHandle` mirror
+    // `lastHdrView`/`hdrHandle`'s own established re-registration pattern
+    // (`recordTonemapDraw()` below; also samples/05_multipass's
+    // `recordLitDrawsChunked()`) -- (re-)registered lazily, from chunk 0 of
+    // the chunked "forward" pass (`recordForwardChunk()`), the one place a
+    // chunked pass may safely call the main-thread-only BindlessTable API
+    // [D4 chunk-0 affordance].
     bool shadowEnabled = false;
-    VkImage shadowImage = VK_NULL_HANDLE;
-    VkDeviceMemory shadowMemory = VK_NULL_HANDLE;
-    VkImageView shadowView = VK_NULL_HANDLE;
+    // [Phase 4 exit fix wave, C1] Debug/test-only toggle -- when true,
+    // forces every row's shadowMapTextureIndex to the documented
+    // 0xFFFFFFFF fully-lit sentinel for this frame, exactly reproducing the
+    // phase-exit review's own runtime discrimination probe (which flipped
+    // `app.shadowEnabled` via gdb -- see updateSceneFrame()'s own comment
+    // on why THIS flag, not shadowEnabled itself, is the clean equivalent:
+    // it forces the shader-side bypass without touching the shadow PASS's
+    // own recording/list-building, so the graph structure and the shadow
+    // map's own contents stay exactly as they'd otherwise be). Read only by
+    // updateSceneFrame()'s row-population loop; never true outside the
+    // headless gate's own D17 discrimination re-proof (runHeadlessGrid()).
+    bool debugForceShadowSentinel = false;
+    VkImageView lastShadowMapView = VK_NULL_HANDLE;
     VkSampler shadowCompareSampler = VK_NULL_HANDLE;
     rx::rhi::BindlessHandle shadowCompareSamplerHandle;
     rx::rhi::BindlessHandle shadowMapHandle;
-    std::optional<rx::rhi::Buffer> shadowDrawDataBuffer;
-    rx::rhi::BindlessHandle shadowDrawDataBufferHandle;
+    std::array<std::optional<rx::rhi::Buffer>, rx::rhi::FrameSync::kFramesInFlight> shadowDrawDataBuffers;
+    std::array<rx::rhi::BindlessHandle, rx::rhi::FrameSync::kFramesInFlight> shadowDrawDataBufferHandles;
     std::vector<rx::shadow::ShadowDrawData> shadowDrawDataRows;
     uint32_t shadowDrawDataCapacityRows = 0;
     rx::shadow::ShadowFrustumFit shadowFit;
@@ -940,10 +1008,18 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
 
 void destroyShadowResources(App& app) {
     const VkDevice device = app.device->device();
-    if (app.shadowDrawDataBufferHandle.isValid()) {
-        app.bindless->release(app.shadowDrawDataBufferHandle);
+    for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
+        if (app.shadowDrawDataBufferHandles[slot].isValid()) {
+            app.bindless->release(app.shadowDrawDataBufferHandles[slot]);
+        }
+        app.shadowDrawDataBuffers[slot].reset();
     }
-    app.shadowDrawDataBuffer.reset();
+    // [Phase 4 exit fix wave, C1] No sample-owned shadow VkImage/
+    // VkDeviceMemory/VkImageView to destroy anymore -- "shadowmap" is a
+    // graph transient now, torn down by the Executor's own TransientPool
+    // (see App::lastShadowMapView's own comment). `shadowMapHandle` is a
+    // bindless registration ONLY (release the slot; the view it pointed at
+    // is someone else's resource to destroy).
     if (app.shadowMapHandle.isValid()) {
         app.bindless->release(app.shadowMapHandle);
     }
@@ -953,18 +1029,6 @@ void destroyShadowResources(App& app) {
     if (app.shadowCompareSampler != VK_NULL_HANDLE) {
         vkDestroySampler(device, app.shadowCompareSampler, nullptr);
         app.shadowCompareSampler = VK_NULL_HANDLE;
-    }
-    if (app.shadowView != VK_NULL_HANDLE) {
-        vkDestroyImageView(device, app.shadowView, nullptr);
-        app.shadowView = VK_NULL_HANDLE;
-    }
-    if (app.shadowImage != VK_NULL_HANDLE) {
-        vkDestroyImage(device, app.shadowImage, nullptr);
-        app.shadowImage = VK_NULL_HANDLE;
-    }
-    if (app.shadowMemory != VK_NULL_HANDLE) {
-        vkFreeMemory(device, app.shadowMemory, nullptr);
-        app.shadowMemory = VK_NULL_HANDLE;
     }
 }
 
@@ -996,10 +1060,12 @@ void destroyApp(App& app) {
         vkDestroyDescriptorSetLayout(app.device->device(), app.materialParamSetLayout, nullptr);
         app.materialParamSetLayout = VK_NULL_HANDLE;
     }
-    if (app.drawDataBufferHandle.isValid() && app.bindless.has_value()) {
-        app.bindless->release(app.drawDataBufferHandle);
+    for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
+        if (app.drawDataBufferHandles[slot].isValid() && app.bindless.has_value()) {
+            app.bindless->release(app.drawDataBufferHandles[slot]);
+        }
+        app.drawDataBuffers[slot].reset();
     }
-    app.drawDataBuffer.reset();
     destroyCompiledPass(app.device->device(), app.tonemapPass);
     if (app.defaultSamplerHandle.isValid() && app.bindless.has_value()) {
         app.bindless->release(app.defaultSamplerHandle);
@@ -1369,6 +1435,33 @@ bool setupImportedMaterials(App& app, const rx::asset::Registry& registry, const
     return true;
 }
 
+// [Phase 4 exit fix wave, I1] Shared by all three populate*()/build*()
+// call sites below -- allocates `rx::rhi::FrameSync::kFramesInFlight`
+// SEPARATE physical draw-data buffers (not one shared buffer -- see
+// App::drawDataBuffers' own comment for the frames-in-flight race this
+// closes) and registers each into bindless, sized for `rows` rows.
+// `app.drawDataCapacityRows`/`app.drawDataRows` (the CPU staging mirror)
+// are set here too, once, for every mode.
+bool createDrawDataBuffers(App& app, uint32_t rows) {
+    app.drawDataCapacityRows = rows;
+    app.drawDataRows.assign(rows, rx::material::DrawDataGpu{});
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(rows) * sizeof(rx::material::DrawDataGpu);
+    for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
+        app.drawDataBuffers[slot] =
+            app.allocator->createHostVisibleBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
+        if (!app.drawDataBuffers[slot].has_value()) {
+            RX_LOG_ERROR("sample_09_scene: createHostVisibleBuffer (draw data, slot {}) failed", slot);
+            return false;
+        }
+        app.drawDataBufferHandles[slot] = app.bindless->registerStorageBuffer(app.drawDataBuffers[slot]->handle(), bytes);
+        if (!app.drawDataBufferHandles[slot].isValid()) {
+            RX_LOG_ERROR("sample_09_scene: registerStorageBuffer (draw data, slot {}) failed", slot);
+            return false;
+        }
+    }
+    return true;
+}
+
 // Populates `scene`/`drawListBuilder` from a real ImportResult's own
 // `scene.instances` (--scene <path> present-mode override, e.g. Sponza) --
 // every instance keeps its DEFAULT layers(~0u)/channels(0xFF) (no
@@ -1432,17 +1525,7 @@ bool populateImportedInstances(App& app, const rx::asset::Registry& registry, co
     app.flyCamera.camera.cullMask = ~0u;
     app.moveSpeed = std::max(radius * 0.5F, 1.0F);
 
-    app.drawDataCapacityRows = std::max<uint32_t>(totalSubmeshCount, 1);
-    app.drawDataRows.assign(app.drawDataCapacityRows, rx::material::DrawDataGpu{});
-    const VkDeviceSize bytes = static_cast<VkDeviceSize>(app.drawDataCapacityRows) * sizeof(rx::material::DrawDataGpu);
-    app.drawDataBuffer = app.allocator->createHostVisibleBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
-    if (!app.drawDataBuffer.has_value()) {
-        RX_LOG_ERROR("sample_09_scene: createHostVisibleBuffer (imported-scene draw data) failed");
-        return false;
-    }
-    app.drawDataBufferHandle = app.bindless->registerStorageBuffer(app.drawDataBuffer->handle(), bytes);
-    if (!app.drawDataBufferHandle.isValid()) {
-        RX_LOG_ERROR("sample_09_scene: registerStorageBuffer (imported-scene draw data) failed");
+    if (!createDrawDataBuffers(app, std::max<uint32_t>(totalSubmeshCount, 1))) {
         return false;
     }
     return true;
@@ -1508,17 +1591,7 @@ bool populateHelmetGrid(App& app, rx::asset::MeshHandle helmetMesh) {
     app.flyCamera.camera.cullMask = app.hud.cullMaskFromToggles();  // == (1<<kVisibleRowCount)-1 by HudState's own default.
     app.moveSpeed = std::max(radius * 2.0F, 0.5F);
 
-    app.drawDataCapacityRows = kGridInstanceCount;
-    app.drawDataRows.assign(kGridInstanceCount, rx::material::DrawDataGpu{});
-    const VkDeviceSize bytes = static_cast<VkDeviceSize>(kGridInstanceCount) * sizeof(rx::material::DrawDataGpu);
-    app.drawDataBuffer = app.allocator->createHostVisibleBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
-    if (!app.drawDataBuffer.has_value()) {
-        RX_LOG_ERROR("sample_09_scene: createHostVisibleBuffer (draw data) failed");
-        return false;
-    }
-    app.drawDataBufferHandle = app.bindless->registerStorageBuffer(app.drawDataBuffer->handle(), bytes);
-    if (!app.drawDataBufferHandle.isValid()) {
-        RX_LOG_ERROR("sample_09_scene: registerStorageBuffer (draw data) failed");
+    if (!createDrawDataBuffers(app, kGridInstanceCount)) {
         return false;
     }
     return true;
@@ -1648,17 +1721,7 @@ bool buildStressField(App& app, uint32_t drawCount) {
     app.flyCamera.camera.cullMask = ~0u;
     app.moveSpeed = 10.0F;
 
-    app.drawDataCapacityRows = drawCount;
-    app.drawDataRows.assign(drawCount, rx::material::DrawDataGpu{});
-    const VkDeviceSize bytes = static_cast<VkDeviceSize>(drawCount) * sizeof(rx::material::DrawDataGpu);
-    app.drawDataBuffer = app.allocator->createHostVisibleBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
-    if (!app.drawDataBuffer.has_value()) {
-        RX_LOG_ERROR("sample_09_scene: createHostVisibleBuffer (stress draw data) failed");
-        return false;
-    }
-    app.drawDataBufferHandle = app.bindless->registerStorageBuffer(app.drawDataBuffer->handle(), bytes);
-    if (!app.drawDataBufferHandle.isValid()) {
-        RX_LOG_ERROR("sample_09_scene: registerStorageBuffer (stress draw data) failed");
+    if (!createDrawDataBuffers(app, drawCount)) {
         return false;
     }
     return true;
@@ -1675,66 +1738,35 @@ void buildPipelineTokenMap(App& app, std::span<const MaterialGpuBinding> binding
         VkPipeline pipeline = app.materialSystem->getPipeline({binding.handle, sig, 0});
         app.pipelineTokenToBinding[std::bit_cast<uint64_t>(pipeline)] = &binding;
     }
+    // [Phase 4 exit fix wave, I3] Hoisted here, main-thread-only, setup-time
+    // (this function is never called mid-frame) -- NOT recomputed inside
+    // recordForwardChunk() anymore, which ran on worker chunks >= 1 and
+    // called the now-guarded MaterialSystem::pipelineLayout() from there
+    // (a sibling of the Task-24 GeometryPool::bind() violation). Every
+    // participating material shares the IDENTICAL pipeline-layout SHAPE
+    // (external bindless set-0 substitution + material set-1 -- Vulkan spec
+    // 14.2.2 set-compatibility), so any one binding's layout is legal to
+    // cache and reuse for every chunk regardless of which pipeline a given
+    // draw ends up binding.
+    if (!bindings.empty()) {
+        app.cachedAnyMaterialLayout = app.materialSystem->pipelineLayout(bindings.front().handle);
+    }
 }
 
 // --- Shadow setup [D21, RC3] ----------------------------------------------
+// [Phase 4 exit fix wave, C1] No raw vkCreateImage/vkAllocateMemory/
+// vkCreateImageView here anymore: "shadowmap" is declared as a genuine
+// rx_graph transient (declareGraph()'s "shadow" pass writes it,
+// shadowAttachmentDesc()), so the Executor's own TransientPool owns and
+// lifetime-tracks its physical VkImage -- registering it into bindless
+// happens lazily, from recordForwardChunk()'s chunk 0, exactly like
+// "hdr"'s own lastHdrView/hdrHandle re-registration pattern
+// (recordTonemapDraw() below). This function now only builds the
+// comparison sampler (a real, independent Vulkan object -- not
+// graph-owned) and the light-frustum fit + per-FIF shadow draw-data
+// buffers.
 bool setupShadow(App& app) {
     const VkDevice device = app.device->device();
-    const VkPhysicalDevice physicalDevice = app.device->physicalDevice();
-
-    VkImageCreateInfo imageInfo{};
-    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    imageInfo.imageType = VK_IMAGE_TYPE_2D;
-    imageInfo.format = kShadowFormat;
-    imageInfo.extent = {kShadowMapResolution, kShadowMapResolution, 1};
-    imageInfo.mipLevels = 1;
-    imageInfo.arrayLayers = 1;
-    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    imageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (vkCreateImage(device, &imageInfo, nullptr, &app.shadowImage) != VK_SUCCESS) {
-        RX_LOG_ERROR("sample_09_scene: vkCreateImage(shadow map) failed");
-        return false;
-    }
-    VkMemoryRequirements memReq{};
-    vkGetImageMemoryRequirements(device, app.shadowImage, &memReq);
-    VkPhysicalDeviceMemoryProperties memProps{};
-    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
-    uint32_t memoryTypeIndex = UINT32_MAX;
-    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
-        if ((memReq.memoryTypeBits & (1U << i)) != 0U &&
-            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0U) {
-            memoryTypeIndex = i;
-            break;
-        }
-    }
-    if (memoryTypeIndex == UINT32_MAX) {
-        RX_LOG_ERROR("sample_09_scene: no device-local memory type found for the shadow map");
-        return false;
-    }
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = memReq.size;
-    allocInfo.memoryTypeIndex = memoryTypeIndex;
-    if (vkAllocateMemory(device, &allocInfo, nullptr, &app.shadowMemory) != VK_SUCCESS) {
-        RX_LOG_ERROR("sample_09_scene: vkAllocateMemory(shadow map) failed");
-        return false;
-    }
-    if (vkBindImageMemory(device, app.shadowImage, app.shadowMemory, 0) != VK_SUCCESS) {
-        RX_LOG_ERROR("sample_09_scene: vkBindImageMemory(shadow map) failed");
-        return false;
-    }
-    VkImageViewCreateInfo viewInfo{};
-    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    viewInfo.image = app.shadowImage;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    viewInfo.format = kShadowFormat;
-    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
-    if (vkCreateImageView(device, &viewInfo, nullptr, &app.shadowView) != VK_SUCCESS) {
-        RX_LOG_ERROR("sample_09_scene: vkCreateImageView(shadow map) failed");
-        return false;
-    }
 
     // Comparison sampler [D21, matches rx_material's own
     // test_standard_pbr_shadow_gpu.cpp rig verbatim].
@@ -1755,11 +1787,6 @@ bool setupShadow(App& app) {
     app.shadowCompareSamplerHandle = app.bindless->registerComparisonSampler(app.shadowCompareSampler);
     if (!app.shadowCompareSamplerHandle.isValid()) {
         RX_LOG_ERROR("sample_09_scene: registerComparisonSampler failed");
-        return false;
-    }
-    app.shadowMapHandle = app.bindless->registerSampledImage(app.shadowView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    if (!app.shadowMapHandle.isValid()) {
-        RX_LOG_ERROR("sample_09_scene: registerSampledImage(shadow map) failed");
         return false;
     }
 
@@ -1792,31 +1819,48 @@ bool setupShadow(App& app) {
     // by this point.
     app.shadowDrawDataCapacityRows = app.drawDataCapacityRows;
     app.shadowDrawDataRows.assign(app.shadowDrawDataCapacityRows, rx::shadow::ShadowDrawData{});
-    const VkDeviceSize shadowBytes = static_cast<VkDeviceSize>(app.shadowDrawDataCapacityRows) * sizeof(rx::shadow::ShadowDrawData);
-    app.shadowDrawDataBuffer =
-        app.allocator->createHostVisibleBuffer(std::max<VkDeviceSize>(shadowBytes, sizeof(rx::shadow::ShadowDrawData)),
-                                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
-    if (!app.shadowDrawDataBuffer.has_value()) {
-        RX_LOG_ERROR("sample_09_scene: createHostVisibleBuffer (shadow draw data) failed");
-        return false;
-    }
-    app.shadowDrawDataBufferHandle = app.bindless->registerStorageBuffer(
-        app.shadowDrawDataBuffer->handle(), std::max<VkDeviceSize>(shadowBytes, sizeof(rx::shadow::ShadowDrawData)));
-    if (!app.shadowDrawDataBufferHandle.isValid()) {
-        RX_LOG_ERROR("sample_09_scene: registerStorageBuffer (shadow draw data) failed");
-        return false;
+    const VkDeviceSize shadowBytes =
+        std::max<VkDeviceSize>(static_cast<VkDeviceSize>(app.shadowDrawDataCapacityRows) * sizeof(rx::shadow::ShadowDrawData),
+                                sizeof(rx::shadow::ShadowDrawData));
+    // [Phase 4 exit fix wave, I1] Per-FIF-slot, same rationale as
+    // createDrawDataBuffers() above -- the shadow pass's own draw-data SSBO
+    // is exactly as exposed to the frames-in-flight host-write race as the
+    // forward pass's.
+    for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
+        app.shadowDrawDataBuffers[slot] =
+            app.allocator->createHostVisibleBuffer(shadowBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
+        if (!app.shadowDrawDataBuffers[slot].has_value()) {
+            RX_LOG_ERROR("sample_09_scene: createHostVisibleBuffer (shadow draw data, slot {}) failed", slot);
+            return false;
+        }
+        app.shadowDrawDataBufferHandles[slot] = app.bindless->registerStorageBuffer(app.shadowDrawDataBuffers[slot]->handle(), shadowBytes);
+        if (!app.shadowDrawDataBufferHandles[slot].isValid()) {
+            RX_LOG_ERROR("sample_09_scene: registerStorageBuffer (shadow draw data, slot {}) failed", slot);
+            return false;
+        }
     }
     app.shadowEnabled = true;
     return true;
 }
 
 // --- Per-frame update -----------------------------------------------------
-// Cull+collapse (DrawListBuilder::build()/buildShadow()), populate both
-// D26.1 draw-data buffers from the resulting `payloads[]` (NOT from a
-// per-renderable loop -- see this file's own header comment), and
-// D27-pre-resolve every distinct materialIndex boundary -- all on the main
-// thread, BEFORE `executor->execute()` (chunk fan-out never touches any of
-// this again).
+// Cull+collapse (DrawListBuilder::build()/buildShadow()), populate the CPU
+// staging mirror of both D26.1 draw-data buffers from the resulting
+// `payloads[]` (NOT from a per-renderable loop -- see this file's own
+// header comment), and D27-pre-resolve every distinct materialIndex
+// boundary -- all on the main thread, BEFORE `executor->execute()` (chunk
+// fan-out never touches any of this again).
+//
+// [Phase 4 exit fix wave, I1] Deliberately does NOT write to the GPU-visible
+// draw-data buffers anymore -- only `app.drawDataRows`/`app.shadowDrawDataRows`
+// (plain CPU `std::vector`s, list-building's own scratch, safe to touch at
+// any point before the frame's GPU work is submitted). The actual
+// memcpy+flush into `app.drawDataBuffers[slot]`/`app.shadowDrawDataBuffers[slot]`
+// is `uploadSceneFrameGpuBuffers()` below, called separately, AFTER the
+// caller's own frame-slot fence wait -- see that function's own comment for
+// why this split is load-bearing, not cosmetic (a single host-visible
+// buffer written here, before the fence wait, is exactly the frames-in-flight
+// host-write race this fix wave's I1 finding closed).
 void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
     // Refresh the block-buffer cache [see App::blockBufferCache's own
     // comment] -- main-thread-only GeometryPool accessors, called here so
@@ -1850,7 +1894,21 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
         row.ambientColor = glm::vec4(0.12F, 0.12F, 0.12F, 0.0F);
         row.cameraPosWorld = glm::vec4(cameraPos, 0.0F);
         row.materialIndex = payload.materialIndex;
-        if (app.shadowEnabled) {
+        // [Phase 4 exit fix wave, C1] Also requires `app.shadowMapHandle.
+        // isValid()` -- NOT just `app.shadowEnabled` -- since the handle is
+        // now (re-)registered lazily, from recordForwardChunk()'s chunk 0,
+        // the first time the graph-owned "shadowmap" transient is realized
+        // (see App::lastShadowMapView's own comment). Before that first
+        // registration (only ever true on the very first frame of a run:
+        // the physical resource is never resized/evicted afterward, so the
+        // handle stays valid and correct for every later frame), rows fall
+        // back to the SAME documented 0xFFFFFFFF fully-lit sentinel the
+        // shadowEnabled==false path already uses -- a well-defined,
+        // one-frame-only degrade, never a read of an unregistered/stale
+        // bindless slot. `!app.debugForceShadowSentinel`: see that field's
+        // own comment -- the D17 discrimination re-proof's clean equivalent
+        // of the review's own gdb-flip probe.
+        if (app.shadowEnabled && app.shadowMapHandle.isValid() && !app.debugForceShadowSentinel) {
             row.lightViewProj = glm::transpose(app.shadowFit.lightViewProj);
             row.shadowMapTextureIndex = app.shadowMapHandle.index();
             row.shadowCompareSamplerIndex = app.shadowCompareSamplerHandle.index();
@@ -1858,11 +1916,6 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
         } else {
             row.shadowMapTextureIndex = 0xFFFFFFFFu;
         }
-    }
-    if (!app.viewLists.payloads.empty()) {
-        const VkDeviceSize bytes = app.viewLists.payloads.size() * sizeof(rx::material::DrawDataGpu);
-        std::memcpy(app.drawDataBuffer->mappedData(), app.drawDataRows.data(), static_cast<size_t>(bytes));
-        app.drawDataBuffer->flush();
     }
 
     if (app.shadowEnabled) {
@@ -1872,11 +1925,6 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
             rx::shadow::ShadowDrawData& row = app.shadowDrawDataRows[i];
             row.model = glm::transpose(transforms[payload.instanceDataIndex]);
             row.lightViewProj = glm::transpose(app.shadowFit.lightViewProj);
-        }
-        if (!app.shadowLists.payloads.empty()) {
-            const VkDeviceSize bytes = app.shadowLists.payloads.size() * sizeof(rx::shadow::ShadowDrawData);
-            std::memcpy(app.shadowDrawDataBuffer->mappedData(), app.shadowDrawDataRows.data(), static_cast<size_t>(bytes));
-            app.shadowDrawDataBuffer->flush();
         }
     }
 
@@ -1892,6 +1940,41 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
             VkPipeline pipeline = app.materialSystem->getPipeline({handle, passSig, 0});
             return std::bit_cast<uint64_t>(pipeline);
         });
+}
+
+// [Phase 4 exit fix wave, I1] The GPU-write half `updateSceneFrame()` above
+// deliberately no longer performs -- memcpy's `app.drawDataRows`/
+// `app.shadowDrawDataRows` (already populated by `updateSceneFrame()`) into
+// THIS frame's `frameSlot`-th physical buffer and flushes it. Sets
+// `app.currentFrameSlot = frameSlot` first (read by `recordForwardChunk()`'s
+// worker chunks and `recordShadowPass()` to select the matching bindless
+// handle -- see App::currentFrameSlot's own comment).
+//
+// CALLER CONTRACT: must be called AFTER the caller has confirmed, via its
+// own fence wait, that frame `frameSlot`'s prior GPU work (the last frame
+// that wrote/read this SAME physical slot, `rx::rhi::FrameSync::
+// kFramesInFlight` frames ago) has completed -- mirrors
+// `rx::material::MaterialSystem::beginFrame()`'s own documented "only after
+// the caller's own fence wait for this slot" contract (material_system.h),
+// the named FIF-discipline precedent this fix wave's I1 finding cites.
+// samples/09_scene's present loop calls this right after
+// `vkWaitForFences(frameSync->currentFence())`; headless mode (no real
+// frames-in-flight overlap -- `captureFrame()`'s `runOnce()` submits and
+// waits synchronously every call) always passes slot 0.
+void uploadSceneFrameGpuBuffers(App& app, uint32_t frameSlot) {
+    app.currentFrameSlot = frameSlot;
+
+    if (!app.viewLists.payloads.empty()) {
+        const VkDeviceSize bytes = app.viewLists.payloads.size() * sizeof(rx::material::DrawDataGpu);
+        std::memcpy(app.drawDataBuffers[frameSlot]->mappedData(), app.drawDataRows.data(), static_cast<size_t>(bytes));
+        app.drawDataBuffers[frameSlot]->flush();
+    }
+
+    if (app.shadowEnabled && !app.shadowLists.payloads.empty()) {
+        const VkDeviceSize bytes = app.shadowLists.payloads.size() * sizeof(rx::shadow::ShadowDrawData);
+        std::memcpy(app.shadowDrawDataBuffers[frameSlot]->mappedData(), app.shadowDrawDataRows.data(), static_cast<size_t>(bytes));
+        app.shadowDrawDataBuffers[frameSlot]->flush();
+    }
 }
 
 // --- Recording -------------------------------------------------------------
@@ -1911,7 +1994,10 @@ void recordShadowPass(rx::graph::PassContext& ctx, App& app) {
     app.shadowCaster->bindAndSetDepthBias(cmd, /*constantFactor=*/2.0F, /*slopeFactor=*/2.5F);
     VkDescriptorSet set = app.bindless->descriptorSet();
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, app.shadowCaster->pipelineLayout(), 0, 1, &set, 0, nullptr);
-    rx::shadow::ShadowCasterPushConstants push{app.shadowDrawDataBufferHandle.index()};
+    // [Phase 4 exit fix wave, I1] `app.currentFrameSlot`-th buffer -- see
+    // that field's own comment; set by uploadSceneFrameGpuBuffers() before
+    // executor->execute() ever reaches this callback.
+    rx::shadow::ShadowCasterPushConstants push{app.shadowDrawDataBufferHandles[app.currentFrameSlot].index()};
     vkCmdPushConstants(cmd, app.shadowCaster->pipelineLayout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
 
     // ShadowLists is a single-pipeline pass (RC3) -- `blocks` alone (no
@@ -1926,6 +2012,34 @@ void recordShadowPass(rx::graph::PassContext& ctx, App& app) {
 }
 
 void recordForwardChunk(rx::graph::PassContext& ctx, App& app, uint32_t chunkIndex, uint32_t chunkCount) {
+    if (chunkIndex == 0 && app.shadowEnabled) {
+        // [Phase 4 exit fix wave, C1] (Re-)register "shadowmap"'s CURRENT
+        // resolved view into bindless, once per execute() call -- NOT once
+        // per draw -- main-thread-only (BindlessTable registration,
+        // docs/threading.md), safe here ONLY because chunk 0 of a
+        // setExecuteChunked() callback is guaranteed to run synchronously,
+        // on the calling (main) thread, before any other chunk begins
+        // [pass.h: Pass::setExecuteChunked()'s own doc comment]. Placed
+        // BEFORE every early return below (unlike the rest of this
+        // function's body) so it always runs on chunk 0 regardless of
+        // whether this particular frame has any forward draws at all --
+        // exactly samples/05_multipass's own recordLitDrawsChunked()
+        // pattern, applied to "shadowmap" instead of "hdr". `ctx.imageView`
+        // resolves against whatever Executor::realize() most recently
+        // bound "shadowmap" to (declareGraph()'s "shadow" pass output) --
+        // legal to call here specifically because "forward" now declares
+        // addTextureInput("shadowmap"), making the name part of this
+        // compiled graph's own resolvable resource set.
+        VkImageView shadowView = ctx.imageView("shadowmap");
+        if (shadowView != app.lastShadowMapView) {
+            if (app.shadowMapHandle.isValid()) {
+                app.bindless->release(app.shadowMapHandle);
+            }
+            app.shadowMapHandle = app.bindless->registerSampledImage(shadowView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            app.lastShadowMapView = shadowView;
+        }
+    }
+
     VkCommandBuffer cmd = ctx.chunkCommandBuffer();
     VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.renderArea.width), static_cast<float>(ctx.renderArea.height),
                         0.0F, 1.0F};
@@ -1948,13 +2062,19 @@ void recordForwardChunk(rx::graph::PassContext& ctx, App& app, uint32_t chunkInd
         return;
     }
     VkDescriptorSet set = app.bindless->descriptorSet();
-    // Every participating material shares the IDENTICAL pipeline-layout
-    // SHAPE (external bindless set-0 substitution + material set-1) --
-    // any one binding's own pipelineLayout() is legal to bind set 0
-    // against regardless of which pipeline ends up bound later (Vulkan
-    // spec 14.2.2 set-compatibility, same precedent samples/08_gltf_viewer's
-    // own recordSceneDraws() already relies on).
-    VkPipelineLayout anyLayout = app.materialSystem->pipelineLayout(app.pipelineTokenToBinding.begin()->second->handle);
+    // [Phase 4 exit fix wave, I3] Main-thread-cached at setup
+    // (buildPipelineTokenMap()) -- NOT resolved here anymore.
+    // MaterialSystem::pipelineLayout() is guarded main-thread-only
+    // (docs/threading.md); calling it from this worker chunk (chunkIndex
+    // can be >= 1) was the exact violation class Task 24 already fixed for
+    // GeometryPool::bind() (see App::blockBufferCache's own comment) but
+    // left unfixed one call site later, here. Every participating material
+    // shares the IDENTICAL pipeline-layout SHAPE (external bindless set-0
+    // substitution + material set-1) -- any one binding's layout is legal
+    // to bind set 0 against regardless of which pipeline ends up bound
+    // later (Vulkan spec 14.2.2 set-compatibility, same precedent
+    // samples/08_gltf_viewer's own recordSceneDraws() already relies on).
+    VkPipelineLayout anyLayout = app.cachedAnyMaterialLayout;
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, anyLayout, /*firstSet=*/0, 1, &set, 0, nullptr);
 
     // [D27 caller-side fix -- see draw_recording.h's own header comment]
@@ -1989,7 +2109,10 @@ void recordForwardChunk(rx::graph::PassContext& ctx, App& app, uint32_t chunkInd
             auto it = app.pipelineTokenToBinding.find(span.pipelineToken);
             if (it != app.pipelineTokenToBinding.end()) {
                 const MaterialGpuBinding& mb = *it->second;
-                rx::material::MaterialGlobalsPush push{app.defaultSamplerHandle.index(), app.drawDataBufferHandle.index(), 0.0F};
+                // [Phase 4 exit fix wave, I1] `app.currentFrameSlot`-th
+                // buffer -- see that field's own comment.
+                rx::material::MaterialGlobalsPush push{app.defaultSamplerHandle.index(),
+                                                         app.drawDataBufferHandles[app.currentFrameSlot].index(), 0.0F};
                 vkCmdPushConstants(cmd, anyLayout, mb.pushStages, mb.pushOffset, mb.pushSize, &push);
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, anyLayout, /*firstSet=*/1, 1, &mb.paramSet, 0,
                                          nullptr);
@@ -2065,8 +2188,25 @@ void declareGraph(rx::graph::RenderGraph& graph, App& app, VkFormat backbufferFo
             .setExecute([&app](rx::graph::PassContext& ctx) { recordShadowPass(ctx, app); });
     }
 
-    graph.addPass("forward")
-        .addColorOutput("hdr", swapchainRelativeDesc(kHdrFormat))
+    rx::graph::Pass& forward = graph.addPass("forward");
+    if (app.shadowEnabled) {
+        // [Phase 4 exit fix wave, C1] THE fix: "forward" genuinely CONSUMES
+        // "shadowmap" through the graph -- this both (a) un-culls the
+        // "shadow" pass (RenderGraph::compile()'s reachability walk now
+        // reaches it transitively: "forward" is reachable from the
+        // backbuffer writer, and "forward" depends on "shadowmap"'s
+        // writer), and (b) buys the depth-write -> sampled-read barrier
+        // (layout transition + availability/visibility) the graph derives
+        // for every addTextureInput() declaration -- exactly D29's
+        // documented mixed-convention composition (reversed-Z "forward" +
+        // standard-Z "shadow" in one graph) working as designed, NOT a
+        // setSideEffect() band-aid on the "shadow" pass (which would keep
+        // it alive without ever proving anything downstream actually reads
+        // its output, or deriving the layout transition the forward
+        // shader's SampleCmp taps require).
+        forward.addTextureInput("shadowmap");
+    }
+    forward.addColorOutput("hdr", swapchainRelativeDesc(kHdrFormat))
         .setDepthStencilOutput("depth", swapchainRelativeReversedDepthDesc(kDepthFormat))
         .setExecuteChunked(
             [&app](rx::graph::PassContext& ctx, uint32_t chunkIndex, uint32_t chunkCount) {
@@ -2510,6 +2650,11 @@ int runHeadless(const Args& args) {
     for (uint32_t frame = 0; frame < kHeadlessFrameCount; ++frame) {
         const auto frameStart = std::chrono::steady_clock::now();
         updateSceneFrame(*app, *app->scheduler);
+        // [Phase 4 exit fix wave, I1] Headless capture is fully synchronous
+        // (captureFrame()'s cmdCtx->runOnce() submits and waits every
+        // call, below) -- no frames-in-flight GPU overlap to race, so slot
+        // 0 always is correct and sufficient here.
+        uploadSceneFrameGpuBuffers(*app, /*frameSlot=*/0);
         app->overlay->beginFrame();  // no widgets this frame -- HUD pass renders empty draw data, scene pixels untouched.
 
         const rx::scene::CullCounters& c = app->viewLists.counters;
@@ -2592,6 +2737,7 @@ int runHeadless(const Args& args) {
         rx::core::debug::detail::setViolationHookForTests(
             [](const char* context) { violations.emplace_back(context != nullptr ? context : ""); });
         updateSceneFrame(*app, *app->scheduler);
+        uploadSceneFrameGpuBuffers(*app, /*frameSlot=*/0);  // [I1] headless: always slot 0 -- see the main gate loop's own comment.
         app->overlay->beginFrame();  // every captureFrame() call executes the graph, which always runs the HUD pass's
                                       // own unconditional ImGui::Render() -- must pair with a fresh NewFrame() each time.
         std::vector<uint8_t> guardPixels = captureFrame();
@@ -2609,6 +2755,7 @@ int runHeadless(const Args& args) {
     // --- HUD smoke-test frame [matrix row 16] -- real widgets, NOT
     // pixel-gated. ---------------------------------------------------------
     updateSceneFrame(*app, *app->scheduler);
+    uploadSceneFrameGpuBuffers(*app, /*frameSlot=*/0);  // [I1] headless: always slot 0.
     app->overlay->beginFrame();
     drawHud(*app, *app->device, app->surface, /*presentMode=*/false);
     std::vector<uint8_t> hudFramePixels = captureFrame();
@@ -2654,6 +2801,52 @@ int runHeadless(const Args& args) {
                 RX_LOG_ERROR("sample_09_scene: D17 grid_scene gate FAILED on lavapipe (first mismatch at ({},{}))",
                              result.firstMismatchX, result.firstMismatchY);
                 gateOk = false;
+            }
+        }
+
+        // [Phase 4 exit fix wave, C1] Discrimination re-proof: re-renders
+        // the EXACT same static-camera frame with app.debugForceShadowSentinel
+        // forced true (every row's shadow term bypassed -- the clean,
+        // reproducible equivalent of the phase-exit review's own gdb-flip
+        // probe) and asserts the result DIFFERS from `gatedPixels` by more
+        // than a noise floor. Before C1's fix this would have found
+        // failingPixels == 0 (the committed reference baked the
+        // ambient/emissive-only, always-shadowed output, so real shadows
+        // and "no shadows at all" rendered identically); the review's own
+        // reproduction measured ~726/65536 (1.11%) on lavapipe once a real
+        // shadow term existed to turn off.
+        if (!gatedPixels.empty()) {
+            app->debugForceShadowSentinel = true;
+            updateSceneFrame(*app, *app->scheduler);
+            uploadSceneFrameGpuBuffers(*app, /*frameSlot=*/0);
+            app->overlay->beginFrame();  // pair with the fresh NewFrame() every captureFrame() call needs.
+            std::vector<uint8_t> shadowOffPixels = captureFrame();
+            app->debugForceShadowSentinel = false;
+
+            if (shadowOffPixels.empty()) {
+                RX_LOG_ERROR("sample_09_scene: C1 discrimination re-proof: shadow-disabled capture failed");
+                gateOk = false;
+            } else {
+                rx::samples::GateResult discrimination = rx::samples::compareToReference(
+                    gatedPixels.data(), kHeadlessWidth, kHeadlessHeight, shadowOffPixels.data(), kHeadlessWidth, kHeadlessHeight);
+                RX_LOG_INFO("sample_09_scene: C1 discrimination re-proof (shadows-on vs. forced-off): "
+                            "differingPixels={}/{} ({:.4f}%){}",
+                            discrimination.failingPixelCount, discrimination.totalPixelCount,
+                            discrimination.failingPixelFraction * 100.0,
+                            lavapipe ? "" : " [non-lavapipe driver -- informational only, not enforced]");
+                // Floor, not the review's exact 726 -- driver/rasterization
+                // noise legitimately shifts the precise count; what must
+                // never recur is the C1 bug's own signature (a shadow map
+                // that is never sampled meaningfully at all, so toggling it
+                // off changes NOTHING -- differingPixels == 0).
+                constexpr uint32_t kMinDiscriminatingPixels = 100;
+                if (lavapipe && discrimination.failingPixelCount < kMinDiscriminatingPixels) {
+                    RX_LOG_ERROR("sample_09_scene: C1 discrimination re-proof FAILED on lavapipe: only {} pixels "
+                                 "differ with shadows forced off (< {}) -- the shadow term is not visibly affecting "
+                                 "the rendered image, the exact C1 regression class",
+                                 discrimination.failingPixelCount, kMinDiscriminatingPixels);
+                    gateOk = false;
+                }
             }
         }
     }
@@ -2915,6 +3108,17 @@ int runPresent(const Args& args) {
 
         app->flyCamera.camera.aspectRatio = static_cast<float>(app->device->swapchainExtent().width) /
                                              static_cast<float>(std::max<uint32_t>(1U, app->device->swapchainExtent().height));
+
+        // [Phase 4 exit fix wave, I1] The GPU-write half of the frame
+        // update -- AFTER `vkWaitForFences(fence)` above (which just
+        // confirmed frame N-2's GPU work, the last frame that used THIS
+        // SAME frame-in-flight slot's buffers, is complete) and selected
+        // by that same slot index, so this write can never race frame
+        // N-1's still-possibly-in-flight GPU reads of a DIFFERENT slot's
+        // buffers. `updateSceneFrame()` above only built the CPU-side row
+        // mirrors -- see that function's own comment for why this split
+        // closes the I1 finding.
+        uploadSceneFrameGpuBuffers(*app, frameSync->currentFrameIndex());
 
         vkResetFences(vkDevice, 1, &fence);
         VkCommandBuffer cmd = frameSync->currentCommandBuffer();
