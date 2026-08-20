@@ -25,6 +25,18 @@ const char* presentModeName(VkPresentModeKHR mode) {
     }
 }
 
+// [Phase 4 Task 17 follow-up, Issue #73] See this function's own header
+// comment (device.h) for the full rationale -- VK_ERROR_INITIALIZATION_FAILED
+// is included alongside the spec-documented VK_ERROR_SURFACE_LOST_KHR
+// specifically because it is what THIS project's own verified loader/driver
+// stack returns for a destroyed-native-window Xcb surface; OOM codes are
+// deliberately excluded so a genuine allocation failure still hard-fails
+// Device::recreateSwapchain() rather than being silently treated as "the
+// window is just gone".
+bool isSurfaceLossResult(VkResult result) {
+    return result == VK_ERROR_SURFACE_LOST_KHR || result == VK_ERROR_INITIALIZATION_FAILED;
+}
+
 namespace {
 
 void destroySurface(const Context& context, VkSurfaceKHR surface) {
@@ -536,6 +548,7 @@ Device& Device::operator=(Device&& other) noexcept {
         desiredPresentMode_ = other.desiredPresentMode_;
         actualPresentMode_ = other.actualPresentMode_;
         suspended_ = other.suspended_;
+        surfaceLost_ = other.surfaceLost_;
         acquireCallCount_ = other.acquireCallCount_;
         presentCallCount_ = other.presentCallCount_;
 
@@ -561,6 +574,7 @@ Device& Device::operator=(Device&& other) noexcept {
         other.desiredPresentMode_ = PresentMode::VsyncOn;
         other.actualPresentMode_ = VK_PRESENT_MODE_FIFO_KHR;
         other.suspended_ = false;
+        other.surfaceLost_ = false;
         other.acquireCallCount_ = 0;
         other.presentCallCount_ = 0;
     }
@@ -599,6 +613,12 @@ AcquireResult Device::acquireNextImage(VkSemaphore signal) {
     // recreateSwapchain()'s own comment for how this state is entered/
     // cleared. acquireCallCount_ deliberately does NOT increment here, so
     // a test can assert "zero real acquires" by call count.
+    // [Phase 4 Task 17 follow-up, Issue #73] Checked before suspended_ --
+    // see isSurfaceLost()'s own comment (device.h) for why the two never
+    // overlap in practice. Also never increments acquireCallCount_.
+    if (surfaceLost_) {
+        return AcquireResult{SwapchainStatus::SurfaceLost, 0};
+    }
     if (suspended_) {
         return AcquireResult{SwapchainStatus::Suspended, 0};
     }
@@ -635,6 +655,11 @@ SwapchainStatus Device::present(uint32_t imageIndex, VkSemaphore wait) {
     // imageIndex to present and is expected to skip straight to the next
     // iteration instead of calling this at all (every sample this task
     // touches does exactly that).
+    // [Phase 4 Task 17 follow-up, Issue #73] Same surface-lost short
+    // circuit as acquireNextImage() above.
+    if (surfaceLost_) {
+        return SwapchainStatus::SurfaceLost;
+    }
     if (suspended_) {
         return SwapchainStatus::Suspended;
     }
@@ -716,12 +741,38 @@ bool Device::recreateSwapchain(VkSurfaceKHR surface, std::optional<VkExtent2D> e
         VkSurfaceCapabilitiesKHR caps{};
         VkResult capsResult = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice_, surface, &caps);
         if (capsResult != VK_SUCCESS) {
+            // [Phase 4 Task 17 follow-up, Issue #73] SURFACE-LOST GUARD --
+            // see this function's own header comment (device.h) for the
+            // full rationale. Distinguished from the zero-extent guard
+            // below: that guard runs on a SUCCESSFUL query that happens to
+            // report 0x0; this runs when the query itself FAILED, which
+            // only ever legitimately happens when the native window
+            // backing this surface no longer exists.
+            if (isSurfaceLossResult(capsResult)) {
+                if (!surfaceLost_) {
+                    RX_LOG_INFO(
+                        "Device::recreateSwapchain: surface capabilities query failed with VkResult={} -- the "
+                        "underlying native window is gone; entering the surface-lost terminal state (no further "
+                        "acquire/present/recreateSwapchain calls against this surface are expected) [Phase 4 Task "
+                        "17 follow-up, Issue #73]",
+                        static_cast<int>(capsResult));
+                }
+                surfaceLost_ = true;
+                return true;
+            }
             RX_LOG_ERROR("Device::recreateSwapchain: vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed: VkResult={}",
                          static_cast<int>(capsResult));
             return false;
         }
         queriedExtent = caps.currentExtent;
     }
+
+    // A successful query this call proves the surface is NOT lost, whether
+    // or not the extent it reports is zero -- clears any surface-lost state
+    // a caller-supplied brand-new (live) surface may be recovering from
+    // (see isSurfaceLost()'s own comment on when this can legitimately
+    // happen).
+    surfaceLost_ = false;
 
     if (queriedExtent.width == 0 || queriedExtent.height == 0) {
         // Skip vkb::SwapchainBuilder::build() ENTIRELY -- no swapchain

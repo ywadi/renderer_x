@@ -23,7 +23,48 @@ enum class SwapchainStatus {
     // fires on a real Wayland compositor-driven minimize (SDL issue
     // #13473) and is therefore never sufficient on its own.
     Suspended,
+    // [Phase 4 Task 17 follow-up, Issue #73] The underlying NATIVE WINDOW
+    // backing this surface is gone -- distinct from Suspended (a suspended
+    // Device is expected to RESUME once a real extent returns, D25; a
+    // surface-lost Device never will, because there is no window left to
+    // ever report one again). Like Suspended, acquireNextImage()/present()
+    // return this WITHOUT calling the real vkAcquireNextImageKHR/
+    // vkQueuePresentKHR (see Device::isSurfaceLost()'s own comment for the
+    // full rationale: no reliable advance-warning event exists for this
+    // case, so recreateSwapchain() reacts to it by classifying the
+    // surface-capabilities query's own VkResult, via isSurfaceLossResult()
+    // below). A caller sees this exactly when Device::isSurfaceLost() is
+    // true; it never overlaps with Suspended/NeedsRecreate/DeviceLost in
+    // the same call. The expected caller response is NOT to retry (unlike
+    // Suspended's "retry every frame until a real extent returns") -- it
+    // is to stop calling acquireNextImage()/present()/recreateSwapchain()
+    // against this Device+surface pair entirely and proceed straight to
+    // an orderly teardown (drain in-flight GPU work, then destroy).
+    SurfaceLost,
 };
+
+// [Phase 4 Task 17 follow-up, Issue #73] Pure, device-free classifier: does
+// `result` (a vkGetPhysicalDeviceSurfaceCapabilitiesKHR return value) mean
+// the underlying NATIVE WINDOW backing this surface is gone, as opposed to
+// a genuine, unrelated error (out-of-memory, ...) that must still hard-fail
+// Device::recreateSwapchain() rather than being silently swallowed?
+//
+// True for VK_ERROR_SURFACE_LOST_KHR -- the Vulkan spec's own documented
+// code for exactly this situation -- AND for VK_ERROR_INITIALIZATION_FAILED,
+// which is NOT a spec-documented return for this specific function but is
+// what this project's own loader/driver stack (NVIDIA proprietary, Xcb WSI)
+// empirically returns when the query touches an already-destroyed X11
+// window: reproduced directly (Issue #73's own investigation) via a
+// third-party XDestroyWindow() against a live --present window (the exact
+// action `xdotool windowclose` performs) -- confirmed there is NO advance-
+// warning SDL event for this case at all (neither SDL_EVENT_WINDOW_
+// CLOSE_REQUESTED nor even SDL_EVENT_WINDOW_DESTROYED fires before the next
+// Vulkan call against the surface fails), so this REACTIVE classification
+// on the query's own result is the only place this can be caught.
+// VK_ERROR_OUT_OF_HOST_MEMORY/VK_ERROR_OUT_OF_DEVICE_MEMORY (and anything
+// else) are deliberately NOT included here -- those stay genuine,
+// unrecoverable Device::recreateSwapchain() failures.
+[[nodiscard]] bool isSurfaceLossResult(VkResult result);
 
 struct AcquireResult {
     SwapchainStatus status;
@@ -249,6 +290,13 @@ public:
     // against). acquireCallCount() only increments on the branch that
     // actually issues the real Vulkan call, so a caller/test can assert
     // "zero acquires while suspended" by call count, not by inference.
+    //
+    // [Phase 4 Task 17 follow-up, Issue #73] Same short-circuit while
+    // isSurfaceLost() is true instead, returning
+    // AcquireResult{SwapchainStatus::SurfaceLost, 0} -- also without
+    // calling vkAcquireNextImageKHR (also excluded from
+    // acquireCallCount()). Checked before isSuspended() (the two never
+    // overlap in practice -- see isSurfaceLost()'s own comment).
     AcquireResult acquireNextImage(VkSemaphore signal);
 
     // Presents `imageIndex`, waiting on `wait` first unless it is
@@ -258,6 +306,11 @@ public:
     // acquireNextImage() above: while isSuspended() is true, returns
     // SwapchainStatus::Suspended without calling vkQueuePresentKHR
     // (presentCallCount() likewise only counts the real call).
+    //
+    // [Phase 4 Task 17 follow-up, Issue #73] Same surface-lost
+    // short-circuit as acquireNextImage() above: while isSurfaceLost() is
+    // true, returns SwapchainStatus::SurfaceLost without calling
+    // vkQueuePresentKHR.
     SwapchainStatus present(uint32_t imageIndex, VkSemaphore wait);
 
     // Waits for the device to go idle, destroys the current swapchain, and
@@ -310,6 +363,21 @@ public:
     // NO reliable zero-extent signal on Wayland at all (matrix row 3) --
     // see Window::logWaylandMinimizeLimitationOnce() for the one-shot,
     // diagnosable-not-silent acknowledgment of that gap.
+    //
+    // SURFACE-LOST GUARD [Phase 4 Task 17 follow-up, Issue #73]: if the
+    // capabilities query above FAILS (rather than succeeding with a
+    // queryable extent) with a VkResult isSurfaceLossResult() (device.h)
+    // classifies as "the native window is gone", this function -- like the
+    // zero-extent guard -- never touches vkb::SwapchainBuilder::build(),
+    // enters the surface-lost terminal state (isSurfaceLost() becomes true
+    // -- see acquireNextImage()/present() above), and returns true (also a
+    // successful outcome: there is nothing left this function could do).
+    // UNLIKE the zero-extent guard, this state is not expected to clear on
+    // a later call against the SAME dead surface -- see isSurfaceLost()'s
+    // own comment for the expected caller response (stop calling this
+    // Device+surface pair entirely, proceed to teardown). Any OTHER
+    // capabilities-query failure (out-of-memory, ...) is unchanged: still a
+    // hard `return false`.
     bool recreateSwapchain(VkSurfaceKHR surface, std::optional<VkExtent2D> extentOverride = std::nullopt);
 
     // True while this Device is in the suspended-present state (the most
@@ -318,6 +386,25 @@ public:
     // VK_NULL_HANDLE/empty for the whole duration. Cleared the next time
     // recreateSwapchain() observes a nonzero extent.
     bool isSuspended() const { return suspended_; }
+
+    // [Phase 4 Task 17 follow-up, Issue #73] True while this Device is in
+    // the surface-lost terminal state: the most recent recreateSwapchain()
+    // call's own vkGetPhysicalDeviceSurfaceCapabilitiesKHR query failed
+    // with a VkResult isSurfaceLossResult() (device.h, above) classifies as
+    // "the native window is gone", rather than succeeding with a
+    // queryable (possibly zero) extent. swapchain()/swapchainImages() are
+    // VK_NULL_HANDLE/empty for the whole duration, exactly like
+    // isSuspended() -- but UNLIKE isSuspended(), this is never expected to
+    // clear on its own: there is no window left to ever report a real
+    // extent again. Only clears if a caller supplies a genuinely different
+    // (live) VkSurfaceKHR to a later recreateSwapchain() call that
+    // succeeds. Callers should treat this exactly like a graceful request
+    // to stop: cease calling acquireNextImage()/present()/
+    // recreateSwapchain() against this Device+surface pair and proceed to
+    // an orderly teardown -- see this project's samples for the
+    // established shape (drain in-flight GPU work via vkDeviceWaitIdle(),
+    // then destroy).
+    bool isSurfaceLost() const { return surfaceLost_; }
 
     // Test/diagnostic accessors [Phase 4 Task 17, gate ruling #25: "present
     // skip asserted by CALL COUNTS, never wall-clock"] -- mirror
@@ -372,6 +459,9 @@ private:
     // [Phase 4 Task 17, FG7] See recreateSwapchain()/isSuspended()'s own
     // comments above.
     bool suspended_ = false;
+    // [Phase 4 Task 17 follow-up, Issue #73] See recreateSwapchain()/
+    // isSurfaceLost()'s own comments above.
+    bool surfaceLost_ = false;
     uint64_t acquireCallCount_ = 0;
     uint64_t presentCallCount_ = 0;
 };

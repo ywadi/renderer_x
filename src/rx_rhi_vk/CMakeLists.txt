@@ -42,7 +42,12 @@ target_include_directories(rx_rhi_vk PUBLIC include ${volk_SOURCE_DIR} ${vma_SOU
 target_link_libraries(rx_rhi_vk PUBLIC rx_core vk-bootstrap::vk-bootstrap rx_shader_layout_types)
 target_compile_definitions(rx_rhi_vk PUBLIC VK_NO_PROTOTYPES)
 
-# Seventeen test translation units now (context_test.cpp, device_test.cpp,
+# surface_loss_test.cpp [Phase 4 Task 17 follow-up, Issue #73]: device-free
+# coverage for isSurfaceLossResult() (device.h) -- pure VkResult classifier,
+# no Vulkan device needed, same shape as eviction_contract_test.cpp's own
+# pure-CPU-logic tier.
+#
+# Eighteen test translation units now (context_test.cpp, device_test.cpp,
 # buffer_test.cpp, clear_color_test.cpp, frame_sync_test.cpp,
 # pipeline_layout_test.cpp, bindless_test.cpp, upload_test.cpp,
 # deletion_queue_test.cpp, texture_test.cpp, descriptor_arena_test.cpp,
@@ -91,6 +96,7 @@ add_executable(rx_rhi_vk_tests
     tests/eviction_contract_test.cpp
     tests/bda_test.cpp
     tests/window_state_test.cpp
+    tests/surface_loss_test.cpp
 )
 target_link_libraries(rx_rhi_vk_tests PRIVATE rx_rhi_vk rx_platform doctest::doctest)
 add_test(NAME rx_rhi_vk_tests COMMAND rx_rhi_vk_tests)
