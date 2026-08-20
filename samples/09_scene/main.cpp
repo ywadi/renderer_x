@@ -98,6 +98,7 @@
 
 #include "draw_recording.h"
 #include "fly_camera.h"
+#include "mouse_capture.h"
 #include <reference_gate.h>
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
@@ -286,6 +287,18 @@ std::filesystem::path resolveSponzaScenePath() {
 // its own header" precedent draw_recording.h already established in this
 // sample.
 using rx::samples9::FlyCamera;
+
+// --- Relative mouse capture [Issue #33] -----------------------------------
+// Captures/releases the OS cursor for fly-through mouse-look -- see
+// mouse_capture.h's own top comment for the full defect writeup (the fix
+// this ticket is entirely about: main.cpp never called
+// rx::platform::Window::setRelativeMouseMode() at all). The struct itself,
+// and the composed mouse-look decision updateFlyCamera() below drives it
+// with, live in mouse_capture.h -- device-free, unit-tested directly
+// (tests/test_mouse_capture.cpp), same "pull pure logic out of main.cpp"
+// precedent fly_camera.h already established just above.
+using rx::samples9::FlyThroughCaptureState;
+using rx::samples9::mouseDeltaDrivesCamera;
 
 // --- Shared pass infra [tonemap pass -- shaders/multipass/tonemap.{vert,
 // frag}.slang, VERBATIM -- same convention samples/07_stress/08_gltf_viewer's
@@ -825,6 +838,14 @@ struct App {
     FlyCamera flyCamera;
     float moveSpeed = FlyCamera::kBaseMoveSpeed;
     HudState hud;
+
+    // [Issue #33] Present-mode-only -- runHeadless() never touches this
+    // (no real OS cursor to capture against a hidden window). Captured by
+    // default; runPresent() engages the real platform capture
+    // (Window::setRelativeMouseMode()) to match this state once, right
+    // after the overlay/window are both up, then re-applies it on every
+    // Esc/click-to-recapture transition inside the present loop.
+    FlyThroughCaptureState mouseCapture;
 
     bool sceneReady = false;  // grid mode: false until the sync import + buildHelmetGrid() complete.
 };
@@ -2322,6 +2343,15 @@ void drawHud(App& app, rx::rhi::Device& device, VkSurfaceKHR surface, bool prese
     ImGui::Begin("sample_09_scene");
 
     ImGui::Text("Frame: %.3f ms  |  FPS (60-frame avg): %.1f", app.hud.lastFrameMs, app.hud.rollingFps());
+    // [Issue #33] Present-mode-only -- runHeadless() never touches
+    // app.mouseCapture (no real OS cursor to report on against a hidden
+    // window). Human-observable confirmation of the current relative-
+    // mouse-capture state and how to change it, for the MANUAL_VERIFICATION
+    // checklist's own capture/release/Esc/HUD-interaction rows.
+    if (presentMode) {
+        ImGui::Text("Mouse: %s  (Esc: toggle release/recapture%s)", app.mouseCapture.captured() ? "CAPTURED" : "RELEASED",
+                    app.mouseCapture.captured() ? "" : ", click viewport: recapture");
+    }
     ImGui::Separator();
 
     ImGui::Text("Cull counters");
@@ -2423,7 +2453,12 @@ void updateFlyCamera(App& app, rx::platform::Window& window, float dt) {
         forward += -pad.leftStick.y;  // SDL's own Y-down stick convention -- forward is -Y.
     }
 
-    if (!ImGui::GetIO().WantCaptureMouse) {
+    // [Issue #33] Composed gate: while mouse-capture is CAPTURED, motion
+    // always drives the camera (the cursor is hidden -- the HUD ignores it
+    // by contract); while RELEASED, the pre-existing !WantCaptureMouse gate
+    // alone decides, unchanged from before this ticket. See
+    // mouse_capture.h's own mouseDeltaDrivesCamera() comment.
+    if (mouseDeltaDrivesCamera(app.mouseCapture.captured(), ImGui::GetIO().WantCaptureMouse)) {
         const rx::platform::MouseDelta delta = window.consumeMouseDelta();
         app.flyCamera.applyLookDelta(delta.x * FlyCamera::kMouseSensitivity, delta.y * FlyCamera::kMouseSensitivity);
     } else {
@@ -3119,6 +3154,16 @@ int runPresent(const Args& args) {
         return 1;
     }
 
+    // [Issue #33] Engage the platform relative-mouse-capture facility to
+    // match app->mouseCapture's own default (captured) -- the fix this
+    // ticket is about: this call was entirely absent before, so the OS
+    // cursor was never hidden/locked at all and could escape the window
+    // during mouse-look. Best-effort (logged internally on failure,
+    // matching setFullscreen()'s own established convention) -- a platform
+    // that refuses relative mode still runs the sample, just without
+    // cursor capture.
+    app->window->setRelativeMouseMode(app->mouseCapture.captured());
+
     rx::graph::RenderGraph graph;
     declareGraph(graph, *app, app->device->swapchainFormat());
     rx::graph::CompileInfo compileInfo;
@@ -3164,13 +3209,46 @@ int runPresent(const Args& args) {
     // [gate ruling #16] ImGui feeds every SDL event FIRST, then platform
     // input accumulators (Window::pumpEvents()'s own `preDispatch` seam).
     while (running) {
+        // [Issue #33] The mouse-capture toggle events (Esc, click-to-
+        // recapture) are handled here, INSIDE the same preDispatch seam,
+        // so they see ImGui's `WantCaptureMouse` exactly as it stood after
+        // last frame's HUD layout (the same one-frame-stale read
+        // updateFlyCamera() below already relies on -- gate ruling
+        // #14/#16's own established caller-level-gating convention, not a
+        // new invariant this ticket introduces). Only the STATE MACHINE
+        // transition happens here (rx::samples9::FlyThroughCaptureState is
+        // SDL-free by design); applying a resulting transition to the real
+        // Window happens once, after the full drain, below.
+        const bool capturedBeforePump = app->mouseCapture.captured();
         app->window->pumpEvents([&](const SDL_Event& event) {
             app->overlay->processEvent(event);
             if (event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
                 running = false;
+            } else if (event.type == SDL_EVENT_KEY_DOWN && event.key.scancode == SDL_SCANCODE_ESCAPE &&
+                       !event.key.repeat) {
+                app->mouseCapture.toggleOnEscPressed();
+            } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT &&
+                       !app->mouseCapture.captured() && !ImGui::GetIO().WantCaptureMouse) {
+                app->mouseCapture.recaptureOnViewportClick();
             }
         });
         if (!running) break;
+
+        // [Issue #33] Apply exactly one real Window transition per frame,
+        // only on an actual change -- Window::setRelativeMouseMode()'s own
+        // relativeModeWanted_ is what pumpEvents()'s FOCUS_GAINED handling
+        // unconditionally re-arms against (window.h's own
+        // setRelativeMouseMode() comment), so this call is what makes that
+        // re-arm compose correctly with this toggle: releasing (Esc) clears
+        // relativeModeWanted_, so a later focus-loss/gain cycle while
+        // released correctly does NOT re-engage capture; recapturing sets
+        // it again, so a focus-loss/gain cycle while captured DOES
+        // re-engage, exactly as src/rx_platform/tests/window_test.cpp's own
+        // "FOCUS_LOST pauses ... FOCUS_GAINED resumes" test already proves
+        // generically for the platform layer.
+        if (app->mouseCapture.captured() != capturedBeforePump) {
+            app->window->setRelativeMouseMode(app->mouseCapture.captured());
+        }
 
         app->scheduler->pumpMain();
 
