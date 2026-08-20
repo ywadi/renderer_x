@@ -1,0 +1,3501 @@
+# Review package: 34684f0..034b201
+
+## Commits
+034b201 docs: fix-wave report addendum -- Registry importGltf/evictForTesting closure
+5c3922c fix(rx_asset): guard Registry::importGltf()/evictForTesting() (in-round closure)
+02c14af docs: Phase 4 exit fix wave report -- per-finding proof, revert evidence
+785559e fix(samples): 08_gltf_viewer frames-in-flight draw-data buffer race
+e9a59f0 fix(samples): 09_scene shadow pass wiring, FIF draw-data races, worker guard
+0050540 docs(threading): cover Phase 4's Stage 1/2 surfaces, drop the stale rx_scene line
+66f6d2a fix(rx_asset): guard Registry's mesh()/material()/texture() read accessors
+53817f4 fix(rx_scene): entry-point guards on DrawListBuilder::build()/buildShadow()
+24a1122 fix(rx_material): guard MaterialSystem's remaining read accessors
+c4700ad fix(rx_graph,rx_rhi_vk): RX_ASSERT_MAIN_THREAD on Executor and FrameSync
+1591291 fix(rx_graph): warn on a culled pass that still carries an execute callback
+277531d docs: registry -- phase 4 exit-review deferrals (blend-partition re-resolution cost, consumer-recorder allocations)
+
+## Files changed
+ .../phase4-fixwave-report.md                       | 346 +++++++++++++
+ .../2026-08-09-toolchain-platform-rhi-design.md    |  10 +
+ docs/threading.md                                  | 100 +++-
+ samples/08_gltf_viewer/main.cpp                    | 113 +++--
+ samples/09_scene/main.cpp                          | 534 ++++++++++++++-------
+ samples/09_scene/references/grid_scene.png         | Bin 9350 -> 9434 bytes
+ src/rx_asset/include/rx_asset/registry.h           |  23 +-
+ src/rx_asset/registry.cpp                          |  44 +-
+ src/rx_asset/tests/thread_guard_test.cpp           | 123 +++++
+ src/rx_graph/executor.cpp                          |  18 +
+ src/rx_graph/include/rx_graph/executor.h           |   4 +
+ src/rx_graph/render_graph.cpp                      |  31 ++
+ src/rx_graph/tests/test_compile.cpp                | 107 +++++
+ src/rx_graph/tests/test_execute_gpu.cpp            | 151 ++++++
+ .../include/rx_material/material_system.h          |   8 +
+ src/rx_material/material_system.cpp                |  14 +
+ src/rx_material/tests/test_material_system.cpp     |  73 +++
+ src/rx_rhi_vk/include/rx_rhi_vk/frame_sync.h       |   9 +-
+ src/rx_rhi_vk/src/frame_sync.cpp                   |  17 +
+ src/rx_rhi_vk/tests/frame_sync_test.cpp            | 121 +++++
+ src/rx_scene/draw_list.cpp                         |   9 +
+ src/rx_scene/include/rx_scene/draw_list.h          |  12 +-
+ src/rx_scene/tests/thread_guard_test.cpp           |  91 ++++
+ 23 files changed, 1741 insertions(+), 217 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/phase4-fixwave-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/phase4-fixwave-report.md
+new file mode 100644
+index 0000000..7b687f2
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/phase4-fixwave-report.md
+@@ -0,0 +1,346 @@
++# Phase 4 Exit Fix Wave -- Implementer Report
++
++**Base:** main @ 34684f0 (per the exit review; HEAD had advanced to 277531d,
++a registry-only docs commit, by the time this wave started -- no functional
++drift).
++**Scope:** every finding in `phase4-exit-review.md` (C1, I1, I2, I3, I4, M1,
++M2, M5). M3/M4 are registry-material, adjudicated by the coordinator
++(commit 277531d) -- not touched here, per the brief.
++**Verification hardware:** this machine, both drivers used deliberately:
++- **lavapipe** (`/usr/share/vulkan/icd.d/lvp_icd.json`, llvmpipe/LLVM 15.0.7)
++  -- the enforced D17/discrimination driver, matching CI's own convention
++  (`ci.yml` "Test (xvfb + lavapipe)" step).
++- The system's other installed ICD -- informational-only runs, matching
++  every sample's own existing lavapipe-vs-other-driver gating convention.
++
++---
++
++## C1 (CRITICAL) -- shadow pass never executed
++
++**Root cause (confirmed identical to the review's own three-part mechanism):**
++`samples/09_scene/main.cpp`'s `declareGraph()` added the `"shadow"` pass
++writing `"shadowmap"` with no reader and no `setSideEffect()` ->
++`RenderGraph::compile()` culled it silently -> the forward shader's 9
++`SampleCmp` taps sampled a sample-owned raw `VkImage` that was never
++written and never left `UNDEFINED` layout.
++
++**Fix (graph-derived consumption, not a `setSideEffect()` band-aid):**
++- `declareGraph()`: `"forward"` now declares
++  `addTextureInput("shadowmap")` when shadows are enabled -- this both
++  un-culls `"shadow"` (compile()'s reachability walk now reaches it via
++  `"forward"`'s own reachability from the backbuffer writer) and derives
++  the depth-write -> sampled-read barrier the graph already knows how to
++  compute for every `addTextureInput()` declaration (D29's mixed-convention
++  composition -- reversed-Z forward + standard-Z shadow -- exercised by a
++  shipped sample for the first time).
++- `setupShadow()`: deleted the sample-owned raw
++  `vkCreateImage`/`vkAllocateMemory`/`vkCreateImageView` entirely.
++  `"shadowmap"` is now a genuine `rx_graph` transient, owned and
++  lifetime-tracked by the Executor's own `TransientPool` (D24 memory
++  reporting sees it now, for free).
++- `recordForwardChunk()`: chunk 0 (re-)registers `"shadowmap"`'s current
++  resolved view into bindless, mirroring `"hdr"`'s own established
++  `lastHdrView`/`hdrHandle` re-registration pattern (this file's
++  `recordTonemapDraw()`; prior art: `samples/05_multipass`'s
++  `recordLitDrawsChunked()`) -- legal only because chunk 0 of a
++  `setExecuteChunked()` callback is guaranteed synchronous on the main
++  thread [D4 chunk-0 affordance].
++- `updateSceneFrame()`'s row population now requires
++  `app.shadowMapHandle.isValid()` in addition to `app.shadowEnabled`
++  before writing a real `shadowMapTextureIndex` -- before the handle's
++  first registration (only ever the very first frame of a run; the
++  physical resource never resizes/evicts afterward) rows fall back to the
++  same documented `0xFFFFFFFF` fully-lit sentinel the disabled path
++  already used. **Never an unregistered/stale bindless read.**
++
++**Library-level guard (generic, not sample-specific):**
++`RenderGraph::compile()` (`src/rx_graph/render_graph.cpp`) now emits
++`RX_LOG_WARN` naming any pass that survives with a recorded
++`setExecute()`/`setExecuteChunked()` callback but gets culled. Two new
++`test_compile.cpp` cases prove it fires and prove it stays silent once a
++real consumer exists.
++
++**Reference regeneration (real lavapipe, `--write-references`):**
++```
++sample_09_scene: wrote D17 reference PNG to '/tmp/rx_refs_out'
++```
++Diff against the OLD (broken) reference: 701 pixels differ, spatially
++concentrated at each helmet's ground-contact silhouette -- exactly a
++new shadow-contact term appearing, not noise (amplified diff image
++inspected directly during this wave; not committed, reproducible via the
++commands below).
++
++**Discrimination re-proof (added to the shipped headless gate itself,**
++`sample_09_scene_headless`**, so it runs every ctest invocation from now on):**
++re-renders the same static-camera frame with a debug
++`app.debugForceShadowSentinel` override forced on (the clean,
++non-gdb equivalent of the review's own runtime flip) and asserts the
++result differs from the real frame by more than a 100-pixel floor,
++hard-gated on lavapipe:
++```
++sample_09_scene: D17 grid_scene gate: failingPixels=0/65536 (0.0000%) pass=true
++sample_09_scene: C1 discrimination re-proof (shadows-on vs. forced-off): differingPixels=324/65536 (0.4944%)
++sample_09_scene: headless gate PASSED
++```
++324/65536 -- same order of magnitude as the review's own ~726/65536
++gdb-probe measurement (the two probes are not identical: the review's
++flip also disabled shadow-list building/recording; this one forces only
++the shader-side row sentinel, deliberately, so it exercises the SAME
++graph structure every real frame does -- see the field's own comment).
++
++**Revert-and-restore proof (in-tree, this session):** commented out the
++single `forward.addTextureInput("shadowmap");` line, rebuilt, ran:
++```
++[warning] rx_graph: pass 'shadow' has a recorded execute callback but was culled (nothing reads any resource it writes, and it never called setSideEffect()) -- its callback will NEVER run; if this is intentional, remove the callback, otherwise add a reader (addTextureInput()/addStorageBufferInput() on the resource it writes) or setSideEffect()
++libc++abi: terminating due to uncaught exception of type std::out_of_range: rx_graph: PassContext: no realized resource named 'shadowmap'
++Aborted (core dumped)
++```
++The new library-level warning fired exactly as designed, immediately, on
++the exact regression; the process then aborted (chunk 0's re-registration
++now genuinely depends on the graph wiring being correct -- the new code
++has no silent-fallback path left, unlike the old raw-image approach it
++replaced). Restored the file (`cp` from a pre-edit backup, verified
++`git diff --stat` matched the pre-revert byte count); rebuilt; reran:
++```
++sample_09_scene: D17 grid_scene gate: failingPixels=0/65536 (0.0000%) pass=true
++sample_09_scene: headless gate PASSED
++```
++byte-identical restoration confirmed (0 failing pixels against the
++committed, regenerated reference).
++
++**Sponza (real, fetched asset) -- sustained present-mode run, `--validate`:**
++```
++sample_09_scene: '/home/ywadi/d2/renderer_x/assets/fetched/Sponza/glTF/Sponza.gltf' loaded -- 1 renderable(s), 25 material(s)
++```
++Ran ~58s under `xvfb` + lavapipe (`--present --scene sponza --validate`),
++killed manually (present-mode has no auto-quit and D16 marks `--scene` as
++CI-exempt/manual-verification territory): zero unfiltered validation
++errors for the whole run (every reported validation message matched one
++of the four pre-existing "known false positive" guards already in
++`context.cpp`); HUD counters read `recordsIn: 103 drawsSubmitted: 103`
++every frame, matching Sponza's real 25-material/103-submesh-instance
++shape. A mid-run screenshot (captured via `import -window`, X11) shows
++real surface texture detail and lighting gradient, not the uniform
++near-black wash C1 produced -- not saved into the repo (throwaway
++verification artifact), reproducible via the commands below.
++
++---
++
++## I1 (IMPORTANT) -- frames-in-flight host-write race, both exit samples
++
++**Fix, both samples, identical shape:** the single shared
++`drawDataBuffer`/`shadowDrawDataBuffer` became a
++`std::array<..., rx::rhi::FrameSync::kFramesInFlight>` (2 physical
++buffers), selected each frame by the present loop's own
++`frameSync->currentFrameIndex()`. Frame N's write to slot `N % 2` now
++only needs frame N-2 (the slot's own last user) to be done -- exactly
++what `vkWaitForFences(currentFence)` already proves -- since frame N-1
++always used the OTHER slot's buffer.
++
++- **09_scene:** `updateSceneFrame()` split into CPU-side row population
++  (kept where it was, before the fence wait -- list-building has no
++  GPU-visibility requirement) and a new `uploadSceneFrameGpuBuffers(App&,
++  uint32_t frameSlot)`, called only after
++  `vkWaitForFences(frameSync->currentFence())` in the present loop.
++  Headless mode (fully synchronous `runOnce()`, zero real frame overlap)
++  always uses slot 0.
++- **08_gltf_viewer:** `updateDrawDataPerPassFields()` already ran after
++  its own fence wait (the review's own text: "same class at :2190/:2252"
++  -- write-after-wait was already true, buffer duplication was the
++  missing half); added the `frameSlot` parameter and per-slot addressing.
++
++**Verification:** both samples' headless AND (09_scene, manually) present
++runs pass with `--validate`, zero validation errors, identical rendered
++output to before (the fix is purely a buffer-topology change; no visual
++delta expected or observed). No live TSAN/timing race reproduction was
++attempted -- the phase-exit review's own "What I could not verify" section
++states the same limitation on the BUG side ("I1's visible artifact was
++not captured on camera... established from the Vulkan host-synchronization
++rules plus the code's write/wait ordering"); the FIX is verified the same
++way the finding was established: by the same host-synchronization rules
++(per-slot buffer + fence-wait-proves-that-slot's-prior-user-done is the
++textbook double-buffering argument), by exact-precedent match against
++`MaterialSystem::ParamArena`'s own already-shipped, already-reviewed FIF
++discipline, and by full-suite green with validation on.
++
++---
++
++## I2 (IMPORTANT) -- Stage-0 F5-remainder guards
++
++`RX_ASSERT_MAIN_THREAD` added to `Executor::execute()`/`realize()`
++(`src/rx_graph/executor.cpp`) and `FrameSync::create()`/`advanceFrame()`/
++`onSwapchainRecreated()` (`src/rx_rhi_vk/src/frame_sync.cpp`) -- the
++literal Stage-0 F5-remainder scope (`stage0-audit.md:136/390`) as
++narrowed by the exit review's own I2 text ("Executor::execute()/realize()
++and the FrameSync frame-advance surface"); `MaterialSystem::beginFrame()/
++onFrameCompleted()` (also named in F5's *original* text) were left
++untouched -- not part of the review's own I2 restatement, and no new
++finding named them.
++
++**Proof (RX_DEBUG_CHECKS death/abort pattern, matching
++`rx_asset/tests/thread_guard_test.cpp`'s established convention -- a
++plain `std::thread` stands in for a chunk >= 1 worker, joined before the
++next call, test-installed hook records-and-returns instead of aborting):**
++new cases in `src/rx_graph/tests/test_execute_gpu.cpp` (minimal
++single-pass graph, no shader needed) and
++`src/rx_rhi_vk/tests/frame_sync_test.cpp`. Both ran clean under the full
++ctest suite (lavapipe) and under Wine (the GPU-backed variants are
++excluded from the Wine run by CI's own existing convention -- no Vulkan
++under Wine -- unrelated to this change).
++
++---
++
++## I3 (IMPORTANT) -- MaterialSystem::pipelineLayout() from worker chunks
++
++**Call-site fix (D27 pre-resolution, main thread):**
++`buildPipelineTokenMap()` now also computes `app.cachedAnyMaterialLayout`
++once, at setup, on the main thread; `recordForwardChunk()` reads the
++cached value instead of calling `pipelineLayout()` from a worker chunk
++(`chunkIndex` can be `>= 1`).
++
++**Guard fix (loud-failure-on-the-next-violation, mirroring GeometryPool's
++precedent):** `RX_ASSERT_MAIN_THREAD` added to
++`pipelineLayout()`/`layoutInfo()`/`materialParams()`/`paramBlockSize()`
++(`src/rx_material/material_system.cpp`). Proof: two new cases in
++`test_material_system.cpp` reusing the existing `bindInstance` guard
++test's capture hook (plain `std::thread`, no chunked rx_graph/rx_task
++machinery needed for these simpler read accessors).
++
++The D27 worker-guard smoke test already present in `sample_09_scene`'s
++own headless gate (`#ifdef RX_DEBUG_CHECKS`, `--threads>1` block) still
++passes with zero violations recorded -- confirms the call-site fix, not
++just the library guard, closed the real violation.
++
++---
++
++## I4 (IMPORTANT) -- docs/threading.md coverage
++
++Added entries for `rx::asset::Registry` (mutation + the full async-import
++surface + `~Registry()`'s teardown-drain contract + the M2 read-accessor
++guards), `rx::asset::TextureCache` (including the deliberate any-thread
++`decodeForUpload()` carve-out), `rx::scene::Scene` (35 guarded call
++sites), `rx::scene::DrawListBuilder`/`resolveDrawGroups()` (D27's
++main-thread half + the M1 guards), and `rx::shadow::ShadowCasterPipeline`.
++Deleted the stale `threading.md:111` line claiming the rx_scene managers
++"do not exist yet, not guarded" (false since Task 18; Scene alone has 35
++guarded call sites). Also recorded the new Executor/FrameSync entries
++(I2) in the same pass.
++
++**Post-report addendum (same session, coordinator-directed):** this
++report originally disclosed, but deliberately left unfixed, that
++`Registry::importGltf()`'s synchronous overloads and `evictForTesting()`
++were documented main-thread-only but carried no `RX_ASSERT_MAIN_THREAD`
++anywhere in their own call chain. Per the coordinator's standing
++in-round-closure policy (no prerequisite blocked it), this was closed in
++the same session: `RX_ASSERT_MAIN_THREAD` added to both `importGltf()`
++overloads and both `evictForTesting()` overloads
++(`src/rx_asset/registry.cpp`), `docs/threading.md`'s Registry entry
++updated to list all nine guarded members, and two new death/abort-pattern
++test cases added to `src/rx_asset/tests/thread_guard_test.cpp` (a real
++GeometryPool+Scheduler fixture, an intentionally empty byte span --
++`importGltf()`'s guard fires as the first statement regardless, and an
++empty/malformed document is an already-covered safe-failure path per
++`import_gltf_gpu_test.cpp`'s own "malformed-file battery" case, so no
++real glTF fixture was needed). Verified: `rx_asset_tests` alone (38/38
++test cases, 596/596 assertions) and the full linux-native serial ctest
++suite, both under lavapipe -- see the addendum commit below.
++
++---
++
++## M1 (MINOR) -- DrawListBuilder entry-point guards
++
++`RX_ASSERT_MAIN_THREAD` added to `build()`/`buildShadow()`
++(`src/rx_scene/draw_list.cpp`), matching `resolveDrawGroups()`'s existing
++guard. Proof: two new cases in `src/rx_scene/tests/thread_guard_test.cpp`.
++The "fires" case asserts *containment*, not an exact count -- both
++methods' own guards fire first (confirmed: `build`/`buildShadow` are
++literally the first captured context in each case), then the
++non-aborting test hook lets execution continue into every downstream
++guarded `Scene`/`DrawListBuilder` accessor the real call internally makes
++(10 total violations captured for the two calls combined) -- documented
++in the test file so a future reader does not mistake the cascade for a
++bug.
++
++---
++
++## M2 (MINOR) -- Registry read-accessor guards
++
++`RX_ASSERT_MAIN_THREAD` added to `mesh()`/`material()`/`texture()`
++(`src/rx_asset/registry.cpp`), mirroring the Task-12 GeometryPool ruling
++the finding cites. Verified safe: `meshSubmeshesFromRegistry()`/
++`materialResolveFromRegistry()` (the production callbacks
++`DrawListBuilder::generateRecords()` calls through) run on the main
++thread only -- `generateRecords()` itself never calls
++`scheduler.parallelFor()` (only the earlier `cullView()` step does, over
++already-snapshotted plain spans) -- so this guard cannot fire on any real,
++correct call path; confirmed by the full suite staying green. Proof: two
++new cases in `src/rx_asset/tests/thread_guard_test.cpp` (a bare
++default-constructed `Registry`, no GPU fixture needed -- its D11
++fallback assets make even a never-registered handle a safe, defined
++read).
++
++**Addendum (post-report, same session):** `importGltf()` (both
++overloads) and `evictForTesting()` (both overloads) also guarded now --
++see the I4 section's addendum above for the full rationale; these were a
++separate, coordinator-directed in-round closure of a gap this report's
++I4 section originally disclosed rather than fixed.
++
++---
++
++## M5 (MINOR) -- stale comment
++
++Fixed in the same `samples/09_scene/main.cpp` commit as C1/I1/I3 (the
++comment sat immediately above the fields those findings also touched).
++Now documents the H1-correct sizing (per-instance submesh totals, not
++`scene->renderableCount()`).
++
++---
++
++## Verification summary
++
++| Check | Result |
++|---|---|
++| linux-native, full serial ctest, lavapipe (CI's own driver) | **29/29 PASSED** (~74-78s) |
++| linux-native build | clean, 0 warnings-as-new from this wave |
++| windows-cross-zig build | clean |
++| Wine, CI's exact ctest invocation (`-E 'rx_rhi_vk\|rx_graph_gpu\|rx_material_gpu\|rx_debug_ui_gpu\|sample'`) | **13/13 PASSED** (~132s) |
++| `sample_09_scene_headless` / `--validate` | zero unfiltered validation errors; D17 gate passes against the regenerated reference; C1 discrimination re-proof passes (324/65536, floor 100) |
++| `sample_08_gltf_viewer_headless` / `--validate` | zero unfiltered validation errors, unchanged behavior |
++| Sponza, `--present --scene sponza --validate`, ~58s sustained | zero unfiltered validation errors; 25 materials / 103 draws every frame; visually not uniformly dark |
++| C1 revert-and-restore | new library warning fires on the exact reintroduced bug; restore verified byte-identical (0/65536 against committed reference) |
++| I1 revert-and-restore (live race) | not attempted -- see I1 section; same disclosed limitation the phase-exit review itself carries on the bug side |
++| New guard tests (I2/I3/M1/M2), death/abort pattern | all pass, both linux-native (lavapipe) and Wine where GPU-independent |
++
++### Reproduction commands (this machine)
++```sh
++export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
++xvfb-run -a ctest --preset linux-native --output-on-failure   # 29/29
++xvfb-run -a ctest --preset windows-cross-zig \
++  -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_debug_ui_gpu|sample' \
++  --output-on-failure                                          # 13/13, via Wine
++```
++
++---
++
++## Commits (pathspec-scoped, no AI attribution, author = local git config)
++
++1. `1591291` fix(rx_graph): warn on a culled pass that still carries an execute callback -- C1 library guard
++2. `c4700ad` fix(rx_graph,rx_rhi_vk): RX_ASSERT_MAIN_THREAD on Executor and FrameSync -- I2
++3. `24a1122` fix(rx_material): guard MaterialSystem's remaining read accessors -- I3 (library half)
++4. `53817f4` fix(rx_scene): entry-point guards on DrawListBuilder::build()/buildShadow() -- M1
++5. `66f6d2a` fix(rx_asset): guard Registry's mesh()/material()/texture() read accessors -- M2
++6. `0050540` docs(threading): cover Phase 4's Stage 1/2 surfaces, drop the stale rx_scene line -- I4
++7. `e9a59f0` fix(samples): 09_scene shadow pass wiring, FIF draw-data races, worker guard -- C1 (sample half) + I1 (09_scene half) + I3 (call-site) + M5
++8. `785559e` fix(samples): 08_gltf_viewer frames-in-flight draw-data buffer race -- I1 (08_gltf_viewer half)
++9. `02c14af` docs: Phase 4 exit fix wave report -- per-finding proof, revert evidence
++10. `5c3922c` fix(rx_asset): guard Registry::importGltf()/evictForTesting() (in-round closure) -- coordinator-directed, post-report addendum: closes the pre-existing gap this report's I4/M2 sections originally disclosed but left unfixed
++
++No board/plan/ledger edits. `docs/threading.md` and the regenerated
++`samples/09_scene/references/grid_scene.png` are the two authorized
++non-code touches; both delivered. Not pushed.
++
++**Post-addendum re-verification:** linux-native, full serial ctest,
++lavapipe: **29/29 PASSED** (~81s), including the two new
++`rx_asset_tests` cases (`rx_asset_tests` alone: 38/38 test cases, 596/596
++assertions). Second preset not re-run for this scale, per the
++coordinator's own instruction.
+diff --git a/docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md b/docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md
+index eda0c12..5294e82 100644
+--- a/docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md
++++ b/docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md
+@@ -493,10 +493,20 @@ it is out of scope for *this* spec only, not out of scope for the project:
+   the engine imposes neither OOP nor an ECS on the host.
+ - **Main-loop ownership** (decided 2026-08-10, binds the SDK-phase spec):
+   RendererX is library-model — the consuming game/engine owns `main()` and
+   the frame loop and calls an explicit frame API (begin-frame → declare
+   passes/submit → end-frame), never the reverse. No required init/frame
+   callbacks, no engine-owned loop: the audience is custom-engine
+   developers who own their own loops (bgfx/PhysX/FMOD precedent). An
+   optional thin "runner" convenience (window + per-frame callback, e.g.
+   over SDL3's callback mode) may ship later for quick starts, built ON the
+   library API and never required by it.
++
++- **Phase 4 exit-review registry items (2026-08-20):** (a) D27
++  pre-resolution's "resolve once per distinct key" currently holds only
++  for the opaque partition — blend-partition interleaving re-fires
++  resolution per run (cost, not correctness); revisit with the
++  techniques phase's transparency work. (b) Sample-recorder worker-side
++  per-frame vector allocations (`splitByBlockAndGroup`/
++  `resolveDrawGroups` return values) — extend the zero-alloc discipline
++  to the sample/consumer recording path when the scene path is next
++  reworked (geometry or techniques phase).
+diff --git a/docs/threading.md b/docs/threading.md
+index 041f07e..072a413 100644
+--- a/docs/threading.md
++++ b/docs/threading.md
+@@ -98,24 +98,116 @@ and compiles to nothing at all when it is OFF:
+   as "safe from any thread holding a valid reference" — `stats()`/
+   `blockCount()`/etc. read the SAME `blocks_`/`VmaVirtualBlock` state
+   `upload()`/`free()` mutate unlocked, with no atomic counters the way
+   `rx::rhi::Allocator::report()` has to justify an any-thread claim;
+   narrowed to main-thread-only and guarded, matching D5's posture for
+   the whole class. The test/diagnostic-only accessors
+   (`vertexBufferAllocatedBytes()`/`indexBufferAllocatedBytes()`/
+   `vertexBufferHandle()`/`indexBufferHandle()`) carry the identical
+   guard for the same reason, though production code has no need for
+   them. (`src/rx_asset/include/rx_asset/geometry_pool.h`)
+-- **`rx::scene::*Manager` registries** (future, Stage 2) —
+-  `RenderableManager`/`TransformManager`/`LightManager` mutation
+-  (create/set/destroy) stays main-thread-only; read-only SoA traversal for
+-  culling (below) does not. Not guarded — does not exist yet.
++- **`rx::asset::Registry`** [Phase 4 Stage 1 Tasks 13/15, spec D9/D24] —
++  `importGltf()` (both overloads)/`importGltfAsync()`/`cancelImport()`/
++  `importProgress()`/`evictForTesting()` (both overloads)/`~Registry()`/
++  `mesh()`/`material()`/`texture()` **[guarded, all nine]**: mutation
++  (`importGltf()`, `evictForTesting()`) and the entire async-import surface
++  (`importGltfAsync()`/`cancelImport()`/`importProgress()` — this
++  Registry's "main" thread is whichever thread also calls
++  `scheduler.pumpMain()` each frame, since that pump loop is what actually
++  advances an in-flight import; see registry.h's own "BYTE-SOURCE LIFETIME
++  CONTRACT"/"CANCELLATION"/"PROGRESS" sections for the full async contract)
++  are main-thread-only exactly like every other GPU-object-mutation entry
++  point above. The read accessors (`mesh()`/`material()`/`texture()`) hold
++  the identical no-internal-lock posture GeometryPool's own reads do —
++  narrowed to guarded main-thread-only in the Phase 4 exit fix wave [M2],
++  mirroring the Task-12 GeometryPool ruling; the synchronous `importGltf()`
++  overloads and `evictForTesting()` were found to be documented
++  main-thread-only but carried NO `RX_ASSERT_MAIN_THREAD` anywhere in
++  their own call chain (`importGltf()` → `importGltfPipeline()` →
++  `marshalGltfImportSync()` → `registerMesh()`/`registerMaterial()`, none
++  guarded) — a pre-existing gap discovered while writing this entry, closed
++  in the same fix wave per the standing no-deferred-fixes policy (no
++  prerequisite blocked it). `~Registry()` is guarded too: its
++  cancel-then-drain teardown sequence (`drainAndRollbackAbandonedAsyncJob()`
++  → a bounded reap-poll gate, leak-not-UAF on timeout) assumes the same
++  single calling thread as every other mutator. `decodeForUpload()`-style
++  any-thread carve-outs do not exist on this class — the compute-heavy half
++  of async import runs on `rx::task::Scheduler` workers, but it never calls
++  back into `Registry` directly (`import_pipeline.h`'s compute/marshal
++  split): only the marshal half, posted back via `postToMain()`, ever
++  touches this class.
++  (`src/rx_asset/include/rx_asset/registry.h`)
++- **`rx::asset::TextureCache`** [Phase 4 Stage 1 Task 14, spec D10/D11/D24/
++  D25] — `create()`/`load()`/`loadFromBytes()`/`registerDecoded()`/
++  `flushPendingUploads()`/`isUploadComplete()`/`resolve()`/
++  `fallbackHandle()`/`checkerboardHandle()`/`getOrCreateSampler()`/
++  `getOrCreateSamplerBindlessIndex()`/`stats()`/`evictForTesting()`/
++  `releaseUnpublished()` (and the rest of this class's own GPU-object-
++  mutating/read surface) **[guarded]**: GPU-object mutation (Texture2D
++  creation, Uploader submission, BindlessTable registration/release,
++  VkSampler creation) is main-thread-only, matching GeometryPool/Registry/
++  Uploader/BindlessTable's identical convention; read accessors share the
++  same posture (no internal lock). **`decodeForUpload()` is the one
++  deliberate any-thread carve-out on this class** — worker-safe by design
++  (the async-import pipeline's texture-decode stage calls it from an
++  `rx::task::Scheduler` worker), performing pure CPU decode/transcode with
++  zero GPU-object touch; every OTHER method stays main-thread-only.
++  (`src/rx_asset/include/rx_asset/texture_cache.h`)
++- **`rx::scene::Scene`** [Phase 4 Stage 2 Task 18, spec D19] — every public
++  method **[guarded, all 35 call sites]**: this class's SoA columns are
++  plain `std::vector`s with no internal synchronization, matching every
++  other GPU-adjacent-state-owning type above. Scene itself never touches
++  the GPU directly, but its data feeds `DrawListBuilder::build()`'s
++  per-frame culling, which does, so the same single-writer-thread
++  discipline applies. (`src/rx_scene/include/rx_scene/scene.h`)
++- **`rx::scene::DrawListBuilder`** [Phase 4 Stage 2 Task 19, spec D15] —
++  `build()`/`buildShadow()` **[guarded, both]** [Phase 4 exit fix wave, M1]:
++  both read `Scene`'s own main-thread-only accessors and mutate this
++  builder's private reused scratch storage with no internal
++  synchronization — the PARALLEL portion (AABB-vs-frustum culling) fans out
++  via `scheduler.parallelFor()` over data already snapshotted from `Scene`
++  on the calling thread before fan-out, so worker chunks never call a
++  `Scene`/`MaterialResolveFn`/`MeshSubmeshesFn` accessor themselves, only
++  index into already-captured spans. **D27's own main-thread half**:
++  `rx::scene::resolveDrawGroups()` **[guarded]** pre-resolves every
++  distinct `materialIndex` boundary's pipeline token ONCE, on the main
++  thread, before any chunk fan-out — `recordDrawList()`'s own
++  `RecordChunkFn` callback (the chunked submit helper, run on
++  `scheduler.parallelFor()` workers) structurally never receives
++  `PipelineResolveFn` at all, so it cannot reach the guarded resolver even
++  by mistake (see draw_list.h's own "D27" section for the full mechanism).
++  (`src/rx_scene/include/rx_scene/draw_list.h`)
++- **`rx::shadow::ShadowCasterPipeline`** [Phase 4 Stage 2 Task 22, spec D21]
++  — `create()` and destruction **[guarded, both]**: ordinary Vulkan
++  object-lifetime rules, matching every other GPU-object-owning type's
++  create()/destroy() above. `pipeline()`/`pipelineLayout()`/
++  `bindAndSetDepthBias()` are read-only/record-time and may be called from
++  any thread already permitted to record into the target command buffer
++  (matching every other record-time helper in this codebase — no internal
++  mutable state) — NOT main-thread-only, unlike this class's own
++  create()/destroy(). (`src/rx_shadow/include/rx_shadow/shadow_caster_pipeline.h`)
++- **`rx::graph::Executor`** [Phase 4 Task 7; Stage-0 audit F5-remainder,
++  stage0-audit.md:136/390] — `realize()`/`execute()` **[guarded, both]**
++  [Phase 4 exit fix wave, I2]: chunk pool resets, secondary-buffer reuse,
++  and `DeletionQueue` pacing all assume these run on the Scheduler's own
++  main thread, exactly once per real fence-bounded frame (`executor.h`'s
++  own `execute()` doc comment has the full caller-discipline bound this
++  guard now enforces instead of merely documenting).
++  (`src/rx_graph/include/rx_graph/executor.h`)
++- **`rx::rhi::FrameSync`** [Stage-0 audit F5-remainder, stage0-audit.md:
++  136/390] — `create()`/`advanceFrame()`/`onSwapchainRecreated()`
++  **[guarded, all three]** [Phase 4 exit fix wave, I2]: owns the present
++  loop's own per-frame-in-flight state (fences/semaphores/command pools),
++  mutated with no internal synchronization — same convention every existing
++  caller (every sample's frame loop) already follows by construction, now
++  enforced rather than documented-by-comment-only.
++  (`src/rx_rhi_vk/include/rx_rhi_vk/frame_sync.h`)
+ - **`rx::platform::Window`** [Phase 4 Task 20, gate ruling #14] —
+   `pumpEvents()`/`setRelativeMouseMode()`/`relativeMouseModeWanted()`/
+   `consumeMouseDelta()`/`setCursorVisible()`/`cursorVisible()`/
+   `setCursorConfined()`/`cursorConfined()`/`poll()`/`isKeyDown()`
+   **[guarded, all ten]** — the full input surface this task added, plus
+   `pumpEvents()` itself (pre-existing, previously documented as
+   main-thread-only only by comment, never enforced — now backed by the
+   same runtime check as every other entry here). Matches D5's whole-class
+   posture (`rx::asset::GeometryPool`'s precedent above): several of these
+   (`isKeyDown()`, the gamepad axis/button reads inside `poll()`) are
+diff --git a/samples/08_gltf_viewer/main.cpp b/samples/08_gltf_viewer/main.cpp
+index 5033e12..7e2b859 100644
+--- a/samples/08_gltf_viewer/main.cpp
++++ b/samples/08_gltf_viewer/main.cpp
+@@ -728,24 +728,44 @@ struct App {
+     // THIS layout is valid to bind at set 1 against a VkPipelineLayout
+     // MaterialSystem itself built, with no cross-library accessor needed for
+     // MaterialSystem's own (private) layout object. ONE shared pool sized
+     // for this scene's material count (kMaxMaterialParamSets below).
+     VkDescriptorSetLayout materialParamSetLayout = VK_NULL_HANDLE;
+     VkDescriptorPool materialParamPool = VK_NULL_HANDLE;
+ 
+     std::vector<MaterialGpuBinding> materialBindings;
+     std::unordered_map<uint32_t, size_t> materialHandleToBinding;  // rx::asset::MaterialHandle::index() -> materialBindings[].
+     std::vector<DrawItem> draws;
+-    std::optional<rx::rhi::Buffer> drawDataBuffer;
+-    rx::rhi::BindlessHandle drawDataBufferHandle;
+-    // CPU-side mirror of every row currently uploaded to `drawDataBuffer` --
+-    // `model`/`normalMatrix`/`materialIndex` are written once (buildDrawList())
++    // [Phase 4 exit fix wave, I1] TWO physical buffers, one per
++    // `rx::rhi::FrameSync::kFramesInFlight` slot -- NOT one shared buffer.
++    // A single buffer rewritten every frame races frame N-1's GPU reads of
++    // it: the present loop's own `vkWaitForFences(currentFence)` (called
++    // BEFORE `updateDrawDataPerPassFields()` already, in this sample) only
++    // proves frame N-2 (the slot's own last user) is done -- frame N-1
++    // always used the OTHER slot, so per-slot buffers are what makes that
++    // proof sufficient. Mirrors `rx::material::MaterialSystem`'s own
++    // `ParamArena` FIF discipline (the named precedent:
++    // `material_system.h`'s `beginFrame()` documents the identical "only
++    // after the caller's own fence wait for this slot" contract).
++    // `currentFrameSlot`-th buffer is written by
++    // `updateDrawDataPerPassFields()`, called only after that fence wait.
++    std::array<std::optional<rx::rhi::Buffer>, rx::rhi::FrameSync::kFramesInFlight> drawDataBuffers;
++    std::array<rx::rhi::BindlessHandle, rx::rhi::FrameSync::kFramesInFlight> drawDataBufferHandles;
++    // [Phase 4 exit fix wave, I1] Which FIF slot `recordSceneDraws()` should
++    // bind this frame -- set once per frame, on the main thread, alongside
++    // `updateDrawDataPerPassFields()`'s own call (both happen inside
++    // `recordForward()`'s caller, never from a worker: this sample's
++    // forward pass is a plain setExecute() whole-pass callback, not
++    // chunked).
++    uint32_t currentFrameSlot = 0;
++    // CPU-side mirror of every row currently uploaded to `drawDataBuffers[currentFrameSlot]`
++    // -- `model`/`normalMatrix`/`materialIndex` are written once (buildDrawList())
+     // and never change again (a static scene); `viewProj`/`lightDirWorld`/
+     // `lightColor`/`ambientColor`/`cameraPosWorld` are per-PASS (D26.1's own
+     // "repeated per row" design, draw_data.h) and are overwritten here, every
+     // frame, by updateDrawDataPerPassFields() before the whole vector is
+     // re-uploaded -- simpler than tracking a separate "did the camera move"
+     // dirty flag, and cheap at this sample's draw-call scale.
+     std::vector<rx::material::DrawDataGpu> drawDataRows;
+ 
+     rx::asset::AABB sceneBoundsWorld;
+     OrbitCamera camera;
+@@ -980,24 +1000,26 @@ void destroyApp(App& app) {
+         binding.paramBuffer.reset();  // paramSet itself is freed implicitly by vkDestroyDescriptorPool below.
+     }
+     if (app.materialParamPool != VK_NULL_HANDLE) {
+         vkDestroyDescriptorPool(app.device->device(), app.materialParamPool, nullptr);
+         app.materialParamPool = VK_NULL_HANDLE;
+     }
+     if (app.materialParamSetLayout != VK_NULL_HANDLE) {
+         vkDestroyDescriptorSetLayout(app.device->device(), app.materialParamSetLayout, nullptr);
+         app.materialParamSetLayout = VK_NULL_HANDLE;
+     }
+-    if (app.drawDataBufferHandle.isValid() && app.bindless.has_value()) {
+-        app.bindless->release(app.drawDataBufferHandle);
++    for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
++        if (app.drawDataBufferHandles[slot].isValid() && app.bindless.has_value()) {
++            app.bindless->release(app.drawDataBufferHandles[slot]);
++        }
++        app.drawDataBuffers[slot].reset();
+     }
+-    app.drawDataBuffer.reset();
+     destroyCompiledPass(app.device->device(), app.tonemapPass);
+     if (app.defaultSamplerHandle.isValid() && app.bindless.has_value()) {
+         app.bindless->release(app.defaultSamplerHandle);
+     }
+     if (app.defaultSampler != VK_NULL_HANDLE) {
+         vkDestroySampler(app.device->device(), app.defaultSampler, nullptr);
+         app.defaultSampler = VK_NULL_HANDLE;
+     }
+     // Registry/TextureCache/GeometryPool/MaterialSystem/Executor/Scheduler
+     // are all torn down (via their own unique_ptr resets) BEFORE Allocator/
+@@ -1275,39 +1297,47 @@ bool buildDrawList(App& app, const rx::asset::Registry& registry, const rx::asse
+ 
+             app.draws.push_back(draw);
+         }
+     }
+ 
+     if (app.draws.empty()) {
+         RX_LOG_ERROR("sample_08_gltf_viewer: imported scene produced zero draws");
+         return false;
+     }
+ 
++    // [Phase 4 exit fix wave, I1] One physical buffer PER frame-in-flight
++    // slot -- see App::drawDataBuffers' own comment. Both slots are primed
++    // with the SAME initial content here (static per-row fields; per-pass
++    // fields still at DrawDataGpu's own defaults, exactly like the
++    // pre-fix single-buffer path -- updateDrawDataPerPassFields() below
++    // fully overwrites both before either is ever read by a real draw).
+     const VkDeviceSize bytes = static_cast<VkDeviceSize>(app.drawDataRows.size()) * sizeof(rx::material::DrawDataGpu);
+-    auto buffer = app.allocator->createHostVisibleBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+-                                                            rx::rhi::MemoryCategory::Internal);
+-    if (!buffer.has_value()) {
+-        RX_LOG_ERROR("sample_08_gltf_viewer: createHostVisibleBuffer (draw data, {} rows) failed",
+-                     app.drawDataRows.size());
+-        return false;
+-    }
+-    std::memcpy(buffer->mappedData(), app.drawDataRows.data(), static_cast<size_t>(bytes));
+-    buffer->flush();
++    for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
++        auto buffer = app.allocator->createHostVisibleBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
++                                                                rx::rhi::MemoryCategory::Internal);
++        if (!buffer.has_value()) {
++            RX_LOG_ERROR("sample_08_gltf_viewer: createHostVisibleBuffer (draw data, {} rows, slot {}) failed",
++                         app.drawDataRows.size(), slot);
++            return false;
++        }
++        std::memcpy(buffer->mappedData(), app.drawDataRows.data(), static_cast<size_t>(bytes));
++        buffer->flush();
+ 
+-    rx::rhi::BindlessHandle handle = app.bindless->registerStorageBuffer(buffer->handle(), bytes);
+-    if (!handle.isValid()) {
+-        RX_LOG_ERROR("sample_08_gltf_viewer: registerStorageBuffer (draw data) failed");
+-        return false;
+-    }
++        rx::rhi::BindlessHandle handle = app.bindless->registerStorageBuffer(buffer->handle(), bytes);
++        if (!handle.isValid()) {
++            RX_LOG_ERROR("sample_08_gltf_viewer: registerStorageBuffer (draw data, slot {}) failed", slot);
++            return false;
++        }
+ 
+-    app.drawDataBuffer = std::move(buffer);
+-    app.drawDataBufferHandle = handle;
++        app.drawDataBuffers[slot] = std::move(buffer);
++        app.drawDataBufferHandles[slot] = handle;
++    }
+     return true;
+ }
+ 
+ // Frames `app.camera` (target + distance) to `app.sceneBoundsWorld` -- a
+ // fixed, deterministic derivation (bounding-sphere radius / sin(halfFov),
+ // with a constant 1.6x margin) so the same committed glTF asset always
+ // produces the same default framing, which is what makes the D17 reference
+ // PNG this default framing renders reproducible from the asset alone.
+ // A no-op (keeps OrbitCamera's own struct defaults) if the scene produced
+ // no valid bounds at all -- never divides by a zero/degenerate radius.
+@@ -1376,36 +1406,49 @@ glm::mat4 computeViewProj(const OrbitCamera& camera, float aspect) {
+ // DrawDataGpu's own bare struct-field defaults (which exist purely to keep
+ // an unconfigured row non-degenerate, not as a rendering recommendation) --
+ // tuned empirically against DamagedHelmet's own dark base-color texture
+ // (this sample's default asset) so its shape/materials read clearly with
+ // only Lambertian + FG1 flat ambient (no IBL until the techniques phase);
+ // `kAmbient` mirrors shaders/multipass/lit.frag.slang's own established
+ // "small constant ambient term keeps a fully-shadowed surface visibly
+ // non-black" precedent (that file's own `kAmbient = 0.08`), nudged slightly
+ // brighter here since THIS sample has no second light/shadow term to lean
+ // on at all.
+-void updateDrawDataPerPassFields(App& app, const glm::mat4& viewProj, const glm::vec3& cameraPosWorld) {
++// [Phase 4 exit fix wave, I1] `frameSlot` selects which of the two
++// per-FIF physical buffers this call writes -- CALLER CONTRACT: must be
++// called only after the caller has confirmed, via its own fence wait, that
++// frame `frameSlot`'s prior GPU work (the last frame that used this SAME
++// physical slot) has completed. Both this sample's call sites already
++// call this after `vkWaitForFences(frameSync->currentFence())` (the
++// present loop) or with no concurrent GPU work at all (the fully
++// synchronous headless capture path) -- see App::drawDataBuffers' own
++// comment for why per-slot addressing, not merely fence-wait ordering
++// alone, is what closes the I1 finding (a single shared buffer written
++// after the fence wait still races frame N-1's GPU reads of the OTHER
++// slot's turn).
++void updateDrawDataPerPassFields(App& app, const glm::mat4& viewProj, const glm::vec3& cameraPosWorld, uint32_t frameSlot) {
++    app.currentFrameSlot = frameSlot;
+     const glm::vec3 lightDirWorld = glm::normalize(glm::vec3(0.4F, 1.0F, 0.6F));
+     const glm::vec3 lightColor(5.0F, 5.0F, 5.0F);
+     const glm::vec3 ambientColor(0.18F, 0.18F, 0.18F);
+ 
+     const glm::mat4 viewProjTransposed = glm::transpose(viewProj);  // [MATRIX LAYOUT] see draw_data.h.
+     for (rx::material::DrawDataGpu& row : app.drawDataRows) {
+         row.viewProj = viewProjTransposed;
+         row.lightDirWorld = glm::vec4(lightDirWorld, 0.0F);
+         row.lightColor = glm::vec4(lightColor, 0.0F);
+         row.ambientColor = glm::vec4(ambientColor, 0.0F);
+         row.cameraPosWorld = glm::vec4(cameraPosWorld, 0.0F);
+     }
+     const VkDeviceSize bytes = static_cast<VkDeviceSize>(app.drawDataRows.size()) * sizeof(rx::material::DrawDataGpu);
+-    std::memcpy(app.drawDataBuffer->mappedData(), app.drawDataRows.data(), static_cast<size_t>(bytes));
+-    app.drawDataBuffer->flush();
++    std::memcpy(app.drawDataBuffers[frameSlot]->mappedData(), app.drawDataRows.data(), static_cast<size_t>(bytes));
++    app.drawDataBuffers[frameSlot]->flush();
+ }
+ 
+ // --- Forward pass recording [D26.1] -------------------------------------
+ // Set 0 (bindless) is content-IDENTICAL across every material's own
+ // pipeline layout (PipelineLayoutBuilder's external-set-0 substitution --
+ // material_system.cpp -- always the SAME `app.bindless->descriptorSetLayout()`
+ // object, not merely an equivalent one) -- bound ONCE, before the draw loop,
+ // against ANY one material's own pipelineLayout(), and never rebound again
+ // even as different materials' own VkPipelines get bound later (Vulkan spec
+ // 14.2.2 set-compatibility; matches samples/07_stress's own identical
+@@ -1438,21 +1481,22 @@ void recordSceneDraws(VkCommandBuffer cmd, App& app) {
+ 
+             // [D26.1] The real per-scene draw-data buffer + this frame's
+             // real --exposure -- NEVER MaterialSystem::bindInstance()'s own
+             // default identity row (that method is the documented pre-
+             // D26.1 legacy path; material_system.cpp's own bindInstance()
+             // header comment names this sample as the real caller that
+             // drives its own buffer here instead -- see MaterialGpuBinding's
+             // own header comment).
+             rx::material::MaterialGlobalsPush push;
+             push.defaultSamplerIndex = app.defaultSamplerHandle.index();
+-            push.drawDataBufferIndex = app.drawDataBufferHandle.index();
++            // [Phase 4 exit fix wave, I1] `app.currentFrameSlot`-th buffer.
++            push.drawDataBufferIndex = app.drawDataBufferHandles[app.currentFrameSlot].index();
+             push.exposure = app.exposure;
+             vkCmdPushConstants(cmd, layout, material.pushStages, material.pushOffset, material.pushSize, &push);
+ 
+             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, /*firstSet=*/1, 1,
+                                      &material.paramSet, 0, nullptr);
+ 
+             lastPipelineMaterial = material.handle;
+         }
+ 
+         if (draw.blockId != lastBoundBlock) {
+@@ -1909,21 +1953,24 @@ int runHeadless(const Args& args) {
+     }
+     if (!importOk) {
+         gateOk = false;
+     }
+ 
+     // --- Loaded-scene capture.
+     std::vector<uint8_t> loadedPixels;
+     if (app->sceneReady) {
+         const float aspect = static_cast<float>(kHeadlessWidth) / static_cast<float>(kHeadlessHeight);
+         const glm::mat4 viewProj = computeViewProj(app->camera, aspect);
+-        updateDrawDataPerPassFields(*app, viewProj, app->camera.eye());
++        // [I1] Headless capture is fully synchronous (captureFrame()
++        // submits and waits every call) -- no frames-in-flight GPU overlap
++        // to race, so slot 0 always is correct and sufficient here.
++        updateDrawDataPerPassFields(*app, viewProj, app->camera.eye(), /*frameSlot=*/0);
+         loadedPixels = captureFrame();
+         if (loadedPixels.empty()) {
+             gateOk = false;
+         } else {
+             // [Fix round, item 6] "sample08: perf" -- greppable, matching
+             // this project's own established per-sample stats-line
+             // convention (sample07's own "stress:" prefix). `import_ms`:
+             // wall-clock from the importGltfAsync() kickoff to the
+             // completion callback confirming setupMaterials()/
+             // buildDrawList() both succeeded (real, measured -- see this
+@@ -2242,21 +2289,29 @@ int runPresent(const Args& args) {
+         VkCommandBufferBeginInfo beginInfo{};
+         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+         vkBeginCommandBuffer(cmd, &beginInfo);
+ 
+         if (app->sceneReady) {
+             const VkExtent2D swapExtent = app->device->swapchainExtent();
+             const float aspect =
+                 static_cast<float>(swapExtent.width) / static_cast<float>(std::max<uint32_t>(1U, swapExtent.height));
+             const glm::mat4 viewProj = computeViewProj(app->camera, aspect);
+-            updateDrawDataPerPassFields(*app, viewProj, app->camera.eye());
++            // [Phase 4 exit fix wave, I1] Already after this loop's own
++            // vkWaitForFences(fence) above -- now ALSO addressed by that
++            // same slot's own physical buffer (not a shared one), which is
++            // what actually closes the race (see App::drawDataBuffers' own
++            // comment: fence-wait ordering alone was insufficient with a
++            // single shared buffer, since frame N-1 always used the OTHER
++            // slot and the wait only proves frame N-2 -- THIS slot's own
++            // last user -- is done).
++            updateDrawDataPerPassFields(*app, viewProj, app->camera.eye(), frameSync->currentFrameIndex());
+         }
+ 
+         app->executor->execute(graph, cmd, app->device->swapchainImages()[acquire.imageIndex],
+                                swapchainViews[acquire.imageIndex], app->device->swapchainExtent());
+ 
+         vkEndCommandBuffer(cmd);
+ 
+         VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+         VkSubmitInfo submitInfo{};
+         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+diff --git a/samples/09_scene/main.cpp b/samples/09_scene/main.cpp
+index 115a095..82b74bd 100644
+--- a/samples/09_scene/main.cpp
++++ b/samples/09_scene/main.cpp
+@@ -677,20 +677,30 @@ struct App {
+     // equivalent raw vkCmdBindVertexBuffers/vkCmdBindIndexBuffer calls
+     // itself (byte-identical to what GeometryPool::bind() itself records
+     // -- binding 0/offset 0/VK_INDEX_TYPE_UINT32, D9's u32-only policy)
+     // rather than calling the guarded method.
+     struct BlockBuffers {
+         VkBuffer vertexBuffer = VK_NULL_HANDLE;
+         VkBuffer indexBuffer = VK_NULL_HANDLE;
+     };
+     std::unordered_map<uint32_t, BlockBuffers> blockBufferCache;
+ 
++    // [Phase 4 exit fix wave, I3] Main-thread-cached, exactly like
++    // blockBufferCache above (same rationale: MaterialSystem::
++    // pipelineLayout() is now guarded main-thread-only -- docs/threading.md
++    // -- so a worker chunk cannot call it directly). Set once, at setup,
++    // by buildPipelineTokenMap() -- every participating material shares
++    // the identical pipeline-layout SHAPE (Vulkan spec 14.2.2
++    // set-compatibility), so caching any one binding's layout here is
++    // valid for the whole run, not just one frame.
++    VkPipelineLayout cachedAnyMaterialLayout = VK_NULL_HANDLE;
++
+     // Mode-agnostic materialIndex -> real MaterialHandle resolver, bound
+     // once at setup depending on which scene kind is active (grid/stress/
+     // custom-import via --scene) -- lets updateSceneFrame()'s D27
+     // resolvePipeline lambda and buildPipelineTokenMap() stay identical
+     // across all three without a mode-specific branch each.
+     std::function<rx::material::MaterialHandle(uint32_t)> resolveMaterialIndexToHandle;
+     // --scene <path> (present-mode only, e.g. Sponza) -- a real imported
+     // scene's own materials, keyed by asset::MaterialHandle::index() (the
+     // SAME index space DrawPayload::materialIndex uses), mirroring
+     // samples/08_gltf_viewer's own materialHandleToBinding map for the
+@@ -703,44 +713,102 @@ struct App {
+     // comment] -- ONE fabricated MeshHandle/Submesh (the procedural cube)
+     // + kStressVariantCount fabricated MaterialHandles/bindings, indexed
+     // directly by their own `.index()` (0..3).
+     rx::asset::MeshHandle stressMeshHandle;
+     rx::asset::AABB stressCubeLocalBounds;
+     rx::asset::Submesh stressCubeSubmesh;
+     std::array<rx::asset::MaterialHandle, kStressVariantCount> stressMaterialHandles;
+     std::array<MaterialGpuBinding, kStressVariantCount> stressMaterialBindings;
+     std::array<bool, kStressVariantCount> stressVariantDoubleSided{};
+ 
+-    // D26.1 per-pass draw-data buffer -- sized ONCE, generously
+-    // (scene->renderableCount() at setup time -- see makeDrawDataBuffer())
+-    // so the buffer never needs live Vulkan recreation even though
++    // D26.1 per-pass draw-data buffer -- capacity sized ONCE, generously,
++    // from the ACTUAL submesh-instance total each populate*() function
++    // computes for its own mode (kGridInstanceCount for the grid;
++    // `totalSubmeshCount` across every instance's own submesh count for an
++    // imported scene -- see populateImportedInstances()'s own comment for
++    // why `scene->renderableCount()` alone undercounts a multi-submesh mesh
++    // like Sponza; that undercount was the H1 heap-overflow bug 1ea8a01
++    // fixed) so the buffer never needs live Vulkan recreation even though
+     // `ViewLists::payloads.size()` legitimately varies frame to frame
+-    // (culling/collapse). Re-written (mapped host-visible memcpy) every
+-    // frame from resolveDrawGroups()'s own output order.
+-    std::optional<rx::rhi::Buffer> drawDataBuffer;
+-    rx::rhi::BindlessHandle drawDataBufferHandle;
++    // (culling/collapse).
++    //
++    // [Phase 4 exit fix wave, I1] TWO physical buffers per logical buffer,
++    // one per `rx::rhi::FrameSync::kFramesInFlight` slot -- NOT one shared
++    // buffer -- selected each frame by `currentFrameSlot` below. A single
++    // shared buffer rewritten every frame races frame N-1's GPU reads of
++    // it (frame N's CPU write can land while frame N-1's vertex/fragment
++    // shaders are still reading the SAME buffer, with FramesInFlight==2 and
++    // no synchronization between the two): the present loop only proves,
++    // via its own slot fence wait, that frame N-2 (the last frame that used
++    // THIS SAME slot's buffer) has completed -- frame N-1 always used the
++    // OTHER slot, so per-slot buffers make that proof sufficient. Mirrors
++    // `rx::material::MaterialSystem`'s own `ParamArena` FIF discipline (the
++    // named precedent: `material_system.h`'s `beginFrame()` documents the
++    // identical "only after the caller's own fence wait for this slot"
++    // contract). `currentFrameSlot`-th buffer is memcpy'd + flushed by
++    // `uploadSceneFrameGpuBuffers()`, called AFTER the present loop's own
++    // `vkWaitForFences(currentFence)` -- `updateSceneFrame()` below only
++    // builds/populates the CPU-side row mirrors (list-building can safely
++    // stay before the fence wait; only the GPU-visible write cannot).
++    std::array<std::optional<rx::rhi::Buffer>, rx::rhi::FrameSync::kFramesInFlight> drawDataBuffers;
++    std::array<rx::rhi::BindlessHandle, rx::rhi::FrameSync::kFramesInFlight> drawDataBufferHandles;
+     std::vector<rx::material::DrawDataGpu> drawDataRows;  // CPU staging mirror, reused capacity.
+     uint32_t drawDataCapacityRows = 0;
+ 
++    // [Phase 4 exit fix wave, I1] Which of the two FIF buffer slots this
++    // frame's GPU-visible draw data lives in -- set exactly once per frame,
++    // on the main thread, before `executor->execute()` (present mode: right
++    // after the slot fence wait, alongside `uploadSceneFrameGpuBuffers()`;
++    // headless mode: always 0, since `captureFrame()`'s `runOnce()` is
++    // fully synchronous with zero cross-frame GPU overlap to race). Read
++    // (never written) by `recordForwardChunk()`'s worker chunks and
++    // `recordShadowPass()` -- safe because the write above always
++    // happens-before `executor->execute()`'s chunk fan-out, the same
++    // established precedent `App::blockBufferCache`'s own comment documents.
++    uint32_t currentFrameSlot = 0;
++
+     // Shadow pass state [D21, RC3] -- built only when NOT --stress (see
+     // this file's own header comment: stress-v2's own A/B comparability
+     // contract never mentions shadows, so it skips the pass entirely for a
+     // leaner, more directly comparable workload).
++    //
++    // [Phase 4 exit fix wave, C1] NO sample-owned VkImage/VkDeviceMemory/
++    // VkImageView here anymore -- "shadowmap" is a genuine rx_graph
++    // TRANSIENT resource now (declareGraph()'s "shadow" pass writes it,
++    // "forward" reads it via addTextureInput()), so its physical image is
++    // owned and lifetime-tracked by the Executor's own TransientPool, not
++    // this sample. `lastShadowMapView`/`shadowMapHandle` mirror
++    // `lastHdrView`/`hdrHandle`'s own established re-registration pattern
++    // (`recordTonemapDraw()` below; also samples/05_multipass's
++    // `recordLitDrawsChunked()`) -- (re-)registered lazily, from chunk 0 of
++    // the chunked "forward" pass (`recordForwardChunk()`), the one place a
++    // chunked pass may safely call the main-thread-only BindlessTable API
++    // [D4 chunk-0 affordance].
+     bool shadowEnabled = false;
+-    VkImage shadowImage = VK_NULL_HANDLE;
+-    VkDeviceMemory shadowMemory = VK_NULL_HANDLE;
+-    VkImageView shadowView = VK_NULL_HANDLE;
++    // [Phase 4 exit fix wave, C1] Debug/test-only toggle -- when true,
++    // forces every row's shadowMapTextureIndex to the documented
++    // 0xFFFFFFFF fully-lit sentinel for this frame, exactly reproducing the
++    // phase-exit review's own runtime discrimination probe (which flipped
++    // `app.shadowEnabled` via gdb -- see updateSceneFrame()'s own comment
++    // on why THIS flag, not shadowEnabled itself, is the clean equivalent:
++    // it forces the shader-side bypass without touching the shadow PASS's
++    // own recording/list-building, so the graph structure and the shadow
++    // map's own contents stay exactly as they'd otherwise be). Read only by
++    // updateSceneFrame()'s row-population loop; never true outside the
++    // headless gate's own D17 discrimination re-proof (runHeadlessGrid()).
++    bool debugForceShadowSentinel = false;
++    VkImageView lastShadowMapView = VK_NULL_HANDLE;
+     VkSampler shadowCompareSampler = VK_NULL_HANDLE;
+     rx::rhi::BindlessHandle shadowCompareSamplerHandle;
+     rx::rhi::BindlessHandle shadowMapHandle;
+-    std::optional<rx::rhi::Buffer> shadowDrawDataBuffer;
+-    rx::rhi::BindlessHandle shadowDrawDataBufferHandle;
++    std::array<std::optional<rx::rhi::Buffer>, rx::rhi::FrameSync::kFramesInFlight> shadowDrawDataBuffers;
++    std::array<rx::rhi::BindlessHandle, rx::rhi::FrameSync::kFramesInFlight> shadowDrawDataBufferHandles;
+     std::vector<rx::shadow::ShadowDrawData> shadowDrawDataRows;
+     uint32_t shadowDrawDataCapacityRows = 0;
+     rx::shadow::ShadowFrustumFit shadowFit;
+     glm::vec3 lightDirWorld{0.4F, -1.0F, 0.3F};  // travel direction (matches LightRecord::direction's own convention).
+ 
+     // Per-frame culling output -- reused, caller-owned storage [D26 amendment].
+     rx::scene::ViewLists viewLists;
+     rx::scene::ShadowLists shadowLists;
+     std::vector<rx::scene::ResolvedDrawGroup> resolvedGroups;  // populated once/frame, chunk 0, before fan-out.
+ 
+@@ -933,46 +1001,42 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
+     if (vkCreateDescriptorPool(app->device->device(), &poolInfo, nullptr, &app->materialParamPool) != VK_SUCCESS) {
+         RX_LOG_ERROR("sample_09_scene: vkCreateDescriptorPool (material params) failed");
+         return nullptr;
+     }
+ 
+     return app;
+ }
+ 
+ void destroyShadowResources(App& app) {
+     const VkDevice device = app.device->device();
+-    if (app.shadowDrawDataBufferHandle.isValid()) {
+-        app.bindless->release(app.shadowDrawDataBufferHandle);
+-    }
+-    app.shadowDrawDataBuffer.reset();
++    for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
++        if (app.shadowDrawDataBufferHandles[slot].isValid()) {
++            app.bindless->release(app.shadowDrawDataBufferHandles[slot]);
++        }
++        app.shadowDrawDataBuffers[slot].reset();
++    }
++    // [Phase 4 exit fix wave, C1] No sample-owned shadow VkImage/
++    // VkDeviceMemory/VkImageView to destroy anymore -- "shadowmap" is a
++    // graph transient now, torn down by the Executor's own TransientPool
++    // (see App::lastShadowMapView's own comment). `shadowMapHandle` is a
++    // bindless registration ONLY (release the slot; the view it pointed at
++    // is someone else's resource to destroy).
+     if (app.shadowMapHandle.isValid()) {
+         app.bindless->release(app.shadowMapHandle);
+     }
+     if (app.shadowCompareSamplerHandle.isValid()) {
+         app.bindless->release(app.shadowCompareSamplerHandle);
+     }
+     if (app.shadowCompareSampler != VK_NULL_HANDLE) {
+         vkDestroySampler(device, app.shadowCompareSampler, nullptr);
+         app.shadowCompareSampler = VK_NULL_HANDLE;
+     }
+-    if (app.shadowView != VK_NULL_HANDLE) {
+-        vkDestroyImageView(device, app.shadowView, nullptr);
+-        app.shadowView = VK_NULL_HANDLE;
+-    }
+-    if (app.shadowImage != VK_NULL_HANDLE) {
+-        vkDestroyImage(device, app.shadowImage, nullptr);
+-        app.shadowImage = VK_NULL_HANDLE;
+-    }
+-    if (app.shadowMemory != VK_NULL_HANDLE) {
+-        vkFreeMemory(device, app.shadowMemory, nullptr);
+-        app.shadowMemory = VK_NULL_HANDLE;
+-    }
+ }
+ 
+ void destroyApp(App& app) {
+     if (app.device.has_value() && app.device->device() != VK_NULL_HANDLE) {
+         vkDeviceWaitIdle(app.device->device());
+     }
+     app.overlay.reset();  // must precede bindless/device teardown -- owns its own descriptor pool/pipeline/font texture.
+     destroyShadowResources(app);
+     for (MaterialGpuBinding& binding : app.stressMaterialBindings) {
+         binding.paramBuffer.reset();
+@@ -989,24 +1053,26 @@ void destroyApp(App& app) {
+     }
+     app.helmetMaterial.paramBuffer.reset();
+     if (app.materialParamPool != VK_NULL_HANDLE) {
+         vkDestroyDescriptorPool(app.device->device(), app.materialParamPool, nullptr);
+         app.materialParamPool = VK_NULL_HANDLE;
+     }
+     if (app.materialParamSetLayout != VK_NULL_HANDLE) {
+         vkDestroyDescriptorSetLayout(app.device->device(), app.materialParamSetLayout, nullptr);
+         app.materialParamSetLayout = VK_NULL_HANDLE;
+     }
+-    if (app.drawDataBufferHandle.isValid() && app.bindless.has_value()) {
+-        app.bindless->release(app.drawDataBufferHandle);
++    for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
++        if (app.drawDataBufferHandles[slot].isValid() && app.bindless.has_value()) {
++            app.bindless->release(app.drawDataBufferHandles[slot]);
++        }
++        app.drawDataBuffers[slot].reset();
+     }
+-    app.drawDataBuffer.reset();
+     destroyCompiledPass(app.device->device(), app.tonemapPass);
+     if (app.defaultSamplerHandle.isValid() && app.bindless.has_value()) {
+         app.bindless->release(app.defaultSamplerHandle);
+     }
+     if (app.defaultSampler != VK_NULL_HANDLE) {
+         vkDestroySampler(app.device->device(), app.defaultSampler, nullptr);
+         app.defaultSampler = VK_NULL_HANDLE;
+     }
+     app.drawListBuilder.reset();
+     app.scene.reset();
+@@ -1362,20 +1428,47 @@ bool setupImportedMaterials(App& app, const rx::asset::Registry& registry, const
+         app.customMaterialBindings.push_back(std::move(binding));
+     }
+     app.resolveMaterialIndexToHandle = [&app](uint32_t idx) -> rx::material::MaterialHandle {
+         auto it = app.customMaterialIndexToBinding.find(idx);
+         return it != app.customMaterialIndexToBinding.end() ? app.customMaterialBindings[it->second].handle
+                                                               : app.customMaterialBindings.front().handle;
+     };
+     return true;
+ }
+ 
++// [Phase 4 exit fix wave, I1] Shared by all three populate*()/build*()
++// call sites below -- allocates `rx::rhi::FrameSync::kFramesInFlight`
++// SEPARATE physical draw-data buffers (not one shared buffer -- see
++// App::drawDataBuffers' own comment for the frames-in-flight race this
++// closes) and registers each into bindless, sized for `rows` rows.
++// `app.drawDataCapacityRows`/`app.drawDataRows` (the CPU staging mirror)
++// are set here too, once, for every mode.
++bool createDrawDataBuffers(App& app, uint32_t rows) {
++    app.drawDataCapacityRows = rows;
++    app.drawDataRows.assign(rows, rx::material::DrawDataGpu{});
++    const VkDeviceSize bytes = static_cast<VkDeviceSize>(rows) * sizeof(rx::material::DrawDataGpu);
++    for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
++        app.drawDataBuffers[slot] =
++            app.allocator->createHostVisibleBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
++        if (!app.drawDataBuffers[slot].has_value()) {
++            RX_LOG_ERROR("sample_09_scene: createHostVisibleBuffer (draw data, slot {}) failed", slot);
++            return false;
++        }
++        app.drawDataBufferHandles[slot] = app.bindless->registerStorageBuffer(app.drawDataBuffers[slot]->handle(), bytes);
++        if (!app.drawDataBufferHandles[slot].isValid()) {
++            RX_LOG_ERROR("sample_09_scene: registerStorageBuffer (draw data, slot {}) failed", slot);
++            return false;
++        }
++    }
++    return true;
++}
++
+ // Populates `scene`/`drawListBuilder` from a real ImportResult's own
+ // `scene.instances` (--scene <path> present-mode override, e.g. Sponza) --
+ // every instance keeps its DEFAULT layers(~0u)/channels(0xFF) (no
+ // grid-row-style demo grouping; that is the deterministic default
+ // composition's own feature, not a property of arbitrary imported
+ // content). `registry` is needed to size the D26.1 draw-data buffer
+ // correctly [fix round: a real bug an independent review's own end-to-end
+ // Sponza run surfaced -- see this function's own drawDataCapacityRows
+ // comment below].
+ bool populateImportedInstances(App& app, const rx::asset::Registry& registry, const rx::asset::ImportedScene& scene) {
+@@ -1425,31 +1518,21 @@ bool populateImportedInstances(App& app, const rx::asset::Registry& registry, co
+     app.flyCamera.camera.position = center + glm::vec3(0.0F, radius * 0.4F, radius * 1.6F);
+     const glm::vec3 lookDir = glm::normalize(center - app.flyCamera.camera.position);
+     app.flyCamera.pitchRadians = std::asin(std::clamp(lookDir.y, -1.0F, 1.0F));
+     app.flyCamera.yawRadians = std::atan2(-lookDir.x, -lookDir.z);
+     app.flyCamera.syncOrientation();
+     app.flyCamera.camera.nearPlane = std::max(0.01F, radius * 0.01F);
+     app.flyCamera.camera.cullingFarPlane = radius * 8.0F;
+     app.flyCamera.camera.cullMask = ~0u;
+     app.moveSpeed = std::max(radius * 0.5F, 1.0F);
+ 
+-    app.drawDataCapacityRows = std::max<uint32_t>(totalSubmeshCount, 1);
+-    app.drawDataRows.assign(app.drawDataCapacityRows, rx::material::DrawDataGpu{});
+-    const VkDeviceSize bytes = static_cast<VkDeviceSize>(app.drawDataCapacityRows) * sizeof(rx::material::DrawDataGpu);
+-    app.drawDataBuffer = app.allocator->createHostVisibleBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
+-    if (!app.drawDataBuffer.has_value()) {
+-        RX_LOG_ERROR("sample_09_scene: createHostVisibleBuffer (imported-scene draw data) failed");
+-        return false;
+-    }
+-    app.drawDataBufferHandle = app.bindless->registerStorageBuffer(app.drawDataBuffer->handle(), bytes);
+-    if (!app.drawDataBufferHandle.isValid()) {
+-        RX_LOG_ERROR("sample_09_scene: registerStorageBuffer (imported-scene draw data) failed");
++    if (!createDrawDataBuffers(app, std::max<uint32_t>(totalSubmeshCount, 1))) {
+         return false;
+     }
+     return true;
+ }
+ 
+ // --- Grid layout [deterministic layer-mask culling -- see this file's own
+ // header comment] ---------------------------------------------------------
+ glm::mat4 gridTransform(uint32_t row, uint32_t col, float spacing) {
+     const float x = (static_cast<float>(col) - 0.5F * static_cast<float>(kGridCols - 1)) * spacing;
+     const float z = -(static_cast<float>(row) * spacing);
+@@ -1501,31 +1584,21 @@ bool populateHelmetGrid(App& app, rx::asset::MeshHandle helmetMesh) {
+     app.flyCamera.camera.position = gridCenter + glm::vec3(0.0F, camDistance * 0.45F, camDistance);
+     const glm::vec3 lookDir = glm::normalize(gridCenter - app.flyCamera.camera.position);
+     app.flyCamera.pitchRadians = std::asin(std::clamp(lookDir.y, -1.0F, 1.0F));
+     app.flyCamera.yawRadians = std::atan2(-lookDir.x, -lookDir.z);
+     app.flyCamera.syncOrientation();
+     app.flyCamera.camera.nearPlane = std::max(0.01F, radius * 0.05F);
+     app.flyCamera.camera.cullingFarPlane = camDistance * 4.0F + halfDepth * 2.0F;
+     app.flyCamera.camera.cullMask = app.hud.cullMaskFromToggles();  // == (1<<kVisibleRowCount)-1 by HudState's own default.
+     app.moveSpeed = std::max(radius * 2.0F, 0.5F);
+ 
+-    app.drawDataCapacityRows = kGridInstanceCount;
+-    app.drawDataRows.assign(kGridInstanceCount, rx::material::DrawDataGpu{});
+-    const VkDeviceSize bytes = static_cast<VkDeviceSize>(kGridInstanceCount) * sizeof(rx::material::DrawDataGpu);
+-    app.drawDataBuffer = app.allocator->createHostVisibleBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
+-    if (!app.drawDataBuffer.has_value()) {
+-        RX_LOG_ERROR("sample_09_scene: createHostVisibleBuffer (draw data) failed");
+-        return false;
+-    }
+-    app.drawDataBufferHandle = app.bindless->registerStorageBuffer(app.drawDataBuffer->handle(), bytes);
+-    if (!app.drawDataBufferHandle.isValid()) {
+-        RX_LOG_ERROR("sample_09_scene: registerStorageBuffer (draw data) failed");
++    if (!createDrawDataBuffers(app, kGridInstanceCount)) {
+         return false;
+     }
+     return true;
+ }
+ 
+ // --- Stress-v2 field [Registry-free -- see this file's own header comment]
+ // -----------------------------------------------------------------------
+ struct HostGeometry {
+     std::vector<rx::asset::PoolVertex> vertices;
+     std::vector<uint32_t> indices;
+@@ -1641,107 +1714,66 @@ bool buildStressField(App& app, uint32_t drawCount) {
+     const float halfExtent = static_cast<float>(gridSize - 1) * 0.5F * kStressInstanceSpacing + kStressInstanceScale + 1.0F;
+     app.flyCamera.camera.position = glm::vec3(0.0F, halfExtent * 2.5F + 10.0F, 0.01F);
+     app.flyCamera.pitchRadians = glm::radians(-89.0F);
+     app.flyCamera.yawRadians = 0.0F;
+     app.flyCamera.syncOrientation();
+     app.flyCamera.camera.nearPlane = 0.1F;
+     app.flyCamera.camera.cullingFarPlane = halfExtent * 6.0F + 20.0F;
+     app.flyCamera.camera.cullMask = ~0u;
+     app.moveSpeed = 10.0F;
+ 
+-    app.drawDataCapacityRows = drawCount;
+-    app.drawDataRows.assign(drawCount, rx::material::DrawDataGpu{});
+-    const VkDeviceSize bytes = static_cast<VkDeviceSize>(drawCount) * sizeof(rx::material::DrawDataGpu);
+-    app.drawDataBuffer = app.allocator->createHostVisibleBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
+-    if (!app.drawDataBuffer.has_value()) {
+-        RX_LOG_ERROR("sample_09_scene: createHostVisibleBuffer (stress draw data) failed");
+-        return false;
+-    }
+-    app.drawDataBufferHandle = app.bindless->registerStorageBuffer(app.drawDataBuffer->handle(), bytes);
+-    if (!app.drawDataBufferHandle.isValid()) {
+-        RX_LOG_ERROR("sample_09_scene: registerStorageBuffer (stress draw data) failed");
++    if (!createDrawDataBuffers(app, drawCount)) {
+         return false;
+     }
+     return true;
+ }
+ 
+ // One (VkPipeline bit_cast token) -> (MaterialGpuBinding*) entry per
+ // participating material -- see App::pipelineTokenToBinding's own comment.
+ // `bindings` is whichever set is active this run (helmet: a 1-element
+ // span; stress: 4; custom-import: N).
+ void buildPipelineTokenMap(App& app, std::span<const MaterialGpuBinding> bindings) {
+     app.pipelineTokenToBinding.clear();
+     const rx::material::PassSignature sig = forwardPassSignature();
+     for (const MaterialGpuBinding& binding : bindings) {
+         VkPipeline pipeline = app.materialSystem->getPipeline({binding.handle, sig, 0});
+         app.pipelineTokenToBinding[std::bit_cast<uint64_t>(pipeline)] = &binding;
+     }
++    // [Phase 4 exit fix wave, I3] Hoisted here, main-thread-only, setup-time
++    // (this function is never called mid-frame) -- NOT recomputed inside
++    // recordForwardChunk() anymore, which ran on worker chunks >= 1 and
++    // called the now-guarded MaterialSystem::pipelineLayout() from there
++    // (a sibling of the Task-24 GeometryPool::bind() violation). Every
++    // participating material shares the IDENTICAL pipeline-layout SHAPE
++    // (external bindless set-0 substitution + material set-1 -- Vulkan spec
++    // 14.2.2 set-compatibility), so any one binding's layout is legal to
++    // cache and reuse for every chunk regardless of which pipeline a given
++    // draw ends up binding.
++    if (!bindings.empty()) {
++        app.cachedAnyMaterialLayout = app.materialSystem->pipelineLayout(bindings.front().handle);
++    }
+ }
+ 
+ // --- Shadow setup [D21, RC3] ----------------------------------------------
++// [Phase 4 exit fix wave, C1] No raw vkCreateImage/vkAllocateMemory/
++// vkCreateImageView here anymore: "shadowmap" is declared as a genuine
++// rx_graph transient (declareGraph()'s "shadow" pass writes it,
++// shadowAttachmentDesc()), so the Executor's own TransientPool owns and
++// lifetime-tracks its physical VkImage -- registering it into bindless
++// happens lazily, from recordForwardChunk()'s chunk 0, exactly like
++// "hdr"'s own lastHdrView/hdrHandle re-registration pattern
++// (recordTonemapDraw() below). This function now only builds the
++// comparison sampler (a real, independent Vulkan object -- not
++// graph-owned) and the light-frustum fit + per-FIF shadow draw-data
++// buffers.
+ bool setupShadow(App& app) {
+     const VkDevice device = app.device->device();
+-    const VkPhysicalDevice physicalDevice = app.device->physicalDevice();
+-
+-    VkImageCreateInfo imageInfo{};
+-    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+-    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+-    imageInfo.format = kShadowFormat;
+-    imageInfo.extent = {kShadowMapResolution, kShadowMapResolution, 1};
+-    imageInfo.mipLevels = 1;
+-    imageInfo.arrayLayers = 1;
+-    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+-    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+-    imageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+-    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+-    if (vkCreateImage(device, &imageInfo, nullptr, &app.shadowImage) != VK_SUCCESS) {
+-        RX_LOG_ERROR("sample_09_scene: vkCreateImage(shadow map) failed");
+-        return false;
+-    }
+-    VkMemoryRequirements memReq{};
+-    vkGetImageMemoryRequirements(device, app.shadowImage, &memReq);
+-    VkPhysicalDeviceMemoryProperties memProps{};
+-    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
+-    uint32_t memoryTypeIndex = UINT32_MAX;
+-    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+-        if ((memReq.memoryTypeBits & (1U << i)) != 0U &&
+-            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0U) {
+-            memoryTypeIndex = i;
+-            break;
+-        }
+-    }
+-    if (memoryTypeIndex == UINT32_MAX) {
+-        RX_LOG_ERROR("sample_09_scene: no device-local memory type found for the shadow map");
+-        return false;
+-    }
+-    VkMemoryAllocateInfo allocInfo{};
+-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+-    allocInfo.allocationSize = memReq.size;
+-    allocInfo.memoryTypeIndex = memoryTypeIndex;
+-    if (vkAllocateMemory(device, &allocInfo, nullptr, &app.shadowMemory) != VK_SUCCESS) {
+-        RX_LOG_ERROR("sample_09_scene: vkAllocateMemory(shadow map) failed");
+-        return false;
+-    }
+-    if (vkBindImageMemory(device, app.shadowImage, app.shadowMemory, 0) != VK_SUCCESS) {
+-        RX_LOG_ERROR("sample_09_scene: vkBindImageMemory(shadow map) failed");
+-        return false;
+-    }
+-    VkImageViewCreateInfo viewInfo{};
+-    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+-    viewInfo.image = app.shadowImage;
+-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+-    viewInfo.format = kShadowFormat;
+-    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+-    if (vkCreateImageView(device, &viewInfo, nullptr, &app.shadowView) != VK_SUCCESS) {
+-        RX_LOG_ERROR("sample_09_scene: vkCreateImageView(shadow map) failed");
+-        return false;
+-    }
+ 
+     // Comparison sampler [D21, matches rx_material's own
+     // test_standard_pbr_shadow_gpu.cpp rig verbatim].
+     VkSamplerCreateInfo compareSamplerInfo{};
+     compareSamplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+     compareSamplerInfo.magFilter = VK_FILTER_LINEAR;
+     compareSamplerInfo.minFilter = VK_FILTER_LINEAR;
+     compareSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+     compareSamplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+     compareSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+@@ -1750,25 +1782,20 @@ bool setupShadow(App& app) {
+     compareSamplerInfo.maxLod = VK_LOD_CLAMP_NONE;
+     if (vkCreateSampler(device, &compareSamplerInfo, nullptr, &app.shadowCompareSampler) != VK_SUCCESS) {
+         RX_LOG_ERROR("sample_09_scene: vkCreateSampler(shadow compare) failed");
+         return false;
+     }
+     app.shadowCompareSamplerHandle = app.bindless->registerComparisonSampler(app.shadowCompareSampler);
+     if (!app.shadowCompareSamplerHandle.isValid()) {
+         RX_LOG_ERROR("sample_09_scene: registerComparisonSampler failed");
+         return false;
+     }
+-    app.shadowMapHandle = app.bindless->registerSampledImage(app.shadowView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+-    if (!app.shadowMapHandle.isValid()) {
+-        RX_LOG_ERROR("sample_09_scene: registerSampledImage(shadow map) failed");
+-        return false;
+-    }
+ 
+     // Fitted, texel-snapped light frustum -- computed ONCE from the
+     // scene's own total world bounds (a bounded, static-content scene;
+     // see this sample's own header comment for why a per-frame refit is
+     // not needed at this scope) with a generous depth-padding margin so
+     // every caster this scene can ever contain lands within [0,1].
+     rx::asset::AABB totalBounds{};
+     for (const rx::asset::AABB& b : app.scene->worldBoundsSpan()) {
+         totalBounds = rx::asset::AABB::unionOf(totalBounds, b);
+     }
+@@ -1785,45 +1812,62 @@ bool setupShadow(App& app) {
+     // scene->renderableCount() -- ShadowLists::payloads is bounded by the
+     // identical "one row per submesh-instance pairing" shape ViewLists::
+     // payloads is (shadow casters are a SUBSET of all renderables), so the
+     // same undercount bug (renderable count != submesh count for a
+     // multi-submesh mesh like Sponza) applies here too. setupShadow() is
+     // always called AFTER populateHelmetGrid()/populateImportedInstances()
+     // in every call site, so `app.drawDataCapacityRows` is already correct
+     // by this point.
+     app.shadowDrawDataCapacityRows = app.drawDataCapacityRows;
+     app.shadowDrawDataRows.assign(app.shadowDrawDataCapacityRows, rx::shadow::ShadowDrawData{});
+-    const VkDeviceSize shadowBytes = static_cast<VkDeviceSize>(app.shadowDrawDataCapacityRows) * sizeof(rx::shadow::ShadowDrawData);
+-    app.shadowDrawDataBuffer =
+-        app.allocator->createHostVisibleBuffer(std::max<VkDeviceSize>(shadowBytes, sizeof(rx::shadow::ShadowDrawData)),
+-                                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
+-    if (!app.shadowDrawDataBuffer.has_value()) {
+-        RX_LOG_ERROR("sample_09_scene: createHostVisibleBuffer (shadow draw data) failed");
+-        return false;
+-    }
+-    app.shadowDrawDataBufferHandle = app.bindless->registerStorageBuffer(
+-        app.shadowDrawDataBuffer->handle(), std::max<VkDeviceSize>(shadowBytes, sizeof(rx::shadow::ShadowDrawData)));
+-    if (!app.shadowDrawDataBufferHandle.isValid()) {
+-        RX_LOG_ERROR("sample_09_scene: registerStorageBuffer (shadow draw data) failed");
+-        return false;
++    const VkDeviceSize shadowBytes =
++        std::max<VkDeviceSize>(static_cast<VkDeviceSize>(app.shadowDrawDataCapacityRows) * sizeof(rx::shadow::ShadowDrawData),
++                                sizeof(rx::shadow::ShadowDrawData));
++    // [Phase 4 exit fix wave, I1] Per-FIF-slot, same rationale as
++    // createDrawDataBuffers() above -- the shadow pass's own draw-data SSBO
++    // is exactly as exposed to the frames-in-flight host-write race as the
++    // forward pass's.
++    for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
++        app.shadowDrawDataBuffers[slot] =
++            app.allocator->createHostVisibleBuffer(shadowBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
++        if (!app.shadowDrawDataBuffers[slot].has_value()) {
++            RX_LOG_ERROR("sample_09_scene: createHostVisibleBuffer (shadow draw data, slot {}) failed", slot);
++            return false;
++        }
++        app.shadowDrawDataBufferHandles[slot] = app.bindless->registerStorageBuffer(app.shadowDrawDataBuffers[slot]->handle(), shadowBytes);
++        if (!app.shadowDrawDataBufferHandles[slot].isValid()) {
++            RX_LOG_ERROR("sample_09_scene: registerStorageBuffer (shadow draw data, slot {}) failed", slot);
++            return false;
++        }
+     }
+     app.shadowEnabled = true;
+     return true;
+ }
+ 
+ // --- Per-frame update -----------------------------------------------------
+-// Cull+collapse (DrawListBuilder::build()/buildShadow()), populate both
+-// D26.1 draw-data buffers from the resulting `payloads[]` (NOT from a
+-// per-renderable loop -- see this file's own header comment), and
+-// D27-pre-resolve every distinct materialIndex boundary -- all on the main
+-// thread, BEFORE `executor->execute()` (chunk fan-out never touches any of
+-// this again).
++// Cull+collapse (DrawListBuilder::build()/buildShadow()), populate the CPU
++// staging mirror of both D26.1 draw-data buffers from the resulting
++// `payloads[]` (NOT from a per-renderable loop -- see this file's own
++// header comment), and D27-pre-resolve every distinct materialIndex
++// boundary -- all on the main thread, BEFORE `executor->execute()` (chunk
++// fan-out never touches any of this again).
++//
++// [Phase 4 exit fix wave, I1] Deliberately does NOT write to the GPU-visible
++// draw-data buffers anymore -- only `app.drawDataRows`/`app.shadowDrawDataRows`
++// (plain CPU `std::vector`s, list-building's own scratch, safe to touch at
++// any point before the frame's GPU work is submitted). The actual
++// memcpy+flush into `app.drawDataBuffers[slot]`/`app.shadowDrawDataBuffers[slot]`
++// is `uploadSceneFrameGpuBuffers()` below, called separately, AFTER the
++// caller's own frame-slot fence wait -- see that function's own comment for
++// why this split is load-bearing, not cosmetic (a single host-visible
++// buffer written here, before the fence wait, is exactly the frames-in-flight
++// host-write race this fix wave's I1 finding closed).
+ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
+     // Refresh the block-buffer cache [see App::blockBufferCache's own
+     // comment] -- main-thread-only GeometryPool accessors, called here so
+     // the chunked forward pass's own worker chunks never touch them.
+     for (uint32_t blockId = 0; blockId < app.geometryPool->blockCount(); ++blockId) {
+         app.blockBufferCache[blockId] =
+             App::BlockBuffers{app.geometryPool->vertexBufferHandle(blockId), app.geometryPool->indexBufferHandle(blockId)};
+     }
+ 
+     app.drawListBuilder->build(*app.scene, app.flyCamera.camera, scheduler, app.viewLists);
+@@ -1843,96 +1887,166 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
+ 
+         rx::material::DrawDataGpu& row = app.drawDataRows[i];
+         row.model = glm::transpose(model);
+         row.normalMatrix = glm::transpose(glm::mat4(normalMat3));
+         row.viewProj = viewProjTransposed;
+         row.lightDirWorld = glm::vec4(-glm::normalize(app.lightDirWorld), 0.0F);
+         row.lightColor = glm::vec4(5.0F, 5.0F, 5.0F, 0.0F);
+         row.ambientColor = glm::vec4(0.12F, 0.12F, 0.12F, 0.0F);
+         row.cameraPosWorld = glm::vec4(cameraPos, 0.0F);
+         row.materialIndex = payload.materialIndex;
+-        if (app.shadowEnabled) {
++        // [Phase 4 exit fix wave, C1] Also requires `app.shadowMapHandle.
++        // isValid()` -- NOT just `app.shadowEnabled` -- since the handle is
++        // now (re-)registered lazily, from recordForwardChunk()'s chunk 0,
++        // the first time the graph-owned "shadowmap" transient is realized
++        // (see App::lastShadowMapView's own comment). Before that first
++        // registration (only ever true on the very first frame of a run:
++        // the physical resource is never resized/evicted afterward, so the
++        // handle stays valid and correct for every later frame), rows fall
++        // back to the SAME documented 0xFFFFFFFF fully-lit sentinel the
++        // shadowEnabled==false path already uses -- a well-defined,
++        // one-frame-only degrade, never a read of an unregistered/stale
++        // bindless slot. `!app.debugForceShadowSentinel`: see that field's
++        // own comment -- the D17 discrimination re-proof's clean equivalent
++        // of the review's own gdb-flip probe.
++        if (app.shadowEnabled && app.shadowMapHandle.isValid() && !app.debugForceShadowSentinel) {
+             row.lightViewProj = glm::transpose(app.shadowFit.lightViewProj);
+             row.shadowMapTextureIndex = app.shadowMapHandle.index();
+             row.shadowCompareSamplerIndex = app.shadowCompareSamplerHandle.index();
+             row.shadowTexelSize = 1.0F / static_cast<float>(kShadowMapResolution);
+         } else {
+             row.shadowMapTextureIndex = 0xFFFFFFFFu;
+         }
+     }
+-    if (!app.viewLists.payloads.empty()) {
+-        const VkDeviceSize bytes = app.viewLists.payloads.size() * sizeof(rx::material::DrawDataGpu);
+-        std::memcpy(app.drawDataBuffer->mappedData(), app.drawDataRows.data(), static_cast<size_t>(bytes));
+-        app.drawDataBuffer->flush();
+-    }
+ 
+     if (app.shadowEnabled) {
+         app.drawListBuilder->buildShadow(*app.scene, app.lightHandle, app.flyCamera.camera, scheduler, app.shadowLists);
+         for (size_t i = 0; i < app.shadowLists.payloads.size(); ++i) {
+             const rx::scene::DrawPayload& payload = app.shadowLists.payloads[i];
+             rx::shadow::ShadowDrawData& row = app.shadowDrawDataRows[i];
+             row.model = glm::transpose(transforms[payload.instanceDataIndex]);
+             row.lightViewProj = glm::transpose(app.shadowFit.lightViewProj);
+         }
+-        if (!app.shadowLists.payloads.empty()) {
+-            const VkDeviceSize bytes = app.shadowLists.payloads.size() * sizeof(rx::shadow::ShadowDrawData);
+-            std::memcpy(app.shadowDrawDataBuffer->mappedData(), app.shadowDrawDataRows.data(), static_cast<size_t>(bytes));
+-            app.shadowDrawDataBuffer->flush();
+-        }
+     }
+ 
+     // [D27] Main-thread pre-resolution -- once per frame, before any chunk
+     // fan-out. `resolvePipeline` returns the SAME bit_cast token
+     // buildPipelineTokenMap() populated at setup (a cache HIT every time,
+     // by construction).
+     const rx::material::PassSignature passSig = forwardPassSignature();
+     const uint64_t passSigHash = passSig.hash();
+     app.resolvedGroups = rx::scene::resolveDrawGroups(
+         app.viewLists, passSigHash, 0, [&app, &passSig](const rx::scene::PipelineRequestKey& key) -> uint64_t {
+             const rx::material::MaterialHandle handle = app.resolveMaterialIndexToHandle(key.materialIndex);
+             VkPipeline pipeline = app.materialSystem->getPipeline({handle, passSig, 0});
+             return std::bit_cast<uint64_t>(pipeline);
+         });
+ }
+ 
++// [Phase 4 exit fix wave, I1] The GPU-write half `updateSceneFrame()` above
++// deliberately no longer performs -- memcpy's `app.drawDataRows`/
++// `app.shadowDrawDataRows` (already populated by `updateSceneFrame()`) into
++// THIS frame's `frameSlot`-th physical buffer and flushes it. Sets
++// `app.currentFrameSlot = frameSlot` first (read by `recordForwardChunk()`'s
++// worker chunks and `recordShadowPass()` to select the matching bindless
++// handle -- see App::currentFrameSlot's own comment).
++//
++// CALLER CONTRACT: must be called AFTER the caller has confirmed, via its
++// own fence wait, that frame `frameSlot`'s prior GPU work (the last frame
++// that wrote/read this SAME physical slot, `rx::rhi::FrameSync::
++// kFramesInFlight` frames ago) has completed -- mirrors
++// `rx::material::MaterialSystem::beginFrame()`'s own documented "only after
++// the caller's own fence wait for this slot" contract (material_system.h),
++// the named FIF-discipline precedent this fix wave's I1 finding cites.
++// samples/09_scene's present loop calls this right after
++// `vkWaitForFences(frameSync->currentFence())`; headless mode (no real
++// frames-in-flight overlap -- `captureFrame()`'s `runOnce()` submits and
++// waits synchronously every call) always passes slot 0.
++void uploadSceneFrameGpuBuffers(App& app, uint32_t frameSlot) {
++    app.currentFrameSlot = frameSlot;
++
++    if (!app.viewLists.payloads.empty()) {
++        const VkDeviceSize bytes = app.viewLists.payloads.size() * sizeof(rx::material::DrawDataGpu);
++        std::memcpy(app.drawDataBuffers[frameSlot]->mappedData(), app.drawDataRows.data(), static_cast<size_t>(bytes));
++        app.drawDataBuffers[frameSlot]->flush();
++    }
++
++    if (app.shadowEnabled && !app.shadowLists.payloads.empty()) {
++        const VkDeviceSize bytes = app.shadowLists.payloads.size() * sizeof(rx::shadow::ShadowDrawData);
++        std::memcpy(app.shadowDrawDataBuffers[frameSlot]->mappedData(), app.shadowDrawDataRows.data(), static_cast<size_t>(bytes));
++        app.shadowDrawDataBuffers[frameSlot]->flush();
++    }
++}
++
+ // --- Recording -------------------------------------------------------------
+ void recordShadowPass(rx::graph::PassContext& ctx, App& app) {
+     if (!app.shadowEnabled || app.shadowLists.commands.empty()) {
+         return;
+     }
+     VkCommandBuffer cmd = ctx.cmd;
+     VkViewport viewport{0.0F, 0.0F, static_cast<float>(kShadowMapResolution), static_cast<float>(kShadowMapResolution), 0.0F, 1.0F};
+     VkRect2D scissor{{0, 0}, {kShadowMapResolution, kShadowMapResolution}};
+     vkCmdSetViewport(cmd, 0, 1, &viewport);
+     vkCmdSetScissor(cmd, 0, 1, &scissor);
+ 
+     // Slope-scaled bias -- fixed, reasonable defaults for this scene's own
+     // scale (D21's own mechanism; this sample does not expose bias
+     // tuning as a CLI knob).
+     app.shadowCaster->bindAndSetDepthBias(cmd, /*constantFactor=*/2.0F, /*slopeFactor=*/2.5F);
+     VkDescriptorSet set = app.bindless->descriptorSet();
+     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, app.shadowCaster->pipelineLayout(), 0, 1, &set, 0, nullptr);
+-    rx::shadow::ShadowCasterPushConstants push{app.shadowDrawDataBufferHandle.index()};
++    // [Phase 4 exit fix wave, I1] `app.currentFrameSlot`-th buffer -- see
++    // that field's own comment; set by uploadSceneFrameGpuBuffers() before
++    // executor->execute() ever reaches this callback.
++    rx::shadow::ShadowCasterPushConstants push{app.shadowDrawDataBufferHandles[app.currentFrameSlot].index()};
+     vkCmdPushConstants(cmd, app.shadowCaster->pipelineLayout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
+ 
+     // ShadowLists is a single-pipeline pass (RC3) -- `blocks` alone (no
+     // pipeline-group resolution needed) gives contiguous per-block runs.
+     for (const rx::scene::BlockRange& blockRange : app.shadowLists.blocks) {
+         app.geometryPool->bind(cmd, blockRange.blockId);
+         for (uint32_t i = blockRange.firstCommand; i < blockRange.firstCommand + blockRange.commandCount; ++i) {
+             const rx::scene::DrawCommand& c = app.shadowLists.commands[i];
+             vkCmdDrawIndexed(cmd, c.indexCount, c.instanceCount, c.firstIndex, c.vertexOffset, c.firstInstance);
+         }
+     }
+ }
+ 
+ void recordForwardChunk(rx::graph::PassContext& ctx, App& app, uint32_t chunkIndex, uint32_t chunkCount) {
++    if (chunkIndex == 0 && app.shadowEnabled) {
++        // [Phase 4 exit fix wave, C1] (Re-)register "shadowmap"'s CURRENT
++        // resolved view into bindless, once per execute() call -- NOT once
++        // per draw -- main-thread-only (BindlessTable registration,
++        // docs/threading.md), safe here ONLY because chunk 0 of a
++        // setExecuteChunked() callback is guaranteed to run synchronously,
++        // on the calling (main) thread, before any other chunk begins
++        // [pass.h: Pass::setExecuteChunked()'s own doc comment]. Placed
++        // BEFORE every early return below (unlike the rest of this
++        // function's body) so it always runs on chunk 0 regardless of
++        // whether this particular frame has any forward draws at all --
++        // exactly samples/05_multipass's own recordLitDrawsChunked()
++        // pattern, applied to "shadowmap" instead of "hdr". `ctx.imageView`
++        // resolves against whatever Executor::realize() most recently
++        // bound "shadowmap" to (declareGraph()'s "shadow" pass output) --
++        // legal to call here specifically because "forward" now declares
++        // addTextureInput("shadowmap"), making the name part of this
++        // compiled graph's own resolvable resource set.
++        VkImageView shadowView = ctx.imageView("shadowmap");
++        if (shadowView != app.lastShadowMapView) {
++            if (app.shadowMapHandle.isValid()) {
++                app.bindless->release(app.shadowMapHandle);
++            }
++            app.shadowMapHandle = app.bindless->registerSampledImage(shadowView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++            app.lastShadowMapView = shadowView;
++        }
++    }
++
+     VkCommandBuffer cmd = ctx.chunkCommandBuffer();
+     VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.renderArea.width), static_cast<float>(ctx.renderArea.height),
+                         0.0F, 1.0F};
+     VkRect2D scissor{{0, 0}, ctx.renderArea};
+     vkCmdSetViewport(cmd, 0, 1, &viewport);
+     vkCmdSetScissor(cmd, 0, 1, &scissor);
+ 
+     const uint32_t totalCommands = static_cast<uint32_t>(app.viewLists.commands.size());
+     if (totalCommands == 0) {
+         return;
+@@ -1941,27 +2055,33 @@ void recordForwardChunk(rx::graph::PassContext& ctx, App& app, uint32_t chunkInd
+     const uint32_t begin = std::min(chunkIndex * perChunk, totalCommands);
+     const uint32_t end = std::min(begin + perChunk, totalCommands);
+     if (begin >= end) {
+         return;
+     }
+ 
+     if (app.pipelineTokenToBinding.empty()) {
+         return;
+     }
+     VkDescriptorSet set = app.bindless->descriptorSet();
+-    // Every participating material shares the IDENTICAL pipeline-layout
+-    // SHAPE (external bindless set-0 substitution + material set-1) --
+-    // any one binding's own pipelineLayout() is legal to bind set 0
+-    // against regardless of which pipeline ends up bound later (Vulkan
+-    // spec 14.2.2 set-compatibility, same precedent samples/08_gltf_viewer's
+-    // own recordSceneDraws() already relies on).
+-    VkPipelineLayout anyLayout = app.materialSystem->pipelineLayout(app.pipelineTokenToBinding.begin()->second->handle);
++    // [Phase 4 exit fix wave, I3] Main-thread-cached at setup
++    // (buildPipelineTokenMap()) -- NOT resolved here anymore.
++    // MaterialSystem::pipelineLayout() is guarded main-thread-only
++    // (docs/threading.md); calling it from this worker chunk (chunkIndex
++    // can be >= 1) was the exact violation class Task 24 already fixed for
++    // GeometryPool::bind() (see App::blockBufferCache's own comment) but
++    // left unfixed one call site later, here. Every participating material
++    // shares the IDENTICAL pipeline-layout SHAPE (external bindless set-0
++    // substitution + material set-1) -- any one binding's layout is legal
++    // to bind set 0 against regardless of which pipeline ends up bound
++    // later (Vulkan spec 14.2.2 set-compatibility, same precedent
++    // samples/08_gltf_viewer's own recordSceneDraws() already relies on).
++    VkPipelineLayout anyLayout = app.cachedAnyMaterialLayout;
+     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, anyLayout, /*firstSet=*/0, 1, &set, 0, nullptr);
+ 
+     // [D27 caller-side fix -- see draw_recording.h's own header comment]
+     // resolveDrawGroups()'s own materialIndex-adjacency scan has no
+     // blockId awareness; splitByBlockAndGroup() further subdivides this
+     // chunk's own command range at every block boundary too, so
+     // GeometryPool::bind()'s "one block per bind-to-next-bind span"
+     // contract always holds.
+     const auto spans = rx::samples9::splitByBlockAndGroup(app.resolvedGroups, app.viewLists.blocks, begin, end - begin);
+ 
+@@ -1982,21 +2102,24 @@ void recordForwardChunk(rx::graph::PassContext& ctx, App& app, uint32_t chunkInd
+                 vkCmdBindIndexBuffer(cmd, it->second.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+             }
+             lastBlock = span.blockId;
+         }
+         if (!havePipeline || span.pipelineToken != lastToken) {
+             VkPipeline pipeline = std::bit_cast<VkPipeline>(span.pipelineToken);
+             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+             auto it = app.pipelineTokenToBinding.find(span.pipelineToken);
+             if (it != app.pipelineTokenToBinding.end()) {
+                 const MaterialGpuBinding& mb = *it->second;
+-                rx::material::MaterialGlobalsPush push{app.defaultSamplerHandle.index(), app.drawDataBufferHandle.index(), 0.0F};
++                // [Phase 4 exit fix wave, I1] `app.currentFrameSlot`-th
++                // buffer -- see that field's own comment.
++                rx::material::MaterialGlobalsPush push{app.defaultSamplerHandle.index(),
++                                                         app.drawDataBufferHandles[app.currentFrameSlot].index(), 0.0F};
+                 vkCmdPushConstants(cmd, anyLayout, mb.pushStages, mb.pushOffset, mb.pushSize, &push);
+                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, anyLayout, /*firstSet=*/1, 1, &mb.paramSet, 0,
+                                          nullptr);
+             }
+             lastToken = span.pipelineToken;
+             havePipeline = true;
+         }
+         for (uint32_t i = span.commandOffset; i < span.commandOffset + span.commandCount; ++i) {
+             const rx::scene::DrawCommand& c = app.viewLists.commands[i];
+             vkCmdDrawIndexed(cmd, c.indexCount, c.instanceCount, c.firstIndex, c.vertexOffset, c.firstInstance);
+@@ -2058,22 +2181,39 @@ rx::graph::AttachmentDesc shadowAttachmentDesc() {
+     return desc;
+ }
+ 
+ void declareGraph(rx::graph::RenderGraph& graph, App& app, VkFormat backbufferFormat) {
+     if (app.shadowEnabled) {
+         graph.addPass("shadow")
+             .setDepthStencilOutput("shadowmap", shadowAttachmentDesc())
+             .setExecute([&app](rx::graph::PassContext& ctx) { recordShadowPass(ctx, app); });
+     }
+ 
+-    graph.addPass("forward")
+-        .addColorOutput("hdr", swapchainRelativeDesc(kHdrFormat))
++    rx::graph::Pass& forward = graph.addPass("forward");
++    if (app.shadowEnabled) {
++        // [Phase 4 exit fix wave, C1] THE fix: "forward" genuinely CONSUMES
++        // "shadowmap" through the graph -- this both (a) un-culls the
++        // "shadow" pass (RenderGraph::compile()'s reachability walk now
++        // reaches it transitively: "forward" is reachable from the
++        // backbuffer writer, and "forward" depends on "shadowmap"'s
++        // writer), and (b) buys the depth-write -> sampled-read barrier
++        // (layout transition + availability/visibility) the graph derives
++        // for every addTextureInput() declaration -- exactly D29's
++        // documented mixed-convention composition (reversed-Z "forward" +
++        // standard-Z "shadow" in one graph) working as designed, NOT a
++        // setSideEffect() band-aid on the "shadow" pass (which would keep
++        // it alive without ever proving anything downstream actually reads
++        // its output, or deriving the layout transition the forward
++        // shader's SampleCmp taps require).
++        forward.addTextureInput("shadowmap");
++    }
++    forward.addColorOutput("hdr", swapchainRelativeDesc(kHdrFormat))
+         .setDepthStencilOutput("depth", swapchainRelativeReversedDepthDesc(kDepthFormat))
+         .setExecuteChunked(
+             [&app](rx::graph::PassContext& ctx, uint32_t chunkIndex, uint32_t chunkCount) {
+                 recordForwardChunk(ctx, app, chunkIndex, chunkCount);
+             });
+ 
+     graph.addPass("tonemap")
+         .addTextureInput("hdr")
+         .addColorOutput("backbuffer", swapchainRelativeDesc(backbufferFormat))
+         .setExecute([&app](rx::graph::PassContext& ctx) { recordTonemapDraw(ctx, app); });
+@@ -2503,20 +2643,25 @@ int runHeadless(const Args& args) {
+         return pixels;
+     };
+ 
+     // --- Main loop: EXACT counter assertions [matrix row 24], NO widgets
+     // drawn (D17-gated capture) -----------------------------------------
+     std::vector<uint32_t> drawsSubmittedPerFrame;
+     std::vector<uint8_t> gatedPixels;
+     for (uint32_t frame = 0; frame < kHeadlessFrameCount; ++frame) {
+         const auto frameStart = std::chrono::steady_clock::now();
+         updateSceneFrame(*app, *app->scheduler);
++        // [Phase 4 exit fix wave, I1] Headless capture is fully synchronous
++        // (captureFrame()'s cmdCtx->runOnce() submits and waits every
++        // call, below) -- no frames-in-flight GPU overlap to race, so slot
++        // 0 always is correct and sufficient here.
++        uploadSceneFrameGpuBuffers(*app, /*frameSlot=*/0);
+         app->overlay->beginFrame();  // no widgets this frame -- HUD pass renders empty draw data, scene pixels untouched.
+ 
+         const rx::scene::CullCounters& c = app->viewLists.counters;
+         if (c.totalCandidates != expectedTotalCandidates) {
+             RX_LOG_ERROR("sample_09_scene: frame {}: totalCandidates={} != expected {}", frame, c.totalCandidates, expectedTotalCandidates);
+             gateOk = false;
+         }
+         if (c.culledByLayerMask + c.culledByFrustum != expectedCulled) {
+             RX_LOG_ERROR("sample_09_scene: frame {}: culled={} != expected {}", frame, c.culledByLayerMask + c.culledByFrustum,
+                          expectedCulled);
+@@ -2585,37 +2730,39 @@ int runHeadless(const Args& args) {
+     // main-thread-only resolvePipeline() guard -- reuses the SAME
+     // rx::core::debug::detail::setViolationHookForTests() seam
+     // draw_list_test.cpp's own D27 test installs.
+ #ifdef RX_DEBUG_CHECKS
+     if (app->scheduler->workerCount() > 1) {
+         static std::vector<std::string> violations;
+         violations.clear();
+         rx::core::debug::detail::setViolationHookForTests(
+             [](const char* context) { violations.emplace_back(context != nullptr ? context : ""); });
+         updateSceneFrame(*app, *app->scheduler);
++        uploadSceneFrameGpuBuffers(*app, /*frameSlot=*/0);  // [I1] headless: always slot 0 -- see the main gate loop's own comment.
+         app->overlay->beginFrame();  // every captureFrame() call executes the graph, which always runs the HUD pass's
+                                       // own unconditional ImGui::Render() -- must pair with a fresh NewFrame() each time.
+         std::vector<uint8_t> guardPixels = captureFrame();
+         (void)guardPixels;
+         rx::core::debug::detail::setViolationHookForTests(nullptr);
+         if (!violations.empty()) {
+             RX_LOG_ERROR("sample_09_scene: D27 main-thread guard tripped {} time(s) under --threads>1 (worker chunk called a "
+                          "main-thread-only resolver)",
+                          violations.size());
+             gateOk = false;
+         }
+     }
+ #endif
+ 
+     // --- HUD smoke-test frame [matrix row 16] -- real widgets, NOT
+     // pixel-gated. ---------------------------------------------------------
+     updateSceneFrame(*app, *app->scheduler);
++    uploadSceneFrameGpuBuffers(*app, /*frameSlot=*/0);  // [I1] headless: always slot 0.
+     app->overlay->beginFrame();
+     drawHud(*app, *app->device, app->surface, /*presentMode=*/false);
+     std::vector<uint8_t> hudFramePixels = captureFrame();
+     (void)hudFramePixels;
+     const ImDrawData* hudDrawData = ImGui::GetDrawData();
+     if (hudDrawData == nullptr || hudDrawData->CmdListsCount == 0 || hudDrawData->TotalVtxCount == 0) {
+         RX_LOG_ERROR("sample_09_scene: HUD overlay pass produced no draw data (CmdListsCount={}, TotalVtxCount={})",
+                      hudDrawData != nullptr ? hudDrawData->CmdListsCount : -1, hudDrawData != nullptr ? hudDrawData->TotalVtxCount : -1);
+         gateOk = false;
+     }
+@@ -2649,20 +2796,66 @@ int runHeadless(const Args& args) {
+                                                                               reference->rgba8.data(), reference->width, reference->height);
+             RX_LOG_INFO("sample_09_scene: D17 grid_scene gate: failingPixels={}/{} ({:.4f}%) pass={}{}", result.failingPixelCount,
+                         result.totalPixelCount, result.failingPixelFraction * 100.0, result.passed,
+                         lavapipe ? "" : " [non-lavapipe driver -- informational only, not enforced]");
+             if (lavapipe && !result.passed) {
+                 RX_LOG_ERROR("sample_09_scene: D17 grid_scene gate FAILED on lavapipe (first mismatch at ({},{}))",
+                              result.firstMismatchX, result.firstMismatchY);
+                 gateOk = false;
+             }
+         }
++
++        // [Phase 4 exit fix wave, C1] Discrimination re-proof: re-renders
++        // the EXACT same static-camera frame with app.debugForceShadowSentinel
++        // forced true (every row's shadow term bypassed -- the clean,
++        // reproducible equivalent of the phase-exit review's own gdb-flip
++        // probe) and asserts the result DIFFERS from `gatedPixels` by more
++        // than a noise floor. Before C1's fix this would have found
++        // failingPixels == 0 (the committed reference baked the
++        // ambient/emissive-only, always-shadowed output, so real shadows
++        // and "no shadows at all" rendered identically); the review's own
++        // reproduction measured ~726/65536 (1.11%) on lavapipe once a real
++        // shadow term existed to turn off.
++        if (!gatedPixels.empty()) {
++            app->debugForceShadowSentinel = true;
++            updateSceneFrame(*app, *app->scheduler);
++            uploadSceneFrameGpuBuffers(*app, /*frameSlot=*/0);
++            app->overlay->beginFrame();  // pair with the fresh NewFrame() every captureFrame() call needs.
++            std::vector<uint8_t> shadowOffPixels = captureFrame();
++            app->debugForceShadowSentinel = false;
++
++            if (shadowOffPixels.empty()) {
++                RX_LOG_ERROR("sample_09_scene: C1 discrimination re-proof: shadow-disabled capture failed");
++                gateOk = false;
++            } else {
++                rx::samples::GateResult discrimination = rx::samples::compareToReference(
++                    gatedPixels.data(), kHeadlessWidth, kHeadlessHeight, shadowOffPixels.data(), kHeadlessWidth, kHeadlessHeight);
++                RX_LOG_INFO("sample_09_scene: C1 discrimination re-proof (shadows-on vs. forced-off): "
++                            "differingPixels={}/{} ({:.4f}%){}",
++                            discrimination.failingPixelCount, discrimination.totalPixelCount,
++                            discrimination.failingPixelFraction * 100.0,
++                            lavapipe ? "" : " [non-lavapipe driver -- informational only, not enforced]");
++                // Floor, not the review's exact 726 -- driver/rasterization
++                // noise legitimately shifts the precise count; what must
++                // never recur is the C1 bug's own signature (a shadow map
++                // that is never sampled meaningfully at all, so toggling it
++                // off changes NOTHING -- differingPixels == 0).
++                constexpr uint32_t kMinDiscriminatingPixels = 100;
++                if (lavapipe && discrimination.failingPixelCount < kMinDiscriminatingPixels) {
++                    RX_LOG_ERROR("sample_09_scene: C1 discrimination re-proof FAILED on lavapipe: only {} pixels "
++                                 "differ with shadows forced off (< {}) -- the shadow term is not visibly affecting "
++                                 "the rendered image, the exact C1 regression class",
++                                 discrimination.failingPixelCount, kMinDiscriminatingPixels);
++                    gateOk = false;
++                }
++            }
++        }
+     }
+ 
+     RX_LOG_INFO("sample09: perf mode={} frame_ms_avg={:.3f}", args.stress ? "stress" : "grid", app->hud.rollingAverageMs());
+ 
+     vkDeviceWaitIdle(vkDevice);
+     cmdCtx.reset();
+     destroyRawResources();
+     destroyApp(*app);
+ 
+     if (args.validate && app->context->hasValidationErrors()) {
+@@ -2909,20 +3102,31 @@ int runPresent(const Args& args) {
+         }
+         if (acquire.status == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("sample_09_scene: device lost during acquireNextImage; exiting present loop");
+             ok = false;
+             break;
+         }
+ 
+         app->flyCamera.camera.aspectRatio = static_cast<float>(app->device->swapchainExtent().width) /
+                                              static_cast<float>(std::max<uint32_t>(1U, app->device->swapchainExtent().height));
+ 
++        // [Phase 4 exit fix wave, I1] The GPU-write half of the frame
++        // update -- AFTER `vkWaitForFences(fence)` above (which just
++        // confirmed frame N-2's GPU work, the last frame that used THIS
++        // SAME frame-in-flight slot's buffers, is complete) and selected
++        // by that same slot index, so this write can never race frame
++        // N-1's still-possibly-in-flight GPU reads of a DIFFERENT slot's
++        // buffers. `updateSceneFrame()` above only built the CPU-side row
++        // mirrors -- see that function's own comment for why this split
++        // closes the I1 finding.
++        uploadSceneFrameGpuBuffers(*app, frameSync->currentFrameIndex());
++
+         vkResetFences(vkDevice, 1, &fence);
+         VkCommandBuffer cmd = frameSync->currentCommandBuffer();
+         vkResetCommandPool(vkDevice, frameSync->currentCommandPool(), 0);
+         VkCommandBufferBeginInfo beginInfo{};
+         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+         vkBeginCommandBuffer(cmd, &beginInfo);
+ 
+         app->overlay->beginFrame();
+         drawHud(*app, *app->device, app->surface, /*presentMode=*/true);
+diff --git a/samples/09_scene/references/grid_scene.png b/samples/09_scene/references/grid_scene.png
+index 3f05648..3ee5dcf 100644
+Binary files a/samples/09_scene/references/grid_scene.png and b/samples/09_scene/references/grid_scene.png differ
+diff --git a/src/rx_asset/include/rx_asset/registry.h b/src/rx_asset/include/rx_asset/registry.h
+index 9881f84..bf86f93 100644
+--- a/src/rx_asset/include/rx_asset/registry.h
++++ b/src/rx_asset/include/rx_asset/registry.h
+@@ -1,23 +1,28 @@
+ #pragma once
+ 
+ // rx_asset/registry.h -- Thread-affinity (D5): Registry MUTATION
+-// (importGltf(), evictForTesting()) is main-thread-only, matching every
+-// other GPU-object-mutation entry point in this codebase (BindlessTable/
+-// Uploader/DeletionQueue/GeometryPool -- docs/threading.md). The read
++// (importGltf(), evictForTesting()) is main-thread-only, [guarded]
++// [Phase 4 exit fix wave, in-round pre-existing-defect closure -- was
++// documented-by-comment-only, unenforced anywhere in importGltf()'s own
++// call chain until now], matching every other GPU-object-mutation entry
++// point in this codebase (BindlessTable/Uploader/DeletionQueue/
++// GeometryPool -- docs/threading.md). The read
+ // accessors (mesh()/material()/texture()) are declared const and are
+-// safe to call from the main thread at any point after a prior
+-// importGltf() call has returned; they are NOT safe to call concurrently
+-// with a mutating call on another thread (this class holds no internal
+-// lock -- same posture as GeometryPool, D5's whole point being that
+-// GPU-object-owning types stay single-threaded rather than growing
+-// locks).
++// main-thread-only, [guarded] [Phase 4 exit fix wave, M2, mirroring the
++// Task-12 GeometryPool read-accessor ruling this class's identical posture
++// never got applied to until now] -- safe to call from the main thread at
++// any point after a prior importGltf() call has returned; they are NOT
++// safe to call concurrently with a mutating call on another thread (this
++// class holds no internal lock -- same posture as GeometryPool, D5's whole
++// point being that GPU-object-owning types stay single-threaded rather
++// than growing locks).
+ //
+ // D24 EVICTION INVARIANT: mesh()/material() are RESIDENCY-TOLERANT --
+ // a handle that is still "live" (passes the generational check) but has
+ // been marked nonresident (evictForTesting(), the one deferred-eviction
+ // path this task exercises; Phase 4 has no automatic eviction POLICY,
+ // only this invariant) resolves to the registry's own D11 fallback
+ // asset, never a null dereference and never an assert. No public method
+ // anywhere on this class returns a raw pointer or index that could
+ // outlive a later mutation -- every return is a value handle or a
+ // const reference whose documented lifetime is "until the next
+diff --git a/src/rx_asset/registry.cpp b/src/rx_asset/registry.cpp
+index 800469c..8ff9cc9 100644
+--- a/src/rx_asset/registry.cpp
++++ b/src/rx_asset/registry.cpp
+@@ -570,25 +570,43 @@ ImportProgress Registry::importProgress(AsyncImportHandle handle) const {
+     ImportProgress progress;
+     progress.stage = job.stage.load(std::memory_order_acquire);
+     progress.itemsCompleted = job.itemsCompleted.load(std::memory_order_acquire);
+     progress.itemsTotal = job.itemsTotal.load(std::memory_order_acquire);
+     progress.cancelled = job.cancelled.load(std::memory_order_acquire);
+     return progress;
+ }
+ 
+ ImportResult Registry::importGltf(std::span<const std::byte> documentBytes, ByteSource& source, GeometryPool& pool,
+                                    rx::task::Scheduler& scheduler, TextureCache* textures) {
++    // [Phase 4 exit fix wave, in-round pre-existing-defect closure] Was
++    // documented main-thread-only (registry.h's own top comment) but never
++    // actually enforced anywhere in this call's chain
++    // (importGltfPipeline() -> computeGltfImport()/marshalGltfImportSync()
++    // -> registerMesh()/registerMaterial(), none guarded) -- discovered
++    // while writing I4's threading.md text, closed here per standing
++    // no-deferred-fixes policy (no prerequisite blocks it). Matches every
++    // other main-thread-only Registry mutator's guard convention.
++    RX_ASSERT_MAIN_THREAD("Registry::importGltf");
+     return importGltfPipeline(*this, documentBytes, source, pool, scheduler, textures);
+ }
+ 
+ ImportResult Registry::importGltf(const std::filesystem::path& path, GeometryPool& pool, rx::task::Scheduler& scheduler,
+                                    TextureCache* textures) {
++    // [Phase 4 exit fix wave] See the byte-span overload's own comment
++    // above -- this overload also reaches it (below), so this guard is
++    // technically redundant with that one, but it fires here FIRST (before
++    // this overload's own direct filesystem read), matching this
++    // codebase's own established "guard every public entry point, even
++    // when an inner call is separately guarded too" convention (e.g.
++    // MaterialSystem::bindInstance() and the getPipeline() it calls
++    // internally both carry their own guard).
++    RX_ASSERT_MAIN_THREAD("Registry::importGltf");
+     // The one sanctioned direct-filesystem read in this whole library
+     // [byte_source.h's own top comment]: reading the MAIN document
+     // itself for this convenience overload. Every OTHER byte (every
+     // external buffer/image URI the document goes on to reference)
+     // still resolves exclusively through the FilesystemByteSource this
+     // wraps below.
+     std::ifstream file(path, std::ios::binary | std::ios::ate);
+     if (!file) {
+         RX_LOG_ERROR("rx_asset: Registry::importGltf: failed to open '{}'", path.string());
+         ImportResult result;
+@@ -611,42 +629,64 @@ ImportResult Registry::importGltf(const std::filesystem::path& path, GeometryPoo
+         ImportResult result;
+         result.error = ImportError::ByteSourceUnavailable;
+         return result;
+     }
+ 
+     FilesystemByteSource fsSource(path.has_parent_path() ? path.parent_path() : std::filesystem::path("."));
+     return importGltf(bytes, fsSource, pool, scheduler, textures);
+ }
+ 
+ const MeshAsset& Registry::mesh(MeshHandle handle) const {
++    // [Phase 4 exit fix wave, M2] Task 12's review ruling narrowed
++    // GeometryPool's read accessors to guarded main-thread-only precisely
++    // because unguarded reads against unlocked mutable state invite silent
++    // misuse -- Registry's identical-posture reads (this class holds no
++    // internal lock either, registry.h's own top comment) never got the
++    // same treatment until now.
++    RX_ASSERT_MAIN_THREAD("Registry::mesh");
+     if (nonresidentMesh_.find(packHandle(handle)) == nonresidentMesh_.end()) {
+         if (const MeshAsset* asset = meshes_.get(handle)) {
+             return *asset;
+         }
+     }
+     const MeshAsset* fallback = meshes_.get(fallbackMesh_);
+     return *fallback;  // always resident -- created in the constructor, never evicted/released
+ }
+ 
+ const MaterialAsset& Registry::material(MaterialHandle handle) const {
++    // [Phase 4 exit fix wave, M2] See mesh()'s own comment above.
++    RX_ASSERT_MAIN_THREAD("Registry::material");
+     if (nonresidentMaterial_.find(packHandle(handle)) == nonresidentMaterial_.end()) {
+         if (const MaterialAsset* asset = materials_.get(handle)) {
+             return *asset;
+         }
+     }
+     const MaterialAsset* fallback = materials_.get(fallbackMaterial_);
+     return *fallback;
+ }
+ 
+ const TextureAsset& Registry::texture(TextureHandle handle) const {
++    // [Phase 4 exit fix wave, M2] See mesh()'s own comment above.
++    RX_ASSERT_MAIN_THREAD("Registry::texture");
+     if (const TextureAsset* asset = textures_.get(handle)) {
+         return *asset;
+     }
+     const TextureAsset* fallback = textures_.get(fallbackTexture_);
+     return *fallback;
+ }
+ 
+-void Registry::evictForTesting(MeshHandle handle) { nonresidentMesh_.insert(packHandle(handle)); }
++void Registry::evictForTesting(MeshHandle handle) {
++    // [Phase 4 exit fix wave, in-round pre-existing-defect closure] Same
++    // rationale as importGltf() above -- documented main-thread-only,
++    // previously unguarded.
++    RX_ASSERT_MAIN_THREAD("Registry::evictForTesting");
++    nonresidentMesh_.insert(packHandle(handle));
++}
+ 
+-void Registry::evictForTesting(MaterialHandle handle) { nonresidentMaterial_.insert(packHandle(handle)); }
++void Registry::evictForTesting(MaterialHandle handle) {
++    // [Phase 4 exit fix wave] See the MeshHandle overload's own comment
++    // above.
++    RX_ASSERT_MAIN_THREAD("Registry::evictForTesting");
++    nonresidentMaterial_.insert(packHandle(handle));
++}
+ 
+ }  // namespace rx::asset
+diff --git a/src/rx_asset/tests/thread_guard_test.cpp b/src/rx_asset/tests/thread_guard_test.cpp
+index f718833..0329172 100644
+--- a/src/rx_asset/tests/thread_guard_test.cpp
++++ b/src/rx_asset/tests/thread_guard_test.cpp
+@@ -1,19 +1,25 @@
+ #include <doctest/doctest.h>
++#include <rx_asset/byte_source.h>
+ #include <rx_asset/geometry_pool.h>
++#include <rx_asset/registry.h>
+ #include <rx_core/debug_checks.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/upload.h>
+ #include <rx_platform/window.h>
++#include <rx_task/scheduler.h>
+ #include <atomic>
++#include <filesystem>
++#include <memory>
+ #include <mutex>
+ #include <optional>
++#include <span>
+ #include <string>
+ #include <thread>
+ #include <utility>
+ 
+ // thread_guard_test.cpp -- [Fix round 1, review IMPORTANT finding] proves
+ // GeometryPool's read accessors (stats()/blockCount()/
+ // bufferDeviceAddressEnabled()/vertexBufferDeviceAddress()/
+ // indexBufferDeviceAddress(), narrowed to main-thread-only this fix round
+ // -- see geometry_pool.h's own updated class comment) actually ENFORCE
+ // that contract via RX_ASSERT_MAIN_THREAD, not merely document it.
+@@ -167,11 +173,128 @@ TEST_CASE(
+     pool->stats();
+     pool->blockCount();
+     pool->bufferDeviceAddressEnabled();
+     pool->vertexBufferDeviceAddress(0);
+     pool->indexBufferDeviceAddress(0);
+ 
+     std::lock_guard<std::mutex> lock(capture.mutex);
+     CHECK(capture.callCount == 0);
+ }
+ 
++// [Phase 4 exit fix wave, M2] Registry::mesh()/material()/texture() carried
++// no guard despite registry.h's own top comment documenting the identical
++// main-thread-only, no-internal-lock posture Task 12's review ruling
++// already narrowed GeometryPool's read accessors to. GPU-free (unlike the
++// GeometryPool cases above): Registry() is a bare default constructor with
++// no Device/Allocator dependency at all, and its D11 fallback assets
++// (created in the constructor, always resident) make even a
++// never-registered, default-constructed handle a safe, defined read --
++// exactly what these tests need, with no real import required.
++TEST_CASE("Registry::mesh/material/texture trip RX_ASSERT_MAIN_THREAD when called from a worker thread [M2]") {
++    rx::asset::Registry registry;
++
++    ViolationCapture capture;
++    g_activeCapture.store(&capture, std::memory_order_relaxed);
++    rx::core::debug::detail::setViolationHookForTests(&captureViolationHook);
++    ViolationHookGuard guard;
++
++    std::thread meshThread([&] { (void)registry.mesh(rx::asset::MeshHandle{}); });
++    meshThread.join();
++    std::thread materialThread([&] { (void)registry.material(rx::asset::MaterialHandle{}); });
++    materialThread.join();
++    std::thread textureThread([&] { (void)registry.texture(rx::asset::TextureHandle{}); });
++    textureThread.join();
++
++    std::lock_guard<std::mutex> lock(capture.mutex);
++    CHECK(capture.callCount == 3);
++    CHECK(capture.lastContext == "Registry::texture");
++}
++
++TEST_CASE("Registry::mesh/material/texture do NOT trip the guard for calls genuinely on the main thread [M2]") {
++    rx::asset::Registry registry;
++
++    ViolationCapture capture;
++    g_activeCapture.store(&capture, std::memory_order_relaxed);
++    rx::core::debug::detail::setViolationHookForTests(&captureViolationHook);
++    ViolationHookGuard guard;
++
++    (void)registry.mesh(rx::asset::MeshHandle{});
++    (void)registry.material(rx::asset::MaterialHandle{});
++    (void)registry.texture(rx::asset::TextureHandle{});
++
++    std::lock_guard<std::mutex> lock(capture.mutex);
++    CHECK(capture.callCount == 0);
++}
++
++// [Phase 4 exit fix wave, in-round pre-existing-defect closure] Discovered
++// while writing threading.md's I4 text: Registry::importGltf()'s two
++// overloads and evictForTesting() were documented main-thread-only
++// (registry.h's own top comment) but carried NO RX_ASSERT_MAIN_THREAD
++// anywhere in their own call chain -- closed per this project's
++// no-deferred-fixes policy (a discovered pre-existing defect with no
++// prerequisite blocking it). importGltf() is given a deliberately EMPTY
++// byte span -- the guard fires as the very first statement regardless,
++// and an empty/malformed document is already a documented safe-failure
++// path (see import_gltf_gpu_test.cpp's own "malformed-file battery --
++// named error, zero partial registry mutation, no crash" case), so no
++// real glTF fixture is needed here.
++TEST_CASE("Registry::importGltf/evictForTesting trip RX_ASSERT_MAIN_THREAD when called from a worker thread") {
++    auto fixture = makeFixture("rx_asset_thread_guard_registry");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto pool = rx::asset::GeometryPool::create(fixture->allocator, fixture->device, fixture->uploader);
++    REQUIRE(pool != nullptr);
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++
++    rx::asset::Registry registry;
++    rx::asset::FilesystemByteSource byteSource(std::filesystem::path("."));
++
++    ViolationCapture capture;
++    g_activeCapture.store(&capture, std::memory_order_relaxed);
++    rx::core::debug::detail::setViolationHookForTests(&captureViolationHook);
++    ViolationHookGuard guard;
++
++    std::thread importThread([&] {
++        (void)registry.importGltf(std::span<const std::byte>{}, byteSource, *pool, *scheduler, nullptr);
++    });
++    importThread.join();
++    std::thread evictMeshThread([&] { registry.evictForTesting(rx::asset::MeshHandle{}); });
++    evictMeshThread.join();
++    std::thread evictMaterialThread([&] { registry.evictForTesting(rx::asset::MaterialHandle{}); });
++    evictMaterialThread.join();
++
++    std::lock_guard<std::mutex> lock(capture.mutex);
++    CHECK(capture.callCount == 3);
++    CHECK(capture.lastContext == "Registry::evictForTesting");
++}
++
++TEST_CASE("Registry::importGltf/evictForTesting do NOT trip the guard for calls genuinely on the main thread") {
++    auto fixture = makeFixture("rx_asset_thread_guard_registry_legal");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto pool = rx::asset::GeometryPool::create(fixture->allocator, fixture->device, fixture->uploader);
++    REQUIRE(pool != nullptr);
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++
++    rx::asset::Registry registry;
++    rx::asset::FilesystemByteSource byteSource(std::filesystem::path("."));
++
++    ViolationCapture capture;
++    g_activeCapture.store(&capture, std::memory_order_relaxed);
++    rx::core::debug::detail::setViolationHookForTests(&captureViolationHook);
++    ViolationHookGuard guard;
++
++    (void)registry.importGltf(std::span<const std::byte>{}, byteSource, *pool, *scheduler, nullptr);
++    registry.evictForTesting(rx::asset::MeshHandle{});
++    registry.evictForTesting(rx::asset::MaterialHandle{});
++
++    std::lock_guard<std::mutex> lock(capture.mutex);
++    CHECK(capture.callCount == 0);
++}
++
+ #endif  // RX_DEBUG_CHECKS
+diff --git a/src/rx_graph/executor.cpp b/src/rx_graph/executor.cpp
+index 15e641b..7853fc7 100644
+--- a/src/rx_graph/executor.cpp
++++ b/src/rx_graph/executor.cpp
+@@ -1,14 +1,15 @@
+ #include <rx_graph/executor.h>
+ 
+ #include "transient_pool.h"
+ 
++#include <rx_core/debug_checks.h>
+ #include <rx_core/log.h>
+ #include <rx_core/profile.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/deletion_queue.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/frame_sync.h>
+ #include <rx_rhi_vk/tracy_gpu.h>
+ #include <rx_task/scheduler.h>
+ #include <volk.h>
+ 
+@@ -1037,20 +1038,29 @@ Executor::~Executor() {
+             if (cp.pool != VK_NULL_HANDLE) {
+                 vkDestroyCommandPool(impl_->device, cp.pool, nullptr);
+             }
+         }
+     }
+     impl_->pool.retireAll(impl_->frameCounter, impl_->deletionQueue);
+     impl_->deletionQueue.flushAll();
+ }
+ 
+ void Executor::realize(const RenderGraph& graph) {
++    // [Phase 4 exit fix wave, I2; Stage-0 audit F5-remainder,
++    // stage0-audit.md:136/390] realize() rebuilds this Executor's
++    // TransientPool bindings in place with no internal synchronization --
++    // a call from any thread other than the one that owns this Executor's
++    // Scheduler (Executor::create()'s own doc comment) corrupts that state
++    // silently instead of failing loudly. Matches every other main-thread-
++    // only GPU-object-mutation entry point's guard convention
++    // (docs/threading.md).
++    RX_ASSERT_MAIN_THREAD("Executor::realize");
+     Impl& impl = *impl_;
+     const CompiledGraph& compiled = graph.compiled();
+     const std::span<const PhysicalResource> resources = compiled.resources();
+ 
+     impl.pool.beginRealizeBatch();
+ 
+     std::vector<ResolvedResource> resolved(resources.size());
+     // realize() is a setup/resize-only path, exempt from this task's
+     // zero-alloc scope [ticket #29] -- rebuilt from scratch here every
+     // call, unchanged. Declared type must still match Impl::nameToIndex's
+@@ -1141,20 +1151,28 @@ void Executor::realize(const RenderGraph& graph) {
+     impl.resources = std::move(resolved);
+     impl.nameToIndex = std::move(nameToIndex);
+ }
+ 
+ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage backbufferImage,
+                         VkImageView backbufferView, VkExtent2D backbufferExtent) {
+     // Whole-execute() CPU zone [Phase 4 Stage 0 Task 3, spec D3: "Executor::
+     // execute (whole)"] -- spans this entire call, i.e. every pass this
+     // frame, on top of the per-pass zones declared inside the loop below.
+     RX_ZONE;
++    // [Phase 4 exit fix wave, I2; Stage-0 audit F5-remainder,
++    // stage0-audit.md:136/390] Chunk pool resets, secondary-buffer reuse,
++    // and DeletionQueue pacing (F10's own "caller-discipline, unenforced"
++    // note) all assume this call happens on the Scheduler's own main
++    // thread, exactly once per real fence-bounded frame -- see this
++    // method's own header comment in executor.h. A call from the wrong
++    // thread must fail loudly, not corrupt shared executor state silently.
++    RX_ASSERT_MAIN_THREAD("Executor::execute");
+     Impl& impl = *impl_;
+     const CompiledGraph& compiled = graph.compiled();
+     const std::span<const PhysicalResource> resources = compiled.resources();
+ 
+     ++impl.frameCounter;
+ 
+     // Phase 4 Task 7 [spec D4 amendment]: this call's own frame-in-flight
+     // slot for the CHUNK secondary-buffer arenas (ChunkCommandPool, above) --
+     // an independent 2-cycle from history's own ping-pong parity below (both
+     // derive from frameCounter, but there is no requirement they share a
+diff --git a/src/rx_graph/include/rx_graph/executor.h b/src/rx_graph/include/rx_graph/executor.h
+index 6f65aa9..6cb6acd 100644
+--- a/src/rx_graph/include/rx_graph/executor.h
++++ b/src/rx_graph/include/rx_graph/executor.h
+@@ -393,20 +393,22 @@ public:
+     // expected) to call again after any RenderGraph::compile() that
+     // changed a resource's shape (e.g. a swapchain resize changing a
+     // SwapchainRelative attachment's real extent) -- this Executor's
+     // previous bindings are released back to the pool (not destroyed
+     // outright; a matching future realize() can reclaim them, and an
+     // unmatched one is eventually swept by the transient pool's own
+     // frames-in-flight-bounded eviction -- see transient_pool.h) and
+     // rebuilt from scratch against the new shapes. Must be called at
+     // least once, after `graph`'s first compile(), before the first
+     // execute() call against it.
++    // Thread-affinity (D5, Phase 4): main-thread-only, [guarded] -- see
++    // docs/threading.md.
+     void realize(const RenderGraph& graph);
+ 
+     // Records one frame's worth of work for `graph` onto `cmd` (an
+     // already-allocated command buffer the caller has already begun
+     // recording into -- Executor never itself calls
+     // vkBeginCommandBuffer/vkEndCommandBuffer, nor submits or waits on
+     // anything, exactly like rx::rhi::CommandContext::runOnce()'s own
+     // `record` callback contract): for every surviving pass in
+     // CompiledGraph::executionOrder(), in order -- one vkCmdPipelineBarrier2
+     // for that position's CompiledGraph::passBarriers() entry (see
+@@ -441,20 +443,22 @@ public:
+     // has the full reasoning) -- assumes at most ONE execute() call per
+     // real, fence-bounded frame (i.e. the caller does not submit and start
+     // a second execute() before confirming, via its own fence wait, that
+     // an earlier frame's GPU work sharing the same frame-in-flight slot has
+     // completed). Every in-tree caller already satisfies this (samples via
+     // `FrameSync`'s fence-wait-then-record cycle; GPU tests via a
+     // synchronous submit-and-wait between calls, which is strictly more
+     // conservative than the bound requires) -- but nothing here asserts it,
+     // so a future caller driving two graphs per real frame would reset
+     // pools the GPU could still be reading.
++    // Thread-affinity (D5, Phase 4): main-thread-only, [guarded] -- see
++    // docs/threading.md.
+     void execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage backbufferImage, VkImageView backbufferView,
+                  VkExtent2D backbufferExtent);
+ 
+     // Forward-declared publicly (the struct body is defined, and only
+     // ever meaningfully used, inside executor.cpp) purely so a handful of
+     // free helper functions in executor.cpp's own anonymous namespace --
+     // applyBarriers()/beginDebugLabel()/endDebugLabel(), none of which are
+     // part of Executor's own interface and none of which any caller
+     // outside this .cpp can ever actually name a real Impl instance to
+     // call them with -- can take an `Impl&` parameter at all. C++ access
+diff --git a/src/rx_graph/render_graph.cpp b/src/rx_graph/render_graph.cpp
+index e435fb2..3badd63 100644
+--- a/src/rx_graph/render_graph.cpp
++++ b/src/rx_graph/render_graph.cpp
+@@ -463,20 +463,51 @@ void RenderGraph::compile(const CompileInfo& info) {
+         }
+     }
+     while (!stack.empty()) {
+         uint32_t p = stack.back();
+         stack.pop_back();
+         for (uint32_t producer : dependsOn[p]) {
+             markReachable(producer);
+         }
+     }
+ 
++    // [Phase 4 exit fix wave, C1] A pass that recorded a real callback
++    // (setExecute()/setExecuteChunked()) but got culled here is very likely
++    // a wiring bug, not intentional dead code: an author who deliberately
++    // wants a pass gone would delete the addPass() call, not leave a live
++    // callback attached to a pass nothing reads and that never called
++    // setSideEffect(). This is exactly the C1 class of defect (sample 09's
++    // "shadow" pass: writes "shadowmap", nothing declares
++    // addTextureInput("shadowmap"), no setSideEffect() -- silently culled,
++    // its callback never invoked, with compile() otherwise emitting no log
++    // at all) -- a pass with NO callback attached (a bare barrier-only
++    // declaration) is culled silently, same as always, since there is
++    // nothing "lost" for it. Warn, don't throw: a pass mid-refactor
++    // (callback wired, consumer not yet added) is a legitimate transient
++    // state this library has no way to distinguish from a permanent bug --
++    // loud-but-non-fatal matches this codebase's own posture for
++    // suspicious-but-not-necessarily-wrong conditions elsewhere.
++    for (uint32_t p = 0; p < passCount; ++p) {
++        if (reachable[p]) {
++            continue;
++        }
++        const Pass& pass = g.passes[p];
++        if (static_cast<bool>(pass.execute_) || pass.hasChunkedExecute()) {
++            RX_LOG_WARN(
++                "rx_graph: pass '{}' has a recorded execute callback but was culled (nothing reads any resource "
++                "it writes, and it never called setSideEffect()) -- its callback will NEVER run; if this is "
++                "intentional, remove the callback, otherwise add a reader (addTextureInput()/addStorageBufferInput() "
++                "on the resource it writes) or setSideEffect()",
++                pass.name_);
++        }
++    }
++
+     // ---- step 3b: stable topological order of survivors -----------------
+     // Kahn's algorithm: `ready` always holds every reachable pass whose
+     // producers have all already been emitted, and a std::set keeps it
+     // sorted by ascending raw pass index -- the brief's "preserve
+     // declaration order among independents" tie-break, with no additional
+     // reordering heuristic.
+     std::vector<uint32_t> indegree(passCount, 0);
+     std::vector<std::vector<uint32_t>> successors(passCount);
+     for (uint32_t p = 0; p < passCount; ++p) {
+         if (!reachable[p]) {
+diff --git a/src/rx_graph/tests/test_compile.cpp b/src/rx_graph/tests/test_compile.cpp
+index 9fd6ee5..6ca2baa 100644
+--- a/src/rx_graph/tests/test_compile.cpp
++++ b/src/rx_graph/tests/test_compile.cpp
+@@ -1,21 +1,25 @@
+ // Task 1 brief's exact test expectations (culling/ordering/lifetimes/
+ // usage-union/diamond/errors), plus a few extra cases exercising the rest
+ // of the Pass/RenderGraph/CompiledGraph surface (accessors, reset(),
+ // swapchain-relative size resolution, compute-vs-graphics storage buffer
+ // stage classification) that the six required cases don't otherwise touch.
+ #include <doctest/doctest.h>
++#include <rx_core/log.h>
++#include <rx_core/log_forward_sink.h>
+ #include <rx_graph/pass_signature.h>
+ #include <rx_graph/render_graph.h>
+ 
++#include <memory>
+ #include <stdexcept>
+ #include <string>
++#include <string_view>
+ 
+ using namespace rx::graph;
+ 
+ namespace {
+ 
+ // A representative 1080p swapchain -- no test below depends on the exact
+ // numbers beyond the swapchain-relative-resolution cases, which check the
+ // arithmetic against these fields directly.
+ constexpr CompileInfo kInfo{1920, 1080, VK_FORMAT_B8G8R8A8_UNORM};
+ 
+@@ -54,20 +58,123 @@ TEST_CASE("culling") {
+     CHECK_FALSE(compiled.isCulled(1));
+ 
+     const auto order = compiled.executionOrder();
+     REQUIRE(order.size() == 1);
+     CHECK(order[0] == 1);
+ 
+     CHECK(findResource(compiled, "x") == nullptr);
+     CHECK(findResource(compiled, "bb") != nullptr);
+ }
+ 
++// [Phase 4 exit fix wave, C1] compile() logs a WARN, naming the pass, when
++// a pass carrying a real setExecute()/setExecuteChunked() callback gets
++// culled -- this is exactly the class of defect the phase-exit review found
++// in sample 09 (a "shadow" pass writing "shadowmap" with no consumer and no
++// setSideEffect(): culled silently, its callback never invoked, and
++// compile() logged nothing at all). Uses the same process-wide
++// LogForwardSink rx_core/tests/log_test.cpp's own ForwardCallbackGuard
++// pattern captures records through -- rx_graph is PUBLIC-linked against
++// rx_core (CMakeLists.txt), so this header is reachable from here without
++// any new dependency.
++
++namespace {
++
++struct CulledWarnCapture {
++    int32_t severity = -1;
++    std::string message;
++    int callCount = 0;
++};
++
++CulledWarnCapture* g_culledWarnCapture = nullptr;
++
++void captureCulledWarn(int32_t severity, const char* /*category*/, const char* message, void* /*userData*/) {
++    if (g_culledWarnCapture == nullptr) {
++        return;
++    }
++    // Only the culled-pass warning this test cares about -- the same
++    // process-wide sink also forwards every other record any earlier/later
++    // TEST_CASE in this binary happens to log, so filter by content rather
++    // than assuming call ordinality.
++    if (message != nullptr && std::string_view(message).find("was culled") != std::string_view::npos) {
++        g_culledWarnCapture->severity = severity;
++        g_culledWarnCapture->message = message;
++        g_culledWarnCapture->callCount++;
++    }
++}
++
++// RAII guard mirroring log_test.cpp's ForwardCallbackGuard -- uninstalls on
++// scope exit regardless of how the TEST_CASE returns (including a failed
++// REQUIRE, which doctest unwinds via a C++ exception).
++struct CulledWarnGuard {
++    std::shared_ptr<rx::core::log::LogForwardSink> sink;
++    ~CulledWarnGuard() {
++        g_culledWarnCapture = nullptr;
++        (void)sink->set(nullptr, nullptr);
++    }
++};
++
++}  // namespace
++
++TEST_CASE("compile() warns, naming the pass, when a culled pass carries a real execute callback") {
++    RenderGraph graph;
++    // Same shape as sample 09's pre-fix bug: "shadow" writes "sm" but
++    // nothing reads it and it never calls setSideEffect() -- culled. "bb"
++    // is the only reachable pass.
++    bool shadowCallbackInvoked = false;
++    graph.addPass("shadow")
++        .setDepthStencilOutput("sm", depthDesc())
++        .setExecute([&shadowCallbackInvoked](PassContext&) { shadowCallbackInvoked = true; });
++    graph.addPass("present").addColorOutput("bb", colorDesc());
++    graph.setBackbufferSource("bb");
++
++    rx::core::log::init();
++    CulledWarnCapture capture;
++    g_culledWarnCapture = &capture;
++    auto sink = rx::core::log::forwardSink();
++    REQUIRE(sink->set(&captureCulledWarn, nullptr));
++    CulledWarnGuard guard{sink};
++
++    graph.compile(kInfo);
++
++    const CompiledGraph& compiled = graph.compiled();
++    CHECK(compiled.isCulled(0));
++    CHECK_FALSE(shadowCallbackInvoked);  // never invoked -- CompiledGraph::executionOrder() skips culled passes.
++
++    CHECK(capture.callCount == 1);
++    CHECK(capture.severity == 3);  // warn, per LogForwardSink's Trace..Error mapping.
++    CHECK(capture.message.find("shadow") != std::string::npos);
++}
++
++TEST_CASE("compile() does NOT warn once the previously-culled pass gains a real consumer") {
++    RenderGraph graph;
++    // Identical topology to the case above, except "present" now declares
++    // addTextureInput("sm") -- the C1 fix shape (a genuine graph-derived
++    // read, not a setSideEffect() band-aid): "shadow" is reachable, no
++    // culled-with-callback condition exists to warn about.
++    graph.addPass("shadow").setDepthStencilOutput("sm", depthDesc()).setExecute([](PassContext&) {});
++    graph.addPass("present").addTextureInput("sm").addColorOutput("bb", colorDesc());
++    graph.setBackbufferSource("bb");
++
++    rx::core::log::init();
++    CulledWarnCapture capture;
++    g_culledWarnCapture = &capture;
++    auto sink = rx::core::log::forwardSink();
++    REQUIRE(sink->set(&captureCulledWarn, nullptr));
++    CulledWarnGuard guard{sink};
++
++    graph.compile(kInfo);
++
++    const CompiledGraph& compiled = graph.compiled();
++    CHECK_FALSE(compiled.isCulled(0));
++    CHECK(capture.callCount == 0);
++}
++
+ TEST_CASE("ordering") {
+     RenderGraph graph;
+     // Declared out of pipeline order: tonemap (reads a resource its own
+     // producer hasn't been declared yet) first, then shadow, then forward.
+     graph.addPass("tonemap").addTextureInput("hdr").addColorOutput("bb", colorDesc());  // pass 0
+     graph.addPass("shadow").setDepthStencilOutput("sm", depthDesc());                   // pass 1
+     graph.addPass("forward").addTextureInput("sm").addColorOutput("hdr", colorDesc());  // pass 2
+ 
+     graph.setBackbufferSource("bb");
+     graph.compile(kInfo);
+diff --git a/src/rx_graph/tests/test_execute_gpu.cpp b/src/rx_graph/tests/test_execute_gpu.cpp
+index 4e41176..e663e14 100644
+--- a/src/rx_graph/tests/test_execute_gpu.cpp
++++ b/src/rx_graph/tests/test_execute_gpu.cpp
+@@ -20,40 +20,43 @@
+ //
+ // Case 2 ("resize-rerealize"): compiles the same kind of graph at 128x128,
+ // realize()s it, recompiles it at 256x256, realize()s it again, executes
+ // once -- proving Executor::realize() is safe to call again after a
+ // resource-shape change (TransientPool's acquire/release/reacquire cycle
+ // across two different-shaped realizes) with zero validation errors.
+ #include <doctest/doctest.h>
+ #include <rx_graph/executor.h>
+ #include <rx_graph/render_graph.h>
+ 
++#include <rx_core/debug_checks.h>
+ #include <rx_platform/window.h>
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/deletion_queue.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/pipeline_layout.h>
+ #include <rx_shader/compiler.h>
+ #include <rx_shader/reflection.h>
+ #include <rx_task/scheduler.h>
+ 
+ #include <array>
+ #include <atomic>
+ #include <cstdint>
+ #include <cstring>
+ #include <memory>
++#include <mutex>
+ #include <optional>
+ #include <stdexcept>
+ #include <string>
++#include <thread>
+ #include <utility>
+ #include <vector>
+ 
+ using namespace rx::graph;
+ 
+ namespace {
+ 
+ constexpr uint32_t kExtent = 256;
+ constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
+ 
+@@ -2363,10 +2366,158 @@ TEST_CASE("Executor::execute performs zero heap allocations in steady state -- e
+             CHECK(after.validChunkBuffersScratchData[slot] == before.validChunkBuffersScratchData[slot]);
+         }
+     }
+ 
+     vkDeviceWaitIdle(device);
+     destroyFillPipeline(device, *fillPipeline);
+     destroyOffscreenImage(device, *offscreen);
+ 
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
++
++// [Phase 4 exit fix wave, I2; Stage-0 audit F5-remainder, stage0-audit.md:
++// 136/390] Proves Executor::realize()/execute()'s new RX_ASSERT_MAIN_THREAD
++// guards are genuinely wired in, not merely documented -- mirrors
++// rx_asset/tests/thread_guard_test.cpp's own "a plain std::thread stands in
++// for a chunk >= 1 worker" pattern (legitimate here for the identical
++// reason that file documents: this tests the thread-identity comparison
++// the guard performs, not any real rx::task::Scheduler integration -- the
++// violating calls below are made directly, never through a chunked pass'
++// own worker fan-out). Each worker thread is joined before the next
++// guarded call starts, so there is never more than one thread touching
++// this Executor's state at a time -- the precondition
++// rx::core::debug::detail::ViolationHook's own contract comment requires
++// of a test-installed hook that records and returns rather than aborting.
++// Graph: a single pass with NO execute() callback at all -- Executor::
++// execute()'s own automatic backbuffer clear is enough to prove both
++// entry points ran to completion past the (non-aborting, test-hooked)
++// guard, with no shader/pipeline machinery needed.
++#ifdef RX_DEBUG_CHECKS
++
++namespace {
++
++struct ExecutorViolationCapture {
++    std::mutex mutex;
++    int callCount = 0;
++    std::string lastContext;
++};
++
++std::atomic<ExecutorViolationCapture*> g_executorCapture{nullptr};
++
++void captureExecutorViolation(const char* context) {
++    ExecutorViolationCapture* capture = g_executorCapture.load(std::memory_order_relaxed);
++    if (capture == nullptr) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(capture->mutex);
++    capture->callCount++;
++    capture->lastContext = context != nullptr ? context : "";
++}
++
++struct ExecutorViolationHookGuard {
++    ~ExecutorViolationHookGuard() {
++        g_executorCapture.store(nullptr, std::memory_order_relaxed);
++        rx::core::debug::detail::setViolationHookForTests(nullptr);
++    }
++};
++
++}  // namespace
++
++TEST_CASE("Executor::realize/execute trip RX_ASSERT_MAIN_THREAD when called from a worker thread") {
++    auto fixture = makeFixture("rx_graph_gpu_executor_guard");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    const VkDevice device = fixture->device.device();
++    const VkPhysicalDevice physicalDevice = fixture->device.physicalDevice();
++
++    RenderGraph graph;
++    graph.addPass("clear").addColorOutput("bb", absoluteColorDesc(kExtent, kExtent));
++    graph.setBackbufferSource("bb");
++
++    CompileInfo info;
++    info.swapchainWidth = kExtent;
++    info.swapchainHeight = kExtent;
++    info.swapchainFormat = kFormat;
++    info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    graph.compile(info);
++
++    auto offscreen = createOffscreenImage(device, physicalDevice, kFormat, VkExtent2D{kExtent, kExtent});
++    REQUIRE(offscreen.has_value());
++    auto cmdCtx =
++        rx::rhi::CommandContext::create(device, fixture->device.graphicsQueue(), fixture->device.graphicsQueueFamily());
++    REQUIRE(cmdCtx.has_value());
++
++    ExecutorViolationCapture capture;
++    g_executorCapture.store(&capture, std::memory_order_relaxed);
++    rx::core::debug::detail::setViolationHookForTests(&captureExecutorViolation);
++    ExecutorViolationHookGuard guard;
++
++    std::thread realizeThread([&] { fixture->executor->realize(graph); });
++    realizeThread.join();
++
++    std::thread executeThread([&] {
++        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++            fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
++        });
++    });
++    executeThread.join();
++
++    {
++        std::lock_guard<std::mutex> lock(capture.mutex);
++        CHECK(capture.callCount == 2);
++        CHECK(capture.lastContext == "Executor::execute");
++    }
++
++    vkDeviceWaitIdle(device);
++    destroyOffscreenImage(device, *offscreen);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("Executor::realize/execute do NOT trip the guard for calls genuinely on the main thread") {
++    auto fixture = makeFixture("rx_graph_gpu_executor_guard_legal");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    const VkDevice device = fixture->device.device();
++    const VkPhysicalDevice physicalDevice = fixture->device.physicalDevice();
++
++    RenderGraph graph;
++    graph.addPass("clear").addColorOutput("bb", absoluteColorDesc(kExtent, kExtent));
++    graph.setBackbufferSource("bb");
++
++    CompileInfo info;
++    info.swapchainWidth = kExtent;
++    info.swapchainHeight = kExtent;
++    info.swapchainFormat = kFormat;
++    info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    graph.compile(info);
++
++    auto offscreen = createOffscreenImage(device, physicalDevice, kFormat, VkExtent2D{kExtent, kExtent});
++    REQUIRE(offscreen.has_value());
++    auto cmdCtx =
++        rx::rhi::CommandContext::create(device, fixture->device.graphicsQueue(), fixture->device.graphicsQueueFamily());
++    REQUIRE(cmdCtx.has_value());
++
++    ExecutorViolationCapture capture;
++    g_executorCapture.store(&capture, std::memory_order_relaxed);
++    rx::core::debug::detail::setViolationHookForTests(&captureExecutorViolation);
++    ExecutorViolationHookGuard guard;
++
++    fixture->executor->realize(graph);
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
++    });
++
++    {
++        std::lock_guard<std::mutex> lock(capture.mutex);
++        CHECK(capture.callCount == 0);
++    }
++
++    vkDeviceWaitIdle(device);
++    destroyOffscreenImage(device, *offscreen);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++#endif  // RX_DEBUG_CHECKS
+diff --git a/src/rx_material/include/rx_material/material_system.h b/src/rx_material/include/rx_material/material_system.h
+index ae9237f..bddae6d 100644
+--- a/src/rx_material/include/rx_material/material_system.h
++++ b/src/rx_material/include/rx_material/material_system.h
+@@ -380,55 +380,63 @@ public:
+     // fails.
+     VkPipeline getPipeline(const PipelineRequest& req);
+ 
+     // `handle`'s VkPipelineLayout, reflection-driven from its own
+     // `ParameterBlock<TParams> gParams` (set 1) plus whatever set-0
+     // bindings it directly declares (if any -- see material_system.cpp;
+     // Phase 3's own test material never declares any, routing textures
+     // through `gParams`'s bindless-table indices instead per D8), built
+     // against the external bindless set-0 layout passed to create().
+     // Throws std::out_of_range for an invalid/unknown `handle`.
++    // Thread-affinity (D5): main-thread-only, [guarded] [Phase 4 exit fix
++    // wave, I3] -- see docs/threading.md.
+     [[nodiscard]] VkPipelineLayout pipelineLayout(MaterialHandle handle) const;
+ 
+     // `handle`'s reflected layout -- the same `rx::shader::ShaderLayoutInfo`
+     // pipelineLayout()'s VkPipelineLayout was built from, exposed for a
+     // caller that needs the raw set/binding/type shape itself (e.g. to
+     // allocate and populate the real set-1 VkDescriptorSet a
+     // ParameterBlock needs -- IMaterialInstance's job, not this task's).
+     // Throws std::out_of_range for an invalid/unknown `handle`.
+     //
+     // CAUTION: The returned reference is invalidated by a later loadMaterial()
+     // call on this same instance -- HandlePool's internal reallocation may
+     // move the underlying MaterialRecord. Store the actual values of interest
+     // (set/binding counts, type information, etc.) rather than caching a
+     // ShaderLayoutInfo pointer/reference across a loadMaterial() call.
++    // Thread-affinity (D5): main-thread-only, [guarded] [Phase 4 exit fix
++    // wave, I3] -- see docs/threading.md.
+     [[nodiscard]] const rx::shader::ShaderLayoutInfo& layoutInfo(MaterialHandle handle) const;
+ 
+     // `handle`'s reflected `TParams` fields -- name, kind, and BYTE
+     // OFFSET/SIZE within the parameter block (rx_material/instance.h's
+     // MaterialParamInfo) [Task 7 coordinator addition 2]: this is the
+     // authoritative reflection api_impl.cpp's IRxMaterialInstance setters
+     // now validate against directly (name lookup -> RX_E_NOTFOUND, kind
+     // mismatch -> RX_E_INVALIDARG) instead of Task 6's own second,
+     // throwaway Slang reflection session -- computed once, here, from the
+     // SAME already-linked `slang::IComponentType` (MaterialRecord::
+     // linkedProgram) that produced this material's real SPIR-V, not a
+     // separately-composed duplicate. Throws std::out_of_range for an
+     // invalid/unknown `handle`.
++    // Thread-affinity (D5): main-thread-only, [guarded] [Phase 4 exit fix
++    // wave, I3] -- see docs/threading.md.
+     [[nodiscard]] const std::vector<MaterialParamInfo>& materialParams(MaterialHandle handle) const;
+ 
+     // `handle`'s whole `TParams` struct size, in bytes (the Slang Uniform
+     // parameter category's own size for the ParameterBlock's element type)
+     // -- exactly how many bytes a caller's instance blob (rx_api.h's
+     // IRxMaterialInstance, or any other InstanceBinding producer) must
+     // supply to bindInstance() below. Throws std::out_of_range for an
+     // invalid/unknown `handle`.
++    // Thread-affinity (D5): main-thread-only, [guarded] [Phase 4 exit fix
++    // wave, I3] -- see docs/threading.md.
+     [[nodiscard]] uint32_t paramBlockSize(MaterialHandle handle) const;
+ 
+     // Frames-in-flight this MaterialSystem's own per-frame GPU-facing state
+     // (the parameter arena below) is sized for -- fixed at 2, mirroring
+     // rx::rhi::FrameSync::kFramesInFlight (frame_sync.h). Not literally the
+     // same constant (this header does not include frame_sync.h purely for
+     // one value) but documented here as required to match it: every real
+     // caller of beginFrame() below drives this MaterialSystem from the same
+     // frame-in-flight loop that already uses FrameSync.
+     static constexpr uint32_t kFramesInFlight = 2;
+diff --git a/src/rx_material/material_system.cpp b/src/rx_material/material_system.cpp
+index 8535861..9ae868e 100644
+--- a/src/rx_material/material_system.cpp
++++ b/src/rx_material/material_system.cpp
+@@ -1632,44 +1632,58 @@ uint64_t MaterialSystem::moduleHash(MaterialHandle handle) const {
+ 
+ MaterialFixedFunctionState MaterialSystem::fixedFunctionState(MaterialHandle handle) const {
+     MaterialRecord* record = impl_->materials.get(handle);
+     if (record == nullptr) {
+         throw std::out_of_range("rx_material: MaterialSystem::fixedFunctionState: invalid or stale MaterialHandle");
+     }
+     return record->fixedFunctionState;
+ }
+ 
+ VkPipelineLayout MaterialSystem::pipelineLayout(MaterialHandle handle) const {
++    // [Phase 4 exit fix wave, I3] `impl_->materials` is the SAME unguarded
++    // HandlePool loadMaterial()/reloadChanged() mutate (reloadChanged()
++    // destroys the old VkPipelineLayout immediately) -- reading it from a
++    // worker chunk is a sibling of the Task-24 GeometryPool::bind()
++    // violation, silent until now because this class's read accessors
++    // carried no guard. Matches docs/threading.md's whole-class
++    // main-thread-only posture for MaterialSystem.
++    RX_ASSERT_MAIN_THREAD("MaterialSystem::pipelineLayout");
+     MaterialRecord* record = impl_->materials.get(handle);
+     if (record == nullptr) {
+         throw std::out_of_range("rx_material: MaterialSystem::pipelineLayout: invalid or stale MaterialHandle");
+     }
+     return record->layoutBundle.layout;
+ }
+ 
+ const rx::shader::ShaderLayoutInfo& MaterialSystem::layoutInfo(MaterialHandle handle) const {
++    // [Phase 4 exit fix wave, I3] See pipelineLayout()'s comment above.
++    RX_ASSERT_MAIN_THREAD("MaterialSystem::layoutInfo");
+     MaterialRecord* record = impl_->materials.get(handle);
+     if (record == nullptr) {
+         throw std::out_of_range("rx_material: MaterialSystem::layoutInfo: invalid or stale MaterialHandle");
+     }
+     return record->layoutInfo;
+ }
+ 
+ const std::vector<MaterialParamInfo>& MaterialSystem::materialParams(MaterialHandle handle) const {
++    // [Phase 4 exit fix wave, I3] See pipelineLayout()'s comment above.
++    RX_ASSERT_MAIN_THREAD("MaterialSystem::materialParams");
+     MaterialRecord* record = impl_->materials.get(handle);
+     if (record == nullptr) {
+         throw std::out_of_range("rx_material: MaterialSystem::materialParams: invalid or stale MaterialHandle");
+     }
+     return record->params;
+ }
+ 
+ uint32_t MaterialSystem::paramBlockSize(MaterialHandle handle) const {
++    // [Phase 4 exit fix wave, I3] See pipelineLayout()'s comment above.
++    RX_ASSERT_MAIN_THREAD("MaterialSystem::paramBlockSize");
+     MaterialRecord* record = impl_->materials.get(handle);
+     if (record == nullptr) {
+         throw std::out_of_range("rx_material: MaterialSystem::paramBlockSize: invalid or stale MaterialHandle");
+     }
+     return record->paramBlockSize;
+ }
+ 
+ void MaterialSystem::beginFrame(uint32_t frameInFlightIndex, uint64_t frameNumber) {
+     Impl& impl = *impl_;
+     impl.paramArena->beginFrame(frameInFlightIndex);
+diff --git a/src/rx_material/tests/test_material_system.cpp b/src/rx_material/tests/test_material_system.cpp
+index 3f0ea5c..7bd4b43 100644
+--- a/src/rx_material/tests/test_material_system.cpp
++++ b/src/rx_material/tests/test_material_system.cpp
+@@ -1233,20 +1233,93 @@ TEST_CASE("MaterialSystem::bindInstance's RX_ASSERT_MAIN_THREAD guard fires, nam
+         // getPipeline() is called internally by bindInstance() and carries
+         // the identical guard -- both firing on this one violating call is
+         // expected, not a double-count bug.
+         CHECK(contextsContain(capture.contexts, "MaterialSystem::bindInstance"));
+         CHECK(contextsContain(capture.contexts, "MaterialSystem::getPipeline"));
+     }
+ 
+     destroyOffscreenColorImage(fixture->device.device(), *offscreen);
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
++
++// [Phase 4 exit fix wave, I3] pipelineLayout()/layoutInfo()/materialParams()/
++// paramBlockSize() -- MaterialSystem's other read accessors, previously
++// unguarded (the sibling of the Task-24 GeometryPool::bind() violation this
++// finding closes: samples/09_scene called pipelineLayout() from a worker
++// chunk, and no guard fired). Simpler than the bindInstance guard tests
++// above -- no chunked rx_graph/rx_task machinery needed, a plain
++// std::thread stands in for a chunk >= 1 worker, exactly like
++// rx_asset/tests/thread_guard_test.cpp's own GeometryPool precedent. Each
++// worker thread is joined before the next guarded call starts, so there is
++// never more than one thread touching this MaterialSystem's state at a
++// time -- reuses the SAME capture hook (captureBindInstanceViolation) and
++// RAII guard (BindInstanceGuardHookScope) declared above, in this same
++// RX_DEBUG_CHECKS-guarded region.
++TEST_CASE("MaterialSystem::pipelineLayout/layoutInfo/materialParams/paramBlockSize trip RX_ASSERT_MAIN_THREAD "
++          "when called from a worker thread") {
++    auto fixture = makeFixture("rx_material_read_accessor_guard");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto system = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
++                                                          freshCachePath("read_accessor_guard"));
++    REQUIRE(system != nullptr);
++    rx::material::MaterialHandle handle = system->loadMaterial(testDataPath("test_unlit.slang"));
++
++    BindInstanceGuardCapture capture;
++    g_bindInstanceCapture.store(&capture, std::memory_order_relaxed);
++    rx::core::debug::detail::setViolationHookForTests(&captureBindInstanceViolation);
++    BindInstanceGuardHookScope guard;
++
++    std::thread layoutThread([&] { (void)system->pipelineLayout(handle); });
++    layoutThread.join();
++    std::thread layoutInfoThread([&] { (void)system->layoutInfo(handle); });
++    layoutInfoThread.join();
++    std::thread paramsThread([&] { (void)system->materialParams(handle); });
++    paramsThread.join();
++    std::thread blockSizeThread([&] { (void)system->paramBlockSize(handle); });
++    blockSizeThread.join();
++
++    std::lock_guard<std::mutex> lock(capture.mutex);
++    CHECK(capture.contexts.size() == 4);
++    CHECK(contextsContain(capture.contexts, "MaterialSystem::pipelineLayout"));
++    CHECK(contextsContain(capture.contexts, "MaterialSystem::layoutInfo"));
++    CHECK(contextsContain(capture.contexts, "MaterialSystem::materialParams"));
++    CHECK(contextsContain(capture.contexts, "MaterialSystem::paramBlockSize"));
++}
++
++TEST_CASE("MaterialSystem::pipelineLayout/layoutInfo/materialParams/paramBlockSize do NOT trip the guard for a "
++          "call genuinely on the main thread") {
++    auto fixture = makeFixture("rx_material_read_accessor_guard_legal");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto system = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
++                                                          freshCachePath("read_accessor_guard_legal"));
++    REQUIRE(system != nullptr);
++    rx::material::MaterialHandle handle = system->loadMaterial(testDataPath("test_unlit.slang"));
++
++    BindInstanceGuardCapture capture;
++    g_bindInstanceCapture.store(&capture, std::memory_order_relaxed);
++    rx::core::debug::detail::setViolationHookForTests(&captureBindInstanceViolation);
++    BindInstanceGuardHookScope guard;
++
++    (void)system->pipelineLayout(handle);
++    (void)system->layoutInfo(handle);
++    (void)system->materialParams(handle);
++    (void)system->paramBlockSize(handle);
++
++    std::lock_guard<std::mutex> lock(capture.mutex);
++    CHECK(capture.contexts.empty());
++}
+ #endif  // RX_DEBUG_CHECKS
+ 
+ // --- createTexture2D()/textureBindlessIndex()/releaseTexture() -----------
+ // [Task 7 coordinator addition 4].
+ TEST_CASE("MaterialSystem::createTexture2D registers a real bindless-indexed texture; releaseTexture defers real "
+           "teardown until onFrameCompleted") {
+     auto fixture = makeFixture("rx_material_create_texture");
+     if (!fixture.has_value()) {
+         return;
+     }
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/frame_sync.h b/src/rx_rhi_vk/include/rx_rhi_vk/frame_sync.h
+index 62e22f9..1c8150a 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/frame_sync.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/frame_sync.h
+@@ -63,23 +63,26 @@ class Allocator;
+ // satisfies this by calling vkDeviceWaitIdle once at shutdown, before
+ // destroying FrameSync (and the per-swapchain-image views, and the
+ // pipeline) -- that is the only point in that loop's lifetime any of these
+ // objects may legally die. The same discipline applies to
+ // onSwapchainRecreated(): it destroys and rebuilds the per-image
+ // renderFinished semaphores, so it must only be called once the device has
+ // reached idle (the present loop's NeedsRecreate path already does this,
+ // via vkDeviceWaitIdle immediately before Device::recreateSwapchain()).
+ //
+ // Thread-affinity (D5, Phase 4): create()/advanceFrame()/onSwapchainRecreated()
+-// are main-thread-only -- this class owns the present loop's own
+-// per-frame-in-flight state, the same convention every existing caller
+-// (every sample's frame loop) already follows. advanceFrame()'s optional
++// are main-thread-only, [guarded] (RX_ASSERT_MAIN_THREAD -- [Phase 4 exit
++// fix wave, I2; Stage-0 audit F5-remainder, stage0-audit.md:136/390], closing
++// the "documented by comment only" gap that finding named) -- this class owns
++// the present loop's own per-frame-in-flight state, the same convention
++// every existing caller (every sample's frame loop) already follows.
++// advanceFrame()'s optional
+ // `allocatorForBudgetRefresh` argument [Phase 4 Task 10] calls into
+ // Allocator::setCurrentFrameIndex(), itself main-thread-only for the same
+ // reason -- see docs/threading.md. Every current*()/frameNumber() accessor
+ // is a read-only snapshot.
+ class FrameSync {
+ public:
+     // Fixed at 2: enough to let the CPU stay one frame ahead of the GPU
+     // without letting an unbounded number of frames queue up (which would
+     // trade latency for no meaningful additional throughput on typical
+     // present-mode-bound swapchains). Not a tunable today -- every per-
+diff --git a/src/rx_rhi_vk/src/frame_sync.cpp b/src/rx_rhi_vk/src/frame_sync.cpp
+index 2ffed7a..1353f0c 100644
+--- a/src/rx_rhi_vk/src/frame_sync.cpp
++++ b/src/rx_rhi_vk/src/frame_sync.cpp
+@@ -1,30 +1,44 @@
+ #include <rx_rhi_vk/frame_sync.h>
+ #include <rx_rhi_vk/buffer.h>
++#include <rx_core/debug_checks.h>
+ #include <rx_core/log.h>
+ #include <utility>
+ 
+ namespace rx::rhi {
+ 
+ void FrameSync::advanceFrame(Allocator* allocatorForBudgetRefresh) {
++    // [Phase 4 exit fix wave, I2; Stage-0 audit F5-remainder,
++    // stage0-audit.md:136/390] Mutates currentFrame_/frameNumber_ with no
++    // internal synchronization -- documented main-thread-only by this
++    // class's own header comment (frame_sync.h) but previously unenforced.
++    // Matches every other main-thread-only GPU-object-adjacent mutator's
++    // guard convention (docs/threading.md).
++    RX_ASSERT_MAIN_THREAD("FrameSync::advanceFrame");
+     currentFrame_ = (currentFrame_ + 1) % kFramesInFlight;
+     ++frameNumber_;
+     if (allocatorForBudgetRefresh != nullptr) {
+         // [Phase 4 Task 10, gate ruling #27] See this method's own header
+         // comment in frame_sync.h -- this is the wired, once-per-frame
+         // vmaSetCurrentFrameIndex() call the gate identified as missing
+         // everywhere in this repository before this task.
+         allocatorForBudgetRefresh->setCurrentFrameIndex(static_cast<uint32_t>(frameNumber_));
+     }
+ }
+ 
+ std::optional<FrameSync> FrameSync::create(VkDevice device, uint32_t queueFamily, uint32_t swapchainImageCount) {
++    // [Phase 4 exit fix wave, I2] Same guard as advanceFrame()/
++    // onSwapchainRecreated() below -- see this class's own header comment
++    // (frame_sync.h) for the full "create()/advanceFrame()/
++    // onSwapchainRecreated() are main-thread-only" contract this closes
++    // the enforcement gap for.
++    RX_ASSERT_MAIN_THREAD("FrameSync::create");
+     FrameSync sync;
+     sync.device_ = device;
+ 
+     for (uint32_t i = 0; i < kFramesInFlight; ++i) {
+         VkFenceCreateInfo fenceInfo{};
+         fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+         // Signaled at creation so the loop's first-ever wait on this slot
+         // (before anything has been submitted against it) returns
+         // immediately instead of blocking forever.
+         fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+@@ -92,20 +106,23 @@ bool FrameSync::createRenderFinishedSemaphores(uint32_t count) {
+ void FrameSync::destroyRenderFinishedSemaphores() {
+     for (VkSemaphore sem : renderFinished_) {
+         if (sem != VK_NULL_HANDLE) {
+             vkDestroySemaphore(device_, sem, nullptr);
+         }
+     }
+     renderFinished_.clear();
+ }
+ 
+ bool FrameSync::onSwapchainRecreated(uint32_t newImageCount) {
++    // [Phase 4 exit fix wave, I2] Same guard as create()/advanceFrame()
++    // above.
++    RX_ASSERT_MAIN_THREAD("FrameSync::onSwapchainRecreated");
+     // Caller contract: device must already be idle (see the class-level
+     // comment in frame_sync.h) -- destroying these semaphores here assumes
+     // nothing on the GPU is still signaling or waiting on any of them.
+     destroyRenderFinishedSemaphores();
+     return createRenderFinishedSemaphores(newImageCount);
+ }
+ 
+ FrameSync::FrameSync(FrameSync&& other) noexcept : FrameSync() {
+     *this = std::move(other);
+ }
+diff --git a/src/rx_rhi_vk/tests/frame_sync_test.cpp b/src/rx_rhi_vk/tests/frame_sync_test.cpp
+index 4339e4a..7caa5bd 100644
+--- a/src/rx_rhi_vk/tests/frame_sync_test.cpp
++++ b/src/rx_rhi_vk/tests/frame_sync_test.cpp
+@@ -1,17 +1,22 @@
+ #include <doctest/doctest.h>
++#include <rx_core/debug_checks.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/frame_sync.h>
+ #include <rx_platform/window.h>
++#include <atomic>
+ #include <cstdint>
++#include <mutex>
+ #include <optional>
++#include <string>
++#include <thread>
+ #include <utility>
+ 
+ namespace {
+ 
+ // Same skip-guarded windowed-device fixture pattern as device_test.cpp
+ // (kept local rather than shared -- these are separate translation units and
+ // device_test.cpp's fixture struct lives in its own anonymous namespace).
+ struct FrameSyncTestFixture {
+     rx::platform::Window window;
+     rx::rhi::Context context;
+@@ -204,10 +209,126 @@ TEST_CASE("FrameSync::frameNumber() advances monotonically with advanceFrame(),
+     // for: two different frameNumber() values (2 and 4, both reachable
+     // within kIterations above) land on the SAME currentFrameIndex() slot
+     // -- a DeletionQueue keyed on currentFrameIndex() alone could not
+     // tell those two frames apart; frameNumber() can.
+     CHECK(2 % rx::rhi::FrameSync::kFramesInFlight == 4 % rx::rhi::FrameSync::kFramesInFlight);
+     CHECK(2 != 4);
+ 
+     REQUIRE(vkDeviceWaitIdle(vkDevice) == VK_SUCCESS);
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
++
++// [Phase 4 exit fix wave, I2; Stage-0 audit F5-remainder, stage0-audit.md:
++// 136/390] Proves create()/advanceFrame()/onSwapchainRecreated()'s new
++// RX_ASSERT_MAIN_THREAD guards are genuinely wired in, not merely
++// documented -- mirrors rx_asset/tests/thread_guard_test.cpp's own "a
++// plain std::thread stands in for a chunk >= 1 worker" pattern (legitimate
++// here for the identical reason that file documents: FrameSync has no
++// rx::task::Scheduler-driven caller in this phase at all, so this tests
++// the thread-identity comparison the guard performs, not any real
++// scheduler integration). Every worker thread below is joined before the
++// next guarded call starts, so there is never more than one thread
++// touching this FrameSync's state at a time -- the precondition
++// rx::core::debug::detail::ViolationHook's own contract comment requires
++// of a test-installed hook that records and returns rather than aborting.
++#ifdef RX_DEBUG_CHECKS
++
++namespace {
++
++struct FrameSyncViolationCapture {
++    std::mutex mutex;
++    int callCount = 0;
++    std::string lastContext;
++};
++
++std::atomic<FrameSyncViolationCapture*> g_frameSyncCapture{nullptr};
++
++void captureFrameSyncViolation(const char* context) {
++    FrameSyncViolationCapture* capture = g_frameSyncCapture.load(std::memory_order_relaxed);
++    if (capture == nullptr) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(capture->mutex);
++    capture->callCount++;
++    capture->lastContext = context != nullptr ? context : "";
++}
++
++struct FrameSyncViolationHookGuard {
++    ~FrameSyncViolationHookGuard() {
++        g_frameSyncCapture.store(nullptr, std::memory_order_relaxed);
++        rx::core::debug::detail::setViolationHookForTests(nullptr);
++    }
++};
++
++}  // namespace
++
++TEST_CASE("FrameSync::create/advanceFrame/onSwapchainRecreated trip RX_ASSERT_MAIN_THREAD when called from a "
++          "worker thread") {
++    auto fixture = makeFixture("rx_rhi_vk_frame_sync_test_guard");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto device = rx::rhi::Device::create(fixture->context, fixture->surface);
++    REQUIRE(device.has_value());
++    const VkDevice vkDevice = device->device();
++    const uint32_t queueFamily = device->graphicsQueueFamily();
++    const uint32_t imageCount = static_cast<uint32_t>(device->swapchainImages().size());
++
++    FrameSyncViolationCapture capture;
++    g_frameSyncCapture.store(&capture, std::memory_order_relaxed);
++    rx::core::debug::detail::setViolationHookForTests(&captureFrameSyncViolation);
++    FrameSyncViolationHookGuard guard;
++
++    std::optional<rx::rhi::FrameSync> frameSync;
++    std::thread createThread([&] { frameSync = rx::rhi::FrameSync::create(vkDevice, queueFamily, imageCount); });
++    createThread.join();
++    REQUIRE(frameSync.has_value());  // the hook records-and-returns -- create() still ran to completion.
++
++    std::thread advanceThread([&] { frameSync->advanceFrame(); });
++    advanceThread.join();
++
++    std::thread recreateThread([&] { (void)frameSync->onSwapchainRecreated(imageCount); });
++    recreateThread.join();
++
++    {
++        std::lock_guard<std::mutex> lock(capture.mutex);
++        CHECK(capture.callCount == 3);
++        CHECK(capture.lastContext == "FrameSync::onSwapchainRecreated");
++    }
++
++    REQUIRE(vkDeviceWaitIdle(vkDevice) == VK_SUCCESS);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("FrameSync::create/advanceFrame/onSwapchainRecreated do NOT trip the guard for calls genuinely on the "
++          "main thread") {
++    auto fixture = makeFixture("rx_rhi_vk_frame_sync_test_guard_legal");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto device = rx::rhi::Device::create(fixture->context, fixture->surface);
++    REQUIRE(device.has_value());
++    const VkDevice vkDevice = device->device();
++
++    FrameSyncViolationCapture capture;
++    g_frameSyncCapture.store(&capture, std::memory_order_relaxed);
++    rx::core::debug::detail::setViolationHookForTests(&captureFrameSyncViolation);
++    FrameSyncViolationHookGuard guard;
++
++    auto frameSync = rx::rhi::FrameSync::create(vkDevice, device->graphicsQueueFamily(),
++                                                  static_cast<uint32_t>(device->swapchainImages().size()));
++    REQUIRE(frameSync.has_value());
++    frameSync->advanceFrame();
++    REQUIRE(frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())));
++
++    {
++        std::lock_guard<std::mutex> lock(capture.mutex);
++        CHECK(capture.callCount == 0);
++    }
++
++    REQUIRE(vkDeviceWaitIdle(vkDevice) == VK_SUCCESS);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++#endif  // RX_DEBUG_CHECKS
+diff --git a/src/rx_scene/draw_list.cpp b/src/rx_scene/draw_list.cpp
+index cf8e0dd..ed80524 100644
+--- a/src/rx_scene/draw_list.cpp
++++ b/src/rx_scene/draw_list.cpp
+@@ -726,39 +726,48 @@ struct DrawListBuilder::Impl {
+ 
+ DrawListBuilder::DrawListBuilder(MeshSubmeshesFn meshSubmeshes, MaterialResolveFn materialResolve)
+     : impl_(std::make_unique<Impl>()) {
+     impl_->meshSubmeshes = std::move(meshSubmeshes);
+     impl_->materialResolve = std::move(materialResolve);
+ }
+ 
+ DrawListBuilder::~DrawListBuilder() = default;
+ 
+ void DrawListBuilder::build(const Scene& scene, const Camera& camera, task::Scheduler& scheduler, ViewLists& out) {
++    // [Phase 4 exit fix wave, M1] Entry-point guard: documented main-thread-
++    // only (draw_list.h's own header comment) but previously enforced only
++    // transitively, via the first Scene accessor cullView() calls -- the
++    // `out.commands.clear()` etc. mutation just below happens BEFORE that,
++    // against this builder's own unsynchronized scratch, so a future code
++    // path that touches scratch before Scene would have no guard at all.
++    RX_ASSERT_MAIN_THREAD("rx::scene::DrawListBuilder::build");
+     RX_ZONE;
+     // [Zero-alloc, caller-owned storage -- D26] .clear() retains capacity;
+     // never reassigned/shrink_to_fit'd.
+     out.commands.clear();
+     out.payloads.clear();
+     out.blocks.clear();
+     out.opaqueCommandCount = 0;
+     out.counters = CullCounters{};
+ 
+     impl_->cullView(scene, camera, scheduler, impl_->visibleIndices, out.counters);
+     impl_->generateRecords(scene, camera, impl_->visibleIndices, impl_->pending);
+     out.counters.recordsIn = static_cast<uint32_t>(impl_->pending.size());
+ 
+     impl_->partitionAndSort();
+     impl_->emit(out);
+ }
+ 
+ void DrawListBuilder::buildShadow(const Scene& scene, LightHandle light, const Camera& camera, task::Scheduler& scheduler,
+                                    ShadowLists& out) {
++    // [Phase 4 exit fix wave, M1] See build()'s own comment above.
++    RX_ASSERT_MAIN_THREAD("rx::scene::DrawListBuilder::buildShadow");
+     RX_ZONE;
+     out.commands.clear();
+     out.payloads.clear();
+     out.blocks.clear();
+     out.opaqueCommandCount = 0;
+     out.counters = CullCounters{};
+ 
+     // A dead handle or a light with shadows disabled produces an empty,
+     // well-formed ShadowLists -- a per-frame QUERY, not a mutator, so this
+     // is documented as a defined no-op rather than a throw (draw_list.h's
+diff --git a/src/rx_scene/include/rx_scene/draw_list.h b/src/rx_scene/include/rx_scene/draw_list.h
+index e927af0..11f5bd0 100644
+--- a/src/rx_scene/include/rx_scene/draw_list.h
++++ b/src/rx_scene/include/rx_scene/draw_list.h
+@@ -441,45 +441,47 @@ public:
+     // Frustum-culls every alive `scene` renderable against `camera`
+     // (`Camera::cullingFrustumPlanes()` -- the FINITE culling projection,
+     // never the infinite-far render one, per matrix-issue05/06's shared
+     // Conflict #1 resolution), applies the camera `cullMask`/renderable
+     // `layers` AND-test, resolves visible renderables into draw records via
+     // this builder's injected `MeshSubmeshesFn`/`MaterialResolveFn`
+     // (D24-tolerant), sorts + instancing-collapses per D14/D26.3, and
+     // writes the result into `out` (caller-owned, reused storage -- see
+     // this header's own top comment).
+     //
+-    // Main-thread-only (D5): reads `scene`'s own main-thread-only
+-    // accessors before fanning any work out to `scheduler`'s workers; the
+-    // parallel AABB-vs-frustum pass itself touches only already-captured
+-    // plain spans, never `scene` again, from a worker thread.
++    // Main-thread-only (D5), [guarded] [Phase 4 exit fix wave, M1]: reads
++    // `scene`'s own main-thread-only accessors before fanning any work out
++    // to `scheduler`'s workers; the parallel AABB-vs-frustum pass itself
++    // touches only already-captured plain spans, never `scene` again, from
++    // a worker thread.
+     void build(const Scene& scene, const Camera& camera, task::Scheduler& scheduler, ViewLists& out);
+ 
+     // Shadow-caster culling for one directional light [D15]: an ortho box
+     // fitted to `camera`'s own visible-bounds cross-section, extruded
+     // conservatively so that the side UPSTREAM of the light (where a
+     // caster must sit to shadow something in the visible region) is
+     // unbounded, while the downstream side stays at the visible bounds' own
+     // tight extent (see draw_list.cpp's own worked-example derivation) so
+     // off-screen casters whose shadow could still reach the visible region
+     // are included. `light` must be a currently-alive `LightHandle` on `scene`;
+     // a dead/stale handle or a light with `castsShadows == false` produces
+     // an EMPTY `out` (cleared, zeroed counters), never a throw (this is a
+     // per-frame query, not a mutator with a "handle must be live"
+     // contract). BLEND-partition casters are EXCLUDED (RC3); MASK casters
+     // are included, rendered as full opaque silhouettes in Phase 4
+     // (documented limitation, RC3 -- no alpha-cutoff test in the depth-only
+     // pass this feeds). Channel coupling (RC5): a renderable whose
+     // `channels` do not overlap `light`'s own `channels` is excluded from
+     // caster consideration entirely, same AND-test as camera cullMask.
+     //
+-    // Main-thread-only (D5), same rationale as build().
++    // Main-thread-only (D5), [guarded] [Phase 4 exit fix wave, M1], same
++    // rationale as build().
+     void buildShadow(const Scene& scene, LightHandle light, const Camera& camera, task::Scheduler& scheduler,
+                       ShadowLists& out);
+ 
+ private:
+     friend detail::DrawListBuilderCapacitiesForTesting detail::capacitiesForTesting(const DrawListBuilder&);
+ 
+     struct Impl;
+     std::unique_ptr<Impl> impl_;
+ };
+ 
+diff --git a/src/rx_scene/tests/thread_guard_test.cpp b/src/rx_scene/tests/thread_guard_test.cpp
+index 6e008ea..32778ca 100644
+--- a/src/rx_scene/tests/thread_guard_test.cpp
++++ b/src/rx_scene/tests/thread_guard_test.cpp
+@@ -1,16 +1,20 @@
+ #include <doctest/doctest.h>
+ #include <rx_core/debug_checks.h>
++#include <rx_scene/draw_list.h>
+ #include <rx_scene/scene.h>
++#include <rx_task/scheduler.h>
+ 
+ #include <atomic>
++#include <memory>
+ #include <mutex>
++#include <span>
+ #include <string>
+ #include <thread>
+ 
+ // thread_guard_test.cpp -- proves Scene's RX_ASSERT_MAIN_THREAD guards
+ // (D5) actually ENFORCE the main-thread-only contract scene.h documents on
+ // every public method, not merely document it. Device-free, no GPU fixture
+ // needed (unlike rx_asset/tests/thread_guard_test.cpp's GeometryPool
+ // case): mirrors rx_core/tests/debug_checks_test.cpp's own "a plain
+ // std::thread stands in for a chunk >= 1 worker" pattern, legitimate here
+ // for the identical reason that file documents -- this tests the
+@@ -24,38 +28,58 @@
+ #ifdef RX_DEBUG_CHECKS
+ 
+ namespace {
+ 
+ rx::asset::AABB fallbackShapedBounds(rx::asset::MeshHandle) { return rx::asset::AABB{}; }
+ 
+ struct ViolationCapture {
+     std::mutex mutex;
+     int callCount = 0;
+     std::string lastContext;
++    // [Phase 4 exit fix wave, M1] Every context string seen, in order --
++    // NOT just the last one. DrawListBuilder::build()/buildShadow()'s own
++    // guard fires FIRST, but the hook records-and-returns rather than
++    // aborting, so execution then continues into every downstream guarded
++    // Scene/DrawListBuilder accessor build()/buildShadow() themselves call
++    // (aliveSpan()/worldBoundsSpan()/etc.) -- all firing too, since the
++    // whole call is still running on the same wrong thread throughout. The
++    // build()/buildShadow() guard tests below check CONTAINMENT in this
++    // list, not an exact total count, for exactly that reason.
++    std::vector<std::string> contexts;
+ };
+ 
+ std::atomic<ViolationCapture*> g_activeCapture{nullptr};
+ 
+ void captureViolationHook(const char* context) {
+     ViolationCapture* capture = g_activeCapture.load(std::memory_order_relaxed);
+     if (capture == nullptr) {
+         return;
+     }
+     std::lock_guard<std::mutex> lock(capture->mutex);
+     capture->callCount++;
+     capture->lastContext = context != nullptr ? context : "";
++    capture->contexts.emplace_back(capture->lastContext);
+     // Returns normally rather than throwing/aborting -- safe here
+     // specifically because every worker thread below is join()'d before
+     // the next guarded call starts (mirrors debug_checks_test.cpp's own
+     // identical precondition note).
+ }
+ 
++bool contextsContain(const std::vector<std::string>& contexts, const std::string& needle) {
++    for (const std::string& context : contexts) {
++        if (context == needle) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ struct ViolationHookGuard {
+     ~ViolationHookGuard() {
+         g_activeCapture.store(nullptr, std::memory_order_relaxed);
+         rx::core::debug::detail::setViolationHookForTests(nullptr);
+     }
+ };
+ 
+ }  // namespace
+ 
+ TEST_CASE("Scene::setTransform/transformsSpan trip RX_ASSERT_MAIN_THREAD when called from a worker thread") {
+@@ -86,11 +110,78 @@ TEST_CASE("Scene::setTransform/transformsSpan do NOT trip the guard for a call g
+     rx::core::debug::detail::setViolationHookForTests(&captureViolationHook);
+     ViolationHookGuard guard;
+ 
+     scene.setTransform(handle, glm::mat4(1.0F));
+     static_cast<void>(scene.transformsSpan());
+ 
+     std::lock_guard<std::mutex> lock(capture.mutex);
+     CHECK(capture.callCount == 0);
+ }
+ 
++// [Phase 4 exit fix wave, M1] DrawListBuilder::build()/buildShadow() carried
++// no entry-point guard of their own -- coverage was transitive only (the
++// first Scene accessor either calls fires Scene's own guard), which
++// disappears for any future code path that touches this builder's private
++// scratch before Scene. An empty Scene/default Camera/invalid LightHandle
++// is enough here: buildShadow() documents a dead/stale LightHandle as a
++// defined empty-result query, never a throw, and the guard fires as the
++// very first statement of both methods regardless of scene content.
++namespace {
++rx::asset::AABB fallbackShapedBoundsForDrawList(rx::asset::MeshHandle) { return rx::asset::AABB{}; }
++std::span<const rx::asset::Submesh> emptySubmeshes(rx::asset::MeshHandle) { return {}; }
++rx::scene::ResolvedMaterial fallbackMaterial(rx::asset::MaterialHandle) { return rx::scene::ResolvedMaterial{}; }
++}  // namespace
++
++TEST_CASE("DrawListBuilder::build/buildShadow trip RX_ASSERT_MAIN_THREAD when called from a worker thread") {
++    rx::scene::Scene scene(&fallbackShapedBoundsForDrawList);
++    rx::scene::Camera camera;
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++    rx::scene::DrawListBuilder builder(&emptySubmeshes, &fallbackMaterial);
++    rx::scene::ViewLists viewLists;
++    rx::scene::ShadowLists shadowLists;
++
++    ViolationCapture capture;
++    g_activeCapture.store(&capture, std::memory_order_relaxed);
++    rx::core::debug::detail::setViolationHookForTests(&captureViolationHook);
++    ViolationHookGuard guard;
++
++    std::thread buildThread([&] { builder.build(scene, camera, *scheduler, viewLists); });
++    buildThread.join();
++    std::thread buildShadowThread(
++        [&] { builder.buildShadow(scene, rx::scene::LightHandle{}, camera, *scheduler, shadowLists); });
++    buildShadowThread.join();
++
++    // Containment, not an exact total -- each guarded call's own guard
++    // fires FIRST (proving THIS fix wave's new entry-point guards are real),
++    // then execution continues (the hook records-and-returns) into every
++    // downstream guarded Scene/DrawListBuilder accessor build()/
++    // buildShadow() call internally -- see ViolationCapture::contexts' own
++    // comment for why the cascade is expected, not a bug in this test.
++    std::lock_guard<std::mutex> lock(capture.mutex);
++    CHECK(capture.callCount >= 2);
++    CHECK(contextsContain(capture.contexts, "rx::scene::DrawListBuilder::build"));
++    CHECK(contextsContain(capture.contexts, "rx::scene::DrawListBuilder::buildShadow"));
++}
++
++TEST_CASE("DrawListBuilder::build/buildShadow do NOT trip the guard for calls genuinely on the main thread") {
++    rx::scene::Scene scene(&fallbackShapedBoundsForDrawList);
++    rx::scene::Camera camera;
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++    rx::scene::DrawListBuilder builder(&emptySubmeshes, &fallbackMaterial);
++    rx::scene::ViewLists viewLists;
++    rx::scene::ShadowLists shadowLists;
++
++    ViolationCapture capture;
++    g_activeCapture.store(&capture, std::memory_order_relaxed);
++    rx::core::debug::detail::setViolationHookForTests(&captureViolationHook);
++    ViolationHookGuard guard;
++
++    builder.build(scene, camera, *scheduler, viewLists);
++    builder.buildShadow(scene, rx::scene::LightHandle{}, camera, *scheduler, shadowLists);
++
++    std::lock_guard<std::mutex> lock(capture.mutex);
++    CHECK(capture.callCount == 0);
++}
++
+ #endif  // RX_DEBUG_CHECKS
