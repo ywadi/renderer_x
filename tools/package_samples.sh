@@ -94,7 +94,18 @@
 #                     asset 08 already stages, staged again here since each
 #                     sample's own packaged subdirectory is self-contained
 #                     (no cross-sample sharing in the redistribution
-#                     layout).
+#                     layout). [TEMPORARY, pre-go-live only, owner
+#                     directive -- see the "package sponza with the sample"
+#                     staging block below] ALSO ships a pre-staged copy of
+#                     the fetched Sponza glTF asset under
+#                     assets/Sponza/glTF/ (resolveSponzaScenePath()'s own
+#                     packaged-first lookup) plus assets/Sponza/
+#                     PROVENANCE.txt -- unlike DamagedHelmet above, this is
+#                     NOT a permanent packaging decision and carries no
+#                     vendored legal text of its own (CRYENGINE-licensed
+#                     test content, not Creative Commons -- see the repo's
+#                     own test-asset ruling in tools/fetch_assets.sh's
+#                     header comment).
 #
 # This script does NOT build anything -- it assumes `cmake --build
 # --preset <preset>` already ran and each sample's build-output directory
@@ -373,6 +384,68 @@ RX_DAMAGED_HELMET_LICENSE
 copy_required "$STAGE_DIR/09_scene/assets/DamagedHelmet" \
   "$REPO_ROOT/samples/09_scene/licenses/CC-BY-4.0.txt" \
   "$REPO_ROOT/samples/09_scene/licenses/CC-BY-NC-4.0.txt"
+
+# ===========================================================================
+# TEMPORARY, pre-go-live-only staging block -- owner directive: "package
+# sponza with the sample for now and we will remove it later". Unlike
+# DamagedHelmet's own staging above (a permanent packaging decision, spec
+# Fixed decision #11), bundling Sponza here is explicitly NOT meant to
+# outlive this stopgap -- it exists so a redistributed sample_09_scene can
+# run the exact command this project's own crash reports/verification runs
+# use (`--present --scene assets/Sponza/glTF/Sponza.gltf`) without a
+# separate multi-hundred-MB fetch step, until a real long-term distribution
+# story for this asset is decided. Remove this whole block (and its header-
+# comment counterpart above) once that happens.
+#
+# Requires `tools/fetch_assets.sh --sponza` to have already populated
+# assets/fetched/Sponza/glTF/ on the PACKAGING HOST -- this script still
+# does not fetch anything itself (this file's own header comment) -- fails
+# loudly with the exact instruction if absent, matching copy_required's own
+# convention for every other required-but-missing input above.
+SPONZA_SRC="$REPO_ROOT/assets/fetched/Sponza/glTF"
+if [[ ! -d "$SPONZA_SRC" ]]; then
+  echo "package_samples: '$SPONZA_SRC' does not exist -- run tools/fetch_assets.sh --sponza first" >&2
+  exit 1
+fi
+mkdir -p "$STAGE_DIR/09_scene/assets/Sponza/glTF"
+# Whole-directory copy, NOT an enumerated file list like DamagedHelmet's own
+# 7-file staging above -- Sponza's own glTF directory carries 71 files (one
+# .gltf + one .bin + ~64 textures; see tools/fetch_assets.sh's own Sponza
+# comment), impractical -- and brittle against a future re-fetch under a
+# different SPONZA_VERSION with renamed textures -- to hardcode one by one.
+# `copy_required`'s per-file existence check is redundant here: the
+# directory-existence check above already covers "nothing fetched" and
+# `cp -a` itself fails loudly (non-zero exit, under `set -e`) on any other
+# read error.
+cp -a "$SPONZA_SRC"/. "$STAGE_DIR/09_scene/assets/Sponza/glTF/"
+
+# Provenance note per the repo's test-asset ruling [tools/fetch_assets.sh's
+# own header comment: Sponza is CRYENGINE Limited License Agreement content,
+# NOT Creative Commons] -- a one-line note travels with the bundled asset;
+# no further ceremony (no vendored legal text, unlike DamagedHelmet's own
+# dual-CC-license attribution above -- this is deliberately lighter-weight,
+# matching the temporary nature of this whole block).
+cat >"$STAGE_DIR/09_scene/assets/Sponza/PROVENANCE.txt" <<'RX_SPONZA_PROVENANCE'
+Sponza -- source: KhronosGroup/glTF-Sample-Assets (Models/Sponza/glTF)
+License: CRYENGINE Limited License Agreement (https://www.cryengine.com/ce-terms)
+RX_SPONZA_PROVENANCE
+
+# Upstream LICENSE/README file, IF tools/fetch_assets.sh's own fetch ever
+# picks one up next to the model (it does not today: fetch_sponza_helper.py
+# mirrors the GitHub Contents API listing for Models/Sponza/glTF/ only,
+# which upstream does not itself contain a LICENSE/README file -- those
+# live one directory up, at Models/Sponza/, which this project's fetch
+# script does not currently pull) -- copied alongside PROVENANCE.txt above
+# rather than silently never bundled if that ever changes. Globs that match
+# nothing expand to their own literal (non-existent) pattern text under this
+# script's default (non-nullglob) shell options, so the `-f` check below
+# safely no-ops in that case rather than needing `shopt -s nullglob`.
+for RX_SPONZA_LICENSE_CANDIDATE in "$REPO_ROOT/assets/fetched/Sponza"/LICENSE* "$REPO_ROOT/assets/fetched/Sponza"/README*; do
+  if [[ -f "$RX_SPONZA_LICENSE_CANDIDATE" ]]; then
+    cp -a "$RX_SPONZA_LICENSE_CANDIDATE" "$STAGE_DIR/09_scene/assets/Sponza/"
+  fi
+done
+# ===========================================================================
 
 mkdir -p "$(dirname "$RX_OUT_ZIP")"
 RX_OUT_ZIP_ABS="$(cd "$(dirname "$RX_OUT_ZIP")" && pwd)/$(basename "$RX_OUT_ZIP")"
