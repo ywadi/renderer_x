@@ -82,6 +82,7 @@
 #include <rx_rhi_vk/command.h>
 #include <rx_rhi_vk/context.h>
 #include <rx_rhi_vk/deletion_queue.h>
+#include <rx_rhi_vk/descriptor_arena.h>
 #include <rx_rhi_vk/device.h>
 #include <rx_rhi_vk/frame_sync.h>
 #include <rx_rhi_vk/pipeline_layout.h>
@@ -727,10 +728,33 @@ struct App {
     // layout-COMPATIBILITY rule (14.2.2) -- a VkDescriptorSet allocated from
     // THIS layout is valid to bind at set 1 against a VkPipelineLayout
     // MaterialSystem itself built, with no cross-library accessor needed for
-    // MaterialSystem's own (private) layout object. ONE shared pool sized
-    // for this scene's material count (kMaxMaterialParamSets below).
+    // MaterialSystem's own (private) layout object.
+    //
+    // [In-round closure, same-class defect as samples/09_scene's own P0 fix
+    // -- see that sample's identical App::materialParamArena comment for the
+    // full account] The SET LAYOUT is scene-independent (built once, in
+    // makeApp()) but the POOL is NOT: this sample's own `--scene <path>`
+    // accepts ANY glTF asset, so how many set-1 VkDescriptorSets a run ever
+    // needs is scene-dependent and unknowable until `importGltfAsync()`'s
+    // completion callback reports the real material count. A fixed pool
+    // built before that (the pre-fix `kMaxMaterialParamSets = 64` constant,
+    // picked only because "every glTF asset this sample ships/documents has
+    // far fewer materials than that") is sized for the wrong scene the
+    // moment a caller passes a bigger one -- exactly the landmine that
+    // crashed samples/09_scene against Sponza's 25 materials (8-set pool)
+    // one asset away from tripping here too. `rx::rhi::DescriptorArena` is
+    // this engine's own existing, already-tested "size it, and refuse
+    // over-budget allocations before ever calling the driver" abstraction
+    // (src/rx_rhi_vk/tests/descriptor_arena_test.cpp) -- reused here at
+    // framesInFlight=1 (this pool is allocated ONCE per run and never
+    // reset; set-1 material params are static for a material's lifetime,
+    // unlike rx_material's own per-instance, per-frame ParamArena) instead
+    // of a second, hand-rolled, unaccounted VkDescriptorPool. Built by
+    // createMaterialParamArena() below, from the REAL material count
+    // `result.materials.size()` reports, once that count is known -- never
+    // before the async import's own completion callback has it.
     VkDescriptorSetLayout materialParamSetLayout = VK_NULL_HANDLE;
-    VkDescriptorPool materialParamPool = VK_NULL_HANDLE;
+    std::optional<rx::rhi::DescriptorArena> materialParamArena;
 
     std::vector<MaterialGpuBinding> materialBindings;
     std::unordered_map<uint32_t, size_t> materialHandleToBinding;  // rx::asset::MaterialHandle::index() -> materialBindings[].
@@ -944,12 +968,14 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
         return nullptr;
     }
 
-    // Material set-1 param descriptor infrastructure -- see App::
-    // materialParamSetLayout's own comment. Sized generously (kMaxMaterialParamSets
-    // sets -- every glTF asset this sample ships/documents has far fewer
-    // materials than that; a larger asset simply needs this bumped, logged
-    // loudly if ever exceeded via vkAllocateDescriptorSets' own
-    // VK_ERROR_OUT_OF_POOL_MEMORY).
+    // Material set-1 param descriptor SET LAYOUT -- see App::
+    // materialParamSetLayout's own comment. Scene-independent (every scene
+    // uses the same one-UBO-binding shape), so this is still built here,
+    // unconditionally. The POOL itself is NOT built here anymore -- see
+    // App::materialParamArena's own comment for why: it needs the real
+    // per-scene material count, which isn't known until the import's own
+    // completion callback reports it. createMaterialParamArena() below
+    // builds it once that count is known.
     VkDescriptorSetLayoutBinding uboBinding{};
     uboBinding.binding = 0;
     uboBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -964,20 +990,34 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
         RX_LOG_ERROR("sample_08_gltf_viewer: vkCreateDescriptorSetLayout (material params) failed");
         return nullptr;
     }
-    constexpr uint32_t kMaxMaterialParamSets = 64;
-    std::array<VkDescriptorPoolSize, 1> poolSizes{
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxMaterialParamSets}};
-    VkDescriptorPoolCreateInfo poolInfo{};
-    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.maxSets = kMaxMaterialParamSets;
-    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
-    poolInfo.pPoolSizes = poolSizes.data();
-    if (vkCreateDescriptorPool(app->device->device(), &poolInfo, nullptr, &app->materialParamPool) != VK_SUCCESS) {
-        RX_LOG_ERROR("sample_08_gltf_viewer: vkCreateDescriptorPool (material params) failed");
-        return nullptr;
-    }
 
     return app;
+}
+
+// Builds App::materialParamArena, sized EXACTLY from `materialCount` -- the
+// real number of set-1 VkDescriptorSets this run will ever allocate
+// (result.materials.size() from whichever scene --scene resolved to), never
+// a fixed magic number picked for one asset and silently reused for every
+// other one [the exact bug this replaces -- see App::materialParamArena's
+// own comment; identical fix already applied to samples/09_scene's own
+// equivalent pool]. Must be called exactly once, after importGltfAsync()'s
+// completion callback has the scene's real material count, and before the
+// first setupMaterials() call. `materialCount == 0` is clamped to 1 --
+// rx::rhi::DescriptorArena::create() rejects a zero capacity outright, and
+// an empty-material scene still needs a valid (if never-used) arena for
+// destroyApp()'s own unconditional teardown path.
+bool createMaterialParamArena(App& app, uint32_t materialCount) {
+    const uint32_t sets = std::max<uint32_t>(materialCount, 1);
+    const rx::rhi::DescriptorArena::Capacities capacities{/*maxSets=*/sets, /*uniformBuffers=*/sets};
+    auto arena = rx::rhi::DescriptorArena::create(app.device->device(), /*framesInFlight=*/1, capacities);
+    if (!arena.has_value()) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: DescriptorArena::create (material params) failed for {} material(s)",
+                     materialCount);
+        return false;
+    }
+    app.materialParamArena = std::move(*arena);
+    RX_LOG_INFO("sample_08_gltf_viewer: material-params descriptor arena sized for {} material(s)", sets);
+    return true;
 }
 
 // Tears down EVERYTHING except `app.context`/`app.window`/`app.surface` --
@@ -997,12 +1037,15 @@ void destroyApp(App& app) {
         vkDeviceWaitIdle(app.device->device());
     }
     for (MaterialGpuBinding& binding : app.materialBindings) {
-        binding.paramBuffer.reset();  // paramSet itself is freed implicitly by vkDestroyDescriptorPool below.
+        binding.paramBuffer.reset();  // paramSet itself is freed implicitly by the arena's own pool teardown below.
     }
-    if (app.materialParamPool != VK_NULL_HANDLE) {
-        vkDestroyDescriptorPool(app.device->device(), app.materialParamPool, nullptr);
-        app.materialParamPool = VK_NULL_HANDLE;
-    }
+    // rx::rhi::DescriptorArena's own destructor (via std::optional::reset())
+    // destroys its underlying VkDescriptorPool(s) -- exactly what the
+    // explicit vkDestroyDescriptorPool() call this replaces did. A run that
+    // never called createMaterialParamArena() (e.g. an early setupApp()
+    // failure before any import ever completed) leaves this optional empty
+    // -- reset() on an empty optional is a documented no-op.
+    app.materialParamArena.reset();
     if (app.materialParamSetLayout != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(app.device->device(), app.materialParamSetLayout, nullptr);
         app.materialParamSetLayout = VK_NULL_HANDLE;
@@ -1193,14 +1236,22 @@ bool setupMaterials(App& app, const rx::asset::Registry& registry,
         std::memcpy(paramBuffer->mappedData(), binding.paramBlob.data(), blockSize);
         paramBuffer->flush();
 
-        VkDescriptorSetAllocateInfo allocInfo{};
-        allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        allocInfo.descriptorPool = app.materialParamPool;
-        allocInfo.descriptorSetCount = 1;
-        allocInfo.pSetLayouts = &app.materialParamSetLayout;
-        VkDescriptorSet paramSet = VK_NULL_HANDLE;
-        if (vkAllocateDescriptorSets(app.device->device(), &allocInfo, &paramSet) != VK_SUCCESS) {
-            RX_LOG_ERROR("sample_08_gltf_viewer: vkAllocateDescriptorSets (material params) failed for material '{}'",
+        // [In-round closure, same-class defect as samples/09_scene's own P0
+        // fix] Allocated through App::materialParamArena, NOT a raw
+        // vkAllocateDescriptorSets against a hand-sized VkDescriptorPool --
+        // the arena tracks this pool's own declared capacity and refuses
+        // (clean VK_NULL_HANDLE, logged) BEFORE ever calling the driver if
+        // this allocation would exceed it, deterministically on every
+        // driver including lavapipe. createMaterialParamArena() sizes the
+        // arena from the real per-scene material count, so a legitimate
+        // call here should never be refused -- if it is, that sizing call
+        // was skipped/wrong for this scene, a caller bug this refusal
+        // surfaces immediately (clean logged failure) instead of crashing
+        // past it on a real, limit-enforcing driver.
+        VkDescriptorSet paramSet = app.materialParamArena->allocate(app.materialParamSetLayout, /*uniformBufferDescriptorCount=*/1);
+        if (paramSet == VK_NULL_HANDLE) {
+            RX_LOG_ERROR("sample_08_gltf_viewer: material-params descriptor arena allocation failed for material "
+                         "'{}' (pool exhausted or driver rejection -- see DescriptorArena's own preceding log line)",
                          asset.name);
             return false;
         }
@@ -1882,6 +1933,16 @@ int runHeadless(const Args& args) {
                              rx::asset::importErrorName(result.error));
                 return;
             }
+            // [In-round closure] Sized from THIS scene's real material
+            // count -- not a fixed magic number that crashes past 64
+            // materials on a real driver. See App::materialParamArena's own
+            // comment. Runs on the main thread (importGltfAsync()'s own
+            // D5 completion-callback contract), so building a VkDescriptor
+            // pool here is safe.
+            if (!createMaterialParamArena(*app, static_cast<uint32_t>(result.materials.size()))) {
+                importOk = false;
+                return;
+            }
             if (!setupMaterials(*app, *app->registry, result.materials) ||
                 !buildDrawList(*app, *app->registry, result.scene)) {
                 importOk = false;
@@ -2182,6 +2243,13 @@ int runPresent(const Args& args) {
             if (!result.ok()) {
                 RX_LOG_ERROR("sample_08_gltf_viewer: import of '{}' failed: {}", scenePath.string(),
                              rx::asset::importErrorName(result.error));
+                return;
+            }
+            // [In-round closure] Sized from THIS scene's real material
+            // count -- see App::materialParamArena's own comment and the
+            // headless runner's identical call above.
+            if (!createMaterialParamArena(*app, static_cast<uint32_t>(result.materials.size()))) {
+                RX_LOG_ERROR("sample_08_gltf_viewer: post-import scene setup failed for '{}'", scenePath.string());
                 return;
             }
             if (!setupMaterials(*app, *app->registry, result.materials) ||
