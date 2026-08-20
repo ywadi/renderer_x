@@ -1,0 +1,671 @@
+# Review package: ab4f1a7..0bf1f79
+
+## Commits
+0bf1f79 docs(sdd): issue #35 helmet-orientation root cause report and evidence
+86c68cc fix(samples/09_scene): compose DamagedHelmet's node rotation into grid instances
+
+## Files changed
+ .../helmet-orientation-report.md                   | 252 +++++++++++++++++++++
+ .../issue35-grid-scene-after-lavapipe.png          | Bin 0 -> 11260 bytes
+ .../issue35-grid-scene-before-lavapipe.png         | Bin 0 -> 9852 bytes
+ .../issue35-nvidia-present-grid-512.png            | Bin 0 -> 125092 bytes
+ samples/09_scene/grid_layout.h                     |  61 +++++
+ samples/09_scene/main.cpp                          |  42 +++-
+ samples/09_scene/references/grid_scene.png         | Bin 9852 -> 11260 bytes
+ samples/09_scene/tests/CMakeLists.txt              |   8 +
+ samples/09_scene/tests/test_grid_layout.cpp        | 120 ++++++++++
+ 9 files changed, 474 insertions(+), 9 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/helmet-orientation-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/helmet-orientation-report.md
+new file mode 100644
+index 0000000..6babbb6
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/helmet-orientation-report.md
+@@ -0,0 +1,252 @@
++# Issue #35: sample 09 grid mode drops DamagedHelmet's node rotation
++
++Repo `main` at `ab4f1a7` at task start. Real path (`cd -P`) used throughout.
++
++## Root cause
++
++DamagedHelmet.gltf's single root node (`assets/fetched/DamagedHelmet/glTF/DamagedHelmet.gltf`,
++`nodes[0]`) carries a rotation, verbatim:
++
++```json
++{"mesh": 0, "name": "node_damagedHelmet_-6514",
++ "rotation": [0.7071068286895752, 0.0, -0.0, 0.7071068286895752]}
++```
++
++glTF quaternion order is `[x, y, z, w]`. `angle = 2*acos(w) = 2*acos(0.70710683) = 90°`;
++axis `= (x,y,z)/sin(45°) = (1,0,0)` — a **+90° rotation about world X**. This is what stands
++the mesh upright; without it the helmet renders lying on its back, visor toward the sky —
++exactly the reported "looking up" symptom.
++
++`src/rx_asset/import_gltf.cpp` composes this into `InstanceRecord::worldTransform`
++(`src/rx_asset/include/rx_asset/mesh_asset.h:206`) for every node the importer flattens.
++Two consumers apply it correctly:
++
++- `populateImportedInstances()` (`samples/09_scene/main.cpp:1546`, the `--scene sponza`/
++  `--scene workshop` present-mode path): `desc.transform = instance.worldTransform;` — uses it
++  directly.
++- Sample 08 (`samples/08_gltf_viewer/main.cpp:1306-1318`): also reads
++  `instance.worldTransform` directly for every renderable.
++
++The grid path did not go through either of those. `runHeadless()`/`runPresent()`'s default
++(no `--scene`, no `--stress`) branch calls `app->registry->importGltf(...)` directly, keeps
++only `result.meshes[0]` (the geometry handle), and **discards `result.scene` entirely** — the
++field that carries `InstanceRecord::worldTransform`. `populateHelmetGrid()`
++(`samples/09_scene/main.cpp`, pre-fix) then hand-built each instance's transform as:
++
++```cpp
++glm::mat4 gridTransform(uint32_t row, uint32_t col, float spacing) {
++    const float x = (static_cast<float>(col) - 0.5F * static_cast<float>(kGridCols - 1)) * spacing;
++    const float z = -(static_cast<float>(row) * spacing);
++    return glm::translate(glm::mat4(1.0F), glm::vec3(x, 0.0F, z));
++}
++...
++desc.transform = gridTransform(row, col, spacing);
++```
++
++Pure translation — no rotation composed in at all. This confirms the hypothesis exactly:
++the grid mode drops the asset's own node transform; the import path and sample 08 do not.
++
++`setupShadow()` was investigated too (requirement 4): it does **not** build any instance
++transforms itself — it only computes the light frustum fit and allocates the shadow draw-data
++buffers. Both the forward pass (`updateSceneFrame()`, `row.model = transforms[...]`) and the
++shadow pass (`row.model = glm::transpose(transforms[payload.instanceDataIndex]);`,
++`main.cpp:2006`) read from the **same** `app.scene->transformsSpan()`, populated once by
++`RenderableDesc::transform` in `populateHelmetGrid()`. So the shadow of a lying-down helmet was
++indeed wrong, and fixing `populateHelmetGrid()`'s composition fixes both forward rendering and
++shadows with one change — confirmed empirically below (C1 discrimination re-proof stayed
++qualitatively unchanged across the fix).
++
++`--stress` mode was also checked: it builds a procedural cube (`generateStressCube()`,
++Registry-free, no glTF import, no node concept at all) and explicitly sets
++`app.shadowEnabled = false`. There is no asset node transform to drop here — confirmed by a
++clean headless `--stress` run (all counters correct, gate PASSED) with no code change needed.
++
++## Fix
++
++1. New device-free header `samples/09_scene/grid_layout.h` (same "no VkDevice/Window seam"
++   precedent as `fly_camera.h`/`mouse_capture.h`/`draw_recording.h`):
++   - `gridTransform(row, col, spacing, gridCols)` — the original pure-translation placement,
++     parameterized instead of closing over `kGridCols`.
++   - `gridInstanceTransform(row, col, spacing, gridCols, assetNodeTransform)` =
++     `gridTransform(...) * assetNodeTransform` — composes grid placement with the asset's own
++     node rotation.
++2. `samples/09_scene/main.cpp`:
++   - New `helmetAssetNodeTransform(const ImportResult&)`: returns
++     `result.scene.instances[0].worldTransform` (defensive identity + `RX_LOG_WARN` fallback if
++     the import ever produces zero instances — never observed against the real asset, which has
++     exactly one root node).
++   - `populateHelmetGrid()` signature extended to take `const glm::mat4& assetNodeTransform`;
++     the grid loop now calls `rx::samples9::gridInstanceTransform(row, col, spacing, kGridCols,
++     assetNodeTransform)`.
++   - Both call sites (`runHeadless()` line ~2649, `runPresent()` line ~3167) updated to pass
++     `helmetAssetNodeTransform(result)`.
++3. D17 reference regenerated: `bash tools/regen_references.sh linux-native 09_scene` (forces
++   `VK_ICD_FILENAMES` to the system lavapipe ICD per that script's own provenance guarantee —
++   never any other driver). `samples/09_scene/references/grid_scene.png` updated.
++
++## Orientation-discriminating regression guard (requirement 3)
++
++The task's own framing proved out directly: the exact-counter/pixel gate alone is blind to this
++class of bug, because the committed reference was baked *from* the buggy render — a
++self-consistent wrong answer passes a pixel-diff gate with `failingPixels=0`.
++
++Added `samples/09_scene/tests/test_grid_layout.cpp` (2 `TEST_CASE`s, 51 assertions), registered
++in `samples/09_scene/tests/CMakeLists.txt`. It hard-codes DamagedHelmet.gltf's own node
++quaternion (`glm::quat(0.7071068286895752F, 0.7071068286895752F, 0.0F, -0.0F)`) — a constant
++taken directly from the asset file, **independent of `gridInstanceTransform()`'s own
++implementation** — and asserts:
++- the composed instance's rotational 3x3 equals that quaternion's rotation matrix (not merely
++  "some" rotation);
++- it is explicitly **not** identity (the exact signature every form of "dropped rotation"
++  produces);
++- the translation part still lands exactly on the plain grid placement.
++
++This is device-free (no GPU, no lavapipe, no reference PNG at all), so it fails deterministically
++regardless of what any regenerated reference says.
++
++### Revert-prove, composition-formula level
++
++Temporarily reverted `gridInstanceTransform()` in `grid_layout.h` to ignore
++`assetNodeTransform` and return plain `gridTransform(...)` (the pre-fix behavior). Rebuilt and
++ran the new tests:
++
++```
++[doctest] test cases:  2 |  1 passed |  1 failed | 33 skipped
++[doctest] assertions: 51 | 19 passed | 32 failed |
++[doctest] Status: FAILURE!
++```
++
++32/51 assertions failed immediately, at exactly the discriminating checks (rotation-matches-known-
++quaternion, rotation-is-not-identity), across all 16 grid cells. Restored the fix; rebuilt;
++`sample_09_scene_tests`: **35/35 test cases, 157/157 assertions, SUCCESS**.
++
++### Revert-prove, call-site level
++
++Temporarily reverted both `populateHelmetGrid()` call sites in `main.cpp` to pass
++`glm::mat4(1.0F)` instead of `helmetAssetNodeTransform(result)` (simulating a regression that
++bypasses the composition entirely at the wiring level, which the header-level unit test above
++cannot see since it never runs the real importer). Rebuilt `sample_09_scene` and ran the headless
++gate against the **already-corrected** reference:
++
++```
++sample_09_scene: D17 grid_scene gate: failingPixels=2499/65536 (3.8132%) pass=false
++sample_09_scene: D17 grid_scene gate FAILED on lavapipe (first mismatch at (80,127))
++sample_09_scene: headless gate FAILED
++```
++
++2499/65536 (3.8132%) — the *exact same number* the pre-fix binary produced against the
++corrected reference before any code changes (see "before/after" below), confirming the D17
++pixel gate now genuinely discriminates a call-site regression once its own reference is correct.
++Restored the fix; rebuilt; gate passed again (`failingPixels=0/65536, pass=true`).
++
++Together, the transform-level unit test (composition-formula regressions) and the corrected D17
++pixel gate (call-site/wiring regressions) cover both ways this bug could be reintroduced.
++
++## Before / after
++
++Old (buggy, pre-fix) committed reference vs. the render produced by the fixed code:
++
++```
++sample_09_scene: D17 grid_scene gate: failingPixels=2499/65536 (3.8132%) pass=false
++sample_09_scene: D17 grid_scene gate FAILED on lavapipe (first mismatch at (80,127))
++```
++
++New reference regenerated from the fixed code; fixed code re-run against it:
++
++```
++sample_09_scene: D17 grid_scene gate: failingPixels=0/65536 (0.0000%) pass=true
++sample_09_scene: C1 discrimination re-proof (shadows-on vs. forced-off): differingPixels=240/65536 (0.3662%)
++sample_09_scene: headless gate PASSED
++```
++
++The shadow discrimination re-proof (C1, pre-existing) stayed meaningfully non-zero throughout
++(240 with the fix in place, 338 with the call-site regression reinstated, back to 240 restored)
++— shadows visibly track the corrected geometry, consistent with the single-source-of-transforms
++finding above.
++
++Captures saved to this SDD directory:
++- `issue35-grid-scene-before-lavapipe.png` — old (buggy) D17 reference, lavapipe, 256x256.
++- `issue35-grid-scene-after-lavapipe.png` — new (fixed) D17 reference, lavapipe, 256x256.
++- `issue35-nvidia-present-grid-512.png` — real-NVIDIA present-mode grid run, HUD visible,
++  helmets upright (visor domes facing the camera), scaled to 512px max dimension.
++
++Visual comparison: the old reference's helmets are dark, near-uniform teardrop silhouettes from
++this elevated downward-angled camera (consistent with lying on their backs, camera mostly seeing
++the chin/underside); the new reference and the real-NVIDIA capture both show the same
++distinctive teal-green domed visor patch per helmet, matching sample 08's known-good coloring.
++
++## Verification
++
++**Full serial lavapipe ctest** (`linux-native`, `VK_ICD_FILENAMES` forced to the system lavapipe
++ICD, `xvfb-run`):
++
++```
++100% tests passed, 0 tests failed out of 29
++Total Test time (real) =  74.52 sec
++```
++
++Includes `sample_09_scene_headless`, `sample_09_scene_stress_headless`, and
++`sample_09_scene_tests` (the new `test_grid_layout.cpp` cases).
++
++**Real-NVIDIA verification** (default/unforced ICD — `nvidia-smi`: GeForce RTX 2080, driver
++580.82.07; `vulkaninfo --summary` confirms it as `GPU0`, `driverID = DRIVER_ID_NVIDIA_PROPRIETARY`;
++independently confirmed "driver-labeled" via the headless run's own D17 log annotation, which
++explicitly reports `[non-lavapipe driver -- informational only, not enforced]` when the default
++loader selects it):
++
++- Present-mode grid run, `--present --validate`: window opened, rendered, closed cleanly
++  (`sample_09_scene: window closed cleanly`, exit 0).
++- `grep -i "validation error" | grep -v "known false positive"` on the full run log: **zero
++  matches** — every reported `Validation Error`/`SYNC-HAZARD` line carries this codebase's own
++  pre-existing, documented false-positive annotation (`context.cpp`'s four known-guard comments);
++  none introduced by this change.
++- 512px frame capture saved (`issue35-nvidia-present-grid-512.png`, see above) — helmets render
++  upright.
++- Separately, a default-ICD **headless** run confirmed the same default-ICD selection picks a
++  non-lavapipe (real) driver, and passed: `sample_09_scene: headless gate PASSED`.
++
++**windows-cross-zig build**: `cmake --build --preset windows-cross-zig` — clean, zero warnings,
++for `sample_09_scene`, `sample_09_scene_tests`, and the full project (`ninja: no work to do` on
++the final full-preset build, i.e. everything already built clean with no diagnostics at any
++incremental step).
++
++**Wine convention**: matched CI's own invocation exactly
++(`.github/workflows/ci.yml` "Test under wine" step):
++
++```
++xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_debug_ui_gpu|sample' --output-on-failure
++...
++100% tests passed, 0 tests failed out of 13
++Total Test time (real) = 133.28 sec
++```
++
++CI's own exclusion regex excludes every `sample*`-named test (not specific to this change), so
++as a bonus check `sample_09_scene_tests.exe` was also run directly under Wine outside ctest
++(it is genuinely device-free, so this is a legitimate extra check even though CI's regex happens
++to skip it):
++
++```
++[doctest] test cases:  35 |  35 passed | 0 failed | 0 skipped
++[doctest] assertions: 157 | 157 passed | 0 failed |
++[doctest] Status: SUCCESS!
++```
++
++**Zero warnings**: every build step (linux-native and windows-cross-zig, full and incremental,
++including every revert-prove rebuild) produced only `Building`/`Linking` lines — no compiler
++diagnostics at any point.
++
++## Files changed
++
++- `samples/09_scene/grid_layout.h` (new) — `gridTransform()`/`gridInstanceTransform()`.
++- `samples/09_scene/main.cpp` — `#include "grid_layout.h"`; new `helmetAssetNodeTransform()`;
++  `populateHelmetGrid()` takes `assetNodeTransform`; both call sites updated.
++- `samples/09_scene/tests/test_grid_layout.cpp` (new) — the orientation-discriminating unit test.
++- `samples/09_scene/tests/CMakeLists.txt` — registers `test_grid_layout.cpp`.
++- `samples/09_scene/references/grid_scene.png` — regenerated D17 reference (lavapipe,
++  `tools/regen_references.sh linux-native 09_scene`).
++- `.superpowers/sdd/2026-08-11-phase4-scene-assets/issue35-*.png` (new, force-added past this
++  directory's own `*` `.gitignore`, matching the existing `helmet-before.png`/`helmet-after.png`
++  precedent) — before/after evidence captures.
++
++`setupShadow()` and the `--stress` path required **no code change** — both were verified
++directly (not merely inferred) per requirement 4, as detailed above.
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/issue35-grid-scene-after-lavapipe.png b/.superpowers/sdd/2026-08-11-phase4-scene-assets/issue35-grid-scene-after-lavapipe.png
+new file mode 100644
+index 0000000..14ba661
+Binary files /dev/null and b/.superpowers/sdd/2026-08-11-phase4-scene-assets/issue35-grid-scene-after-lavapipe.png differ
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/issue35-grid-scene-before-lavapipe.png b/.superpowers/sdd/2026-08-11-phase4-scene-assets/issue35-grid-scene-before-lavapipe.png
+new file mode 100644
+index 0000000..19988e3
+Binary files /dev/null and b/.superpowers/sdd/2026-08-11-phase4-scene-assets/issue35-grid-scene-before-lavapipe.png differ
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/issue35-nvidia-present-grid-512.png b/.superpowers/sdd/2026-08-11-phase4-scene-assets/issue35-nvidia-present-grid-512.png
+new file mode 100644
+index 0000000..e10eb43
+Binary files /dev/null and b/.superpowers/sdd/2026-08-11-phase4-scene-assets/issue35-nvidia-present-grid-512.png differ
+diff --git a/samples/09_scene/grid_layout.h b/samples/09_scene/grid_layout.h
+new file mode 100644
+index 0000000..1cbf9aa
+--- /dev/null
++++ b/samples/09_scene/grid_layout.h
+@@ -0,0 +1,61 @@
++#pragma once
++// samples/09_scene/grid_layout.h -- rx::samples9::gridTransform()/
++// gridInstanceTransform(), the pure grid-placement + asset-node-rotation
++// composition the default DamagedHelmet grid (populateHelmetGrid(),
++// main.cpp) uses to place each instance.
++//
++// WHY THIS EXISTS [Issue #35]: populateHelmetGrid() used to hand-build each
++// instance's transform as gridTransform(row, col, spacing) ALONE -- a pure
++// translation, no rotation at all. DamagedHelmet.gltf's own single root
++// node carries a rotation (+90 degrees about world X; quaternion
++// x=0.7071068, y=0, z=0, w=0.7071068 -- see
++// assets/fetched/DamagedHelmet/glTF/DamagedHelmet.gltf's own "nodes" array)
++// that the --scene import path (populateImportedInstances(), which reads
++// InstanceRecord::worldTransform directly) and sample 08's own
++// single-helmet view both apply -- but the grid path silently dropped it:
++// the grid's helmets rendered lying on their backs (visor toward the sky)
++// while every import-path helmet rendered upright. gridInstanceTransform()
++// composes the two so the grid matches import-path orientation exactly:
++// `gridTransform(...) * assetNodeTransform` -- grid placement in world
++// space, applied to the mesh AFTER the asset's own node rotation, the same
++// composition order populateImportedInstances() gets for free since its
++// own `instance.worldTransform` already IS the node transform (there is
++// nothing else to compose it with there).
++//
++// Extracted to a device-free header -- same "no VkDevice/Window seam"
++// precedent as fly_camera.h/mouse_capture.h/draw_recording.h's own top
++// comments -- so samples/09_scene/tests/test_grid_layout.cpp can assert the
++// composed rotation against DamagedHelmet.gltf's own hard-coded node
++// quaternion directly. A dropped rotation (reverting to gridTransform(...)
++// alone, or passing an identity assetNodeTransform) fails that test
++// immediately -- no GPU, no lavapipe, no rendered/regenerated reference PNG
++// in the loop at all (see that test file's own top comment for why the
++// pixel-only D17 gate alone proved insufficient: a reference regenerated
++// FROM the buggy render certifies the bug right along with it).
++#include <glm/glm.hpp>
++#include <glm/gtc/matrix_transform.hpp>
++
++namespace rx::samples9 {
++
++// Pure grid-cell placement -- world-space translation only, no rotation:
++// row 0 nearest the camera, walking -Z per row; columns centered on X.
++[[nodiscard]] inline glm::mat4 gridTransform(uint32_t row, uint32_t col, float spacing, uint32_t gridCols) {
++    const float x = (static_cast<float>(col) - 0.5F * static_cast<float>(gridCols - 1)) * spacing;
++    const float z = -(static_cast<float>(row) * spacing);
++    return glm::translate(glm::mat4(1.0F), glm::vec3(x, 0.0F, z));
++}
++
++// Composes a grid cell's placement with the imported asset's own node
++// transform (InstanceRecord::worldTransform from the import path -- see
++// this header's own top comment) so a grid instance renders in the SAME
++// orientation the import path (populateImportedInstances(), sample 08)
++// already does. `assetNodeTransform` pre-multiplies on the right: it acts
++// on the local mesh FIRST, then the whole (now-upright) instance is placed
++// in the grid -- pass glm::mat4(1.0F) for an asset with no meaningful node
++// transform to recover plain gridTransform() behavior.
++[[nodiscard]] inline glm::mat4 gridInstanceTransform(uint32_t row, uint32_t col, float spacing, uint32_t gridCols,
++                                                       const glm::mat4& assetNodeTransform) {
++    return gridTransform(row, col, spacing, gridCols) * assetNodeTransform;
++}
++
++}  // namespace rx::samples9
+diff --git a/samples/09_scene/main.cpp b/samples/09_scene/main.cpp
+index 3de9064..4cb31ae 100644
+--- a/samples/09_scene/main.cpp
++++ b/samples/09_scene/main.cpp
+@@ -91,20 +91,21 @@
+ #include <rx_scene/draw_list.h>
+ #include <rx_scene/scene.h>
+ #include <rx_shader/compiler.h>
+ #include <rx_shader/reflection.h>
+ #include <rx_shadow/shadow_caster_pipeline.h>
+ #include <rx_shadow/shadow_frustum.h>
+ #include <rx_task/scheduler.h>
+ 
+ #include "draw_recording.h"
+ #include "fly_camera.h"
++#include "grid_layout.h"
+ #include "mouse_capture.h"
+ #include <reference_gate.h>
+ 
+ #define GLM_FORCE_DEPTH_ZERO_TO_ONE
+ #include <glm/glm.hpp>
+ #include <glm/gtc/matrix_transform.hpp>
+ #include <glm/gtc/quaternion.hpp>
+ 
+ #include <SDL3/SDL.h>
+ #include <imgui.h>
+@@ -1597,47 +1598,69 @@ bool populateImportedInstances(App& app, const rx::asset::Registry& registry, co
+     app.flyCamera.camera.cullMask = ~0u;
+     app.moveSpeed = std::max(radius * 0.5F, 1.0F);
+ 
+     if (!createDrawDataBuffers(app, std::max<uint32_t>(totalSubmeshCount, 1))) {
+         return false;
+     }
+     return true;
+ }
+ 
+ // --- Grid layout [deterministic layer-mask culling -- see this file's own
+-// header comment] ---------------------------------------------------------
+-glm::mat4 gridTransform(uint32_t row, uint32_t col, float spacing) {
+-    const float x = (static_cast<float>(col) - 0.5F * static_cast<float>(kGridCols - 1)) * spacing;
+-    const float z = -(static_cast<float>(row) * spacing);
+-    return glm::translate(glm::mat4(1.0F), glm::vec3(x, 0.0F, z));
++// header comment] -- gridTransform()/gridInstanceTransform() themselves
++// live in grid_layout.h now [Issue #35] -- see that header's own top
++// comment for why (device-free, test-seam extraction, same precedent as
++// fly_camera.h/mouse_capture.h/draw_recording.h). ------------------------
++
++// [Issue #35] The single root-node transform DamagedHelmet.gltf's own
++// import produces -- both populateHelmetGrid() call sites (runHeadless()/
++// runPresent()) feed this into gridInstanceTransform() so the grid
++// composes the SAME node rotation the --scene import path
++// (populateImportedInstances(), InstanceRecord::worldTransform) and sample
++// 08's own single-helmet view already apply. Defensive fallback to
++// identity + a loud warning if the import ever produces zero instances for
++// this asset (never observed against the real fetched DamagedHelmet, which
++// has exactly one root node) -- silently rendering with no rotation is
++// exactly this issue's own regression class, so this path is never silent.
++glm::mat4 helmetAssetNodeTransform(const rx::asset::ImportResult& result) {
++    if (result.scene.instances.empty()) {
++        RX_LOG_WARN("sample_09_scene: DamagedHelmet import produced zero scene instances -- grid falling back to an "
++                    "identity node transform (helmets may render in the WRONG orientation)");
++        return glm::mat4(1.0F);
++    }
++    return result.scene.instances[0].worldTransform;
+ }
+ 
+ // Populates the helmet grid's Scene/DrawListBuilder/renderables given the
+ // real imported MeshHandle (Registry already holds the MeshAsset by the
+ // time this runs -- see runHeadless()/runPresent()'s own import call).
+-bool populateHelmetGrid(App& app, rx::asset::MeshHandle helmetMesh) {
++// `assetNodeTransform` is the imported DamagedHelmet's own single root-node
++// transform (result.scene.instances[0].worldTransform at both call sites
++// -- see grid_layout.h's own top comment for why the grid must compose
++// this in, matching the --scene import path's orientation instead of
++// dropping it).
++bool populateHelmetGrid(App& app, rx::asset::MeshHandle helmetMesh, const glm::mat4& assetNodeTransform) {
+     const glm::vec3 size = app.helmetLocalBounds.isValid() ? (app.helmetLocalBounds.max - app.helmetLocalBounds.min)
+                                                              : glm::vec3(1.0F);
+     const float radius = std::max(0.5F * glm::length(size), 0.01F);
+     const float spacing = radius * 3.0F;  // generous non-overlap margin (radius-scale gap either side).
+ 
+     app.scene.emplace(rx::scene::meshBoundsFromRegistry(*app.registry));
+     app.drawListBuilder.emplace(rx::scene::meshSubmeshesFromRegistry(*app.registry),
+                                  rx::scene::materialResolveFromRegistry(*app.registry));
+ 
+     app.renderableHandles.clear();
+     app.renderableHandles.reserve(kGridInstanceCount);
+     for (uint32_t row = 0; row < kGridRows; ++row) {
+         for (uint32_t col = 0; col < kGridCols; ++col) {
+             rx::scene::RenderableDesc desc;
+             desc.mesh = helmetMesh;
+-            desc.transform = gridTransform(row, col, spacing);
++            desc.transform = rx::samples9::gridInstanceTransform(row, col, spacing, kGridCols, assetNodeTransform);
+             desc.layers = (1u << row);
+             // Row 0 alone carries the highlight channel EXCLUSIVELY (never
+             // 0xFF) -- see HudState's own comment for why this isolates
+             // row 0 as the light-channel demo's subject.
+             desc.channels = (row == 0) ? kHighlightChannelBit : 0xFFu;
+             const rx::scene::RenderableHandle handle = app.scene->createRenderable(desc);
+             app.renderableHandles.push_back(handle);
+         }
+     }
+ 
+@@ -2616,21 +2639,21 @@ int runHeadless(const Args& args) {
+         // many the DamagedHelmet asset itself reports -- matches
+         // setupHelmetMaterial()'s own single-material call below.
+         if (!createMaterialParamArena(*app, 1)) {
+             destroyApp(*app);
+             return 1;
+         }
+         if (!setupHelmetMaterial(*app, app->registry->material(result.materials[0]))) {
+             destroyApp(*app);
+             return 1;
+         }
+-        if (!populateHelmetGrid(*app, result.meshes[0])) {
++        if (!populateHelmetGrid(*app, result.meshes[0], helmetAssetNodeTransform(result))) {
+             destroyApp(*app);
+             return 1;
+         }
+         warmMaterialPipelines(*app, std::span<const MaterialGpuBinding>(&app->helmetMaterial, 1));
+         if (!setupShadow(*app)) {
+             destroyApp(*app);
+             return 1;
+         }
+         expectedTotalCandidates = kGridInstanceCount;
+         expectedCulled = kDefaultCulledInstances;
+@@ -3133,21 +3156,22 @@ int runPresent(const Args& args) {
+             return 1;
+         }
+         app->helmetLocalBounds = app->registry->mesh(result.meshes[0]).bounds;
+         // Exactly 1 material used (result.materials[0]) -- matches
+         // setupHelmetMaterial()'s own single-material call below.
+         if (!createMaterialParamArena(*app, 1)) {
+             frameSync.reset();
+             destroyApp(*app);
+             return 1;
+         }
+-        if (!setupHelmetMaterial(*app, app->registry->material(result.materials[0])) || !populateHelmetGrid(*app, result.meshes[0])) {
++        if (!setupHelmetMaterial(*app, app->registry->material(result.materials[0])) ||
++            !populateHelmetGrid(*app, result.meshes[0], helmetAssetNodeTransform(result))) {
+             frameSync.reset();
+             destroyApp(*app);
+             return 1;
+         }
+         warmMaterialPipelines(*app, std::span<const MaterialGpuBinding>(&app->helmetMaterial, 1));
+         if (!setupShadow(*app)) {
+             frameSync.reset();
+             destroyApp(*app);
+             return 1;
+         }
+diff --git a/samples/09_scene/references/grid_scene.png b/samples/09_scene/references/grid_scene.png
+index 19988e3..14ba661 100644
+Binary files a/samples/09_scene/references/grid_scene.png and b/samples/09_scene/references/grid_scene.png differ
+diff --git a/samples/09_scene/tests/CMakeLists.txt b/samples/09_scene/tests/CMakeLists.txt
+index b285e55..90894dd 100644
+--- a/samples/09_scene/tests/CMakeLists.txt
++++ b/samples/09_scene/tests/CMakeLists.txt
+@@ -10,23 +10,31 @@
+ # #33's relative-mouse-capture toggle/ImGui-composition coverage.
+ #
+ # test_mouse_capture_focus_composition.cpp is the ONE exception to
+ # "device-free" in this binary: it links rx_platform to drive a real
+ # (headless/hidden, no VkDevice) rx::platform::Window -- see that file's
+ # own top comment for why the toggle/ImGui-composition coverage above is
+ # insufficient on its own to prove Issue #33's "re-arm on focus-gain
+ # composes with the toggle state" requirement, and why this needs the real
+ # Window rather than re-mocking window.cpp's own already-tested
+ # (src/rx_platform/tests/window_test.cpp) FOCUS_LOST/FOCUS_GAINED logic.
++#
++# test_grid_layout.cpp covers ../grid_layout.h (also device-free,
++# header-only -- no matching .cpp to add) -- Issue #35's dropped-asset-
++# node-rotation regression coverage (the default DamagedHelmet grid
++# rendered every helmet lying on its back; the D17 pixel-diff gate alone
++# proved blind to it, since the committed reference was itself baked FROM
++# the buggy render -- see that test file's own top comment).
+ add_executable(sample_09_scene_tests
+     doctest_main.cpp
+     test_draw_recording.cpp
+     test_fly_camera.cpp
++    test_grid_layout.cpp
+     test_mouse_capture.cpp
+     test_mouse_capture_focus_composition.cpp
+     "${CMAKE_CURRENT_SOURCE_DIR}/../draw_recording.cpp"
+ )
+ target_link_libraries(sample_09_scene_tests PRIVATE rx_scene rx_platform doctest::doctest)
+ add_test(NAME sample_09_scene_tests COMMAND sample_09_scene_tests)
+ # Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+ # (windows-cross Wine hang, run 31512073559).
+ set_tests_properties(sample_09_scene_tests PROPERTIES TIMEOUT 120)
+diff --git a/samples/09_scene/tests/test_grid_layout.cpp b/samples/09_scene/tests/test_grid_layout.cpp
+new file mode 100644
+index 0000000..3ed9e84
+--- /dev/null
++++ b/samples/09_scene/tests/test_grid_layout.cpp
+@@ -0,0 +1,120 @@
++// samples/09_scene/tests/test_grid_layout.cpp -- proves gridInstanceTransform()
++// (../grid_layout.h) actually composes the imported asset's own node
++// rotation into a grid instance's transform, instead of silently dropping
++// it [Issue #35: the default DamagedHelmet grid rendered every helmet
++// lying on its back, visor toward the sky, because populateHelmetGrid()
++// used to hand-build each instance's transform as pure grid-placement
++// translation ALONE -- gridTransform(row, col, spacing), with no rotation
++// at all -- while the --scene import path (populateImportedInstances(),
++// InstanceRecord::worldTransform) and sample 08's own single-helmet view
++// both apply DamagedHelmet.gltf's own root-node rotation].
++//
++// WHY A TRANSFORM-LEVEL TEST, NOT JUST A PIXEL-DIFF GATE: this sample's own
++// D17 headless gate (main.cpp's runHeadless()) already pixel-diffs every
++// frame against a COMMITTED reference PNG -- but that gate proved BLIND to
++// exactly this defect, because the committed reference was itself
++// regenerated FROM the buggy (rotation-dropped) render: a reference baked
++// from the bug certifies the bug right along with it, and the gate cannot
++// tell the difference between "correct" and "wrong, but self-consistent"
++// without an independent source of truth. This test supplies that
++// independent source of truth directly: DamagedHelmet.gltf's own root node
++// (assets/fetched/DamagedHelmet/glTF/DamagedHelmet.gltf, node index 0) has
++// exactly one property, "rotation": [0.7071068286895752, 0.0, -0.0,
++// 0.7071068286895752] (glTF's own [x, y, z, w] quaternion order) -- a
++// +90-degree rotation about world X. That value is hard-coded below,
++// completely independent of gridInstanceTransform()'s own implementation,
++// so a regression that silently drops or zeroes the composed rotation
++// fails this test regardless of what any reference PNG says.
++//
++// Device-free (no VkDevice/Window/Registry/GeometryPool) -- grid_layout.h
++// is plain glm data transformation, same precedent as
++// test_fly_camera.cpp/test_mouse_capture.cpp's own top comments.
++#include "../grid_layout.h"
++
++#include <doctest/doctest.h>
++
++#include <glm/gtc/quaternion.hpp>
++
++using rx::samples9::gridInstanceTransform;
++using rx::samples9::gridTransform;
++
++namespace {
++constexpr float kEps = 1e-5F;
++
++bool mat3AlmostEqual(const glm::mat3& a, const glm::mat3& b, float eps) {
++    for (int col = 0; col < 3; ++col) {
++        for (int row = 0; row < 3; ++row) {
++            if (std::abs(a[col][row] - b[col][row]) > eps) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
++bool vec3AlmostEqual(const glm::vec3& a, const glm::vec3& b, float eps) { return glm::length(a - b) <= eps; }
++
++// DamagedHelmet.gltf's own node 0 "rotation" quaternion, verbatim (glTF
++// stores [x, y, z, w]; glm::quat's constructor takes (w, x, y, z)) -- see
++// this file's own top comment. A +90-degree rotation about world X.
++glm::mat4 damagedHelmetNodeTransform() {
++    const glm::quat q(0.7071068286895752F, 0.7071068286895752F, 0.0F, -0.0F);
++    return glm::mat4_cast(q);
++}
++}  // namespace
++
++TEST_CASE("gridInstanceTransform composes DamagedHelmet.gltf's own node rotation into every grid cell "
++          "[Issue #35 regression: the grid used to drop this rotation entirely]") {
++    const glm::mat4 assetNodeTransform = damagedHelmetNodeTransform();
++    constexpr float spacing = 2.0F;
++    constexpr uint32_t gridCols = 4;
++
++    for (uint32_t row = 0; row < 4; ++row) {
++        for (uint32_t col = 0; col < gridCols; ++col) {
++            const glm::mat4 composed = gridInstanceTransform(row, col, spacing, gridCols, assetNodeTransform);
++
++            // Rotational part: composing a pure translation (gridTransform)
++            // with assetNodeTransform on the right must leave the asset's
++            // own rotation untouched in the result -- exactly the
++            // composition Issue #35's fix introduces, and exactly what the
++            // pre-fix code (gridTransform(...) alone, no assetNodeTransform
++            // at all) could never produce.
++            CHECK(mat3AlmostEqual(glm::mat3(composed), glm::mat3(assetNodeTransform), kEps));
++
++            // ... and it must NOT be identity -- the pre-fix bug's own
++            // exact signature (a "dropped rotation" always manifests as an
++            // identity rotational part, regardless of how it was dropped:
++            // never composing assetNodeTransform at all, or composing an
++            // identity in its place).
++            CHECK_FALSE(mat3AlmostEqual(glm::mat3(composed), glm::mat3(1.0F), kEps));
++
++            // Translation part: DamagedHelmet's own node carries NO
++            // translation or scale (rotation only), so the composed
++            // instance's translation must land exactly on the plain grid
++            // placement -- a regression that also breaks placement (e.g.
++            // composing in the wrong order, applying assetNodeTransform's
++            // translation column) is caught here too.
++            const glm::vec3 expectedTranslation = glm::vec3(gridTransform(row, col, spacing, gridCols)[3]);
++            CHECK(vec3AlmostEqual(glm::vec3(composed[3]), expectedTranslation, kEps));
++        }
++    }
++}
++
++TEST_CASE("gridInstanceTransform with an identity asset node transform reduces to plain gridTransform() "
++          "placement [documents the Issue #35 regression signature this test discriminates against]") {
++    constexpr float spacing = 2.0F;
++    constexpr uint32_t gridCols = 4;
++    constexpr uint32_t row = 2;
++    constexpr uint32_t col = 3;
++
++    const glm::mat4 composed = gridInstanceTransform(row, col, spacing, gridCols, glm::mat4(1.0F));
++    const glm::mat4 plain = gridTransform(row, col, spacing, gridCols);
++    CHECK(mat3AlmostEqual(glm::mat3(composed), glm::mat3(plain), kEps));
++    CHECK(mat3AlmostEqual(glm::mat3(composed), glm::mat3(1.0F), kEps));
++
++    // This identity-rotation result must NOT match DamagedHelmet's real
++    // node rotation -- the discriminating assertion the case above relies
++    // on to fail loudly if a future change re-drops the rotation.
++    const glm::mat4 assetNodeTransform = damagedHelmetNodeTransform();
++    CHECK_FALSE(mat3AlmostEqual(glm::mat3(composed), glm::mat3(assetNodeTransform), kEps));
++}
