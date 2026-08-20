@@ -106,35 +106,35 @@ and compiles to nothing at all when it is OFF:
   guard for the same reason, though production code has no need for
   them. (`src/rx_asset/include/rx_asset/geometry_pool.h`)
 - **`rx::asset::Registry`** [Phase 4 Stage 1 Tasks 13/15, spec D9/D24] —
-  `importGltfAsync()`/`cancelImport()`/`importProgress()`/`~Registry()`/
-  `mesh()`/`material()`/`texture()` **[guarded, all six]**: the entire
-  async-import surface (`importGltfAsync()`/`cancelImport()`/
-  `importProgress()` — this Registry's "main" thread is whichever thread
-  also calls `scheduler.pumpMain()` each frame, since that pump loop is
-  what actually advances an in-flight import; see registry.h's own
-  "BYTE-SOURCE LIFETIME CONTRACT"/"CANCELLATION"/"PROGRESS" sections for the
-  full async contract) is main-thread-only exactly like every other
-  GPU-object-mutation entry point above. The read accessors
-  (`mesh()`/`material()`/`texture()`) hold the identical no-internal-lock
-  posture GeometryPool's own reads do — narrowed to guarded main-thread-only
-  this fix wave [Phase 4 exit fix wave, M2], mirroring the Task-12
-  GeometryPool ruling. `~Registry()` is guarded too: its cancel-then-drain
-  teardown sequence (`drainAndRollbackAbandonedAsyncJob()` → a bounded
-  reap-poll gate, leak-not-UAF on timeout) assumes the same single calling
-  thread as every other mutator. `decodeForUpload()`-style any-thread
-  carve-outs do not exist on this class — the compute-heavy half of async
-  import runs on `rx::task::Scheduler` workers, but it never calls back
-  into `Registry` directly (`import_pipeline.h`'s compute/marshal split):
-  only the marshal half, posted back via `postToMain()`, ever touches this
-  class. **Disclosure (pre-existing, out of this fix wave's scope):** the
-  SYNCHRONOUS `importGltf()` overloads and `evictForTesting()` are
-  documented main-thread-only by this same convention but do NOT carry
-  their own `RX_ASSERT_MAIN_THREAD` call anywhere in their call chain
-  (`importGltf()` → `importGltfPipeline()` → `marshalGltfImportSync()` →
-  `registerMesh()`/`registerMaterial()`, none guarded) — every in-tree
-  caller already respects the documented contract, so this is a
-  documentation-honesty gap of the same F5/I2 class, not a reproduced
-  violation; recorded here rather than silently left implied-guarded.
+  `importGltf()` (both overloads)/`importGltfAsync()`/`cancelImport()`/
+  `importProgress()`/`evictForTesting()` (both overloads)/`~Registry()`/
+  `mesh()`/`material()`/`texture()` **[guarded, all nine]**: mutation
+  (`importGltf()`, `evictForTesting()`) and the entire async-import surface
+  (`importGltfAsync()`/`cancelImport()`/`importProgress()` — this
+  Registry's "main" thread is whichever thread also calls
+  `scheduler.pumpMain()` each frame, since that pump loop is what actually
+  advances an in-flight import; see registry.h's own "BYTE-SOURCE LIFETIME
+  CONTRACT"/"CANCELLATION"/"PROGRESS" sections for the full async contract)
+  are main-thread-only exactly like every other GPU-object-mutation entry
+  point above. The read accessors (`mesh()`/`material()`/`texture()`) hold
+  the identical no-internal-lock posture GeometryPool's own reads do —
+  narrowed to guarded main-thread-only in the Phase 4 exit fix wave [M2],
+  mirroring the Task-12 GeometryPool ruling; the synchronous `importGltf()`
+  overloads and `evictForTesting()` were found to be documented
+  main-thread-only but carried NO `RX_ASSERT_MAIN_THREAD` anywhere in
+  their own call chain (`importGltf()` → `importGltfPipeline()` →
+  `marshalGltfImportSync()` → `registerMesh()`/`registerMaterial()`, none
+  guarded) — a pre-existing gap discovered while writing this entry, closed
+  in the same fix wave per the standing no-deferred-fixes policy (no
+  prerequisite blocked it). `~Registry()` is guarded too: its
+  cancel-then-drain teardown sequence (`drainAndRollbackAbandonedAsyncJob()`
+  → a bounded reap-poll gate, leak-not-UAF on timeout) assumes the same
+  single calling thread as every other mutator. `decodeForUpload()`-style
+  any-thread carve-outs do not exist on this class — the compute-heavy half
+  of async import runs on `rx::task::Scheduler` workers, but it never calls
+  back into `Registry` directly (`import_pipeline.h`'s compute/marshal
+  split): only the marshal half, posted back via `postToMain()`, ever
+  touches this class.
   (`src/rx_asset/include/rx_asset/registry.h`)
 - **`rx::asset::TextureCache`** [Phase 4 Stage 1 Task 14, spec D10/D11/D24/
   D25] — `create()`/`load()`/`loadFromBytes()`/`registerDecoded()`/

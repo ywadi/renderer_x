@@ -577,11 +577,29 @@ ImportProgress Registry::importProgress(AsyncImportHandle handle) const {
 
 ImportResult Registry::importGltf(std::span<const std::byte> documentBytes, ByteSource& source, GeometryPool& pool,
                                    rx::task::Scheduler& scheduler, TextureCache* textures) {
+    // [Phase 4 exit fix wave, in-round pre-existing-defect closure] Was
+    // documented main-thread-only (registry.h's own top comment) but never
+    // actually enforced anywhere in this call's chain
+    // (importGltfPipeline() -> computeGltfImport()/marshalGltfImportSync()
+    // -> registerMesh()/registerMaterial(), none guarded) -- discovered
+    // while writing I4's threading.md text, closed here per standing
+    // no-deferred-fixes policy (no prerequisite blocks it). Matches every
+    // other main-thread-only Registry mutator's guard convention.
+    RX_ASSERT_MAIN_THREAD("Registry::importGltf");
     return importGltfPipeline(*this, documentBytes, source, pool, scheduler, textures);
 }
 
 ImportResult Registry::importGltf(const std::filesystem::path& path, GeometryPool& pool, rx::task::Scheduler& scheduler,
                                    TextureCache* textures) {
+    // [Phase 4 exit fix wave] See the byte-span overload's own comment
+    // above -- this overload also reaches it (below), so this guard is
+    // technically redundant with that one, but it fires here FIRST (before
+    // this overload's own direct filesystem read), matching this
+    // codebase's own established "guard every public entry point, even
+    // when an inner call is separately guarded too" convention (e.g.
+    // MaterialSystem::bindInstance() and the getPipeline() it calls
+    // internally both carry their own guard).
+    RX_ASSERT_MAIN_THREAD("Registry::importGltf");
     // The one sanctioned direct-filesystem read in this whole library
     // [byte_source.h's own top comment]: reading the MAIN document
     // itself for this convenience overload. Every OTHER byte (every
@@ -656,8 +674,19 @@ const TextureAsset& Registry::texture(TextureHandle handle) const {
     return *fallback;
 }
 
-void Registry::evictForTesting(MeshHandle handle) { nonresidentMesh_.insert(packHandle(handle)); }
+void Registry::evictForTesting(MeshHandle handle) {
+    // [Phase 4 exit fix wave, in-round pre-existing-defect closure] Same
+    // rationale as importGltf() above -- documented main-thread-only,
+    // previously unguarded.
+    RX_ASSERT_MAIN_THREAD("Registry::evictForTesting");
+    nonresidentMesh_.insert(packHandle(handle));
+}
 
-void Registry::evictForTesting(MaterialHandle handle) { nonresidentMaterial_.insert(packHandle(handle)); }
+void Registry::evictForTesting(MaterialHandle handle) {
+    // [Phase 4 exit fix wave] See the MeshHandle overload's own comment
+    // above.
+    RX_ASSERT_MAIN_THREAD("Registry::evictForTesting");
+    nonresidentMaterial_.insert(packHandle(handle));
+}
 
 }  // namespace rx::asset

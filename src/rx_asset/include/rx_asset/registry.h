@@ -1,9 +1,12 @@
 #pragma once
 
 // rx_asset/registry.h -- Thread-affinity (D5): Registry MUTATION
-// (importGltf(), evictForTesting()) is main-thread-only, matching every
-// other GPU-object-mutation entry point in this codebase (BindlessTable/
-// Uploader/DeletionQueue/GeometryPool -- docs/threading.md). The read
+// (importGltf(), evictForTesting()) is main-thread-only, [guarded]
+// [Phase 4 exit fix wave, in-round pre-existing-defect closure -- was
+// documented-by-comment-only, unenforced anywhere in importGltf()'s own
+// call chain until now], matching every other GPU-object-mutation entry
+// point in this codebase (BindlessTable/Uploader/DeletionQueue/
+// GeometryPool -- docs/threading.md). The read
 // accessors (mesh()/material()/texture()) are declared const and are
 // main-thread-only, [guarded] [Phase 4 exit fix wave, M2, mirroring the
 // Task-12 GeometryPool read-accessor ruling this class's identical posture

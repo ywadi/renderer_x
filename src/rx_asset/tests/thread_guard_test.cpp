@@ -1,13 +1,18 @@
 #include <doctest/doctest.h>
+#include <rx_asset/byte_source.h>
 #include <rx_asset/geometry_pool.h>
 #include <rx_asset/registry.h>
 #include <rx_core/debug_checks.h>
 #include <rx_rhi_vk/device.h>
 #include <rx_rhi_vk/upload.h>
 #include <rx_platform/window.h>
+#include <rx_task/scheduler.h>
 #include <atomic>
+#include <filesystem>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <utility>
@@ -215,6 +220,78 @@ TEST_CASE("Registry::mesh/material/texture do NOT trip the guard for calls genui
     (void)registry.mesh(rx::asset::MeshHandle{});
     (void)registry.material(rx::asset::MaterialHandle{});
     (void)registry.texture(rx::asset::TextureHandle{});
+
+    std::lock_guard<std::mutex> lock(capture.mutex);
+    CHECK(capture.callCount == 0);
+}
+
+// [Phase 4 exit fix wave, in-round pre-existing-defect closure] Discovered
+// while writing threading.md's I4 text: Registry::importGltf()'s two
+// overloads and evictForTesting() were documented main-thread-only
+// (registry.h's own top comment) but carried NO RX_ASSERT_MAIN_THREAD
+// anywhere in their own call chain -- closed per this project's
+// no-deferred-fixes policy (a discovered pre-existing defect with no
+// prerequisite blocking it). importGltf() is given a deliberately EMPTY
+// byte span -- the guard fires as the very first statement regardless,
+// and an empty/malformed document is already a documented safe-failure
+// path (see import_gltf_gpu_test.cpp's own "malformed-file battery --
+// named error, zero partial registry mutation, no crash" case), so no
+// real glTF fixture is needed here.
+TEST_CASE("Registry::importGltf/evictForTesting trip RX_ASSERT_MAIN_THREAD when called from a worker thread") {
+    auto fixture = makeFixture("rx_asset_thread_guard_registry");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto pool = rx::asset::GeometryPool::create(fixture->allocator, fixture->device, fixture->uploader);
+    REQUIRE(pool != nullptr);
+    auto scheduler = rx::task::Scheduler::create(2);
+    REQUIRE(scheduler != nullptr);
+
+    rx::asset::Registry registry;
+    rx::asset::FilesystemByteSource byteSource(std::filesystem::path("."));
+
+    ViolationCapture capture;
+    g_activeCapture.store(&capture, std::memory_order_relaxed);
+    rx::core::debug::detail::setViolationHookForTests(&captureViolationHook);
+    ViolationHookGuard guard;
+
+    std::thread importThread([&] {
+        (void)registry.importGltf(std::span<const std::byte>{}, byteSource, *pool, *scheduler, nullptr);
+    });
+    importThread.join();
+    std::thread evictMeshThread([&] { registry.evictForTesting(rx::asset::MeshHandle{}); });
+    evictMeshThread.join();
+    std::thread evictMaterialThread([&] { registry.evictForTesting(rx::asset::MaterialHandle{}); });
+    evictMaterialThread.join();
+
+    std::lock_guard<std::mutex> lock(capture.mutex);
+    CHECK(capture.callCount == 3);
+    CHECK(capture.lastContext == "Registry::evictForTesting");
+}
+
+TEST_CASE("Registry::importGltf/evictForTesting do NOT trip the guard for calls genuinely on the main thread") {
+    auto fixture = makeFixture("rx_asset_thread_guard_registry_legal");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto pool = rx::asset::GeometryPool::create(fixture->allocator, fixture->device, fixture->uploader);
+    REQUIRE(pool != nullptr);
+    auto scheduler = rx::task::Scheduler::create(2);
+    REQUIRE(scheduler != nullptr);
+
+    rx::asset::Registry registry;
+    rx::asset::FilesystemByteSource byteSource(std::filesystem::path("."));
+
+    ViolationCapture capture;
+    g_activeCapture.store(&capture, std::memory_order_relaxed);
+    rx::core::debug::detail::setViolationHookForTests(&captureViolationHook);
+    ViolationHookGuard guard;
+
+    (void)registry.importGltf(std::span<const std::byte>{}, byteSource, *pool, *scheduler, nullptr);
+    registry.evictForTesting(rx::asset::MeshHandle{});
+    registry.evictForTesting(rx::asset::MaterialHandle{});
 
     std::lock_guard<std::mutex> lock(capture.mutex);
     CHECK(capture.callCount == 0);
