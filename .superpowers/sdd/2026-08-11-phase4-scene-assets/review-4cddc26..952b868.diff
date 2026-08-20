@@ -1,0 +1,2686 @@
+# Review package: 4cddc26..952b868
+
+## Commits
+952b868 fix(samples): sweep Device::isSurfaceLost()/Window::abandonNativeHandle() consumption to samples 01-08
+7feced3 fix(samples/09_scene): stop touching a dying surface the moment Device::isSurfaceLost() fires
+9aa578c fix(rx_platform): Window::abandonNativeHandle() skips SDL_DestroyWindow() on an already-gone handle
+a739a40 fix(rx_rhi_vk): Device enters a surface-lost terminal state instead of hard-failing when the native window is gone
+204873b feat(samples/09_scene): resizable present window + F11 fullscreen toggle
+7f94dc4 test(rx_rhi_vk): prove a real SDL_SetWindowSize() resize drives Device::recreateSwapchain() cleanly
+370b7a6 feat(rx_platform): add resizable-window flag to Window::create
+
+## Files changed
+ samples/01_triangle/main.cpp                  |  44 +++-
+ samples/02_hotreload/main.cpp                 |  44 +++-
+ samples/03_bindless_mesh/main.cpp             |  50 ++++-
+ samples/04_streaming/main.cpp                 |  44 +++-
+ samples/05_multipass/main.cpp                 |  49 ++++-
+ samples/06_materials/main.cpp                 |  49 ++++-
+ samples/07_stress/main.cpp                    |  47 +++-
+ samples/08_gltf_viewer/main.cpp               |  43 +++-
+ samples/09_scene/main.cpp                     | 302 +++++++++++++++++++++++---
+ samples/09_scene/tests/CMakeLists.txt         |   6 +
+ samples/09_scene/tests/test_window_resize.cpp |  65 ++++++
+ samples/09_scene/window_resize.h              |  72 ++++++
+ src/rx_platform/include/rx_platform/window.h  |  54 ++++-
+ src/rx_platform/src/window.cpp                |  23 +-
+ src/rx_platform/tests/window_test.cpp         |  70 ++++++
+ src/rx_rhi_vk/CMakeLists.txt                  |   8 +-
+ src/rx_rhi_vk/include/rx_rhi_vk/device.h      |  90 ++++++++
+ src/rx_rhi_vk/src/device.cpp                  |  51 +++++
+ src/rx_rhi_vk/tests/surface_loss_test.cpp     |  38 ++++
+ src/rx_rhi_vk/tests/window_state_test.cpp     |  79 ++++++-
+ 20 files changed, 1136 insertions(+), 92 deletions(-)
+
+## Diff
+diff --git a/samples/01_triangle/main.cpp b/samples/01_triangle/main.cpp
+index 987fef6..b815b27 100644
+--- a/samples/01_triangle/main.cpp
++++ b/samples/01_triangle/main.cpp
+@@ -802,42 +802,67 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
+             // re-queries the real surface extent every iteration to detect
+             // when a real size returns -- "idle until restored, no
+             // swapchain churn" (no vkb::SwapchainBuilder::build() call
+             // happens again until the extent is genuinely nonzero).
+             std::this_thread::sleep_for(std::chrono::milliseconds(16));
+             if (!device->recreateSwapchain(surface)) {
+                 RX_LOG_ERROR("Device::recreateSwapchain failed while suspended (zero-extent retry)");
+                 ok = false;
+                 break;
+             }
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] The underlying
++                // native window is gone (no advance-warning SDL event
++                // exists for a third-party destroy -- see
++                // samples/09_scene/main.cpp's own recreateSwapchainAndDependents()
++                // comment for the full investigation). A graceful stop,
++                // not a failure: mark the Window so its own teardown skips
++                // the doomed SDL_DestroyWindow() call (Window::
++                // abandonNativeHandle()'s own comment, rx_platform), then
++                // quit the loop before touching the surface again.
++                window->abandonNativeHandle();
++                quit = true;
++                continue;
++            }
+             if (!device->isSuspended()) {
+                 // Resumed this iteration -- rebuild the per-swapchain-image
+                 // resources exactly like the NeedsRecreate branch does.
+                 destroySwapchainViews(vkDevice, swapchainViews);
+                 if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
+                     !createSwapchainViews(vkDevice, *device, swapchainViews)) {
+                     RX_LOG_ERROR("swapchain view rebuild failed after resuming from suspended state");
+                     ok = false;
+                     break;
+                 }
+             }
+             continue;
+         }
+         if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
+             if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
+                 RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
+                 ok = false;
+                 break;
+             }
+             destroySwapchainViews(vkDevice, swapchainViews);
+-            if (!device->recreateSwapchain(surface) ||
+-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
++            if (!device->recreateSwapchain(surface)) {
++                RX_LOG_ERROR("swapchain recreation failed after acquireNextImage NeedsRecreate");
++                ok = false;
++                break;
++            }
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
++                // branch's own identical comment above.
++                window->abandonNativeHandle();
++                quit = true;
++                continue;
++            }
++            if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
+                 !createSwapchainViews(vkDevice, *device, swapchainViews)) {
+                 RX_LOG_ERROR("swapchain recreation failed after acquireNextImage NeedsRecreate");
+                 ok = false;
+                 break;
+             }
+             continue;
+         }
+         if (acquire.status == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("device lost during acquireNextImage; exiting present loop");
+             ok = false;
+@@ -932,23 +957,32 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
+         }
+ 
+         auto presentStatus = device->present(acquire.imageIndex, signalSem);
+         if (presentStatus == rx::rhi::SwapchainStatus::NeedsRecreate) {
+             if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
+                 RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
+                 ok = false;
+                 break;
+             }
+             destroySwapchainViews(vkDevice, swapchainViews);
+-            if (!device->recreateSwapchain(surface) ||
+-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
+-                !createSwapchainViews(vkDevice, *device, swapchainViews)) {
++            if (!device->recreateSwapchain(surface)) {
++                RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
++                ok = false;
++                break;
++            }
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
++                // branch's own identical comment above.
++                window->abandonNativeHandle();
++                quit = true;
++            } else if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
++                       !createSwapchainViews(vkDevice, *device, swapchainViews)) {
+                 RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
+                 ok = false;
+                 break;
+             }
+         } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("device lost during present; exiting present loop");
+             ok = false;
+             break;
+         }
+ 
+diff --git a/samples/02_hotreload/main.cpp b/samples/02_hotreload/main.cpp
+index 267ffaa..57b060b 100644
+--- a/samples/02_hotreload/main.cpp
++++ b/samples/02_hotreload/main.cpp
+@@ -1019,40 +1019,65 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
+         if (acquire.status == rx::rhi::SwapchainStatus::Suspended) {
+             // Zero-extent/minimize guard [Phase 4 Task 17, FG7]: see
+             // samples/01_triangle/main.cpp's runPresent() for the full
+             // rationale (same pattern, every --present sample).
+             std::this_thread::sleep_for(std::chrono::milliseconds(16));
+             if (!device->recreateSwapchain(surface)) {
+                 RX_LOG_ERROR("Device::recreateSwapchain failed while suspended (zero-extent retry)");
+                 ok = false;
+                 break;
+             }
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] The underlying
++                // native window is gone (no advance-warning SDL event
++                // exists for a third-party destroy -- see
++                // samples/09_scene/main.cpp's own recreateSwapchainAndDependents()
++                // comment for the full investigation). A graceful stop,
++                // not a failure: mark the Window so its own teardown skips
++                // the doomed SDL_DestroyWindow() call (Window::
++                // abandonNativeHandle()'s own comment, rx_platform), then
++                // quit the loop before touching the surface again.
++                window->abandonNativeHandle();
++                quit = true;
++                continue;
++            }
+             if (!device->isSuspended()) {
+                 destroySwapchainViews(vkDevice, swapchainViews);
+                 if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
+                     !createSwapchainViews(vkDevice, *device, swapchainViews)) {
+                     RX_LOG_ERROR("swapchain view rebuild failed after resuming from suspended state");
+                     ok = false;
+                     break;
+                 }
+             }
+             continue;
+         }
+         if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
+             if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
+                 RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
+                 ok = false;
+                 break;
+             }
+             destroySwapchainViews(vkDevice, swapchainViews);
+-            if (!device->recreateSwapchain(surface) ||
+-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
++            if (!device->recreateSwapchain(surface)) {
++                RX_LOG_ERROR("swapchain recreation failed after acquireNextImage NeedsRecreate");
++                ok = false;
++                break;
++            }
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
++                // branch's own identical comment above.
++                window->abandonNativeHandle();
++                quit = true;
++                continue;
++            }
++            if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
+                 !createSwapchainViews(vkDevice, *device, swapchainViews)) {
+                 RX_LOG_ERROR("swapchain recreation failed after acquireNextImage NeedsRecreate");
+                 ok = false;
+                 break;
+             }
+             continue;
+         }
+         if (acquire.status == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("device lost during acquireNextImage; exiting present loop");
+             ok = false;
+@@ -1148,23 +1173,32 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
+         }
+ 
+         auto presentStatus = device->present(acquire.imageIndex, signalSem);
+         if (presentStatus == rx::rhi::SwapchainStatus::NeedsRecreate) {
+             if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
+                 RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
+                 ok = false;
+                 break;
+             }
+             destroySwapchainViews(vkDevice, swapchainViews);
+-            if (!device->recreateSwapchain(surface) ||
+-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
+-                !createSwapchainViews(vkDevice, *device, swapchainViews)) {
++            if (!device->recreateSwapchain(surface)) {
++                RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
++                ok = false;
++                break;
++            }
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
++                // branch's own identical comment above.
++                window->abandonNativeHandle();
++                quit = true;
++            } else if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
++                       !createSwapchainViews(vkDevice, *device, swapchainViews)) {
+                 RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
+                 ok = false;
+                 break;
+             }
+         } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("device lost during present; exiting present loop");
+             ok = false;
+             break;
+         }
+ 
+diff --git a/samples/03_bindless_mesh/main.cpp b/samples/03_bindless_mesh/main.cpp
+index 9ffe229..9317ad4 100644
+--- a/samples/03_bindless_mesh/main.cpp
++++ b/samples/03_bindless_mesh/main.cpp
+@@ -1459,40 +1459,65 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
+             // 01_triangle, this sample also owns a depth buffer sized off
+             // the swapchain extent -- rebuildDepthAndViews() only runs once
+             // isSuspended() is confirmed false (a 0x0 depth image create
+             // would itself be a validation error).
+             std::this_thread::sleep_for(std::chrono::milliseconds(16));
+             if (!device->recreateSwapchain(surface)) {
+                 RX_LOG_ERROR("Device::recreateSwapchain failed while suspended (zero-extent retry)");
+                 ok = false;
+                 break;
+             }
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] The underlying
++                // native window is gone (no advance-warning SDL event
++                // exists for a third-party destroy -- see
++                // samples/09_scene/main.cpp's own recreateSwapchainAndDependents()
++                // comment for the full investigation). A graceful stop,
++                // not a failure: mark the Window so its own teardown skips
++                // the doomed SDL_DestroyWindow() call (Window::
++                // abandonNativeHandle()'s own comment, rx_platform), then
++                // quit the loop before touching the surface again.
++                window->abandonNativeHandle();
++                quit = true;
++                continue;
++            }
+             if (!device->isSuspended()) {
+                 if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
+                     !rebuildDepthAndViews()) {
+                     RX_LOG_ERROR("swapchain/depth rebuild failed after resuming from suspended state");
+                     ok = false;
+                     break;
+                 }
+             }
+             continue;
+         }
+         if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
+             if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
+                 RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
+                 ok = false;
+                 break;
+             }
+             destroySwapchainViews();
+             depth.reset();
+-            if (!device->recreateSwapchain(surface) ||
+-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size()))) {
++            if (!device->recreateSwapchain(surface)) {
++                RX_LOG_ERROR("swapchain recreation failed after acquireNextImage NeedsRecreate");
++                ok = false;
++                break;
++            }
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
++                // branch's own identical comment above.
++                window->abandonNativeHandle();
++                quit = true;
++                continue;
++            }
++            if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size()))) {
+                 RX_LOG_ERROR("swapchain recreation failed after acquireNextImage NeedsRecreate");
+                 ok = false;
+                 break;
+             }
+             // [Phase 4 Task 17, FG7] A genuinely zero-extent resize (real
+             // minimize on X11/Win32) lands HERE too -- recreateSwapchain()
+             // above still returns true (it entered the suspended state
+             // successfully), but there is no real swapchain to rebuild
+             // per-extent resources against yet.
+             if (!device->isSuspended()) {
+@@ -1615,30 +1640,39 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
+ 
+         auto presentStatus = device->present(acquire.imageIndex, signalSem);
+         if (presentStatus == rx::rhi::SwapchainStatus::NeedsRecreate) {
+             if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
+                 RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
+                 ok = false;
+                 break;
+             }
+             destroySwapchainViews();
+             depth.reset();
+-            if (!device->recreateSwapchain(surface) ||
+-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size()))) {
++            if (!device->recreateSwapchain(surface)) {
+                 RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
+                 ok = false;
+                 break;
+             }
+-            // [Phase 4 Task 17, FG7] Same zero-extent guard as the acquire
+-            // branch above -- recreateSwapchain() may have entered the
+-            // suspended state instead of rebuilding a real swapchain.
+-            if (!device->isSuspended()) {
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
++                // branch's own identical comment above.
++                window->abandonNativeHandle();
++                quit = true;
++            } else if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size()))) {
++                RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
++                ok = false;
++                break;
++            } else if (!device->isSuspended()) {
++                // [Phase 4 Task 17, FG7] Same zero-extent guard as the
++                // acquire branch above -- recreateSwapchain() may have
++                // entered the suspended state instead of rebuilding a real
++                // swapchain.
+                 if (!rebuildDepthAndViews()) {
+                     ok = false;
+                     break;
+                 }
+             }
+         } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("device lost during present; exiting present loop");
+             ok = false;
+             break;
+         }
+diff --git a/samples/04_streaming/main.cpp b/samples/04_streaming/main.cpp
+index 56f906f..56c8691 100644
+--- a/samples/04_streaming/main.cpp
++++ b/samples/04_streaming/main.cpp
+@@ -1772,40 +1772,65 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
+         if (acquire.status == rx::rhi::SwapchainStatus::Suspended) {
+             // Zero-extent/minimize guard [Phase 4 Task 17, FG7]: see
+             // samples/01_triangle/main.cpp's runPresent() for the full
+             // rationale (same pattern, every --present sample).
+             std::this_thread::sleep_for(std::chrono::milliseconds(16));
+             if (!device->recreateSwapchain(surface)) {
+                 RX_LOG_ERROR("Device::recreateSwapchain failed while suspended (zero-extent retry)");
+                 ok = false;
+                 break;
+             }
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] The underlying
++                // native window is gone (no advance-warning SDL event
++                // exists for a third-party destroy -- see
++                // samples/09_scene/main.cpp's own recreateSwapchainAndDependents()
++                // comment for the full investigation). A graceful stop,
++                // not a failure: mark the Window so its own teardown skips
++                // the doomed SDL_DestroyWindow() call (Window::
++                // abandonNativeHandle()'s own comment, rx_platform), then
++                // quit the loop before touching the surface again.
++                window->abandonNativeHandle();
++                quit = true;
++                continue;
++            }
+             if (!device->isSuspended()) {
+                 destroySwapchainViews();
+                 if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
+                     !createSwapchainViews()) {
+                     RX_LOG_ERROR("swapchain view rebuild failed after resuming from suspended state");
+                     ok = false;
+                     break;
+                 }
+             }
+             continue;
+         }
+         if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
+             if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
+                 RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
+                 ok = false;
+                 break;
+             }
+             destroySwapchainViews();
+-            if (!device->recreateSwapchain(surface) ||
+-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
++            if (!device->recreateSwapchain(surface)) {
++                RX_LOG_ERROR("swapchain recreation failed after acquireNextImage NeedsRecreate");
++                ok = false;
++                break;
++            }
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
++                // branch's own identical comment above.
++                window->abandonNativeHandle();
++                quit = true;
++                continue;
++            }
++            if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
+                 !createSwapchainViews()) {
+                 RX_LOG_ERROR("swapchain recreation failed after acquireNextImage NeedsRecreate");
+                 ok = false;
+                 break;
+             }
+             continue;
+         }
+         if (acquire.status == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("device lost during acquireNextImage; exiting present loop");
+             ok = false;
+@@ -1908,23 +1933,32 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
+         }
+ 
+         auto presentStatus = device->present(acquire.imageIndex, signalSem);
+         if (presentStatus == rx::rhi::SwapchainStatus::NeedsRecreate) {
+             if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
+                 RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
+                 ok = false;
+                 break;
+             }
+             destroySwapchainViews();
+-            if (!device->recreateSwapchain(surface) ||
+-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
+-                !createSwapchainViews()) {
++            if (!device->recreateSwapchain(surface)) {
++                RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
++                ok = false;
++                break;
++            }
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
++                // branch's own identical comment above.
++                window->abandonNativeHandle();
++                quit = true;
++            } else if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
++                       !createSwapchainViews()) {
+                 RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
+                 ok = false;
+                 break;
+             }
+         } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("device lost during present; exiting present loop");
+             ok = false;
+             break;
+         }
+ 
+diff --git a/samples/05_multipass/main.cpp b/samples/05_multipass/main.cpp
+index 12ef049..2952f20 100644
+--- a/samples/05_multipass/main.cpp
++++ b/samples/05_multipass/main.cpp
+@@ -2144,41 +2144,66 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
+             // swapchain extent -- unlike executor->realize() alone, this
+             // WOULD create an invalid 0x0 transient image if run while
+             // still suspended, so it only runs once isSuspended() is
+             // confirmed false, exactly like the NeedsRecreate branch below.
+             std::this_thread::sleep_for(std::chrono::milliseconds(16));
+             if (!device->recreateSwapchain(surface)) {
+                 RX_LOG_ERROR("Device::recreateSwapchain failed while suspended (zero-extent retry)");
+                 ok = false;
+                 break;
+             }
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] The underlying
++                // native window is gone (no advance-warning SDL event
++                // exists for a third-party destroy -- see
++                // samples/09_scene/main.cpp's own recreateSwapchainAndDependents()
++                // comment for the full investigation). A graceful stop,
++                // not a failure: mark the Window so its own teardown skips
++                // the doomed SDL_DestroyWindow() call (Window::
++                // abandonNativeHandle()'s own comment, rx_platform), then
++                // quit the loop before touching the surface again.
++                window->abandonNativeHandle();
++                quit = true;
++                continue;
++            }
+             if (!device->isSuspended()) {
+                 destroySwapchainViews();
+                 if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
+                     !createSwapchainViews()) {
+                     RX_LOG_ERROR("swapchain view rebuild failed after resuming from suspended state");
+                     ok = false;
+                     break;
+                 }
+                 compileForExtent(device->swapchainExtent());
+             }
+             continue;
+         }
+         if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
+             if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
+                 RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
+                 ok = false;
+                 break;
+             }
+             destroySwapchainViews();
+-            if (!device->recreateSwapchain(surface) ||
+-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
++            if (!device->recreateSwapchain(surface)) {
++                RX_LOG_ERROR("swapchain recreation failed after acquireNextImage NeedsRecreate");
++                ok = false;
++                break;
++            }
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
++                // branch's own identical comment above.
++                window->abandonNativeHandle();
++                quit = true;
++                continue;
++            }
++            if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
+                 !createSwapchainViews()) {
+                 RX_LOG_ERROR("swapchain recreation failed after acquireNextImage NeedsRecreate");
+                 ok = false;
+                 break;
+             }
+             // Re-derive every SwapchainRelative resource's real extent
+             // (recompile + re-realize) immediately -- device is provably
+             // idle (just waited above) and nothing has been submitted
+             // since, so the NEXT execute() call's own bindless
+             // re-registration (recordLitDraws()/recordTonemapDraw(), on
+@@ -2257,30 +2282,38 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
+         }
+ 
+         auto presentStatus = device->present(acquire.imageIndex, signalSem);
+         if (presentStatus == rx::rhi::SwapchainStatus::NeedsRecreate) {
+             if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
+                 RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
+                 ok = false;
+                 break;
+             }
+             destroySwapchainViews();
+-            if (!device->recreateSwapchain(surface) ||
+-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
+-                !createSwapchainViews()) {
++            if (!device->recreateSwapchain(surface)) {
+                 RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
+                 ok = false;
+                 break;
+             }
+-            // [Phase 4 Task 17, FG7] Same zero-extent guard as the acquire
+-            // branch above.
+-            if (!device->isSuspended()) {
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
++                // branch's own identical comment above.
++                window->abandonNativeHandle();
++                quit = true;
++            } else if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
++                       !createSwapchainViews()) {
++                RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
++                ok = false;
++                break;
++            } else if (!device->isSuspended()) {
++                // [Phase 4 Task 17, FG7] Same zero-extent guard as the
++                // acquire branch above.
+                 compileForExtent(device->swapchainExtent());
+             }
+         } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("device lost during present; exiting present loop");
+             ok = false;
+             break;
+         }
+ 
+         // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3,
+         // spec D3] -- present-mode path, right after this frame's present/
+diff --git a/samples/06_materials/main.cpp b/samples/06_materials/main.cpp
+index 4ac29d2..bd7a91b 100644
+--- a/samples/06_materials/main.cpp
++++ b/samples/06_materials/main.cpp
+@@ -1801,41 +1801,66 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
+             // the LIVE swapchain extent -- unlike executor->realize() alone,
+             // this WOULD create an invalid 0x0 transient image if run while
+             // still suspended, so it only runs once isSuspended() is
+             // confirmed false, exactly like the NeedsRecreate branch below.
+             std::this_thread::sleep_for(std::chrono::milliseconds(16));
+             if (!device->recreateSwapchain(surface)) {
+                 RX_LOG_ERROR("Device::recreateSwapchain failed while suspended (zero-extent retry)");
+                 ok = false;
+                 break;
+             }
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] The underlying
++                // native window is gone (no advance-warning SDL event
++                // exists for a third-party destroy -- see
++                // samples/09_scene/main.cpp's own recreateSwapchainAndDependents()
++                // comment for the full investigation). A graceful stop,
++                // not a failure: mark the Window so its own teardown skips
++                // the doomed SDL_DestroyWindow() call (Window::
++                // abandonNativeHandle()'s own comment, rx_platform), then
++                // quit the loop before touching the surface again.
++                window->abandonNativeHandle();
++                quit = true;
++                continue;
++            }
+             if (!device->isSuspended()) {
+                 destroySwapchainViews();
+                 if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
+                     !createSwapchainViews()) {
+                     RX_LOG_ERROR("swapchain view rebuild failed after resuming from suspended state");
+                     ok = false;
+                     break;
+                 }
+                 compileForExtent(device->swapchainExtent());
+             }
+             continue;
+         }
+         if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
+             if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
+                 RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
+                 ok = false;
+                 break;
+             }
+             destroySwapchainViews();
+-            if (!device->recreateSwapchain(surface) ||
+-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
++            if (!device->recreateSwapchain(surface)) {
++                RX_LOG_ERROR("swapchain recreation failed after acquireNextImage NeedsRecreate");
++                ok = false;
++                break;
++            }
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
++                // branch's own identical comment above.
++                window->abandonNativeHandle();
++                quit = true;
++                continue;
++            }
++            if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
+                 !createSwapchainViews()) {
+                 RX_LOG_ERROR("swapchain recreation failed after acquireNextImage NeedsRecreate");
+                 ok = false;
+                 break;
+             }
+             // [Phase 4 Task 17, FG7] A genuinely zero-extent resize (real
+             // minimize on X11/Win32) lands HERE too -- recreateSwapchain()
+             // above still returns true (it entered the suspended state
+             // successfully), but compileForExtent() must not run against a
+             // 0x0 extent.
+@@ -1911,30 +1936,38 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
+         lastSubmittedFrameNumber[frameSync->currentFrameIndex()] = frameSync->frameNumber();
+ 
+         auto presentStatus = device->present(acquire.imageIndex, signalSem);
+         if (presentStatus == rx::rhi::SwapchainStatus::NeedsRecreate) {
+             if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
+                 RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
+                 ok = false;
+                 break;
+             }
+             destroySwapchainViews();
+-            if (!device->recreateSwapchain(surface) ||
+-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
+-                !createSwapchainViews()) {
++            if (!device->recreateSwapchain(surface)) {
+                 RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
+                 ok = false;
+                 break;
+             }
+-            // [Phase 4 Task 17, FG7] Same zero-extent guard as the acquire
+-            // branch above.
+-            if (!device->isSuspended()) {
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
++                // branch's own identical comment above.
++                window->abandonNativeHandle();
++                quit = true;
++            } else if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
++                       !createSwapchainViews()) {
++                RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
++                ok = false;
++                break;
++            } else if (!device->isSuspended()) {
++                // [Phase 4 Task 17, FG7] Same zero-extent guard as the
++                // acquire branch above.
+                 compileForExtent(device->swapchainExtent());
+             }
+         } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("device lost during present; exiting present loop");
+             ok = false;
+             break;
+         }
+ 
+         // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3,
+         // spec D3] -- present-mode path, right after this frame's present/
+diff --git a/samples/07_stress/main.cpp b/samples/07_stress/main.cpp
+index f697228..301063c 100644
+--- a/samples/07_stress/main.cpp
++++ b/samples/07_stress/main.cpp
+@@ -1669,36 +1669,61 @@ int runPresent(const Args& args) {
+             // resources sized off the ORIGINAL, startup-time compile, never
+             // the live swapchain extent), so no extra isSuspended() guard
+             // is needed around it beyond the rebuild-only-once-resumed
+             // shape every other guard in this file already uses.
+             std::this_thread::sleep_for(std::chrono::milliseconds(16));
+             if (!device->recreateSwapchain(surface)) {
+                 RX_LOG_ERROR("Device::recreateSwapchain failed while suspended (zero-extent retry)");
+                 ok = false;
+                 break;
+             }
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] The underlying
++                // native window is gone (no advance-warning SDL event
++                // exists for a third-party destroy -- see
++                // samples/09_scene/main.cpp's own recreateSwapchainAndDependents()
++                // comment for the full investigation). A graceful stop,
++                // not a failure: mark the Window so its own teardown skips
++                // the doomed SDL_DestroyWindow() call (Window::
++                // abandonNativeHandle()'s own comment, rx_platform), then
++                // quit the loop before touching the surface again.
++                window->abandonNativeHandle();
++                running = false;
++                continue;
++            }
+             if (!device->isSuspended()) {
+                 if (!rebuildSwapchainViews() ||
+                     !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size()))) {
+                     RX_LOG_ERROR("swapchain view rebuild failed after resuming from suspended state");
+                     ok = false;
+                     break;
+                 }
+                 executor->realize(graph);
+                 scene->viewProj = makeCameraViewProj(args.draws, device->swapchainExtent().width,
+                                                       device->swapchainExtent().height);
+             }
+             continue;
+         }
+         if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
+             vkDeviceWaitIdle(vkDevice);
+-            if (!device->recreateSwapchain(surface) || !rebuildSwapchainViews() ||
++            if (!device->recreateSwapchain(surface)) {
++                ok = false;
++                break;
++            }
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
++                // branch's own identical comment above.
++                window->abandonNativeHandle();
++                running = false;
++                continue;
++            }
++            if (!rebuildSwapchainViews() ||
+                 !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size()))) {
+                 ok = false;
+                 break;
+             }
+             executor->realize(graph);
+             scene->viewProj =
+                 makeCameraViewProj(args.draws, device->swapchainExtent().width, device->swapchainExtent().height);
+             continue;
+         }
+         if (acquire.status == rx::rhi::SwapchainStatus::DeviceLost) {
+@@ -1738,28 +1763,38 @@ int runPresent(const Args& args) {
+         submitInfo.signalSemaphoreCount = 1;
+         submitInfo.pSignalSemaphores = &signalSem;
+         if (vkQueueSubmit(device->graphicsQueue(), 1, &submitInfo, fence) != VK_SUCCESS) {
+             ok = false;
+             break;
+         }
+ 
+         auto presentStatus = device->present(acquire.imageIndex, signalSem);
+         if (presentStatus == rx::rhi::SwapchainStatus::NeedsRecreate) {
+             vkDeviceWaitIdle(vkDevice);
+-            if (!device->recreateSwapchain(surface) || !rebuildSwapchainViews() ||
+-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size()))) {
++            if (!device->recreateSwapchain(surface)) {
+                 ok = false;
+                 break;
+             }
+-            executor->realize(graph);
+-            scene->viewProj =
+-                makeCameraViewProj(args.draws, device->swapchainExtent().width, device->swapchainExtent().height);
++            if (device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
++                // branch's own identical comment above.
++                window->abandonNativeHandle();
++                running = false;
++            } else if (!rebuildSwapchainViews() ||
++                       !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size()))) {
++                ok = false;
++                break;
++            } else {
++                executor->realize(graph);
++                scene->viewProj = makeCameraViewProj(args.draws, device->swapchainExtent().width,
++                                                      device->swapchainExtent().height);
++            }
+         } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("device lost during present; exiting present loop");
+             ok = false;
+             break;
+         }
+ 
+         frameSync->advanceFrame();
+         RX_FRAME_MARK;
+ 
+         // Per-second stdout stats [task-7-brief.md: "per-second stdout
+diff --git a/samples/08_gltf_viewer/main.cpp b/samples/08_gltf_viewer/main.cpp
+index 943524a..823818a 100644
+--- a/samples/08_gltf_viewer/main.cpp
++++ b/samples/08_gltf_viewer/main.cpp
+@@ -2315,35 +2315,60 @@ int runPresent(const Args& args) {
+             // startup-time compile, never the live swapchain extent), so no
+             // extra isSuspended() guard is needed around it beyond the
+             // rebuild-only-once-resumed shape used below.
+             std::this_thread::sleep_for(std::chrono::milliseconds(16));
+             if (!app->device->recreateSwapchain(app->surface)) {
+                 RX_LOG_ERROR("sample_08_gltf_viewer: Device::recreateSwapchain failed while suspended (zero-extent "
+                              "retry)");
+                 ok = false;
+                 break;
+             }
++            if (app->device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] The underlying
++                // native window is gone (no advance-warning SDL event
++                // exists for a third-party destroy -- see
++                // samples/09_scene/main.cpp's own recreateSwapchainAndDependents()
++                // comment for the full investigation). A graceful stop,
++                // not a failure: mark the Window so its own teardown skips
++                // the doomed SDL_DestroyWindow() call (Window::
++                // abandonNativeHandle()'s own comment, rx_platform), then
++                // quit the loop before touching the surface again.
++                app->window->abandonNativeHandle();
++                running = false;
++                continue;
++            }
+             if (!app->device->isSuspended()) {
+                 if (!rebuildSwapchainViews() ||
+                     !frameSync->onSwapchainRecreated(static_cast<uint32_t>(app->device->swapchainImages().size()))) {
+                     RX_LOG_ERROR("sample_08_gltf_viewer: swapchain view rebuild failed after resuming from "
+                                  "suspended state");
+                     ok = false;
+                     break;
+                 }
+                 app->executor->realize(graph);
+             }
+             continue;
+         }
+         if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
+             vkDeviceWaitIdle(vkDevice);
+-            if (!app->device->recreateSwapchain(app->surface) || !rebuildSwapchainViews() ||
++            if (!app->device->recreateSwapchain(app->surface)) {
++                ok = false;
++                break;
++            }
++            if (app->device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
++                // branch's own identical comment above.
++                app->window->abandonNativeHandle();
++                running = false;
++                continue;
++            }
++            if (!rebuildSwapchainViews() ||
+                 !frameSync->onSwapchainRecreated(static_cast<uint32_t>(app->device->swapchainImages().size()))) {
+                 ok = false;
+                 break;
+             }
+             app->executor->realize(graph);
+             continue;
+         }
+         if (acquire.status == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("sample_08_gltf_viewer: device lost during acquireNextImage; exiting present loop");
+             ok = false;
+@@ -2393,26 +2418,36 @@ int runPresent(const Args& args) {
+         submitInfo.signalSemaphoreCount = 1;
+         submitInfo.pSignalSemaphores = &signalSem;
+         if (vkQueueSubmit(app->device->graphicsQueue(), 1, &submitInfo, fence) != VK_SUCCESS) {
+             ok = false;
+             break;
+         }
+ 
+         auto presentStatus = app->device->present(acquire.imageIndex, signalSem);
+         if (presentStatus == rx::rhi::SwapchainStatus::NeedsRecreate) {
+             vkDeviceWaitIdle(vkDevice);
+-            if (!app->device->recreateSwapchain(app->surface) || !rebuildSwapchainViews() ||
+-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(app->device->swapchainImages().size()))) {
++            if (!app->device->recreateSwapchain(app->surface)) {
+                 ok = false;
+                 break;
+             }
+-            app->executor->realize(graph);
++            if (app->device->isSurfaceLost()) {
++                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
++                // branch's own identical comment above.
++                app->window->abandonNativeHandle();
++                running = false;
++            } else if (!rebuildSwapchainViews() ||
++                       !frameSync->onSwapchainRecreated(static_cast<uint32_t>(app->device->swapchainImages().size()))) {
++                ok = false;
++                break;
++            } else {
++                app->executor->realize(graph);
++            }
+         } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("sample_08_gltf_viewer: device lost during present; exiting present loop");
+             ok = false;
+             break;
+         }
+ 
+         frameSync->advanceFrame();
+         RX_FRAME_MARK;
+     }
+ 
+diff --git a/samples/09_scene/main.cpp b/samples/09_scene/main.cpp
+index 4cb31ae..c364cc5 100644
+--- a/samples/09_scene/main.cpp
++++ b/samples/09_scene/main.cpp
+@@ -93,20 +93,21 @@
+ #include <rx_shader/compiler.h>
+ #include <rx_shader/reflection.h>
+ #include <rx_shadow/shadow_caster_pipeline.h>
+ #include <rx_shadow/shadow_frustum.h>
+ #include <rx_task/scheduler.h>
+ 
+ #include "draw_recording.h"
+ #include "fly_camera.h"
+ #include "grid_layout.h"
+ #include "mouse_capture.h"
++#include "window_resize.h"
+ #include <reference_gate.h>
+ 
+ #define GLM_FORCE_DEPTH_ZERO_TO_ONE
+ #include <glm/glm.hpp>
+ #include <glm/gtc/matrix_transform.hpp>
+ #include <glm/gtc/quaternion.hpp>
+ 
+ #include <SDL3/SDL.h>
+ #include <imgui.h>
+ #include <volk.h>
+@@ -296,20 +297,27 @@ using rx::samples9::keyboardDrivesCamera;
+ // this ticket is entirely about: main.cpp never called
+ // rx::platform::Window::setRelativeMouseMode() at all). The struct itself,
+ // and the composed mouse-look decision updateFlyCamera() below drives it
+ // with, live in mouse_capture.h -- device-free, unit-tested directly
+ // (tests/test_mouse_capture.cpp), same "pull pure logic out of main.cpp"
+ // precedent fly_camera.h already established just above.
+ using rx::samples9::FlyThroughCaptureState;
+ using rx::samples9::mouseDeltaDrivesCamera;
+ using rx::samples9::escTogglesCapture;
+ 
++// --- Live resize + runtime fullscreen toggle [Issue #36] ------------------
++// f11TogglesFullscreen()/pixelSizeRequiresRecreate() -- pure decisions
++// window_resize.h documents in full; runPresent() below is the sole
++// consumer.
++using rx::samples9::f11TogglesFullscreen;
++using rx::samples9::pixelSizeRequiresRecreate;
++
+ // --- Shared pass infra [tonemap pass -- shaders/multipass/tonemap.{vert,
+ // frag}.slang, VERBATIM -- same convention samples/07_stress/08_gltf_viewer's
+ // own copies establish] ---------------------------------------------------
+ struct TonemapPushConstants {
+     uint32_t hdrTextureIndex;
+     uint32_t hdrSamplerIndex;
+ };
+ 
+ struct CompiledPass {
+     VkShaderModule vertModule = VK_NULL_HANDLE;
+@@ -851,27 +859,32 @@ struct App {
+     FlyThroughCaptureState mouseCapture;
+ 
+     bool sceneReady = false;  // grid mode: false until the sync import + buildHelmetGrid() complete.
+ };
+ 
+ // Builds every field up to (but not including) scene content -- device/
+ // allocator/uploader/bindless/materialSystem/geometryPool/textureCache/
+ // scheduler/executor, the shadow-caster pipeline, the tonemap pipeline, and
+ // the shared material-param descriptor infrastructure. Returns nullptr
+ // (logged) on any failure.
++//
++// `resizable` [Issue #36] defaults to false (runHeadless()'s own call site
++// below never passes it -- a hidden headless window has nothing for a user
++// to drag-resize); runPresent() passes true, so its --present window
++// carries SDL_WINDOW_RESIZABLE from creation.
+ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uint32_t height, bool visible,
+-                              bool validate, bool stressMode) {
++                              bool validate, bool stressMode, bool resizable = false) {
+     auto app = std::make_unique<App>();
+     app->stressMode = stressMode;
+ 
+     auto window = rx::platform::Window::create(windowTitle.c_str(), static_cast<int>(width), static_cast<int>(height),
+-                                                 visible);
++                                                 visible, resizable);
+     if (!window.has_value()) {
+         RX_LOG_ERROR("sample_09_scene: Window::create failed: no display backend available");
+         return nullptr;
+     }
+     auto extensions = window->requiredVulkanInstanceExtensions();
+     if (extensions.empty()) {
+         RX_LOG_ERROR("sample_09_scene: video driver reports no Vulkan surface extensions");
+         return nullptr;
+     }
+     auto context = rx::rhi::Context::create(extensions, validate);
+@@ -2352,67 +2365,82 @@ void declareGraph(rx::graph::RenderGraph& graph, App& app, VkFormat backbufferFo
+     }
+ 
+     graph.setBackbufferSource("backbuffer");
+ }
+ 
+ // --- HUD widgets [matrix rows 18-20; gate ruling #15] ---------------------
+ // Draws the real ImGui widget content this task's own HUD content list
+ // requires. Called between `overlay->beginFrame()` and `executor->execute()`
+ // -- see runHeadless()'s own two-frame split (D17-gated capture draws NO
+ // widgets at all; the separate HUD-smoke-test frame calls this).
+-void drawHud(App& app, rx::rhi::Device& device, VkSurfaceKHR surface, bool presentMode) {
++void drawHud(App& app, bool presentMode) {
+     // Explicit size on first appearance -- avoids Dear ImGui's own "brand
+     // new auto-fit window's first frame only measures content, doesn't
+     // draw it" behavior (src/rx_debug_ui/tests/test_overlay_gpu.cpp's own
+     // GPU test sets both position AND size for the identical reason).
+     ImGui::SetNextWindowSize(ImVec2(280.0F, 420.0F), ImGuiCond_FirstUseEver);
+     ImGui::Begin("sample_09_scene");
+ 
+     ImGui::Text("Frame: %.3f ms  |  FPS (60-frame avg): %.1f", app.hud.lastFrameMs, app.hud.rollingFps());
+     // [Issue #33] Present-mode-only -- runHeadless() never touches
+     // app.mouseCapture (no real OS cursor to report on against a hidden
+     // window). Human-observable confirmation of the current relative-
+     // mouse-capture state and how to change it, for the MANUAL_VERIFICATION
+     // checklist's own capture/release/Esc/HUD-interaction rows.
+     if (presentMode) {
+         ImGui::Text("Mouse: %s  (Esc: toggle release/recapture%s)", app.mouseCapture.captured() ? "CAPTURED" : "RELEASED",
+                     app.mouseCapture.captured() ? "" : ", click viewport: recapture");
++        // [Issue #36] Human-observable confirmation of the current window
++        // mode and how to change it -- mirrors the Mouse line just above
++        // (same "state + how to change it" HUD convention this sample
++        // already established for Issue #33), for this task's own
++        // MANUAL_VERIFICATION checklist's resize/fullscreen rows. The
++        // window itself is always resizable in --present mode (drag any
++        // edge/corner) in addition to this toggle.
++        ImGui::Text("Window: %s  (F11: toggle fullscreen, drag edges to resize)",
++                    app.window->isFullscreen() ? "FULLSCREEN" : "WINDOWED");
+     }
+     ImGui::Separator();
+ 
+     ImGui::Text("Cull counters");
+     ImGui::Text("  imported/candidates: %u", app.viewLists.counters.totalCandidates);
+     ImGui::Text("  culled (layer+frustum): %u (layer=%u frustum=%u)",
+                 app.viewLists.counters.culledByLayerMask + app.viewLists.counters.culledByFrustum,
+                 app.viewLists.counters.culledByLayerMask, app.viewLists.counters.culledByFrustum);
+     ImGui::Text("  visible: %u", app.viewLists.counters.visible);
+     ImGui::Text("  recordsIn: %u  drawsSubmitted: %u", app.viewLists.counters.recordsIn, app.viewLists.counters.drawsSubmitted);
+     const double collapseRatio = app.viewLists.counters.recordsIn > 0
+                                       ? 100.0 * (1.0 - static_cast<double>(app.viewLists.counters.drawsSubmitted) /
+                                                             static_cast<double>(app.viewLists.counters.recordsIn))
+                                       : 0.0;
+     ImGui::Text("  instancing-collapse ratio: %.2f%%", collapseRatio);
+     ImGui::Separator();
+ 
+-    // vsync toggle -- the SAME setPresentMode+recreateSwapchain path the
+-    // --vsync CLI flag drives (present mode only; no live swapchain to
+-    // toggle headless).
++    // vsync toggle -- ImGui::Checkbox only MUTATES app.hud.vsyncOn here;
++    // applying it (Device::setPresentMode() + the SAME recreation path a
++    // resize/fullscreen toggle drives) is deferred to runPresent()'s own
++    // loop [Issue #36 fix-in-round], at the top of the NEXT frame, before
++    // that frame's own acquireNextImage(). Applying it HERE, inline, used
++    // to call Device::recreateSwapchain() directly (mid-frame, AFTER
++    // acquireNextImage() had already fixed this frame's `acquire.
++    // imageIndex` and AFTER vkBeginCommandBuffer() had already started
++    // recording against the swapchain images valid at acquire time) --
++    // recreateSwapchain() destroys and rebuilds the ENTIRE VkSwapchainKHR
++    // for a present-mode change (not merely "the same images, different
++    // timing"), which left `acquire.imageIndex`/the swapchain image views/
++    // FrameSync's per-image sync objects referencing since-destroyed state
++    // for the remainder of that same frame -- a real bug, closed by this
++    // sample's own "exactly one recreation call site, called only from a
++    // safe pre-acquire point" design rule (Task 17; see
++    // recreateSwapchainAndDependents() in runPresent()).
+     if (presentMode) {
+-        if (ImGui::Checkbox("vsync", &app.hud.vsyncOn)) {
+-            const rx::rhi::PresentMode mode = app.hud.vsyncOn ? rx::rhi::PresentMode::VsyncOn : rx::rhi::PresentMode::VsyncOff;
+-            device.setPresentMode(mode);
+-            if (!device.recreateSwapchain(surface)) {
+-                RX_LOG_ERROR("sample_09_scene: recreateSwapchain failed applying the HUD vsync toggle");
+-            } else {
+-                RX_LOG_INFO("sample_09_scene: --present: present mode in use: {}", rx::rhi::presentModeName(device.presentMode()));
+-            }
+-        }
++        ImGui::Checkbox("vsync", &app.hud.vsyncOn);
+     } else {
+         ImGui::Text("vsync: %s (present-mode only)", app.hud.vsyncOn ? "on" : "off");
+     }
+     ImGui::Separator();
+ 
+     // TWO VISIBLY DISTINCT MASK CONTROLS [gate ruling #15]: layer-mask
+     // (camera cullMask u32, visibility ONLY) vs light-channel (u8,
+     // lighting/shadow-casting ONLY) -- never one shared control.
+     ImGui::Text("Layer-mask instance-group toggles (visibility ONLY -- camera.cullMask, u32)");
+     bool cullMaskChanged = false;
+@@ -2909,21 +2937,21 @@ int runHeadless(const Args& args) {
+             gateOk = false;
+         }
+     }
+ #endif
+ 
+     // --- HUD smoke-test frame [matrix row 16] -- real widgets, NOT
+     // pixel-gated. ---------------------------------------------------------
+     updateSceneFrame(*app, *app->scheduler);
+     uploadSceneFrameGpuBuffers(*app, /*frameSlot=*/0);  // [I1] headless: always slot 0.
+     app->overlay->beginFrame();
+-    drawHud(*app, *app->device, app->surface, /*presentMode=*/false);
++    drawHud(*app, /*presentMode=*/false);
+     std::vector<uint8_t> hudFramePixels = captureFrame();
+     (void)hudFramePixels;
+     const ImDrawData* hudDrawData = ImGui::GetDrawData();
+     if (hudDrawData == nullptr || hudDrawData->CmdListsCount == 0 || hudDrawData->TotalVtxCount == 0) {
+         RX_LOG_ERROR("sample_09_scene: HUD overlay pass produced no draw data (CmdListsCount={}, TotalVtxCount={})",
+                      hudDrawData != nullptr ? hudDrawData->CmdListsCount : -1, hudDrawData != nullptr ? hudDrawData->TotalVtxCount : -1);
+         gateOk = false;
+     }
+ 
+     // --- --write-references escape hatch [D17].
+@@ -3024,21 +3052,22 @@ int runHeadless(const Args& args) {
+     if (gateOk) {
+         RX_LOG_INFO("sample_09_scene: headless gate PASSED");
+         return 0;
+     }
+     RX_LOG_ERROR("sample_09_scene: headless gate FAILED");
+     return 1;
+ }
+ 
+ // --- Present mode: interactive window, fly-through camera, real HUD ------
+ int runPresent(const Args& args) {
+-    auto app = makeApp("RendererX -- 09_scene", kPresentWidth, kPresentHeight, /*visible=*/true, args.validate, args.stress);
++    auto app = makeApp("RendererX -- 09_scene", kPresentWidth, kPresentHeight, /*visible=*/true, args.validate, args.stress,
++                        /*resizable=*/true);
+     if (app == nullptr) {
+         return 1;
+     }
+     app->hud.vsyncOn = (args.vsyncMode == rx::rhi::PresentMode::VsyncOn);
+ 
+     if (args.vsyncMode == rx::rhi::PresentMode::VsyncOff) {
+         app->device->setPresentMode(args.vsyncMode);
+         if (!app->device->recreateSwapchain(app->surface)) {
+             RX_LOG_ERROR("sample_09_scene: Device::recreateSwapchain failed while applying --vsync off");
+             destroyApp(*app);
+@@ -3230,112 +3259,309 @@ int runPresent(const Args& args) {
+             swapchainViews.push_back(view);
+         }
+         return true;
+     };
+     if (!rebuildSwapchainViews()) {
+         frameSync.reset();
+         destroyApp(*app);
+         return 1;
+     }
+ 
++    // [Issue #36] THE single Device::recreateSwapchain() call site every
++    // extent-changing/present-mode-changing/fullscreen-toggling event in
++    // this loop funnels through -- Task 17's own explicit design rule (see
++    // src/rx_rhi_vk/tests/window_state_test.cpp's own "Exactly one
++    // recreation call site" comment on the fullscreen double-toggle test).
++    // Re-derives compileInfo's width/height/format from the FRESHLY
++    // queried Device::swapchainExtent()/swapchainFormat() and re-runs
++    // RenderGraph::compile() BEFORE Executor::realize() -- NOT realize()
++    // alone: RenderGraph::compile() is the only place a SwapchainRelative
++    // AttachmentDesc (rx_graph/resources.h) is resolved from CompileInfo
++    // into a real pixel extent; skipping straight to realize() with a
++    // stale compiled shape would silently leave every SwapchainRelative
++    // pooled resource this graph declares ("hdr"/"depth", declareGraph()
++    // above) at the OLD extent while the backbuffer itself already
++    // resized -- Executor::realize()'s own header comment documents
++    // calling it again after such a recompile as safe/expected
++    // (src/rx_graph/tests/test_execute_gpu.cpp's own "resize-rerealize"
++    // TEST_CASE already proves the rx_graph half of this generically); the
++    // gap this closes is that nothing in this sample called compile()
++    // again on ANY of its pre-existing recreation paths before this fix,
++    // because none of them had ever been reachable with a genuinely
++    // different extent until this sample's window became resizable.
++    //
++    // Device::recreateSwapchain() itself already calls vkDeviceWaitIdle()
++    // internally (device.cpp) before touching the live swapchain, so no
++    // separate wait is needed for that; the explicit vkDeviceWaitIdle()
++    // below covers the SEPARATE hazard of this function's OWN caller-owned
++    // GPU resources (swapchainViews, FrameSync's pooled command buffers/
++    // semaphores) being reallocated out from under still-in-flight work --
++    // mirrors this loop's own pre-existing NeedsRecreate handling.
++    //
++    // Returns false on any failure (never itself logs beyond what
++    // recreateSwapchain()/rebuildSwapchainViews()/
++    // FrameSync::onSwapchainRecreated() already log) -- every caller below
++    // treats that as fatal, exactly like the original NeedsRecreate
++    // branches did before this function existed.
++    // [Issue #73] Declared here, before recreateSwapchainAndDependents()
++    // below, because that lambda now sets `running = false` directly (see
++    // its own isSurfaceLost() branch) -- moved up from its own prior
++    // position (just before the loop) so the lambda can capture it.
+     bool running = true;
+     bool ok = true;
++
++    // recreateSwapchainAndDependents() [Issue #73 update]: ALSO now the
++    // single place this loop reacts to Device::isSurfaceLost() (device.h)
++    // -- the underlying native window is gone. Verified directly: no SDL
++    // event (neither SDL_EVENT_WINDOW_CLOSE_REQUESTED nor even
++    // SDL_EVENT_WINDOW_DESTROYED) ever fires for a third-party window
++    // destroy (e.g. `xdotool windowclose`, the exact action that surfaced
++    // this), so this can only be caught REACTIVELY, via
++    // Device::recreateSwapchain()'s own classification of its surface-
++    // capabilities query's VkResult -- there is no advance-warning event
++    // to gate this call on in the first place. Entering that state is NOT
++    // a failure here either -- it sets `running = false` and returns true,
++    // exactly like a graceful SDL_EVENT_QUIT/WINDOW_CLOSE_REQUESTED -- and
++    // every call site below checks `running` immediately afterward, before
++    // doing anything else that could touch the (now known-dead) surface
++    // again this same iteration, so the loop falls straight through to its
++    // EXISTING orderly teardown (vkDeviceWaitIdle, destroy views,
++    // frameSync.reset(), destroyApp()) below `while (running)` -- no new
++    // teardown mechanism needed, just correct, immediate detection.
++    auto recreateSwapchainAndDependents = [&]() -> bool {
++        vkDeviceWaitIdle(vkDevice);
++        if (!app->device->recreateSwapchain(app->surface)) {
++            return false;
++        }
++        if (app->device->isSurfaceLost()) {
++            RX_LOG_INFO(
++                "sample_09_scene: the present window's native handle is gone -- stopping without touching the "
++                "surface further [Issue #73]");
++            // [Issue #73] Tell Window it must not attempt SDL_DestroyWindow()
++            // on this now-invalid native handle during its own eventual
++            // teardown (destroyApp() below, once this loop exits) -- see
++            // Window::abandonNativeHandle()'s own comment (window.h) for the
++            // fatal-Xlib-error-handler crash this specifically avoids.
++            app->window->abandonNativeHandle();
++            running = false;
++            return true;
++        }
++        if (app->device->isSuspended()) {
++            // [D25] No live swapchain images/format/extent to rebuild
++            // views/FrameSync/the render graph's transients against --
++            // the present loop's own Suspended branch below retries this
++            // same function every ~16ms until a real extent returns.
++            return true;
++        }
++        compileInfo.swapchainWidth = app->device->swapchainExtent().width;
++        compileInfo.swapchainHeight = app->device->swapchainExtent().height;
++        compileInfo.swapchainFormat = app->device->swapchainFormat();
++        graph.compile(compileInfo);
++        if (!rebuildSwapchainViews()) {
++            return false;
++        }
++        if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(app->device->swapchainImages().size()))) {
++            return false;
++        }
++        app->executor->realize(graph);
++        return true;
++    };
++
+     auto lastFrameTime = std::chrono::steady_clock::now();
++    // [Issue #36] The extent this run's swapchain was last (re)built
++    // against -- pixelSizeRequiresRecreate()'s own `lastHandled` baseline,
++    // updated after every successful recreateSwapchainAndDependents() call
++    // below (see that lambda's own call sites).
++    VkExtent2D lastHandledExtent = app->device->swapchainExtent();
++    // [Issue #36 fix-in-round] Mirrors app->hud.vsyncOn as of the last
++    // frame this loop actually applied a present-mode change for -- see
++    // drawHud()'s own updated vsync-checkbox comment for why applying it
++    // is deferred to here instead of happening inline inside drawHud().
++    bool vsyncOnAppliedLastFrame = app->hud.vsyncOn;
+ 
+     // [gate ruling #16] ImGui feeds every SDL event FIRST, then platform
+     // input accumulators (Window::pumpEvents()'s own `preDispatch` seam).
+     while (running) {
+         // [Issue #33] The mouse-capture toggle events (Esc, click-to-
+         // recapture) are handled here, INSIDE the same preDispatch seam,
+         // so they see ImGui's `WantCaptureMouse` exactly as it stood after
+         // last frame's HUD layout (the same one-frame-stale read
+         // updateFlyCamera() below already relies on -- gate ruling
+         // #14/#16's own established caller-level-gating convention, not a
+         // new invariant this ticket introduces). Only the STATE MACHINE
+         // transition happens here (rx::samples9::FlyThroughCaptureState is
+         // SDL-free by design); applying a resulting transition to the real
+         // Window happens once, after the full drain, below.
+         const bool capturedBeforePump = app->mouseCapture.captured();
++        // [Issue #36] Edge-triggered, applied once after the full drain
++        // below -- same "detect during pump, apply once after" split the
++        // mouse-capture toggle above already establishes.
++        bool f11FullscreenToggleRequested = false;
+         app->window->pumpEvents([&](const SDL_Event& event) {
+             app->overlay->processEvent(event);
+             if (event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
+                 running = false;
+             } else if (event.type == SDL_EVENT_KEY_DOWN && event.key.scancode == SDL_SCANCODE_ESCAPE &&
+                        !event.key.repeat && escTogglesCapture(ImGui::GetIO().WantCaptureKeyboard)) {
+                 // [Issue #33 review, Minor finding 1] Gated on
+                 // WantCaptureKeyboard -- inert today (no keyboard-focusable/
+                 // text-input HUD widget in this sample to steal Esc's
+                 // "cancel editing" meaning instead), but a future one would
+                 // otherwise have its Esc silently also toggle mouse capture
+                 // underneath it. See mouse_capture.h's own
+                 // escTogglesCapture() comment.
+                 app->mouseCapture.toggleOnEscPressed();
+             } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT &&
+                        !app->mouseCapture.captured() && !ImGui::GetIO().WantCaptureMouse) {
+                 app->mouseCapture.recaptureOnViewportClick();
++            } else if (event.type == SDL_EVENT_KEY_DOWN && event.key.scancode == SDL_SCANCODE_F11 &&
++                       !event.key.repeat && f11TogglesFullscreen(ImGui::GetIO().WantCaptureKeyboard)) {
++                // [Issue #36] Esc stays owned by mouse-capture (branch
++                // above) -- F11 is its own, independently-gated key, never
++                // conflicting with it. See window_resize.h's own
++                // f11TogglesFullscreen() comment for the WantCaptureKeyboard
++                // gate rationale (mirrors escTogglesCapture()'s).
++                f11FullscreenToggleRequested = true;
+             }
+         });
+         if (!running) break;
+ 
+         // [Issue #33] Apply exactly one real Window transition per frame,
+         // only on an actual change -- Window::setRelativeMouseMode()'s own
+         // relativeModeWanted_ is what pumpEvents()'s FOCUS_GAINED handling
+         // unconditionally re-arms against (window.h's own
+         // setRelativeMouseMode() comment), so this call is what makes that
+         // re-arm compose correctly with this toggle: releasing (Esc) clears
+         // relativeModeWanted_, so a later focus-loss/gain cycle while
+         // released correctly does NOT re-engage capture; recapturing sets
+         // it again, so a focus-loss/gain cycle while captured DOES
+         // re-engage, exactly as src/rx_platform/tests/window_test.cpp's own
+         // "FOCUS_LOST pauses ... FOCUS_GAINED resumes" test already proves
+         // generically for the platform layer.
+         if (app->mouseCapture.captured() != capturedBeforePump) {
+             app->window->setRelativeMouseMode(app->mouseCapture.captured());
+         }
+ 
++        // [Issue #36] F11 runtime fullscreen toggle -- routed through the
++        // SAME Window::setFullscreen() + recreateSwapchainAndDependents()
++        // path the --fullscreen CLI flag applies above, before this loop.
++        // Applied here, before this frame's own acquireNextImage(): no
++        // acquire/command-buffer/HUD work has happened yet this iteration,
++        // so there is no in-flight frame state this recreation could race
++        // (unlike the pre-existing HUD vsync-checkbox bug this same task
++        // fixed -- see drawHud()'s own comment).
++        if (f11FullscreenToggleRequested) {
++            if (!app->window->setFullscreen(!app->window->isFullscreen())) {
++                RX_LOG_ERROR("sample_09_scene: Window::setFullscreen failed applying the F11 toggle");
++            } else if (!recreateSwapchainAndDependents()) {
++                ok = false;
++                break;
++            } else {
++                lastHandledExtent = app->device->swapchainExtent();
++            }
++        }
++        // [Issue #73] recreateSwapchainAndDependents() may have just set
++        // `running = false` (Device::isSurfaceLost()) -- stop before this
++        // same iteration touches the surface again (pixel-size/vsync
++        // checks below, then acquireNextImage()).
++        if (!running) break;
++
++        // [Issue #36] Live drag-resize: SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED
++        // (drained by pumpEvents() above into Window::lastPixelSizeEvent())
++        // drives the SAME recreation path NeedsRecreate/fullscreen do,
++        // proactively -- rather than waiting for
++        // vkAcquireNextImageKHR/vkQueuePresentKHR to eventually report
++        // VK_ERROR_OUT_OF_DATE_KHR/VK_SUBOPTIMAL_KHR, which can lag a live
++        // drag-resize by several frames on some platforms/drivers. See
++        // window_resize.h's own pixelSizeRequiresRecreate() comment for why
++        // this is safe to gate on an SDL event even though device.h
++        // documents lastPixelSizeEvent() as "optimization/logging signal
++        // only" -- a genuine minimize/zero-extent is never proactively
++        // triggered from here (pixelSizeRequiresRecreate() requires both
++        // dimensions nonzero), staying exclusively owned by the
++        // acquire/present-driven NeedsRecreate branches and
++        // Device::recreateSwapchain()'s own live-queried suspended guard,
++        // below.
++        if (pixelSizeRequiresRecreate(lastHandledExtent, app->window->lastPixelSizeEvent())) {
++            if (!recreateSwapchainAndDependents()) {
++                ok = false;
++                break;
++            }
++            lastHandledExtent = app->device->swapchainExtent();
++        }
++        // [Issue #73] Same guard as above -- see that comment.
++        if (!running) break;
++
++        // [Issue #36 fix-in-round] The HUD's own vsync checkbox
++        // (drawHud(), called further down this same loop body) only
++        // MUTATES app->hud.vsyncOn -- detected and applied HERE instead,
++        // one frame later, before THIS frame's acquireNextImage(), through
++        // the same recreateSwapchainAndDependents() path. See drawHud()'s
++        // own comment for the full "why not apply it inline" rationale
++        // (recreating the swapchain after acquireNextImage() had already
++        // fixed this frame's imageIndex was a real, pre-existing bug).
++        if (app->hud.vsyncOn != vsyncOnAppliedLastFrame) {
++            vsyncOnAppliedLastFrame = app->hud.vsyncOn;
++            app->device->setPresentMode(vsyncOnAppliedLastFrame ? rx::rhi::PresentMode::VsyncOn
++                                                                  : rx::rhi::PresentMode::VsyncOff);
++            if (!recreateSwapchainAndDependents()) {
++                ok = false;
++                break;
++            }
++            lastHandledExtent = app->device->swapchainExtent();
++            RX_LOG_INFO("sample_09_scene: --present: present mode in use: {}",
++                        rx::rhi::presentModeName(app->device->presentMode()));
++        }
++        // [Issue #73] Same guard as above -- see that comment.
++        if (!running) break;
++
+         app->scheduler->pumpMain();
+ 
+         const auto now = std::chrono::steady_clock::now();
+         const float dt = std::min(std::chrono::duration<float>(now - lastFrameTime).count(), 0.1F);
+         lastFrameTime = now;
+         app->hud.pushFrameTime(static_cast<double>(dt) * 1000.0);
+ 
+         updateFlyCamera(*app, *app->window, dt);
+         updateSceneFrame(*app, *app->scheduler);
+ 
+         VkFence fence = frameSync->currentFence();
+         vkWaitForFences(vkDevice, 1, &fence, VK_TRUE, UINT64_MAX);
+         auto acquire = app->device->acquireNextImage(frameSync->currentImageAvailableSemaphore());
++        if (acquire.status == rx::rhi::SwapchainStatus::SurfaceLost) {
++            // [Issue #73] Defense-in-depth -- recreateSwapchainAndDependents()
++            // already sets `running = false` itself the moment
++            // Device::isSurfaceLost() first becomes true (see its own
++            // comment above), and every call site above this one already
++            // breaks out via `if (!running) break;` before ever reaching
++            // acquireNextImage() again -- so this branch is not expected
++            // to be reachable in this loop's own current control flow. Kept
++            // anyway, symmetric with DeviceLost below: a clean, NON-fatal
++            // stop (never `ok = false`) if it is ever reached regardless.
++            running = false;
++            continue;
++        }
+         if (acquire.status == rx::rhi::SwapchainStatus::Suspended) {
+             std::this_thread::sleep_for(std::chrono::milliseconds(16));
+-            if (!app->device->recreateSwapchain(app->surface)) {
+-                RX_LOG_ERROR("sample_09_scene: Device::recreateSwapchain failed while suspended (zero-extent retry)");
++            if (!recreateSwapchainAndDependents()) {
+                 ok = false;
+                 break;
+             }
+-            if (!app->device->isSuspended()) {
+-                if (!rebuildSwapchainViews() || !frameSync->onSwapchainRecreated(static_cast<uint32_t>(app->device->swapchainImages().size()))) {
+-                    ok = false;
+-                    break;
+-                }
+-                app->executor->realize(graph);
+-            }
++            lastHandledExtent = app->device->swapchainExtent();
+             continue;
+         }
+         if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
+-            vkDeviceWaitIdle(vkDevice);
+-            if (!app->device->recreateSwapchain(app->surface) || !rebuildSwapchainViews() ||
+-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(app->device->swapchainImages().size()))) {
++            if (!recreateSwapchainAndDependents()) {
+                 ok = false;
+                 break;
+             }
+-            app->executor->realize(graph);
++            lastHandledExtent = app->device->swapchainExtent();
+             continue;
+         }
+         if (acquire.status == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("sample_09_scene: device lost during acquireNextImage; exiting present loop");
+             ok = false;
+             break;
+         }
+ 
+         app->flyCamera.camera.aspectRatio = static_cast<float>(app->device->swapchainExtent().width) /
+                                              static_cast<float>(std::max<uint32_t>(1U, app->device->swapchainExtent().height));
+@@ -3353,21 +3579,21 @@ int runPresent(const Args& args) {
+ 
+         vkResetFences(vkDevice, 1, &fence);
+         VkCommandBuffer cmd = frameSync->currentCommandBuffer();
+         vkResetCommandPool(vkDevice, frameSync->currentCommandPool(), 0);
+         VkCommandBufferBeginInfo beginInfo{};
+         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+         vkBeginCommandBuffer(cmd, &beginInfo);
+ 
+         app->overlay->beginFrame();
+-        drawHud(*app, *app->device, app->surface, /*presentMode=*/true);
++        drawHud(*app, /*presentMode=*/true);
+ 
+         app->executor->execute(graph, cmd, app->device->swapchainImages()[acquire.imageIndex], swapchainViews[acquire.imageIndex],
+                                app->device->swapchainExtent());
+         vkEndCommandBuffer(cmd);
+ 
+         VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+         VkSubmitInfo submitInfo{};
+         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+         submitInfo.waitSemaphoreCount = 1;
+         VkSemaphore waitSem = frameSync->currentImageAvailableSemaphore();
+@@ -3376,28 +3602,32 @@ int runPresent(const Args& args) {
+         submitInfo.commandBufferCount = 1;
+         submitInfo.pCommandBuffers = &cmd;
+         VkSemaphore signalSem = frameSync->renderFinishedSemaphore(acquire.imageIndex);
+         submitInfo.signalSemaphoreCount = 1;
+         submitInfo.pSignalSemaphores = &signalSem;
+         if (vkQueueSubmit(app->device->graphicsQueue(), 1, &submitInfo, fence) != VK_SUCCESS) {
+             ok = false;
+             break;
+         }
+         auto presentStatus = app->device->present(acquire.imageIndex, signalSem);
+-        if (presentStatus == rx::rhi::SwapchainStatus::NeedsRecreate) {
+-            vkDeviceWaitIdle(vkDevice);
+-            if (!app->device->recreateSwapchain(app->surface) || !rebuildSwapchainViews() ||
+-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(app->device->swapchainImages().size()))) {
++        if (presentStatus == rx::rhi::SwapchainStatus::SurfaceLost) {
++            // [Issue #73] Defense-in-depth -- see the identical branch on
++            // acquire.status above for why this is not expected to be
++            // reachable in this loop's own current control flow, and why
++            // it is a clean, NON-fatal stop if it ever is.
++            running = false;
++        } else if (presentStatus == rx::rhi::SwapchainStatus::NeedsRecreate) {
++            if (!recreateSwapchainAndDependents()) {
+                 ok = false;
+                 break;
+             }
+-            app->executor->realize(graph);
++            lastHandledExtent = app->device->swapchainExtent();
+         } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("sample_09_scene: device lost during present; exiting present loop");
+             ok = false;
+             break;
+         }
+         frameSync->advanceFrame();
+         RX_FRAME_MARK;
+     }
+ 
+     vkDeviceWaitIdle(vkDevice);
+diff --git a/samples/09_scene/tests/CMakeLists.txt b/samples/09_scene/tests/CMakeLists.txt
+index 90894dd..d0c77af 100644
+--- a/samples/09_scene/tests/CMakeLists.txt
++++ b/samples/09_scene/tests/CMakeLists.txt
+@@ -17,24 +17,30 @@
+ # composes with the toggle state" requirement, and why this needs the real
+ # Window rather than re-mocking window.cpp's own already-tested
+ # (src/rx_platform/tests/window_test.cpp) FOCUS_LOST/FOCUS_GAINED logic.
+ #
+ # test_grid_layout.cpp covers ../grid_layout.h (also device-free,
+ # header-only -- no matching .cpp to add) -- Issue #35's dropped-asset-
+ # node-rotation regression coverage (the default DamagedHelmet grid
+ # rendered every helmet lying on its back; the D17 pixel-diff gate alone
+ # proved blind to it, since the committed reference was itself baked FROM
+ # the buggy render -- see that test file's own top comment).
++#
++# test_window_resize.cpp covers ../window_resize.h (also device-free,
++# header-only -- no matching .cpp to add) -- Issue #36's live-resize/
++# fullscreen-toggle decision-logic coverage (f11TogglesFullscreen(),
++# pixelSizeRequiresRecreate()).
+ add_executable(sample_09_scene_tests
+     doctest_main.cpp
+     test_draw_recording.cpp
+     test_fly_camera.cpp
+     test_grid_layout.cpp
+     test_mouse_capture.cpp
+     test_mouse_capture_focus_composition.cpp
++    test_window_resize.cpp
+     "${CMAKE_CURRENT_SOURCE_DIR}/../draw_recording.cpp"
+ )
+ target_link_libraries(sample_09_scene_tests PRIVATE rx_scene rx_platform doctest::doctest)
+ add_test(NAME sample_09_scene_tests COMMAND sample_09_scene_tests)
+ # Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+ # (windows-cross Wine hang, run 31512073559).
+ set_tests_properties(sample_09_scene_tests PROPERTIES TIMEOUT 120)
+diff --git a/samples/09_scene/tests/test_window_resize.cpp b/samples/09_scene/tests/test_window_resize.cpp
+new file mode 100644
+index 0000000..acac6fd
+--- /dev/null
++++ b/samples/09_scene/tests/test_window_resize.cpp
+@@ -0,0 +1,65 @@
++// samples/09_scene/tests/test_window_resize.cpp -- Issue #36 (live window
++// resizing + a runtime fullscreen toggle in --present mode): device-free
++// coverage for ../window_resize.h's two pure decisions, matching
++// test_mouse_capture.cpp's own established shape for this sample (truth
++// tables + revert-discrimination cases, no rx::platform::Window/SDL/
++// VkDevice anywhere in this file).
++#include "../window_resize.h"
++
++#include <doctest/doctest.h>
++
++using rx::samples9::f11TogglesFullscreen;
++using rx::samples9::pixelSizeRequiresRecreate;
++
++// --- f11TogglesFullscreen() -----------------------------------------------
++TEST_CASE("f11TogglesFullscreen(): true (F11 should toggle) when ImGui does NOT claim the keyboard") {
++    CHECK(f11TogglesFullscreen(/*imguiWantsKeyboard=*/false));
++}
++
++TEST_CASE("f11TogglesFullscreen(): false (F11 must NOT toggle) when ImGui DOES claim the keyboard -- mirrors "
++          "escTogglesCapture()'s own Esc gate (mouse_capture.h) so a future keyboard-focused HUD widget can claim "
++          "F11 too") {
++    CHECK_FALSE(f11TogglesFullscreen(/*imguiWantsKeyboard=*/true));
++}
++
++TEST_CASE("f11TogglesFullscreen(): full 2-row truth table [revert-discrimination -- an implementation that "
++          "returned imguiWantsKeyboard verbatim instead of negating it fails both rows here]") {
++    CHECK(f11TogglesFullscreen(false) == true);
++    CHECK(f11TogglesFullscreen(true) == false);
++}
++
++// --- pixelSizeRequiresRecreate() ------------------------------------------
++TEST_CASE("pixelSizeRequiresRecreate(): false before any real SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED event -- the "
++          "{0,0} pre-first-event sentinel (Window::lastPixelSizeEvent()'s own documented starting value) must "
++          "never itself read as 'the window resized to zero'") {
++    CHECK_FALSE(pixelSizeRequiresRecreate(VkExtent2D{1280, 720}, VkExtent2D{0, 0}));
++}
++
++TEST_CASE("pixelSizeRequiresRecreate(): false when observed has a zero dimension even if lastHandled differs -- "
++          "this optimization signal must never itself decide suspended/resume (window.h's own documented "
++          "invariant); a genuine minimize is caught by Device::recreateSwapchain()'s own live-queried guard "
++          "instead, via the pre-existing NeedsRecreate path") {
++    CHECK_FALSE(pixelSizeRequiresRecreate(VkExtent2D{1280, 720}, VkExtent2D{0, 480}));
++    CHECK_FALSE(pixelSizeRequiresRecreate(VkExtent2D{1280, 720}, VkExtent2D{640, 0}));
++}
++
++TEST_CASE("pixelSizeRequiresRecreate(): false when observed exactly matches lastHandled -- idempotent, no "
++          "spurious recreation once a resize has already been applied") {
++    CHECK_FALSE(pixelSizeRequiresRecreate(VkExtent2D{1280, 720}, VkExtent2D{1280, 720}));
++}
++
++TEST_CASE("pixelSizeRequiresRecreate(): true when either dimension genuinely differs and both are nonzero -- "
++          "growing, shrinking, and single-axis-only changes all count") {
++    CHECK(pixelSizeRequiresRecreate(VkExtent2D{1280, 720}, VkExtent2D{1920, 1080}));  // grow both.
++    CHECK(pixelSizeRequiresRecreate(VkExtent2D{1280, 720}, VkExtent2D{640, 480}));    // shrink both.
++    CHECK(pixelSizeRequiresRecreate(VkExtent2D{1280, 720}, VkExtent2D{1280, 800}));   // height only.
++    CHECK(pixelSizeRequiresRecreate(VkExtent2D{1280, 720}, VkExtent2D{1024, 720}));   // width only.
++}
++
++TEST_CASE("pixelSizeRequiresRecreate(): revert-discrimination -- an implementation that compared ONLY width (or "
++          "ONLY height) instead of both would pass the single-axis cases above by accident but fail to notice a "
++          "same-width-different-height OR same-height-different-width change is still exercised distinctly here") {
++    CHECK(pixelSizeRequiresRecreate(VkExtent2D{800, 600}, VkExtent2D{800, 601}));
++    CHECK(pixelSizeRequiresRecreate(VkExtent2D{800, 600}, VkExtent2D{801, 600}));
++    CHECK_FALSE(pixelSizeRequiresRecreate(VkExtent2D{800, 600}, VkExtent2D{800, 600}));
++}
+diff --git a/samples/09_scene/window_resize.h b/samples/09_scene/window_resize.h
+new file mode 100644
+index 0000000..dd0ea73
+--- /dev/null
++++ b/samples/09_scene/window_resize.h
+@@ -0,0 +1,72 @@
++#pragma once
++// samples/09_scene/window_resize.h -- pure decision logic for Issue #36
++// (live window resizing + a runtime fullscreen toggle in --present mode),
++// pulled out of main.cpp exactly like fly_camera.h/mouse_capture.h's own
++// established "device-free pure logic gets its own header, so it is
++// unit-testable without an SDL window or a VkDevice" precedent in this
++// sample. Two independent decisions live here:
++//
++//   - f11TogglesFullscreen(): the same "compose with ImGui's own
++//     WantCaptureKeyboard at the call site" shape mouse_capture.h's
++//     escTogglesCapture() already establishes for Esc -- deliberately its
++//     own named function rather than reusing escTogglesCapture() or
++//     fly_camera.h's keyboardDrivesCamera() (both are `!imguiWantsKeyboard`
++//     today too), for the identical reason mouse_capture.h's own comment
++//     gives: these gate different call sites free to diverge later.
++//
++//   - pixelSizeRequiresRecreate(): the trigger for main.cpp's runPresent()
++//     loop to proactively call the SAME Device::recreateSwapchain() path
++//     NeedsRecreate/fullscreen already drive, from a live
++//     SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED observation
++//     (rx::platform::Window::lastPixelSizeEvent()) rather than waiting for
++//     vkAcquireNextImageKHR/vkQueuePresentKHR to eventually report
++//     VK_ERROR_OUT_OF_DATE_KHR/VK_SUBOPTIMAL_KHR -- on some platforms/
++//     drivers that signal can lag a live drag-resize by several frames,
++//     during which the OLD-sized swapchain image would be presented
++//     stretched into the NEW-sized window.
++#include <vulkan/vulkan.h>
++
++namespace rx::samples9 {
++
++// [Issue #36] main.cpp's pumpEvents() `preDispatch` seam calls this on
++// every real SDL_EVENT_KEY_DOWN whose `scancode == SDL_SCANCODE_F11` AND
++// whose `repeat` field is false (edge-triggered, exactly like Esc/
++// escTogglesCapture()'s own contract) -- only when this returns true does
++// the caller flip the runtime fullscreen toggle, so a future keyboard-
++// focused HUD widget can still claim F11 for itself without also toggling
++// fullscreen underneath it.
++[[nodiscard]] inline bool f11TogglesFullscreen(bool imguiWantsKeyboard) { return !imguiWantsKeyboard; }
++
++// [Issue #36] `lastHandled` is the extent this run's own swapchain was
++// last (re)built against (tracked by runPresent(), updated after every
++// successful recreation); `observed` is
++// rx::platform::Window::lastPixelSizeEvent()'s current value, drained by
++// pumpEvents() this same frame. Returns true only when a recreation should
++// be proactively triggered THIS frame.
++//
++// `observed` with either dimension == 0 NEVER triggers a recreation here --
++// two distinct reasons converge on the same guard:
++//   1. lastPixelSizeEvent() itself starts at {0, 0} before the first real
++//      SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED event this window ever observes
++//      (window.h's own documented contract) -- treating that pre-first-
++//      event sentinel as "the window just resized to zero" would fire a
++//      spurious recreation on frame 1 of every --present run, before any
++//      resize ever happened.
++//   2. window.h's own header comment is explicit that
++//      lastPixelSizeEvent()/minimizedEventObserved() are "OPTIMIZATION/
++//      LOGGING SIGNAL ONLY" -- the AUTHORITATIVE suspended-present decision
++//      is rx::rhi::Device::recreateSwapchain()'s own extent-query-driven
++//      guard, never an SDL event. A genuine minimize is already caught by
++//      this loop's pre-existing NeedsRecreate handling (the driver reports
++//      VK_ERROR_OUT_OF_DATE_KHR once the real surface shrinks), which then
++//      calls that same authoritative, live-queried guard -- this function
++//      only decides whether to PROACTIVELY get ahead of a live drag-resize
++//      the driver hasn't signaled yet, never whether to suspend.
++[[nodiscard]] inline bool pixelSizeRequiresRecreate(VkExtent2D lastHandled, VkExtent2D observed) {
++    if (observed.width == 0 || observed.height == 0) {
++        return false;
++    }
++    return observed.width != lastHandled.width || observed.height != lastHandled.height;
++}
++
++}  // namespace rx::samples9
+diff --git a/src/rx_platform/include/rx_platform/window.h b/src/rx_platform/include/rx_platform/window.h
+index 8d5e81d..b50a169 100644
+--- a/src/rx_platform/include/rx_platform/window.h
++++ b/src/rx_platform/include/rx_platform/window.h
+@@ -10,21 +10,29 @@
+ namespace rx::platform {
+ 
+ class Window {
+ public:
+     Window(Window&&) noexcept;
+     Window& operator=(Window&&) noexcept;
+     Window(const Window&) = delete;
+     Window& operator=(const Window&) = delete;
+     ~Window();
+ 
+-    static std::optional<Window> create(const char* title, int width, int height, bool visible);
++    // `resizable` [Phase 4 Task 17 follow-up, Issue #36] adds SDL_WINDOW_RESIZABLE
++    // (defaults to false, matching every caller written before this parameter
++    // existed) -- purely a WM/decoration hint for USER drag-resize; it has no
++    // effect on programmatic SDL_SetWindowSize()/setFullscreen() calls, which
++    // work regardless, and callers still drive any resulting swapchain
++    // recreation themselves via rx::rhi::Device::recreateSwapchain() (this
++    // class owns no Vulkan handle at all).
++    static std::optional<Window> create(const char* title, int width, int height, bool visible,
++                                         bool resizable = false);
+ 
+     SDL_Window* sdlWindow() const { return window_; }
+ 
+     // Drains SDL's process-wide event queue (SDL_PollEvent) -- callers that
+     // also need to react to OTHER event types (quit, ImGui, ...) still poll
+     // those themselves; this owns draining the queue's window-state events
+     // into the observed state below [Phase 4 Task 17, FG7, gate ruling #25],
+     // AND [Phase 4 Task 20, gate ruling #14] the mouse-delta accumulation
+     // (SDL_EVENT_MOUSE_MOTION), gamepad hot-plug lifecycle
+     // (SDL_EVENT_GAMEPAD_ADDED/REMOVED), and the focus-loss/gain handling
+@@ -211,27 +219,71 @@ public:
+     // project's existing "best-effort sync, log don't fail the caller for
+     // it" convention.
+     bool setFullscreen(bool fullscreen);
+ 
+     // SDL_GetWindowFlags() & SDL_WINDOW_FULLSCREEN -- true in EITHER
+     // borderless or exclusive fullscreen (this engine only ever REQUESTS
+     // borderless via setFullscreen() above, but reports the flag as-is);
+     // false in windowed mode.
+     bool isFullscreen() const;
+ 
++    // [Phase 4 Task 17 follow-up, Issue #73] Marks this window's underlying
++    // NATIVE handle as already gone -- the caller learned this
++    // INDEPENDENTLY of anything SDL itself reported (e.g. via
++    // rx::rhi::Device::isSurfaceLost(), reacting to a Vulkan surface query
++    // failure), never from an SDL event: reproduced directly that neither
++    // SDL_EVENT_WINDOW_CLOSE_REQUESTED nor even SDL_EVENT_WINDOW_DESTROYED
++    // fires for a third-party destroy of this window (e.g. `xdotool
++    // windowclose`, a raw XDestroyWindow() against a window this process
++    // does not expect gone). Once called, this Window's destructor and
++    // move-assignment's "destroy what this object currently owns" step
++    // SKIP SDL_DestroyWindow() entirely for the native handle -- there is
++    // nothing valid left to destroy, and calling it anyway issues further
++    // native (on X11: further Xlib/XCB protocol) requests against an
++    // already-invalid ID. Reproduced directly: doing so triggers an
++    // unhandled X11 BadWindow protocol error that Xlib's own DEFAULT error
++    // handler treats as FATAL (calls exit() with a nonzero status),
++    // terminating the whole process AFTER this engine's own graceful
++    // shutdown had already logically completed successfully -- this is
++    // what actually turned a correctly-detected, gracefully-handled
++    // surface loss into an observed nonzero exit code.
++    //
++    // Safe to call ONLY because the expected caller (a --present sample's
++    // own teardown, immediately following the SAME surface-loss detection
++    // that calls this) is about to let this Window -- and the whole
++    // process -- go away regardless: SDL's own internal per-window
++    // bookkeeping for the now-abandoned handle is reclaimed by the OS at
++    // process exit either way, exactly like every other resource a process
++    // never explicitly frees before exiting. This is NOT a general-purpose
++    // "detach and keep using the Window" escape hatch -- every other
++    // method on this class remains unguarded against an abandoned native
++    // handle and is not expected to be called again afterward.
++    void abandonNativeHandle() { nativeHandleAbandoned_ = true; }
++
++    // True after abandonNativeHandle() -- see that method's own comment.
++    // Exposed purely for testability/diagnostics (mirrors
++    // relativeMouseModeWanted()'s own "expose the tracked intent, not a
++    // live OS query" shape); production code has no need to read this back
++    // before calling abandonNativeHandle() itself, which is idempotent.
++    bool nativeHandleAbandoned() const { return nativeHandleAbandoned_; }
++
+     std::vector<const char*> requiredVulkanInstanceExtensions() const;
+     VkSurfaceKHR createVulkanSurface(VkInstance instance) const;
+ 
+ private:
+     explicit Window(SDL_Window* window) : window_(window) {}
+     SDL_Window* window_ = nullptr;
+ 
++    // [Phase 4 Task 17 follow-up, Issue #73] See abandonNativeHandle()'s
++    // own comment above.
++    bool nativeHandleAbandoned_ = false;
++
+     // [Phase 4 Task 17, FG7] See minimizedEventObserved()/
+     // lastPixelSizeEvent()'s own comments above.
+     bool minimizedEventObserved_ = false;
+     VkExtent2D lastPixelSizeEvent_{0, 0};
+ 
+     // [Phase 4 Task 20, gate ruling #14] See setRelativeMouseMode()/
+     // consumeMouseDelta()'s own comments above. relativeModeWanted_ is the
+     // APP's own last-requested intent (never a live SDL query);
+     // focusLost_ gates mouse-delta accumulation while true.
+     bool relativeModeWanted_ = false;
+diff --git a/src/rx_platform/src/window.cpp b/src/rx_platform/src/window.cpp
+index 6175895..5728bea 100644
+--- a/src/rx_platform/src/window.cpp
++++ b/src/rx_platform/src/window.cpp
+@@ -32,21 +32,21 @@ void logWaylandMinimizeLimitationOnce(const char* platformName) {
+             "window minimize here (SDL_EVENT_WINDOW_MINIMIZED/RESTORED and SDL_GetWindowFlags()'s MINIMIZED bit "
+             "only reflect this process's OWN SDL_MinimizeWindow() calls on Wayland, never the window manager's -- "
+             "see github.com/libsdl-org/SDL/issues/13473 and wiki.libsdl.org/SDL3/README-wayland). This engine's "
+             "own suspended-present guard (rx::rhi::Device::recreateSwapchain()) is unaffected -- it is driven by "
+             "the queried Vulkan surface extent, not these events -- but any HOST code that separately listens for "
+             "these same SDL events/flags to drive its own pause behavior will not see them fire on a real "
+             "minimize here.");
+     }
+ }
+ 
+-std::optional<Window> Window::create(const char* title, int width, int height, bool visible) {
++std::optional<Window> Window::create(const char* title, int width, int height, bool visible, bool resizable) {
+     if (!SDL_WasInit(SDL_INIT_VIDEO)) {
+         if (!SDL_Init(SDL_INIT_VIDEO)) {
+             RX_LOG_WARN("SDL_Init(SDL_INIT_VIDEO) failed: {}", SDL_GetError());
+             return std::nullopt;
+         }
+     }
+     // [Phase 4 Task 20, gate ruling #14] SDL3's joystick/gamepad subsystem
+     // SILENTLY DROPS input state updates while the app is "in the
+     // background" (no window has OS input focus) -- SDL_hints.h's own doc
+     // for this hint: default "0" = "Disable joystick & gamecontroller
+@@ -84,80 +84,97 @@ std::optional<Window> Window::create(const char* title, int width, int height, b
+     // -- see logWaylandMinimizeLimitationOnce()'s own comment (window.h).
+     // SDL_GetPlatform() is valid to call once SDL_INIT_VIDEO has succeeded
+     // above (it is documented safe to call before SDL_Init() too, but this
+     // keeps the call site right where video is known to be up).
+     logWaylandMinimizeLimitationOnce(SDL_GetPlatform());
+ 
+     SDL_WindowFlags flags = SDL_WINDOW_VULKAN;
+     if (!visible) {
+         flags |= SDL_WINDOW_HIDDEN;
+     }
++    if (resizable) {
++        flags |= SDL_WINDOW_RESIZABLE;
++    }
+ 
+     SDL_Window* window = SDL_CreateWindow(title, width, height, flags);
+     if (!window) {
+         RX_LOG_WARN("SDL_CreateWindow failed: {}", SDL_GetError());
+         return std::nullopt;
+     }
+     return Window(window);
+ }
+ 
+ Window::Window(Window&& other) noexcept
+     : window_(other.window_),
++      nativeHandleAbandoned_(other.nativeHandleAbandoned_),
+       minimizedEventObserved_(other.minimizedEventObserved_),
+       lastPixelSizeEvent_(other.lastPixelSizeEvent_),
+       relativeModeWanted_(other.relativeModeWanted_),
+       focusLost_(other.focusLost_),
+       accumMouseDeltaX_(other.accumMouseDeltaX_),
+       accumMouseDeltaY_(other.accumMouseDeltaY_),
+       gamepads_(std::move(other.gamepads_)) {
+     other.window_ = nullptr;
++    other.nativeHandleAbandoned_ = false;
+     other.minimizedEventObserved_ = false;
+     other.lastPixelSizeEvent_ = VkExtent2D{0, 0};
+     other.relativeModeWanted_ = false;
+     other.focusLost_ = false;
+     other.accumMouseDeltaX_ = 0.0f;
+     other.accumMouseDeltaY_ = 0.0f;
+     // gamepads_ ownership moved out via std::move above -- other.gamepads_
+     // is left in its moved-from (empty, per std::unordered_map's own
+     // guarantee) state, so other's eventual destructor closes nothing this
+     // Window now owns.
+ }
+ 
+ Window& Window::operator=(Window&& other) noexcept {
+     if (this != &other) {
+-        if (window_) {
++        // [Phase 4 Task 17 follow-up, Issue #73] See abandonNativeHandle()'s
++        // own comment (window.h) -- skip SDL_DestroyWindow() for a handle
++        // already known abandoned, exactly like the destructor below.
++        if (window_ && !nativeHandleAbandoned_) {
+             SDL_DestroyWindow(window_);
+         }
+         closeAllGamepads();
+         window_ = other.window_;
++        nativeHandleAbandoned_ = other.nativeHandleAbandoned_;
+         minimizedEventObserved_ = other.minimizedEventObserved_;
+         lastPixelSizeEvent_ = other.lastPixelSizeEvent_;
+         relativeModeWanted_ = other.relativeModeWanted_;
+         focusLost_ = other.focusLost_;
+         accumMouseDeltaX_ = other.accumMouseDeltaX_;
+         accumMouseDeltaY_ = other.accumMouseDeltaY_;
+         gamepads_ = std::move(other.gamepads_);
+         other.window_ = nullptr;
++        other.nativeHandleAbandoned_ = false;
+         other.minimizedEventObserved_ = false;
+         other.lastPixelSizeEvent_ = VkExtent2D{0, 0};
+         other.relativeModeWanted_ = false;
+         other.focusLost_ = false;
+         other.accumMouseDeltaX_ = 0.0f;
+         other.accumMouseDeltaY_ = 0.0f;
+         // other.gamepads_ already emptied by std::move above.
+     }
+     return *this;
+ }
+ 
+ Window::~Window() {
+     closeAllGamepads();
+-    if (window_) {
++    // [Phase 4 Task 17 follow-up, Issue #73] See abandonNativeHandle()'s
++    // own comment (window.h) -- skip SDL_DestroyWindow() for a handle
++    // already known abandoned: there is nothing valid left to destroy, and
++    // calling it anyway issues further native requests against an
++    // already-invalid native ID (reproduced directly as an unhandled X11
++    // BadWindow protocol error that Xlib's own default error handler
++    // treats as fatal to the whole process).
++    if (window_ && !nativeHandleAbandoned_) {
+         SDL_DestroyWindow(window_);
+     }
+ }
+ 
+ void Window::closeAllGamepads() {
+     for (auto& [id, gamepad] : gamepads_) {
+         (void)id;
+         SDL_CloseGamepad(gamepad);
+     }
+     gamepads_.clear();
+diff --git a/src/rx_platform/tests/window_test.cpp b/src/rx_platform/tests/window_test.cpp
+index ffafde3..cffa980 100644
+--- a/src/rx_platform/tests/window_test.cpp
++++ b/src/rx_platform/tests/window_test.cpp
+@@ -11,20 +11,21 @@
+ #include <SDL3/SDL.h>
+ 
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <cmath>
+ #include <initializer_list>
+ #include <mutex>
+ #include <string>
+ #include <thread>
++#include <utility>
+ #include <vector>
+ 
+ namespace {
+ 
+ // A real desktop's window manager (this repo's own dev machine, not just
+ // CI's bare Xvfb) delivers genuine SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED
+ // events for a just-created window ASYNCHRONOUSLY -- with real, observed
+ // latency across more than one pumpEvents() call, not necessarily all
+ // present by the very first drain (reproduced directly during this task's
+ // own development: a single upfront pumpEvents() call was not sufficient
+@@ -727,20 +728,89 @@ TEST_CASE("Window::setFullscreen(true) enters borderless-desktop fullscreen (SDL
+     CHECK(window->isFullscreen());
+     // Borderless, not exclusive [gate ruling #25 row 4's own acceptance
+     // criterion]: setFullscreen() never calls SDL_SetWindowFullscreenMode(),
+     // so SDL3's own documented borderless-desktop signal is a nullptr mode.
+     CHECK(SDL_GetWindowFullscreenMode(window->sdlWindow()) == nullptr);
+ 
+     CHECK(window->setFullscreen(false));
+     CHECK_FALSE(window->isFullscreen());
+ }
+ 
++// ===== Resizable window flag [Issue #36] ===================================
++TEST_CASE("Window::create()'s `resizable` parameter threads through to SDL_WINDOW_RESIZABLE -- defaults to false "
++          "(every caller written before this parameter existed keeps its pre-existing non-resizable behavior "
++          "unchanged), true when explicitly requested [revert-discrimination: an implementation that ignored the "
++          "parameter and always/never set the flag fails one of the three cases below]") {
++    auto defaulted = rx::platform::Window::create("rx_platform_resizable_default_test", 64, 64, /*visible=*/false);
++    REQUIRE(defaulted.has_value());
++    CHECK((SDL_GetWindowFlags(defaulted->sdlWindow()) & SDL_WINDOW_RESIZABLE) == 0);
++
++    auto explicitFalse =
++        rx::platform::Window::create("rx_platform_resizable_false_test", 64, 64, /*visible=*/false, /*resizable=*/false);
++    REQUIRE(explicitFalse.has_value());
++    CHECK((SDL_GetWindowFlags(explicitFalse->sdlWindow()) & SDL_WINDOW_RESIZABLE) == 0);
++
++    auto resizable =
++        rx::platform::Window::create("rx_platform_resizable_true_test", 64, 64, /*visible=*/false, /*resizable=*/true);
++    REQUIRE(resizable.has_value());
++    CHECK((SDL_GetWindowFlags(resizable->sdlWindow()) & SDL_WINDOW_RESIZABLE) != 0);
++}
++
++// ===== abandonNativeHandle() [Issue #73] ====================================
++// Device-free tier: the tracked-intent flag's own get/set/move contract,
++// exactly mirroring relativeMouseModeWanted()'s own established "expose the
++// tracked intent, never a live OS/native-handle query" testing shape in
++// this same file. The DEEP behavioral consequence -- that a Window with
++// this flag set skips SDL_DestroyWindow() and therefore avoids the fatal
++// Xlib BadWindow crash a genuinely externally-destroyed native handle
++// otherwise triggers -- is MANUAL_VERIFICATION-only, proven directly
++// against a real desktop (xdotool windowclose + real-NVIDIA --present run,
++// this task's own report): no CI driver/display backend this repo's
++// fixtures use can be made to genuinely destroy a live window out from
++// under a running process the way a real window manager (or xdotool) can,
++// mirroring window_state_test.cpp's own "matrix row 6" precedent for the
++// zero-extent guard's DI-seam split.
++TEST_CASE("Window::nativeHandleAbandoned() is false by default and becomes true (idempotently) after "
++          "abandonNativeHandle() [Issue #73]") {
++    auto window = rx::platform::Window::create("rx_platform_abandon_native_handle_test", 64, 64, /*visible=*/false);
++    REQUIRE(window.has_value());
++    CHECK_FALSE(window->nativeHandleAbandoned());
++
++    window->abandonNativeHandle();
++    CHECK(window->nativeHandleAbandoned());
++
++    // Idempotent -- a second call changes nothing observable.
++    window->abandonNativeHandle();
++    CHECK(window->nativeHandleAbandoned());
++}
++
++TEST_CASE("Window::abandonNativeHandle()'s flag survives move-construction and move-assignment, and the "
++          "moved-FROM object's own flag resets to false [Issue #73, revert-discrimination: an implementation that "
++          "forgot to thread this new member through the move special members would silently drop it, exactly the "
++          "class of bug this file's own established per-member move tests already guard every other bool against]") {
++    auto source = rx::platform::Window::create("rx_platform_abandon_move_ctor_test", 64, 64, /*visible=*/false);
++    REQUIRE(source.has_value());
++    source->abandonNativeHandle();
++    REQUIRE(source->nativeHandleAbandoned());
++
++    rx::platform::Window moved(std::move(*source));
++    CHECK(moved.nativeHandleAbandoned());
++    CHECK_FALSE(source->nativeHandleAbandoned());  // moved-from resets to false.
++
++    auto target = rx::platform::Window::create("rx_platform_abandon_move_assign_test", 64, 64, /*visible=*/false);
++    REQUIRE(target.has_value());
++    REQUIRE_FALSE(target->nativeHandleAbandoned());
++    *target = std::move(moved);
++    CHECK(target->nativeHandleAbandoned());
++    CHECK_FALSE(moved.nativeHandleAbandoned());  // moved-from resets to false.
++}
++
+ // ===== Gamepad [Phase 4 Task 20, gate ruling #14, matrix rows 4-10] =======
+ // Every test below drives a REAL SDL_Gamepad through SDL_AttachVirtualJoystick
+ // (VirtualGamepad helper, top of this file) -- CI-automatable per the gate
+ // hardening block's TEST-COVERAGE CORRECTION (matrix Conflict #3),
+ // confirmed working under this project's CI-representative headless driver
+ // (xvfb-run -a) by this task's own smoke check (task-20-report.md). Tests
+ // that need to read THIS test's own driven values back through
+ // Window::poll() first check foreignGamepadIds() (top of file) and skip
+ // with an honest MESSAGE if a real gamepad is already connected in this
+ // environment -- see that helper's own comment for why (this dev machine
+diff --git a/src/rx_rhi_vk/CMakeLists.txt b/src/rx_rhi_vk/CMakeLists.txt
+index 0e42072..ce7ee9a 100644
+--- a/src/rx_rhi_vk/CMakeLists.txt
++++ b/src/rx_rhi_vk/CMakeLists.txt
+@@ -35,21 +35,26 @@ target_include_directories(rx_rhi_vk PUBLIC include ${volk_SOURCE_DIR} ${vma_SOU
+ # rx_shader_layout_types (defined in src/rx_shader/CMakeLists.txt) is a
+ # header-only INTERFACE target exposing ONLY rx_shader's plain-data
+ # shader_layout_info.h -- never `rx_shader` itself, which would drag
+ # slang::slang (a real link dependency, plus every other rx_shader header)
+ # into this library. See pipeline_layout.h's own comment for why
+ # PipelineLayoutBuilder needs `rx::shader::ShaderLayoutInfo` without any of
+ # that.
+ target_link_libraries(rx_rhi_vk PUBLIC rx_core vk-bootstrap::vk-bootstrap rx_shader_layout_types)
+ target_compile_definitions(rx_rhi_vk PUBLIC VK_NO_PROTOTYPES)
+ 
+-# Seventeen test translation units now (context_test.cpp, device_test.cpp,
++# surface_loss_test.cpp [Phase 4 Task 17 follow-up, Issue #73]: device-free
++# coverage for isSurfaceLossResult() (device.h) -- pure VkResult classifier,
++# no Vulkan device needed, same shape as eviction_contract_test.cpp's own
++# pure-CPU-logic tier.
++#
++# Eighteen test translation units now (context_test.cpp, device_test.cpp,
+ # buffer_test.cpp, clear_color_test.cpp, frame_sync_test.cpp,
+ # pipeline_layout_test.cpp, bindless_test.cpp, upload_test.cpp,
+ # deletion_queue_test.cpp, texture_test.cpp, descriptor_arena_test.cpp,
+ # memory_report_test.cpp, memory_budget_test.cpp, oom_handling_test.cpp,
+ # eviction_contract_test.cpp [Phase 4 Task 10], bda_test.cpp [Phase 4
+ # Stage 1 Task 12, spec D26.4], window_state_test.cpp [Phase 4 Stage 1
+ # Task 17, FG7 -- the zero-extent-guard DI seam, present-skip call counts,
+ # the D25 uploads-not-gated interaction, and the borderless-fullscreen
+ # double-toggle, all against a real Device]), so -- like rx_core_tests, and
+ # unlike this
+@@ -84,16 +89,17 @@ add_executable(rx_rhi_vk_tests
+     tests/upload_test.cpp
+     tests/deletion_queue_test.cpp
+     tests/texture_test.cpp
+     tests/descriptor_arena_test.cpp
+     tests/memory_report_test.cpp
+     tests/memory_budget_test.cpp
+     tests/oom_handling_test.cpp
+     tests/eviction_contract_test.cpp
+     tests/bda_test.cpp
+     tests/window_state_test.cpp
++    tests/surface_loss_test.cpp
+ )
+ target_link_libraries(rx_rhi_vk_tests PRIVATE rx_rhi_vk rx_platform doctest::doctest)
+ add_test(NAME rx_rhi_vk_tests COMMAND rx_rhi_vk_tests)
+ # Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+ # (windows-cross Wine hang, run 31512073559).
+ set_tests_properties(rx_rhi_vk_tests PROPERTIES TIMEOUT 120)
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/device.h b/src/rx_rhi_vk/include/rx_rhi_vk/device.h
+index f745e7b..2787f11 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/device.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/device.h
+@@ -16,22 +16,63 @@ enum class SwapchainStatus {
+     // there is no live VkSwapchainKHR to acquire/present against while
+     // suspended (see Device::recreateSwapchain()'s own comment on the
+     // zero-extent guard). A caller sees this exactly when
+     // Device::isSuspended() is true; it never overlaps with NeedsRecreate/
+     // DeviceLost in the same call. The design-corrected trigger (matrix
+     // conflict 1 / rulings-2026-08-18.md #25) is the QUERIED surface
+     // extent being 0x0 -- not an SDL minimize event/flag, which never
+     // fires on a real Wayland compositor-driven minimize (SDL issue
+     // #13473) and is therefore never sufficient on its own.
+     Suspended,
++    // [Phase 4 Task 17 follow-up, Issue #73] The underlying NATIVE WINDOW
++    // backing this surface is gone -- distinct from Suspended (a suspended
++    // Device is expected to RESUME once a real extent returns, D25; a
++    // surface-lost Device never will, because there is no window left to
++    // ever report one again). Like Suspended, acquireNextImage()/present()
++    // return this WITHOUT calling the real vkAcquireNextImageKHR/
++    // vkQueuePresentKHR (see Device::isSurfaceLost()'s own comment for the
++    // full rationale: no reliable advance-warning event exists for this
++    // case, so recreateSwapchain() reacts to it by classifying the
++    // surface-capabilities query's own VkResult, via isSurfaceLossResult()
++    // below). A caller sees this exactly when Device::isSurfaceLost() is
++    // true; it never overlaps with Suspended/NeedsRecreate/DeviceLost in
++    // the same call. The expected caller response is NOT to retry (unlike
++    // Suspended's "retry every frame until a real extent returns") -- it
++    // is to stop calling acquireNextImage()/present()/recreateSwapchain()
++    // against this Device+surface pair entirely and proceed straight to
++    // an orderly teardown (drain in-flight GPU work, then destroy).
++    SurfaceLost,
+ };
+ 
++// [Phase 4 Task 17 follow-up, Issue #73] Pure, device-free classifier: does
++// `result` (a vkGetPhysicalDeviceSurfaceCapabilitiesKHR return value) mean
++// the underlying NATIVE WINDOW backing this surface is gone, as opposed to
++// a genuine, unrelated error (out-of-memory, ...) that must still hard-fail
++// Device::recreateSwapchain() rather than being silently swallowed?
++//
++// True for VK_ERROR_SURFACE_LOST_KHR -- the Vulkan spec's own documented
++// code for exactly this situation -- AND for VK_ERROR_INITIALIZATION_FAILED,
++// which is NOT a spec-documented return for this specific function but is
++// what this project's own loader/driver stack (NVIDIA proprietary, Xcb WSI)
++// empirically returns when the query touches an already-destroyed X11
++// window: reproduced directly (Issue #73's own investigation) via a
++// third-party XDestroyWindow() against a live --present window (the exact
++// action `xdotool windowclose` performs) -- confirmed there is NO advance-
++// warning SDL event for this case at all (neither SDL_EVENT_WINDOW_
++// CLOSE_REQUESTED nor even SDL_EVENT_WINDOW_DESTROYED fires before the next
++// Vulkan call against the surface fails), so this REACTIVE classification
++// on the query's own result is the only place this can be caught.
++// VK_ERROR_OUT_OF_HOST_MEMORY/VK_ERROR_OUT_OF_DEVICE_MEMORY (and anything
++// else) are deliberately NOT included here -- those stay genuine,
++// unrecoverable Device::recreateSwapchain() failures.
++[[nodiscard]] bool isSurfaceLossResult(VkResult result);
++
+ struct AcquireResult {
+     SwapchainStatus status;
+     uint32_t imageIndex;
+ };
+ 
+ // Present-mode control [Phase 4 Task 6, spec seed 1]. Only two choices are
+ // exposed at this layer -- an on/off vsync preference, not a raw
+ // VkPresentModeKHR -- because the actual mode is driver/surface-dependent
+ // (see Device::setPresentMode()'s own comment for the exact fallback
+ // ladder each of these resolves to). Callers that need the concrete mode
+@@ -242,29 +283,41 @@ public:
+     // here: the image is still valid to render into and present, so
+     // recreation is deferred to present()'s return value instead.
+     //
+     // [Phase 4 Task 17, FG7] While isSuspended() is true, this returns
+     // AcquireResult{SwapchainStatus::Suspended, 0} WITHOUT calling
+     // vkAcquireNextImageKHR at all (skip-acquire-entirely, the
+     // Khronos-tutorial pattern -- there is no live swapchain to acquire
+     // against). acquireCallCount() only increments on the branch that
+     // actually issues the real Vulkan call, so a caller/test can assert
+     // "zero acquires while suspended" by call count, not by inference.
++    //
++    // [Phase 4 Task 17 follow-up, Issue #73] Same short-circuit while
++    // isSurfaceLost() is true instead, returning
++    // AcquireResult{SwapchainStatus::SurfaceLost, 0} -- also without
++    // calling vkAcquireNextImageKHR (also excluded from
++    // acquireCallCount()). Checked before isSuspended() (the two never
++    // overlap in practice -- see isSurfaceLost()'s own comment).
+     AcquireResult acquireNextImage(VkSemaphore signal);
+ 
+     // Presents `imageIndex`, waiting on `wait` first unless it is
+     // VK_NULL_HANDLE.
+     //
+     // [Phase 4 Task 17, FG7] Same suspended short-circuit as
+     // acquireNextImage() above: while isSuspended() is true, returns
+     // SwapchainStatus::Suspended without calling vkQueuePresentKHR
+     // (presentCallCount() likewise only counts the real call).
++    //
++    // [Phase 4 Task 17 follow-up, Issue #73] Same surface-lost
++    // short-circuit as acquireNextImage() above: while isSurfaceLost() is
++    // true, returns SwapchainStatus::SurfaceLost without calling
++    // vkQueuePresentKHR.
+     SwapchainStatus present(uint32_t imageIndex, VkSemaphore wait);
+ 
+     // Waits for the device to go idle, destroys the current swapchain, and
+     // rebuilds it against `surface` (refreshing images/format/extent).
+     // Does not take ownership of `surface` and does not touch the surface
+     // this Device already owns; in the expected usage the same surface
+     // handle is passed again on every call.
+     //
+     // Also the sole place the present mode most recently recorded via
+     // setPresentMode() is actually applied [Phase 4 Task 6] -- every
+@@ -303,29 +356,63 @@ public:
+     //
+     // WAYLAND NOTE (design correction, matrix conflict 1): on Wayland,
+     // `currentExtent` is the (0xFFFFFFFF, 0xFFFFFFFF) "surface determines
+     // its own size" sentinel, never a real (0,0) -- this guard's
+     // width==0||height==0 check correctly never fires for that sentinel
+     // (0xFFFFFFFF != 0), so a Wayland surface always falls through to the
+     // normal build path exactly as it did before this task. This engine has
+     // NO reliable zero-extent signal on Wayland at all (matrix row 3) --
+     // see Window::logWaylandMinimizeLimitationOnce() for the one-shot,
+     // diagnosable-not-silent acknowledgment of that gap.
++    //
++    // SURFACE-LOST GUARD [Phase 4 Task 17 follow-up, Issue #73]: if the
++    // capabilities query above FAILS (rather than succeeding with a
++    // queryable extent) with a VkResult isSurfaceLossResult() (device.h)
++    // classifies as "the native window is gone", this function -- like the
++    // zero-extent guard -- never touches vkb::SwapchainBuilder::build(),
++    // enters the surface-lost terminal state (isSurfaceLost() becomes true
++    // -- see acquireNextImage()/present() above), and returns true (also a
++    // successful outcome: there is nothing left this function could do).
++    // UNLIKE the zero-extent guard, this state is not expected to clear on
++    // a later call against the SAME dead surface -- see isSurfaceLost()'s
++    // own comment for the expected caller response (stop calling this
++    // Device+surface pair entirely, proceed to teardown). Any OTHER
++    // capabilities-query failure (out-of-memory, ...) is unchanged: still a
++    // hard `return false`.
+     bool recreateSwapchain(VkSurfaceKHR surface, std::optional<VkExtent2D> extentOverride = std::nullopt);
+ 
+     // True while this Device is in the suspended-present state (the most
+     // recent recreateSwapchain() call observed a 0x0 extent and skipped
+     // building a real swapchain). swapchain()/swapchainImages() are
+     // VK_NULL_HANDLE/empty for the whole duration. Cleared the next time
+     // recreateSwapchain() observes a nonzero extent.
+     bool isSuspended() const { return suspended_; }
+ 
++    // [Phase 4 Task 17 follow-up, Issue #73] True while this Device is in
++    // the surface-lost terminal state: the most recent recreateSwapchain()
++    // call's own vkGetPhysicalDeviceSurfaceCapabilitiesKHR query failed
++    // with a VkResult isSurfaceLossResult() (device.h, above) classifies as
++    // "the native window is gone", rather than succeeding with a
++    // queryable (possibly zero) extent. swapchain()/swapchainImages() are
++    // VK_NULL_HANDLE/empty for the whole duration, exactly like
++    // isSuspended() -- but UNLIKE isSuspended(), this is never expected to
++    // clear on its own: there is no window left to ever report a real
++    // extent again. Only clears if a caller supplies a genuinely different
++    // (live) VkSurfaceKHR to a later recreateSwapchain() call that
++    // succeeds. Callers should treat this exactly like a graceful request
++    // to stop: cease calling acquireNextImage()/present()/
++    // recreateSwapchain() against this Device+surface pair and proceed to
++    // an orderly teardown -- see this project's samples for the
++    // established shape (drain in-flight GPU work via vkDeviceWaitIdle(),
++    // then destroy).
++    bool isSurfaceLost() const { return surfaceLost_; }
++
+     // Test/diagnostic accessors [Phase 4 Task 17, gate ruling #25: "present
+     // skip asserted by CALL COUNTS, never wall-clock"] -- mirror
+     // rx::rhi::Uploader's everUsedDirectPath()/ringWrapCount() convention
+     // (upload.h): production code has no need for these. Count the number
+     // of times this Device has actually issued the real
+     // vkAcquireNextImageKHR/vkQueuePresentKHR call respectively, across its
+     // whole lifetime -- NOT the number of times acquireNextImage()/
+     // present() were merely CALLED (a call made while suspended returns
+     // early and does not increment either counter). A test drives N
+     // suspended frames and asserts these stay exactly at their pre-loop
+@@ -365,15 +452,18 @@ private:
+     // next time either builds a swapchain. Defaults to VsyncOn to match
+     // create()'s explicit FIFO default -- see that function's comment.
+     PresentMode desiredPresentMode_ = PresentMode::VsyncOn;
+     // What the ladder actually resolved `desiredPresentMode_` to, as
+     // reported back by vk-bootstrap. Returned by presentMode().
+     VkPresentModeKHR actualPresentMode_ = VK_PRESENT_MODE_FIFO_KHR;
+ 
+     // [Phase 4 Task 17, FG7] See recreateSwapchain()/isSuspended()'s own
+     // comments above.
+     bool suspended_ = false;
++    // [Phase 4 Task 17 follow-up, Issue #73] See recreateSwapchain()/
++    // isSurfaceLost()'s own comments above.
++    bool surfaceLost_ = false;
+     uint64_t acquireCallCount_ = 0;
+     uint64_t presentCallCount_ = 0;
+ };
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/src/device.cpp b/src/rx_rhi_vk/src/device.cpp
+index 78bd8a0..48d2f89 100644
+--- a/src/rx_rhi_vk/src/device.cpp
++++ b/src/rx_rhi_vk/src/device.cpp
+@@ -18,20 +18,32 @@ const char* presentModeName(VkPresentModeKHR mode) {
+             return "MAILBOX";
+         case VK_PRESENT_MODE_IMMEDIATE_KHR:
+             return "IMMEDIATE";
+         case VK_PRESENT_MODE_FIFO_RELAXED_KHR:
+             return "FIFO_RELAXED";
+         default:
+             return "UNKNOWN";
+     }
+ }
+ 
++// [Phase 4 Task 17 follow-up, Issue #73] See this function's own header
++// comment (device.h) for the full rationale -- VK_ERROR_INITIALIZATION_FAILED
++// is included alongside the spec-documented VK_ERROR_SURFACE_LOST_KHR
++// specifically because it is what THIS project's own verified loader/driver
++// stack returns for a destroyed-native-window Xcb surface; OOM codes are
++// deliberately excluded so a genuine allocation failure still hard-fails
++// Device::recreateSwapchain() rather than being silently treated as "the
++// window is just gone".
++bool isSurfaceLossResult(VkResult result) {
++    return result == VK_ERROR_SURFACE_LOST_KHR || result == VK_ERROR_INITIALIZATION_FAILED;
++}
++
+ namespace {
+ 
+ void destroySurface(const Context& context, VkSurfaceKHR surface) {
+     vkb::destroy_surface(context.vkbInstance(), surface);
+ }
+ 
+ // One entry per bit this Device requires from VkPhysicalDeviceVulkan12Features
+ // [Phase 2 spec Fixed decision #5, R:B1/B2] -- kept as a table of
+ // (name, accessor) pairs rather than ten separate `if`s so the "loud
+ // startup error naming the missing feature" diagnostic below and the
+@@ -529,20 +541,21 @@ Device& Device::operator=(Device&& other) noexcept {
+         bufferDeviceAddressEnabled_ = other.bufferDeviceAddressEnabled_;
+         samplerAnisotropyEnabled_ = other.samplerAnisotropyEnabled_;
+         depthClampEnabled_ = other.depthClampEnabled_;
+         swapchain_ = other.swapchain_;
+         swapchainImages_ = std::move(other.swapchainImages_);
+         swapchainFormat_ = other.swapchainFormat_;
+         swapchainExtent_ = other.swapchainExtent_;
+         desiredPresentMode_ = other.desiredPresentMode_;
+         actualPresentMode_ = other.actualPresentMode_;
+         suspended_ = other.suspended_;
++        surfaceLost_ = other.surfaceLost_;
+         acquireCallCount_ = other.acquireCallCount_;
+         presentCallCount_ = other.presentCallCount_;
+ 
+         other.instance_ = VK_NULL_HANDLE;
+         other.physicalDevice_ = VK_NULL_HANDLE;
+         other.device_ = VK_NULL_HANDLE;
+         other.surface_ = VK_NULL_HANDLE;
+         other.graphicsQueue_ = VK_NULL_HANDLE;
+         other.graphicsQueueFamily_ = 0;
+         other.presentQueue_ = VK_NULL_HANDLE;
+@@ -554,20 +567,21 @@ Device& Device::operator=(Device&& other) noexcept {
+         other.bufferDeviceAddressEnabled_ = false;
+         other.samplerAnisotropyEnabled_ = false;
+         other.depthClampEnabled_ = false;
+         other.swapchain_ = VK_NULL_HANDLE;
+         other.swapchainImages_.clear();
+         other.swapchainFormat_ = VK_FORMAT_UNDEFINED;
+         other.swapchainExtent_ = VkExtent2D{0, 0};
+         other.desiredPresentMode_ = PresentMode::VsyncOn;
+         other.actualPresentMode_ = VK_PRESENT_MODE_FIFO_KHR;
+         other.suspended_ = false;
++        other.surfaceLost_ = false;
+         other.acquireCallCount_ = 0;
+         other.presentCallCount_ = 0;
+     }
+     return *this;
+ }
+ 
+ Device::~Device() {
+     destroyAll();
+ }
+ 
+@@ -592,20 +606,26 @@ AcquireResult Device::acquireNextImage(VkSemaphore signal) {
+     // semaphores around].
+     RX_ASSERT_MAIN_THREAD("Device::acquireNextImage");
+     RX_ZONE;
+ 
+     // [Phase 4 Task 17, FG7, gate ruling #25] Suspended-present short
+     // circuit: skip-acquire-ENTIRELY (never call vkAcquireNextImageKHR at
+     // all) while there is no live swapchain to acquire from -- see
+     // recreateSwapchain()'s own comment for how this state is entered/
+     // cleared. acquireCallCount_ deliberately does NOT increment here, so
+     // a test can assert "zero real acquires" by call count.
++    // [Phase 4 Task 17 follow-up, Issue #73] Checked before suspended_ --
++    // see isSurfaceLost()'s own comment (device.h) for why the two never
++    // overlap in practice. Also never increments acquireCallCount_.
++    if (surfaceLost_) {
++        return AcquireResult{SwapchainStatus::SurfaceLost, 0};
++    }
+     if (suspended_) {
+         return AcquireResult{SwapchainStatus::Suspended, 0};
+     }
+ 
+     uint32_t imageIndex = 0;
+     VkResult result = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, signal, VK_NULL_HANDLE, &imageIndex);
+     ++acquireCallCount_;
+     switch (result) {
+         case VK_SUCCESS:
+         case VK_SUBOPTIMAL_KHR:
+@@ -628,20 +648,25 @@ SwapchainStatus Device::present(uint32_t imageIndex, VkSemaphore wait) {
+     RX_ZONE;
+ 
+     // [Phase 4 Task 17, FG7] Same suspended short circuit as
+     // acquireNextImage() above -- see that function's comment. In the
+     // documented usage (acquire, then present the SAME frame) this branch
+     // is reached only defensively: a caller that already saw
+     // SwapchainStatus::Suspended from acquireNextImage() has no valid
+     // imageIndex to present and is expected to skip straight to the next
+     // iteration instead of calling this at all (every sample this task
+     // touches does exactly that).
++    // [Phase 4 Task 17 follow-up, Issue #73] Same surface-lost short
++    // circuit as acquireNextImage() above.
++    if (surfaceLost_) {
++        return SwapchainStatus::SurfaceLost;
++    }
+     if (suspended_) {
+         return SwapchainStatus::Suspended;
+     }
+ 
+     VkPresentInfoKHR presentInfo{};
+     presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+     if (wait != VK_NULL_HANDLE) {
+         presentInfo.waitSemaphoreCount = 1;
+         presentInfo.pWaitSemaphores = &wait;
+     }
+@@ -709,27 +734,53 @@ bool Device::recreateSwapchain(VkSurfaceKHR surface, std::optional<VkExtent2D> e
+     // without a display server that will actually report a zero-sized
+     // surface (matrix row 6) -- every production call site leaves it at the
+     // default (std::nullopt) and gets the real query below.
+     VkExtent2D queriedExtent{0, 0};
+     if (extentOverride.has_value()) {
+         queriedExtent = *extentOverride;
+     } else {
+         VkSurfaceCapabilitiesKHR caps{};
+         VkResult capsResult = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice_, surface, &caps);
+         if (capsResult != VK_SUCCESS) {
++            // [Phase 4 Task 17 follow-up, Issue #73] SURFACE-LOST GUARD --
++            // see this function's own header comment (device.h) for the
++            // full rationale. Distinguished from the zero-extent guard
++            // below: that guard runs on a SUCCESSFUL query that happens to
++            // report 0x0; this runs when the query itself FAILED, which
++            // only ever legitimately happens when the native window
++            // backing this surface no longer exists.
++            if (isSurfaceLossResult(capsResult)) {
++                if (!surfaceLost_) {
++                    RX_LOG_INFO(
++                        "Device::recreateSwapchain: surface capabilities query failed with VkResult={} -- the "
++                        "underlying native window is gone; entering the surface-lost terminal state (no further "
++                        "acquire/present/recreateSwapchain calls against this surface are expected) [Phase 4 Task "
++                        "17 follow-up, Issue #73]",
++                        static_cast<int>(capsResult));
++                }
++                surfaceLost_ = true;
++                return true;
++            }
+             RX_LOG_ERROR("Device::recreateSwapchain: vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed: VkResult={}",
+                          static_cast<int>(capsResult));
+             return false;
+         }
+         queriedExtent = caps.currentExtent;
+     }
+ 
++    // A successful query this call proves the surface is NOT lost, whether
++    // or not the extent it reports is zero -- clears any surface-lost state
++    // a caller-supplied brand-new (live) surface may be recovering from
++    // (see isSurfaceLost()'s own comment on when this can legitimately
++    // happen).
++    surfaceLost_ = false;
++
+     if (queriedExtent.width == 0 || queriedExtent.height == 0) {
+         // Skip vkb::SwapchainBuilder::build() ENTIRELY -- no swapchain
+         // object is created or touched (matches the Khronos-tutorial
+         // "minimization results in a frame buffer size of 0" pattern:
+         // skip-acquire-entirely, not acquire-then-discard). swapchain_
+         // stays VK_NULL_HANDLE / swapchainImages_ stays empty from above;
+         // swapchainExtent_ is recorded as the queried (possibly
+         // partially-zero) extent so callers reading it back see reality.
+         swapchainExtent_ = queriedExtent;
+         if (!suspended_) {
+diff --git a/src/rx_rhi_vk/tests/surface_loss_test.cpp b/src/rx_rhi_vk/tests/surface_loss_test.cpp
+new file mode 100644
+index 0000000..e18d54d
+--- /dev/null
++++ b/src/rx_rhi_vk/tests/surface_loss_test.cpp
+@@ -0,0 +1,38 @@
++// [Phase 4 Task 17 follow-up, Issue #73] Device-free tier for
++// isSurfaceLossResult() (device.h) -- pure classifier, zero Vulkan device
++// needed, mirroring eviction_contract_test.cpp's own "pure CPU logic" shape
++// among this binary's test files. The real end-to-end path (a genuinely
++// destroyed native window making Device::recreateSwapchain() enter the
++// surface-lost terminal state via this SAME classifier) is
++// MANUAL_VERIFICATION-only -- see this task's own report: no CI driver/
++// display backend this repo's fixtures use can be made to genuinely
++// destroy a live window out from under a running process the way a
++// real desktop's window manager (or `xdotool windowclose`, the tool used to
++// find and verify this) can, mirroring window_state_test.cpp's own "matrix
++// row 6" precedent for the zero-extent guard's DI-seam split.
++#include <doctest/doctest.h>
++#include <rx_rhi_vk/device.h>
++
++using rx::rhi::isSurfaceLossResult;
++
++TEST_CASE("isSurfaceLossResult(): true for VK_ERROR_SURFACE_LOST_KHR -- the Vulkan spec's own documented code for "
++          "a surface whose native window is gone") {
++    CHECK(isSurfaceLossResult(VK_ERROR_SURFACE_LOST_KHR));
++}
++
++TEST_CASE("isSurfaceLossResult(): true for VK_ERROR_INITIALIZATION_FAILED -- NOT a spec-documented return for "
++          "vkGetPhysicalDeviceSurfaceCapabilitiesKHR, but empirically what this project's own verified NVIDIA/Xcb "
++          "loader stack returns for a destroyed-native-window surface [Issue #73's own reproduction]") {
++    CHECK(isSurfaceLossResult(VK_ERROR_INITIALIZATION_FAILED));
++}
++
++TEST_CASE("isSurfaceLossResult(): false for genuine, unrelated errors -- these must still hard-fail "
++          "Device::recreateSwapchain() rather than being silently treated as 'the window is just gone' "
++          "[revert-discrimination: an implementation that classified ANY non-VK_SUCCESS result as surface-loss "
++          "would incorrectly pass VK_ERROR_OUT_OF_HOST_MEMORY/VK_ERROR_OUT_OF_DEVICE_MEMORY here too]") {
++    CHECK_FALSE(isSurfaceLossResult(VK_ERROR_OUT_OF_HOST_MEMORY));
++    CHECK_FALSE(isSurfaceLossResult(VK_ERROR_OUT_OF_DEVICE_MEMORY));
++    CHECK_FALSE(isSurfaceLossResult(VK_ERROR_DEVICE_LOST));
++    CHECK_FALSE(isSurfaceLossResult(VK_ERROR_OUT_OF_DATE_KHR));
++    CHECK_FALSE(isSurfaceLossResult(VK_SUCCESS));
++}
+diff --git a/src/rx_rhi_vk/tests/window_state_test.cpp b/src/rx_rhi_vk/tests/window_state_test.cpp
+index 6644302..e602425 100644
+--- a/src/rx_rhi_vk/tests/window_state_test.cpp
++++ b/src/rx_rhi_vk/tests/window_state_test.cpp
+@@ -13,36 +13,37 @@
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/upload.h>
+ #include <rx_platform/window.h>
+ #include <SDL3/SDL.h>
+ 
+ #include <array>
+ #include <chrono>
+ #include <cstdint>
+ #include <optional>
++#include <thread>
+ #include <utility>
+ 
+ namespace {
+ 
+ // Same skip-guarded windowed fixture shape as device_test.cpp/
+ // upload_test.cpp -- kept local (separate translation unit) per this
+ // project's own established convention (frame_sync_test.cpp's own comment
+ // on why it doesn't share device_test.cpp's anonymous-namespace fixture).
+ struct WindowStateTestFixture {
+     rx::platform::Window window;
+     rx::rhi::Context context;
+     VkSurfaceKHR surface;
+ };
+ 
+-std::optional<WindowStateTestFixture> makeFixture(const char* title, bool visible = false) {
+-    auto window = rx::platform::Window::create(title, 64, 64, visible);
++std::optional<WindowStateTestFixture> makeFixture(const char* title, bool visible = false, bool resizable = false) {
++    auto window = rx::platform::Window::create(title, 64, 64, visible, resizable);
+     if (!window.has_value()) {
+         MESSAGE("no display backend available, skipping window-state test");
+         return std::nullopt;
+     }
+ 
+     auto extensions = window->requiredVulkanInstanceExtensions();
+     if (extensions.empty()) {
+         MESSAGE("video driver reports no Vulkan surface extensions (e.g. dummy driver), skipping window-state "
+                  "test");
+         return std::nullopt;
+@@ -290,10 +291,84 @@ TEST_CASE("Window::setFullscreen() double-toggle routes through the SAME Device:
+                  "or a WM that ignores an unmapped/undecorated window's fullscreen hint) -- the resize-parity "
+                  "assertions above were skipped, but recreateSwapchain() itself was still exercised after every "
+                  "toggle with zero validation errors, which is this test's load-bearing claim either way");
+     }
+ 
+     // Accumulated across the WHOLE sequence (both cycles, both
+     // directions), not just per-transition -- catches a leak that only
+     // shows up on the second cycle.
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
++
++// ===== Programmatic live resize -> Device::recreateSwapchain() [Issue #36]
++// -- the matrix rows 4/5 "exactly one recreation call site" pattern the
++// fullscreen double-toggle test above already establishes, exercised here
++// against a REAL SDL_SetWindowSize() live resize instead of a fullscreen
++// toggle. Same "WM-grant-adaptive" shape: a bare Xvfb/WM-less backend may
++// silently decline to actually resize an unmapped/undecorated window, so
++// this asserts the UNCONDITIONAL floor (recreateSwapchain() succeeds,
++// isSuspended()==false, zero validation errors) regardless, with the
++// resize-parity assertion gated on whether this environment's driver
++// actually granted it. Creates its own fixture with `resizable=true`
++// (Issue #36's own new Window::create() parameter) -- proving that flag's
++// SDL_WINDOW_RESIZABLE wiring is exercised here too, not just asserted in
++// isolation (src/rx_platform/tests/window_test.cpp's own device-free
++// test). Human-driven drag-resize itself stays MANUAL_VERIFICATION -- see
++// this task's own report -- this proves the PROGRAMMATIC floor. ==========
++TEST_CASE("A real SDL_SetWindowSize() resize, followed by Device::recreateSwapchain() (the exact call every "
++          "NeedsRecreate/live-drag-resize path in this codebase already uses, no extentOverride seam), succeeds "
++          "with zero validation errors and leaves the device unsuspended") {
++    auto fixture = makeFixture("rx_rhi_vk_window_state_live_resize", /*visible=*/true, /*resizable=*/true);
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto device = rx::rhi::Device::create(fixture->context, fixture->surface);
++    REQUIRE(device.has_value());
++    CHECK_FALSE(device->isSuspended());
++
++    int beforeW = 0;
++    int beforeH = 0;
++    SDL_GetWindowSizeInPixels(fixture->window.sdlWindow(), &beforeW, &beforeH);
++    const int requestedW = beforeW + 64;
++    const int requestedH = beforeH + 48;
++
++    if (!SDL_SetWindowSize(fixture->window.sdlWindow(), requestedW, requestedH)) {
++        MESSAGE("SDL_SetWindowSize failed on this video driver, skipping the remainder of this check");
++        return;
++    }
++
++    // Same bounded-repoll-until-quiescent shape as
++    // src/rx_platform/tests/window_test.cpp's own drainUntilQuiescent() --
++    // a real WM applies a programmatic resize asynchronously.
++    int afterW = beforeW;
++    int afterH = beforeH;
++    for (int attempt = 0; attempt < 20; ++attempt) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(10));
++        fixture->window.pumpEvents();
++        SDL_GetWindowSizeInPixels(fixture->window.sdlWindow(), &afterW, &afterH);
++        if (afterW == requestedW && afterH == requestedH) {
++            break;
++        }
++    }
++
++    const bool resizeGranted = (afterW != beforeW || afterH != beforeH);
++    if (!resizeGranted) {
++        MESSAGE("this video driver/window-manager never actually resized the window on SDL_SetWindowSize() -- e.g. "
++                 "CI's bare Xvfb backend, no window manager to honor the request. The unconditional floor "
++                 "(recreateSwapchain() success, isSuspended()==false, zero validation errors) is still exercised "
++                 "below.");
++    }
++
++    // The SAME Device::recreateSwapchain(surface) call every real
++    // NeedsRecreate/live-drag-resize path in this codebase uses -- no
++    // extentOverride, no bespoke resize-handling function.
++    REQUIRE(device->recreateSwapchain(fixture->surface));
++    CHECK_FALSE(device->isSuspended());
++
++    if (resizeGranted) {
++        CHECK(device->swapchainExtent().width == static_cast<uint32_t>(afterW));
++        CHECK(device->swapchainExtent().height == static_cast<uint32_t>(afterH));
++    }
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
