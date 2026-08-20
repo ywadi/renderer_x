@@ -734,6 +734,26 @@ TEST_CASE("Window::setFullscreen(true) enters borderless-desktop fullscreen (SDL
     CHECK_FALSE(window->isFullscreen());
 }
 
+// ===== Resizable window flag [Issue #36] ===================================
+TEST_CASE("Window::create()'s `resizable` parameter threads through to SDL_WINDOW_RESIZABLE -- defaults to false "
+          "(every caller written before this parameter existed keeps its pre-existing non-resizable behavior "
+          "unchanged), true when explicitly requested [revert-discrimination: an implementation that ignored the "
+          "parameter and always/never set the flag fails one of the three cases below]") {
+    auto defaulted = rx::platform::Window::create("rx_platform_resizable_default_test", 64, 64, /*visible=*/false);
+    REQUIRE(defaulted.has_value());
+    CHECK((SDL_GetWindowFlags(defaulted->sdlWindow()) & SDL_WINDOW_RESIZABLE) == 0);
+
+    auto explicitFalse =
+        rx::platform::Window::create("rx_platform_resizable_false_test", 64, 64, /*visible=*/false, /*resizable=*/false);
+    REQUIRE(explicitFalse.has_value());
+    CHECK((SDL_GetWindowFlags(explicitFalse->sdlWindow()) & SDL_WINDOW_RESIZABLE) == 0);
+
+    auto resizable =
+        rx::platform::Window::create("rx_platform_resizable_true_test", 64, 64, /*visible=*/false, /*resizable=*/true);
+    REQUIRE(resizable.has_value());
+    CHECK((SDL_GetWindowFlags(resizable->sdlWindow()) & SDL_WINDOW_RESIZABLE) != 0);
+}
+
 // ===== Gamepad [Phase 4 Task 20, gate ruling #14, matrix rows 4-10] =======
 // Every test below drives a REAL SDL_Gamepad through SDL_AttachVirtualJoystick
 // (VirtualGamepad helper, top of this file) -- CI-automatable per the gate

@@ -39,7 +39,7 @@ void logWaylandMinimizeLimitationOnce(const char* platformName) {
     }
 }
 
-std::optional<Window> Window::create(const char* title, int width, int height, bool visible) {
+std::optional<Window> Window::create(const char* title, int width, int height, bool visible, bool resizable) {
     if (!SDL_WasInit(SDL_INIT_VIDEO)) {
         if (!SDL_Init(SDL_INIT_VIDEO)) {
             RX_LOG_WARN("SDL_Init(SDL_INIT_VIDEO) failed: {}", SDL_GetError());
@@ -90,6 +90,9 @@ std::optional<Window> Window::create(const char* title, int width, int height, b
     SDL_WindowFlags flags = SDL_WINDOW_VULKAN;
     if (!visible) {
         flags |= SDL_WINDOW_HIDDEN;
+    }
+    if (resizable) {
+        flags |= SDL_WINDOW_RESIZABLE;
     }
 
     SDL_Window* window = SDL_CreateWindow(title, width, height, flags);

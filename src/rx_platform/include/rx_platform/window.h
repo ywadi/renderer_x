@@ -17,7 +17,15 @@ public:
     Window& operator=(const Window&) = delete;
     ~Window();
 
-    static std::optional<Window> create(const char* title, int width, int height, bool visible);
+    // `resizable` [Phase 4 Task 17 follow-up, Issue #36] adds SDL_WINDOW_RESIZABLE
+    // (defaults to false, matching every caller written before this parameter
+    // existed) -- purely a WM/decoration hint for USER drag-resize; it has no
+    // effect on programmatic SDL_SetWindowSize()/setFullscreen() calls, which
+    // work regardless, and callers still drive any resulting swapchain
+    // recreation themselves via rx::rhi::Device::recreateSwapchain() (this
+    // class owns no Vulkan handle at all).
+    static std::optional<Window> create(const char* title, int width, int height, bool visible,
+                                         bool resizable = false);
 
     SDL_Window* sdlWindow() const { return window_; }
 
