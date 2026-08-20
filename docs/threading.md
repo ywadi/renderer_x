@@ -105,10 +105,102 @@ and compiles to nothing at all when it is OFF:
   `vertexBufferHandle()`/`indexBufferHandle()`) carry the identical
   guard for the same reason, though production code has no need for
   them. (`src/rx_asset/include/rx_asset/geometry_pool.h`)
-- **`rx::scene::*Manager` registries** (future, Stage 2) —
-  `RenderableManager`/`TransformManager`/`LightManager` mutation
-  (create/set/destroy) stays main-thread-only; read-only SoA traversal for
-  culling (below) does not. Not guarded — does not exist yet.
+- **`rx::asset::Registry`** [Phase 4 Stage 1 Tasks 13/15, spec D9/D24] —
+  `importGltfAsync()`/`cancelImport()`/`importProgress()`/`~Registry()`/
+  `mesh()`/`material()`/`texture()` **[guarded, all six]**: the entire
+  async-import surface (`importGltfAsync()`/`cancelImport()`/
+  `importProgress()` — this Registry's "main" thread is whichever thread
+  also calls `scheduler.pumpMain()` each frame, since that pump loop is
+  what actually advances an in-flight import; see registry.h's own
+  "BYTE-SOURCE LIFETIME CONTRACT"/"CANCELLATION"/"PROGRESS" sections for the
+  full async contract) is main-thread-only exactly like every other
+  GPU-object-mutation entry point above. The read accessors
+  (`mesh()`/`material()`/`texture()`) hold the identical no-internal-lock
+  posture GeometryPool's own reads do — narrowed to guarded main-thread-only
+  this fix wave [Phase 4 exit fix wave, M2], mirroring the Task-12
+  GeometryPool ruling. `~Registry()` is guarded too: its cancel-then-drain
+  teardown sequence (`drainAndRollbackAbandonedAsyncJob()` → a bounded
+  reap-poll gate, leak-not-UAF on timeout) assumes the same single calling
+  thread as every other mutator. `decodeForUpload()`-style any-thread
+  carve-outs do not exist on this class — the compute-heavy half of async
+  import runs on `rx::task::Scheduler` workers, but it never calls back
+  into `Registry` directly (`import_pipeline.h`'s compute/marshal split):
+  only the marshal half, posted back via `postToMain()`, ever touches this
+  class. **Disclosure (pre-existing, out of this fix wave's scope):** the
+  SYNCHRONOUS `importGltf()` overloads and `evictForTesting()` are
+  documented main-thread-only by this same convention but do NOT carry
+  their own `RX_ASSERT_MAIN_THREAD` call anywhere in their call chain
+  (`importGltf()` → `importGltfPipeline()` → `marshalGltfImportSync()` →
+  `registerMesh()`/`registerMaterial()`, none guarded) — every in-tree
+  caller already respects the documented contract, so this is a
+  documentation-honesty gap of the same F5/I2 class, not a reproduced
+  violation; recorded here rather than silently left implied-guarded.
+  (`src/rx_asset/include/rx_asset/registry.h`)
+- **`rx::asset::TextureCache`** [Phase 4 Stage 1 Task 14, spec D10/D11/D24/
+  D25] — `create()`/`load()`/`loadFromBytes()`/`registerDecoded()`/
+  `flushPendingUploads()`/`isUploadComplete()`/`resolve()`/
+  `fallbackHandle()`/`checkerboardHandle()`/`getOrCreateSampler()`/
+  `getOrCreateSamplerBindlessIndex()`/`stats()`/`evictForTesting()`/
+  `releaseUnpublished()` (and the rest of this class's own GPU-object-
+  mutating/read surface) **[guarded]**: GPU-object mutation (Texture2D
+  creation, Uploader submission, BindlessTable registration/release,
+  VkSampler creation) is main-thread-only, matching GeometryPool/Registry/
+  Uploader/BindlessTable's identical convention; read accessors share the
+  same posture (no internal lock). **`decodeForUpload()` is the one
+  deliberate any-thread carve-out on this class** — worker-safe by design
+  (the async-import pipeline's texture-decode stage calls it from an
+  `rx::task::Scheduler` worker), performing pure CPU decode/transcode with
+  zero GPU-object touch; every OTHER method stays main-thread-only.
+  (`src/rx_asset/include/rx_asset/texture_cache.h`)
+- **`rx::scene::Scene`** [Phase 4 Stage 2 Task 18, spec D19] — every public
+  method **[guarded, all 35 call sites]**: this class's SoA columns are
+  plain `std::vector`s with no internal synchronization, matching every
+  other GPU-adjacent-state-owning type above. Scene itself never touches
+  the GPU directly, but its data feeds `DrawListBuilder::build()`'s
+  per-frame culling, which does, so the same single-writer-thread
+  discipline applies. (`src/rx_scene/include/rx_scene/scene.h`)
+- **`rx::scene::DrawListBuilder`** [Phase 4 Stage 2 Task 19, spec D15] —
+  `build()`/`buildShadow()` **[guarded, both]** [Phase 4 exit fix wave, M1]:
+  both read `Scene`'s own main-thread-only accessors and mutate this
+  builder's private reused scratch storage with no internal
+  synchronization — the PARALLEL portion (AABB-vs-frustum culling) fans out
+  via `scheduler.parallelFor()` over data already snapshotted from `Scene`
+  on the calling thread before fan-out, so worker chunks never call a
+  `Scene`/`MaterialResolveFn`/`MeshSubmeshesFn` accessor themselves, only
+  index into already-captured spans. **D27's own main-thread half**:
+  `rx::scene::resolveDrawGroups()` **[guarded]** pre-resolves every
+  distinct `materialIndex` boundary's pipeline token ONCE, on the main
+  thread, before any chunk fan-out — `recordDrawList()`'s own
+  `RecordChunkFn` callback (the chunked submit helper, run on
+  `scheduler.parallelFor()` workers) structurally never receives
+  `PipelineResolveFn` at all, so it cannot reach the guarded resolver even
+  by mistake (see draw_list.h's own "D27" section for the full mechanism).
+  (`src/rx_scene/include/rx_scene/draw_list.h`)
+- **`rx::shadow::ShadowCasterPipeline`** [Phase 4 Stage 2 Task 22, spec D21]
+  — `create()` and destruction **[guarded, both]**: ordinary Vulkan
+  object-lifetime rules, matching every other GPU-object-owning type's
+  create()/destroy() above. `pipeline()`/`pipelineLayout()`/
+  `bindAndSetDepthBias()` are read-only/record-time and may be called from
+  any thread already permitted to record into the target command buffer
+  (matching every other record-time helper in this codebase — no internal
+  mutable state) — NOT main-thread-only, unlike this class's own
+  create()/destroy(). (`src/rx_shadow/include/rx_shadow/shadow_caster_pipeline.h`)
+- **`rx::graph::Executor`** [Phase 4 Task 7; Stage-0 audit F5-remainder,
+  stage0-audit.md:136/390] — `realize()`/`execute()` **[guarded, both]**
+  [Phase 4 exit fix wave, I2]: chunk pool resets, secondary-buffer reuse,
+  and `DeletionQueue` pacing all assume these run on the Scheduler's own
+  main thread, exactly once per real fence-bounded frame (`executor.h`'s
+  own `execute()` doc comment has the full caller-discipline bound this
+  guard now enforces instead of merely documenting).
+  (`src/rx_graph/include/rx_graph/executor.h`)
+- **`rx::rhi::FrameSync`** [Stage-0 audit F5-remainder, stage0-audit.md:
+  136/390] — `create()`/`advanceFrame()`/`onSwapchainRecreated()`
+  **[guarded, all three]** [Phase 4 exit fix wave, I2]: owns the present
+  loop's own per-frame-in-flight state (fences/semaphores/command pools),
+  mutated with no internal synchronization — same convention every existing
+  caller (every sample's frame loop) already follows by construction, now
+  enforced rather than documented-by-comment-only.
+  (`src/rx_rhi_vk/include/rx_rhi_vk/frame_sync.h`)
 - **`rx::platform::Window`** [Phase 4 Task 20, gate ruling #14] —
   `pumpEvents()`/`setRelativeMouseMode()`/`relativeMouseModeWanted()`/
   `consumeMouseDelta()`/`setCursorVisible()`/`cursorVisible()`/
