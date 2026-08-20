@@ -1,0 +1,2087 @@
+# Review package: 9c76f01..fcedd3c
+
+## Commits
+fcedd3c docs: texture-path round report (mip generation + oversized-upload staging)
+5834114 feat(rx_rhi_vk): chunked staging for texture uploads exceeding the ring cap
+dd1e110 feat(rx_asset): runtime mip-chain generation for the stb PNG/JPG decode path
+
+## Files changed
+ .../texture-path-round-report.md                   | 474 +++++++++++++++++++++
+ .../texture-path-round-sponza-nvidia.png           | Bin 0 -> 393874 bytes
+ .../texture-path-round-workshop-nvidia.png         | Bin 0 -> 417510 bytes
+ assets/test/oversized_texture_probe.gltf           | 158 +++++++
+ assets/test/textures/generate_fixtures.sh          |  11 +
+ assets/test/textures/oversized_quadrant.png        | Bin 0 -> 30041 bytes
+ samples/08_gltf_viewer/references/loaded_scene.png | Bin 21025 -> 20191 bytes
+ samples/09_scene/references/grid_scene.png         | Bin 9434 -> 9852 bytes
+ src/rx_asset/CMakeLists.txt                        |   5 +
+ src/rx_asset/include/rx_asset/texture_decode.h     |  61 ++-
+ src/rx_asset/stb_image_resize_impl.cpp             |  23 +
+ src/rx_asset/tests/texture_cache_test.cpp          |  77 +++-
+ src/rx_asset/tests/texture_decode_test.cpp         | 215 ++++++++++
+ src/rx_asset/texture_decode.cpp                    | 175 +++++++-
+ src/rx_rhi_vk/include/rx_rhi_vk/upload.h           |  46 +-
+ src/rx_rhi_vk/src/upload.cpp                       | 180 ++++++--
+ src/rx_rhi_vk/tests/upload_test.cpp                | 151 +++++++
+ 17 files changed, 1518 insertions(+), 58 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/texture-path-round-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/texture-path-round-report.md
+new file mode 100644
+index 0000000..401d40e
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/texture-path-round-report.md
+@@ -0,0 +1,474 @@
++# Texture-path round report — runtime mips (Option A) + oversized-upload staging fix
++
++Brief: `texture-path-round-brief.md`. Repo `/media/ywadi/second/renderer_x`,
++base `main` at `9c76f01` (D5-clean tree except the coordinator's own
++`progress.md` append and pre-existing untracked SDD workspace files, neither
++touched here). Both release-gate items closed in this round.
++
++**Real device used throughout this report's "real-NVIDIA" evidence**:
++`vulkaninfo` under `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json`
++reports `deviceName = NVIDIA GeForce RTX 2080`, `driverInfo = 580.82.07`.
++Lavapipe evidence used `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`
++(mesa llvmpipe) explicitly, per this repo's own D17/regen-script convention.
++Both ICDs are present system-wide on this machine; every command below
++states which one it forced.
++
++## Item A — runtime mip-chain generation for the stb decode path (D10 Option A)
++
++### Design
++
++`decodeStbForUpload()` (`src/rx_asset/texture_decode.cpp`) previously
++uploaded mip 0 only. The fix adds `generateStbMipChain()` (new public
++function, declared in `texture_decode.h` right after `DecodedTextureLevel`,
++same device-free/thread-affinity-NONE header the KTX2 decode layer already
++lives in — no new header, so no new D5 blanket note needed; the existing
++file-level "pure CPU parse/transcode/decode logic... safe to call from any
++thread" comment already covers it) that produces levels 1..N (floor-halving
++down to 1x1, matching Vulkan's own `floor(log2(max(w,h)))+1` total-level
++rule) from an already-decoded RGBA8 mip 0, then `decodeStbForUpload()`
++appends them onto the same `result.levels` the KTX2 path already populates
++generically. No changes were needed in `TextureCache::applyDecodeResult()`
++or `Uploader::uploadImageMips()`'s registration path — confirmed exactly
++what the prior investigation (`sponza-visual-investigation.md` §2.7) found:
++that path was already mip-chain-generic.
++
++**Library-first**: `stb_image_resize2.h` is already vendored — it lives in
++the SAME `stb` GitHub checkout `third_party/CMakeLists.txt`'s existing
++`FetchContent_Declare(stb ...)` pulls for `stb_image.h` (one repo, one pinned
++commit, `RX_STB_TAG`), so no new dependency, no new pin, and no new
++`target_include_directories` were needed — `rx_asset` already inherits
++`stb_SOURCE_DIR` transitively via its existing `PUBLIC` link against
++`rx_rhi_vk`. One new implementation TU was added,
++`src/rx_asset/stb_image_resize_impl.cpp` (`#define
++STB_IMAGE_RESIZE_IMPLEMENTATION`), mirroring `rx_rhi_vk/src/stb_impl.cpp`'s
++own established single-TU-implementation discipline, and added to
++`rx_asset`'s `add_library()` sources.
++
++The library expresses both real kernels this task needs directly, via the
++general `stbir_resize()` entry point (explicit `STBIR_FILTER_BOX` — "same
++result as box for integer scale ratios" per the library's own enum comment
++— not `STBIR_FILTER_DEFAULT`, so every power-of-two halving step is an
++exact, unambiguous arithmetic mean, which is what this round's own
++correctness tests pin against):
++
++- **sRGB roles** (`BaseColor`/`Emissive`, `roleExpectsSrgb()==true`):
++  `STBIR_TYPE_UINT8_SRGB` + `STBIR_RGBA` layout — sRGB-decode, box-average
++  in linear space, sRGB-re-encode for RGB; alpha stays linear (glTF's own
++  "baseColor alpha is coverage, never color" convention — `STBIR_TYPE_UINT8_SRGB`,
++  not `_SRGB_ALPHA`, confirmed by reading the library's own convenience-
++  wrapper source) and is alpha-weighted into the RGB blend (the library's
++  documented anti-"black-fringing" behavior for RGBA + real alpha content —
++  a genuine correctness bonus over a naive per-channel average, not just
++  parity with it).
++- **Every linear-data role** (`MetallicRoughness`/`Occlusion`/`GenericData`,
++  and the pre-renormalize pass for `Normal`): `STBIR_TYPE_UINT8` +
++  `STBIR_4CHANNEL` — plain per-channel box average, deliberately NO alpha
++  weighting (`STBIR_4CHANNEL`, not `STBIR_RGBA` — channel 3 is not real
++  alpha for any of these roles).
++
++**Hand-rolled, explicitly (per the brief's own "otherwise hand-roll the
++small kernels and say so" allowance)**: normal-map renormalization.  No
++general-purpose image resizer has any reason to know a texel encodes a unit
++tangent-space vector — `renormalizeNormalTexelsInPlace()`
++(`texture_decode.cpp`, anonymous namespace) decodes each output texel
++(`2*byte/255-1`), renormalizes to unit length (falling back to the
++tangent-space "straight up" `(0,0,1)` — the same convention D11's own
++flat-normal fallback texture uses — only in the fully-degenerate
++zero-length case), and re-encodes. This is the ONLY hand-rolled numeric
++kernel in the whole implementation; everything else routes through the
++library.
++
++Deviation worth naming explicitly: nothing was hand-rolled as a
++"shortcut" — the library expresses both required kernels natively, so the
++brief's own fallback clause ("prefer the library IF it can express the
++requirements") resolved in the library's favor for the sRGB and plain-linear
++kernels, with hand-rolling scoped to exactly the one thing outside any image
++resizer's domain.
++
++### Correctness tests (new, `src/rx_asset/tests/texture_decode_test.cpp`)
++
++Every math test below constructs its own tiny in-memory RGBA8 buffer (not a
++PNG round-trip) so expected values are exact arithmetic on known bytes, and
++every 2x2→1x1 step is an EXACT box average by construction (no fractional-
++coverage ambiguity for an integer 2x downsample).
++
++**(a) sRGB linear-space averaging** — 2x2 checkerboard, two texels
++`(255,255,255,255)` (white) and two `(0,0,0,255)` (black), role
++`BaseColor`. Reference math (IEC 61966-2-1, implemented independently in
++the test file — NOT calling the same production code path, so this is a
++real cross-check): `srgbToLinear(255)=1.0`, `srgbToLinear(0)=0.0`, linear
++average `=0.5`, `linearToSrgb(0.5) = 1.055*0.5^(1/2.4)-0.055 = 0.7354 ->
++byte 188`. Measured production output: **R=G=B=188, A=255** — exact match.
++A naive byte average of the same 4 bytes is `(255+0+255+0)/4 = 127.5 ->
++127/128`, a ~60-value gap from the correct answer.
++
++**(b) Normal-map renormalization** — 2x2, two symmetric unit tangent-space
++normals `N1=(0.6,0.8,0)`/`N2=(-0.6,0.8,0)` byte-encoded and tiled, role
++`Normal`. Their plain average is `(0,0.8,0)`, length 0.8 (a real, non-
++contrived flattening case). Measured production output, decoded back to a
++vector: `x=0.00392, y=1.0, z=0.00392`, **length = 1.00002** (unit, within
++float rounding).
++
++**(c) Plain linear average** (item 3) — the IDENTICAL (255/0) checkerboard
++input as (a), role `MetallicRoughness`: measured **128** (plain arithmetic
++mean, NOT the sRGB-correct 188) — proves the role selects the colorspace
++path, not the input bytes.
++
++**(d) Chain length/dimensions** (item 5/6c) — NPOT 5x3 source: 2 generated
++levels, `(2,1)` then `(1,1)` (`floor(log2(5))+1=3` total, matches). POT 8x8
++source (role `BaseColor`): 3 generated levels, `(4,4)`, `(2,2)`, `(1,1)`.
++
++**(e) Degenerate input**: width/height 0, or fewer bytes than
++`width*height*4`, returns an empty chain (never fabricates levels).
++
++**(f) End-to-end integration** — `decodeTextureForUpload()` against the
++real, committed `quadrant.png` fixture (8x8): now produces exactly 4 levels
++(`8,4,2,1`), level 0 byte-identical (`256` bytes) to the pre-fix decode.
++
++Command tail (`rx_asset_gltf_tests`, device-free binary,
++`--test-case="*generateStbMipChain*,*decodeTextureForUpload: a real 8x8*"`):
++
++```
++[doctest] test cases:  7 |  7 passed | 0 failed | 48 skipped
++[doctest] assertions: 58 | 58 passed | 0 failed |
++[doctest] Status: SUCCESS!
++```
++
++### Revert-discrimination (empirical, not asserted)
++
++`levelNeedsChunking` is Item B's own function — for Item A the probe was:
++temporarily forced `isSrgb=false`/`isNormal=false` unconditionally in
++`generateStbMipChain()` (simulating a naive byte-average-only revert),
++rebuilt, re-ran the SAME two tests:
++
++```
++generateStbMipChain: BaseColor (sRGB role) box-averages in LINEAR space...
++  CHECK( channel(0) > static_cast<uint8_t>(expectedCorrect - 12) ) is NOT correct!
++    values: CHECK( 128 >  176 )
++  CHECK( channel(0) > 150 ) is NOT correct!
++    values: CHECK( 128 >  150 )
++
++generateStbMipChain: role == Normal renormalizes...
++  CHECK( length > 0.99F ) is NOT correct!
++    values: CHECK( 0.803941 >  0.99 )
++  CHECK( y > 0.9F ) is NOT correct!
++    values: CHECK( 0.803922 >  0.9 )
++
++[doctest] test cases:  6 |  4 passed | 2 failed | 49 skipped
++```
++
++Both correctness tests genuinely fail against the naive revert (128 vs. the
++correct 188; length 0.804 vs. the required [0.99,1.01] band) — real
++discrimination, not a vacuous assertion. The revert was then restored
++byte-for-byte from a saved copy and re-verified green (58/58 assertions).
++
++### D17 blast radius (item 7)
++
++Full serial lavapipe ctest immediately after landing Item A alone showed
++exactly the anticipated blast radius:
++
++```
++sample_08_gltf_viewer_headless ...........***Failed
++sample_09_scene_headless .................***Failed
++  [error] sample_09_scene: D17 grid_scene gate FAILED on lavapipe (first mismatch at (80,132))
++  failingPixels=1154/65536 (1.7609%)
++```
++
++`sample_06_materials_headless` (the brief's third named risk) stayed green
++throughout — checked directly: that sample has NO committed D17 reference
++PNG / pixel gate at all (`find samples/06_materials -iname '*.png'` is
++empty), so it was never actually at risk; the prior investigation's own
++flag was conservative, not wrong to raise.
++
++Regenerated via `tools/regen_references.sh linux-native 08_gltf_viewer` and
++`... 09_scene` (lavapipe-forced, per that script's own hard-coded ICD path —
++the one mechanism this repo has for updating D17 expectations). Only the
++POST-texture-load frames changed:
++
++```
++$ git status --short samples/08_gltf_viewer/references/ samples/09_scene/references/
++ M samples/08_gltf_viewer/references/loaded_scene.png
++ M samples/09_scene/references/grid_scene.png
++```
++
++`loading_state.png` (08_gltf_viewer's pre-import loading-screen frame) is
++untouched — correct, since no texture has loaded yet at that point. Both
++regenerated PNGs were visually reviewed (helmet grid / single helmet render
++correctly, no corruption) before committing. Re-run gates, both PASS:
++
++```
++sample_08_gltf_viewer: D17 loading_state gate: failingPixels=0/65536 pass=true
++sample_08_gltf_viewer: D17 loaded_scene gate: failingPixels=0/65536 pass=true
++sample_08_gltf_viewer: headless gate PASSED
++sample_09_scene: headless gate PASSED
++```
++
++## Item B — oversized texture uploads (the 16MB staging cap)
++
++### Design
++
++`Uploader::uploadImageMips()` (`src/rx_rhi_vk/src/upload.cpp`) previously
++rejected any level whose `size` exceeded the ring buffer's total capacity
++outright, before recording anything — `TextureCache::registerRealTexture()`
++mapped that failure to the D11 checkerboard fallback. Fixed via CHUNKED
++STAGING TRIPS through the SAME fixed-size ring (the brief's own preferred
++option — "preserves bounded memory", no unbounded ring growth, no separate
++transient allocation):
++
++- `levelNeedsChunking()` (new, anonymous-namespace helper): a level that
++  fits in one trip (`size <= ringBufferSize_`) is untouched — byte-for-byte
++  the SAME single-copy code path this method always had. An oversized level
++  is split into consecutive row-groups (`bytesPerRow = size / extent.height`,
++  requiring exact divisibility — true for every uncompressed RGBA8 level
++  unconditionally, and every block-compressed level whose true height is
++  block-aligned, i.e. every level actually large enough to need chunking in
++  practice; a level that fails this check is refused loudly, before any GPU
++  work is recorded, rather than mis-sliced).
++- Each chunk gets its OWN `reserveRingSpace()` reservation, memcpy, and
++  `vkCmdCopyBufferToImage` region (`imageOffset.y` advances to the right
++  vertical strip; `bufferRowLength`/`bufferImageHeight` stay 0, "tightly
++  packed within this chunk", the same Vulkan block-copy convention the
++  existing single-copy path already relies on) — reusing
++  `reserveRingSpace()`'s own existing flush/wrap/reclaim machinery
++  unmodified, so D25's ticket semantics ("a batch's ticket covers every
++  chunk recorded before the next `flush()`") apply with zero new completion-
++  tracking code.
++- Validation happens up front (loop over every level BEFORE recording
++  anything) — same "no partial-batch corruption" contract the method
++  always had: a level whose bytes don't divide evenly into whole rows, or
++  where even a single row exceeds the ring, fails the whole call cleanly.
++
++Checkerboard fallback now fires ONLY for genuine decode failures / an
++un-chunkable level shape — never for size alone, closing the defect exactly
++as specified.
++
++### Tests
++
++**Low-level, `src/rx_rhi_vk/tests/upload_test.cpp`** (deliberately tiny
++rings so the chunked path is exercised cheaply/deterministically):
++
++1. 32x32 RGBA8 (4096 bytes) through a 1024-byte ring — 4 exact 128-byte-row
++   chunks (`rowsPerChunk = 1024/128 = 8`). Byte-exact FULL-IMAGE readback
++   against a non-repeating gradient (`x*7+y`, `y*5+x`, `x^y`) — a
++   misplaced/dropped chunk would corrupt a visible row range, not just
++   "some pixels wrong":
++   ```
++   CHECK( uploader->ringWrapCount() >= 3 ) — values: CHECK( 3 >= 3 )
++   CHECK( std::memcmp(readBackPixels.data(), pixels.data(), pixels.size()) == 0 )
++   ```
++2. A 64-byte ring (smaller than even one 128-byte row) — the "cannot chunk
++   at all" branch: fails cleanly, `flush().value == 0` (nothing was ever
++   recorded).
++
++```
++[doctest] test cases:  2 |  2 passed | 0 failed | 72 skipped
++[doctest] assertions: 23 | 23 passed | 0 failed |
++```
++
++**Real-shaped, end-to-end GPU test, `src/rx_asset/tests/texture_cache_test.cpp`**:
++a NEW committed fixture, `assets/test/textures/oversized_quadrant.png`
++(4096x4096, nearest-neighbor upscale of the SAME `quadrant4x4.png` source
++every other quadrant fixture in this suite uses — real quadrant content,
++30KB on disk since flat regions compress trivially despite the huge pixel
++count) referenced by a new glTF fixture,
++`assets/test/oversized_texture_probe.gltf` (reuses the existing
++`sampler_wrap_probe.bin` quad geometry — same `[0,1]`-UV textured quad
++shape). Imported through the FULL `Registry::importGltf()` path (not just
++`TextureCache::load()` in isolation) against the PRODUCTION default 16MiB
++ring (`TcTestFixture`'s own `Uploader::create(*allocator, *device)`, no
++override):
++
++```
++CHECK( record.width == 4096 )
++CHECK( record.height == 4096 )
++CHECK( record.mipLevels == 13 )     // floor(log2(4096))+1 -- item A composed with item B
++REQUIRE_FALSE( record.isFallback )  // NOT checkerboard
++CHECK( approxEqual(readback->topLeft, {255,0,0}, 2) )     // red
++CHECK( approxEqual(readback->topRight, {0,255,0}, 2) )    // green
++CHECK( approxEqual(readback->bottomLeft, {0,0,255}, 2) )  // blue
++CHECK( approxEqual(readback->bottomRight, {255,255,0}, 2) ) // yellow
++[doctest] test cases:  1 |  1 passed | 0 failed
++[doctest] assertions: 23 | 23 passed | 0 failed
++```
++
++Mip 0 (64MB) needs chunking; mip 1 (2048x2048 = exactly 16MiB) is the
++boundary case (fits in ONE trip, `size <= ringBufferSize_`); every smaller
++level uses the pre-existing single-copy path — this one fixture exercises
++both branches in one real import.
++
++### Revert-discrimination (empirical)
++
++`levelNeedsChunking()` temporarily forced to always report "cannot chunk"
++for anything oversized (simulating the pre-fix hard rejection), rebuilt,
++re-ran BOTH the new tests:
++
++```
++$ ./rx_asset_tests --test-case="*item B*" --validate
++[error] Uploader::uploadImageMips: level 0 is 67108864 bytes (extent 4096x4096), exceeding
++  the 16777216-byte staging ring buffer's total capacity, and its byte size does not divide
++  evenly into whole image rows -- cannot chunk safely
++[error] rx_asset: TextureCache: 'oversized_texture_probe_material baseColor' failed to load
++  (GPU upload/bindless registration failed) -- falling back to the D11 checkerboard
++FATAL ERROR: REQUIRE_FALSE( record.isFallback ) is NOT correct!
++  values: REQUIRE_FALSE( true )
++[doctest] test cases:  1 |  0 passed | 1 failed
++
++$ ./rx_rhi_vk_tests --test-case="*CHUNKED*" --validate
++FATAL ERROR: REQUIRE( uploader->uploadImageMips(...) ) is NOT correct!
++  values: REQUIRE( false )
++[doctest] test cases:  2 |  1 passed | 1 failed
++```
++
++Both fail exactly as the original defect describes (checkerboard fallback /
++outright rejection). Restored byte-for-byte from a saved copy; re-verified
++green.
++
++### Real-world proof — the Workshop asset (real NVIDIA)
++
++`sample_09_scene --present --scene assets/fetched/Workshop/workshop_render_scene.glb
++--validate`, real display (`DISPLAY=:1`), `VK_ICD_FILENAMES` forced to
++`nvidia_icd.json` (GeForce RTX 2080), sustained ~11s (two frames captured
++5s apart via `import -window <id>`), then a real `SIGTERM`:
++
++- `stb-recommend-ktx2` warnings fired 30 times (real stb decode + runtime
++  mip generation engaged for real content).
++- Zero `exceeding...staging`/`cannot chunk` errors.
++- Zero occurrences of `checkerboard`/`fallback` anywhere in the log.
++- Zero raw `[error]` lines; every `Validation Error`/`Validation Warning`
++  line carries this codebase's own pre-existing "known false positive"
++  label (the separate-sampler sync-validation misclassification class
++  already documented elsewhere in this repo) — zero UNFILTERED validation
++  errors.
++- `sample_09_scene: window closed cleanly` logged on the real `SIGTERM`.
++- HUD readout: `Texture: 827444.0 KiB (34 alloc(s))`, `316` renderables —
++  real, large, multi-4K-material texture memory (a checkerboard-only
++  scenario would be a handful of KB, not 827MB).
++
++Frame captured as evidence:
++`texture-path-round-workshop-nvidia.png` (this directory) — garage
++interior, car, tool shelving, all real materials, no checkerboard/magenta
++anywhere visible.
++
++`sample_09_scene --present --scene sponza --validate` (same machine/ICD/
++methodology, `Sponza`) run identically for corroboration: zero unfiltered
++validation errors, `window closed cleanly`, `Texture: 393339.5 KiB (77
++alloc(s))`. Frame: `texture-path-round-sponza-nvidia.png`.
++
++## Verification bar — full results
++
++**Full serial lavapipe ctest** (`VK_ICD_FILENAMES=lvp_icd.json xvfb-run -a
++ctest --output-on-failure -j1`), after the D17 regen:
++
++```
++100% tests passed, 0 tests failed out of 29
++Total Test time (real) =  81.51 sec
++```
++
++**Full serial ctest, real-NVIDIA forced** (`VK_ICD_FILENAMES=nvidia_icd.json
++ctest --output-on-failure -j1`):
++
++```
++100% tests passed, 0 tests failed out of 29
++Total Test time (real) = 137.23 sec
++```
++
++Every GPU-backed TEST_CASE in this suite asserts
++`CHECK_FALSE(context.hasValidationErrors())` inline (the project's own
++established pattern) — 29/29 green on the real driver is itself the "zero
++unfiltered validation errors" proof for the whole suite, not just the two
++samples captured above.
++
++**`rx_asset_tests`/`rx_rhi_vk_tests` explicitly driver-labeled** (both
++binaries, both ICDs, forced independently):
++
++```
++LAVAPIPE  rx_asset_tests:   39 test cases, 619 assertions, 0 failed
++LAVAPIPE  rx_rhi_vk_tests:  74 test cases, 2164 assertions, 0 failed
++NVIDIA    rx_asset_tests:   39 test cases, 619 assertions, 0 failed
++NVIDIA    rx_rhi_vk_tests:  74 test cases, 2187 assertions, 0 failed
++```
++
++(The lavapipe/NVIDIA assertion-count difference, 2164 vs 2187, is a
++pre-existing, unrelated window-resize-parity test that skips some checks
++when the window manager doesn't actually resize an undecorated/unmapped
++window on a fullscreen toggle — logged explicitly by that test itself, not
++a regression here.)
++
++**Zero warnings**: every touched file force-rebuilt (`touch` + full
++rebuild) on BOTH presets; `grep -i warning` against both build logs
++(excluding `_deps/`) returns nothing on either.
++
++**windows-cross-zig build**: clean, 208/208 targets, zero warnings.
++
++**Wine ctest** (this repo's own CI exclusion set,
++`-E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_debug_ui_gpu|sample'`,
++`WINEARCH=win64 xvfb-run -a ctest`):
++
++```
++100% tests passed, 0 tests failed out of 13
++Total Test time (real) = 103.40 sec
++```
++
++Bonus (not required by the exclusion set, run directly as an extra check):
++this machine's Wine install has a working winevulkan->llvmpipe passthrough,
++so `rx_rhi_vk_tests.exe --test-case="*CHUNKED*"` was ALSO run directly under
++Wine and passed (2/2, 23/23 assertions) — the chunked-staging path verified
++under Wine too, not just excluded by policy.
++
++## Files touched
++
++- `src/rx_asset/texture_decode.{h,cpp}` — `generateStbMipChain()` +
++  wiring into `decodeStbForUpload()`.
++- `src/rx_asset/stb_image_resize_impl.cpp` (new) — the
++  `STB_IMAGE_RESIZE_IMPLEMENTATION` TU.
++- `src/rx_asset/CMakeLists.txt` — added the new TU.
++- `src/rx_asset/tests/texture_decode_test.cpp` — 7 new device-free
++  correctness/chain-length/degenerate-input tests.
++- `src/rx_asset/tests/texture_cache_test.cpp` — updated the now-stale
++  "PNG mip level 0 only" assertion (4 levels now); new end-to-end
++  oversized-texture GPU test.
++- `src/rx_rhi_vk/src/upload.cpp`, `include/rx_rhi_vk/upload.h` — chunked-
++  row staging in `uploadImageMips()`; updated the D5 thread-affinity
++  enumeration to name `uploadImageMips()` explicitly (pre-existing gap,
++  fixed in passing since this round was already rewriting that exact
++  method's doc comment).
++- `src/rx_rhi_vk/tests/upload_test.cpp` — 2 new low-level chunked-staging
++  tests.
++- `assets/test/textures/generate_fixtures.sh`,
++  `assets/test/textures/oversized_quadrant.png` (new),
++  `assets/test/oversized_texture_probe.gltf` (new) — the Item B fixture.
++- `samples/08_gltf_viewer/references/loaded_scene.png`,
++  `samples/09_scene/references/grid_scene.png` — D17 regen (lavapipe,
++  provenance above).
++- This report + two evidence PNGs
++  (`texture-path-round-{sponza,workshop}-nvidia.png`).
++
++## Deviations from the brief
++
++None material. Two things worth flagging as positive deviations rather than
++gaps:
++
++1. `stb_image_resize2` needed NO new vendoring/pinning at all (already
++   present in the existing `stb` FetchContent checkout, same pinned
++   commit) — better than the brief's own "check third_party for it or
++   vendor the single header, pinned" anticipated.
++2. The sRGB kernel's alpha-weighted RGB blend (`STBIR_RGBA`, not `_PM`)
++   is a genuine correctness improvement over the brief's own literal
++   "decode sRGB -> average -> re-encode" wording for content with varying
++   alpha (avoids transparent-edge color bleed) — not exercised by this
++   round's own opaque-alpha test fixtures, but real production behavior
++   for any future cutout-alpha baseColor texture.
++
++## Concerns for the coordinator
++
++- Item B's chunking requires a level's bytes to divide evenly into whole
++  image rows to chunk safely; this holds for every level this engine
++  currently produces (uncompressed RGBA8 always; block-compressed KTX2
++  levels large enough to need chunking always, since a level anywhere near
++  the cap is never a 1-2-texel sub-block tail) — but a HYPOTHETICAL future
++  KTX2 level with a genuinely non-block-aligned height AND large enough to
++  need chunking would fail loudly rather than upload. Not exercised by any
++  current asset; flagged for awareness, not a defect.
++- Draco (#31), Workshop bundling, and the release build/rebuild remain the
++  next items in the coordinator's own dispatch order per `progress.md`;
++  untouched here.
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/texture-path-round-sponza-nvidia.png b/.superpowers/sdd/2026-08-11-phase4-scene-assets/texture-path-round-sponza-nvidia.png
+new file mode 100644
+index 0000000..3eb957f
+Binary files /dev/null and b/.superpowers/sdd/2026-08-11-phase4-scene-assets/texture-path-round-sponza-nvidia.png differ
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/texture-path-round-workshop-nvidia.png b/.superpowers/sdd/2026-08-11-phase4-scene-assets/texture-path-round-workshop-nvidia.png
+new file mode 100644
+index 0000000..8e07a9c
+Binary files /dev/null and b/.superpowers/sdd/2026-08-11-phase4-scene-assets/texture-path-round-workshop-nvidia.png differ
+diff --git a/assets/test/oversized_texture_probe.gltf b/assets/test/oversized_texture_probe.gltf
+new file mode 100644
+index 0000000..7fdf502
+--- /dev/null
++++ b/assets/test/oversized_texture_probe.gltf
+@@ -0,0 +1,158 @@
++{
++  "asset": {
++    "version": "2.0",
++    "generator": "rx_asset hand-authored test fixture (texture-path round, item B -- 16MB staging-cap fix)"
++  },
++  "scene": 0,
++  "scenes": [
++    {
++      "nodes": [
++        0
++      ]
++    }
++  ],
++  "nodes": [
++    {
++      "mesh": 0,
++      "name": "quad"
++    }
++  ],
++  "meshes": [
++    {
++      "name": "quad",
++      "primitives": [
++        {
++          "attributes": {
++            "POSITION": 0,
++            "NORMAL": 1,
++            "TANGENT": 2,
++            "TEXCOORD_0": 3
++          },
++          "indices": 4,
++          "material": 0,
++          "mode": 4
++        }
++      ]
++    }
++  ],
++  "materials": [
++    {
++      "name": "oversized_texture_probe_material",
++      "pbrMetallicRoughness": {
++        "baseColorFactor": [
++          1.0,
++          1.0,
++          1.0,
++          1.0
++        ],
++        "baseColorTexture": {
++          "index": 0
++        },
++        "metallicFactor": 1.0,
++        "roughnessFactor": 1.0
++      },
++      "doubleSided": false,
++      "alphaMode": "OPAQUE"
++    }
++  ],
++  "images": [
++    {
++      "uri": "textures/oversized_quadrant.png",
++      "name": "oversized_quadrant"
++    }
++  ],
++  "samplers": [
++    {}
++  ],
++  "textures": [
++    {
++      "source": 0,
++      "sampler": 0
++    }
++  ],
++  "accessors": [
++    {
++      "bufferView": 0,
++      "byteOffset": 0,
++      "componentType": 5126,
++      "count": 4,
++      "type": "VEC3",
++      "min": [
++        -0.5,
++        -0.5,
++        0.0
++      ],
++      "max": [
++        0.5,
++        0.5,
++        0.0
++      ]
++    },
++    {
++      "bufferView": 1,
++      "byteOffset": 0,
++      "componentType": 5126,
++      "count": 4,
++      "type": "VEC3"
++    },
++    {
++      "bufferView": 2,
++      "byteOffset": 0,
++      "componentType": 5126,
++      "count": 4,
++      "type": "VEC4"
++    },
++    {
++      "bufferView": 3,
++      "byteOffset": 0,
++      "componentType": 5126,
++      "count": 4,
++      "type": "VEC2"
++    },
++    {
++      "bufferView": 4,
++      "byteOffset": 0,
++      "componentType": 5123,
++      "count": 6,
++      "type": "SCALAR"
++    }
++  ],
++  "bufferViews": [
++    {
++      "buffer": 0,
++      "byteOffset": 0,
++      "byteLength": 48,
++      "target": 34962
++    },
++    {
++      "buffer": 0,
++      "byteOffset": 48,
++      "byteLength": 48,
++      "target": 34962
++    },
++    {
++      "buffer": 0,
++      "byteOffset": 96,
++      "byteLength": 64,
++      "target": 34962
++    },
++    {
++      "buffer": 0,
++      "byteOffset": 160,
++      "byteLength": 32,
++      "target": 34962
++    },
++    {
++      "buffer": 0,
++      "byteOffset": 192,
++      "byteLength": 12,
++      "target": 34963
++    }
++  ],
++  "buffers": [
++    {
++      "uri": "sampler_wrap_probe.bin",
++      "byteLength": 204
++    }
++  ]
++}
+diff --git a/assets/test/textures/generate_fixtures.sh b/assets/test/textures/generate_fixtures.sh
+index 0ef1d60..d979b0d 100755
+--- a/assets/test/textures/generate_fixtures.sh
++++ b/assets/test/textures/generate_fixtures.sh
+@@ -92,20 +92,31 @@ convert -size 4x4 xc:"#0000FF" face_pz.png
+ convert -size 4x4 xc:"#FFFF00" face_nz.png
+ 
+ # stb (PNG/JPG) fallback-path fixtures -- the SAME quadrant pattern,
+ # scaled up slightly (8x8) so JPEG's own lossy block DCT has enough
+ # spatial extent per flat region to stay recognizably close to its
+ # source color (a raw 4x4 JPEG re-quantizes visibly at block boundaries).
+ convert quadrant4x4.png -filter point -resize 8x8 quadrant8x8.png
+ cp quadrant8x8.png "${OUT_DIR}/quadrant.png"
+ convert quadrant8x8.png -quality 95 "${OUT_DIR}/quadrant.jpg"
+ 
++# [Texture-path round, item B -- the 16MB staging-cap fix] 4096x4096
++# nearest-neighbor upscale of the SAME quadrant pattern: mip 0 alone is
++# 4096*4096*4 = 64MB RGBA8, well over the 16MiB default Uploader ring
++# buffer -- the exact real-world shape (the Workshop asset's own 4K
++# textures) Uploader::uploadImageMips()'s new chunked-row path exists
++# for. Flat-quadrant content compresses to a tiny PNG file despite the
++# huge pixel dimensions (nearest-neighbor upscale of 4 flat 2x2 blocks
++# has essentially zero real entropy) -- safe to commit despite the
++# 4096x4096 logical size.
++convert quadrant4x4.png -filter point -resize 4096x4096 "${OUT_DIR}/oversized_quadrant.png"
++
+ # --- Slot-swap discrimination fixture set [helmet-texture-fix verification
+ # gap] -- five DISTINCT, pure-primary/secondary colors (every channel
+ # either 0 or 255 -- deliberately, so a baseColor/emissive readback is
+ # byte-exact regardless of whether the render pipeline used to read it
+ # back applies an sRGB<->linear round-trip: the sRGB transfer function is
+ # the identity at both 0 and 255), one per StandardPBR texture slot
+ # (baseColor/metallicRoughness/normal/occlusion/emissive), consumed by
+ # cube_slot_swap_probe.gltf (texture_cache_test.cpp's own "slot-swap
+ # discrimination" TEST_CASE). Every color is chosen so that landing in the
+ # WRONG slot is unmistakable from landing in its own -- in particular
+diff --git a/assets/test/textures/oversized_quadrant.png b/assets/test/textures/oversized_quadrant.png
+new file mode 100644
+index 0000000..10f8fd6
+Binary files /dev/null and b/assets/test/textures/oversized_quadrant.png differ
+diff --git a/samples/08_gltf_viewer/references/loaded_scene.png b/samples/08_gltf_viewer/references/loaded_scene.png
+index bcf981e..d9aecd9 100644
+Binary files a/samples/08_gltf_viewer/references/loaded_scene.png and b/samples/08_gltf_viewer/references/loaded_scene.png differ
+diff --git a/samples/09_scene/references/grid_scene.png b/samples/09_scene/references/grid_scene.png
+index 3ee5dcf..19988e3 100644
+Binary files a/samples/09_scene/references/grid_scene.png and b/samples/09_scene/references/grid_scene.png differ
+diff --git a/src/rx_asset/CMakeLists.txt b/src/rx_asset/CMakeLists.txt
+index 141541c..d807f32 100644
+--- a/src/rx_asset/CMakeLists.txt
++++ b/src/rx_asset/CMakeLists.txt
+@@ -39,20 +39,25 @@ add_library(rx_asset STATIC
+     fallbacks.cpp
+     # Phase 4 Stage 1 Task 14 -- KTX2/Basis compressed texture pipeline +
+     # sampler cache (spec D10/D11, gate matrix-issue03 as amended by
+     # gate/rulings-2026-08-18.md #3). texture_decode.{h,cpp} is the
+     # device-free parse/transcode/decode layer (mirrors gltf_pipeline.cpp's
+     # own device-free/GPU split -- see tests/CMakeLists.txt); texture_cache.
+     # {h,cpp} is the GPU-facing layer (Texture2D/Uploader/BindlessTable/
+     # DeletionQueue/sampler cache, D5 main-thread-only).
+     texture_decode.cpp
+     texture_cache.cpp
++    # [texture-path round, D10 Option A] stb_image_resize2's own single
++    # implementation TU -- see stb_image_resize_impl.cpp's own comment for
++    # why this lives in rx_asset (the actual runtime-mip-generation
++    # consumer) rather than rx_rhi_vk's existing stb_impl.cpp.
++    stb_image_resize_impl.cpp
+     # MikkTSpace [G2]: no CMakeLists.txt upstream (two loose files,
+     # "designed to be stand-alone... copied and used as is" per its own
+     # header comment) -- compiled straight into rx_asset, matching this
+     # project's stb/volk-style "no build system -> compile into the
+     # consumer" convention (see third_party/CMakeLists.txt's own comment
+     # on the FetchContent_Populate that fetched mikktspace_SOURCE_DIR).
+     "${mikktspace_SOURCE_DIR}/mikktspace.c"
+ )
+ target_include_directories(rx_asset PUBLIC include)
+ target_include_directories(rx_asset PRIVATE "${mikktspace_SOURCE_DIR}")
+diff --git a/src/rx_asset/include/rx_asset/texture_decode.h b/src/rx_asset/include/rx_asset/texture_decode.h
+index 1a4d090..dfc571a 100644
+--- a/src/rx_asset/include/rx_asset/texture_decode.h
++++ b/src/rx_asset/include/rx_asset/texture_decode.h
+@@ -251,29 +251,34 @@ bool looksLikeKtx2(std::span<const std::byte> bytes);
+ 
+ // Oversized-texture guard [matrix "Dimension/format limits" row]: pure
+ // comparison against a caller-supplied device limit (real callers pass
+ // VkPhysicalDeviceLimits::maxImageDimension2D; tests pass a synthetic
+ // small one) so this is deterministically testable device-free without
+ // assuming what any particular driver/device actually reports.
+ bool exceedsDimensionLimit(uint32_t width, uint32_t height, uint32_t maxDimension2D);
+ 
+ // ---------------------------------------------------------------------
+ // stb PNG/JPG fallback path [D10: "no runtime block compression in Phase
+-// 4"; gate ruling #3 N2: "stb path uploads mip 0 only -- recorded
+-// limitation"]
++// 4"; gate ruling #3 N2 originally recorded "stb path uploads mip 0 only"
++// as a limitation -- CLOSED by the texture-path round's D10 Option A
++// (generateStbMipChain(), below): decodeStbForUpload() (texture_decode.cpp)
++// now appends a full runtime-generated box-filtered mip chain after level
++// 0. Still no runtime BLOCK COMPRESSION for this path (that half of N2
++// stands) -- mip generation and block compression are independent axes.]
+ // ---------------------------------------------------------------------
+ 
+ struct DecodedStbImage {
+     uint32_t width = 0;
+     uint32_t height = 0;
+     bool was16Bit = false;              // stb transparently downconverts -- surfaced for the caller's own log line
+-    std::vector<uint8_t> rgba8;          // tightly packed, 4 bytes/texel, mip 0 ONLY (see this section's own comment)
++    std::vector<uint8_t> rgba8;          // tightly packed, 4 bytes/texel, mip 0 ONLY -- see generateStbMipChain()
++                                          // below for how the REST of the chain gets built.
+ };
+ 
+ // Decodes `bytes` via stb_image (already vendored, rx_rhi_vk/src/
+ // stb_impl.cpp's single STB_IMAGE_IMPLEMENTATION translation unit --
+ // this function only ever calls the DECLARATION-side API, never redefines
+ // the implementation macro). Returns std::nullopt (and, if
+ // `outFailureReason` is non-null, stb's own `stbi_failure_reason()`
+ // string) on any decode failure -- the caller maps that to the D11
+ // checkerboard fallback, never a crash.
+ std::optional<DecodedStbImage> decodeStbImage(std::span<const std::byte> bytes, std::string* outFailureReason);
+@@ -304,20 +309,70 @@ VkFormat stbRgba8Format(TextureRole role);
+ // survive a hand-off to a different thread (worker -> main), so it copies
+ // its bytes out rather than returning a span into a container this
+ // function's own caller may not keep alive.
+ struct DecodedTextureLevel {
+     uint32_t level = 0;
+     uint32_t width = 0;
+     uint32_t height = 0;
+     std::vector<std::byte> bytes;
+ };
+ 
++// [texture-path round, D10 Option A -- see .superpowers/sdd/2026-08-11-
++// phase4-scene-assets/sponza-visual-investigation.md §2.7] Generates the
++// REST of a full, floor-halving box-filtered mip chain for an
++// already-decoded RGBA8 mip-0 image -- level 0 itself is NOT included in
++// the returned vector (the caller already has it verbatim); this
++// function's own output is exactly levels 1..N, where N is the SAME
++// total level count Vulkan's own image-creation rule computes
++// (floor(log2(max(width,height)))+1 levels overall -- see
++// Texture2D::createForPresuppliedMips()'s own VkImageCreateInfo::
++// mipLevels, which this task's caller (decodeStbForUpload(),
++// texture_decode.cpp) feeds `decoded.levels.size()` into directly, no
++// separate cap). `width`/`height` MUST be mip0Rgba8's own true extent
++// (mip0Rgba8.size() >= width*height*4, tightly packed) -- returns an
++// empty vector on a malformed/degenerate input rather than fabricating
++// levels from too little data.
++//
++// PER-ROLE CORRECTNESS (binding, not a shortcut -- see the implementation's
++// own comment for the exact stb_image_resize2 calls this hands off to,
++// this task's own "prefer a ready-made library" choice over a hand-rolled
++// box-filter loop):
++//   - roleExpectsSrgb(role) (BaseColor/Emissive): each level's RGB is
++//     decoded sRGB->linear, box-averaged in LINEAR space, and re-encoded
++//     back to sRGB -- NEVER a naive byte average, which visibly darkens
++//     the image at every level (averaging gamma-encoded bytes as if they
++//     were linear energy is a real, measurable error, not a cosmetic
++//     one). Alpha is treated as already-linear (glTF's own convention:
++//     baseColorTexture alpha is coverage/opacity, never color) and is
++//     alpha-weighted into the RGB average (avoids the classic
++//     transparent-edge "black fringing" artifact a plain unweighted
++//     average produces).
++//   - role == Normal: plain LINEAR box average (no sRGB transform -- this
++//     is tangent-space vector data, never color), then each output
++//     texel's decoded (2*byte/255-1) vector is RENORMALIZED to unit
++//     length before re-encoding -- undoing the "flattening" a plain
++//     average produces (two divergent unit normals average to a SHORTER
++//     vector; sampling that unnormalized visibly softens/darkens
++//     normal-mapped detail at a distance).
++//   - every other role (MetallicRoughness/Occlusion/GenericData): plain
++//     linear box average, no colorspace transform, no renormalization --
++//     already-linear scalar/data channels, exactly D10's own table.
++//
++// Non-power-of-two width/height are handled by the standard floor-halving
++// chain (each level's extent is max(1, previous >> 1) independently per
++// axis) -- stb_image_resize2's own general resize (fractional-ratio box
++// filter) computes the correctly-weighted result for the non-exact-2x
++// steps this produces on an odd dimension, not just the power-of-two
++// case.
++std::vector<DecodedTextureLevel> generateStbMipChain(std::span<const uint8_t> mip0Rgba8, uint32_t width,
++                                                       uint32_t height, TextureRole role);
++
+ // A single log line this function decided was warranted but could not
+ // safely emit itself (this function is thread-affinity-NONE and must not
+ // touch TextureCache's own `loggedFailures_` dedup set, which is
+ // main-thread-only state) -- `category` is the SAME dedup category
+ // TextureCache::shouldLogOnce() already uses internally (e.g.
+ // "unsupported-layout", "oversized", "colorspace", "no-mips",
+ // "stb-recommend-ktx2", "stb-16bit") so the caller can apply the identical
+ // once-per-(debugName,category) dedup this function's own synchronous
+ // sibling (loadKtx2Bytes()/loadStbBytes()) already provides.
+ struct DecodedTextureWarning {
+diff --git a/src/rx_asset/stb_image_resize_impl.cpp b/src/rx_asset/stb_image_resize_impl.cpp
+new file mode 100644
+index 0000000..46d4dec
+--- /dev/null
++++ b/src/rx_asset/stb_image_resize_impl.cpp
+@@ -0,0 +1,23 @@
++// The sole STB_IMAGE_RESIZE_IMPLEMENTATION translation unit for this whole
++// program -- mirrors rx_rhi_vk/src/stb_impl.cpp's own single-TU-
++// implementation discipline (stb_image.h's own real implementation TU),
++// applied to stb_image_resize2.h: same vendored `stb` GitHub repo,
++// third_party/CMakeLists.txt's own single stb FetchContent_Populate (both
++// headers live in the same checkout, `stb_SOURCE_DIR`) -- so no new
++// third_party/CMakeLists.txt wiring was needed, just this new TU added to
++// rx_asset's own add_library() sources (rx_asset already inherits
++// `stb_SOURCE_DIR` on its include path transitively, via its PUBLIC link
++// against rx_rhi_vk, which already exposes it PUBLIC).
++//
++// [texture-path round, D10 Option A -- runtime mip-chain generation for
++// the stb PNG/JPG decode path, .superpowers/sdd/2026-08-11-phase4-scene-
++// assets/sponza-visual-investigation.md §2.7] This project's own "prefer
++// ready-made libraries" rule (CLAUDE.md): stb_image_resize2 already
++// expresses exactly the two box-average kernels rx_asset/texture_decode.cpp's
++// generateStbMipChain() needs (sRGB-aware STBIR_TYPE_UINT8_SRGB, and plain
++// linear STBIR_4CHANNEL with no alpha weighting) -- only the normal-map
++// renormalization step on top (something no general-purpose image resizer
++// has any reason to know about) is hand-rolled, in texture_decode.cpp
++// itself, never here.
++#define STB_IMAGE_RESIZE_IMPLEMENTATION
++#include <stb_image_resize2.h>
+diff --git a/src/rx_asset/tests/texture_cache_test.cpp b/src/rx_asset/tests/texture_cache_test.cpp
+index 84ca876..2d9872b 100644
+--- a/src/rx_asset/tests/texture_cache_test.cpp
++++ b/src/rx_asset/tests/texture_cache_test.cpp
+@@ -795,33 +795,37 @@ TEST_CASE("TextureCache: corrupt PNG bytes (stb decode failure) -> checkerboard
+         return;
+     }
+     makeCache(*fixture);
+     TextureHandle handle = fixture->cache->load(fixturePath("corrupt.png"), TextureRole::BaseColor);
+     CHECK(handle == fixture->cache->checkerboardHandle());
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
+ // ===== stb PNG/JPG fallback path ============================================
+ 
+-TEST_CASE("TextureCache: a real PNG loads via stb to a real, non-fallback texture, mip level 0 only") {
++TEST_CASE("TextureCache: a real PNG loads via stb to a real, non-fallback texture with a FULL runtime-generated "
++          "mip chain [texture-path round, D10 Option A -- previously mip level 0 only]") {
+     auto fixture = makeFixture("rx_asset_tc_png");
+     if (!fixture.has_value()) {
+         return;
+     }
+     makeCache(*fixture);
+     TextureHandle handle = fixture->cache->load(fixturePath("quadrant.png"), TextureRole::BaseColor);
+     REQUIRE(handle.isValid());
+     const TextureRecord& record = fixture->cache->resolve(handle);
+     CHECK_FALSE(record.isFallback);
+     CHECK(record.width == 8);
+     CHECK(record.height == 8);
+-    CHECK(record.mipLevels == 1);
++    // 8x8 -> 4x4 -> 2x2 -> 1x1: 4 levels total, exactly Vulkan's own
++    // floor(log2(max(w,h)))+1 formula -- see generateStbMipChain()'s own
++    // header comment (texture_decode.h).
++    CHECK(record.mipLevels == 4);
+     CHECK(record.format == VK_FORMAT_R8G8B8A8_SRGB);
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
+ TEST_CASE("TextureCache: a real JPEG loads via stb to a real, non-fallback texture") {
+     auto fixture = makeFixture("rx_asset_tc_jpg");
+     if (!fixture.has_value()) {
+         return;
+     }
+     makeCache(*fixture);
+@@ -1548,10 +1552,79 @@ TEST_CASE("Sampler-wrap regression: glTF-default REPEAT (samplers:[{}], DamagedH
+     // Sanity probe (non-discriminating alone -- both fix and bug read BLUE
+     // here, since V=1.6875 already wraps to the SAME row a CLAMP_TO_EDGE
+     // revert would also land on): proves the texture/pipeline are real and
+     // not degenerate, and that BOTH quadrant.png halves are genuinely
+     // reachable through this exact code path.
+     CHECK(approxEqual(bottomReadback->topLeft, kBlue, 2));
+     CHECK(approxEqual(bottomReadback->bottomRight, kBlue, 2));
+ 
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
++
++// ===== Oversized-texture staging [texture-path round, item B] =============
++//
++// Prior defect (found on the real Workshop asset, real NVIDIA): a texture
++// whose mip-0 bytes exceed the Uploader's staging-ring capacity (a
++// 4096x4096 RGBA8 mip 0 is 64MB, over the 16MiB default ring) was
++// REJECTED by Uploader::uploadImageMips() and silently replaced by the
++// D11 checkerboard fallback -- size was, incorrectly, a fallback reason.
++// `oversized_quadrant.png` (assets/test/textures/generate_fixtures.sh's
++// own comment) is the SAME quadrant4x4.png source nearest-neighbor-
++// upscaled to 4096x4096 -- real quadrant content, not a degenerate flat
++// fixture, so a chunk landing at the wrong subresource offset would be
++// visible as a wrong quadrant color, not just "some pixels came back
++// non-black".
++TEST_CASE("TextureCache GPU [texture-path round, item B]: a 4096x4096 stb PNG (64MB mip 0, exceeding the "
++          "16MiB default staging ring) imports through the FULL Registry::importGltf path to a real, "
++          "non-fallback texture with its complete runtime-generated mip chain (item A composed with item B), "
++          "and its 4 quadrant colors render correctly -- proving Uploader::uploadImageMips()'s chunked-row "
++          "staging path end to end, not just format bookkeeping") {
++    auto fixture = makeFixture("rx_asset_tc_oversized");
++    if (!fixture.has_value()) {
++        return;
++    }
++    makeCache(*fixture);
++
++    auto pool = rx::asset::GeometryPool::create(fixture->allocator, fixture->device, fixture->uploader);
++    REQUIRE(pool != nullptr);
++    auto scheduler = rx::task::Scheduler::create(2);
++    REQUIRE(scheduler != nullptr);
++
++    rx::asset::Registry registry;
++    rx::asset::ImportResult result = registry.importGltf(gltfFixturePath("oversized_texture_probe.gltf"), *pool,
++                                                            *scheduler, fixture->cache.get());
++    REQUIRE(result.ok());
++    REQUIRE(result.materials.size() == 1);
++
++    const rx::asset::MaterialAsset& material = registry.material(result.materials[0]);
++    REQUIRE(material.baseColorTexture.present);
++    const TextureRecord& record = fixture->cache->resolve(material.baseColorTexture.handle);
++    // THE headline assertion: NOT the checkerboard/fallback the pre-fix
++    // behavior silently substituted for any texture whose mip-0 bytes
++    // exceeded the staging cap.
++    REQUIRE_FALSE(record.isFallback);
++    CHECK(record.width == 4096);
++    CHECK(record.height == 4096);
++    // floor(log2(4096))+1 == 13 -- the full runtime-generated chain
++    // (texture-path round item A), composed with item B's own chunked
++    // upload for mip 0 (64MB, chunked) and mip 1 (2048x2048 == exactly
++    // 16MiB, still a single-trip level) alike -- "works composed with
++    // item A" per this round's own brief.
++    CHECK(record.mipLevels == 13);
++
++    std::optional<uint32_t> samplerIndex =
++        fixture->cache->getOrCreateSamplerBindlessIndex(material.baseColorTexture.sampler);
++    REQUIRE(samplerIndex.has_value());
++
++    auto readback = renderAndReadbackQuadrants(*fixture, record.bindlessIndex, *samplerIndex, /*lod=*/0.0F);
++    REQUIRE(readback.has_value());
++
++    // Same TL=red/TR=green/BL=blue/BR=yellow quadrant layout as every
++    // other quadrant fixture in this file (oversized_quadrant.png is the
++    // SAME quadrant4x4.png source, just nearest-neighbor-upscaled).
++    CHECK(approxEqual(readback->topLeft, {255, 0, 0}, 2));
++    CHECK(approxEqual(readback->topRight, {0, 255, 0}, 2));
++    CHECK(approxEqual(readback->bottomLeft, {0, 0, 255}, 2));
++    CHECK(approxEqual(readback->bottomRight, {255, 255, 0}, 2));
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/src/rx_asset/tests/texture_decode_test.cpp b/src/rx_asset/tests/texture_decode_test.cpp
+index d7be259..a0e089d 100644
+--- a/src/rx_asset/tests/texture_decode_test.cpp
++++ b/src/rx_asset/tests/texture_decode_test.cpp
+@@ -1,18 +1,20 @@
+ #include <doctest/doctest.h>
+ #include <rx_asset/texture_decode.h>
+ #include <rx_core/log.h>
+ #include <rx_core/log_forward_sink.h>
+ #include <spdlog/sinks/ostream_sink.h>
+ #include <algorithm>
+ #include <array>
++#include <cmath>
+ #include <cstddef>
++#include <cstdint>
+ #include <fstream>
+ #include <optional>
+ #include <sstream>
+ #include <string>
+ #include <vector>
+ 
+ // texture_decode_test.cpp -- device-free coverage for rx::asset's KTX2/
+ // Basis parse+transcode decision layer and the stb PNG/JPG fallback
+ // decode [Phase 4 Stage 1 Task 14, spec D10, gate matrix-issue03 as
+ // amended by gate/rulings-2026-08-18.md #3]. No GPU, no VkDevice --
+@@ -37,20 +39,39 @@ std::vector<std::byte> readFixture(const std::string& name) {
+ 
+ // A permissive support predicate a test can point planTranscodeFormat()
+ // at -- always reports every format supported, i.e. the exact-format
+ // branch always wins.
+ bool alwaysSupported(VkFormat) { return true; }
+ // The "format-support-forced-off" seam [matrix-issue03's own lavapipe row]
+ // -- always reports NOTHING supported, forcing the RGBA32-fallback
+ // branch deterministically regardless of what any real driver advertises.
+ bool neverSupported(VkFormat) { return false; }
+ 
++// ===== generateStbMipChain() test-only reference math [texture-path
++// round, D10 Option A] -- the IEC 61966-2-1 sRGB transfer-function
++// formulas, used ONLY to compute this file's OWN expected values; the
++// production code under test (texture_decode.cpp's generateStbMipChain())
++// never calls these -- it hands the sRGB<->linear conversion to
++// stb_image_resize2's own STBIR_TYPE_UINT8_SRGB path instead (this task's
++// "prefer a ready-made library" rule). Kept deliberately independent so
++// this test is a real cross-check, not a tautology against the same code
++// path it is meant to verify.
++float srgbByteToLinearRef(uint8_t byteValue) {
++    float c = static_cast<float>(byteValue) / 255.0F;
++    return c <= 0.04045F ? c / 12.92F : std::pow((c + 0.055F) / 1.055F, 2.4F);
++}
++uint8_t linearToSrgbByteRef(float linear) {
++    float c = linear <= 0.0031308F ? linear * 12.92F : 1.055F * std::pow(linear, 1.0F / 2.4F) - 0.055F;
++    c = std::clamp(c, 0.0F, 1.0F);
++    return static_cast<uint8_t>(std::lround(c * 255.0F));
++}
++
+ // Swaps spdlog's default logger for an ostream-capturing one for the
+ // scope of one TEST_CASE, mirroring src/rx_core/tests/log_test.cpp's own
+ // established "RX_LOG_INFO writes... through spdlog's default logger"
+ // pattern (the lightweight rx_core-only capture mechanism -- this binary
+ // does not link rx_material, so the public rxSetLogCallback ABI is not an
+ // option here).
+ struct LogCapture {
+     std::ostringstream stream;
+     std::shared_ptr<spdlog::logger> previousDefault;
+ 
+@@ -436,20 +457,214 @@ TEST_CASE("decodeStbImage: an empty byte span fails cleanly") {
+ 
+ TEST_CASE("stbRgba8Format: role-correct SRGB vs UNORM, mirroring roleFormatTable()'s own colorspace column") {
+     CHECK(stbRgba8Format(TextureRole::BaseColor) == VK_FORMAT_R8G8B8A8_SRGB);
+     CHECK(stbRgba8Format(TextureRole::Emissive) == VK_FORMAT_R8G8B8A8_SRGB);
+     CHECK(stbRgba8Format(TextureRole::Normal) == VK_FORMAT_R8G8B8A8_UNORM);
+     CHECK(stbRgba8Format(TextureRole::MetallicRoughness) == VK_FORMAT_R8G8B8A8_UNORM);
+     CHECK(stbRgba8Format(TextureRole::Occlusion) == VK_FORMAT_R8G8B8A8_UNORM);
+     CHECK(stbRgba8Format(TextureRole::GenericData) == VK_FORMAT_R8G8B8A8_UNORM);
+ }
+ 
++// ===== generateStbMipChain() [texture-path round, D10 Option A] ===========
++//
++// Every fixture below is a hand-built, tiny (2x2/5x3) in-memory RGBA8
++// buffer -- NOT a PNG file round-trip -- so the expected numbers are
++// exact arithmetic on known input bytes, not "whatever a real photo
++// happens to contain". A 2x2 -> 1x1 step is an EXACT arithmetic box
++// average by construction (STBIR_FILTER_BOX's own documented "same
++// result as box for integer scale ratios" -- an exact 2x downsample has
++// no fractional-coverage ambiguity at all), so these are not
++// approximations of what the library does -- they pin its behavior.
++
++TEST_CASE("generateStbMipChain: BaseColor (sRGB role) box-averages in LINEAR space, re-encodes sRGB -- a "
++          "naive byte average would FAIL this assertion by ~60 byte values [texture-path round item 1, "
++          "revert-discrimination: reverting to `(255+0+255+0)/4` naive averaging fails this CHECK]") {
++    // 2x2, two texels white (255,255,255,255), two texels black (0,0,0,255)
++    // -- alpha constant 255 throughout (glTF baseColor alpha is linear
++    // coverage, never sRGB -- see this fixture's own role comment).
++    const std::array<uint8_t, 16> src{
++        255, 255, 255, 255,  // texel 0: white
++        0,   0,   0,   255,  // texel 1: black
++        255, 255, 255, 255,  // texel 2: white
++        0,   0,   0,   255,  // texel 3: black
++    };
++    auto mips = generateStbMipChain(std::span<const uint8_t>(src), 2, 2, TextureRole::BaseColor);
++    REQUIRE(mips.size() == 1);  // 2x2 -> 1x1, exactly one step
++    CHECK(mips[0].level == 1);
++    CHECK(mips[0].width == 1);
++    CHECK(mips[0].height == 1);
++    REQUIRE(mips[0].bytes.size() == 4);
++
++    auto channel = [&](size_t i) { return static_cast<uint8_t>(mips[0].bytes[i]); };
++
++    // CORRECT (linear-space) reference: sRGB-decode 255 and 0 (-> linear
++    // 1.0 and 0.0), average (-> linear 0.5), re-encode sRGB.
++    float linearAvg = (srgbByteToLinearRef(255) + srgbByteToLinearRef(0)) / 2.0F;
++    uint8_t expectedCorrect = linearToSrgbByteRef(linearAvg);
++    CAPTURE(linearAvg);
++    CAPTURE(static_cast<int>(expectedCorrect));
++    CAPTURE(static_cast<int>(channel(0)));
++
++    // The discriminating band: correct linear-space averaging of
++    // (255,0,255,0) lands at ~188 (IEC 61966-2-1 formula: 1.055*0.5^(1/2.4)
++    // - 0.055 -> 0.735 -> byte 187-188); a NAIVE byte average of the same
++    // four bytes is (255+0+255+0)/4 = 127.5 -> byte 127 or 128, a ~60-value
++    // gap -- generously tolerant (+-12) on the correct side while staying
++    // FAR outside the naive value's own neighborhood proves this is a real
++    // discriminating assertion, not a coincidence of a wide tolerance.
++    CHECK(channel(0) > static_cast<uint8_t>(expectedCorrect - 12));
++    CHECK(channel(0) < static_cast<uint8_t>(expectedCorrect + 12));
++    CHECK(channel(1) == channel(0));  // R/G/B identical -- the source is achromatic
++    CHECK(channel(2) == channel(0));
++    // The naive-average value (127 or 128) must NOT be in range -- this is
++    // the actual revert-discrimination check: a hand-reverted
++    // `(a+b+c+d)/4` byte-average implementation produces 127 or 128 here,
++    // clearly outside [expectedCorrect-12, expectedCorrect+12] for any
++    // expectedCorrect near 188.
++    CHECK(channel(0) > 150);
++
++    // Alpha is constant 255 input -- plain average either way, sRGB or
++    // not (glTF alpha is never sRGB-transformed).
++    CHECK(channel(3) == 255);
++}
++
++TEST_CASE("generateStbMipChain: role == Normal renormalizes the averaged tangent-space vector to unit length "
++          "-- a plain (unrenormalized) average would FAIL the unit-length assertion [texture-path round item 2, "
++          "revert-discrimination: skipping the renormalize step leaves a ~0.80-length vector, failing the "
++          "[0.99,1.01] length band below]") {
++    // Two symmetric unit tangent-space normals, N1=(0.6,0.8,0) and
++    // N2=(-0.6,0.8,0) -- their PLAIN average is (0,0.8,0), length 0.8 (a
++    // real, non-degenerate "flattening" case, not a contrived zero-vector
++    // edge case). Byte-encode: (v*0.5+0.5)*255, rounded.
++    auto encode = [](float v) -> uint8_t {
++        return static_cast<uint8_t>(std::lround(std::clamp((v * 0.5F + 0.5F) * 255.0F, 0.0F, 255.0F)));
++    };
++    const uint8_t n1r = encode(0.6F), n1g = encode(0.8F), n1b = encode(0.0F);
++    const uint8_t n2r = encode(-0.6F), n2g = encode(0.8F), n2b = encode(0.0F);
++
++    const std::array<uint8_t, 16> src{
++        n1r, n1g, n1b, 255, n2r, n2g, n2b, 255, n1r, n1g, n1b, 255, n2r, n2g, n2b, 255,
++    };
++    auto mips = generateStbMipChain(std::span<const uint8_t>(src), 2, 2, TextureRole::Normal);
++    REQUIRE(mips.size() == 1);
++    REQUIRE(mips[0].bytes.size() == 4);
++
++    auto decode = [](std::byte b) { return (static_cast<float>(b) / 255.0F) * 2.0F - 1.0F; };
++    float x = decode(mips[0].bytes[0]);
++    float y = decode(mips[0].bytes[1]);
++    float z = decode(mips[0].bytes[2]);
++    float length = std::sqrt(x * x + y * y + z * z);
++    CAPTURE(x);
++    CAPTURE(y);
++    CAPTURE(z);
++    CAPTURE(length);
++
++    // THE discriminating assertion: unit length. The pre-renormalize
++    // average has length ~0.80 (the two input vectors' own Y=0.8, X/Z
++    // canceling), which fails this tight [0.99,1.01] band outright -- a
++    // reverted implementation that skips renormalizeNormalTexelsInPlace()
++    // fails HERE, not on some unrelated symptom.
++    CHECK(length > 0.99F);
++    CHECK(length < 1.01F);
++    // The averaged direction itself is still preserved (Y dominant,
++    // pointing "up") -- renormalization changes MAGNITUDE, not direction.
++    CHECK(y > 0.9F);
++}
++
++TEST_CASE("generateStbMipChain: MetallicRoughness/Occlusion/GenericData use a plain LINEAR box average -- no "
++          "sRGB transform, no renormalization [texture-path round item 3]") {
++    // Same achromatic (255,0,255,0) checkerboard as the sRGB test above,
++    // but role=MetallicRoughness this time: the CORRECT answer here is
++    // the PLAIN byte average (127 or 128) -- the exact value the sRGB
++    // test's own revert-discrimination check rejects for BaseColor.
++    const std::array<uint8_t, 16> src{
++        255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255,
++    };
++    auto mips = generateStbMipChain(std::span<const uint8_t>(src), 2, 2, TextureRole::MetallicRoughness);
++    REQUIRE(mips.size() == 1);
++    auto channel = [&](size_t i) { return static_cast<uint8_t>(mips[0].bytes[i]); };
++    CAPTURE(static_cast<int>(channel(0)));
++    // Plain arithmetic mean of (255,0,255,0) = 127.5 -> 127 or 128
++    // depending on the resize implementation's own rounding -- NEVER the
++    // sRGB-correct ~188 the BaseColor test above expects for the
++    // identical input bytes (proving role, not content, selects the
++    // colorspace path).
++    CHECK(channel(0) >= 127);
++    CHECK(channel(0) <= 128);
++}
++
++TEST_CASE("generateStbMipChain: chain length/dimensions follow the standard floor-halving formula for a "
++          "non-power-of-two source (5x3), matching Vulkan's own floor(log2(max(w,h)))+1 total-level rule "
++          "[texture-path round item 5]") {
++    // Content doesn't matter for this test -- a flat mid-gray source is
++    // enough (chain SHAPE, not per-texel color, is under test).
++    std::vector<uint8_t> src(static_cast<size_t>(5) * 3 * 4, 128);
++    auto mips = generateStbMipChain(std::span<const uint8_t>(src), 5, 3, TextureRole::GenericData);
++    // 5x3 -(floor-half)-> 2x1 -(floor-half)-> 1x1: 2 generated levels (+
++    // level 0, which this function never returns) = 3 total, matching
++    // floor(log2(5))+1 = 2+1 = 3.
++    REQUIRE(mips.size() == 2);
++    CHECK(mips[0].level == 1);
++    CHECK(mips[0].width == 2);
++    CHECK(mips[0].height == 1);
++    CHECK(mips[1].level == 2);
++    CHECK(mips[1].width == 1);
++    CHECK(mips[1].height == 1);
++}
++
++TEST_CASE("generateStbMipChain: a power-of-two square source (8x8) produces the exact 4-level chain "
++          "(8,4,2,1) [texture-path round item 5/6c]") {
++    std::vector<uint8_t> src(static_cast<size_t>(8) * 8 * 4, 200);
++    auto mips = generateStbMipChain(std::span<const uint8_t>(src), 8, 8, TextureRole::BaseColor);
++    REQUIRE(mips.size() == 3);  // levels 1,2,3 (level 0 excluded) -> 4x4, 2x2, 1x1
++    const std::array<uint32_t, 3> expectedExtent{4, 2, 1};
++    for (size_t i = 0; i < mips.size(); ++i) {
++        CAPTURE(i);
++        CHECK(mips[i].level == i + 1);
++        CHECK(mips[i].width == expectedExtent[i]);
++        CHECK(mips[i].height == expectedExtent[i]);
++    }
++}
++
++TEST_CASE("generateStbMipChain: degenerate input (width/height 0, or fewer bytes than width*height*4) returns "
++          "an empty chain rather than fabricating levels from too little data") {
++    std::vector<uint8_t> tooShort(4, 0);  // claims to be 2x2 (needs 16 bytes) but only has 4
++    CHECK(generateStbMipChain(std::span<const uint8_t>(tooShort), 2, 2, TextureRole::BaseColor).empty());
++    CHECK(generateStbMipChain(std::span<const uint8_t>(tooShort), 0, 2, TextureRole::BaseColor).empty());
++    CHECK(generateStbMipChain(std::span<const uint8_t>(tooShort), 2, 0, TextureRole::BaseColor).empty());
++}
++
++// ===== decodeTextureForUpload() end-to-end: stb path now generates its =====
++// ===== own full runtime mip chain [texture-path round, D10 Option A]  =====
++
++TEST_CASE("decodeTextureForUpload: a real 8x8 PNG fixture (stb path) now produces a FULL 4-level mip chain "
++          "(8,4,2,1), level 0 byte-identical to the un-mipped decode, format/role unaffected") {
++    auto bytes = readFixture("quadrant.png");
++    TextureDecodeResult result =
++        decodeTextureForUpload(std::span<const std::byte>(bytes), TextureRole::BaseColor, 4096, alwaysSupported);
++    REQUIRE(result.outcome == TextureDecodeResult::Outcome::Ready);
++    CHECK(result.width == 8);
++    CHECK(result.height == 8);
++    CHECK(result.format == VK_FORMAT_R8G8B8A8_SRGB);
++    REQUIRE(result.levels.size() == 4);
++    const std::array<uint32_t, 4> expectedExtent{8, 4, 2, 1};
++    for (size_t i = 0; i < result.levels.size(); ++i) {
++        CAPTURE(i);
++        CHECK(result.levels[i].level == i);
++        CHECK(result.levels[i].width == expectedExtent[i]);
++        CHECK(result.levels[i].height == expectedExtent[i]);
++    }
++    // Level 0 itself is UNCHANGED by this task -- exactly stb's own
++    // decoded bytes, byte-for-byte (only levels 1+ are new).
++    CHECK(result.levels[0].bytes.size() == 8 * 8 * 4);
++}
++
+ // ===== Suppress unused-function warnings for the LogCapture utility ========
+ // (reserved for texture_cache_test.cpp-style WARN-content assertions if a
+ // future device-free case needs one; kept here since this is the shared
+ // device-free binary's own translation unit and the utility is otherwise
+ // header-local-only noise to duplicate per file).
+ TEST_CASE("LogCapture utility captures spdlog output for the scope of one TEST_CASE") {
+     LogCapture capture;
+     RX_LOG_WARN("marker-{}", 7);
+     CHECK(capture.count("marker-7") == 1);
+     CHECK(capture.count("marker-7-nonexistent") == 0);
+diff --git a/src/rx_asset/texture_decode.cpp b/src/rx_asset/texture_decode.cpp
+index e488671..dc03c4f 100644
+--- a/src/rx_asset/texture_decode.cpp
++++ b/src/rx_asset/texture_decode.cpp
+@@ -1,15 +1,17 @@
+ #include <rx_asset/texture_decode.h>
+ #include <rx_core/log.h>
+ #include <stb_image.h>
++#include <stb_image_resize2.h>
+ #include <algorithm>
+ #include <array>
++#include <cmath>
+ #include <cstring>
+ #include <utility>
+ 
+ namespace rx::asset {
+ 
+ const char* textureRoleName(TextureRole role) {
+     switch (role) {
+         case TextureRole::BaseColor:
+             return "baseColor";
+         case TextureRole::Emissive:
+@@ -337,20 +339,161 @@ std::optional<DecodedStbImage> decodeStbImage(std::span<const std::byte> bytes,
+     result.was16Bit = was16Bit;
+     result.rgba8.assign(pixels, pixels + (static_cast<size_t>(width) * height * 4));
+     stbi_image_free(pixels);
+     return result;
+ }
+ 
+ VkFormat stbRgba8Format(TextureRole role) {
+     return roleExpectsSrgb(role) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+ }
+ 
++// ---------------------------------------------------------------------
++// [texture-path round, D10 Option A] Runtime mip-chain generation for the
++// stb decode path -- see this function's own declaration (texture_decode.h)
++// for the full per-role correctness contract this implements.
++// ---------------------------------------------------------------------
++
++namespace {
++
++// Standard floor-halving step: max(1, extent >> 1) -- the same formula
++// Vulkan's own mip-dimension rule uses, and DecodedKtx2Texture::levels()'s
++// own `levelWidth`/`levelHeight` computation (texture_decode.cpp, above)
++// already relies on for the KTX2 side of this codebase.
++uint32_t nextMipExtent(uint32_t extent) { return std::max<uint32_t>(1U, extent >> 1); }
++
++// Decodes one UNORM byte channel to a signed unit-range float
++// (tangent-space normal-map convention: byte 0 -> -1.0, byte 255 -> +1.0).
++float decodeSignedUnorm(uint8_t byteValue) { return (static_cast<float>(byteValue) / 255.0F) * 2.0F - 1.0F; }
++
++// Inverse of decodeSignedUnorm(), rounding to nearest and clamping (a
++// renormalized vector's components can transiently exceed [-1,1] by a
++// hair from float rounding).
++uint8_t encodeSignedUnorm(float value) {
++    float scaled = (value * 0.5F + 0.5F) * 255.0F;
++    scaled = std::clamp(scaled, 0.0F, 255.0F);
++    return static_cast<uint8_t>(std::lround(scaled));
++}
++
++// [Normal-map mip correctness, texture-path round item 2] Renormalizes
++// every RGB-encoded tangent-space texel in `rgba8` (tightly packed, 4
++// bytes/texel) to unit length in place -- undoes the "flattening" a plain
++// per-channel box average produces (see generateStbMipChain()'s own
++// header comment for why this is needed at all). Alpha (byte index 3 of
++// every texel) is left exactly as the box-average resize already wrote it
++// -- normal maps carry no meaningful alpha channel for this path to
++// reinterpret.
++void renormalizeNormalTexelsInPlace(std::vector<uint8_t>& rgba8) {
++    for (size_t i = 0; i + 3 < rgba8.size(); i += 4) {
++        float x = decodeSignedUnorm(rgba8[i + 0]);
++        float y = decodeSignedUnorm(rgba8[i + 1]);
++        float z = decodeSignedUnorm(rgba8[i + 2]);
++        float lengthSquared = x * x + y * y + z * z;
++        if (lengthSquared > 1e-12F) {
++            float invLength = 1.0F / std::sqrt(lengthSquared);
++            x *= invLength;
++            y *= invLength;
++            z *= invLength;
++        } else {
++            // Degenerate: the averaged vector canceled to (near-)zero
++            // length (e.g. two exactly opposite input normals) -- fall
++            // back to tangent-space "straight up" rather than propagate a
++            // zero/NaN-length normal downstream; the same (0,0,1)
++            // convention D11's own flat-normal fallback texture already
++            // uses (texture_cache.cpp's buildFallbackTextures()).
++            x = 0.0F;
++            y = 0.0F;
++            z = 1.0F;
++        }
++        rgba8[i + 0] = encodeSignedUnorm(x);
++        rgba8[i + 1] = encodeSignedUnorm(y);
++        rgba8[i + 2] = encodeSignedUnorm(z);
++    }
++}
++
++}  // namespace
++
++std::vector<DecodedTextureLevel> generateStbMipChain(std::span<const uint8_t> mip0Rgba8, uint32_t width,
++                                                       uint32_t height, TextureRole role) {
++    std::vector<DecodedTextureLevel> result;
++    if (width == 0 || height == 0 ||
++        mip0Rgba8.size() < static_cast<size_t>(width) * static_cast<size_t>(height) * 4U) {
++        return result;  // malformed/degenerate input -- never fabricate levels from too little data
++    }
++
++    const bool isSrgb = roleExpectsSrgb(role);
++    const bool isNormal = role == TextureRole::Normal;
++
++    std::vector<uint8_t> prevLevel(mip0Rgba8.begin(), mip0Rgba8.end());
++    uint32_t prevWidth = width;
++    uint32_t prevHeight = height;
++
++    while (prevWidth > 1 || prevHeight > 1) {
++        uint32_t nextWidth = nextMipExtent(prevWidth);
++        uint32_t nextHeight = nextMipExtent(prevHeight);
++        std::vector<uint8_t> nextLevel(static_cast<size_t>(nextWidth) * static_cast<size_t>(nextHeight) * 4U);
++
++        // Library-first [this task's own "no reinvented wheels" rule]:
++        // stb_image_resize2 (already vendored -- same `stb` repo FetchContent
++        // as stb_image.h itself, see stb_image_resize_impl.cpp's own
++        // comment) expresses exactly the two box-average kernels this
++        // needs directly:
++        //   - STBIR_TYPE_UINT8_SRGB: decode sRGB->linear, filter, re-encode
++        //     sRGB -- the library's OWN documented sRGB-aware resize mode,
++        //     never a hand-rolled gamma-curve loop. STBIR_RGBA (not the
++        //     "_PM"/"NO_AW" layout) applies the library's alpha-weighted
++        //     RGB blend, matching glTF's own baseColor-alpha-is-linear-
++        //     coverage convention (this function's own header comment).
++        //   - STBIR_TYPE_UINT8 + STBIR_4CHANNEL: plain per-channel linear
++        //     box average, deliberately with NO alpha weighting at all
++        //     (STBIR_4CHANNEL, not STBIR_RGBA) -- correct for both the
++        //     Normal role (channel 3 is not real alpha) and the plain
++        //     linear-data roles (MetallicRoughness/Occlusion/GenericData).
++        // STBIR_FILTER_BOX explicitly (not STBIR_FILTER_DEFAULT): "same
++        // result as box for integer scale ratios" per the library's own
++        // enum comment -- the exact, unambiguous arithmetic-mean semantics
++        // this task's own correctness tests assert against for every
++        // power-of-two halving step.
++        void* resizeResult =
++            isSrgb ? stbir_resize(prevLevel.data(), static_cast<int>(prevWidth), static_cast<int>(prevHeight), 0,
++                                   nextLevel.data(), static_cast<int>(nextWidth), static_cast<int>(nextHeight), 0,
++                                   STBIR_RGBA, STBIR_TYPE_UINT8_SRGB, STBIR_EDGE_CLAMP, STBIR_FILTER_BOX)
++                    : stbir_resize(prevLevel.data(), static_cast<int>(prevWidth), static_cast<int>(prevHeight), 0,
++                                   nextLevel.data(), static_cast<int>(nextWidth), static_cast<int>(nextHeight), 0,
++                                   STBIR_4CHANNEL, STBIR_TYPE_UINT8, STBIR_EDGE_CLAMP, STBIR_FILTER_BOX);
++        if (resizeResult == nullptr) {
++            RX_LOG_ERROR(
++                "rx_asset: generateStbMipChain: stbir_resize failed building level {} ({}x{} -> {}x{}, role={}) -- "
++                "chain truncated",
++                result.size() + 1, prevWidth, prevHeight, nextWidth, nextHeight, textureRoleName(role));
++            break;
++        }
++
++        if (isNormal) {
++            renormalizeNormalTexelsInPlace(nextLevel);
++        }
++
++        DecodedTextureLevel level;
++        level.level = static_cast<uint32_t>(result.size() + 1);
++        level.width = nextWidth;
++        level.height = nextHeight;
++        level.bytes.resize(nextLevel.size());
++        std::memcpy(level.bytes.data(), nextLevel.data(), nextLevel.size());
++        result.push_back(std::move(level));
++
++        prevLevel = std::move(nextLevel);
++        prevWidth = nextWidth;
++        prevHeight = nextHeight;
++    }
++
++    return result;
++}
++
+ // ---------------------------------------------------------------------
+ // [Phase 4 Stage 1 Task 15] decodeTextureForUpload()
+ // ---------------------------------------------------------------------
+ 
+ namespace {
+ 
+ TextureDecodeResult decodeKtx2ForUpload(std::span<const std::byte> bytes, TextureRole role,
+                                           uint32_t maxImageDimension2D, const FormatSupportQuery& isFormatSupported) {
+     TextureDecodeResult result;
+     result.role = role;
+@@ -448,48 +591,62 @@ TextureDecodeResult decodeStbForUpload(std::span<const std::byte> bytes, Texture
+     std::string failureReason;
+     auto decoded = decodeStbImage(bytes, &failureReason);
+     if (!decoded.has_value()) {
+         result.outcome = TextureDecodeResult::Outcome::Failed;
+         result.failureReason = std::string("stb decode failed: ") + failureReason;
+         return result;
+     }
+ 
+     result.warnings.push_back(
+         {"stb-recommend-ktx2",
+-         "loaded via stb (PNG/JPG) -- recommend converting to KTX2 for GPU block-compressed upload + a full mip "
+-         "chain (D10); this path uploads mip 0 ONLY (recorded limitation)"});
++         "loaded via stb (PNG/JPG) -- recommend converting to KTX2 for GPU block-compressed upload (D10); this "
++         "path now generates its own runtime box-filtered mip chain (texture-path round, D10 Option A) but still "
++         "uploads uncompressed RGBA8 bytes, unlike a pre-authored KTX2's block-compressed levels"});
+     if (decoded->was16Bit) {
+         result.warnings.push_back(
+             {"stb-16bit", "is a 16-bit-per-channel source image -- stb_image downconverts to 8-bit on decode"});
+     }
+ 
+     if (exceedsDimensionLimit(decoded->width, decoded->height, maxImageDimension2D)) {
+         result.outcome = TextureDecodeResult::Outcome::Checkerboard;
+         result.failureReason = "exceeds maxImageDimension2D";
+         result.warnings.push_back(
+             {"oversized", "is " + std::to_string(decoded->width) + "x" + std::to_string(decoded->height) +
+                               ", exceeding this device's maxImageDimension2D=" + std::to_string(maxImageDimension2D) +
+                               " -- falling back to checkerboard"});
+         return result;
+     }
+ 
+     result.outcome = TextureDecodeResult::Outcome::Ready;
+     result.format = stbRgba8Format(role);
+     result.width = decoded->width;
+     result.height = decoded->height;
+-    DecodedTextureLevel level;
+-    level.level = 0;
+-    level.width = decoded->width;
+-    level.height = decoded->height;
+-    level.bytes.resize(decoded->rgba8.size());
+-    std::memcpy(level.bytes.data(), decoded->rgba8.data(), decoded->rgba8.size());
+-    result.levels.push_back(std::move(level));
++    DecodedTextureLevel level0;
++    level0.level = 0;
++    level0.width = decoded->width;
++    level0.height = decoded->height;
++    level0.bytes.resize(decoded->rgba8.size());
++    std::memcpy(level0.bytes.data(), decoded->rgba8.data(), decoded->rgba8.size());
++    result.levels.push_back(std::move(level0));
++
++    // [texture-path round, D10 Option A] The rest of the chain (levels
++    // 1..N) -- see generateStbMipChain()'s own header comment for the
++    // per-role sRGB/renormalization correctness this applies. Appended
++    // onto the SAME result.levels applyDecodeResult() (texture_cache.cpp)
++    // already uploads generically for the KTX2 path -- no new upload/
++    // registration code needed for this to reach the GPU (sponza-visual-
++    // investigation.md §2.7's own finding).
++    std::vector<DecodedTextureLevel> mips =
++        generateStbMipChain(std::span<const uint8_t>(decoded->rgba8), decoded->width, decoded->height, role);
++    for (DecodedTextureLevel& mip : mips) {
++        result.levels.push_back(std::move(mip));
++    }
+     return result;
+ }
+ 
+ }  // namespace
+ 
+ TextureDecodeResult decodeTextureForUpload(std::span<const std::byte> bytes, TextureRole role,
+                                             uint32_t maxImageDimension2D, const FormatSupportQuery& isFormatSupported) {
+     if (bytes.empty()) {
+         TextureDecodeResult result;
+         result.role = role;
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/upload.h b/src/rx_rhi_vk/include/rx_rhi_vk/upload.h
+index 47fd8ed..32c1f00 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/upload.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/upload.h
+@@ -181,24 +181,25 @@ struct UploadTicket {
+ // ring buffer's end before the pending batch is flushed, this Uploader
+ // transparently flushes what is already recorded (submitting it, and
+ // tracking its ring range per the paragraph above -- not waiting on it)
+ // and then continues writing from offset 0 once enough of the ring's
+ // front is confirmed reclaimable -- callers never need to reason about
+ // ring-buffer capacity themselves unless a single upload's size exceeds
+ // the ring buffer's total capacity, which fails cleanly (logged, returns
+ // false) rather than silently corrupting anything. This never applies to
+ // a direct-path buffer upload, which never touches the ring at all.
+ //
+-// Thread-affinity (D5, Phase 4): uploadToBuffer()/uploadToImage()/flush()/
+-// isComplete()/wait() are main-thread-only -- see docs/threading.md.
+-// uploadToBuffer()/uploadToImage()/flush()/isComplete()/wait() all carry a
+-// dev-time RX_ASSERT_MAIN_THREAD guard [Phase 4 Task 7 fix round 1;
++// Thread-affinity (D5, Phase 4): uploadToBuffer()/uploadToImage()/
++// uploadImageMips()/flush()/isComplete()/wait() are main-thread-only -- see
++// docs/threading.md. uploadToBuffer()/uploadToImage()/uploadImageMips()/
++// flush()/isComplete()/wait() all carry a dev-time RX_ASSERT_MAIN_THREAD
++// guard [Phase 4 Task 7 fix round 1;
+ // extended to flush()/isComplete()/wait() in Task 11, since flush() can
+ // now be a legitimate standalone call -- e.g. on nothing recorded -- no
+ // longer reachable only via an already-guarded uploadTo*() call] that
+ // fails loudly on a chunk >= 1 violation instead of corrupting shared
+ // state silently. isComplete()/wait() poll/wait on this Uploader's own
+ // timeline semaphore, which the Vulkan spec itself permits from any
+ // thread with no external synchronization -- the guard here is this
+ // project's own D5 policy scoping, matching every other Uploader entry
+ // point's identical scoping, not a hazard these two introduce.
+ class Uploader {
+@@ -303,28 +304,49 @@ public:
+     // block-rounded byte count matches this formula bit-for-bit for
+     // every level, including sub-block tails, where `extent` reports the
+     // true 2x2/1x1 texel size while the region's OWN copied byte count is
+     // exactly one whole compressed block regardless). No block-width/
+     // height-aware pitch arithmetic is written by this engine at all --
+     // Vulkan's own copy semantics already do it correctly for every
+     // level in one uniform code path, compressed or not.
+     //
+     // Levels need not be sorted or cover every level of `dst`'s own
+     // mipLevels() (not exercised by any Task 14 test, but not
+-    // disallowed). Returns false (logged) only if `levels` is empty or
+-    // any single entry's `size` exceeds this Uploader's total ring-buffer
+-    // capacity outright -- same "no partial-batch corruption" contract as
+-    // uploadToImage()/uploadToBuffer() above (a batch that fails a later
+-    // entry after successfully staging earlier ones still returns false;
+-    // nothing from this call is submitted at flush() -- see
+-    // upload_test.cpp's texture-upload tests for the equivalent
+-    // uploadToImage() contract this mirrors).
++    // disallowed).
++    //
++    // OVERSIZED LEVELS (bigger than this Uploader's own ring-buffer
++    // capacity) [texture-path round, item B -- the 16MB staging-cap fix;
++    // e.g. a 4096x4096 RGBA8 mip 0 is 64MB against the 16MB default ring]:
++    // handled via CHUNKED STAGING TRIPS, not rejected. A level whose
++    // `size` exceeds ringCapacity() is split into consecutive, contiguous
++    // row-groups -- each its own independent reserve/memcpy/
++    // vkCmdCopyBufferToImage trip through the SAME fixed-size ring (never
++    // growing it, never a separate transient allocation) -- so the final
++    // image ends up byte-identical to one theoretical giant copy, just
++    // assembled from several bounded ones. This composes transparently
++    // with flush()/isComplete()/wait(): every chunk's copy is recorded
++    // like any other Uploader command, covered by whatever ticket the
++    // NEXT flush() call returns -- a caller awaiting that ticket (or
++    // relying on the sync loadFromBytes()-style flush()+wait()
++    // convenience) is guaranteed every chunk has completed before
++    // treating the texture as ready, exactly D25's ticket-covers-
++    // everything-recorded-so-far semantics, no separate per-chunk
++    // completion tracking needed. A level this large can still fail
++    // (logged, returns false, BEFORE any GPU work is recorded for the
++    // whole call -- same "no partial-batch corruption" contract as
++    // uploadToImage()/uploadToBuffer() above) if it cannot be safely
++    // chunked at all: `levels` is empty, or an oversized level's `size`
++    // does not divide evenly into whole `extent.height` rows (every
++    // uncompressed RGBA8 level, and every block-compressed level actually
++    // large enough to need chunking, divides evenly in practice -- see
++    // upload.cpp's own levelNeedsChunking() comment), or even a single row
++    // does not fit in the ring outright (a pathologically wide level).
+     bool uploadImageMips(Texture2D& dst, std::span<const ImageMipLevel> levels);
+ 
+     // Submits every uploadTo*() call recorded since the last flush() (or
+     // since create()) and returns a pollable UploadTicket -- see the class
+     // comment above for the full ticket design. Does NOT block: a caller
+     // that needs the old always-blocking behavior calls wait() on the
+     // returned ticket explicitly (see MeshBuffers::create() for exactly
+     // this pattern). If nothing was recorded since the last flush() (no
+     // uploadTo*() call happened, or every call in this batch took the
+     // direct memcpy path with zero real GPU work queued), returns the
+diff --git a/src/rx_rhi_vk/src/upload.cpp b/src/rx_rhi_vk/src/upload.cpp
+index 529a939..06c9ba7 100644
+--- a/src/rx_rhi_vk/src/upload.cpp
++++ b/src/rx_rhi_vk/src/upload.cpp
+@@ -1,17 +1,19 @@
+ #include <rx_rhi_vk/upload.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/texture.h>
+ #include <rx_core/debug_checks.h>
+ #include <rx_core/log.h>
+ #include <rx_core/profile.h>
++#include <algorithm>
++#include <cstdint>
+ #include <cstring>
+ #include <utility>
+ 
+ namespace rx::rhi {
+ 
+ namespace {
+ 
+ // vkCmdCopyBufferToImage requires bufferOffset to be a multiple of 4 (and,
+ // for best behavior across formats, of the texel block size); vkCmdCopyBuffer
+ // has no such requirement but aligning every reservation uniformly is
+@@ -24,20 +26,47 @@ VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment) {
+     return (value + alignment - 1) & ~(alignment - 1);
+ }
+ 
+ // Half-open interval overlap test -- used by reserveRingSpace() to decide
+ // whether a candidate write range would stomp on a still-unreclaimed
+ // PendingRegion [matrix-issue28 rows 5/6].
+ bool regionsOverlap(VkDeviceSize start, VkDeviceSize size, VkDeviceSize otherStart, VkDeviceSize otherEnd) {
+     return !(start + size <= otherStart || otherEnd <= start);
+ }
+ 
++// [Texture-path round, item B -- the 16MB staging-cap fix] Whether `level`
++// fits through this Uploader's ring in ONE copy trip (`true`), or needs
++// uploadImageMips()'s own CHUNKED-ROW path (`false`) -- and, on the
++// chunked branch, `outBytesPerRow` is the per-image-row byte pitch that
++// path splits on. A level's bytes divide evenly into whole image rows
++// (`level.size % level.extent.height == 0`) for every level this engine's
++// own upload call sites ever produce: uncompressed RGBA8 (the stb decode
++// path, D10 Option A's own full mip chain -- always true, size ==
++// width*height*4) and any block-compressed KTX2 level whose true height is
++// itself a multiple of the format's block height (every level this large
++// in practice -- a level anywhere near the 16MB cap is never a 1-2 texel
++// sub-block MIP TAIL, which is always a few dozen bytes at most). A level
++// that fails this divisibility check is reported as "cannot chunk" rather
++// than silently mis-sliced -- see uploadImageMips()'s own validation loop
++// for the caller-visible failure this produces.
++bool levelNeedsChunking(const Uploader::ImageMipLevel& level, VkDeviceSize ringBufferSize, VkDeviceSize& outBytesPerRow) {
++    outBytesPerRow = 0;
++    if (level.size <= ringBufferSize) {
++        return false;
++    }
++    if (level.extent.height == 0 || level.size % level.extent.height != 0) {
++        return true;  // needs chunking, but outBytesPerRow == 0 signals "cannot safely chunk" to the caller
++    }
++    outBytesPerRow = level.size / level.extent.height;
++    return true;
++}
++
+ }  // namespace
+ 
+ std::optional<Uploader> Uploader::create(Allocator& allocator, Device& device, VkDeviceSize ringBufferSize) {
+     VkDevice vkDevice = device.device();
+     VkQueue queue = device.graphicsQueue();
+ 
+     VkCommandPoolCreateInfo poolInfo{};
+     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+     // RESET_COMMAND_BUFFER_BIT: beginRecordingIfNeeded() individually
+     // resets whichever command-buffer slot it picks (never the whole pool
+@@ -324,26 +353,47 @@ bool Uploader::uploadToImage(Texture2D& dst, const void* pixels, VkDeviceSize pi
+     return true;
+ }
+ 
+ bool Uploader::uploadImageMips(Texture2D& dst, std::span<const ImageMipLevel> levels) {
+     RX_ASSERT_MAIN_THREAD("Uploader::uploadImageMips");
+     RX_ZONE;
+     if (levels.empty()) {
+         RX_LOG_ERROR("Uploader::uploadImageMips: empty `levels` span -- at least one mip level is required");
+         return false;
+     }
++    // [Texture-path round, item B] A level exceeding the ring's total
++    // capacity is no longer an outright rejection -- see this method's own
++    // header comment (upload.h) for the chunked-row design. It only fails
++    // here (before ANY GPU work is recorded, preserving this method's own
++    // "no partial-batch corruption" contract) when it genuinely CANNOT be
++    // safely chunked: a degenerate zero-height level, or one whose byte
++    // count doesn't divide evenly into whole image rows (levelNeedsChunking()'s
++    // own header comment names exactly which real levels this excludes --
++    // none, in this engine's current call sites).
+     for (const ImageMipLevel& level : levels) {
+-        if (level.size > ringBufferSize_) {
++        VkDeviceSize bytesPerRow = 0;
++        if (!levelNeedsChunking(level, ringBufferSize_, bytesPerRow)) {
++            continue;
++        }
++        if (bytesPerRow == 0) {
++            RX_LOG_ERROR(
++                "Uploader::uploadImageMips: level {} is {} bytes (extent {}x{}), exceeding the {}-byte staging "
++                "ring buffer's total capacity, and its byte size does not divide evenly into whole image rows "
++                "-- cannot chunk safely",
++                level.mipLevel, level.size, level.extent.width, level.extent.height, ringBufferSize_);
++            return false;
++        }
++        if (bytesPerRow > ringBufferSize_) {
+             RX_LOG_ERROR(
+                 "Uploader::uploadImageMips: level {} is {} bytes, exceeding the {}-byte staging ring buffer's "
+-                "total capacity",
+-                level.mipLevel, level.size, ringBufferSize_);
++                "total capacity, and even a SINGLE row ({} bytes) does not fit -- cannot chunk",
++                level.mipLevel, level.size, ringBufferSize_, bytesPerRow);
+             return false;
+         }
+     }
+ 
+     // Whole-resource UNDEFINED -> TRANSFER_DST_OPTIMAL transition, once,
+     // before the FIRST level with real bytes to copy -- exactly
+     // uploadToImage()'s own reasoning (every level starts UNDEFINED at
+     // image-creation time; one whole-resource transition is correct and
+     // simpler than a per-level one). Recorded lazily against whichever
+     // command-buffer slot is active AT THAT POINT -- see this method's
+@@ -352,52 +402,118 @@ bool Uploader::uploadImageMips(Texture2D& dst, std::span<const ImageMipLevel> le
+     // slot) does not require a SECOND transition: the underlying VkImage
+     // is already, really, in TRANSFER_DST_OPTIMAL by the time any later
+     // slot's commands execute (same queue, submission order preserved --
+     // the same assumption this class's own ticket-ordering guarantee
+     // already documents, class comment above).
+     bool transitionedToDst = false;
+     for (const ImageMipLevel& level : levels) {
+         if (level.size == 0) {
+             continue;
+         }
+-        VkDeviceSize ringOffset = 0;
+-        if (!reserveRingSpace(level.size, ringOffset)) {
+-            return false;
+-        }
+ 
+-        std::memcpy(static_cast<uint8_t*>(ringBuffer_.mappedData()) + ringOffset, level.data, level.size);
+-        ringBuffer_.flush(ringOffset, level.size);
+-
+-        beginRecordingIfNeeded();
+-        VkCommandBuffer cmd = activeCmd();
+-
+-        if (!transitionedToDst) {
+-            transitionImage(cmd, dst.image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+-            transitionedToDst = true;
++        VkDeviceSize bytesPerRow = 0;
++        if (!levelNeedsChunking(level, ringBufferSize_, bytesPerRow)) {
++            // UNCHANGED single-copy path -- byte-for-byte the same
++            // recording this method always did for a level that fits the
++            // ring whole (every KTX2 level this engine has ever uploaded,
++            // and any RGBA8 level small enough to fit in one trip).
++            VkDeviceSize ringOffset = 0;
++            if (!reserveRingSpace(level.size, ringOffset)) {
++                return false;
++            }
++            std::memcpy(static_cast<uint8_t*>(ringBuffer_.mappedData()) + ringOffset, level.data, level.size);
++            ringBuffer_.flush(ringOffset, level.size);
++
++            beginRecordingIfNeeded();
++            VkCommandBuffer cmd = activeCmd();
++            if (!transitionedToDst) {
++                transitionImage(cmd, dst.image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++                transitionedToDst = true;
++            }
++
++            // BLOCK-COMPRESSED ROW PITCH / SUB-BLOCK MIP TAILS -- see this
++            // method's own header comment (upload.h) for the full Vulkan-
++            // spec citation. bufferRowLength/bufferImageHeight are left at 0
++            // (the VkBufferImageCopy default-initialized value) deliberately
++            // -- "tightly packed, block-rounded" is exactly libktx's own
++            // per-level byte layout, for every level including sub-block
++            // tails.
++            VkBufferImageCopy region{};
++            region.bufferOffset = ringOffset;
++            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++            region.imageSubresource.mipLevel = level.mipLevel;
++            region.imageSubresource.baseArrayLayer = 0;
++            region.imageSubresource.layerCount = 1;
++            region.imageExtent = {level.extent.width, level.extent.height, 1};
++            vkCmdCopyBufferToImage(cmd, ringBuffer_.handle(), dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
++                                    &region);
++            continue;
+         }
+ 
+-        // BLOCK-COMPRESSED ROW PITCH / SUB-BLOCK MIP TAILS -- see this
+-        // method's own header comment (upload.h) for the full Vulkan-
+-        // spec citation. bufferRowLength/bufferImageHeight are left at 0
+-        // (the VkBufferImageCopy default-initialized value) deliberately
+-        // -- "tightly packed, block-rounded" is exactly libktx's own
+-        // per-level byte layout, for every level including sub-block
+-        // tails.
+-        VkBufferImageCopy region{};
+-        region.bufferOffset = ringOffset;
+-        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+-        region.imageSubresource.mipLevel = level.mipLevel;
+-        region.imageSubresource.baseArrayLayer = 0;
+-        region.imageSubresource.layerCount = 1;
+-        region.imageExtent = {level.extent.width, level.extent.height, 1};
+-        vkCmdCopyBufferToImage(cmd, ringBuffer_.handle(), dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+-                                &region);
++        // [Texture-path round, item B] CHUNKED-ROW path: this level's own
++        // bytes exceed the ring's total capacity -- split it into
++        // consecutive, contiguous row-groups, each staged through the
++        // SAME ring buffer as its own independent reservation+copy trip
++        // (D25's "chunked trips must complete before registration" is
++        // automatic here: every chunk records a real vkCmdCopyBufferToImage,
++        // and the ticket flush()/registerRealTexture() callers already
++        // await covers ALL of them, same as any other recorded work this
++        // Uploader ever produces -- no separate completion tracking
++        // needed). `rowsPerChunk` is sized to the largest whole-row count
++        // that fits in ONE reservation (`ringBufferSize_ / bytesPerRow`,
++        // already proven <= ringBufferSize_/1 by the validation loop
++        // above) -- bounded ring memory the whole time, exactly D24's own
++        // "no unbounded growth" requirement; a giant level becomes many
++        // bounded trips through the ring, never one giant allocation.
++        const auto* srcBytes = static_cast<const uint8_t*>(level.data);
++        const uint32_t rowsPerChunk =
++            static_cast<uint32_t>(std::min<VkDeviceSize>(level.extent.height, ringBufferSize_ / bytesPerRow));
++        uint32_t rowStart = 0;
++        while (rowStart < level.extent.height) {
++            uint32_t chunkRows = std::min(rowsPerChunk, level.extent.height - rowStart);
++            VkDeviceSize chunkBytes = static_cast<VkDeviceSize>(chunkRows) * bytesPerRow;
++
++            VkDeviceSize ringOffset = 0;
++            if (!reserveRingSpace(chunkBytes, ringOffset)) {
++                return false;
++            }
++            std::memcpy(static_cast<uint8_t*>(ringBuffer_.mappedData()) + ringOffset,
++                        srcBytes + static_cast<VkDeviceSize>(rowStart) * bytesPerRow, chunkBytes);
++            ringBuffer_.flush(ringOffset, chunkBytes);
++
++            beginRecordingIfNeeded();
++            VkCommandBuffer cmd = activeCmd();
++            if (!transitionedToDst) {
++                transitionImage(cmd, dst.image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++                transitionedToDst = true;
++            }
++
++            // Tightly packed WITHIN THIS CHUNK's own staged sub-buffer
++            // (bufferRowLength/bufferImageHeight == 0, same "computed from
++            // imageExtent" Vulkan copy rule the single-copy branch above
++            // relies on) -- imageOffset.y advances this region to the
++            // right vertical strip of the FULL level, so the final image
++            // ends up identical to one big copy, just assembled from
++            // several bounded ones.
++            VkBufferImageCopy region{};
++            region.bufferOffset = ringOffset;
++            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++            region.imageSubresource.mipLevel = level.mipLevel;
++            region.imageSubresource.baseArrayLayer = 0;
++            region.imageSubresource.layerCount = 1;
++            region.imageOffset = {0, static_cast<int32_t>(rowStart), 0};
++            region.imageExtent = {level.extent.width, chunkRows, 1};
++            vkCmdCopyBufferToImage(cmd, ringBuffer_.handle(), dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
++                                    &region);
++
++            rowStart += chunkRows;
++        }
+     }
+ 
+     beginRecordingIfNeeded();
+     VkCommandBuffer cmd = activeCmd();
+     if (!transitionedToDst) {
+         // Every level had size == 0 (degenerate, not exercised by any
+         // Task 14 fixture, but defensively handled rather than left
+         // UNDEFINED): still transition so `dst` ends up sampleable.
+         transitionImage(cmd, dst.image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+     }
+diff --git a/src/rx_rhi_vk/tests/upload_test.cpp b/src/rx_rhi_vk/tests/upload_test.cpp
+index df0cd7a..5ea7227 100644
+--- a/src/rx_rhi_vk/tests/upload_test.cpp
++++ b/src/rx_rhi_vk/tests/upload_test.cpp
+@@ -973,10 +973,161 @@ TEST_CASE("Uploader ring reclamation polls (never blocks) when the oldest pendin
+                         uploader->timelineSemaphore(), ticketC.value);
+     std::vector<uint8_t> readC =
+         readBackBuffer(fixture->allocator, fixture->device.device(), fixture->device.graphicsQueue(),
+                         fixture->device.graphicsQueueFamily(), dstC->handle(), kChunkSize,
+                         uploader->timelineSemaphore(), ticketC.value);
+     CHECK(std::memcmp(readA.data(), patternA.data(), kChunkSize) == 0);
+     CHECK(std::memcmp(readB.data(), patternB.data(), kChunkSize) == 0);
+     CHECK(std::memcmp(readC.data(), patternC.data(), kChunkSize) == 0);
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
++
++// ===== Chunked-row staging for oversized levels [texture-path round, ======
++// ===== item B -- the 16MB staging-cap fix]                            =====
++//
++// Prior defect: a level whose OWN bytes exceeded the ring buffer's total
++// capacity was rejected outright (uploadImageMips() returned false before
++// recording anything), which TextureCache::registerRealTexture() mapped to
++// the D11 checkerboard fallback -- reproduced on the real Workshop asset's
++// 4K textures (4096x4096 RGBA8 mip 0 = 64MB > the 16MiB default ring).
++// These tests use a deliberately TINY ring (far below the 16MiB
++// production default) so the chunked path is exercised cheaply and
++// deterministically, without needing a multi-megabyte fixture at this
++// layer (texture_cache_test.cpp's own oversized-texture GPU test covers
++// the real-shaped 4096x4096 case end to end through the actual decode
++// pipeline).
++
++namespace {
++// Deterministic RGBA8 gradient, same shape as texture_test.cpp's own
++// makeGradientPixels() (kept local to this file rather than shared --
++// this codebase's own established per-file fixture-helper convention,
++// e.g. texture_decode_test.cpp's LogCapture) -- every byte is a simple,
++// non-repeating function of (x, y), so a byte-exact readback comparison
++// after a MULTI-CHUNK upload is a real proof that every chunk landed at
++// the right subresource offset, not just that SOME bytes arrived
++// somewhere (a flat/solid-color source could pass even with chunks
++// swapped or dropped).
++std::vector<uint8_t> makeGradientPixelsLocal(uint32_t width, uint32_t height) {
++    std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4);
++    for (uint32_t y = 0; y < height; ++y) {
++        for (uint32_t x = 0; x < width; ++x) {
++            size_t i = (static_cast<size_t>(y) * width + x) * 4;
++            pixels[i + 0] = static_cast<uint8_t>(x * 7 + y);
++            pixels[i + 1] = static_cast<uint8_t>(y * 5 + x);
++            pixels[i + 2] = static_cast<uint8_t>((x ^ y) & 0xFF);
++            pixels[i + 3] = 255;
++        }
++    }
++    return pixels;
++}
++}  // namespace
++
++TEST_CASE("Uploader::uploadImageMips CHUNKED-ROW path: a level bigger than the ring buffer's total capacity "
++          "uploads correctly via multiple bounded staging trips -- byte-exact full-image readback, forcing "
++          "several ring wraps mid-level [texture-path round, item B]") {
++    auto fixture = makeFixture("rx_rhi_vk_upload_test_chunked_oversized_level");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    // 32x32 RGBA8 mip 0 = 4096 bytes, against a 1024-byte ring -- 4x over
++    // capacity. bytesPerRow = 32*4 = 128 bytes -> rowsPerChunk =
++    // 1024/128 = 8 -> exactly 4 chunks of 8 rows each, no remainder (a
++    // deliberately clean division so this test's own expected chunk count
++    // is exact, not just "at least 2").
++    constexpr VkDeviceSize kRingSize = 1024;
++    constexpr VkExtent2D kExtent{32, 32};
++    constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
++
++    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device, kRingSize);
++    REQUIRE(uploader.has_value());
++    CHECK(uploader->ringCapacity() == kRingSize);
++
++    auto texture = rx::rhi::Texture2D::createForPresuppliedMips(
++        fixture->device.physicalDevice(), fixture->device.device(), fixture->allocator, kExtent, kFormat,
++        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, /*mipLevels=*/1, rx::rhi::MemoryCategory::Texture);
++    REQUIRE(texture.has_value());
++
++    std::vector<uint8_t> pixels = makeGradientPixelsLocal(kExtent.width, kExtent.height);
++    rx::rhi::Uploader::ImageMipLevel level{};
++    level.data = pixels.data();
++    level.size = static_cast<VkDeviceSize>(pixels.size());
++    level.mipLevel = 0;
++    level.extent = kExtent;
++    REQUIRE(level.size > kRingSize);  // this test's own premise -- must actually need chunking
++
++    REQUIRE(uploader->uploadImageMips(*texture, std::span<const rx::rhi::Uploader::ImageMipLevel>(&level, 1)));
++    uploader->wait(uploader->flush());
++
++    // Revert-discrimination evidence (diagnostic, not load-bearing on its
++    // own): the wrap count directly proves multiple bounded trips actually
++    // happened through the ring, not one oversized reservation that
++    // somehow slipped through reserveRingSpace()'s own total-capacity
++    // check. 4096 bytes through a 1024-byte ring, one chunk exactly
++    // filling it per trip, wraps at LEAST 3 times (the 2nd/3rd/4th chunks
++    // each start past the ring's end after the previous chunk filled it).
++    CHECK(uploader->ringWrapCount() >= 3);
++
++    auto readback = fixture->allocator.createHostVisibleBuffer(pixels.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    REQUIRE(readback.has_value());
++    auto cmdCtx = rx::rhi::CommandContext::create(fixture->device.device(), fixture->device.graphicsQueue(),
++                                                    fixture->device.graphicsQueueFamily());
++    REQUIRE(cmdCtx.has_value());
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        rx::rhi::transitionImage(cmd, texture->image(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++                                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++        VkBufferImageCopy region{};
++        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        region.imageSubresource.layerCount = 1;
++        region.imageExtent = {kExtent.width, kExtent.height, 1};
++        vkCmdCopyImageToBuffer(cmd, texture->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1,
++                               &region);
++    });
++    readback->invalidate();
++    std::vector<uint8_t> readBackPixels(pixels.size());
++    std::memcpy(readBackPixels.data(), readback->mappedData(), pixels.size());
++
++    // THE headline assertion: every one of the 4 chunks landed at the
++    // right vertical offset with the right bytes -- a byte-exact, whole-
++    // image comparison against a non-repeating gradient (a swapped or
++    // misplaced chunk would corrupt SOME row range, failing this memcmp).
++    CHECK(std::memcmp(readBackPixels.data(), pixels.data(), pixels.size()) == 0);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("Uploader::uploadImageMips: an oversized level that STILL exceeds capacity even chunked one row at a "
++          "time (a single row alone bigger than the ring) fails cleanly, before recording any GPU work -- never "
++          "a partial/corrupt upload [texture-path round, item B]") {
++    auto fixture = makeFixture("rx_rhi_vk_upload_test_chunked_row_too_big");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    // A single row is 32*4=128 bytes; a 64-byte ring cannot fit even ONE
++    // row -- the "cannot chunk at all" branch, distinct from the "needs
++    // multiple chunks" success case above.
++    constexpr VkDeviceSize kRingSize = 64;
++    constexpr VkExtent2D kExtent{32, 32};
++    constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
++
++    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device, kRingSize);
++    REQUIRE(uploader.has_value());
++
++    auto texture = rx::rhi::Texture2D::createForPresuppliedMips(
++        fixture->device.physicalDevice(), fixture->device.device(), fixture->allocator, kExtent, kFormat,
++        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, /*mipLevels=*/1, rx::rhi::MemoryCategory::Texture);
++    REQUIRE(texture.has_value());
++
++    std::vector<uint8_t> pixels = makeGradientPixelsLocal(kExtent.width, kExtent.height);
++    rx::rhi::Uploader::ImageMipLevel level{};
++    level.data = pixels.data();
++    level.size = static_cast<VkDeviceSize>(pixels.size());
++    level.mipLevel = 0;
++    level.extent = kExtent;
++
++    CHECK_FALSE(uploader->uploadImageMips(*texture, std::span<const rx::rhi::Uploader::ImageMipLevel>(&level, 1)));
++    // Nothing was ever recorded for this doomed call -- flush() reports
++    // the trivially-complete sentinel, exactly this class's own "no
++    // partial-batch corruption" contract for every other rejection path.
++    CHECK(uploader->flush().value == 0);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
