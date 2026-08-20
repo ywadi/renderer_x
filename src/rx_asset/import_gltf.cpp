@@ -543,16 +543,93 @@ DracoDecodeResult decodeDracoPrimitive(const fastgltf::Asset& asset, const fastg
     }
     std::unique_ptr<draco::Mesh> mesh = std::move(statusOr).value();
 
+    // [Review round, real defect found while investigating Medium finding
+    // 2] `it->accessorIndex` holds the Draco attribute's persistent
+    // UNIQUE id (KHR_draco_mesh_compression's own spec text: "the
+    // corresponding Draco attribute id" -- the id the ENCODER assigned,
+    // e.g. via Encoder::AddAttribute()'s own return value, which survives
+    // the bitstream round-trip unchanged as PointAttribute::unique_id()).
+    // This is NOT necessarily the same as `mesh->attribute(i)`'s own
+    // ARRAY index after decode: `Mesh::attribute(int)` addresses Draco's
+    // internal `attributes_` vector by POSITION, and this project's own
+    // vendored Draco (verified directly, both by reading the decoder
+    // source and by an independent standalone probe against the real
+    // BoomBox fixture) reorders that vector during decode -- observed
+    // directly: BoomBox's own glTF declares POSITION at Draco id 3, but
+    // `mesh->attribute(3)` post-decode is actually NORMAL (unique_id 1,
+    // grouped-by-type reordering), while the real POSITION lives at array
+    // index 1. The previous code (`mesh->attribute(attId)`, treating the
+    // declared id as a literal array index) silently read the WRONG
+    // attribute's data whenever encode-time id and decode-time array
+    // index diverge -- which they always do for this project's own
+    // trivial single-primitive-per-type fixtures (id happens to equal
+    // array index there, by simple coincidence of the encode order used)
+    // but do NOT for real-world content encoded by other tools. Fixed by
+    // using Draco's own purpose-built lookup,
+    // `PointCloud::GetAttributeByUniqueId()` (point_cloud.h -- a safe
+    // linear scan by `unique_id()`, returns nullptr on no match, verified
+    // directly against the vendored source), which resolves by the
+    // SEMANTICALLY correct key regardless of decode-time array ordering.
     const auto findAttr = [&](std::string_view name) -> const draco::PointAttribute* {
         auto it = draco.findAttribute(name);
         if (it == draco.attributes.end()) {
             return nullptr;
         }
-        const int32_t attId = static_cast<int32_t>(it->accessorIndex);  // holds the DRACO attribute id in this context, not a glTF accessor index
-        if (attId < 0 || attId >= mesh->num_attributes()) {
-            return nullptr;
+        const uint32_t attId = static_cast<uint32_t>(it->accessorIndex);
+        return mesh->GetAttributeByUniqueId(attId);
+    };
+
+    // [issue #31 review round, Medium finding 2] Defensive bounds check,
+    // middleware-grade: draco::PointAttribute::mapped_index() is documented
+    // to always return a value within [0, attr->size()) for a well-formed,
+    // successfully-decoded mesh -- but this project does not trust that
+    // invariant blindly, for two verified reasons:
+    //   1. KHR_draco_mesh_compression bufferView bytes are untrusted,
+    //      attacker-influenced glTF content, not this project's own
+    //      internal state -- a hand-crafted or corrupted compressed
+    //      payload that still passes DecodeMeshFromBuffer() (a successful
+    //      decode with an internally-inconsistent attribute) is exactly
+    //      the shape of input Draco's own C++ API offers no defense
+    //      against on its own.
+    //   2. Verified directly against the vendored Draco source
+    //      (geometry_attribute.h): ConvertValue<T,N>() DOES bounds-check
+    //      the resulting byte address against the attribute's own DataBuffer
+    //      allocation (IsAddressValid()) and returns false on a genuine
+    //      out-of-bounds address -- but that allocation can legitimately be
+    //      larger than size()*byte_stride() (padding/sharing), so an
+    //      AttributeValueIndex at or beyond size() but still within the
+    //      buffer's physical extent silently "succeeds" and returns a
+    //      WRONG (garbage/adjacent) value, not a bounds failure -- and the
+    //      code below previously never inspected ConvertValue's own bool
+    //      return value at all, so even the false-on-genuine-OOB case was
+    //      silently discarded (garbage or the zero-initialized default
+    //      used with no error). Reproduced directly: on the real BoomBox
+    //      fixture (posAttr->size() == 3237, numPoints == 3575), a
+    //      mapped_index()-bypassing decode bug reads uninitialized/
+    //      adjacent attribute memory for 338 of 3575 points, entirely
+    //      silently.
+    // Both failure classes are closed the same way: check
+    // mapped_index()'s result against size() BEFORE reading, and check
+    // ConvertValue's own return value AFTER -- either violation is
+    // treated as a decode failure via the SAME clear, actionable,
+    // non-crashing error path as a malformed bufferView or a failed
+    // DecodeMeshFromBuffer() call, never a raw/unchecked indexed read.
+    const auto convertAttrChecked = [](const draco::PointAttribute* attr, draco::PointIndex pi, float* out,
+                                        int numComponents) -> bool {
+        const draco::AttributeValueIndex vi = attr->mapped_index(pi);
+        if (vi.value() >= static_cast<uint32_t>(attr->size())) {
+            return false;
         }
-        return mesh->attribute(attId);
+        switch (numComponents) {
+            case 2:
+                return attr->ConvertValue<float, 2>(vi, out);
+            case 3:
+                return attr->ConvertValue<float, 3>(vi, out);
+            case 4:
+                return attr->ConvertValue<float, 4>(vi, out);
+            default:
+                return false;
+        }
     };
 
     const size_t numPoints = mesh->num_points();
@@ -572,22 +649,46 @@ DracoDecodeResult decodeDracoPrimitive(const fastgltf::Asset& asset, const fastg
     for (size_t p = 0; p < numPoints; ++p) {
         const draco::PointIndex pi(static_cast<uint32_t>(p));
         float pos[3] = {0, 0, 0};
-        posAttr->ConvertValue<float, 3>(posAttr->mapped_index(pi), pos);
+        if (!convertAttrChecked(posAttr, pi, pos, 3)) {
+            RX_LOG_ERROR(
+                "rx_asset: Draco decode failed: POSITION attribute value index out of range for point {} "
+                "(attribute size {}, mesh has {} points) -- decoded mesh is internally inconsistent",
+                p, posAttr->size(), numPoints);
+            return DracoDecodeResult{};
+        }
         result.positions[p] = glm::vec3(pos[0], pos[1], pos[2]);
 
         if (normAttr != nullptr) {
             float n[3] = {0, 0, 1};
-            normAttr->ConvertValue<float, 3>(normAttr->mapped_index(pi), n);
+            if (!convertAttrChecked(normAttr, pi, n, 3)) {
+                RX_LOG_ERROR(
+                    "rx_asset: Draco decode failed: NORMAL attribute value index out of range for point {} "
+                    "(attribute size {}, mesh has {} points) -- decoded mesh is internally inconsistent",
+                    p, normAttr->size(), numPoints);
+                return DracoDecodeResult{};
+            }
             result.normals[p] = glm::vec3(n[0], n[1], n[2]);
         }
         if (uvAttr != nullptr) {
             float uv[2] = {0, 0};
-            uvAttr->ConvertValue<float, 2>(uvAttr->mapped_index(pi), uv);
+            if (!convertAttrChecked(uvAttr, pi, uv, 2)) {
+                RX_LOG_ERROR(
+                    "rx_asset: Draco decode failed: TEXCOORD_0 attribute value index out of range for point {} "
+                    "(attribute size {}, mesh has {} points) -- decoded mesh is internally inconsistent",
+                    p, uvAttr->size(), numPoints);
+                return DracoDecodeResult{};
+            }
             result.uvs[p] = glm::vec2(uv[0], uv[1]);
         }
         if (tanAttr != nullptr) {
             float t[4] = {1, 0, 0, 1};
-            tanAttr->ConvertValue<float, 4>(tanAttr->mapped_index(pi), t);
+            if (!convertAttrChecked(tanAttr, pi, t, 4)) {
+                RX_LOG_ERROR(
+                    "rx_asset: Draco decode failed: TANGENT attribute value index out of range for point {} "
+                    "(attribute size {}, mesh has {} points) -- decoded mesh is internally inconsistent",
+                    p, tanAttr->size(), numPoints);
+                return DracoDecodeResult{};
+            }
             result.tangents[p] = glm::vec4(t[0], t[1], t[2], t[3]);
         }
     }
