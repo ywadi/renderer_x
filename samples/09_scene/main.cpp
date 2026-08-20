@@ -100,6 +100,7 @@
 #include "fly_camera.h"
 #include "grid_layout.h"
 #include "mouse_capture.h"
+#include "window_resize.h"
 #include <reference_gate.h>
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
@@ -302,6 +303,13 @@ using rx::samples9::keyboardDrivesCamera;
 using rx::samples9::FlyThroughCaptureState;
 using rx::samples9::mouseDeltaDrivesCamera;
 using rx::samples9::escTogglesCapture;
+
+// --- Live resize + runtime fullscreen toggle [Issue #36] ------------------
+// f11TogglesFullscreen()/pixelSizeRequiresRecreate() -- pure decisions
+// window_resize.h documents in full; runPresent() below is the sole
+// consumer.
+using rx::samples9::f11TogglesFullscreen;
+using rx::samples9::pixelSizeRequiresRecreate;
 
 // --- Shared pass infra [tonemap pass -- shaders/multipass/tonemap.{vert,
 // frag}.slang, VERBATIM -- same convention samples/07_stress/08_gltf_viewer's
@@ -858,13 +866,18 @@ struct App {
 // scheduler/executor, the shadow-caster pipeline, the tonemap pipeline, and
 // the shared material-param descriptor infrastructure. Returns nullptr
 // (logged) on any failure.
+//
+// `resizable` [Issue #36] defaults to false (runHeadless()'s own call site
+// below never passes it -- a hidden headless window has nothing for a user
+// to drag-resize); runPresent() passes true, so its --present window
+// carries SDL_WINDOW_RESIZABLE from creation.
 std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uint32_t height, bool visible,
-                              bool validate, bool stressMode) {
+                              bool validate, bool stressMode, bool resizable = false) {
     auto app = std::make_unique<App>();
     app->stressMode = stressMode;
 
     auto window = rx::platform::Window::create(windowTitle.c_str(), static_cast<int>(width), static_cast<int>(height),
-                                                 visible);
+                                                 visible, resizable);
     if (!window.has_value()) {
         RX_LOG_ERROR("sample_09_scene: Window::create failed: no display backend available");
         return nullptr;
@@ -2359,7 +2372,7 @@ void declareGraph(rx::graph::RenderGraph& graph, App& app, VkFormat backbufferFo
 // requires. Called between `overlay->beginFrame()` and `executor->execute()`
 // -- see runHeadless()'s own two-frame split (D17-gated capture draws NO
 // widgets at all; the separate HUD-smoke-test frame calls this).
-void drawHud(App& app, rx::rhi::Device& device, VkSurfaceKHR surface, bool presentMode) {
+void drawHud(App& app, bool presentMode) {
     // Explicit size on first appearance -- avoids Dear ImGui's own "brand
     // new auto-fit window's first frame only measures content, doesn't
     // draw it" behavior (src/rx_debug_ui/tests/test_overlay_gpu.cpp's own
@@ -2376,6 +2389,15 @@ void drawHud(App& app, rx::rhi::Device& device, VkSurfaceKHR surface, bool prese
     if (presentMode) {
         ImGui::Text("Mouse: %s  (Esc: toggle release/recapture%s)", app.mouseCapture.captured() ? "CAPTURED" : "RELEASED",
                     app.mouseCapture.captured() ? "" : ", click viewport: recapture");
+        // [Issue #36] Human-observable confirmation of the current window
+        // mode and how to change it -- mirrors the Mouse line just above
+        // (same "state + how to change it" HUD convention this sample
+        // already established for Issue #33), for this task's own
+        // MANUAL_VERIFICATION checklist's resize/fullscreen rows. The
+        // window itself is always resizable in --present mode (drag any
+        // edge/corner) in addition to this toggle.
+        ImGui::Text("Window: %s  (F11: toggle fullscreen, drag edges to resize)",
+                    app.window->isFullscreen() ? "FULLSCREEN" : "WINDOWED");
     }
     ImGui::Separator();
 
@@ -2393,19 +2415,25 @@ void drawHud(App& app, rx::rhi::Device& device, VkSurfaceKHR surface, bool prese
     ImGui::Text("  instancing-collapse ratio: %.2f%%", collapseRatio);
     ImGui::Separator();
 
-    // vsync toggle -- the SAME setPresentMode+recreateSwapchain path the
-    // --vsync CLI flag drives (present mode only; no live swapchain to
-    // toggle headless).
+    // vsync toggle -- ImGui::Checkbox only MUTATES app.hud.vsyncOn here;
+    // applying it (Device::setPresentMode() + the SAME recreation path a
+    // resize/fullscreen toggle drives) is deferred to runPresent()'s own
+    // loop [Issue #36 fix-in-round], at the top of the NEXT frame, before
+    // that frame's own acquireNextImage(). Applying it HERE, inline, used
+    // to call Device::recreateSwapchain() directly (mid-frame, AFTER
+    // acquireNextImage() had already fixed this frame's `acquire.
+    // imageIndex` and AFTER vkBeginCommandBuffer() had already started
+    // recording against the swapchain images valid at acquire time) --
+    // recreateSwapchain() destroys and rebuilds the ENTIRE VkSwapchainKHR
+    // for a present-mode change (not merely "the same images, different
+    // timing"), which left `acquire.imageIndex`/the swapchain image views/
+    // FrameSync's per-image sync objects referencing since-destroyed state
+    // for the remainder of that same frame -- a real bug, closed by this
+    // sample's own "exactly one recreation call site, called only from a
+    // safe pre-acquire point" design rule (Task 17; see
+    // recreateSwapchainAndDependents() in runPresent()).
     if (presentMode) {
-        if (ImGui::Checkbox("vsync", &app.hud.vsyncOn)) {
-            const rx::rhi::PresentMode mode = app.hud.vsyncOn ? rx::rhi::PresentMode::VsyncOn : rx::rhi::PresentMode::VsyncOff;
-            device.setPresentMode(mode);
-            if (!device.recreateSwapchain(surface)) {
-                RX_LOG_ERROR("sample_09_scene: recreateSwapchain failed applying the HUD vsync toggle");
-            } else {
-                RX_LOG_INFO("sample_09_scene: --present: present mode in use: {}", rx::rhi::presentModeName(device.presentMode()));
-            }
-        }
+        ImGui::Checkbox("vsync", &app.hud.vsyncOn);
     } else {
         ImGui::Text("vsync: %s (present-mode only)", app.hud.vsyncOn ? "on" : "off");
     }
@@ -2916,7 +2944,7 @@ int runHeadless(const Args& args) {
     updateSceneFrame(*app, *app->scheduler);
     uploadSceneFrameGpuBuffers(*app, /*frameSlot=*/0);  // [I1] headless: always slot 0.
     app->overlay->beginFrame();
-    drawHud(*app, *app->device, app->surface, /*presentMode=*/false);
+    drawHud(*app, /*presentMode=*/false);
     std::vector<uint8_t> hudFramePixels = captureFrame();
     (void)hudFramePixels;
     const ImDrawData* hudDrawData = ImGui::GetDrawData();
@@ -3031,7 +3059,8 @@ int runHeadless(const Args& args) {
 
 // --- Present mode: interactive window, fly-through camera, real HUD ------
 int runPresent(const Args& args) {
-    auto app = makeApp("RendererX -- 09_scene", kPresentWidth, kPresentHeight, /*visible=*/true, args.validate, args.stress);
+    auto app = makeApp("RendererX -- 09_scene", kPresentWidth, kPresentHeight, /*visible=*/true, args.validate, args.stress,
+                        /*resizable=*/true);
     if (app == nullptr) {
         return 1;
     }
@@ -3237,9 +3266,81 @@ int runPresent(const Args& args) {
         return 1;
     }
 
+    // [Issue #36] THE single Device::recreateSwapchain() call site every
+    // extent-changing/present-mode-changing/fullscreen-toggling event in
+    // this loop funnels through -- Task 17's own explicit design rule (see
+    // src/rx_rhi_vk/tests/window_state_test.cpp's own "Exactly one
+    // recreation call site" comment on the fullscreen double-toggle test).
+    // Re-derives compileInfo's width/height/format from the FRESHLY
+    // queried Device::swapchainExtent()/swapchainFormat() and re-runs
+    // RenderGraph::compile() BEFORE Executor::realize() -- NOT realize()
+    // alone: RenderGraph::compile() is the only place a SwapchainRelative
+    // AttachmentDesc (rx_graph/resources.h) is resolved from CompileInfo
+    // into a real pixel extent; skipping straight to realize() with a
+    // stale compiled shape would silently leave every SwapchainRelative
+    // pooled resource this graph declares ("hdr"/"depth", declareGraph()
+    // above) at the OLD extent while the backbuffer itself already
+    // resized -- Executor::realize()'s own header comment documents
+    // calling it again after such a recompile as safe/expected
+    // (src/rx_graph/tests/test_execute_gpu.cpp's own "resize-rerealize"
+    // TEST_CASE already proves the rx_graph half of this generically); the
+    // gap this closes is that nothing in this sample called compile()
+    // again on ANY of its pre-existing recreation paths before this fix,
+    // because none of them had ever been reachable with a genuinely
+    // different extent until this sample's window became resizable.
+    //
+    // Device::recreateSwapchain() itself already calls vkDeviceWaitIdle()
+    // internally (device.cpp) before touching the live swapchain, so no
+    // separate wait is needed for that; the explicit vkDeviceWaitIdle()
+    // below covers the SEPARATE hazard of this function's OWN caller-owned
+    // GPU resources (swapchainViews, FrameSync's pooled command buffers/
+    // semaphores) being reallocated out from under still-in-flight work --
+    // mirrors this loop's own pre-existing NeedsRecreate handling.
+    //
+    // Returns false on any failure (never itself logs beyond what
+    // recreateSwapchain()/rebuildSwapchainViews()/
+    // FrameSync::onSwapchainRecreated() already log) -- every caller below
+    // treats that as fatal, exactly like the original NeedsRecreate
+    // branches did before this function existed.
+    auto recreateSwapchainAndDependents = [&]() -> bool {
+        vkDeviceWaitIdle(vkDevice);
+        if (!app->device->recreateSwapchain(app->surface)) {
+            return false;
+        }
+        if (app->device->isSuspended()) {
+            // [D25] No live swapchain images/format/extent to rebuild
+            // views/FrameSync/the render graph's transients against --
+            // the present loop's own Suspended branch below retries this
+            // same function every ~16ms until a real extent returns.
+            return true;
+        }
+        compileInfo.swapchainWidth = app->device->swapchainExtent().width;
+        compileInfo.swapchainHeight = app->device->swapchainExtent().height;
+        compileInfo.swapchainFormat = app->device->swapchainFormat();
+        graph.compile(compileInfo);
+        if (!rebuildSwapchainViews()) {
+            return false;
+        }
+        if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(app->device->swapchainImages().size()))) {
+            return false;
+        }
+        app->executor->realize(graph);
+        return true;
+    };
+
     bool running = true;
     bool ok = true;
     auto lastFrameTime = std::chrono::steady_clock::now();
+    // [Issue #36] The extent this run's swapchain was last (re)built
+    // against -- pixelSizeRequiresRecreate()'s own `lastHandled` baseline,
+    // updated after every successful recreateSwapchainAndDependents() call
+    // below (see that lambda's own call sites).
+    VkExtent2D lastHandledExtent = app->device->swapchainExtent();
+    // [Issue #36 fix-in-round] Mirrors app->hud.vsyncOn as of the last
+    // frame this loop actually applied a present-mode change for -- see
+    // drawHud()'s own updated vsync-checkbox comment for why applying it
+    // is deferred to here instead of happening inline inside drawHud().
+    bool vsyncOnAppliedLastFrame = app->hud.vsyncOn;
 
     // [gate ruling #16] ImGui feeds every SDL event FIRST, then platform
     // input accumulators (Window::pumpEvents()'s own `preDispatch` seam).
@@ -3255,6 +3356,10 @@ int runPresent(const Args& args) {
         // SDL-free by design); applying a resulting transition to the real
         // Window happens once, after the full drain, below.
         const bool capturedBeforePump = app->mouseCapture.captured();
+        // [Issue #36] Edge-triggered, applied once after the full drain
+        // below -- same "detect during pump, apply once after" split the
+        // mouse-capture toggle above already establishes.
+        bool f11FullscreenToggleRequested = false;
         app->window->pumpEvents([&](const SDL_Event& event) {
             app->overlay->processEvent(event);
             if (event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
@@ -3272,6 +3377,14 @@ int runPresent(const Args& args) {
             } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT &&
                        !app->mouseCapture.captured() && !ImGui::GetIO().WantCaptureMouse) {
                 app->mouseCapture.recaptureOnViewportClick();
+            } else if (event.type == SDL_EVENT_KEY_DOWN && event.key.scancode == SDL_SCANCODE_F11 &&
+                       !event.key.repeat && f11TogglesFullscreen(ImGui::GetIO().WantCaptureKeyboard)) {
+                // [Issue #36] Esc stays owned by mouse-capture (branch
+                // above) -- F11 is its own, independently-gated key, never
+                // conflicting with it. See window_resize.h's own
+                // f11TogglesFullscreen() comment for the WantCaptureKeyboard
+                // gate rationale (mirrors escTogglesCapture()'s).
+                f11FullscreenToggleRequested = true;
             }
         });
         if (!running) break;
@@ -3292,6 +3405,70 @@ int runPresent(const Args& args) {
             app->window->setRelativeMouseMode(app->mouseCapture.captured());
         }
 
+        // [Issue #36] F11 runtime fullscreen toggle -- routed through the
+        // SAME Window::setFullscreen() + recreateSwapchainAndDependents()
+        // path the --fullscreen CLI flag applies above, before this loop.
+        // Applied here, before this frame's own acquireNextImage(): no
+        // acquire/command-buffer/HUD work has happened yet this iteration,
+        // so there is no in-flight frame state this recreation could race
+        // (unlike the pre-existing HUD vsync-checkbox bug this same task
+        // fixed -- see drawHud()'s own comment).
+        if (f11FullscreenToggleRequested) {
+            if (!app->window->setFullscreen(!app->window->isFullscreen())) {
+                RX_LOG_ERROR("sample_09_scene: Window::setFullscreen failed applying the F11 toggle");
+            } else if (!recreateSwapchainAndDependents()) {
+                ok = false;
+                break;
+            } else {
+                lastHandledExtent = app->device->swapchainExtent();
+            }
+        }
+
+        // [Issue #36] Live drag-resize: SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED
+        // (drained by pumpEvents() above into Window::lastPixelSizeEvent())
+        // drives the SAME recreation path NeedsRecreate/fullscreen do,
+        // proactively -- rather than waiting for
+        // vkAcquireNextImageKHR/vkQueuePresentKHR to eventually report
+        // VK_ERROR_OUT_OF_DATE_KHR/VK_SUBOPTIMAL_KHR, which can lag a live
+        // drag-resize by several frames on some platforms/drivers. See
+        // window_resize.h's own pixelSizeRequiresRecreate() comment for why
+        // this is safe to gate on an SDL event even though device.h
+        // documents lastPixelSizeEvent() as "optimization/logging signal
+        // only" -- a genuine minimize/zero-extent is never proactively
+        // triggered from here (pixelSizeRequiresRecreate() requires both
+        // dimensions nonzero), staying exclusively owned by the
+        // acquire/present-driven NeedsRecreate branches and
+        // Device::recreateSwapchain()'s own live-queried suspended guard,
+        // below.
+        if (pixelSizeRequiresRecreate(lastHandledExtent, app->window->lastPixelSizeEvent())) {
+            if (!recreateSwapchainAndDependents()) {
+                ok = false;
+                break;
+            }
+            lastHandledExtent = app->device->swapchainExtent();
+        }
+
+        // [Issue #36 fix-in-round] The HUD's own vsync checkbox
+        // (drawHud(), called further down this same loop body) only
+        // MUTATES app->hud.vsyncOn -- detected and applied HERE instead,
+        // one frame later, before THIS frame's acquireNextImage(), through
+        // the same recreateSwapchainAndDependents() path. See drawHud()'s
+        // own comment for the full "why not apply it inline" rationale
+        // (recreating the swapchain after acquireNextImage() had already
+        // fixed this frame's imageIndex was a real, pre-existing bug).
+        if (app->hud.vsyncOn != vsyncOnAppliedLastFrame) {
+            vsyncOnAppliedLastFrame = app->hud.vsyncOn;
+            app->device->setPresentMode(vsyncOnAppliedLastFrame ? rx::rhi::PresentMode::VsyncOn
+                                                                  : rx::rhi::PresentMode::VsyncOff);
+            if (!recreateSwapchainAndDependents()) {
+                ok = false;
+                break;
+            }
+            lastHandledExtent = app->device->swapchainExtent();
+            RX_LOG_INFO("sample_09_scene: --present: present mode in use: {}",
+                        rx::rhi::presentModeName(app->device->presentMode()));
+        }
+
         app->scheduler->pumpMain();
 
         const auto now = std::chrono::steady_clock::now();
@@ -3307,28 +3484,19 @@ int runPresent(const Args& args) {
         auto acquire = app->device->acquireNextImage(frameSync->currentImageAvailableSemaphore());
         if (acquire.status == rx::rhi::SwapchainStatus::Suspended) {
             std::this_thread::sleep_for(std::chrono::milliseconds(16));
-            if (!app->device->recreateSwapchain(app->surface)) {
-                RX_LOG_ERROR("sample_09_scene: Device::recreateSwapchain failed while suspended (zero-extent retry)");
+            if (!recreateSwapchainAndDependents()) {
                 ok = false;
                 break;
             }
-            if (!app->device->isSuspended()) {
-                if (!rebuildSwapchainViews() || !frameSync->onSwapchainRecreated(static_cast<uint32_t>(app->device->swapchainImages().size()))) {
-                    ok = false;
-                    break;
-                }
-                app->executor->realize(graph);
-            }
+            lastHandledExtent = app->device->swapchainExtent();
             continue;
         }
         if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
-            vkDeviceWaitIdle(vkDevice);
-            if (!app->device->recreateSwapchain(app->surface) || !rebuildSwapchainViews() ||
-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(app->device->swapchainImages().size()))) {
+            if (!recreateSwapchainAndDependents()) {
                 ok = false;
                 break;
             }
-            app->executor->realize(graph);
+            lastHandledExtent = app->device->swapchainExtent();
             continue;
         }
         if (acquire.status == rx::rhi::SwapchainStatus::DeviceLost) {
@@ -3360,7 +3528,7 @@ int runPresent(const Args& args) {
         vkBeginCommandBuffer(cmd, &beginInfo);
 
         app->overlay->beginFrame();
-        drawHud(*app, *app->device, app->surface, /*presentMode=*/true);
+        drawHud(*app, /*presentMode=*/true);
 
         app->executor->execute(graph, cmd, app->device->swapchainImages()[acquire.imageIndex], swapchainViews[acquire.imageIndex],
                                app->device->swapchainExtent());
@@ -3384,13 +3552,11 @@ int runPresent(const Args& args) {
         }
         auto presentStatus = app->device->present(acquire.imageIndex, signalSem);
         if (presentStatus == rx::rhi::SwapchainStatus::NeedsRecreate) {
-            vkDeviceWaitIdle(vkDevice);
-            if (!app->device->recreateSwapchain(app->surface) || !rebuildSwapchainViews() ||
-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(app->device->swapchainImages().size()))) {
+            if (!recreateSwapchainAndDependents()) {
                 ok = false;
                 break;
             }
-            app->executor->realize(graph);
+            lastHandledExtent = app->device->swapchainExtent();
         } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
             RX_LOG_ERROR("sample_09_scene: device lost during present; exiting present loop");
             ok = false;

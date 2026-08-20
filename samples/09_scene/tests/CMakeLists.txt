@@ -24,6 +24,11 @@
 # rendered every helmet lying on its back; the D17 pixel-diff gate alone
 # proved blind to it, since the committed reference was itself baked FROM
 # the buggy render -- see that test file's own top comment).
+#
+# test_window_resize.cpp covers ../window_resize.h (also device-free,
+# header-only -- no matching .cpp to add) -- Issue #36's live-resize/
+# fullscreen-toggle decision-logic coverage (f11TogglesFullscreen(),
+# pixelSizeRequiresRecreate()).
 add_executable(sample_09_scene_tests
     doctest_main.cpp
     test_draw_recording.cpp
@@ -31,6 +36,7 @@ add_executable(sample_09_scene_tests
     test_grid_layout.cpp
     test_mouse_capture.cpp
     test_mouse_capture_focus_composition.cpp
+    test_window_resize.cpp
     "${CMAKE_CURRENT_SOURCE_DIR}/../draw_recording.cpp"
 )
 target_link_libraries(sample_09_scene_tests PRIVATE rx_scene rx_platform doctest::doctest)
