@@ -510,3 +510,20 @@ it is out of scope for *this* spec only, not out of scope for the project:
   `resolveDrawGroups` return values) — extend the zero-alloc discipline
   to the sample/consumer recording path when the scene path is next
   reworked (geometry or techniques phase).
+
+- **Layer-10 offline asset tooling — committed content inventory
+  (2026-08-20):** everything the runtime currently regenerates per run
+  is this phase's baking backlog, recorded here so none of it is lost:
+  (a) texture baking — PNG/JPG → KTX2 (block-compressed + offline mip
+  chains; `toktx` toolchain decision included), replacing the runtime
+  stb decode+mip path for shipped content; (b) geometry baking —
+  MikkTSpace tangent generation and meshoptimizer processing moved to
+  import-time-once instead of every-run; (c) a **derived-data cache**
+  (hash of source asset + processing parameters → cached processed
+  blobs: decoded/mipped textures, tangents, optimized meshes) so even
+  DEV-time imports of arbitrary content pay processing once per asset
+  version, not per run; (d) the runtime stb/tangent paths REMAIN as
+  the arbitrary-content fallback (dev convenience), never removed.
+  Context: the per-run cost inventory and the pipeline-cache precedent
+  (VkPipelineCache already persists per sample) are ledgered in the
+  Phase 4 SDD (2026-08-20 entries).
