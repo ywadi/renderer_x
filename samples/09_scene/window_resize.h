@@ -105,4 +105,29 @@ namespace rx::samples9 {
     return newExtent.width != lastCompiledExtent.width || newExtent.height != lastCompiledExtent.height;
 }
 
+// [Issue #74] Pure decision, used by runPresent() at the present loop's own
+// exit point: after the loop breaks (either gracefully, via
+// Device::isSurfaceLost(), or on a hard failure), the previously-unchecked
+// `vkDeviceWaitIdle()` result is checked here. Reproduced directly on real
+// NVIDIA/Xcb hardware: when the loop already exited because the native
+// window is known gone (`surfaceLost`), the underlying VkDevice can ALSO
+// report VK_ERROR_DEVICE_LOST from that wait -- a further, empirically-
+// observed consequence of the SAME external event, one layer deeper than
+// the surface-lost state #73 already handles. A lost device does not
+// actually wait for anything, so letting teardown proceed regardless into
+// the fine-grained per-object vkDestroyImageView()/FrameSync::~FrameSync()/
+// destroyApp() calls produces real, unfiltered validation-layer "still in
+// use" errors (nothing was actually drained) -- reproduced directly, not
+// assumed. True ONLY for the exact compound condition this was reproduced
+// under (device lost AND the surface already known lost) -- a device lost
+// while the surface is still alive (e.g. mid-frame,
+// SwapchainStatus::DeviceLost from acquire()/present()) is a DIFFERENT,
+// more serious situation this function deliberately does not touch; that
+// path keeps failing hard (`ok = false`) exactly as it already did, so a
+// genuine, unrelated device-loss bug is never silently masked as a clean
+// exit by this narrower fix.
+[[nodiscard]] inline bool shouldSkipTeardownAfterDeviceLoss(VkResult waitIdleResult, bool surfaceLost) {
+    return waitIdleResult == VK_ERROR_DEVICE_LOST && surfaceLost;
+}
+
 }  // namespace rx::samples9

@@ -119,6 +119,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -306,11 +307,13 @@ using rx::samples9::escTogglesCapture;
 
 // --- Live resize + runtime fullscreen toggle [Issue #36] ------------------
 // f11TogglesFullscreen()/pixelSizeRequiresRecreate()/
-// graphNeedsRecompileForExtent() -- pure decisions window_resize.h
-// documents in full; runPresent() below is the sole consumer.
+// graphNeedsRecompileForExtent()/shouldSkipTeardownAfterDeviceLoss() -- pure
+// decisions window_resize.h documents in full; runPresent() below is the
+// sole consumer.
 using rx::samples9::f11TogglesFullscreen;
 using rx::samples9::graphNeedsRecompileForExtent;
 using rx::samples9::pixelSizeRequiresRecreate;
+using rx::samples9::shouldSkipTeardownAfterDeviceLoss;
 
 // --- Shared pass infra [tonemap pass -- shaders/multipass/tonemap.{vert,
 // frag}.slang, VERBATIM -- same convention samples/07_stress/08_gltf_viewer's
@@ -3663,7 +3666,54 @@ int runPresent(const Args& args) {
         RX_FRAME_MARK;
     }
 
-    vkDeviceWaitIdle(vkDevice);
+    // [Issue #74] This result was previously discarded. Reproduced directly
+    // on real NVIDIA/Xcb hardware: when the loop above has ALREADY exited
+    // via Device::isSurfaceLost() (the present window's native handle died
+    // mid-session -- #73), the underlying VkDevice can ALSO report
+    // VK_ERROR_DEVICE_LOST here, on this same driver stack -- a further,
+    // empirically-observed consequence of the SAME external event (the
+    // window is gone), one layer deeper than the surface-lost state #73
+    // already handles, not a new/unrelated failure. Per the Vulkan spec,
+    // once a device is lost it "should [be treated as] no longer usable" --
+    // vkDeviceWaitIdle() does not actually wait for anything in that state,
+    // so letting teardown proceed regardless into the fine-grained
+    // per-object vkDestroyImageView()/FrameSync::~FrameSync()/destroyApp()
+    // calls below produces real, UNFILTERED validation-layer errors
+    // (VUID-vkDestroySemaphore-semaphore-01137 and two siblings -- "object
+    // still in use", since nothing was actually drained) -- reproduced
+    // directly, not assumed. Deliberately NOT added as a new "known false
+    // positive" classifier in context.cpp: every existing classifier there
+    // is independently verified against a NEWER validation layer build
+    // proving the installed layer itself is behind spec, and that has not
+    // been done here -- whether an up-to-date layer would also flag a real
+    // post-DEVICE_LOST destroy this way is genuinely unclear, not a proven
+    // layer bug. Instead this mirrors Window::abandonNativeHandle()'s own
+    // established, narrower precedent: once the underlying resource is
+    // CONFIRMED gone, stop issuing further calls against it and let the OS
+    // reclaim everything at process exit. std::_Exit() (not a normal
+    // `return`) is deliberate here -- it skips every remaining C++
+    // destructor (frameSync, swapchainViews, app, and everything app still
+    // owns) rather than requiring a new "abandon" primitive on each of the
+    // half-dozen unrelated RAII types those destructors would otherwise
+    // touch; the log is explicitly flushed first since std::_Exit() does
+    // not run spdlog's own atexit-registered flush.
+    const VkResult waitIdleResult = vkDeviceWaitIdle(vkDevice);
+    if (shouldSkipTeardownAfterDeviceLoss(waitIdleResult, app->device->isSurfaceLost())) {
+        const bool hadValidationErrors = args.validate && app->context->hasValidationErrors();
+        if (hadValidationErrors) {
+            RX_LOG_ERROR("sample_09_scene: Vulkan validation layer reported errors during the present loop");
+        }
+        RX_LOG_INFO(
+            "sample_09_scene: VkDevice reports lost immediately after the present window's native handle was "
+            "already known gone -- skipping further Vulkan teardown (frameSync/destroyApp) and letting process "
+            "exit reclaim GPU resources directly [Issue #74]");
+        if (!hadValidationErrors && ok) {
+            RX_LOG_INFO("sample_09_scene: window closed cleanly");
+        }
+        ::spdlog::default_logger()->flush();
+        std::_Exit((hadValidationErrors || !ok) ? 1 : 0);
+    }
+
     for (VkImageView view : swapchainViews) vkDestroyImageView(vkDevice, view, nullptr);
     frameSync.reset();
     destroyApp(*app);

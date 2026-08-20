@@ -12,6 +12,7 @@
 using rx::samples9::f11TogglesFullscreen;
 using rx::samples9::graphNeedsRecompileForExtent;
 using rx::samples9::pixelSizeRequiresRecreate;
+using rx::samples9::shouldSkipTeardownAfterDeviceLoss;
 
 // --- f11TogglesFullscreen() -----------------------------------------------
 TEST_CASE("f11TogglesFullscreen(): true (F11 should toggle) when ImGui does NOT claim the keyboard") {
@@ -80,4 +81,30 @@ TEST_CASE("graphNeedsRecompileForExtent(): true when either dimension genuinely 
     CHECK(graphNeedsRecompileForExtent(VkExtent2D{1280, 720}, VkExtent2D{1920, 1080}));  // grow both.
     CHECK(graphNeedsRecompileForExtent(VkExtent2D{1280, 720}, VkExtent2D{1280, 800}));    // height only.
     CHECK(graphNeedsRecompileForExtent(VkExtent2D{1280, 720}, VkExtent2D{1024, 720}));    // width only.
+}
+
+// --- shouldSkipTeardownAfterDeviceLoss() [Issue #74] -----------------------
+TEST_CASE("shouldSkipTeardownAfterDeviceLoss(): true ONLY for the exact reproduced compound condition -- "
+          "VK_ERROR_DEVICE_LOST from vkDeviceWaitIdle() AND the surface already known lost") {
+    CHECK(shouldSkipTeardownAfterDeviceLoss(VK_ERROR_DEVICE_LOST, /*surfaceLost=*/true));
+}
+
+TEST_CASE("shouldSkipTeardownAfterDeviceLoss(): false when the device is fine (VK_SUCCESS), regardless of "
+          "surface-lost state -- the overwhelmingly common case: normal teardown proceeds exactly as before") {
+    CHECK_FALSE(shouldSkipTeardownAfterDeviceLoss(VK_SUCCESS, /*surfaceLost=*/true));
+    CHECK_FALSE(shouldSkipTeardownAfterDeviceLoss(VK_SUCCESS, /*surfaceLost=*/false));
+}
+
+TEST_CASE("shouldSkipTeardownAfterDeviceLoss(): false when the device is lost but the surface was NEVER known "
+          "lost -- revert-discrimination against silently masking an unrelated, genuine device-loss bug (e.g. a "
+          "mid-frame GPU crash while the window is still alive) as a clean exit; that case must keep failing "
+          "hard via the pre-existing SwapchainStatus::DeviceLost/`ok = false` path, not this narrower fix") {
+    CHECK_FALSE(shouldSkipTeardownAfterDeviceLoss(VK_ERROR_DEVICE_LOST, /*surfaceLost=*/false));
+}
+
+TEST_CASE("shouldSkipTeardownAfterDeviceLoss(): false for any other non-success VkResult even with the surface "
+          "already known lost -- narrowly scoped to VK_ERROR_DEVICE_LOST specifically, not 'any wait failure'") {
+    CHECK_FALSE(shouldSkipTeardownAfterDeviceLoss(VK_ERROR_OUT_OF_HOST_MEMORY, /*surfaceLost=*/true));
+    CHECK_FALSE(shouldSkipTeardownAfterDeviceLoss(VK_ERROR_OUT_OF_DEVICE_MEMORY, /*surfaceLost=*/true));
+    CHECK_FALSE(shouldSkipTeardownAfterDeviceLoss(VK_ERROR_SURFACE_LOST_KHR, /*surfaceLost=*/true));
 }
