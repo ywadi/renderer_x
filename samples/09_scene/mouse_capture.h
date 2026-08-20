@@ -47,6 +47,13 @@ public:
     // fly_camera.h's own precedent establishes). Calling this once per
     // held-key OS repeat event instead would thrash the toggle every
     // repeat interval rather than flipping it once per physical press.
+    // [Issue #33 review, Minor finding 1] The caller must ALSO gate this on
+    // `escTogglesCapture(ImGui::GetIO().WantCaptureKeyboard)` below (i.e.
+    // only call this when ImGui does not claim the keyboard) -- inert today
+    // (this sample's HUD has no keyboard-focusable/text-input widget for
+    // Esc to mean "cancel editing" instead of "release capture"), but the
+    // day one is added, an ungated Esc here would still unconditionally
+    // toggle mouse capture out from under it.
     void toggleOnEscPressed() { captured_ = !captured_; }
 
     // Click-to-recapture: call on a real SDL_EVENT_MOUSE_BUTTON_DOWN
@@ -78,6 +85,23 @@ private:
 //     this ticket.
 [[nodiscard]] inline bool mouseDeltaDrivesCamera(bool captured, bool imguiWantsMouse) {
     return captured || !imguiWantsMouse;
+}
+
+// [Issue #33 review, Minor finding 1] The Esc-toggle gate: main.cpp's
+// `pumpEvents` `preDispatch` lambda must call
+// `FlyThroughCaptureState::toggleOnEscPressed()` ONLY when this returns
+// true, i.e. only when ImGui does not claim the keyboard -- matching
+// `mouseDeltaDrivesCamera()`'s own established "compose with the ImGui
+// WantCapture* flag at the call site" shape (gate ruling #14/#16) rather
+// than toggling capture unconditionally underneath a future keyboard-
+// focused HUD widget (e.g. a text field Esc conventionally cancels/
+// unfocuses instead of bubbling to the app). Deliberately its own named
+// decision, separate from `keyboardDrivesCamera()` (fly_camera.h) even
+// though both are `!imguiWantsKeyboard` today -- they gate two different
+// call sites (the capture toggle here vs. WASD movement there) that are
+// free to diverge independently later.
+[[nodiscard]] inline bool escTogglesCapture(bool imguiWantsKeyboard) {
+    return !imguiWantsKeyboard;
 }
 
 }  // namespace rx::samples9

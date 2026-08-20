@@ -22,6 +22,7 @@
 
 using rx::samples9::FlyCamera;
 using rx::samples9::flyCameraLocalMoveDelta;
+using rx::samples9::keyboardDrivesCamera;
 
 namespace {
 constexpr float kEps = 1e-4F;
@@ -130,4 +131,15 @@ TEST_CASE("FlyCamera: W/S-vs-A/D-vs-Space/Ctrl axis assignment [regression -- th
     CHECK(delta.x == doctest::Approx(2.0F));
     CHECK(delta.y == doctest::Approx(3.0F));
     CHECK(delta.z == doctest::Approx(1.0F));
+}
+
+// --- keyboardDrivesCamera() [Issue #33 review, latent-sibling finding 2] --
+TEST_CASE("keyboardDrivesCamera(): true (keyboard reads allowed) when ImGui does NOT claim the keyboard") {
+    CHECK(keyboardDrivesCamera(/*imguiWantsKeyboard=*/false));
+}
+
+TEST_CASE("keyboardDrivesCamera(): false (keyboard reads suppressed) when ImGui DOES claim the keyboard "
+          "[matches updateFlyCamera()'s pre-existing WASD/Space/LCtrl/LShift gating -- now narrowed to keyboard "
+          "reads only, not the whole function]") {
+    CHECK_FALSE(keyboardDrivesCamera(/*imguiWantsKeyboard=*/true));
 }

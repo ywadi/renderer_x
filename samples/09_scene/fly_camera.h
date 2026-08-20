@@ -74,4 +74,21 @@ struct FlyCamera {
     return glm::vec3(strafe, vertical, forward);
 }
 
+// The keyboard-movement decision updateFlyCamera() (main.cpp) gates its
+// W/S/A/D/Space/LCtrl/LShift `window.isKeyDown()` reads with [Issue #33
+// review, latent-sibling finding 2]: WantCaptureKeyboard must gate ONLY
+// keyboard-SOURCED movement, not the whole function -- the pre-existing
+// code here used a single blanket `if (WantCaptureKeyboard) return;` at
+// the top of updateFlyCamera(), which also skipped `window.poll()` and
+// every gamepad-sourced contribution to `forward`/`strafe`/look/speed
+// below it as an unintended side effect (gamepad reads neither
+// `app.mouseCapture` nor `ImGui::GetIO()` by this sample's own contract --
+// see mouse_capture.h's own top comment -- so a future HUD text field
+// stealing keyboard focus must not freeze gamepad flight too). This
+// decision is deliberately narrow (keyboard reads only) so it composes
+// with gamepad/mouse contributions that must keep flowing regardless.
+[[nodiscard]] inline bool keyboardDrivesCamera(bool imguiWantsKeyboard) {
+    return !imguiWantsKeyboard;
+}
+
 }  // namespace rx::samples9

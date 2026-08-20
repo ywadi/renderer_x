@@ -287,6 +287,7 @@ std::filesystem::path resolveSponzaScenePath() {
 // its own header" precedent draw_recording.h already established in this
 // sample.
 using rx::samples9::FlyCamera;
+using rx::samples9::keyboardDrivesCamera;
 
 // --- Relative mouse capture [Issue #33] -----------------------------------
 // Captures/releases the OS cursor for fly-through mouse-look -- see
@@ -299,6 +300,7 @@ using rx::samples9::FlyCamera;
 // precedent fly_camera.h already established just above.
 using rx::samples9::FlyThroughCaptureState;
 using rx::samples9::mouseDeltaDrivesCamera;
+using rx::samples9::escTogglesCapture;
 
 // --- Shared pass infra [tonemap pass -- shaders/multipass/tonemap.{vert,
 // frag}.slang, VERBATIM -- same convention samples/07_stress/08_gltf_viewer's
@@ -2433,19 +2435,28 @@ void drawHud(App& app, rx::rhi::Device& device, VkSurfaceKHR surface, bool prese
 
 // --- Fly-through camera input update [Task 20 input surface] -------------
 void updateFlyCamera(App& app, rx::platform::Window& window, float dt) {
-    if (ImGui::GetIO().WantCaptureKeyboard) {
-        return;  // [gate ruling #16] HUD focus gates platform-input consumption.
-    }
     float forward = 0.0F;
     float strafe = 0.0F;
     float vertical = 0.0F;
-    if (window.isKeyDown(SDL_SCANCODE_W)) forward += 1.0F;
-    if (window.isKeyDown(SDL_SCANCODE_S)) forward -= 1.0F;
-    if (window.isKeyDown(SDL_SCANCODE_D)) strafe += 1.0F;
-    if (window.isKeyDown(SDL_SCANCODE_A)) strafe -= 1.0F;
-    if (window.isKeyDown(SDL_SCANCODE_SPACE)) vertical += 1.0F;
-    if (window.isKeyDown(SDL_SCANCODE_LCTRL)) vertical -= 1.0F;
-    const bool fast = window.isKeyDown(SDL_SCANCODE_LSHIFT);
+    bool fast = false;
+    // [Issue #33 review, latent-sibling finding 2] WantCaptureKeyboard gates
+    // ONLY the keyboard-sourced reads below (WASD/Space/LCtrl/LShift) --
+    // this used to be a single blanket `if (WantCaptureKeyboard) return;`
+    // at the top of this function, which also skipped `window.poll()` and
+    // every gamepad-sourced contribution below it as an unintended side
+    // effect (a future HUD text field stealing keyboard focus would have
+    // frozen gamepad flight too, contradicting this sample's own "gamepad
+    // unaffected by capture state" contract). See fly_camera.h's own
+    // keyboardDrivesCamera() comment.
+    if (keyboardDrivesCamera(ImGui::GetIO().WantCaptureKeyboard)) {
+        if (window.isKeyDown(SDL_SCANCODE_W)) forward += 1.0F;
+        if (window.isKeyDown(SDL_SCANCODE_S)) forward -= 1.0F;
+        if (window.isKeyDown(SDL_SCANCODE_D)) strafe += 1.0F;
+        if (window.isKeyDown(SDL_SCANCODE_A)) strafe -= 1.0F;
+        if (window.isKeyDown(SDL_SCANCODE_SPACE)) vertical += 1.0F;
+        if (window.isKeyDown(SDL_SCANCODE_LCTRL)) vertical -= 1.0F;
+        fast = window.isKeyDown(SDL_SCANCODE_LSHIFT);
+    }
 
     const rx::platform::GamepadState pad = window.poll();
     if (pad.connected) {
@@ -3225,7 +3236,14 @@ int runPresent(const Args& args) {
             if (event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
                 running = false;
             } else if (event.type == SDL_EVENT_KEY_DOWN && event.key.scancode == SDL_SCANCODE_ESCAPE &&
-                       !event.key.repeat) {
+                       !event.key.repeat && escTogglesCapture(ImGui::GetIO().WantCaptureKeyboard)) {
+                // [Issue #33 review, Minor finding 1] Gated on
+                // WantCaptureKeyboard -- inert today (no keyboard-focusable/
+                // text-input HUD widget in this sample to steal Esc's
+                // "cancel editing" meaning instead), but a future one would
+                // otherwise have its Esc silently also toggle mouse capture
+                // underneath it. See mouse_capture.h's own
+                // escTogglesCapture() comment.
                 app->mouseCapture.toggleOnEscPressed();
             } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT &&
                        !app->mouseCapture.captured() && !ImGui::GetIO().WantCaptureMouse) {

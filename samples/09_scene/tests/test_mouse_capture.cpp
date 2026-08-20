@@ -13,6 +13,7 @@
 
 using rx::samples9::FlyThroughCaptureState;
 using rx::samples9::mouseDeltaDrivesCamera;
+using rx::samples9::escTogglesCapture;
 
 TEST_CASE("FlyThroughCaptureState: captured by default [Issue #33, requirement 1 -- recommended UX: usable from "
           "frame 1 of --present without an extra click]") {
@@ -117,4 +118,35 @@ TEST_CASE("FlyThroughCaptureState + mouseDeltaDrivesCamera(): end-to-end composi
     // Immediately after recapture, WantCaptureMouse might still read stale-true from last frame's HUD
     // hover -- captured must win regardless.
     CHECK(mouseDeltaDrivesCamera(state.captured(), /*imguiWantsMouse=*/true));
+}
+
+// --- escTogglesCapture() [Issue #33 review, Minor finding 1] --------------
+TEST_CASE("escTogglesCapture(): true (Esc should toggle) when ImGui does NOT claim the keyboard") {
+    CHECK(escTogglesCapture(/*imguiWantsKeyboard=*/false));
+}
+
+TEST_CASE("escTogglesCapture(): false (Esc must NOT toggle) when ImGui DOES claim the keyboard "
+          "[the review's own scenario: a future keyboard-focused HUD widget, e.g. a text field mid-edit, must "
+          "keep Esc's conventional cancel/unfocus meaning instead of it also releasing mouse capture]") {
+    CHECK_FALSE(escTogglesCapture(/*imguiWantsKeyboard=*/true));
+}
+
+TEST_CASE("escTogglesCapture() composed with FlyThroughCaptureState: an Esc press that ImGui claims leaves "
+          "captured() completely unchanged, exactly matching main.cpp's own "
+          "`!event.key.repeat && escTogglesCapture(WantCaptureKeyboard)` call-site gate -- the caller simply does "
+          "not call toggleOnEscPressed() at all in that case") {
+    FlyThroughCaptureState state;
+    REQUIRE(state.captured());
+
+    // Simulates main.cpp's own call-site condition: only invoke the toggle
+    // when escTogglesCapture() says so.
+    if (escTogglesCapture(/*imguiWantsKeyboard=*/true)) {
+        state.toggleOnEscPressed();
+    }
+    CHECK(state.captured());  // untouched -- ImGui claimed the keyboard, so Esc was never applied.
+
+    if (escTogglesCapture(/*imguiWantsKeyboard=*/false)) {
+        state.toggleOnEscPressed();
+    }
+    CHECK_FALSE(state.captured());  // NOW it toggles, once ImGui releases the keyboard.
 }
