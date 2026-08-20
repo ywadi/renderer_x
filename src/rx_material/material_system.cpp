@@ -1639,6 +1639,14 @@ MaterialFixedFunctionState MaterialSystem::fixedFunctionState(MaterialHandle han
 }
 
 VkPipelineLayout MaterialSystem::pipelineLayout(MaterialHandle handle) const {
+    // [Phase 4 exit fix wave, I3] `impl_->materials` is the SAME unguarded
+    // HandlePool loadMaterial()/reloadChanged() mutate (reloadChanged()
+    // destroys the old VkPipelineLayout immediately) -- reading it from a
+    // worker chunk is a sibling of the Task-24 GeometryPool::bind()
+    // violation, silent until now because this class's read accessors
+    // carried no guard. Matches docs/threading.md's whole-class
+    // main-thread-only posture for MaterialSystem.
+    RX_ASSERT_MAIN_THREAD("MaterialSystem::pipelineLayout");
     MaterialRecord* record = impl_->materials.get(handle);
     if (record == nullptr) {
         throw std::out_of_range("rx_material: MaterialSystem::pipelineLayout: invalid or stale MaterialHandle");
@@ -1647,6 +1655,8 @@ VkPipelineLayout MaterialSystem::pipelineLayout(MaterialHandle handle) const {
 }
 
 const rx::shader::ShaderLayoutInfo& MaterialSystem::layoutInfo(MaterialHandle handle) const {
+    // [Phase 4 exit fix wave, I3] See pipelineLayout()'s comment above.
+    RX_ASSERT_MAIN_THREAD("MaterialSystem::layoutInfo");
     MaterialRecord* record = impl_->materials.get(handle);
     if (record == nullptr) {
         throw std::out_of_range("rx_material: MaterialSystem::layoutInfo: invalid or stale MaterialHandle");
@@ -1655,6 +1665,8 @@ const rx::shader::ShaderLayoutInfo& MaterialSystem::layoutInfo(MaterialHandle ha
 }
 
 const std::vector<MaterialParamInfo>& MaterialSystem::materialParams(MaterialHandle handle) const {
+    // [Phase 4 exit fix wave, I3] See pipelineLayout()'s comment above.
+    RX_ASSERT_MAIN_THREAD("MaterialSystem::materialParams");
     MaterialRecord* record = impl_->materials.get(handle);
     if (record == nullptr) {
         throw std::out_of_range("rx_material: MaterialSystem::materialParams: invalid or stale MaterialHandle");
@@ -1663,6 +1675,8 @@ const std::vector<MaterialParamInfo>& MaterialSystem::materialParams(MaterialHan
 }
 
 uint32_t MaterialSystem::paramBlockSize(MaterialHandle handle) const {
+    // [Phase 4 exit fix wave, I3] See pipelineLayout()'s comment above.
+    RX_ASSERT_MAIN_THREAD("MaterialSystem::paramBlockSize");
     MaterialRecord* record = impl_->materials.get(handle);
     if (record == nullptr) {
         throw std::out_of_range("rx_material: MaterialSystem::paramBlockSize: invalid or stale MaterialHandle");

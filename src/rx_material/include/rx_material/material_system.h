@@ -387,6 +387,8 @@ public:
     // through `gParams`'s bindless-table indices instead per D8), built
     // against the external bindless set-0 layout passed to create().
     // Throws std::out_of_range for an invalid/unknown `handle`.
+    // Thread-affinity (D5): main-thread-only, [guarded] [Phase 4 exit fix
+    // wave, I3] -- see docs/threading.md.
     [[nodiscard]] VkPipelineLayout pipelineLayout(MaterialHandle handle) const;
 
     // `handle`'s reflected layout -- the same `rx::shader::ShaderLayoutInfo`
@@ -401,6 +403,8 @@ public:
     // move the underlying MaterialRecord. Store the actual values of interest
     // (set/binding counts, type information, etc.) rather than caching a
     // ShaderLayoutInfo pointer/reference across a loadMaterial() call.
+    // Thread-affinity (D5): main-thread-only, [guarded] [Phase 4 exit fix
+    // wave, I3] -- see docs/threading.md.
     [[nodiscard]] const rx::shader::ShaderLayoutInfo& layoutInfo(MaterialHandle handle) const;
 
     // `handle`'s reflected `TParams` fields -- name, kind, and BYTE
@@ -414,6 +418,8 @@ public:
     // linkedProgram) that produced this material's real SPIR-V, not a
     // separately-composed duplicate. Throws std::out_of_range for an
     // invalid/unknown `handle`.
+    // Thread-affinity (D5): main-thread-only, [guarded] [Phase 4 exit fix
+    // wave, I3] -- see docs/threading.md.
     [[nodiscard]] const std::vector<MaterialParamInfo>& materialParams(MaterialHandle handle) const;
 
     // `handle`'s whole `TParams` struct size, in bytes (the Slang Uniform
@@ -422,6 +428,8 @@ public:
     // IRxMaterialInstance, or any other InstanceBinding producer) must
     // supply to bindInstance() below. Throws std::out_of_range for an
     // invalid/unknown `handle`.
+    // Thread-affinity (D5): main-thread-only, [guarded] [Phase 4 exit fix
+    // wave, I3] -- see docs/threading.md.
     [[nodiscard]] uint32_t paramBlockSize(MaterialHandle handle) const;
 
     // Frames-in-flight this MaterialSystem's own per-frame GPU-facing state

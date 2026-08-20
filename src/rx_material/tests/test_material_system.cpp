@@ -1240,6 +1240,79 @@ TEST_CASE("MaterialSystem::bindInstance's RX_ASSERT_MAIN_THREAD guard fires, nam
     destroyOffscreenColorImage(fixture->device.device(), *offscreen);
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
+
+// [Phase 4 exit fix wave, I3] pipelineLayout()/layoutInfo()/materialParams()/
+// paramBlockSize() -- MaterialSystem's other read accessors, previously
+// unguarded (the sibling of the Task-24 GeometryPool::bind() violation this
+// finding closes: samples/09_scene called pipelineLayout() from a worker
+// chunk, and no guard fired). Simpler than the bindInstance guard tests
+// above -- no chunked rx_graph/rx_task machinery needed, a plain
+// std::thread stands in for a chunk >= 1 worker, exactly like
+// rx_asset/tests/thread_guard_test.cpp's own GeometryPool precedent. Each
+// worker thread is joined before the next guarded call starts, so there is
+// never more than one thread touching this MaterialSystem's state at a
+// time -- reuses the SAME capture hook (captureBindInstanceViolation) and
+// RAII guard (BindInstanceGuardHookScope) declared above, in this same
+// RX_DEBUG_CHECKS-guarded region.
+TEST_CASE("MaterialSystem::pipelineLayout/layoutInfo/materialParams/paramBlockSize trip RX_ASSERT_MAIN_THREAD "
+          "when called from a worker thread") {
+    auto fixture = makeFixture("rx_material_read_accessor_guard");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto system = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+                                                          freshCachePath("read_accessor_guard"));
+    REQUIRE(system != nullptr);
+    rx::material::MaterialHandle handle = system->loadMaterial(testDataPath("test_unlit.slang"));
+
+    BindInstanceGuardCapture capture;
+    g_bindInstanceCapture.store(&capture, std::memory_order_relaxed);
+    rx::core::debug::detail::setViolationHookForTests(&captureBindInstanceViolation);
+    BindInstanceGuardHookScope guard;
+
+    std::thread layoutThread([&] { (void)system->pipelineLayout(handle); });
+    layoutThread.join();
+    std::thread layoutInfoThread([&] { (void)system->layoutInfo(handle); });
+    layoutInfoThread.join();
+    std::thread paramsThread([&] { (void)system->materialParams(handle); });
+    paramsThread.join();
+    std::thread blockSizeThread([&] { (void)system->paramBlockSize(handle); });
+    blockSizeThread.join();
+
+    std::lock_guard<std::mutex> lock(capture.mutex);
+    CHECK(capture.contexts.size() == 4);
+    CHECK(contextsContain(capture.contexts, "MaterialSystem::pipelineLayout"));
+    CHECK(contextsContain(capture.contexts, "MaterialSystem::layoutInfo"));
+    CHECK(contextsContain(capture.contexts, "MaterialSystem::materialParams"));
+    CHECK(contextsContain(capture.contexts, "MaterialSystem::paramBlockSize"));
+}
+
+TEST_CASE("MaterialSystem::pipelineLayout/layoutInfo/materialParams/paramBlockSize do NOT trip the guard for a "
+          "call genuinely on the main thread") {
+    auto fixture = makeFixture("rx_material_read_accessor_guard_legal");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto system = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+                                                          freshCachePath("read_accessor_guard_legal"));
+    REQUIRE(system != nullptr);
+    rx::material::MaterialHandle handle = system->loadMaterial(testDataPath("test_unlit.slang"));
+
+    BindInstanceGuardCapture capture;
+    g_bindInstanceCapture.store(&capture, std::memory_order_relaxed);
+    rx::core::debug::detail::setViolationHookForTests(&captureBindInstanceViolation);
+    BindInstanceGuardHookScope guard;
+
+    (void)system->pipelineLayout(handle);
+    (void)system->layoutInfo(handle);
+    (void)system->materialParams(handle);
+    (void)system->paramBlockSize(handle);
+
+    std::lock_guard<std::mutex> lock(capture.mutex);
+    CHECK(capture.contexts.empty());
+}
 #endif  // RX_DEBUG_CHECKS
 
 // --- createTexture2D()/textureBindlessIndex()/releaseTexture() -----------
