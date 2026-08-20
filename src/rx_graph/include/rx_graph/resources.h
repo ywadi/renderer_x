@@ -100,6 +100,70 @@ struct BufferDesc {
     VkBufferUsageFlags usage = 0;
 };
 
+// [Task 2, gate ruling RC2] One storage-IMAGE resource's declared shape, as
+// written by the pass that establishes it (Pass::addStorageImageOutput()) --
+// mirrors BufferDesc's own spirit (a plain declared-shape struct alongside
+// AttachmentDesc/BufferDesc) generalized with the mip/array-layer/cube
+// fields neither of those two carries: AttachmentDesc-backed resources
+// (color/depth/history) stay single-mip/single-layer in this task (see
+// PhysicalResource::mipLevels/arrayLayers/cube's own comment -- rasterized
+// attachment output growing subresource addressing is explicitly out of
+// this task's scope, since no named Phase 5 consumer needs it yet), so only
+// a storage-image resource can ever have more than one mip/layer today.
+//
+// `cube` requires `arrayLayers` to be a positive multiple of 6
+// [VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT's own Vulkan-spec precondition,
+// VUID-VkImageCreateInfo-flags-08865] -- RenderGraph::compile() validates
+// this at the declaring pass and throws, naming the resource, otherwise
+// (render_graph.cpp).
+struct ImageDesc {
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    SizeClass sizeClass = SizeClass::SwapchainRelative;
+    float width = 1.0F;
+    float height = 1.0F;
+    uint32_t mipLevels = 1;
+    uint32_t arrayLayers = 1;
+    bool cube = false;
+};
+
+// [Task 2, gate ruling RC2] Sentinel meaning "every remaining mip level
+// from baseMipLevel" / "every remaining array layer from baseArrayLayer" --
+// mirrors VK_REMAINING_MIP_LEVELS/VK_REMAINING_ARRAY_LAYERS's own semantics
+// without pulling either literal into a device-free struct's default
+// member initializer (this header stays Vulkan-Headers-only, no volk --
+// see the file's own top comment -- and VK_REMAINING_MIP_LEVELS/
+// VK_REMAINING_ARRAY_LAYERS are plain `(~0U)` `#define`s in
+// vulkan_core.h anyway, so this is simply naming that same value locally
+// rather than depending on the macro).
+inline constexpr uint32_t kRemainingMipLevels = ~0U;
+inline constexpr uint32_t kRemainingArrayLayers = ~0U;
+
+// [Task 2, gate ruling RC2] One image resource's declared subresource
+// range -- the mip level(s) + array layer(s) a single Pass::Declaration
+// addresses. Default-constructed means "the whole resource" (every mip,
+// every layer), BYTE-IDENTICAL in effect to every declaration kind that
+// predates this task (addColorOutput/setDepthStencilOutput/addTextureInput/
+// addHistoryInput/setHistoryOutput), none of which ever specify one: every
+// PhysicalResource those kinds establish has exactly one mip and one layer
+// (see PhysicalResource::mipLevels/arrayLayers's own comment), so "the
+// whole resource" and "mip 0, layer 0 alone" resolve to the exact same
+// single subresource for them either way -- this struct changes nothing
+// about their existing behavior.
+//
+// RenderGraph::compile() resolves the two sentinel fields (levelCount/
+// layerCount) into concrete counts once a declaration's target resource's
+// real mipLevels/arrayLayers are known (render_graph.cpp step 4) -- every
+// ResourceAccess::subresource a compiled graph exposes is fully resolved
+// (no sentinel values survive compile()).
+struct Subresource {
+    uint32_t baseMipLevel = 0;
+    uint32_t levelCount = kRemainingMipLevels;
+    uint32_t baseArrayLayer = 0;
+    uint32_t layerCount = kRemainingArrayLayers;
+
+    bool operator==(const Subresource&) const = default;
+};
+
 // One declared access to one physical resource, resolved by compile() from
 // the *kind* of declaration (addColorOutput vs addTextureInput, etc.) per
 // the Task 1 brief's compile algorithm step 1. `layout` is meaningless for
@@ -109,6 +173,15 @@ struct ResourceAccess {
     VkPipelineStageFlags2 stages;
     VkAccessFlags2 access;
     VkImageLayout layout;
+
+    // [Task 2, gate ruling RC2] The RESOLVED (no sentinel values -- see
+    // Subresource's own comment) subresource range this declaration
+    // addresses. Meaningless (left default-constructed, i.e. "the whole
+    // resource") for a buffer access or for any declaration kind that
+    // predates this task -- populated with a real, possibly-narrower range
+    // only for a StorageImageOutput/StorageImageInput/TextureInput
+    // declaration that named an explicit `subresource` argument.
+    Subresource subresource;
 };
 
 // One physical resource compile() resolved from every declaration sharing
@@ -149,6 +222,18 @@ struct PhysicalResource {
     uint32_t lastUsePass = 0;
 
     bool isBackbuffer = false;
+
+    // [Task 2, gate ruling RC2] Real image shape -- meaningless (left at
+    // their defaults, 1/1/false) for a buffer resource. Every
+    // AttachmentDesc-backed resource (color/depth/history/texture-input-
+    // only) stays 1/1/false: this task does not extend rasterized
+    // attachment output to carry more than one mip/layer (see ImageDesc's
+    // own comment for why that is a deliberate scope boundary, not an
+    // oversight). Only a resource established via addStorageImageOutput()
+    // ever has mipLevels/arrayLayers/cube set from its declared ImageDesc.
+    uint32_t mipLevels = 1;
+    uint32_t arrayLayers = 1;
+    bool cube = false;
 
     // Phase 4 Task 1: true for a resource established via
     // Pass::setHistoryOutput()/read via Pass::addHistoryInput() -- i.e. a

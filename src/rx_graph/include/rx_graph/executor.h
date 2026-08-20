@@ -270,6 +270,29 @@ public:
     [[nodiscard]] VkBuffer buffer(std::string_view name) const;
     [[nodiscard]] VkFormat imageFormat(std::string_view name) const;
 
+    // [Task 2 (#38), gate ruling RC2] Resolves to a VkImageView scoped
+    // EXACTLY to the subresource (mip level + array-layer range) THIS
+    // PASS declared against `name` via Pass::addStorageImageOutput()/
+    // addStorageImageInput()'s own `subresource` argument -- as opposed to
+    // imageView() above, which always resolves to a view covering the
+    // resource's WHOLE mip/layer range regardless of what any one pass
+    // declared. A storage-image binding always needs a real,
+    // subresource-scoped VkImageView (Vulkan has no "bind the whole
+    // resource, index a mip/layer range yourself" mode a RWTexture2D/
+    // RWTexture2DArray could use the way a StructuredBuffer's own
+    // byte-offset indexing lets buffer()'s whole-buffer handle work) --
+    // this is why storage images need a SEPARATE resolver from
+    // imageView(), not an overload of it: the two can legitimately return
+    // DIFFERENT views for the SAME `name` (imageView() the whole resource,
+    // this one THIS pass's own narrower declared range).
+    //
+    // Throws std::out_of_range if `name` was not declared as a
+    // StorageImageOutput/StorageImageInput by THIS pass (a name declared
+    // by a DIFFERENT pass, or declared here only as a TextureInput/
+    // StorageBufferOutput/etc., is "not resolvable" from this call's own
+    // narrow contract -- use imageView()/buffer() for those instead).
+    [[nodiscard]] VkImageView storageImageView(std::string_view name) const;
+
     // Phase 4 Task 7 [spec D4 amendment]: the secondary command buffer THIS
     // CHUNK records into -- valid only from inside a Pass::setExecuteChunked()
     // callback (`cmd` above stays VK_NULL_HANDLE for that callback kind; use
@@ -484,6 +507,9 @@ private:
     [[nodiscard]] VkImage resolveImage(std::string_view name) const;
     [[nodiscard]] VkBuffer resolveBuffer(std::string_view name) const;
     [[nodiscard]] VkFormat resolveImageFormat(std::string_view name) const;
+    // [Task 2 (#38), gate ruling RC2] Backs PassContext::storageImageView()
+    // -- see that method's own doc comment.
+    [[nodiscard]] VkImageView resolveStorageImageView(std::string_view name) const;
     [[nodiscard]] bool resolveHistoryValid(std::string_view name) const;
     // Phase 4 Task 7: backs PassContext::chunkCommandBuffer() -- see that
     // method's own doc comment.

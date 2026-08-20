@@ -96,6 +96,25 @@ namespace {
 // "depth-like" for the same reason that pre-existing row does: this task's
 // scope does not extend to giving depth-vs-stencil-only formats separate
 // layouts, a gap setDepthStencilOutput already has today).
+// [Task 2, gate ruling RC2] Turns a possibly-sentinel-carrying Subresource
+// (Pass::addTextureInput()/addStorageImageOutput()/addStorageImageInput()'s
+// own `subresource` argument, still possibly kRemainingMipLevels/
+// kRemainingArrayLayers) into a fully concrete one, against the real
+// `mipLevels`/`arrayLayers` its target PhysicalResource resolved to at the
+// point this declaration's access is resolved. Every ResourceAccess a
+// compiled graph exposes carries a Subresource this function has already
+// run on -- see resources.h's own comment on ResourceAccess::subresource.
+Subresource resolveSubresource(const Subresource& sub, uint32_t mipLevels, uint32_t arrayLayers) {
+    Subresource resolved = sub;
+    if (resolved.levelCount == kRemainingMipLevels) {
+        resolved.levelCount = mipLevels - resolved.baseMipLevel;
+    }
+    if (resolved.layerCount == kRemainingArrayLayers) {
+        resolved.layerCount = arrayLayers - resolved.baseArrayLayer;
+    }
+    return resolved;
+}
+
 bool isDepthOrStencilFormat(VkFormat format) {
     switch (format) {
         case VK_FORMAT_D16_UNORM:
@@ -202,6 +221,23 @@ ResourceAccess Pass::resolveAccess(const Declaration& decl, uint32_t physicalInd
                 access.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             }
             break;
+        case AccessKind::StorageImageOutput:
+            // [Task 2, gate ruling RC2 + matrix Open Question 3] Mirrors
+            // StorageBufferOutput's own stage split exactly; VK_IMAGE_
+            // LAYOUT_GENERAL is the only legal layout a generic (both
+            // shader-read AND shader-write capable) storage-image binding
+            // can use.
+            access.stages = computeClass ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                                          : (VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+            access.access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+            access.layout = VK_IMAGE_LAYOUT_GENERAL;
+            break;
+        case AccessKind::StorageImageInput:
+            access.stages = computeClass ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                                          : (VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+            access.access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+            access.layout = VK_IMAGE_LAYOUT_GENERAL;
+            break;
     }
     return access;
 }
@@ -212,7 +248,12 @@ bool Pass::isWriteKind(AccessKind kind) {
     // resource kind that unquestionably IS a write must still stay out of
     // the writersByName/dependsOn edge graph this predicate feeds.
     return kind == AccessKind::ColorOutput || kind == AccessKind::DepthStencilOutput ||
-           kind == AccessKind::StorageBufferOutput;
+           kind == AccessKind::StorageBufferOutput ||
+           // [Task 2, gate ruling RC2] Mirrors StorageBufferOutput exactly:
+           // a storage image OUTPUT establishes/updates its resource and
+           // participates in the same dependency-edge graph a storage
+           // buffer output does.
+           kind == AccessKind::StorageImageOutput;
 }
 
 RenderGraph::RenderGraph() : impl_(std::make_unique<Impl>()) {
@@ -370,7 +411,12 @@ void RenderGraph::compile(const CompileInfo& info) {
     for (uint32_t p = 0; p < passCount; ++p) {
         const Pass& pass = g.passes[p];
         for (const Pass::Declaration& decl : pass.declarations_) {
-            if (decl.kind != Pass::AccessKind::TextureInput && decl.kind != Pass::AccessKind::StorageBufferInput) {
+            // [Task 2, gate ruling RC2] StorageImageInput joins TextureInput/
+            // StorageBufferInput here -- it is a read, resolved against the
+            // same writersByName map (its establishing writer is always a
+            // StorageImageOutput declaration, Pass::isWriteKind() above).
+            if (decl.kind != Pass::AccessKind::TextureInput && decl.kind != Pass::AccessKind::StorageBufferInput &&
+                decl.kind != Pass::AccessKind::StorageImageInput) {
                 continue;
             }
             auto it = writersByName.find(decl.resourceName);
@@ -683,6 +729,41 @@ void RenderGraph::compile(const CompileInfo& info) {
                     break;
                 case Pass::AccessKind::StorageBufferInput:
                     break;
+                case Pass::AccessKind::StorageImageOutput:
+                    // [Task 2, gate ruling RC2] `desc`'s shape is only ever
+                    // consumed from the declaration that FIRST establishes
+                    // `resource` (i.e. the very first pass, in declaration
+                    // order, whose write reaches physicalIndexByName's
+                    // else-branch above for this name) -- a second
+                    // addStorageImageOutput() of the same name (a later
+                    // write-after-write) only ever narrows `subresource`;
+                    // see addStorageImageOutput()'s own doc comment
+                    // (pass.h). `existing == physicalIndexByName.end()`
+                    // (captured just above, before this switch) is exactly
+                    // that "first establishment" test.
+                    if (existing == physicalIndexByName.end()) {
+                        if (decl.image.cube && (decl.image.arrayLayers == 0 || decl.image.arrayLayers % 6 != 0)) {
+                            RX_LOG_ERROR("rx_graph: pass '{}' declares storage image '{}' as cube with {} array "
+                                         "layers -- cube requires a positive multiple of 6",
+                                         pass.name_, decl.resourceName, decl.image.arrayLayers);
+                            throw std::runtime_error(
+                                "rx_graph: pass '" + pass.name_ + "' declares storage image '" + decl.resourceName +
+                                "' as cube with " + std::to_string(decl.image.arrayLayers) +
+                                " array layers -- cube requires a positive multiple of 6");
+                        }
+                        resource.attachment.format = decl.image.format;
+                        resource.attachment.sizeClass = decl.image.sizeClass;
+                        resource.attachment.width = decl.image.width;
+                        resource.attachment.height = decl.image.height;
+                        resource.mipLevels = decl.image.mipLevels;
+                        resource.arrayLayers = decl.image.arrayLayers;
+                        resource.cube = decl.image.cube;
+                    }
+                    resource.imageUsage |= VK_IMAGE_USAGE_STORAGE_BIT;
+                    break;
+                case Pass::AccessKind::StorageImageInput:
+                    resource.imageUsage |= VK_IMAGE_USAGE_STORAGE_BIT;
+                    break;
                 case Pass::AccessKind::HistoryInput:
                     // Phase 4 Task 1: a history resource is ALWAYS sampled
                     // eventually (that is its entire point -- see
@@ -709,7 +790,87 @@ void RenderGraph::compile(const CompileInfo& info) {
                     break;
             }
 
-            accesses.push_back(Pass::resolveAccess(decl, physicalIndex, computeClass));
+            // [Task 2, gate ruling RC2] `resource` (the switch statement
+            // just above) already carries its FINAL mipLevels/arrayLayers
+            // by this point -- either this declaration just established
+            // them (StorageImageOutput's first-establishment branch) or an
+            // earlier pass in execution order already did (topological
+            // order guarantees any resource's establishing writer runs
+            // before any reader of it -- see step 2's own comment) -- so
+            // resolving this declaration's own (possibly sentinel-carrying)
+            // subresource against `resource`'s real shape here is always
+            // safe, for every declaration kind, not just the two new ones.
+            ResourceAccess access = Pass::resolveAccess(decl, physicalIndex, computeClass);
+            access.subresource = resolveSubresource(decl.subresource, resource.mipLevels, resource.arrayLayers);
+            accesses.push_back(access);
+        }
+    }
+
+    // ---- [Task 2, gate ruling RC2] subresource overlap validation -------
+    // Per-resource barrier tracking below (barriers.h's buildBarriers(),
+    // Task 2's last phase) tracks one detail::ResourceBarrierState PER
+    // DISTINCT (physicalIndex, resolved Subresource) key -- correct and
+    // fully independent for any two declared ranges against the same image
+    // that are either IDENTICAL or fully DISJOINT (no shared mip AND no
+    // shared layer), but silently WRONG for two ranges that partially
+    // overlap without being identical (e.g. one declaration addressing
+    // "the whole array at mip 0" and another addressing "layer 3 alone at
+    // mip 0" of the same resource): each would get its own independent
+    // barrier-state entry with no cross-tracking between them, so a real
+    // data hazard between the two could go unsynchronized. No Phase 5 task
+    // named at this gate needs true partial-overlap tracking (every named
+    // consumer -- T9's per-face cube writes, T22's per-mip chain -- always
+    // addresses a given resource at one consistent granularity throughout
+    // a graph), so this is rejected here, loudly, rather than silently
+    // mistracked -- matching this codebase's own "throw, don't guess"
+    // convention for an unsupported combination (e.g. Pass::compile()'s
+    // own history-namespace-mixing check above). A future task that
+    // genuinely needs partial-overlap tracking would extend buildBarriers()
+    // to a real interval-aware tracker at that time, per this repo's
+    // "ship the minimal shape a named consumer needs" precedent (matrix
+    // Open Question 3's own citation of D9's GeometryPool scoping).
+    {
+        std::unordered_map<uint32_t, std::vector<Subresource>> seenByResource;
+        for (uint32_t p : executionOrder) {
+            for (const ResourceAccess& access : compiled.passAccesses_[p]) {
+                const PhysicalResource& resource = compiled.resources_[access.physicalIndex];
+                if (resource.isBuffer) {
+                    continue;  // Subresource is meaningless for a buffer.
+                }
+                std::vector<Subresource>& seen = seenByResource[access.physicalIndex];
+                bool alreadySeen = false;
+                for (const Subresource& other : seen) {
+                    if (other == access.subresource) {
+                        alreadySeen = true;
+                        break;
+                    }
+                    const bool mipOverlaps = access.subresource.baseMipLevel < other.baseMipLevel + other.levelCount &&
+                                              other.baseMipLevel < access.subresource.baseMipLevel + access.subresource.levelCount;
+                    const bool layerOverlaps =
+                        access.subresource.baseArrayLayer < other.baseArrayLayer + other.layerCount &&
+                        other.baseArrayLayer < access.subresource.baseArrayLayer + access.subresource.layerCount;
+                    if (mipOverlaps && layerOverlaps) {
+                        RX_LOG_ERROR("rx_graph: resource '{}' is declared with two overlapping-but-not-identical "
+                                     "subresource ranges (mip [{}, {}), layer [{}, {}) vs mip [{}, {}), layer "
+                                     "[{}, {})) -- partial subresource overlap is not supported; declare either "
+                                     "identical or fully disjoint ranges",
+                                     resource.name, access.subresource.baseMipLevel,
+                                     access.subresource.baseMipLevel + access.subresource.levelCount,
+                                     access.subresource.baseArrayLayer,
+                                     access.subresource.baseArrayLayer + access.subresource.layerCount,
+                                     other.baseMipLevel, other.baseMipLevel + other.levelCount, other.baseArrayLayer,
+                                     other.baseArrayLayer + other.layerCount);
+                        throw std::runtime_error(
+                            "rx_graph: resource '" + resource.name +
+                            "' is declared with two overlapping-but-not-identical subresource ranges -- partial "
+                            "subresource overlap is not supported; declare either identical or fully disjoint "
+                            "ranges");
+                    }
+                }
+                if (!alreadySeen) {
+                    seen.push_back(access.subresource);
+                }
+            }
         }
     }
 
@@ -788,8 +949,9 @@ Pass& Pass::setDepthStencilOutput(std::string_view name, const AttachmentDesc& d
     return *this;
 }
 
-Pass& Pass::addTextureInput(std::string_view name) {
-    declarations_.push_back(Declaration{AccessKind::TextureInput, std::string(name), AttachmentDesc{}, BufferDesc{}});
+Pass& Pass::addTextureInput(std::string_view name, Subresource subresource) {
+    declarations_.push_back(Declaration{AccessKind::TextureInput, std::string(name), AttachmentDesc{}, BufferDesc{},
+                                         ImageDesc{}, subresource});
     return *this;
 }
 
@@ -811,6 +973,18 @@ Pass& Pass::addStorageBufferOutput(std::string_view name, const BufferDesc& desc
 Pass& Pass::addStorageBufferInput(std::string_view name) {
     declarations_.push_back(
         Declaration{AccessKind::StorageBufferInput, std::string(name), AttachmentDesc{}, BufferDesc{}});
+    return *this;
+}
+
+Pass& Pass::addStorageImageOutput(std::string_view name, const ImageDesc& desc, Subresource subresource) {
+    declarations_.push_back(Declaration{AccessKind::StorageImageOutput, std::string(name), AttachmentDesc{},
+                                         BufferDesc{}, desc, subresource});
+    return *this;
+}
+
+Pass& Pass::addStorageImageInput(std::string_view name, Subresource subresource) {
+    declarations_.push_back(Declaration{AccessKind::StorageImageInput, std::string(name), AttachmentDesc{},
+                                         BufferDesc{}, ImageDesc{}, subresource});
     return *this;
 }
 

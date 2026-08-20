@@ -35,6 +35,19 @@ AttachmentDesc depthDesc() {
     return desc;
 }
 
+// [Task 2, gate ruling RC2] A plain single-mip/single-layer storage-image
+// shape -- the degenerate case every field of ImageDesc that predates this
+// task's default already covers, used by every test below that does not
+// itself need more than one mip/layer.
+ImageDesc storageImageDesc() {
+    ImageDesc desc;
+    desc.format = VK_FORMAT_R8G8B8A8_UNORM;
+    desc.sizeClass = SizeClass::Absolute;
+    desc.width = 64.0F;
+    desc.height = 64.0F;
+    return desc;
+}
+
 const PhysicalResource* findResource(const CompiledGraph& compiled, std::string_view name) {
     for (const PhysicalResource& resource : compiled.resources()) {
         if (resource.name == name) {
@@ -725,6 +738,209 @@ TEST_CASE("a depth-format HistoryOutput declaration never counts toward the colo
         pass.addColorOutput("color_" + std::to_string(i), colorDesc());
     }
     pass.setHistoryOutput("hist_depth", depthDesc());
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+    CHECK_NOTHROW(graph.compile(kInfo));
+}
+
+// ===========================================================================
+// [Task 2, gate ruling RC2] Storage-image resource-model extension: the
+// generic per-mip/per-layer subresource pass I/O + storage-image read/write
+// API + cube/array views RC2 requires T2 to land once, device-free-testable
+// here exactly like every other declaration kind above.
+// ===========================================================================
+
+TEST_CASE("addStorageImageOutput establishes a storage-image resource with STORAGE usage and its declared shape") {
+    RenderGraph graph;
+    ImageDesc desc = storageImageDesc();
+    desc.mipLevels = 3;
+    desc.arrayLayers = 6;
+    desc.cube = true;
+
+    graph.addPass("bake").addStorageImageOutput("env", desc).setSideEffect();
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+    graph.compile(kInfo);
+
+    const PhysicalResource* env = findResource(graph.compiled(), "env");
+    REQUIRE(env != nullptr);
+    CHECK_FALSE(env->isBuffer);
+    CHECK(env->mipLevels == 3);
+    CHECK(env->arrayLayers == 6);
+    CHECK(env->cube);
+    CHECK((env->imageUsage & VK_IMAGE_USAGE_STORAGE_BIT) != 0);
+    CHECK(env->attachment.format == VK_FORMAT_R8G8B8A8_UNORM);
+}
+
+TEST_CASE("a second addStorageImageOutput of the same name only narrows subresource, never redeclares shape") {
+    RenderGraph graph;
+    ImageDesc desc = storageImageDesc();
+    desc.mipLevels = 2;
+    desc.arrayLayers = 1;
+
+    ImageDesc bogus = storageImageDesc();
+    bogus.mipLevels = 99;  // must be ignored -- the FIRST establishment wins
+
+    Subresource mip0{0, 1, 0, 1};
+    Subresource mip1{1, 1, 0, 1};
+    graph.addPass("write_mip0").addStorageImageOutput("chain", desc, mip0).setSideEffect();
+    graph.addPass("write_mip1").addStorageImageOutput("chain", bogus, mip1).setSideEffect();
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+    graph.compile(kInfo);
+
+    const PhysicalResource* chain = findResource(graph.compiled(), "chain");
+    REQUIRE(chain != nullptr);
+    CHECK(chain->mipLevels == 2);  // NOT 99 -- the second declaration's `desc` was ignored.
+}
+
+TEST_CASE("addStorageImageOutput/Input resolve compute-class vs graphics-class stages at VK_IMAGE_LAYOUT_GENERAL") {
+    RenderGraph graph;
+    // "bake" has no attachment output at all -- Compute-class.
+    graph.addPass("bake").addStorageImageOutput("img", storageImageDesc()).setSideEffect();  // pass 0
+    // "present" has a color output alongside its storage-image input -- Graphics-class.
+    graph.addPass("present").addStorageImageInput("img").addColorOutput("bb", colorDesc());  // pass 1
+    graph.setBackbufferSource("bb");
+    graph.compile(kInfo);
+
+    const CompiledGraph& compiled = graph.compiled();
+
+    const auto bakeAccesses = compiled.passAccesses(0);
+    REQUIRE(bakeAccesses.size() == 1);
+    CHECK(bakeAccesses[0].stages == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    CHECK(bakeAccesses[0].access == (VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
+    CHECK(bakeAccesses[0].layout == VK_IMAGE_LAYOUT_GENERAL);
+
+    const auto presentAccesses = compiled.passAccesses(1);
+    REQUIRE(presentAccesses.size() == 2);
+    CHECK(presentAccesses[0].stages == (VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT));
+    CHECK(presentAccesses[0].access == VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+    CHECK(presentAccesses[0].layout == VK_IMAGE_LAYOUT_GENERAL);
+}
+
+TEST_CASE("compile() rejects a cube storage image whose arrayLayers is not a positive multiple of 6") {
+    RenderGraph graph;
+    ImageDesc desc = storageImageDesc();
+    desc.cube = true;
+    desc.arrayLayers = 4;  // not a multiple of 6
+
+    graph.addPass("bake").addStorageImageOutput("env", desc).setSideEffect();
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+
+    bool threw = false;
+    try {
+        graph.compile(kInfo);
+    } catch (const std::runtime_error& e) {
+        threw = true;
+        CHECK(std::string(e.what()).find("env") != std::string::npos);
+    }
+    CHECK(threw);
+}
+
+TEST_CASE("a default-constructed Subresource resolves to the whole resource, sentinels replaced with real counts") {
+    RenderGraph graph;
+    ImageDesc desc = storageImageDesc();
+    desc.mipLevels = 3;
+    desc.arrayLayers = 6;
+    desc.cube = true;
+
+    graph.addPass("bake").addStorageImageOutput("env", desc).setSideEffect();  // default subresource
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+    graph.compile(kInfo);
+
+    const auto bakeAccesses = graph.compiled().passAccesses(0);
+    REQUIRE(bakeAccesses.size() == 1);
+    CHECK(bakeAccesses[0].subresource.baseMipLevel == 0);
+    CHECK(bakeAccesses[0].subresource.levelCount == 3);
+    CHECK(bakeAccesses[0].subresource.baseArrayLayer == 0);
+    CHECK(bakeAccesses[0].subresource.layerCount == 6);
+}
+
+TEST_CASE("an explicit subresource narrows the resolved access to a sub-range of the resource") {
+    RenderGraph graph;
+    ImageDesc desc = storageImageDesc();
+    desc.mipLevels = 1;
+    desc.arrayLayers = 6;
+    desc.cube = true;
+
+    graph.addPass("bake_face2").addStorageImageOutput("env", desc, Subresource{0, 1, 2, 1}).setSideEffect();
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+    graph.compile(kInfo);
+
+    const auto accesses = graph.compiled().passAccesses(0);
+    REQUIRE(accesses.size() == 1);
+    CHECK(accesses[0].subresource.baseMipLevel == 0);
+    CHECK(accesses[0].subresource.levelCount == 1);
+    CHECK(accesses[0].subresource.baseArrayLayer == 2);
+    CHECK(accesses[0].subresource.layerCount == 1);
+}
+
+TEST_CASE("addTextureInput accepts an explicit subresource narrowing a read of a multi-layer storage image") {
+    RenderGraph graph;
+    ImageDesc desc = storageImageDesc();
+    desc.arrayLayers = 6;
+    desc.cube = true;
+
+    // The read's subresource matches the write's exactly (both address
+    // "face 3 alone") -- identical ranges are the supported case (see the
+    // "overlapping-but-not-identical" throw test above for the range this
+    // deliberately avoids).
+    const Subresource face3{0, 1, 3, 1};
+    graph.addPass("bake").addStorageImageOutput("env", desc, face3).setSideEffect();
+    graph.addPass("present").addTextureInput("env", face3).addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+    graph.compile(kInfo);
+
+    const auto presentAccesses = graph.compiled().passAccesses(1);
+    REQUIRE(presentAccesses.size() == 2);
+    CHECK(presentAccesses[0].subresource.baseArrayLayer == 3);
+    CHECK(presentAccesses[0].subresource.layerCount == 1);
+}
+
+TEST_CASE("compile() throws when two overlapping-but-not-identical subresource ranges target the same resource") {
+    RenderGraph graph;
+    ImageDesc desc = storageImageDesc();
+    desc.arrayLayers = 6;
+    desc.cube = true;
+
+    // "whole array at mip 0" (layers [0,6)) vs "layer 3 alone" (layers
+    // [3,4)) -- overlapping (layer 3 is inside both) but not identical.
+    graph.addPass("bake_all").addStorageImageOutput("env", desc).setSideEffect();
+    graph.addPass("read_one_face")
+        .addStorageImageInput("env", Subresource{0, 1, 3, 1})
+        .addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+
+    bool threw = false;
+    try {
+        graph.compile(kInfo);
+    } catch (const std::runtime_error& e) {
+        threw = true;
+        CHECK(std::string(e.what()).find("env") != std::string::npos);
+    }
+    CHECK(threw);
+}
+
+TEST_CASE("compile() accepts two DISJOINT subresource ranges (different mip levels) against the same resource") {
+    RenderGraph graph;
+    ImageDesc desc = storageImageDesc();
+    desc.mipLevels = 2;
+
+    graph.addPass("write_mip0").addStorageImageOutput("chain", desc, Subresource{0, 1, 0, 1}).setSideEffect();
+    graph.addPass("write_mip1").addStorageImageOutput("chain", desc, Subresource{1, 1, 0, 1}).setSideEffect();
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+    CHECK_NOTHROW(graph.compile(kInfo));
+}
+
+TEST_CASE("compile() accepts two IDENTICAL subresource ranges against the same resource") {
+    RenderGraph graph;
+    graph.addPass("write").addStorageImageOutput("img", storageImageDesc()).setSideEffect();
+    graph.addPass("read1").addStorageImageInput("img").setSideEffect();
+    graph.addPass("read2").addStorageImageInput("img").setSideEffect();
     graph.addPass("present").addColorOutput("bb", colorDesc());
     graph.setBackbufferSource("bb");
     CHECK_NOTHROW(graph.compile(kInfo));

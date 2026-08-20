@@ -4,6 +4,12 @@
 // device-free, exactly like Task 1's compile() [Task 2 brief].
 #include <vulkan/vulkan_core.h>
 
+// [Task 2, gate ruling RC2] Needed for Subresource (ImageBarrier::
+// subresource below) -- still device-free (resources.h itself is
+// Vulkan-Headers-only, same rule this file already follows) and creates no
+// cycle: resources.h has no dependency back on this header.
+#include <rx_graph/resources.h>
+
 #include <array>
 #include <cstdint>
 #include <optional>
@@ -32,6 +38,17 @@ struct ImageBarrier {
     VkAccessFlags2 dstAccess;
     VkImageLayout oldLayout;
     VkImageLayout newLayout;
+
+    // [Task 2, gate ruling RC2] The RESOLVED subresource range this barrier
+    // applies to -- default-constructed ("the whole resource") for every
+    // resource this task does not extend to carry more than one mip/layer
+    // (every existing barrier before this task effectively meant "the
+    // whole resource" anyway, since every PhysicalResource had exactly one
+    // mip/layer -- this field makes that implicit meaning explicit and lets
+    // Executor build a real, narrower VkImageSubresourceRange for a
+    // storage-image resource with more than one). See resources.h's
+    // Subresource for the field shapes.
+    Subresource subresource;
 };
 
 // 1:1 payload for VkBufferMemoryBarrier2, minus the real VkBuffer handle.

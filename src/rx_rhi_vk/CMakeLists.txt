@@ -23,6 +23,8 @@ add_library(rx_rhi_vk STATIC
     src/upload.cpp
     src/deletion_queue.cpp
     src/texture.cpp
+    src/storage_image.cpp
+    src/compute_pipeline.cpp
     src/mesh_buffers.cpp
     src/descriptor_arena.cpp
     src/tracy_gpu.cpp
@@ -97,8 +99,20 @@ add_executable(rx_rhi_vk_tests
     tests/bda_test.cpp
     tests/window_state_test.cpp
     tests/surface_loss_test.cpp
+    tests/storage_image_test.cpp
+    # [Task 2 (#38), gate ruling RC2] compute_pipeline_test.cpp compiles a
+    # real compute .slang module in-process (rx::shader::Compiler +
+    # reflect()) to exercise rx::rhi::ComputePipelineCache end to end --
+    # same reason test_execute_gpu.cpp (rx_graph/tests/CMakeLists.txt) links
+    # rx_shader: PipelineLayoutBuilder's own pipeline_layout_test.cpp needs
+    # no real SPIR-V (it only ever builds a VkPipelineLayout from a
+    # hand-constructed ShaderLayoutInfo), but a genuine
+    # vkCreateComputePipelines call needs a genuine, driver-valid compiled
+    # module, which only the real Slang compiler path can produce.
+    tests/compute_pipeline_test.cpp
 )
-target_link_libraries(rx_rhi_vk_tests PRIVATE rx_rhi_vk rx_platform doctest::doctest)
+target_link_libraries(rx_rhi_vk_tests PRIVATE rx_rhi_vk rx_platform rx_shader doctest::doctest)
+rx_shader_deploy_runtime_libs(rx_rhi_vk_tests)
 add_test(NAME rx_rhi_vk_tests COMMAND rx_rhi_vk_tests)
 # Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
 # (windows-cross Wine hang, run 31512073559).

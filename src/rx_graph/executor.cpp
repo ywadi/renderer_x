@@ -203,6 +203,14 @@ struct ResolvedResource {
     // Executor never pools [Task 3 ambiguity resolution #4].
     uint32_t poolIndex = UINT32_MAX;
 
+    // [Task 2 (#38), gate ruling RC2] True for a resource established via
+    // Pass::addStorageImageOutput()/addStorageImageInput() -- `poolIndex`
+    // then indexes Impl::pool's storageImages_ (TransientPool::
+    // storageImage()) instead of images_ (TransientPool::image()).
+    // Mutually exclusive with isBuffer/isHistory/isBackbuffer (a storage
+    // image is always a plain, non-history, non-backbuffer image).
+    bool isStorageImage = false;
+
     // Meaningless (left at their defaults) for isHistory == true: a
     // history resource has TWO real images (ping-pong slots), never one,
     // so there is no single VkImage/VkImageView a generic field here could
@@ -338,6 +346,22 @@ struct Executor::Impl {
     // for THIS scratch-reuse discipline to do for them.
     std::vector<uint32_t> colorPhysIdxScratch;
     std::vector<VkRenderingAttachmentInfo> colorAttachmentsScratch;
+
+    // [Task 2 (#38), gate ruling RC2] THIS PASS's own declared storage-image
+    // subresource views (Pass::addStorageImageOutput()/addStorageImageInput()),
+    // rebuilt fresh at the top of every pass's processing in execute()'s
+    // per-pass loop -- see PassContext::storageImageView()'s own doc
+    // comment (executor.h) for why a per-pass (not global, unlike
+    // imageView()'s name->view map) lookup is required: two different
+    // passes may declare the SAME resource name at two DIFFERENT
+    // subresources (e.g. two different mip levels of the same chain), so
+    // "the view for this name" is only well-defined per-pass, not
+    // globally. `std::string_view` keys borrow directly from the owning
+    // Pass::Declaration::resourceName (a real std::string that outlives
+    // this scratch's use -- Pass objects live in RenderGraph::Impl's own
+    // std::deque for the whole graph's lifetime, never reallocated or
+    // destroyed mid-execute()).
+    std::vector<std::pair<std::string_view, VkImageView>> currentPassStorageImageViews;
 
     // Barrier-emission scratch for applyBarriers() (was: 2 locals freshly
     // constructed on every applyBarriers() call -- ticket sites 7-8; called
@@ -496,11 +520,20 @@ void applyBarriers(Executor::Impl& impl, const CompiledGraph& compiled, VkComman
         VkPipelineStageFlags2 srcStage = b.srcStage;
         VkAccessFlags2 srcAccess = b.srcAccess;
         if (!resolved.isBackbuffer && !firstBarrierSeen[b.physicalIndex]) {
-            srcStage = impl.pool.image(resolved.poolIndex).lastFrameFinalStages;
-            // Make the prior frame's final writes AVAILABLE before this
-            // frame's discard transition (execution ordering alone does
-            // not flush caches -- see PooledImage::lastFrameFinalAccess).
-            srcAccess = impl.pool.image(resolved.poolIndex).lastFrameFinalAccess;
+            // [Task 2 (#38), gate ruling RC2] A storage image's pooled
+            // cross-frame carry-forward lives in Impl::pool's
+            // storageImages_ entry, not images_ -- see ResolvedResource::
+            // isStorageImage's own comment.
+            if (resolved.isStorageImage) {
+                srcStage = impl.pool.storageImage(resolved.poolIndex).lastFrameFinalStages;
+                srcAccess = impl.pool.storageImage(resolved.poolIndex).lastFrameFinalAccess;
+            } else {
+                srcStage = impl.pool.image(resolved.poolIndex).lastFrameFinalStages;
+                // Make the prior frame's final writes AVAILABLE before this
+                // frame's discard transition (execution ordering alone does
+                // not flush caches -- see PooledImage::lastFrameFinalAccess).
+                srcAccess = impl.pool.image(resolved.poolIndex).lastFrameFinalAccess;
+            }
         } else if (resolved.isBackbuffer && !firstBarrierSeen[b.physicalIndex] &&
                    b.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
             // Backbuffer acquire chaining: when the backbuffer is a freshly
@@ -531,10 +564,21 @@ void applyBarriers(Executor::Impl& impl, const CompiledGraph& compiled, VkComman
         vkBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         vkBarrier.image = resolved.image;
         vkBarrier.subresourceRange.aspectMask = aspectMaskForFormat(physical.attachment.format);
-        vkBarrier.subresourceRange.baseMipLevel = 0;
-        vkBarrier.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
-        vkBarrier.subresourceRange.baseArrayLayer = 0;
-        vkBarrier.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+        // [Task 2 (#38), gate ruling RC2] `b.subresource` is ALWAYS fully
+        // resolved (concrete counts, no sentinel -- render_graph.cpp's
+        // resolveSubresource()) by the time compile() produces it, and for
+        // every resource this task does not extend beyond single-mip/
+        // single-layer (every kind except a storage image) it is always
+        // exactly {0, 1, 0, 1} -- byte-identical in effect to this site's
+        // former hardcoded VK_REMAINING_MIP_LEVELS/VK_REMAINING_ARRAY_LAYERS
+        // for those resources (a 1-mip/1-layer image's "whole resource" and
+        // "mip 0, layer 0 alone" are the same range either way). Only a
+        // storage image with more than one mip/layer ever produces a
+        // narrower, real subresourceRange here.
+        vkBarrier.subresourceRange.baseMipLevel = b.subresource.baseMipLevel;
+        vkBarrier.subresourceRange.levelCount = b.subresource.levelCount;
+        vkBarrier.subresourceRange.baseArrayLayer = b.subresource.baseArrayLayer;
+        vkBarrier.subresourceRange.layerCount = b.subresource.layerCount;
         vkImageBarriers.push_back(vkBarrier);
     }
 
@@ -1130,6 +1174,30 @@ void Executor::realize(const RenderGraph& graph) {
             }
             entry.poolIndex = *poolIndex;
             entry.buffer = impl.pool.buffer(*poolIndex).buffer->handle();
+        } else if ((physical.imageUsage & VK_IMAGE_USAGE_STORAGE_BIT) != 0) {
+            // [Task 2 (#38), gate ruling RC2] A resource established via
+            // Pass::addStorageImageOutput()/addStorageImageInput() always
+            // unions VK_IMAGE_USAGE_STORAGE_BIT into imageUsage
+            // (render_graph.cpp) -- the one discriminator this branch needs
+            // to route to the storage-image pool (mip/array/cube-capable)
+            // instead of the ordinary Texture2D one below.
+            const VkExtent2D extent = toExtent(physical.attachment);
+            auto poolIndex = impl.pool.acquireStorageImage(physical.attachment.format, extent, physical.mipLevels,
+                                                             physical.arrayLayers, physical.cube, physical.imageUsage,
+                                                             impl.frameCounter);
+            if (!poolIndex.has_value()) {
+                RX_LOG_ERROR("rx_graph: Executor::realize: failed to acquire a pooled storage image for resource "
+                             "'{}'",
+                             physical.name);
+                continue;
+            }
+            entry.poolIndex = *poolIndex;
+            entry.isStorageImage = true;
+            const rx::rhi::StorageImage& image = *impl.pool.storageImage(*poolIndex).texture;
+            entry.image = image.image();
+            entry.view = image.fullView();
+            entry.format = image.format();
+            entry.extent = image.extent();
         } else {
             const VkExtent2D extent = toExtent(physical.attachment);
             auto poolIndex = impl.pool.acquireImage(physical.attachment.format, extent, physical.imageUsage,
@@ -1420,6 +1488,37 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
             }
         }
 
+        // [Task 2 (#38), gate ruling RC2] Rebuild this pass's own storage-
+        // image subresource view lookup -- see Impl::currentPassStorageImageViews'
+        // own comment for why this must be per-pass. `pass.declarations_`
+        // (private; reachable here only because Executor is a friend of
+        // Pass -- pass.h) and `accesses` (compiled.passAccesses(rawIndex))
+        // are positionally 1:1, in the SAME order, by construction
+        // (render_graph.cpp step 4's own per-declaration loop pushes
+        // exactly one resolved ResourceAccess per declaration, in
+        // declaration order) -- zipping them by index is what recovers
+        // each storage-image declaration's OWN resolved Subresource
+        // (ResourceAccess::subresource) without needing a new AccessKind
+        // field on ResourceAccess itself.
+        impl.currentPassStorageImageViews.clear();
+        for (size_t declIdx = 0; declIdx < pass.declarations_.size() && declIdx < accesses.size(); ++declIdx) {
+            const Pass::Declaration& decl = pass.declarations_[declIdx];
+            if (decl.kind != Pass::AccessKind::StorageImageOutput && decl.kind != Pass::AccessKind::StorageImageInput) {
+                continue;
+            }
+            const ResourceAccess& access = accesses[declIdx];
+            const ResolvedResource& resolvedRes = impl.resources.at(access.physicalIndex);
+            if (!resolvedRes.isStorageImage) {
+                continue;  // acquireStorageImage() failed in realize(); nothing to resolve.
+            }
+            rx::rhi::StorageImage& storageImage = *impl.pool.storageImage(resolvedRes.poolIndex).texture;
+            VkImageView view = storageImage.viewForSubresource(access.subresource.baseMipLevel,
+                                                                 access.subresource.levelCount,
+                                                                 access.subresource.baseArrayLayer,
+                                                                 access.subresource.layerCount);
+            impl.currentPassStorageImageViews.emplace_back(decl.resourceName, view);
+        }
+
         PassContext ctx(*this);
         ctx.renderArea = renderArea;
         ctx.passSignature_ = signature;
@@ -1516,6 +1615,11 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
             impl.pool.buffer(resolvedRes.poolIndex).lastFrameFinalStages = stage;
             impl.pool.buffer(resolvedRes.poolIndex).lastFrameFinalAccess = access;
             impl.pool.touchBuffer(resolvedRes.poolIndex, impl.frameCounter);
+        } else if (resolvedRes.isStorageImage) {
+            // [Task 2 (#38), gate ruling RC2]
+            impl.pool.storageImage(resolvedRes.poolIndex).lastFrameFinalStages = stage;
+            impl.pool.storageImage(resolvedRes.poolIndex).lastFrameFinalAccess = access;
+            impl.pool.touchStorageImage(resolvedRes.poolIndex, impl.frameCounter);
         } else {
             impl.pool.image(resolvedRes.poolIndex).lastFrameFinalStages = stage;
             impl.pool.image(resolvedRes.poolIndex).lastFrameFinalAccess = access;
@@ -1836,6 +1940,24 @@ VkFormat Executor::resolveImageFormat(std::string_view name) const {
     return resolved.format;
 }
 
+VkImageView Executor::resolveStorageImageView(std::string_view name) const {
+    // [Task 2 (#38), gate ruling RC2] Deliberately NOT lookupResolvedIndex()
+    // + Impl::resources -- that map is name -> the GLOBAL "whole resource"
+    // binding, exactly what imageView() itself resolves. This resolver's
+    // whole contract is "THIS PASS's own declared subresource", which only
+    // Impl::currentPassStorageImageViews (rebuilt fresh every pass, see its
+    // own comment) can answer -- a linear scan over it (a handful of
+    // storage-image declarations per pass at most).
+    for (const auto& [declaredName, view] : impl_->currentPassStorageImageViews) {
+        if (declaredName == name) {
+            return view;
+        }
+    }
+    throw std::out_of_range("rx_graph: PassContext::storageImageView(): '" + std::string(name) +
+                             "' was not declared as a StorageImageOutput/StorageImageInput by the CURRENTLY "
+                             "EXECUTING pass");
+}
+
 bool Executor::resolveHistoryValid(std::string_view name) const {
     const uint32_t idx = lookupResolvedIndex(*impl_, name);
     const ResolvedResource& resolved = impl_->resources.at(idx);
@@ -1864,6 +1986,9 @@ VkImageView PassContext::imageView(std::string_view name) const { return executo
 VkImage PassContext::image(std::string_view name) const { return executor_->resolveImage(name); }
 VkBuffer PassContext::buffer(std::string_view name) const { return executor_->resolveBuffer(name); }
 VkFormat PassContext::imageFormat(std::string_view name) const { return executor_->resolveImageFormat(name); }
+VkImageView PassContext::storageImageView(std::string_view name) const {
+    return executor_->resolveStorageImageView(name);
+}
 bool PassContext::historyValid(std::string_view name) const { return executor_->resolveHistoryValid(name); }
 VkCommandBuffer PassContext::chunkCommandBuffer() const { return executor_->resolveChunkCommandBuffer(); }
 
@@ -1892,6 +2017,10 @@ VkPipelineStageFlags2 debugLastFrameFinalStages(const Executor& executor, std::s
     const ResolvedResource& resolved = impl.resources.at(idx);
     if (resolved.isBuffer) {
         return impl.pool.buffer(resolved.poolIndex).lastFrameFinalStages;
+    }
+    if (resolved.isStorageImage) {
+        // [Task 2 (#38), gate ruling RC2]
+        return impl.pool.storageImage(resolved.poolIndex).lastFrameFinalStages;
     }
     return impl.pool.image(resolved.poolIndex).lastFrameFinalStages;
 }

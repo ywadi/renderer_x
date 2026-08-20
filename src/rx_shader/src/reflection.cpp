@@ -143,12 +143,31 @@ std::optional<ShaderLayoutInfo> reflect(const CompileResult& result) {
     // reflect() for why getLayout()/the walk below need it too.
     std::lock_guard<std::mutex> lock(detail::globalSessionMutex());
 
-    Slang::ComPtr<slang::IBlob> layoutDiagnostics;
-    slang::ProgramLayout* layout = result.linkedProgram->getLayout(0, layoutDiagnostics.writeRef());
-    if (layoutDiagnostics.get() != nullptr && layoutDiagnostics->getBufferSize() > 0) {
-        RX_LOG_WARN("rx_shader::reflect: diagnostics from getLayout:\n{}",
-                    std::string(static_cast<const char*>(layoutDiagnostics->getBufferPointer()),
-                                layoutDiagnostics->getBufferSize()));
+    // [Task 2 (#38), empirical finding -- see CompileResult::cachedLayout's
+    // own doc comment, compiler.h] Reuse compileImpl()'s own getLayout()
+    // result rather than calling getLayout() a SECOND time on the same
+    // `result.linkedProgram`: a second call was found, empirically, to
+    // crash inside this shipped Slang release for a compute-only linked
+    // program under realistic conditions (a process with an already-
+    // initialized Vulkan instance) -- not a hypothetical worry, a
+    // reproduced-and-fixed regression (see rx_rhi_vk/tests/
+    // compute_pipeline_test.cpp). `result.cachedLayout` is null only for a
+    // CompileResult this function's own `result.ok`/`linkedProgram` guard
+    // above would already have rejected (compileImpl() always populates it
+    // alongside `linkedProgram`, never one without the other), so falling
+    // back to a fresh getLayout() call here exists purely as a defensive
+    // fallback for a hypothetical future caller constructing a
+    // CompileResult by hand (e.g. a test fixture) rather than through
+    // compileImpl() -- never expected to be the path a real compile takes.
+    slang::ProgramLayout* layout = result.cachedLayout;
+    if (layout == nullptr) {
+        Slang::ComPtr<slang::IBlob> layoutDiagnostics;
+        layout = result.linkedProgram->getLayout(0, layoutDiagnostics.writeRef());
+        if (layoutDiagnostics.get() != nullptr && layoutDiagnostics->getBufferSize() > 0) {
+            RX_LOG_WARN("rx_shader::reflect: diagnostics from getLayout:\n{}",
+                        std::string(static_cast<const char*>(layoutDiagnostics->getBufferPointer()),
+                                    layoutDiagnostics->getBufferSize()));
+        }
     }
     if (layout == nullptr) {
         RX_LOG_ERROR("rx_shader::reflect: IComponentType::getLayout returned null");

@@ -15,6 +15,7 @@
 // rx_graph's own sibling library as it would to a third-party one.
 #include <rx_graph/barriers.h>
 #include <rx_rhi_vk/buffer.h>
+#include <rx_rhi_vk/storage_image.h>
 #include <rx_rhi_vk/texture.h>
 #include <volk.h>
 
@@ -98,6 +99,34 @@ struct PooledImage {
     // sweepStale() compares the CURRENT frame counter against this to
     // decide eviction; realize()'s acquireImage()/acquireBuffer() and
     // execute()'s per-pass bookkeeping both bump it.
+    uint64_t lastUsedFrame = 0;
+};
+
+// [Task 2 (#38), gate ruling RC2] One pooled STORAGE image entry -- same
+// shape/contract as PooledImage above, but keyed additionally by
+// (mipLevels, arrayLayers, cube), the shape axes only a storage-image
+// resource (Pass::addStorageImageOutput()) can ever declare more than 1 of.
+// A plain ordinary transient (color/depth/history/texture-input-only
+// resource, never more than 1 mip/1 layer -- see resources.h's
+// PhysicalResource::mipLevels comment) still goes through PooledImage/
+// Texture2D above unchanged; only a resource whose imageUsage carries
+// VK_IMAGE_USAGE_STORAGE_BIT is ever pooled here instead (Executor::
+// realize()'s own branch).
+struct PooledStorageImage {
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkExtent2D extent{0, 0};
+    uint32_t mipLevels = 1;
+    uint32_t arrayLayers = 1;
+    bool cube = false;
+    VkImageUsageFlags usage = 0;
+
+    std::optional<rx::rhi::StorageImage> texture;
+
+    // Same cross-frame carry-forward contract as PooledImage's own two
+    // fields (executor.cpp's applyBarriers() first-use-of-frame override).
+    VkPipelineStageFlags2 lastFrameFinalStages = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    VkAccessFlags2 lastFrameFinalAccess = VK_ACCESS_2_MEMORY_WRITE_BIT;
+
     uint64_t lastUsedFrame = 0;
 };
 
@@ -225,6 +254,14 @@ public:
     // Same contract as acquireImage(), for a buffer keyed by (size, usage).
     std::optional<uint32_t> acquireBuffer(VkDeviceSize size, VkBufferUsageFlags usage, uint64_t currentFrame);
 
+    // [Task 2 (#38), gate ruling RC2] Same acquire-or-create contract as
+    // acquireImage() above, for a rx::rhi::StorageImage keyed by (format,
+    // extent, mipLevels, arrayLayers, cube, usage). Returns std::nullopt
+    // (logged) only if creating a brand new entry's StorageImage fails.
+    std::optional<uint32_t> acquireStorageImage(VkFormat format, VkExtent2D extent, uint32_t mipLevels,
+                                                 uint32_t arrayLayers, bool cube, VkImageUsageFlags usage,
+                                                 uint64_t currentFrame);
+
     // Phase 4 Task 1: returns the index (stable for the pool's lifetime --
     // see this struct's own class comment on why a pinned entry is never
     // swept the way acquireImage()'s entries are) of `name`'s pinned entry,
@@ -265,6 +302,8 @@ public:
     [[nodiscard]] const PooledImage& image(uint32_t index) const { return images_.at(index); }
     [[nodiscard]] PooledBuffer& buffer(uint32_t index) { return buffers_.at(index); }
     [[nodiscard]] const PooledBuffer& buffer(uint32_t index) const { return buffers_.at(index); }
+    [[nodiscard]] PooledStorageImage& storageImage(uint32_t index) { return storageImages_.at(index); }
+    [[nodiscard]] const PooledStorageImage& storageImage(uint32_t index) const { return storageImages_.at(index); }
     [[nodiscard]] PinnedHistoryEntry& pinned(uint32_t index) { return pinned_.at(index); }
     [[nodiscard]] const PinnedHistoryEntry& pinned(uint32_t index) const { return pinned_.at(index); }
 
@@ -275,6 +314,7 @@ public:
     // keeps reusing every frame never looks "unused" to sweepStale() below.
     void touchImage(uint32_t index, uint64_t currentFrame);
     void touchBuffer(uint32_t index, uint64_t currentFrame);
+    void touchStorageImage(uint32_t index, uint64_t currentFrame);
 
     // Retires (via `deletionQueue`, tagged with each entry's own
     // lastUsedFrame -- already provably safe to destroy once that frame
@@ -317,6 +357,11 @@ private:
 
     std::vector<PooledImage> images_;
     std::vector<PooledBuffer> buffers_;
+    // [Task 2 (#38), gate ruling RC2] Separate from images_ -- see
+    // PooledStorageImage's own comment for why a storage-image resource
+    // needs its own pool keyed on additional shape axes (mip/array/cube)
+    // ordinary transients never vary.
+    std::vector<PooledStorageImage> storageImages_;
 
     // Phase 4 Task 1: pinned history entries, keyed by name (linear scan in
     // acquireHistory() -- a graph has at most a handful of history
@@ -339,6 +384,7 @@ private:
     // structure over cleverness with no measured benefit.
     std::vector<bool> imageClaimedThisBatch_;
     std::vector<bool> bufferClaimedThisBatch_;
+    std::vector<bool> storageImageClaimedThisBatch_;
 };
 
 }  // namespace rx::graph::detail

@@ -56,6 +56,17 @@ AttachmentDesc depthDesc() {
     return desc;
 }
 
+// [Task 2, gate ruling RC2] A plain storage-image shape -- see
+// test_compile.cpp's identically-named/-shaped helper.
+ImageDesc storageImageDesc() {
+    ImageDesc desc;
+    desc.format = VK_FORMAT_R8G8B8A8_UNORM;
+    desc.sizeClass = SizeClass::Absolute;
+    desc.width = 64.0F;
+    desc.height = 64.0F;
+    return desc;
+}
+
 uint32_t physicalIndexOf(const CompiledGraph& compiled, std::string_view name) {
     const auto resources = compiled.resources();
     for (uint32_t i = 0; i < resources.size(); ++i) {
@@ -461,4 +472,117 @@ TEST_CASE("culled-contributes-nothing") {
                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
+// ===========================================================================
+// [Task 2, gate ruling RC2] Per-(resource, subresource) barrier-state
+// independence -- the load-bearing correctness property the storage-image
+// resource-model extension's "per-mip/per-layer subresource pass I/O"
+// requires of buildBarriers() itself (as opposed to test_compile.cpp's own
+// coverage of the DECLARATION-side plumbing that produces the resolved
+// Subresource each ResourceAccess/ImageBarrier now carries).
+// ===========================================================================
+
+TEST_CASE("two disjoint mip-level subresources of the same storage image get independently tracked barrier state") {
+    RenderGraph graph;
+    ImageDesc desc = storageImageDesc();
+    desc.mipLevels = 2;
+
+    graph.addPass("write_mip0").addStorageImageOutput("chain", desc, Subresource{0, 1, 0, 1}).setSideEffect();  // 0
+    graph.addPass("write_mip1").addStorageImageOutput("chain", desc, Subresource{1, 1, 0, 1}).setSideEffect();  // 1
+    graph.addPass("present").addColorOutput("bb", colorDesc());                                                  // 2
+    graph.setBackbufferSource("bb");
+    graph.compile(kInfo);
+
+    const auto barriers = graph.compiled().passBarriers();
+    REQUIRE(barriers.size() == 3);
+    const uint32_t chain = physicalIndexOf(graph.compiled(), "chain");
+
+    // Each write is its OWN subresource's first-ever access in this
+    // compile walk -- an IMAGE always needs a real UNDEFINED->GENERAL
+    // layout-transition barrier on first use (unlike a buffer, which has
+    // no layout at all to transition -- see barriers.cpp's own
+    // applyAccess() comment on that asymmetry), srcStage NONE since
+    // nothing precedes either write. Under the PRE-Task-2
+    // whole-resource-only state machine, "write_mip1" would incorrectly
+    // inherit "write_mip0"'s already-GENERAL currentLayout and
+    // everAccessed=true, producing a WAW-shaped barrier (srcStage
+    // COMPUTE_SHADER, chained off the OTHER mip's write) instead of its
+    // own independent fresh first-use one.
+    REQUIRE(barriers[0].imageBarriers.size() == 1);
+    REQUIRE(barriers[1].imageBarriers.size() == 1);
+    checkImageBarrier(barriers[0].imageBarriers[0], chain, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+                       VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    checkImageBarrier(barriers[1].imageBarriers[0], chain, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+                       VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    CHECK(barriers[0].imageBarriers[0].subresource.baseMipLevel == 0);
+    CHECK(barriers[1].imageBarriers[0].subresource.baseMipLevel == 1);
+}
+
+TEST_CASE("a write-after-write on one subresource does not disturb an unrelated subresource's independent state") {
+    RenderGraph graph;
+    ImageDesc desc = storageImageDesc();
+    desc.mipLevels = 2;
+
+    const Subresource mip0{0, 1, 0, 1};
+    const Subresource mip1{1, 1, 0, 1};
+
+    graph.addPass("write_mip0_a").addStorageImageOutput("chain", desc, mip0).setSideEffect();  // 0
+    graph.addPass("write_mip0_b").addStorageImageOutput("chain", desc, mip0).setSideEffect();  // 1: WAW on mip0
+    graph.addPass("write_mip1").addStorageImageOutput("chain", desc, mip1).setSideEffect();     // 2: mip1's first use
+    graph.addPass("present").addColorOutput("bb", colorDesc());                                 // 3
+    graph.setBackbufferSource("bb");
+    graph.compile(kInfo);
+
+    const auto order = graph.compiled().executionOrder();
+    REQUIRE(order.size() == 4);
+    // write_mip0_a/write_mip0_b share a name -> a real write-after-write
+    // dependsOn edge orders them relative to each other; write_mip1 has no
+    // edge to either (a disjoint subresource of the same name still only
+    // ever chains a dependsOn edge by NAME, per step 1's writersByName
+    // construction -- see render_graph.cpp -- so all three of these
+    // passes' declaration-order positions [0, 1, 2] are still exactly
+    // Kahn's ascending-index tie-break result among what remain,
+    // structurally, three independent roots).
+    CHECK(order[0] == 0);
+    CHECK(order[1] == 1);
+    CHECK(order[2] == 2);
+
+    const auto barriers = graph.compiled().passBarriers();
+    const uint32_t chain = physicalIndexOf(graph.compiled(), "chain");
+
+    // pass 0 (write_mip0_a): first-ever access to (chain, mip0) -- a real
+    // UNDEFINED->GENERAL layout-transition barrier (every image's first use
+    // needs one -- srcStage NONE, nothing precedes it).
+    REQUIRE(barriers[0].imageBarriers.size() == 1);
+    checkImageBarrier(barriers[0].imageBarriers[0], chain, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+                       VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+
+    // pass 1 (write_mip0_b): WAW on the SAME subresource -- chains off
+    // pass 0's own write (srcStage COMPUTE_SHADER, not NONE); both layouts
+    // GENERAL already (no transition needed, only an execution+
+    // availability dependency).
+    REQUIRE(barriers[1].imageBarriers.size() == 1);
+    checkImageBarrier(barriers[1].imageBarriers[0], chain, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+                       VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    CHECK(barriers[1].imageBarriers[0].subresource.baseMipLevel == 0);
+
+    // pass 2 (write_mip1): a COMPLETELY DISJOINT subresource from mip0's
+    // own WAW activity just above -- its OWN fresh UNDEFINED->GENERAL,
+    // srcStage NONE first-use barrier, proving mip0's state (already
+    // GENERAL, already written twice) never leaked into mip1's.
+    REQUIRE(barriers[2].imageBarriers.size() == 1);
+    checkImageBarrier(barriers[2].imageBarriers[0], chain, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+                       VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    CHECK(barriers[2].imageBarriers[0].subresource.baseMipLevel == 1);
 }

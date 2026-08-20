@@ -11,6 +11,7 @@ namespace rx::graph::detail {
 void TransientPool::beginRealizeBatch() {
     imageClaimedThisBatch_.assign(images_.size(), false);
     bufferClaimedThisBatch_.assign(buffers_.size(), false);
+    storageImageClaimedThisBatch_.assign(storageImages_.size(), false);
 }
 
 std::optional<uint32_t> TransientPool::acquireImage(VkFormat format, VkExtent2D extent, VkImageUsageFlags usage,
@@ -49,6 +50,49 @@ std::optional<uint32_t> TransientPool::acquireImage(VkFormat format, VkExtent2D 
     images_.push_back(std::move(entry));
     imageClaimedThisBatch_.push_back(true);
     return static_cast<uint32_t>(images_.size() - 1);
+}
+
+std::optional<uint32_t> TransientPool::acquireStorageImage(VkFormat format, VkExtent2D extent, uint32_t mipLevels,
+                                                             uint32_t arrayLayers, bool cube,
+                                                             VkImageUsageFlags usage, uint64_t currentFrame) {
+    for (uint32_t i = 0; i < storageImages_.size(); ++i) {
+        const PooledStorageImage& entry = storageImages_[i];
+        if (storageImageClaimedThisBatch_[i] || !entry.texture.has_value()) {
+            continue;
+        }
+        if (entry.format == format && entry.extent.width == extent.width && entry.extent.height == extent.height &&
+            entry.mipLevels == mipLevels && entry.arrayLayers == arrayLayers && entry.cube == cube &&
+            entry.usage == usage) {
+            storageImageClaimedThisBatch_[i] = true;
+            storageImages_[i].lastUsedFrame = currentFrame;
+            return i;
+        }
+    }
+
+    auto texture = rx::rhi::StorageImage::create(physicalDevice_, device_, *allocator_, extent, format, usage,
+                                                  mipLevels, arrayLayers, cube);
+    if (!texture.has_value()) {
+        RX_LOG_ERROR("rx_graph: TransientPool::acquireStorageImage: StorageImage::create failed ({}x{}, "
+                     "format={}, mipLevels={}, arrayLayers={}, cube={})",
+                     extent.width, extent.height, static_cast<int>(format), mipLevels, arrayLayers, cube);
+        return std::nullopt;
+    }
+
+    PooledStorageImage entry;
+    entry.format = format;
+    entry.extent = extent;
+    entry.mipLevels = mipLevels;
+    entry.arrayLayers = arrayLayers;
+    entry.cube = cube;
+    entry.usage = usage;
+    entry.texture = std::move(*texture);
+    entry.lastFrameFinalStages = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    entry.lastFrameFinalAccess = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    entry.lastUsedFrame = currentFrame;
+
+    storageImages_.push_back(std::move(entry));
+    storageImageClaimedThisBatch_.push_back(true);
+    return static_cast<uint32_t>(storageImages_.size() - 1);
 }
 
 std::optional<uint32_t> TransientPool::acquireBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
@@ -164,6 +208,10 @@ void TransientPool::touchBuffer(uint32_t index, uint64_t currentFrame) {
     buffers_.at(index).lastUsedFrame = currentFrame;
 }
 
+void TransientPool::touchStorageImage(uint32_t index, uint64_t currentFrame) {
+    storageImages_.at(index).lastUsedFrame = currentFrame;
+}
+
 void TransientPool::sweepStale(uint64_t currentFrame, rx::rhi::DeletionQueue& deletionQueue) {
     for (PooledImage& entry : images_) {
         if (!entry.texture.has_value()) {
@@ -199,6 +247,17 @@ void TransientPool::sweepStale(uint64_t currentFrame, rx::rhi::DeletionQueue& de
             deletionQueue.retire([keepAlive] {}, entry.lastUsedFrame);
         }
     }
+    // [Task 2 (#38), gate ruling RC2] Same staleness rule as images_ above.
+    for (PooledStorageImage& entry : storageImages_) {
+        if (!entry.texture.has_value()) {
+            continue;
+        }
+        if (currentFrame - entry.lastUsedFrame >= kStaleAfterExecutes) {
+            auto keepAlive = std::make_shared<rx::rhi::StorageImage>(std::move(*entry.texture));
+            entry.texture.reset();
+            deletionQueue.retire([keepAlive] {}, entry.lastUsedFrame);
+        }
+    }
 }
 
 void TransientPool::retireAll(uint64_t currentFrame, rx::rhi::DeletionQueue& deletionQueue) {
@@ -216,6 +275,15 @@ void TransientPool::retireAll(uint64_t currentFrame, rx::rhi::DeletionQueue& del
         }
         auto keepAlive = std::make_shared<rx::rhi::Buffer>(std::move(*entry.buffer));
         entry.buffer.reset();
+        deletionQueue.retire([keepAlive] {}, currentFrame);
+    }
+    // [Task 2 (#38), gate ruling RC2]
+    for (PooledStorageImage& entry : storageImages_) {
+        if (!entry.texture.has_value()) {
+            continue;
+        }
+        auto keepAlive = std::make_shared<rx::rhi::StorageImage>(std::move(*entry.texture));
+        entry.texture.reset();
         deletionQueue.retire([keepAlive] {}, currentFrame);
     }
     // Phase 4 Task 1: pinned history entries are never touched by

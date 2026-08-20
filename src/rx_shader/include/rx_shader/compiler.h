@@ -36,6 +36,23 @@ struct CompileResult {
     // long as the IComponentType it came from is alive, and this is that
     // lifetime anchor. Null when `ok` is false.
     Slang::ComPtr<slang::IComponentType> linkedProgram;
+
+    // [Task 2 (#38), empirical finding] `compileImpl()`'s own
+    // `linkedProgram->getLayout(0, ...)` call (needed internally to map
+    // each entry point's stage -- see compiler.cpp) already computes this;
+    // stashed here so `rx::shader::reflect()` can reuse it INSTEAD OF
+    // calling `getLayout()` a second time on the same `linkedProgram`.
+    // Load-bearing, not just an optimization: a SECOND `getLayout()` call
+    // on a compute-only (single-entry-point) `linkedProgram` was found,
+    // empirically (gdb, this session), to crash inside this exact shipped
+    // Slang release's own `TargetProgram`/`CompilerOptionSet` machinery
+    // under realistic conditions (a process that has already initialized
+    // Vulkan/vk-bootstrap) -- reusing the first call's own result avoids
+    // the crash-prone re-entrant path entirely, for every caller, not a
+    // compute-specific workaround bolted onto reflect() alone. Valid for
+    // exactly as long as `linkedProgram` is alive (same lifetime anchor);
+    // null whenever `ok` is false (nothing was linked to call it on).
+    slang::ProgramLayout* cachedLayout = nullptr;
 };
 
 // Compiles Slang source (from a string or a file) to SPIR-V, in-process,

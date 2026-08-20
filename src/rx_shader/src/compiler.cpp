@@ -4,6 +4,7 @@
 
 #include <rx_core/log.h>
 
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -233,6 +234,10 @@ CompileResult compileImpl(slang::ISession* session,
     result.entryPointCode = std::move(blobs);
     if (result.ok) {
         result.linkedProgram = linked;
+        // See CompileResult::cachedLayout's own doc comment (compiler.h):
+        // reused by rx::shader::reflect() instead of a second getLayout()
+        // call on the same `linked` component.
+        result.cachedLayout = layout;
     }
 
     if (!diagnostics.empty()) {
@@ -290,19 +295,57 @@ std::optional<Compiler> Compiler::create() {
     // should never actually trigger against the pinned Slang version this
     // was verified against, but a future version bump changing capability
     // names is exactly the kind of drift [R:A6] this guards against.
+    std::array<slang::CompilerOptionEntry, 2> compilerOptionEntries{};
+    uint32_t compilerOptionEntryCount = 0;
+
     slang::CompilerOptionEntry capabilityEntry{};
     SlangCapabilityID spirvFloor = global->findCapability("spirv_1_3");
     if (spirvFloor != SLANG_CAPABILITY_UNKNOWN) {
         capabilityEntry.name = slang::CompilerOptionName::Capability;
         capabilityEntry.value.kind = slang::CompilerOptionValueKind::Int;
         capabilityEntry.value.intValue0 = static_cast<int32_t>(spirvFloor);
-        targetDesc.compilerOptionEntries = &capabilityEntry;
-        targetDesc.compilerOptionEntryCount = 1;
+        compilerOptionEntries[compilerOptionEntryCount++] = capabilityEntry;
     } else {
         RX_LOG_WARN(
             "rx_shader: Slang capability 'spirv_1_3' not found by this Slang build; "
             "compiling without an explicit SPIR-V version floor");
     }
+
+    // [Task 2 (#38), gate ruling RC2 -- empirical finding, not in the
+    // matrix's own "zero changes needed" text] `targetDesc.profile` above
+    // (the raw TargetDesc struct field) is NOT sufficient on its own to
+    // populate the per-target-request CompilerOptionSet
+    // Slang::TargetRequest::getTargetCaps() reads via
+    // Slang::CompilerOptionSet::getProfile() -- verified directly (gdb,
+    // this session): a compute-ONLY linked program's first-ever
+    // IComponentType::getLayout(0, ...) call (rx::shader::reflect()'s own
+    // entry point) crashes with SIGFPE, an unmasked integer divide-by-zero
+    // inside getProfile(), specifically when NO explicit
+    // CompilerOptionName::Profile entry was ALSO passed via
+    // compilerOptionEntries -- reproduced reliably (a real, deterministic
+    // crash under realistic conditions: a process that has already
+    // initialized Vulkan/vk-bootstrap, matching what every real compute
+    // consumer's own runtime environment looks like), NOT reproducible for
+    // a vertex+fragment-linked program under the exact same conditions
+    // (graphics reflection already implicitly ends up with a populated
+    // CompilerOptionSet through Slang's own multi-stage linking path;
+    // compute's single-entry-point link does not). Passing the SAME
+    // profile explicitly here, via the documented CompilerOptionName::
+    // Profile entry (slang.h: "intValue0: profile"), populates that
+    // CompilerOptionSet unconditionally for every target -- verified fixed
+    // against this exact repro (rx_rhi_vk/tests/compute_pipeline_test.cpp)
+    // both with and without a live Vulkan instance already created in the
+    // process. Harmless for the existing vertex+fragment path (an
+    // identical redundant restatement of the same profile
+    // targetDesc.profile already carries).
+    slang::CompilerOptionEntry profileEntry{};
+    profileEntry.name = slang::CompilerOptionName::Profile;
+    profileEntry.value.kind = slang::CompilerOptionValueKind::Int;
+    profileEntry.value.intValue0 = static_cast<int32_t>(targetDesc.profile);
+    compilerOptionEntries[compilerOptionEntryCount++] = profileEntry;
+
+    targetDesc.compilerOptionEntries = compilerOptionEntries.data();
+    targetDesc.compilerOptionEntryCount = compilerOptionEntryCount;
 
     slang::SessionDesc sessionDesc = {};
     sessionDesc.targets = &targetDesc;

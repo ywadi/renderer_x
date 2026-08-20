@@ -33,6 +33,14 @@ set_tests_properties(rx_graph_tests PROPERTIES TIMEOUT 120)
 add_executable(rx_graph_gpu_tests
     doctest_main_gpu.cpp
     test_execute_gpu.cpp
+    # [Task 2 (#38), gate rulings: per-ticket ruling + RC2] the compute-
+    # pipeline capability's own primary gate (real compute PSO + dispatch
+    # through the render graph's Compute-class pass machinery, storage
+    # buffer + storage image, bindless set 0, cube/array subresource
+    # addressing) -- joins this binary rather than a new one for the exact
+    # same reasons test_execute_gpu.cpp already does (real windowed Device,
+    # rx_shader in-process compilation).
+    test_compute_gpu.cpp
 )
 target_link_libraries(rx_graph_gpu_tests PRIVATE rx_graph rx_rhi_vk rx_platform rx_shader doctest::doctest)
 rx_shader_deploy_runtime_libs(rx_graph_gpu_tests)

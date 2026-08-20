@@ -217,3 +217,62 @@ TEST_CASE("reflect() reports elementStride for storage-buffer bindings (Structur
     CHECK(readBuffer->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
     CHECK(readBuffer->elementStride == 80);
 }
+
+// [Task 2 (#38), gate ruling RC2, matrix row 2's binding acceptance
+// criterion: "a compute module declaring one RWStructuredBuffer<uint> and
+// one RWTexture2D<float4> global reflects both correctly (types,
+// set/binding, stage flags incl. VK_SHADER_STAGE_COMPUTE_BIT) via the
+// EXISTING reflect() path unmodified"] Also the regression coverage for a
+// REAL crash this ticket's own work found and fixed: a compute-only
+// linked program's reflect() call used to crash inside a process that had
+// already initialized Vulkan/vk-bootstrap (see CompileResult::cachedLayout's
+// own doc comment, compiler.h, and rx_rhi_vk/tests/compute_pipeline_test.cpp
+// for the device-backed half of this regression's coverage) -- this
+// specific TEST_CASE, run standalone (no Vulkan Context anywhere in this
+// binary), never itself exercised that failure mode, but is kept exactly
+// as the matrix's own row 2 asks: proof the EXISTING reflect() path needs
+// no compute-specific code of its own, only the shared cachedLayout fix
+// every caller (graphics included) now benefits from.
+TEST_CASE("reflect() reports exact set/binding/type/stage for a compute module's RWStructuredBuffer + RWTexture2D") {
+    const char* src = R"(
+        [[vk::binding(0, 0)]]
+        RWStructuredBuffer<uint> gOutBuffer;
+
+        [[vk::binding(1, 0)]]
+        RWTexture2D<float4> gOutImage;
+
+        [shader("compute")]
+        [numthreads(8, 8, 1)]
+        void csMain(uint3 id : SV_DispatchThreadID)
+        {
+            gOutBuffer[id.x] = id.x;
+            gOutImage[id.xy] = float4(1, 1, 1, 1);
+        }
+    )";
+
+    auto compiler = rx::shader::Compiler::create();
+    REQUIRE(compiler.has_value());
+
+    rx::shader::CompileResult compileResult = compiler->compileFromSource("ComputeLayoutModule", src, {"csMain"});
+    INFO("diagnostics: " << compileResult.diagnostics);
+    REQUIRE(compileResult.ok);
+    REQUIRE(compileResult.entryPointCode.size() == 1);
+    CHECK(compileResult.entryPointCode[0].stage == VK_SHADER_STAGE_COMPUTE_BIT);
+
+    auto layout = rx::shader::reflect(compileResult);
+    REQUIRE(layout.has_value());
+    REQUIRE(layout->bindings.size() == 2);
+
+    const auto* outBuffer = findBinding(*layout, /*set=*/0, /*binding=*/0);
+    REQUIRE(outBuffer != nullptr);
+    CHECK(outBuffer->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+    CHECK(outBuffer->count == 1);
+    CHECK(outBuffer->stages == VK_SHADER_STAGE_COMPUTE_BIT);
+    CHECK(outBuffer->elementStride == 4);  // uint
+
+    const auto* outImage = findBinding(*layout, /*set=*/0, /*binding=*/1);
+    REQUIRE(outImage != nullptr);
+    CHECK(outImage->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+    CHECK(outImage->count == 1);
+    CHECK(outImage->stages == VK_SHADER_STAGE_COMPUTE_BIT);
+}

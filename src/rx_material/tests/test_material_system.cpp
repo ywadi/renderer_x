@@ -1518,3 +1518,54 @@ TEST_CASE("MaterialSystem::createTexture2D rejects zero width/height and null/em
 
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
+
+// [Task 2 (#38), gate rulings: per-ticket ruling "getPipeline's
+// attachment-free rejection unchanged"; matrix row 11] Closes a
+// pre-existing test-coverage gap this gate's own research found (not
+// introduced by this ticket): getPipeline() has ALWAYS thrown for a
+// PassSignature with neither a color nor a depth attachment
+// (material_system.cpp, "[Task 5 ambiguity resolution] no Phase 3 use case
+// for a graphics pipeline with neither a color nor a depth attachment"),
+// but no existing test exercised that exact degenerate case -- every
+// PassSignature construction across this whole test suite sets
+// colorCount >= 1. Task 2's own compute-pipeline facility
+// (rx::rhi::ComputePipelineCache, rx_rhi_vk) is what actually makes an
+// attachment-free (Compute-class) render-graph pass executable end to end
+// now -- via a parallel path that never reaches MaterialSystem::
+// getPipeline() at all (see rx_graph/tests/test_compute_gpu.cpp) -- so this
+// rejection is preserved BYTE-IDENTICAL, not weakened: a graphics pipeline
+// genuinely still has no valid use with zero attachments, independent of
+// compute's own new, separate facility.
+TEST_CASE("MaterialSystem::getPipeline rejects a PassSignature with neither a color nor a depth attachment") {
+    auto fixture = makeFixture("rx_material_attachment_free_rejection");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto system = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+                                                          freshCachePath("attachment_free_rejection"));
+    REQUIRE(system != nullptr);
+
+    rx::material::MaterialHandle handle = system->loadMaterial(testDataPath("test_unlit.slang"));
+
+    rx::material::PipelineRequest request;
+    request.material = handle;
+    // Default-constructed PassSignature: colorCount == 0, depthFormat ==
+    // VK_FORMAT_UNDEFINED -- the exact degenerate "bare pass" shape a
+    // Compute-class render-graph pass's own PassContext::passSignature()
+    // reports (executor.h's own doc comment), and the one getPipeline()
+    // has always rejected.
+    request.pass = rx::graph::PassSignature{};
+
+    bool threw = false;
+    try {
+        static_cast<void>(system->getPipeline(request));
+    } catch (const std::runtime_error& e) {
+        threw = true;
+        const std::string what = e.what();
+        CHECK(what.find("no color") != std::string::npos);
+    }
+    CHECK(threw);
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}

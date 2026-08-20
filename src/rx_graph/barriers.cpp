@@ -171,10 +171,27 @@ std::optional<BarrierTransition> applyAccess(ResourceBarrierState& state, bool i
 
 namespace {
 
-// One pass's declared accesses, merged per physical resource. Almost
-// always a 1:1 pass with a single ResourceAccess per resource; the merge
-// only does real work for Task 2's ambiguity resolution "a resource both
-// read and written by the same pass (e.g. depth output also declared
+// [Task 2, gate ruling RC2] The unit buildBarriers() now tracks ONE
+// detail::ResourceBarrierState per, not one per physical resource -- see
+// this file's own "subresource overlap validation" comment in
+// render_graph.cpp for why identical-or-disjoint declared ranges are what
+// makes independent per-key tracking correct. Every resource that predates
+// this task resolves every one of its accesses to the exact same single
+// Subresource (its whole, single-mip/single-layer shape -- see
+// resources.h's ResourceAccess::subresource comment), so it still gets
+// exactly one ResourceKey, byte-identical in effect to this file's former
+// physicalIndex-only keying.
+struct ResourceKey {
+    uint32_t physicalIndex;
+    Subresource subresource;
+
+    bool operator==(const ResourceKey&) const = default;
+};
+
+// One pass's declared accesses, merged per (physical resource, subresource)
+// key. Almost always a 1:1 pass with a single ResourceAccess per key; the
+// merge only does real work for Task 2's ambiguity resolution "a resource
+// both read and written by the same pass (e.g. depth output also declared
 // sampled -- invalid combination) -- ... derive barriers from the union
 // access at that pass; do not add new validation in this task": stages
 // and access simply union, and a write's layout wins over a read's when a
@@ -187,13 +204,13 @@ struct CombinedAccess {
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
 };
 
-std::vector<std::pair<uint32_t, CombinedAccess>> combineByResource(std::span<const ResourceAccess> accesses) {
-    std::vector<std::pair<uint32_t, CombinedAccess>> combined;
+std::vector<std::pair<ResourceKey, CombinedAccess>> combineByResource(std::span<const ResourceAccess> accesses) {
+    std::vector<std::pair<ResourceKey, CombinedAccess>> combined;
     for (const ResourceAccess& access : accesses) {
-        auto it = std::find_if(combined.begin(), combined.end(),
-                                [&](const auto& entry) { return entry.first == access.physicalIndex; });
+        const ResourceKey key{access.physicalIndex, access.subresource};
+        auto it = std::find_if(combined.begin(), combined.end(), [&](const auto& entry) { return entry.first == key; });
         if (it == combined.end()) {
-            combined.push_back({access.physicalIndex, CombinedAccess{access.stages, access.access, access.layout}});
+            combined.push_back({key, CombinedAccess{access.stages, access.access, access.layout}});
             continue;
         }
         it->second.stages |= access.stages;
@@ -209,27 +226,44 @@ std::vector<std::pair<uint32_t, CombinedAccess>> combineByResource(std::span<con
 
 std::vector<PassBarriers> buildBarriers(const CompiledGraph& graph, PassBarriers& outFinalBarriers) {
     const std::span<const PhysicalResource> resources = graph.resources();
-    std::vector<detail::ResourceBarrierState> state(resources.size());  // per-frame: starts empty [Task 2 brief D4]
+
+    // [Task 2, RC2] Grown dynamically, keyed by (physicalIndex,
+    // subresource) -- a linear scan is plenty at the tens-of-entries scale
+    // a real compiled graph has (the same "plainest correct structure"
+    // precedent this file's own sibling TransientPool::pinned_ already
+    // follows, transient_pool.h). Per-frame: starts empty [Task 2 brief D4].
+    std::vector<std::pair<ResourceKey, detail::ResourceBarrierState>> state;
+    auto stateFor = [&state](const ResourceKey& key) -> detail::ResourceBarrierState& {
+        for (auto& entry : state) {
+            if (entry.first == key) {
+                return entry.second;
+            }
+        }
+        state.push_back({key, detail::ResourceBarrierState{}});
+        return state.back().second;
+    };
 
     const std::span<const uint32_t> order = graph.executionOrder();
     std::vector<PassBarriers> result(order.size());
 
     for (size_t pos = 0; pos < order.size(); ++pos) {
         PassBarriers& passBarriers = result[pos];
-        for (const auto& [physicalIndex, combined] : combineByResource(graph.passAccesses(order[pos]))) {
-            const PhysicalResource& resource = resources[physicalIndex];
-            std::optional<detail::BarrierTransition> transition = detail::applyAccess(
-                state[physicalIndex], resource.isBuffer, combined.stages, combined.access, combined.layout);
+        for (const auto& [key, combined] : combineByResource(graph.passAccesses(order[pos]))) {
+            const PhysicalResource& resource = resources[key.physicalIndex];
+            detail::ResourceBarrierState& s = stateFor(key);
+            std::optional<detail::BarrierTransition> transition =
+                detail::applyAccess(s, resource.isBuffer, combined.stages, combined.access, combined.layout);
             if (!transition) {
                 continue;
             }
             if (resource.isBuffer) {
-                passBarriers.bufferBarriers.push_back(BufferBarrier{
-                    physicalIndex, transition->srcStage, transition->srcAccess, transition->dstStage, transition->dstAccess});
+                passBarriers.bufferBarriers.push_back(BufferBarrier{key.physicalIndex, transition->srcStage,
+                                                                      transition->srcAccess, transition->dstStage,
+                                                                      transition->dstAccess});
             } else {
-                passBarriers.imageBarriers.push_back(ImageBarrier{physicalIndex, transition->srcStage, transition->srcAccess,
-                                                                    transition->dstStage, transition->dstAccess,
-                                                                    transition->oldLayout, transition->newLayout});
+                passBarriers.imageBarriers.push_back(ImageBarrier{
+                    key.physicalIndex, transition->srcStage, transition->srcAccess, transition->dstStage,
+                    transition->dstAccess, transition->oldLayout, transition->newLayout, key.subresource});
             }
         }
     }
@@ -238,15 +272,20 @@ std::vector<PassBarriers> buildBarriers(const CompiledGraph& graph, PassBarriers
     // src = its last write's (stage, access) [Task 2 brief ambiguity
     // resolution]. That is exactly the resource's pendingFlush at the end
     // of the walk: nothing reads the backbuffer after its final writer
-    // runs, so nothing ever resolves/clears it first.
+    // runs, so nothing ever resolves/clears it first. The backbuffer is
+    // always established via addColorOutput()/setDepthStencilOutput()
+    // (never addStorageImageOutput()), so it is always single-mip/
+    // single-layer -- every one of its accesses resolved to the same one
+    // Subresource{0, 1, 0, 1} key throughout the walk above [Task 2, RC2].
     for (uint32_t i = 0; i < resources.size(); ++i) {
         if (!resources[i].isBackbuffer) {
             continue;
         }
-        const detail::ResourceBarrierState& s = state[i];
+        const ResourceKey key{i, Subresource{0, 1, 0, 1}};
+        const detail::ResourceBarrierState& s = stateFor(key);
         outFinalBarriers.imageBarriers.push_back(ImageBarrier{i, s.lastWriteStages, s.pendingFlushAccess,
                                                                 VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE, s.currentLayout,
-                                                                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR});
+                                                                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, key.subresource});
         break;
     }
 

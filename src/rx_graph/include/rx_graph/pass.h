@@ -62,7 +62,18 @@ public:
     // Declares a sampled read of a resource some earlier-established pass
     // wrote as an attachment. `name` must already have a writer somewhere
     // in the graph -- see RenderGraph::compile()'s validation.
-    Pass& addTextureInput(std::string_view name);
+    //
+    // [Task 2, gate ruling RC2] `subresource` narrows this read to a
+    // sub-range of `name`'s real mip/array shape (default: the whole
+    // resource, sampling every mip/layer -- BYTE-IDENTICAL to this
+    // parameter's absence before this task, since every resource an
+    // addColorOutput()/setDepthStencilOutput()/setHistoryOutput() pass can
+    // establish stays single-mip/single-layer regardless). Meaningful
+    // narrowing only applies to a `name` some pass established via
+    // addStorageImageOutput() with more than one mip/layer -- e.g. a
+    // downstream pass sampling one specific face of a cube storage image a
+    // compute pass wrote earlier in the same graph.
+    Pass& addTextureInput(std::string_view name, Subresource subresource = {});
 
     // Phase 4 Task 1: declares a sampled read of history resource `name`'s
     // PREVIOUS FRAME's contents -- NOT this frame's own setHistoryOutput()
@@ -145,6 +156,32 @@ public:
     // Declares a storage buffer read of a resource some earlier-established
     // pass wrote via addStorageBufferOutput.
     Pass& addStorageBufferInput(std::string_view name);
+
+    // [Task 2, gate ruling RC2 + per-ticket ruling "storage-image API
+    // mirrors StorageBuffer shapes"] Declares a storage IMAGE (UAV) this
+    // pass writes -- read-write, exactly like addStorageBufferOutput()'s
+    // own SHADER_STORAGE_WRITE + SHADER_STORAGE_READ access (see
+    // Pass::resolveAccess). The first pass to declare a given `name` as any
+    // kind of output establishes it -- same one-name-one-PhysicalResource
+    // rule addColorOutput()/addStorageBufferOutput() already follow -- with
+    // `desc` giving its format/size/mip/array/cube shape (ImageDesc,
+    // resources.h) and `subresource` narrowing THIS declaration's own
+    // access to a sub-range of it (default: the whole resource -- see
+    // Subresource's own comment). A resource's real mipLevels/arrayLayers/
+    // cube come from whichever declaration FIRST establishes it; a later
+    // addStorageImageOutput()/addStorageImageInput() declaration of the
+    // SAME name only ever narrows `subresource`, never redeclares `desc`'s
+    // shape (compile() ignores `desc` on every declaration after the
+    // first -- see render_graph.cpp).
+    //
+    // Always resolves to VK_IMAGE_LAYOUT_GENERAL (the only legal generic
+    // UAV layout) -- see Pass::resolveAccess's own StorageImageOutput row.
+    Pass& addStorageImageOutput(std::string_view name, const ImageDesc& desc, Subresource subresource = {});
+
+    // Declares a storage image read of a resource some earlier-established
+    // pass wrote via addStorageImageOutput. `subresource` narrows this
+    // read to a sub-range of the resource (default: the whole resource).
+    Pass& addStorageImageInput(std::string_view name, Subresource subresource = {});
 
     // Exempts this pass from culling: RenderGraph::compile() keeps it (and
     // everything it transitively depends on) even if nothing reads any
@@ -302,6 +339,11 @@ private:
         // against -- no ordering significance beyond that.
         HistoryInput,
         HistoryOutput,
+        // [Task 2, gate ruling RC2] See addStorageImageOutput()/
+        // addStorageImageInput() above. Listed last for the same
+        // diff-friendliness reason HistoryInput/HistoryOutput are.
+        StorageImageOutput,
+        StorageImageInput,
     };
 
     struct Declaration {
@@ -309,6 +351,11 @@ private:
         std::string resourceName;
         AttachmentDesc attachment;  // meaningful for ColorOutput/DepthStencilOutput/HistoryOutput
         BufferDesc buffer;          // meaningful for StorageBufferOutput
+        ImageDesc image;            // [Task 2, RC2] meaningful for StorageImageOutput
+        // [Task 2, RC2] meaningful for TextureInput/StorageImageOutput/
+        // StorageImageInput; default-constructed ("the whole resource") for
+        // every other kind.
+        Subresource subresource;
     };
 
     Pass(std::string name, QueueClass queue);
