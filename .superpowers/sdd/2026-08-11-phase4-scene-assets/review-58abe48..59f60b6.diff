@@ -1,0 +1,1476 @@
+# Review package: 58abe48..59f60b6
+
+## Commits
+59f60b6 fix(samples): Sponza texture-to-mesh misassignment + fly-camera W/S inversion
+
+## Files changed
+ .../sponza-after-default.png                       | Bin 0 -> 95102 bytes
+ .../sponza-after-interior.png                      | Bin 0 -> 225762 bytes
+ .../sponza-before-default.png                      | Bin 0 -> 115443 bytes
+ .../sponza-before-interior.png                     | Bin 0 -> 295856 bytes
+ .../sponza-gt-default.png                          | Bin 0 -> 62464 bytes
+ .../sponza-gt-interior.png                         | Bin 0 -> 285478 bytes
+ .../sponza-visual-investigation.md                 | 451 +++++++++++++++++++++
+ samples/09_scene/draw_recording.cpp                |  19 +
+ samples/09_scene/draw_recording.h                  |  24 ++
+ samples/09_scene/fly_camera.h                      |  77 ++++
+ samples/09_scene/main.cpp                          | 152 ++++---
+ samples/09_scene/tests/CMakeLists.txt              |   5 +-
+ samples/09_scene/tests/test_draw_recording.cpp     |  56 +++
+ samples/09_scene/tests/test_fly_camera.cpp         | 133 ++++++
+ 14 files changed, 852 insertions(+), 65 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-after-default.png b/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-after-default.png
+new file mode 100644
+index 0000000..3e17a31
+Binary files /dev/null and b/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-after-default.png differ
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-after-interior.png b/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-after-interior.png
+new file mode 100644
+index 0000000..e1d88e7
+Binary files /dev/null and b/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-after-interior.png differ
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-before-default.png b/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-before-default.png
+new file mode 100644
+index 0000000..1e629c6
+Binary files /dev/null and b/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-before-default.png differ
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-before-interior.png b/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-before-interior.png
+new file mode 100644
+index 0000000..76cf1e0
+Binary files /dev/null and b/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-before-interior.png differ
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-gt-default.png b/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-gt-default.png
+new file mode 100644
+index 0000000..4704a84
+Binary files /dev/null and b/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-gt-default.png differ
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-gt-interior.png b/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-gt-interior.png
+new file mode 100644
+index 0000000..10e119a
+Binary files /dev/null and b/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-gt-interior.png differ
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-visual-investigation.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-visual-investigation.md
+new file mode 100644
+index 0000000..cea844c
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-visual-investigation.md
+@@ -0,0 +1,451 @@
++# Sponza visual-defect investigation (P1, native-Windows-first-run report)
++
++**Status: BOTH items root-caused, fixed, and empirically proven on the REAL
++NVIDIA driver. Neither defect is Windows-specific** — both reproduce
++byte-for-byte on this machine's real `nvidia_icd.json` ICD (GeForce RTX
++2080), independent of Wine/lavapipe/llvmpipe. The fixes are expected to
++resolve both reported symptoms on the user's native-Windows machine as-is;
++see §5 for the one item that genuinely cannot be verified without native
++Windows access, characterized as precisely as possible instead of guessed
++at.
++
++Base commit for this investigation: `e02955a` (tree clean except the two
++pre-existing untracked SDD files noted in the task brief, not touched here).
++
++## 1. Item 1 — W/S fly-camera inversion
++
++### 1.1 Root cause
++
++`samples/09_scene/main.cpp`'s `updateFlyCamera()` (pre-fix):
++
++```cpp
++if (window.isKeyDown(SDL_SCANCODE_W)) forward += 1.0F;
++if (window.isKeyDown(SDL_SCANCODE_S)) forward -= 1.0F;
++...
++const glm::vec3 localDelta(strafe, vertical, -forward);  // forward() is -Z in this camera's own convention.
++```
++
++`rx_scene/camera.h`'s `Camera::forward()` is `orientation * (0,0,-1)` — it
++**already** encodes the "local -Z is forward" convention as part of
++computing the camera's real, current-orientation world-space forward
++vector. `FlyCamera::moveLocal()` (also `main.cpp`, pre-fix) does
++`position += right()*x + up()*y + forward()*z` — a WORLD-space displacement
++built directly from the camera's own basis vectors, where `localDelta.z` is
++already "how far along the camera's real forward direction," full stop. The
++`-forward` in the line above is a **second, redundant negation** of a sign
++already baked into `forward()` itself — it silently cancels forward travel
++into backward travel. Since keyboard (`forward += 1` on W) and gamepad
++(`forward += -pad.leftStick.y`, already correctly normalized to the same
++"W-shaped" convention) both feed the SAME `forward` accumulator through this
++ONE line, **the bug affects W/S AND gamepad forward/back identically** — a
++single fix covers both input devices.
++
++A/D (strafe), mouse look (yaw sign `yawRadians -= dxRadians`, pitch sign
++`pitchRadians -= dyRadians`), and gamepad look were all independently
++derived and checked (§1.3) — none were inverted. Only the forward axis was
++affected.
++
++### 1.2 Fix
++
++Extracted `FlyCamera` (unchanged) and a NEW pure function into a new header,
++`samples/09_scene/fly_camera.h` (mirrors this sample's own established
++precedent, `draw_recording.h`, for pulling device-free logic out of
++`main.cpp` into something unit-testable):
++
++```cpp
++[[nodiscard]] inline glm::vec3 flyCameraLocalMoveDelta(float forward, float strafe, float vertical) {
++    return glm::vec3(strafe, vertical, forward);   // NOT negated.
++}
++```
++
++`updateFlyCamera()` now calls
++`rx::samples9::flyCameraLocalMoveDelta(forward, strafe, vertical)` instead
++of constructing the vector inline. `main.cpp` gained `using
++rx::samples9::FlyCamera;` in place of its old inline struct definition.
++
++### 1.3 Discriminating tests (new, committed)
++
++`samples/09_scene/tests/test_fly_camera.cpp` — 9 new `TEST_CASE`s (14
++total in `sample_09_scene_tests`, 42 assertions), driving the REAL
++production `flyCameraLocalMoveDelta()` + `FlyCamera::moveLocal()`/
++`applyLookDelta()`, not a re-implementation:
++
++- W (`forward=+1`) displaces the camera along its OWN `camera.forward()` —
++  the regression case.
++- S (`forward=-1`) displaces opposite `camera.forward()`.
++- W after a non-trivial yaw+pitch rotation still matches `camera.forward()`
++  — proves the invariant generally, not only at identity orientation.
++- D/A (`strafe=±1`) displace along `camera.right()`/opposite.
++- Space/LCtrl (`vertical=±1`) displace along `camera.up()`/opposite.
++- Gamepad left-stick forward accumulator (`forward = -stick.y`) resolves
++  through the SAME shared mapping as keyboard W — proves the fix covers
++  gamepad move too, since `updateFlyCamera()` feeds both devices into one
++  `forward` accumulator before this function ever runs.
++- Mouse-look sense: `dx>0` (mouse right) turns the camera toward its own
++  pre-turn `right()`; `dy<0` (mouse up, SDL's y-down relative-motion
++  convention) tilts the camera to look upward (`forward().y > 0`).
++- A structural axis-assignment check on `flyCameraLocalMoveDelta()` itself.
++
++### 1.4 Revert-proof (empirical, not asserted)
++
++Reintroduced the historical bug in-place (`fly_camera.h`,
++`glm::vec3(strafe, vertical, -forward)`), rebuilt, reran:
++
++```
++[doctest] test cases: 14 |  9 passed | 5 failed | 0 skipped
++[doctest] assertions: 42 | 34 passed | 8 failed |
++```
++
++The 5 failures were EXACTLY the forward-axis cases (W, S, W-after-rotation,
++gamepad-forward, axis-assignment) — A/D, Space/Ctrl, and both mouse-look
++cases stayed green, confirming those axes were never broken and the test
++suite is discriminating, not just noisy. Concrete before/after positional
++log for W (`forward=+1`, distance 5, identity orientation —
++`camera.forward() == (0,0,-1)`):
++
++| | `disp` (world-space) | `dot(normalize(disp), camera.forward())` |
++|---|---|---|
++| **Buggy** (`-forward`) | `(0, 0, +5)` | `-1.0` (moves AWAY from where the camera looks) |
++| **Fixed** (`forward`) | `(0, 0, -5)` | `+1.0` (moves WITH the camera's look direction) |
++
++Restored the fix, rebuilt, reran: `14/14 passed, 42/42 assertions` again.
++
++## 2. Item 2 — Sponza texture-to-mesh misassignment
++
++### 2.1 Root cause: pipeline-identity used as a material-identity proxy
++
++`samples/09_scene/main.cpp`'s forward-pass recorder
++(`recordForwardChunk()`) selected the **material-params descriptor set**
++(set 1: texture indices, factors, samplers) via a
++`pipelineToken -> MaterialGpuBinding*` map
++(`App::pipelineTokenToBinding`, built by the old `buildPipelineTokenMap()`),
++where `pipelineToken` is `bit_cast<uint64_t>(VkPipeline)`.
++
++`MaterialSystem::getPipeline()`'s own cache key
++(`src/rx_material/material_system.cpp:677-685`, `struct PipelineKey`) is:
++
++```cpp
++struct PipelineKey {
++    uint64_t moduleHash;       // the .slang module's own content hash
++    uint64_t passHash;
++    uint32_t specializationBits;
++    AlphaMode alphaMode;       // [D28] fixed-function state
++    bool doubleSided;          // [D28] fixed-function state
++};
++```
++
++**It never depends on which textures a material references.** Sponza's own
++committed glTF (`assets/fetched/Sponza/glTF/Sponza.gltf`, 25 materials, 1
++mesh/25 submeshes) has **22 of its 25 materials sharing the exact same
++fixed-function state** — `(StandardPBR, OPAQUE, single-sided)` — confirmed
++directly against the real asset:
++
++```
++(MASK, doubleSided=True)  -> 3 materials: [0, 3, 20]
++(OPAQUE, doubleSided=False) -> 22 materials: [1, 2, 4, 5, 6, 7, 8, 9, 10, 11,
++                                               12, 13, 14, 15, 16, 17, 18, 19,
++                                               21, 22, 23, 24]
++```
++
++All 22 load the same `standard_pbr.slang` module (same `moduleHash`) at the
++same pass — so `MaterialSystem::getPipeline()` legitimately returns the
++**same single `VkPipeline`** for all 22 (a real, correct pipeline-caching
++optimization; not itself a bug). `buildPipelineTokenMap()`'s loop, run once
++per material in glTF import order (0→24), wrote its map entry for that
++shared token 22 times — **last write wins**: material index 24 (the last
++of the 22, in import order). Confirmed via a Blender face/material-slot
++analysis of the real imported mesh: material slot 24 spans the **entire
++building footprint** (`bbox_x=[-15.37,14.40] bbox_y=[-8.84,9.46]`) with a
++thin vertical extent (`dz=1.19`) near the top of the building — the **roof**
++material. At draw-record time, `recordForwardChunk()` bound material 24's
++own descriptor set (its own baseColor/normal/metallicRoughness texture
++indices) for EVERY draw group whose resolved pipeline token matched that
++shared token — i.e., for every one of the other 21 opaque single-sided
++materials (columns, walls, arches, floor, vaulted ceiling) too. Every one of
++those surfaces sampled the ROOF's own tile texture. **Reproducible on any
++driver** — this is a CPU-side descriptor-binding logic error, not a
++lighting, shader, or driver artifact.
++
++### 2.2 The fix
++
++Decoupled "which `VkPipeline` to bind" (still legitimately keyed by
++`pipelineToken` — a real, cheap, valid state-sort optimization: many
++consecutive draw spans DO share one pipeline) from "which material-params
++descriptor set to bind" (now keyed by the REAL per-draw `materialIndex`):
++
++- New `rx::samples9::materialIndexForSpan()`
++  (`samples/09_scene/draw_recording.{h,cpp}`) recovers the exact
++  `DrawPayload::materialIndex` a `RecordSpan` was built from, by reading
++  `payloads[commands[span.commandOffset].firstInstance].materialIndex` —
++  exact, not a heuristic: D26.1 already guarantees `DrawCommand::firstInstance`
++  addresses `payloads[]` directly, and `resolveDrawGroups()`'s own
++  materialIndex-ADJACENCY scan guarantees one `RecordSpan` never spans two
++  different materialIndex runs (subdividing a group only ever shrinks it).
++- New `App::resolveMaterialIndexToBinding` (a `materialIndex ->
++  MaterialGpuBinding*` resolver), populated at each of the 3 setup sites
++  (grid/stress/custom-import), sibling to the existing
++  `resolveMaterialIndexToHandle`.
++- `recordForwardChunk()`'s bind loop now tracks pipeline-rebind and
++  material-rebind INDEPENDENTLY (`lastToken`/`havePipeline` vs.
++  `lastMaterialIndex`/`haveMaterial`) — the descriptor set is re-selected
++  whenever the real `materialIndex` changes, even across two spans sharing
++  one `pipelineToken`.
++- The now-fully-dead `App::pipelineTokenToBinding` map is removed;
++  `buildPipelineTokenMap()` is renamed `warmMaterialPipelines()`, keeping
++  its still-legitimate job (pre-warming `MaterialSystem`'s pipeline cache +
++  caching `cachedAnyMaterialLayout`).
++
++### 2.3 Ground truth (Blender 5.1.2, headless `--background --python`)
++
++No live Blender GUI/MCP session was connected in this environment, so the
++ground-truth render used the equivalent standalone `blender --background
++--python <script>` path (same asset, same intent as the helmet
++investigation's own Blender-ground-truth precedent). Imported the REAL
++committed `assets/fetched/Sponza/glTF/Sponza.gltf` (byte-identical to what
++`sample_09_scene` itself loads), flat/neutral lighting (uniform gray world
++ambient + one soft sun), EEVEE. Camera pose computed **exactly** from the
++engine's own deterministic startup-framing formula
++(`populateImportedInstances()`, `samples/09_scene/main.cpp`) against the
++asset's real accessor bounds (after its node's 0.008 uniform scale):
++position `(-0.484, 12.631, 29.367)`, pitch `-14.04°`, yaw `0°`, vertical FOV
++`60°`, aspect `1280:720` — the SAME numbers `sample_09_scene` itself would
++compute at startup for this exact asset.
++
++### 2.4 Real-NVIDIA before/after (side by side)
++
++Real hardware: **NVIDIA GeForce RTX 2080**, driver 580.82.07, `VK_ICD_FILENAMES`
++explicitly forced to `/usr/share/vulkan/icd.d/nvidia_icd.json` (this
++machine also has lavapipe registered, so the ICD is named explicitly rather
++than left to loader default). "Before" is a literal `git worktree` built at
++`e02955a` (real HEAD before this fix, unmodified except a temporary,
++identically-applied `RX_DEBUG_CAMERA_POSE` screenshot-diagnostic hook — see
++§2.5 — fully reverted from the real working tree before commit, confirmed
++via `git diff` showing zero trace of it). "After" is the fixed working
++tree, same real driver, same poses. `--present --scene sponza --validate`
++in both cases; zero unfiltered Vulkan validation errors in either.
++
++**Default startup pose** (roof vs. wall — the whole building envelope from
++outside):
++
++| Ground truth (Blender) | Before (buggy) | After (fixed) |
++|---|---|---|
++| ![gt](sponza-gt-default.png) | ![before](sponza-before-default.png) | ![after](sponza-after-default.png) |
++
++Ground truth and the fixed build both show the roof's tile texture ONLY on
++the roof, with a DIFFERENT, correct stone-wall texture below it. The buggy
++build shows the SAME tile texture blanketing the roof AND every wall face —
++the entire building envelope rendered in one material's texture.
++
++**Interior atrium pose** (arches/columns/banners — matches the user's own
++"column shafts and arches" description directly):
++
++| Ground truth (Blender) | Before (buggy) | After (fixed) |
++|---|---|---|
++| ![gt](sponza-gt-interior.png) | ![before](sponza-before-interior.png) | ![after](sponza-after-interior.png) |
++
++This is the clearest reproduction of the reported symptom: the buggy build
++shows the SAME dark, repetitive roof-tile pattern smeared across the vaulted
++ceiling, arches, and columns — "tile/roof-like textures... on column shafts
++and arches, everything dark... heavy noisy aliasing," verbatim. The fixed
++build shows correct, distinct stone arches, banners, the lion medallion, and
++floor, closely matching the Blender ground truth's material layout.
++
++### 2.5 Methodology note: reproducible pose capture
++
++`--write-references` (the sample's existing headless PNG-dump escape hatch)
++only exists in `runHeadless()`, which never accepts `--scene` at all
++(headless mode is hardcoded to the DamagedHelmet grid/`--stress`). Real
++Sponza rendering only happens through `runPresent()` (a real window/
++swapchain), so frames were captured via a real X11 session already running
++on this machine (`DISPLAY=:1`) and ImageMagick's `import -window <id>`.
++Sponza's own auto-framed startup pose (`populateImportedInstances()`) is
++already fully deterministic (computed from the scene's own AABB, no input
++needed) and was used directly for the default-pose comparison. For the
++interior atrium pose specifically, a TEMPORARY, diagnostic-only
++`RX_DEBUG_CAMERA_POSE="x,y,z,yawDeg,pitchDeg"` environment-variable
++override was added identically to BOTH the before (worktree) and after
++(working-tree) builds — parsed once, right after camera auto-framing,
++applied only when the env var is set. This was used purely to reach an
++exact, reproducible, independently-computable pose (matching a Blender
++camera placed via the identical world-space coordinates) for the
++screenshot comparison; it was fully reverted from the real working tree
++before commit (confirmed via `git diff --stat` showing zero trace) and
++never shipped.
++
++### 2.6 Quantifying "wrong texture" vs. "missing-mips aliasing" (D10)
++
++The stb (PNG/JPG) texture-decode path uploads mip 0 only — a pre-existing,
++already-recorded D10 limitation (`decodeStbForUpload()`,
++`src/rx_asset/texture_decode.cpp`), logged explicitly on every Sponza
++texture load. This is a REAL, separate contributor to "noisy" appearance at
++distance/oblique angles, distinct from the assignment bug above.
++
++The interior-atrium comparison (§2.4) isolates this cleanly: at that
++walking-distance, near-flat-on view, BOTH the Blender ground truth and the
++fixed engine build show clean, non-shimmering wall/floor/arch texture
++content, with matching material identity — i.e., at a range where
++minification aliasing is negligible, **the texture on the surface is the
++correct one**. The outdoor establishing shot (whole building facade, more
++oblique/distant) is a more plausible surface for the D10 aliasing artifact
++to actually show, but that is now an orthogonal, secondary concern —
++assignment correctness and mip-aliasing are cleanly separated by this
++evidence, matching the task's own request.
++
++### 2.7 D10 disposition: options, not a silent choice
++
++Per this project's "no deferred fixes" policy, D10 becoming user-visible in
++a shipped sample would normally close in-round — but the two concrete paths
++to closing it both carry real costs or a real blocker, assessed below
++rather than picked silently:
++
++**Option A — runtime mip-chain generation for the stb decode path.**
++Investigated the actual blast radius: `TextureCache::applyDecodeResult()`
++(`src/rx_asset/texture_cache.cpp`) is ALREADY fully generic over
++`TextureDecodeResult::levels.size()` — the exact same upload/registration
++path the KTX2 decode path already uses for its own (offline-authored) mip
++chains. The sampler cache already requests `VK_LOD_CLAMP_NONE`
++(full-chain trilinear) for any glTF `minFilter` naming `MIPMAP`
++(`getOrCreateSampler()`), and Sponza's own glTF sampler IS one of those
++(`minFilter=9987`, `LINEAR_MIPMAP_LINEAR`). So the ONLY missing piece is
++generating the mip levels themselves inside `decodeStbForUpload()` — smaller
++in scope than initially expected, but not free:
++  - Correctness: box-averaging must happen in LINEAR space for sRGB-role
++    textures (baseColor/emissive) to avoid a real, visible energy-loss
++    darkening artifact at each level, not a naive byte average; normal-map
++    mips need re-normalization after averaging to avoid a flattening
++    artifact. Neither is a big algorithm, but neither is a shortcut either.
++  - Blast radius: EVERY sample loading stb-sourced textures (DamagedHelmet:
++    `06_materials`/`08_gltf_viewer`/`09_scene` grid mode too, not just
++    Sponza) would start sampling real mip>0 content for the first time —
++    risk to currently-green, driver-specific D17 reference PNGs, needing a
++    full regen-and-review pass across multiple samples, not just this one.
++  - No existing test exercises mip-level content at all; closing this
++    honestly needs new correctness tests (e.g., a known-pattern source
++    downsampling to an expected filtered result), not just a visual check.
++  - **Assessment: a properly-scoped, single dedicated round** — real,
++    closeable, but not safely foldable into this already-large
++    investigation without risking a rushed, under-tested core-engine
++    texture-pipeline change.
++
++**Option B — offline KTX2-convert Sponza's bundled textures via `toktx`**
++(D10's own already-documented recommended path). Zero engine-code risk,
++scoped only to the Sponza asset. **Blocked by a real prerequisite in this
++environment**: no `toktx`/`ktx` CLI is installed here, and wiring one into
++`tools/fetch_sponza_helper.py`/`fetch_assets.sh` as a new toolchain
++dependency is a separate decision this investigation should not make
++unilaterally.
++
++**Option C — leave as-is.** No code change; D10 stays recorded. Weakest
++option given project policy; listed for completeness.
++
++**Recommendation**: Option A is the right long-term fix (format-agnostic;
++closes the gap for every stb-sourced texture, not just Sponza) but merits
++its own dedicated, properly-tested round given the correctness subtleties
++and multi-sample D17 blast radius identified above. Not implemented in this
++round; flagging for the coordinator to schedule explicitly rather than
++silently deferring it back into D10's existing text unchanged.
++
++## 3. Windows-native-specific characterization (item 5)
++
++The confirmed root cause (§2.1) is **100% reproducible on Linux/NVIDIA**
++(this machine) and needs no native-Windows-specific explanation — it is a
++CPU-side C++ map/lookup logic error, identical on every platform this code
++runs on. The fix is expected to resolve the reported Sponza symptom on the
++user's Windows machine as shipped. Two specific Windows-portability
++surfaces the task asked to characterize were checked regardless:
++
++- **Bindless texture-index uniformity / `NonUniformResourceIndex`**:
++  `shaders/material/material.slang`'s `rx_sampleTexture()` (`gTextures[textureIndex].Sample(...)`)
++  has NO explicit `NonUniformResourceIndex`/`nonuniformEXT` qualification
++  anywhere in this codebase. Traced `textureIndex`'s source
++  (`gParams.baseColorTexture` etc., `standard_pbr.slang`) to
++  `ParameterBlock<StandardPbrParams> gParams` — a per-material UNIFORM
++  buffer bound once per draw call (descriptor set 1), never a per-instance
++  or per-invocation-varying value. This is dynamically uniform across the
++  whole draw by the Vulkan/SPIR-V spec's own definition, so
++  `NonUniformResourceIndex` is not strictly required here for spec-correct
++  behavior — the D26.3 instancing-collapse path only ever merges hardware
++  instances that already share one material, so `materialIndex`/texture
++  indices never vary within one draw's invocations either. That said, this
++  is a well-known area of real-world shader-compiler divergence across GPU
++  vendors (AMD historically stricter than NVIDIA about honoring this even
++  in near-uniform cases) — since the user's Windows GPU vendor is unknown
++  and this cannot be verified without native Windows access, it is flagged
++  as a low-probability, unverified hardening candidate for a follow-up ONLY
++  if the confirmed fix above does not fully resolve the symptom on the
++  user's machine. Not changed here — an unverifiable speculative shader
++  edit is not something this investigation should ship on top of the
++  already-proven fix.
++- **Upload row pitch/alignment**: `src/rx_rhi_vk/src/upload.cpp`'s image
++  copy leaves `VkBufferImageCopy::bufferRowLength`/`bufferImageHeight` at 0
++  ("tightly packed"), which is an explicit, Vulkan-spec-mandated
++  interpretation every conformant driver (Windows NVIDIA/AMD/Intel
++  included) must honor identically — ruled out as a platform-specific
++  corruption vector.
++
++No further action is needed on the user's Windows machine to validate this
++specific fix, beyond re-testing the shipped build (their originally
++reported run was their first-ever native-Windows verification of any kind).
++
++## 4. Verification
++
++- **Real-NVIDIA** (`nvidia_icd.json` explicit, GeForce RTX 2080,
++  `--present --scene sponza --validate`): zero unfiltered Vulkan validation
++  errors, before and after. `sample_09_scene --validate` (default
++  DamagedHelmet grid) and `--validate --stress --stress-draws 64`: both
++  `headless gate PASSED` on real NVIDIA (single-material/4-material modes
++  are structurally unaffected by this fix — confirmed unchanged).
++- **Lavapipe, full serial `ctest`** (`VK_ICD_FILENAMES` forced to
++  `lvp_icd.json`, since this machine also has NVIDIA registered):
++  `ctest --preset linux-native -j1` → **29/29 passed** (79.65s), including
++  the new `sample_09_scene_tests` (14/14 cases, 42/42 assertions) and both
++  `sample_09_scene_headless`/`sample_09_scene_stress_headless` gates.
++- **`windows-cross-zig` preset**: builds clean (incremental, only the
++  touched files relinked). Full serial `ctest --preset windows-cross-zig
++  -j1` under Wine: **29/29 passed** (196.64s).
++- Revert-proofs: §1.4 (camera, in-tree revert-and-restore, empirical
++  before/after positional data) and §2.4 (material assignment, literal
++  `git worktree` at the real pre-fix HEAD, empirical before/after GPU
++  captures on real NVIDIA against an independent Blender ground truth).
++
++## 5. Files touched
++
++Pathspec-scoped, no AI attribution, no push, no board/plan/spec/ledger
++edits:
++
++- `samples/09_scene/fly_camera.h` (new) — `FlyCamera` struct (moved from
++  `main.cpp`) + `flyCameraLocalMoveDelta()`.
++- `samples/09_scene/tests/test_fly_camera.cpp` (new) — 9 `TEST_CASE`s.
++- `samples/09_scene/tests/CMakeLists.txt` — added `test_fly_camera.cpp`.
++- `samples/09_scene/draw_recording.h`/`.cpp` — new
++  `materialIndexForSpan()`.
++- `samples/09_scene/tests/test_draw_recording.cpp` — 2 new `TEST_CASE`s for
++  `materialIndexForSpan()` (the Sponza-shaped shared-pipeline case + a
++  defensive out-of-range case).
++- `samples/09_scene/main.cpp` — `updateFlyCamera()` now calls
++  `flyCameraLocalMoveDelta()`; `App::resolveMaterialIndexToBinding` (new)
++  + `App::pipelineTokenToBinding` (removed); `buildPipelineTokenMap()`
++  renamed `warmMaterialPipelines()` (dead map-building removed, pipeline
++  pre-warm + layout caching kept); `recordForwardChunk()`'s bind loop
++  decouples pipeline-rebind from material-rebind.
++- This report + 6 comparison PNGs (`sponza-{gt,before,after}-{default,interior}.png`,
++  all ≤512px) in this directory.
++
++No board/plan/spec/ledger file was edited by this investigation.
++
++## 6. Concerns for the coordinator
++
++- The Option A mip-generation follow-up (§2.7) needs its own scoped task —
++  flagging so it doesn't silently fall back into D10's existing
++  "recorded limitation" text unchanged now that it's user-visible.
++- The `NonUniformResourceIndex` hardening candidate (§3) is unverified
++  (no native Windows access here) and deliberately NOT implemented
++  speculatively — if the user's Windows re-test after this fix still shows
++  any texture artifact, that is the next concrete thing to check, and this
++  report gives the exact file/line/reasoning to start from.
++- This session observed at least one other concurrent agent commit
++  unrelated docs changes to the shared tree during this investigation
++  (`58abe48`, `docs(assets): provenance note...`) — unrelated to this
++  task's files, called out per this project's own established
++  shared-tree-collision disclosure convention (see
++  `helmet-texture-fix-report.md` §8 for the precedent this follows).
+diff --git a/samples/09_scene/draw_recording.cpp b/samples/09_scene/draw_recording.cpp
+index 373217b..df2a6fc 100644
+--- a/samples/09_scene/draw_recording.cpp
++++ b/samples/09_scene/draw_recording.cpp
+@@ -41,11 +41,30 @@ std::vector<RecordSpan> splitByBlockAndGroup(std::span<const rx::scene::Resolved
+         if (cursor >= groupEnd && groupIdx + 1 < groups.size()) {
+             ++groupIdx;
+         }
+         if (cursor >= blockEnd && blockIdx + 1 < blocks.size()) {
+             ++blockIdx;
+         }
+     }
+     return out;
+ }
+ 
++uint32_t materialIndexForSpan(std::span<const rx::scene::DrawCommand> commands,
++                               std::span<const rx::scene::DrawPayload> payloads, const RecordSpan& span) {
++    // Both branches below are defensive only -- see this function's own
++    // header comment for why `span.commandCount > 0` and
++    // `firstInstance < payloads.size()` hold by construction for every
++    // `RecordSpan` this file's own `splitByBlockAndGroup()` produces from a
++    // real `ViewLists`. Falling back to materialIndex 0 rather than
++    // indexing out of bounds keeps this a safe, if degraded, no-op instead
++    // of UB if a future caller ever violates that contract.
++    if (span.commandCount == 0 || span.commandOffset >= commands.size()) {
++        return 0;
++    }
++    const rx::scene::DrawCommand& firstCommand = commands[span.commandOffset];
++    if (firstCommand.firstInstance >= payloads.size()) {
++        return 0;
++    }
++    return payloads[firstCommand.firstInstance].materialIndex;
++}
++
+ }  // namespace rx::samples9
+diff --git a/samples/09_scene/draw_recording.h b/samples/09_scene/draw_recording.h
+index 2ef33f7..708e345 100644
+--- a/samples/09_scene/draw_recording.h
++++ b/samples/09_scene/draw_recording.h
+@@ -68,11 +68,35 @@ struct RecordSpan {
+ // rangeStart+rangeCount)` range (true by construction whenever `groups`
+ // came from `resolveDrawGroups(lists, ...)` and `blocks` is that SAME
+ // `lists.blocks` -- this function does not itself validate that
+ // precondition, matching this project's own "device-free helper trusts
+ // its caller's own already-established invariant" convention for a
+ // tightly-scoped internal seam like this one).
+ [[nodiscard]] std::vector<RecordSpan> splitByBlockAndGroup(std::span<const rx::scene::ResolvedDrawGroup> groups,
+                                                              std::span<const rx::scene::BlockRange> blocks,
+                                                              uint32_t rangeStart, uint32_t rangeCount);
+ 
++// The REAL `DrawPayload::materialIndex` a `RecordSpan` was built from --
++// recovers the identity `ResolvedDrawGroup`/`RecordSpan` themselves discard
++// (both types carry only a `pipelineToken`, deliberately: `resolveDrawGroups()`
++// groups by materialIndex-ADJACENCY, but its returned token is a real
++// `VkPipeline`, and DISTINCT materialIndex values legitimately collapse onto
++// the SAME pipeline whenever they share identical fixed-function state
++// [D28] -- e.g. Sponza's own glTF: 22 of its 25 materials are all
++// (StandardPBR, Opaque, single-sided), so they all resolve to ONE shared
++// VkPipeline. A caller that keys its MATERIAL PARAMS descriptor-set choice
++// off `pipelineToken` alone [the historical bug this function exists to let
++// a caller avoid] binds whichever ONE of those 22 materials happened to be
++// registered last for every one of the other 21's geometry -- reproducible
++// on any driver, not lighting- or platform-dependent. Every command within
++// one `RecordSpan` shares one materialIndex by construction (the SAME
++// invariant `splitByBlockAndGroup()`'s own header comment documents for
++// block identity: subdividing a group only ever shrinks a run, never
++// merges two different materialIndex runs), so reading it off the span's
++// OWN first command is exact, not a heuristic -- `DrawCommand::firstInstance`
++// addresses `payloads[]` directly [D26.1], and `payloads[i].materialIndex`
++// is the ground truth every `DrawDataGpu::materialIndex` row is itself
++// populated from (main.cpp's own `updateSceneFrame()`).
++[[nodiscard]] uint32_t materialIndexForSpan(std::span<const rx::scene::DrawCommand> commands,
++                                             std::span<const rx::scene::DrawPayload> payloads, const RecordSpan& span);
++
+ }  // namespace rx::samples9
+diff --git a/samples/09_scene/fly_camera.h b/samples/09_scene/fly_camera.h
+new file mode 100644
+index 0000000..3ebd4db
+--- /dev/null
++++ b/samples/09_scene/fly_camera.h
+@@ -0,0 +1,77 @@
++#pragma once
++// samples/09_scene/fly_camera.h -- rx::samples9::FlyCamera, the sample's own
++// mouse+keyboard+gamepad fly-through camera rig, and the pure axis-to-
++// local-move-delta mapping updateFlyCamera() (main.cpp) drives it with.
++//
++// WHY THIS EXISTS (extracted from main.cpp): the W/S-inverted-movement
++// defect (fly-camera flies BACKWARD on W) lived entirely in a one-line sign
++// flip at the update() call site, with no test seam able to reach it --
++// FlyCamera itself has no rx::platform::Window/GPU dependency (plain glm
++// data + rx::scene::Camera, same "device-free" shape draw_recording.h's own
++// top comment already establishes as this sample's precedent for pulling
++// pure logic out of main.cpp into a separately-testable header). Moving the
++// struct AND the axis->local-delta mapping here lets
++// samples/09_scene/tests/test_fly_camera.cpp assert the actual world-space
++// movement direction for W/S/A/D/Space/Ctrl against camera.forward()/
++// right()/up(), without an SDL window or a VkDevice.
++#include <rx_scene/camera.h>
++
++#include <glm/glm.hpp>
++#include <glm/gtc/quaternion.hpp>
++
++#include <algorithm>
++
++namespace rx::samples9 {
++
++struct FlyCamera {
++    rx::scene::Camera camera;
++    float yawRadians = 0.0F;    // rotation around world +Y.
++    float pitchRadians = 0.0F;  // rotation around the camera's own local +X, clamped.
++
++    static constexpr float kMinPitch = glm::radians(-85.0F);
++    static constexpr float kMaxPitch = glm::radians(85.0F);
++    static constexpr float kMouseSensitivity = 0.0025F;
++    static constexpr float kGamepadLookSensitivity = 2.5F;   // radians/sec at full stick deflection.
++    static constexpr float kBaseMoveSpeed = 3.0F;            // world units/sec: overridden per scene by frameToScene().
++    static constexpr float kFastMoveMultiplier = 4.0F;       // held Shift / gamepad right trigger.
++
++    void syncOrientation() { camera.orientation = glm::angleAxis(yawRadians, glm::vec3(0, 1, 0)) *
++                                                    glm::angleAxis(pitchRadians, glm::vec3(1, 0, 0)); }
++
++    void applyLookDelta(float dxRadians, float dyRadians) {
++        yawRadians -= dxRadians;
++        pitchRadians = std::clamp(pitchRadians - dyRadians, kMinPitch, kMaxPitch);
++        syncOrientation();
++    }
++
++    void moveLocal(const glm::vec3& localDelta) {
++        camera.position += camera.right() * localDelta.x + camera.up() * localDelta.y + camera.forward() * localDelta.z;
++    }
++};
++
++// The W/S/A/D/Space/Ctrl (and gamepad left-stick) axis-accumulator ->
++// FlyCamera::moveLocal() input mapping updateFlyCamera() (main.cpp) uses,
++// pulled out as a pure function so it is unit-testable directly.
++//
++// `forward`/`strafe`/`vertical` are the SAME signed accumulator values
++// updateFlyCamera() computes before calling this: W alone yields
++// forward=+1, S alone yields forward=-1 (gamepad: `-pad.leftStick.y`, SDL's
++// own Y-down stick convention negated so a forward stick push also yields
++// forward=+1) -- D alone yields strafe=+1, A alone yields strafe=-1; Space
++// alone yields vertical=+1, LCtrl alone yields vertical=-1.
++//
++// FlyCamera::moveLocal(localDelta) already does
++// `position += right()*x + up()*y + forward()*z` -- camera.forward()
++// ITSELF already encodes the "local -Z is forward" convention
++// (rx_scene/camera.h's own `forward()` accessor), so this mapping must NOT
++// re-negate `forward` a second time: `localDelta.z` is `forward` directly,
++// unnegated. (The historical bug here was exactly that redundant second
++// negation -- `glm::vec3(strafe, vertical, -forward)` -- which silently
++// cancelled forward travel into backward travel for every input device
++// that ever set the `forward` accumulator: keyboard AND gamepad alike,
++// since both feed this one shared function.)
++[[nodiscard]] inline glm::vec3 flyCameraLocalMoveDelta(float forward, float strafe, float vertical) {
++    return glm::vec3(strafe, vertical, forward);
++}
++
++}  // namespace rx::samples9
+diff --git a/samples/09_scene/main.cpp b/samples/09_scene/main.cpp
+index f639e1e..f075766 100644
+--- a/samples/09_scene/main.cpp
++++ b/samples/09_scene/main.cpp
+@@ -90,20 +90,21 @@
+ #include <rx_scene/camera.h>
+ #include <rx_scene/draw_list.h>
+ #include <rx_scene/scene.h>
+ #include <rx_shader/compiler.h>
+ #include <rx_shader/reflection.h>
+ #include <rx_shadow/shadow_caster_pipeline.h>
+ #include <rx_shadow/shadow_frustum.h>
+ #include <rx_task/scheduler.h>
+ 
+ #include "draw_recording.h"
++#include "fly_camera.h"
+ #include <reference_gate.h>
+ 
+ #define GLM_FORCE_DEPTH_ZERO_TO_ONE
+ #include <glm/glm.hpp>
+ #include <glm/gtc/matrix_transform.hpp>
+ #include <glm/gtc/quaternion.hpp>
+ 
+ #include <SDL3/SDL.h>
+ #include <imgui.h>
+ #include <volk.h>
+@@ -271,46 +272,27 @@ std::filesystem::path resolveSponzaScenePath() {
+     }
+     return std::filesystem::path(RX_REPO_ROOT_DIR) / "assets" / "fetched" / "Sponza" / "glTF" / "Sponza.gltf";
+ }
+ 
+ // --- Fly-through camera [Task 20 input surface -- gate ruling #15's own
+ // "Task 20 input surface" correction of the plan's stray "D16 input"
+ // citation] --------------------------------------------------------------
+ // WASD (via `Window::isKeyDown`) + relative-mouse-mode look + gamepad
+ // (left stick move, right stick look, triggers = speed multiplier) drive a
+ // plain yaw/pitch `rx::scene::Camera`. Movement/look are both continuous,
+-// framerate-scaled (`dt`).
+-struct FlyCamera {
+-    rx::scene::Camera camera;
+-    float yawRadians = 0.0F;    // rotation around world +Y.
+-    float pitchRadians = 0.0F;  // rotation around the camera's own local +X, clamped.
+-
+-    static constexpr float kMinPitch = glm::radians(-85.0F);
+-    static constexpr float kMaxPitch = glm::radians(85.0F);
+-    static constexpr float kMouseSensitivity = 0.0025F;
+-    static constexpr float kGamepadLookSensitivity = 2.5F;   // radians/sec at full stick deflection.
+-    static constexpr float kBaseMoveSpeed = 3.0F;            // world units/sec: overridden per scene by frameToScene().
+-    static constexpr float kFastMoveMultiplier = 4.0F;       // held Shift / gamepad right trigger.
+-
+-    void syncOrientation() { camera.orientation = glm::angleAxis(yawRadians, glm::vec3(0, 1, 0)) *
+-                                                    glm::angleAxis(pitchRadians, glm::vec3(1, 0, 0)); }
+-
+-    void applyLookDelta(float dxRadians, float dyRadians) {
+-        yawRadians -= dxRadians;
+-        pitchRadians = std::clamp(pitchRadians - dyRadians, kMinPitch, kMaxPitch);
+-        syncOrientation();
+-    }
+-
+-    void moveLocal(const glm::vec3& localDelta) {
+-        camera.position += camera.right() * localDelta.x + camera.up() * localDelta.y + camera.forward() * localDelta.z;
+-    }
+-};
++// framerate-scaled (`dt`). The struct itself, and the axis->local-move-delta
++// mapping updateFlyCamera() below drives it with, now live in
++// fly_camera.h -- device-free, unit-tested directly
++// (tests/test_fly_camera.cpp), same "pull pure logic out of main.cpp into
++// its own header" precedent draw_recording.h already established in this
++// sample.
++using rx::samples9::FlyCamera;
+ 
+ // --- Shared pass infra [tonemap pass -- shaders/multipass/tonemap.{vert,
+ // frag}.slang, VERBATIM -- same convention samples/07_stress/08_gltf_viewer's
+ // own copies establish] ---------------------------------------------------
+ struct TonemapPushConstants {
+     uint32_t hdrTextureIndex;
+     uint32_t hdrSamplerIndex;
+ };
+ 
+ struct CompiledPass {
+@@ -672,29 +654,20 @@ struct App {
+     bool stressMode = false;
+     std::optional<rx::scene::Scene> scene;
+     std::optional<rx::scene::DrawListBuilder> drawListBuilder;
+     rx::scene::LightHandle lightHandle;
+     std::vector<rx::scene::RenderableHandle> renderableHandles;  // grid mode: index == row*kGridCols+col.
+ 
+     // Grid-mode material (DamagedHelmet, real Registry-backed).
+     MaterialGpuBinding helmetMaterial;
+     rx::asset::AABB helmetLocalBounds;
+ 
+-    // pipelineToken (the SAME bit_cast<uint64_t>(VkPipeline) resolveDrawGroups()'s
+-    // own resolvePipeline callback returns) -> the MaterialGpuBinding that
+-    // produced it -- populated once, right after material setup, from a
+-    // SECOND getPipeline() call per binding (always a D27 cache HIT, never
+-    // a recompile) so the chunked forward-pass recorder can recover
+-    // paramSet/push-constant-shape from a resolved group's own token alone
+-    // (see recordForwardChunk() below).
+-    std::unordered_map<uint64_t, const MaterialGpuBinding*> pipelineTokenToBinding;
+-
+     // [D5 caller-side accommodation] GeometryPool::bind() is main-thread-
+     // only (every accessor in that class is, by the library's own uniform
+     // D5 posture) -- but the chunked forward pass's own worker chunks
+     // (chunkIndex >= 1) each need to bind a block's vertex/index buffers
+     // into THEIR OWN secondary command buffer (a secondary buffer
+     // inherits no bound state from any other, per Pass::setExecuteChunked()'s
+     // own contract). This cache is refreshed on the main thread, once per
+     // frame (updateSceneFrame(), cheap -- one or a handful of blocks),
+     // from GeometryPool's own guarded vertexBufferHandle()/
+     // indexBufferHandle() accessors; recordForwardChunk() reads this
+@@ -706,32 +679,44 @@ struct App {
+     struct BlockBuffers {
+         VkBuffer vertexBuffer = VK_NULL_HANDLE;
+         VkBuffer indexBuffer = VK_NULL_HANDLE;
+     };
+     std::unordered_map<uint32_t, BlockBuffers> blockBufferCache;
+ 
+     // [Phase 4 exit fix wave, I3] Main-thread-cached, exactly like
+     // blockBufferCache above (same rationale: MaterialSystem::
+     // pipelineLayout() is now guarded main-thread-only -- docs/threading.md
+     // -- so a worker chunk cannot call it directly). Set once, at setup,
+-    // by buildPipelineTokenMap() -- every participating material shares
++    // by warmMaterialPipelines() -- every participating material shares
+     // the identical pipeline-layout SHAPE (Vulkan spec 14.2.2
+     // set-compatibility), so caching any one binding's layout here is
+     // valid for the whole run, not just one frame.
+     VkPipelineLayout cachedAnyMaterialLayout = VK_NULL_HANDLE;
+ 
+     // Mode-agnostic materialIndex -> real MaterialHandle resolver, bound
+     // once at setup depending on which scene kind is active (grid/stress/
+     // custom-import via --scene) -- lets updateSceneFrame()'s D27
+-    // resolvePipeline lambda and buildPipelineTokenMap() stay identical
+-    // across all three without a mode-specific branch each.
++    // resolvePipeline lambda stay identical across all three without a
++    // mode-specific branch each.
+     std::function<rx::material::MaterialHandle(uint32_t)> resolveMaterialIndexToHandle;
++    // [Sponza texture-misassignment fix] Sibling of resolveMaterialIndexToHandle
++    // above, returning the material's OWN MaterialGpuBinding (paramSet/
++    // push-constant shape) directly, keyed by the SAME materialIndex --
++    // NOT by pipelineToken. See draw_recording.h's own materialIndexForSpan()
++    // header comment for why keying descriptor-set selection off
++    // pipelineToken is wrong in general: DISTINCT materials legitimately
++    // share one VkPipeline whenever their fixed-function state matches
++    // (Sponza: 22/25 materials), so a pipelineToken -> binding map can only
++    // ever remember ONE of them. recordForwardChunk() below resolves each
++    // RecordSpan's REAL materialIndex via materialIndexForSpan() and looks
++    // it up through this resolver instead.
++    std::function<const MaterialGpuBinding*(uint32_t)> resolveMaterialIndexToBinding;
+     // --scene <path> (present-mode only, e.g. Sponza) -- a real imported
+     // scene's own materials, keyed by asset::MaterialHandle::index() (the
+     // SAME index space DrawPayload::materialIndex uses), mirroring
+     // samples/08_gltf_viewer's own materialHandleToBinding map for the
+     // "many materials" case the deterministic single-material grid never
+     // needs.
+     std::vector<MaterialGpuBinding> customMaterialBindings;
+     std::unordered_map<uint32_t, size_t> customMaterialIndexToBinding;
+ 
+     // Stress-mode Registry-free fabrication [see this file's own header
+@@ -1319,20 +1304,21 @@ bool setupHelmetMaterial(App& app, const rx::asset::MaterialAsset& asset) {
+     if (!ok) {
+         RX_LOG_ERROR("sample_09_scene: helmet material param setup failed");
+         return false;
+     }
+ 
+     if (!finalizeMaterialBinding(app, binding, blob, blockSize)) {
+         return false;
+     }
+     app.helmetMaterial = std::move(binding);
+     app.resolveMaterialIndexToHandle = [&app](uint32_t) { return app.helmetMaterial.handle; };  // DamagedHelmet: exactly 1 material.
++    app.resolveMaterialIndexToBinding = [&app](uint32_t) -> const MaterialGpuBinding* { return &app.helmetMaterial; };
+     return true;
+ }
+ 
+ // Loads the 4 --stress Unlit material variants [D28's real fixed-function
+ // axis: 2 alphaModes (Opaque/Mask, cutoff always 0 -- never trips the
+ // discard, so Mask behaves visually identically to Opaque here) x 2
+ // doubleSided states -- 4 genuinely independently-cached VkPipeline
+ // objects, matching sample 07_stress's own "4 mesh/pipeline-state
+ // variations" in spirit through this sample's own real D28 axis, not a
+ // re-derivation of sample 07's cull-mode-only scheme]. Distinct
+@@ -1383,20 +1369,23 @@ bool setupStressMaterials(App& app) {
+         if (!ok) {
+             RX_LOG_ERROR("sample_09_scene: stress material param setup failed for variant {}", i);
+             return false;
+         }
+         if (!finalizeMaterialBinding(app, binding, blob, blockSize)) {
+             return false;
+         }
+         app.stressMaterialBindings[i] = std::move(binding);
+     }
+     app.resolveMaterialIndexToHandle = [&app](uint32_t idx) { return app.stressMaterialBindings[idx % kStressVariantCount].handle; };
++    app.resolveMaterialIndexToBinding = [&app](uint32_t idx) -> const MaterialGpuBinding* {
++        return &app.stressMaterialBindings[idx % kStressVariantCount];
++    };
+     return true;
+ }
+ 
+ // Loads every material `registry` reports for a `--scene <path>` import
+ // (Sponza or any other custom asset, present-mode only -- see this file's
+ // own header comment on why the deterministic grid never needs this: it
+ // has exactly 1 material, handled directly by setupHelmetMaterial()
+ // above). Mirrors samples/08_gltf_viewer's own setupMaterials() loop,
+ // generalized to StandardPBR OR Unlit per material's own disposition [D22,
+ // gate ruling C5].
+@@ -1480,20 +1469,25 @@ bool setupImportedMaterials(App& app, const rx::asset::Registry& registry, const
+             return false;
+         }
+         app.customMaterialIndexToBinding[assetHandle.index()] = app.customMaterialBindings.size();
+         app.customMaterialBindings.push_back(std::move(binding));
+     }
+     app.resolveMaterialIndexToHandle = [&app](uint32_t idx) -> rx::material::MaterialHandle {
+         auto it = app.customMaterialIndexToBinding.find(idx);
+         return it != app.customMaterialIndexToBinding.end() ? app.customMaterialBindings[it->second].handle
+                                                               : app.customMaterialBindings.front().handle;
+     };
++    app.resolveMaterialIndexToBinding = [&app](uint32_t idx) -> const MaterialGpuBinding* {
++        auto it = app.customMaterialIndexToBinding.find(idx);
++        return it != app.customMaterialIndexToBinding.end() ? &app.customMaterialBindings[it->second]
++                                                              : &app.customMaterialBindings.front();
++    };
+     return true;
+ }
+ 
+ // [Phase 4 exit fix wave, I1] Shared by all three populate*()/build*()
+ // call sites below -- allocates `rx::rhi::FrameSync::kFramesInFlight`
+ // SEPARATE physical draw-data buffers (not one shared buffer -- see
+ // App::drawDataBuffers' own comment for the frames-in-flight race this
+ // closes) and registers each into bindless, sized for `rows` rows.
+ // `app.drawDataCapacityRows`/`app.drawDataRows` (the CPU staging mirror)
+ // are set here too, once, for every mode.
+@@ -1775,30 +1769,38 @@ bool buildStressField(App& app, uint32_t drawCount) {
+     app.flyCamera.camera.cullingFarPlane = halfExtent * 6.0F + 20.0F;
+     app.flyCamera.camera.cullMask = ~0u;
+     app.moveSpeed = 10.0F;
+ 
+     if (!createDrawDataBuffers(app, drawCount)) {
+         return false;
+     }
+     return true;
+ }
+ 
+-// One (VkPipeline bit_cast token) -> (MaterialGpuBinding*) entry per
+-// participating material -- see App::pipelineTokenToBinding's own comment.
+-// `bindings` is whichever set is active this run (helmet: a 1-element
+-// span; stress: 4; custom-import: N).
+-void buildPipelineTokenMap(App& app, std::span<const MaterialGpuBinding> bindings) {
+-    app.pipelineTokenToBinding.clear();
++// Pre-warms MaterialSystem's own pipeline cache for every participating
++// material (a D27 cache HIT at first real use in updateSceneFrame()'s own
++// resolvePipeline callback, never a mid-frame recompile) and caches the
++// shared pipeline-LAYOUT every one of them uses -- see
++// App::cachedAnyMaterialLayout's own comment. `bindings` is whichever set
++// is active this run (helmet: a 1-element span; stress: 4; custom-import:
++// N). [Sponza texture-misassignment fix] Deliberately does NOT build a
++// pipelineToken -> binding map anymore: distinct materials legitimately
++// SHARE one VkPipeline whenever their fixed-function state matches (D28;
++// Sponza: 22/25 materials), so such a map can only ever remember one
++// binding per shared token -- see draw_recording.h's own
++// materialIndexForSpan() header comment. Descriptor-set selection at
++// record time now goes through App::resolveMaterialIndexToBinding instead,
++// keyed by the REAL per-span materialIndex.
++void warmMaterialPipelines(App& app, std::span<const MaterialGpuBinding> bindings) {
+     const rx::material::PassSignature sig = forwardPassSignature();
+     for (const MaterialGpuBinding& binding : bindings) {
+-        VkPipeline pipeline = app.materialSystem->getPipeline({binding.handle, sig, 0});
+-        app.pipelineTokenToBinding[std::bit_cast<uint64_t>(pipeline)] = &binding;
++        app.materialSystem->getPipeline({binding.handle, sig, 0});
+     }
+     // [Phase 4 exit fix wave, I3] Hoisted here, main-thread-only, setup-time
+     // (this function is never called mid-frame) -- NOT recomputed inside
+     // recordForwardChunk() anymore, which ran on worker chunks >= 1 and
+     // called the now-guarded MaterialSystem::pipelineLayout() from there
+     // (a sibling of the Task-24 GeometryPool::bind() violation). Every
+     // participating material shares the IDENTICAL pipeline-layout SHAPE
+     // (external bindless set-0 substitution + material set-1 -- Vulkan spec
+     // 14.2.2 set-compatibility), so any one binding's layout is legal to
+     // cache and reuse for every chunk regardless of which pipeline a given
+@@ -1977,23 +1979,23 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
+         app.drawListBuilder->buildShadow(*app.scene, app.lightHandle, app.flyCamera.camera, scheduler, app.shadowLists);
+         for (size_t i = 0; i < app.shadowLists.payloads.size(); ++i) {
+             const rx::scene::DrawPayload& payload = app.shadowLists.payloads[i];
+             rx::shadow::ShadowDrawData& row = app.shadowDrawDataRows[i];
+             row.model = glm::transpose(transforms[payload.instanceDataIndex]);
+             row.lightViewProj = glm::transpose(app.shadowFit.lightViewProj);
+         }
+     }
+ 
+     // [D27] Main-thread pre-resolution -- once per frame, before any chunk
+-    // fan-out. `resolvePipeline` returns the SAME bit_cast token
+-    // buildPipelineTokenMap() populated at setup (a cache HIT every time,
+-    // by construction).
++    // fan-out. `resolvePipeline` returns a `getPipeline()` cache HIT every
++    // time, by construction (warmMaterialPipelines() pre-warmed every
++    // participating material's pipeline at setup).
+     const rx::material::PassSignature passSig = forwardPassSignature();
+     const uint64_t passSigHash = passSig.hash();
+     app.resolvedGroups = rx::scene::resolveDrawGroups(
+         app.viewLists, passSigHash, 0, [&app, &passSig](const rx::scene::PipelineRequestKey& key) -> uint64_t {
+             const rx::material::MaterialHandle handle = app.resolveMaterialIndexToHandle(key.materialIndex);
+             VkPipeline pipeline = app.materialSystem->getPipeline({handle, passSig, 0});
+             return std::bit_cast<uint64_t>(pipeline);
+         });
+ }
+ 
+@@ -2106,26 +2108,26 @@ void recordForwardChunk(rx::graph::PassContext& ctx, App& app, uint32_t chunkInd
+     if (totalCommands == 0) {
+         return;
+     }
+     const uint32_t perChunk = (totalCommands + chunkCount - 1) / chunkCount;
+     const uint32_t begin = std::min(chunkIndex * perChunk, totalCommands);
+     const uint32_t end = std::min(begin + perChunk, totalCommands);
+     if (begin >= end) {
+         return;
+     }
+ 
+-    if (app.pipelineTokenToBinding.empty()) {
++    if (!app.resolveMaterialIndexToBinding) {
+         return;
+     }
+     VkDescriptorSet set = app.bindless->descriptorSet();
+     // [Phase 4 exit fix wave, I3] Main-thread-cached at setup
+-    // (buildPipelineTokenMap()) -- NOT resolved here anymore.
++    // (warmMaterialPipelines()) -- NOT resolved here anymore.
+     // MaterialSystem::pipelineLayout() is guarded main-thread-only
+     // (docs/threading.md); calling it from this worker chunk (chunkIndex
+     // can be >= 1) was the exact violation class Task 24 already fixed for
+     // GeometryPool::bind() (see App::blockBufferCache's own comment) but
+     // left unfixed one call site later, here. Every participating material
+     // shares the IDENTICAL pipeline-layout SHAPE (external bindless set-0
+     // substitution + material set-1) -- any one binding's layout is legal
+     // to bind set 0 against regardless of which pipeline ends up bound
+     // later (Vulkan spec 14.2.2 set-compatibility, same precedent
+     // samples/08_gltf_viewer's own recordSceneDraws() already relies on).
+@@ -2133,54 +2135,76 @@ void recordForwardChunk(rx::graph::PassContext& ctx, App& app, uint32_t chunkInd
+     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, anyLayout, /*firstSet=*/0, 1, &set, 0, nullptr);
+ 
+     // [D27 caller-side fix -- see draw_recording.h's own header comment]
+     // resolveDrawGroups()'s own materialIndex-adjacency scan has no
+     // blockId awareness; splitByBlockAndGroup() further subdivides this
+     // chunk's own command range at every block boundary too, so
+     // GeometryPool::bind()'s "one block per bind-to-next-bind span"
+     // contract always holds.
+     const auto spans = rx::samples9::splitByBlockAndGroup(app.resolvedGroups, app.viewLists.blocks, begin, end - begin);
+ 
++    // [Sponza texture-misassignment fix] `span.pipelineToken` and the span's
++    // REAL materialIndex are tracked and re-bound INDEPENDENTLY on purpose:
++    // rebinding the VkPipeline only when the token actually changes is
++    // still a valid, cheap state-sort optimization (many spans genuinely do
++    // share one pipeline back-to-back), but the material-params descriptor
++    // set (textures) MUST be re-selected every time the real materialIndex
++    // changes, even across two spans that happen to share one pipelineToken
++    // -- see draw_recording.h's own materialIndexForSpan() header comment
++    // for why those two are NOT the same condition in general (D28
++    // fixed-function-state collapse: Sponza's own glTF has 22/25 materials
++    // sharing one VkPipeline). Binding set 1 off `pipelineTokenToBinding`
++    // (the historical bug) silently rendered every one of those 22
++    // materials' geometry with whichever ONE of them happened to be
++    // registered last -- e.g. a roof/parapet material's textures appearing
++    // on column shafts and arches, reproducible on any driver.
+     uint32_t lastBlock = UINT32_MAX;
+     uint64_t lastToken = 0;
+     bool havePipeline = false;
++    uint32_t lastMaterialIndex = UINT32_MAX;
++    bool haveMaterial = false;
+     for (const rx::samples9::RecordSpan& span : spans) {
+         if (span.blockId != lastBlock) {
+             // NOT GeometryPool::bind() -- main-thread-only, unsafe from a
+             // worker chunk. Byte-identical raw calls against the
+             // main-thread-cached handles instead (see App::blockBufferCache's
+             // own comment): binding 0/offset 0/VK_INDEX_TYPE_UINT32
+             // matches bind()'s own documented contract exactly.
+             auto it = app.blockBufferCache.find(span.blockId);
+             if (it != app.blockBufferCache.end()) {
+                 VkDeviceSize offset = 0;
+                 vkCmdBindVertexBuffers(cmd, 0, 1, &it->second.vertexBuffer, &offset);
+                 vkCmdBindIndexBuffer(cmd, it->second.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+             }
+             lastBlock = span.blockId;
+         }
+         if (!havePipeline || span.pipelineToken != lastToken) {
+             VkPipeline pipeline = std::bit_cast<VkPipeline>(span.pipelineToken);
+             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+-            auto it = app.pipelineTokenToBinding.find(span.pipelineToken);
+-            if (it != app.pipelineTokenToBinding.end()) {
+-                const MaterialGpuBinding& mb = *it->second;
++            lastToken = span.pipelineToken;
++            havePipeline = true;
++        }
++        const uint32_t materialIndex =
++            rx::samples9::materialIndexForSpan(app.viewLists.commands, app.viewLists.payloads, span);
++        if (!haveMaterial || materialIndex != lastMaterialIndex) {
++            const MaterialGpuBinding* mb = app.resolveMaterialIndexToBinding(materialIndex);
++            if (mb != nullptr) {
+                 // [Phase 4 exit fix wave, I1] `app.currentFrameSlot`-th
+                 // buffer -- see that field's own comment.
+                 rx::material::MaterialGlobalsPush push{app.defaultSamplerHandle.index(),
+                                                          app.drawDataBufferHandles[app.currentFrameSlot].index(), 0.0F};
+-                vkCmdPushConstants(cmd, anyLayout, mb.pushStages, mb.pushOffset, mb.pushSize, &push);
+-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, anyLayout, /*firstSet=*/1, 1, &mb.paramSet, 0,
++                vkCmdPushConstants(cmd, anyLayout, mb->pushStages, mb->pushOffset, mb->pushSize, &push);
++                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, anyLayout, /*firstSet=*/1, 1, &mb->paramSet, 0,
+                                          nullptr);
+             }
+-            lastToken = span.pipelineToken;
+-            havePipeline = true;
++            lastMaterialIndex = materialIndex;
++            haveMaterial = true;
+         }
+         for (uint32_t i = span.commandOffset; i < span.commandOffset + span.commandCount; ++i) {
+             const rx::scene::DrawCommand& c = app.viewLists.commands[i];
+             vkCmdDrawIndexed(cmd, c.indexCount, c.instanceCount, c.firstIndex, c.vertexOffset, c.firstInstance);
+         }
+     }
+ }
+ 
+ void recordTonemapDraw(rx::graph::PassContext& ctx, App& app) {
+     VkImageView hdrView = ctx.imageView("hdr");
+@@ -2404,21 +2428,21 @@ void updateFlyCamera(App& app, rx::platform::Window& window, float dt) {
+         app.flyCamera.applyLookDelta(delta.x * FlyCamera::kMouseSensitivity, delta.y * FlyCamera::kMouseSensitivity);
+     } else {
+         window.consumeMouseDelta();  // still drain the accumulator so a later frame doesn't see a stale jump.
+     }
+     if (pad.connected) {
+         app.flyCamera.applyLookDelta(pad.rightStick.x * FlyCamera::kGamepadLookSensitivity * dt,
+                                       -pad.rightStick.y * FlyCamera::kGamepadLookSensitivity * dt);
+     }
+ 
+     const float speed = app.moveSpeed * (fast || (pad.connected && pad.rightTrigger > 0.5F) ? FlyCamera::kFastMoveMultiplier : 1.0F);
+-    const glm::vec3 localDelta(strafe, vertical, -forward);  // forward() is -Z in this camera's own convention.
++    const glm::vec3 localDelta = rx::samples9::flyCameraLocalMoveDelta(forward, strafe, vertical);
+     if (glm::length(localDelta) > 0.0001F) {
+         app.flyCamera.moveLocal(glm::normalize(localDelta) * speed * dt);
+     }
+ }
+ 
+ // --- D17 reference-gate support [samples/08_gltf_viewer's own identical
+ // helpers] -----------------------------------------------------------------
+ struct ChannelIndices {
+     int r;
+     int g;
+@@ -2510,21 +2534,21 @@ int runHeadless(const Args& args) {
+             return 1;
+         }
+         if (!setupStressMaterials(*app)) {
+             destroyApp(*app);
+             return 1;
+         }
+         if (!buildStressField(*app, args.stressDraws)) {
+             destroyApp(*app);
+             return 1;
+         }
+-        buildPipelineTokenMap(*app, app->stressMaterialBindings);
++        warmMaterialPipelines(*app, app->stressMaterialBindings);
+         app->shadowEnabled = false;
+         expectedTotalCandidates = args.stressDraws;
+         expectedCulled = 0;
+         expectedVisible = args.stressDraws;
+         expectedRecordsIn = args.stressDraws;
+         expectedDrawsSubmitted = std::min<uint32_t>(kStressVariantCount, args.stressDraws);
+         RX_LOG_INFO("sample_09_scene: --stress: {} instances, {} variants, Registry-free", args.stressDraws, kStressVariantCount);
+     } else {
+         const std::filesystem::path scenePath = resolveHelmetScenePath();
+         if (!std::filesystem::exists(scenePath)) {
+@@ -2550,21 +2574,21 @@ int runHeadless(const Args& args) {
+             return 1;
+         }
+         if (!setupHelmetMaterial(*app, app->registry->material(result.materials[0]))) {
+             destroyApp(*app);
+             return 1;
+         }
+         if (!populateHelmetGrid(*app, result.meshes[0])) {
+             destroyApp(*app);
+             return 1;
+         }
+-        buildPipelineTokenMap(*app, std::span<const MaterialGpuBinding>(&app->helmetMaterial, 1));
++        warmMaterialPipelines(*app, std::span<const MaterialGpuBinding>(&app->helmetMaterial, 1));
+         if (!setupShadow(*app)) {
+             destroyApp(*app);
+             return 1;
+         }
+         expectedTotalCandidates = kGridInstanceCount;
+         expectedCulled = kDefaultCulledInstances;
+         expectedVisible = kDefaultVisibleInstances;
+         expectedRecordsIn = kDefaultVisibleInstances;  // 1 submesh per instance.
+         expectedDrawsSubmitted = kDefaultDrawsSubmitted;
+     }
+@@ -2992,21 +3016,21 @@ int runPresent(const Args& args) {
+         if (!createMaterialParamArena(*app, kStressVariantCount)) {
+             frameSync.reset();
+             destroyApp(*app);
+             return 1;
+         }
+         if (!setupStressMaterials(*app) || !buildStressField(*app, args.stressDraws)) {
+             frameSync.reset();
+             destroyApp(*app);
+             return 1;
+         }
+-        buildPipelineTokenMap(*app, app->stressMaterialBindings);
++        warmMaterialPipelines(*app, app->stressMaterialBindings);
+         app->shadowEnabled = false;
+     } else if (!args.scenePath.empty()) {
+         const std::filesystem::path scenePath =
+             args.scenePath == "sponza" ? resolveSponzaScenePath() : std::filesystem::path(args.scenePath);
+         if (!std::filesystem::exists(scenePath)) {
+             RX_LOG_ERROR("sample_09_scene: scene file not found: '{}' -- run `tools/fetch_assets.sh --sponza` first if this is "
+                          "the Sponza override",
+                          scenePath.string());
+             frameSync.reset();
+             destroyApp(*app);
+@@ -3031,21 +3055,21 @@ int runPresent(const Args& args) {
+             frameSync.reset();
+             destroyApp(*app);
+             return 1;
+         }
+         if (!setupImportedMaterials(*app, *app->registry, result.materials) ||
+             !populateImportedInstances(*app, *app->registry, result.scene)) {
+             frameSync.reset();
+             destroyApp(*app);
+             return 1;
+         }
+-        buildPipelineTokenMap(*app, app->customMaterialBindings);
++        warmMaterialPipelines(*app, app->customMaterialBindings);
+         if (!setupShadow(*app)) {
+             frameSync.reset();
+             destroyApp(*app);
+             return 1;
+         }
+         RX_LOG_INFO("sample_09_scene: '{}' loaded -- {} renderable(s), {} material(s)", scenePath.string(),
+                     app->renderableHandles.size(), result.materials.size());
+     } else {
+         const std::filesystem::path scenePath = resolveHelmetScenePath();
+         if (!std::filesystem::exists(scenePath)) {
+@@ -3068,21 +3092,21 @@ int runPresent(const Args& args) {
+         if (!createMaterialParamArena(*app, 1)) {
+             frameSync.reset();
+             destroyApp(*app);
+             return 1;
+         }
+         if (!setupHelmetMaterial(*app, app->registry->material(result.materials[0])) || !populateHelmetGrid(*app, result.meshes[0])) {
+             frameSync.reset();
+             destroyApp(*app);
+             return 1;
+         }
+-        buildPipelineTokenMap(*app, std::span<const MaterialGpuBinding>(&app->helmetMaterial, 1));
++        warmMaterialPipelines(*app, std::span<const MaterialGpuBinding>(&app->helmetMaterial, 1));
+         if (!setupShadow(*app)) {
+             frameSync.reset();
+             destroyApp(*app);
+             return 1;
+         }
+         RX_LOG_INFO("sample_09_scene: default helmet grid loaded -- {} instance(s)", app->renderableHandles.size());
+     }
+     app->sceneReady = true;
+     app->flyCamera.camera.aspectRatio =
+         static_cast<float>(app->device->swapchainExtent().width) / static_cast<float>(std::max<uint32_t>(1U, app->device->swapchainExtent().height));
+diff --git a/samples/09_scene/tests/CMakeLists.txt b/samples/09_scene/tests/CMakeLists.txt
+index afb7343..9067e3b 100644
+--- a/samples/09_scene/tests/CMakeLists.txt
++++ b/samples/09_scene/tests/CMakeLists.txt
+@@ -1,16 +1,19 @@
+ # Device-free (no VkDevice, no rx::platform::Window) -- splitByBlockAndGroup()
+ # (../draw_recording.h) is pure data transformation over plain rx::scene
+ # types, matching src/rx_scene/tests/CMakeLists.txt's own device-free
+ # binary convention. Compiles ../draw_recording.cpp directly rather than
+ # linking a separate library target -- this seam is sample-09-local, not a
+-# reusable engine module (no other sample needs it).
++# reusable engine module (no other sample needs it). test_fly_camera.cpp
++# covers ../fly_camera.h (also device-free, header-only -- no matching .cpp
++# to add) -- the W/S-inversion regression coverage.
+ add_executable(sample_09_scene_tests
+     doctest_main.cpp
+     test_draw_recording.cpp
++    test_fly_camera.cpp
+     "${CMAKE_CURRENT_SOURCE_DIR}/../draw_recording.cpp"
+ )
+ target_link_libraries(sample_09_scene_tests PRIVATE rx_scene doctest::doctest)
+ add_test(NAME sample_09_scene_tests COMMAND sample_09_scene_tests)
+ # Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+ # (windows-cross Wine hang, run 31512073559).
+ set_tests_properties(sample_09_scene_tests PROPERTIES TIMEOUT 120)
+diff --git a/samples/09_scene/tests/test_draw_recording.cpp b/samples/09_scene/tests/test_draw_recording.cpp
+index 74ad9cc..cdcede6 100644
+--- a/samples/09_scene/tests/test_draw_recording.cpp
++++ b/samples/09_scene/tests/test_draw_recording.cpp
+@@ -5,23 +5,26 @@
+ // (draw_recording.h's own top comment has the full derivation): that
+ // function groups purely by adjacent DrawPayload::materialIndex, with no
+ // blockId awareness at all, so two renderables in DIFFERENT blocks that
+ // happen to share one materialIndex collapse into ONE ResolvedDrawGroup a
+ // naive recorder would record as if it were entirely inside a single
+ // GeometryPool::bind() call.
+ #include "../draw_recording.h"
+ 
+ #include <doctest/doctest.h>
+ 
++using rx::samples9::materialIndexForSpan;
+ using rx::samples9::RecordSpan;
+ using rx::samples9::splitByBlockAndGroup;
+ using rx::scene::BlockRange;
++using rx::scene::DrawCommand;
++using rx::scene::DrawPayload;
+ using rx::scene::ResolvedDrawGroup;
+ 
+ TEST_CASE("splitByBlockAndGroup: a single resolved group spanning two blocks splits into two spans, one per "
+           "block, both carrying the group's own pipeline token [discriminates the resolveDrawGroups() "
+           "blockId-blind-spot this header exists to close]") {
+     // Two blocks, two commands each: block 0 = commands [0,2), block 1 =
+     // commands [2,4).
+     const std::vector<BlockRange> blocks{
+         BlockRange{/*blockId=*/0, /*firstCommand=*/0, /*commandCount=*/2},
+         BlockRange{/*blockId=*/1, /*firstCommand=*/2, /*commandCount=*/2},
+@@ -87,10 +90,63 @@ TEST_CASE("splitByBlockAndGroup: a single command (one block, one group) is one
+ 
+     REQUIRE(spans.size() == 1);
+     CHECK(spans[0] == RecordSpan{3, 999, 0, 1});
+ }
+ 
+ TEST_CASE("splitByBlockAndGroup: rangeCount == 0 returns an empty span list") {
+     const std::vector<BlockRange> blocks{BlockRange{0, 0, 1}};
+     const std::vector<ResolvedDrawGroup> groups{ResolvedDrawGroup{0, 1, 1}};
+     CHECK(splitByBlockAndGroup(groups, blocks, 0, 0).empty());
+ }
++
++// --- materialIndexForSpan() [Sponza texture-misassignment regression] ----
++// The real-world shape this reproduces: Sponza's own glTF has 22/25
++// materials sharing one (StandardPBR, Opaque, single-sided) fixed-function
++// state, so MaterialSystem::getPipeline() -- keyed on
++// {moduleHash,passHash,specializationBits,alphaMode,doubleSided}, NEVER on
++// per-material texture data -- legitimately returns the SAME VkPipeline for
++// every one of those 22 DISTINCT materials. `pipelineToken` alone can never
++// distinguish them; `materialIndexForSpan()` must recover the real,
++// distinct materialIndex from each span's own first command instead.
++TEST_CASE("materialIndexForSpan: two DIFFERENT materials sharing ONE pipelineToken (Sponza's own shape -- 22/25 "
++          "materials collapse onto one VkPipeline by fixed-function state) still resolve to their own DISTINCT "
++          "materialIndex per span [regression -- a caller keying descriptor-set selection off pipelineToken "
++          "alone binds the WRONG material's textures for every material but one sharing that token]") {
++    // Two submesh-instances, two DIFFERENT materials (7 and 19 -- arbitrary,
++    // non-adjacent values, deliberately NOT 0/1 so an accidental
++    // materialIndex==payload-array-index coincidence can't hide a bug),
++    // sharing pipelineToken 42 (the fixed-function-state collapse).
++    const std::vector<DrawPayload> payloads{
++        DrawPayload{/*materialIndex=*/7, /*instanceDataIndex=*/0},   // e.g. a column shaft.
++        DrawPayload{/*materialIndex=*/19, /*instanceDataIndex=*/1},  // e.g. a roof/parapet.
++    };
++    const std::vector<DrawCommand> commands{
++        DrawCommand{/*indexCount=*/6, /*instanceCount=*/1, /*firstIndex=*/0, /*vertexOffset=*/0, /*firstInstance=*/0},
++        DrawCommand{/*indexCount=*/6, /*instanceCount=*/1, /*firstIndex=*/6, /*vertexOffset=*/0, /*firstInstance=*/1},
++    };
++    // resolveDrawGroups() still emits TWO groups (materialIndex-ADJACENCY
++    // grouping never merges across a materialIndex change -- draw_list.h's
++    // own documented behavior), both carrying the identical pipelineToken
++    // the shared-pipeline collapse produces.
++    const std::vector<ResolvedDrawGroup> groups{
++        ResolvedDrawGroup{/*firstCommand=*/0, /*commandCount=*/1, /*pipelineToken=*/42},
++        ResolvedDrawGroup{/*firstCommand=*/1, /*commandCount=*/1, /*pipelineToken=*/42},
++    };
++    const std::vector<BlockRange> blocks{BlockRange{/*blockId=*/0, /*firstCommand=*/0, /*commandCount=*/2}};
++
++    const auto spans = splitByBlockAndGroup(groups, blocks, 0, 2);
++    REQUIRE(spans.size() == 2);
++    CHECK(spans[0].pipelineToken == 42);
++    CHECK(spans[1].pipelineToken == 42);  // SAME token -- exactly the case a pipelineToken-keyed lookup conflates.
++
++    CHECK(materialIndexForSpan(commands, payloads, spans[0]) == 7);
++    CHECK(materialIndexForSpan(commands, payloads, spans[1]) == 19);  // MUST differ from spans[0], despite the shared token.
++}
++
++TEST_CASE("materialIndexForSpan: defensive fallback for an empty/out-of-range span (never hit by construction "
++          "from a real splitByBlockAndGroup() result, but must not read out of bounds)") {
++    const std::vector<DrawPayload> payloads{DrawPayload{5, 0}};
++    const std::vector<DrawCommand> commands{DrawCommand{1, 1, 0, 0, 0}};
++
++    CHECK(materialIndexForSpan(commands, payloads, RecordSpan{0, 1, 0, 0}) == 0);   // commandCount == 0.
++    CHECK(materialIndexForSpan(commands, payloads, RecordSpan{0, 1, 5, 1}) == 0);   // commandOffset out of range.
++}
+diff --git a/samples/09_scene/tests/test_fly_camera.cpp b/samples/09_scene/tests/test_fly_camera.cpp
+new file mode 100644
+index 0000000..cea7290
+--- /dev/null
++++ b/samples/09_scene/tests/test_fly_camera.cpp
+@@ -0,0 +1,133 @@
++// samples/09_scene/tests/test_fly_camera.cpp -- proves the W/S-inversion
++// regression: FlyCamera's W input must displace the camera along its OWN
++// camera.forward() direction, not the opposite. The reported defect (W
++// flies backward) lived in updateFlyCamera()'s one-line construction of the
++// world-space move delta -- `glm::vec3(strafe, vertical, -forward)` --
++// which re-negated the `forward` accumulator a SECOND time even though
++// FlyCamera::moveLocal() already multiplies it against camera.forward()
++// itself (which already encodes the "-Z is local forward" convention via
++// rx_scene/camera.h's own forward() accessor). Extracted to
++// flyCameraLocalMoveDelta() (fly_camera.h) so this exact call-site logic is
++// reachable without an rx::platform::Window/SDL/VkDevice -- see that
++// header's own top comment for the full derivation.
++//
++// Every TEST_CASE below drives the REAL production function
++// (flyCameraLocalMoveDelta()) and the REAL FlyCamera::moveLocal()/
++// applyLookDelta(), not a re-implementation -- a bug reintroduced at the
++// call site (main.cpp) would need to also break these assertions to pass
++// CI silently.
++#include "../fly_camera.h"
++
++#include <doctest/doctest.h>
++
++using rx::samples9::FlyCamera;
++using rx::samples9::flyCameraLocalMoveDelta;
++
++namespace {
++constexpr float kEps = 1e-4F;
++
++// Displacement observed from moveLocal() for one frame's worth of input,
++// isolated from the camera's starting position (moveLocal() is a `+=`).
++glm::vec3 observedDisplacement(FlyCamera cam, float forward, float strafe, float vertical, float distance = 1.0F) {
++    const glm::vec3 before = cam.camera.position;
++    const glm::vec3 localDelta = flyCameraLocalMoveDelta(forward, strafe, vertical);
++    REQUIRE(glm::length(localDelta) > kEps);
++    cam.moveLocal(glm::normalize(localDelta) * distance);
++    return cam.camera.position - before;
++}
++}  // namespace
++
++TEST_CASE("FlyCamera: W input (forward=+1) displaces the camera along its OWN camera.forward() direction "
++          "[regression -- the reported bug flew backward on W]") {
++    FlyCamera cam;  // identity orientation: forward() == (0,0,-1).
++    const glm::vec3 disp = observedDisplacement(cam, /*forward=*/1.0F, /*strafe=*/0.0F, /*vertical=*/0.0F, 5.0F);
++
++    // Must move WITH forward(), not against it.
++    CHECK(glm::dot(glm::normalize(disp), cam.camera.forward()) > 0.99F);
++    CHECK(disp.x == doctest::Approx(0.0F).epsilon(kEps));
++    CHECK(disp.y == doctest::Approx(0.0F).epsilon(kEps));
++    CHECK(disp.z == doctest::Approx(-5.0F).epsilon(kEps));  // forward() == (0,0,-1) at identity.
++}
++
++TEST_CASE("FlyCamera: S input (forward=-1) displaces the camera opposite camera.forward()") {
++    FlyCamera cam;
++    const glm::vec3 disp = observedDisplacement(cam, /*forward=*/-1.0F, /*strafe=*/0.0F, /*vertical=*/0.0F, 5.0F);
++
++    CHECK(glm::dot(glm::normalize(disp), cam.camera.forward()) < -0.99F);
++    CHECK(disp.z == doctest::Approx(5.0F).epsilon(kEps));
++}
++
++TEST_CASE("FlyCamera: W displacement matches camera.forward() after a non-trivial yaw+pitch rotation too "
++          "[proves the invariant generally, not only at identity orientation]") {
++    FlyCamera cam;
++    cam.yawRadians = glm::radians(37.0F);
++    cam.pitchRadians = glm::radians(-15.0F);
++    cam.syncOrientation();
++    REQUIRE(glm::length(cam.camera.forward() - glm::vec3(0, 0, -1)) > 0.01F);  // sanity: really rotated.
++
++    const glm::vec3 disp = observedDisplacement(cam, /*forward=*/1.0F, /*strafe=*/0.0F, /*vertical=*/0.0F, 3.0F);
++    CHECK(glm::dot(glm::normalize(disp), cam.camera.forward()) > 0.999F);
++    CHECK(glm::length(disp - cam.camera.forward() * 3.0F) < kEps);
++}
++
++TEST_CASE("FlyCamera: D input (strafe=+1) displaces the camera along camera.right(); A (strafe=-1) opposite") {
++    FlyCamera cam;
++    const glm::vec3 dispD = observedDisplacement(cam, 0.0F, /*strafe=*/1.0F, 0.0F, 2.0F);
++    CHECK(glm::dot(glm::normalize(dispD), cam.camera.right()) > 0.99F);
++
++    const glm::vec3 dispA = observedDisplacement(cam, 0.0F, /*strafe=*/-1.0F, 0.0F, 2.0F);
++    CHECK(glm::dot(glm::normalize(dispA), cam.camera.right()) < -0.99F);
++}
++
++TEST_CASE("FlyCamera: Space input (vertical=+1) displaces the camera along camera.up(); LCtrl (vertical=-1) "
++          "opposite") {
++    FlyCamera cam;
++    const glm::vec3 dispUp = observedDisplacement(cam, 0.0F, 0.0F, /*vertical=*/1.0F, 2.0F);
++    CHECK(glm::dot(glm::normalize(dispUp), cam.camera.up()) > 0.99F);
++
++    const glm::vec3 dispDown = observedDisplacement(cam, 0.0F, 0.0F, /*vertical=*/-1.0F, 2.0F);
++    CHECK(glm::dot(glm::normalize(dispDown), cam.camera.up()) < -0.99F);
++}
++
++TEST_CASE("FlyCamera: gamepad left-stick forward accumulator (forward = -stick.y, SDL's Y-down convention) "
++          "resolves through the SAME shared mapping as keyboard W -- proves the fix covers gamepad move too, "
++          "since updateFlyCamera() feeds both devices into one `forward` accumulator before this function ever "
++          "runs") {
++    FlyCamera cam;
++    constexpr float kStickForwardPush = -1.0F;  // SDL: pushing the stick away from the player reports negative Y.
++    const float forwardAccumulator = -kStickForwardPush;  // updateFlyCamera()'s own `forward += -pad.leftStick.y`.
++    REQUIRE(forwardAccumulator == doctest::Approx(1.0F));
++
++    const glm::vec3 disp = observedDisplacement(cam, forwardAccumulator, 0.0F, 0.0F, 4.0F);
++    CHECK(glm::dot(glm::normalize(disp), cam.camera.forward()) > 0.99F);
++}
++
++TEST_CASE("FlyCamera: mouse-look sense -- moving the mouse right (dx>0) turns the camera toward its OWN "
++          "pre-turn right() direction, not left") {
++    FlyCamera cam;  // identity: forward=(0,0,-1), right=(1,0,0).
++    const glm::vec3 rightBeforeTurn = cam.camera.right();
++
++    cam.applyLookDelta(/*dxRadians=*/glm::radians(20.0F), /*dyRadians=*/0.0F);
++
++    // Turning "right" means the new forward() should have swung toward
++    // where right() used to point.
++    CHECK(glm::dot(cam.camera.forward(), rightBeforeTurn) > 0.0F);
++}
++
++TEST_CASE("FlyCamera: mouse-look sense -- moving the mouse up (dy<0, SDL's own y-increases-downward relative "
++          "motion) tilts the camera to look upward, toward +Y") {
++    FlyCamera cam;
++    cam.applyLookDelta(/*dxRadians=*/0.0F, /*dyRadians=*/-0.3F);  // mouse moved up.
++    CHECK(cam.camera.forward().y > 0.0F);  // looking up now.
++    CHECK(cam.pitchRadians > 0.0F);
++}
++
++TEST_CASE("FlyCamera: W/S-vs-A/D-vs-Space/Ctrl axis assignment [regression -- the fix must not have "
++          "accidentally moved the sign flip onto a different axis]") {
++    // A pure structural check on flyCameraLocalMoveDelta() itself: x is
++    // strafe, y is vertical, z is forward, UNNEGATED.
++    const glm::vec3 delta = flyCameraLocalMoveDelta(/*forward=*/1.0F, /*strafe=*/2.0F, /*vertical=*/3.0F);
++    CHECK(delta.x == doctest::Approx(2.0F));
++    CHECK(delta.y == doctest::Approx(3.0F));
++    CHECK(delta.z == doctest::Approx(1.0F));
++}
