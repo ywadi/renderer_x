@@ -1,0 +1,1333 @@
+# Review package: 9e6a3da..ec86e87
+
+## Commits
+ec86e87 docs: append 08_gltf_viewer in-round closure to the Sponza crash fix report
+e86202c fix(samples): 08_gltf_viewer material-params pool -- same-class DescriptorArena fix as 09
+fe9042f docs: Sponza crash fix report -- root cause, fix rationale, revert evidence
+c3b6d0b chore(tools): temporarily bundle fetched Sponza with the 09_scene package
+5f031bd fix(samples,rx_rhi_vk): size 09_scene material-params pool from real material count (P0)
+
+## Files changed
+ .../sponza-crash-fix-report.md                     | 425 +++++++++++++++++++++
+ samples/08_gltf_viewer/main.cpp                    | 138 +++++--
+ samples/09_scene/main.cpp                          | 143 +++++--
+ src/rx_rhi_vk/tests/descriptor_arena_test.cpp      |  68 ++++
+ tools/package_samples.sh                           |  75 +++-
+ 5 files changed, 785 insertions(+), 64 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-crash-fix-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-crash-fix-report.md
+new file mode 100644
+index 0000000..98dcfcc
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/sponza-crash-fix-report.md
+@@ -0,0 +1,425 @@
++# P0: `sample_09_scene --present --scene Sponza.gltf` NVIDIA crash -- fix + Sponza packaging
++
++Repo: `/media/ywadi/second/renderer_x` (real path only -- every build/test/run
++command in this report was executed from that path, never the
++`/home/ywadi/d2/renderer_x` symlink alias). Started from `main` at `9e6a3da`.
++
++Commits:
++- `5f031bd` fix(samples,rx_rhi_vk): size 09_scene material-params pool from
++  real material count (P0)
++- `c3b6d0b` chore(tools): temporarily bundle fetched Sponza with the
++  09_scene package
++
++Tree stayed clean except the pre-existing, not-mine
++`.superpowers/sdd/2026-08-11-phase4-scene-assets/progress.md` modification
++that was already present before this task started.
++
++## 1. Root cause
++
++**Symptom** (verbatim, reproduced below): `sample_09_scene --present --scene
++<Sponza.gltf>` prints
++
++```
++[error] sample_09_scene: vkAllocateDescriptorSets (material params) failed
++```
++
++on a real, limit-enforcing driver (NVIDIA RTX 2080, driver 580.82.07) about
++half a second in, then fails out.
++
++**Where**: `samples/09_scene/main.cpp`. `makeApp()` built ONE hand-rolled
++`VkDescriptorPool` (`App::materialParamPool`) at startup, sized by a
++`constexpr uint32_t kMaxMaterialParamSets = 8;` -- both `maxSets` and the
++pool's single `VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER` pool-size entry used this
++same constant. The comment at the call site said exactly what it was sized
++for: *"Sized for helmetMaterial (1) + kStressVariantCount (4) -- generous
++headroom either way since only one of the two is ever populated per run."*
++That comment is correct for the grid (1 material) and `--stress` (4
++materials) modes -- and simply never accounts for the THIRD mode,
++`--present --scene <path>`, added later. `setupImportedMaterials()` (called
++only from that third mode) loops over **every material the imported scene
++reports** and calls `finalizeMaterialBinding()` once per material, each call
++doing one `vkAllocateDescriptorSets` (1 set, 1 UBO descriptor) against that
++same 8-set pool. The pool is allocated once, up front, and never reset --
++unlike `rx_material`'s own per-frame `ParamArena`, these sets are static
++material-definition data that must persist for the whole run.
++
++**The exact demand-vs-capacity numbers**:
++
++| | value |
++|---|---|
++| Pool capacity (pre-fix `kMaxMaterialParamSets`) | 8 sets / 8 UBO descriptors |
++| Sponza's own material count (`assets/fetched/Sponza/glTF/Sponza.gltf`, verified via `python3 -m json`) | **25** materials |
++| First failing call | material index 8 (the 9th `finalizeMaterialBinding()` call) |
++| Shortfall | 17 sets short of the real demand |
++
++**Why lavapipe never caught it**: `src/rx_rhi_vk/include/rx_rhi_vk/descriptor_arena.h`'s
++own class-level comment already documents this exact gap for a DIFFERENT
++pool in this codebase (`rx::rhi::DescriptorArena`, used by `rx_material`'s
++`ParamArena`): the Vulkan spec never obligates a driver to detect or report
++`VkDescriptorPool` exhaustion (`vkAllocateDescriptorSets` "may" fail on
++over-allocation, not "must"), and lavapipe/Mesa is a real, spec-conformant
++implementation that does not choose to. `samples/09_scene/main.cpp`'s own
++hand-rolled pool had NO software-side accounting of its own (unlike
++`DescriptorArena`), so it inherited that gap directly: every prior Sponza
++verification of this sample ran under lavapipe, which silently accepted all
++25 allocations against an 8-set pool, and only a real, limit-enforcing
++driver ever surfaced the bug.
++
++**Why this is a sample bug, not a library bug**: `rx::material::MaterialSystem`
++does not own this pool at all -- `samples/08_gltf_viewer` and
++`samples/09_scene` each build their own, separate, hand-rolled "set-1
++material params" `VkDescriptorPool` directly in the sample, structurally
++identical to (but a SEPARATE object from) the set-1 layout
++`MaterialSystem::reflectMaterialLayout()` builds internally per material
++(verified via the Vulkan 14.2.2 pipeline-layout-compatibility argument
++`08_gltf_viewer/main.cpp`'s own comment already spells out). `08_gltf_viewer`
++had already been bumped to `kMaxMaterialParamSets = 64` for the same reason
++(comment: *"Sized generously ... every glTF asset this sample
++ships/documents has far fewer materials than that"*) -- `09_scene` simply
++never received the equivalent bump when its own `--scene <path>` mode was
++added. `MaterialSystem` and `rx::rhi::DescriptorArena` themselves were
++correct and untouched by the bug.
++
++## 2. Fix
++
++**Reused, did not reinvent**: this project's engineering rule is "prefer
++ready-made libraries ... over writing subsystems from scratch." This
++codebase already has exactly the right primitive for this job:
++`rx::rhi::DescriptorArena` (`src/rx_rhi_vk/include/rx_rhi_vk/descriptor_arena.h`)
++-- a sized, arena-enforced `VkDescriptorSet` allocator that tracks its own
++declared capacity in software and refuses (`VK_NULL_HANDLE`, logged) BEFORE
++ever calling `vkAllocateDescriptorSets` once that capacity would be
++exceeded, deterministically on every driver including lavapipe. It was
++previously used only by `rx_material::ParamArena`; `samples/09_scene/main.cpp`
++now uses it directly for its own set-1 material-params pool instead of a
++second, hand-rolled, unaccounted `VkDescriptorPool`.
++
++**Sized from real demand, not a bigger magic number**: `App::materialParamPool`
++(`VkDescriptorPool`) became `App::materialParamArena`
++(`std::optional<rx::rhi::DescriptorArena>`). `makeApp()` still builds the
++mode-independent `VkDescriptorSetLayout` up front, but no longer builds a
++pool at all -- pool creation moved to a new
++`createMaterialParamArena(App&, uint32_t materialCount)` (`main.cpp`, right
++after `makeApp()`), called from `runHeadless()`/`runPresent()` once the
++active mode -- and, for `--scene`, the REAL imported material count -- is
++known, and always before the first `finalizeMaterialBinding()` call for
++that mode:
++
++| call site | `materialCount` passed |
++|---|---|
++| `--stress` (both headless and present) | `kStressVariantCount` (4) |
++| default DamagedHelmet grid (both headless and present) | `1` (only `result.materials[0]` is ever bound) |
++| `--present --scene <path>` (Sponza or any other custom import) | `static_cast<uint32_t>(result.materials.size())` -- the scene's own real count, known only after `importGltf()` returns |
++
++`finalizeMaterialBinding()` now calls
++`app.materialParamArena->allocate(app.materialParamSetLayout, 1)` instead of
++a raw `vkAllocateDescriptorSets`; `destroyApp()` now just
++`.reset()`s the `std::optional<DescriptorArena>` (its destructor destroys
++the underlying pool(s), same effect as the old explicit
++`vkDestroyDescriptorPool` call).
++
++## 3. Regression coverage
++
++Added one new `TEST_CASE` to `src/rx_rhi_vk/tests/descriptor_arena_test.cpp`
++("... discriminates Sponza-scale demand against an undersized pool (8-set
++capacity vs. 25-material demand) deterministically, even under lavapipe"),
++pinning this incident's own two real numbers directly against
++`DescriptorArena`'s arena-enforced accounting:
++
++- An 8-capacity arena (the pre-fix sample constant) accepts EXACTLY 8 of 25
++  allocation attempts and refuses the rest.
++- A 25-capacity arena (what `createMaterialParamArena()` now derives for
++  Sponza) accepts all 25 with zero rejections.
++
++This is the "assertion/accounting check that FAILS on any driver when
++demand would exceed the pool" requirement: the check already lives inside
++`DescriptorArena::allocate()` (arena-side, before the driver call), and this
++new test proves it discriminates on this exact incident's numbers.
++
++### Revert-discrimination evidence (mandatory, scratch, never committed)
++
++**A -- the original bug was real and is what got fixed.** With
++`samples/09_scene/main.cpp` temporarily restored to its pre-fix content
++(`git show 9e6a3da:samples/09_scene/main.cpp`, single file, rebuilt, then
++restored via `git checkout HEAD --` and rebuilt again -- `git diff --stat
++HEAD` empty before and after), the exact crash-report command against the
++real NVIDIA driver reproduced the exact reported symptom:
++
++```
++[2026-08-20 08:23:39.234] [error] sample_09_scene: vkAllocateDescriptorSets (material params) failed
++```
++
++exit code 1. With the fix restored and rebuilt, the identical command runs
++clean (section 4 below).
++
++**B -- the new test genuinely discriminates, not vacuously.** With
++`DescriptorArena::allocate()`'s two arena-enforced budget checks temporarily
++neutered (`if (false && ...)`, `src/rx_rhi_vk/src/descriptor_arena.cpp`,
++rebuilt, then restored via `git checkout HEAD --` and rebuilt again -- `git
++diff --stat HEAD` empty before and after), the new test FAILED under
++lavapipe exactly as expected:
++
++```
++/media/ywadi/second/renderer_x/src/rx_rhi_vk/tests/descriptor_arena_test.cpp:318: ERROR: CHECK( succeeded == kPreFixSampleCapacity ) is NOT correct!
++  values: CHECK( 25 == 8 )
++```
++
++-- i.e. with the arena-side check disabled, lavapipe silently let all 25
++allocations through an 8-set pool (the exact original failure mode,
++reproduced at the mechanism level). With the real check restored, the same
++test passes on both lavapipe and NVIDIA (section 4).
++
++Both experiments used the real build system/binaries/drivers, restored via
++`git checkout HEAD -- <file>` (non-destructive: both files were already
++committed, `git diff --stat HEAD` confirmed empty before starting and after
++finishing each experiment), then rebuilt to leave the tree's actual build
++artifacts in the fixed state before final verification.
++
++**Scope note on "revert-proof"**: the new test exercises
++`rx::rhi::DescriptorArena`'s own arena-enforced mechanism directly (proven
++above to genuinely discriminate), which is what the fix now routes through.
++It does NOT call through `samples/09_scene/main.cpp` itself --
++`sample_09_scene`'s ctest-registered headless gates
++(`sample_09_scene_headless`, `sample_09_scene_stress_headless`) never
++exercise the `--scene <path>` custom-import branch on any driver, before or
++after this fix (only `--present --scene` does, which is interactive-only
++and not ctest-registered). So a future regression in the SAMPLE's own
++`createMaterialParamArena()` call sites (e.g. someone passing a wrong count)
++would not be caught by `ctest` -- but it also could no longer reproduce a
++crash: `DescriptorArena::allocate()`'s own arena-enforced refusal turns any
++such misuse into a clean, loud `RX_LOG_ERROR` + `return false` (exit code 1)
++on every driver, never a driver-dependent failure past a raw
++`vkAllocateDescriptorSets` call. Flagging this as a known coverage gap
++rather than overclaiming full end-to-end ctest coverage of the sample's own
++sizing call sites.
++
++## 4. Verification
++
++### 4a. NVIDIA path (real GPU: GeForce RTX 2080, driver 580.82.07, real X11
++session `:1`, `VK_ICD_FILENAMES` pinned to `/usr/share/vulkan/icd.d/nvidia_icd.json`)
++
++Exact crash-report command, sustained run (SIGTERM after ~30s via `timeout
++32`, caught by SDL and shut down cleanly -- not a crash):
++
++```
++$ timeout 32 ./build/linux-native/samples/09_scene/sample_09_scene --present \
++    --scene /media/ywadi/second/renderer_x/assets/fetched/Sponza/glTF/Sponza.gltf
++...
++[2026-08-20 08:13:18.775] [info] sample_09_scene: material-params descriptor arena sized for 25 material(s)
++[2026-08-20 08:13:20.130] [info] sample_09_scene: '/media/ywadi/second/renderer_x/assets/fetched/Sponza/glTF/Sponza.gltf' loaded -- 1 renderable(s), 25 material(s)
++[2026-08-20 08:13:20.136] [info] rx_platform: gamepad connected id=2 name="Generic X-Box pad" ...
++[2026-08-20 08:13:49.412] [info] rx_material: saved 59416 bytes of pipeline cache data to '.../scene_pipeline.cache'
++[2026-08-20 08:13:49.579] [info] sample_09_scene: window closed cleanly
++```
++
++~29.4s of live rendering (08:13:20.136 load-complete to 08:13:49.412
++shutdown-begin), **zero `[error]`/`[critical]`/fatal/segfault lines** in the
++92-line log.
++
++Same command + `--validate` (Khronos validation layer active), same
++duration: **zero unfiltered validation errors** (`grep -i "\[error\]" | grep
++-v "known false positive"` -> 0 matches; 30097 matches were the
++already-documented, pre-existing "known false positive" sync-validation
++misclassification `context.cpp` already filters -- unrelated to this fix,
++present before and after), clean `window closed cleanly` exit.
++
++### 4b. lavapipe (unaffected)
++
++Full serial `ctest`, `VK_ICD_FILENAMES` pinned to
++`/usr/share/vulkan/icd.d/lvp_icd.json`, `xvfb-run`, from the real repo path:
++
++```
++$ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json xvfb-run -a \
++    ctest --test-dir /media/ywadi/second/renderer_x/build/linux-native --output-on-failure
++...
++100% tests passed, 0 tests failed out of 29
++Total Test time (real) =  75.24 sec
++```
++
++**29/29**, run a second time after the revert-evidence rebuilds in section
++3 to confirm the final committed state is what's green. The new
++`rx_rhi_vk_tests` regression test (part of `#6`) and both `sample_09_scene`
++headless gates (`#27`/`#28`) are included and pass.
++
++Full `rx_rhi_vk_tests` binary in isolation (not just the DescriptorArena
++cases), both drivers: **72/72 test cases, 2153/2153 assertions (lavapipe)**,
++**72/72 test cases, 2164/2164 assertions (NVIDIA)**.
++
++### 4c. windows-cross-zig
++
++```
++$ cmake --build build/windows-cross-zig --target sample_09_scene rx_rhi_vk_tests -j"$(nproc)"
++...
++[4/4] Linking CXX executable samples/09_scene/sample_09_scene.exe
++$ cmake --build build/windows-cross-zig -j"$(nproc)"
++ninja: no work to do.
++```
++
++Clean build, targeted rebuild + a full incremental rebuild of the whole
++preset (confirms nothing else in the dependency graph broke).
++
++### 4d. Packaging (Task 2)
++
++```
++$ bash tools/package_samples.sh linux-native linux-x86_64 <zip>
++...
++09_scene/assets/Sponza/glTF/Sponza.gltf        (167176 bytes)
++09_scene/assets/Sponza/glTF/Sponza.bin         (9528220 bytes)
+++ 69 more files (textures) under 09_scene/assets/Sponza/glTF/
++09_scene/assets/Sponza/PROVENANCE.txt          (153 bytes)
++package_samples: done.
++```
++
++71 files staged under `09_scene/assets/Sponza/glTF/` (matches
++`tools/fetch_assets.sh`'s own documented Sponza file count exactly), plus
++`PROVENANCE.txt`. `LICENSE*`/`README*` glob for an upstream license file
++found nothing to copy (`tools/fetch_assets.sh --sponza` does not itself
++fetch one -- see `PROVENANCE.txt`'s own citation of the license instead).
++
++Unzipped OUTSIDE the repo
++(`/tmp/claude-1000/.../scratchpad/p0_pkg_verify*/`, well outside
++`/media/ywadi/second/renderer_x`), ran the packaged binary against the
++BUNDLED path from inside the extracted `09_scene/` directory:
++
++```
++$ ./sample_09_scene --present --scene assets/Sponza/glTF/Sponza.gltf
++...
++[info] sample_09_scene: material-params descriptor arena sized for 25 material(s)
++[info] sample_09_scene: 'assets/Sponza/glTF/Sponza.gltf' loaded -- 1 renderable(s), 25 material(s)
++...
++[info] sample_09_scene: window closed cleanly
++```
++
++Zero `[error]`/fatal/segfault lines. Repeated once more after the final
++re-package (post revert-evidence rebuilds) with the same clean result.
++
++Packaged zip size: 425MB total (linux-native, all 9 samples); Sponza's own
++footprint inside `09_scene/`: ~51MB (matches `tools/fetch_assets.sh`'s own
++documented "~53 MB" estimate).
++
++## 5. README note for the coordinator (not made by this task -- packaging
++script does not own README.txt generation)
++
++The 09_scene zip's README.txt (added by hand at release-packaging time, per
++this repo's own convention) should now additionally document the bundled
++Sponza path:
++
++```
++./sample_09_scene --present --scene assets/Sponza/glTF/Sponza.gltf
++```
++
++alongside the existing DamagedHelmet-default documentation, and should note
++that this bundling is TEMPORARY (owner directive, "for now") and licensed
++under the CRYENGINE Limited License Agreement (see
++`assets/Sponza/PROVENANCE.txt`), not Creative Commons like DamagedHelmet.
++
++## 6. Deviations / concerns
++
++- **`samples/08_gltf_viewer` shared the same architectural pattern** (a
++  hand-rolled, fixed-size `VkDescriptorPool` for set-1 material params,
++  `kMaxMaterialParamSets = 64`) -- NOT broken at the time of the original
++  report (25 <= 64 for Sponza) and out of this P0's originally stated scope
++  (the crash report named `sample_09_scene` only). **Closed in-round per
++  coordinator instruction -- see section 7 below** rather than left as a
++  follow-up: same defect class, found while this exact fix was fresh, so it
++  closed now instead of going to the registry.
++- **Packaging bundling is explicitly temporary** per the owner directive
++  quoted in the task and in the commit message/code comments -- both the
++  header-comment addendum and the staging block itself in
++  `tools/package_samples.sh` are marked for removal once a real long-term
++  Sponza distribution story is decided.
++- **ctest coverage gap for `--scene <path>`** noted explicitly in section 3
++  above (no headless ctest gate exercises the custom-import branch on any
++  driver); the fix converts a driver-dependent crash into a clean, loud,
++  portable failure if that branch's own sizing call is ever wrong again,
++  but does not add ctest-level coverage of the sample's own call sites --
++  doing so would need either extracting the sizing logic into a testable
++  library seam or a new interactive/present-mode ctest entry, both judged
++  out of scope for this P0.
++- No board/issue/plan/spec/ledger files touched, no push performed, per
++  task constraints.
++
++## 7. In-round closure: `samples/08_gltf_viewer`'s identical pattern (`e86202c`)
++
++Coordinator instruction: close the same-class defect in
++`samples/08_gltf_viewer` now rather than defer it -- its own set-1
++"material params" pool used the identical hand-rolled, fixed-size
++`VkDescriptorPool` shape (`kMaxMaterialParamSets = 64`) as `09_scene`'s
++pre-fix pool, built before the real material count was known. Not broken at
++25 <= 64, but the same landmine one asset away, and `08_gltf_viewer`'s own
++`--scene <path>` accepts ANY glTF asset (not gated to a curated Sponza
++special-case like `09_scene`'s), so it is if anything MORE exposed.
++
++**Fix (mirrors section 2 above exactly)**: `App::materialParamPool`
++(`VkDescriptorPool`) -> `App::materialParamArena`
++(`std::optional<rx::rhi::DescriptorArena>`); the `VkDescriptorSetLayout`
++stays built unconditionally in `makeApp()`, but pool creation moved to a new
++`createMaterialParamArena(App&, uint32_t materialCount)`. One structural
++difference from `09_scene`: `08_gltf_viewer` has no separate grid/stress/
++custom-scene modes -- `setupMaterials()` is the ONLY material-setup path,
++invoked from inside `importGltfAsync()`'s completion callback (both
++`runHeadless()`'s and `runPresent()`'s own async import). `createMaterialParamArena(*app,
++static_cast<uint32_t>(result.materials.size()))` is now called at the top
++of that SAME callback, before `setupMaterials()`, at both call sites. That
++callback is confirmed main-thread-only by `registry.h`'s own D5 contract
++("GPU uploads and every registry mutation are marshalled to the main
++thread... this Registry's own main thread is whichever thread also calls
++`scheduler.pumpMain()` each frame"), so building a `VkDescriptorPool` there
++is safe. `setupMaterials()`'s own allocation now calls
++`app.materialParamArena->allocate(app.materialParamSetLayout, 1)` instead of
++a raw `vkAllocateDescriptorSets`. `destroyApp()` now just `.reset()`s the
++`std::optional<DescriptorArena>`.
++
++No new regression test added for this closure -- it reuses the exact same
++`rx::rhi::DescriptorArena` mechanism section 3's Sponza-scale (8-vs-25) test
++already pins; that test already proves the underlying arena-enforced
++accounting discriminates deterministically on every driver, including
++lavapipe, and both samples now route through the identical, already-covered
++primitive.
++
++### Verification
++
++- **08's own headless ctest gates, isolated**:
++  ```
++  $ ctest --test-dir build/linux-native -R "sample_08" --output-on-failure
++  1/2 Test #25: sample_08_gltf_viewer_headless ...........   Passed    1.54 sec
++  2/2 Test #26: sample_08_gltf_viewer_quit_during_load ...   Passed    1.34 sec
++  100% tests passed, 0 tests failed out of 2
++  ```
++  `sample_08_gltf_viewer_headless` includes the D17 pixel-tolerance
++  reference-image gate -- passing confirms the pool-routing change produced
++  byte-identical rendered output, as expected (same descriptor contents,
++  different allocator underneath).
++
++- **Real NVIDIA driver, labeled**: GeForce RTX 2080, driver 580.82.07,
++  `VK_ICD_FILENAMES` pinned to `/usr/share/vulkan/icd.d/nvidia_icd.json`,
++  real X11 session `:1`. `sample_08_gltf_viewer --present --validate`
++  (default DamagedHelmet mode, no `--scene` override), sustained ~14s
++  (`timeout 15`, SDL caught the terminating signal and shut down cleanly):
++  ```
++  [info] sample_08_gltf_viewer: material-params descriptor arena sized for 1 material(s)
++  [info] sample_08_gltf_viewer: scene '.../DamagedHelmet.gltf' loaded -- 1 draw(s)
++  ...
++  [info] sample_08_gltf_viewer: window closed cleanly
++  ```
++  Zero unfiltered `[error]` lines (`grep -i "\[error\]" | grep -v "known
++  false positive"` -> 0 matches); every match was the same pre-existing,
++  already-documented "known false positive" sync-validation
++  misclassification `context.cpp` already filters (unrelated to this
++  change, present before and after).
++
++- **Full serial ctest, once, lavapipe-labeled**: `VK_ICD_FILENAMES` pinned
++  to `/usr/share/vulkan/icd.d/lvp_icd.json`, `xvfb-run`, real repo path:
++  ```
++  100% tests passed, 0 tests failed out of 29
++  Total Test time (real) =  75.43 sec
++  ```
++  **29/29**, run after the 08 fix was built (includes both 08's own gates
++  and every test from section 4b).
++
++### Commit
++
++`e86202c` fix(samples): 08_gltf_viewer material-params pool -- same-class
++DescriptorArena fix as 09. Pathspec-scoped to
++`samples/08_gltf_viewer/main.cpp` only, author = local git config (Yousef
++Wadi), no AI attribution, not pushed.
+diff --git a/samples/08_gltf_viewer/main.cpp b/samples/08_gltf_viewer/main.cpp
+index 7e2b859..943524a 100644
+--- a/samples/08_gltf_viewer/main.cpp
++++ b/samples/08_gltf_viewer/main.cpp
+@@ -75,20 +75,21 @@
+ #include <rx_graph/executor.h>
+ #include <rx_graph/render_graph.h>
+ #include <rx_material/draw_data.h>
+ #include <rx_material/material_system.h>
+ #include <rx_platform/window.h>
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/deletion_queue.h>
++#include <rx_rhi_vk/descriptor_arena.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/frame_sync.h>
+ #include <rx_rhi_vk/pipeline_layout.h>
+ #include <rx_rhi_vk/upload.h>
+ #include <rx_scene/camera.h>
+ #include <rx_shader/compiler.h>
+ #include <rx_shader/reflection.h>
+ #include <rx_task/scheduler.h>
+ 
+ #include <reference_gate.h>
+@@ -720,24 +721,47 @@ struct App {
+     // VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT) to what
+     // MaterialSystem::reflectMaterialLayout() (material_system.cpp) builds
+     // internally for EVERY material's own set 1 -- verified directly against
+     // that function's own source (kMaterialParamBlockSet=1,
+     // kMaterialParamBlockBinding=0, kMaterialStageFlags=VERTEX|FRAGMENT).
+     // Two SEPARATELY created VkDescriptorSetLayout objects with identical
+     // content are "identically defined" per the Vulkan spec's own pipeline-
+     // layout-COMPATIBILITY rule (14.2.2) -- a VkDescriptorSet allocated from
+     // THIS layout is valid to bind at set 1 against a VkPipelineLayout
+     // MaterialSystem itself built, with no cross-library accessor needed for
+-    // MaterialSystem's own (private) layout object. ONE shared pool sized
+-    // for this scene's material count (kMaxMaterialParamSets below).
++    // MaterialSystem's own (private) layout object.
++    //
++    // [In-round closure, same-class defect as samples/09_scene's own P0 fix
++    // -- see that sample's identical App::materialParamArena comment for the
++    // full account] The SET LAYOUT is scene-independent (built once, in
++    // makeApp()) but the POOL is NOT: this sample's own `--scene <path>`
++    // accepts ANY glTF asset, so how many set-1 VkDescriptorSets a run ever
++    // needs is scene-dependent and unknowable until `importGltfAsync()`'s
++    // completion callback reports the real material count. A fixed pool
++    // built before that (the pre-fix `kMaxMaterialParamSets = 64` constant,
++    // picked only because "every glTF asset this sample ships/documents has
++    // far fewer materials than that") is sized for the wrong scene the
++    // moment a caller passes a bigger one -- exactly the landmine that
++    // crashed samples/09_scene against Sponza's 25 materials (8-set pool)
++    // one asset away from tripping here too. `rx::rhi::DescriptorArena` is
++    // this engine's own existing, already-tested "size it, and refuse
++    // over-budget allocations before ever calling the driver" abstraction
++    // (src/rx_rhi_vk/tests/descriptor_arena_test.cpp) -- reused here at
++    // framesInFlight=1 (this pool is allocated ONCE per run and never
++    // reset; set-1 material params are static for a material's lifetime,
++    // unlike rx_material's own per-instance, per-frame ParamArena) instead
++    // of a second, hand-rolled, unaccounted VkDescriptorPool. Built by
++    // createMaterialParamArena() below, from the REAL material count
++    // `result.materials.size()` reports, once that count is known -- never
++    // before the async import's own completion callback has it.
+     VkDescriptorSetLayout materialParamSetLayout = VK_NULL_HANDLE;
+-    VkDescriptorPool materialParamPool = VK_NULL_HANDLE;
++    std::optional<rx::rhi::DescriptorArena> materialParamArena;
+ 
+     std::vector<MaterialGpuBinding> materialBindings;
+     std::unordered_map<uint32_t, size_t> materialHandleToBinding;  // rx::asset::MaterialHandle::index() -> materialBindings[].
+     std::vector<DrawItem> draws;
+     // [Phase 4 exit fix wave, I1] TWO physical buffers, one per
+     // `rx::rhi::FrameSync::kFramesInFlight` slot -- NOT one shared buffer.
+     // A single buffer rewritten every frame races frame N-1's GPU reads of
+     // it: the present loop's own `vkWaitForFences(currentFence)` (called
+     // BEFORE `updateDrawDataPerPassFields()` already, in this sample) only
+     // proves frame N-2 (the slot's own last user) is done -- frame N-1
+@@ -937,79 +961,98 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
+     if (!compiler.has_value()) {
+         RX_LOG_ERROR("sample_08_gltf_viewer: rx::shader::Compiler::create failed");
+         return nullptr;
+     }
+     if (!buildTonemapPipeline(app->device->device(), *compiler, app->bindless->descriptorSetLayout(),
+                               app->device->swapchainFormat(), basePath / "tonemap.vert.slang",
+                               basePath / "tonemap.frag.slang", app->tonemapPass)) {
+         return nullptr;
+     }
+ 
+-    // Material set-1 param descriptor infrastructure -- see App::
+-    // materialParamSetLayout's own comment. Sized generously (kMaxMaterialParamSets
+-    // sets -- every glTF asset this sample ships/documents has far fewer
+-    // materials than that; a larger asset simply needs this bumped, logged
+-    // loudly if ever exceeded via vkAllocateDescriptorSets' own
+-    // VK_ERROR_OUT_OF_POOL_MEMORY).
++    // Material set-1 param descriptor SET LAYOUT -- see App::
++    // materialParamSetLayout's own comment. Scene-independent (every scene
++    // uses the same one-UBO-binding shape), so this is still built here,
++    // unconditionally. The POOL itself is NOT built here anymore -- see
++    // App::materialParamArena's own comment for why: it needs the real
++    // per-scene material count, which isn't known until the import's own
++    // completion callback reports it. createMaterialParamArena() below
++    // builds it once that count is known.
+     VkDescriptorSetLayoutBinding uboBinding{};
+     uboBinding.binding = 0;
+     uboBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+     uboBinding.descriptorCount = 1;
+     uboBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+     VkDescriptorSetLayoutCreateInfo setLayoutInfo{};
+     setLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+     setLayoutInfo.bindingCount = 1;
+     setLayoutInfo.pBindings = &uboBinding;
+     if (vkCreateDescriptorSetLayout(app->device->device(), &setLayoutInfo, nullptr, &app->materialParamSetLayout) !=
+         VK_SUCCESS) {
+         RX_LOG_ERROR("sample_08_gltf_viewer: vkCreateDescriptorSetLayout (material params) failed");
+         return nullptr;
+     }
+-    constexpr uint32_t kMaxMaterialParamSets = 64;
+-    std::array<VkDescriptorPoolSize, 1> poolSizes{
+-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxMaterialParamSets}};
+-    VkDescriptorPoolCreateInfo poolInfo{};
+-    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+-    poolInfo.maxSets = kMaxMaterialParamSets;
+-    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+-    poolInfo.pPoolSizes = poolSizes.data();
+-    if (vkCreateDescriptorPool(app->device->device(), &poolInfo, nullptr, &app->materialParamPool) != VK_SUCCESS) {
+-        RX_LOG_ERROR("sample_08_gltf_viewer: vkCreateDescriptorPool (material params) failed");
+-        return nullptr;
+-    }
+ 
+     return app;
+ }
+ 
++// Builds App::materialParamArena, sized EXACTLY from `materialCount` -- the
++// real number of set-1 VkDescriptorSets this run will ever allocate
++// (result.materials.size() from whichever scene --scene resolved to), never
++// a fixed magic number picked for one asset and silently reused for every
++// other one [the exact bug this replaces -- see App::materialParamArena's
++// own comment; identical fix already applied to samples/09_scene's own
++// equivalent pool]. Must be called exactly once, after importGltfAsync()'s
++// completion callback has the scene's real material count, and before the
++// first setupMaterials() call. `materialCount == 0` is clamped to 1 --
++// rx::rhi::DescriptorArena::create() rejects a zero capacity outright, and
++// an empty-material scene still needs a valid (if never-used) arena for
++// destroyApp()'s own unconditional teardown path.
++bool createMaterialParamArena(App& app, uint32_t materialCount) {
++    const uint32_t sets = std::max<uint32_t>(materialCount, 1);
++    const rx::rhi::DescriptorArena::Capacities capacities{/*maxSets=*/sets, /*uniformBuffers=*/sets};
++    auto arena = rx::rhi::DescriptorArena::create(app.device->device(), /*framesInFlight=*/1, capacities);
++    if (!arena.has_value()) {
++        RX_LOG_ERROR("sample_08_gltf_viewer: DescriptorArena::create (material params) failed for {} material(s)",
++                     materialCount);
++        return false;
++    }
++    app.materialParamArena = std::move(*arena);
++    RX_LOG_INFO("sample_08_gltf_viewer: material-params descriptor arena sized for {} material(s)", sets);
++    return true;
++}
++
+ // Tears down EVERYTHING except `app.context`/`app.window`/`app.surface` --
+ // deliberately stops one step short of Context so both callers (runHeadless()/
+ // runPresent()) can still call `app.context->hasValidationErrors()`
+ // immediately afterward and have it mean something: the debug-utils
+ // messenger callback that populates that flag is owned by Context and stays
+ // live throughout every vkDestroy* call this function itself makes (device,
+ // allocator, uploader, bindless pool, tonemap pipeline, material descriptor
+ // pool, ...) -- so checking it right after this function returns, before
+ // `app` itself is destroyed, is what actually satisfies this task's own
+ // binding constraint ("zero unfiltered validation errors INCLUDING
+ // teardown-time"), matching sample07/06's own identical
+ // `destroyScene(); if (validate && context->hasValidationErrors())` ordering.
+ void destroyApp(App& app) {
+     if (app.device.has_value() && app.device->device() != VK_NULL_HANDLE) {
+         vkDeviceWaitIdle(app.device->device());
+     }
+     for (MaterialGpuBinding& binding : app.materialBindings) {
+-        binding.paramBuffer.reset();  // paramSet itself is freed implicitly by vkDestroyDescriptorPool below.
+-    }
+-    if (app.materialParamPool != VK_NULL_HANDLE) {
+-        vkDestroyDescriptorPool(app.device->device(), app.materialParamPool, nullptr);
+-        app.materialParamPool = VK_NULL_HANDLE;
+-    }
++        binding.paramBuffer.reset();  // paramSet itself is freed implicitly by the arena's own pool teardown below.
++    }
++    // rx::rhi::DescriptorArena's own destructor (via std::optional::reset())
++    // destroys its underlying VkDescriptorPool(s) -- exactly what the
++    // explicit vkDestroyDescriptorPool() call this replaces did. A run that
++    // never called createMaterialParamArena() (e.g. an early setupApp()
++    // failure before any import ever completed) leaves this optional empty
++    // -- reset() on an empty optional is a documented no-op.
++    app.materialParamArena.reset();
+     if (app.materialParamSetLayout != VK_NULL_HANDLE) {
+         vkDestroyDescriptorSetLayout(app.device->device(), app.materialParamSetLayout, nullptr);
+         app.materialParamSetLayout = VK_NULL_HANDLE;
+     }
+     for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
+         if (app.drawDataBufferHandles[slot].isValid() && app.bindless.has_value()) {
+             app.bindless->release(app.drawDataBufferHandles[slot]);
+         }
+         app.drawDataBuffers[slot].reset();
+     }
+@@ -1186,28 +1229,36 @@ bool setupMaterials(App& app, const rx::asset::Registry& registry,
+         auto paramBuffer = app.allocator->createHostVisibleBuffer(blockSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                                                      rx::rhi::MemoryCategory::Internal);
+         if (!paramBuffer.has_value()) {
+             RX_LOG_ERROR("sample_08_gltf_viewer: createHostVisibleBuffer (material params) failed for material '{}'",
+                          asset.name);
+             return false;
+         }
+         std::memcpy(paramBuffer->mappedData(), binding.paramBlob.data(), blockSize);
+         paramBuffer->flush();
+ 
+-        VkDescriptorSetAllocateInfo allocInfo{};
+-        allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+-        allocInfo.descriptorPool = app.materialParamPool;
+-        allocInfo.descriptorSetCount = 1;
+-        allocInfo.pSetLayouts = &app.materialParamSetLayout;
+-        VkDescriptorSet paramSet = VK_NULL_HANDLE;
+-        if (vkAllocateDescriptorSets(app.device->device(), &allocInfo, &paramSet) != VK_SUCCESS) {
+-            RX_LOG_ERROR("sample_08_gltf_viewer: vkAllocateDescriptorSets (material params) failed for material '{}'",
++        // [In-round closure, same-class defect as samples/09_scene's own P0
++        // fix] Allocated through App::materialParamArena, NOT a raw
++        // vkAllocateDescriptorSets against a hand-sized VkDescriptorPool --
++        // the arena tracks this pool's own declared capacity and refuses
++        // (clean VK_NULL_HANDLE, logged) BEFORE ever calling the driver if
++        // this allocation would exceed it, deterministically on every
++        // driver including lavapipe. createMaterialParamArena() sizes the
++        // arena from the real per-scene material count, so a legitimate
++        // call here should never be refused -- if it is, that sizing call
++        // was skipped/wrong for this scene, a caller bug this refusal
++        // surfaces immediately (clean logged failure) instead of crashing
++        // past it on a real, limit-enforcing driver.
++        VkDescriptorSet paramSet = app.materialParamArena->allocate(app.materialParamSetLayout, /*uniformBufferDescriptorCount=*/1);
++        if (paramSet == VK_NULL_HANDLE) {
++            RX_LOG_ERROR("sample_08_gltf_viewer: material-params descriptor arena allocation failed for material "
++                         "'{}' (pool exhausted or driver rejection -- see DescriptorArena's own preceding log line)",
+                          asset.name);
+             return false;
+         }
+         VkDescriptorBufferInfo bufferInfo{paramBuffer->handle(), 0, blockSize};
+         VkWriteDescriptorSet write{};
+         write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+         write.dstSet = paramSet;
+         write.dstBinding = 0;
+         write.descriptorCount = 1;
+         write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+@@ -1875,20 +1926,30 @@ int runHeadless(const Args& args) {
+     rx::asset::AsyncImportHandle importHandle = app->registry->importGltfAsync(
+         scenePath, *app->geometryPool, *app->scheduler, app->textureCache.get(),
+         [&](rx::asset::ImportResult result) {
+             importFinished = true;
+             importOk = result.ok();
+             if (!importOk) {
+                 RX_LOG_ERROR("sample_08_gltf_viewer: import of '{}' failed: {}", scenePath.string(),
+                              rx::asset::importErrorName(result.error));
+                 return;
+             }
++            // [In-round closure] Sized from THIS scene's real material
++            // count -- not a fixed magic number that crashes past 64
++            // materials on a real driver. See App::materialParamArena's own
++            // comment. Runs on the main thread (importGltfAsync()'s own
++            // D5 completion-callback contract), so building a VkDescriptor
++            // pool here is safe.
++            if (!createMaterialParamArena(*app, static_cast<uint32_t>(result.materials.size()))) {
++                importOk = false;
++                return;
++            }
+             if (!setupMaterials(*app, *app->registry, result.materials) ||
+                 !buildDrawList(*app, *app->registry, result.scene)) {
+                 importOk = false;
+                 return;
+             }
+             frameCameraToScene(*app);
+             app->sceneReady = true;
+             importMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - importStart)
+                            .count();
+         });
+@@ -2177,20 +2238,27 @@ int runPresent(const Args& args) {
+     // pass (recordForward()'s own !app.sceneReady branch) renders every
+     // frame until this completes.
+     rx::asset::AsyncImportHandle importHandle = app->registry->importGltfAsync(
+         scenePath, *app->geometryPool, *app->scheduler, app->textureCache.get(),
+         [&](rx::asset::ImportResult result) {
+             if (!result.ok()) {
+                 RX_LOG_ERROR("sample_08_gltf_viewer: import of '{}' failed: {}", scenePath.string(),
+                              rx::asset::importErrorName(result.error));
+                 return;
+             }
++            // [In-round closure] Sized from THIS scene's real material
++            // count -- see App::materialParamArena's own comment and the
++            // headless runner's identical call above.
++            if (!createMaterialParamArena(*app, static_cast<uint32_t>(result.materials.size()))) {
++                RX_LOG_ERROR("sample_08_gltf_viewer: post-import scene setup failed for '{}'", scenePath.string());
++                return;
++            }
+             if (!setupMaterials(*app, *app->registry, result.materials) ||
+                 !buildDrawList(*app, *app->registry, result.scene)) {
+                 RX_LOG_ERROR("sample_08_gltf_viewer: post-import scene setup failed for '{}'", scenePath.string());
+                 return;
+             }
+             frameCameraToScene(*app);
+             app->sceneReady = true;
+             RX_LOG_INFO("sample_08_gltf_viewer: scene '{}' loaded -- {} draw(s)", scenePath.string(),
+                         app->draws.size());
+         });
+diff --git a/samples/09_scene/main.cpp b/samples/09_scene/main.cpp
+index 82b74bd..f639e1e 100644
+--- a/samples/09_scene/main.cpp
++++ b/samples/09_scene/main.cpp
+@@ -74,20 +74,21 @@
+ #include <rx_graph/executor.h>
+ #include <rx_graph/render_graph.h>
+ #include <rx_material/draw_data.h>
+ #include <rx_material/material_system.h>
+ #include <rx_platform/window.h>
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/deletion_queue.h>
++#include <rx_rhi_vk/descriptor_arena.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/frame_sync.h>
+ #include <rx_rhi_vk/memory_report.h>
+ #include <rx_rhi_vk/pipeline_layout.h>
+ #include <rx_rhi_vk/upload.h>
+ #include <rx_scene/camera.h>
+ #include <rx_scene/draw_list.h>
+ #include <rx_scene/scene.h>
+ #include <rx_shader/compiler.h>
+ #include <rx_shader/reflection.h>
+@@ -633,22 +634,46 @@ struct App {
+     CompiledPass tonemapPass;
+     VkSampler defaultSampler = VK_NULL_HANDLE;
+     rx::rhi::BindlessHandle defaultSamplerHandle;
+     VkImageView lastHdrView = VK_NULL_HANDLE;
+     rx::rhi::BindlessHandle hdrHandle;
+ 
+     // Set-1 (material params) descriptor infrastructure -- identical shape
+     // to samples/08_gltf_viewer's own (one VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+     // at binding 0, VERTEX|FRAGMENT) -- see that file's own comment for the
+     // Vulkan pipeline-layout-compatibility argument this relies on.
++    //
++    // [P0 crash fix] The SET LAYOUT is mode-independent (created once, in
++    // makeApp()) but the POOL is NOT: how many set-1 VkDescriptorSets this
++    // run ever needs depends entirely on which mode is active -- 1 for the
++    // DamagedHelmet grid, kStressVariantCount for --stress, or the REAL,
++    // scene-dependent material count for a `--scene <path>` import (Sponza's
++    // own glTF has 25). A single fixed-size pool created before any of that
++    // is known (the pre-fix `kMaxMaterialParamSets = 8` constant) is sized
++    // for the wrong mode by construction the moment a caller picks a
++    // different one -- that undersizing crashed `--present --scene
++    // Sponza.gltf` on a real, limit-enforcing NVIDIA driver (25 > 8) while
++    // passing clean under lavapipe, which never enforces VkDescriptorPool's
++    // own maxSets/pool-size ceilings at all (see descriptor_arena.h's own
++    // BUDGETS ARE ARENA-ENFORCED comment). rx::rhi::DescriptorArena is this
++    // engine's own existing, already-tested "size it, and refuse
++    // over-budget allocations before ever calling the driver" abstraction
++    // (src/rx_rhi_vk/tests/descriptor_arena_test.cpp) -- reused here at
++    // framesInFlight=1 (this pool is allocated ONCE per run and never reset;
++    // set-1 material params are static for a material's lifetime, unlike
++    // rx_material's own per-instance, per-frame ParamArena) instead of hand-
++    // rolling a second, unaccounted VkDescriptorPool. Created by
++    // createMaterialParamArena() below, from the REAL material count for
++    // whichever mode this run selected, once that count is known -- never
++    // before runHeadless()/runPresent() have picked a mode.
+     VkDescriptorSetLayout materialParamSetLayout = VK_NULL_HANDLE;
+-    VkDescriptorPool materialParamPool = VK_NULL_HANDLE;
++    std::optional<rx::rhi::DescriptorArena> materialParamArena;
+ 
+     // --- Scene (grid or stress -- mutually exclusive per run) -----------
+     bool stressMode = false;
+     std::optional<rx::scene::Scene> scene;
+     std::optional<rx::scene::DrawListBuilder> drawListBuilder;
+     rx::scene::LightHandle lightHandle;
+     std::vector<rx::scene::RenderableHandle> renderableHandles;  // grid mode: index == row*kGridCols+col.
+ 
+     // Grid-mode material (DamagedHelmet, real Registry-backed).
+     MaterialGpuBinding helmetMaterial;
+@@ -965,54 +990,73 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
+         return nullptr;
+     }
+ 
+     // Shadow-caster pipeline [D21, RC3] -- built outside MaterialSystem.
+     app->shadowCaster = rx::shadow::ShadowCasterPipeline::create(*app->device, *app->bindless, {}, app->shadowShaderDir);
+     if (app->shadowCaster == nullptr) {
+         RX_LOG_ERROR("sample_09_scene: ShadowCasterPipeline::create failed");
+         return nullptr;
+     }
+ 
+-    // Material set-1 param descriptor infrastructure -- see
++    // Material set-1 param descriptor SET LAYOUT -- see
+     // samples/08_gltf_viewer's own identical block for the full rationale.
+-    // Sized for helmetMaterial (1) + kStressVariantCount (4) -- generous
+-    // headroom either way since only one of the two is ever populated per
+-    // run.
++    // Mode-independent (every mode uses the same one-UBO-binding shape), so
++    // this is still built here, unconditionally. The POOL itself is NOT
++    // built here anymore -- see App::materialParamArena's own comment for
++    // why: it needs the real, mode-dependent material count, which isn't
++    // known yet at this point in startup. createMaterialParamArena() below
++    // builds it once that count is known.
+     VkDescriptorSetLayoutBinding uboBinding{};
+     uboBinding.binding = 0;
+     uboBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+     uboBinding.descriptorCount = 1;
+     uboBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+     VkDescriptorSetLayoutCreateInfo setLayoutInfo{};
+     setLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+     setLayoutInfo.bindingCount = 1;
+     setLayoutInfo.pBindings = &uboBinding;
+     if (vkCreateDescriptorSetLayout(app->device->device(), &setLayoutInfo, nullptr, &app->materialParamSetLayout) !=
+         VK_SUCCESS) {
+         RX_LOG_ERROR("sample_09_scene: vkCreateDescriptorSetLayout (material params) failed");
+         return nullptr;
+     }
+-    constexpr uint32_t kMaxMaterialParamSets = 8;
+-    std::array<VkDescriptorPoolSize, 1> poolSizes{VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxMaterialParamSets}};
+-    VkDescriptorPoolCreateInfo poolInfo{};
+-    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+-    poolInfo.maxSets = kMaxMaterialParamSets;
+-    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+-    poolInfo.pPoolSizes = poolSizes.data();
+-    if (vkCreateDescriptorPool(app->device->device(), &poolInfo, nullptr, &app->materialParamPool) != VK_SUCCESS) {
+-        RX_LOG_ERROR("sample_09_scene: vkCreateDescriptorPool (material params) failed");
+-        return nullptr;
+-    }
+ 
+     return app;
+ }
+ 
++// Builds App::materialParamArena, sized EXACTLY from `materialCount` -- the
++// real number of set-1 VkDescriptorSets this run will ever allocate (1 for
++// the DamagedHelmet grid, kStressVariantCount for --stress, or
++// result.materials.size() for a `--scene <path>` import), never a fixed
++// magic number picked for one mode and silently reused for every other one
++// [the exact bug this replaces -- see App::materialParamArena's own
++// comment]. Must be called exactly once, after the caller has determined
++// which mode is active and (for a custom import) after importGltf() has
++// returned its real material count, and before the first
++// finalizeMaterialBinding() call for that mode. `materialCount == 0` is
++// clamped to 1 -- rx::rhi::DescriptorArena::create() rejects a zero
++// capacity outright, and an empty-material scene still needs a valid (if
++// never-used) arena for destroyApp()'s own unconditional teardown path.
++bool createMaterialParamArena(App& app, uint32_t materialCount) {
++    const uint32_t sets = std::max<uint32_t>(materialCount, 1);
++    const rx::rhi::DescriptorArena::Capacities capacities{/*maxSets=*/sets, /*uniformBuffers=*/sets};
++    auto arena = rx::rhi::DescriptorArena::create(app.device->device(), /*framesInFlight=*/1, capacities);
++    if (!arena.has_value()) {
++        RX_LOG_ERROR("sample_09_scene: DescriptorArena::create (material params) failed for {} material(s)",
++                     materialCount);
++        return false;
++    }
++    app.materialParamArena = std::move(*arena);
++    RX_LOG_INFO("sample_09_scene: material-params descriptor arena sized for {} material(s)", sets);
++    return true;
++}
++
+ void destroyShadowResources(App& app) {
+     const VkDevice device = app.device->device();
+     for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
+         if (app.shadowDrawDataBufferHandles[slot].isValid()) {
+             app.bindless->release(app.shadowDrawDataBufferHandles[slot]);
+         }
+         app.shadowDrawDataBuffers[slot].reset();
+     }
+     // [Phase 4 exit fix wave, C1] No sample-owned shadow VkImage/
+     // VkDeviceMemory/VkImageView to destroy anymore -- "shadowmap" is a
+@@ -1045,24 +1089,27 @@ void destroyApp(App& app) {
+     // overrides, e.g. Sponza's own 25 materials) was never torn down here
+     // -- a real resource leak an independent review's own end-to-end
+     // Sponza run surfaced directly: VUID-vkDestroyDevice-device-00378
+     // ("child objects... has not been destroyed") fired once per leaked
+     // material param VkBuffer at process exit. helmetMaterial/
+     // stressMaterialBindings above were both handled; this one was missed.
+     for (MaterialGpuBinding& binding : app.customMaterialBindings) {
+         binding.paramBuffer.reset();
+     }
+     app.helmetMaterial.paramBuffer.reset();
+-    if (app.materialParamPool != VK_NULL_HANDLE) {
+-        vkDestroyDescriptorPool(app.device->device(), app.materialParamPool, nullptr);
+-        app.materialParamPool = VK_NULL_HANDLE;
+-    }
++    // rx::rhi::DescriptorArena's own destructor (via std::optional::reset())
++    // destroys its underlying VkDescriptorPool(s) -- exactly what the
++    // explicit vkDestroyDescriptorPool() call this replaces did. A run that
++    // never called createMaterialParamArena() (e.g. an early setupApp()
++    // failure before any mode was selected) leaves this optional empty --
++    // reset() on an empty optional is a documented no-op.
++    app.materialParamArena.reset();
+     if (app.materialParamSetLayout != VK_NULL_HANDLE) {
+         vkDestroyDescriptorSetLayout(app.device->device(), app.materialParamSetLayout, nullptr);
+         app.materialParamSetLayout = VK_NULL_HANDLE;
+     }
+     for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
+         if (app.drawDataBufferHandles[slot].isValid() && app.bindless.has_value()) {
+             app.bindless->release(app.drawDataBufferHandles[slot]);
+         }
+         app.drawDataBuffers[slot].reset();
+     }
+@@ -1147,28 +1194,36 @@ bool finalizeMaterialBinding(App& app, MaterialGpuBinding& binding, const std::v
+                               uint32_t blockSize) {
+     auto paramBuffer =
+         app.allocator->createHostVisibleBuffer(blockSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
+     if (!paramBuffer.has_value()) {
+         RX_LOG_ERROR("sample_09_scene: createHostVisibleBuffer (material params) failed");
+         return false;
+     }
+     std::memcpy(paramBuffer->mappedData(), blob.data(), blockSize);
+     paramBuffer->flush();
+ 
+-    VkDescriptorSetAllocateInfo allocInfo{};
+-    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+-    allocInfo.descriptorPool = app.materialParamPool;
+-    allocInfo.descriptorSetCount = 1;
+-    allocInfo.pSetLayouts = &app.materialParamSetLayout;
+-    VkDescriptorSet paramSet = VK_NULL_HANDLE;
+-    if (vkAllocateDescriptorSets(app.device->device(), &allocInfo, &paramSet) != VK_SUCCESS) {
+-        RX_LOG_ERROR("sample_09_scene: vkAllocateDescriptorSets (material params) failed");
++    // [P0 crash fix] Allocated through App::materialParamArena, NOT a raw
++    // vkAllocateDescriptorSets against a hand-sized VkDescriptorPool -- the
++    // arena tracks this pool's own declared capacity and refuses (clean
++    // VK_NULL_HANDLE, logged) BEFORE ever calling the driver if this
++    // allocation would exceed it, deterministically on every driver
++    // including lavapipe (see descriptor_arena.h's own BUDGETS ARE
++    // ARENA-ENFORCED comment). createMaterialParamArena() sizes the arena
++    // from the real per-run material count, so a legitimate call here
++    // should never be refused -- if it is, either that sizing call was
++    // skipped/wrong for the active mode, or materialCount undercounted the
++    // scene's real materials; both are caller bugs this refusal surfaces
++    // immediately instead of crashing past it.
++    VkDescriptorSet paramSet = app.materialParamArena->allocate(app.materialParamSetLayout, /*uniformBufferDescriptorCount=*/1);
++    if (paramSet == VK_NULL_HANDLE) {
++        RX_LOG_ERROR("sample_09_scene: material-params descriptor arena allocation failed (pool exhausted or driver "
++                     "rejection -- see DescriptorArena's own preceding log line)");
+         return false;
+     }
+     VkDescriptorBufferInfo bufferInfo{paramBuffer->handle(), 0, blockSize};
+     VkWriteDescriptorSet write{};
+     write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+     write.dstSet = paramSet;
+     write.dstBinding = 0;
+     write.descriptorCount = 1;
+     write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+     write.pBufferInfo = &bufferInfo;
+@@ -2443,20 +2498,24 @@ int runHeadless(const Args& args) {
+     }
+ 
+     bool gateOk = true;
+     uint32_t expectedTotalCandidates = 0;
+     uint32_t expectedCulled = 0;
+     uint32_t expectedVisible = 0;
+     uint32_t expectedRecordsIn = 0;
+     uint32_t expectedDrawsSubmitted = 0;
+ 
+     if (args.stress) {
++        if (!createMaterialParamArena(*app, kStressVariantCount)) {
++            destroyApp(*app);
++            return 1;
++        }
+         if (!setupStressMaterials(*app)) {
+             destroyApp(*app);
+             return 1;
+         }
+         if (!buildStressField(*app, args.stressDraws)) {
+             destroyApp(*app);
+             return 1;
+         }
+         buildPipelineTokenMap(*app, app->stressMaterialBindings);
+         app->shadowEnabled = false;
+@@ -2476,20 +2535,27 @@ int runHeadless(const Args& args) {
+         rx::asset::ImportResult result = app->registry->importGltf(scenePath, *app->geometryPool, *app->scheduler, app->textureCache.get());
+         if (!result.ok() || result.meshes.empty() || result.materials.empty()) {
+             RX_LOG_ERROR("sample_09_scene: import of '{}' failed: {}", scenePath.string(), rx::asset::importErrorName(result.error));
+             destroyApp(*app);
+             return 1;
+         }
+         app->helmetLocalBounds = app->registry->mesh(result.meshes[0]).bounds;
+         const size_t submeshCount = app->registry->mesh(result.meshes[0]).submeshes.size();
+         RX_LOG_INFO("sample_09_scene: import counts meshes={} submeshes={} materials={} grid_instances={}", result.meshes.size(),
+                     submeshCount, result.materials.size(), kGridInstanceCount);
++        // Exactly 1 material used (result.materials[0]) regardless of how
++        // many the DamagedHelmet asset itself reports -- matches
++        // setupHelmetMaterial()'s own single-material call below.
++        if (!createMaterialParamArena(*app, 1)) {
++            destroyApp(*app);
++            return 1;
++        }
+         if (!setupHelmetMaterial(*app, app->registry->material(result.materials[0]))) {
+             destroyApp(*app);
+             return 1;
+         }
+         if (!populateHelmetGrid(*app, result.meshes[0])) {
+             destroyApp(*app);
+             return 1;
+         }
+         buildPipelineTokenMap(*app, std::span<const MaterialGpuBinding>(&app->helmetMaterial, 1));
+         if (!setupShadow(*app)) {
+@@ -2916,20 +2982,25 @@ int runPresent(const Args& args) {
+     const VkDevice vkDevice = app->device->device();
+     auto frameSync = rx::rhi::FrameSync::create(vkDevice, app->device->graphicsQueueFamily(),
+                                                  static_cast<uint32_t>(app->device->swapchainImages().size()));
+     if (!frameSync.has_value()) {
+         RX_LOG_ERROR("sample_09_scene: FrameSync::create failed");
+         destroyApp(*app);
+         return 1;
+     }
+ 
+     if (args.stress) {
++        if (!createMaterialParamArena(*app, kStressVariantCount)) {
++            frameSync.reset();
++            destroyApp(*app);
++            return 1;
++        }
+         if (!setupStressMaterials(*app) || !buildStressField(*app, args.stressDraws)) {
+             frameSync.reset();
+             destroyApp(*app);
+             return 1;
+         }
+         buildPipelineTokenMap(*app, app->stressMaterialBindings);
+         app->shadowEnabled = false;
+     } else if (!args.scenePath.empty()) {
+         const std::filesystem::path scenePath =
+             args.scenePath == "sponza" ? resolveSponzaScenePath() : std::filesystem::path(args.scenePath);
+@@ -2945,20 +3016,29 @@ int runPresent(const Args& args) {
+             app->registry->importGltf(scenePath, *app->geometryPool, *app->scheduler, app->textureCache.get());
+         if (!result.ok()) {
+             RX_LOG_ERROR("sample_09_scene: import of '{}' failed: {}", scenePath.string(), rx::asset::importErrorName(result.error));
+             frameSync.reset();
+             destroyApp(*app);
+             return 1;
+         }
+         app->scene.emplace(rx::scene::meshBoundsFromRegistry(*app->registry));
+         app->drawListBuilder.emplace(rx::scene::meshSubmeshesFromRegistry(*app->registry),
+                                       rx::scene::materialResolveFromRegistry(*app->registry));
++        // [P0 crash fix] Sized from THIS scene's real material count
++        // (Sponza's own glTF: 25) -- not the fixed grid/stress-only
++        // constant that crashed `--present --scene Sponza.gltf` on a real
++        // NVIDIA driver. See App::materialParamArena's own comment.
++        if (!createMaterialParamArena(*app, static_cast<uint32_t>(result.materials.size()))) {
++            frameSync.reset();
++            destroyApp(*app);
++            return 1;
++        }
+         if (!setupImportedMaterials(*app, *app->registry, result.materials) ||
+             !populateImportedInstances(*app, *app->registry, result.scene)) {
+             frameSync.reset();
+             destroyApp(*app);
+             return 1;
+         }
+         buildPipelineTokenMap(*app, app->customMaterialBindings);
+         if (!setupShadow(*app)) {
+             frameSync.reset();
+             destroyApp(*app);
+@@ -2976,20 +3056,27 @@ int runPresent(const Args& args) {
+         }
+         rx::asset::ImportResult result =
+             app->registry->importGltf(scenePath, *app->geometryPool, *app->scheduler, app->textureCache.get());
+         if (!result.ok() || result.meshes.empty() || result.materials.empty()) {
+             RX_LOG_ERROR("sample_09_scene: import of '{}' failed: {}", scenePath.string(), rx::asset::importErrorName(result.error));
+             frameSync.reset();
+             destroyApp(*app);
+             return 1;
+         }
+         app->helmetLocalBounds = app->registry->mesh(result.meshes[0]).bounds;
++        // Exactly 1 material used (result.materials[0]) -- matches
++        // setupHelmetMaterial()'s own single-material call below.
++        if (!createMaterialParamArena(*app, 1)) {
++            frameSync.reset();
++            destroyApp(*app);
++            return 1;
++        }
+         if (!setupHelmetMaterial(*app, app->registry->material(result.materials[0])) || !populateHelmetGrid(*app, result.meshes[0])) {
+             frameSync.reset();
+             destroyApp(*app);
+             return 1;
+         }
+         buildPipelineTokenMap(*app, std::span<const MaterialGpuBinding>(&app->helmetMaterial, 1));
+         if (!setupShadow(*app)) {
+             frameSync.reset();
+             destroyApp(*app);
+             return 1;
+diff --git a/src/rx_rhi_vk/tests/descriptor_arena_test.cpp b/src/rx_rhi_vk/tests/descriptor_arena_test.cpp
+index 063b2fa..bc014ec 100644
+--- a/src/rx_rhi_vk/tests/descriptor_arena_test.cpp
++++ b/src/rx_rhi_vk/tests/descriptor_arena_test.cpp
+@@ -264,10 +264,78 @@ TEST_CASE("DescriptorArena::allocate enforces its own maxSets and per-type unifo
+ 
+             vkDestroyDescriptorSetLayout(fixture.device, twoUboLayout, nullptr);
+         }
+ 
+         vkDestroyDescriptorSetLayout(fixture.device, oneUboLayout, nullptr);
+     }
+ 
+     vkb::destroy_device(fixture.vkbDevice);
+     CHECK_FALSE(fixture.context.hasValidationErrors());
+ }
++
++// [P0 regression pin] samples/09_scene/main.cpp crashed running
++// `sample_09_scene --present --scene <Sponza.gltf>` on a real, limit-
++// enforcing NVIDIA driver: its own hand-rolled "material params"
++// VkDescriptorPool was fixed at capacity=8 (justified only for that
++// sample's grid/stress modes), while Sponza's own glTF asset has 25
++// materials, each needing one set-1 VkDescriptorSet -- vkAllocateDescriptorSets
++// failed on the 9th. lavapipe let the SAME oversubscription through clean
++// (it never enforces VkDescriptorPool's own maxSets/pool-size ceilings --
++// descriptor_arena.h's own BUDGETS ARE ARENA-ENFORCED comment), which is
++// exactly why every prior Sponza verification of that sample missed this:
++// only a real driver's own pool enforcement ever surfaced it there. The fix
++// (samples/09_scene/main.cpp's createMaterialParamArena()) now routes that
++// same allocation through THIS class instead of a raw, unaccounted pool, so
++// this test pins the two concrete real-world numbers from that incident
++// directly against DescriptorArena's own arena-enforced accounting -- which
++// discriminates demand > capacity deterministically on every driver,
++// including lavapipe, with zero dependence on a real GPU's own enforcement.
++TEST_CASE("DescriptorArena::allocate discriminates Sponza-scale demand against an undersized pool (8-set capacity "
++          "vs. 25-material demand) deterministically, even under lavapipe") {
++    HeadlessDescriptorArenaFixture fixture = makeFixture();
++
++    constexpr uint32_t kPreFixSampleCapacity = 8;    // sample_09_scene's own pre-fix kMaxMaterialParamSets constant.
++    constexpr uint32_t kSponzaMaterialCount = 25;    // assets/fetched/Sponza/glTF/Sponza.gltf's real material count.
++
++    {
++        VkDescriptorSetLayout layout = makeUboSetLayout(fixture.device);
++
++        // --- The undersized (pre-fix) pool: accepts EXACTLY its declared
++        // capacity and refuses every allocation past it -- the arena's own
++        // accounting, not driver behavior, is what discriminates
++        // demand > capacity, and it must hold identically under lavapipe.
++        {
++            rx::rhi::DescriptorArena::Capacities undersized{kPreFixSampleCapacity, kPreFixSampleCapacity};
++            auto arena = rx::rhi::DescriptorArena::create(fixture.device, /*framesInFlight=*/1, undersized);
++            REQUIRE(arena.has_value());
++            arena->beginFrame(0);
++
++            uint32_t succeeded = 0;
++            for (uint32_t i = 0; i < kSponzaMaterialCount; ++i) {
++                if (arena->allocate(layout) != VK_NULL_HANDLE) {
++                    ++succeeded;
++                }
++            }
++            CHECK(succeeded == kPreFixSampleCapacity);
++        }
++
++        // --- The fixed pool: sized from the real material count (exactly
++        // what createMaterialParamArena() now does) accepts the FULL
++        // demand with zero rejections -- proves the fix's own sizing
++        // strategy, not just the enforcement mechanism, is correct.
++        {
++            rx::rhi::DescriptorArena::Capacities fixed{kSponzaMaterialCount, kSponzaMaterialCount};
++            auto arena = rx::rhi::DescriptorArena::create(fixture.device, /*framesInFlight=*/1, fixed);
++            REQUIRE(arena.has_value());
++            arena->beginFrame(0);
++
++            for (uint32_t i = 0; i < kSponzaMaterialCount; ++i) {
++                CHECK(arena->allocate(layout) != VK_NULL_HANDLE);
++            }
++        }
++
++        vkDestroyDescriptorSetLayout(fixture.device, layout, nullptr);
++    }
++
++    vkb::destroy_device(fixture.vkbDevice);
++    CHECK_FALSE(fixture.context.hasValidationErrors());
++}
+diff --git a/tools/package_samples.sh b/tools/package_samples.sh
+index 5debccd..340b08a 100755
+--- a/tools/package_samples.sh
++++ b/tools/package_samples.sh
+@@ -87,21 +87,32 @@
+ #                     + references/ (grid_scene.png, this sample's own D17
+ #                     committed lavapipe reference) + Slang runtime libs +
+ #                     LICENSE + a PRE-STAGED copy of the DamagedHelmet glTF
+ #                     asset (this sample's own default scene, same
+ #                     packaged-first lookup convention as 08's
+ #                     resolveHelmetScenePath()) plus its own dual
+ #                     CC-BY-4.0/CC-BY-NC-4.0 attribution text -- the SAME
+ #                     asset 08 already stages, staged again here since each
+ #                     sample's own packaged subdirectory is self-contained
+ #                     (no cross-sample sharing in the redistribution
+-#                     layout).
++#                     layout). [TEMPORARY, pre-go-live only, owner
++#                     directive -- see the "package sponza with the sample"
++#                     staging block below] ALSO ships a pre-staged copy of
++#                     the fetched Sponza glTF asset under
++#                     assets/Sponza/glTF/ (resolveSponzaScenePath()'s own
++#                     packaged-first lookup) plus assets/Sponza/
++#                     PROVENANCE.txt -- unlike DamagedHelmet above, this is
++#                     NOT a permanent packaging decision and carries no
++#                     vendored legal text of its own (CRYENGINE-licensed
++#                     test content, not Creative Commons -- see the repo's
++#                     own test-asset ruling in tools/fetch_assets.sh's
++#                     header comment).
+ #
+ # This script does NOT build anything -- it assumes `cmake --build
+ # --preset <preset>` already ran and each sample's build-output directory
+ # already has its runtime libs/assets deployed next to its binary (that
+ # deployment is CMake's job: rx_shader_deploy_runtime_libs() in
+ # src/rx_shader/CMakeLists.txt for the Slang libs, and each sample's own
+ # POST_BUILD copy step for its on-disk asset). This script's only job is to
+ # select, per sample, the subset of that build-output directory a
+ # redistributed copy actually needs -- leaving out CMake/Ninja build
+ # bookkeeping (CMakeFiles/, cmake_install.cmake, CTestTestfile.cmake, *.pdb,
+@@ -367,19 +378,81 @@ DamagedHelmet -- CC-BY-4.0 AND CC-BY-NC-4.0
+ The combination of these two licenses means the whole asset carries the
+ Non-Commercial restriction forward (CC-BY-NC-4.0), not a plain CC BY grant.
+ The full legal text of both licenses is bundled alongside this file:
+ CC-BY-4.0.txt and CC-BY-NC-4.0.txt (fetched verbatim from
+ creativecommons.org/licenses/{by,by-nc}/4.0/legalcode.txt).
+ RX_DAMAGED_HELMET_LICENSE
+ copy_required "$STAGE_DIR/09_scene/assets/DamagedHelmet" \
+   "$REPO_ROOT/samples/09_scene/licenses/CC-BY-4.0.txt" \
+   "$REPO_ROOT/samples/09_scene/licenses/CC-BY-NC-4.0.txt"
+ 
++# ===========================================================================
++# TEMPORARY, pre-go-live-only staging block -- owner directive: "package
++# sponza with the sample for now and we will remove it later". Unlike
++# DamagedHelmet's own staging above (a permanent packaging decision, spec
++# Fixed decision #11), bundling Sponza here is explicitly NOT meant to
++# outlive this stopgap -- it exists so a redistributed sample_09_scene can
++# run the exact command this project's own crash reports/verification runs
++# use (`--present --scene assets/Sponza/glTF/Sponza.gltf`) without a
++# separate multi-hundred-MB fetch step, until a real long-term distribution
++# story for this asset is decided. Remove this whole block (and its header-
++# comment counterpart above) once that happens.
++#
++# Requires `tools/fetch_assets.sh --sponza` to have already populated
++# assets/fetched/Sponza/glTF/ on the PACKAGING HOST -- this script still
++# does not fetch anything itself (this file's own header comment) -- fails
++# loudly with the exact instruction if absent, matching copy_required's own
++# convention for every other required-but-missing input above.
++SPONZA_SRC="$REPO_ROOT/assets/fetched/Sponza/glTF"
++if [[ ! -d "$SPONZA_SRC" ]]; then
++  echo "package_samples: '$SPONZA_SRC' does not exist -- run tools/fetch_assets.sh --sponza first" >&2
++  exit 1
++fi
++mkdir -p "$STAGE_DIR/09_scene/assets/Sponza/glTF"
++# Whole-directory copy, NOT an enumerated file list like DamagedHelmet's own
++# 7-file staging above -- Sponza's own glTF directory carries 71 files (one
++# .gltf + one .bin + ~64 textures; see tools/fetch_assets.sh's own Sponza
++# comment), impractical -- and brittle against a future re-fetch under a
++# different SPONZA_VERSION with renamed textures -- to hardcode one by one.
++# `copy_required`'s per-file existence check is redundant here: the
++# directory-existence check above already covers "nothing fetched" and
++# `cp -a` itself fails loudly (non-zero exit, under `set -e`) on any other
++# read error.
++cp -a "$SPONZA_SRC"/. "$STAGE_DIR/09_scene/assets/Sponza/glTF/"
++
++# Provenance note per the repo's test-asset ruling [tools/fetch_assets.sh's
++# own header comment: Sponza is CRYENGINE Limited License Agreement content,
++# NOT Creative Commons] -- a one-line note travels with the bundled asset;
++# no further ceremony (no vendored legal text, unlike DamagedHelmet's own
++# dual-CC-license attribution above -- this is deliberately lighter-weight,
++# matching the temporary nature of this whole block).
++cat >"$STAGE_DIR/09_scene/assets/Sponza/PROVENANCE.txt" <<'RX_SPONZA_PROVENANCE'
++Sponza -- source: KhronosGroup/glTF-Sample-Assets (Models/Sponza/glTF)
++License: CRYENGINE Limited License Agreement (https://www.cryengine.com/ce-terms)
++RX_SPONZA_PROVENANCE
++
++# Upstream LICENSE/README file, IF tools/fetch_assets.sh's own fetch ever
++# picks one up next to the model (it does not today: fetch_sponza_helper.py
++# mirrors the GitHub Contents API listing for Models/Sponza/glTF/ only,
++# which upstream does not itself contain a LICENSE/README file -- those
++# live one directory up, at Models/Sponza/, which this project's fetch
++# script does not currently pull) -- copied alongside PROVENANCE.txt above
++# rather than silently never bundled if that ever changes. Globs that match
++# nothing expand to their own literal (non-existent) pattern text under this
++# script's default (non-nullglob) shell options, so the `-f` check below
++# safely no-ops in that case rather than needing `shopt -s nullglob`.
++for RX_SPONZA_LICENSE_CANDIDATE in "$REPO_ROOT/assets/fetched/Sponza"/LICENSE* "$REPO_ROOT/assets/fetched/Sponza"/README*; do
++  if [[ -f "$RX_SPONZA_LICENSE_CANDIDATE" ]]; then
++    cp -a "$RX_SPONZA_LICENSE_CANDIDATE" "$STAGE_DIR/09_scene/assets/Sponza/"
++  fi
++done
++# ===========================================================================
++
+ mkdir -p "$(dirname "$RX_OUT_ZIP")"
+ RX_OUT_ZIP_ABS="$(cd "$(dirname "$RX_OUT_ZIP")" && pwd)/$(basename "$RX_OUT_ZIP")"
+ rm -f "$RX_OUT_ZIP_ABS"
+ 
+ echo "package_samples: zipping into '$RX_OUT_ZIP_ABS' ..."
+ (cd "$STAGE_DIR" && zip -r -X -q "$RX_OUT_ZIP_ABS" 01_triangle 02_hotreload 03_bindless_mesh 04_streaming 05_multipass 06_materials 07_stress 08_gltf_viewer 09_scene)
+ 
+ echo "package_samples: done. Contents:"
+ unzip -l "$RX_OUT_ZIP_ABS"
