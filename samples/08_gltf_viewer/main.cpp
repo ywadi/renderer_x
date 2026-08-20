@@ -735,10 +735,30 @@ struct App {
     std::vector<MaterialGpuBinding> materialBindings;
     std::unordered_map<uint32_t, size_t> materialHandleToBinding;  // rx::asset::MaterialHandle::index() -> materialBindings[].
     std::vector<DrawItem> draws;
-    std::optional<rx::rhi::Buffer> drawDataBuffer;
-    rx::rhi::BindlessHandle drawDataBufferHandle;
-    // CPU-side mirror of every row currently uploaded to `drawDataBuffer` --
-    // `model`/`normalMatrix`/`materialIndex` are written once (buildDrawList())
+    // [Phase 4 exit fix wave, I1] TWO physical buffers, one per
+    // `rx::rhi::FrameSync::kFramesInFlight` slot -- NOT one shared buffer.
+    // A single buffer rewritten every frame races frame N-1's GPU reads of
+    // it: the present loop's own `vkWaitForFences(currentFence)` (called
+    // BEFORE `updateDrawDataPerPassFields()` already, in this sample) only
+    // proves frame N-2 (the slot's own last user) is done -- frame N-1
+    // always used the OTHER slot, so per-slot buffers are what makes that
+    // proof sufficient. Mirrors `rx::material::MaterialSystem`'s own
+    // `ParamArena` FIF discipline (the named precedent:
+    // `material_system.h`'s `beginFrame()` documents the identical "only
+    // after the caller's own fence wait for this slot" contract).
+    // `currentFrameSlot`-th buffer is written by
+    // `updateDrawDataPerPassFields()`, called only after that fence wait.
+    std::array<std::optional<rx::rhi::Buffer>, rx::rhi::FrameSync::kFramesInFlight> drawDataBuffers;
+    std::array<rx::rhi::BindlessHandle, rx::rhi::FrameSync::kFramesInFlight> drawDataBufferHandles;
+    // [Phase 4 exit fix wave, I1] Which FIF slot `recordSceneDraws()` should
+    // bind this frame -- set once per frame, on the main thread, alongside
+    // `updateDrawDataPerPassFields()`'s own call (both happen inside
+    // `recordForward()`'s caller, never from a worker: this sample's
+    // forward pass is a plain setExecute() whole-pass callback, not
+    // chunked).
+    uint32_t currentFrameSlot = 0;
+    // CPU-side mirror of every row currently uploaded to `drawDataBuffers[currentFrameSlot]`
+    // -- `model`/`normalMatrix`/`materialIndex` are written once (buildDrawList())
     // and never change again (a static scene); `viewProj`/`lightDirWorld`/
     // `lightColor`/`ambientColor`/`cameraPosWorld` are per-PASS (D26.1's own
     // "repeated per row" design, draw_data.h) and are overwritten here, every
@@ -987,10 +1007,12 @@ void destroyApp(App& app) {
         vkDestroyDescriptorSetLayout(app.device->device(), app.materialParamSetLayout, nullptr);
         app.materialParamSetLayout = VK_NULL_HANDLE;
     }
-    if (app.drawDataBufferHandle.isValid() && app.bindless.has_value()) {
-        app.bindless->release(app.drawDataBufferHandle);
+    for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
+        if (app.drawDataBufferHandles[slot].isValid() && app.bindless.has_value()) {
+            app.bindless->release(app.drawDataBufferHandles[slot]);
+        }
+        app.drawDataBuffers[slot].reset();
     }
-    app.drawDataBuffer.reset();
     destroyCompiledPass(app.device->device(), app.tonemapPass);
     if (app.defaultSamplerHandle.isValid() && app.bindless.has_value()) {
         app.bindless->release(app.defaultSamplerHandle);
@@ -1282,25 +1304,33 @@ bool buildDrawList(App& app, const rx::asset::Registry& registry, const rx::asse
         return false;
     }
 
+    // [Phase 4 exit fix wave, I1] One physical buffer PER frame-in-flight
+    // slot -- see App::drawDataBuffers' own comment. Both slots are primed
+    // with the SAME initial content here (static per-row fields; per-pass
+    // fields still at DrawDataGpu's own defaults, exactly like the
+    // pre-fix single-buffer path -- updateDrawDataPerPassFields() below
+    // fully overwrites both before either is ever read by a real draw).
     const VkDeviceSize bytes = static_cast<VkDeviceSize>(app.drawDataRows.size()) * sizeof(rx::material::DrawDataGpu);
-    auto buffer = app.allocator->createHostVisibleBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                                            rx::rhi::MemoryCategory::Internal);
-    if (!buffer.has_value()) {
-        RX_LOG_ERROR("sample_08_gltf_viewer: createHostVisibleBuffer (draw data, {} rows) failed",
-                     app.drawDataRows.size());
-        return false;
-    }
-    std::memcpy(buffer->mappedData(), app.drawDataRows.data(), static_cast<size_t>(bytes));
-    buffer->flush();
+    for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
+        auto buffer = app.allocator->createHostVisibleBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                                                rx::rhi::MemoryCategory::Internal);
+        if (!buffer.has_value()) {
+            RX_LOG_ERROR("sample_08_gltf_viewer: createHostVisibleBuffer (draw data, {} rows, slot {}) failed",
+                         app.drawDataRows.size(), slot);
+            return false;
+        }
+        std::memcpy(buffer->mappedData(), app.drawDataRows.data(), static_cast<size_t>(bytes));
+        buffer->flush();
 
-    rx::rhi::BindlessHandle handle = app.bindless->registerStorageBuffer(buffer->handle(), bytes);
-    if (!handle.isValid()) {
-        RX_LOG_ERROR("sample_08_gltf_viewer: registerStorageBuffer (draw data) failed");
-        return false;
-    }
+        rx::rhi::BindlessHandle handle = app.bindless->registerStorageBuffer(buffer->handle(), bytes);
+        if (!handle.isValid()) {
+            RX_LOG_ERROR("sample_08_gltf_viewer: registerStorageBuffer (draw data, slot {}) failed", slot);
+            return false;
+        }
 
-    app.drawDataBuffer = std::move(buffer);
-    app.drawDataBufferHandle = handle;
+        app.drawDataBuffers[slot] = std::move(buffer);
+        app.drawDataBufferHandles[slot] = handle;
+    }
     return true;
 }
 
@@ -1383,7 +1413,20 @@ glm::mat4 computeViewProj(const OrbitCamera& camera, float aspect) {
 // non-black" precedent (that file's own `kAmbient = 0.08`), nudged slightly
 // brighter here since THIS sample has no second light/shadow term to lean
 // on at all.
-void updateDrawDataPerPassFields(App& app, const glm::mat4& viewProj, const glm::vec3& cameraPosWorld) {
+// [Phase 4 exit fix wave, I1] `frameSlot` selects which of the two
+// per-FIF physical buffers this call writes -- CALLER CONTRACT: must be
+// called only after the caller has confirmed, via its own fence wait, that
+// frame `frameSlot`'s prior GPU work (the last frame that used this SAME
+// physical slot) has completed. Both this sample's call sites already
+// call this after `vkWaitForFences(frameSync->currentFence())` (the
+// present loop) or with no concurrent GPU work at all (the fully
+// synchronous headless capture path) -- see App::drawDataBuffers' own
+// comment for why per-slot addressing, not merely fence-wait ordering
+// alone, is what closes the I1 finding (a single shared buffer written
+// after the fence wait still races frame N-1's GPU reads of the OTHER
+// slot's turn).
+void updateDrawDataPerPassFields(App& app, const glm::mat4& viewProj, const glm::vec3& cameraPosWorld, uint32_t frameSlot) {
+    app.currentFrameSlot = frameSlot;
     const glm::vec3 lightDirWorld = glm::normalize(glm::vec3(0.4F, 1.0F, 0.6F));
     const glm::vec3 lightColor(5.0F, 5.0F, 5.0F);
     const glm::vec3 ambientColor(0.18F, 0.18F, 0.18F);
@@ -1397,8 +1440,8 @@ void updateDrawDataPerPassFields(App& app, const glm::mat4& viewProj, const glm:
         row.cameraPosWorld = glm::vec4(cameraPosWorld, 0.0F);
     }
     const VkDeviceSize bytes = static_cast<VkDeviceSize>(app.drawDataRows.size()) * sizeof(rx::material::DrawDataGpu);
-    std::memcpy(app.drawDataBuffer->mappedData(), app.drawDataRows.data(), static_cast<size_t>(bytes));
-    app.drawDataBuffer->flush();
+    std::memcpy(app.drawDataBuffers[frameSlot]->mappedData(), app.drawDataRows.data(), static_cast<size_t>(bytes));
+    app.drawDataBuffers[frameSlot]->flush();
 }
 
 // --- Forward pass recording [D26.1] -------------------------------------
@@ -1445,7 +1488,8 @@ void recordSceneDraws(VkCommandBuffer cmd, App& app) {
             // own header comment).
             rx::material::MaterialGlobalsPush push;
             push.defaultSamplerIndex = app.defaultSamplerHandle.index();
-            push.drawDataBufferIndex = app.drawDataBufferHandle.index();
+            // [Phase 4 exit fix wave, I1] `app.currentFrameSlot`-th buffer.
+            push.drawDataBufferIndex = app.drawDataBufferHandles[app.currentFrameSlot].index();
             push.exposure = app.exposure;
             vkCmdPushConstants(cmd, layout, material.pushStages, material.pushOffset, material.pushSize, &push);
 
@@ -1916,7 +1960,10 @@ int runHeadless(const Args& args) {
     if (app->sceneReady) {
         const float aspect = static_cast<float>(kHeadlessWidth) / static_cast<float>(kHeadlessHeight);
         const glm::mat4 viewProj = computeViewProj(app->camera, aspect);
-        updateDrawDataPerPassFields(*app, viewProj, app->camera.eye());
+        // [I1] Headless capture is fully synchronous (captureFrame()
+        // submits and waits every call) -- no frames-in-flight GPU overlap
+        // to race, so slot 0 always is correct and sufficient here.
+        updateDrawDataPerPassFields(*app, viewProj, app->camera.eye(), /*frameSlot=*/0);
         loadedPixels = captureFrame();
         if (loadedPixels.empty()) {
             gateOk = false;
@@ -2249,7 +2296,15 @@ int runPresent(const Args& args) {
             const float aspect =
                 static_cast<float>(swapExtent.width) / static_cast<float>(std::max<uint32_t>(1U, swapExtent.height));
             const glm::mat4 viewProj = computeViewProj(app->camera, aspect);
-            updateDrawDataPerPassFields(*app, viewProj, app->camera.eye());
+            // [Phase 4 exit fix wave, I1] Already after this loop's own
+            // vkWaitForFences(fence) above -- now ALSO addressed by that
+            // same slot's own physical buffer (not a shared one), which is
+            // what actually closes the race (see App::drawDataBuffers' own
+            // comment: fence-wait ordering alone was insufficient with a
+            // single shared buffer, since frame N-1 always used the OTHER
+            // slot and the wait only proves frame N-2 -- THIS slot's own
+            // last user -- is done).
+            updateDrawDataPerPassFields(*app, viewProj, app->camera.eye(), frameSync->currentFrameIndex());
         }
 
         app->executor->execute(graph, cmd, app->device->swapchainImages()[acquire.imageIndex],
