@@ -18,6 +18,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -752,6 +753,55 @@ TEST_CASE("Window::create()'s `resizable` parameter threads through to SDL_WINDO
         rx::platform::Window::create("rx_platform_resizable_true_test", 64, 64, /*visible=*/false, /*resizable=*/true);
     REQUIRE(resizable.has_value());
     CHECK((SDL_GetWindowFlags(resizable->sdlWindow()) & SDL_WINDOW_RESIZABLE) != 0);
+}
+
+// ===== abandonNativeHandle() [Issue #73] ====================================
+// Device-free tier: the tracked-intent flag's own get/set/move contract,
+// exactly mirroring relativeMouseModeWanted()'s own established "expose the
+// tracked intent, never a live OS/native-handle query" testing shape in
+// this same file. The DEEP behavioral consequence -- that a Window with
+// this flag set skips SDL_DestroyWindow() and therefore avoids the fatal
+// Xlib BadWindow crash a genuinely externally-destroyed native handle
+// otherwise triggers -- is MANUAL_VERIFICATION-only, proven directly
+// against a real desktop (xdotool windowclose + real-NVIDIA --present run,
+// this task's own report): no CI driver/display backend this repo's
+// fixtures use can be made to genuinely destroy a live window out from
+// under a running process the way a real window manager (or xdotool) can,
+// mirroring window_state_test.cpp's own "matrix row 6" precedent for the
+// zero-extent guard's DI-seam split.
+TEST_CASE("Window::nativeHandleAbandoned() is false by default and becomes true (idempotently) after "
+          "abandonNativeHandle() [Issue #73]") {
+    auto window = rx::platform::Window::create("rx_platform_abandon_native_handle_test", 64, 64, /*visible=*/false);
+    REQUIRE(window.has_value());
+    CHECK_FALSE(window->nativeHandleAbandoned());
+
+    window->abandonNativeHandle();
+    CHECK(window->nativeHandleAbandoned());
+
+    // Idempotent -- a second call changes nothing observable.
+    window->abandonNativeHandle();
+    CHECK(window->nativeHandleAbandoned());
+}
+
+TEST_CASE("Window::abandonNativeHandle()'s flag survives move-construction and move-assignment, and the "
+          "moved-FROM object's own flag resets to false [Issue #73, revert-discrimination: an implementation that "
+          "forgot to thread this new member through the move special members would silently drop it, exactly the "
+          "class of bug this file's own established per-member move tests already guard every other bool against]") {
+    auto source = rx::platform::Window::create("rx_platform_abandon_move_ctor_test", 64, 64, /*visible=*/false);
+    REQUIRE(source.has_value());
+    source->abandonNativeHandle();
+    REQUIRE(source->nativeHandleAbandoned());
+
+    rx::platform::Window moved(std::move(*source));
+    CHECK(moved.nativeHandleAbandoned());
+    CHECK_FALSE(source->nativeHandleAbandoned());  // moved-from resets to false.
+
+    auto target = rx::platform::Window::create("rx_platform_abandon_move_assign_test", 64, 64, /*visible=*/false);
+    REQUIRE(target.has_value());
+    REQUIRE_FALSE(target->nativeHandleAbandoned());
+    *target = std::move(moved);
+    CHECK(target->nativeHandleAbandoned());
+    CHECK_FALSE(moved.nativeHandleAbandoned());  // moved-from resets to false.
 }
 
 // ===== Gamepad [Phase 4 Task 20, gate ruling #14, matrix rows 4-10] =======

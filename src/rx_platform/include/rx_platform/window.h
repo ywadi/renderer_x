@@ -226,12 +226,56 @@ public:
     // false in windowed mode.
     bool isFullscreen() const;
 
+    // [Phase 4 Task 17 follow-up, Issue #73] Marks this window's underlying
+    // NATIVE handle as already gone -- the caller learned this
+    // INDEPENDENTLY of anything SDL itself reported (e.g. via
+    // rx::rhi::Device::isSurfaceLost(), reacting to a Vulkan surface query
+    // failure), never from an SDL event: reproduced directly that neither
+    // SDL_EVENT_WINDOW_CLOSE_REQUESTED nor even SDL_EVENT_WINDOW_DESTROYED
+    // fires for a third-party destroy of this window (e.g. `xdotool
+    // windowclose`, a raw XDestroyWindow() against a window this process
+    // does not expect gone). Once called, this Window's destructor and
+    // move-assignment's "destroy what this object currently owns" step
+    // SKIP SDL_DestroyWindow() entirely for the native handle -- there is
+    // nothing valid left to destroy, and calling it anyway issues further
+    // native (on X11: further Xlib/XCB protocol) requests against an
+    // already-invalid ID. Reproduced directly: doing so triggers an
+    // unhandled X11 BadWindow protocol error that Xlib's own DEFAULT error
+    // handler treats as FATAL (calls exit() with a nonzero status),
+    // terminating the whole process AFTER this engine's own graceful
+    // shutdown had already logically completed successfully -- this is
+    // what actually turned a correctly-detected, gracefully-handled
+    // surface loss into an observed nonzero exit code.
+    //
+    // Safe to call ONLY because the expected caller (a --present sample's
+    // own teardown, immediately following the SAME surface-loss detection
+    // that calls this) is about to let this Window -- and the whole
+    // process -- go away regardless: SDL's own internal per-window
+    // bookkeeping for the now-abandoned handle is reclaimed by the OS at
+    // process exit either way, exactly like every other resource a process
+    // never explicitly frees before exiting. This is NOT a general-purpose
+    // "detach and keep using the Window" escape hatch -- every other
+    // method on this class remains unguarded against an abandoned native
+    // handle and is not expected to be called again afterward.
+    void abandonNativeHandle() { nativeHandleAbandoned_ = true; }
+
+    // True after abandonNativeHandle() -- see that method's own comment.
+    // Exposed purely for testability/diagnostics (mirrors
+    // relativeMouseModeWanted()'s own "expose the tracked intent, not a
+    // live OS query" shape); production code has no need to read this back
+    // before calling abandonNativeHandle() itself, which is idempotent.
+    bool nativeHandleAbandoned() const { return nativeHandleAbandoned_; }
+
     std::vector<const char*> requiredVulkanInstanceExtensions() const;
     VkSurfaceKHR createVulkanSurface(VkInstance instance) const;
 
 private:
     explicit Window(SDL_Window* window) : window_(window) {}
     SDL_Window* window_ = nullptr;
+
+    // [Phase 4 Task 17 follow-up, Issue #73] See abandonNativeHandle()'s
+    // own comment above.
+    bool nativeHandleAbandoned_ = false;
 
     // [Phase 4 Task 17, FG7] See minimizedEventObserved()/
     // lastPixelSizeEvent()'s own comments above.

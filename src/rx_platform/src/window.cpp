@@ -105,6 +105,7 @@ std::optional<Window> Window::create(const char* title, int width, int height, b
 
 Window::Window(Window&& other) noexcept
     : window_(other.window_),
+      nativeHandleAbandoned_(other.nativeHandleAbandoned_),
       minimizedEventObserved_(other.minimizedEventObserved_),
       lastPixelSizeEvent_(other.lastPixelSizeEvent_),
       relativeModeWanted_(other.relativeModeWanted_),
@@ -113,6 +114,7 @@ Window::Window(Window&& other) noexcept
       accumMouseDeltaY_(other.accumMouseDeltaY_),
       gamepads_(std::move(other.gamepads_)) {
     other.window_ = nullptr;
+    other.nativeHandleAbandoned_ = false;
     other.minimizedEventObserved_ = false;
     other.lastPixelSizeEvent_ = VkExtent2D{0, 0};
     other.relativeModeWanted_ = false;
@@ -127,11 +129,15 @@ Window::Window(Window&& other) noexcept
 
 Window& Window::operator=(Window&& other) noexcept {
     if (this != &other) {
-        if (window_) {
+        // [Phase 4 Task 17 follow-up, Issue #73] See abandonNativeHandle()'s
+        // own comment (window.h) -- skip SDL_DestroyWindow() for a handle
+        // already known abandoned, exactly like the destructor below.
+        if (window_ && !nativeHandleAbandoned_) {
             SDL_DestroyWindow(window_);
         }
         closeAllGamepads();
         window_ = other.window_;
+        nativeHandleAbandoned_ = other.nativeHandleAbandoned_;
         minimizedEventObserved_ = other.minimizedEventObserved_;
         lastPixelSizeEvent_ = other.lastPixelSizeEvent_;
         relativeModeWanted_ = other.relativeModeWanted_;
@@ -140,6 +146,7 @@ Window& Window::operator=(Window&& other) noexcept {
         accumMouseDeltaY_ = other.accumMouseDeltaY_;
         gamepads_ = std::move(other.gamepads_);
         other.window_ = nullptr;
+        other.nativeHandleAbandoned_ = false;
         other.minimizedEventObserved_ = false;
         other.lastPixelSizeEvent_ = VkExtent2D{0, 0};
         other.relativeModeWanted_ = false;
@@ -153,7 +160,14 @@ Window& Window::operator=(Window&& other) noexcept {
 
 Window::~Window() {
     closeAllGamepads();
-    if (window_) {
+    // [Phase 4 Task 17 follow-up, Issue #73] See abandonNativeHandle()'s
+    // own comment (window.h) -- skip SDL_DestroyWindow() for a handle
+    // already known abandoned: there is nothing valid left to destroy, and
+    // calling it anyway issues further native requests against an
+    // already-invalid native ID (reproduced directly as an unhandled X11
+    // BadWindow protocol error that Xlib's own default error handler
+    // treats as fatal to the whole process).
+    if (window_ && !nativeHandleAbandoned_) {
         SDL_DestroyWindow(window_);
     }
 }
