@@ -300,6 +300,12 @@ it is out of scope for *this* spec only, not out of scope for the project:
     fail-on-overcommit on AMD) and
     `VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT` (proactive per-allocation
     budget enforcement) — both additive, both currently unnamed.
+  - KHR_draco_mesh_compression: SUPPORTED (correction 2026-08-20 —
+    this registry previously omitted it entirely): vendored Google
+    Draco v1.5.7 decoder + fastgltf-native extension parsing landed
+    with Phase 4 Task 13; hardened and acceptance-proven 2026-08-20
+    (unique-id attribute resolution fix, bounds-validated reads,
+    BoomBox integration + decoded-value assertions, issue #31).
   - KHR_meshopt_compression (Khronos ratification-track successor to
     EXT_meshopt_compression; NOT supported by fastgltf v0.9.0) — watch
     item on the fastgltf pin, re-checked at each dependency refresh; if
