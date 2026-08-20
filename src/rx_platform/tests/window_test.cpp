@@ -707,6 +707,53 @@ TEST_CASE("logWaylandMinimizeLimitationOnce fires exactly once for a mocked \"Wa
     }
 }
 
+// ===== shouldInstallX11ErrorHandler / isIgnorableX11Error [Phase 4 Task 17
+// follow-up, Issue #74] ==================================================
+// Device-free: no live X11 display/window is needed for either -- both are
+// pure decision functions, matching logWaylandMinimizeLimitationOnce's own
+// "pass the string in" testability pattern above. The side-effecting half
+// (installX11ErrorHandlerOnce()'s real dlopen/XSetErrorHandler call) is
+// internal-linkage-only and real-hardware-verified separately (see the
+// Issue #74 report) -- exactly this file's existing split between pure
+// decision logic (exhaustively unit-tested here) and hardware-touching
+// glue (MANUAL_VERIFICATION-only), already established throughout this
+// file.
+TEST_CASE("shouldInstallX11ErrorHandler(): true only for the exact string \"x11\"; false for wayland/windows/dummy/"
+          "null/case-mismatch") {
+    CHECK(rx::platform::shouldInstallX11ErrorHandler("x11"));
+
+    CHECK_FALSE(rx::platform::shouldInstallX11ErrorHandler("wayland"));
+    CHECK_FALSE(rx::platform::shouldInstallX11ErrorHandler("windows"));
+    CHECK_FALSE(rx::platform::shouldInstallX11ErrorHandler("cocoa"));
+    CHECK_FALSE(rx::platform::shouldInstallX11ErrorHandler("dummy"));
+    CHECK_FALSE(rx::platform::shouldInstallX11ErrorHandler("offscreen"));
+    CHECK_FALSE(rx::platform::shouldInstallX11ErrorHandler(""));
+    CHECK_FALSE(rx::platform::shouldInstallX11ErrorHandler(nullptr));
+    // Case-sensitive, matching SDL_GetCurrentVideoDriver()'s own documented
+    // lowercase driver names -- a near-miss must not accidentally match.
+    CHECK_FALSE(rx::platform::shouldInstallX11ErrorHandler("X11"));
+    CHECK_FALSE(rx::platform::shouldInstallX11ErrorHandler("x11 "));
+}
+
+TEST_CASE("isIgnorableX11Error(): true ONLY for BadWindow (3) -- revert-discrimination against classifying any "
+          "other X11 error code as ignorable") {
+    CHECK(rx::platform::isIgnorableX11Error(3));  // BadWindow, <X11/X.h>.
+
+    // Success and every other core-protocol error code this codebase's own
+    // reproduction never observed stay fatal (forwarded to the previous
+    // handler) -- this fix is deliberately narrow, not "any X11 error is
+    // now survivable".
+    CHECK_FALSE(rx::platform::isIgnorableX11Error(0));   // Success (never delivered as an error, but exercised
+                                                          // anyway for completeness).
+    CHECK_FALSE(rx::platform::isIgnorableX11Error(1));   // BadRequest.
+    CHECK_FALSE(rx::platform::isIgnorableX11Error(2));   // BadValue.
+    CHECK_FALSE(rx::platform::isIgnorableX11Error(4));   // BadPixmap.
+    CHECK_FALSE(rx::platform::isIgnorableX11Error(9));   // BadDrawable.
+    CHECK_FALSE(rx::platform::isIgnorableX11Error(11));  // BadAlloc.
+    CHECK_FALSE(rx::platform::isIgnorableX11Error(17));  // BadAtom.
+    CHECK_FALSE(rx::platform::isIgnorableX11Error(255));
+}
+
 // ===== Borderless-fullscreen toggle [Phase 4 Task 17, FG7, gate ruling #25
 // row 4] -- SDL-level only (no Vulkan/Device here; the real windowed<->
 // fullscreen<->windowed GPU test, including the swapchain-recreation path,

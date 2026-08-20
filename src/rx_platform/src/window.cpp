@@ -11,7 +11,150 @@
 #include <string_view>
 #include <utility>
 
+#if defined(SDL_PLATFORM_LINUX)
+// [Phase 4 Task 17 follow-up, Issue #74] dlopen/dlsym only -- see
+// installX11ErrorHandlerOnce()'s own comment below for why this engine
+// never links against -lX11 directly.
+#include <dlfcn.h>
+#endif
+
 namespace rx::platform {
+
+namespace {
+
+#if defined(SDL_PLATFORM_LINUX)
+// [Phase 4 Task 17 follow-up, Issue #74] Minimal, ABI-stable mirror of the
+// fields of Xlib's real `XErrorEvent` (<X11/Xlib.h>) that
+// installX11ErrorHandlerOnce()'s handler actually reads. Deliberately NOT
+// including the real header and NOT link-time-depending on libX11 (this
+// engine resolves the one Xlib entry point it needs the exact same way
+// SDL3 itself does -- SDL_x11dyn's own dlopen-based dynamic loading -- so a
+// Wayland-only environment with no libX11.so.6 installed at all is never
+// made to need one just because this engine links against SDL3). The X11
+// wire protocol's error-packet layout has been frozen since X11R1 -- this
+// struct's layout is not expected to change (the same "empirically stable
+// protocol/ABI constant" tolerance this codebase already extends to e.g.
+// the VkResult classifiers in rx_rhi_vk's isSurfaceLossResult()).
+struct XErrorEventAbi {
+    int type;
+    void* display;
+    unsigned long resourceid;
+    unsigned long serial;
+    unsigned char error_code;
+    unsigned char request_code;
+    unsigned char minor_code;
+};
+
+using XErrorHandlerFn = int (*)(void* display, XErrorEventAbi* event);
+using XSetErrorHandlerFn = XErrorHandlerFn (*)(XErrorHandlerFn);
+
+// The handler XSetErrorHandler() reported as previously installed (normally
+// Xlib's own default, fatal handler) -- non-BadWindow errors are forwarded
+// to it unchanged below, so this fix stays narrowly scoped to the ONE
+// error code it targets and every other X11 protocol error still behaves
+// exactly as it always has (loud, fatal -- a genuine, unexpected protocol
+// bug should stay visible, not be silently swallowed by this fix).
+std::atomic<XErrorHandlerFn> g_previousX11ErrorHandler{nullptr};
+
+int handleX11Error(void* display, XErrorEventAbi* event) {
+    if (event != nullptr && isIgnorableX11Error(event->error_code)) {
+        RX_LOG_WARN(
+            "rx_platform: X11 BadWindow protocol error suppressed (resource=0x{:x}, request_code={}, "
+            "minor_code={}, serial={}) -- almost certainly a third-party window destroy (e.g. a window-manager "
+            "close, or a raw XDestroyWindow()) racing an in-flight SDL/X11 call; this engine's own "
+            "Device::isSurfaceLost() detection (rx_rhi_vk/device.h) will notice and handle the underlying "
+            "surface loss on its own next check [Issue #74]",
+            event->resourceid, static_cast<int>(event->request_code), static_cast<int>(event->minor_code),
+            event->serial);
+        return 0;
+    }
+    XErrorHandlerFn previous = g_previousX11ErrorHandler.load();
+    if (previous != nullptr) {
+        return previous(display, event);
+    }
+    return 0;
+}
+
+// [Phase 4 Task 17 follow-up, Issue #74] One-shot (per PROCESS, not per
+// Window) -- mirrors logWaylandMinimizeLimitationOnce()'s own established
+// atomic-guarded pattern. Root cause (reproduced directly with gdb-level
+// instrumentation against real NVIDIA/Xcb hardware, see the Issue #74
+// report): a third-party window destroy can happen at ANY point across the
+// whole session -- not just during this engine's own present-loop teardown
+// -- and Xlib's DEFAULT error handler is installed for the ENTIRE process
+// lifetime the moment SDL3's X11 backend opens its display connection
+// (confirmed by inspecting SDL3's own X11 video-driver source: it only
+// EVER installs a scoped custom handler transiently, during its own
+// window-manager capability probe at video-driver init, restoring the
+// default handler immediately afterward -- SDL3 provides no general
+// protection against this class of race). Rather than chasing and guarding
+// every individual SDL-internal call site that might touch a since-
+// destroyed window handle (mouse-capture engage/disengage, focus-dispatch
+// grab re-arm, cursor redraw, and any future SDL-internal call this
+// engine's own code never directly calls) -- an open-ended, whack-a-mole
+// list -- this installs ONE process-wide non-fatal handler for the ONE
+// well-defined error code (BadWindow) that class of race always produces,
+// regardless of which specific X11 request triggered it.
+void installX11ErrorHandlerOnce(const char* videoDriver) {
+    static std::atomic<bool> installed{false};
+
+    if (!shouldInstallX11ErrorHandler(videoDriver)) {
+        return;
+    }
+
+    bool expected = false;
+    if (!installed.compare_exchange_strong(expected, true)) {
+        return;  // Already installed earlier this process -- idempotent.
+    }
+
+    // Resolved via dlopen/dlsym, exactly like SDL3's own SDL_x11dyn.c loads
+    // every Xlib entry point it calls. By the time this runs
+    // (Window::create(), immediately after SDL_Init(SDL_INIT_VIDEO)
+    // succeeds with the x11 driver selected), SDL3 has already dlopen'd
+    // libX11.so.6 into this process to create the x11 video driver in the
+    // first place -- this call simply attaches to that SAME already-mapped
+    // library (POSIX dlopen: re-opening an already-loaded soname bumps its
+    // refcount and returns the existing handle, it does not reload or
+    // duplicate it), so this is safe and correct regardless of which flags
+    // SDL3's own internal dlopen call used. Never dlclose()'d -- reclaimed
+    // by the OS at process exit either way, exactly like this engine's own
+    // established "never explicitly freed before exit" precedent for e.g.
+    // Window::abandonNativeHandle()'s own native handle.
+    void* libX11 = dlopen("libX11.so.6", RTLD_NOW);
+    if (libX11 == nullptr) {
+        RX_LOG_WARN(
+            "rx_platform: dlopen(libX11.so.6) failed installing the non-fatal BadWindow handler: {} -- a "
+            "third-party window destroy racing an in-flight X11 call may still terminate the process [Issue #74]",
+            dlerror());
+        return;
+    }
+
+    auto setErrorHandler = reinterpret_cast<XSetErrorHandlerFn>(dlsym(libX11, "XSetErrorHandler"));
+    if (setErrorHandler == nullptr) {
+        RX_LOG_WARN(
+            "rx_platform: dlsym(XSetErrorHandler) failed: {} -- non-fatal BadWindow handler not installed "
+            "[Issue #74]",
+            dlerror());
+        return;
+    }
+
+    g_previousX11ErrorHandler.store(setErrorHandler(&handleX11Error));
+}
+#endif  // defined(SDL_PLATFORM_LINUX)
+
+}  // namespace
+
+bool shouldInstallX11ErrorHandler(const char* videoDriver) {
+    return videoDriver != nullptr && std::string_view(videoDriver) == "x11";
+}
+
+bool isIgnorableX11Error(unsigned char errorCode) {
+    // <X11/X.h>: `#define BadWindow 3` -- see this function's own header
+    // comment (window.h) for why BadWindow specifically, and why by error
+    // code alone rather than by request code.
+    constexpr unsigned char kX11BadWindow = 3;
+    return errorCode == kX11BadWindow;
+}
 
 void logWaylandMinimizeLimitationOnce(const char* platformName) {
     // See this function's own header comment (window.h) for the full
@@ -86,6 +229,18 @@ std::optional<Window> Window::create(const char* title, int width, int height, b
     // above (it is documented safe to call before SDL_Init() too, but this
     // keeps the call site right where video is known to be up).
     logWaylandMinimizeLimitationOnce(SDL_GetPlatform());
+
+#if defined(SDL_PLATFORM_LINUX)
+    // [Phase 4 Task 17 follow-up, Issue #74] See installX11ErrorHandlerOnce()'s
+    // own comment above for the full rationale. Must run after
+    // SDL_Init(SDL_INIT_VIDEO) above (SDL_GetCurrentVideoDriver() is only
+    // valid once video is initialized) and before this function hands back
+    // a live window: the race this closes can start from this engine's very
+    // first SDL_CreateWindow()/SDL_ShowWindow() call onward, not just during
+    // later teardown -- reproduced directly (Issue #74) racing SDL's own
+    // internal focus-dispatch handling during window creation itself.
+    installX11ErrorHandlerOnce(SDL_GetCurrentVideoDriver());
+#endif
 
     SDL_WindowFlags flags = SDL_WINDOW_VULKAN;
     if (!visible) {

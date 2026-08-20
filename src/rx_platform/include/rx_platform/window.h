@@ -338,4 +338,52 @@ private:
 // with any other platform name are a no-op every time, not just once.
 void logWaylandMinimizeLimitationOnce(const char* platformName);
 
+// [Phase 4 Task 17 follow-up, Issue #74] Pure decision: should this engine
+// install its own non-fatal X11 BadWindow error handler for the given SDL
+// video driver name? True ONLY for the exact string "x11" (case-sensitive,
+// matching SDL_GetCurrentVideoDriver()'s own documented lowercase driver
+// names, e.g. SDL_x11video.c's own `"x11"` literal) -- a Wayland/Windows/
+// dummy/offscreen session never dlopens libX11 at all, and this must never
+// be the reason one gets pulled in there. See installX11ErrorHandlerOnce()'s
+// own comment (window.cpp) for WHY a handler is installed at all: reproduced
+// directly (Issue #74) that a third-party window destroy (e.g. `xdotool
+// windowclose`, a raw XDestroyWindow()) racing an in-flight SDL-internal
+// X11 call (mouse-capture engage, focus-dispatch grab re-arm, or any other
+// call SDL's X11 backend may issue against a window handle -- this is not
+// one specific call site, it is a whole CLASS of async-protocol race) hits
+// an unhandled X11 BadWindow protocol error, and Xlib's DEFAULT error
+// handler treats that as FATAL (calls exit()), killing the whole process
+// before this engine's own reactive rx::rhi::Device::isSurfaceLost()
+// detection (device.h) -- which only runs from inside the present loop's
+// own swapchain-recreation path -- ever gets a chance to run. Exposed here
+// taking the driver name as a parameter rather than querying SDL
+// internally, purely for testability -- mirrors
+// logWaylandMinimizeLimitationOnce()'s own established "pass the string in"
+// pattern (window_test.cpp's own device-free coverage).
+bool shouldInstallX11ErrorHandler(const char* videoDriver);
+
+// [Phase 4 Task 17 follow-up, Issue #74] Pure decision: is this X11 core
+// protocol error code (XErrorEvent::error_code, <X11/Xlib.h>) one this
+// engine's own installed handler treats as non-fatal (logged, then
+// execution continues) rather than forwarding to whatever handler was
+// previously installed (which -- for every OTHER error code -- still
+// terminates the process on a genuine, unexpected X11 protocol bug, exactly
+// like Xlib's own out-of-the-box default behavior; this fix deliberately
+// does NOT make the whole process immune to X11 errors in general). True
+// only for BadWindow (<X11/X.h>: `#define BadWindow 3` -- a frozen,
+// X11R1-era wire-protocol constant, not re-declared from the real header to
+// keep this engine's only X11 dependency dlopen-based -- see
+// installX11ErrorHandlerOnce()'s own comment for why). BadWindow's own
+// protocol meaning ("a value for a Window argument does not name a defined
+// Window") is EXACTLY this fix's target scenario for ANY request type that
+// carries a Window argument -- which is why this classifies on the error
+// code alone, never on which specific request triggered it: reproduced
+// directly (Issue #74) via at least three DIFFERENT request codes
+// (X_ChangeWindowAttributes, X_GetWindowAttributes, and one XInputExtension
+// request) depending on exactly which internal SDL call happened to race
+// the destroy -- enumerating every request SDL might ever issue against a
+// window is an unbounded list this fix deliberately does not attempt to
+// chase.
+bool isIgnorableX11Error(unsigned char errorCode);
+
 }  // namespace rx::platform
