@@ -99,6 +99,17 @@ convert quadrant4x4.png -filter point -resize 8x8 quadrant8x8.png
 cp quadrant8x8.png "${OUT_DIR}/quadrant.png"
 convert quadrant8x8.png -quality 95 "${OUT_DIR}/quadrant.jpg"
 
+# [Texture-path round, item B -- the 16MB staging-cap fix] 4096x4096
+# nearest-neighbor upscale of the SAME quadrant pattern: mip 0 alone is
+# 4096*4096*4 = 64MB RGBA8, well over the 16MiB default Uploader ring
+# buffer -- the exact real-world shape (the Workshop asset's own 4K
+# textures) Uploader::uploadImageMips()'s new chunked-row path exists
+# for. Flat-quadrant content compresses to a tiny PNG file despite the
+# huge pixel dimensions (nearest-neighbor upscale of 4 flat 2x2 blocks
+# has essentially zero real entropy) -- safe to commit despite the
+# 4096x4096 logical size.
+convert quadrant4x4.png -filter point -resize 4096x4096 "${OUT_DIR}/oversized_quadrant.png"
+
 # --- Slot-swap discrimination fixture set [helmet-texture-fix verification
 # gap] -- five DISTINCT, pure-primary/secondary colors (every channel
 # either 0 or 255 -- deliberately, so a baseColor/emissive readback is

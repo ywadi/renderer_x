@@ -5,6 +5,8 @@
 #include <rx_core/debug_checks.h>
 #include <rx_core/log.h>
 #include <rx_core/profile.h>
+#include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <utility>
 
@@ -29,6 +31,33 @@ VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment) {
 // PendingRegion [matrix-issue28 rows 5/6].
 bool regionsOverlap(VkDeviceSize start, VkDeviceSize size, VkDeviceSize otherStart, VkDeviceSize otherEnd) {
     return !(start + size <= otherStart || otherEnd <= start);
+}
+
+// [Texture-path round, item B -- the 16MB staging-cap fix] Whether `level`
+// fits through this Uploader's ring in ONE copy trip (`true`), or needs
+// uploadImageMips()'s own CHUNKED-ROW path (`false`) -- and, on the
+// chunked branch, `outBytesPerRow` is the per-image-row byte pitch that
+// path splits on. A level's bytes divide evenly into whole image rows
+// (`level.size % level.extent.height == 0`) for every level this engine's
+// own upload call sites ever produce: uncompressed RGBA8 (the stb decode
+// path, D10 Option A's own full mip chain -- always true, size ==
+// width*height*4) and any block-compressed KTX2 level whose true height is
+// itself a multiple of the format's block height (every level this large
+// in practice -- a level anywhere near the 16MB cap is never a 1-2 texel
+// sub-block MIP TAIL, which is always a few dozen bytes at most). A level
+// that fails this divisibility check is reported as "cannot chunk" rather
+// than silently mis-sliced -- see uploadImageMips()'s own validation loop
+// for the caller-visible failure this produces.
+bool levelNeedsChunking(const Uploader::ImageMipLevel& level, VkDeviceSize ringBufferSize, VkDeviceSize& outBytesPerRow) {
+    outBytesPerRow = 0;
+    if (level.size <= ringBufferSize) {
+        return false;
+    }
+    if (level.extent.height == 0 || level.size % level.extent.height != 0) {
+        return true;  // needs chunking, but outBytesPerRow == 0 signals "cannot safely chunk" to the caller
+    }
+    outBytesPerRow = level.size / level.extent.height;
+    return true;
 }
 
 }  // namespace
@@ -331,12 +360,33 @@ bool Uploader::uploadImageMips(Texture2D& dst, std::span<const ImageMipLevel> le
         RX_LOG_ERROR("Uploader::uploadImageMips: empty `levels` span -- at least one mip level is required");
         return false;
     }
+    // [Texture-path round, item B] A level exceeding the ring's total
+    // capacity is no longer an outright rejection -- see this method's own
+    // header comment (upload.h) for the chunked-row design. It only fails
+    // here (before ANY GPU work is recorded, preserving this method's own
+    // "no partial-batch corruption" contract) when it genuinely CANNOT be
+    // safely chunked: a degenerate zero-height level, or one whose byte
+    // count doesn't divide evenly into whole image rows (levelNeedsChunking()'s
+    // own header comment names exactly which real levels this excludes --
+    // none, in this engine's current call sites).
     for (const ImageMipLevel& level : levels) {
-        if (level.size > ringBufferSize_) {
+        VkDeviceSize bytesPerRow = 0;
+        if (!levelNeedsChunking(level, ringBufferSize_, bytesPerRow)) {
+            continue;
+        }
+        if (bytesPerRow == 0) {
+            RX_LOG_ERROR(
+                "Uploader::uploadImageMips: level {} is {} bytes (extent {}x{}), exceeding the {}-byte staging "
+                "ring buffer's total capacity, and its byte size does not divide evenly into whole image rows "
+                "-- cannot chunk safely",
+                level.mipLevel, level.size, level.extent.width, level.extent.height, ringBufferSize_);
+            return false;
+        }
+        if (bytesPerRow > ringBufferSize_) {
             RX_LOG_ERROR(
                 "Uploader::uploadImageMips: level {} is {} bytes, exceeding the {}-byte staging ring buffer's "
-                "total capacity",
-                level.mipLevel, level.size, ringBufferSize_);
+                "total capacity, and even a SINGLE row ({} bytes) does not fit -- cannot chunk",
+                level.mipLevel, level.size, ringBufferSize_, bytesPerRow);
             return false;
         }
     }
@@ -359,38 +409,104 @@ bool Uploader::uploadImageMips(Texture2D& dst, std::span<const ImageMipLevel> le
         if (level.size == 0) {
             continue;
         }
-        VkDeviceSize ringOffset = 0;
-        if (!reserveRingSpace(level.size, ringOffset)) {
-            return false;
+
+        VkDeviceSize bytesPerRow = 0;
+        if (!levelNeedsChunking(level, ringBufferSize_, bytesPerRow)) {
+            // UNCHANGED single-copy path -- byte-for-byte the same
+            // recording this method always did for a level that fits the
+            // ring whole (every KTX2 level this engine has ever uploaded,
+            // and any RGBA8 level small enough to fit in one trip).
+            VkDeviceSize ringOffset = 0;
+            if (!reserveRingSpace(level.size, ringOffset)) {
+                return false;
+            }
+            std::memcpy(static_cast<uint8_t*>(ringBuffer_.mappedData()) + ringOffset, level.data, level.size);
+            ringBuffer_.flush(ringOffset, level.size);
+
+            beginRecordingIfNeeded();
+            VkCommandBuffer cmd = activeCmd();
+            if (!transitionedToDst) {
+                transitionImage(cmd, dst.image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                transitionedToDst = true;
+            }
+
+            // BLOCK-COMPRESSED ROW PITCH / SUB-BLOCK MIP TAILS -- see this
+            // method's own header comment (upload.h) for the full Vulkan-
+            // spec citation. bufferRowLength/bufferImageHeight are left at 0
+            // (the VkBufferImageCopy default-initialized value) deliberately
+            // -- "tightly packed, block-rounded" is exactly libktx's own
+            // per-level byte layout, for every level including sub-block
+            // tails.
+            VkBufferImageCopy region{};
+            region.bufferOffset = ringOffset;
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.mipLevel = level.mipLevel;
+            region.imageSubresource.baseArrayLayer = 0;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent = {level.extent.width, level.extent.height, 1};
+            vkCmdCopyBufferToImage(cmd, ringBuffer_.handle(), dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                                    &region);
+            continue;
         }
 
-        std::memcpy(static_cast<uint8_t*>(ringBuffer_.mappedData()) + ringOffset, level.data, level.size);
-        ringBuffer_.flush(ringOffset, level.size);
+        // [Texture-path round, item B] CHUNKED-ROW path: this level's own
+        // bytes exceed the ring's total capacity -- split it into
+        // consecutive, contiguous row-groups, each staged through the
+        // SAME ring buffer as its own independent reservation+copy trip
+        // (D25's "chunked trips must complete before registration" is
+        // automatic here: every chunk records a real vkCmdCopyBufferToImage,
+        // and the ticket flush()/registerRealTexture() callers already
+        // await covers ALL of them, same as any other recorded work this
+        // Uploader ever produces -- no separate completion tracking
+        // needed). `rowsPerChunk` is sized to the largest whole-row count
+        // that fits in ONE reservation (`ringBufferSize_ / bytesPerRow`,
+        // already proven <= ringBufferSize_/1 by the validation loop
+        // above) -- bounded ring memory the whole time, exactly D24's own
+        // "no unbounded growth" requirement; a giant level becomes many
+        // bounded trips through the ring, never one giant allocation.
+        const auto* srcBytes = static_cast<const uint8_t*>(level.data);
+        const uint32_t rowsPerChunk =
+            static_cast<uint32_t>(std::min<VkDeviceSize>(level.extent.height, ringBufferSize_ / bytesPerRow));
+        uint32_t rowStart = 0;
+        while (rowStart < level.extent.height) {
+            uint32_t chunkRows = std::min(rowsPerChunk, level.extent.height - rowStart);
+            VkDeviceSize chunkBytes = static_cast<VkDeviceSize>(chunkRows) * bytesPerRow;
 
-        beginRecordingIfNeeded();
-        VkCommandBuffer cmd = activeCmd();
+            VkDeviceSize ringOffset = 0;
+            if (!reserveRingSpace(chunkBytes, ringOffset)) {
+                return false;
+            }
+            std::memcpy(static_cast<uint8_t*>(ringBuffer_.mappedData()) + ringOffset,
+                        srcBytes + static_cast<VkDeviceSize>(rowStart) * bytesPerRow, chunkBytes);
+            ringBuffer_.flush(ringOffset, chunkBytes);
 
-        if (!transitionedToDst) {
-            transitionImage(cmd, dst.image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            transitionedToDst = true;
+            beginRecordingIfNeeded();
+            VkCommandBuffer cmd = activeCmd();
+            if (!transitionedToDst) {
+                transitionImage(cmd, dst.image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                transitionedToDst = true;
+            }
+
+            // Tightly packed WITHIN THIS CHUNK's own staged sub-buffer
+            // (bufferRowLength/bufferImageHeight == 0, same "computed from
+            // imageExtent" Vulkan copy rule the single-copy branch above
+            // relies on) -- imageOffset.y advances this region to the
+            // right vertical strip of the FULL level, so the final image
+            // ends up identical to one big copy, just assembled from
+            // several bounded ones.
+            VkBufferImageCopy region{};
+            region.bufferOffset = ringOffset;
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.mipLevel = level.mipLevel;
+            region.imageSubresource.baseArrayLayer = 0;
+            region.imageSubresource.layerCount = 1;
+            region.imageOffset = {0, static_cast<int32_t>(rowStart), 0};
+            region.imageExtent = {level.extent.width, chunkRows, 1};
+            vkCmdCopyBufferToImage(cmd, ringBuffer_.handle(), dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                                    &region);
+
+            rowStart += chunkRows;
         }
-
-        // BLOCK-COMPRESSED ROW PITCH / SUB-BLOCK MIP TAILS -- see this
-        // method's own header comment (upload.h) for the full Vulkan-
-        // spec citation. bufferRowLength/bufferImageHeight are left at 0
-        // (the VkBufferImageCopy default-initialized value) deliberately
-        // -- "tightly packed, block-rounded" is exactly libktx's own
-        // per-level byte layout, for every level including sub-block
-        // tails.
-        VkBufferImageCopy region{};
-        region.bufferOffset = ringOffset;
-        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.imageSubresource.mipLevel = level.mipLevel;
-        region.imageSubresource.baseArrayLayer = 0;
-        region.imageSubresource.layerCount = 1;
-        region.imageExtent = {level.extent.width, level.extent.height, 1};
-        vkCmdCopyBufferToImage(cmd, ringBuffer_.handle(), dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                                &region);
     }
 
     beginRecordingIfNeeded();

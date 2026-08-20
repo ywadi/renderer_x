@@ -802,7 +802,8 @@ TEST_CASE("TextureCache: corrupt PNG bytes (stb decode failure) -> checkerboard 
 
 // ===== stb PNG/JPG fallback path ============================================
 
-TEST_CASE("TextureCache: a real PNG loads via stb to a real, non-fallback texture, mip level 0 only") {
+TEST_CASE("TextureCache: a real PNG loads via stb to a real, non-fallback texture with a FULL runtime-generated "
+          "mip chain [texture-path round, D10 Option A -- previously mip level 0 only]") {
     auto fixture = makeFixture("rx_asset_tc_png");
     if (!fixture.has_value()) {
         return;
@@ -814,7 +815,10 @@ TEST_CASE("TextureCache: a real PNG loads via stb to a real, non-fallback textur
     CHECK_FALSE(record.isFallback);
     CHECK(record.width == 8);
     CHECK(record.height == 8);
-    CHECK(record.mipLevels == 1);
+    // 8x8 -> 4x4 -> 2x2 -> 1x1: 4 levels total, exactly Vulkan's own
+    // floor(log2(max(w,h)))+1 formula -- see generateStbMipChain()'s own
+    // header comment (texture_decode.h).
+    CHECK(record.mipLevels == 4);
     CHECK(record.format == VK_FORMAT_R8G8B8A8_SRGB);
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
@@ -1552,6 +1556,75 @@ TEST_CASE("Sampler-wrap regression: glTF-default REPEAT (samplers:[{}], DamagedH
     // reachable through this exact code path.
     CHECK(approxEqual(bottomReadback->topLeft, kBlue, 2));
     CHECK(approxEqual(bottomReadback->bottomRight, kBlue, 2));
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// ===== Oversized-texture staging [texture-path round, item B] =============
+//
+// Prior defect (found on the real Workshop asset, real NVIDIA): a texture
+// whose mip-0 bytes exceed the Uploader's staging-ring capacity (a
+// 4096x4096 RGBA8 mip 0 is 64MB, over the 16MiB default ring) was
+// REJECTED by Uploader::uploadImageMips() and silently replaced by the
+// D11 checkerboard fallback -- size was, incorrectly, a fallback reason.
+// `oversized_quadrant.png` (assets/test/textures/generate_fixtures.sh's
+// own comment) is the SAME quadrant4x4.png source nearest-neighbor-
+// upscaled to 4096x4096 -- real quadrant content, not a degenerate flat
+// fixture, so a chunk landing at the wrong subresource offset would be
+// visible as a wrong quadrant color, not just "some pixels came back
+// non-black".
+TEST_CASE("TextureCache GPU [texture-path round, item B]: a 4096x4096 stb PNG (64MB mip 0, exceeding the "
+          "16MiB default staging ring) imports through the FULL Registry::importGltf path to a real, "
+          "non-fallback texture with its complete runtime-generated mip chain (item A composed with item B), "
+          "and its 4 quadrant colors render correctly -- proving Uploader::uploadImageMips()'s chunked-row "
+          "staging path end to end, not just format bookkeeping") {
+    auto fixture = makeFixture("rx_asset_tc_oversized");
+    if (!fixture.has_value()) {
+        return;
+    }
+    makeCache(*fixture);
+
+    auto pool = rx::asset::GeometryPool::create(fixture->allocator, fixture->device, fixture->uploader);
+    REQUIRE(pool != nullptr);
+    auto scheduler = rx::task::Scheduler::create(2);
+    REQUIRE(scheduler != nullptr);
+
+    rx::asset::Registry registry;
+    rx::asset::ImportResult result = registry.importGltf(gltfFixturePath("oversized_texture_probe.gltf"), *pool,
+                                                            *scheduler, fixture->cache.get());
+    REQUIRE(result.ok());
+    REQUIRE(result.materials.size() == 1);
+
+    const rx::asset::MaterialAsset& material = registry.material(result.materials[0]);
+    REQUIRE(material.baseColorTexture.present);
+    const TextureRecord& record = fixture->cache->resolve(material.baseColorTexture.handle);
+    // THE headline assertion: NOT the checkerboard/fallback the pre-fix
+    // behavior silently substituted for any texture whose mip-0 bytes
+    // exceeded the staging cap.
+    REQUIRE_FALSE(record.isFallback);
+    CHECK(record.width == 4096);
+    CHECK(record.height == 4096);
+    // floor(log2(4096))+1 == 13 -- the full runtime-generated chain
+    // (texture-path round item A), composed with item B's own chunked
+    // upload for mip 0 (64MB, chunked) and mip 1 (2048x2048 == exactly
+    // 16MiB, still a single-trip level) alike -- "works composed with
+    // item A" per this round's own brief.
+    CHECK(record.mipLevels == 13);
+
+    std::optional<uint32_t> samplerIndex =
+        fixture->cache->getOrCreateSamplerBindlessIndex(material.baseColorTexture.sampler);
+    REQUIRE(samplerIndex.has_value());
+
+    auto readback = renderAndReadbackQuadrants(*fixture, record.bindlessIndex, *samplerIndex, /*lod=*/0.0F);
+    REQUIRE(readback.has_value());
+
+    // Same TL=red/TR=green/BL=blue/BR=yellow quadrant layout as every
+    // other quadrant fixture in this file (oversized_quadrant.png is the
+    // SAME quadrant4x4.png source, just nearest-neighbor-upscaled).
+    CHECK(approxEqual(readback->topLeft, {255, 0, 0}, 2));
+    CHECK(approxEqual(readback->topRight, {0, 255, 0}, 2));
+    CHECK(approxEqual(readback->bottomLeft, {0, 0, 255}, 2));
+    CHECK(approxEqual(readback->bottomRight, {255, 255, 0}, 2));
 
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }

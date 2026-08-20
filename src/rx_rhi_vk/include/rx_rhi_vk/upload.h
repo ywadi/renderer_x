@@ -188,10 +188,11 @@ struct UploadTicket {
 // false) rather than silently corrupting anything. This never applies to
 // a direct-path buffer upload, which never touches the ring at all.
 //
-// Thread-affinity (D5, Phase 4): uploadToBuffer()/uploadToImage()/flush()/
-// isComplete()/wait() are main-thread-only -- see docs/threading.md.
-// uploadToBuffer()/uploadToImage()/flush()/isComplete()/wait() all carry a
-// dev-time RX_ASSERT_MAIN_THREAD guard [Phase 4 Task 7 fix round 1;
+// Thread-affinity (D5, Phase 4): uploadToBuffer()/uploadToImage()/
+// uploadImageMips()/flush()/isComplete()/wait() are main-thread-only -- see
+// docs/threading.md. uploadToBuffer()/uploadToImage()/uploadImageMips()/
+// flush()/isComplete()/wait() all carry a dev-time RX_ASSERT_MAIN_THREAD
+// guard [Phase 4 Task 7 fix round 1;
 // extended to flush()/isComplete()/wait() in Task 11, since flush() can
 // now be a legitimate standalone call -- e.g. on nothing recorded -- no
 // longer reachable only via an already-guarded uploadTo*() call] that
@@ -310,14 +311,35 @@ public:
     //
     // Levels need not be sorted or cover every level of `dst`'s own
     // mipLevels() (not exercised by any Task 14 test, but not
-    // disallowed). Returns false (logged) only if `levels` is empty or
-    // any single entry's `size` exceeds this Uploader's total ring-buffer
-    // capacity outright -- same "no partial-batch corruption" contract as
-    // uploadToImage()/uploadToBuffer() above (a batch that fails a later
-    // entry after successfully staging earlier ones still returns false;
-    // nothing from this call is submitted at flush() -- see
-    // upload_test.cpp's texture-upload tests for the equivalent
-    // uploadToImage() contract this mirrors).
+    // disallowed).
+    //
+    // OVERSIZED LEVELS (bigger than this Uploader's own ring-buffer
+    // capacity) [texture-path round, item B -- the 16MB staging-cap fix;
+    // e.g. a 4096x4096 RGBA8 mip 0 is 64MB against the 16MB default ring]:
+    // handled via CHUNKED STAGING TRIPS, not rejected. A level whose
+    // `size` exceeds ringCapacity() is split into consecutive, contiguous
+    // row-groups -- each its own independent reserve/memcpy/
+    // vkCmdCopyBufferToImage trip through the SAME fixed-size ring (never
+    // growing it, never a separate transient allocation) -- so the final
+    // image ends up byte-identical to one theoretical giant copy, just
+    // assembled from several bounded ones. This composes transparently
+    // with flush()/isComplete()/wait(): every chunk's copy is recorded
+    // like any other Uploader command, covered by whatever ticket the
+    // NEXT flush() call returns -- a caller awaiting that ticket (or
+    // relying on the sync loadFromBytes()-style flush()+wait()
+    // convenience) is guaranteed every chunk has completed before
+    // treating the texture as ready, exactly D25's ticket-covers-
+    // everything-recorded-so-far semantics, no separate per-chunk
+    // completion tracking needed. A level this large can still fail
+    // (logged, returns false, BEFORE any GPU work is recorded for the
+    // whole call -- same "no partial-batch corruption" contract as
+    // uploadToImage()/uploadToBuffer() above) if it cannot be safely
+    // chunked at all: `levels` is empty, or an oversized level's `size`
+    // does not divide evenly into whole `extent.height` rows (every
+    // uncompressed RGBA8 level, and every block-compressed level actually
+    // large enough to need chunking, divides evenly in practice -- see
+    // upload.cpp's own levelNeedsChunking() comment), or even a single row
+    // does not fit in the ring outright (a pathologically wide level).
     bool uploadImageMips(Texture2D& dst, std::span<const ImageMipLevel> levels);
 
     // Submits every uploadTo*() call recorded since the last flush() (or

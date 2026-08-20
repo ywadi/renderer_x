@@ -980,3 +980,154 @@ TEST_CASE("Uploader ring reclamation polls (never blocks) when the oldest pendin
     CHECK(std::memcmp(readC.data(), patternC.data(), kChunkSize) == 0);
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
+
+// ===== Chunked-row staging for oversized levels [texture-path round, ======
+// ===== item B -- the 16MB staging-cap fix]                            =====
+//
+// Prior defect: a level whose OWN bytes exceeded the ring buffer's total
+// capacity was rejected outright (uploadImageMips() returned false before
+// recording anything), which TextureCache::registerRealTexture() mapped to
+// the D11 checkerboard fallback -- reproduced on the real Workshop asset's
+// 4K textures (4096x4096 RGBA8 mip 0 = 64MB > the 16MiB default ring).
+// These tests use a deliberately TINY ring (far below the 16MiB
+// production default) so the chunked path is exercised cheaply and
+// deterministically, without needing a multi-megabyte fixture at this
+// layer (texture_cache_test.cpp's own oversized-texture GPU test covers
+// the real-shaped 4096x4096 case end to end through the actual decode
+// pipeline).
+
+namespace {
+// Deterministic RGBA8 gradient, same shape as texture_test.cpp's own
+// makeGradientPixels() (kept local to this file rather than shared --
+// this codebase's own established per-file fixture-helper convention,
+// e.g. texture_decode_test.cpp's LogCapture) -- every byte is a simple,
+// non-repeating function of (x, y), so a byte-exact readback comparison
+// after a MULTI-CHUNK upload is a real proof that every chunk landed at
+// the right subresource offset, not just that SOME bytes arrived
+// somewhere (a flat/solid-color source could pass even with chunks
+// swapped or dropped).
+std::vector<uint8_t> makeGradientPixelsLocal(uint32_t width, uint32_t height) {
+    std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4);
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            size_t i = (static_cast<size_t>(y) * width + x) * 4;
+            pixels[i + 0] = static_cast<uint8_t>(x * 7 + y);
+            pixels[i + 1] = static_cast<uint8_t>(y * 5 + x);
+            pixels[i + 2] = static_cast<uint8_t>((x ^ y) & 0xFF);
+            pixels[i + 3] = 255;
+        }
+    }
+    return pixels;
+}
+}  // namespace
+
+TEST_CASE("Uploader::uploadImageMips CHUNKED-ROW path: a level bigger than the ring buffer's total capacity "
+          "uploads correctly via multiple bounded staging trips -- byte-exact full-image readback, forcing "
+          "several ring wraps mid-level [texture-path round, item B]") {
+    auto fixture = makeFixture("rx_rhi_vk_upload_test_chunked_oversized_level");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    // 32x32 RGBA8 mip 0 = 4096 bytes, against a 1024-byte ring -- 4x over
+    // capacity. bytesPerRow = 32*4 = 128 bytes -> rowsPerChunk =
+    // 1024/128 = 8 -> exactly 4 chunks of 8 rows each, no remainder (a
+    // deliberately clean division so this test's own expected chunk count
+    // is exact, not just "at least 2").
+    constexpr VkDeviceSize kRingSize = 1024;
+    constexpr VkExtent2D kExtent{32, 32};
+    constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
+
+    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device, kRingSize);
+    REQUIRE(uploader.has_value());
+    CHECK(uploader->ringCapacity() == kRingSize);
+
+    auto texture = rx::rhi::Texture2D::createForPresuppliedMips(
+        fixture->device.physicalDevice(), fixture->device.device(), fixture->allocator, kExtent, kFormat,
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, /*mipLevels=*/1, rx::rhi::MemoryCategory::Texture);
+    REQUIRE(texture.has_value());
+
+    std::vector<uint8_t> pixels = makeGradientPixelsLocal(kExtent.width, kExtent.height);
+    rx::rhi::Uploader::ImageMipLevel level{};
+    level.data = pixels.data();
+    level.size = static_cast<VkDeviceSize>(pixels.size());
+    level.mipLevel = 0;
+    level.extent = kExtent;
+    REQUIRE(level.size > kRingSize);  // this test's own premise -- must actually need chunking
+
+    REQUIRE(uploader->uploadImageMips(*texture, std::span<const rx::rhi::Uploader::ImageMipLevel>(&level, 1)));
+    uploader->wait(uploader->flush());
+
+    // Revert-discrimination evidence (diagnostic, not load-bearing on its
+    // own): the wrap count directly proves multiple bounded trips actually
+    // happened through the ring, not one oversized reservation that
+    // somehow slipped through reserveRingSpace()'s own total-capacity
+    // check. 4096 bytes through a 1024-byte ring, one chunk exactly
+    // filling it per trip, wraps at LEAST 3 times (the 2nd/3rd/4th chunks
+    // each start past the ring's end after the previous chunk filled it).
+    CHECK(uploader->ringWrapCount() >= 3);
+
+    auto readback = fixture->allocator.createHostVisibleBuffer(pixels.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    REQUIRE(readback.has_value());
+    auto cmdCtx = rx::rhi::CommandContext::create(fixture->device.device(), fixture->device.graphicsQueue(),
+                                                    fixture->device.graphicsQueueFamily());
+    REQUIRE(cmdCtx.has_value());
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        rx::rhi::transitionImage(cmd, texture->image(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy region{};
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent = {kExtent.width, kExtent.height, 1};
+        vkCmdCopyImageToBuffer(cmd, texture->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1,
+                               &region);
+    });
+    readback->invalidate();
+    std::vector<uint8_t> readBackPixels(pixels.size());
+    std::memcpy(readBackPixels.data(), readback->mappedData(), pixels.size());
+
+    // THE headline assertion: every one of the 4 chunks landed at the
+    // right vertical offset with the right bytes -- a byte-exact, whole-
+    // image comparison against a non-repeating gradient (a swapped or
+    // misplaced chunk would corrupt SOME row range, failing this memcmp).
+    CHECK(std::memcmp(readBackPixels.data(), pixels.data(), pixels.size()) == 0);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("Uploader::uploadImageMips: an oversized level that STILL exceeds capacity even chunked one row at a "
+          "time (a single row alone bigger than the ring) fails cleanly, before recording any GPU work -- never "
+          "a partial/corrupt upload [texture-path round, item B]") {
+    auto fixture = makeFixture("rx_rhi_vk_upload_test_chunked_row_too_big");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    // A single row is 32*4=128 bytes; a 64-byte ring cannot fit even ONE
+    // row -- the "cannot chunk at all" branch, distinct from the "needs
+    // multiple chunks" success case above.
+    constexpr VkDeviceSize kRingSize = 64;
+    constexpr VkExtent2D kExtent{32, 32};
+    constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
+
+    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device, kRingSize);
+    REQUIRE(uploader.has_value());
+
+    auto texture = rx::rhi::Texture2D::createForPresuppliedMips(
+        fixture->device.physicalDevice(), fixture->device.device(), fixture->allocator, kExtent, kFormat,
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, /*mipLevels=*/1, rx::rhi::MemoryCategory::Texture);
+    REQUIRE(texture.has_value());
+
+    std::vector<uint8_t> pixels = makeGradientPixelsLocal(kExtent.width, kExtent.height);
+    rx::rhi::Uploader::ImageMipLevel level{};
+    level.data = pixels.data();
+    level.size = static_cast<VkDeviceSize>(pixels.size());
+    level.mipLevel = 0;
+    level.extent = kExtent;
+
+    CHECK_FALSE(uploader->uploadImageMips(*texture, std::span<const rx::rhi::Uploader::ImageMipLevel>(&level, 1)));
+    // Nothing was ever recorded for this doomed call -- flush() reports
+    // the trivially-complete sentinel, exactly this class's own "no
+    // partial-batch corruption" contract for every other rejection path.
+    CHECK(uploader->flush().value == 0);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
