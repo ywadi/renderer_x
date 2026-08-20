@@ -1685,12 +1685,21 @@ uint32_t MaterialSystem::paramBlockSize(MaterialHandle handle) const {
 }
 
 void MaterialSystem::beginFrame(uint32_t frameInFlightIndex, uint64_t frameNumber) {
+    // [Phase 4 exit fix wave, F5] beginFrame() mutates impl_->paramArena
+    // state and writes impl_->currentFrameNumber, both unguarded. A worker
+    // chunk calling this is the same violation class as Task 24's
+    // GeometryPool::bind() finding and Task 7's other MaterialSystem read
+    // accessors, now closed: docs/threading.md's whole-class main-thread-only
+    // posture for MaterialSystem.
+    RX_ASSERT_MAIN_THREAD("MaterialSystem::beginFrame");
     Impl& impl = *impl_;
     impl.paramArena->beginFrame(frameInFlightIndex);
     impl.currentFrameNumber = frameNumber;
 }
 
 void MaterialSystem::onFrameCompleted(uint64_t completedFrameNumber) {
+    // [Phase 4 exit fix wave, F5] See beginFrame()'s comment above.
+    RX_ASSERT_MAIN_THREAD("MaterialSystem::onFrameCompleted");
     impl_->deletionQueue.onFrameFenceSignaled(completedFrameNumber);
 }
 

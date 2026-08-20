@@ -458,6 +458,8 @@ public:
     // own direct rx::rhi::DeletionQueue::retire() calls (e.g.
     // rx::rhi::FrameSync::frameNumber()) so this MaterialSystem's own
     // retirements become due at exactly the point the caller's own are.
+    // Thread-affinity (D5): main-thread-only, [guarded] [Phase 4 exit fix
+    // wave, F5] -- see docs/threading.md.
     void beginFrame(uint32_t frameInFlightIndex, uint64_t frameNumber);
 
     // Runs (and permanently removes) every VkPipeline/Texture2D retirement
@@ -468,6 +470,8 @@ public:
     // documented "typical frame-loop usage" pattern (deletion_queue.h)
     // exactly, just routed through this MaterialSystem's own internal
     // queue rather than one the caller owns directly.
+    // Thread-affinity (D5): main-thread-only, [guarded] [Phase 4 exit fix
+    // wave, F5] -- see docs/threading.md.
     void onFrameCompleted(uint64_t completedFrameNumber);
 
     // Record-time material-instance binding [Task 7 coordinator addition 3;

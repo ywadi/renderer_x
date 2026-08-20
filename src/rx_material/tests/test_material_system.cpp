@@ -1313,6 +1313,34 @@ TEST_CASE("MaterialSystem::pipelineLayout/layoutInfo/materialParams/paramBlockSi
     std::lock_guard<std::mutex> lock(capture.mutex);
     CHECK(capture.contexts.empty());
 }
+
+// [Phase 4 exit fix wave, F5] beginFrame()/onFrameCompleted() --
+// MaterialSystem's frame-management methods, previously unguarded.
+// Similar to the read accessor guards above: a plain std::thread stands in
+// for a worker, and each call is joined before the next starts. Reuses the
+// same capture hook and RAII guard.
+TEST_CASE("MaterialSystem::beginFrame trips RX_ASSERT_MAIN_THREAD when called from a worker thread") {
+    auto fixture = makeFixture("rx_material_begin_frame_guard");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto system = rx::material::MaterialSystem::create(fixture->device, fixture->bindless,
+                                                          freshCachePath("begin_frame_guard"));
+    REQUIRE(system != nullptr);
+
+    BindInstanceGuardCapture capture;
+    g_bindInstanceCapture.store(&capture, std::memory_order_relaxed);
+    rx::core::debug::detail::setViolationHookForTests(&captureBindInstanceViolation);
+    BindInstanceGuardHookScope guard;
+
+    std::thread beginFrameThread([&] { system->beginFrame(/*frameInFlightIndex=*/0, /*frameNumber=*/1); });
+    beginFrameThread.join();
+
+    std::lock_guard<std::mutex> lock(capture.mutex);
+    CHECK(capture.contexts.size() == 1);
+    CHECK(contextsContain(capture.contexts, "MaterialSystem::beginFrame"));
+}
 #endif  // RX_DEBUG_CHECKS
 
 // --- createTexture2D()/textureBindlessIndex()/releaseTexture() -----------
