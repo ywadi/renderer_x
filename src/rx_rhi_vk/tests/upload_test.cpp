@@ -1131,3 +1131,61 @@ TEST_CASE("Uploader::uploadImageMips: an oversized level that STILL exceeds capa
     CHECK(uploader->flush().value == 0);
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
+
+TEST_CASE("Uploader::uploadImageMips: an oversized level whose byte size does NOT divide evenly into whole "
+          "image rows fails cleanly (loud, not silent, not a crash), before recording any GPU work -- the "
+          "SECOND 'cannot chunk safely' branch, distinct from the 'single row too big' case above [texture-path "
+          "round, item B; review finding, texture-round-review.md]") {
+    auto fixture = makeFixture("rx_rhi_vk_upload_test_chunked_nondivisible_rows");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    // A deliberately BOGUS (extent, size) pair: `size` is neither 0 mod
+    // `extent.height` (193 = 3*64 + 1, so 193 % 3 == 1) nor small enough to
+    // fit the 64-byte ring whole (193 > 64) -- this exercises
+    // levelNeedsChunking()'s OTHER failure branch (upload.cpp): the one
+    // that fires when `level.size % level.extent.height != 0`, i.e. no
+    // safe per-row byte pitch can be derived at all, as opposed to the
+    // sibling test above (a real, evenly-divisible row that is simply
+    // wider than the ring). The `data`/`extent` byte layout does not need
+    // to correspond to any real image content here -- uploadImageMips()'s
+    // own validation loop runs over every level BEFORE touching `level.data`
+    // at all (see its own "no partial-batch corruption" contract), so this
+    // call fails at the validation step, never reaching a memcpy/recording
+    // step that would care whether the bytes are a real 16x3 RGBA8 image.
+    constexpr VkDeviceSize kRingSize = 64;
+    constexpr VkDeviceSize kBogusSize = 193;
+    constexpr VkExtent2D kExtent{16, 3};
+    constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    static_assert(kBogusSize > kRingSize, "must need chunking at all");
+    static_assert(kBogusSize % kExtent.height != 0, "must NOT divide evenly into whole rows -- the branch under test");
+
+    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device, kRingSize);
+    REQUIRE(uploader.has_value());
+
+    auto texture = rx::rhi::Texture2D::createForPresuppliedMips(
+        fixture->device.physicalDevice(), fixture->device.device(), fixture->allocator, kExtent, kFormat,
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, /*mipLevels=*/1, rx::rhi::MemoryCategory::Texture);
+    REQUIRE(texture.has_value());
+
+    std::vector<uint8_t> junk(kBogusSize, 0xAB);
+    rx::rhi::Uploader::ImageMipLevel level{};
+    level.data = junk.data();
+    level.size = kBogusSize;
+    level.mipLevel = 0;
+    level.extent = kExtent;
+
+    // THE discriminating assertion: a LOUD, clean failure -- not silence
+    // (which would mean this call returned true and either corrupted the
+    // upload or read past `junk`'s own bounds trying to compute a
+    // per-chunk row count from a non-integer division) and not a crash
+    // (this whole TEST_CASE completing, with zero validation errors below,
+    // is itself proof of that).
+    CHECK_FALSE(uploader->uploadImageMips(*texture, std::span<const rx::rhi::Uploader::ImageMipLevel>(&level, 1)));
+    // Nothing was ever recorded for this doomed call -- same "no
+    // partial-batch corruption" contract every other rejection path in
+    // this class provides.
+    CHECK(uploader->flush().value == 0);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
