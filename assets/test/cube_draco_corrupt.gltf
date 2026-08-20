@@ -1,10 +1,10 @@
 {
-  "asset": {"version": "2.0", "generator": "rx_asset gen_gltf_compression_fixtures (Task 13, Draco v1.5.7 real encode; material added round-11/issue-31)"},
+  "asset": {"version": "2.0", "generator": "rx_asset gen_gltf_compression_fixtures (round-11/issue-31, deliberately-corrupt Draco payload -- decode-failure fixture)"},
   "extensionsUsed": ["KHR_draco_mesh_compression"],
   "extensionsRequired": ["KHR_draco_mesh_compression"],
   "scene": 0,
   "scenes": [{"nodes": [0]}],
-  "nodes": [{"mesh": 0, "name": "draco_quad"}],
+  "nodes": [{"mesh": 0, "name": "draco_corrupt_quad"}],
   "materials": [
     {"name": "draco_quad_material", "pbrMetallicRoughness": {"baseColorFactor": [0.2, 0.6, 0.9, 1.0], "metallicFactor": 0.1, "roughnessFactor": 0.6}, "doubleSided": false, "alphaMode": "OPAQUE"}
   ],
@@ -18,6 +18,6 @@
     {"componentType": 5126, "count": 4, "type": "VEC2"},
     {"componentType": 5125, "count": 6, "type": "SCALAR"}
   ],
-  "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 169}],
-  "buffers": [{"uri": "cube_draco.bin", "byteLength": 169}]
+  "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 16}],
+  "buffers": [{"uri": "cube_draco_corrupt.bin", "byteLength": 16}]
 }

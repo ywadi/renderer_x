@@ -1,0 +1,23 @@
+{
+  "asset": {"version": "2.0", "generator": "rx_asset gen_gltf_compression_fixtures (round-11/issue-31, uncompressed Draco-fixture twin)"},
+  "scene": 0,
+  "scenes": [{"nodes": [0]}],
+  "nodes": [{"mesh": 0, "name": "draco_reference_quad"}],
+  "materials": [
+    {"name": "draco_quad_material", "pbrMetallicRoughness": {"baseColorFactor": [0.2, 0.6, 0.9, 1.0], "metallicFactor": 0.1, "roughnessFactor": 0.6}, "doubleSided": false, "alphaMode": "OPAQUE"}
+  ],
+  "meshes": [{"name": "quad", "primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2}, "indices": 3, "material": 0, "mode": 4}]}],
+  "accessors": [
+    {"bufferView": 0, "componentType": 5126, "count": 4, "type": "VEC3", "min": [0,0,0], "max": [1,1,0]},
+    {"bufferView": 1, "componentType": 5126, "count": 4, "type": "VEC3"},
+    {"bufferView": 2, "componentType": 5126, "count": 4, "type": "VEC2"},
+    {"bufferView": 3, "componentType": 5125, "count": 6, "type": "SCALAR"}
+  ],
+  "bufferViews": [
+    {"buffer": 0, "byteOffset": 0, "byteLength": 48, "target": 34962},
+    {"buffer": 0, "byteOffset": 48, "byteLength": 48, "target": 34962},
+    {"buffer": 0, "byteOffset": 96, "byteLength": 32, "target": 34962},
+    {"buffer": 0, "byteOffset": 128, "byteLength": 24, "target": 34963}
+  ],
+  "buffers": [{"uri": "cube_draco_reference.bin", "byteLength": 152}]
+}

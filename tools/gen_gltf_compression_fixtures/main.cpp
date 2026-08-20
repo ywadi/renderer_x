@@ -1,12 +1,20 @@
 // gen_gltf_compression_fixtures -- see this directory's CMakeLists.txt
 // for the full rationale. Regenerates:
-//   assets/test/cube_meshopt.{gltf,bin}  (EXT_meshopt_compression)
-//   assets/test/cube_draco.{gltf,bin}    (KHR_draco_mesh_compression)
+//   assets/test/cube_meshopt.{gltf,bin}          (EXT_meshopt_compression)
+//   assets/test/cube_draco.{gltf,bin}            (KHR_draco_mesh_compression, materialed)
+//   assets/test/cube_draco_reference.{gltf,bin}  (round-11/issue-31: uncompressed twin of
+//                                                  cube_draco.gltf -- identical geometry +
+//                                                  material as plain accessors, the render-
+//                                                  equivalence gate's ground truth)
+//   assets/test/cube_draco_corrupt.{gltf,bin}    (round-11/issue-31: same extension shape,
+//                                                  deliberately-truncated compressed payload --
+//                                                  the decode-failure fixture)
 // Run with one argument: the repository root (tools/fetch_assets.sh
 // invokes it as `gen_gltf_compression_fixtures <repo-root>`).
 #include <meshoptimizer.h>
 #include <draco/compression/encode.h>
 #include <draco/mesh/triangle_soup_mesh_builder.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -129,6 +137,91 @@ void genMeshoptFixture(const std::filesystem::path& outDir) {
                 kIndices.size() * sizeof(uint32_t), idxEncodedSize);
 }
 
+// Shared material block both the Draco-compressed fixture and its
+// uncompressed reference twin (below) carry -- IDENTICAL values in both,
+// so a render-equivalence gate comparing the two rendered images has no
+// material-side variable to account for, only the decode path itself.
+// Distinct from cube_textured.gltf's own baseColorFactor (warm red)
+// specifically so the two fixture families are never visually confusable
+// if ever rendered side by side.
+constexpr const char* kSharedMaterialJson =
+    "  \"materials\": [\n"
+    "    {\"name\": \"draco_quad_material\", \"pbrMetallicRoughness\": {\"baseColorFactor\": [0.2, 0.6, 0.9, "
+    "1.0], \"metallicFactor\": 0.1, \"roughnessFactor\": 0.6}, \"doubleSided\": false, \"alphaMode\": "
+    "\"OPAQUE\"}\n"
+    "  ],\n";
+
+// ---------------------------------------------------------------------
+// Uncompressed twin of genDracoFixture()'s own quad -- IDENTICAL
+// positions/normals/uvs/indices and the IDENTICAL material (above),
+// stored as plain (non-Draco) accessors. Round-11/issue-31 addition: the
+// render-equivalence gate (samples/09_scene conventions -- exact
+// counters + a pixel-tolerance gate) needs a ground truth to compare the
+// Draco-decoded render against; comparing against THIS twin (rendered
+// through the identical sample binary/pipeline) is a stronger, more
+// precise gate than a committed reference PNG would be here, and adds no
+// second reference-regeneration mechanism (gate ruling #15) since
+// nothing about this comparison is a committed golden file -- both
+// images are rendered fresh at gate time.
+// ---------------------------------------------------------------------
+void genDracoReferenceFixture(const std::filesystem::path& outDir) {
+    std::vector<uint8_t> buf;
+    const size_t posOff = buf.size();
+    for (const Vec3& p : kPositions) {
+        const float f[3] = {p.x, p.y, p.z};
+        buf.insert(buf.end(), reinterpret_cast<const uint8_t*>(f), reinterpret_cast<const uint8_t*>(f) + sizeof(f));
+    }
+    const size_t normOff = buf.size();
+    for (const Vec3& n : kNormals) {
+        const float f[3] = {n.x, n.y, n.z};
+        buf.insert(buf.end(), reinterpret_cast<const uint8_t*>(f), reinterpret_cast<const uint8_t*>(f) + sizeof(f));
+    }
+    const size_t uvOff = buf.size();
+    for (const Vec2& uv : kUVs) {
+        const float f[2] = {uv.x, uv.y};
+        buf.insert(buf.end(), reinterpret_cast<const uint8_t*>(f), reinterpret_cast<const uint8_t*>(f) + sizeof(f));
+    }
+    const size_t idxOff = buf.size();
+    buf.insert(buf.end(), reinterpret_cast<const uint8_t*>(kIndices.data()),
+               reinterpret_cast<const uint8_t*>(kIndices.data()) + kIndices.size() * sizeof(uint32_t));
+
+    writeFile(outDir / "cube_draco_reference.bin", buf.data(), buf.size());
+
+    std::ostringstream ss;
+    ss << gltfHeader(nullptr, nullptr,
+                      "rx_asset gen_gltf_compression_fixtures (round-11/issue-31, uncompressed Draco-fixture twin)");
+    ss << "  \"scene\": 0,\n"
+       << "  \"scenes\": [{\"nodes\": [0]}],\n"
+       << "  \"nodes\": [{\"mesh\": 0, \"name\": \"draco_reference_quad\"}],\n"
+       << kSharedMaterialJson
+       << "  \"meshes\": [{\"name\": \"quad\", \"primitives\": [{\"attributes\": {\"POSITION\": 0, \"NORMAL\": 1, "
+          "\"TEXCOORD_0\": 2}, \"indices\": 3, \"material\": 0, \"mode\": 4}]}],\n"
+       << "  \"accessors\": [\n"
+       << "    {\"bufferView\": 0, \"componentType\": 5126, \"count\": 4, \"type\": \"VEC3\", \"min\": [0,0,0], "
+          "\"max\": [1,1,0]},\n"
+       << "    {\"bufferView\": 1, \"componentType\": 5126, \"count\": 4, \"type\": \"VEC3\"},\n"
+       << "    {\"bufferView\": 2, \"componentType\": 5126, \"count\": 4, \"type\": \"VEC2\"},\n"
+       << "    {\"bufferView\": 3, \"componentType\": 5125, \"count\": 6, \"type\": \"SCALAR\"}\n"
+       << "  ],\n"
+       << "  \"bufferViews\": [\n"
+       << "    {\"buffer\": 0, \"byteOffset\": " << posOff << ", \"byteLength\": " << (kPositions.size() * 12)
+       << ", \"target\": 34962},\n"
+       << "    {\"buffer\": 0, \"byteOffset\": " << normOff << ", \"byteLength\": " << (kNormals.size() * 12)
+       << ", \"target\": 34962},\n"
+       << "    {\"buffer\": 0, \"byteOffset\": " << uvOff << ", \"byteLength\": " << (kUVs.size() * 8)
+       << ", \"target\": 34962},\n"
+       << "    {\"buffer\": 0, \"byteOffset\": " << idxOff << ", \"byteLength\": " << (kIndices.size() * 4)
+       << ", \"target\": 34963}\n"
+       << "  ],\n"
+       << "  \"buffers\": [{\"uri\": \"cube_draco_reference.bin\", \"byteLength\": " << buf.size() << "}]\n"
+       << "}\n";
+
+    std::ofstream jf(outDir / "cube_draco_reference.gltf");
+    jf << ss.str();
+    std::printf("wrote cube_draco_reference.gltf (%zu bytes JSON, %zu bytes bin -- uncompressed twin)\n", ss.str().size(),
+                buf.size());
+}
+
 // ---------------------------------------------------------------------
 // KHR_draco_mesh_compression fixture.
 // ---------------------------------------------------------------------
@@ -188,12 +281,15 @@ void genDracoFixture(const std::filesystem::path& outDir) {
     // fixture round-tripping in import_gltf_gpu_test.cpp.
     std::ostringstream ss;
     ss << gltfHeader("KHR_draco_mesh_compression", "KHR_draco_mesh_compression",
-                      "rx_asset gen_gltf_compression_fixtures (Task 13, Draco v1.5.7 real encode)");
+                      "rx_asset gen_gltf_compression_fixtures (Task 13, Draco v1.5.7 real encode; material added "
+                      "round-11/issue-31)");
     ss << "  \"scene\": 0,\n"
        << "  \"scenes\": [{\"nodes\": [0]}],\n"
        << "  \"nodes\": [{\"mesh\": 0, \"name\": \"draco_quad\"}],\n"
+       << kSharedMaterialJson
        << "  \"meshes\": [{\"name\": \"quad\", \"primitives\": [{\n"
-       << "    \"attributes\": {\"POSITION\": 0, \"NORMAL\": 1, \"TEXCOORD_0\": 2}, \"indices\": 3, \"mode\": 4,\n"
+       << "    \"attributes\": {\"POSITION\": 0, \"NORMAL\": 1, \"TEXCOORD_0\": 2}, \"indices\": 3, \"material\": "
+          "0, \"mode\": 4,\n"
        << "    \"extensions\": {\"KHR_draco_mesh_compression\": {\"bufferView\": 0, \"attributes\": {\"POSITION\": "
        << posAtt << ", \"NORMAL\": " << normAtt << ", \"TEXCOORD_0\": " << uvAtt << "}}}\n"
        << "  }]}],\n"
@@ -212,6 +308,53 @@ void genDracoFixture(const std::filesystem::path& outDir) {
     std::printf("wrote cube_draco.gltf (%zu bytes JSON, %zu bytes compressed mesh; attribute ids POSITION=%d NORMAL=%d "
                 "TEXCOORD_0=%d)\n",
                 ss.str().size(), buffer.size(), posAtt, normAtt, uvAtt);
+
+    // -----------------------------------------------------------------
+    // Round-11/issue-31: a decode-FAILURE fixture -- the extension is
+    // present (glTF-valid shape, same attribute-id map/bufferView as
+    // cube_draco.gltf above) but the compressed payload itself is
+    // corrupt (the real encoder's own valid output, truncated to its
+    // first 16 bytes -- past Draco's own bitstream header but nowhere
+    // near a complete mesh, so draco::Decoder::DecodeMeshFromBuffer()
+    // genuinely fails to parse it rather than merely producing an empty
+    // mesh). Exercises decodeDracoPrimitive()'s "Draco decode failed: touch
+    // {status}" RX_LOG_ERROR path (import_gltf.cpp) -- proves a
+    // corrupt-but-extension-tagged primitive fails cleanly (named error,
+    // primitive skipped, no crash), never silently or via UB.
+    // -----------------------------------------------------------------
+    const size_t corruptSize = std::min<size_t>(16, buffer.size());
+    writeFile(outDir / "cube_draco_corrupt.bin", buffer.data(), corruptSize);
+
+    std::ostringstream ssCorrupt;
+    ssCorrupt << gltfHeader("KHR_draco_mesh_compression", "KHR_draco_mesh_compression",
+                             "rx_asset gen_gltf_compression_fixtures (round-11/issue-31, deliberately-corrupt Draco "
+                             "payload -- decode-failure fixture)");
+    ssCorrupt << "  \"scene\": 0,\n"
+              << "  \"scenes\": [{\"nodes\": [0]}],\n"
+              << "  \"nodes\": [{\"mesh\": 0, \"name\": \"draco_corrupt_quad\"}],\n"
+              << kSharedMaterialJson
+              << "  \"meshes\": [{\"name\": \"quad\", \"primitives\": [{\n"
+              << "    \"attributes\": {\"POSITION\": 0, \"NORMAL\": 1, \"TEXCOORD_0\": 2}, \"indices\": 3, "
+                 "\"material\": 0, \"mode\": 4,\n"
+              << "    \"extensions\": {\"KHR_draco_mesh_compression\": {\"bufferView\": 0, \"attributes\": "
+                 "{\"POSITION\": "
+              << posAtt << ", \"NORMAL\": " << normAtt << ", \"TEXCOORD_0\": " << uvAtt << "}}}\n"
+              << "  }]}],\n"
+              << "  \"accessors\": [\n"
+              << "    {\"componentType\": 5126, \"count\": 4, \"type\": \"VEC3\", \"min\": [0,0,0], \"max\": "
+                 "[1,1,0]},\n"
+              << "    {\"componentType\": 5126, \"count\": 4, \"type\": \"VEC3\"},\n"
+              << "    {\"componentType\": 5126, \"count\": 4, \"type\": \"VEC2\"},\n"
+              << "    {\"componentType\": 5125, \"count\": 6, \"type\": \"SCALAR\"}\n"
+              << "  ],\n"
+              << "  \"bufferViews\": [{\"buffer\": 0, \"byteOffset\": 0, \"byteLength\": " << corruptSize << "}],\n"
+              << "  \"buffers\": [{\"uri\": \"cube_draco_corrupt.bin\", \"byteLength\": " << corruptSize << "}]\n"
+              << "}\n";
+
+    std::ofstream jfCorrupt(outDir / "cube_draco_corrupt.gltf");
+    jfCorrupt << ssCorrupt.str();
+    std::printf("wrote cube_draco_corrupt.gltf (%zu bytes JSON, %zu bytes truncated/corrupt compressed payload)\n",
+                ssCorrupt.str().size(), corruptSize);
 }
 
 }  // namespace
@@ -226,5 +369,6 @@ int main(int argc, char** argv) {
 
     genMeshoptFixture(outDir);
     genDracoFixture(outDir);
+    genDracoReferenceFixture(outDir);
     return 0;
 }
