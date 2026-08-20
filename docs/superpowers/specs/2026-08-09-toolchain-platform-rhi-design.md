@@ -533,3 +533,14 @@ it is out of scope for *this* spec only, not out of scope for the project:
   Context: the per-run cost inventory and the pipeline-cache precedent
   (VkPipelineCache already persists per sample) are ledgered in the
   Phase 4 SDD (2026-08-20 entries).
+
+- **Phase ordering ratified (owner, 2026-08-20):** Phase 5 =
+  **Techniques** (the advanced material/lighting charter above, with
+  minimal compute-pipeline capability pulled forward from the geometry
+  phase as its Stage-0 prerequisite); Phase 6 = Geometry (meshlets,
+  GPU-driven culling ladder, remaining compute scope); Phase 7 =
+  Streaming/VFS (+ layer-10 offline asset tooling & derived-data
+  cache, as two halves of one asset pipeline); Phase 8 = Animation;
+  Phase 9 = SDK/DLL (ship line; tooling/profiling threads through
+  phases 5-9 rather than standing alone). Plan documents remain the
+  per-phase source of truth; this entry fixes only the sequence.
