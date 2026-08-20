@@ -146,9 +146,9 @@ jobs:
       # mandatory glTF import gate asset (rx_asset_gltf_gpu_tests'
       # damaged_helmet_test.cpp) -- cached exactly like Slang above
       # (tools/fetch_assets.sh's own versioned marker file makes a
-      # version bump self-invalidating). Sponza is intentionally never
-      # fetched here (--sponza is a local-only flag this workflow never
-      # passes, per D16).
+      # version bump self-invalidating). Sponza is now fetched too (see
+      # the fetch step's own comment) for the temporary packaging bundle;
+      # D16 still exempts it from any ctest gate.
       # Closure-sweep item 5(a) [build-time incident, ledgered]: this key
       # rotates on any tools/fetch_assets.sh edit (e.g. a version-marker
       # bump), and without a restore-keys fallback that rotation forced a
@@ -164,16 +164,25 @@ jobs:
       # filename simply isn't found, so the script re-fetches and re-
       # verifies checksums from scratch) -- never a silent stale-asset
       # reuse.
-      - name: Cache fetched test assets (DamagedHelmet)
+      - name: Cache fetched test assets (DamagedHelmet + Sponza)
         uses: actions/cache@v5
         with:
           path: assets/fetched
-          key: fetched-assets-damagedhelmet-${{ hashFiles('tools/fetch_assets.sh') }}
+          key: fetched-assets-all-${{ hashFiles('tools/fetch_assets.sh') }}
           restore-keys: |
+            fetched-assets-all-
             fetched-assets-damagedhelmet-
 
-      - name: Fetch test assets (DamagedHelmet)
-        run: tools/fetch_assets.sh
+      # --sponza added 2026-08-20: package_samples.sh now bundles Sponza
+      # into the 09_scene package (TEMPORARY pre-go-live bundling, owner
+      # directive) and fails loudly without it, so CI's packaging step
+      # needs the asset fetched. The cache key was renamed (damagedhelmet-
+      # -> all-) so an existing helmet-only cache entry doesn't exact-match
+      # and block the first sponza-inclusive save; the old prefix stays in
+      # restore-keys as a warm partial. fetch_assets.sh's version-marker
+      # self-correction covers staleness either way.
+      - name: Fetch test assets (DamagedHelmet + Sponza)
+        run: tools/fetch_assets.sh --sponza
 
       # Unlike the Slang cache above, this key is job-specific
       # (deps-cache-linux-native-..., not shared with windows-cross-zig):
@@ -478,16 +487,25 @@ jobs:
       # rationale as the linux-native job's identically-worded step above
       # (a stale same-prefix restore is safe here: fetch_assets.sh's own
       # version-named marker file self-corrects).
-      - name: Cache fetched test assets (DamagedHelmet)
+      - name: Cache fetched test assets (DamagedHelmet + Sponza)
         uses: actions/cache@v5
         with:
           path: assets/fetched
-          key: fetched-assets-damagedhelmet-${{ hashFiles('tools/fetch_assets.sh') }}
+          key: fetched-assets-all-${{ hashFiles('tools/fetch_assets.sh') }}
           restore-keys: |
+            fetched-assets-all-
             fetched-assets-damagedhelmet-
 
-      - name: Fetch test assets (DamagedHelmet)
-        run: tools/fetch_assets.sh
+      # --sponza added 2026-08-20: package_samples.sh now bundles Sponza
+      # into the 09_scene package (TEMPORARY pre-go-live bundling, owner
+      # directive) and fails loudly without it, so CI's packaging step
+      # needs the asset fetched. The cache key was renamed (damagedhelmet-
+      # -> all-) so an existing helmet-only cache entry doesn't exact-match
+      # and block the first sponza-inclusive save; the old prefix stays in
+      # restore-keys as a warm partial. fetch_assets.sh's version-marker
+      # self-correction covers staleness either way.
+      - name: Fetch test assets (DamagedHelmet + Sponza)
+        run: tools/fetch_assets.sh --sponza
 
       # Closure-sweep item 5(a) -- same restore-keys fallback and the same
       # rationale as the linux-native job's identically-worded step above
