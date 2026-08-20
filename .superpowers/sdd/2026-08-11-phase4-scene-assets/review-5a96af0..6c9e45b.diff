@@ -1,0 +1,1180 @@
+# Review package: 5a96af0..6c9e45b
+
+## Commits
+6c9e45b docs: mouse-capture round report + MANUAL_VERIFICATION reconciliation (#33)
+09fff66 fix(samples): engage relative mouse capture in 09_scene fly-through (#33)
+
+## Files changed
+ .../mouse-capture-report.md                        | 267 +++++++++++++++++++++
+ MANUAL_VERIFICATION.md                             |  81 ++++++-
+ samples/09_scene/main.cpp                          |  80 +++++-
+ samples/09_scene/mouse_capture.h                   |  83 +++++++
+ samples/09_scene/tests/CMakeLists.txt              |  17 +-
+ samples/09_scene/tests/test_mouse_capture.cpp      | 120 +++++++++
+ .../tests/test_mouse_capture_focus_composition.cpp | 180 ++++++++++++++
+ 7 files changed, 819 insertions(+), 9 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-11-phase4-scene-assets/mouse-capture-report.md b/.superpowers/sdd/2026-08-11-phase4-scene-assets/mouse-capture-report.md
+new file mode 100644
+index 0000000..8aa10b8
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-11-phase4-scene-assets/mouse-capture-report.md
+@@ -0,0 +1,267 @@
++# Issue #33 — relative mouse capture in sample 09's fly-through
++
++Implementer report. Base commit at start: `4c481c7`; main advanced during
++this session via a concurrent, unrelated docs-only commit (`5a96af0`,
++layer-10 offline-tooling inventory) from another agent — no file overlap
++with this work.
++
++## Ticket text (`gh issue view 33`)
++
++> Sample 09: engage relative mouse capture in fly-through (bug, phase-4)
++>
++> User-reported: the OS cursor keeps moving during mouse-look, making
++> fly-through control impractical. Root cause: samples/09_scene never calls
++> `Window::setRelativeMouseMode()` — the platform facility (hide+capture,
++> delta accumulation, focus-loss auto-release) exists and is tested but
++> unconsumed. Fix: capture on fly start (or click-to-capture), Esc/focus-loss
++> release, ImGui `WantCaptureMouse` gating so the HUD remains usable while
++> released; MANUAL_VERIFICATION rows updated. Queued behind the texture-path
++> round.
++
++## Files changed
++
++- `samples/09_scene/mouse_capture.h` (new) — `rx::samples9::FlyThroughCaptureState`
++  (pure capture/release toggle) + `mouseDeltaDrivesCamera()` (pure composed
++  gate). Same device-free, header-only shape as `fly_camera.h`'s own W/S-fix
++  precedent this task was told to follow.
++- `samples/09_scene/tests/test_mouse_capture.cpp` (new) — 9 TEST_CASEs, fully
++  SDL/Window-free, covering the toggle state machine and the
++  `mouseDeltaDrivesCamera()` truth table.
++- `samples/09_scene/tests/test_mouse_capture_focus_composition.cpp` (new) —
++  3 TEST_CASEs linking a real (headless) `rx::platform::Window` to prove the
++  requirement-1 composition claim (re-arm-on-focus-gain vs. the capture
++  toggle) end to end, not just by citation.
++- `samples/09_scene/tests/CMakeLists.txt` — registers both new test files;
++  adds `rx_platform` to the test binary's link libraries (previously
++  `rx_scene` + doctest only).
++- `samples/09_scene/main.cpp` — wires the fix: include, `App::mouseCapture`
++  field, `updateFlyCamera()`'s composed mouse gate, the initial
++  `setRelativeMouseMode()` engagement call in `runPresent()`, the
++  Esc/click-to-recapture handling inside the existing `pumpEvents`
++  `preDispatch` lambda, the post-pump apply-on-change call, and a HUD status
++  line (present-mode only).
++- `MANUAL_VERIFICATION.md` — new capture/release/Esc/HUD-interaction
++  checklist rows under `## 09_scene` (unchecked); reconciled the
++  `## rx_platform input surface` section's "09_scene is now the first real
++  consumer" claim (it consumed deltas but never actually engaged capture —
++  exactly this ticket's gap); added a real-NVIDIA log-evidence addendum;
++  cross-referenced the `## rx_debug_ui overlay` "camera stops moving" row.
++
++Not touched: `.superpowers/sdd/.../progress.md` (ledger — another agent's
++concurrent WIP, explicitly out of scope), any plan/spec/board content.
++
++## Per-requirement proof
++
++### 1. Engage relative mouse mode; capture default; Esc toggle; click-to-recapture; re-arm composition
++
++`runPresent()` (main.cpp) now:
++- Calls `app->window->setRelativeMouseMode(app->mouseCapture.captured())`
++  unconditionally once, right after `Overlay::create()` succeeds (captured
++  by default — recommended UX, usable from frame 1).
++- Inside the existing `pumpEvents` `preDispatch` lambda: a non-repeat
++  `SDL_EVENT_KEY_DOWN`/`SDL_SCANCODE_ESCAPE` calls
++  `mouseCapture.toggleOnEscPressed()`; a `SDL_EVENT_MOUSE_BUTTON_DOWN`
++  (left button) while released AND `!ImGui::GetIO().WantCaptureMouse` calls
++  `mouseCapture.recaptureOnViewportClick()`.
++- After the full event drain, applies exactly one real transition —
++  `if (captured() changed) window->setRelativeMouseMode(captured())`.
++
++Focus-loss/gain re-arm is platform-handled and was **not reimplemented** —
++verified, not assumed: `src/rx_platform/src/window.cpp`'s
++`SDL_EVENT_WINDOW_FOCUS_GAINED` case unconditionally re-issues
++`SDL_SetWindowRelativeMouseMode(window_, true)` only `if
++(relativeModeWanted_)`, and `setRelativeMouseMode()` is the only writer of
++that field. Composition with our toggle is proven directly (not just cited)
++by `test_mouse_capture_focus_composition.cpp`, which drives a real headless
++`Window` through: initial capture → Esc release → alt-tab away/back →
++assert `relativeMouseModeWanted() == false` (did NOT silently re-arm), and
++the mirror case: release → recapture → alt-tab away/back → assert `== true`
++(DID re-arm). Both pass. See "Test evidence" below for the mutation proof
++that these assertions are load-bearing.
++
++### 2. ImGui interplay (WantCaptureMouse/WantCaptureKeyboard gating)
++
++`updateFlyCamera()`'s pre-existing `WantCaptureKeyboard` early-return is
++unchanged (keyboard gating untouched by this ticket). The mouse-delta gate
++is now `mouseDeltaDrivesCamera(mouseCapture.captured(),
++ImGui::GetIO().WantCaptureMouse)`:
++- CAPTURED → always `true` (cursor hidden; HUD ignores it by contract,
++  requirement 2's own wording).
++- RELEASED → `!WantCaptureMouse` exactly, i.e. the pre-existing gate,
++  unchanged — HUD stays fully usable while released, camera never steals
++  clicks/drags aimed at an open HUD panel.
++
++No duplication of the overlay's own ImGui-first event routing: the fix adds
++branches to the ALREADY-existing `preDispatch` lambda
++(`app->overlay->processEvent(event)` still runs first, unconditionally,
++before the new Esc/click branches) rather than introducing a second event
++path.
++
++### 3. Gamepad unaffected in both capture states
++
++Verified by inspection, not merely "didn't break it": `updateFlyCamera()`'s
++gamepad block (`window.poll()`, left-stick move, right-stick look, trigger
++speed multiplier) sits entirely outside the mouse-delta `if` this ticket
++touched — zero lines of the gamepad path were changed, and it reads neither
++`app.mouseCapture` nor `ImGui::GetIO()`. Structurally cannot be affected by
++capture state.
++
++### 4. Tests
++
++- **Pure state machine** (`test_mouse_capture.cpp`, 9 cases, 28
++  assertions): default-captured, Esc toggle transitions (multi-press
++  round-trip), click-to-recapture (including idempotent no-op while
++  captured), the full `mouseDeltaDrivesCamera()` 2×2 truth table, and an
++  end-to-end capture/HUD-interaction/release/recapture cycle scenario.
++- **Real-Window composition** (`test_mouse_capture_focus_composition.cpp`,
++  3 cases, 16 assertions): proves requirement 1's re-arm/toggle composition
++  against a real (headless) `rx::platform::Window`, per the ticket's
++  explicit ask to confirm this rather than assume it.
++- **MANUAL_VERIFICATION.md**: new unchecked rows for capture-default,
++  Esc release/recapture, click-to-recapture, HUD usability while released,
++  and alt-tab-while-captured — the genuinely non-automatable half (actual
++  OS cursor visibility/lock behavior, human feel).
++- **Reconciliation**: the `## rx_platform input surface` section's
++  "09_scene is now the first real consumer" claim is corrected — Task 24
++  consumed deltas but never engaged capture; this ticket closes that gap.
++  Cross-referenced from the `## rx_debug_ui overlay` section's pre-existing
++  "camera stops moving while HUD has focus" row.
++
++### 5. Verification (commands + tails below)
++
++- Full serial lavapipe ctest: **29/29 green** (linux-native).
++- Real-NVIDIA `--present --validate`, ~15s sustained: clean (see below).
++- windows-cross-zig build + Wine: clean build, **28/28** device-free tests
++  green under Wine; windows-cross-zig ctest (GPU/sample-excluded, CI's own
++  convention): **13/13** green.
++- Zero compiler warnings on every build performed (linux-native full
++  rebuild, windows-cross-zig full rebuild) — nothing suppressed, plainly
++  absent from `ninja` output.
++- Zero unfiltered Vulkan validation errors on the real-NVIDIA run (see
++  below).
++
++## Test evidence: revert-discrimination (mutation testing)
++
++Each claim below was verified by actually breaking the code, rebuilding,
++observing the expected test failure, then restoring the original and
++rebuilding green again — not asserted from reading the test source.
++
++1. **`mouseDeltaDrivesCamera()`: OR → AND.** Changed
++   `return captured || !imguiWantsMouse;` to `captured && !imguiWantsMouse;`.
++   Result: 4 of 9 `test_mouse_capture.cpp` cases failed (6 assertions),
++   including the explicit 2×2-truth-table case. Restored → 9/9 green again.
++
++2. **`FlyThroughCaptureState::toggleOnEscPressed()`: toggle → always-release.**
++   Changed `captured_ = !captured_;` to `captured_ = false;`. Result: 2
++   cases failed (the toggle-round-trip case and the click/Esc/click
++   sequence case) — exactly the two designed to catch this class of bug.
++   Restored → 9/9 green again.
++
++3. **`applyCaptureTransition()`'s guard: `!=` → `==`** (in
++   `test_mouse_capture_focus_composition.cpp`, mirroring main.cpp's real
++   `if (captured() != capturedBeforePump)` condition). Result: all 3
++   composition cases failed at their first post-toggle
++   `relativeMouseModeWanted()` assertion (both stayed wrongly stuck at the
++   initial captured=true state). Restored → 28/28 green again (full
++   `sample_09_scene_tests` binary).
++
++## Command tails
++
++### Full serial lavapipe ctest (linux-native)
++
++```
++$ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json xvfb-run -a ctest --preset linux-native --output-on-failure
++...
++27/29 Test #27: sample_09_scene_headless .................   Passed    1.72 sec
++28/29 Test #28: sample_09_scene_stress_headless ..........   Passed    1.03 sec
++29/29 Test #29: sample_09_scene_tests ....................   Passed    0.40 sec
++
++100% tests passed, 0 tests failed out of 29
++Total Test time (real) =  79.96 sec
++```
++
++### `sample_09_scene_tests` full run (linux-native, under Xvfb — needs SDL video init now that it links rx_platform)
++
++```
++$ xvfb-run -a ./samples/09_scene/tests/sample_09_scene_tests
++[doctest] doctest version is "2.5.3"
++...
++===============================================================================
++[doctest] test cases: 28 | 28 passed | 0 failed | 0 skipped
++[doctest] assertions: 99 | 99 passed | 0 failed |
++[doctest] Status: SUCCESS!
++```
++
++### windows-cross-zig build + Wine
++
++```
++$ cmake --build --preset windows-cross-zig --target sample_09_scene sample_09_scene_tests
++...
++[7/7] Linking CXX executable samples/09_scene/sample_09_scene.exe   (also sample_09_scene_tests.exe)
++(zero warnings emitted)
++
++$ wine samples/09_scene/tests/sample_09_scene_tests.exe
++...
++[doctest] test cases: 28 | 28 passed | 0 failed | 0 skipped
++[doctest] assertions: 99 | 99 passed | 0 failed |
++[doctest] Status: SUCCESS!
++
++$ xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_debug_ui_gpu|sample' --output-on-failure
++...
++100% tests passed, 0 tests failed out of 13
++Total Test time (real) = 115.46 sec
++```
++
++### Real-NVIDIA `--present --validate`, ~15s sustained (default/unforced ICD)
++
++Environment: `vulkaninfo --summary` confirms `GPU0: NVIDIA GeForce RTX 2080`,
++`driverID = DRIVER_ID_NVIDIA_PROPRIETARY`, `driverInfo = 580.82.07`, alongside
++an also-installed lavapipe ICD (`GPU1`) — `vkb::PhysicalDeviceSelector`'s own
++default discrete-GPU preference (unchanged by this ticket) selects the
++NVIDIA device. Run against a real X display (not Xvfb), default/unforced
++`VK_ICD_FILENAMES`.
++
++```
++$ ./sample_09_scene --present --validate   # backgrounded, SIGTERM after ~15s
++...
++[info] Device::create: present mode in use: FIFO (explicit default, PresentMode::VsyncOn)
++[info] sample_09_scene: --present: present mode in use: FIFO
++...
++[info] sample_09_scene: window closed cleanly
++```
++
++Log analysis (4834 lines total):
++- `[error]`-level lines: **0**.
++- `Validation Error` lines total: 4809, of which lines **NOT** carrying this
++  codebase's own documented `(known false positive: ...)` guard prefix:
++  **0**.
++- `SDL_SetWindowRelativeMouseMode` failure warnings: **0** — `Window::
++  setRelativeMouseMode()` only logs on failure (matches `setFullscreen()`'s
++  convention), so this absence is positive evidence the real NVIDIA driver
++  GRANTED relative mode for this session, not merely that the call was
++  reached.
++
++What this does **not** prove, and is intentionally left as unchecked
++MANUAL_VERIFICATION rows: whether the OS cursor visibly stays hidden/locked,
++whether Esc/click-to-recapture *feel* correct, and Steam Deck gamepad
++drivability. None of that is observable from a log in a non-interactive
++session — stated honestly per the task's own instruction, not glossed over.
++The code-path proof for this run is exactly what the task asked for: the
++platform API call being made (and granted) + the state-machine tests above.
++
++## Concerns / open items
++
++- Real human-observed cursor-capture behavior (visible hide/lock, Esc feel,
++  click-to-recapture feel) remains unverified — genuinely not automatable
++  headlessly, consistent with this file's own established posture for every
++  other `09_scene` mouse/gamepad row. Flagged as new unchecked
++  MANUAL_VERIFICATION rows, not silently left implicit.
++- `mouse_capture.h` deliberately carries no D5 thread-affinity comment: it
++  is a pure value type with no OS resource and no static/shared state,
++  matching the established precedent of every other pure sample-local
++  header in this codebase (`fly_camera.h`, `draw_recording.h`,
++  `rx_platform/input.h`'s `applyStickDeadzone`/`applyTriggerDeadzone`) —
++  none of which carry a D5 note either. D5 is scoped to headers exposing a
++  main-thread-only or worker-allowed API over stateful/OS-resource-owning
++  classes (`docs/threading.md`); applying it here would be boilerplate
++  without content.
+diff --git a/MANUAL_VERIFICATION.md b/MANUAL_VERIFICATION.md
+index 6f4e605..eb7e611 100644
+--- a/MANUAL_VERIFICATION.md
++++ b/MANUAL_VERIFICATION.md
+@@ -158,20 +158,34 @@ including gamepad hot-plug/axis/button paths, which SDL3's
+ `SDL_AttachVirtualJoystick` makes CI-testable without real hardware (see
+ `src/rx_platform/tests/window_test.cpp`) — but a few things are genuinely
+ NOT automatable headlessly, matching this file's own established
+ "screenshot/human-observed, not scriptable" carve-out (see e.g. row 3's own
+ acceptance criterion in the gate matrix for this ticket). **`09_scene`
+ (Task 24) is now the first real consumer** (mouse-look + gamepad + WASD
+ fly-through camera — see this file's own `## 09_scene` section below for
+ its end-to-end checklist); the rows below remain the raw platform-level
+ checks, independent of that sample.
+ 
++**[Issue #33 correction, superseding the paragraph above as originally
++written]** Task 24's original `09_scene` wiring only went as far as
++*consuming* `consumeMouseDelta()` each frame — it never actually called
++`setRelativeMouseMode()`, so the facility below was still functionally
++unconsumed: the OS cursor was never hidden/locked, and the reported defect
++(cursor escapes the window/hits screen edges during `--present`
++fly-through, making control impractical) was exactly that gap. `09_scene`
++now calls `setRelativeMouseMode()` for real (captured by default entering
++`--present` fly-through, Esc toggles release/recapture, click-to-recapture
++on the viewport — see `samples/09_scene/mouse_capture.h` and this file's own
++`## 09_scene` section below for the new checklist rows) — this facility is
++genuinely consumed end to end as of Issue #33, not merely partially as
++Task 24 first left it.
++
+ - [ ] Relative mouse mode: call `setRelativeMouseMode(true)` in a real
+       (non-hidden) window session — cursor visibly disappears and stays
+       centered/locked to the window regardless of how far the mouse is
+       moved; `setRelativeMouseMode(false)` visibly restores the normal
+       cursor at a sane position.
+ - [ ] Cursor `setCursorVisible(false)`/`(true)` — cursor visibly
+       disappears/reappears over the window.
+ - [ ] Cursor `setCursorConfined(true)`/`(false)` — cursor is visibly
+       unable to leave the window's bounds while confined, and free to
+       leave once un-confined.
+@@ -198,25 +212,33 @@ checks, independent of that sample.
+       the fly-through camera as expected, and check the log for the
+       gyro/device-name diagnostic line this ticket adds
+       (`rx_platform: gamepad connected id=... name="..." hasGyroSensor=...`)
+       — SDL issue #9148 predicts a Steam Deck's own gyro reports
+       `hasGyroSensor=false` at this project's pinned SDL3 version; this row
+       confirms that diagnostic actually appears on real Deck hardware,
+       not just in the virtual-joystick test.
+ 
+ **Last run:** not yet performed on real hardware — this task (Task 20)
+ implemented and automated-tested the platform-level surface; `09_scene`
+-(Task 24) now drives it end to end (see this file's own `## 09_scene`
+-section), but a real human-observed session (desktop mouse/keyboard/
+-gamepad, then Steam Deck) has not yet been performed. Fill in the
+-checkboxes above the first time this is actually run, before any release
+-claiming Deck gamepad support.
++(Issue #33) now actually calls `setRelativeMouseMode()` and drives it end
++to end (see this file's own `## 09_scene` section), but a real
++human-observed session (desktop mouse/keyboard/gamepad, then Steam Deck)
++has not yet been performed. Issue #33's own fix DID confirm, via log
++inspection (not visual observation — genuinely not automatable headlessly,
++see this file's own posture above), that `SDL_SetWindowRelativeMouseMode(true)`
++succeeds with no failure warning logged against a real windowed session on
++a real NVIDIA GPU/driver (RTX 2080, `DRIVER_ID_NVIDIA_PROPRIETARY`) — the
++code path executes and is granted by a real driver, which is as far as a
++non-interactive session can verify; whether the cursor visibly
++disappears/stays locked as a human would observe it is still an open row
++below. Fill in the checkboxes above the first time this is actually run,
++before any release claiming Deck gamepad support.
+ 
+ ## rx_debug_ui overlay (Phase 4 Stage 2 Task 21, spec D20, gate ruling #16)
+ 
+ `rx::debug_ui::Overlay` (font upload, descriptor pool, render-graph pass,
+ event dispatch, LOAD-not-CLEAR pattern-preservation, at-most-once
+ `vkQueueWaitIdle`) is exercised automatically end-to-end against an
+ offscreen readback target (`src/rx_debug_ui/tests/test_overlay_gpu.cpp`,
+ `rx_debug_ui_gpu_tests`) under lavapipe + validation, both CI presets
+ (GPU test excluded on windows-cross-zig/Wine — no real Vulkan device
+ there, same posture as `rx_rhi_vk_tests`/`rx_graph_gpu_tests`). **`09_scene`
+@@ -238,21 +260,25 @@ directly, so that half is a MANUAL_VERIFICATION row").
+       `overlay.cpp`) — Task 20/#14's own gamepad hot-plug log line
+       (`rx_platform: gamepad connected id=...`) should fire exactly once
+       per physical connect, with no second, ImGui-driven open/close
+       racing it (the hazard gate ruling #16 row 7 names).
+ - [ ] "Camera stops moving while the HUD has focus" (gate matrix row 6's
+       second half): with a sample driving both a fly-through camera
+       (Task 20's mouse-look) and this overlay, click/drag inside an open
+       HUD panel — the camera must NOT respond to that mouse motion while
+       `ImGui::GetIO().WantCaptureMouse` is true (the automated GPU test
+       proves `WantCaptureMouse` itself flips correctly; it cannot drive a
+-      real camera to observe the consuming half of the contract).
++      real camera to observe the consuming half of the contract). [Issue
++      #33] `09_scene` now has a RELEASED mouse-capture state (Esc) as a
++      prerequisite for this row to even be exercisable with a visible,
++      free cursor — see this file's own `## 09_scene` section below for the
++      capture-specific rows this composes with.
+ - [ ] Steam Deck: confirm the HUD renders and is legible/usable at Deck's
+       actual display resolution and, if the HUD ever grows touch-target
+       sizing considerations, that mouse/keyboard-driven toggles remain
+       operable via Deck's trackpads (gamepad HUD navigation is explicitly
+       NOT implemented this phase, per gate ruling #16 row 7 — Manual
+       gamepad mode means the HUD is not gamepad-navigable at all yet).
+ 
+ **Last run:** not yet performed on real hardware — this task (Task 21)
+ implemented and automated-tested the module against an offscreen readback
+ target; `09_scene` (Task 24) now wires this overlay into a live windowed
+@@ -471,20 +497,27 @@ pre-staged `assets/DamagedHelmet/glTF/` deployed next to it — see
+   columns; the fixed startup camera frames the two default-visible rows —
+   8 helmets — plus a directional-light shadow on the ground) rendered
+   through the full Registry → Scene → DrawListBuilder → render-graph path.
+   `--scene sponza` (after `tools/fetch_assets.sh --sponza`) loads Sponza
+   instead; without that fetch it fails loudly with a named "run
+   `tools/fetch_assets.sh --sponza` first" error rather than hanging or
+   crashing.
+ - WASD + mouse-look (relative mouse mode) + gamepad (left stick move,
+   right stick look) fly the camera through the scene smoothly, with no
+   jump/snap and no drift.
++- [Issue #33] Mouse capture: CAPTURED by default on entering `--present`
++  (cursor hidden, locked to the window, drives look immediately — no extra
++  click needed). Esc toggles RELEASED (cursor visibly reappears at a sane
++  position, HUD is fully clickable, camera stops responding to mouse motion
++  claimed by an open HUD panel) and back to CAPTURED. While RELEASED,
++  left-clicking the viewport (i.e. NOT an open HUD panel) recaptures.
++  Gamepad look/move work identically in both capture states.
+ - The ImGui HUD shows FPS/frame-ms (60-frame rolling average), cull
+   counters (visible/culled/recordsIn/drawsSubmitted + the instancing-
+   collapse-ratio percentage), a vsync checkbox, TWO VISIBLY DISTINCT mask
+   controls — one row of layer-mask checkboxes (toggling a row's checkbox
+   hides/shows that whole row of helmets outright) and a SEPARATE light-
+   channel checkbox (toggling it only changes whether row 0 is lit/casts a
+   shadow — the helmets in row 0 never disappear when this is toggled,
+   unlike the layer checkboxes) — pool stats, and the #27 memory report.
+ - The vsync checkbox visibly changes tearing/frame-pacing behavior and logs
+   the same "present mode in use" line the `--vsync` CLI flag produces.
+@@ -498,20 +531,37 @@ pre-staged `assets/DamagedHelmet/glTF/` deployed next to it — see
+ - On Linux, run with `--validate` and confirm no `[error]`-level validation
+   output beyond this codebase's documented false-positive guards.
+ 
+ ### Linux (native, `linux-native` preset)
+ 
+ - [ ] Build: `cmake --preset linux-native && cmake --build --preset linux-native`
+ - [ ] Fetch the default asset once: `tools/fetch_assets.sh`
+ - [ ] Run: `./build/linux-native/samples/09_scene/sample_09_scene --present --validate`
+ - [ ] Default helmet grid renders correctly; fly-through (WASD + mouse-look)
+       feels smooth and correctly oriented
++- [ ] Mouse capture [Issue #33]: on launch, the OS cursor is hidden and
++      mouse-look works immediately (captured by default) — the cursor never
++      escapes the window/hits screen edges during continuous mouse-look
++      (the originally reported defect)
++- [ ] Esc releases capture: OS cursor visibly reappears at a sane position;
++      moving the mouse over the (non-HUD) viewport no longer spins the
++      camera while an open HUD panel is hovered (`WantCaptureMouse` true);
++      a second Esc recaptures (cursor hides again, look resumes)
++- [ ] While released, left-clicking the (non-HUD) viewport recaptures
++      (cursor hides, mouse-look resumes) without needing Esc again
++- [ ] While released, the HUD (checkboxes, vsync toggle, layer-mask rows,
++      etc. — see the HUD row below) is fully clickable/usable with the
++      visible cursor, and the "Mouse: RELEASED ..." / "Mouse: CAPTURED ..."
++      status line in the HUD itself reflects the current state accurately
++- [ ] Alt-tab away and back while captured: no crash; mouse-look resumes
++      correctly on refocus (re-arm composes with the capture toggle — see
++      this file's own `## rx_platform input surface` section above)
+ - [ ] HUD shows FPS/cull-counters/vsync/layer-mask row toggles/light-channel
+       toggle/pool stats/memory report; layer-mask toggles hide/show whole
+       rows, the light-channel toggle only changes row 0's lighting/shadow
+       (never its visibility) — confirms the two controls are genuinely
+       independent, not one shared control
+ - [ ] vsync checkbox visibly changes present behavior and logs the same
+       line the `--vsync` CLI flag does
+ - [ ] `--scene sponza` (after `tools/fetch_assets.sh --sponza`) loads and
+       renders Sponza; without the fetch it fails loudly with a named error
+ - [ ] `--stress` renders the large instanced field smoothly
+@@ -540,20 +590,39 @@ implemented per the same fetch-and-fail-loudly contract sample 08's own
+ Sponza-adjacent code follows, but was NOT exercised against a real fetched
+ Sponza asset in this environment (Sponza is present-mode-only, never
+ CI-fetched, and fetching the ~53 MB asset was outside this task's
+ available session time) — this is a disclosed scope gap, not a claimed
+ pass. This is real functional verification, not a placeholder — but it is
+ not the human-observed-on-real-hardware, real-mouse-and-gamepad-drive check
+ this file otherwise tracks. Fill in the checkboxes and hardware/driver
+ details above the first time `--present` is actually watched (and driven)
+ on a real display.
+ 
++**[Issue #33 addendum]** The mouse-capture fix itself was additionally run
++`--present --validate` for ~15s against a REAL windowed session (a real X
++display, not Xvfb) on a REAL discrete NVIDIA GPU with the DEFAULT (unforced)
++ICD loader — `vulkaninfo` confirms `GPU0: NVIDIA GeForce RTX 2080`,
++`driverID = DRIVER_ID_NVIDIA_PROPRIETARY`, `driverInfo = 580.82.07`, and
++`vkb::PhysicalDeviceSelector`'s own default discrete-GPU preference selects
++it ahead of the also-installed lavapipe ICD: zero `[error]`-level log lines,
++zero `Validation Error` lines without this codebase's own documented
++false-positive guard prefix, and a clean `SIGTERM` exit logging
++`window closed cleanly`. Critically, `SDL_SetWindowRelativeMouseMode(true)`
++logged NO failure warning during this real run — `Window::setRelativeMouseMode()`
++only logs on failure, so its absence here is positive evidence the real
++driver GRANTED relative mode, not just that the call was reached. What this
++does NOT prove, and remains genuinely open below: whether the OS cursor
++*visibly* stays hidden/locked, whether Esc/click-to-recapture *feel* right,
++and Steam Deck gamepad drivability — none of that is observable from a log
++in a non-interactive session; a human must still watch and drive this the
++first time the checkboxes above are filled in.
++
+ ## Steam Deck (09_scene, `linux-native` preset)
+ 
+ Same posture as every other sample's own Steam Deck subsection (see
+ 01_triangle's own, above): SteamOS Desktop Mode uses the identical
+ `linux-native` preset and binary, no Deck-specific build variant.
+ 
+ - [ ] Build directly on the Deck in Desktop Mode, or copy the packaged
+       `09_scene/` directory over (see `tools/package_samples.sh`)
+ - [ ] Run: `./sample_09_scene --present` from Konsole (or Gamescope)
+ - [ ] Fly-through camera is drivable via the Deck's own built-in gamepad
+diff --git a/samples/09_scene/main.cpp b/samples/09_scene/main.cpp
+index f075766..51a2eda 100644
+--- a/samples/09_scene/main.cpp
++++ b/samples/09_scene/main.cpp
+@@ -91,20 +91,21 @@
+ #include <rx_scene/draw_list.h>
+ #include <rx_scene/scene.h>
+ #include <rx_shader/compiler.h>
+ #include <rx_shader/reflection.h>
+ #include <rx_shadow/shadow_caster_pipeline.h>
+ #include <rx_shadow/shadow_frustum.h>
+ #include <rx_task/scheduler.h>
+ 
+ #include "draw_recording.h"
+ #include "fly_camera.h"
++#include "mouse_capture.h"
+ #include <reference_gate.h>
+ 
+ #define GLM_FORCE_DEPTH_ZERO_TO_ONE
+ #include <glm/glm.hpp>
+ #include <glm/gtc/matrix_transform.hpp>
+ #include <glm/gtc/quaternion.hpp>
+ 
+ #include <SDL3/SDL.h>
+ #include <imgui.h>
+ #include <volk.h>
+@@ -280,20 +281,32 @@ std::filesystem::path resolveSponzaScenePath() {
+ // (left stick move, right stick look, triggers = speed multiplier) drive a
+ // plain yaw/pitch `rx::scene::Camera`. Movement/look are both continuous,
+ // framerate-scaled (`dt`). The struct itself, and the axis->local-move-delta
+ // mapping updateFlyCamera() below drives it with, now live in
+ // fly_camera.h -- device-free, unit-tested directly
+ // (tests/test_fly_camera.cpp), same "pull pure logic out of main.cpp into
+ // its own header" precedent draw_recording.h already established in this
+ // sample.
+ using rx::samples9::FlyCamera;
+ 
++// --- Relative mouse capture [Issue #33] -----------------------------------
++// Captures/releases the OS cursor for fly-through mouse-look -- see
++// mouse_capture.h's own top comment for the full defect writeup (the fix
++// this ticket is entirely about: main.cpp never called
++// rx::platform::Window::setRelativeMouseMode() at all). The struct itself,
++// and the composed mouse-look decision updateFlyCamera() below drives it
++// with, live in mouse_capture.h -- device-free, unit-tested directly
++// (tests/test_mouse_capture.cpp), same "pull pure logic out of main.cpp"
++// precedent fly_camera.h already established just above.
++using rx::samples9::FlyThroughCaptureState;
++using rx::samples9::mouseDeltaDrivesCamera;
++
+ // --- Shared pass infra [tonemap pass -- shaders/multipass/tonemap.{vert,
+ // frag}.slang, VERBATIM -- same convention samples/07_stress/08_gltf_viewer's
+ // own copies establish] ---------------------------------------------------
+ struct TonemapPushConstants {
+     uint32_t hdrTextureIndex;
+     uint32_t hdrSamplerIndex;
+ };
+ 
+ struct CompiledPass {
+     VkShaderModule vertModule = VK_NULL_HANDLE;
+@@ -819,20 +832,28 @@ struct App {
+ 
+     // Per-frame culling output -- reused, caller-owned storage [D26 amendment].
+     rx::scene::ViewLists viewLists;
+     rx::scene::ShadowLists shadowLists;
+     std::vector<rx::scene::ResolvedDrawGroup> resolvedGroups;  // populated once/frame, chunk 0, before fan-out.
+ 
+     FlyCamera flyCamera;
+     float moveSpeed = FlyCamera::kBaseMoveSpeed;
+     HudState hud;
+ 
++    // [Issue #33] Present-mode-only -- runHeadless() never touches this
++    // (no real OS cursor to capture against a hidden window). Captured by
++    // default; runPresent() engages the real platform capture
++    // (Window::setRelativeMouseMode()) to match this state once, right
++    // after the overlay/window are both up, then re-applies it on every
++    // Esc/click-to-recapture transition inside the present loop.
++    FlyThroughCaptureState mouseCapture;
++
+     bool sceneReady = false;  // grid mode: false until the sync import + buildHelmetGrid() complete.
+ };
+ 
+ // Builds every field up to (but not including) scene content -- device/
+ // allocator/uploader/bindless/materialSystem/geometryPool/textureCache/
+ // scheduler/executor, the shadow-caster pipeline, the tonemap pipeline, and
+ // the shared material-param descriptor infrastructure. Returns nullptr
+ // (logged) on any failure.
+ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uint32_t height, bool visible,
+                               bool validate, bool stressMode) {
+@@ -2315,20 +2336,29 @@ void declareGraph(rx::graph::RenderGraph& graph, App& app, VkFormat backbufferFo
+ // widgets at all; the separate HUD-smoke-test frame calls this).
+ void drawHud(App& app, rx::rhi::Device& device, VkSurfaceKHR surface, bool presentMode) {
+     // Explicit size on first appearance -- avoids Dear ImGui's own "brand
+     // new auto-fit window's first frame only measures content, doesn't
+     // draw it" behavior (src/rx_debug_ui/tests/test_overlay_gpu.cpp's own
+     // GPU test sets both position AND size for the identical reason).
+     ImGui::SetNextWindowSize(ImVec2(280.0F, 420.0F), ImGuiCond_FirstUseEver);
+     ImGui::Begin("sample_09_scene");
+ 
+     ImGui::Text("Frame: %.3f ms  |  FPS (60-frame avg): %.1f", app.hud.lastFrameMs, app.hud.rollingFps());
++    // [Issue #33] Present-mode-only -- runHeadless() never touches
++    // app.mouseCapture (no real OS cursor to report on against a hidden
++    // window). Human-observable confirmation of the current relative-
++    // mouse-capture state and how to change it, for the MANUAL_VERIFICATION
++    // checklist's own capture/release/Esc/HUD-interaction rows.
++    if (presentMode) {
++        ImGui::Text("Mouse: %s  (Esc: toggle release/recapture%s)", app.mouseCapture.captured() ? "CAPTURED" : "RELEASED",
++                    app.mouseCapture.captured() ? "" : ", click viewport: recapture");
++    }
+     ImGui::Separator();
+ 
+     ImGui::Text("Cull counters");
+     ImGui::Text("  imported/candidates: %u", app.viewLists.counters.totalCandidates);
+     ImGui::Text("  culled (layer+frustum): %u (layer=%u frustum=%u)",
+                 app.viewLists.counters.culledByLayerMask + app.viewLists.counters.culledByFrustum,
+                 app.viewLists.counters.culledByLayerMask, app.viewLists.counters.culledByFrustum);
+     ImGui::Text("  visible: %u", app.viewLists.counters.visible);
+     ImGui::Text("  recordsIn: %u  drawsSubmitted: %u", app.viewLists.counters.recordsIn, app.viewLists.counters.drawsSubmitted);
+     const double collapseRatio = app.viewLists.counters.recordsIn > 0
+@@ -2416,21 +2446,26 @@ void updateFlyCamera(App& app, rx::platform::Window& window, float dt) {
+     if (window.isKeyDown(SDL_SCANCODE_SPACE)) vertical += 1.0F;
+     if (window.isKeyDown(SDL_SCANCODE_LCTRL)) vertical -= 1.0F;
+     const bool fast = window.isKeyDown(SDL_SCANCODE_LSHIFT);
+ 
+     const rx::platform::GamepadState pad = window.poll();
+     if (pad.connected) {
+         strafe += pad.leftStick.x;
+         forward += -pad.leftStick.y;  // SDL's own Y-down stick convention -- forward is -Y.
+     }
+ 
+-    if (!ImGui::GetIO().WantCaptureMouse) {
++    // [Issue #33] Composed gate: while mouse-capture is CAPTURED, motion
++    // always drives the camera (the cursor is hidden -- the HUD ignores it
++    // by contract); while RELEASED, the pre-existing !WantCaptureMouse gate
++    // alone decides, unchanged from before this ticket. See
++    // mouse_capture.h's own mouseDeltaDrivesCamera() comment.
++    if (mouseDeltaDrivesCamera(app.mouseCapture.captured(), ImGui::GetIO().WantCaptureMouse)) {
+         const rx::platform::MouseDelta delta = window.consumeMouseDelta();
+         app.flyCamera.applyLookDelta(delta.x * FlyCamera::kMouseSensitivity, delta.y * FlyCamera::kMouseSensitivity);
+     } else {
+         window.consumeMouseDelta();  // still drain the accumulator so a later frame doesn't see a stale jump.
+     }
+     if (pad.connected) {
+         app.flyCamera.applyLookDelta(pad.rightStick.x * FlyCamera::kGamepadLookSensitivity * dt,
+                                       -pad.rightStick.y * FlyCamera::kGamepadLookSensitivity * dt);
+     }
+ 
+@@ -3112,20 +3147,30 @@ int runPresent(const Args& args) {
+         static_cast<float>(app->device->swapchainExtent().width) / static_cast<float>(std::max<uint32_t>(1U, app->device->swapchainExtent().height));
+ 
+     app->overlay = rx::debug_ui::Overlay::create(*app->device, *app->window, app->device->swapchainFormat());
+     if (!app->overlay.has_value()) {
+         RX_LOG_ERROR("sample_09_scene: Overlay::create failed");
+         frameSync.reset();
+         destroyApp(*app);
+         return 1;
+     }
+ 
++    // [Issue #33] Engage the platform relative-mouse-capture facility to
++    // match app->mouseCapture's own default (captured) -- the fix this
++    // ticket is about: this call was entirely absent before, so the OS
++    // cursor was never hidden/locked at all and could escape the window
++    // during mouse-look. Best-effort (logged internally on failure,
++    // matching setFullscreen()'s own established convention) -- a platform
++    // that refuses relative mode still runs the sample, just without
++    // cursor capture.
++    app->window->setRelativeMouseMode(app->mouseCapture.captured());
++
+     rx::graph::RenderGraph graph;
+     declareGraph(graph, *app, app->device->swapchainFormat());
+     rx::graph::CompileInfo compileInfo;
+     compileInfo.swapchainWidth = app->device->swapchainExtent().width;
+     compileInfo.swapchainHeight = app->device->swapchainExtent().height;
+     compileInfo.swapchainFormat = app->device->swapchainFormat();
+     compileInfo.backbufferFinalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+     graph.compile(compileInfo);
+     app->executor->realize(graph);
+ 
+@@ -3157,28 +3202,61 @@ int runPresent(const Args& args) {
+         return 1;
+     }
+ 
+     bool running = true;
+     bool ok = true;
+     auto lastFrameTime = std::chrono::steady_clock::now();
+ 
+     // [gate ruling #16] ImGui feeds every SDL event FIRST, then platform
+     // input accumulators (Window::pumpEvents()'s own `preDispatch` seam).
+     while (running) {
++        // [Issue #33] The mouse-capture toggle events (Esc, click-to-
++        // recapture) are handled here, INSIDE the same preDispatch seam,
++        // so they see ImGui's `WantCaptureMouse` exactly as it stood after
++        // last frame's HUD layout (the same one-frame-stale read
++        // updateFlyCamera() below already relies on -- gate ruling
++        // #14/#16's own established caller-level-gating convention, not a
++        // new invariant this ticket introduces). Only the STATE MACHINE
++        // transition happens here (rx::samples9::FlyThroughCaptureState is
++        // SDL-free by design); applying a resulting transition to the real
++        // Window happens once, after the full drain, below.
++        const bool capturedBeforePump = app->mouseCapture.captured();
+         app->window->pumpEvents([&](const SDL_Event& event) {
+             app->overlay->processEvent(event);
+             if (event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
+                 running = false;
++            } else if (event.type == SDL_EVENT_KEY_DOWN && event.key.scancode == SDL_SCANCODE_ESCAPE &&
++                       !event.key.repeat) {
++                app->mouseCapture.toggleOnEscPressed();
++            } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT &&
++                       !app->mouseCapture.captured() && !ImGui::GetIO().WantCaptureMouse) {
++                app->mouseCapture.recaptureOnViewportClick();
+             }
+         });
+         if (!running) break;
+ 
++        // [Issue #33] Apply exactly one real Window transition per frame,
++        // only on an actual change -- Window::setRelativeMouseMode()'s own
++        // relativeModeWanted_ is what pumpEvents()'s FOCUS_GAINED handling
++        // unconditionally re-arms against (window.h's own
++        // setRelativeMouseMode() comment), so this call is what makes that
++        // re-arm compose correctly with this toggle: releasing (Esc) clears
++        // relativeModeWanted_, so a later focus-loss/gain cycle while
++        // released correctly does NOT re-engage capture; recapturing sets
++        // it again, so a focus-loss/gain cycle while captured DOES
++        // re-engage, exactly as src/rx_platform/tests/window_test.cpp's own
++        // "FOCUS_LOST pauses ... FOCUS_GAINED resumes" test already proves
++        // generically for the platform layer.
++        if (app->mouseCapture.captured() != capturedBeforePump) {
++            app->window->setRelativeMouseMode(app->mouseCapture.captured());
++        }
++
+         app->scheduler->pumpMain();
+ 
+         const auto now = std::chrono::steady_clock::now();
+         const float dt = std::min(std::chrono::duration<float>(now - lastFrameTime).count(), 0.1F);
+         lastFrameTime = now;
+         app->hud.pushFrameTime(static_cast<double>(dt) * 1000.0);
+ 
+         updateFlyCamera(*app, *app->window, dt);
+         updateSceneFrame(*app, *app->scheduler);
+ 
+diff --git a/samples/09_scene/mouse_capture.h b/samples/09_scene/mouse_capture.h
+new file mode 100644
+index 0000000..7e4514e
+--- /dev/null
++++ b/samples/09_scene/mouse_capture.h
+@@ -0,0 +1,83 @@
++#pragma once
++// samples/09_scene/mouse_capture.h -- rx::samples9::FlyThroughCaptureState,
++// the sample's own relative-mouse-capture toggle for --present fly-through
++// [Issue #33]. Device-free/SDL-free, no rx::platform::Window dependency --
++// same "pull pure logic out of main.cpp into its own header" precedent
++// fly_camera.h already established in this sample (that header's own top
++// comment documents the W/S-inversion regression this one mirrors
++// structurally) -- so samples/09_scene/tests/test_mouse_capture.cpp can
++// exercise every toggle transition and the ImGui-composition decision
++// directly, without an SDL window or a VkDevice.
++//
++// WHY THIS EXISTS: the reported defect (the OS cursor keeps moving and
++// escapes the window/hits screen edges during --present fly-through mouse-
++// look, making control impractical) traced to main.cpp never calling
++// rx::platform::Window::setRelativeMouseMode() at all -- the Phase 4 Task
++// 20 platform facility (hide+capture cursor, delta accumulation, focus-loss
++// pause + unconditional re-arm on focus-gain -- see window.h's own
++// setRelativeMouseMode()/consumeMouseDelta() comments) existed and was
++// already tested, but had no consumer. This header is the small state
++// machine that decides WHEN main.cpp's runPresent() calls
++// setRelativeMouseMode(): CAPTURED by default on entering --present
++// fly-through (recommended UX -- usable from frame 1, no extra click),
++// Esc toggles release/recapture, and a left-click on the viewport (i.e. a
++// click ImGui itself does not claim) while released recaptures.
++// runPresent() applies every transition to the real Window at its own call
++// site (main.cpp, "engages the platform capture facility" comment) --
++// this header itself never touches SDL/Window, only tracks intent, exactly
++// mirroring the split window.h's own relativeModeWanted_ already draws
++// between "app-requested intent" and "what SDL/the OS actually granted".
++namespace rx::samples9 {
++
++// Fly-through mouse-capture intent. Captured: the platform cursor is
++// hidden+locked (rx::platform::Window::setRelativeMouseMode(true)) and
++// every mouse motion delta drives the camera. Released: the cursor is
++// visible and free, and the HUD (rx_debug_ui::Overlay) is the normal
++// ImGui-driven interactive surface.
++class FlyThroughCaptureState {
++public:
++    // Captured by default -- see this header's own top comment for the
++    // recommended-UX rationale (Issue #33, requirement 1).
++    [[nodiscard]] bool captured() const { return captured_; }
++
++    // Edge-triggered Esc handling: call exactly once per REAL
++    // SDL_EVENT_KEY_DOWN whose `scancode == SDL_SCANCODE_ESCAPE` AND whose
++    // `repeat` field is false -- filtering key-repeat is the caller's job
++    // (this method takes no SDL type at all, keeping the "pure" contract
++    // fly_camera.h's own precedent establishes). Calling this once per
++    // held-key OS repeat event instead would thrash the toggle every
++    // repeat interval rather than flipping it once per physical press.
++    void toggleOnEscPressed() { captured_ = !captured_; }
++
++    // Click-to-recapture: call on a real SDL_EVENT_MOUSE_BUTTON_DOWN
++    // (left button) that the caller has ALREADY confirmed ImGui does not
++    // claim (`!ImGui::GetIO().WantCaptureMouse` at the call site, gate
++    // ruling #14/#16's own caller-level-gating convention) -- a click
++    // landing on an open HUD panel must never recapture out from under it.
++    // No-op while already captured (idempotent, matching
++    // Window::setRelativeMouseMode(true)'s own idempotent-re-request
++    // contract).
++    void recaptureOnViewportClick() { captured_ = true; }
++
++private:
++    bool captured_ = true;
++};
++
++// The composed mouse-look decision updateFlyCamera() (main.cpp) drives the
++// camera's own look-delta consumption with [Issue #33, requirement 2]:
++//   - CAPTURED: mouse motion ALWAYS drives the camera. The cursor is
++//     hidden, so there is no visible pointer for any HUD widget to be
++//     hovered by -- the HUD ignores the (hidden) cursor by contract,
++//     independent of whatever ImGui's own WantCaptureMouse happens to
++//     read at this instant.
++//   - RELEASED: mouse motion drives the camera ONLY when ImGui itself does
++//     not claim it -- the pre-existing `!ImGui::GetIO().WantCaptureMouse`
++//     gate (gate ruling #14/#16), now composed with capture state instead
++//     of being the only condition, so the released/cursor-visible/
++//     HUD-usable state keeps behaving exactly as it already did before
++//     this ticket.
++[[nodiscard]] inline bool mouseDeltaDrivesCamera(bool captured, bool imguiWantsMouse) {
++    return captured || !imguiWantsMouse;
++}
++
++}  // namespace rx::samples9
+diff --git a/samples/09_scene/tests/CMakeLists.txt b/samples/09_scene/tests/CMakeLists.txt
+index 9067e3b..b285e55 100644
+--- a/samples/09_scene/tests/CMakeLists.txt
++++ b/samples/09_scene/tests/CMakeLists.txt
+@@ -1,19 +1,32 @@
+ # Device-free (no VkDevice, no rx::platform::Window) -- splitByBlockAndGroup()
+ # (../draw_recording.h) is pure data transformation over plain rx::scene
+ # types, matching src/rx_scene/tests/CMakeLists.txt's own device-free
+ # binary convention. Compiles ../draw_recording.cpp directly rather than
+ # linking a separate library target -- this seam is sample-09-local, not a
+ # reusable engine module (no other sample needs it). test_fly_camera.cpp
+ # covers ../fly_camera.h (also device-free, header-only -- no matching .cpp
+-# to add) -- the W/S-inversion regression coverage.
++# to add) -- the W/S-inversion regression coverage. test_mouse_capture.cpp
++# covers ../mouse_capture.h (same device-free, header-only shape) -- Issue
++# #33's relative-mouse-capture toggle/ImGui-composition coverage.
++#
++# test_mouse_capture_focus_composition.cpp is the ONE exception to
++# "device-free" in this binary: it links rx_platform to drive a real
++# (headless/hidden, no VkDevice) rx::platform::Window -- see that file's
++# own top comment for why the toggle/ImGui-composition coverage above is
++# insufficient on its own to prove Issue #33's "re-arm on focus-gain
++# composes with the toggle state" requirement, and why this needs the real
++# Window rather than re-mocking window.cpp's own already-tested
++# (src/rx_platform/tests/window_test.cpp) FOCUS_LOST/FOCUS_GAINED logic.
+ add_executable(sample_09_scene_tests
+     doctest_main.cpp
+     test_draw_recording.cpp
+     test_fly_camera.cpp
++    test_mouse_capture.cpp
++    test_mouse_capture_focus_composition.cpp
+     "${CMAKE_CURRENT_SOURCE_DIR}/../draw_recording.cpp"
+ )
+-target_link_libraries(sample_09_scene_tests PRIVATE rx_scene doctest::doctest)
++target_link_libraries(sample_09_scene_tests PRIVATE rx_scene rx_platform doctest::doctest)
+ add_test(NAME sample_09_scene_tests COMMAND sample_09_scene_tests)
+ # Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+ # (windows-cross Wine hang, run 31512073559).
+ set_tests_properties(sample_09_scene_tests PROPERTIES TIMEOUT 120)
+diff --git a/samples/09_scene/tests/test_mouse_capture.cpp b/samples/09_scene/tests/test_mouse_capture.cpp
+new file mode 100644
+index 0000000..cd1a3f5
+--- /dev/null
++++ b/samples/09_scene/tests/test_mouse_capture.cpp
+@@ -0,0 +1,120 @@
++// samples/09_scene/tests/test_mouse_capture.cpp -- proves Issue #33's fix:
++// samples/09_scene/main.cpp must engage rx::platform::Window::
++// setRelativeMouseMode() for --present fly-through, driven by
++// rx::samples9::FlyThroughCaptureState's own toggle transitions (Esc,
++// click-to-recapture) and composed with ImGui's WantCaptureMouse the same
++// way updateFlyCamera() (main.cpp) actually composes them
++// (mouseDeltaDrivesCamera()). Device-free/SDL-free, matching
++// test_fly_camera.cpp's own precedent for this sample -- no rx::platform::
++// Window/SDL/VkDevice anywhere in this file.
++#include "../mouse_capture.h"
++
++#include <doctest/doctest.h>
++
++using rx::samples9::FlyThroughCaptureState;
++using rx::samples9::mouseDeltaDrivesCamera;
++
++TEST_CASE("FlyThroughCaptureState: captured by default [Issue #33, requirement 1 -- recommended UX: usable from "
++          "frame 1 of --present without an extra click]") {
++    FlyThroughCaptureState state;
++    CHECK(state.captured());
++}
++
++TEST_CASE("FlyThroughCaptureState: toggleOnEscPressed() flips captured -> released -> captured across repeated "
++          "calls [simulating one edge-triggered SDL_EVENT_KEY_DOWN per physical Esc press]") {
++    FlyThroughCaptureState state;
++    REQUIRE(state.captured());
++
++    state.toggleOnEscPressed();
++    CHECK_FALSE(state.captured());
++
++    state.toggleOnEscPressed();
++    CHECK(state.captured());
++
++    state.toggleOnEscPressed();
++    CHECK_FALSE(state.captured());
++}
++
++TEST_CASE("FlyThroughCaptureState: recaptureOnViewportClick() sets captured=true when released") {
++    FlyThroughCaptureState state;
++    state.toggleOnEscPressed();
++    REQUIRE_FALSE(state.captured());
++
++    state.recaptureOnViewportClick();
++    CHECK(state.captured());
++}
++
++TEST_CASE("FlyThroughCaptureState: recaptureOnViewportClick() is a no-op (idempotent) while already captured "
++          "[matches Window::setRelativeMouseMode(true)'s own idempotent-re-request contract]") {
++    FlyThroughCaptureState state;
++    REQUIRE(state.captured());
++
++    state.recaptureOnViewportClick();
++    CHECK(state.captured());
++}
++
++TEST_CASE("FlyThroughCaptureState: a click-then-Esc-then-click sequence round-trips correctly "
++          "[revert-discrimination: a caller that dropped the edge/idempotency guards would still pass a naive "
++          "single-toggle test but diverge here]") {
++    FlyThroughCaptureState state;
++    state.recaptureOnViewportClick();  // already captured -- no-op.
++    CHECK(state.captured());
++
++    state.toggleOnEscPressed();  // release.
++    CHECK_FALSE(state.captured());
++
++    state.toggleOnEscPressed();  // recapture via Esc.
++    CHECK(state.captured());
++
++    state.toggleOnEscPressed();  // release again.
++    CHECK_FALSE(state.captured());
++
++    state.recaptureOnViewportClick();  // recapture via click.
++    CHECK(state.captured());
++}
++
++TEST_CASE("mouseDeltaDrivesCamera(): CAPTURED always drives the camera, regardless of ImGui's WantCaptureMouse "
++          "[Issue #33, requirement 2 -- captured means the cursor is hidden, so the HUD ignores it by contract]") {
++    CHECK(mouseDeltaDrivesCamera(/*captured=*/true, /*imguiWantsMouse=*/false));
++    CHECK(mouseDeltaDrivesCamera(/*captured=*/true, /*imguiWantsMouse=*/true));
++}
++
++TEST_CASE("mouseDeltaDrivesCamera(): RELEASED preserves the pre-existing !WantCaptureMouse gate exactly "
++          "[Issue #33, requirement 2 -- camera look must NOT consume input ImGui claims while released]") {
++    CHECK(mouseDeltaDrivesCamera(/*captured=*/false, /*imguiWantsMouse=*/false));
++    CHECK_FALSE(mouseDeltaDrivesCamera(/*captured=*/false, /*imguiWantsMouse=*/true));
++}
++
++TEST_CASE("mouseDeltaDrivesCamera(): full 2x2 truth table [revert-discrimination -- an implementation that ANDed "
++          "instead of OR'd captured with !imguiWantsMouse, or inverted either operand, fails at least one row "
++          "here]") {
++    CHECK(mouseDeltaDrivesCamera(true, true) == true);
++    CHECK(mouseDeltaDrivesCamera(true, false) == true);
++    CHECK(mouseDeltaDrivesCamera(false, true) == false);
++    CHECK(mouseDeltaDrivesCamera(false, false) == true);
++}
++
++TEST_CASE("FlyThroughCaptureState + mouseDeltaDrivesCamera(): end-to-end composition across a full "
++          "capture/HUD-interaction/release/recapture cycle, driving mouseDeltaDrivesCamera() with the state's own "
++          "captured() accessor exactly as updateFlyCamera() (main.cpp) does") {
++    FlyThroughCaptureState state;
++
++    // Frame 1: fresh --present session, HUD not hovered -- camera drives.
++    CHECK(mouseDeltaDrivesCamera(state.captured(), /*imguiWantsMouse=*/false));
++
++    // Player presses Esc to interact with the HUD.
++    state.toggleOnEscPressed();
++    REQUIRE_FALSE(state.captured());
++
++    // While released, hovering an open HUD panel: HUD wins, camera silent.
++    CHECK_FALSE(mouseDeltaDrivesCamera(state.captured(), /*imguiWantsMouse=*/true));
++    // While released, NOT over a HUD panel: pre-existing behavior preserved -- camera still drives.
++    CHECK(mouseDeltaDrivesCamera(state.captured(), /*imguiWantsMouse=*/false));
++
++    // Player left-clicks the (non-HUD) viewport to recapture.
++    state.recaptureOnViewportClick();
++    REQUIRE(state.captured());
++    // Immediately after recapture, WantCaptureMouse might still read stale-true from last frame's HUD
++    // hover -- captured must win regardless.
++    CHECK(mouseDeltaDrivesCamera(state.captured(), /*imguiWantsMouse=*/true));
++}
+diff --git a/samples/09_scene/tests/test_mouse_capture_focus_composition.cpp b/samples/09_scene/tests/test_mouse_capture_focus_composition.cpp
+new file mode 100644
+index 0000000..a39dfeb
+--- /dev/null
++++ b/samples/09_scene/tests/test_mouse_capture_focus_composition.cpp
+@@ -0,0 +1,180 @@
++// samples/09_scene/tests/test_mouse_capture_focus_composition.cpp -- proves
++// Issue #33's requirement 1 explicitly: "confirm re-arm on focus-gain
++// composes with your toggle state". Unlike test_mouse_capture.cpp (fully
++// SDL/Window-free, proving the pure state machine in isolation), THIS file
++// deliberately links a real rx::platform::Window (headless/hidden, no
++// VkDevice needed -- same "Window::create/destroy lifecycle succeeds under
++// any video driver" posture src/rx_platform/tests/window_test.cpp's own
++// first TEST_CASE already establishes) and drives it through the EXACT
++// call sequence runPresent() (main.cpp) uses:
++//   1. rx::samples9::FlyThroughCaptureState's own toggle methods change
++//      captured() intent (Esc / click-to-recapture) -- pure, no Window.
++//   2. main.cpp applies that transition to the real Window with
++//      `window.setRelativeMouseMode(state.captured())`, ONLY when
++//      captured() actually changed (see main.cpp's own
++//      "[Issue #33] Apply exactly one real Window transition per frame"
++//      comment) -- reproduced verbatim below as applyCaptureTransition().
++// window.cpp's own pumpEvents() FOCUS_LOST/FOCUS_GAINED handling (gate
++// matrix row 1) is already generically proven by window_test.cpp's own
++// "FOCUS_LOST pauses ... FOCUS_GAINED resumes ... unconditionally re-arms"
++// TEST_CASE -- this file does not re-prove that mechanism in isolation. It
++// proves the COMPOSITION: that main.cpp's OWN toggle-driven
++// setRelativeMouseMode() calls correctly set window.h's own
++// relativeModeWanted_ (via relativeMouseModeWanted()) BEFORE a focus-loss/
++// gain cycle, so that cycle's re-arm decision reflects the CURRENT capture
++// toggle state, not a stale one -- e.g. releasing via Esc and THEN
++// alt-tabbing away and back must NOT silently re-engage capture the app no
++// longer wants.
++#include "../mouse_capture.h"
++
++#include <doctest/doctest.h>
++#include <rx_platform/window.h>
++#include <SDL3/SDL.h>
++
++using rx::samples9::FlyThroughCaptureState;
++
++namespace {
++
++// Mirrors runPresent()'s own "capturedBeforePump -> pump -> apply on
++// change" sequence (main.cpp) exactly -- see that function's own
++// "[Issue #33] Apply exactly one real Window transition per frame" comment.
++// Pulled out here so this test file states the exact contract once instead
++// of inlining it at every call site below.
++void applyCaptureTransition(rx::platform::Window& window, const FlyThroughCaptureState& state, bool capturedBefore) {
++    if (state.captured() != capturedBefore) {
++        window.setRelativeMouseMode(state.captured());
++    }
++}
++
++// window_test.cpp's own established synthetic-event-injection idiom
++// (SDL_PushEvent + pumpEvents()) -- reused verbatim rather than
++// reinvented, per this project's own "prefer the established pattern"
++// convention.
++void pushWindowEvent(SDL_EventType type, SDL_WindowID windowId) {
++    SDL_Event event{};
++    event.window.type = type;
++    event.window.windowID = windowId;
++    REQUIRE(SDL_PushEvent(&event));
++}
++
++}  // namespace
++
++TEST_CASE("Issue #33 composition: releasing via Esc clears relativeMouseModeWanted(), and a SUBSEQUENT focus-loss/"
++          "gain cycle correctly does NOT re-arm capture the app no longer wants [requirement 1: re-arm-on-"
++          "focus-gain composes with the toggle state]") {
++    auto window = rx::platform::Window::create("rx_samples9_capture_compose_test", 64, 64, /*visible=*/false);
++    REQUIRE(window.has_value());
++    const SDL_WindowID windowId = SDL_GetWindowID(window->sdlWindow());
++    window->pumpEvents();
++
++    FlyThroughCaptureState state;  // captured by default.
++    // runPresent()'s own startup call (main.cpp, "[Issue #33] Engage the
++    // platform relative-mouse-capture facility") is UNCONDITIONAL, not
++    // gated through applyCaptureTransition()'s "only on change" guard
++    // below -- there is no "before" frame to diff against yet.
++    window->setRelativeMouseMode(state.captured());
++    REQUIRE(window->relativeMouseModeWanted());
++
++    // Esc -> released.
++    bool capturedBefore = state.captured();
++    state.toggleOnEscPressed();
++    applyCaptureTransition(*window, state, capturedBefore);
++    REQUIRE_FALSE(state.captured());
++    CHECK_FALSE(window->relativeMouseModeWanted());  // the toggle's own setRelativeMouseMode(false) took effect.
++
++    // Alt-tab away and back WHILE RELEASED.
++    pushWindowEvent(SDL_EVENT_WINDOW_FOCUS_LOST, windowId);
++    window->pumpEvents();
++    pushWindowEvent(SDL_EVENT_WINDOW_FOCUS_GAINED, windowId);
++    window->pumpEvents();
++
++    // Must NOT have been silently re-armed -- window.cpp's own FOCUS_GAINED
++    // handling only re-arms `if (relativeModeWanted_)`, and this composition
++    // is exactly what makes that condition correctly false here.
++    CHECK_FALSE(window->relativeMouseModeWanted());
++}
++
++TEST_CASE("Issue #33 composition: recapturing (click or Esc) sets relativeMouseModeWanted() again, and a "
++          "SUBSEQUENT focus-loss/gain cycle DOES re-arm capture, composing correctly with window.cpp's own "
++          "unconditional re-arm-if-wanted rule [requirement 1, the positive case]") {
++    auto window = rx::platform::Window::create("rx_samples9_capture_compose_test2", 64, 64, /*visible=*/false);
++    REQUIRE(window.has_value());
++    const SDL_WindowID windowId = SDL_GetWindowID(window->sdlWindow());
++    window->pumpEvents();
++
++    FlyThroughCaptureState state;
++    window->setRelativeMouseMode(state.captured());  // runPresent()'s own unconditional startup engagement.
++    REQUIRE(window->relativeMouseModeWanted());
++
++    // Esc -> released -> recapture via viewport click, all before any focus event.
++    bool capturedBefore = state.captured();
++    state.toggleOnEscPressed();
++    applyCaptureTransition(*window, state, capturedBefore);
++    REQUIRE_FALSE(window->relativeMouseModeWanted());
++
++    capturedBefore = state.captured();
++    state.recaptureOnViewportClick();
++    applyCaptureTransition(*window, state, capturedBefore);
++    REQUIRE(state.captured());
++    CHECK(window->relativeMouseModeWanted());
++
++    // Alt-tab away and back WHILE CAPTURED (again).
++    pushWindowEvent(SDL_EVENT_WINDOW_FOCUS_LOST, windowId);
++    window->pumpEvents();
++    pushWindowEvent(SDL_EVENT_WINDOW_FOCUS_GAINED, windowId);
++    window->pumpEvents();
++
++    // Composes correctly the other way too -- capture the app currently
++    // wants survives the focus cycle (window.cpp's own re-arm branch,
++    // driven off the state THIS toggle sequence produced, not a value the
++    // test seeded directly).
++    CHECK(window->relativeMouseModeWanted());
++}
++
++TEST_CASE("Issue #33 composition: a steady-state frame where captured() did NOT change is a harmless no-op re-"
++          "apply (matches runPresent()'s own per-frame call in the common case -- most frames touch neither Esc "
++          "nor a recapture click) -- interleaved between the toggle and the focus cycle to prove it does not "
++          "disturb the composition either way") {
++    auto window = rx::platform::Window::create("rx_samples9_capture_compose_test3", 64, 64, /*visible=*/false);
++    REQUIRE(window.has_value());
++    const SDL_WindowID windowId = SDL_GetWindowID(window->sdlWindow());
++    window->pumpEvents();
++
++    FlyThroughCaptureState state;
++    window->setRelativeMouseMode(state.captured());  // runPresent()'s own unconditional startup engagement.
++    REQUIRE(window->relativeMouseModeWanted());
++
++    bool capturedBefore = state.captured();
++    state.toggleOnEscPressed();  // released.
++    applyCaptureTransition(*window, state, capturedBefore);
++    REQUIRE_FALSE(window->relativeMouseModeWanted());
++
++    // A frame where nothing changed (state.captured() unchanged) --
++    // applyCaptureTransition() is a pure no-op here, exactly like
++    // runPresent()'s own per-frame call in the steady state.
++    capturedBefore = state.captured();
++    applyCaptureTransition(*window, state, capturedBefore);
++    CHECK_FALSE(window->relativeMouseModeWanted());  // still released -- no-op re-apply didn't flip anything.
++
++    pushWindowEvent(SDL_EVENT_WINDOW_FOCUS_LOST, windowId);
++    window->pumpEvents();
++    pushWindowEvent(SDL_EVENT_WINDOW_FOCUS_GAINED, windowId);
++    window->pumpEvents();
++    CHECK_FALSE(window->relativeMouseModeWanted());
++}
++
++// [Revert-discrimination] The genuinely load-bearing part of
++// applyCaptureTransition() (above) is the `!=` in
++// `state.captured() != capturedBefore`: an inverted (`==`) condition would
++// call Window::setRelativeMouseMode() only on NO-OP frames and SKIP it on
++// every REAL transition, so a released toggle would never actually reach
++// the real Window at all. Verified directly by mutation (not left as a
++// permanent test, since proving it requires editing that very function to
++// inject the bug): temporarily flipping that operator to `==` and
++// rebuilding turns the two composition TEST_CASEs above from all-passing
++// into failing at their first post-toggle `relativeMouseModeWanted()`
++// assertion (both stay wrongly stuck at the initial captured=true state,
++// since the Esc-driven transition is exactly the "captured() changed"
++// frame the inverted condition treats as a no-op instead) -- confirming
++// those two TEST_CASEs already discriminate this exact class of bug,
++// without needing a dedicated third one for it.
