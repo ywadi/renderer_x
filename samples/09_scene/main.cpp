@@ -3302,10 +3302,48 @@ int runPresent(const Args& args) {
     // FrameSync::onSwapchainRecreated() already log) -- every caller below
     // treats that as fatal, exactly like the original NeedsRecreate
     // branches did before this function existed.
+    // [Issue #73] Declared here, before recreateSwapchainAndDependents()
+    // below, because that lambda now sets `running = false` directly (see
+    // its own isSurfaceLost() branch) -- moved up from its own prior
+    // position (just before the loop) so the lambda can capture it.
+    bool running = true;
+    bool ok = true;
+
+    // recreateSwapchainAndDependents() [Issue #73 update]: ALSO now the
+    // single place this loop reacts to Device::isSurfaceLost() (device.h)
+    // -- the underlying native window is gone. Verified directly: no SDL
+    // event (neither SDL_EVENT_WINDOW_CLOSE_REQUESTED nor even
+    // SDL_EVENT_WINDOW_DESTROYED) ever fires for a third-party window
+    // destroy (e.g. `xdotool windowclose`, the exact action that surfaced
+    // this), so this can only be caught REACTIVELY, via
+    // Device::recreateSwapchain()'s own classification of its surface-
+    // capabilities query's VkResult -- there is no advance-warning event
+    // to gate this call on in the first place. Entering that state is NOT
+    // a failure here either -- it sets `running = false` and returns true,
+    // exactly like a graceful SDL_EVENT_QUIT/WINDOW_CLOSE_REQUESTED -- and
+    // every call site below checks `running` immediately afterward, before
+    // doing anything else that could touch the (now known-dead) surface
+    // again this same iteration, so the loop falls straight through to its
+    // EXISTING orderly teardown (vkDeviceWaitIdle, destroy views,
+    // frameSync.reset(), destroyApp()) below `while (running)` -- no new
+    // teardown mechanism needed, just correct, immediate detection.
     auto recreateSwapchainAndDependents = [&]() -> bool {
         vkDeviceWaitIdle(vkDevice);
         if (!app->device->recreateSwapchain(app->surface)) {
             return false;
+        }
+        if (app->device->isSurfaceLost()) {
+            RX_LOG_INFO(
+                "sample_09_scene: the present window's native handle is gone -- stopping without touching the "
+                "surface further [Issue #73]");
+            // [Issue #73] Tell Window it must not attempt SDL_DestroyWindow()
+            // on this now-invalid native handle during its own eventual
+            // teardown (destroyApp() below, once this loop exits) -- see
+            // Window::abandonNativeHandle()'s own comment (window.h) for the
+            // fatal-Xlib-error-handler crash this specifically avoids.
+            app->window->abandonNativeHandle();
+            running = false;
+            return true;
         }
         if (app->device->isSuspended()) {
             // [D25] No live swapchain images/format/extent to rebuild
@@ -3328,8 +3366,6 @@ int runPresent(const Args& args) {
         return true;
     };
 
-    bool running = true;
-    bool ok = true;
     auto lastFrameTime = std::chrono::steady_clock::now();
     // [Issue #36] The extent this run's swapchain was last (re)built
     // against -- pixelSizeRequiresRecreate()'s own `lastHandled` baseline,
@@ -3423,6 +3459,11 @@ int runPresent(const Args& args) {
                 lastHandledExtent = app->device->swapchainExtent();
             }
         }
+        // [Issue #73] recreateSwapchainAndDependents() may have just set
+        // `running = false` (Device::isSurfaceLost()) -- stop before this
+        // same iteration touches the surface again (pixel-size/vsync
+        // checks below, then acquireNextImage()).
+        if (!running) break;
 
         // [Issue #36] Live drag-resize: SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED
         // (drained by pumpEvents() above into Window::lastPixelSizeEvent())
@@ -3447,6 +3488,8 @@ int runPresent(const Args& args) {
             }
             lastHandledExtent = app->device->swapchainExtent();
         }
+        // [Issue #73] Same guard as above -- see that comment.
+        if (!running) break;
 
         // [Issue #36 fix-in-round] The HUD's own vsync checkbox
         // (drawHud(), called further down this same loop body) only
@@ -3468,6 +3511,8 @@ int runPresent(const Args& args) {
             RX_LOG_INFO("sample_09_scene: --present: present mode in use: {}",
                         rx::rhi::presentModeName(app->device->presentMode()));
         }
+        // [Issue #73] Same guard as above -- see that comment.
+        if (!running) break;
 
         app->scheduler->pumpMain();
 
@@ -3482,6 +3527,19 @@ int runPresent(const Args& args) {
         VkFence fence = frameSync->currentFence();
         vkWaitForFences(vkDevice, 1, &fence, VK_TRUE, UINT64_MAX);
         auto acquire = app->device->acquireNextImage(frameSync->currentImageAvailableSemaphore());
+        if (acquire.status == rx::rhi::SwapchainStatus::SurfaceLost) {
+            // [Issue #73] Defense-in-depth -- recreateSwapchainAndDependents()
+            // already sets `running = false` itself the moment
+            // Device::isSurfaceLost() first becomes true (see its own
+            // comment above), and every call site above this one already
+            // breaks out via `if (!running) break;` before ever reaching
+            // acquireNextImage() again -- so this branch is not expected
+            // to be reachable in this loop's own current control flow. Kept
+            // anyway, symmetric with DeviceLost below: a clean, NON-fatal
+            // stop (never `ok = false`) if it is ever reached regardless.
+            running = false;
+            continue;
+        }
         if (acquire.status == rx::rhi::SwapchainStatus::Suspended) {
             std::this_thread::sleep_for(std::chrono::milliseconds(16));
             if (!recreateSwapchainAndDependents()) {
@@ -3551,7 +3609,13 @@ int runPresent(const Args& args) {
             break;
         }
         auto presentStatus = app->device->present(acquire.imageIndex, signalSem);
-        if (presentStatus == rx::rhi::SwapchainStatus::NeedsRecreate) {
+        if (presentStatus == rx::rhi::SwapchainStatus::SurfaceLost) {
+            // [Issue #73] Defense-in-depth -- see the identical branch on
+            // acquire.status above for why this is not expected to be
+            // reachable in this loop's own current control flow, and why
+            // it is a clean, NON-fatal stop if it ever is.
+            running = false;
+        } else if (presentStatus == rx::rhi::SwapchainStatus::NeedsRecreate) {
             if (!recreateSwapchainAndDependents()) {
                 ok = false;
                 break;
