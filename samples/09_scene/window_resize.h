@@ -24,6 +24,12 @@
 //     drivers that signal can lag a live drag-resize by several frames,
 //     during which the OLD-sized swapchain image would be presented
 //     stretched into the NEW-sized window.
+//
+//   - graphNeedsRecompileForExtent() [Issue #73 round-review hardening]:
+//     whether recreateSwapchainAndDependents() needs to re-run
+//     RenderGraph::compile()+Executor::realize() at all after a
+//     successful Device::recreateSwapchain() -- skipped when the extent
+//     didn't actually change (e.g. a present-mode-only vsync toggle).
 #include <vulkan/vulkan.h>
 
 namespace rx::samples9 {
@@ -67,6 +73,36 @@ namespace rx::samples9 {
         return false;
     }
     return observed.width != lastHandled.width || observed.height != lastHandled.height;
+}
+
+// [Issue #73 round-review hardening] Pure decision, used by runPresent()'s
+// recreateSwapchainAndDependents() (main.cpp): does RenderGraph::compile()
+// (and the Executor::realize() that must follow any compile() that
+// actually changed a resource shape) need to run again for `newExtent`,
+// given the graph was last compiled against `lastCompiledExtent`? Every
+// Device::recreateSwapchain() success rebuilds the whole VkSwapchainKHR
+// (a NEW set of VkImages), but a present-mode-only change (the HUD vsync
+// checkbox: same width/height, different VkPresentModeKHR) never changes
+// any SwapchainRelative resource's real pixel extent -- recompiling/
+// re-realizing the render graph's "hdr"/"depth" transients for THAT case
+// is pure redundant GPU-idle-time work (this project's own "performance
+// is an exit criterion" posture, CLAUDE.md), not a correctness
+// requirement the way it is for a genuine resize.
+//
+// Deliberately its OWN function rather than a call to
+// pixelSizeRequiresRecreate() above under a confusing name at this new
+// call site, even though the underlying comparison is the same shape:
+// that function's whole contract is built around
+// Window::lastPixelSizeEvent()'s own {0, 0} pre-first-event sentinel
+// (see its own comment) -- a concern that does NOT apply here.
+// recreateSwapchainAndDependents() only ever reaches this call AFTER
+// Device::recreateSwapchain() has already succeeded AND neither
+// isSuspended() nor isSurfaceLost() is true, so `newExtent` (read from
+// Device::swapchainExtent() at that point) is already known-nonzero --
+// a narrower, simpler contract that does not need (and should not
+// silently inherit) that other function's zero-guard.
+[[nodiscard]] inline bool graphNeedsRecompileForExtent(VkExtent2D lastCompiledExtent, VkExtent2D newExtent) {
+    return newExtent.width != lastCompiledExtent.width || newExtent.height != lastCompiledExtent.height;
 }
 
 }  // namespace rx::samples9

@@ -305,10 +305,11 @@ using rx::samples9::mouseDeltaDrivesCamera;
 using rx::samples9::escTogglesCapture;
 
 // --- Live resize + runtime fullscreen toggle [Issue #36] ------------------
-// f11TogglesFullscreen()/pixelSizeRequiresRecreate() -- pure decisions
-// window_resize.h documents in full; runPresent() below is the sole
-// consumer.
+// f11TogglesFullscreen()/pixelSizeRequiresRecreate()/
+// graphNeedsRecompileForExtent() -- pure decisions window_resize.h
+// documents in full; runPresent() below is the sole consumer.
 using rx::samples9::f11TogglesFullscreen;
+using rx::samples9::graphNeedsRecompileForExtent;
 using rx::samples9::pixelSizeRequiresRecreate;
 
 // --- Shared pass infra [tonemap pass -- shaders/multipass/tonemap.{vert,
@@ -3302,6 +3303,16 @@ int runPresent(const Args& args) {
     // FrameSync::onSwapchainRecreated() already log) -- every caller below
     // treats that as fatal, exactly like the original NeedsRecreate
     // branches did before this function existed.
+    //
+    // [Issue #73 round-review hardening] The compile()+realize() pair
+    // described above is now CONDITIONAL on the extent actually having
+    // changed (graphNeedsRecompileForExtent(), window_resize.h) -- see
+    // this lambda's own body for why: a present-mode-only recreation
+    // (the HUD vsync toggle) never changes any SwapchainRelative
+    // resource's shape, so recompiling for it was pure redundant work.
+    // rebuildSwapchainViews()/FrameSync::onSwapchainRecreated() stay
+    // unconditional either way -- the swapchain's own VkImages always
+    // change on any successful recreateSwapchain() call.
     // [Issue #73] Declared here, before recreateSwapchainAndDependents()
     // below, because that lambda now sets `running = false` directly (see
     // its own isSurfaceLost() branch) -- moved up from its own prior
@@ -3352,17 +3363,39 @@ int runPresent(const Args& args) {
             // same function every ~16ms until a real extent returns.
             return true;
         }
-        compileInfo.swapchainWidth = app->device->swapchainExtent().width;
-        compileInfo.swapchainHeight = app->device->swapchainExtent().height;
-        compileInfo.swapchainFormat = app->device->swapchainFormat();
-        graph.compile(compileInfo);
+        // [Issue #73 round-review hardening] rebuildSwapchainViews()/
+        // FrameSync::onSwapchainRecreated() below are UNCONDITIONAL --
+        // every Device::recreateSwapchain() success rebuilds the whole
+        // VkSwapchainKHR (a fresh set of VkImages) regardless of WHY it
+        // was called, so those two always need to run. RenderGraph::
+        // compile()/Executor::realize() are DIFFERENT: they only need to
+        // run again when the swapchain's real pixel extent actually
+        // changed -- a present-mode-only change (the HUD vsync toggle)
+        // rebuilds the swapchain object but never changes any
+        // SwapchainRelative resource's shape, so recompiling/re-realizing
+        // the render graph's "hdr"/"depth" transients for that case is
+        // pure redundant work (computed once here, into `needsRecompile`,
+        // and reused below -- NOT re-derived after compileInfo's own
+        // width/height are updated, which would trivially always read
+        // "unchanged" the second time).
+        const VkExtent2D newExtent = app->device->swapchainExtent();
+        const bool needsRecompile = graphNeedsRecompileForExtent(
+            VkExtent2D{compileInfo.swapchainWidth, compileInfo.swapchainHeight}, newExtent);
+        if (needsRecompile) {
+            compileInfo.swapchainWidth = newExtent.width;
+            compileInfo.swapchainHeight = newExtent.height;
+            compileInfo.swapchainFormat = app->device->swapchainFormat();
+            graph.compile(compileInfo);
+        }
         if (!rebuildSwapchainViews()) {
             return false;
         }
         if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(app->device->swapchainImages().size()))) {
             return false;
         }
-        app->executor->realize(graph);
+        if (needsRecompile) {
+            app->executor->realize(graph);
+        }
         return true;
     };
 

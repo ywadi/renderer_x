@@ -1,14 +1,16 @@
 // samples/09_scene/tests/test_window_resize.cpp -- Issue #36 (live window
-// resizing + a runtime fullscreen toggle in --present mode): device-free
-// coverage for ../window_resize.h's two pure decisions, matching
-// test_mouse_capture.cpp's own established shape for this sample (truth
-// tables + revert-discrimination cases, no rx::platform::Window/SDL/
-// VkDevice anywhere in this file).
+// resizing + a runtime fullscreen toggle in --present mode) and its Issue
+// #73 round-review hardening follow-up: device-free coverage for
+// ../window_resize.h's pure decisions, matching test_mouse_capture.cpp's
+// own established shape for this sample (truth tables + revert-
+// discrimination cases, no rx::platform::Window/SDL/VkDevice anywhere in
+// this file).
 #include "../window_resize.h"
 
 #include <doctest/doctest.h>
 
 using rx::samples9::f11TogglesFullscreen;
+using rx::samples9::graphNeedsRecompileForExtent;
 using rx::samples9::pixelSizeRequiresRecreate;
 
 // --- f11TogglesFullscreen() -----------------------------------------------
@@ -62,4 +64,20 @@ TEST_CASE("pixelSizeRequiresRecreate(): revert-discrimination -- an implementati
     CHECK(pixelSizeRequiresRecreate(VkExtent2D{800, 600}, VkExtent2D{800, 601}));
     CHECK(pixelSizeRequiresRecreate(VkExtent2D{800, 600}, VkExtent2D{801, 600}));
     CHECK_FALSE(pixelSizeRequiresRecreate(VkExtent2D{800, 600}, VkExtent2D{800, 600}));
+}
+
+// --- graphNeedsRecompileForExtent() [Issue #73 round-review hardening] ----
+TEST_CASE("graphNeedsRecompileForExtent(): false when the extent is unchanged -- the exact scenario a "
+          "present-mode-only recreation (the HUD vsync toggle) hits: Device::recreateSwapchain() rebuilds the "
+          "whole VkSwapchainKHR, but the real pixel extent it reports back is identical, so recompiling the "
+          "render graph would be pure redundant work") {
+    CHECK_FALSE(graphNeedsRecompileForExtent(VkExtent2D{1280, 720}, VkExtent2D{1280, 720}));
+}
+
+TEST_CASE("graphNeedsRecompileForExtent(): true when either dimension genuinely differs -- a real resize must "
+          "still recompile [revert-discrimination: an implementation that always returned false here would "
+          "silently reintroduce the exact stale-transient-extent bug this task's own #36 work fixed]") {
+    CHECK(graphNeedsRecompileForExtent(VkExtent2D{1280, 720}, VkExtent2D{1920, 1080}));  // grow both.
+    CHECK(graphNeedsRecompileForExtent(VkExtent2D{1280, 720}, VkExtent2D{1280, 800}));    // height only.
+    CHECK(graphNeedsRecompileForExtent(VkExtent2D{1280, 720}, VkExtent2D{1024, 720}));    // width only.
 }
