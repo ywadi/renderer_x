@@ -5,6 +5,7 @@
 #include <rx_rhi_vk/upload.h>
 #include <rx_platform/window.h>
 #include <rx_task/scheduler.h>
+#include <cmath>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -225,6 +226,51 @@ TEST_CASE("importGltf: BoomBox (fetched, real-world KHR_draco_mesh_compression a
     CHECK(sub.range.indexCount == 18108);
     CHECK(sub.range.indexCount % 3 == 0);
     CHECK(sub.bounds.isValid());
+
+    // [Review round, Medium finding 2] Decoded-VALUE assertion, not just a
+    // structural isValid() check -- BoomBox.gltf's own POSITION accessor
+    // (index 4) declares min/max per glTF's own spec requirement (mandatory
+    // for POSITION even under Draco compression -- the exporter that wrote
+    // this file already computed it from the SAME real decoded data this
+    // importer is expected to reproduce), verified directly against the
+    // fetched file:
+    //   min = (-0.00993099889037616, -0.00978147489037616, -0.01008609019037616)
+    //   max = ( 0.009926144998339033, 0.009780322287054225, 0.01008609019037616)
+    // An independent ground truth this project never computed itself --
+    // catching exactly the class of silent decode corruption a corrupted-
+    // but-still-"successful" decode can produce (right COUNTS, wrong
+    // VALUES) that the index-count check alone would miss. Cross-checked
+    // independently a second way while investigating this review round's
+    // findings: Draco's OWN reference `draco_decoder` CLI (a standalone
+    // binary this project's own dep-cache sub-build already produces,
+    // entirely independent of this importer's own code), run directly
+    // against the extracted compressed bufferView bytes, decodes the
+    // SAME tiny (~0.01) magnitude values -- not the ~1.0 magnitude this
+    // review round's investigation found this importer itself producing
+    // before the GetAttributeByUniqueId() fix a few lines above (a real,
+    // separate, pre-existing bug this decoded-value assertion class
+    // exists specifically to catch: `mesh->attribute(i)`'s ARRAY index
+    // does not equal the Draco attribute's persistent unique_id() after
+    // decode for real-world content, so the previous array-index lookup
+    // was silently reading NORMAL data (a similarly-shaped but semantically
+    // wrong VEC3 attribute, unit-vector-scaled -- explaining the
+    // ~[-1,1] result observed) into the POSITION output). A plain
+    // absolute-margin check (this project's vendored doctest only exposes
+    // Approx::epsilon()/scale(), a RELATIVE tolerance -- see
+    // test_standard_pbr_unlit.cpp's own near8() for the identical
+    // reasoning) at 0.0005 -- roughly 50x the actual observed decode
+    // deviation (~0.00001, Draco's own quantization step for whatever
+    // bit-depth this asset's external encoder used) and roughly 2000x
+    // tighter than the ~1.0 deviation the real bug this test caught
+    // produced, so this is tight enough to fail hard on a real decode
+    // defect while remaining robust to ordinary quantization noise.
+    const auto nearAbs = [](float actual, double expected, float margin) { return std::abs(actual - static_cast<float>(expected)) < margin; };
+    CHECK(nearAbs(sub.bounds.min.x, -0.00993099889037616, 0.0005F));
+    CHECK(nearAbs(sub.bounds.min.y, -0.00978147489037616, 0.0005F));
+    CHECK(nearAbs(sub.bounds.min.z, -0.01008609019037616, 0.0005F));
+    CHECK(nearAbs(sub.bounds.max.x, 0.009926144998339033, 0.0005F));
+    CHECK(nearAbs(sub.bounds.max.y, 0.009780322287054225, 0.0005F));
+    CHECK(nearAbs(sub.bounds.max.z, 0.01008609019037616, 0.0005F));
 
     // BoomBox has no skin in the source file -- asserting `present ==
     // false` (rather than omitting the check) is itself the proof this
