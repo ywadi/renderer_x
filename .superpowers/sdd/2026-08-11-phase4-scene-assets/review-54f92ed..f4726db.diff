@@ -1,0 +1,585 @@
+# Review package: 54f92ed..f4726db
+
+## Commits
+f4726db fix(samples/09_scene): skip fine-grained Vulkan teardown when the device is lost right after the surface is
+e094381 fix(rx_platform): non-fatal X11 BadWindow handler survives a third-party window destroy racing SDL's own X11 calls
+
+## Files changed
+ samples/09_scene/main.cpp                     |  56 +++++++++-
+ samples/09_scene/tests/test_window_resize.cpp |  27 +++++
+ samples/09_scene/window_resize.h              |  25 +++++
+ src/rx_platform/include/rx_platform/window.h  |  48 ++++++++
+ src/rx_platform/src/window.cpp                | 155 ++++++++++++++++++++++++++
+ src/rx_platform/tests/window_test.cpp         |  47 ++++++++
+ 6 files changed, 355 insertions(+), 3 deletions(-)
+
+## Diff
+diff --git a/samples/09_scene/main.cpp b/samples/09_scene/main.cpp
+index 693b31d..b9c4905 100644
+--- a/samples/09_scene/main.cpp
++++ b/samples/09_scene/main.cpp
+@@ -112,20 +112,21 @@
+ #include <imgui.h>
+ #include <volk.h>
+ 
+ #include <algorithm>
+ #include <array>
+ #include <bit>
+ #include <charconv>
+ #include <chrono>
+ #include <cmath>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <deque>
+ #include <filesystem>
+ #include <fstream>
+ #include <memory>
+ #include <optional>
+ #include <sstream>
+ #include <string>
+ #include <string_view>
+ #include <thread>
+@@ -299,25 +300,27 @@ using rx::samples9::keyboardDrivesCamera;
+ // and the composed mouse-look decision updateFlyCamera() below drives it
+ // with, live in mouse_capture.h -- device-free, unit-tested directly
+ // (tests/test_mouse_capture.cpp), same "pull pure logic out of main.cpp"
+ // precedent fly_camera.h already established just above.
+ using rx::samples9::FlyThroughCaptureState;
+ using rx::samples9::mouseDeltaDrivesCamera;
+ using rx::samples9::escTogglesCapture;
+ 
+ // --- Live resize + runtime fullscreen toggle [Issue #36] ------------------
+ // f11TogglesFullscreen()/pixelSizeRequiresRecreate()/
+-// graphNeedsRecompileForExtent() -- pure decisions window_resize.h
+-// documents in full; runPresent() below is the sole consumer.
++// graphNeedsRecompileForExtent()/shouldSkipTeardownAfterDeviceLoss() -- pure
++// decisions window_resize.h documents in full; runPresent() below is the
++// sole consumer.
+ using rx::samples9::f11TogglesFullscreen;
+ using rx::samples9::graphNeedsRecompileForExtent;
+ using rx::samples9::pixelSizeRequiresRecreate;
++using rx::samples9::shouldSkipTeardownAfterDeviceLoss;
+ 
+ // --- Shared pass infra [tonemap pass -- shaders/multipass/tonemap.{vert,
+ // frag}.slang, VERBATIM -- same convention samples/07_stress/08_gltf_viewer's
+ // own copies establish] ---------------------------------------------------
+ struct TonemapPushConstants {
+     uint32_t hdrTextureIndex;
+     uint32_t hdrSamplerIndex;
+ };
+ 
+ struct CompiledPass {
+@@ -3656,21 +3659,68 @@ int runPresent(const Args& args) {
+             lastHandledExtent = app->device->swapchainExtent();
+         } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
+             RX_LOG_ERROR("sample_09_scene: device lost during present; exiting present loop");
+             ok = false;
+             break;
+         }
+         frameSync->advanceFrame();
+         RX_FRAME_MARK;
+     }
+ 
+-    vkDeviceWaitIdle(vkDevice);
++    // [Issue #74] This result was previously discarded. Reproduced directly
++    // on real NVIDIA/Xcb hardware: when the loop above has ALREADY exited
++    // via Device::isSurfaceLost() (the present window's native handle died
++    // mid-session -- #73), the underlying VkDevice can ALSO report
++    // VK_ERROR_DEVICE_LOST here, on this same driver stack -- a further,
++    // empirically-observed consequence of the SAME external event (the
++    // window is gone), one layer deeper than the surface-lost state #73
++    // already handles, not a new/unrelated failure. Per the Vulkan spec,
++    // once a device is lost it "should [be treated as] no longer usable" --
++    // vkDeviceWaitIdle() does not actually wait for anything in that state,
++    // so letting teardown proceed regardless into the fine-grained
++    // per-object vkDestroyImageView()/FrameSync::~FrameSync()/destroyApp()
++    // calls below produces real, UNFILTERED validation-layer errors
++    // (VUID-vkDestroySemaphore-semaphore-01137 and two siblings -- "object
++    // still in use", since nothing was actually drained) -- reproduced
++    // directly, not assumed. Deliberately NOT added as a new "known false
++    // positive" classifier in context.cpp: every existing classifier there
++    // is independently verified against a NEWER validation layer build
++    // proving the installed layer itself is behind spec, and that has not
++    // been done here -- whether an up-to-date layer would also flag a real
++    // post-DEVICE_LOST destroy this way is genuinely unclear, not a proven
++    // layer bug. Instead this mirrors Window::abandonNativeHandle()'s own
++    // established, narrower precedent: once the underlying resource is
++    // CONFIRMED gone, stop issuing further calls against it and let the OS
++    // reclaim everything at process exit. std::_Exit() (not a normal
++    // `return`) is deliberate here -- it skips every remaining C++
++    // destructor (frameSync, swapchainViews, app, and everything app still
++    // owns) rather than requiring a new "abandon" primitive on each of the
++    // half-dozen unrelated RAII types those destructors would otherwise
++    // touch; the log is explicitly flushed first since std::_Exit() does
++    // not run spdlog's own atexit-registered flush.
++    const VkResult waitIdleResult = vkDeviceWaitIdle(vkDevice);
++    if (shouldSkipTeardownAfterDeviceLoss(waitIdleResult, app->device->isSurfaceLost())) {
++        const bool hadValidationErrors = args.validate && app->context->hasValidationErrors();
++        if (hadValidationErrors) {
++            RX_LOG_ERROR("sample_09_scene: Vulkan validation layer reported errors during the present loop");
++        }
++        RX_LOG_INFO(
++            "sample_09_scene: VkDevice reports lost immediately after the present window's native handle was "
++            "already known gone -- skipping further Vulkan teardown (frameSync/destroyApp) and letting process "
++            "exit reclaim GPU resources directly [Issue #74]");
++        if (!hadValidationErrors && ok) {
++            RX_LOG_INFO("sample_09_scene: window closed cleanly");
++        }
++        ::spdlog::default_logger()->flush();
++        std::_Exit((hadValidationErrors || !ok) ? 1 : 0);
++    }
++
+     for (VkImageView view : swapchainViews) vkDestroyImageView(vkDevice, view, nullptr);
+     frameSync.reset();
+     destroyApp(*app);
+ 
+     if (args.validate && app->context->hasValidationErrors()) {
+         RX_LOG_ERROR("sample_09_scene: Vulkan validation layer reported errors during the present loop");
+         return 1;
+     }
+     if (!ok) {
+         return 1;
+diff --git a/samples/09_scene/tests/test_window_resize.cpp b/samples/09_scene/tests/test_window_resize.cpp
+index 60ea036..22cadea 100644
+--- a/samples/09_scene/tests/test_window_resize.cpp
++++ b/samples/09_scene/tests/test_window_resize.cpp
+@@ -5,20 +5,21 @@
+ // own established shape for this sample (truth tables + revert-
+ // discrimination cases, no rx::platform::Window/SDL/VkDevice anywhere in
+ // this file).
+ #include "../window_resize.h"
+ 
+ #include <doctest/doctest.h>
+ 
+ using rx::samples9::f11TogglesFullscreen;
+ using rx::samples9::graphNeedsRecompileForExtent;
+ using rx::samples9::pixelSizeRequiresRecreate;
++using rx::samples9::shouldSkipTeardownAfterDeviceLoss;
+ 
+ // --- f11TogglesFullscreen() -----------------------------------------------
+ TEST_CASE("f11TogglesFullscreen(): true (F11 should toggle) when ImGui does NOT claim the keyboard") {
+     CHECK(f11TogglesFullscreen(/*imguiWantsKeyboard=*/false));
+ }
+ 
+ TEST_CASE("f11TogglesFullscreen(): false (F11 must NOT toggle) when ImGui DOES claim the keyboard -- mirrors "
+           "escTogglesCapture()'s own Esc gate (mouse_capture.h) so a future keyboard-focused HUD widget can claim "
+           "F11 too") {
+     CHECK_FALSE(f11TogglesFullscreen(/*imguiWantsKeyboard=*/true));
+@@ -74,10 +75,36 @@ TEST_CASE("graphNeedsRecompileForExtent(): false when the extent is unchanged --
+     CHECK_FALSE(graphNeedsRecompileForExtent(VkExtent2D{1280, 720}, VkExtent2D{1280, 720}));
+ }
+ 
+ TEST_CASE("graphNeedsRecompileForExtent(): true when either dimension genuinely differs -- a real resize must "
+           "still recompile [revert-discrimination: an implementation that always returned false here would "
+           "silently reintroduce the exact stale-transient-extent bug this task's own #36 work fixed]") {
+     CHECK(graphNeedsRecompileForExtent(VkExtent2D{1280, 720}, VkExtent2D{1920, 1080}));  // grow both.
+     CHECK(graphNeedsRecompileForExtent(VkExtent2D{1280, 720}, VkExtent2D{1280, 800}));    // height only.
+     CHECK(graphNeedsRecompileForExtent(VkExtent2D{1280, 720}, VkExtent2D{1024, 720}));    // width only.
+ }
++
++// --- shouldSkipTeardownAfterDeviceLoss() [Issue #74] -----------------------
++TEST_CASE("shouldSkipTeardownAfterDeviceLoss(): true ONLY for the exact reproduced compound condition -- "
++          "VK_ERROR_DEVICE_LOST from vkDeviceWaitIdle() AND the surface already known lost") {
++    CHECK(shouldSkipTeardownAfterDeviceLoss(VK_ERROR_DEVICE_LOST, /*surfaceLost=*/true));
++}
++
++TEST_CASE("shouldSkipTeardownAfterDeviceLoss(): false when the device is fine (VK_SUCCESS), regardless of "
++          "surface-lost state -- the overwhelmingly common case: normal teardown proceeds exactly as before") {
++    CHECK_FALSE(shouldSkipTeardownAfterDeviceLoss(VK_SUCCESS, /*surfaceLost=*/true));
++    CHECK_FALSE(shouldSkipTeardownAfterDeviceLoss(VK_SUCCESS, /*surfaceLost=*/false));
++}
++
++TEST_CASE("shouldSkipTeardownAfterDeviceLoss(): false when the device is lost but the surface was NEVER known "
++          "lost -- revert-discrimination against silently masking an unrelated, genuine device-loss bug (e.g. a "
++          "mid-frame GPU crash while the window is still alive) as a clean exit; that case must keep failing "
++          "hard via the pre-existing SwapchainStatus::DeviceLost/`ok = false` path, not this narrower fix") {
++    CHECK_FALSE(shouldSkipTeardownAfterDeviceLoss(VK_ERROR_DEVICE_LOST, /*surfaceLost=*/false));
++}
++
++TEST_CASE("shouldSkipTeardownAfterDeviceLoss(): false for any other non-success VkResult even with the surface "
++          "already known lost -- narrowly scoped to VK_ERROR_DEVICE_LOST specifically, not 'any wait failure'") {
++    CHECK_FALSE(shouldSkipTeardownAfterDeviceLoss(VK_ERROR_OUT_OF_HOST_MEMORY, /*surfaceLost=*/true));
++    CHECK_FALSE(shouldSkipTeardownAfterDeviceLoss(VK_ERROR_OUT_OF_DEVICE_MEMORY, /*surfaceLost=*/true));
++    CHECK_FALSE(shouldSkipTeardownAfterDeviceLoss(VK_ERROR_SURFACE_LOST_KHR, /*surfaceLost=*/true));
++}
+diff --git a/samples/09_scene/window_resize.h b/samples/09_scene/window_resize.h
+index c8e3360..e9edff6 100644
+--- a/samples/09_scene/window_resize.h
++++ b/samples/09_scene/window_resize.h
+@@ -98,11 +98,36 @@ namespace rx::samples9 {
+ // recreateSwapchainAndDependents() only ever reaches this call AFTER
+ // Device::recreateSwapchain() has already succeeded AND neither
+ // isSuspended() nor isSurfaceLost() is true, so `newExtent` (read from
+ // Device::swapchainExtent() at that point) is already known-nonzero --
+ // a narrower, simpler contract that does not need (and should not
+ // silently inherit) that other function's zero-guard.
+ [[nodiscard]] inline bool graphNeedsRecompileForExtent(VkExtent2D lastCompiledExtent, VkExtent2D newExtent) {
+     return newExtent.width != lastCompiledExtent.width || newExtent.height != lastCompiledExtent.height;
+ }
+ 
++// [Issue #74] Pure decision, used by runPresent() at the present loop's own
++// exit point: after the loop breaks (either gracefully, via
++// Device::isSurfaceLost(), or on a hard failure), the previously-unchecked
++// `vkDeviceWaitIdle()` result is checked here. Reproduced directly on real
++// NVIDIA/Xcb hardware: when the loop already exited because the native
++// window is known gone (`surfaceLost`), the underlying VkDevice can ALSO
++// report VK_ERROR_DEVICE_LOST from that wait -- a further, empirically-
++// observed consequence of the SAME external event, one layer deeper than
++// the surface-lost state #73 already handles. A lost device does not
++// actually wait for anything, so letting teardown proceed regardless into
++// the fine-grained per-object vkDestroyImageView()/FrameSync::~FrameSync()/
++// destroyApp() calls produces real, unfiltered validation-layer "still in
++// use" errors (nothing was actually drained) -- reproduced directly, not
++// assumed. True ONLY for the exact compound condition this was reproduced
++// under (device lost AND the surface already known lost) -- a device lost
++// while the surface is still alive (e.g. mid-frame,
++// SwapchainStatus::DeviceLost from acquire()/present()) is a DIFFERENT,
++// more serious situation this function deliberately does not touch; that
++// path keeps failing hard (`ok = false`) exactly as it already did, so a
++// genuine, unrelated device-loss bug is never silently masked as a clean
++// exit by this narrower fix.
++[[nodiscard]] inline bool shouldSkipTeardownAfterDeviceLoss(VkResult waitIdleResult, bool surfaceLost) {
++    return waitIdleResult == VK_ERROR_DEVICE_LOST && surfaceLost;
++}
++
+ }  // namespace rx::samples9
+diff --git a/src/rx_platform/include/rx_platform/window.h b/src/rx_platform/include/rx_platform/window.h
+index b50a169..402366f 100644
+--- a/src/rx_platform/include/rx_platform/window.h
++++ b/src/rx_platform/include/rx_platform/window.h
+@@ -331,11 +331,59 @@ private:
+ // its real call site (Window::create(), window.cpp) rather than calling
+ // SDL_GetPlatform() internally, purely for testability: see
+ // window_test.cpp's device-free test asserting this fires exactly once for
+ // a mocked "Wayland" platform name and never fires for "Windows"/"Linux"
+ // (the X11 case) -- no live Wayland session is needed to prove the logic.
+ // Only a real "Wayland" match (case-sensitive, matching SDL_GetPlatform()'s
+ // own documented return values) ever consumes the one-shot budget; calls
+ // with any other platform name are a no-op every time, not just once.
+ void logWaylandMinimizeLimitationOnce(const char* platformName);
+ 
++// [Phase 4 Task 17 follow-up, Issue #74] Pure decision: should this engine
++// install its own non-fatal X11 BadWindow error handler for the given SDL
++// video driver name? True ONLY for the exact string "x11" (case-sensitive,
++// matching SDL_GetCurrentVideoDriver()'s own documented lowercase driver
++// names, e.g. SDL_x11video.c's own `"x11"` literal) -- a Wayland/Windows/
++// dummy/offscreen session never dlopens libX11 at all, and this must never
++// be the reason one gets pulled in there. See installX11ErrorHandlerOnce()'s
++// own comment (window.cpp) for WHY a handler is installed at all: reproduced
++// directly (Issue #74) that a third-party window destroy (e.g. `xdotool
++// windowclose`, a raw XDestroyWindow()) racing an in-flight SDL-internal
++// X11 call (mouse-capture engage, focus-dispatch grab re-arm, or any other
++// call SDL's X11 backend may issue against a window handle -- this is not
++// one specific call site, it is a whole CLASS of async-protocol race) hits
++// an unhandled X11 BadWindow protocol error, and Xlib's DEFAULT error
++// handler treats that as FATAL (calls exit()), killing the whole process
++// before this engine's own reactive rx::rhi::Device::isSurfaceLost()
++// detection (device.h) -- which only runs from inside the present loop's
++// own swapchain-recreation path -- ever gets a chance to run. Exposed here
++// taking the driver name as a parameter rather than querying SDL
++// internally, purely for testability -- mirrors
++// logWaylandMinimizeLimitationOnce()'s own established "pass the string in"
++// pattern (window_test.cpp's own device-free coverage).
++bool shouldInstallX11ErrorHandler(const char* videoDriver);
++
++// [Phase 4 Task 17 follow-up, Issue #74] Pure decision: is this X11 core
++// protocol error code (XErrorEvent::error_code, <X11/Xlib.h>) one this
++// engine's own installed handler treats as non-fatal (logged, then
++// execution continues) rather than forwarding to whatever handler was
++// previously installed (which -- for every OTHER error code -- still
++// terminates the process on a genuine, unexpected X11 protocol bug, exactly
++// like Xlib's own out-of-the-box default behavior; this fix deliberately
++// does NOT make the whole process immune to X11 errors in general). True
++// only for BadWindow (<X11/X.h>: `#define BadWindow 3` -- a frozen,
++// X11R1-era wire-protocol constant, not re-declared from the real header to
++// keep this engine's only X11 dependency dlopen-based -- see
++// installX11ErrorHandlerOnce()'s own comment for why). BadWindow's own
++// protocol meaning ("a value for a Window argument does not name a defined
++// Window") is EXACTLY this fix's target scenario for ANY request type that
++// carries a Window argument -- which is why this classifies on the error
++// code alone, never on which specific request triggered it: reproduced
++// directly (Issue #74) via at least three DIFFERENT request codes
++// (X_ChangeWindowAttributes, X_GetWindowAttributes, and one XInputExtension
++// request) depending on exactly which internal SDL call happened to race
++// the destroy -- enumerating every request SDL might ever issue against a
++// window is an unbounded list this fix deliberately does not attempt to
++// chase.
++bool isIgnorableX11Error(unsigned char errorCode);
++
+ }  // namespace rx::platform
+diff --git a/src/rx_platform/src/window.cpp b/src/rx_platform/src/window.cpp
+index 5728bea..6845d0c 100644
+--- a/src/rx_platform/src/window.cpp
++++ b/src/rx_platform/src/window.cpp
+@@ -4,22 +4,165 @@
+ // SDL3/SDL.h does not pull in the Vulkan-interop declarations
+ // (SDL_Vulkan_GetInstanceExtensions, SDL_Vulkan_CreateSurface); SDL3 keeps
+ // those in their own header.
+ #include <SDL3/SDL_vulkan.h>
+ 
+ #include <algorithm>
+ #include <atomic>
+ #include <string_view>
+ #include <utility>
+ 
++#if defined(SDL_PLATFORM_LINUX)
++// [Phase 4 Task 17 follow-up, Issue #74] dlopen/dlsym only -- see
++// installX11ErrorHandlerOnce()'s own comment below for why this engine
++// never links against -lX11 directly.
++#include <dlfcn.h>
++#endif
++
+ namespace rx::platform {
+ 
++namespace {
++
++#if defined(SDL_PLATFORM_LINUX)
++// [Phase 4 Task 17 follow-up, Issue #74] Minimal, ABI-stable mirror of the
++// fields of Xlib's real `XErrorEvent` (<X11/Xlib.h>) that
++// installX11ErrorHandlerOnce()'s handler actually reads. Deliberately NOT
++// including the real header and NOT link-time-depending on libX11 (this
++// engine resolves the one Xlib entry point it needs the exact same way
++// SDL3 itself does -- SDL_x11dyn's own dlopen-based dynamic loading -- so a
++// Wayland-only environment with no libX11.so.6 installed at all is never
++// made to need one just because this engine links against SDL3). The X11
++// wire protocol's error-packet layout has been frozen since X11R1 -- this
++// struct's layout is not expected to change (the same "empirically stable
++// protocol/ABI constant" tolerance this codebase already extends to e.g.
++// the VkResult classifiers in rx_rhi_vk's isSurfaceLossResult()).
++struct XErrorEventAbi {
++    int type;
++    void* display;
++    unsigned long resourceid;
++    unsigned long serial;
++    unsigned char error_code;
++    unsigned char request_code;
++    unsigned char minor_code;
++};
++
++using XErrorHandlerFn = int (*)(void* display, XErrorEventAbi* event);
++using XSetErrorHandlerFn = XErrorHandlerFn (*)(XErrorHandlerFn);
++
++// The handler XSetErrorHandler() reported as previously installed (normally
++// Xlib's own default, fatal handler) -- non-BadWindow errors are forwarded
++// to it unchanged below, so this fix stays narrowly scoped to the ONE
++// error code it targets and every other X11 protocol error still behaves
++// exactly as it always has (loud, fatal -- a genuine, unexpected protocol
++// bug should stay visible, not be silently swallowed by this fix).
++std::atomic<XErrorHandlerFn> g_previousX11ErrorHandler{nullptr};
++
++int handleX11Error(void* display, XErrorEventAbi* event) {
++    if (event != nullptr && isIgnorableX11Error(event->error_code)) {
++        RX_LOG_WARN(
++            "rx_platform: X11 BadWindow protocol error suppressed (resource=0x{:x}, request_code={}, "
++            "minor_code={}, serial={}) -- almost certainly a third-party window destroy (e.g. a window-manager "
++            "close, or a raw XDestroyWindow()) racing an in-flight SDL/X11 call; this engine's own "
++            "Device::isSurfaceLost() detection (rx_rhi_vk/device.h) will notice and handle the underlying "
++            "surface loss on its own next check [Issue #74]",
++            event->resourceid, static_cast<int>(event->request_code), static_cast<int>(event->minor_code),
++            event->serial);
++        return 0;
++    }
++    XErrorHandlerFn previous = g_previousX11ErrorHandler.load();
++    if (previous != nullptr) {
++        return previous(display, event);
++    }
++    return 0;
++}
++
++// [Phase 4 Task 17 follow-up, Issue #74] One-shot (per PROCESS, not per
++// Window) -- mirrors logWaylandMinimizeLimitationOnce()'s own established
++// atomic-guarded pattern. Root cause (reproduced directly with gdb-level
++// instrumentation against real NVIDIA/Xcb hardware, see the Issue #74
++// report): a third-party window destroy can happen at ANY point across the
++// whole session -- not just during this engine's own present-loop teardown
++// -- and Xlib's DEFAULT error handler is installed for the ENTIRE process
++// lifetime the moment SDL3's X11 backend opens its display connection
++// (confirmed by inspecting SDL3's own X11 video-driver source: it only
++// EVER installs a scoped custom handler transiently, during its own
++// window-manager capability probe at video-driver init, restoring the
++// default handler immediately afterward -- SDL3 provides no general
++// protection against this class of race). Rather than chasing and guarding
++// every individual SDL-internal call site that might touch a since-
++// destroyed window handle (mouse-capture engage/disengage, focus-dispatch
++// grab re-arm, cursor redraw, and any future SDL-internal call this
++// engine's own code never directly calls) -- an open-ended, whack-a-mole
++// list -- this installs ONE process-wide non-fatal handler for the ONE
++// well-defined error code (BadWindow) that class of race always produces,
++// regardless of which specific X11 request triggered it.
++void installX11ErrorHandlerOnce(const char* videoDriver) {
++    static std::atomic<bool> installed{false};
++
++    if (!shouldInstallX11ErrorHandler(videoDriver)) {
++        return;
++    }
++
++    bool expected = false;
++    if (!installed.compare_exchange_strong(expected, true)) {
++        return;  // Already installed earlier this process -- idempotent.
++    }
++
++    // Resolved via dlopen/dlsym, exactly like SDL3's own SDL_x11dyn.c loads
++    // every Xlib entry point it calls. By the time this runs
++    // (Window::create(), immediately after SDL_Init(SDL_INIT_VIDEO)
++    // succeeds with the x11 driver selected), SDL3 has already dlopen'd
++    // libX11.so.6 into this process to create the x11 video driver in the
++    // first place -- this call simply attaches to that SAME already-mapped
++    // library (POSIX dlopen: re-opening an already-loaded soname bumps its
++    // refcount and returns the existing handle, it does not reload or
++    // duplicate it), so this is safe and correct regardless of which flags
++    // SDL3's own internal dlopen call used. Never dlclose()'d -- reclaimed
++    // by the OS at process exit either way, exactly like this engine's own
++    // established "never explicitly freed before exit" precedent for e.g.
++    // Window::abandonNativeHandle()'s own native handle.
++    void* libX11 = dlopen("libX11.so.6", RTLD_NOW);
++    if (libX11 == nullptr) {
++        RX_LOG_WARN(
++            "rx_platform: dlopen(libX11.so.6) failed installing the non-fatal BadWindow handler: {} -- a "
++            "third-party window destroy racing an in-flight X11 call may still terminate the process [Issue #74]",
++            dlerror());
++        return;
++    }
++
++    auto setErrorHandler = reinterpret_cast<XSetErrorHandlerFn>(dlsym(libX11, "XSetErrorHandler"));
++    if (setErrorHandler == nullptr) {
++        RX_LOG_WARN(
++            "rx_platform: dlsym(XSetErrorHandler) failed: {} -- non-fatal BadWindow handler not installed "
++            "[Issue #74]",
++            dlerror());
++        return;
++    }
++
++    g_previousX11ErrorHandler.store(setErrorHandler(&handleX11Error));
++}
++#endif  // defined(SDL_PLATFORM_LINUX)
++
++}  // namespace
++
++bool shouldInstallX11ErrorHandler(const char* videoDriver) {
++    return videoDriver != nullptr && std::string_view(videoDriver) == "x11";
++}
++
++bool isIgnorableX11Error(unsigned char errorCode) {
++    // <X11/X.h>: `#define BadWindow 3` -- see this function's own header
++    // comment (window.h) for why BadWindow specifically, and why by error
++    // code alone rather than by request code.
++    constexpr unsigned char kX11BadWindow = 3;
++    return errorCode == kX11BadWindow;
++}
++
+ void logWaylandMinimizeLimitationOnce(const char* platformName) {
+     // See this function's own header comment (window.h) for the full
+     // rationale. Only a "Wayland" match ever flips this -- an X11/Windows
+     // call never consumes the one-shot budget, so a later genuine Wayland
+     // call (regardless of how many non-Wayland calls preceded it, e.g. in
+     // a multi-platform test binary) still logs exactly once.
+     static std::atomic<bool> alreadyLogged{false};
+ 
+     if (platformName == nullptr || std::string_view(platformName) != "Wayland") {
+         return;
+@@ -80,20 +223,32 @@ std::optional<Window> Window::create(const char* title, int width, int height, b
+         }
+     }
+ 
+     // [Phase 4 Task 17, FG7, gate ruling #25 row 3] One-shot, process-wide
+     // -- see logWaylandMinimizeLimitationOnce()'s own comment (window.h).
+     // SDL_GetPlatform() is valid to call once SDL_INIT_VIDEO has succeeded
+     // above (it is documented safe to call before SDL_Init() too, but this
+     // keeps the call site right where video is known to be up).
+     logWaylandMinimizeLimitationOnce(SDL_GetPlatform());
+ 
++#if defined(SDL_PLATFORM_LINUX)
++    // [Phase 4 Task 17 follow-up, Issue #74] See installX11ErrorHandlerOnce()'s
++    // own comment above for the full rationale. Must run after
++    // SDL_Init(SDL_INIT_VIDEO) above (SDL_GetCurrentVideoDriver() is only
++    // valid once video is initialized) and before this function hands back
++    // a live window: the race this closes can start from this engine's very
++    // first SDL_CreateWindow()/SDL_ShowWindow() call onward, not just during
++    // later teardown -- reproduced directly (Issue #74) racing SDL's own
++    // internal focus-dispatch handling during window creation itself.
++    installX11ErrorHandlerOnce(SDL_GetCurrentVideoDriver());
++#endif
++
+     SDL_WindowFlags flags = SDL_WINDOW_VULKAN;
+     if (!visible) {
+         flags |= SDL_WINDOW_HIDDEN;
+     }
+     if (resizable) {
+         flags |= SDL_WINDOW_RESIZABLE;
+     }
+ 
+     SDL_Window* window = SDL_CreateWindow(title, width, height, flags);
+     if (!window) {
+diff --git a/src/rx_platform/tests/window_test.cpp b/src/rx_platform/tests/window_test.cpp
+index cffa980..fd665a8 100644
+--- a/src/rx_platform/tests/window_test.cpp
++++ b/src/rx_platform/tests/window_test.cpp
+@@ -700,20 +700,67 @@ TEST_CASE("logWaylandMinimizeLimitationOnce fires exactly once for a mocked \"Wa
+ 
+     // One-shot: a second (and third) "Wayland" call does not log again.
+     rx::platform::logWaylandMinimizeLimitationOnce("Wayland");
+     rx::platform::logWaylandMinimizeLimitationOnce("Wayland");
+     {
+         std::lock_guard<std::mutex> lock(captured.mutex);
+         CHECK(captured.callCount == 1);
+     }
+ }
+ 
++// ===== shouldInstallX11ErrorHandler / isIgnorableX11Error [Phase 4 Task 17
++// follow-up, Issue #74] ==================================================
++// Device-free: no live X11 display/window is needed for either -- both are
++// pure decision functions, matching logWaylandMinimizeLimitationOnce's own
++// "pass the string in" testability pattern above. The side-effecting half
++// (installX11ErrorHandlerOnce()'s real dlopen/XSetErrorHandler call) is
++// internal-linkage-only and real-hardware-verified separately (see the
++// Issue #74 report) -- exactly this file's existing split between pure
++// decision logic (exhaustively unit-tested here) and hardware-touching
++// glue (MANUAL_VERIFICATION-only), already established throughout this
++// file.
++TEST_CASE("shouldInstallX11ErrorHandler(): true only for the exact string \"x11\"; false for wayland/windows/dummy/"
++          "null/case-mismatch") {
++    CHECK(rx::platform::shouldInstallX11ErrorHandler("x11"));
++
++    CHECK_FALSE(rx::platform::shouldInstallX11ErrorHandler("wayland"));
++    CHECK_FALSE(rx::platform::shouldInstallX11ErrorHandler("windows"));
++    CHECK_FALSE(rx::platform::shouldInstallX11ErrorHandler("cocoa"));
++    CHECK_FALSE(rx::platform::shouldInstallX11ErrorHandler("dummy"));
++    CHECK_FALSE(rx::platform::shouldInstallX11ErrorHandler("offscreen"));
++    CHECK_FALSE(rx::platform::shouldInstallX11ErrorHandler(""));
++    CHECK_FALSE(rx::platform::shouldInstallX11ErrorHandler(nullptr));
++    // Case-sensitive, matching SDL_GetCurrentVideoDriver()'s own documented
++    // lowercase driver names -- a near-miss must not accidentally match.
++    CHECK_FALSE(rx::platform::shouldInstallX11ErrorHandler("X11"));
++    CHECK_FALSE(rx::platform::shouldInstallX11ErrorHandler("x11 "));
++}
++
++TEST_CASE("isIgnorableX11Error(): true ONLY for BadWindow (3) -- revert-discrimination against classifying any "
++          "other X11 error code as ignorable") {
++    CHECK(rx::platform::isIgnorableX11Error(3));  // BadWindow, <X11/X.h>.
++
++    // Success and every other core-protocol error code this codebase's own
++    // reproduction never observed stay fatal (forwarded to the previous
++    // handler) -- this fix is deliberately narrow, not "any X11 error is
++    // now survivable".
++    CHECK_FALSE(rx::platform::isIgnorableX11Error(0));   // Success (never delivered as an error, but exercised
++                                                          // anyway for completeness).
++    CHECK_FALSE(rx::platform::isIgnorableX11Error(1));   // BadRequest.
++    CHECK_FALSE(rx::platform::isIgnorableX11Error(2));   // BadValue.
++    CHECK_FALSE(rx::platform::isIgnorableX11Error(4));   // BadPixmap.
++    CHECK_FALSE(rx::platform::isIgnorableX11Error(9));   // BadDrawable.
++    CHECK_FALSE(rx::platform::isIgnorableX11Error(11));  // BadAlloc.
++    CHECK_FALSE(rx::platform::isIgnorableX11Error(17));  // BadAtom.
++    CHECK_FALSE(rx::platform::isIgnorableX11Error(255));
++}
++
+ // ===== Borderless-fullscreen toggle [Phase 4 Task 17, FG7, gate ruling #25
+ // row 4] -- SDL-level only (no Vulkan/Device here; the real windowed<->
+ // fullscreen<->windowed GPU test, including the swapchain-recreation path,
+ // lives in rx_rhi_vk/tests/window_state_test.cpp). ======================
+ TEST_CASE("Window::setFullscreen(true) enters borderless-desktop fullscreen (SDL_GetWindowFullscreenMode() == "
+           "nullptr); toggled back to windowed") {
+     auto window = rx::platform::Window::create("rx_platform_fullscreen_test", 64, 64, /*visible=*/false);
+     if (!window.has_value()) {
+         MESSAGE("no display backend available, skipping fullscreen check");
+         return;
