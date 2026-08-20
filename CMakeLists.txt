@@ -149,5 +149,10 @@ add_subdirectory(samples/07_stress)
 # samples/common: D17's reusable reference-PNG gate -- add_subdirectory'd
 # before 08_gltf_viewer (the first sample to link it).
 add_subdirectory(samples/common)
+# Issue #31: generic two-PNG comparison host tool built on samples/common's
+# own gate algorithm -- see tools/compare_rgba8_png/main.cpp's own header
+# comment. Added after samples/common (its own dependency) and before
+# 08_gltf_viewer (not a dependency of it, ordering is incidental).
+add_subdirectory(tools/compare_rgba8_png)
 add_subdirectory(samples/08_gltf_viewer)
 add_subdirectory(samples/09_scene)
