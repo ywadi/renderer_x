@@ -65,8 +65,8 @@ rx::samples9::FlyCamera;` in place of its old inline struct definition.
 
 ### 1.3 Discriminating tests (new, committed)
 
-`samples/09_scene/tests/test_fly_camera.cpp` — 9 new `TEST_CASE`s (14
-total in `sample_09_scene_tests`, 42 assertions), driving the REAL
+`samples/09_scene/tests/test_fly_camera.cpp` — 9 new `TEST_CASE`s (16
+total in `sample_09_scene_tests`, 49 assertions), driving the REAL
 production `flyCameraLocalMoveDelta()` + `FlyCamera::moveLocal()`/
 `applyLookDelta()`, not a re-implementation:
 
@@ -92,8 +92,8 @@ Reintroduced the historical bug in-place (`fly_camera.h`,
 `glm::vec3(strafe, vertical, -forward)`), rebuilt, reran:
 
 ```
-[doctest] test cases: 14 |  9 passed | 5 failed | 0 skipped
-[doctest] assertions: 42 | 34 passed | 8 failed |
+[doctest] test cases: 16 |  11 passed | 5 failed | 0 skipped
+[doctest] assertions: 49 | 41 passed | 8 failed |
 ```
 
 The 5 failures were EXACTLY the forward-axis cases (W, S, W-after-rotation,
@@ -108,7 +108,7 @@ log for W (`forward=+1`, distance 5, identity orientation —
 | **Buggy** (`-forward`) | `(0, 0, +5)` | `-1.0` (moves AWAY from where the camera looks) |
 | **Fixed** (`forward`) | `(0, 0, -5)` | `+1.0` (moves WITH the camera's look direction) |
 
-Restored the fix, rebuilt, reran: `14/14 passed, 42/42 assertions` again.
+Restored the fix, rebuilt, reran: `16/16 passed, 49/49 assertions` again.
 
 ## 2. Item 2 — Sponza texture-to-mesh misassignment
 
@@ -398,7 +398,7 @@ reported run was their first-ever native-Windows verification of any kind).
 - **Lavapipe, full serial `ctest`** (`VK_ICD_FILENAMES` forced to
   `lvp_icd.json`, since this machine also has NVIDIA registered):
   `ctest --preset linux-native -j1` → **29/29 passed** (79.65s), including
-  the new `sample_09_scene_tests` (14/14 cases, 42/42 assertions) and both
+  the new `sample_09_scene_tests` (16/16 cases, 49/49 assertions) and both
   `sample_09_scene_headless`/`sample_09_scene_stress_headless` gates.
 - **`windows-cross-zig` preset**: builds clean (incremental, only the
   touched files relinked). Full serial `ctest --preset windows-cross-zig
