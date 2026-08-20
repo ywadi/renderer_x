@@ -470,6 +470,37 @@ void RenderGraph::compile(const CompileInfo& info) {
         }
     }
 
+    // [Phase 4 exit fix wave, C1] A pass that recorded a real callback
+    // (setExecute()/setExecuteChunked()) but got culled here is very likely
+    // a wiring bug, not intentional dead code: an author who deliberately
+    // wants a pass gone would delete the addPass() call, not leave a live
+    // callback attached to a pass nothing reads and that never called
+    // setSideEffect(). This is exactly the C1 class of defect (sample 09's
+    // "shadow" pass: writes "shadowmap", nothing declares
+    // addTextureInput("shadowmap"), no setSideEffect() -- silently culled,
+    // its callback never invoked, with compile() otherwise emitting no log
+    // at all) -- a pass with NO callback attached (a bare barrier-only
+    // declaration) is culled silently, same as always, since there is
+    // nothing "lost" for it. Warn, don't throw: a pass mid-refactor
+    // (callback wired, consumer not yet added) is a legitimate transient
+    // state this library has no way to distinguish from a permanent bug --
+    // loud-but-non-fatal matches this codebase's own posture for
+    // suspicious-but-not-necessarily-wrong conditions elsewhere.
+    for (uint32_t p = 0; p < passCount; ++p) {
+        if (reachable[p]) {
+            continue;
+        }
+        const Pass& pass = g.passes[p];
+        if (static_cast<bool>(pass.execute_) || pass.hasChunkedExecute()) {
+            RX_LOG_WARN(
+                "rx_graph: pass '{}' has a recorded execute callback but was culled (nothing reads any resource "
+                "it writes, and it never called setSideEffect()) -- its callback will NEVER run; if this is "
+                "intentional, remove the callback, otherwise add a reader (addTextureInput()/addStorageBufferInput() "
+                "on the resource it writes) or setSideEffect()",
+                pass.name_);
+        }
+    }
+
     // ---- step 3b: stable topological order of survivors -----------------
     // Kahn's algorithm: `ready` always holds every reachable pass whose
     // producers have all already been emitted, and a std::set keeps it

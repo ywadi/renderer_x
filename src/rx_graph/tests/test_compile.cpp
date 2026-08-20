@@ -4,11 +4,15 @@
 // swapchain-relative size resolution, compute-vs-graphics storage buffer
 // stage classification) that the six required cases don't otherwise touch.
 #include <doctest/doctest.h>
+#include <rx_core/log.h>
+#include <rx_core/log_forward_sink.h>
 #include <rx_graph/pass_signature.h>
 #include <rx_graph/render_graph.h>
 
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 using namespace rx::graph;
 
@@ -59,6 +63,109 @@ TEST_CASE("culling") {
 
     CHECK(findResource(compiled, "x") == nullptr);
     CHECK(findResource(compiled, "bb") != nullptr);
+}
+
+// [Phase 4 exit fix wave, C1] compile() logs a WARN, naming the pass, when
+// a pass carrying a real setExecute()/setExecuteChunked() callback gets
+// culled -- this is exactly the class of defect the phase-exit review found
+// in sample 09 (a "shadow" pass writing "shadowmap" with no consumer and no
+// setSideEffect(): culled silently, its callback never invoked, and
+// compile() logged nothing at all). Uses the same process-wide
+// LogForwardSink rx_core/tests/log_test.cpp's own ForwardCallbackGuard
+// pattern captures records through -- rx_graph is PUBLIC-linked against
+// rx_core (CMakeLists.txt), so this header is reachable from here without
+// any new dependency.
+
+namespace {
+
+struct CulledWarnCapture {
+    int32_t severity = -1;
+    std::string message;
+    int callCount = 0;
+};
+
+CulledWarnCapture* g_culledWarnCapture = nullptr;
+
+void captureCulledWarn(int32_t severity, const char* /*category*/, const char* message, void* /*userData*/) {
+    if (g_culledWarnCapture == nullptr) {
+        return;
+    }
+    // Only the culled-pass warning this test cares about -- the same
+    // process-wide sink also forwards every other record any earlier/later
+    // TEST_CASE in this binary happens to log, so filter by content rather
+    // than assuming call ordinality.
+    if (message != nullptr && std::string_view(message).find("was culled") != std::string_view::npos) {
+        g_culledWarnCapture->severity = severity;
+        g_culledWarnCapture->message = message;
+        g_culledWarnCapture->callCount++;
+    }
+}
+
+// RAII guard mirroring log_test.cpp's ForwardCallbackGuard -- uninstalls on
+// scope exit regardless of how the TEST_CASE returns (including a failed
+// REQUIRE, which doctest unwinds via a C++ exception).
+struct CulledWarnGuard {
+    std::shared_ptr<rx::core::log::LogForwardSink> sink;
+    ~CulledWarnGuard() {
+        g_culledWarnCapture = nullptr;
+        (void)sink->set(nullptr, nullptr);
+    }
+};
+
+}  // namespace
+
+TEST_CASE("compile() warns, naming the pass, when a culled pass carries a real execute callback") {
+    RenderGraph graph;
+    // Same shape as sample 09's pre-fix bug: "shadow" writes "sm" but
+    // nothing reads it and it never calls setSideEffect() -- culled. "bb"
+    // is the only reachable pass.
+    bool shadowCallbackInvoked = false;
+    graph.addPass("shadow")
+        .setDepthStencilOutput("sm", depthDesc())
+        .setExecute([&shadowCallbackInvoked](PassContext&) { shadowCallbackInvoked = true; });
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+
+    rx::core::log::init();
+    CulledWarnCapture capture;
+    g_culledWarnCapture = &capture;
+    auto sink = rx::core::log::forwardSink();
+    REQUIRE(sink->set(&captureCulledWarn, nullptr));
+    CulledWarnGuard guard{sink};
+
+    graph.compile(kInfo);
+
+    const CompiledGraph& compiled = graph.compiled();
+    CHECK(compiled.isCulled(0));
+    CHECK_FALSE(shadowCallbackInvoked);  // never invoked -- CompiledGraph::executionOrder() skips culled passes.
+
+    CHECK(capture.callCount == 1);
+    CHECK(capture.severity == 3);  // warn, per LogForwardSink's Trace..Error mapping.
+    CHECK(capture.message.find("shadow") != std::string::npos);
+}
+
+TEST_CASE("compile() does NOT warn once the previously-culled pass gains a real consumer") {
+    RenderGraph graph;
+    // Identical topology to the case above, except "present" now declares
+    // addTextureInput("sm") -- the C1 fix shape (a genuine graph-derived
+    // read, not a setSideEffect() band-aid): "shadow" is reachable, no
+    // culled-with-callback condition exists to warn about.
+    graph.addPass("shadow").setDepthStencilOutput("sm", depthDesc()).setExecute([](PassContext&) {});
+    graph.addPass("present").addTextureInput("sm").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+
+    rx::core::log::init();
+    CulledWarnCapture capture;
+    g_culledWarnCapture = &capture;
+    auto sink = rx::core::log::forwardSink();
+    REQUIRE(sink->set(&captureCulledWarn, nullptr));
+    CulledWarnGuard guard{sink};
+
+    graph.compile(kInfo);
+
+    const CompiledGraph& compiled = graph.compiled();
+    CHECK_FALSE(compiled.isCulled(0));
+    CHECK(capture.callCount == 0);
 }
 
 TEST_CASE("ordering") {
