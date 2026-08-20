@@ -754,6 +754,20 @@ TEST_CASE("isIgnorableX11Error(): true ONLY for BadWindow (3) -- revert-discrimi
     CHECK_FALSE(rx::platform::isIgnorableX11Error(255));
 }
 
+// ===== [Issue #74 round review] "armed after Window::abandonNativeHandle()"
+// gate -- implemented, tested here (full armed/unarmed x BadWindow/other
+// truth table, device-free), then REVERTED. See isIgnorableX11Error()'s own
+// header comment (window.h) and installX11ErrorHandlerOnce()'s own comment
+// (window.cpp) for the full record: this gate reproduced Issue #74's own
+// original fatal crash three times in a row on real NVIDIA hardware
+// (window-destruction independently confirmed via `xdotool getwindowname`
+// each time), because this race's first BadWindow routinely fires before
+// Window::abandonNativeHandle() has EVER been called on anything -- there is
+// no signal earlier than "a Window exists" to arm suppression on, and that
+// is indistinguishable from permanently armed for any realistic session.
+// isIgnorableX11Error() (tested above) is once again the installed
+// handler's sole, permanent suppression predicate.
+
 // ===== Borderless-fullscreen toggle [Phase 4 Task 17, FG7, gate ruling #25
 // row 4] -- SDL-level only (no Vulkan/Device here; the real windowed<->
 // fullscreen<->windowed GPU test, including the swapchain-recreation path,

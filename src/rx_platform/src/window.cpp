@@ -57,6 +57,12 @@ using XSetErrorHandlerFn = XErrorHandlerFn (*)(XErrorHandlerFn);
 std::atomic<XErrorHandlerFn> g_previousX11ErrorHandler{nullptr};
 
 int handleX11Error(void* display, XErrorEventAbi* event) {
+    // [Issue #74 round review] Deliberately NOT gated on a "has some window
+    // already been abandoned" temporal flag -- see isIgnorableX11Error()'s
+    // own comment (window.h) for the full record of why that was tried and
+    // reverted this round: it reproduced Issue #74's own original crash,
+    // because this race's first BadWindow routinely fires before this
+    // engine has ever abandoned anything.
     if (event != nullptr && isIgnorableX11Error(event->error_code)) {
         RX_LOG_WARN(
             "rx_platform: X11 BadWindow protocol error suppressed (resource=0x{:x}, request_code={}, "
@@ -95,6 +101,34 @@ int handleX11Error(void* display, XErrorEventAbi* event) {
 // list -- this installs ONE process-wide non-fatal handler for the ONE
 // well-defined error code (BadWindow) that class of race always produces,
 // regardless of which specific X11 request triggered it.
+//
+// [Issue #74 round review] The handler stays armed for the rest of the
+// process's life -- there is deliberately no "disarm" call anywhere. A
+// round-review finding (LOW, Approved, not blocking) flagged this as a
+// theoretical future multi-window risk: an XID-agnostic handler could
+// silently downgrade a genuine BadWindow bug in a SECOND, still-alive
+// window into a permanent warning, if this engine ever grows past one
+// Window per process. A follow-up gate -- suppress BadWindow only once
+// Window::abandonNativeHandle() had fired at least once -- was implemented
+// and empirically tested against this exact scenario this round, and
+// REVERTED: it reproduced Issue #74's own original fatal crash three times
+// in a row on real NVIDIA hardware (window-destruction independently
+// confirmed each time via `xdotool getwindowname` failing post-close), all
+// on the Workshop scene's mid-load-close case. Root cause of why a
+// temporal gate cannot work here: this race's first BadWindow routinely
+// arrives before abandonNativeHandle() is EVER called on anything (that
+// only happens reactively, once the present loop's own swapchain-
+// recreation path notices the surface is gone -- which has not even
+// started running yet when e.g. Window::setRelativeMouseMode(), called
+// once immediately after scene load and before the loop begins, races a
+// window that died during that load). There is no signal earlier than "a
+// Window exists" to arm on, and arming at Window::create() time is
+// indistinguishable from always-armed for any realistic single-process
+// session -- so this stays permanently armed once installed, exactly as
+// originally shipped. Safe under this engine's CURRENT architecture (one
+// Window per process, ImGui multi-viewport explicitly disabled --
+// rx_debug_ui/overlay.h) -- genuine per-window scoping is the correct fix
+// if/when multi-window support is ever added, not a temporal gate.
 void installX11ErrorHandlerOnce(const char* videoDriver) {
     static std::atomic<bool> installed{false};
 

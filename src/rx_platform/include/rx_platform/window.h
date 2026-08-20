@@ -257,6 +257,19 @@ public:
     // "detach and keep using the Window" escape hatch -- every other
     // method on this class remains unguarded against an abandoned native
     // handle and is not expected to be called again afterward.
+    //
+    // [Issue #74 round review] Does NOT gate installX11ErrorHandlerOnce()'s
+    // BadWindow suppression (window.cpp) -- see isIgnorableX11Error()'s own
+    // comment (below) for why a temporal "only after some window has been
+    // abandoned" gate was tried in this round and reverted: it reintroduced
+    // the exact fatal crash Issue #74 exists to fix. The race this issue
+    // targets routinely produces its FIRST BadWindow before this method is
+    // ever called on anything -- reproduced directly (Issue #74's own root-
+    // cause investigation): a third-party window destroy during a scene's
+    // multi-second asset load races SDL-internal X11 calls (e.g.
+    // Window::setRelativeMouseMode()) that fire well before this engine's
+    // reactive rx::rhi::Device::isSurfaceLost() detection -- the thing that
+    // eventually calls this method -- ever gets a chance to run.
     void abandonNativeHandle() { nativeHandleAbandoned_ = true; }
 
     // True after abandonNativeHandle() -- see that method's own comment.
@@ -384,6 +397,41 @@ bool shouldInstallX11ErrorHandler(const char* videoDriver);
 // the destroy -- enumerating every request SDL might ever issue against a
 // window is an unbounded list this fix deliberately does not attempt to
 // chase.
+//
+// [Issue #74 round review] THIS ALONE is deliberately the installed
+// handler's actual, permanent suppression predicate -- see
+// installX11ErrorHandlerOnce()'s own comment (window.cpp) for the full
+// "why not gate this on Window::abandonNativeHandle() having already
+// fired" discussion: a temporal gate of that shape was implemented and
+// empirically tested this round, and REVERTED after it reproduced Issue
+// #74's own original fatal crash (byte-for-byte -- same `X Error of failed
+// request: BadWindow`/`X_ChangeWindowAttributes` signature, exit 1, real
+// NVIDIA hardware, window-destruction independently confirmed via
+// `xdotool getwindowname`) on the Workshop scene's own mid-load-close
+// scenario, three times, always. Root cause of why the gate cannot work:
+// this race's FIRST BadWindow routinely fires before ANY window has ever
+// been abandoned -- abandonment only happens reactively, from inside the
+// present loop's own swapchain-recreation path, which has not even started
+// yet when e.g. Window::setRelativeMouseMode() (called once, immediately
+// after scene load, before the loop begins) races a window that died
+// during that load. There is no signal earlier than "a Window exists" that
+// could arm suppression before this race, and "armed from Window::create()
+// onward" is indistinguishable from permanently armed for any realistic
+// session. The remaining, documented trade-off (round-review finding, LOW,
+// Approved-not-blocking): this predicate is process-wide and XID-agnostic,
+// not scoped to a specific window -- a resourceid-based scope was also
+// considered and rejected (SDL's own X11 backend creates sub-resources
+// whose XIDs are not the top-level window's own, and this round's real-
+// hardware telemetry independently confirmed varying resource ids across
+// suppressed errors). Safe under this engine's CURRENT architecture: every
+// sample creates exactly one Window per process run (ImGui multi-viewport/
+// docking is explicitly disabled, rx_debug_ui/overlay.h), so there is never
+// a second, still-alive window whose genuine BadWindow this could wrongly
+// swallow. REVISIT WHEN MULTI-WINDOW SUPPORT IS ADDED (a second present
+// window, a tool window, ImGui multi-viewport): at that point this
+// predicate would need real per-window scoping (not a temporal gate) to
+// avoid silently downgrading an unrelated, still-live window's genuine
+// BadWindow bug into a permanent warning for the rest of the process.
 bool isIgnorableX11Error(unsigned char errorCode);
 
 }  // namespace rx::platform
