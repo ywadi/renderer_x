@@ -456,10 +456,13 @@ it is out of scope for *this* spec only, not out of scope for the project:
     fallback, (8) LTC area lights, (9) sheen/cloth, (10) iridescence
     + dispersion, (11) diffuse transmission (leaves/wax), (12) then
     GI.
-  - Import-side note: every listed material extension is already
-    parsed and preserved/logged by the Phase 4 importer (gate
-    dispositions) — consumption here requires no importer rework;
-    TEXCOORD_1/COLOR_0 vertex-layout growth rides the first
+  - Import-side note — ERRATUM (2026-08-20, P5 gate research): the
+    original claim that consumption "requires no importer rework" is
+    FALSE for transmission/volume/ior/clearcoat/anisotropy/specular
+    (WARN-log-only today; only emissive_strength is consume-ready).
+    Importer plumbing (parse → MaterialAsset fields → value-asserted
+    tests) is folded into P5 T21/T23/T24 per gate ruling RC3.
+    TEXCOORD_1/COLOR_0 vertex-layout growth still rides the first
     sub-item that needs it.
   - **Showcase/benchmark scene (committed 2026-08-19): Amazon
     Lumberyard Bistro** (NVIDIA ORCA distribution, CC-BY 4.0) as the
