@@ -3,10 +3,13 @@
 # types, matching src/rx_scene/tests/CMakeLists.txt's own device-free
 # binary convention. Compiles ../draw_recording.cpp directly rather than
 # linking a separate library target -- this seam is sample-09-local, not a
-# reusable engine module (no other sample needs it).
+# reusable engine module (no other sample needs it). test_fly_camera.cpp
+# covers ../fly_camera.h (also device-free, header-only -- no matching .cpp
+# to add) -- the W/S-inversion regression coverage.
 add_executable(sample_09_scene_tests
     doctest_main.cpp
     test_draw_recording.cpp
+    test_fly_camera.cpp
     "${CMAKE_CURRENT_SOURCE_DIR}/../draw_recording.cpp"
 )
 target_link_libraries(sample_09_scene_tests PRIVATE rx_scene doctest::doctest)

@@ -75,4 +75,28 @@ struct RecordSpan {
                                                              std::span<const rx::scene::BlockRange> blocks,
                                                              uint32_t rangeStart, uint32_t rangeCount);
 
+// The REAL `DrawPayload::materialIndex` a `RecordSpan` was built from --
+// recovers the identity `ResolvedDrawGroup`/`RecordSpan` themselves discard
+// (both types carry only a `pipelineToken`, deliberately: `resolveDrawGroups()`
+// groups by materialIndex-ADJACENCY, but its returned token is a real
+// `VkPipeline`, and DISTINCT materialIndex values legitimately collapse onto
+// the SAME pipeline whenever they share identical fixed-function state
+// [D28] -- e.g. Sponza's own glTF: 22 of its 25 materials are all
+// (StandardPBR, Opaque, single-sided), so they all resolve to ONE shared
+// VkPipeline. A caller that keys its MATERIAL PARAMS descriptor-set choice
+// off `pipelineToken` alone [the historical bug this function exists to let
+// a caller avoid] binds whichever ONE of those 22 materials happened to be
+// registered last for every one of the other 21's geometry -- reproducible
+// on any driver, not lighting- or platform-dependent. Every command within
+// one `RecordSpan` shares one materialIndex by construction (the SAME
+// invariant `splitByBlockAndGroup()`'s own header comment documents for
+// block identity: subdividing a group only ever shrinks a run, never
+// merges two different materialIndex runs), so reading it off the span's
+// OWN first command is exact, not a heuristic -- `DrawCommand::firstInstance`
+// addresses `payloads[]` directly [D26.1], and `payloads[i].materialIndex`
+// is the ground truth every `DrawDataGpu::materialIndex` row is itself
+// populated from (main.cpp's own `updateSceneFrame()`).
+[[nodiscard]] uint32_t materialIndexForSpan(std::span<const rx::scene::DrawCommand> commands,
+                                             std::span<const rx::scene::DrawPayload> payloads, const RecordSpan& span);
+
 }  // namespace rx::samples9

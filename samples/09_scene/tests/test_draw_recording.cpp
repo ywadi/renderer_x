@@ -12,9 +12,12 @@
 
 #include <doctest/doctest.h>
 
+using rx::samples9::materialIndexForSpan;
 using rx::samples9::RecordSpan;
 using rx::samples9::splitByBlockAndGroup;
 using rx::scene::BlockRange;
+using rx::scene::DrawCommand;
+using rx::scene::DrawPayload;
 using rx::scene::ResolvedDrawGroup;
 
 TEST_CASE("splitByBlockAndGroup: a single resolved group spanning two blocks splits into two spans, one per "
@@ -93,4 +96,57 @@ TEST_CASE("splitByBlockAndGroup: rangeCount == 0 returns an empty span list") {
     const std::vector<BlockRange> blocks{BlockRange{0, 0, 1}};
     const std::vector<ResolvedDrawGroup> groups{ResolvedDrawGroup{0, 1, 1}};
     CHECK(splitByBlockAndGroup(groups, blocks, 0, 0).empty());
+}
+
+// --- materialIndexForSpan() [Sponza texture-misassignment regression] ----
+// The real-world shape this reproduces: Sponza's own glTF has 22/25
+// materials sharing one (StandardPBR, Opaque, single-sided) fixed-function
+// state, so MaterialSystem::getPipeline() -- keyed on
+// {moduleHash,passHash,specializationBits,alphaMode,doubleSided}, NEVER on
+// per-material texture data -- legitimately returns the SAME VkPipeline for
+// every one of those 22 DISTINCT materials. `pipelineToken` alone can never
+// distinguish them; `materialIndexForSpan()` must recover the real,
+// distinct materialIndex from each span's own first command instead.
+TEST_CASE("materialIndexForSpan: two DIFFERENT materials sharing ONE pipelineToken (Sponza's own shape -- 22/25 "
+          "materials collapse onto one VkPipeline by fixed-function state) still resolve to their own DISTINCT "
+          "materialIndex per span [regression -- a caller keying descriptor-set selection off pipelineToken "
+          "alone binds the WRONG material's textures for every material but one sharing that token]") {
+    // Two submesh-instances, two DIFFERENT materials (7 and 19 -- arbitrary,
+    // non-adjacent values, deliberately NOT 0/1 so an accidental
+    // materialIndex==payload-array-index coincidence can't hide a bug),
+    // sharing pipelineToken 42 (the fixed-function-state collapse).
+    const std::vector<DrawPayload> payloads{
+        DrawPayload{/*materialIndex=*/7, /*instanceDataIndex=*/0},   // e.g. a column shaft.
+        DrawPayload{/*materialIndex=*/19, /*instanceDataIndex=*/1},  // e.g. a roof/parapet.
+    };
+    const std::vector<DrawCommand> commands{
+        DrawCommand{/*indexCount=*/6, /*instanceCount=*/1, /*firstIndex=*/0, /*vertexOffset=*/0, /*firstInstance=*/0},
+        DrawCommand{/*indexCount=*/6, /*instanceCount=*/1, /*firstIndex=*/6, /*vertexOffset=*/0, /*firstInstance=*/1},
+    };
+    // resolveDrawGroups() still emits TWO groups (materialIndex-ADJACENCY
+    // grouping never merges across a materialIndex change -- draw_list.h's
+    // own documented behavior), both carrying the identical pipelineToken
+    // the shared-pipeline collapse produces.
+    const std::vector<ResolvedDrawGroup> groups{
+        ResolvedDrawGroup{/*firstCommand=*/0, /*commandCount=*/1, /*pipelineToken=*/42},
+        ResolvedDrawGroup{/*firstCommand=*/1, /*commandCount=*/1, /*pipelineToken=*/42},
+    };
+    const std::vector<BlockRange> blocks{BlockRange{/*blockId=*/0, /*firstCommand=*/0, /*commandCount=*/2}};
+
+    const auto spans = splitByBlockAndGroup(groups, blocks, 0, 2);
+    REQUIRE(spans.size() == 2);
+    CHECK(spans[0].pipelineToken == 42);
+    CHECK(spans[1].pipelineToken == 42);  // SAME token -- exactly the case a pipelineToken-keyed lookup conflates.
+
+    CHECK(materialIndexForSpan(commands, payloads, spans[0]) == 7);
+    CHECK(materialIndexForSpan(commands, payloads, spans[1]) == 19);  // MUST differ from spans[0], despite the shared token.
+}
+
+TEST_CASE("materialIndexForSpan: defensive fallback for an empty/out-of-range span (never hit by construction "
+          "from a real splitByBlockAndGroup() result, but must not read out of bounds)") {
+    const std::vector<DrawPayload> payloads{DrawPayload{5, 0}};
+    const std::vector<DrawCommand> commands{DrawCommand{1, 1, 0, 0, 0}};
+
+    CHECK(materialIndexForSpan(commands, payloads, RecordSpan{0, 1, 0, 0}) == 0);   // commandCount == 0.
+    CHECK(materialIndexForSpan(commands, payloads, RecordSpan{0, 1, 5, 1}) == 0);   // commandOffset out of range.
 }

@@ -97,6 +97,7 @@
 #include <rx_task/scheduler.h>
 
 #include "draw_recording.h"
+#include "fly_camera.h"
 #include <reference_gate.h>
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
@@ -278,32 +279,13 @@ std::filesystem::path resolveSponzaScenePath() {
 // WASD (via `Window::isKeyDown`) + relative-mouse-mode look + gamepad
 // (left stick move, right stick look, triggers = speed multiplier) drive a
 // plain yaw/pitch `rx::scene::Camera`. Movement/look are both continuous,
-// framerate-scaled (`dt`).
-struct FlyCamera {
-    rx::scene::Camera camera;
-    float yawRadians = 0.0F;    // rotation around world +Y.
-    float pitchRadians = 0.0F;  // rotation around the camera's own local +X, clamped.
-
-    static constexpr float kMinPitch = glm::radians(-85.0F);
-    static constexpr float kMaxPitch = glm::radians(85.0F);
-    static constexpr float kMouseSensitivity = 0.0025F;
-    static constexpr float kGamepadLookSensitivity = 2.5F;   // radians/sec at full stick deflection.
-    static constexpr float kBaseMoveSpeed = 3.0F;            // world units/sec: overridden per scene by frameToScene().
-    static constexpr float kFastMoveMultiplier = 4.0F;       // held Shift / gamepad right trigger.
-
-    void syncOrientation() { camera.orientation = glm::angleAxis(yawRadians, glm::vec3(0, 1, 0)) *
-                                                    glm::angleAxis(pitchRadians, glm::vec3(1, 0, 0)); }
-
-    void applyLookDelta(float dxRadians, float dyRadians) {
-        yawRadians -= dxRadians;
-        pitchRadians = std::clamp(pitchRadians - dyRadians, kMinPitch, kMaxPitch);
-        syncOrientation();
-    }
-
-    void moveLocal(const glm::vec3& localDelta) {
-        camera.position += camera.right() * localDelta.x + camera.up() * localDelta.y + camera.forward() * localDelta.z;
-    }
-};
+// framerate-scaled (`dt`). The struct itself, and the axis->local-move-delta
+// mapping updateFlyCamera() below drives it with, now live in
+// fly_camera.h -- device-free, unit-tested directly
+// (tests/test_fly_camera.cpp), same "pull pure logic out of main.cpp into
+// its own header" precedent draw_recording.h already established in this
+// sample.
+using rx::samples9::FlyCamera;
 
 // --- Shared pass infra [tonemap pass -- shaders/multipass/tonemap.{vert,
 // frag}.slang, VERBATIM -- same convention samples/07_stress/08_gltf_viewer's
@@ -679,15 +661,6 @@ struct App {
     MaterialGpuBinding helmetMaterial;
     rx::asset::AABB helmetLocalBounds;
 
-    // pipelineToken (the SAME bit_cast<uint64_t>(VkPipeline) resolveDrawGroups()'s
-    // own resolvePipeline callback returns) -> the MaterialGpuBinding that
-    // produced it -- populated once, right after material setup, from a
-    // SECOND getPipeline() call per binding (always a D27 cache HIT, never
-    // a recompile) so the chunked forward-pass recorder can recover
-    // paramSet/push-constant-shape from a resolved group's own token alone
-    // (see recordForwardChunk() below).
-    std::unordered_map<uint64_t, const MaterialGpuBinding*> pipelineTokenToBinding;
-
     // [D5 caller-side accommodation] GeometryPool::bind() is main-thread-
     // only (every accessor in that class is, by the library's own uniform
     // D5 posture) -- but the chunked forward pass's own worker chunks
@@ -713,7 +686,7 @@ struct App {
     // blockBufferCache above (same rationale: MaterialSystem::
     // pipelineLayout() is now guarded main-thread-only -- docs/threading.md
     // -- so a worker chunk cannot call it directly). Set once, at setup,
-    // by buildPipelineTokenMap() -- every participating material shares
+    // by warmMaterialPipelines() -- every participating material shares
     // the identical pipeline-layout SHAPE (Vulkan spec 14.2.2
     // set-compatibility), so caching any one binding's layout here is
     // valid for the whole run, not just one frame.
@@ -722,9 +695,21 @@ struct App {
     // Mode-agnostic materialIndex -> real MaterialHandle resolver, bound
     // once at setup depending on which scene kind is active (grid/stress/
     // custom-import via --scene) -- lets updateSceneFrame()'s D27
-    // resolvePipeline lambda and buildPipelineTokenMap() stay identical
-    // across all three without a mode-specific branch each.
+    // resolvePipeline lambda stay identical across all three without a
+    // mode-specific branch each.
     std::function<rx::material::MaterialHandle(uint32_t)> resolveMaterialIndexToHandle;
+    // [Sponza texture-misassignment fix] Sibling of resolveMaterialIndexToHandle
+    // above, returning the material's OWN MaterialGpuBinding (paramSet/
+    // push-constant shape) directly, keyed by the SAME materialIndex --
+    // NOT by pipelineToken. See draw_recording.h's own materialIndexForSpan()
+    // header comment for why keying descriptor-set selection off
+    // pipelineToken is wrong in general: DISTINCT materials legitimately
+    // share one VkPipeline whenever their fixed-function state matches
+    // (Sponza: 22/25 materials), so a pipelineToken -> binding map can only
+    // ever remember ONE of them. recordForwardChunk() below resolves each
+    // RecordSpan's REAL materialIndex via materialIndexForSpan() and looks
+    // it up through this resolver instead.
+    std::function<const MaterialGpuBinding*(uint32_t)> resolveMaterialIndexToBinding;
     // --scene <path> (present-mode only, e.g. Sponza) -- a real imported
     // scene's own materials, keyed by asset::MaterialHandle::index() (the
     // SAME index space DrawPayload::materialIndex uses), mirroring
@@ -1326,6 +1311,7 @@ bool setupHelmetMaterial(App& app, const rx::asset::MaterialAsset& asset) {
     }
     app.helmetMaterial = std::move(binding);
     app.resolveMaterialIndexToHandle = [&app](uint32_t) { return app.helmetMaterial.handle; };  // DamagedHelmet: exactly 1 material.
+    app.resolveMaterialIndexToBinding = [&app](uint32_t) -> const MaterialGpuBinding* { return &app.helmetMaterial; };
     return true;
 }
 
@@ -1390,6 +1376,9 @@ bool setupStressMaterials(App& app) {
         app.stressMaterialBindings[i] = std::move(binding);
     }
     app.resolveMaterialIndexToHandle = [&app](uint32_t idx) { return app.stressMaterialBindings[idx % kStressVariantCount].handle; };
+    app.resolveMaterialIndexToBinding = [&app](uint32_t idx) -> const MaterialGpuBinding* {
+        return &app.stressMaterialBindings[idx % kStressVariantCount];
+    };
     return true;
 }
 
@@ -1486,6 +1475,11 @@ bool setupImportedMaterials(App& app, const rx::asset::Registry& registry, const
         auto it = app.customMaterialIndexToBinding.find(idx);
         return it != app.customMaterialIndexToBinding.end() ? app.customMaterialBindings[it->second].handle
                                                               : app.customMaterialBindings.front().handle;
+    };
+    app.resolveMaterialIndexToBinding = [&app](uint32_t idx) -> const MaterialGpuBinding* {
+        auto it = app.customMaterialIndexToBinding.find(idx);
+        return it != app.customMaterialIndexToBinding.end() ? &app.customMaterialBindings[it->second]
+                                                              : &app.customMaterialBindings.front();
     };
     return true;
 }
@@ -1782,16 +1776,24 @@ bool buildStressField(App& app, uint32_t drawCount) {
     return true;
 }
 
-// One (VkPipeline bit_cast token) -> (MaterialGpuBinding*) entry per
-// participating material -- see App::pipelineTokenToBinding's own comment.
-// `bindings` is whichever set is active this run (helmet: a 1-element
-// span; stress: 4; custom-import: N).
-void buildPipelineTokenMap(App& app, std::span<const MaterialGpuBinding> bindings) {
-    app.pipelineTokenToBinding.clear();
+// Pre-warms MaterialSystem's own pipeline cache for every participating
+// material (a D27 cache HIT at first real use in updateSceneFrame()'s own
+// resolvePipeline callback, never a mid-frame recompile) and caches the
+// shared pipeline-LAYOUT every one of them uses -- see
+// App::cachedAnyMaterialLayout's own comment. `bindings` is whichever set
+// is active this run (helmet: a 1-element span; stress: 4; custom-import:
+// N). [Sponza texture-misassignment fix] Deliberately does NOT build a
+// pipelineToken -> binding map anymore: distinct materials legitimately
+// SHARE one VkPipeline whenever their fixed-function state matches (D28;
+// Sponza: 22/25 materials), so such a map can only ever remember one
+// binding per shared token -- see draw_recording.h's own
+// materialIndexForSpan() header comment. Descriptor-set selection at
+// record time now goes through App::resolveMaterialIndexToBinding instead,
+// keyed by the REAL per-span materialIndex.
+void warmMaterialPipelines(App& app, std::span<const MaterialGpuBinding> bindings) {
     const rx::material::PassSignature sig = forwardPassSignature();
     for (const MaterialGpuBinding& binding : bindings) {
-        VkPipeline pipeline = app.materialSystem->getPipeline({binding.handle, sig, 0});
-        app.pipelineTokenToBinding[std::bit_cast<uint64_t>(pipeline)] = &binding;
+        app.materialSystem->getPipeline({binding.handle, sig, 0});
     }
     // [Phase 4 exit fix wave, I3] Hoisted here, main-thread-only, setup-time
     // (this function is never called mid-frame) -- NOT recomputed inside
@@ -1984,9 +1986,9 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
     }
 
     // [D27] Main-thread pre-resolution -- once per frame, before any chunk
-    // fan-out. `resolvePipeline` returns the SAME bit_cast token
-    // buildPipelineTokenMap() populated at setup (a cache HIT every time,
-    // by construction).
+    // fan-out. `resolvePipeline` returns a `getPipeline()` cache HIT every
+    // time, by construction (warmMaterialPipelines() pre-warmed every
+    // participating material's pipeline at setup).
     const rx::material::PassSignature passSig = forwardPassSignature();
     const uint64_t passSigHash = passSig.hash();
     app.resolvedGroups = rx::scene::resolveDrawGroups(
@@ -2113,12 +2115,12 @@ void recordForwardChunk(rx::graph::PassContext& ctx, App& app, uint32_t chunkInd
         return;
     }
 
-    if (app.pipelineTokenToBinding.empty()) {
+    if (!app.resolveMaterialIndexToBinding) {
         return;
     }
     VkDescriptorSet set = app.bindless->descriptorSet();
     // [Phase 4 exit fix wave, I3] Main-thread-cached at setup
-    // (buildPipelineTokenMap()) -- NOT resolved here anymore.
+    // (warmMaterialPipelines()) -- NOT resolved here anymore.
     // MaterialSystem::pipelineLayout() is guarded main-thread-only
     // (docs/threading.md); calling it from this worker chunk (chunkIndex
     // can be >= 1) was the exact violation class Task 24 already fixed for
@@ -2140,9 +2142,26 @@ void recordForwardChunk(rx::graph::PassContext& ctx, App& app, uint32_t chunkInd
     // contract always holds.
     const auto spans = rx::samples9::splitByBlockAndGroup(app.resolvedGroups, app.viewLists.blocks, begin, end - begin);
 
+    // [Sponza texture-misassignment fix] `span.pipelineToken` and the span's
+    // REAL materialIndex are tracked and re-bound INDEPENDENTLY on purpose:
+    // rebinding the VkPipeline only when the token actually changes is
+    // still a valid, cheap state-sort optimization (many spans genuinely do
+    // share one pipeline back-to-back), but the material-params descriptor
+    // set (textures) MUST be re-selected every time the real materialIndex
+    // changes, even across two spans that happen to share one pipelineToken
+    // -- see draw_recording.h's own materialIndexForSpan() header comment
+    // for why those two are NOT the same condition in general (D28
+    // fixed-function-state collapse: Sponza's own glTF has 22/25 materials
+    // sharing one VkPipeline). Binding set 1 off `pipelineTokenToBinding`
+    // (the historical bug) silently rendered every one of those 22
+    // materials' geometry with whichever ONE of them happened to be
+    // registered last -- e.g. a roof/parapet material's textures appearing
+    // on column shafts and arches, reproducible on any driver.
     uint32_t lastBlock = UINT32_MAX;
     uint64_t lastToken = 0;
     bool havePipeline = false;
+    uint32_t lastMaterialIndex = UINT32_MAX;
+    bool haveMaterial = false;
     for (const rx::samples9::RecordSpan& span : spans) {
         if (span.blockId != lastBlock) {
             // NOT GeometryPool::bind() -- main-thread-only, unsafe from a
@@ -2161,19 +2180,24 @@ void recordForwardChunk(rx::graph::PassContext& ctx, App& app, uint32_t chunkInd
         if (!havePipeline || span.pipelineToken != lastToken) {
             VkPipeline pipeline = std::bit_cast<VkPipeline>(span.pipelineToken);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-            auto it = app.pipelineTokenToBinding.find(span.pipelineToken);
-            if (it != app.pipelineTokenToBinding.end()) {
-                const MaterialGpuBinding& mb = *it->second;
+            lastToken = span.pipelineToken;
+            havePipeline = true;
+        }
+        const uint32_t materialIndex =
+            rx::samples9::materialIndexForSpan(app.viewLists.commands, app.viewLists.payloads, span);
+        if (!haveMaterial || materialIndex != lastMaterialIndex) {
+            const MaterialGpuBinding* mb = app.resolveMaterialIndexToBinding(materialIndex);
+            if (mb != nullptr) {
                 // [Phase 4 exit fix wave, I1] `app.currentFrameSlot`-th
                 // buffer -- see that field's own comment.
                 rx::material::MaterialGlobalsPush push{app.defaultSamplerHandle.index(),
                                                          app.drawDataBufferHandles[app.currentFrameSlot].index(), 0.0F};
-                vkCmdPushConstants(cmd, anyLayout, mb.pushStages, mb.pushOffset, mb.pushSize, &push);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, anyLayout, /*firstSet=*/1, 1, &mb.paramSet, 0,
+                vkCmdPushConstants(cmd, anyLayout, mb->pushStages, mb->pushOffset, mb->pushSize, &push);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, anyLayout, /*firstSet=*/1, 1, &mb->paramSet, 0,
                                          nullptr);
             }
-            lastToken = span.pipelineToken;
-            havePipeline = true;
+            lastMaterialIndex = materialIndex;
+            haveMaterial = true;
         }
         for (uint32_t i = span.commandOffset; i < span.commandOffset + span.commandCount; ++i) {
             const rx::scene::DrawCommand& c = app.viewLists.commands[i];
@@ -2411,7 +2435,7 @@ void updateFlyCamera(App& app, rx::platform::Window& window, float dt) {
     }
 
     const float speed = app.moveSpeed * (fast || (pad.connected && pad.rightTrigger > 0.5F) ? FlyCamera::kFastMoveMultiplier : 1.0F);
-    const glm::vec3 localDelta(strafe, vertical, -forward);  // forward() is -Z in this camera's own convention.
+    const glm::vec3 localDelta = rx::samples9::flyCameraLocalMoveDelta(forward, strafe, vertical);
     if (glm::length(localDelta) > 0.0001F) {
         app.flyCamera.moveLocal(glm::normalize(localDelta) * speed * dt);
     }
@@ -2517,7 +2541,7 @@ int runHeadless(const Args& args) {
             destroyApp(*app);
             return 1;
         }
-        buildPipelineTokenMap(*app, app->stressMaterialBindings);
+        warmMaterialPipelines(*app, app->stressMaterialBindings);
         app->shadowEnabled = false;
         expectedTotalCandidates = args.stressDraws;
         expectedCulled = 0;
@@ -2557,7 +2581,7 @@ int runHeadless(const Args& args) {
             destroyApp(*app);
             return 1;
         }
-        buildPipelineTokenMap(*app, std::span<const MaterialGpuBinding>(&app->helmetMaterial, 1));
+        warmMaterialPipelines(*app, std::span<const MaterialGpuBinding>(&app->helmetMaterial, 1));
         if (!setupShadow(*app)) {
             destroyApp(*app);
             return 1;
@@ -2999,7 +3023,7 @@ int runPresent(const Args& args) {
             destroyApp(*app);
             return 1;
         }
-        buildPipelineTokenMap(*app, app->stressMaterialBindings);
+        warmMaterialPipelines(*app, app->stressMaterialBindings);
         app->shadowEnabled = false;
     } else if (!args.scenePath.empty()) {
         const std::filesystem::path scenePath =
@@ -3038,7 +3062,7 @@ int runPresent(const Args& args) {
             destroyApp(*app);
             return 1;
         }
-        buildPipelineTokenMap(*app, app->customMaterialBindings);
+        warmMaterialPipelines(*app, app->customMaterialBindings);
         if (!setupShadow(*app)) {
             frameSync.reset();
             destroyApp(*app);
@@ -3075,7 +3099,7 @@ int runPresent(const Args& args) {
             destroyApp(*app);
             return 1;
         }
-        buildPipelineTokenMap(*app, std::span<const MaterialGpuBinding>(&app->helmetMaterial, 1));
+        warmMaterialPipelines(*app, std::span<const MaterialGpuBinding>(&app->helmetMaterial, 1));
         if (!setupShadow(*app)) {
             frameSync.reset();
             destroyApp(*app);

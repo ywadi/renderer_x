@@ -48,4 +48,23 @@ std::vector<RecordSpan> splitByBlockAndGroup(std::span<const rx::scene::Resolved
     return out;
 }
 
+uint32_t materialIndexForSpan(std::span<const rx::scene::DrawCommand> commands,
+                               std::span<const rx::scene::DrawPayload> payloads, const RecordSpan& span) {
+    // Both branches below are defensive only -- see this function's own
+    // header comment for why `span.commandCount > 0` and
+    // `firstInstance < payloads.size()` hold by construction for every
+    // `RecordSpan` this file's own `splitByBlockAndGroup()` produces from a
+    // real `ViewLists`. Falling back to materialIndex 0 rather than
+    // indexing out of bounds keeps this a safe, if degraded, no-op instead
+    // of UB if a future caller ever violates that contract.
+    if (span.commandCount == 0 || span.commandOffset >= commands.size()) {
+        return 0;
+    }
+    const rx::scene::DrawCommand& firstCommand = commands[span.commandOffset];
+    if (firstCommand.firstInstance >= payloads.size()) {
+        return 0;
+    }
+    return payloads[firstCommand.firstInstance].materialIndex;
+}
+
 }  // namespace rx::samples9
