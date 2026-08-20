@@ -1,11 +1,19 @@
 #include <rx_rhi_vk/frame_sync.h>
 #include <rx_rhi_vk/buffer.h>
+#include <rx_core/debug_checks.h>
 #include <rx_core/log.h>
 #include <utility>
 
 namespace rx::rhi {
 
 void FrameSync::advanceFrame(Allocator* allocatorForBudgetRefresh) {
+    // [Phase 4 exit fix wave, I2; Stage-0 audit F5-remainder,
+    // stage0-audit.md:136/390] Mutates currentFrame_/frameNumber_ with no
+    // internal synchronization -- documented main-thread-only by this
+    // class's own header comment (frame_sync.h) but previously unenforced.
+    // Matches every other main-thread-only GPU-object-adjacent mutator's
+    // guard convention (docs/threading.md).
+    RX_ASSERT_MAIN_THREAD("FrameSync::advanceFrame");
     currentFrame_ = (currentFrame_ + 1) % kFramesInFlight;
     ++frameNumber_;
     if (allocatorForBudgetRefresh != nullptr) {
@@ -18,6 +26,12 @@ void FrameSync::advanceFrame(Allocator* allocatorForBudgetRefresh) {
 }
 
 std::optional<FrameSync> FrameSync::create(VkDevice device, uint32_t queueFamily, uint32_t swapchainImageCount) {
+    // [Phase 4 exit fix wave, I2] Same guard as advanceFrame()/
+    // onSwapchainRecreated() below -- see this class's own header comment
+    // (frame_sync.h) for the full "create()/advanceFrame()/
+    // onSwapchainRecreated() are main-thread-only" contract this closes
+    // the enforcement gap for.
+    RX_ASSERT_MAIN_THREAD("FrameSync::create");
     FrameSync sync;
     sync.device_ = device;
 
@@ -99,6 +113,9 @@ void FrameSync::destroyRenderFinishedSemaphores() {
 }
 
 bool FrameSync::onSwapchainRecreated(uint32_t newImageCount) {
+    // [Phase 4 exit fix wave, I2] Same guard as create()/advanceFrame()
+    // above.
+    RX_ASSERT_MAIN_THREAD("FrameSync::onSwapchainRecreated");
     // Caller contract: device must already be idle (see the class-level
     // comment in frame_sync.h) -- destroying these semaphores here assumes
     // nothing on the GPU is still signaling or waiting on any of them.

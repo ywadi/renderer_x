@@ -70,9 +70,12 @@ class Allocator;
 // via vkDeviceWaitIdle immediately before Device::recreateSwapchain()).
 //
 // Thread-affinity (D5, Phase 4): create()/advanceFrame()/onSwapchainRecreated()
-// are main-thread-only -- this class owns the present loop's own
-// per-frame-in-flight state, the same convention every existing caller
-// (every sample's frame loop) already follows. advanceFrame()'s optional
+// are main-thread-only, [guarded] (RX_ASSERT_MAIN_THREAD -- [Phase 4 exit
+// fix wave, I2; Stage-0 audit F5-remainder, stage0-audit.md:136/390], closing
+// the "documented by comment only" gap that finding named) -- this class owns
+// the present loop's own per-frame-in-flight state, the same convention
+// every existing caller (every sample's frame loop) already follows.
+// advanceFrame()'s optional
 // `allocatorForBudgetRefresh` argument [Phase 4 Task 10] calls into
 // Allocator::setCurrentFrameIndex(), itself main-thread-only for the same
 // reason -- see docs/threading.md. Every current*()/frameNumber() accessor

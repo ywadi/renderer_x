@@ -2,6 +2,7 @@
 
 #include "transient_pool.h"
 
+#include <rx_core/debug_checks.h>
 #include <rx_core/log.h>
 #include <rx_core/profile.h>
 #include <rx_rhi_vk/command.h>
@@ -1044,6 +1045,15 @@ Executor::~Executor() {
 }
 
 void Executor::realize(const RenderGraph& graph) {
+    // [Phase 4 exit fix wave, I2; Stage-0 audit F5-remainder,
+    // stage0-audit.md:136/390] realize() rebuilds this Executor's
+    // TransientPool bindings in place with no internal synchronization --
+    // a call from any thread other than the one that owns this Executor's
+    // Scheduler (Executor::create()'s own doc comment) corrupts that state
+    // silently instead of failing loudly. Matches every other main-thread-
+    // only GPU-object-mutation entry point's guard convention
+    // (docs/threading.md).
+    RX_ASSERT_MAIN_THREAD("Executor::realize");
     Impl& impl = *impl_;
     const CompiledGraph& compiled = graph.compiled();
     const std::span<const PhysicalResource> resources = compiled.resources();
@@ -1148,6 +1158,14 @@ void Executor::execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage ba
     // execute (whole)"] -- spans this entire call, i.e. every pass this
     // frame, on top of the per-pass zones declared inside the loop below.
     RX_ZONE;
+    // [Phase 4 exit fix wave, I2; Stage-0 audit F5-remainder,
+    // stage0-audit.md:136/390] Chunk pool resets, secondary-buffer reuse,
+    // and DeletionQueue pacing (F10's own "caller-discipline, unenforced"
+    // note) all assume this call happens on the Scheduler's own main
+    // thread, exactly once per real fence-bounded frame -- see this
+    // method's own header comment in executor.h. A call from the wrong
+    // thread must fail loudly, not corrupt shared executor state silently.
+    RX_ASSERT_MAIN_THREAD("Executor::execute");
     Impl& impl = *impl_;
     const CompiledGraph& compiled = graph.compiled();
     const std::span<const PhysicalResource> resources = compiled.resources();

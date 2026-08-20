@@ -1,10 +1,15 @@
 #include <doctest/doctest.h>
+#include <rx_core/debug_checks.h>
 #include <rx_rhi_vk/command.h>
 #include <rx_rhi_vk/device.h>
 #include <rx_rhi_vk/frame_sync.h>
 #include <rx_platform/window.h>
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <optional>
+#include <string>
+#include <thread>
 #include <utility>
 
 namespace {
@@ -211,3 +216,119 @@ TEST_CASE("FrameSync::frameNumber() advances monotonically with advanceFrame(), 
     REQUIRE(vkDeviceWaitIdle(vkDevice) == VK_SUCCESS);
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
+
+// [Phase 4 exit fix wave, I2; Stage-0 audit F5-remainder, stage0-audit.md:
+// 136/390] Proves create()/advanceFrame()/onSwapchainRecreated()'s new
+// RX_ASSERT_MAIN_THREAD guards are genuinely wired in, not merely
+// documented -- mirrors rx_asset/tests/thread_guard_test.cpp's own "a
+// plain std::thread stands in for a chunk >= 1 worker" pattern (legitimate
+// here for the identical reason that file documents: FrameSync has no
+// rx::task::Scheduler-driven caller in this phase at all, so this tests
+// the thread-identity comparison the guard performs, not any real
+// scheduler integration). Every worker thread below is joined before the
+// next guarded call starts, so there is never more than one thread
+// touching this FrameSync's state at a time -- the precondition
+// rx::core::debug::detail::ViolationHook's own contract comment requires
+// of a test-installed hook that records and returns rather than aborting.
+#ifdef RX_DEBUG_CHECKS
+
+namespace {
+
+struct FrameSyncViolationCapture {
+    std::mutex mutex;
+    int callCount = 0;
+    std::string lastContext;
+};
+
+std::atomic<FrameSyncViolationCapture*> g_frameSyncCapture{nullptr};
+
+void captureFrameSyncViolation(const char* context) {
+    FrameSyncViolationCapture* capture = g_frameSyncCapture.load(std::memory_order_relaxed);
+    if (capture == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(capture->mutex);
+    capture->callCount++;
+    capture->lastContext = context != nullptr ? context : "";
+}
+
+struct FrameSyncViolationHookGuard {
+    ~FrameSyncViolationHookGuard() {
+        g_frameSyncCapture.store(nullptr, std::memory_order_relaxed);
+        rx::core::debug::detail::setViolationHookForTests(nullptr);
+    }
+};
+
+}  // namespace
+
+TEST_CASE("FrameSync::create/advanceFrame/onSwapchainRecreated trip RX_ASSERT_MAIN_THREAD when called from a "
+          "worker thread") {
+    auto fixture = makeFixture("rx_rhi_vk_frame_sync_test_guard");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto device = rx::rhi::Device::create(fixture->context, fixture->surface);
+    REQUIRE(device.has_value());
+    const VkDevice vkDevice = device->device();
+    const uint32_t queueFamily = device->graphicsQueueFamily();
+    const uint32_t imageCount = static_cast<uint32_t>(device->swapchainImages().size());
+
+    FrameSyncViolationCapture capture;
+    g_frameSyncCapture.store(&capture, std::memory_order_relaxed);
+    rx::core::debug::detail::setViolationHookForTests(&captureFrameSyncViolation);
+    FrameSyncViolationHookGuard guard;
+
+    std::optional<rx::rhi::FrameSync> frameSync;
+    std::thread createThread([&] { frameSync = rx::rhi::FrameSync::create(vkDevice, queueFamily, imageCount); });
+    createThread.join();
+    REQUIRE(frameSync.has_value());  // the hook records-and-returns -- create() still ran to completion.
+
+    std::thread advanceThread([&] { frameSync->advanceFrame(); });
+    advanceThread.join();
+
+    std::thread recreateThread([&] { (void)frameSync->onSwapchainRecreated(imageCount); });
+    recreateThread.join();
+
+    {
+        std::lock_guard<std::mutex> lock(capture.mutex);
+        CHECK(capture.callCount == 3);
+        CHECK(capture.lastContext == "FrameSync::onSwapchainRecreated");
+    }
+
+    REQUIRE(vkDeviceWaitIdle(vkDevice) == VK_SUCCESS);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("FrameSync::create/advanceFrame/onSwapchainRecreated do NOT trip the guard for calls genuinely on the "
+          "main thread") {
+    auto fixture = makeFixture("rx_rhi_vk_frame_sync_test_guard_legal");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto device = rx::rhi::Device::create(fixture->context, fixture->surface);
+    REQUIRE(device.has_value());
+    const VkDevice vkDevice = device->device();
+
+    FrameSyncViolationCapture capture;
+    g_frameSyncCapture.store(&capture, std::memory_order_relaxed);
+    rx::core::debug::detail::setViolationHookForTests(&captureFrameSyncViolation);
+    FrameSyncViolationHookGuard guard;
+
+    auto frameSync = rx::rhi::FrameSync::create(vkDevice, device->graphicsQueueFamily(),
+                                                  static_cast<uint32_t>(device->swapchainImages().size()));
+    REQUIRE(frameSync.has_value());
+    frameSync->advanceFrame();
+    REQUIRE(frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())));
+
+    {
+        std::lock_guard<std::mutex> lock(capture.mutex);
+        CHECK(capture.callCount == 0);
+    }
+
+    REQUIRE(vkDeviceWaitIdle(vkDevice) == VK_SUCCESS);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+#endif  // RX_DEBUG_CHECKS

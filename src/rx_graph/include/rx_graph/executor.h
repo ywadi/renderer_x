@@ -400,6 +400,8 @@ public:
     // rebuilt from scratch against the new shapes. Must be called at
     // least once, after `graph`'s first compile(), before the first
     // execute() call against it.
+    // Thread-affinity (D5, Phase 4): main-thread-only, [guarded] -- see
+    // docs/threading.md.
     void realize(const RenderGraph& graph);
 
     // Records one frame's worth of work for `graph` onto `cmd` (an
@@ -448,6 +450,8 @@ public:
     // conservative than the bound requires) -- but nothing here asserts it,
     // so a future caller driving two graphs per real frame would reset
     // pools the GPU could still be reading.
+    // Thread-affinity (D5, Phase 4): main-thread-only, [guarded] -- see
+    // docs/threading.md.
     void execute(const RenderGraph& graph, VkCommandBuffer cmd, VkImage backbufferImage, VkImageView backbufferView,
                  VkExtent2D backbufferExtent);
 

@@ -27,6 +27,7 @@
 #include <rx_graph/executor.h>
 #include <rx_graph/render_graph.h>
 
+#include <rx_core/debug_checks.h>
 #include <rx_platform/window.h>
 #include <rx_rhi_vk/bindless.h>
 #include <rx_rhi_vk/buffer.h>
@@ -44,9 +45,11 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -2370,3 +2373,151 @@ TEST_CASE("Executor::execute performs zero heap allocations in steady state -- e
 
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
+
+// [Phase 4 exit fix wave, I2; Stage-0 audit F5-remainder, stage0-audit.md:
+// 136/390] Proves Executor::realize()/execute()'s new RX_ASSERT_MAIN_THREAD
+// guards are genuinely wired in, not merely documented -- mirrors
+// rx_asset/tests/thread_guard_test.cpp's own "a plain std::thread stands in
+// for a chunk >= 1 worker" pattern (legitimate here for the identical
+// reason that file documents: this tests the thread-identity comparison
+// the guard performs, not any real rx::task::Scheduler integration -- the
+// violating calls below are made directly, never through a chunked pass'
+// own worker fan-out). Each worker thread is joined before the next
+// guarded call starts, so there is never more than one thread touching
+// this Executor's state at a time -- the precondition
+// rx::core::debug::detail::ViolationHook's own contract comment requires
+// of a test-installed hook that records and returns rather than aborting.
+// Graph: a single pass with NO execute() callback at all -- Executor::
+// execute()'s own automatic backbuffer clear is enough to prove both
+// entry points ran to completion past the (non-aborting, test-hooked)
+// guard, with no shader/pipeline machinery needed.
+#ifdef RX_DEBUG_CHECKS
+
+namespace {
+
+struct ExecutorViolationCapture {
+    std::mutex mutex;
+    int callCount = 0;
+    std::string lastContext;
+};
+
+std::atomic<ExecutorViolationCapture*> g_executorCapture{nullptr};
+
+void captureExecutorViolation(const char* context) {
+    ExecutorViolationCapture* capture = g_executorCapture.load(std::memory_order_relaxed);
+    if (capture == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(capture->mutex);
+    capture->callCount++;
+    capture->lastContext = context != nullptr ? context : "";
+}
+
+struct ExecutorViolationHookGuard {
+    ~ExecutorViolationHookGuard() {
+        g_executorCapture.store(nullptr, std::memory_order_relaxed);
+        rx::core::debug::detail::setViolationHookForTests(nullptr);
+    }
+};
+
+}  // namespace
+
+TEST_CASE("Executor::realize/execute trip RX_ASSERT_MAIN_THREAD when called from a worker thread") {
+    auto fixture = makeFixture("rx_graph_gpu_executor_guard");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    const VkDevice device = fixture->device.device();
+    const VkPhysicalDevice physicalDevice = fixture->device.physicalDevice();
+
+    RenderGraph graph;
+    graph.addPass("clear").addColorOutput("bb", absoluteColorDesc(kExtent, kExtent));
+    graph.setBackbufferSource("bb");
+
+    CompileInfo info;
+    info.swapchainWidth = kExtent;
+    info.swapchainHeight = kExtent;
+    info.swapchainFormat = kFormat;
+    info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    graph.compile(info);
+
+    auto offscreen = createOffscreenImage(device, physicalDevice, kFormat, VkExtent2D{kExtent, kExtent});
+    REQUIRE(offscreen.has_value());
+    auto cmdCtx =
+        rx::rhi::CommandContext::create(device, fixture->device.graphicsQueue(), fixture->device.graphicsQueueFamily());
+    REQUIRE(cmdCtx.has_value());
+
+    ExecutorViolationCapture capture;
+    g_executorCapture.store(&capture, std::memory_order_relaxed);
+    rx::core::debug::detail::setViolationHookForTests(&captureExecutorViolation);
+    ExecutorViolationHookGuard guard;
+
+    std::thread realizeThread([&] { fixture->executor->realize(graph); });
+    realizeThread.join();
+
+    std::thread executeThread([&] {
+        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+            fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
+        });
+    });
+    executeThread.join();
+
+    {
+        std::lock_guard<std::mutex> lock(capture.mutex);
+        CHECK(capture.callCount == 2);
+        CHECK(capture.lastContext == "Executor::execute");
+    }
+
+    vkDeviceWaitIdle(device);
+    destroyOffscreenImage(device, *offscreen);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("Executor::realize/execute do NOT trip the guard for calls genuinely on the main thread") {
+    auto fixture = makeFixture("rx_graph_gpu_executor_guard_legal");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    const VkDevice device = fixture->device.device();
+    const VkPhysicalDevice physicalDevice = fixture->device.physicalDevice();
+
+    RenderGraph graph;
+    graph.addPass("clear").addColorOutput("bb", absoluteColorDesc(kExtent, kExtent));
+    graph.setBackbufferSource("bb");
+
+    CompileInfo info;
+    info.swapchainWidth = kExtent;
+    info.swapchainHeight = kExtent;
+    info.swapchainFormat = kFormat;
+    info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    graph.compile(info);
+
+    auto offscreen = createOffscreenImage(device, physicalDevice, kFormat, VkExtent2D{kExtent, kExtent});
+    REQUIRE(offscreen.has_value());
+    auto cmdCtx =
+        rx::rhi::CommandContext::create(device, fixture->device.graphicsQueue(), fixture->device.graphicsQueueFamily());
+    REQUIRE(cmdCtx.has_value());
+
+    ExecutorViolationCapture capture;
+    g_executorCapture.store(&capture, std::memory_order_relaxed);
+    rx::core::debug::detail::setViolationHookForTests(&captureExecutorViolation);
+    ExecutorViolationHookGuard guard;
+
+    fixture->executor->realize(graph);
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        fixture->executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
+    });
+
+    {
+        std::lock_guard<std::mutex> lock(capture.mutex);
+        CHECK(capture.callCount == 0);
+    }
+
+    vkDeviceWaitIdle(device);
+    destroyOffscreenImage(device, *offscreen);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+#endif  // RX_DEBUG_CHECKS
