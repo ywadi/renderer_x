@@ -46,6 +46,11 @@ add_library(rx_asset STATIC
     # DeletionQueue/sampler cache, D5 main-thread-only).
     texture_decode.cpp
     texture_cache.cpp
+    # [texture-path round, D10 Option A] stb_image_resize2's own single
+    # implementation TU -- see stb_image_resize_impl.cpp's own comment for
+    # why this lives in rx_asset (the actual runtime-mip-generation
+    # consumer) rather than rx_rhi_vk's existing stb_impl.cpp.
+    stb_image_resize_impl.cpp
     # MikkTSpace [G2]: no CMakeLists.txt upstream (two loose files,
     # "designed to be stand-alone... copied and used as is" per its own
     # header comment) -- compiled straight into rx_asset, matching this

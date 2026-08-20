@@ -1,8 +1,10 @@
 #include <rx_asset/texture_decode.h>
 #include <rx_core/log.h>
 #include <stb_image.h>
+#include <stb_image_resize2.h>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <utility>
 
@@ -345,6 +347,147 @@ VkFormat stbRgba8Format(TextureRole role) {
 }
 
 // ---------------------------------------------------------------------
+// [texture-path round, D10 Option A] Runtime mip-chain generation for the
+// stb decode path -- see this function's own declaration (texture_decode.h)
+// for the full per-role correctness contract this implements.
+// ---------------------------------------------------------------------
+
+namespace {
+
+// Standard floor-halving step: max(1, extent >> 1) -- the same formula
+// Vulkan's own mip-dimension rule uses, and DecodedKtx2Texture::levels()'s
+// own `levelWidth`/`levelHeight` computation (texture_decode.cpp, above)
+// already relies on for the KTX2 side of this codebase.
+uint32_t nextMipExtent(uint32_t extent) { return std::max<uint32_t>(1U, extent >> 1); }
+
+// Decodes one UNORM byte channel to a signed unit-range float
+// (tangent-space normal-map convention: byte 0 -> -1.0, byte 255 -> +1.0).
+float decodeSignedUnorm(uint8_t byteValue) { return (static_cast<float>(byteValue) / 255.0F) * 2.0F - 1.0F; }
+
+// Inverse of decodeSignedUnorm(), rounding to nearest and clamping (a
+// renormalized vector's components can transiently exceed [-1,1] by a
+// hair from float rounding).
+uint8_t encodeSignedUnorm(float value) {
+    float scaled = (value * 0.5F + 0.5F) * 255.0F;
+    scaled = std::clamp(scaled, 0.0F, 255.0F);
+    return static_cast<uint8_t>(std::lround(scaled));
+}
+
+// [Normal-map mip correctness, texture-path round item 2] Renormalizes
+// every RGB-encoded tangent-space texel in `rgba8` (tightly packed, 4
+// bytes/texel) to unit length in place -- undoes the "flattening" a plain
+// per-channel box average produces (see generateStbMipChain()'s own
+// header comment for why this is needed at all). Alpha (byte index 3 of
+// every texel) is left exactly as the box-average resize already wrote it
+// -- normal maps carry no meaningful alpha channel for this path to
+// reinterpret.
+void renormalizeNormalTexelsInPlace(std::vector<uint8_t>& rgba8) {
+    for (size_t i = 0; i + 3 < rgba8.size(); i += 4) {
+        float x = decodeSignedUnorm(rgba8[i + 0]);
+        float y = decodeSignedUnorm(rgba8[i + 1]);
+        float z = decodeSignedUnorm(rgba8[i + 2]);
+        float lengthSquared = x * x + y * y + z * z;
+        if (lengthSquared > 1e-12F) {
+            float invLength = 1.0F / std::sqrt(lengthSquared);
+            x *= invLength;
+            y *= invLength;
+            z *= invLength;
+        } else {
+            // Degenerate: the averaged vector canceled to (near-)zero
+            // length (e.g. two exactly opposite input normals) -- fall
+            // back to tangent-space "straight up" rather than propagate a
+            // zero/NaN-length normal downstream; the same (0,0,1)
+            // convention D11's own flat-normal fallback texture already
+            // uses (texture_cache.cpp's buildFallbackTextures()).
+            x = 0.0F;
+            y = 0.0F;
+            z = 1.0F;
+        }
+        rgba8[i + 0] = encodeSignedUnorm(x);
+        rgba8[i + 1] = encodeSignedUnorm(y);
+        rgba8[i + 2] = encodeSignedUnorm(z);
+    }
+}
+
+}  // namespace
+
+std::vector<DecodedTextureLevel> generateStbMipChain(std::span<const uint8_t> mip0Rgba8, uint32_t width,
+                                                       uint32_t height, TextureRole role) {
+    std::vector<DecodedTextureLevel> result;
+    if (width == 0 || height == 0 ||
+        mip0Rgba8.size() < static_cast<size_t>(width) * static_cast<size_t>(height) * 4U) {
+        return result;  // malformed/degenerate input -- never fabricate levels from too little data
+    }
+
+    const bool isSrgb = roleExpectsSrgb(role);
+    const bool isNormal = role == TextureRole::Normal;
+
+    std::vector<uint8_t> prevLevel(mip0Rgba8.begin(), mip0Rgba8.end());
+    uint32_t prevWidth = width;
+    uint32_t prevHeight = height;
+
+    while (prevWidth > 1 || prevHeight > 1) {
+        uint32_t nextWidth = nextMipExtent(prevWidth);
+        uint32_t nextHeight = nextMipExtent(prevHeight);
+        std::vector<uint8_t> nextLevel(static_cast<size_t>(nextWidth) * static_cast<size_t>(nextHeight) * 4U);
+
+        // Library-first [this task's own "no reinvented wheels" rule]:
+        // stb_image_resize2 (already vendored -- same `stb` repo FetchContent
+        // as stb_image.h itself, see stb_image_resize_impl.cpp's own
+        // comment) expresses exactly the two box-average kernels this
+        // needs directly:
+        //   - STBIR_TYPE_UINT8_SRGB: decode sRGB->linear, filter, re-encode
+        //     sRGB -- the library's OWN documented sRGB-aware resize mode,
+        //     never a hand-rolled gamma-curve loop. STBIR_RGBA (not the
+        //     "_PM"/"NO_AW" layout) applies the library's alpha-weighted
+        //     RGB blend, matching glTF's own baseColor-alpha-is-linear-
+        //     coverage convention (this function's own header comment).
+        //   - STBIR_TYPE_UINT8 + STBIR_4CHANNEL: plain per-channel linear
+        //     box average, deliberately with NO alpha weighting at all
+        //     (STBIR_4CHANNEL, not STBIR_RGBA) -- correct for both the
+        //     Normal role (channel 3 is not real alpha) and the plain
+        //     linear-data roles (MetallicRoughness/Occlusion/GenericData).
+        // STBIR_FILTER_BOX explicitly (not STBIR_FILTER_DEFAULT): "same
+        // result as box for integer scale ratios" per the library's own
+        // enum comment -- the exact, unambiguous arithmetic-mean semantics
+        // this task's own correctness tests assert against for every
+        // power-of-two halving step.
+        void* resizeResult =
+            isSrgb ? stbir_resize(prevLevel.data(), static_cast<int>(prevWidth), static_cast<int>(prevHeight), 0,
+                                   nextLevel.data(), static_cast<int>(nextWidth), static_cast<int>(nextHeight), 0,
+                                   STBIR_RGBA, STBIR_TYPE_UINT8_SRGB, STBIR_EDGE_CLAMP, STBIR_FILTER_BOX)
+                    : stbir_resize(prevLevel.data(), static_cast<int>(prevWidth), static_cast<int>(prevHeight), 0,
+                                   nextLevel.data(), static_cast<int>(nextWidth), static_cast<int>(nextHeight), 0,
+                                   STBIR_4CHANNEL, STBIR_TYPE_UINT8, STBIR_EDGE_CLAMP, STBIR_FILTER_BOX);
+        if (resizeResult == nullptr) {
+            RX_LOG_ERROR(
+                "rx_asset: generateStbMipChain: stbir_resize failed building level {} ({}x{} -> {}x{}, role={}) -- "
+                "chain truncated",
+                result.size() + 1, prevWidth, prevHeight, nextWidth, nextHeight, textureRoleName(role));
+            break;
+        }
+
+        if (isNormal) {
+            renormalizeNormalTexelsInPlace(nextLevel);
+        }
+
+        DecodedTextureLevel level;
+        level.level = static_cast<uint32_t>(result.size() + 1);
+        level.width = nextWidth;
+        level.height = nextHeight;
+        level.bytes.resize(nextLevel.size());
+        std::memcpy(level.bytes.data(), nextLevel.data(), nextLevel.size());
+        result.push_back(std::move(level));
+
+        prevLevel = std::move(nextLevel);
+        prevWidth = nextWidth;
+        prevHeight = nextHeight;
+    }
+
+    return result;
+}
+
+// ---------------------------------------------------------------------
 // [Phase 4 Stage 1 Task 15] decodeTextureForUpload()
 // ---------------------------------------------------------------------
 
@@ -455,8 +598,9 @@ TextureDecodeResult decodeStbForUpload(std::span<const std::byte> bytes, Texture
 
     result.warnings.push_back(
         {"stb-recommend-ktx2",
-         "loaded via stb (PNG/JPG) -- recommend converting to KTX2 for GPU block-compressed upload + a full mip "
-         "chain (D10); this path uploads mip 0 ONLY (recorded limitation)"});
+         "loaded via stb (PNG/JPG) -- recommend converting to KTX2 for GPU block-compressed upload (D10); this "
+         "path now generates its own runtime box-filtered mip chain (texture-path round, D10 Option A) but still "
+         "uploads uncompressed RGBA8 bytes, unlike a pre-authored KTX2's block-compressed levels"});
     if (decoded->was16Bit) {
         result.warnings.push_back(
             {"stb-16bit", "is a 16-bit-per-channel source image -- stb_image downconverts to 8-bit on decode"});
@@ -476,13 +620,26 @@ TextureDecodeResult decodeStbForUpload(std::span<const std::byte> bytes, Texture
     result.format = stbRgba8Format(role);
     result.width = decoded->width;
     result.height = decoded->height;
-    DecodedTextureLevel level;
-    level.level = 0;
-    level.width = decoded->width;
-    level.height = decoded->height;
-    level.bytes.resize(decoded->rgba8.size());
-    std::memcpy(level.bytes.data(), decoded->rgba8.data(), decoded->rgba8.size());
-    result.levels.push_back(std::move(level));
+    DecodedTextureLevel level0;
+    level0.level = 0;
+    level0.width = decoded->width;
+    level0.height = decoded->height;
+    level0.bytes.resize(decoded->rgba8.size());
+    std::memcpy(level0.bytes.data(), decoded->rgba8.data(), decoded->rgba8.size());
+    result.levels.push_back(std::move(level0));
+
+    // [texture-path round, D10 Option A] The rest of the chain (levels
+    // 1..N) -- see generateStbMipChain()'s own header comment for the
+    // per-role sRGB/renormalization correctness this applies. Appended
+    // onto the SAME result.levels applyDecodeResult() (texture_cache.cpp)
+    // already uploads generically for the KTX2 path -- no new upload/
+    // registration code needed for this to reach the GPU (sponza-visual-
+    // investigation.md §2.7's own finding).
+    std::vector<DecodedTextureLevel> mips =
+        generateStbMipChain(std::span<const uint8_t>(decoded->rgba8), decoded->width, decoded->height, role);
+    for (DecodedTextureLevel& mip : mips) {
+        result.levels.push_back(std::move(mip));
+    }
     return result;
 }
 

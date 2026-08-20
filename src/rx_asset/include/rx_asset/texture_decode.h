@@ -258,15 +258,20 @@ bool exceedsDimensionLimit(uint32_t width, uint32_t height, uint32_t maxDimensio
 
 // ---------------------------------------------------------------------
 // stb PNG/JPG fallback path [D10: "no runtime block compression in Phase
-// 4"; gate ruling #3 N2: "stb path uploads mip 0 only -- recorded
-// limitation"]
+// 4"; gate ruling #3 N2 originally recorded "stb path uploads mip 0 only"
+// as a limitation -- CLOSED by the texture-path round's D10 Option A
+// (generateStbMipChain(), below): decodeStbForUpload() (texture_decode.cpp)
+// now appends a full runtime-generated box-filtered mip chain after level
+// 0. Still no runtime BLOCK COMPRESSION for this path (that half of N2
+// stands) -- mip generation and block compression are independent axes.]
 // ---------------------------------------------------------------------
 
 struct DecodedStbImage {
     uint32_t width = 0;
     uint32_t height = 0;
     bool was16Bit = false;              // stb transparently downconverts -- surfaced for the caller's own log line
-    std::vector<uint8_t> rgba8;          // tightly packed, 4 bytes/texel, mip 0 ONLY (see this section's own comment)
+    std::vector<uint8_t> rgba8;          // tightly packed, 4 bytes/texel, mip 0 ONLY -- see generateStbMipChain()
+                                          // below for how the REST of the chain gets built.
 };
 
 // Decodes `bytes` via stb_image (already vendored, rx_rhi_vk/src/
@@ -310,6 +315,56 @@ struct DecodedTextureLevel {
     uint32_t height = 0;
     std::vector<std::byte> bytes;
 };
+
+// [texture-path round, D10 Option A -- see .superpowers/sdd/2026-08-11-
+// phase4-scene-assets/sponza-visual-investigation.md §2.7] Generates the
+// REST of a full, floor-halving box-filtered mip chain for an
+// already-decoded RGBA8 mip-0 image -- level 0 itself is NOT included in
+// the returned vector (the caller already has it verbatim); this
+// function's own output is exactly levels 1..N, where N is the SAME
+// total level count Vulkan's own image-creation rule computes
+// (floor(log2(max(width,height)))+1 levels overall -- see
+// Texture2D::createForPresuppliedMips()'s own VkImageCreateInfo::
+// mipLevels, which this task's caller (decodeStbForUpload(),
+// texture_decode.cpp) feeds `decoded.levels.size()` into directly, no
+// separate cap). `width`/`height` MUST be mip0Rgba8's own true extent
+// (mip0Rgba8.size() >= width*height*4, tightly packed) -- returns an
+// empty vector on a malformed/degenerate input rather than fabricating
+// levels from too little data.
+//
+// PER-ROLE CORRECTNESS (binding, not a shortcut -- see the implementation's
+// own comment for the exact stb_image_resize2 calls this hands off to,
+// this task's own "prefer a ready-made library" choice over a hand-rolled
+// box-filter loop):
+//   - roleExpectsSrgb(role) (BaseColor/Emissive): each level's RGB is
+//     decoded sRGB->linear, box-averaged in LINEAR space, and re-encoded
+//     back to sRGB -- NEVER a naive byte average, which visibly darkens
+//     the image at every level (averaging gamma-encoded bytes as if they
+//     were linear energy is a real, measurable error, not a cosmetic
+//     one). Alpha is treated as already-linear (glTF's own convention:
+//     baseColorTexture alpha is coverage/opacity, never color) and is
+//     alpha-weighted into the RGB average (avoids the classic
+//     transparent-edge "black fringing" artifact a plain unweighted
+//     average produces).
+//   - role == Normal: plain LINEAR box average (no sRGB transform -- this
+//     is tangent-space vector data, never color), then each output
+//     texel's decoded (2*byte/255-1) vector is RENORMALIZED to unit
+//     length before re-encoding -- undoing the "flattening" a plain
+//     average produces (two divergent unit normals average to a SHORTER
+//     vector; sampling that unnormalized visibly softens/darkens
+//     normal-mapped detail at a distance).
+//   - every other role (MetallicRoughness/Occlusion/GenericData): plain
+//     linear box average, no colorspace transform, no renormalization --
+//     already-linear scalar/data channels, exactly D10's own table.
+//
+// Non-power-of-two width/height are handled by the standard floor-halving
+// chain (each level's extent is max(1, previous >> 1) independently per
+// axis) -- stb_image_resize2's own general resize (fractional-ratio box
+// filter) computes the correctly-weighted result for the non-exact-2x
+// steps this produces on an odd dimension, not just the power-of-two
+// case.
+std::vector<DecodedTextureLevel> generateStbMipChain(std::span<const uint8_t> mip0Rgba8, uint32_t width,
+                                                       uint32_t height, TextureRole role);
 
 // A single log line this function decided was warranted but could not
 // safely emit itself (this function is thread-affinity-NONE and must not

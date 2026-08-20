@@ -5,7 +5,9 @@
 #include <spdlog/sinks/ostream_sink.h>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <fstream>
 #include <optional>
 #include <sstream>
@@ -43,6 +45,25 @@ bool alwaysSupported(VkFormat) { return true; }
 // -- always reports NOTHING supported, forcing the RGBA32-fallback
 // branch deterministically regardless of what any real driver advertises.
 bool neverSupported(VkFormat) { return false; }
+
+// ===== generateStbMipChain() test-only reference math [texture-path
+// round, D10 Option A] -- the IEC 61966-2-1 sRGB transfer-function
+// formulas, used ONLY to compute this file's OWN expected values; the
+// production code under test (texture_decode.cpp's generateStbMipChain())
+// never calls these -- it hands the sRGB<->linear conversion to
+// stb_image_resize2's own STBIR_TYPE_UINT8_SRGB path instead (this task's
+// "prefer a ready-made library" rule). Kept deliberately independent so
+// this test is a real cross-check, not a tautology against the same code
+// path it is meant to verify.
+float srgbByteToLinearRef(uint8_t byteValue) {
+    float c = static_cast<float>(byteValue) / 255.0F;
+    return c <= 0.04045F ? c / 12.92F : std::pow((c + 0.055F) / 1.055F, 2.4F);
+}
+uint8_t linearToSrgbByteRef(float linear) {
+    float c = linear <= 0.0031308F ? linear * 12.92F : 1.055F * std::pow(linear, 1.0F / 2.4F) - 0.055F;
+    c = std::clamp(c, 0.0F, 1.0F);
+    return static_cast<uint8_t>(std::lround(c * 255.0F));
+}
 
 // Swaps spdlog's default logger for an ostream-capturing one for the
 // scope of one TEST_CASE, mirroring src/rx_core/tests/log_test.cpp's own
@@ -441,6 +462,200 @@ TEST_CASE("stbRgba8Format: role-correct SRGB vs UNORM, mirroring roleFormatTable
     CHECK(stbRgba8Format(TextureRole::MetallicRoughness) == VK_FORMAT_R8G8B8A8_UNORM);
     CHECK(stbRgba8Format(TextureRole::Occlusion) == VK_FORMAT_R8G8B8A8_UNORM);
     CHECK(stbRgba8Format(TextureRole::GenericData) == VK_FORMAT_R8G8B8A8_UNORM);
+}
+
+// ===== generateStbMipChain() [texture-path round, D10 Option A] ===========
+//
+// Every fixture below is a hand-built, tiny (2x2/5x3) in-memory RGBA8
+// buffer -- NOT a PNG file round-trip -- so the expected numbers are
+// exact arithmetic on known input bytes, not "whatever a real photo
+// happens to contain". A 2x2 -> 1x1 step is an EXACT arithmetic box
+// average by construction (STBIR_FILTER_BOX's own documented "same
+// result as box for integer scale ratios" -- an exact 2x downsample has
+// no fractional-coverage ambiguity at all), so these are not
+// approximations of what the library does -- they pin its behavior.
+
+TEST_CASE("generateStbMipChain: BaseColor (sRGB role) box-averages in LINEAR space, re-encodes sRGB -- a "
+          "naive byte average would FAIL this assertion by ~60 byte values [texture-path round item 1, "
+          "revert-discrimination: reverting to `(255+0+255+0)/4` naive averaging fails this CHECK]") {
+    // 2x2, two texels white (255,255,255,255), two texels black (0,0,0,255)
+    // -- alpha constant 255 throughout (glTF baseColor alpha is linear
+    // coverage, never sRGB -- see this fixture's own role comment).
+    const std::array<uint8_t, 16> src{
+        255, 255, 255, 255,  // texel 0: white
+        0,   0,   0,   255,  // texel 1: black
+        255, 255, 255, 255,  // texel 2: white
+        0,   0,   0,   255,  // texel 3: black
+    };
+    auto mips = generateStbMipChain(std::span<const uint8_t>(src), 2, 2, TextureRole::BaseColor);
+    REQUIRE(mips.size() == 1);  // 2x2 -> 1x1, exactly one step
+    CHECK(mips[0].level == 1);
+    CHECK(mips[0].width == 1);
+    CHECK(mips[0].height == 1);
+    REQUIRE(mips[0].bytes.size() == 4);
+
+    auto channel = [&](size_t i) { return static_cast<uint8_t>(mips[0].bytes[i]); };
+
+    // CORRECT (linear-space) reference: sRGB-decode 255 and 0 (-> linear
+    // 1.0 and 0.0), average (-> linear 0.5), re-encode sRGB.
+    float linearAvg = (srgbByteToLinearRef(255) + srgbByteToLinearRef(0)) / 2.0F;
+    uint8_t expectedCorrect = linearToSrgbByteRef(linearAvg);
+    CAPTURE(linearAvg);
+    CAPTURE(static_cast<int>(expectedCorrect));
+    CAPTURE(static_cast<int>(channel(0)));
+
+    // The discriminating band: correct linear-space averaging of
+    // (255,0,255,0) lands at ~188 (IEC 61966-2-1 formula: 1.055*0.5^(1/2.4)
+    // - 0.055 -> 0.735 -> byte 187-188); a NAIVE byte average of the same
+    // four bytes is (255+0+255+0)/4 = 127.5 -> byte 127 or 128, a ~60-value
+    // gap -- generously tolerant (+-12) on the correct side while staying
+    // FAR outside the naive value's own neighborhood proves this is a real
+    // discriminating assertion, not a coincidence of a wide tolerance.
+    CHECK(channel(0) > static_cast<uint8_t>(expectedCorrect - 12));
+    CHECK(channel(0) < static_cast<uint8_t>(expectedCorrect + 12));
+    CHECK(channel(1) == channel(0));  // R/G/B identical -- the source is achromatic
+    CHECK(channel(2) == channel(0));
+    // The naive-average value (127 or 128) must NOT be in range -- this is
+    // the actual revert-discrimination check: a hand-reverted
+    // `(a+b+c+d)/4` byte-average implementation produces 127 or 128 here,
+    // clearly outside [expectedCorrect-12, expectedCorrect+12] for any
+    // expectedCorrect near 188.
+    CHECK(channel(0) > 150);
+
+    // Alpha is constant 255 input -- plain average either way, sRGB or
+    // not (glTF alpha is never sRGB-transformed).
+    CHECK(channel(3) == 255);
+}
+
+TEST_CASE("generateStbMipChain: role == Normal renormalizes the averaged tangent-space vector to unit length "
+          "-- a plain (unrenormalized) average would FAIL the unit-length assertion [texture-path round item 2, "
+          "revert-discrimination: skipping the renormalize step leaves a ~0.80-length vector, failing the "
+          "[0.99,1.01] length band below]") {
+    // Two symmetric unit tangent-space normals, N1=(0.6,0.8,0) and
+    // N2=(-0.6,0.8,0) -- their PLAIN average is (0,0.8,0), length 0.8 (a
+    // real, non-degenerate "flattening" case, not a contrived zero-vector
+    // edge case). Byte-encode: (v*0.5+0.5)*255, rounded.
+    auto encode = [](float v) -> uint8_t {
+        return static_cast<uint8_t>(std::lround(std::clamp((v * 0.5F + 0.5F) * 255.0F, 0.0F, 255.0F)));
+    };
+    const uint8_t n1r = encode(0.6F), n1g = encode(0.8F), n1b = encode(0.0F);
+    const uint8_t n2r = encode(-0.6F), n2g = encode(0.8F), n2b = encode(0.0F);
+
+    const std::array<uint8_t, 16> src{
+        n1r, n1g, n1b, 255, n2r, n2g, n2b, 255, n1r, n1g, n1b, 255, n2r, n2g, n2b, 255,
+    };
+    auto mips = generateStbMipChain(std::span<const uint8_t>(src), 2, 2, TextureRole::Normal);
+    REQUIRE(mips.size() == 1);
+    REQUIRE(mips[0].bytes.size() == 4);
+
+    auto decode = [](std::byte b) { return (static_cast<float>(b) / 255.0F) * 2.0F - 1.0F; };
+    float x = decode(mips[0].bytes[0]);
+    float y = decode(mips[0].bytes[1]);
+    float z = decode(mips[0].bytes[2]);
+    float length = std::sqrt(x * x + y * y + z * z);
+    CAPTURE(x);
+    CAPTURE(y);
+    CAPTURE(z);
+    CAPTURE(length);
+
+    // THE discriminating assertion: unit length. The pre-renormalize
+    // average has length ~0.80 (the two input vectors' own Y=0.8, X/Z
+    // canceling), which fails this tight [0.99,1.01] band outright -- a
+    // reverted implementation that skips renormalizeNormalTexelsInPlace()
+    // fails HERE, not on some unrelated symptom.
+    CHECK(length > 0.99F);
+    CHECK(length < 1.01F);
+    // The averaged direction itself is still preserved (Y dominant,
+    // pointing "up") -- renormalization changes MAGNITUDE, not direction.
+    CHECK(y > 0.9F);
+}
+
+TEST_CASE("generateStbMipChain: MetallicRoughness/Occlusion/GenericData use a plain LINEAR box average -- no "
+          "sRGB transform, no renormalization [texture-path round item 3]") {
+    // Same achromatic (255,0,255,0) checkerboard as the sRGB test above,
+    // but role=MetallicRoughness this time: the CORRECT answer here is
+    // the PLAIN byte average (127 or 128) -- the exact value the sRGB
+    // test's own revert-discrimination check rejects for BaseColor.
+    const std::array<uint8_t, 16> src{
+        255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255,
+    };
+    auto mips = generateStbMipChain(std::span<const uint8_t>(src), 2, 2, TextureRole::MetallicRoughness);
+    REQUIRE(mips.size() == 1);
+    auto channel = [&](size_t i) { return static_cast<uint8_t>(mips[0].bytes[i]); };
+    CAPTURE(static_cast<int>(channel(0)));
+    // Plain arithmetic mean of (255,0,255,0) = 127.5 -> 127 or 128
+    // depending on the resize implementation's own rounding -- NEVER the
+    // sRGB-correct ~188 the BaseColor test above expects for the
+    // identical input bytes (proving role, not content, selects the
+    // colorspace path).
+    CHECK(channel(0) >= 127);
+    CHECK(channel(0) <= 128);
+}
+
+TEST_CASE("generateStbMipChain: chain length/dimensions follow the standard floor-halving formula for a "
+          "non-power-of-two source (5x3), matching Vulkan's own floor(log2(max(w,h)))+1 total-level rule "
+          "[texture-path round item 5]") {
+    // Content doesn't matter for this test -- a flat mid-gray source is
+    // enough (chain SHAPE, not per-texel color, is under test).
+    std::vector<uint8_t> src(static_cast<size_t>(5) * 3 * 4, 128);
+    auto mips = generateStbMipChain(std::span<const uint8_t>(src), 5, 3, TextureRole::GenericData);
+    // 5x3 -(floor-half)-> 2x1 -(floor-half)-> 1x1: 2 generated levels (+
+    // level 0, which this function never returns) = 3 total, matching
+    // floor(log2(5))+1 = 2+1 = 3.
+    REQUIRE(mips.size() == 2);
+    CHECK(mips[0].level == 1);
+    CHECK(mips[0].width == 2);
+    CHECK(mips[0].height == 1);
+    CHECK(mips[1].level == 2);
+    CHECK(mips[1].width == 1);
+    CHECK(mips[1].height == 1);
+}
+
+TEST_CASE("generateStbMipChain: a power-of-two square source (8x8) produces the exact 4-level chain "
+          "(8,4,2,1) [texture-path round item 5/6c]") {
+    std::vector<uint8_t> src(static_cast<size_t>(8) * 8 * 4, 200);
+    auto mips = generateStbMipChain(std::span<const uint8_t>(src), 8, 8, TextureRole::BaseColor);
+    REQUIRE(mips.size() == 3);  // levels 1,2,3 (level 0 excluded) -> 4x4, 2x2, 1x1
+    const std::array<uint32_t, 3> expectedExtent{4, 2, 1};
+    for (size_t i = 0; i < mips.size(); ++i) {
+        CAPTURE(i);
+        CHECK(mips[i].level == i + 1);
+        CHECK(mips[i].width == expectedExtent[i]);
+        CHECK(mips[i].height == expectedExtent[i]);
+    }
+}
+
+TEST_CASE("generateStbMipChain: degenerate input (width/height 0, or fewer bytes than width*height*4) returns "
+          "an empty chain rather than fabricating levels from too little data") {
+    std::vector<uint8_t> tooShort(4, 0);  // claims to be 2x2 (needs 16 bytes) but only has 4
+    CHECK(generateStbMipChain(std::span<const uint8_t>(tooShort), 2, 2, TextureRole::BaseColor).empty());
+    CHECK(generateStbMipChain(std::span<const uint8_t>(tooShort), 0, 2, TextureRole::BaseColor).empty());
+    CHECK(generateStbMipChain(std::span<const uint8_t>(tooShort), 2, 0, TextureRole::BaseColor).empty());
+}
+
+// ===== decodeTextureForUpload() end-to-end: stb path now generates its =====
+// ===== own full runtime mip chain [texture-path round, D10 Option A]  =====
+
+TEST_CASE("decodeTextureForUpload: a real 8x8 PNG fixture (stb path) now produces a FULL 4-level mip chain "
+          "(8,4,2,1), level 0 byte-identical to the un-mipped decode, format/role unaffected") {
+    auto bytes = readFixture("quadrant.png");
+    TextureDecodeResult result =
+        decodeTextureForUpload(std::span<const std::byte>(bytes), TextureRole::BaseColor, 4096, alwaysSupported);
+    REQUIRE(result.outcome == TextureDecodeResult::Outcome::Ready);
+    CHECK(result.width == 8);
+    CHECK(result.height == 8);
+    CHECK(result.format == VK_FORMAT_R8G8B8A8_SRGB);
+    REQUIRE(result.levels.size() == 4);
+    const std::array<uint32_t, 4> expectedExtent{8, 4, 2, 1};
+    for (size_t i = 0; i < result.levels.size(); ++i) {
+        CAPTURE(i);
+        CHECK(result.levels[i].level == i);
+        CHECK(result.levels[i].width == expectedExtent[i]);
+        CHECK(result.levels[i].height == expectedExtent[i]);
+    }
+    // Level 0 itself is UNCHANGED by this task -- exactly stb's own
+    // decoded bytes, byte-for-byte (only levels 1+ are new).
+    CHECK(result.levels[0].bytes.size() == 8 * 8 * 4);
 }
 
 // ===== Suppress unused-function warnings for the LogCapture utility ========
