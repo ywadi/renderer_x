@@ -105,7 +105,20 @@
 #                     vendored legal text of its own (CRYENGINE-licensed
 #                     test content, not Creative Commons -- see the repo's
 #                     own test-asset ruling in tools/fetch_assets.sh's
-#                     header comment).
+#                     header comment). ALSO ships, same TEMPORARY
+#                     pre-go-live posture, a pre-staged copy of the
+#                     Workshop (Render Scene) GLB under assets/Workshop/
+#                     workshop_render_scene.glb plus assets/Workshop/
+#                     PROVENANCE.txt -- see the "package the Workshop test
+#                     scene with the sample" staging block below. UNLIKE
+#                     Sponza above, Workshop is SKIP-IF-ABSENT rather than
+#                     a hard failure: it is not scriptably fetchable (a
+#                     one-time Sketchfab signed-URL download, not a
+#                     tools/fetch_assets.sh flag -- see assets/test/
+#                     ASSET-NOTES.md), CI never has a copy, and CI's own
+#                     invocation of this script must stay green without
+#                     it; a release zip built on a host that DOES have the
+#                     asset (a one-time manual fetch) still bundles it.
 #
 # This script does NOT build anything -- it assumes `cmake --build
 # --preset <preset>` already ran and each sample's build-output directory
@@ -445,6 +458,62 @@ for RX_SPONZA_LICENSE_CANDIDATE in "$REPO_ROOT/assets/fetched/Sponza"/LICENSE* "
     cp -a "$RX_SPONZA_LICENSE_CANDIDATE" "$STAGE_DIR/09_scene/assets/Sponza/"
   fi
 done
+# ===========================================================================
+
+# ===========================================================================
+# TEMPORARY, pre-go-live-only staging block -- owner directive: "package the
+# Workshop test scene with the sample" -- same stopgap posture as the
+# Sponza block directly above (bundle a second real-world, multi-material,
+# 4K-texture complex scene with 09_scene for direct, no-download testing;
+# see this script's own header comment for both blocks' shared rationale).
+# Remove this whole block (and its header-comment counterpart above) once a
+# real long-term distribution story for third-party test content is
+# decided, same as Sponza's own block.
+#
+# CRITICAL DIFFERENCE from Sponza's block above: Workshop is NOT
+# scriptably fetchable. Sponza has a `tools/fetch_assets.sh --sponza`
+# flag a CI runner (or any packaging host) can invoke to populate
+# assets/fetched/Sponza/ on demand, so an absent Sponza is a packaging-
+# host misconfiguration worth failing loudly over. Workshop has no such
+# flag -- its source is a Sketchfab one-time SIGNED-URL download, fetched
+# manually by hand once (see assets/test/ASSET-NOTES.md's own Workshop
+# entry: "signed-URL download; not scriptable") -- there is no script this
+# repo could run to (re-)obtain it. CI's own "Fetch test assets" step
+# (.github/workflows/ci.yml) therefore never populates
+# assets/fetched/Workshop/ and structurally never will, so CI running this
+# very script is EXPECTED to hit a missing Workshop asset on every run.
+# Failing loudly the way Sponza's block does would turn that permanent,
+# expected CI condition into a permanent CI failure -- so this block is
+# SKIP-IF-ABSENT instead: print a prominent warning and continue, staging
+# nothing for Workshop, rather than copy_required's usual loud-failure
+# convention. A release zip built on a host that HAS the asset (this
+# project's own packaging host, after the owner's one-time manual fetch)
+# still bundles it -- this only relaxes CI's own copy of the run, not a
+# real release build's.
+WORKSHOP_SRC="$REPO_ROOT/assets/fetched/Workshop/workshop_render_scene.glb"
+if [[ ! -f "$WORKSHOP_SRC" ]]; then
+  echo "package_samples: WARNING -- '$WORKSHOP_SRC' not found; SKIPPING Workshop staging in 09_scene (this is expected on CI, not a failure -- see this script's own header comment)" >&2
+  echo "package_samples: WARNING -- Workshop is a one-time Sketchfab signed-URL download, not fetchable via tools/fetch_assets.sh; see assets/test/ASSET-NOTES.md for how to obtain it" >&2
+else
+  mkdir -p "$STAGE_DIR/09_scene/assets/Workshop"
+  copy_required "$STAGE_DIR/09_scene/assets/Workshop" "$WORKSHOP_SRC"
+
+  # Provenance note per the repo's test-asset ruling (assets/test/
+  # ASSET-NOTES.md) -- same lightweight, one-file convention as Sponza's
+  # own PROVENANCE.txt above (no vendored legal text ceremony beyond it;
+  # CC-BY 4.0 only requires attribution, which this note provides).
+  cat >"$STAGE_DIR/09_scene/assets/Workshop/PROVENANCE.txt" <<'RX_WORKSHOP_PROVENANCE'
+Workshop (Render Scene) -- by 3DHaupt
+Source: https://sketchfab.com/3d-models/workshop-render-scene-ff29e81ff1564d73bad71d0042f96a28
+License: CC-BY 4.0
+
+Fetched via a one-time Sketchfab signed-URL download (not scriptable via
+tools/fetch_assets.sh) -- see assets/test/ASSET-NOTES.md in the project
+repository for the full provenance note. This bundling is TEMPORARY,
+pre-go-live packaging only -- see tools/package_samples.sh's own header
+comment and the Sponza staging block above it for the same rationale.
+RX_WORKSHOP_PROVENANCE
+fi
 # ===========================================================================
 
 mkdir -p "$(dirname "$RX_OUT_ZIP")"
