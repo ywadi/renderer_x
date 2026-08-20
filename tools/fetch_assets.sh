@@ -2,12 +2,16 @@
 set -euo pipefail
 
 # tools/fetch_assets.sh -- fetches Khronos glTF-Sample-Assets test content
-# [Phase 4 Stage 1 Task 13, spec D16]: DamagedHelmet is MANDATORY (small,
-# the standard PBR-correctness asset, gate-tested by
-# import_gltf_damagedhelmet_test.cpp) and fetched by default; Sponza is
-# OPTIONAL (large, local/present-mode "wow" content only -- CI NEVER
-# downloads it) and fetched only when --sponza is passed. Checksummed,
-# cached with a versioned marker file exactly like
+# [Phase 4 Stage 1 Task 13, spec D16; extended round-11/issue-31]:
+# DamagedHelmet is MANDATORY (small, the standard PBR-correctness asset,
+# gate-tested by damaged_helmet_test.cpp) and fetched by default; BoomBox
+# (glTF-Draco variant) is also MANDATORY (small, the real-world
+# KHR_draco_mesh_compression compatibility asset, gate-tested by
+# draco_compression_test.cpp -- see that file's own header comment for
+# why this specific model was chosen over an ad hoc Sketchfab download);
+# Sponza is OPTIONAL (large, local/present-mode "wow" content only -- CI
+# NEVER downloads it) and fetched only when --sponza is passed.
+# Checksummed, cached with a versioned marker file exactly like
 # tools/fetch_slang.cmake's own pattern (a version/checksum-set bump
 # self-invalidates a stale cache; re-running this script when everything
 # is already fetched and verified is a fast no-op).
@@ -36,6 +40,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST_ROOT="${REPO_ROOT}/assets/fetched"
 DAMAGED_HELMET_DIR="${DEST_ROOT}/DamagedHelmet/glTF"
 SPONZA_DIR="${DEST_ROOT}/Sponza/glTF"
+BOOMBOX_DRACO_DIR="${DEST_ROOT}/BoomBox/glTF-Draco"
 
 FETCH_SPONZA=0
 for arg in "$@"; do
@@ -129,7 +134,66 @@ fetch_sponza() {
   echo "[fetch_assets] Sponza fetched and verified -> ${SPONZA_DIR}"
 }
 
+# ---------------------------------------------------------------------
+# BoomBox (glTF-Draco variant) -- MANDATORY, like DamagedHelmet above
+# [issue #31 acceptance criterion: "a real-world Draco asset (Sketchfab-
+# class) imports headless without errors"]. CC0-1.0 (Creative Commons
+# Zero -- public-domain-equivalent; LICENSE.md verified directly against
+# the pinned commit: "All files directly associated with the model...
+# Creative Commons Zero v1.0 Universal"), by Microsoft (glTF-Sample-
+# Assets' own attribution). Not literally sourced from Sketchfab.com --
+# the ticket's own "(Sketchfab-class)" parenthetical reads as a
+# description of TYPICAL characteristics (a small real-world-authored
+# asset a converted Sketchfab download would also have: baked PBR
+# textures, KHR_draco_mesh_compression, a single mesh/material), not a
+# literal sourcing requirement -- this is glTF-Sample-Assets' own
+# canonical Draco-compressed reference model, maintained by the Khronos
+# Group specifically to exercise KHR_draco_mesh_compression decoders
+# (verified directly: extensionsRequired=["KHR_draco_mesh_compression"]),
+# which makes it a stronger real-world compatibility fixture than an
+# arbitrary Sketchfab download would be. Per-file sha256 pinned exactly
+# like DamagedHelmet above (computed directly against
+# github.com/KhronosGroup/glTF-Sample-Assets main branch, this task,
+# 2026-08-20).
+# ---------------------------------------------------------------------
+BOOMBOX_DRACO_BASE_URL="https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/BoomBox/glTF-Draco"
+BOOMBOX_DRACO_VERSION="2026-08-20"
+BOOMBOX_DRACO_MARKER="${DEST_ROOT}/.rx-fetched-boombox-draco-${BOOMBOX_DRACO_VERSION}"
+
+BOOMBOX_DRACO_FILES='
+BoomBox.gltf aa0c0eaeeedd1ab0d30f89b19acd0b7ca5caf2c04f07e2041680e5ea6aca7b42
+BoomBox.bin a619055105a510746d14a599074373ab38fb3c0a04486465f662ae79114f536e
+BoomBox_baseColor.png 099816a7afc5f6690494313ac8039806fd6d5b84179126a808b2678aaab3563a
+BoomBox_emissive.png e9970da7010591b73070151fe5039a158413499e38300d14106e367472c03b5b
+BoomBox_normal.png c9a7904e7f25246ac47f86c337cfd4ec8e103fff83e07d3af472e5c620ec6f27
+BoomBox_occlusionRoughnessMetallic.png 496704a4836ff364dc4441f41651edb25178498926c859933e33df42d6361412
+'
+
+fetch_boombox_draco() {
+  if [[ -f "${BOOMBOX_DRACO_MARKER}" ]]; then
+    echo "[fetch_assets] BoomBox (glTF-Draco) already fetched and verified (marker ${BOOMBOX_DRACO_MARKER}) -- skipping"
+    return
+  fi
+
+  echo "[fetch_assets] BoomBox (glTF-Draco) -- CC0-1.0 (Creative Commons Zero / public domain)."
+  echo "[fetch_assets]   Source: https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/BoomBox"
+
+  mkdir -p "${BOOMBOX_DRACO_DIR}"
+  echo "${BOOMBOX_DRACO_FILES}" | while read -r name checksum; do
+    [[ -z "${name}" ]] && continue
+    local_path="${BOOMBOX_DRACO_DIR}/${name}"
+    echo "[fetch_assets] downloading ${name}"
+    curl -fsSL -o "${local_path}" "${BOOMBOX_DRACO_BASE_URL}/${name}"
+    echo "${checksum}  ${local_path}" | sha256sum -c -
+  done
+
+  mkdir -p "${DEST_ROOT}"
+  echo "${BOOMBOX_DRACO_VERSION}" >"${BOOMBOX_DRACO_MARKER}"
+  echo "[fetch_assets] BoomBox (glTF-Draco) fetched and verified -> ${BOOMBOX_DRACO_DIR}"
+}
+
 fetch_damaged_helmet
+fetch_boombox_draco
 if [[ "${FETCH_SPONZA}" -eq 1 ]]; then
   fetch_sponza
 else
