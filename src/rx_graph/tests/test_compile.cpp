@@ -924,6 +924,72 @@ TEST_CASE("compile() throws when two overlapping-but-not-identical subresource r
     CHECK(threw);
 }
 
+TEST_CASE("compile() throws when two subresource ranges overlap on the MIP axis only (layers identical)") {
+    // [Review round, T2/#38, Low finding closure] The layer-axis overlap
+    // test above (both declarations at mip [0,1), differing only in
+    // layer range) never exercises the mip axis of the SAME overlap
+    // check -- the validator is symmetric/correct by inspection, but T9's
+    // per-face cube writes and T22's per-mip downsample chain both lean
+    // on the mip axis specifically, so this closes that coverage gap
+    // directly rather than trusting inspection alone.
+    RenderGraph graph;
+    ImageDesc desc = storageImageDesc();
+    desc.mipLevels = 3;
+
+    // mip [0,2) vs mip [1,3) -- overlapping at mip level 1, NOT identical;
+    // layer ranges are IDENTICAL (both the resource's single layer, since
+    // arrayLayers stays at storageImageDesc()'s default of 1) -- isolates
+    // the overlap to the mip axis alone.
+    graph.addPass("write_low_mips")
+        .addStorageImageOutput("chain", desc, Subresource{0, 2, 0, 1})
+        .setSideEffect();
+    graph.addPass("read_high_mips")
+        .addStorageImageInput("chain", Subresource{1, 2, 0, 1})
+        .addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+
+    bool threw = false;
+    try {
+        graph.compile(kInfo);
+    } catch (const std::runtime_error& e) {
+        threw = true;
+        CHECK(std::string(e.what()).find("chain") != std::string::npos);
+    }
+    CHECK(threw);
+}
+
+TEST_CASE("compile() throws when two subresource ranges overlap on BOTH the mip and layer axes") {
+    // The general case: neither axis alone is disjoint, and the ranges
+    // are not identical -- both mipOverlaps and layerOverlaps must be
+    // true (the validator's actual `&&` condition) for this to reject,
+    // so this is the case that most directly exercises that conjunction
+    // rather than either axis in isolation.
+    RenderGraph graph;
+    ImageDesc desc = storageImageDesc();
+    desc.mipLevels = 3;
+    desc.arrayLayers = 6;
+    desc.cube = true;
+
+    // mip [0,2) x layer [0,3) vs mip [1,3) x layer [2,5) -- overlaps at
+    // (mip 1, layer 2), not identical on either axis.
+    graph.addPass("write_block_a")
+        .addStorageImageOutput("cube", desc, Subresource{0, 2, 0, 3})
+        .setSideEffect();
+    graph.addPass("read_block_b")
+        .addStorageImageInput("cube", Subresource{1, 2, 2, 3})
+        .addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+
+    bool threw = false;
+    try {
+        graph.compile(kInfo);
+    } catch (const std::runtime_error& e) {
+        threw = true;
+        CHECK(std::string(e.what()).find("cube") != std::string::npos);
+    }
+    CHECK(threw);
+}
+
 TEST_CASE("compile() accepts two DISJOINT subresource ranges (different mip levels) against the same resource") {
     RenderGraph graph;
     ImageDesc desc = storageImageDesc();
