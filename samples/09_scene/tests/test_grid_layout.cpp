@@ -93,7 +93,21 @@ TEST_CASE("gridInstanceTransform composes DamagedHelmet.gltf's own node rotation
             // instance's translation must land exactly on the plain grid
             // placement -- a regression that also breaks placement (e.g.
             // composing in the wrong order, applying assetNodeTransform's
-            // translation column) is caught here too.
+            // translation column) is caught here too. [Review nit] THIS is
+            // also where multiplication-ORDER regressions are actually
+            // caught: gridTransform(...) * assetNodeTransform vs.
+            // assetNodeTransform * gridTransform(...) produce the IDENTICAL
+            // rotational 3x3 (assetNodeTransform is pure rotation, so its
+            // 3x3 commutes trivially with a pure translation's identity
+            // 3x3) -- the CHECK() above cannot tell the two orders apart.
+            // The translation differs, though: right-multiplying
+            // (gridTransform * assetNodeTransform, the correct order)
+            // leaves the grid's own translation column untouched, while the
+            // swapped order instead rotates that translation by
+            // assetNodeTransform first. Confirmed directly: swapping the
+            // multiplication order in gridInstanceTransform() fails exactly
+            // these translation assertions (12/157), with every rotation
+            // assertion above still passing.
             const glm::vec3 expectedTranslation = glm::vec3(gridTransform(row, col, spacing, gridCols)[3]);
             CHECK(vec3AlmostEqual(glm::vec3(composed[3]), expectedTranslation, kEps));
         }
