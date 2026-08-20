@@ -839,18 +839,52 @@ TEST_CASE("importGltfAsync: WALL-CLOCK GATE -- deliberately slow decode + a real
     // stall detector exists to catch. A fixed number recalibrated against
     // this one incident would still be exactly as fragile the next time
     // CI's own throughput drifts, so this tier is now SELF-CALIBRATING
-    // instead: it times ONE real TextureCache::registerDecoded() call,
-    // right here, against a synthetic payload sized like this fixture's
-    // own real textures (2048x2048 RGBA8 -- every one of DamagedHelmet's
-    // 5 JPGs decodes to exactly this size; the calibration op's cost is
-    // otherwise dominated by payload-size-dependent memcpy/copy-recording
-    // cost, not fixed per-call overhead -- an earlier 4x4 probe measured
-    // only that fixed overhead and was two orders of magnitude too small
-    // to be a representative baseline, see the report), on THIS machine,
-    // THIS run, immediately before the real gate below -- then derives
-    // the CI-tier ceiling as a multiple of that live measurement, so it
-    // scales automatically with whatever hardware this test happens to
-    // run on instead of encoding one machine's snapshot forever.
+    // instead: it times a real TextureCache::registerDecoded() call,
+    // against a synthetic payload sized like this fixture's own real
+    // textures (2048x2048 RGBA8 -- every one of DamagedHelmet's 5 JPGs
+    // decodes to exactly this size; the calibration op's cost is otherwise
+    // dominated by payload-size-dependent memcpy/copy-recording cost, not
+    // fixed per-call overhead -- an earlier 4x4 probe measured only that
+    // fixed overhead and was two orders of magnitude too small to be a
+    // representative baseline, see the report), on THIS machine, THIS run
+    // -- then derives the CI-tier ceiling as a multiple of that live
+    // measurement, so it scales automatically with whatever hardware this
+    // test happens to run on instead of encoding one machine's snapshot
+    // forever.
+    //
+    // [gltf-gpu-load-flake investigation, follow-up to issue #30] TWO
+    // samples, not one: the calibration op is measured once immediately
+    // BEFORE the pumpMain() loop below (as originally) and a second time
+    // immediately AFTER it, and the larger of the two feeds the formula.
+    // Root cause this addressed: a full-serial ctest run under genuine
+    // external load (a concurrent windows-cross-zig rebuild, reproducing
+    // this project's own packaging-time incident) tripped this gate with
+    // `REQUIRE( 9689us < 9160us )` -- a real ~6% margin miss, NOT a
+    // reintroduced blocking-wait defect (D25's zero-wait-calls counters
+    // stayed at baseline the same run). The calibration probe that run
+    // read only 2290us, well BELOW this comment's own recorded quiet/
+    // constrained baseline (5634-6202us) -- a single sample taken at one
+    // instant can land in a transient lull of genuinely bursty external
+    // contention (a concurrent build's per-file compile/link cadence is
+    // not uniform) even while the sustained ~300+ frame loop that follows
+    // it goes on to encounter a real contention spike. A single repeated
+    // back-to-back burst of samples was tried and rejected as the fix: it
+    // introduces its own confound (rapid-fire registerDecoded() calls
+    // measurably slow down across the burst from internal upload-path
+    // effects unrelated to external contention, which would bias the
+    // ceiling upward for the wrong reason). Bracketing the ACTUAL
+    // measurement window with one sample on each side avoids that
+    // confound (each sample is independent, well-separated in time by the
+    // loop's own duration) while directly targeting the demonstrated
+    // failure mode: whatever contention regime is present immediately
+    // before OR immediately after the loop is now used, and a lucky-quiet
+    // instant on one side no longer solely determines the ceiling. This
+    // can only RAISE the derived ceiling relative to the single-BEFORE-
+    // sample formula it replaces (max() of two nonnegative samples >= the
+    // first alone) -- strictly more permissive under contention, never
+    // less sensitive to a real blocking-wait regression (see the
+    // BLOCKING-DEFECT signature below, ~4x further away than this
+    // widening could plausibly close).
     //
     // MULTIPLIER DERIVATION (measured, not guessed -- 3 measurement sets,
     // 22 total runs, constrained repro: taskset -c 0,1 + LP_NUM_THREADS=1
@@ -907,13 +941,14 @@ TEST_CASE("importGltfAsync: WALL-CLOCK GATE -- deliberately slow decode + a real
     calibrationLevel0.height = 2048;
     calibrationLevel0.bytes.assign(static_cast<size_t>(2048) * 2048 * 4, std::byte{0xFF});
     calibrationPayload.levels.push_back(std::move(calibrationLevel0));
-    const auto calibStart = std::chrono::steady_clock::now();
-    TextureHandle calibrationHandle = fixture->textures->registerDecoded(calibrationPayload, "wallclock-gate-calibration-probe");
-    const auto calibDuration =
-        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - calibStart);
-    REQUIRE(calibrationHandle.isValid());
-    MESSAGE("wall-clock gate: calibration probe (2048x2048 synthetic registerDecoded()) took ", calibDuration.count(),
-            " us on this run -- CI-tier threshold derived as ", kCiStallMultiplier, "x this value");
+    const auto calibBeforeStart = std::chrono::steady_clock::now();
+    TextureHandle calibrationHandleBefore =
+        fixture->textures->registerDecoded(calibrationPayload, "wallclock-gate-calibration-probe-before");
+    const auto calibDurationBefore = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - calibBeforeStart);
+    REQUIRE(calibrationHandleBefore.isValid());
+    MESSAGE("wall-clock gate: calibration probe BEFORE the loop (2048x2048 synthetic registerDecoded()) took ",
+            calibDurationBefore.count(), " us on this run");
 
     Registry registry;
     ImportResult result;
@@ -927,7 +962,6 @@ TEST_CASE("importGltfAsync: WALL-CLOCK GATE -- deliberately slow decode + a real
     REQUIRE(handle.isValid());
 
     constexpr auto kLocalBudget = std::chrono::microseconds(2000);   // 2 ms, published/trend-tracked -- unchanged
-    const auto kCiStallDetector = std::max(kLocalBudget, kCiStallMultiplier * calibDuration);  // self-calibrated (see above)
 
     uint64_t framesWhileInFlight = 0;
     std::chrono::microseconds maxPumpDuration{0};
@@ -979,6 +1013,56 @@ TEST_CASE("importGltfAsync: WALL-CLOCK GATE -- deliberately slow decode + a real
     // >= 300 rendered frames while genuinely in flight -- proves real
     // overlap (the import did not simply complete on the first pump).
     CHECK(framesWhileInFlight >= 300);
+
+    // [gltf-gpu-load-flake investigation, follow-up to issue #30] A SECOND
+    // calibration sample, taken immediately AFTER the loop -- bracketing
+    // the real measurement window instead of sampling once, before it,
+    // in isolation. See the multiplier-derivation comment above this
+    // TEST_CASE's calibration-payload setup for the full rationale and the
+    // reproduced failure this addresses.
+    const auto calibAfterStart = std::chrono::steady_clock::now();
+    TextureHandle calibrationHandleAfter =
+        fixture->textures->registerDecoded(calibrationPayload, "wallclock-gate-calibration-probe-after");
+    const auto calibDurationAfter = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - calibAfterStart);
+    REQUIRE(calibrationHandleAfter.isValid());
+
+    // [gltf-gpu-load-flake investigation] Drain the AFTER probe's own GPU
+    // upload before this TEST_CASE ends and its fixture (TextureCache/
+    // Uploader/Device) tears down. The original single BEFORE-loop probe
+    // never needed this: the real import loop that follows it (300+
+    // pumpMain() calls) drains it naturally as a side effect. This AFTER
+    // probe has no such loop after it -- left undrained, the fixture
+    // destructor can destroy this texture's VkImage while its own upload
+    // commands are still in flight on the GPU, exactly the "bound VkImage
+    // ... was destroyed" validation hazard TextureCache::registerRealTexture()'s
+    // own header comment documents and guards against on ITS failure paths
+    // (reproduced here empirically under this investigation's own dual
+    // CPU+GPU load harness: a real UNASSIGNED-CoreValidation-DrawState-
+    // InvalidCommandBuffer-VkImage error followed by the whole binary
+    // stalling past ctest's 300s per-test timeout). This drain uses the
+    // SAME public poll API the async import pipeline itself uses
+    // (flushPendingUploads()/isUploadComplete(), D25's "poll, never a
+    // blocking wait" contract) -- not a reintroduced blocking uploader_.wait()
+    // call, and it never touches waitCallCountForTesting() (confirmed by
+    // reading both methods: neither increments it), so it cannot skew the
+    // D25 zero-wait-calls assertions below.
+    {
+        rx::rhi::UploadTicket afterTicket = fixture->textures->flushPendingUploads();
+        const auto drainDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!fixture->textures->isUploadComplete(afterTicket) &&
+               std::chrono::steady_clock::now() < drainDeadline) {
+            scheduler->pumpMain();
+        }
+        REQUIRE(fixture->textures->isUploadComplete(afterTicket));
+    }
+
+    const auto calibDuration = std::max(calibDurationBefore, calibDurationAfter);
+    const auto kCiStallDetector = std::max(kLocalBudget, kCiStallMultiplier * calibDuration);  // self-calibrated (see above)
+    MESSAGE("wall-clock gate: calibration probe AFTER the loop took ", calibDurationAfter.count(),
+            " us on this run (BEFORE sample was ", calibDurationBefore.count(),
+            " us) -- CI-tier threshold derived as ", kCiStallMultiplier, "x the larger of the two (",
+            calibDuration.count(), " us)");
 
     // The CI stall-detector tier (RC6, self-calibrated -- see
     // kCiStallDetector's own comment above): THE load-bearing assertion for
