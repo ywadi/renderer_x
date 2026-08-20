@@ -1466,6 +1466,20 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
                 ok = false;
                 break;
             }
+            if (device->isSurfaceLost()) {
+                // [Phase 4 Task 17 follow-up, Issue #73] The underlying
+                // native window is gone (no advance-warning SDL event
+                // exists for a third-party destroy -- see
+                // samples/09_scene/main.cpp's own recreateSwapchainAndDependents()
+                // comment for the full investigation). A graceful stop,
+                // not a failure: mark the Window so its own teardown skips
+                // the doomed SDL_DestroyWindow() call (Window::
+                // abandonNativeHandle()'s own comment, rx_platform), then
+                // quit the loop before touching the surface again.
+                window->abandonNativeHandle();
+                quit = true;
+                continue;
+            }
             if (!device->isSuspended()) {
                 if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
                     !rebuildDepthAndViews()) {
@@ -1484,8 +1498,19 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
             }
             destroySwapchainViews();
             depth.reset();
-            if (!device->recreateSwapchain(surface) ||
-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size()))) {
+            if (!device->recreateSwapchain(surface)) {
+                RX_LOG_ERROR("swapchain recreation failed after acquireNextImage NeedsRecreate");
+                ok = false;
+                break;
+            }
+            if (device->isSurfaceLost()) {
+                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
+                // branch's own identical comment above.
+                window->abandonNativeHandle();
+                quit = true;
+                continue;
+            }
+            if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size()))) {
                 RX_LOG_ERROR("swapchain recreation failed after acquireNextImage NeedsRecreate");
                 ok = false;
                 break;
@@ -1622,16 +1647,25 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
             }
             destroySwapchainViews();
             depth.reset();
-            if (!device->recreateSwapchain(surface) ||
-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size()))) {
+            if (!device->recreateSwapchain(surface)) {
                 RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
                 ok = false;
                 break;
             }
-            // [Phase 4 Task 17, FG7] Same zero-extent guard as the acquire
-            // branch above -- recreateSwapchain() may have entered the
-            // suspended state instead of rebuilding a real swapchain.
-            if (!device->isSuspended()) {
+            if (device->isSurfaceLost()) {
+                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
+                // branch's own identical comment above.
+                window->abandonNativeHandle();
+                quit = true;
+            } else if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size()))) {
+                RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
+                ok = false;
+                break;
+            } else if (!device->isSuspended()) {
+                // [Phase 4 Task 17, FG7] Same zero-extent guard as the
+                // acquire branch above -- recreateSwapchain() may have
+                // entered the suspended state instead of rebuilding a real
+                // swapchain.
                 if (!rebuildDepthAndViews()) {
                     ok = false;
                     break;

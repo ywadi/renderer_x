@@ -1676,6 +1676,20 @@ int runPresent(const Args& args) {
                 ok = false;
                 break;
             }
+            if (device->isSurfaceLost()) {
+                // [Phase 4 Task 17 follow-up, Issue #73] The underlying
+                // native window is gone (no advance-warning SDL event
+                // exists for a third-party destroy -- see
+                // samples/09_scene/main.cpp's own recreateSwapchainAndDependents()
+                // comment for the full investigation). A graceful stop,
+                // not a failure: mark the Window so its own teardown skips
+                // the doomed SDL_DestroyWindow() call (Window::
+                // abandonNativeHandle()'s own comment, rx_platform), then
+                // quit the loop before touching the surface again.
+                window->abandonNativeHandle();
+                running = false;
+                continue;
+            }
             if (!device->isSuspended()) {
                 if (!rebuildSwapchainViews() ||
                     !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size()))) {
@@ -1691,7 +1705,18 @@ int runPresent(const Args& args) {
         }
         if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
             vkDeviceWaitIdle(vkDevice);
-            if (!device->recreateSwapchain(surface) || !rebuildSwapchainViews() ||
+            if (!device->recreateSwapchain(surface)) {
+                ok = false;
+                break;
+            }
+            if (device->isSurfaceLost()) {
+                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
+                // branch's own identical comment above.
+                window->abandonNativeHandle();
+                running = false;
+                continue;
+            }
+            if (!rebuildSwapchainViews() ||
                 !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size()))) {
                 ok = false;
                 break;
@@ -1745,14 +1770,24 @@ int runPresent(const Args& args) {
         auto presentStatus = device->present(acquire.imageIndex, signalSem);
         if (presentStatus == rx::rhi::SwapchainStatus::NeedsRecreate) {
             vkDeviceWaitIdle(vkDevice);
-            if (!device->recreateSwapchain(surface) || !rebuildSwapchainViews() ||
-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size()))) {
+            if (!device->recreateSwapchain(surface)) {
                 ok = false;
                 break;
             }
-            executor->realize(graph);
-            scene->viewProj =
-                makeCameraViewProj(args.draws, device->swapchainExtent().width, device->swapchainExtent().height);
+            if (device->isSurfaceLost()) {
+                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
+                // branch's own identical comment above.
+                window->abandonNativeHandle();
+                running = false;
+            } else if (!rebuildSwapchainViews() ||
+                       !frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size()))) {
+                ok = false;
+                break;
+            } else {
+                executor->realize(graph);
+                scene->viewProj = makeCameraViewProj(args.draws, device->swapchainExtent().width,
+                                                      device->swapchainExtent().height);
+            }
         } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
             RX_LOG_ERROR("device lost during present; exiting present loop");
             ok = false;
