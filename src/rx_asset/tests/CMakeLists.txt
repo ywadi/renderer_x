@@ -107,6 +107,13 @@ add_executable(rx_asset_gltf_gpu_tests
     # rx_task's Scheduler::runOnWorkerThread()/runOnIoThread()/pumpMain()
     # this binary's own rx_task link already provides everything for.
     async_import_test.cpp
+    # Issue #31 -- KHR_draco_mesh_compression additional acceptance
+    # coverage (render-equivalence/exact-counter gate, decode-failure
+    # gate, real-world BoomBox integration) beyond Task 13's own
+    # import_gltf_gpu_test.cpp decode test. Joins THIS binary for the
+    # identical reason every file above does: the same fastgltf-aware
+    # Registry/GeometryPool/Scheduler fixture shape, no new dependency.
+    draco_compression_test.cpp
 )
 target_include_directories(rx_asset_gltf_gpu_tests PRIVATE ..)
 target_link_libraries(rx_asset_gltf_gpu_tests PRIVATE rx_asset rx_rhi_vk rx_platform rx_task fastgltf::fastgltf doctest::doctest)
