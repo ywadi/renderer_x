@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstdint>
 #include <optional>
+#include <thread>
 #include <utility>
 
 namespace {
@@ -34,8 +35,8 @@ struct WindowStateTestFixture {
     VkSurfaceKHR surface;
 };
 
-std::optional<WindowStateTestFixture> makeFixture(const char* title, bool visible = false) {
-    auto window = rx::platform::Window::create(title, 64, 64, visible);
+std::optional<WindowStateTestFixture> makeFixture(const char* title, bool visible = false, bool resizable = false) {
+    auto window = rx::platform::Window::create(title, 64, 64, visible, resizable);
     if (!window.has_value()) {
         MESSAGE("no display backend available, skipping window-state test");
         return std::nullopt;
@@ -295,5 +296,79 @@ TEST_CASE("Window::setFullscreen() double-toggle routes through the SAME Device:
     // Accumulated across the WHOLE sequence (both cycles, both
     // directions), not just per-transition -- catches a leak that only
     // shows up on the second cycle.
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// ===== Programmatic live resize -> Device::recreateSwapchain() [Issue #36]
+// -- the matrix rows 4/5 "exactly one recreation call site" pattern the
+// fullscreen double-toggle test above already establishes, exercised here
+// against a REAL SDL_SetWindowSize() live resize instead of a fullscreen
+// toggle. Same "WM-grant-adaptive" shape: a bare Xvfb/WM-less backend may
+// silently decline to actually resize an unmapped/undecorated window, so
+// this asserts the UNCONDITIONAL floor (recreateSwapchain() succeeds,
+// isSuspended()==false, zero validation errors) regardless, with the
+// resize-parity assertion gated on whether this environment's driver
+// actually granted it. Creates its own fixture with `resizable=true`
+// (Issue #36's own new Window::create() parameter) -- proving that flag's
+// SDL_WINDOW_RESIZABLE wiring is exercised here too, not just asserted in
+// isolation (src/rx_platform/tests/window_test.cpp's own device-free
+// test). Human-driven drag-resize itself stays MANUAL_VERIFICATION -- see
+// this task's own report -- this proves the PROGRAMMATIC floor. ==========
+TEST_CASE("A real SDL_SetWindowSize() resize, followed by Device::recreateSwapchain() (the exact call every "
+          "NeedsRecreate/live-drag-resize path in this codebase already uses, no extentOverride seam), succeeds "
+          "with zero validation errors and leaves the device unsuspended") {
+    auto fixture = makeFixture("rx_rhi_vk_window_state_live_resize", /*visible=*/true, /*resizable=*/true);
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto device = rx::rhi::Device::create(fixture->context, fixture->surface);
+    REQUIRE(device.has_value());
+    CHECK_FALSE(device->isSuspended());
+
+    int beforeW = 0;
+    int beforeH = 0;
+    SDL_GetWindowSizeInPixels(fixture->window.sdlWindow(), &beforeW, &beforeH);
+    const int requestedW = beforeW + 64;
+    const int requestedH = beforeH + 48;
+
+    if (!SDL_SetWindowSize(fixture->window.sdlWindow(), requestedW, requestedH)) {
+        MESSAGE("SDL_SetWindowSize failed on this video driver, skipping the remainder of this check");
+        return;
+    }
+
+    // Same bounded-repoll-until-quiescent shape as
+    // src/rx_platform/tests/window_test.cpp's own drainUntilQuiescent() --
+    // a real WM applies a programmatic resize asynchronously.
+    int afterW = beforeW;
+    int afterH = beforeH;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        fixture->window.pumpEvents();
+        SDL_GetWindowSizeInPixels(fixture->window.sdlWindow(), &afterW, &afterH);
+        if (afterW == requestedW && afterH == requestedH) {
+            break;
+        }
+    }
+
+    const bool resizeGranted = (afterW != beforeW || afterH != beforeH);
+    if (!resizeGranted) {
+        MESSAGE("this video driver/window-manager never actually resized the window on SDL_SetWindowSize() -- e.g. "
+                 "CI's bare Xvfb backend, no window manager to honor the request. The unconditional floor "
+                 "(recreateSwapchain() success, isSuspended()==false, zero validation errors) is still exercised "
+                 "below.");
+    }
+
+    // The SAME Device::recreateSwapchain(surface) call every real
+    // NeedsRecreate/live-drag-resize path in this codebase uses -- no
+    // extentOverride, no bespoke resize-handling function.
+    REQUIRE(device->recreateSwapchain(fixture->surface));
+    CHECK_FALSE(device->isSuspended());
+
+    if (resizeGranted) {
+        CHECK(device->swapchainExtent().width == static_cast<uint32_t>(afterW));
+        CHECK(device->swapchainExtent().height == static_cast<uint32_t>(afterH));
+    }
+
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
