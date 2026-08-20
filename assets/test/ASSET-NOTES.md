@@ -1,0 +1,1 @@
+- Workshop (Render Scene) by 3DHaupt (sketchfab.com/3d-models/workshop-render-scene-ff29e81ff1564d73bad71d0042f96a28), CC-BY 4.0 — complex-scene test asset (531k tris, 4k textures, GLB), fetched 2026-08-20 to assets/fetched/Workshop/workshop_render_scene.glb (signed-URL download; not scriptable). Test asset only; cleaned out pre-go-live.
