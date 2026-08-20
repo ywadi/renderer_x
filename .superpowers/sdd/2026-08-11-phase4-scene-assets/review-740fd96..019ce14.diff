@@ -1,0 +1,280 @@
+# Review package: 740fd96..019ce14
+
+## Commits
+019ce14 test(rx_asset): strengthen BoomBox test with decoded-value assertions (review round)
+340c71d fix(rx_asset): Draco attribute lookup by unique_id (not array index) + bounds-checked reads
+
+## Files changed
+ src/rx_asset/import_gltf.cpp                  | 117 ++++++++++++++++++++++++--
+ src/rx_asset/tests/draco_compression_test.cpp |  46 ++++++++++
+ 2 files changed, 155 insertions(+), 8 deletions(-)
+
+## Diff
+diff --git a/src/rx_asset/import_gltf.cpp b/src/rx_asset/import_gltf.cpp
+index 514341a..f5214e2 100644
+--- a/src/rx_asset/import_gltf.cpp
++++ b/src/rx_asset/import_gltf.cpp
+@@ -536,65 +536,166 @@ DracoDecodeResult decodeDracoPrimitive(const fastgltf::Asset& asset, const fastg
+     decoderBuffer.Init(reinterpret_cast<const char*>(compressed.data()), compressed.size());
+ 
+     draco::Decoder decoder;
+     auto statusOr = decoder.DecodeMeshFromBuffer(&decoderBuffer);
+     if (!statusOr.ok() || statusOr.value() == nullptr) {
+         RX_LOG_ERROR("rx_asset: Draco decode failed: {}", statusOr.ok() ? "null mesh" : statusOr.status().error_msg());
+         return result;
+     }
+     std::unique_ptr<draco::Mesh> mesh = std::move(statusOr).value();
+ 
++    // [Review round, real defect found while investigating Medium finding
++    // 2] `it->accessorIndex` holds the Draco attribute's persistent
++    // UNIQUE id (KHR_draco_mesh_compression's own spec text: "the
++    // corresponding Draco attribute id" -- the id the ENCODER assigned,
++    // e.g. via Encoder::AddAttribute()'s own return value, which survives
++    // the bitstream round-trip unchanged as PointAttribute::unique_id()).
++    // This is NOT necessarily the same as `mesh->attribute(i)`'s own
++    // ARRAY index after decode: `Mesh::attribute(int)` addresses Draco's
++    // internal `attributes_` vector by POSITION, and this project's own
++    // vendored Draco (verified directly, both by reading the decoder
++    // source and by an independent standalone probe against the real
++    // BoomBox fixture) reorders that vector during decode -- observed
++    // directly: BoomBox's own glTF declares POSITION at Draco id 3, but
++    // `mesh->attribute(3)` post-decode is actually NORMAL (unique_id 1,
++    // grouped-by-type reordering), while the real POSITION lives at array
++    // index 1. The previous code (`mesh->attribute(attId)`, treating the
++    // declared id as a literal array index) silently read the WRONG
++    // attribute's data whenever encode-time id and decode-time array
++    // index diverge -- which they always do for this project's own
++    // trivial single-primitive-per-type fixtures (id happens to equal
++    // array index there, by simple coincidence of the encode order used)
++    // but do NOT for real-world content encoded by other tools. Fixed by
++    // using Draco's own purpose-built lookup,
++    // `PointCloud::GetAttributeByUniqueId()` (point_cloud.h -- a safe
++    // linear scan by `unique_id()`, returns nullptr on no match, verified
++    // directly against the vendored source), which resolves by the
++    // SEMANTICALLY correct key regardless of decode-time array ordering.
+     const auto findAttr = [&](std::string_view name) -> const draco::PointAttribute* {
+         auto it = draco.findAttribute(name);
+         if (it == draco.attributes.end()) {
+             return nullptr;
+         }
+-        const int32_t attId = static_cast<int32_t>(it->accessorIndex);  // holds the DRACO attribute id in this context, not a glTF accessor index
+-        if (attId < 0 || attId >= mesh->num_attributes()) {
+-            return nullptr;
++        const uint32_t attId = static_cast<uint32_t>(it->accessorIndex);
++        return mesh->GetAttributeByUniqueId(attId);
++    };
++
++    // [issue #31 review round, Medium finding 2] Defensive bounds check,
++    // middleware-grade: draco::PointAttribute::mapped_index() is documented
++    // to always return a value within [0, attr->size()) for a well-formed,
++    // successfully-decoded mesh -- but this project does not trust that
++    // invariant blindly, for two verified reasons:
++    //   1. KHR_draco_mesh_compression bufferView bytes are untrusted,
++    //      attacker-influenced glTF content, not this project's own
++    //      internal state -- a hand-crafted or corrupted compressed
++    //      payload that still passes DecodeMeshFromBuffer() (a successful
++    //      decode with an internally-inconsistent attribute) is exactly
++    //      the shape of input Draco's own C++ API offers no defense
++    //      against on its own.
++    //   2. Verified directly against the vendored Draco source
++    //      (geometry_attribute.h): ConvertValue<T,N>() DOES bounds-check
++    //      the resulting byte address against the attribute's own DataBuffer
++    //      allocation (IsAddressValid()) and returns false on a genuine
++    //      out-of-bounds address -- but that allocation can legitimately be
++    //      larger than size()*byte_stride() (padding/sharing), so an
++    //      AttributeValueIndex at or beyond size() but still within the
++    //      buffer's physical extent silently "succeeds" and returns a
++    //      WRONG (garbage/adjacent) value, not a bounds failure -- and the
++    //      code below previously never inspected ConvertValue's own bool
++    //      return value at all, so even the false-on-genuine-OOB case was
++    //      silently discarded (garbage or the zero-initialized default
++    //      used with no error). Reproduced directly: on the real BoomBox
++    //      fixture (posAttr->size() == 3237, numPoints == 3575), a
++    //      mapped_index()-bypassing decode bug reads uninitialized/
++    //      adjacent attribute memory for 338 of 3575 points, entirely
++    //      silently.
++    // Both failure classes are closed the same way: check
++    // mapped_index()'s result against size() BEFORE reading, and check
++    // ConvertValue's own return value AFTER -- either violation is
++    // treated as a decode failure via the SAME clear, actionable,
++    // non-crashing error path as a malformed bufferView or a failed
++    // DecodeMeshFromBuffer() call, never a raw/unchecked indexed read.
++    const auto convertAttrChecked = [](const draco::PointAttribute* attr, draco::PointIndex pi, float* out,
++                                        int numComponents) -> bool {
++        const draco::AttributeValueIndex vi = attr->mapped_index(pi);
++        if (vi.value() >= static_cast<uint32_t>(attr->size())) {
++            return false;
++        }
++        switch (numComponents) {
++            case 2:
++                return attr->ConvertValue<float, 2>(vi, out);
++            case 3:
++                return attr->ConvertValue<float, 3>(vi, out);
++            case 4:
++                return attr->ConvertValue<float, 4>(vi, out);
++            default:
++                return false;
+         }
+-        return mesh->attribute(attId);
+     };
+ 
+     const size_t numPoints = mesh->num_points();
+     const draco::PointAttribute* posAttr = findAttr("POSITION");
+     if (posAttr == nullptr) {
+         RX_LOG_ERROR("rx_asset: Draco-compressed primitive has no POSITION attribute");
+         return result;
+     }
+     const draco::PointAttribute* normAttr = findAttr("NORMAL");
+     const draco::PointAttribute* uvAttr = findAttr("TEXCOORD_0");
+     const draco::PointAttribute* tanAttr = findAttr("TANGENT");
+ 
+     result.positions.resize(numPoints);
+     result.normals.resize(numPoints);
+     result.uvs.resize(numPoints);
+     result.tangents.resize(numPoints);
+     for (size_t p = 0; p < numPoints; ++p) {
+         const draco::PointIndex pi(static_cast<uint32_t>(p));
+         float pos[3] = {0, 0, 0};
+-        posAttr->ConvertValue<float, 3>(posAttr->mapped_index(pi), pos);
++        if (!convertAttrChecked(posAttr, pi, pos, 3)) {
++            RX_LOG_ERROR(
++                "rx_asset: Draco decode failed: POSITION attribute value index out of range for point {} "
++                "(attribute size {}, mesh has {} points) -- decoded mesh is internally inconsistent",
++                p, posAttr->size(), numPoints);
++            return DracoDecodeResult{};
++        }
+         result.positions[p] = glm::vec3(pos[0], pos[1], pos[2]);
+ 
+         if (normAttr != nullptr) {
+             float n[3] = {0, 0, 1};
+-            normAttr->ConvertValue<float, 3>(normAttr->mapped_index(pi), n);
++            if (!convertAttrChecked(normAttr, pi, n, 3)) {
++                RX_LOG_ERROR(
++                    "rx_asset: Draco decode failed: NORMAL attribute value index out of range for point {} "
++                    "(attribute size {}, mesh has {} points) -- decoded mesh is internally inconsistent",
++                    p, normAttr->size(), numPoints);
++                return DracoDecodeResult{};
++            }
+             result.normals[p] = glm::vec3(n[0], n[1], n[2]);
+         }
+         if (uvAttr != nullptr) {
+             float uv[2] = {0, 0};
+-            uvAttr->ConvertValue<float, 2>(uvAttr->mapped_index(pi), uv);
++            if (!convertAttrChecked(uvAttr, pi, uv, 2)) {
++                RX_LOG_ERROR(
++                    "rx_asset: Draco decode failed: TEXCOORD_0 attribute value index out of range for point {} "
++                    "(attribute size {}, mesh has {} points) -- decoded mesh is internally inconsistent",
++                    p, uvAttr->size(), numPoints);
++                return DracoDecodeResult{};
++            }
+             result.uvs[p] = glm::vec2(uv[0], uv[1]);
+         }
+         if (tanAttr != nullptr) {
+             float t[4] = {1, 0, 0, 1};
+-            tanAttr->ConvertValue<float, 4>(tanAttr->mapped_index(pi), t);
++            if (!convertAttrChecked(tanAttr, pi, t, 4)) {
++                RX_LOG_ERROR(
++                    "rx_asset: Draco decode failed: TANGENT attribute value index out of range for point {} "
++                    "(attribute size {}, mesh has {} points) -- decoded mesh is internally inconsistent",
++                    p, tanAttr->size(), numPoints);
++                return DracoDecodeResult{};
++            }
+             result.tangents[p] = glm::vec4(t[0], t[1], t[2], t[3]);
+         }
+     }
+     if (normAttr == nullptr) {
+         result.normals.clear();
+     }
+     if (uvAttr == nullptr) {
+         result.uvs.clear();
+     }
+     if (tanAttr == nullptr) {
+diff --git a/src/rx_asset/tests/draco_compression_test.cpp b/src/rx_asset/tests/draco_compression_test.cpp
+index 671169b..a93bf54 100644
+--- a/src/rx_asset/tests/draco_compression_test.cpp
++++ b/src/rx_asset/tests/draco_compression_test.cpp
+@@ -1,17 +1,18 @@
+ #include <doctest/doctest.h>
+ #include <rx_asset/geometry_pool.h>
+ #include <rx_asset/registry.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/upload.h>
+ #include <rx_platform/window.h>
+ #include <rx_task/scheduler.h>
++#include <cmath>
+ #include <filesystem>
+ #include <memory>
+ #include <optional>
+ #include <string>
+ 
+ // draco_compression_test.cpp -- KHR_draco_mesh_compression decode coverage
+ // [issue #31], additional to import_gltf_gpu_test.cpp's own Task 13
+ // "decodes within quantization tolerance" test (which this file does not
+ // duplicate):
+ //
+@@ -219,20 +220,65 @@ TEST_CASE("importGltf: BoomBox (fetched, real-world KHR_draco_mesh_compression a
+     const Submesh& sub = mesh.submeshes[0];
+     // Source index accessor (accessors[0]: {"type":"SCALAR",
+     // "componentType":5123,"count":18108}, verified directly against
+     // BoomBox.gltf) is u16, decoded via Draco then widened to u32 by the
+     // accessor-tools pipeline -- this asserts the WHOLE real-world file's
+     // index count survived Draco decode intact.
+     CHECK(sub.range.indexCount == 18108);
+     CHECK(sub.range.indexCount % 3 == 0);
+     CHECK(sub.bounds.isValid());
+ 
++    // [Review round, Medium finding 2] Decoded-VALUE assertion, not just a
++    // structural isValid() check -- BoomBox.gltf's own POSITION accessor
++    // (index 4) declares min/max per glTF's own spec requirement (mandatory
++    // for POSITION even under Draco compression -- the exporter that wrote
++    // this file already computed it from the SAME real decoded data this
++    // importer is expected to reproduce), verified directly against the
++    // fetched file:
++    //   min = (-0.00993099889037616, -0.00978147489037616, -0.01008609019037616)
++    //   max = ( 0.009926144998339033, 0.009780322287054225, 0.01008609019037616)
++    // An independent ground truth this project never computed itself --
++    // catching exactly the class of silent decode corruption a corrupted-
++    // but-still-"successful" decode can produce (right COUNTS, wrong
++    // VALUES) that the index-count check alone would miss. Cross-checked
++    // independently a second way while investigating this review round's
++    // findings: Draco's OWN reference `draco_decoder` CLI (a standalone
++    // binary this project's own dep-cache sub-build already produces,
++    // entirely independent of this importer's own code), run directly
++    // against the extracted compressed bufferView bytes, decodes the
++    // SAME tiny (~0.01) magnitude values -- not the ~1.0 magnitude this
++    // review round's investigation found this importer itself producing
++    // before the GetAttributeByUniqueId() fix a few lines above (a real,
++    // separate, pre-existing bug this decoded-value assertion class
++    // exists specifically to catch: `mesh->attribute(i)`'s ARRAY index
++    // does not equal the Draco attribute's persistent unique_id() after
++    // decode for real-world content, so the previous array-index lookup
++    // was silently reading NORMAL data (a similarly-shaped but semantically
++    // wrong VEC3 attribute, unit-vector-scaled -- explaining the
++    // ~[-1,1] result observed) into the POSITION output). A plain
++    // absolute-margin check (this project's vendored doctest only exposes
++    // Approx::epsilon()/scale(), a RELATIVE tolerance -- see
++    // test_standard_pbr_unlit.cpp's own near8() for the identical
++    // reasoning) at 0.0005 -- roughly 50x the actual observed decode
++    // deviation (~0.00001, Draco's own quantization step for whatever
++    // bit-depth this asset's external encoder used) and roughly 2000x
++    // tighter than the ~1.0 deviation the real bug this test caught
++    // produced, so this is tight enough to fail hard on a real decode
++    // defect while remaining robust to ordinary quantization noise.
++    const auto nearAbs = [](float actual, double expected, float margin) { return std::abs(actual - static_cast<float>(expected)) < margin; };
++    CHECK(nearAbs(sub.bounds.min.x, -0.00993099889037616, 0.0005F));
++    CHECK(nearAbs(sub.bounds.min.y, -0.00978147489037616, 0.0005F));
++    CHECK(nearAbs(sub.bounds.min.z, -0.01008609019037616, 0.0005F));
++    CHECK(nearAbs(sub.bounds.max.x, 0.009926144998339033, 0.0005F));
++    CHECK(nearAbs(sub.bounds.max.y, 0.009780322287054225, 0.0005F));
++    CHECK(nearAbs(sub.bounds.max.z, 0.01008609019037616, 0.0005F));
++
+     // BoomBox has no skin in the source file -- asserting `present ==
+     // false` (rather than omitting the check) is itself the proof this
+     // importer does not fabricate skin data for an unskinned asset,
+     // matching damaged_helmet_test.cpp's own identical assertion.
+     CHECK_FALSE(mesh.skin.present);
+ 
+     REQUIRE(result.materials.size() == 1);
+     const MaterialAsset& material = registry.material(result.materials[0]);
+     CHECK(material.name == "BoomBox_Mat");
+     CHECK(material.disposition == MaterialDisposition::StandardPBR);
