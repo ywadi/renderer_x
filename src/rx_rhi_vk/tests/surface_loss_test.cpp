@@ -32,7 +32,21 @@ TEST_CASE("isSurfaceLossResult(): false for genuine, unrelated errors -- these m
           "would incorrectly pass VK_ERROR_OUT_OF_HOST_MEMORY/VK_ERROR_OUT_OF_DEVICE_MEMORY here too]") {
     CHECK_FALSE(isSurfaceLossResult(VK_ERROR_OUT_OF_HOST_MEMORY));
     CHECK_FALSE(isSurfaceLossResult(VK_ERROR_OUT_OF_DEVICE_MEMORY));
-    CHECK_FALSE(isSurfaceLossResult(VK_ERROR_DEVICE_LOST));
     CHECK_FALSE(isSurfaceLossResult(VK_ERROR_OUT_OF_DATE_KHR));
     CHECK_FALSE(isSurfaceLossResult(VK_SUCCESS));
+}
+
+// [Round-review hardening] Its own dedicated TEST_CASE, deliberately
+// separate from the general "genuine, unrelated errors" one above -- a
+// lost DEVICE is a categorically different, always-fatal condition (the
+// whole VkDevice this Device wraps is gone, not just this one surface),
+// explicitly excluded FIRST in isSurfaceLossResult()'s own implementation
+// (checked before either VK_ERROR_SURFACE_LOST_KHR/
+// VK_ERROR_INITIALIZATION_FAILED match) so it can never be reclassified
+// as "just the window closing" no matter how the rest of that function's
+// logic evolves. This test exists to keep that guarantee load-bearing and
+// visible on its own, not merely incidental to a broader list.
+TEST_CASE("isSurfaceLossResult(): false for VK_ERROR_DEVICE_LOST, unconditionally -- a lost device is never "
+          "inferred as 'the window is just gone' [Issue #73 round-review hardening]") {
+    CHECK_FALSE(isSurfaceLossResult(VK_ERROR_DEVICE_LOST));
 }

@@ -43,27 +43,47 @@ enum class SwapchainStatus {
     SurfaceLost,
 };
 
-// [Phase 4 Task 17 follow-up, Issue #73] Pure, device-free classifier: does
-// `result` (a vkGetPhysicalDeviceSurfaceCapabilitiesKHR return value) mean
-// the underlying NATIVE WINDOW backing this surface is gone, as opposed to
-// a genuine, unrelated error (out-of-memory, ...) that must still hard-fail
-// Device::recreateSwapchain() rather than being silently swallowed?
+// [Phase 4 Task 17 follow-up, Issue #73, round-review hardening] Pure,
+// device-free classifier: does `result` (a
+// vkGetPhysicalDeviceSurfaceCapabilitiesKHR return value) mean the
+// underlying NATIVE WINDOW backing this surface is gone, as opposed to a
+// genuine, unrelated error (out-of-memory, device lost, ...) that must
+// still hard-fail Device::recreateSwapchain() rather than being silently
+// swallowed?
 //
-// True for VK_ERROR_SURFACE_LOST_KHR -- the Vulkan spec's own documented
-// code for exactly this situation -- AND for VK_ERROR_INITIALIZATION_FAILED,
-// which is NOT a spec-documented return for this specific function but is
-// what this project's own loader/driver stack (NVIDIA proprietary, Xcb WSI)
-// empirically returns when the query touches an already-destroyed X11
-// window: reproduced directly (Issue #73's own investigation) via a
-// third-party XDestroyWindow() against a live --present window (the exact
-// action `xdotool windowclose` performs) -- confirmed there is NO advance-
-// warning SDL event for this case at all (neither SDL_EVENT_WINDOW_
-// CLOSE_REQUESTED nor even SDL_EVENT_WINDOW_DESTROYED fires before the next
-// Vulkan call against the surface fails), so this REACTIVE classification
-// on the query's own result is the only place this can be caught.
+// True for VK_ERROR_SURFACE_LOST_KHR -- the Vulkan spec's own SOLE
+// documented code for exactly this situation -- and, as a SPEC CAVEAT,
+// ALSO for VK_ERROR_INITIALIZATION_FAILED: NOT a spec-documented return
+// for this specific function at all, included here purely as an
+// EMPIRICALLY-OBSERVED, vendor/WSI-backend-specific inference -- this
+// project's own verified NVIDIA proprietary driver + Xcb WSI backend
+// returns exactly this code (never VK_ERROR_SURFACE_LOST_KHR) when the
+// query touches an already-destroyed X11 window: reproduced directly
+// (Issue #73's own investigation) via a third-party XDestroyWindow()
+// against a live --present window (the exact action `xdotool windowclose`
+// performs) -- confirmed there is NO advance-warning SDL event for this
+// case at all (neither SDL_EVENT_WINDOW_CLOSE_REQUESTED nor even
+// SDL_EVENT_WINDOW_DESTROYED fires before the next Vulkan call against the
+// surface fails), so this REACTIVE classification on the query's own
+// result is the only place this can be caught. This out-of-spec half of
+// the classification is UNVERIFIED on any other vendor/WSI backend --
+// Device::recreateSwapchain() (device.cpp) emits a clearly-labeled,
+// one-shot (per process) WARN log (naming the raw VkResult) every time
+// this function's answer is reached via VK_ERROR_INITIALIZATION_FAILED
+// rather than the spec-documented VK_ERROR_SURFACE_LOST_KHR, specifically
+// so a future misclassification on an unverified driver surfaces in the
+// first bug report instead of silently eating what might be a real,
+// unrelated device error.
+//
+// VK_ERROR_DEVICE_LOST is EXPLICITLY, unconditionally excluded (checked
+// first, before either of the two matches above) -- a lost DEVICE is a
+// categorically different, always-fatal condition (the whole VkDevice
+// this Device wraps is gone, not just this one surface) and must never be
+// inferred as "just the window closing", regardless of how the
+// true/false logic below might otherwise evolve.
 // VK_ERROR_OUT_OF_HOST_MEMORY/VK_ERROR_OUT_OF_DEVICE_MEMORY (and anything
-// else) are deliberately NOT included here -- those stay genuine,
-// unrecoverable Device::recreateSwapchain() failures.
+// else) are likewise deliberately NOT included here -- those stay
+// genuine, unrecoverable Device::recreateSwapchain() failures.
 [[nodiscard]] bool isSurfaceLossResult(VkResult result);
 
 struct AcquireResult {

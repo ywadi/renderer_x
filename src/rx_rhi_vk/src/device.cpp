@@ -5,6 +5,7 @@
 #include <VkBootstrap.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <utility>
 #include <vector>
 
@@ -25,15 +26,25 @@ const char* presentModeName(VkPresentModeKHR mode) {
     }
 }
 
-// [Phase 4 Task 17 follow-up, Issue #73] See this function's own header
-// comment (device.h) for the full rationale -- VK_ERROR_INITIALIZATION_FAILED
-// is included alongside the spec-documented VK_ERROR_SURFACE_LOST_KHR
-// specifically because it is what THIS project's own verified loader/driver
-// stack returns for a destroyed-native-window Xcb surface; OOM codes are
-// deliberately excluded so a genuine allocation failure still hard-fails
-// Device::recreateSwapchain() rather than being silently treated as "the
-// window is just gone".
+// [Phase 4 Task 17 follow-up, Issue #73, round-review hardening] See this
+// function's own header comment (device.h) for the full rationale.
+// VK_ERROR_DEVICE_LOST is checked FIRST and unconditionally excluded --
+// never inferred as surface loss, regardless of how the rest of this
+// function evolves. VK_ERROR_INITIALIZATION_FAILED is included alongside
+// the spec-documented VK_ERROR_SURFACE_LOST_KHR specifically because it is
+// what THIS project's own verified loader/driver stack (NVIDIA proprietary
+// + Xcb WSI) returns for a destroyed-native-window surface -- an
+// out-of-spec, empirically-observed-only inference; the one-shot WARN this
+// classification's own non-spec half triggers lives at this function's
+// real call site (Device::recreateSwapchain(), below), not here (this
+// stays a pure, side-effect-free, device-free-testable classifier). OOM
+// codes are deliberately excluded so a genuine allocation failure still
+// hard-fails Device::recreateSwapchain() rather than being silently
+// treated as "the window is just gone".
 bool isSurfaceLossResult(VkResult result) {
+    if (result == VK_ERROR_DEVICE_LOST) {
+        return false;
+    }
     return result == VK_ERROR_SURFACE_LOST_KHR || result == VK_ERROR_INITIALIZATION_FAILED;
 }
 
@@ -749,6 +760,38 @@ bool Device::recreateSwapchain(VkSurfaceKHR surface, std::optional<VkExtent2D> e
             // only ever legitimately happens when the native window
             // backing this surface no longer exists.
             if (isSurfaceLossResult(capsResult)) {
+                // [Round-review hardening] Clearly-labeled, one-shot (per
+                // process) WARN whenever this inference fires from
+                // anything OTHER than the spec-documented
+                // VK_ERROR_SURFACE_LOST_KHR -- i.e. from
+                // isSurfaceLossResult()'s own empirically-observed-only
+                // VK_ERROR_INITIALIZATION_FAILED case (see that function's
+                // own header comment, device.h, for the full NVIDIA/Xcb
+                // rationale and reproduction this was verified against).
+                // Exists so a future misclassification on an UNVERIFIED
+                // driver/WSI backend is visible in the first bug report
+                // instead of silently eating what might be a real,
+                // unrelated device error. A function-local static -- one
+                // instantiation for the whole process, matching
+                // rx::platform::logWaylandMinimizeLimitationOnce()'s own
+                // "one-shot, process-wide, diagnosable-not-silent"
+                // precedent (rx_platform/window.h) -- deliberately never
+                // reset per-Device, since the concern (an unverified
+                // driver returning this code) is a fact about the host's
+                // driver stack, not about any one Device instance.
+                if (capsResult != VK_ERROR_SURFACE_LOST_KHR) {
+                    static std::atomic<bool> nonStandardLossWarned{false};
+                    bool expected = false;
+                    if (nonStandardLossWarned.compare_exchange_strong(expected, true)) {
+                        RX_LOG_WARN(
+                            "Device::recreateSwapchain: surface-lost inferred from VkResult={} -- NOT the "
+                            "spec-documented VK_ERROR_SURFACE_LOST_KHR, only the empirically-observed NVIDIA/Xcb "
+                            "VK_ERROR_INITIALIZATION_FAILED case (isSurfaceLossResult(), device.h); if this fires "
+                            "on a different driver/platform, verify the classification still holds there instead "
+                            "of trusting it blindly [Phase 4 Task 17 follow-up, Issue #73, round-review hardening]",
+                            static_cast<int>(capsResult));
+                    }
+                }
                 if (!surfaceLost_) {
                     RX_LOG_INFO(
                         "Device::recreateSwapchain: surface capabilities query failed with VkResult={} -- the "
