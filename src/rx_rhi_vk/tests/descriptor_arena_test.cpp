@@ -271,3 +271,71 @@ TEST_CASE("DescriptorArena::allocate enforces its own maxSets and per-type unifo
     vkb::destroy_device(fixture.vkbDevice);
     CHECK_FALSE(fixture.context.hasValidationErrors());
 }
+
+// [P0 regression pin] samples/09_scene/main.cpp crashed running
+// `sample_09_scene --present --scene <Sponza.gltf>` on a real, limit-
+// enforcing NVIDIA driver: its own hand-rolled "material params"
+// VkDescriptorPool was fixed at capacity=8 (justified only for that
+// sample's grid/stress modes), while Sponza's own glTF asset has 25
+// materials, each needing one set-1 VkDescriptorSet -- vkAllocateDescriptorSets
+// failed on the 9th. lavapipe let the SAME oversubscription through clean
+// (it never enforces VkDescriptorPool's own maxSets/pool-size ceilings --
+// descriptor_arena.h's own BUDGETS ARE ARENA-ENFORCED comment), which is
+// exactly why every prior Sponza verification of that sample missed this:
+// only a real driver's own pool enforcement ever surfaced it there. The fix
+// (samples/09_scene/main.cpp's createMaterialParamArena()) now routes that
+// same allocation through THIS class instead of a raw, unaccounted pool, so
+// this test pins the two concrete real-world numbers from that incident
+// directly against DescriptorArena's own arena-enforced accounting -- which
+// discriminates demand > capacity deterministically on every driver,
+// including lavapipe, with zero dependence on a real GPU's own enforcement.
+TEST_CASE("DescriptorArena::allocate discriminates Sponza-scale demand against an undersized pool (8-set capacity "
+          "vs. 25-material demand) deterministically, even under lavapipe") {
+    HeadlessDescriptorArenaFixture fixture = makeFixture();
+
+    constexpr uint32_t kPreFixSampleCapacity = 8;    // sample_09_scene's own pre-fix kMaxMaterialParamSets constant.
+    constexpr uint32_t kSponzaMaterialCount = 25;    // assets/fetched/Sponza/glTF/Sponza.gltf's real material count.
+
+    {
+        VkDescriptorSetLayout layout = makeUboSetLayout(fixture.device);
+
+        // --- The undersized (pre-fix) pool: accepts EXACTLY its declared
+        // capacity and refuses every allocation past it -- the arena's own
+        // accounting, not driver behavior, is what discriminates
+        // demand > capacity, and it must hold identically under lavapipe.
+        {
+            rx::rhi::DescriptorArena::Capacities undersized{kPreFixSampleCapacity, kPreFixSampleCapacity};
+            auto arena = rx::rhi::DescriptorArena::create(fixture.device, /*framesInFlight=*/1, undersized);
+            REQUIRE(arena.has_value());
+            arena->beginFrame(0);
+
+            uint32_t succeeded = 0;
+            for (uint32_t i = 0; i < kSponzaMaterialCount; ++i) {
+                if (arena->allocate(layout) != VK_NULL_HANDLE) {
+                    ++succeeded;
+                }
+            }
+            CHECK(succeeded == kPreFixSampleCapacity);
+        }
+
+        // --- The fixed pool: sized from the real material count (exactly
+        // what createMaterialParamArena() now does) accepts the FULL
+        // demand with zero rejections -- proves the fix's own sizing
+        // strategy, not just the enforcement mechanism, is correct.
+        {
+            rx::rhi::DescriptorArena::Capacities fixed{kSponzaMaterialCount, kSponzaMaterialCount};
+            auto arena = rx::rhi::DescriptorArena::create(fixture.device, /*framesInFlight=*/1, fixed);
+            REQUIRE(arena.has_value());
+            arena->beginFrame(0);
+
+            for (uint32_t i = 0; i < kSponzaMaterialCount; ++i) {
+                CHECK(arena->allocate(layout) != VK_NULL_HANDLE);
+            }
+        }
+
+        vkDestroyDescriptorSetLayout(fixture.device, layout, nullptr);
+    }
+
+    vkb::destroy_device(fixture.vkbDevice);
+    CHECK_FALSE(fixture.context.hasValidationErrors());
+}

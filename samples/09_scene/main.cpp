@@ -81,6 +81,7 @@
 #include <rx_rhi_vk/command.h>
 #include <rx_rhi_vk/context.h>
 #include <rx_rhi_vk/deletion_queue.h>
+#include <rx_rhi_vk/descriptor_arena.h>
 #include <rx_rhi_vk/device.h>
 #include <rx_rhi_vk/frame_sync.h>
 #include <rx_rhi_vk/memory_report.h>
@@ -640,8 +641,32 @@ struct App {
     // to samples/08_gltf_viewer's own (one VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
     // at binding 0, VERTEX|FRAGMENT) -- see that file's own comment for the
     // Vulkan pipeline-layout-compatibility argument this relies on.
+    //
+    // [P0 crash fix] The SET LAYOUT is mode-independent (created once, in
+    // makeApp()) but the POOL is NOT: how many set-1 VkDescriptorSets this
+    // run ever needs depends entirely on which mode is active -- 1 for the
+    // DamagedHelmet grid, kStressVariantCount for --stress, or the REAL,
+    // scene-dependent material count for a `--scene <path>` import (Sponza's
+    // own glTF has 25). A single fixed-size pool created before any of that
+    // is known (the pre-fix `kMaxMaterialParamSets = 8` constant) is sized
+    // for the wrong mode by construction the moment a caller picks a
+    // different one -- that undersizing crashed `--present --scene
+    // Sponza.gltf` on a real, limit-enforcing NVIDIA driver (25 > 8) while
+    // passing clean under lavapipe, which never enforces VkDescriptorPool's
+    // own maxSets/pool-size ceilings at all (see descriptor_arena.h's own
+    // BUDGETS ARE ARENA-ENFORCED comment). rx::rhi::DescriptorArena is this
+    // engine's own existing, already-tested "size it, and refuse
+    // over-budget allocations before ever calling the driver" abstraction
+    // (src/rx_rhi_vk/tests/descriptor_arena_test.cpp) -- reused here at
+    // framesInFlight=1 (this pool is allocated ONCE per run and never reset;
+    // set-1 material params are static for a material's lifetime, unlike
+    // rx_material's own per-instance, per-frame ParamArena) instead of hand-
+    // rolling a second, unaccounted VkDescriptorPool. Created by
+    // createMaterialParamArena() below, from the REAL material count for
+    // whichever mode this run selected, once that count is known -- never
+    // before runHeadless()/runPresent() have picked a mode.
     VkDescriptorSetLayout materialParamSetLayout = VK_NULL_HANDLE;
-    VkDescriptorPool materialParamPool = VK_NULL_HANDLE;
+    std::optional<rx::rhi::DescriptorArena> materialParamArena;
 
     // --- Scene (grid or stress -- mutually exclusive per run) -----------
     bool stressMode = false;
@@ -972,11 +997,14 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
         return nullptr;
     }
 
-    // Material set-1 param descriptor infrastructure -- see
+    // Material set-1 param descriptor SET LAYOUT -- see
     // samples/08_gltf_viewer's own identical block for the full rationale.
-    // Sized for helmetMaterial (1) + kStressVariantCount (4) -- generous
-    // headroom either way since only one of the two is ever populated per
-    // run.
+    // Mode-independent (every mode uses the same one-UBO-binding shape), so
+    // this is still built here, unconditionally. The POOL itself is NOT
+    // built here anymore -- see App::materialParamArena's own comment for
+    // why: it needs the real, mode-dependent material count, which isn't
+    // known yet at this point in startup. createMaterialParamArena() below
+    // builds it once that count is known.
     VkDescriptorSetLayoutBinding uboBinding{};
     uboBinding.binding = 0;
     uboBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -991,19 +1019,35 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
         RX_LOG_ERROR("sample_09_scene: vkCreateDescriptorSetLayout (material params) failed");
         return nullptr;
     }
-    constexpr uint32_t kMaxMaterialParamSets = 8;
-    std::array<VkDescriptorPoolSize, 1> poolSizes{VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxMaterialParamSets}};
-    VkDescriptorPoolCreateInfo poolInfo{};
-    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.maxSets = kMaxMaterialParamSets;
-    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
-    poolInfo.pPoolSizes = poolSizes.data();
-    if (vkCreateDescriptorPool(app->device->device(), &poolInfo, nullptr, &app->materialParamPool) != VK_SUCCESS) {
-        RX_LOG_ERROR("sample_09_scene: vkCreateDescriptorPool (material params) failed");
-        return nullptr;
-    }
 
     return app;
+}
+
+// Builds App::materialParamArena, sized EXACTLY from `materialCount` -- the
+// real number of set-1 VkDescriptorSets this run will ever allocate (1 for
+// the DamagedHelmet grid, kStressVariantCount for --stress, or
+// result.materials.size() for a `--scene <path>` import), never a fixed
+// magic number picked for one mode and silently reused for every other one
+// [the exact bug this replaces -- see App::materialParamArena's own
+// comment]. Must be called exactly once, after the caller has determined
+// which mode is active and (for a custom import) after importGltf() has
+// returned its real material count, and before the first
+// finalizeMaterialBinding() call for that mode. `materialCount == 0` is
+// clamped to 1 -- rx::rhi::DescriptorArena::create() rejects a zero
+// capacity outright, and an empty-material scene still needs a valid (if
+// never-used) arena for destroyApp()'s own unconditional teardown path.
+bool createMaterialParamArena(App& app, uint32_t materialCount) {
+    const uint32_t sets = std::max<uint32_t>(materialCount, 1);
+    const rx::rhi::DescriptorArena::Capacities capacities{/*maxSets=*/sets, /*uniformBuffers=*/sets};
+    auto arena = rx::rhi::DescriptorArena::create(app.device->device(), /*framesInFlight=*/1, capacities);
+    if (!arena.has_value()) {
+        RX_LOG_ERROR("sample_09_scene: DescriptorArena::create (material params) failed for {} material(s)",
+                     materialCount);
+        return false;
+    }
+    app.materialParamArena = std::move(*arena);
+    RX_LOG_INFO("sample_09_scene: material-params descriptor arena sized for {} material(s)", sets);
+    return true;
 }
 
 void destroyShadowResources(App& app) {
@@ -1052,10 +1096,13 @@ void destroyApp(App& app) {
         binding.paramBuffer.reset();
     }
     app.helmetMaterial.paramBuffer.reset();
-    if (app.materialParamPool != VK_NULL_HANDLE) {
-        vkDestroyDescriptorPool(app.device->device(), app.materialParamPool, nullptr);
-        app.materialParamPool = VK_NULL_HANDLE;
-    }
+    // rx::rhi::DescriptorArena's own destructor (via std::optional::reset())
+    // destroys its underlying VkDescriptorPool(s) -- exactly what the
+    // explicit vkDestroyDescriptorPool() call this replaces did. A run that
+    // never called createMaterialParamArena() (e.g. an early setupApp()
+    // failure before any mode was selected) leaves this optional empty --
+    // reset() on an empty optional is a documented no-op.
+    app.materialParamArena.reset();
     if (app.materialParamSetLayout != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(app.device->device(), app.materialParamSetLayout, nullptr);
         app.materialParamSetLayout = VK_NULL_HANDLE;
@@ -1154,14 +1201,22 @@ bool finalizeMaterialBinding(App& app, MaterialGpuBinding& binding, const std::v
     std::memcpy(paramBuffer->mappedData(), blob.data(), blockSize);
     paramBuffer->flush();
 
-    VkDescriptorSetAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    allocInfo.descriptorPool = app.materialParamPool;
-    allocInfo.descriptorSetCount = 1;
-    allocInfo.pSetLayouts = &app.materialParamSetLayout;
-    VkDescriptorSet paramSet = VK_NULL_HANDLE;
-    if (vkAllocateDescriptorSets(app.device->device(), &allocInfo, &paramSet) != VK_SUCCESS) {
-        RX_LOG_ERROR("sample_09_scene: vkAllocateDescriptorSets (material params) failed");
+    // [P0 crash fix] Allocated through App::materialParamArena, NOT a raw
+    // vkAllocateDescriptorSets against a hand-sized VkDescriptorPool -- the
+    // arena tracks this pool's own declared capacity and refuses (clean
+    // VK_NULL_HANDLE, logged) BEFORE ever calling the driver if this
+    // allocation would exceed it, deterministically on every driver
+    // including lavapipe (see descriptor_arena.h's own BUDGETS ARE
+    // ARENA-ENFORCED comment). createMaterialParamArena() sizes the arena
+    // from the real per-run material count, so a legitimate call here
+    // should never be refused -- if it is, either that sizing call was
+    // skipped/wrong for the active mode, or materialCount undercounted the
+    // scene's real materials; both are caller bugs this refusal surfaces
+    // immediately instead of crashing past it.
+    VkDescriptorSet paramSet = app.materialParamArena->allocate(app.materialParamSetLayout, /*uniformBufferDescriptorCount=*/1);
+    if (paramSet == VK_NULL_HANDLE) {
+        RX_LOG_ERROR("sample_09_scene: material-params descriptor arena allocation failed (pool exhausted or driver "
+                     "rejection -- see DescriptorArena's own preceding log line)");
         return false;
     }
     VkDescriptorBufferInfo bufferInfo{paramBuffer->handle(), 0, blockSize};
@@ -2450,6 +2505,10 @@ int runHeadless(const Args& args) {
     uint32_t expectedDrawsSubmitted = 0;
 
     if (args.stress) {
+        if (!createMaterialParamArena(*app, kStressVariantCount)) {
+            destroyApp(*app);
+            return 1;
+        }
         if (!setupStressMaterials(*app)) {
             destroyApp(*app);
             return 1;
@@ -2483,6 +2542,13 @@ int runHeadless(const Args& args) {
         const size_t submeshCount = app->registry->mesh(result.meshes[0]).submeshes.size();
         RX_LOG_INFO("sample_09_scene: import counts meshes={} submeshes={} materials={} grid_instances={}", result.meshes.size(),
                     submeshCount, result.materials.size(), kGridInstanceCount);
+        // Exactly 1 material used (result.materials[0]) regardless of how
+        // many the DamagedHelmet asset itself reports -- matches
+        // setupHelmetMaterial()'s own single-material call below.
+        if (!createMaterialParamArena(*app, 1)) {
+            destroyApp(*app);
+            return 1;
+        }
         if (!setupHelmetMaterial(*app, app->registry->material(result.materials[0]))) {
             destroyApp(*app);
             return 1;
@@ -2923,6 +2989,11 @@ int runPresent(const Args& args) {
     }
 
     if (args.stress) {
+        if (!createMaterialParamArena(*app, kStressVariantCount)) {
+            frameSync.reset();
+            destroyApp(*app);
+            return 1;
+        }
         if (!setupStressMaterials(*app) || !buildStressField(*app, args.stressDraws)) {
             frameSync.reset();
             destroyApp(*app);
@@ -2952,6 +3023,15 @@ int runPresent(const Args& args) {
         app->scene.emplace(rx::scene::meshBoundsFromRegistry(*app->registry));
         app->drawListBuilder.emplace(rx::scene::meshSubmeshesFromRegistry(*app->registry),
                                       rx::scene::materialResolveFromRegistry(*app->registry));
+        // [P0 crash fix] Sized from THIS scene's real material count
+        // (Sponza's own glTF: 25) -- not the fixed grid/stress-only
+        // constant that crashed `--present --scene Sponza.gltf` on a real
+        // NVIDIA driver. See App::materialParamArena's own comment.
+        if (!createMaterialParamArena(*app, static_cast<uint32_t>(result.materials.size()))) {
+            frameSync.reset();
+            destroyApp(*app);
+            return 1;
+        }
         if (!setupImportedMaterials(*app, *app->registry, result.materials) ||
             !populateImportedInstances(*app, *app->registry, result.scene)) {
             frameSync.reset();
@@ -2983,6 +3063,13 @@ int runPresent(const Args& args) {
             return 1;
         }
         app->helmetLocalBounds = app->registry->mesh(result.meshes[0]).bounds;
+        // Exactly 1 material used (result.materials[0]) -- matches
+        // setupHelmetMaterial()'s own single-material call below.
+        if (!createMaterialParamArena(*app, 1)) {
+            frameSync.reset();
+            destroyApp(*app);
+            return 1;
+        }
         if (!setupHelmetMaterial(*app, app->registry->material(result.materials[0])) || !populateHelmetGrid(*app, result.meshes[0])) {
             frameSync.reset();
             destroyApp(*app);
