@@ -224,14 +224,26 @@ main-thread half + the M1 guards), and `rx::shadow::ShadowCasterPipeline`.
 Deleted the stale `threading.md:111` line claiming the rx_scene managers
 "do not exist yet, not guarded" (false since Task 18; Scene alone has 35
 guarded call sites). Also recorded the new Executor/FrameSync entries
-(I2) in the same pass, and disclosed -- honestly, not silently -- that
+(I2) in the same pass.
+
+**Post-report addendum (same session, coordinator-directed):** this
+report originally disclosed, but deliberately left unfixed, that
 `Registry::importGltf()`'s synchronous overloads and `evictForTesting()`
-are documented main-thread-only by the same convention but carry no
-`RX_ASSERT_MAIN_THREAD` anywhere in their own call chain; this was
-discovered while writing accurate doc text, is a pre-existing gap of the
-same class, and is explicitly **not** fixed here -- out of this fix
-wave's named scope (only `mesh()`/`material()`/`texture()` were named by
-M2). Recommend the coordinator register it, same as M3/M4.
+were documented main-thread-only but carried no `RX_ASSERT_MAIN_THREAD`
+anywhere in their own call chain. Per the coordinator's standing
+in-round-closure policy (no prerequisite blocked it), this was closed in
+the same session: `RX_ASSERT_MAIN_THREAD` added to both `importGltf()`
+overloads and both `evictForTesting()` overloads
+(`src/rx_asset/registry.cpp`), `docs/threading.md`'s Registry entry
+updated to list all nine guarded members, and two new death/abort-pattern
+test cases added to `src/rx_asset/tests/thread_guard_test.cpp` (a real
+GeometryPool+Scheduler fixture, an intentionally empty byte span --
+`importGltf()`'s guard fires as the first statement regardless, and an
+empty/malformed document is an already-covered safe-failure path per
+`import_gltf_gpu_test.cpp`'s own "malformed-file battery" case, so no
+real glTF fixture was needed). Verified: `rx_asset_tests` alone (38/38
+test cases, 596/596 assertions) and the full linux-native serial ctest
+suite, both under lavapipe -- see the addendum commit below.
 
 ---
 
@@ -266,6 +278,12 @@ new cases in `src/rx_asset/tests/thread_guard_test.cpp` (a bare
 default-constructed `Registry`, no GPU fixture needed -- its D11
 fallback assets make even a never-registered handle a safe, defined
 read).
+
+**Addendum (post-report, same session):** `importGltf()` (both
+overloads) and `evictForTesting()` (both overloads) also guarded now --
+see the I4 section's addendum above for the full rationale; these were a
+separate, coordinator-directed in-round closure of a gap this report's
+I4 section originally disclosed rather than fixed.
 
 ---
 
@@ -314,7 +332,15 @@ xvfb-run -a ctest --preset windows-cross-zig \
 6. `0050540` docs(threading): cover Phase 4's Stage 1/2 surfaces, drop the stale rx_scene line -- I4
 7. `e9a59f0` fix(samples): 09_scene shadow pass wiring, FIF draw-data races, worker guard -- C1 (sample half) + I1 (09_scene half) + I3 (call-site) + M5
 8. `785559e` fix(samples): 08_gltf_viewer frames-in-flight draw-data buffer race -- I1 (08_gltf_viewer half)
+9. `02c14af` docs: Phase 4 exit fix wave report -- per-finding proof, revert evidence
+10. `5c3922c` fix(rx_asset): guard Registry::importGltf()/evictForTesting() (in-round closure) -- coordinator-directed, post-report addendum: closes the pre-existing gap this report's I4/M2 sections originally disclosed but left unfixed
 
 No board/plan/ledger edits. `docs/threading.md` and the regenerated
 `samples/09_scene/references/grid_scene.png` are the two authorized
 non-code touches; both delivered. Not pushed.
+
+**Post-addendum re-verification:** linux-native, full serial ctest,
+lavapipe: **29/29 PASSED** (~81s), including the two new
+`rx_asset_tests` cases (`rx_asset_tests` alone: 38/38 test cases, 596/596
+assertions). Second preset not re-run for this scale, per the
+coordinator's own instruction.
