@@ -165,6 +165,20 @@ fly-through camera — see this file's own `## 09_scene` section below for
 its end-to-end checklist); the rows below remain the raw platform-level
 checks, independent of that sample.
 
+**[Issue #33 correction, superseding the paragraph above as originally
+written]** Task 24's original `09_scene` wiring only went as far as
+*consuming* `consumeMouseDelta()` each frame — it never actually called
+`setRelativeMouseMode()`, so the facility below was still functionally
+unconsumed: the OS cursor was never hidden/locked, and the reported defect
+(cursor escapes the window/hits screen edges during `--present`
+fly-through, making control impractical) was exactly that gap. `09_scene`
+now calls `setRelativeMouseMode()` for real (captured by default entering
+`--present` fly-through, Esc toggles release/recapture, click-to-recapture
+on the viewport — see `samples/09_scene/mouse_capture.h` and this file's own
+`## 09_scene` section below for the new checklist rows) — this facility is
+genuinely consumed end to end as of Issue #33, not merely partially as
+Task 24 first left it.
+
 - [ ] Relative mouse mode: call `setRelativeMouseMode(true)` in a real
       (non-hidden) window session — cursor visibly disappears and stays
       centered/locked to the window regardless of how far the mouse is
@@ -205,11 +219,19 @@ checks, independent of that sample.
 
 **Last run:** not yet performed on real hardware — this task (Task 20)
 implemented and automated-tested the platform-level surface; `09_scene`
-(Task 24) now drives it end to end (see this file's own `## 09_scene`
-section), but a real human-observed session (desktop mouse/keyboard/
-gamepad, then Steam Deck) has not yet been performed. Fill in the
-checkboxes above the first time this is actually run, before any release
-claiming Deck gamepad support.
+(Issue #33) now actually calls `setRelativeMouseMode()` and drives it end
+to end (see this file's own `## 09_scene` section), but a real
+human-observed session (desktop mouse/keyboard/gamepad, then Steam Deck)
+has not yet been performed. Issue #33's own fix DID confirm, via log
+inspection (not visual observation — genuinely not automatable headlessly,
+see this file's own posture above), that `SDL_SetWindowRelativeMouseMode(true)`
+succeeds with no failure warning logged against a real windowed session on
+a real NVIDIA GPU/driver (RTX 2080, `DRIVER_ID_NVIDIA_PROPRIETARY`) — the
+code path executes and is granted by a real driver, which is as far as a
+non-interactive session can verify; whether the cursor visibly
+disappears/stays locked as a human would observe it is still an open row
+below. Fill in the checkboxes above the first time this is actually run,
+before any release claiming Deck gamepad support.
 
 ## rx_debug_ui overlay (Phase 4 Stage 2 Task 21, spec D20, gate ruling #16)
 
@@ -245,7 +267,11 @@ directly, so that half is a MANUAL_VERIFICATION row").
       HUD panel — the camera must NOT respond to that mouse motion while
       `ImGui::GetIO().WantCaptureMouse` is true (the automated GPU test
       proves `WantCaptureMouse` itself flips correctly; it cannot drive a
-      real camera to observe the consuming half of the contract).
+      real camera to observe the consuming half of the contract). [Issue
+      #33] `09_scene` now has a RELEASED mouse-capture state (Esc) as a
+      prerequisite for this row to even be exercisable with a visible,
+      free cursor — see this file's own `## 09_scene` section below for the
+      capture-specific rows this composes with.
 - [ ] Steam Deck: confirm the HUD renders and is legible/usable at Deck's
       actual display resolution and, if the HUD ever grows touch-target
       sizing considerations, that mouse/keyboard-driven toggles remain
@@ -478,6 +504,13 @@ pre-staged `assets/DamagedHelmet/glTF/` deployed next to it — see
 - WASD + mouse-look (relative mouse mode) + gamepad (left stick move,
   right stick look) fly the camera through the scene smoothly, with no
   jump/snap and no drift.
+- [Issue #33] Mouse capture: CAPTURED by default on entering `--present`
+  (cursor hidden, locked to the window, drives look immediately — no extra
+  click needed). Esc toggles RELEASED (cursor visibly reappears at a sane
+  position, HUD is fully clickable, camera stops responding to mouse motion
+  claimed by an open HUD panel) and back to CAPTURED. While RELEASED,
+  left-clicking the viewport (i.e. NOT an open HUD panel) recaptures.
+  Gamepad look/move work identically in both capture states.
 - The ImGui HUD shows FPS/frame-ms (60-frame rolling average), cull
   counters (visible/culled/recordsIn/drawsSubmitted + the instancing-
   collapse-ratio percentage), a vsync checkbox, TWO VISIBLY DISTINCT mask
@@ -505,6 +538,23 @@ pre-staged `assets/DamagedHelmet/glTF/` deployed next to it — see
 - [ ] Run: `./build/linux-native/samples/09_scene/sample_09_scene --present --validate`
 - [ ] Default helmet grid renders correctly; fly-through (WASD + mouse-look)
       feels smooth and correctly oriented
+- [ ] Mouse capture [Issue #33]: on launch, the OS cursor is hidden and
+      mouse-look works immediately (captured by default) — the cursor never
+      escapes the window/hits screen edges during continuous mouse-look
+      (the originally reported defect)
+- [ ] Esc releases capture: OS cursor visibly reappears at a sane position;
+      moving the mouse over the (non-HUD) viewport no longer spins the
+      camera while an open HUD panel is hovered (`WantCaptureMouse` true);
+      a second Esc recaptures (cursor hides again, look resumes)
+- [ ] While released, left-clicking the (non-HUD) viewport recaptures
+      (cursor hides, mouse-look resumes) without needing Esc again
+- [ ] While released, the HUD (checkboxes, vsync toggle, layer-mask rows,
+      etc. — see the HUD row below) is fully clickable/usable with the
+      visible cursor, and the "Mouse: RELEASED ..." / "Mouse: CAPTURED ..."
+      status line in the HUD itself reflects the current state accurately
+- [ ] Alt-tab away and back while captured: no crash; mouse-look resumes
+      correctly on refocus (re-arm composes with the capture toggle — see
+      this file's own `## rx_platform input surface` section above)
 - [ ] HUD shows FPS/cull-counters/vsync/layer-mask row toggles/light-channel
       toggle/pool stats/memory report; layer-mask toggles hide/show whole
       rows, the light-channel toggle only changes row 0's lighting/shadow
@@ -546,6 +596,25 @@ not the human-observed-on-real-hardware, real-mouse-and-gamepad-drive check
 this file otherwise tracks. Fill in the checkboxes and hardware/driver
 details above the first time `--present` is actually watched (and driven)
 on a real display.
+
+**[Issue #33 addendum]** The mouse-capture fix itself was additionally run
+`--present --validate` for ~15s against a REAL windowed session (a real X
+display, not Xvfb) on a REAL discrete NVIDIA GPU with the DEFAULT (unforced)
+ICD loader — `vulkaninfo` confirms `GPU0: NVIDIA GeForce RTX 2080`,
+`driverID = DRIVER_ID_NVIDIA_PROPRIETARY`, `driverInfo = 580.82.07`, and
+`vkb::PhysicalDeviceSelector`'s own default discrete-GPU preference selects
+it ahead of the also-installed lavapipe ICD: zero `[error]`-level log lines,
+zero `Validation Error` lines without this codebase's own documented
+false-positive guard prefix, and a clean `SIGTERM` exit logging
+`window closed cleanly`. Critically, `SDL_SetWindowRelativeMouseMode(true)`
+logged NO failure warning during this real run — `Window::setRelativeMouseMode()`
+only logs on failure, so its absence here is positive evidence the real
+driver GRANTED relative mode, not just that the call was reached. What this
+does NOT prove, and remains genuinely open below: whether the OS cursor
+*visibly* stays hidden/locked, whether Esc/click-to-recapture *feel* right,
+and Steam Deck gamepad drivability — none of that is observable from a log
+in a non-interactive session; a human must still watch and drive this the
+first time the checkboxes above are filled in.
 
 ## Steam Deck (09_scene, `linux-native` preset)
 
