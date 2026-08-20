@@ -1,0 +1,6 @@
+# SDD ledger — plan: docs/superpowers/plans/2026-08-20-phase5-techniques.md
+
+PHASE 5 (TECHNIQUES) SDD LEDGER. Board tickets #37-#72 = P5 T01-T36. Owner decision policy (2026-08-20, standing): coordinator takes the best-recommended option autonomously; ONLY genuinely unclear/owner-level decisions escalate. Inherited standing rules: no-deferral (incl. pre-existing defects), real-GPU verification alongside lavapipe (driver-labeled), decoded/rendered-VALUE assertions (never import-success-only), revert-discrimination proofs, mirror tickets at dispatch, pathspec commits, no AI attribution, CI watched per push, cd -P real path, samples consume engine/shared facilities (present-loop centralization committed in T5/#41).
+
+P5 T1 PRIMARY GATE (#37) KICKED OFF: 5 parallel read-only stage-research agents -> per-ticket completeness matrices in gate/; coordinator authors binding rulings after; plan+matrices+rulings order of authority per phase-4 precedent (rulings > plan > matrix > ticket).
+STANDING RULE (owner, forceful — binding on all P5 dispatches): on-desktop/GPU-interactive verification is SERIALIZED (machine to itself), ANNOUNCED to owner beforehand, agent builds run NICEd, WM-semantics trials prefer a nested Xephyr display. Memory: feedback_desktop_verification.md. Origin incident: #74 trials + concurrent builds froze the owner's desktop.
