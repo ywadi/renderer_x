@@ -5,12 +5,14 @@
 // other GPU-object-mutation entry point in this codebase (BindlessTable/
 // Uploader/DeletionQueue/GeometryPool -- docs/threading.md). The read
 // accessors (mesh()/material()/texture()) are declared const and are
-// safe to call from the main thread at any point after a prior
-// importGltf() call has returned; they are NOT safe to call concurrently
-// with a mutating call on another thread (this class holds no internal
-// lock -- same posture as GeometryPool, D5's whole point being that
-// GPU-object-owning types stay single-threaded rather than growing
-// locks).
+// main-thread-only, [guarded] [Phase 4 exit fix wave, M2, mirroring the
+// Task-12 GeometryPool read-accessor ruling this class's identical posture
+// never got applied to until now] -- safe to call from the main thread at
+// any point after a prior importGltf() call has returned; they are NOT
+// safe to call concurrently with a mutating call on another thread (this
+// class holds no internal lock -- same posture as GeometryPool, D5's whole
+// point being that GPU-object-owning types stay single-threaded rather
+// than growing locks).
 //
 // D24 EVICTION INVARIANT: mesh()/material() are RESIDENCY-TOLERANT --
 // a handle that is still "live" (passes the generational check) but has

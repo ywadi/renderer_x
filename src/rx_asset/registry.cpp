@@ -618,6 +618,13 @@ ImportResult Registry::importGltf(const std::filesystem::path& path, GeometryPoo
 }
 
 const MeshAsset& Registry::mesh(MeshHandle handle) const {
+    // [Phase 4 exit fix wave, M2] Task 12's review ruling narrowed
+    // GeometryPool's read accessors to guarded main-thread-only precisely
+    // because unguarded reads against unlocked mutable state invite silent
+    // misuse -- Registry's identical-posture reads (this class holds no
+    // internal lock either, registry.h's own top comment) never got the
+    // same treatment until now.
+    RX_ASSERT_MAIN_THREAD("Registry::mesh");
     if (nonresidentMesh_.find(packHandle(handle)) == nonresidentMesh_.end()) {
         if (const MeshAsset* asset = meshes_.get(handle)) {
             return *asset;
@@ -628,6 +635,8 @@ const MeshAsset& Registry::mesh(MeshHandle handle) const {
 }
 
 const MaterialAsset& Registry::material(MaterialHandle handle) const {
+    // [Phase 4 exit fix wave, M2] See mesh()'s own comment above.
+    RX_ASSERT_MAIN_THREAD("Registry::material");
     if (nonresidentMaterial_.find(packHandle(handle)) == nonresidentMaterial_.end()) {
         if (const MaterialAsset* asset = materials_.get(handle)) {
             return *asset;
@@ -638,6 +647,8 @@ const MaterialAsset& Registry::material(MaterialHandle handle) const {
 }
 
 const TextureAsset& Registry::texture(TextureHandle handle) const {
+    // [Phase 4 exit fix wave, M2] See mesh()'s own comment above.
+    RX_ASSERT_MAIN_THREAD("Registry::texture");
     if (const TextureAsset* asset = textures_.get(handle)) {
         return *asset;
     }

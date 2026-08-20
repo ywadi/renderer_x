@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 #include <rx_asset/geometry_pool.h>
+#include <rx_asset/registry.h>
 #include <rx_core/debug_checks.h>
 #include <rx_rhi_vk/device.h>
 #include <rx_rhi_vk/upload.h>
@@ -169,6 +170,51 @@ TEST_CASE(
     pool->bufferDeviceAddressEnabled();
     pool->vertexBufferDeviceAddress(0);
     pool->indexBufferDeviceAddress(0);
+
+    std::lock_guard<std::mutex> lock(capture.mutex);
+    CHECK(capture.callCount == 0);
+}
+
+// [Phase 4 exit fix wave, M2] Registry::mesh()/material()/texture() carried
+// no guard despite registry.h's own top comment documenting the identical
+// main-thread-only, no-internal-lock posture Task 12's review ruling
+// already narrowed GeometryPool's read accessors to. GPU-free (unlike the
+// GeometryPool cases above): Registry() is a bare default constructor with
+// no Device/Allocator dependency at all, and its D11 fallback assets
+// (created in the constructor, always resident) make even a
+// never-registered, default-constructed handle a safe, defined read --
+// exactly what these tests need, with no real import required.
+TEST_CASE("Registry::mesh/material/texture trip RX_ASSERT_MAIN_THREAD when called from a worker thread [M2]") {
+    rx::asset::Registry registry;
+
+    ViolationCapture capture;
+    g_activeCapture.store(&capture, std::memory_order_relaxed);
+    rx::core::debug::detail::setViolationHookForTests(&captureViolationHook);
+    ViolationHookGuard guard;
+
+    std::thread meshThread([&] { (void)registry.mesh(rx::asset::MeshHandle{}); });
+    meshThread.join();
+    std::thread materialThread([&] { (void)registry.material(rx::asset::MaterialHandle{}); });
+    materialThread.join();
+    std::thread textureThread([&] { (void)registry.texture(rx::asset::TextureHandle{}); });
+    textureThread.join();
+
+    std::lock_guard<std::mutex> lock(capture.mutex);
+    CHECK(capture.callCount == 3);
+    CHECK(capture.lastContext == "Registry::texture");
+}
+
+TEST_CASE("Registry::mesh/material/texture do NOT trip the guard for calls genuinely on the main thread [M2]") {
+    rx::asset::Registry registry;
+
+    ViolationCapture capture;
+    g_activeCapture.store(&capture, std::memory_order_relaxed);
+    rx::core::debug::detail::setViolationHookForTests(&captureViolationHook);
+    ViolationHookGuard guard;
+
+    (void)registry.mesh(rx::asset::MeshHandle{});
+    (void)registry.material(rx::asset::MaterialHandle{});
+    (void)registry.texture(rx::asset::TextureHandle{});
 
     std::lock_guard<std::mutex> lock(capture.mutex);
     CHECK(capture.callCount == 0);
