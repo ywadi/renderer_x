@@ -448,10 +448,11 @@ public:
     // writes the result into `out` (caller-owned, reused storage -- see
     // this header's own top comment).
     //
-    // Main-thread-only (D5): reads `scene`'s own main-thread-only
-    // accessors before fanning any work out to `scheduler`'s workers; the
-    // parallel AABB-vs-frustum pass itself touches only already-captured
-    // plain spans, never `scene` again, from a worker thread.
+    // Main-thread-only (D5), [guarded] [Phase 4 exit fix wave, M1]: reads
+    // `scene`'s own main-thread-only accessors before fanning any work out
+    // to `scheduler`'s workers; the parallel AABB-vs-frustum pass itself
+    // touches only already-captured plain spans, never `scene` again, from
+    // a worker thread.
     void build(const Scene& scene, const Camera& camera, task::Scheduler& scheduler, ViewLists& out);
 
     // Shadow-caster culling for one directional light [D15]: an ortho box
@@ -472,7 +473,8 @@ public:
     // `channels` do not overlap `light`'s own `channels` is excluded from
     // caster consideration entirely, same AND-test as camera cullMask.
     //
-    // Main-thread-only (D5), same rationale as build().
+    // Main-thread-only (D5), [guarded] [Phase 4 exit fix wave, M1], same
+    // rationale as build().
     void buildShadow(const Scene& scene, LightHandle light, const Camera& camera, task::Scheduler& scheduler,
                       ShadowLists& out);
 

@@ -733,6 +733,13 @@ DrawListBuilder::DrawListBuilder(MeshSubmeshesFn meshSubmeshes, MaterialResolveF
 DrawListBuilder::~DrawListBuilder() = default;
 
 void DrawListBuilder::build(const Scene& scene, const Camera& camera, task::Scheduler& scheduler, ViewLists& out) {
+    // [Phase 4 exit fix wave, M1] Entry-point guard: documented main-thread-
+    // only (draw_list.h's own header comment) but previously enforced only
+    // transitively, via the first Scene accessor cullView() calls -- the
+    // `out.commands.clear()` etc. mutation just below happens BEFORE that,
+    // against this builder's own unsynchronized scratch, so a future code
+    // path that touches scratch before Scene would have no guard at all.
+    RX_ASSERT_MAIN_THREAD("rx::scene::DrawListBuilder::build");
     RX_ZONE;
     // [Zero-alloc, caller-owned storage -- D26] .clear() retains capacity;
     // never reassigned/shrink_to_fit'd.
@@ -752,6 +759,8 @@ void DrawListBuilder::build(const Scene& scene, const Camera& camera, task::Sche
 
 void DrawListBuilder::buildShadow(const Scene& scene, LightHandle light, const Camera& camera, task::Scheduler& scheduler,
                                    ShadowLists& out) {
+    // [Phase 4 exit fix wave, M1] See build()'s own comment above.
+    RX_ASSERT_MAIN_THREAD("rx::scene::DrawListBuilder::buildShadow");
     RX_ZONE;
     out.commands.clear();
     out.payloads.clear();
