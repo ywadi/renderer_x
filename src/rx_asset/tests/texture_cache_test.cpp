@@ -14,6 +14,8 @@
 #include <rx_shader/reflection.h>
 #include <rx_task/scheduler.h>
 #include <spdlog/sinks/ostream_sink.h>
+#include <glm/gtc/packing.hpp>
+#include <glm/vec4.hpp>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -566,6 +568,50 @@ std::optional<QuadrantPixels> renderAndReadbackQuadrants(TcTestFixture& fixture,
     return result;
 }
 
+// [Phase 5 Task 6, ticket #42, gate matrix-p5t06-ktx2-cubemap-hdr row 11's
+// own "direct face-indexed readback" alternative] A sampler-free
+// readback of ONE subresource (a specific mip level + array layer) of a
+// real, already-uploaded rx::rhi::Texture2D's underlying VkImage --
+// vkCmdCopyImageToBuffer straight off the GPU image, mirroring the
+// established texture_test.cpp/upload_test.cpp readback pattern (this
+// file's own renderAndReadbackQuadrants() above uses a fragment-shader/
+// sampler pipeline instead, which has no bindless-array slot for a
+// TextureCube-typed binding -- this class's own fixed 3-binding bindless
+// layout is 2D-only; see TextureCache::rawImageForTesting()'s own header
+// comment). `bytesPerTexel` parametrizes over both the 4-byte RGBA8 cube
+// fixture and the 8-byte R16G16B16A16_SFLOAT HDR fixture this task adds.
+std::optional<std::vector<uint8_t>> readBackSubresource(TcTestFixture& fixture, VkImage image, VkExtent2D extent,
+                                                           uint32_t mipLevel, uint32_t arrayLayer,
+                                                           VkDeviceSize bytesPerTexel) {
+    const VkDeviceSize byteSize = static_cast<VkDeviceSize>(extent.width) * extent.height * bytesPerTexel;
+    auto readback = fixture.allocator.createHostVisibleBuffer(byteSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    if (!readback.has_value()) {
+        return std::nullopt;
+    }
+    auto cmdCtx = rx::rhi::CommandContext::create(fixture.device.device(), fixture.device.graphicsQueue(),
+                                                    fixture.device.graphicsQueueFamily());
+    if (!cmdCtx.has_value()) {
+        return std::nullopt;
+    }
+    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+        rx::rhi::transitionImage(cmd, image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy region{};
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = mipLevel;
+        region.imageSubresource.baseArrayLayer = arrayLayer;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent = {extent.width, extent.height, 1};
+        vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1, &region);
+        rx::rhi::transitionImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    });
+    readback->invalidate();
+    std::vector<uint8_t> result(byteSize);
+    std::memcpy(result.data(), readback->mappedData(), byteSize);
+    return result;
+}
+
 bool approxEqual(const std::array<uint8_t, 4>& actual, std::array<uint8_t, 3> expectedRgb, int tolerance) {
     return std::abs(static_cast<int>(actual[0]) - expectedRgb[0]) <= tolerance &&
            std::abs(static_cast<int>(actual[1]) - expectedRgb[1]) <= tolerance &&
@@ -756,14 +802,207 @@ TEST_CASE("TextureCache: a full mip chain (16x16 -> 1x1) loads all 5 levels") {
 
 // ===== D11 fallback routing for every failure mode ==========================
 
-TEST_CASE("TextureCache: cubemap KTX2 -> checkerboard fallback (never a silently-wrong 2D slice)") {
+// [Phase 5 Task 6, ticket #42, gate matrix-p5t06-ktx2-cubemap-hdr row 2 --
+// the DISCRIMINATION PROOF] Replaces the Phase 4 test that asserted this
+// SAME fixture (cubemap.ktx2) resolved to the checkerboard -- exactly the
+// assertion a no-op cube implementation could leave passing. Loads the
+// SAME file and asserts the FLIP: a real, non-fallback, cube-flagged
+// texture.
+TEST_CASE("TextureCache: cubemap KTX2 now loads as a real, non-fallback cube texture [matrix row 2, "
+          "discrimination proof]") {
     auto fixture = makeFixture("rx_asset_tc_cubemap");
     if (!fixture.has_value()) {
         return;
     }
     makeCache(*fixture);
     TextureHandle handle = fixture->cache->load(fixturePath("cubemap.ktx2"), TextureRole::BaseColor);
+    REQUIRE(handle.isValid());
+    CHECK_FALSE(handle == fixture->cache->checkerboardHandle());
+    const TextureRecord& record = fixture->cache->resolve(handle);
+    CHECK_FALSE(record.isFallback);
+    CHECK(record.isCube);
+    CHECK(record.width == 4);   // ONE FACE's own extent (row 7's own contract)
+    CHECK(record.height == 4);
+    CHECK(record.mipLevels == 1);  // cubemap.ktx2 is deliberately single-level
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// [Phase 5 Task 6, gate matrix row 3] Flat 2D-array and cube-array KTX2
+// stay explicitly rejected after the narrowed predicate -- their own
+// GPU-level regression, mirroring this test's own pre-Task-6 shape
+// (which the test just above replaced) but against the two NEW
+// still-rejected fixtures instead of the now-supported cubemap.ktx2.
+TEST_CASE("TextureCache: flat 2D-array and cube-array KTX2 both still -> checkerboard fallback (cubemap-only "
+          "support, matrix row 3)") {
+    auto fixture = makeFixture("rx_asset_tc_array_rejected");
+    if (!fixture.has_value()) {
+        return;
+    }
+    makeCache(*fixture);
+    TextureHandle array2d = fixture->cache->load(fixturePath("array2d_rejected.ktx2"), TextureRole::BaseColor);
+    TextureHandle cubeArray = fixture->cache->load(fixturePath("cubearray_rejected.ktx2"), TextureRole::BaseColor);
+    CHECK(array2d == fixture->cache->checkerboardHandle());
+    CHECK(cubeArray == fixture->cache->checkerboardHandle());
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// [Phase 5 Task 6, gate matrix row 6/11] THE primary cube GPU acceptance
+// test: uploads cubemap_mips.ktx2 (32x32 base, 6 mip levels, each face a
+// distinct flat authored color) and directly reads back EVERY face at
+// BOTH mip 0 and the deepest (1x1) mip level, asserting each matches its
+// authored color EXACTLY -- proving mip data landed in the correct
+// face's own subresource range, not just that SOME upload succeeded.
+TEST_CASE("TextureCache: cubemap_mips.ktx2 GPU readback proves exact per-face, per-mip values [matrix row 6/11]") {
+    auto fixture = makeFixture("rx_asset_tc_cubemap_mips");
+    if (!fixture.has_value()) {
+        return;
+    }
+    makeCache(*fixture);
+    TextureHandle handle = fixture->cache->load(fixturePath("cubemap_mips.ktx2"), TextureRole::Environment);
+    REQUIRE(handle.isValid());
+    CHECK_FALSE(handle == fixture->cache->checkerboardHandle());
+    const TextureRecord& record = fixture->cache->resolve(handle);
+    CHECK(record.isCube);
+    CHECK(record.width == 32);
+    CHECK(record.height == 32);
+    CHECK(record.mipLevels == 6);  // 32 -> 16 -> 8 -> 4 -> 2 -> 1
+
+    VkImage image = fixture->cache->rawImageForTesting(handle);
+    REQUIRE(image != VK_NULL_HANDLE);
+
+    // Standard KTX2 cube face order (+X,-X,+Y,-Y,+Z,-Z), matching
+    // generate_fixtures.sh's own toktx invocation order -- identical
+    // authored colors to the device-free flip test (texture_decode_test.cpp),
+    // here proven all the way through GPU upload + readback instead.
+    struct FaceColor {
+        uint32_t face;
+        std::array<uint8_t, 4> rgba;
+    };
+    constexpr std::array<FaceColor, 6> kExpected{{
+        {0, {0xFF, 0x00, 0x00, 0xFF}},  // +X red
+        {1, {0x00, 0xFF, 0xFF, 0xFF}},  // -X cyan
+        {2, {0x00, 0xFF, 0x00, 0xFF}},  // +Y green
+        {3, {0xFF, 0x00, 0xFF, 0xFF}},  // -Y magenta
+        {4, {0x00, 0x00, 0xFF, 0xFF}},  // +Z blue
+        {5, {0xFF, 0xFF, 0x00, 0xFF}},  // -Z yellow
+    }};
+
+    for (const FaceColor& expected : kExpected) {
+        for (uint32_t level : {0U, 5U}) {  // mip 0 (32x32) and the deepest 1x1 tail
+            const uint32_t extent = 32U >> level;
+            auto pixels = readBackSubresource(*fixture, image, VkExtent2D{extent, extent}, level, expected.face,
+                                               /*bytesPerTexel=*/4);
+            REQUIRE(pixels.has_value());
+            // A flat authored color box-filters to itself at every mip
+            // level (same reasoning as flat_withmips_uastc.ktx2's own
+            // deep-mip test) -- every texel in this level must match
+            // EXACTLY, not just the corners.
+            for (size_t texel = 0; texel < static_cast<size_t>(extent) * extent; ++texel) {
+                const uint8_t* px = pixels->data() + texel * 4;
+                CAPTURE(expected.face);
+                CAPTURE(level);
+                CHECK(px[0] == expected.rgba[0]);
+                CHECK(px[1] == expected.rgba[1]);
+                CHECK(px[2] == expected.rgba[2]);
+                CHECK(px[3] == expected.rgba[3]);
+            }
+        }
+    }
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+// ===== Equirect HDR (Radiance .hdr) input [Phase 5 Task 6, gate matrix
+// row 9/13] ===================================================================
+
+TEST_CASE("TextureCache: equirect .hdr loads as a real R16G16B16A16_SFLOAT texture -- a >1.0 texel survives "
+          "GPU upload + readback exactly [matrix row 13, the ticket's own explicit acceptance bar]") {
+    auto fixture = makeFixture("rx_asset_tc_hdr");
+    if (!fixture.has_value()) {
+        return;
+    }
+    makeCache(*fixture);
+    TextureHandle handle = fixture->cache->load(fixturePath("equirect_test.hdr"), TextureRole::Environment);
+    REQUIRE(handle.isValid());
+    CHECK_FALSE(handle == fixture->cache->checkerboardHandle());
+    const TextureRecord& record = fixture->cache->resolve(handle);
+    CHECK_FALSE(record.isCube);
+    CHECK(record.format == VK_FORMAT_R16G16B16A16_SFLOAT);
+    CHECK(record.width == 2);
+    CHECK(record.height == 2);
+
+    VkImage image = fixture->cache->rawImageForTesting(handle);
+    REQUIRE(image != VK_NULL_HANDLE);
+    auto pixels = readBackSubresource(*fixture, image, VkExtent2D{2, 2}, /*mipLevel=*/0, /*arrayLayer=*/0,
+                                       /*bytesPerTexel=*/8);
+    REQUIRE(pixels.has_value());
+    REQUIRE(pixels->size() == 2 * 2 * 8);
+
+    auto texelAt = [&](size_t index) {
+        uint64_t packed = 0;
+        std::memcpy(&packed, pixels->data() + index * 8, sizeof(packed));
+        return glm::unpackHalf4x16(packed);
+    };
+    // Same per-texel values as texture_decode_test.cpp's own device-free
+    // decodeStbImageHdr() test, this time round-tripped all the way
+    // through real GPU upload (glm::packHalf4x16 in decodeStbHdrForUpload())
+    // and a real GPU readback -- proving no accidental UNORM clamp/8-bit
+    // truncation anywhere in the path (row 13's own acceptance wording).
+    glm::vec4 tl = texelAt(0);
+    glm::vec4 br = texelAt(3);
+    CHECK(tl.r == doctest::Approx(4.0F).epsilon(0.001));
+    CHECK(tl.g == doctest::Approx(0.5F).epsilon(0.001));
+    CHECK(tl.b == doctest::Approx(0.5F).epsilon(0.001));
+    CHECK(tl.r > 1.0F);
+    CHECK(br.r == doctest::Approx(2.0F).epsilon(0.001));
+    CHECK(br.g == doctest::Approx(2.0F).epsilon(0.001));
+    CHECK(br.b == doctest::Approx(2.0F).epsilon(0.001));
+
+    TextureCacheStats stats = fixture->cache->stats();
+    CHECK(stats.byRole[static_cast<size_t>(TextureRole::Environment)].count >= 1);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("TextureCache: corrupt HDR bytes -> checkerboard fallback, no crash [mirrors the corrupt.ktx2/corrupt.png "
+          "tests' identical D11 contract]") {
+    auto fixture = makeFixture("rx_asset_tc_corrupthdr");
+    if (!fixture.has_value()) {
+        return;
+    }
+    makeCache(*fixture);
+    TextureHandle handle = fixture->cache->load(fixturePath("corrupt.hdr"), TextureRole::Environment);
     CHECK(handle == fixture->cache->checkerboardHandle());
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("TextureCache: TextureRole::Environment's own D11 fallback is a REAL, non-checkerboard, uniform "
+          "mid-gray R16G16B16A16_SFLOAT texture [coordinator ruling T6, matrix Open Question 3]") {
+    auto fixture = makeFixture("rx_asset_tc_env_fallback");
+    if (!fixture.has_value()) {
+        return;
+    }
+    makeCache(*fixture);
+    TextureHandle fallback = fixture->cache->fallbackHandle(TextureRole::Environment);
+    REQUIRE(fallback.isValid());
+    CHECK_FALSE(fallback == fixture->cache->checkerboardHandle());
+    const TextureRecord& record = fixture->cache->resolve(fallback);
+    CHECK(record.isFallback);
+    CHECK(record.format == VK_FORMAT_R16G16B16A16_SFLOAT);
+
+    VkImage image = fixture->cache->rawImageForTesting(fallback);
+    REQUIRE(image != VK_NULL_HANDLE);
+    auto pixels = readBackSubresource(*fixture, image, VkExtent2D{record.width, record.height}, /*mipLevel=*/0,
+                                       /*arrayLayer=*/0, /*bytesPerTexel=*/8);
+    REQUIRE(pixels.has_value());
+    uint64_t packed = 0;
+    std::memcpy(&packed, pixels->data(), sizeof(packed));
+    glm::vec4 decoded = glm::unpackHalf4x16(packed);
+    // Mid-gray (0.5) -- deliberately NOT black (D11's "neutral ambient",
+    // not "no light at all") and NOT sRGB 0.5 (Environment is always
+    // linear, roleExpectsSrgb()==false).
+    CHECK(decoded.r == doctest::Approx(0.5F).epsilon(0.001));
+    CHECK(decoded.g == doctest::Approx(0.5F).epsilon(0.001));
+    CHECK(decoded.b == doctest::Approx(0.5F).epsilon(0.001));
+    CHECK(decoded.a == doctest::Approx(1.0F).epsilon(0.001));
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 
@@ -852,25 +1091,27 @@ TEST_CASE("TextureCache: a real JPEG loads via stb to a real, non-fallback textu
 // exhaustion during a real registerRealTexture() call, so this path had
 // never been exercised. This TEST_CASE reproduces the exact failure mode
 // in isolation (no Sponza/network fetch needed): a fixture whose
-// sampledImages capacity is EXACTLY the D11 fallback-texture count (4:
-// checkerboard + white + flat-normal + neutral-MR, see
-// buildFallbackTextures()'s own comment) -- TextureCache::create() itself
-// must still succeed (it consumes exactly 4, zero spare), but the very
-// NEXT real texture load is guaranteed to hit
-// BindlessTable::registerSampledImage()'s own capacity-exhaustion
-// rejection deterministically, every run, on any device.
+// sampledImages capacity is EXACTLY the D11 fallback-texture count (5 as
+// of Phase 5 Task 6's Environment mid-gray addition: checkerboard + white
+// + flat-normal + neutral-MR + environment, see buildFallbackTextures()'s
+// own comment) -- TextureCache::create() itself must still succeed (it
+// consumes exactly 5, zero spare), but the very NEXT real texture load is
+// guaranteed to hit BindlessTable::registerSampledImage()'s own
+// capacity-exhaustion rejection deterministically, every run, on any
+// device.
 TEST_CASE("TextureCache: bindless sampled-image capacity exhaustion at registerRealTexture() -- checkerboard "
           "fallback, no crash, zero validation errors [fix round, Finding H1(b), independent review of #15]") {
-    rx::rhi::BindlessTable::Capacities tightCapacities{/*sampledImages=*/4, /*samplers=*/8, /*storageBuffers=*/1};
+    rx::rhi::BindlessTable::Capacities tightCapacities{/*sampledImages=*/5, /*samplers=*/8, /*storageBuffers=*/1};
     auto fixture = makeFixture("rx_asset_tc_capexhaust", tightCapacities);
     if (!fixture.has_value()) {
         return;
     }
-    // TextureCache::create() -> buildFallbackTextures() consumes exactly 4
+    // TextureCache::create() -> buildFallbackTextures() consumes exactly 5
     // sampled-image slots (checkerboard + white + flat-normal +
-    // neutral-MR) -- this must still succeed against a capacity of
-    // exactly 4, proving the fixture itself is sized precisely, not
-    // accidentally too small to even construct a cache.
+    // neutral-MR + [Phase 5 Task 6] environment) -- this must still
+    // succeed against a capacity of exactly 5, proving the fixture itself
+    // is sized precisely, not accidentally too small to even construct a
+    // cache.
     makeCache(*fixture);
     CHECK_FALSE(fixture->context.hasValidationErrors());
 

@@ -80,6 +80,16 @@ struct TextureRecord {
     uint32_t height = 0;
     uint32_t mipLevels = 0;
     VkFormat format = VK_FORMAT_UNDEFINED;
+    // [Phase 5 Task 6] True for a real (non-fallback) cubemap texture --
+    // `width`/`height` are ONE FACE's own extent, `mipLevels` is the
+    // PER-FACE level count, and the underlying rx::rhi::Texture2D's own
+    // view() is a VK_IMAGE_VIEW_TYPE_CUBE view over all 6 faces (never a
+    // plain 2D one) -- a future consumer (Stage 1 T9/T10's skybox/IBL
+    // bind) checks this before assuming a `samplerCube`-shaped binding is
+    // valid. Always false for every pre-Task-6 record and for the D11
+    // fallback/utility textures (all plain 2D, including the new
+    // Environment role's own mid-gray fallback -- see buildFallbackTextures()).
+    bool isCube = false;
     // [D24] false between evictForTesting() and DeletionQueue's actual
     // reclaim -- resolve() substitutes the checkerboard's record (still
     // isFallback=true, resident=true) whenever this is false.
@@ -104,9 +114,11 @@ struct TextureCacheStats {
         uint64_t bytes = 0;
         uint32_t count = 0;
     };
-    // Indexed by static_cast<size_t>(TextureRole) -- 6 entries, one per
-    // TextureRole enumerator (texture_decode.h).
-    std::array<RoleStats, 6> byRole{};
+    // Indexed by static_cast<size_t>(TextureRole) -- 7 entries, one per
+    // TextureRole enumerator (texture_decode.h; 7 as of Phase 5 Task 6's
+    // Environment addition, appended at the end -- see that enum's own
+    // comment for the index-stability contract this relies on).
+    std::array<RoleStats, 7> byRole{};
     uint64_t totalBytes = 0;
     uint32_t totalCount = 0;
 };
@@ -357,6 +369,17 @@ public:
     // Main-thread-only (D5), matching every other accessor on this class.
     [[nodiscard]] size_t samplerCountForTesting() const;
     [[nodiscard]] size_t liveTextureCountForTesting() const;
+    // [Phase 5 Task 6] The raw VkImage backing `handle` -- VK_NULL_HANDLE
+    // for a dead/nonresident handle. Production code has no need for this
+    // (the bindless index, TextureRecord::bindlessIndex, is the only
+    // production-supported access path to a resolved texture, exactly
+    // like every other TextureCache-owned resource) -- exists purely so a
+    // GPU test can do a direct vkCmdCopyImageToBuffer readback (matrix-
+    // p5t06-ktx2-cubemap-hdr row 11's own "direct face-indexed readback"
+    // alternative to a samplerCube-shaped bindless binding, which this
+    // class's own fixed 3-binding bindless layout has no slot for) without
+    // this test/diagnostic accessor.
+    [[nodiscard]] VkImage rawImageForTesting(TextureHandle handle) const;
 
 private:
     struct Entry {
@@ -386,9 +409,20 @@ private:
     // IS this function's own first caller) -- on any GPU-side failure;
     // callers translate that into whatever fallback is appropriate for
     // their own call site.
+    //
+    // [Phase 5 Task 6] `isCube`: when true, `width`/`height` are ONE
+    // FACE's own extent, `mipLevels` is the PER-FACE level count, and
+    // `uploadLevels` is expected to carry 6 * mipLevels entries (every
+    // entry's own ImageMipLevel::baseArrayLayer selecting its face) --
+    // builds via rx::rhi::Texture2D::createCubeForPresuppliedMips()
+    // instead of createForPresuppliedMips(). Defaulted to false so every
+    // pre-Task-6 call site (buildFallbackTextures()'s own
+    // uploadSolidColor()/uploadCheckerboard(), the plain-2D branch of
+    // applyDecodeResult()) needs no change at all.
     [[nodiscard]] TextureHandle registerRealTexture(TextureRole role, VkFormat format, uint32_t width,
                                                      uint32_t height, uint32_t mipLevels,
-                                                     std::span<const rx::rhi::Uploader::ImageMipLevel> uploadLevels);
+                                                     std::span<const rx::rhi::Uploader::ImageMipLevel> uploadLevels,
+                                                     bool isCube = false);
 
     // Logs the FAILURE `reason` (RX_LOG_ERROR, once per (debugName,
     // "failed") pair -- see shouldLogOnce() below) and returns
@@ -420,6 +454,18 @@ private:
     [[nodiscard]] std::optional<TextureHandle> uploadSolidColor(TextureRole role, std::array<uint8_t, 4> rgba,
                                                                   VkFormat format, std::string_view debugName);
     [[nodiscard]] std::optional<TextureHandle> uploadCheckerboard();
+    // [Phase 5 Task 6, coordinator ruling T6, gate matrix-p5t06-ktx2-
+    // cubemap-hdr Open Question 3] The Environment role's OWN D11
+    // fallback -- deliberately NOT uploadSolidColor()'s existing 8-bit
+    // RGBA path cast to float: a small uniform MID-GRAY (not black)
+    // VK_FORMAT_R16G16B16A16_SFLOAT texture, uploaded through the SAME
+    // real float-packing path decodeStbHdrForUpload()'s own output uses
+    // (glm::packHalf4x16) -- proves that path works end-to-end before
+    // Stage 1 lands a real HDR asset. Mid-gray (not black) reads as
+    // "neutral ambient" for an unbound environment slot, consistent with
+    // this project's own D22 interim-flat-ambient philosophy, rather than
+    // "no light at all".
+    [[nodiscard]] std::optional<TextureHandle> uploadEnvironmentFallback();
 
     [[nodiscard]] bool isFormatSupported(VkFormat format) const;
 
@@ -432,7 +478,9 @@ private:
     rx::core::HandlePool<struct TextureTag, Entry> pool_;
 
     TextureHandle checkerboard_;
-    std::array<TextureHandle, 6> roleFallback_{};  // indexed by static_cast<size_t>(TextureRole)
+    // 7 entries as of Phase 5 Task 6's Environment addition -- see
+    // TextureCacheStats::byRole's own identically-worded comment.
+    std::array<TextureHandle, 7> roleFallback_{};  // indexed by static_cast<size_t>(TextureRole)
 
     struct SamplerKey {
         VkSamplerAddressMode wrapS;

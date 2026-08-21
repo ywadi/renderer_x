@@ -38,6 +38,15 @@ namespace rx::asset {
 // material-slot context, or a future glTF extension's own data texture)
 // so the role->format table stays TOTAL without inventing slot-specific
 // entries no consumer needs yet.
+// [Phase 5 Task 6, ticket #42, gate matrix-p5t06-ktx2-cubemap-hdr row 8]
+// `Environment` is APPENDED at the end, never inserted before an existing
+// value -- static_cast<size_t>(role) must stay unchanged for every
+// pre-existing enumerator (matrix row 4's own regression bar: every
+// byRole[idx]/roleFallback_[idx] index in texture_cache.h would otherwise
+// silently shift). Scene-level (skybox/IBL equirect HDR or cubemap), not
+// a glTF material-slot concept -- glTF has no material slot named
+// "environment", so import_gltf.cpp's 5 material-slot call sites need no
+// change for this role to exist.
 enum class TextureRole : uint8_t {
     BaseColor,
     Emissive,
@@ -45,6 +54,7 @@ enum class TextureRole : uint8_t {
     MetallicRoughness,
     Occlusion,
     GenericData,
+    Environment,
 };
 
 const char* textureRoleName(TextureRole role);
@@ -212,22 +222,46 @@ public:
     // acceptance test (and D10/gate ruling #3's WARN) correct at all.
     khr_df_transfer_e containerTransferFunction() const { return originalTransfer_; }
 
-    // True iff the container declares a layout this Phase-4 TextureCache
-    // does not consume (isArray/isCubemap/numFaces>1/numLayers>1/
-    // numDimensions!=2) -- callers MUST check this before trusting
-    // width()/height()/levels() as "the whole texture" (matrix's
-    // "Cubemap/array/3D KTX2" row: WARN naming the layout + fallback,
-    // never a silently-wrong 2D slice). Also true whenever
-    // parseAndTranscode() itself already classified the container this
-    // way (outError == UnsupportedLayout) -- exposed as a method too so a
-    // caller holding a successfully-constructed instance never needs to
-    // separately remember the out-parameter from construction.
+    // [Phase 5 Task 6, gate matrix row 3/Open Question 1] True iff the
+    // container declares a layout this TextureCache does not consume --
+    // narrowed from Phase 4's blanket "isArray || isCubemap || numFaces>1
+    // || numLayers>1 || numDimensions!=2" to `numDimensions != 2 ||
+    // (isArray && !isCubemap) || (isCubemap && numLayers > 1)`: a plain,
+    // single-layer CUBEMAP (isCubemap && numLayers<=1, which by the KTX2
+    // spec always means numFaces==6) is now SUPPORTED -- flat 2D arrays
+    // and cube-arrays stay explicitly rejected (zero charter consumer,
+    // see the matrix's own Open Question 1), 1D/3D stays rejected
+    // unchanged. Callers MUST check this before trusting width()/
+    // height()/levels() as "the whole texture" (matrix's "Cubemap/array/
+    // 3D KTX2" row: WARN naming the layout + fallback, never a silently-
+    // wrong 2D slice). Also true whenever parseAndTranscode() itself
+    // already classified the container this way (outError ==
+    // UnsupportedLayout) -- exposed as a method too so a caller holding a
+    // successfully-constructed instance never needs to separately
+    // remember the out-parameter from construction.
     bool isUnsupportedLayout() const;
 
-    // Per-level extent+bytes, in ascending level order, reflecting
-    // whatever currentVkFormat() the data is actually in right now (see
-    // that accessor's own comment). Empty if isUnsupportedLayout().
-    std::vector<MipLevelData> levels() const;
+    // [Phase 5 Task 6] True iff this is a SUPPORTED single-layer cubemap
+    // (isUnsupportedLayout() == false and the container's own isCubemap
+    // flag is set) -- always false for a rejected/unsupported container
+    // or a plain 2D texture. numFaces() is always 6 whenever this is
+    // true (the KTX2 spec's own cubemap invariant) and always 1
+    // otherwise -- exposed for callers that want the raw count without
+    // re-deriving it from isCube().
+    bool isCube() const;
+    uint32_t numFaces() const;
+
+    // Per-level extent+bytes for face `face` (0 for a plain 2D texture --
+    // the only valid value there; 0..numFaces()-1, i.e. 0..5, for a
+    // supported cubemap, in the standard +X,-X,+Y,-Y,+Z,-Z KTX2 face
+    // order), in ascending level order, reflecting whatever
+    // currentVkFormat() the data is actually in right now (see that
+    // accessor's own comment). Empty if isUnsupportedLayout(). Defaulted
+    // to face 0 so every pre-existing call site (`decoded->levels()`,
+    // exclusively 2D textures before this task) keeps compiling and
+    // behaving byte-identically -- see matrix row 7's own "DecodedKtx2Texture
+    // ::levels()'s face-blindness" gap this parameter closes.
+    std::vector<MipLevelData> levels(uint32_t face = 0) const;
 
 private:
     DecodedKtx2Texture(ktxTexture2* texture, bool wasBasisEncoded, bool unsupportedLayout, VkFormat currentFormat,
@@ -290,6 +324,36 @@ std::optional<DecodedStbImage> decodeStbImage(std::span<const std::byte> bytes, 
 VkFormat stbRgba8Format(TextureRole role);
 
 // ---------------------------------------------------------------------
+// [Phase 5 Task 6, ticket #42, gate matrix-p5t06-ktx2-cubemap-hdr row 9]
+// Radiance (.hdr) equirect float input -- library-first: stb_image.h
+// (already vendored, the SAME translation unit decodeStbImage() above
+// calls into) already declares+implements stbi_loadf_from_memory()/
+// stbi_is_hdr_from_memory() -- genuinely zero new dependency. This closes
+// a real, previously-silent correctness gap: decodeStbImage() above
+// (stbi_load_from_memory, the 8-bit entry point) auto-detects a Radiance
+// input internally and decodes it through stb's own
+// stbi__hdr_to_ldr() tonemap+clamp path with NO warning at all --
+// decodeTextureForUpload() below now checks stbi_is_hdr_from_memory()
+// BEFORE ever reaching that 8-bit branch, so a .hdr file is routed here
+// instead, never silently tonemapped.
+// ---------------------------------------------------------------------
+
+struct DecodedStbHdrImage {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<float> rgba32;  // tightly packed, 4 floats/texel (forced via desired_channels=4)
+};
+
+// Decodes `bytes` via stbi_loadf_from_memory -- same failure-reporting
+// contract as decodeStbImage() (std::nullopt + stbi_failure_reason() on
+// any failure, caller maps to the D11 checkerboard). Caller (this header's
+// own decodeTextureForUpload()) is responsible for calling
+// stbi_is_hdr_from_memory() FIRST to route here at all -- this function
+// itself does not re-check (mirrors decodeStbImage()'s own "caller
+// already decided this is the right path" contract).
+std::optional<DecodedStbHdrImage> decodeStbImageHdr(std::span<const std::byte> bytes, std::string* outFailureReason);
+
+// ---------------------------------------------------------------------
 // [Phase 4 Stage 1 Task 15] Combined KTX2/stb decode -- worker-safe
 // (thread-affinity: NONE, same as every other function in this header):
 // consolidates exactly the branch logic TextureCache::loadKtx2Bytes()/
@@ -313,6 +377,14 @@ struct DecodedTextureLevel {
     uint32_t level = 0;
     uint32_t width = 0;
     uint32_t height = 0;
+    // [Phase 5 Task 6] Cube face index (0..5, standard KTX2 +X,-X,+Y,-Y,
+    // +Z,-Z order) this level's bytes belong to -- 0 for every non-cube
+    // producer of this type (every EXISTING call site: decodeStbForUpload()'s
+    // LDR/HDR paths, decodeKtx2ForUpload()'s plain-2D branch), so
+    // TextureCache::applyDecodeResult()'s ImageMipLevel::baseArrayLayer
+    // mapping (upload.h) stays 0 -- byte-identical to every pre-Task-6
+    // upload -- for anything that isn't a cube.
+    uint32_t faceIndex = 0;
     std::vector<std::byte> bytes;
 };
 
@@ -396,6 +468,14 @@ struct TextureDecodeResult {
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0;
     uint32_t height = 0;
+    // [Phase 5 Task 6] True for a supported cubemap KTX2 -- `levels` then
+    // holds 6 * perFaceMipLevels entries (every face's DecodedTextureLevel
+    // ::faceIndex populated 0..5), never a mix of cube and non-cube
+    // entries. Always false for every pre-Task-6 producer of this struct
+    // (plain 2D KTX2, stb LDR/HDR) -- `levels.size()` alone still gives
+    // the correct per-face-and-per-texture mip count either way (divide
+    // by 6 only when this is true).
+    bool isCube = false;
     std::vector<DecodedTextureLevel> levels;
 };
 
@@ -404,6 +484,15 @@ struct TextureDecodeResult {
 // `maxImageDimension2D_`, passed explicitly since this function has no
 // TextureCache instance to read it from. `isFormatSupported`: same
 // FormatSupportQuery contract as planTranscodeFormat() above.
+//
+// [Phase 5 Task 6] Dispatch order: looksLikeKtx2(bytes) routes to the
+// KTX2 path (now cube-aware, TextureDecodeResult::isCube) FIRST;
+// otherwise stbi_is_hdr_from_memory(bytes) routes to the NEW
+// decodeStbImageHdr()-backed float path (VK_FORMAT_R16G16B16A16_SFLOAT,
+// per the phase's environment-upload-format ruling) BEFORE the plain
+// 8-bit stb branch ever gets a chance to silently tonemap it (see
+// decodeStbImageHdr()'s own header comment); everything else falls to
+// the unchanged 8-bit stb (PNG/JPG) path.
 TextureDecodeResult decodeTextureForUpload(std::span<const std::byte> bytes, TextureRole role,
                                             uint32_t maxImageDimension2D, const FormatSupportQuery& isFormatSupported);
 

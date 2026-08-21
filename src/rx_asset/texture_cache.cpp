@@ -5,6 +5,8 @@
 #include <rx_rhi_vk/buffer.h>
 #include <rx_rhi_vk/deletion_queue.h>
 #include <rx_rhi_vk/device.h>
+#include <glm/gtc/packing.hpp>
+#include <glm/vec4.hpp>
 #include <algorithm>
 #include <cstring>
 #include <functional>
@@ -187,13 +189,55 @@ bool TextureCache::shouldLogOnce(std::string_view debugName, std::string_view ca
 
 TextureHandle TextureCache::registerRealTexture(TextureRole role, VkFormat format, uint32_t width, uint32_t height,
                                                   uint32_t mipLevels,
-                                                  std::span<const rx::rhi::Uploader::ImageMipLevel> uploadLevels) {
-    auto texture = rx::rhi::Texture2D::createForPresuppliedMips(
-        device_.physicalDevice(), device_.device(), allocator_, VkExtent2D{width, height}, format,
-        VK_IMAGE_USAGE_SAMPLED_BIT, mipLevels, rx::rhi::MemoryCategory::Texture);
+                                                  std::span<const rx::rhi::Uploader::ImageMipLevel> uploadLevels,
+                                                  bool isCube) {
+    // [Phase 5 Task 6] `width`/`height`/`mipLevels` are per-FACE for a
+    // cube (see this method's own header comment) -- createCubeForPresuppliedMips()
+    // vs. createForPresuppliedMips() is the only branch point; everything
+    // below (upload, bindless registration, Entry/stats bookkeeping) is
+    // identical for both, since Uploader::uploadImageMips() and
+    // BindlessTable::registerSampledImage() both already accept a cube
+    // Texture2D/view transparently (matrix rows 7/6 -- verified, no
+    // further branching needed).
+    //
+    // TRANSFER_SRC_BIT, additionally: every REAL (non-fallback and
+    // fallback alike) texture this cache creates is now also a valid
+    // vkCmdCopyImage(ToBuffer) SOURCE, not sampled-only. This is the
+    // caller-supplied `usage` parameter both Texture2D factories already
+    // OR with their own mandatory TRANSFER_DST_BIT (texture.h's own
+    // documented contract) -- adding SRC here does not touch either
+    // factory's "no blit-format-feature probe / never called with
+    // recordMipChainBlit()" mip-GENERATION contract at all (that
+    // reasoning is about BLIT-source use for THIS class's own mip-chain
+    // generation mechanism, which createForPresuppliedMips()/
+    // createCubeForPresuppliedMips() never invoke regardless of this
+    // bit). Cost is zero on any conformant Vulkan implementation
+    // (TRANSFER_SRC_BIT is part of the Vulkan spec's own mandatory
+    // format-feature support for every optimal-tiling SAMPLED_IMAGE
+    // format this engine uses). Rationale: gate matrix-p5t06-ktx2-
+    // cubemap-hdr row 11 itself names "direct face-indexed readback" as
+    // the GPU test technique for a cube texture's per-face values --
+    // exactly a raw vkCmdCopyImageToBuffer off a TextureCache-resident
+    // image (texture_cache_test.cpp's own rawImageForTesting()-based
+    // tests) -- and the identical need applies to the new
+    // R16G16B16A16_SFLOAT Environment HDR path's own value-readback test
+    // (row 13's ">1.0 texel survives" bar). A generically useful
+    // capability (debug/screenshot capture of any resident texture, a
+    // future mip-streaming downgrade copy), not test-only surface area
+    // bolted on: nothing about the bit itself is test-specific, only
+    // today's callers of it are.
+    constexpr VkImageUsageFlags kRealTextureUsage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    auto texture = isCube ? rx::rhi::Texture2D::createCubeForPresuppliedMips(
+                                 device_.physicalDevice(), device_.device(), allocator_, VkExtent2D{width, height},
+                                 format, kRealTextureUsage, mipLevels, rx::rhi::MemoryCategory::Texture)
+                           : rx::rhi::Texture2D::createForPresuppliedMips(
+                                 device_.physicalDevice(), device_.device(), allocator_, VkExtent2D{width, height},
+                                 format, kRealTextureUsage, mipLevels, rx::rhi::MemoryCategory::Texture);
     if (!texture.has_value()) {
-        RX_LOG_ERROR("rx_asset: TextureCache: Texture2D::createForPresuppliedMips failed ({}x{}, {} levels, format={})",
-                     width, height, mipLevels, static_cast<int>(format));
+        RX_LOG_ERROR(
+            "rx_asset: TextureCache: Texture2D::{} failed ({}x{}, {} levels, format={}, isCube={})",
+            isCube ? "createCubeForPresuppliedMips" : "createForPresuppliedMips", width, height, mipLevels,
+            static_cast<int>(format), isCube);
         return TextureHandle{};
     }
 
@@ -248,6 +292,7 @@ TextureHandle TextureCache::registerRealTexture(TextureRole role, VkFormat forma
     entry.record.height = height;
     entry.record.mipLevels = mipLevels;
     entry.record.format = format;
+    entry.record.isCube = isCube;
     entry.record.resident = true;
     entry.image = std::move(texture);
     entry.bindlessHandle = bindlessHandle;
@@ -323,6 +368,42 @@ std::optional<TextureHandle> TextureCache::uploadCheckerboard() {
     return handle;
 }
 
+std::optional<TextureHandle> TextureCache::uploadEnvironmentFallback() {
+    // [Coordinator ruling T6, gate matrix Open Question 3] Small (4x4,
+    // matching this class's own checkerboard/solid-color fallback sizing
+    // convention) uniform MID-GRAY, VK_FORMAT_R16G16B16A16_SFLOAT --
+    // uploaded through the identical glm::packHalf4x16 float-packing this
+    // class's real HDR path (TextureCache::applyDecodeResult(), fed by
+    // decodeStbHdrForUpload()) produces, rather than reusing
+    // uploadSolidColor()'s 8-bit RGBA-cast-to-float shortcut -- proves the
+    // real float upload path works even before Stage 1 lands an actual
+    // HDR asset.
+    constexpr uint32_t kSize = 4;
+    constexpr float kMidGray = 0.5F;  // linear mid-gray, not sRGB 0.5 -- Environment is always linear (roleExpectsSrgb()==false)
+    const uint64_t packedTexel = glm::packHalf4x16(glm::vec4(kMidGray, kMidGray, kMidGray, 1.0F));
+
+    std::array<uint64_t, kSize * kSize> pixels{};
+    pixels.fill(packedTexel);
+
+    rx::rhi::Uploader::ImageMipLevel level{};
+    level.data = pixels.data();
+    level.size = pixels.size() * sizeof(uint64_t);
+    level.mipLevel = 0;
+    level.extent = VkExtent2D{kSize, kSize};
+
+    TextureHandle handle =
+        registerRealTexture(TextureRole::Environment, VK_FORMAT_R16G16B16A16_SFLOAT, kSize, kSize, 1,
+                             std::span<const rx::rhi::Uploader::ImageMipLevel>(&level, 1));
+    if (!handle.isValid()) {
+        RX_LOG_ERROR("rx_asset: TextureCache: failed to build the D11 Environment mid-gray fallback texture");
+        return std::nullopt;
+    }
+    if (Entry* entry = pool_.get(handle)) {
+        entry->record.isFallback = true;
+    }
+    return handle;
+}
+
 bool TextureCache::buildFallbackTextures() {
     auto checker = uploadCheckerboard();
     if (!checker.has_value()) {
@@ -334,7 +415,10 @@ bool TextureCache::buildFallbackTextures() {
     // flat-normal + neutral-MR") shared across the roles that expect an
     // "as if untextured" (texture-times-factor-equals-factor) sampled
     // value -- built once each, then fanned out by role below, rather
-    // than 6 separate near-identical GPU allocations.
+    // than 6 separate near-identical GPU allocations. [Phase 5 Task 6]
+    // Environment gets its OWN, fourth, real fallback texture (mid-gray
+    // float, uploadEnvironmentFallback() above) -- it has no "as if
+    // untextured * factor" precedent to share with any existing role.
     auto white =
         uploadSolidColor(TextureRole::GenericData, {255, 255, 255, 255}, VK_FORMAT_R8G8B8A8_UNORM, "fallback:white");
     // Tangent-space "straight up" normal, UNORM-encoded ((0,0,1) ->
@@ -345,7 +429,8 @@ bool TextureCache::buildFallbackTextures() {
         uploadSolidColor(TextureRole::Normal, {128, 128, 255, 255}, VK_FORMAT_R8G8B8A8_UNORM, "fallback:flat-normal");
     auto neutralMr = uploadSolidColor(TextureRole::MetallicRoughness, {255, 255, 255, 255}, VK_FORMAT_R8G8B8A8_UNORM,
                                        "fallback:neutral-MR");
-    if (!white.has_value() || !flatNormal.has_value() || !neutralMr.has_value()) {
+    auto environment = uploadEnvironmentFallback();
+    if (!white.has_value() || !flatNormal.has_value() || !neutralMr.has_value() || !environment.has_value()) {
         return false;
     }
 
@@ -355,17 +440,20 @@ bool TextureCache::buildFallbackTextures() {
     roleFallback_[static_cast<size_t>(TextureRole::Normal)] = *flatNormal;
     roleFallback_[static_cast<size_t>(TextureRole::MetallicRoughness)] = *neutralMr;
     roleFallback_[static_cast<size_t>(TextureRole::Occlusion)] = *neutralMr;
+    roleFallback_[static_cast<size_t>(TextureRole::Environment)] = *environment;
 
-    // [D25] ONE flush()+wait() covering all 4 fallback uploads together --
-    // load-bearing, not cosmetic: without this, their upload commands stay
-    // RECORDED-but-never-submitted on this Uploader's active command
-    // buffer (`recording_` stays true) for as long as no LATER load() call
-    // happens to trigger a flush of its own. A TextureCache that is
-    // constructed and then torn down without ever loading a REAL texture
-    // (every load() call resolving to the checkerboard fallback, e.g. this
-    // class's own cubemap/corrupt/missing-byte-source failure-path tests)
-    // would otherwise reach ~TextureCache() with those 4 images destroyed
-    // while Uploader's OWN destructor still auto-flushes (calls
+    // [D25] ONE flush()+wait() covering all 5 fallback uploads together
+    // (checkerboard + white + flat-normal + neutral-MR + [Phase 5 Task 6]
+    // the new Environment mid-gray) -- load-bearing, not cosmetic: without
+    // this, their upload commands stay RECORDED-but-never-submitted on
+    // this Uploader's active command buffer (`recording_` stays true) for
+    // as long as no LATER load() call happens to trigger a flush of its
+    // own. A TextureCache that is constructed and then torn down without
+    // ever loading a REAL texture (every load() call resolving to the
+    // checkerboard fallback, e.g. this class's own corrupt/missing-byte-
+    // source failure-path tests) would otherwise reach ~TextureCache()
+    // with those images destroyed while Uploader's OWN destructor still
+    // auto-flushes (calls
     // vkEndCommandBuffer on) the very command buffer that recorded copies
     // into them -- reproduced directly, empirically, as a real
     // UNASSIGNED-CoreValidation-DrawState-InvalidCommandBuffer-VkImage
@@ -405,11 +493,21 @@ TextureHandle TextureCache::applyDecodeResult(const TextureDecodeResult& decoded
         u.size = static_cast<VkDeviceSize>(lvl.bytes.size());
         u.mipLevel = lvl.level;
         u.extent = VkExtent2D{lvl.width, lvl.height};
+        // [Phase 5 Task 6] 0 for every non-cube decode (lvl.faceIndex's
+        // own default) -- byte-identical to every pre-Task-6 upload; the
+        // real face 0..5 for a cube decode's own 6*perFaceLevels entries.
+        u.baseArrayLayer = lvl.faceIndex;
         uploadLevels.push_back(u);
     }
 
+    // [Phase 5 Task 6] `decoded.levels.size()` is the PER-FACE mip count
+    // times 6 for a cube decode -- registerRealTexture()'s own `mipLevels`
+    // parameter wants the PER-FACE count (matches its `isCube` contract,
+    // this method's own header comment).
+    const uint32_t mipLevels = decoded.isCube ? static_cast<uint32_t>(decoded.levels.size() / 6)
+                                               : static_cast<uint32_t>(decoded.levels.size());
     TextureHandle handle = registerRealTexture(decoded.role, decoded.format, decoded.width, decoded.height,
-                                                static_cast<uint32_t>(decoded.levels.size()), uploadLevels);
+                                                mipLevels, uploadLevels, decoded.isCube);
     if (!handle.isValid()) {
         return failureFallback(debugName, "GPU upload/bindless registration failed");
     }
@@ -604,6 +702,15 @@ size_t TextureCache::samplerCountForTesting() const {
 size_t TextureCache::liveTextureCountForTesting() const {
     RX_ASSERT_MAIN_THREAD("TextureCache::liveTextureCountForTesting");
     return pool_.liveCount();
+}
+
+VkImage TextureCache::rawImageForTesting(TextureHandle handle) const {
+    RX_ASSERT_MAIN_THREAD("TextureCache::rawImageForTesting");
+    const Entry* entry = pool_.get(handle);
+    if (entry == nullptr || !entry->image.has_value()) {
+        return VK_NULL_HANDLE;
+    }
+    return entry->image->image();
 }
 
 void TextureCache::evictForTesting(TextureHandle handle, uint64_t frameIndex) {

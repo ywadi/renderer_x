@@ -3,11 +3,15 @@
 #include <rx_core/log.h>
 #include <rx_core/log_forward_sink.h>
 #include <spdlog/sinks/ostream_sink.h>
+#include <stb_image.h>
+#include <glm/gtc/packing.hpp>
+#include <glm/vec4.hpp>
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <optional>
 #include <sstream>
@@ -314,9 +318,88 @@ TEST_CASE("DecodedKtx2Texture: non-multiple-of-4 base dimensions (6x5) parse wit
     CHECK(levels[0].bytes.size() == 64);
 }
 
-TEST_CASE("DecodedKtx2Texture: cubemap fixture is classified UnsupportedLayout, never silently treated as a "
-          "2D slice [matrix 'Cubemap/array/3D' row]") {
+// [Phase 5 Task 6, ticket #42, gate matrix-p5t06-ktx2-cubemap-hdr row 2 --
+// the DISCRIMINATION PROOF] The Phase 4 test this replaces asserted
+// cubemap.ktx2 was REJECTED (isUnsupportedLayout()==true) -- exactly the
+// assertion a no-op cube implementation could leave passing. This test
+// loads the SAME fixture (now regenerated with a real, uploadable format
+// -- see generate_fixtures.sh's own comment) and asserts the FLIP:
+// isUnsupportedLayout() is now false, isCube() is true, and every one of
+// the 6 faces' own per-texel bytes matches its authored flat color
+// EXACTLY (decoded-value discipline, not just "it parsed") -- the flip
+// itself, not merely new coverage, is what this row requires.
+TEST_CASE("DecodedKtx2Texture: cubemap fixture now parses as a SUPPORTED cube -- isUnsupportedLayout() flips to "
+          "false, every face's real per-texel color is decoded correctly [matrix row 2, discrimination proof]") {
     auto bytes = readFixture("cubemap.ktx2");
+    TranscodePlan plan = planTranscodeFormat(TextureRole::GenericData, alwaysSupported);
+    Ktx2ParseError error = Ktx2ParseError::None;
+    auto decoded = DecodedKtx2Texture::parseAndTranscode(std::span<const std::byte>(bytes), plan, error);
+    REQUIRE(decoded.has_value());
+    CHECK_FALSE(decoded->isUnsupportedLayout());
+    CHECK(error == Ktx2ParseError::None);
+    CHECK(decoded->isCube());
+    CHECK(decoded->numFaces() == 6);
+    CHECK(decoded->width() == 4);
+    CHECK(decoded->height() == 4);
+
+    // Standard KTX2 cube face order (+X,-X,+Y,-Y,+Z,-Z), matching
+    // generate_fixtures.sh's own toktx invocation order exactly.
+    struct FaceColor {
+        uint32_t face;
+        std::array<uint8_t, 4> rgba;
+    };
+    constexpr std::array<FaceColor, 6> kExpected{{
+        {0, {0xFF, 0x00, 0x00, 0xFF}},  // +X red
+        {1, {0x00, 0xFF, 0xFF, 0xFF}},  // -X cyan
+        {2, {0x00, 0xFF, 0x00, 0xFF}},  // +Y green
+        {3, {0xFF, 0x00, 0xFF, 0xFF}},  // -Y magenta
+        {4, {0x00, 0x00, 0xFF, 0xFF}},  // +Z blue
+        {5, {0xFF, 0xFF, 0x00, 0xFF}},  // -Z yellow
+    }};
+
+    for (const FaceColor& expected : kExpected) {
+        auto levels = decoded->levels(expected.face);
+        REQUIRE(levels.size() == 1);  // cubemap.ktx2 is deliberately single-level (row 6's own discrimination fixture)
+        CHECK(levels[0].width == 4);
+        CHECK(levels[0].height == 4);
+        REQUIRE(levels[0].bytes.size() == 4 * 4 * 4);  // 4x4 texels, RGBA8
+        for (size_t texel = 0; texel < 16; ++texel) {
+            const auto* px = reinterpret_cast<const uint8_t*>(levels[0].bytes.data()) + texel * 4;
+            CHECK(px[0] == expected.rgba[0]);
+            CHECK(px[1] == expected.rgba[1]);
+            CHECK(px[2] == expected.rgba[2]);
+            CHECK(px[3] == expected.rgba[3]);
+        }
+    }
+}
+
+// [Phase 5 Task 6, gate matrix row 3] Flat 2D ARRAY (isArray && !isCubemap)
+// stays explicitly REJECTED after the narrowed predicate -- its own
+// dedicated regression fixture/test, distinct from the cube-array test
+// below (the two rejection clauses are independent, gate matrix Open
+// Question 1).
+TEST_CASE("DecodedKtx2Texture: flat 2D-array KTX2 (isArray, numLayers>1, not a cubemap) stays REJECTED -- "
+          "cubemap-only support, zero charter consumer for a general texture array [matrix row 3]") {
+    auto bytes = readFixture("array2d_rejected.ktx2");
+    TranscodePlan plan = planTranscodeFormat(TextureRole::GenericData, alwaysSupported);
+    Ktx2ParseError error = Ktx2ParseError::None;
+    auto decoded = DecodedKtx2Texture::parseAndTranscode(std::span<const std::byte>(bytes), plan, error);
+    REQUIRE(decoded.has_value());  // structurally valid, parseable -- just an unsupported LAYOUT
+    CHECK(decoded->isUnsupportedLayout());
+    CHECK_FALSE(decoded->isCube());
+    CHECK(error == Ktx2ParseError::UnsupportedLayout);
+    CHECK(decoded->levels().empty());
+}
+
+// [Phase 5 Task 6, gate matrix row 3] CUBE-ARRAY (isCubemap && numLayers>1)
+// ALSO stays explicitly REJECTED -- the narrowed predicate's OTHER
+// rejection clause, distinct from the flat-array test above. This is the
+// one shape that could plausibly be mistaken for "just a bigger cubemap"
+// by an implementation that only checked isCubemap without also checking
+// numLayers -- this test exists specifically to catch that mistake.
+TEST_CASE("DecodedKtx2Texture: cube-array KTX2 (isCubemap AND numLayers>1) stays REJECTED, distinct from the "
+          "now-supported single-layer cubemap case [matrix row 3]") {
+    auto bytes = readFixture("cubearray_rejected.ktx2");
     TranscodePlan plan = planTranscodeFormat(TextureRole::GenericData, alwaysSupported);
     Ktx2ParseError error = Ktx2ParseError::None;
     auto decoded = DecodedKtx2Texture::parseAndTranscode(std::span<const std::byte>(bytes), plan, error);
@@ -453,6 +536,92 @@ TEST_CASE("decodeStbImage: an empty byte span fails cleanly") {
     std::string failureReason;
     auto decoded = decodeStbImage(std::span<const std::byte>(empty), &failureReason);
     CHECK_FALSE(decoded.has_value());
+}
+
+// ===== decodeStbImageHdr() [Phase 5 Task 6, ticket #42, gate matrix-
+// p5t06-ktx2-cubemap-hdr row 9/13] ==========================================
+
+TEST_CASE("decodeStbImageHdr: a real Radiance .hdr fixture decodes to the exact authored float values, "
+          "including super-unity (>1.0) texels -- decoded-value discipline, the ticket's own explicit bar") {
+    auto bytes = readFixture("equirect_test.hdr");
+    CHECK(stbi_is_hdr_from_memory(reinterpret_cast<const stbi_uc*>(bytes.data()), static_cast<int>(bytes.size())) !=
+          0);
+
+    std::string failureReason;
+    auto decoded = decodeStbImageHdr(std::span<const std::byte>(bytes), &failureReason);
+    REQUIRE(decoded.has_value());
+    CHECK(decoded->width == 2);
+    CHECK(decoded->height == 2);
+    REQUIRE(decoded->rgba32.size() == 2 * 2 * 4);
+
+    // Exact per-texel values, matching generate_fixtures.sh's own RGBE
+    // encoding comment precisely (mantissa_byte * ldexp(1, exponent-136)):
+    // TL=(4,0.5,0.5) TR=(0.5,4,0.5) BL=(0.5,0.5,4) BR=(2,2,2). Row-major,
+    // top-to-bottom (stb's own HDR row order matches the Radiance "-Y"
+    // top-to-bottom convention this fixture was authored with).
+    auto texel = [&](size_t index) {
+        return glm::vec4(decoded->rgba32[index * 4 + 0], decoded->rgba32[index * 4 + 1],
+                          decoded->rgba32[index * 4 + 2], decoded->rgba32[index * 4 + 3]);
+    };
+    constexpr float kEps = 0.0001F;
+    glm::vec4 tl = texel(0);
+    glm::vec4 tr = texel(1);
+    glm::vec4 bl = texel(2);
+    glm::vec4 br = texel(3);
+    CHECK(tl.r == doctest::Approx(4.0F).epsilon(kEps));
+    CHECK(tl.g == doctest::Approx(0.5F).epsilon(kEps));
+    CHECK(tl.b == doctest::Approx(0.5F).epsilon(kEps));
+    CHECK(tr.r == doctest::Approx(0.5F).epsilon(kEps));
+    CHECK(tr.g == doctest::Approx(4.0F).epsilon(kEps));
+    CHECK(tr.b == doctest::Approx(0.5F).epsilon(kEps));
+    CHECK(bl.r == doctest::Approx(0.5F).epsilon(kEps));
+    CHECK(bl.g == doctest::Approx(0.5F).epsilon(kEps));
+    CHECK(bl.b == doctest::Approx(4.0F).epsilon(kEps));
+    CHECK(br.r == doctest::Approx(2.0F).epsilon(kEps));
+    CHECK(br.g == doctest::Approx(2.0F).epsilon(kEps));
+    CHECK(br.b == doctest::Approx(2.0F).epsilon(kEps));
+    // The explicit >1.0-survives bar, asserted directly and loudly (not
+    // just implied by the exact-value checks above).
+    CHECK(tl.r > 1.0F);
+}
+
+TEST_CASE("decodeStbImageHdr: a corrupt/truncated .hdr byte stream fails cleanly with a non-empty failure "
+          "reason, never a crash [mirrors decodeStbImage()'s identical corrupt.png test]") {
+    auto bytes = readFixture("corrupt.hdr");
+    std::string failureReason;
+    auto decoded = decodeStbImageHdr(std::span<const std::byte>(bytes), &failureReason);
+    CHECK_FALSE(decoded.has_value());
+    CHECK_FALSE(failureReason.empty());
+}
+
+TEST_CASE("decodeTextureForUpload: an .hdr byte stream routes to the HDR float path BEFORE the 8-bit stb branch "
+          "ever sees it -- VK_FORMAT_R16G16B16A16_SFLOAT output, closing the silent-tonemap gap row 9's own "
+          "addendum documents") {
+    auto bytes = readFixture("equirect_test.hdr");
+    TextureDecodeResult result =
+        decodeTextureForUpload(std::span<const std::byte>(bytes), TextureRole::Environment,
+                                /*maxImageDimension2D=*/4096, alwaysSupported);
+    REQUIRE(result.outcome == TextureDecodeResult::Outcome::Ready);
+    CHECK(result.format == VK_FORMAT_R16G16B16A16_SFLOAT);
+    CHECK(result.width == 2);
+    CHECK(result.height == 2);
+    CHECK_FALSE(result.isCube);
+    REQUIRE(result.levels.size() == 1);
+    CHECK(result.levels[0].level == 0);
+    CHECK(result.levels[0].faceIndex == 0);
+    // 2x2 texels * 8 bytes/texel (R16G16B16A16_SFLOAT, packed via
+    // glm::packHalf4x16) == 32 bytes.
+    CHECK(result.levels[0].bytes.size() == 2 * 2 * 8);
+
+    // Decode the packed bytes back and confirm the >1.0 texel survived
+    // the SAME float32->float16 packing this task's real upload path
+    // uses (glm::packHalf4x16/glm::unpackHalf4x16 are exact inverses for
+    // any value representable in half precision -- 4.0 is exact).
+    uint64_t packedTl = 0;
+    std::memcpy(&packedTl, result.levels[0].bytes.data(), sizeof(packedTl));
+    glm::vec4 decodedTl = glm::unpackHalf4x16(packedTl);
+    CHECK(decodedTl.r == doctest::Approx(4.0F).epsilon(0.001));
+    CHECK(decodedTl.r > 1.0F);
 }
 
 TEST_CASE("stbRgba8Format: role-correct SRGB vs UNORM, mirroring roleFormatTable()'s own colorspace column") {

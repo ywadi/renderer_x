@@ -2,6 +2,8 @@
 #include <rx_core/log.h>
 #include <stb_image.h>
 #include <stb_image_resize2.h>
+#include <glm/gtc/packing.hpp>
+#include <glm/vec4.hpp>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -24,6 +26,8 @@ const char* textureRoleName(TextureRole role) {
             return "occlusion";
         case TextureRole::GenericData:
             return "genericData";
+        case TextureRole::Environment:
+            return "environment";
     }
     return "unknown";
 }
@@ -36,7 +40,9 @@ bool roleExpectsSrgb(TextureRole role) {
     // spec text, occlusionTexture is convention-linear (the spec defines
     // only its scalar semantics, never a transfer function -- gate matrix
     // Conflict C3, cited precisely rather than lumped in with the
-    // MUST-linear pair).
+    // MUST-linear pair). [Phase 5 Task 6] Environment is physical light
+    // data (radiance), always linear -- never sRGB-encoded, same
+    // reasoning as MetallicRoughness/Occlusion.
     return role == TextureRole::BaseColor || role == TextureRole::Emissive;
 }
 
@@ -67,6 +73,22 @@ const RoleFormatEntry& roleFormatTable(TextureRole role) {
         case TextureRole::MetallicRoughness:
         case TextureRole::Occlusion:
         case TextureRole::GenericData:
+            return kUnormData;
+        case TextureRole::Environment:
+            // [Phase 5 Task 6, gate matrix row 8's own disposition] DEAD
+            // CODE for this task's actual HDR path -- decodeStbImageHdr()'s
+            // caller (decodeStbHdrForUpload(), below) bypasses
+            // planTranscodeFormat()/roleFormatTable() entirely (a Radiance
+            // .hdr file always uploads as VK_FORMAT_R16G16B16A16_SFLOAT
+            // per the phase's environment-upload-format ruling, never a
+            // Basis-transcode-shaped format). This entry exists ONLY to
+            // keep the switch total (an Environment-role KTX2 -- e.g. a
+            // conceivable future Basis-encoded environment cubemap -- must
+            // still resolve to SOME entry): linear/non-sRGB, matching
+            // Environment's own roleExpectsSrgb()==false, reusing
+            // kUnormData rather than inventing a fourth near-identical
+            // constant for a path nothing in this task's fixtures
+            // exercises.
             return kUnormData;
     }
     // Unreachable given the exhaustive switch above (every TextureRole
@@ -138,8 +160,17 @@ bool exceedsDimensionLimit(uint32_t width, uint32_t height, uint32_t maxDimensio
 
 namespace {
 
+// [Phase 5 Task 6, ticket #42, gate matrix-p5t06-ktx2-cubemap-hdr row 3/
+// Open Question 1, coordinator ruling T6] NARROWED from Phase 4's blanket
+// rejection: a plain, single-layer CUBEMAP (isCubemap && numLayers <= 1,
+// which by the KTX2 spec always means numFaces == 6) is now SUPPORTED.
+// Flat 2D arrays (isArray && !isCubemap) and cube-arrays (isCubemap &&
+// numLayers > 1) stay explicitly rejected -- zero charter consumer needs
+// either anywhere in the Stage 0-4 plan text (matrix's own Open Question
+// 1 finding); FG1's real consumer needs exactly ONE cubemap per
+// environment. 1D/3D (numDimensions != 2) stays rejected unchanged.
 bool isUnsupportedLayoutFor(const ktxTexture2* tex) {
-    return tex->isArray || tex->isCubemap || tex->numFaces > 1 || tex->numLayers > 1 || tex->numDimensions != 2;
+    return tex->numDimensions != 2 || (tex->isArray && !tex->isCubemap) || (tex->isCubemap && tex->numLayers > 1);
 }
 
 }  // namespace
@@ -269,7 +300,16 @@ uint32_t DecodedKtx2Texture::numLevels() const { return texture_ != nullptr ? te
 VkFormat DecodedKtx2Texture::currentVkFormat() const { return currentFormat_; }
 bool DecodedKtx2Texture::isUnsupportedLayout() const { return unsupportedLayout_; }
 
-std::vector<MipLevelData> DecodedKtx2Texture::levels() const {
+// [Phase 5 Task 6] isCube()/numFaces() are only meaningful once
+// isUnsupportedLayout() == false -- a rejected container (including a
+// cube-array, which also sets texture_->isCubemap) never reaches here
+// through the caller's own required check, so this does not need to
+// separately re-derive "supported cube" vs. "rejected cube-array": every
+// caller of levels(face) already gated on isUnsupportedLayout() first.
+bool DecodedKtx2Texture::isCube() const { return texture_ != nullptr && texture_->isCubemap != 0; }
+uint32_t DecodedKtx2Texture::numFaces() const { return texture_ != nullptr ? texture_->numFaces : 0; }
+
+std::vector<MipLevelData> DecodedKtx2Texture::levels(uint32_t face) const {
     std::vector<MipLevelData> result;
     if (texture_ == nullptr || unsupportedLayout_) {
         return result;
@@ -278,9 +318,27 @@ std::vector<MipLevelData> DecodedKtx2Texture::levels() const {
     const ktx_uint8_t* base = ktxTexture_GetData(ktxTexture(texture_));
     for (uint32_t level = 0; level < texture_->numLevels; ++level) {
         ktx_size_t offset = 0;
-        if (ktxTexture_GetImageOffset(ktxTexture(texture_), level, 0, 0, &offset) != KTX_SUCCESS) {
+        // [Phase 5 Task 6, gate matrix row 7's own "DecodedKtx2Texture::
+        // levels()'s face-blindness" gap] `layer` stays 0 (a supported
+        // cubemap is always single-layer, isUnsupportedLayoutFor()'s own
+        // narrowed predicate guarantees numLayers <= 1); `faceSlice` is
+        // now the caller-supplied `face` instead of the old hardcoded 0
+        // -- the vendored ktx.h's own ktxTexture_GetImageOffset() macro
+        // signature already had this exact parameter, simply unused
+        // before this task.
+        if (ktxTexture_GetImageOffset(ktxTexture(texture_), level, /*layer=*/0, face, &offset) != KTX_SUCCESS) {
             continue;
         }
+        // ktxTexture_GetImageSize() returns ONE image's bytes (this
+        // face's own share of the level, not the level's combined
+        // multi-face total) -- verified against this project's own
+        // vendored libktx (v4.4.2): the identical GetImageSize()/
+        // GetImageOffset() pairing already worked correctly for the
+        // numFaces==1 case pre-Task-6, where "one image" and "the whole
+        // level" are trivially the same value; ktxTexture_IterateLevelFaces()'s
+        // own per-face callback contract (`faceLodSize`, ktx.h) confirms
+        // the per-image (not per-level-combined) semantics for the
+        // numFaces==6 case this task adds.
         ktx_size_t size = ktxTexture_GetImageSize(ktxTexture(texture_), level);
         // True (sub-block-tolerant) mip-level extent -- NEVER rounded up
         // to block granularity. See this struct's own header comment for
@@ -344,6 +402,47 @@ std::optional<DecodedStbImage> decodeStbImage(std::span<const std::byte> bytes, 
 
 VkFormat stbRgba8Format(TextureRole role) {
     return roleExpectsSrgb(role) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+}
+
+// ---------------------------------------------------------------------
+// [Phase 5 Task 6] Radiance (.hdr) float decode path -- see this
+// function's own declaration (texture_decode.h) for the full "why this
+// exists / what silent bug it closes" rationale.
+// ---------------------------------------------------------------------
+
+std::optional<DecodedStbHdrImage> decodeStbImageHdr(std::span<const std::byte> bytes, std::string* outFailureReason) {
+    if (bytes.empty()) {
+        if (outFailureReason != nullptr) {
+            *outFailureReason = "empty byte span";
+        }
+        return std::nullopt;
+    }
+
+    int width = 0;
+    int height = 0;
+    int channelsInFile = 0;
+    const auto* data = reinterpret_cast<const stbi_uc*>(bytes.data());
+    const int len = static_cast<int>(bytes.size());
+
+    // desired_channels=4 -- forces a real RGBA float buffer regardless of
+    // the source's own channel count (mirrors decodeStbImage()'s
+    // identical desired_channels=4 choice for the 8-bit path), so this
+    // function's own caller never needs to branch on channelsInFile.
+    float* pixels = stbi_loadf_from_memory(data, len, &width, &height, &channelsInFile, /*desired_channels=*/4);
+    if (pixels == nullptr) {
+        if (outFailureReason != nullptr) {
+            const char* reason = stbi_failure_reason();
+            *outFailureReason = reason != nullptr ? reason : "unknown stb_image HDR failure";
+        }
+        return std::nullopt;
+    }
+
+    DecodedStbHdrImage result;
+    result.width = static_cast<uint32_t>(width);
+    result.height = static_cast<uint32_t>(height);
+    result.rgba32.assign(pixels, pixels + (static_cast<size_t>(width) * height * 4));
+    stbi_image_free(pixels);
+    return result;
 }
 
 // ---------------------------------------------------------------------
@@ -510,11 +609,11 @@ TextureDecodeResult decodeKtx2ForUpload(std::span<const std::byte> bytes, Textur
 
     if (decoded->isUnsupportedLayout()) {
         result.outcome = TextureDecodeResult::Outcome::Checkerboard;
-        result.failureReason = "cubemap/array/non-2D KTX2 container";
+        result.failureReason = "array/cube-array/non-2D KTX2 container";
         result.warnings.push_back(
             {"unsupported-layout",
-             "is a cubemap/array/non-2D KTX2 container -- unsupported in Phase 4 (FG1, the registered "
-             "techniques-phase skybox/IBL consumer, is the scheduled loader for this layout); falling back to "
+             "is an array, cube-array, or non-2D KTX2 container -- unsupported (cubemap-only per the Phase 5 Task "
+             "6 ruling; zero charter consumer needs a general texture array or cube-array); falling back to "
              "checkerboard"});
         return result;
     }
@@ -555,13 +654,17 @@ TextureDecodeResult decodeKtx2ForUpload(std::span<const std::byte> bytes, Textur
         }
     }
 
-    std::vector<MipLevelData> levels = decoded->levels();
-    if (levels.empty()) {
+    // [Phase 5 Task 6] Face 0's own levels first -- both the "how many
+    // levels/is there a mip chain" question below AND (for a plain 2D
+    // texture) the whole answer are decided off this one call; a
+    // supported cubemap's remaining 5 faces are appended after, below.
+    std::vector<MipLevelData> faceZeroLevels = decoded->levels(0);
+    if (faceZeroLevels.empty()) {
         result.outcome = TextureDecodeResult::Outcome::Failed;
         result.failureReason = "KTX2 container reported zero usable mip levels";
         return result;
     }
-    if (levels.size() == 1) {
+    if (faceZeroLevels.size() == 1) {
         result.warnings.push_back(
             {"no-mips", "has no mip chain (1 level) -- recommend regenerating with `toktx --genmipmap` (D10; no "
                         "runtime mip generation for block-compressed formats)"});
@@ -571,14 +674,26 @@ TextureDecodeResult decodeKtx2ForUpload(std::span<const std::byte> bytes, Textur
     result.format = finalFormat;
     result.width = decoded->width();
     result.height = decoded->height();
-    result.levels.reserve(levels.size());
-    for (const MipLevelData& lvl : levels) {
-        DecodedTextureLevel out;
-        out.level = lvl.level;
-        out.width = lvl.width;
-        out.height = lvl.height;
-        out.bytes.assign(lvl.bytes.begin(), lvl.bytes.end());
-        result.levels.push_back(std::move(out));
+    result.isCube = decoded->isCube();
+
+    const uint32_t faceCount = result.isCube ? decoded->numFaces() : 1;
+    result.levels.reserve(static_cast<size_t>(faceZeroLevels.size()) * faceCount);
+    for (uint32_t face = 0; face < faceCount; ++face) {
+        // Face 0's levels are already fetched above (also doubles as the
+        // "does this container have any usable data at all" probe) --
+        // every later face is fetched fresh, exactly the same way, per
+        // the vendored GetImageOffset()/GetImageSize() per-face contract
+        // this class's own levels(face) comment documents.
+        std::vector<MipLevelData> faceLevels = (face == 0) ? std::move(faceZeroLevels) : decoded->levels(face);
+        for (const MipLevelData& lvl : faceLevels) {
+            DecodedTextureLevel out;
+            out.level = lvl.level;
+            out.width = lvl.width;
+            out.height = lvl.height;
+            out.faceIndex = face;
+            out.bytes.assign(lvl.bytes.begin(), lvl.bytes.end());
+            result.levels.push_back(std::move(out));
+        }
     }
     return result;
 }
@@ -643,6 +758,83 @@ TextureDecodeResult decodeStbForUpload(std::span<const std::byte> bytes, Texture
     return result;
 }
 
+// [Phase 5 Task 6] Radiance (.hdr) equirect float path -- see
+// decodeStbImageHdr()'s own header comment (texture_decode.h) for why
+// this must run BEFORE decodeStbForUpload() (the 8-bit branch) ever gets
+// a chance to silently tonemap this same content.
+TextureDecodeResult decodeStbHdrForUpload(std::span<const std::byte> bytes, TextureRole role,
+                                            uint32_t maxImageDimension2D, const FormatSupportQuery& isFormatSupported) {
+    TextureDecodeResult result;
+    result.role = role;
+
+    std::string failureReason;
+    auto decoded = decodeStbImageHdr(bytes, &failureReason);
+    if (!decoded.has_value()) {
+        result.outcome = TextureDecodeResult::Outcome::Failed;
+        result.failureReason = std::string("stb HDR decode failed: ") + failureReason;
+        return result;
+    }
+
+    if (exceedsDimensionLimit(decoded->width, decoded->height, maxImageDimension2D)) {
+        result.outcome = TextureDecodeResult::Outcome::Checkerboard;
+        result.failureReason = "exceeds maxImageDimension2D";
+        result.warnings.push_back(
+            {"oversized", "is " + std::to_string(decoded->width) + "x" + std::to_string(decoded->height) +
+                              ", exceeding this device's maxImageDimension2D=" + std::to_string(maxImageDimension2D) +
+                              " -- falling back to checkerboard"});
+        return result;
+    }
+
+    // [Coordinator ruling T6, gate matrix row 9 Open Question 2]
+    // R16G16B16A16_SFLOAT unconditionally -- the phase's single-sourced
+    // environment-upload-format choice, matching the SAME kHdrFormat
+    // convention every existing sample already defines. Still gated on a
+    // real isFormatSupported() query (D11 defensive discipline, never
+    // assumed) even though this is a Vulkan-mandatory format for
+    // SAMPLED_IMAGE + optimal tiling on every conformant implementation --
+    // never actually expected to fail on real hardware, but a graceful
+    // checkerboard fallback costs nothing and matches every other branch
+    // in this file.
+    constexpr VkFormat kEnvironmentHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    if (!isFormatSupported || !isFormatSupported(kEnvironmentHdrFormat)) {
+        result.outcome = TextureDecodeResult::Outcome::Checkerboard;
+        result.failureReason = "R16G16B16A16_SFLOAT unsupported for sampling on this device";
+        result.warnings.push_back(
+            {"unsupported-stored-format", "the environment HDR upload format (VK_FORMAT_R16G16B16A16_SFLOAT) is "
+                                           "unsupported for sampling on this device -- falling back to checkerboard"});
+        return result;
+    }
+
+    // float32 (stb's own decode) -> float16 packed bytes: GLM's own
+    // reference half-float packer (glm::packHalf4x16, already used
+    // process-wide for this exact format -- rx_graph/scene_color.h's own
+    // kHdrFormat readback tests) -- library-first, no hand-rolled
+    // float-to-half bit-twiddling written for this task.
+    const size_t texelCount = static_cast<size_t>(decoded->width) * decoded->height;
+    std::vector<std::byte> packed(texelCount * sizeof(uint64_t));
+    for (size_t i = 0; i < texelCount; ++i) {
+        glm::vec4 texel(decoded->rgba32[i * 4 + 0], decoded->rgba32[i * 4 + 1], decoded->rgba32[i * 4 + 2],
+                         decoded->rgba32[i * 4 + 3]);
+        uint64_t half = glm::packHalf4x16(texel);
+        std::memcpy(packed.data() + i * sizeof(uint64_t), &half, sizeof(uint64_t));
+    }
+
+    result.outcome = TextureDecodeResult::Outcome::Ready;
+    result.format = kEnvironmentHdrFormat;
+    result.width = decoded->width;
+    result.height = decoded->height;
+    // Mip 0 only -- Stage 1 Task 9 bakes the prefiltered mip chain from
+    // this raw equirect; this task only gets the float bytes onto the GPU
+    // as one sampled 2D image (matrix row 10's own scope boundary).
+    DecodedTextureLevel level0;
+    level0.level = 0;
+    level0.width = decoded->width;
+    level0.height = decoded->height;
+    level0.bytes = std::move(packed);
+    result.levels.push_back(std::move(level0));
+    return result;
+}
+
 }  // namespace
 
 TextureDecodeResult decodeTextureForUpload(std::span<const std::byte> bytes, TextureRole role,
@@ -654,8 +846,16 @@ TextureDecodeResult decodeTextureForUpload(std::span<const std::byte> bytes, Tex
         result.failureReason = "empty byte span";
         return result;
     }
-    return looksLikeKtx2(bytes) ? decodeKtx2ForUpload(bytes, role, maxImageDimension2D, isFormatSupported)
-                                 : decodeStbForUpload(bytes, role, maxImageDimension2D);
+    if (looksLikeKtx2(bytes)) {
+        return decodeKtx2ForUpload(bytes, role, maxImageDimension2D, isFormatSupported);
+    }
+    // [Phase 5 Task 6] Checked BEFORE the 8-bit stb branch -- see
+    // decodeStbImageHdr()'s own header comment for the silent-tonemap gap
+    // this ordering closes.
+    if (stbi_is_hdr_from_memory(reinterpret_cast<const stbi_uc*>(bytes.data()), static_cast<int>(bytes.size())) != 0) {
+        return decodeStbHdrForUpload(bytes, role, maxImageDimension2D, isFormatSupported);
+    }
+    return decodeStbForUpload(bytes, role, maxImageDimension2D);
 }
 
 }  // namespace rx::asset
