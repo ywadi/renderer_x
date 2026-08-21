@@ -111,12 +111,19 @@ jobs:
         # timeout-minutes + Acquire::Retries: runner apt mirrors stall
         # indefinitely on bad days (3 observed 2026-08-19, 20-47 min
         # hangs) — fail fast so a rerun costs minutes, not an hour.
+        # spirv-tools [Phase 5 Task 7 (#43), gate ruling T7]: provides the
+        # spirv-dis binary rx_material_brdf_gpu_tests' own
+        # test_brdf_spirv_link_composition_gpu.cpp requires at CMake
+        # configure time (find_program(), FATAL_ERROR if absent) to prove
+        # the Slang link-time-composition mechanism's SPIR-V-absence
+        # guarantee -- the first automated (not manual) spirv-dis
+        # invocation in this repository (matrix's own "New gaps" entry).
         timeout-minutes: 10
         run: |
           sudo apt-get -o Acquire::Retries=3 update
           sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y \
             ninja-build mesa-vulkan-drivers vulkan-tools libvulkan-dev \
-            vulkan-validationlayers xvfb \
+            vulkan-validationlayers xvfb spirv-tools \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
             libxfixes-dev libxss-dev libxtst-dev libxkbcommon-dev
 
@@ -469,11 +476,16 @@ jobs:
       # succeeds" and is not verified here.
       - name: Install system packages
         # Same stall guard as the linux-native job (see comment there).
+        # spirv-tools: needed here too even though this job's own ctest run
+        # excludes rx_material_brdf_gpu_tests below -- CMake's find_program()
+        # for RX_SPIRV_DIS (src/rx_material/tests/CMakeLists.txt) runs at
+        # CONFIGURE time on this SAME host regardless of the cross-compile
+        # TARGET, and FATAL_ERRORs the whole configure step if absent.
         timeout-minutes: 10
         run: |
           sudo apt-get -o Acquire::Retries=3 update
           sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y \
-            ninja-build wine xvfb mesa-vulkan-drivers vulkan-tools libvulkan-dev
+            ninja-build wine xvfb mesa-vulkan-drivers vulkan-tools libvulkan-dev spirv-tools
 
       - name: Install pinned zig toolchain (checksum-verified)
         run: |
@@ -653,7 +665,14 @@ jobs:
       # cycle, same GPU-backed reason; rx_frame_loop_tests, the SIBLING
       # device-free binary for this module's pure decision functions, is
       # deliberately NOT matched by this pattern and runs for real under
-      # Wine, like rx_graph_tests/rx_material_tests already do], and every
+      # Wine, like rx_graph_tests/rx_material_tests already do],
+      # rx_material_brdf_gpu_tests [Phase 5 Task 7, ticket #43 -- two of its
+      # three source files build a real windowed VkDevice; its third file
+      # (the SPIR-V link-composition proof) is itself device-free but
+      # shells out to the HOST's own spirv-dis binary via std::system(),
+      # which a cross-compiled Windows .exe running under Wine cannot
+      # reliably do -- excluded as one whole binary rather than split, since
+      # 2 of its 3 files genuinely need a live GPU anyway], and every
       # sample_*_headless gate are excluded: Wine in CI has no real Vulkan
       # device to hand them, and that is a real, documented environment
       # limitation -- not a silent pass. rx_core, rx_platform,
@@ -684,7 +703,7 @@ jobs:
       # (:77), not this one.
       - name: Test under wine (xvfb; GPU tests excluded -- no Vulkan under Wine)
         run: >-
-          ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_debug_ui_gpu|rx_frame_loop_gpu|sample' --output-on-failure
+          ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_material_brdf_gpu|rx_debug_ui_gpu|rx_frame_loop_gpu|sample' --output-on-failure
           --output-junit ${{ github.workspace }}/ctest-results-windows-cross-zig.xml
 
       - name: Build budget check
