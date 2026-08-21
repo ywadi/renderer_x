@@ -1303,7 +1303,8 @@ TEST_CASE("resolveDrawGroups(): a single linear scan calls the resolver exactly 
         resolveCalls.push_back(key);
         return static_cast<uint64_t>(key.materialIndex) * 100;
     };
-    const auto groups = rx::scene::resolveDrawGroups(lists, kPassSignatureHash, kSpecializationBits, resolver);
+    std::vector<rx::scene::ResolvedDrawGroup> groups;
+    rx::scene::resolveDrawGroups(lists, kPassSignatureHash, kSpecializationBits, resolver, groups);
 
     REQUIRE(resolveCalls.size() == 3);  // {1},{2},{1} -- three contiguous runs, three calls
     CHECK(resolveCalls[0] == rx::scene::PipelineRequestKey{1, kPassSignatureHash, kSpecializationBits});
@@ -1314,6 +1315,144 @@ TEST_CASE("resolveDrawGroups(): a single linear scan calls the resolver exactly 
     CHECK(groups[0] == rx::scene::ResolvedDrawGroup{0, 2, 100});
     CHECK(groups[1] == rx::scene::ResolvedDrawGroup{2, 1, 200});
     CHECK(groups[2] == rx::scene::ResolvedDrawGroup{3, 1, 100});
+}
+
+// [Phase 5 Task 5, ticket #41 row 6, Phase 4 exit-review M4 / master
+// registry item (b)] ZERO-ALLOC capacity-snapshot tests -- same
+// methodology as this file's own "D26 zero-alloc invariant" test (both
+// `.capacity()` AND `.data()` pointer identity checked across N
+// steady-state calls, matching Task 23's own gate-hardened
+// `ExecutorAllocationCapacitiesForTesting`/`debugChunkStats()` precedent
+// -- capacity alone is an empirically-verified-insufficient signal per
+// that test's own documented rationale: a buggy "swap in a fresh
+// same-capacity vector every call" implementation would still pass a
+// capacity-only check).
+TEST_CASE("resolveDrawGroups(): outGroups' storage is reused across steady-state calls -- zero growth, "
+          "zero reallocation after the first call [Phase 5 Task 5 row 6, revert-discrimination: an implementation "
+          "that returns a fresh std::vector (the pre-promotion shape) fails this test even though its CONTENT is "
+          "still correct]") {
+    ViewLists lists;
+    for (uint32_t i = 0; i < 8; ++i) {
+        DrawCommand cmd;
+        cmd.firstInstance = static_cast<uint32_t>(lists.payloads.size());
+        cmd.instanceCount = 1;
+        lists.commands.push_back(cmd);
+        lists.payloads.push_back(DrawPayload{i % 3, 0});  // 3 distinct materials, repeating -> several groups
+    }
+    auto resolver = [](const rx::scene::PipelineRequestKey& key) -> uint64_t { return key.materialIndex; };
+
+    std::vector<rx::scene::ResolvedDrawGroup> outGroups;
+    rx::scene::resolveDrawGroups(lists, /*passSignatureHash=*/0, /*specializationBits=*/0, resolver, outGroups);
+    const size_t capacityAfterFirst = outGroups.capacity();
+    const rx::scene::ResolvedDrawGroup* dataAfterFirst = outGroups.data();
+    REQUIRE(capacityAfterFirst > 0);
+
+    for (int frame = 0; frame < 20; ++frame) {
+        rx::scene::resolveDrawGroups(lists, /*passSignatureHash=*/0, /*specializationBits=*/0, resolver, outGroups);
+        CHECK(outGroups.capacity() == capacityAfterFirst);
+        CHECK(outGroups.data() == dataAfterFirst);
+    }
+}
+
+TEST_CASE("splitByBlockAndGroup(): outSpans' storage is reused across steady-state calls -- zero growth, zero "
+          "reallocation after the first call [Phase 5 Task 5 row 6]") {
+    const std::vector<rx::scene::ResolvedDrawGroup> groups = {
+        rx::scene::ResolvedDrawGroup{0, 4, 100},
+        rx::scene::ResolvedDrawGroup{4, 4, 200},
+    };
+    const std::vector<rx::scene::BlockRange> blocks = {
+        rx::scene::BlockRange{0, 0, 3},
+        rx::scene::BlockRange{1, 3, 5},
+    };
+
+    std::vector<rx::scene::RecordSpan> outSpans;
+    rx::scene::splitByBlockAndGroup(groups, blocks, /*rangeStart=*/0, /*rangeCount=*/8, outSpans);
+    const size_t capacityAfterFirst = outSpans.capacity();
+    const rx::scene::RecordSpan* dataAfterFirst = outSpans.data();
+    REQUIRE(capacityAfterFirst > 0);
+    REQUIRE(outSpans.size() == 3);  // [0,3) block0/group0, [3,4) block1/group0, [4,8) block1/group1
+
+    for (int frame = 0; frame < 20; ++frame) {
+        rx::scene::splitByBlockAndGroup(groups, blocks, /*rangeStart=*/0, /*rangeCount=*/8, outSpans);
+        CHECK(outSpans.capacity() == capacityAfterFirst);
+        CHECK(outSpans.data() == dataAfterFirst);
+        REQUIRE(outSpans.size() == 3);
+    }
+}
+
+TEST_CASE("splitByBlockAndGroup(): concurrent chunks writing into PER-WORKER-SLOT vectors never race or corrupt "
+          "each other's output [Phase 5 Task 5 row 6 -- the worker-safety re-verification the gate matrix's own "
+          "acceptance criterion names: 'persistent scratch must be per-worker-slot, not a single shared buffer, "
+          "or this reintroduces a data race']") {
+    // A wider synthetic draw list -- 4 blocks x 4 groups worth of commands,
+    // interleaved so every chunk's own slice spans a genuinely different
+    // set of block/group boundaries.
+    std::vector<rx::scene::ResolvedDrawGroup> groups;
+    std::vector<rx::scene::BlockRange> blocks;
+    constexpr uint32_t kCommandsPerRun = 4;
+    constexpr uint32_t kRuns = 8;
+    for (uint32_t r = 0; r < kRuns; ++r) {
+        groups.push_back(rx::scene::ResolvedDrawGroup{r * kCommandsPerRun, kCommandsPerRun, r * 10ULL});
+        blocks.push_back(rx::scene::BlockRange{r, r * kCommandsPerRun, kCommandsPerRun});
+    }
+    const uint32_t totalCommands = kRuns * kCommandsPerRun;
+
+    // One chunk per run, so each chunk's own slice lands on EXACTLY one
+    // block/group boundary pair -- isolates the race check (below) from
+    // splitByBlockAndGroup()'s own multi-span-per-call logic, which the
+    // capacity-snapshot test above already covers separately.
+    constexpr uint32_t kChunkCount = kRuns;
+    const uint32_t perChunk = totalCommands / kChunkCount;
+
+    // One persistent, per-worker-slot vector per chunk index -- the exact
+    // shape the gate matrix's acceptance criterion requires callers adopt;
+    // reused across "frames" (outer loop) to also prove no cross-frame
+    // corruption compounds the race check.
+    std::vector<std::vector<rx::scene::RecordSpan>> perChunkScratch(kChunkCount);
+
+    for (int frame = 0; frame < 5; ++frame) {
+        std::vector<std::thread> workers;
+        for (uint32_t c = 0; c < kChunkCount; ++c) {
+            workers.emplace_back([&, c]() {
+                rx::scene::splitByBlockAndGroup(groups, blocks, c * perChunk, perChunk, perChunkScratch[c]);
+            });
+        }
+        for (auto& t : workers) {
+            t.join();
+        }
+
+        // Every chunk's own slice is exactly one block/group run wide here
+        // (perChunk == kCommandsPerRun, chunk boundaries coincide with
+        // block/group boundaries) -- each chunk's output must be exactly
+        // one RecordSpan naming ITS OWN blockId/pipelineToken, never a
+        // neighboring chunk's, on every frame.
+        for (uint32_t c = 0; c < kChunkCount; ++c) {
+            REQUIRE(perChunkScratch[c].size() == 1);
+            CHECK(perChunkScratch[c][0].blockId == c);
+            CHECK(perChunkScratch[c][0].pipelineToken == c * 10ULL);
+            CHECK(perChunkScratch[c][0].commandOffset == c * perChunk);
+            CHECK(perChunkScratch[c][0].commandCount == perChunk);
+        }
+    }
+}
+
+TEST_CASE("materialIndexForSpan(): reads the real materialIndex off a span's first command, matching the "
+          "producing DrawPayload exactly") {
+    ViewLists lists;
+    for (uint32_t mat : {5U, 5U, 9U}) {
+        DrawCommand cmd;
+        cmd.firstInstance = static_cast<uint32_t>(lists.payloads.size());
+        cmd.instanceCount = 1;
+        lists.commands.push_back(cmd);
+        lists.payloads.push_back(DrawPayload{mat, 0});
+    }
+    const rx::scene::RecordSpan spanOverFirstTwo{/*blockId=*/0, /*pipelineToken=*/0, /*commandOffset=*/0,
+                                                   /*commandCount=*/2};
+    CHECK(rx::scene::materialIndexForSpan(lists.commands, lists.payloads, spanOverFirstTwo) == 5);
+
+    const rx::scene::RecordSpan spanOverThird{/*blockId=*/0, /*pipelineToken=*/0, /*commandOffset=*/2,
+                                                /*commandCount=*/1};
+    CHECK(rx::scene::materialIndexForSpan(lists.commands, lists.payloads, spanOverThird) == 9);
 }
 
 #ifdef RX_DEBUG_CHECKS

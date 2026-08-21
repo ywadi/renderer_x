@@ -852,14 +852,19 @@ void DrawListBuilder::buildShadow(const Scene& scene, LightHandle light, const C
 // recordDrawList [D27].
 // ---------------------------------------------------------------------
 
-std::vector<ResolvedDrawGroup> resolveDrawGroups(const ViewLists& lists, uint64_t passSignatureHash,
-                                                    uint32_t specializationBits, const PipelineResolveFn& resolvePipeline) {
+void resolveDrawGroups(const ViewLists& lists, uint64_t passSignatureHash, uint32_t specializationBits,
+                        const PipelineResolveFn& resolvePipeline, std::vector<ResolvedDrawGroup>& outGroups) {
     RX_ASSERT_MAIN_THREAD("rx::scene::resolveDrawGroups");
     RX_ZONE;
-    std::vector<ResolvedDrawGroup> groups;
+    // [Phase 5 Task 5, row 6] Clear, never replace -- keeps `outGroups`'s
+    // already-allocated storage (capacity) intact across calls, which is
+    // the entire zero-alloc contract this function's own header comment
+    // documents. std::vector::clear() destroys elements but does not
+    // release capacity, exactly what a steady-state caller needs.
+    outGroups.clear();
     const size_t n = lists.commands.size();
     if (n == 0) {
-        return groups;
+        return;
     }
 
     auto materialOf = [&](size_t commandIndex) -> uint32_t {
@@ -881,7 +886,7 @@ std::vector<ResolvedDrawGroup> resolveDrawGroups(const ViewLists& lists, uint64_
         const bool atEnd = (i == n);
         const uint32_t mat = atEnd ? 0 : materialOf(i);
         if (atEnd || mat != currentMaterial) {
-            groups.push_back(ResolvedDrawGroup{groupStart, static_cast<uint32_t>(i) - groupStart, currentToken});
+            outGroups.push_back(ResolvedDrawGroup{groupStart, static_cast<uint32_t>(i) - groupStart, currentToken});
             if (!atEnd) {
                 groupStart = static_cast<uint32_t>(i);
                 currentMaterial = mat;
@@ -889,14 +894,88 @@ std::vector<ResolvedDrawGroup> resolveDrawGroups(const ViewLists& lists, uint64_
             }
         }
     }
-    return groups;
+}
+
+void splitByBlockAndGroup(std::span<const ResolvedDrawGroup> groups, std::span<const BlockRange> blocks,
+                           uint32_t rangeStart, uint32_t rangeCount, std::vector<RecordSpan>& outSpans) {
+    RX_ZONE;
+    // [Phase 5 Task 5, row 6] Same clear-not-replace contract as
+    // resolveDrawGroups() above -- see this function's own header comment
+    // for the PER-WORKER-SLOT requirement this places on the CALLER's own
+    // choice of `outSpans` instance.
+    outSpans.clear();
+    if (rangeCount == 0 || groups.empty() || blocks.empty()) {
+        return;
+    }
+    const uint32_t rangeEnd = rangeStart + rangeCount;
+
+    // Locate the first group/block whose own [firstCommand, firstCommand+
+    // commandCount) interval contains `rangeStart` -- a linear scan is
+    // correct and cheap at this scale (both lists are, in practice, tiny
+    // relative to `commands` itself: one entry per distinct materialIndex
+    // run / per distinct-block run, never per command).
+    size_t groupIdx = 0;
+    while (groupIdx + 1 < groups.size() && groups[groupIdx].firstCommand + groups[groupIdx].commandCount <= rangeStart) {
+        ++groupIdx;
+    }
+    size_t blockIdx = 0;
+    while (blockIdx + 1 < blocks.size() && blocks[blockIdx].firstCommand + blocks[blockIdx].commandCount <= rangeStart) {
+        ++blockIdx;
+    }
+
+    uint32_t cursor = rangeStart;
+    while (cursor < rangeEnd) {
+        const ResolvedDrawGroup& g = groups[groupIdx];
+        const BlockRange& b = blocks[blockIdx];
+        const uint32_t groupEnd = g.firstCommand + g.commandCount;
+        const uint32_t blockEnd = b.firstCommand + b.commandCount;
+        const uint32_t spanEnd = std::min({groupEnd, blockEnd, rangeEnd});
+
+        outSpans.push_back(RecordSpan{b.blockId, g.pipelineToken, cursor, spanEnd - cursor});
+
+        cursor = spanEnd;
+        if (cursor >= groupEnd && groupIdx + 1 < groups.size()) {
+            ++groupIdx;
+        }
+        if (cursor >= blockEnd && blockIdx + 1 < blocks.size()) {
+            ++blockIdx;
+        }
+    }
+}
+
+uint32_t materialIndexForSpan(std::span<const DrawCommand> commands, std::span<const DrawPayload> payloads,
+                               const RecordSpan& span) {
+    // Both branches below are defensive only -- see this function's own
+    // header comment for why `span.commandCount > 0` and
+    // `firstInstance < payloads.size()` hold by construction for every
+    // `RecordSpan` this file's own `splitByBlockAndGroup()` produces from a
+    // real `ViewLists`. Falling back to materialIndex 0 rather than
+    // indexing out of bounds keeps this a safe, if degraded, no-op instead
+    // of UB if a future caller ever violates that contract.
+    if (span.commandCount == 0 || span.commandOffset >= commands.size()) {
+        return 0;
+    }
+    const DrawCommand& firstCommand = commands[span.commandOffset];
+    if (firstCommand.firstInstance >= payloads.size()) {
+        return 0;
+    }
+    return payloads[firstCommand.firstInstance].materialIndex;
 }
 
 void recordDrawList(const ViewLists& lists, task::Scheduler& scheduler, uint32_t chunkCount, uint64_t passSignatureHash,
                      uint32_t specializationBits, const PipelineResolveFn& resolvePipeline,
                      const RecordChunkFn& recordChunk) {
     RX_ZONE;
-    const std::vector<ResolvedDrawGroup> groups = resolveDrawGroups(lists, passSignatureHash, specializationBits, resolvePipeline);
+    // [Phase 5 Task 5, row 6] This function has no persistent state to hold
+    // `groups` across calls (a free function, not a class instance) and no
+    // production caller in this codebase today -- unlike resolveDrawGroups()
+    // itself (whose zero-alloc contract a real per-frame caller, e.g.
+    // samples/09_scene, depends on directly), so it keeps its own
+    // pre-existing "fresh scratch per call" behavior verbatim, just sourced
+    // from the now out-param-shaped resolveDrawGroups() instead of that
+    // function's old return value.
+    std::vector<ResolvedDrawGroup> groups;
+    resolveDrawGroups(lists, passSignatureHash, specializationBits, resolvePipeline, groups);
     const uint32_t effectiveChunkCount = (chunkCount == 0) ? 1 : chunkCount;
     scheduler.parallelFor(effectiveChunkCount, /*grainSize=*/1, [&](uint32_t begin, uint32_t end, uint32_t) {
         for (uint32_t c = begin; c < end; ++c) {

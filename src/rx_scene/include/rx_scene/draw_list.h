@@ -577,10 +577,116 @@ using RecordChunkFn = std::function<void(uint32_t chunkIndex, uint32_t chunkCoun
 // RX_ASSERT_MAIN_THREAD (see draw_list.cpp). O(commands.size()) -- one
 // pass, no second grouping sort.
 //
-// Main-thread-only (D5/D27).
-[[nodiscard]] std::vector<ResolvedDrawGroup> resolveDrawGroups(const ViewLists& lists, uint64_t passSignatureHash,
-                                                                  uint32_t specializationBits,
-                                                                  const PipelineResolveFn& resolvePipeline);
+// [Phase 5 Task 5, ticket #41 row 6, Phase 4 exit-review M4 / master
+// registry item (b)] ZERO-ALLOC: writes into caller-owned `outGroups`
+// (cleared, then refilled in place -- never replaced with a fresh vector)
+// instead of returning a fresh `std::vector` every call, extending the same
+// "capacity-snapshot via a caller/test-held accessor, NOT global operator-
+// new interposition" discipline this codebase's Task 23
+// (`rx_graph::Executor`) and this very header's own D26 zero-alloc
+// invariant (`ViewLists`, `DrawListBuilder::build()`) already establish.
+// `outGroups`'s capacity stabilizes once its caller has driven a few
+// steady-state frames of an unchanging draw-list shape -- see
+// draw_list_test.cpp's own capacity-snapshot TEST_CASE for the exact
+// methodology (both `.capacity()` and `.data()` pointer identity checked,
+// matching the D26 test's own documented rationale for why capacity alone
+// is an insufficient signal). Main-thread-only (D5/D27) -- called from a
+// SINGLE thread every frame, so `outGroups` needs no per-worker-slot
+// treatment the way `splitByBlockAndGroup()`'s own scratch below does.
+void resolveDrawGroups(const ViewLists& lists, uint64_t passSignatureHash, uint32_t specializationBits,
+                        const PipelineResolveFn& resolvePipeline, std::vector<ResolvedDrawGroup>& outGroups);
+
+// [Phase 5 Task 5, ticket #41 row 6; promoted from
+// samples/09_scene/draw_recording.h] The block/pipeline-group command split
+// a chunked forward-pass recorder needs that `resolveDrawGroups()` above
+// does not itself provide.
+//
+// WHY THIS EXISTS: `resolveDrawGroups()` groups `ViewLists::commands` into
+// contiguous runs by `DrawPayload::materialIndex` ADJACENCY ONLY -- it has
+// no notion of `blockId` at all (that field lives on `ViewLists::blocks`, a
+// SEPARATE list `resolveDrawGroups()` never reads; see `ResolvedDrawGroup`'s
+// own comment: "the ONLY thing a `RecordChunkFn` chunk callback ever
+// sees"). Since `blockId` is the SORT key's outermost tier but is NOT
+// itself part of the 64-bit encoded key `resolveDrawGroups()`'s
+// materialIndex-adjacency scan walks, a resolved `ResolvedDrawGroup` CAN
+// legitimately span two different blocks whenever the exact same
+// `materialIndex` value happens to repeat immediately across a block
+// boundary (two renderables, different GeometryPool blocks, coincidentally
+// sharing one material). `GeometryPool::bind()`'s own contract requires
+// every draw between two `bind()` calls to share one block -- a recorder
+// that trusts `ResolvedDrawGroup` alone for its `vkCmdBindPipeline`/bind-
+// block loop can silently issue draws against the WRONG bound block for
+// part of a group. `splitByBlockAndGroup()` closes that gap on the caller
+// side: it further subdivides a `[rangeStart, rangeStart+rangeCount)` slice
+// of `ViewLists::commands` (a chunk's own assigned command range) at EVERY
+// group boundary AND every block boundary, whichever comes first, so each
+// emitted `RecordSpan` is guaranteed to lie within exactly one resolved
+// pipeline group AND exactly one GeometryPool block.
+struct RecordSpan {
+    uint32_t blockId = 0;
+    uint64_t pipelineToken = 0;
+    uint32_t commandOffset = 0;
+    uint32_t commandCount = 0;
+
+    bool operator==(const RecordSpan&) const = default;
+};
+
+// `groups`/`blocks` are the FULL, pass-wide lists (`resolveDrawGroups()`'s
+// own output and `ViewLists::blocks` respectively) -- both are sorted and
+// contiguous, together covering `[0, totalCommandCount)` exactly once
+// each. `rangeStart`/`rangeCount` is the caller's own chunk-local slice of
+// that same command index space (e.g. a chunked forward pass's own
+// ceil-division partition). `groups`/`blocks` must each be non-empty and
+// must together cover the full `[rangeStart, rangeStart+rangeCount)` range
+// (true by construction whenever `groups` came from `resolveDrawGroups(lists,
+// ...)` and `blocks` is that SAME `lists.blocks` -- this function does not
+// itself validate that precondition, matching this library's own
+// "device-free helper trusts its caller's own already-established
+// invariant" convention for a tightly-scoped internal seam like this one).
+//
+// [Phase 5 Task 5, ticket #41 row 6] ZERO-ALLOC + WORKER-SAFE: writes into
+// caller-owned `outSpans` (cleared, then refilled in place), exactly like
+// `resolveDrawGroups()` above -- clears `outSpans` and returns immediately
+// for `rangeCount == 0`. UNLIKE `resolveDrawGroups()`, this function is
+// called PER CHUNK, PER WORKER THREAD, PER FRAME (a chunked pass's own
+// `RecordChunkFn`-shaped callback, invoked concurrently across a
+// scheduler's worker threads) -- so `outSpans` MUST be a genuinely
+// PER-WORKER-SLOT vector (e.g. one entry of a `chunkCount`-sized
+// `std::vector<std::vector<RecordSpan>>` the caller owns, indexed by that
+// chunk's own stable index), never a single vector shared across
+// concurrently-running chunks: two chunks writing into the SAME `outSpans`
+// concurrently would race on every `push_back()`/reallocation, silently
+// reintroducing the exact data race the pre-existing "fresh
+// `std::vector` per call" design accidentally avoided by construction.
+// This function itself performs no synchronization of any kind -- it
+// trusts the caller to supply a vector no other concurrently-running call
+// can observe.
+void splitByBlockAndGroup(std::span<const ResolvedDrawGroup> groups, std::span<const BlockRange> blocks,
+                           uint32_t rangeStart, uint32_t rangeCount, std::vector<RecordSpan>& outSpans);
+
+// The REAL `DrawPayload::materialIndex` a `RecordSpan` was built from --
+// recovers the identity `ResolvedDrawGroup`/`RecordSpan` themselves discard
+// (both types carry only a `pipelineToken`, deliberately: `resolveDrawGroups()`
+// groups by materialIndex-ADJACENCY, but its returned token is a real
+// `VkPipeline`, and DISTINCT materialIndex values legitimately collapse onto
+// the SAME pipeline whenever they share identical fixed-function state
+// [D28] -- e.g. Sponza's own glTF: 22 of its 25 materials are all
+// (StandardPBR, Opaque, single-sided), so they all resolve to ONE shared
+// VkPipeline. A caller that keys its MATERIAL PARAMS descriptor-set choice
+// off `pipelineToken` alone [the historical bug this function exists to let
+// a caller avoid] binds whichever ONE of those 22 materials happened to be
+// registered last for every one of the other 21's geometry -- reproducible
+// on any driver, not lighting- or platform-dependent. Every command within
+// one `RecordSpan` shares one materialIndex by construction (the SAME
+// invariant `splitByBlockAndGroup()`'s own header comment documents for
+// block identity: subdividing a group only ever shrinks a run, never
+// merges two different materialIndex runs), so reading it off the span's
+// OWN first command is exact, not a heuristic -- `DrawCommand::firstInstance`
+// addresses `payloads[]` directly [D26.1], and `payloads[i].materialIndex`
+// is the ground truth every per-draw GPU payload row is itself populated
+// from.
+[[nodiscard]] uint32_t materialIndexForSpan(std::span<const DrawCommand> commands,
+                                             std::span<const DrawPayload> payloads, const RecordSpan& span);
 
 // Pre-resolves (see resolveDrawGroups() above, called internally, on the
 // calling/main thread, BEFORE any fan-out) then fans `recordChunk` out
