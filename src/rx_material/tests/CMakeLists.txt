@@ -102,3 +102,46 @@ add_test(NAME rx_material_tests COMMAND rx_material_tests)
 # Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
 # (windows-cross Wine hang, run 31512073559).
 set_tests_properties(rx_material_tests PROPERTIES TIMEOUT 120)
+
+# --- Phase 5 Stage 1 Task 7 [#43]: shaders/material/brdf.slang's own
+# compute-based numerical test harness -- a NEW, sibling binary rather than
+# folding into rx_material_gpu_tests above: these tests drive slang::
+# ISession directly (brdf_test_harness.h, mirroring material_system.cpp's
+# own createMaterialSession()/compileMaterial(), NOT MaterialSystem/
+# ParameterBlock machinery) and need rx_rhi_vk::ComputePipelineCache
+# (Task 2), neither of which any existing file in this directory touches.
+# doctest_main.cpp is reused verbatim (the same vk-bootstrap warm-up
+# pattern, added as a SOURCE to a second executable target -- harmless,
+# matches every other doctest_main.cpp/doctest_main_gpu.cpp precedent in
+# this codebase of one file compiled into exactly the binary that needs it).
+find_program(RX_SPIRV_DIS_EXECUTABLE NAMES spirv-dis)
+if(NOT RX_SPIRV_DIS_EXECUTABLE)
+  message(FATAL_ERROR
+    "[rx_material_brdf_gpu_tests] 'spirv-dis' not found on PATH -- required "
+    "by test_brdf_spirv_link_composition_gpu.cpp's SPIR-V-absence proof "
+    "(gate ruling T7). Install the spirv-tools package (apt: spirv-tools; "
+    "the CI images install it alongside vulkan-validationlayers -- see "
+    ".github/workflows/ci.yml).")
+endif()
+
+add_executable(rx_material_brdf_gpu_tests
+    doctest_main.cpp
+    test_brdf_module_gpu.cpp
+    test_brdf_white_furnace_gpu.cpp
+    test_brdf_spirv_link_composition_gpu.cpp
+)
+target_link_libraries(rx_material_brdf_gpu_tests PRIVATE rx_shader rx_rhi_vk rx_platform doctest::doctest)
+rx_shader_deploy_runtime_libs(rx_material_brdf_gpu_tests)
+target_compile_definitions(rx_material_brdf_gpu_tests PRIVATE
+  # Same fixed, checked-out-repo-relative shaders/material/ path
+  # rx_material's own RX_MATERIAL_SHADER_DIR resolves to (that macro is
+  # PRIVATE to the rx_material library target and does not propagate here)
+  # -- brdf.slang lives in the SAME directory as material.slang/
+  # standard_pbr.slang/forward_entry.slang, per the ticket's own file list.
+  RX_MATERIAL_SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders/material"
+  RX_SPIRV_DIS="${RX_SPIRV_DIS_EXECUTABLE}"
+)
+add_test(NAME rx_material_brdf_gpu_tests COMMAND rx_material_brdf_gpu_tests --validate)
+# Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+# (windows-cross Wine hang, run 31512073559).
+set_tests_properties(rx_material_brdf_gpu_tests PROPERTIES TIMEOUT 300)
