@@ -625,8 +625,10 @@ std::optional<MaterialReflection> reflectMaterialLayout(slang::ProgramLayout* la
             // updating `rx::material::MaterialGlobalsPush` (draw_data.h) to
             // match byte-for-byte -- see that header's own comment on why
             // this drift risk is real and how both sides must move
-            // together. All-scalar (uint/uint/float, 12 bytes) is expected
-            // to reflect with zero padding, matching this project's own
+            // together. All-scalar (uint/uint, 8 bytes -- Task 4/#40
+            // removed the former `float exposure` field, see draw_data.h's
+            // own header comment) is expected to reflect with zero
+            // padding, matching this project's own
             // empirically-verified "plain scalar push-constant fields pack
             // with zero padding" finding (shaders/multipass/lit.vert.slang's
             // own header comment) -- but this check verifies that against

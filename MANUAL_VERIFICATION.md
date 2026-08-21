@@ -445,8 +445,10 @@ a pre-staged `assets/DamagedHelmet/glTF/` deployed next to it — see
 - Left-click-dragging orbits the camera around the helmet smoothly; no
   jump/snap on mouse-down, no drift after release.
 - `--scene <path/to/other.gltf>` loads a different glTF asset instead of
-  DamagedHelmet; `--exposure <n>` visibly brightens (positive) or darkens
-  (negative) the rendered scene, pre-tonemap.
+  DamagedHelmet; `--exposure <n>` feeds a real EV100 value into the
+  camera's pre-exposure — positive (higher EV100) visibly *darkens* the
+  rendered scene, negative *brightens* it (the physical-camera
+  convention; `0`, the default, is neutral).
 - Closing the window exits promptly, with no crash/hang, and logs
   `sample_08_gltf_viewer: window closed cleanly`.
 - On Linux, run with `--validate` and confirm no `[error]`-level validation

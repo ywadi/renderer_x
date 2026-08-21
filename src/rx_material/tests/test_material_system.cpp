@@ -419,10 +419,13 @@ TEST_CASE("MaterialSystem::loadMaterial reflects the set-1 parameter block and b
     CHECK(compareSamplers.type == VK_DESCRIPTOR_TYPE_SAMPLER);
     CHECK(compareSamplers.unboundedArray);
 
-    // [Task 4, Phase 4 Task 16] gMaterialGlobals -- same "always present
-    // regardless of use" reasoning as the three bindings above; grew from
-    // one `uint` to `rx::material::MaterialGlobalsPush`'s three scalar
-    // fields (D26.1's `drawDataBufferIndex` + sample 08's `exposure`).
+    // [Phase 4 Task 16, Phase 5 Task 4/#40] gMaterialGlobals -- same
+    // "always present regardless of use" reasoning as the three bindings
+    // above; grew from one `uint` to `rx::material::MaterialGlobalsPush`'s
+    // two scalar fields (`defaultSamplerIndex` + D26.1's
+    // `drawDataBufferIndex`) -- Task 16's original three-field shape also
+    // carried a `float exposure`, removed by Task 4/#40's pre-exposure
+    // migration (see draw_data.h's own header comment).
     REQUIRE(layout.pushRanges.size() == 1);
     CHECK(layout.pushRanges[0].size == sizeof(rx::material::MaterialGlobalsPush));
 

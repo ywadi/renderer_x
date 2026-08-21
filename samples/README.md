@@ -733,10 +733,15 @@ this sample builds and uploads itself — never a per-draw push constant;
 `samples/07_stress`'s own `gPush.instanceIndex` is the named anti-pattern
 this does not repeat). A mouse-drag orbit camera (left-click-drag; reads SDL
 mouse state directly via `Window::sdlWindow()` — sample-local, not a new
-`rx_platform` input surface) and `--exposure` (a pre-tonemap `2^exposure`
-multiplier applied inside the material forward pass — the shared
+`rx_platform` input surface) and `--exposure` (a real EV100 value fed
+directly into `rx::scene::Camera::setExposure(float)` — higher EV100
+*darkens* the image, the physical-camera convention, e.g. `--exposure 5`
+is noticeably darker than the default; exposure now pre-multiplies the
+scene's own light/ambient intensities before shading runs, never a
+post-tonemap or post-shading multiplier — the shared
 `shaders/multipass/tonemap.{vert,frag}.slang` shaders this sample reuses
-verbatim are byte-for-byte untouched) round out the interactive half.
+verbatim are byte-for-byte untouched either way) round out the
+interactive half.
 
 **D28**: each glTF material's `alphaMode`/`doubleSided` become
 `MaterialSystem`'s own fixed-function pipeline-state axis
@@ -748,8 +753,10 @@ yielding two independently-cached `VkPipeline`s.
 
 **No `MaterialSystem::bindInstance()`**: that method is the documented
 pre-D26.1 legacy path (it always pushes `MaterialSystem`'s own default
-identity draw-data row and `exposure=0.0`) — this sample drives its own
-real per-scene draw-data buffer and `--exposure` value by hand
+identity draw-data row — the push constant itself carries no exposure
+field at all since Task 4/#40's pre-exposure migration) — this sample
+drives its own real per-scene draw-data buffer, with `--exposure` baked
+into its own lightColor/ambientColor before upload, by hand
 (`recordSceneDraws()` in `main.cpp`): resolve the pipeline
 (`getPipeline()`, pre-resolved once per material at load time per D27, so
 the very first real draw never stalls on a cold Slang-to-`VkPipeline`
@@ -783,8 +790,14 @@ PNGs.
   Not part of `ctest` — see `MANUAL_VERIFICATION.md`.
 - **`--scene <path>`** — imports a different glTF/GLB file instead of
   DamagedHelmet.
-- **`--exposure <n>`** — pre-tonemap `2^n` multiplier (`0` — the default —
-  is neutral, `2^0 == 1`).
+- **`--exposure <n>`** — a real EV100 value fed into
+  `Camera::setExposure(n)`, pre-multiplied onto the scene's light/ambient
+  intensities before shading (Filament-style pre-exposure, not a
+  post-tonemap multiplier). Higher EV100 *darkens* the image (the
+  physical-camera convention: more EV100 means less exposure) — e.g.
+  `--exposure 5` renders noticeably darker than the default. `0` — the
+  default, and the only value that is a SENTINEL rather than a real
+  EV100 — is neutral (no override applied at all, `exposure() == 1.0`).
 - **`--vsync on|off`** (default `on`) — same present-mode control as
   01_triangle's `--vsync` section above.
 - **`--fullscreen`** — same borderless-desktop fullscreen toggle as
