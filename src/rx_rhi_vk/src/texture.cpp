@@ -254,6 +254,74 @@ std::optional<Texture2D> Texture2D::createForPresuppliedMips(VkPhysicalDevice ph
                       allocator.accounting(), category, allocationInfo.size);
 }
 
+std::optional<Texture2D> Texture2D::createCubeForPresuppliedMips(VkPhysicalDevice physicalDevice, VkDevice device,
+                                                                    Allocator& allocator, VkExtent2D faceExtent,
+                                                                    VkFormat format, VkImageUsageFlags usage,
+                                                                    uint32_t mipLevels, MemoryCategory category) {
+    // Same "no blit-format-feature probe, no fallback-to-1 clamp, never
+    // TRANSFER_SRC_BIT" reasoning as createForPresuppliedMips() above --
+    // see that factory's own header comment (texture.h). `physicalDevice`
+    // is unused for the identical reason that factory's own comment gives.
+    (void)physicalDevice;
+    VkImageUsageFlags finalUsage = usage | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    // VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT: the Vulkan spec's own required
+    // flag for any image a VK_IMAGE_VIEW_TYPE_CUBE view will be created
+    // against (VUID-VkImageViewCreateInfo-viewType-01003) -- cubes are
+    // still VK_IMAGE_TYPE_2D-typed images with 6 array layers, never a
+    // distinct VkImageType. Mirrors this project's own established
+    // StorageImage::create() precedent (storage_image.cpp) for a
+    // sampled-only image instead of a storage one.
+    imageInfo.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = format;
+    imageInfo.extent = {faceExtent.width, faceExtent.height, 1};
+    imageInfo.mipLevels = mipLevels;
+    imageInfo.arrayLayers = 6;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = finalUsage;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VmaAllocationCreateInfo allocCreateInfo{};
+    allocCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
+
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation allocation = VK_NULL_HANDLE;
+    VmaAllocationInfo allocationInfo{};
+    VkResult result = vmaCreateImage(allocator.raw(), &imageInfo, &allocCreateInfo, &image, &allocation, &allocationInfo);
+    if (result != VK_SUCCESS) {
+        allocator.noteAllocationFailure("Texture2D::createCubeForPresuppliedMips(vmaCreateImage)", category, result);
+        return std::nullopt;
+    }
+
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+    viewInfo.format = format;
+    viewInfo.subresourceRange.aspectMask = aspectMaskForFormat(format);
+    viewInfo.subresourceRange.baseMipLevel = 0;
+    viewInfo.subresourceRange.levelCount = mipLevels;
+    viewInfo.subresourceRange.baseArrayLayer = 0;
+    viewInfo.subresourceRange.layerCount = 6;
+
+    VkImageView view = VK_NULL_HANDLE;
+    result = vkCreateImageView(device, &viewInfo, nullptr, &view);
+    if (result != VK_SUCCESS) {
+        allocator.noteNonMemoryFailure("Texture2D::createCubeForPresuppliedMips(vkCreateImageView)", result);
+        vmaDestroyImage(allocator.raw(), image, allocation);
+        return std::nullopt;
+    }
+
+    allocator.accounting()->record(category, allocationInfo.size);
+    return Texture2D(allocator.raw(), device, image, allocation, view, faceExtent, format, mipLevels,
+                      allocator.accounting(), category, allocationInfo.size, /*arrayLayers=*/6, /*isCube=*/true);
+}
+
 void Texture2D::recordMipChainBlit(VkCommandBuffer cmd) const {
     if (mipLevels_ <= 1) {
         // Nothing to blit -- level 0 alone still needs the
@@ -328,6 +396,8 @@ Texture2D& Texture2D::operator=(Texture2D&& other) noexcept {
         accounting_ = std::move(other.accounting_);
         category_ = other.category_;
         allocatedBytes_ = other.allocatedBytes_;
+        arrayLayers_ = other.arrayLayers_;
+        isCube_ = other.isCube_;
 
         other.allocator_ = VK_NULL_HANDLE;
         other.device_ = VK_NULL_HANDLE;
@@ -339,6 +409,8 @@ Texture2D& Texture2D::operator=(Texture2D&& other) noexcept {
         other.mipLevels_ = 1;
         other.category_ = MemoryCategory::Internal;
         other.allocatedBytes_ = 0;
+        other.arrayLayers_ = 1;
+        other.isCube_ = false;
     }
     return *this;
 }

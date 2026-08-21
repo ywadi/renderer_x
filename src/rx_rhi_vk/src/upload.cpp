@@ -441,7 +441,10 @@ bool Uploader::uploadImageMips(Texture2D& dst, std::span<const ImageMipLevel> le
             region.bufferOffset = ringOffset;
             region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             region.imageSubresource.mipLevel = level.mipLevel;
-            region.imageSubresource.baseArrayLayer = 0;
+            // [Phase 5 Task 6] `level.baseArrayLayer` (0 for every
+            // pre-Task-6 caller, a cube face 0..5 otherwise) -- see
+            // ImageMipLevel::baseArrayLayer's own header comment.
+            region.imageSubresource.baseArrayLayer = level.baseArrayLayer;
             region.imageSubresource.layerCount = 1;
             region.imageExtent = {level.extent.width, level.extent.height, 1};
             vkCmdCopyBufferToImage(cmd, ringBuffer_.handle(), dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
@@ -498,7 +501,11 @@ bool Uploader::uploadImageMips(Texture2D& dst, std::span<const ImageMipLevel> le
             region.bufferOffset = ringOffset;
             region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             region.imageSubresource.mipLevel = level.mipLevel;
-            region.imageSubresource.baseArrayLayer = 0;
+            // [Phase 5 Task 6] Same `level.baseArrayLayer` threading as
+            // the unchunked branch above -- proves the chunked-staging
+            // path lands data in the CORRECT face's subresource, not just
+            // the correct rows within one face (matrix row 12).
+            region.imageSubresource.baseArrayLayer = level.baseArrayLayer;
             region.imageSubresource.layerCount = 1;
             region.imageOffset = {0, static_cast<int32_t>(rowStart), 0};
             region.imageExtent = {level.extent.width, chunkRows, 1};

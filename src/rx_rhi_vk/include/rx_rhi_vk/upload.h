@@ -278,6 +278,17 @@ public:
         VkDeviceSize size = 0;
         uint32_t mipLevel = 0;
         VkExtent2D extent{0, 0};
+        // [Phase 5 Task 6, ticket #42, gate matrix-p5t06-ktx2-cubemap-hdr
+        // row 7] Destination array layer (cube face 0..5 for a `dst` built
+        // via Texture2D::createCubeForPresuppliedMips(); always 0 -- the
+        // default -- for a plain single-layer `dst`). Every EXISTING
+        // caller of uploadImageMips() leaves this at its default, so this
+        // field's addition is byte-identical-regression-safe by
+        // construction (matrix row 4/12): the two `imageSubresource.
+        // baseArrayLayer` sites this threads into (upload.cpp) both read
+        // 0 for every pre-Task-6 call site, exactly as they did when that
+        // field was hardcoded to the literal 0.
+        uint32_t baseArrayLayer = 0;
     };
 
     // Uploads a full set of caller-supplied mip levels DIRECTLY into

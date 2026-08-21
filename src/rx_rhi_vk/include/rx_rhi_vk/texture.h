@@ -140,6 +140,27 @@ public:
                                                                uint32_t mipLevels,
                                                                MemoryCategory category = MemoryCategory::Texture);
 
+    // [Phase 5 Task 6, ticket #42, gate matrix-p5t06-ktx2-cubemap-hdr row
+    // 7] Cube-aware sibling of createForPresuppliedMips() above -- SAME
+    // "fully caller-supplied mip chain, no blit generation, no
+    // blit-format-feature probe" contract (see that factory's own header
+    // comment for the full rationale), but creates a 6-array-layer image
+    // with VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT set and a
+    // VK_IMAGE_VIEW_TYPE_CUBE view instead of a plain 2D one -- mirrors
+    // this project's own established StorageImage::create() cube-flag/
+    // view-type-resolution precedent (storage_image.cpp's viewTypeFor()),
+    // reused here rather than reinvented for the sampled-image case.
+    // `faceExtent` is ONE face's own width/height (Vulkan's own cube-image
+    // rule: all 6 faces of one cube image always share the same extent).
+    // `mipLevels` applies per-face, exactly like createForPresuppliedMips()'s
+    // own `mipLevels` parameter. Same failure/category-attribution
+    // contract as both factories above.
+    static std::optional<Texture2D> createCubeForPresuppliedMips(VkPhysicalDevice physicalDevice, VkDevice device,
+                                                                    Allocator& allocator, VkExtent2D faceExtent,
+                                                                    VkFormat format, VkImageUsageFlags usage,
+                                                                    uint32_t mipLevels,
+                                                                    MemoryCategory category = MemoryCategory::Texture);
+
     VkImage image() const { return image_; }
     VkImageView view() const { return view_; }
     VkExtent2D extent() const { return extent_; }
@@ -147,6 +168,14 @@ public:
     uint32_t mipLevels() const { return mipLevels_; }
     MemoryCategory category() const { return category_; }
     VkDeviceSize allocatedBytes() const { return allocatedBytes_; }
+    // [Phase 5 Task 6] arrayLayers() is 1 for every Texture2D built via
+    // create()/createForPresuppliedMips() and 6 for one built via
+    // createCubeForPresuppliedMips() -- isCube() is the same information
+    // spelled as a bool, for a caller (TextureCache::registerRealTexture())
+    // that just needs to know which of the two factories built this
+    // instance without re-deriving it from the layer count.
+    uint32_t arrayLayers() const { return arrayLayers_; }
+    bool isCube() const { return isCube_; }
 
     // Records the full mip-chain blit for a texture whose level 0 was
     // just written (e.g. by rx::rhi::Uploader::uploadToImage()) and is
@@ -179,10 +208,16 @@ public:
 
 private:
     Texture2D() = default;
+    // [Phase 5 Task 6] `arrayLayers`/`isCube` default to 1/false so
+    // create()/createForPresuppliedMips()'s own `return Texture2D(...)`
+    // call sites (texture.cpp) need NO change at all -- zero risk to
+    // either existing factory; only createCubeForPresuppliedMips() (the
+    // new one) passes 6/true explicitly.
     Texture2D(VmaAllocator allocator, VkDevice device, VkImage image, VmaAllocation allocation, VkImageView view,
                VkExtent2D extent, VkFormat format, uint32_t mipLevels,
                std::shared_ptr<MemoryAccounting> accounting = nullptr,
-               MemoryCategory category = MemoryCategory::Internal, VkDeviceSize allocatedBytes = 0)
+               MemoryCategory category = MemoryCategory::Internal, VkDeviceSize allocatedBytes = 0,
+               uint32_t arrayLayers = 1, bool isCube = false)
         : allocator_(allocator),
           device_(device),
           image_(image),
@@ -193,7 +228,9 @@ private:
           mipLevels_(mipLevels),
           accounting_(std::move(accounting)),
           category_(category),
-          allocatedBytes_(allocatedBytes) {}
+          allocatedBytes_(allocatedBytes),
+          arrayLayers_(arrayLayers),
+          isCube_(isCube) {}
 
     void destroyAll();
 
@@ -212,6 +249,10 @@ private:
     std::shared_ptr<MemoryAccounting> accounting_;
     MemoryCategory category_ = MemoryCategory::Internal;
     VkDeviceSize allocatedBytes_ = 0;
+
+    // [Phase 5 Task 6]
+    uint32_t arrayLayers_ = 1;
+    bool isCube_ = false;
 };
 
 }  // namespace rx::rhi

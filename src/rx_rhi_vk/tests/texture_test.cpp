@@ -241,3 +241,37 @@ TEST_CASE("Texture2D::create honors an explicit requestedMipLevels below the aut
 
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
+
+TEST_CASE("Texture2D::createCubeForPresuppliedMips builds a real 6-layer VK_IMAGE_VIEW_TYPE_CUBE image, "
+          "isolated from TextureCache -- [Phase 5 Task 6, ticket #42, gate matrix-p5t06-ktx2-cubemap-hdr row 7]") {
+    auto fixture = makeFixture("rx_rhi_vk_texture_test_create_cube");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto cube = rx::rhi::Texture2D::createCubeForPresuppliedMips(
+        fixture->device.physicalDevice(), fixture->device.device(), fixture->allocator, VkExtent2D{16, 16},
+        VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT, /*mipLevels=*/3, rx::rhi::MemoryCategory::Texture);
+    REQUIRE(cube.has_value());
+    CHECK(cube->image() != VK_NULL_HANDLE);
+    CHECK(cube->view() != VK_NULL_HANDLE);
+    CHECK(cube->isCube());
+    CHECK(cube->arrayLayers() == 6);
+    CHECK(cube->mipLevels() == 3);
+    // `extent()` reports ONE FACE's own extent (this factory's own
+    // documented contract, texture.h) -- never a 6x-multiplied width.
+    CHECK(cube->extent().width == 16);
+    CHECK(cube->extent().height == 16);
+
+    // A plain (non-cube) Texture2D built via the SIBLING factory in the
+    // same test, for direct contrast: isCube()/arrayLayers() must NOT
+    // have silently become "always cube" process-wide.
+    auto plain = rx::rhi::Texture2D::createForPresuppliedMips(
+        fixture->device.physicalDevice(), fixture->device.device(), fixture->allocator, VkExtent2D{16, 16},
+        VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT, /*mipLevels=*/1, rx::rhi::MemoryCategory::Texture);
+    REQUIRE(plain.has_value());
+    CHECK_FALSE(plain->isCube());
+    CHECK(plain->arrayLayers() == 1);
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}

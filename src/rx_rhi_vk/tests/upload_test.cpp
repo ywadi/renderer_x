@@ -1189,3 +1189,103 @@ TEST_CASE("Uploader::uploadImageMips: an oversized level whose byte size does NO
     CHECK(uploader->flush().value == 0);
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
+
+TEST_CASE("Uploader::uploadImageMips + Texture2D::createCubeForPresuppliedMips: per-face CHUNKED-ROW uploads "
+          "land in the CORRECT face's subresource, not just the correct rows within one face [Phase 5 Task 6, "
+          "ticket #42, gate matrix-p5t06-ktx2-cubemap-hdr row 12]") {
+    auto fixture = makeFixture("rx_rhi_vk_upload_test_cube_chunked_per_face");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    // Same 32x32 RGBA8 / 1024-byte-ring shape as the plain-2D chunked test
+    // above (4096 bytes/face against a 1024-byte ring -- 4 chunks/face, no
+    // remainder) -- mirrored deliberately (matrix row 12's own
+    // instruction: "locate the existing non-cube chunking test's ring-
+    // size-forcing mechanism and mirror it exactly"), just against a cube
+    // image and two DISTINCT per-face source buffers instead of one.
+    constexpr VkDeviceSize kRingSize = 1024;
+    constexpr VkExtent2D kFaceExtent{32, 32};
+    constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    constexpr uint32_t kFaceA = 0;
+    constexpr uint32_t kFaceB = 5;
+
+    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device, kRingSize);
+    REQUIRE(uploader.has_value());
+
+    auto texture = rx::rhi::Texture2D::createCubeForPresuppliedMips(
+        fixture->device.physicalDevice(), fixture->device.device(), fixture->allocator, kFaceExtent, kFormat,
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, /*mipLevels=*/1, rx::rhi::MemoryCategory::Texture);
+    REQUIRE(texture.has_value());
+    CHECK(texture->isCube());
+    CHECK(texture->arrayLayers() == 6);
+
+    // Face A gets the plain gradient; face B gets its bitwise-NOT --
+    // maximally distinguishable from face A at every byte, so a
+    // face-swap OR a misplaced chunk both fail this test's memcmp, not
+    // just a subtle value drift.
+    std::vector<uint8_t> pixelsA = makeGradientPixelsLocal(kFaceExtent.width, kFaceExtent.height);
+    std::vector<uint8_t> pixelsB(pixelsA.size());
+    for (size_t i = 0; i < pixelsA.size(); ++i) {
+        pixelsB[i] = static_cast<uint8_t>(~pixelsA[i]);
+    }
+    REQUIRE(static_cast<VkDeviceSize>(pixelsA.size()) > kRingSize);  // this test's own premise -- must actually need chunking
+
+    std::array<rx::rhi::Uploader::ImageMipLevel, 2> levels{};
+    levels[0].data = pixelsA.data();
+    levels[0].size = static_cast<VkDeviceSize>(pixelsA.size());
+    levels[0].mipLevel = 0;
+    levels[0].extent = kFaceExtent;
+    levels[0].baseArrayLayer = kFaceA;
+    levels[1].data = pixelsB.data();
+    levels[1].size = static_cast<VkDeviceSize>(pixelsB.size());
+    levels[1].mipLevel = 0;
+    levels[1].extent = kFaceExtent;
+    levels[1].baseArrayLayer = kFaceB;
+
+    REQUIRE(uploader->uploadImageMips(*texture, levels));
+    uploader->wait(uploader->flush());
+    // Same revert-discrimination evidence as the plain-2D chunked test:
+    // proves multiple bounded ring trips actually happened across BOTH
+    // faces, not one oversized reservation slipping through.
+    CHECK(uploader->ringWrapCount() >= 3);
+
+    auto readBackFace = [&](uint32_t face, const std::vector<uint8_t>& expected) {
+        auto readback = fixture->allocator.createHostVisibleBuffer(expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        REQUIRE(readback.has_value());
+        auto cmdCtx = rx::rhi::CommandContext::create(fixture->device.device(), fixture->device.graphicsQueue(),
+                                                        fixture->device.graphicsQueueFamily());
+        REQUIRE(cmdCtx.has_value());
+        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+            rx::rhi::transitionImage(cmd, texture->image(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            VkBufferImageCopy region{};
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.baseArrayLayer = face;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent = {kFaceExtent.width, kFaceExtent.height, 1};
+            vkCmdCopyImageToBuffer(cmd, texture->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(),
+                                   1, &region);
+        });
+        readback->invalidate();
+        std::vector<uint8_t> readBackPixels(expected.size());
+        std::memcpy(readBackPixels.data(), readback->mappedData(), expected.size());
+        CHECK(std::memcmp(readBackPixels.data(), expected.data(), expected.size()) == 0);
+        // Restore SHADER_READ_ONLY_OPTIMAL for the next face's own
+        // transition-in above (both faces of the SAME image, transitioned
+        // sequentially).
+        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+            rx::rhi::transitionImage(cmd, texture->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        });
+    };
+
+    // THE headline assertions: face A reads back as face A's own content
+    // (not face B's, not a chunk-corrupted mix), and face B independently
+    // reads back as face B's own content -- proving uploadImageMips()'s
+    // `baseArrayLayer` threading (upload.cpp) lands each face's chunked
+    // trips in ITS OWN subresource, not the other face's.
+    readBackFace(kFaceA, pixelsA);
+    readBackFace(kFaceB, pixelsB);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
