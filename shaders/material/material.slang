@@ -46,7 +46,30 @@ public struct MaterialVertex {
     public float2 uv;
     public float3 lightDirWorld;  // unit vector FROM the surface TOWARD the light.
     public float3 lightColor;     // rgb = light color * intensity.
-    public float3 ambientColor;   // [FG1] interim flat ambient/environment term.
+    // [FG1, RETIRED by Phase 5 Task 10, #46] The interim flat ambient/
+    // environment term -- StandardPbr's evaluate() no longer reads this
+    // field (see standard_pbr.slang's own header comment: the `env*`
+    // fields below replace it with real IBL). Kept, unconsumed, on
+    // MaterialVertex/RxDrawData/rx::material::DrawDataGpu (rather than
+    // renamed/removed) to avoid an unrelated mass edit across every
+    // existing DrawDataGpu producer/test that still populates it
+    // (samples 06/09, several GPU test rigs) -- a future cleanup task may
+    // remove it once nothing sets it either.
+    public float3 ambientColor;
+
+    // [Phase 5 Task 10, #46] The scene environment's own bindless bundle,
+    // forwarded verbatim from the SAME RxDrawData row forward_entry.slang's
+    // fragmentMain re-reads for its shadow fields -- see RxDrawData's own
+    // header comment (material.slang, above) for the full field-by-field
+    // rationale and the `envIrradianceCubeIndex == 0xFFFFFFFF` "no
+    // environment" sentinel convention.
+    public uint envIrradianceCubeIndex;
+    public uint envPrefilteredCubeIndex;
+    public uint envDfgLutIndex;
+    public uint envCubeSamplerIndex;
+    public uint envDfgSamplerIndex;
+    public float envMaxPrefilteredLod;
+    public float envIntensity;
 
     // [BRDF baseline] World-space camera/eye position -- the one piece of
     // per-pass (not per-vertex) data StandardPBR's specular term genuinely
@@ -142,6 +165,25 @@ SamplerState gSamplers[];
 // (the only thing that touches this global) lives in this module too.
 [[vk::binding(3, 0)]]
 SamplerComparisonState gShadowCompareSamplers[];
+
+// [Phase 5 Task 10, #46] The scene-environment bindless CUBE array --
+// base/irradiance/prefiltered environment cubemaps (rx::ibl::BakeResult,
+// T9's own bake chain), consumed by standard_pbr.slang's IBL diffuse/
+// specular lobes (this file's own `RxDrawData::envIrradianceCubeIndex`/
+// `envPrefilteredCubeIndex` below) and shaders/ibl/skybox.slang's own
+// background pass. A SEPARATE bindless array from `gTextures` above (not
+// a shared binding): Slang/SPIR-V's `TextureCube` and `Texture2D` are
+// distinct `OpTypeImage` `Dim` declarations, so one binding cannot serve
+// both bindless element shapes even though Vulkan's own descriptor TYPE
+// (VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) is identical either way -- see
+// `rx::rhi::BindlessTable::kCubeSampledImageBinding`'s own header comment
+// (bindless.h) for the full rationale. Bound at
+// `BindlessTable::kCubeSampledImageBinding` (binding 4), the table's own
+// FIFTH, OPTIONAL slot (`BindlessTable::Capacities::cubeImages` -- see
+// that field's own header comment for why every pre-Task-10 non-IBL
+// bindless consumer is unaffected by this addition).
+[[vk::binding(4, 0)]]
+TextureCube gTexturesCube[];
 
 // DEFAULT SAMPLER INDEX -- the bindless SAMPLER slot `rx_sampleTexture`'s
 // two-argument overload (below) reads has to come from somewhere at
@@ -273,6 +315,75 @@ public struct RxDrawData {
     public uint shadowCompareSamplerIndex;
     public float shadowTexelSize;
     public uint _padShadow;
+
+    // [Phase 5 Task 10, #46, FG1 closure] The scene environment's own
+    // bindless bundle -- per-pass, repeated per row, same "simpler than a
+    // second one-row bindless buffer" precedent as every other per-pass
+    // field in this struct (`viewProj`/`lightDirWorld`/`lightColor`/
+    // `cameraPosWorld` above). Populated from `rx::scene::Scene::
+    // environment()` (an `EnvironmentDesc`, rx_scene/environment.h) by
+    // whichever RxDrawData PRODUCER a caller uses (samples/08_gltf_viewer's
+    // own `updateDrawDataPerPassFields()`). `envIrradianceCubeIndex ==
+    // 0xFFFFFFFF` is the "no environment configured for this scene" sentinel
+    // -- SAME convention as `shadowMapTextureIndex` above -- every producer
+    // that never sets these fields (every pre-Task-10 producer: samples 06/
+    // 09, this engine's own GPU test rigs) leaves them at that default and
+    // standard_pbr.slang's evaluate() contributes ZERO indirect lighting for
+    // such a draw, exactly matching Filament's own "no IndirectLight bound"
+    // behavior -- see standard_pbr.slang's own header comment for why this
+    // is a real behavior change from the RETIRED `ambientColor` flat term
+    // below (a scene that never opts into IBL now gets NO ambient
+    // contribution at all, not a placeholder one).
+    public uint envIrradianceCubeIndex;
+    public uint envPrefilteredCubeIndex;
+    public uint envDfgLutIndex;
+    // Bindless SAMPLER indices -- a trilinear-across-mips CLAMP_TO_EDGE
+    // sampler for the two cube reads above (both share one; a mip-chain
+    // read needs LINEAR mipmap filtering, which the base/irradiance
+    // cube's own single-mip reads tolerate trivially) and a bilinear
+    // CLAMP_TO_EDGE sampler for the 2D DFG LUT (never wraps -- both its
+    // axes are already clamped [0,1] parameterizations, see
+    // shaders/ibl/dfg_lut.slang's own header comment).
+    public uint envCubeSamplerIndex;
+    public uint envDfgSamplerIndex;
+    // `prefilteredCubemap`'s own highest mip INDEX (mip count - 1), as a
+    // float -- the roughness-to-LOD remap's own natural unit
+    // (`perceptualRoughness * envMaxPrefilteredLod`, standard_pbr.slang).
+    public float envMaxPrefilteredLod;
+    // [T10's own environment-intensity-in-physical-units ruling, gate
+    // matrix Open Question resolved (a): a documented lux/nits-equivalent
+    // scalar, PRE-EXPOSED at the SAME single CPU-side point Task 4's
+    // `rx::scene::Camera::exposure()` multiply already applies to
+    // `lightColor`/`ambientColor` above (see this struct's own top
+    // comment) -- a producer computes `envIntensity = physicalIntensity *
+    // camera.exposure()` once, here, exactly mirroring
+    // `lightColor`/`ambientColor`'s own pre-exposure convention, so a
+    // `--exposure` change scales the IBL terms AND the skybox's own
+    // rendered radiance (shaders/ibl/skybox.slang reads the identical
+    // pre-exposed value from its own per-frame environment buffer,
+    // populated by the SAME CPU-side formula) by the same factor --
+    // Task 13 (Stage 2, KHR_lights_punctual) is where this reconciles
+    // against a broader physical-light-unit system; this field's own
+    // "environment radiance/luminance, exposure-premultiplied" unit is
+    // T10's OWN documented convention until then.
+    public float envIntensity;
+    // [MATRIX LAYOUT / std430 ARRAY STRIDE -- LOAD-BEARING] A
+    // `StructuredBuffer<RxDrawData>[]`'s per-element STRIDE is rounded up
+    // to the alignment of its largest member (16 bytes, this struct's own
+    // several `float4x4`/`float4` fields) -- exactly the GLSL/HLSL std430
+    // array-of-struct rule, verified directly against this exact
+    // mismatch during this task's own development (a struct total NOT a
+    // multiple of 16 bytes makes the SHADER's own real per-row byte
+    // stride silently round up beyond what a C++ producer's tight
+    // `sizeof(DrawDataGpu) * rowCount` packing assumes -- row 0 still
+    // reads correctly, since it sits at offset 0 either way, but every
+    // row AFTER it reads progressively misaligned/garbage data. This ONE
+    // padding field is exactly what's needed to bring this struct's own
+    // total size back to a 16-byte multiple (352 + 7 real env fields' 28
+    // bytes + this 4 bytes == 384) -- see draw_data.h's own
+    // `static_assert(sizeof(DrawDataGpu) == 384, ...)` for the other half
+    // of this invariant.
+    public float _padEnv0;
 }
 
 [[vk::binding(2, 0)]]
@@ -374,4 +485,18 @@ public float4 rx_sampleTexture(uint textureIndex, uint samplerIndex, float2 uv) 
 // default this file's own header comment (above) now describes in full.
 public float4 rx_sampleTexture(uint textureIndex, float2 uv) {
     return rx_sampleTexture(textureIndex, gMaterialGlobals.defaultSamplerIndex, uv);
+}
+
+// [Phase 5 Task 10, #46] Explicit-LOD bindless cube sample -- the ONLY cube
+// read shape this engine needs: the irradiance cubemap is always sampled at
+// mip 0 (single-mip, T9's own bake output), the prefiltered cubemap is
+// sampled at a roughness-derived LOD (`RxDrawData::envMaxPrefilteredLod`,
+// standard_pbr.slang), and the skybox pass (shaders/ibl/skybox.slang) reads
+// the base cubemap sharp (LOD 0) -- every call site already knows its own
+// LOD, so this never needs an implicit-derivatives (`.Sample()`) overload
+// (which is also illegal from a compute-adjacent/non-gradient context
+// anyway; keeping ONE explicit-LOD entry point avoids that class of
+// mistake entirely).
+public float4 rx_sampleTextureCubeLod(uint cubeIndex, uint samplerIndex, float3 dir, float lod) {
+    return gTexturesCube[cubeIndex].SampleLevel(gSamplers[samplerIndex], dir, lod);
 }

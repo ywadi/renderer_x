@@ -341,6 +341,34 @@ size_t Scene::lightCount() const {
     return lightGeneration_.size() - lightFreeList_.size();
 }
 
+// ---------------------------------------------------------------------
+// Environment [Phase 5 Task 10, #46]
+// ---------------------------------------------------------------------
+
+void Scene::setEnvironment(const EnvironmentDesc& desc) {
+    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::setEnvironment");
+    environment_ = desc;
+}
+
+void Scene::clearEnvironment() {
+    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::clearEnvironment");
+    environment_.reset();
+}
+
+bool Scene::hasEnvironment() const {
+    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::hasEnvironment");
+    return environment_.has_value();
+}
+
+const EnvironmentDesc& Scene::environment() const {
+    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::environment");
+    if (!environment_.has_value()) {
+        RX_LOG_ERROR("rx::scene::Scene::environment: no environment configured -- call hasEnvironment() first");
+        throw std::out_of_range("rx::scene::Scene::environment");
+    }
+    return *environment_;
+}
+
 namespace detail {
 
 LightHandle createLightRecordForTesting(Scene& scene, const LightRecord& record) { return scene.insertLightRecord(record); }

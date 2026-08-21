@@ -90,7 +90,13 @@ struct DrawDataGpu {
     // matching every other vector field in this struct).
     glm::vec4 lightDirWorld{0.0F, 1.0F, 0.0F, 0.0F};
     glm::vec4 lightColor{1.0F, 1.0F, 1.0F, 0.0F};    // rgb = color * intensity; w unused.
-    glm::vec4 ambientColor{0.03F, 0.03F, 0.03F, 0.0F};  // [FG1] flat interim ambient/environment term; w unused.
+    // [FG1, RETIRED by Phase 5 Task 10, #46] StandardPbr's evaluate() no
+    // longer reads this field -- see standard_pbr.slang's own header
+    // comment. Kept, unconsumed, rather than removed/renamed -- see
+    // material.slang's own `MaterialVertex::ambientColor` header comment
+    // for why (avoids an unrelated mass edit across every existing
+    // DrawDataGpu producer/test that still populates it).
+    glm::vec4 ambientColor{0.03F, 0.03F, 0.03F, 0.0F};
 
     // [BRDF baseline] World-space camera/eye position, xyz (w unused) --
     // per-pass, repeated per row like the three fields above. Genuinely
@@ -128,8 +134,41 @@ struct DrawDataGpu {
     uint32_t shadowCompareSamplerIndex = 0;        // bindless COMPARISON-SAMPLER index (BindlessTable::kComparisonSamplerBinding).
     float shadowTexelSize = 0.0F;                  // UV-space PCF tap step (1.0 / shadow map resolution).
     uint32_t _padShadow = 0;
+
+    // [Phase 5 Task 10, #46, FG1 closure] Mirrors material.slang's
+    // RxDrawData environment fields EXACTLY (added at the same struct-tail
+    // position on both sides -- see this header's own top comment on why
+    // both sides must move together). `envIrradianceCubeIndex ==
+    // 0xFFFFFFFF` (the default below) is the "no environment configured"
+    // sentinel -- every EXISTING producer of a DrawDataGpu row that never
+    // sets these fields (samples 06/09, every pre-Task-10 GPU test rig)
+    // gets ZERO indirect/IBL contribution, per standard_pbr.slang's own
+    // header comment on why this is a real, intentional behavior change
+    // from the RETIRED `ambientColor` term above, not a byte-identical
+    // default.
+    uint32_t envIrradianceCubeIndex = 0xFFFFFFFFu;   // bindless CUBE index (BindlessTable::kCubeSampledImageBinding).
+    uint32_t envPrefilteredCubeIndex = 0xFFFFFFFFu;  // bindless CUBE index.
+    uint32_t envDfgLutIndex = 0xFFFFFFFFu;           // bindless SAMPLED_IMAGE (2D) index.
+    uint32_t envCubeSamplerIndex = 0;                // bindless SAMPLER index, trilinear-across-mips.
+    uint32_t envDfgSamplerIndex = 0;                 // bindless SAMPLER index, bilinear clamp-to-edge.
+    float envMaxPrefilteredLod = 0.0F;               // prefilteredCubemap mip count - 1.
+    float envIntensity = 0.0F;                       // PRE-EXPOSED physical-units scalar (Camera::exposure() already applied).
+    // [MATRIX LAYOUT / std430 ARRAY STRIDE -- LOAD-BEARING, see this
+    // header's own top comment] ONE padding field, not decorative --
+    // rounds this struct's total size up to a multiple of 16 bytes,
+    // matching the per-element STRIDE Slang's `StructuredBuffer<RxDrawData>
+    // []` (material.slang) actually uses on the GPU side (std430's
+    // array-of-struct stride-rounds-to-largest-member-alignment rule,
+    // 16 bytes here because of this struct's several float4x4/float4
+    // fields). Omitting this padding reproduced a REAL bug directly during
+    // this task's own development: row 0 of a multi-row DrawDataGpu buffer
+    // still read correctly (offset 0 either way), but every row after it
+    // read progressively misaligned/garbage data, because a C++ producer's
+    // tight `sizeof(DrawDataGpu) * rowCount` packing silently disagreed
+    // with the shader's own (16-byte-rounded) real stride.
+    float _padEnv0 = 0.0F;
 };
-static_assert(sizeof(DrawDataGpu) == 352, "DrawDataGpu must stay exactly 352 bytes -- mirrors material.slang's RxDrawData");
+static_assert(sizeof(DrawDataGpu) == 384, "DrawDataGpu must stay exactly 384 bytes -- mirrors material.slang's RxDrawData");
 
 // Mirrors material.slang's `RxMaterialGlobals` push-constant struct
 // (`[[vk::push_constant]] ConstantBuffer<RxMaterialGlobals> gMaterialGlobals;`)
@@ -160,5 +199,31 @@ struct MaterialGlobalsPush {
 static_assert(sizeof(MaterialGlobalsPush) == 8,
               "MaterialGlobalsPush must stay exactly 8 bytes (2 packed 4-byte scalars) -- mirrors material.slang's "
               "RxMaterialGlobals, and bindInstance() (material_system.cpp) pushes exactly this many bytes for it");
+
+// [Phase 5 Task 10, #46, FG1 closure] Mirrors shaders/ibl/skybox.slang's
+// own `RxSkyboxData` struct field-for-field -- see that struct's own
+// header comment and this header's own top comment (MATRIX LAYOUT/std430
+// ARRAY STRIDE) for the same cross-file-drift and 16-byte-struct-stride
+// discipline DrawDataGpu/RxDrawData already establish. ONE row, rebuilt
+// every frame by samples/08_gltf_viewer's own recordSkybox() call site
+// (the camera moves every frame in the interactive present loop).
+struct SkyboxDataGpu {
+    glm::mat4 invViewProj{1.0F};              // clip -> world. Transposed before upload -- see this header's own MATRIX LAYOUT paragraph.
+    glm::vec4 cameraPosWorld{0.0F};           // xyz used; w unused padding.
+    uint32_t baseCubeIndex = 0xFFFFFFFFu;     // bindless CUBE index (BindlessTable::kCubeSampledImageBinding).
+    uint32_t cubeSamplerIndex = 0;            // bindless SAMPLER index.
+    float intensity = 1.0F;                   // PRE-EXPOSED, SAME convention as DrawDataGpu::envIntensity above.
+    uint32_t _pad0 = 0;
+};
+static_assert(sizeof(SkyboxDataGpu) == 96,
+              "SkyboxDataGpu must stay exactly 96 bytes (already a multiple of 16 -- mat4[64] + vec4[16] + "
+              "4 scalars[16]) -- mirrors shaders/ibl/skybox.slang's RxSkyboxData");
+
+// Mirrors shaders/ibl/skybox.slang's own `SkyboxPush` push-constant struct.
+// All-scalar, same reasoning as MaterialGlobalsPush above.
+struct SkyboxPush {
+    uint32_t skyboxDataBufferIndex = 0;  // bindless STORAGE BUFFER index of the one-row SkyboxDataGpu[] above.
+};
+static_assert(sizeof(SkyboxPush) == 4, "SkyboxPush must stay exactly 4 bytes (one scalar) -- mirrors skybox.slang's SkyboxPush");
 
 }  // namespace rx::material

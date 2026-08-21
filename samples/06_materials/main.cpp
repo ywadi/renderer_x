@@ -852,6 +852,11 @@ bool createScene(Scene& scene, VkPhysicalDevice physicalDevice, rx::rhi::Device&
     // SPIR-V's own declared shape for pipeline creation to succeed).
     rx::rhi::BindlessTable::Capacities capacities{/*sampledImages=*/4, /*samplers=*/1, /*storageBuffers=*/1};
     capacities.comparisonSamplers = 1;
+    // [Phase 5 Task 10, #46] Same requirement as `comparisonSamplers`
+    // above: material.slang now unconditionally declares `gTexturesCube`
+    // at binding 4 (this sample never binds a real environment either, but
+    // the descriptor set layout still needs a matching binding).
+    capacities.cubeImages = 1;
     auto bindlessTable = rx::rhi::BindlessTable::create(physicalDevice, device.device(), capacities);
     if (!bindlessTable.has_value()) {
         RX_LOG_ERROR("sample_06_materials: BindlessTable::create failed");

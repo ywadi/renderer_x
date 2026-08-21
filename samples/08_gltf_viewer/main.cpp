@@ -82,11 +82,13 @@
 #include <rx_asset/geometry_pool.h>
 #include <rx_asset/registry.h>
 #include <rx_asset/texture_cache.h>
+#include <rx_asset/texture_decode.h>
 #include <rx_core/log.h>
 #include <rx_core/profile.h>
 #include <rx_graph/executor.h>
 #include <rx_graph/render_graph.h>
 #include <rx_graph/scene_color.h>
+#include <rx_ibl/bake.h>
 #include <rx_material/draw_data.h>
 #include <rx_material/material_system.h>
 #include <rx_material/param_arena_factory.h>
@@ -102,8 +104,10 @@
 #include <rx_rhi_vk/frame_sync.h>
 #include <rx_rhi_vk/per_frame_storage_buffer.h>
 #include <rx_rhi_vk/pipeline_layout.h>
+#include <rx_rhi_vk/texture.h>
 #include <rx_rhi_vk/upload.h>
 #include <rx_scene/camera.h>
+#include <rx_scene/scene.h>
 #include <rx_shader/compiler.h>
 #include <rx_shader/reflection.h>
 #include <rx_task/scheduler.h>
@@ -192,6 +196,26 @@ struct Args {
     // prints (there is none) -- discoverable only by reading this source or
     // that script.
     std::string writeReferencesDir;
+
+    // [Phase 5 Task 10, #46, FG1 closure] `--env <path.hdr>` -- an equirect
+    // HDR environment to bake (rx::ibl::bakeEnvironment()) and bind via
+    // `rx::scene::Scene::setEnvironment()`. Empty (the default) resolves to
+    // this sample's own committed fixture (resolveDefaultEnvironmentPath(),
+    // samples/08_gltf_viewer/environments/gate_test_env.hdr) UNLESS `noEnv`
+    // is set -- see that flag's own comment.
+    std::string envPath;
+    // [Phase 5 Task 10, #46] `--no-env` -- explicitly skips loading ANY
+    // environment (not even the default fixture), overriding `envPath`'s
+    // own default-resolution -- this sample's own escape hatch for
+    // reproducing the pre-T10 "no environment, zero indirect light" render
+    // (the discrimination gate's own "BEFORE" comparison capture; see
+    // tools/regen_references.sh's own T10 addendum / task-10-report.md).
+    bool noEnv = false;
+    // [Phase 5 Task 10, #46] Overrides this sample's own physical-units
+    // environment intensity (EnvironmentDesc::intensity's own header
+    // comment, rx_scene/scene.h) -- default 1.0 (neutral), matching
+    // EnvironmentDesc's own default.
+    float envIntensity = 1.0F;
 };
 
 std::optional<Args> parseArgs(int argc, char** argv) {
@@ -228,6 +252,18 @@ std::optional<Args> parseArgs(int argc, char** argv) {
             }
         } else if (arg == "--fullscreen") {
             args.fullscreen = true;
+        } else if (arg == "--env" && i + 1 < argc) {
+            args.envPath = argv[++i];
+        } else if (arg == "--no-env") {
+            args.noEnv = true;
+        } else if (arg == "--env-intensity" && i + 1 < argc) {
+            const std::string_view value = argv[++i];
+            float parsed = 1.0F;
+            if (std::from_chars(value.data(), value.data() + value.size(), parsed).ec != std::errc{}) {
+                RX_LOG_ERROR("sample_08_gltf_viewer: --env-intensity expects a real number, got '{}'", value);
+                return std::nullopt;
+            }
+            args.envIntensity = parsed;
         } else {
             RX_LOG_ERROR("sample_08_gltf_viewer: unrecognized argument '{}'", arg);
             return std::nullopt;
@@ -266,6 +302,25 @@ std::filesystem::path resolveDefaultScenePath() {
     std::filesystem::path devTree =
         std::filesystem::path(RX_REPO_ROOT_DIR) / "assets" / "fetched" / "DamagedHelmet" / "glTF" / "DamagedHelmet.gltf";
     return devTree;
+}
+
+// [Phase 5 Task 10, #46, FG1 closure] Resolution order mirrors
+// resolveDefaultScenePath() above exactly: (1) a packaged, pre-staged copy
+// next to the binary (this sample's own CMakeLists.txt `environments/`
+// deploy block); (2) this checked-out repository's own committed copy
+// (samples/08_gltf_viewer/environments/gate_test_env.hdr -- COMMITTED
+// directly, unlike DamagedHelmet's own tools/fetch_assets.sh-fetched
+// asset: this fixture is small and procedurally generated FOR this task,
+// not third-party content -- see that file's own provenance note, this
+// function's caller). Never silently falls through to a third guess, same
+// discipline as resolveDefaultScenePath().
+std::filesystem::path resolveDefaultEnvironmentPath() {
+    std::filesystem::path packaged = basePathDirectory() / "environments" / "gate_test_env.hdr";
+    if (std::filesystem::exists(packaged)) {
+        return packaged;
+    }
+    return std::filesystem::path(RX_REPO_ROOT_DIR) / "samples" / "08_gltf_viewer" / "environments" /
+           "gate_test_env.hdr";
 }
 
 // --- Orbit camera [gate ruling #8: SDL mouse state read directly via
@@ -806,6 +861,50 @@ struct App {
     rx::asset::AsyncImportHandle importHandle;
     bool importStarted = false;
     bool sceneReady = false;
+
+    // --- Environment / IBL / skybox [Phase 5 Task 10, #46, FG1 closure] ---
+    // `scene` exists SOLELY for its `setEnvironment()`/`hasEnvironment()`/
+    // `environment()` surface -- this sample does not adopt rx::scene::
+    // Scene's renderable-proxy/DrawListBuilder machinery at all (out of
+    // this ticket's own scope; sample 09 is that integration), so it is
+    // constructed with a trivial, never-invoked MeshBoundsFn (matching
+    // scene_test.cpp's own `fallbackShapedBounds` device-free-test
+    // precedent) -- this sample never calls createRenderable().
+    std::optional<rx::scene::Scene> scene;
+    // Owns the 4 baked textures (base/irradiance/prefiltered cubemaps +
+    // DFG LUT) -- rx::ibl::bakeEnvironment()'s own output, kept alive for
+    // this App's whole lifetime (the bindless handles below point INTO
+    // these textures' own VkImageViews).
+    std::optional<rx::ibl::BakeResult> environment;
+    // Trilinear-across-mips CLAMP_TO_EDGE (cube reads) / bilinear
+    // CLAMP_TO_EDGE (DFG LUT read) samplers -- explicit non-RAII teardown,
+    // matching `defaultSampler`'s own convention above.
+    VkSampler envCubeSampler = VK_NULL_HANDLE;
+    VkSampler envDfgSampler = VK_NULL_HANDLE;
+    rx::rhi::BindlessHandle envBaseCubeHandle;
+    rx::rhi::BindlessHandle envIrradianceHandle;
+    rx::rhi::BindlessHandle envPrefilteredHandle;
+    rx::rhi::BindlessHandle envDfgLutHandle;
+    rx::rhi::BindlessHandle envCubeSamplerHandle;
+    rx::rhi::BindlessHandle envDfgSamplerHandle;
+    // The scene environment's own PHYSICAL-UNITS intensity (Args::
+    // envIntensity, EnvironmentDesc::intensity's own header comment) --
+    // PRE-exposure; `updateDrawDataPerPassFields()` multiplies this by
+    // `exposureCamera.exposure()` at upload time, the SAME single point
+    // `lightColor`/(the retired) `ambientColor` already apply it at.
+    float envIntensityPhysical = 1.0F;
+
+    // Skybox pass (shaders/ibl/skybox.slang) -- built only once an
+    // environment is actually loaded (buildSkyboxPipeline() needs the
+    // real bindless set-0 layout, which is stable from makeApp() on, so
+    // this could be built earlier, but there is nothing useful to draw
+    // with it before an environment exists; built lazily inside
+    // setupEnvironment() instead).
+    CompiledPass skyboxPass;
+    // One-row-per-FIF-slot buffer of `rx::material::SkyboxDataGpu`,
+    // mirroring `drawDataBuffer`'s own per-FIF discipline exactly (I1) --
+    // rebuilt every frame the camera moves (recordSkybox()'s own caller).
+    std::optional<rx::rhi::PerFrameStorageBuffer> skyboxDataBuffer;
 };
 
 // Builds every field up to (but not including) the imported-scene GPU
@@ -873,8 +972,22 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
     // sentinel default -- this viewer does not build a real shadow map
     // (that is Task 24/sample 09's own scene-path job) -- so 1 slot is
     // enough (never more than one comparison sampler live at once).
-    rx::rhi::BindlessTable::Capacities capacities{/*sampledImages=*/256, /*samplers=*/16, /*storageBuffers=*/4};
+    // [Phase 5 Task 10, #46] storageBuffers bumped from 4 to 8: this
+    // sample now ALSO registers `skyboxDataBuffer` (rx::rhi::
+    // PerFrameStorageBuffer, 2 FIF-slot bindless storage buffers, same
+    // shape as `drawDataBuffer` below) -- MaterialSystem's own default
+    // draw-data row (1) + drawDataBuffer's own 2 FIF slots + skyboxDataBuffer's
+    // 2 FIF slots == 5 minimum; 8 leaves real headroom, matching this
+    // sample's own established "generous, not exact" sizing convention
+    // for this table (sampledImages=256 is the same posture).
+    rx::rhi::BindlessTable::Capacities capacities{/*sampledImages=*/256, /*samplers=*/16, /*storageBuffers=*/8};
     capacities.comparisonSamplers = 1;
+    // [Phase 5 Task 10, #46] material.slang now unconditionally declares
+    // `gTexturesCube` at binding 4 -- same requirement as
+    // `comparisonSamplers` above. This viewer registers up to 3 real cube
+    // textures per loaded environment (base/irradiance/prefiltered --
+    // rx::ibl::BakeResult, via `--env`) -- 4 gives one spare slot.
+    capacities.cubeImages = 4;
     auto bindless =
         rx::rhi::BindlessTable::create(app->device->physicalDevice(), app->device->device(), capacities);
     if (!bindless.has_value()) {
@@ -976,8 +1089,394 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
         return nullptr;
     }
 
+    // [Phase 5 Task 10, #46] See App::scene's own header comment -- a
+    // trivial MeshBoundsFn this sample never actually invokes (no
+    // createRenderable() call anywhere in this file).
+    app->scene.emplace([](rx::asset::MeshHandle) { return rx::asset::AABB{}; });
+
     return app;
 }
+
+// [Phase 5 Task 10, #46] "wire the LUT through and turn the variant on for
+// IBL-lit materials" -- the ticket's own landed-context text, made real
+// here: EVERY material this sample loads is StandardPBR or Unlit; Unlit
+// never declares `extern EnergyComp` at all (it doesn't import brdf.slang),
+// so specializationBits is meaningless for it -- MaterialSystem::
+// loadMaterial()/getPipeline() simply ignore a specialization bit no
+// loaded module's own composite references (verified directly: Unlit's
+// own compiled program has no unresolved `EnergyComp` extern to link
+// against in the first place, so `kSpecializationEnergyCompensation` is a
+// harmless no-op bit for it, not a second unrelated risk). ONE bit, ONE
+// call site each in setupMaterials()'s own D27 pre-resolution AND
+// recordSceneDraws()'s own real per-draw getPipeline() lookup -- BOTH
+// MUST agree (getPipeline()'s own cache key includes specializationBits;
+// D27's whole point is warming the cache with the EXACT key the real draw
+// later uses) -- this single function is the ONE place that decision is
+// made, so the two call sites cannot drift apart.
+uint32_t materialSpecializationBits(const App& app) {
+    return app.scene->hasEnvironment() ? rx::material::kSpecializationEnergyCompensation : 0U;
+}
+
+
+// --- Skybox pass [Phase 5 Task 10, #46, FG1 closure] -----------------
+// shaders/ibl/skybox.slang, own header comment: a fullscreen triangle
+// sampling the scene environment's own BASE cubemap, depth-tested BEHIND
+// every real draw (D29). `bindlessSetLayout`/`backbufferFormat` mirror
+// buildTonemapPipeline()'s own parameters exactly; this pipeline
+// ADDITIONALLY declares a depth attachment (GREATER_OR_EQUAL, no write --
+// see skybox.slang's own "DEPTH TEST" header-comment section for the full
+// derivation) and reads BOTH `vsMain`/`fsMain` from the SAME source file
+// (unlike the tonemap pass's own two-file vert/frag split).
+bool buildSkyboxPipeline(VkDevice device, rx::shader::Compiler& compiler, VkDescriptorSetLayout bindlessSetLayout,
+                          VkFormat colorFormat, VkFormat depthFormat, const std::filesystem::path& skyboxSlangPath,
+                          CompiledPass& skyboxPass) {
+    destroyCompiledPass(device, skyboxPass);
+
+    auto reflected =
+        compileAndReflect(compiler, "GltfViewerSkyboxModule", {skyboxSlangPath.string()}, {"vsMain", "fsMain"});
+    if (!reflected.has_value()) {
+        return false;
+    }
+    if (reflected->layoutInfo.pushRanges.size() != 1 ||
+        reflected->layoutInfo.pushRanges[0].size != sizeof(rx::material::SkyboxPush)) {
+        RX_LOG_ERROR(
+            "sample_08_gltf_viewer: skybox shader reflects an unexpected push-constant shape ({} range(s), "
+            "size={} vs. sizeof(rx::material::SkyboxPush)={})",
+            reflected->layoutInfo.pushRanges.size(),
+            reflected->layoutInfo.pushRanges.empty() ? 0 : reflected->layoutInfo.pushRanges[0].size,
+            sizeof(rx::material::SkyboxPush));
+        return false;
+    }
+
+    auto layoutBundle = rx::rhi::PipelineLayoutBuilder::build(device, reflected->layoutInfo, bindlessSetLayout);
+    if (!layoutBundle.has_value()) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: PipelineLayoutBuilder::build failed for the skybox pass");
+        return false;
+    }
+    skyboxPass.layoutBundle = std::move(*layoutBundle);
+    skyboxPass.pushConstantOffset = reflected->layoutInfo.pushRanges[0].offset;
+    skyboxPass.pushConstantSize = reflected->layoutInfo.pushRanges[0].size;
+    skyboxPass.pushConstantStages = reflected->layoutInfo.pushRanges[0].stages;
+
+    if (!assignShaderModules(device, reflected->compileResult, "vsMain", "fsMain", skyboxPass)) {
+        destroyCompiledPass(device, skyboxPass);
+        return false;
+    }
+
+    VkPipelineVertexInputStateCreateInfo vertexInputState{};
+    vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssemblyState{};
+    inputAssemblyState.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rasterizationState{};
+    rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizationState.cullMode = VK_CULL_MODE_NONE;
+    rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizationState.lineWidth = 1.0F;
+
+    VkPipelineMultisampleStateCreateInfo multisampleState{};
+    multisampleState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampleState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    // [D29/RC3, skybox.slang's own "DEPTH TEST" header-comment section]
+    // GREATER_OR_EQUAL (this project's reversed-Z convention, SAME compare
+    // op MaterialSystem::getPipeline() hardcodes for every forward-pass
+    // material pipeline) -- depthWriteEnable=FALSE: the skybox never
+    // overwrites a real draw's own stored depth, consistent with "strictly
+    // behind everything".
+    VkPipelineDepthStencilStateCreateInfo depthStencilState{};
+    depthStencilState.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencilState.depthTestEnable = VK_TRUE;
+    depthStencilState.depthWriteEnable = VK_FALSE;
+    depthStencilState.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
+
+    VkPipelineColorBlendAttachmentState blendAttachment{};
+    blendAttachment.blendEnable = VK_FALSE;
+    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+                                      VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo colorBlendState{};
+    colorBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlendState.attachmentCount = 1;
+    colorBlendState.pAttachments = &blendAttachment;
+
+    std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState{};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+    dynamicState.pDynamicStates = dynamicStates.data();
+
+    VkPipelineRenderingCreateInfo renderingCreateInfo{};
+    renderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    renderingCreateInfo.colorAttachmentCount = 1;
+    renderingCreateInfo.pColorAttachmentFormats = &colorFormat;
+    renderingCreateInfo.depthAttachmentFormat = depthFormat;
+
+    std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = skyboxPass.vertModule;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = skyboxPass.fragModule;
+    stages[1].pName = "main";
+
+    VkGraphicsPipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.pNext = &renderingCreateInfo;
+    pipelineInfo.stageCount = static_cast<uint32_t>(stages.size());
+    pipelineInfo.pStages = stages.data();
+    pipelineInfo.pVertexInputState = &vertexInputState;
+    pipelineInfo.pInputAssemblyState = &inputAssemblyState;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterizationState;
+    pipelineInfo.pMultisampleState = &multisampleState;
+    pipelineInfo.pDepthStencilState = &depthStencilState;
+    pipelineInfo.pColorBlendState = &colorBlendState;
+    pipelineInfo.pDynamicState = &dynamicState;
+    pipelineInfo.layout = skyboxPass.layoutBundle.layout;
+    pipelineInfo.renderPass = VK_NULL_HANDLE;
+    pipelineInfo.basePipelineIndex = -1;
+
+    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &skyboxPass.pipeline) !=
+        VK_SUCCESS) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: vkCreateGraphicsPipelines failed for the skybox pass");
+        destroyCompiledPass(device, skyboxPass);
+        return false;
+    }
+    return true;
+}
+
+// Loads an equirect HDR file directly (bypassing TextureCache -- this
+// texture is a TEMPORARY input to rx::ibl::bakeEnvironment(), never
+// itself bindless-registered or kept resident; TextureCache has no public
+// accessor for a raw rx::rhi::Texture2D&, which bakeEnvironment()'s own
+// `source` parameter requires) via the SAME `rx::asset::decodeTextureForUpload()`
+// + `Texture2D::createForPresuppliedMips()` + `Uploader::uploadImageMips()`
+// sequence `TextureCache::registerRealTexture()`/`loadFromBytes()` use
+// internally (texture_cache.cpp) -- see this function's own body for the
+// direct correspondence. Returns std::nullopt (logged) on any failure.
+std::optional<rx::rhi::Texture2D> loadEquirectHdr(rx::rhi::Device& device, rx::rhi::Allocator& allocator,
+                                                    rx::rhi::Uploader& uploader, const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: failed to open environment file '{}'", path.string());
+        return std::nullopt;
+    }
+    const std::streamsize fileSize = file.tellg();
+    if (fileSize <= 0) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: environment file '{}' is empty or unreadable", path.string());
+        return std::nullopt;
+    }
+    file.seekg(0, std::ios::beg);
+    std::vector<std::byte> bytes(static_cast<size_t>(fileSize));
+    if (!file.read(reinterpret_cast<char*>(bytes.data()), fileSize)) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: failed to read environment file '{}'", path.string());
+        return std::nullopt;
+    }
+
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(device.physicalDevice(), &props);
+    auto isFormatSupported = [&](VkFormat format) {
+        VkFormatProperties2 formatProps{};
+        formatProps.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
+        vkGetPhysicalDeviceFormatProperties2(device.physicalDevice(), format, &formatProps);
+        constexpr VkFormatFeatureFlags kNeeded = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        return (formatProps.formatProperties.optimalTilingFeatures & kNeeded) == kNeeded;
+    };
+    rx::asset::TextureDecodeResult decoded = rx::asset::decodeTextureForUpload(
+        bytes, rx::asset::TextureRole::Environment, props.limits.maxImageDimension2D, isFormatSupported);
+    if (decoded.outcome != rx::asset::TextureDecodeResult::Outcome::Ready) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: failed to decode environment '{}': {}", path.string(),
+                     decoded.failureReason);
+        return std::nullopt;
+    }
+    if (decoded.isCube) {
+        RX_LOG_ERROR(
+            "sample_08_gltf_viewer: environment '{}' decoded as a CUBE container -- this loader only handles "
+            "equirect 2D HDR input (a cube source would need Texture2D::createCubeForPresuppliedMips() + "
+            "bakeEnvironment()'s own sourceIsCube=true path, not implemented by this sample)",
+            path.string());
+        return std::nullopt;
+    }
+
+    auto texture = rx::rhi::Texture2D::createForPresuppliedMips(
+        device.physicalDevice(), device.device(), allocator, VkExtent2D{decoded.width, decoded.height},
+        decoded.format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        static_cast<uint32_t>(decoded.levels.size()));
+    if (!texture.has_value()) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: Texture2D::createForPresuppliedMips failed for environment '{}'",
+                     path.string());
+        return std::nullopt;
+    }
+
+    std::vector<rx::rhi::Uploader::ImageMipLevel> uploadLevels;
+    uploadLevels.reserve(decoded.levels.size());
+    for (const rx::asset::DecodedTextureLevel& level : decoded.levels) {
+        rx::rhi::Uploader::ImageMipLevel entry;
+        entry.data = level.bytes.data();
+        entry.size = static_cast<VkDeviceSize>(level.bytes.size());
+        entry.mipLevel = level.level;
+        entry.extent = {level.width, level.height};
+        uploadLevels.push_back(entry);
+    }
+    if (!uploader.uploadImageMips(*texture, uploadLevels)) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: Uploader::uploadImageMips failed for environment '{}'", path.string());
+        return std::nullopt;
+    }
+    rx::rhi::UploadTicket ticket = uploader.flush();
+    uploader.wait(ticket);
+    return texture;
+}
+
+// Bakes `hdrPath` (rx::ibl::bakeEnvironment(), production-scale
+// BakeParams -- larger than this module's own GPU-test defaults, see
+// bake.h's own BakeParams header comment on why: this is a real load-time
+// call, not a test iteration budget), registers every BakeResult texture
+// into `app.bindless` (the CUBE-typed `registerCubeSampledImage()` for
+// base/irradiance/prefiltered, the ordinary `registerSampledImage()` for
+// the 2D DFG LUT), builds the two real samplers, and calls
+// `app.scene->setEnvironment()`. Also builds `app.skyboxPass` (lazily --
+// see App::skyboxPass's own header comment) and `app.skyboxDataBuffer`.
+// Returns false (logged) on any failure; `app.scene->hasEnvironment()`
+// stays false in that case (never partially set).
+bool setupEnvironment(App& app, const std::filesystem::path& hdrPath, const std::filesystem::path& iblShaderDir,
+                      float intensity) {
+    RX_ZONE_NAMED("sample08: setupEnvironment");
+    auto equirect = loadEquirectHdr(*app.device, *app.allocator, *app.uploader, hdrPath);
+    if (!equirect.has_value()) {
+        return false;
+    }
+
+    auto cmdCtx =
+        rx::rhi::CommandContext::create(app.device->device(), app.device->graphicsQueue(), app.device->graphicsQueueFamily());
+    if (!cmdCtx.has_value()) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: CommandContext::create failed for the IBL bake");
+        return false;
+    }
+
+    // [T9's own bake.h header comment: "a real load-time caller (Task 10)
+    // is expected to pass larger production values (real-driver bake
+    // timings are published against BOTH this default AND a production-
+    // scale configuration)"] This sample's OWN D17 headless gate runs this
+    // exact bake on lavapipe (software rasterization) in CI, same as T9's
+    // own GPU test suite -- BakeParams' own defaults (64/16/512/5/64/128/
+    // 64/512) are kept HERE too (not widened) for that reason: the
+    // committed fixture is a small 64x32 procedural HDR (this sample's own
+    // provenance note, environments/gate_test_env.hdr), which does not
+    // contain enough real detail for a larger bake to resolve anyway, and
+    // a lavapipe-CI-friendly bake time matters more than resolution
+    // headroom this fixture cannot use. task-10-report.md publishes a
+    // SEPARATE, larger production-scale real-driver timing run
+    // (BakeParams left at these same defaults is the number quoted for
+    // the CI-representative case; a manually-invoked larger configuration
+    // is this sample's own documented follow-up knob, not exposed via CLI
+    // in this task's own scope).
+    rx::ibl::BakeParams params;
+
+    rx::ibl::BakeTimings timings;
+    auto bakeResult = rx::ibl::bakeEnvironment(*app.device, *app.allocator, *cmdCtx, *app.scheduler, *equirect,
+                                                /*sourceIsCube=*/false, iblShaderDir, params, &timings,
+                                                "sample08_gltf_viewer");
+    if (!bakeResult.has_value()) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: rx::ibl::bakeEnvironment failed for '{}'", hdrPath.string());
+        return false;
+    }
+    // [Plan Task 9/10's own "bake timing measured and reported" binding
+    // requirement] "sample08: perf"-prefixed, matching this file's own
+    // established greppable stats-line convention (runHeadless()'s own
+    // "sample08: perf scene=..." line).
+    RX_LOG_INFO(
+        "sample08: perf ibl_bake path='{}' equirect_to_cubemap_ms={:.3f} irradiance_ms={:.3f} prefilter_ms={:.3f} "
+        "dfg_ms={:.3f} total_ms={:.3f}",
+        hdrPath.string(), timings.equirectToCubemapMs, timings.irradianceMs, timings.prefilterMs, timings.dfgMs,
+        timings.totalMs);
+
+    app.environment = std::move(*bakeResult);
+
+    VkSamplerCreateInfo cubeSamplerInfo{};
+    cubeSamplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    cubeSamplerInfo.magFilter = VK_FILTER_LINEAR;
+    cubeSamplerInfo.minFilter = VK_FILTER_LINEAR;
+    cubeSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    cubeSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    cubeSamplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    cubeSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    cubeSamplerInfo.minLod = 0.0F;
+    cubeSamplerInfo.maxLod = VK_LOD_CLAMP_NONE;
+    if (vkCreateSampler(app.device->device(), &cubeSamplerInfo, nullptr, &app.envCubeSampler) != VK_SUCCESS) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: vkCreateSampler (environment cube sampler) failed");
+        return false;
+    }
+    VkSamplerCreateInfo dfgSamplerInfo = cubeSamplerInfo;
+    dfgSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;  // the DFG LUT is single-mip -- mode is irrelevant but kept explicit.
+    if (vkCreateSampler(app.device->device(), &dfgSamplerInfo, nullptr, &app.envDfgSampler) != VK_SUCCESS) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: vkCreateSampler (environment DFG sampler) failed");
+        return false;
+    }
+
+    app.envBaseCubeHandle =
+        app.bindless->registerCubeSampledImage(app.environment->baseCubemap.view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    app.envIrradianceHandle = app.bindless->registerCubeSampledImage(app.environment->irradianceCubemap.view(),
+                                                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    app.envPrefilteredHandle = app.bindless->registerCubeSampledImage(app.environment->prefilteredCubemap.view(),
+                                                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    app.envDfgLutHandle =
+        app.bindless->registerSampledImage(app.environment->dfgLut.view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    app.envCubeSamplerHandle = app.bindless->registerSampler(app.envCubeSampler);
+    app.envDfgSamplerHandle = app.bindless->registerSampler(app.envDfgSampler);
+    if (!app.envBaseCubeHandle.isValid() || !app.envIrradianceHandle.isValid() ||
+        !app.envPrefilteredHandle.isValid() || !app.envDfgLutHandle.isValid() ||
+        !app.envCubeSamplerHandle.isValid() || !app.envDfgSamplerHandle.isValid()) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: bindless registration failed for the baked environment");
+        return false;
+    }
+
+    rx::scene::EnvironmentDesc envDesc;
+    envDesc.baseCubemapIndex = app.envBaseCubeHandle.index();
+    envDesc.irradianceCubemapIndex = app.envIrradianceHandle.index();
+    envDesc.prefilteredCubemapIndex = app.envPrefilteredHandle.index();
+    envDesc.dfgLutIndex = app.envDfgLutHandle.index();
+    envDesc.cubeSamplerIndex = app.envCubeSamplerHandle.index();
+    envDesc.dfgSamplerIndex = app.envDfgSamplerHandle.index();
+    envDesc.maxPrefilteredLod = static_cast<float>(app.environment->prefilteredMipCount) - 1.0F;
+    envDesc.intensity = intensity;
+    app.scene->setEnvironment(envDesc);
+    app.envIntensityPhysical = intensity;
+
+    auto compiler = rx::shader::Compiler::create();
+    if (!compiler.has_value()) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: rx::shader::Compiler::create failed for the skybox pipeline");
+        return false;
+    }
+    if (!buildSkyboxPipeline(app.device->device(), *compiler, app.bindless->descriptorSetLayout(),
+                              rx::graph::kHdrFormat, kDepthFormat, iblShaderDir / "skybox.slang", app.skyboxPass)) {
+        return false;
+    }
+
+    // One-row-per-FIF-slot buffer -- see App::skyboxDataBuffer's own
+    // header comment. Primed with a neutral (no-environment-yet) row;
+    // recordSkybox()'s own caller overwrites it every frame before use.
+    rx::material::SkyboxDataGpu initialRow;
+    const VkDeviceSize skyboxBytes = sizeof(rx::material::SkyboxDataGpu);
+    auto skyboxBuffer = rx::rhi::PerFrameStorageBuffer::create(*app.allocator, *app.bindless, skyboxBytes, &initialRow);
+    if (!skyboxBuffer.has_value()) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: PerFrameStorageBuffer::create (skybox data) failed");
+        return false;
+    }
+    app.skyboxDataBuffer = std::move(*skyboxBuffer);
+
+    return true;
+}
+
 
 // [Phase 5 Task 5, ticket #41 row 1] Builds App::materialParamArena (set
 // LAYOUT + demand-sized DescriptorArena together) via the promoted
@@ -1036,6 +1535,32 @@ void destroyApp(App& app) {
         app.drawDataBuffer->release(*app.bindless);
     }
     app.drawDataBuffer.reset();
+    // [Phase 5 Task 10, #46] Same PerFrameStorageBuffer TEARDOWN CONTRACT
+    // as drawDataBuffer above -- release() before reset().
+    if (app.skyboxDataBuffer.has_value() && app.bindless.has_value()) {
+        app.skyboxDataBuffer->release(*app.bindless);
+    }
+    app.skyboxDataBuffer.reset();
+    destroyCompiledPass(app.device->device(), app.skyboxPass);
+    if (app.bindless.has_value()) {
+        app.bindless->release(app.envBaseCubeHandle);
+        app.bindless->release(app.envIrradianceHandle);
+        app.bindless->release(app.envPrefilteredHandle);
+        app.bindless->release(app.envDfgLutHandle);
+        app.bindless->release(app.envCubeSamplerHandle);
+        app.bindless->release(app.envDfgSamplerHandle);
+    }
+    if (app.envCubeSampler != VK_NULL_HANDLE) {
+        vkDestroySampler(app.device->device(), app.envCubeSampler, nullptr);
+        app.envCubeSampler = VK_NULL_HANDLE;
+    }
+    if (app.envDfgSampler != VK_NULL_HANDLE) {
+        vkDestroySampler(app.device->device(), app.envDfgSampler, nullptr);
+        app.envDfgSampler = VK_NULL_HANDLE;
+    }
+    // rx::ibl::BakeResult's own Texture2D members are RAII (move-only,
+    // real destructors) -- reset() alone destroys the 4 baked images.
+    app.environment.reset();
     destroyCompiledPass(app.device->device(), app.tonemapPass);
     if (app.defaultSamplerHandle.isValid() && app.bindless.has_value()) {
         app.bindless->release(app.defaultSamplerHandle);
@@ -1273,9 +1798,12 @@ bool setupMaterials(App& app, const rx::asset::Registry& registry,
 
         // [D27] Pre-resolve this material's forward-pass VkPipeline on the
         // main thread, before any draw is recorded -- discarded, see
-        // MaterialGpuBinding's own header comment.
+        // MaterialGpuBinding's own header comment. [Phase 5 Task 10, #46]
+        // specializationBits via materialSpecializationBits() -- see that
+        // function's own header comment for why recordSceneDraws()'s own
+        // real lookup MUST use the identical value.
         try {
-            app.materialSystem->getPipeline({binding.handle, passSig, 0});
+            app.materialSystem->getPipeline({binding.handle, passSig, materialSpecializationBits(app)});
         } catch (const std::exception& ex) {
             RX_LOG_ERROR("sample_08_gltf_viewer: D27 pipeline pre-resolution failed for material '{}': {}",
                          asset.name, ex.what());
@@ -1487,7 +2015,24 @@ void updateDrawDataPerPassFields(App& app, const glm::mat4& viewProj, const glm:
     const glm::vec3 lightDirWorld = glm::normalize(glm::vec3(0.4F, 1.0F, 0.6F));
     const float preExposure = app.exposureCamera.exposure();
     const glm::vec3 lightColor = glm::vec3(5.0F, 5.0F, 5.0F) * preExposure;
-    const glm::vec3 ambientColor = glm::vec3(0.18F, 0.18F, 0.18F) * preExposure;
+    // [Phase 5 Task 10, #46] `ambientColor` is RETIRED (no longer read by
+    // standard_pbr.slang's evaluate() -- see MaterialVertex::ambientColor's
+    // own header comment, material.slang) -- left at its neutral zero
+    // rather than the old FG1 flat-term tuning, matching every producer
+    // this ticket's own gate matrix expects to have stopped populating it
+    // meaningfully.
+    const glm::vec3 ambientColor(0.0F, 0.0F, 0.0F);
+
+    // [Phase 5 Task 10, #46, FG1 closure] The scene environment's own
+    // bindless bundle -- `hasEnvironment() == false` (no `--env`/no
+    // default fixture resolved) leaves every row at DrawDataGpu's own "no
+    // environment" sentinel default, byte-identical to a pre-T10 producer.
+    const bool hasEnvironment = app.scene->hasEnvironment();
+    rx::scene::EnvironmentDesc envDesc;
+    if (hasEnvironment) {
+        envDesc = app.scene->environment();
+    }
+    const float envIntensityExposed = app.envIntensityPhysical * preExposure;
 
     const glm::mat4 viewProjTransposed = glm::transpose(viewProj);  // [MATRIX LAYOUT] see draw_data.h.
     for (rx::material::DrawDataGpu& row : app.drawDataRows) {
@@ -1496,9 +2041,41 @@ void updateDrawDataPerPassFields(App& app, const glm::mat4& viewProj, const glm:
         row.lightColor = glm::vec4(lightColor, 0.0F);
         row.ambientColor = glm::vec4(ambientColor, 0.0F);
         row.cameraPosWorld = glm::vec4(cameraPosWorld, 0.0F);
+        if (hasEnvironment) {
+            row.envIrradianceCubeIndex = envDesc.irradianceCubemapIndex;
+            row.envPrefilteredCubeIndex = envDesc.prefilteredCubemapIndex;
+            row.envDfgLutIndex = envDesc.dfgLutIndex;
+            row.envCubeSamplerIndex = envDesc.cubeSamplerIndex;
+            row.envDfgSamplerIndex = envDesc.dfgSamplerIndex;
+            row.envMaxPrefilteredLod = envDesc.maxPrefilteredLod;
+            row.envIntensity = envIntensityExposed;
+        } else {
+            row.envIrradianceCubeIndex = 0xFFFFFFFFu;
+            row.envPrefilteredCubeIndex = 0xFFFFFFFFu;
+            row.envDfgLutIndex = 0xFFFFFFFFu;
+        }
     }
     const VkDeviceSize bytes = static_cast<VkDeviceSize>(app.drawDataRows.size()) * sizeof(rx::material::DrawDataGpu);
     app.drawDataBuffer->write(frameSlot, app.drawDataRows.data(), bytes);
+
+    // [Phase 5 Task 10, #46] The skybox pass's own per-frame data --
+    // rebuilt every frame (the camera moves) exactly like the DrawDataGpu
+    // rows above; a no-op write (baseCubeIndex sentinel) when no
+    // environment is bound -- recordSkybox() itself never runs in that
+    // case (see recordForward()'s own `hasEnvironment` guard), so this
+    // buffer's content is simply unread then.
+    if (app.skyboxDataBuffer.has_value()) {
+        rx::material::SkyboxDataGpu skyboxRow;
+        if (hasEnvironment) {
+            const glm::mat4 invViewProj = glm::inverse(viewProj);
+            skyboxRow.invViewProj = glm::transpose(invViewProj);  // [MATRIX LAYOUT] see draw_data.h.
+            skyboxRow.cameraPosWorld = glm::vec4(cameraPosWorld, 0.0F);
+            skyboxRow.baseCubeIndex = envDesc.baseCubemapIndex;
+            skyboxRow.cubeSamplerIndex = envDesc.cubeSamplerIndex;
+            skyboxRow.intensity = envIntensityExposed;
+        }
+        app.skyboxDataBuffer->write(frameSlot, &skyboxRow, sizeof(skyboxRow));
+    }
 }
 
 // --- Forward pass recording [D26.1] -------------------------------------
@@ -1529,10 +2106,14 @@ void recordSceneDraws(VkCommandBuffer cmd, App& app) {
 
         if (!(material.handle == lastPipelineMaterial)) {
             // [D27] Cache HIT -- setupMaterials() already pre-resolved this
-            // exact (material, forward pass signature, 0) key; this call
-            // never compiles anything, it only looks the cached VkPipeline
-            // up (MaterialSystem::getPipeline()'s own doc comment).
-            VkPipeline pipeline = app.materialSystem->getPipeline({material.handle, passSig, 0});
+            // exact (material, forward pass signature, specializationBits)
+            // key; this call never compiles anything, it only looks the
+            // cached VkPipeline up (MaterialSystem::getPipeline()'s own doc
+            // comment). [Phase 5 Task 10, #46] materialSpecializationBits()
+            // -- MUST match setupMaterials()'s own D27 pre-resolution call
+            // exactly, see that function's own header comment.
+            VkPipeline pipeline =
+                app.materialSystem->getPipeline({material.handle, passSig, materialSpecializationBits(app)});
             VkPipelineLayout layout = app.materialSystem->pipelineLayout(material.handle);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
@@ -1573,8 +2154,51 @@ void recordSceneDraws(VkCommandBuffer cmd, App& app) {
     }
 }
 
+// --- Skybox pass recording [Phase 5 Task 10, #46, FG1 closure] -----------
+// Recorded as a SECOND draw inside the SAME "forward" render-graph Pass
+// (never a separate rx::graph::Pass) -- see shaders/ibl/skybox.slang's own
+// header comment for the full "why a second draw inside the SAME pass, not
+// a new render-graph primitive" reasoning: this reuses the pass's own
+// ALREADY-BOUND depth attachment (the skybox's own depth test needs to
+// read what recordSceneDraws() just wrote, within the SAME dynamic-
+// rendering scope) with zero new render-graph capability. Set 0 (bindless)
+// is REBOUND here, against THIS pipeline's own layout, even though
+// recordSceneDraws() above already bound the identical VkDescriptorSet --
+// [bug found and fixed during this task's own development, matching
+// recordTonemapDraw()'s own identical rebind, below] Vulkan's own pipeline-
+// layout "compatible for set N" rule (spec 14.2.2) requires BOTH matching
+// descriptor-set-layout objects for sets 0..N AND identical push-constant
+// ranges across the whole layout -- this pipeline's own `SkyboxPush` (4
+// bytes) is a DIFFERENT shape from `RxMaterialGlobals`/`MaterialGlobalsPush`
+// (8 bytes, every material pipeline's own shape), so binding set 0 once
+// against a material pipeline's layout and then drawing against THIS
+// pipeline without rebinding is a real
+// VUID-vkCmdDraw-None-02697 violation (reproduced directly this round,
+// not a hypothetical) -- every material pipeline shares ONE push-constant
+// shape with every OTHER material pipeline (which is why recordSceneDraws()
+// itself never rebinds set 0 between different materials), but this
+// pipeline does not share that shape, so it needs its own bind. Viewport/
+// scissor are already set by this function's own caller (recordForward()).
+void recordSkybox(VkCommandBuffer cmd, App& app) {
+    VkDescriptorSet bindlessSet = app.bindless->descriptorSet();
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, app.skyboxPass.layoutBundle.layout, /*firstSet=*/0,
+                             1, &bindlessSet, 0, nullptr);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, app.skyboxPass.pipeline);
+
+    rx::material::SkyboxPush push;
+    push.skyboxDataBufferIndex = app.skyboxDataBuffer->bindlessIndex(app.currentFrameSlot);
+    vkCmdPushConstants(cmd, app.skyboxPass.layoutBundle.layout, app.skyboxPass.pushConstantStages,
+                       app.skyboxPass.pushConstantOffset, app.skyboxPass.pushConstantSize, &push);
+
+    // No vertex/index buffer -- the fullscreen-triangle trick (skybox.slang's
+    // own vsMain, SV_VertexID-driven).
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+}
+
 // The forward pass's own whole-pass callback -- either the D17 loading-state
-// clear (scene not yet ready) or the real scene draws.
+// clear (scene not yet ready) or the real scene draws (+ the skybox pass,
+// when an environment is bound -- see this function's own tail).
 void recordForward(rx::graph::PassContext& ctx, App& app) {
     if (!app.sceneReady) {
         // [D17] The render graph's own automatic clear (Executor::execute(),
@@ -1603,6 +2227,14 @@ void recordForward(rx::graph::PassContext& ctx, App& app) {
     vkCmdSetScissor(ctx.cmd, 0, 1, &scissor);
 
     recordSceneDraws(ctx.cmd, app);
+
+    // [Phase 5 Task 10, #46] Skybox pass -- ONLY when an environment is
+    // actually bound (`app.skyboxPass.pipeline` is VK_NULL_HANDLE
+    // otherwise, since setupEnvironment() is what builds it); matches
+    // this ticket's own "Skybox pass gated" acceptance line.
+    if (app.scene->hasEnvironment() && app.skyboxPass.pipeline != VK_NULL_HANDLE) {
+        recordSkybox(ctx.cmd, app);
+    }
 }
 
 // --- Tonemap pass recording [shaders/multipass/tonemap.{vert,frag}.slang,
@@ -1750,6 +2382,46 @@ void applyExposureArg(App& app, const Args& args) {
     }
 }
 
+// [Phase 5 Task 10, #46, FG1 closure] Resolves and bakes this run's own
+// environment (or explicitly skips it, `--no-env`) -- called BEFORE the
+// async glTF import starts (both entry points below), so
+// `materialSpecializationBits()`'s own return value is stable for the
+// WHOLE run by the time `setupMaterials()`'s D27 pre-resolution reads it
+// (see that function's own header comment for why the two call sites must
+// never disagree). Returns false (logged) only on a REAL failure -- `--no-
+// env` and "the default fixture happens not to exist" (a packaged build
+// missing it, say) both return true with no environment bound, matching
+// this sample's own established "content-optional, degrade gracefully"
+// posture for --scene's own resolution.
+bool applyEnvironmentArg(App& app, const Args& args) {
+    if (args.noEnv) {
+        RX_LOG_INFO("sample_08_gltf_viewer: --no-env -- no environment bound (FG1's retired flat ambient stays "
+                    "retired too: zero indirect light)");
+        return true;
+    }
+    const std::filesystem::path envPath = args.envPath.empty() ? resolveDefaultEnvironmentPath()
+                                                                  : std::filesystem::path(args.envPath);
+    if (!std::filesystem::exists(envPath)) {
+        if (args.envPath.empty()) {
+            RX_LOG_INFO(
+                "sample_08_gltf_viewer: no environment fixture found at '{}' -- continuing with no environment "
+                "bound (pass --env explicitly, or --no-env to silence this message)",
+                envPath.string());
+            return true;
+        }
+        RX_LOG_ERROR("sample_08_gltf_viewer: --env '{}' does not exist", envPath.string());
+        return false;
+    }
+    const std::filesystem::path iblShaderDir = basePathDirectory() / "ibl_shaders";
+    if (!setupEnvironment(app, envPath, iblShaderDir, args.envIntensity)) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: setupEnvironment('{}') failed", envPath.string());
+        return false;
+    }
+    RX_LOG_INFO("sample_08_gltf_viewer: environment '{}' baked and bound (intensity={:.3f})", envPath.string(),
+                args.envIntensity);
+    return true;
+}
+
 // --- Headless mode --------------------------------------------------------
 // Imports the default (or --scene) glTF asset ASYNCHRONOUSLY, captures a
 // loading-state frame (before the import can possibly have completed) and a
@@ -1785,6 +2457,10 @@ int runHeadless(const Args& args) {
         return 1;
     }
     applyExposureArg(*app, args);
+    if (!applyEnvironmentArg(*app, args)) {
+        destroyApp(*app);
+        return 1;
+    }
 
     const std::filesystem::path scenePath =
         args.scenePath.empty() ? resolveDefaultScenePath() : std::filesystem::path(args.scenePath);
@@ -2166,6 +2842,10 @@ int runPresent(const Args& args) {
         return 1;
     }
     applyExposureArg(*app, args);
+    if (!applyEnvironmentArg(*app, args)) {
+        destroyApp(*app);
+        return 1;
+    }
 
     // --vsync off, applied before any per-swapchain-image resource is built
     // -- same ordering samples/05_multipass/06_materials/07_stress already

@@ -52,6 +52,7 @@ BindlessTable& BindlessTable::operator=(BindlessTable&& other) noexcept {
         samplers_ = std::move(other.samplers_);
         storageBuffers_ = std::move(other.storageBuffers_);
         comparisonSamplers_ = std::move(other.comparisonSamplers_);
+        cubeImages_ = std::move(other.cubeImages_);
 
         other.device_ = VK_NULL_HANDLE;
         other.setLayout_ = VK_NULL_HANDLE;
@@ -120,47 +121,79 @@ std::optional<BindlessTable> BindlessTable::create(VkPhysicalDevice physicalDevi
     }
 
     // --- Set layout ------------------------------------------------------
-    // [Phase 4 Stage 2 Task 22 fix round, F1] Binding 3
-    // (kComparisonSamplerBinding) is CONDITIONAL: present only when
-    // `capacities.comparisonSamplers > 0` -- see that field's own header
-    // comment for why (every pre-Task-22 caller leaves it at 0 and gets
-    // this table's original, byte-identical 3-binding layout). Only the
-    // LAST declared binding may carry VK_DESCRIPTOR_BINDING_VARIABLE_
-    // DESCRIPTOR_COUNT_BIT [Vulkan spec constraint] -- when binding 3
-    // exists, IT becomes the variable-count binding instead of binding 2
-    // (which still gets a real, fixed `descriptorCount` matching its own
-    // requested capacity either way; only the FLAG and the allocate-time
-    // `VkDescriptorSetVariableDescriptorCountAllocateInfo::
-    // pDescriptorCounts` entry move).
+    // [Phase 4 Stage 2 Task 22 fix round, F1; Phase 5 Task 10, #46 widened
+    // this from a binary (3-or-4-binding) choice to four possible shapes]
+    // Binding 3 (kComparisonSamplerBinding) and binding 4
+    // (kCubeSampledImageBinding) are EACH independently CONDITIONAL: present
+    // only when their own capacity is > 0 -- see those fields' own header
+    // comments for why (every caller that leaves either at 0 gets this
+    // table's original, byte-identical layout for that slot). Only the LAST
+    // binding in `pBindings`'s own array ORDER may carry
+    // VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT [Vulkan spec
+    // constraint] -- built here as a plain ordered list (SampledImage,
+    // Sampler, StorageBuffer, then ComparisonSampler/CubeImage if present,
+    // in that fixed priority order) so whichever of the two optional slots
+    // is actually present LAST always receives the flag, covering all four
+    // (comparisonSamplers x cubeImages) present/absent combinations
+    // uniformly -- binding NUMBERS are never renumbered/compacted (a table
+    // with cubeImages>0 but comparisonSamplers==0 legitimately has bindings
+    // {0,1,2,4}, skipping 3 entirely; Vulkan does not require contiguous
+    // binding numbers within one set).
     const bool hasComparisonSamplers = capacities.comparisonSamplers > 0;
-    const uint32_t bindingCount = hasComparisonSamplers ? 4 : 3;
+    const bool hasCubeImages = capacities.cubeImages > 0;
 
-    std::vector<VkDescriptorSetLayoutBinding> bindings(bindingCount);
-    bindings[0].binding = kSampledImageBinding;
-    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    bindings[0].descriptorCount = capacities.sampledImages;
-    bindings[0].stageFlags = VK_SHADER_STAGE_ALL;
+    std::vector<VkDescriptorSetLayoutBinding> bindings;
+    bindings.reserve(5);
 
-    bindings[1].binding = kSamplerBinding;
-    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    bindings[1].descriptorCount = capacities.samplers;
-    bindings[1].stageFlags = VK_SHADER_STAGE_ALL;
+    VkDescriptorSetLayoutBinding sampledImageBinding{};
+    sampledImageBinding.binding = kSampledImageBinding;
+    sampledImageBinding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    sampledImageBinding.descriptorCount = capacities.sampledImages;
+    sampledImageBinding.stageFlags = VK_SHADER_STAGE_ALL;
+    bindings.push_back(sampledImageBinding);
 
-    bindings[2].binding = kStorageBufferBinding;
-    bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    bindings[2].descriptorCount = capacities.storageBuffers;
-    bindings[2].stageFlags = VK_SHADER_STAGE_ALL;
+    VkDescriptorSetLayoutBinding samplerBinding{};
+    samplerBinding.binding = kSamplerBinding;
+    samplerBinding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    samplerBinding.descriptorCount = capacities.samplers;
+    samplerBinding.stageFlags = VK_SHADER_STAGE_ALL;
+    bindings.push_back(samplerBinding);
 
-    std::vector<VkDescriptorBindingFlags> bindingFlags(bindingCount, kCommonBindingFlags);
+    VkDescriptorSetLayoutBinding storageBufferBinding{};
+    storageBufferBinding.binding = kStorageBufferBinding;
+    storageBufferBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    storageBufferBinding.descriptorCount = capacities.storageBuffers;
+    storageBufferBinding.stageFlags = VK_SHADER_STAGE_ALL;
+    bindings.push_back(storageBufferBinding);
+
     if (hasComparisonSamplers) {
-        bindings[3].binding = kComparisonSamplerBinding;
-        bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-        bindings[3].descriptorCount = capacities.comparisonSamplers;
-        bindings[3].stageFlags = VK_SHADER_STAGE_ALL;
-        bindingFlags[3] |= VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
-    } else {
-        bindingFlags[2] |= VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
+        VkDescriptorSetLayoutBinding comparisonSamplerBinding{};
+        comparisonSamplerBinding.binding = kComparisonSamplerBinding;
+        comparisonSamplerBinding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        comparisonSamplerBinding.descriptorCount = capacities.comparisonSamplers;
+        comparisonSamplerBinding.stageFlags = VK_SHADER_STAGE_ALL;
+        bindings.push_back(comparisonSamplerBinding);
     }
+    if (hasCubeImages) {
+        VkDescriptorSetLayoutBinding cubeImageBinding{};
+        cubeImageBinding.binding = kCubeSampledImageBinding;
+        cubeImageBinding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        cubeImageBinding.descriptorCount = capacities.cubeImages;
+        cubeImageBinding.stageFlags = VK_SHADER_STAGE_ALL;
+        bindings.push_back(cubeImageBinding);
+    }
+
+    const uint32_t bindingCount = static_cast<uint32_t>(bindings.size());
+    std::vector<VkDescriptorBindingFlags> bindingFlags(bindingCount, kCommonBindingFlags);
+    // The variable-count slot is whichever capacity `bindings.back()`
+    // actually is -- since `bindings` is built in the fixed priority order
+    // above, this is ALWAYS the last-present of (cubeImages,
+    // comparisonSamplers, storageBuffers), matching this function's own
+    // header comment.
+    bindingFlags.back() |= VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
+    const uint32_t variableCount = hasCubeImages          ? capacities.cubeImages
+                                    : hasComparisonSamplers ? capacities.comparisonSamplers
+                                                             : capacities.storageBuffers;
 
     VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo{};
     flagsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
@@ -198,6 +231,15 @@ std::optional<BindlessTable> BindlessTable::create(VkPhysicalDevice physicalDevi
         // must reserve, and this table tracks the two counts independently.
         poolSizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLER, capacities.comparisonSamplers});
     }
+    if (hasCubeImages) {
+        // Same descriptor TYPE as binding 0 (VK_DESCRIPTOR_TYPE_SAMPLED_
+        // IMAGE -- Vulkan draws no type-level distinction between a cube
+        // and an ordinary sampled image; only the shader-side `TextureCube`
+        // vs `Texture2D` declaration and the registered VkImageView's own
+        // VK_IMAGE_VIEW_TYPE differ) -- a SEPARATE pool-size entry, same
+        // reasoning as comparisonSamplers above.
+        poolSizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, capacities.cubeImages});
+    }
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -216,7 +258,8 @@ std::optional<BindlessTable> BindlessTable::create(VkPhysicalDevice physicalDevi
     }
 
     // --- Descriptor set (variable count on the last binding) -------------
-    const uint32_t variableCount = hasComparisonSamplers ? capacities.comparisonSamplers : capacities.storageBuffers;
+    // `variableCount` was already derived above, alongside the matching
+    // bindingFlags.back() flag -- see this function's own comment there.
     VkDescriptorSetVariableDescriptorCountAllocateInfo variableCountInfo{};
     variableCountInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO;
     variableCountInfo.descriptorSetCount = 1;
@@ -377,6 +420,43 @@ BindlessHandle BindlessTable::registerComparisonSampler(VkSampler sampler) {
     return BindlessHandle(BindlessResourceKind::ComparisonSampler, internal.index(), internal.generation());
 }
 
+BindlessHandle BindlessTable::registerCubeSampledImage(VkImageView view, VkImageLayout layout) {
+    RX_ASSERT_MAIN_THREAD("BindlessTable::registerCubeSampledImage");
+    if (capacities_.cubeImages == 0) {
+        RX_LOG_ERROR(
+            "rx::rhi::BindlessTable::registerCubeSampledImage: this table was created with "
+            "capacities.cubeImages == 0 -- binding 4 does not exist; rejecting");
+        return BindlessHandle{};
+    }
+    auto internal = cubeImages_.acquire(detail::EmptyPayload{});
+    if (internal.index() >= capacities_.cubeImages) {
+        RX_LOG_ERROR(
+            "rx::rhi::BindlessTable::registerCubeSampledImage: cube-image capacity ({}) already fully "
+            "occupied; rejecting",
+            capacities_.cubeImages);
+        cubeImages_.release(internal);
+        return BindlessHandle{};
+    }
+
+    VkDescriptorImageInfo imageInfo{};
+    imageInfo.sampler = VK_NULL_HANDLE;
+    imageInfo.imageView = view;
+    imageInfo.imageLayout = layout;
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = set_;
+    write.dstBinding = kCubeSampledImageBinding;
+    write.dstArrayElement = internal.index();
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    write.pImageInfo = &imageInfo;
+
+    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+
+    return BindlessHandle(BindlessResourceKind::CubeImage, internal.index(), internal.generation());
+}
+
 void BindlessTable::release(BindlessHandle handle) {
     RX_ASSERT_MAIN_THREAD("BindlessTable::release");
     if (!handle.isValid()) {
@@ -396,6 +476,9 @@ void BindlessTable::release(BindlessHandle handle) {
         case BindlessResourceKind::ComparisonSampler:
             comparisonSamplers_.release(
                 rx::core::Handle<detail::ComparisonSamplerSlotTag>(handle.index(), handle.generation()));
+            break;
+        case BindlessResourceKind::CubeImage:
+            cubeImages_.release(rx::core::Handle<detail::CubeImageSlotTag>(handle.index(), handle.generation()));
             break;
     }
 }

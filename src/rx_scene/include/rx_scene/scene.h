@@ -228,6 +228,67 @@ struct DirectionalLightDesc {
     uint8_t channels = 0xFF;
 };
 
+// [Phase 5 Task 10, #46, FG1 closure] The scene-level environment binding
+// -- skybox pass sampling the base cubemap + IBL diffuse/specular feeding
+// every lit-path lobe (the ticket's own text). rx::scene stays DEVICE-FREE
+// (no VkDevice/rx_rhi_vk dependency anywhere in this library -- see this
+// header's own top comment), so `EnvironmentDesc` carries plain D11-style
+// BINDLESS INDICES (uint32_t), never a `rx::rhi::Texture2D`/`BindlessHandle`
+// -- the SAME "engine-defined interface consumed by index, never by
+// concrete GPU type" convention `asset::TextureRef`/`RenderableDesc`'s own
+// texture-index fields already establish. A production caller (samples/
+// 08_gltf_viewer) registers `rx::ibl::bakeEnvironment()`'s own BakeResult
+// textures into its `rx::rhi::BindlessTable` (the CUBE-typed
+// `registerCubeSampledImage()` for base/irradiance/prefiltered, the
+// ordinary `registerSampledImage()` for the 2D DFG LUT) and passes the
+// resulting indices here.
+//
+// SINGLETON, NOT A HANDLE POOL [implementer decision, matching Filament's
+// own `Scene::setIndirectLight()`/`setSkybox()` precedent -- a single
+// setter, not a handle-returning factory]: a Scene has AT MOST ONE active
+// environment (the charter's own "Scene-level environment binding" framing,
+// singular) -- `createDirectionalLight()`'s own handle-pool idiom exists
+// because a scene legitimately has MANY lights; there is no equivalent
+// multiplicity requirement for environments in this phase's own scope
+// (multiple simultaneous environments/reflection-probe volumes are a later,
+// unscoped feature), so a handle pool here would be unused generality, not
+// a real requirement -- matching the gate matrix's own "or an
+// EnvironmentHandle-returning factory" ALTERNATIVE phrasing explicitly, not
+// its only option.
+struct EnvironmentDesc {
+    // Bindless CUBE indices (BindlessTable::kCubeSampledImageBinding) --
+    // rx::ibl::BakeResult::{baseCubemap,irradianceCubemap,prefilteredCubemap}
+    // registered by the caller. `baseCubemapIndex` feeds the skybox pass
+    // ONLY (standard_pbr.slang's IBL lobes never sample it); the other two
+    // feed StandardPbr's diffuse/specular IBL terms.
+    uint32_t baseCubemapIndex = 0;
+    uint32_t irradianceCubemapIndex = 0;
+    uint32_t prefilteredCubemapIndex = 0;
+    // Bindless SAMPLED_IMAGE (2D, NOT cube) index -- rx::ibl::BakeResult::
+    // dfgLut.
+    uint32_t dfgLutIndex = 0;
+    // Bindless SAMPLER indices -- a trilinear-across-mips CLAMP_TO_EDGE
+    // sampler for the three cube reads above, a bilinear CLAMP_TO_EDGE
+    // sampler for the 2D DFG LUT (see material.slang's own RxDrawData
+    // header comment for why these are two DISTINCT samplers, not one
+    // shared index).
+    uint32_t cubeSamplerIndex = 0;
+    uint32_t dfgSamplerIndex = 0;
+    // rx::ibl::BakeResult::prefilteredMipCount - 1 -- the roughness-to-LOD
+    // remap's own natural unit (standard_pbr.slang's own `roughness *
+    // maxPrefilteredLod`).
+    float maxPrefilteredLod = 0.0F;
+    // [T10's own "physical units" ruling -- see material.slang's own
+    // RxDrawData::envIntensity header comment for the full unit-convention
+    // rationale] Environment radiance/luminance in this scene's own
+    // documented physical-ish unit, PRE-EXPOSURE (i.e. NOT yet multiplied
+    // by `rx::scene::Camera::exposure()` -- a DrawDataGpu/RxSkyboxData
+    // PRODUCER applies that multiply once, per Task 4's own pre-exposure
+    // convention, the same point `lightColor`/`ambientColor` already
+    // apply it at). Default 1.0 -- a neutral, unscaled environment.
+    float intensity = 1.0F;
+};
+
 class Scene;
 
 namespace detail {
@@ -377,6 +438,28 @@ public:
     [[nodiscard]] uint8_t lightChannels(LightHandle handle) const;
     [[nodiscard]] size_t lightCount() const;
 
+    // --- Environment [Phase 5 Task 10, #46] -------------------------------
+
+    // Sets/replaces this Scene's own single active environment -- see
+    // `EnvironmentDesc`'s own header comment for the singleton rationale.
+    // Main-thread-only (D5), matching every other Scene mutator.
+    void setEnvironment(const EnvironmentDesc& desc);
+    // Clears this Scene's environment -- `hasEnvironment()` returns false
+    // and every subsequent RxDrawData row a caller populates from this
+    // Scene should carry the "no environment" sentinel again (a caller's
+    // own responsibility -- Scene itself does not retroactively touch
+    // already-uploaded GPU buffers, matching its own "no dirty tracking"
+    // top-of-file convention).
+    void clearEnvironment();
+    [[nodiscard]] bool hasEnvironment() const;
+    // Throws std::out_of_range if `hasEnvironment() == false` -- matching
+    // this class's own established "a mutator/accessor that expects
+    // already-live state fails loudly" convention (requireLiveRenderable()/
+    // requireLiveLight()), rather than returning a silently-default-
+    // constructed EnvironmentDesc a caller could mistake for a real,
+    // intentionally-neutral one.
+    [[nodiscard]] const EnvironmentDesc& environment() const;
+
 private:
     friend LightHandle detail::createLightRecordForTesting(Scene&, const LightRecord&);
     friend const LightRecord& detail::lightRecordForTesting(const Scene&, LightHandle);
@@ -426,6 +509,10 @@ private:
     std::vector<bool> lightAlive_;
     std::vector<uint32_t> lightFreeList_;
     std::vector<LightRecord> lightRecords_;
+
+    // --- Environment [Phase 5 Task 10, #46] -- a plain optional value, not
+    // a handle-pool column (see EnvironmentDesc's own singleton rationale).
+    std::optional<EnvironmentDesc> environment_;
 };
 
 }  // namespace rx::scene

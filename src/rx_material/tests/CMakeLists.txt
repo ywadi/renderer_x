@@ -48,6 +48,12 @@ add_executable(rx_material_gpu_tests
     # shadow-caster pipeline building the shadow map this test's receiver
     # draws sample).
     test_standard_pbr_shadow_gpu.cpp
+    # Phase 5 Stage 1 Task 10 [#46, FG1 closure]: standard_pbr.slang's new
+    # IBL diffuse/specular lobes (Lambertian-under-uniform-environment
+    # closed form, mirror-metal matched-pose value probe, rough-metal
+    # furnace sanity) + shaders/ibl/skybox.slang's own background pass
+    # (camera-ray value probe) -- see that file's own header comment.
+    test_standard_pbr_ibl_gpu.cpp
 )
 # [Phase 5 Task 4/#40] rx_scene: test_standard_pbr_unlit.cpp's own
 # pre-exposure TEST_CASE constructs a real rx::scene::Camera and reads
@@ -66,6 +72,12 @@ target_compile_definitions(rx_material_gpu_tests PRIVATE
   # that library target and does not propagate to this executable, so it
   # is redeclared here, verbatim, for the one test file that needs it.
   RX_MATERIAL_SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders/material"
+  # [Phase 5 Task 10, #46] test_standard_pbr_ibl_gpu.cpp's own skybox
+  # TEST_CASE compiles the REAL shipped shaders/ibl/skybox.slang directly
+  # (rx_shader::Compiler, not via rx_ibl -- this binary does not link
+  # rx_ibl, which owns the BAKE chain's own shaders, a distinct concern
+  # from the skybox pass this file's own test targets).
+  RX_IBL_SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders/ibl"
 )
 
 # --validate: same developer/CI-gate opt-in every other GPU-backed test

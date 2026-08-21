@@ -18,11 +18,20 @@
 // Fresnel (`F_Schlick`, explicit-f90 overload -- brdf.slang), all consumed
 // from Task 7's module rather than duplicated inline (matrix-issue08's own
 // three-first-tier-reference convergence on this exact baseline is
-// unchanged by the rework; only WHERE the math lives changed). Plus [FG1,
-// issue comment 2] an interim flat ambient/environment term (uniform color
-// x occlusion) so metals never render pure black pre-IBL -- the full
-// skybox+IBL environment path is registered for the techniques phase
-// (Task 9/10), not built here.
+// unchanged by the rework; only WHERE the math lives changed). PLUS
+// [Phase 5 Task 10, #46, FG1 closure] real image-based lighting -- diffuse
+// irradiance + specular prefiltered-cubemap sampling, fed by
+// `MaterialVertex::env*` (material.slang, populated from
+// `rx::scene::Scene::environment()` via forward_entry.slang's own re-read
+// of the draw's RxDrawData row) -- see this file's own `evaluate()` body
+// for the full split-sum composition. This REPLACES [FG1, issue comment 2]
+// the former interim flat ambient/environment term (`v.ambientColor *
+// occlusion * baseColor.rgb`, uniform color, independent of
+// roughness/metallic beyond the diffuse-only multiply) -- that field is
+// RETIRED (no longer read here; see MaterialVertex::ambientColor's own
+// header comment for why it stays declared, unconsumed) per the ticket's
+// own "replacing... not adding a toggle" framing: a draw with no
+// environment bound now gets ZERO indirect light, not a placeholder one.
 //
 // TASK 8 -- KHR_materials_ior / KHR_materials_specular [gate matrix rows,
 // same file]: `computeDielectricF0F90()` below derives the dielectric F0/
@@ -394,6 +403,32 @@ struct StandardPbr : IMaterialShader {
 
         float alpha = roughness * roughness;
 
+        // [Phase 5 Task 10, #46, FG1 closure] The scene environment's own
+        // DFG-LUT sample -- taken ONCE, here, before either the direct- or
+        // indirect-lighting specular terms below, because BOTH consume it:
+        // this is the "wire the LUT through... for IBL-lit materials"
+        // activation the ticket's own landed context names explicitly --
+        // `gParams.dfgY`'s pre-Task-10 neutral CPU constant (1.0, "no
+        // unaccounted multi-scattering loss assumed") is superseded by the
+        // REAL per-pixel `dfg.y` Task 9's baked LUT supplies, for every
+        // draw that has an environment bound (`hasEnvironment` below) --
+        // Filament's own `pixel.dfg` is populated exactly this way
+        // (`getEnergyCompensationPixelParams()`, surface_shading_lit.fs).
+        // A draw with NO environment bound keeps `gParams.dfgY`'s own
+        // CPU-bound value verbatim (byte-identical to every pre-Task-10
+        // producer, which never populates `v.env*` at all) -- see
+        // `EnergyComp`'s own header comment for why a caller must ALSO
+        // request the ON specialization (`kSpecializationEnergyCompensation`,
+        // material_system.h) for this real value to have any effect at all
+        // (the OFF variant's `apply()` ignores its `dfgY` argument
+        // entirely, by construction).
+        bool hasEnvironment = v.envIrradianceCubeIndex != 0xFFFFFFFFu;
+        float2 dfg = float2(0.0, 1.0);
+        if (hasEnvironment) {
+            dfg = rx_sampleTexture(v.envDfgLutIndex, v.envDfgSamplerIndex, float2(NdotV, 1.0 - roughness)).rg;
+        }
+        float dfgY = hasEnvironment ? dfg.y : gParams.dfgY;
+
         float D = D_GGX(alpha, NdotH);
         float vis = V_SmithGGXCorrelated(alpha, NdotV, NdotL);
         float3 fresnel = F_Schlick(F0, F90, VdotH);
@@ -406,7 +441,7 @@ struct StandardPbr : IMaterialShader {
         // for the MULTIPLICATIVE CONTRACT this follows exactly: the
         // specular lobe's response only, never the diffuse lobe.
         EnergyComp energyFeature;
-        specular = energyFeature.apply(specular, F0, gParams.dfgY);
+        specular = energyFeature.apply(specular, F0, dfgY);
 
         float3 diffuse = diffuseColor * Fd_Lambert();
 
@@ -425,14 +460,69 @@ struct StandardPbr : IMaterialShader {
         // lands. Direct light is governed by NdotL/shadowing alone.
         float3 directLight = (diffuse + specular) * v.lightColor * NdotL;
 
-        // [FG1] Interim flat ambient/environment term -- uniform color x
-        // occlusion x baseColor, the EXACT closed-form the acceptance
-        // criterion's non-black-metal probe checks, independent of
-        // metallic/NdotL (a fully-metallic surface has zero diffuse but
-        // still gets this contribution -- the whole point of FG1).
-        float3 ambient = v.ambientColor * occlusion * baseColor.rgb;
+        // [Phase 5 Task 10, #46, FG1 closure] Image-based lighting --
+        // REPLACES the retired FG1 flat ambient/environment term (see
+        // MaterialVertex::ambientColor's own header comment, material.slang)
+        // with real diffuse irradiance + specular prefiltered-cubemap
+        // sampling, per the charter's own "each lobe fed by both direct
+        // lighting and IBL" requirement. Split-sum composition [Karis 2013;
+        // Filament `evaluateIBL()`, shaders/src/surface_light_indirect.fs,
+        // google/filament v1.75.0, :717-758 -- see brdf.slang's own
+        // `iblSpecularReflectance()` header comment for the full citation]:
+        //   E  = f0*dfg.x + dfg.y                          (specularDFG)
+        //   Fr = E * prefilteredRadiance(R, roughness-LOD)   (specular)
+        //   Fd = diffuseColor * diffuseIrradiance * (1-E)    (diffuse, energy-
+        //                                                     conserving: gets
+        //                                                     what specular
+        //                                                     did NOT reflect)
+        // A draw with no environment bound (`hasEnvironment == false`,
+        // `v.envIrradianceCubeIndex` still the "no environment" sentinel)
+        // contributes EXACTLY ZERO indirect light -- matching Filament's own
+        // "no IndirectLight bound" behavior, a real, physically-honest
+        // behavior change from FG1's own always-on placeholder (see this
+        // file's own header comment and the T10 gate matrix's
+        // discrimination row: "the old flat-ambient code is retired after
+        // ... not 'adding a toggle'" -- there is deliberately no
+        // ambientColor-shaped fallback here).
+        float3 ibl = float3(0.0, 0.0, 0.0);
+        if (hasEnvironment) {
+            // Mirror reflection direction about N -- the SAME `NdotV` this
+            // file already clamped away from 0 above, reused rather than a
+            // second `dot(N, viewDir)` (negligible divergence at the
+            // clamped grazing angle this guards).
+            float3 R = 2.0 * NdotV * N - viewDir;
+            // [prefilter_specular.slang / dfg_lut.slang's own shared
+            // roughness<->coord parameterization, bake.cpp's own header
+            // comment: `linearRoughness = coord*coord`, i.e.
+            // `coord == sqrt(linearRoughness) == perceptualRoughness`] The
+            // SAME `roughness` (perceptual, already clamped to
+            // [kMinRoughness,1]) variable indexes BOTH the prefiltered
+            // mip-chain's own LOD *and* the DFG LUT's own y-axis above
+            // (`1.0 - roughness`) -- a mismatch between the two would
+            // silently sample a roughness-inconsistent (mip, dfg) pair.
+            float lod = roughness * v.envMaxPrefilteredLod;
+            float3 irradianceSample =
+                rx_sampleTextureCubeLod(v.envIrradianceCubeIndex, v.envCubeSamplerIndex, N, 0.0).rgb;
+            float3 prefilteredSample =
+                rx_sampleTextureCubeLod(v.envPrefilteredCubeIndex, v.envCubeSamplerIndex, R, lod).rgb;
 
-        float3 color = directLight + ambient + emissive;
+            float3 E = iblSpecularReflectance(F0, dfg);
+            float3 iblSpecular = energyFeature.apply(prefilteredSample * E, F0, dfgY);
+            float3 iblDiffuse = diffuseColor * irradianceSample * (float3(1.0, 1.0, 1.0) - E);
+
+            // [glTF core spec, occlusionTexture: "indirect light only" --
+            // this file's own existing `directLight` comment above already
+            // establishes the same "occlusion never touches direct light"
+            // rule; IBL is exactly the indirect term that DOES get it,
+            // matching FG1's own retired `ambient * occlusion` shape one
+            // for one] `envIntensity` is PRE-EXPOSED (T4's convention,
+            // RxDrawData::envIntensity's own header comment, material.slang)
+            // -- no separate exposure multiply here, matching
+            // `v.lightColor`'s own already-pre-exposed convention.
+            ibl = (iblDiffuse + iblSpecular) * occlusion * v.envIntensity;
+        }
+
+        float3 color = directLight + ibl + emissive;
         return float4(color, baseColor.a);
     }
 };

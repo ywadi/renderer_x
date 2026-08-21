@@ -18,6 +18,15 @@ enum class BindlessResourceKind : uint8_t {
     Sampler,
     StorageBuffer,
     ComparisonSampler,
+    // [Phase 5 Task 10, #46] A CUBE-typed (VK_IMAGE_VIEW_TYPE_CUBE) sampled
+    // image -- see BindlessTable::kCubeSampledImageBinding's own comment
+    // for why this needs a DISTINCT binding from ordinary SampledImage
+    // rather than sharing kSampledImageBinding: Slang/SPIR-V's
+    // `TextureCube` and `Texture2D` are different OpTypeImage `Dim`
+    // declarations, so one binding cannot serve both bindless array
+    // element types even though Vulkan's own VK_DESCRIPTOR_TYPE_SAMPLED_
+    // IMAGE descriptor type is identical either way.
+    CubeImage,
 };
 
 namespace detail {
@@ -34,6 +43,7 @@ struct SampledImageSlotTag {};
 struct SamplerSlotTag {};
 struct StorageBufferSlotTag {};
 struct ComparisonSamplerSlotTag {};
+struct CubeImageSlotTag {};
 struct EmptyPayload {};
 
 }  // namespace detail
@@ -178,12 +188,31 @@ public:
         // library's own tests), which never sets it and gets the
         // unchanged 3-binding shape.
         uint32_t comparisonSamplers = 0;
+
+        // [Phase 5 Task 10, #46] Cube-typed (VK_IMAGE_VIEW_TYPE_CUBE)
+        // sampled images -- environment base/irradiance/prefiltered
+        // cubemaps (rx::ibl::BakeResult), consumed by standard_pbr.slang's
+        // IBL lobes and shaders/ibl/skybox.slang. A FIFTH, OPTIONAL
+        // binding, same "0 == absent, byte-identical to every pre-existing
+        // caller" convention as `comparisonSamplers` above: a table built
+        // with `cubeImages == 0` (the default) declares no
+        // `kCubeSampledImageBinding` binding at all.
+        uint32_t cubeImages = 0;
     };
 
     static constexpr uint32_t kSampledImageBinding = 0;
     static constexpr uint32_t kSamplerBinding = 1;
     static constexpr uint32_t kStorageBufferBinding = 2;
     static constexpr uint32_t kComparisonSamplerBinding = 3;
+    // [Phase 5 Task 10, #46] Fixed at 4 regardless of whether
+    // `kComparisonSamplerBinding` is actually present in a given table
+    // (binding NUMBERS need not be contiguous in a Vulkan descriptor set
+    // layout -- only DECLARED bindings need a VkDescriptorSetLayoutBinding
+    // entry) -- see BindlessTable::create()'s own comment for how the
+    // VARIABLE_DESCRIPTOR_COUNT/"last binding" Vulkan constraint is
+    // satisfied across the four (comparisonSamplers x cubeImages)
+    // present/absent combinations this now allows.
+    static constexpr uint32_t kCubeSampledImageBinding = 4;
 
     BindlessTable(BindlessTable&&) noexcept;
     BindlessTable& operator=(BindlessTable&&) noexcept;
@@ -248,6 +277,18 @@ public:
     // `Capacities::comparisonSamplers`'s own comment).
     BindlessHandle registerComparisonSampler(VkSampler sampler);
 
+    // [Phase 5 Task 10, #46] Registers `view` (a VK_IMAGE_VIEW_TYPE_CUBE
+    // view, e.g. `rx::rhi::Texture2D::createCubeForPresuppliedMips()`'s own
+    // `view()` -- this method does not itself validate the view type; a
+    // non-cube view registered here would simply be sampled as garbage by
+    // a `TextureCube` shader declaration, not a Vulkan error) at a free
+    // index in binding `kCubeSampledImageBinding`, written immediately.
+    // Returns an invalid handle (and logs an error) if this table's
+    // cube-image capacity is already fully occupied OR if this table was
+    // created with `capacities.cubeImages == 0` (binding 4 does not exist
+    // at all -- see `Capacities::cubeImages`'s own comment).
+    BindlessHandle registerCubeSampledImage(VkImageView view, VkImageLayout layout);
+
     // Returns `handle`'s slot to the relevant resource class's free list
     // for future reuse. See the RELEASE-SAFETY CONTRACT above -- this does
     // NOT touch the descriptor's current GPU-visible contents, and does
@@ -271,6 +312,7 @@ private:
     rx::core::HandlePool<detail::SamplerSlotTag, detail::EmptyPayload> samplers_;
     rx::core::HandlePool<detail::StorageBufferSlotTag, detail::EmptyPayload> storageBuffers_;
     rx::core::HandlePool<detail::ComparisonSamplerSlotTag, detail::EmptyPayload> comparisonSamplers_;
+    rx::core::HandlePool<detail::CubeImageSlotTag, detail::EmptyPayload> cubeImages_;
 };
 
 }  // namespace rx::rhi

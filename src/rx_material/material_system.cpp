@@ -281,7 +281,14 @@ constexpr uint32_t kBindlessTextureArraySet = 0;
 // BindlessTable::kStorageBufferBinding) -- SLANG_STRUCTURED_BUFFER is the
 // same base-shape masking technique the two pre-existing cases already use,
 // just a different `SlangResourceShape` value.
-enum class BindlessArrayElementKind { SampledImageArray, SamplerArray, StorageBufferArray, Other };
+// [Phase 5 Task 10, #46] Gained `CubeImageArray` for material.slang's new
+// `gTexturesCube` global (`TextureCube[]`, unbounded, at
+// BindlessTable::kCubeSampledImageBinding) -- SLANG_TEXTURE_CUBE is the
+// same base-shape masking technique the pre-existing SLANG_TEXTURE_2D case
+// already uses, just a different `SlangResourceShape` value (Slang/SPIR-V
+// treat `Texture2D`/`TextureCube` as distinct `OpTypeImage` `Dim`
+// declarations, so this needs its own recognized kind, not a shared one).
+enum class BindlessArrayElementKind { SampledImageArray, SamplerArray, StorageBufferArray, CubeImageArray, Other };
 
 BindlessArrayElementKind classifyBindlessArrayElement(slang::TypeReflection* elemType) {
     if (elemType == nullptr) {
@@ -299,6 +306,9 @@ BindlessArrayElementKind classifyBindlessArrayElement(slang::TypeReflection* ele
         }
         if (baseShape == SLANG_STRUCTURED_BUFFER) {
             return BindlessArrayElementKind::StorageBufferArray;
+        }
+        if (baseShape == SLANG_TEXTURE_CUBE && !combinedSampler) {
+            return BindlessArrayElementKind::CubeImageArray;
         }
     }
     return BindlessArrayElementKind::Other;
@@ -402,6 +412,7 @@ std::optional<MaterialReflection> reflectMaterialLayout(slang::ProgramLayout* la
     bool foundSamplerArray = false;
     bool foundDrawDataArray = false;
     bool foundComparisonSamplerArray = false;
+    bool foundCubeImageArray = false;
     bool foundMaterialGlobalsPushConstant = false;
 
     // [Task 4] Needed only by the DescriptorTableSlot branch below, for
@@ -572,6 +583,26 @@ std::optional<MaterialReflection> reflectMaterialLayout(slang::ProgramLayout* la
                 foundComparisonSamplerArray = true;
                 continue;
             }
+            // [Phase 5 Task 10, #46] material.slang's own `gTexturesCube`
+            // bindless CUBE sampled-image array -- environment base/
+            // irradiance/prefiltered cubemaps. SAME "handled as optional,
+            // present for every material in practice" posture as the other
+            // bindless globals above -- `import material;` pulls it in
+            // regardless of whether a given material's own evaluate() ever
+            // samples it (see material.slang's own header comment).
+            if (set == kBindlessTextureArraySet && bindingIndex == rx::rhi::BindlessTable::kCubeSampledImageBinding &&
+                kind == BindlessArrayElementKind::CubeImageArray && unbounded && !foundCubeImageArray) {
+                rx::shader::ShaderLayoutInfo::Binding binding;
+                binding.set = set;
+                binding.binding = bindingIndex;
+                binding.count = 0;
+                binding.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                binding.stages = kMaterialStageFlags;
+                binding.unboundedArray = true;
+                result.shaderLayout.bindings.push_back(binding);
+                foundCubeImageArray = true;
+                continue;
+            }
 
             error = "material module '" + moduleLabel + "' declares an unsupported bindless global '" + name +
                     "' at set " + std::to_string(set) + " binding " + std::to_string(bindingIndex) +
@@ -585,7 +616,9 @@ std::optional<MaterialReflection> reflectMaterialLayout(slang::ProgramLayout* la
                     std::to_string(rx::rhi::BindlessTable::kStorageBufferBinding) +
                     "] / `gShadowCompareSamplers` [unbounded SamplerComparisonState[], set " +
                     std::to_string(kBindlessTextureArraySet) + ", binding " +
-                    std::to_string(rx::rhi::BindlessTable::kComparisonSamplerBinding) + "] shape)";
+                    std::to_string(rx::rhi::BindlessTable::kComparisonSamplerBinding) +
+                    "] / `gTexturesCube` [unbounded TextureCube[], set " + std::to_string(kBindlessTextureArraySet) +
+                    ", binding " + std::to_string(rx::rhi::BindlessTable::kCubeSampledImageBinding) + "] shape)";
             return std::nullopt;
         }
 

@@ -459,3 +459,74 @@ TEST_CASE(
     CHECK(scene.lightCount() == 2);
     CHECK(rx::scene::detail::lightRecordForTesting(scene, dirHandle).type == rx::scene::LightType::Directional);
 }
+
+// ---------------------------------------------------------------------
+// Environment [Phase 5 Task 10, #46, FG1 closure]
+// ---------------------------------------------------------------------
+
+TEST_CASE("Scene environment: absent by default, hasEnvironment()/environment() round-trip a set value, "
+          "environment() throws for an unconfigured Scene [gate matrix 'Scene-level environment API' row]") {
+    rx::scene::Scene scene(&fallbackShapedBounds);
+
+    // Absent by default -- a freshly-constructed Scene has no environment
+    // (the "existing 08/09 gates regenerate with new, provably-more-
+    // correct references" bar, not "byte-identical unless requested" --
+    // see this class's own EnvironmentDesc header comment).
+    CHECK_FALSE(scene.hasEnvironment());
+    CHECK_THROWS_AS(static_cast<void>(scene.environment()), std::out_of_range);
+
+    rx::scene::EnvironmentDesc desc;
+    desc.baseCubemapIndex = 3;
+    desc.irradianceCubemapIndex = 4;
+    desc.prefilteredCubemapIndex = 5;
+    desc.dfgLutIndex = 6;
+    desc.cubeSamplerIndex = 1;
+    desc.dfgSamplerIndex = 2;
+    desc.maxPrefilteredLod = 4.0F;
+    desc.intensity = 2.5F;
+    scene.setEnvironment(desc);
+
+    REQUIRE(scene.hasEnvironment());
+    const rx::scene::EnvironmentDesc& stored = scene.environment();
+    CHECK(stored.baseCubemapIndex == 3);
+    CHECK(stored.irradianceCubemapIndex == 4);
+    CHECK(stored.prefilteredCubemapIndex == 5);
+    CHECK(stored.dfgLutIndex == 6);
+    CHECK(stored.cubeSamplerIndex == 1);
+    CHECK(stored.dfgSamplerIndex == 2);
+    CHECK(stored.maxPrefilteredLod == doctest::Approx(4.0F));
+    CHECK(stored.intensity == doctest::Approx(2.5F));
+}
+
+TEST_CASE("Scene environment: setEnvironment() REPLACES a prior value (singleton, not a handle pool), "
+          "clearEnvironment() removes it again") {
+    rx::scene::Scene scene(&fallbackShapedBounds);
+
+    rx::scene::EnvironmentDesc first;
+    first.baseCubemapIndex = 10;
+    first.intensity = 1.0F;
+    scene.setEnvironment(first);
+    REQUIRE(scene.hasEnvironment());
+    CHECK(scene.environment().baseCubemapIndex == 10);
+
+    rx::scene::EnvironmentDesc second;
+    second.baseCubemapIndex = 20;
+    second.intensity = 3.0F;
+    scene.setEnvironment(second);
+    REQUIRE(scene.hasEnvironment());
+    // A real REPLACE, not an additive/accumulating set -- exactly one
+    // active environment at a time, matching this struct's own singleton
+    // rationale (Filament's `setIndirectLight()`/`setSkybox()` precedent).
+    CHECK(scene.environment().baseCubemapIndex == 20);
+    CHECK(scene.environment().intensity == doctest::Approx(3.0F));
+
+    scene.clearEnvironment();
+    CHECK_FALSE(scene.hasEnvironment());
+    CHECK_THROWS_AS(static_cast<void>(scene.environment()), std::out_of_range);
+
+    // clearEnvironment() on an already-clear Scene is a harmless no-op
+    // (not a throw) -- mirrors destroyRenderable()/destroyLight()'s own
+    // idempotent-mutator convention for this class.
+    scene.clearEnvironment();
+    CHECK_FALSE(scene.hasEnvironment());
+}

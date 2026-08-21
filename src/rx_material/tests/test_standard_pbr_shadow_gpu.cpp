@@ -92,6 +92,13 @@ std::optional<Fixture> makeFixture(const char* title) {
     capacities.samplers = 16;
     capacities.storageBuffers = 16;
     capacities.comparisonSamplers = 8;
+    // [Phase 5 Task 10, #46] material.slang now unconditionally declares
+    // `gTexturesCube` at binding 4 -- every BindlessTable feeding
+    // MaterialSystem needs a nonzero cube-image capacity, same reasoning as
+    // `comparisonSamplers` above (this fixture's own tests never actually
+    // register a cube texture, but the pipeline LAYOUT still needs a
+    // matching binding for the shader's static declaration).
+    capacities.cubeImages = 4;
     auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
     REQUIRE(bindless.has_value());
 

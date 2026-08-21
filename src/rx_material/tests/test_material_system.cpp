@@ -97,6 +97,10 @@ std::optional<MaterialTestFixture> makeFixture(const char* title) {
     // unconditionally declares `gShadowCompareSamplers` at binding 3 --
     // every MaterialSystem pipeline this fixture builds needs it present.
     capacities.comparisonSamplers = 1;
+    // [Phase 5 Task 10, #46] material.slang now unconditionally declares
+    // `gTexturesCube` at binding 4 -- same requirement as
+    // `comparisonSamplers` above.
+    capacities.cubeImages = 1;
     auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
     REQUIRE(bindless.has_value());
 
@@ -388,7 +392,11 @@ TEST_CASE("MaterialSystem::loadMaterial reflects the set-1 parameter block and b
     // material.slang's new `gShadowCompareSamplers` bindless comparison-
     // sampler array (the hardware-PCF shadow-sampling mechanism) joins
     // the other four, same "always present" reasoning.
-    REQUIRE(layout.bindings.size() == 5);
+    // [Phase 5 Task 10, #46] grew from 5 to 6: material.slang's new
+    // `gTexturesCube` bindless CUBE sampled-image array (environment
+    // cubemaps) joins the other five, same "always present regardless of
+    // use" reasoning.
+    REQUIRE(layout.bindings.size() == 6);
 
     const auto& paramBlock = findBinding(layout, 1, 0);
     CHECK(paramBlock.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
@@ -418,6 +426,14 @@ TEST_CASE("MaterialSystem::loadMaterial reflects the set-1 parameter block and b
     const auto& compareSamplers = findBinding(layout, 0, rx::rhi::BindlessTable::kComparisonSamplerBinding);
     CHECK(compareSamplers.type == VK_DESCRIPTOR_TYPE_SAMPLER);
     CHECK(compareSamplers.unboundedArray);
+
+    // [Phase 5 Task 10, #46] gTexturesCube -- the new bindless CUBE
+    // sampled-image array (environment base/irradiance/prefiltered
+    // cubemaps), same "always present regardless of use" reasoning as
+    // gTextures/gSamplers/gDrawData/gShadowCompareSamplers above.
+    const auto& cubeImages = findBinding(layout, 0, rx::rhi::BindlessTable::kCubeSampledImageBinding);
+    CHECK(cubeImages.type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE);
+    CHECK(cubeImages.unboundedArray);
 
     // [Phase 4 Task 16, Phase 5 Task 4/#40] gMaterialGlobals -- same
     // "always present regardless of use" reasoning as the three bindings

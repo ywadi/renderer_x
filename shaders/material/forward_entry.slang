@@ -117,7 +117,21 @@ struct VertexStageOutput {
     float2 uv;
     float3 lightDirWorld;
     float3 lightColor;
-    float3 ambientColor;
+    // [Phase 5 Task 10, #46] `ambientColor` DROPPED from this interpolant
+    // struct (unlike RxDrawData/MaterialVertex, which both KEEP the field
+    // -- see MaterialVertex::ambientColor's own header comment, material.
+    // slang): no conforming material reads `MaterialVertex::ambientColor`
+    // any more (StandardPbr's own evaluate() retired it this task; Unlit
+    // never read it), so Slang's own whole-program dead-code elimination
+    // strips the FRAGMENT-side consumption of it entirely, which left this
+    // struct's own vertex-stage WRITE (`output.ambientColor = ...`, below)
+    // as a genuine "vertex shader writes an output the fragment shader
+    // does not consume" mismatch -- a real Vulkan validation performance
+    // warning, reproduced directly during this task's own development,
+    // not a hypothetical. Removing the now-pointless carry-through here
+    // (fragmentMain sets `v.ambientColor` to a literal zero instead, right
+    // before calling `material.evaluate()`) closes the mismatch at its
+    // source rather than suppressing the warning.
     float3 cameraPosWorld;
     // [Phase 4 Stage 2 Task 22 fix round, F1, spec D21] The draw's own
     // bindless row index -- carried through so fragmentMain can re-read
@@ -163,7 +177,6 @@ VertexStageOutput vertexMain(float3 position : POSITION, float3 normal : NORMAL,
     output.uv = uv;
     output.lightDirWorld = draw.lightDirWorld.xyz;
     output.lightColor = draw.lightColor.xyz;
-    output.ambientColor = draw.ambientColor.xyz;
     output.cameraPosWorld = draw.cameraPosWorld.xyz;
     output.drawDataRow = instanceId;
     return output;
@@ -199,8 +212,26 @@ float4 fragmentMain(VertexStageOutput input) : SV_Target {
     // occlusion-vs-shadow comment, written when this shader-side half of
     // Task 22 was still future work, now landed here).
     v.lightColor = input.lightColor * shadowFactor;
-    v.ambientColor = input.ambientColor;
+    // [Phase 5 Task 10, #46] Retired literal -- see MaterialVertex::
+    // ambientColor's own header comment (material.slang) and this file's
+    // own VertexStageOutput comment above for why this is a plain zero
+    // constant rather than a carried-through vertex-stage interpolant.
+    v.ambientColor = float3(0.0, 0.0, 0.0);
     v.cameraPosWorld = input.cameraPosWorld;
+
+    // [Phase 5 Task 10, #46] The scene environment's own bindless bundle --
+    // read directly off the SAME `draw` row re-read above for the shadow
+    // fields (not carried through VertexStageOutput/interpolated: every
+    // field here is per-pass-constant, and this draw's own row is already
+    // sitting in a local, so there is nothing to gain from also widening
+    // the vertex-stage output struct for it).
+    v.envIrradianceCubeIndex = draw.envIrradianceCubeIndex;
+    v.envPrefilteredCubeIndex = draw.envPrefilteredCubeIndex;
+    v.envDfgLutIndex = draw.envDfgLutIndex;
+    v.envCubeSamplerIndex = draw.envCubeSamplerIndex;
+    v.envDfgSamplerIndex = draw.envDfgSamplerIndex;
+    v.envMaxPrefilteredLod = draw.envMaxPrefilteredLod;
+    v.envIntensity = draw.envIntensity;
 
     // Default-constructed: every conforming material struct this engine
     // links against is data-free by convention (its bound parameters live

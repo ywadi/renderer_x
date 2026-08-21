@@ -4,8 +4,10 @@
 
 add_executable(sample_08_gltf_viewer main.cpp)
 # rx_frame_loop [Phase 5 Task 5, ticket #41]: shared present-loop helper.
+# rx_ibl [Phase 5 Task 10, #46, FG1 closure]: rx::ibl::bakeEnvironment(),
+# consumed by this sample's own `--env <path.hdr>` handling.
 target_link_libraries(sample_08_gltf_viewer PRIVATE
-    rx_graph rx_rhi_vk rx_platform rx_material rx_asset rx_scene rx_task rx_shader rx_frame_loop sample_common
+    rx_graph rx_rhi_vk rx_platform rx_material rx_asset rx_scene rx_task rx_shader rx_frame_loop rx_ibl sample_common
 )
 
 # RX_REPO_ROOT_DIR: the same "bake an absolute CMAKE_SOURCE_DIR-relative
@@ -101,6 +103,57 @@ add_custom_command(
 add_custom_target(sample_08_gltf_viewer_tonemap_shaders
   DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/tonemap_shaders_deploy.stamp")
 add_dependencies(sample_08_gltf_viewer sample_08_gltf_viewer_tonemap_shaders)
+
+# [Phase 5 Task 10, #46, FG1 closure] rx_ibl's own bake-chain compute
+# kernels (rx::ibl::bakeEnvironment()'s own `shaderDir` parameter, an
+# EXPLICIT path this sample resolves at runtime -- see rx_ibl/CMakeLists.txt's
+# own comment on why that library has no compiled-in default) + this
+# sample's own skybox pass shader -- deployed into an `ibl_shaders/`
+# directory next to the binary. Same OUTPUT/DEPENDS-tracked shape as the
+# material/tonemap shader-deploy blocks above -- see either's own comment
+# for why a bare POST_BUILD recipe is not enough.
+set(RX_GLTF_VIEWER_IBL_SHADERS
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/ibl/equirect_to_cubemap.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/ibl/irradiance_convolve.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/ibl/prefilter_specular.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/ibl/dfg_lut.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/ibl/skybox.slang"
+)
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ibl_shaders_deploy.stamp"
+  COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sample_08_gltf_viewer>/ibl_shaders"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_GLTF_VIEWER_IBL_SHADERS}
+          "$<TARGET_FILE_DIR:sample_08_gltf_viewer>/ibl_shaders/"
+  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/ibl_shaders_deploy.stamp"
+  DEPENDS ${RX_GLTF_VIEWER_IBL_SHADERS}
+  COMMENT "sample_08_gltf_viewer: deploying rx_ibl's bake-chain + skybox shaders next to the binary"
+  VERBATIM
+)
+add_custom_target(sample_08_gltf_viewer_ibl_shaders
+  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/ibl_shaders_deploy.stamp")
+add_dependencies(sample_08_gltf_viewer sample_08_gltf_viewer_ibl_shaders)
+
+# [Phase 5 Task 10, #46] The committed small procedurally-generated .hdr
+# environment fixture (samples/08_gltf_viewer/environments/gate_test_env.hdr
+# -- see that file's own provenance note in this sample's main.cpp) this
+# sample's own `--env` default resolution falls back to. Deployed next to
+# the binary exactly like the D17 reference PNGs below.
+set(RX_GLTF_VIEWER_ENVIRONMENT_FIXTURES
+  "${CMAKE_CURRENT_SOURCE_DIR}/environments/gate_test_env.hdr"
+)
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/environments_deploy.stamp"
+  COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sample_08_gltf_viewer>/environments"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_GLTF_VIEWER_ENVIRONMENT_FIXTURES}
+          "$<TARGET_FILE_DIR:sample_08_gltf_viewer>/environments/"
+  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/environments_deploy.stamp"
+  DEPENDS ${RX_GLTF_VIEWER_ENVIRONMENT_FIXTURES}
+  COMMENT "sample_08_gltf_viewer: deploying the committed .hdr environment fixture next to the binary"
+  VERBATIM
+)
+add_custom_target(sample_08_gltf_viewer_environments
+  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/environments_deploy.stamp")
+add_dependencies(sample_08_gltf_viewer sample_08_gltf_viewer_environments)
 
 # D17 committed reference PNGs (256x256, lavapipe-rendered) -- deployed next
 # to the binary so main.cpp's basePathDirectory()-relative resolution finds

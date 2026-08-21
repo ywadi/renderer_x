@@ -23,6 +23,8 @@
 #include <doctest/doctest.h>
 #include <rx_material/material_system.h>
 #include <rx_material/draw_data.h>
+
+#include "ibl_environment_test_fixture.h"
 #include <rx_platform/window.h>
 #include <rx_rhi_vk/bindless.h>
 #include <rx_rhi_vk/buffer.h>
@@ -114,6 +116,12 @@ std::optional<Fixture> makeFixture(const char* title) {
     // registers its own comparison sampler alongside whatever the rest
     // of this file's existing tests already leave live).
     capacities.comparisonSamplers = 2;
+    // [Phase 5 Task 10, #46] material.slang now unconditionally declares
+    // `gTexturesCube` at binding 4 -- same requirement as
+    // `comparisonSamplers` above (this file's own tests never register a
+    // real cube texture, but the pipeline LAYOUT still needs a matching
+    // binding for the shader's static declaration).
+    capacities.cubeImages = 4;
     auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
     REQUIRE(bindless.has_value());
 
@@ -1258,8 +1266,14 @@ TEST_CASE("StandardPBR: metallic (blue channel) vs dielectric (metallic=0) at fi
     CHECK_FALSE(rig->fixture->context.hasValidationErrors());
 }
 
-TEST_CASE("StandardPBR: occlusion closed-form -- R=0,strength=1 zeroes ambient exactly; strength=0.5 halves it "
-          "exactly") {
+TEST_CASE("StandardPBR: occlusion closed-form -- R=0,strength=1 zeroes the IBL term exactly; strength=0.5 halves "
+          "it exactly [Phase 5 Task 10, #46, FG1 closure -- REWRITTEN from the retired ambient-term version: "
+          "occlusion's own closed-form multiplier now scales the REAL IBL contribution "
+          "(standard_pbr.slang: `ibl = (iblDiffuse+iblSpecular) * occlusion * envIntensity`), not FG1's retired "
+          "flat ambient*occlusion*baseColor -- see MaterialVertex::ambientColor's own header comment. A RATIO "
+          "check against a real bound (uniform, so radiometrically simple) environment, rather than a hand-"
+          "derived absolute constant, since the exact IBL value depends on the split-sum E=f0*dfg.x+dfg.y term "
+          "this test does not need to re-derive to prove occlusion's own multiplicative role.") {
     auto rig = makeStandardPbrRig("standard_pbr_occlusion");
     if (!rig.has_value()) {
         return;
@@ -1268,16 +1282,35 @@ TEST_CASE("StandardPBR: occlusion closed-form -- R=0,strength=1 zeroes ambient e
         rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
     const auto params = rig->system->materialParams(handle);
 
+    // A real, bindless-registered environment -- see
+    // ibl_environment_test_fixture.h's own header comment. Uniform,
+    // deliberately DIM (radiance 0.6, well under the UNORM store's own
+    // 1.0 clamp ceiling): at metallic=1.0/white baseColor (this probe's
+    // own material), F0=(1,1,1) and E=F0*dfg.x+dfg.y=1.0*0.5+0.5==1.0
+    // exactly (dfgValue=(0.5,0.5) below), so the fully-unoccluded pixel's
+    // own closed-form value is exactly `radiance * E * occlusion(1.0) ==
+    // radiance` -- 0.6 keeps that comfortably below 1.0 so the occlusion=
+    // 0.5 case's own halved value (0.3) is a REAL, distinguishable ~77/255
+    // rather than both cases alike clamping to 255 (empirically found
+    // during this task's own development at an earlier, brighter radiance
+    // choice -- the ratio check is meaningless once BOTH sides saturate).
+    auto env = rx::material_test::makeUniformTestEnvironment(rig->fixture->device, rig->fixture->allocator,
+                                                               rig->fixture->bindless, glm::vec4(0.6F, 0.6F, 0.6F, 1.0F),
+                                                               glm::vec2(0.5F, 0.5F));
+    REQUIRE(env.has_value());
+
     // Fully-occluding (R=0) texture + a directional light pointed AWAY
-    // from the surface (NdotL=0, zero direct light) isolates the ambient
-    // term exactly, matching the matrix's own acceptance criterion: "a
-    // metallic=1.0... probe pixel with zero direct light visible... reads
-    // ambientColor x occlusionValue x baseColor, the ONLY contribution".
+    // from the surface (NdotL=0, zero direct light) isolates the IBL
+    // term exactly, matching the matrix's own acceptance criterion (now
+    // pointed at IBL instead of the retired ambient placeholder): a
+    // metallic=1.0 probe pixel with zero direct light visible reads
+    // occlusion x (IBL diffuse+specular), the ONLY contribution.
     uint32_t blackOcclusionTex = makeTexture(*rig->system, {0, 255, 255, 255});  // R=0 (occluded); G/B irrelevant here.
 
     rx::material::DrawDataGpu row = makeHeadOnRow();
     row.lightDirWorld = glm::vec4(0.0F, 0.0F, -1.0F, 0.0F);  // light BEHIND the surface -> NdotL clamps to 0.
-    row.ambientColor = glm::vec4(0.5F, 0.5F, 0.5F, 0.0F);
+    row.ambientColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);    // retired field, inert -- see this struct's own header comment.
+    env->applyTo(row);
 
     std::vector<uint8_t> fullyOccludedBlob = makeDefaultStandardPbrBlob(*rig, handle);
     setParam(fullyOccludedBlob, params, "occlusionTexture", blackOcclusionTex);
@@ -1285,11 +1318,20 @@ TEST_CASE("StandardPBR: occlusion closed-form -- R=0,strength=1 zeroes ambient e
     setParam(fullyOccludedBlob, params, "metallicFactor", 1.0F);
     Rgba8 fullyOccludedPixel = renderOne(*rig, handle, fullyOccludedBlob, row);
 
-    // occlusion = 1.0 + 1.0*(0-1.0) = 0.0 exactly -> ambient = 0.5*0*1 = 0
-    // -> the ENTIRE output is 0 (no direct light, no ambient, no emissive).
+    // occlusion = 1.0 + 1.0*(0-1.0) = 0.0 exactly -> ibl = ... * 0 = 0
+    // exactly -> the ENTIRE output is 0 (no direct light, no IBL, no
+    // emissive).
     CHECK(fullyOccludedPixel.r == 0);
     CHECK(fullyOccludedPixel.g == 0);
     CHECK(fullyOccludedPixel.b == 0);
+
+    std::vector<uint8_t> unoccludedBlob = makeDefaultStandardPbrBlob(*rig, handle);
+    setParam(unoccludedBlob, params, "metallicFactor", 1.0F);  // occlusionTexture left at the white (no-op) default -> occlusion == 1.0.
+    Rgba8 unoccludedPixel = renderOne(*rig, handle, unoccludedBlob, row);
+    // Sanity: the environment is genuinely visible (not accidentally zero
+    // for some unrelated reason) -- otherwise the ratio check below would
+    // be vacuous (0 ~= 0.5*0).
+    CHECK(unoccludedPixel.r > 20);
 
     std::vector<uint8_t> halfStrengthBlob = makeDefaultStandardPbrBlob(*rig, handle);
     setParam(halfStrengthBlob, params, "occlusionTexture", blackOcclusionTex);
@@ -1297,11 +1339,12 @@ TEST_CASE("StandardPBR: occlusion closed-form -- R=0,strength=1 zeroes ambient e
     setParam(halfStrengthBlob, params, "metallicFactor", 1.0F);
     Rgba8 halfStrengthPixel = renderOne(*rig, handle, halfStrengthBlob, row);
 
-    // occlusion = 1.0 + 0.5*(0-1.0) = 0.5 exactly -> ambient = 0.5*0.5*1 =
-    // 0.25 -> 0.25*255 ~= 64.
-    CHECK(near8(halfStrengthPixel.r, 64, 8));
-    CHECK(near8(halfStrengthPixel.g, 64, 8));
-    CHECK(near8(halfStrengthPixel.b, 64, 8));
+    // occlusion = 1.0 + 0.5*(0-1.0) = 0.5 exactly -> ibl_half == 0.5 *
+    // ibl_full, a real closed-form RATIO (not an absolute constant this
+    // test would otherwise have to re-derive from the split-sum formula).
+    CHECK(near8(halfStrengthPixel.r, static_cast<int>(std::lround(unoccludedPixel.r * 0.5)), 6));
+    CHECK(near8(halfStrengthPixel.g, static_cast<int>(std::lround(unoccludedPixel.g * 0.5)), 6));
+    CHECK(near8(halfStrengthPixel.b, static_cast<int>(std::lround(unoccludedPixel.b * 0.5)), 6));
 
     // [Fix round, item 5b -- coordinator ruling] Occlusion is
     // INDIRECT-only: it must NOT attenuate direct light at all (an earlier
@@ -1341,6 +1384,7 @@ TEST_CASE("StandardPBR: occlusion closed-form -- R=0,strength=1 zeroes ambient e
     CHECK(near8(directOccludedPixel.g, directUnoccludedPixel.g, 2));
     CHECK(near8(directOccludedPixel.b, directUnoccludedPixel.b, 2));
 
+    env->destroySamplers(rig->fixture->device.device());
     destroyRig(*rig);
     CHECK_FALSE(rig->fixture->context.hasValidationErrors());
 }
@@ -1450,8 +1494,12 @@ TEST_CASE("StandardPBR: Lambertian diffuse matches NdotL x baseColor / pi within
     CHECK_FALSE(rig->fixture->context.hasValidationErrors());
 }
 
-TEST_CASE("StandardPBR: FG1 ambient closed-form non-black-metal probe -- a fully metallic surface with zero "
-          "direct light still reads ambientColor x occlusion x baseColor") {
+TEST_CASE("StandardPBR: FG1 discrimination -- a fully metallic, zero-direct-light probe that USED TO read the "
+          "retired flat-ambient closed form (ambientColor x occlusion x baseColor, ~(82,20,20)/255) now reads "
+          "BLACK when no environment is bound, and the OLD formula's own predicted value fails the D17 tolerance "
+          "against the NEW render by a wide margin -- the gate matrix's own 'regenerated references must FAIL "
+          "against the Phase-4 flat-ambient renderer's own tolerance' requirement, reproduced directly as a real "
+          "gate-flip rather than an old-commit checkout (see this TEST_CASE's own body for why)") {
     auto rig = makeStandardPbrRig("standard_pbr_ambient_metal");
     if (!rig.has_value()) {
         return;
@@ -1467,21 +1515,52 @@ TEST_CASE("StandardPBR: FG1 ambient closed-form non-black-metal probe -- a fully
 
     rx::material::DrawDataGpu row = makeHeadOnRow();
     row.lightDirWorld = glm::vec4(0.0F, 0.0F, -1.0F, 0.0F);  // light BEHIND -> zero direct contribution (NdotL=0).
+    // [Phase 5 Task 10, #46] `ambientColor` is set to the EXACT SAME value
+    // the pre-T10 version of this test used (0.4) -- deliberately: this
+    // is the RETIRED FIELD (MaterialVertex::ambientColor's own header
+    // comment), still populated here to prove the shader genuinely does
+    // not read it any more (a zeroed field wouldn't discriminate "never
+    // read" from "read but happens to be zero"). No environment is bound
+    // (`row`'s own `env*` fields stay at their default "no environment"
+    // sentinel, DrawDataGpu's own default) -- the exact scenario the
+    // matrix's discrimination row names: a scene that never opts into
+    // IBL now gets NO indirect contribution at all.
     row.ambientColor = glm::vec4(0.4F, 0.4F, 0.4F, 0.0F);
     Rgba8 pixel = renderOne(*rig, handle, blob, row);
 
-    // Fully metallic -> diffuseColor=0; specular also vanishes here
-    // because NdotL clamps to 0 (this rig's directLight multiplies by
-    // NdotL). occlusion=1 (no occlusion texture bound -> white fallback).
-    // ambient = ambientColor x occlusion x baseColor = 0.4 x 1 x
-    // (0.8,0.2,0.2) = (0.32,0.08,0.08) -> ~(82,20,20)/255 -- a real, loud,
-    // NON-BLACK result despite zero direct light and full metalness, the
-    // exact scenario D22's FG1 amendment exists to fix ("metals must not
-    // render black without IBL").
-    CHECK(near8(pixel.r, 82, 12));
-    CHECK(near8(pixel.g, 20, 12));
-    CHECK(near8(pixel.b, 20, 12));
-    CHECK(pixel.r > 0);  // the non-black assertion itself.
+    // THE discrimination assertion: fully metallic + zero direct light +
+    // no environment bound now reads BLACK -- not the old FG1 ambient
+    // closed form. This is the exact FLIP of what this TEST_CASE asserted
+    // before this task (a real, provable gate-flip, not a hypothetical).
+    CHECK(pixel.r == 0);
+    CHECK(pixel.g == 0);
+    CHECK(pixel.b == 0);
+
+    // Quantified pixel-diff against the OLD renderer's own predicted
+    // value, exceeding the D17 gate's own tolerance (+-4/255 per channel,
+    // samples/common/reference_gate.h) by a WIDE margin -- the matrix's
+    // own "quantified pixel-diff exceeding whatever tolerance the old
+    // gate used" acceptance line, applied directly rather than via a
+    // fragile checked-out-prior-commit build (this codebase's SPIR-V/
+    // MaterialSystem pipeline has no supported "load two different
+    // standard_pbr.slang versions in one process" path -- the OLD
+    // formula's own closed form, unchanged arithmetic, ambient x
+    // occlusion x baseColor = 0.4 x 1.0 x (0.8,0.2,0.2), is reproduced
+    // here as a plain host-side computation instead, which is exactly
+    // what "the old renderer's own tolerance" MEANS for a formula this
+    // simple and already closed-form-verified by this file's own git
+    // history before this task).
+    constexpr int kD17ToleranceUnits = 4;  // samples/common/reference_gate.h's own +-4/255 budget.
+    constexpr std::array<float, 3> kOldFormulaPrediction{0.4F * 0.8F, 0.4F * 0.2F, 0.4F * 0.2F};  // ~(82,20,20)/255.
+    const std::array<uint8_t, 3> newPixel{pixel.r, pixel.g, pixel.b};
+    for (size_t channel = 0; channel < 3; ++channel) {
+        const int oldPrediction8 = static_cast<int>(std::lround(kOldFormulaPrediction[channel] * 255.0F));
+        const int delta = std::abs(static_cast<int>(newPixel[channel]) - oldPrediction8);
+        INFO("channel=", channel, " new=", static_cast<int>(newPixel[channel]), " oldPrediction=", oldPrediction8,
+             " delta=", delta);
+        CHECK(delta > kD17ToleranceUnits);
+    }
+
     destroyRig(*rig);
     CHECK_FALSE(rig->fixture->context.hasValidationErrors());
 }
@@ -2021,9 +2100,30 @@ TEST_CASE("StandardPBR per-slot sampler wiring: baseColorSampler/emissiveSampler
     // same reasoning as the rx_asset-level test).
     const std::array<float, 4> kProbeUvTransform{0.0F, 0.625F, 1.0F, 1.0F};
 
+    // [Phase 5 Task 10, #46] This test's own "make the sampled texel show
+    // up unmistakably in the final pixel" vehicle is now DIRECT light, not
+    // the retired `ambientColor` flat term (see MaterialVertex::
+    // ambientColor's own header comment). makeDefaultStandardPbrBlob()'s
+    // own metallicFactor default is 1.0 (glTF's own spec default), so the
+    // baseColor-isolated case's only direct-light contribution is the
+    // METAL-TINTED specular lobe (F0 = lerp(dielectric, baseColor,
+    // metallic=1) == baseColor.rgb exactly, and at this rig's head-on
+    // angles VdotH==1 makes Fresnel == F0 exactly too, per F_Schlick's own
+    // (1-VoH)^5==0 -- diffuseColor is zero for a fully metallic surface,
+    // matching standard_pbr.slang's own `diffuseColor = baseColor.rgb *
+    // (1-metallic)`) -- a bright (well beyond 1.0) light color pushes that
+    // tinted specular past the UNORM store's own clamp to a crisp 255 on
+    // the tinted channel, giving the SAME near-pure-RED/near-pure-BLUE
+    // discrimination signal the ambient-based version used to, for a
+    // reason entirely orthogonal to what this test actually probes
+    // (baseColor/emissive SAMPLER wrap-mode wiring, not lighting). The
+    // emissive-isolated case needs no such margin at all: its own
+    // baseColorFactor is BLACK, so F0 (and therefore the entire direct-
+    // light response) is exactly zero regardless of light brightness --
+    // emissive alone reaches the target texel's blue channel there.
     rx::material::DrawDataGpu isolatedRow = makeHeadOnRow();
-    isolatedRow.ambientColor = glm::vec4(1.0F, 1.0F, 1.0F, 0.0F);
-    isolatedRow.lightColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
+    isolatedRow.ambientColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);  // retired, inert.
+    isolatedRow.lightColor = glm::vec4(16.0F, 16.0F, 16.0F, 0.0F);
 
     // `baseColorSamplerValue`/`emissiveSamplerValue` are passed through
     // explicitly (not hardcoded inside this lambda) so the revert-proof
@@ -2082,21 +2182,25 @@ TEST_CASE("StandardPBR per-slot sampler wiring: baseColorSampler/emissiveSampler
     CHECK_FALSE(rig->fixture->context.hasValidationErrors());
 }
 
-TEST_CASE("Camera pre-exposure: rx::scene::Camera::exposure() pre-multiplies the ambient term's own RxDrawData "
-          "source exactly [Phase 5 Task 4/#40, gate ruling rulings-2026-08-20.md T4 -- PRE-EXPOSURE, not a "
-          "post-tonemap multiply]") {
+TEST_CASE("Camera pre-exposure: rx::scene::Camera::exposure() pre-multiplies the direct-light term's own "
+          "RxDrawData source exactly [Phase 5 Task 4/#40, gate ruling rulings-2026-08-20.md T4 -- PRE-EXPOSURE, "
+          "not a post-tonemap multiply; REWRITTEN for Phase 5 Task 10, #46: `lightColor` replaces the retired "
+          "`ambientColor` as this test's own isolation vehicle -- see MaterialVertex::ambientColor's own header "
+          "comment. `lightColor`'s own pre-exposure convention is UNCHANGED by T10 (it was never the retired "
+          "field); this rewrite only changes WHICH already-pre-exposed field the test isolates, not what's "
+          "being proven]") {
     // [Phase 5 Task 4/#40] Supersedes the old "--exposure: 2^exposure
     // pre-tonemap multiply" test: MaterialGlobalsPush no longer carries an
     // `exposure` field at all (material.slang's own `RxMaterialGlobals`
     // header comment), and forward_entry.slang's fragmentMain no longer
     // post-multiplies the shaded color -- exposure is now baked into
-    // RxDrawData's own `lightColor`/`ambientColor` fields BEFORE upload,
-    // by whichever CPU-side code produces a draw-data row (samples/
-    // 08_gltf_viewer's own updateDrawDataPerPassFields(), for the real
-    // production case). This test simulates that same "at the source"
-    // pre-multiply directly: a real rx::scene::Camera computes
-    // exposure(), and THIS test scales ambientColor by it before
-    // building the row -- exactly what a real producer does.
+    // RxDrawData's own `lightColor`/`ambientColor`/`envIntensity` fields
+    // BEFORE upload, by whichever CPU-side code produces a draw-data row
+    // (samples/08_gltf_viewer's own updateDrawDataPerPassFields(), for the
+    // real production case). This test simulates that same "at the
+    // source" pre-multiply directly: a real rx::scene::Camera computes
+    // exposure(), and THIS test scales `lightColor` by it before building
+    // the row -- exactly what a real producer does.
     auto rig = makeStandardPbrRig("standard_pbr_pre_exposure");
     if (!rig.has_value()) {
         return;
@@ -2110,14 +2214,15 @@ TEST_CASE("Camera pre-exposure: rx::scene::Camera::exposure() pre-multiplies the
     setParam(blob, params, "roughnessFactor", 1.0F);
     setParam(blob, params, "baseColorFactor", std::array<float, 4>{0.5F, 0.5F, 0.5F, 1.0F});
 
-    // Isolate the ambient term entirely (zero direct light) so
-    // `color == ambientColor * occlusion(==1.0, default blob) *
-    // baseColor.rgb` exactly [standard_pbr.slang's own evaluate():
-    // `directLight = (diffuse+specular)*v.lightColor*NdotL` is the zero
-    // vector whenever `v.lightColor` is, regardless of NdotL/diffuse/
-    // specular; `ambient = v.ambientColor * occlusion * baseColor.rgb`] --
-    // an exact closed form to assert the pre-exposure SCALE against,
-    // rather than a loose ">" brightness inequality.
+    // Isolate the direct-light term (no environment bound -> zero IBL
+    // contribution, per standard_pbr.slang's own `hasEnvironment` guard)
+    // so `color == (diffuse+specular) * lightColor * NdotL` exactly. At
+    // this rig's own head-on angles (NdotL=NdotV=NdotH=VdotH=1, metallic=0,
+    // roughness=1, glTF-default dielectric F0=0.04/F90=1.0): diffuse =
+    // baseColor/pi = 0.5/pi ~= 0.159155; specular = D*Vis*Fresnel =
+    // (1/pi)*0.25*0.04 ~= 0.0031831 (the SAME closed-form components this
+    // file's own "Lambertian ... within tolerance" TEST_CASE derives,
+    // reused here) -- combined factor k ~= 0.162338 per unit lightColor.
     rx::scene::Camera neutralCamera;  // default-constructed: exposure() == 1.0 exactly [matrix row 4].
     REQUIRE(neutralCamera.exposure() == doctest::Approx(1.0F));
 
@@ -2130,19 +2235,20 @@ TEST_CASE("Camera pre-exposure: rx::scene::Camera::exposure() pre-multiplies the
 
     auto makeRow = [](float exposureMultiplier) {
         rx::material::DrawDataGpu row = makeHeadOnRow();
-        row.lightColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
-        row.ambientColor = glm::vec4(0.4F, 0.4F, 0.4F, 0.0F) * exposureMultiplier;
+        row.ambientColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);  // retired, inert.
+        row.lightColor = glm::vec4(1.0F, 1.0F, 1.0F, 0.0F) * exposureMultiplier;
         return row;
     };
 
     Rgba8 neutralPixel = renderOne(*rig, handle, blob, makeRow(neutralCamera.exposure()));
     Rgba8 brighterPixel = renderOne(*rig, handle, blob, makeRow(brighterCamera.exposure()));
 
-    // Exact closed form: color.r == (0.4 * exposureMultiplier) * baseColor.r.
-    // Neutral: 0.4 * 1.0 * 0.5 == 0.2 -> 0.2*255 == 51.0 exactly.
-    CHECK(near8(neutralPixel.r, 51, 2));
-    // Brighter: 0.4 * (5/3) * 0.5 == 1/3 -> (1/3)*255 == 85.0 exactly.
-    CHECK(near8(brighterPixel.r, 85, 2));
+    // Closed form: color.r == k * exposureMultiplier, k ~= 0.162338 (this
+    // TEST_CASE's own derivation above).
+    // Neutral: k * 1.0 ~= 0.162338 -> *255 ~= 41.4.
+    CHECK(near8(neutralPixel.r, 41, 4));
+    // Brighter: k * (5/3) ~= 0.270563 -> *255 ~= 69.0.
+    CHECK(near8(brighterPixel.r, 69, 4));
 
     // Genuinely LINEAR in the exposure multiplier (the value-asserted
     // "EV100 input -> expected scaled radiance" end-to-end proof) -- the

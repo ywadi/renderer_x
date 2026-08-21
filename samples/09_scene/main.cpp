@@ -958,6 +958,12 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
     // section) round out the remaining headroom.
     rx::rhi::BindlessTable::Capacities capacities{/*sampledImages=*/256, /*samplers=*/32, /*storageBuffers=*/8};
     capacities.comparisonSamplers = 1;
+    // [Phase 5 Task 10, #46] material.slang now unconditionally declares
+    // `gTexturesCube` at binding 4 -- same requirement as
+    // `comparisonSamplers` above. This sample does not bind a Scene
+    // environment (out of this ticket's own file list), so headroom of 1
+    // is never actually exercised, only structurally required.
+    capacities.cubeImages = 1;
     auto bindless = rx::rhi::BindlessTable::create(app->device->physicalDevice(), app->device->device(), capacities);
     if (!bindless.has_value()) {
         RX_LOG_ERROR("sample_09_scene: BindlessTable::create failed");

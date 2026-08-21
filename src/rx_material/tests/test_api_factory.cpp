@@ -87,6 +87,10 @@ std::optional<ApiTestFixture> makeFixture(const char* title) {
     // [Phase 4 Stage 2 Task 22 fix round, F1] Same requirement as
     // test_material_system.cpp's own identical comment.
     capacities.comparisonSamplers = 1;
+    // [Phase 5 Task 10, #46] material.slang now unconditionally declares
+    // `gTexturesCube` at binding 4 -- same requirement as
+    // `comparisonSamplers` above.
+    capacities.cubeImages = 1;
     auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
     REQUIRE(bindless.has_value());
 
