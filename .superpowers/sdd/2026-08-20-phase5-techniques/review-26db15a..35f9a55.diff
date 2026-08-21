@@ -1,0 +1,1701 @@
+# Review package: 26db15a..35f9a55
+
+## Commits
+35f9a55 chore: p5 task 4 SDD report
+8dab009 feat(rx_scene): camera exposure + physical-units API, pre-exposure convention (#40)
+
+## Files changed
+ .../2026-08-20-phase5-techniques/task-04-report.md | 278 +++++++++++++++++++++
+ samples/08_gltf_viewer/main.cpp                    | 113 +++++++--
+ samples/09_scene/main.cpp                          |  21 +-
+ shaders/material/forward_entry.slang               |  19 +-
+ shaders/material/material.slang                    |  34 +--
+ src/rx_material/include/rx_material/draw_data.h    |  13 +-
+ src/rx_material/material_system.cpp                |   7 +-
+ src/rx_material/tests/CMakeLists.txt               |   7 +-
+ .../tests/test_standard_pbr_shadow_gpu.cpp         |   1 -
+ src/rx_material/tests/test_standard_pbr_unlit.cpp  | 102 +++++---
+ src/rx_scene/camera.cpp                            |  40 +++
+ src/rx_scene/include/rx_scene/camera.h             | 144 ++++++++++-
+ src/rx_scene/tests/camera_test.cpp                 | 125 +++++++++
+ 13 files changed, 811 insertions(+), 93 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-20-phase5-techniques/task-04-report.md b/.superpowers/sdd/2026-08-20-phase5-techniques/task-04-report.md
+new file mode 100644
+index 0000000..e44b15e
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-20-phase5-techniques/task-04-report.md
+@@ -0,0 +1,278 @@
++# Task 4 report — Camera exposure + physical-units API (issue #40)
++
++Implementer round. Base: main `26db15a`. Order of authority followed:
++rulings (`rulings-2026-08-20.md`, "T4 (#40)") > plan (Task 4) > gate matrix
++(`matrix-p5t04-camera-exposure.md`) > ticket (#40).
++
++## Status: COMPLETE
++
++All matrix rows (as ruled) satisfied. Both presets green. Real-driver
++(NVIDIA GeForce RTX 2080) and lavapipe full-suite runs both clean, zero
++unfiltered validation errors. Default (`exposure=0.0`/no-flag) output
++proven byte-identical on lavapipe — no reference regeneration.
++
++## What shipped
++
++**`rx::scene::Camera` gains a physical-units exposure API
++(`src/rx_scene/include/rx_scene/camera.h`/`camera.cpp`), superseding D22
++wholesale:**
++- `rx::scene::exposure::{ev100, exposure}` — pure free functions ported
++  byte-for-byte from Filament's `Exposure.cpp` (google/filament **v1.75.0**,
++  commit `0e58877c09afb1aacd09ff640f74d2adcd2a7e80`, Apache-2.0 — fetched
++  and diffed against this exact tag via `gh api ...?ref=v1.75.0` this
++  session, not paraphrased from docs; tag SHA independently verified via
++  `gh api repos/google/filament/git/refs/tags/v1.75.0` to match RC1's pin).
++  `ev100(N,t,S) = log2((N²/t)·(100/S))`; the merged
++  `exposure(N,t,S) = 1/(1.2·(N²/t)·(100/S))`; `exposure(ev100) =
++  1/(1.2·2^ev100)`. The `1.2` constant is the exact saturation-based-
++  sensitivity derivation (`78/(100·0.65)`), not a tunable — cited in the
++  header comment, matching this codebase's own constant-citation
++  discipline.
++- `Camera::aperture`/`shutterSpeed`/`sensitivity` — Filament's own
++  `Camera.h` defaults verbatim (`16.0F`, `1/125F`, `100.0F`,
++  `details/Camera.h:211-213` v1.75.0).
++- `Camera::ev100()` / `Camera::exposure()` — the triple-derived EV100 and
++  the pre-exposure multiplier every light/IBL-intensity producer this
++  ruling binds must apply to its own values.
++- `Camera::exposureOverride` (`std::optional<float>`, defaults engaged at
++  exactly `1.0F`) — the mechanism resolving the matrix's own flagged
++  tension (row 1 vs. row 4/Conflicts row 2): Filament's real photographic
++  defaults do NOT resolve to a neutral multiplier (`ev100≈14.97`,
++  `exposure≈2.6e-5`), so the override — not the triple — is what makes a
++  freshly-constructed `Camera::exposure() == 1.0` exactly, the load-bearing
++  D17 regression default.
++- `Camera::setExposure(aperture, shutterSpeed, sensitivity)` — Filament's
++  exact clamp ranges ported (`details/Camera.cpp:45-50`: aperture
++  [0.5,64], shutterSpeed [1/25000,60]s, sensitivity [10,204800] ISO);
++  clears the override.
++- `Camera::setExposure(float ev100Override)` — direct override overload
++  (matrix row 1's own proposed shape; row 6's "no literal Filament
++  Camera-level precedent" flagged and documented — only Filament's free
++  `Exposure::exposure(float ev100)` exists, never wired onto `FCamera`).
++- `Camera::clearExposureOverride()` — restores the same neutral state a
++  fresh `Camera` starts with.
++
++**Filament-style PRE-EXPOSURE adopted (ruling, matrix row 3), not a
++post-tonemap/post-shading multiply:**
++- `material.slang`'s `RxMaterialGlobals` push-constant struct LOST its
++  `exposure` field entirely (was: `defaultSamplerIndex`,
++  `drawDataBufferIndex`, `exposure`; now: the first two only — 8 bytes,
++  not 12). `rx::material::MaterialGlobalsPush` (`draw_data.h`) mirrors
++  this exactly, `static_assert`-pinned at 8 bytes.
++- `forward_entry.slang`'s fragmentMain — the old
++  `color.rgb *= exp2(gMaterialGlobals.exposure);` post-multiply is
++  **deleted**, not left dormant (matrix row 5's own explicit "double-
++  application" failure-mode warning).
++- Exposure now multiplies each `RxDrawData` producer's own
++  `lightColor`/`ambientColor` BEFORE upload — "at the source", matching
++  Filament's `View.cpp` (`prepareAmbientLight`/`prepareDirectionalLight`,
++  both fed a single per-frame `exposure` computed from `cameraInfo.ev100`,
++  verified first-hand against v1.75.0 this session).
++- `samples/08_gltf_viewer/main.cpp`: `App::exposureCamera` (a real
++  `rx::scene::Camera`) replaces the old bare `float exposure` field.
++  `updateDrawDataPerPassFields()` scales its own `lightColor`/
++  `ambientColor` locals by `exposureCamera.exposure()` before writing
++  each row. `--exposure`'s CLI flag is preserved AS A FLAG, but its VALUE
++  now feeds `Camera::setExposure(float ev100Override)` directly (matrix
++  row 5's own sanctioned mapping) — **with one deliberate, documented
++  sentinel**: `args.exposure == 0.0F` (the flag's own pre-Task-4 "0 ==
++  neutral" default) does NOT call `setExposure()` at all, leaving
++  `exposureCamera` at its own default-constructed neutral state
++  (`exposure()==1.0` exactly) — see "Deviations" for why this, not
++  "feed 0.0 through the formula", is what the byte-identical regression
++  guard actually requires. Shared by both entry points via a new
++  `applyExposureArg()` helper.
++- `samples/09_scene/main.cpp`: wired for coherence (no half-migrated
++  consumer) even though this sample has no `--exposure` CLI control of
++  its own — `updateSceneFrame()` now scales its own `lightColor`/
++  `ambientColor` locals by `app.flyCamera.camera.exposure()` (its own
++  real `rx::scene::Camera`, `fly_camera.h`), a no-op today (always
++  neutral) but future-proofed.
++- `material_system.cpp`'s `bindInstance()` legacy default-row path: just
++  drops the now-nonexistent `push.exposure = 0.0F;` line (was never wired
++  to `--exposure` control either way — unaffected by the ruling).
++
++**Tests added/rewritten (all passing, both presets, both drivers):**
++- `src/rx_scene/tests/camera_test.cpp` — 6 new device-free `TEST_CASE`s:
++  a 5-triple `ev100()`/`exposure()` formula table (bright daylight through
++  bright-sun-narrow-aperture, `doctest::Approx(...).epsilon(0.0001)`,
++  matching this file's own established tolerance idiom) against
++  independently-computed (python3, double precision) reference values;
++  Filament-default-triple pin; the neutral-1.0-default proof (explicitly
++  distinguishing it from what the triple's own math would give);
++  `setExposure(triple)` clamp-range + override-clearing proof;
++  `setExposure(ev100Override)` triple-independence proof; `clearExposureOverride()`
++  round-trip proof.
++- `src/rx_material/tests/test_standard_pbr_unlit.cpp` — the old
++  "`--exposure`: 2^exposure pre-tonemap multiply" `TEST_CASE` (which
++  pushed a push-constant scalar, now impossible) is **replaced**, not
++  patched, by "Camera pre-exposure: ..." — a genuinely value-asserted
++  GPU test: isolates the ambient term to an exact closed form
++  (`color == ambientColor·occlusion(1.0)·baseColor`, zero direct light),
++  drives it with two real `rx::scene::Camera` instances (neutral default,
++  and `setExposure(-1.0F)` → `exposure()==5/3` exactly), asserts the
++  EXACT expected 8-bit pixel values (51 and 85, both exact rational
++  fractions of 255, not hand-waved), AND asserts the measured brightness
++  RATIO matches `exposure()`'s own ratio (not its square) — the explicit
++  double-application-revert discriminator the matrix's own "New gaps"
++  section flagged as having no existing precedent in this codebase.
++  `DrawRequest`/`renderOne()` lost their now-meaningless `exposure`
++  parameter; every other call site (46 others) unaffected since the
++  parameter always defaulted to the now-neutral no-op value.
++  `rx_material_gpu_tests` gained a `rx_scene` link dependency (CMakeLists)
++  for this one test.
++- `src/rx_material/tests/test_standard_pbr_shadow_gpu.cpp`,
++  `src/rx_material/material_system.cpp`,
++  `samples/09_scene/main.cpp` — dead `push.exposure = 0.0F;` /
++  `MaterialGlobalsPush{..., 0.0F}` sites removed (would not compile
++  otherwise; `MaterialGlobalsPush` is now a 2-field aggregate).
++
++## Per-row proof (matrix)
++
++| # | Criterion | Disposition | Evidence |
++|---|---|---|---|
++| 1 | `Camera` gains aperture/shutter/ISO + EV100/exposure helpers + direct override, replacing tonemap-side `--exposure` | Delivered | `camera.h`/`camera.cpp`; Filament defaults verbatim; `setExposure` overload pair |
++| 2 | EV100/exposure math matches Filament reference values | Delivered | `camera_test.cpp`'s 5-triple table, `epsilon(0.0001)`, `1.2` constant cited with derivation |
++| 3 | Pre-exposure vs. full-float ruling | **Ruling adopted verbatim** (pre-exposure) | `RxMaterialGlobals`/`MaterialGlobalsPush` exposure field removed; light/ambient scaled at source in both samples |
++| 4 | Neutral-value regression guard: default reproduces Phase 4 output byte-identically | Delivered, verified not assumed | `defaultCamera.exposure()==Approx(1.0F)` (device-free) + lavapipe D17 gates 0/65536 failing pixels, both samples 08/09 |
++| 5 | Exposure applied exactly once, pre-tonemap, documented pipeline point; `--exposure` migrates with behavior preserved | Delivered | Old post-multiply site deleted (not dormant); linearity (not squared-ratio) GPU test; CLI flag preserved with documented sentinel semantics |
++| 6 | `setExposure` direct-override API shape | Delivered per matrix's own recommendation | `setExposure(float)` overload, `exposureOverride` mechanism, documented as a RendererX extension beyond literal Filament `Camera` |
++
++## Deviations from the matrix's stated expectation
++
++**Row 4's own Conflicts #2 flagged that Filament's real camera defaults
++(16, 1/125, 100) do NOT resolve to `exposure()==1.0`, and left the exact
++resolution mechanism to the implementer.** Resolved via
++`exposureOverride` defaulting ENGAGED at `1.0F` (not derived from the
++triple) — the triple itself still holds Filament's real defaults (so
++`ev100()` reads a genuine `~14.97` out of the box), but `exposure()`
++(what actually reaches `RxDrawData`) reads neutral until a caller
++explicitly calls `setExposure(...)`. This is the ONLY design that
++satisfies both row 1 ("Filament's exact defaults as RendererX's own
++defaults") and row 4 ("must resolve to a multiplier of exactly 1.0")
++simultaneously — verified directly, not asserted, by
++`camera_test.cpp`'s "default-constructed Camera resolves to a neutral
++(1.0) multiplier despite its non-neutral photographic defaults" case.
++
++**Sample 08's `--exposure` CLI flag: `0.0F` is a sentinel, not "ev100=0
++fed through the formula".** Matrix row 5 sanctions feeding the flag's raw
++value into `Camera::setExposure(ev100Override)` directly — but doing that
++literally for the flag's own DEFAULT value (`0.0F`, unchanged from Phase
++4, meaning "0 == neutral") would resolve to `exposure(0.0)≈0.833`, not
++`1.0`, silently breaking the D17 byte-identical default. `applyExposureArg()`
++therefore skips the `setExposure()` call entirely when `args.exposure ==
++0.0F`, leaving `exposureCamera` at its own default neutral state. This is
++the one place this task's own CLI-flag migration is NOT a literal
++1:1 formula feed — documented at three sites (`Args::exposure`,
++`App::exposureCamera`, `applyExposureArg()`) so a future reader does not
++mistake it for an oversight. Verified empirically: `sample_08_gltf_viewer
++--validate` (no `--exposure`) on lavapipe reproduces its committed
++reference at 0/65536 failing pixels for BOTH captured frames;
++`--exposure -1.0` (a real, non-neutral override, `exposure()==5/3`)
++measurably diverges (5598/65536, 8.54%) confirming the plumbing is live,
++not merely a no-op.
++
++**No reference-PNG regeneration.** Both sample 08 (`loading_state` +
++`loaded_scene`) and sample 09 (`grid_scene`) D17 gates measured
++`failingPixels=0/65536 (0.0000%)` on lavapipe with this task's changes,
++zero regeneration run.
++
++## Both-preset / both-driver verification (command tails)
++
++Lavapipe, full suite, linux-native:
++```
++VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json xvfb-run -a ctest --test-dir build/linux-native --output-on-failure -j1
++...
++100% tests passed, 0 tests failed out of 29
++Total Test time (real) =  80.69 sec
++```
++
++Real driver (NVIDIA GeForce RTX 2080, default ICD, full suite):
++```
++ctest --test-dir build/linux-native --output-on-failure -j4
++...
++100% tests passed, 0 tests failed out of 29
++Total Test time (real) =  69.97 sec
++```
++D17 gate specifically, real driver: `loading_state` failingPixels=0/65536
++pass=true; `loaded_scene` failingPixels=425/65536 (0.6485%) pass=false
++`[non-lavapipe driver -- informational only, not enforced]`; overall
++`headless gate PASSED` — this is PRE-EXISTING Phase-4 driver-divergence
++behavior (same shape T3's report already documented for its own change),
++unrelated to this task.
++
++Windows-cross-zig, full build + Wine ctest (T2/T3's own exclusion
++pattern):
++```
++ninja                                    # 38/38, zero errors
++xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_debug_ui_gpu|sample' --output-on-failure
++...
++100% tests passed, 0 tests failed out of 13
++Total Test time (real) = 123.43 sec
++```
++
++Direct lavapipe D17 re-verification (both samples, isolated ICD):
++```
++VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json ./sample_08_gltf_viewer --validate
++  D17 loading_state gate: failingPixels=0/65536 (0.0000%) pass=true
++  D17 loaded_scene gate:  failingPixels=0/65536 (0.0000%) pass=true
++  headless gate PASSED
++
++VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json ./sample_09_scene --validate
++  D17 grid_scene gate: failingPixels=0/65536 (0.0000%) pass=true
++  headless gate PASSED
++
++VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json ./sample_08_gltf_viewer --validate --exposure -1.0
++  D17 loaded_scene gate: failingPixels=5598/65536 (8.5419%) pass=false   # expected: real exposure change, not a bug
++```
++
++`rx_material_gpu_tests --validate`: 57/57 test cases, 2549/2549
++assertions, zero unfiltered validation errors (every "[vulkan validation]"
++line matches this codebase's own pre-existing documented false-positive
++filter set).
++
++## Self-review
++
++- **TDD discipline**: exact Filament formulas fetched and verified
++  first-hand (`gh api`) BEFORE any implementation code was written;
++  `camera_test.cpp`'s table test's expected values computed independently
++  (python3) from the cited formulas, not reverse-fitted from the port's
++  own output; the pre-exposure GPU test's expected pixel values (51, 85)
++  derived algebraically from the exact closed form before running, then
++  confirmed to match.
++- **No deferred fixes**: every `MaterialGlobalsPush`/`RxMaterialGlobals`
++  call site touched by the field removal was found and fixed in this
++  round (9 additional aggregate-init sites in
++  `test_standard_pbr_unlit.cpp` beyond the ones first spotted by grep —
++  caught by the build failing, not missed).
++- **Revert-discrimination**: the pre-exposure GPU test's ratio assertion
++  is the explicit double-application-revert proof (a stray leftover
++  post-multiply would measure the SQUARE of the expected ratio, not the
++  ratio itself) — this is a genuinely new test pattern for this codebase,
++  as the matrix's own "New gaps" section flagged.
++- **No AI attribution**: none added anywhere (commit messages, code
++  comments, this report).
++- **Commit scope**: pathspec-scoped to exactly the files listed under
++  "What shipped" above; `.superpowers/sdd/2026-08-20-phase5-techniques/
++  progress.md` is concurrently modified by another agent in this shared
++  tree (confirmed via `git status` throughout this session, not present
++  in this task's own diff) and is deliberately excluded from this commit.
++- **Scope discipline**: no Stage 1 IBL / Stage 2 physical-light work
++  attempted — this task lands the `Camera` API + the pre-exposure
++  CONVENTION only, exactly as the matrix's own row 5 scopes it ("Task 4
++  itself has no direct lighting to pre-expose yet").
++- **Concerns for the coordinator**: (1) `setExposure(float ev100Override)`
++  has no literal 1:1 Filament `Camera`-class precedent (row 6's own
++  finding, confirmed independently this session — only the free
++  `Exposure::exposure(float ev100)` function exists) — flagged in code
++  comments as a RendererX extension, not misrepresented as a direct port;
++  (2) sample 08's `--exposure` flag semantics changed from "2^x brightness
++  multiplier" to "real EV100 stops" (higher now DARKENS, the real-camera
++  convention) for every NON-zero value — a deliberate, matrix-sanctioned
++  change (row 5), but worth the coordinator's awareness since it is a
++  user-facing behavior change to a documented CLI flag, even though the
++  zero/default case is untouched; (3) Stage 1 (IBL, Tasks 9-10) and Stage
++  2 (physical lights, Task 13) are the ruling's actual downstream
++  consumers of this convention — neither exists yet, so this task's
++  pre-exposure wiring currently touches only the two samples' own interim
++  flat-ambient/key-light terms, not a real light/IBL system.
+diff --git a/samples/08_gltf_viewer/main.cpp b/samples/08_gltf_viewer/main.cpp
+index 81e1b37..e9a8b5b 100644
+--- a/samples/08_gltf_viewer/main.cpp
++++ b/samples/08_gltf_viewer/main.cpp
+@@ -34,26 +34,38 @@
+ //
+ // REVERSED-Z: NOT yet -- D13's reversed-Z camera convention arrives with
+ // rx::scene::Camera in Stage 2 (Task 18). This sample uses the SAME
+ // standard-Z convention (near=0/far=1, depth cleared to 1.0, compare-op
+ // LESS) every earlier sample already relies on via MaterialSystem's own
+ // fixed `depthCompareOp` -- a future Stage-2 migration point, not
+ // reproduced here as a TODO beyond this comment.
+ //
+ // TONEMAP: reuses shaders/multipass/tonemap.{vert,frag}.slang VERBATIM
+ // (this task's own binding constraint: "you may NOT touch
+-// shaders/multipass/") -- `--exposure`'s pre-tonemap `2^exposure` multiply
+-// happens INSIDE the material forward pass instead (forward_entry.slang's
+-// own fragmentMain, material.slang's `RxMaterialGlobals::exposure`), so
+-// the shared tonemap shaders' own SPIR-V is byte-for-byte unchanged by
+-// this task -- see the exposure-neutral regression test this sample's own
+-// headless gate runs.
++// shaders/multipass/") -- exposure never touches the tonemap pass at all.
++//
++// EXPOSURE [Phase 5 Task 4/#40, gate ruling rulings-2026-08-20.md T4,
++// superseding this comment's own former D22-era description]: `--exposure`
++// now feeds `App::exposureCamera` (a real `rx::scene::Camera`), a direct
++// EV100 override via `Camera::setExposure(float)` -- Filament-style
++// PRE-EXPOSURE, applied to `updateDrawDataPerPassFields()`'s own
++// lightColor/ambientColor BEFORE they are uploaded into RxDrawData, not a
++// push-constant scalar the forward pass reads (material.slang's
++// `RxMaterialGlobals` no longer has an `exposure` field at all -- see that
++// struct's own header comment). `--exposure`'s DEFAULT (0.0, matching its
++// pre-Task-4 "0 == neutral" contract) intentionally does NOT call
++// setExposure() at all -- `exposureCamera` stays at its own
++// default-constructed neutral (`exposure() == 1.0`) state, which is what
++// keeps this sample's D17 headless gate byte-identical without any
++// reference regeneration (see Args::exposure's own comment for the exact
++// mapping and why 0.0 is a genuinely different case from every other
++// value, not merely "the same formula evaluated at zero").
+ //
+ // D17 TOLERANCE GATE: headless mode captures TWO frames (a loading-state
+ // frame, captured on frame 0 before the async import can possibly have
+ // completed, and a loaded-scene frame, captured once
+ // Registry::importProgress() reaches a terminal state) and compares each
+ // against its own committed 256x256 lavapipe reference PNG via
+ // samples/common/reference_gate.h's reusable tolerance-gate helper
+ // (+-4/255 per channel, <0.5% failing-pixel budget) -- local-GPU
+ // divergence is reported as INFO, never a failure (D17's own text): this
+ // binary detects "am I lavapipe?" via the reported VkPhysicalDeviceProperties
+@@ -138,21 +150,35 @@ constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
+ 
+ // A distinct, unmistakably-not-black "loading" color -- see recordLoadingPass()
+ // below. Chosen to be far from both the tonemapped scene's own likely
+ // palette and pure black/white, so a wrong-frame-shown-instead-of-loading
+ // bug (or vice versa) is visually obvious, not just barely distinguishable.
+ constexpr VkClearColorValue kLoadingClearColor{{0.06F, 0.10F, 0.22F, 1.0F}};
+ 
+ // --- CLI arguments ------------------------------------------------------
+ struct Args {
+     std::string scenePath;  // empty == use the default (DamagedHelmet) resolution.
+-    float exposure = 0.0F;  // pre-tonemap 2^exposure multiplier; 0 == neutral (2^0 == 1).
++    // [Phase 5 Task 4/#40] real EV100 units, fed directly into
++    // `App::exposureCamera.setExposure(float)` (Camera's direct-override
++    // path -- rx_scene/camera.h) -- HIGHER darkens (real camera
++    // convention: more EV100 means less exposure needed), unlike the
++    // Phase-4 `2^exposure` knob this superseded (where higher always
++    // brightened). 0.0F is a SENTINEL, not "ev100=0 fed through the
++    // formula" (which would resolve to a non-neutral ~0.833 multiplier,
++    // per rx::scene::exposure::exposure()'s own Filament-ported math): it
++    // means "no override requested at all", leaving `exposureCamera` at
++    // its own default-constructed neutral state (`exposure() == 1.0`
++    // exactly) -- the load-bearing D17 byte-identical-regression default,
++    // preserving this flag's pre-Task-4 "0 == neutral" contract exactly
++    // even though its non-zero semantics changed to real photographic
++    // units.
++    float exposure = 0.0F;
+     rx::rhi::PresentMode vsyncMode = rx::rhi::PresentMode::VsyncOn;
+     bool validate = false;
+     bool present = false;
+     bool quitDuringLoad = false;
+     // [Phase 4 Task 17, FG7] Borderless-desktop fullscreen, applied at
+     // startup only (no in-sample runtime hotkey) -- same present-mode-flag
+     // convention --vsync above already follows.
+     bool fullscreen = false;
+     // [D17] Undocumented-to-users, documented-to-maintainers escape hatch:
+     // when non-empty, runHeadless() WRITES its two captured frames
+@@ -523,23 +549,26 @@ bool buildTonemapPipeline(VkDevice device, rx::shader::Compiler& compiler, VkDes
+ // (offset/size/stages), cached once from `layoutInfo()` per that method's
+ // own CAUTION comment (its returned reference is invalidated by a LATER
+ // loadMaterial() call; setupMaterials() below loads every material before
+ // reading any of them, so copying these three scalars once, here, is safe).
+ //
+ // DELIBERATELY NOT `MaterialSystem::bindInstance()`: that method is the
+ // documented pre-D26.1 LEGACY path (material_system.cpp's own bindInstance()
+ // header comment: "a real D26.1 caller (StandardPBR/Unlit, samples/
+ // 08_gltf_viewer) drives its OWN real per-draw buffer and pushes this same
+ // push-constant range itself, never through this method") -- bindInstance()
+-// always pushes MaterialSystem's own DEFAULT (identity) drawDataBufferIndex
+-// and exposure=0.0, neither of which this sample can use (it has a REAL
+-// per-submesh transform buatch and a real `--exposure`). recordForwardPass()
++// always pushes MaterialSystem's own DEFAULT (identity) drawDataBufferIndex,
++// which this sample cannot use (it has a REAL per-submesh transform batch,
++// addressed by its OWN real drawDataBufferIndex -- see App::exposureCamera's
++// own comment for where this sample's real `--exposure` now lives instead,
++// pre-baked into that buffer's own lightColor/ambientColor, not a push-
++// constant scalar). recordForwardPass()
+ // below (this file) is this sample's own equivalent of bindInstance() --
+ // pipeline bind, push-constant write, descriptor-set-1 bind -- built by hand
+ // against this one small, always-identical (set 1, binding 0,
+ // VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VERTEX|FRAGMENT) reflected shape every
+ // material.slang-conforming module produces [D6/D8's own "one
+ // ParameterBlock<TParams> gParams" convention] -- see App::
+ // materialParamSetLayout's own comment for why a SEPARATELY-created
+ // VkDescriptorSetLayout with identical content is valid to bind against a
+ // pipeline layout MaterialSystem itself built (Vulkan's own "identically
+ // defined" pipeline-layout-compatibility rule, spec 14.2.2), and D27's own
+@@ -790,21 +819,29 @@ struct App {
+     // and never change again (a static scene); `viewProj`/`lightDirWorld`/
+     // `lightColor`/`ambientColor`/`cameraPosWorld` are per-PASS (D26.1's own
+     // "repeated per row" design, draw_data.h) and are overwritten here, every
+     // frame, by updateDrawDataPerPassFields() before the whole vector is
+     // re-uploaded -- simpler than tracking a separate "did the camera move"
+     // dirty flag, and cheap at this sample's draw-call scale.
+     std::vector<rx::material::DrawDataGpu> drawDataRows;
+ 
+     rx::asset::AABB sceneBoundsWorld;
+     OrbitCamera camera;
+-    float exposure = 0.0F;
++    // [Phase 5 Task 4/#40] Exposure ONLY -- OrbitCamera `camera` above
++    // remains this sample's own view/projection source (unchanged scope;
++    // computeViewProj() still builds its own throwaway `rx::scene::Camera`
++    // for cullingProj() alone, per that function's own comment). Default-
++    // constructed: exposure() == 1.0 (neutral) until makeApp()'s caller
++    // applies `args.exposure` via setExposure() -- see Args::exposure's own
++    // comment for why args.exposure==0.0F deliberately does NOT call
++    // setExposure() at all.
++    rx::scene::Camera exposureCamera;
+ 
+     rx::asset::AsyncImportHandle importHandle;
+     bool importStarted = false;
+     bool sceneReady = false;
+ };
+ 
+ // Builds every field up to (but not including) the imported-scene GPU
+ // state -- device/allocator/uploader/bindless/materialSystem/geometryPool/
+ // textureCache/registry/scheduler/executor, the tonemap pipeline, and the
+ // shared material-param descriptor infrastructure. Returns nullptr (logged)
+@@ -1473,25 +1510,39 @@ glm::mat4 computeViewProj(const OrbitCamera& camera, float aspect) {
+ // called only after the caller has confirmed, via its own fence wait, that
+ // frame `frameSlot`'s prior GPU work (the last frame that used this SAME
+ // physical slot) has completed. Both this sample's call sites already
+ // call this after `vkWaitForFences(frameSync->currentFence())` (the
+ // present loop) or with no concurrent GPU work at all (the fully
+ // synchronous headless capture path) -- see App::drawDataBuffers' own
+ // comment for why per-slot addressing, not merely fence-wait ordering
+ // alone, is what closes the I1 finding (a single shared buffer written
+ // after the fence wait still races frame N-1's GPU reads of the OTHER
+ // slot's turn).
++//
++// [Phase 5 Task 4/#40, gate ruling rulings-2026-08-20.md T4] PRE-EXPOSURE:
++// `app.exposureCamera.exposure()` scales `lightColor`/`ambientColor` HERE,
++// at their own source, before this row is ever uploaded -- this is the
++// exact "at its source" call site the gate matrix's row 5 names (this
++// sample's own FG1 flat-ambient/key-light term is the only lighting Phase
++// 4 shipped; there is no separate direct-light/IBL producer yet for this
++// ruling to also touch). NOT a push-constant post-multiply on the shaded
++// color anymore -- material.slang's `RxMaterialGlobals` has no `exposure`
++// field at all (see that struct's own header comment). A default-
++// constructed `exposureCamera` (no `--exposure` flag given) has
++// `exposure() == 1.0` exactly, so this multiply is a byte-identical no-op
++// for this sample's own D17 headless gate in that case.
+ void updateDrawDataPerPassFields(App& app, const glm::mat4& viewProj, const glm::vec3& cameraPosWorld, uint32_t frameSlot) {
+     app.currentFrameSlot = frameSlot;
+     const glm::vec3 lightDirWorld = glm::normalize(glm::vec3(0.4F, 1.0F, 0.6F));
+-    const glm::vec3 lightColor(5.0F, 5.0F, 5.0F);
+-    const glm::vec3 ambientColor(0.18F, 0.18F, 0.18F);
++    const float preExposure = app.exposureCamera.exposure();
++    const glm::vec3 lightColor = glm::vec3(5.0F, 5.0F, 5.0F) * preExposure;
++    const glm::vec3 ambientColor = glm::vec3(0.18F, 0.18F, 0.18F) * preExposure;
+ 
+     const glm::mat4 viewProjTransposed = glm::transpose(viewProj);  // [MATRIX LAYOUT] see draw_data.h.
+     for (rx::material::DrawDataGpu& row : app.drawDataRows) {
+         row.viewProj = viewProjTransposed;
+         row.lightDirWorld = glm::vec4(lightDirWorld, 0.0F);
+         row.lightColor = glm::vec4(lightColor, 0.0F);
+         row.ambientColor = glm::vec4(ambientColor, 0.0F);
+         row.cameraPosWorld = glm::vec4(cameraPosWorld, 0.0F);
+     }
+     const VkDeviceSize bytes = static_cast<VkDeviceSize>(app.drawDataRows.size()) * sizeof(rx::material::DrawDataGpu);
+@@ -1527,32 +1578,34 @@ void recordSceneDraws(VkCommandBuffer cmd, App& app) {
+ 
+         if (!(material.handle == lastPipelineMaterial)) {
+             // [D27] Cache HIT -- setupMaterials() already pre-resolved this
+             // exact (material, forward pass signature, 0) key; this call
+             // never compiles anything, it only looks the cached VkPipeline
+             // up (MaterialSystem::getPipeline()'s own doc comment).
+             VkPipeline pipeline = app.materialSystem->getPipeline({material.handle, passSig, 0});
+             VkPipelineLayout layout = app.materialSystem->pipelineLayout(material.handle);
+             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+ 
+-            // [D26.1] The real per-scene draw-data buffer + this frame's
+-            // real --exposure -- NEVER MaterialSystem::bindInstance()'s own
+-            // default identity row (that method is the documented pre-
+-            // D26.1 legacy path; material_system.cpp's own bindInstance()
+-            // header comment names this sample as the real caller that
+-            // drives its own buffer here instead -- see MaterialGpuBinding's
+-            // own header comment).
++            // [D26.1] The real per-scene draw-data buffer -- NEVER
++            // MaterialSystem::bindInstance()'s own default identity row
++            // (that method is the documented pre-D26.1 legacy path;
++            // material_system.cpp's own bindInstance() header comment
++            // names this sample as the real caller that drives its own
++            // buffer here instead -- see MaterialGpuBinding's own header
++            // comment). [Phase 5 Task 4/#40] No `exposure` field here
++            // anymore -- pre-exposure is already baked into this row's own
++            // lightColor/ambientColor by updateDrawDataPerPassFields()
++            // (see that function's own comment).
+             rx::material::MaterialGlobalsPush push;
+             push.defaultSamplerIndex = app.defaultSamplerHandle.index();
+             // [Phase 4 exit fix wave, I1] `app.currentFrameSlot`-th buffer.
+             push.drawDataBufferIndex = app.drawDataBufferHandles[app.currentFrameSlot].index();
+-            push.exposure = app.exposure;
+             vkCmdPushConstants(cmd, layout, material.pushStages, material.pushOffset, material.pushSize, &push);
+ 
+             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, /*firstSet=*/1, 1,
+                                      &material.paramSet, 0, nullptr);
+ 
+             lastPipelineMaterial = material.handle;
+         }
+ 
+         if (draw.blockId != lastBoundBlock) {
+             app.geometryPool->bind(cmd, draw.blockId);
+@@ -1725,20 +1778,34 @@ bool canonicalizeToRgba8(std::vector<uint8_t>& pixels, VkFormat format) {
+ // [D17] "am I lavapipe?" -- the ONE case this gate enforces a hard PASS/FAIL
+ // verdict for (the committed references were themselves rendered on
+ // lavapipe, tools/regen_references.sh's own documented convention); any
+ // other driver's own divergence is reported as INFO, never a failure.
+ bool isLavapipeDevice(VkPhysicalDevice physicalDevice) {
+     VkPhysicalDeviceProperties props{};
+     vkGetPhysicalDeviceProperties(physicalDevice, &props);
+     return std::string_view(props.deviceName).find("llvmpipe") != std::string_view::npos;
+ }
+ 
++// [Phase 5 Task 4/#40] Applies `args.exposure` to `app.exposureCamera` --
++// see Args::exposure's own comment for why 0.0F (the flag's default,
++// "not passed" and "passed as literal 0.0" both) is a SENTINEL meaning
++// "leave exposureCamera at its own default-constructed neutral state",
++// not "call setExposure(0.0F)" (which would resolve to a non-neutral
++// ~0.833 multiplier and break this sample's own D17 byte-identical
++// regression default). Shared by both entry points (runHeadless/
++// runPresent below) so the sentinel logic lives in exactly one place.
++void applyExposureArg(App& app, const Args& args) {
++    if (args.exposure != 0.0F) {
++        app.exposureCamera.setExposure(args.exposure);
++    }
++}
++
+ // --- Headless mode --------------------------------------------------------
+ // Imports the default (or --scene) glTF asset ASYNCHRONOUSLY, captures a
+ // loading-state frame (before the import can possibly have completed) and a
+ // loaded-scene frame (once it reaches a terminal state), and gates each
+ // against its own committed D17 reference PNG. `--write-references <dir>`
+ // (undocumented escape hatch, Args' own comment) writes the two captures
+ // instead of comparing them -- the only way tools/regen_references.sh
+ // (never auto-run) produces a new reference pair. `--quit-during-load`
+ // starts the import, lets it run for a small BOUNDED number of pumped steps
+ // (enough for >=1 real GPU resource to plausibly have landed), cancels it,
+@@ -1759,21 +1826,21 @@ int runHeadless(const Args& args) {
+     // GUI session profiles when one IS connected (RX_TRACY=ON in this
+     // preset, per CMakePresets.json) -- this is a second, independent,
+     // always-on measurement, not a replacement for them.
+     const auto processStart = std::chrono::steady_clock::now();
+ 
+     auto app = makeApp("RendererX -- 08_gltf_viewer (headless)", kHeadlessWidth, kHeadlessHeight, /*visible=*/false,
+                         args.validate);
+     if (app == nullptr) {
+         return 1;
+     }
+-    app->exposure = args.exposure;
++    applyExposureArg(*app, args);
+ 
+     const std::filesystem::path scenePath =
+         args.scenePath.empty() ? resolveDefaultScenePath() : std::filesystem::path(args.scenePath);
+     if (!std::filesystem::exists(scenePath)) {
+         RX_LOG_ERROR("sample_08_gltf_viewer: scene file not found: '{}'", scenePath.string());
+         destroyApp(*app);
+         return 1;
+     }
+ 
+     const VkDevice vkDevice = app->device->device();
+@@ -2137,21 +2204,21 @@ int runHeadless(const Args& args) {
+ 
+ // --- Present mode: interactive window, real FrameSync loop, mouse-drag
+ // orbit camera [gate ruling #8: SDL mouse state read directly via SDL3's
+ // own global SDL_GetMouseState() -- see this file's own header comment]
+ // --------------------------------------------------------------------
+ int runPresent(const Args& args) {
+     auto app = makeApp("RendererX -- 08_gltf_viewer", kPresentWidth, kPresentHeight, /*visible=*/true, args.validate);
+     if (app == nullptr) {
+         return 1;
+     }
+-    app->exposure = args.exposure;
++    applyExposureArg(*app, args);
+ 
+     // --vsync off, applied before any per-swapchain-image resource is built
+     // -- same ordering samples/05_multipass/06_materials/07_stress already
+     // establish.
+     if (args.vsyncMode == rx::rhi::PresentMode::VsyncOff) {
+         app->device->setPresentMode(args.vsyncMode);
+         if (!app->device->recreateSwapchain(app->surface)) {
+             RX_LOG_ERROR("sample_08_gltf_viewer: Device::recreateSwapchain failed while applying --vsync off");
+             destroyApp(*app);
+             return 1;
+diff --git a/samples/09_scene/main.cpp b/samples/09_scene/main.cpp
+index 0376f7f..103034c 100644
+--- a/samples/09_scene/main.cpp
++++ b/samples/09_scene/main.cpp
+@@ -1990,38 +1990,48 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
+     // the chunked forward pass's own worker chunks never touch them.
+     for (uint32_t blockId = 0; blockId < app.geometryPool->blockCount(); ++blockId) {
+         app.blockBufferCache[blockId] =
+             App::BlockBuffers{app.geometryPool->vertexBufferHandle(blockId), app.geometryPool->indexBufferHandle(blockId)};
+     }
+ 
+     app.drawListBuilder->build(*app.scene, app.flyCamera.camera, scheduler, app.viewLists);
+ 
+     const glm::mat4 viewProjTransposed = glm::transpose(app.flyCamera.camera.viewProj());
+     const glm::vec3 cameraPos = app.flyCamera.camera.position;
++    // [Phase 5 Task 4/#40, gate ruling rulings-2026-08-20.md T4] PRE-EXPOSURE
++    // -- this sample's own FlyCamera already owns a real rx::scene::Camera
++    // (fly_camera.h); this sample has no `--exposure` CLI control of its
++    // own (unlike sample 08), so `exposure()` is always the default
++    // neutral 1.0 today -- wired in anyway so this sample stays
++    // coherently migrated with sample 08's own convention (no
++    // half-migrated consumer of RxDrawData's lightColor/ambientColor
++    // fields) and so a future exposure control on THIS sample needs no
++    // further plumbing here.
++    const float preExposure = app.flyCamera.camera.exposure();
+     const uint8_t lightChannels = app.hud.lightChannelHighlightOn ? 0xFFu : static_cast<uint8_t>(0xFFu & ~kHighlightChannelBit);
+     if (app.scene->isLightAlive(app.lightHandle)) {
+         app.scene->setLightChannels(app.lightHandle, lightChannels);
+     }
+ 
+     const auto transforms = app.scene->transformsSpan();
+     for (size_t i = 0; i < app.viewLists.payloads.size(); ++i) {
+         const rx::scene::DrawPayload& payload = app.viewLists.payloads[i];
+         const glm::mat4& model = transforms[payload.instanceDataIndex];
+         const glm::mat3 normalMat3 = glm::transpose(glm::inverse(glm::mat3(model)));
+ 
+         rx::material::DrawDataGpu& row = app.drawDataRows[i];
+         row.model = glm::transpose(model);
+         row.normalMatrix = glm::transpose(glm::mat4(normalMat3));
+         row.viewProj = viewProjTransposed;
+         row.lightDirWorld = glm::vec4(-glm::normalize(app.lightDirWorld), 0.0F);
+-        row.lightColor = glm::vec4(5.0F, 5.0F, 5.0F, 0.0F);
+-        row.ambientColor = glm::vec4(0.12F, 0.12F, 0.12F, 0.0F);
++        row.lightColor = glm::vec4(5.0F, 5.0F, 5.0F, 0.0F) * preExposure;
++        row.ambientColor = glm::vec4(0.12F, 0.12F, 0.12F, 0.0F) * preExposure;
+         row.cameraPosWorld = glm::vec4(cameraPos, 0.0F);
+         row.materialIndex = payload.materialIndex;
+         // [Phase 4 exit fix wave, C1] Also requires `app.shadowMapHandle.
+         // isValid()` -- NOT just `app.shadowEnabled` -- since the handle is
+         // now (re-)registered lazily, from recordForwardChunk()'s chunk 0,
+         // the first time the graph-owned "shadowmap" transient is realized
+         // (see App::lastShadowMapView's own comment). Before that first
+         // registration (only ever true on the very first frame of a run:
+         // the physical resource is never resized/evicted afterward, so the
+         // handle stays valid and correct for every later frame), rows fall
+@@ -2248,23 +2258,26 @@ void recordForwardChunk(rx::graph::PassContext& ctx, App& app, uint32_t chunkInd
+             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+             lastToken = span.pipelineToken;
+             havePipeline = true;
+         }
+         const uint32_t materialIndex =
+             rx::samples9::materialIndexForSpan(app.viewLists.commands, app.viewLists.payloads, span);
+         if (!haveMaterial || materialIndex != lastMaterialIndex) {
+             const MaterialGpuBinding* mb = app.resolveMaterialIndexToBinding(materialIndex);
+             if (mb != nullptr) {
+                 // [Phase 4 exit fix wave, I1] `app.currentFrameSlot`-th
+-                // buffer -- see that field's own comment.
++                // buffer -- see that field's own comment. [Phase 5 Task
++                // 4/#40] No third (`exposure`) field anymore -- pre-
++                // exposure is baked into this buffer's own rows by
++                // updateSceneFrame() (see that function's own comment).
+                 rx::material::MaterialGlobalsPush push{app.defaultSamplerHandle.index(),
+-                                                         app.drawDataBufferHandles[app.currentFrameSlot].index(), 0.0F};
++                                                         app.drawDataBufferHandles[app.currentFrameSlot].index()};
+                 vkCmdPushConstants(cmd, anyLayout, mb->pushStages, mb->pushOffset, mb->pushSize, &push);
+                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, anyLayout, /*firstSet=*/1, 1, &mb->paramSet, 0,
+                                          nullptr);
+             }
+             lastMaterialIndex = materialIndex;
+             haveMaterial = true;
+         }
+         for (uint32_t i = span.commandOffset; i < span.commandOffset + span.commandCount; ++i) {
+             const rx::scene::DrawCommand& c = app.viewLists.commands[i];
+             vkCmdDrawIndexed(cmd, c.indexCount, c.instanceCount, c.firstIndex, c.vertexOffset, c.firstInstance);
+diff --git a/shaders/material/forward_entry.slang b/shaders/material/forward_entry.slang
+index 45fb445..b1ab22c 100644
+--- a/shaders/material/forward_entry.slang
++++ b/shaders/material/forward_entry.slang
+@@ -203,20 +203,23 @@ float4 fragmentMain(VertexStageOutput input) : SV_Target {
+     v.cameraPosWorld = input.cameraPosWorld;
+ 
+     // Default-constructed: every conforming material struct this engine
+     // links against is data-free by convention (its bound parameters live
+     // in its own module-scope `ParameterBlock<TParams> gParams`, per D8 --
+     // see material.slang's header comment and test_unlit.slang for the
+     // worked example), so there is no instance state to initialize here.
+     MaterialImpl material;
+     float4 color = material.evaluate(v);
+ 
+-    // [Phase 4 Task 16] `--exposure` (samples/08_gltf_viewer): a pre-
+-    // tonemap linear-HDR multiply, applied here (the forward material
+-    // pass) rather than inside the SHARED, UNTOUCHED tonemap shaders
+-    // (shaders/multipass/tonemap.frag.slang) -- see gMaterialGlobals' own
+-    // header comment for why exposure=0.0 (2^0 == 1) is a byte-identical
+-    // no-op regression guard. Alpha is left untouched (exposure is a
+-    // radiometric HDR scale, not a coverage/blend value).
+-    color.rgb *= exp2(gMaterialGlobals.exposure);
++    // [Phase 5 Task 4/#40, gate ruling rulings-2026-08-20.md T4] The
++    // Phase-4 `--exposure` post-multiply that used to sit here
++    // (`color.rgb *= exp2(gMaterialGlobals.exposure);`) is DELETED, not
++    // relocated: Filament-style PRE-EXPOSURE means exposure is already
++    // baked into `v.lightColor`/`v.ambientColor` above (pre-multiplied by
++    // `rx::scene::Camera::exposure()` at each RxDrawData producer's own
++    // CPU-side source, before this pass ever runs), so `material.evaluate()`
++    // above already returns a correctly-exposed color -- a second
++    // multiply here would double-apply exposure. See
++    // gMaterialGlobals' own header comment (material.slang) for the full
++    // ruling.
+     return color;
+ }
+diff --git a/shaders/material/material.slang b/shaders/material/material.slang
+index aba0543..63426be 100644
+--- a/shaders/material/material.slang
++++ b/shaders/material/material.slang
+@@ -310,45 +310,49 @@ public float rx_sampleShadowPCF(uint shadowMapTextureIndex, uint shadowCompareSa
+     for (int dy = -1; dy <= 1; dy++) {
+         for (int dx = -1; dx <= 1; dx++) {
+             float2 tapUv = shadowUv + float2(float(dx), float(dy)) * texelSize;
+             visibility += gTextures[shadowMapTextureIndex].SampleCmp(gShadowCompareSamplers[shadowCompareSamplerIndex], tapUv, compareDepth);
+         }
+     }
+     return visibility / 9.0;
+ }
+ 
+ // [Phase 4 Task 16] Gained `drawDataBufferIndex` (the D26.1 bindless
+-// STORAGE BUFFER index -- see RxDrawData/gDrawData above) and `exposure`
+-// (the sample 08 `--exposure` CLI flag's pre-tonemap `2^exposure`
+-// multiplier, applied in forward_entry.slang's fragmentMain immediately
+-// after a material's own evaluate() returns -- BEFORE the value ever
+-// reaches the separate, UNTOUCHED shared tonemap pass; exposure=0.0 is the
+-// neutral value, `2^0 == 1`, a byte-identical no-op regression guard for
+-// every sample that does not care about exposure). Kept ALL-SCALAR
+-// (uint/float only, no vector/matrix field) deliberately -- see
++// STORAGE BUFFER index -- see RxDrawData/gDrawData above). Kept ALL-SCALAR
++// (uint-only, no vector/matrix field) deliberately -- see
+ // shaders/multipass/lit.vert.slang's own header comment for the
+ // empirically-verified reason this project avoids vector/matrix fields
+ // inside a push-constant block; every genuinely vector-shaped per-pass
+ // value (viewProj, light/ambient) lives in RxDrawData above instead,
+ // reached indirectly via `drawDataBufferIndex`. Field layout mirrors
+ // `rx::material::MaterialGlobalsPush` (draw_data.h) EXACTLY.
+ //
+-// `public` is now load-bearing here too (grew from module-internal under
+-// the pre-Task-16 design): forward_entry.slang's vertexMain/fragmentMain
+-// both read `gMaterialGlobals` BY NAME directly now (`drawDataBufferIndex`,
+-// `exposure`), not just indirectly through this module's own
+-// rx_sampleTexture() -- same access-control rule as RxDrawData/gDrawData
+-// above.
++// [Phase 5 Task 4/#40, gate ruling rulings-2026-08-20.md T4] LOST
++// `exposure`: the Phase-4 `--exposure` CLI knob's pre-tonemap `2^exposure`
++// post-multiply on the ALREADY-SHADED final color (this struct's own
++// former field, applied in forward_entry.slang's fragmentMain) is
++// SUPERSEDED, not relocated -- Filament-style PRE-EXPOSURE now multiplies
++// light/IBL intensities BEFORE the lighting equation runs, at each
++// producer's own RxDrawData `lightColor`/`ambientColor` source (CPU-side,
++// via `rx::scene::Camera::exposure()` -- see camera.h), never as a
++// push-constant scalar read inside this shared entry point. See
++// forward_entry.slang's own fragmentMain for the deleted post-multiply
++// site.
++//
++// `public` is load-bearing here (grew from module-internal under the
++// pre-Task-16 design): forward_entry.slang's vertexMain/fragmentMain both
++// read `gMaterialGlobals` BY NAME directly (`drawDataBufferIndex`), not
++// just indirectly through this module's own rx_sampleTexture() -- same
++// access-control rule as RxDrawData/gDrawData above.
+ public struct RxMaterialGlobals {
+     public uint defaultSamplerIndex;
+     public uint drawDataBufferIndex;
+-    public float exposure;
+ }
+ 
+ [[vk::push_constant]]
+ public ConstantBuffer<RxMaterialGlobals> gMaterialGlobals;
+ 
+ // [Fix round, sampler-wrap P0] Primary entry point every PER-SLOT-sampler-
+ // aware material's `evaluate()` calls (StandardPbr/Unlit -- standard_pbr.
+ // slang/unlit.slang) to sample a bindless-indexed texture through an
+ // EXPLICIT bindless-indexed sampler -- both `gParams`'s own `uint` fields,
+ // per this engine's D8 bindless-index convention. `uv` is passed straight
+diff --git a/src/rx_material/include/rx_material/draw_data.h b/src/rx_material/include/rx_material/draw_data.h
+index 2e7d63f..a094b68 100644
+--- a/src/rx_material/include/rx_material/draw_data.h
++++ b/src/rx_material/include/rx_material/draw_data.h
+@@ -133,25 +133,32 @@ static_assert(sizeof(DrawDataGpu) == 352, "DrawDataGpu must stay exactly 352 byt
+ 
+ // Mirrors material.slang's `RxMaterialGlobals` push-constant struct
+ // (`[[vk::push_constant]] ConstantBuffer<RxMaterialGlobals> gMaterialGlobals;`)
+ // field-for-field. Deliberately ALL-SCALAR (no vec/mat fields) -- see
+ // lit.vert.slang's own header comment for the empirically-verified reason
+ // this project avoids vector/matrix fields inside a push-constant block
+ // (Slang's push-constant packing rules are not the predictable std430 rules
+ // a StructuredBuffer gets); every genuinely vector-shaped per-pass value
+ // (viewProj, light/ambient) lives in DrawDataGpu above instead, reached
+ // indirectly via `drawDataBufferIndex`.
++//
++// [Phase 5 Task 4/#40, gate ruling rulings-2026-08-20.md T4] LOST its
++// former `exposure` field: Filament-style PRE-EXPOSURE moved exposure
++// application to each RxDrawData producer's own `lightColor`/
++// `ambientColor` source (multiplied there by `rx::scene::Camera::
++// exposure()`, CPU-side, before upload), not a push-constant scalar this
++// shared struct carries -- see material.slang's own `RxMaterialGlobals`
++// header comment for the full ruling.
+ struct MaterialGlobalsPush {
+     uint32_t defaultSamplerIndex = 0;  // bindless SAMPLER index -- material.slang's pre-D26.1 field, unchanged in
+                                         // shape. [Fix round, sampler-wrap P0] StandardPbr/Unlit no longer sample
+                                         // through this for real texture slots (they carry their own per-slot
+                                         // sampler indices in gParams) -- this is now only the two-argument
+                                         // rx_sampleTexture() overload's fallback; see material.slang's own header
+                                         // comment.
+     uint32_t drawDataBufferIndex = 0;  // bindless STORAGE BUFFER index of the DrawDataGpu[] this draw reads.
+-    float exposure = 0.0F;             // pre-tonemap 2^exposure multiplier (0.0 = neutral, no-op: 2^0 == 1).
+ };
+-static_assert(sizeof(MaterialGlobalsPush) == 12,
+-              "MaterialGlobalsPush must stay exactly 12 bytes (3 packed 4-byte scalars) -- mirrors material.slang's "
++static_assert(sizeof(MaterialGlobalsPush) == 8,
++              "MaterialGlobalsPush must stay exactly 8 bytes (2 packed 4-byte scalars) -- mirrors material.slang's "
+               "RxMaterialGlobals, and bindInstance() (material_system.cpp) pushes exactly this many bytes for it");
+ 
+ }  // namespace rx::material
+diff --git a/src/rx_material/material_system.cpp b/src/rx_material/material_system.cpp
+index 88bc29d..d6592c4 100644
+--- a/src/rx_material/material_system.cpp
++++ b/src/rx_material/material_system.cpp
+@@ -1737,28 +1737,29 @@ void MaterialSystem::bindInstance(VkCommandBuffer cmd, const rx::graph::PassCont
+     // range exists on THIS material's pipeline layout specifically -- not
+     // an assumption this function should hardcode. See material.slang's own
+     // header comment for why `defaultSamplerIndex` (not a fixed slot) is
+     // the real registered index of MaterialSystem's own default sampler,
+     // and Impl::defaultDrawDataBuffer's own comment for why
+     // `drawDataBufferIndex` here is always this instance's own DEFAULT
+     // (identity) row -- bindInstance() is the pre-D26.1 LEGACY path (06/07's
+     // own simple test materials); a real D26.1 caller (StandardPBR/Unlit,
+     // samples/08_gltf_viewer) drives its OWN real per-draw buffer and pushes
+     // this same push-constant range itself, never through this method.
+-    // `exposure` stays 0.0 (neutral, `2^0 == 1`) here for the identical
+-    // reason -- bindInstance() callers never asked for exposure control.
++    // [Phase 5 Task 4/#40] `MaterialGlobalsPush` no longer carries an
++    // `exposure` field at all (pre-exposure moved to each RxDrawData
++    // producer's own lightColor/ambientColor source) -- this default
++    // (identity) row was never wired to `--exposure` control either way.
+     if (!record->layoutInfo.pushRanges.empty()) {
+         const rx::shader::ShaderLayoutInfo::PushRange& range = record->layoutInfo.pushRanges[0];
+         MaterialGlobalsPush push;
+         push.defaultSamplerIndex = impl.defaultSamplerHandle.index();
+         push.drawDataBufferIndex = impl.defaultDrawDataBufferHandle.index();
+-        push.exposure = 0.0F;
+         vkCmdPushConstants(cmd, record->layoutBundle.layout, range.stages, range.offset, range.size, &push);
+     }
+ 
+     if (record->layoutBundle.setLayouts.size() <= kMaterialParamBlockSet) {
+         throw std::runtime_error(
+             "rx_material: MaterialSystem::bindInstance: material '" + record->path.string() +
+             "' has no set-1 parameter-block descriptor set layout");
+     }
+     VkDescriptorSetLayout setLayout = record->layoutBundle.setLayouts[kMaterialParamBlockSet];
+ 
+diff --git a/src/rx_material/tests/CMakeLists.txt b/src/rx_material/tests/CMakeLists.txt
+index c450ec2..9a0ee39 100644
+--- a/src/rx_material/tests/CMakeLists.txt
++++ b/src/rx_material/tests/CMakeLists.txt
+@@ -42,21 +42,26 @@ add_executable(rx_material_gpu_tests
+     # sampler 3x3 PCF mechanism (material.slang's own gShadowCompareSamplers/
+     # rx_sampleShadowPCF, forward_entry.slang's fragmentMain re-read/
+     # shadowFactor wiring) exercised through the REAL production lit path
+     # (MaterialSystem::getPipeline() against standard_pbr.slang), not a
+     # standalone probe rig -- links rx_shadow for its
+     # ShadowCasterPipeline/fitShadowFrustum (device-free math + the real
+     # shadow-caster pipeline building the shadow map this test's receiver
+     # draws sample).
+     test_standard_pbr_shadow_gpu.cpp
+ )
+-target_link_libraries(rx_material_gpu_tests PRIVATE rx_material rx_shadow rx_rhi_vk rx_platform doctest::doctest)
++# [Phase 5 Task 4/#40] rx_scene: test_standard_pbr_unlit.cpp's own
++# pre-exposure TEST_CASE constructs a real rx::scene::Camera and reads
++# camera.exposure()/rx::scene::exposure::exposure(ev100) to compute the
++# expected pre-multiplied lightColor it asserts against -- the ONE case in
++# this binary that needs Camera's exposure math linked in.
++target_link_libraries(rx_material_gpu_tests PRIVATE rx_material rx_shadow rx_scene rx_rhi_vk rx_platform doctest::doctest)
+ rx_shader_deploy_runtime_libs(rx_material_gpu_tests)
+ 
+ target_compile_definitions(rx_material_gpu_tests PRIVATE
+   RX_MATERIAL_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
+   # [Phase 4 Stage 1 Task 16] test_standard_pbr_unlit.cpp loads the REAL
+   # shipped shaders/material/{standard_pbr,unlit}.slang (not this
+   # directory's own data/ test fixtures) -- rx_material's own
+   # RX_MATERIAL_SHADER_DIR (src/rx_material/CMakeLists.txt) is PRIVATE to
+   # that library target and does not propagate to this executable, so it
+   # is redeclared here, verbatim, for the one test file that needs it.
+diff --git a/src/rx_material/tests/test_standard_pbr_shadow_gpu.cpp b/src/rx_material/tests/test_standard_pbr_shadow_gpu.cpp
+index f5e101d..6d710cc 100644
+--- a/src/rx_material/tests/test_standard_pbr_shadow_gpu.cpp
++++ b/src/rx_material/tests/test_standard_pbr_shadow_gpu.cpp
+@@ -730,21 +730,20 @@ std::optional<RenderResult> renderWithBias(Fixture& fixture, SceneRig& rig, floa
+ 
+         VkDescriptorSet bindlessSet = fixture.bindless.descriptorSet();
+         VkPipelineLayout layout = rig.system->pipelineLayout(rig.material);
+         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &bindlessSet, 0, nullptr);
+ 
+         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, rig.pipeline);
+ 
+         rx::material::MaterialGlobalsPush push;
+         push.defaultSamplerIndex = rig.samplerIndex;
+         push.drawDataBufferIndex = rig.drawDataHandle.index();
+-        push.exposure = 0.0F;
+         vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+ 
+         paramBuffer = fixture.allocator.createHostVisibleBuffer(rig.paramBlob.size(), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                                                   rx::rhi::MemoryCategory::Internal);
+         REQUIRE(paramBuffer.has_value());
+         std::memcpy(paramBuffer->mappedData(), rig.paramBlob.data(), rig.paramBlob.size());
+         paramBuffer->flush();
+ 
+         VkDescriptorSetAllocateInfo setAllocInfo{};
+         setAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+diff --git a/src/rx_material/tests/test_standard_pbr_unlit.cpp b/src/rx_material/tests/test_standard_pbr_unlit.cpp
+index c544267..ec15eca 100644
+--- a/src/rx_material/tests/test_standard_pbr_unlit.cpp
++++ b/src/rx_material/tests/test_standard_pbr_unlit.cpp
+@@ -22,20 +22,21 @@
+ // their own camera/model override explicitly, documented at each call site.
+ #include <doctest/doctest.h>
+ #include <rx_material/material_system.h>
+ #include <rx_material/draw_data.h>
+ #include <rx_platform/window.h>
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/device.h>
++#include <rx_scene/camera.h>
+ 
+ #include <rx_graph/executor.h>
+ #include <rx_graph/render_graph.h>
+ #include <rx_task/scheduler.h>
+ 
+ #define GLM_FORCE_DEPTH_ZERO_TO_ONE
+ #include <glm/glm.hpp>
+ #include <glm/gtc/matrix_transform.hpp>
+ 
+ #include <array>
+@@ -303,21 +304,20 @@ bool near8(uint8_t actual, int expected, int margin) {
+ // values + the row index (firstInstance) this draw addresses in the shared
+ // DrawDataBuffer.
+ struct DrawRequest {
+     VkPipeline pipeline = VK_NULL_HANDLE;
+     VkPipelineLayout layout = VK_NULL_HANDLE;
+     VkDescriptorSetLayout paramSetLayout = VK_NULL_HANDLE;
+     const uint8_t* paramBlob = nullptr;
+     size_t paramBlobSize = 0;
+     uint32_t pushSize = 0;  // record->layoutInfo.pushRanges[0].size, reflected (always sizeof(MaterialGlobalsPush) today).
+     uint32_t drawDataRow = 0;
+-    float exposure = 0.0F;
+ };
+ 
+ // Renders every entry in `draws` (in order -- later draws composite OVER
+ // earlier ones, exercising BLEND's own over-compositing test) into a fresh
+ // 8x8 color+depth offscreen target and reads back ONE pixel (the center,
+ // (4,4) -- every draw fills the whole viewport per this file's own
+ // head-on-rig comment) as RGBA8. Builds its OWN set-1 UBO/descriptor set
+ // per draw directly (rx::rhi::Allocator + vkAllocateDescriptorSets) --
+ // deliberately NOT MaterialSystem::bindInstance() (that method is the
+ // pre-D26.1 LEGACY path, per its own header comment: "a real D26.1 caller
+@@ -409,21 +409,20 @@ std::vector<uint8_t> renderQuadPixels(rx::rhi::Device& device, rx::rhi::Allocato
+         VkBuffer vbHandle = mesh.vertexBuffer.handle();
+         vkCmdBindVertexBuffers(cmd, 0, 1, &vbHandle, &zeroOffset);
+         vkCmdBindIndexBuffer(cmd, mesh.indexBuffer.handle(), 0, VK_INDEX_TYPE_UINT32);
+ 
+         for (const DrawRequest& draw : draws) {
+             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, draw.pipeline);
+ 
+             rx::material::MaterialGlobalsPush push;
+             push.defaultSamplerIndex = defaultSamplerBindlessIndex;
+             push.drawDataBufferIndex = drawDataBufferHandle.index();
+-            push.exposure = draw.exposure;
+             REQUIRE(draw.pushSize == sizeof(push));
+             vkCmdPushConstants(cmd, draw.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                 draw.pushSize, &push);
+ 
+             auto paramBuffer = allocator.createHostVisibleBuffer(
+                 draw.paramBlobSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, rx::rhi::MemoryCategory::Internal);
+             REQUIRE(paramBuffer.has_value());
+             std::memcpy(paramBuffer->mappedData(), draw.paramBlob, draw.paramBlobSize);
+             paramBuffer->flush();
+ 
+@@ -760,23 +759,23 @@ TEST_CASE("D26.1: two draws in one command buffer, the second at firstInstance>0
+     VkDescriptorSetLayoutCreateInfo setLayoutInfo{};
+     setLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+     setLayoutInfo.bindingCount = 1;
+     setLayoutInfo.pBindings = &uboBinding;
+     VkDescriptorSetLayout realParamLayout = VK_NULL_HANDLE;
+     REQUIRE(vkCreateDescriptorSetLayout(fixture->device.device(), &setLayoutInfo, nullptr, &realParamLayout) ==
+             VK_SUCCESS);
+ 
+     std::vector<DrawRequest> draws;
+     draws.push_back(DrawRequest{pipeline, system->pipelineLayout(unlit), realParamLayout, redBlob.data(),
+-                                 redBlob.size(), pushSize, /*drawDataRow=*/0, 0.0F});
++                                 redBlob.size(), pushSize, /*drawDataRow=*/0});
+     draws.push_back(DrawRequest{pipeline, system->pipelineLayout(unlit), realParamLayout, greenBlob.data(),
+-                                 greenBlob.size(), pushSize, /*drawDataRow=*/1, 0.0F});
++                                 greenBlob.size(), pushSize, /*drawDataRow=*/1});
+ 
+     // [Fix round, item 1] A 48x48 target (vs. the 8x8 every single-quad
+     // test uses) and the widened orthoHalfExtent=3.0 frustum above give
+     // exactly 8 texels per world unit -- world x=0 (row 0's quad center)
+     // maps to texel x=(0+3)*8=24; world x=2 (row 1's quad center, after
+     // its own +2 translation) maps to texel x=(2+3)*8=40. Both probes sit
+     // comfortably inside their own quad's own footprint (each quad spans a
+     // full world unit, i.e. 8 texels, centered on its own probe point) and
+     // nowhere near the other quad's footprint (a >=8-texel gap either way)
+     // or the frustum edge.
+@@ -979,30 +978,30 @@ rx::graph::PassSignature makeQuadPassSignature() {
+     rx::graph::PassSignature sig;
+     sig.colorCount = 1;
+     sig.colorFormats[0] = VK_FORMAT_R8G8B8A8_UNORM;
+     sig.depthFormat = VK_FORMAT_D32_SFLOAT;
+     sig.samples = VK_SAMPLE_COUNT_1_BIT;
+     return sig;
+ }
+ 
+ // Convenience for the common "one material, one draw, one row" case.
+ Rgba8 renderOne(StandardPbrRig& rig, rx::material::MaterialHandle handle, const std::vector<uint8_t>& blob,
+-                 rx::material::DrawDataGpu row = makeHeadOnRow(), float exposure = 0.0F) {
++                 rx::material::DrawDataGpu row = makeHeadOnRow()) {
+     VkPipeline pipeline = rig.system->getPipeline({handle, makeQuadPassSignature(), 0});
+     REQUIRE(pipeline != VK_NULL_HANDLE);
+     std::vector<rx::material::DrawDataGpu> rows{row};
+     auto drawDataBuffer = createDrawDataBuffer(rig.fixture->allocator, rig.fixture->bindless, rows);
+     REQUIRE(drawDataBuffer.has_value());
+ 
+     uint32_t pushSize = rig.system->layoutInfo(handle).pushRanges[0].size;
+     std::vector<DrawRequest> draws{DrawRequest{pipeline, rig.system->pipelineLayout(handle), rig.paramSetLayout,
+-                                                blob.data(), blob.size(), pushSize, /*drawDataRow=*/0, exposure}};
++                                                blob.data(), blob.size(), pushSize, /*drawDataRow=*/0}};
+     return renderQuad(rig.fixture->device, rig.fixture->allocator, rig.fixture->bindless, drawDataBuffer->handle,
+                        rig.defaultSamplerIndex, rig.mesh, draws);
+ }
+ 
+ }  // namespace
+ 
+ TEST_CASE("StandardPBR: baseColorFactor with no texture renders that exact linear color; a bound texture "
+           "multiplies per-texel") {
+     auto rig = makeStandardPbrRig("standard_pbr_basecolor");
+     if (!rig.has_value()) {
+@@ -1504,45 +1503,45 @@ TEST_CASE("StandardPBR: alphaMode=MASK discards below cutoff, renders opaque abo
+     auto drawDataBuffer = createDrawDataBuffer(rig->fixture->allocator, rig->fixture->bindless, rows);
+     REQUIRE(drawDataBuffer.has_value());
+ 
+     VkPipeline backgroundPipeline = rig->system->getPipeline({backgroundHandle, makeQuadPassSignature(), 0});
+     VkPipeline maskPipeline = rig->system->getPipeline({handle, makeQuadPassSignature(), 0});
+     uint32_t backgroundPush = rig->system->layoutInfo(backgroundHandle).pushRanges[0].size;
+     uint32_t maskPush = rig->system->layoutInfo(handle).pushRanges[0].size;
+ 
+     std::vector<DrawRequest> draws{
+         DrawRequest{backgroundPipeline, rig->system->pipelineLayout(backgroundHandle), rig->paramSetLayout,
+-                    backgroundBlob.data(), backgroundBlob.size(), backgroundPush, /*drawDataRow=*/0, 0.0F},
++                    backgroundBlob.data(), backgroundBlob.size(), backgroundPush, /*drawDataRow=*/0},
+         DrawRequest{maskPipeline, rig->system->pipelineLayout(handle), rig->paramSetLayout, belowBlob.data(),
+-                    belowBlob.size(), maskPush, /*drawDataRow=*/1, 0.0F},
++                    belowBlob.size(), maskPush, /*drawDataRow=*/1},
+     };
+     Rgba8 belowResult = renderQuad(rig->fixture->device, rig->fixture->allocator, rig->fixture->bindless,
+                                     drawDataBuffer->handle, rig->defaultSamplerIndex, rig->mesh, draws);
+ 
+     // The MASK quad discarded -> the background green shows through
+     // untouched (depth NOT written by the discarded fragment).
+     CHECK(belowResult.g > 200);
+     CHECK(belowResult.r < 50);
+ 
+     // A=0.8 (above cutoff) -- renders fully opaque, occluding the
+     // background (depth IS written).
+     uint32_t aboveCutoffTex = makeTexture(*rig->system, {255, 0, 0, 204});  // alpha 204/255 ~= 0.8.
+     std::vector<uint8_t> aboveBlob = makeDefaultStandardPbrBlob(*rig, handle);
+     setParam(aboveBlob, params, "baseColorTexture", aboveCutoffTex);
+     setParam(aboveBlob, params, "alphaCutoff", 0.5F);
+     setParam(aboveBlob, params, "metallicFactor", 0.0F);
+ 
+     std::vector<DrawRequest> aboveDraws{
+         DrawRequest{backgroundPipeline, rig->system->pipelineLayout(backgroundHandle), rig->paramSetLayout,
+-                    backgroundBlob.data(), backgroundBlob.size(), backgroundPush, /*drawDataRow=*/0, 0.0F},
++                    backgroundBlob.data(), backgroundBlob.size(), backgroundPush, /*drawDataRow=*/0},
+         DrawRequest{maskPipeline, rig->system->pipelineLayout(handle), rig->paramSetLayout, aboveBlob.data(),
+-                    aboveBlob.size(), maskPush, /*drawDataRow=*/1, 0.0F},
++                    aboveBlob.size(), maskPush, /*drawDataRow=*/1},
+     };
+     Rgba8 aboveResult = renderQuad(rig->fixture->device, rig->fixture->allocator, rig->fixture->bindless,
+                                     drawDataBuffer->handle, rig->defaultSamplerIndex, rig->mesh, aboveDraws);
+     CHECK(aboveResult.r > 20);
+     CHECK(aboveResult.g < 50);  // NOT the background green -- the MASK quad occluded it.
+     destroyRig(*rig);
+     CHECK_FALSE(rig->fixture->context.hasValidationErrors());
+ }
+ 
+ TEST_CASE("D28: alphaMode=BLEND composites over an opaque background and does not occlude it in the depth buffer") {
+@@ -1606,23 +1605,23 @@ TEST_CASE("D28: alphaMode=BLEND composites over an opaque background and does no
+     auto drawDataBuffer = createDrawDataBuffer(rig->fixture->allocator, rig->fixture->bindless, rows);
+     REQUIRE(drawDataBuffer.has_value());
+ 
+     VkPipeline backgroundPipeline = rig->system->getPipeline({opaqueHandle, makeQuadPassSignature(), 0});
+     VkPipeline blendPipeline = rig->system->getPipeline({handle, makeQuadPassSignature(), 0});
+     uint32_t backgroundPush = rig->system->layoutInfo(opaqueHandle).pushRanges[0].size;
+     uint32_t blendPush = rig->system->layoutInfo(handle).pushRanges[0].size;
+ 
+     std::vector<DrawRequest> draws{
+         DrawRequest{backgroundPipeline, rig->system->pipelineLayout(opaqueHandle), rig->paramSetLayout,
+-                    backgroundBlob.data(), backgroundBlob.size(), backgroundPush, /*drawDataRow=*/0, 0.0F},
++                    backgroundBlob.data(), backgroundBlob.size(), backgroundPush, /*drawDataRow=*/0},
+         DrawRequest{blendPipeline, rig->system->pipelineLayout(handle), rig->paramSetLayout, blendBlob.data(),
+-                    blendBlob.size(), blendPush, /*drawDataRow=*/1, 0.0F},
++                    blendBlob.size(), blendPush, /*drawDataRow=*/1},
+     };
+     Rgba8 result = renderQuad(rig->fixture->device, rig->fixture->allocator, rig->fixture->bindless,
+                                drawDataBuffer->handle, rig->defaultSamplerIndex, rig->mesh, draws);
+ 
+     // Straight-alpha over-compositing: out = src*srcAlpha + dst*(1-srcAlpha)
+     // = (0,0,255)*0.502 + (255,0,0)*(1-0.502) ~= (127, 0, 128).
+     CHECK(near8(result.r, 127, 15));
+     CHECK(result.g < 15);
+     CHECK(near8(result.b, 128, 15));
+ 
+@@ -1640,21 +1639,21 @@ TEST_CASE("D28: alphaMode=BLEND composites over an opaque background and does no
+     std::vector<uint8_t> thirdBlob(rig->system->paramBlockSize(opaqueHandle), 0);
+     setParam(thirdBlob, opaqueParams, "baseColorFactor", std::array<float, 4>{1.0F, 1.0F, 0.0F, 1.0F});
+     setParam(thirdBlob, opaqueParams, "baseColorTexture", yellowTex);
+     // [Fix round, sampler-wrap P0] see makeDefaultStandardPbrBlob()'s own comment.
+     setParam(thirdBlob, opaqueParams, "baseColorSampler", rig->defaultSamplerIndex);
+     setParam(thirdBlob, opaqueParams, "alphaCutoff", 0.0F);
+     setParam(thirdBlob, opaqueParams, "baseColorUvOffsetScale", std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
+     std::vector<DrawRequest> withThird = draws;
+     withThird.push_back(DrawRequest{backgroundPipeline, rig->system->pipelineLayout(opaqueHandle),
+                                       rig->paramSetLayout, thirdBlob.data(), thirdBlob.size(), backgroundPush,
+-                                      /*drawDataRow=*/2, 0.0F});
++                                      /*drawDataRow=*/2});
+     Rgba8 thirdResult = renderQuad(rig->fixture->device, rig->fixture->allocator, rig->fixture->bindless,
+                                     drawDataBuffer->handle, rig->defaultSamplerIndex, rig->mesh, withThird);
+     CHECK(thirdResult.r > 200);
+     CHECK(thirdResult.g > 200);  // yellow reached the target -- proof BLEND's first draw never wrote depth at z=-1's own equal-depth comparison.
+     destroyRig(*rig);
+     CHECK_FALSE(rig->fixture->context.hasValidationErrors());
+ }
+ 
+ TEST_CASE("D28: doubleSided disables back-face culling -- a single-sided quad viewed from its back face renders "
+           "nothing; the identical geometry/viewpoint with doubleSided=true renders correctly lit") {
+@@ -1915,45 +1914,92 @@ TEST_CASE("StandardPBR per-slot sampler wiring: baseColorSampler/emissiveSampler
+     CHECK(emissivePixel.r < 50);
+     CHECK(emissivePixel.g < 50);
+ 
+     for (VkSampler sampler : rawWrapSamplers) {
+         vkDestroySampler(rig->fixture->device.device(), sampler, nullptr);
+     }
+     destroyRig(*rig);
+     CHECK_FALSE(rig->fixture->context.hasValidationErrors());
+ }
+ 
+-TEST_CASE("--exposure: 2^exposure pre-tonemap multiply -- exposure=0 is a byte-identical no-op; exposure=1 "
+-          "measurably brightens the same draw") {
+-    auto rig = makeStandardPbrRig("standard_pbr_exposure");
++TEST_CASE("Camera pre-exposure: rx::scene::Camera::exposure() pre-multiplies the ambient term's own RxDrawData "
++          "source exactly [Phase 5 Task 4/#40, gate ruling rulings-2026-08-20.md T4 -- PRE-EXPOSURE, not a "
++          "post-tonemap multiply]") {
++    // [Phase 5 Task 4/#40] Supersedes the old "--exposure: 2^exposure
++    // pre-tonemap multiply" test: MaterialGlobalsPush no longer carries an
++    // `exposure` field at all (material.slang's own `RxMaterialGlobals`
++    // header comment), and forward_entry.slang's fragmentMain no longer
++    // post-multiplies the shaded color -- exposure is now baked into
++    // RxDrawData's own `lightColor`/`ambientColor` fields BEFORE upload,
++    // by whichever CPU-side code produces a draw-data row (samples/
++    // 08_gltf_viewer's own updateDrawDataPerPassFields(), for the real
++    // production case). This test simulates that same "at the source"
++    // pre-multiply directly: a real rx::scene::Camera computes
++    // exposure(), and THIS test scales ambientColor by it before
++    // building the row -- exactly what a real producer does.
++    auto rig = makeStandardPbrRig("standard_pbr_pre_exposure");
+     if (!rig.has_value()) {
+         return;
+     }
+     rx::material::MaterialHandle handle =
+         rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
+     const auto params = rig->system->materialParams(handle);
+ 
+     std::vector<uint8_t> blob = makeDefaultStandardPbrBlob(*rig, handle);
+     setParam(blob, params, "metallicFactor", 0.0F);
+     setParam(blob, params, "roughnessFactor", 1.0F);
+-    setParam(blob, params, "baseColorFactor", std::array<float, 4>{0.3F, 0.3F, 0.3F, 1.0F});
+-
+-    Rgba8 neutralPixel = renderOne(*rig, handle, blob, makeHeadOnRow(), /*exposure=*/0.0F);
+-    Rgba8 doubledPixel = renderOne(*rig, handle, blob, makeHeadOnRow(), /*exposure=*/1.0F);
+-
+-    // 2^0 == 1 -> byte-identical to the "no exposure field at all" case
+-    // this file's own Lambertian test already computes independently
+-    // (0.3/pi ~= 0.0955 -> ~24/255).
+-    CHECK(near8(neutralPixel.r, 24, 6));
+-    // 2^1 == 2 -> measurably brighter (not clamped to 255 at this base
+-    // value, so the doubling is directly visible).
+-    CHECK(doubledPixel.r > neutralPixel.r + 15);
++    setParam(blob, params, "baseColorFactor", std::array<float, 4>{0.5F, 0.5F, 0.5F, 1.0F});
++
++    // Isolate the ambient term entirely (zero direct light) so
++    // `color == ambientColor * occlusion(==1.0, default blob) *
++    // baseColor.rgb` exactly [standard_pbr.slang's own evaluate():
++    // `directLight = (diffuse+specular)*v.lightColor*NdotL` is the zero
++    // vector whenever `v.lightColor` is, regardless of NdotL/diffuse/
++    // specular; `ambient = v.ambientColor * occlusion * baseColor.rgb`] --
++    // an exact closed form to assert the pre-exposure SCALE against,
++    // rather than a loose ">" brightness inequality.
++    rx::scene::Camera neutralCamera;  // default-constructed: exposure() == 1.0 exactly [matrix row 4].
++    REQUIRE(neutralCamera.exposure() == doctest::Approx(1.0F));
++
++    rx::scene::Camera brighterCamera;
++    // exposure(ev100) == 1/(1.2*2^ev100) [Filament Exposure.cpp, ported
++    // verbatim -- camera.cpp]; at ev100=-1.0 this is exactly 1/(1.2*0.5)
++    // == 1/0.6 == 5/3, a clean, hand-checkable value.
++    brighterCamera.setExposure(/*ev100Override=*/-1.0F);
++    REQUIRE(brighterCamera.exposure() == doctest::Approx(5.0F / 3.0F).epsilon(0.0001));
++
++    auto makeRow = [](float exposureMultiplier) {
++        rx::material::DrawDataGpu row = makeHeadOnRow();
++        row.lightColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
++        row.ambientColor = glm::vec4(0.4F, 0.4F, 0.4F, 0.0F) * exposureMultiplier;
++        return row;
++    };
++
++    Rgba8 neutralPixel = renderOne(*rig, handle, blob, makeRow(neutralCamera.exposure()));
++    Rgba8 brighterPixel = renderOne(*rig, handle, blob, makeRow(brighterCamera.exposure()));
++
++    // Exact closed form: color.r == (0.4 * exposureMultiplier) * baseColor.r.
++    // Neutral: 0.4 * 1.0 * 0.5 == 0.2 -> 0.2*255 == 51.0 exactly.
++    CHECK(near8(neutralPixel.r, 51, 2));
++    // Brighter: 0.4 * (5/3) * 0.5 == 1/3 -> (1/3)*255 == 85.0 exactly.
++    CHECK(near8(brighterPixel.r, 85, 2));
++
++    // Genuinely LINEAR in the exposure multiplier (the value-asserted
++    // "EV100 input -> expected scaled radiance" end-to-end proof) -- the
++    // measured ratio matches exposure()'s own ratio, not merely "went
++    // up": a double-application bug (this exact multiplier applied
++    // twice, e.g. a stray leftover post-multiply site) would instead
++    // measure the SQUARE of this ratio, ((5/3)/1.0)^2 ~= 2.78, not 5/3
++    // ~= 1.667.
++    CHECK(static_cast<float>(brighterPixel.r) / static_cast<float>(neutralPixel.r) ==
++          doctest::Approx(brighterCamera.exposure() / neutralCamera.exposure()).epsilon(0.05));
++
+     destroyRig(*rig);
+     CHECK_FALSE(rig->fixture->context.hasValidationErrors());
+ }
+ 
+ TEST_CASE("Unlit: evaluate() == baseColorFactor x baseColorTexture exactly, zero lighting dependence (light-flip "
+           "zero-delta probe)") {
+     auto rig = makeStandardPbrRig("unlit_exactness");
+     if (!rig.has_value()) {
+         return;
+     }
+diff --git a/src/rx_scene/camera.cpp b/src/rx_scene/camera.cpp
+index 97c67f4..dfe725e 100644
+--- a/src/rx_scene/camera.cpp
++++ b/src/rx_scene/camera.cpp
+@@ -1,18 +1,58 @@
+ #include <rx_scene/camera.h>
+ 
+ #include <glm/gtc/matrix_transform.hpp>
+ 
++#include <algorithm>
+ #include <cmath>
+ 
+ namespace rx::scene {
+ 
++// --- Exposure [Phase 5 Task 4/#40; see camera.h's own top comment and the
++// `rx::scene::exposure` namespace's own comments for the full citation] ---
++namespace exposure {
++
++float ev100(float aperture, float shutterSpeed, float sensitivity) {
++    return std::log2((aperture * aperture) / shutterSpeed * 100.0F / sensitivity);
++}
++
++float exposure(float aperture, float shutterSpeed, float sensitivity) {
++    // Merged form -- one log2-free division chain, matching Filament's own
++    // `Exposure::exposure(float, float, float)` exactly (not composed from
++    // ev100()+exposure(float) above, which would round-trip through an
++    // extra log2/pow pair for the identical result).
++    const float e = (aperture * aperture) / shutterSpeed * 100.0F / sensitivity;
++    return 1.0F / (1.2F * e);
++}
++
++float exposure(float ev100Value) { return 1.0F / (1.2F * std::pow(2.0F, ev100Value)); }
++
++}  // namespace exposure
++
++float Camera::ev100() const { return exposure::ev100(aperture, shutterSpeed, sensitivity); }
++
++float Camera::exposure() const {
++    return exposureOverride.has_value() ? *exposureOverride : exposure::exposure(ev100());
++}
++
++void Camera::setExposure(float apertureIn, float shutterSpeedIn, float sensitivityIn) {
++    // Filament's exact clamp ranges [details/Camera.cpp:45-50, v1.75.0].
++    aperture = std::clamp(apertureIn, 0.5F, 64.0F);
++    shutterSpeed = std::clamp(shutterSpeedIn, 1.0F / 25000.0F, 60.0F);
++    sensitivity = std::clamp(sensitivityIn, 10.0F, 204800.0F);
++    exposureOverride.reset();
++}
++
++void Camera::setExposure(float ev100Override) { exposureOverride = exposure::exposure(ev100Override); }
++
++void Camera::clearExposureOverride() { exposureOverride = 1.0F; }
++
+ glm::mat4 Camera::view() const {
+     // inverse(T(position) * R(orientation)) = R(orientation)^-1 * T(-position)
+     // -- conjugate(orientation) is the inverse of a unit quaternion's
+     // rotation, and translate(-position) is the inverse of T(position);
+     // composing the two known inverses is exact and cheaper than a
+     // general glm::inverse(mat4).
+     const glm::mat4 invRotation = glm::mat4_cast(glm::conjugate(orientation));
+     const glm::mat4 invTranslation = glm::translate(glm::mat4(1.0F), -position);
+     return invRotation * invTranslation;
+ }
+diff --git a/src/rx_scene/include/rx_scene/camera.h b/src/rx_scene/include/rx_scene/camera.h
+index a892182..98e6874 100644
+--- a/src/rx_scene/include/rx_scene/camera.h
++++ b/src/rx_scene/include/rx_scene/camera.h
+@@ -31,45 +31,97 @@
+ // option (a)]: proj()'s infinite far makes its own "far" row degenerate
+ // under Gribb-Hartmann plane extraction (see this header's own comment on
+ // extractFrustumPlanes() below for the exact algebra) -- Filament's
+ // answer, adopted here, is a SEPARATE finite-far projection
+ // (cullingProj(), Camera.h:159-162/292-309's `projectionForCulling`
+ // precedent) used ONLY to derive real, non-degenerate culling planes.
+ // DrawListBuilder (Task 19) is the intended consumer of cullingProj()/
+ // cullingFrustumPlanes(); proj()/viewProj() remain what the render pass
+ // itself binds.
+ //
+-// EXPOSURE: deliberately absent from this type. D22 places the manual
+-// exposure parameter on the tonemap pass, not Camera (gate ruling: "stays
+-// on the tonemap for Phase 4 -- D22 stands; a Camera exposure API becomes
+-// meaningful with physical light units/IBL -- registry, techniques
+-// phase"), even though Filament itself owns exposure on Camera -- see the
+-// matrix's Conflict #2 for the full precedent-vs-spec discussion this
+-// ruling resolves.
++// EXPOSURE [Phase 5 Task 4/#40, superseding D22 wholesale -- gate ruling
++// rulings-2026-08-20.md's T4 section: "Filament-style PRE-EXPOSURE
++// adopted... physical-units exposure API per the matrix's shape"; matrix
++// .superpowers/sdd/2026-08-20-phase5-techniques/gate/matrix-p5t04-camera-
++// exposure.md]: Camera now owns a Filament-precedented photographic
++// aperture/shutterSpeed/sensitivity triple, an EV100/exposure() pair
++// ported byte-for-byte from Filament's own `Exposure.cpp` (google/filament
++// v1.75.0, commit 0e58877c09afb1aacd09ff640f74d2adcd2a7e80, Apache-2.0 --
++// the `rx::scene::exposure` namespace below), and a direct EV100 override
++// (`setExposure(float)`, no literal Filament Camera-level precedent -- see
++// that overload's own comment). PRE-EXPOSURE, not a post-multiply on the
++// final shaded color: `exposure()` is the multiplier every light/IBL-
++// intensity producer this ruling binds (techniques-phase Stage 1 IBL,
++// Stage 2 physical lights) applies to its OWN values before the lighting
++// equation runs -- mirroring Filament's `View.cpp` (`prepareAmbientLight`/
++// `prepareDirectionalLight`, both fed a single per-frame `exposure` value
++// computed from `cameraInfo.ev100`), which this repo's own half-float HDR
++// scene-color choice (T3/#39, B10G11R11) shares the identical
++// precision-range motivation for. See exposureOverride's own comment for
++// why a freshly-constructed Camera's exposure() is a neutral 1.0 despite
++// its photographic triple defaulting to a real (non-neutral) daylight
++// exposure -- the load-bearing byte-identical regression guard for every
++// pre-Task-4 consumer.
+ //
+ // JITTER [preserve-later, TAA]: `jitter` is threaded through proj()'s
+ // translation terms (see proj()'s own comment) but is `{0,0}` (inert) in
+ // every Phase 4 call site -- reserved so the temporal cluster (techniques
+ // phase) does not need to change this type's call signature later
+ // (Filament places jitter on `View::TemporalAntiAliasingOptions`, not
+ // Camera -- RendererX has no separate View type in the Task 18 interface,
+ // so Camera is the correct analog by elimination, not a precedent match;
+ // see the matrix's own "Camera: jitter hook" row).
+ 
+ #include <glm/glm.hpp>
+ #include <glm/gtc/quaternion.hpp>
+ 
+ #include <array>
+ #include <cstdint>
++#include <optional>
+ 
+ namespace rx::scene {
+ 
++// Ported byte-for-byte from Filament's `namespace filament::Exposure`'s
++// free `ev100`/`exposure` overloads [google/filament v1.75.0,
++// filament/src/Exposure.cpp, commit 0e58877c09afb1aacd09ff640f74d2adcd2a7e80,
++// Apache-2.0 -- fetched and diffed against this exact tag/commit while
++// writing this file, not paraphrased from docs]. Pure functions (this
++// codebase's own established test pattern -- see e.g. this header's own
++// extractFrustumPlanes()) so camera_test.cpp can assert them directly
++// against hand-derived reference values, independent of Camera's own
++// exposureOverride mechanism (Camera::ev100()/exposure() below are thin
++// wrappers over these).
++namespace exposure {
++
++// EV100 from a photographic aperture (f-stop, N)/shutterSpeed (seconds,
++// t)/sensitivity (ISO, S) triple: `log2((N^2/t) * (100/S))` [Exposure.cpp
++// `ev100(float, float, float)`].
++[[nodiscard]] float ev100(float aperture, float shutterSpeed, float sensitivity);
++
++// The pre-exposure multiplier from the SAME triple -- Filament's own
++// merged, single-pow-call form (`1 / (1.2 * (N^2/t) * (100/S))`,
++// mathematically identical to `exposure(ev100(aperture, shutterSpeed,
++// sensitivity))` but without a redundant log2/pow round-trip) [Exposure.cpp
++// `exposure(float, float, float)`]. The `1.2f` constant is exact, not a
++// tunable: derived from the saturation-based-sensitivity method
++// (`S_sat = 78/H_sat`, lens/vignetting attenuation `q = 0.65`,
++// `78/(100*0.65) = 1.2`) -- Exposure.cpp's own `exposure(float ev100)`
++// doc comment carries the full derivation.
++[[nodiscard]] float exposure(float aperture, float shutterSpeed, float sensitivity);
++
++// The pre-exposure multiplier from an ALREADY-KNOWN EV100 value:
++// `1 / (1.2 * 2^ev100)` [Exposure.cpp `exposure(float ev100)`] -- the
++// formula Camera::setExposure(float)'s direct override below uses.
++[[nodiscard]] float exposure(float ev100);
++
++}  // namespace exposure
++
+ // Six frustum planes, Filament's own `Frustum::getNormalizedPlane(s)`
+ // ordering (Frustum.h:78-89: "left, right, bottom, top, far, near") --
+ // matched deliberately (not RendererX's own invention) so anyone
+ // cross-referencing that precedent finds the same order here. Each
+ // glm::vec4 is a normalized plane (`dot(plane.xyz, worldPos) + plane.w >=
+ // 0` for "inside"), per extractFrustumPlanes()'s own comment.
+ enum class FrustumPlaneIndex : uint8_t { Left = 0, Right = 1, Bottom = 2, Top = 3, Far = 4, Near = 5 };
+ inline constexpr size_t kFrustumPlaneCount = 6;
+ using FrustumPlanes = std::array<glm::vec4, kFrustumPlaneCount>;
+ 
+@@ -134,20 +186,98 @@ struct Camera {
+     // change this type's call signature.
+     glm::vec2 jitter{0.0F, 0.0F};
+ 
+     // [D19/matrix-issue07] Camera-side visibility mask, ANDed against a
+     // renderable's own RenderableDesc::layers by DrawListBuilder (Task 19)
+     // -- all-ones default per Unity/Godot's own "opt-out, not opt-in"
+     // convention (matrix-issue07's own "all-ones defaults CONFIRMED as
+     // deliberate" ruling).
+     uint32_t cullMask = ~0u;
+ 
++    // --- Exposure [Phase 5 Task 4/#40; see this header's own top comment
++    // for the full ruling/citation] --------------------------------------
++
++    // Photographic exposure triple -- Filament's OWN real-camera defaults,
++    // verbatim [details/Camera.h:211-213, v1.75.0]: aperture is an f-stop
++    // (f/N), shutterSpeed is in seconds, sensitivity is ISO (100-relative).
++    // A freshly-constructed Camera therefore has a sane, non-degenerate
++    // real f/16-1/125s-ISO100 daylight exposure on hand (ev100() ~= 14.97)
++    // if a caller reads it -- but see exposureOverride below for why
++    // exposure() itself does NOT default to what this triple resolves to.
++    float aperture = 16.0F;
++    float shutterSpeed = 1.0F / 125.0F;
++    float sensitivity = 100.0F;
++
++    // Direct pre-exposure-multiplier override [RendererX addition -- no
++    // literal Filament Camera-level precedent: only Filament's free
++    // `Exposure::exposure(float ev100)` overload exists for "EV100 already
++    // known", never wired onto FCamera itself; matrix-p5t04's row 6].
++    // When engaged (`has_value()`), exposure() returns
++    // `exposure::exposure(*exposureOverride)` verbatim, bypassing
++    // aperture/shutterSpeed/sensitivity entirely; ev100() is UNAFFECTED
++    // either way (it always reflects the photographic triple above -- an
++    // override changes what multiplies onto light/IBL intensities, not
++    // what EV100 the triple represents).
++    //
++    // DEFAULTS ENGAGED, AT EXACTLY 1.0 -- the neutral, byte-identical-to-
++    // Phase-4 multiplier (matrix-p5t04 row 4's "Camera's default-
++    // constructed exposure state must resolve to a multiplier of exactly
++    // 1.0"), a DELIBERATELY different value from what the photographic
++    // triple's own Filament defaults resolve to (~2.6e-5, a real daylight
++    // exposure -- matrix Conflicts row 2: naively deriving the default
++    // from Filament's real-camera triple would silently break every
++    // pre-Task-4 consumer's byte-identical output). setExposure(aperture,
++    // shutterSpeed, sensitivity) clears this override (falls back to the
++    // triple); setExposure(ev100Override) re-engages it at a new, explicit
++    // value; clearExposureOverride() re-engages it back to this same
++    // neutral 1.0.
++    std::optional<float> exposureOverride = 1.0F;
++
++    // EV100 of the CURRENT photographic triple -- exposure::ev100() above,
++    // applied to this Camera's own aperture/shutterSpeed/sensitivity.
++    // Unaffected by exposureOverride (see that field's own comment).
++    [[nodiscard]] float ev100() const;
++
++    // The pre-exposure multiplier [Filament-style pre-exposure, gate
++    // ruling rulings-2026-08-20.md's T4 section] every light/IBL-intensity
++    // producer this ruling binds is required to multiply onto its OWN
++    // values before the lighting equation runs (NOT a post-multiply on
++    // the final shaded color -- see this header's own top comment).
++    // `*exposureOverride` if engaged, else `exposure::exposure(ev100())`.
++    [[nodiscard]] float exposure() const;
++
++    // Sets the photographic triple and clears any direct override --
++    // Filament `FCamera::setExposure(float, float, float)`, INCLUDING its
++    // exact clamp ranges [details/Camera.cpp:45-50,258-260, v1.75.0]:
++    // aperture clamped to [0.5, 64], shutterSpeed to [1/25000, 60]
++    // (seconds), sensitivity to [10, 204800] (ISO). Unlike Filament's
++    // FCamera (private fields, setter-only mutation), this type's fields
++    // stay PLAIN AND PUBLIC like every other Camera field above (nearPlane,
++    // aspectRatio, ...) -- a caller writing `camera.aperture` directly
++    // bypasses this clamp, matching this type's existing "no invariant
++    // enforcement on direct field writes" convention; only this named
++    // setter clamps.
++    void setExposure(float apertureIn, float shutterSpeedIn, float sensitivityIn);
++
++    // Direct EV100 override -- bypasses the photographic triple entirely
++    // (see exposureOverride's own comment above for why this has no
++    // literal Filament Camera-level precedent). exposure() returns
++    // `exposure::exposure(ev100Override)` verbatim from this call until
++    // clearExposureOverride() or the triple-setting overload above runs.
++    void setExposure(float ev100Override);
++
++    // Re-engages the neutral (1.0) override -- equivalent to a freshly-
++    // constructed Camera's own exposure() state, discarding any
++    // setExposure(ev100Override) call or a prior setExposure(triple)
++    // call's override-clearing effect.
++    void clearExposureOverride();
++
+     [[nodiscard]] glm::vec3 forward() const { return orientation * glm::vec3(0.0F, 0.0F, -1.0F); }
+     [[nodiscard]] glm::vec3 up() const { return orientation * glm::vec3(0.0F, 1.0F, 0.0F); }
+     [[nodiscard]] glm::vec3 right() const { return orientation * glm::vec3(1.0F, 0.0F, 0.0F); }
+ 
+     // World-to-view matrix: inverse(translate(position) * mat4_cast(orientation)),
+     // computed directly (conjugate rotation, then translate) rather than via
+     // glm::inverse() -- both this camera's rotation and translation are
+     // individually trivial to invert, so there is no reason to pay for a
+     // general 4x4 inverse.
+     [[nodiscard]] glm::mat4 view() const;
+diff --git a/src/rx_scene/tests/camera_test.cpp b/src/rx_scene/tests/camera_test.cpp
+index bab37af..0c3038d 100644
+--- a/src/rx_scene/tests/camera_test.cpp
++++ b/src/rx_scene/tests/camera_test.cpp
+@@ -192,20 +192,145 @@ TEST_CASE("Camera::jitter is threaded through proj()'s translation terms and is
+         }
+     }
+ 
+     // cullingProj() is never jittered (a jittered culling frustum would be
+     // wrong -- see camera.h's own comment).
+     rx::scene::Camera unjitteredCam = cam;
+     unjitteredCam.jitter = glm::vec2(0.0F, 0.0F);
+     CHECK(cam.cullingProj() == unjitteredCam.cullingProj());
+ }
+ 
++// --- Exposure [Phase 5 Task 4/#40; gate ruling rulings-2026-08-20.md T4,
++// matrix-p5t04-camera-exposure.md] --------------------------------------
++
++TEST_CASE(
++    "rx::scene::exposure::ev100()/exposure() match Filament's ported Exposure.cpp formulas at 5 aperture/shutter/ISO "
++    "triples [google/filament v1.75.0, commit 0e58877]") {
++    // Expected values independently computed (python3, double precision)
++    // straight from Filament's own formulas
++    // (ev100 = log2((N^2/t)*(100/S)), exposure = 1/(1.2*(N^2/t)*(100/S))),
++    // not derived from this file's own port -- see this TEST_CASE's own
++    // report for the derivation. Spans bright daylight (Filament's own
++    // Camera.h defaults) through a bright-sun narrow-aperture case.
++    struct Case {
++        const char* name;
++        float aperture;
++        float shutterSpeed;
++        float sensitivity;
++        float expectedEv100;
++        float expectedExposure;
++    };
++    const Case cases[] = {
++        {"daylight (Filament Camera.h default)", 16.0F, 1.0F / 125.0F, 100.0F, 14.965784F, 2.604166667e-05F},
++        {"low light", 1.4F, 1.0F / 15.0F, 3200.0F, -0.122256F, 0.9070294785F},
++        {"overcast", 8.0F, 1.0F / 250.0F, 400.0F, 11.965784F, 0.0002083333333F},
++        {"indoor", 2.8F, 1.0F / 60.0F, 800.0F, 5.877744F, 0.0141723356F},
++        {"bright sun, narrow aperture", 22.0F, 1.0F / 1000.0F, 400.0F, 16.884648F, 6.887052342e-06F},
++    };
++    for (const Case& c : cases) {
++        CAPTURE(c.name);
++        const float ev100 = rx::scene::exposure::ev100(c.aperture, c.shutterSpeed, c.sensitivity);
++        CHECK(ev100 == doctest::Approx(c.expectedEv100).epsilon(0.0001));
++        // Merged 3-argument form.
++        const float exposureMerged = rx::scene::exposure::exposure(c.aperture, c.shutterSpeed, c.sensitivity);
++        CHECK(exposureMerged == doctest::Approx(c.expectedExposure).epsilon(0.0001));
++        // 1-argument EV100 overload -- mathematically identical (Filament's
++        // own doc comment on the merged form makes this claim explicitly;
++        // asserted here, not just assumed).
++        const float exposureFromEv100 = rx::scene::exposure::exposure(ev100);
++        CHECK(exposureFromEv100 == doctest::Approx(c.expectedExposure).epsilon(0.0001));
++    }
++}
++
++TEST_CASE("Camera exposure: photographic-triple defaults match Filament's own Camera.h defaults verbatim "
++          "[details/Camera.h:211-213, v1.75.0]") {
++    rx::scene::Camera cam;
++    CHECK(cam.aperture == doctest::Approx(16.0F));
++    CHECK(cam.shutterSpeed == doctest::Approx(1.0F / 125.0F));
++    CHECK(cam.sensitivity == doctest::Approx(100.0F));
++    // Confirms these really are a real, non-degenerate daylight exposure
++    // (~14.97 EV100) -- NOT what exposure() itself resolves to by default,
++    // see the next TEST_CASE.
++    CHECK(cam.ev100() == doctest::Approx(14.965784F).epsilon(0.0001));
++}
++
++TEST_CASE("Camera exposure: default-constructed Camera resolves to a neutral (1.0) multiplier despite its "
++          "non-neutral photographic defaults [matrix-p5t04 row 4, Conflicts row 2 -- the D17 byte-identical "
++          "regression-guard default]") {
++    rx::scene::Camera cam;
++    CHECK(cam.exposure() == doctest::Approx(1.0F));
++    // ev100() still reflects the real triple, unaffected by the override.
++    CHECK(cam.ev100() == doctest::Approx(14.965784F).epsilon(0.0001));
++    // NOT what a literal `exposure::exposure(cam.ev100())` would give --
++    // proves the override, not a coincidence of the triple's own math,
++    // is what makes exposure() read 1.0.
++    CHECK(rx::scene::exposure::exposure(cam.ev100()) != doctest::Approx(1.0F));
++}
++
++TEST_CASE("Camera::setExposure(triple) clamps to Filament's exact ranges [details/Camera.cpp:45-50, v1.75.0] and "
++          "clears any direct override") {
++    rx::scene::Camera cam;
++    cam.setExposure(/*ev100Override=*/3.0F);
++    REQUIRE(cam.exposure() == doctest::Approx(rx::scene::exposure::exposure(3.0F)));
++
++    // Out-of-range triple -- every component clamped independently.
++    cam.setExposure(/*aperture=*/0.01F, /*shutterSpeed=*/1000.0F, /*sensitivity=*/1'000'000.0F);
++    CHECK(cam.aperture == doctest::Approx(0.5F));       // clamped up to MIN_APERTURE.
++    CHECK(cam.shutterSpeed == doctest::Approx(60.0F));  // clamped down to MAX_SHUTTER_SPEED.
++    CHECK(cam.sensitivity == doctest::Approx(204800.0F));  // clamped down to MAX_SENSITIVITY.
++
++    // The prior ev100Override is gone -- exposure() now derives from the
++    // (clamped) triple, not the stale override value.
++    const float expected = rx::scene::exposure::exposure(cam.aperture, cam.shutterSpeed, cam.sensitivity);
++    CHECK(cam.exposure() == doctest::Approx(expected));
++    CHECK(cam.exposure() != doctest::Approx(rx::scene::exposure::exposure(3.0F)));
++
++    // In-range triple: passes through unclamped.
++    cam.setExposure(/*aperture=*/4.0F, /*shutterSpeed=*/1.0F / 200.0F, /*sensitivity=*/400.0F);
++    CHECK(cam.aperture == doctest::Approx(4.0F));
++    CHECK(cam.shutterSpeed == doctest::Approx(1.0F / 200.0F));
++    CHECK(cam.sensitivity == doctest::Approx(400.0F));
++}
++
++TEST_CASE("Camera::setExposure(ev100Override) bypasses the photographic triple entirely, independent of "
++          "aperture/shutterSpeed/sensitivity") {
++    rx::scene::Camera cam;
++    cam.aperture = 4.0F;
++    cam.shutterSpeed = 1.0F / 200.0F;
++    cam.sensitivity = 400.0F;
++    const float triplePreOverride = cam.exposure();  // exposure::exposure(ev100()) -- no override engaged yet.
++
++    cam.setExposure(/*ev100Override=*/5.0F);
++    CHECK(cam.exposure() == doctest::Approx(rx::scene::exposure::exposure(5.0F)));
++    // The triple is untouched by the direct override.
++    CHECK(cam.aperture == doctest::Approx(4.0F));
++    CHECK(cam.shutterSpeed == doctest::Approx(1.0F / 200.0F));
++    CHECK(cam.sensitivity == doctest::Approx(400.0F));
++    // ev100() still reflects the triple, not the override value (5.0).
++    CHECK(cam.ev100() == doctest::Approx(rx::scene::exposure::ev100(4.0F, 1.0F / 200.0F, 400.0F)));
++    CHECK(cam.exposure() != doctest::Approx(triplePreOverride));
++}
++
++TEST_CASE("Camera::clearExposureOverride() restores the same neutral 1.0 default a freshly-constructed Camera has") {
++    rx::scene::Camera cam;
++    cam.setExposure(/*ev100Override=*/8.0F);
++    REQUIRE(cam.exposure() != doctest::Approx(1.0F));
++
++    cam.clearExposureOverride();
++    CHECK(cam.exposure() == doctest::Approx(1.0F));
++
++    // Symmetric with a triple-setting override-clear: after clamping to an
++    // in-range daylight-ish triple, exposure() derives from IT, not 1.0.
++    cam.setExposure(16.0F, 1.0F / 125.0F, 100.0F);
++    CHECK(cam.exposure() == doctest::Approx(2.604166667e-05F).epsilon(0.0001));
++}
++
+ TEST_CASE("Camera::view() places the camera at its own local origin looking down its own forward axis") {
+     rx::scene::Camera cam;
+     cam.position = glm::vec3(3.0F, 4.0F, 5.0F);
+     const glm::mat4 v = cam.view();
+     // The camera's own position transforms to the view-space origin.
+     const glm::vec4 viewSpaceOrigin = v * glm::vec4(cam.position, 1.0F);
+     CHECK(viewSpaceOrigin.x == doctest::Approx(0.0F).epsilon(0.0001));
+     CHECK(viewSpaceOrigin.y == doctest::Approx(0.0F).epsilon(0.0001));
+     CHECK(viewSpaceOrigin.z == doctest::Approx(0.0F).epsilon(0.0001));
+ 
