@@ -543,12 +543,27 @@ std::optional<DecodedStbHdrImage> decodeExrImage(std::span<const std::byte> byte
         // confirmed directly, task-exr-report.md, since neither is in
         // tinyexr's own internal allow-list; ZFP is separately named by
         // tinyexr itself, "ZFP compression is not supported.") and any
-        // other header-parse failure (truncated/corrupt attribute data).
+        // other header-parse failure (truncated/corrupt attribute data,
+        // malformed channel info, etc.).
         std::string wrapped = "EXR decode rejected: ";
         wrapped += (headerErr != nullptr) ? headerErr : "header parse failed";
-        wrapped +=
-            " (known excluded codecs: DWAA, DWAB -- not implemented by the vendored tinyexr build; ZFP -- "
-            "requires an additional dependency, not enabled); ";
+        // [issue #75 fix round 1] The known-excluded-codec parenthetical
+        // is only relevant when tinyexr's OWN message is actually about
+        // compression support -- its three compression-related failure
+        // strings ("Unknown compression type.", "PIZ compression is not
+        // supported.", "ZFP compression is not supported.") all contain
+        // "compression"; every OTHER header-parse failure this branch can
+        // reach (truncated/corrupt attribute data, malformed channel
+        // info, ...) does not, and appending a codec list unrelated to
+        // the actual failure would be misleading, not actionable.
+        const bool isCompressionFailure =
+            headerErr != nullptr && std::string(headerErr).find("compression") != std::string::npos;
+        if (isCompressionFailure) {
+            wrapped +=
+                " (known excluded codecs: DWAA, DWAB -- not implemented by the vendored tinyexr build; ZFP -- "
+                "requires an additional dependency, not enabled)";
+        }
+        wrapped += "; ";
         wrapped += kExrSupportedEnvelope;
         if (outFailureReason != nullptr) {
             *outFailureReason = wrapped;
@@ -925,6 +940,21 @@ TextureDecodeResult decodeStbForUpload(std::span<const std::byte> bytes, Texture
     return result;
 }
 
+// [Phase 5 Task 6/issue #75 fix round 1] Shared Failed-outcome builder --
+// decodeStbHdrForUpload()/decodeExrForUpload() below both need exactly
+// this shape on their own decode-failure branch (before either ever
+// reaches finalizeHdrFloatUpload()): a fresh, role-tagged
+// TextureDecodeResult with outcome=Failed and `reason` as the
+// failureReason. Factored out to close the near-identical boilerplate
+// those two functions used to duplicate.
+TextureDecodeResult makeFailedResult(TextureRole role, std::string reason) {
+    TextureDecodeResult result;
+    result.role = role;
+    result.outcome = TextureDecodeResult::Outcome::Failed;
+    result.failureReason = std::move(reason);
+    return result;
+}
+
 // [Phase 5 Task 6, extended by issue #75] Shared tail for BOTH float-RGBA
 // environment sources -- Radiance .hdr (decodeStbImageHdr()) and OpenEXR
 // .exr (decodeExrImage()) -- one shared implementation per D5/Task 15's
@@ -1008,11 +1038,7 @@ TextureDecodeResult decodeStbHdrForUpload(std::span<const std::byte> bytes, Text
     std::string failureReason;
     auto decoded = decodeStbImageHdr(bytes, &failureReason);
     if (!decoded.has_value()) {
-        TextureDecodeResult result;
-        result.role = role;
-        result.outcome = TextureDecodeResult::Outcome::Failed;
-        result.failureReason = std::string("stb HDR decode failed: ") + failureReason;
-        return result;
+        return makeFailedResult(role, std::string("stb HDR decode failed: ") + failureReason);
     }
     return finalizeHdrFloatUpload(*decoded, role, maxImageDimension2D, isFormatSupported);
 }
@@ -1027,11 +1053,7 @@ TextureDecodeResult decodeExrForUpload(std::span<const std::byte> bytes, Texture
     std::string failureReason;
     auto decoded = decodeExrImage(bytes, &failureReason);
     if (!decoded.has_value()) {
-        TextureDecodeResult result;
-        result.role = role;
-        result.outcome = TextureDecodeResult::Outcome::Failed;
-        result.failureReason = failureReason;
-        return result;
+        return makeFailedResult(role, std::move(failureReason));
     }
     return finalizeHdrFloatUpload(*decoded, role, maxImageDimension2D, isFormatSupported);
 }

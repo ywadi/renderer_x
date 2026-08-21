@@ -725,17 +725,27 @@ TEST_CASE("decodeExrImage: rejects DWAA compression loudly (genuinely unimplemen
     auto decoded = decodeExrImage(std::span<const std::byte>(bytes), &failureReason);
     CHECK_FALSE(decoded.has_value());
     CHECK(failureReason.find("DWAA") != std::string::npos);
+    // [issue #75 fix round 1] This IS a genuine compression-support
+    // failure (tinyexr's own "Unknown compression type." message) -- the
+    // known-excluded-codec parenthetical must be present, the mirror
+    // image of the corrupt/truncated test's own negative assertion below.
+    CHECK(failureReason.find("known excluded codecs") != std::string::npos);
     CHECK(failureReason.find("supported envelope") != std::string::npos);
 }
 
 TEST_CASE("decodeExrImage: a corrupt/truncated .exr byte stream fails cleanly with a non-empty failure reason, "
-          "never a crash [mirrors decodeStbImageHdr()'s identical corrupt.hdr test]") {
+          "never a crash [mirrors decodeStbImageHdr()'s identical corrupt.hdr test] -- and, since this failure is "
+          "unrelated to compression support (tinyexr's own message here is \"Failed to read attribute.\", "
+          "confirmed directly), the known-excluded-codec parenthetical must NOT be appended [issue #75 fix round "
+          "1: scoping proof, mirrors the DWAA rejection test's own positive case above]") {
     auto bytes = readFixture("gate_test_env.exr");
     std::vector<std::byte> truncated(bytes.begin(), bytes.begin() + 16);
     std::string failureReason;
     auto decoded = decodeExrImage(std::span<const std::byte>(truncated), &failureReason);
     CHECK_FALSE(decoded.has_value());
     CHECK_FALSE(failureReason.empty());
+    CHECK(failureReason.find("known excluded codecs") == std::string::npos);
+    CHECK(failureReason.find("DWAA") == std::string::npos);
 }
 
 TEST_CASE("decodeExrImage: an empty byte span fails cleanly") {
