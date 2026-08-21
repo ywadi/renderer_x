@@ -77,13 +77,15 @@ inline constexpr VkFormat kHdrFormat = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
 // `VK_FORMAT_R16G16B16A16_SFLOAT`: four IEEE-754-binary16-compatible
 // channels (1 sign + 5 exponent + 10 mantissa bits each), including alpha,
 // symmetric across every channel -- proven by
-// `SceneColorGpu::EscapeHatchPreservesNegativeAndSymmetricPrecision`
-// (test_scene_color_gpu.cpp), which writes a negative value through this
-// format and confirms R/G/B decode with IDENTICAL, symmetric rounding
-// error via `glm::unpackHalf4x16`, unlike kHdrFormat's proven asymmetry
-// above. This was RGBA16F's status quo before this task (all four samples
-// used it as their sole HDR format) -- kept alive as the documented
-// fallback rather than removed, exactly per the ruling's wording.
+// `test_scene_color_gpu.cpp`'s TEST_CASE "SceneColorGpu: the escape hatch
+// (kHdrFormatHighPrecision) preserves a negative value and decodes with
+// symmetric channel precision, unlike kHdrFormat", which writes a negative
+// value through this format and confirms R/G/B decode with IDENTICAL,
+// symmetric rounding error via `glm::unpackHalf4x16`, unlike kHdrFormat's
+// proven asymmetry above. This was RGBA16F's status quo before this task
+// (all four samples used it as their sole HDR format) -- kept alive as
+// the documented fallback rather than removed, exactly per the ruling's
+// wording.
 inline constexpr VkFormat kHdrFormatHighPrecision = VK_FORMAT_R16G16B16A16_SFLOAT;
 
 // [Task 3 (#39), matrix row 6] The canonical name every pass that
@@ -210,9 +212,10 @@ inline constexpr const char* kSceneColorResourceName = "hdr";
 // volumetrics -- Task 30) that may need to read-modify-write scene color
 // as a storage image, not only sample it: `kHdrFormat`'s
 // `VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT` support is empirically confirmed
-// (both lavapipe and the real NVIDIA driver, this task's own
-// `SceneColorGpu::FormatSupportsColorAttachmentAndLinearSampling` test
-// logs it) but is NOT guaranteed the same way `kHdrFormatHighPrecision`'s
+// (both lavapipe and the real NVIDIA driver -- `test_scene_color_gpu.cpp`'s
+// TEST_CASE "SceneColorGpu: kHdrFormat and kHdrFormatHighPrecision
+// empirically support COLOR_ATTACHMENT + linear-filtered sampling on this
+// driver" logs it) but is NOT guaranteed the same way `kHdrFormatHighPrecision`'s
 // is (RGBA16F's storage-image/UAV read+write support has no known vendor
 // caveat on any graphics API; packed-float formats like `kHdrFormat`
 // historically do on the closest cross-API analogue, DirectX's
