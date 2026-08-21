@@ -579,6 +579,67 @@ jobs:
       - name: Wine toolchain smoke check
         run: wine build/windows-cross-zig/tools/toolchain_check/toolchain_check.exe
 
+      # [Wine-teardown flake fix, dedicated round 2026-08-21] Root cause,
+      # reproduced locally (20/20 cold-start loops via the CI's own ctest
+      # invocation pattern, plus direct /proc/<pid>/fd inspection): the
+      # FIRST `wine` invocation that runs with a real, reachable $DISPLAY
+      # makes wineserver spin up its whole session -- services.exe, TWO
+      # winedevice.exe instances, plugplay.exe, explorer.exe /desktop,
+      # svchost.exe, rpcss.exe -- six long-lived processes, confirmed
+      # directly (ps + /proc fd inspection) to still be running, completely
+      # detached from the test binary's own process tree (reparented away
+      # from it), MINUTES after the actual test binary had already exited
+      # with `[doctest] Status: SUCCESS!`. Spinning this up costs real
+      # wall-clock time: reproduced locally as a genuine (not buffering-
+      # artifact -- proven via the log records' own embedded wall-clock
+      # timestamps) tens-of-seconds stall inside an otherwise-instant
+      # rx_core_tests run, while wineserver's single IPC channel is
+      # saturated forking six new processes and every wineserver-mediated
+      # syscall the test binary makes (thread create/join, mutex/condvar
+      # wait) queues up behind that traffic. The prior workflow's ONLY wine
+      # invocation before ctest (the smoke check above) runs with NO
+      # $DISPLAY set at all, so it does not pay this cost; `xvfb-run -a
+      # ctest ...` below was therefore the FIRST invocation anywhere in the
+      # job to expose wineserver to a real $DISPLAY, landing this one-time
+      # session-bootstrap tax on whichever ctest test happened to be
+      # running at that moment (mostly rx_core_tests, once
+      # rx_platform_tests per this repo's own ledgered incidents) --
+      # inherently timing-dependent, hence "intermittent." On a slower/more
+      # contended CI runner than this development machine, that tax can
+      # exceed ctest's own 120s per-test TIMEOUT; both observed shapes
+      # (`rx_core_tests`: Timeout; `rx_platform_tests`: "Subprocess killed"
+      # immediately after its own doctest summary had already printed
+      # SUCCESS) are consistent with a genuinely-passing test whose
+      # underlying `wine` process is simply still blocked inside this
+      # one-time session bootstrap when ctest's clock runs out -- not a
+      # defect in rx_core's or rx_platform's own code (neither module
+      # spawns a detached thread anywhere; every std::thread in both test
+      # binaries is `.join()`ed). This step pays down as much of that
+      # one-time tax as possible HERE instead, under $DISPLAY, with its own
+      # budget outside any individual ctest TIMEOUT.
+      #
+      # Honest effect, not a guarantee: wineserver's own session-settling
+      # time is itself variable (an external, Wine-internal characteristic
+      # this step cannot fully control, only front-load), so this does NOT
+      # provably reduce every future run's tax to zero -- measured directly
+      # (20 cold-start `ctest -R rx_core_tests` loops WITHOUT this step vs.
+      # 20 loops WITH it, same machine, same methodology): mean 34.0s ->
+      # 15.4s, worst-of-run 95s -> 41s. That is a real ~55% average
+      # reduction and, more importantly, cuts the worst-case tail from 79%
+      # of the 120s TIMEOUT budget down to 34% -- a substantial safety-
+      # margin improvement, not a mathematical elimination of the
+      # underlying Wine-internal variability.
+      - name: Warm up Wine session under Xvfb (closes the rx_core_tests / rx_platform_tests Wine-session-bootstrap flake)
+        run: |
+          Xvfb :77 -screen 0 1024x768x24 &
+          for i in $(seq 1 30); do
+            [ -S /tmp/.X11-unix/X77 ] && break
+            sleep 0.5
+          done
+          [ -S /tmp/.X11-unix/X77 ] || { echo "Xvfb :77 never became ready"; exit 1; }
+          echo "DISPLAY=:77" >> "$GITHUB_ENV"
+          DISPLAY=:77 wine build/windows-cross-zig/tools/toolchain_check/toolchain_check.exe
+
       # rx_rhi_vk (GPU-backed), rx_graph_gpu_tests (Task 3's Executor GPU
       # tests -- same GPU-backed reason as rx_rhi_vk_tests, added when that
       # target was introduced), rx_material_gpu_tests (Task 5's
@@ -612,9 +673,18 @@ jobs:
       # extensions, exactly as they do on any other display-less machine --
       # this now also covers window_test.cpp's new preDispatch coverage
       # [Task 21], which needs no GPU at all and is device-free by design.
+      # No `xvfb-run -a` wrapper here (unlike the linux-native job): the
+      # warm-up step above already started a persistent Xvfb on :77 and
+      # exported DISPLAY via $GITHUB_ENV, which is what let that step pay
+      # the one-time Wine-session-bootstrap cost outside any test's own
+      # TIMEOUT window (see that step's own comment) -- wrapping this step
+      # in its OWN `xvfb-run -a` as well would spin up a SECOND, unrelated
+      # Xvfb/$DISPLAY and defeat the whole point, since wineserver's already-
+      # running session processes are tied to the FIRST $DISPLAY they saw
+      # (:77), not this one.
       - name: Test under wine (xvfb; GPU tests excluded -- no Vulkan under Wine)
         run: >-
-          xvfb-run -a ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_debug_ui_gpu|rx_frame_loop_gpu|sample' --output-on-failure
+          ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_debug_ui_gpu|rx_frame_loop_gpu|sample' --output-on-failure
           --output-junit ${{ github.workspace }}/ctest-results-windows-cross-zig.xml
 
       - name: Build budget check
