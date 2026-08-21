@@ -270,6 +270,66 @@ TEST_CASE("PresentLoop: the Suspended path [extentOverrideForTesting DI seam, mi
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 
+TEST_CASE("PresentLoop: a Device already surface-lost BEFORE the first runFrame() call [Phase 5 Task 5 review "
+          "round, Medium finding #2; matrix row 9's own literal acceptance criterion: 'a targeted regression test "
+          "constructs a Device already in the surface-lost state and asserts the helper's very first "
+          "acquireNextImage() call is handled without falling through to frame recording']: the FIRST runFrame() "
+          "call short-circuits to Result::SurfaceLost, frameBody is never invoked, and NO real "
+          "vkAcquireNextImageKHR is attempted") {
+    auto fixture = makeFixture("rx_frame_loop_pre_lost");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto loop = PresentLoop::create(PresentLoop::CreateInfo{&fixture->device, fixture->surface, &fixture->window});
+    REQUIRE(loop.has_value());
+    CHECK_FALSE(loop->isSurfaceLost());
+
+    // Constructs the EXACT ordering matrix row 9 names -- a Device already
+    // in the surface-lost state BEFORE this PresentLoop's own first
+    // runFrame() call, i.e. PresentLoop's OWN surfaceLost_ latch
+    // (present_loop.cpp) is still false (this fresh loop has never itself
+    // observed a loss) while the Device it wraps already is (e.g. a host
+    // sharing one Device across multiple PresentLoop lifetimes, or a
+    // recreateSwapchain() call made outside this loop's own
+    // recreateAndDependents()). This is exactly the case runFrame()'s own
+    // top-of-function `if (surfaceLost_)` guard (present_loop.cpp) does
+    // NOT catch (it only ever sees ITS OWN prior detections) -- the real
+    // short-circuit this test targets is the SECOND one, inside the
+    // acquire-status branch, which reads `device_->acquireNextImage()`'s
+    // own live status rather than a cached flag. See device.h's own
+    // forceSurfaceLostForTesting() comment for why this is the only way an
+    // automated suite can construct this precise ordering (a genuinely
+    // destroyed native window is MANUAL_VERIFICATION-only per
+    // surface_loss_test.cpp's own header comment).
+    rx::rhi::detail::forceSurfaceLostForTesting(fixture->device);
+    REQUIRE(fixture->device.isSurfaceLost());
+
+    const uint64_t acquireBefore = fixture->device.acquireCallCount();
+    bool frameBodyCalled = false;
+    const Result result = loop->runFrame([&](const FrameContext&) { frameBodyCalled = true; });
+
+    CHECK(result == Result::SurfaceLost);
+    CHECK_FALSE(frameBodyCalled);
+    // No real vkAcquireNextImageKHR was ever attempted -- Device::
+    // acquireNextImage()'s own surfaceLost_ short-circuit (device.cpp)
+    // returns SwapchainStatus::SurfaceLost WITHOUT incrementing
+    // acquireCallCount_ [Phase 4 Task 17, gate ruling #25's own "present
+    // skip asserted by CALL COUNTS" convention], exactly like the
+    // Suspended-path test above.
+    CHECK(fixture->device.acquireCallCount() == acquireBefore);
+    // runFrame() latches its OWN surfaceLost_ flag too, matching every
+    // other SurfaceLost-detecting path in this class
+    // (recreateAndDependents(), the mid-loop acquire/present branches) --
+    // a SECOND runFrame() call would now take the top-of-function guard
+    // this ordering originally bypassed.
+    CHECK(loop->isSurfaceLost());
+
+    vkDeviceWaitIdle(fixture->device.device());
+    loop.reset();
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
 TEST_CASE("PresentLoop::recreateAndDependents() (WITH a RenderGraph) called twice with an unchanged surface is a "
           "correctness no-op -- rendering keeps working cleanly afterward [Phase 5 Task 5 row 10 integration: "
           "RenderGraph::compile()'s own recompile-skip is exercised through PresentLoop's real call path, not "

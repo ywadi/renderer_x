@@ -608,6 +608,12 @@ void Device::destroyAll() {
     }
 }
 
+namespace detail {
+
+void forceSurfaceLostForTesting(Device& device) { device.surfaceLost_ = true; }
+
+}  // namespace detail
+
 AcquireResult Device::acquireNextImage(VkSemaphore signal) {
     // FrameSync's frame loop begins here every iteration [Phase 4 Stage 0
     // Task 3, spec D3: "FrameSync acquire/present" zone placement --

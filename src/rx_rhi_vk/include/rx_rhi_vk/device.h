@@ -111,6 +111,35 @@ enum class PresentMode {
 // codebase never requests).
 const char* presentModeName(VkPresentModeKHR mode);
 
+class Device;
+
+namespace detail {
+
+// Test-only seam -- NOT part of the stable public contract, mirroring
+// `rx::rhi::detail::debugSlotBufferData()`'s own carve-out convention
+// (per_frame_storage_buffer.h) and `rx::material::detail::
+// debugFrameBufferData()`'s (instance.h): the ONLY way this repo's own
+// automated test suites can construct "a Device already in the
+// surface-lost state" [Phase 5 Task 5, ticket #41 review round, Medium
+// finding #2, matrix row 9's own literal acceptance-criterion text] is a
+// GENUINE destroyed native window, which `surface_loss_test.cpp`'s own
+// header comment already documents as MANUAL_VERIFICATION-only -- "no CI
+// driver/display backend this repo's fixtures use can be made to
+// genuinely destroy a live window out from under a running process the
+// way a real desktop's window manager can". Directly setting the SAME
+// `surfaceLost_` flag `recreateSwapchain()`'s own real
+// `isSurfaceLossResult()`-classified failure path sets (device.cpp) lets
+// a GPU test exercise every DOWNSTREAM consumer of that state
+// (`acquireNextImage()`'s/`present()`'s own short-circuits, and --
+// `present_loop_gpu_test.cpp`'s own use -- `PresentLoop::runFrame()`'s
+// first-call short-circuit) deterministically, without needing the
+// underlying VkSurfaceKHR/native window to have genuinely died (both stay
+// perfectly valid Vulkan objects here -- only the LOGICAL state this
+// class's own callers observe is forced).
+void forceSurfaceLostForTesting(Device& device);
+
+}  // namespace detail
+
 // Device owns the logical VkDevice selected/built against a Context's
 // vkb::Instance, its graphics and present queues, and a VkSwapchainKHR built
 // against a caller-provided VkSurfaceKHR.
@@ -137,6 +166,8 @@ public:
     Device(const Device&) = delete;
     Device& operator=(const Device&) = delete;
     ~Device();
+
+    friend void detail::forceSurfaceLostForTesting(Device& device);
 
     static std::optional<Device> create(Context& context, VkSurfaceKHR surface);
 
