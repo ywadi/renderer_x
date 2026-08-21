@@ -1,0 +1,1482 @@
+# Review package: 9f7dfb2..e341433
+
+## Commits
+e341433 feat(rx_graph): HDR scene-color single source + FG6 no-MSAA ruling (#39)
+
+## Files changed
+ samples/05_multipass/main.cpp               |  12 +-
+ samples/07_stress/main.cpp                  |   9 +-
+ samples/08_gltf_viewer/main.cpp             |  14 +-
+ samples/09_scene/main.cpp                   |   9 +-
+ src/rx_graph/include/rx_graph/scene_color.h | 224 +++++++++
+ src/rx_graph/tests/CMakeLists.txt           |  10 +
+ src/rx_graph/tests/test_scene_color.cpp     |  48 ++
+ src/rx_graph/tests/test_scene_color_gpu.cpp | 694 ++++++++++++++++++++++++++++
+ 8 files changed, 1005 insertions(+), 15 deletions(-)
+
+## Diff
+diff --git a/samples/05_multipass/main.cpp b/samples/05_multipass/main.cpp
+index 2952f20..6840068 100644
+--- a/samples/05_multipass/main.cpp
++++ b/samples/05_multipass/main.cpp
+@@ -16,21 +16,22 @@
+ // own tonemap-pass-entry barrier (compile() always derives a resource's
+ // first access as a fresh UNDEFINED->newLayout transition, correct for
+ // both a real just-acquired swapchain image and an offscreen headless
+ // target reused call-to-call -- see "BACKBUFFER REUSE ACROSS repeated
+ // execute() CALLS" below for why the latter is still safe here).
+ //
+ // GRAPH SHAPE: three passes, three resources besides the backbuffer --
+ //   shadow   (writes "shadowmap": Absolute 1024x1024 D32_SFLOAT, depth-only,
+ //             no fragment shader stage at all -- see shadow.vert.slang)
+ //   forward  (reads "shadowmap" as a texture input; writes "hdr":
+-//             SwapchainRelative R16G16B16A16_SFLOAT, and its own "depth":
++//             SwapchainRelative rx::graph::kHdrFormat [Task 3 (#39),
++//             B10G11R11_UFLOAT_PACK32], and its own "depth":
+ //             SwapchainRelative D32_SFLOAT -- "depth" has no reader
+ //             anywhere else in the graph, which is fine: it is an
+ //             attachment-only resource, and forward itself is kept alive by
+ //             "hdr" having a real downstream reader, not by "depth")
+ //   tonemap  (reads "hdr"; writes "backbuffer", the graph's
+ //             setBackbufferSource() target)
+ //
+ // SCENE: one ground plane (XZ, y=0, half-size kGroundHalfSize) plus one cube
+ // and one sphere sitting on it -- reusing samples/03_bindless_mesh's
+ // procedural cube/sphere GENERATORS (adapted here to also emit a per-vertex
+@@ -128,20 +129,21 @@
+ //   [Phase 4 Task 6]: forwarded into Device::setPresentMode() +
+ //   recreateSwapchain() right after Device::create(), before any
+ //   per-swapchain-image resource is built. Has no effect in headless mode,
+ //   whose swapchain is built once and never presented -- the flag still
+ //   parses there, it just has nothing to apply to.
+ #include <rx_core/log.h>
+ #include <rx_core/profile.h>
+ #include <rx_platform/window.h>
+ #include <rx_graph/executor.h>
+ #include <rx_graph/render_graph.h>
++#include <rx_graph/scene_color.h>
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/frame_sync.h>
+ #include <rx_rhi_vk/mesh_buffers.h>
+ #include <rx_rhi_vk/pipeline_layout.h>
+ #include <rx_rhi_vk/upload.h>
+ #include <rx_shader/compiler.h>
+@@ -182,21 +184,23 @@ constexpr uint32_t kHeadlessWidth = 256;
+ constexpr uint32_t kHeadlessHeight = 256;
+ constexpr VkDeviceSize kHeadlessPixelBytes = static_cast<VkDeviceSize>(kHeadlessWidth) * kHeadlessHeight * 4;
+ constexpr uint32_t kHeadlessFrameCount = 3;
+ 
+ constexpr uint32_t kPresentWidth = 900;
+ constexpr uint32_t kPresentHeight = 700;
+ constexpr float kLightOrbitRadPerSec = 0.3F;
+ 
+ constexpr uint32_t kShadowMapSize = 1024;
+ constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
+-constexpr VkFormat kHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
++// [Task 3 (#39)] the engine-owned HDR scene-color format
++// (rx::graph::kHdrFormat, rx_graph/scene_color.h) replaces this sample's
++// own former copy -- see that header for the format ruling + rationale.
+ 
+ // [fix round 1] the single source of truth for ObjectTransform, shared by
+ // the shadow and lit passes -- concatenated ahead of each pass's own
+ // file(s) below, never Slang `import`ed/`__include`d; see that file's own
+ // header comment for why.
+ constexpr const char* kSceneTypesFilename = "scene_types.slang";
+ constexpr const char* kShadowVertFilename = "shadow.vert.slang";
+ constexpr const char* kLitVertFilename = "lit.vert.slang";
+ constexpr const char* kLitFragFilename = "lit.frag.slang";
+ constexpr const char* kTonemapVertFilename = "tonemap.vert.slang";
+@@ -1057,21 +1061,21 @@ bool buildLitPipeline(VkDevice device, rx::shader::Compiler& compiler, VkDescrip
+ 
+     std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+     VkPipelineDynamicStateCreateInfo dynamicState{};
+     dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+     dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+     dynamicState.pDynamicStates = dynamicStates.data();
+ 
+     VkPipelineRenderingCreateInfo renderingCreateInfo{};
+     renderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+     renderingCreateInfo.colorAttachmentCount = 1;
+-    renderingCreateInfo.pColorAttachmentFormats = &kHdrFormat;
++    renderingCreateInfo.pColorAttachmentFormats = &rx::graph::kHdrFormat;
+     renderingCreateInfo.depthAttachmentFormat = kDepthFormat;
+ 
+     VkGraphicsPipelineCreateInfo pipelineInfo{};
+     pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+     pipelineInfo.pNext = &renderingCreateInfo;
+ 
+     std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+     stages[0].module = scene.litPass.vertModule;
+@@ -1512,21 +1516,21 @@ void recordTonemapDraw(rx::graph::PassContext& ctx, Scene& scene) {
+ // src/rx_graph/tests/test_execute_gpu.cpp's own "resize-rerealize" test for
+ // the proof this is a supported, tested RenderGraph usage pattern (no
+ // addPass()/reset() needed for a plain re-compile at a new size).
+ void declareGraph(rx::graph::RenderGraph& graph, Scene& scene, VkFormat backbufferFormat) {
+     graph.addPass("shadow")
+         .setDepthStencilOutput("shadowmap", absoluteDesc(kDepthFormat, kShadowMapSize, kShadowMapSize))
+         .setExecute([&scene](rx::graph::PassContext& ctx) { recordShadowDraws(ctx, scene); });
+ 
+     graph.addPass("forward")
+         .addTextureInput("shadowmap")
+-        .addColorOutput("hdr", swapchainRelativeDesc(kHdrFormat))
++        .addColorOutput("hdr", swapchainRelativeDesc(rx::graph::kHdrFormat))
+         .setDepthStencilOutput("depth", swapchainRelativeDesc(kDepthFormat))
+         .setExecuteChunked([&scene](rx::graph::PassContext& ctx, uint32_t chunkIndex, uint32_t chunkCount) {
+             recordLitDrawsChunked(ctx, scene, chunkIndex, chunkCount);
+         });
+ 
+     graph.addPass("tonemap")
+         .addTextureInput("hdr")
+         .addColorOutput("backbuffer", swapchainRelativeDesc(backbufferFormat))
+         .setExecute([&scene](rx::graph::PassContext& ctx) { recordTonemapDraw(ctx, scene); });
+ 
+diff --git a/samples/07_stress/main.cpp b/samples/07_stress/main.cpp
+index 301063c..85f8e19 100644
+--- a/samples/07_stress/main.cpp
++++ b/samples/07_stress/main.cpp
+@@ -66,20 +66,21 @@
+ // same "graph_pass_chunk_fanout"/"graph_pass_chunk_record" zones
+ // executor.cpp already emits (spec D3), for single-thread vs default
+ // worker count.
+ //
+ // Registered as ctest sample_07_stress_headless.
+ #include <rx_core/log.h>
+ #include <rx_core/profile.h>
+ #include <rx_platform/window.h>
+ #include <rx_graph/executor.h>
+ #include <rx_graph/render_graph.h>
++#include <rx_graph/scene_color.h>
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/frame_sync.h>
+ #include <rx_rhi_vk/mesh_buffers.h>
+ #include <rx_rhi_vk/pipeline_layout.h>
+ #include <rx_rhi_vk/upload.h>
+ #include <rx_shader/compiler.h>
+@@ -122,21 +123,23 @@ constexpr uint32_t kHeadlessFrameCount = 3;
+ 
+ // The interactive/measurement default -- task-7-brief.md: "default --draws
+ // 30000". The ctest-registered headless gate overrides this to a much
+ // smaller value (see this sample's own CMakeLists.txt) -- chunk-count
+ // derivation is workerCount-only (executor.h), never drawCount-dependent,
+ // so a small gate drawCount exercises the identical parallel-recording
+ // machinery a real 30000-draw run does, just framed small enough for exact
+ // pixel probing.
+ constexpr uint32_t kDefaultDraws = 30000;
+ 
+-constexpr VkFormat kHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
++// [Task 3 (#39)] the engine-owned HDR scene-color format
++// (rx::graph::kHdrFormat, rx_graph/scene_color.h) replaces this sample's
++// own former copy -- see that header for the format ruling + rationale.
+ constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
+ 
+ // Both procedural meshes are generated at unit size (cube half-extent 1,
+ // sphere radius 1 -- see generateCube()/generateSphere() below) so a single
+ // `positionAndScale.w` scale factor applies uniformly to either shape, and
+ // both shapes' own TOP point (local +Y = 1) lands at exactly world Y ==
+ // scale after that one multiply -- the shared fact this file's probe
+ // derivation (topWorldPositionForInstance()) leans on.
+ constexpr float kInstanceScale = 0.85F;
+ // Spacing wide enough that two adjacent unit-scale instances (radius/half-
+@@ -659,21 +662,21 @@ bool buildForwardPipelines(VkDevice device, rx::shader::Compiler& compiler, VkDe
+ 
+     std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+     VkPipelineDynamicStateCreateInfo dynamicState{};
+     dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+     dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+     dynamicState.pDynamicStates = dynamicStates.data();
+ 
+     VkPipelineRenderingCreateInfo renderingCreateInfo{};
+     renderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+     renderingCreateInfo.colorAttachmentCount = 1;
+-    renderingCreateInfo.pColorAttachmentFormats = &kHdrFormat;
++    renderingCreateInfo.pColorAttachmentFormats = &rx::graph::kHdrFormat;
+     renderingCreateInfo.depthAttachmentFormat = kDepthFormat;
+ 
+     std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+     stages[0].module = scene.forwardPass.vertModule;
+     stages[0].pName = "main";
+     stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+     stages[1].module = scene.forwardPass.fragModule;
+@@ -1127,21 +1130,21 @@ void recordTonemapDraw(rx::graph::PassContext& ctx, Scene& scene) {
+     push.hdrTextureIndex = scene.hdrHandle.index();
+     push.hdrSamplerIndex = scene.samplerHandle.index();
+     vkCmdPushConstants(ctx.cmd, scene.tonemapPass.layoutBundle.layout, scene.tonemapPass.pushConstantStages,
+                        scene.tonemapPass.pushConstantOffset, scene.tonemapPass.pushConstantSize, &push);
+ 
+     vkCmdDraw(ctx.cmd, 3, 1, 0, 0);
+ }
+ 
+ void declareGraph(rx::graph::RenderGraph& graph, Scene& scene, VkFormat backbufferFormat) {
+     graph.addPass("forward")
+-        .addColorOutput("hdr", swapchainRelativeDesc(kHdrFormat))
++        .addColorOutput("hdr", swapchainRelativeDesc(rx::graph::kHdrFormat))
+         .setDepthStencilOutput("depth", swapchainRelativeDesc(kDepthFormat))
+         .setExecuteChunked([&scene](rx::graph::PassContext& ctx, uint32_t chunkIndex, uint32_t chunkCount) {
+             recordForwardChunked(ctx, scene, chunkIndex, chunkCount);
+         });
+ 
+     graph.addPass("tonemap")
+         .addTextureInput("hdr")
+         .addColorOutput("backbuffer", swapchainRelativeDesc(backbufferFormat))
+         .setExecute([&scene](rx::graph::PassContext& ctx) { recordTonemapDraw(ctx, scene); });
+ 
+diff --git a/samples/08_gltf_viewer/main.cpp b/samples/08_gltf_viewer/main.cpp
+index 823818a..81e1b37 100644
+--- a/samples/08_gltf_viewer/main.cpp
++++ b/samples/08_gltf_viewer/main.cpp
+@@ -67,20 +67,21 @@
+ // territory (abandon/teardown paths need REAL GPU-resource tests, never a
+ // mock). Asserted via zero unfiltered Vulkan validation errors through a
+ // real cancel-mid-import-then-destroy sequence.
+ #include <rx_asset/geometry_pool.h>
+ #include <rx_asset/registry.h>
+ #include <rx_asset/texture_cache.h>
+ #include <rx_core/log.h>
+ #include <rx_core/profile.h>
+ #include <rx_graph/executor.h>
+ #include <rx_graph/render_graph.h>
++#include <rx_graph/scene_color.h>
+ #include <rx_material/draw_data.h>
+ #include <rx_material/material_system.h>
+ #include <rx_platform/window.h>
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/deletion_queue.h>
+ #include <rx_rhi_vk/descriptor_arena.h>
+ #include <rx_rhi_vk/device.h>
+@@ -123,21 +124,23 @@
+ namespace {
+ 
+ // --- Constants --------------------------------------------------------------
+ constexpr uint32_t kHeadlessWidth = 256;
+ constexpr uint32_t kHeadlessHeight = 256;
+ constexpr VkDeviceSize kHeadlessPixelBytes = static_cast<VkDeviceSize>(kHeadlessWidth) * kHeadlessHeight * 4;
+ 
+ constexpr uint32_t kPresentWidth = 1280;
+ constexpr uint32_t kPresentHeight = 720;
+ 
+-constexpr VkFormat kHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
++// [Task 3 (#39)] the engine-owned HDR scene-color format
++// (rx::graph::kHdrFormat, rx_graph/scene_color.h) replaces this sample's
++// own former copy -- see that header for the format ruling + rationale.
+ constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
+ 
+ // A distinct, unmistakably-not-black "loading" color -- see recordLoadingPass()
+ // below. Chosen to be far from both the tonemapped scene's own likely
+ // palette and pure black/white, so a wrong-frame-shown-instead-of-loading
+ // bug (or vice versa) is visually obvious, not just barely distinguishable.
+ constexpr VkClearColorValue kLoadingClearColor{{0.06F, 0.10F, 0.22F, 1.0F}};
+ 
+ // --- CLI arguments ------------------------------------------------------
+ struct Args {
+@@ -547,31 +550,32 @@ struct MaterialGpuBinding {
+     rx::material::MaterialHandle handle;
+     std::vector<uint8_t> paramBlob;
+     std::optional<rx::rhi::Buffer> paramBuffer;
+     VkDescriptorSet paramSet = VK_NULL_HANDLE;
+     uint32_t pushOffset = 0;
+     uint32_t pushSize = 0;
+     VkShaderStageFlags pushStages = 0;
+ };
+ 
+ // [D7/D27] The forward pass's own attachment shape -- one HDR color target
+-// + one depth target, both fixed formats (kHdrFormat/kDepthFormat above),
+-// single-sampled. Built as a plain value (not stored per-instance state)
++// + one depth target, both fixed formats (rx::graph::kHdrFormat/
++// kDepthFormat above), single-sampled. Built as a plain value (not stored
++// per-instance state)
+ // since every field is a compile-time constant of this sample -- both
+ // setupMaterials()'s own D27 pre-resolution call and declareGraph()'s own
+ // Pass::addColorOutput()/setDepthStencilOutput() calls must derive the
+ // EXACT SAME PassSignature bit-for-bit (getPipeline()'s own cache key is
+ // this struct's hash()), so this one function is the sole place that shape
+ // is spelled out.
+ rx::material::PassSignature forwardPassSignature() {
+     rx::material::PassSignature sig;
+-    sig.colorFormats[0] = kHdrFormat;
++    sig.colorFormats[0] = rx::graph::kHdrFormat;
+     sig.colorCount = 1;
+     sig.depthFormat = kDepthFormat;
+     sig.samples = VK_SAMPLE_COUNT_1_BIT;
+     return sig;
+ }
+ 
+ // One forward-pass draw: a submesh's own geometry range (GeometryPool
+ // addressing) plus which row of the D26.1 bindless per-draw buffer
+ // (gDrawData[...][SV_VulkanInstanceID]) it reads and which material binds
+ // its own set-1 params.
+@@ -1649,21 +1653,21 @@ rx::graph::AttachmentDesc swapchainRelativeDesc(VkFormat format) {
+ // `Camera::cullingProj()` -- three independent call sites, one
+ // convention, per D29's own text.
+ rx::graph::AttachmentDesc swapchainRelativeReversedDepthDesc(VkFormat format) {
+     rx::graph::AttachmentDesc desc = swapchainRelativeDesc(format);
+     desc.depthConvention = rx::graph::DepthConvention::Reversed;
+     return desc;
+ }
+ 
+ void declareGraph(rx::graph::RenderGraph& graph, App& app, VkFormat backbufferFormat) {
+     graph.addPass("forward")
+-        .addColorOutput("hdr", swapchainRelativeDesc(kHdrFormat))
++        .addColorOutput("hdr", swapchainRelativeDesc(rx::graph::kHdrFormat))
+         .setDepthStencilOutput("depth", swapchainRelativeReversedDepthDesc(kDepthFormat))
+         .setExecute([&app](rx::graph::PassContext& ctx) { recordForward(ctx, app); });
+ 
+     graph.addPass("tonemap")
+         .addTextureInput("hdr")
+         .addColorOutput("backbuffer", swapchainRelativeDesc(backbufferFormat))
+         .setExecute([&app](rx::graph::PassContext& ctx) { recordTonemapDraw(ctx, app); });
+ 
+     graph.setBackbufferSource("backbuffer");
+ }
+diff --git a/samples/09_scene/main.cpp b/samples/09_scene/main.cpp
+index b9c4905..0376f7f 100644
+--- a/samples/09_scene/main.cpp
++++ b/samples/09_scene/main.cpp
+@@ -66,20 +66,21 @@
+ // sample scope rather than invented. See buildStressField() below.
+ #include <rx_asset/geometry_pool.h>
+ #include <rx_asset/registry.h>
+ #include <rx_asset/texture_cache.h>
+ #include <rx_core/debug_checks.h>
+ #include <rx_core/log.h>
+ #include <rx_core/profile.h>
+ #include <rx_debug_ui/overlay.h>
+ #include <rx_graph/executor.h>
+ #include <rx_graph/render_graph.h>
++#include <rx_graph/scene_color.h>
+ #include <rx_material/draw_data.h>
+ #include <rx_material/material_system.h>
+ #include <rx_platform/window.h>
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/deletion_queue.h>
+ #include <rx_rhi_vk/descriptor_arena.h>
+ #include <rx_rhi_vk/device.h>
+@@ -137,21 +138,23 @@
+ namespace {
+ 
+ // --- Constants --------------------------------------------------------------
+ constexpr uint32_t kHeadlessWidth = 256;
+ constexpr uint32_t kHeadlessHeight = 256;
+ constexpr VkDeviceSize kHeadlessPixelBytes = static_cast<VkDeviceSize>(kHeadlessWidth) * kHeadlessHeight * 4;
+ 
+ constexpr uint32_t kPresentWidth = 1280;
+ constexpr uint32_t kPresentHeight = 720;
+ 
+-constexpr VkFormat kHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
++// [Task 3 (#39)] the engine-owned HDR scene-color format
++// (rx::graph::kHdrFormat, rx_graph/scene_color.h) replaces this sample's
++// own former copy -- see that header for the format ruling + rationale.
+ constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
+ constexpr VkFormat kShadowFormat = VK_FORMAT_D32_SFLOAT;
+ constexpr uint32_t kShadowMapResolution = 1024;
+ 
+ // Helmet-grid composition -- see this file's own header comment ("layer
+ // mask, not frustum geometry") for the full deterministic-culling
+ // rationale this feeds.
+ constexpr uint32_t kGridRows = 4;
+ constexpr uint32_t kGridCols = 4;
+ constexpr uint32_t kGridInstanceCount = kGridRows * kGridCols;
+@@ -535,21 +538,21 @@ struct MaterialGpuBinding {
+     std::optional<rx::rhi::Buffer> paramBuffer;
+     uint32_t pushOffset = 0;
+     uint32_t pushSize = 0;
+     VkShaderStageFlags pushStages = 0;
+ };
+ 
+ // [D7/D27] The scene forward pass's own attachment shape -- one HDR color
+ // target + one REVERSED-Z depth target [D13/RC3], single-sampled.
+ rx::material::PassSignature forwardPassSignature() {
+     rx::material::PassSignature sig;
+-    sig.colorFormats[0] = kHdrFormat;
++    sig.colorFormats[0] = rx::graph::kHdrFormat;
+     sig.colorCount = 1;
+     sig.depthFormat = kDepthFormat;
+     sig.samples = VK_SAMPLE_COUNT_1_BIT;
+     return sig;
+ }
+ 
+ // --- HUD state [matrix rows 18-20; TWO visibly distinct mask controls] --
+ struct HudState {
+     // 60-frame rolling FPS/frame-ms average [gate ruling #15].
+     std::deque<double> frameTimesMs;
+@@ -2341,21 +2344,21 @@ void declareGraph(rx::graph::RenderGraph& graph, App& app, VkFormat backbufferFo
+         // (layout transition + availability/visibility) the graph derives
+         // for every addTextureInput() declaration -- exactly D29's
+         // documented mixed-convention composition (reversed-Z "forward" +
+         // standard-Z "shadow" in one graph) working as designed, NOT a
+         // setSideEffect() band-aid on the "shadow" pass (which would keep
+         // it alive without ever proving anything downstream actually reads
+         // its output, or deriving the layout transition the forward
+         // shader's SampleCmp taps require).
+         forward.addTextureInput("shadowmap");
+     }
+-    forward.addColorOutput("hdr", swapchainRelativeDesc(kHdrFormat))
++    forward.addColorOutput("hdr", swapchainRelativeDesc(rx::graph::kHdrFormat))
+         .setDepthStencilOutput("depth", swapchainRelativeReversedDepthDesc(kDepthFormat))
+         .setExecuteChunked(
+             [&app](rx::graph::PassContext& ctx, uint32_t chunkIndex, uint32_t chunkCount) {
+                 recordForwardChunk(ctx, app, chunkIndex, chunkCount);
+             });
+ 
+     graph.addPass("tonemap")
+         .addTextureInput("hdr")
+         .addColorOutput("backbuffer", swapchainRelativeDesc(backbufferFormat))
+         .setExecute([&app](rx::graph::PassContext& ctx) { recordTonemapDraw(ctx, app); });
+diff --git a/src/rx_graph/include/rx_graph/scene_color.h b/src/rx_graph/include/rx_graph/scene_color.h
+new file mode 100644
+index 0000000..21d7feb
+--- /dev/null
++++ b/src/rx_graph/include/rx_graph/scene_color.h
+@@ -0,0 +1,224 @@
++#pragma once
++// Vulkan-Headers only -- same device-free header-hygiene rule as every
++// other public rx_graph header this file sits alongside (resources.h/
++// pass_signature.h): a plain VkFormat/string constant declaration touches
++// no live Vulkan handle, so it carries no volk/rx_rhi_vk dependency either.
++#include <vulkan/vulkan_core.h>
++
++namespace rx::graph {
++
++// [Task 3 (#39), gate ruling -- rulings-2026-08-20.md "T3 (#39)": "HDR
++// scene-color format B10G11R11 (UFLOAT) as the process-wide default with a
++// documented A16B16G16R16F escape hatch where precision demands"; matrix
++// rows 2/3/6/9, matrix-p5t03-hdr-scene-color.md]
++//
++// THE ONE ENGINE-OWNED HDR SCENE-COLOR CONVENTION -- replaces four
++// independent `constexpr VkFormat kHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;`
++// copies that used to live one per sample (samples/05_multipass,
++// 07_stress, 08_gltf_viewer, 09_scene -- verified identical-by-copy-paste,
++// not by any shared source, before this task) [matrix row 2/9]. Every
++// sample now declares its opaque-lit working color target against this
++// constant, never its own.
++//
++// FORMAT: `VK_FORMAT_B10G11R11_UFLOAT_PACK32` -- a packed 32-bit-per-texel
++// value: 11-bit unsigned float R (5-bit exponent, 6-bit mantissa), 11-bit
++// unsigned float G (same layout), 10-bit unsigned float B (5-bit exponent,
++// 5-bit mantissa) [Khronos `VkFormat` spec, bit-layout section, fetched
++// directly -- matrix row 10's "Verified first-hand" citation]. NO sign bit
++// (radiance is never negative, so this costs nothing real) and NO alpha
++// channel (a sampled read of this format always returns alpha == 1.0).
++//
++// PRECISION CHARACTERISTIC THAT MUST BE HANDLED HONESTLY, NOT GLOSSED
++// OVER: the blue channel's mantissa is ONE BIT NARROWER than red/green's
++// (5 bits vs 6) -- for the SAME magnitude value written to all three
++// channels, blue quantizes to a COARSER grid (step size 2x red/green's, at
++// the same exponent) and can end up with up to 2x red/green's worst-case
++// rounding error. This is proven, not just documented, by
++// rx_graph_gpu_tests' `SceneColorGpu` cases (test_scene_color_gpu.cpp),
++// which write an identical non-power-of-two radiance value to all three
++// channels of a real `VK_FORMAT_B10G11R11_UFLOAT_PACK32` attachment via a
++// real draw, read the raw packed texel back, and decode it with
++// `glm::unpackF2x11_1x10` (GLM's own implementation of this exact packed
++// layout -- reused, not reimplemented, per this repo's "don't reinvent the
++// wheel" rule) to show blue's larger quantization error directly.
++//
++// WHY B10G11R11 OVER RGBA16F AS THE DEFAULT [matrix row 3's decisive
++// recommendation, adopted verbatim by the ruling]: half the per-texel
++// footprint (32 bits vs 64) on every read/write this buffer sees for its
++// entire consumer chain (mip chain -- Task 22; SSR -- Task 26; glass read
++// -- Tasks 23/24; bloom -- Task 31; tonemap -- this task + Task 32; TAA --
++// Task 33), which matters most on the Steam Deck's UMA bandwidth floor
++// this phase's benchmark gates are required to prove against (repo
++// CLAUDE.md, "Performance is an exit criterion"). Google Filament's own
++// `FRenderer::getHdrFormat()` (`filament/src/details/Renderer.cpp`, v1.75.0
++// pin) independently makes the identical choice for its OPAQUE views at
++// its low/medium quality tier (`TextureFormat::R11F_G11F_B10F`, bit-
++// identical layout) -- only Filament's TRANSLUCENT views ever get an
++// alpha-bearing RGBA16F-class buffer. The commonly-raised "but transmission
++// blending needs alpha on this buffer" counter-argument does not survive
++// contact with this codebase's own charter: glass is real screen-space-
++// refraction that READS this buffer as a texture input, never a
++// fixed-function alpha-blend WRITE onto it (charter,
++// `docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md:398-411`)
++// -- an opaque buffer's alpha channel is definitionally always 1.0 and was
++// never going to carry information either way.
++inline constexpr VkFormat kHdrFormat = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
++
++// [Task 3 (#39), gate ruling] THE DOCUMENTED ESCAPE HATCH -- use this,
++// never a fifth ad hoc format, whenever a scene-color-shaped resource
++// genuinely needs what `kHdrFormat` structurally cannot provide:
++//   - SIGNED values (kHdrFormat is unsigned-only; a resource that can go
++//     negative -- e.g. some post-process intermediate, never plain
++//     radiance -- cannot be stored in it at all, not just imprecisely).
++//   - An ALPHA channel that must carry real information (kHdrFormat's
++//     alpha is definitionally 1.0 always -- see kHdrFormat's own comment).
++//   - Symmetric, higher per-channel precision than kHdrFormat's narrower
++//     (and blue-asymmetric) mantissas can offer.
++// `VK_FORMAT_R16G16B16A16_SFLOAT`: four IEEE-754-binary16-compatible
++// channels (1 sign + 5 exponent + 10 mantissa bits each), including alpha,
++// symmetric across every channel -- proven by
++// `SceneColorGpu::EscapeHatchPreservesNegativeAndSymmetricPrecision`
++// (test_scene_color_gpu.cpp), which writes a negative value through this
++// format and confirms R/G/B decode with IDENTICAL, symmetric rounding
++// error via `glm::unpackHalf4x16`, unlike kHdrFormat's proven asymmetry
++// above. This was RGBA16F's status quo before this task (all four samples
++// used it as their sole HDR format) -- kept alive as the documented
++// fallback rather than removed, exactly per the ruling's wording.
++inline constexpr VkFormat kHdrFormatHighPrecision = VK_FORMAT_R16G16B16A16_SFLOAT;
++
++// [Task 3 (#39), matrix row 6] The canonical name every pass that
++// establishes or consumes the opaque-lit scene-color working image should
++// declare (`Pass::addColorOutput(kSceneColorResourceName, ...)` /
++// `Pass::addTextureInput(kSceneColorResourceName)`). Not a *requirement*
++// enforced anywhere in rx_graph itself (a graph can still name a resource
++// whatever it wants -- this constant only removes the reason to ever type
++// the literal "hdr" by hand) -- every one of this repo's existing samples
++// already happened to agree on this exact name by copy-paste convention
++// before this task; this constant is that convention's single source now.
++inline constexpr const char* kSceneColorResourceName = "hdr";
++
++// ===========================================================================
++// SCENE-COLOR SEAM -- the documented consumer table [matrix row 6's own
++// acceptance criterion: "a table mapping each frame-pipeline-target stage
++// after 'opaque lighting' to the task that will attach to it"].
++//
++// Charter frame-pipeline target (binding order,
++// `docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md:447-451`,
++// restated at `docs/superpowers/plans/2026-08-20-phase5-techniques.md:20-24`):
++//
++//   depth -> shadows -> clustered light assignment -> opaque lighting
++//     [[[ writes kSceneColorResourceName / kHdrFormat -- THIS TASK ]]]
++//   -> volumetrics (froxel march + apply)
++//   -> SSR                              (reads scene color -- Task 26, #62)
++//   -> scene-color mip chain            (Task 22, #58 -- the seam's own
++//                                         downstream mip-generation owner)
++//   -> glass/transmission                (reads scene color as a texture
++//                                         input for screen-space refraction,
++//                                         never an alpha-blend write onto
++//                                         it -- Tasks 23/#59 and 24/#60)
++//   -> particles/transparency
++//   -> bloom                             (Task 31, #67)
++//   -> tone mapping (AgX/ACES, FG8 HDR output)
++//                                         [reads kSceneColorResourceName;
++//                                         this task's own tonemap-hook
++//                                         documentation below; the actual
++//                                         AgX/ACES algorithm lands in
++//                                         Task 32, #68]
++//   -> TAA                               (Task 33, #69 -- history/velocity
++//                                         resources are NEW work per RC6,
++//                                         not something this seam pre-pays)
++//
++// Every one of the above tasks CONSUMES this seam; none of them may
++// establish a second, independently-formatted "scene color"-shaped
++// resource of their own [plan global constraint: "samples are pure
++// consumers... no sample/task hand-rolls what the engine provides"].
++// ===========================================================================
++
++// ===========================================================================
++// FG6 MSAA POLICY RULING -- DOCUMENTED REJECTION, NOT AN IMPLEMENTATION
++// [Task 3 (#39), gate ruling -- rulings-2026-08-20.md "T3 (#39)": "FG6
++// ruled no-MSAA/TAA-first (a documented rejection with rationale,
++// revisitable post-TAA)"; matrix rows 4/5, matrix-p5t03-hdr-scene-color.md].
++//
++// FG6 registry text
++// (`docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md:211-213`):
++// "(FG6) MSAA policy decision + resolve-attachment semantics in the graph
++// (decide in techniques-phase spec, before aliasing/history ossify the
++// resource model)". This task DECIDES the policy and records the decision
++// here; it does NOT implement MSAA or resolve-attachment semantics.
++//
++// DECISION: no-MSAA, TAA-first. Real hardware multisample resolve is
++// explicitly rejected for this phase's default anti-aliasing story in
++// favor of Task 33's TAA (already the charter's own committed, LAST stage
++// of the frame-pipeline target above) -- REVISITABLE after TAA lands, if
++// real evidence later demands hardware MSAA specifically (e.g. a
++// forward-only content class TAA serves poorly). Not a permanent
++// architectural wall, a sequencing call.
++//
++// RATIONALE:
++//   1. TAA is already the committed, scheduled temporal-stability
++//      mechanism for this entire phase (frame-pipeline target, last
++//      stage) -- this is not a new commitment this task invents, only one
++//      it declines to duplicate with a second, competing AA path.
++//   2. The render graph's history-resource machinery already exists
++//      specifically to support a ping-ponged temporal consumer
++//      (`isHistory`/`PinnedHistoryEntry`, `transient_pool.h`) -- Task 33
++//      is not starting from zero the way a from-scratch MSAA resolve path
++//      would be.
++//   3. Real MSAA resolve requires NEW work in TWO currently-incomplete
++//      layers, verified directly this task (both citations below still
++//      hold as of this task's own HEAD):
++//
++// GAP (a) -- the `samples` axis is real per-attachment metadata, correctly
++// threaded from `AttachmentDesc::samples` (resources.h) through
++// `PassSignature::samples` (pass_signature.h, hashed) to
++// `TransientPool::acquireImage()`'s own pooling key (transient_pool.h),
++// and `rx::material::MaterialSystem`'s pipeline creation DOES correctly
++// derive `multisampleState.rasterizationSamples` from a declared pass's
++// sample count (`src/rx_material/material_system.cpp:1997`,
++// `multisampleState.rasterizationSamples = req.pass.samples;`) -- but it
++// dead-ends at the one place that actually allocates the GPU image:
++// `rx::rhi::Texture2D::create()`'s signature (`src/rx_rhi_vk/include/
++// rx_rhi_vk/texture.h`) takes no `samples` parameter at all, and BOTH of
++// its image-creation paths hardcode `imageInfo.samples =
++// VK_SAMPLE_COUNT_1_BIT` unconditionally
++// (`src/rx_rhi_vk/src/texture.cpp:133,213`, verified unchanged as of this
++// task). Declaring `samples > 1` on an `AttachmentDesc` today would build
++// a pipeline correctly expecting N samples bound against an ACTUALLY
++// 1-sample image -- an immediate dynamic-rendering validation error, not
++// silent misbehavior.
++//
++// GAP (b) -- zero resolve-target wiring exists anywhere in this codebase:
++// no field on `AttachmentDesc`/`PhysicalResource` (resources.h) carries a
++// resolve-target reference, and `Executor`'s `VkRenderingAttachmentInfo`
++// construction (`src/rx_graph/executor.cpp`) never sets
++// `resolveMode`/`resolveImageView` (whole-file grep, zero hits, verified
++// this task).
++//
++// A future MSAA ticket's actual starting scope is therefore: (1) thread a
++// real `samples` parameter through `Texture2D::create()`/
++// `createForPresuppliedMips()` and `TransientPool::acquireImage()`'s
++// actual VkImage creation, (2) add a resolve-target field to
++// `AttachmentDesc`/`PhysicalResource` and wire `resolveMode`/
++// `resolveImageView` into `Executor`'s attachment-info construction --
++// NOT "wire up an already-working axis" (FG6's own wording could be
++// misread that way; it is not the case -- see GAP (a) above).
++// ===========================================================================
++
++// [Task 3 (#39), matrix row 10] STORAGE-IMAGE CAVEAT, forward-looking note
++// for Task 2 (#38)'s compute-pass consumers (SSR -- Task 26; froxel
++// volumetrics -- Task 30) that may need to read-modify-write scene color
++// as a storage image, not only sample it: `kHdrFormat`'s
++// `VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT` support is empirically confirmed
++// (both lavapipe and the real NVIDIA driver, this task's own
++// `SceneColorGpu::FormatSupportsColorAttachmentAndLinearSampling` test
++// logs it) but is NOT guaranteed the same way `kHdrFormatHighPrecision`'s
++// is (RGBA16F's storage-image/UAV read+write support has no known vendor
++// caveat on any graphics API; packed-float formats like `kHdrFormat`
++// historically do on the closest cross-API analogue, DirectX's
++// `DXGI_FORMAT_R11G11B10_FLOAT` UAV typed-load). Any future compute pass
++// that targets `kHdrFormat` as a READ-WRITE storage image must re-query
++// `VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT` on its own target hardware before
++// assuming it -- never assumed from this comment alone.
++
++}  // namespace rx::graph
+diff --git a/src/rx_graph/tests/CMakeLists.txt b/src/rx_graph/tests/CMakeLists.txt
+index f42cffa..695996c 100644
+--- a/src/rx_graph/tests/CMakeLists.txt
++++ b/src/rx_graph/tests/CMakeLists.txt
+@@ -1,20 +1,24 @@
+ # Device-free (no rx::platform::Window, no VkSurfaceKHR, no vk-bootstrap
+ # instance) -- unlike rx_rhi_vk_tests' doctest_main.cpp, this binary needs
+ # no warm-up before its first TEST_CASE runs, so doctest_main.cpp here is
+ # the plain DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN translation unit rx_core_tests
+ # uses. Task 1/2 compile()/barrier tests only -- Task 3's GPU-backed tests
+ # live in the separate rx_graph_gpu_tests target below, never in this one.
+ add_executable(rx_graph_tests
+     doctest_main.cpp
+     test_compile.cpp
+     test_barriers.cpp
++    # [Task 3 (#39)] kHdrFormat/kHdrFormatHighPrecision pinning -- device-free,
++    # joins this binary rather than rx_graph_gpu_tests for the same reason
++    # test_compile.cpp/test_barriers.cpp do (no real device needed).
++    test_scene_color.cpp
+ )
+ target_link_libraries(rx_graph_tests PRIVATE rx_graph doctest::doctest)
+ add_test(NAME rx_graph_tests COMMAND rx_graph_tests)
+ # Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+ # (windows-cross Wine hang, run 31512073559).
+ set_tests_properties(rx_graph_tests PROPERTIES TIMEOUT 120)
+ 
+ # Task 3: GPU-backed Executor tests -- a real headless-but-validated
+ # rx::rhi::Device (via rx::platform::Window, exactly like
+ # rx_rhi_vk_tests' own windowed test fixtures), so this binary needs the
+@@ -34,20 +38,26 @@ add_executable(rx_graph_gpu_tests
+     doctest_main_gpu.cpp
+     test_execute_gpu.cpp
+     # [Task 2 (#38), gate rulings: per-ticket ruling + RC2] the compute-
+     # pipeline capability's own primary gate (real compute PSO + dispatch
+     # through the render graph's Compute-class pass machinery, storage
+     # buffer + storage image, bindless set 0, cube/array subresource
+     # addressing) -- joins this binary rather than a new one for the exact
+     # same reasons test_execute_gpu.cpp already does (real windowed Device,
+     # rx_shader in-process compilation).
+     test_compute_gpu.cpp
++    # [Task 3 (#39)] HDR scene-color format's own primary gate -- value
++    # survival + honest precision-asymmetry proof + discrimination mutant +
++    # escape-hatch exercise + empirical format-support queries. Joins this
++    # binary for the same real-windowed-Device/rx_shader-in-process reasons
++    # as the two files above.
++    test_scene_color_gpu.cpp
+ )
+ target_link_libraries(rx_graph_gpu_tests PRIVATE rx_graph rx_rhi_vk rx_platform rx_shader doctest::doctest)
+ rx_shader_deploy_runtime_libs(rx_graph_gpu_tests)
+ 
+ # --validate: appended for the same reason every sample's own headless
+ # ctest gate appends it (samples/01_triangle/CMakeLists.txt etc.) -- ctest
+ # is the developer/CI gate, opting into the Vulkan validation layers on
+ # top of whatever a plain manual run would default to. This binary's
+ # fixtures already build every rx::rhi::Context with enableValidation=true
+ # unconditionally (unlike a sample's runtime --validate flag, which
+diff --git a/src/rx_graph/tests/test_scene_color.cpp b/src/rx_graph/tests/test_scene_color.cpp
+new file mode 100644
+index 0000000..87b52dd
+--- /dev/null
++++ b/src/rx_graph/tests/test_scene_color.cpp
+@@ -0,0 +1,48 @@
++// [Task 3 (#39), matrix row 2: "The chosen format's precision
++// characteristics are documented, with a test pinning the format"]
++// Device-free: `rx_graph/scene_color.h` is a plain-value header (no live
++// Vulkan handle), so pinning its constants needs no real device -- this
++// file lives in the `rx_graph_tests` binary (doctest_main.cpp's plain
++// DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN target), not `rx_graph_gpu_tests`.
++// The GPU-backed proof that the ruled format actually behaves as
++// documented (value survival, precision-asymmetry discrimination, the
++// escape hatch, empirical format-support queries) lives in
++// test_scene_color_gpu.cpp.
++#include <doctest/doctest.h>
++#include <rx_graph/scene_color.h>
++
++#include <cstring>
++
++using namespace rx::graph;
++
++TEST_CASE("kHdrFormat is pinned to the ruled process-wide default (B10G11R11_UFLOAT_PACK32)") {
++    // [rulings-2026-08-20.md, "T3 (#39)"] "HDR scene-color format B10G11R11
++    // (UFLOAT) as the process-wide default" -- a single named engine
++    // constant, not the four independent per-sample copies that predated
++    // this task (matrix row 2/9).
++    CHECK(kHdrFormat == VK_FORMAT_B10G11R11_UFLOAT_PACK32);
++}
++
++TEST_CASE("kHdrFormatHighPrecision is pinned to the ruled escape hatch (A16B16G16R16F)") {
++    // [rulings-2026-08-20.md, "T3 (#39)"] "...with a documented
++    // A16B16G16R16F escape hatch where precision demands" -- Vulkan spells
++    // this bit layout VK_FORMAT_R16G16B16A16_SFLOAT (component-order
++    // naming convention, same layout the ruling's "A16B16G16R16F" shorthand
++    // names).
++    CHECK(kHdrFormatHighPrecision == VK_FORMAT_R16G16B16A16_SFLOAT);
++}
++
++TEST_CASE("kHdrFormat and kHdrFormatHighPrecision are distinct formats") {
++    // Guards against a future edit accidentally collapsing the ruled
++    // default and its documented escape hatch onto the same value, which
++    // would silently defeat the entire point of having an escape hatch.
++    CHECK(kHdrFormat != kHdrFormatHighPrecision);
++}
++
++TEST_CASE("kSceneColorResourceName is the canonical \"hdr\" resource name") {
++    // [matrix row 6] "the resource name (\"hdr\" or a ruled successor)" --
++    // kept as "hdr" (every existing sample already agreed on this by
++    // copy-paste convention before this task; no ruling text requires
++    // renaming it).
++    CHECK(std::strcmp(kSceneColorResourceName, "hdr") == 0);
++}
+diff --git a/src/rx_graph/tests/test_scene_color_gpu.cpp b/src/rx_graph/tests/test_scene_color_gpu.cpp
+new file mode 100644
+index 0000000..f367430
+--- /dev/null
++++ b/src/rx_graph/tests/test_scene_color_gpu.cpp
+@@ -0,0 +1,694 @@
++// [Task 3 (#39), gate rulings -- rulings-2026-08-20.md "T3 (#39)"; matrix
++// rows 1/2/3/6/9/10, matrix-p5t03-hdr-scene-color.md] This ticket's own
++// primary gate: prove, by VALUE, that `rx::graph::kHdrFormat`
++// (VK_FORMAT_B10G11R11_UFLOAT_PACK32) actually carries a >1.0 radiance
++// value through a real draw and readback (not just "it compiles"), that
++// its documented blue-channel mantissa precision deficit is REAL (not
++// merely asserted in a comment) via an honest CPU-side decode of the raw
++// packed bits, that a wrong (UNORM8-family) target genuinely clamps
++// (discrimination proof -- the same mechanism against a deliberately
++// broken target must fail differently), that the documented escape hatch
++// (`kHdrFormatHighPrecision`) is actually exercised (not merely declared),
++// and that both formats empirically support the exact format features this
++// codebase's own consumers need on THIS driver (never assumed from a
++// memorized spec table -- matrix row 3/10's own verification-health note).
++//
++// Same real-windowed-Device-but-never-presenting fixture pattern as
++// test_execute_gpu.cpp/test_compute_gpu.cpp -- an independent, small local
++// copy of `makeFixture`/`OffscreenImage`/a push-constant fill pipeline
++// rather than a shared header, matching this codebase's own established
++// per-file-helper precedent (see e.g. test_compute_gpu.cpp's own comment
++// on why it duplicates test_execute_gpu.cpp's near-identical fixture
++// rather than sharing it).
++#include <doctest/doctest.h>
++#include <rx_graph/executor.h>
++#include <rx_graph/render_graph.h>
++#include <rx_graph/scene_color.h>
++
++#include <rx_platform/window.h>
++#include <rx_rhi_vk/buffer.h>
++#include <rx_rhi_vk/command.h>
++#include <rx_rhi_vk/context.h>
++#include <rx_rhi_vk/device.h>
++#include <rx_rhi_vk/pipeline_layout.h>
++#include <rx_shader/compiler.h>
++#include <rx_shader/reflection.h>
++#include <rx_task/scheduler.h>
++
++#include <glm/gtc/packing.hpp>
++#include <glm/vec3.hpp>
++#include <glm/vec4.hpp>
++
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++using namespace rx::graph;
++
++namespace {
++
++// Small extent -- every case below fills its whole target with one
++// constant color via a fullscreen triangle, so a single corner texel
++// (like test_execute_gpu.cpp's own `corner` readback) carries the entire
++// proof; matches test_compute_gpu.cpp's own `kBbExtent = 4` precedent for
++// the same reason (minimal, not 256, since no spatial pattern is tested
++// here).
++constexpr uint32_t kExtent = 4;
++
++struct SceneColorGpuFixture {
++    rx::platform::Window window;
++    rx::rhi::Context context;
++    rx::rhi::Device device;
++    rx::rhi::Allocator allocator;
++    std::unique_ptr<rx::task::Scheduler> scheduler;
++    std::unique_ptr<Executor> executor;
++};
++
++std::optional<SceneColorGpuFixture> makeFixture(const char* title) {
++    auto window = rx::platform::Window::create(title, 64, 64, /*visible=*/false);
++    if (!window.has_value()) {
++        MESSAGE("no display backend available, skipping rx_graph scene-color GPU test");
++        return std::nullopt;
++    }
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        MESSAGE("video driver reports no Vulkan surface extensions (e.g. dummy driver), skipping rx_graph "
++                 "scene-color GPU test");
++        return std::nullopt;
++    }
++
++    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++
++    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
++    REQUIRE(surface != VK_NULL_HANDLE);
++
++    auto device = rx::rhi::Device::create(*context, surface);
++    REQUIRE(device.has_value());
++
++    auto allocator = rx::rhi::Allocator::create(*context, *device);
++    REQUIRE(allocator.has_value());
++
++    auto scheduler = rx::task::Scheduler::create();
++    REQUIRE(scheduler != nullptr);
++
++    auto executor = Executor::create(*device, *scheduler);
++    REQUIRE(executor != nullptr);
++
++    return SceneColorGpuFixture{std::move(*window),    std::move(*context),  std::move(*device),
++                                 std::move(*allocator), std::move(scheduler), std::move(executor)};
++}
++
++// --- Offscreen "backbuffer" -- format-parameterized, same shape/rationale
++// as test_execute_gpu.cpp's own OffscreenImage (an external, never-pooled
++// image the test itself owns, read back once execute() finishes). --------
++struct OffscreenImage {
++    VkImage image = VK_NULL_HANDLE;
++    VkDeviceMemory memory = VK_NULL_HANDLE;
++    VkImageView view = VK_NULL_HANDLE;
++};
++
++std::optional<OffscreenImage> createOffscreenImage(VkDevice device, VkPhysicalDevice physicalDevice, VkFormat format,
++                                                     VkExtent2D extent) {
++    OffscreenImage result;
++
++    VkImageCreateInfo imageInfo{};
++    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    imageInfo.imageType = VK_IMAGE_TYPE_2D;
++    imageInfo.format = format;
++    imageInfo.extent = {extent.width, extent.height, 1};
++    imageInfo.mipLevels = 1;
++    imageInfo.arrayLayers = 1;
++    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
++    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
++    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    if (vkCreateImage(device, &imageInfo, nullptr, &result.image) != VK_SUCCESS) {
++        return std::nullopt;
++    }
++
++    VkMemoryRequirements memReq{};
++    vkGetImageMemoryRequirements(device, result.image, &memReq);
++    VkPhysicalDeviceMemoryProperties memProps{};
++    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
++
++    uint32_t memoryTypeIndex = UINT32_MAX;
++    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
++        if ((memReq.memoryTypeBits & (1U << i)) != 0U &&
++            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0U) {
++            memoryTypeIndex = i;
++            break;
++        }
++    }
++    if (memoryTypeIndex == UINT32_MAX) {
++        vkDestroyImage(device, result.image, nullptr);
++        return std::nullopt;
++    }
++
++    VkMemoryAllocateInfo allocInfo{};
++    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++    allocInfo.allocationSize = memReq.size;
++    allocInfo.memoryTypeIndex = memoryTypeIndex;
++    if (vkAllocateMemory(device, &allocInfo, nullptr, &result.memory) != VK_SUCCESS) {
++        vkDestroyImage(device, result.image, nullptr);
++        return std::nullopt;
++    }
++    if (vkBindImageMemory(device, result.image, result.memory, 0) != VK_SUCCESS) {
++        vkFreeMemory(device, result.memory, nullptr);
++        vkDestroyImage(device, result.image, nullptr);
++        return std::nullopt;
++    }
++
++    VkImageViewCreateInfo viewInfo{};
++    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++    viewInfo.image = result.image;
++    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    viewInfo.format = format;
++    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    viewInfo.subresourceRange.levelCount = 1;
++    viewInfo.subresourceRange.layerCount = 1;
++    if (vkCreateImageView(device, &viewInfo, nullptr, &result.view) != VK_SUCCESS) {
++        vkFreeMemory(device, result.memory, nullptr);
++        vkDestroyImage(device, result.image, nullptr);
++        return std::nullopt;
++    }
++
++    return result;
++}
++
++void destroyOffscreenImage(VkDevice device, OffscreenImage& img) {
++    if (img.view != VK_NULL_HANDLE) {
++        vkDestroyImageView(device, img.view, nullptr);
++    }
++    if (img.image != VK_NULL_HANDLE) {
++        vkDestroyImage(device, img.image, nullptr);
++    }
++    if (img.memory != VK_NULL_HANDLE) {
++        vkFreeMemory(device, img.memory, nullptr);
++    }
++    img = OffscreenImage{};
++}
++
++// --- Fill pipeline: a fullscreen triangle (no vertex buffer, SV_VertexID
++// trick) writing a push-constant float4 color -- same shader source and
++// generic colorFormat parameterization as test_execute_gpu.cpp's own
++// FillPipeline (its "history-output-writing pass" consumer), reused here
++// verbatim as a controlled-value draw for a completely different purpose:
++// this is exactly the "controlled draw" matrix row 1 asks for -- a real
++// fragment shader stage writes a caller-chosen HDR value into a real
++// attachment of a real color format, going through the SAME fixed-function
++// color-attachment-write hardware path production rendering uses (never a
++// CPU-side encode of the expected bits). --------------------------------
++constexpr const char* kFillShaderSource = R"(
++struct PushConstants {
++    float4 color;
++};
++
++[[vk::push_constant]]
++ConstantBuffer<PushConstants> gPush;
++
++struct VSOut {
++    float4 position : SV_Position;
++};
++
++[shader("vertex")]
++VSOut vsMain(uint vertexID : SV_VertexID)
++{
++    float2 positions[3] = float2[3](
++        float2(-1.0, -1.0),
++        float2(3.0, -1.0),
++        float2(-1.0, 3.0)
++    );
++    VSOut o;
++    o.position = float4(positions[vertexID], 0.0, 1.0);
++    return o;
++}
++
++[shader("fragment")]
++float4 fsMain() : SV_Target
++{
++    return gPush.color;
++}
++)";
++
++const std::vector<std::string> kFillEntryPoints = {"vsMain", "fsMain"};
++
++struct FillPipeline {
++    VkShaderModule vertModule = VK_NULL_HANDLE;
++    VkShaderModule fragModule = VK_NULL_HANDLE;
++    rx::rhi::PipelineLayoutBundle layoutBundle;
++    VkPipeline pipeline = VK_NULL_HANDLE;
++    uint32_t pushConstantOffset = 0;
++    uint32_t pushConstantSize = 0;
++    VkShaderStageFlags pushConstantStages = 0;
++};
++
++void destroyFillPipeline(VkDevice device, FillPipeline& p) {
++    if (p.pipeline != VK_NULL_HANDLE) {
++        vkDestroyPipeline(device, p.pipeline, nullptr);
++    }
++    if (p.fragModule != VK_NULL_HANDLE) {
++        vkDestroyShaderModule(device, p.fragModule, nullptr);
++    }
++    if (p.vertModule != VK_NULL_HANDLE) {
++        vkDestroyShaderModule(device, p.vertModule, nullptr);
++    }
++    p.pipeline = VK_NULL_HANDLE;
++    p.fragModule = VK_NULL_HANDLE;
++    p.vertModule = VK_NULL_HANDLE;
++    p.layoutBundle = rx::rhi::PipelineLayoutBundle{};
++}
++
++std::optional<FillPipeline> buildFillPipeline(VkDevice device, VkFormat colorFormat) {
++    FillPipeline result;
++
++    auto compiler = rx::shader::Compiler::create();
++    if (!compiler.has_value()) {
++        return std::nullopt;
++    }
++
++    rx::shader::CompileResult compileResult =
++        compiler->compileFromSource("RxSceneColorFillModule", kFillShaderSource, kFillEntryPoints);
++    if (!compileResult.ok) {
++        MESSAGE("rx_graph scene-color fill shader compile failed: ", compileResult.diagnostics);
++        return std::nullopt;
++    }
++
++    auto layoutInfo = rx::shader::reflect(compileResult);
++    if (!layoutInfo.has_value() || layoutInfo->pushRanges.size() != 1) {
++        return std::nullopt;
++    }
++
++    auto layoutBundle = rx::rhi::PipelineLayoutBuilder::build(device, *layoutInfo);
++    if (!layoutBundle.has_value()) {
++        return std::nullopt;
++    }
++    result.layoutBundle = std::move(*layoutBundle);
++    result.pushConstantOffset = layoutInfo->pushRanges[0].offset;
++    result.pushConstantSize = layoutInfo->pushRanges[0].size;
++    result.pushConstantStages = layoutInfo->pushRanges[0].stages;
++
++    for (const auto& blob : compileResult.entryPointCode) {
++        VkShaderModuleCreateInfo moduleInfo{};
++        moduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
++        moduleInfo.codeSize = blob.code.size() * sizeof(uint32_t);
++        moduleInfo.pCode = blob.code.data();
++
++        VkShaderModule module = VK_NULL_HANDLE;
++        if (vkCreateShaderModule(device, &moduleInfo, nullptr, &module) != VK_SUCCESS) {
++            destroyFillPipeline(device, result);
++            return std::nullopt;
++        }
++        if (blob.entryPointName == "vsMain") {
++            result.vertModule = module;
++        } else if (blob.entryPointName == "fsMain") {
++            result.fragModule = module;
++        } else {
++            vkDestroyShaderModule(device, module, nullptr);
++            destroyFillPipeline(device, result);
++            return std::nullopt;
++        }
++    }
++    if (result.vertModule == VK_NULL_HANDLE || result.fragModule == VK_NULL_HANDLE) {
++        destroyFillPipeline(device, result);
++        return std::nullopt;
++    }
++
++    std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
++    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++    stages[0].module = result.vertModule;
++    stages[0].pName = "main";
++    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++    stages[1].module = result.fragModule;
++    stages[1].pName = "main";
++
++    VkPipelineVertexInputStateCreateInfo vertexInputState{};
++    vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
++
++    VkPipelineInputAssemblyStateCreateInfo inputAssemblyState{};
++    inputAssemblyState.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
++    inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++
++    VkPipelineViewportStateCreateInfo viewportState{};
++    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
++    viewportState.viewportCount = 1;
++    viewportState.scissorCount = 1;
++
++    VkPipelineRasterizationStateCreateInfo rasterizationState{};
++    rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
++    rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
++    rasterizationState.cullMode = VK_CULL_MODE_NONE;
++    rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++    rasterizationState.lineWidth = 1.0F;
++
++    VkPipelineMultisampleStateCreateInfo multisampleState{};
++    multisampleState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
++    multisampleState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++
++    VkPipelineColorBlendAttachmentState blendAttachment{};
++    blendAttachment.blendEnable = VK_FALSE;
++    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
++                                      VK_COLOR_COMPONENT_A_BIT;
++
++    VkPipelineColorBlendStateCreateInfo colorBlendState{};
++    colorBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
++    colorBlendState.attachmentCount = 1;
++    colorBlendState.pAttachments = &blendAttachment;
++
++    std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
++    VkPipelineDynamicStateCreateInfo dynamicState{};
++    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
++    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
++    dynamicState.pDynamicStates = dynamicStates.data();
++
++    VkPipelineRenderingCreateInfo renderingCreateInfo{};
++    renderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
++    renderingCreateInfo.colorAttachmentCount = 1;
++    renderingCreateInfo.pColorAttachmentFormats = &colorFormat;
++
++    VkGraphicsPipelineCreateInfo pipelineInfo{};
++    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
++    pipelineInfo.pNext = &renderingCreateInfo;
++    pipelineInfo.stageCount = static_cast<uint32_t>(stages.size());
++    pipelineInfo.pStages = stages.data();
++    pipelineInfo.pVertexInputState = &vertexInputState;
++    pipelineInfo.pInputAssemblyState = &inputAssemblyState;
++    pipelineInfo.pViewportState = &viewportState;
++    pipelineInfo.pRasterizationState = &rasterizationState;
++    pipelineInfo.pMultisampleState = &multisampleState;
++    pipelineInfo.pColorBlendState = &colorBlendState;
++    pipelineInfo.pDynamicState = &dynamicState;
++    pipelineInfo.layout = result.layoutBundle.layout;
++    pipelineInfo.renderPass = VK_NULL_HANDLE;  // dynamic rendering
++    pipelineInfo.basePipelineIndex = -1;
++
++    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &result.pipeline) !=
++        VK_SUCCESS) {
++        destroyFillPipeline(device, result);
++        return std::nullopt;
++    }
++
++    return result;
++}
++
++AttachmentDesc absoluteColorDesc(VkFormat format, uint32_t width, uint32_t height) {
++    AttachmentDesc desc;
++    desc.format = format;
++    desc.sizeClass = SizeClass::Absolute;
++    desc.width = static_cast<float>(width);
++    desc.height = static_cast<float>(height);
++    return desc;
++}
++
++// Renders `fillColor` into a single kExtent x kExtent attachment of
++// `format` (the graph's ONLY pass, named kSceneColorResourceName and set
++// directly as the backbuffer -- exactly matching how a real forward pass
++// establishes "hdr" today, samples/09_scene/main.cpp's own
++// `.addColorOutput("hdr", swapchainRelativeDesc(kHdrFormat))` site), then
++// copies the raw, still-packed-per-`format` corner texel back to a
++// host-visible buffer. Returns the raw bytes (`sizeof` = format's own
++// per-texel byte count -- 4 for kHdrFormat/UNORM8, 8 for
++// kHdrFormatHighPrecision) or std::nullopt on any setup failure (already
++// REQUIRE()'d against inside, so a std::nullopt return only happens after
++// this test has already been marked failed).
++std::optional<std::array<uint8_t, 8>> renderAndReadbackTexel(SceneColorGpuFixture& fixture, VkFormat format,
++                                                               glm::vec4 fillColor, VkDeviceSize texelBytes) {
++    const VkDevice device = fixture.device.device();
++    const VkPhysicalDevice physicalDevice = fixture.device.physicalDevice();
++
++    auto pipeline = buildFillPipeline(device, format);
++    REQUIRE(pipeline.has_value());
++
++    auto offscreen = createOffscreenImage(device, physicalDevice, format, VkExtent2D{kExtent, kExtent});
++    REQUIRE(offscreen.has_value());
++
++    RenderGraph graph;
++    graph.addPass("fill")
++        .addColorOutput(kSceneColorResourceName, absoluteColorDesc(format, kExtent, kExtent))
++        .setExecute([&](PassContext& ctx) {
++            vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
++
++            struct {
++                glm::vec4 color;
++            } push{fillColor};
++            vkCmdPushConstants(ctx.cmd, pipeline->layoutBundle.layout, pipeline->pushConstantStages,
++                                pipeline->pushConstantOffset, pipeline->pushConstantSize, &push);
++
++            VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.renderArea.width),
++                                 static_cast<float>(ctx.renderArea.height), 0.0F, 1.0F};
++            VkRect2D scissor{{0, 0}, ctx.renderArea};
++            vkCmdSetViewport(ctx.cmd, 0, 1, &viewport);
++            vkCmdSetScissor(ctx.cmd, 0, 1, &scissor);
++
++            vkCmdDraw(ctx.cmd, 3, 1, 0, 0);
++        });
++    graph.setBackbufferSource(kSceneColorResourceName);
++
++    CompileInfo info;
++    info.swapchainWidth = kExtent;
++    info.swapchainHeight = kExtent;
++    info.swapchainFormat = format;
++    info.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    graph.compile(info);
++
++    fixture.executor->realize(graph);
++
++    auto cmdCtx = rx::rhi::CommandContext::create(device, fixture.device.graphicsQueue(),
++                                                   fixture.device.graphicsQueueFamily());
++    REQUIRE(cmdCtx.has_value());
++
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        fixture.executor->execute(graph, cmd, offscreen->image, offscreen->view, VkExtent2D{kExtent, kExtent});
++    });
++
++    auto readback = fixture.allocator.createHostVisibleBuffer(texelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    REQUIRE(readback.has_value());
++
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        VkBufferImageCopy region{};
++        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        region.imageSubresource.layerCount = 1;
++        // A single texel (the corner) is all any case below needs -- the
++        // fill shader writes the identical value to every pixel.
++        region.imageExtent = {1, 1, 1};
++        vkCmdCopyImageToBuffer(cmd, offscreen->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1,
++                                &region);
++    });
++    readback->invalidate();
++
++    std::array<uint8_t, 8> raw{};
++    std::memcpy(raw.data(), readback->mappedData(), static_cast<size_t>(texelBytes));
++
++    vkDeviceWaitIdle(device);
++    destroyFillPipeline(device, *pipeline);
++    destroyOffscreenImage(device, *offscreen);
++
++    CHECK_FALSE(fixture.context.hasValidationErrors());
++    return raw;
++}
++
++}  // namespace
++
++TEST_CASE(
++    "SceneColorGpu: a >1.0 radiance value survives a real draw into kHdrFormat, with the documented blue-mantissa "
++    "precision deficit proven, not just asserted") {
++    auto fixture = makeFixture("rx_graph_scene_color_survival");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    // [matrix row 1] "render a synthetic radiance value >1.0... via a
++    // controlled draw". 4.31875 is deliberately NOT a value kHdrFormat's
++    // 11-bit (R/G) grid can represent any more precisely than it already
++    // can -- chosen so its true mantissa fraction, expressed in R/G's
++    // 6-bit grid units, is 5.1 (not an integer -- both channels must
++    // round) while the SAME true value expressed in B's 5-bit grid units
++    // is 2.55 (also not an integer, but on the far side of ITS OWN
++    // nearest grid line from where 5.1 sits relative to R/G's). Because
++    // B's representable grid (multiples of 2^-5) is a literal subset of
++    // R/G's representable grid (multiples of 2^-6) at the same exponent,
++    // the nearest-B-grid-point distance is PROVABLY >= the
++    // nearest-R/G-grid-point distance for ANY true value and ANY
++    // (round-to-nearest or truncating) hardware rounding convention -- and
++    // this specific value was picked so that inequality is comfortably
++    // STRICT under both conventions (not a coincidental tie), making the
++    // R-vs-B error comparison below a robust discrimination proof rather
++    // than a lucky one-off.
++    constexpr float kValue = 4.31875F;
++    auto raw = renderAndReadbackTexel(*fixture, kHdrFormat, glm::vec4(kValue, kValue, kValue, 1.0F), 4);
++    REQUIRE(raw.has_value());
++
++    uint32_t packed = 0;
++    std::memcpy(&packed, raw->data(), sizeof(packed));
++    // glm::unpackF2x11_1x10 decodes the EXACT VK_FORMAT_B10G11R11_UFLOAT_PACK32
++    // bit layout (R in bits [0,11), G in bits [11,22), B in bits [22,32) --
++    // verified directly against GLM 1.0.3's own packF2x11_1x10 encoder,
++    // which this format's Vulkan/GL/D3D-shared packed-float layout mirrors
++    // bit-for-bit) -- reused rather than a hand-rolled decoder, per this
++    // repo's "don't reinvent the wheel" rule.
++    glm::vec3 decoded = glm::unpackF2x11_1x10(packed);
++
++    // The core claim: the value is NOT clamped to [0,1) the way a UNORM
++    // target would (row 1's own value-survival criterion) -- every channel
++    // reads back well above 1.0, close to the 4.31875 that was written.
++    CHECK(decoded.r > 4.0F);
++    CHECK(decoded.g > 4.0F);
++    CHECK(decoded.b > 4.0F);
++    CHECK(decoded.r == doctest::Approx(kValue).epsilon(0.01));
++    CHECK(decoded.g == doctest::Approx(kValue).epsilon(0.01));
++    // B's own precision is documented as coarser -- give it a looser
++    // (but still tight, HDR-value-preserving) tolerance rather than
++    // asserting it matches R/G's.
++    CHECK(decoded.b == doctest::Approx(kValue).epsilon(0.02));
++
++    // R and G share an identical 11-bit encoding, applied to an identical
++    // input value -- they must decode to the exact same bits.
++    CHECK(decoded.r == decoded.g);
++
++    // THE HONEST PRECISION PROOF [task brief: "B10G11R11 has no sign bit
++    // and reduced blue mantissa -- the tests must prove the chosen format
++    // against the criteria honestly"]: blue's coarser 5-bit mantissa must
++    // produce a STRICTLY larger rounding error against the true written
++    // value than red/green's 6-bit mantissa does, for this specific input
++    // (see the value-choice rationale above -- this is not a >= that could
++    // pass by coincidence, it is a > that was engineered to hold under
++    // either plausible hardware rounding convention).
++    const float errorR = std::abs(decoded.r - kValue);
++    const float errorB = std::abs(decoded.b - kValue);
++    CHECK(errorB > errorR);
++    MESSAGE("kHdrFormat precision proof: input=", kValue, " decodedR=", decoded.r, " decodedB=", decoded.b,
++            " errorR=", errorR, " errorB=", errorB);
++}
++
++TEST_CASE(
++    "SceneColorGpu: the same >1.0 value clamps to ~1.0 against a deliberately wrong UNORM8-family target "
++    "(discrimination proof)") {
++    auto fixture = makeFixture("rx_graph_scene_color_mutant");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    // [matrix row 1] "the same test run against a deliberately wrong
++    // UNORM8-family target must show the value clamped to ~1.0, proving
++    // the test actually discriminates rather than passing by
++    // construction." Same mechanism (renderAndReadbackTexel), same input
++    // magnitude, ONLY the target format differs.
++    constexpr float kValue = 4.31875F;
++    auto raw = renderAndReadbackTexel(*fixture, VK_FORMAT_R8G8B8A8_UNORM, glm::vec4(kValue, kValue, kValue, 1.0F), 4);
++    REQUIRE(raw.has_value());
++
++    // UNORM8 clamps to [0,1] before quantizing to a byte -- any value
++    // >= 1.0 becomes exactly byte 255.
++    CHECK((*raw)[0] == 255);
++    CHECK((*raw)[1] == 255);
++    CHECK((*raw)[2] == 255);
++}
++
++TEST_CASE(
++    "SceneColorGpu: the escape hatch (kHdrFormatHighPrecision) preserves a negative value and decodes with "
++    "symmetric channel precision, unlike kHdrFormat") {
++    auto fixture = makeFixture("rx_graph_scene_color_escape_hatch");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    // [Task 3 (#39), rulings.md: "...with a documented A16B16G16R16F escape
++    // hatch where precision demands" -- task brief: "the escape hatch must
++    // be exercised by at least one test"] Push a NEGATIVE value -- the one
++    // thing kHdrFormat (unsigned-only) cannot represent AT ALL, at any
++    // precision, demonstrating structurally (not just "it's higher
++    // precision") why the escape hatch exists. Also reuses R/G's own
++    // kValue from the precision-asymmetry test above for B, to directly
++    // contrast: kHdrFormatHighPrecision's B channel gets the SAME
++    // treatment as its R/G channels (symmetric 10-bit mantissa across all
++    // three), unlike kHdrFormat's proven blue deficit.
++    constexpr float kNegative = -2.5F;
++    constexpr float kValue = 4.31875F;
++    constexpr float kAlpha = 0.75F;  // kHdrFormat's alpha is definitionally
++                                      // always 1.0 -- this format's alpha
++                                      // channel actually carries this value.
++    auto raw = renderAndReadbackTexel(*fixture, kHdrFormatHighPrecision,
++                                       glm::vec4(kNegative, kValue, kValue, kAlpha), 8);
++    REQUIRE(raw.has_value());
++
++    uint64_t packed = 0;
++    std::memcpy(&packed, raw->data(), sizeof(packed));
++    // glm::unpackHalf4x16 decodes VK_FORMAT_R16G16B16A16_SFLOAT's own
++    // memory layout directly (R in the lowest 16 bits through A in the
++    // highest, matching Vulkan's R,G,B,A component-order-is-memory-order
++    // convention for this non-packed format) -- again GLM's own reference
++    // implementation, not a hand-rolled half-float decoder.
++    glm::vec4 decoded = glm::unpackHalf4x16(packed);
++
++    // The negative value survives exactly (a Vulkan mandatory feature, and
++    // half-precision floats represent -2.5 with zero rounding error --
++    // -2.5 = -1.25 * 2^1, mantissa fraction 0.25 exactly representable in
++    // 10 bits).
++    CHECK(decoded.r == doctest::Approx(kNegative).epsilon(0.001));
++    CHECK(decoded.a == doctest::Approx(kAlpha).epsilon(0.001));
++
++    // Symmetric precision: G and B (both driven from the identical kValue
++    // input, both this format's own 10-bit mantissa) decode to the exact
++    // same bits -- no blue-specific deficit the way kHdrFormat has.
++    CHECK(decoded.g == decoded.b);
++    CHECK(decoded.g == doctest::Approx(kValue).epsilon(0.001));
++}
++
++TEST_CASE(
++    "SceneColorGpu: kHdrFormat and kHdrFormatHighPrecision empirically support COLOR_ATTACHMENT + "
++    "linear-filtered sampling on this driver") {
++    auto fixture = makeFixture("rx_graph_scene_color_format_support");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    // [matrix row 3's own verification-health note: the exact Vulkan
++    // mandatory-format-support table row could not be independently
++    // re-fetched during research -- "routes the actual acceptance
++    // criterion through an in-task vkGetPhysicalDeviceFormatProperties
++    // empirical query instead of a memorized spec citation."] Queried on
++    // whichever real ICD this binary runs against (lavapipe in CI; the
++    // real NVIDIA driver when run with --validate against the default
++    // ICD per this phase's real-GPU-verification constraint) -- never
++    // assumed.
++    const VkPhysicalDevice physicalDevice = fixture->device.physicalDevice();
++
++    auto checkFormat = [&](VkFormat format, const char* label) {
++        VkFormatProperties props{};
++        vkGetPhysicalDeviceFormatProperties(physicalDevice, format, &props);
++
++        constexpr VkFormatFeatureFlags kRequired =
++            VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
++        // std::string(label), not the bare `const char*` -- doctest 2.5.3's
++        // variadic INFO/MESSAGE stringifies a NAMED `const char*` LVALUE
++        // incorrectly (empirically confirmed: prints "1" instead of the
++        // string content; a string LITERAL argument is unaffected, so this
++        // was not caught until a variable was actually used here). Wrapping
++        // in std::string routes through doctest's normal std::string
++        // stringification instead.
++        INFO("format = ", std::string(label));
++        CHECK((props.optimalTilingFeatures & kRequired) == kRequired);
++
++        // [matrix row 10] Informational only, never asserted-required here
++        // -- kHdrFormat's storage-image support is a real, documented risk
++        // for a LATER compute consumer (SSR/volumetrics), not something
++        // this task's own opaque-attachment usage needs. Logged so the
++        // empirical answer is on record for whichever task queries it
++        // next, per scene_color.h's own storage-image caveat comment.
++        const bool hasColorBlend = (props.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0;
++        const bool hasStorageImage = (props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
++        MESSAGE("format ", std::string(label), ": COLOR_ATTACHMENT_BLEND=", hasColorBlend,
++                " STORAGE_IMAGE=", hasStorageImage);
++    };
++
++    checkFormat(kHdrFormat, "kHdrFormat (B10G11R11_UFLOAT_PACK32)");
++    checkFormat(kHdrFormatHighPrecision, "kHdrFormatHighPrecision (R16G16B16A16_SFLOAT)");
++}
