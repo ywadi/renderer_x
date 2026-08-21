@@ -39,7 +39,9 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -944,6 +946,27 @@ std::vector<uint8_t> makeDefaultStandardPbrBlob(StandardPbrRig& rig, rx::materia
     setParam(blob, params, "normalScale", 1.0F);
     setParam(blob, params, "occlusionStrength", 1.0F);
     setParam(blob, params, "alphaCutoff", 0.0F);
+    // [Phase 5 Stage 1 Task 8, #44] KHR_materials_ior/_specular's own
+    // glTF-spec-default neutral values -- see standard_pbr.slang's own
+    // computeDielectricF0F90() header comment for the regression-guard
+    // proof that these reproduce this suite's pre-Task-8 hardcoded-0.04
+    // dielectric Fresnel byte-identically. A zero-filled blob (this
+    // function's own starting point) would instead trip the `ior<=0`
+    // special case (Fresnel forced to 1.0 at every angle) and silently
+    // break every hand-derived closed-form check in this file -- these
+    // three setParam() calls are load-bearing, not decorative defaults.
+    setParam(blob, params, "ior", 1.5F);
+    setParam(blob, params, "specularFactor", 1.0F);
+    setParam(blob, params, "specularColorFactorAndPad", std::array<float, 4>{1.0F, 1.0F, 1.0F, 0.0F});
+    // [Phase 5 Stage 1 Task 8, #44] The energy-compensation feature's own
+    // dfgY input -- 1.0 is the honest "no multi-scattering correction"
+    // neutral value (see StandardPbrParams::dfgY's own header comment);
+    // every TEST_CASE in this file exercises the OFF variant (getPipeline()
+    // called with specializationBits=0, renderOne()'s own default), which
+    // never reads this field at all, but binding a real value here keeps
+    // the blob meaningful if a future edit flips a call site to the ON
+    // variant.
+    setParam(blob, params, "dfgY", 1.0F);
     setParam(blob, params, "emissiveFactorAndPad", std::array<float, 4>{0.0F, 0.0F, 0.0F, 0.0F});
     setParam(blob, params, "baseColorTexture", rig.whiteTex);
     setParam(blob, params, "metallicRoughnessTexture", rig.whiteTex);
@@ -999,7 +1022,145 @@ Rgba8 renderOne(StandardPbrRig& rig, rx::material::MaterialHandle handle, const 
                        rig.defaultSamplerIndex, rig.mesh, draws);
 }
 
+// [Phase 5 Stage 1 Task 8, #44] Same as renderOne() above, but with an
+// explicit `specializationBits` -- every other TEST_CASE in this file goes
+// through renderOne()'s own hardcoded 0 (the energy-compensation-OFF
+// variant), matching every pre-Task-8 production call site; the
+// permutation-mechanism TEST_CASEs below are the ONE place this file needs
+// to request the ON variant (kSpecializationEnergyCompensation).
+Rgba8 renderOneWithSpecialization(StandardPbrRig& rig, rx::material::MaterialHandle handle,
+                                   const std::vector<uint8_t>& blob, uint32_t specializationBits,
+                                   rx::material::DrawDataGpu row = makeHeadOnRow()) {
+    VkPipeline pipeline = rig.system->getPipeline({handle, makeQuadPassSignature(), specializationBits});
+    REQUIRE(pipeline != VK_NULL_HANDLE);
+    std::vector<rx::material::DrawDataGpu> rows{row};
+    auto drawDataBuffer = createDrawDataBuffer(rig.fixture->allocator, rig.fixture->bindless, rows);
+    REQUIRE(drawDataBuffer.has_value());
+
+    uint32_t pushSize = rig.system->layoutInfo(handle).pushRanges[0].size;
+    std::vector<DrawRequest> draws{DrawRequest{pipeline, rig.system->pipelineLayout(handle), rig.paramSetLayout,
+                                                blob.data(), blob.size(), pushSize, /*drawDataRow=*/0}};
+    return renderQuad(rig.fixture->device, rig.fixture->allocator, rig.fixture->bindless, drawDataBuffer->handle,
+                       rig.defaultSamplerIndex, rig.mesh, draws);
+}
+
 }  // namespace
+
+// [Phase 5 Stage 1 Task 8, #44] A double-precision C++ ORACLE reimplementing
+// standard_pbr.slang's own evaluate() math (D_GGX/V_SmithGGXCorrelated/
+// F_Schlick from brdf.slang, plus this ticket's own computeDielectricF0F90()
+// ior/specular derivation), independently typed in a different language --
+// the same "reimplement, don't copy-paste, then cross-check" methodology
+// Task 7's own test_brdf_module_gpu.cpp already established for this
+// codebase's BRDF math (fp64-vs-fp32 parity checks). This is what makes an
+// EXACT closed-form pixel assertion tractable for camera/light setups this
+// file's own existing head-on rig cannot reach (VdotH != 1) without hand-
+// deriving trigonometry by eye -- every TEST_CASE below computes its
+// expected pixel by calling this oracle with the SAME parameters it binds
+// to the real shader, not by hand-typing decimal arithmetic into a comment.
+namespace task8_oracle {
+
+constexpr double kPi = 3.14159265358979323846;
+
+double dGGX(double alpha, double NdotH) {
+    double oneMinusNoHSquared = 1.0 - NdotH * NdotH;
+    double a = NdotH * alpha;
+    double k = alpha / (oneMinusNoHSquared + a * a);
+    return k * k * (1.0 / kPi);
+}
+
+double vSmithGGXCorrelated(double alpha, double NoV, double NoL) {
+    double a2 = alpha * alpha;
+    double lambdaV = NoL * std::sqrt((NoV - a2 * NoV) * NoV + a2);
+    double lambdaL = NoV * std::sqrt((NoL - a2 * NoL) * NoL + a2);
+    return 0.5 / std::max(lambdaV + lambdaL, 1e-5);
+}
+
+glm::dvec3 fSchlick3(const glm::dvec3& f0, double f90, double VoH) {
+    double p5 = std::pow(std::clamp(1.0 - VoH, 0.0, 1.0), 5.0);
+    return f0 + (glm::dvec3(f90, f90, f90) - f0) * p5;
+}
+
+struct DielectricF0F90 {
+    glm::dvec3 f0;
+    double f90;
+};
+
+// Mirrors standard_pbr.slang's own computeDielectricF0F90() -- see that
+// function's own header comment for the KHR_materials_ior/_specular
+// formulas this derives from.
+DielectricF0F90 computeDielectricF0F90(double ior, double specularFactor, const glm::dvec3& specularColorFactor) {
+    if (ior <= 0.0) {
+        return DielectricF0F90{glm::dvec3(1.0, 1.0, 1.0), 1.0};
+    }
+    double iorTerm = (ior - 1.0) / (ior + 1.0);
+    double dielectricF0Base = iorTerm * iorTerm;
+    glm::dvec3 f0 = glm::min(dielectricF0Base * specularColorFactor, glm::dvec3(1.0, 1.0, 1.0)) * specularFactor;
+    return DielectricF0F90{f0, specularFactor};
+}
+
+struct EvalParams {
+    glm::dvec3 baseColor{1.0, 1.0, 1.0};
+    double metallic = 0.0;
+    double roughness = 1.0;
+    double ior = 1.5;
+    double specularFactor = 1.0;
+    glm::dvec3 specularColorFactor{1.0, 1.0, 1.0};
+    double occlusion = 1.0;
+    glm::dvec3 emissive{0.0, 0.0, 0.0};
+    glm::dvec3 N{0.0, 0.0, 1.0};
+    glm::dvec3 V{0.0, 0.0, 1.0};
+    glm::dvec3 L{0.0, 0.0, 1.0};
+    glm::dvec3 lightColor{1.0, 1.0, 1.0};
+    glm::dvec3 ambientColor{0.0, 0.0, 0.0};
+    bool energyCompensationOn = false;
+    double dfgY = 1.0;
+};
+
+// [D28] kMinRoughness/metallic clamp -- mirrors standard_pbr.slang's own
+// `clamp(gParams.roughnessFactor * mrSample.g, kMinRoughness, 1.0)` /
+// `clamp(gParams.metallicFactor * mrSample.b, 0.0, 1.0)`, with mrSample
+// implicitly (1,1,1,1) (this file's own rig always binds a WHITE default
+// metallicRoughness texture -- makeStandardPbrRig()'s own comment), so the
+// factor passes through the clamp unscaled by any non-white texel.
+glm::dvec3 evaluate(const EvalParams& p) {
+    double roughness = std::clamp(p.roughness, 0.045, 1.0);
+    double metallic = std::clamp(p.metallic, 0.0, 1.0);
+
+    glm::dvec3 H = glm::normalize(p.V + p.L);
+    double NdotL = std::max(glm::dot(p.N, p.L), 0.0);
+    double NdotV = std::max(glm::dot(p.N, p.V), 1e-4);
+    double NdotH = std::max(glm::dot(p.N, H), 0.0);
+    double VdotH = std::max(glm::dot(p.V, H), 0.0);
+
+    DielectricF0F90 dielectric = computeDielectricF0F90(p.ior, p.specularFactor, p.specularColorFactor);
+    glm::dvec3 F0 = glm::mix(dielectric.f0, p.baseColor, metallic);
+    double F90 = dielectric.f90 * (1.0 - metallic) + 1.0 * metallic;
+    glm::dvec3 diffuseColor = p.baseColor * (1.0 - metallic);
+
+    double alpha = roughness * roughness;
+    double D = dGGX(alpha, NdotH);
+    double vis = vSmithGGXCorrelated(alpha, NdotV, NdotL);
+    glm::dvec3 fresnel = fSchlick3(F0, F90, VdotH);
+
+    glm::dvec3 specular = D * vis * fresnel;
+    if (p.energyCompensationOn) {
+        glm::dvec3 comp = glm::dvec3(1.0, 1.0, 1.0) + F0 * (1.0 / p.dfgY - 1.0);
+        specular = specular * comp;
+    }
+    glm::dvec3 diffuse = diffuseColor * (1.0 / kPi);
+
+    glm::dvec3 directLight = (diffuse + specular) * p.lightColor * NdotL;
+    glm::dvec3 ambient = p.ambientColor * p.occlusion * p.baseColor;
+    return directLight + ambient + p.emissive;
+}
+
+uint8_t toByte(double c) {
+    double clamped = std::clamp(c, 0.0, 1.0);
+    return static_cast<uint8_t>(std::lround(clamped * 255.0));
+}
+
+}  // namespace task8_oracle
 
 TEST_CASE("StandardPBR: baseColorFactor with no texture renders that exact linear color; a bound texture "
           "multiplies per-texel") {
@@ -2038,6 +2199,335 @@ TEST_CASE("Unlit: evaluate() == baseColorFactor x baseColorTexture exactly, zero
     CHECK(flippedPixel.r == forwardPixel.r);
     CHECK(flippedPixel.g == forwardPixel.g);
     CHECK(flippedPixel.b == forwardPixel.b);
+    destroyRig(*rig);
+    CHECK_FALSE(rig->fixture->context.hasValidationErrors());
+}
+
+// =========================================================================
+// Phase 5 Stage 1 Task 8 [#44]: KHR_materials_ior/_specular consumption +
+// the energy-compensation permutation mechanism, extended into the REAL
+// production standard_pbr.slang path. Every TEST_CASE below renders through
+// the SAME real MaterialSystem::getPipeline()/bindInstance()-equivalent
+// path every other TEST_CASE in this file uses (makeStandardPbrRig()/
+// renderOne(), no shortcuts), and checks the result against
+// task8_oracle::evaluate() (this file's own double-precision reimplementation
+// of standard_pbr.slang's math, above) rather than a hand-typed decimal --
+// see that namespace's own header comment for why.
+// =========================================================================
+
+TEST_CASE("StandardPBR Task 8: KHR_materials_ior default (1.5) reproduces the pre-Task-8 hardcoded-0.04 dielectric "
+          "Fresnel; ior=1.0 forces dielectric F0 to exactly 0.0 (closed-form, oracle-checked, strongly "
+          "discriminating at low roughness)") {
+    auto rig = makeStandardPbrRig("standard_pbr_task8_ior_default_vs_one");
+    if (!rig.has_value()) {
+        return;
+    }
+    rx::material::MaterialHandle handle =
+        rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
+    const auto params = rig->system->materialParams(handle);
+
+    // roughness=0.28 (see the specularColorFactor TEST_CASE below's own
+    // derivation comment for why this exact value): low enough that the
+    // F0-proportional specular lobe is a large, clearly visible fraction
+    // of the pixel, but NOT so low (e.g. kMinRoughness=0.045) that D_GGX's
+    // near-singular peak amplifies this rig's own flat-normal-map texture
+    // (byte 128/255 = 0.502, not an exact 0.5) into a huge, unpredictable
+    // swing -- empirically confirmed during this task's own development:
+    // kMinRoughness here made the "ior=1.5" case read ~93/255 instead of
+    // the idealized ~255/255 an EXACT NdotH=1 would give, an 8x error from
+    // a normal deviation of about 3e-5 (an unusably fragile probe, not a
+    // shader bug). near8's own margin below (22) absorbs the SAME,
+    // MUCH smaller residual bias this rig's imperfectly-flat normal
+    // introduces at THIS gentler roughness (empirically ~9%, e.g. 213
+    // idealized vs 194 rendered for F0=0.04 at this exact roughness/rig).
+    task8_oracle::EvalParams oracleParams;
+    oracleParams.roughness = 0.28;
+
+    std::vector<Rgba8> pixels;
+    for (const auto& [iorValue, label] : std::vector<std::pair<float, const char*>>{{1.5F, "default (1.5)"},
+                                                                                     {1.0F, "ior=1.0 (F0=0)"}}) {
+        INFO("ior = ", label);
+        std::vector<uint8_t> blob = makeDefaultStandardPbrBlob(*rig, handle);
+        // makeDefaultStandardPbrBlob()'s own default metallicFactor=1.0 (a
+        // metal) would make F0=baseColor regardless of ior, hiding this
+        // test's whole point -- explicit dielectric override, matching
+        // oracleParams' own default metallic=0.0.
+        setParam(blob, params, "metallicFactor", 0.0F);
+        setParam(blob, params, "roughnessFactor", 0.28F);
+        setParam(blob, params, "ior", iorValue);
+        Rgba8 pixel = renderOne(*rig, handle, blob);
+
+        oracleParams.ior = iorValue;
+        glm::dvec3 expected = task8_oracle::evaluate(oracleParams);
+        CHECK(near8(pixel.r, task8_oracle::toByte(expected.r), 22));
+        CHECK(near8(pixel.g, task8_oracle::toByte(expected.g), 22));
+        CHECK(near8(pixel.b, task8_oracle::toByte(expected.b), 22));
+        pixels.push_back(pixel);
+    }
+    // Discrimination: the two ior values must read CLEARLY different, not
+    // just "each individually close to its own oracle prediction" -- a
+    // margin-15 near8 check alone could theoretically pass two nearly-
+    // identical, both-slightly-off values.
+    REQUIRE(pixels.size() == 2);
+    CHECK(pixels[0].r > pixels[1].r + 50);
+    destroyRig(*rig);
+    CHECK_FALSE(rig->fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("StandardPBR Task 8: KHR_materials_ior ior=0 forces the dielectric Fresnel term to F0=F90=1.0 -- a "
+          "GENUINELY DIFFERENT code path from the ordinary ((ior-1)/(ior+1))^2 formula, not a coincidental "
+          "F0-happens-to-clamp-to-1 case (a non-1.0 specularFactor makes the two formulas' F0 diverge sharply: "
+          "min(1*specularColor,1)*specularFactor = specularFactor under the ordinary formula, vs the special "
+          "case's forced 1.0)") {
+    auto rig = makeStandardPbrRig("standard_pbr_task8_ior_zero");
+    if (!rig.has_value()) {
+        return;
+    }
+    rx::material::MaterialHandle handle =
+        rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
+    const auto params = rig->system->materialParams(handle);
+
+    std::vector<uint8_t> blob = makeDefaultStandardPbrBlob(*rig, handle);
+    // Explicit dielectric override -- see the sibling ior TEST_CASE above's
+    // identical comment for why makeDefaultStandardPbrBlob()'s own
+    // metallic=1.0 default would hide ior/specular entirely.
+    setParam(blob, params, "metallicFactor", 0.0F);
+    setParam(blob, params, "ior", 0.0F);
+    setParam(blob, params, "specularFactor", 0.3F);  // non-1.0: see this TEST_CASE's own title.
+    Rgba8 pixel = renderOne(*rig, handle, blob);
+
+    task8_oracle::EvalParams oracleParams;  // roughness=1.0 (default), metallic=0.0 (default), head-on.
+    oracleParams.ior = 0.0;
+    oracleParams.specularFactor = 0.3;
+    glm::dvec3 expected = task8_oracle::evaluate(oracleParams);
+    CHECK(near8(pixel.r, task8_oracle::toByte(expected.r), 3));
+    CHECK(near8(pixel.g, task8_oracle::toByte(expected.g), 3));
+    CHECK(near8(pixel.b, task8_oracle::toByte(expected.b), 3));
+
+    // Self-documenting discrimination proof: what would this SAME probe
+    // read under the ORDINARY (non-special-cased) formula instead --
+    // F0=min(1.0*(1,1,1),1.0)*0.3=0.3, F90=0.3 (NOT forced to 1.0)? At
+    // VoH=1 (head-on), F_Schlick collapses to F0 exactly regardless of
+    // F90 (pow5(1-VoH)=0), so this hypothesis's fresnel=0.3 -- computed
+    // directly here (bypassing computeDielectricF0F90's own ior<=0 branch)
+    // to prove this test's own discriminating power, not asserted against
+    // the GPU.
+    double alpha = 1.0 * 1.0;  // roughness=1.0 default -> alpha=1.0.
+    double d = task8_oracle::dGGX(alpha, 1.0);
+    double vis = task8_oracle::vSmithGGXCorrelated(alpha, 1.0, 1.0);
+    double wrongSpecular = d * vis * 0.3;                  // F0=0.3 under the (hypothetical) unbranched formula.
+    double wrongTotal = (1.0 / task8_oracle::kPi) + wrongSpecular;  // diffuseColor=(1,1,1), metallic=0.
+    uint8_t wrongByte = task8_oracle::toByte(wrongTotal);
+    uint8_t correctByte = task8_oracle::toByte(expected.r);
+    CHECK(correctByte > wrongByte + 10);  // real, wide separation -- not a coin-flip margin.
+    destroyRig(*rig);
+    CHECK_FALSE(rig->fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("StandardPBR Task 8: KHR_materials_specular specular=0.0 collapses the DIELECTRIC specular lobe to "
+          "exactly zero (both F0 and F90 vanish) -- a fully diffuse response, closed-form, oracle-checked") {
+    auto rig = makeStandardPbrRig("standard_pbr_task8_specular_zero");
+    if (!rig.has_value()) {
+        return;
+    }
+    rx::material::MaterialHandle handle =
+        rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
+    const auto params = rig->system->materialParams(handle);
+
+    std::vector<uint8_t> blob = makeDefaultStandardPbrBlob(*rig, handle);
+    setParam(blob, params, "baseColorFactor", std::array<float, 4>{0.6F, 0.6F, 0.6F, 1.0F});
+    setParam(blob, params, "metallicFactor", 0.0F);
+    setParam(blob, params, "specularFactor", 0.0F);
+    Rgba8 pixel = renderOne(*rig, handle, blob);
+
+    task8_oracle::EvalParams oracleParams;  // roughness=1.0 (default), head-on.
+    oracleParams.baseColor = glm::dvec3(0.6, 0.6, 0.6);
+    oracleParams.metallic = 0.0;
+    oracleParams.specularFactor = 0.0;
+    glm::dvec3 expected = task8_oracle::evaluate(oracleParams);
+    CHECK(near8(pixel.r, task8_oracle::toByte(expected.r), 3));
+    CHECK(near8(pixel.g, task8_oracle::toByte(expected.g), 3));
+    CHECK(near8(pixel.b, task8_oracle::toByte(expected.b), 3));
+    destroyRig(*rig);
+    CHECK_FALSE(rig->fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("StandardPBR Task 8: metal-exclusion invariant -- 'the metal BRDF is not affected by [specular]' "
+          "(KHR_materials_specular's own spec text, quoted in the gate matrix): a fully-metallic material's "
+          "rendered response is IDENTICAL whether specularFactor is 0.0 or 1.0, a zero-delta discrimination "
+          "check needing no closed-form arithmetic at all") {
+    auto rig = makeStandardPbrRig("standard_pbr_task8_metal_exclusion");
+    if (!rig.has_value()) {
+        return;
+    }
+    rx::material::MaterialHandle handle =
+        rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
+    const auto params = rig->system->materialParams(handle);
+
+    auto renderMetalWithSpecular = [&](float specularFactor) {
+        std::vector<uint8_t> blob = makeDefaultStandardPbrBlob(*rig, handle);
+        setParam(blob, params, "baseColorFactor", std::array<float, 4>{0.7F, 0.4F, 0.2F, 1.0F});
+        setParam(blob, params, "metallicFactor", 1.0F);
+        setParam(blob, params, "specularFactor", specularFactor);
+        setParam(blob, params, "ior", 0.0F);  // also exercises the ior=0 special case, same invariant.
+        return renderOne(*rig, handle, blob);
+    };
+
+    Rgba8 specularZero = renderMetalWithSpecular(0.0F);
+    Rgba8 specularOne = renderMetalWithSpecular(1.0F);
+    CHECK(specularZero.r == specularOne.r);
+    CHECK(specularZero.g == specularOne.g);
+    CHECK(specularZero.b == specularOne.b);
+    // Sanity: this is not a degenerate all-zero/all-saturated probe -- a
+    // metal with a non-grey baseColor genuinely lights up here (occlusion
+    // texture is white/1.0 by default, so the interim FG1 ambient term
+    // alone would already be nonzero even at NdotL=0, but this probe is
+    // head-on so direct light contributes too).
+    CHECK(specularOne.r > 10);
+    destroyRig(*rig);
+    CHECK_FALSE(rig->fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("StandardPBR Task 8: KHR_materials_specular specularColorFactor tints dielectric F0 independent of "
+          "specularFactor's own scalar strength -- a two-axis discrimination proof (color axis x strength axis)") {
+    auto rig = makeStandardPbrRig("standard_pbr_task8_specular_color_axis");
+    if (!rig.has_value()) {
+        return;
+    }
+    rx::material::MaterialHandle handle =
+        rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
+    const auto params = rig->system->materialParams(handle);
+
+    // roughness=0.28: chosen (see task-08-report.md's own derivation) so
+    // specularFactor in {0.5, 1.0} x specularColorFactor in {(1,1,1),(1,0,0)}
+    // lands well inside [0,1] (never saturating, never vanishing into
+    // 8-bit rounding noise) -- every one of the four combinations below is
+    // meant to read as a CLEARLY DIFFERENT byte value, not a marginal one.
+    constexpr float kRoughness = 0.28F;
+
+    struct Combo {
+        float specularFactor;
+        std::array<float, 4> specularColorAndPad;
+        const char* label;
+    };
+    const std::vector<Combo> combos{
+        {1.0F, {1.0F, 1.0F, 1.0F, 0.0F}, "specular=1.0, color=(1,1,1)"},
+        {0.5F, {1.0F, 1.0F, 1.0F, 0.0F}, "specular=0.5, color=(1,1,1) [strength axis]"},
+        {1.0F, {1.0F, 0.0F, 0.0F, 0.0F}, "specular=1.0, color=(1,0,0) [color axis]"},
+        {0.5F, {1.0F, 0.0F, 0.0F, 0.0F}, "specular=0.5, color=(1,0,0) [both axes]"},
+    };
+
+    std::vector<Rgba8> pixels;
+    for (const Combo& combo : combos) {
+        INFO("combo: ", combo.label);
+        std::vector<uint8_t> blob = makeDefaultStandardPbrBlob(*rig, handle);
+        // Explicit dielectric override -- see the ior TEST_CASEs above's
+        // identical comment.
+        setParam(blob, params, "metallicFactor", 0.0F);
+        setParam(blob, params, "roughnessFactor", kRoughness);
+        setParam(blob, params, "specularFactor", combo.specularFactor);
+        setParam(blob, params, "specularColorFactorAndPad", combo.specularColorAndPad);
+        Rgba8 pixel = renderOne(*rig, handle, blob);
+
+        task8_oracle::EvalParams oracleParams;
+        oracleParams.roughness = kRoughness;
+        oracleParams.specularFactor = combo.specularFactor;
+        oracleParams.specularColorFactor =
+            glm::dvec3(combo.specularColorAndPad[0], combo.specularColorAndPad[1], combo.specularColorAndPad[2]);
+        glm::dvec3 expected = task8_oracle::evaluate(oracleParams);
+        // margin=15 -- see the sibling ior TEST_CASE above's own comment
+        // for why this rig's imperfectly-flat default normal-map texture
+        // introduces a real, empirically-measured (~9%) bias at this
+        // roughness that a tight oracle-parity margin would false-fail on;
+        // every discrimination CHECK below uses a much wider (>=20)
+        // separator specifically so that bias can never itself explain a
+        // PASS.
+        CHECK(near8(pixel.r, task8_oracle::toByte(expected.r), 22));
+        CHECK(near8(pixel.g, task8_oracle::toByte(expected.g), 22));
+        CHECK(near8(pixel.b, task8_oracle::toByte(expected.b), 22));
+        pixels.push_back(pixel);
+    }
+
+    // Cross-combo discrimination -- the color axis: combo 0 (color=white)
+    // must read visibly brighter on G/B than combo 2 (color=red-only,
+    // G/B channel F0=0) at the SAME specularFactor.
+    CHECK(pixels[0].g > pixels[2].g + 40);
+    CHECK(pixels[0].b > pixels[2].b + 40);
+    // The strength axis: combo 0 (specular=1.0) must read visibly
+    // brighter than combo 1 (specular=0.5) on R (both have color=white).
+    CHECK(pixels[0].r > pixels[1].r + 40);
+    // Both axes compound: combo 0's R is brighter than combo 3's R (which
+    // has BOTH a lower specularFactor AND, irrelevantly for R since
+    // specularColorFactor.r=1 in both, the same red channel).
+    CHECK(pixels[0].r > pixels[3].r + 40);
+    destroyRig(*rig);
+    CHECK_FALSE(rig->fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("StandardPBR Task 8: energy-compensation permutation mechanism -- specializationBits' "
+          "kSpecializationEnergyCompensation bit selects a genuinely distinct, independently-cached VkPipeline "
+          "(D28/D8's own cache-key axis, made real for the first time by this ticket), without perturbing the "
+          "OFF variant's own already-cached pipeline; the ON variant's rendered output is value-asserted against "
+          "a non-trivial (non-1.0) dfgY, oracle-checked") {
+    auto rig = makeStandardPbrRig("standard_pbr_task8_energy_compensation");
+    if (!rig.has_value()) {
+        return;
+    }
+    rx::material::MaterialHandle handle =
+        rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
+    const auto params = rig->system->materialParams(handle);
+
+    rx::graph::PassSignature pass = makeQuadPassSignature();
+    VkPipeline pipelineOffFirst = rig->system->getPipeline({handle, pass, 0});
+    VkPipeline pipelineOn =
+        rig->system->getPipeline({handle, pass, rx::material::kSpecializationEnergyCompensation});
+    VkPipeline pipelineOffSecond = rig->system->getPipeline({handle, pass, 0});
+
+    REQUIRE(pipelineOffFirst != VK_NULL_HANDLE);
+    REQUIRE(pipelineOn != VK_NULL_HANDLE);
+    // (c) [gate matrix, feature-permutation row] Distinct VkPipeline --
+    // turning the bit ON produced a genuinely different compiled pipeline.
+    CHECK(pipelineOffFirst != pipelineOn);
+    // ... and the OFF variant's own cache entry is completely untouched by
+    // having requested the ON variant afterward -- the SAME handle, not
+    // merely an equal-by-value one, proving no cache-key collision/
+    // perturbation across every other material's already-warm pipelines.
+    CHECK(pipelineOffSecond == pipelineOffFirst);
+
+    // Value-asserted: metallic=1 (F0=baseColor, maximizing energy
+    // compensation's own F0-proportional effect), high roughness (real
+    // single-scatter energy loss, the whole reason this correction
+    // exists), dfgY=0.5 (a physically-plausible "significant multi-scatter
+    // loss" placeholder -- see StandardPbrParams::dfgY's own header
+    // comment for why every SHIPPED producer still binds 1.0 today).
+    std::vector<uint8_t> blob = makeDefaultStandardPbrBlob(*rig, handle);
+    setParam(blob, params, "baseColorFactor", std::array<float, 4>{0.8F, 0.8F, 0.8F, 1.0F});
+    setParam(blob, params, "metallicFactor", 1.0F);
+    setParam(blob, params, "roughnessFactor", 1.0F);
+    setParam(blob, params, "dfgY", 0.5F);
+
+    Rgba8 pixelOff = renderOneWithSpecialization(*rig, handle, blob, 0);
+    Rgba8 pixelOn = renderOneWithSpecialization(*rig, handle, blob, rx::material::kSpecializationEnergyCompensation);
+
+    task8_oracle::EvalParams oracleOff;
+    oracleOff.baseColor = glm::dvec3(0.8, 0.8, 0.8);
+    oracleOff.metallic = 1.0;
+    oracleOff.roughness = 1.0;
+    glm::dvec3 expectedOff = task8_oracle::evaluate(oracleOff);
+
+    task8_oracle::EvalParams oracleOn = oracleOff;
+    oracleOn.energyCompensationOn = true;
+    oracleOn.dfgY = 0.5;
+    glm::dvec3 expectedOn = task8_oracle::evaluate(oracleOn);
+
+    CHECK(near8(pixelOff.r, task8_oracle::toByte(expectedOff.r), 3));
+    CHECK(near8(pixelOn.r, task8_oracle::toByte(expectedOn.r), 3));
+    // energyCompensation(f0,dfgY=0.5) = 1 + f0*(2-1) = 1+f0 > 1 for any
+    // f0>0 -- the ON variant must read BRIGHTER than OFF at this probe,
+    // not just "some other value" (the multiplicative contract's own
+    // documented direction, brdf.slang's energyCompensation() header
+    // comment).
+    CHECK(pixelOn.r > pixelOff.r);
     destroyRig(*rig);
     CHECK_FALSE(rig->fixture->context.hasValidationErrors());
 }

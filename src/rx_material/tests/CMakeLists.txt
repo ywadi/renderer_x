@@ -129,6 +129,16 @@ add_executable(rx_material_brdf_gpu_tests
     test_brdf_module_gpu.cpp
     test_brdf_white_furnace_gpu.cpp
     test_brdf_spirv_link_composition_gpu.cpp
+    # Phase 5 Stage 1 Task 8 [#44]: extends the two files above's own
+    # SPIR-V-absence + white-furnace methodology from brdf.slang standalone
+    # onto the REAL production standard_pbr.slang path (composes the real
+    # shipped material.slang/forward_entry.slang/standard_pbr.slang/
+    # brdf.slang/energy_compensation_{off,on}.slang files directly, not a
+    # synthetic fixture) -- lives in THIS binary (not rx_material_gpu_tests)
+    # since it drives slang::ISession directly via brdf_test_harness.h and
+    # needs spirv-dis (RX_SPIRV_DIS), matching this binary's own existing
+    # scope, not rx_material_gpu_tests' MaterialSystem-level scope.
+    test_standard_pbr_energy_compensation_gpu.cpp
 )
 target_link_libraries(rx_material_brdf_gpu_tests PRIVATE rx_shader rx_rhi_vk rx_platform doctest::doctest)
 rx_shader_deploy_runtime_libs(rx_material_brdf_gpu_tests)

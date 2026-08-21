@@ -278,6 +278,17 @@ std::vector<uint8_t> makeParamBlob(rx::material::MaterialSystem& system, rx::mat
     setParam(blob, params, "normalScale", 1.0F);
     setParam(blob, params, "occlusionStrength", 1.0F);
     setParam(blob, params, "alphaCutoff", 0.0F);
+    // [Phase 5 Stage 1 Task 8, #44] KHR_materials_ior/_specular's own
+    // glTF-spec-default neutral values -- see standard_pbr.slang's own
+    // computeDielectricF0F90() header comment (test_standard_pbr_unlit.cpp's
+    // own makeDefaultStandardPbrBlob() carries the same three calls with
+    // the full regression-guard rationale). A zero-filled `ior` would trip
+    // the ior<=0 special case (Fresnel forced to 1.0 at every angle),
+    // silently breaking this file's own shadow-attenuation pixel checks.
+    setParam(blob, params, "ior", 1.5F);
+    setParam(blob, params, "specularFactor", 1.0F);
+    setParam(blob, params, "specularColorFactorAndPad", std::array<float, 4>{1.0F, 1.0F, 1.0F, 0.0F});
+    setParam(blob, params, "dfgY", 1.0F);
     setParam(blob, params, "emissiveFactorAndPad", std::array<float, 4>{0.0F, 0.0F, 0.0F, 0.0F});
     setParam(blob, params, "baseColorTexture", whiteTex);
     setParam(blob, params, "metallicRoughnessTexture", whiteTex);
