@@ -162,6 +162,64 @@ struct StandardPbrParams {
     float4 emissiveUvOffsetScale;
 };
 
+// --- Extension points [declared-but-gated slots, gate ruling T8's Open
+// Question "grow the struct only for what it actually consumes now"] ---
+// The nine glTF material extensions this ticket's own scope line names as
+// "declared-but-gated" (clearcoat/anisotropy/sheen/transmission/thickness/
+// attenuation/dispersion/iridescence/diffuseTransmission) do NOT get
+// StandardPbrParams fields today -- see this file's own header comment
+// and the gate matrix's Open Question for why (D8's "bound parameters
+// change per-instance with zero recompilation" contract presumes the
+// parameter block reflects what's actually wired, not a maximal
+// superset; every declared-but-unused field would cost real per-instance
+// storage regardless of use, the exact "pay for what you use" violation
+// the ruling rejects). Clearcoat/anisotropy already have a dedicated
+// code-location breadcrumb in brdf.slang's own "Extension point [Task
+// 21]" comment (that lobe's own D_GGX-reuse/V_Kelemen math belongs
+// there, general BRDF math, not here); the remaining seven land HERE, in
+// this glTF-vocabulary-aware module, matching computeDielectricF0F90()'s
+// own module-boundary reasoning above -- this is the code location a
+// future implementer adding any of them finds first, per D13/D7's
+// established "future task lands here" idiom:
+//   - KHR_materials_transmission (Task 23, #59): a genuinely new BRDF
+//     layer (light passing through, preserving specular reflection), not
+//     a factor tweak on the existing lobes -- adds its own
+//     transmissionFactor/transmissionTexture and a refraction-ray
+//     evaluation, per RC4's own TRANSMISSION draw-partition ruling
+//     (ViewLists gains a third, never-instancing-collapsed partition).
+//   - KHR_materials_volume (Task 24, #60): thicknessTexture +
+//     attenuationColor/attenuationDistance -- Beer-Lambert colored-glass
+//     attenuation, coupled to (sequenced strictly after) the transmission
+//     row above; RC3's own importer-plumbing fold-in names T24 as the
+//     scope owner.
+//   - KHR_materials_sheen (Task 34, #70, stretch tier): a fabric/cloth
+//     retroreflective lobe ported from the Khronos Sample Viewer per
+//     that ruling -- adds sheenColorFactor/sheenRoughnessFactor and a
+//     second, additive specular term.
+//   - KHR_materials_iridescence (Task 34, #70, stretch tier): thin-film
+//     interference (soap-bubble/oil-film effect) -- a view-dependent F0
+//     modulation, adds iridescenceFactor/iridescenceIor/
+//     iridescenceThickness.
+//   - KHR_materials_dispersion (Task 34, #70, stretch tier): chromatic
+//     aberration through transmissive volumes, ported from Filament
+//     v1.75.0 per that ruling -- strictly downstream of the transmission
+//     row above (meaningless without it).
+//   - KHR_materials_diffuse_transmission (Task 34, #70, stretch tier): a
+//     live, currently-ratified extension the Phase-4 gate matrix
+//     (matrix-issue08) found absent from that ticket's own named list
+//     (thin, one-sided transmissive materials -- leaves, thin fabric) --
+//     adds diffuseTransmissionFactor/diffuseTransmissionColorFactor.
+//   - KHR_materials_emissive_strength beyond its CURRENT CPU-side
+//     pre-multiply (no future task assigned -- this is this ticket's own
+//     matrix row, not a registry item): `emissiveFactorAndPad` is
+//     ALREADY consume-now (folded into the CPU-side bind at material-
+//     resolution time, matrix-issue08's own disposition, unchanged by
+//     this rework) -- the open question is purely an internal-
+//     consistency one (should the multiply move on-shader for symmetry
+//     with ior/specular's own on-shader derivation above?), not a
+//     functional gap; flagged here, per the gate matrix's own text
+//     raising it explicitly without resolving it, rather than left
+//     silent.
 [[vk::binding(0, 1)]]
 ParameterBlock<StandardPbrParams> gParams;
 

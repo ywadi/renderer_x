@@ -2130,6 +2130,16 @@ VkPipeline MaterialSystem::getPipeline(const PipelineRequest& req) {
             "attachment; rejecting (no use case in Phase 3)");
     }
 
+    // [Task 8, trap note for whoever adds the NEXT specialization axis]
+    // `key` embeds `req.specializationBits` VERBATIM, even for a bit this
+    // material has no registered variant for (see wantsEnergyCompensationOn
+    // below, which silently falls back to the base pair in that case) --
+    // the fallback is CORRECT (identical SPIR-V either way) but still
+    // mints a SEPARATE cache entry/VkPipeline rather than colliding with
+    // the base variant's own key, since PipelineKey has no way to know
+    // "this bit was irrelevant here" after the fact. Harmless today (one
+    // axis, one real bit) but worth knowing before a second axis makes the
+    // space of irrelevant-bit combinations grow.
     PipelineKey key{record->contentHash, req.pass.hash(), req.specializationBits,
                      record->fixedFunctionState.alphaMode, record->fixedFunctionState.doubleSided};
     auto it = impl.pipelines.find(key);
