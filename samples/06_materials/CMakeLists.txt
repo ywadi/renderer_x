@@ -4,7 +4,8 @@
 # every other sample's own CMakeLists.txt already relies on.
 
 add_executable(sample_06_materials main.cpp)
-target_link_libraries(sample_06_materials PRIVATE rx_graph rx_rhi_vk rx_platform rx_material)
+# rx_frame_loop [Phase 5 Task 5, ticket #41]: shared present-loop helper.
+target_link_libraries(sample_06_materials PRIVATE rx_graph rx_rhi_vk rx_platform rx_material rx_frame_loop)
 
 # This sample links rx_material, which links slang::slang and does real
 # in-process Slang compilation at startup (loadMaterial() for both

@@ -162,6 +162,7 @@
 //   to apply to.
 #include <rx_core/log.h>
 #include <rx_core/profile.h>
+#include <rx_frame_loop/present_loop.h>
 #include <rx_platform/window.h>
 #include <rx_rhi_vk/bindless.h>
 #include <rx_rhi_vk/buffer.h>
@@ -199,7 +200,6 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1607,7 +1607,18 @@ int runHeadless(bool enableValidation) {
 }
 
 // --- --present mode: real window, continuously cycling grid ----------------
-int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fullscreen) {
+struct Args {
+    bool validate = false;
+    rx::rhi::PresentMode vsyncMode = rx::rhi::PresentMode::VsyncOn;
+    bool fullscreen = false;
+};
+
+// [Phase 5 Task 5, ticket #41] The acquire/status-handle/recreate/present
+// MECHANICS this function used to hand-roll now live once, engine-side, in
+// rx::frame_loop::PresentLoop -- including the per-frame
+// `FrameSync::advanceFrame(allocatorForBudgetRefresh)` wiring [D24] this
+// sample needs, via `CreateInfo::allocatorForBudgetRefresh`.
+int runPresent(const Args& args) {
     auto window = rx::platform::Window::create("rx_streaming_sample (--present)", static_cast<int>(kPresentWidth),
                                                  static_cast<int>(kPresentHeight), /*visible=*/true);
     if (!window.has_value()) {
@@ -1615,11 +1626,7 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
         return 1;
     }
 
-    // --fullscreen [Phase 4 Task 17, FG7]: applied immediately after window
-    // creation, before Device::create() below builds the initial swapchain
-    // -- see samples/01_triangle/main.cpp's runPresent() for the full
-    // rationale (same pattern, every --present sample).
-    if (fullscreen) {
+    if (args.fullscreen) {
         if (!window->setFullscreen(true)) {
             RX_LOG_ERROR("Window::setFullscreen(true) failed while applying --fullscreen");
             return 1;
@@ -1632,7 +1639,7 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
         return 1;
     }
 
-    auto context = rx::rhi::Context::create(extensions, enableValidation);
+    auto context = rx::rhi::Context::create(extensions, args.validate);
     if (!context.has_value()) {
         RX_LOG_ERROR("Context::create failed");
         return 1;
@@ -1651,17 +1658,8 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
     }
     const VkDevice vkDevice = device->device();
 
-    // --vsync [Phase 4 Task 6]: Device::create() always builds its
-    // swapchain with an explicit FIFO default (PresentMode::VsyncOn) --
-    // see device.cpp's own comment at the creation site. setPresentMode()
-    // only records what the caller wants; recreateSwapchain() (the exact
-    // path the NeedsRecreate handling below already drives on a real
-    // resize) is what actually applies it -- reused here, once, before any
-    // per-swapchain-image resource (FrameSync, image views) is built
-    // against this device, so nothing downstream is built against a
-    // swapchain generation that is about to be replaced.
-    if (vsyncMode == rx::rhi::PresentMode::VsyncOff) {
-        device->setPresentMode(vsyncMode);
+    if (args.vsyncMode == rx::rhi::PresentMode::VsyncOff) {
+        device->setPresentMode(args.vsyncMode);
         if (!device->recreateSwapchain(surface)) {
             RX_LOG_ERROR("Device::recreateSwapchain failed while applying --vsync off");
             return 1;
@@ -1681,13 +1679,6 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
         return 1;
     }
 
-    auto frameSync = rx::rhi::FrameSync::create(vkDevice, device->graphicsQueueFamily(),
-                                                 static_cast<uint32_t>(device->swapchainImages().size()));
-    if (!frameSync.has_value()) {
-        RX_LOG_ERROR("FrameSync::create failed");
-        return 1;
-    }
-
     const auto expectedColors = computeExpectedColors();
 
     auto scene =
@@ -1697,36 +1688,11 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
         return 1;
     }
 
-    std::vector<VkImageView> swapchainViews;
-    auto createSwapchainViews = [&]() -> bool {
-        swapchainViews.assign(device->swapchainImages().size(), VK_NULL_HANDLE);
-        for (size_t i = 0; i < swapchainViews.size(); ++i) {
-            VkImageViewCreateInfo viewInfo{};
-            viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-            viewInfo.image = device->swapchainImages()[i];
-            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            viewInfo.format = device->swapchainFormat();
-            viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            viewInfo.subresourceRange.levelCount = 1;
-            viewInfo.subresourceRange.layerCount = 1;
-            if (vkCreateImageView(vkDevice, &viewInfo, nullptr, &swapchainViews[i]) != VK_SUCCESS) {
-                RX_LOG_ERROR("sample_04_streaming: vkCreateImageView(swapchain image {}) failed", i);
-                return false;
-            }
-        }
-        return true;
-    };
-    auto destroySwapchainViews = [&]() {
-        for (VkImageView view : swapchainViews) {
-            if (view != VK_NULL_HANDLE) {
-                vkDestroyImageView(vkDevice, view, nullptr);
-            }
-        }
-        swapchainViews.clear();
-    };
-
-    if (!createSwapchainViews()) {
-        destroySwapchainViews();
+    rx::frame_loop::PresentLoop::CreateInfo loopInfo{&*device, surface, &*window};
+    loopInfo.allocatorForBudgetRefresh = &*allocator;
+    auto loop = rx::frame_loop::PresentLoop::create(loopInfo);
+    if (!loop.has_value()) {
+        RX_LOG_ERROR("PresentLoop::create failed");
         destroyScene(vkDevice, *scene);
         return 1;
     }
@@ -1739,243 +1705,114 @@ int runPresent(bool enableValidation, rx::rhi::PresentMode vsyncMode, bool fulls
     float lastStreamSeconds = 0.0F;
 
     bool ok = true;
-    bool quit = false;
-    while (!quit) {
+    bool running = true;
+    while (running) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_EVENT_QUIT) {
-                quit = true;
+                running = false;
             }
         }
-        if (quit) {
+        if (!running) {
             break;
         }
 
-        VkFence fence = frameSync->currentFence();
-        if (vkWaitForFences(vkDevice, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
-            RX_LOG_ERROR("vkWaitForFences failed in present loop");
-            ok = false;
-            break;
-        }
-
-        // This slot's fence just confirmed frame (frameNumber() -
-        // framesInFlight()) -- and, transitively, everything before it --
-        // has completed on the GPU (same single-queue submission-order
-        // argument as this file's header comment / runHeadless()); safe
-        // to run any DeletionQueue retirements tagged at or before that
-        // frame now.
-        if (frameSync->frameNumber() >= rx::rhi::FrameSync::framesInFlight()) {
-            scene->deletionQueue.onFrameFenceSignaled(frameSync->frameNumber() - rx::rhi::FrameSync::framesInFlight());
-        }
-
-        auto acquire = device->acquireNextImage(frameSync->currentImageAvailableSemaphore());
-        if (acquire.status == rx::rhi::SwapchainStatus::Suspended) {
-            // Zero-extent/minimize guard [Phase 4 Task 17, FG7]: see
-            // samples/01_triangle/main.cpp's runPresent() for the full
-            // rationale (same pattern, every --present sample).
-            std::this_thread::sleep_for(std::chrono::milliseconds(16));
-            if (!device->recreateSwapchain(surface)) {
-                RX_LOG_ERROR("Device::recreateSwapchain failed while suspended (zero-extent retry)");
-                ok = false;
-                break;
+        const auto result = loop->runFrame([&](const rx::frame_loop::FrameContext& ctx) {
+            // [Phase 4 exit-review-shaped ordering] This slot's fence was
+            // already waited on before this callback runs (PresentLoop::
+            // runFrame()'s own contract) -- frame (ctx.frameNumber -
+            // framesInFlight()), and transitively everything before it, has
+            // completed on the GPU; safe to run any DeletionQueue
+            // retirements tagged at or before that frame now.
+            if (ctx.frameNumber >= rx::rhi::FrameSync::framesInFlight()) {
+                scene->deletionQueue.onFrameFenceSignaled(ctx.frameNumber - rx::rhi::FrameSync::framesInFlight());
             }
-            if (device->isSurfaceLost()) {
-                // [Phase 4 Task 17 follow-up, Issue #73] The underlying
-                // native window is gone (no advance-warning SDL event
-                // exists for a third-party destroy -- see
-                // samples/09_scene/main.cpp's own recreateSwapchainAndDependents()
-                // comment for the full investigation). A graceful stop,
-                // not a failure: mark the Window so its own teardown skips
-                // the doomed SDL_DestroyWindow() call (Window::
-                // abandonNativeHandle()'s own comment, rx_platform), then
-                // quit the loop before touching the surface again.
-                window->abandonNativeHandle();
-                quit = true;
-                continue;
-            }
-            if (!device->isSuspended()) {
-                destroySwapchainViews();
-                if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
-                    !createSwapchainViews()) {
-                    RX_LOG_ERROR("swapchain view rebuild failed after resuming from suspended state");
+
+            auto now = std::chrono::steady_clock::now();
+            float elapsedSeconds = std::chrono::duration<float>(now - startTime).count();
+            if (elapsedSeconds - lastStreamSeconds >= kPresentStreamIntervalSeconds) {
+                lastStreamSeconds = elapsedSeconds;
+                // A false return here has no clean way to fail this
+                // callback (FrameBodyFn returns void) -- matches this
+                // sample's own pre-promotion severity assessment: a failed
+                // stream-in is logged by evictOldestAndStreamInNext()
+                // itself and this frame simply renders the scene's
+                // current (pre-eviction) content instead, exactly as
+                // dropping through to `recordGridDraws()` unconditionally
+                // already did when this returned false previously (the
+                // pre-promotion code's `ok = false; break;` on failure is
+                // preserved via the `streamFailed` flag below instead).
+                if (!evictOldestAndStreamInNext(device->physicalDevice(), vkDevice, *allocator, *uploader, *scene,
+                                                 expectedColors, ctx.frameNumber)) {
                     ok = false;
-                    break;
                 }
             }
-            continue;
+
+            rx::rhi::transitionImage(ctx.cmd, ctx.image, VK_IMAGE_LAYOUT_UNDEFINED,
+                                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+            VkRenderingAttachmentInfo colorAttachment{};
+            colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            colorAttachment.imageView = ctx.view;
+            colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            colorAttachment.clearValue.color = VkClearColorValue{{0.05F, 0.05F, 0.08F, 1.0F}};
+
+            VkRenderingInfo renderingInfo{};
+            renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+            renderingInfo.renderArea = VkRect2D{{0, 0}, ctx.extent};
+            renderingInfo.layerCount = 1;
+            renderingInfo.colorAttachmentCount = 1;
+            renderingInfo.pColorAttachments = &colorAttachment;
+
+            vkCmdBeginRendering(ctx.cmd, &renderingInfo);
+
+            VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.extent.width),
+                                 static_cast<float>(ctx.extent.height), 0.0F, 1.0F};
+            vkCmdSetViewport(ctx.cmd, 0, 1, &viewport);
+            VkRect2D scissor{{0, 0}, ctx.extent};
+            vkCmdSetScissor(ctx.cmd, 0, 1, &scissor);
+
+            float aspect = static_cast<float>(ctx.extent.width) / static_cast<float>(ctx.extent.height);
+            glm::mat4 viewProj = makeProjection(aspect) * makeViewMatrix();
+            recordGridDraws(ctx.cmd, *scene, viewProj);
+
+            vkCmdEndRendering(ctx.cmd);
+
+            rx::rhi::transitionImage(ctx.cmd, ctx.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                      VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        });
+        if (!ok) {
+            break;
         }
-        if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
-            if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
-                RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
-                ok = false;
-                break;
-            }
-            destroySwapchainViews();
-            if (!device->recreateSwapchain(surface)) {
-                RX_LOG_ERROR("swapchain recreation failed after acquireNextImage NeedsRecreate");
-                ok = false;
-                break;
-            }
-            if (device->isSurfaceLost()) {
-                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
-                // branch's own identical comment above.
-                window->abandonNativeHandle();
-                quit = true;
-                continue;
-            }
-            if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
-                !createSwapchainViews()) {
-                RX_LOG_ERROR("swapchain recreation failed after acquireNextImage NeedsRecreate");
-                ok = false;
-                break;
-            }
-            continue;
-        }
-        if (acquire.status == rx::rhi::SwapchainStatus::DeviceLost) {
-            RX_LOG_ERROR("device lost during acquireNextImage; exiting present loop");
+        if (result == rx::frame_loop::Result::Failed) {
             ok = false;
             break;
         }
-
-        if (vkResetFences(vkDevice, 1, &fence) != VK_SUCCESS) {
-            RX_LOG_ERROR("vkResetFences failed in present loop");
-            ok = false;
-            break;
+        if (result == rx::frame_loop::Result::SurfaceLost) {
+            running = false;
         }
-
-        auto now = std::chrono::steady_clock::now();
-        float elapsedSeconds = std::chrono::duration<float>(now - startTime).count();
-        if (elapsedSeconds - lastStreamSeconds >= kPresentStreamIntervalSeconds) {
-            lastStreamSeconds = elapsedSeconds;
-            if (!evictOldestAndStreamInNext(device->physicalDevice(), vkDevice, *allocator, *uploader, *scene,
-                                             expectedColors, frameSync->frameNumber())) {
-                ok = false;
-                break;
-            }
-        }
-
-        VkCommandPool pool = frameSync->currentCommandPool();
-        if (vkResetCommandPool(vkDevice, pool, 0) != VK_SUCCESS) {
-            RX_LOG_ERROR("vkResetCommandPool failed in present loop");
-            ok = false;
-            break;
-        }
-        VkCommandBuffer cmd = frameSync->currentCommandBuffer();
-
-        VkCommandBufferBeginInfo beginInfo{};
-        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS) {
-            RX_LOG_ERROR("vkBeginCommandBuffer failed in present loop");
-            ok = false;
-            break;
-        }
-
-        VkImage swapchainImage = device->swapchainImages()[acquire.imageIndex];
-        rx::rhi::transitionImage(cmd, swapchainImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-
-        VkRenderingAttachmentInfo colorAttachment{};
-        colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        colorAttachment.imageView = swapchainViews[acquire.imageIndex];
-        colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        colorAttachment.clearValue.color = VkClearColorValue{{0.05F, 0.05F, 0.08F, 1.0F}};
-
-        const VkExtent2D extent = device->swapchainExtent();
-        VkRenderingInfo renderingInfo{};
-        renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        renderingInfo.renderArea = VkRect2D{{0, 0}, extent};
-        renderingInfo.layerCount = 1;
-        renderingInfo.colorAttachmentCount = 1;
-        renderingInfo.pColorAttachments = &colorAttachment;
-
-        vkCmdBeginRendering(cmd, &renderingInfo);
-
-        VkViewport viewport{0.0F, 0.0F, static_cast<float>(extent.width), static_cast<float>(extent.height), 0.0F, 1.0F};
-        vkCmdSetViewport(cmd, 0, 1, &viewport);
-        VkRect2D scissor{{0, 0}, extent};
-        vkCmdSetScissor(cmd, 0, 1, &scissor);
-
-        float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
-        glm::mat4 viewProj = makeProjection(aspect) * makeViewMatrix();
-        recordGridDraws(cmd, *scene, viewProj);
-
-        vkCmdEndRendering(cmd);
-
-        rx::rhi::transitionImage(cmd, swapchainImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                  VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-
-        if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
-            RX_LOG_ERROR("vkEndCommandBuffer failed in present loop");
-            ok = false;
-            break;
-        }
-
-        VkSemaphore waitSem = frameSync->currentImageAvailableSemaphore();
-        VkSemaphore signalSem = frameSync->renderFinishedSemaphore(acquire.imageIndex);
-        VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-
-        VkSubmitInfo submitInfo{};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.waitSemaphoreCount = 1;
-        submitInfo.pWaitSemaphores = &waitSem;
-        submitInfo.pWaitDstStageMask = &waitStage;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &cmd;
-        submitInfo.signalSemaphoreCount = 1;
-        submitInfo.pSignalSemaphores = &signalSem;
-
-        if (vkQueueSubmit(device->graphicsQueue(), 1, &submitInfo, fence) != VK_SUCCESS) {
-            RX_LOG_ERROR("vkQueueSubmit failed in present loop");
-            ok = false;
-            break;
-        }
-
-        auto presentStatus = device->present(acquire.imageIndex, signalSem);
-        if (presentStatus == rx::rhi::SwapchainStatus::NeedsRecreate) {
-            if (vkDeviceWaitIdle(vkDevice) != VK_SUCCESS) {
-                RX_LOG_ERROR("vkDeviceWaitIdle failed before swapchain recreation");
-                ok = false;
-                break;
-            }
-            destroySwapchainViews();
-            if (!device->recreateSwapchain(surface)) {
-                RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
-                ok = false;
-                break;
-            }
-            if (device->isSurfaceLost()) {
-                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
-                // branch's own identical comment above.
-                window->abandonNativeHandle();
-                quit = true;
-            } else if (!frameSync->onSwapchainRecreated(static_cast<uint32_t>(device->swapchainImages().size())) ||
-                       !createSwapchainViews()) {
-                RX_LOG_ERROR("swapchain recreation failed after present NeedsRecreate");
-                ok = false;
-                break;
-            }
-        } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
-            RX_LOG_ERROR("device lost during present; exiting present loop");
-            ok = false;
-            break;
-        }
-
-        // RX_FRAME_MARK once per rendered frame [Phase 4 Stage 0 Task 3,
-        // spec D3] -- present-mode path; see the headless loop above for
-        // this sample's other frame boundary.
-        RX_FRAME_MARK;
-        // [Phase 4 closure-sweep item 3] Same `&*allocator` wiring as the
-        // headless loop above -- see that call site's own comment.
-        frameSync->advanceFrame(&*allocator);
+        // Ok/Skipped: keep looping.
     }
 
-    vkDeviceWaitIdle(vkDevice);
-    destroySwapchainViews();
+    const VkResult waitIdleResult = vkDeviceWaitIdle(vkDevice);
+    if (rx::frame_loop::shouldSkipTeardownAfterDeviceLoss(waitIdleResult, loop->isSurfaceLost())) {
+        const bool hadValidationErrors = args.validate && context->hasValidationErrors();
+        if (hadValidationErrors) {
+            RX_LOG_ERROR("Vulkan validation layer reported errors during the present loop");
+        }
+        RX_LOG_INFO("VkDevice reports lost immediately after the present window's native handle was already "
+                     "known gone -- skipping further Vulkan teardown and letting process exit reclaim GPU "
+                     "resources directly [Issue #74]");
+        ::spdlog::default_logger()->flush();
+        std::_Exit((hadValidationErrors || !ok) ? 1 : 0);
+    }
+
+    loop.reset();
     destroyScene(vkDevice, *scene);  // drains the DeletionQueue (flushAll) before tearing down.
 
-    if (enableValidation && context->hasValidationErrors()) {
+    if (args.validate && context->hasValidationErrors()) {
         RX_LOG_ERROR("Vulkan validation layer reported errors during the present loop");
         return 1;
     }
@@ -2023,7 +1860,11 @@ int main(int argc, char** argv) {
     }
 
     if (presentMode) {
-        return runPresent(enableValidation, vsyncMode, fullscreen);
+        Args args;
+        args.validate = enableValidation;
+        args.vsyncMode = vsyncMode;
+        args.fullscreen = fullscreen;
+        return runPresent(args);
     }
     return runHeadless(enableValidation);
 }

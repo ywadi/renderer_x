@@ -4,7 +4,10 @@
 # compiles the .slang sources to SPIR-V. Same consumption pattern as
 # shader_spirv_test in that same file.
 add_executable(sample_01_triangle main.cpp)
-target_link_libraries(sample_01_triangle PRIVATE rx_rhi_vk rx_platform)
+# rx_frame_loop [Phase 5 Task 5, ticket #41]: the shared present-loop
+# helper -- runPresent() consumes rx::frame_loop::PresentLoop instead of
+# hand-rolling its own acquire/status/recreate/present orchestration.
+target_link_libraries(sample_01_triangle PRIVATE rx_rhi_vk rx_platform rx_frame_loop)
 target_compile_definitions(sample_01_triangle PRIVATE
   RX_TRIANGLE_VERT_SPV="${RX_TRIANGLE_VERT_SPV}"
   RX_TRIANGLE_FRAG_SPV="${RX_TRIANGLE_FRAG_SPV}"

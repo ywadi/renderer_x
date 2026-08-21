@@ -3,8 +3,9 @@
 # function-name visibility every other sample's own CMakeLists.txt relies on.
 
 add_executable(sample_08_gltf_viewer main.cpp)
+# rx_frame_loop [Phase 5 Task 5, ticket #41]: shared present-loop helper.
 target_link_libraries(sample_08_gltf_viewer PRIVATE
-    rx_graph rx_rhi_vk rx_platform rx_material rx_asset rx_scene rx_task rx_shader sample_common
+    rx_graph rx_rhi_vk rx_platform rx_material rx_asset rx_scene rx_task rx_shader rx_frame_loop sample_common
 )
 
 # RX_REPO_ROOT_DIR: the same "bake an absolute CMAKE_SOURCE_DIR-relative

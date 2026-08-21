@@ -89,7 +89,9 @@
 #include <rx_graph/scene_color.h>
 #include <rx_material/draw_data.h>
 #include <rx_material/material_system.h>
+#include <rx_material/param_arena_factory.h>
 #include <rx_platform/window.h>
+#include <rx_frame_loop/present_loop.h>
 #include <rx_rhi_vk/bindless.h>
 #include <rx_rhi_vk/buffer.h>
 #include <rx_rhi_vk/command.h>
@@ -98,6 +100,7 @@
 #include <rx_rhi_vk/descriptor_arena.h>
 #include <rx_rhi_vk/device.h>
 #include <rx_rhi_vk/frame_sync.h>
+#include <rx_rhi_vk/per_frame_storage_buffer.h>
 #include <rx_rhi_vk/pipeline_layout.h>
 #include <rx_rhi_vk/upload.h>
 #include <rx_scene/camera.h>
@@ -748,65 +751,28 @@ struct App {
     VkImageView lastHdrView = VK_NULL_HANDLE;
     rx::rhi::BindlessHandle hdrHandle;
 
-    // Set-1 (material params) descriptor infrastructure -- ONE
-    // VkDescriptorSetLayout this sample builds BY HAND, structurally
-    // IDENTICAL (one VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER at binding 0,
-    // VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT) to what
-    // MaterialSystem::reflectMaterialLayout() (material_system.cpp) builds
-    // internally for EVERY material's own set 1 -- verified directly against
-    // that function's own source (kMaterialParamBlockSet=1,
-    // kMaterialParamBlockBinding=0, kMaterialStageFlags=VERTEX|FRAGMENT).
-    // Two SEPARATELY created VkDescriptorSetLayout objects with identical
-    // content are "identically defined" per the Vulkan spec's own pipeline-
-    // layout-COMPATIBILITY rule (14.2.2) -- a VkDescriptorSet allocated from
-    // THIS layout is valid to bind at set 1 against a VkPipelineLayout
-    // MaterialSystem itself built, with no cross-library accessor needed for
-    // MaterialSystem's own (private) layout object.
-    //
-    // [In-round closure, same-class defect as samples/09_scene's own P0 fix
-    // -- see that sample's identical App::materialParamArena comment for the
-    // full account] The SET LAYOUT is scene-independent (built once, in
-    // makeApp()) but the POOL is NOT: this sample's own `--scene <path>`
-    // accepts ANY glTF asset, so how many set-1 VkDescriptorSets a run ever
-    // needs is scene-dependent and unknowable until `importGltfAsync()`'s
-    // completion callback reports the real material count. A fixed pool
-    // built before that (the pre-fix `kMaxMaterialParamSets = 64` constant,
-    // picked only because "every glTF asset this sample ships/documents has
-    // far fewer materials than that") is sized for the wrong scene the
-    // moment a caller passes a bigger one -- exactly the landmine that
-    // crashed samples/09_scene against Sponza's 25 materials (8-set pool)
-    // one asset away from tripping here too. `rx::rhi::DescriptorArena` is
-    // this engine's own existing, already-tested "size it, and refuse
-    // over-budget allocations before ever calling the driver" abstraction
-    // (src/rx_rhi_vk/tests/descriptor_arena_test.cpp) -- reused here at
-    // framesInFlight=1 (this pool is allocated ONCE per run and never
-    // reset; set-1 material params are static for a material's lifetime,
-    // unlike rx_material's own per-instance, per-frame ParamArena) instead
-    // of a second, hand-rolled, unaccounted VkDescriptorPool. Built by
-    // createMaterialParamArena() below, from the REAL material count
-    // `result.materials.size()` reports, once that count is known -- never
-    // before the async import's own completion callback has it.
-    VkDescriptorSetLayout materialParamSetLayout = VK_NULL_HANDLE;
-    std::optional<rx::rhi::DescriptorArena> materialParamArena;
+    // Set-1 (material params) descriptor infrastructure [Phase 5 Task 5,
+    // ticket #41 row 1 -- promoted into
+    // rx::material::createDemandSizedMaterialParamArena(); see that
+    // function's own header comment for the full rationale this struct's
+    // former, hand-rolled comment used to carry]. Built by
+    // createDemandSizedMaterialParamArena() below, from the REAL material
+    // count `result.materials.size()` reports, once that count is known --
+    // never before the async import's own completion callback has it.
+    std::optional<rx::material::DemandSizedMaterialParamArena> materialParamArena;
 
     std::vector<MaterialGpuBinding> materialBindings;
     std::unordered_map<uint32_t, size_t> materialHandleToBinding;  // rx::asset::MaterialHandle::index() -> materialBindings[].
     std::vector<DrawItem> draws;
-    // [Phase 4 exit fix wave, I1] TWO physical buffers, one per
-    // `rx::rhi::FrameSync::kFramesInFlight` slot -- NOT one shared buffer.
-    // A single buffer rewritten every frame races frame N-1's GPU reads of
-    // it: the present loop's own `vkWaitForFences(currentFence)` (called
-    // BEFORE `updateDrawDataPerPassFields()` already, in this sample) only
-    // proves frame N-2 (the slot's own last user) is done -- frame N-1
-    // always used the OTHER slot, so per-slot buffers are what makes that
-    // proof sufficient. Mirrors `rx::material::MaterialSystem`'s own
-    // `ParamArena` FIF discipline (the named precedent:
-    // `material_system.h`'s `beginFrame()` documents the identical "only
-    // after the caller's own fence wait for this slot" contract).
-    // `currentFrameSlot`-th buffer is written by
-    // `updateDrawDataPerPassFields()`, called only after that fence wait.
-    std::array<std::optional<rx::rhi::Buffer>, rx::rhi::FrameSync::kFramesInFlight> drawDataBuffers;
-    std::array<rx::rhi::BindlessHandle, rx::rhi::FrameSync::kFramesInFlight> drawDataBufferHandles;
+    // [Phase 4 exit fix wave, I1; Phase 5 Task 5 ticket #41 row 2 -- promoted
+    // into rx::rhi::PerFrameStorageBuffer] One physical buffer PER
+    // `rx::rhi::FrameSync::kFramesInFlight` slot -- see that class's own
+    // header comment for the full per-FIF discipline rationale this
+    // struct's former, hand-rolled fields used to carry directly.
+    // `currentFrameSlot`-th buffer is written (via `drawDataBuffer->write()`)
+    // by `updateDrawDataPerPassFields()`, called only after that slot's own
+    // fence wait.
+    std::optional<rx::rhi::PerFrameStorageBuffer> drawDataBuffer;
     // [Phase 4 exit fix wave, I1] Which FIF slot `recordSceneDraws()` should
     // bind this frame -- set once per frame, on the main thread, alongside
     // `updateDrawDataPerPassFields()`'s own call (both happen inside
@@ -814,8 +780,9 @@ struct App {
     // forward pass is a plain setExecute() whole-pass callback, not
     // chunked).
     uint32_t currentFrameSlot = 0;
-    // CPU-side mirror of every row currently uploaded to `drawDataBuffers[currentFrameSlot]`
-    // -- `model`/`normalMatrix`/`materialIndex` are written once (buildDrawList())
+    // CPU-side mirror of every row currently uploaded to
+    // `drawDataBuffer`'s `currentFrameSlot`-th physical buffer --
+    // `model`/`normalMatrix`/`materialIndex` are written once (buildDrawList())
     // and never change again (a static scene); `viewProj`/`lightDirWorld`/
     // `lightColor`/`ambientColor`/`cameraPosWorld` are per-PASS (D26.1's own
     // "repeated per row" design, draw_data.h) and are overwritten here, every
@@ -1009,55 +976,25 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
         return nullptr;
     }
 
-    // Material set-1 param descriptor SET LAYOUT -- see App::
-    // materialParamSetLayout's own comment. Scene-independent (every scene
-    // uses the same one-UBO-binding shape), so this is still built here,
-    // unconditionally. The POOL itself is NOT built here anymore -- see
-    // App::materialParamArena's own comment for why: it needs the real
-    // per-scene material count, which isn't known until the import's own
-    // completion callback reports it. createMaterialParamArena() below
-    // builds it once that count is known.
-    VkDescriptorSetLayoutBinding uboBinding{};
-    uboBinding.binding = 0;
-    uboBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    uboBinding.descriptorCount = 1;
-    uboBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-    VkDescriptorSetLayoutCreateInfo setLayoutInfo{};
-    setLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    setLayoutInfo.bindingCount = 1;
-    setLayoutInfo.pBindings = &uboBinding;
-    if (vkCreateDescriptorSetLayout(app->device->device(), &setLayoutInfo, nullptr, &app->materialParamSetLayout) !=
-        VK_SUCCESS) {
-        RX_LOG_ERROR("sample_08_gltf_viewer: vkCreateDescriptorSetLayout (material params) failed");
-        return nullptr;
-    }
-
     return app;
 }
 
-// Builds App::materialParamArena, sized EXACTLY from `materialCount` -- the
-// real number of set-1 VkDescriptorSets this run will ever allocate
-// (result.materials.size() from whichever scene --scene resolved to), never
-// a fixed magic number picked for one asset and silently reused for every
-// other one [the exact bug this replaces -- see App::materialParamArena's
-// own comment; identical fix already applied to samples/09_scene's own
-// equivalent pool]. Must be called exactly once, after importGltfAsync()'s
-// completion callback has the scene's real material count, and before the
-// first setupMaterials() call. `materialCount == 0` is clamped to 1 --
-// rx::rhi::DescriptorArena::create() rejects a zero capacity outright, and
-// an empty-material scene still needs a valid (if never-used) arena for
-// destroyApp()'s own unconditional teardown path.
+// [Phase 5 Task 5, ticket #41 row 1] Builds App::materialParamArena (set
+// LAYOUT + demand-sized DescriptorArena together) via the promoted
+// rx::material::createDemandSizedMaterialParamArena() -- see that
+// function's own header comment for the full "why sized exactly from the
+// real material count, not a fixed magic number" rationale this call site
+// used to carry directly. Must be called exactly once, after
+// importGltfAsync()'s completion callback has the scene's real material
+// count, and before the first setupMaterials() call.
 bool createMaterialParamArena(App& app, uint32_t materialCount) {
-    const uint32_t sets = std::max<uint32_t>(materialCount, 1);
-    const rx::rhi::DescriptorArena::Capacities capacities{/*maxSets=*/sets, /*uniformBuffers=*/sets};
-    auto arena = rx::rhi::DescriptorArena::create(app.device->device(), /*framesInFlight=*/1, capacities);
+    auto arena = rx::material::createDemandSizedMaterialParamArena(app.device->device(), materialCount);
     if (!arena.has_value()) {
-        RX_LOG_ERROR("sample_08_gltf_viewer: DescriptorArena::create (material params) failed for {} material(s)",
+        RX_LOG_ERROR("sample_08_gltf_viewer: createDemandSizedMaterialParamArena failed for {} material(s)",
                      materialCount);
         return false;
     }
     app.materialParamArena = std::move(*arena);
-    RX_LOG_INFO("sample_08_gltf_viewer: material-params descriptor arena sized for {} material(s)", sets);
     return true;
 }
 
@@ -1080,23 +1017,25 @@ void destroyApp(App& app) {
     for (MaterialGpuBinding& binding : app.materialBindings) {
         binding.paramBuffer.reset();  // paramSet itself is freed implicitly by the arena's own pool teardown below.
     }
-    // rx::rhi::DescriptorArena's own destructor (via std::optional::reset())
-    // destroys its underlying VkDescriptorPool(s) -- exactly what the
-    // explicit vkDestroyDescriptorPool() call this replaces did. A run that
-    // never called createMaterialParamArena() (e.g. an early setupApp()
-    // failure before any import ever completed) leaves this optional empty
-    // -- reset() on an empty optional is a documented no-op.
+    // [Phase 5 Task 5 row 1] rx::rhi::DescriptorArena's own destructor (via
+    // the bundle's own std::optional::reset()) destroys its underlying
+    // VkDescriptorPool(s); the set layout is destroyed explicitly here (see
+    // DemandSizedMaterialParamArena's own TEARDOWN CONTRACT comment,
+    // param_arena_factory.h) -- a run that never called
+    // createMaterialParamArena() (e.g. an early setupApp() failure before
+    // any import ever completed) leaves this optional empty -- both are
+    // documented no-ops in that case.
+    if (app.materialParamArena.has_value()) {
+        vkDestroyDescriptorSetLayout(app.device->device(), app.materialParamArena->setLayout, nullptr);
+    }
     app.materialParamArena.reset();
-    if (app.materialParamSetLayout != VK_NULL_HANDLE) {
-        vkDestroyDescriptorSetLayout(app.device->device(), app.materialParamSetLayout, nullptr);
-        app.materialParamSetLayout = VK_NULL_HANDLE;
+    // [Phase 5 Task 5 row 2] PerFrameStorageBuffer::release() must run
+    // BEFORE its own destructor (reset() below) -- see that class's own
+    // TEARDOWN CONTRACT comment.
+    if (app.drawDataBuffer.has_value() && app.bindless.has_value()) {
+        app.drawDataBuffer->release(*app.bindless);
     }
-    for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
-        if (app.drawDataBufferHandles[slot].isValid() && app.bindless.has_value()) {
-            app.bindless->release(app.drawDataBufferHandles[slot]);
-        }
-        app.drawDataBuffers[slot].reset();
-    }
+    app.drawDataBuffer.reset();
     destroyCompiledPass(app.device->device(), app.tonemapPass);
     if (app.defaultSamplerHandle.isValid() && app.bindless.has_value()) {
         app.bindless->release(app.defaultSamplerHandle);
@@ -1289,7 +1228,8 @@ bool setupMaterials(App& app, const rx::asset::Registry& registry,
         // was skipped/wrong for this scene, a caller bug this refusal
         // surfaces immediately (clean logged failure) instead of crashing
         // past it on a real, limit-enforcing driver.
-        VkDescriptorSet paramSet = app.materialParamArena->allocate(app.materialParamSetLayout, /*uniformBufferDescriptorCount=*/1);
+        VkDescriptorSet paramSet =
+            app.materialParamArena->arena.allocate(app.materialParamArena->setLayout, /*uniformBufferDescriptorCount=*/1);
         if (paramSet == VK_NULL_HANDLE) {
             RX_LOG_ERROR("sample_08_gltf_viewer: material-params descriptor arena allocation failed for material "
                          "'{}' (pool exhausted or driver rejection -- see DescriptorArena's own preceding log line)",
@@ -1396,33 +1336,22 @@ bool buildDrawList(App& app, const rx::asset::Registry& registry, const rx::asse
         return false;
     }
 
-    // [Phase 4 exit fix wave, I1] One physical buffer PER frame-in-flight
-    // slot -- see App::drawDataBuffers' own comment. Both slots are primed
-    // with the SAME initial content here (static per-row fields; per-pass
-    // fields still at DrawDataGpu's own defaults, exactly like the
-    // pre-fix single-buffer path -- updateDrawDataPerPassFields() below
-    // fully overwrites both before either is ever read by a real draw).
+    // [Phase 4 exit fix wave, I1; Phase 5 Task 5 row 2] One physical buffer
+    // PER frame-in-flight slot, via the promoted
+    // rx::rhi::PerFrameStorageBuffer -- both slots are primed with the SAME
+    // initial content (static per-row fields; per-pass fields still at
+    // DrawDataGpu's own defaults, exactly like the pre-promotion path --
+    // updateDrawDataPerPassFields() below fully overwrites both before
+    // either is ever read by a real draw).
     const VkDeviceSize bytes = static_cast<VkDeviceSize>(app.drawDataRows.size()) * sizeof(rx::material::DrawDataGpu);
-    for (uint32_t slot = 0; slot < rx::rhi::FrameSync::kFramesInFlight; ++slot) {
-        auto buffer = app.allocator->createHostVisibleBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                                                rx::rhi::MemoryCategory::Internal);
-        if (!buffer.has_value()) {
-            RX_LOG_ERROR("sample_08_gltf_viewer: createHostVisibleBuffer (draw data, {} rows, slot {}) failed",
-                         app.drawDataRows.size(), slot);
-            return false;
-        }
-        std::memcpy(buffer->mappedData(), app.drawDataRows.data(), static_cast<size_t>(bytes));
-        buffer->flush();
-
-        rx::rhi::BindlessHandle handle = app.bindless->registerStorageBuffer(buffer->handle(), bytes);
-        if (!handle.isValid()) {
-            RX_LOG_ERROR("sample_08_gltf_viewer: registerStorageBuffer (draw data, slot {}) failed", slot);
-            return false;
-        }
-
-        app.drawDataBuffers[slot] = std::move(buffer);
-        app.drawDataBufferHandles[slot] = handle;
+    auto drawDataBuffer =
+        rx::rhi::PerFrameStorageBuffer::create(*app.allocator, *app.bindless, bytes, app.drawDataRows.data());
+    if (!drawDataBuffer.has_value()) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: PerFrameStorageBuffer::create (draw data, {} rows) failed",
+                     app.drawDataRows.size());
+        return false;
     }
+    app.drawDataBuffer = std::move(*drawDataBuffer);
     return true;
 }
 
@@ -1510,10 +1439,11 @@ glm::mat4 computeViewProj(const OrbitCamera& camera, float aspect) {
 // called only after the caller has confirmed, via its own fence wait, that
 // frame `frameSlot`'s prior GPU work (the last frame that used this SAME
 // physical slot) has completed. Both this sample's call sites already
-// call this after `vkWaitForFences(frameSync->currentFence())` (the
-// present loop) or with no concurrent GPU work at all (the fully
-// synchronous headless capture path) -- see App::drawDataBuffers' own
-// comment for why per-slot addressing, not merely fence-wait ordering
+// call this after that fence wait (rx::frame_loop::PresentLoop::runFrame()'s
+// own contract, for the present loop) or with no concurrent GPU work at all
+// (the fully synchronous headless capture path) -- see
+// App::drawDataBuffer's own comment for why per-slot addressing, not merely
+// fence-wait ordering
 // alone, is what closes the I1 finding (a single shared buffer written
 // after the fence wait still races frame N-1's GPU reads of the OTHER
 // slot's turn).
@@ -1546,8 +1476,7 @@ void updateDrawDataPerPassFields(App& app, const glm::mat4& viewProj, const glm:
         row.cameraPosWorld = glm::vec4(cameraPosWorld, 0.0F);
     }
     const VkDeviceSize bytes = static_cast<VkDeviceSize>(app.drawDataRows.size()) * sizeof(rx::material::DrawDataGpu);
-    std::memcpy(app.drawDataBuffers[frameSlot]->mappedData(), app.drawDataRows.data(), static_cast<size_t>(bytes));
-    app.drawDataBuffers[frameSlot]->flush();
+    app.drawDataBuffer->write(frameSlot, app.drawDataRows.data(), bytes);
 }
 
 // --- Forward pass recording [D26.1] -------------------------------------
@@ -1598,7 +1527,7 @@ void recordSceneDraws(VkCommandBuffer cmd, App& app) {
             rx::material::MaterialGlobalsPush push;
             push.defaultSamplerIndex = app.defaultSamplerHandle.index();
             // [Phase 4 exit fix wave, I1] `app.currentFrameSlot`-th buffer.
-            push.drawDataBufferIndex = app.drawDataBufferHandles[app.currentFrameSlot].index();
+            push.drawDataBufferIndex = app.drawDataBuffer->bindlessIndex(app.currentFrameSlot);
             vkCmdPushConstants(cmd, layout, material.pushStages, material.pushOffset, material.pushSize, &push);
 
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, /*firstSet=*/1, 1,
@@ -2206,6 +2135,9 @@ int runHeadless(const Args& args) {
 // orbit camera [gate ruling #8: SDL mouse state read directly via SDL3's
 // own global SDL_GetMouseState() -- see this file's own header comment]
 // --------------------------------------------------------------------
+// [Phase 5 Task 5, ticket #41] The acquire/status-handle/recreate/present
+// MECHANICS this function used to hand-roll now live once, engine-side, in
+// rx::frame_loop::PresentLoop.
 int runPresent(const Args& args) {
     auto app = makeApp("RendererX -- 08_gltf_viewer", kPresentWidth, kPresentHeight, /*visible=*/true, args.validate);
     if (app == nullptr) {
@@ -2247,19 +2179,10 @@ int runPresent(const Args& args) {
 
     const VkDevice vkDevice = app->device->device();
 
-    auto frameSync = rx::rhi::FrameSync::create(vkDevice, app->device->graphicsQueueFamily(),
-                                                 static_cast<uint32_t>(app->device->swapchainImages().size()));
-    if (!frameSync.has_value()) {
-        RX_LOG_ERROR("sample_08_gltf_viewer: FrameSync::create failed");
-        destroyApp(*app);
-        return 1;
-    }
-
     const std::filesystem::path scenePath =
         args.scenePath.empty() ? resolveDefaultScenePath() : std::filesystem::path(args.scenePath);
     if (!std::filesystem::exists(scenePath)) {
         RX_LOG_ERROR("sample_08_gltf_viewer: scene file not found: '{}'", scenePath.string());
-        frameSync.reset();  // see the final teardown's own comment on why this must precede destroyApp().
         destroyApp(*app);
         return 1;
     }
@@ -2267,40 +2190,10 @@ int runPresent(const Args& args) {
     rx::graph::RenderGraph graph;
     declareGraph(graph, *app, app->device->swapchainFormat());
 
-    rx::graph::CompileInfo compileInfo;
-    compileInfo.swapchainWidth = app->device->swapchainExtent().width;
-    compileInfo.swapchainHeight = app->device->swapchainExtent().height;
-    compileInfo.swapchainFormat = app->device->swapchainFormat();
-    compileInfo.backbufferFinalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    graph.compile(compileInfo);
-    app->executor->realize(graph);
-
-    std::vector<VkImageView> swapchainViews;
-    auto rebuildSwapchainViews = [&]() -> bool {
-        for (VkImageView view : swapchainViews) {
-            vkDestroyImageView(vkDevice, view, nullptr);
-        }
-        swapchainViews.clear();
-        for (VkImage image : app->device->swapchainImages()) {
-            VkImageViewCreateInfo viewInfo{};
-            viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-            viewInfo.image = image;
-            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            viewInfo.format = app->device->swapchainFormat();
-            viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            viewInfo.subresourceRange.levelCount = 1;
-            viewInfo.subresourceRange.layerCount = 1;
-            VkImageView view = VK_NULL_HANDLE;
-            if (vkCreateImageView(vkDevice, &viewInfo, nullptr, &view) != VK_SUCCESS) {
-                RX_LOG_ERROR("sample_08_gltf_viewer: vkCreateImageView(swapchain) failed");
-                return false;
-            }
-            swapchainViews.push_back(view);
-        }
-        return true;
-    };
-    if (!rebuildSwapchainViews()) {
-        frameSync.reset();  // see the final teardown's own comment on why this must precede destroyApp().
+    auto loop = rx::frame_loop::PresentLoop::create(rx::frame_loop::PresentLoop::CreateInfo{
+        &*app->device, app->surface, &*app->window, &graph, app->executor.get()});
+    if (!loop.has_value()) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: PresentLoop::create failed");
         destroyApp(*app);
         return 1;
     }
@@ -2372,175 +2265,56 @@ int runPresent(const Args& args) {
         lastMouseX = mouseX;
         lastMouseY = mouseY;
 
-        VkFence fence = frameSync->currentFence();
-        vkWaitForFences(vkDevice, 1, &fence, VK_TRUE, UINT64_MAX);
+        const auto result = loop->runFrame([&](const rx::frame_loop::FrameContext& ctx) {
+            if (app->sceneReady) {
+                const float aspect =
+                    static_cast<float>(ctx.extent.width) / static_cast<float>(std::max<uint32_t>(1U, ctx.extent.height));
+                const glm::mat4 viewProj = computeViewProj(app->camera, aspect);
+                // [Phase 4 exit fix wave, I1] PresentLoop::runFrame() already
+                // waited on this frame-in-flight slot's own fence before
+                // invoking this callback -- now ALSO addressed by that same
+                // slot's own physical buffer (not a shared one), which is
+                // what actually closes the race (see
+                // PerFrameStorageBuffer's own header comment: fence-wait
+                // ordering alone was insufficient with a single shared
+                // buffer, since frame N-1 always used the OTHER slot and the
+                // wait only proves frame N-2 -- THIS slot's own last user --
+                // is done).
+                updateDrawDataPerPassFields(*app, viewProj, app->camera.eye(), ctx.frameInFlightIndex);
+            }
 
-        auto acquire = app->device->acquireNextImage(frameSync->currentImageAvailableSemaphore());
-        if (acquire.status == rx::rhi::SwapchainStatus::Suspended) {
-            // Zero-extent/minimize guard [Phase 4 Task 17, FG7]: see
-            // samples/01_triangle/main.cpp's runPresent() for the full
-            // rationale (same pattern, every --present sample).
-            // app->executor->realize(graph) is safe to call unconditionally
-            // here (this sample never re-runs graph.compile() on resize --
-            // realize() only rebuilds resources sized off the ORIGINAL,
-            // startup-time compile, never the live swapchain extent), so no
-            // extra isSuspended() guard is needed around it beyond the
-            // rebuild-only-once-resumed shape used below.
-            std::this_thread::sleep_for(std::chrono::milliseconds(16));
-            if (!app->device->recreateSwapchain(app->surface)) {
-                RX_LOG_ERROR("sample_08_gltf_viewer: Device::recreateSwapchain failed while suspended (zero-extent "
-                             "retry)");
-                ok = false;
-                break;
-            }
-            if (app->device->isSurfaceLost()) {
-                // [Phase 4 Task 17 follow-up, Issue #73] The underlying
-                // native window is gone (no advance-warning SDL event
-                // exists for a third-party destroy -- see
-                // samples/09_scene/main.cpp's own recreateSwapchainAndDependents()
-                // comment for the full investigation). A graceful stop,
-                // not a failure: mark the Window so its own teardown skips
-                // the doomed SDL_DestroyWindow() call (Window::
-                // abandonNativeHandle()'s own comment, rx_platform), then
-                // quit the loop before touching the surface again.
-                app->window->abandonNativeHandle();
-                running = false;
-                continue;
-            }
-            if (!app->device->isSuspended()) {
-                if (!rebuildSwapchainViews() ||
-                    !frameSync->onSwapchainRecreated(static_cast<uint32_t>(app->device->swapchainImages().size()))) {
-                    RX_LOG_ERROR("sample_08_gltf_viewer: swapchain view rebuild failed after resuming from "
-                                 "suspended state");
-                    ok = false;
-                    break;
-                }
-                app->executor->realize(graph);
-            }
-            continue;
-        }
-        if (acquire.status == rx::rhi::SwapchainStatus::NeedsRecreate) {
-            vkDeviceWaitIdle(vkDevice);
-            if (!app->device->recreateSwapchain(app->surface)) {
-                ok = false;
-                break;
-            }
-            if (app->device->isSurfaceLost()) {
-                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
-                // branch's own identical comment above.
-                app->window->abandonNativeHandle();
-                running = false;
-                continue;
-            }
-            if (!rebuildSwapchainViews() ||
-                !frameSync->onSwapchainRecreated(static_cast<uint32_t>(app->device->swapchainImages().size()))) {
-                ok = false;
-                break;
-            }
-            app->executor->realize(graph);
-            continue;
-        }
-        if (acquire.status == rx::rhi::SwapchainStatus::DeviceLost) {
-            RX_LOG_ERROR("sample_08_gltf_viewer: device lost during acquireNextImage; exiting present loop");
+            app->executor->execute(graph, ctx.cmd, ctx.image, ctx.view, ctx.extent);
+        });
+        if (result == rx::frame_loop::Result::Failed) {
             ok = false;
             break;
         }
-
-        vkResetFences(vkDevice, 1, &fence);
-        VkCommandBuffer cmd = frameSync->currentCommandBuffer();
-        vkResetCommandPool(vkDevice, frameSync->currentCommandPool(), 0);
-
-        VkCommandBufferBeginInfo beginInfo{};
-        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(cmd, &beginInfo);
-
-        if (app->sceneReady) {
-            const VkExtent2D swapExtent = app->device->swapchainExtent();
-            const float aspect =
-                static_cast<float>(swapExtent.width) / static_cast<float>(std::max<uint32_t>(1U, swapExtent.height));
-            const glm::mat4 viewProj = computeViewProj(app->camera, aspect);
-            // [Phase 4 exit fix wave, I1] Already after this loop's own
-            // vkWaitForFences(fence) above -- now ALSO addressed by that
-            // same slot's own physical buffer (not a shared one), which is
-            // what actually closes the race (see App::drawDataBuffers' own
-            // comment: fence-wait ordering alone was insufficient with a
-            // single shared buffer, since frame N-1 always used the OTHER
-            // slot and the wait only proves frame N-2 -- THIS slot's own
-            // last user -- is done).
-            updateDrawDataPerPassFields(*app, viewProj, app->camera.eye(), frameSync->currentFrameIndex());
+        if (result == rx::frame_loop::Result::SurfaceLost) {
+            running = false;
         }
-
-        app->executor->execute(graph, cmd, app->device->swapchainImages()[acquire.imageIndex],
-                               swapchainViews[acquire.imageIndex], app->device->swapchainExtent());
-
-        vkEndCommandBuffer(cmd);
-
-        VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        VkSubmitInfo submitInfo{};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.waitSemaphoreCount = 1;
-        VkSemaphore waitSem = frameSync->currentImageAvailableSemaphore();
-        submitInfo.pWaitSemaphores = &waitSem;
-        submitInfo.pWaitDstStageMask = &waitStage;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &cmd;
-        VkSemaphore signalSem = frameSync->renderFinishedSemaphore(acquire.imageIndex);
-        submitInfo.signalSemaphoreCount = 1;
-        submitInfo.pSignalSemaphores = &signalSem;
-        if (vkQueueSubmit(app->device->graphicsQueue(), 1, &submitInfo, fence) != VK_SUCCESS) {
-            ok = false;
-            break;
-        }
-
-        auto presentStatus = app->device->present(acquire.imageIndex, signalSem);
-        if (presentStatus == rx::rhi::SwapchainStatus::NeedsRecreate) {
-            vkDeviceWaitIdle(vkDevice);
-            if (!app->device->recreateSwapchain(app->surface)) {
-                ok = false;
-                break;
-            }
-            if (app->device->isSurfaceLost()) {
-                // [Phase 4 Task 17 follow-up, Issue #73] See the Suspended
-                // branch's own identical comment above.
-                app->window->abandonNativeHandle();
-                running = false;
-            } else if (!rebuildSwapchainViews() ||
-                       !frameSync->onSwapchainRecreated(static_cast<uint32_t>(app->device->swapchainImages().size()))) {
-                ok = false;
-                break;
-            } else {
-                app->executor->realize(graph);
-            }
-        } else if (presentStatus == rx::rhi::SwapchainStatus::DeviceLost) {
-            RX_LOG_ERROR("sample_08_gltf_viewer: device lost during present; exiting present loop");
-            ok = false;
-            break;
-        }
-
-        frameSync->advanceFrame();
-        RX_FRAME_MARK;
+        // Ok/Skipped: keep looping.
     }
 
-    vkDeviceWaitIdle(vkDevice);
-    for (VkImageView view : swapchainViews) {
-        vkDestroyImageView(vkDevice, view, nullptr);
+    const VkResult waitIdleResult = vkDeviceWaitIdle(vkDevice);
+    if (rx::frame_loop::shouldSkipTeardownAfterDeviceLoss(waitIdleResult, loop->isSurfaceLost())) {
+        const bool hadValidationErrors = args.validate && app->context->hasValidationErrors();
+        if (hadValidationErrors) {
+            RX_LOG_ERROR("sample_08_gltf_viewer: Vulkan validation layer reported errors during the present loop");
+        }
+        RX_LOG_INFO("sample_08_gltf_viewer: VkDevice reports lost immediately after the present window's native "
+                     "handle was already known gone -- skipping further Vulkan teardown and letting process exit "
+                     "reclaim GPU resources directly [Issue #74]");
+        ::spdlog::default_logger()->flush();
+        std::_Exit((hadValidationErrors || !ok) ? 1 : 0);
     }
-    // `frameSync` owns real VkCommandPool/VkFence/VkSemaphore objects --
-    // MUST be torn down before destroyApp() destroys the VkDevice it was
-    // built against (its own destructor calls vkDestroy* against them,
-    // undefined behavior against an already-destroyed device -- the exact
-    // same class of bug this file's own runHeadless()/cmdCtx already hit
-    // and fixed; see that variable's own comment). Reproduced directly
-    // during this task's own development: a real SDL-delivered quit (SIGINT
-    // under Xvfb, which SDL3 translates into a normal SDL_EVENT_QUIT) left
-    // this present loop's own FrameSync objects live across destroyApp()'s
-    // vkDestroyDevice call, producing a full page of VUID-vkDestroyDevice-
-    // device-00378 "child object not destroyed" validation errors
-    // immediately followed by a segfault (core dump) once `frameSync`
-    // itself finally went out of scope and tried to destroy its own
-    // now-dangling handles.
-    frameSync.reset();
+
+    // PresentLoop owns FrameSync/the per-swapchain-image views -- MUST be
+    // torn down before destroyApp() destroys the VkDevice it was built
+    // against (its own destructor calls vkDestroy* against them, undefined
+    // behavior against an already-destroyed device -- the exact same class
+    // of bug this file's own runHeadless()/cmdCtx already hit and fixed;
+    // see that variable's own comment).
+    loop.reset();
     destroyApp(*app);
 
     if (args.validate && app->context->hasValidationErrors()) {

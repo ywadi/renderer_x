@@ -17,7 +17,8 @@
 # below with nothing to set up first.
 
 add_executable(sample_02_hotreload main.cpp)
-target_link_libraries(sample_02_hotreload PRIVATE rx_rhi_vk rx_platform rx_shader)
+# rx_frame_loop [Phase 5 Task 5, ticket #41]: shared present-loop helper.
+target_link_libraries(sample_02_hotreload PRIVATE rx_rhi_vk rx_platform rx_shader rx_frame_loop)
 
 # This sample does real in-process Slang compilation on every run (both
 # modes) -- it is the redistribution proof for the Task 1 runtime-lib

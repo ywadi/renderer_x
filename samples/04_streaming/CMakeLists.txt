@@ -4,7 +4,8 @@
 # makes it safe to call unqualified from here, no local re-glob needed.
 
 add_executable(sample_04_streaming main.cpp)
-target_link_libraries(sample_04_streaming PRIVATE rx_rhi_vk rx_platform rx_shader)
+# rx_frame_loop [Phase 5 Task 5, ticket #41]: shared present-loop helper.
+target_link_libraries(sample_04_streaming PRIVATE rx_rhi_vk rx_platform rx_shader rx_frame_loop)
 
 # This sample does real in-process Slang compilation at startup (both
 # modes -- see main.cpp's kShaderSource/buildScenePipeline()), same as
