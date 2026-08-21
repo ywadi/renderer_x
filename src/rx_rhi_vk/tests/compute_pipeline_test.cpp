@@ -13,11 +13,28 @@
 #include <rx_platform/window.h>
 #include <rx_shader/compiler.h>
 #include <rx_shader/reflection.h>
+#include <filesystem>
 #include <optional>
 #include <utility>
 #include <vector>
 
 namespace {
+
+// [Phase 5 Task 6 bundled fix, ticket #42] The three ComputePipelineCache::create()
+// calls below used to pass a bare relative filename ("rx_compute_pipeline_test*.cache")
+// straight through to ComputePipelineCache::create()'s std::filesystem::path
+// parameter -- ctest's own default working directory is wherever `ctest`
+// itself was invoked from (this repo's own root when run via `ctest
+// --preset ...` from a checkout root, NOT this binary's own build
+// directory), so those three files landed as untracked stray artifacts at
+// the REPO ROOT on every local test run. std::filesystem::temp_directory_path()
+// keeps every pre-existing behavior (content-hash cache creation/reuse
+// across the 3 distinct TEST_CASEs below, each with its own distinct
+// filename so they never collide with each other) while writing nowhere
+// this repository's own working tree can be polluted.
+std::filesystem::path testPipelineCachePath(const char* name) {
+    return std::filesystem::temp_directory_path() / name;
+}
 
 // Same skip-guarded windowed-device fixture pattern as texture_test.cpp/
 // storage_image_test.cpp.
@@ -124,7 +141,8 @@ TEST_CASE("ComputePipelineCache::getOrCreate builds a valid compute VkPipeline f
     auto layoutInfo = rx::shader::reflect(*compileResult);
     REQUIRE(layoutInfo.has_value());
 
-    auto cache = rx::rhi::ComputePipelineCache::create(fixture->device.device(), "rx_compute_pipeline_test.cache");
+    auto cache = rx::rhi::ComputePipelineCache::create(fixture->device.device(),
+                                                         testPipelineCachePath("rx_compute_pipeline_test.cache"));
     REQUIRE(cache.has_value());
 
     auto pso = cache->getOrCreate(compileResult->entryPointCode[0].code, *layoutInfo);
@@ -149,7 +167,8 @@ TEST_CASE("ComputePipelineCache::getOrCreate caches by SPIR-V content -- identic
     auto layoutInfo = rx::shader::reflect(*compileResult);
     REQUIRE(layoutInfo.has_value());
 
-    auto cache = rx::rhi::ComputePipelineCache::create(fixture->device.device(), "rx_compute_pipeline_test2.cache");
+    auto cache = rx::rhi::ComputePipelineCache::create(fixture->device.device(),
+                                                         testPipelineCachePath("rx_compute_pipeline_test2.cache"));
     REQUIRE(cache.has_value());
 
     auto first = cache->getOrCreate(compileResult->entryPointCode[0].code, *layoutInfo);
@@ -179,7 +198,8 @@ TEST_CASE("ComputePipelineCache::getOrCreate substitutes a real BindlessTable la
     auto layoutInfo = rx::shader::reflect(*compileResult);
     REQUIRE(layoutInfo.has_value());
 
-    auto cache = rx::rhi::ComputePipelineCache::create(fixture->device.device(), "rx_compute_pipeline_test3.cache");
+    auto cache = rx::rhi::ComputePipelineCache::create(fixture->device.device(),
+                                                         testPipelineCachePath("rx_compute_pipeline_test3.cache"));
     REQUIRE(cache.has_value());
 
     auto pso =
