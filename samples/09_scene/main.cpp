@@ -73,6 +73,7 @@
 #include <rx_debug_ui/overlay.h>
 #include <rx_graph/executor.h>
 #include <rx_graph/render_graph.h>
+#include <rx_graph/scene_color.h>
 #include <rx_material/draw_data.h>
 #include <rx_material/material_system.h>
 #include <rx_platform/window.h>
@@ -144,7 +145,9 @@ constexpr VkDeviceSize kHeadlessPixelBytes = static_cast<VkDeviceSize>(kHeadless
 constexpr uint32_t kPresentWidth = 1280;
 constexpr uint32_t kPresentHeight = 720;
 
-constexpr VkFormat kHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+// [Task 3 (#39)] the engine-owned HDR scene-color format
+// (rx::graph::kHdrFormat, rx_graph/scene_color.h) replaces this sample's
+// own former copy -- see that header for the format ruling + rationale.
 constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
 constexpr VkFormat kShadowFormat = VK_FORMAT_D32_SFLOAT;
 constexpr uint32_t kShadowMapResolution = 1024;
@@ -542,7 +545,7 @@ struct MaterialGpuBinding {
 // target + one REVERSED-Z depth target [D13/RC3], single-sampled.
 rx::material::PassSignature forwardPassSignature() {
     rx::material::PassSignature sig;
-    sig.colorFormats[0] = kHdrFormat;
+    sig.colorFormats[0] = rx::graph::kHdrFormat;
     sig.colorCount = 1;
     sig.depthFormat = kDepthFormat;
     sig.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -2348,7 +2351,7 @@ void declareGraph(rx::graph::RenderGraph& graph, App& app, VkFormat backbufferFo
         // shader's SampleCmp taps require).
         forward.addTextureInput("shadowmap");
     }
-    forward.addColorOutput("hdr", swapchainRelativeDesc(kHdrFormat))
+    forward.addColorOutput("hdr", swapchainRelativeDesc(rx::graph::kHdrFormat))
         .setDepthStencilOutput("depth", swapchainRelativeReversedDepthDesc(kDepthFormat))
         .setExecuteChunked(
             [&app](rx::graph::PassContext& ctx, uint32_t chunkIndex, uint32_t chunkCount) {

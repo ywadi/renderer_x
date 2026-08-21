@@ -73,6 +73,7 @@
 #include <rx_platform/window.h>
 #include <rx_graph/executor.h>
 #include <rx_graph/render_graph.h>
+#include <rx_graph/scene_color.h>
 #include <rx_rhi_vk/bindless.h>
 #include <rx_rhi_vk/buffer.h>
 #include <rx_rhi_vk/command.h>
@@ -129,7 +130,9 @@ constexpr uint32_t kHeadlessFrameCount = 3;
 // pixel probing.
 constexpr uint32_t kDefaultDraws = 30000;
 
-constexpr VkFormat kHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+// [Task 3 (#39)] the engine-owned HDR scene-color format
+// (rx::graph::kHdrFormat, rx_graph/scene_color.h) replaces this sample's
+// own former copy -- see that header for the format ruling + rationale.
 constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
 
 // Both procedural meshes are generated at unit size (cube half-extent 1,
@@ -666,7 +669,7 @@ bool buildForwardPipelines(VkDevice device, rx::shader::Compiler& compiler, VkDe
     VkPipelineRenderingCreateInfo renderingCreateInfo{};
     renderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     renderingCreateInfo.colorAttachmentCount = 1;
-    renderingCreateInfo.pColorAttachmentFormats = &kHdrFormat;
+    renderingCreateInfo.pColorAttachmentFormats = &rx::graph::kHdrFormat;
     renderingCreateInfo.depthAttachmentFormat = kDepthFormat;
 
     std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
@@ -1134,7 +1137,7 @@ void recordTonemapDraw(rx::graph::PassContext& ctx, Scene& scene) {
 
 void declareGraph(rx::graph::RenderGraph& graph, Scene& scene, VkFormat backbufferFormat) {
     graph.addPass("forward")
-        .addColorOutput("hdr", swapchainRelativeDesc(kHdrFormat))
+        .addColorOutput("hdr", swapchainRelativeDesc(rx::graph::kHdrFormat))
         .setDepthStencilOutput("depth", swapchainRelativeDesc(kDepthFormat))
         .setExecuteChunked([&scene](rx::graph::PassContext& ctx, uint32_t chunkIndex, uint32_t chunkCount) {
             recordForwardChunked(ctx, scene, chunkIndex, chunkCount);

@@ -8,6 +8,10 @@ add_executable(rx_graph_tests
     doctest_main.cpp
     test_compile.cpp
     test_barriers.cpp
+    # [Task 3 (#39)] kHdrFormat/kHdrFormatHighPrecision pinning -- device-free,
+    # joins this binary rather than rx_graph_gpu_tests for the same reason
+    # test_compile.cpp/test_barriers.cpp do (no real device needed).
+    test_scene_color.cpp
 )
 target_link_libraries(rx_graph_tests PRIVATE rx_graph doctest::doctest)
 add_test(NAME rx_graph_tests COMMAND rx_graph_tests)
@@ -41,6 +45,12 @@ add_executable(rx_graph_gpu_tests
     # same reasons test_execute_gpu.cpp already does (real windowed Device,
     # rx_shader in-process compilation).
     test_compute_gpu.cpp
+    # [Task 3 (#39)] HDR scene-color format's own primary gate -- value
+    # survival + honest precision-asymmetry proof + discrimination mutant +
+    # escape-hatch exercise + empirical format-support queries. Joins this
+    # binary for the same real-windowed-Device/rx_shader-in-process reasons
+    # as the two files above.
+    test_scene_color_gpu.cpp
 )
 target_link_libraries(rx_graph_gpu_tests PRIVATE rx_graph rx_rhi_vk rx_platform rx_shader doctest::doctest)
 rx_shader_deploy_runtime_libs(rx_graph_gpu_tests)

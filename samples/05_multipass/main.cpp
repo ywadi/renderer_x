@@ -23,7 +23,8 @@
 //   shadow   (writes "shadowmap": Absolute 1024x1024 D32_SFLOAT, depth-only,
 //             no fragment shader stage at all -- see shadow.vert.slang)
 //   forward  (reads "shadowmap" as a texture input; writes "hdr":
-//             SwapchainRelative R16G16B16A16_SFLOAT, and its own "depth":
+//             SwapchainRelative rx::graph::kHdrFormat [Task 3 (#39),
+//             B10G11R11_UFLOAT_PACK32], and its own "depth":
 //             SwapchainRelative D32_SFLOAT -- "depth" has no reader
 //             anywhere else in the graph, which is fine: it is an
 //             attachment-only resource, and forward itself is kept alive by
@@ -135,6 +136,7 @@
 #include <rx_platform/window.h>
 #include <rx_graph/executor.h>
 #include <rx_graph/render_graph.h>
+#include <rx_graph/scene_color.h>
 #include <rx_rhi_vk/bindless.h>
 #include <rx_rhi_vk/buffer.h>
 #include <rx_rhi_vk/command.h>
@@ -189,7 +191,9 @@ constexpr float kLightOrbitRadPerSec = 0.3F;
 
 constexpr uint32_t kShadowMapSize = 1024;
 constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
-constexpr VkFormat kHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+// [Task 3 (#39)] the engine-owned HDR scene-color format
+// (rx::graph::kHdrFormat, rx_graph/scene_color.h) replaces this sample's
+// own former copy -- see that header for the format ruling + rationale.
 
 // [fix round 1] the single source of truth for ObjectTransform, shared by
 // the shadow and lit passes -- concatenated ahead of each pass's own
@@ -1064,7 +1068,7 @@ bool buildLitPipeline(VkDevice device, rx::shader::Compiler& compiler, VkDescrip
     VkPipelineRenderingCreateInfo renderingCreateInfo{};
     renderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     renderingCreateInfo.colorAttachmentCount = 1;
-    renderingCreateInfo.pColorAttachmentFormats = &kHdrFormat;
+    renderingCreateInfo.pColorAttachmentFormats = &rx::graph::kHdrFormat;
     renderingCreateInfo.depthAttachmentFormat = kDepthFormat;
 
     VkGraphicsPipelineCreateInfo pipelineInfo{};
@@ -1519,7 +1523,7 @@ void declareGraph(rx::graph::RenderGraph& graph, Scene& scene, VkFormat backbuff
 
     graph.addPass("forward")
         .addTextureInput("shadowmap")
-        .addColorOutput("hdr", swapchainRelativeDesc(kHdrFormat))
+        .addColorOutput("hdr", swapchainRelativeDesc(rx::graph::kHdrFormat))
         .setDepthStencilOutput("depth", swapchainRelativeDesc(kDepthFormat))
         .setExecuteChunked([&scene](rx::graph::PassContext& ctx, uint32_t chunkIndex, uint32_t chunkCount) {
             recordLitDrawsChunked(ctx, scene, chunkIndex, chunkCount);

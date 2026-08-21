@@ -74,6 +74,7 @@
 #include <rx_core/profile.h>
 #include <rx_graph/executor.h>
 #include <rx_graph/render_graph.h>
+#include <rx_graph/scene_color.h>
 #include <rx_material/draw_data.h>
 #include <rx_material/material_system.h>
 #include <rx_platform/window.h>
@@ -130,7 +131,9 @@ constexpr VkDeviceSize kHeadlessPixelBytes = static_cast<VkDeviceSize>(kHeadless
 constexpr uint32_t kPresentWidth = 1280;
 constexpr uint32_t kPresentHeight = 720;
 
-constexpr VkFormat kHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+// [Task 3 (#39)] the engine-owned HDR scene-color format
+// (rx::graph::kHdrFormat, rx_graph/scene_color.h) replaces this sample's
+// own former copy -- see that header for the format ruling + rationale.
 constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
 
 // A distinct, unmistakably-not-black "loading" color -- see recordLoadingPass()
@@ -554,8 +557,9 @@ struct MaterialGpuBinding {
 };
 
 // [D7/D27] The forward pass's own attachment shape -- one HDR color target
-// + one depth target, both fixed formats (kHdrFormat/kDepthFormat above),
-// single-sampled. Built as a plain value (not stored per-instance state)
+// + one depth target, both fixed formats (rx::graph::kHdrFormat/
+// kDepthFormat above), single-sampled. Built as a plain value (not stored
+// per-instance state)
 // since every field is a compile-time constant of this sample -- both
 // setupMaterials()'s own D27 pre-resolution call and declareGraph()'s own
 // Pass::addColorOutput()/setDepthStencilOutput() calls must derive the
@@ -564,7 +568,7 @@ struct MaterialGpuBinding {
 // is spelled out.
 rx::material::PassSignature forwardPassSignature() {
     rx::material::PassSignature sig;
-    sig.colorFormats[0] = kHdrFormat;
+    sig.colorFormats[0] = rx::graph::kHdrFormat;
     sig.colorCount = 1;
     sig.depthFormat = kDepthFormat;
     sig.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -1656,7 +1660,7 @@ rx::graph::AttachmentDesc swapchainRelativeReversedDepthDesc(VkFormat format) {
 
 void declareGraph(rx::graph::RenderGraph& graph, App& app, VkFormat backbufferFormat) {
     graph.addPass("forward")
-        .addColorOutput("hdr", swapchainRelativeDesc(kHdrFormat))
+        .addColorOutput("hdr", swapchainRelativeDesc(rx::graph::kHdrFormat))
         .setDepthStencilOutput("depth", swapchainRelativeReversedDepthDesc(kDepthFormat))
         .setExecute([&app](rx::graph::PassContext& ctx) { recordForward(ctx, app); });
 
