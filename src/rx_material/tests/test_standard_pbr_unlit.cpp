@@ -1272,8 +1272,10 @@ TEST_CASE("StandardPBR: occlusion closed-form -- R=0,strength=1 zeroes the IBL t
           "(standard_pbr.slang: `ibl = (iblDiffuse+iblSpecular) * occlusion * envIntensity`), not FG1's retired "
           "flat ambient*occlusion*baseColor -- see MaterialVertex::ambientColor's own header comment. A RATIO "
           "check against a real bound (uniform, so radiometrically simple) environment, rather than a hand-"
-          "derived absolute constant, since the exact IBL value depends on the split-sum E=f0*dfg.x+dfg.y term "
-          "this test does not need to re-derive to prove occlusion's own multiplicative role.") {
+          "derived absolute constant, since the exact IBL value depends on the split-sum E=mix(dfg.x,dfg.y,f0) "
+          "term [T10 fix round, task-10-review.md Finding 1 -- corrected from the retired f0*dfg.x+dfg.y form] "
+          "this test does not need to re-derive to prove occlusion's own multiplicative role: the ratio "
+          "assertion below holds for whatever E the corrected formula produces, by construction.") {
     auto rig = makeStandardPbrRig("standard_pbr_occlusion");
     if (!rig.has_value()) {
         return;
@@ -1286,14 +1288,22 @@ TEST_CASE("StandardPBR: occlusion closed-form -- R=0,strength=1 zeroes the IBL t
     // ibl_environment_test_fixture.h's own header comment. Uniform,
     // deliberately DIM (radiance 0.6, well under the UNORM store's own
     // 1.0 clamp ceiling): at metallic=1.0/white baseColor (this probe's
-    // own material), F0=(1,1,1) and E=F0*dfg.x+dfg.y=1.0*0.5+0.5==1.0
-    // exactly (dfgValue=(0.5,0.5) below), so the fully-unoccluded pixel's
-    // own closed-form value is exactly `radiance * E * occlusion(1.0) ==
-    // radiance` -- 0.6 keeps that comfortably below 1.0 so the occlusion=
-    // 0.5 case's own halved value (0.3) is a REAL, distinguishable ~77/255
-    // rather than both cases alike clamping to 255 (empirically found
-    // during this task's own development at an earlier, brighter radiance
-    // choice -- the ratio check is meaningless once BOTH sides saturate).
+    // own material), F0=(1,1,1) exactly. [T10 fix round, task-10-
+    // review.md Finding 1/2] Under the CORRECTED split-sum formula
+    // (brdf.slang iblSpecularReflectance(), mix(dfg.x,dfg.y,f0)), at f0=1
+    // this reduces to E==dfg.y==0.5 exactly (the mix() endpoint identity
+    // -- see the mirror-metal TEST_CASE in test_standard_pbr_ibl_gpu.cpp
+    // for the same identity used as an actual value probe there), so the
+    // fully-unoccluded pixel's own closed-form value is `radiance * E *
+    // occlusion(1.0) == 0.6*0.5 == 0.3 -> ~77/255`, and the occlusion=0.5
+    // case's own halved value is `~38/255` -- both comfortably clear of 0
+    // and 255 (this test's own ratio assertion does not depend on the
+    // exact numbers, only on neither side saturating; dfgValue=(0.5,0.5)
+    // below satisfies the dfg.x<=dfg.y invariant every real T9 bake
+    // output satisfies, as an equality boundary case -- this test only
+    // needs a real, non-clamped visible value, not a discriminating one,
+    // since its own assertions are RATIOS, invariant to which E-formula
+    // produced them).
     auto env = rx::material_test::makeUniformTestEnvironment(rig->fixture->device, rig->fixture->allocator,
                                                                rig->fixture->bindless, glm::vec4(0.6F, 0.6F, 0.6F, 1.0F),
                                                                glm::vec2(0.5F, 0.5F));

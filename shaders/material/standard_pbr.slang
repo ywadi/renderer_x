@@ -468,8 +468,9 @@ struct StandardPbr : IMaterialShader {
         // lighting and IBL" requirement. Split-sum composition [Karis 2013;
         // Filament `evaluateIBL()`, shaders/src/surface_light_indirect.fs,
         // google/filament v1.75.0, :717-758 -- see brdf.slang's own
-        // `iblSpecularReflectance()` header comment for the full citation]:
-        //   E  = f0*dfg.x + dfg.y                          (specularDFG)
+        // `iblSpecularReflectance()` header comment for the full citation,
+        // corrected in the T10 fix round per task-10-review.md Finding 1]:
+        //   E  = mix(dfg.x, dfg.y, f0) = (1-f0)*dfg.x+f0*dfg.y (specularDFG)
         //   Fr = E * prefilteredRadiance(R, roughness-LOD)   (specular)
         //   Fd = diffuseColor * diffuseIrradiance * (1-E)    (diffuse, energy-
         //                                                     conserving: gets

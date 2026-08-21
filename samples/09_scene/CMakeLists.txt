@@ -8,8 +8,11 @@
 # present-loop helper. grid_layout.h alone stays sample-local (row 5
 # ruling).
 add_executable(sample_09_scene main.cpp)
+# rx_ibl [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW]:
+# rx::ibl::bakeEnvironment(), consumed by this sample's own default-
+# environment bind (setupEnvironment() in main.cpp).
 target_link_libraries(sample_09_scene PRIVATE
-    rx_graph rx_rhi_vk rx_platform rx_material rx_asset rx_scene rx_shadow rx_debug_ui rx_task rx_shader rx_frame_loop sample_common
+    rx_graph rx_rhi_vk rx_platform rx_material rx_asset rx_scene rx_shadow rx_debug_ui rx_task rx_shader rx_frame_loop rx_ibl sample_common
 )
 
 # RX_REPO_ROOT_DIR: same "bake an absolute CMAKE_SOURCE_DIR-relative path at
@@ -107,6 +110,54 @@ add_custom_command(
 add_custom_target(sample_09_scene_tonemap_shaders
   DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/tonemap_shaders_deploy.stamp")
 add_dependencies(sample_09_scene sample_09_scene_tonemap_shaders)
+
+# [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW] rx_ibl's
+# own bake-chain compute kernels (rx::ibl::bakeEnvironment()'s own
+# `shaderDir` parameter) -- deployed into an `ibl_shaders/` directory next
+# to the binary, mirroring samples/08_gltf_viewer's own identical deploy
+# block EXACTLY, minus shaders/ibl/skybox.slang (this sample builds no
+# skybox pass -- out of this fix round's own scope).
+set(RX_SCENE_IBL_SHADERS
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/ibl/equirect_to_cubemap.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/ibl/irradiance_convolve.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/ibl/prefilter_specular.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/ibl/dfg_lut.slang"
+)
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ibl_shaders_deploy.stamp"
+  COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sample_09_scene>/ibl_shaders"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_SCENE_IBL_SHADERS}
+          "$<TARGET_FILE_DIR:sample_09_scene>/ibl_shaders/"
+  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/ibl_shaders_deploy.stamp"
+  DEPENDS ${RX_SCENE_IBL_SHADERS}
+  COMMENT "sample_09_scene: deploying rx_ibl's bake-chain shaders next to the binary"
+  VERBATIM
+)
+add_custom_target(sample_09_scene_ibl_shaders
+  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/ibl_shaders_deploy.stamp")
+add_dependencies(sample_09_scene sample_09_scene_ibl_shaders)
+
+# [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW] Reuses
+# samples/08_gltf_viewer's own committed procedural .hdr fixture VERBATIM
+# (NO NEW ASSET) -- deployed a second time next to THIS binary, same
+# pattern as samples/08_gltf_viewer/CMakeLists.txt's own
+# `environments_deploy.stamp` block.
+set(RX_SCENE_ENVIRONMENT_FIXTURES
+  "${CMAKE_CURRENT_SOURCE_DIR}/../08_gltf_viewer/environments/gate_test_env.hdr"
+)
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/environments_deploy.stamp"
+  COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sample_09_scene>/environments"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_SCENE_ENVIRONMENT_FIXTURES}
+          "$<TARGET_FILE_DIR:sample_09_scene>/environments/"
+  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/environments_deploy.stamp"
+  DEPENDS ${RX_SCENE_ENVIRONMENT_FIXTURES}
+  COMMENT "sample_09_scene: deploying the shared (samples/08_gltf_viewer-owned) .hdr environment fixture next to the binary"
+  VERBATIM
+)
+add_custom_target(sample_09_scene_environments
+  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/environments_deploy.stamp")
+add_dependencies(sample_09_scene sample_09_scene_environments)
 
 # D17 committed reference PNG (256x256, lavapipe-rendered) for the default
 # headless DamagedHelmet-grid composition (no HUD -- see main.cpp's own

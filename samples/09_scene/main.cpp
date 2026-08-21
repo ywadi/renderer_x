@@ -68,6 +68,7 @@
 #include <rx_asset/geometry_pool.h>
 #include <rx_asset/registry.h>
 #include <rx_asset/texture_cache.h>
+#include <rx_asset/texture_decode.h>
 #include <rx_core/debug_checks.h>
 #include <rx_core/log.h>
 #include <rx_core/profile.h>
@@ -76,6 +77,11 @@
 #include <rx_graph/executor.h>
 #include <rx_graph/render_graph.h>
 #include <rx_graph/scene_color.h>
+// [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW] this
+// sample's own default environment bind -- rx::ibl::bakeEnvironment(),
+// consumed by setupEnvironment() below, mirroring samples/08_gltf_viewer's
+// own identical consumption.
+#include <rx_ibl/bake.h>
 #include <rx_material/draw_data.h>
 #include <rx_material/material_system.h>
 #include <rx_material/param_arena_factory.h>
@@ -153,6 +159,15 @@ constexpr uint32_t kPresentHeight = 720;
 constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
 constexpr VkFormat kShadowFormat = VK_FORMAT_D32_SFLOAT;
 constexpr uint32_t kShadowMapResolution = 1024;
+
+// [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW]
+// Deliberately MODEST (well under EnvironmentDesc::intensity's own neutral
+// 1.0 default, and under samples/08_gltf_viewer's own default `--env`
+// intensity) -- this sample's own non-stress content should read lit, not
+// washed out by a bright indirect term competing with the one directional
+// light + shadow this scene already exercises. See setupEnvironment()'s
+// own header comment for the full rationale.
+constexpr float kDefaultEnvironmentIntensity = 0.4F;
 
 // Helmet-grid composition -- see this file's own header comment ("layer
 // mask, not frustum geometry") for the full deterministic-culling
@@ -280,6 +295,25 @@ std::filesystem::path resolveSponzaScenePath() {
         return packaged;
     }
     return std::filesystem::path(RX_REPO_ROOT_DIR) / "assets" / "fetched" / "Sponza" / "glTF" / "Sponza.gltf";
+}
+
+// [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW] Resolves
+// the SAME committed procedural .hdr fixture samples/08_gltf_viewer's own
+// D17 gate already uses (samples/08_gltf_viewer/environments/
+// gate_test_env.hdr) -- NO NEW ASSET is added by this fix round; this
+// sample reuses that one committed file, deployed a second time next to
+// THIS binary by this sample's own CMakeLists.txt (see that file's own
+// `environments_deploy.stamp` block) for the packaged case, or resolved
+// straight from the source tree for an ordinary build-tree run. Same
+// two-step "packaged, then dev-tree" resolution order as
+// resolveHelmetScenePath()/resolveSponzaScenePath() above.
+std::filesystem::path resolveEnvironmentPath() {
+    std::filesystem::path packaged = basePathDirectory() / "environments" / "gate_test_env.hdr";
+    if (std::filesystem::exists(packaged)) {
+        return packaged;
+    }
+    return std::filesystem::path(RX_REPO_ROOT_DIR) / "samples" / "08_gltf_viewer" / "environments" /
+           "gate_test_env.hdr";
 }
 
 // --- Fly-through camera [Task 20 input surface -- gate ruling #15's own
@@ -657,6 +691,27 @@ struct App {
     VkImageView lastHdrView = VK_NULL_HANDLE;
     rx::rhi::BindlessHandle hdrHandle;
 
+    // [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW] A
+    // modest default environment -- see setupEnvironment()'s own header
+    // comment for why this sample binds one now (the retired FG1 flat-
+    // ambient term's removal left the non-stress DamagedHelmet-grid render
+    // reading near-black with zero environment bound; this sample is an
+    // interactive fly-through, not a static gate-only asset). Field shape
+    // mirrors samples/08_gltf_viewer's own identical set exactly (same
+    // `rx::ibl::BakeResult` + bindless-handle + sampler bundle) -- no
+    // skybox pass here (out of this fix round's own scope; only the
+    // diffuse/specular IBL lighting terms this sample's own materials
+    // already consume via standard_pbr.slang).
+    std::optional<rx::ibl::BakeResult> environment;
+    VkSampler envCubeSampler = VK_NULL_HANDLE;
+    VkSampler envDfgSampler = VK_NULL_HANDLE;
+    rx::rhi::BindlessHandle envBaseCubeHandle;
+    rx::rhi::BindlessHandle envIrradianceHandle;
+    rx::rhi::BindlessHandle envPrefilteredHandle;
+    rx::rhi::BindlessHandle envDfgLutHandle;
+    rx::rhi::BindlessHandle envCubeSamplerHandle;
+    rx::rhi::BindlessHandle envDfgSamplerHandle;
+
     // Set-1 (material params) descriptor infrastructure [Phase 5 Task 5,
     // ticket #41 row 1 -- promoted into
     // rx::material::createDemandSizedMaterialParamArena(); see that
@@ -960,10 +1015,12 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
     capacities.comparisonSamplers = 1;
     // [Phase 5 Task 10, #46] material.slang now unconditionally declares
     // `gTexturesCube` at binding 4 -- same requirement as
-    // `comparisonSamplers` above. This sample does not bind a Scene
-    // environment (out of this ticket's own file list), so headroom of 1
-    // is never actually exercised, only structurally required.
-    capacities.cubeImages = 1;
+    // `comparisonSamplers` above. [Fix round, task-10-review.md Finding
+    // 3/LOW] This sample NOW binds a real Scene environment
+    // (setupEnvironment() below) -- base/irradiance/prefiltered cubemaps,
+    // 3 real registrations -- 4 gives one spare slot, matching
+    // samples/08_gltf_viewer's own identical sizing.
+    capacities.cubeImages = 4;
     auto bindless = rx::rhi::BindlessTable::create(app->device->physicalDevice(), app->device->device(), capacities);
     if (!bindless.has_value()) {
         RX_LOG_ERROR("sample_09_scene: BindlessTable::create failed");
@@ -1040,6 +1097,179 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
     }
 
     return app;
+}
+
+// [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW] Decodes
+// an equirect .hdr file into a sampled Texture2D -- a TRIMMED duplicate of
+// samples/08_gltf_viewer's own loadEquirectHdr() (this project's own
+// established per-sample-duplicated-fixture idiom, restated across this
+// codebase's several test suites -- no cross-sample .cpp dependency this
+// binary would otherwise need). Returns std::nullopt (logged) on failure.
+std::optional<rx::rhi::Texture2D> loadEquirectHdr(rx::rhi::Device& device, rx::rhi::Allocator& allocator,
+                                                    rx::rhi::Uploader& uploader, const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        RX_LOG_ERROR("sample_09_scene: failed to open environment file '{}'", path.string());
+        return std::nullopt;
+    }
+    const std::streamsize fileSize = file.tellg();
+    if (fileSize <= 0) {
+        RX_LOG_ERROR("sample_09_scene: environment file '{}' is empty or unreadable", path.string());
+        return std::nullopt;
+    }
+    file.seekg(0, std::ios::beg);
+    std::vector<std::byte> bytes(static_cast<size_t>(fileSize));
+    if (!file.read(reinterpret_cast<char*>(bytes.data()), fileSize)) {
+        RX_LOG_ERROR("sample_09_scene: failed to read environment file '{}'", path.string());
+        return std::nullopt;
+    }
+
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(device.physicalDevice(), &props);
+    auto isFormatSupported = [&](VkFormat format) {
+        VkFormatProperties2 formatProps{};
+        formatProps.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
+        vkGetPhysicalDeviceFormatProperties2(device.physicalDevice(), format, &formatProps);
+        constexpr VkFormatFeatureFlags kNeeded = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        return (formatProps.formatProperties.optimalTilingFeatures & kNeeded) == kNeeded;
+    };
+    rx::asset::TextureDecodeResult decoded = rx::asset::decodeTextureForUpload(
+        bytes, rx::asset::TextureRole::Environment, props.limits.maxImageDimension2D, isFormatSupported);
+    if (decoded.outcome != rx::asset::TextureDecodeResult::Outcome::Ready || decoded.isCube) {
+        RX_LOG_ERROR("sample_09_scene: failed to decode environment '{}': {}", path.string(), decoded.failureReason);
+        return std::nullopt;
+    }
+
+    auto texture = rx::rhi::Texture2D::createForPresuppliedMips(
+        device.physicalDevice(), device.device(), allocator, VkExtent2D{decoded.width, decoded.height},
+        decoded.format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        static_cast<uint32_t>(decoded.levels.size()));
+    if (!texture.has_value()) {
+        RX_LOG_ERROR("sample_09_scene: Texture2D::createForPresuppliedMips failed for environment '{}'", path.string());
+        return std::nullopt;
+    }
+
+    std::vector<rx::rhi::Uploader::ImageMipLevel> uploadLevels;
+    uploadLevels.reserve(decoded.levels.size());
+    for (const rx::asset::DecodedTextureLevel& level : decoded.levels) {
+        rx::rhi::Uploader::ImageMipLevel entry;
+        entry.data = level.bytes.data();
+        entry.size = static_cast<VkDeviceSize>(level.bytes.size());
+        entry.mipLevel = level.level;
+        entry.extent = {level.width, level.height};
+        uploadLevels.push_back(entry);
+    }
+    if (!uploader.uploadImageMips(*texture, uploadLevels)) {
+        RX_LOG_ERROR("sample_09_scene: Uploader::uploadImageMips failed for environment '{}'", path.string());
+        return std::nullopt;
+    }
+    rx::rhi::UploadTicket ticket = uploader.flush();
+    uploader.wait(ticket);
+    return texture;
+}
+
+// [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW] Bakes
+// samples/08_gltf_viewer's own committed procedural .hdr fixture
+// (resolveEnvironmentPath(), NO NEW ASSET) and binds it via
+// `app.scene->setEnvironment()` -- closing the review's LOW product-quality
+// finding: with FG1's flat ambient term retired (this task's own headline
+// change), this sample's non-stress DamagedHelmet content read near-black
+// with no environment bound, which reads as "looks broken" to an
+// interactive fly-through a human drives, independent of the underlying
+// physically-correct zero-ambient rationale. `intensity` is DELIBERATELY
+// modest (see this function's own caller) -- "reads lit, not washed", not
+// a bright showcase render; this fixture is a small 64x32 procedural sky
+// gradient, not production content. No skybox pass -- out of this fix
+// round's own scope; only the diffuse/specular IBL terms standard_pbr.slang
+// already consumes. Mirrors samples/08_gltf_viewer's own setupEnvironment()
+// exactly, minus the skybox half. Returns false (logged) on any failure;
+// `app.scene->hasEnvironment()` stays false in that case.
+bool setupEnvironment(App& app, const std::filesystem::path& hdrPath, const std::filesystem::path& iblShaderDir,
+                      float intensity) {
+    RX_ZONE_NAMED("sample09: setupEnvironment");
+    auto equirect = loadEquirectHdr(*app.device, *app.allocator, *app.uploader, hdrPath);
+    if (!equirect.has_value()) {
+        return false;
+    }
+
+    auto cmdCtx =
+        rx::rhi::CommandContext::create(app.device->device(), app.device->graphicsQueue(), app.device->graphicsQueueFamily());
+    if (!cmdCtx.has_value()) {
+        RX_LOG_ERROR("sample_09_scene: CommandContext::create failed for the IBL bake");
+        return false;
+    }
+
+    // BakeParams left at their own defaults -- same "small committed
+    // fixture, CI-representative bake time" rationale as
+    // samples/08_gltf_viewer's own setupEnvironment() (that function's own
+    // header comment); this sample's own headless D17 gate runs this exact
+    // bake on lavapipe too.
+    rx::ibl::BakeParams params;
+    rx::ibl::BakeTimings timings;
+    auto bakeResult = rx::ibl::bakeEnvironment(*app.device, *app.allocator, *cmdCtx, *app.scheduler, *equirect,
+                                                /*sourceIsCube=*/false, iblShaderDir, params, &timings,
+                                                "sample09_scene");
+    if (!bakeResult.has_value()) {
+        RX_LOG_ERROR("sample_09_scene: rx::ibl::bakeEnvironment failed for '{}'", hdrPath.string());
+        return false;
+    }
+    RX_LOG_INFO(
+        "sample09: perf ibl_bake path='{}' equirect_to_cubemap_ms={:.3f} irradiance_ms={:.3f} prefilter_ms={:.3f} "
+        "dfg_ms={:.3f} total_ms={:.3f}",
+        hdrPath.string(), timings.equirectToCubemapMs, timings.irradianceMs, timings.prefilterMs, timings.dfgMs,
+        timings.totalMs);
+
+    app.environment = std::move(*bakeResult);
+
+    VkSamplerCreateInfo cubeSamplerInfo{};
+    cubeSamplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    cubeSamplerInfo.magFilter = VK_FILTER_LINEAR;
+    cubeSamplerInfo.minFilter = VK_FILTER_LINEAR;
+    cubeSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    cubeSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    cubeSamplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    cubeSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    cubeSamplerInfo.minLod = 0.0F;
+    cubeSamplerInfo.maxLod = VK_LOD_CLAMP_NONE;
+    if (vkCreateSampler(app.device->device(), &cubeSamplerInfo, nullptr, &app.envCubeSampler) != VK_SUCCESS) {
+        RX_LOG_ERROR("sample_09_scene: vkCreateSampler (environment cube sampler) failed");
+        return false;
+    }
+    VkSamplerCreateInfo dfgSamplerInfo = cubeSamplerInfo;
+    dfgSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    if (vkCreateSampler(app.device->device(), &dfgSamplerInfo, nullptr, &app.envDfgSampler) != VK_SUCCESS) {
+        RX_LOG_ERROR("sample_09_scene: vkCreateSampler (environment DFG sampler) failed");
+        return false;
+    }
+
+    app.envBaseCubeHandle =
+        app.bindless->registerCubeSampledImage(app.environment->baseCubemap.view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    app.envIrradianceHandle = app.bindless->registerCubeSampledImage(app.environment->irradianceCubemap.view(),
+                                                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    app.envPrefilteredHandle = app.bindless->registerCubeSampledImage(app.environment->prefilteredCubemap.view(),
+                                                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    app.envDfgLutHandle =
+        app.bindless->registerSampledImage(app.environment->dfgLut.view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    app.envCubeSamplerHandle = app.bindless->registerSampler(app.envCubeSampler);
+    app.envDfgSamplerHandle = app.bindless->registerSampler(app.envDfgSampler);
+    if (!app.envBaseCubeHandle.isValid() || !app.envIrradianceHandle.isValid() ||
+        !app.envPrefilteredHandle.isValid() || !app.envDfgLutHandle.isValid() ||
+        !app.envCubeSamplerHandle.isValid() || !app.envDfgSamplerHandle.isValid()) {
+        RX_LOG_ERROR("sample_09_scene: bindless registration failed for the baked environment");
+        return false;
+    }
+
+    rx::scene::EnvironmentDesc envDesc;
+    envDesc.baseCubemapIndex = app.envBaseCubeHandle.index();
+    envDesc.irradianceCubemapIndex = app.envIrradianceHandle.index();
+    envDesc.prefilteredCubemapIndex = app.envPrefilteredHandle.index();
+    envDesc.dfgLutIndex = app.envDfgLutHandle.index();
+    envDesc.cubeSamplerIndex = app.envCubeSamplerHandle.index();
+    envDesc.dfgSamplerIndex = app.envDfgSamplerHandle.index();
+    envDesc.maxPrefilteredLod = static_cast<float>(app.environment->prefilteredMipCount) - 1.0F;
+    envDesc.intensity = intensity;
+    app.scene->setEnvironment(envDesc);
+    return true;
 }
 
 // [Phase 5 Task 5, ticket #41 row 1] Builds App::materialParamArena (set
@@ -1128,6 +1358,29 @@ void destroyApp(App& app) {
         app.drawDataBuffer->release(*app.bindless);
     }
     app.drawDataBuffer.reset();
+    // [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW]
+    // Same teardown shape as samples/08_gltf_viewer's own destroyApp() --
+    // bindless release, then the two raw VkSampler handles, then
+    // rx::ibl::BakeResult's own RAII Texture2D members via reset(). A run
+    // that never bound an environment (setupEnvironment() failed, or was
+    // never reached) leaves every one of these a documented no-op.
+    if (app.bindless.has_value()) {
+        app.bindless->release(app.envBaseCubeHandle);
+        app.bindless->release(app.envIrradianceHandle);
+        app.bindless->release(app.envPrefilteredHandle);
+        app.bindless->release(app.envDfgLutHandle);
+        app.bindless->release(app.envCubeSamplerHandle);
+        app.bindless->release(app.envDfgSamplerHandle);
+    }
+    if (app.envCubeSampler != VK_NULL_HANDLE) {
+        vkDestroySampler(app.device->device(), app.envCubeSampler, nullptr);
+        app.envCubeSampler = VK_NULL_HANDLE;
+    }
+    if (app.envDfgSampler != VK_NULL_HANDLE) {
+        vkDestroySampler(app.device->device(), app.envDfgSampler, nullptr);
+        app.envDfgSampler = VK_NULL_HANDLE;
+    }
+    app.environment.reset();
     destroyCompiledPass(app.device->device(), app.tonemapPass);
     if (app.defaultSamplerHandle.isValid() && app.bindless.has_value()) {
         app.bindless->release(app.defaultSamplerHandle);
@@ -1856,10 +2109,21 @@ bool buildStressField(App& app, uint32_t drawCount) {
 // materialIndexForSpan() header comment. Descriptor-set selection at
 // record time now goes through App::resolveMaterialIndexToBinding instead,
 // keyed by the REAL per-span materialIndex.
-void warmMaterialPipelines(App& app, std::span<const MaterialGpuBinding> bindings) {
+// [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW] The
+// SAME specialization-bits derivation samples/08_gltf_viewer's own
+// materialSpecializationBits() uses, at BOTH this file's own pre-
+// resolution site (warmMaterialPipelines() below) and its real per-draw
+// site (updateSceneFrame()'s own resolveDrawGroups() lambda) -- a single
+// function, so the two call sites cannot drift apart (matching sample08's
+// own documented rationale exactly).
+uint32_t materialSpecializationBits(const App& app) {
+    return app.scene->hasEnvironment() ? rx::material::kSpecializationEnergyCompensation : 0U;
+}
+
+void warmMaterialPipelines(App& app, std::span<const MaterialGpuBinding> bindings, uint32_t specializationBits = 0U) {
     const rx::material::PassSignature sig = forwardPassSignature();
     for (const MaterialGpuBinding& binding : bindings) {
-        app.materialSystem->getPipeline({binding.handle, sig, 0});
+        app.materialSystem->getPipeline({binding.handle, sig, specializationBits});
     }
     // [Phase 4 exit fix wave, I3] Hoisted here, main-thread-only, setup-time
     // (this function is never called mid-frame) -- NOT recomputed inside
@@ -2008,6 +2272,21 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
         app.scene->setLightChannels(app.lightHandle, lightChannels);
     }
 
+    // [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW] The
+    // scene environment's own bindless bundle -- mirrors
+    // samples/08_gltf_viewer's own updateDrawDataPerPassFields()
+    // identically (same EnvironmentDesc-read-once-per-frame-then-broadcast
+    // shape). `hasEnvironment() == false` leaves every row at
+    // DrawDataGpu{}'s own "no environment" sentinel default (set once at
+    // app.drawDataRows.assign(rows, DrawDataGpu{}), never touched again in
+    // that case) -- byte-identical to a pre-T10 producer.
+    const bool hasEnvironment = app.scene->hasEnvironment();
+    rx::scene::EnvironmentDesc envDesc;
+    if (hasEnvironment) {
+        envDesc = app.scene->environment();
+    }
+    const float envIntensityExposed = envDesc.intensity * preExposure;
+
     const auto transforms = app.scene->transformsSpan();
     for (size_t i = 0; i < app.viewLists.payloads.size(); ++i) {
         const rx::scene::DrawPayload& payload = app.viewLists.payloads[i];
@@ -2020,9 +2299,18 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
         row.viewProj = viewProjTransposed;
         row.lightDirWorld = glm::vec4(-glm::normalize(app.lightDirWorld), 0.0F);
         row.lightColor = glm::vec4(5.0F, 5.0F, 5.0F, 0.0F) * preExposure;
-        row.ambientColor = glm::vec4(0.12F, 0.12F, 0.12F, 0.0F) * preExposure;
+        row.ambientColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);  // retired field, inert -- see MaterialVertex::ambientColor's own header comment.
         row.cameraPosWorld = glm::vec4(cameraPos, 0.0F);
         row.materialIndex = payload.materialIndex;
+        if (hasEnvironment) {
+            row.envIrradianceCubeIndex = envDesc.irradianceCubemapIndex;
+            row.envPrefilteredCubeIndex = envDesc.prefilteredCubemapIndex;
+            row.envDfgLutIndex = envDesc.dfgLutIndex;
+            row.envCubeSamplerIndex = envDesc.cubeSamplerIndex;
+            row.envDfgSamplerIndex = envDesc.dfgSamplerIndex;
+            row.envMaxPrefilteredLod = envDesc.maxPrefilteredLod;
+            row.envIntensity = envIntensityExposed;
+        }
         // [Phase 4 exit fix wave, C1] Also requires `app.shadowMapHandle.
         // isValid()` -- NOT just `app.shadowEnabled` -- since the handle is
         // now (re-)registered lazily, from recordForwardChunk()'s chunk 0,
@@ -2068,11 +2356,15 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
     // returning (and this call site discarding the previous) a fresh
     // std::vector every frame -- see rx::scene::resolveDrawGroups()'s own
     // header comment.
+    // [Phase 5 Task 10, #46 fix round] `materialSpecializationBits()` --
+    // MUST match warmMaterialPipelines()'s own call, or this lookup misses
+    // the pre-warmed cache entry (see that function's own header comment).
+    const uint32_t specializationBits = materialSpecializationBits(app);
     rx::scene::resolveDrawGroups(
         app.viewLists, passSigHash, 0,
-        [&app, &passSig](const rx::scene::PipelineRequestKey& key) -> uint64_t {
+        [&app, &passSig, specializationBits](const rx::scene::PipelineRequestKey& key) -> uint64_t {
             const rx::material::MaterialHandle handle = app.resolveMaterialIndexToHandle(key.materialIndex);
-            VkPipeline pipeline = app.materialSystem->getPipeline({handle, passSig, 0});
+            VkPipeline pipeline = app.materialSystem->getPipeline({handle, passSig, specializationBits});
             return std::bit_cast<uint64_t>(pipeline);
         },
         app.resolvedGroups);
@@ -2717,7 +3009,21 @@ int runHeadless(const Args& args) {
             destroyApp(*app);
             return 1;
         }
-        warmMaterialPipelines(*app, std::span<const MaterialGpuBinding>(&app->helmetMaterial, 1));
+        // [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW]
+        // Bind the committed default environment BEFORE
+        // warmMaterialPipelines() so the pre-warmed pipeline variant
+        // (materialSpecializationBits()) matches the one updateSceneFrame()
+        // resolves at real draw time -- see that function's own header
+        // comment. Failure here is logged but non-fatal: the scene still
+        // renders (with zero indirect light, matching this task's own
+        // pre-existing physically-honest fallback), just without the
+        // fix-round's own product-quality improvement.
+        const std::filesystem::path iblShaderDir = basePathDirectory() / "ibl_shaders";
+        if (!setupEnvironment(*app, resolveEnvironmentPath(), iblShaderDir, kDefaultEnvironmentIntensity)) {
+            RX_LOG_WARN("sample_09_scene: setupEnvironment failed -- continuing with zero indirect light");
+        }
+        warmMaterialPipelines(*app, std::span<const MaterialGpuBinding>(&app->helmetMaterial, 1),
+                              materialSpecializationBits(*app));
         if (!setupShadow(*app)) {
             destroyApp(*app);
             return 1;
@@ -3222,7 +3528,16 @@ int runPresent(const Args& args) {
             destroyApp(*app);
             return 1;
         }
-        warmMaterialPipelines(*app, std::span<const MaterialGpuBinding>(&app->helmetMaterial, 1));
+        // [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW]
+        // Same default-environment bind as runHeadless() above -- this is
+        // the interactive fly-through the review's own LOW finding names
+        // directly ("plausibly reads as 'looks broken' to a human tester").
+        const std::filesystem::path iblShaderDir = basePathDirectory() / "ibl_shaders";
+        if (!setupEnvironment(*app, resolveEnvironmentPath(), iblShaderDir, kDefaultEnvironmentIntensity)) {
+            RX_LOG_WARN("sample_09_scene: setupEnvironment failed -- continuing with zero indirect light");
+        }
+        warmMaterialPipelines(*app, std::span<const MaterialGpuBinding>(&app->helmetMaterial, 1),
+                              materialSpecializationBits(*app));
         if (!setupShadow(*app)) {
             destroyApp(*app);
             return 1;

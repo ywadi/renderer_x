@@ -518,12 +518,24 @@ uint32_t makeFlatNormalTexture(rx::material::MaterialSystem& system) {
 
 TEST_CASE("StandardPBR IBL: Lambertian diffuse under a uniform environment reproduces the closed-form "
           "albedo x radiance value exactly [gate matrix 'Diffuse IBL feeding the diffuse lobe' row] -- "
-          "dfgValue=(0,0) makes E==f0*0+0==0 identically (regardless of F0), isolating the diffuse lobe "
-          "(iblDiffuse = diffuseColor * irradianceSample * (1-E) == diffuseColor * irradianceSample exactly; "
-          "iblSpecular = prefilteredSample * E == 0 exactly) -- bake.h's own pre-divided irradiance convention "
-          "means the uploaded uniform-radiance texel L IS the closed-form Lambertian-under-uniform-environment "
-          "answer directly (irradiance = L*pi; outgoing Lambertian radiance = albedo/pi * irradiance == "
-          "albedo*L for a white albedo == L exactly)") {
+          "[T10 fix round, task-10-review.md Finding 1/2] dfgValue=(0.05,0.4) satisfies the dfg.x<=dfg.y "
+          "invariant every real T9 bake output satisfies (the retired (0,0) constant was degenerate: E==0 "
+          "identically under EITHER the buggy or the corrected specular-DFG formula, which is exactly why "
+          "this TEST_CASE alone could never have caught Finding 1). Even with a non-degenerate dfg, this "
+          "specific probe is STILL formula-invariant, but for an exact, provable reason, not a test gap: "
+          "energy compensation is OFF for this pipeline variant (specializationBits=0, renderQuad()'s own "
+          "getPipeline() call), so `ibl = diffuseColor*irradianceSample*(1-E) + prefilteredSample*E`; with "
+          "metallic=0 and a white baseColorFactor, diffuseColor==(1,1,1) and (uniform environment) "
+          "irradianceSample==prefilteredSample==L, so `ibl = L*(1-E) + L*E == L` EXACTLY for ANY E in "
+          "[0,1] -- the split-sum method's own energy-conservation identity, not something a different dfg "
+          "choice can un-cancel. Discriminating the specular E-formula therefore requires killing the "
+          "diffuse lobe (metallic=1), which is exactly what the mirror-metal and furnace TEST_CASEs below "
+          "do; THIS TEST_CASE's own job is validating the diffuse lobe's own machinery (irradiance "
+          "sampling, Lambertian evaluation, the `(1-E)` wiring) independently of what E's value is -- "
+          "bake.h's own pre-divided irradiance convention means the uploaded uniform-radiance texel L IS "
+          "the closed-form Lambertian-under-uniform-environment answer directly (irradiance = L*pi; "
+          "outgoing Lambertian radiance = albedo/pi * irradiance == albedo*L for a white albedo == L "
+          "exactly)") {
     auto fixture = makeFixture("standard_pbr_ibl_lambertian");
     if (!fixture.has_value()) {
         return;
@@ -556,11 +568,18 @@ TEST_CASE("StandardPBR IBL: Lambertian diffuse under a uniform environment repro
     }
 
     // radiance L=0.5 -- comfortably below the UNORM store's 1.0 clamp
-    // ceiling, and dfgValue=(0,0) as this TEST_CASE's own header comment
-    // derives.
+    // ceiling. dfgValue=(0.05,0.4): [T10 fix round] a realistic,
+    // invariant-respecting (dfg.x < dfg.y) pair for a fully-rough
+    // (roughness=1.0, see the blob below) dielectric probe -- see this
+    // TEST_CASE's own header comment for why the specific value no longer
+    // matters to the final assertion (energy conservation, energy comp
+    // OFF).
     constexpr float kRadiance = 0.5F;
+    constexpr float kDfgX = 0.05F;
+    constexpr float kDfgY = 0.4F;
     auto env = makeUniformTestEnvironment(fixture->device, fixture->allocator, fixture->bindless,
-                                           glm::vec4(kRadiance, kRadiance, kRadiance, 1.0F), glm::vec2(0.0F, 0.0F));
+                                           glm::vec4(kRadiance, kRadiance, kRadiance, 1.0F),
+                                           glm::vec2(kDfgX, kDfgY));
     REQUIRE(env.has_value());
 
     rx::material::DrawDataGpu row = makeHeadOnIblRow();
@@ -580,10 +599,13 @@ TEST_CASE("StandardPBR IBL: Lambertian diffuse under a uniform environment repro
     // storage rounding through the irradiance cubemap's own R16G16B16A16_
     // SFLOAT texel (kRadiance=0.5 is EXACTLY representable in fp16, so
     // this tolerance is about the shading math's own rounding, not the
-    // storage format).
+    // storage format). This closed form is EXACTLY L regardless of which
+    // specular-DFG formula is in effect (see header comment) -- included
+    // here as INFO, not a second CHECK, precisely to make that invariance
+    // visible rather than silently assumed.
     const int expected = static_cast<int>(std::lround(kRadiance * 255.0));
     INFO("pixel r=", static_cast<int>(pixel.r), " g=", static_cast<int>(pixel.g), " b=", static_cast<int>(pixel.b),
-         " expected=", expected);
+         " expected=", expected, " (formula-invariant: both the corrected and the retired-buggy E give ibl==L here)");
     CHECK(near8(pixel.r, expected, 6));
     CHECK(near8(pixel.g, expected, 6));
     CHECK(near8(pixel.b, expected, 6));
@@ -594,14 +616,24 @@ TEST_CASE("StandardPBR IBL: Lambertian diffuse under a uniform environment repro
 }
 
 TEST_CASE("StandardPBR IBL: mirror-metal sphere under a known environment reproduces the environment -- a "
-          "matched-pose value probe [ticket #46's own acceptance line, quoted verbatim] -- metallic=1, "
-          "roughness clamped to kMinRoughness (near-mirror), white F0 (baseColorFactor white x metallic=1 -> "
-          "F0=(1,1,1)), dfgValue=(1,0) makes E==f0*1+0==f0==(1,1,1) exactly (a perfect, lossless mirror): "
-          "iblSpecular = prefilteredSample * E == prefilteredSample exactly, iblDiffuse == 0 (metallic=1 kills "
-          "diffuseColor before E is even applied) -- the head-on rig's own reflection vector R==(0,0,1) (world "
-          "+Z) always samples cube FACE INDEX 4 (Vulkan's own standard layer-order convention, this file's own "
-          "header comment) -- a DISTINCT, recognizable color on that ONE face, black everywhere else, proves "
-          "the probe reads the CORRECT face, not merely 'some' face") {
+          "matched-pose value probe [ticket #46's own acceptance line, quoted verbatim] -- [T10 fix round, "
+          "task-10-review.md Finding 1/2] metallic=1, roughness clamped to kMinRoughness (near-mirror), white "
+          "F0 (baseColorFactor white x metallic=1 -> F0=(1,1,1) exactly). dfgValue=(0.12,0.80): the retired "
+          "(1,0) constant both violated the dfg.x<=dfg.y invariant every real T9 bake output satisfies AND "
+          "had its own 'expected' derived from the SAME (buggy) formula the shader shipped -- a tautology, "
+          "not independent ground truth. The CORRECTED formula [brdf.slang iblSpecularReflectance(), "
+          "mix(dfg.x,dfg.y,f0)] has a robust endpoint identity at f0==(1,1,1) exactly (this probe's own "
+          "F0): mix(dfg.x,dfg.y,1)==dfg.y for ANY dfg.x, so E==dfg.y==0.80 independently of the retired "
+          "formula's own dfg.x term -- a perfect, lossless-in-dfg.y mirror, not exactly f0 anymore (that "
+          "pedagogical shape only held for the OLD formula's own math). iblSpecular = prefilteredSample * E, "
+          "iblDiffuse == 0 (metallic=1 kills diffuseColor before E is even applied), energy compensation OFF "
+          "for this pipeline variant (specializationBits=0) -- the head-on rig's own reflection vector "
+          "R==(0,0,1) (world +Z) always samples cube FACE INDEX 4 (Vulkan's own standard layer-order "
+          "convention, this file's own header comment) -- a DISTINCT, recognizable color on that ONE face, "
+          "black everywhere else, proves the probe reads the CORRECT face, not merely 'some' face. This "
+          "TEST_CASE also asserts an explicit DISCRIMINATION check: the retired formula's own prediction "
+          "(E==dfg.x+dfg.y==0.92 at f0=1) differs from the corrected E==0.80 by exactly dfg.x==0.12, a "
+          "pixel delta comfortably outside this TEST_CASE's own +-8/255 tolerance") {
     auto fixture = makeFixture("standard_pbr_ibl_mirror");
     if (!fixture.has_value()) {
         return;
@@ -640,7 +672,16 @@ TEST_CASE("StandardPBR IBL: mirror-metal sphere under a known environment reprod
     constexpr glm::vec4 kFaceColor{0.9F, 0.45F, 0.05F, 1.0F};
     std::array<glm::vec4, 6> faces{glm::vec4(0.0F), glm::vec4(0.0F), glm::vec4(0.0F),
                                      glm::vec4(0.0F), kFaceColor,      glm::vec4(0.0F)};
-    auto env = makeTestEnvironment(fixture->device, fixture->allocator, fixture->bindless, faces, glm::vec2(1.0F, 0.0F));
+    // [T10 fix round] dfg.x=0.12 < dfg.y=0.80 -- satisfies the real-bake
+    // invariant (was (1,0), inverted) and is large enough in dfg.x that the
+    // retired formula's own prediction (dfg.x+dfg.y at f0=1, see header
+    // comment) diverges from the corrected one (dfg.y alone) by more than
+    // this TEST_CASE's own tolerance -- a genuine discriminator, not merely
+    // invariant-compliant.
+    constexpr float kDfgX = 0.12F;
+    constexpr float kDfgY = 0.80F;
+    auto env =
+        makeTestEnvironment(fixture->device, fixture->allocator, fixture->bindless, faces, glm::vec2(kDfgX, kDfgY));
     REQUIRE(env.has_value());
 
     rx::material::DrawDataGpu row = makeHeadOnIblRow();
@@ -655,9 +696,14 @@ TEST_CASE("StandardPBR IBL: mirror-metal sphere under a known environment reprod
     Rgba8 pixel = renderQuad(fixture->device, fixture->allocator, fixture->bindless, drawDataBuffer->handle,
                               samplerIndex, *mesh, *system, handle, blob);
 
-    const int expectedR = static_cast<int>(std::lround(kFaceColor.r * 255.0F));
-    const int expectedG = static_cast<int>(std::lround(kFaceColor.g * 255.0F));
-    const int expectedB = static_cast<int>(std::lround(kFaceColor.b * 255.0F));
+    // Independently-derived (not read from the shader) closed-form
+    // expected, using the CORRECTED split-sum formula's own endpoint
+    // identity at f0==(1,1,1) exactly: mix(dfg.x,dfg.y,1)==dfg.y for ANY
+    // dfg.x -- see this TEST_CASE's own header comment.
+    constexpr float kExpectedE = kDfgY;
+    const int expectedR = static_cast<int>(std::lround(kFaceColor.r * kExpectedE * 255.0F));
+    const int expectedG = static_cast<int>(std::lround(kFaceColor.g * kExpectedE * 255.0F));
+    const int expectedB = static_cast<int>(std::lround(kFaceColor.b * kExpectedE * 255.0F));
     INFO("pixel r=", static_cast<int>(pixel.r), " g=", static_cast<int>(pixel.g), " b=", static_cast<int>(pixel.b),
          " expected=(", expectedR, ",", expectedG, ",", expectedB, ")");
     CHECK(near8(pixel.r, expectedR, 8));
@@ -667,6 +713,19 @@ TEST_CASE("StandardPBR IBL: mirror-metal sphere under a known environment reprod
     // one of the 5 black faces instead.
     CHECK(pixel.r > 100);
 
+    // [T10 fix round, task-10-review.md Finding 1] Explicit discrimination
+    // against the RETIRED (buggy) formula's own prediction -- at f0=1 the
+    // retired `f0*dfg.x+dfg.y` reduces to `dfg.x+dfg.y`, strictly greater
+    // than the corrected `dfg.y` by exactly `dfg.x`. Assert the two
+    // predictions are themselves far enough apart to matter (i.e. this
+    // TEST_CASE's own choice of dfg.x is not accidentally too small to
+    // discriminate), independent of what the actual rendered pixel reads.
+    constexpr float kOldFormulaE = kDfgX + kDfgY;  // f0*dfg.x+dfg.y at f0=1.
+    const int oldPredictedR = static_cast<int>(std::lround(kFaceColor.r * kOldFormulaE * 255.0F));
+    const int deltaR = oldPredictedR - expectedR;
+    INFO("retired-formula prediction r=", oldPredictedR, " corrected expected r=", expectedR, " delta=", deltaR);
+    CHECK(deltaR > 8);  // exceeds this TEST_CASE's own +-8/255 tolerance -- a real gate-flip, not noise.
+
     env->destroySamplers(fixture->device.device());
     vkDestroySampler(fixture->device.device(), rawSampler, nullptr);
     CHECK_FALSE(fixture->context.hasValidationErrors());
@@ -674,10 +733,19 @@ TEST_CASE("StandardPBR IBL: mirror-metal sphere under a known environment reprod
 
 TEST_CASE("StandardPBR IBL: rough-metal furnace sanity on the FULL runtime path -- under a uniform environment "
           "(radiance L, every face/mip identical by construction) a rough metal's own IBL specular response "
-          "reproduces the closed form L*E exactly (E=f0*dfgX+dfgY, non-trivial dfg values this time, unlike the "
-          "mirror TEST_CASE's own toy (1,0)) and stays WITHIN [0, L] -- energy-sane, never exceeding the "
-          "environment's own radiance (the classic furnace-test invariant, applied end to end through the real "
-          "production shader rather than brdf.slang's own standalone Monte-Carlo harness)") {
+          "reproduces the closed form L*E exactly -- [T10 fix round, task-10-review.md Finding 1/2] "
+          "E=mix(dfgX,dfgY,f0)==(1-f0)*dfgX+f0*dfgY (Filament's own `specularDFG()`, "
+          "shaders/src/surface_light_indirect.fs v1.75.0:135, matching brdf.slang's own corrected "
+          "`iblSpecularReflectance()`), computed HERE independently in C++ from first principles -- NOT by "
+          "calling the shader's own helper -- so this is a real ground truth, not a tautology (the RETIRED "
+          "version of this TEST_CASE computed `expectedE = kF0*kDfgX+kDfgY`, the EXACT SAME formula the "
+          "shader shipped, which is why it could never have caught Finding 1 no matter what the constants "
+          "were). dfgX=0.08 < dfgY=0.55 satisfies the dfg.x<=dfg.y invariant every real T9 bake output "
+          "satisfies (the retired dfgX=0.9 > dfgY=0.05 inverted it). Also asserts the retired formula's own "
+          "prediction diverges from the corrected one by well outside this TEST_CASE's own +-8/255 "
+          "tolerance -- a real, quantified gate-flip, and stays WITHIN [0, L] -- energy-sane, never "
+          "exceeding the environment's own radiance (the classic furnace-test invariant, applied end to end "
+          "through the real production shader rather than brdf.slang's own standalone Monte-Carlo harness)") {
     auto fixture = makeFixture("standard_pbr_ibl_furnace");
     if (!fixture.has_value()) {
         return;
@@ -710,8 +778,16 @@ TEST_CASE("StandardPBR IBL: rough-metal furnace sanity on the FULL runtime path 
     }
 
     constexpr float kRadiance = 0.6F;
-    constexpr float kDfgX = 0.9F;   // a plausible mid-roughness split-sum scale term.
-    constexpr float kDfgY = 0.05F;  // a plausible mid-roughness split-sum bias term.
+    // [T10 fix round] dfgX is the Fresnel-scaling (F0) channel -- small at
+    // this probe's own NdotV==1 head-on geometry, per dfg_lut.slang's own
+    // accumulation (`r.x += term*fc`, `fc=(1-VoH)^5` small near VoH==1).
+    // dfgY is the base energy-return channel -- larger, but not the
+    // near-1.0 a near-mirror texel would carry, since this probe's own
+    // roughness=0.6 (fairly rough) reduces total specular energy return.
+    // dfgX < dfgY strictly, satisfying every real T9 bake's own invariant
+    // (the retired dfgX=0.9/dfgY=0.05 pair had this backwards).
+    constexpr float kDfgX = 0.08F;
+    constexpr float kDfgY = 0.55F;
     constexpr float kF0 = 0.7F;     // grey rough metal (baseColorFactor x metallic=1).
     auto env = makeUniformTestEnvironment(fixture->device, fixture->allocator, fixture->bindless,
                                            glm::vec4(kRadiance, kRadiance, kRadiance, 1.0F), glm::vec2(kDfgX, kDfgY));
@@ -729,7 +805,15 @@ TEST_CASE("StandardPBR IBL: rough-metal furnace sanity on the FULL runtime path 
     Rgba8 pixel = renderQuad(fixture->device, fixture->allocator, fixture->bindless, drawDataBuffer->handle,
                               samplerIndex, *mesh, *system, handle, blob);
 
-    const float expectedE = kF0 * kDfgX + kDfgY;
+    // [T10 fix round, task-10-review.md Finding 2] Independent ground
+    // truth: Filament's own `specularDFG()` reconstruction (v1.75.0
+    // surface_light_indirect.fs:135, CubemapIBL.cpp:790-833's own
+    // DFV_Multiscatter() comment "Er() = (1-f0)*DFV.x + f0*DFV.y"),
+    // transcribed here directly in C++ from the cited source -- NOT
+    // derived by calling brdf.slang's own iblSpecularReflectance() or any
+    // shader code -- so a bug in that shader function cannot silently
+    // match this expectation.
+    const float expectedE = (1.0F - kF0) * kDfgX + kF0 * kDfgY;
     REQUIRE(expectedE >= 0.0F);
     REQUIRE(expectedE <= 1.0F);  // sanity on this TEST_CASE's own chosen constants -- a real dfg texel never exceeds 1.
     const float expectedRadiance = kRadiance * expectedE;
@@ -738,6 +822,21 @@ TEST_CASE("StandardPBR IBL: rough-metal furnace sanity on the FULL runtime path 
     CHECK(near8(pixel.r, expected, 8));
     CHECK(near8(pixel.g, expected, 8));
     CHECK(near8(pixel.b, expected, 8));
+
+    // [T10 fix round, task-10-review.md Finding 1] Explicit discrimination
+    // against the RETIRED (buggy) formula's own prediction
+    // (`f0*dfgX+dfgY`, byte-identical to the pre-fix
+    // iblSpecularReflectance()) -- assert the two independently-computed
+    // predictions are themselves far enough apart that this TEST_CASE's
+    // own choice of constants is a real discriminator, not an accident of
+    // rounding.
+    const float oldFormulaE = kF0 * kDfgX + kDfgY;
+    const float oldFormulaRadiance = kRadiance * oldFormulaE;
+    const int oldPredicted = static_cast<int>(std::lround(oldFormulaRadiance * 255.0));
+    const int deltaFromOldFormula = oldPredicted - expected;
+    INFO("retired-formula E=", oldFormulaE, " prediction=", oldPredicted, " corrected expected=", expected,
+         " delta=", deltaFromOldFormula);
+    CHECK(deltaFromOldFormula > 8);  // exceeds this TEST_CASE's own +-8/255 tolerance -- a real gate-flip.
 
     // The furnace invariant itself: never brighter than the environment's
     // own radiance (a real energy-conservation bug -- e.g. E applied

@@ -220,33 +220,43 @@ public float3 energyCompensation(float3 f0, float dfgY) {
     return float3(1.0, 1.0, 1.0) + f0 * (1.0 / dfgY - 1.0);
 }
 
-// [Phase 5 Task 10, #46, FG1 closure] Split-sum IBL specular reflectance
-// scale [Karis 2013, "Real Shading in Unreal Engine 4"; ported here as
-// Filament's own `specularDFG()` -- shaders/src/surface_light_indirect.fs
-// google/filament v1.75.0, commit 0e58877c09afb1aacd09ff640f74d2adcd2a7e80,
-// Apache-2.0, :135 cited by matrix-p5t10-ibl-runtime-skybox.md]:
-// `E = f0*dfg.x + dfg.y`, where `dfg` is the pre-integrated BRDF LUT
-// texel at (NoV, roughness) -- T9's own `dfgLut` bake output
-// (shaders/ibl/dfg_lut.slang: R=DFV_Multiscatter(NoV,roughness).x,
-// G=...y). `E` is BOTH the specular lobe's own reflectance scale
-// (`Fr = E * prefilteredRadiance`) AND, via `(1-E)`, the fraction of
-// incident energy specular did NOT reflect that the diffuse lobe is
-// entitled to (`Fd = diffuseColor * diffuseIrradiance * (1-E)`) -- a real
-// coupling between the two lobes, not two independently-added terms; see
-// standard_pbr.slang's own evaluateIBL()-equivalent call site for the
-// exact composition. Distinct from `energyCompensation()` above (which
-// corrects the DIRECT-lit specular response for energy LOST to
-// unaccounted multiple scattering, `1 + f0*(1/dfg.y - 1)`) -- this
-// function is the split-sum single-scattering APPROXIMATION itself, the
-// mechanism IBL needs to turn a prefiltered environment sample into a
-// physically-plausible specular response at all, independent of whether
-// energy compensation is separately applied on top (Filament's own
-// `evaluateIBL()` applies BOTH: `Fr *= pixel.energyCompensation` follows
-// the split-sum `Fr = E * prefilteredRadiance` -- standard_pbr.slang's own
-// call site does the same, reusing the SAME `EnergyComp` feature-
-// permutation point Task 8 already wired for direct lighting).
+// [Phase 5 Task 10, #46, FG1 closure; corrected in the T10 fix round per
+// task-10-review.md Finding 1 (CRITICAL)] Split-sum IBL specular
+// reflectance scale [Karis 2013, "Real Shading in Unreal Engine 4"; ported
+// here as Filament's own `specularDFG()` -- shaders/src/
+// surface_light_indirect.fs, google/filament v1.75.0, commit
+// 0e58877c09afb1aacd09ff640f74d2adcd2a7e80, Apache-2.0, :135]:
+// `E = mix(dfg.x, dfg.y, f0) = (1-f0)*dfg.x + f0*dfg.y`, where `dfg` is the
+// pre-integrated BRDF LUT texel at (NoV, roughness) sampled from T9's own
+// `dfgLut` bake output -- T9's own `dfg_lut.slang` header comment (a
+// byte-for-byte structural port of CubemapIBL::DFV_Multiscatter, which T9
+// bakes UNCONDITIONALLY, never the plain non-multiscatter `DFV()`) already
+// quotes this exact reconstruction verbatim: `"Er() = (1-f0)*DFV.x +
+// f0*DFV.y = mix(DFV.xxx, DFV.yyy, f0)"` (CubemapIBL.cpp:790-833's own
+// comment for `DFV_Multiscatter()`). The PRIOR version of this function
+// (`f0*dfg.x + dfg.y`) was `CubemapIBL.cpp:778`'s reconstruction for the
+// plain, non-multiscatter `DFV()` -- the variant T9 does NOT bake -- a
+// citation/formula mismatch verified against a fresh fetch of the pinned
+// v1.75.0 source and reproduced live (see task-10-report.md "Fix round 1").
+// `E` is BOTH the specular lobe's own reflectance scale (`Fr = E *
+// prefilteredRadiance`) AND, via `(1-E)`, the fraction of incident energy
+// specular did NOT reflect that the diffuse lobe is entitled to (`Fd =
+// diffuseColor * diffuseIrradiance * (1-E)`) -- a real coupling between the
+// two lobes, not two independently-added terms; see standard_pbr.slang's
+// own evaluateIBL()-equivalent call site for the exact composition.
+// Distinct from `energyCompensation()` above (which corrects the
+// DIRECT-lit specular response for energy LOST to unaccounted multiple
+// scattering, `1 + f0*(1/dfg.y - 1)`) -- this function is the split-sum
+// single-scattering APPROXIMATION itself, the mechanism IBL needs to turn a
+// prefiltered environment sample into a physically-plausible specular
+// response at all, independent of whether energy compensation is
+// separately applied on top (Filament's own `evaluateIBL()` applies BOTH:
+// `Fr *= pixel.energyCompensation` follows the split-sum `Fr = E *
+// prefilteredRadiance` -- standard_pbr.slang's own call site does the
+// same, reusing the SAME `EnergyComp` feature-permutation point Task 8
+// already wired for direct lighting).
 public float3 iblSpecularReflectance(float3 f0, float2 dfg) {
-    return f0 * dfg.x + float3(dfg.y, dfg.y, dfg.y);
+    return lerp(float3(dfg.x, dfg.x, dfg.x), float3(dfg.y, dfg.y, dfg.y), f0);
 }
 
 // --- Extension point [Task 21, clearcoat/anisotropy] ---------------------
