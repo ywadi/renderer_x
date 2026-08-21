@@ -586,3 +586,88 @@ clean configure + full build, all targets including
 ### Commit
 
 `aaa51ed` — fix(rx_frame_loop): sync2 vkQueueSubmit2 for PresentLoop's own submission (#41)
+
+## Second CI-arbiter addendum (run 32466037296)
+
+**Status: fix committed (`82a7335`).** aaa51ed's WRITE_AFTER_READ fix
+was confirmed working (those hazards are gone). One hazard class
+persisted: `SYNC-HAZARD-PRESENT-AFTER-WRITE`.
+
+**Correction to the coordinator's own summary, verified directly
+against the fetched run log, not assumed:** the summary described the
+persisting hazard as confined to "the no-RenderGraph test case." The
+actual fetched log (`gh run view 32466037296 --log-failed`) shows the
+opposite — every failing `TEST CASE:` line is explicitly labeled
+`(WITH a RenderGraph)`:
+```
+present_loop_gpu_test.cpp:131 / TEST CASE: PresentLoop::create (WITH a RenderGraph) performs the first compile()+realize() internally...
+present_loop_gpu_test.cpp:336 / TEST CASE: PresentLoop::recreateAndDependents() (WITH a RenderGraph) called twice...
+present_loop_gpu_test.cpp:372 / TEST CASE: PresentLoop: a genuine SDL_SetWindowSize() resize + recreateAndDependents() (WITH a RenderGraph)...
+```
+The no-RenderGraph test (lines 82-127) does not appear in the failure
+list at all — it was and stays clean. This correction did not change
+the investigation's own directed method (compare the clean path against
+the failing one) — it just meant the two paths' roles were reversed
+from how they were first described. Reported here per the standing
+"receiving code review" discipline: verify claims against ground truth
+before acting on them, rather than accepting a paraphrase — this one
+was checkable and the check mattered (acting on the original framing
+would have pointed the "delta" comparison in the wrong direction).
+
+**Root cause**, found via the (correctly reversed) comparison:
+`buildBarriers()`'s `finalBarriers()` construction
+(`src/rx_graph/barriers.cpp:280-290`, pre-existing since Task 2)
+transitions the backbuffer to `PRESENT_SRC_KHR` with
+`dstStage=VK_PIPELINE_STAGE_2_NONE`/`dstAccess=VK_ACCESS_2_NONE` — the
+"nothing in this command buffer reads it again" pre-present pattern.
+`present_loop_gpu_test.cpp`'s own no-RenderGraph fixture's hand-rolled
+equivalent transition instead uses a REAL terminal stage
+(`VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT`) and was clean under the
+identical 1.3.275 layer both before and after `aaa51ed` — that one
+field is the entire delta between the two paths. With `aaa51ed`'s own
+signal-side fix (`VkSemaphoreSubmitInfo::stageMask=ALL_COMMANDS_BIT`),
+the signal has nothing real to chain FROM when the write it's meant to
+cover used `NONE` — SyncVal 1.3.275 flags `vkQueuePresentKHR` as not
+provably ordered-after that write.
+
+**Disposition: real, provable, own-code bug — fixed, not classified as
+an upstream false positive.** Investigation order followed: (1)
+per-frame semaphore pairing checked directly —
+`present_loop.cpp`'s `signalSem` is ONE local variable passed to both
+the submit's `pSignalSemaphoreInfos` and immediately to
+`device_->present(acquire.imageIndex, signalSem)`, no independent
+re-derivation that could diverge — provably correct by construction,
+not merely by inspection. (2) Since a real, comparative, reproducible
+root cause was already found in this codebase's own barrier-emission
+code (not a semaphore-index bug, but an equally real gap), step 2 (the
+upstream-false-positive GitHub-issue check) does not apply — the
+"documented false positive" disposition would have been dishonest here
+given a concrete, fixable, own-code explanation was in hand.
+
+**Fix:** `dstStage` becomes `VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT`
+(sync2's own non-deprecated equivalent of "the end of everything,"
+matching the vocabulary `present_loop.cpp`'s own submission already
+uses for the identical need); `dstAccess` stays `VK_ACCESS_2_NONE`
+(presenting is not itself a memory-access type any `VkAccessFlagBits2`
+enumerant represents — confirmed by the same no-RenderGraph fixture,
+whose own barrier also leaves `dstAccessMask` at its zero-init default
+and is clean; only the stage half is load-bearing). `test_barriers.cpp`'s
+two `finalBarriers()` assertions (default and
+explicit-`backbufferFinalLayout`-override subcases) updated to match.
+Every OTHER `VK_PIPELINE_STAGE_2_NONE` assertion in this codebase's test
+suite is a `srcStage=NONE` first-use barrier — a different, still-correct
+pattern, confirmed by direct grep and left untouched.
+
+**Verification:** full serial lavapipe ctest 31/31; `rx_graph_tests`
+60/60 (379/379 assertions, including the two updated `finalBarriers()`
+cases); `rx_graph_gpu_tests` 19/19 (1228/1228) and
+`rx_material_gpu_tests` 59/59 (2567/2567) clean under the CI-matched
+1.3.275 layer + Mesa 25.2.8 ICD (side-loaded, same setup as `aaa51ed`'s
+own account); real-NVIDIA present run (`sample_09_scene --present
+--validate`) zero unfiltered validation errors, clean exit;
+windows-cross-zig full build clean, `rx_graph_tests`/`rx_frame_loop_tests`
+green under Wine.
+
+### Commit
+
+`82a7335` — fix(rx_graph): backbuffer final transition gets a real dstStage (#41)
