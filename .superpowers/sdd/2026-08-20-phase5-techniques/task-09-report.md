@@ -699,19 +699,24 @@ runtime):
 === SABOTAGED, real NVIDIA GeForce RTX 2080 (580.82.07) ===
 [doctest] test cases:  1 |  0 passed | 1 failed | 6 skipped
 [doctest] assertions: 39 | 30 passed |  9 failed |
-# ALL 9 failures at mip=3 (linearRoughness=0.5625, the highest tested
-# roughness) -- offsets 0/8/16/24/35 deg; the sabotage's own systematic
-# bias (measured ~7-11x this test's own tolerance) is largest exactly
-# where GGX importance sampling spans the widest range of NoL values,
-# matching the "roughness-to-angular-width mapping bug" class this test
-# was built to catch.
+# 4 failures at mip=2 (offsets 0/8/16/24 deg) + 5 at mip=3 (offsets
+# 0/8/16/24/35 deg) -- concentrated at the two HIGHEST tested roughness
+# levels (linearRoughness 0.25 and 0.5625), growing from 4 to 5 failing
+# offsets as roughness increases; the sabotage's own systematic bias
+# (measured 1.8x-3.6x this test's own tolerance, computed directly from
+# the diff/tol values in the reproduction log) is largest exactly where
+# GGX importance sampling spans the widest range of NoL values, matching
+# the "roughness-to-angular-width mapping bug" class this test was built
+# to catch.
 
 === SABOTAGED, lavapipe (llvmpipe, Mesa) ===
 [doctest] test cases:  1 |  0 passed | 1 failed | 6 skipped
 [doctest] assertions: 39 | 30 passed |  9 failed |
-# Same 9 assertions, same mip, values within normal cross-driver
-# variance of the NVIDIA run (both drivers execute the identical
-# deterministic Hammersley-sequence algorithm).
+# Same breakdown, confirmed directly (not assumed from the NVIDIA run):
+# 4 at mip=2, 5 at mip=3, at the SAME 9 offsets, with per-value diffs
+# matching NVIDIA's own to within normal cross-driver floating-point
+# variance (both drivers execute the identical deterministic
+# Hammersley-sequence algorithm).
 ```
 
 Reverted (`weight += noL;`, byte-identical to the pre-sabotage source —
