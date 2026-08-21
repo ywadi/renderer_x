@@ -1,0 +1,3150 @@
+# Review package: c2f9eae..163672d
+
+## Commits
+163672d chore: p5 task 6 SDD report
+44ae638 fix(rx_rhi_vk): stop leaking rx_compute_pipeline_test*.cache into CWD
+2badf74 ci(tools): real byte-source-invariant grep, both CI jobs (RC7e) (#42)
+aa7e3e1 feat(rx_asset): cubemap KTX2 + equirect HDR loading, Environment role (#42)
+db99857 test(assets): cubemap/array/HDR KTX2+Radiance fixtures (#42)
+0d26462 feat(rx_rhi_vk): cube-aware Texture2D + per-face Uploader::ImageMipLevel (#42)
+
+## Files changed
+ .github/workflows/ci.yml                           |  16 ++
+ .../2026-08-20-phase5-techniques/task-06-report.md | 298 +++++++++++++++++++++
+ assets/test/textures/array2d_rejected.ktx2         | Bin 0 -> 396 bytes
+ assets/test/textures/corrupt.hdr                   |   4 +
+ assets/test/textures/cubearray_rejected.ktx2       | Bin 0 -> 828 bytes
+ assets/test/textures/cubemap.ktx2                  | Bin 540 -> 648 bytes
+ assets/test/textures/cubemap_mips.ktx2             | Bin 0 -> 33144 bytes
+ assets/test/textures/equirect_test.hdr             |   5 +
+ assets/test/textures/generate_fixtures.sh          | 116 +++++++-
+ src/rx_asset/include/rx_asset/texture_cache.h      |  58 +++-
+ src/rx_asset/include/rx_asset/texture_decode.h     | 117 +++++++-
+ src/rx_asset/tests/texture_cache_test.cpp          | 267 +++++++++++++++++-
+ src/rx_asset/tests/texture_decode_test.cpp         | 173 +++++++++++-
+ src/rx_asset/texture_cache.cpp                     | 147 ++++++++--
+ src/rx_asset/texture_decode.cpp                    | 240 +++++++++++++++--
+ src/rx_rhi_vk/include/rx_rhi_vk/texture.h          |  45 +++-
+ src/rx_rhi_vk/include/rx_rhi_vk/upload.h           |  11 +
+ src/rx_rhi_vk/src/texture.cpp                      |  72 +++++
+ src/rx_rhi_vk/src/upload.cpp                       |  11 +-
+ src/rx_rhi_vk/tests/compute_pipeline_test.cpp      |  26 +-
+ src/rx_rhi_vk/tests/texture_test.cpp               |  34 +++
+ src/rx_rhi_vk/tests/upload_test.cpp                | 100 +++++++
+ tools/check_byte_source_invariant.sh               |  83 ++++++
+ 23 files changed, 1735 insertions(+), 88 deletions(-)
+
+## Diff
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 4a101da..78af3b5 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -37,20 +37,29 @@ env:
+   RX_ZIG_URL: "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
+   RX_ZIG_SHA256: "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+ 
+ jobs:
+   linux-native:
+     name: linux-native
+     runs-on: ubuntu-latest
+     steps:
+       - uses: actions/checkout@v7
+ 
++      # [Phase 5 Task 6, ticket #42, gate rulings-2026-08-20.md RC7e] The
++      # byte-source-abstraction invariant's "grep-enforced" wording becomes
++      # TRUE here -- source-only, no build/dependency-cache steps needed
++      # first, so this runs as early as possible for the fastest possible
++      # fail signal. Mirrored verbatim in the windows-cross-zig job below
++      # (the invariant is about source text, not the target platform).
++      - name: Byte-source abstraction invariant check
++        run: tools/check_byte_source_invariant.sh
++
+       # mesa-vulkan-drivers provides lavapipe (llvmpipe's Vulkan ICD, lvp_icd.json)
+       # -- the only Vulkan device this runner has, since it has no real GPU.
+       # vulkan-tools gives vulkaninfo for diagnostics if a run ever needs it.
+       # libvulkan-dev provides the Vulkan loader (libvulkan.so.1) that volk
+       # dlopens at runtime. xvfb provides the X server SDL3 needs even though
+       # every window this codebase creates is hidden (visible=false) --
+       # SDL3 still requires *some* video driver backend to initialize.
+       #
+       # libx11-dev/libxext-dev/libxrandr-dev/libxcursor-dev/libxi-dev/
+       # libxfixes-dev/libxss-dev/libxtst-dev/libxkbcommon-dev: discovered
+@@ -419,20 +428,27 @@ jobs:
+     # (which pulls in a wine32/i386-multiarch dependency this project never
+     # otherwise needs). Note this alone did NOT fix the Vulkan-surface
+     # failure below (verified: the same failure reproduced identically with
+     # WINEARCH pinned) -- it's kept as separately-correct hygiene for a
+     # 64-bit-only target, not as that fix.
+     env:
+       WINEARCH: win64
+     steps:
+       - uses: actions/checkout@v7
+ 
++      # [Phase 5 Task 6, ticket #42, gate rulings-2026-08-20.md RC7e] Same
++      # check, same rationale as the linux-native job's identically-worded
++      # step above -- the invariant is about source text, not the target
++      # platform, so both jobs run it identically.
++      - name: Byte-source abstraction invariant check
++        run: tools/check_byte_source_invariant.sh
++
+       # wine runs the cross-compiled Windows test binaries transparently
+       # (cmake/toolchains/windows-cross-zig.cmake sets it as
+       # CMAKE_CROSSCOMPILING_EMULATOR when found). xvfb: same reason as the
+       # linux-native job -- SDL3 needs a video driver backend even for
+       # hidden windows, and Wine's own window creation additionally wants a
+       # real X server underneath it.
+       #
+       # mesa-vulkan-drivers/vulkan-tools/libvulkan-dev: discovered missing
+       # on this workflow's first real run of this job. rx_platform's
+       # Window::create() (src/rx_platform/src/window.cpp) unconditionally
+diff --git a/.superpowers/sdd/2026-08-20-phase5-techniques/task-06-report.md b/.superpowers/sdd/2026-08-20-phase5-techniques/task-06-report.md
+new file mode 100644
+index 0000000..2fdb2f5
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-20-phase5-techniques/task-06-report.md
+@@ -0,0 +1,298 @@
++# Task 6 report — Cubemap/array KTX2 loading + HDR image input (issue #42)
++
++Implementer round. Base: main `c2f9eae` (post T5). Order of authority
++followed: rulings (`rulings-2026-08-20.md`, "T6 (#42)" + RC7e) > plan
++(`2026-08-20-phase5-techniques.md`, "Task 6", Stage 0) > gate matrix
++(`matrix-p5t06-ktx2-cubemap-hdr.md`) > ticket (#42). Last Stage 0 task.
++
++## Status: COMPLETE
++
++Cubemap KTX2 now decodes/uploads for real (flat-array and cube-array
++stay explicitly rejected, each with its own regression fixture+test);
++equirect Radiance `.hdr` loads as float and uploads as
++`VK_FORMAT_R16G16B16A16_SFLOAT`; `TextureRole::Environment` lands with
++its own real mid-gray D11 fallback; the byte-source invariant's
++"grep-enforced" wording is now literally true (`tools/
++check_byte_source_invariant.sh`, wired into both CI jobs). T2's stray
++`rx_compute_pipeline_test*.cache` leak is fixed in the same round, as
++directed. Full suite green on linux-native (real NVIDIA AND lavapipe,
++both driver-labeled) and windows-cross-zig (build clean; Wine ctest
++green except one pre-existing, diff-unrelated `rx_core_tests` timeout —
++see Concerns).
++
++## Ruling followed (T6, #42, `rulings-2026-08-20.md:106-109`)
++
++> T6 (#42): cubemap-only (arrays/cube-arrays stay explicitly rejected
++> with regression tests); environment upload format
++> R16G16B16A16_SFLOAT; environment-role D11 fallback = uniform
++> mid-gray; byte-source grep becomes a real CI check (RC7e).
++
++Followed exactly — see per-row proof below.
++
++## What shipped
++
++**`isUnsupportedLayoutFor()` narrowed** (`src/rx_asset/texture_decode.cpp`)
++from Phase 4's blanket `isArray || isCubemap || numFaces>1 || numLayers>1
++|| numDimensions!=2` to `numDimensions != 2 || (isArray && !isCubemap) ||
++(isCubemap && numLayers > 1)` — a plain single-layer cubemap is now
++supported; flat 2D-arrays and cube-arrays stay explicitly rejected by
++their own independent clauses.
++
++**`DecodedKtx2Texture` gains `isCube()`/`numFaces()`/a face-parametrized
++`levels(uint32_t face = 0)`** (default preserves every pre-existing call
++site byte-for-byte). `ktxTexture_GetImageOffset()`'s previously-unused
++`faceSlice` parameter now threads the real face index through.
++`decodeKtx2ForUpload()` gathers all 6 faces' mip chains into
++`TextureDecodeResult::levels` (new `isCube`/`DecodedTextureLevel::
++faceIndex` fields, both defaulting to false/0 for every non-cube
++producer).
++
++**`TextureRole::Environment`** appended last (index-stable — every
++pre-existing `byRole`/`roleFallback_` index is unchanged; both arrays
++grow 6→7). `roleFormatTable()`'s new case is documented dead code for
++this task's actual HDR path (reused `kUnormData`, linear/non-sRGB) —
++kept only so the exhaustive switch stays total against a conceivable
++future Basis-encoded environment cubemap.
++
++**Radiance `.hdr` float decode path** (`decodeStbImageHdr()`,
++`stbi_loadf_from_memory`) — `decodeTextureForUpload()` now checks
++`stbi_is_hdr_from_memory()` **before** the 8-bit stb branch. This closes
++a real, previously-silent bug the matrix's own research surfaced: an
++`.hdr` file handed to the OLD `decodeStbImage()` path decoded
++*successfully* through stb's own internal `stbi__hdr_to_ldr()` tonemap,
++silently clamping every super-unity texel to 8-bit LDR with zero
++warning. HDR content uploads as `VK_FORMAT_R16G16B16A16_SFLOAT`
++(`glm::packHalf4x16` — GLM's own reference half-float packer, already
++used process-wide for this exact format by `rx_graph/scene_color.h`'s
++readback tests; no hand-rolled float-to-half bit-twiddling written).
++
++**`Texture2D::createCubeForPresuppliedMips()`** (`src/rx_rhi_vk/`) — a
++real 6-layer, `VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT` image with a
++`VK_IMAGE_VIEW_TYPE_CUBE` view, mirroring this project's own
++`StorageImage::create()` cube-flag/view-type precedent for the
++sampled-image case (not reinvented). `Uploader::ImageMipLevel` gains
++`baseArrayLayer` (default 0, byte-identical for every existing caller),
++threaded into both the single-copy and chunked-row `VkBufferImageCopy`
++regions.
++
++**`TextureCache::registerRealTexture()`** branches on `isCube` to call
++the new cube factory, and now requests `VK_IMAGE_USAGE_TRANSFER_SRC_BIT`
++in addition to `SAMPLED_BIT` for every real texture it builds (see
++Design decisions below). `TextureRole::Environment`'s own D11 fallback
++(`uploadEnvironmentFallback()`) is a real, uniform mid-gray
++`R16G16B16A16_SFLOAT` texture built through the SAME float-packing path
++real HDR content uses — never a black texture, never an 8-bit-cast
++shortcut (Open Question 3's own recommendation, followed exactly).
++
++**Fixtures** (`assets/test/textures/`, `generate_fixtures.sh`, all
++regenerated with the pinned `toktx` v4.4.2 release binary + system
++ImageMagick): `cubemap.ktx2` regenerated with `--target_type RGBA
++--assign_oetf srgb` (a real uploadable format now — the SAME file the
++old rejection test used, now the discrimination-flip fixture);
++`cubemap_mips.ktx2` (32×32 base, 6-level per-face mip chain, the primary
++value-asserted GPU fixture); `array2d_rejected.ktx2`/
++`cubearray_rejected.ktx2` (still-rejected regression fixtures);
++`equirect_test.hdr`/`corrupt.hdr` (hand-authored Radiance RGBE — this
++sandbox's ImageMagick is Q16 without HDRI and cannot express genuine
++super-unity pixels, so the bytes are computed by hand against
++`stb_image.h`'s own RGBE decode formula, documented inline).
++
++**`tools/check_byte_source_invariant.sh`** (RC7e) — the real grep: zero
++`fopen(`/`std::ifstream`/`std::ofstream` and zero `std::filesystem::`
++members other than `path` in `texture_decode.cpp`/`texture_cache.cpp`.
++Wired into both CI jobs immediately after checkout.
++
++**Bundled fix**: `ComputePipelineCache::create()`'s three test call
++sites (`compute_pipeline_test.cpp`) now write to
++`std::filesystem::temp_directory_path()` instead of a bare relative
++filename — closes the `rx_compute_pipeline_test*.cache`-into-CWD leak
++directed by the coordinator's dispatch note.
++
++## Matrix row disposition (selected — full matrix in `gate/
++matrix-p5t06-ktx2-cubemap-hdr.md`)
++
++| Row | Item | Disposition | Delivered |
++|---|---|---|---|
++| 1/2 | Cube rejection baseline + discrimination flip | consume-now / flip required | `isUnsupportedLayoutFor()` narrowed; `cubemap.ktx2`'s two old rejection tests DELETED, replaced by flip tests (device-free + GPU) asserting `handle != checkerboardHandle()` + exact per-face bytes |
++| 3 | Scope: cubemap-only | needs-coordinator-decision → **ruled** cubemap-only | Narrowed predicate implements exactly the ruled formula; array2d/cubearray fixtures+tests prove the two excluded shapes stay rejected |
++| 4 | Non-cube regression byte-identical | consume-now | Full pre-existing `rx_asset_tests`/`rx_asset_gltf_tests` suites re-run unmodified (minus the two deliberately-flipped cases) and pass; `TextureRole::Environment` appended at the end, verified index-stable |
++| 5 | `cube_basisu_misleading_normal.ktx2` disambiguation | N/A | Untouched — confirmed unrelated lineage (Phase 4 Task 14), no action taken |
++| 6 | New mip'd cubemap fixture | consume-now | `cubemap_mips.ktx2`, 32×32→1×1, 6 levels, `--genmipmap` |
++| 7 | `Texture2D`/`Uploader` array-layer plumbing | consume-now, promoted from conditional to required | `createCubeForPresuppliedMips()` + `ImageMipLevel::baseArrayLayer` |
++| 8 | `TextureRole::Environment` blast radius | consume-now | Appended last; `byRole`/`roleFallback_` grow 6→7; import_gltf.cpp's 5 material-slot call sites untouched (glTF has no environment slot) |
++| 9 | Equirect HDR decode path | consume-now, closes a live silent-tonemap bug | `decodeStbImageHdr()` + dispatch-order fix |
++| 10 | HDR is flat 2D, not cube | consume-now | Loads through the existing single-layer 2D path unmodified; zero cube-plumbing collision |
++| 11 | GPU test asserts exact per-face/per-mip values | consume-now | `cubemap_mips.ktx2` GPU test: every face × {mip 0, mip 5} exact byte match, both drivers |
++| 12 | Chunked-staging × per-face interaction | consume-now | `upload_test.cpp`'s new cube-chunked test forces the ring small enough to require chunking per face, asserts no cross-face corruption |
++| 13 | HDR value-readback (>1.0 survives) | consume-now | Device-free (`decodeStbImageHdr`/`decodeTextureForUpload`) AND GPU (real upload+readback) tests both assert `4.0F` exactly |
++| 14 | Byte-source invariant "grep-enforced" | needs-coordinator-ruling → **ruled**: add the real grep | `tools/check_byte_source_invariant.sh`, revert-proven, wired into both CI jobs |
++
++Open Questions 1-5 (matrix) all resolved per their own stated
++recommendation, matching the ruling: cubemap-only (1), `R16G16B16A16_
++SFLOAT` (2), mid-gray fallback via the real float path (3),
++`cubemap_mips.ktx2` naming/generation via the existing script (4), a
++real CI grep script (5).
++
++## Design decisions beyond the ticket's literal text
++
++**`registerRealTexture()` now requests `VK_IMAGE_USAGE_TRANSFER_SRC_BIT`
++for every real texture, not just cubes.** Neither `Texture2D::
++createForPresuppliedMips()` nor `createCubeForPresuppliedMips()` had
++their own documented usage contract changed (`usage | TRANSFER_DST_BIT`
++stays their only unconditional addition) — this is `registerRealTexture
++()`'s own caller-supplied `usage` argument gaining a bit, which was
++always an open, additive parameter. Needed because a TextureCache-
++resident image is sampled-only by design; the matrix's own row 11 names
++"direct face-indexed readback" (a raw `vkCmdCopyImageToBuffer`) as the
++GPU test technique for per-face cube values and row 13's HDR
++`>1.0`-survives bar needs the identical mechanism — neither is possible
++against a `SAMPLED_BIT`-only image. Cost is zero on any conformant
++Vulkan implementation (`TRANSFER_SRC_BIT` is mandatory format-feature
++support for every optimal-tiling sampled format this engine uses); a new
++`rawImageForTesting()` diagnostic accessor exposes the raw `VkImage`
++(matching this class's existing `*ForTesting()` convention) so the
++readback tests never need bindless/shader machinery to prove a value.
++One pre-existing test's bindless-capacity fixture (`rx_asset_tc_
++capexhaust`) needed its `sampledImages` capacity bumped 4→5 to match the
++new Environment fallback's own slot consumption at `TextureCache::
++create()` time — a real, expected, mechanically-derived adjustment, not
++a design compromise.
++
++## Verification
++
++Device-free (`rx_asset_gltf_tests`, home of `texture_decode_test.cpp`):
++```
++[doctest] test cases:  60 |  60 passed | 0 failed | 0 skipped
++[doctest] assertions: 806 | 806 passed | 0 failed |
++```
++
++GPU, **real NVIDIA** (RTX 2080, driver 580.82.07, `VK_ICD_FILENAMES=
++nvidia_icd.json`, driver-labeled):
++```
++$ rx_asset_tests    -> 44/44 cases, 25314/25314 assertions, 0 failed, 0 unfiltered validation errors
++$ rx_rhi_vk_tests   -> 97/97 cases,  2398/2398 assertions, 0 failed, 0 unfiltered validation errors
++```
++
++GPU, **lavapipe** (pixel-reference driver, `VK_ICD_FILENAMES=
++lvp_icd.json`, driver-labeled):
++```
++$ rx_asset_tests    -> 44/44 cases, 25314/25314 assertions, 0 failed
++$ rx_rhi_vk_tests   -> 97/97 cases,  2387/2387 assertions, 0 failed
++```
++(Assertion-count delta between drivers is pre-existing conditional
++coverage, e.g. `samplerAnisotropy` support branching — not new this
++round; both runs are 100% pass.)
++
++Full project suite, linux-native, default device selection:
++```
++$ ctest --preset linux-native --output-on-failure
++100% tests passed, 0 tests failed out of 31
++Total Test time (real) = 198.89 sec
++```
++
++`tools/check_byte_source_invariant.sh` revert-proven: injected
++`fopen(`/`std::ifstream`/`std::filesystem::exists` into
++`texture_decode.cpp`, script failed loudly naming the exact line;
++reverted, script passes clean.
++
++windows-cross-zig: clean configure + full build (74/74 targets, zero
++errors/warnings). Wine ctest (CI's own GPU-exclusion pattern):
++```
++13/14 tests passed (rx_core_tests: Timeout)
++```
++`rx_asset_tests` (home of every new cube/HDR GPU test) and
++`rx_asset_gltf_gpu_tests` both PASS under Wine — the actual surface this
++task touches is proven there too, not just build-clean.
++
++Zero compiler warnings on a forced rebuild of every touched `.cpp`
++(`-v` ninja output grepped for `warning`/`error`: no hits).
++
++## Revert-discrimination
++
++**`isUnsupportedLayoutFor()`'s narrowed predicate** — the two OLD
++Phase-4 cube-rejection tests were deleted, not left alongside new
++passing ones; their replacements assert the literal flip (`isUnsupported
++Layout()` false where it used to be true), which is itself the
++discrimination proof the matrix's row 2 requires — a no-op
++implementation could not make these new tests pass.
++
++**`ImageMipLevel::baseArrayLayer` threading** — `upload_test.cpp`'s new
++cube-chunked test uses two per-face buffers that are bitwise-NOT of each
++other (maximally distinguishable at every byte), forced through the
++SAME small-ring chunking path the pre-existing plain-2D chunked test
++uses; a face-swap or a misplaced chunk both fail its `memcmp`.
++
++**`tools/check_byte_source_invariant.sh`** — proven both directions live
++this round (see Verification): fails loudly on injected violations,
++passes clean on the real, unmodified files.
++
++## Self-review
++
++- **TDD discipline**: fixtures generated and `ktx2check`/`ktxinfo`-
++  verified (`isCubemap`/`isArray`/`numLayers`/`numFaces`/`vkFormat`
++  fields confirmed matching the intended container shape) before any
++  production code changed; the HDR corrupt-fixture design itself went
++  through one real TDD cycle (the first truncated-scanline design
++  "passed" decode instead of failing, root-caused via the vendored
++  `stb_image.h` source directly, then fixed to a genuinely-corrupt
++  resolution line — documented inline, not silently patched over).
++- **No deferred fixes**: every matrix row closes in this round; the
++  live-bindless-capacity-off-by-one this task's own Environment fallback
++  addition caused in a pre-existing test was found (real-driver run)
++  and fixed in-round, not deferred.
++- **Value-asserted GPU tests**: every new GPU test asserts real decoded
++  bytes/floats (per-face RGBA8 colors, half-float texel values via
++  `glm::unpackHalf4x16`), never "it loaded without crashing."
++- **Real-GPU verification**: both binaries this task touches run clean
++  on real NVIDIA hardware, driver-labeled, not lavapipe-only.
++- **No AI attribution**: verified directly against all 5 commits this
++  round (`git log` + grep for claude/anthropic/co-authored/generated-by/
++  ai-assistant) — none found; author identity is the user's own
++  configured git identity throughout.
++- **Commit scope**: 5 pathspec-scoped commits (rx_rhi_vk primitives,
++  fixtures, rx_asset decode/cache layer, CI grep, the bundled T2
++  cache-leak fix) — see SHAs below.
++  `.superpowers/sdd/2026-08-20-phase5-techniques/progress.md` carries
++  the coordinator's own concurrent edits throughout this round
++  (confirmed via `git status`/`git diff --stat` before every commit) and
++  is deliberately excluded from all of them.
++- **Scope discipline**: no push performed; no board/plan/spec/ledger
++  file edited; the `TRANSFER_SRC_BIT` widening (see Design decisions) is
++  the one choice beyond the ticket's literal text — flagged explicitly
++  above rather than silently folded in.
++
++## Concerns for the coordinator
++
++1. **Wine `rx_core_tests` timeout, windows-cross-zig** — reproducible
++   (2/2 runs, identical hang point: right after the log-forward-
++   callback-throws test sequence, before the suite's own teardown).
++   `rx_core` is untouched by this diff (`git diff --stat -- src/rx_core/`
++   is empty) and the target that DOES matter for this task
++   (`rx_asset_tests`, which carries every new cube/HDR test) passes
++   clean under Wine both times. This matches the same category of
++   Wine-teardown flake T5's own ledger entry already documented for a
++   *different* binary (`rx_platform_tests`, "Subprocess killed... after
++   passing 34/365") — recommend treating as the same watch-item class
++   rather than a new incident, but flagging since it is a second,
++   independent occurrence against a third binary.
++2. **`TRANSFER_SRC_BIT` widening** (see Design decisions above) is a
++   real, if small, capability change to every TextureCache-resident
++   texture — reviewed here as clearly in-scope and low-cost, but it is
++   the one place this round's implementation reached slightly past the
++   ticket's literal "loading" framing into a production RHI usage-flag
++   change; flagging explicitly for the review round.
++3. **libktx v5 tool-suite removal** (matrix's own "New gaps," unrelated
++   to this task's scope) — `generate_fixtures.sh` still targets `toktx`
++   (v4.4.2, the current pin); a future pin-refresh task will need to
++   migrate its invocations to `ktx create`'s different flag surface.
++   Not touched this round (out of scope), reproduced here only because
++   this task fetched v4.4.2 `toktx` fresh from the pinned release URL
++   and confirmed it still works exactly as documented.
++
++## Commit SHAs (base `c2f9eae`, all local, none pushed)
++
++1. `0d26462` — feat(rx_rhi_vk): cube-aware Texture2D + per-face Uploader::ImageMipLevel (#42)
++2. `db99857` — test(assets): cubemap/array/HDR KTX2+Radiance fixtures (#42)
++3. `aa7e3e1` — feat(rx_asset): cubemap KTX2 + equirect HDR loading, Environment role (#42)
++4. `2badf74` — ci(tools): real byte-source-invariant grep, both CI jobs (RC7e) (#42)
++5. `44ae638` — fix(rx_rhi_vk): stop leaking rx_compute_pipeline_test*.cache into CWD
+diff --git a/assets/test/textures/array2d_rejected.ktx2 b/assets/test/textures/array2d_rejected.ktx2
+new file mode 100644
+index 0000000..dbacc53
+Binary files /dev/null and b/assets/test/textures/array2d_rejected.ktx2 differ
+diff --git a/assets/test/textures/corrupt.hdr b/assets/test/textures/corrupt.hdr
+new file mode 100644
+index 0000000..fa131b5
+--- /dev/null
++++ b/assets/test/textures/corrupt.hdr
+@@ -0,0 +1,4 @@
++#?RADIANCE
++FORMAT=32-bit_rle_rgbe
++
++GARBAGE-NOT-A-VALID-RESOLUTION-LINE
+diff --git a/assets/test/textures/cubearray_rejected.ktx2 b/assets/test/textures/cubearray_rejected.ktx2
+new file mode 100644
+index 0000000..077b8b8
+Binary files /dev/null and b/assets/test/textures/cubearray_rejected.ktx2 differ
+diff --git a/assets/test/textures/cubemap.ktx2 b/assets/test/textures/cubemap.ktx2
+index ed163a1..cb37d14 100644
+Binary files a/assets/test/textures/cubemap.ktx2 and b/assets/test/textures/cubemap.ktx2 differ
+diff --git a/assets/test/textures/cubemap_mips.ktx2 b/assets/test/textures/cubemap_mips.ktx2
+new file mode 100644
+index 0000000..193cc35
+Binary files /dev/null and b/assets/test/textures/cubemap_mips.ktx2 differ
+diff --git a/assets/test/textures/equirect_test.hdr b/assets/test/textures/equirect_test.hdr
+new file mode 100644
+index 0000000..6036e50
+--- /dev/null
++++ b/assets/test/textures/equirect_test.hdr
+@@ -0,0 +1,5 @@
++#?RADIANCE
++FORMAT=32-bit_rle_rgbe
++
++-Y 2 +X 2
++����������
+\ No newline at end of file
+diff --git a/assets/test/textures/generate_fixtures.sh b/assets/test/textures/generate_fixtures.sh
+index d979b0d..e0d460e 100755
+--- a/assets/test/textures/generate_fixtures.sh
++++ b/assets/test/textures/generate_fixtures.sh
+@@ -75,29 +75,44 @@ convert -size 8x8 xc:"#8080FF" normal_flat.png
+ # the quadrant pattern) the fixture the deep-mip-readback / sub-block-
+ # mip-tail GPU test asserts an EXACT expected color against at every
+ # level down to the 1x1 tail.
+ convert -size 8x8 xc:"#FF8000" flat_orange.png
+ 
+ # 6x5 (non-multiple-of-4 in BOTH dimensions) solid pattern -- exercises
+ # block-rounding at the BASE level, not just a generated mip tail.
+ convert -size 6x5 xc:"#FF00FF" nonmult4.png
+ 
+ # 6 cubemap faces (+X -X +Y -Y +Z -Z), each a distinct flat color so a
+-# (deliberately never-attempted, per D10/matrix scope) face-order bug
+-# would be visually obvious if anything ever DID consume this layout.
++# face-order bug is visually obvious. [Phase 5 Task 6, gate matrix-
++# p5t06-ktx2-cubemap-hdr row 6/Open Question 1] Cubemap KTX2 is now a
++# SUPPORTED, real, value-asserted-uploaded layout (narrowed
++# isUnsupportedLayoutFor() -- cube-array/flat-array/1D/3D stay rejected,
++# see the array2d_rejected.ktx2/cubearray_rejected.ktx2 fixtures below),
++# so these faces are consumed by REAL GPU readback tests now, not merely
++# a rejection stand-in.
+ convert -size 4x4 xc:"#FF0000" face_px.png
+ convert -size 4x4 xc:"#00FFFF" face_nx.png
+ convert -size 4x4 xc:"#00FF00" face_py.png
+ convert -size 4x4 xc:"#FF00FF" face_ny.png
+ convert -size 4x4 xc:"#0000FF" face_pz.png
+ convert -size 4x4 xc:"#FFFF00" face_nz.png
+ 
++# 32x32 nearest-neighbor upscale of the same 6 faces -- same technique as
++# quadrant16x16.png's own comment above: gives cubemap_mips.ktx2 (below) a
++# real per-face mip chain (32 -> 16 -> 8 -> 4 -> 2 -> 1, 6 levels) while
++# every level still decodes to the SAME flat per-face color a readback
++# test can assert exactly (a flat color box-filters to itself at every
++# level, same reasoning as flat_orange.png's own mip fixture).
++for face in px nx py ny pz nz; do
++  convert "face_${face}.png" -filter point -resize 32x32 "face_${face}_32.png"
++done
++
+ # stb (PNG/JPG) fallback-path fixtures -- the SAME quadrant pattern,
+ # scaled up slightly (8x8) so JPEG's own lossy block DCT has enough
+ # spatial extent per flat region to stay recognizably close to its
+ # source color (a raw 4x4 JPEG re-quantizes visibly at block boundaries).
+ convert quadrant4x4.png -filter point -resize 8x8 quadrant8x8.png
+ cp quadrant8x8.png "${OUT_DIR}/quadrant.png"
+ convert quadrant8x8.png -quality 95 "${OUT_DIR}/quadrant.jpg"
+ 
+ # [Texture-path round, item B -- the 16MB staging-cap fix] 4096x4096
+ # nearest-neighbor upscale of the SAME quadrant pattern: mip 0 alone is
+@@ -168,24 +183,55 @@ printf '\x89PNG\r\n\x1a\nGARBAGE-NOT-A-REAL-PNG-STREAM' > "${OUT_DIR}/corrupt.pn
+ # with TextureRole::GenericData in texture_cache_test.cpp specifically so
+ # NO sRGB<->linear decode happens on sample (role-authoritative BC7_UNORM,
+ # D10) -- letting that test assert BYTE-LEVEL-exact (well, BC7-solid-
+ # color-exact) readback values instead of reasoning about a gamma curve.
+ "${TOKTX}" --t2 --encode uastc --genmipmap --assign_oetf linear "${OUT_DIR}/flat_withmips_uastc.ktx2" flat_orange.png
+ 
+ # Mips-ABSENT (no --genmipmap/--mipmap at all) -- the "importer warns,
+ # recommends --genmipmap" acceptance row.
+ "${TOKTX}" --t2 --encode uastc --assign_oetf srgb "${OUT_DIR}/mips_absent.ktx2" quadrant4x4.png
+ 
+-# Cubemap -- unsupported layout in Phase 4 (D10 scope; FG1's future
+-# consumer) -- raw (non-Basis) storage is sufficient since this container
+-# is never transcoded, only classified-and-rejected.
+-"${TOKTX}" --t2 --cubemap "${OUT_DIR}/cubemap.ktx2" face_px.png face_nx.png face_py.png face_ny.png face_pz.png face_nz.png
++# Cubemap -- SUPPORTED layout as of Phase 5 Task 6 (gate matrix-p5t06-
++# ktx2-cubemap-hdr row 2/6, the discrimination-proof fixture: the SAME
++# file the old "cube -> checkerboard" test asserted against now loads for
++# real). --target_type RGBA forces a real 4-component format (same reason
++# as raw_rgba8.ktx2's own comment below: the source PNGs carry no alpha
++# channel, and toktx's default component-count inference would otherwise
++# produce a 3-component VK_FORMAT_R8G8B8_SRGB, unreliable for
++# SAMPLED_IMAGE on some devices) and --assign_oetf srgb makes the
++# container's own colorspace label explicit rather than inferred. Raw
++# (non-Basis) storage: never transcoded, uploaded verbatim.
++"${TOKTX}" --t2 --cubemap --target_type RGBA --assign_oetf srgb "${OUT_DIR}/cubemap.ktx2" face_px.png face_nx.png face_py.png face_ny.png face_pz.png face_nz.png
++
++# Cubemap WITH a full per-face mip chain (32x32 base -> 1x1, 6 levels) --
++# the primary cube GPU readback fixture (gate matrix row 6/11): every face
++# keeps its own flat authored color at every mip level (box-filtering a
++# flat color reproduces itself, same reasoning as flat_withmips_uastc.ktx2
++# below), so a readback test can assert EXACT per-face-per-mip values.
++"${TOKTX}" --t2 --cubemap --genmipmap --target_type RGBA --assign_oetf srgb "${OUT_DIR}/cubemap_mips.ktx2" face_px_32.png face_nx_32.png face_py_32.png face_ny_32.png face_pz_32.png face_nz_32.png
++
++# Flat 2D ARRAY (isArray=true, isCubemap=false, numLayers=3) -- STILL
++# REJECTED after Task 6's narrowed isUnsupportedLayoutFor() predicate
++# (`numDimensions != 2 || (isArray && !isCubemap) || (isCubemap &&
++# numLayers > 1)`) -- cubemap-only support, zero charter consumer needs a
++# general texture array (gate matrix row 3/Open Question 1). Same 4x4
++# content repeated 3x -- layer content is irrelevant to a rejection-only
++# regression fixture.
++"${TOKTX}" --t2 --layers 3 "${OUT_DIR}/array2d_rejected.ktx2" quadrant4x4.png quadrant4x4.png quadrant4x4.png
++
++# CUBE-ARRAY (isCubemap=true, isArray=true, numLayers=2) -- STILL REJECTED
++# by the same narrowed predicate as array2d_rejected.ktx2 above (the
++# `isCubemap && numLayers > 1` clause) -- cube-array is explicitly out of
++# scope alongside the flat-array case. 12 face images (2 layers x 6
++# faces); the same 6 face_*.png files reused for both layers -- content is
++# irrelevant to a rejection-only regression fixture.
++"${TOKTX}" --t2 --cubemap --layers 2 "${OUT_DIR}/cubearray_rejected.ktx2" face_px.png face_nx.png face_py.png face_ny.png face_pz.png face_nz.png face_px.png face_nx.png face_py.png face_ny.png face_pz.png face_nz.png
+ 
+ # Non-multiple-of-4 base dimensions (6x5) -- block-compressed (UASTC),
+ # proving base-level (not just mip-tail) sub-block rounding.
+ "${TOKTX}" --t2 --encode uastc --assign_oetf srgb "${OUT_DIR}/nonmult4.ktx2" nonmult4.png
+ 
+ # sRGB-MISLABELED NORMAL [D10/gate ruling #3, Godot #99589 class]: the
+ # CONTENT is linear normal-map data (normal_flat.png, see its own
+ # generation comment above) but the container's own DFD transfer function
+ # is force-assigned sRGB anyway -- role (Normal, linear) must win over
+ # this container claim, with exactly one WARN naming the disagreement.
+@@ -212,12 +258,68 @@ printf '\x89PNG\r\n\x1a\nGARBAGE-NOT-A-REAL-PNG-STREAM' > "${OUT_DIR}/corrupt.pn
+ # (no relabel)" behavior -- deliberately DIFFERENT from the Basis path's
+ # own free relabel (see texture_cache.cpp's own comment on why
+ # relabeling is scoped to the Basis-transcoded path only).
+ "${TOKTX}" --t2 --target_type RGBA --assign_oetf srgb "${OUT_DIR}/raw_srgb_mislabeled_normal.ktx2" normal_flat.png
+ 
+ # Deliberately corrupt KTX2 -- valid 12-byte KTX2 identifier (so
+ # looksLikeKtx2() routes it to the libktx path) followed by garbage, for
+ # the "corrupted container -> named parse error, no crash" acceptance row.
+ printf '\xABKTX\x20\x32\x30\xBB\x0D\x0A\x1A\x0AGARBAGE-NOT-A-REAL-KTX2-PAYLOAD' > "${OUT_DIR}/corrupt.ktx2"
+ 
++# ---------------------------------------------------------------------
++# Radiance HDR fixtures [Phase 5 Task 6, gate matrix-p5t06-ktx2-cubemap-hdr
++# row 9/13] -- hand-authored via plain `printf`, not ImageMagick: this
++# sandbox's ImageMagick build is Q16 WITHOUT HDRI (`convert -version`
++# reports no "HDRI" token), which clamps every pixel value it can express
++# to the normalized [0,1] range -- structurally incapable of producing a
++# genuine super-unity (>1.0) texel, exactly the bar this fixture exists to
++# prove survives the load/upload/readback pipeline. The Radiance/RGBE
++# format itself is simple enough to hand-author correctly and
++# deterministically (D17 regeneration-script discipline: every byte below
++# is derived, not copied from an external binary) -- old-style
++# (non-run-length-encoded) scanlines are the CORRECT choice for a width
++# this small (4 < 8): the Radiance spec's own RLE scanline format is
++# never used below 8 pixels wide, and stb_image.h's own HDR reader
++# (stbi__hdr_load) falls back to reading flat per-pixel RGBE quads
++# whenever a scanline's first 4 bytes don't match the RLE marker
++# (0x02 0x02 <hi> <lo>) -- exactly what this block writes.
++#
++# RGBE encoding [Radiance format, matching stb_image.h's own decode:
++# stbi__hdr_convert(): value = mantissa_byte * ldexp(1, exponent_byte -
++# 136)]: every pixel below shares exponent byte 131 (2^(131-136) =
++# 2^-5 = 0.03125), so mantissa_byte * 0.03125 gives each channel's exact
++# decoded float value:
++#   TL = (128,  16,  16, 131) -> (4.0, 0.5, 0.5)  -- R clearly > 1.0
++#   TR = ( 16, 128,  16, 131) -> (0.5, 4.0, 0.5)  -- G clearly > 1.0
++#   BL = ( 16,  16, 128, 131) -> (0.5, 0.5, 4.0)  -- B clearly > 1.0
++#   BR = (128, 128, 128, 130) -> (2.0, 2.0, 2.0)  -- uniform bright gray
++#     (BR uses exponent 130: ldexp(1, 130-136) = 2^-6 = 0.015625;
++#     128 * 0.015625 = 2.0)
++# "-Y 2 +X 2" -- 2 rows (top-to-bottom), 2 columns (left-to-right) per
++# row: row 0 is TL,TR; row 1 is BL,BR -- matching this fixture's own
++# per-quadrant-color convention used throughout this script (e.g.
++# quadrant4x4.png).
++{
++  printf '#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 2 +X 2\n'
++  printf '\x80\x10\x10\x83'   # TL: (4.0, 0.5, 0.5)
++  printf '\x10\x80\x10\x83'   # TR: (0.5, 4.0, 0.5)
++  printf '\x10\x10\x80\x83'   # BL: (0.5, 0.5, 4.0)
++  printf '\x80\x80\x80\x82'   # BR: (2.0, 2.0, 2.0)
++} > "${OUT_DIR}/equirect_test.hdr"
++
++# Deliberately corrupt HDR -- a syntactically valid Radiance SIGNATURE
++# (stbi_is_hdr_from_memory() reads true -- verified directly against the
++# vendored stb_image.h: stbi__hdr_test()/stbi__hdr_test_core() checks
++# ONLY the leading 11-byte "#?RADIANCE\n" magic, never the FORMAT/
++# resolution lines) with a GARBLED resolution line instead of a real
++# "-Y <h> +X <w>" one -- this is the deliberate choice, not a truncated
++# scanline: stb's own flat (non-RLE, width<8) pixel loop reads through
++# stbi__getn(), which silently zero-pads past EOF rather than erroring
++# (verified empirically -- a truncated-scanline version of this fixture
++# decoded "successfully" with zero-padded trailing pixels, not the
++# failure this row needs). A malformed resolution line instead hits
++# stbi__hdr_load()'s own `strncmp(token, "-Y ", 3)` check
++# deterministically, returning a real, named decode failure every time.
++printf '#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\nGARBAGE-NOT-A-VALID-RESOLUTION-LINE\n' > "${OUT_DIR}/corrupt.hdr"
++
+ echo "Fixtures written to ${OUT_DIR}:"
+-ls -la "${OUT_DIR}"/*.ktx2 "${OUT_DIR}"/*.png "${OUT_DIR}"/*.jpg
++ls -la "${OUT_DIR}"/*.ktx2 "${OUT_DIR}"/*.png "${OUT_DIR}"/*.jpg "${OUT_DIR}"/*.hdr
+diff --git a/src/rx_asset/include/rx_asset/texture_cache.h b/src/rx_asset/include/rx_asset/texture_cache.h
+index d9cb4f9..b5f763e 100644
+--- a/src/rx_asset/include/rx_asset/texture_cache.h
++++ b/src/rx_asset/include/rx_asset/texture_cache.h
+@@ -73,20 +73,30 @@ struct TextureRecord {
+     bool isFallback = false;
+     TextureRole role = TextureRole::GenericData;
+     // BindlessTable sampled-image slot index -- ALWAYS valid (points at
+     // the checkerboard/utility fallback's own slot while nonresident/
+     // evicted, D24 -- never a stale or dangling index).
+     uint32_t bindlessIndex = 0;
+     uint32_t width = 0;
+     uint32_t height = 0;
+     uint32_t mipLevels = 0;
+     VkFormat format = VK_FORMAT_UNDEFINED;
++    // [Phase 5 Task 6] True for a real (non-fallback) cubemap texture --
++    // `width`/`height` are ONE FACE's own extent, `mipLevels` is the
++    // PER-FACE level count, and the underlying rx::rhi::Texture2D's own
++    // view() is a VK_IMAGE_VIEW_TYPE_CUBE view over all 6 faces (never a
++    // plain 2D one) -- a future consumer (Stage 1 T9/T10's skybox/IBL
++    // bind) checks this before assuming a `samplerCube`-shaped binding is
++    // valid. Always false for every pre-Task-6 record and for the D11
++    // fallback/utility textures (all plain 2D, including the new
++    // Environment role's own mid-gray fallback -- see buildFallbackTextures()).
++    bool isCube = false;
+     // [D24] false between evictForTesting() and DeletionQueue's actual
+     // reclaim -- resolve() substitutes the checkerboard's record (still
+     // isFallback=true, resident=true) whenever this is false.
+     bool resident = true;
+ };
+ 
+ // `TextureHandle` itself is mesh_asset.h's own `rx::core::Handle<struct
+ // TextureTag>` alias (already visible here via the `#include
+ // <rx_asset/mesh_asset.h>` above) -- deliberately NOT re-aliased in this
+ // header. See this header's own top-of-class comment on TextureRecord for
+@@ -97,23 +107,25 @@ struct TextureRecord {
+ // resident-memory stats (bytes by role, count) mirroring GeometryPool's
+ // stats"]. Balances to zero across load/evict/teardown -- the Task 10
+ // accounting test pattern (src/rx_asset/tests/accounting_test.cpp,
+ // GeometryPool's own equivalent) applied here in
+ // texture_cache_accounting_test.cpp.
+ struct TextureCacheStats {
+     struct RoleStats {
+         uint64_t bytes = 0;
+         uint32_t count = 0;
+     };
+-    // Indexed by static_cast<size_t>(TextureRole) -- 6 entries, one per
+-    // TextureRole enumerator (texture_decode.h).
+-    std::array<RoleStats, 6> byRole{};
++    // Indexed by static_cast<size_t>(TextureRole) -- 7 entries, one per
++    // TextureRole enumerator (texture_decode.h; 7 as of Phase 5 Task 6's
++    // Environment addition, appended at the end -- see that enum's own
++    // comment for the index-stability contract this relies on).
++    std::array<RoleStats, 7> byRole{};
+     uint64_t totalBytes = 0;
+     uint32_t totalCount = 0;
+ };
+ 
+ class TextureCache {
+ public:
+     TextureCache(const TextureCache&) = delete;
+     TextureCache& operator=(const TextureCache&) = delete;
+     TextureCache(TextureCache&&) = delete;
+     TextureCache& operator=(TextureCache&&) = delete;
+@@ -350,20 +362,31 @@ public:
+     // POLICY, D24) -- test/diagnostic-only, matching Registry::
+     // evictForTesting()'s identical naming/scope.
+     //
+     // Main-thread-only (D5).
+     void evictForTesting(TextureHandle handle, uint64_t frameIndex = 0);
+ 
+     // Test/diagnostic accessors -- production code has no need for them.
+     // Main-thread-only (D5), matching every other accessor on this class.
+     [[nodiscard]] size_t samplerCountForTesting() const;
+     [[nodiscard]] size_t liveTextureCountForTesting() const;
++    // [Phase 5 Task 6] The raw VkImage backing `handle` -- VK_NULL_HANDLE
++    // for a dead/nonresident handle. Production code has no need for this
++    // (the bindless index, TextureRecord::bindlessIndex, is the only
++    // production-supported access path to a resolved texture, exactly
++    // like every other TextureCache-owned resource) -- exists purely so a
++    // GPU test can do a direct vkCmdCopyImageToBuffer readback (matrix-
++    // p5t06-ktx2-cubemap-hdr row 11's own "direct face-indexed readback"
++    // alternative to a samplerCube-shaped bindless binding, which this
++    // class's own fixed 3-binding bindless layout has no slot for) without
++    // this test/diagnostic accessor.
++    [[nodiscard]] VkImage rawImageForTesting(TextureHandle handle) const;
+ 
+ private:
+     struct Entry {
+         TextureRecord record;
+         std::optional<rx::rhi::Texture2D> image;
+         // The FULL BindlessHandle (kind+index+generation) -- release()
+         // needs this, not just record.bindlessIndex (a raw index alone
+         // cannot express BindlessTable's own generational free-list
+         // safety).
+         rx::rhi::BindlessHandle bindlessHandle;
+@@ -379,23 +402,34 @@ private:
+     // place a real (non-fallback) TextureRecord is minted, shared by
+     // load()/loadFromBytes()'s libktx path, the stb path (a single
+     // `uploadLevels` entry, mipLevel 0), and buildFallbackTextures()'s own
+     // solid-color/checkerboard textures below (also single-entry).
+     // Returns an invalid (default-constructed) TextureHandle -- NEVER
+     // itself falling back to checkerboardHandle(), since that fallback
+     // does not exist yet the first time this runs (buildFallbackTextures()
+     // IS this function's own first caller) -- on any GPU-side failure;
+     // callers translate that into whatever fallback is appropriate for
+     // their own call site.
++    //
++    // [Phase 5 Task 6] `isCube`: when true, `width`/`height` are ONE
++    // FACE's own extent, `mipLevels` is the PER-FACE level count, and
++    // `uploadLevels` is expected to carry 6 * mipLevels entries (every
++    // entry's own ImageMipLevel::baseArrayLayer selecting its face) --
++    // builds via rx::rhi::Texture2D::createCubeForPresuppliedMips()
++    // instead of createForPresuppliedMips(). Defaulted to false so every
++    // pre-Task-6 call site (buildFallbackTextures()'s own
++    // uploadSolidColor()/uploadCheckerboard(), the plain-2D branch of
++    // applyDecodeResult()) needs no change at all.
+     [[nodiscard]] TextureHandle registerRealTexture(TextureRole role, VkFormat format, uint32_t width,
+                                                      uint32_t height, uint32_t mipLevels,
+-                                                     std::span<const rx::rhi::Uploader::ImageMipLevel> uploadLevels);
++                                                     std::span<const rx::rhi::Uploader::ImageMipLevel> uploadLevels,
++                                                     bool isCube = false);
+ 
+     // Logs the FAILURE `reason` (RX_LOG_ERROR, once per (debugName,
+     // "failed") pair -- see shouldLogOnce() below) and returns
+     // checkerboardHandle() -- the ONE place every load()/loadFromBytes()
+     // failure branch funnels through.
+     [[nodiscard]] TextureHandle failureFallback(std::string_view debugName, std::string_view reason);
+ 
+     // [D11 "ONE log per asset (dedup criterion -- no per-frame spam)"]
+     // True the FIRST time this exact (debugName, category) pair is seen;
+     // false (and no further bookkeeping) on every later call with the
+@@ -413,33 +447,47 @@ private:
+     // that stays each caller's own job (loadFromBytes() flushes+waits
+     // unconditionally; registerDecoded() never does).
+     [[nodiscard]] TextureHandle applyDecodeResult(const TextureDecodeResult& decoded, std::string_view debugName);
+ 
+     void releaseInternal(TextureHandle handle, uint64_t frameIndex);
+ 
+     bool buildFallbackTextures();
+     [[nodiscard]] std::optional<TextureHandle> uploadSolidColor(TextureRole role, std::array<uint8_t, 4> rgba,
+                                                                   VkFormat format, std::string_view debugName);
+     [[nodiscard]] std::optional<TextureHandle> uploadCheckerboard();
++    // [Phase 5 Task 6, coordinator ruling T6, gate matrix-p5t06-ktx2-
++    // cubemap-hdr Open Question 3] The Environment role's OWN D11
++    // fallback -- deliberately NOT uploadSolidColor()'s existing 8-bit
++    // RGBA path cast to float: a small uniform MID-GRAY (not black)
++    // VK_FORMAT_R16G16B16A16_SFLOAT texture, uploaded through the SAME
++    // real float-packing path decodeStbHdrForUpload()'s own output uses
++    // (glm::packHalf4x16) -- proves that path works end-to-end before
++    // Stage 1 lands a real HDR asset. Mid-gray (not black) reads as
++    // "neutral ambient" for an unbound environment slot, consistent with
++    // this project's own D22 interim-flat-ambient philosophy, rather than
++    // "no light at all".
++    [[nodiscard]] std::optional<TextureHandle> uploadEnvironmentFallback();
+ 
+     [[nodiscard]] bool isFormatSupported(VkFormat format) const;
+ 
+     rx::rhi::Allocator& allocator_;
+     rx::rhi::Device& device_;
+     rx::rhi::Uploader& uploader_;
+     rx::rhi::BindlessTable& bindless_;
+     rx::rhi::DeletionQueue& deletionQueue_;
+ 
+     rx::core::HandlePool<struct TextureTag, Entry> pool_;
+ 
+     TextureHandle checkerboard_;
+-    std::array<TextureHandle, 6> roleFallback_{};  // indexed by static_cast<size_t>(TextureRole)
++    // 7 entries as of Phase 5 Task 6's Environment addition -- see
++    // TextureCacheStats::byRole's own identically-worded comment.
++    std::array<TextureHandle, 7> roleFallback_{};  // indexed by static_cast<size_t>(TextureRole)
+ 
+     struct SamplerKey {
+         VkSamplerAddressMode wrapS;
+         VkSamplerAddressMode wrapT;
+         VkFilter magFilter;
+         VkFilter minFilter;
+         VkSamplerMipmapMode mipmapMode;
+         int32_t anisotropyTimes100;  // maxAnisotropy*100, rounded -- exact float equality is not a safe map key
+         bool operator==(const SamplerKey&) const = default;
+     };
+diff --git a/src/rx_asset/include/rx_asset/texture_decode.h b/src/rx_asset/include/rx_asset/texture_decode.h
+index dfc571a..6cce6e2 100644
+--- a/src/rx_asset/include/rx_asset/texture_decode.h
++++ b/src/rx_asset/include/rx_asset/texture_decode.h
+@@ -31,27 +31,37 @@
+ #include <vector>
+ 
+ namespace rx::asset {
+ 
+ // D10 role table's domain -- the material SLOT a texture is bound to
+ // (baseColor/emissive/normal/metallicRoughness/occlusion), plus a
+ // catch-all `GenericData` for anything else (e.g. a texture with no
+ // material-slot context, or a future glTF extension's own data texture)
+ // so the role->format table stays TOTAL without inventing slot-specific
+ // entries no consumer needs yet.
++// [Phase 5 Task 6, ticket #42, gate matrix-p5t06-ktx2-cubemap-hdr row 8]
++// `Environment` is APPENDED at the end, never inserted before an existing
++// value -- static_cast<size_t>(role) must stay unchanged for every
++// pre-existing enumerator (matrix row 4's own regression bar: every
++// byRole[idx]/roleFallback_[idx] index in texture_cache.h would otherwise
++// silently shift). Scene-level (skybox/IBL equirect HDR or cubemap), not
++// a glTF material-slot concept -- glTF has no material slot named
++// "environment", so import_gltf.cpp's 5 material-slot call sites need no
++// change for this role to exist.
+ enum class TextureRole : uint8_t {
+     BaseColor,
+     Emissive,
+     Normal,
+     MetallicRoughness,
+     Occlusion,
+     GenericData,
++    Environment,
+ };
+ 
+ const char* textureRoleName(TextureRole role);
+ 
+ // One row of the D10 role->format table: `transcodeTarget` is the
+ // ktx_transcode_fmt_e passed to ktxTexture2_TranscodeBasis() when the
+ // container IS Basis-encoded; `exactFormat` is the VkFormat the resulting
+ // bytes are uploaded as when the device supports sampling it;
+ // `rgba32Fallback` is the role-correct (SRGB vs UNORM) VkFormat used
+ // instead when it does not (KTX_TTF_RGBA32 always decodes to plain
+@@ -205,36 +215,60 @@ public:
+     // ktxTexture2*: `ktxTexture2_TranscodeBasis()` REWRITES the object's
+     // own DFD to describe the OUTPUT format (verified directly, this
+     // task's own testing -- a BC5 transcode target has no sRGB variant at
+     // all, so the post-transcode DFD reports LINEAR regardless of what
+     // the container originally claimed), which would silently erase
+     // exactly the disagreement this accessor exists to surface. Capturing
+     // once, at parse time, is what makes the sRGB-mislabeled-normal
+     // acceptance test (and D10/gate ruling #3's WARN) correct at all.
+     khr_df_transfer_e containerTransferFunction() const { return originalTransfer_; }
+ 
+-    // True iff the container declares a layout this Phase-4 TextureCache
+-    // does not consume (isArray/isCubemap/numFaces>1/numLayers>1/
+-    // numDimensions!=2) -- callers MUST check this before trusting
+-    // width()/height()/levels() as "the whole texture" (matrix's
+-    // "Cubemap/array/3D KTX2" row: WARN naming the layout + fallback,
+-    // never a silently-wrong 2D slice). Also true whenever
+-    // parseAndTranscode() itself already classified the container this
+-    // way (outError == UnsupportedLayout) -- exposed as a method too so a
+-    // caller holding a successfully-constructed instance never needs to
+-    // separately remember the out-parameter from construction.
++    // [Phase 5 Task 6, gate matrix row 3/Open Question 1] True iff the
++    // container declares a layout this TextureCache does not consume --
++    // narrowed from Phase 4's blanket "isArray || isCubemap || numFaces>1
++    // || numLayers>1 || numDimensions!=2" to `numDimensions != 2 ||
++    // (isArray && !isCubemap) || (isCubemap && numLayers > 1)`: a plain,
++    // single-layer CUBEMAP (isCubemap && numLayers<=1, which by the KTX2
++    // spec always means numFaces==6) is now SUPPORTED -- flat 2D arrays
++    // and cube-arrays stay explicitly rejected (zero charter consumer,
++    // see the matrix's own Open Question 1), 1D/3D stays rejected
++    // unchanged. Callers MUST check this before trusting width()/
++    // height()/levels() as "the whole texture" (matrix's "Cubemap/array/
++    // 3D KTX2" row: WARN naming the layout + fallback, never a silently-
++    // wrong 2D slice). Also true whenever parseAndTranscode() itself
++    // already classified the container this way (outError ==
++    // UnsupportedLayout) -- exposed as a method too so a caller holding a
++    // successfully-constructed instance never needs to separately
++    // remember the out-parameter from construction.
+     bool isUnsupportedLayout() const;
+ 
+-    // Per-level extent+bytes, in ascending level order, reflecting
+-    // whatever currentVkFormat() the data is actually in right now (see
+-    // that accessor's own comment). Empty if isUnsupportedLayout().
+-    std::vector<MipLevelData> levels() const;
++    // [Phase 5 Task 6] True iff this is a SUPPORTED single-layer cubemap
++    // (isUnsupportedLayout() == false and the container's own isCubemap
++    // flag is set) -- always false for a rejected/unsupported container
++    // or a plain 2D texture. numFaces() is always 6 whenever this is
++    // true (the KTX2 spec's own cubemap invariant) and always 1
++    // otherwise -- exposed for callers that want the raw count without
++    // re-deriving it from isCube().
++    bool isCube() const;
++    uint32_t numFaces() const;
++
++    // Per-level extent+bytes for face `face` (0 for a plain 2D texture --
++    // the only valid value there; 0..numFaces()-1, i.e. 0..5, for a
++    // supported cubemap, in the standard +X,-X,+Y,-Y,+Z,-Z KTX2 face
++    // order), in ascending level order, reflecting whatever
++    // currentVkFormat() the data is actually in right now (see that
++    // accessor's own comment). Empty if isUnsupportedLayout(). Defaulted
++    // to face 0 so every pre-existing call site (`decoded->levels()`,
++    // exclusively 2D textures before this task) keeps compiling and
++    // behaving byte-identically -- see matrix row 7's own "DecodedKtx2Texture
++    // ::levels()'s face-blindness" gap this parameter closes.
++    std::vector<MipLevelData> levels(uint32_t face = 0) const;
+ 
+ private:
+     DecodedKtx2Texture(ktxTexture2* texture, bool wasBasisEncoded, bool unsupportedLayout, VkFormat currentFormat,
+                         khr_df_transfer_e originalTransfer);
+ 
+     ktxTexture2* texture_ = nullptr;
+     bool wasBasisEncoded_ = false;
+     bool unsupportedLayout_ = false;
+     VkFormat currentFormat_ = VK_FORMAT_UNDEFINED;
+     khr_df_transfer_e originalTransfer_ = KHR_DF_TRANSFER_UNSPECIFIED;
+@@ -282,20 +316,50 @@ struct DecodedStbImage {
+ // string) on any decode failure -- the caller maps that to the D11
+ // checkerboard fallback, never a crash.
+ std::optional<DecodedStbImage> decodeStbImage(std::span<const std::byte> bytes, std::string* outFailureReason);
+ 
+ // Role-correct RGBA8 format for a decodeStbImage() result -- SRGB for
+ // BaseColor/Emissive, UNORM otherwise, exactly mirroring
+ // roleFormatTable()'s own colorspace column (roleExpectsSrgb()) but
+ // returning the UNCOMPRESSED equivalent this path actually uploads.
+ VkFormat stbRgba8Format(TextureRole role);
+ 
++// ---------------------------------------------------------------------
++// [Phase 5 Task 6, ticket #42, gate matrix-p5t06-ktx2-cubemap-hdr row 9]
++// Radiance (.hdr) equirect float input -- library-first: stb_image.h
++// (already vendored, the SAME translation unit decodeStbImage() above
++// calls into) already declares+implements stbi_loadf_from_memory()/
++// stbi_is_hdr_from_memory() -- genuinely zero new dependency. This closes
++// a real, previously-silent correctness gap: decodeStbImage() above
++// (stbi_load_from_memory, the 8-bit entry point) auto-detects a Radiance
++// input internally and decodes it through stb's own
++// stbi__hdr_to_ldr() tonemap+clamp path with NO warning at all --
++// decodeTextureForUpload() below now checks stbi_is_hdr_from_memory()
++// BEFORE ever reaching that 8-bit branch, so a .hdr file is routed here
++// instead, never silently tonemapped.
++// ---------------------------------------------------------------------
++
++struct DecodedStbHdrImage {
++    uint32_t width = 0;
++    uint32_t height = 0;
++    std::vector<float> rgba32;  // tightly packed, 4 floats/texel (forced via desired_channels=4)
++};
++
++// Decodes `bytes` via stbi_loadf_from_memory -- same failure-reporting
++// contract as decodeStbImage() (std::nullopt + stbi_failure_reason() on
++// any failure, caller maps to the D11 checkerboard). Caller (this header's
++// own decodeTextureForUpload()) is responsible for calling
++// stbi_is_hdr_from_memory() FIRST to route here at all -- this function
++// itself does not re-check (mirrors decodeStbImage()'s own "caller
++// already decided this is the right path" contract).
++std::optional<DecodedStbHdrImage> decodeStbImageHdr(std::span<const std::byte> bytes, std::string* outFailureReason);
++
+ // ---------------------------------------------------------------------
+ // [Phase 4 Stage 1 Task 15] Combined KTX2/stb decode -- worker-safe
+ // (thread-affinity: NONE, same as every other function in this header):
+ // consolidates exactly the branch logic TextureCache::loadKtx2Bytes()/
+ // loadStbBytes() (texture_cache.cpp) already ran, MINUS the GPU-facing
+ // tail (Texture2D creation / Uploader submission / BindlessTable
+ // registration, all main-thread-only per D5) -- this is the "decode" half
+ // of the sync path's own loadFromBytes(), reused verbatim by BOTH the sync
+ // TextureCache::loadFromBytes() (decode here, then register on the SAME
+ // calling thread, back to back) and the async import pipeline (decode on
+@@ -306,20 +370,28 @@ VkFormat stbRgba8Format(TextureRole role);
+ 
+ // One already-decoded mip level, OWNED (not aliasing anything else) --
+ // unlike MipLevelData/DecodedKtx2Texture::levels() above, this type must
+ // survive a hand-off to a different thread (worker -> main), so it copies
+ // its bytes out rather than returning a span into a container this
+ // function's own caller may not keep alive.
+ struct DecodedTextureLevel {
+     uint32_t level = 0;
+     uint32_t width = 0;
+     uint32_t height = 0;
++    // [Phase 5 Task 6] Cube face index (0..5, standard KTX2 +X,-X,+Y,-Y,
++    // +Z,-Z order) this level's bytes belong to -- 0 for every non-cube
++    // producer of this type (every EXISTING call site: decodeStbForUpload()'s
++    // LDR/HDR paths, decodeKtx2ForUpload()'s plain-2D branch), so
++    // TextureCache::applyDecodeResult()'s ImageMipLevel::baseArrayLayer
++    // mapping (upload.h) stays 0 -- byte-identical to every pre-Task-6
++    // upload -- for anything that isn't a cube.
++    uint32_t faceIndex = 0;
+     std::vector<std::byte> bytes;
+ };
+ 
+ // [texture-path round, D10 Option A -- see .superpowers/sdd/2026-08-11-
+ // phase4-scene-assets/sponza-visual-investigation.md §2.7] Generates the
+ // REST of a full, floor-halving box-filtered mip chain for an
+ // already-decoded RGBA8 mip-0 image -- level 0 itself is NOT included in
+ // the returned vector (the caller already has it verbatim); this
+ // function's own output is exactly levels 1..N, where N is the SAME
+ // total level count Vulkan's own image-creation rule computes
+@@ -389,22 +461,39 @@ struct TextureDecodeResult {
+     };
+     Outcome outcome = Outcome::Failed;
+     std::string failureReason;  // meaningful for Failed/Checkerboard only
+ 
+     std::vector<DecodedTextureWarning> warnings;
+ 
+     TextureRole role = TextureRole::GenericData;
+     VkFormat format = VK_FORMAT_UNDEFINED;
+     uint32_t width = 0;
+     uint32_t height = 0;
++    // [Phase 5 Task 6] True for a supported cubemap KTX2 -- `levels` then
++    // holds 6 * perFaceMipLevels entries (every face's DecodedTextureLevel
++    // ::faceIndex populated 0..5), never a mix of cube and non-cube
++    // entries. Always false for every pre-Task-6 producer of this struct
++    // (plain 2D KTX2, stb LDR/HDR) -- `levels.size()` alone still gives
++    // the correct per-face-and-per-texture mip count either way (divide
++    // by 6 only when this is true).
++    bool isCube = false;
+     std::vector<DecodedTextureLevel> levels;
+ };
+ 
+ // `maxImageDimension2D`: the device's VkPhysicalDeviceLimits field (or a
+ // synthetic test value) -- same role as TextureCache's own stored
+ // `maxImageDimension2D_`, passed explicitly since this function has no
+ // TextureCache instance to read it from. `isFormatSupported`: same
+ // FormatSupportQuery contract as planTranscodeFormat() above.
++//
++// [Phase 5 Task 6] Dispatch order: looksLikeKtx2(bytes) routes to the
++// KTX2 path (now cube-aware, TextureDecodeResult::isCube) FIRST;
++// otherwise stbi_is_hdr_from_memory(bytes) routes to the NEW
++// decodeStbImageHdr()-backed float path (VK_FORMAT_R16G16B16A16_SFLOAT,
++// per the phase's environment-upload-format ruling) BEFORE the plain
++// 8-bit stb branch ever gets a chance to silently tonemap it (see
++// decodeStbImageHdr()'s own header comment); everything else falls to
++// the unchanged 8-bit stb (PNG/JPG) path.
+ TextureDecodeResult decodeTextureForUpload(std::span<const std::byte> bytes, TextureRole role,
+                                             uint32_t maxImageDimension2D, const FormatSupportQuery& isFormatSupported);
+ 
+ }  // namespace rx::asset
+diff --git a/src/rx_asset/tests/texture_cache_test.cpp b/src/rx_asset/tests/texture_cache_test.cpp
+index 2d9872b..71514d8 100644
+--- a/src/rx_asset/tests/texture_cache_test.cpp
++++ b/src/rx_asset/tests/texture_cache_test.cpp
+@@ -7,20 +7,22 @@
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/deletion_queue.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/pipeline_layout.h>
+ #include <rx_platform/window.h>
+ #include <rx_shader/compiler.h>
+ #include <rx_shader/reflection.h>
+ #include <rx_task/scheduler.h>
+ #include <spdlog/sinks/ostream_sink.h>
++#include <glm/gtc/packing.hpp>
++#include <glm/vec4.hpp>
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
+ #include <fstream>
+ #include <optional>
+ #include <sstream>
+ #include <string>
+ #include <utility>
+ #include <vector>
+@@ -559,20 +561,64 @@ std::optional<QuadrantPixels> renderAndReadbackQuadrants(TcTestFixture& fixture,
+     const uint32_t q1 = extent / 4;
+     const uint32_t q3 = extent - q1 - 1;
+     QuadrantPixels result;
+     result.topLeft = pixelAt(q1, q1);
+     result.topRight = pixelAt(q3, q1);
+     result.bottomLeft = pixelAt(q1, q3);
+     result.bottomRight = pixelAt(q3, q3);
+     return result;
+ }
+ 
++// [Phase 5 Task 6, ticket #42, gate matrix-p5t06-ktx2-cubemap-hdr row 11's
++// own "direct face-indexed readback" alternative] A sampler-free
++// readback of ONE subresource (a specific mip level + array layer) of a
++// real, already-uploaded rx::rhi::Texture2D's underlying VkImage --
++// vkCmdCopyImageToBuffer straight off the GPU image, mirroring the
++// established texture_test.cpp/upload_test.cpp readback pattern (this
++// file's own renderAndReadbackQuadrants() above uses a fragment-shader/
++// sampler pipeline instead, which has no bindless-array slot for a
++// TextureCube-typed binding -- this class's own fixed 3-binding bindless
++// layout is 2D-only; see TextureCache::rawImageForTesting()'s own header
++// comment). `bytesPerTexel` parametrizes over both the 4-byte RGBA8 cube
++// fixture and the 8-byte R16G16B16A16_SFLOAT HDR fixture this task adds.
++std::optional<std::vector<uint8_t>> readBackSubresource(TcTestFixture& fixture, VkImage image, VkExtent2D extent,
++                                                           uint32_t mipLevel, uint32_t arrayLayer,
++                                                           VkDeviceSize bytesPerTexel) {
++    const VkDeviceSize byteSize = static_cast<VkDeviceSize>(extent.width) * extent.height * bytesPerTexel;
++    auto readback = fixture.allocator.createHostVisibleBuffer(byteSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    if (!readback.has_value()) {
++        return std::nullopt;
++    }
++    auto cmdCtx = rx::rhi::CommandContext::create(fixture.device.device(), fixture.device.graphicsQueue(),
++                                                    fixture.device.graphicsQueueFamily());
++    if (!cmdCtx.has_value()) {
++        return std::nullopt;
++    }
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        rx::rhi::transitionImage(cmd, image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++                                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++        VkBufferImageCopy region{};
++        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        region.imageSubresource.mipLevel = mipLevel;
++        region.imageSubresource.baseArrayLayer = arrayLayer;
++        region.imageSubresource.layerCount = 1;
++        region.imageExtent = {extent.width, extent.height, 1};
++        vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1, &region);
++        rx::rhi::transitionImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    });
++    readback->invalidate();
++    std::vector<uint8_t> result(byteSize);
++    std::memcpy(result.data(), readback->mappedData(), byteSize);
++    return result;
++}
++
+ bool approxEqual(const std::array<uint8_t, 4>& actual, std::array<uint8_t, 3> expectedRgb, int tolerance) {
+     return std::abs(static_cast<int>(actual[0]) - expectedRgb[0]) <= tolerance &&
+            std::abs(static_cast<int>(actual[1]) - expectedRgb[1]) <= tolerance &&
+            std::abs(static_cast<int>(actual[2]) - expectedRgb[2]) <= tolerance;
+ }
+ 
+ // [Fix round 1] Swaps spdlog's default logger for an ostream-capturing one
+ // for the scope of one TEST_CASE -- the same lightweight rx_core-only
+ // pattern src/rx_core/tests/log_test.cpp, texture_decode_test.cpp, and
+ // import_gltf_basisu_test.cpp all already establish (duplicated per-file,
+@@ -749,31 +795,224 @@ TEST_CASE("TextureCache: a full mip chain (16x16 -> 1x1) loads all 5 levels") {
+     REQUIRE(handle.isValid());
+     const TextureRecord& record = fixture->cache->resolve(handle);
+     CHECK(record.width == 16);
+     CHECK(record.height == 16);
+     CHECK(record.mipLevels == 5);
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
+ // ===== D11 fallback routing for every failure mode ==========================
+ 
+-TEST_CASE("TextureCache: cubemap KTX2 -> checkerboard fallback (never a silently-wrong 2D slice)") {
++// [Phase 5 Task 6, ticket #42, gate matrix-p5t06-ktx2-cubemap-hdr row 2 --
++// the DISCRIMINATION PROOF] Replaces the Phase 4 test that asserted this
++// SAME fixture (cubemap.ktx2) resolved to the checkerboard -- exactly the
++// assertion a no-op cube implementation could leave passing. Loads the
++// SAME file and asserts the FLIP: a real, non-fallback, cube-flagged
++// texture.
++TEST_CASE("TextureCache: cubemap KTX2 now loads as a real, non-fallback cube texture [matrix row 2, "
++          "discrimination proof]") {
+     auto fixture = makeFixture("rx_asset_tc_cubemap");
+     if (!fixture.has_value()) {
+         return;
+     }
+     makeCache(*fixture);
+     TextureHandle handle = fixture->cache->load(fixturePath("cubemap.ktx2"), TextureRole::BaseColor);
++    REQUIRE(handle.isValid());
++    CHECK_FALSE(handle == fixture->cache->checkerboardHandle());
++    const TextureRecord& record = fixture->cache->resolve(handle);
++    CHECK_FALSE(record.isFallback);
++    CHECK(record.isCube);
++    CHECK(record.width == 4);   // ONE FACE's own extent (row 7's own contract)
++    CHECK(record.height == 4);
++    CHECK(record.mipLevels == 1);  // cubemap.ktx2 is deliberately single-level
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++// [Phase 5 Task 6, gate matrix row 3] Flat 2D-array and cube-array KTX2
++// stay explicitly rejected after the narrowed predicate -- their own
++// GPU-level regression, mirroring this test's own pre-Task-6 shape
++// (which the test just above replaced) but against the two NEW
++// still-rejected fixtures instead of the now-supported cubemap.ktx2.
++TEST_CASE("TextureCache: flat 2D-array and cube-array KTX2 both still -> checkerboard fallback (cubemap-only "
++          "support, matrix row 3)") {
++    auto fixture = makeFixture("rx_asset_tc_array_rejected");
++    if (!fixture.has_value()) {
++        return;
++    }
++    makeCache(*fixture);
++    TextureHandle array2d = fixture->cache->load(fixturePath("array2d_rejected.ktx2"), TextureRole::BaseColor);
++    TextureHandle cubeArray = fixture->cache->load(fixturePath("cubearray_rejected.ktx2"), TextureRole::BaseColor);
++    CHECK(array2d == fixture->cache->checkerboardHandle());
++    CHECK(cubeArray == fixture->cache->checkerboardHandle());
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++// [Phase 5 Task 6, gate matrix row 6/11] THE primary cube GPU acceptance
++// test: uploads cubemap_mips.ktx2 (32x32 base, 6 mip levels, each face a
++// distinct flat authored color) and directly reads back EVERY face at
++// BOTH mip 0 and the deepest (1x1) mip level, asserting each matches its
++// authored color EXACTLY -- proving mip data landed in the correct
++// face's own subresource range, not just that SOME upload succeeded.
++TEST_CASE("TextureCache: cubemap_mips.ktx2 GPU readback proves exact per-face, per-mip values [matrix row 6/11]") {
++    auto fixture = makeFixture("rx_asset_tc_cubemap_mips");
++    if (!fixture.has_value()) {
++        return;
++    }
++    makeCache(*fixture);
++    TextureHandle handle = fixture->cache->load(fixturePath("cubemap_mips.ktx2"), TextureRole::Environment);
++    REQUIRE(handle.isValid());
++    CHECK_FALSE(handle == fixture->cache->checkerboardHandle());
++    const TextureRecord& record = fixture->cache->resolve(handle);
++    CHECK(record.isCube);
++    CHECK(record.width == 32);
++    CHECK(record.height == 32);
++    CHECK(record.mipLevels == 6);  // 32 -> 16 -> 8 -> 4 -> 2 -> 1
++
++    VkImage image = fixture->cache->rawImageForTesting(handle);
++    REQUIRE(image != VK_NULL_HANDLE);
++
++    // Standard KTX2 cube face order (+X,-X,+Y,-Y,+Z,-Z), matching
++    // generate_fixtures.sh's own toktx invocation order -- identical
++    // authored colors to the device-free flip test (texture_decode_test.cpp),
++    // here proven all the way through GPU upload + readback instead.
++    struct FaceColor {
++        uint32_t face;
++        std::array<uint8_t, 4> rgba;
++    };
++    constexpr std::array<FaceColor, 6> kExpected{{
++        {0, {0xFF, 0x00, 0x00, 0xFF}},  // +X red
++        {1, {0x00, 0xFF, 0xFF, 0xFF}},  // -X cyan
++        {2, {0x00, 0xFF, 0x00, 0xFF}},  // +Y green
++        {3, {0xFF, 0x00, 0xFF, 0xFF}},  // -Y magenta
++        {4, {0x00, 0x00, 0xFF, 0xFF}},  // +Z blue
++        {5, {0xFF, 0xFF, 0x00, 0xFF}},  // -Z yellow
++    }};
++
++    for (const FaceColor& expected : kExpected) {
++        for (uint32_t level : {0U, 5U}) {  // mip 0 (32x32) and the deepest 1x1 tail
++            const uint32_t extent = 32U >> level;
++            auto pixels = readBackSubresource(*fixture, image, VkExtent2D{extent, extent}, level, expected.face,
++                                               /*bytesPerTexel=*/4);
++            REQUIRE(pixels.has_value());
++            // A flat authored color box-filters to itself at every mip
++            // level (same reasoning as flat_withmips_uastc.ktx2's own
++            // deep-mip test) -- every texel in this level must match
++            // EXACTLY, not just the corners.
++            for (size_t texel = 0; texel < static_cast<size_t>(extent) * extent; ++texel) {
++                const uint8_t* px = pixels->data() + texel * 4;
++                CAPTURE(expected.face);
++                CAPTURE(level);
++                CHECK(px[0] == expected.rgba[0]);
++                CHECK(px[1] == expected.rgba[1]);
++                CHECK(px[2] == expected.rgba[2]);
++                CHECK(px[3] == expected.rgba[3]);
++            }
++        }
++    }
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++// ===== Equirect HDR (Radiance .hdr) input [Phase 5 Task 6, gate matrix
++// row 9/13] ===================================================================
++
++TEST_CASE("TextureCache: equirect .hdr loads as a real R16G16B16A16_SFLOAT texture -- a >1.0 texel survives "
++          "GPU upload + readback exactly [matrix row 13, the ticket's own explicit acceptance bar]") {
++    auto fixture = makeFixture("rx_asset_tc_hdr");
++    if (!fixture.has_value()) {
++        return;
++    }
++    makeCache(*fixture);
++    TextureHandle handle = fixture->cache->load(fixturePath("equirect_test.hdr"), TextureRole::Environment);
++    REQUIRE(handle.isValid());
++    CHECK_FALSE(handle == fixture->cache->checkerboardHandle());
++    const TextureRecord& record = fixture->cache->resolve(handle);
++    CHECK_FALSE(record.isCube);
++    CHECK(record.format == VK_FORMAT_R16G16B16A16_SFLOAT);
++    CHECK(record.width == 2);
++    CHECK(record.height == 2);
++
++    VkImage image = fixture->cache->rawImageForTesting(handle);
++    REQUIRE(image != VK_NULL_HANDLE);
++    auto pixels = readBackSubresource(*fixture, image, VkExtent2D{2, 2}, /*mipLevel=*/0, /*arrayLayer=*/0,
++                                       /*bytesPerTexel=*/8);
++    REQUIRE(pixels.has_value());
++    REQUIRE(pixels->size() == 2 * 2 * 8);
++
++    auto texelAt = [&](size_t index) {
++        uint64_t packed = 0;
++        std::memcpy(&packed, pixels->data() + index * 8, sizeof(packed));
++        return glm::unpackHalf4x16(packed);
++    };
++    // Same per-texel values as texture_decode_test.cpp's own device-free
++    // decodeStbImageHdr() test, this time round-tripped all the way
++    // through real GPU upload (glm::packHalf4x16 in decodeStbHdrForUpload())
++    // and a real GPU readback -- proving no accidental UNORM clamp/8-bit
++    // truncation anywhere in the path (row 13's own acceptance wording).
++    glm::vec4 tl = texelAt(0);
++    glm::vec4 br = texelAt(3);
++    CHECK(tl.r == doctest::Approx(4.0F).epsilon(0.001));
++    CHECK(tl.g == doctest::Approx(0.5F).epsilon(0.001));
++    CHECK(tl.b == doctest::Approx(0.5F).epsilon(0.001));
++    CHECK(tl.r > 1.0F);
++    CHECK(br.r == doctest::Approx(2.0F).epsilon(0.001));
++    CHECK(br.g == doctest::Approx(2.0F).epsilon(0.001));
++    CHECK(br.b == doctest::Approx(2.0F).epsilon(0.001));
++
++    TextureCacheStats stats = fixture->cache->stats();
++    CHECK(stats.byRole[static_cast<size_t>(TextureRole::Environment)].count >= 1);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("TextureCache: corrupt HDR bytes -> checkerboard fallback, no crash [mirrors the corrupt.ktx2/corrupt.png "
++          "tests' identical D11 contract]") {
++    auto fixture = makeFixture("rx_asset_tc_corrupthdr");
++    if (!fixture.has_value()) {
++        return;
++    }
++    makeCache(*fixture);
++    TextureHandle handle = fixture->cache->load(fixturePath("corrupt.hdr"), TextureRole::Environment);
+     CHECK(handle == fixture->cache->checkerboardHandle());
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
++TEST_CASE("TextureCache: TextureRole::Environment's own D11 fallback is a REAL, non-checkerboard, uniform "
++          "mid-gray R16G16B16A16_SFLOAT texture [coordinator ruling T6, matrix Open Question 3]") {
++    auto fixture = makeFixture("rx_asset_tc_env_fallback");
++    if (!fixture.has_value()) {
++        return;
++    }
++    makeCache(*fixture);
++    TextureHandle fallback = fixture->cache->fallbackHandle(TextureRole::Environment);
++    REQUIRE(fallback.isValid());
++    CHECK_FALSE(fallback == fixture->cache->checkerboardHandle());
++    const TextureRecord& record = fixture->cache->resolve(fallback);
++    CHECK(record.isFallback);
++    CHECK(record.format == VK_FORMAT_R16G16B16A16_SFLOAT);
++
++    VkImage image = fixture->cache->rawImageForTesting(fallback);
++    REQUIRE(image != VK_NULL_HANDLE);
++    auto pixels = readBackSubresource(*fixture, image, VkExtent2D{record.width, record.height}, /*mipLevel=*/0,
++                                       /*arrayLayer=*/0, /*bytesPerTexel=*/8);
++    REQUIRE(pixels.has_value());
++    uint64_t packed = 0;
++    std::memcpy(&packed, pixels->data(), sizeof(packed));
++    glm::vec4 decoded = glm::unpackHalf4x16(packed);
++    // Mid-gray (0.5) -- deliberately NOT black (D11's "neutral ambient",
++    // not "no light at all") and NOT sRGB 0.5 (Environment is always
++    // linear, roleExpectsSrgb()==false).
++    CHECK(decoded.r == doctest::Approx(0.5F).epsilon(0.001));
++    CHECK(decoded.g == doctest::Approx(0.5F).epsilon(0.001));
++    CHECK(decoded.b == doctest::Approx(0.5F).epsilon(0.001));
++    CHECK(decoded.a == doctest::Approx(1.0F).epsilon(0.001));
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
+ TEST_CASE("TextureCache: corrupt KTX2 -> checkerboard fallback, no crash") {
+     auto fixture = makeFixture("rx_asset_tc_corrupt");
+     if (!fixture.has_value()) {
+         return;
+     }
+     makeCache(*fixture);
+     TextureHandle handle = fixture->cache->load(fixturePath("corrupt.ktx2"), TextureRole::BaseColor);
+     CHECK(handle == fixture->cache->checkerboardHandle());
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+@@ -845,39 +1084,41 @@ TEST_CASE("TextureCache: a real JPEG loads via stb to a real, non-fallback textu
+ // BEFORE attempting BindlessTable::registerSampledImage(); when THAT call
+ // fails (capacity exhausted), the function returned immediately, letting
+ // the local Texture2D's destructor destroy a VkImage its own
+ // already-recorded (not yet flushed/awaited) upload commands still
+ // reference -- "UNASSIGNED-CoreValidation-DrawState-InvalidCommandBuffer-
+ // VkImage: ... bound VkImage ... was destroyed", then a segfault. No
+ // earlier test ever drove bindless sampled-image capacity to genuine
+ // exhaustion during a real registerRealTexture() call, so this path had
+ // never been exercised. This TEST_CASE reproduces the exact failure mode
+ // in isolation (no Sponza/network fetch needed): a fixture whose
+-// sampledImages capacity is EXACTLY the D11 fallback-texture count (4:
+-// checkerboard + white + flat-normal + neutral-MR, see
+-// buildFallbackTextures()'s own comment) -- TextureCache::create() itself
+-// must still succeed (it consumes exactly 4, zero spare), but the very
+-// NEXT real texture load is guaranteed to hit
+-// BindlessTable::registerSampledImage()'s own capacity-exhaustion
+-// rejection deterministically, every run, on any device.
++// sampledImages capacity is EXACTLY the D11 fallback-texture count (5 as
++// of Phase 5 Task 6's Environment mid-gray addition: checkerboard + white
++// + flat-normal + neutral-MR + environment, see buildFallbackTextures()'s
++// own comment) -- TextureCache::create() itself must still succeed (it
++// consumes exactly 5, zero spare), but the very NEXT real texture load is
++// guaranteed to hit BindlessTable::registerSampledImage()'s own
++// capacity-exhaustion rejection deterministically, every run, on any
++// device.
+ TEST_CASE("TextureCache: bindless sampled-image capacity exhaustion at registerRealTexture() -- checkerboard "
+           "fallback, no crash, zero validation errors [fix round, Finding H1(b), independent review of #15]") {
+-    rx::rhi::BindlessTable::Capacities tightCapacities{/*sampledImages=*/4, /*samplers=*/8, /*storageBuffers=*/1};
++    rx::rhi::BindlessTable::Capacities tightCapacities{/*sampledImages=*/5, /*samplers=*/8, /*storageBuffers=*/1};
+     auto fixture = makeFixture("rx_asset_tc_capexhaust", tightCapacities);
+     if (!fixture.has_value()) {
+         return;
+     }
+-    // TextureCache::create() -> buildFallbackTextures() consumes exactly 4
++    // TextureCache::create() -> buildFallbackTextures() consumes exactly 5
+     // sampled-image slots (checkerboard + white + flat-normal +
+-    // neutral-MR) -- this must still succeed against a capacity of
+-    // exactly 4, proving the fixture itself is sized precisely, not
+-    // accidentally too small to even construct a cache.
++    // neutral-MR + [Phase 5 Task 6] environment) -- this must still
++    // succeed against a capacity of exactly 5, proving the fixture itself
++    // is sized precisely, not accidentally too small to even construct a
++    // cache.
+     makeCache(*fixture);
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ 
+     // The 5th sampled-image registration attempt: capacity is already
+     // fully, deterministically exhausted. Before the fix, this crashed
+     // (destroy-while-upload-commands-still-reference-the-image); after
+     // the fix, registerRealTexture() flushes+awaits the already-recorded
+     // upload commands before the doomed Texture2D is destroyed, and
+     // load() falls back to the checkerboard handle via its own
+     // established failure-path convention (same as every other
+diff --git a/src/rx_asset/tests/texture_decode_test.cpp b/src/rx_asset/tests/texture_decode_test.cpp
+index a0e089d..aad46f8 100644
+--- a/src/rx_asset/tests/texture_decode_test.cpp
++++ b/src/rx_asset/tests/texture_decode_test.cpp
+@@ -1,20 +1,24 @@
+ #include <doctest/doctest.h>
+ #include <rx_asset/texture_decode.h>
+ #include <rx_core/log.h>
+ #include <rx_core/log_forward_sink.h>
+ #include <spdlog/sinks/ostream_sink.h>
++#include <stb_image.h>
++#include <glm/gtc/packing.hpp>
++#include <glm/vec4.hpp>
+ #include <algorithm>
+ #include <array>
+ #include <cmath>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstring>
+ #include <fstream>
+ #include <optional>
+ #include <sstream>
+ #include <string>
+ #include <vector>
+ 
+ // texture_decode_test.cpp -- device-free coverage for rx::asset's KTX2/
+ // Basis parse+transcode decision layer and the stb PNG/JPG fallback
+ // decode [Phase 4 Stage 1 Task 14, spec D10, gate matrix-issue03 as
+ // amended by gate/rulings-2026-08-18.md #3]. No GPU, no VkDevice --
+@@ -307,26 +311,105 @@ TEST_CASE("DecodedKtx2Texture: non-multiple-of-4 base dimensions (6x5) parse wit
+     CHECK(decoded->width() == 6);
+     CHECK(decoded->height() == 5);
+     auto levels = decoded->levels();
+     REQUIRE(levels.size() == 1);
+     CHECK(levels[0].width == 6);
+     CHECK(levels[0].height == 5);
+     // ceil(6/4)*ceil(5/4) = 2*2 = 4 blocks * 16 bytes = 64.
+     CHECK(levels[0].bytes.size() == 64);
+ }
+ 
+-TEST_CASE("DecodedKtx2Texture: cubemap fixture is classified UnsupportedLayout, never silently treated as a "
+-          "2D slice [matrix 'Cubemap/array/3D' row]") {
++// [Phase 5 Task 6, ticket #42, gate matrix-p5t06-ktx2-cubemap-hdr row 2 --
++// the DISCRIMINATION PROOF] The Phase 4 test this replaces asserted
++// cubemap.ktx2 was REJECTED (isUnsupportedLayout()==true) -- exactly the
++// assertion a no-op cube implementation could leave passing. This test
++// loads the SAME fixture (now regenerated with a real, uploadable format
++// -- see generate_fixtures.sh's own comment) and asserts the FLIP:
++// isUnsupportedLayout() is now false, isCube() is true, and every one of
++// the 6 faces' own per-texel bytes matches its authored flat color
++// EXACTLY (decoded-value discipline, not just "it parsed") -- the flip
++// itself, not merely new coverage, is what this row requires.
++TEST_CASE("DecodedKtx2Texture: cubemap fixture now parses as a SUPPORTED cube -- isUnsupportedLayout() flips to "
++          "false, every face's real per-texel color is decoded correctly [matrix row 2, discrimination proof]") {
+     auto bytes = readFixture("cubemap.ktx2");
+     TranscodePlan plan = planTranscodeFormat(TextureRole::GenericData, alwaysSupported);
+     Ktx2ParseError error = Ktx2ParseError::None;
+     auto decoded = DecodedKtx2Texture::parseAndTranscode(std::span<const std::byte>(bytes), plan, error);
++    REQUIRE(decoded.has_value());
++    CHECK_FALSE(decoded->isUnsupportedLayout());
++    CHECK(error == Ktx2ParseError::None);
++    CHECK(decoded->isCube());
++    CHECK(decoded->numFaces() == 6);
++    CHECK(decoded->width() == 4);
++    CHECK(decoded->height() == 4);
++
++    // Standard KTX2 cube face order (+X,-X,+Y,-Y,+Z,-Z), matching
++    // generate_fixtures.sh's own toktx invocation order exactly.
++    struct FaceColor {
++        uint32_t face;
++        std::array<uint8_t, 4> rgba;
++    };
++    constexpr std::array<FaceColor, 6> kExpected{{
++        {0, {0xFF, 0x00, 0x00, 0xFF}},  // +X red
++        {1, {0x00, 0xFF, 0xFF, 0xFF}},  // -X cyan
++        {2, {0x00, 0xFF, 0x00, 0xFF}},  // +Y green
++        {3, {0xFF, 0x00, 0xFF, 0xFF}},  // -Y magenta
++        {4, {0x00, 0x00, 0xFF, 0xFF}},  // +Z blue
++        {5, {0xFF, 0xFF, 0x00, 0xFF}},  // -Z yellow
++    }};
++
++    for (const FaceColor& expected : kExpected) {
++        auto levels = decoded->levels(expected.face);
++        REQUIRE(levels.size() == 1);  // cubemap.ktx2 is deliberately single-level (row 6's own discrimination fixture)
++        CHECK(levels[0].width == 4);
++        CHECK(levels[0].height == 4);
++        REQUIRE(levels[0].bytes.size() == 4 * 4 * 4);  // 4x4 texels, RGBA8
++        for (size_t texel = 0; texel < 16; ++texel) {
++            const auto* px = reinterpret_cast<const uint8_t*>(levels[0].bytes.data()) + texel * 4;
++            CHECK(px[0] == expected.rgba[0]);
++            CHECK(px[1] == expected.rgba[1]);
++            CHECK(px[2] == expected.rgba[2]);
++            CHECK(px[3] == expected.rgba[3]);
++        }
++    }
++}
++
++// [Phase 5 Task 6, gate matrix row 3] Flat 2D ARRAY (isArray && !isCubemap)
++// stays explicitly REJECTED after the narrowed predicate -- its own
++// dedicated regression fixture/test, distinct from the cube-array test
++// below (the two rejection clauses are independent, gate matrix Open
++// Question 1).
++TEST_CASE("DecodedKtx2Texture: flat 2D-array KTX2 (isArray, numLayers>1, not a cubemap) stays REJECTED -- "
++          "cubemap-only support, zero charter consumer for a general texture array [matrix row 3]") {
++    auto bytes = readFixture("array2d_rejected.ktx2");
++    TranscodePlan plan = planTranscodeFormat(TextureRole::GenericData, alwaysSupported);
++    Ktx2ParseError error = Ktx2ParseError::None;
++    auto decoded = DecodedKtx2Texture::parseAndTranscode(std::span<const std::byte>(bytes), plan, error);
++    REQUIRE(decoded.has_value());  // structurally valid, parseable -- just an unsupported LAYOUT
++    CHECK(decoded->isUnsupportedLayout());
++    CHECK_FALSE(decoded->isCube());
++    CHECK(error == Ktx2ParseError::UnsupportedLayout);
++    CHECK(decoded->levels().empty());
++}
++
++// [Phase 5 Task 6, gate matrix row 3] CUBE-ARRAY (isCubemap && numLayers>1)
++// ALSO stays explicitly REJECTED -- the narrowed predicate's OTHER
++// rejection clause, distinct from the flat-array test above. This is the
++// one shape that could plausibly be mistaken for "just a bigger cubemap"
++// by an implementation that only checked isCubemap without also checking
++// numLayers -- this test exists specifically to catch that mistake.
++TEST_CASE("DecodedKtx2Texture: cube-array KTX2 (isCubemap AND numLayers>1) stays REJECTED, distinct from the "
++          "now-supported single-layer cubemap case [matrix row 3]") {
++    auto bytes = readFixture("cubearray_rejected.ktx2");
++    TranscodePlan plan = planTranscodeFormat(TextureRole::GenericData, alwaysSupported);
++    Ktx2ParseError error = Ktx2ParseError::None;
++    auto decoded = DecodedKtx2Texture::parseAndTranscode(std::span<const std::byte>(bytes), plan, error);
+     REQUIRE(decoded.has_value());  // structurally valid, parseable -- just an unsupported LAYOUT
+     CHECK(decoded->isUnsupportedLayout());
+     CHECK(error == Ktx2ParseError::UnsupportedLayout);
+     CHECK(decoded->levels().empty());
+ }
+ 
+ TEST_CASE("DecodedKtx2Texture: non-Basis (raw RGBA8) fixture is detected via NeedsTranscoding() -- never "
+           "discovered by a blind transcode call hitting KTX_INVALID_OPERATION [matrix's explicitly forbidden "
+           "discovery mechanism]") {
+     auto bytes = readFixture("raw_rgba8.ktx2");
+@@ -448,20 +531,106 @@ TEST_CASE("decodeStbImage: a corrupt/non-image byte stream fails cleanly with a
+     CHECK_FALSE(failureReason.empty());
+ }
+ 
+ TEST_CASE("decodeStbImage: an empty byte span fails cleanly") {
+     std::vector<std::byte> empty;
+     std::string failureReason;
+     auto decoded = decodeStbImage(std::span<const std::byte>(empty), &failureReason);
+     CHECK_FALSE(decoded.has_value());
+ }
+ 
++// ===== decodeStbImageHdr() [Phase 5 Task 6, ticket #42, gate matrix-
++// p5t06-ktx2-cubemap-hdr row 9/13] ==========================================
++
++TEST_CASE("decodeStbImageHdr: a real Radiance .hdr fixture decodes to the exact authored float values, "
++          "including super-unity (>1.0) texels -- decoded-value discipline, the ticket's own explicit bar") {
++    auto bytes = readFixture("equirect_test.hdr");
++    CHECK(stbi_is_hdr_from_memory(reinterpret_cast<const stbi_uc*>(bytes.data()), static_cast<int>(bytes.size())) !=
++          0);
++
++    std::string failureReason;
++    auto decoded = decodeStbImageHdr(std::span<const std::byte>(bytes), &failureReason);
++    REQUIRE(decoded.has_value());
++    CHECK(decoded->width == 2);
++    CHECK(decoded->height == 2);
++    REQUIRE(decoded->rgba32.size() == 2 * 2 * 4);
++
++    // Exact per-texel values, matching generate_fixtures.sh's own RGBE
++    // encoding comment precisely (mantissa_byte * ldexp(1, exponent-136)):
++    // TL=(4,0.5,0.5) TR=(0.5,4,0.5) BL=(0.5,0.5,4) BR=(2,2,2). Row-major,
++    // top-to-bottom (stb's own HDR row order matches the Radiance "-Y"
++    // top-to-bottom convention this fixture was authored with).
++    auto texel = [&](size_t index) {
++        return glm::vec4(decoded->rgba32[index * 4 + 0], decoded->rgba32[index * 4 + 1],
++                          decoded->rgba32[index * 4 + 2], decoded->rgba32[index * 4 + 3]);
++    };
++    constexpr float kEps = 0.0001F;
++    glm::vec4 tl = texel(0);
++    glm::vec4 tr = texel(1);
++    glm::vec4 bl = texel(2);
++    glm::vec4 br = texel(3);
++    CHECK(tl.r == doctest::Approx(4.0F).epsilon(kEps));
++    CHECK(tl.g == doctest::Approx(0.5F).epsilon(kEps));
++    CHECK(tl.b == doctest::Approx(0.5F).epsilon(kEps));
++    CHECK(tr.r == doctest::Approx(0.5F).epsilon(kEps));
++    CHECK(tr.g == doctest::Approx(4.0F).epsilon(kEps));
++    CHECK(tr.b == doctest::Approx(0.5F).epsilon(kEps));
++    CHECK(bl.r == doctest::Approx(0.5F).epsilon(kEps));
++    CHECK(bl.g == doctest::Approx(0.5F).epsilon(kEps));
++    CHECK(bl.b == doctest::Approx(4.0F).epsilon(kEps));
++    CHECK(br.r == doctest::Approx(2.0F).epsilon(kEps));
++    CHECK(br.g == doctest::Approx(2.0F).epsilon(kEps));
++    CHECK(br.b == doctest::Approx(2.0F).epsilon(kEps));
++    // The explicit >1.0-survives bar, asserted directly and loudly (not
++    // just implied by the exact-value checks above).
++    CHECK(tl.r > 1.0F);
++}
++
++TEST_CASE("decodeStbImageHdr: a corrupt/truncated .hdr byte stream fails cleanly with a non-empty failure "
++          "reason, never a crash [mirrors decodeStbImage()'s identical corrupt.png test]") {
++    auto bytes = readFixture("corrupt.hdr");
++    std::string failureReason;
++    auto decoded = decodeStbImageHdr(std::span<const std::byte>(bytes), &failureReason);
++    CHECK_FALSE(decoded.has_value());
++    CHECK_FALSE(failureReason.empty());
++}
++
++TEST_CASE("decodeTextureForUpload: an .hdr byte stream routes to the HDR float path BEFORE the 8-bit stb branch "
++          "ever sees it -- VK_FORMAT_R16G16B16A16_SFLOAT output, closing the silent-tonemap gap row 9's own "
++          "addendum documents") {
++    auto bytes = readFixture("equirect_test.hdr");
++    TextureDecodeResult result =
++        decodeTextureForUpload(std::span<const std::byte>(bytes), TextureRole::Environment,
++                                /*maxImageDimension2D=*/4096, alwaysSupported);
++    REQUIRE(result.outcome == TextureDecodeResult::Outcome::Ready);
++    CHECK(result.format == VK_FORMAT_R16G16B16A16_SFLOAT);
++    CHECK(result.width == 2);
++    CHECK(result.height == 2);
++    CHECK_FALSE(result.isCube);
++    REQUIRE(result.levels.size() == 1);
++    CHECK(result.levels[0].level == 0);
++    CHECK(result.levels[0].faceIndex == 0);
++    // 2x2 texels * 8 bytes/texel (R16G16B16A16_SFLOAT, packed via
++    // glm::packHalf4x16) == 32 bytes.
++    CHECK(result.levels[0].bytes.size() == 2 * 2 * 8);
++
++    // Decode the packed bytes back and confirm the >1.0 texel survived
++    // the SAME float32->float16 packing this task's real upload path
++    // uses (glm::packHalf4x16/glm::unpackHalf4x16 are exact inverses for
++    // any value representable in half precision -- 4.0 is exact).
++    uint64_t packedTl = 0;
++    std::memcpy(&packedTl, result.levels[0].bytes.data(), sizeof(packedTl));
++    glm::vec4 decodedTl = glm::unpackHalf4x16(packedTl);
++    CHECK(decodedTl.r == doctest::Approx(4.0F).epsilon(0.001));
++    CHECK(decodedTl.r > 1.0F);
++}
++
+ TEST_CASE("stbRgba8Format: role-correct SRGB vs UNORM, mirroring roleFormatTable()'s own colorspace column") {
+     CHECK(stbRgba8Format(TextureRole::BaseColor) == VK_FORMAT_R8G8B8A8_SRGB);
+     CHECK(stbRgba8Format(TextureRole::Emissive) == VK_FORMAT_R8G8B8A8_SRGB);
+     CHECK(stbRgba8Format(TextureRole::Normal) == VK_FORMAT_R8G8B8A8_UNORM);
+     CHECK(stbRgba8Format(TextureRole::MetallicRoughness) == VK_FORMAT_R8G8B8A8_UNORM);
+     CHECK(stbRgba8Format(TextureRole::Occlusion) == VK_FORMAT_R8G8B8A8_UNORM);
+     CHECK(stbRgba8Format(TextureRole::GenericData) == VK_FORMAT_R8G8B8A8_UNORM);
+ }
+ 
+ // ===== generateStbMipChain() [texture-path round, D10 Option A] ===========
+diff --git a/src/rx_asset/texture_cache.cpp b/src/rx_asset/texture_cache.cpp
+index 0f17745..05ed47a 100644
+--- a/src/rx_asset/texture_cache.cpp
++++ b/src/rx_asset/texture_cache.cpp
+@@ -1,17 +1,19 @@
+ #include <rx_asset/texture_cache.h>
+ #include <rx_core/debug_checks.h>
+ #include <rx_core/log.h>
+ #include <rx_core/profile.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/deletion_queue.h>
+ #include <rx_rhi_vk/device.h>
++#include <glm/gtc/packing.hpp>
++#include <glm/vec4.hpp>
+ #include <algorithm>
+ #include <cstring>
+ #include <functional>
+ #include <utility>
+ 
+ namespace rx::asset {
+ 
+ namespace {
+ 
+ // glTF sampler enum values [spec section 5.29 "sampler", quoted in gate
+@@ -180,27 +182,69 @@ bool TextureCache::shouldLogOnce(std::string_view debugName, std::string_view ca
+     std::string key;
+     key.reserve(debugName.size() + category.size() + 1);
+     key.append(debugName);
+     key.push_back('|');
+     key.append(category);
+     return loggedFailures_.insert(std::move(key)).second;
+ }
+ 
+ TextureHandle TextureCache::registerRealTexture(TextureRole role, VkFormat format, uint32_t width, uint32_t height,
+                                                   uint32_t mipLevels,
+-                                                  std::span<const rx::rhi::Uploader::ImageMipLevel> uploadLevels) {
+-    auto texture = rx::rhi::Texture2D::createForPresuppliedMips(
+-        device_.physicalDevice(), device_.device(), allocator_, VkExtent2D{width, height}, format,
+-        VK_IMAGE_USAGE_SAMPLED_BIT, mipLevels, rx::rhi::MemoryCategory::Texture);
++                                                  std::span<const rx::rhi::Uploader::ImageMipLevel> uploadLevels,
++                                                  bool isCube) {
++    // [Phase 5 Task 6] `width`/`height`/`mipLevels` are per-FACE for a
++    // cube (see this method's own header comment) -- createCubeForPresuppliedMips()
++    // vs. createForPresuppliedMips() is the only branch point; everything
++    // below (upload, bindless registration, Entry/stats bookkeeping) is
++    // identical for both, since Uploader::uploadImageMips() and
++    // BindlessTable::registerSampledImage() both already accept a cube
++    // Texture2D/view transparently (matrix rows 7/6 -- verified, no
++    // further branching needed).
++    //
++    // TRANSFER_SRC_BIT, additionally: every REAL (non-fallback and
++    // fallback alike) texture this cache creates is now also a valid
++    // vkCmdCopyImage(ToBuffer) SOURCE, not sampled-only. This is the
++    // caller-supplied `usage` parameter both Texture2D factories already
++    // OR with their own mandatory TRANSFER_DST_BIT (texture.h's own
++    // documented contract) -- adding SRC here does not touch either
++    // factory's "no blit-format-feature probe / never called with
++    // recordMipChainBlit()" mip-GENERATION contract at all (that
++    // reasoning is about BLIT-source use for THIS class's own mip-chain
++    // generation mechanism, which createForPresuppliedMips()/
++    // createCubeForPresuppliedMips() never invoke regardless of this
++    // bit). Cost is zero on any conformant Vulkan implementation
++    // (TRANSFER_SRC_BIT is part of the Vulkan spec's own mandatory
++    // format-feature support for every optimal-tiling SAMPLED_IMAGE
++    // format this engine uses). Rationale: gate matrix-p5t06-ktx2-
++    // cubemap-hdr row 11 itself names "direct face-indexed readback" as
++    // the GPU test technique for a cube texture's per-face values --
++    // exactly a raw vkCmdCopyImageToBuffer off a TextureCache-resident
++    // image (texture_cache_test.cpp's own rawImageForTesting()-based
++    // tests) -- and the identical need applies to the new
++    // R16G16B16A16_SFLOAT Environment HDR path's own value-readback test
++    // (row 13's ">1.0 texel survives" bar). A generically useful
++    // capability (debug/screenshot capture of any resident texture, a
++    // future mip-streaming downgrade copy), not test-only surface area
++    // bolted on: nothing about the bit itself is test-specific, only
++    // today's callers of it are.
++    constexpr VkImageUsageFlags kRealTextureUsage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    auto texture = isCube ? rx::rhi::Texture2D::createCubeForPresuppliedMips(
++                                 device_.physicalDevice(), device_.device(), allocator_, VkExtent2D{width, height},
++                                 format, kRealTextureUsage, mipLevels, rx::rhi::MemoryCategory::Texture)
++                           : rx::rhi::Texture2D::createForPresuppliedMips(
++                                 device_.physicalDevice(), device_.device(), allocator_, VkExtent2D{width, height},
++                                 format, kRealTextureUsage, mipLevels, rx::rhi::MemoryCategory::Texture);
+     if (!texture.has_value()) {
+-        RX_LOG_ERROR("rx_asset: TextureCache: Texture2D::createForPresuppliedMips failed ({}x{}, {} levels, format={})",
+-                     width, height, mipLevels, static_cast<int>(format));
++        RX_LOG_ERROR(
++            "rx_asset: TextureCache: Texture2D::{} failed ({}x{}, {} levels, format={}, isCube={})",
++            isCube ? "createCubeForPresuppliedMips" : "createForPresuppliedMips", width, height, mipLevels,
++            static_cast<int>(format), isCube);
+         return TextureHandle{};
+     }
+ 
+     if (!uploader_.uploadImageMips(*texture, uploadLevels)) {
+         RX_LOG_ERROR("rx_asset: TextureCache: Uploader::uploadImageMips failed ({}x{}, {} levels)", width, height,
+                      uploadLevels.size());
+         // [Fix round, Finding H1(b)] `uploadImageMips()` may already have
+         // recorded partial GPU commands referencing `texture`'s own VkImage
+         // before reporting failure -- ensure they are flushed and their
+         // completion awaited before this scope's own destructor destroys
+@@ -241,20 +285,21 @@ TextureHandle TextureCache::registerRealTexture(TextureRole role, VkFormat forma
+     uint64_t allocatedBytes = texture->allocatedBytes();
+ 
+     Entry entry;
+     entry.record.isFallback = false;
+     entry.record.role = role;
+     entry.record.bindlessIndex = bindlessHandle.index();
+     entry.record.width = width;
+     entry.record.height = height;
+     entry.record.mipLevels = mipLevels;
+     entry.record.format = format;
++    entry.record.isCube = isCube;
+     entry.record.resident = true;
+     entry.image = std::move(texture);
+     entry.bindlessHandle = bindlessHandle;
+ 
+     TextureHandle handle = pool_.acquire(std::move(entry));
+     TextureCacheStats::RoleStats& roleStats = stats_.byRole[static_cast<size_t>(role)];
+     roleStats.bytes += allocatedBytes;
+     roleStats.count += 1;
+     stats_.totalBytes += allocatedBytes;
+     stats_.totalCount += 1;
+@@ -316,63 +361,106 @@ std::optional<TextureHandle> TextureCache::uploadCheckerboard() {
+     if (!handle.isValid()) {
+         RX_LOG_ERROR("rx_asset: TextureCache: failed to build the D11 checkerboard fallback texture");
+         return std::nullopt;
+     }
+     if (Entry* entry = pool_.get(handle)) {
+         entry->record.isFallback = true;
+     }
+     return handle;
+ }
+ 
++std::optional<TextureHandle> TextureCache::uploadEnvironmentFallback() {
++    // [Coordinator ruling T6, gate matrix Open Question 3] Small (4x4,
++    // matching this class's own checkerboard/solid-color fallback sizing
++    // convention) uniform MID-GRAY, VK_FORMAT_R16G16B16A16_SFLOAT --
++    // uploaded through the identical glm::packHalf4x16 float-packing this
++    // class's real HDR path (TextureCache::applyDecodeResult(), fed by
++    // decodeStbHdrForUpload()) produces, rather than reusing
++    // uploadSolidColor()'s 8-bit RGBA-cast-to-float shortcut -- proves the
++    // real float upload path works even before Stage 1 lands an actual
++    // HDR asset.
++    constexpr uint32_t kSize = 4;
++    constexpr float kMidGray = 0.5F;  // linear mid-gray, not sRGB 0.5 -- Environment is always linear (roleExpectsSrgb()==false)
++    const uint64_t packedTexel = glm::packHalf4x16(glm::vec4(kMidGray, kMidGray, kMidGray, 1.0F));
++
++    std::array<uint64_t, kSize * kSize> pixels{};
++    pixels.fill(packedTexel);
++
++    rx::rhi::Uploader::ImageMipLevel level{};
++    level.data = pixels.data();
++    level.size = pixels.size() * sizeof(uint64_t);
++    level.mipLevel = 0;
++    level.extent = VkExtent2D{kSize, kSize};
++
++    TextureHandle handle =
++        registerRealTexture(TextureRole::Environment, VK_FORMAT_R16G16B16A16_SFLOAT, kSize, kSize, 1,
++                             std::span<const rx::rhi::Uploader::ImageMipLevel>(&level, 1));
++    if (!handle.isValid()) {
++        RX_LOG_ERROR("rx_asset: TextureCache: failed to build the D11 Environment mid-gray fallback texture");
++        return std::nullopt;
++    }
++    if (Entry* entry = pool_.get(handle)) {
++        entry->record.isFallback = true;
++    }
++    return handle;
++}
++
+ bool TextureCache::buildFallbackTextures() {
+     auto checker = uploadCheckerboard();
+     if (!checker.has_value()) {
+         return false;
+     }
+     checkerboard_ = *checker;
+ 
+     // D11's own enumeration is exactly THREE utility assets ("1x1 white +
+     // flat-normal + neutral-MR") shared across the roles that expect an
+     // "as if untextured" (texture-times-factor-equals-factor) sampled
+     // value -- built once each, then fanned out by role below, rather
+-    // than 6 separate near-identical GPU allocations.
++    // than 6 separate near-identical GPU allocations. [Phase 5 Task 6]
++    // Environment gets its OWN, fourth, real fallback texture (mid-gray
++    // float, uploadEnvironmentFallback() above) -- it has no "as if
++    // untextured * factor" precedent to share with any existing role.
+     auto white =
+         uploadSolidColor(TextureRole::GenericData, {255, 255, 255, 255}, VK_FORMAT_R8G8B8A8_UNORM, "fallback:white");
+     // Tangent-space "straight up" normal, UNORM-encoded ((0,0,1) ->
+     // (128,128,255)) -- D11's own "flat-normal", never the checkerboard,
+     // for an UNBOUND normal slot (a magenta normal map would shade
+     // garbage).
+     auto flatNormal =
+         uploadSolidColor(TextureRole::Normal, {128, 128, 255, 255}, VK_FORMAT_R8G8B8A8_UNORM, "fallback:flat-normal");
+     auto neutralMr = uploadSolidColor(TextureRole::MetallicRoughness, {255, 255, 255, 255}, VK_FORMAT_R8G8B8A8_UNORM,
+                                        "fallback:neutral-MR");
+-    if (!white.has_value() || !flatNormal.has_value() || !neutralMr.has_value()) {
++    auto environment = uploadEnvironmentFallback();
++    if (!white.has_value() || !flatNormal.has_value() || !neutralMr.has_value() || !environment.has_value()) {
+         return false;
+     }
+ 
+     roleFallback_[static_cast<size_t>(TextureRole::BaseColor)] = *white;
+     roleFallback_[static_cast<size_t>(TextureRole::Emissive)] = *white;
+     roleFallback_[static_cast<size_t>(TextureRole::GenericData)] = *white;
+     roleFallback_[static_cast<size_t>(TextureRole::Normal)] = *flatNormal;
+     roleFallback_[static_cast<size_t>(TextureRole::MetallicRoughness)] = *neutralMr;
+     roleFallback_[static_cast<size_t>(TextureRole::Occlusion)] = *neutralMr;
+-
+-    // [D25] ONE flush()+wait() covering all 4 fallback uploads together --
+-    // load-bearing, not cosmetic: without this, their upload commands stay
+-    // RECORDED-but-never-submitted on this Uploader's active command
+-    // buffer (`recording_` stays true) for as long as no LATER load() call
+-    // happens to trigger a flush of its own. A TextureCache that is
+-    // constructed and then torn down without ever loading a REAL texture
+-    // (every load() call resolving to the checkerboard fallback, e.g. this
+-    // class's own cubemap/corrupt/missing-byte-source failure-path tests)
+-    // would otherwise reach ~TextureCache() with those 4 images destroyed
+-    // while Uploader's OWN destructor still auto-flushes (calls
++    roleFallback_[static_cast<size_t>(TextureRole::Environment)] = *environment;
++
++    // [D25] ONE flush()+wait() covering all 5 fallback uploads together
++    // (checkerboard + white + flat-normal + neutral-MR + [Phase 5 Task 6]
++    // the new Environment mid-gray) -- load-bearing, not cosmetic: without
++    // this, their upload commands stay RECORDED-but-never-submitted on
++    // this Uploader's active command buffer (`recording_` stays true) for
++    // as long as no LATER load() call happens to trigger a flush of its
++    // own. A TextureCache that is constructed and then torn down without
++    // ever loading a REAL texture (every load() call resolving to the
++    // checkerboard fallback, e.g. this class's own corrupt/missing-byte-
++    // source failure-path tests) would otherwise reach ~TextureCache()
++    // with those images destroyed while Uploader's OWN destructor still
++    // auto-flushes (calls
+     // vkEndCommandBuffer on) the very command buffer that recorded copies
+     // into them -- reproduced directly, empirically, as a real
+     // UNASSIGNED-CoreValidation-DrawState-InvalidCommandBuffer-VkImage
+     // validation error the first time this task's own test suite ran
+     // without this call.
+     uploader_.wait(uploader_.flush());
+     return true;
+ }
+ 
+ TextureDecodeResult TextureCache::decodeForUpload(std::span<const std::byte> bytes, TextureRole role) const {
+@@ -398,25 +486,35 @@ TextureHandle TextureCache::applyDecodeResult(const TextureDecodeResult& decoded
+     }
+ 
+     std::vector<rx::rhi::Uploader::ImageMipLevel> uploadLevels;
+     uploadLevels.reserve(decoded.levels.size());
+     for (const DecodedTextureLevel& lvl : decoded.levels) {
+         rx::rhi::Uploader::ImageMipLevel u{};
+         u.data = lvl.bytes.data();
+         u.size = static_cast<VkDeviceSize>(lvl.bytes.size());
+         u.mipLevel = lvl.level;
+         u.extent = VkExtent2D{lvl.width, lvl.height};
++        // [Phase 5 Task 6] 0 for every non-cube decode (lvl.faceIndex's
++        // own default) -- byte-identical to every pre-Task-6 upload; the
++        // real face 0..5 for a cube decode's own 6*perFaceLevels entries.
++        u.baseArrayLayer = lvl.faceIndex;
+         uploadLevels.push_back(u);
+     }
+ 
++    // [Phase 5 Task 6] `decoded.levels.size()` is the PER-FACE mip count
++    // times 6 for a cube decode -- registerRealTexture()'s own `mipLevels`
++    // parameter wants the PER-FACE count (matches its `isCube` contract,
++    // this method's own header comment).
++    const uint32_t mipLevels = decoded.isCube ? static_cast<uint32_t>(decoded.levels.size() / 6)
++                                               : static_cast<uint32_t>(decoded.levels.size());
+     TextureHandle handle = registerRealTexture(decoded.role, decoded.format, decoded.width, decoded.height,
+-                                                static_cast<uint32_t>(decoded.levels.size()), uploadLevels);
++                                                mipLevels, uploadLevels, decoded.isCube);
+     if (!handle.isValid()) {
+         return failureFallback(debugName, "GPU upload/bindless registration failed");
+     }
+     return handle;
+ }
+ 
+ TextureHandle TextureCache::registerDecoded(const TextureDecodeResult& decoded, std::string_view debugName) {
+     RX_ASSERT_MAIN_THREAD("TextureCache::registerDecoded");
+     RX_ZONE;
+     // No flush()/wait() here -- see this method's own header comment
+@@ -599,20 +697,29 @@ TextureCacheStats TextureCache::stats() const {
+ size_t TextureCache::samplerCountForTesting() const {
+     RX_ASSERT_MAIN_THREAD("TextureCache::samplerCountForTesting");
+     return samplerCache_.size();
+ }
+ 
+ size_t TextureCache::liveTextureCountForTesting() const {
+     RX_ASSERT_MAIN_THREAD("TextureCache::liveTextureCountForTesting");
+     return pool_.liveCount();
+ }
+ 
++VkImage TextureCache::rawImageForTesting(TextureHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("TextureCache::rawImageForTesting");
++    const Entry* entry = pool_.get(handle);
++    if (entry == nullptr || !entry->image.has_value()) {
++        return VK_NULL_HANDLE;
++    }
++    return entry->image->image();
++}
++
+ void TextureCache::evictForTesting(TextureHandle handle, uint64_t frameIndex) {
+     RX_ASSERT_MAIN_THREAD("TextureCache::evictForTesting");
+     releaseInternal(handle, frameIndex);
+ }
+ 
+ void TextureCache::releaseUnpublished(TextureHandle handle, uint64_t frameIndex) {
+     RX_ASSERT_MAIN_THREAD("TextureCache::releaseUnpublished");
+     releaseInternal(handle, frameIndex);
+ }
+ 
+diff --git a/src/rx_asset/texture_decode.cpp b/src/rx_asset/texture_decode.cpp
+index dc03c4f..1e77218 100644
+--- a/src/rx_asset/texture_decode.cpp
++++ b/src/rx_asset/texture_decode.cpp
+@@ -1,14 +1,16 @@
+ #include <rx_asset/texture_decode.h>
+ #include <rx_core/log.h>
+ #include <stb_image.h>
+ #include <stb_image_resize2.h>
++#include <glm/gtc/packing.hpp>
++#include <glm/vec4.hpp>
+ #include <algorithm>
+ #include <array>
+ #include <cmath>
+ #include <cstring>
+ #include <utility>
+ 
+ namespace rx::asset {
+ 
+ const char* textureRoleName(TextureRole role) {
+     switch (role) {
+@@ -17,33 +19,37 @@ const char* textureRoleName(TextureRole role) {
+         case TextureRole::Emissive:
+             return "emissive";
+         case TextureRole::Normal:
+             return "normal";
+         case TextureRole::MetallicRoughness:
+             return "metallicRoughness";
+         case TextureRole::Occlusion:
+             return "occlusion";
+         case TextureRole::GenericData:
+             return "genericData";
++        case TextureRole::Environment:
++            return "environment";
+     }
+     return "unknown";
+ }
+ 
+ bool roleExpectsSrgb(TextureRole role) {
+     // [glTF 2.0 spec, quoted in gate matrix-issue03] baseColorTexture/
+     // emissiveTexture "MUST contain 8-bit values encoded with the sRGB
+     // opto-electronic transfer function"; every other role is linear --
+     // metallicRoughnessTexture/normalTexture are explicit MUST-linear
+     // spec text, occlusionTexture is convention-linear (the spec defines
+     // only its scalar semantics, never a transfer function -- gate matrix
+     // Conflict C3, cited precisely rather than lumped in with the
+-    // MUST-linear pair).
++    // MUST-linear pair). [Phase 5 Task 6] Environment is physical light
++    // data (radiance), always linear -- never sRGB-encoded, same
++    // reasoning as MetallicRoughness/Occlusion.
+     return role == TextureRole::BaseColor || role == TextureRole::Emissive;
+ }
+ 
+ // D10 role -> transcode-target table [matrix-issue03 "Role->format matrix
+ // completeness" row]: TOTAL over TextureRole via an exhaustive switch with
+ // NO default case -- adding an enumerator without a case here produces a
+ // compiler WARNING (-Wswitch; this project's build carries no -Werror
+ // anywhere, verified directly, so this is real but non-fatal build-log
+ // signal, not a hard compile error), not a silently-wrong runtime
+ // default. BC4_R
+@@ -61,20 +67,36 @@ const RoleFormatEntry& roleFormatTable(TextureRole role) {
+     switch (role) {
+         case TextureRole::BaseColor:
+         case TextureRole::Emissive:
+             return kBaseColorEmissive;
+         case TextureRole::Normal:
+             return kNormal;
+         case TextureRole::MetallicRoughness:
+         case TextureRole::Occlusion:
+         case TextureRole::GenericData:
+             return kUnormData;
++        case TextureRole::Environment:
++            // [Phase 5 Task 6, gate matrix row 8's own disposition] DEAD
++            // CODE for this task's actual HDR path -- decodeStbImageHdr()'s
++            // caller (decodeStbHdrForUpload(), below) bypasses
++            // planTranscodeFormat()/roleFormatTable() entirely (a Radiance
++            // .hdr file always uploads as VK_FORMAT_R16G16B16A16_SFLOAT
++            // per the phase's environment-upload-format ruling, never a
++            // Basis-transcode-shaped format). This entry exists ONLY to
++            // keep the switch total (an Environment-role KTX2 -- e.g. a
++            // conceivable future Basis-encoded environment cubemap -- must
++            // still resolve to SOME entry): linear/non-sRGB, matching
++            // Environment's own roleExpectsSrgb()==false, reusing
++            // kUnormData rather than inventing a fourth near-identical
++            // constant for a path nothing in this task's fixtures
++            // exercises.
++            return kUnormData;
+     }
+     // Unreachable given the exhaustive switch above (every TextureRole
+     // enumerator is covered) -- kept as a defensive terminator rather
+     // than UB on an out-of-range enum value, matching this codebase's own
+     // memoryCategoryName()-style convention for exhaustive-but-defensive
+     // lookups.
+     return kUnormData;
+ }
+ 
+ TranscodePlan planTranscodeFormat(TextureRole role, const FormatSupportQuery& isFormatSupported) {
+@@ -131,22 +153,31 @@ bool looksLikeKtx2(std::span<const std::byte> bytes) {
+     }
+     return std::memcmp(bytes.data(), kMagic.data(), kMagic.size()) == 0;
+ }
+ 
+ bool exceedsDimensionLimit(uint32_t width, uint32_t height, uint32_t maxDimension2D) {
+     return width > maxDimension2D || height > maxDimension2D;
+ }
+ 
+ namespace {
+ 
++// [Phase 5 Task 6, ticket #42, gate matrix-p5t06-ktx2-cubemap-hdr row 3/
++// Open Question 1, coordinator ruling T6] NARROWED from Phase 4's blanket
++// rejection: a plain, single-layer CUBEMAP (isCubemap && numLayers <= 1,
++// which by the KTX2 spec always means numFaces == 6) is now SUPPORTED.
++// Flat 2D arrays (isArray && !isCubemap) and cube-arrays (isCubemap &&
++// numLayers > 1) stay explicitly rejected -- zero charter consumer needs
++// either anywhere in the Stage 0-4 plan text (matrix's own Open Question
++// 1 finding); FG1's real consumer needs exactly ONE cubemap per
++// environment. 1D/3D (numDimensions != 2) stays rejected unchanged.
+ bool isUnsupportedLayoutFor(const ktxTexture2* tex) {
+-    return tex->isArray || tex->isCubemap || tex->numFaces > 1 || tex->numLayers > 1 || tex->numDimensions != 2;
++    return tex->numDimensions != 2 || (tex->isArray && !tex->isCubemap) || (tex->isCubemap && tex->numLayers > 1);
+ }
+ 
+ }  // namespace
+ 
+ DecodedKtx2Texture::DecodedKtx2Texture(ktxTexture2* texture, bool wasBasisEncoded, bool unsupportedLayout,
+                                         VkFormat currentFormat, khr_df_transfer_e originalTransfer)
+     : texture_(texture), wasBasisEncoded_(wasBasisEncoded), unsupportedLayout_(unsupportedLayout),
+       currentFormat_(currentFormat), originalTransfer_(originalTransfer) {}
+ 
+ DecodedKtx2Texture::DecodedKtx2Texture(DecodedKtx2Texture&& other) noexcept
+@@ -262,32 +293,59 @@ std::optional<DecodedKtx2Texture> DecodedKtx2Texture::parseAndTranscode(std::spa
+     return DecodedKtx2Texture(texture, /*wasBasisEncoded=*/true, /*unsupportedLayout=*/false, plan.vkFormat,
+                                originalTransfer);
+ }
+ 
+ uint32_t DecodedKtx2Texture::width() const { return texture_ != nullptr ? texture_->baseWidth : 0; }
+ uint32_t DecodedKtx2Texture::height() const { return texture_ != nullptr ? texture_->baseHeight : 0; }
+ uint32_t DecodedKtx2Texture::numLevels() const { return texture_ != nullptr ? texture_->numLevels : 0; }
+ VkFormat DecodedKtx2Texture::currentVkFormat() const { return currentFormat_; }
+ bool DecodedKtx2Texture::isUnsupportedLayout() const { return unsupportedLayout_; }
+ 
+-std::vector<MipLevelData> DecodedKtx2Texture::levels() const {
++// [Phase 5 Task 6] isCube()/numFaces() are only meaningful once
++// isUnsupportedLayout() == false -- a rejected container (including a
++// cube-array, which also sets texture_->isCubemap) never reaches here
++// through the caller's own required check, so this does not need to
++// separately re-derive "supported cube" vs. "rejected cube-array": every
++// caller of levels(face) already gated on isUnsupportedLayout() first.
++bool DecodedKtx2Texture::isCube() const { return texture_ != nullptr && texture_->isCubemap != 0; }
++uint32_t DecodedKtx2Texture::numFaces() const { return texture_ != nullptr ? texture_->numFaces : 0; }
++
++std::vector<MipLevelData> DecodedKtx2Texture::levels(uint32_t face) const {
+     std::vector<MipLevelData> result;
+     if (texture_ == nullptr || unsupportedLayout_) {
+         return result;
+     }
+     result.reserve(texture_->numLevels);
+     const ktx_uint8_t* base = ktxTexture_GetData(ktxTexture(texture_));
+     for (uint32_t level = 0; level < texture_->numLevels; ++level) {
+         ktx_size_t offset = 0;
+-        if (ktxTexture_GetImageOffset(ktxTexture(texture_), level, 0, 0, &offset) != KTX_SUCCESS) {
++        // [Phase 5 Task 6, gate matrix row 7's own "DecodedKtx2Texture::
++        // levels()'s face-blindness" gap] `layer` stays 0 (a supported
++        // cubemap is always single-layer, isUnsupportedLayoutFor()'s own
++        // narrowed predicate guarantees numLayers <= 1); `faceSlice` is
++        // now the caller-supplied `face` instead of the old hardcoded 0
++        // -- the vendored ktx.h's own ktxTexture_GetImageOffset() macro
++        // signature already had this exact parameter, simply unused
++        // before this task.
++        if (ktxTexture_GetImageOffset(ktxTexture(texture_), level, /*layer=*/0, face, &offset) != KTX_SUCCESS) {
+             continue;
+         }
++        // ktxTexture_GetImageSize() returns ONE image's bytes (this
++        // face's own share of the level, not the level's combined
++        // multi-face total) -- verified against this project's own
++        // vendored libktx (v4.4.2): the identical GetImageSize()/
++        // GetImageOffset() pairing already worked correctly for the
++        // numFaces==1 case pre-Task-6, where "one image" and "the whole
++        // level" are trivially the same value; ktxTexture_IterateLevelFaces()'s
++        // own per-face callback contract (`faceLodSize`, ktx.h) confirms
++        // the per-image (not per-level-combined) semantics for the
++        // numFaces==6 case this task adds.
+         ktx_size_t size = ktxTexture_GetImageSize(ktxTexture(texture_), level);
+         // True (sub-block-tolerant) mip-level extent -- NEVER rounded up
+         // to block granularity. See this struct's own header comment for
+         // why `bytes.size()` can legitimately be one whole compressed
+         // block even when width/height report 2 or 1 (the sub-block mip
+         // tail, gate matrix-issue03's own "classic off-by-one" row).
+         uint32_t levelWidth = std::max<uint32_t>(1U, texture_->baseWidth >> level);
+         uint32_t levelHeight = std::max<uint32_t>(1U, texture_->baseHeight >> level);
+         MipLevelData data;
+         data.level = level;
+@@ -339,20 +397,61 @@ std::optional<DecodedStbImage> decodeStbImage(std::span<const std::byte> bytes,
+     result.was16Bit = was16Bit;
+     result.rgba8.assign(pixels, pixels + (static_cast<size_t>(width) * height * 4));
+     stbi_image_free(pixels);
+     return result;
+ }
+ 
+ VkFormat stbRgba8Format(TextureRole role) {
+     return roleExpectsSrgb(role) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+ }
+ 
++// ---------------------------------------------------------------------
++// [Phase 5 Task 6] Radiance (.hdr) float decode path -- see this
++// function's own declaration (texture_decode.h) for the full "why this
++// exists / what silent bug it closes" rationale.
++// ---------------------------------------------------------------------
++
++std::optional<DecodedStbHdrImage> decodeStbImageHdr(std::span<const std::byte> bytes, std::string* outFailureReason) {
++    if (bytes.empty()) {
++        if (outFailureReason != nullptr) {
++            *outFailureReason = "empty byte span";
++        }
++        return std::nullopt;
++    }
++
++    int width = 0;
++    int height = 0;
++    int channelsInFile = 0;
++    const auto* data = reinterpret_cast<const stbi_uc*>(bytes.data());
++    const int len = static_cast<int>(bytes.size());
++
++    // desired_channels=4 -- forces a real RGBA float buffer regardless of
++    // the source's own channel count (mirrors decodeStbImage()'s
++    // identical desired_channels=4 choice for the 8-bit path), so this
++    // function's own caller never needs to branch on channelsInFile.
++    float* pixels = stbi_loadf_from_memory(data, len, &width, &height, &channelsInFile, /*desired_channels=*/4);
++    if (pixels == nullptr) {
++        if (outFailureReason != nullptr) {
++            const char* reason = stbi_failure_reason();
++            *outFailureReason = reason != nullptr ? reason : "unknown stb_image HDR failure";
++        }
++        return std::nullopt;
++    }
++
++    DecodedStbHdrImage result;
++    result.width = static_cast<uint32_t>(width);
++    result.height = static_cast<uint32_t>(height);
++    result.rgba32.assign(pixels, pixels + (static_cast<size_t>(width) * height * 4));
++    stbi_image_free(pixels);
++    return result;
++}
++
+ // ---------------------------------------------------------------------
+ // [texture-path round, D10 Option A] Runtime mip-chain generation for the
+ // stb decode path -- see this function's own declaration (texture_decode.h)
+ // for the full per-role correctness contract this implements.
+ // ---------------------------------------------------------------------
+ 
+ namespace {
+ 
+ // Standard floor-halving step: max(1, extent >> 1) -- the same formula
+ // Vulkan's own mip-dimension rule uses, and DecodedKtx2Texture::levels()'s
+@@ -503,25 +602,25 @@ TextureDecodeResult decodeKtx2ForUpload(std::span<const std::byte> bytes, Textur
+     Ktx2ParseError parseError = Ktx2ParseError::None;
+     auto decoded = DecodedKtx2Texture::parseAndTranscode(bytes, plan, parseError);
+     if (!decoded.has_value()) {
+         result.outcome = TextureDecodeResult::Outcome::Failed;
+         result.failureReason = std::string("KTX2 parse/transcode failed: ") + ktx2ParseErrorName(parseError);
+         return result;
+     }
+ 
+     if (decoded->isUnsupportedLayout()) {
+         result.outcome = TextureDecodeResult::Outcome::Checkerboard;
+-        result.failureReason = "cubemap/array/non-2D KTX2 container";
++        result.failureReason = "array/cube-array/non-2D KTX2 container";
+         result.warnings.push_back(
+             {"unsupported-layout",
+-             "is a cubemap/array/non-2D KTX2 container -- unsupported in Phase 4 (FG1, the registered "
+-             "techniques-phase skybox/IBL consumer, is the scheduled loader for this layout); falling back to "
++             "is an array, cube-array, or non-2D KTX2 container -- unsupported (cubemap-only per the Phase 5 Task "
++             "6 ruling; zero charter consumer needs a general texture array or cube-array); falling back to "
+              "checkerboard"});
+         return result;
+     }
+ 
+     if (exceedsDimensionLimit(decoded->width(), decoded->height(), maxImageDimension2D)) {
+         result.outcome = TextureDecodeResult::Outcome::Checkerboard;
+         result.failureReason = "exceeds maxImageDimension2D";
+         result.warnings.push_back(
+             {"oversized", "is " + std::to_string(decoded->width()) + "x" + std::to_string(decoded->height()) +
+                               ", exceeding this device's maxImageDimension2D=" + std::to_string(maxImageDimension2D) +
+@@ -548,44 +647,60 @@ TextureDecodeResult decodeKtx2ForUpload(std::span<const std::byte> bytes, Textur
+             result.outcome = TextureDecodeResult::Outcome::Checkerboard;
+             result.failureReason = "non-Basis KTX2 stored format unsupported for sampling";
+             result.warnings.push_back(
+                 {"unsupported-stored-format",
+                  "is a non-Basis KTX2 stored as format " + std::to_string(static_cast<int>(finalFormat)) +
+                      ", unsupported for sampling on this device -- falling back to checkerboard"});
+             return result;
+         }
+     }
+ 
+-    std::vector<MipLevelData> levels = decoded->levels();
+-    if (levels.empty()) {
++    // [Phase 5 Task 6] Face 0's own levels first -- both the "how many
++    // levels/is there a mip chain" question below AND (for a plain 2D
++    // texture) the whole answer are decided off this one call; a
++    // supported cubemap's remaining 5 faces are appended after, below.
++    std::vector<MipLevelData> faceZeroLevels = decoded->levels(0);
++    if (faceZeroLevels.empty()) {
+         result.outcome = TextureDecodeResult::Outcome::Failed;
+         result.failureReason = "KTX2 container reported zero usable mip levels";
+         return result;
+     }
+-    if (levels.size() == 1) {
++    if (faceZeroLevels.size() == 1) {
+         result.warnings.push_back(
+             {"no-mips", "has no mip chain (1 level) -- recommend regenerating with `toktx --genmipmap` (D10; no "
+                         "runtime mip generation for block-compressed formats)"});
+     }
+ 
+     result.outcome = TextureDecodeResult::Outcome::Ready;
+     result.format = finalFormat;
+     result.width = decoded->width();
+     result.height = decoded->height();
+-    result.levels.reserve(levels.size());
+-    for (const MipLevelData& lvl : levels) {
+-        DecodedTextureLevel out;
+-        out.level = lvl.level;
+-        out.width = lvl.width;
+-        out.height = lvl.height;
+-        out.bytes.assign(lvl.bytes.begin(), lvl.bytes.end());
+-        result.levels.push_back(std::move(out));
++    result.isCube = decoded->isCube();
++
++    const uint32_t faceCount = result.isCube ? decoded->numFaces() : 1;
++    result.levels.reserve(static_cast<size_t>(faceZeroLevels.size()) * faceCount);
++    for (uint32_t face = 0; face < faceCount; ++face) {
++        // Face 0's levels are already fetched above (also doubles as the
++        // "does this container have any usable data at all" probe) --
++        // every later face is fetched fresh, exactly the same way, per
++        // the vendored GetImageOffset()/GetImageSize() per-face contract
++        // this class's own levels(face) comment documents.
++        std::vector<MipLevelData> faceLevels = (face == 0) ? std::move(faceZeroLevels) : decoded->levels(face);
++        for (const MipLevelData& lvl : faceLevels) {
++            DecodedTextureLevel out;
++            out.level = lvl.level;
++            out.width = lvl.width;
++            out.height = lvl.height;
++            out.faceIndex = face;
++            out.bytes.assign(lvl.bytes.begin(), lvl.bytes.end());
++            result.levels.push_back(std::move(out));
++        }
+     }
+     return result;
+ }
+ 
+ TextureDecodeResult decodeStbForUpload(std::span<const std::byte> bytes, TextureRole role,
+                                          uint32_t maxImageDimension2D) {
+     TextureDecodeResult result;
+     result.role = role;
+ 
+     std::string failureReason;
+@@ -636,26 +751,111 @@ TextureDecodeResult decodeStbForUpload(std::span<const std::byte> bytes, Texture
+     // registration code needed for this to reach the GPU (sponza-visual-
+     // investigation.md §2.7's own finding).
+     std::vector<DecodedTextureLevel> mips =
+         generateStbMipChain(std::span<const uint8_t>(decoded->rgba8), decoded->width, decoded->height, role);
+     for (DecodedTextureLevel& mip : mips) {
+         result.levels.push_back(std::move(mip));
+     }
+     return result;
+ }
+ 
++// [Phase 5 Task 6] Radiance (.hdr) equirect float path -- see
++// decodeStbImageHdr()'s own header comment (texture_decode.h) for why
++// this must run BEFORE decodeStbForUpload() (the 8-bit branch) ever gets
++// a chance to silently tonemap this same content.
++TextureDecodeResult decodeStbHdrForUpload(std::span<const std::byte> bytes, TextureRole role,
++                                            uint32_t maxImageDimension2D, const FormatSupportQuery& isFormatSupported) {
++    TextureDecodeResult result;
++    result.role = role;
++
++    std::string failureReason;
++    auto decoded = decodeStbImageHdr(bytes, &failureReason);
++    if (!decoded.has_value()) {
++        result.outcome = TextureDecodeResult::Outcome::Failed;
++        result.failureReason = std::string("stb HDR decode failed: ") + failureReason;
++        return result;
++    }
++
++    if (exceedsDimensionLimit(decoded->width, decoded->height, maxImageDimension2D)) {
++        result.outcome = TextureDecodeResult::Outcome::Checkerboard;
++        result.failureReason = "exceeds maxImageDimension2D";
++        result.warnings.push_back(
++            {"oversized", "is " + std::to_string(decoded->width) + "x" + std::to_string(decoded->height) +
++                              ", exceeding this device's maxImageDimension2D=" + std::to_string(maxImageDimension2D) +
++                              " -- falling back to checkerboard"});
++        return result;
++    }
++
++    // [Coordinator ruling T6, gate matrix row 9 Open Question 2]
++    // R16G16B16A16_SFLOAT unconditionally -- the phase's single-sourced
++    // environment-upload-format choice, matching the SAME kHdrFormat
++    // convention every existing sample already defines. Still gated on a
++    // real isFormatSupported() query (D11 defensive discipline, never
++    // assumed) even though this is a Vulkan-mandatory format for
++    // SAMPLED_IMAGE + optimal tiling on every conformant implementation --
++    // never actually expected to fail on real hardware, but a graceful
++    // checkerboard fallback costs nothing and matches every other branch
++    // in this file.
++    constexpr VkFormat kEnvironmentHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
++    if (!isFormatSupported || !isFormatSupported(kEnvironmentHdrFormat)) {
++        result.outcome = TextureDecodeResult::Outcome::Checkerboard;
++        result.failureReason = "R16G16B16A16_SFLOAT unsupported for sampling on this device";
++        result.warnings.push_back(
++            {"unsupported-stored-format", "the environment HDR upload format (VK_FORMAT_R16G16B16A16_SFLOAT) is "
++                                           "unsupported for sampling on this device -- falling back to checkerboard"});
++        return result;
++    }
++
++    // float32 (stb's own decode) -> float16 packed bytes: GLM's own
++    // reference half-float packer (glm::packHalf4x16, already used
++    // process-wide for this exact format -- rx_graph/scene_color.h's own
++    // kHdrFormat readback tests) -- library-first, no hand-rolled
++    // float-to-half bit-twiddling written for this task.
++    const size_t texelCount = static_cast<size_t>(decoded->width) * decoded->height;
++    std::vector<std::byte> packed(texelCount * sizeof(uint64_t));
++    for (size_t i = 0; i < texelCount; ++i) {
++        glm::vec4 texel(decoded->rgba32[i * 4 + 0], decoded->rgba32[i * 4 + 1], decoded->rgba32[i * 4 + 2],
++                         decoded->rgba32[i * 4 + 3]);
++        uint64_t half = glm::packHalf4x16(texel);
++        std::memcpy(packed.data() + i * sizeof(uint64_t), &half, sizeof(uint64_t));
++    }
++
++    result.outcome = TextureDecodeResult::Outcome::Ready;
++    result.format = kEnvironmentHdrFormat;
++    result.width = decoded->width;
++    result.height = decoded->height;
++    // Mip 0 only -- Stage 1 Task 9 bakes the prefiltered mip chain from
++    // this raw equirect; this task only gets the float bytes onto the GPU
++    // as one sampled 2D image (matrix row 10's own scope boundary).
++    DecodedTextureLevel level0;
++    level0.level = 0;
++    level0.width = decoded->width;
++    level0.height = decoded->height;
++    level0.bytes = std::move(packed);
++    result.levels.push_back(std::move(level0));
++    return result;
++}
++
+ }  // namespace
+ 
+ TextureDecodeResult decodeTextureForUpload(std::span<const std::byte> bytes, TextureRole role,
+                                             uint32_t maxImageDimension2D, const FormatSupportQuery& isFormatSupported) {
+     if (bytes.empty()) {
+         TextureDecodeResult result;
+         result.role = role;
+         result.outcome = TextureDecodeResult::Outcome::Failed;
+         result.failureReason = "empty byte span";
+         return result;
+     }
+-    return looksLikeKtx2(bytes) ? decodeKtx2ForUpload(bytes, role, maxImageDimension2D, isFormatSupported)
+-                                 : decodeStbForUpload(bytes, role, maxImageDimension2D);
++    if (looksLikeKtx2(bytes)) {
++        return decodeKtx2ForUpload(bytes, role, maxImageDimension2D, isFormatSupported);
++    }
++    // [Phase 5 Task 6] Checked BEFORE the 8-bit stb branch -- see
++    // decodeStbImageHdr()'s own header comment for the silent-tonemap gap
++    // this ordering closes.
++    if (stbi_is_hdr_from_memory(reinterpret_cast<const stbi_uc*>(bytes.data()), static_cast<int>(bytes.size())) != 0) {
++        return decodeStbHdrForUpload(bytes, role, maxImageDimension2D, isFormatSupported);
++    }
++    return decodeStbForUpload(bytes, role, maxImageDimension2D);
+ }
+ 
+ }  // namespace rx::asset
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/texture.h b/src/rx_rhi_vk/include/rx_rhi_vk/texture.h
+index 3d41046..56cdce8 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/texture.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/texture.h
+@@ -133,27 +133,56 @@ public:
+     // Same failure/category-attribution contract as create() above
+     // (std::nullopt + Allocator::noteAllocationFailure()/
+     // noteNonMemoryFailure() on vmaCreateImage/vkCreateImageView failure
+     // respectively).
+     static std::optional<Texture2D> createForPresuppliedMips(VkPhysicalDevice physicalDevice, VkDevice device,
+                                                                Allocator& allocator, VkExtent2D extent,
+                                                                VkFormat format, VkImageUsageFlags usage,
+                                                                uint32_t mipLevels,
+                                                                MemoryCategory category = MemoryCategory::Texture);
+ 
++    // [Phase 5 Task 6, ticket #42, gate matrix-p5t06-ktx2-cubemap-hdr row
++    // 7] Cube-aware sibling of createForPresuppliedMips() above -- SAME
++    // "fully caller-supplied mip chain, no blit generation, no
++    // blit-format-feature probe" contract (see that factory's own header
++    // comment for the full rationale), but creates a 6-array-layer image
++    // with VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT set and a
++    // VK_IMAGE_VIEW_TYPE_CUBE view instead of a plain 2D one -- mirrors
++    // this project's own established StorageImage::create() cube-flag/
++    // view-type-resolution precedent (storage_image.cpp's viewTypeFor()),
++    // reused here rather than reinvented for the sampled-image case.
++    // `faceExtent` is ONE face's own width/height (Vulkan's own cube-image
++    // rule: all 6 faces of one cube image always share the same extent).
++    // `mipLevels` applies per-face, exactly like createForPresuppliedMips()'s
++    // own `mipLevels` parameter. Same failure/category-attribution
++    // contract as both factories above.
++    static std::optional<Texture2D> createCubeForPresuppliedMips(VkPhysicalDevice physicalDevice, VkDevice device,
++                                                                    Allocator& allocator, VkExtent2D faceExtent,
++                                                                    VkFormat format, VkImageUsageFlags usage,
++                                                                    uint32_t mipLevels,
++                                                                    MemoryCategory category = MemoryCategory::Texture);
++
+     VkImage image() const { return image_; }
+     VkImageView view() const { return view_; }
+     VkExtent2D extent() const { return extent_; }
+     VkFormat format() const { return format_; }
+     uint32_t mipLevels() const { return mipLevels_; }
+     MemoryCategory category() const { return category_; }
+     VkDeviceSize allocatedBytes() const { return allocatedBytes_; }
++    // [Phase 5 Task 6] arrayLayers() is 1 for every Texture2D built via
++    // create()/createForPresuppliedMips() and 6 for one built via
++    // createCubeForPresuppliedMips() -- isCube() is the same information
++    // spelled as a bool, for a caller (TextureCache::registerRealTexture())
++    // that just needs to know which of the two factories built this
++    // instance without re-deriving it from the layer count.
++    uint32_t arrayLayers() const { return arrayLayers_; }
++    bool isCube() const { return isCube_; }
+ 
+     // Records the full mip-chain blit for a texture whose level 0 was
+     // just written (e.g. by rx::rhi::Uploader::uploadToImage()) and is
+     // currently in VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, with every level
+     // 1..mipLevels()-1 still in its initial VK_IMAGE_LAYOUT_UNDEFINED.
+     // Issues the per-level VkImageMemoryBarrier2 + vkCmdBlitImage sequence
+     // (level 0 -> 1, barrier, 1 -> 2, barrier, ...) and leaves EVERY level
+     // in VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL on return, ready for
+     // sampling. A no-op beyond that same final transition if
+     // mipLevels() == 1 (nothing to blit; level 0 alone still needs the
+@@ -172,46 +201,58 @@ public:
+     // engine accepts that caveat for this phase rather than building a
+     // decode/average/re-encode compute pass: the spec's Fixed decision #8
+     // restricts Phase 2 samples to UNORM formats specifically so this
+     // caveat never actually applies to shipped content. Do not reuse this
+     // function unmodified for an SRGB-format Texture2D without accounting
+     // for it first.
+     void recordMipChainBlit(VkCommandBuffer cmd) const;
+ 
+ private:
+     Texture2D() = default;
++    // [Phase 5 Task 6] `arrayLayers`/`isCube` default to 1/false so
++    // create()/createForPresuppliedMips()'s own `return Texture2D(...)`
++    // call sites (texture.cpp) need NO change at all -- zero risk to
++    // either existing factory; only createCubeForPresuppliedMips() (the
++    // new one) passes 6/true explicitly.
+     Texture2D(VmaAllocator allocator, VkDevice device, VkImage image, VmaAllocation allocation, VkImageView view,
+                VkExtent2D extent, VkFormat format, uint32_t mipLevels,
+                std::shared_ptr<MemoryAccounting> accounting = nullptr,
+-               MemoryCategory category = MemoryCategory::Internal, VkDeviceSize allocatedBytes = 0)
++               MemoryCategory category = MemoryCategory::Internal, VkDeviceSize allocatedBytes = 0,
++               uint32_t arrayLayers = 1, bool isCube = false)
+         : allocator_(allocator),
+           device_(device),
+           image_(image),
+           allocation_(allocation),
+           view_(view),
+           extent_(extent),
+           format_(format),
+           mipLevels_(mipLevels),
+           accounting_(std::move(accounting)),
+           category_(category),
+-          allocatedBytes_(allocatedBytes) {}
++          allocatedBytes_(allocatedBytes),
++          arrayLayers_(arrayLayers),
++          isCube_(isCube) {}
+ 
+     void destroyAll();
+ 
+     VmaAllocator allocator_ = VK_NULL_HANDLE;
+     VkDevice device_ = VK_NULL_HANDLE;
+     VkImage image_ = VK_NULL_HANDLE;
+     VmaAllocation allocation_ = VK_NULL_HANDLE;
+     VkImageView view_ = VK_NULL_HANDLE;
+     VkExtent2D extent_{0, 0};
+     VkFormat format_ = VK_FORMAT_UNDEFINED;
+     uint32_t mipLevels_ = 1;
+ 
+     // [Phase 4 Task 10] Category-attributed accounting (D24(a)) -- same
+     // shape/rationale as Buffer's own accounting_/category_/allocatedBytes_
+     // (buffer.h).
+     std::shared_ptr<MemoryAccounting> accounting_;
+     MemoryCategory category_ = MemoryCategory::Internal;
+     VkDeviceSize allocatedBytes_ = 0;
++
++    // [Phase 5 Task 6]
++    uint32_t arrayLayers_ = 1;
++    bool isCube_ = false;
+ };
+ 
+ }  // namespace rx::rhi
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/upload.h b/src/rx_rhi_vk/include/rx_rhi_vk/upload.h
+index 32c1f00..74567d0 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/upload.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/upload.h
+@@ -271,20 +271,31 @@ public:
+     // DecodedKtx2Texture::levels()), and `extent` is the level's TRUE
+     // texel extent (NEVER rounded up to block granularity -- a
+     // block-compressed format's sub-block mip TAIL level, e.g. 2x2 or
+     // 1x1 under a 4x4-block format, reports its real 2 or 1 here; see
+     // uploadImageMips()'s own comment for why this is still correct).
+     struct ImageMipLevel {
+         const void* data = nullptr;
+         VkDeviceSize size = 0;
+         uint32_t mipLevel = 0;
+         VkExtent2D extent{0, 0};
++        // [Phase 5 Task 6, ticket #42, gate matrix-p5t06-ktx2-cubemap-hdr
++        // row 7] Destination array layer (cube face 0..5 for a `dst` built
++        // via Texture2D::createCubeForPresuppliedMips(); always 0 -- the
++        // default -- for a plain single-layer `dst`). Every EXISTING
++        // caller of uploadImageMips() leaves this at its default, so this
++        // field's addition is byte-identical-regression-safe by
++        // construction (matrix row 4/12): the two `imageSubresource.
++        // baseArrayLayer` sites this threads into (upload.cpp) both read
++        // 0 for every pre-Task-6 call site, exactly as they did when that
++        // field was hardcoded to the literal 0.
++        uint32_t baseArrayLayer = 0;
+     };
+ 
+     // Uploads a full set of caller-supplied mip levels DIRECTLY into
+     // `dst` -- one VkBufferImageCopy region per entry in `levels`, through
+     // this Uploader's own staging ring exactly like uploadToImage() above
+     // -- and transitions `dst` to VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL.
+     // NEVER calls Texture2D::recordMipChainBlit() (no mip GENERATION on
+     // this path at all -- every level's real data comes from `levels`
+     // itself): `dst` must have been created via
+     // Texture2D::createForPresuppliedMips(), not create().
+diff --git a/src/rx_rhi_vk/src/texture.cpp b/src/rx_rhi_vk/src/texture.cpp
+index 8d9da60..aee44eb 100644
+--- a/src/rx_rhi_vk/src/texture.cpp
++++ b/src/rx_rhi_vk/src/texture.cpp
+@@ -247,20 +247,88 @@ std::optional<Texture2D> Texture2D::createForPresuppliedMips(VkPhysicalDevice ph
+         allocator.noteNonMemoryFailure("Texture2D::createForPresuppliedMips(vkCreateImageView)", result);
+         vmaDestroyImage(allocator.raw(), image, allocation);
+         return std::nullopt;
+     }
+ 
+     allocator.accounting()->record(category, allocationInfo.size);
+     return Texture2D(allocator.raw(), device, image, allocation, view, extent, format, mipLevels,
+                       allocator.accounting(), category, allocationInfo.size);
+ }
+ 
++std::optional<Texture2D> Texture2D::createCubeForPresuppliedMips(VkPhysicalDevice physicalDevice, VkDevice device,
++                                                                    Allocator& allocator, VkExtent2D faceExtent,
++                                                                    VkFormat format, VkImageUsageFlags usage,
++                                                                    uint32_t mipLevels, MemoryCategory category) {
++    // Same "no blit-format-feature probe, no fallback-to-1 clamp, never
++    // TRANSFER_SRC_BIT" reasoning as createForPresuppliedMips() above --
++    // see that factory's own header comment (texture.h). `physicalDevice`
++    // is unused for the identical reason that factory's own comment gives.
++    (void)physicalDevice;
++    VkImageUsageFlags finalUsage = usage | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++
++    VkImageCreateInfo imageInfo{};
++    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    // VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT: the Vulkan spec's own required
++    // flag for any image a VK_IMAGE_VIEW_TYPE_CUBE view will be created
++    // against (VUID-VkImageViewCreateInfo-viewType-01003) -- cubes are
++    // still VK_IMAGE_TYPE_2D-typed images with 6 array layers, never a
++    // distinct VkImageType. Mirrors this project's own established
++    // StorageImage::create() precedent (storage_image.cpp) for a
++    // sampled-only image instead of a storage one.
++    imageInfo.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
++    imageInfo.imageType = VK_IMAGE_TYPE_2D;
++    imageInfo.format = format;
++    imageInfo.extent = {faceExtent.width, faceExtent.height, 1};
++    imageInfo.mipLevels = mipLevels;
++    imageInfo.arrayLayers = 6;
++    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
++    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
++    imageInfo.usage = finalUsage;
++    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++
++    VmaAllocationCreateInfo allocCreateInfo{};
++    allocCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
++
++    VkImage image = VK_NULL_HANDLE;
++    VmaAllocation allocation = VK_NULL_HANDLE;
++    VmaAllocationInfo allocationInfo{};
++    VkResult result = vmaCreateImage(allocator.raw(), &imageInfo, &allocCreateInfo, &image, &allocation, &allocationInfo);
++    if (result != VK_SUCCESS) {
++        allocator.noteAllocationFailure("Texture2D::createCubeForPresuppliedMips(vmaCreateImage)", category, result);
++        return std::nullopt;
++    }
++
++    VkImageViewCreateInfo viewInfo{};
++    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++    viewInfo.image = image;
++    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
++    viewInfo.format = format;
++    viewInfo.subresourceRange.aspectMask = aspectMaskForFormat(format);
++    viewInfo.subresourceRange.baseMipLevel = 0;
++    viewInfo.subresourceRange.levelCount = mipLevels;
++    viewInfo.subresourceRange.baseArrayLayer = 0;
++    viewInfo.subresourceRange.layerCount = 6;
++
++    VkImageView view = VK_NULL_HANDLE;
++    result = vkCreateImageView(device, &viewInfo, nullptr, &view);
++    if (result != VK_SUCCESS) {
++        allocator.noteNonMemoryFailure("Texture2D::createCubeForPresuppliedMips(vkCreateImageView)", result);
++        vmaDestroyImage(allocator.raw(), image, allocation);
++        return std::nullopt;
++    }
++
++    allocator.accounting()->record(category, allocationInfo.size);
++    return Texture2D(allocator.raw(), device, image, allocation, view, faceExtent, format, mipLevels,
++                      allocator.accounting(), category, allocationInfo.size, /*arrayLayers=*/6, /*isCube=*/true);
++}
++
+ void Texture2D::recordMipChainBlit(VkCommandBuffer cmd) const {
+     if (mipLevels_ <= 1) {
+         // Nothing to blit -- level 0 alone still needs the
+         // TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL transition
+         // Uploader::uploadToImage() otherwise relies on this function for.
+         transitionLevelRange(cmd, image_, 0, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+         return;
+     }
+ 
+@@ -321,31 +389,35 @@ Texture2D& Texture2D::operator=(Texture2D&& other) noexcept {
+         device_ = other.device_;
+         image_ = other.image_;
+         allocation_ = other.allocation_;
+         view_ = other.view_;
+         extent_ = other.extent_;
+         format_ = other.format_;
+         mipLevels_ = other.mipLevels_;
+         accounting_ = std::move(other.accounting_);
+         category_ = other.category_;
+         allocatedBytes_ = other.allocatedBytes_;
++        arrayLayers_ = other.arrayLayers_;
++        isCube_ = other.isCube_;
+ 
+         other.allocator_ = VK_NULL_HANDLE;
+         other.device_ = VK_NULL_HANDLE;
+         other.image_ = VK_NULL_HANDLE;
+         other.allocation_ = VK_NULL_HANDLE;
+         other.view_ = VK_NULL_HANDLE;
+         other.extent_ = VkExtent2D{0, 0};
+         other.format_ = VK_FORMAT_UNDEFINED;
+         other.mipLevels_ = 1;
+         other.category_ = MemoryCategory::Internal;
+         other.allocatedBytes_ = 0;
++        other.arrayLayers_ = 1;
++        other.isCube_ = false;
+     }
+     return *this;
+ }
+ 
+ Texture2D::~Texture2D() {
+     destroyAll();
+ }
+ 
+ void Texture2D::destroyAll() {
+     if (image_ != VK_NULL_HANDLE && accounting_) {
+diff --git a/src/rx_rhi_vk/src/upload.cpp b/src/rx_rhi_vk/src/upload.cpp
+index 06c9ba7..5da11f8 100644
+--- a/src/rx_rhi_vk/src/upload.cpp
++++ b/src/rx_rhi_vk/src/upload.cpp
+@@ -434,21 +434,24 @@ bool Uploader::uploadImageMips(Texture2D& dst, std::span<const ImageMipLevel> le
+             // method's own header comment (upload.h) for the full Vulkan-
+             // spec citation. bufferRowLength/bufferImageHeight are left at 0
+             // (the VkBufferImageCopy default-initialized value) deliberately
+             // -- "tightly packed, block-rounded" is exactly libktx's own
+             // per-level byte layout, for every level including sub-block
+             // tails.
+             VkBufferImageCopy region{};
+             region.bufferOffset = ringOffset;
+             region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+             region.imageSubresource.mipLevel = level.mipLevel;
+-            region.imageSubresource.baseArrayLayer = 0;
++            // [Phase 5 Task 6] `level.baseArrayLayer` (0 for every
++            // pre-Task-6 caller, a cube face 0..5 otherwise) -- see
++            // ImageMipLevel::baseArrayLayer's own header comment.
++            region.imageSubresource.baseArrayLayer = level.baseArrayLayer;
+             region.imageSubresource.layerCount = 1;
+             region.imageExtent = {level.extent.width, level.extent.height, 1};
+             vkCmdCopyBufferToImage(cmd, ringBuffer_.handle(), dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                                     &region);
+             continue;
+         }
+ 
+         // [Texture-path round, item B] CHUNKED-ROW path: this level's own
+         // bytes exceed the ring's total capacity -- split it into
+         // consecutive, contiguous row-groups, each staged through the
+@@ -491,21 +494,25 @@ bool Uploader::uploadImageMips(Texture2D& dst, std::span<const ImageMipLevel> le
+             // (bufferRowLength/bufferImageHeight == 0, same "computed from
+             // imageExtent" Vulkan copy rule the single-copy branch above
+             // relies on) -- imageOffset.y advances this region to the
+             // right vertical strip of the FULL level, so the final image
+             // ends up identical to one big copy, just assembled from
+             // several bounded ones.
+             VkBufferImageCopy region{};
+             region.bufferOffset = ringOffset;
+             region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+             region.imageSubresource.mipLevel = level.mipLevel;
+-            region.imageSubresource.baseArrayLayer = 0;
++            // [Phase 5 Task 6] Same `level.baseArrayLayer` threading as
++            // the unchunked branch above -- proves the chunked-staging
++            // path lands data in the CORRECT face's subresource, not just
++            // the correct rows within one face (matrix row 12).
++            region.imageSubresource.baseArrayLayer = level.baseArrayLayer;
+             region.imageSubresource.layerCount = 1;
+             region.imageOffset = {0, static_cast<int32_t>(rowStart), 0};
+             region.imageExtent = {level.extent.width, chunkRows, 1};
+             vkCmdCopyBufferToImage(cmd, ringBuffer_.handle(), dst.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                                     &region);
+ 
+             rowStart += chunkRows;
+         }
+     }
+ 
+diff --git a/src/rx_rhi_vk/tests/compute_pipeline_test.cpp b/src/rx_rhi_vk/tests/compute_pipeline_test.cpp
+index 0ff080a..625e495 100644
+--- a/src/rx_rhi_vk/tests/compute_pipeline_test.cpp
++++ b/src/rx_rhi_vk/tests/compute_pipeline_test.cpp
+@@ -6,26 +6,43 @@
+ // requires. test_compute_gpu.cpp (rx_graph_gpu_tests) proves the full
+ // end-to-end dispatch + readback path this class' pipelines are bound and
+ // run through; this file proves the PIPELINE-OBJECT mechanics in isolation.
+ #include <doctest/doctest.h>
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/compute_pipeline.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_platform/window.h>
+ #include <rx_shader/compiler.h>
+ #include <rx_shader/reflection.h>
++#include <filesystem>
+ #include <optional>
+ #include <utility>
+ #include <vector>
+ 
+ namespace {
+ 
++// [Phase 5 Task 6 bundled fix, ticket #42] The three ComputePipelineCache::create()
++// calls below used to pass a bare relative filename ("rx_compute_pipeline_test*.cache")
++// straight through to ComputePipelineCache::create()'s std::filesystem::path
++// parameter -- ctest's own default working directory is wherever `ctest`
++// itself was invoked from (this repo's own root when run via `ctest
++// --preset ...` from a checkout root, NOT this binary's own build
++// directory), so those three files landed as untracked stray artifacts at
++// the REPO ROOT on every local test run. std::filesystem::temp_directory_path()
++// keeps every pre-existing behavior (content-hash cache creation/reuse
++// across the 3 distinct TEST_CASEs below, each with its own distinct
++// filename so they never collide with each other) while writing nowhere
++// this repository's own working tree can be polluted.
++std::filesystem::path testPipelineCachePath(const char* name) {
++    return std::filesystem::temp_directory_path() / name;
++}
++
+ // Same skip-guarded windowed-device fixture pattern as texture_test.cpp/
+ // storage_image_test.cpp.
+ struct ComputePipelineTestFixture {
+     rx::platform::Window window;
+     rx::rhi::Context context;
+     rx::rhi::Device device;
+ };
+ 
+ std::optional<ComputePipelineTestFixture> makeFixture(const char* title) {
+     auto window = rx::platform::Window::create(title, 64, 64, /*visible=*/false);
+@@ -117,21 +134,22 @@ TEST_CASE("ComputePipelineCache::getOrCreate builds a valid compute VkPipeline f
+     }
+ 
+     auto compileResult = compileCompute("RxComputePipelineTestSimple", kSimpleComputeSource);
+     REQUIRE(compileResult.has_value());
+     REQUIRE(compileResult->entryPointCode.size() == 1);
+     CHECK(compileResult->entryPointCode[0].stage == VK_SHADER_STAGE_COMPUTE_BIT);
+ 
+     auto layoutInfo = rx::shader::reflect(*compileResult);
+     REQUIRE(layoutInfo.has_value());
+ 
+-    auto cache = rx::rhi::ComputePipelineCache::create(fixture->device.device(), "rx_compute_pipeline_test.cache");
++    auto cache = rx::rhi::ComputePipelineCache::create(fixture->device.device(),
++                                                         testPipelineCachePath("rx_compute_pipeline_test.cache"));
+     REQUIRE(cache.has_value());
+ 
+     auto pso = cache->getOrCreate(compileResult->entryPointCode[0].code, *layoutInfo);
+     REQUIRE(pso.has_value());
+     CHECK(pso->pipeline != VK_NULL_HANDLE);
+     CHECK(pso->layout != VK_NULL_HANDLE);
+     REQUIRE(pso->setLayouts.size() >= 2);  // set 0 (empty placeholder) + set 1 (gOut)
+     CHECK(pso->setLayouts[1] != VK_NULL_HANDLE);
+ 
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+@@ -142,21 +160,22 @@ TEST_CASE("ComputePipelineCache::getOrCreate caches by SPIR-V content -- identic
+     auto fixture = makeFixture("rx_rhi_vk_compute_pipeline_cache_hit");
+     if (!fixture.has_value()) {
+         return;
+     }
+ 
+     auto compileResult = compileCompute("RxComputePipelineTestCacheHit", kSimpleComputeSource);
+     REQUIRE(compileResult.has_value());
+     auto layoutInfo = rx::shader::reflect(*compileResult);
+     REQUIRE(layoutInfo.has_value());
+ 
+-    auto cache = rx::rhi::ComputePipelineCache::create(fixture->device.device(), "rx_compute_pipeline_test2.cache");
++    auto cache = rx::rhi::ComputePipelineCache::create(fixture->device.device(),
++                                                         testPipelineCachePath("rx_compute_pipeline_test2.cache"));
+     REQUIRE(cache.has_value());
+ 
+     auto first = cache->getOrCreate(compileResult->entryPointCode[0].code, *layoutInfo);
+     REQUIRE(first.has_value());
+     auto second = cache->getOrCreate(compileResult->entryPointCode[0].code, *layoutInfo);
+     REQUIRE(second.has_value());
+ 
+     CHECK(first->pipeline == second->pipeline);
+     CHECK(first->layout == second->layout);
+ 
+@@ -172,21 +191,22 @@ TEST_CASE("ComputePipelineCache::getOrCreate substitutes a real BindlessTable la
+ 
+     auto bindlessTable = rx::rhi::BindlessTable::create(fixture->device.physicalDevice(), fixture->device.device(),
+                                                           rx::rhi::BindlessTable::Capacities{4, 2, 4});
+     REQUIRE(bindlessTable.has_value());
+ 
+     auto compileResult = compileCompute("RxComputePipelineTestBindless", kBindlessComputeSource);
+     REQUIRE(compileResult.has_value());
+     auto layoutInfo = rx::shader::reflect(*compileResult);
+     REQUIRE(layoutInfo.has_value());
+ 
+-    auto cache = rx::rhi::ComputePipelineCache::create(fixture->device.device(), "rx_compute_pipeline_test3.cache");
++    auto cache = rx::rhi::ComputePipelineCache::create(fixture->device.device(),
++                                                         testPipelineCachePath("rx_compute_pipeline_test3.cache"));
+     REQUIRE(cache.has_value());
+ 
+     auto pso =
+         cache->getOrCreate(compileResult->entryPointCode[0].code, *layoutInfo, bindlessTable->descriptorSetLayout());
+     REQUIRE(pso.has_value());
+     CHECK(pso->pipeline != VK_NULL_HANDLE);
+     REQUIRE(pso->setLayouts.size() >= 2);
+     // set 0 IS the real BindlessTable's own layout, not a lookalike this
+     // cache invented -- the exact substitution PipelineLayoutBuilder::
+     // build()'s own externalSet0 parameter documents (pipeline_layout.h),
+diff --git a/src/rx_rhi_vk/tests/texture_test.cpp b/src/rx_rhi_vk/tests/texture_test.cpp
+index 3f8a89c..d1a3739 100644
+--- a/src/rx_rhi_vk/tests/texture_test.cpp
++++ b/src/rx_rhi_vk/tests/texture_test.cpp
+@@ -234,10 +234,44 @@ TEST_CASE("Texture2D::create honors an explicit requestedMipLevels below the aut
+     // 3 levels (4 -> 2 -> 1) regardless of what's requested.
+     auto clamped =
+         rx::rhi::Texture2D::create(fixture->device.physicalDevice(), fixture->device.device(), fixture->allocator,
+                                     VkExtent2D{4, 4}, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT,
+                                     /*requestedMipLevels=*/10);
+     REQUIRE(clamped.has_value());
+     CHECK(clamped->mipLevels() == 3);
+ 
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
++
++TEST_CASE("Texture2D::createCubeForPresuppliedMips builds a real 6-layer VK_IMAGE_VIEW_TYPE_CUBE image, "
++          "isolated from TextureCache -- [Phase 5 Task 6, ticket #42, gate matrix-p5t06-ktx2-cubemap-hdr row 7]") {
++    auto fixture = makeFixture("rx_rhi_vk_texture_test_create_cube");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto cube = rx::rhi::Texture2D::createCubeForPresuppliedMips(
++        fixture->device.physicalDevice(), fixture->device.device(), fixture->allocator, VkExtent2D{16, 16},
++        VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT, /*mipLevels=*/3, rx::rhi::MemoryCategory::Texture);
++    REQUIRE(cube.has_value());
++    CHECK(cube->image() != VK_NULL_HANDLE);
++    CHECK(cube->view() != VK_NULL_HANDLE);
++    CHECK(cube->isCube());
++    CHECK(cube->arrayLayers() == 6);
++    CHECK(cube->mipLevels() == 3);
++    // `extent()` reports ONE FACE's own extent (this factory's own
++    // documented contract, texture.h) -- never a 6x-multiplied width.
++    CHECK(cube->extent().width == 16);
++    CHECK(cube->extent().height == 16);
++
++    // A plain (non-cube) Texture2D built via the SIBLING factory in the
++    // same test, for direct contrast: isCube()/arrayLayers() must NOT
++    // have silently become "always cube" process-wide.
++    auto plain = rx::rhi::Texture2D::createForPresuppliedMips(
++        fixture->device.physicalDevice(), fixture->device.device(), fixture->allocator, VkExtent2D{16, 16},
++        VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT, /*mipLevels=*/1, rx::rhi::MemoryCategory::Texture);
++    REQUIRE(plain.has_value());
++    CHECK_FALSE(plain->isCube());
++    CHECK(plain->arrayLayers() == 1);
++
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/src/rx_rhi_vk/tests/upload_test.cpp b/src/rx_rhi_vk/tests/upload_test.cpp
+index 9180beb..154ccd5 100644
+--- a/src/rx_rhi_vk/tests/upload_test.cpp
++++ b/src/rx_rhi_vk/tests/upload_test.cpp
+@@ -1182,10 +1182,110 @@ TEST_CASE("Uploader::uploadImageMips: an oversized level whose byte size does NO
+     // per-chunk row count from a non-integer division) and not a crash
+     // (this whole TEST_CASE completing, with zero validation errors below,
+     // is itself proof of that).
+     CHECK_FALSE(uploader->uploadImageMips(*texture, std::span<const rx::rhi::Uploader::ImageMipLevel>(&level, 1)));
+     // Nothing was ever recorded for this doomed call -- same "no
+     // partial-batch corruption" contract every other rejection path in
+     // this class provides.
+     CHECK(uploader->flush().value == 0);
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
++
++TEST_CASE("Uploader::uploadImageMips + Texture2D::createCubeForPresuppliedMips: per-face CHUNKED-ROW uploads "
++          "land in the CORRECT face's subresource, not just the correct rows within one face [Phase 5 Task 6, "
++          "ticket #42, gate matrix-p5t06-ktx2-cubemap-hdr row 12]") {
++    auto fixture = makeFixture("rx_rhi_vk_upload_test_cube_chunked_per_face");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    // Same 32x32 RGBA8 / 1024-byte-ring shape as the plain-2D chunked test
++    // above (4096 bytes/face against a 1024-byte ring -- 4 chunks/face, no
++    // remainder) -- mirrored deliberately (matrix row 12's own
++    // instruction: "locate the existing non-cube chunking test's ring-
++    // size-forcing mechanism and mirror it exactly"), just against a cube
++    // image and two DISTINCT per-face source buffers instead of one.
++    constexpr VkDeviceSize kRingSize = 1024;
++    constexpr VkExtent2D kFaceExtent{32, 32};
++    constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
++    constexpr uint32_t kFaceA = 0;
++    constexpr uint32_t kFaceB = 5;
++
++    auto uploader = rx::rhi::Uploader::create(fixture->allocator, fixture->device, kRingSize);
++    REQUIRE(uploader.has_value());
++
++    auto texture = rx::rhi::Texture2D::createCubeForPresuppliedMips(
++        fixture->device.physicalDevice(), fixture->device.device(), fixture->allocator, kFaceExtent, kFormat,
++        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, /*mipLevels=*/1, rx::rhi::MemoryCategory::Texture);
++    REQUIRE(texture.has_value());
++    CHECK(texture->isCube());
++    CHECK(texture->arrayLayers() == 6);
++
++    // Face A gets the plain gradient; face B gets its bitwise-NOT --
++    // maximally distinguishable from face A at every byte, so a
++    // face-swap OR a misplaced chunk both fail this test's memcmp, not
++    // just a subtle value drift.
++    std::vector<uint8_t> pixelsA = makeGradientPixelsLocal(kFaceExtent.width, kFaceExtent.height);
++    std::vector<uint8_t> pixelsB(pixelsA.size());
++    for (size_t i = 0; i < pixelsA.size(); ++i) {
++        pixelsB[i] = static_cast<uint8_t>(~pixelsA[i]);
++    }
++    REQUIRE(static_cast<VkDeviceSize>(pixelsA.size()) > kRingSize);  // this test's own premise -- must actually need chunking
++
++    std::array<rx::rhi::Uploader::ImageMipLevel, 2> levels{};
++    levels[0].data = pixelsA.data();
++    levels[0].size = static_cast<VkDeviceSize>(pixelsA.size());
++    levels[0].mipLevel = 0;
++    levels[0].extent = kFaceExtent;
++    levels[0].baseArrayLayer = kFaceA;
++    levels[1].data = pixelsB.data();
++    levels[1].size = static_cast<VkDeviceSize>(pixelsB.size());
++    levels[1].mipLevel = 0;
++    levels[1].extent = kFaceExtent;
++    levels[1].baseArrayLayer = kFaceB;
++
++    REQUIRE(uploader->uploadImageMips(*texture, levels));
++    uploader->wait(uploader->flush());
++    // Same revert-discrimination evidence as the plain-2D chunked test:
++    // proves multiple bounded ring trips actually happened across BOTH
++    // faces, not one oversized reservation slipping through.
++    CHECK(uploader->ringWrapCount() >= 3);
++
++    auto readBackFace = [&](uint32_t face, const std::vector<uint8_t>& expected) {
++        auto readback = fixture->allocator.createHostVisibleBuffer(expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++        REQUIRE(readback.has_value());
++        auto cmdCtx = rx::rhi::CommandContext::create(fixture->device.device(), fixture->device.graphicsQueue(),
++                                                        fixture->device.graphicsQueueFamily());
++        REQUIRE(cmdCtx.has_value());
++        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++            rx::rhi::transitionImage(cmd, texture->image(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++                                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++            VkBufferImageCopy region{};
++            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++            region.imageSubresource.baseArrayLayer = face;
++            region.imageSubresource.layerCount = 1;
++            region.imageExtent = {kFaceExtent.width, kFaceExtent.height, 1};
++            vkCmdCopyImageToBuffer(cmd, texture->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(),
++                                   1, &region);
++        });
++        readback->invalidate();
++        std::vector<uint8_t> readBackPixels(expected.size());
++        std::memcpy(readBackPixels.data(), readback->mappedData(), expected.size());
++        CHECK(std::memcmp(readBackPixels.data(), expected.data(), expected.size()) == 0);
++        // Restore SHADER_READ_ONLY_OPTIMAL for the next face's own
++        // transition-in above (both faces of the SAME image, transitioned
++        // sequentially).
++        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++            rx::rhi::transitionImage(cmd, texture->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        });
++    };
++
++    // THE headline assertions: face A reads back as face A's own content
++    // (not face B's, not a chunk-corrupted mix), and face B independently
++    // reads back as face B's own content -- proving uploadImageMips()'s
++    // `baseArrayLayer` threading (upload.cpp) lands each face's chunked
++    // trips in ITS OWN subresource, not the other face's.
++    readBackFace(kFaceA, pixelsA);
++    readBackFace(kFaceB, pixelsB);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
+diff --git a/tools/check_byte_source_invariant.sh b/tools/check_byte_source_invariant.sh
+new file mode 100755
+index 0000000..7e3dd0d
+--- /dev/null
++++ b/tools/check_byte_source_invariant.sh
+@@ -0,0 +1,83 @@
++#!/usr/bin/env bash
++# tools/check_byte_source_invariant.sh -- [Phase 5 Task 6, ticket #42,
++# gate rulings-2026-08-20.md RC7e, gate matrix-p5t06-ktx2-cubemap-hdr row
++# 14] Makes the "byte-source abstraction is grep-enforced" wording
++# (texture_decode.cpp's own comment, this ticket's acceptance text, and
++# matrix-issue03's Phase 4 gate) actually TRUE for the first time: this
++# script IS the grep. Before this task, no CI workflow and no committed
++# script performed it -- the phrase described a manual-code-review
++# criterion, not an automated one (verified directly this task).
++#
++# Invariant: rx_asset's KTX2/stb decode layer (texture_decode.cpp) and its
++# GPU-facing caller (texture_cache.cpp) must never touch the filesystem
++# directly -- every byte comes in through the ByteSource abstraction
++# (byte_source.h/.cpp, a DIFFERENT translation unit), so decode/transcode
++# logic stays pure, device-free, and worker-thread-safe with no hidden I/O
++# dependency (docs/threading.md's "Worker-allowed" list; texture_decode.h's
++# own top-of-file comment).
++#
++# Two checks, over both files:
++#   1. Zero occurrences of a direct file-I/O call (fopen(/std::ifstream/
++#      std::ofstream) -- no exceptions; neither file needs to call these
++#      at all.
++#   2. Zero occurrences of `std::filesystem::<member>` where <member> is
++#      anything OTHER than `path` -- the one documented exception is
++#      TextureCache::load(const std::filesystem::path&)'s own path-typed
++#      parameter/local (texture_cache.cpp): it constructs a
++#      FilesystemByteSource and delegates immediately, never itself
++#      touching the filesystem. Any OTHER std::filesystem member
++#      (exists/directory_iterator/file_size/read_symlink/...) would be
++#      real filesystem I/O creeping into this invariant-protected pair of
++#      files.
++#
++# Usage: tools/check_byte_source_invariant.sh
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
++
++FILES=(
++  "$REPO_ROOT/src/rx_asset/texture_decode.cpp"
++  "$REPO_ROOT/src/rx_asset/texture_cache.cpp"
++)
++
++for f in "${FILES[@]}"; do
++  if [[ ! -f "$f" ]]; then
++    echo "check_byte_source_invariant: file does not exist: $f" >&2
++    exit 1
++  fi
++done
++
++fail=0
++
++for f in "${FILES[@]}"; do
++  # Direct file-I/O calls -- real call syntax only (an open-paren after
++  # fopen, the qualified std::ifstream/std::ofstream type names), so a
++  # prose comment merely NAMING these (e.g. texture_decode.cpp's own
++  # "zero std::filesystem/fopen in this whole translation unit" comment,
++  # which has no trailing "(") never false-positives here.
++  hits="$(grep -nE '\bfopen[[:space:]]*\(|\bstd::ifstream\b|\bstd::ofstream\b' "$f" || true)"
++  if [[ -n "$hits" ]]; then
++    echo "check_byte_source_invariant: FAIL - direct file-I/O call found in $f:" >&2
++    echo "$hits" >&2
++    fail=1
++  fi
++done
++
++for f in "${FILES[@]}"; do
++  # Every std::filesystem::<member> usage, filtered down to anything
++  # other than the one allowed `path` member.
++  hits="$(grep -noE 'std::filesystem::[A-Za-z_]+' "$f" | grep -vE '::path$' || true)"
++  if [[ -n "$hits" ]]; then
++    echo "check_byte_source_invariant: FAIL - std::filesystem member other than 'path' found in $f:" >&2
++    echo "$hits" >&2
++    fail=1
++  fi
++done
++
++if [[ "$fail" -ne 0 ]]; then
++  echo "check_byte_source_invariant: FAIL - byte-source abstraction invariant violated (see above)" >&2
++  exit 1
++fi
++
++echo "check_byte_source_invariant: OK - no direct filesystem I/O found in ${FILES[*]}"
