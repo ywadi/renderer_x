@@ -22,6 +22,9 @@ target_link_libraries(rx_platform PUBLIC SDL3::SDL3-static Vulkan::Headers rx_co
 
 add_executable(rx_platform_tests
     tests/window_test.cpp
+    # [Phase 5 Task 5, ticket #41 row 3] MouseCaptureToggle -- promoted from
+    # samples/09_scene/mouse_capture.h's own FlyThroughCaptureState.
+    tests/test_mouse_capture_toggle.cpp
 )
 target_link_libraries(rx_platform_tests PRIVATE rx_platform doctest::doctest)
 add_test(NAME rx_platform_tests COMMAND rx_platform_tests)
