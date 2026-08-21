@@ -44,6 +44,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # [Phase 5 Task 6, ticket #42, gate rulings-2026-08-20.md RC7e] The
+      # byte-source-abstraction invariant's "grep-enforced" wording becomes
+      # TRUE here -- source-only, no build/dependency-cache steps needed
+      # first, so this runs as early as possible for the fastest possible
+      # fail signal. Mirrored verbatim in the windows-cross-zig job below
+      # (the invariant is about source text, not the target platform).
+      - name: Byte-source abstraction invariant check
+        run: tools/check_byte_source_invariant.sh
+
       # mesa-vulkan-drivers provides lavapipe (llvmpipe's Vulkan ICD, lvp_icd.json)
       # -- the only Vulkan device this runner has, since it has no real GPU.
       # vulkan-tools gives vulkaninfo for diagnostics if a run ever needs it.
@@ -425,6 +434,13 @@ jobs:
       WINEARCH: win64
     steps:
       - uses: actions/checkout@v7
+
+      # [Phase 5 Task 6, ticket #42, gate rulings-2026-08-20.md RC7e] Same
+      # check, same rationale as the linux-native job's identically-worded
+      # step above -- the invariant is about source text, not the target
+      # platform, so both jobs run it identically.
+      - name: Byte-source abstraction invariant check
+        run: tools/check_byte_source_invariant.sh
 
       # wine runs the cross-compiled Windows test binaries transparently
       # (cmake/toolchains/windows-cross-zig.cmake sets it as
