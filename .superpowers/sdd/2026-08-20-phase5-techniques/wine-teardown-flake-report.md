@@ -202,6 +202,6 @@ disclosed but NOT used as the headline number — the cold, decontaminated
 
 ## Commit
 
-- `<COMMIT_SHA_PLACEHOLDER>` — `ci(windows-cross-zig): pre-warm Wine
-  session under Xvfb before ctest (Wine session-bootstrap flake)`
-  — `.github/workflows/ci.yml` only.
+- `9f92bc8` — `ci(windows-cross-zig): pre-warm Wine session under Xvfb
+  before ctest` — `.github/workflows/ci.yml` +
+  `.superpowers/sdd/2026-08-20-phase5-techniques/wine-teardown-flake-report.md`.
