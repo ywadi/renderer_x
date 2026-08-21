@@ -336,6 +336,8 @@ promotion.
 10. `4283286` — chore: p5 task 5 SDD report
 11. `d23a047` — build(cmake): configure-enforce rx_frame_loop absence from core targets (#41)
 12. `e8e1875` — test(rx_frame_loop): regression-test the pre-lost-Device short-circuit (#41)
+13. `47c9b16` — chore: p5 task 5 SDD report -- review round addendum
+14. `aaa51ed` — fix(rx_frame_loop): sync2 vkQueueSubmit2 for PresentLoop's own submission (#41)
 
 ## Review round addendum (2 Medium findings, both closed in-round)
 
@@ -445,3 +447,142 @@ green under Wine.
 the Issue #73 log sequence, noted separately by the coordinator) is
 ruled a pre-existing `device.cpp` characteristic outside this diff — a
 watch item, not addressed in this round.
+
+## CI-failure addendum (post-push, run 32463376885)
+
+**Status: fix committed (`aaa51ed`), CI is the verification arbiter** —
+local repro of the exact hazard was attempted with real effort and not
+achieved (full account below); the push after this fix, and CI's own
+conclusion on it, is what confirms or reopens this.
+
+### Root cause
+
+Fetched the real failure log directly (`gh run view 32463376885
+--log-failed`), not paraphrased. Two related SyncVal hazard classes in
+`rx_frame_loop_gpu_tests`, both genuine gaps `PresentLoop::runFrame()`'s
+ONE submission call site had left unproven to the validator (present
+since the very first sample migrated, never CI-present-tested before
+this task's own new GPU test suite existed):
+
+1. **SYNC-HAZARD-WRITE-AFTER-READ** — the acquired swapchain image's
+   own first-touch layout-transition barrier (`seq_no: 1`,
+   `SYNC_IMAGE_LAYOUT_TRANSITION`) hazards against the presentation
+   engine's synthetic acquire-read
+   (`SYNC_PRESENT_ENGINE_SYNCVAL_PRESENT_ACQUIRE_READ_SYNCVAL`, whose
+   own `read_barriers` showed only `COLOR_ATTACHMENT_OUTPUT_BIT|
+   BOTTOM_OF_PIPE_BIT` as proven-covered). Confirmed via CI's own exact
+   file:line failures (`present_loop_gpu_test.cpp:83/131/336/372`,
+   mapped against this session's own `grep -n "^TEST_CASE"`) that this
+   hits BOTH the no-RenderGraph test fixture's own hand-rolled barrier
+   AND every RenderGraph-based test. The RenderGraph path already
+   carries a narrower, TARGETED fix for exactly this class
+   (`src/rx_graph/executor.cpp:537-551`, "Backbuffer acquire chaining"
+   comment, `srcStage` overridden to `COLOR_ATTACHMENT_OUTPUT_BIT` for
+   the backbuffer's first UNDEFINED-oldLayout transition, explicitly
+   dated in its own comment to an EARLIER "layers >= ~1.3.240"
+   threshold) — CI's own log proves that fix is no longer sufficient by
+   itself against 1.3.275.
+2. **SYNC-HAZARD-PRESENT-AFTER-WRITE** (no-RenderGraph test case only) —
+   `vkQueuePresentKHR` not provably ordered-after the submission's own
+   final layout-transition write via the render-finished semaphore's
+   coverage (`write_barriers: 0` on the prior write in CI's own log).
+
+Both stem from the SAME root cause: `PresentLoop::runFrame()` used
+legacy `vkQueueSubmit`/`VkSubmitInfo`, whose wait/signal semaphore
+coverage is implicit/ambient ("waits/signals the whole batch") rather
+than an explicit, per-stage-provable sync2 chain — and `frameBody` is
+OPAQUE to `PresentLoop` (a RenderGraph's `Executor::execute()` or any
+hand-rolled recording), so this class can never safely assume which
+stage a caller's first/last touch of the acquired image happens at.
+
+### Fix
+
+`present_loop.cpp`'s one submission call site switches from
+`vkQueueSubmit`/`VkSubmitInfo` to sync2 `vkQueueSubmit2`/`VkSubmitInfo2`/
+`VkSemaphoreSubmitInfo` (`synchronization2` is already an unconditional
+Vulkan 1.3 core feature this project enables,
+`device.cpp:223 features13.synchronization2 = VK_TRUE`) — both the wait
+and signal `VkSemaphoreSubmitInfo` now use the explicit, spec-documented,
+maximally-conservative `VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT` stage
+mask, a strict superset of every narrower mask any caller's own barriers
+already use (including the RenderGraph-side partial fix, which stays in
+place, now redundant-but-harmless rather than the sole line of defense).
+The sync-chain invariant this fix documents is written directly into
+`present_loop.cpp`'s own comment block, per the module's explicit
+ownership of this concern.
+
+Verified no sample retains its own present-submission path with this
+gap:
+```
+$ grep -rln "vkQueueSubmit\b\|VkSubmitInfo\b" samples/*/main.cpp
+samples/04_streaming/main.cpp
+samples/07_stress/main.cpp
+```
+Both are unrelated HEADLESS (no swapchain, no acquire) submissions —
+`04_streaming/main.cpp:1496`'s own comment: "No wait/signal semaphores
+-- there is no swapchain and no cross-queue dependency in this mode";
+`07_stress/main.cpp:1400` is a prose comment, not code. Every present-
+mode `runPresent()` across all nine samples goes exclusively through
+`PresentLoop::runFrame()`'s one call site.
+
+### Local repro attempt (full account, per the coordinator's explicit ask)
+
+Local dev machine runs `vulkan-validationlayers 1.3.204.1-2` (Pop!_OS/
+jammy apt) and `mesa-vulkan-drivers 25.1.5` — CI's `ubuntu-latest`
+(noble/24.04) installs `vulkan-validationlayers 1.3.275.0-1` and
+`mesa-vulkan-drivers 25.2.8` from Ubuntu's own archive. Both were
+side-loaded locally, WITHOUT touching the system package manager:
+
+```
+$ curl -sL -o vvl275.deb http://mirrors.kernel.org/ubuntu/pool/universe/v/vulkan-validationlayers/vulkan-validationlayers_1.3.275.0-1_amd64.deb
+$ dpkg-deb -x vvl275.deb extracted   # libVkLayer_khronos_validation.so + VkLayer_khronos_validation.json, colocated
+$ curl -sL -o mesa.deb http://security.ubuntu.com/ubuntu/pool/main/m/mesa/mesa-vulkan-drivers_25.2.8-0ubuntu0.24.04.2_amd64.deb
+$ dpkg-deb -x mesa.deb extracted     # libvulkan_lvp.so + lvp_icd.json, colocated
+$ VK_LAYER_PATH=.../layer_dir vulkaninfo --summary | grep khronos_validation
+  VK_LAYER_KHRONOS_validation ... 1.3.275  version 1     # confirmed loaded, exact CI version
+```
+
+`rx_frame_loop_gpu_tests` run against the CURRENT (pre-fix) committed
+code under every combination tried:
+- CI-matched layer (1.3.275) + local ICD, real `DISPLAY` — 8/8 pass.
+- CI-matched layer + CI-matched ICD (25.2.8), real `DISPLAY` — 8/8 pass.
+- CI-matched layer + CI-matched ICD, `xvfb-run -a` (matching CI's exact
+  wrapper) — 8/8 pass.
+- CI-matched layer + CI-matched ICD, `xvfb-run -a taskset -c 0,1`
+  (CPU-constrained, 3 runs) — 8/8 pass, all 3.
+
+**None reproduced the hazard.** SyncVal's cross-batch hazard tracking
+depends on genuine GPU-completion timing (when a software rasterizer's
+prior batch is actually observed complete relative to the next
+submission), which a version-matched layer+driver combination does not,
+by itself, guarantee reproduces — this is the same class of
+non-forceable, timing-sensitive divergence the Phase 4 Stage 1
+`7cc685f` round already hit and documented ("Revert-check could not
+force the scheduling-sensitive hazard locally... CI green is the final
+confirmation"). Per the coordinator's own explicit instruction, this is
+reported honestly rather than claimed as a verified repro: **CI's own
+next run on this push is the arbiter.**
+
+### Verification after the fix (regression-only, since local repro was not achieved)
+
+Full serial lavapipe ctest (local 1.3.204 layer):
+```
+$ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json DISPLAY=:1 ctest --output-on-failure -j1
+...
+100% tests passed, 0 tests failed out of 31
+Total Test time (real) = 146.87 sec
+```
+`rx_frame_loop_gpu_tests` under the side-loaded CI-matched layer+ICD:
+8/8 cases, 117/117 assertions, clean (no regression from the fix
+itself, though this combination never reproduced the original hazard
+either). D17 gates re-confirmed byte-identical post-fix:
+`sample_09_scene --validate`: `grid_scene` 0/65536; `sample_08_gltf_viewer
+--validate`: `loading_state`/`loaded_scene` both 0/65536. Real-NVIDIA
+present run (`sample_09_scene --present --validate`, DISPLAY=:1): zero
+unfiltered validation errors, "window closed cleanly". windows-cross-zig:
+clean configure + full build, all targets including
+`rx_frame_loop_gpu_tests.exe`.
+
+### Commit
+
+`aaa51ed` — fix(rx_frame_loop): sync2 vkQueueSubmit2 for PresentLoop's own submission (#41)
