@@ -1,0 +1,416 @@
+# Review package: 4283286..47c9b16
+
+## Commits
+47c9b16 chore: p5 task 5 SDD report -- review round addendum
+e8e1875 test(rx_frame_loop): regression-test the pre-lost-Device short-circuit (#41)
+d23a047 build(cmake): configure-enforce rx_frame_loop absence from core targets (#41)
+
+## Files changed
+ .../2026-08-20-phase5-techniques/task-05-report.md | 112 +++++++++++++++++++++
+ CMakeLists.txt                                     |  32 ++++++
+ cmake/DependencyBoundaryCheck.cmake                |   5 +-
+ src/rx_frame_loop/tests/present_loop_gpu_test.cpp  |  60 +++++++++++
+ src/rx_rhi_vk/include/rx_rhi_vk/device.h           |  31 ++++++
+ src/rx_rhi_vk/src/device.cpp                       |   6 ++
+ 6 files changed, 244 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-20-phase5-techniques/task-05-report.md b/.superpowers/sdd/2026-08-20-phase5-techniques/task-05-report.md
+index cdc2e61..b6b34e2 100644
+--- a/.superpowers/sdd/2026-08-20-phase5-techniques/task-05-report.md
++++ b/.superpowers/sdd/2026-08-20-phase5-techniques/task-05-report.md
+@@ -326,10 +326,122 @@ promotion.
+ 
+ 1. `8bae5d3` — feat(rx_frame_loop): new present-loop engine module (#41)
+ 2. `0a4bdd3` — feat(rx_graph): RenderGraph::compile() skips a redundant recompile (#41)
+ 3. `97d8bbf` — feat(rx_rhi_vk): add PerFrameStorageBuffer, close row 2 (#41)
+ 4. `088e071` — feat(rx_material): promote createDemandSizedMaterialParamArena (#41)
+ 5. `42c25e3` — feat(rx_platform): promote MouseCaptureToggle, close row 3 (#41)
+ 6. `e5770de` — feat(rx_scene): promote FlyCamera, close row 4 (#41)
+ 7. `d9466fd` — perf(rx_scene): zero-alloc splitByBlockAndGroup/resolveDrawGroups (#41)
+ 8. `2f84947` — refactor(samples): migrate 01-08 to rx::frame_loop::PresentLoop (#41)
+ 9. `4d5caeb` — refactor(samples/09_scene): migrate to PresentLoop, consume all promoted primitives (#41)
++10. `4283286` — chore: p5 task 5 SDD report
++11. `d23a047` — build(cmake): configure-enforce rx_frame_loop absence from core targets (#41)
++12. `e8e1875` — test(rx_frame_loop): regression-test the pre-lost-Device short-circuit (#41)
++
++## Review round addendum (2 Medium findings, both closed in-round)
++
++Verdict: spec PASS, Approved, 2 Mediums. Both closed this round; see
++`task-05-review.md` for the full review.
++
++**Medium #1 — the Task-21 CMake configure-time link-boundary check was
++never extended to `rx_frame_loop`.** Link closure was already clean, but
++nothing FAILED configure if a core target ever started linking it.
++Fixed by mirroring the existing `imgui` boundary check exactly (same
++core-target list, same `rx_assert_target_excludes_dependency()`
++mechanism, `CMakeLists.txt`) and generalizing that function's own
++FATAL_ERROR message, which had hardcoded "core-libraries-stay-ImGui-free"
++regardless of which forbidden dependency actually triggered it
++(`cmake/DependencyBoundaryCheck.cmake`).
++
++Proven load-bearing, exactly like Task 21's own imgui check was proven:
++```
++$ # injected: target_link_libraries(rx_material PUBLIC rx_frame_loop), right after
++$ # rx_material's add_subdirectory in CMakeLists.txt
++$ cmake .
++...
++CMake Error at cmake/DependencyBoundaryCheck.cmake:138 (message):
++  [dependency-boundary-check] 'rx_material' transitively depends on something
++  matching 'rx_frame_loop' -- this violates a core-library dependency
++  boundary (see the rx_assert_target_excludes_dependency(rx_material
++  rx_frame_loop) call site in the root CMakeLists.txt for which boundary and
++  its rationale).  Dependency chain: rx_material -> rx_frame_loop
++```
++Injection removed, reconfigured clean (`-- Configuring done` /
++`-- Generating done`, no errors). One real finding surfaced while
++picking the injection target: a first attempt via `rx_platform`
++(`target_link_libraries(rx_platform PUBLIC rx_frame_loop)`) did NOT
++produce the expected FATAL_ERROR — it hit the dependency-closure walk's
++own recursion-depth guard instead (`_rx_dep_closure_contains`'s
++documented non-visited-set-deduplicated design,
++`DependencyBoundaryCheck.cmake:28-44`), because `rx_platform` is one of
++`rx_frame_loop`'s OWN dependencies, so that injection created a genuine
++`rx_platform -> rx_frame_loop -> rx_platform` cycle the walk is not
++designed to short-circuit. Not a bug against this project's real
++(acyclic) target graph — recorded as an in-code usability note
++(`CMakeLists.txt`'s own comment on the new check) for picking a future
++injection target: use a core target `rx_frame_loop` does NOT itself
++depend on (`rx_material`/`rx_task`/`rx_shader`/`rx_asset`/`rx_scene`),
++not one of `rx_platform`/`rx_rhi_vk`/`rx_graph`/`rx_core`.
++
++**Medium #2 — matrix row 9's literal regression-test artifact was
++missing.** Row 9's own acceptance criterion: "a targeted regression test
++constructs a Device already in the surface-lost state and asserts the
++helper's very first `acquireNextImage()` call is handled without falling
++through to frame recording." Closed via a new
++`rx::rhi::detail::forceSurfaceLostForTesting(Device&)` test-only friend
++seam (`device.h`/`.cpp`, mirroring the `detail::debugSlotBufferData()`/
++`debugFrameBufferData()` convention already used elsewhere this task) —
++the real end-to-end path (a genuinely destroyed native window) is
++MANUAL_VERIFICATION-only per `surface_loss_test.cpp`'s own header
++comment (no CI driver/display backend this repo's fixtures use can
++destroy a live window out from under a running process), so this is the
++GPU-under-lavapipe fallback tier the review comment itself anticipated.
++
++New `present_loop_gpu_test.cpp` TEST_CASE forces a real `Device`
++surface-lost BEFORE `PresentLoop`'s own first `runFrame()` call (an
++ordering `PresentLoop::surfaceLost_`'s own top-of-function guard does
++NOT catch, since it has never itself observed a loss yet — the actual
++catching branch is the acquire-status check inside `runFrame()`) and
++asserts: `Result::SurfaceLost` returned, `frameBody` never invoked,
++`Device::acquireCallCount()` unchanged (Device's own
++`surfaceLost_`-short-circuit in `acquireNextImage()` deliberately never
++increments it — the same call-count contract Task 17's Suspended-path
++tests already rely on), and `loop->isSurfaceLost()` latches true
++afterward. Result: `rx_frame_loop_gpu_tests` 8/8 cases (up from 7),
++117/117 assertions (up from 106), zero unfiltered validation errors.
++
++Revert-proved: temporarily disabled `runFrame()`'s
++`acquire.status == SwapchainStatus::SurfaceLost` branch
++(`present_loop.cpp`), rebuilt, ran the new test standalone. It did not
++merely fail an assertion — it produced a genuine, UNFILTERED Vulkan
++validation error and then hung (had to be `SIGKILL`ed):
++```
++[error] [vulkan validation] Validation Error: [ VUID-vkQueueSubmit-pWaitSemaphores-03238 ]
++  ... Queue ... is waiting on semaphore (VkSemaphore ...) that has no way to be signaled.
++```
++— because with the short-circuit removed, `runFrame()` falls through to
++`vkQueueSubmit` waiting on `frameSync_->currentImageAvailableSemaphore()`,
++which `Device::acquireNextImage()`'s OWN (untouched) `surfaceLost_`
++short-circuit never actually submitted for signaling (no real
++`vkAcquireNextImageKHR` ran) — a genuine, reproduced GPU deadlock, the
++exact hazard the disabled branch exists to prevent. Reverted
++(`git diff` against the committed version was empty), rebuilt,
++`rx_frame_loop_gpu_tests`: 8/8 cases, 117/117 assertions pass again.
++
++**Verification after both fixes:** full project rebuild clean on both
++presets; `rx_rhi_vk_tests`/`rx_frame_loop_tests`/`rx_frame_loop_gpu_tests`
++(the touched suites) green under lavapipe; full serial lavapipe ctest:
++```
++$ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json DISPLAY=:1 ctest --output-on-failure -j1
++...
++100% tests passed, 0 tests failed out of 31
++Total Test time (real) = 132.80 sec
++```
++windows-cross-zig: clean configure + full build (87/87 targets,
++including the new `rx_frame_loop_gpu_tests.exe`), plus `rx_rhi_vk_tests`/
++`rx_frame_loop_tests` (the touched device-free/GPU-boundary suites) run
++green under Wine.
++
++07_stress's WM-close-trial latency (17s from `xdotool windowclose` to
++the Issue #73 log sequence, noted separately by the coordinator) is
++ruled a pre-existing `device.cpp` characteristic outside this diff — a
++watch item, not addressed in this round.
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 658468c..12703c5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -134,20 +134,52 @@ add_subdirectory(src/rx_debug_ui)
+ # which are hosts, not core libraries) must not transitively link the
+ # vendored `imgui` target -- the "core libraries and public ABI stay
+ # ImGui-free" hard boundary D20/ticket #16 both restate. Runs once, right
+ # here, so a violation fails THIS configure step before any compilation
+ # starts.
+ include(cmake/DependencyBoundaryCheck.cmake)
+ foreach(_rx_core_target rx_core rx_rhi_vk rx_graph rx_material rx_platform rx_task rx_shader rx_asset rx_scene)
+     rx_assert_target_excludes_dependency(${_rx_core_target} imgui)
+ endforeach()
+ 
++# Second configure-time link-boundary check [Phase 5 Task 5, ticket #41,
++# review round Medium finding #1] -- mirrors the imgui check immediately
++# above exactly, same core-target list, same mechanism
++# (cmake/DependencyBoundaryCheck.cmake): every rx_* CORE library defined
++# above (deliberately excludes rx_frame_loop itself, which is SUPPOSED to
++# depend on rx_platform/rx_rhi_vk/rx_graph, and excludes rx_debug_ui/
++# samples/tools, which are hosts or peers, not core libraries) must not
++# transitively link rx_frame_loop -- the "core libraries stay free of the
++# optional runner-convenience module" boundary rx_frame_loop's own header
++# comment already states in prose (present_loop.h: "rx_graph/rx_rhi_vk/
++# rx_platform themselves gain NO new dependency ... from this module's
++# existence") is now configure-enforced, not merely documented. Proven
++# load-bearing this round exactly like Task 21's own imgui check was: a
++# violation (`target_link_libraries(rx_material PUBLIC rx_frame_loop)`,
++# injected temporarily immediately after `add_subdirectory(src/
++# rx_material)` above) was configured, observed to FATAL_ERROR with the
++# expected "rx_material -> rx_frame_loop" dependency-chain message, then
++# removed -- see task-05-report.md, which also records a first injection
++# attempt via rx_platform that hit the walk's own recursion-depth guard
++# instead (`_rx_dep_closure_contains`'s documented non-deduplicated design,
++# cmake/DependencyBoundaryCheck.cmake:28-44): rx_platform is one of
++# rx_frame_loop's OWN dependencies, so that injection created a genuine
++# rx_platform->rx_frame_loop->rx_platform cycle the walk is not designed to
++# short-circuit -- not a bug in the check as applied to this project's real
++# (acyclic) target graph, but a real usability note for a future user
++# picking an injection target to re-run this same proof: pick a target
++# rx_frame_loop does NOT itself depend on (rx_material/rx_task/rx_shader/
++# rx_asset/rx_scene), not one of rx_platform/rx_rhi_vk/rx_graph/rx_core.
++foreach(_rx_core_target rx_core rx_rhi_vk rx_graph rx_material rx_platform rx_task rx_shader rx_asset rx_scene)
++    rx_assert_target_excludes_dependency(${_rx_core_target} rx_frame_loop)
++endforeach()
++
+ add_subdirectory(tools/dep_cache_smoketest)
+ add_subdirectory(tools/toolchain_check)
+ # Phase 4 Stage 1 Task 13: host-only fixture regenerator (assets/test/
+ # cube_meshopt.*/cube_draco.*) -- see its own CMakeLists.txt comment.
+ add_subdirectory(tools/gen_gltf_compression_fixtures)
+ add_subdirectory(samples/01_triangle)
+ add_subdirectory(samples/02_hotreload)
+ add_subdirectory(samples/03_bindless_mesh)
+ add_subdirectory(samples/04_streaming)
+ add_subdirectory(samples/05_multipass)
+diff --git a/cmake/DependencyBoundaryCheck.cmake b/cmake/DependencyBoundaryCheck.cmake
+index e9b6174..4166d30 100644
+--- a/cmake/DependencyBoundaryCheck.cmake
++++ b/cmake/DependencyBoundaryCheck.cmake
+@@ -130,14 +130,15 @@ function(rx_assert_target_excludes_dependency TARGET_NAME FORBIDDEN)
+     message(FATAL_ERROR
+       "[dependency-boundary-check] target '${TARGET_NAME}' does not exist at the point this check runs -- "
+       "this is a root CMakeLists.txt add_subdirectory-ordering bug (the check must run AFTER every target "
+       "it examines is defined), not a passing check.")
+   endif()
+ 
+   _rx_dep_closure_contains("${TARGET_NAME}" "${FORBIDDEN}" 0 _rx_found _rx_chain)
+   if(_rx_found)
+     message(FATAL_ERROR
+       "[dependency-boundary-check] '${TARGET_NAME}' transitively depends on something matching "
+-      "'${FORBIDDEN}' -- this violates the core-libraries-stay-ImGui-free hard boundary (spec D20, gate "
+-      "ruling #16). Dependency chain: ${_rx_chain}")
++      "'${FORBIDDEN}' -- this violates a core-library dependency boundary (see the "
++      "rx_assert_target_excludes_dependency(${TARGET_NAME} ${FORBIDDEN}) call site in the root "
++      "CMakeLists.txt for which boundary and its rationale). Dependency chain: ${_rx_chain}")
+   endif()
+ endfunction()
+diff --git a/src/rx_frame_loop/tests/present_loop_gpu_test.cpp b/src/rx_frame_loop/tests/present_loop_gpu_test.cpp
+index 8c0053f..0699f0b 100644
+--- a/src/rx_frame_loop/tests/present_loop_gpu_test.cpp
++++ b/src/rx_frame_loop/tests/present_loop_gpu_test.cpp
+@@ -263,20 +263,80 @@ TEST_CASE("PresentLoop: the Suspended path [extentOverrideForTesting DI seam, mi
+     CHECK(fixture->device.presentCallCount() == presentBefore);
+     // The internal retry (recreateAndDependents(), no override) already
+     // resumed against this fixture's real, nonzero-extent surface.
+     CHECK_FALSE(loop->isSuspended());
+ 
+     vkDeviceWaitIdle(fixture->device.device());
+     loop.reset();
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
++TEST_CASE("PresentLoop: a Device already surface-lost BEFORE the first runFrame() call [Phase 5 Task 5 review "
++          "round, Medium finding #2; matrix row 9's own literal acceptance criterion: 'a targeted regression test "
++          "constructs a Device already in the surface-lost state and asserts the helper's very first "
++          "acquireNextImage() call is handled without falling through to frame recording']: the FIRST runFrame() "
++          "call short-circuits to Result::SurfaceLost, frameBody is never invoked, and NO real "
++          "vkAcquireNextImageKHR is attempted") {
++    auto fixture = makeFixture("rx_frame_loop_pre_lost");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto loop = PresentLoop::create(PresentLoop::CreateInfo{&fixture->device, fixture->surface, &fixture->window});
++    REQUIRE(loop.has_value());
++    CHECK_FALSE(loop->isSurfaceLost());
++
++    // Constructs the EXACT ordering matrix row 9 names -- a Device already
++    // in the surface-lost state BEFORE this PresentLoop's own first
++    // runFrame() call, i.e. PresentLoop's OWN surfaceLost_ latch
++    // (present_loop.cpp) is still false (this fresh loop has never itself
++    // observed a loss) while the Device it wraps already is (e.g. a host
++    // sharing one Device across multiple PresentLoop lifetimes, or a
++    // recreateSwapchain() call made outside this loop's own
++    // recreateAndDependents()). This is exactly the case runFrame()'s own
++    // top-of-function `if (surfaceLost_)` guard (present_loop.cpp) does
++    // NOT catch (it only ever sees ITS OWN prior detections) -- the real
++    // short-circuit this test targets is the SECOND one, inside the
++    // acquire-status branch, which reads `device_->acquireNextImage()`'s
++    // own live status rather than a cached flag. See device.h's own
++    // forceSurfaceLostForTesting() comment for why this is the only way an
++    // automated suite can construct this precise ordering (a genuinely
++    // destroyed native window is MANUAL_VERIFICATION-only per
++    // surface_loss_test.cpp's own header comment).
++    rx::rhi::detail::forceSurfaceLostForTesting(fixture->device);
++    REQUIRE(fixture->device.isSurfaceLost());
++
++    const uint64_t acquireBefore = fixture->device.acquireCallCount();
++    bool frameBodyCalled = false;
++    const Result result = loop->runFrame([&](const FrameContext&) { frameBodyCalled = true; });
++
++    CHECK(result == Result::SurfaceLost);
++    CHECK_FALSE(frameBodyCalled);
++    // No real vkAcquireNextImageKHR was ever attempted -- Device::
++    // acquireNextImage()'s own surfaceLost_ short-circuit (device.cpp)
++    // returns SwapchainStatus::SurfaceLost WITHOUT incrementing
++    // acquireCallCount_ [Phase 4 Task 17, gate ruling #25's own "present
++    // skip asserted by CALL COUNTS" convention], exactly like the
++    // Suspended-path test above.
++    CHECK(fixture->device.acquireCallCount() == acquireBefore);
++    // runFrame() latches its OWN surfaceLost_ flag too, matching every
++    // other SurfaceLost-detecting path in this class
++    // (recreateAndDependents(), the mid-loop acquire/present branches) --
++    // a SECOND runFrame() call would now take the top-of-function guard
++    // this ordering originally bypassed.
++    CHECK(loop->isSurfaceLost());
++
++    vkDeviceWaitIdle(fixture->device.device());
++    loop.reset();
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
+ TEST_CASE("PresentLoop::recreateAndDependents() (WITH a RenderGraph) called twice with an unchanged surface is a "
+           "correctness no-op -- rendering keeps working cleanly afterward [Phase 5 Task 5 row 10 integration: "
+           "RenderGraph::compile()'s own recompile-skip is exercised through PresentLoop's real call path, not "
+           "just rx_graph's own isolated unit tests]") {
+     auto fixture = makeFixture("rx_frame_loop_recreate_noop");
+     if (!fixture.has_value()) {
+         return;
+     }
+     auto scheduler = rx::task::Scheduler::create();
+     REQUIRE(scheduler != nullptr);
+diff --git a/src/rx_rhi_vk/include/rx_rhi_vk/device.h b/src/rx_rhi_vk/include/rx_rhi_vk/device.h
+index 8eab804..c8f99d8 100644
+--- a/src/rx_rhi_vk/include/rx_rhi_vk/device.h
++++ b/src/rx_rhi_vk/include/rx_rhi_vk/device.h
+@@ -104,20 +104,49 @@ enum class PresentMode {
+ };
+ 
+ // Human-readable name for a VkPresentModeKHR, for logging/HUD use (e.g. a
+ // sample printing Device::presentMode() once at startup). Covers every
+ // value Device's own present-mode ladder can select (FIFO, MAILBOX,
+ // IMMEDIATE) plus FIFO_RELAXED for completeness, with "UNKNOWN" as the
+ // fallback for anything else (e.g. the shared-present extension modes this
+ // codebase never requests).
+ const char* presentModeName(VkPresentModeKHR mode);
+ 
++class Device;
++
++namespace detail {
++
++// Test-only seam -- NOT part of the stable public contract, mirroring
++// `rx::rhi::detail::debugSlotBufferData()`'s own carve-out convention
++// (per_frame_storage_buffer.h) and `rx::material::detail::
++// debugFrameBufferData()`'s (instance.h): the ONLY way this repo's own
++// automated test suites can construct "a Device already in the
++// surface-lost state" [Phase 5 Task 5, ticket #41 review round, Medium
++// finding #2, matrix row 9's own literal acceptance-criterion text] is a
++// GENUINE destroyed native window, which `surface_loss_test.cpp`'s own
++// header comment already documents as MANUAL_VERIFICATION-only -- "no CI
++// driver/display backend this repo's fixtures use can be made to
++// genuinely destroy a live window out from under a running process the
++// way a real desktop's window manager can". Directly setting the SAME
++// `surfaceLost_` flag `recreateSwapchain()`'s own real
++// `isSurfaceLossResult()`-classified failure path sets (device.cpp) lets
++// a GPU test exercise every DOWNSTREAM consumer of that state
++// (`acquireNextImage()`'s/`present()`'s own short-circuits, and --
++// `present_loop_gpu_test.cpp`'s own use -- `PresentLoop::runFrame()`'s
++// first-call short-circuit) deterministically, without needing the
++// underlying VkSurfaceKHR/native window to have genuinely died (both stay
++// perfectly valid Vulkan objects here -- only the LOGICAL state this
++// class's own callers observe is forced).
++void forceSurfaceLostForTesting(Device& device);
++
++}  // namespace detail
++
+ // Device owns the logical VkDevice selected/built against a Context's
+ // vkb::Instance, its graphics and present queues, and a VkSwapchainKHR built
+ // against a caller-provided VkSurfaceKHR.
+ //
+ // Device::create() takes ownership of the VkSurfaceKHR passed to it,
+ // unconditionally: on success the returned Device owns and destroys it
+ // (together with the swapchain and device) on destruction or move-assign;
+ // on failure Device::create destroys the surface itself before returning
+ // std::nullopt. Either way, the caller must not destroy that surface handle
+ // itself once create() has been called with it.
+@@ -131,20 +160,22 @@ const char* presentModeName(VkPresentModeKHR mode);
+ // read-only snapshot, safe to call from any thread holding a valid
+ // reference -- see docs/threading.md.
+ class Device {
+ public:
+     Device(Device&&) noexcept;
+     Device& operator=(Device&&) noexcept;
+     Device(const Device&) = delete;
+     Device& operator=(const Device&) = delete;
+     ~Device();
+ 
++    friend void detail::forceSurfaceLostForTesting(Device& device);
++
+     static std::optional<Device> create(Context& context, VkSurfaceKHR surface);
+ 
+     // Task 3 (rx_graph's Executor): the same VkInstance handle this Device
+     // was built against (Context::instance(), stashed at create() time --
+     // see the private instance_ member below). Added because
+     // Executor::create(Device&) needs to build its own
+     // rx::rhi::Allocator::createRaw(physicalDevice, device, instance) from
+     // a Device alone, with no separate Context& in its signature, and
+     // every other accessor on this class already exposes exactly this
+     // kind of already-stored handle (physicalDevice(), device(), ...) the
+diff --git a/src/rx_rhi_vk/src/device.cpp b/src/rx_rhi_vk/src/device.cpp
+index f3e7e42..fef8106 100644
+--- a/src/rx_rhi_vk/src/device.cpp
++++ b/src/rx_rhi_vk/src/device.cpp
+@@ -601,20 +601,26 @@ void Device::destroyAll() {
+         vkDestroySwapchainKHR(device_, swapchain_, nullptr);
+     }
+     if (device_ != VK_NULL_HANDLE) {
+         vkDestroyDevice(device_, nullptr);
+     }
+     if (surface_ != VK_NULL_HANDLE) {
+         vkDestroySurfaceKHR(instance_, surface_, nullptr);
+     }
+ }
+ 
++namespace detail {
++
++void forceSurfaceLostForTesting(Device& device) { device.surfaceLost_ = true; }
++
++}  // namespace detail
++
+ AcquireResult Device::acquireNextImage(VkSemaphore signal) {
+     // FrameSync's frame loop begins here every iteration [Phase 4 Stage 0
+     // Task 3, spec D3: "FrameSync acquire/present" zone placement --
+     // FrameSync itself (frame_sync.h/.cpp) owns no acquire/present method
+     // of its own; these two Device functions are the real acquire/present
+     // calls every sample's present loop drives its FrameSync fences/
+     // semaphores around].
+     RX_ASSERT_MAIN_THREAD("Device::acquireNextImage");
+     RX_ZONE;
+ 
