@@ -354,6 +354,68 @@ struct DecodedStbHdrImage {
 std::optional<DecodedStbHdrImage> decodeStbImageHdr(std::span<const std::byte> bytes, std::string* outFailureReason);
 
 // ---------------------------------------------------------------------
+// [Phase 5, issue #75, owner insertion into Stage 1 between T10 and T11]
+// OpenEXR (.exr) equirect float input -- library-first: tinyexr
+// (vendored, third_party/CMakeLists.txt's own comment has the full
+// pin+rationale, including the brief check against OpenEXR proper --
+// too heavy a dependency for one input path, same reasoning T6's own
+// comment above gives for reusing stb_image.h's Radiance reader rather
+// than a dedicated decoder -- and miniexr, rejected outright as
+// write-only). Produces the SAME DecodedStbHdrImage float-RGBA payload
+// decodeStbImageHdr() above does -- both feed the identical downstream
+// Environment-role -> T9 bake chain, untouched (texture_decode.cpp's
+// own finalizeHdrFloatUpload(), shared by both paths).
+//
+// SUPPORTED ENVELOPE, probed directly against the pinned tinyexr release
+// (not assumed from its README -- task-exr-report.md has the full
+// evidence, including a real 4K production HDRI decoded successfully):
+// single-part SCANLINE EXR (never tiled/deep/multipart), HALF or FLOAT
+// pixel-type channels, any of NONE/RLE/ZIPS/ZIP/PIZ/PXR24/B44/B44A
+// compression. REJECTED, loudly, naming the specific excluded variant
+// and restating this envelope:
+//   - tiled / deep (non-image) / multipart EXR -- checked from the
+//     cheap 8-byte EXRVersion flags, before ever attempting a full
+//     header parse (which could fail for an unrelated, less legible
+//     reason on one of these shapes).
+//   - DWAA/DWAB compression -- genuinely NOT implemented by the pinned
+//     tinyexr (its own header marks them "Not yet supported"; confirmed
+//     directly: ParseEXRHeaderFromMemory() falls through to a generic
+//     "Unknown compression type" rejection for these two codes, wrapped
+//     here into a message that names them explicitly).
+//   - ZFP compression -- TINYEXR_USE_ZFP is left at its default OFF (a
+//     separate libzfp dependency this task has no cause to add).
+//   - any channel using the UINT pixel type -- tinyexr's OWN convenience
+//     LoadEXRFromMemory() (called below, after this envelope check
+//     passes) does NOT convert UINT samples to float: it reinterprets
+//     the raw uint32 bits as an IEEE-754 float bit pattern, a genuine
+//     silently-wrong-pixels bug confirmed directly against this pin
+//     (task-exr-report.md). Gated here, before that function is ever
+//     called -- exactly the T6 LDR-collapse regression class this
+//     ticket's own scope note cites, never reproduced for a new
+//     container.
+// ---------------------------------------------------------------------
+
+// Quick, cheap 4-byte magic-identifier sniff (the OpenEXR spec's own
+// fixed container signature, 0x76 0x2F 0x31 0x01) -- same role as
+// looksLikeKtx2()/stbi_is_hdr_from_memory() above: lets
+// decodeTextureForUpload() route to the EXR path unambiguously (no
+// collision with either of those other two signatures) before either
+// gets a chance to run.
+bool looksLikeExr(std::span<const std::byte> bytes);
+
+// Decodes `bytes` via tinyexr -- same std::nullopt + human-readable
+// failure-reason contract as decodeStbImageHdr(), except every REJECTED-
+// variant reason above is actionable BY CONSTRUCTION: it always names
+// the specific excluded variant/pixel-type and restates the supported
+// envelope, never just tinyexr's own raw (sometimes generic, e.g.
+// "Unknown compression type.") error text alone. Caller
+// (decodeTextureForUpload() below) is responsible for calling
+// looksLikeExr() FIRST to route here at all -- mirrors
+// decodeStbImageHdr()'s own "caller already decided this is the right
+// path" contract.
+std::optional<DecodedStbHdrImage> decodeExrImage(std::span<const std::byte> bytes, std::string* outFailureReason);
+
+// ---------------------------------------------------------------------
 // [Phase 4 Stage 1 Task 15] Combined KTX2/stb decode -- worker-safe
 // (thread-affinity: NONE, same as every other function in this header):
 // consolidates exactly the branch logic TextureCache::loadKtx2Bytes()/
@@ -485,12 +547,15 @@ struct TextureDecodeResult {
 // TextureCache instance to read it from. `isFormatSupported`: same
 // FormatSupportQuery contract as planTranscodeFormat() above.
 //
-// [Phase 5 Task 6] Dispatch order: looksLikeKtx2(bytes) routes to the
-// KTX2 path (now cube-aware, TextureDecodeResult::isCube) FIRST;
-// otherwise stbi_is_hdr_from_memory(bytes) routes to the NEW
-// decodeStbImageHdr()-backed float path (VK_FORMAT_R16G16B16A16_SFLOAT,
-// per the phase's environment-upload-format ruling) BEFORE the plain
-// 8-bit stb branch ever gets a chance to silently tonemap it (see
+// [Phase 5 Task 6, extended by issue #75] Dispatch order:
+// looksLikeKtx2(bytes) routes to the KTX2 path (cube-aware,
+// TextureDecodeResult::isCube) FIRST; then looksLikeExr(bytes) routes to
+// the EXR float path (decodeExrImage(), this header's own EXR block
+// above); then stbi_is_hdr_from_memory(bytes) routes to the
+// decodeStbImageHdr()-backed Radiance float path -- BOTH float paths
+// share the identical VK_FORMAT_R16G16B16A16_SFLOAT packing tail
+// (texture_decode.cpp's finalizeHdrFloatUpload()) -- BEFORE the plain
+// 8-bit stb branch ever gets a chance to silently tonemap either (see
 // decodeStbImageHdr()'s own header comment); everything else falls to
 // the unchanged 8-bit stb (PNG/JPG) path.
 TextureDecodeResult decodeTextureForUpload(std::span<const std::byte> bytes, TextureRole role,

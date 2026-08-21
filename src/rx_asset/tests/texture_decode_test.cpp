@@ -30,15 +30,19 @@ using namespace rx::asset;
 
 namespace {
 
-std::vector<std::byte> readFixture(const std::string& name) {
-    std::string path = std::string(RX_ASSET_ROOT_DIR) + "/assets/test/textures/" + name;
+std::vector<std::byte> readRepoFile(const std::string& repoRelativePath) {
+    std::string path = std::string(RX_ASSET_ROOT_DIR) + "/" + repoRelativePath;
     std::ifstream file(path, std::ios::binary | std::ios::ate);
-    REQUIRE_MESSAGE(file.good(), "fixture missing: " << path);
+    REQUIRE_MESSAGE(file.good(), "file missing: " << path);
     auto size = file.tellg();
     file.seekg(0);
     std::vector<std::byte> bytes(static_cast<size_t>(size));
     file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     return bytes;
+}
+
+std::vector<std::byte> readFixture(const std::string& name) {
+    return readRepoFile("assets/test/textures/" + name);
 }
 
 // A permissive support predicate a test can point planTranscodeFormat()
@@ -622,6 +626,151 @@ TEST_CASE("decodeTextureForUpload: an .hdr byte stream routes to the HDR float p
     glm::vec4 decodedTl = glm::unpackHalf4x16(packedTl);
     CHECK(decodedTl.r == doctest::Approx(4.0F).epsilon(0.001));
     CHECK(decodedTl.r > 1.0F);
+}
+
+// ===== decodeExrImage()/looksLikeExr() [issue #75, owner insertion into
+// Phase 5 Stage 1 between T10 and T11] =====================================
+//
+// gate_test_env.hdr/gate_test_env.exr provenance: tools/gen_exr_env_fixtures
+// (main.cpp's own header comment has the full "same generator, second
+// container" rationale) decodes the EXISTING, untouched, committed
+// samples/08_gltf_viewer/environments/gate_test_env.hdr via
+// decodeStbImageHdr() -- the SAME production function -- and re-encodes
+// those exact floats as HALF-pixel-type, ZIP-compressed EXR via tinyexr's
+// own SaveEXRImageToMemory(). assets/test/textures/gate_test_env.exr is a
+// byte-identical copy of samples/08_gltf_viewer/environments/
+// gate_test_env.exr (the sample's own --env fixture, exercised end-to-end
+// by sample_08_gltf_viewer_exr_env_headless, this file's own sibling
+// ctest) -- kept here too so this device-free suite never reads outside
+// rx_asset's own established assets/test/textures/ fixture directory
+// (readFixture()'s own convention, top of this file).
+
+TEST_CASE("looksLikeExr: the OpenEXR magic number, and only that magic number, routes true") {
+    auto bytes = readFixture("gate_test_env.exr");
+    CHECK(looksLikeExr(std::span<const std::byte>(bytes)));
+
+    auto hdrBytes = readFixture("equirect_test.hdr");
+    CHECK_FALSE(looksLikeExr(std::span<const std::byte>(hdrBytes)));
+
+    std::vector<std::byte> empty;
+    CHECK_FALSE(looksLikeExr(std::span<const std::byte>(empty)));
+}
+
+TEST_CASE("decodeExrImage/container-equivalence: gate_test_env.exr decodes to the SAME float values "
+          "gate_test_env.hdr decodes to, within half-float quantization epsilon -- the float-fidelity assertion "
+          "that structurally rules out the LDR-collapse bug class this ticket cites, for the EXR container") {
+    auto hdrBytes = readRepoFile("samples/08_gltf_viewer/environments/gate_test_env.hdr");
+    std::string hdrFailure;
+    auto hdrDecoded = decodeStbImageHdr(std::span<const std::byte>(hdrBytes), &hdrFailure);
+    REQUIRE_MESSAGE(hdrDecoded.has_value(), "decodeStbImageHdr(gate_test_env.hdr) failed: ", hdrFailure);
+
+    auto exrBytes = readFixture("gate_test_env.exr");
+    CHECK(looksLikeExr(std::span<const std::byte>(exrBytes)));
+    std::string exrFailure;
+    auto exrDecoded = decodeExrImage(std::span<const std::byte>(exrBytes), &exrFailure);
+    REQUIRE_MESSAGE(exrDecoded.has_value(), "decodeExrImage(gate_test_env.exr) failed: ", exrFailure);
+
+    REQUIRE(exrDecoded->width == hdrDecoded->width);
+    REQUIRE(exrDecoded->height == hdrDecoded->height);
+    REQUIRE(exrDecoded->rgba32.size() == hdrDecoded->rgba32.size());
+
+    // Epsilon justification: gate_test_env.exr stores HALF (10-bit
+    // mantissa, ~2^-11 relative precision) samples re-encoded from
+    // gate_test_env.hdr's own ALREADY RGBE-quantized floats (8-bit
+    // shared-exponent mantissa, ~2^-8 relative precision) -- half is
+    // finer than the source's own existing quantization step over this
+    // fixture's value range, so the EXR round-trip adds only a small
+    // further step on top of noise the .hdr already carries. 1% (0.01)
+    // relative epsilon is ~20x the ~0.05% half-quantization noise floor
+    // (comfortably covers accumulated per-channel rounding) while staying
+    // far tighter than the deliberate channel-order sabotage this file's
+    // own discrimination test below proves this epsilon rejects (that
+    // corruption swaps entire channels -- order-of-magnitude, not
+    // percent-scale, differences for any non-gray texel).
+    double maxAbsDiff = 0.0;
+    for (size_t i = 0; i < hdrDecoded->rgba32.size(); ++i) {
+        double hdrVal = hdrDecoded->rgba32[i];
+        double exrVal = exrDecoded->rgba32[i];
+        maxAbsDiff = std::max(maxAbsDiff, std::abs(hdrVal - exrVal));
+        CHECK(exrVal == doctest::Approx(hdrVal).epsilon(0.01));
+    }
+    INFO("max abs per-channel diff across ", hdrDecoded->rgba32.size(), " floats: ", maxAbsDiff);
+    CHECK(maxAbsDiff < 0.01);
+}
+
+TEST_CASE("decodeExrImage: rejects a deep (non-image) EXR loudly, naming the variant and the supported "
+          "envelope -- never silently-wrong pixels") {
+    auto bytes = readFixture("exr_deep_rejected.exr");
+    std::string failureReason;
+    auto decoded = decodeExrImage(std::span<const std::byte>(bytes), &failureReason);
+    CHECK_FALSE(decoded.has_value());
+    CHECK(failureReason.find("deep") != std::string::npos);
+    CHECK(failureReason.find("supported envelope") != std::string::npos);
+}
+
+TEST_CASE("decodeExrImage: rejects a tiled EXR loudly, naming the variant and the supported envelope") {
+    auto bytes = readFixture("exr_tiled_rejected.exr");
+    std::string failureReason;
+    auto decoded = decodeExrImage(std::span<const std::byte>(bytes), &failureReason);
+    CHECK_FALSE(decoded.has_value());
+    CHECK(failureReason.find("tiled") != std::string::npos);
+    CHECK(failureReason.find("supported envelope") != std::string::npos);
+}
+
+TEST_CASE("decodeExrImage: rejects DWAA compression loudly (genuinely unimplemented by the pinned tinyexr, "
+          "confirmed directly -- not merely assumed from its README), naming the known-excluded codecs and the "
+          "supported envelope") {
+    auto bytes = readFixture("exr_dwaa_rejected.exr");
+    std::string failureReason;
+    auto decoded = decodeExrImage(std::span<const std::byte>(bytes), &failureReason);
+    CHECK_FALSE(decoded.has_value());
+    CHECK(failureReason.find("DWAA") != std::string::npos);
+    CHECK(failureReason.find("supported envelope") != std::string::npos);
+}
+
+TEST_CASE("decodeExrImage: a corrupt/truncated .exr byte stream fails cleanly with a non-empty failure reason, "
+          "never a crash [mirrors decodeStbImageHdr()'s identical corrupt.hdr test]") {
+    auto bytes = readFixture("gate_test_env.exr");
+    std::vector<std::byte> truncated(bytes.begin(), bytes.begin() + 16);
+    std::string failureReason;
+    auto decoded = decodeExrImage(std::span<const std::byte>(truncated), &failureReason);
+    CHECK_FALSE(decoded.has_value());
+    CHECK_FALSE(failureReason.empty());
+}
+
+TEST_CASE("decodeExrImage: an empty byte span fails cleanly") {
+    std::vector<std::byte> empty;
+    std::string failureReason;
+    auto decoded = decodeExrImage(std::span<const std::byte>(empty), &failureReason);
+    CHECK_FALSE(decoded.has_value());
+}
+
+TEST_CASE("decodeTextureForUpload: an .exr byte stream routes to the EXR float path -- "
+          "VK_FORMAT_R16G16B16A16_SFLOAT output, same downstream shape as the .hdr path (finalizeHdrFloatUpload() "
+          "is the SAME shared tail both containers feed)") {
+    auto bytes = readFixture("gate_test_env.exr");
+    TextureDecodeResult result =
+        decodeTextureForUpload(std::span<const std::byte>(bytes), TextureRole::Environment,
+                                /*maxImageDimension2D=*/4096, alwaysSupported);
+    REQUIRE(result.outcome == TextureDecodeResult::Outcome::Ready);
+    CHECK(result.format == VK_FORMAT_R16G16B16A16_SFLOAT);
+    CHECK(result.width == 64);
+    CHECK(result.height == 32);
+    CHECK_FALSE(result.isCube);
+    REQUIRE(result.levels.size() == 1);
+    CHECK(result.levels[0].level == 0);
+    CHECK(result.levels[0].faceIndex == 0);
+    CHECK(result.levels[0].bytes.size() == 64 * 32 * 8);
+}
+
+TEST_CASE("decodeTextureForUpload: an unsupported-variant .exr routes to Failed with the actionable reason, "
+          "never a checkerboard/silent-success outcome") {
+    auto bytes = readFixture("exr_dwaa_rejected.exr");
+    TextureDecodeResult result =
+        decodeTextureForUpload(std::span<const std::byte>(bytes), TextureRole::Environment,
+                                /*maxImageDimension2D=*/4096, alwaysSupported);
+    CHECK(result.outcome == TextureDecodeResult::Outcome::Failed);
+    CHECK(result.failureReason.find("DWAA") != std::string::npos);
 }
 
 TEST_CASE("stbRgba8Format: role-correct SRGB vs UNORM, mirroring roleFormatTable()'s own colorspace column") {

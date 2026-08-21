@@ -191,6 +191,11 @@ add_subdirectory(tools/toolchain_check)
 # Phase 4 Stage 1 Task 13: host-only fixture regenerator (assets/test/
 # cube_meshopt.*/cube_draco.*) -- see its own CMakeLists.txt comment.
 add_subdirectory(tools/gen_gltf_compression_fixtures)
+# Phase 5, issue #75: host-only EXR fixture regenerator (assets/test/
+# textures/gate_test_env.exr + rejection fixtures,
+# samples/08_gltf_viewer/environments/gate_test_env.exr) -- see its own
+# CMakeLists.txt comment.
+add_subdirectory(tools/gen_exr_env_fixtures)
 # Phase 5 Stage 1 Task 9 [#45]: standalone IBL bake-timing benchmark, NOT
 # ctest-registered -- see tools/rx_ibl_bench/main.cpp's own header comment.
 add_subdirectory(tools/rx_ibl_bench)

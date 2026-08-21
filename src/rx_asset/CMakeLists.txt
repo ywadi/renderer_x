@@ -58,9 +58,21 @@ add_library(rx_asset STATIC
     # consumer" convention (see third_party/CMakeLists.txt's own comment
     # on the FetchContent_Populate that fetched mikktspace_SOURCE_DIR).
     "${mikktspace_SOURCE_DIR}/mikktspace.c"
+    # [issue #75] tinyexr's own single TINYEXR_IMPLEMENTATION translation
+    # unit -- see tinyexr_impl.cpp's own comment for why this lives here
+    # (rx_asset, the actual EXR-decode consumer) rather than rx_rhi_vk's
+    # existing stb_impl.cpp, mirroring stb_image_resize_impl.cpp's own
+    # identical precedent immediately above.
+    tinyexr_impl.cpp
+    # tinyexr's own vendored miniz (deps/miniz/miniz.c) -- no CMakeLists.txt
+    # of its own within that subdirectory, compiled straight into rx_asset
+    # exactly like mikktspace.c above (see third_party/CMakeLists.txt's own
+    # comment on the tinyexr FetchContent_Populate for why this file, and
+    # not a system zlib, provides tinyexr's DEFLATE implementation).
+    "${tinyexr_SOURCE_DIR}/deps/miniz/miniz.c"
 )
 target_include_directories(rx_asset PUBLIC include)
-target_include_directories(rx_asset PRIVATE "${mikktspace_SOURCE_DIR}")
+target_include_directories(rx_asset PRIVATE "${mikktspace_SOURCE_DIR}" "${tinyexr_SOURCE_DIR}" "${tinyexr_SOURCE_DIR}/deps/miniz")
 target_link_libraries(rx_asset PUBLIC rx_rhi_vk rx_task fastgltf::fastgltf meshoptimizer::meshoptimizer draco::draco KTX::ktx)
 
 # Draco dead-stripping [gate matrix row 9, third_party/CMakeLists.txt's

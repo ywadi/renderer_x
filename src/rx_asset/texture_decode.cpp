@@ -2,11 +2,13 @@
 #include <rx_core/log.h>
 #include <stb_image.h>
 #include <stb_image_resize2.h>
+#include <tinyexr.h>
 #include <glm/gtc/packing.hpp>
 #include <glm/vec4.hpp>
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 
@@ -156,6 +158,18 @@ bool looksLikeKtx2(std::span<const std::byte> bytes) {
 
 bool exceedsDimensionLimit(uint32_t width, uint32_t height, uint32_t maxDimension2D) {
     return width > maxDimension2D || height > maxDimension2D;
+}
+
+// [issue #75] OpenEXR spec 2.0's own fixed 4-byte magic ("File Identifier"
+// / "Magic Number" in the spec text): 0x76, 0x2F, 0x31, 0x01. Same shape
+// as looksLikeKtx2() above -- no signature collision with either that
+// 12-byte KTX2 magic or anything stbi_is_hdr_from_memory() recognizes.
+bool looksLikeExr(std::span<const std::byte> bytes) {
+    static constexpr std::array<uint8_t, 4> kMagic{0x76, 0x2F, 0x31, 0x01};
+    if (bytes.size() < kMagic.size()) {
+        return false;
+    }
+    return std::memcmp(bytes.data(), kMagic.data(), kMagic.size()) == 0;
 }
 
 namespace {
@@ -442,6 +456,159 @@ std::optional<DecodedStbHdrImage> decodeStbImageHdr(std::span<const std::byte> b
     result.height = static_cast<uint32_t>(height);
     result.rgba32.assign(pixels, pixels + (static_cast<size_t>(width) * height * 4));
     stbi_image_free(pixels);
+    return result;
+}
+
+// ---------------------------------------------------------------------
+// [issue #75] OpenEXR (.exr) float decode path -- see this function's own
+// declaration (texture_decode.h) for the full "why this exists / probed
+// supported envelope" rationale.
+// ---------------------------------------------------------------------
+
+namespace {
+
+// The fixed set of compression codes this decode path accepts once
+// ParseEXRHeaderFromMemory() has already succeeded (i.e. tinyexr itself
+// considers the header well-formed) -- restated here purely for the
+// rejection message text below; the actual gate is tinyexr's OWN
+// internal allow-list inside ParseEXRHeaderFromMemory() (verified
+// directly, task-exr-report.md), never re-implemented here.
+constexpr const char* kExrSupportedEnvelope =
+    "supported envelope: single-part scanline EXR (never tiled/deep/multipart), HALF or FLOAT channels, "
+    "NONE/RLE/ZIPS/ZIP/PIZ/PXR24/B44/B44A compression";
+
+}  // namespace
+
+std::optional<DecodedStbHdrImage> decodeExrImage(std::span<const std::byte> bytes, std::string* outFailureReason) {
+    if (bytes.empty()) {
+        if (outFailureReason != nullptr) {
+            *outFailureReason = "empty byte span";
+        }
+        return std::nullopt;
+    }
+
+    const auto* data = reinterpret_cast<const unsigned char*>(bytes.data());
+    const size_t size = bytes.size();
+
+    EXRVersion version;
+    int versionRet = ParseEXRVersionFromMemory(&version, data, size);
+    if (versionRet != TINYEXR_SUCCESS) {
+        if (outFailureReason != nullptr) {
+            *outFailureReason = std::string("EXR decode rejected: not a valid EXR container (magic/version parse "
+                                             "failed, tinyexr code ") +
+                                 std::to_string(versionRet) + "); " + kExrSupportedEnvelope;
+        }
+        return std::nullopt;
+    }
+
+    // [scope bar] tiled/deep/multipart are rejected straight off the
+    // 8-byte EXRVersion flags -- always available regardless of whether
+    // the rest of the header is even well-formed, and names the EXACT
+    // excluded variant rather than whatever unrelated structural failure
+    // ParseEXRHeaderFromMemory() might otherwise produce trying (and
+    // likely failing) to parse a deep/multipart header's own different
+    // attribute shape.
+    if (version.non_image) {
+        if (outFailureReason != nullptr) {
+            *outFailureReason = std::string("EXR decode rejected: this file is a deep (non-image) EXR, outside "
+                                             "the supported baseline; ") +
+                                 kExrSupportedEnvelope;
+        }
+        return std::nullopt;
+    }
+    if (version.multipart) {
+        if (outFailureReason != nullptr) {
+            *outFailureReason = std::string("EXR decode rejected: this file is a multipart EXR, outside the "
+                                             "supported baseline; ") +
+                                 kExrSupportedEnvelope;
+        }
+        return std::nullopt;
+    }
+    if (version.tiled) {
+        if (outFailureReason != nullptr) {
+            *outFailureReason = std::string("EXR decode rejected: this file is a tiled EXR, outside the "
+                                             "supported baseline (scanline only); ") +
+                                 kExrSupportedEnvelope;
+        }
+        return std::nullopt;
+    }
+
+    EXRHeader header;
+    InitEXRHeader(&header);
+    const char* headerErr = nullptr;
+    int headerRet = ParseEXRHeaderFromMemory(&header, &version, data, size, &headerErr);
+    if (headerRet != TINYEXR_SUCCESS) {
+        // Covers unsupported compression (DWAA/DWAB collapse into
+        // tinyexr's own generic "Unknown compression type." here --
+        // confirmed directly, task-exr-report.md, since neither is in
+        // tinyexr's own internal allow-list; ZFP is separately named by
+        // tinyexr itself, "ZFP compression is not supported.") and any
+        // other header-parse failure (truncated/corrupt attribute data).
+        std::string wrapped = "EXR decode rejected: ";
+        wrapped += (headerErr != nullptr) ? headerErr : "header parse failed";
+        wrapped +=
+            " (known excluded codecs: DWAA, DWAB -- not implemented by the vendored tinyexr build; ZFP -- "
+            "requires an additional dependency, not enabled); ";
+        wrapped += kExrSupportedEnvelope;
+        if (outFailureReason != nullptr) {
+            *outFailureReason = wrapped;
+        }
+        if (headerErr != nullptr) {
+            FreeEXRErrorMessage(headerErr);
+        }
+        FreeEXRHeader(&header);
+        return std::nullopt;
+    }
+
+    // [scope bar, silently-wrong-pixels guard] UINT channels: tinyexr's
+    // own convenience LoadEXRFromMemory() below does NOT convert a
+    // UINT-typed channel to float -- it reinterprets the raw uint32
+    // sample bits as an IEEE-754 float bit pattern (confirmed directly,
+    // task-exr-report.md's own probe). Gate here, BEFORE ever calling
+    // that function -- exactly the T6 LDR-collapse regression class this
+    // ticket cites, never reproduced for a new container.
+    for (int c = 0; c < header.num_channels; ++c) {
+        if (header.pixel_types[c] == TINYEXR_PIXELTYPE_UINT) {
+            if (outFailureReason != nullptr) {
+                *outFailureReason = std::string("EXR decode rejected: channel \"") + header.channels[c].name +
+                                     "\" uses the UINT pixel type (RendererX's EXR envelope supports HALF and "
+                                     "FLOAT channels only, matching the .hdr Radiance path's own float-only "
+                                     "contract); " +
+                                     kExrSupportedEnvelope;
+            }
+            FreeEXRHeader(&header);
+            return std::nullopt;
+        }
+    }
+    FreeEXRHeader(&header);
+
+    // Envelope validated -- library-first from here: tinyexr's own
+    // convenience LoadEXRFromMemory() performs the actual scanline
+    // decode + HALF->FLOAT upconversion + RGBA channel packing (R
+    // channel required; single-channel-replicated-to-RGB and
+    // missing-alpha=1.0 handling are that function's own documented
+    // behavior) -- no hand-rolled EXR pixel decode written for this task.
+    float* rgba = nullptr;
+    int width = 0;
+    int height = 0;
+    const char* loadErr = nullptr;
+    int loadRet = LoadEXRFromMemory(&rgba, &width, &height, data, size, &loadErr);
+    if (loadRet != TINYEXR_SUCCESS) {
+        if (outFailureReason != nullptr) {
+            *outFailureReason =
+                std::string("EXR decode failed: ") + (loadErr != nullptr ? loadErr : "unknown tinyexr failure");
+        }
+        if (loadErr != nullptr) {
+            FreeEXRErrorMessage(loadErr);
+        }
+        return std::nullopt;
+    }
+
+    DecodedStbHdrImage result;
+    result.width = static_cast<uint32_t>(width);
+    result.height = static_cast<uint32_t>(height);
+    result.rgba32.assign(rgba, rgba + (static_cast<size_t>(width) * height * 4));
+    free(rgba);  // tinyexr's own malloc-based ownership contract (LoadEXRFromMemory's own header comment)
     return result;
 }
 
@@ -758,28 +925,25 @@ TextureDecodeResult decodeStbForUpload(std::span<const std::byte> bytes, Texture
     return result;
 }
 
-// [Phase 5 Task 6] Radiance (.hdr) equirect float path -- see
-// decodeStbImageHdr()'s own header comment (texture_decode.h) for why
-// this must run BEFORE decodeStbForUpload() (the 8-bit branch) ever gets
-// a chance to silently tonemap this same content.
-TextureDecodeResult decodeStbHdrForUpload(std::span<const std::byte> bytes, TextureRole role,
-                                            uint32_t maxImageDimension2D, const FormatSupportQuery& isFormatSupported) {
+// [Phase 5 Task 6, extended by issue #75] Shared tail for BOTH float-RGBA
+// environment sources -- Radiance .hdr (decodeStbImageHdr()) and OpenEXR
+// .exr (decodeExrImage()) -- one shared implementation per D5/Task 15's
+// own "no forked logic" rule (this header's top-of-file comment): the
+// dimension gate, the format-support gate, and the float32->float16
+// packing step apply IDENTICALLY to both input containers, never
+// independently re-derived per format. `decoded` is already a fully
+// parsed, envelope-validated float RGBA image by the time either caller
+// reaches this function.
+TextureDecodeResult finalizeHdrFloatUpload(const DecodedStbHdrImage& decoded, TextureRole role,
+                                             uint32_t maxImageDimension2D, const FormatSupportQuery& isFormatSupported) {
     TextureDecodeResult result;
     result.role = role;
 
-    std::string failureReason;
-    auto decoded = decodeStbImageHdr(bytes, &failureReason);
-    if (!decoded.has_value()) {
-        result.outcome = TextureDecodeResult::Outcome::Failed;
-        result.failureReason = std::string("stb HDR decode failed: ") + failureReason;
-        return result;
-    }
-
-    if (exceedsDimensionLimit(decoded->width, decoded->height, maxImageDimension2D)) {
+    if (exceedsDimensionLimit(decoded.width, decoded.height, maxImageDimension2D)) {
         result.outcome = TextureDecodeResult::Outcome::Checkerboard;
         result.failureReason = "exceeds maxImageDimension2D";
         result.warnings.push_back(
-            {"oversized", "is " + std::to_string(decoded->width) + "x" + std::to_string(decoded->height) +
+            {"oversized", "is " + std::to_string(decoded.width) + "x" + std::to_string(decoded.height) +
                               ", exceeding this device's maxImageDimension2D=" + std::to_string(maxImageDimension2D) +
                               " -- falling back to checkerboard"});
         return result;
@@ -805,34 +969,71 @@ TextureDecodeResult decodeStbHdrForUpload(std::span<const std::byte> bytes, Text
         return result;
     }
 
-    // float32 (stb's own decode) -> float16 packed bytes: GLM's own
-    // reference half-float packer (glm::packHalf4x16, already used
-    // process-wide for this exact format -- rx_graph/scene_color.h's own
-    // kHdrFormat readback tests) -- library-first, no hand-rolled
+    // float32 (stb's or tinyexr's own decode) -> float16 packed bytes:
+    // GLM's own reference half-float packer (glm::packHalf4x16, already
+    // used process-wide for this exact format -- rx_graph/scene_color.h's
+    // own kHdrFormat readback tests) -- library-first, no hand-rolled
     // float-to-half bit-twiddling written for this task.
-    const size_t texelCount = static_cast<size_t>(decoded->width) * decoded->height;
+    const size_t texelCount = static_cast<size_t>(decoded.width) * decoded.height;
     std::vector<std::byte> packed(texelCount * sizeof(uint64_t));
     for (size_t i = 0; i < texelCount; ++i) {
-        glm::vec4 texel(decoded->rgba32[i * 4 + 0], decoded->rgba32[i * 4 + 1], decoded->rgba32[i * 4 + 2],
-                         decoded->rgba32[i * 4 + 3]);
+        glm::vec4 texel(decoded.rgba32[i * 4 + 0], decoded.rgba32[i * 4 + 1], decoded.rgba32[i * 4 + 2],
+                         decoded.rgba32[i * 4 + 3]);
         uint64_t half = glm::packHalf4x16(texel);
         std::memcpy(packed.data() + i * sizeof(uint64_t), &half, sizeof(uint64_t));
     }
 
     result.outcome = TextureDecodeResult::Outcome::Ready;
     result.format = kEnvironmentHdrFormat;
-    result.width = decoded->width;
-    result.height = decoded->height;
+    result.width = decoded.width;
+    result.height = decoded.height;
     // Mip 0 only -- Stage 1 Task 9 bakes the prefiltered mip chain from
     // this raw equirect; this task only gets the float bytes onto the GPU
     // as one sampled 2D image (matrix row 10's own scope boundary).
     DecodedTextureLevel level0;
     level0.level = 0;
-    level0.width = decoded->width;
-    level0.height = decoded->height;
+    level0.width = decoded.width;
+    level0.height = decoded.height;
     level0.bytes = std::move(packed);
     result.levels.push_back(std::move(level0));
     return result;
+}
+
+// [Phase 5 Task 6] Radiance (.hdr) equirect float path -- see
+// decodeStbImageHdr()'s own header comment (texture_decode.h) for why
+// this must run BEFORE decodeStbForUpload() (the 8-bit branch) ever gets
+// a chance to silently tonemap this same content.
+TextureDecodeResult decodeStbHdrForUpload(std::span<const std::byte> bytes, TextureRole role,
+                                            uint32_t maxImageDimension2D, const FormatSupportQuery& isFormatSupported) {
+    std::string failureReason;
+    auto decoded = decodeStbImageHdr(bytes, &failureReason);
+    if (!decoded.has_value()) {
+        TextureDecodeResult result;
+        result.role = role;
+        result.outcome = TextureDecodeResult::Outcome::Failed;
+        result.failureReason = std::string("stb HDR decode failed: ") + failureReason;
+        return result;
+    }
+    return finalizeHdrFloatUpload(*decoded, role, maxImageDimension2D, isFormatSupported);
+}
+
+// [issue #75] OpenEXR (.exr) equirect float path -- see decodeExrImage()'s
+// own header comment (texture_decode.h) for the probed supported
+// envelope and rejection contract; every rejection reason it returns is
+// already fully actionable, passed through here verbatim (never
+// re-wrapped).
+TextureDecodeResult decodeExrForUpload(std::span<const std::byte> bytes, TextureRole role,
+                                         uint32_t maxImageDimension2D, const FormatSupportQuery& isFormatSupported) {
+    std::string failureReason;
+    auto decoded = decodeExrImage(bytes, &failureReason);
+    if (!decoded.has_value()) {
+        TextureDecodeResult result;
+        result.role = role;
+        result.outcome = TextureDecodeResult::Outcome::Failed;
+        result.failureReason = failureReason;
+        return result;
+    }
+    return finalizeHdrFloatUpload(*decoded, role, maxImageDimension2D, isFormatSupported);
 }
 
 }  // namespace
@@ -848,6 +1049,13 @@ TextureDecodeResult decodeTextureForUpload(std::span<const std::byte> bytes, Tex
     }
     if (looksLikeKtx2(bytes)) {
         return decodeKtx2ForUpload(bytes, role, maxImageDimension2D, isFormatSupported);
+    }
+    // [issue #75] Checked before the stb HDR/8-bit branches -- an EXR
+    // byte stream never collides with either of those signatures, but
+    // checked first anyway for the same "most specific container check
+    // first" discipline looksLikeKtx2() already establishes.
+    if (looksLikeExr(bytes)) {
+        return decodeExrForUpload(bytes, role, maxImageDimension2D, isFormatSupported);
     }
     // [Phase 5 Task 6] Checked BEFORE the 8-bit stb branch -- see
     // decodeStbImageHdr()'s own header comment for the silent-tonemap gap

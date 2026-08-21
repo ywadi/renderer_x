@@ -662,6 +662,85 @@ endif()
 # mikktspace.c/mikktspace.h.
 set(mikktspace_SOURCE_DIR "${mikktspace_SOURCE_DIR}" PARENT_SCOPE)
 
+# tinyexr (tinyexr.h): OpenEXR (.exr) input decode [issue #75, owner
+# insertion into Phase 5 Stage 1 between T10 and T11]. Library-first
+# choice, briefly checked against two alternatives: OpenEXR proper (the
+# reference implementation) was rejected as too heavy a dependency for
+# one input path -- it is a multi-library CMake project of its own
+# (OpenEXR + Imath, plus its own zlib dependency and thread pool),
+# exactly the class of dependency weight T6's own header comment
+# (texture_decode.h) already rejected in favor of reusing stb_image.h's
+# built-in Radiance reader for the sibling .hdr path; miniexr (also by
+# this same tinyexr author) was rejected outright -- it is WRITE-only (an
+# EXR *encoder*, no decode API at all), no use for an input path. tinyexr
+# is the de-facto lightweight single-purpose EXR decoder the ecosystem
+# reaches for exactly this case (used by Blender's own glTF importer,
+# Filament, and dozens of other engines for the identical "read an EXR
+# without linking full OpenEXR" need).
+#
+# CORRECTION vs. this ticket's own brief text: tinyexr is BSD-3-Clause
+# licensed (verified directly against the pinned tag's own LICENSE file),
+# not zlib as the brief assumed -- permissive either way, no attribution
+# beyond this repository's own, but recorded accurately here rather than
+# silently repeating the wrong license family.
+#
+# NOT LITERALLY SINGLE-FILE as of this pin, despite the "single-file"
+# framing both the ticket and this project's own convention (stb/
+# mikktspace) would suggest -- verified directly by compiling against the
+# pinned tag: tinyexr.h itself unconditionally `#include`s two small
+# companion headers from the same repo, exr_reader.hh (191 lines) and
+# streamreader.hh (both header-only, no separate implementation TU of
+# their own) -- a v3.x refactor upstream split part of the reader out of
+# the monolithic header. Still a lightweight, decode-focused vendoring
+# (nowhere near full OpenEXR's weight): the FetchContent_Populate below
+# fetches the whole tinyexr source tree (like every other no-CMakeLists
+# dependency here), and only tinyexr.h/exr_reader.hh/streamreader.hh (via
+# the include path) plus deps/miniz/miniz.c (explicitly compiled, see
+# below) are ever referenced -- the rest of the tree (examples/, attic/,
+# deps/astcenc for an unrelated ASTC-texture feature this task never
+# touches, etc.) is simply unused dead weight on disk, never compiled.
+#
+# TINYEXR_USE_MINIZ (the header's own default, ON): decoding ZIP/ZIPS-
+# compressed scanlines needs a real DEFLATE implementation. tinyexr ships
+# one pre-vendored at deps/miniz/{miniz.c,miniz.h} (a permissively-
+# licensed, dependency-free zlib-compatible implementation) specifically
+# so consumers are not forced to link a system zlib -- kept as the
+# upstream-recommended default rather than switching to
+# TINYEXR_USE_STB_ZLIB (which would additionally require linking
+# stb_image_write.h's SaveEXR-only stbi_zlib_compress() symbol for pure
+# decode use, this task's actual need) or TINYEXR_USE_NANOZLIB (a third
+# vendored option, no clearer benefit investigated). Compiled straight
+# into src/rx_asset (see that directory's own CMakeLists.txt), exactly
+# mirroring mikktspace.c's own "no build system -> compile into the
+# consumer" precedent immediately above this block.
+#
+# Probed supported-compression/pixel-type envelope for THIS pinned
+# release (task-exr-report.md has the full evidence): NONE/RLE/ZIPS/ZIP/
+# PIZ/PXR24/B44/B44A compression and HALF/FLOAT pixel types decode
+# correctly (round-tripped directly, including through a real 4K
+# production HDRI asset using PIZ+HALF); DWAA/DWAB compression is
+# genuinely NOT implemented (the header's own comment: "Not yet
+# supported"; confirmed empirically -- ParseEXRHeaderFromMemory() rejects
+# it); ZFP compression is left disabled (TINYEXR_USE_ZFP default OFF,
+# would need a separate libzfp dependency); UINT-typed channels are
+# rejected by rx_asset's OWN decode wrapper (texture_decode.cpp) BEFORE
+# ever reaching tinyexr's convenience RGBA loader -- that loader does NOT
+# convert UINT samples to float, it reinterprets the raw bits, a genuine
+# silently-wrong-pixels trap confirmed directly against this pin.
+set(RX_TINYEXR_TAG "v3.2.0")
+FetchContent_Declare(tinyexr
+  GIT_REPOSITORY https://github.com/syoyo/tinyexr.git
+  GIT_TAG ${RX_TINYEXR_TAG}
+  GIT_SHALLOW TRUE)
+FetchContent_GetProperties(tinyexr)
+if(NOT tinyexr_POPULATED)
+  FetchContent_Populate(tinyexr)
+endif()
+# Same CMake 3.22 sibling-scope reason as volk/VMA/stb/mikktspace above:
+# propagate to root scope for src/rx_asset (a sibling directory) to
+# locate tinyexr.h/deps/miniz.
+set(tinyexr_SOURCE_DIR "${tinyexr_SOURCE_DIR}" PARENT_SCOPE)
+
 # Draco: KHR_draco_mesh_compression decode [gate matrix §2B -- fastgltf
 # parses only the extension's metadata, "does NOT decode... zero draco::
 # calls in fastgltf.cpp"]. Apache License 2.0 (LICENSE, verified

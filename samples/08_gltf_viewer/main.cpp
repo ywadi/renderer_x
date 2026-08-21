@@ -197,10 +197,17 @@ struct Args {
     // that script.
     std::string writeReferencesDir;
 
-    // [Phase 5 Task 10, #46, FG1 closure] `--env <path.hdr>` -- an equirect
-    // HDR environment to bake (rx::ibl::bakeEnvironment()) and bind via
-    // `rx::scene::Scene::setEnvironment()`. Empty (the default) resolves to
-    // this sample's own committed fixture (resolveDefaultEnvironmentPath(),
+    // [Phase 5 Task 10, #46, FG1 closure; issue #75 -- .exr routing added
+    // with NO change to this flag's own parsing/resolution, both below]
+    // `--env <path.hdr|.exr>` -- an equirect environment to bake
+    // (rx::ibl::bakeEnvironment()) and bind via
+    // `rx::scene::Scene::setEnvironment()`. Container format is detected
+    // by magic number, not this flag's own file extension
+    // (rx::asset::decodeTextureForUpload()'s own dispatch,
+    // texture_decode.cpp) -- a Radiance .hdr or an OpenEXR .exr both work
+    // here unmodified; see sample_08_gltf_viewer_exr_env_headless
+    // (CMakeLists.txt) for the routing proof. Empty (the default) resolves
+    // to this sample's own committed fixture (resolveDefaultEnvironmentPath(),
     // samples/08_gltf_viewer/environments/gate_test_env.hdr) UNLESS `noEnv`
     // is set -- see that flag's own comment.
     std::string envPath;

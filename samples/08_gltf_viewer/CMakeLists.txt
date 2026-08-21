@@ -210,3 +210,22 @@ set_tests_properties(sample_08_gltf_viewer_headless PROPERTIES TIMEOUT 300)
 # cancel-mid-import-then-destroy sequence, not a synthetic stand-in.
 add_test(NAME sample_08_gltf_viewer_quit_during_load COMMAND sample_08_gltf_viewer --validate --quit-during-load)
 set_tests_properties(sample_08_gltf_viewer_quit_during_load PROPERTIES TIMEOUT 300)
+
+# [issue #75, full-chain proof] Routing-only: the SAME headless gate as
+# sample_08_gltf_viewer_headless above, pointed at the committed EXR
+# sibling of gate_test_env.hdr (tools/gen_exr_env_fixtures's own output,
+# container-equivalent content -- task-exr-report.md has the decoded-float
+# proof) via the pre-existing `--env <path>` flag -- zero new sample logic,
+# exactly the ticket's own scope bar. Gated by the identical
+# gateOneFrame()/loaded_scene.png D17 comparison
+# sample_08_gltf_viewer_headless already runs (unconditional regardless of
+# which --env was given, non-lavapipe informational-only carve-out
+# included) -- a real decode -> T9 bake -> render proof that the EXR input
+# path reproduces the SAME visual result the .hdr default already gates
+# on, not a separate/looser check invented for this ticket. Referenced by
+# its source-tree path (works from any build/package layout, same as this
+# file's own RX_REPO_ROOT_DIR-based devTree fallback precedent) -- no new
+# deploy step needed since `--env` accepts any filesystem path directly.
+add_test(NAME sample_08_gltf_viewer_exr_env_headless
+         COMMAND sample_08_gltf_viewer --validate --env "${CMAKE_CURRENT_SOURCE_DIR}/environments/gate_test_env.exr")
+set_tests_properties(sample_08_gltf_viewer_exr_env_headless PROPERTIES TIMEOUT 300)
