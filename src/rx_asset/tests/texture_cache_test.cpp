@@ -832,6 +832,17 @@ TEST_CASE("TextureCache: cubemap KTX2 now loads as a real, non-fallback cube tex
 // GPU-level regression, mirroring this test's own pre-Task-6 shape
 // (which the test just above replaced) but against the two NEW
 // still-rejected fixtures instead of the now-supported cubemap.ktx2.
+//
+// [Review round, MINOR] LogCapture-asserted WARN text, matching this
+// file's own established D11-rejection-path convention (the
+// sRGB-mislabeled-normal WARN test and the log-once-dedup test just
+// above both lock their exact message text this same way) -- the actual
+// RX_LOG_WARN only fires here, at the TextureCache layer
+// (applyDecodeResult()); the device-free DecodedKtx2Texture::
+// parseAndTranscode() tests in texture_decode_test.cpp have no message
+// text to capture at all (that layer only returns the Ktx2ParseError
+// enum), so this is the one place this warning's own wording is
+// regression-locked.
 TEST_CASE("TextureCache: flat 2D-array and cube-array KTX2 both still -> checkerboard fallback (cubemap-only "
           "support, matrix row 3)") {
     auto fixture = makeFixture("rx_asset_tc_array_rejected");
@@ -839,10 +850,21 @@ TEST_CASE("TextureCache: flat 2D-array and cube-array KTX2 both still -> checker
         return;
     }
     makeCache(*fixture);
+
+    LogCapture capture;
     TextureHandle array2d = fixture->cache->load(fixturePath("array2d_rejected.ktx2"), TextureRole::BaseColor);
     TextureHandle cubeArray = fixture->cache->load(fixturePath("cubearray_rejected.ktx2"), TextureRole::BaseColor);
     CHECK(array2d == fixture->cache->checkerboardHandle());
     CHECK(cubeArray == fixture->cache->checkerboardHandle());
+
+    // Both fixtures fire the SAME shared warning text (texture_decode.cpp's
+    // decodeKtx2ForUpload(), "unsupported-layout" category) -- distinct
+    // debugNames (the two different filenames) mean D11's per-(debugName,
+    // category) dedup does NOT collapse them into one line, so this text
+    // is expected exactly twice, once per fixture.
+    CHECK(capture.count("is an array, cube-array, or non-2D KTX2 container") == 2);
+    CHECK(capture.count("cubemap-only per the Phase 5 Task 6 ruling") == 2);
+
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }
 
