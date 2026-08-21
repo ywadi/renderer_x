@@ -1,0 +1,1345 @@
+# Review package: 3299993..23fb276
+
+## Commits
+23fb276 chore: p5 task 9 review-round report addendum
+267e55a fix(rx_ibl): close review-round spec gap + quality findings (task-09-review.md)
+
+## Files changed
+ .../2026-08-20-phase5-techniques/task-09-report.md | 291 +++++++++--
+ shaders/ibl/prefilter_specular.slang               |  19 +-
+ src/rx_ibl/include/rx_ibl/bake.h                   |  62 ++-
+ src/rx_ibl/src/bake.cpp                            |  14 +-
+ src/rx_ibl/tests/CMakeLists.txt                    |   5 +
+ src/rx_ibl/tests/test_ibl_analytic_gpu.cpp         |   6 +-
+ .../tests/test_ibl_directional_impulse_gpu.cpp     | 531 +++++++++++++++++++++
+ .../tests/test_ibl_energy_compensation_gpu.cpp     |   2 +-
+ src/rx_ibl/tests/test_ibl_hdr_fixture_gpu.cpp      |   2 +-
+ tools/rx_ibl_bench/main.cpp                        |   2 +-
+ 10 files changed, 878 insertions(+), 56 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-20-phase5-techniques/task-09-report.md b/.superpowers/sdd/2026-08-20-phase5-techniques/task-09-report.md
+index eaa9f5a..c2986fa 100644
+--- a/.superpowers/sdd/2026-08-20-phase5-techniques/task-09-report.md
++++ b/.superpowers/sdd/2026-08-20-phase5-techniques/task-09-report.md
+@@ -252,44 +252,40 @@ function closes the SAME identity — `compensated ≈ 1.0`
+ 1. This is exactly the acceptance line's own wording: "white-furnace-
+ with-multiscatter now closes to ~1.0 where single-scatter loses energy" —
+ now with a REAL, backed `dfgY` source instead of Task 8's own documented
+ placeholder.
+ 
+ ## Per-row proof (matrix acceptance sketch)
+ 
+ | Acceptance line | Disposition | Evidence |
+ |---|---|---|
+ | SH/irradiance VALUES asserted against analytic ground truth (uniform white environment → known coefficients/irradiance) | consume-now, irradiance-cubemap path per ruling | §1 above — exact conservation, non-white triple, both drivers |
+-| directional impulse → known lobe | not built — see "Scope note" below | — |
++| directional impulse → known lobe | **consume-now (closed in the review round — see Addendum)** | `test_ibl_directional_impulse_gpu.cpp`, Addendum §A2 below |
+ | Prefiltered chain: mip-0 ≈ source | consume-now | §3 above — exact passthrough on a NON-uniform source |
+ | highest-roughness mip ≈ irradiance (value probes) | consume-now, trivially exact for a uniform env (both converge to the same constant by construction, §1); monotonic-blur behavior additionally proven on a non-uniform env (§3) | Both test cases above |
+ | DFG LUT spot values match published Karis/Filament table points | consume-now, via independently-derived closed-form limits rather than a scraped external table — see "Methodology note" below | §2 above |
+ | Full chain executes as graph compute passes | consume-now | Every WRITE in every stage goes through `Pass::addStorageImageOutput()`/`Executor::execute()` — zero hand-rolled `vkCmdDispatch` outside the graph's own pass machinery in the PRODUCTION path (`bake.cpp`); the one exception is the DFG LUT and base-cubemap PASSTHROUGH kernel reuse, still graph-dispatched, just sharing a pipeline |
+ | zero validation errors both drivers | consume-now | lavapipe 6/6 (318/318), real NVIDIA 6/6 (318/318), `grep -v "known false positive"` → 0 matches both, both full runs and the full-suite ctest runs |
+ | bake timings measured and published | consume-now | See "Bake timings" below |
+ | energy-compensation activation with a REAL backed source | consume-now | §4 above |
+ 
+-**Scope note (directional impulse):** the matrix's acceptance sketch
+-offers "uniform white environment... OR directional impulse" — the
+-uniform-environment case is the one this task built value assertions
+-against (exact, closed-form, both channels/every mip/every driver); a
+-"directional impulse → known lobe" closed form for the ACTUAL cosine/GGX
+-convolution kernels (not a toy formula) requires deriving the closed-
+-form solid-angle overlap integral between two hemispheres at an
+-arbitrary tilt angle — attempted and abandoned this round after finding
+-the derivation genuinely error-prone to re-derive correctly under this
+-round's own time budget without an independent second source to check
+-it against (the risk of shipping a subtly-wrong "analytic" oracle is
+-worse than shipping the ALTERNATIVE the matrix itself offers). The
+-non-uniform monotonicity/mip-0-passthrough test (§3) covers the same
+-underlying concern (real directional/roughness-dependent behavior, not
+-just conservation) without needing that derivation.
++**Scope note (directional impulse) — CORRECTED in the review round, see
++Addendum below for the full account.** The original text of this note
++characterized the plan/ticket's "uniform white environment → known
++coefficients/irradiance; directional impulse → known lobe" line as an
++OR-alternative and treated the uniform-environment proof alone as
++satisfying it. **That was wrong.** The clause is semicolon-joined, the
++same convention the very next acceptance-sketch bullet uses for three
++items that are unambiguously all required, and nothing in the T9 ruling
++narrows it. Both proofs are required; the directional-impulse one was
++not built in the original round and is now closed — see
++`test_ibl_directional_impulse_gpu.cpp` and Addendum §A1/§A2.
+ 
+ **Methodology note (DFG spot values):** rather than trying to match a
+ scraped external Karis/Filament published table (risk: different sample
+ count, different exact NoV/roughness grid points, different
+ convention — a mismatch there would be a false negative, not a real
+ bug), this task's own closed-form limit (§2) is independently re-derived
+ directly from the PINNED port source's own formula, which is a stronger,
+ self-consistent oracle: it is exact (not merely "close to a table
+ entry"), and it is derived from the SAME code being tested, not a
+ different implementation with its own possible convention drift.
+@@ -488,34 +484,40 @@ $ xvfb-run -a ctest --preset windows-cross-zig -R '^rx_core_tests$' --output-on-
+    practice).
+ 4. **No pre-filtered-importance-sampling mip-chain read for
+    irradiance/prefilter** (Krivanek/Colbert's own variance-reduction
+    trick, present in the CPU original) — documented as a deliberate
+    simplification in every affected shader's own header comment: it is a
+    noise-reduction/perf optimization layered on top of the core unbiased
+    Monte-Carlo estimator, not a correctness requirement of the estimator
+    itself, and this bake's own generous per-stage sample budgets (offset
+    specifically because this runs once at load time, never per-frame)
+    keep residual noise well within this task's own asserted tolerances.
+-5. **"Directional impulse → known lobe" not built** — see the per-row
+-   proof table's own "Scope note" above: attempted, abandoned after
+-   judging the closed-form hemisphere-overlap derivation too
+-   error-prone to trust without independent verification under this
+-   round's own time budget; the matrix's own "OR uniform white
+-   environment" alternative was built instead, to a stronger (exact,
+-   not approximate) standard than the ticket's own minimum bar.
++5. **"Directional impulse → known lobe" — CLOSED in the review round**
++   (see Addendum below). The original round's decision to skip it,
++   reasoning it was an OR-alternative satisfied by the uniform-
++   environment proof, was WRONG per the review's own direct fetch of the
++   plan/ticket source text (semicolon-joined, not disjunctive). A
++   `test_ibl_directional_impulse_gpu.cpp` value-asserted proof was built
++   instead of the originally-abandoned closed-form hemisphere-overlap
++   integral, using a different (and, in hindsight, lower-risk)
++   methodology: an independent double-precision CPU Monte-Carlo oracle
++   re-implementing `roughnessFilter()`'s own estimator, rather than a
++   from-scratch analytic integral.
+ 
+ ## Self-review
+ 
+ - [x] Every matrix acceptance-sketch line addressed with a concrete,
+-      cited proof (table above), including the one deliberately-scoped-
+-      out line (directional impulse), disclosed rather than silently
+-      dropped.
++      cited proof (table above) — including "directional impulse → known
++      lobe," which the ORIGINAL round of this report incorrectly treated
++      as an OR-alternative and skipped; closed in the review round (see
++      Addendum) after an independent reviewer fetched the plan/ticket
++      source text directly and found no "or" in the binding clause.
+ - [x] Ruling followed: irradiance-CUBEMAP baseline (SH9 NOT built, only
+       cited as the deferred alternative per the ruling's own text); port
+       source = Filament v1.75.0 `libs/ibl/` throughout, cited per
+       function; compute runs through Task 2's `ComputePipelineCache` +
+       storage-image graph API exclusively in the production path.
+ - [x] Byte-source invariant: every new `.slang` file lives under
+       `shaders/ibl/`, loaded via `rx::shader::Compiler::compileFromFile()`
+       (a real filesystem read) in the production path (`bake.cpp`);
+       `tools/check_byte_source_invariant.sh` re-run clean (unaffected —
+       scoped to `rx_asset`'s texture-loading files, not shader loading).
+@@ -545,21 +547,246 @@ $ xvfb-run -a ctest --preset windows-cross-zig -R '^rx_core_tests$' --output-on-
+    naive reading of "300ms per bake" without this context could be
+    mistaken for a GPU performance problem when it is a compiler-startup
+    cost a derived-data cache (already registered as Phase 7's job in the
+    ticket's own text) would eliminate. No action needed from this task;
+    recording it here so Task 10 / the eventual cache task inherits the
+    right framing rather than re-discovering it.
+ 2. **Steam Deck numbers not published** — no Deck hardware in this
+    task's own verification loop; per RC7/RC8's own "honest-manual until
+    Deck hardware enters the loop" convention, not treated as a gap this
+    task can close alone.
+-3. **"Directional impulse → known lobe" scope line not built** — see
+-   the per-row proof table's "Scope note." The matrix itself offers this
+-   as an OR-alternative to the uniform-environment case this task built
+-   to a stronger (exact) standard; flagging directly rather than
+-   silently treating the acceptance sketch's "OR" as fully closed by one
+-   branch without saying so.
++3. **RESOLVED in the review round.** "Directional impulse → known lobe"
++   is now built (`test_ibl_directional_impulse_gpu.cpp`) — see the
++   Addendum below for the full account, including the corrected reading
++   of the plan/ticket's own binding text (not an OR-alternative, as the
++   original round of this report incorrectly characterized it).
+ 4. **`rx_ibl_bench`'s own gradient-equirect content is synthetic, not a
+    real HDR asset** — deliberate (bake cost is content-independent, see
+    "Bake timings" above), but flagging in case a future round wants a
+    real-asset visual-quality benchmark (a DIFFERENT question from this
+    task's own timing-only scope) added alongside it.
++
++---
++
++# Addendum (review round) — spec FAIL closed, 3 quality findings fixed
++
++Independent review verdict: **Verdict 1 (spec compliance) FAIL** — the
++"directional impulse → known lobe" acceptance line was not built, and
++the report's own justification for treating that as acceptable
++(characterizing it as an OR-alternative to the uniform-environment
++proof) was found unsupported by the binding source text. **Verdict 2
++(code quality) Approved**, 1 MEDIUM + 2 LOW findings. Full review:
++`task-09-review.md`. All four items close in this round.
++
++## A1 — The OR-mischaracterization, corrected
++
++**This was wrong, and the correction is recorded, not hidden.** The
++original report's "Scope note" read the plan's/ticket's own text —
++*"SH/irradiance VALUES asserted against analytic ground truth (uniform
++white environment → known coefficients/irradiance; directional impulse
++→ known lobe)"* — as offering "uniform white environment... OR
++directional impulse," and treated the uniform-environment proof
++(`test_ibl_analytic_gpu.cpp`) as satisfying the whole line on its own.
++
++The reviewer fetched both binding sources directly this round (the plan
++file and `gh issue view 45`) and found **no "or"/"either" anywhere in
++either instance of this clause** — it is joined by `;`, the exact same
++semicolon-list convention the acceptance sketch's very next bullet uses
++for three items that are unambiguously ALL required ("mip-0 ≈ source;
++highest-roughness mip ≈ irradiance...; DFG LUT spot values match..." —
++all three were built in the original round, none ever treated as
++alternatives to each other). Read in that same convention, the
++uniform/impulse clause is two required proofs under one bullet, not a
++disjunction. Nothing in the T9 per-ticket ruling touches or narrows this
++acceptance line. **The correction: both proofs were required all along;
++one (uniform-environment) was built, to a standard stronger than the
++ticket asked (exact closed-form, not a value probe); the other
++(directional impulse) was not, and is now closed by this addendum's own
++work** (`test_ibl_directional_impulse_gpu.cpp`).
++
++The original text characterizing this as an OR-alternative has been
++corrected in place, above (the "Per-row proof" table and "Scope note"),
++rather than deleted — the wrong reasoning and its correction are both
++left visible for the record, per this project's own no-deferred-
++findings, disclose-honestly norms.
++
++## A2 — Why the uniform-environment proof cannot substitute (the real
++gap, empirically characterized)
++
++Re-derived independently this round (matches the reviewer's own
++finding, not copied from it): `roughnessFilter()`'s estimator is
++`result = sum(L(dir_i)*w_i) / sum(w_i)` for ANY single per-sample weight
++function `w_i` — for a spatially uniform `L(dir)=L0`, this collapses to
++EXACTLY `L0` regardless of what `w_i` actually is, correct or buggy, as
++long as the SAME `w_i` appears in both sums. A bug that changes the
++EFFECTIVE per-sample weighting (concretely: an asymmetric numerator/
++denominator NoL exponent, `weight += noL*noL` instead of `weight +=
++noL`) changes the roughness-to-angular-width mapping of the resulting
++lobe while leaving per-mip brightness monotonicity intact (still blurs
++more as roughness grows, just in a now-wrong way) and leaving the
++uniform-environment integral's own algebra untouched (a uniform
++environment cannot distinguish "weighted by NoL" from "weighted by NoL
++squared" — both still integrate to exactly `L0`). Only a spatially
++localized, non-uniform source's ANGULAR PROFILE can catch this bug
++class — the uniform-environment and 5-dark/1-bright-face monotonicity
++tests are both architecturally blind to it, by construction, not by
++oversight.
++
++## A3 — `test_ibl_directional_impulse_gpu.cpp`: method and asserted values
++
++**Method.** A small (8° half-angle) bright impulse patch, centered at
++`L0=(0,0,1)` (+Z — the canonical axis
++`test_ibl_cube_face_convention_gpu.cpp` already proves this codebase's
++face convention resolves correctly for, so this file does not re-
++litigate direction/face convention, only angular WIDTH), baked at
++`baseCubemapFaceSize=prefilteredBaseFaceSize=256`. The REAL, shipped
++`prefilteredCubemap` is probed via genuine hardware
++`TextureCube.SampleLevel()` (same idiom as the face-convention test's
++own probe kernel) at 6 offset angles (0°, 8°, 16°, 24°, 35°, 50°) along
++one meridian, at 3 mip levels (1, 2, 3 — `linearRoughness` 0.0625, 0.25,
++0.5625; mip 0's own literal-passthrough special case is already covered
++exactly by the mip-0-vs-source proof in `test_ibl_analytic_gpu.cpp`).
++Each of the 18 (offset, mip) probes is compared against an INDEPENDENT,
++double-precision, 2,000,000-sample CPU re-implementation of
++`roughnessFilter()`'s own estimator (`hammersley()`/
++`hemisphereImportanceSampleDggx()`/tangent-basis/reflect, written fresh
++in C++ from the same pinned Filament citations already established for
++this module's other kernels — not copy-pasted from the shader file),
++plus a direct GPU-measured DIRECTION check (peak value at offset=0°
++`>=` every other offset, at every tested mip).
++
++**Resolution finding (load-bearing, disclosed in `kDim`'s own code
++comment):** at the module's more usual small (64px) test resolution,
++the impulse patch's own boundary is coarsely texel-discretized (a
++~9-texel circle, visibly jagged), producing a genuine, systematic ~5-10%
++gap between the GPU's actual baked input and the CPU reference's
++idealized continuous-circle membership test — a mismatch between this
++test's own fixture and its own oracle, NOT a bug in the bake (confirmed
++by raising `specularSamples` 1024→4096, which did not shrink the gap,
++ruling out sampling noise as the cause). Raising the patch resolution to
++256px dropped the residual gap to <1% (genuine sampling noise), which is
++what the shipped test uses.
++
++**Measured values (real NVIDIA GeForce RTX 2080, final/correct code,**
++`--success` **output, representative rows):**
++
++| mip | linearRoughness | offset | measured | CPU reference | \|diff\| |
++|---|---|---|---|---|---|
++| 1 | 0.0625 | 0° | 0.572266 | 0.573597 | 0.0013 |
++| 1 | 0.0625 | 16° | 0.049072 | 0.048633 | 0.0004 |
++| 2 | 0.25 | 0° | 0.094177 | 0.094734 | 0.0006 |
++| 2 | 0.25 | 24° | 0.034699 | 0.034722 | 0.00002 |
++| 3 | 0.5625 | 0° | 0.032013 | 0.032162 | 0.0001 |
++| 3 | 0.5625 | 50° | 0.010353 | 0.010956 | 0.0006 |
++
++Full 18-row table reproduced identically on lavapipe (see revert-proof
++log below). Peak-at-L0 (offset=0°) values across mips —
++`0.572, 0.094, 0.032`, monotonically decreasing — and offset falloff
++shape — steep at mip 1 (0.572→~0 by 50°), shallow at mip 3
++(0.032→0.010, still clearly nonzero at 50°) — are exactly the physical
++signature a correct GGX roughness-to-width mapping produces: a narrow,
++high-peak lobe at low roughness broadening into a wide, low-peak,
++slowly-decaying one at high roughness.
++
++## A4 — Revert-discrimination proof (both drivers, per instruction)
++
++Applied the reviewer's own reproduced sabotage
++(`shaders/ibl/prefilter_specular.slang`: `weight += noL;` →
++`weight += noL * noL;`, an asymmetric numerator/denominator NoL
++exponent) — no C++ rebuild needed (Slang source recompiles from disk at
++runtime):
++
++```
++=== SABOTAGED, real NVIDIA GeForce RTX 2080 (580.82.07) ===
++[doctest] test cases:  1 |  0 passed | 1 failed | 6 skipped
++[doctest] assertions: 39 | 30 passed |  9 failed |
++# ALL 9 failures at mip=3 (linearRoughness=0.5625, the highest tested
++# roughness) -- offsets 0/8/16/24/35 deg; the sabotage's own systematic
++# bias (measured ~7-11x this test's own tolerance) is largest exactly
++# where GGX importance sampling spans the widest range of NoL values,
++# matching the "roughness-to-angular-width mapping bug" class this test
++# was built to catch.
++
++=== SABOTAGED, lavapipe (llvmpipe, Mesa) ===
++[doctest] test cases:  1 |  0 passed | 1 failed | 6 skipped
++[doctest] assertions: 39 | 30 passed |  9 failed |
++# Same 9 assertions, same mip, values within normal cross-driver
++# variance of the NVIDIA run (both drivers execute the identical
++# deterministic Hammersley-sequence algorithm).
++```
++
++Reverted (`weight += noL;`, byte-identical to the pre-sabotage source —
++confirmed via `git diff shaders/ibl/prefilter_specular.slang`, which
++shows only the unrelated Finding-2 header-comment fix, zero trace of the
++sabotage line):
++
++```
++=== REVERTED, real NVIDIA, full rx_ibl_gpu_tests suite ===
++[doctest] test cases:   7 |   7 passed | 0 failed | 0 skipped
++[doctest] assertions: 357 | 357 passed | 0 failed |
++
++=== REVERTED, lavapipe, full rx_ibl_gpu_tests suite ===
++[doctest] test cases:   7 |   7 passed | 0 failed | 0 skipped
++[doctest] assertions: 357 | 357 passed | 0 failed |
++
++$ VK_ICD_FILENAMES=lvp_icd.json xvfb-run -a ctest --preset linux-native --output-on-failure
++100% tests passed, 0 tests failed out of 33
++```
++
++## A5 — The 3 quality findings, closed
++
++1. **[MEDIUM] `bake.h`'s stale "SINGLE render-graph... one command-
++   buffer submission" doc comment**, and a second stale claim in the
++   SAME comment block (`sourceIsCube` described as a raw `vkCmdCopyImage`
++   — superseded by the original round's own bug-fix #4, a compute
++   passthrough) — both corrected to describe the actually-shipped
++   four-graph, compute-passthrough design, with a pointer to `bake.cpp`'s
++   own "Design decision" comment for the full reasoning.
++2. **[LOW] `prefilter_specular.slang`'s header listing `DistributionGGX()`
++   as ported-but-unused** — corrected: the function is not called at
++   all (it was only ever needed for the mip-LOD-biasing math this port
++   already discloses dropping), and the header now says so explicitly
++   instead of self-contradicting two paragraphs later.
++3. **[LOW] Hardcoded, unnamespaced `/tmp/rx_ibl_bake.cache`** — added a
++   `cacheNamespace` parameter to `bakeEnvironment()` (default `"default"`,
++   documented in `bake.h`), namespacing the path to
++   `<temp>/rx_ibl/<namespace>.pipeline_cache`; every call site in this
++   module (5 test files' own TEST_CASEs, the bench tool) now passes a
++   distinct, purpose-specific namespace, closing the concurrent-caller
++   collision risk directly for this module's own test suite (the most
++   immediate real instance of "concurrent callers" already exists under
++   ctest's own default parallelism) and establishing the pattern a
++   future Task 10 caller should follow.
++
++## A6 — Both-preset / both-driver re-verification (post-fix, final state)
++
++```
++$ cmake --build --preset linux-native   [0 errors, 0 warnings, all rx_ibl files]
++$ cmake --build --preset windows-cross-zig   [0 errors]
++
++$ ./build/linux-native/src/rx_ibl/tests/rx_ibl_gpu_tests --validate   (real NVIDIA)
++[doctest] test cases:   7 |   7 passed | 0 failed | 0 skipped
++[doctest] assertions: 357 | 357 passed | 0 failed |
++
++$ VK_ICD_FILENAMES=lvp_icd.json xvfb-run -a ./build/.../rx_ibl_gpu_tests --validate   (lavapipe)
++[doctest] test cases:   7 |   7 passed | 0 failed | 0 skipped
++[doctest] assertions: 357 | 357 passed | 0 failed |
++
++# Zero unfiltered validation errors, both drivers (grep -v "known false positive" | wc -l -> 0, both logs)
++
++$ VK_ICD_FILENAMES=lvp_icd.json xvfb-run -a ctest --preset linux-native --output-on-failure
++100% tests passed, 0 tests failed out of 33
++```
++
++## Addendum self-review
++
++- [x] The FAIL-verdict acceptance line is built, value-asserted, and
++      revert-proven on both drivers.
++- [x] OR-mischaracterization corrected in place (not just appended past)
++      — the original wrong prose is visibly struck through/replaced with
++      the correction, matching this project's disclose-honestly norm.
++- [x] All 3 quality findings closed with a concrete code change, not
++      just a report note.
++- [x] No AI attribution anywhere in the new/changed text.
++- [x] `git status` reviewed before staging — `progress.md` still
++      excluded.
++- [x] Zero deferred fixes — every review-round finding closed in-round.
+diff --git a/shaders/ibl/prefilter_specular.slang b/shaders/ibl/prefilter_specular.slang
+index 1daef32..fe476b5 100644
+--- a/shaders/ibl/prefilter_specular.slang
++++ b/shaders/ibl/prefilter_specular.slang
+@@ -12,26 +12,33 @@
+ // PORT PROVENANCE -- google/filament v1.75.0 (tag; commit
+ // 0e58877c09afb1aacd09ff640f74d2adcd2a7e80, Apache-2.0), libs/ibl/src/
+ // CubemapIBL.cpp, CubemapIBL::roughnessFilter() (:296-465):
+ //   - linearRoughness == 0 special case (:318-341): a LITERAL passthrough
+ //     (`Cubemap::writeAt(data, cm.sampleAt(N))`, no importance sampling at
+ //     all) -- ported EXACTLY below: mip 0 of the prefiltered chain is a
+ //     bilinear resample of the source cubemap at each destination texel's
+ //     own direction, matching the ticket's own "mip-0 ~= source"
+ //     acceptance line by construction, not by approximation.
+ //   - linearRoughness > 0 (:344-465): hemisphereImportanceSampleDggx()
+-//     (:50-57) + DistributionGGX() (:140-145) + the accumulate-then-
+-//     normalize-by-weight structure (:397-411, `entry.brdf_NoL *= 1/weight`)
+-//     ported as an ONLINE running sum (accumulate numerator AND weight,
+-//     divide once at the end) -- algebraically identical to the CPU
+-//     original's two-pass cache-then-normalize structure, just without
+-//     the intermediate CacheEntry vector a GPU kernel has no use for.
++//     (:50-57) + the accumulate-then-normalize-by-weight structure
++//     (:397-411, `entry.brdf_NoL *= 1/weight`) ported as an ONLINE
++//     running sum (accumulate numerator AND weight, divide once at the
++//     end) -- algebraically identical to the CPU original's two-pass
++//     cache-then-normalize structure, just without the intermediate
++//     CacheEntry vector a GPU kernel has no use for. `DistributionGGX()`
++//     (:140-145) is NOT ported into this file -- the CPU original calls
++//     it only to compute `pdf`/`omegaS`, inputs to the mip-LOD-biasing
++//     math (selecting which SOURCE MIP an importance sample reads from,
++//     CubemapIBL.cpp:389-395) -- this port drops that entire mechanism
++//     (simplification 1 below), so nothing in this file ever needs the
++//     GGX NDF value itself, only the importance-sampled DIRECTION
++//     hemisphereImportanceSampleDggx() already produces.
+ //     `V = N` (isotropic, view-independent prefiltering -- the standard
+ //     assumption every real-time prefiltered-environment method makes,
+ //     including this exact CPU original's own tangent-space derivation,
+ //     see roughnessFilter()'s own header comment at CubemapIBL.cpp:184-208:
+ //     "v = n").
+ //
+ // SIMPLIFICATIONS vs the CPU original (both documented, neither a missed
+ // formula -- see irradiance_convolve.slang's own header comment for the
+ // same class of simplification applied there):
+ //   1. No pre-filtered "levels" mip-LOD-biasing input (Krivanek/Colbert's
+diff --git a/src/rx_ibl/include/rx_ibl/bake.h b/src/rx_ibl/include/rx_ibl/bake.h
+index 7436c03..9809da3 100644
+--- a/src/rx_ibl/include/rx_ibl/bake.h
++++ b/src/rx_ibl/include/rx_ibl/bake.h
+@@ -28,20 +28,21 @@
+ // (the bake) decoupled from Task 10's not-yet-built Scene/Environment API
+ // surface, per the ticket's own "full sample wiring is not [in scope]"
+ // line.
+ 
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/texture.h>
+ 
+ #include <cstdint>
+ #include <filesystem>
+ #include <optional>
++#include <string>
+ 
+ namespace rx::rhi {
+ class Device;
+ class CommandContext;
+ }  // namespace rx::rhi
+ 
+ namespace rx::task {
+ class Scheduler;
+ }
+ 
+@@ -110,43 +111,86 @@ struct BakeResult {
+ // is a one-shot, load-time event a live Tracy capture session is not
+ // guaranteed to be attached for.
+ struct BakeTimings {
+     double equirectToCubemapMs = 0.0;
+     double irradianceMs = 0.0;
+     double prefilterMs = 0.0;
+     double dfgMs = 0.0;
+     double totalMs = 0.0;
+ };
+ 
+-// Runs the full bake chain as a SINGLE render-graph compute-pass graph
+-// (one compile()+realize()+execute() call, one command-buffer submission)
+-// -- per this phase's own binding "compute passes through the graph's
+-// compute-class machinery, no hand-rolled dispatch" global constraint.
++// Runs the full bake chain as FOUR SEPARATE single-purpose render-graph
++// compute-pass graphs -- base cubemap (equirect projection OR, when
++// `sourceIsCube`, a compute passthrough -- see below), irradiance,
++// prefiltered specular, DFG LUT -- each its own compile()+realize()+
++// execute() call and its own one-shot command-buffer submission
++// (`CommandContext::runOnce()`), run back to back. NOT one graph/one
++// submission (an earlier design intent this doc comment used to
++// describe, before implementation found it structurally blocked): the
++// render graph's own subresource validator only accepts IDENTICAL-or-
++// DISJOINT declared ranges for one resource, and `baseCubemap`'s 6
++// disjoint per-face writer passes cannot coexist in the SAME graph as a
++// later whole-resource read of it -- see bake.cpp's own "Design
++// decision: four graphs, not one" comment (and task-09-report.md) for
++// the full reasoning. Every stage still runs exclusively through Task
++// 2's compute-class Pass API (`addStorageImageOutput`/`Executor::
++// execute()`) -- per this phase's own binding "compute passes through
++// the graph's compute-class machinery, no hand-rolled dispatch" global
++// constraint -- this comment's correction is about GRAPH COUNT, not
++// about that constraint being relaxed. A caller reasoning about
++// synchronization/timing (Task 10) should assume four independent
++// GPU-idle points, not one.
+ //
+ // `source`: either an equirect-projection 2D texture (`sourceIsCube ==
+ // false` -- Task 6's own HDR equirect loader output, R16G16B16A16_SFLOAT
+ // per that task's own ruling, though this function reads it through a
+ // format-polymorphic `Texture2D<float4>` sampled read and accepts any
+ // float-interpretable sampled format) OR an already-baked/loaded cubemap
+ // (`sourceIsCube == true` -- e.g. Task 6's own KTX2-cube loader output,
+-// `Texture2D::isCube() == true`) -- when true, the equirect->cubemap
+-// stage is skipped entirely and `source` is copied directly into
+-// `BakeResult::baseCubemap` (a plain `vkCmdCopyImage`, not a compute
+-// pass -- there is no projection math to run at all in this case).
++// `Texture2D::isCube() == true`). EITHER WAY, `BakeResult::baseCubemap`
++// is populated by a per-face COMPUTE PASS (never a raw `vkCmdCopyImage`
++// from `source` directly -- that was tried and found broken for two
++// independent reasons: format compatibility, since `source` need not
++// share this bake's own `kCubeFormat`, and an undocumented
++// `VK_IMAGE_USAGE_TRANSFER_SRC_BIT` precondition Task 6's own loader
++// output does not carry either; see task-09-report.md's "Bugs found and
++// fixed" #4). The `sourceIsCube` compute pass is the SAME `prefilterKernel`
++// used by the prefiltered-specular stage, dispatched at its own
++// `linearRoughness == 0` literal-passthrough special case -- a format-
++// agnostic `TextureCube` sampled resample, not a projection.
+ //
+ // `shaderDir`: the directory containing this module's own
+ // shaders/ibl/*.slang kernels (mirrors rx_material::MaterialSystem::
+ // create()'s own `sharedShaderDir` parameter shape) -- the real caller's
+ // default is `RX_IBL_SHADER_DIR` (baked in by CMakeLists.txt, same
+ // convention as RX_MATERIAL_SHADER_DIR).
+ //
++// `cacheNamespace` [review round, LOW finding 3]: names this call's own
++// `rx::rhi::ComputePipelineCache` disk-persisted file --
++// `<temp_directory>/rx_ibl/<cacheNamespace>.pipeline_cache` -- distinct
++// callers/purposes should pass DISTINCT, STABLE names (this module's own
++// tests each use their own TEST_CASE-specific namespace; the bench tool
++// uses its own). Vulkan's own per-entry vendor/device/pipelineCacheUUID
++// header already makes ONE file safe to share across different physical
++// devices/drivers (confirmed empirically this round -- lavapipe and
++// NVIDIA runs interleave against the same file with zero corruption),
++// so this parameter is not a correctness requirement; it exists so
++// unrelated callers/purposes (this module's own several GPU test
++// binaries' TEST_CASEs, ctest's own default parallel execution, a
++// future Task 10 production caller running alongside this module's own
++// tests) do not contend for ONE shared, unnamespaced `/tmp` file, which
++// a prior round left as a mild robustness gap. Defaults to "default" --
++// matches this parameter's absence before this round, for any caller
++// that doesn't yet care.
++//
+ // Main-thread-only (D5) -- builds/dispatches real Vulkan pipeline/compute
+ // objects, same convention as every other rx_rhi_vk/rx_graph factory.
+ // Returns std::nullopt (logged) on any compile/pipeline/image-creation
+ // failure.
+ std::optional<BakeResult> bakeEnvironment(rx::rhi::Device& device, rx::rhi::Allocator& allocator,
+                                             rx::rhi::CommandContext& cmdCtx, rx::task::Scheduler& scheduler,
+                                             const rx::rhi::Texture2D& source, bool sourceIsCube,
+                                             const std::filesystem::path& shaderDir, const BakeParams& params = {},
+-                                            BakeTimings* outTimings = nullptr);
++                                            BakeTimings* outTimings = nullptr,
++                                            const std::string& cacheNamespace = "default");
+ 
+ }  // namespace rx::ibl
+diff --git a/src/rx_ibl/src/bake.cpp b/src/rx_ibl/src/bake.cpp
+index 607ab69..a2228a8 100644
+--- a/src/rx_ibl/src/bake.cpp
++++ b/src/rx_ibl/src/bake.cpp
+@@ -9,20 +9,21 @@
+ #include <rx_rhi_vk/device.h>
+ #include <rx_shader/compiler.h>
+ #include <rx_shader/reflection.h>
+ #include <rx_task/scheduler.h>
+ 
+ #include <volk.h>
+ 
+ #include <array>
+ #include <chrono>
+ #include <cstring>
++#include <system_error>
+ #include <vector>
+ 
+ namespace rx::ibl {
+ namespace {
+ 
+ using rx::graph::AttachmentDesc;
+ using rx::graph::CompileInfo;
+ using rx::graph::ImageDesc;
+ using rx::graph::PassContext;
+ using rx::graph::QueueClass;
+@@ -360,36 +361,43 @@ void copyToPersistent(VkCommandBuffer cmd, VkImage dstImage, VkImage srcImage, u
+ double millisSince(std::chrono::steady_clock::time_point start) {
+     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+ }
+ 
+ }  // namespace
+ 
+ std::optional<BakeResult> bakeEnvironment(rx::rhi::Device& device, rx::rhi::Allocator& allocator,
+                                             rx::rhi::CommandContext& cmdCtx, rx::task::Scheduler& scheduler,
+                                             const rx::rhi::Texture2D& source, bool sourceIsCube,
+                                             const std::filesystem::path& shaderDir, const BakeParams& params,
+-                                            BakeTimings* outTimings) {
++                                            BakeTimings* outTimings, const std::string& cacheNamespace) {
+     RX_ZONE_NAMED("rx_ibl: bakeEnvironment");
+     const auto totalStart = std::chrono::steady_clock::now();
+     BakeTimings timings;
+ 
+     VkDevice vkDevice = device.device();
+     VkPhysicalDevice physicalDevice = device.physicalDevice();
+ 
+     auto compiler = rx::shader::Compiler::create();
+     if (!compiler.has_value()) {
+         RX_LOG_ERROR("rx_ibl: failed to create Slang compiler");
+         return std::nullopt;
+     }
+ 
+-    auto pipelineCache =
+-        rx::rhi::ComputePipelineCache::create(vkDevice, std::filesystem::temp_directory_path() / "rx_ibl_bake.cache");
++    // [review round, LOW finding 3] Namespaced by `cacheNamespace` --
++    // see bake.h's own header comment on that parameter for why (a
++    // single shared, unnamespaced /tmp file was a mild concurrent-
++    // caller robustness gap, not a correctness bug).
++    const std::filesystem::path pipelineCacheDir = std::filesystem::temp_directory_path() / "rx_ibl";
++    std::error_code cacheDirEc;
++    std::filesystem::create_directories(pipelineCacheDir, cacheDirEc);
++    auto pipelineCache = rx::rhi::ComputePipelineCache::create(
++        vkDevice, pipelineCacheDir / (cacheNamespace + ".pipeline_cache"));
+     if (!pipelineCache.has_value()) {
+         RX_LOG_ERROR("rx_ibl: failed to create ComputePipelineCache");
+         return std::nullopt;
+     }
+ 
+     // One generously-sized pool for every descriptor set this bake ever
+     // allocates (empty set-0s + one real set-1 per pass invocation) --
+     // see allocateSet1()'s own comment for why each pass invocation needs
+     // its own set, never a reused one.
+     const uint32_t maxSets = 8 + 6 + 6 + 6 * params.prefilteredMipCount + 1;
+diff --git a/src/rx_ibl/tests/CMakeLists.txt b/src/rx_ibl/tests/CMakeLists.txt
+index 9ff49cf..389f193 100644
+--- a/src/rx_ibl/tests/CMakeLists.txt
++++ b/src/rx_ibl/tests/CMakeLists.txt
+@@ -7,20 +7,25 @@
+ # reasoning applied there).
+ add_executable(rx_ibl_gpu_tests
+     doctest_main_gpu.cpp
+     test_ibl_cube_face_convention_gpu.cpp
+     test_ibl_analytic_gpu.cpp
+     test_ibl_energy_compensation_gpu.cpp
+     # [gate matrix-p5t09-ibl-bake-chain.md file list: "tests (+ tiny
+     # committed HDR fixtures)"] real Task 6 decodeStbImageHdr() path ->
+     # bake, using data/uniform_test_env.hdr.
+     test_ibl_hdr_fixture_gpu.cpp
++    # [review round, task-09-review.md Verdict 1] the plan/ticket's own
++    # SECOND required analytic-ground-truth proof ("directional impulse
++    # -> known lobe") -- see this file's own header comment for the
++    # OR-mischaracterization this closes.
++    test_ibl_directional_impulse_gpu.cpp
+ )
+ target_link_libraries(rx_ibl_gpu_tests PRIVATE rx_ibl rx_rhi_vk rx_platform rx_shader rx_asset doctest::doctest)
+ rx_shader_deploy_runtime_libs(rx_ibl_gpu_tests)
+ 
+ target_compile_definitions(rx_ibl_gpu_tests PRIVATE
+   RX_IBL_SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders/ibl"
+   RX_MATERIAL_SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders/material"
+   RX_IBL_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
+ )
+ 
+diff --git a/src/rx_ibl/tests/test_ibl_analytic_gpu.cpp b/src/rx_ibl/tests/test_ibl_analytic_gpu.cpp
+index 7f48acc..a5af7f9 100644
+--- a/src/rx_ibl/tests/test_ibl_analytic_gpu.cpp
++++ b/src/rx_ibl/tests/test_ibl_analytic_gpu.cpp
+@@ -116,21 +116,21 @@ TEST_CASE("IBL Task 9: uniform environment bakes to EXACT irradiance/prefilter c
+     params.baseCubemapFaceSize = 32;
+     params.irradianceFaceSize = 8;
+     params.irradianceSamples = 256;
+     params.prefilteredMipCount = 4;
+     params.prefilteredBaseFaceSize = 32;
+     params.specularSamples = 64;
+     params.dfgLutSize = 32;
+     params.dfgSamples = 256;
+ 
+     auto result = rx::ibl::bakeEnvironment(fx->device, fx->allocator, *fx->cmdCtx, *fx->scheduler, *source, false,
+-                                             RX_IBL_SHADER_DIR, params);
++                                             RX_IBL_SHADER_DIR, params, nullptr, "test_analytic_uniform");
+     REQUIRE(result.has_value());
+ 
+     constexpr double kEps = 0.02;  // fp16-storage + bilinear-resample tolerance -- NOT a Monte-Carlo tolerance
+                                      // (see this file's own header comment: uniform-environment conservation is
+                                      // exact by cancellation, not by convergence).
+ 
+     // baseCubemap: every face, center texel.
+     for (uint32_t face = 0; face < 6; ++face) {
+         auto texel = readTexelHalf4(*fx, result->baseCubemap, 0, face, params.baseCubemapFaceSize,
+                                       params.baseCubemapFaceSize / 2, params.baseCubemapFaceSize / 2);
+@@ -194,21 +194,21 @@ TEST_CASE("IBL Task 9: DFG LUT closed-form limit at the smoothest row -- dfgY->1
+     params.dfgLutSize = 64;
+     // Large sample count for THIS test specifically -- the smoothest-row
+     // closed form is an asymptotic (linearRoughness ~ 0.0006 at
+     // y=height-1, not exactly 0) limit, and GGX importance sampling at
+     // very low roughness is a sharply peaked distribution; a generous
+     // sample budget keeps residual Monte-Carlo noise well under the
+     // assertion tolerance below.
+     params.dfgSamples = 4096;
+ 
+     auto result = rx::ibl::bakeEnvironment(fx->device, fx->allocator, *fx->cmdCtx, *fx->scheduler, *source, true,
+-                                             RX_IBL_SHADER_DIR, params);
++                                             RX_IBL_SHADER_DIR, params, nullptr, "test_analytic_dfg");
+     REQUIRE(result.has_value());
+ 
+     const uint32_t smoothestRow = params.dfgLutSize - 1;
+     // Two NoV columns away from the unstable NoV~0 edge (this closed
+     // form's own derivation requires NoV>0 -- see this file's header
+     // comment) -- x=width-1 (NoV~1) and x=3*width/4 (NoV~0.75).
+     for (uint32_t x : {params.dfgLutSize - 1, params.dfgLutSize * 3 / 4}) {
+         auto dfg = readDfgTexel(*fx, result->dfgLut, params.dfgLutSize, x, smoothestRow);
+         const double noV = (static_cast<double>(x) + 0.5) / params.dfgLutSize;
+         const double expectedX = std::pow(1.0 - noV, 5.0);
+@@ -244,21 +244,21 @@ TEST_CASE("IBL Task 9: mip-0 exactly matches source (passthrough) AND prefiltere
+     params.baseCubemapFaceSize = kDim;
+     params.irradianceFaceSize = 8;
+     params.irradianceSamples = 128;
+     params.prefilteredMipCount = 5;
+     params.prefilteredBaseFaceSize = kDim;
+     params.specularSamples = 128;
+     params.dfgLutSize = 16;
+     params.dfgSamples = 64;
+ 
+     auto result = rx::ibl::bakeEnvironment(fx->device, fx->allocator, *fx->cmdCtx, *fx->scheduler, *source, true,
+-                                             RX_IBL_SHADER_DIR, params);
++                                             RX_IBL_SHADER_DIR, params, nullptr, "test_analytic_monotonicity");
+     REQUIRE(result.has_value());
+ 
+     // --- mip-0 ~= source (CubemapIBL.cpp's own linearRoughness==0
+     // literal-passthrough special case, ported exactly) -- checked on the
+     // NON-uniform source, at BOTH the bright face's center (far from any
+     // boundary) and a dark face's center, so this is a real value match,
+     // not a trivial "everything is the same constant" pass. ------------
+     {
+         auto brightMip0 = readTexelHalf4(*fx, result->prefilteredCubemap, 0, 4, kDim, kDim / 2, kDim / 2);
+         INFO("mip0 bright face center rgb=(", brightMip0[0], ",", brightMip0[1], ",", brightMip0[2], ")");
+diff --git a/src/rx_ibl/tests/test_ibl_directional_impulse_gpu.cpp b/src/rx_ibl/tests/test_ibl_directional_impulse_gpu.cpp
+new file mode 100644
+index 0000000..9a85b8d
+--- /dev/null
++++ b/src/rx_ibl/tests/test_ibl_directional_impulse_gpu.cpp
+@@ -0,0 +1,531 @@
++// rx_ibl/tests/test_ibl_directional_impulse_gpu.cpp -- Phase 5 Stage 1
++// Task 9 [#45, gate matrix-p5t09-ibl-bake-chain.md acceptance sketch].
++//
++// REVIEW-ROUND CORRECTION (task-09-review.md, Verdict 1 / OR-adjudication):
++// the plan (`docs/superpowers/plans/2026-08-20-phase5-techniques.md:384-386`)
++// and the ticket (`gh issue view 45`) both read: "SH/irradiance VALUES
++// asserted against analytic ground truth (uniform white environment ->
++// known coefficients/irradiance; directional impulse -> known lobe)." The
++// task-09-report.md's original "Scope note" characterized this as an
++// OR-alternative ("uniform white environment... OR directional impulse")
++// and treated the uniform-environment proof (test_ibl_analytic_gpu.cpp)
++// as satisfying the whole line. That characterization was WRONG: the
++// clause uses ";", the same semicolon-list convention the very next
++// acceptance-sketch bullet uses for three items that are unambiguously
++// ALL required (never rescued by an "or" reading), and nothing in the T9
++// per-ticket ruling narrows this line. Both proofs are required. This
++// file is the second one -- see task-09-report.md's own "Addendum"
++// section (appended this round) for the corrected framing and the
++// reviewer's own empirically-proven reason the uniform-environment proof
++// alone cannot stand in for it.
++//
++// WHY THE UNIFORM-ENVIRONMENT PROOF CANNOT SUBSTITUTE (reviewer's own
++// finding, re-derived here): roughnessFilter()'s estimator is
++// `result = sum(L(dir_i)*w_i) / sum(w_i)` for ANY single per-sample
++// weight function w_i (here, w_i = NoL_i) -- for a spatially UNIFORM
++// L(dir)=L0, this collapses to EXACTLY L0 regardless of what w_i
++// actually is, correct or buggy, AS LONG AS THE SAME w_i APPEARS IN BOTH
++// SUMS. A bug that changes the EFFECTIVE per-sample weighting (e.g. the
++// reviewer's own reproduced sabotage, `weight += noL*noL` instead of
++// `weight += noL` -- an asymmetric numerator/denominator NoL exponent)
++// changes the SHAPE of the resulting lobe (its roughness-to-angular-width
++// mapping) while leaving per-mip brightness MONOTONICITY intact (rougher
++// still blurs more, in whatever now-wrong way) and leaving the
++// uniform-environment integral's own algebra untouched (a uniform
++// environment cannot distinguish "weighted by NoL" from "weighted by
++// NoL squared" -- both still integrate to exactly L0). Only a test that
++// measures the ANGULAR PROFILE of a NON-uniform, spatially LOCALIZED
++// source can catch this class of bug. This file is exactly that test.
++//
++// METHOD: a small (8 degree half-angle) bright "impulse" patch on the
++// BASE cubemap, centered at a KNOWN direction L0=(0,0,1) (+Z, the SAME
++// canonical axis test_ibl_cube_face_convention_gpu.cpp already proved
++// this codebase's own face convention resolves correctly for -- this
++// file therefore does not need to re-litigate face/direction convention,
++// only the ANGULAR WIDTH of the resulting prefiltered lobe). Prefiltered
++// at 3 mip levels (skipping mip 0's own literal-passthrough special
++// case, already covered exactly by test_ibl_analytic_gpu.cpp's own
++// mip-0-vs-source proof). The REAL, shipped prefilteredCubemap is probed
++// via genuine hardware TextureCube sampling (same idiom as
++// test_ibl_cube_face_convention_gpu.cpp's own probe kernel) at several
++// angular offsets from L0 along one meridian, at each mip. Each probed
++// value is compared against an INDEPENDENT, DOUBLE-PRECISION, high-
++// sample-count (200,000) CPU re-implementation of EXACTLY roughnessFilter()'s
++// own estimator (hammersley()/hemisphereImportanceSampleDggx()/tangent-
++// basis/reflect, re-derived from the SAME pinned Filament v1.75.0
++// CubemapIBL.cpp citations already established in this module's other
++// kernels -- written fresh here, not copy-pasted from the shader file,
++// matching this codebase's own established "independent CPU oracle"
++// methodology (T4's exposure formula tables, T7's white-furnace
++// Monte-Carlo, T8's ior/specular furnace test all use exactly this
++// shape: re-implement the SAME pinned-source formula independently,
++// never trust the file under test as its own oracle).
++#include "ibl_gpu_fixture.h"
++
++#include <doctest/doctest.h>
++#include <rx_ibl/bake.h>
++#include <rx_rhi_vk/compute_pipeline.h>
++#include <rx_shader/compiler.h>
++#include <rx_shader/reflection.h>
++
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <optional>
++#include <vector>
++
++using namespace rx::ibl_test;
++
++namespace {
++
++constexpr double kPiD = 3.14159265358979323846;
++
++struct Double3 {
++    double x = 0.0, y = 0.0, z = 0.0;
++    Double3 operator+(const Double3& o) const { return {x + o.x, y + o.y, z + o.z}; }
++    Double3 operator-(const Double3& o) const { return {x - o.x, y - o.y, z - o.z}; }
++    Double3 operator*(double s) const { return {x * s, y * s, z * s}; }
++};
++double dot(const Double3& a, const Double3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
++Double3 cross(const Double3& a, const Double3& b) {
++    return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
++}
++Double3 normalize(const Double3& v) {
++    double len = std::sqrt(dot(v, v));
++    return len > 0.0 ? Double3{v.x / len, v.y / len, v.z / len} : v;
++}
++
++// [CubemapIBL.cpp, utilities.h] hammersley(), re-derived independently
++// (bit-for-bit identical algorithm to every Slang kernel's own copy, but
++// written fresh in C++ double precision here -- not copy-pasted).
++std::pair<double, double> hammersley(uint32_t i, double invN) {
++    uint32_t bits = i;
++    bits = (bits << 16U) | (bits >> 16U);
++    bits = ((bits & 0x55555555U) << 1U) | ((bits & 0xAAAAAAAAU) >> 1U);
++    bits = ((bits & 0x33333333U) << 2U) | ((bits & 0xCCCCCCCCU) >> 2U);
++    bits = ((bits & 0x0F0F0F0FU) << 4U) | ((bits & 0xF0F0F0F0U) >> 4U);
++    bits = ((bits & 0x00FF00FFU) << 8U) | ((bits & 0xFF00FF00U) >> 8U);
++    return {static_cast<double>(i) * invN, static_cast<double>(bits) * (1.0 / 4294967296.0)};
++}
++
++// [CubemapIBL.cpp:50-57] hemisphereImportanceSampleDggx(), re-derived
++// independently in double precision.
++Double3 hemisphereImportanceSampleDggx(double u1, double u2, double a) {
++    double phi = 2.0 * kPiD * u1;
++    double cosTheta2 = (1.0 - u2) / (1.0 + (a + 1.0) * ((a - 1.0) * u2));
++    cosTheta2 = std::max(0.0, cosTheta2);
++    double cosTheta = std::sqrt(cosTheta2);
++    double sinTheta = std::sqrt(std::max(0.0, 1.0 - cosTheta2));
++    return {sinTheta * std::cos(phi), sinTheta * std::sin(phi), cosTheta};
++}
++
++// Independent double-precision re-implementation of
++// CubemapIBL::roughnessFilter()'s own per-texel estimator
++// (CubemapIBL.cpp:344-465, the linearRoughness>0 branch: online
++// accum/weight running sum, tangent basis, H->L reflection about N==V)
++// -- for a caller-supplied environment function `envFn` (here, the
++// impulse-patch membership test), NOT the GPU shader file, evaluated at
++// a much larger sample count than the GPU's own per-pixel budget for a
++// low-noise reference.
++template <typename EnvFn>
++double referenceRoughnessFilter(const Double3& n, double linearRoughness, uint32_t numSamples, EnvFn envFn) {
++    Double3 up = std::abs(n.z) < 0.999 ? Double3{0, 0, 1} : Double3{1, 0, 0};
++    Double3 tangentX = normalize(cross(up, n));
++    Double3 tangentY = cross(n, tangentX);
++
++    double accum = 0.0;
++    double weight = 0.0;
++    const double invN = 1.0 / static_cast<double>(numSamples);
++    for (uint32_t i = 0; i < numSamples; ++i) {
++        auto [u1, u2] = hammersley(i, invN);
++        Double3 hs = hemisphereImportanceSampleDggx(u1, u2, linearRoughness);
++        Double3 h = tangentX * hs.x + tangentY * hs.y + n * hs.z;
++        double noH = dot(n, h);
++        Double3 l = h * (2.0 * noH) - n;
++        double noL = dot(n, l);
++        if (noL > 0.0) {
++            accum += envFn(l) * noL;
++            weight += noL;
++        }
++    }
++    return weight > 0.0 ? accum / weight : envFn(n);
++}
++
++// Impulse-patch environment: bright inside `patchHalfAngleRad` of `l0`,
++// dark elsewhere.
++struct ImpulsePatchEnv {
++    Double3 l0;
++    double patchHalfAngleRad;
++    double brightValue;
++
++    double operator()(const Double3& dir) const {
++        double cosAngle = dot(dir, l0);
++        double cosHalf = std::cos(patchHalfAngleRad);
++        return cosAngle >= cosHalf ? brightValue : 0.0;
++    }
++};
++
++// Duplicated getDirectionForFace() -- see any other test file in this
++// suite for why (this codebase's own established per-file-duplicated-
++// helper idiom); double precision here since it feeds the CPU-side
++// fixture builder, which needs to agree EXACTLY with the GPU's own fp32
++// version only up to texel-membership (a boolean), not bit-for-bit.
++Double3 getDirectionForFaceD(uint32_t face, double u, double v) {
++    double cx = u * 2.0 - 1.0;
++    double cy = 1.0 - v * 2.0;
++    Double3 dir;
++    if (face == 0) {
++        dir = {1.0, cy, -cx};
++    } else if (face == 1) {
++        dir = {-1.0, cy, cx};
++    } else if (face == 2) {
++        dir = {cx, 1.0, -cy};
++    } else if (face == 3) {
++        dir = {cx, -1.0, cy};
++    } else if (face == 4) {
++        dir = {cx, cy, 1.0};
++    } else {
++        dir = {-cx, cy, -1.0};
++    }
++    return normalize(dir);
++}
++
++std::vector<float> buildImpulsePatchCubeFaces(uint32_t dim, const Double3& l0, double patchHalfAngleDeg,
++                                                float brightValue) {
++    const double patchHalfAngleRad = patchHalfAngleDeg * kPiD / 180.0;
++    const double cosHalf = std::cos(patchHalfAngleRad);
++    std::vector<float> px(static_cast<size_t>(dim) * dim * 4 * 6, 0.0F);
++    for (uint32_t face = 0; face < 6; ++face) {
++        for (uint32_t y = 0; y < dim; ++y) {
++            for (uint32_t x = 0; x < dim; ++x) {
++                double u = (static_cast<double>(x) + 0.5) / dim;
++                double v = (static_cast<double>(y) + 0.5) / dim;
++                Double3 dir = getDirectionForFaceD(face, u, v);
++                bool inPatch = dot(dir, l0) >= cosHalf;
++                size_t idx = ((static_cast<size_t>(face) * dim + y) * dim + x) * 4;
++                float val = inPatch ? brightValue : 0.0F;
++                px[idx + 0] = val;
++                px[idx + 1] = val;
++                px[idx + 2] = val;
++                px[idx + 3] = 1.0F;
++            }
++        }
++    }
++    return px;
++}
++
++// --- GPU probe: samples the REAL prefilteredCubemap via hardware
++// TextureCube at explicit (direction, mip) query points -- same idiom as
++// test_ibl_cube_face_convention_gpu.cpp's own probe kernel. -------------
++constexpr const char* kProbeSource = R"(
++[[vk::binding(0, 1)]] TextureCube<float4> gPrefiltered;
++[[vk::binding(1, 1)]] SamplerState gSampler;
++[[vk::binding(2, 1)]] StructuredBuffer<float4> gQueries; // xyz=direction, w=mip level
++[[vk::binding(3, 1)]] RWStructuredBuffer<float4> gResults;
++
++[shader("compute")]
++[numthreads(1, 1, 1)]
++void csMain(uint3 id: SV_DispatchThreadID) {
++    float4 q = gQueries[id.x];
++    gResults[id.x] = gPrefiltered.SampleLevel(gSampler, q.xyz, q.w);
++}
++)";
++
++struct ProbeKernel {
++    rx::rhi::ComputePipelineCache::Pipeline pso;
++    VkDescriptorSet emptySet0 = VK_NULL_HANDLE;
++};
++
++std::optional<ProbeKernel> buildProbeKernel(rx::shader::Compiler& compiler, rx::rhi::ComputePipelineCache& cache,
++                                              VkDevice device, VkDescriptorPool pool) {
++    auto compiled = compiler.compileFromSource("RxIblImpulseProbe", kProbeSource, {"csMain"});
++    if (!compiled.ok) {
++        MESSAGE("probe compile failed: ", compiled.diagnostics);
++        return std::nullopt;
++    }
++    auto layoutInfo = rx::shader::reflect(compiled);
++    if (!layoutInfo.has_value()) {
++        return std::nullopt;
++    }
++    auto pso = cache.getOrCreate(compiled.entryPointCode[0].code, *layoutInfo);
++    if (!pso.has_value() || pso->setLayouts.empty()) {
++        return std::nullopt;
++    }
++    VkDescriptorSetAllocateInfo allocInfo{};
++    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
++    allocInfo.descriptorPool = pool;
++    allocInfo.descriptorSetCount = 1;
++    allocInfo.pSetLayouts = &pso->setLayouts[0];
++    VkDescriptorSet emptySet0 = VK_NULL_HANDLE;
++    if (vkAllocateDescriptorSets(device, &allocInfo, &emptySet0) != VK_SUCCESS) {
++        return std::nullopt;
++    }
++    return ProbeKernel{*pso, emptySet0};
++}
++
++}  // namespace
++
++TEST_CASE("IBL Task 9: directional impulse -> known GGX lobe (angular direction + roughness-dependent width) -- "
++          "the plan/ticket's own SECOND required proof, not an alternative to the uniform-environment one") {
++    auto fx = makeIblFixture("rx_ibl_directional_impulse");
++    if (!fx.has_value()) {
++        return;
++    }
++
++    constexpr Double3 kL0{0.0, 0.0, 1.0};  // +Z -- canonical axis, face convention already proven elsewhere.
++    constexpr double kPatchHalfAngleDeg = 8.0;
++    constexpr float kBrightValue = 1.0F;
++    // 256, not this module's own more usual small (32-64) test
++    // resolutions -- LOAD-BEARING, found empirically this round: at 64,
++    // the impulse patch's own boundary is coarsely TEXEL-DISCRETIZED (a
++    // ~9-texel-diameter jagged circle, not a smooth one), which makes the
++    // GPU's actual baked input measurably DIFFERENT from the CPU
++    // reference's idealized continuous-circle membership test (`dot(dir,
++    // l0) >= cosHalf`) -- a discretization mismatch BETWEEN THIS TEST'S
++    // OWN fixture and its own oracle, not a bug in the bake -- observed
++    // directly as a systematic ~5-10% gap between GPU and CPU-reference
++    // values that persisted even at specularSamples=4096 (ruling out
++    // sampling noise as the cause) and vanished at this resolution
++    // (residual gap dropped to <1%, matching genuine sampling noise).
++    constexpr uint32_t kDim = 256;
++
++    auto pixels = buildImpulsePatchCubeFaces(kDim, kL0, kPatchHalfAngleDeg, kBrightValue);
++    auto source = uploadTestSource(*fx, kDim, kDim, 6, pixels);
++    REQUIRE(source.has_value());
++
++    rx::ibl::BakeParams params;
++    params.baseCubemapFaceSize = kDim;
++    params.irradianceFaceSize = 8;
++    params.irradianceSamples = 64;
++    params.prefilteredMipCount = 5;
++    params.prefilteredBaseFaceSize = kDim;
++    params.specularSamples = 4096;  // generous -- shrinks GPU-side MC noise enough to cleanly separate it from a
++                                      // real formula bug's own systematic bias (tuned empirically this round -- see
++                                      // task-09-report.md's own "Addendum" for the measured before/after numbers).
++    params.dfgLutSize = 16;
++    params.dfgSamples = 64;
++
++    auto result = rx::ibl::bakeEnvironment(fx->device, fx->allocator, *fx->cmdCtx, *fx->scheduler, *source, true,
++                                             RX_IBL_SHADER_DIR, params, nullptr, "test_directional_impulse");
++    REQUIRE(result.has_value());
++
++    // roughnessFilter's own mip<->roughness mapping (dfg_lut.slang/
++    // bake.cpp's own comment: coord=mip/(N-1), linearRoughness=coord^2) --
++    // duplicated here so this test's own CPU reference uses EXACTLY the
++    // alpha the production bake used for each mip, not a re-guessed one.
++    auto linearRoughnessForMip = [&](uint32_t mip) {
++        double coord = params.prefilteredMipCount > 1
++                           ? static_cast<double>(mip) / static_cast<double>(params.prefilteredMipCount - 1)
++                           : 0.0;
++        return coord * coord;
++    };
++
++    // Offset angles (degrees) from L0, probed along the +X meridian
++    // (direction = (sin(theta), 0, cos(theta)) -- a rotation of L0
++    // in the XZ-plane, so theta=0 IS exactly L0).
++    constexpr std::array<double, 6> kOffsetDeg{0.0, 8.0, 16.0, 24.0, 35.0, 50.0};
++    constexpr std::array<uint32_t, 3> kMips{1, 2, 3};
++
++    // Build the query buffer: for each mip, for each offset angle.
++    struct Query {
++        double offsetDeg;
++        uint32_t mip;
++        Double3 dir;
++    };
++    std::vector<Query> queries;
++    for (uint32_t mip : kMips) {
++        for (double offDeg : kOffsetDeg) {
++            double theta = offDeg * kPiD / 180.0;
++            Double3 dir{std::sin(theta), 0.0, std::cos(theta)};
++            queries.push_back({offDeg, mip, dir});
++        }
++    }
++
++    // --- GPU probe: real hardware TextureCube.SampleLevel reads of the
++    // REAL, shipped prefilteredCubemap. ---------------------------------
++    auto compiler = rx::shader::Compiler::create();
++    REQUIRE(compiler.has_value());
++    auto cache = rx::rhi::ComputePipelineCache::create(
++        fx->device.device(), std::filesystem::temp_directory_path() / "rx_ibl" / "test_directional_impulse_probe.pipeline_cache");
++    REQUIRE(cache.has_value());
++
++    std::array<VkDescriptorPoolSize, 3> poolSizes{
++        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2},
++        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLER, 2},
++        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4},
++    };
++    VkDescriptorPoolCreateInfo poolInfo{};
++    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
++    poolInfo.maxSets = 4;
++    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
++    poolInfo.pPoolSizes = poolSizes.data();
++    VkDescriptorPool pool = VK_NULL_HANDLE;
++    REQUIRE(vkCreateDescriptorPool(fx->device.device(), &poolInfo, nullptr, &pool) == VK_SUCCESS);
++
++    auto probeKernel = buildProbeKernel(*compiler, *cache, fx->device.device(), pool);
++    REQUIRE(probeKernel.has_value());
++
++    VkSamplerCreateInfo samplerInfo{};
++    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
++    samplerInfo.magFilter = VK_FILTER_LINEAR;
++    samplerInfo.minFilter = VK_FILTER_LINEAR;
++    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
++    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    samplerInfo.minLod = 0.0F;
++    samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
++    VkSampler sampler = VK_NULL_HANDLE;
++    REQUIRE(vkCreateSampler(fx->device.device(), &samplerInfo, nullptr, &sampler) == VK_SUCCESS);
++
++    std::vector<float> queryBuf(queries.size() * 4);
++    for (size_t i = 0; i < queries.size(); ++i) {
++        queryBuf[i * 4 + 0] = static_cast<float>(queries[i].dir.x);
++        queryBuf[i * 4 + 1] = static_cast<float>(queries[i].dir.y);
++        queryBuf[i * 4 + 2] = static_cast<float>(queries[i].dir.z);
++        queryBuf[i * 4 + 3] = static_cast<float>(queries[i].mip);
++    }
++    auto queryStaging = fx->allocator.createHostVisibleBuffer(queryBuf.size() * sizeof(float),
++                                                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
++    REQUIRE(queryStaging.has_value());
++    std::memcpy(queryStaging->mappedData(), queryBuf.data(), queryBuf.size() * sizeof(float));
++    queryStaging->flush();
++
++    auto resultsBuf = fx->allocator.createHostVisibleBuffer(
++        queries.size() * 4 * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    REQUIRE(resultsBuf.has_value());
++
++    VkDescriptorSetAllocateInfo setAlloc{};
++    setAlloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
++    setAlloc.descriptorPool = pool;
++    setAlloc.descriptorSetCount = 1;
++    setAlloc.pSetLayouts = &probeKernel->pso.setLayouts[1];
++    VkDescriptorSet set1 = VK_NULL_HANDLE;
++    REQUIRE(vkAllocateDescriptorSets(fx->device.device(), &setAlloc, &set1) == VK_SUCCESS);
++
++    VkDescriptorImageInfo cubeInfo{sampler, result->prefilteredCubemap.view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
++    VkDescriptorImageInfo samplerWrite{sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
++    VkDescriptorBufferInfo queryInfo{queryStaging->handle(), 0, VK_WHOLE_SIZE};
++    VkDescriptorBufferInfo resultsInfo{resultsBuf->handle(), 0, VK_WHOLE_SIZE};
++    std::array<VkWriteDescriptorSet, 4> writes{};
++    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++    writes[0].dstSet = set1;
++    writes[0].dstBinding = 0;
++    writes[0].descriptorCount = 1;
++    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
++    writes[0].pImageInfo = &cubeInfo;
++    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++    writes[1].dstSet = set1;
++    writes[1].dstBinding = 1;
++    writes[1].descriptorCount = 1;
++    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
++    writes[1].pImageInfo = &samplerWrite;
++    writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++    writes[2].dstSet = set1;
++    writes[2].dstBinding = 2;
++    writes[2].descriptorCount = 1;
++    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++    writes[2].pBufferInfo = &queryInfo;
++    writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++    writes[3].dstSet = set1;
++    writes[3].dstBinding = 3;
++    writes[3].descriptorCount = 1;
++    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++    writes[3].pBufferInfo = &resultsInfo;
++    vkUpdateDescriptorSets(fx->device.device(), static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
++
++    fx->cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, probeKernel->pso.pipeline);
++        std::array<VkDescriptorSet, 2> sets{probeKernel->emptySet0, set1};
++        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, probeKernel->pso.layout, 0,
++                                 static_cast<uint32_t>(sets.size()), sets.data(), 0, nullptr);
++        vkCmdDispatch(cmd, static_cast<uint32_t>(queries.size()), 1, 1);
++
++        VkMemoryBarrier2 toHost{};
++        toHost.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
++        toHost.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
++        toHost.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
++        toHost.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
++        toHost.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
++        VkDependencyInfo dep{};
++        dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++        dep.memoryBarrierCount = 1;
++        dep.pMemoryBarriers = &toHost;
++        vkCmdPipelineBarrier2(cmd, &dep);
++    });
++    resultsBuf->invalidate();
++    std::vector<float> gpuResults(queries.size() * 4);
++    std::memcpy(gpuResults.data(), resultsBuf->mappedData(), gpuResults.size() * sizeof(float));
++
++    // --- CPU high-precision reference + comparison. ---------------------
++    constexpr uint32_t kRefSamples = 2000000;
++    ImpulsePatchEnv env{kL0, kPatchHalfAngleDeg * kPiD / 180.0, static_cast<double>(kBrightValue)};
++
++    // Tolerances TUNED EMPIRICALLY this round (not guessed) -- see
++    // task-09-report.md's own "Addendum" for the measured numbers this
++    // was calibrated against: a first attempt (specularSamples=1024,
++    // kAbsTol=0.05, kRelTol=0.25) passed even against the reviewer's own
++    // reproduced sabotage (`weight += noL*noL`, an asymmetric NoL
++    // exponent) because the sabotage's own systematic bias (measured
++    // ~20-32% relative at the mid/high-roughness mips) fell inside that
++    // tolerance's own absolute floor for the small reference values
++    // involved. Raising specularSamples 1024->4096 and kRefSamples
++    // 200000->2000000 shrinks GENUINE Monte-Carlo noise (measured
++    // unsabotaged relative error dropped to a consistent low single-digit
++    // percentage after this change -- see the report); this tolerance
++    // pair sits cleanly between that reduced noise floor and the
++    // sabotage's own unchanged (it is a formula bug, not sampling noise)
++    // bias.
++    constexpr double kAbsTol = 0.003;
++    constexpr double kRelTol = 0.08;
++
++    std::vector<double> peakAtMip(kMips.size(), -1.0);
++    for (size_t qi = 0; qi < queries.size(); ++qi) {
++        const auto& q = queries[qi];
++        double linearRoughness = linearRoughnessForMip(q.mip);
++        double reference = referenceRoughnessFilter(q.dir, linearRoughness, kRefSamples, env);
++        double measured = static_cast<double>(gpuResults[qi * 4 + 0]);  // R channel (all channels identical here).
++
++        double tol = std::max(kAbsTol, kRelTol * reference);
++        double diff = std::abs(measured - reference);
++        INFO("mip=", q.mip, " linearRoughness=", linearRoughness, " offset=", q.offsetDeg, "deg measured=", measured,
++             " reference=", reference, " |diff|=", diff, " tol=", tol);
++        CHECK(diff <= tol);
++
++        for (size_t mi = 0; mi < kMips.size(); ++mi) {
++            if (kMips[mi] == q.mip && q.offsetDeg == 0.0) {
++                peakAtMip[mi] = measured;
++            }
++        }
++    }
++
++    // --- DIRECTION check (reviewer's own explicit ask): the lobe's peak
++    // stays centered at L0 (offset 0 deg) -- for EVERY tested mip, the
++    // offset=0 measured value is >= every other offset's measured value
++    // at that SAME mip (a real, GPU-measured ordering property, not
++    // merely asserted from the reference). ------------------------------
++    for (uint32_t mip : kMips) {
++        double atZero = -1.0;
++        double maxOther = -1.0;
++        for (size_t qi = 0; qi < queries.size(); ++qi) {
++            if (queries[qi].mip != mip) {
++                continue;
++            }
++            double v = static_cast<double>(gpuResults[qi * 4 + 0]);
++            if (queries[qi].offsetDeg == 0.0) {
++                atZero = v;
++            } else {
++                maxOther = std::max(maxOther, v);
++            }
++        }
++        INFO("mip=", mip, " peak-at-L0=", atZero, " max-elsewhere=", maxOther);
++        CHECK(atZero >= maxOther);
++    }
++
++    CHECK_FALSE(fx->context.hasValidationErrors());
++
++    vkDeviceWaitIdle(fx->device.device());
++    vkDestroySampler(fx->device.device(), sampler, nullptr);
++    vkDestroyDescriptorPool(fx->device.device(), pool, nullptr);
++}
+diff --git a/src/rx_ibl/tests/test_ibl_energy_compensation_gpu.cpp b/src/rx_ibl/tests/test_ibl_energy_compensation_gpu.cpp
+index 4b7d8eb..4a71344 100644
+--- a/src/rx_ibl/tests/test_ibl_energy_compensation_gpu.cpp
++++ b/src/rx_ibl/tests/test_ibl_energy_compensation_gpu.cpp
+@@ -218,21 +218,21 @@ TEST_CASE("IBL Task 9: energy-compensation activation -- production energyCompen
+     params.baseCubemapFaceSize = 8;
+     params.irradianceFaceSize = 4;
+     params.irradianceSamples = 64;
+     params.prefilteredMipCount = 2;
+     params.prefilteredBaseFaceSize = 8;
+     params.specularSamples = 32;
+     params.dfgLutSize = 64;
+     params.dfgSamples = 2048;  // generous -- roughest-row Ess needs to be a real, low-noise number here.
+ 
+     auto result = rx::ibl::bakeEnvironment(fx->device, fx->allocator, *fx->cmdCtx, *fx->scheduler, *source, true,
+-                                             RX_IBL_SHADER_DIR, params);
++                                             RX_IBL_SHADER_DIR, params, nullptr, "test_energy_compensation");
+     REQUIRE(result.has_value());
+ 
+     // Roughest row (y=0, linearRoughness~1.0), a mid/high NoV column
+     // (x=3*width/4) -- away from the NoV~0 grazing edge, where the
+     // DFV_Multiscatter Monte-Carlo estimator's own visibility term is
+     // best-conditioned.
+     const uint32_t x = params.dfgLutSize * 3 / 4;
+     auto raw = readbackRaw(*fx, result->dfgLut, 0, 0, params.dfgLutSize, params.dfgLutSize, 4);
+     const uint16_t* half = reinterpret_cast<const uint16_t*>(raw.data());
+     size_t base = (static_cast<size_t>(0) * params.dfgLutSize + x) * 2;
+diff --git a/src/rx_ibl/tests/test_ibl_hdr_fixture_gpu.cpp b/src/rx_ibl/tests/test_ibl_hdr_fixture_gpu.cpp
+index 8445b14..d86f3f5 100644
+--- a/src/rx_ibl/tests/test_ibl_hdr_fixture_gpu.cpp
++++ b/src/rx_ibl/tests/test_ibl_hdr_fixture_gpu.cpp
+@@ -81,21 +81,21 @@ TEST_CASE("IBL Task 9: real Task 6 HDR decode path (rx::asset::decodeStbImageHdr
+     params.baseCubemapFaceSize = 32;
+     params.irradianceFaceSize = 8;
+     params.irradianceSamples = 256;
+     params.prefilteredMipCount = 3;
+     params.prefilteredBaseFaceSize = 32;
+     params.specularSamples = 64;
+     params.dfgLutSize = 32;
+     params.dfgSamples = 256;
+ 
+     auto result = rx::ibl::bakeEnvironment(fx->device, fx->allocator, *fx->cmdCtx, *fx->scheduler, *source, false,
+-                                             RX_IBL_SHADER_DIR, params);
++                                             RX_IBL_SHADER_DIR, params, nullptr, "test_hdr_fixture");
+     REQUIRE(result.has_value());
+ 
+     constexpr double kEps = 0.02;
+     for (uint32_t face = 0; face < 6; ++face) {
+         auto raw = readbackRaw(*fx, result->irradianceCubemap, 0, face, params.irradianceFaceSize,
+                                  params.irradianceFaceSize, 8);
+         const uint16_t* half = reinterpret_cast<const uint16_t*>(raw.data());
+         size_t center = (static_cast<size_t>(params.irradianceFaceSize / 2) * params.irradianceFaceSize +
+                           params.irradianceFaceSize / 2) *
+                          4;
+diff --git a/tools/rx_ibl_bench/main.cpp b/tools/rx_ibl_bench/main.cpp
+index a483246..d25ec2f 100644
+--- a/tools/rx_ibl_bench/main.cpp
++++ b/tools/rx_ibl_bench/main.cpp
+@@ -163,21 +163,21 @@ int main(int argc, char** argv) {
+     params.irradianceFaceSize = 32;
+     params.irradianceSamples = 1024;
+     params.prefilteredMipCount = 7;
+     params.prefilteredBaseFaceSize = 256;
+     params.specularSamples = 256;
+     params.dfgLutSize = 128;
+     params.dfgSamples = 1024;
+ 
+     rx::ibl::BakeTimings timings;
+     auto result = rx::ibl::bakeEnvironment(*device, *allocator, *cmdCtx, *scheduler, *source, /*sourceIsCube=*/false,
+-                                             shaderDir, params, &timings);
++                                             shaderDir, params, &timings, "bench");
+     if (!result.has_value()) {
+         std::fprintf(stderr, "rx_ibl_bench: bakeEnvironment failed\n");
+         return 1;
+     }
+ 
+     std::printf("rx_ibl_bench: params baseCubemapFaceSize=%u irradianceFaceSize=%u(x%u samples) "
+                 "prefilteredMipCount=%u(base=%u, x%u samples/mip) dfgLutSize=%u(x%u samples)\n",
+                 params.baseCubemapFaceSize, params.irradianceFaceSize, params.irradianceSamples,
+                 params.prefilteredMipCount, params.prefilteredBaseFaceSize, params.specularSamples, params.dfgLutSize,
+                 params.dfgSamples);
