@@ -41,6 +41,13 @@ set(RX_SCENE_MATERIAL_SHADERS
   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/forward_entry.slang"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/standard_pbr.slang"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/unlit.slang"
+  # [Phase 5 Stage 1 Task 8, #44] See samples/08_gltf_viewer/CMakeLists.txt's
+  # identical addition's own comment -- standard_pbr.slang now `import
+  # brdf;`s Task 7's BRDF module and links against one of these two
+  # companion variant-selector files.
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/brdf.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/energy_compensation_off.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/energy_compensation_on.slang"
 )
 add_custom_command(
   OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/material_shaders_deploy.stamp"

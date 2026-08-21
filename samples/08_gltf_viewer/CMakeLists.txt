@@ -52,6 +52,15 @@ set(RX_GLTF_VIEWER_MATERIAL_SHADERS
   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/forward_entry.slang"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/standard_pbr.slang"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/unlit.slang"
+  # [Phase 5 Stage 1 Task 8, #44] standard_pbr.slang now `import brdf;`s
+  # Task 7's BRDF module and links against one of these two companion
+  # variant-selector files (energy-compensation permutation axis) -- all
+  # three must deploy alongside it, or MaterialSystem::create()'s runtime
+  # search-path resolution (against this same deployed material_shaders/
+  # directory) fails the moment this sample tries to load standard_pbr.slang.
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/brdf.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/energy_compensation_off.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/energy_compensation_on.slang"
 )
 add_custom_command(
   OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/material_shaders_deploy.stamp"

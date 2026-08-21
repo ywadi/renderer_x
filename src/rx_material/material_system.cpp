@@ -744,6 +744,19 @@ struct MaterialRecord {
 
     VkShaderModule vertexModule = VK_NULL_HANDLE;
     VkShaderModule fragmentModule = VK_NULL_HANDLE;
+
+    // [Phase 5 Stage 1 Task 8, #44] The energy-compensation-ON sibling
+    // variant -- see CompiledMaterial's own identical fields (this file's
+    // "energy-compensation variant" comment) for the full mechanism;
+    // mirrored here 1:1 by loadMaterial()/reloadChanged() on every
+    // (re)compile. getPipeline() below selects between this pair and
+    // vertexModule/fragmentModule above per
+    // req.specializationBits & kSpecializationEnergyCompensation, falling
+    // back to the base pair whenever hasEnergyCompensationVariant is false
+    // (every material besides standard_pbr.slang today).
+    VkShaderModule vertexModuleOn = VK_NULL_HANDLE;
+    VkShaderModule fragmentModuleOn = VK_NULL_HANDLE;
+    bool hasEnergyCompensationVariant = false;
 };
 
 // [Task 7 coordinator addition 4] One created texture: the real owned
@@ -797,6 +810,12 @@ struct MaterialSystem::Impl {
                                                     // own comment on why material modules are handled the same way.
     Slang::ComPtr<slang::IEntryPoint> vertexEntryPoint;
     Slang::ComPtr<slang::IEntryPoint> fragmentEntryPoint;
+
+    // [Task 8] The energy-compensation permutation axis's two companion
+    // modules -- see loadEnergyCompVariants()'s own header comment. Owned
+    // by `session`, same lifetime discipline as forwardEntryModule above.
+    slang::IModule* energyCompOffModule = nullptr;
+    slang::IModule* energyCompOnModule = nullptr;
 
     rx::core::HandlePool<MaterialTag, MaterialRecord> materials;
 
@@ -1014,7 +1033,42 @@ std::optional<ForwardEntryBundle> loadForwardEntry(slang::ISession* session, con
     return bundle;
 }
 
+// [Task 8] The energy-compensation permutation axis's two companion
+// modules -- see energy_compensation_{off,on}.slang's own header comments
+// and material_system.h's kSpecializationEnergyCompensation comment for
+// the full mechanism. Loaded exactly once per session (create()'s own
+// `impl.session`, or reloadChanged()'s fresh per-reload session), mirroring
+// loadForwardEntry()'s own "shared module, loaded once, reused by every
+// compileMaterial() call against this session" shape.
+struct EnergyCompVariantModules {
+    slang::IModule* offModule = nullptr;  // owned by `session`, not this struct.
+    slang::IModule* onModule = nullptr;   // owned by `session`, not this struct.
+};
+
+std::optional<EnergyCompVariantModules> loadEnergyCompVariants(slang::ISession* session,
+                                                                 const std::filesystem::path& shaderDir,
+                                                                 std::string& diagnostics) {
+    EnergyCompVariantModules modules;
+    modules.offModule = loadSharedModule(session, shaderDir, "energy_compensation_off.slang", diagnostics);
+    if (modules.offModule == nullptr) {
+        return std::nullopt;
+    }
+    modules.onModule = loadSharedModule(session, shaderDir, "energy_compensation_on.slang", diagnostics);
+    if (modules.onModule == nullptr) {
+        return std::nullopt;
+    }
+    return modules;
+}
+
 void destroyMaterialRecord(VkDevice device, MaterialRecord& record) {
+    if (record.vertexModuleOn != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, record.vertexModuleOn, nullptr);
+        record.vertexModuleOn = VK_NULL_HANDLE;
+    }
+    if (record.fragmentModuleOn != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, record.fragmentModuleOn, nullptr);
+        record.fragmentModuleOn = VK_NULL_HANDLE;
+    }
     if (record.vertexModule != VK_NULL_HANDLE) {
         vkDestroyShaderModule(device, record.vertexModule, nullptr);
         record.vertexModule = VK_NULL_HANDLE;
@@ -1050,6 +1104,19 @@ struct CompiledMaterial {
     rx::rhi::PipelineLayoutBundle layoutBundle;
     VkShaderModule vertexModule = VK_NULL_HANDLE;
     VkShaderModule fragmentModule = VK_NULL_HANDLE;
+
+    // [Phase 5 Stage 1 Task 8, #44] The energy-compensation-ON sibling
+    // variant -- see material_system.h's own kSpecializationEnergyCompensation
+    // comment and this file's "energy-compensation variant" comment below
+    // for the full mechanism. Only populated (hasEnergyCompensationVariant
+    // == true) for a material module whose source references
+    // `IEnergyCompensationFeature` (standard_pbr.slang, today); every other
+    // material leaves these VK_NULL_HANDLE and getPipeline() always falls
+    // back to vertexModule/fragmentModule above for it, regardless of
+    // req.specializationBits.
+    VkShaderModule vertexModuleOn = VK_NULL_HANDLE;
+    VkShaderModule fragmentModuleOn = VK_NULL_HANDLE;
+    bool hasEnergyCompensationVariant = false;
 };
 
 void destroyCompiledMaterialGpuObjects(VkDevice device, CompiledMaterial& compiled) {
@@ -1061,7 +1128,94 @@ void destroyCompiledMaterialGpuObjects(VkDevice device, CompiledMaterial& compil
         vkDestroyShaderModule(device, compiled.fragmentModule, nullptr);
         compiled.fragmentModule = VK_NULL_HANDLE;
     }
+    if (compiled.vertexModuleOn != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, compiled.vertexModuleOn, nullptr);
+        compiled.vertexModuleOn = VK_NULL_HANDLE;
+    }
+    if (compiled.fragmentModuleOn != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, compiled.fragmentModuleOn, nullptr);
+        compiled.fragmentModuleOn = VK_NULL_HANDLE;
+    }
     compiled.layoutBundle = rx::rhi::PipelineLayoutBundle{};
+}
+
+// [Task 8] One linked-and-codegen'd (vertex, fragment) VkShaderModule pair
+// -- the tail half of what compileMaterial()'s pre-Task-8 body did inline
+// exactly once; factored out so it can run a SECOND time (the energy-
+// compensation-ON variant pass) without a second, drift-prone hand copy,
+// matching task-6-report.md's own Fix round 1 (F3) precedent for why this
+// file factors identical setup rather than typing it out twice.
+// `diagnosticsLabel` tags every diagnostic this produces (e.g.
+// "energyCompOn") so a failure in one variant pass is unambiguous in the
+// log even though both passes share one `diagnostics` accumulator.
+std::optional<CompiledMaterial> linkAndCreateShaderModules(VkDevice device, slang::ISession* session,
+                                                            const std::vector<slang::IComponentType*>& parts,
+                                                            const char* diagnosticsLabel, std::string& diagnostics) {
+    Slang::ComPtr<slang::IComponentType> composite;
+    Slang::ComPtr<slang::IBlob> composeDiag;
+    SlangResult composeResult = session->createCompositeComponentType(
+        parts.data(), static_cast<SlangInt>(parts.size()), composite.writeRef(), composeDiag.writeRef());
+    appendDiagnostics(diagnostics, (std::string("compose[") + diagnosticsLabel + "]").c_str(), composeDiag);
+    if (SLANG_FAILED(composeResult) || composite.get() == nullptr) {
+        return std::nullopt;
+    }
+
+    Slang::ComPtr<slang::IComponentType> linked;
+    Slang::ComPtr<slang::IBlob> linkDiag;
+    SlangResult linkResult = composite->link(linked.writeRef(), linkDiag.writeRef());
+    appendDiagnostics(diagnostics, (std::string("link[") + diagnosticsLabel + "]").c_str(), linkDiag);
+    if (SLANG_FAILED(linkResult) || linked.get() == nullptr) {
+        return std::nullopt;
+    }
+
+    // Entry point order in `parts` is always (forwardEntryModule,
+    // vertexEntryPoint, fragmentEntryPoint, materialModule, [variant
+    // part]) -- vertex is always index 0, fragment always index 1,
+    // matching compiler.cpp's own "entry points contribute in exactly the
+    // order pushed" contract, regardless of which (if any) variant part
+    // follows the material module.
+    Slang::ComPtr<slang::IBlob> vertexCodeDiag;
+    Slang::ComPtr<slang::IBlob> vertexCode;
+    SlangResult vertexCodeResult = linked->getEntryPointCode(0, 0, vertexCode.writeRef(), vertexCodeDiag.writeRef());
+    appendDiagnostics(diagnostics, (std::string("codegen(vertex)[") + diagnosticsLabel + "]").c_str(),
+                       vertexCodeDiag);
+    if (SLANG_FAILED(vertexCodeResult) || vertexCode.get() == nullptr) {
+        return std::nullopt;
+    }
+
+    Slang::ComPtr<slang::IBlob> fragmentCodeDiag;
+    Slang::ComPtr<slang::IBlob> fragmentCode;
+    SlangResult fragmentCodeResult =
+        linked->getEntryPointCode(1, 0, fragmentCode.writeRef(), fragmentCodeDiag.writeRef());
+    appendDiagnostics(diagnostics, (std::string("codegen(fragment)[") + diagnosticsLabel + "]").c_str(),
+                       fragmentCodeDiag);
+    if (SLANG_FAILED(fragmentCodeResult) || fragmentCode.get() == nullptr) {
+        return std::nullopt;
+    }
+
+    CompiledMaterial result;
+    result.linkedProgram = linked;
+
+    VkShaderModuleCreateInfo vertexModuleInfo{};
+    vertexModuleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    vertexModuleInfo.codeSize = vertexCode->getBufferSize();
+    vertexModuleInfo.pCode = static_cast<const uint32_t*>(vertexCode->getBufferPointer());
+    if (vkCreateShaderModule(device, &vertexModuleInfo, nullptr, &result.vertexModule) != VK_SUCCESS) {
+        diagnostics += std::string("vkCreateShaderModule (vertex[") + diagnosticsLabel + "]) failed\n";
+        return std::nullopt;
+    }
+
+    VkShaderModuleCreateInfo fragmentModuleInfo{};
+    fragmentModuleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    fragmentModuleInfo.codeSize = fragmentCode->getBufferSize();
+    fragmentModuleInfo.pCode = static_cast<const uint32_t*>(fragmentCode->getBufferPointer());
+    if (vkCreateShaderModule(device, &fragmentModuleInfo, nullptr, &result.fragmentModule) != VK_SUCCESS) {
+        diagnostics += std::string("vkCreateShaderModule (fragment[") + diagnosticsLabel + "]) failed\n";
+        vkDestroyShaderModule(device, result.vertexModule, nullptr);
+        return std::nullopt;
+    }
+
+    return result;
 }
 
 std::optional<CompiledMaterial> compileMaterial(VkDevice device, rx::rhi::BindlessTable& bindless,
@@ -1069,6 +1223,8 @@ std::optional<CompiledMaterial> compileMaterial(VkDevice device, rx::rhi::Bindle
                                                  slang::IModule* forwardEntryModule,
                                                  slang::IEntryPoint* vertexEntryPoint,
                                                  slang::IEntryPoint* fragmentEntryPoint,
+                                                 slang::IModule* energyCompOffModule,
+                                                 slang::IModule* energyCompOnModule,
                                                  const std::filesystem::path& slangModulePath,
                                                  std::string& diagnostics) {
     auto source = readFileBytes(slangModulePath);
@@ -1077,6 +1233,20 @@ std::optional<CompiledMaterial> compileMaterial(VkDevice device, rx::rhi::Bindle
         return std::nullopt;
     }
     uint64_t contentHash = fnv1aBytes(source->data(), source->size());
+
+    // [Task 8] Content-sniffed, not parsed -- a material module wanting the
+    // energy-compensation permutation axis declares
+    // `extern struct EnergyComp : IEnergyCompensationFeature;`
+    // (standard_pbr.slang does; see that file's own header comment), which
+    // this substring search detects cheaply and reliably (Slang identifier
+    // names cannot appear as a substring by accident in valid source
+    // without ALSO being the real interface name, since `IEnergyCompensation
+    // Feature` is brdf.slang's own, deliberately unusual, non-generic
+    // identifier). A module that does NOT reference it (every material
+    // besides standard_pbr.slang today -- Unlit, every test fixture) skips
+    // the whole second-variant machinery below entirely, unaffected byte-
+    // for-byte by this ticket's own change.
+    bool usesEnergyComp = source->find("IEnergyCompensationFeature") != std::string::npos;
 
     // Loaded via loadModuleFromSource() + a self-read ifstream, exactly
     // like rx_shader::Compiler::compileFromFile() -- not
@@ -1104,33 +1274,28 @@ std::optional<CompiledMaterial> compileMaterial(VkDevice device, rx::rhi::Bindle
         return std::nullopt;
     }
 
-    std::vector<slang::IComponentType*> parts;
-    parts.push_back(forwardEntryModule);
-    parts.push_back(vertexEntryPoint);
-    parts.push_back(fragmentEntryPoint);
-    parts.push_back(materialModule);
-
-    Slang::ComPtr<slang::IComponentType> composite;
-    Slang::ComPtr<slang::IBlob> composeDiag;
-    SlangResult composeResult = session->createCompositeComponentType(
-        parts.data(), static_cast<SlangInt>(parts.size()), composite.writeRef(), composeDiag.writeRef());
-    appendDiagnostics(diagnostics, "compose", composeDiag);
-    if (SLANG_FAILED(composeResult) || composite.get() == nullptr) {
-        return std::nullopt;
+    // --- Base pass [Task 8: was the WHOLE function's body pre-rework] --
+    // Always the energy-compensation-OFF resolution when `usesEnergyComp`
+    // -- this is the variant a bare `specializationBits=0` request
+    // (bindInstance()'s own hardcoded value; every pre-Task-8 caller)
+    // resolves to, so it stays the DEFAULT/base compiled variant this
+    // function returns, exactly as before for every material that does not
+    // use the mechanism at all.
+    std::vector<slang::IComponentType*> baseParts{forwardEntryModule, vertexEntryPoint, fragmentEntryPoint,
+                                                    materialModule};
+    if (usesEnergyComp) {
+        baseParts.push_back(energyCompOffModule);
     }
-
-    Slang::ComPtr<slang::IComponentType> linked;
-    Slang::ComPtr<slang::IBlob> linkDiag;
-    SlangResult linkResult = composite->link(linked.writeRef(), linkDiag.writeRef());
-    appendDiagnostics(diagnostics, "link", linkDiag);
-    if (SLANG_FAILED(linkResult) || linked.get() == nullptr) {
+    auto basePass = linkAndCreateShaderModules(device, session.get(), baseParts, "base", diagnostics);
+    if (!basePass.has_value()) {
         return std::nullopt;
     }
 
     Slang::ComPtr<slang::IBlob> layoutDiag;
-    slang::ProgramLayout* progLayout = linked->getLayout(0, layoutDiag.writeRef());
+    slang::ProgramLayout* progLayout = basePass->linkedProgram->getLayout(0, layoutDiag.writeRef());
     appendDiagnostics(diagnostics, "layout", layoutDiag);
     if (progLayout == nullptr) {
+        destroyCompiledMaterialGpuObjects(device, *basePass);
         return std::nullopt;
     }
 
@@ -1139,6 +1304,7 @@ std::optional<CompiledMaterial> compileMaterial(VkDevice device, rx::rhi::Bindle
     if (!reflection.has_value()) {
         diagnostics += reflectError;
         diagnostics.push_back('\n');
+        destroyCompiledMaterialGpuObjects(device, *basePass);
         return std::nullopt;
     }
 
@@ -1146,60 +1312,38 @@ std::optional<CompiledMaterial> compileMaterial(VkDevice device, rx::rhi::Bindle
         rx::rhi::PipelineLayoutBuilder::build(device, reflection->shaderLayout, bindless.descriptorSetLayout());
     if (!layoutBundle.has_value()) {
         diagnostics += "PipelineLayoutBuilder::build failed for material '" + slangModulePath.string() + "'\n";
+        destroyCompiledMaterialGpuObjects(device, *basePass);
         return std::nullopt;
     }
 
     CompiledMaterial result;
     result.session = std::move(session);
-    result.linkedProgram = linked;
+    result.linkedProgram = basePass->linkedProgram;
     result.contentHash = contentHash;
     result.layoutInfo = std::move(reflection->shaderLayout);
     result.params = std::move(reflection->params);
     result.paramBlockSize = reflection->paramBlockSize;
     result.layoutBundle = std::move(*layoutBundle);
+    result.vertexModule = basePass->vertexModule;
+    result.fragmentModule = basePass->fragmentModule;
 
-    // Entry point order in the composite above is fixed
-    // (forwardEntryModule, vertexEntryPoint, fragmentEntryPoint,
-    // materialModule) -- vertex is always index 0, fragment always index 1,
-    // matching compiler.cpp's own "entry points contribute in exactly the
-    // order pushed" contract.
-    Slang::ComPtr<slang::IBlob> vertexCodeDiag;
-    Slang::ComPtr<slang::IBlob> vertexCode;
-    SlangResult vertexCodeResult = linked->getEntryPointCode(0, 0, vertexCode.writeRef(), vertexCodeDiag.writeRef());
-    appendDiagnostics(diagnostics, "codegen(vertex)", vertexCodeDiag);
-    if (SLANG_FAILED(vertexCodeResult) || vertexCode.get() == nullptr) {
-        destroyCompiledMaterialGpuObjects(device, result);
-        return std::nullopt;
-    }
-
-    Slang::ComPtr<slang::IBlob> fragmentCodeDiag;
-    Slang::ComPtr<slang::IBlob> fragmentCode;
-    SlangResult fragmentCodeResult =
-        linked->getEntryPointCode(1, 0, fragmentCode.writeRef(), fragmentCodeDiag.writeRef());
-    appendDiagnostics(diagnostics, "codegen(fragment)", fragmentCodeDiag);
-    if (SLANG_FAILED(fragmentCodeResult) || fragmentCode.get() == nullptr) {
-        destroyCompiledMaterialGpuObjects(device, result);
-        return std::nullopt;
-    }
-
-    VkShaderModuleCreateInfo vertexModuleInfo{};
-    vertexModuleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    vertexModuleInfo.codeSize = vertexCode->getBufferSize();
-    vertexModuleInfo.pCode = static_cast<const uint32_t*>(vertexCode->getBufferPointer());
-    if (vkCreateShaderModule(device, &vertexModuleInfo, nullptr, &result.vertexModule) != VK_SUCCESS) {
-        diagnostics += "vkCreateShaderModule (vertex) failed for material '" + slangModulePath.string() + "'\n";
-        destroyCompiledMaterialGpuObjects(device, result);
-        return std::nullopt;
-    }
-
-    VkShaderModuleCreateInfo fragmentModuleInfo{};
-    fragmentModuleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    fragmentModuleInfo.codeSize = fragmentCode->getBufferSize();
-    fragmentModuleInfo.pCode = static_cast<const uint32_t*>(fragmentCode->getBufferPointer());
-    if (vkCreateShaderModule(device, &fragmentModuleInfo, nullptr, &result.fragmentModule) != VK_SUCCESS) {
-        diagnostics += "vkCreateShaderModule (fragment) failed for material '" + slangModulePath.string() + "'\n";
-        destroyCompiledMaterialGpuObjects(device, result);
-        return std::nullopt;
+    // --- Second pass [Task 8, conditional]: energy-compensation-ON -----
+    // Reuses the SAME reflection/layoutBundle above -- `EnergyComp`'s
+    // choice of On vs Off never changes StandardPbrParams' own field
+    // shape (only which CODE `energyFeature.apply()` resolves to), so
+    // re-reflecting from a second linked program would be redundant work
+    // computing the identical answer, not a correctness requirement.
+    if (usesEnergyComp) {
+        std::vector<slang::IComponentType*> onParts{forwardEntryModule, vertexEntryPoint, fragmentEntryPoint,
+                                                      materialModule, energyCompOnModule};
+        auto onPass = linkAndCreateShaderModules(device, result.session.get(), onParts, "energyCompOn", diagnostics);
+        if (!onPass.has_value()) {
+            destroyCompiledMaterialGpuObjects(device, result);
+            return std::nullopt;
+        }
+        result.vertexModuleOn = onPass->vertexModule;
+        result.fragmentModuleOn = onPass->fragmentModule;
+        result.hasEnergyCompensationVariant = true;
     }
 
     return result;
@@ -1394,6 +1538,18 @@ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device, 
         return nullptr;
     }
 
+    // [Task 8] The energy-compensation permutation axis's two companion
+    // modules -- see loadEnergyCompVariants()'s own header comment. Loaded
+    // unconditionally alongside forward_entry.slang: cheap (two tiny
+    // one-line files), and required before the FIRST standard_pbr.slang
+    // loadMaterial() call can succeed (its own `extern struct EnergyComp`
+    // needs a resolving export from the very first compile -- see
+    // compileMaterial()'s own "base pass" comment).
+    auto energyCompVariants = loadEnergyCompVariants(session, effectiveShaderDir, diagnostics);
+    if (!energyCompVariants.has_value()) {
+        return nullptr;
+    }
+
     // --- Pipeline cache: load if present, fresh+empty otherwise --------
     // [Task 5 ambiguity resolution: an unreadable/corrupt cache file is a
     // logged warning, never fatal -- Vulkan itself guarantees
@@ -1565,6 +1721,8 @@ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device, 
     impl->forwardEntryModule = forwardEntry->module;
     impl->vertexEntryPoint = std::move(forwardEntry->vertexEntryPoint);
     impl->fragmentEntryPoint = std::move(forwardEntry->fragmentEntryPoint);
+    impl->energyCompOffModule = energyCompVariants->offModule;
+    impl->energyCompOnModule = energyCompVariants->onModule;
     impl->allocator = std::move(allocator);
     impl->uploader = std::move(uploader);
     impl->paramArena = std::move(paramArena);
@@ -1589,7 +1747,8 @@ MaterialHandle MaterialSystem::loadMaterial(const std::filesystem::path& slangMo
     std::string diagnostics;
     auto compiled = compileMaterial(impl.device, *impl.bindless, Slang::ComPtr<slang::ISession>(impl.session),
                                      impl.forwardEntryModule, impl.vertexEntryPoint.get(),
-                                     impl.fragmentEntryPoint.get(), slangModulePath, diagnostics);
+                                     impl.fragmentEntryPoint.get(), impl.energyCompOffModule, impl.energyCompOnModule,
+                                     slangModulePath, diagnostics);
     if (!compiled.has_value()) {
         RX_LOG_ERROR("rx_material: failed to load material '{}':\n{}", slangModulePath.string(), diagnostics);
         throw std::runtime_error("rx_material: failed to load material '" + slangModulePath.string() + "':\n" +
@@ -1612,6 +1771,9 @@ MaterialHandle MaterialSystem::loadMaterial(const std::filesystem::path& slangMo
     record.layoutBundle = std::move(compiled->layoutBundle);
     record.vertexModule = compiled->vertexModule;
     record.fragmentModule = compiled->fragmentModule;
+    record.vertexModuleOn = compiled->vertexModuleOn;
+    record.fragmentModuleOn = compiled->fragmentModuleOn;
+    record.hasEnergyCompensationVariant = compiled->hasEnergyCompensationVariant;
 
     std::error_code mtimeError;
     auto mtime = std::filesystem::last_write_time(slangModulePath, mtimeError);
@@ -1847,11 +2009,26 @@ void MaterialSystem::reloadChanged() {
             continue;
         }
 
+        // [Task 8] Reloaded fresh alongside forward_entry.slang above --
+        // same "fresh Compiler per reload" reasoning (this function's own
+        // header comment): `freshSession` cannot reuse `impl.session`'s
+        // already-loaded energy_compensation_{off,on}.slang modules.
+        std::string energyCompDiag;
+        auto freshEnergyCompVariants = loadEnergyCompVariants(freshSession, shaderDir, energyCompDiag);
+        if (!freshEnergyCompVariants.has_value()) {
+            RX_LOG_WARN("rx_material: reloadChanged: failed to reload energy_compensation_{{off,on}}.slang while "
+                        "reloading '{}'; keeping last-good:\n{}",
+                        record->path.string(), energyCompDiag);
+            continue;
+        }
+
         ++impl.compileCount;
         std::string diagnostics;
         auto compiled = compileMaterial(impl.device, *impl.bindless, freshSession, freshForwardEntry->module,
                                          freshForwardEntry->vertexEntryPoint.get(),
-                                         freshForwardEntry->fragmentEntryPoint.get(), record->path, diagnostics);
+                                         freshForwardEntry->fragmentEntryPoint.get(),
+                                         freshEnergyCompVariants->offModule, freshEnergyCompVariants->onModule,
+                                         record->path, diagnostics);
         if (!compiled.has_value()) {
             // Keep-last-good: `record` has not been touched at all past
             // `lastKnownMtime` above -- reload failure is not a caller
@@ -1903,6 +2080,17 @@ void MaterialSystem::reloadChanged() {
         if (record->fragmentModule != VK_NULL_HANDLE) {
             vkDestroyShaderModule(impl.device, record->fragmentModule, nullptr);
         }
+        // [Task 8] The energy-compensation-ON sibling pair, if this
+        // material has one -- same immediate-destroy reasoning as
+        // vertexModule/fragmentModule above (a VkShaderModule needs to
+        // outlive vkCreateGraphicsPipelines/command-buffer RECORDING, never
+        // GPU execution, so there is no in-flight hazard here).
+        if (record->vertexModuleOn != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(impl.device, record->vertexModuleOn, nullptr);
+        }
+        if (record->fragmentModuleOn != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(impl.device, record->fragmentModuleOn, nullptr);
+        }
 
         // --- Swap in the new compiled material, preserving path/
         // lastKnownMtime (already updated above).
@@ -1915,6 +2103,9 @@ void MaterialSystem::reloadChanged() {
         record->layoutBundle = std::move(compiled->layoutBundle);
         record->vertexModule = compiled->vertexModule;
         record->fragmentModule = compiled->fragmentModule;
+        record->vertexModuleOn = compiled->vertexModuleOn;
+        record->fragmentModuleOn = compiled->fragmentModuleOn;
+        record->hasEnergyCompensationVariant = compiled->hasEnergyCompensationVariant;
 
         RX_LOG_INFO("rx_material: hot-reload of '{}' succeeded (module hash {:#x} -> {:#x})", record->path.string(),
                     oldHash, record->contentHash);
@@ -1946,14 +2137,24 @@ VkPipeline MaterialSystem::getPipeline(const PipelineRequest& req) {
         return it->second;
     }
 
+    // [Task 8] Select this material's energy-compensation variant --
+    // record->hasEnergyCompensationVariant is false for every material
+    // besides standard_pbr.slang today, so this always falls back to the
+    // base pair for them regardless of req.specializationBits (see
+    // MaterialRecord::vertexModuleOn's own header comment).
+    bool wantsEnergyCompensationOn =
+        record->hasEnergyCompensationVariant && (req.specializationBits & kSpecializationEnergyCompensation) != 0;
+    VkShaderModule vertexModule = wantsEnergyCompensationOn ? record->vertexModuleOn : record->vertexModule;
+    VkShaderModule fragmentModule = wantsEnergyCompensationOn ? record->fragmentModuleOn : record->fragmentModule;
+
     // --- Build a new VkPipeline from this material's already-compiled  --
-    // --- SPIR-V (record->vertexModule/fragmentModule) and req.pass's   --
+    // --- SPIR-V (vertexModule/fragmentModule, above) and req.pass's    --
     // --- attachment shape. No Slang involvement at all past this point --
     // --- -- see detail::debugCompileCount()'s own comment.             --
     std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = record->vertexModule;
+    stages[0].module = vertexModule;
     // Slang's SPIR-V backend always names each entry point's OpEntryPoint
     // "main" regardless of source-level function name -- verified
     // directly for this exact multi-part-composite path before writing
@@ -1963,7 +2164,7 @@ VkPipeline MaterialSystem::getPipeline(const PipelineRequest& req) {
     stages[0].pName = "main";
     stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = record->fragmentModule;
+    stages[1].module = fragmentModule;
     stages[1].pName = "main";
 
     VertexInputState vertexInput = makeVertexInputState();

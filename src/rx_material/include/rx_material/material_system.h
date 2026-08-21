@@ -64,6 +64,25 @@ struct PipelineRequest {
     uint32_t specializationBits = 0;
 };
 
+// [Phase 5 Stage 1 Task 8, #44, gate rulings T7/T8] The FIRST real
+// `specializationBits` axis -- T2's own compute-pipeline work confirmed
+// this field was, until now, hardcoded to 0 at its one call site
+// (bindInstance()) and never varied, making it a dead field despite D8's
+// own "reserved for a future... bitmask" framing. This bit selects which
+// of `shaders/material/energy_compensation_{off,on}.slang` a material
+// declaring `extern struct EnergyComp : IEnergyCompensationFeature;`
+// (standard_pbr.slang) links against -- Task 7's own
+// `IEnergyCompensationFeature` link-time-composition mechanism
+// (brdf.slang, test_brdf_spirv_link_composition_gpu.cpp), extended here
+// into the real MaterialSystem::getPipeline() pipeline-variant cache key
+// (see material_system.cpp's own "energy-compensation variant" comment).
+// A material whose module does not declare that `extern` (every material
+// besides standard_pbr.slang today) ignores this bit entirely -- it
+// selects between two SPIR-V variants that are byte-identical for that
+// material, since neither `EnergyComp` export is ever referenced by its
+// code.
+inline constexpr uint32_t kSpecializationEnergyCompensation = 0x1u;
+
 // --- D28 (gate ruling RC1, 2026-08-18): the fixed-function pipeline-state
 // axis -----------------------------------------------------------------
 // glTF's `alphaMode`/`doubleSided` are `VkPipeline` FIXED-FUNCTION fields

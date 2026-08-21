@@ -1298,6 +1298,16 @@ bool setupHelmetMaterial(App& app, const rx::asset::MaterialAsset& asset) {
     ok = ok && setMaterialParam(blob, params, "normalScale", asset.normalScale);
     ok = ok && setMaterialParam(blob, params, "occlusionStrength", asset.occlusionStrength);
     ok = ok && setMaterialParam(blob, params, "alphaCutoff", appliedAlphaCutoff);
+    // [Phase 5 Stage 1 Task 8, #44] KHR_materials_ior/_specular's own
+    // glTF-spec-default neutral values -- see
+    // samples/08_gltf_viewer/main.cpp's own setupMaterials() and
+    // standard_pbr.slang's own computeDielectricF0F90() header comment for
+    // the full rationale (regression-guard: reproduces this sample's
+    // pre-Task-8 hardcoded-0.04 dielectric Fresnel byte-identically).
+    ok = ok && setMaterialParam(blob, params, "ior", 1.5F);
+    ok = ok && setMaterialParam(blob, params, "specularFactor", 1.0F);
+    ok = ok && setMaterialParam(blob, params, "specularColorFactorAndPad", std::array<float, 4>{1.0F, 1.0F, 1.0F, 0.0F});
+    ok = ok && setMaterialParam(blob, params, "dfgY", 1.0F);
     ok = ok && setMaterialParam(blob, params, "emissiveFactorAndPad", emissiveFactorAndPad);
     ok = ok && setMaterialParam(blob, params, "baseColorTexture",
                                 resolveTextureIndex(*app.textureCache, asset.baseColorTexture, rx::asset::TextureRole::BaseColor));
@@ -1458,6 +1468,13 @@ bool setupImportedMaterials(App& app, const rx::asset::Registry& registry, const
             ok = ok && setMaterialParam(blob, params, "normalScale", asset.normalScale);
             ok = ok && setMaterialParam(blob, params, "occlusionStrength", asset.occlusionStrength);
             ok = ok && setMaterialParam(blob, params, "alphaCutoff", appliedAlphaCutoff);
+            // [Phase 5 Stage 1 Task 8, #44] See setupHelmetMaterial()'s own
+            // identical three calls (this file, above) for the full
+            // rationale.
+            ok = ok && setMaterialParam(blob, params, "ior", 1.5F);
+            ok = ok && setMaterialParam(blob, params, "specularFactor", 1.0F);
+            ok = ok && setMaterialParam(blob, params, "specularColorFactorAndPad", std::array<float, 4>{1.0F, 1.0F, 1.0F, 0.0F});
+            ok = ok && setMaterialParam(blob, params, "dfgY", 1.0F);
             ok = ok && setMaterialParam(blob, params, "emissiveFactorAndPad", emissiveFactorAndPad);
             ok = ok && setMaterialParam(blob, params, "baseColorTexture",
                                         resolveTextureIndex(*app.textureCache, asset.baseColorTexture, rx::asset::TextureRole::BaseColor));

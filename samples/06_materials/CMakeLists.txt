@@ -65,6 +65,18 @@ add_dependencies(sample_06_materials sample_06_materials_own_deploy)
 set(RX_MATERIALS_SHARED_SHADERS
   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/material.slang"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/forward_entry.slang"
+  # [Phase 5 Stage 1 Task 8, #44] MaterialSystem::create() now loads these
+  # two unconditionally alongside material.slang/forward_entry.slang (the
+  # energy-compensation permutation axis -- see material_system.cpp's own
+  # "energy-compensation variant" comment) regardless of whether a given
+  # sample's own materials reference it: this sample's checker.slang/
+  # rim.slang never do, but create() itself still requires the files to
+  # exist in whatever sharedShaderDir it's pointed at, or it fails outright
+  # (this is what broke sample_06_materials_headless before this fix --
+  # revert-discrimination evidence recorded in task-08-report.md).
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/brdf.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/energy_compensation_off.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/energy_compensation_on.slang"
 )
 add_custom_command(
   OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/materials_shared_shader_deploy.stamp"

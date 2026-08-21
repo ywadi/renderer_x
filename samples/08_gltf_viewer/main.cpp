@@ -1135,6 +1135,28 @@ bool setupMaterials(App& app, const rx::asset::Registry& registry,
             ok = ok && setMaterialParam(binding.paramBlob, params, "normalScale", asset.normalScale);
             ok = ok && setMaterialParam(binding.paramBlob, params, "occlusionStrength", asset.occlusionStrength);
             ok = ok && setMaterialParam(binding.paramBlob, params, "alphaCutoff", appliedAlphaCutoff);
+            // [Phase 5 Stage 1 Task 8, #44] KHR_materials_ior/_specular's
+            // own glTF-spec-default neutral values -- see
+            // standard_pbr.slang's own computeDielectricF0F90() header
+            // comment for the regression-guard proof that these reproduce
+            // this sample's pre-Task-8 hardcoded-0.04 dielectric Fresnel
+            // byte-identically. [Gate ruling RC3] Neither extension is
+            // parsed from glTF content by the importer yet (T21/T23's own
+            // scope), so every material here binds the neutral default
+            // regardless of what the source asset actually specifies --
+            // non-default real-asset values arrive once those tasks land.
+            ok = ok && setMaterialParam(binding.paramBlob, params, "ior", 1.5F);
+            ok = ok && setMaterialParam(binding.paramBlob, params, "specularFactor", 1.0F);
+            ok = ok && setMaterialParam(binding.paramBlob, params, "specularColorFactorAndPad",
+                                        std::array<float, 4>{1.0F, 1.0F, 1.0F, 0.0F});
+            // [Phase 5 Stage 1 Task 8, #44] Energy-compensation's own dfgY
+            // input -- 1.0 is the honest "no correction" neutral value
+            // (StandardPbrParams::dfgY's own header comment); this sample's
+            // own D27 pipeline pre-resolution call below always requests
+            // specializationBits=0 (the energy-compensation-OFF variant,
+            // which never reads this field), pending Task 9's real
+            // per-pixel DFG-LUT source.
+            ok = ok && setMaterialParam(binding.paramBlob, params, "dfgY", 1.0F);
             ok = ok && setMaterialParam(binding.paramBlob, params, "emissiveFactorAndPad", emissiveFactorAndPad);
             ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorTexture",
                                         resolveTextureIndex(*app.textureCache, asset.baseColorTexture,
