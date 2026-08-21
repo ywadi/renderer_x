@@ -108,6 +108,15 @@ public float V_SmithGGXCorrelated(float alpha, float NoV, float NoL) {
 // overload below reduces to. Two overloads, matching Filament's own split:
 // vec3 f0 (the real per-material call shape) and scalar f0 (Fd_Burley's
 // own call shape below, which always passes f0=1.0).
+//
+// DISCLOSED DEVIATION [review round]: all three F_Schlick overloads below
+// clamp `1.0 - VoH` to [0,1] before pow5, unlike Filament's own pinned
+// `pow5(1.0 - VoH)` (unclamped) -- inherited from standard_pbr.slang's own
+// pre-T7 inline convention (`pow(clamp(1.0 - VdotH, 0.0, 1.0), 5.0)`), not
+// reinvented here. Provably a no-op at every call site in this codebase:
+// VoH is always pre-saturated to [0,1] before reaching these functions
+// (every caller computes it via `saturate(dot(...))`/`clamp(...)`), so
+// `1.0 - VoH` is already in [0,1] and the clamp never fires.
 public float3 F_Schlick(float3 f0, float f90, float VoH) {
     float p5 = pow(clamp(1.0 - VoH, 0.0, 1.0), 5.0);
     return f0 + (float3(f90, f90, f90) - f0) * p5;
@@ -123,7 +132,8 @@ public float F_Schlick(float f0, float f90, float VoH) {
 // the EXACT form standard_pbr.slang's own pre-T7 inline Fresnel already
 // shipped -- kept here, named and tested, as a real, cheap fallback tier
 // (e.g. a future Deck-floor low-quality path), per the gate matrix's Open
-// Question recommendation.
+// Question recommendation. Also clamps before pow5 -- see the disclosed
+// deviation note on the F_Schlick(float3,float,float) overload above.
 public float3 F_Schlick(float3 f0, float VoH) {
     float f = pow(clamp(1.0 - VoH, 0.0, 1.0), 5.0);
     return float3(f, f, f) + f0 * (1.0 - f);
@@ -201,7 +211,7 @@ public float Fd_Burley(float alpha, float NoV, float NoL, float LoH) {
 // module close standalone, per the ticket's own "modules compile
 // standalone" acceptance line.
 //
-// MULTIPLICATIVE CONTRACT [surface_shading_model_standard.fs:135, `color =
+// MULTIPLICATIVE CONTRACT [surface_shading_model_standard.fs:128, `color =
 // Fd + Fr * pixel.energyCompensation`]: the caller multiplies this
 // function's result into the SPECULAR lobe's response only (`Fr`), never
 // the diffuse lobe (`Fd`) -- this function does not perform that multiply
