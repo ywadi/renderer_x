@@ -137,7 +137,8 @@ function(rx_assert_target_excludes_dependency TARGET_NAME FORBIDDEN)
   if(_rx_found)
     message(FATAL_ERROR
       "[dependency-boundary-check] '${TARGET_NAME}' transitively depends on something matching "
-      "'${FORBIDDEN}' -- this violates the core-libraries-stay-ImGui-free hard boundary (spec D20, gate "
-      "ruling #16). Dependency chain: ${_rx_chain}")
+      "'${FORBIDDEN}' -- this violates a core-library dependency boundary (see the "
+      "rx_assert_target_excludes_dependency(${TARGET_NAME} ${FORBIDDEN}) call site in the root "
+      "CMakeLists.txt for which boundary and its rationale). Dependency chain: ${_rx_chain}")
   endif()
 endfunction()

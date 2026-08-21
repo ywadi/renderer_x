@@ -141,6 +141,38 @@ foreach(_rx_core_target rx_core rx_rhi_vk rx_graph rx_material rx_platform rx_ta
     rx_assert_target_excludes_dependency(${_rx_core_target} imgui)
 endforeach()
 
+# Second configure-time link-boundary check [Phase 5 Task 5, ticket #41,
+# review round Medium finding #1] -- mirrors the imgui check immediately
+# above exactly, same core-target list, same mechanism
+# (cmake/DependencyBoundaryCheck.cmake): every rx_* CORE library defined
+# above (deliberately excludes rx_frame_loop itself, which is SUPPOSED to
+# depend on rx_platform/rx_rhi_vk/rx_graph, and excludes rx_debug_ui/
+# samples/tools, which are hosts or peers, not core libraries) must not
+# transitively link rx_frame_loop -- the "core libraries stay free of the
+# optional runner-convenience module" boundary rx_frame_loop's own header
+# comment already states in prose (present_loop.h: "rx_graph/rx_rhi_vk/
+# rx_platform themselves gain NO new dependency ... from this module's
+# existence") is now configure-enforced, not merely documented. Proven
+# load-bearing this round exactly like Task 21's own imgui check was: a
+# violation (`target_link_libraries(rx_material PUBLIC rx_frame_loop)`,
+# injected temporarily immediately after `add_subdirectory(src/
+# rx_material)` above) was configured, observed to FATAL_ERROR with the
+# expected "rx_material -> rx_frame_loop" dependency-chain message, then
+# removed -- see task-05-report.md, which also records a first injection
+# attempt via rx_platform that hit the walk's own recursion-depth guard
+# instead (`_rx_dep_closure_contains`'s documented non-deduplicated design,
+# cmake/DependencyBoundaryCheck.cmake:28-44): rx_platform is one of
+# rx_frame_loop's OWN dependencies, so that injection created a genuine
+# rx_platform->rx_frame_loop->rx_platform cycle the walk is not designed to
+# short-circuit -- not a bug in the check as applied to this project's real
+# (acyclic) target graph, but a real usability note for a future user
+# picking an injection target to re-run this same proof: pick a target
+# rx_frame_loop does NOT itself depend on (rx_material/rx_task/rx_shader/
+# rx_asset/rx_scene), not one of rx_platform/rx_rhi_vk/rx_graph/rx_core.
+foreach(_rx_core_target rx_core rx_rhi_vk rx_graph rx_material rx_platform rx_task rx_shader rx_asset rx_scene)
+    rx_assert_target_excludes_dependency(${_rx_core_target} rx_frame_loop)
+endforeach()
+
 add_subdirectory(tools/dep_cache_smoketest)
 add_subdirectory(tools/toolchain_check)
 # Phase 4 Stage 1 Task 13: host-only fixture regenerator (assets/test/
