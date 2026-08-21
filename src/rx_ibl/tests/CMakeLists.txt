@@ -14,6 +14,11 @@ add_executable(rx_ibl_gpu_tests
     # committed HDR fixtures)"] real Task 6 decodeStbImageHdr() path ->
     # bake, using data/uniform_test_env.hdr.
     test_ibl_hdr_fixture_gpu.cpp
+    # [review round, task-09-review.md Verdict 1] the plan/ticket's own
+    # SECOND required analytic-ground-truth proof ("directional impulse
+    # -> known lobe") -- see this file's own header comment for the
+    # OR-mischaracterization this closes.
+    test_ibl_directional_impulse_gpu.cpp
 )
 target_link_libraries(rx_ibl_gpu_tests PRIVATE rx_ibl rx_rhi_vk rx_platform rx_shader rx_asset doctest::doctest)
 rx_shader_deploy_runtime_libs(rx_ibl_gpu_tests)

@@ -16,6 +16,7 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <system_error>
 #include <vector>
 
 namespace rx::ibl {
@@ -367,7 +368,7 @@ std::optional<BakeResult> bakeEnvironment(rx::rhi::Device& device, rx::rhi::Allo
                                             rx::rhi::CommandContext& cmdCtx, rx::task::Scheduler& scheduler,
                                             const rx::rhi::Texture2D& source, bool sourceIsCube,
                                             const std::filesystem::path& shaderDir, const BakeParams& params,
-                                            BakeTimings* outTimings) {
+                                            BakeTimings* outTimings, const std::string& cacheNamespace) {
     RX_ZONE_NAMED("rx_ibl: bakeEnvironment");
     const auto totalStart = std::chrono::steady_clock::now();
     BakeTimings timings;
@@ -381,8 +382,15 @@ std::optional<BakeResult> bakeEnvironment(rx::rhi::Device& device, rx::rhi::Allo
         return std::nullopt;
     }
 
-    auto pipelineCache =
-        rx::rhi::ComputePipelineCache::create(vkDevice, std::filesystem::temp_directory_path() / "rx_ibl_bake.cache");
+    // [review round, LOW finding 3] Namespaced by `cacheNamespace` --
+    // see bake.h's own header comment on that parameter for why (a
+    // single shared, unnamespaced /tmp file was a mild concurrent-
+    // caller robustness gap, not a correctness bug).
+    const std::filesystem::path pipelineCacheDir = std::filesystem::temp_directory_path() / "rx_ibl";
+    std::error_code cacheDirEc;
+    std::filesystem::create_directories(pipelineCacheDir, cacheDirEc);
+    auto pipelineCache = rx::rhi::ComputePipelineCache::create(
+        vkDevice, pipelineCacheDir / (cacheNamespace + ".pipeline_cache"));
     if (!pipelineCache.has_value()) {
         RX_LOG_ERROR("rx_ibl: failed to create ComputePipelineCache");
         return std::nullopt;

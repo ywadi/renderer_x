@@ -88,7 +88,7 @@ TEST_CASE("IBL Task 9: real Task 6 HDR decode path (rx::asset::decodeStbImageHdr
     params.dfgSamples = 256;
 
     auto result = rx::ibl::bakeEnvironment(fx->device, fx->allocator, *fx->cmdCtx, *fx->scheduler, *source, false,
-                                             RX_IBL_SHADER_DIR, params);
+                                             RX_IBL_SHADER_DIR, params, nullptr, "test_hdr_fixture");
     REQUIRE(result.has_value());
 
     constexpr double kEps = 0.02;

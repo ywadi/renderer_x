@@ -225,7 +225,7 @@ TEST_CASE("IBL Task 9: energy-compensation activation -- production energyCompen
     params.dfgSamples = 2048;  // generous -- roughest-row Ess needs to be a real, low-noise number here.
 
     auto result = rx::ibl::bakeEnvironment(fx->device, fx->allocator, *fx->cmdCtx, *fx->scheduler, *source, true,
-                                             RX_IBL_SHADER_DIR, params);
+                                             RX_IBL_SHADER_DIR, params, nullptr, "test_energy_compensation");
     REQUIRE(result.has_value());
 
     // Roughest row (y=0, linearRoughness~1.0), a mid/high NoV column

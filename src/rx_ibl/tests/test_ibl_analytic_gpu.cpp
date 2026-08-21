@@ -123,7 +123,7 @@ TEST_CASE("IBL Task 9: uniform environment bakes to EXACT irradiance/prefilter c
     params.dfgSamples = 256;
 
     auto result = rx::ibl::bakeEnvironment(fx->device, fx->allocator, *fx->cmdCtx, *fx->scheduler, *source, false,
-                                             RX_IBL_SHADER_DIR, params);
+                                             RX_IBL_SHADER_DIR, params, nullptr, "test_analytic_uniform");
     REQUIRE(result.has_value());
 
     constexpr double kEps = 0.02;  // fp16-storage + bilinear-resample tolerance -- NOT a Monte-Carlo tolerance
@@ -201,7 +201,7 @@ TEST_CASE("IBL Task 9: DFG LUT closed-form limit at the smoothest row -- dfgY->1
     params.dfgSamples = 4096;
 
     auto result = rx::ibl::bakeEnvironment(fx->device, fx->allocator, *fx->cmdCtx, *fx->scheduler, *source, true,
-                                             RX_IBL_SHADER_DIR, params);
+                                             RX_IBL_SHADER_DIR, params, nullptr, "test_analytic_dfg");
     REQUIRE(result.has_value());
 
     const uint32_t smoothestRow = params.dfgLutSize - 1;
@@ -251,7 +251,7 @@ TEST_CASE("IBL Task 9: mip-0 exactly matches source (passthrough) AND prefiltere
     params.dfgSamples = 64;
 
     auto result = rx::ibl::bakeEnvironment(fx->device, fx->allocator, *fx->cmdCtx, *fx->scheduler, *source, true,
-                                             RX_IBL_SHADER_DIR, params);
+                                             RX_IBL_SHADER_DIR, params, nullptr, "test_analytic_monotonicity");
     REQUIRE(result.has_value());
 
     // --- mip-0 ~= source (CubemapIBL.cpp's own linearRoughness==0

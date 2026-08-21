@@ -35,6 +35,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <string>
 
 namespace rx::rhi {
 class Device;
@@ -117,10 +118,27 @@ struct BakeTimings {
     double totalMs = 0.0;
 };
 
-// Runs the full bake chain as a SINGLE render-graph compute-pass graph
-// (one compile()+realize()+execute() call, one command-buffer submission)
-// -- per this phase's own binding "compute passes through the graph's
-// compute-class machinery, no hand-rolled dispatch" global constraint.
+// Runs the full bake chain as FOUR SEPARATE single-purpose render-graph
+// compute-pass graphs -- base cubemap (equirect projection OR, when
+// `sourceIsCube`, a compute passthrough -- see below), irradiance,
+// prefiltered specular, DFG LUT -- each its own compile()+realize()+
+// execute() call and its own one-shot command-buffer submission
+// (`CommandContext::runOnce()`), run back to back. NOT one graph/one
+// submission (an earlier design intent this doc comment used to
+// describe, before implementation found it structurally blocked): the
+// render graph's own subresource validator only accepts IDENTICAL-or-
+// DISJOINT declared ranges for one resource, and `baseCubemap`'s 6
+// disjoint per-face writer passes cannot coexist in the SAME graph as a
+// later whole-resource read of it -- see bake.cpp's own "Design
+// decision: four graphs, not one" comment (and task-09-report.md) for
+// the full reasoning. Every stage still runs exclusively through Task
+// 2's compute-class Pass API (`addStorageImageOutput`/`Executor::
+// execute()`) -- per this phase's own binding "compute passes through
+// the graph's compute-class machinery, no hand-rolled dispatch" global
+// constraint -- this comment's correction is about GRAPH COUNT, not
+// about that constraint being relaxed. A caller reasoning about
+// synchronization/timing (Task 10) should assume four independent
+// GPU-idle points, not one.
 //
 // `source`: either an equirect-projection 2D texture (`sourceIsCube ==
 // false` -- Task 6's own HDR equirect loader output, R16G16B16A16_SFLOAT
@@ -128,16 +146,41 @@ struct BakeTimings {
 // format-polymorphic `Texture2D<float4>` sampled read and accepts any
 // float-interpretable sampled format) OR an already-baked/loaded cubemap
 // (`sourceIsCube == true` -- e.g. Task 6's own KTX2-cube loader output,
-// `Texture2D::isCube() == true`) -- when true, the equirect->cubemap
-// stage is skipped entirely and `source` is copied directly into
-// `BakeResult::baseCubemap` (a plain `vkCmdCopyImage`, not a compute
-// pass -- there is no projection math to run at all in this case).
+// `Texture2D::isCube() == true`). EITHER WAY, `BakeResult::baseCubemap`
+// is populated by a per-face COMPUTE PASS (never a raw `vkCmdCopyImage`
+// from `source` directly -- that was tried and found broken for two
+// independent reasons: format compatibility, since `source` need not
+// share this bake's own `kCubeFormat`, and an undocumented
+// `VK_IMAGE_USAGE_TRANSFER_SRC_BIT` precondition Task 6's own loader
+// output does not carry either; see task-09-report.md's "Bugs found and
+// fixed" #4). The `sourceIsCube` compute pass is the SAME `prefilterKernel`
+// used by the prefiltered-specular stage, dispatched at its own
+// `linearRoughness == 0` literal-passthrough special case -- a format-
+// agnostic `TextureCube` sampled resample, not a projection.
 //
 // `shaderDir`: the directory containing this module's own
 // shaders/ibl/*.slang kernels (mirrors rx_material::MaterialSystem::
 // create()'s own `sharedShaderDir` parameter shape) -- the real caller's
 // default is `RX_IBL_SHADER_DIR` (baked in by CMakeLists.txt, same
 // convention as RX_MATERIAL_SHADER_DIR).
+//
+// `cacheNamespace` [review round, LOW finding 3]: names this call's own
+// `rx::rhi::ComputePipelineCache` disk-persisted file --
+// `<temp_directory>/rx_ibl/<cacheNamespace>.pipeline_cache` -- distinct
+// callers/purposes should pass DISTINCT, STABLE names (this module's own
+// tests each use their own TEST_CASE-specific namespace; the bench tool
+// uses its own). Vulkan's own per-entry vendor/device/pipelineCacheUUID
+// header already makes ONE file safe to share across different physical
+// devices/drivers (confirmed empirically this round -- lavapipe and
+// NVIDIA runs interleave against the same file with zero corruption),
+// so this parameter is not a correctness requirement; it exists so
+// unrelated callers/purposes (this module's own several GPU test
+// binaries' TEST_CASEs, ctest's own default parallel execution, a
+// future Task 10 production caller running alongside this module's own
+// tests) do not contend for ONE shared, unnamespaced `/tmp` file, which
+// a prior round left as a mild robustness gap. Defaults to "default" --
+// matches this parameter's absence before this round, for any caller
+// that doesn't yet care.
 //
 // Main-thread-only (D5) -- builds/dispatches real Vulkan pipeline/compute
 // objects, same convention as every other rx_rhi_vk/rx_graph factory.
@@ -147,6 +190,7 @@ std::optional<BakeResult> bakeEnvironment(rx::rhi::Device& device, rx::rhi::Allo
                                             rx::rhi::CommandContext& cmdCtx, rx::task::Scheduler& scheduler,
                                             const rx::rhi::Texture2D& source, bool sourceIsCube,
                                             const std::filesystem::path& shaderDir, const BakeParams& params = {},
-                                            BakeTimings* outTimings = nullptr);
+                                            BakeTimings* outTimings = nullptr,
+                                            const std::string& cacheNamespace = "default");
 
 }  // namespace rx::ibl

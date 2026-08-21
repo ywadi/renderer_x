@@ -19,12 +19,19 @@
 //     own direction, matching the ticket's own "mip-0 ~= source"
 //     acceptance line by construction, not by approximation.
 //   - linearRoughness > 0 (:344-465): hemisphereImportanceSampleDggx()
-//     (:50-57) + DistributionGGX() (:140-145) + the accumulate-then-
-//     normalize-by-weight structure (:397-411, `entry.brdf_NoL *= 1/weight`)
-//     ported as an ONLINE running sum (accumulate numerator AND weight,
-//     divide once at the end) -- algebraically identical to the CPU
-//     original's two-pass cache-then-normalize structure, just without
-//     the intermediate CacheEntry vector a GPU kernel has no use for.
+//     (:50-57) + the accumulate-then-normalize-by-weight structure
+//     (:397-411, `entry.brdf_NoL *= 1/weight`) ported as an ONLINE
+//     running sum (accumulate numerator AND weight, divide once at the
+//     end) -- algebraically identical to the CPU original's two-pass
+//     cache-then-normalize structure, just without the intermediate
+//     CacheEntry vector a GPU kernel has no use for. `DistributionGGX()`
+//     (:140-145) is NOT ported into this file -- the CPU original calls
+//     it only to compute `pdf`/`omegaS`, inputs to the mip-LOD-biasing
+//     math (selecting which SOURCE MIP an importance sample reads from,
+//     CubemapIBL.cpp:389-395) -- this port drops that entire mechanism
+//     (simplification 1 below), so nothing in this file ever needs the
+//     GGX NDF value itself, only the importance-sampled DIRECTION
+//     hemisphereImportanceSampleDggx() already produces.
 //     `V = N` (isotropic, view-independent prefiltering -- the standard
 //     assumption every real-time prefiltered-environment method makes,
 //     including this exact CPU original's own tangent-space derivation,

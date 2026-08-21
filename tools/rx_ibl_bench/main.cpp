@@ -170,7 +170,7 @@ int main(int argc, char** argv) {
 
     rx::ibl::BakeTimings timings;
     auto result = rx::ibl::bakeEnvironment(*device, *allocator, *cmdCtx, *scheduler, *source, /*sourceIsCube=*/false,
-                                             shaderDir, params, &timings);
+                                             shaderDir, params, &timings, "bench");
     if (!result.has_value()) {
         std::fprintf(stderr, "rx_ibl_bench: bakeEnvironment failed\n");
         return 1;
