@@ -1,13 +1,18 @@
 // samples/09_scene/tests/test_mouse_capture_focus_composition.cpp -- proves
 // Issue #33's requirement 1 explicitly: "confirm re-arm on focus-gain
-// composes with your toggle state". Unlike test_mouse_capture.cpp (fully
-// SDL/Window-free, proving the pure state machine in isolation), THIS file
-// deliberately links a real rx::platform::Window (headless/hidden, no
-// VkDevice needed -- same "Window::create/destroy lifecycle succeeds under
-// any video driver" posture src/rx_platform/tests/window_test.cpp's own
-// first TEST_CASE already establishes) and drives it through the EXACT
-// call sequence runPresent() (main.cpp) uses:
-//   1. rx::samples9::FlyThroughCaptureState's own toggle methods change
+// composes with your toggle state". [Phase 5 Task 5, ticket #41 row 3]
+// Drives the ENGINE-OWNED rx::platform::MouseCaptureToggle (promoted from
+// this sample's own former mouse_capture.h) through this SAMPLE's own
+// composition logic -- this file's own scope is proving runPresent()'s own
+// "apply the transition to the real Window" call sequence, not the toggle
+// primitive itself (that is src/rx_platform/tests/test_mouse_capture_toggle.cpp's
+// job now). Unlike that device-free suite, THIS file deliberately links a
+// real rx::platform::Window (headless/hidden, no VkDevice needed -- same
+// "Window::create/destroy lifecycle succeeds under any video driver"
+// posture src/rx_platform/tests/window_test.cpp's own first TEST_CASE
+// already establishes) and drives it through the EXACT call sequence
+// runPresent() (main.cpp) uses:
+//   1. rx::platform::MouseCaptureToggle's own toggle methods change
 //      captured() intent (Esc / click-to-recapture) -- pure, no Window.
 //   2. main.cpp applies that transition to the real Window with
 //      `window.setRelativeMouseMode(state.captured())`, ONLY when
@@ -25,13 +30,13 @@
 // toggle state, not a stale one -- e.g. releasing via Esc and THEN
 // alt-tabbing away and back must NOT silently re-engage capture the app no
 // longer wants.
-#include "../mouse_capture.h"
+#include <rx_platform/mouse_capture_toggle.h>
 
 #include <doctest/doctest.h>
 #include <rx_platform/window.h>
 #include <SDL3/SDL.h>
 
-using rx::samples9::FlyThroughCaptureState;
+using rx::platform::MouseCaptureToggle;
 
 namespace {
 
@@ -40,7 +45,7 @@ namespace {
 // "[Issue #33] Apply exactly one real Window transition per frame" comment.
 // Pulled out here so this test file states the exact contract once instead
 // of inlining it at every call site below.
-void applyCaptureTransition(rx::platform::Window& window, const FlyThroughCaptureState& state, bool capturedBefore) {
+void applyCaptureTransition(rx::platform::Window& window, const MouseCaptureToggle& state, bool capturedBefore) {
     if (state.captured() != capturedBefore) {
         window.setRelativeMouseMode(state.captured());
     }
@@ -67,7 +72,7 @@ TEST_CASE("Issue #33 composition: releasing via Esc clears relativeMouseModeWant
     const SDL_WindowID windowId = SDL_GetWindowID(window->sdlWindow());
     window->pumpEvents();
 
-    FlyThroughCaptureState state;  // captured by default.
+    MouseCaptureToggle state;  // captured by default.
     // runPresent()'s own startup call (main.cpp, "[Issue #33] Engage the
     // platform relative-mouse-capture facility") is UNCONDITIONAL, not
     // gated through applyCaptureTransition()'s "only on change" guard
@@ -102,7 +107,7 @@ TEST_CASE("Issue #33 composition: recapturing (click or Esc) sets relativeMouseM
     const SDL_WindowID windowId = SDL_GetWindowID(window->sdlWindow());
     window->pumpEvents();
 
-    FlyThroughCaptureState state;
+    MouseCaptureToggle state;
     window->setRelativeMouseMode(state.captured());  // runPresent()'s own unconditional startup engagement.
     REQUIRE(window->relativeMouseModeWanted());
 
@@ -140,7 +145,7 @@ TEST_CASE("Issue #33 composition: a steady-state frame where captured() did NOT 
     const SDL_WindowID windowId = SDL_GetWindowID(window->sdlWindow());
     window->pumpEvents();
 
-    FlyThroughCaptureState state;
+    MouseCaptureToggle state;
     window->setRelativeMouseMode(state.captured());  // runPresent()'s own unconditional startup engagement.
     REQUIRE(window->relativeMouseModeWanted());
 

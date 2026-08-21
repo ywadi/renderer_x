@@ -2,9 +2,14 @@
 # (add_subdirectory'd before this directory) -- same cross-directory
 # function-name visibility every other sample's own CMakeLists.txt relies on.
 
-add_executable(sample_09_scene main.cpp draw_recording.cpp)
+# [Phase 5 Task 5, ticket #41] draw_recording.{h,cpp}/fly_camera.h/
+# mouse_capture.h/window_resize.h are GONE -- promoted engine-side (rows
+# 1-2, 3, 4, 6, 7 of the gate matrix); rx_frame_loop is the new shared
+# present-loop helper. grid_layout.h alone stays sample-local (row 5
+# ruling).
+add_executable(sample_09_scene main.cpp)
 target_link_libraries(sample_09_scene PRIVATE
-    rx_graph rx_rhi_vk rx_platform rx_material rx_asset rx_scene rx_shadow rx_debug_ui rx_task rx_shader sample_common
+    rx_graph rx_rhi_vk rx_platform rx_material rx_asset rx_scene rx_shadow rx_debug_ui rx_task rx_shader rx_frame_loop sample_common
 )
 
 # RX_REPO_ROOT_DIR: same "bake an absolute CMAKE_SOURCE_DIR-relative path at
