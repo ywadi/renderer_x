@@ -333,3 +333,115 @@ promotion.
 7. `d9466fd` — perf(rx_scene): zero-alloc splitByBlockAndGroup/resolveDrawGroups (#41)
 8. `2f84947` — refactor(samples): migrate 01-08 to rx::frame_loop::PresentLoop (#41)
 9. `4d5caeb` — refactor(samples/09_scene): migrate to PresentLoop, consume all promoted primitives (#41)
+10. `4283286` — chore: p5 task 5 SDD report
+11. `d23a047` — build(cmake): configure-enforce rx_frame_loop absence from core targets (#41)
+12. `e8e1875` — test(rx_frame_loop): regression-test the pre-lost-Device short-circuit (#41)
+
+## Review round addendum (2 Medium findings, both closed in-round)
+
+Verdict: spec PASS, Approved, 2 Mediums. Both closed this round; see
+`task-05-review.md` for the full review.
+
+**Medium #1 — the Task-21 CMake configure-time link-boundary check was
+never extended to `rx_frame_loop`.** Link closure was already clean, but
+nothing FAILED configure if a core target ever started linking it.
+Fixed by mirroring the existing `imgui` boundary check exactly (same
+core-target list, same `rx_assert_target_excludes_dependency()`
+mechanism, `CMakeLists.txt`) and generalizing that function's own
+FATAL_ERROR message, which had hardcoded "core-libraries-stay-ImGui-free"
+regardless of which forbidden dependency actually triggered it
+(`cmake/DependencyBoundaryCheck.cmake`).
+
+Proven load-bearing, exactly like Task 21's own imgui check was proven:
+```
+$ # injected: target_link_libraries(rx_material PUBLIC rx_frame_loop), right after
+$ # rx_material's add_subdirectory in CMakeLists.txt
+$ cmake .
+...
+CMake Error at cmake/DependencyBoundaryCheck.cmake:138 (message):
+  [dependency-boundary-check] 'rx_material' transitively depends on something
+  matching 'rx_frame_loop' -- this violates a core-library dependency
+  boundary (see the rx_assert_target_excludes_dependency(rx_material
+  rx_frame_loop) call site in the root CMakeLists.txt for which boundary and
+  its rationale).  Dependency chain: rx_material -> rx_frame_loop
+```
+Injection removed, reconfigured clean (`-- Configuring done` /
+`-- Generating done`, no errors). One real finding surfaced while
+picking the injection target: a first attempt via `rx_platform`
+(`target_link_libraries(rx_platform PUBLIC rx_frame_loop)`) did NOT
+produce the expected FATAL_ERROR — it hit the dependency-closure walk's
+own recursion-depth guard instead (`_rx_dep_closure_contains`'s
+documented non-visited-set-deduplicated design,
+`DependencyBoundaryCheck.cmake:28-44`), because `rx_platform` is one of
+`rx_frame_loop`'s OWN dependencies, so that injection created a genuine
+`rx_platform -> rx_frame_loop -> rx_platform` cycle the walk is not
+designed to short-circuit. Not a bug against this project's real
+(acyclic) target graph — recorded as an in-code usability note
+(`CMakeLists.txt`'s own comment on the new check) for picking a future
+injection target: use a core target `rx_frame_loop` does NOT itself
+depend on (`rx_material`/`rx_task`/`rx_shader`/`rx_asset`/`rx_scene`),
+not one of `rx_platform`/`rx_rhi_vk`/`rx_graph`/`rx_core`.
+
+**Medium #2 — matrix row 9's literal regression-test artifact was
+missing.** Row 9's own acceptance criterion: "a targeted regression test
+constructs a Device already in the surface-lost state and asserts the
+helper's very first `acquireNextImage()` call is handled without falling
+through to frame recording." Closed via a new
+`rx::rhi::detail::forceSurfaceLostForTesting(Device&)` test-only friend
+seam (`device.h`/`.cpp`, mirroring the `detail::debugSlotBufferData()`/
+`debugFrameBufferData()` convention already used elsewhere this task) —
+the real end-to-end path (a genuinely destroyed native window) is
+MANUAL_VERIFICATION-only per `surface_loss_test.cpp`'s own header
+comment (no CI driver/display backend this repo's fixtures use can
+destroy a live window out from under a running process), so this is the
+GPU-under-lavapipe fallback tier the review comment itself anticipated.
+
+New `present_loop_gpu_test.cpp` TEST_CASE forces a real `Device`
+surface-lost BEFORE `PresentLoop`'s own first `runFrame()` call (an
+ordering `PresentLoop::surfaceLost_`'s own top-of-function guard does
+NOT catch, since it has never itself observed a loss yet — the actual
+catching branch is the acquire-status check inside `runFrame()`) and
+asserts: `Result::SurfaceLost` returned, `frameBody` never invoked,
+`Device::acquireCallCount()` unchanged (Device's own
+`surfaceLost_`-short-circuit in `acquireNextImage()` deliberately never
+increments it — the same call-count contract Task 17's Suspended-path
+tests already rely on), and `loop->isSurfaceLost()` latches true
+afterward. Result: `rx_frame_loop_gpu_tests` 8/8 cases (up from 7),
+117/117 assertions (up from 106), zero unfiltered validation errors.
+
+Revert-proved: temporarily disabled `runFrame()`'s
+`acquire.status == SwapchainStatus::SurfaceLost` branch
+(`present_loop.cpp`), rebuilt, ran the new test standalone. It did not
+merely fail an assertion — it produced a genuine, UNFILTERED Vulkan
+validation error and then hung (had to be `SIGKILL`ed):
+```
+[error] [vulkan validation] Validation Error: [ VUID-vkQueueSubmit-pWaitSemaphores-03238 ]
+  ... Queue ... is waiting on semaphore (VkSemaphore ...) that has no way to be signaled.
+```
+— because with the short-circuit removed, `runFrame()` falls through to
+`vkQueueSubmit` waiting on `frameSync_->currentImageAvailableSemaphore()`,
+which `Device::acquireNextImage()`'s OWN (untouched) `surfaceLost_`
+short-circuit never actually submitted for signaling (no real
+`vkAcquireNextImageKHR` ran) — a genuine, reproduced GPU deadlock, the
+exact hazard the disabled branch exists to prevent. Reverted
+(`git diff` against the committed version was empty), rebuilt,
+`rx_frame_loop_gpu_tests`: 8/8 cases, 117/117 assertions pass again.
+
+**Verification after both fixes:** full project rebuild clean on both
+presets; `rx_rhi_vk_tests`/`rx_frame_loop_tests`/`rx_frame_loop_gpu_tests`
+(the touched suites) green under lavapipe; full serial lavapipe ctest:
+```
+$ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json DISPLAY=:1 ctest --output-on-failure -j1
+...
+100% tests passed, 0 tests failed out of 31
+Total Test time (real) = 132.80 sec
+```
+windows-cross-zig: clean configure + full build (87/87 targets,
+including the new `rx_frame_loop_gpu_tests.exe`), plus `rx_rhi_vk_tests`/
+`rx_frame_loop_tests` (the touched device-free/GPU-boundary suites) run
+green under Wine.
+
+07_stress's WM-close-trial latency (17s from `xdotool windowclose` to
+the Issue #73 log sequence, noted separately by the coordinator) is
+ruled a pre-existing `device.cpp` characteristic outside this diff — a
+watch item, not addressed in this round.
