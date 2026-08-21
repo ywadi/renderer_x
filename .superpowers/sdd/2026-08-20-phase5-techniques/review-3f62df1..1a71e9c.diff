@@ -1,0 +1,1259 @@
+1a71e9c fix(rx_material,samples): correct split-sum specular DFG formula (T10 fix round)
+
+ samples/08_gltf_viewer/references/loaded_scene.png | Bin 24915 -> 26230 bytes
+ samples/09_scene/CMakeLists.txt                    |  53 +++-
+ samples/09_scene/main.cpp                          | 337 ++++++++++++++++++++-
+ samples/09_scene/references/grid_scene.png         | Bin 10023 -> 11825 bytes
+ shaders/material/brdf.slang                        |  62 ++--
+ shaders/material/standard_pbr.slang                |   5 +-
+ .../tests/test_standard_pbr_ibl_gpu.cpp            | 159 ++++++++--
+ src/rx_material/tests/test_standard_pbr_unlit.cpp  |  30 +-
+ 8 files changed, 566 insertions(+), 80 deletions(-)
+
+diff --git a/samples/08_gltf_viewer/references/loaded_scene.png b/samples/08_gltf_viewer/references/loaded_scene.png
+index 3e68d3c..46742f0 100644
+Binary files a/samples/08_gltf_viewer/references/loaded_scene.png and b/samples/08_gltf_viewer/references/loaded_scene.png differ
+diff --git a/samples/09_scene/CMakeLists.txt b/samples/09_scene/CMakeLists.txt
+index 08f1488..ed99043 100644
+--- a/samples/09_scene/CMakeLists.txt
++++ b/samples/09_scene/CMakeLists.txt
+@@ -1,22 +1,25 @@
+ # rx_shader_deploy_runtime_libs() is defined in src/rx_shader/CMakeLists.txt
+ # (add_subdirectory'd before this directory) -- same cross-directory
+ # function-name visibility every other sample's own CMakeLists.txt relies on.
+ 
+ # [Phase 5 Task 5, ticket #41] draw_recording.{h,cpp}/fly_camera.h/
+ # mouse_capture.h/window_resize.h are GONE -- promoted engine-side (rows
+ # 1-2, 3, 4, 6, 7 of the gate matrix); rx_frame_loop is the new shared
+ # present-loop helper. grid_layout.h alone stays sample-local (row 5
+ # ruling).
+ add_executable(sample_09_scene main.cpp)
++# rx_ibl [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW]:
++# rx::ibl::bakeEnvironment(), consumed by this sample's own default-
++# environment bind (setupEnvironment() in main.cpp).
+ target_link_libraries(sample_09_scene PRIVATE
+-    rx_graph rx_rhi_vk rx_platform rx_material rx_asset rx_scene rx_shadow rx_debug_ui rx_task rx_shader rx_frame_loop sample_common
++    rx_graph rx_rhi_vk rx_platform rx_material rx_asset rx_scene rx_shadow rx_debug_ui rx_task rx_shader rx_frame_loop rx_ibl sample_common
+ )
+ 
+ # RX_REPO_ROOT_DIR: same "bake an absolute CMAKE_SOURCE_DIR-relative path at
+ # compile time" idiom samples/08_gltf_viewer's own CMakeLists.txt already
+ # establishes -- used by resolveHelmetScenePath()/resolveSponzaScenePath()'s
+ # dev-tree fallback (assets/fetched/{DamagedHelmet,Sponza},
+ # tools/fetch_assets.sh's own output) when this binary is NOT running from a
+ # packaged (pre-staged assets/) redistribution.
+ target_compile_definitions(sample_09_scene PRIVATE
+   RX_REPO_ROOT_DIR="${CMAKE_SOURCE_DIR}"
+@@ -101,20 +104,68 @@ add_custom_command(
+           "$<TARGET_FILE_DIR:sample_09_scene>/"
+   COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/tonemap_shaders_deploy.stamp"
+   DEPENDS ${RX_SCENE_TONEMAP_SHADERS}
+   COMMENT "sample_09_scene: deploying the shared tonemap shaders next to the binary"
+   VERBATIM
+ )
+ add_custom_target(sample_09_scene_tonemap_shaders
+   DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/tonemap_shaders_deploy.stamp")
+ add_dependencies(sample_09_scene sample_09_scene_tonemap_shaders)
+ 
++# [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW] rx_ibl's
++# own bake-chain compute kernels (rx::ibl::bakeEnvironment()'s own
++# `shaderDir` parameter) -- deployed into an `ibl_shaders/` directory next
++# to the binary, mirroring samples/08_gltf_viewer's own identical deploy
++# block EXACTLY, minus shaders/ibl/skybox.slang (this sample builds no
++# skybox pass -- out of this fix round's own scope).
++set(RX_SCENE_IBL_SHADERS
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/ibl/equirect_to_cubemap.slang"
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/ibl/irradiance_convolve.slang"
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/ibl/prefilter_specular.slang"
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/ibl/dfg_lut.slang"
++)
++add_custom_command(
++  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ibl_shaders_deploy.stamp"
++  COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sample_09_scene>/ibl_shaders"
++  COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_SCENE_IBL_SHADERS}
++          "$<TARGET_FILE_DIR:sample_09_scene>/ibl_shaders/"
++  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/ibl_shaders_deploy.stamp"
++  DEPENDS ${RX_SCENE_IBL_SHADERS}
++  COMMENT "sample_09_scene: deploying rx_ibl's bake-chain shaders next to the binary"
++  VERBATIM
++)
++add_custom_target(sample_09_scene_ibl_shaders
++  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/ibl_shaders_deploy.stamp")
++add_dependencies(sample_09_scene sample_09_scene_ibl_shaders)
++
++# [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW] Reuses
++# samples/08_gltf_viewer's own committed procedural .hdr fixture VERBATIM
++# (NO NEW ASSET) -- deployed a second time next to THIS binary, same
++# pattern as samples/08_gltf_viewer/CMakeLists.txt's own
++# `environments_deploy.stamp` block.
++set(RX_SCENE_ENVIRONMENT_FIXTURES
++  "${CMAKE_CURRENT_SOURCE_DIR}/../08_gltf_viewer/environments/gate_test_env.hdr"
++)
++add_custom_command(
++  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/environments_deploy.stamp"
++  COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sample_09_scene>/environments"
++  COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_SCENE_ENVIRONMENT_FIXTURES}
++          "$<TARGET_FILE_DIR:sample_09_scene>/environments/"
++  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/environments_deploy.stamp"
++  DEPENDS ${RX_SCENE_ENVIRONMENT_FIXTURES}
++  COMMENT "sample_09_scene: deploying the shared (samples/08_gltf_viewer-owned) .hdr environment fixture next to the binary"
++  VERBATIM
++)
++add_custom_target(sample_09_scene_environments
++  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/environments_deploy.stamp")
++add_dependencies(sample_09_scene sample_09_scene_environments)
++
+ # D17 committed reference PNG (256x256, lavapipe-rendered) for the default
+ # headless DamagedHelmet-grid composition (no HUD -- see main.cpp's own
+ # header comment for why the D17-gated capture and the HUD-smoke-test
+ # capture are deliberately two different frames) -- deployed next to the
+ # binary, regenerated only via tools/regen_references.sh (extended by this
+ # task to cover this sample too -- no second regeneration mechanism, per
+ # the gate's own binding instruction). OUTPUT/DEPENDS-tracked -- see
+ # samples/08_gltf_viewer/CMakeLists.txt's own references.stamp block for
+ # the full incremental-rebuild-staleness rationale this mirrors exactly.
+ set(RX_SCENE_REFERENCE_PNGS
+diff --git a/samples/09_scene/main.cpp b/samples/09_scene/main.cpp
+index 9a8c8b7..5308a58 100644
+--- a/samples/09_scene/main.cpp
++++ b/samples/09_scene/main.cpp
+@@ -61,28 +61,34 @@
+ // friend-scoped to import_gltf.cpp alone (verified directly against
+ // registry.h), so a Registry-free workload supplies its OWN
+ // `MeshSubmeshesFn`/`MaterialResolveFn`/`MeshBoundsFn` closures instead of
+ // `xFromRegistry()`'s production adapters -- exactly the injected-seam
+ // escape hatch draw_list.h's own top comment documents ("this library's
+ // own tests bind a trivial in-test callable instead"), applied here at
+ // sample scope rather than invented. See buildStressField() below.
+ #include <rx_asset/geometry_pool.h>
+ #include <rx_asset/registry.h>
+ #include <rx_asset/texture_cache.h>
++#include <rx_asset/texture_decode.h>
+ #include <rx_core/debug_checks.h>
+ #include <rx_core/log.h>
+ #include <rx_core/profile.h>
+ #include <rx_debug_ui/overlay.h>
+ #include <rx_frame_loop/present_loop.h>
+ #include <rx_graph/executor.h>
+ #include <rx_graph/render_graph.h>
+ #include <rx_graph/scene_color.h>
++// [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW] this
++// sample's own default environment bind -- rx::ibl::bakeEnvironment(),
++// consumed by setupEnvironment() below, mirroring samples/08_gltf_viewer's
++// own identical consumption.
++#include <rx_ibl/bake.h>
+ #include <rx_material/draw_data.h>
+ #include <rx_material/material_system.h>
+ #include <rx_material/param_arena_factory.h>
+ #include <rx_platform/mouse_capture_toggle.h>
+ #include <rx_platform/window.h>
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/buffer.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/context.h>
+ #include <rx_rhi_vk/deletion_queue.h>
+@@ -147,20 +153,29 @@ constexpr VkDeviceSize kHeadlessPixelBytes = static_cast<VkDeviceSize>(kHeadless
+ constexpr uint32_t kPresentWidth = 1280;
+ constexpr uint32_t kPresentHeight = 720;
+ 
+ // [Task 3 (#39)] the engine-owned HDR scene-color format
+ // (rx::graph::kHdrFormat, rx_graph/scene_color.h) replaces this sample's
+ // own former copy -- see that header for the format ruling + rationale.
+ constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
+ constexpr VkFormat kShadowFormat = VK_FORMAT_D32_SFLOAT;
+ constexpr uint32_t kShadowMapResolution = 1024;
+ 
++// [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW]
++// Deliberately MODEST (well under EnvironmentDesc::intensity's own neutral
++// 1.0 default, and under samples/08_gltf_viewer's own default `--env`
++// intensity) -- this sample's own non-stress content should read lit, not
++// washed out by a bright indirect term competing with the one directional
++// light + shadow this scene already exercises. See setupEnvironment()'s
++// own header comment for the full rationale.
++constexpr float kDefaultEnvironmentIntensity = 0.4F;
++
+ // Helmet-grid composition -- see this file's own header comment ("layer
+ // mask, not frustum geometry") for the full deterministic-culling
+ // rationale this feeds.
+ constexpr uint32_t kGridRows = 4;
+ constexpr uint32_t kGridCols = 4;
+ constexpr uint32_t kGridInstanceCount = kGridRows * kGridCols;
+ // Rows [0, kVisibleRowCount) are in the default camera cullMask; the rest
+ // are deterministically excluded BY LAYER MASK.
+ constexpr uint32_t kVisibleRowCount = 2;
+ constexpr uint32_t kDefaultVisibleInstances = kVisibleRowCount * kGridCols;
+@@ -275,20 +290,39 @@ std::filesystem::path resolveHelmetScenePath() {
+ // acceptance criterion), never a silent fallback or a confusing importer
+ // failure two layers down.
+ std::filesystem::path resolveSponzaScenePath() {
+     std::filesystem::path packaged = basePathDirectory() / "assets" / "Sponza" / "glTF" / "Sponza.gltf";
+     if (std::filesystem::exists(packaged)) {
+         return packaged;
+     }
+     return std::filesystem::path(RX_REPO_ROOT_DIR) / "assets" / "fetched" / "Sponza" / "glTF" / "Sponza.gltf";
+ }
+ 
++// [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW] Resolves
++// the SAME committed procedural .hdr fixture samples/08_gltf_viewer's own
++// D17 gate already uses (samples/08_gltf_viewer/environments/
++// gate_test_env.hdr) -- NO NEW ASSET is added by this fix round; this
++// sample reuses that one committed file, deployed a second time next to
++// THIS binary by this sample's own CMakeLists.txt (see that file's own
++// `environments_deploy.stamp` block) for the packaged case, or resolved
++// straight from the source tree for an ordinary build-tree run. Same
++// two-step "packaged, then dev-tree" resolution order as
++// resolveHelmetScenePath()/resolveSponzaScenePath() above.
++std::filesystem::path resolveEnvironmentPath() {
++    std::filesystem::path packaged = basePathDirectory() / "environments" / "gate_test_env.hdr";
++    if (std::filesystem::exists(packaged)) {
++        return packaged;
++    }
++    return std::filesystem::path(RX_REPO_ROOT_DIR) / "samples" / "08_gltf_viewer" / "environments" /
++           "gate_test_env.hdr";
++}
++
+ // --- Fly-through camera [Task 20 input surface -- gate ruling #15's own
+ // "Task 20 input surface" correction of the plan's stray "D16 input"
+ // citation] --------------------------------------------------------------
+ // WASD (via `Window::isKeyDown`) + relative-mouse-mode look + gamepad
+ // (left stick move, right stick look, triggers = speed multiplier) drive a
+ // plain yaw/pitch `rx::scene::Camera`. Movement/look are both continuous,
+ // framerate-scaled (`dt`). [Phase 5 Task 5, ticket #41 row 4] The struct
+ // itself, and the axis->local-move-delta mapping updateFlyCamera() below
+ // drives it with, now live engine-side in rx_scene/fly_camera.h -- promoted
+ // from this sample's own former fly_camera.h (device-free, unit-tested at
+@@ -650,20 +684,41 @@ struct App {
+ 
+     std::filesystem::path sharedShaderDir;
+     std::filesystem::path shadowShaderDir;
+ 
+     CompiledPass tonemapPass;
+     VkSampler defaultSampler = VK_NULL_HANDLE;
+     rx::rhi::BindlessHandle defaultSamplerHandle;
+     VkImageView lastHdrView = VK_NULL_HANDLE;
+     rx::rhi::BindlessHandle hdrHandle;
+ 
++    // [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW] A
++    // modest default environment -- see setupEnvironment()'s own header
++    // comment for why this sample binds one now (the retired FG1 flat-
++    // ambient term's removal left the non-stress DamagedHelmet-grid render
++    // reading near-black with zero environment bound; this sample is an
++    // interactive fly-through, not a static gate-only asset). Field shape
++    // mirrors samples/08_gltf_viewer's own identical set exactly (same
++    // `rx::ibl::BakeResult` + bindless-handle + sampler bundle) -- no
++    // skybox pass here (out of this fix round's own scope; only the
++    // diffuse/specular IBL lighting terms this sample's own materials
++    // already consume via standard_pbr.slang).
++    std::optional<rx::ibl::BakeResult> environment;
++    VkSampler envCubeSampler = VK_NULL_HANDLE;
++    VkSampler envDfgSampler = VK_NULL_HANDLE;
++    rx::rhi::BindlessHandle envBaseCubeHandle;
++    rx::rhi::BindlessHandle envIrradianceHandle;
++    rx::rhi::BindlessHandle envPrefilteredHandle;
++    rx::rhi::BindlessHandle envDfgLutHandle;
++    rx::rhi::BindlessHandle envCubeSamplerHandle;
++    rx::rhi::BindlessHandle envDfgSamplerHandle;
++
+     // Set-1 (material params) descriptor infrastructure [Phase 5 Task 5,
+     // ticket #41 row 1 -- promoted into
+     // rx::material::createDemandSizedMaterialParamArena(); see that
+     // function's own header comment for the full "why sized exactly from
+     // the real, mode-dependent material count, not a fixed magic number"
+     // rationale (the P0 crash this promotion's predecessor fixed: 25 > 8
+     // material-param sets on a real, limit-enforcing NVIDIA driver against
+     // Sponza)]. Created by createMaterialParamArena() below, from the REAL
+     // material count for whichever mode this run selected, once that count
+     // is known -- never before runHeadless()/runPresent() have picked a
+@@ -953,24 +1008,26 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
+     // distinct wrap/filter combinations, even after TextureCache's own
+     // per-descriptor sampler dedup) -- shadow map + comparison sampler,
+     // the per-pass DrawDataGpu/ShadowDrawData storage buffers, and ImGui's
+     // own font atlas (registered by the vendored backend, NOT through this
+     // table -- see rx_debug_ui/overlay.h's own FONT/TEXTURE UPLOAD
+     // section) round out the remaining headroom.
+     rx::rhi::BindlessTable::Capacities capacities{/*sampledImages=*/256, /*samplers=*/32, /*storageBuffers=*/8};
+     capacities.comparisonSamplers = 1;
+     // [Phase 5 Task 10, #46] material.slang now unconditionally declares
+     // `gTexturesCube` at binding 4 -- same requirement as
+-    // `comparisonSamplers` above. This sample does not bind a Scene
+-    // environment (out of this ticket's own file list), so headroom of 1
+-    // is never actually exercised, only structurally required.
+-    capacities.cubeImages = 1;
++    // `comparisonSamplers` above. [Fix round, task-10-review.md Finding
++    // 3/LOW] This sample NOW binds a real Scene environment
++    // (setupEnvironment() below) -- base/irradiance/prefiltered cubemaps,
++    // 3 real registrations -- 4 gives one spare slot, matching
++    // samples/08_gltf_viewer's own identical sizing.
++    capacities.cubeImages = 4;
+     auto bindless = rx::rhi::BindlessTable::create(app->device->physicalDevice(), app->device->device(), capacities);
+     if (!bindless.has_value()) {
+         RX_LOG_ERROR("sample_09_scene: BindlessTable::create failed");
+         return nullptr;
+     }
+     app->bindless.emplace(std::move(*bindless));
+     app->deletionQueue.emplace();
+ 
+     const std::filesystem::path basePath = basePathDirectory();
+     app->sharedShaderDir = basePath / "material_shaders";
+@@ -1035,20 +1092,193 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
+     // Shadow-caster pipeline [D21, RC3] -- built outside MaterialSystem.
+     app->shadowCaster = rx::shadow::ShadowCasterPipeline::create(*app->device, *app->bindless, {}, app->shadowShaderDir);
+     if (app->shadowCaster == nullptr) {
+         RX_LOG_ERROR("sample_09_scene: ShadowCasterPipeline::create failed");
+         return nullptr;
+     }
+ 
+     return app;
+ }
+ 
++// [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW] Decodes
++// an equirect .hdr file into a sampled Texture2D -- a TRIMMED duplicate of
++// samples/08_gltf_viewer's own loadEquirectHdr() (this project's own
++// established per-sample-duplicated-fixture idiom, restated across this
++// codebase's several test suites -- no cross-sample .cpp dependency this
++// binary would otherwise need). Returns std::nullopt (logged) on failure.
++std::optional<rx::rhi::Texture2D> loadEquirectHdr(rx::rhi::Device& device, rx::rhi::Allocator& allocator,
++                                                    rx::rhi::Uploader& uploader, const std::filesystem::path& path) {
++    std::ifstream file(path, std::ios::binary | std::ios::ate);
++    if (!file.is_open()) {
++        RX_LOG_ERROR("sample_09_scene: failed to open environment file '{}'", path.string());
++        return std::nullopt;
++    }
++    const std::streamsize fileSize = file.tellg();
++    if (fileSize <= 0) {
++        RX_LOG_ERROR("sample_09_scene: environment file '{}' is empty or unreadable", path.string());
++        return std::nullopt;
++    }
++    file.seekg(0, std::ios::beg);
++    std::vector<std::byte> bytes(static_cast<size_t>(fileSize));
++    if (!file.read(reinterpret_cast<char*>(bytes.data()), fileSize)) {
++        RX_LOG_ERROR("sample_09_scene: failed to read environment file '{}'", path.string());
++        return std::nullopt;
++    }
++
++    VkPhysicalDeviceProperties props{};
++    vkGetPhysicalDeviceProperties(device.physicalDevice(), &props);
++    auto isFormatSupported = [&](VkFormat format) {
++        VkFormatProperties2 formatProps{};
++        formatProps.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
++        vkGetPhysicalDeviceFormatProperties2(device.physicalDevice(), format, &formatProps);
++        constexpr VkFormatFeatureFlags kNeeded = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
++        return (formatProps.formatProperties.optimalTilingFeatures & kNeeded) == kNeeded;
++    };
++    rx::asset::TextureDecodeResult decoded = rx::asset::decodeTextureForUpload(
++        bytes, rx::asset::TextureRole::Environment, props.limits.maxImageDimension2D, isFormatSupported);
++    if (decoded.outcome != rx::asset::TextureDecodeResult::Outcome::Ready || decoded.isCube) {
++        RX_LOG_ERROR("sample_09_scene: failed to decode environment '{}': {}", path.string(), decoded.failureReason);
++        return std::nullopt;
++    }
++
++    auto texture = rx::rhi::Texture2D::createForPresuppliedMips(
++        device.physicalDevice(), device.device(), allocator, VkExtent2D{decoded.width, decoded.height},
++        decoded.format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++        static_cast<uint32_t>(decoded.levels.size()));
++    if (!texture.has_value()) {
++        RX_LOG_ERROR("sample_09_scene: Texture2D::createForPresuppliedMips failed for environment '{}'", path.string());
++        return std::nullopt;
++    }
++
++    std::vector<rx::rhi::Uploader::ImageMipLevel> uploadLevels;
++    uploadLevels.reserve(decoded.levels.size());
++    for (const rx::asset::DecodedTextureLevel& level : decoded.levels) {
++        rx::rhi::Uploader::ImageMipLevel entry;
++        entry.data = level.bytes.data();
++        entry.size = static_cast<VkDeviceSize>(level.bytes.size());
++        entry.mipLevel = level.level;
++        entry.extent = {level.width, level.height};
++        uploadLevels.push_back(entry);
++    }
++    if (!uploader.uploadImageMips(*texture, uploadLevels)) {
++        RX_LOG_ERROR("sample_09_scene: Uploader::uploadImageMips failed for environment '{}'", path.string());
++        return std::nullopt;
++    }
++    rx::rhi::UploadTicket ticket = uploader.flush();
++    uploader.wait(ticket);
++    return texture;
++}
++
++// [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW] Bakes
++// samples/08_gltf_viewer's own committed procedural .hdr fixture
++// (resolveEnvironmentPath(), NO NEW ASSET) and binds it via
++// `app.scene->setEnvironment()` -- closing the review's LOW product-quality
++// finding: with FG1's flat ambient term retired (this task's own headline
++// change), this sample's non-stress DamagedHelmet content read near-black
++// with no environment bound, which reads as "looks broken" to an
++// interactive fly-through a human drives, independent of the underlying
++// physically-correct zero-ambient rationale. `intensity` is DELIBERATELY
++// modest (see this function's own caller) -- "reads lit, not washed", not
++// a bright showcase render; this fixture is a small 64x32 procedural sky
++// gradient, not production content. No skybox pass -- out of this fix
++// round's own scope; only the diffuse/specular IBL terms standard_pbr.slang
++// already consumes. Mirrors samples/08_gltf_viewer's own setupEnvironment()
++// exactly, minus the skybox half. Returns false (logged) on any failure;
++// `app.scene->hasEnvironment()` stays false in that case.
++bool setupEnvironment(App& app, const std::filesystem::path& hdrPath, const std::filesystem::path& iblShaderDir,
++                      float intensity) {
++    RX_ZONE_NAMED("sample09: setupEnvironment");
++    auto equirect = loadEquirectHdr(*app.device, *app.allocator, *app.uploader, hdrPath);
++    if (!equirect.has_value()) {
++        return false;
++    }
++
++    auto cmdCtx =
++        rx::rhi::CommandContext::create(app.device->device(), app.device->graphicsQueue(), app.device->graphicsQueueFamily());
++    if (!cmdCtx.has_value()) {
++        RX_LOG_ERROR("sample_09_scene: CommandContext::create failed for the IBL bake");
++        return false;
++    }
++
++    // BakeParams left at their own defaults -- same "small committed
++    // fixture, CI-representative bake time" rationale as
++    // samples/08_gltf_viewer's own setupEnvironment() (that function's own
++    // header comment); this sample's own headless D17 gate runs this exact
++    // bake on lavapipe too.
++    rx::ibl::BakeParams params;
++    rx::ibl::BakeTimings timings;
++    auto bakeResult = rx::ibl::bakeEnvironment(*app.device, *app.allocator, *cmdCtx, *app.scheduler, *equirect,
++                                                /*sourceIsCube=*/false, iblShaderDir, params, &timings,
++                                                "sample09_scene");
++    if (!bakeResult.has_value()) {
++        RX_LOG_ERROR("sample_09_scene: rx::ibl::bakeEnvironment failed for '{}'", hdrPath.string());
++        return false;
++    }
++    RX_LOG_INFO(
++        "sample09: perf ibl_bake path='{}' equirect_to_cubemap_ms={:.3f} irradiance_ms={:.3f} prefilter_ms={:.3f} "
++        "dfg_ms={:.3f} total_ms={:.3f}",
++        hdrPath.string(), timings.equirectToCubemapMs, timings.irradianceMs, timings.prefilterMs, timings.dfgMs,
++        timings.totalMs);
++
++    app.environment = std::move(*bakeResult);
++
++    VkSamplerCreateInfo cubeSamplerInfo{};
++    cubeSamplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
++    cubeSamplerInfo.magFilter = VK_FILTER_LINEAR;
++    cubeSamplerInfo.minFilter = VK_FILTER_LINEAR;
++    cubeSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
++    cubeSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    cubeSamplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    cubeSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    cubeSamplerInfo.minLod = 0.0F;
++    cubeSamplerInfo.maxLod = VK_LOD_CLAMP_NONE;
++    if (vkCreateSampler(app.device->device(), &cubeSamplerInfo, nullptr, &app.envCubeSampler) != VK_SUCCESS) {
++        RX_LOG_ERROR("sample_09_scene: vkCreateSampler (environment cube sampler) failed");
++        return false;
++    }
++    VkSamplerCreateInfo dfgSamplerInfo = cubeSamplerInfo;
++    dfgSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
++    if (vkCreateSampler(app.device->device(), &dfgSamplerInfo, nullptr, &app.envDfgSampler) != VK_SUCCESS) {
++        RX_LOG_ERROR("sample_09_scene: vkCreateSampler (environment DFG sampler) failed");
++        return false;
++    }
++
++    app.envBaseCubeHandle =
++        app.bindless->registerCubeSampledImage(app.environment->baseCubemap.view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    app.envIrradianceHandle = app.bindless->registerCubeSampledImage(app.environment->irradianceCubemap.view(),
++                                                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    app.envPrefilteredHandle = app.bindless->registerCubeSampledImage(app.environment->prefilteredCubemap.view(),
++                                                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    app.envDfgLutHandle =
++        app.bindless->registerSampledImage(app.environment->dfgLut.view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    app.envCubeSamplerHandle = app.bindless->registerSampler(app.envCubeSampler);
++    app.envDfgSamplerHandle = app.bindless->registerSampler(app.envDfgSampler);
++    if (!app.envBaseCubeHandle.isValid() || !app.envIrradianceHandle.isValid() ||
++        !app.envPrefilteredHandle.isValid() || !app.envDfgLutHandle.isValid() ||
++        !app.envCubeSamplerHandle.isValid() || !app.envDfgSamplerHandle.isValid()) {
++        RX_LOG_ERROR("sample_09_scene: bindless registration failed for the baked environment");
++        return false;
++    }
++
++    rx::scene::EnvironmentDesc envDesc;
++    envDesc.baseCubemapIndex = app.envBaseCubeHandle.index();
++    envDesc.irradianceCubemapIndex = app.envIrradianceHandle.index();
++    envDesc.prefilteredCubemapIndex = app.envPrefilteredHandle.index();
++    envDesc.dfgLutIndex = app.envDfgLutHandle.index();
++    envDesc.cubeSamplerIndex = app.envCubeSamplerHandle.index();
++    envDesc.dfgSamplerIndex = app.envDfgSamplerHandle.index();
++    envDesc.maxPrefilteredLod = static_cast<float>(app.environment->prefilteredMipCount) - 1.0F;
++    envDesc.intensity = intensity;
++    app.scene->setEnvironment(envDesc);
++    return true;
++}
++
+ // [Phase 5 Task 5, ticket #41 row 1] Builds App::materialParamArena (set
+ // LAYOUT + demand-sized DescriptorArena together) via the promoted
+ // rx::material::createDemandSizedMaterialParamArena() -- see that
+ // function's own header comment for the full "why sized exactly from the
+ // real, mode-dependent material count, not a fixed magic number" rationale
+ // this call site used to carry directly. Must be called exactly once,
+ // after the caller has determined which mode is active and (for a custom
+ // import) after importGltf() has returned its real material count, and
+ // before the first finalizeMaterialBinding() call for that mode.
+ bool createMaterialParamArena(App& app, uint32_t materialCount) {
+@@ -1121,20 +1351,43 @@ void destroyApp(App& app) {
+         vkDestroyDescriptorSetLayout(app.device->device(), app.materialParamArena->setLayout, nullptr);
+     }
+     app.materialParamArena.reset();
+     // [Phase 5 Task 5 row 2] PerFrameStorageBuffer::release() must run
+     // BEFORE its own destructor (reset() below) -- see that class's own
+     // TEARDOWN CONTRACT comment.
+     if (app.drawDataBuffer.has_value() && app.bindless.has_value()) {
+         app.drawDataBuffer->release(*app.bindless);
+     }
+     app.drawDataBuffer.reset();
++    // [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW]
++    // Same teardown shape as samples/08_gltf_viewer's own destroyApp() --
++    // bindless release, then the two raw VkSampler handles, then
++    // rx::ibl::BakeResult's own RAII Texture2D members via reset(). A run
++    // that never bound an environment (setupEnvironment() failed, or was
++    // never reached) leaves every one of these a documented no-op.
++    if (app.bindless.has_value()) {
++        app.bindless->release(app.envBaseCubeHandle);
++        app.bindless->release(app.envIrradianceHandle);
++        app.bindless->release(app.envPrefilteredHandle);
++        app.bindless->release(app.envDfgLutHandle);
++        app.bindless->release(app.envCubeSamplerHandle);
++        app.bindless->release(app.envDfgSamplerHandle);
++    }
++    if (app.envCubeSampler != VK_NULL_HANDLE) {
++        vkDestroySampler(app.device->device(), app.envCubeSampler, nullptr);
++        app.envCubeSampler = VK_NULL_HANDLE;
++    }
++    if (app.envDfgSampler != VK_NULL_HANDLE) {
++        vkDestroySampler(app.device->device(), app.envDfgSampler, nullptr);
++        app.envDfgSampler = VK_NULL_HANDLE;
++    }
++    app.environment.reset();
+     destroyCompiledPass(app.device->device(), app.tonemapPass);
+     if (app.defaultSamplerHandle.isValid() && app.bindless.has_value()) {
+         app.bindless->release(app.defaultSamplerHandle);
+     }
+     if (app.defaultSampler != VK_NULL_HANDLE) {
+         vkDestroySampler(app.device->device(), app.defaultSampler, nullptr);
+         app.defaultSampler = VK_NULL_HANDLE;
+     }
+     app.drawListBuilder.reset();
+     app.scene.reset();
+@@ -1849,24 +2102,35 @@ bool buildStressField(App& app, uint32_t drawCount) {
+ // App::cachedAnyMaterialLayout's own comment. `bindings` is whichever set
+ // is active this run (helmet: a 1-element span; stress: 4; custom-import:
+ // N). [Sponza texture-misassignment fix] Deliberately does NOT build a
+ // pipelineToken -> binding map anymore: distinct materials legitimately
+ // SHARE one VkPipeline whenever their fixed-function state matches (D28;
+ // Sponza: 22/25 materials), so such a map can only ever remember one
+ // binding per shared token -- see draw_recording.h's own
+ // materialIndexForSpan() header comment. Descriptor-set selection at
+ // record time now goes through App::resolveMaterialIndexToBinding instead,
+ // keyed by the REAL per-span materialIndex.
+-void warmMaterialPipelines(App& app, std::span<const MaterialGpuBinding> bindings) {
++// [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW] The
++// SAME specialization-bits derivation samples/08_gltf_viewer's own
++// materialSpecializationBits() uses, at BOTH this file's own pre-
++// resolution site (warmMaterialPipelines() below) and its real per-draw
++// site (updateSceneFrame()'s own resolveDrawGroups() lambda) -- a single
++// function, so the two call sites cannot drift apart (matching sample08's
++// own documented rationale exactly).
++uint32_t materialSpecializationBits(const App& app) {
++    return app.scene->hasEnvironment() ? rx::material::kSpecializationEnergyCompensation : 0U;
++}
++
++void warmMaterialPipelines(App& app, std::span<const MaterialGpuBinding> bindings, uint32_t specializationBits = 0U) {
+     const rx::material::PassSignature sig = forwardPassSignature();
+     for (const MaterialGpuBinding& binding : bindings) {
+-        app.materialSystem->getPipeline({binding.handle, sig, 0});
++        app.materialSystem->getPipeline({binding.handle, sig, specializationBits});
+     }
+     // [Phase 4 exit fix wave, I3] Hoisted here, main-thread-only, setup-time
+     // (this function is never called mid-frame) -- NOT recomputed inside
+     // recordForwardChunk() anymore, which ran on worker chunks >= 1 and
+     // called the now-guarded MaterialSystem::pipelineLayout() from there
+     // (a sibling of the Task-24 GeometryPool::bind() violation). Every
+     // participating material shares the IDENTICAL pipeline-layout SHAPE
+     // (external bindless set-0 substitution + material set-1 -- Vulkan spec
+     // 14.2.2 set-compatibility), so any one binding's layout is legal to
+     // cache and reuse for every chunk regardless of which pipeline a given
+@@ -2001,35 +2265,59 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
+     // coherently migrated with sample 08's own convention (no
+     // half-migrated consumer of RxDrawData's lightColor/ambientColor
+     // fields) and so a future exposure control on THIS sample needs no
+     // further plumbing here.
+     const float preExposure = app.flyCamera.camera.exposure();
+     const uint8_t lightChannels = app.hud.lightChannelHighlightOn ? 0xFFu : static_cast<uint8_t>(0xFFu & ~kHighlightChannelBit);
+     if (app.scene->isLightAlive(app.lightHandle)) {
+         app.scene->setLightChannels(app.lightHandle, lightChannels);
+     }
+ 
++    // [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW] The
++    // scene environment's own bindless bundle -- mirrors
++    // samples/08_gltf_viewer's own updateDrawDataPerPassFields()
++    // identically (same EnvironmentDesc-read-once-per-frame-then-broadcast
++    // shape). `hasEnvironment() == false` leaves every row at
++    // DrawDataGpu{}'s own "no environment" sentinel default (set once at
++    // app.drawDataRows.assign(rows, DrawDataGpu{}), never touched again in
++    // that case) -- byte-identical to a pre-T10 producer.
++    const bool hasEnvironment = app.scene->hasEnvironment();
++    rx::scene::EnvironmentDesc envDesc;
++    if (hasEnvironment) {
++        envDesc = app.scene->environment();
++    }
++    const float envIntensityExposed = envDesc.intensity * preExposure;
++
+     const auto transforms = app.scene->transformsSpan();
+     for (size_t i = 0; i < app.viewLists.payloads.size(); ++i) {
+         const rx::scene::DrawPayload& payload = app.viewLists.payloads[i];
+         const glm::mat4& model = transforms[payload.instanceDataIndex];
+         const glm::mat3 normalMat3 = glm::transpose(glm::inverse(glm::mat3(model)));
+ 
+         rx::material::DrawDataGpu& row = app.drawDataRows[i];
+         row.model = glm::transpose(model);
+         row.normalMatrix = glm::transpose(glm::mat4(normalMat3));
+         row.viewProj = viewProjTransposed;
+         row.lightDirWorld = glm::vec4(-glm::normalize(app.lightDirWorld), 0.0F);
+         row.lightColor = glm::vec4(5.0F, 5.0F, 5.0F, 0.0F) * preExposure;
+-        row.ambientColor = glm::vec4(0.12F, 0.12F, 0.12F, 0.0F) * preExposure;
++        row.ambientColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);  // retired field, inert -- see MaterialVertex::ambientColor's own header comment.
+         row.cameraPosWorld = glm::vec4(cameraPos, 0.0F);
+         row.materialIndex = payload.materialIndex;
++        if (hasEnvironment) {
++            row.envIrradianceCubeIndex = envDesc.irradianceCubemapIndex;
++            row.envPrefilteredCubeIndex = envDesc.prefilteredCubemapIndex;
++            row.envDfgLutIndex = envDesc.dfgLutIndex;
++            row.envCubeSamplerIndex = envDesc.cubeSamplerIndex;
++            row.envDfgSamplerIndex = envDesc.dfgSamplerIndex;
++            row.envMaxPrefilteredLod = envDesc.maxPrefilteredLod;
++            row.envIntensity = envIntensityExposed;
++        }
+         // [Phase 4 exit fix wave, C1] Also requires `app.shadowMapHandle.
+         // isValid()` -- NOT just `app.shadowEnabled` -- since the handle is
+         // now (re-)registered lazily, from recordForwardChunk()'s chunk 0,
+         // the first time the graph-owned "shadowmap" transient is realized
+         // (see App::lastShadowMapView's own comment). Before that first
+         // registration (only ever true on the very first frame of a run:
+         // the physical resource is never resized/evicted afterward, so the
+         // handle stays valid and correct for every later frame), rows fall
+         // back to the SAME documented 0xFFFFFFFF fully-lit sentinel the
+         // shadowEnabled==false path already uses -- a well-defined,
+@@ -2061,25 +2349,29 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
+     // fan-out. `resolvePipeline` returns a `getPipeline()` cache HIT every
+     // time, by construction (warmMaterialPipelines() pre-warmed every
+     // participating material's pipeline at setup).
+     const rx::material::PassSignature passSig = forwardPassSignature();
+     const uint64_t passSigHash = passSig.hash();
+     // [Phase 5 Task 5, ticket #41 row 6] Zero-alloc: writes into
+     // app.resolvedGroups' own already-allocated storage instead of
+     // returning (and this call site discarding the previous) a fresh
+     // std::vector every frame -- see rx::scene::resolveDrawGroups()'s own
+     // header comment.
++    // [Phase 5 Task 10, #46 fix round] `materialSpecializationBits()` --
++    // MUST match warmMaterialPipelines()'s own call, or this lookup misses
++    // the pre-warmed cache entry (see that function's own header comment).
++    const uint32_t specializationBits = materialSpecializationBits(app);
+     rx::scene::resolveDrawGroups(
+         app.viewLists, passSigHash, 0,
+-        [&app, &passSig](const rx::scene::PipelineRequestKey& key) -> uint64_t {
++        [&app, &passSig, specializationBits](const rx::scene::PipelineRequestKey& key) -> uint64_t {
+             const rx::material::MaterialHandle handle = app.resolveMaterialIndexToHandle(key.materialIndex);
+-            VkPipeline pipeline = app.materialSystem->getPipeline({handle, passSig, 0});
++            VkPipeline pipeline = app.materialSystem->getPipeline({handle, passSig, specializationBits});
+             return std::bit_cast<uint64_t>(pipeline);
+         },
+         app.resolvedGroups);
+ }
+ 
+ // [Phase 4 exit fix wave, I1] The GPU-write half `updateSceneFrame()` above
+ // deliberately no longer performs -- memcpy's `app.drawDataRows`/
+ // `app.shadowDrawDataRows` (already populated by `updateSceneFrame()`) into
+ // THIS frame's `frameSlot`-th physical buffer and flushes it. Sets
+ // `app.currentFrameSlot = frameSlot` first (read by `recordForwardChunk()`'s
+@@ -2710,21 +3002,35 @@ int runHeadless(const Args& args) {
+             return 1;
+         }
+         if (!setupHelmetMaterial(*app, app->registry->material(result.materials[0]))) {
+             destroyApp(*app);
+             return 1;
+         }
+         if (!populateHelmetGrid(*app, result.meshes[0], helmetAssetNodeTransform(result))) {
+             destroyApp(*app);
+             return 1;
+         }
+-        warmMaterialPipelines(*app, std::span<const MaterialGpuBinding>(&app->helmetMaterial, 1));
++        // [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW]
++        // Bind the committed default environment BEFORE
++        // warmMaterialPipelines() so the pre-warmed pipeline variant
++        // (materialSpecializationBits()) matches the one updateSceneFrame()
++        // resolves at real draw time -- see that function's own header
++        // comment. Failure here is logged but non-fatal: the scene still
++        // renders (with zero indirect light, matching this task's own
++        // pre-existing physically-honest fallback), just without the
++        // fix-round's own product-quality improvement.
++        const std::filesystem::path iblShaderDir = basePathDirectory() / "ibl_shaders";
++        if (!setupEnvironment(*app, resolveEnvironmentPath(), iblShaderDir, kDefaultEnvironmentIntensity)) {
++            RX_LOG_WARN("sample_09_scene: setupEnvironment failed -- continuing with zero indirect light");
++        }
++        warmMaterialPipelines(*app, std::span<const MaterialGpuBinding>(&app->helmetMaterial, 1),
++                              materialSpecializationBits(*app));
+         if (!setupShadow(*app)) {
+             destroyApp(*app);
+             return 1;
+         }
+         expectedTotalCandidates = kGridInstanceCount;
+         expectedCulled = kDefaultCulledInstances;
+         expectedVisible = kDefaultVisibleInstances;
+         expectedRecordsIn = kDefaultVisibleInstances;  // 1 submesh per instance.
+         expectedDrawsSubmitted = kDefaultDrawsSubmitted;
+     }
+@@ -3215,21 +3521,30 @@ int runPresent(const Args& args) {
+         // setupHelmetMaterial()'s own single-material call below.
+         if (!createMaterialParamArena(*app, 1)) {
+             destroyApp(*app);
+             return 1;
+         }
+         if (!setupHelmetMaterial(*app, app->registry->material(result.materials[0])) ||
+             !populateHelmetGrid(*app, result.meshes[0], helmetAssetNodeTransform(result))) {
+             destroyApp(*app);
+             return 1;
+         }
+-        warmMaterialPipelines(*app, std::span<const MaterialGpuBinding>(&app->helmetMaterial, 1));
++        // [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW]
++        // Same default-environment bind as runHeadless() above -- this is
++        // the interactive fly-through the review's own LOW finding names
++        // directly ("plausibly reads as 'looks broken' to a human tester").
++        const std::filesystem::path iblShaderDir = basePathDirectory() / "ibl_shaders";
++        if (!setupEnvironment(*app, resolveEnvironmentPath(), iblShaderDir, kDefaultEnvironmentIntensity)) {
++            RX_LOG_WARN("sample_09_scene: setupEnvironment failed -- continuing with zero indirect light");
++        }
++        warmMaterialPipelines(*app, std::span<const MaterialGpuBinding>(&app->helmetMaterial, 1),
++                              materialSpecializationBits(*app));
+         if (!setupShadow(*app)) {
+             destroyApp(*app);
+             return 1;
+         }
+         RX_LOG_INFO("sample_09_scene: default helmet grid loaded -- {} instance(s)", app->renderableHandles.size());
+     }
+     app->sceneReady = true;
+     app->flyCamera.camera.aspectRatio =
+         static_cast<float>(app->device->swapchainExtent().width) / static_cast<float>(std::max<uint32_t>(1U, app->device->swapchainExtent().height));
+ 
+diff --git a/samples/09_scene/references/grid_scene.png b/samples/09_scene/references/grid_scene.png
+index f9c6f64..3725281 100644
+Binary files a/samples/09_scene/references/grid_scene.png and b/samples/09_scene/references/grid_scene.png differ
+diff --git a/shaders/material/brdf.slang b/shaders/material/brdf.slang
+index 9dbd8dc..163f9d4 100644
+--- a/shaders/material/brdf.slang
++++ b/shaders/material/brdf.slang
+@@ -213,47 +213,57 @@ public float Fd_Burley(float alpha, float NoV, float NoL, float LoH) {
+ //
+ // MULTIPLICATIVE CONTRACT [surface_shading_model_standard.fs:128, `color =
+ // Fd + Fr * pixel.energyCompensation`]: the caller multiplies this
+ // function's result into the SPECULAR lobe's response only (`Fr`), never
+ // the diffuse lobe (`Fd`) -- this function does not perform that multiply
+ // itself, matching Filament's own call-site shape exactly.
+ public float3 energyCompensation(float3 f0, float dfgY) {
+     return float3(1.0, 1.0, 1.0) + f0 * (1.0 / dfgY - 1.0);
+ }
+ 
+-// [Phase 5 Task 10, #46, FG1 closure] Split-sum IBL specular reflectance
+-// scale [Karis 2013, "Real Shading in Unreal Engine 4"; ported here as
+-// Filament's own `specularDFG()` -- shaders/src/surface_light_indirect.fs
+-// google/filament v1.75.0, commit 0e58877c09afb1aacd09ff640f74d2adcd2a7e80,
+-// Apache-2.0, :135 cited by matrix-p5t10-ibl-runtime-skybox.md]:
+-// `E = f0*dfg.x + dfg.y`, where `dfg` is the pre-integrated BRDF LUT
+-// texel at (NoV, roughness) -- T9's own `dfgLut` bake output
+-// (shaders/ibl/dfg_lut.slang: R=DFV_Multiscatter(NoV,roughness).x,
+-// G=...y). `E` is BOTH the specular lobe's own reflectance scale
+-// (`Fr = E * prefilteredRadiance`) AND, via `(1-E)`, the fraction of
+-// incident energy specular did NOT reflect that the diffuse lobe is
+-// entitled to (`Fd = diffuseColor * diffuseIrradiance * (1-E)`) -- a real
+-// coupling between the two lobes, not two independently-added terms; see
+-// standard_pbr.slang's own evaluateIBL()-equivalent call site for the
+-// exact composition. Distinct from `energyCompensation()` above (which
+-// corrects the DIRECT-lit specular response for energy LOST to
+-// unaccounted multiple scattering, `1 + f0*(1/dfg.y - 1)`) -- this
+-// function is the split-sum single-scattering APPROXIMATION itself, the
+-// mechanism IBL needs to turn a prefiltered environment sample into a
+-// physically-plausible specular response at all, independent of whether
+-// energy compensation is separately applied on top (Filament's own
+-// `evaluateIBL()` applies BOTH: `Fr *= pixel.energyCompensation` follows
+-// the split-sum `Fr = E * prefilteredRadiance` -- standard_pbr.slang's own
+-// call site does the same, reusing the SAME `EnergyComp` feature-
+-// permutation point Task 8 already wired for direct lighting).
++// [Phase 5 Task 10, #46, FG1 closure; corrected in the T10 fix round per
++// task-10-review.md Finding 1 (CRITICAL)] Split-sum IBL specular
++// reflectance scale [Karis 2013, "Real Shading in Unreal Engine 4"; ported
++// here as Filament's own `specularDFG()` -- shaders/src/
++// surface_light_indirect.fs, google/filament v1.75.0, commit
++// 0e58877c09afb1aacd09ff640f74d2adcd2a7e80, Apache-2.0, :135]:
++// `E = mix(dfg.x, dfg.y, f0) = (1-f0)*dfg.x + f0*dfg.y`, where `dfg` is the
++// pre-integrated BRDF LUT texel at (NoV, roughness) sampled from T9's own
++// `dfgLut` bake output -- T9's own `dfg_lut.slang` header comment (a
++// byte-for-byte structural port of CubemapIBL::DFV_Multiscatter, which T9
++// bakes UNCONDITIONALLY, never the plain non-multiscatter `DFV()`) already
++// quotes this exact reconstruction verbatim: `"Er() = (1-f0)*DFV.x +
++// f0*DFV.y = mix(DFV.xxx, DFV.yyy, f0)"` (CubemapIBL.cpp:790-833's own
++// comment for `DFV_Multiscatter()`). The PRIOR version of this function
++// (`f0*dfg.x + dfg.y`) was `CubemapIBL.cpp:778`'s reconstruction for the
++// plain, non-multiscatter `DFV()` -- the variant T9 does NOT bake -- a
++// citation/formula mismatch verified against a fresh fetch of the pinned
++// v1.75.0 source and reproduced live (see task-10-report.md "Fix round 1").
++// `E` is BOTH the specular lobe's own reflectance scale (`Fr = E *
++// prefilteredRadiance`) AND, via `(1-E)`, the fraction of incident energy
++// specular did NOT reflect that the diffuse lobe is entitled to (`Fd =
++// diffuseColor * diffuseIrradiance * (1-E)`) -- a real coupling between the
++// two lobes, not two independently-added terms; see standard_pbr.slang's
++// own evaluateIBL()-equivalent call site for the exact composition.
++// Distinct from `energyCompensation()` above (which corrects the
++// DIRECT-lit specular response for energy LOST to unaccounted multiple
++// scattering, `1 + f0*(1/dfg.y - 1)`) -- this function is the split-sum
++// single-scattering APPROXIMATION itself, the mechanism IBL needs to turn a
++// prefiltered environment sample into a physically-plausible specular
++// response at all, independent of whether energy compensation is
++// separately applied on top (Filament's own `evaluateIBL()` applies BOTH:
++// `Fr *= pixel.energyCompensation` follows the split-sum `Fr = E *
++// prefilteredRadiance` -- standard_pbr.slang's own call site does the
++// same, reusing the SAME `EnergyComp` feature-permutation point Task 8
++// already wired for direct lighting).
+ public float3 iblSpecularReflectance(float3 f0, float2 dfg) {
+-    return f0 * dfg.x + float3(dfg.y, dfg.y, dfg.y);
++    return lerp(float3(dfg.x, dfg.x, dfg.x), float3(dfg.y, dfg.y, dfg.y), f0);
+ }
+ 
+ // --- Extension point [Task 21, clearcoat/anisotropy] ---------------------
+ // Filament's own clearcoat lobe (surface_brdf.fs's distributionClearCoat()/
+ // visibilityClearCoat()) reuses D_GGX above unchanged and adds exactly one
+ // new visibility term, V_Kelemen(LoH) = 0.25/(LoH*LoH) (Kelemen 2001, "A
+ // Microfacet Based Coupled Specular-Matte BRDF Model with Importance
+ // Sampling"), plus a fixed-IOR-1.5 F_Schlick(0.04, 1.0, LoH) Fresnel
+ // (surface_shading_model_standard.fs's clearCoatLobe()). Task 21 adds
+ // V_Kelemen()/a clearcoat dispatch HERE, verified against Filament's
+diff --git a/shaders/material/standard_pbr.slang b/shaders/material/standard_pbr.slang
+index b7283b7..fab6f4a 100644
+--- a/shaders/material/standard_pbr.slang
++++ b/shaders/material/standard_pbr.slang
+@@ -461,22 +461,23 @@ struct StandardPbr : IMaterialShader {
+         float3 directLight = (diffuse + specular) * v.lightColor * NdotL;
+ 
+         // [Phase 5 Task 10, #46, FG1 closure] Image-based lighting --
+         // REPLACES the retired FG1 flat ambient/environment term (see
+         // MaterialVertex::ambientColor's own header comment, material.slang)
+         // with real diffuse irradiance + specular prefiltered-cubemap
+         // sampling, per the charter's own "each lobe fed by both direct
+         // lighting and IBL" requirement. Split-sum composition [Karis 2013;
+         // Filament `evaluateIBL()`, shaders/src/surface_light_indirect.fs,
+         // google/filament v1.75.0, :717-758 -- see brdf.slang's own
+-        // `iblSpecularReflectance()` header comment for the full citation]:
+-        //   E  = f0*dfg.x + dfg.y                          (specularDFG)
++        // `iblSpecularReflectance()` header comment for the full citation,
++        // corrected in the T10 fix round per task-10-review.md Finding 1]:
++        //   E  = mix(dfg.x, dfg.y, f0) = (1-f0)*dfg.x+f0*dfg.y (specularDFG)
+         //   Fr = E * prefilteredRadiance(R, roughness-LOD)   (specular)
+         //   Fd = diffuseColor * diffuseIrradiance * (1-E)    (diffuse, energy-
+         //                                                     conserving: gets
+         //                                                     what specular
+         //                                                     did NOT reflect)
+         // A draw with no environment bound (`hasEnvironment == false`,
+         // `v.envIrradianceCubeIndex` still the "no environment" sentinel)
+         // contributes EXACTLY ZERO indirect light -- matching Filament's own
+         // "no IndirectLight bound" behavior, a real, physically-honest
+         // behavior change from FG1's own always-on placeholder (see this
+diff --git a/src/rx_material/tests/test_standard_pbr_ibl_gpu.cpp b/src/rx_material/tests/test_standard_pbr_ibl_gpu.cpp
+index 8962fb7..3b2bf23 100644
+--- a/src/rx_material/tests/test_standard_pbr_ibl_gpu.cpp
++++ b/src/rx_material/tests/test_standard_pbr_ibl_gpu.cpp
+@@ -511,26 +511,38 @@ uint32_t makeFlatNormalTexture(rx::material::MaterialSystem& system) {
+     texInfo.pixelBytes = flatPixel.size();
+     rx::material::TextureHandle tex = system.createTexture2D(texInfo);
+     REQUIRE(tex.isValid());
+     return system.textureBindlessIndex(tex);
+ }
+ 
+ }  // namespace
+ 
+ TEST_CASE("StandardPBR IBL: Lambertian diffuse under a uniform environment reproduces the closed-form "
+           "albedo x radiance value exactly [gate matrix 'Diffuse IBL feeding the diffuse lobe' row] -- "
+-          "dfgValue=(0,0) makes E==f0*0+0==0 identically (regardless of F0), isolating the diffuse lobe "
+-          "(iblDiffuse = diffuseColor * irradianceSample * (1-E) == diffuseColor * irradianceSample exactly; "
+-          "iblSpecular = prefilteredSample * E == 0 exactly) -- bake.h's own pre-divided irradiance convention "
+-          "means the uploaded uniform-radiance texel L IS the closed-form Lambertian-under-uniform-environment "
+-          "answer directly (irradiance = L*pi; outgoing Lambertian radiance = albedo/pi * irradiance == "
+-          "albedo*L for a white albedo == L exactly)") {
++          "[T10 fix round, task-10-review.md Finding 1/2] dfgValue=(0.05,0.4) satisfies the dfg.x<=dfg.y "
++          "invariant every real T9 bake output satisfies (the retired (0,0) constant was degenerate: E==0 "
++          "identically under EITHER the buggy or the corrected specular-DFG formula, which is exactly why "
++          "this TEST_CASE alone could never have caught Finding 1). Even with a non-degenerate dfg, this "
++          "specific probe is STILL formula-invariant, but for an exact, provable reason, not a test gap: "
++          "energy compensation is OFF for this pipeline variant (specializationBits=0, renderQuad()'s own "
++          "getPipeline() call), so `ibl = diffuseColor*irradianceSample*(1-E) + prefilteredSample*E`; with "
++          "metallic=0 and a white baseColorFactor, diffuseColor==(1,1,1) and (uniform environment) "
++          "irradianceSample==prefilteredSample==L, so `ibl = L*(1-E) + L*E == L` EXACTLY for ANY E in "
++          "[0,1] -- the split-sum method's own energy-conservation identity, not something a different dfg "
++          "choice can un-cancel. Discriminating the specular E-formula therefore requires killing the "
++          "diffuse lobe (metallic=1), which is exactly what the mirror-metal and furnace TEST_CASEs below "
++          "do; THIS TEST_CASE's own job is validating the diffuse lobe's own machinery (irradiance "
++          "sampling, Lambertian evaluation, the `(1-E)` wiring) independently of what E's value is -- "
++          "bake.h's own pre-divided irradiance convention means the uploaded uniform-radiance texel L IS "
++          "the closed-form Lambertian-under-uniform-environment answer directly (irradiance = L*pi; "
++          "outgoing Lambertian radiance = albedo/pi * irradiance == albedo*L for a white albedo == L "
++          "exactly)") {
+     auto fixture = makeFixture("standard_pbr_ibl_lambertian");
+     if (!fixture.has_value()) {
+         return;
+     }
+     auto system = rx::material::MaterialSystem::create(fixture->device, fixture->bindless, freshCachePath("lambertian"));
+     REQUIRE(system != nullptr);
+     auto mesh = createQuadMesh(fixture->allocator);
+     REQUIRE(mesh.has_value());
+ 
+     rx::material::MaterialHandle handle =
+@@ -549,66 +561,86 @@ TEST_CASE("StandardPBR IBL: Lambertian diffuse under a uniform environment repro
+         info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+         info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+         info.maxLod = VK_LOD_CLAMP_NONE;
+         REQUIRE(vkCreateSampler(fixture->device.device(), &info, nullptr, &rawSampler) == VK_SUCCESS);
+         rx::rhi::BindlessHandle h = fixture->bindless.registerSampler(rawSampler);
+         REQUIRE(h.isValid());
+         samplerIndex = h.index();
+     }
+ 
+     // radiance L=0.5 -- comfortably below the UNORM store's 1.0 clamp
+-    // ceiling, and dfgValue=(0,0) as this TEST_CASE's own header comment
+-    // derives.
++    // ceiling. dfgValue=(0.05,0.4): [T10 fix round] a realistic,
++    // invariant-respecting (dfg.x < dfg.y) pair for a fully-rough
++    // (roughness=1.0, see the blob below) dielectric probe -- see this
++    // TEST_CASE's own header comment for why the specific value no longer
++    // matters to the final assertion (energy conservation, energy comp
++    // OFF).
+     constexpr float kRadiance = 0.5F;
++    constexpr float kDfgX = 0.05F;
++    constexpr float kDfgY = 0.4F;
+     auto env = makeUniformTestEnvironment(fixture->device, fixture->allocator, fixture->bindless,
+-                                           glm::vec4(kRadiance, kRadiance, kRadiance, 1.0F), glm::vec2(0.0F, 0.0F));
++                                           glm::vec4(kRadiance, kRadiance, kRadiance, 1.0F),
++                                           glm::vec2(kDfgX, kDfgY));
+     REQUIRE(env.has_value());
+ 
+     rx::material::DrawDataGpu row = makeHeadOnIblRow();
+     env->applyTo(row);
+     auto drawDataBuffer = createDrawDataBuffer(fixture->allocator, fixture->bindless, row);
+     REQUIRE(drawDataBuffer.has_value());
+ 
+     std::vector<uint8_t> blob =
+         makeIblBlob(*system, handle, whiteTex, flatNormalTex, samplerIndex, /*metallic=*/0.0F, /*roughness=*/1.0F,
+                     glm::vec4(1.0F, 1.0F, 1.0F, 1.0F));
+ 
+     Rgba8 pixel = renderQuad(fixture->device, fixture->allocator, fixture->bindless, drawDataBuffer->handle,
+                               samplerIndex, *mesh, *system, handle, blob);
+ 
+     // Expected: L*255 == 0.5*255 == 127.5 -> 127 or 128 depending on
+     // rounding; a generous +-6 tolerance absorbs lavapipe's own fp16
+     // storage rounding through the irradiance cubemap's own R16G16B16A16_
+     // SFLOAT texel (kRadiance=0.5 is EXACTLY representable in fp16, so
+     // this tolerance is about the shading math's own rounding, not the
+-    // storage format).
++    // storage format). This closed form is EXACTLY L regardless of which
++    // specular-DFG formula is in effect (see header comment) -- included
++    // here as INFO, not a second CHECK, precisely to make that invariance
++    // visible rather than silently assumed.
+     const int expected = static_cast<int>(std::lround(kRadiance * 255.0));
+     INFO("pixel r=", static_cast<int>(pixel.r), " g=", static_cast<int>(pixel.g), " b=", static_cast<int>(pixel.b),
+-         " expected=", expected);
++         " expected=", expected, " (formula-invariant: both the corrected and the retired-buggy E give ibl==L here)");
+     CHECK(near8(pixel.r, expected, 6));
+     CHECK(near8(pixel.g, expected, 6));
+     CHECK(near8(pixel.b, expected, 6));
+ 
+     env->destroySamplers(fixture->device.device());
+     vkDestroySampler(fixture->device.device(), rawSampler, nullptr);
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
+ TEST_CASE("StandardPBR IBL: mirror-metal sphere under a known environment reproduces the environment -- a "
+-          "matched-pose value probe [ticket #46's own acceptance line, quoted verbatim] -- metallic=1, "
+-          "roughness clamped to kMinRoughness (near-mirror), white F0 (baseColorFactor white x metallic=1 -> "
+-          "F0=(1,1,1)), dfgValue=(1,0) makes E==f0*1+0==f0==(1,1,1) exactly (a perfect, lossless mirror): "
+-          "iblSpecular = prefilteredSample * E == prefilteredSample exactly, iblDiffuse == 0 (metallic=1 kills "
+-          "diffuseColor before E is even applied) -- the head-on rig's own reflection vector R==(0,0,1) (world "
+-          "+Z) always samples cube FACE INDEX 4 (Vulkan's own standard layer-order convention, this file's own "
+-          "header comment) -- a DISTINCT, recognizable color on that ONE face, black everywhere else, proves "
+-          "the probe reads the CORRECT face, not merely 'some' face") {
++          "matched-pose value probe [ticket #46's own acceptance line, quoted verbatim] -- [T10 fix round, "
++          "task-10-review.md Finding 1/2] metallic=1, roughness clamped to kMinRoughness (near-mirror), white "
++          "F0 (baseColorFactor white x metallic=1 -> F0=(1,1,1) exactly). dfgValue=(0.12,0.80): the retired "
++          "(1,0) constant both violated the dfg.x<=dfg.y invariant every real T9 bake output satisfies AND "
++          "had its own 'expected' derived from the SAME (buggy) formula the shader shipped -- a tautology, "
++          "not independent ground truth. The CORRECTED formula [brdf.slang iblSpecularReflectance(), "
++          "mix(dfg.x,dfg.y,f0)] has a robust endpoint identity at f0==(1,1,1) exactly (this probe's own "
++          "F0): mix(dfg.x,dfg.y,1)==dfg.y for ANY dfg.x, so E==dfg.y==0.80 independently of the retired "
++          "formula's own dfg.x term -- a perfect, lossless-in-dfg.y mirror, not exactly f0 anymore (that "
++          "pedagogical shape only held for the OLD formula's own math). iblSpecular = prefilteredSample * E, "
++          "iblDiffuse == 0 (metallic=1 kills diffuseColor before E is even applied), energy compensation OFF "
++          "for this pipeline variant (specializationBits=0) -- the head-on rig's own reflection vector "
++          "R==(0,0,1) (world +Z) always samples cube FACE INDEX 4 (Vulkan's own standard layer-order "
++          "convention, this file's own header comment) -- a DISTINCT, recognizable color on that ONE face, "
++          "black everywhere else, proves the probe reads the CORRECT face, not merely 'some' face. This "
++          "TEST_CASE also asserts an explicit DISCRIMINATION check: the retired formula's own prediction "
++          "(E==dfg.x+dfg.y==0.92 at f0=1) differs from the corrected E==0.80 by exactly dfg.x==0.12, a "
++          "pixel delta comfortably outside this TEST_CASE's own +-8/255 tolerance") {
+     auto fixture = makeFixture("standard_pbr_ibl_mirror");
+     if (!fixture.has_value()) {
+         return;
+     }
+     auto system = rx::material::MaterialSystem::create(fixture->device, fixture->bindless, freshCachePath("mirror"));
+     REQUIRE(system != nullptr);
+     auto mesh = createQuadMesh(fixture->allocator);
+     REQUIRE(mesh.has_value());
+ 
+     rx::material::MaterialHandle handle =
+@@ -633,58 +665,94 @@ TEST_CASE("StandardPBR IBL: mirror-metal sphere under a known environment reprod
+         samplerIndex = h.index();
+     }
+ 
+     // +X,-X,+Y,-Y,+Z,-Z order -- index 4 (+Z) gets a distinctive orange;
+     // every other face is black, so a wrong-face read is unmistakable
+     // (reads near-black instead of orange), not just "a different shade
+     // of some plausible color".
+     constexpr glm::vec4 kFaceColor{0.9F, 0.45F, 0.05F, 1.0F};
+     std::array<glm::vec4, 6> faces{glm::vec4(0.0F), glm::vec4(0.0F), glm::vec4(0.0F),
+                                      glm::vec4(0.0F), kFaceColor,      glm::vec4(0.0F)};
+-    auto env = makeTestEnvironment(fixture->device, fixture->allocator, fixture->bindless, faces, glm::vec2(1.0F, 0.0F));
++    // [T10 fix round] dfg.x=0.12 < dfg.y=0.80 -- satisfies the real-bake
++    // invariant (was (1,0), inverted) and is large enough in dfg.x that the
++    // retired formula's own prediction (dfg.x+dfg.y at f0=1, see header
++    // comment) diverges from the corrected one (dfg.y alone) by more than
++    // this TEST_CASE's own tolerance -- a genuine discriminator, not merely
++    // invariant-compliant.
++    constexpr float kDfgX = 0.12F;
++    constexpr float kDfgY = 0.80F;
++    auto env =
++        makeTestEnvironment(fixture->device, fixture->allocator, fixture->bindless, faces, glm::vec2(kDfgX, kDfgY));
+     REQUIRE(env.has_value());
+ 
+     rx::material::DrawDataGpu row = makeHeadOnIblRow();
+     env->applyTo(row);
+     auto drawDataBuffer = createDrawDataBuffer(fixture->allocator, fixture->bindless, row);
+     REQUIRE(drawDataBuffer.has_value());
+ 
+     std::vector<uint8_t> blob =
+         makeIblBlob(*system, handle, whiteTex, flatNormalTex, samplerIndex, /*metallic=*/1.0F, /*roughness=*/0.0F,
+                     glm::vec4(1.0F, 1.0F, 1.0F, 1.0F));
+ 
+     Rgba8 pixel = renderQuad(fixture->device, fixture->allocator, fixture->bindless, drawDataBuffer->handle,
+                               samplerIndex, *mesh, *system, handle, blob);
+ 
+-    const int expectedR = static_cast<int>(std::lround(kFaceColor.r * 255.0F));
+-    const int expectedG = static_cast<int>(std::lround(kFaceColor.g * 255.0F));
+-    const int expectedB = static_cast<int>(std::lround(kFaceColor.b * 255.0F));
++    // Independently-derived (not read from the shader) closed-form
++    // expected, using the CORRECTED split-sum formula's own endpoint
++    // identity at f0==(1,1,1) exactly: mix(dfg.x,dfg.y,1)==dfg.y for ANY
++    // dfg.x -- see this TEST_CASE's own header comment.
++    constexpr float kExpectedE = kDfgY;
++    const int expectedR = static_cast<int>(std::lround(kFaceColor.r * kExpectedE * 255.0F));
++    const int expectedG = static_cast<int>(std::lround(kFaceColor.g * kExpectedE * 255.0F));
++    const int expectedB = static_cast<int>(std::lround(kFaceColor.b * kExpectedE * 255.0F));
+     INFO("pixel r=", static_cast<int>(pixel.r), " g=", static_cast<int>(pixel.g), " b=", static_cast<int>(pixel.b),
+          " expected=(", expectedR, ",", expectedG, ",", expectedB, ")");
+     CHECK(near8(pixel.r, expectedR, 8));
+     CHECK(near8(pixel.g, expectedG, 8));
+     CHECK(near8(pixel.b, expectedB, 8));
+     // Discrimination: NOT black -- proves this isn't accidentally reading
+     // one of the 5 black faces instead.
+     CHECK(pixel.r > 100);
+ 
++    // [T10 fix round, task-10-review.md Finding 1] Explicit discrimination
++    // against the RETIRED (buggy) formula's own prediction -- at f0=1 the
++    // retired `f0*dfg.x+dfg.y` reduces to `dfg.x+dfg.y`, strictly greater
++    // than the corrected `dfg.y` by exactly `dfg.x`. Assert the two
++    // predictions are themselves far enough apart to matter (i.e. this
++    // TEST_CASE's own choice of dfg.x is not accidentally too small to
++    // discriminate), independent of what the actual rendered pixel reads.
++    constexpr float kOldFormulaE = kDfgX + kDfgY;  // f0*dfg.x+dfg.y at f0=1.
++    const int oldPredictedR = static_cast<int>(std::lround(kFaceColor.r * kOldFormulaE * 255.0F));
++    const int deltaR = oldPredictedR - expectedR;
++    INFO("retired-formula prediction r=", oldPredictedR, " corrected expected r=", expectedR, " delta=", deltaR);
++    CHECK(deltaR > 8);  // exceeds this TEST_CASE's own +-8/255 tolerance -- a real gate-flip, not noise.
++
+     env->destroySamplers(fixture->device.device());
+     vkDestroySampler(fixture->device.device(), rawSampler, nullptr);
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
+ TEST_CASE("StandardPBR IBL: rough-metal furnace sanity on the FULL runtime path -- under a uniform environment "
+           "(radiance L, every face/mip identical by construction) a rough metal's own IBL specular response "
+-          "reproduces the closed form L*E exactly (E=f0*dfgX+dfgY, non-trivial dfg values this time, unlike the "
+-          "mirror TEST_CASE's own toy (1,0)) and stays WITHIN [0, L] -- energy-sane, never exceeding the "
+-          "environment's own radiance (the classic furnace-test invariant, applied end to end through the real "
+-          "production shader rather than brdf.slang's own standalone Monte-Carlo harness)") {
++          "reproduces the closed form L*E exactly -- [T10 fix round, task-10-review.md Finding 1/2] "
++          "E=mix(dfgX,dfgY,f0)==(1-f0)*dfgX+f0*dfgY (Filament's own `specularDFG()`, "
++          "shaders/src/surface_light_indirect.fs v1.75.0:135, matching brdf.slang's own corrected "
++          "`iblSpecularReflectance()`), computed HERE independently in C++ from first principles -- NOT by "
++          "calling the shader's own helper -- so this is a real ground truth, not a tautology (the RETIRED "
++          "version of this TEST_CASE computed `expectedE = kF0*kDfgX+kDfgY`, the EXACT SAME formula the "
++          "shader shipped, which is why it could never have caught Finding 1 no matter what the constants "
++          "were). dfgX=0.08 < dfgY=0.55 satisfies the dfg.x<=dfg.y invariant every real T9 bake output "
++          "satisfies (the retired dfgX=0.9 > dfgY=0.05 inverted it). Also asserts the retired formula's own "
++          "prediction diverges from the corrected one by well outside this TEST_CASE's own +-8/255 "
++          "tolerance -- a real, quantified gate-flip, and stays WITHIN [0, L] -- energy-sane, never "
++          "exceeding the environment's own radiance (the classic furnace-test invariant, applied end to end "
++          "through the real production shader rather than brdf.slang's own standalone Monte-Carlo harness)") {
+     auto fixture = makeFixture("standard_pbr_ibl_furnace");
+     if (!fixture.has_value()) {
+         return;
+     }
+     auto system = rx::material::MaterialSystem::create(fixture->device, fixture->bindless, freshCachePath("furnace"));
+     REQUIRE(system != nullptr);
+     auto mesh = createQuadMesh(fixture->allocator);
+     REQUIRE(mesh.has_value());
+ 
+     rx::material::MaterialHandle handle =
+@@ -703,49 +771,80 @@ TEST_CASE("StandardPBR IBL: rough-metal furnace sanity on the FULL runtime path
+         info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+         info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+         info.maxLod = VK_LOD_CLAMP_NONE;
+         REQUIRE(vkCreateSampler(fixture->device.device(), &info, nullptr, &rawSampler) == VK_SUCCESS);
+         rx::rhi::BindlessHandle h = fixture->bindless.registerSampler(rawSampler);
+         REQUIRE(h.isValid());
+         samplerIndex = h.index();
+     }
+ 
+     constexpr float kRadiance = 0.6F;
+-    constexpr float kDfgX = 0.9F;   // a plausible mid-roughness split-sum scale term.
+-    constexpr float kDfgY = 0.05F;  // a plausible mid-roughness split-sum bias term.
++    // [T10 fix round] dfgX is the Fresnel-scaling (F0) channel -- small at
++    // this probe's own NdotV==1 head-on geometry, per dfg_lut.slang's own
++    // accumulation (`r.x += term*fc`, `fc=(1-VoH)^5` small near VoH==1).
++    // dfgY is the base energy-return channel -- larger, but not the
++    // near-1.0 a near-mirror texel would carry, since this probe's own
++    // roughness=0.6 (fairly rough) reduces total specular energy return.
++    // dfgX < dfgY strictly, satisfying every real T9 bake's own invariant
++    // (the retired dfgX=0.9/dfgY=0.05 pair had this backwards).
++    constexpr float kDfgX = 0.08F;
++    constexpr float kDfgY = 0.55F;
+     constexpr float kF0 = 0.7F;     // grey rough metal (baseColorFactor x metallic=1).
+     auto env = makeUniformTestEnvironment(fixture->device, fixture->allocator, fixture->bindless,
+                                            glm::vec4(kRadiance, kRadiance, kRadiance, 1.0F), glm::vec2(kDfgX, kDfgY));
+     REQUIRE(env.has_value());
+ 
+     rx::material::DrawDataGpu row = makeHeadOnIblRow();
+     env->applyTo(row);
+     auto drawDataBuffer = createDrawDataBuffer(fixture->allocator, fixture->bindless, row);
+     REQUIRE(drawDataBuffer.has_value());
+ 
+     std::vector<uint8_t> blob =
+         makeIblBlob(*system, handle, whiteTex, flatNormalTex, samplerIndex, /*metallic=*/1.0F, /*roughness=*/0.6F,
+                     glm::vec4(kF0, kF0, kF0, 1.0F));
+ 
+     Rgba8 pixel = renderQuad(fixture->device, fixture->allocator, fixture->bindless, drawDataBuffer->handle,
+                               samplerIndex, *mesh, *system, handle, blob);
+ 
+-    const float expectedE = kF0 * kDfgX + kDfgY;
++    // [T10 fix round, task-10-review.md Finding 2] Independent ground
++    // truth: Filament's own `specularDFG()` reconstruction (v1.75.0
++    // surface_light_indirect.fs:135, CubemapIBL.cpp:790-833's own
++    // DFV_Multiscatter() comment "Er() = (1-f0)*DFV.x + f0*DFV.y"),
++    // transcribed here directly in C++ from the cited source -- NOT
++    // derived by calling brdf.slang's own iblSpecularReflectance() or any
++    // shader code -- so a bug in that shader function cannot silently
++    // match this expectation.
++    const float expectedE = (1.0F - kF0) * kDfgX + kF0 * kDfgY;
+     REQUIRE(expectedE >= 0.0F);
+     REQUIRE(expectedE <= 1.0F);  // sanity on this TEST_CASE's own chosen constants -- a real dfg texel never exceeds 1.
+     const float expectedRadiance = kRadiance * expectedE;
+     const int expected = static_cast<int>(std::lround(expectedRadiance * 255.0));
+     INFO("pixel r=", static_cast<int>(pixel.r), " expectedE=", expectedE, " expected=", expected);
+     CHECK(near8(pixel.r, expected, 8));
+     CHECK(near8(pixel.g, expected, 8));
+     CHECK(near8(pixel.b, expected, 8));
+ 
++    // [T10 fix round, task-10-review.md Finding 1] Explicit discrimination
++    // against the RETIRED (buggy) formula's own prediction
++    // (`f0*dfgX+dfgY`, byte-identical to the pre-fix
++    // iblSpecularReflectance()) -- assert the two independently-computed
++    // predictions are themselves far enough apart that this TEST_CASE's
++    // own choice of constants is a real discriminator, not an accident of
++    // rounding.
++    const float oldFormulaE = kF0 * kDfgX + kDfgY;
++    const float oldFormulaRadiance = kRadiance * oldFormulaE;
++    const int oldPredicted = static_cast<int>(std::lround(oldFormulaRadiance * 255.0));
++    const int deltaFromOldFormula = oldPredicted - expected;
++    INFO("retired-formula E=", oldFormulaE, " prediction=", oldPredicted, " corrected expected=", expected,
++         " delta=", deltaFromOldFormula);
++    CHECK(deltaFromOldFormula > 8);  // exceeds this TEST_CASE's own +-8/255 tolerance -- a real gate-flip.
++
+     // The furnace invariant itself: never brighter than the environment's
+     // own radiance (a real energy-conservation bug -- e.g. E applied
+     // twice, or an accidental +1 -- would blow this past kRadiance*255).
+     const int radianceCeiling = static_cast<int>(std::lround(kRadiance * 255.0)) + 4;  // +4 == D17's own per-channel slack.
+     CHECK(pixel.r <= radianceCeiling);
+     CHECK(pixel.g <= radianceCeiling);
+     CHECK(pixel.b <= radianceCeiling);
+ 
+     env->destroySamplers(fixture->device.device());
+     vkDestroySampler(fixture->device.device(), rawSampler, nullptr);
+diff --git a/src/rx_material/tests/test_standard_pbr_unlit.cpp b/src/rx_material/tests/test_standard_pbr_unlit.cpp
+index 747339a..d0a9b34 100644
+--- a/src/rx_material/tests/test_standard_pbr_unlit.cpp
++++ b/src/rx_material/tests/test_standard_pbr_unlit.cpp
+@@ -1265,42 +1265,52 @@ TEST_CASE("StandardPBR: metallic (blue channel) vs dielectric (metallic=0) at fi
+     destroyRig(*rig);
+     CHECK_FALSE(rig->fixture->context.hasValidationErrors());
+ }
+ 
+ TEST_CASE("StandardPBR: occlusion closed-form -- R=0,strength=1 zeroes the IBL term exactly; strength=0.5 halves "
+           "it exactly [Phase 5 Task 10, #46, FG1 closure -- REWRITTEN from the retired ambient-term version: "
+           "occlusion's own closed-form multiplier now scales the REAL IBL contribution "
+           "(standard_pbr.slang: `ibl = (iblDiffuse+iblSpecular) * occlusion * envIntensity`), not FG1's retired "
+           "flat ambient*occlusion*baseColor -- see MaterialVertex::ambientColor's own header comment. A RATIO "
+           "check against a real bound (uniform, so radiometrically simple) environment, rather than a hand-"
+-          "derived absolute constant, since the exact IBL value depends on the split-sum E=f0*dfg.x+dfg.y term "
+-          "this test does not need to re-derive to prove occlusion's own multiplicative role.") {
++          "derived absolute constant, since the exact IBL value depends on the split-sum E=mix(dfg.x,dfg.y,f0) "
++          "term [T10 fix round, task-10-review.md Finding 1 -- corrected from the retired f0*dfg.x+dfg.y form] "
++          "this test does not need to re-derive to prove occlusion's own multiplicative role: the ratio "
++          "assertion below holds for whatever E the corrected formula produces, by construction.") {
+     auto rig = makeStandardPbrRig("standard_pbr_occlusion");
+     if (!rig.has_value()) {
+         return;
+     }
+     rx::material::MaterialHandle handle =
+         rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
+     const auto params = rig->system->materialParams(handle);
+ 
+     // A real, bindless-registered environment -- see
+     // ibl_environment_test_fixture.h's own header comment. Uniform,
+     // deliberately DIM (radiance 0.6, well under the UNORM store's own
+     // 1.0 clamp ceiling): at metallic=1.0/white baseColor (this probe's
+-    // own material), F0=(1,1,1) and E=F0*dfg.x+dfg.y=1.0*0.5+0.5==1.0
+-    // exactly (dfgValue=(0.5,0.5) below), so the fully-unoccluded pixel's
+-    // own closed-form value is exactly `radiance * E * occlusion(1.0) ==
+-    // radiance` -- 0.6 keeps that comfortably below 1.0 so the occlusion=
+-    // 0.5 case's own halved value (0.3) is a REAL, distinguishable ~77/255
+-    // rather than both cases alike clamping to 255 (empirically found
+-    // during this task's own development at an earlier, brighter radiance
+-    // choice -- the ratio check is meaningless once BOTH sides saturate).
++    // own material), F0=(1,1,1) exactly. [T10 fix round, task-10-
++    // review.md Finding 1/2] Under the CORRECTED split-sum formula
++    // (brdf.slang iblSpecularReflectance(), mix(dfg.x,dfg.y,f0)), at f0=1
++    // this reduces to E==dfg.y==0.5 exactly (the mix() endpoint identity
++    // -- see the mirror-metal TEST_CASE in test_standard_pbr_ibl_gpu.cpp
++    // for the same identity used as an actual value probe there), so the
++    // fully-unoccluded pixel's own closed-form value is `radiance * E *
++    // occlusion(1.0) == 0.6*0.5 == 0.3 -> ~77/255`, and the occlusion=0.5
++    // case's own halved value is `~38/255` -- both comfortably clear of 0
++    // and 255 (this test's own ratio assertion does not depend on the
++    // exact numbers, only on neither side saturating; dfgValue=(0.5,0.5)
++    // below satisfies the dfg.x<=dfg.y invariant every real T9 bake
++    // output satisfies, as an equality boundary case -- this test only
++    // needs a real, non-clamped visible value, not a discriminating one,
++    // since its own assertions are RATIOS, invariant to which E-formula
++    // produced them).
+     auto env = rx::material_test::makeUniformTestEnvironment(rig->fixture->device, rig->fixture->allocator,
+                                                                rig->fixture->bindless, glm::vec4(0.6F, 0.6F, 0.6F, 1.0F),
+                                                                glm::vec2(0.5F, 0.5F));
+     REQUIRE(env.has_value());
+ 
+     // Fully-occluding (R=0) texture + a directional light pointed AWAY
+     // from the surface (NdotL=0, zero direct light) isolates the IBL
+     // term exactly, matching the matrix's own acceptance criterion (now
+     // pointed at IBL instead of the retired ambient placeholder): a
+     // metallic=1.0 probe pixel with zero direct light visible reads
