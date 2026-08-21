@@ -231,19 +231,84 @@ Result PresentLoop::runFrame(const FrameBodyFn& frameBody) {
 
     vkEndCommandBuffer(cmd);
 
-    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.waitSemaphoreCount = 1;
-    VkSemaphore waitSem = frameSync_->currentImageAvailableSemaphore();
-    submitInfo.pWaitSemaphores = &waitSem;
-    submitInfo.pWaitDstStageMask = &waitStage;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
+    // [Phase 5 Task 5 review round, CI run 32463376885, pinned validation
+    // layers 1.3.275 (local dev machines run 1.3.204 -- this exact
+    // divergence class is ledgered from Phase 4 Stage 1's 7cc685f
+    // timeline-semaphore round: a newer SyncVal build enforces something an
+    // older one didn't, and CI is the environment that actually catches
+    // it)] THE sync-chain invariant this class owns and must get right on
+    // every caller's behalf, documented here once rather than re-derived
+    // per sample: `frameBody` above is OPAQUE to this class -- it may be a
+    // RenderGraph's own Executor::execute() (whose first command is a
+    // sync2 vkCmdPipelineBarrier2 layout-transitioning the freshly acquired
+    // backbuffer) or, for a graph-free caller, ANY hand-rolled recording at
+    // all. This class therefore cannot assume WHICH pipeline stage the
+    // first real touch of `ctx.image` happens at, and must not require
+    // every caller to independently chain its own first barrier's
+    // srcStageMask from a specific stage this class picks (that
+    // per-caller-must-know-to-chain-correctly contract is exactly the
+    // "hand-rolled sync, patched per sample" pattern this whole module
+    // exists to retire) -- so BOTH ends of this ONE submission use the
+    // WIDEST valid sync2 stage mask instead of trying to name the precise
+    // stage, closing two related SyncVal hazard classes CI's newer layer
+    // surfaced (neither is a false positive -- both are genuine gaps in
+    // what this submission had explicitly proven to the validator, even
+    // though every sample's actual GPU behavior was already correct):
+    //   1. SYNC-HAZARD-WRITE-AFTER-READ: the acquired image's first-touch
+    //      barrier (SYNC_IMAGE_LAYOUT_TRANSITION) must be provably
+    //      ordered-after the presentation engine's own acquire-read
+    //      (SYNC_PRESENT_ENGINE_SYNCVAL_PRESENT_ACQUIRE_READ_SYNCVAL) --
+    //      the WAIT semaphore's own stage coverage is what proves that
+    //      chain, and it must cover whatever stage the first touch uses,
+    //      whichever caller supplied it.
+    //   2. SYNC-HAZARD-PRESENT-AFTER-WRITE: vkQueuePresentKHR must be
+    //      provably ordered-after this submission's OWN final write to
+    //      `ctx.image` (typically the graph's own PRESENT_SRC_KHR
+    //      transition) -- the SIGNAL semaphore's own stage coverage is
+    //      what proves THAT chain.
+    // vkQueueSubmit2/VkSemaphoreSubmitInfo (sync2, not the legacy
+    // VkSubmitInfo/vkQueueSubmit this call used before -- synchronization2
+    // is an unconditional Vulkan 1.3 core feature this project already
+    // enables, device.cpp's own features13.synchronization2 = VK_TRUE) is
+    // what lets each semaphore state its OWN explicit stage coverage
+    // rather than relying on legacy vkQueueSubmit's implicit, ambient
+    // "waits/signals the whole batch" semantics -- exactly the "per sync2
+    // semantics" fix shape, not merely a wider legacy stage mask, since the
+    // failing CI run's own graph-based test cases show the narrower,
+    // RenderGraph-side COLOR_ATTACHMENT_OUTPUT_BIT-chained partial fix
+    // (executor.cpp's own "Backbuffer acquire chaining" comment, dated to
+    // an EARLIER `layers >= ~1.3.240` threshold) is no longer sufficient
+    // against 1.3.275 on its own. VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT is
+    // the Vulkan-spec-documented, maximally-conservative choice for
+    // exactly this "the exact stage is caller-owned, unknowable here"
+    // situation -- a strict superset of every narrower mask any caller's
+    // own barriers already use (including the RenderGraph-side fix above,
+    // which stays in place, now redundant-but-harmless rather than the
+    // sole line of defense).
+    VkCommandBufferSubmitInfo cmdSubmitInfo{};
+    cmdSubmitInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    cmdSubmitInfo.commandBuffer = cmd;
+
+    VkSemaphoreSubmitInfo waitSemInfo{};
+    waitSemInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    waitSemInfo.semaphore = frameSync_->currentImageAvailableSemaphore();
+    waitSemInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
     VkSemaphore signalSem = frameSync_->renderFinishedSemaphore(acquire.imageIndex);
-    submitInfo.signalSemaphoreCount = 1;
-    submitInfo.pSignalSemaphores = &signalSem;
-    if (vkQueueSubmit(device_->graphicsQueue(), 1, &submitInfo, fence) != VK_SUCCESS) {
+    VkSemaphoreSubmitInfo signalSemInfo{};
+    signalSemInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    signalSemInfo.semaphore = signalSem;
+    signalSemInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+    VkSubmitInfo2 submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submitInfo.waitSemaphoreInfoCount = 1;
+    submitInfo.pWaitSemaphoreInfos = &waitSemInfo;
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+    submitInfo.signalSemaphoreInfoCount = 1;
+    submitInfo.pSignalSemaphoreInfos = &signalSemInfo;
+    if (vkQueueSubmit2(device_->graphicsQueue(), 1, &submitInfo, fence) != VK_SUCCESS) {
         return Result::Failed;
     }
 
