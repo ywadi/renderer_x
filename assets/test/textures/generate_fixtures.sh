@@ -82,14 +82,29 @@ convert -size 8x8 xc:"#FF8000" flat_orange.png
 convert -size 6x5 xc:"#FF00FF" nonmult4.png
 
 # 6 cubemap faces (+X -X +Y -Y +Z -Z), each a distinct flat color so a
-# (deliberately never-attempted, per D10/matrix scope) face-order bug
-# would be visually obvious if anything ever DID consume this layout.
+# face-order bug is visually obvious. [Phase 5 Task 6, gate matrix-
+# p5t06-ktx2-cubemap-hdr row 6/Open Question 1] Cubemap KTX2 is now a
+# SUPPORTED, real, value-asserted-uploaded layout (narrowed
+# isUnsupportedLayoutFor() -- cube-array/flat-array/1D/3D stay rejected,
+# see the array2d_rejected.ktx2/cubearray_rejected.ktx2 fixtures below),
+# so these faces are consumed by REAL GPU readback tests now, not merely
+# a rejection stand-in.
 convert -size 4x4 xc:"#FF0000" face_px.png
 convert -size 4x4 xc:"#00FFFF" face_nx.png
 convert -size 4x4 xc:"#00FF00" face_py.png
 convert -size 4x4 xc:"#FF00FF" face_ny.png
 convert -size 4x4 xc:"#0000FF" face_pz.png
 convert -size 4x4 xc:"#FFFF00" face_nz.png
+
+# 32x32 nearest-neighbor upscale of the same 6 faces -- same technique as
+# quadrant16x16.png's own comment above: gives cubemap_mips.ktx2 (below) a
+# real per-face mip chain (32 -> 16 -> 8 -> 4 -> 2 -> 1, 6 levels) while
+# every level still decodes to the SAME flat per-face color a readback
+# test can assert exactly (a flat color box-filters to itself at every
+# level, same reasoning as flat_orange.png's own mip fixture).
+for face in px nx py ny pz nz; do
+  convert "face_${face}.png" -filter point -resize 32x32 "face_${face}_32.png"
+done
 
 # stb (PNG/JPG) fallback-path fixtures -- the SAME quadrant pattern,
 # scaled up slightly (8x8) so JPEG's own lossy block DCT has enough
@@ -175,10 +190,41 @@ printf '\x89PNG\r\n\x1a\nGARBAGE-NOT-A-REAL-PNG-STREAM' > "${OUT_DIR}/corrupt.pn
 # recommends --genmipmap" acceptance row.
 "${TOKTX}" --t2 --encode uastc --assign_oetf srgb "${OUT_DIR}/mips_absent.ktx2" quadrant4x4.png
 
-# Cubemap -- unsupported layout in Phase 4 (D10 scope; FG1's future
-# consumer) -- raw (non-Basis) storage is sufficient since this container
-# is never transcoded, only classified-and-rejected.
-"${TOKTX}" --t2 --cubemap "${OUT_DIR}/cubemap.ktx2" face_px.png face_nx.png face_py.png face_ny.png face_pz.png face_nz.png
+# Cubemap -- SUPPORTED layout as of Phase 5 Task 6 (gate matrix-p5t06-
+# ktx2-cubemap-hdr row 2/6, the discrimination-proof fixture: the SAME
+# file the old "cube -> checkerboard" test asserted against now loads for
+# real). --target_type RGBA forces a real 4-component format (same reason
+# as raw_rgba8.ktx2's own comment below: the source PNGs carry no alpha
+# channel, and toktx's default component-count inference would otherwise
+# produce a 3-component VK_FORMAT_R8G8B8_SRGB, unreliable for
+# SAMPLED_IMAGE on some devices) and --assign_oetf srgb makes the
+# container's own colorspace label explicit rather than inferred. Raw
+# (non-Basis) storage: never transcoded, uploaded verbatim.
+"${TOKTX}" --t2 --cubemap --target_type RGBA --assign_oetf srgb "${OUT_DIR}/cubemap.ktx2" face_px.png face_nx.png face_py.png face_ny.png face_pz.png face_nz.png
+
+# Cubemap WITH a full per-face mip chain (32x32 base -> 1x1, 6 levels) --
+# the primary cube GPU readback fixture (gate matrix row 6/11): every face
+# keeps its own flat authored color at every mip level (box-filtering a
+# flat color reproduces itself, same reasoning as flat_withmips_uastc.ktx2
+# below), so a readback test can assert EXACT per-face-per-mip values.
+"${TOKTX}" --t2 --cubemap --genmipmap --target_type RGBA --assign_oetf srgb "${OUT_DIR}/cubemap_mips.ktx2" face_px_32.png face_nx_32.png face_py_32.png face_ny_32.png face_pz_32.png face_nz_32.png
+
+# Flat 2D ARRAY (isArray=true, isCubemap=false, numLayers=3) -- STILL
+# REJECTED after Task 6's narrowed isUnsupportedLayoutFor() predicate
+# (`numDimensions != 2 || (isArray && !isCubemap) || (isCubemap &&
+# numLayers > 1)`) -- cubemap-only support, zero charter consumer needs a
+# general texture array (gate matrix row 3/Open Question 1). Same 4x4
+# content repeated 3x -- layer content is irrelevant to a rejection-only
+# regression fixture.
+"${TOKTX}" --t2 --layers 3 "${OUT_DIR}/array2d_rejected.ktx2" quadrant4x4.png quadrant4x4.png quadrant4x4.png
+
+# CUBE-ARRAY (isCubemap=true, isArray=true, numLayers=2) -- STILL REJECTED
+# by the same narrowed predicate as array2d_rejected.ktx2 above (the
+# `isCubemap && numLayers > 1` clause) -- cube-array is explicitly out of
+# scope alongside the flat-array case. 12 face images (2 layers x 6
+# faces); the same 6 face_*.png files reused for both layers -- content is
+# irrelevant to a rejection-only regression fixture.
+"${TOKTX}" --t2 --cubemap --layers 2 "${OUT_DIR}/cubearray_rejected.ktx2" face_px.png face_nx.png face_py.png face_ny.png face_pz.png face_nz.png face_px.png face_nx.png face_py.png face_ny.png face_pz.png face_nz.png
 
 # Non-multiple-of-4 base dimensions (6x5) -- block-compressed (UASTC),
 # proving base-level (not just mip-tail) sub-block rounding.
@@ -219,5 +265,61 @@ printf '\x89PNG\r\n\x1a\nGARBAGE-NOT-A-REAL-PNG-STREAM' > "${OUT_DIR}/corrupt.pn
 # the "corrupted container -> named parse error, no crash" acceptance row.
 printf '\xABKTX\x20\x32\x30\xBB\x0D\x0A\x1A\x0AGARBAGE-NOT-A-REAL-KTX2-PAYLOAD' > "${OUT_DIR}/corrupt.ktx2"
 
+# ---------------------------------------------------------------------
+# Radiance HDR fixtures [Phase 5 Task 6, gate matrix-p5t06-ktx2-cubemap-hdr
+# row 9/13] -- hand-authored via plain `printf`, not ImageMagick: this
+# sandbox's ImageMagick build is Q16 WITHOUT HDRI (`convert -version`
+# reports no "HDRI" token), which clamps every pixel value it can express
+# to the normalized [0,1] range -- structurally incapable of producing a
+# genuine super-unity (>1.0) texel, exactly the bar this fixture exists to
+# prove survives the load/upload/readback pipeline. The Radiance/RGBE
+# format itself is simple enough to hand-author correctly and
+# deterministically (D17 regeneration-script discipline: every byte below
+# is derived, not copied from an external binary) -- old-style
+# (non-run-length-encoded) scanlines are the CORRECT choice for a width
+# this small (4 < 8): the Radiance spec's own RLE scanline format is
+# never used below 8 pixels wide, and stb_image.h's own HDR reader
+# (stbi__hdr_load) falls back to reading flat per-pixel RGBE quads
+# whenever a scanline's first 4 bytes don't match the RLE marker
+# (0x02 0x02 <hi> <lo>) -- exactly what this block writes.
+#
+# RGBE encoding [Radiance format, matching stb_image.h's own decode:
+# stbi__hdr_convert(): value = mantissa_byte * ldexp(1, exponent_byte -
+# 136)]: every pixel below shares exponent byte 131 (2^(131-136) =
+# 2^-5 = 0.03125), so mantissa_byte * 0.03125 gives each channel's exact
+# decoded float value:
+#   TL = (128,  16,  16, 131) -> (4.0, 0.5, 0.5)  -- R clearly > 1.0
+#   TR = ( 16, 128,  16, 131) -> (0.5, 4.0, 0.5)  -- G clearly > 1.0
+#   BL = ( 16,  16, 128, 131) -> (0.5, 0.5, 4.0)  -- B clearly > 1.0
+#   BR = (128, 128, 128, 130) -> (2.0, 2.0, 2.0)  -- uniform bright gray
+#     (BR uses exponent 130: ldexp(1, 130-136) = 2^-6 = 0.015625;
+#     128 * 0.015625 = 2.0)
+# "-Y 2 +X 2" -- 2 rows (top-to-bottom), 2 columns (left-to-right) per
+# row: row 0 is TL,TR; row 1 is BL,BR -- matching this fixture's own
+# per-quadrant-color convention used throughout this script (e.g.
+# quadrant4x4.png).
+{
+  printf '#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 2 +X 2\n'
+  printf '\x80\x10\x10\x83'   # TL: (4.0, 0.5, 0.5)
+  printf '\x10\x80\x10\x83'   # TR: (0.5, 4.0, 0.5)
+  printf '\x10\x10\x80\x83'   # BL: (0.5, 0.5, 4.0)
+  printf '\x80\x80\x80\x82'   # BR: (2.0, 2.0, 2.0)
+} > "${OUT_DIR}/equirect_test.hdr"
+
+# Deliberately corrupt HDR -- a syntactically valid Radiance SIGNATURE
+# (stbi_is_hdr_from_memory() reads true -- verified directly against the
+# vendored stb_image.h: stbi__hdr_test()/stbi__hdr_test_core() checks
+# ONLY the leading 11-byte "#?RADIANCE\n" magic, never the FORMAT/
+# resolution lines) with a GARBLED resolution line instead of a real
+# "-Y <h> +X <w>" one -- this is the deliberate choice, not a truncated
+# scanline: stb's own flat (non-RLE, width<8) pixel loop reads through
+# stbi__getn(), which silently zero-pads past EOF rather than erroring
+# (verified empirically -- a truncated-scanline version of this fixture
+# decoded "successfully" with zero-padded trailing pixels, not the
+# failure this row needs). A malformed resolution line instead hits
+# stbi__hdr_load()'s own `strncmp(token, "-Y ", 3)` check
+# deterministically, returning a real, named decode failure every time.
+printf '#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\nGARBAGE-NOT-A-VALID-RESOLUTION-LINE\n' > "${OUT_DIR}/corrupt.hdr"
+
 echo "Fixtures written to ${OUT_DIR}:"
-ls -la "${OUT_DIR}"/*.ktx2 "${OUT_DIR}"/*.png "${OUT_DIR}"/*.jpg
+ls -la "${OUT_DIR}"/*.ktx2 "${OUT_DIR}"/*.png "${OUT_DIR}"/*.jpg "${OUT_DIR}"/*.hdr
