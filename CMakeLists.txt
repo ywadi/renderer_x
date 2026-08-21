@@ -110,6 +110,13 @@ add_subdirectory(src/rx_material)
 # MaterialSystem entirely (RC3), so it has no dependency on that library.
 add_subdirectory(src/rx_shadow)
 
+# Phase 5 Task 5 -- rx_frame_loop: the shared present-loop helper (ticket
+# #41, gate ruling T5) -- an OPTIONAL engine module layered exactly like
+# rx_debug_ui immediately below (same rx_platform/rx_rhi_vk/rx_graph/rx_core
+# dependency shape); added here, after every rx_* CORE library above, for
+# the identical reason rx_debug_ui is -- see that module's own comment.
+add_subdirectory(src/rx_frame_loop)
+
 # Phase 4 Stage 2 Task 21 -- rx_debug_ui: Dear ImGui overlay module (spec
 # D20). Depends on rx_platform (Window)/rx_rhi_vk (Device/Uploader)/
 # rx_graph (RenderGraph pass declaration) plus the vendored `imgui` target
