@@ -71,6 +71,19 @@ struct RenderGraph::Impl {
     std::string backbufferName;
     bool hasBackbuffer = false;
     CompiledGraph compiled;
+
+    // [Phase 5 Task 5, ticket #41 row 10] Recompile-skip cache state -- see
+    // RenderGraph::compile()'s own header comment (render_graph.h) for the
+    // full contract. `declarationGeneration` is bumped by every call that
+    // can change the declared pass topology (addPass()/setBackbufferSource()/
+    // reset()); a successful (non-skipped) compile() stamps
+    // `lastCompiledGeneration`/`lastCompileInfo` with the values it just
+    // compiled against. compile() skips only when BOTH the topology and the
+    // CompileInfo are unchanged since that stamp.
+    uint64_t declarationGeneration = 0;
+    bool hasCompiledOnce = false;
+    uint64_t lastCompiledGeneration = 0;
+    CompileInfo lastCompileInfo{};
 };
 
 // hasAttachmentOutput()/resolveAccess()/isWriteKind() are private members
@@ -269,21 +282,43 @@ Pass& RenderGraph::addPass(std::string_view name, QueueClass queue) {
     // friend access to Pass's private named-parameter constructor itself.
     Pass pass(std::string(name), queue);
     impl_->passes.push_back(std::move(pass));
+    // [Phase 5 Task 5, row 10] Declaring a new pass changes what a future
+    // compile() must resolve -- invalidates the recompile-skip cache even
+    // if a caller re-passes byte-identical CompileInfo.
+    ++impl_->declarationGeneration;
     return impl_->passes.back();
 }
 
 void RenderGraph::setBackbufferSource(std::string_view name) {
     impl_->backbufferName = std::string(name);
     impl_->hasBackbuffer = true;
+    // [Phase 5 Task 5, row 10] Same reasoning as addPass() above.
+    ++impl_->declarationGeneration;
 }
 
-void RenderGraph::compile(const CompileInfo& info) {
+bool RenderGraph::compile(const CompileInfo& info) {
     Impl& g = *impl_;
 
     if (!g.hasBackbuffer) {
         RX_LOG_ERROR("rx_graph: RenderGraph::compile() called without a backbuffer source");
         throw std::runtime_error(
             "rx_graph: RenderGraph::compile() called without a backbuffer source; call setBackbufferSource() first");
+    }
+
+    // ---- [Phase 5 Task 5, ticket #41 row 10] recompile-skip cache -------
+    // See render_graph.h's own compile() comment for the full contract.
+    // Checked FIRST, before any validation below: if neither the declared
+    // topology nor `info` has changed since the last successful compile(),
+    // every check below already passed on that same call and cannot have
+    // started failing without also bumping declarationGeneration (every
+    // topology-mutating entry point does so) -- so re-running them here
+    // would only ever re-derive the same answer at real cost.
+    if (g.hasCompiledOnce && g.lastCompiledGeneration == g.declarationGeneration &&
+        g.lastCompileInfo.swapchainWidth == info.swapchainWidth &&
+        g.lastCompileInfo.swapchainHeight == info.swapchainHeight &&
+        g.lastCompileInfo.swapchainFormat == info.swapchainFormat &&
+        g.lastCompileInfo.backbufferFinalLayout == info.backbufferFinalLayout) {
+        return false;
     }
 
     const auto passCount = static_cast<uint32_t>(g.passes.size());
@@ -920,6 +955,15 @@ void RenderGraph::compile(const CompileInfo& info) {
     }
 
     g.compiled = std::move(compiled);
+
+    // [Phase 5 Task 5, row 10] Stamp the recompile-skip cache with exactly
+    // what this call just compiled against -- the next compile() call with
+    // an unchanged topology AND unchanged `info` skips the work above
+    // entirely (see the cache check near the top of this function).
+    g.hasCompiledOnce = true;
+    g.lastCompiledGeneration = g.declarationGeneration;
+    g.lastCompileInfo = info;
+    return true;
 }
 
 const CompiledGraph& RenderGraph::compiled() const {
@@ -935,6 +979,14 @@ void RenderGraph::reset() {
     impl_->backbufferName.clear();
     impl_->hasBackbuffer = false;
     impl_->compiled = CompiledGraph{};
+    // [Phase 5 Task 5, row 10] A reset graph has no declared passes and no
+    // backbuffer source -- compile() already throws until setBackbufferSource()
+    // is called again (which itself bumps this), so bumping here is
+    // defense-in-depth, not load-bearing on its own; kept for the same
+    // "every topology-mutating entry point bumps this" invariant addPass()/
+    // setBackbufferSource() document.
+    ++impl_->declarationGeneration;
+    impl_->hasCompiledOnce = false;
 }
 
 Pass::Pass(std::string name, QueueClass queue) : name_(std::move(name)), queue_(queue) {}

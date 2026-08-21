@@ -1011,3 +1011,90 @@ TEST_CASE("compile() accepts two IDENTICAL subresource ranges against the same r
     graph.setBackbufferSource("bb");
     CHECK_NOTHROW(graph.compile(kInfo));
 }
+
+// [Phase 5 Task 5, ticket #41 row 10] Recompile-skip cache -- device-free,
+// TDD-first per this ticket's own binding constraint (mirrors the codebase's
+// established pure-function/state-machine test discipline). These assert
+// the exact contract render_graph.h's compile() comment documents; the
+// first two are the REVERT-DISCRIMINATION pair the ticket requires: a
+// revert to "compile() always does the full work" fails the first, a
+// revert to "compile() always skips after the first call" fails the second.
+TEST_CASE("compile() returns true and does real work on the first call") {
+    RenderGraph graph;
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+    CHECK(graph.compile(kInfo) == true);
+    REQUIRE(graph.compiled().executionOrder().size() == 1);
+}
+
+TEST_CASE("compile() returns false (skips) on a second call with byte-identical CompileInfo and unchanged topology") {
+    RenderGraph graph;
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+    CHECK(graph.compile(kInfo) == true);
+    const PhysicalResource* firstResourcePtr = findResource(graph.compiled(), "bb");
+    REQUIRE(firstResourcePtr != nullptr);
+
+    CHECK(graph.compile(kInfo) == false);
+    // Not merely "returns false" -- the compiled() object itself must be
+    // completely untouched (no new resource-resolution work happened at
+    // all), proven by pointer identity, not just equal content -- the same
+    // discipline this project's own D26 zero-alloc invariant test
+    // (rx_scene/draw_list_test.cpp) uses "capacity AND .data() pointer
+    // identity", not content equality alone, for the identical reason: a
+    // buggy "recompute into a fresh vector containing the same values"
+    // implementation would still pass a content-only check.
+    CHECK(findResource(graph.compiled(), "bb") == firstResourcePtr);
+}
+
+TEST_CASE("compile() returns true again once the CompileInfo actually changes (a genuine extent change)") {
+    RenderGraph graph;
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+    CHECK(graph.compile(kInfo) == true);
+
+    CompileInfo resized = kInfo;
+    resized.swapchainWidth = kInfo.swapchainWidth + 1;
+    CHECK(graph.compile(resized) == true);
+    CHECK(graph.compiled().resources()[0].attachment.width == static_cast<float>(resized.swapchainWidth));
+}
+
+TEST_CASE("compile() returns true again when only swapchainFormat or backbufferFinalLayout changes, extent held fixed") {
+    RenderGraph graph;
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+    CHECK(graph.compile(kInfo) == true);
+
+    CompileInfo differentFormat = kInfo;
+    differentFormat.swapchainFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    CHECK(graph.compile(differentFormat) == true);
+
+    CompileInfo differentLayout = differentFormat;
+    differentLayout.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    CHECK(graph.compile(differentLayout) == true);
+}
+
+TEST_CASE("compile() returns true again after addPass()/setBackbufferSource(), even with byte-identical CompileInfo (topology changed)") {
+    RenderGraph graph;
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+    CHECK(graph.compile(kInfo) == true);
+
+    // A second pass added after the first compile() -- same CompileInfo,
+    // but the declared topology is no longer what was last compiled.
+    graph.addPass("side_effect_only").setSideEffect();
+    CHECK(graph.compile(kInfo) == true);
+    CHECK(graph.compiled().executionOrder().size() == 2);
+}
+
+TEST_CASE("compile() returns true again after reset() + re-declaration, even with byte-identical CompileInfo") {
+    RenderGraph graph;
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+    CHECK(graph.compile(kInfo) == true);
+
+    graph.reset();
+    graph.addPass("present").addColorOutput("bb", colorDesc());
+    graph.setBackbufferSource("bb");
+    CHECK(graph.compile(kInfo) == true);
+}

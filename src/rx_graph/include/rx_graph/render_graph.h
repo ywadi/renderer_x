@@ -143,7 +143,44 @@ public:
     // and never cause compile() to throw. Reachable cycles (involving any
     // pass dependency-reachable from the backbuffer or a side-effect pass)
     // are always fatal and throw std::runtime_error with the cycle named.
-    void compile(const CompileInfo& info);
+    //
+    // [Phase 5 Task 5, ticket #41 row 10, gate ruling T5] RECOMPILE-SKIP
+    // CACHE: this call is a no-op (returns false immediately, `compiled()`
+    // left completely untouched -- same object identity, not merely
+    // byte-identical content) when BOTH of the following hold since the
+    // most recent successful (non-skipped) compile() on this instance: (a)
+    // no addPass()/setBackbufferSource()/reset() call has happened in
+    // between, and (b) `info` compares field-for-field equal to the
+    // CompileInfo that call was given. Returns true whenever it actually
+    // performs the compile algorithm (either the very first call, or any
+    // call where (a) or (b) does not hold).
+    //
+    // WHY THIS EXISTS HERE, not only in a caller: every present loop in
+    // this codebase calls compile() again after EVERY successful
+    // Device::recreateSwapchain() (rx_rhi_vk/device.h), including a
+    // present-mode-only toggle that changes no SwapchainRelative resource's
+    // real pixel shape at all -- three samples independently reinvented
+    // three different, inconsistent answers to "was this recompile
+    // actually necessary" before this cache existed (matrix-p5t05, present-
+    // loop survey finding 2). Centralizing the decision here fixes it once
+    // for every caller, including a future host that never adopts
+    // rx_frame_loop's shared present-loop helper -- not just samples that
+    // do.
+    //
+    // A caller that needs to force a genuine same-CompileInfo recompile
+    // (e.g. it mutated pass topology through some future API that does not
+    // go through addPass()/setBackbufferSource()/reset()) has no such API
+    // today -- no real caller in this codebase has ever needed one; adding
+    // a force parameter is deferred until a real need appears, per this
+    // ticket's own gate matrix (Open Questions #4).
+    //
+    // Deliberately NOT [[nodiscard]]: every pre-existing call site in this
+    // codebase (samples, tests) calls this purely for its side effect and
+    // has no reason to start checking a bool it never needed before --
+    // rx_frame_loop::PresentLoop (the one caller that DOES need to know,
+    // to decide whether the matching Executor::realize() is worth paying
+    // for) reads it explicitly.
+    bool compile(const CompileInfo& info);
 
     [[nodiscard]] const CompiledGraph& compiled() const;
 
