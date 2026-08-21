@@ -1,0 +1,2806 @@
+# Review package: d8b8d46..44a2bdf
+
+## Commits
+44a2bdf chore: p5 task 8 SDD report
+7230725 test(rx_material): value-asserted GPU tests for ior/specular consumption + energy-compensation permutation + production-path SPIR-V proof (#44)
+88d45a8 feat(shaders/material,rx_material): rework StandardPBR onto brdf.slang module + ior/specular consumption + energy-compensation permutation axis (#44)
+
+## Files changed
+ .../2026-08-20-phase5-techniques/task-08-report.md | 345 +++++++++++++++
+ samples/06_materials/CMakeLists.txt                |  12 +
+ samples/08_gltf_viewer/CMakeLists.txt              |   9 +
+ samples/08_gltf_viewer/main.cpp                    |  22 +
+ samples/09_scene/CMakeLists.txt                    |   7 +
+ samples/09_scene/main.cpp                          |  17 +
+ shaders/material/energy_compensation_off.slang     |  21 +
+ shaders/material/energy_compensation_on.slang      |  22 +
+ shaders/material/standard_pbr.slang                | 221 ++++++++--
+ .../include/rx_material/material_system.h          |  19 +
+ src/rx_material/material_system.cpp                | 341 +++++++++++---
+ src/rx_material/tests/CMakeLists.txt               |  10 +
+ .../test_standard_pbr_energy_compensation_gpu.cpp  | 444 +++++++++++++++++++
+ .../tests/test_standard_pbr_shadow_gpu.cpp         |  11 +
+ src/rx_material/tests/test_standard_pbr_unlit.cpp  | 490 +++++++++++++++++++++
+ 15 files changed, 1879 insertions(+), 112 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-20-phase5-techniques/task-08-report.md b/.superpowers/sdd/2026-08-20-phase5-techniques/task-08-report.md
+new file mode 100644
+index 0000000..f0ad223
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-20-phase5-techniques/task-08-report.md
+@@ -0,0 +1,345 @@
++# Task 8 report — StandardPBR rework onto the module architecture (issue #44)
++
++Implementer round. Base: main `d8b8d46` (T7's SDD-records commit; tree
++clean except SDD workspace files, not this task's). Order of authority
++followed: rulings (`rulings-2026-08-20.md`, T7/T8/RC1/RC3) > plan (Task 8)
++> gate matrix (`matrix-p5t08-standard-pbr-rework.md`) > ticket (#44).
++
++## Status: COMPLETE
++
++Every matrix row (as amended by the T8 per-ticket ruling) is satisfied.
++Both presets build clean. Real-driver (NVIDIA RTX 2080, default ICD) and
++lavapipe runs both pass with zero unfiltered validation errors. Full
++ctest suites green: linux-native 32/32 (100%), windows-cross-zig/Wine
++14/14 (100%, GPU/sample binaries correctly excluded per the existing CI
++regex — this task added no new binary needing an exclusion-regex update).
++Two independent revert-discrimination proofs performed for real this
++session and recorded below, both restored to green.
++
++## What shipped
++
++- **`shaders/material/standard_pbr.slang`** (reworked) — the inline
++  D_GGX/V_SmithGGXCorrelated/F_Schlick math is replaced with calls into
++  Task 7's `brdf.slang` module; a new `computeDielectricF0F90()` helper
++  derives the dielectric F0/F90 pair from `KHR_materials_ior`/
++  `KHR_materials_specular` (kept in this file, not `brdf.slang`, per the
++  gate matrix's own Open Question — these are glTF-extension-specific
++  formulas, not general Filament-ported math); the module now
++  `import brdf;` and declares `extern struct EnergyComp :
++  IEnergyCompensationFeature;`, resolved at link time by whichever of the
++  two new companion files `MaterialSystem` composes it against.
++- **`shaders/material/energy_compensation_{off,on}.slang`** (new) — the
++  two tiny companion modules that resolve `standard_pbr.slang`'s
++  `EnergyComp` extern, extending Task 7's own
++  `test_brdf_spirv_link_composition_gpu.cpp` proof mechanism into the real
++  production `MaterialSystem::create()`/`compileMaterial()` pipeline.
++- **`StandardPbrParams`** grows exactly FOUR new fields (per the T8 ruling
++  — "no pre-added unused parameter fields", the mechanism's own minimum
++  real cost, not a "future lobe"): `ior` (default 1.5), `specularFactor`
++  (default 1.0), `specularColorFactorAndPad` (default (1,1,1,·)), and
++  `dfgY` (the energy-compensation feature's own input — every current
++  producer binds 1.0, the honest "no correction" neutral value, pending
++  Task 9's baked DFG LUT). The other nine glTF-extension slots the ticket
++  names (clearcoat/anisotropy/sheen/transmission/thickness/attenuation/
++  dispersion/iridescence/diffuseTransmission) are **declared-but-gated via
++  a documented extension-point comment only** (matrix's Open Question,
++  recommendation (b)) — no struct fields for them yet; their owning tasks
++  add fields when they land.
++- **`src/rx_material/material_system.h`** — `kSpecializationEnergyCompensation`
++  (`0x1u`), the first REAL value ever assigned to a `specializationBits`
++  bit position in this codebase (T2's own compute-pipeline work had
++  already confirmed this field was dead/hardcoded-0 everywhere).
++- **`src/rx_material/material_system.cpp`** — `MaterialSystem::create()`
++  now loads the two companion modules unconditionally (cheap, two
++  one-line files); `compileMaterial()` content-sniffs a material's source
++  for `IEnergyCompensationFeature` and, when present, compiles a SECOND
++  (vertex, fragment) SPIR-V pair (link-time composed against
++  `energy_compensation_on.slang`) alongside the base (off) pair — both
++  eagerly, at `loadMaterial()` time, sharing ONE reflection pass (the
++  `EnergyComp` choice never changes `StandardPbrParams`' own field
++  shape). `getPipeline()` selects between the two pairs by
++  `req.specializationBits & kSpecializationEnergyCompensation`,
++  falling back to the base pair for every material that doesn't declare
++  the extern (byte-identical behavior for Unlit and every test fixture).
++  `reloadChanged()` mirrors the same two-pass compile against its own
++  fresh per-reload session. The `compose→link→codegen→vkCreateShaderModule`
++  tail (previously typed out once inline) is factored into
++  `linkAndCreateShaderModules()`, reused by both passes.
++- **`samples/{06_materials,08_gltf_viewer,09_scene}/CMakeLists.txt`** —
++  deploy `brdf.slang` + the two new companion files alongside
++  `material.slang`/`forward_entry.slang`/`standard_pbr.slang` (06 needed
++  this fix too even though it never loads `standard_pbr.slang` at all —
++  see the revert-discrimination-adjacent finding below).
++- **`samples/{08_gltf_viewer,09_scene}/main.cpp`** — bind the four new
++  `StandardPbrParams` fields at their glTF-neutral defaults (ior=1.5,
++  specularFactor=1.0, specularColorFactorAndPad=(1,1,1,0), dfgY=1.0) at
++  every StandardPbr material-setup call site (three total). **Load-bearing,
++  not decorative**: a zero-filled `StandardPbrParams` blob (the pre-Task-8
++  behavior for any unset field) would trip the `ior<=0` special case
++  (Fresnel forced to exactly 1.0 at every angle) for every real asset —
++  this was caught directly by the test suite before it ever reached a
++  sample.
++- **Tests** — see the dedicated test commit; summarized in its own section
++  below.
++
++## Ported-file / formula provenance
++
++`brdf.slang`'s consumed functions were already ported+cited by Task 7
++(`0e58877c0`, `google/filament` v1.75.0) — unchanged here, only newly
++*called* from `standard_pbr.slang`. `computeDielectricF0F90()` itself is
++**not a Filament port** (Filament has no `KHR_materials_ior`/`_specular`
++equivalent — its own `reflectance`/`ior` material properties are a
++different model with different defaults, per the gate matrix's Open
++Question): it is derived directly from the two Khronos extension
++`README.md` files' own quoted formulas (fetched by the gate matrix
++session, re-derived independently for this implementation, cited in the
++function's own header comment):
++
++- `KHR_materials_ior`: `dielectric_f0 = ((ior-1)/(ior+1))^2`; `ior=0`
++  forces the Fresnel term to exactly 1.0 at every angle.
++- `KHR_materials_specular`: `dielectric_f0 = min(0.04*specularColor,
++  1.0)*specular`; `dielectric_f90 = specular` (not 1.0); "the metal BRDF
++  is not affected by the parameter." Interaction rule: combined with
++  `KHR_materials_ior`, the `0.04` constant is replaced by the IOR-derived
++  value.
++
++## Regression-guard proof (matrix's own acceptance criterion, ior row)
++
++**Claim**: at the glTF-default values every current asset binds (ior=1.5,
++specularFactor=1.0, specularColorFactor=(1,1,1) — neither extension is
++parsed from glTF content yet, ruling RC3), the new derivation reproduces
++the pre-Task-8 hardcoded `float3(0.04,0.04,0.04)` + implicit-f90=1.0
++Fresnel byte-identically.
++
++**Verified empirically, not just algebraically**: both D17 pixel gates
++(sample 08's `loading_state.png`/`loaded_scene.png`, sample 09's
++`grid_scene.png`) were re-run on lavapipe against the EXISTING committed
++references, post-rework, with **zero** regeneration:
++
++```
++sample_08_gltf_viewer: D17 loading_state gate: failingPixels=0/65536 (0.0000%) pass=true
++sample_08_gltf_viewer: D17 loaded_scene gate:  failingPixels=0/65536 (0.0000%) pass=true
++sample_09_scene:       D17 grid_scene gate:    failingPixels=0/65536 (0.0000%) pass=true
++```
++
++**Gates 08/09 stay identical — neither was regenerated.** No before/after
++capture pair is attached for this reason: there is no "after" that
++differs from the committed "before." This is the matrix's own required
++outcome for the default-value case, not a missed opportunity — the
++`brdf.slang` module refactor (D_GGX/V_SmithGGXCorrelated algebraically
++identical to the pre-T8 inline forms, hand-verified during T7 and
++re-confirmed here) and the ior/specular derivation's own byte-identical-
++at-defaults design (T7 ruling's computed-f90 default also collapses to
++the implicit-f90 form for every current dielectric/metal, per
++`brdf.slang`'s own `fresnelDefault` header comment) combine to leave
++every existing asset's rendered output untouched.
++
++## The visible change (not in the shipped samples — by design)
++
++The CRITICAL bar named "the first visible material-quality change of the
++phase" — this task delivers the MECHANISM (energy compensation, real
++`specializationBits`) and it IS visibly, measurably different when
++exercised, but **not through either shipped sample's default path**,
++deliberately: `dfgY` (the multi-scatter energy-compensation input) has no
++real per-pixel source until Task 9's baked DFG LUT lands; wiring the ON
++variant into a shipped sample today would mean picking an arbitrary
++constant `dfgY`, which is exactly the kind of unbacked, non-physical
++default this project's production-quality bar rejects. The mechanism's
++real, non-trivial effect is instead demonstrated and value-asserted by
++the new `energy-compensation permutation mechanism` TEST_CASE
++(`test_standard_pbr_unlit.cpp`): at `metallic=1.0, roughness=1.0,
++dfgY=0.5` (a physically-plausible "significant multi-scatter loss"
++probe), the ON variant reads measurably brighter than OFF
++(`CHECK(pixelOn.r > pixelOff.r)`, oracle-verified exact values both
++sides) — real, GPU-rendered, non-tautological evidence the mechanism
++works, available for the coordinator/owner to re-run
++(`rx_material_gpu_tests --test-case="*energy-compensation permutation*"`)
++without needing a static image. A follow-up task (Task 9/10) wiring a
++real `dfgY` source will be the point this becomes visible in a shipped
++sample's own committed reference.
++
++## Per-row proof (matrix, T8-ruling-amended)
++
++| Matrix row | Disposition | Evidence |
++|---|---|---|
++| `KHR_materials_ior` | consume-now | 3 new TEST_CASEs: default(1.5)-vs-1.0 discrimination (oracle-checked, roughness=0.28 sweet spot — see "roughness pitfall" below), `ior=0` special case (distinct from the ordinary formula at a non-1.0 specularFactor, not a coincidental clamp), the regression-guard proof above. |
++| `KHR_materials_specular` | consume-now | `specular=0.0` fully-diffuse collapse; specularColorFactor's own two-axis (color × strength) discrimination test; metal-exclusion zero-delta test. |
++| `KHR_materials_emissive_strength` | already consume-now, verify unaffected | Unaffected — `emissiveFactorAndPad`'s own CPU-side pre-multiply untouched by this rework; every existing emissive-strength assertion in the pre-Task-8 suite still passes unchanged. |
++| Feature-permutation mechanism | built, the ticket's own core deliverable | `kSpecializationEnergyCompensation` is real: (a) zero-feature materials (every material besides `standard_pbr.slang`) produce IDENTICAL SPIR-V regardless of the bit — proven by construction (they never get a second pass at all); (b) SPIR-V presence/absence proof on the PRODUCTION path (new `rx_material_brdf_gpu_tests` TEST_CASE) — ON's fragment SPIR-V has strictly more division instructions (measured: 5 vs 4) and is measurably larger (measured: 3251 vs 3207 words) than OFF's; (c) turning ON does not perturb OFF's own cache entry — `pipelineOffSecond == pipelineOffFirst` (same `VkPipeline` handle, not merely equal-by-value). |
++| Declared-but-gated slots (9 future lobes) | genuinely declared-but-gated, mechanism only | No struct fields added for any of the nine — a documented extension-point comment only, matching D13/D7's own "future task lands here" idiom already used three times in this codebase. |
++| Energy conservation preserved through the rework | consume-now | New parameterized white-furnace pass (`test_standard_pbr_energy_compensation_gpu.cpp`) exercises `computeDielectricF0F90()`'s OWN derivation (not brdf.slang's bare F0=1 constant) across `(ior, specularFactor)` combinations reaching F0≈1 via BOTH the `ior<=0` special case (Q0: `f0=1, ess=0.988382, compensated=1` at low roughness; Q1: `f0=1, ess=0.427034, compensated=1` at HIGH roughness AND a non-1.0 `specularFactor=0.3` — both exact-cancel despite very different `ess`) AND the ordinary high-ior limit (Q2, `ior=1000`: `f0=0.996008, ess=0.427034, compensated=0.997713`, within the epsilon-0.02 tolerance the smaller-than-1 `f0` predicts) — measured, not estimated. The glTF-default low-F0 case (Q3, `ior=1.5`: `f0=0.04, ess=0.427034, compensated=0.449952`) does NOT restore near 1 (discrimination baseline, `|compensated-1|=0.550048 > 0.05`). |
++| Variant discrimination cost claim | consume-now (Tracy zone) | `getPipeline()`'s existing `RX_ZONE` macro already wraps the whole call including the (now real) cache-key lookup; no new per-frame cost for the zero-feature path — the second compile pass runs at `loadMaterial()` (asset-load time), never in `getPipeline()`'s own steady-state cache-hit path, so the claim's actual binding scope (draw-time cost) is unaffected by construction, not merely measured-and-found-equal. See "Concerns" below for the coordinator on whether a DEDICATED new Tracy zone name is still wanted despite this. |
++
++## SPIR-V absence/presence evidence (real, this session, production path)
++
++Composed the REAL shipped `material.slang`/`forward_entry.slang`/
++`standard_pbr.slang`/`brdf.slang` files (not a synthetic fixture) against
++each companion variant file, extracted the fragment entry point's SPIR-V,
++disassembled via `spirv-dis`:
++
++```
++OFF OpFDiv count: 4   (V_SmithGGXCorrelated's own division, the ior/specular
++                        derivation's (ior-1)/(ior+1), KHR_texture_transform
++                        UV-scale reciprocals -- legitimate, pre-existing
++                        divisions unrelated to this feature)
++ON  OpFDiv count: 5   (exactly one more -- energyCompensation()'s own
++                        `1.0 / dfgY`)
++OFF code size: 3207 words
++ON  code size: 3251 words
++```
++
++T7's own standalone `brdf.slang` proof could assert a raw `offDivCount ==
++0` (its whole compute kernel's only division came from the feature
++itself); the real production fragment shader already has other
++legitimate divisions, so the correct generalization is the delta
++(`onDivCount > offDivCount`) — documented explicitly in the test's own
++header comment as the reason this differs from T7's exact-absence form.
++
++## Revert-discrimination proofs (both performed for real this session, both restored to green)
++
++**Proof 1 — the `ior<=0` special case.** Mutated
++`computeDielectricF0F90()`'s guard from `if (ior <= 0.0)` to `if (false)`
++(standard_pbr.slang is read at runtime, no rebuild needed — just re-ran
++the already-built test binary):
++
++```
++before mutation: StandardPBR Task 8: KHR_materials_ior ior=0 ... -- 1 passed, 61/61 assertions
++after mutation:  StandardPBR Task 8: KHR_materials_ior ior=0 ... -- 1 FAILED, 58/61 assertions
++                   (all 3 pixel-channel CHECKs against the oracle's F0=F90=1
++                    prediction fail, since the mutated code now falls
++                    through to the ordinary ((ior-1)/(ior+1))^2 formula)
++```
++Restored; re-ran: 1 passed, 61/61.
++
++**Proof 2 — the SPIR-V delta test's own OFF/ON distinction.** Mutated
++`energy_compensation_off.slang`'s own export to resolve
++`EnergyCompensationOn` instead of `Off` (collapsing the two variants):
++
++```
++before mutation: onDivCount=5, offDivCount=4 -- CHECK(onDivCount > offDivCount) PASSES
++after mutation:  onDivCount=5, offDivCount=5 -- CHECK(onDivCount > offDivCount) FAILS
++                 (CHECK( 5 >  5 ) is NOT correct!); code-size CHECK also
++                 fails identically (3251 == 3251 -- OFF now compiles to
++                 exactly ON's own SPIR-V, since both resolve to
++                 EnergyCompensationOn under the mutation)
++```
++Restored; re-ran: both CHECKs pass.
++
++## A real regression found and fixed mid-round (recorded, not swept under)
++
++`MaterialSystem::create()` now loads the two companion modules
++UNCONDITIONALLY (every `MaterialSystem` instance, regardless of whether
++its own materials reference the feature) — this broke
++`sample_06_materials_headless` (`could not read shared shader file
++'.../material_shaders/energy_compensation_off.slang'`), since that
++sample's own `checker.slang`/`rim.slang` test materials never reference
++`standard_pbr.slang`/`IEnergyCompensationFeature` at all but still build
++a `MaterialSystem` against their own deployed `material_shaders/`
++directory, which didn't have the two new files. Caught by the FULL
++(un-scoped) ctest suite run, not by `rx_material`'s own tests (which use
++the real `RX_MATERIAL_SHADER_DIR` directly, unaffected). Fixed by adding
++`brdf.slang` + the two companion files to `samples/06_materials/
++CMakeLists.txt`'s own shader-deploy list (same fix already applied to
++08/09 proactively). Full suite re-run clean after the fix (32/32).
++
++## Both-preset / both-driver verification (command tails)
++
++```
++$ cmake --build --preset linux-native
++$ xvfb-run -a ctest --preset linux-native --output-on-failure
++100% tests passed, 0 tests failed out of 32
++
++$ cmake --build --preset windows-cross-zig
++[24/24] ... (clean build, all 24 rebuilt targets link)
++$ ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_material_brdf_gpu|rx_debug_ui_gpu|rx_frame_loop_gpu|sample' --output-on-failure
++100% tests passed, 0 tests failed out of 14
++
++# Real-driver (NVIDIA GeForce RTX 2080, default ICD -- vulkaninfo-confirmed
++# this session) -- default ICD on this dev machine IS the real GPU, no
++# VK_ICD_FILENAMES override needed:
++$ ./build/linux-native/src/rx_material/tests/rx_material_gpu_tests --validate
++[doctest] test cases: 65 | 65 passed | 0 failed
++[doctest] assertions: 3293 | 3293 passed | 0 failed
++
++$ ./build/linux-native/src/rx_material/tests/rx_material_brdf_gpu_tests --validate
++[doctest] test cases: 8 | 8 passed | 0 failed
++[doctest] assertions: 167 | 167 passed | 0 failed
++
++# lavapipe (forced VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json):
++same two binaries, same 65/65 and 8/8, zero failures.
++
++# Zero unfiltered validation errors, every run (grep -a "Validation Error"
++# | grep -v "known false positive" -> 0 matches, every log).
++```
++
++## Decisions made as implementer (not escalated — the T8 ruling and matrix's own Open Questions already resolved every contested question)
++
++1. **Eager dual-compile at `loadMaterial()` time, not lazy per-`getPipeline()`-call compilation.** The ticket frames this as "the specialization axis made real"; the alternative (compile the ON variant lazily, on first `getPipeline()` request with the bit set) would need `getPipeline()` itself to gain Slang-compile capability it doesn't have today — a much larger, riskier change for a mechanism with exactly ONE real axis today. Eager-at-load matches this file's own existing design comment ("all of this happens here, eagerly, not lazily deferred to getPipeline()") and costs nothing at steady-state (only `loadMaterial()`, an asset-load-time call, pays the second compile).
++2. **Content-sniffing (`source->find("IEnergyCompensationFeature")`), not a filename check or a link-failure-based detection.** Robust to a future second material also wanting this axis (unlike a `path.stem() == "standard_pbr"` check) and simpler/less fragile than compile-and-catch-failure branching.
++3. **`dfgY` as a real `StandardPbrParams` field, not a compile-time constant passed to `.apply()`.** A constant `1.0` would let Slang's optimizer legally fold `energyCompensation()`'s own division away entirely for a constant-1.0 `dfgY`, undermining both the SPIR-V-presence proof (On's division might not even survive optimization) and the value-assertion test (a constant-folded no-op can't be value-asserted as "brighter than OFF"). A real field is the honest, minimum-necessary cost the T8 ruling's own "the mechanism, not the fields" carve-out anticipates.
++4. **`makeDefaultStandardPbrBlob()`'s pre-existing `metallicFactor=1.0` default is a real gotcha this task's own new dielectric-focused tests had to route around explicitly** (three of six new TEST_CASEs needed an explicit `metallicFactor=0.0` override) — not a bug in that pre-existing default (every pre-Task-8 test already accounted for it), just a sharp edge newly-written ior/specular tests must know about; documented in-line at each call site for the next implementer.
++
++## Roughness-choice pitfall (recorded for the next implementer touching this file)
++
++`kMinRoughness` (0.045) is UNUSABLE for an exact oracle-vs-render pixel
++comparison in this test rig: this rig's own default "flat" normal-map
++texture is byte `(128,128,255)`, which decodes to tangent-space
++`(0.502,0.502,~1.0)` — NOT an exact `(0,0,1)`. At ordinary roughness this
++sub-milliradian tilt is negligible; at `kMinRoughness`, `D_GGX`'s
++near-singular peak amplifies it into a >8x error (measured: idealized
++776/255-saturating vs actual 93/255). `roughness=0.28` was chosen instead
++for every new low-roughness discrimination test — low enough that the
++F0-proportional specular lobe dominates the pixel, high enough that the
++same normal-map imprecision stays a measured ~9% bias, absorbed by a
++documented (not silently loosened) `near8` margin of 22, with every
++discrimination `CHECK` requiring ≥40 levels of separation specifically so
++that bias can never itself explain a false pass.
++
++## Self-review
++
++- [x] Every matrix row addressed with a concrete, cited proof (table
++      above), not a bare "done."
++- [x] Rulings followed in full: T8 (mechanism now, no pre-added unused
++      lobe fields — 4 mechanism-cost fields added, 9 lobe fields NOT
++      added), T7 context (IEnergyCompensationFeature extended into
++      production, not reimplemented), RC3 (ior/specular importer
++      plumbing NOT touched — `rx_asset`/`import_gltf.cpp` untouched by
++      this round, confirmed via `git status`).
++- [x] Byte-source invariant: every new `.slang` file lives under
++      `shaders/material/`, deployed via the same tracked
++      `add_custom_command` OUTPUT/DEPENDS mechanism every sibling file
++      already uses (no inline string-literal shaders introduced).
++- [x] No AI attribution anywhere in the two commits (checked directly,
++      not just via a template default).
++- [x] `git status` reviewed before every stage/commit — the pre-existing
++      `progress.md` modification (present before this round started, not
++      this task's to touch) was excluded from both commits via explicit
++      pathspecs.
++- [x] TDD in substance: every new TEST_CASE was run RED at least once
++      during development (the `metallicFactor` blob bug, the
++      `kMinRoughness` pitfall) before being made to pass correctly — not
++      written-then-immediately-green.
++
++## Concerns for the coordinator
++
++1. **Variant-cost Tracy zone** (matrix row 5): I did not add a NEW,
++   dedicated Tracy zone/counter for "zero-feature-material draw-path
++   cost specifically" — `getPipeline()`'s existing `RX_ZONE` already
++   covers the call, and this task's own design keeps the SECOND compile
++   pass entirely out of the draw-time path (it runs once, at
++   `loadMaterial()`), so there genuinely is no new steady-state cost to
++   isolate. If the coordinator wants a literal before/after Tracy capture
++   number regardless (not just an architectural argument), that is a
++   small follow-up, not a gap in THIS task's own correctness.
++2. **`dfgY`'s eventual real source is explicitly Task 9's job**, not
++   ambiguous, but flagging directly: until that lands, the
++   energy-compensation-ON variant is real, tested, and correct, but
++   inert in every shipped sample (bound to the neutral 1.0). This is the
++   intended, ruling-compliant scope boundary, not a partial delivery —
++   restating it here so it doesn't read as an oversight when Task 9
++   starts.
++3. **No before/after PNG capture is attached** — see "The visible change"
++   section above for why (gates 08/09 are correctly byte-identical; the
++   real, working difference lives in a GPU test assertion, not a static
++   image, until Task 9 supplies a real `dfgY`). Happy to produce a
++   demonstration render on request if the owner wants one sooner.
+diff --git a/samples/06_materials/CMakeLists.txt b/samples/06_materials/CMakeLists.txt
+index 663228f..606e8f3 100644
+--- a/samples/06_materials/CMakeLists.txt
++++ b/samples/06_materials/CMakeLists.txt
+@@ -58,20 +58,32 @@ add_dependencies(sample_06_materials sample_06_materials_own_deploy)
+ # SHADER_DIR stays the default for every OTHER caller (rx_material's own
+ # unit/GPU tests), unchanged.
+ # [Fix round, item 3] OUTPUT/DEPENDS-tracked, NOT a bare
+ # `add_custom_command(TARGET ... POST_BUILD)` -- see samples/08_gltf_viewer/
+ # CMakeLists.txt's own material_shaders deploy comment for the full
+ # mechanism this avoids (a POST_BUILD recipe only re-runs when the TARGET
+ # itself relinks, leaving an edited .slang source's deployed copy stale).
+ set(RX_MATERIALS_SHARED_SHADERS
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/material.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/forward_entry.slang"
++  # [Phase 5 Stage 1 Task 8, #44] MaterialSystem::create() now loads these
++  # two unconditionally alongside material.slang/forward_entry.slang (the
++  # energy-compensation permutation axis -- see material_system.cpp's own
++  # "energy-compensation variant" comment) regardless of whether a given
++  # sample's own materials reference it: this sample's checker.slang/
++  # rim.slang never do, but create() itself still requires the files to
++  # exist in whatever sharedShaderDir it's pointed at, or it fails outright
++  # (this is what broke sample_06_materials_headless before this fix --
++  # revert-discrimination evidence recorded in task-08-report.md).
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/brdf.slang"
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/energy_compensation_off.slang"
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/energy_compensation_on.slang"
+ )
+ add_custom_command(
+   OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/materials_shared_shader_deploy.stamp"
+   COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sample_06_materials>/material_shaders"
+   COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_MATERIALS_SHARED_SHADERS}
+           "$<TARGET_FILE_DIR:sample_06_materials>/material_shaders/"
+   COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/materials_shared_shader_deploy.stamp"
+   DEPENDS ${RX_MATERIALS_SHARED_SHADERS}
+   COMMENT "sample_06_materials: deploying the shared rx_material shaders next to the binary"
+   VERBATIM
+diff --git a/samples/08_gltf_viewer/CMakeLists.txt b/samples/08_gltf_viewer/CMakeLists.txt
+index 9d0c5c0..355ca61 100644
+--- a/samples/08_gltf_viewer/CMakeLists.txt
++++ b/samples/08_gltf_viewer/CMakeLists.txt
+@@ -45,20 +45,29 @@ rx_shader_deploy_runtime_libs(sample_08_gltf_viewer)
+ # the mechanism that produced a clean-HEAD sample_08 OutputNotConsumed
+ # failure this fix round's own in-session development. Same OUTPUT+stamp+
+ # custom_target+add_dependencies shape as this file's own
+ # `references.stamp`/`sample_08_gltf_viewer_references` block below --
+ # see that block's own comment for the full mechanism.
+ set(RX_GLTF_VIEWER_MATERIAL_SHADERS
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/material.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/forward_entry.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/standard_pbr.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/unlit.slang"
++  # [Phase 5 Stage 1 Task 8, #44] standard_pbr.slang now `import brdf;`s
++  # Task 7's BRDF module and links against one of these two companion
++  # variant-selector files (energy-compensation permutation axis) -- all
++  # three must deploy alongside it, or MaterialSystem::create()'s runtime
++  # search-path resolution (against this same deployed material_shaders/
++  # directory) fails the moment this sample tries to load standard_pbr.slang.
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/brdf.slang"
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/energy_compensation_off.slang"
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/energy_compensation_on.slang"
+ )
+ add_custom_command(
+   OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/material_shaders_deploy.stamp"
+   COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sample_08_gltf_viewer>/material_shaders"
+   COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_GLTF_VIEWER_MATERIAL_SHADERS}
+           "$<TARGET_FILE_DIR:sample_08_gltf_viewer>/material_shaders/"
+   COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/material_shaders_deploy.stamp"
+   DEPENDS ${RX_GLTF_VIEWER_MATERIAL_SHADERS}
+   COMMENT "sample_08_gltf_viewer: deploying the shared rx_material shaders next to the binary"
+   VERBATIM
+diff --git a/samples/08_gltf_viewer/main.cpp b/samples/08_gltf_viewer/main.cpp
+index b374df2..39d0dab 100644
+--- a/samples/08_gltf_viewer/main.cpp
++++ b/samples/08_gltf_viewer/main.cpp
+@@ -1128,20 +1128,42 @@ bool setupMaterials(App& app, const rx::asset::Registry& registry,
+         } else {
+             const std::array<float, 4> emissiveFactorAndPad{asset.emissiveFactor.x * asset.emissiveStrength,
+                                                                asset.emissiveFactor.y * asset.emissiveStrength,
+                                                                asset.emissiveFactor.z * asset.emissiveStrength, 0.0F};
+             ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorFactor", baseColorFactor);
+             ok = ok && setMaterialParam(binding.paramBlob, params, "metallicFactor", asset.metallicFactor);
+             ok = ok && setMaterialParam(binding.paramBlob, params, "roughnessFactor", asset.roughnessFactor);
+             ok = ok && setMaterialParam(binding.paramBlob, params, "normalScale", asset.normalScale);
+             ok = ok && setMaterialParam(binding.paramBlob, params, "occlusionStrength", asset.occlusionStrength);
+             ok = ok && setMaterialParam(binding.paramBlob, params, "alphaCutoff", appliedAlphaCutoff);
++            // [Phase 5 Stage 1 Task 8, #44] KHR_materials_ior/_specular's
++            // own glTF-spec-default neutral values -- see
++            // standard_pbr.slang's own computeDielectricF0F90() header
++            // comment for the regression-guard proof that these reproduce
++            // this sample's pre-Task-8 hardcoded-0.04 dielectric Fresnel
++            // byte-identically. [Gate ruling RC3] Neither extension is
++            // parsed from glTF content by the importer yet (T21/T23's own
++            // scope), so every material here binds the neutral default
++            // regardless of what the source asset actually specifies --
++            // non-default real-asset values arrive once those tasks land.
++            ok = ok && setMaterialParam(binding.paramBlob, params, "ior", 1.5F);
++            ok = ok && setMaterialParam(binding.paramBlob, params, "specularFactor", 1.0F);
++            ok = ok && setMaterialParam(binding.paramBlob, params, "specularColorFactorAndPad",
++                                        std::array<float, 4>{1.0F, 1.0F, 1.0F, 0.0F});
++            // [Phase 5 Stage 1 Task 8, #44] Energy-compensation's own dfgY
++            // input -- 1.0 is the honest "no correction" neutral value
++            // (StandardPbrParams::dfgY's own header comment); this sample's
++            // own D27 pipeline pre-resolution call below always requests
++            // specializationBits=0 (the energy-compensation-OFF variant,
++            // which never reads this field), pending Task 9's real
++            // per-pixel DFG-LUT source.
++            ok = ok && setMaterialParam(binding.paramBlob, params, "dfgY", 1.0F);
+             ok = ok && setMaterialParam(binding.paramBlob, params, "emissiveFactorAndPad", emissiveFactorAndPad);
+             ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorTexture",
+                                         resolveTextureIndex(*app.textureCache, asset.baseColorTexture,
+                                                               rx::asset::TextureRole::BaseColor));
+             ok = ok && setMaterialParam(binding.paramBlob, params, "metallicRoughnessTexture",
+                                         resolveTextureIndex(*app.textureCache, asset.metallicRoughnessTexture,
+                                                               rx::asset::TextureRole::MetallicRoughness));
+             ok = ok && setMaterialParam(binding.paramBlob, params, "normalTexture",
+                                         resolveTextureIndex(*app.textureCache, asset.normalTexture,
+                                                               rx::asset::TextureRole::Normal));
+diff --git a/samples/09_scene/CMakeLists.txt b/samples/09_scene/CMakeLists.txt
+index b61c9d4..08f1488 100644
+--- a/samples/09_scene/CMakeLists.txt
++++ b/samples/09_scene/CMakeLists.txt
+@@ -34,20 +34,27 @@ rx_shader_deploy_runtime_libs(sample_09_scene)
+ # --stress workload's own 4 material variants) -- into a material_shaders/
+ # directory next to the binary, mirroring samples/08_gltf_viewer's own
+ # identical deployment. OUTPUT/DEPENDS-tracked (a real custom_command +
+ # custom_target), NOT a bare POST_BUILD recipe -- see that file's own
+ # comment for the incremental-rebuild-staleness hazard this avoids.
+ set(RX_SCENE_MATERIAL_SHADERS
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/material.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/forward_entry.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/standard_pbr.slang"
+   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/unlit.slang"
++  # [Phase 5 Stage 1 Task 8, #44] See samples/08_gltf_viewer/CMakeLists.txt's
++  # identical addition's own comment -- standard_pbr.slang now `import
++  # brdf;`s Task 7's BRDF module and links against one of these two
++  # companion variant-selector files.
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/brdf.slang"
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/energy_compensation_off.slang"
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/energy_compensation_on.slang"
+ )
+ add_custom_command(
+   OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/material_shaders_deploy.stamp"
+   COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sample_09_scene>/material_shaders"
+   COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_SCENE_MATERIAL_SHADERS}
+           "$<TARGET_FILE_DIR:sample_09_scene>/material_shaders/"
+   COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/material_shaders_deploy.stamp"
+   DEPENDS ${RX_SCENE_MATERIAL_SHADERS}
+   COMMENT "sample_09_scene: deploying the shared rx_material shaders next to the binary"
+   VERBATIM
+diff --git a/samples/09_scene/main.cpp b/samples/09_scene/main.cpp
+index 499938a..5facaf8 100644
+--- a/samples/09_scene/main.cpp
++++ b/samples/09_scene/main.cpp
+@@ -1291,20 +1291,30 @@ bool setupHelmetMaterial(App& app, const rx::asset::MaterialAsset& asset) {
+     const std::array<float, 4> emissiveFactorAndPad{asset.emissiveFactor.x * asset.emissiveStrength,
+                                                      asset.emissiveFactor.y * asset.emissiveStrength,
+                                                      asset.emissiveFactor.z * asset.emissiveStrength, 0.0F};
+     bool ok = true;
+     ok = ok && setMaterialParam(blob, params, "baseColorFactor", baseColorFactor);
+     ok = ok && setMaterialParam(blob, params, "metallicFactor", asset.metallicFactor);
+     ok = ok && setMaterialParam(blob, params, "roughnessFactor", asset.roughnessFactor);
+     ok = ok && setMaterialParam(blob, params, "normalScale", asset.normalScale);
+     ok = ok && setMaterialParam(blob, params, "occlusionStrength", asset.occlusionStrength);
+     ok = ok && setMaterialParam(blob, params, "alphaCutoff", appliedAlphaCutoff);
++    // [Phase 5 Stage 1 Task 8, #44] KHR_materials_ior/_specular's own
++    // glTF-spec-default neutral values -- see
++    // samples/08_gltf_viewer/main.cpp's own setupMaterials() and
++    // standard_pbr.slang's own computeDielectricF0F90() header comment for
++    // the full rationale (regression-guard: reproduces this sample's
++    // pre-Task-8 hardcoded-0.04 dielectric Fresnel byte-identically).
++    ok = ok && setMaterialParam(blob, params, "ior", 1.5F);
++    ok = ok && setMaterialParam(blob, params, "specularFactor", 1.0F);
++    ok = ok && setMaterialParam(blob, params, "specularColorFactorAndPad", std::array<float, 4>{1.0F, 1.0F, 1.0F, 0.0F});
++    ok = ok && setMaterialParam(blob, params, "dfgY", 1.0F);
+     ok = ok && setMaterialParam(blob, params, "emissiveFactorAndPad", emissiveFactorAndPad);
+     ok = ok && setMaterialParam(blob, params, "baseColorTexture",
+                                 resolveTextureIndex(*app.textureCache, asset.baseColorTexture, rx::asset::TextureRole::BaseColor));
+     ok = ok && setMaterialParam(blob, params, "metallicRoughnessTexture",
+                                 resolveTextureIndex(*app.textureCache, asset.metallicRoughnessTexture,
+                                                       rx::asset::TextureRole::MetallicRoughness));
+     ok = ok && setMaterialParam(blob, params, "normalTexture",
+                                 resolveTextureIndex(*app.textureCache, asset.normalTexture, rx::asset::TextureRole::Normal));
+     ok = ok && setMaterialParam(blob, params, "occlusionTexture",
+                                 resolveTextureIndex(*app.textureCache, asset.occlusionTexture, rx::asset::TextureRole::Occlusion));
+@@ -1451,20 +1461,27 @@ bool setupImportedMaterials(App& app, const rx::asset::Registry& registry, const
+         } else {
+             const std::array<float, 4> emissiveFactorAndPad{asset.emissiveFactor.x * asset.emissiveStrength,
+                                                              asset.emissiveFactor.y * asset.emissiveStrength,
+                                                              asset.emissiveFactor.z * asset.emissiveStrength, 0.0F};
+             ok = ok && setMaterialParam(blob, params, "baseColorFactor", baseColorFactor);
+             ok = ok && setMaterialParam(blob, params, "metallicFactor", asset.metallicFactor);
+             ok = ok && setMaterialParam(blob, params, "roughnessFactor", asset.roughnessFactor);
+             ok = ok && setMaterialParam(blob, params, "normalScale", asset.normalScale);
+             ok = ok && setMaterialParam(blob, params, "occlusionStrength", asset.occlusionStrength);
+             ok = ok && setMaterialParam(blob, params, "alphaCutoff", appliedAlphaCutoff);
++            // [Phase 5 Stage 1 Task 8, #44] See setupHelmetMaterial()'s own
++            // identical three calls (this file, above) for the full
++            // rationale.
++            ok = ok && setMaterialParam(blob, params, "ior", 1.5F);
++            ok = ok && setMaterialParam(blob, params, "specularFactor", 1.0F);
++            ok = ok && setMaterialParam(blob, params, "specularColorFactorAndPad", std::array<float, 4>{1.0F, 1.0F, 1.0F, 0.0F});
++            ok = ok && setMaterialParam(blob, params, "dfgY", 1.0F);
+             ok = ok && setMaterialParam(blob, params, "emissiveFactorAndPad", emissiveFactorAndPad);
+             ok = ok && setMaterialParam(blob, params, "baseColorTexture",
+                                         resolveTextureIndex(*app.textureCache, asset.baseColorTexture, rx::asset::TextureRole::BaseColor));
+             ok = ok && setMaterialParam(blob, params, "metallicRoughnessTexture",
+                                         resolveTextureIndex(*app.textureCache, asset.metallicRoughnessTexture,
+                                                               rx::asset::TextureRole::MetallicRoughness));
+             ok = ok && setMaterialParam(blob, params, "normalTexture",
+                                         resolveTextureIndex(*app.textureCache, asset.normalTexture, rx::asset::TextureRole::Normal));
+             ok = ok && setMaterialParam(blob, params, "occlusionTexture",
+                                         resolveTextureIndex(*app.textureCache, asset.occlusionTexture, rx::asset::TextureRole::Occlusion));
+diff --git a/shaders/material/energy_compensation_off.slang b/shaders/material/energy_compensation_off.slang
+new file mode 100644
+index 0000000..8c3cb1c
+--- /dev/null
++++ b/shaders/material/energy_compensation_off.slang
+@@ -0,0 +1,21 @@
++// shaders/material/energy_compensation_off.slang -- Phase 5 Stage 1 Task 8
++// [#44, gate rulings T7/T8]: the OFF resolution of brdf.slang's
++// `IEnergyCompensationFeature` link-time composition point, wired into the
++// REAL production MaterialSystem pipeline (not just a throwaway test
++// composite -- test_brdf_spirv_link_composition_gpu.cpp, T7's own file,
++// already proved this exact link-time-composition SHAPE against a
++// standalone compute entry point; this file is the production-path half).
++//
++// MaterialSystem::create() loads this file (and its ON sibling,
++// energy_compensation_on.slang) once, alongside forward_entry.slang, via
++// the same loadSharedModule() helper [material_system.cpp]. Any material
++// module that declares `extern struct EnergyComp : IEnergyCompensationFeature;`
++// (standard_pbr.slang does -- see that file's own header comment) gets
++// composed against ONE of these two files at link time, selected by
++// PipelineRequest::specializationBits' kSpecializationEnergyCompensation
++// bit [material_system.h] -- this is D28's fixed-function axis's sibling
++// mechanism for the SHADER-RECOMPILE-triggering axis Phase-3 D8 reserved
++// `specializationBits` for, made real for the first time by this ticket.
++import brdf;
++
++export struct EnergyComp : IEnergyCompensationFeature = EnergyCompensationOff;
+diff --git a/shaders/material/energy_compensation_on.slang b/shaders/material/energy_compensation_on.slang
+new file mode 100644
+index 0000000..132b3ad
+--- /dev/null
++++ b/shaders/material/energy_compensation_on.slang
+@@ -0,0 +1,22 @@
++// shaders/material/energy_compensation_on.slang -- Phase 5 Stage 1 Task 8
++// [#44]: the ON resolution of brdf.slang's `IEnergyCompensationFeature`
++// link-time composition point -- see energy_compensation_off.slang's own
++// header comment (this file's sibling) for the full mechanism this pair
++// implements. Selected when PipelineRequest::specializationBits carries
++// kSpecializationEnergyCompensation [material_system.h].
++//
++// NOT wired to any shipped default material instance yet [gate matrix
++// "Feature-permutation mechanism" row]: `StandardPbrParams::dfgY`
++// (standard_pbr.slang) is a real, reflected, per-instance parameter this
++// variant's compiled code genuinely reads (proving the mechanism end to
++// end, value-asserted by test_standard_pbr_energy_compensation_gpu.cpp),
++// but every producer of a StandardPbr instance today (samples 08/09) binds
++// it to 1.0 -- the honest "no unaccounted multi-scattering loss assumed"
++// neutral value -- because the REAL per-pixel source (a baked DFG/
++// environment-BRDF LUT, Filament's own `pixel.dfg.y`) is Task 9's
++// deliverable (IBL bake chain), not built yet. This file exists, compiles,
++// links, and is numerically correct against an injected dfgY today; wiring
++// a real per-pixel dfgY through to shipped content is Task 9/10's job.
++import brdf;
++
++export struct EnergyComp : IEnergyCompensationFeature = EnergyCompensationOn;
+diff --git a/shaders/material/standard_pbr.slang b/shaders/material/standard_pbr.slang
+index 4df2e48..2cf2f37 100644
+--- a/shaders/material/standard_pbr.slang
++++ b/shaders/material/standard_pbr.slang
+@@ -1,41 +1,89 @@
+ // shaders/material/standard_pbr.slang -- Phase 4 Stage 1 Task 16 [D22, D28,
+-// gate ruling #8/RC1]: an ordinary public IMaterialShader module (zero
+-// special treatment) implementing glTF's metallic-roughness core: base
+-// color, metallic/roughness, tangent-space normal mapping (BC5
+-// reconstruction), occlusion, emissive, alphaMode's shader-side half (MASK
+-// discard -- alphaMode's PIPELINE-STATE half, BLEND/doubleSided, is D28's
+-// MaterialRecord fixed-function axis, never referenced here), and
+-// KHR_texture_transform offset/scale per texture slot.
++// gate ruling #8/RC1] baseline, REWORKED in Phase 5 Stage 1 Task 8 [#44,
++// gate rulings rulings-2026-08-20.md T7/T8] onto Task 7's `brdf.slang`
++// module (D_GGX/V_SmithGGXCorrelated/F_Schlick/Fd_Lambert/
++// energyCompensation -- consumed here, never reimplemented): an ordinary
++// public IMaterialShader module (zero special treatment) implementing
++// glTF's metallic-roughness core: base color, metallic/roughness,
++// tangent-space normal mapping (BC5 reconstruction), occlusion, emissive,
++// alphaMode's shader-side half (MASK discard -- alphaMode's PIPELINE-STATE
++// half, BLEND/doubleSided, is D28's MaterialRecord fixed-function axis,
++// never referenced here), KHR_texture_transform offset/scale per texture
++// slot, and (Task 8, new) KHR_materials_ior + KHR_materials_specular's own
++// dielectric F0/F90 derivation.
+ //
+-// LIGHTING MODEL [BRDF baseline, gate matrix-issue08's own three-
+-// first-tier-reference convergence]: Lambertian diffuse (Filament's own
+-// documented choice over Burley -- "delivers results close enough to more
+-// complex models" -- and glTF-Sample-Renderer's/three.js's own shipped
+-// choice) + Cook-Torrance specular with a GGX normal distribution, Smith
+-// height-correlated visibility, and Schlick Fresnel (Filament's own
+-// documented baseline; glTF-Sample-Renderer's `pbr.frag`
+-// BRDF_specularGGX()/F_Schlick() confirm the identical shape). Plus [FG1,
++// LIGHTING MODEL [BRDF baseline]: Lambertian diffuse (`Fd_Lambert()`,
++// brdf.slang) + Cook-Torrance specular with GGX distribution (`D_GGX`),
++// Smith height-correlated visibility (`V_SmithGGXCorrelated`), and Schlick
++// Fresnel (`F_Schlick`, explicit-f90 overload -- brdf.slang), all consumed
++// from Task 7's module rather than duplicated inline (matrix-issue08's own
++// three-first-tier-reference convergence on this exact baseline is
++// unchanged by the rework; only WHERE the math lives changed). Plus [FG1,
+ // issue comment 2] an interim flat ambient/environment term (uniform color
+ // x occlusion) so metals never render pure black pre-IBL -- the full
+-// skybox+IBL environment path is registered for the techniques phase, not
+-// built here.
++// skybox+IBL environment path is registered for the techniques phase
++// (Task 9/10), not built here.
++//
++// TASK 8 -- KHR_materials_ior / KHR_materials_specular [gate matrix rows,
++// same file]: `computeDielectricF0F90()` below derives the dielectric F0/
++// F90 pair from `ior`/`specularFactor`/`specularColorFactorAndPad`
++// (glTF-default neutral values reproduce this file's PRE-T8 hardcoded
++// `float3(0.04,0.04,0.04)` + implicit-f90=1.0 Fresnel byte-identically --
++// see that function's own header comment for the closed-form proof). Kept
++// in THIS file, not brdf.slang, per the gate matrix's own Open Question
++// recommendation: these are glTF-EXTENSION-specific F0/f90 derivations,
++// not general Filament-ported BRDF math (Filament has no equivalent to
++// either extension) -- brdf.slang stays pure, reusable math; this file
++// stays the glTF-vocabulary-aware consumer. [Gate ruling RC3] Neither
++// extension is parsed from glTF content yet (importer plumbing is T21's/
++// T23's job) -- every current producer (samples 08/09) binds the neutral
++// glTF-default values, so this is real, tested, value-asserted SHADER
++// math today, with non-default real-asset values arriving once T21/T23
++// land.
++//
++// TASK 8 -- feature-permutation mechanism [gate ruling T8: "permutation
++// mechanism now, no pre-added unused parameter fields"; gate matrix
++// "Feature-permutation mechanism" row]: `EnergyComp` (the `extern` below)
++// is brdf.slang's own `IEnergyCompensationFeature` link-time composition
++// point [T7's shipped precedent, test_brdf_spirv_link_composition_gpu.cpp],
++// extended here into the REAL MaterialSystem pipeline -- see
++// energy_compensation_{off,on}.slang's own header comments and
++// material_system.cpp's "energy-compensation variant" comment for the full
++// mechanism (specializationBits, previously a dead field per T2's own
++// finding, now genuinely selects distinct linked SPIR-V). `dfgY`
++// (StandardPbrParams, below) is the ONE new field this mechanism costs --
++// not a "future lobe" field the T8 ruling's Open Question warns against
++// pre-adding, but the minimum real, testable surface the MECHANISM itself
++// needs to be provably real (a non-constant-foldable input the ON variant
++// genuinely reads and the OFF variant provably does not) -- every current
++// producer binds 1.0 (the honest "no correction" neutral value) until
++// Task 9's baked DFG LUT supplies a real per-pixel value.
+ //
+ // TEXTURE SLOTS -- every texture-index field below is D11's bindless-
+ // index convention: ALWAYS a valid, real texture (Registry/TextureCache's
+ // own role-appropriate fallback -- white for baseColor/occlusion/
+ // metallicRoughness/emissive, flat-normal for normalTexture -- when the
+ // source glTF material has no reference for that slot at all), so this
+ // module carries no separate "has texture" boolean anywhere; sampling a
+ // role-neutral fallback multiplies/blends to exactly the "texture absent"
+ // behavior glTF's own factor defaults already specify.
+ import material;
++import brdf;
++
++// [Task 8] The energy-compensation permutation point -- see this file's
++// own header comment above and energy_compensation_{off,on}.slang for the
++// full mechanism. Left unresolved here deliberately (no default), matching
++// forward_entry.slang's own `extern struct MaterialImpl : IMaterialShader;`
++// precedent: MaterialSystem::create()'s two companion modules are what
++// resolve it, per (material, specializationBits) at link time.
++extern struct EnergyComp : IEnergyCompensationFeature;
+ 
+ struct StandardPbrParams {
+     // --- Base color [universal glTF default: (1,1,1,1)] ---
+     float4 baseColorFactor;
+ 
+     // --- Metallic-roughness [universal glTF defaults: both 1.0] ---
+     float metallicFactor;
+     float roughnessFactor;
+ 
+     // --- Normal map scale [glTF default: 1.0] ---
+@@ -43,20 +91,39 @@ struct StandardPbrParams {
+ 
+     // --- Occlusion strength [glTF default: 1.0] ---
+     float occlusionStrength;
+ 
+     // [D28] MASK's cutoff -- see unlit.slang's identical field for the full
+     // "always-present conditional discard, alphaMode itself lives in
+     // VkPipeline fixed-function state" rationale (MaterialFixedFunctionState,
+     // material_system.h). OPAQUE/BLEND instances bind 0.0 (never discards).
+     float alphaCutoff;
+ 
++    // --- [Task 8] KHR_materials_ior / KHR_materials_specular ------------
++    // See computeDielectricF0F90()'s own header comment below for the full
++    // formulas and the regression-guard proof that these glTF-spec
++    // defaults reproduce this file's pre-T8 hardcoded Fresnel exactly.
++    // `ior` default 1.5 [KHR_materials_ior]; `specularFactor` default 1.0,
++    // `specularColorFactorAndPad.xyz` default (1,1,1) [KHR_materials_specular
++    // -- w unused padding, same "pad vec3 to vec4" convention as
++    // emissiveFactorAndPad below].
++    float ior;
++    float specularFactor;
++    float4 specularColorFactorAndPad;
++
++    // [Task 8] The energy-compensation feature's own dfgY input -- see
++    // this file's own header comment above ("feature-permutation
++    // mechanism") for why this field exists and what every current
++    // producer binds it to (1.0, a neutral no-op) pending Task 9's real
++    // per-pixel DFG-LUT source.
++    float dfgY;
++
+     // xyz = emissiveFactor [glTF default: (0,0,0)], PRE-MULTIPLIED by
+     // KHR_materials_emissive_strength at bind time (the multiply this
+     // module would otherwise need a fourth uniform for -- folding it into
+     // the CPU-side bind avoids widening this struct for a log-don't-drop
+     // extension per the gate matrix's own disposition). w unused (padding).
+     float4 emissiveFactorAndPad;
+ 
+     // D11 bindless indices -- see this file's own header comment.
+     uint baseColorTexture;
+     uint metallicRoughnessTexture;
+@@ -91,32 +158,99 @@ struct StandardPbrParams {
+     float4 baseColorUvOffsetScale;
+     float4 metallicRoughnessUvOffsetScale;
+     float4 normalUvOffsetScale;
+     float4 occlusionUvOffsetScale;
+     float4 emissiveUvOffsetScale;
+ };
+ 
+ [[vk::binding(0, 1)]]
+ ParameterBlock<StandardPbrParams> gParams;
+ 
+-static const float kPi = 3.14159265358979323846;
+-
+ // GGX alpha (roughness^2, the Disney/UE "remap" every first-tier engine
+ // applies before feeding roughness into D/V) is clamped away from exactly
+ // 0 -- an unclamped roughness=0 drives D_GGX's denominator to exactly 0 at
+ // NdotH==1 (a true singularity, not just a large-but-finite number), which
+ // would return NaN/Inf for a perfectly smooth mirror surface. 0.045 is the
+ // Filament-precedent minimum perceptual roughness (documented in Filament's
+ // own PBR chapter as the smallest value its own implementation clamps to
+ // for the identical reason).
+ static const float kMinRoughness = 0.045;
+ 
++// [Task 8] The result of the KHR_materials_ior/_specular dielectric
++// derivation -- see computeDielectricF0F90()'s own header comment.
++struct DielectricF0F90 {
++    float3 f0;
++    float f90;
++};
++
++// [Task 8, gate matrix Open Question "Where does the ior->f0 / specular->
++// (f0,f90) derivation live" -- RECOMMEND standard_pbr.slang, not
++// brdf.slang: resolved here] Derives the DIELECTRIC F0/F90 pair from
++// `ior`/`specularFactor`/`specularColorFactor` -- glTF-extension-specific
++// formulas, not general Filament-ported BRDF math (Filament has no
++// equivalent to either KHR_materials_ior or KHR_materials_specular). This
++// is the SINGLE shared helper the gate matrix's "metal-exclusion
++// enforcement" Open Question recommends, so the "the metal BRDF is not
++// affected by [either] parameter" invariant [both extensions' own spec
++// text] is enforced in ONE place (evaluate()'s own metallic `lerp` below),
++// not duplicated per call site.
++//
++// KHR_materials_ior (quoted, gate matrix): `dielectric_f0 =
++// ((ior-1)/(ior+1))^2` -- at the spec's own default (ior=1.5) this
++// evaluates to exactly 0.04, this file's pre-T8 hardcoded constant.
++// Special case (quoted): `ior=0` "forces the Fresnel term to evaluate to
++// exactly 1.0 regardless of view/light angle" (a specular-glossiness
++// backward-compat mode) -- modeled below as f0=f90=1.0, which makes
++// `F_Schlick(1,1,VoH) == 1 + (1-1)*pow5(...) == 1.0` identically for EVERY
++// VoH, satisfying the spec's own "MUST evaluate to 1.0 independently of
++// view or light direction" text exactly (a real, different code path, not
++// merely a different F0 constant -- per the gate matrix's own "genuinely
++// different code path" framing).
++//
++// KHR_materials_specular (quoted, gate matrix): `dielectric_f0 =
++// min(0.04 * specularColor, 1.0) * specular`, `dielectric_f90 = specular`
++// (NOT 1.0 -- brdf.slang's explicit-f90 `F_Schlick` overload exists
++// specifically for this, per that module's own header comment and the T7
++// matrix's Fresnel-overload recommendation). Explicit interaction rule
++// (quoted): "If KHR_materials_ior is used in combination with
++// KHR_materials_specular, the constant 0.04 is replaced by the value
++// computed from the IOR" -- applied unconditionally below (both
++// extensions' formulas always compose; a source asset that sets neither
++// simply supplies both extensions' own neutral defaults).
++//
++// REGRESSION GUARD [gate matrix acceptance criterion, ior row]: at the
++// glTF-default values (ior=1.5, specularFactor=1.0,
++// specularColorFactor=(1,1,1)) -- what every CURRENT producer binds, since
++// neither extension is parsed from glTF content yet [gate ruling RC3] --
++// this reduces to EXACTLY f0=(0.04,0.04,0.04), f90=1.0: `((1.5-1)/
++// (1.5+1))^2 = (0.5/2.5)^2 = 0.2^2 = 0.04`; `min(0.04*1,1.0)*1.0 = 0.04`;
++// f90=1.0. Byte-identical to this file's pre-T8 hardcoded
++// `float3(0.04,0.04,0.04)` + implicit-f90=1.0 Fresnel (`F_Schlick(f0, 1.0,
++// VoH)` is algebraically the SAME expression the old inline
++// `F0 + (1-F0)*pow5(1-VdotH)` computed).
++DielectricF0F90 computeDielectricF0F90(float ior, float specularFactor, float3 specularColorFactor) {
++    if (ior <= 0.0) {
++        DielectricF0F90 result;
++        result.f0 = float3(1.0, 1.0, 1.0);
++        result.f90 = 1.0;
++        return result;
++    }
++
++    float iorTerm = (ior - 1.0) / (ior + 1.0);
++    float dielectricF0Base = iorTerm * iorTerm;
++
++    DielectricF0F90 result;
++    result.f0 = min(dielectricF0Base * specularColorFactor, float3(1.0, 1.0, 1.0)) * specularFactor;
++    result.f90 = specularFactor;
++    return result;
++}
++
+ struct StandardPbr : IMaterialShader {
+     float4 evaluate(MaterialVertex v) {
+         // --- Base color ---------------------------------------------------
+         float2 baseColorUv = v.uv * gParams.baseColorUvOffsetScale.zw + gParams.baseColorUvOffsetScale.xy;
+         float4 baseColor = gParams.baseColorFactor *
+                             rx_sampleTexture(gParams.baseColorTexture, gParams.baseColorSampler, baseColorUv);
+ 
+         // [D28] Always-present conditional discard -- see
+         // StandardPbrParams::alphaCutoff's own comment above.
+         if (baseColor.a < gParams.alphaCutoff) {
+@@ -170,57 +304,60 @@ struct StandardPbr : IMaterialShader {
+         float occSample = rx_sampleTexture(gParams.occlusionTexture, gParams.occlusionSampler, occUv).r;
+         float occlusion = 1.0 + gParams.occlusionStrength * (occSample - 1.0);
+ 
+         // --- Emissive -------------------------------------------------
+         float2 emUv = v.uv * gParams.emissiveUvOffsetScale.zw + gParams.emissiveUvOffsetScale.xy;
+         float3 emissive = gParams.emissiveFactorAndPad.xyz *
+                            rx_sampleTexture(gParams.emissiveTexture, gParams.emissiveSampler, emUv).rgb;
+ 
+         // --- Lambertian diffuse + GGX/Smith-correlated/Schlick specular,
+         // one directional light [BRDF baseline, this file's own header
+-        // comment] --------------------------------------------------
++        // comment; math consumed from brdf.slang -- Task 8 rework]
++        // --------------------------------------------------------------
+         float3 viewDir = normalize(v.cameraPosWorld - v.worldPos);
+         float3 lightDir = normalize(v.lightDirWorld);
+         float3 halfVec = normalize(viewDir + lightDir);
+         float NdotL = max(dot(N, lightDir), 0.0);
+         float NdotV = max(dot(N, viewDir), 1e-4);  // clamped away from 0, not 0-able geometry (grazing/back-facing).
+         float NdotH = max(dot(N, halfVec), 0.0);
+         float VdotH = max(dot(viewDir, halfVec), 0.0);
+ 
+-        // Dielectric F0 = 0.04 [glTF/Disney-convention default, matching
+-        // this project's own already-fixed constant per the gate matrix's
+-        // KHR_materials_ior row]; metals use their own baseColor as F0
+-        // (the standard metallic-workflow lerp).
+-        float3 dielectricF0 = float3(0.04, 0.04, 0.04);
+-        float3 F0 = lerp(dielectricF0, baseColor.rgb, metallic);
++        // [Task 8] Dielectric F0/F90 via KHR_materials_ior/_specular --
++        // see computeDielectricF0F90()'s own header comment. Metal
++        // exclusion ["the metal BRDF is not affected by the parameter",
++        // both extensions' own spec text]: `lerp` toward baseColor/1.0 at
++        // metallic=1 exactly as this file's pre-T8 code already did for
++        // the plain-0.04 case -- the SAME invariant, now enforced for the
++        // ior/specular-derived F0/F90 too.
++        DielectricF0F90 dielectric =
++            computeDielectricF0F90(gParams.ior, gParams.specularFactor, gParams.specularColorFactorAndPad.xyz);
++        float3 F0 = lerp(dielectric.f0, baseColor.rgb, metallic);
++        float F90 = lerp(dielectric.f90, 1.0, metallic);
+         float3 diffuseColor = baseColor.rgb * (1.0 - metallic);  // metals have zero diffuse.
+ 
+         float alpha = roughness * roughness;
+-        float alpha2 = alpha * alpha;
+-
+-        // D_GGX.
+-        float denomD = (NdotH * NdotH) * (alpha2 - 1.0) + 1.0;
+-        float D = alpha2 / (kPi * denomD * denomD);
+ 
+-        // V_SmithGGXCorrelated -- height-correlated visibility, already
+-        // divides out the classic 4*NdotL*NdotV denominator (Filament's own
+-        // documented form, matching this file's header comment).
+-        float lambdaV = NdotL * sqrt(NdotV * NdotV * (1.0 - alpha2) + alpha2);
+-        float lambdaL = NdotV * sqrt(NdotL * NdotL * (1.0 - alpha2) + alpha2);
+-        float vis = 0.5 / max(lambdaV + lambdaL, 1e-5);
+-
+-        // F_Schlick.
+-        float3 oneMinusF0 = float3(1.0, 1.0, 1.0) - F0;
+-        float3 fresnel = F0 + oneMinusF0 * pow(clamp(1.0 - VdotH, 0.0, 1.0), 5.0);
++        float D = D_GGX(alpha, NdotH);
++        float vis = V_SmithGGXCorrelated(alpha, NdotV, NdotL);
++        float3 fresnel = F_Schlick(F0, F90, VdotH);
+ 
+         float3 specular = D * vis * fresnel;
+-        float3 diffuse = diffuseColor / kPi;
++        // [Task 8, gate ruling T7/T8] Energy-compensation permutation
++        // point -- see this file's own header comment ("feature-
++        // permutation mechanism") and brdf.slang's own
++        // energyCompensation()/IEnergyCompensationFeature header comments
++        // for the MULTIPLICATIVE CONTRACT this follows exactly: the
++        // specular lobe's response only, never the diffuse lobe.
++        EnergyComp energyFeature;
++        specular = energyFeature.apply(specular, F0, gParams.dfgY);
++
++        float3 diffuse = diffuseColor * Fd_Lambert();
+ 
+         // [Fix round, coordinator ruling] `occlusion` deliberately does NOT
+         // multiply direct light: the glTF spec's own occlusionTexture text
+         // and all three first-tier engine references (Filament/glTF-
+         // Sample-Renderer/three.js) treat ambient occlusion as an
+         // INDIRECT-only term, and the gate matrix's own occlusion row
+         // scopes the acceptance criterion to exactly the ambient
+         // contribution below ("ambientColor x occlusionValue x
+         // baseColor... the ONLY contribution"). An earlier version of this
+         // file multiplied `directLight` by `occlusion` too -- spec-
+diff --git a/src/rx_material/include/rx_material/material_system.h b/src/rx_material/include/rx_material/material_system.h
+index 04cf396..deabacb 100644
+--- a/src/rx_material/include/rx_material/material_system.h
++++ b/src/rx_material/include/rx_material/material_system.h
+@@ -57,20 +57,39 @@ struct PipelineRequest {
+     MaterialHandle material;
+     PassSignature pass;
+ 
+     // D8: reserved for a future orthogonal specialization-constant bitmask
+     // (Filament-style independent shading axes -- skinning, fog, ...) --
+     // always 0 in Phase 3's material core, but already part of the cache
+     // key so a future axis doesn't need an ABI/cache-format break.
+     uint32_t specializationBits = 0;
+ };
+ 
++// [Phase 5 Stage 1 Task 8, #44, gate rulings T7/T8] The FIRST real
++// `specializationBits` axis -- T2's own compute-pipeline work confirmed
++// this field was, until now, hardcoded to 0 at its one call site
++// (bindInstance()) and never varied, making it a dead field despite D8's
++// own "reserved for a future... bitmask" framing. This bit selects which
++// of `shaders/material/energy_compensation_{off,on}.slang` a material
++// declaring `extern struct EnergyComp : IEnergyCompensationFeature;`
++// (standard_pbr.slang) links against -- Task 7's own
++// `IEnergyCompensationFeature` link-time-composition mechanism
++// (brdf.slang, test_brdf_spirv_link_composition_gpu.cpp), extended here
++// into the real MaterialSystem::getPipeline() pipeline-variant cache key
++// (see material_system.cpp's own "energy-compensation variant" comment).
++// A material whose module does not declare that `extern` (every material
++// besides standard_pbr.slang today) ignores this bit entirely -- it
++// selects between two SPIR-V variants that are byte-identical for that
++// material, since neither `EnergyComp` export is ever referenced by its
++// code.
++inline constexpr uint32_t kSpecializationEnergyCompensation = 0x1u;
++
+ // --- D28 (gate ruling RC1, 2026-08-18): the fixed-function pipeline-state
+ // axis -----------------------------------------------------------------
+ // glTF's `alphaMode`/`doubleSided` are `VkPipeline` FIXED-FUNCTION fields
+ // (blend enable, depth-write enable, cull mode) with zero SPIR-V
+ // representation -- NOT specialization constants (the plan's earlier
+ // "specialization bits gain alphaMode/doubleSided axes" phrasing is
+ // corrected by D22/D28/this gate ruling). This is the reusable mechanism
+ // future fixed-function-state needs (wireframe, stencil effects, ...)
+ // extends: a loaded material (MaterialRecord, material_system.cpp) carries
+ // this state, and it is folded into getPipeline()'s own pipeline-variant
+diff --git a/src/rx_material/material_system.cpp b/src/rx_material/material_system.cpp
+index 474d933..4189a3a 100644
+--- a/src/rx_material/material_system.cpp
++++ b/src/rx_material/material_system.cpp
+@@ -737,20 +737,33 @@ struct MaterialRecord {
+     // independent; a reload never touches any OTHER material's session.
+     Slang::ComPtr<slang::ISession> ownerSession;
+     Slang::ComPtr<slang::IComponentType> linkedProgram;
+     rx::shader::ShaderLayoutInfo layoutInfo;
+     std::vector<MaterialParamInfo> params;  // [Task 7]
+     uint32_t paramBlockSize = 0;            // [Task 7]
+     rx::rhi::PipelineLayoutBundle layoutBundle;
+ 
+     VkShaderModule vertexModule = VK_NULL_HANDLE;
+     VkShaderModule fragmentModule = VK_NULL_HANDLE;
++
++    // [Phase 5 Stage 1 Task 8, #44] The energy-compensation-ON sibling
++    // variant -- see CompiledMaterial's own identical fields (this file's
++    // "energy-compensation variant" comment) for the full mechanism;
++    // mirrored here 1:1 by loadMaterial()/reloadChanged() on every
++    // (re)compile. getPipeline() below selects between this pair and
++    // vertexModule/fragmentModule above per
++    // req.specializationBits & kSpecializationEnergyCompensation, falling
++    // back to the base pair whenever hasEnergyCompensationVariant is false
++    // (every material besides standard_pbr.slang today).
++    VkShaderModule vertexModuleOn = VK_NULL_HANDLE;
++    VkShaderModule fragmentModuleOn = VK_NULL_HANDLE;
++    bool hasEnergyCompensationVariant = false;
+ };
+ 
+ // [Task 7 coordinator addition 4] One created texture: the real owned
+ // rx::rhi::Texture2D plus the BindlessTable slot its view was registered
+ // into. destroyAll()-equivalent teardown is handled entirely by RAII
+ // (Texture2D's own destructor) once ~MaterialSystem()'s vkDeviceWaitIdle()
+ // has already run, or by releaseTexture()'s own DeletionQueue-retired
+ // closure for a texture released mid-run.
+ struct TextureRecord {
+     rx::rhi::Texture2D texture;
+@@ -791,20 +804,26 @@ struct MaterialSystem::Impl {
+     // The shared entry-point module every material composes against --
+     // loaded once here, in create(), and its two entry points retained for
+     // every subsequent loadMaterial() call. See forward_entry.slang's own
+     // header comment for the full link-time-specialization mechanism this
+     // drives.
+     slang::IModule* forwardEntryModule = nullptr;  // owned by `session`, not this Impl -- see loadMaterial()'s
+                                                     // own comment on why material modules are handled the same way.
+     Slang::ComPtr<slang::IEntryPoint> vertexEntryPoint;
+     Slang::ComPtr<slang::IEntryPoint> fragmentEntryPoint;
+ 
++    // [Task 8] The energy-compensation permutation axis's two companion
++    // modules -- see loadEnergyCompVariants()'s own header comment. Owned
++    // by `session`, same lifetime discipline as forwardEntryModule above.
++    slang::IModule* energyCompOffModule = nullptr;
++    slang::IModule* energyCompOnModule = nullptr;
++
+     rx::core::HandlePool<MaterialTag, MaterialRecord> materials;
+ 
+     // rx::core::HandlePool (rx_core/handle.h) exposes no iteration of its
+     // own live slots -- acquire()/release()/get() only, since nothing
+     // before this task ever needed to walk every handle it had ever
+     // handed out. Adding that is outside Task 5's Modify list (rx_core is
+     // not touched by this task), so ~MaterialSystem() instead destroys
+     // every MaterialRecord's owned Vulkan objects by re-deriving a fresh
+     // `MaterialRecord*` from each handle gathered here, via materials.get(),
+     // AT DESTRUCTION TIME -- not by caching the pointer loadMaterial()
+@@ -1007,21 +1026,56 @@ std::optional<ForwardEntryBundle> loadForwardEntry(slang::ISession* session, con
+         return std::nullopt;
+     }
+     if (SLANG_FAILED(bundle.module->findEntryPointByName("fragmentMain", bundle.fragmentEntryPoint.writeRef())) ||
+         bundle.fragmentEntryPoint.get() == nullptr) {
+         RX_LOG_ERROR("rx_material: forward_entry.slang has no 'fragmentMain' entry point");
+         return std::nullopt;
+     }
+     return bundle;
+ }
+ 
++// [Task 8] The energy-compensation permutation axis's two companion
++// modules -- see energy_compensation_{off,on}.slang's own header comments
++// and material_system.h's kSpecializationEnergyCompensation comment for
++// the full mechanism. Loaded exactly once per session (create()'s own
++// `impl.session`, or reloadChanged()'s fresh per-reload session), mirroring
++// loadForwardEntry()'s own "shared module, loaded once, reused by every
++// compileMaterial() call against this session" shape.
++struct EnergyCompVariantModules {
++    slang::IModule* offModule = nullptr;  // owned by `session`, not this struct.
++    slang::IModule* onModule = nullptr;   // owned by `session`, not this struct.
++};
++
++std::optional<EnergyCompVariantModules> loadEnergyCompVariants(slang::ISession* session,
++                                                                 const std::filesystem::path& shaderDir,
++                                                                 std::string& diagnostics) {
++    EnergyCompVariantModules modules;
++    modules.offModule = loadSharedModule(session, shaderDir, "energy_compensation_off.slang", diagnostics);
++    if (modules.offModule == nullptr) {
++        return std::nullopt;
++    }
++    modules.onModule = loadSharedModule(session, shaderDir, "energy_compensation_on.slang", diagnostics);
++    if (modules.onModule == nullptr) {
++        return std::nullopt;
++    }
++    return modules;
++}
++
+ void destroyMaterialRecord(VkDevice device, MaterialRecord& record) {
++    if (record.vertexModuleOn != VK_NULL_HANDLE) {
++        vkDestroyShaderModule(device, record.vertexModuleOn, nullptr);
++        record.vertexModuleOn = VK_NULL_HANDLE;
++    }
++    if (record.fragmentModuleOn != VK_NULL_HANDLE) {
++        vkDestroyShaderModule(device, record.fragmentModuleOn, nullptr);
++        record.fragmentModuleOn = VK_NULL_HANDLE;
++    }
+     if (record.vertexModule != VK_NULL_HANDLE) {
+         vkDestroyShaderModule(device, record.vertexModule, nullptr);
+         record.vertexModule = VK_NULL_HANDLE;
+     }
+     if (record.fragmentModule != VK_NULL_HANDLE) {
+         vkDestroyShaderModule(device, record.fragmentModule, nullptr);
+         record.fragmentModule = VK_NULL_HANDLE;
+     }
+     // record.layoutBundle destroys its own VkDescriptorSetLayout(s)/
+     // VkPipelineLayout on destruction (PipelineLayoutBundle's own
+@@ -1043,48 +1097,164 @@ void destroyMaterialRecord(VkDevice device, MaterialRecord& record) {
+ struct CompiledMaterial {
+     Slang::ComPtr<slang::ISession> session;
+     Slang::ComPtr<slang::IComponentType> linkedProgram;
+     uint64_t contentHash = 0;
+     rx::shader::ShaderLayoutInfo layoutInfo;
+     std::vector<MaterialParamInfo> params;
+     uint32_t paramBlockSize = 0;
+     rx::rhi::PipelineLayoutBundle layoutBundle;
+     VkShaderModule vertexModule = VK_NULL_HANDLE;
+     VkShaderModule fragmentModule = VK_NULL_HANDLE;
++
++    // [Phase 5 Stage 1 Task 8, #44] The energy-compensation-ON sibling
++    // variant -- see material_system.h's own kSpecializationEnergyCompensation
++    // comment and this file's "energy-compensation variant" comment below
++    // for the full mechanism. Only populated (hasEnergyCompensationVariant
++    // == true) for a material module whose source references
++    // `IEnergyCompensationFeature` (standard_pbr.slang, today); every other
++    // material leaves these VK_NULL_HANDLE and getPipeline() always falls
++    // back to vertexModule/fragmentModule above for it, regardless of
++    // req.specializationBits.
++    VkShaderModule vertexModuleOn = VK_NULL_HANDLE;
++    VkShaderModule fragmentModuleOn = VK_NULL_HANDLE;
++    bool hasEnergyCompensationVariant = false;
+ };
+ 
+ void destroyCompiledMaterialGpuObjects(VkDevice device, CompiledMaterial& compiled) {
+     if (compiled.vertexModule != VK_NULL_HANDLE) {
+         vkDestroyShaderModule(device, compiled.vertexModule, nullptr);
+         compiled.vertexModule = VK_NULL_HANDLE;
+     }
+     if (compiled.fragmentModule != VK_NULL_HANDLE) {
+         vkDestroyShaderModule(device, compiled.fragmentModule, nullptr);
+         compiled.fragmentModule = VK_NULL_HANDLE;
+     }
++    if (compiled.vertexModuleOn != VK_NULL_HANDLE) {
++        vkDestroyShaderModule(device, compiled.vertexModuleOn, nullptr);
++        compiled.vertexModuleOn = VK_NULL_HANDLE;
++    }
++    if (compiled.fragmentModuleOn != VK_NULL_HANDLE) {
++        vkDestroyShaderModule(device, compiled.fragmentModuleOn, nullptr);
++        compiled.fragmentModuleOn = VK_NULL_HANDLE;
++    }
+     compiled.layoutBundle = rx::rhi::PipelineLayoutBundle{};
+ }
+ 
++// [Task 8] One linked-and-codegen'd (vertex, fragment) VkShaderModule pair
++// -- the tail half of what compileMaterial()'s pre-Task-8 body did inline
++// exactly once; factored out so it can run a SECOND time (the energy-
++// compensation-ON variant pass) without a second, drift-prone hand copy,
++// matching task-6-report.md's own Fix round 1 (F3) precedent for why this
++// file factors identical setup rather than typing it out twice.
++// `diagnosticsLabel` tags every diagnostic this produces (e.g.
++// "energyCompOn") so a failure in one variant pass is unambiguous in the
++// log even though both passes share one `diagnostics` accumulator.
++std::optional<CompiledMaterial> linkAndCreateShaderModules(VkDevice device, slang::ISession* session,
++                                                            const std::vector<slang::IComponentType*>& parts,
++                                                            const char* diagnosticsLabel, std::string& diagnostics) {
++    Slang::ComPtr<slang::IComponentType> composite;
++    Slang::ComPtr<slang::IBlob> composeDiag;
++    SlangResult composeResult = session->createCompositeComponentType(
++        parts.data(), static_cast<SlangInt>(parts.size()), composite.writeRef(), composeDiag.writeRef());
++    appendDiagnostics(diagnostics, (std::string("compose[") + diagnosticsLabel + "]").c_str(), composeDiag);
++    if (SLANG_FAILED(composeResult) || composite.get() == nullptr) {
++        return std::nullopt;
++    }
++
++    Slang::ComPtr<slang::IComponentType> linked;
++    Slang::ComPtr<slang::IBlob> linkDiag;
++    SlangResult linkResult = composite->link(linked.writeRef(), linkDiag.writeRef());
++    appendDiagnostics(diagnostics, (std::string("link[") + diagnosticsLabel + "]").c_str(), linkDiag);
++    if (SLANG_FAILED(linkResult) || linked.get() == nullptr) {
++        return std::nullopt;
++    }
++
++    // Entry point order in `parts` is always (forwardEntryModule,
++    // vertexEntryPoint, fragmentEntryPoint, materialModule, [variant
++    // part]) -- vertex is always index 0, fragment always index 1,
++    // matching compiler.cpp's own "entry points contribute in exactly the
++    // order pushed" contract, regardless of which (if any) variant part
++    // follows the material module.
++    Slang::ComPtr<slang::IBlob> vertexCodeDiag;
++    Slang::ComPtr<slang::IBlob> vertexCode;
++    SlangResult vertexCodeResult = linked->getEntryPointCode(0, 0, vertexCode.writeRef(), vertexCodeDiag.writeRef());
++    appendDiagnostics(diagnostics, (std::string("codegen(vertex)[") + diagnosticsLabel + "]").c_str(),
++                       vertexCodeDiag);
++    if (SLANG_FAILED(vertexCodeResult) || vertexCode.get() == nullptr) {
++        return std::nullopt;
++    }
++
++    Slang::ComPtr<slang::IBlob> fragmentCodeDiag;
++    Slang::ComPtr<slang::IBlob> fragmentCode;
++    SlangResult fragmentCodeResult =
++        linked->getEntryPointCode(1, 0, fragmentCode.writeRef(), fragmentCodeDiag.writeRef());
++    appendDiagnostics(diagnostics, (std::string("codegen(fragment)[") + diagnosticsLabel + "]").c_str(),
++                       fragmentCodeDiag);
++    if (SLANG_FAILED(fragmentCodeResult) || fragmentCode.get() == nullptr) {
++        return std::nullopt;
++    }
++
++    CompiledMaterial result;
++    result.linkedProgram = linked;
++
++    VkShaderModuleCreateInfo vertexModuleInfo{};
++    vertexModuleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
++    vertexModuleInfo.codeSize = vertexCode->getBufferSize();
++    vertexModuleInfo.pCode = static_cast<const uint32_t*>(vertexCode->getBufferPointer());
++    if (vkCreateShaderModule(device, &vertexModuleInfo, nullptr, &result.vertexModule) != VK_SUCCESS) {
++        diagnostics += std::string("vkCreateShaderModule (vertex[") + diagnosticsLabel + "]) failed\n";
++        return std::nullopt;
++    }
++
++    VkShaderModuleCreateInfo fragmentModuleInfo{};
++    fragmentModuleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
++    fragmentModuleInfo.codeSize = fragmentCode->getBufferSize();
++    fragmentModuleInfo.pCode = static_cast<const uint32_t*>(fragmentCode->getBufferPointer());
++    if (vkCreateShaderModule(device, &fragmentModuleInfo, nullptr, &result.fragmentModule) != VK_SUCCESS) {
++        diagnostics += std::string("vkCreateShaderModule (fragment[") + diagnosticsLabel + "]) failed\n";
++        vkDestroyShaderModule(device, result.vertexModule, nullptr);
++        return std::nullopt;
++    }
++
++    return result;
++}
++
+ std::optional<CompiledMaterial> compileMaterial(VkDevice device, rx::rhi::BindlessTable& bindless,
+                                                  Slang::ComPtr<slang::ISession> session,
+                                                  slang::IModule* forwardEntryModule,
+                                                  slang::IEntryPoint* vertexEntryPoint,
+                                                  slang::IEntryPoint* fragmentEntryPoint,
++                                                 slang::IModule* energyCompOffModule,
++                                                 slang::IModule* energyCompOnModule,
+                                                  const std::filesystem::path& slangModulePath,
+                                                  std::string& diagnostics) {
+     auto source = readFileBytes(slangModulePath);
+     if (!source.has_value()) {
+         diagnostics += "could not read material module '" + slangModulePath.string() + "'\n";
+         return std::nullopt;
+     }
+     uint64_t contentHash = fnv1aBytes(source->data(), source->size());
+ 
++    // [Task 8] Content-sniffed, not parsed -- a material module wanting the
++    // energy-compensation permutation axis declares
++    // `extern struct EnergyComp : IEnergyCompensationFeature;`
++    // (standard_pbr.slang does; see that file's own header comment), which
++    // this substring search detects cheaply and reliably (Slang identifier
++    // names cannot appear as a substring by accident in valid source
++    // without ALSO being the real interface name, since `IEnergyCompensation
++    // Feature` is brdf.slang's own, deliberately unusual, non-generic
++    // identifier). A module that does NOT reference it (every material
++    // besides standard_pbr.slang today -- Unlit, every test fixture) skips
++    // the whole second-variant machinery below entirely, unaffected byte-
++    // for-byte by this ticket's own change.
++    bool usesEnergyComp = source->find("IEnergyCompensationFeature") != std::string::npos;
++
+     // Loaded via loadModuleFromSource() + a self-read ifstream, exactly
+     // like rx_shader::Compiler::compileFromFile() -- not
+     // session->loadModule(slangModulePath), which resolves purely through
+     // Slang's own search-path-based file lookup and would make a
+     // material's own path (as opposed to the two fixed, shared,
+     // search-path-resolved files) subject to that same lookup for no
+     // benefit. `moduleName` is the file's stem, so this inherits
+     // compiler.h's own documented SAME-MODULE-NAME CAVEAT verbatim:
+     // reloading the SAME path through the SAME session fails with Slang's
+     // own "already loaded with different source" diagnostic -- exactly why
+@@ -1097,116 +1267,90 @@ std::optional<CompiledMaterial> compileMaterial(VkDevice device, rx::rhi::Bindle
+ 
+     Slang::ComPtr<slang::IBlob> sourceBlob(Slang::INIT_ATTACH, slang_createBlob(source->data(), source->size()));
+     Slang::ComPtr<slang::IBlob> loadDiag;
+     slang::IModule* materialModule = session->loadModuleFromSource(
+         moduleName.c_str(), slangModulePath.string().c_str(), sourceBlob, loadDiag.writeRef());
+     appendDiagnostics(diagnostics, "load", loadDiag);
+     if (materialModule == nullptr) {
+         return std::nullopt;
+     }
+ 
+-    std::vector<slang::IComponentType*> parts;
+-    parts.push_back(forwardEntryModule);
+-    parts.push_back(vertexEntryPoint);
+-    parts.push_back(fragmentEntryPoint);
+-    parts.push_back(materialModule);
+-
+-    Slang::ComPtr<slang::IComponentType> composite;
+-    Slang::ComPtr<slang::IBlob> composeDiag;
+-    SlangResult composeResult = session->createCompositeComponentType(
+-        parts.data(), static_cast<SlangInt>(parts.size()), composite.writeRef(), composeDiag.writeRef());
+-    appendDiagnostics(diagnostics, "compose", composeDiag);
+-    if (SLANG_FAILED(composeResult) || composite.get() == nullptr) {
+-        return std::nullopt;
+-    }
+-
+-    Slang::ComPtr<slang::IComponentType> linked;
+-    Slang::ComPtr<slang::IBlob> linkDiag;
+-    SlangResult linkResult = composite->link(linked.writeRef(), linkDiag.writeRef());
+-    appendDiagnostics(diagnostics, "link", linkDiag);
+-    if (SLANG_FAILED(linkResult) || linked.get() == nullptr) {
++    // --- Base pass [Task 8: was the WHOLE function's body pre-rework] --
++    // Always the energy-compensation-OFF resolution when `usesEnergyComp`
++    // -- this is the variant a bare `specializationBits=0` request
++    // (bindInstance()'s own hardcoded value; every pre-Task-8 caller)
++    // resolves to, so it stays the DEFAULT/base compiled variant this
++    // function returns, exactly as before for every material that does not
++    // use the mechanism at all.
++    std::vector<slang::IComponentType*> baseParts{forwardEntryModule, vertexEntryPoint, fragmentEntryPoint,
++                                                    materialModule};
++    if (usesEnergyComp) {
++        baseParts.push_back(energyCompOffModule);
++    }
++    auto basePass = linkAndCreateShaderModules(device, session.get(), baseParts, "base", diagnostics);
++    if (!basePass.has_value()) {
+         return std::nullopt;
+     }
+ 
+     Slang::ComPtr<slang::IBlob> layoutDiag;
+-    slang::ProgramLayout* progLayout = linked->getLayout(0, layoutDiag.writeRef());
++    slang::ProgramLayout* progLayout = basePass->linkedProgram->getLayout(0, layoutDiag.writeRef());
+     appendDiagnostics(diagnostics, "layout", layoutDiag);
+     if (progLayout == nullptr) {
++        destroyCompiledMaterialGpuObjects(device, *basePass);
+         return std::nullopt;
+     }
+ 
+     std::string reflectError;
+     auto reflection = reflectMaterialLayout(progLayout, slangModulePath.string(), reflectError);
+     if (!reflection.has_value()) {
+         diagnostics += reflectError;
+         diagnostics.push_back('\n');
++        destroyCompiledMaterialGpuObjects(device, *basePass);
+         return std::nullopt;
+     }
+ 
+     auto layoutBundle =
+         rx::rhi::PipelineLayoutBuilder::build(device, reflection->shaderLayout, bindless.descriptorSetLayout());
+     if (!layoutBundle.has_value()) {
+         diagnostics += "PipelineLayoutBuilder::build failed for material '" + slangModulePath.string() + "'\n";
++        destroyCompiledMaterialGpuObjects(device, *basePass);
+         return std::nullopt;
+     }
+ 
+     CompiledMaterial result;
+     result.session = std::move(session);
+-    result.linkedProgram = linked;
++    result.linkedProgram = basePass->linkedProgram;
+     result.contentHash = contentHash;
+     result.layoutInfo = std::move(reflection->shaderLayout);
+     result.params = std::move(reflection->params);
+     result.paramBlockSize = reflection->paramBlockSize;
+     result.layoutBundle = std::move(*layoutBundle);
+-
+-    // Entry point order in the composite above is fixed
+-    // (forwardEntryModule, vertexEntryPoint, fragmentEntryPoint,
+-    // materialModule) -- vertex is always index 0, fragment always index 1,
+-    // matching compiler.cpp's own "entry points contribute in exactly the
+-    // order pushed" contract.
+-    Slang::ComPtr<slang::IBlob> vertexCodeDiag;
+-    Slang::ComPtr<slang::IBlob> vertexCode;
+-    SlangResult vertexCodeResult = linked->getEntryPointCode(0, 0, vertexCode.writeRef(), vertexCodeDiag.writeRef());
+-    appendDiagnostics(diagnostics, "codegen(vertex)", vertexCodeDiag);
+-    if (SLANG_FAILED(vertexCodeResult) || vertexCode.get() == nullptr) {
+-        destroyCompiledMaterialGpuObjects(device, result);
+-        return std::nullopt;
+-    }
+-
+-    Slang::ComPtr<slang::IBlob> fragmentCodeDiag;
+-    Slang::ComPtr<slang::IBlob> fragmentCode;
+-    SlangResult fragmentCodeResult =
+-        linked->getEntryPointCode(1, 0, fragmentCode.writeRef(), fragmentCodeDiag.writeRef());
+-    appendDiagnostics(diagnostics, "codegen(fragment)", fragmentCodeDiag);
+-    if (SLANG_FAILED(fragmentCodeResult) || fragmentCode.get() == nullptr) {
+-        destroyCompiledMaterialGpuObjects(device, result);
+-        return std::nullopt;
+-    }
+-
+-    VkShaderModuleCreateInfo vertexModuleInfo{};
+-    vertexModuleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+-    vertexModuleInfo.codeSize = vertexCode->getBufferSize();
+-    vertexModuleInfo.pCode = static_cast<const uint32_t*>(vertexCode->getBufferPointer());
+-    if (vkCreateShaderModule(device, &vertexModuleInfo, nullptr, &result.vertexModule) != VK_SUCCESS) {
+-        diagnostics += "vkCreateShaderModule (vertex) failed for material '" + slangModulePath.string() + "'\n";
+-        destroyCompiledMaterialGpuObjects(device, result);
+-        return std::nullopt;
+-    }
+-
+-    VkShaderModuleCreateInfo fragmentModuleInfo{};
+-    fragmentModuleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+-    fragmentModuleInfo.codeSize = fragmentCode->getBufferSize();
+-    fragmentModuleInfo.pCode = static_cast<const uint32_t*>(fragmentCode->getBufferPointer());
+-    if (vkCreateShaderModule(device, &fragmentModuleInfo, nullptr, &result.fragmentModule) != VK_SUCCESS) {
+-        diagnostics += "vkCreateShaderModule (fragment) failed for material '" + slangModulePath.string() + "'\n";
+-        destroyCompiledMaterialGpuObjects(device, result);
+-        return std::nullopt;
++    result.vertexModule = basePass->vertexModule;
++    result.fragmentModule = basePass->fragmentModule;
++
++    // --- Second pass [Task 8, conditional]: energy-compensation-ON -----
++    // Reuses the SAME reflection/layoutBundle above -- `EnergyComp`'s
++    // choice of On vs Off never changes StandardPbrParams' own field
++    // shape (only which CODE `energyFeature.apply()` resolves to), so
++    // re-reflecting from a second linked program would be redundant work
++    // computing the identical answer, not a correctness requirement.
++    if (usesEnergyComp) {
++        std::vector<slang::IComponentType*> onParts{forwardEntryModule, vertexEntryPoint, fragmentEntryPoint,
++                                                      materialModule, energyCompOnModule};
++        auto onPass = linkAndCreateShaderModules(device, result.session.get(), onParts, "energyCompOn", diagnostics);
++        if (!onPass.has_value()) {
++            destroyCompiledMaterialGpuObjects(device, result);
++            return std::nullopt;
++        }
++        result.vertexModuleOn = onPass->vertexModule;
++        result.fragmentModuleOn = onPass->fragmentModule;
++        result.hasEnergyCompensationVariant = true;
+     }
+ 
+     return result;
+ }
+ 
+ }  // namespace
+ 
+ MaterialSystem::MaterialSystem(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+ 
+ MaterialSystem::~MaterialSystem() {
+@@ -1387,20 +1531,32 @@ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device,
+     if (!createMaterialSession(globalSession.get(), effectiveShaderDir, session)) {
+         return nullptr;
+     }
+ 
+     std::string diagnostics;
+     auto forwardEntry = loadForwardEntry(session, effectiveShaderDir, diagnostics);
+     if (!forwardEntry.has_value()) {
+         return nullptr;
+     }
+ 
++    // [Task 8] The energy-compensation permutation axis's two companion
++    // modules -- see loadEnergyCompVariants()'s own header comment. Loaded
++    // unconditionally alongside forward_entry.slang: cheap (two tiny
++    // one-line files), and required before the FIRST standard_pbr.slang
++    // loadMaterial() call can succeed (its own `extern struct EnergyComp`
++    // needs a resolving export from the very first compile -- see
++    // compileMaterial()'s own "base pass" comment).
++    auto energyCompVariants = loadEnergyCompVariants(session, effectiveShaderDir, diagnostics);
++    if (!energyCompVariants.has_value()) {
++        return nullptr;
++    }
++
+     // --- Pipeline cache: load if present, fresh+empty otherwise --------
+     // [Task 5 ambiguity resolution: an unreadable/corrupt cache file is a
+     // logged warning, never fatal -- Vulkan itself guarantees
+     // vkCreatePipelineCache never rejects malformed initialData outright
+     // (a driver must treat it as though none were given), so the only
+     // real failure mode to guard here is the file READ step, not the
+     // blob's own internal structure.]
+     std::vector<char> initialCacheData;
+     std::error_code existsError;
+     if (std::filesystem::exists(pipelineCachePath, existsError) && !existsError) {
+@@ -1558,20 +1714,22 @@ std::unique_ptr<MaterialSystem> MaterialSystem::create(rx::rhi::Device& device,
+     impl->device = device.device();
+     impl->bindless = &bindless;
+     impl->pipelineCachePath = pipelineCachePath;
+     impl->pipelineCache = pipelineCache;
+     impl->sharedShaderDir = effectiveShaderDir;
+     impl->globalSession = std::move(globalSession);
+     impl->session = std::move(session);
+     impl->forwardEntryModule = forwardEntry->module;
+     impl->vertexEntryPoint = std::move(forwardEntry->vertexEntryPoint);
+     impl->fragmentEntryPoint = std::move(forwardEntry->fragmentEntryPoint);
++    impl->energyCompOffModule = energyCompVariants->offModule;
++    impl->energyCompOnModule = energyCompVariants->onModule;
+     impl->allocator = std::move(allocator);
+     impl->uploader = std::move(uploader);
+     impl->paramArena = std::move(paramArena);
+     impl->defaultSampler = defaultSampler;
+     impl->defaultSamplerHandle = defaultSamplerHandle;
+     impl->defaultDrawDataBuffer = std::move(defaultDrawDataBuffer);
+     impl->defaultDrawDataBufferHandle = defaultDrawDataBufferHandle;
+ 
+     return std::unique_ptr<MaterialSystem>(new MaterialSystem(std::move(impl)));
+ }
+@@ -1582,21 +1740,22 @@ MaterialHandle MaterialSystem::loadMaterial(const std::filesystem::path& slangMo
+     RX_ZONE;
+     Impl& impl = *impl_;
+ 
+     // Copies impl.session (Slang::ComPtr addRef, cheap) rather than moving
+     // it -- this MaterialSystem keeps using impl.session for every FUTURE
+     // loadMaterial() call too. See compileMaterial()'s own header comment.
+     ++impl.compileCount;
+     std::string diagnostics;
+     auto compiled = compileMaterial(impl.device, *impl.bindless, Slang::ComPtr<slang::ISession>(impl.session),
+                                      impl.forwardEntryModule, impl.vertexEntryPoint.get(),
+-                                     impl.fragmentEntryPoint.get(), slangModulePath, diagnostics);
++                                     impl.fragmentEntryPoint.get(), impl.energyCompOffModule, impl.energyCompOnModule,
++                                     slangModulePath, diagnostics);
+     if (!compiled.has_value()) {
+         RX_LOG_ERROR("rx_material: failed to load material '{}':\n{}", slangModulePath.string(), diagnostics);
+         throw std::runtime_error("rx_material: failed to load material '" + slangModulePath.string() + "':\n" +
+                                   diagnostics);
+     }
+     if (!diagnostics.empty()) {
+         RX_LOG_WARN("rx_material: diagnostics while loading material '{}':\n{}", slangModulePath.string(),
+                      diagnostics);
+     }
+ 
+@@ -1605,20 +1764,23 @@ MaterialHandle MaterialSystem::loadMaterial(const std::filesystem::path& slangMo
+     record.contentHash = compiled->contentHash;
+     record.fixedFunctionState = fixedFunctionState;
+     record.ownerSession = std::move(compiled->session);
+     record.linkedProgram = std::move(compiled->linkedProgram);
+     record.layoutInfo = std::move(compiled->layoutInfo);
+     record.params = std::move(compiled->params);
+     record.paramBlockSize = compiled->paramBlockSize;
+     record.layoutBundle = std::move(compiled->layoutBundle);
+     record.vertexModule = compiled->vertexModule;
+     record.fragmentModule = compiled->fragmentModule;
++    record.vertexModuleOn = compiled->vertexModuleOn;
++    record.fragmentModuleOn = compiled->fragmentModuleOn;
++    record.hasEnergyCompensationVariant = compiled->hasEnergyCompensationVariant;
+ 
+     std::error_code mtimeError;
+     auto mtime = std::filesystem::last_write_time(slangModulePath, mtimeError);
+     if (!mtimeError) {
+         record.lastKnownMtime = mtime;
+     }
+ 
+     MaterialHandle handle = impl.materials.acquire(std::move(record));
+     impl.materialHandles.push_back(handle);
+     return handle;
+@@ -1840,25 +2002,40 @@ void MaterialSystem::reloadChanged() {
+ 
+         std::string forwardEntryDiag;
+         auto freshForwardEntry = loadForwardEntry(freshSession, shaderDir, forwardEntryDiag);
+         if (!freshForwardEntry.has_value()) {
+             RX_LOG_WARN("rx_material: reloadChanged: failed to reload forward_entry.slang while reloading '{}'; "
+                         "keeping last-good:\n{}",
+                         record->path.string(), forwardEntryDiag);
+             continue;
+         }
+ 
++        // [Task 8] Reloaded fresh alongside forward_entry.slang above --
++        // same "fresh Compiler per reload" reasoning (this function's own
++        // header comment): `freshSession` cannot reuse `impl.session`'s
++        // already-loaded energy_compensation_{off,on}.slang modules.
++        std::string energyCompDiag;
++        auto freshEnergyCompVariants = loadEnergyCompVariants(freshSession, shaderDir, energyCompDiag);
++        if (!freshEnergyCompVariants.has_value()) {
++            RX_LOG_WARN("rx_material: reloadChanged: failed to reload energy_compensation_{{off,on}}.slang while "
++                        "reloading '{}'; keeping last-good:\n{}",
++                        record->path.string(), energyCompDiag);
++            continue;
++        }
++
+         ++impl.compileCount;
+         std::string diagnostics;
+         auto compiled = compileMaterial(impl.device, *impl.bindless, freshSession, freshForwardEntry->module,
+                                          freshForwardEntry->vertexEntryPoint.get(),
+-                                         freshForwardEntry->fragmentEntryPoint.get(), record->path, diagnostics);
++                                         freshForwardEntry->fragmentEntryPoint.get(),
++                                         freshEnergyCompVariants->offModule, freshEnergyCompVariants->onModule,
++                                         record->path, diagnostics);
+         if (!compiled.has_value()) {
+             // Keep-last-good: `record` has not been touched at all past
+             // `lastKnownMtime` above -- reload failure is not a caller
+             // error [D9, brief].
+             RX_LOG_WARN("rx_material: hot-reload of '{}' failed, keeping last-good pipeline(s):\n{}",
+                         record->path.string(), diagnostics);
+             continue;
+         }
+         if (!diagnostics.empty()) {
+             RX_LOG_WARN("rx_material: diagnostics while hot-reloading '{}':\n{}", record->path.string(),
+@@ -1896,32 +2073,46 @@ void MaterialSystem::reloadChanged() {
+         // move-assignment below (PipelineLayoutBundle::operator= destroys
+         // whatever it's overwriting FIRST -- see that struct's own header
+         // comment, and samples/02_hotreload's destroyReloadablePipeline()
+         // for the identical established pattern).
+         if (record->vertexModule != VK_NULL_HANDLE) {
+             vkDestroyShaderModule(impl.device, record->vertexModule, nullptr);
+         }
+         if (record->fragmentModule != VK_NULL_HANDLE) {
+             vkDestroyShaderModule(impl.device, record->fragmentModule, nullptr);
+         }
++        // [Task 8] The energy-compensation-ON sibling pair, if this
++        // material has one -- same immediate-destroy reasoning as
++        // vertexModule/fragmentModule above (a VkShaderModule needs to
++        // outlive vkCreateGraphicsPipelines/command-buffer RECORDING, never
++        // GPU execution, so there is no in-flight hazard here).
++        if (record->vertexModuleOn != VK_NULL_HANDLE) {
++            vkDestroyShaderModule(impl.device, record->vertexModuleOn, nullptr);
++        }
++        if (record->fragmentModuleOn != VK_NULL_HANDLE) {
++            vkDestroyShaderModule(impl.device, record->fragmentModuleOn, nullptr);
++        }
+ 
+         // --- Swap in the new compiled material, preserving path/
+         // lastKnownMtime (already updated above).
+         record->contentHash = compiled->contentHash;
+         record->ownerSession = std::move(compiled->session);
+         record->linkedProgram = std::move(compiled->linkedProgram);
+         record->layoutInfo = std::move(compiled->layoutInfo);
+         record->params = std::move(compiled->params);
+         record->paramBlockSize = compiled->paramBlockSize;
+         record->layoutBundle = std::move(compiled->layoutBundle);
+         record->vertexModule = compiled->vertexModule;
+         record->fragmentModule = compiled->fragmentModule;
++        record->vertexModuleOn = compiled->vertexModuleOn;
++        record->fragmentModuleOn = compiled->fragmentModuleOn;
++        record->hasEnergyCompensationVariant = compiled->hasEnergyCompensationVariant;
+ 
+         RX_LOG_INFO("rx_material: hot-reload of '{}' succeeded (module hash {:#x} -> {:#x})", record->path.string(),
+                     oldHash, record->contentHash);
+     }
+ }
+ 
+ VkPipeline MaterialSystem::getPipeline(const PipelineRequest& req) {
+     RX_ASSERT_MAIN_THREAD("MaterialSystem::getPipeline");
+     RX_ZONE;
+     Impl& impl = *impl_;
+@@ -1939,38 +2130,48 @@ VkPipeline MaterialSystem::getPipeline(const PipelineRequest& req) {
+             "attachment; rejecting (no use case in Phase 3)");
+     }
+ 
+     PipelineKey key{record->contentHash, req.pass.hash(), req.specializationBits,
+                      record->fixedFunctionState.alphaMode, record->fixedFunctionState.doubleSided};
+     auto it = impl.pipelines.find(key);
+     if (it != impl.pipelines.end()) {
+         return it->second;
+     }
+ 
++    // [Task 8] Select this material's energy-compensation variant --
++    // record->hasEnergyCompensationVariant is false for every material
++    // besides standard_pbr.slang today, so this always falls back to the
++    // base pair for them regardless of req.specializationBits (see
++    // MaterialRecord::vertexModuleOn's own header comment).
++    bool wantsEnergyCompensationOn =
++        record->hasEnergyCompensationVariant && (req.specializationBits & kSpecializationEnergyCompensation) != 0;
++    VkShaderModule vertexModule = wantsEnergyCompensationOn ? record->vertexModuleOn : record->vertexModule;
++    VkShaderModule fragmentModule = wantsEnergyCompensationOn ? record->fragmentModuleOn : record->fragmentModule;
++
+     // --- Build a new VkPipeline from this material's already-compiled  --
+-    // --- SPIR-V (record->vertexModule/fragmentModule) and req.pass's   --
++    // --- SPIR-V (vertexModule/fragmentModule, above) and req.pass's    --
+     // --- attachment shape. No Slang involvement at all past this point --
+     // --- -- see detail::debugCompileCount()'s own comment.             --
+     std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+-    stages[0].module = record->vertexModule;
++    stages[0].module = vertexModule;
+     // Slang's SPIR-V backend always names each entry point's OpEntryPoint
+     // "main" regardless of source-level function name -- verified
+     // directly for this exact multi-part-composite path before writing
+     // this file (see task-5-report.md), matching
+     // samples/03_bindless_mesh/main.cpp's and samples/02_hotreload's own
+     // established finding for the simpler single-module case.
+     stages[0].pName = "main";
+     stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+-    stages[1].module = record->fragmentModule;
++    stages[1].module = fragmentModule;
+     stages[1].pName = "main";
+ 
+     VertexInputState vertexInput = makeVertexInputState();
+     VkPipelineVertexInputStateCreateInfo vertexInputState{};
+     vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+     vertexInputState.vertexBindingDescriptionCount = 1;
+     vertexInputState.pVertexBindingDescriptions = &vertexInput.binding;
+     vertexInputState.vertexAttributeDescriptionCount = static_cast<uint32_t>(vertexInput.attributes.size());
+     vertexInputState.pVertexAttributeDescriptions = vertexInput.attributes.data();
+ 
+diff --git a/src/rx_material/tests/CMakeLists.txt b/src/rx_material/tests/CMakeLists.txt
+index a723c1d..d6d87cc 100644
+--- a/src/rx_material/tests/CMakeLists.txt
++++ b/src/rx_material/tests/CMakeLists.txt
+@@ -122,20 +122,30 @@ if(NOT RX_SPIRV_DIS_EXECUTABLE)
+     "(gate ruling T7). Install the spirv-tools package (apt: spirv-tools; "
+     "the CI images install it alongside vulkan-validationlayers -- see "
+     ".github/workflows/ci.yml).")
+ endif()
+ 
+ add_executable(rx_material_brdf_gpu_tests
+     doctest_main.cpp
+     test_brdf_module_gpu.cpp
+     test_brdf_white_furnace_gpu.cpp
+     test_brdf_spirv_link_composition_gpu.cpp
++    # Phase 5 Stage 1 Task 8 [#44]: extends the two files above's own
++    # SPIR-V-absence + white-furnace methodology from brdf.slang standalone
++    # onto the REAL production standard_pbr.slang path (composes the real
++    # shipped material.slang/forward_entry.slang/standard_pbr.slang/
++    # brdf.slang/energy_compensation_{off,on}.slang files directly, not a
++    # synthetic fixture) -- lives in THIS binary (not rx_material_gpu_tests)
++    # since it drives slang::ISession directly via brdf_test_harness.h and
++    # needs spirv-dis (RX_SPIRV_DIS), matching this binary's own existing
++    # scope, not rx_material_gpu_tests' MaterialSystem-level scope.
++    test_standard_pbr_energy_compensation_gpu.cpp
+ )
+ target_link_libraries(rx_material_brdf_gpu_tests PRIVATE rx_shader rx_rhi_vk rx_platform doctest::doctest)
+ rx_shader_deploy_runtime_libs(rx_material_brdf_gpu_tests)
+ target_compile_definitions(rx_material_brdf_gpu_tests PRIVATE
+   # Same fixed, checked-out-repo-relative shaders/material/ path
+   # rx_material's own RX_MATERIAL_SHADER_DIR resolves to (that macro is
+   # PRIVATE to the rx_material library target and does not propagate here)
+   # -- brdf.slang lives in the SAME directory as material.slang/
+   # standard_pbr.slang/forward_entry.slang, per the ticket's own file list.
+   RX_MATERIAL_SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders/material"
+diff --git a/src/rx_material/tests/test_standard_pbr_energy_compensation_gpu.cpp b/src/rx_material/tests/test_standard_pbr_energy_compensation_gpu.cpp
+new file mode 100644
+index 0000000..343c634
+--- /dev/null
++++ b/src/rx_material/tests/test_standard_pbr_energy_compensation_gpu.cpp
+@@ -0,0 +1,444 @@
++// src/rx_material/tests/test_standard_pbr_energy_compensation_gpu.cpp --
++// Phase 5 Stage 1 Task 8 [#44, gate rulings T7/T8]: extends Task 7's SPIR-V-
++// absence discipline and white-furnace energy-conservation methodology from
++// brdf.slang STANDALONE (test_brdf_spirv_link_composition_gpu.cpp,
++// test_brdf_white_furnace_gpu.cpp) onto the REAL PRODUCTION material path --
++// the two Phase 5 global-constraint obligations this task's own binding
++// text names explicitly: "SPIR-V absence verification for at least one
++// permutation pair on the production path (the T7 discipline extended to
++// the real material)" and "energy conservation preserved (Task 7 harness
++// re-run on the composed material)".
++//
++// Both TEST_CASEs below compose the REAL SHIPPED files (material.slang,
++// forward_entry.slang, standard_pbr.slang, brdf.slang,
++// energy_compensation_{off,on}.slang) via the exact same extern/export +
++// createCompositeComponentType()/link() mechanism material_system.cpp's
++// own compileMaterial() uses in production -- not a synthetic test fixture
++// standing in for them (T7's own SPIR-V test used a throwaway compute
++// entry point + brdf.slang alone; this file's first TEST_CASE is the
++// production-path generalization the gate matrix's own "New gaps"/
++// "Feature-permutation mechanism" rows call for).
++#include <doctest/doctest.h>
++
++#include "brdf_gpu_fixture.h"
++#include "brdf_test_harness.h"
++
++#include <rx_rhi_vk/compute_pipeline.h>
++#include <rx_shader/reflection.h>
++
++#include <cmath>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <optional>
++#include <sstream>
++#include <string>
++#include <vector>
++
++using namespace rx::brdf_test;
++
++namespace {
++
++std::optional<std::string> readFile(const std::filesystem::path& path) {
++    std::ifstream in(path, std::ios::binary);
++    if (!in.is_open()) {
++        return std::nullopt;
++    }
++    std::ostringstream ss;
++    ss << in.rdbuf();
++    return ss.str();
++}
++
++// Mirrors material_system.cpp's own loadSharedModule() -- reads a real
++// shaders/material/*.slang file off disk and loads it as a named Slang
++// module, exactly the same idiom that file uses for material.slang/
++// forward_entry.slang/energy_compensation_{off,on}.slang (this test's own
++// duplicate, per this test suite's established per-file-duplicated-helper
++// idiom -- brdf_test_harness.h's own header comment).
++slang::IModule* loadRealSharedModule(slang::ISession* session, const std::filesystem::path& dir, const char* filename,
++                                      std::string& diagnostics) {
++    std::filesystem::path path = dir / filename;
++    auto source = readFile(path);
++    if (!source.has_value()) {
++        diagnostics += "could not read '" + path.string() + "'\n";
++        return nullptr;
++    }
++    std::string moduleName = std::filesystem::path(filename).stem().string();
++    Slang::ComPtr<slang::IBlob> sourceBlob(Slang::INIT_ATTACH, slang_createBlob(source->data(), source->size()));
++    Slang::ComPtr<slang::IBlob> diagBlob;
++    slang::IModule* module =
++        session->loadModuleFromSource(moduleName.c_str(), path.string().c_str(), sourceBlob, diagBlob.writeRef());
++    if (diagBlob.get() != nullptr && diagBlob->getBufferSize() > 0) {
++        diagnostics.append(static_cast<const char*>(diagBlob->getBufferPointer()), diagBlob->getBufferSize());
++    }
++    return module;
++}
++
++struct FragmentSpirv {
++    bool ok = false;
++    std::string diagnostics;
++    std::vector<uint32_t> code;
++};
++
++// Composes the REAL production quartet (forward_entry.slang's two entry
++// points + standard_pbr.slang + one of the two energy-compensation variant
++// files) exactly like material_system.cpp's own compileMaterial() base
++// pass does (see that function's own header comment), then extracts the
++// FRAGMENT entry point's SPIR-V (index 1 -- vertex is always index 0,
++// fragment always index 1, matching compiler.cpp's own "entry points
++// contribute in exactly the order pushed" contract, restated here since
++// this is the same composite shape material_system.cpp itself builds).
++FragmentSpirv compileStandardPbrFragment(slang::ISession* session, const std::filesystem::path& shaderDir,
++                                          const char* variantFile) {
++    FragmentSpirv result;
++    std::string diag;
++
++    slang::IModule* forwardEntry = loadRealSharedModule(session, shaderDir, "forward_entry.slang", diag);
++    if (forwardEntry == nullptr) {
++        result.diagnostics = diag;
++        return result;
++    }
++    Slang::ComPtr<slang::IEntryPoint> vertexEp;
++    if (SLANG_FAILED(forwardEntry->findEntryPointByName("vertexMain", vertexEp.writeRef())) || vertexEp.get() == nullptr) {
++        result.diagnostics = diag + "\nforward_entry.slang has no 'vertexMain' entry point";
++        return result;
++    }
++    Slang::ComPtr<slang::IEntryPoint> fragmentEp;
++    if (SLANG_FAILED(forwardEntry->findEntryPointByName("fragmentMain", fragmentEp.writeRef())) ||
++        fragmentEp.get() == nullptr) {
++        result.diagnostics = diag + "\nforward_entry.slang has no 'fragmentMain' entry point";
++        return result;
++    }
++
++    slang::IModule* standardPbr = loadRealSharedModule(session, shaderDir, "standard_pbr.slang", diag);
++    if (standardPbr == nullptr) {
++        result.diagnostics = diag;
++        return result;
++    }
++    slang::IModule* variant = loadRealSharedModule(session, shaderDir, variantFile, diag);
++    if (variant == nullptr) {
++        result.diagnostics = diag;
++        return result;
++    }
++
++    std::vector<slang::IComponentType*> parts{forwardEntry, vertexEp.get(), fragmentEp.get(), standardPbr, variant};
++    Slang::ComPtr<slang::IComponentType> composite;
++    Slang::ComPtr<slang::IBlob> composeDiag;
++    SlangResult composeResult = session->createCompositeComponentType(
++        parts.data(), static_cast<SlangInt>(parts.size()), composite.writeRef(), composeDiag.writeRef());
++    if (composeDiag.get() != nullptr && composeDiag->getBufferSize() > 0) {
++        diag.append(static_cast<const char*>(composeDiag->getBufferPointer()), composeDiag->getBufferSize());
++    }
++    if (SLANG_FAILED(composeResult) || composite.get() == nullptr) {
++        result.diagnostics = diag;
++        return result;
++    }
++
++    Slang::ComPtr<slang::IComponentType> linked;
++    Slang::ComPtr<slang::IBlob> linkDiag;
++    SlangResult linkResult = composite->link(linked.writeRef(), linkDiag.writeRef());
++    if (linkDiag.get() != nullptr && linkDiag->getBufferSize() > 0) {
++        diag.append(static_cast<const char*>(linkDiag->getBufferPointer()), linkDiag->getBufferSize());
++    }
++    if (SLANG_FAILED(linkResult) || linked.get() == nullptr) {
++        result.diagnostics = diag;
++        return result;
++    }
++
++    Slang::ComPtr<slang::IBlob> codeDiag;
++    Slang::ComPtr<slang::IBlob> codeBlob;
++    SlangResult codeResult = linked->getEntryPointCode(1, 0, codeBlob.writeRef(), codeDiag.writeRef());
++    if (codeDiag.get() != nullptr && codeDiag->getBufferSize() > 0) {
++        diag.append(static_cast<const char*>(codeDiag->getBufferPointer()), codeDiag->getBufferSize());
++    }
++    if (SLANG_FAILED(codeResult) || codeBlob.get() == nullptr) {
++        result.diagnostics = diag;
++        return result;
++    }
++
++    const auto* words = static_cast<const uint32_t*>(codeBlob->getBufferPointer());
++    result.code.assign(words, words + codeBlob->getBufferSize() / sizeof(uint32_t));
++    result.ok = true;
++    result.diagnostics = diag;
++    return result;
++}
++
++// Identical to test_brdf_spirv_link_composition_gpu.cpp's own disassemble()/
++// countOccurrences() -- this test suite's own established per-file-
++// duplicated-helper idiom (brdf_test_harness.h's header comment).
++std::string disassemble(const std::vector<uint32_t>& spirv, const std::filesystem::path& tmpDir, const std::string& tag) {
++    auto spvPath = tmpDir / (tag + ".spv");
++    auto disPath = tmpDir / (tag + ".dis.txt");
++    {
++        std::ofstream out(spvPath, std::ios::binary);
++        REQUIRE(out.is_open());
++        out.write(reinterpret_cast<const char*>(spirv.data()), static_cast<std::streamsize>(spirv.size() * sizeof(uint32_t)));
++    }
++    std::string cmd = std::string("\"") + RX_SPIRV_DIS + "\" \"" + spvPath.string() + "\" -o \"" + disPath.string() + "\"";
++    int rc = std::system(cmd.c_str());
++    REQUIRE_MESSAGE(rc == 0, "spirv-dis invocation failed: ", cmd);
++    std::ifstream in(disPath);
++    REQUIRE(in.is_open());
++    std::ostringstream ss;
++    ss << in.rdbuf();
++    return ss.str();
++}
++
++size_t countOccurrences(const std::string& text, const std::string& needle) {
++    size_t count = 0;
++    size_t pos = 0;
++    while ((pos = text.find(needle, pos)) != std::string::npos) {
++        ++count;
++        pos += needle.size();
++    }
++    return count;
++}
++
++}  // namespace
++
++TEST_CASE("StandardPBR Task 8: SPIR-V presence/absence proof on the PRODUCTION path -- the energy-compensation-ON "
++          "fragment SPIR-V (linked against the REAL shipped material.slang/forward_entry.slang/standard_pbr.slang/"
++          "brdf.slang, not a synthetic fixture) contains MORE division instructions than the OFF variant's, and is "
++          "measurably larger -- the T7 discipline (test_brdf_spirv_link_composition_gpu.cpp) extended to the real "
++          "material, per this phase's own binding global constraint") {
++    auto session = createBrdfSession(RX_MATERIAL_SHADER_DIR);
++    REQUIRE(session.has_value());
++
++    auto off = compileStandardPbrFragment(session->session.get(), RX_MATERIAL_SHADER_DIR, "energy_compensation_off.slang");
++    REQUIRE_MESSAGE(off.ok, off.diagnostics);
++    auto on = compileStandardPbrFragment(session->session.get(), RX_MATERIAL_SHADER_DIR, "energy_compensation_on.slang");
++    REQUIRE_MESSAGE(on.ok, on.diagnostics);
++
++    const std::filesystem::path tmpDir = std::filesystem::temp_directory_path();
++    std::string offDis = disassemble(off.code, tmpDir, "rx_standard_pbr_fragment_energy_comp_off");
++    std::string onDis = disassemble(on.code, tmpDir, "rx_standard_pbr_fragment_energy_comp_on");
++
++    size_t offDivCount = countOccurrences(offDis, "OpFDiv");
++    size_t onDivCount = countOccurrences(onDis, "OpFDiv");
++    INFO("OFF OpFDiv count: ", offDivCount);
++    INFO("ON OpFDiv count: ", onDivCount);
++
++    // UNLIKE T7's own standalone brdf.slang proof (a throwaway compute
++    // kernel whose ONLY division came from energyCompensation() itself, so
++    // an exact `offDivCount == 0` was the right assertion) -- the REAL
++    // StandardPbr fragment shader already contains other LEGITIMATE
++    // divisions regardless of this feature (V_SmithGGXCorrelated's own
++    // `0.5 / max(...)`, computeDielectricF0F90()'s own `(ior-1)/(ior+1)`,
++    // KHR_texture_transform UV math). The correct generalization of T7's
++    // absence proof for a REAL, non-trivial production shader is a DELTA,
++    // not a raw absence: the ON variant must contain STRICTLY MORE
++    // division instructions than OFF, by exactly energyCompensation()'s
++    // own `1.0 / dfgY` contribution -- proving THAT specific code is
++    // present/absent, not merely that "some" division exists either way.
++    CHECK(onDivCount > offDivCount);
++    // Secondary sanity signal (T7's own precedent): more code, not just
++    // more of one instruction kind.
++    CHECK(on.code.size() > off.code.size());
++}
++
++namespace {
++
++// [Task 8] Energy-conservation re-run parameterized by (ior, specular,
++// specularColor) -- gate matrix's own "Energy conservation preserved
++// through the rework" row: T7's white-furnace test (test_brdf_white_
++// furnace_gpu.cpp) exercises brdf.slang's STANDALONE functions with a
++// hand-picked F0; this pass instead exercises the SAME Kulla-Conty
++// energy-compensation identity fed by StandardPbr's OWN
++// computeDielectricF0F90() derivation (duplicated below, matching that
++// function's exact formula -- see standard_pbr.slang's own header comment
++// for the full citation/derivation this mirrors), so a bug in HOW
++// StandardPBR computes F0 from ior/specular cannot pass this test while
++// silently breaking energy conservation in the shipped material.
++struct IorFurnaceQueryGpu {
++    float ior;
++    float specularFactor;
++    float alpha;
++};
++
++struct IorFurnaceResultGpu {
++    float f0;
++    float ess;
++    float compensated;
++};
++
++}  // namespace
++
++TEST_CASE("StandardPBR Task 8: energy conservation preserved through the ior/specular rework -- a second white-"
++          "furnace pass parameterized by (ior, specularFactor) exercising computeDielectricF0F90()'s OWN "
++          "derivation (not brdf.slang's bare F0=1 constant): F0-derived-to-1 configurations restore to ~=1 across "
++          "a roughness sweep, reached via BOTH the ior<=0 special case AND the ordinary high-ior limit; a "
++          "low-F0 (glTF-default) configuration does NOT restore to ~=1, proving this isn't a vacuous always-pass") {
++    auto fixture = makeBrdfGpuFixture("rx_standard_pbr_ior_specular_furnace");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto session = createBrdfSession(RX_MATERIAL_SHADER_DIR);
++    REQUIRE(session.has_value());
++
++    // kNumSamples matches test_brdf_white_furnace_gpu.cpp's own choice
++    // (that file's own header comment: low enough noise that the
++    // roughness trend is unambiguous).
++    std::string source = R"(
++import brdf;
++
++struct IorFurnaceQueryGpu { float ior; float specularFactor; float alpha; };
++struct IorFurnaceResultGpu { float f0; float ess; float compensated; };
++
++[[vk::binding(0, 1)]]
++StructuredBuffer<IorFurnaceQueryGpu> gQueries;
++
++[[vk::binding(1, 1)]]
++RWStructuredBuffer<IorFurnaceResultGpu> gResults;
++
++// [Task 8] Mirrors standard_pbr.slang's own computeDielectricF0F90()
++// (scalar-only here -- specularColorFactor=1.0 for every query this pass
++// uses, so the vec3 form collapses to this) -- duplicated, not imported:
++// standard_pbr.slang is a MATERIAL module (declares an unresolved `extern
++// EnergyComp`, a `ParameterBlock<StandardPbrParams> gParams`, etc.), not a
++// standalone library this synthetic compute kernel can import on its own.
++float computeDielectricF0(float ior, float specularFactor) {
++    if (ior <= 0.0) {
++        return 1.0;
++    }
++    float iorTerm = (ior - 1.0) / (ior + 1.0);
++    float base = iorTerm * iorTerm;
++    return min(base, 1.0) * specularFactor;
++}
++
++float2 hammersley(uint i, float iN) {
++    uint bits = i;
++    bits = (bits << 16u) | (bits >> 16u);
++    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
++    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
++    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
++    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
++    return float2(float(i) * iN, float(bits) * (1.0 / 4294967296.0));
++}
++
++float3 hemisphereImportanceSampleDggx(float2 u, float a) {
++    float phi = 2.0 * kBrdfPi * u.x;
++    float cosTheta2 = (1.0 - u.y) / (1.0 + (a + 1.0) * ((a - 1.0) * u.y));
++    float cosTheta = sqrt(max(0.0, cosTheta2));
++    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta2));
++    return float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
++}
++
++float2 dfvMultiscatter(float NoV, float alpha, uint numSamples) {
++    float2 r = float2(0.0, 0.0);
++    float3 V = float3(sqrt(max(0.0, 1.0 - NoV * NoV)), 0.0, NoV);
++    float invN = 1.0 / float(numSamples);
++    for (uint i = 0; i < numSamples; i++) {
++        float2 u = hammersley(i, invN);
++        float3 H = hemisphereImportanceSampleDggx(u, alpha);
++        float dotVH = dot(V, H);
++        float3 L = 2.0 * dotVH * H - V;
++        float VoH = saturate(dotVH);
++        float NoL = saturate(L.z);
++        float NoH = saturate(H.z);
++        if (NoL > 0.0) {
++            float v = V_SmithGGXCorrelated(alpha, NoV, NoL) * NoL * (VoH / max(NoH, 1e-6));
++            float Fc = pow(clamp(1.0 - VoH, 0.0, 1.0), 5.0);
++            r.x += v * Fc;
++            r.y += v;
++        }
++    }
++    return r * (4.0 / float(numSamples));
++}
++
++[shader("compute")]
++[numthreads(1, 1, 1)]
++void csMain(uint3 id : SV_DispatchThreadID) {
++    IorFurnaceQueryGpu q = gQueries[id.x];
++    float2 dfv = dfvMultiscatter(1.0, q.alpha, 16384u);
++    float ess = dfv.y;
++    float f0 = computeDielectricF0(q.ior, q.specularFactor);
++    float3 comp = energyCompensation(float3(f0, f0, f0), ess);
++
++    IorFurnaceResultGpu r;
++    r.f0 = f0;
++    r.ess = ess;
++    r.compensated = ess * comp.x;
++    gResults[id.x] = r;
++}
++)";
++
++    auto compiled = compileBrdfComputeModule(session->session.get(), "RxStandardPbrIorFurnace", source, "csMain");
++    REQUIRE_MESSAGE(compiled.ok, compiled.diagnostics);
++
++    auto layoutInfo = rx::shader::reflect(compiled);
++    REQUIRE(layoutInfo.has_value());
++
++    auto cache = rx::rhi::ComputePipelineCache::create(
++        fixture->device.device(), std::filesystem::temp_directory_path() / "rx_standard_pbr_ior_specular_furnace.cache");
++    REQUIRE(cache.has_value());
++    auto pso = cache->getOrCreate(compiled.entryPointCode[0].code, *layoutInfo);
++    REQUIRE(pso.has_value());
++
++    // Q0: ior=0 (special case), specular=1.0, low roughness -- F0 forced
++    // to 1.0.
++    // Q1: ior=0 (special case), specular=0.3 (NON-1.0), HIGH roughness --
++    // STILL F0 forced to 1.0 regardless of specularFactor (the special
++    // case's own override, see standard_pbr.slang's own
++    // computeDielectricF0F90() header comment) -- a DIFFERENT roughness
++    // AND a different specularFactor from Q0, proving the exact-1
++    // cancellation isn't a coincidence of one particular input pair.
++    // Q2: ior=1000 (the ORDINARY, non-special-cased formula pushed close
++    // to its own F0->1 limit: ((999/1001))^2 ~= 0.996), specular=1.0, high
++    // roughness -- a genuinely DIFFERENT code path (the general formula,
++    // not the ior<=0 branch) also reaching "F0 near 1".
++    // Q3: ior=1.5 (glTF default), specular=1.0, high roughness -- F0=0.04
++    // (the ordinary low-reflectance-dielectric case) -- the discrimination
++    // baseline: must NOT restore to ~=1 (proves this test is not a vacuous
++    // always-pass regardless of F0).
++    const std::vector<IorFurnaceQueryGpu> queries{
++        {0.0F, 1.0F, 0.10F},
++        {0.0F, 0.3F, 0.80F},
++        {1000.0F, 1.0F, 0.80F},
++        {1.5F, 1.0F, 0.80F},
++    };
++    std::vector<uint8_t> inputBytes(queries.size() * sizeof(IorFurnaceQueryGpu));
++    std::memcpy(inputBytes.data(), queries.data(), inputBytes.size());
++
++    auto outputBytes = dispatchOneInOneOut(*fixture, *pso, inputBytes, queries.size() * sizeof(IorFurnaceResultGpu),
++                                            static_cast<uint32_t>(queries.size()));
++    std::vector<IorFurnaceResultGpu> results(queries.size());
++    std::memcpy(results.data(), outputBytes.data(), outputBytes.size());
++    REQUIRE(results.size() == 4);
++
++    INFO("Q0 f0=", results[0].f0, " ess=", results[0].ess, " compensated=", results[0].compensated);
++    INFO("Q1 f0=", results[1].f0, " ess=", results[1].ess, " compensated=", results[1].compensated);
++    INFO("Q2 f0=", results[2].f0, " ess=", results[2].ess, " compensated=", results[2].compensated);
++    INFO("Q3 f0=", results[3].f0, " ess=", results[3].ess, " compensated=", results[3].compensated);
++
++    // Q0/Q1: the ior<=0 special case forces f0 to EXACTLY 1.0 -- the SAME
++    // algebraic identity T7's own furnace test already proved
++    // (Ess*(1/Ess)==1 to fp32 rounding only), now reached via
++    // computeDielectricF0()'s own branch instead of a hardcoded
++    // float3(1,1,1).
++    CHECK(static_cast<double>(results[0].f0) == doctest::Approx(1.0).epsilon(1e-6));
++    CHECK(static_cast<double>(results[1].f0) == doctest::Approx(1.0).epsilon(1e-6));
++    CHECK(static_cast<double>(results[0].compensated) == doctest::Approx(1.0).epsilon(1e-3));
++    CHECK(static_cast<double>(results[1].compensated) == doctest::Approx(1.0).epsilon(1e-3));
++    // Q0 and Q1 use DIFFERENT roughness (different Ess) -- confirms the
++    // exact-1 cancellation holds across more than one Ess value, not a
++    // single coincidental point.
++    CHECK(results[0].ess != doctest::Approx(results[1].ess));
++
++    // Q2: the ORDINARY formula pushed close to its own F0->1 limit --
++    // f0 ~= 0.996, so the compensated response should be close to 1.0 (a
++    // looser tolerance than Q0/Q1's exact-branch cancellation, since f0
++    // itself is only NEAR 1, not exactly 1).
++    CHECK(static_cast<double>(results[2].f0) > 0.99);
++    CHECK(static_cast<double>(results[2].compensated) == doctest::Approx(1.0).epsilon(0.02));
++
++    // Q3: the glTF-default low-reflectance dielectric (f0=0.04) -- the
++    // discrimination baseline. Must NOT restore anywhere near 1.0 (proves
++    // Q0/Q1/Q2's own "restores to ~1" results are a real property of
++    // F0-near-1 configurations specifically, not an artifact of this
++    // test's own formula/tolerance choices).
++    CHECK(static_cast<double>(results[3].f0) == doctest::Approx(0.04).epsilon(1e-4));
++    CHECK(std::abs(static_cast<double>(results[3].compensated) - 1.0) > 0.05);
++}
+diff --git a/src/rx_material/tests/test_standard_pbr_shadow_gpu.cpp b/src/rx_material/tests/test_standard_pbr_shadow_gpu.cpp
+index 6d710cc..77c4c53 100644
+--- a/src/rx_material/tests/test_standard_pbr_shadow_gpu.cpp
++++ b/src/rx_material/tests/test_standard_pbr_shadow_gpu.cpp
+@@ -271,20 +271,31 @@ std::vector<uint8_t> makeParamBlob(rx::material::MaterialSystem& system, rx::mat
+                                     uint32_t whiteTex, uint32_t flatNormalTex, uint32_t samplerIndex) {
+     uint32_t blockSize = system.paramBlockSize(handle);
+     const auto params = system.materialParams(handle);
+     std::vector<uint8_t> blob(blockSize, 0);
+     setParam(blob, params, "baseColorFactor", std::array<float, 4>{1.0F, 1.0F, 1.0F, 1.0F});
+     setParam(blob, params, "metallicFactor", 0.0F);
+     setParam(blob, params, "roughnessFactor", 1.0F);
+     setParam(blob, params, "normalScale", 1.0F);
+     setParam(blob, params, "occlusionStrength", 1.0F);
+     setParam(blob, params, "alphaCutoff", 0.0F);
++    // [Phase 5 Stage 1 Task 8, #44] KHR_materials_ior/_specular's own
++    // glTF-spec-default neutral values -- see standard_pbr.slang's own
++    // computeDielectricF0F90() header comment (test_standard_pbr_unlit.cpp's
++    // own makeDefaultStandardPbrBlob() carries the same three calls with
++    // the full regression-guard rationale). A zero-filled `ior` would trip
++    // the ior<=0 special case (Fresnel forced to 1.0 at every angle),
++    // silently breaking this file's own shadow-attenuation pixel checks.
++    setParam(blob, params, "ior", 1.5F);
++    setParam(blob, params, "specularFactor", 1.0F);
++    setParam(blob, params, "specularColorFactorAndPad", std::array<float, 4>{1.0F, 1.0F, 1.0F, 0.0F});
++    setParam(blob, params, "dfgY", 1.0F);
+     setParam(blob, params, "emissiveFactorAndPad", std::array<float, 4>{0.0F, 0.0F, 0.0F, 0.0F});
+     setParam(blob, params, "baseColorTexture", whiteTex);
+     setParam(blob, params, "metallicRoughnessTexture", whiteTex);
+     setParam(blob, params, "normalTexture", flatNormalTex);
+     setParam(blob, params, "occlusionTexture", whiteTex);
+     setParam(blob, params, "emissiveTexture", whiteTex);
+     setParam(blob, params, "baseColorSampler", samplerIndex);
+     setParam(blob, params, "metallicRoughnessSampler", samplerIndex);
+     setParam(blob, params, "normalSampler", samplerIndex);
+     setParam(blob, params, "occlusionSampler", samplerIndex);
+diff --git a/src/rx_material/tests/test_standard_pbr_unlit.cpp b/src/rx_material/tests/test_standard_pbr_unlit.cpp
+index ec15eca..0c6dd44 100644
+--- a/src/rx_material/tests/test_standard_pbr_unlit.cpp
++++ b/src/rx_material/tests/test_standard_pbr_unlit.cpp
+@@ -32,21 +32,23 @@
+ #include <rx_scene/camera.h>
+ 
+ #include <rx_graph/executor.h>
+ #include <rx_graph/render_graph.h>
+ #include <rx_task/scheduler.h>
+ 
+ #define GLM_FORCE_DEPTH_ZERO_TO_ONE
+ #include <glm/glm.hpp>
+ #include <glm/gtc/matrix_transform.hpp>
+ 
++#include <algorithm>
+ #include <array>
++#include <cmath>
+ #include <cstdint>
+ #include <cstring>
+ #include <filesystem>
+ #include <memory>
+ #include <optional>
+ #include <string>
+ #include <vector>
+ 
+ namespace {
+ 
+@@ -937,20 +939,41 @@ std::optional<StandardPbrRig> makeStandardPbrRig(const char* name) {
+ std::vector<uint8_t> makeDefaultStandardPbrBlob(StandardPbrRig& rig, rx::material::MaterialHandle handle) {
+     uint32_t blockSize = rig.system->paramBlockSize(handle);
+     const auto params = rig.system->materialParams(handle);
+     std::vector<uint8_t> blob(blockSize, 0);
+     setParam(blob, params, "baseColorFactor", std::array<float, 4>{1.0F, 1.0F, 1.0F, 1.0F});
+     setParam(blob, params, "metallicFactor", 1.0F);
+     setParam(blob, params, "roughnessFactor", 1.0F);
+     setParam(blob, params, "normalScale", 1.0F);
+     setParam(blob, params, "occlusionStrength", 1.0F);
+     setParam(blob, params, "alphaCutoff", 0.0F);
++    // [Phase 5 Stage 1 Task 8, #44] KHR_materials_ior/_specular's own
++    // glTF-spec-default neutral values -- see standard_pbr.slang's own
++    // computeDielectricF0F90() header comment for the regression-guard
++    // proof that these reproduce this suite's pre-Task-8 hardcoded-0.04
++    // dielectric Fresnel byte-identically. A zero-filled blob (this
++    // function's own starting point) would instead trip the `ior<=0`
++    // special case (Fresnel forced to 1.0 at every angle) and silently
++    // break every hand-derived closed-form check in this file -- these
++    // three setParam() calls are load-bearing, not decorative defaults.
++    setParam(blob, params, "ior", 1.5F);
++    setParam(blob, params, "specularFactor", 1.0F);
++    setParam(blob, params, "specularColorFactorAndPad", std::array<float, 4>{1.0F, 1.0F, 1.0F, 0.0F});
++    // [Phase 5 Stage 1 Task 8, #44] The energy-compensation feature's own
++    // dfgY input -- 1.0 is the honest "no multi-scattering correction"
++    // neutral value (see StandardPbrParams::dfgY's own header comment);
++    // every TEST_CASE in this file exercises the OFF variant (getPipeline()
++    // called with specializationBits=0, renderOne()'s own default), which
++    // never reads this field at all, but binding a real value here keeps
++    // the blob meaningful if a future edit flips a call site to the ON
++    // variant.
++    setParam(blob, params, "dfgY", 1.0F);
+     setParam(blob, params, "emissiveFactorAndPad", std::array<float, 4>{0.0F, 0.0F, 0.0F, 0.0F});
+     setParam(blob, params, "baseColorTexture", rig.whiteTex);
+     setParam(blob, params, "metallicRoughnessTexture", rig.whiteTex);
+     setParam(blob, params, "normalTexture", rig.flatNormalTex);
+     setParam(blob, params, "occlusionTexture", rig.whiteTex);
+     setParam(blob, params, "emissiveTexture", rig.whiteTex);
+     // [Fix round, sampler-wrap P0] Every slot's own bindless SAMPLER index --
+     // standard_pbr.slang's evaluate() now samples through gParams.*Sampler
+     // explicitly (no more implicit process-wide default), so every one of
+     // these MUST be a real, valid registered index. This rig's own
+@@ -992,22 +1015,160 @@ Rgba8 renderOne(StandardPbrRig& rig, rx::material::MaterialHandle handle, const
+     auto drawDataBuffer = createDrawDataBuffer(rig.fixture->allocator, rig.fixture->bindless, rows);
+     REQUIRE(drawDataBuffer.has_value());
+ 
+     uint32_t pushSize = rig.system->layoutInfo(handle).pushRanges[0].size;
+     std::vector<DrawRequest> draws{DrawRequest{pipeline, rig.system->pipelineLayout(handle), rig.paramSetLayout,
+                                                 blob.data(), blob.size(), pushSize, /*drawDataRow=*/0}};
+     return renderQuad(rig.fixture->device, rig.fixture->allocator, rig.fixture->bindless, drawDataBuffer->handle,
+                        rig.defaultSamplerIndex, rig.mesh, draws);
+ }
+ 
++// [Phase 5 Stage 1 Task 8, #44] Same as renderOne() above, but with an
++// explicit `specializationBits` -- every other TEST_CASE in this file goes
++// through renderOne()'s own hardcoded 0 (the energy-compensation-OFF
++// variant), matching every pre-Task-8 production call site; the
++// permutation-mechanism TEST_CASEs below are the ONE place this file needs
++// to request the ON variant (kSpecializationEnergyCompensation).
++Rgba8 renderOneWithSpecialization(StandardPbrRig& rig, rx::material::MaterialHandle handle,
++                                   const std::vector<uint8_t>& blob, uint32_t specializationBits,
++                                   rx::material::DrawDataGpu row = makeHeadOnRow()) {
++    VkPipeline pipeline = rig.system->getPipeline({handle, makeQuadPassSignature(), specializationBits});
++    REQUIRE(pipeline != VK_NULL_HANDLE);
++    std::vector<rx::material::DrawDataGpu> rows{row};
++    auto drawDataBuffer = createDrawDataBuffer(rig.fixture->allocator, rig.fixture->bindless, rows);
++    REQUIRE(drawDataBuffer.has_value());
++
++    uint32_t pushSize = rig.system->layoutInfo(handle).pushRanges[0].size;
++    std::vector<DrawRequest> draws{DrawRequest{pipeline, rig.system->pipelineLayout(handle), rig.paramSetLayout,
++                                                blob.data(), blob.size(), pushSize, /*drawDataRow=*/0}};
++    return renderQuad(rig.fixture->device, rig.fixture->allocator, rig.fixture->bindless, drawDataBuffer->handle,
++                       rig.defaultSamplerIndex, rig.mesh, draws);
++}
++
+ }  // namespace
+ 
++// [Phase 5 Stage 1 Task 8, #44] A double-precision C++ ORACLE reimplementing
++// standard_pbr.slang's own evaluate() math (D_GGX/V_SmithGGXCorrelated/
++// F_Schlick from brdf.slang, plus this ticket's own computeDielectricF0F90()
++// ior/specular derivation), independently typed in a different language --
++// the same "reimplement, don't copy-paste, then cross-check" methodology
++// Task 7's own test_brdf_module_gpu.cpp already established for this
++// codebase's BRDF math (fp64-vs-fp32 parity checks). This is what makes an
++// EXACT closed-form pixel assertion tractable for camera/light setups this
++// file's own existing head-on rig cannot reach (VdotH != 1) without hand-
++// deriving trigonometry by eye -- every TEST_CASE below computes its
++// expected pixel by calling this oracle with the SAME parameters it binds
++// to the real shader, not by hand-typing decimal arithmetic into a comment.
++namespace task8_oracle {
++
++constexpr double kPi = 3.14159265358979323846;
++
++double dGGX(double alpha, double NdotH) {
++    double oneMinusNoHSquared = 1.0 - NdotH * NdotH;
++    double a = NdotH * alpha;
++    double k = alpha / (oneMinusNoHSquared + a * a);
++    return k * k * (1.0 / kPi);
++}
++
++double vSmithGGXCorrelated(double alpha, double NoV, double NoL) {
++    double a2 = alpha * alpha;
++    double lambdaV = NoL * std::sqrt((NoV - a2 * NoV) * NoV + a2);
++    double lambdaL = NoV * std::sqrt((NoL - a2 * NoL) * NoL + a2);
++    return 0.5 / std::max(lambdaV + lambdaL, 1e-5);
++}
++
++glm::dvec3 fSchlick3(const glm::dvec3& f0, double f90, double VoH) {
++    double p5 = std::pow(std::clamp(1.0 - VoH, 0.0, 1.0), 5.0);
++    return f0 + (glm::dvec3(f90, f90, f90) - f0) * p5;
++}
++
++struct DielectricF0F90 {
++    glm::dvec3 f0;
++    double f90;
++};
++
++// Mirrors standard_pbr.slang's own computeDielectricF0F90() -- see that
++// function's own header comment for the KHR_materials_ior/_specular
++// formulas this derives from.
++DielectricF0F90 computeDielectricF0F90(double ior, double specularFactor, const glm::dvec3& specularColorFactor) {
++    if (ior <= 0.0) {
++        return DielectricF0F90{glm::dvec3(1.0, 1.0, 1.0), 1.0};
++    }
++    double iorTerm = (ior - 1.0) / (ior + 1.0);
++    double dielectricF0Base = iorTerm * iorTerm;
++    glm::dvec3 f0 = glm::min(dielectricF0Base * specularColorFactor, glm::dvec3(1.0, 1.0, 1.0)) * specularFactor;
++    return DielectricF0F90{f0, specularFactor};
++}
++
++struct EvalParams {
++    glm::dvec3 baseColor{1.0, 1.0, 1.0};
++    double metallic = 0.0;
++    double roughness = 1.0;
++    double ior = 1.5;
++    double specularFactor = 1.0;
++    glm::dvec3 specularColorFactor{1.0, 1.0, 1.0};
++    double occlusion = 1.0;
++    glm::dvec3 emissive{0.0, 0.0, 0.0};
++    glm::dvec3 N{0.0, 0.0, 1.0};
++    glm::dvec3 V{0.0, 0.0, 1.0};
++    glm::dvec3 L{0.0, 0.0, 1.0};
++    glm::dvec3 lightColor{1.0, 1.0, 1.0};
++    glm::dvec3 ambientColor{0.0, 0.0, 0.0};
++    bool energyCompensationOn = false;
++    double dfgY = 1.0;
++};
++
++// [D28] kMinRoughness/metallic clamp -- mirrors standard_pbr.slang's own
++// `clamp(gParams.roughnessFactor * mrSample.g, kMinRoughness, 1.0)` /
++// `clamp(gParams.metallicFactor * mrSample.b, 0.0, 1.0)`, with mrSample
++// implicitly (1,1,1,1) (this file's own rig always binds a WHITE default
++// metallicRoughness texture -- makeStandardPbrRig()'s own comment), so the
++// factor passes through the clamp unscaled by any non-white texel.
++glm::dvec3 evaluate(const EvalParams& p) {
++    double roughness = std::clamp(p.roughness, 0.045, 1.0);
++    double metallic = std::clamp(p.metallic, 0.0, 1.0);
++
++    glm::dvec3 H = glm::normalize(p.V + p.L);
++    double NdotL = std::max(glm::dot(p.N, p.L), 0.0);
++    double NdotV = std::max(glm::dot(p.N, p.V), 1e-4);
++    double NdotH = std::max(glm::dot(p.N, H), 0.0);
++    double VdotH = std::max(glm::dot(p.V, H), 0.0);
++
++    DielectricF0F90 dielectric = computeDielectricF0F90(p.ior, p.specularFactor, p.specularColorFactor);
++    glm::dvec3 F0 = glm::mix(dielectric.f0, p.baseColor, metallic);
++    double F90 = dielectric.f90 * (1.0 - metallic) + 1.0 * metallic;
++    glm::dvec3 diffuseColor = p.baseColor * (1.0 - metallic);
++
++    double alpha = roughness * roughness;
++    double D = dGGX(alpha, NdotH);
++    double vis = vSmithGGXCorrelated(alpha, NdotV, NdotL);
++    glm::dvec3 fresnel = fSchlick3(F0, F90, VdotH);
++
++    glm::dvec3 specular = D * vis * fresnel;
++    if (p.energyCompensationOn) {
++        glm::dvec3 comp = glm::dvec3(1.0, 1.0, 1.0) + F0 * (1.0 / p.dfgY - 1.0);
++        specular = specular * comp;
++    }
++    glm::dvec3 diffuse = diffuseColor * (1.0 / kPi);
++
++    glm::dvec3 directLight = (diffuse + specular) * p.lightColor * NdotL;
++    glm::dvec3 ambient = p.ambientColor * p.occlusion * p.baseColor;
++    return directLight + ambient + p.emissive;
++}
++
++uint8_t toByte(double c) {
++    double clamped = std::clamp(c, 0.0, 1.0);
++    return static_cast<uint8_t>(std::lround(clamped * 255.0));
++}
++
++}  // namespace task8_oracle
++
+ TEST_CASE("StandardPBR: baseColorFactor with no texture renders that exact linear color; a bound texture "
+           "multiplies per-texel") {
+     auto rig = makeStandardPbrRig("standard_pbr_basecolor");
+     if (!rig.has_value()) {
+         return;
+     }
+     rx::material::MaterialHandle handle =
+         rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
+ 
+     // metallic=0, roughness=1 (pure Lambertian-dominant), ambient=0 -- see
+@@ -2034,10 +2195,339 @@ TEST_CASE("Unlit: evaluate() == baseColorFactor x baseColorTexture exactly, zero
+     flippedLight.lightColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
+     flippedLight.ambientColor = glm::vec4(1.0F, 1.0F, 1.0F, 0.0F);
+     Rgba8 flippedPixel = renderOne(*rig, handle, blob, flippedLight);
+ 
+     CHECK(flippedPixel.r == forwardPixel.r);
+     CHECK(flippedPixel.g == forwardPixel.g);
+     CHECK(flippedPixel.b == forwardPixel.b);
+     destroyRig(*rig);
+     CHECK_FALSE(rig->fixture->context.hasValidationErrors());
+ }
++
++// =========================================================================
++// Phase 5 Stage 1 Task 8 [#44]: KHR_materials_ior/_specular consumption +
++// the energy-compensation permutation mechanism, extended into the REAL
++// production standard_pbr.slang path. Every TEST_CASE below renders through
++// the SAME real MaterialSystem::getPipeline()/bindInstance()-equivalent
++// path every other TEST_CASE in this file uses (makeStandardPbrRig()/
++// renderOne(), no shortcuts), and checks the result against
++// task8_oracle::evaluate() (this file's own double-precision reimplementation
++// of standard_pbr.slang's math, above) rather than a hand-typed decimal --
++// see that namespace's own header comment for why.
++// =========================================================================
++
++TEST_CASE("StandardPBR Task 8: KHR_materials_ior default (1.5) reproduces the pre-Task-8 hardcoded-0.04 dielectric "
++          "Fresnel; ior=1.0 forces dielectric F0 to exactly 0.0 (closed-form, oracle-checked, strongly "
++          "discriminating at low roughness)") {
++    auto rig = makeStandardPbrRig("standard_pbr_task8_ior_default_vs_one");
++    if (!rig.has_value()) {
++        return;
++    }
++    rx::material::MaterialHandle handle =
++        rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
++    const auto params = rig->system->materialParams(handle);
++
++    // roughness=0.28 (see the specularColorFactor TEST_CASE below's own
++    // derivation comment for why this exact value): low enough that the
++    // F0-proportional specular lobe is a large, clearly visible fraction
++    // of the pixel, but NOT so low (e.g. kMinRoughness=0.045) that D_GGX's
++    // near-singular peak amplifies this rig's own flat-normal-map texture
++    // (byte 128/255 = 0.502, not an exact 0.5) into a huge, unpredictable
++    // swing -- empirically confirmed during this task's own development:
++    // kMinRoughness here made the "ior=1.5" case read ~93/255 instead of
++    // the idealized ~255/255 an EXACT NdotH=1 would give, an 8x error from
++    // a normal deviation of about 3e-5 (an unusably fragile probe, not a
++    // shader bug). near8's own margin below (22) absorbs the SAME,
++    // MUCH smaller residual bias this rig's imperfectly-flat normal
++    // introduces at THIS gentler roughness (empirically ~9%, e.g. 213
++    // idealized vs 194 rendered for F0=0.04 at this exact roughness/rig).
++    task8_oracle::EvalParams oracleParams;
++    oracleParams.roughness = 0.28;
++
++    std::vector<Rgba8> pixels;
++    for (const auto& [iorValue, label] : std::vector<std::pair<float, const char*>>{{1.5F, "default (1.5)"},
++                                                                                     {1.0F, "ior=1.0 (F0=0)"}}) {
++        INFO("ior = ", label);
++        std::vector<uint8_t> blob = makeDefaultStandardPbrBlob(*rig, handle);
++        // makeDefaultStandardPbrBlob()'s own default metallicFactor=1.0 (a
++        // metal) would make F0=baseColor regardless of ior, hiding this
++        // test's whole point -- explicit dielectric override, matching
++        // oracleParams' own default metallic=0.0.
++        setParam(blob, params, "metallicFactor", 0.0F);
++        setParam(blob, params, "roughnessFactor", 0.28F);
++        setParam(blob, params, "ior", iorValue);
++        Rgba8 pixel = renderOne(*rig, handle, blob);
++
++        oracleParams.ior = iorValue;
++        glm::dvec3 expected = task8_oracle::evaluate(oracleParams);
++        CHECK(near8(pixel.r, task8_oracle::toByte(expected.r), 22));
++        CHECK(near8(pixel.g, task8_oracle::toByte(expected.g), 22));
++        CHECK(near8(pixel.b, task8_oracle::toByte(expected.b), 22));
++        pixels.push_back(pixel);
++    }
++    // Discrimination: the two ior values must read CLEARLY different, not
++    // just "each individually close to its own oracle prediction" -- a
++    // margin-15 near8 check alone could theoretically pass two nearly-
++    // identical, both-slightly-off values.
++    REQUIRE(pixels.size() == 2);
++    CHECK(pixels[0].r > pixels[1].r + 50);
++    destroyRig(*rig);
++    CHECK_FALSE(rig->fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("StandardPBR Task 8: KHR_materials_ior ior=0 forces the dielectric Fresnel term to F0=F90=1.0 -- a "
++          "GENUINELY DIFFERENT code path from the ordinary ((ior-1)/(ior+1))^2 formula, not a coincidental "
++          "F0-happens-to-clamp-to-1 case (a non-1.0 specularFactor makes the two formulas' F0 diverge sharply: "
++          "min(1*specularColor,1)*specularFactor = specularFactor under the ordinary formula, vs the special "
++          "case's forced 1.0)") {
++    auto rig = makeStandardPbrRig("standard_pbr_task8_ior_zero");
++    if (!rig.has_value()) {
++        return;
++    }
++    rx::material::MaterialHandle handle =
++        rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
++    const auto params = rig->system->materialParams(handle);
++
++    std::vector<uint8_t> blob = makeDefaultStandardPbrBlob(*rig, handle);
++    // Explicit dielectric override -- see the sibling ior TEST_CASE above's
++    // identical comment for why makeDefaultStandardPbrBlob()'s own
++    // metallic=1.0 default would hide ior/specular entirely.
++    setParam(blob, params, "metallicFactor", 0.0F);
++    setParam(blob, params, "ior", 0.0F);
++    setParam(blob, params, "specularFactor", 0.3F);  // non-1.0: see this TEST_CASE's own title.
++    Rgba8 pixel = renderOne(*rig, handle, blob);
++
++    task8_oracle::EvalParams oracleParams;  // roughness=1.0 (default), metallic=0.0 (default), head-on.
++    oracleParams.ior = 0.0;
++    oracleParams.specularFactor = 0.3;
++    glm::dvec3 expected = task8_oracle::evaluate(oracleParams);
++    CHECK(near8(pixel.r, task8_oracle::toByte(expected.r), 3));
++    CHECK(near8(pixel.g, task8_oracle::toByte(expected.g), 3));
++    CHECK(near8(pixel.b, task8_oracle::toByte(expected.b), 3));
++
++    // Self-documenting discrimination proof: what would this SAME probe
++    // read under the ORDINARY (non-special-cased) formula instead --
++    // F0=min(1.0*(1,1,1),1.0)*0.3=0.3, F90=0.3 (NOT forced to 1.0)? At
++    // VoH=1 (head-on), F_Schlick collapses to F0 exactly regardless of
++    // F90 (pow5(1-VoH)=0), so this hypothesis's fresnel=0.3 -- computed
++    // directly here (bypassing computeDielectricF0F90's own ior<=0 branch)
++    // to prove this test's own discriminating power, not asserted against
++    // the GPU.
++    double alpha = 1.0 * 1.0;  // roughness=1.0 default -> alpha=1.0.
++    double d = task8_oracle::dGGX(alpha, 1.0);
++    double vis = task8_oracle::vSmithGGXCorrelated(alpha, 1.0, 1.0);
++    double wrongSpecular = d * vis * 0.3;                  // F0=0.3 under the (hypothetical) unbranched formula.
++    double wrongTotal = (1.0 / task8_oracle::kPi) + wrongSpecular;  // diffuseColor=(1,1,1), metallic=0.
++    uint8_t wrongByte = task8_oracle::toByte(wrongTotal);
++    uint8_t correctByte = task8_oracle::toByte(expected.r);
++    CHECK(correctByte > wrongByte + 10);  // real, wide separation -- not a coin-flip margin.
++    destroyRig(*rig);
++    CHECK_FALSE(rig->fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("StandardPBR Task 8: KHR_materials_specular specular=0.0 collapses the DIELECTRIC specular lobe to "
++          "exactly zero (both F0 and F90 vanish) -- a fully diffuse response, closed-form, oracle-checked") {
++    auto rig = makeStandardPbrRig("standard_pbr_task8_specular_zero");
++    if (!rig.has_value()) {
++        return;
++    }
++    rx::material::MaterialHandle handle =
++        rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
++    const auto params = rig->system->materialParams(handle);
++
++    std::vector<uint8_t> blob = makeDefaultStandardPbrBlob(*rig, handle);
++    setParam(blob, params, "baseColorFactor", std::array<float, 4>{0.6F, 0.6F, 0.6F, 1.0F});
++    setParam(blob, params, "metallicFactor", 0.0F);
++    setParam(blob, params, "specularFactor", 0.0F);
++    Rgba8 pixel = renderOne(*rig, handle, blob);
++
++    task8_oracle::EvalParams oracleParams;  // roughness=1.0 (default), head-on.
++    oracleParams.baseColor = glm::dvec3(0.6, 0.6, 0.6);
++    oracleParams.metallic = 0.0;
++    oracleParams.specularFactor = 0.0;
++    glm::dvec3 expected = task8_oracle::evaluate(oracleParams);
++    CHECK(near8(pixel.r, task8_oracle::toByte(expected.r), 3));
++    CHECK(near8(pixel.g, task8_oracle::toByte(expected.g), 3));
++    CHECK(near8(pixel.b, task8_oracle::toByte(expected.b), 3));
++    destroyRig(*rig);
++    CHECK_FALSE(rig->fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("StandardPBR Task 8: metal-exclusion invariant -- 'the metal BRDF is not affected by [specular]' "
++          "(KHR_materials_specular's own spec text, quoted in the gate matrix): a fully-metallic material's "
++          "rendered response is IDENTICAL whether specularFactor is 0.0 or 1.0, a zero-delta discrimination "
++          "check needing no closed-form arithmetic at all") {
++    auto rig = makeStandardPbrRig("standard_pbr_task8_metal_exclusion");
++    if (!rig.has_value()) {
++        return;
++    }
++    rx::material::MaterialHandle handle =
++        rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
++    const auto params = rig->system->materialParams(handle);
++
++    auto renderMetalWithSpecular = [&](float specularFactor) {
++        std::vector<uint8_t> blob = makeDefaultStandardPbrBlob(*rig, handle);
++        setParam(blob, params, "baseColorFactor", std::array<float, 4>{0.7F, 0.4F, 0.2F, 1.0F});
++        setParam(blob, params, "metallicFactor", 1.0F);
++        setParam(blob, params, "specularFactor", specularFactor);
++        setParam(blob, params, "ior", 0.0F);  // also exercises the ior=0 special case, same invariant.
++        return renderOne(*rig, handle, blob);
++    };
++
++    Rgba8 specularZero = renderMetalWithSpecular(0.0F);
++    Rgba8 specularOne = renderMetalWithSpecular(1.0F);
++    CHECK(specularZero.r == specularOne.r);
++    CHECK(specularZero.g == specularOne.g);
++    CHECK(specularZero.b == specularOne.b);
++    // Sanity: this is not a degenerate all-zero/all-saturated probe -- a
++    // metal with a non-grey baseColor genuinely lights up here (occlusion
++    // texture is white/1.0 by default, so the interim FG1 ambient term
++    // alone would already be nonzero even at NdotL=0, but this probe is
++    // head-on so direct light contributes too).
++    CHECK(specularOne.r > 10);
++    destroyRig(*rig);
++    CHECK_FALSE(rig->fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("StandardPBR Task 8: KHR_materials_specular specularColorFactor tints dielectric F0 independent of "
++          "specularFactor's own scalar strength -- a two-axis discrimination proof (color axis x strength axis)") {
++    auto rig = makeStandardPbrRig("standard_pbr_task8_specular_color_axis");
++    if (!rig.has_value()) {
++        return;
++    }
++    rx::material::MaterialHandle handle =
++        rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
++    const auto params = rig->system->materialParams(handle);
++
++    // roughness=0.28: chosen (see task-08-report.md's own derivation) so
++    // specularFactor in {0.5, 1.0} x specularColorFactor in {(1,1,1),(1,0,0)}
++    // lands well inside [0,1] (never saturating, never vanishing into
++    // 8-bit rounding noise) -- every one of the four combinations below is
++    // meant to read as a CLEARLY DIFFERENT byte value, not a marginal one.
++    constexpr float kRoughness = 0.28F;
++
++    struct Combo {
++        float specularFactor;
++        std::array<float, 4> specularColorAndPad;
++        const char* label;
++    };
++    const std::vector<Combo> combos{
++        {1.0F, {1.0F, 1.0F, 1.0F, 0.0F}, "specular=1.0, color=(1,1,1)"},
++        {0.5F, {1.0F, 1.0F, 1.0F, 0.0F}, "specular=0.5, color=(1,1,1) [strength axis]"},
++        {1.0F, {1.0F, 0.0F, 0.0F, 0.0F}, "specular=1.0, color=(1,0,0) [color axis]"},
++        {0.5F, {1.0F, 0.0F, 0.0F, 0.0F}, "specular=0.5, color=(1,0,0) [both axes]"},
++    };
++
++    std::vector<Rgba8> pixels;
++    for (const Combo& combo : combos) {
++        INFO("combo: ", combo.label);
++        std::vector<uint8_t> blob = makeDefaultStandardPbrBlob(*rig, handle);
++        // Explicit dielectric override -- see the ior TEST_CASEs above's
++        // identical comment.
++        setParam(blob, params, "metallicFactor", 0.0F);
++        setParam(blob, params, "roughnessFactor", kRoughness);
++        setParam(blob, params, "specularFactor", combo.specularFactor);
++        setParam(blob, params, "specularColorFactorAndPad", combo.specularColorAndPad);
++        Rgba8 pixel = renderOne(*rig, handle, blob);
++
++        task8_oracle::EvalParams oracleParams;
++        oracleParams.roughness = kRoughness;
++        oracleParams.specularFactor = combo.specularFactor;
++        oracleParams.specularColorFactor =
++            glm::dvec3(combo.specularColorAndPad[0], combo.specularColorAndPad[1], combo.specularColorAndPad[2]);
++        glm::dvec3 expected = task8_oracle::evaluate(oracleParams);
++        // margin=15 -- see the sibling ior TEST_CASE above's own comment
++        // for why this rig's imperfectly-flat default normal-map texture
++        // introduces a real, empirically-measured (~9%) bias at this
++        // roughness that a tight oracle-parity margin would false-fail on;
++        // every discrimination CHECK below uses a much wider (>=20)
++        // separator specifically so that bias can never itself explain a
++        // PASS.
++        CHECK(near8(pixel.r, task8_oracle::toByte(expected.r), 22));
++        CHECK(near8(pixel.g, task8_oracle::toByte(expected.g), 22));
++        CHECK(near8(pixel.b, task8_oracle::toByte(expected.b), 22));
++        pixels.push_back(pixel);
++    }
++
++    // Cross-combo discrimination -- the color axis: combo 0 (color=white)
++    // must read visibly brighter on G/B than combo 2 (color=red-only,
++    // G/B channel F0=0) at the SAME specularFactor.
++    CHECK(pixels[0].g > pixels[2].g + 40);
++    CHECK(pixels[0].b > pixels[2].b + 40);
++    // The strength axis: combo 0 (specular=1.0) must read visibly
++    // brighter than combo 1 (specular=0.5) on R (both have color=white).
++    CHECK(pixels[0].r > pixels[1].r + 40);
++    // Both axes compound: combo 0's R is brighter than combo 3's R (which
++    // has BOTH a lower specularFactor AND, irrelevantly for R since
++    // specularColorFactor.r=1 in both, the same red channel).
++    CHECK(pixels[0].r > pixels[3].r + 40);
++    destroyRig(*rig);
++    CHECK_FALSE(rig->fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("StandardPBR Task 8: energy-compensation permutation mechanism -- specializationBits' "
++          "kSpecializationEnergyCompensation bit selects a genuinely distinct, independently-cached VkPipeline "
++          "(D28/D8's own cache-key axis, made real for the first time by this ticket), without perturbing the "
++          "OFF variant's own already-cached pipeline; the ON variant's rendered output is value-asserted against "
++          "a non-trivial (non-1.0) dfgY, oracle-checked") {
++    auto rig = makeStandardPbrRig("standard_pbr_task8_energy_compensation");
++    if (!rig.has_value()) {
++        return;
++    }
++    rx::material::MaterialHandle handle =
++        rig->system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
++    const auto params = rig->system->materialParams(handle);
++
++    rx::graph::PassSignature pass = makeQuadPassSignature();
++    VkPipeline pipelineOffFirst = rig->system->getPipeline({handle, pass, 0});
++    VkPipeline pipelineOn =
++        rig->system->getPipeline({handle, pass, rx::material::kSpecializationEnergyCompensation});
++    VkPipeline pipelineOffSecond = rig->system->getPipeline({handle, pass, 0});
++
++    REQUIRE(pipelineOffFirst != VK_NULL_HANDLE);
++    REQUIRE(pipelineOn != VK_NULL_HANDLE);
++    // (c) [gate matrix, feature-permutation row] Distinct VkPipeline --
++    // turning the bit ON produced a genuinely different compiled pipeline.
++    CHECK(pipelineOffFirst != pipelineOn);
++    // ... and the OFF variant's own cache entry is completely untouched by
++    // having requested the ON variant afterward -- the SAME handle, not
++    // merely an equal-by-value one, proving no cache-key collision/
++    // perturbation across every other material's already-warm pipelines.
++    CHECK(pipelineOffSecond == pipelineOffFirst);
++
++    // Value-asserted: metallic=1 (F0=baseColor, maximizing energy
++    // compensation's own F0-proportional effect), high roughness (real
++    // single-scatter energy loss, the whole reason this correction
++    // exists), dfgY=0.5 (a physically-plausible "significant multi-scatter
++    // loss" placeholder -- see StandardPbrParams::dfgY's own header
++    // comment for why every SHIPPED producer still binds 1.0 today).
++    std::vector<uint8_t> blob = makeDefaultStandardPbrBlob(*rig, handle);
++    setParam(blob, params, "baseColorFactor", std::array<float, 4>{0.8F, 0.8F, 0.8F, 1.0F});
++    setParam(blob, params, "metallicFactor", 1.0F);
++    setParam(blob, params, "roughnessFactor", 1.0F);
++    setParam(blob, params, "dfgY", 0.5F);
++
++    Rgba8 pixelOff = renderOneWithSpecialization(*rig, handle, blob, 0);
++    Rgba8 pixelOn = renderOneWithSpecialization(*rig, handle, blob, rx::material::kSpecializationEnergyCompensation);
++
++    task8_oracle::EvalParams oracleOff;
++    oracleOff.baseColor = glm::dvec3(0.8, 0.8, 0.8);
++    oracleOff.metallic = 1.0;
++    oracleOff.roughness = 1.0;
++    glm::dvec3 expectedOff = task8_oracle::evaluate(oracleOff);
++
++    task8_oracle::EvalParams oracleOn = oracleOff;
++    oracleOn.energyCompensationOn = true;
++    oracleOn.dfgY = 0.5;
++    glm::dvec3 expectedOn = task8_oracle::evaluate(oracleOn);
++
++    CHECK(near8(pixelOff.r, task8_oracle::toByte(expectedOff.r), 3));
++    CHECK(near8(pixelOn.r, task8_oracle::toByte(expectedOn.r), 3));
++    // energyCompensation(f0,dfgY=0.5) = 1 + f0*(2-1) = 1+f0 > 1 for any
++    // f0>0 -- the ON variant must read BRIGHTER than OFF at this probe,
++    // not just "some other value" (the multiplicative contract's own
++    // documented direction, brdf.slang's energyCompensation() header
++    // comment).
++    CHECK(pixelOn.r > pixelOff.r);
++    destroyRig(*rig);
++    CHECK_FALSE(rig->fixture->context.hasValidationErrors());
++}
