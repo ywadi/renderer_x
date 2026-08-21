@@ -1,0 +1,13 @@
+{
+  "name": "rx-gltf-conformance-reference-generator",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Phase 5 Task 11 (#47): generates ground-truth reference PNGs for RendererX's glTF PBR conformance gate by driving the Khronos glTF-Sample-Renderer (GltfView/GltfState) headlessly via Playwright. Offline/occasional maintenance tooling only -- never run by CI (see generate_reference.mjs's own header comment).",
+  "type": "module",
+  "scripts": {
+    "generate": "node generate_reference.mjs"
+  },
+  "dependencies": {
+    "playwright": "1.62.1"
+  }
+}

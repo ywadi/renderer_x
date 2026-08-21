@@ -13,3 +13,9 @@ ctest-results-*.xml
 # --sponza-only) here -- never committed (D16), fetched/checksum-verified
 # on demand for local/CI testing only.
 assets/fetched/
+
+# Phase 5 Stage 1 Task 11 (#47): tools/gltf_conformance's own pinned
+# Playwright install (npm ci output) -- reproducible from package.json/
+# package-lock.json, never committed (same posture as every other
+# language-ecosystem dependency tree in this repo).
+tools/gltf_conformance/node_modules/

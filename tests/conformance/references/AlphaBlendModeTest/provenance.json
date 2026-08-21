@@ -1,0 +1,57 @@
+{
+  "model": "AlphaBlendModeTest",
+  "sourceGltf": "assets/fetched/AlphaBlendModeTest/glTF/AlphaBlendModeTest.gltf",
+  "generator": "tools/gltf_conformance/generate_reference.mjs",
+  "rendererRepo": "https://github.com/KhronosGroup/glTF-Sample-Renderer",
+  "rendererCommit": "863b981fb755359063e370ff7b6e956bda0716e2",
+  "rendererLicense": "Apache-2.0",
+  "generatedAt": "2026-08-21T23:17:43.749Z",
+  "renderWidth": 512,
+  "renderHeight": 512,
+  "environment": {
+    "path": "samples/08_gltf_viewer/environments/gate_test_env.hdr",
+    "intensity": 1,
+    "rotationDegrees": 0
+  },
+  "renderingParameters": {
+    "toneMap": "None (Linear mapping, clamped at 1.0)",
+    "exposure": 1,
+    "useIBL": true,
+    "usePunctual": true,
+    "renderEnvironmentMap": false,
+    "clearColor": [
+      0.22,
+      0.25,
+      0.29,
+      1
+    ]
+  },
+  "camera": {
+    "position": [
+      0,
+      1.0997666120529175,
+      10.791272163391113
+    ],
+    "target": [
+      0,
+      1.0997666120529175,
+      -0.09999991208314896
+    ],
+    "yfov": 0.7853981633974483,
+    "znear": 0.010465714208716705,
+    "zfar": 104.65714208716705,
+    "distance": 10.891272072561982
+  },
+  "sceneExtents": {
+    "min": [
+      -4.511312484741211,
+      -3.411545991897583,
+      -4.611312389373779
+    ],
+    "max": [
+      4.511312484741211,
+      5.611079216003418,
+      4.411312580108643
+    ]
+  }
+}

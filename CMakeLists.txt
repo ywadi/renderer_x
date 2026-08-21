@@ -216,3 +216,11 @@ add_subdirectory(samples/common)
 add_subdirectory(tools/compare_rgba8_png)
 add_subdirectory(samples/08_gltf_viewer)
 add_subdirectory(samples/09_scene)
+
+# Phase 5 Stage 1 Task 11 (#47), gate ruling T11: the glTF PBR conformance
+# harness (rx_conformance_render) -- see tests/conformance/CMakeLists.txt's
+# own header comment for why this is a NEW top-level tests/ tree rather
+# than living under an existing src/*/tests convention. Added last: it
+# links rx_ibl/rx_material/rx_scene/samples' own sample_common, all
+# already defined above.
+add_subdirectory(tests/conformance)

@@ -1,0 +1,57 @@
+{
+  "model": "MetalRoughSpheresNoTextures",
+  "sourceGltf": "assets/fetched/MetalRoughSpheresNoTextures/glTF/MetalRoughSpheresNoTextures.gltf",
+  "generator": "tools/gltf_conformance/generate_reference.mjs",
+  "rendererRepo": "https://github.com/KhronosGroup/glTF-Sample-Renderer",
+  "rendererCommit": "863b981fb755359063e370ff7b6e956bda0716e2",
+  "rendererLicense": "Apache-2.0",
+  "generatedAt": "2026-08-21T23:15:13.399Z",
+  "renderWidth": 512,
+  "renderHeight": 512,
+  "environment": {
+    "path": "samples/08_gltf_viewer/environments/gate_test_env.hdr",
+    "intensity": 1,
+    "rotationDegrees": 0
+  },
+  "renderingParameters": {
+    "toneMap": "None (Linear mapping, clamped at 1.0)",
+    "exposure": 1,
+    "useIBL": true,
+    "usePunctual": true,
+    "renderEnvironmentMap": false,
+    "clearColor": [
+      0.22,
+      0.25,
+      0.29,
+      1
+    ]
+  },
+  "camera": {
+    "position": [
+      0.0028085585217922926,
+      0.002775889588519931,
+      0.007747060619294643
+    ],
+    "target": [
+      0.0028085585217922926,
+      0.002775889588519931,
+      -0.0015000001294538379
+    ],
+    "yfov": 0.7853981633974483,
+    "znear": 0.000007873217110153214,
+    "zfar": 0.07873217110153213,
+    "distance": 0.009247060757452035
+  },
+  "sceneExtents": {
+    "min": [
+      -0.0009891114896163344,
+      -0.0010543683310970664,
+      -0.003606147598475218
+    ],
+    "max": [
+      0.0066062286496162415,
+      0.00660614762455225,
+      0.0006061475141905248
+    ]
+  }
+}

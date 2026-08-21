@@ -1,0 +1,232 @@
+<!doctype html>
+<!--
+  tools/gltf_conformance/harness.html -- Phase 5 Task 11 (#47), gate ruling
+  T11. A minimal, non-Vue page that drives the Khronos glTF-Sample-Renderer's
+  own GltfView/GltfState/ResourceLoader API DIRECTLY (bypassing the
+  glTF-Sample-Viewer Vue.js UI shell entirely -- see
+  tools/fetch_gltf_sample_renderer.sh's own header comment for why that
+  shell is not fetched at all). Loaded by generate_reference.mjs inside a
+  headless Chromium page; window.rxCapture() below is the ONE function that
+  script calls via page.evaluate().
+
+  METHODOLOGY (recorded here + task-11-report.md; see that report for the
+  full derivation):
+   - Camera: state.userCamera.resetView(gltf, sceneIndex) -- the Renderer's
+     OWN default "fit to scene" algorithm (source/gltf/user_camera.js,
+     pinned commit), used VERBATIM here (not re-derived) so the reference
+     render's camera is the actual reference renderer's actual default
+     framing. RendererX's own conformance harness (tests/conformance/
+     camera_fit.cpp/camera_fit.h) ports this EXACT algorithm
+     (fitDistanceToExtents/fitCameraTargetToExtents/
+     fitCameraPlanesToExtents, cited by function name) against its own
+     imported scene's world bounds, using the SAME 45-degree default yfov
+     and the SAME square 512x512 (aspect=1) render resolution -- both
+     sides are therefore expected to converge on numerically identical
+     camera parameters from the same deterministic formula over the same
+     input, not merely "close". TWO non-obvious findings this task's own
+     development had to reverse-engineer (both now cited in camera_fit.h,
+     not re-derived a second time here): (1) resetView()'s own
+     getSceneExtents() reads world transforms that are only valid AFTER
+     scene.applyTransformHierarchy(gltf) has run at least once -- this
+     harness calls it explicitly, once, right before resetView() (see the
+     inline comment at that call site below); (2) getSceneExtents() does
+     NOT union tight per-primitive AABBs -- source/gltf/gltf_utils.js's
+     own getExtentsFromAccessor() replaces EACH primitive's tight AABB
+     with the smallest CUBE inscribing that AABB's own bounding SPHERE
+     (center +/- half-the-AABB's-own-diagonal, not half its per-axis
+     extent) BEFORE the union -- camera_fit.h's own
+     accumulateReferenceStyleSceneExtents()/sphereInscribingCubeOf()
+     reproduce this exactly, including the per-PRIMITIVE (not per-mesh)
+     granularity, which is load-bearing for at least one gated model
+     (MetalRoughSpheresNoTextures' own multi-primitive text-label meshes).
+   - Tonemap: GltfState.ToneMaps.NONE ("Linear mapping, clamped at 1.0 per
+     channel" -- source/Renderer/shaders/tonemapping.glsl's own toneMap(),
+     verified by reading that file directly: NONE selects none of the
+     `#ifdef TONEMAP_*` branches, leaving `color *= u_Exposure;
+     return linearTosRGB(color);` i.e. exposure multiply, hard clip at
+     write time, sRGB encode). This is DELIBERATE, not a default left
+     unconsidered: RendererX's own tonemap.frag.slang (shaders/multipass/)
+     is a plain Reinhard curve (Phase 4 decision), a materially DIFFERENT
+     curve from every option this renderer offers (KHR_PBR_NEUTRAL/ACES/
+     NONE) -- comparing through either side's own "nice" tonemap would
+     make this conformance gate measure "do the two tonemap curves agree"
+     (an orthogonal, Phase-5-Task-32-owned question) rather than "do the
+     BRDF/lighting/IBL values agree". NONE is the one option with a
+     TRIVIAL, exactly-reproducible curve (clamp+sRGB, no compression) that
+     RendererX's own conformance render tool (tests/conformance/main.cpp)
+     replicates bit-for-bit on its own linear HDR capture instead of
+     running its production Reinhard pass -- see that tool's own
+     applyLinearClampTonemap() for the identical formula.
+   - Environment: the SAME committed equirect HDR fixture RendererX's own
+     samples/08_gltf_viewer already uses for its own IBL gate
+     (samples/08_gltf_viewer/environments/gate_test_env.hdr, procedurally
+     generated for this project, Task 10) -- loaded via ResourceLoader.
+     loadEnvironment() on this side, and via rx::ibl::bakeEnvironment() on
+     RendererX's own side: two INDEPENDENT IBL implementations baking the
+     SAME input texture, which is the actual point of this conformance
+     check for T9/T10. environmentRotation is left at 0 (this renderer's
+     own zero-rotation reading of the raw equirect mapping) since
+     RendererX's own EnvironmentDesc has no rotation concept at all to
+     match against (rx_scene/scene.h, verified) -- recorded as an accepted
+     residual-divergence source the pilot-derived tolerance (task-11-
+     report.md) absorbs, not something either side "gets wrong".
+   - Background: renderEnvironmentMap=false (flat clearColor background,
+     matched literally byte-for-byte against RendererX's own capture) for
+     the material/emissive/texture-transform conformance set -- isolates
+     "does the shaded PBR geometry match" from "does the visible skybox's
+     own orientation/sampling match" (a second, independent divergence
+     axis this ticket's core 6-model set does not need to also absorb).
+   - No punctual lights: every core conformance model (MetalRoughSpheres[
+     NoTextures]/EmissiveStrengthTest/TextureTransformTest[Multi]/
+     CompareEmissiveStrength) is IBL-only by design (no KHR_lights_punctual
+     -- KHR_lights_punctual is Stage 2/Task 13, not yet landed in
+     RendererX at this ticket's base commit); usePunctual stays at this
+     renderer's own default (true) but is a no-op for content with no
+     punctual lights, matching RendererX's own zero-fake-light capture
+     (tests/conformance/main.cpp deliberately zeroes its inherited-from-
+     sample08 fake directional key light -- see that file's own comment).
+-->
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>rx-gltf-conformance-harness</title>
+  </head>
+  <body style="margin:0;background:#000;">
+    <canvas id="rxCanvas" width="512" height="512"></canvas>
+    <!-- Classic (non-module) script -- defines the global `createKtxModule`
+         KtxDecoder's constructor reads unconditionally (source/ResourceLoader/
+         ktx.js, pinned commit) whenever ResourceLoader.initKtxLib() is not
+         given an explicit external lib. None of this ticket's conformance
+         models use KTX2 textures (plain PNG/JPG only, verified against each
+         model's own glTF `images` array) -- this script only needs to exist
+         so that bare identifier reference does not throw a ReferenceError
+         before window.rxCapture is ever defined; its own async WASM init
+         (fired, never awaited, by KtxDecoder's constructor) completing or
+         not is irrelevant to this harness. -->
+    <script src="../../toolchain/gltf-sample-renderer/dist/libs/libktx.js"></script>
+    <script type="module">
+      import { GltfView, GltfState } from "../../toolchain/gltf-sample-renderer/dist/gltf-viewer.module.js";
+
+      const canvas = document.getElementById("rxCanvas");
+      const context = canvas.getContext("webgl2", {
+        antialias: false,
+        preserveDrawingBuffer: true,
+        alpha: true,
+      });
+      if (context === null) {
+        window.rxInitError = "webgl2 context creation failed";
+      }
+
+      const view = context !== null ? new GltfView(context) : null;
+      const resourceLoader = view !== null ? view.createResourceLoader() : null;
+
+      // window.rxCapture(modelUrl, envUrlOrNull, width, height) -> {
+      //   dataUrl: "data:image/png;base64,...",
+      //   camera: { position, target, yfov, znear, zfar, distance },
+      //   sceneExtents: { min, max },
+      // }
+      // Thrown errors propagate to Playwright's own page.evaluate() caller
+      // as a rejected promise -- generate_reference.mjs surfaces them
+      // directly rather than swallowing them into a null return.
+      window.rxCapture = async function rxCapture(modelUrl, envUrl, width, height) {
+        if (view === null || resourceLoader === null) {
+          throw new Error(window.rxInitError ?? "GltfView/ResourceLoader not initialized");
+        }
+        canvas.width = width;
+        canvas.height = height;
+
+        const state = view.createState();
+        const gltf = await resourceLoader.loadGltf(modelUrl);
+        state.gltf = gltf;
+        state.sceneIndex = gltf.scene ?? 0;
+        state.cameraNodeIndex = undefined; // force the user (fit-to-scene) camera.
+
+        if (envUrl) {
+          state.environment = await resourceLoader.loadEnvironment(envUrl);
+        }
+
+        // BUG FOUND THIS TASK, FIXED HERE (#1 of 2 camera-fit findings --
+        // see this file's own top comment for #2, the sphere-inscribing-
+        // cube step): UserCamera::resetView()'s own getSceneExtents() reads
+        // each node's getRenderedWorldTransform() (source/gltf/gltf_utils.
+        // js), which is simply `this.worldTransform` (source/gltf/node.js)
+        // -- a field ONLY populated by scene.applyTransformHierarchy(gltf)
+        // (source/gltf/scene.js), which this renderer's OWN GltfView.
+        // renderFrame() calls internally, AFTER its own camera/animation
+        // setup, every frame. Calling resetView() before the FIRST
+        // renderFrame() (this harness's original, naive call order) reads
+        // every node's `worldTransform` still at its own post-construction
+        // default (identity for every node, real hierarchy never yet
+        // applied) -- reproduced directly this task against MetalRough
+        // Spheres' own real (0.4x scale + axis-swap rotation) root
+        // transform. FIX: apply the transform hierarchy once
+        // (scene.applyTransformHierarchy(gltf), the SAME call renderFrame()
+        // itself makes) before resetView() ever reads it -- matches the
+        // deployed Sample Viewer app's own effective behavior (its
+        // continuous render loop has always already applied the hierarchy
+        // at least once before any user-triggered "reset view" UI action
+        // could run).
+        gltf.scenes[state.sceneIndex].applyTransformHierarchy(gltf);
+
+        // Fit-to-scene camera -- ported verbatim in tests/conformance/
+        // camera_fit.cpp (including finding #2, the sphere-inscribing-cube
+        // step camera_fit.h's own accumulateReferenceStyleSceneExtents()
+        // documents in full); see this file's own top comment.
+        state.userCamera.resetView(gltf, state.sceneIndex);
+        // Opt-in diagnostic (harness.html?debug=1) -- prints the resolved
+        // camera-fit extents to the page console; useful for re-deriving/
+        // cross-checking camera_fit.cpp's own numbers by hand against a
+        // fresh model without instrumenting this file again. Never
+        // enabled by generate_reference.mjs's own normal invocation.
+        if (window.location.search.includes('debug')) {
+          console.log(`DEBUG cam.sceneExtents min=${JSON.stringify(Array.from(state.userCamera.sceneExtents.min))} max=${JSON.stringify(Array.from(state.userCamera.sceneExtents.max))}`);
+        }
+
+        state.renderingParameters.toneMap = GltfState.ToneMaps.NONE;
+        state.renderingParameters.exposure = 1.0;
+        state.renderingParameters.useIBL = true;
+        state.renderingParameters.usePunctual = true;
+        state.renderingParameters.renderEnvironmentMap = false;
+        state.renderingParameters.blurEnvironmentMap = true;
+        state.renderingParameters.iblIntensity = 1.0;
+        state.renderingParameters.environmentRotation = 0.0;
+        // RendererX's own linear-clamp capture clears to the SAME literal
+        // sRGB-domain color both sides then encode identically -- see
+        // tests/conformance/main.cpp's own kConformanceClearColorSrgb.
+        state.renderingParameters.clearColor = [0.22, 0.25, 0.29, 1.0];
+
+        // Two renders: WebGL/driver state (shader/program binds, IBL
+        // texture completeness) can have a benign first-frame warm-up
+        // difference on some backends -- the SECOND frame is what is
+        // actually captured, matching this project's own "never trust an
+        // uninitialized first frame" headless-capture convention
+        // (RendererX's own samples capture only after their own
+        // known-ready state, never frame 0 blind).
+        view.renderFrame(state, width, height);
+        view.renderFrame(state, width, height);
+
+        const dataUrl = canvas.toDataURL("image/png");
+
+        const cam = state.userCamera;
+        const position = cam.getPosition();
+        const target = cam.getTarget();
+        return {
+          dataUrl,
+          camera: {
+            position: [position[0], position[1], position[2]],
+            target: [target[0], target[1], target[2]],
+            yfov: cam.perspective.yfov,
+            znear: cam.perspective.znear,
+            zfar: cam.perspective.zfar,
+            distance: cam.distance,
+          },
+          sceneExtents: {
+            min: [cam.sceneExtents.min[0], cam.sceneExtents.min[1], cam.sceneExtents.min[2]],
+            max: [cam.sceneExtents.max[0], cam.sceneExtents.max[1], cam.sceneExtents.max[2]],
+          },
+        };
+      };
+      window.rxHarnessReady = true;
+    </script>
+  </body>
+</html>
