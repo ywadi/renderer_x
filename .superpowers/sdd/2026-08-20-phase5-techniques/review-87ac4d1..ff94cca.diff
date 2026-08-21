@@ -1,0 +1,1984 @@
+# Review package: 87ac4d1..ff94cca
+
+## Commits
+ff94cca chore: p5 task 7 SDD report
+59b598e ci: install spirv-tools, exclude rx_material_brdf_gpu from Wine run (#43)
+3eaaa0b feat(shaders/material): port Filament BRDF module + link-time composition proof (#43)
+
+## Files changed
+ .github/workflows/ci.yml                           |  27 +-
+ .../2026-08-20-phase5-techniques/task-07-report.md | 289 +++++++++++++++++
+ shaders/material/brdf.slang                        | 258 +++++++++++++++
+ src/rx_material/tests/CMakeLists.txt               |  43 +++
+ src/rx_material/tests/brdf_gpu_fixture.h           | 138 ++++++++
+ src/rx_material/tests/brdf_test_harness.h          | 272 ++++++++++++++++
+ src/rx_material/tests/test_brdf_module_gpu.cpp     | 361 +++++++++++++++++++++
+ .../tests/test_brdf_spirv_link_composition_gpu.cpp | 181 +++++++++++
+ .../tests/test_brdf_white_furnace_gpu.cpp          | 241 ++++++++++++++
+ 9 files changed, 1806 insertions(+), 4 deletions(-)
+
+## Diff
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 5efaa28..9678090 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -104,26 +104,33 @@ jobs:
+       # warning disappears with the layer package installed and VK_LAYER_PATH
+       # unset -- i.e. this one missing apt package, not any code path in
+       # this repository, was the entire root cause. See descriptor_arena.h/
+       # .cpp's own "BUDGETS ARE ARENA-ENFORCED" comment for this same CI
+       # run's other, unrelated finding (DescriptorArena's exhaustion
+       # contract relying on driver-optional VkDescriptorPool enforcement).
+       - name: Install system packages
+         # timeout-minutes + Acquire::Retries: runner apt mirrors stall
+         # indefinitely on bad days (3 observed 2026-08-19, 20-47 min
+         # hangs) — fail fast so a rerun costs minutes, not an hour.
++        # spirv-tools [Phase 5 Task 7 (#43), gate ruling T7]: provides the
++        # spirv-dis binary rx_material_brdf_gpu_tests' own
++        # test_brdf_spirv_link_composition_gpu.cpp requires at CMake
++        # configure time (find_program(), FATAL_ERROR if absent) to prove
++        # the Slang link-time-composition mechanism's SPIR-V-absence
++        # guarantee -- the first automated (not manual) spirv-dis
++        # invocation in this repository (matrix's own "New gaps" entry).
+         timeout-minutes: 10
+         run: |
+           sudo apt-get -o Acquire::Retries=3 update
+           sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y \
+             ninja-build mesa-vulkan-drivers vulkan-tools libvulkan-dev \
+-            vulkan-validationlayers xvfb \
++            vulkan-validationlayers xvfb spirv-tools \
+             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+             libxfixes-dev libxss-dev libxtst-dev libxkbcommon-dev
+ 
+       - name: Install pinned zig toolchain (checksum-verified)
+         run: |
+           curl -fsSL -o "/tmp/${RX_ZIG_ARCHIVE}" "${RX_ZIG_URL}"
+           echo "${RX_ZIG_SHA256}  /tmp/${RX_ZIG_ARCHIVE}" | sha256sum -c -
+           mkdir -p toolchain/zig
+           tar -xf "/tmp/${RX_ZIG_ARCHIVE}" -C toolchain/zig --strip-components=1
+           toolchain/zig/zig version
+@@ -462,25 +469,30 @@ jobs:
+       # this job's very first ctest run. Installing the same lavapipe +
+       # loader packages the linux-native job uses gives winevulkan a real
+       # (software) Vulkan implementation to forward to, without changing
+       # what's excluded below: rx_rhi_vk_tests and every sample_*_headless
+       # gate stay excluded from ctest -- exercising this project's actual
+       # device/swapchain/synchronization2 pipeline through Wine's Vulkan
+       # passthrough is a materially bigger claim than "window creation
+       # succeeds" and is not verified here.
+       - name: Install system packages
+         # Same stall guard as the linux-native job (see comment there).
++        # spirv-tools: needed here too even though this job's own ctest run
++        # excludes rx_material_brdf_gpu_tests below -- CMake's find_program()
++        # for RX_SPIRV_DIS (src/rx_material/tests/CMakeLists.txt) runs at
++        # CONFIGURE time on this SAME host regardless of the cross-compile
++        # TARGET, and FATAL_ERRORs the whole configure step if absent.
+         timeout-minutes: 10
+         run: |
+           sudo apt-get -o Acquire::Retries=3 update
+           sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y \
+-            ninja-build wine xvfb mesa-vulkan-drivers vulkan-tools libvulkan-dev
++            ninja-build wine xvfb mesa-vulkan-drivers vulkan-tools libvulkan-dev spirv-tools
+ 
+       - name: Install pinned zig toolchain (checksum-verified)
+         run: |
+           curl -fsSL -o "/tmp/${RX_ZIG_ARCHIVE}" "${RX_ZIG_URL}"
+           echo "${RX_ZIG_SHA256}  /tmp/${RX_ZIG_ARCHIVE}" | sha256sum -c -
+           mkdir -p toolchain/zig
+           tar -xf "/tmp/${RX_ZIG_ARCHIVE}" -C toolchain/zig --strip-components=1
+           toolchain/zig/zig version
+ 
+       # Per-job key -- see the linux-native job's identically-worded comment
+@@ -646,21 +658,28 @@ jobs:
+       # MaterialSystem tests -- every one of them builds a real
+       # VkGraphicsPipeline, same GPU-backed reason), rx_debug_ui_gpu_tests
+       # [Phase 4 Stage 2 Task 21 -- Overlay::create() builds a real
+       # VkGraphicsPipeline/descriptor pool/font-atlas texture through the
+       # vendored ImGui Vulkan backend, same GPU-backed reason],
+       # rx_frame_loop_gpu_tests [Phase 5 Task 5, ticket #41 -- PresentLoop's
+       # own orchestration wraps a real rx::rhi::Device acquire/present
+       # cycle, same GPU-backed reason; rx_frame_loop_tests, the SIBLING
+       # device-free binary for this module's pure decision functions, is
+       # deliberately NOT matched by this pattern and runs for real under
+-      # Wine, like rx_graph_tests/rx_material_tests already do], and every
++      # Wine, like rx_graph_tests/rx_material_tests already do],
++      # rx_material_brdf_gpu_tests [Phase 5 Task 7, ticket #43 -- two of its
++      # three source files build a real windowed VkDevice; its third file
++      # (the SPIR-V link-composition proof) is itself device-free but
++      # shells out to the HOST's own spirv-dis binary via std::system(),
++      # which a cross-compiled Windows .exe running under Wine cannot
++      # reliably do -- excluded as one whole binary rather than split, since
++      # 2 of its 3 files genuinely need a live GPU anyway], and every
+       # sample_*_headless gate are excluded: Wine in CI has no real Vulkan
+       # device to hand them, and that is a real, documented environment
+       # limitation -- not a silent pass. rx_core, rx_platform,
+       # shader_spirv_test, AND rx_shader_tests all run for real under Wine
+       # and are NOT excluded here -- rx_shader_tests does real in-process
+       # Slang compilation (slang::createGlobalSession etc.) via the
+       # MSVC-built slang-compiler.dll cross-linked through zig/LLD
+       # [R:A6/D2], which needs no GPU at all (SPIR-V codegen is pure CPU
+       # work), and this was investigated rather than assumed: Task 1
+       # verified directly that Slang's Windows DLLs (slang-compiler.dll +
+@@ -677,21 +696,21 @@ jobs:
+       # warm-up step above already started a persistent Xvfb on :77 and
+       # exported DISPLAY via $GITHUB_ENV, which is what let that step pay
+       # the one-time Wine-session-bootstrap cost outside any test's own
+       # TIMEOUT window (see that step's own comment) -- wrapping this step
+       # in its OWN `xvfb-run -a` as well would spin up a SECOND, unrelated
+       # Xvfb/$DISPLAY and defeat the whole point, since wineserver's already-
+       # running session processes are tied to the FIRST $DISPLAY they saw
+       # (:77), not this one.
+       - name: Test under wine (xvfb; GPU tests excluded -- no Vulkan under Wine)
+         run: >-
+-          ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_debug_ui_gpu|rx_frame_loop_gpu|sample' --output-on-failure
++          ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_material_brdf_gpu|rx_debug_ui_gpu|rx_frame_loop_gpu|sample' --output-on-failure
+           --output-junit ${{ github.workspace }}/ctest-results-windows-cross-zig.xml
+ 
+       - name: Build budget check
+         run: tools/check_build_budget.sh windows-cross-zig 60
+ 
+       # Same packaging mechanism as the linux-native job -- see
+       # tools/package_samples.sh and that job's identically-worded comment
+       # above its own packaging step for the full per-sample manifest.
+       - name: Package samples for redistribution
+         run: tools/package_samples.sh windows-cross-zig windows-x86_64 rendererx-samples-windows-x86_64.zip
+diff --git a/.superpowers/sdd/2026-08-20-phase5-techniques/task-07-report.md b/.superpowers/sdd/2026-08-20-phase5-techniques/task-07-report.md
+new file mode 100644
+index 0000000..9db3389
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-20-phase5-techniques/task-07-report.md
+@@ -0,0 +1,289 @@
++# Task 7 report — Filament BRDF module port to Slang (issue #43)
++
++Implementer round. Base: main `87ac4d1` (one ledger commit ahead of the
++dispatch note's stated `06e6488`; no conflicting work). Order of authority
++followed: rulings (`rulings-2026-08-20.md`) > plan (Task 7) > gate matrix
++(`matrix-p5t07-brdf-module-port.md`) > ticket (#43).
++
++## Status: COMPLETE
++
++Every matrix row (as amended by the T7 per-ticket ruling) is satisfied.
++Both presets build clean. Real-driver (NVIDIA RTX 2080) and lavapipe runs
++both pass with zero unfiltered validation errors. Windows-cross-zig/Wine
++suite unaffected (14/14, unchanged from before this round). Four
++independent revert-discrimination proofs performed and recorded (D_GGX
++parity, the f90 discriminator, the white-furnace energy-compensation
++formula, and the SPIR-V link-composition mechanism) — every one reproduced
++the expected failure, then was restored to green.
++
++## What shipped
++
++- **`shaders/material/brdf.slang`** (new) — the composable BRDF math
++  module: `D_GGX`, `V_SmithGGXCorrelated`, `F_Schlick` (three overloads:
++  vec3-f0/f90, scalar-f0/f90, vec3-f0-implicit-f90=1.0), `fresnelDefault`
++  (computed-f90, the T7-ruled default), `Fd_Lambert`, `Fd_Burley`,
++  `energyCompensation`, plus the link-time feature-composition machinery
++  (`IEnergyCompensationFeature`, `EnergyCompensationOn`/
++  `EnergyCompensationOff`) and a named clearcoat extension-point comment for
++  Task 21. Every function takes scalar/vector inputs only — no
++  `ParameterBlock`, no bindless global, no `IMaterialShader` dependency.
++  **`standard_pbr.slang`/`material.slang` are NOT modified** — per the
++  ticket's own scope line ("this task is the MATH + MODULES + MECHANISM...
++  do not rewrite the production material path here"), so the existing
++  08/09 D17 gates stay byte-identical trivially (confirmed: full suite
++  rerun below, `sample_08_gltf_viewer_headless` still passes unchanged).
++- **`src/rx_material/tests/brdf_test_harness.h`** (new) — shared
++  `slang::ISession` plumbing (mirrors `MaterialSystem::
++  createMaterialSession()`/`compileMaterial()`, not shared with it — this
++  codebase's own established per-file-duplicated-helper idiom) for single-
++  module and two-module (link-time-composed) compute compiles with a real
++  search path into `shaders/material/`.
++- **`src/rx_material/tests/brdf_gpu_fixture.h`** (new) — skip-guarded
++  windowed-device fixture + one shared "one input buffer, one output
++  buffer, N-wide dispatch" helper.
++- **`src/rx_material/tests/test_brdf_module_gpu.cpp`** (new) — standalone-
++  compile test, the 7-point port-parity table, the Smith-correlated
++  discrimination case, the f90 discrimination case.
++- **`src/rx_material/tests/test_brdf_white_furnace_gpu.cpp`** (new) — the
++  white-furnace energy-conservation test (Monte-Carlo `DFV_Multiscatter`
++  port + `energyCompensation()` ON/OFF discrimination).
++- **`src/rx_material/tests/test_brdf_spirv_link_composition_gpu.cpp`**
++  (new) — the SPIR-V-absence proof for Slang link-time generic composition.
++- **`src/rx_material/tests/CMakeLists.txt`** — new `rx_material_brdf_gpu_tests`
++  binary; `find_program(spirv-dis)` with a `FATAL_ERROR` if absent.
++- **`.github/workflows/ci.yml`** — `spirv-tools` apt package (both jobs —
++  `find_program` runs at CMake-configure time on the same Linux host
++  regardless of cross-compile target); `rx_material_brdf_gpu` added to the
++  Wine-job ctest exclusion pattern (two of its three files build a real
++  windowed `VkDevice`; the third shells out to the host's own `spirv-dis`
++  via `std::system()`, which a Wine-hosted cross-compiled `.exe` cannot
++  reliably do — excluded as one whole binary, matching every other GPU-
++  backed binary's own exclusion precedent in that same regex).
++
++## Ported-file provenance
++
++All from `google/filament` **v1.75.0** (tag; commit
++`0e58877c09afb1aacd09ff640f74d2adcd2a7e80`, Apache-2.0, whole-repo LICENSE)
++— RC1's phase-wide pin. Re-fetched and re-read in full against this exact
++commit this session (the Stage-1 gate matrix's own citations were against
++main HEAD `721ec80`; content diffed identical for every function ported
++below — no drift found).
++
++| Filament source (pinned `0e58877c0`) | Our module |
++|---|---|
++| `shaders/src/surface_brdf.fs:54-79` — `D_GGX(roughness, NoH, h)` | `brdf.slang::D_GGX(alpha, NoH)` |
++| `shaders/src/surface_brdf.fs:102-113` — `V_SmithGGXCorrelated(roughness, NoV, NoL)` | `brdf.slang::V_SmithGGXCorrelated(alpha, NoV, NoL)` |
++| `shaders/src/surface_brdf.fs:145-157` — `F_Schlick` (three overloads) | `brdf.slang::F_Schlick` (matching three overloads) |
++| `shaders/src/surface_brdf.fs:177-186` — `fresnel()`'s computed-f90 (`FILAMENT_QUALITY_HIGH`) dispatch | `brdf.slang::fresnelDefault(f0, VoH)` |
++| `shaders/src/surface_brdf.fs:237-239` — `Fd_Lambert()` | `brdf.slang::Fd_Lambert()` |
++| `shaders/src/surface_brdf.fs:241-247` — `Fd_Burley(roughness, NoV, NoL, LoH)` | `brdf.slang::Fd_Burley(alpha, NoV, NoL, LoH)` |
++| `shaders/src/surface_shading_lit.fs:230-238` — `getEnergyCompensationPixelParams()`'s `1.0 + f0*(1.0/dfg.y - 1.0)` | `brdf.slang::energyCompensation(f0, dfgY)` |
++| `shaders/src/surface_shading_model_standard.fs:135` — `color = Fd + Fr * pixel.energyCompensation` (the multiplicative contract) | Documented as `energyCompensation()`'s own calling contract; not itself wired into any production path this task |
++| `libs/ibl/src/CubemapIBL.cpp:790-833` — `DFV_Multiscatter()` (+`hammersley()`, `hemisphereImportanceSampleDggx()`, `Visibility()`) | Test-local Monte-Carlo kernel in `test_brdf_white_furnace_gpu.cpp` (ported verbatim; `Visibility()` itself is not re-ported — the kernel calls `brdf.slang`'s own already-verified `V_SmithGGXCorrelated`, the identical formula) |
++| `libs/ibl/include/ibl/utilities.h:44-53` — `hammersley(i, iN)` | Same test-local kernel |
++
++## Per-row proof (matrix, T7-ruling-amended)
++
++| Row | Disposition | Evidence |
++|---|---|---|
++| `D_GGX` | consume-now, port-parity verified | `test_brdf_module_gpu.cpp`, 7-point table, exact-tolerance (`epsilon(1e-4)`) match against an independent fp64 C++ transcription |
++| `V_SmithGGXCorrelated` | consume-now, port-parity verified + discrimination | Same table; discrimination case swaps in the textbook SEPARABLE Smith form at P3 (alpha=1.0, NoV=0.1, NoL=0.2) — diverges by ~0.91, four orders of magnitude past the parity tolerance |
++| `F_Schlick` (f90 convention) | **resolved: computed-f90 (`fresnelDefault`) ships as the new default; implicit-f90=1.0 kept as a named, tested fallback (`F_Schlick(f0,VoH)`)** — per the T7 per-ticket ruling | Both forms table-tested; discrimination case at P6 (f0=(0.01,0.01,0.01), VoH=0.02) — diverges by ~0.456. **Correction to the matrix's own "high-F0" framing**: re-derived directly against the pinned formula and found the OPPOSITE — `f90 = saturate(dot(f0,16.5))` saturates to exactly 1.0 (byte-identical to the implicit form) for any f0 with `sum(f0) >= ~0.0606`, true of the glTF/Disney 0.04 dielectric baseline and essentially every physically-plausible metal; the two forms only diverge for LOW total reflectance (e.g. a `KHR_materials_specular`-attenuated dielectric). Documented in `brdf.slang`'s own `fresnelDefault()` header comment |
++| `Fd_Lambert` | consume-now, modularized | Table test, exact match to `1/PI` |
++| `Fd_Burley` | **ruled: shipped alongside Lambert, exported and tested, not wired into any production material** (no dedicated Task 1 spec doc landed; the charter's own binding "Shader architecture" bullet already names Lambert as the flagship's lobe choice) | Table test, exact-tolerance match |
++| Energy compensation | consume-now (this ticket's headline deliverable) | `energyCompensation(f0, dfgY)` takes `dfgY` as a plain parameter (no IBL/LUT dependency) per the matrix's own resolved calling contract; white-furnace test below |
++| Clearcoat extension point | N/A for T7's own bar; module-boundary comment delivered | `brdf.slang`'s own "Extension point [Task 21...]" comment |
++| Composable module layout | consume-now | `brdf.slang` compiles standalone (device-free test, `rx_shader::Compiler::compileFromFile`, zero entry points, `import`-free) |
++
++## SPIR-V absence evidence (real, this session)
++
++`spirv-dis` output on the two link-time-composed variants (temp files,
++`/tmp/rx_brdf_energy_feature_{on,off}.{spv,dis.txt}`):
++
++```
++$ grep -c OpFDiv /tmp/rx_brdf_energy_feature_on.dis.txt
++1
++$ grep -n OpFDiv /tmp/rx_brdf_energy_feature_on.dis.txt
++68:         %74 = OpFDiv %float %float_1 %27
++$ grep -c OpFDiv /tmp/rx_brdf_energy_feature_off.dis.txt
++0
++$ wc -l /tmp/rx_brdf_energy_feature_{on,off}.dis.txt
++  77 /tmp/rx_brdf_energy_feature_on.dis.txt
++  64 /tmp/rx_brdf_energy_feature_off.dis.txt
++$ ls -la /tmp/rx_brdf_energy_feature_{on,off}.spv
++-rw-rw-r-- 1 ywadi ywadi 1252 ... rx_brdf_energy_feature_on.spv   (313 words)
++-rw-rw-r-- 1 ywadi ywadi 1000 ... rx_brdf_energy_feature_off.spv  (250 words)
++```
++
++The ON variant's single `OpFDiv` is exactly `EnergyCompensationOn::apply()`'s
++`1.0 / dfgY`; the OFF variant (linked against `EnergyCompensationOff`,
++which returns `specular` unchanged and never reads `dfgY` at all) contains
++**zero** division instructions anywhere in its compiled module — the
++feature's code is provably absent, not merely dead-code-eliminated after
++generation.
++
++## White-furnace energy-conservation numbers (real GPU output, NVIDIA-equivalent formula, lavapipe run)
++
++Monte-Carlo `DFV_Multiscatter` port, 16384 samples/point:
++
++| Query | NoV | alpha | Ess (uncompensated, GPU) | compensated (GPU) |
++|---|---|---|---|---|
++| Q0 | 1.0 | 0.02 | ≈0.9996 | ≈1.000 |
++| Q1 | 1.0 | 0.30 | 0.877392 | ≈1.000 |
++| Q2 | 1.0 | 0.70 | 0.503748 | ≈1.000 |
++| Q3 | 1.0 | 1.00 | 0.306884 | ≈1.000 |
++| Q4 | 0.3 | 0.70 | 0.669238 | ≈1.000 |
++
++(Uncompensated/Ess values captured directly from the deliberate
++`energyCompensation() -> 1.0` mutation's own real failure output during the
++revert-discrimination proof below — not synthetic. Independently
++cross-checked this session against a from-scratch fp64 Python transcription
++of the exact same formulas: 0.99963 / 0.87739 / 0.50375 / 0.30688 / 0.66924
++— matches to within GPU fp32 noise.) Monotonic decrease with roughness
++confirmed (Q0 > Q1 > Q2 > Q3); off-normal view (Q4) also shows a real,
++non-trivial deficit. See `test_brdf_white_furnace_gpu.cpp`'s own header
++comment for why "compensated ≈ 1" alone would be a tautological check, and
++why the Ess-monotonicity assertions are the test's real, non-tautological
++discriminating power.
++
++## Revert-discrimination proofs (all performed for real this session, all restored to green)
++
++1. **D_GGX parity** — mutated `1.0/kBrdfPi` → `2.0/kBrdfPi`: 7/7 table
++   points failed at exactly 2x the expected value (e.g. `24.868 ==
++   Approx(12.434)`). Reverted; suite green.
++2. **f90 discriminator** — mutated `fresnelDefault()` to hardcode `f90 =
++   1.0` (the implicit form): the discrimination assertion failed exactly
++   as expected (`CHECK( 0 > 0.05 )`, the two forms became bit-identical).
++   Reverted; suite green.
++3. **White-furnace formula** — mutated `energyCompensation()` to
++   unconditionally `return float3(1,1,1)`: 4/5 "compensated ≈ 1"
++   assertions failed with the real Ess values (0.877392/0.503748/0.306884/
++   0.669238 — the numbers tabled above), plus the ON-vs-OFF gap assertion.
++   Reverted; suite green.
++4. **SPIR-V link composition** — mutated the OFF impl module to link
++   `EnergyCompensationOn` too (simulating a harness bug): `offDivCount`
++   became `1` (matching ON), failing `CHECK(offDivCount == 0)` and the
++   size-comparison sanity check. Reverted; suite green.
++
++## Both-preset / both-driver verification (command tails)
++
++**Lavapipe, new binary alone:**
++```
++$ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json xvfb-run -a \
++  ./build/linux-native/src/rx_material/tests/rx_material_brdf_gpu_tests --validate
++...
++[doctest] test cases:   6 |   6 passed | 0 failed | 0 skipped
++[doctest] assertions: 131 | 131 passed | 0 failed |
++[doctest] Status: SUCCESS!
++```
++
++**Lavapipe, full linux-native suite (regression check — existing gates
++unaffected):**
++```
++$ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json xvfb-run -a \
++  ctest --test-dir build/linux-native --output-on-failure -j1
++...
++100% tests passed, 0 tests failed out of 32
++Total Test time (real) =  81.58 sec
++```
++(32 = the prior 31-test baseline + this task's one new binary.)
++
++**Real driver (NVIDIA GeForce RTX 2080, driver 580.82.07, default ICD —
++`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json`, `DISPLAY=:1`,
++on-desktop, NICEd per the standing owner rule, non-interactive headless
++compute dispatch only):**
++```
++$ DISPLAY=:1 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json nice -n 15 \
++  ./build/linux-native/src/rx_material/tests/rx_material_brdf_gpu_tests --validate
++...
++[doctest] test cases:   6 |   6 passed | 0 failed | 0 skipped
++[doctest] assertions: 131 | 131 passed | 0 failed |
++[doctest] Status: SUCCESS!
++```
++
++**Windows-cross-zig: configure + build (both `find_program(spirv-dis)` and
++the new target compile cleanly):**
++```
++$ cmake --preset windows-cross-zig            # spirv-dis found, no FATAL_ERROR
++$ cmake --build build/windows-cross-zig --target rx_material_brdf_gpu_tests -j
++[5/5] Linking CXX executable src/rx_material/tests/rx_material_brdf_gpu_tests.exe
++```
++
++**Wine ctest (CI's own exclusion pattern, confirming
++`rx_material_brdf_gpu_tests` is correctly excluded and nothing else
++regressed):**
++```
++$ xvfb-run -a ctest --test-dir build/windows-cross-zig -E \
++  'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_material_brdf_gpu|rx_debug_ui_gpu|rx_frame_loop_gpu|sample' \
++  --output-on-failure -j1
++...
++100% tests passed, 0 tests failed out of 14
++Total Test time (real) = 161.25 sec
++```
++(14 = unchanged from the pre-existing baseline; confirms the new binary is
++excluded, not silently skipped-and-passing.)
++
++Every "[vulkan validation]" line observed across every run above matches
++this codebase's own pre-existing, documented false-positive filter set
++(`context.cpp`'s `debugCallback()`); zero unfiltered validation errors on
++any run (`hasValidationErrors()` false throughout).
++
++## Decisions made as implementer (not escalated — none met the owner-escalation bar)
++
++- **Fd_Burley in/out**: shipped alongside Lambert, unused by production —
++  see matrix row above.
++- **f90 divergence condition**: corrected the matrix's own "high-F0"
++  framing after re-deriving directly against the pinned formula (see
++  matrix-row entry above and `brdf.slang`'s own header comment) — a
++  factual correction to a research artifact, not a design decision.
++- **Test target location**: a new sibling binary
++  (`rx_material_brdf_gpu_tests`) rather than folding into
++  `rx_material_gpu_tests` — these tests drive `slang::ISession` directly
++  and need `rx::rhi::ComputePipelineCache` (Task 2), neither of which any
++  existing file in that directory touches; MaterialSystem/ParameterBlock
++  machinery is irrelevant to this module's own tests.
++- **spirv-dis invocation mechanism**: shells out to the CMake-located
++  binary via `std::system()` (test-only code) rather than linking
++  libSPIRV-Tools — no existing CMake integration for that library exists
++  in this repo, and the CLI tool is this codebase's own already-established
++  manual-verification precedent (multiple header comments cite direct
++  `spirv-dis` use); this task makes that precedent an automated CI check
++  for the first time.
++
++## Self-review
++
++- **TDD**: iterated for real — the SPIR-V-absence test's own positive
++  control (`onDivCount >= 1`) and the white-furnace test's Ess-monotonicity
++  design were arrived at only after the naive "compensated ≈ 1 alone"
++  framing was recognized as tautological during this task's own
++  development (documented candidly in the test file's own header comment,
++  not hidden).
++- **No deferred fixes**: none found requiring deferral; the matrix's own
++  "New gaps" (no compute-numerical-test-harness precedent, no scripted
++  SPIR-V-inspection tooling) are both closed by this task's own delivery,
++  not left open.
++- **No AI attribution**: verified directly (`git show <both SHAs> | grep
++  -iE "claude|anthropic|co-authored|generated"` — clean) in both commits'
++  messages and diffs, not just assumed.
++- **Commit scope**: two pathspec-scoped commits — `3eaaa0b` (module + tests
++  + CMake) and `59b598e` (CI wiring) — matching this repo's own
++  feat/ci-commit-split precedent (e.g. `aa7e3e1`/`2badf74`).
++  `.superpowers/sdd/.../progress.md` was untouched by `git status` at every
++  check this session (no concurrent-agent conflict observed) and is
++  deliberately excluded from both commits per this task's own no-ledger-
++  edits constraint.
++- **Not pushed**: per the task's own instruction ("no push").
++
++## Concerns for the coordinator
++
++- None blocking. One forward note: Task 9's real DFG LUT will eventually
++  replace this task's test-local Monte-Carlo `dfgY` source at production
++  call sites — `energyCompensation()`'s own calling contract (plain
++  parameter, no binding) already accommodates that without any signature
++  change, per the matrix's own resolved cross-ticket dependency.
++- `brdf.slang`'s `IEnergyCompensationFeature`/`EnergyCompensationOn`/
++  `EnergyCompensationOff` are shipped as real, importable module surface
++  (not test-only scaffolding) since Task 8 will need this exact link-time-
++  composition pattern for its own permutation axes and can consume these
++  two structs directly rather than reinventing them — flagged here in case
++  Task 8's own implementer wants to extend rather than duplicate.
+diff --git a/shaders/material/brdf.slang b/shaders/material/brdf.slang
+new file mode 100644
+index 0000000..014fb26
+--- /dev/null
++++ b/shaders/material/brdf.slang
+@@ -0,0 +1,258 @@
++// shaders/material/brdf.slang -- Phase 5 Stage 1 Task 7 [#43, gate rulings
++// RC1/T7]: the composable Cook-Torrance BRDF math module the charter's own
++// "Shader architecture" bullet names (docs/superpowers/specs/
++// 2026-08-09-toolchain-platform-rhi-design.md:388-398) -- GGX distribution,
++// height-correlated Smith visibility, Schlick Fresnel (both the plain and
++// the computed-f90 forms), Lambert/Burley diffuse, and single-scattering
++// energy compensation.
++//
++// PORT PROVENANCE -- ported from google/filament v1.75.0 (tag; commit
++// 0e58877c09afb1aacd09ff640f74d2adcd2a7e80, Apache-2.0, whole-repo LICENSE
++// -- Filament's shader-snippet files under shaders/src/ carry no per-file
++// SPDX header of their own, unlike e.g. libs/ibl/src/CubemapIBL.cpp, which
++// does; both are covered by the same repo-root LICENSE), fetched via the
++// GitHub Contents API and read in full against this exact commit this
++// session (RC1's phase-wide pin -- re-verified byte-identical to the
++// Stage-1-research matrix's own main-HEAD citations, confirming no drift
++// between 721ec80 and this pin for the functions below):
++//   - shaders/src/surface_brdf.fs -- D_GGX, V_SmithGGXCorrelated, F_Schlick
++//     (all three overloads), fresnel()'s computed-f90 dispatch, Fd_Lambert,
++//     Fd_Burley.
++//   - shaders/src/surface_shading_lit.fs -- getEnergyCompensationPixelParams()
++//     (the `1.0 + f0*(1.0/dfg.y - 1.0)` closed form) and
++//     surface_shading_model_standard.fs's own surfaceShading() (`color =
++//     Fd + Fr * pixel.energyCompensation` -- the exact multiplicative
++//     contract energyCompensation() below follows: it multiplies the
++//     specular lobe's response only, never the diffuse lobe).
++// Per the techniques-phase charter's explicit instruction: port from
++// Filament's CURRENT shaders/ implementation, never its documentation
++// prose -- every formula below was read directly from the fetched source,
++// not from Filament's PBR guide/docs site.
++//
++// MODULE BOUNDARY [gate matrix "Composable module layout" row] -- every
++// function below takes scalar/vector inputs ONLY: no ParameterBlock, no
++// bindless global (gTextures/gSamplers/gDrawData), no IMaterialShader
++// dependency at all. Verified by this module's own standalone-compile test
++// (test_brdf_module_gpu.cpp's "brdf.slang compiles standalone" case), which
++// compiles THIS FILE ALONE, importing nothing else, with zero requested
++// entry points -- exactly Filament's own surface_brdf.fs precedent (pure
++// math, no material/lighting state; surface_shading_lit.fs is the separate
++// file that consumes PixelParams).
++//
++// NOT YET CONSUMED BY PRODUCTION [ticket's own scope line] -- standard_pbr.
++// slang is NOT modified by this task: its existing inline D_GGX/
++// V_SmithGGXCorrelated/F_Schlick math is untouched, so the existing 08/09
++// gates stay byte-identical trivially (nothing that produces them changed).
++// Rewiring StandardPbr onto this module (and choosing which of the
++// Fresnel/diffuse variants below it actually calls) is Task 8's job
++// ("StandardPBR rework onto the module architecture") -- this file exists,
++// compiles standalone, and is fully tested on its own, per this ticket's
++// "this task is the MATH + MODULES + MECHANISM... do not rewrite the
++// production material path here beyond what proving the modules requires."
++//
++// fp32-ONLY, NO MEDIUMP TARGET [gate matrix row dispositions] -- Filament's
++// own PREVENT_DIV0 macro/453.5 D_GGX clamp/five separate fp16-derived
++// epsilons (e.g. "0.0000077 = nextafter(0.5 / MEDIUMP_FLT_MAX, 1.0) in
++// fp16") are precision guards for its OPTIONAL mediump/fp16 mobile target,
++// which this project does not have (Vulkan 1.3 desktop/Deck baseline, fp32
++// shading throughout) -- ported with ONE shared, generously-safe fp32
++// epsilon (kDiv0Epsilon below) in place of Filament's per-call fp16-tuned
++// magic numbers. This is a precision-GUARD-constant decision, not a
++// formula difference: standard_pbr.slang's own pre-existing
++// V_SmithGGXCorrelated inline already made the identical call (max(...,
++// 1e-5)), matched here rather than reinvented.
++public static const float kBrdfPi = 3.14159265358979323846;
++
++// Shared fp32 div-by-zero guard -- see this file's header comment above for
++// why one constant replaces Filament's five separate fp16-derived ones.
++static const float kDiv0Epsilon = 1e-5;
++
++// [surface_brdf.fs:54-79, Walter et al. 2007, "Microfacet Models for
++// Refraction through Rough Surfaces"] Numerically-stable GGX normal
++// distribution via Lagrange's identity (`||N x H||^2 = 1 - NoH^2`,
++// Filament's own comment) -- algebraically identical to the textbook
++// `alpha^2 / (PI * (NoH^2*(alpha^2-1)+1)^2)` rearrangement (both reduce to
++// the same `1 - NoH^2*(1-alpha^2)` inner term, hand-verified during this
++// task's own research). `roughness` here is Filament's own convention:
++// already alpha (perceptualRoughness^2), matching standard_pbr.slang's own
++// `alpha = roughness * roughness` pre-multiply before it calls its
++// (pre-T7, still-inline, untouched) D_GGX-equivalent math. Filament's own
++// `min(..., 453.5)` fp16-overflow guard is dropped -- see this file's
++// header comment (fp32 has no such overflow risk at any physically
++// reachable alpha/NoH).
++public float D_GGX(float alpha, float NoH) {
++    float oneMinusNoHSquared = 1.0 - NoH * NoH;
++    float a = NoH * alpha;
++    float k = alpha / (oneMinusNoHSquared + a * a);
++    float d = k * k * (1.0 / kBrdfPi);
++    return d;
++}
++
++// [surface_brdf.fs:102-113, Heitz 2014, "Understanding the
++// Masking-Shadowing Function in Microfacet-Based BRDFs"] Height-correlated
++// Smith visibility -- already divides out the classic 4*NoL*NoV
++// denominator, matching standard_pbr.slang's own pre-existing (untouched)
++// inline form and CubemapIBL.cpp's own `Visibility()` (the SAME formula,
++// reused verbatim by this module's own white-furnace test harness's
++// Monte-Carlo DFV kernel -- test_brdf_white_furnace_gpu.cpp).
++public float V_SmithGGXCorrelated(float alpha, float NoV, float NoL) {
++    float a2 = alpha * alpha;
++    float lambdaV = NoL * sqrt((NoV - a2 * NoV) * NoV + a2);
++    float lambdaL = NoV * sqrt((NoL - a2 * NoL) * NoL + a2);
++    return 0.5 / max(lambdaV + lambdaL, kDiv0Epsilon);
++}
++
++// [surface_brdf.fs:145-148 (vec3 f0 overload) and :155-157 (scalar
++// overload), Schlick 1994, "An Inexpensive BRDF Model for Physically-Based
++// Rendering"] Explicit-f90 Fresnel -- the general form every other
++// overload below reduces to. Two overloads, matching Filament's own split:
++// vec3 f0 (the real per-material call shape) and scalar f0 (Fd_Burley's
++// own call shape below, which always passes f0=1.0).
++public float3 F_Schlick(float3 f0, float f90, float VoH) {
++    float p5 = pow(clamp(1.0 - VoH, 0.0, 1.0), 5.0);
++    return f0 + (float3(f90, f90, f90) - f0) * p5;
++}
++
++public float F_Schlick(float f0, float f90, float VoH) {
++    float p5 = pow(clamp(1.0 - VoH, 0.0, 1.0), 5.0);
++    return f0 + (f90 - f0) * p5;
++}
++
++// [surface_brdf.fs:150-153] Implicit-f90=1.0 overload -- Filament's own
++// FILAMENT_QUALITY_LOW tier, algebraically F_Schlick(f0, 1.0, VoH). This is
++// the EXACT form standard_pbr.slang's own pre-T7 inline Fresnel already
++// shipped -- kept here, named and tested, as a real, cheap fallback tier
++// (e.g. a future Deck-floor low-quality path), per the gate matrix's Open
++// Question recommendation.
++public float3 F_Schlick(float3 f0, float VoH) {
++    float f = pow(clamp(1.0 - VoH, 0.0, 1.0), 5.0);
++    return float3(f, f, f) + f0 * (1.0 - f);
++}
++
++// [surface_brdf.fs:177-186, the `FILAMENT_QUALITY >= FILAMENT_QUALITY_HIGH`
++// branch of fresnel() -- gate ruling T7: THIS project's DEFAULT, not an
++// optional upgrade] f90 computed from f0's own magnitude
++// (`saturate(dot(f0, vec3(50.0*0.33)))`) rather than fixed at 1.0. This is
++// Filament's own shipped default quality tier (the implicit-f90=1.0 form
++// above is Filament's LOW tier, which is what this project's pre-T7
++// standard_pbr.slang happened to ship instead -- an unintentional choice
++// predating any Filament source consultation, per the gate matrix's Open
++// Question).
++//
++// DIVERGENCE CONDITION, verified directly against this exact formula (not
++// assumed from the gate matrix's own paraphrase, which frames the
++// divergence as a "high-F0" case -- re-derived here and found to be the
++// opposite): `f90 = saturate(dot(f0, 16.5))` saturates to EXACTLY 1.0 (byte
++// identical to the implicit form) for any f0 with `f0.r+f0.g+f0.b >=
++// 1/16.5 ~= 0.0606` -- true for the glTF/Disney dielectric baseline
++// (0.04*3 = 0.12) and essentially every physically-plausible metal, so the
++// two Fresnel forms are IDENTICAL for almost all standard PBR materials.
++// The two forms only diverge for LOW total reflectance (e.g. a
++// KHR_materials_specular-attenuated dielectric pushed below that ~0.0606
++// sum) -- test_brdf_module_gpu.cpp's own f90-discrimination case uses
++// exactly such a point (f0 = (0.01, 0.01, 0.01)), not a metal.
++public float3 fresnelDefault(float3 f0, float VoH) {
++    float f90 = saturate(dot(f0, float3(50.0 * 0.33, 50.0 * 0.33, 50.0 * 0.33)));
++    return F_Schlick(f0, f90, VoH);
++}
++
++// [surface_brdf.fs:237-239] Lambertian diffuse -- the charter's own binding
++// "Shader architecture" bullet ("lobe structure diffuse(Lambert)") and this
++// project's pre-existing StandardPbr choice; also Filament's own compiled
++// default (`BRDF_DIFFUSE = DIFFUSE_LAMBERT`, surface_brdf.fs:29).
++public float Fd_Lambert() {
++    return 1.0 / kBrdfPi;
++}
++
++// [surface_brdf.fs:241-247, Burley 2012, "Physically-Based Shading at
++// Disney"] Disney's retro-reflective grazing-angle diffuse term. The
++// ticket's own text defers Lambert-vs-Burley to "Task 1's spec ruling";
++// no dedicated Task 1 spec document landed (docs/superpowers/specs/
++// 2026-08-2x-phase5-techniques-design.md does not exist), and the
++// charter's own binding "Shader architecture" bullet already names Lambert
++// as the flagship material's lobe choice -- so this module ships Burley
++// alongside Lambert, exported and tested on its own, without wiring it
++// into any production material, per the gate matrix's own pre-specified
++// disposition for this exact outcome ("brdf.slang still exposes
++// Fd_Burley() as an unused, tested module function... either is
++// acceptable, but silence is not").
++public float Fd_Burley(float alpha, float NoV, float NoL, float LoH) {
++    float f90 = 0.5 + 2.0 * alpha * LoH * LoH;
++    float lightScatter = F_Schlick(1.0, f90, NoL);
++    float viewScatter = F_Schlick(1.0, f90, NoV);
++    return lightScatter * viewScatter * (1.0 / kBrdfPi);
++}
++
++// [surface_shading_lit.fs:230-238, "Multiple-Scattering Microfacet BSDFs
++// with the Smith Model" (Heitz/Hery/Misty 2016); Fdez-Aguera's DFG-based
++// derivation is the same family] Compensates the single-scattering GGX/
++// Smith BRDF above for energy lost to unaccounted multiple scattering
++// between microfacets -- a measurable darkening on rough, high-F0
++// (metallic) surfaces the terms above under-integrate on their own.
++//
++// CALLING CONTRACT [gate matrix's own resolved cross-ticket dependency]:
++// `dfgY` is taken as a PLAIN PARAMETER, not a global/binding -- this
++// function carries NO runtime dependency on IBL infrastructure. Task 9's
++// baked DFG LUT (not built yet) will eventually supply the real value at
++// production call sites (via `pixel.dfg.y`, Filament's own name);
++// test_brdf_white_furnace_gpu.cpp supplies a LOCALLY-computed one instead
++// (a small Monte-Carlo importance-sampling kernel following
++// CubemapIBL::DFV_Multiscatter's own structure), which is what lets this
++// module close standalone, per the ticket's own "modules compile
++// standalone" acceptance line.
++//
++// MULTIPLICATIVE CONTRACT [surface_shading_model_standard.fs:135, `color =
++// Fd + Fr * pixel.energyCompensation`]: the caller multiplies this
++// function's result into the SPECULAR lobe's response only (`Fr`), never
++// the diffuse lobe (`Fd`) -- this function does not perform that multiply
++// itself, matching Filament's own call-site shape exactly.
++public float3 energyCompensation(float3 f0, float dfgY) {
++    return float3(1.0, 1.0, 1.0) + f0 * (1.0 / dfgY - 1.0);
++}
++
++// --- Extension point [Task 21, clearcoat/anisotropy] ---------------------
++// Filament's own clearcoat lobe (surface_brdf.fs's distributionClearCoat()/
++// visibilityClearCoat()) reuses D_GGX above unchanged and adds exactly one
++// new visibility term, V_Kelemen(LoH) = 0.25/(LoH*LoH) (Kelemen 2001, "A
++// Microfacet Based Coupled Specular-Matte BRDF Model with Importance
++// Sampling"), plus a fixed-IOR-1.5 F_Schlick(0.04, 1.0, LoH) Fresnel
++// (surface_shading_model_standard.fs's clearCoatLobe()). Task 21 adds
++// V_Kelemen()/a clearcoat dispatch HERE, verified against Filament's
++// CURRENT shader code at whatever commit Task 21 pins (per the charter's
++// own "never from documentation prose" instruction -- the June-2026
++// clearcoat doc-vs-code discrepancy the charter names is resolved
++// correctly only in shader code) -- this ticket does not resolve that
++// discrepancy itself, matching D13/D7's own "code comment pointing at the
++// future task" precedent.
++
++// --- Link-time feature composition [gate ruling T7: the mechanism that
++// GUARANTEES a feature's code is absent from SPIR-V when unused, verified
++// at the SPIR-V level] --------------------------------------------------
++// Proves the mechanism Task 8 grows into StandardPbr's own full permutation
++// axis, using THIS module's own energyCompensation() term as the first
++// real, working example -- not an abstract toy interface. Follows
++// forward_entry.slang's own extern/export + `ISession::
++// createCompositeComponentType()` + `IComponentType::link()` contract
++// verbatim (already verified working in this codebase's production
++// material path, not a new technique this ticket invents) -- see that
++// file's own header comment for the underlying mechanism.
++// test_brdf_spirv_link_composition_gpu.cpp links this interface against
++// EACH conforming struct below into two SEPARATE SPIR-V modules and proves
++// (via spirv-dis) that the OFF variant's compiled code contains no trace
++// of the ON variant's division instruction -- the code is never generated,
++// not merely dead-code-eliminated after the fact.
++public interface IEnergyCompensationFeature {
++    float3 apply(float3 specular, float3 f0, float dfgY);
++}
++
++public struct EnergyCompensationOn : IEnergyCompensationFeature {
++    public float3 apply(float3 specular, float3 f0, float dfgY) {
++        return specular * energyCompensation(f0, dfgY);
++    }
++};
++
++public struct EnergyCompensationOff : IEnergyCompensationFeature {
++    public float3 apply(float3 specular, float3 f0, float dfgY) {
++        return specular;
++    }
++};
+diff --git a/src/rx_material/tests/CMakeLists.txt b/src/rx_material/tests/CMakeLists.txt
+index 9a0ee39..a723c1d 100644
+--- a/src/rx_material/tests/CMakeLists.txt
++++ b/src/rx_material/tests/CMakeLists.txt
+@@ -95,10 +95,53 @@ add_executable(rx_material_tests
+     doctest_main_plain.cpp
+     test_api_contract.cpp
+     test_api_header_self_contained.cpp
+ )
+ target_link_libraries(rx_material_tests PRIVATE rx_material doctest::doctest)
+ rx_shader_deploy_runtime_libs(rx_material_tests)
+ add_test(NAME rx_material_tests COMMAND rx_material_tests)
+ # Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+ # (windows-cross Wine hang, run 31512073559).
+ set_tests_properties(rx_material_tests PROPERTIES TIMEOUT 120)
++
++# --- Phase 5 Stage 1 Task 7 [#43]: shaders/material/brdf.slang's own
++# compute-based numerical test harness -- a NEW, sibling binary rather than
++# folding into rx_material_gpu_tests above: these tests drive slang::
++# ISession directly (brdf_test_harness.h, mirroring material_system.cpp's
++# own createMaterialSession()/compileMaterial(), NOT MaterialSystem/
++# ParameterBlock machinery) and need rx_rhi_vk::ComputePipelineCache
++# (Task 2), neither of which any existing file in this directory touches.
++# doctest_main.cpp is reused verbatim (the same vk-bootstrap warm-up
++# pattern, added as a SOURCE to a second executable target -- harmless,
++# matches every other doctest_main.cpp/doctest_main_gpu.cpp precedent in
++# this codebase of one file compiled into exactly the binary that needs it).
++find_program(RX_SPIRV_DIS_EXECUTABLE NAMES spirv-dis)
++if(NOT RX_SPIRV_DIS_EXECUTABLE)
++  message(FATAL_ERROR
++    "[rx_material_brdf_gpu_tests] 'spirv-dis' not found on PATH -- required "
++    "by test_brdf_spirv_link_composition_gpu.cpp's SPIR-V-absence proof "
++    "(gate ruling T7). Install the spirv-tools package (apt: spirv-tools; "
++    "the CI images install it alongside vulkan-validationlayers -- see "
++    ".github/workflows/ci.yml).")
++endif()
++
++add_executable(rx_material_brdf_gpu_tests
++    doctest_main.cpp
++    test_brdf_module_gpu.cpp
++    test_brdf_white_furnace_gpu.cpp
++    test_brdf_spirv_link_composition_gpu.cpp
++)
++target_link_libraries(rx_material_brdf_gpu_tests PRIVATE rx_shader rx_rhi_vk rx_platform doctest::doctest)
++rx_shader_deploy_runtime_libs(rx_material_brdf_gpu_tests)
++target_compile_definitions(rx_material_brdf_gpu_tests PRIVATE
++  # Same fixed, checked-out-repo-relative shaders/material/ path
++  # rx_material's own RX_MATERIAL_SHADER_DIR resolves to (that macro is
++  # PRIVATE to the rx_material library target and does not propagate here)
++  # -- brdf.slang lives in the SAME directory as material.slang/
++  # standard_pbr.slang/forward_entry.slang, per the ticket's own file list.
++  RX_MATERIAL_SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders/material"
++  RX_SPIRV_DIS="${RX_SPIRV_DIS_EXECUTABLE}"
++)
++add_test(NAME rx_material_brdf_gpu_tests COMMAND rx_material_brdf_gpu_tests --validate)
++# Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
++# (windows-cross Wine hang, run 31512073559).
++set_tests_properties(rx_material_brdf_gpu_tests PROPERTIES TIMEOUT 300)
+diff --git a/src/rx_material/tests/brdf_gpu_fixture.h b/src/rx_material/tests/brdf_gpu_fixture.h
+new file mode 100644
+index 0000000..f4ffc04
+--- /dev/null
++++ b/src/rx_material/tests/brdf_gpu_fixture.h
+@@ -0,0 +1,138 @@
++#pragma once
++// src/rx_material/tests/brdf_gpu_fixture.h -- Phase 5 Stage 1 Task 7 [#43]:
++// the skip-guarded windowed-device fixture every brdf.slang GPU test needs,
++// plus one shared dispatch-and-readback helper for the common "one input
++// storage buffer, one output storage buffer, N-wide dispatch" shape every
++// table-driven test in this suite uses. Fixture shape copied from
++// rx_rhi_vk/tests/compute_pipeline_test.cpp's own ComputePipelineTestFixture
++// (this codebase's own established per-file-duplicated-helper idiom, not a
++// shared header with that file), extended with an Allocator since these
++// tests move real data, not just build pipeline objects.
++
++#include <rx_platform/window.h>
++#include <rx_rhi_vk/buffer.h>
++#include <rx_rhi_vk/command.h>
++#include <rx_rhi_vk/compute_pipeline.h>
++#include <rx_rhi_vk/context.h>
++#include <rx_rhi_vk/device.h>
++
++#include <doctest/doctest.h>
++
++#include <array>
++#include <cstdint>
++#include <cstring>
++#include <optional>
++#include <utility>
++#include <vector>
++
++namespace rx::brdf_test {
++
++struct BrdfGpuFixture {
++    rx::platform::Window window;
++    rx::rhi::Context context;
++    rx::rhi::Device device;
++    rx::rhi::Allocator allocator;
++};
++
++inline std::optional<BrdfGpuFixture> makeBrdfGpuFixture(const char* title) {
++    auto window = rx::platform::Window::create(title, 64, 64, /*visible=*/false);
++    if (!window.has_value()) {
++        MESSAGE("no display backend available, skipping brdf module GPU test");
++        return std::nullopt;
++    }
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        MESSAGE("video driver reports no Vulkan surface extensions (e.g. dummy driver), skipping brdf module GPU test");
++        return std::nullopt;
++    }
++
++    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++
++    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
++    REQUIRE(surface != VK_NULL_HANDLE);
++
++    auto device = rx::rhi::Device::create(*context, surface);
++    REQUIRE(device.has_value());
++
++    auto allocator = rx::rhi::Allocator::create(*context, *device);
++    REQUIRE(allocator.has_value());
++
++    return BrdfGpuFixture{std::move(*window), std::move(*context), std::move(*device), std::move(*allocator)};
++}
++
++// Dispatches `pso` with exactly one host-visible input StructuredBuffer
++// (set 1, binding 0 -- populated from `inputBytes` before dispatch) and one
++// host-visible output RWStructuredBuffer (set 1, binding 1 -- read back
++// into a fresh `outputBytes`-sized buffer after dispatch). Set 0 is never
++// bound -- every compute module in this test suite declares no set-0
++// resource, matching rx_graph/tests/test_compute_gpu.cpp's own TEST_CASE 2
++// precedent (`vkCmdBindDescriptorSets(..., /*firstSet=*/1, ...)`, skipping
++// set 0 entirely). No explicit device->host memory barrier before
++// `invalidate()` -- matching test_compute_gpu.cpp's own established,
++// validation-clean precedent: `CommandContext::runOnce()`'s
++// `vkQueueWaitIdle()` already makes every write from that submission
++// available before this function returns.
++inline std::vector<uint8_t> dispatchOneInOneOut(BrdfGpuFixture& fixture, const rx::rhi::ComputePipelineCache::Pipeline& pso,
++                                                 const std::vector<uint8_t>& inputBytes, size_t outputBytes,
++                                                 uint32_t groupCountX) {
++    VkDevice device = fixture.device.device();
++
++    auto inBuf = fixture.allocator.createHostVisibleBuffer(inputBytes.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
++    REQUIRE(inBuf.has_value());
++    std::memcpy(inBuf->mappedData(), inputBytes.data(), inputBytes.size());
++    inBuf->flush();
++
++    auto outBuf = fixture.allocator.createHostVisibleBuffer(outputBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
++    REQUIRE(outBuf.has_value());
++
++    REQUIRE(pso.setLayouts.size() >= 2);
++    std::array<VkDescriptorPoolSize, 1> sizes{VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}};
++    VkDescriptorPoolCreateInfo poolInfo{};
++    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
++    poolInfo.maxSets = 1;
++    poolInfo.poolSizeCount = static_cast<uint32_t>(sizes.size());
++    poolInfo.pPoolSizes = sizes.data();
++    VkDescriptorPool pool = VK_NULL_HANDLE;
++    REQUIRE(vkCreateDescriptorPool(device, &poolInfo, nullptr, &pool) == VK_SUCCESS);
++
++    VkDescriptorSetLayout set1Layout = pso.setLayouts[1];
++    VkDescriptorSet set = VK_NULL_HANDLE;
++    VkDescriptorSetAllocateInfo setAllocInfo{};
++    setAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
++    setAllocInfo.descriptorPool = pool;
++    setAllocInfo.descriptorSetCount = 1;
++    setAllocInfo.pSetLayouts = &set1Layout;
++    REQUIRE(vkAllocateDescriptorSets(device, &setAllocInfo, &set) == VK_SUCCESS);
++
++    VkDescriptorBufferInfo inInfo{inBuf->handle(), 0, VK_WHOLE_SIZE};
++    VkDescriptorBufferInfo outInfo{outBuf->handle(), 0, VK_WHOLE_SIZE};
++    std::array<VkWriteDescriptorSet, 2> writes{};
++    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++    writes[0].dstSet = set;
++    writes[0].dstBinding = 0;
++    writes[0].descriptorCount = 1;
++    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++    writes[0].pBufferInfo = &inInfo;
++    writes[1] = writes[0];
++    writes[1].dstBinding = 1;
++    writes[1].pBufferInfo = &outInfo;
++    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
++
++    auto cmdCtx = rx::rhi::CommandContext::create(device, fixture.device.graphicsQueue(), fixture.device.graphicsQueueFamily());
++    REQUIRE(cmdCtx.has_value());
++    cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pso.pipeline);
++        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pso.layout, 1, 1, &set, 0, nullptr);
++        vkCmdDispatch(cmd, groupCountX, 1, 1);
++    });
++
++    outBuf->invalidate();
++    std::vector<uint8_t> result(outputBytes);
++    std::memcpy(result.data(), outBuf->mappedData(), outputBytes);
++
++    vkDestroyDescriptorPool(device, pool, nullptr);
++    return result;
++}
++
++}  // namespace rx::brdf_test
+diff --git a/src/rx_material/tests/brdf_test_harness.h b/src/rx_material/tests/brdf_test_harness.h
+new file mode 100644
+index 0000000..25e15a3
+--- /dev/null
++++ b/src/rx_material/tests/brdf_test_harness.h
+@@ -0,0 +1,272 @@
++#pragma once
++// src/rx_material/tests/brdf_test_harness.h -- Phase 5 Stage 1 Task 7
++// [#43]: shared Slang session/compile plumbing for brdf.slang's own
++// compute-based numerical test harness (test_brdf_module_gpu.cpp,
++// test_brdf_white_furnace_gpu.cpp, test_brdf_spirv_link_composition_gpu.cpp).
++//
++// Drives slang::ISession directly, exactly like rx_material::MaterialSystem
++// itself does -- see material_system.cpp's own header comment ("MaterialSystem
++// drives slang::ISession directly... rx_shader::Compiler's public surface is
++// too narrow for the multi-module link-time-specialization composition this
++// library needs") and its own createMaterialSession()/compileMaterial()
++// (material_system.cpp:949-987, :1067-1160), mirrored here rather than
++// shared -- this codebase's own established per-file-duplicated-helper
++// idiom (e.g. compileCompute() independently duplicated in
++// rx_graph/tests/test_compute_gpu.cpp and
++// rx_rhi_vk/tests/compute_pipeline_test.cpp).
++//
++// WHY NOT rx_shader::Compiler -- these tests need a session with a real
++// search path (RX_MATERIAL_SHADER_DIR, shaders/material/) so a synthetic
++// compute module can `import brdf;`; rx_shader::Compiler::create() sets no
++// searchPaths (compiler.h's own doc comment: it has no multi-file import to
++// resolve for its own callers -- triangle.vert/frag.slang and friends never
++// import anything).
++//
++// A FRESH slang::IGlobalSession per test case (never rx_shader's own
++// process-wide shared one, which is private to that library) -- the same
++// tradeoff MaterialSystem::create() itself makes and documents (Slang's
++// stdlib-load cost paid once more), acceptable here for the same reason:
++// this is a small, finite set of test cases, not a hot per-frame path.
++//
++// THREAD SAFETY -- rx_shader::Compiler's own front-end calls are
++// synchronized against a process-wide mutex private to that library
++// (detail::global_session_mutex.h, not part of rx_shader's public include/
++// surface). MaterialSystem has no access to that mutex either (it does not
++// link rx_shader) and ships with no additional synchronization of its own,
++// relying on each IGlobalSession/ISession pair being independent and on
++// single-threaded call discipline (RX_ASSERT_MAIN_THREAD elsewhere in this
++// codebase) -- this header follows the identical precedent: no mutex, each
++// helper below assumes single-threaded, sequential use (doctest's own
++// default execution model for one binary).
++
++#include <rx_shader/compiler.h>
++#include <rx_shader/reflection.h>
++
++#include <slang-com-ptr.h>
++#include <slang.h>
++
++#include <array>
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace rx::brdf_test {
++
++// Keeps BOTH the global and per-test session alive together -- ISession
++// does not itself keep its creating IGlobalSession alive (verified against
++// material_system.cpp's own Impl, which stores both as separate,
++// co-lifetime class members for exactly this reason).
++struct BrdfSession {
++    Slang::ComPtr<slang::IGlobalSession> globalSession;
++    Slang::ComPtr<slang::ISession> session;
++};
++
++// Mirrors createMaterialSession() (material_system.cpp) -- SPIR-V target,
++// "sm_6_0" profile, explicit spirv_1_3 capability floor PLUS an explicit
++// CompilerOptionName::Profile entry [Task 2 (#38) empirical finding,
++// compiler.cpp's own header comment: required for a compute-only linked
++// program's getLayout() call to not crash inside a process that has
++// already initialized Vulkan/vk-bootstrap, which every GPU test fixture in
++// this codebase has by the time these helpers run] -- plus `searchPaths`
++// pointed at `shaderDir` (RX_MATERIAL_SHADER_DIR, shaders/material/), so
++// `import brdf;` resolves to the real shipped module.
++inline std::optional<BrdfSession> createBrdfSession(const std::string& shaderDir) {
++    BrdfSession result;
++    if (SLANG_FAILED(slang::createGlobalSession(result.globalSession.writeRef())) ||
++        result.globalSession.get() == nullptr) {
++        return std::nullopt;
++    }
++
++    slang::TargetDesc targetDesc{};
++    targetDesc.format = SLANG_SPIRV;
++    targetDesc.profile = result.globalSession->findProfile("sm_6_0");
++
++    std::array<slang::CompilerOptionEntry, 2> compilerOptionEntries{};
++    uint32_t entryCount = 0;
++
++    SlangCapabilityID spirvFloor = result.globalSession->findCapability("spirv_1_3");
++    if (spirvFloor != SLANG_CAPABILITY_UNKNOWN) {
++        slang::CompilerOptionEntry capabilityEntry{};
++        capabilityEntry.name = slang::CompilerOptionName::Capability;
++        capabilityEntry.value.kind = slang::CompilerOptionValueKind::Int;
++        capabilityEntry.value.intValue0 = static_cast<int32_t>(spirvFloor);
++        compilerOptionEntries[entryCount++] = capabilityEntry;
++    }
++
++    slang::CompilerOptionEntry profileEntry{};
++    profileEntry.name = slang::CompilerOptionName::Profile;
++    profileEntry.value.kind = slang::CompilerOptionValueKind::Int;
++    profileEntry.value.intValue0 = static_cast<int32_t>(targetDesc.profile);
++    compilerOptionEntries[entryCount++] = profileEntry;
++
++    targetDesc.compilerOptionEntries = compilerOptionEntries.data();
++    targetDesc.compilerOptionEntryCount = entryCount;
++
++    const char* searchPath = shaderDir.c_str();
++
++    slang::SessionDesc sessionDesc{};
++    sessionDesc.targets = &targetDesc;
++    sessionDesc.targetCount = 1;
++    sessionDesc.searchPaths = &searchPath;
++    sessionDesc.searchPathCount = 1;
++
++    if (SLANG_FAILED(result.globalSession->createSession(sessionDesc, result.session.writeRef())) ||
++        result.session.get() == nullptr) {
++        return std::nullopt;
++    }
++    return result;
++}
++
++namespace detail {
++
++// Shared compose->link->codegen tail for both single- and two-module
++// compiles below -- `parts` already contains every slang::IComponentType
++// to compose (module(s) + entry point(s), in the SAME "module(s) first,
++// entry points after" order compiler.cpp's own compileImpl() documents as
++// load-bearing for the stage lookup). Always requests exactly ONE entry
++// point's code (index 0) -- every caller in this test suite links exactly
++// one compute entry point per composite.
++inline rx::shader::CompileResult finishLink(slang::ISession* session,
++                                             std::vector<slang::IComponentType*>& parts,
++                                             const std::string& entryPointName) {
++    rx::shader::CompileResult result;
++
++    Slang::ComPtr<slang::IComponentType> composite;
++    Slang::ComPtr<slang::IBlob> composeDiag;
++    SlangResult composeResult = session->createCompositeComponentType(
++        parts.data(), static_cast<SlangInt>(parts.size()), composite.writeRef(), composeDiag.writeRef());
++    if (composeDiag.get() != nullptr && composeDiag->getBufferSize() > 0) {
++        result.diagnostics.append(static_cast<const char*>(composeDiag->getBufferPointer()), composeDiag->getBufferSize());
++    }
++    if (SLANG_FAILED(composeResult) || composite.get() == nullptr) {
++        result.ok = false;
++        return result;
++    }
++
++    Slang::ComPtr<slang::IComponentType> linked;
++    Slang::ComPtr<slang::IBlob> linkDiag;
++    SlangResult linkResult = composite->link(linked.writeRef(), linkDiag.writeRef());
++    if (linkDiag.get() != nullptr && linkDiag->getBufferSize() > 0) {
++        result.diagnostics.append(static_cast<const char*>(linkDiag->getBufferPointer()), linkDiag->getBufferSize());
++    }
++    if (SLANG_FAILED(linkResult) || linked.get() == nullptr) {
++        result.ok = false;
++        return result;
++    }
++
++    Slang::ComPtr<slang::IBlob> layoutDiag;
++    slang::ProgramLayout* layout = linked->getLayout(0, layoutDiag.writeRef());
++
++    Slang::ComPtr<slang::IBlob> codeDiag;
++    Slang::ComPtr<slang::IBlob> codeBlob;
++    SlangResult codeResult = linked->getEntryPointCode(0, 0, codeBlob.writeRef(), codeDiag.writeRef());
++    if (codeDiag.get() != nullptr && codeDiag->getBufferSize() > 0) {
++        result.diagnostics.append(static_cast<const char*>(codeDiag->getBufferPointer()), codeDiag->getBufferSize());
++    }
++    if (SLANG_FAILED(codeResult) || codeBlob.get() == nullptr) {
++        result.ok = false;
++        return result;
++    }
++
++    rx::shader::SpirvBlob blob;
++    blob.entryPointName = entryPointName;
++    blob.stage = VK_SHADER_STAGE_COMPUTE_BIT;  // every compile in this test suite is compute-only.
++    const auto* words = static_cast<const uint32_t*>(codeBlob->getBufferPointer());
++    blob.code.assign(words, words + codeBlob->getBufferSize() / sizeof(uint32_t));
++
++    result.ok = true;
++    result.entryPointCode.push_back(std::move(blob));
++    result.linkedProgram = linked;
++    result.cachedLayout = layout;
++    return result;
++}
++
++}  // namespace detail
++
++// Single-module compile: `source` may `import brdf;` (or anything else on
++// the session's own search path); `entryPointName` must be defined in
++// `source` itself. Mirrors rx_shader::compiler.cpp's own compileImpl(), one
++// entry point only.
++inline rx::shader::CompileResult compileBrdfComputeModule(slang::ISession* session, const std::string& moduleName,
++                                                            const std::string& source,
++                                                            const std::string& entryPointName) {
++    Slang::ComPtr<slang::IBlob> sourceBlob(Slang::INIT_ATTACH, slang_createBlob(source.data(), source.size()));
++    Slang::ComPtr<slang::IBlob> loadDiag;
++    slang::IModule* module =
++        session->loadModuleFromSource(moduleName.c_str(), (moduleName + ".slang").c_str(), sourceBlob, loadDiag.writeRef());
++    if (module == nullptr) {
++        rx::shader::CompileResult result;
++        result.ok = false;
++        if (loadDiag.get() != nullptr && loadDiag->getBufferSize() > 0) {
++            result.diagnostics.append(static_cast<const char*>(loadDiag->getBufferPointer()), loadDiag->getBufferSize());
++        }
++        return result;
++    }
++
++    Slang::ComPtr<slang::IEntryPoint> entryPoint;
++    if (SLANG_FAILED(module->findEntryPointByName(entryPointName.c_str(), entryPoint.writeRef())) ||
++        entryPoint.get() == nullptr) {
++        rx::shader::CompileResult result;
++        result.ok = false;
++        result.diagnostics = "entry point not found: " + entryPointName;
++        return result;
++    }
++
++    std::vector<slang::IComponentType*> parts{module, entryPoint.get()};
++    return detail::finishLink(session, parts, entryPointName);
++}
++
++// Two-module compile for the link-time feature-composition proof
++// (test_brdf_spirv_link_composition_gpu.cpp): `entrySource` declares
++// `extern struct <Name> : <Interface>;` plus the compute entry point (which
++// must be named `entryPointName`); `implSource` supplies the matching
++// `export struct <Name> : <Interface> = <Concrete>;` alias. NEITHER source
++// imports the other -- both may `import brdf;` independently, exactly
++// forward_entry.slang/standard_pbr.slang's own established shape (see
++// brdf.slang's own "Link-time feature composition" header comment).
++inline rx::shader::CompileResult compileLinkedFeatureVariant(slang::ISession* session, const std::string& entryModuleName,
++                                                               const std::string& entrySource,
++                                                               const std::string& entryPointName,
++                                                               const std::string& implModuleName,
++                                                               const std::string& implSource) {
++    Slang::ComPtr<slang::IBlob> entryBlob(Slang::INIT_ATTACH, slang_createBlob(entrySource.data(), entrySource.size()));
++    Slang::ComPtr<slang::IBlob> entryLoadDiag;
++    slang::IModule* entryModule = session->loadModuleFromSource(
++        entryModuleName.c_str(), (entryModuleName + ".slang").c_str(), entryBlob, entryLoadDiag.writeRef());
++    if (entryModule == nullptr) {
++        rx::shader::CompileResult result;
++        result.ok = false;
++        if (entryLoadDiag.get() != nullptr && entryLoadDiag->getBufferSize() > 0) {
++            result.diagnostics.append(static_cast<const char*>(entryLoadDiag->getBufferPointer()), entryLoadDiag->getBufferSize());
++        }
++        return result;
++    }
++
++    Slang::ComPtr<slang::IEntryPoint> entryPoint;
++    if (SLANG_FAILED(entryModule->findEntryPointByName(entryPointName.c_str(), entryPoint.writeRef())) ||
++        entryPoint.get() == nullptr) {
++        rx::shader::CompileResult result;
++        result.ok = false;
++        result.diagnostics = "entry point not found: " + entryPointName;
++        return result;
++    }
++
++    Slang::ComPtr<slang::IBlob> implBlob(Slang::INIT_ATTACH, slang_createBlob(implSource.data(), implSource.size()));
++    Slang::ComPtr<slang::IBlob> implLoadDiag;
++    slang::IModule* implModule = session->loadModuleFromSource(
++        implModuleName.c_str(), (implModuleName + ".slang").c_str(), implBlob, implLoadDiag.writeRef());
++    if (implModule == nullptr) {
++        rx::shader::CompileResult result;
++        result.ok = false;
++        if (implLoadDiag.get() != nullptr && implLoadDiag->getBufferSize() > 0) {
++            result.diagnostics.append(static_cast<const char*>(implLoadDiag->getBufferPointer()), implLoadDiag->getBufferSize());
++        }
++        return result;
++    }
++
++    std::vector<slang::IComponentType*> parts{entryModule, entryPoint.get(), implModule};
++    return detail::finishLink(session, parts, entryPointName);
++}
++
++}  // namespace rx::brdf_test
+diff --git a/src/rx_material/tests/test_brdf_module_gpu.cpp b/src/rx_material/tests/test_brdf_module_gpu.cpp
+new file mode 100644
+index 0000000..064e82b
+--- /dev/null
++++ b/src/rx_material/tests/test_brdf_module_gpu.cpp
+@@ -0,0 +1,361 @@
++// src/rx_material/tests/test_brdf_module_gpu.cpp -- Phase 5 Stage 1 Task 7
++// [#43]: the ticket's own primary port-parity gate. Every reference value
++// below is computed by an INDEPENDENTLY-TYPED fp64 C++ function (a fresh
++// transcription of the exact pinned Filament formula, never brdf.slang's
++// own source text, never copy-pasted), compared against brdf.slang's own
++// compiled-and-dispatched fp32 GPU output -- see brdf.slang's own header
++// comment for the full google/filament v1.75.0 (commit
++// 0e58877c09afb1aacd09ff640f74d2adcd2a7e80, Apache-2.0) provenance.
++//
++// TEST_CASE 1 needs no GPU device at all (Slang compilation is a host-side
++// process) -- proves the ticket's own "modules compile standalone through
++// the existing Slang path" acceptance line directly, via rx_shader::
++// Compiler (brdf.slang imports nothing, so no custom search-path session is
++// needed for this one case).
++//
++// TEST_CASE 2 is the port-parity table: D_GGX/V_SmithGGXCorrelated/
++// F_Schlick(implicit f90)/fresnelDefault(computed f90)/Fd_Burley/Fd_Lambert
++// at a 7-point table (values hand-verified against a Python transcription
++// of the SAME formulas during this task's own research), all in ONE
++// compute dispatch, exact-tolerance asserts.
++//
++// TEST_CASE 3 is the gate matrix's own literal ask (row 2, "Discrimination:
++// swap in the UN-height-correlated (separable) Smith form at one table
++// point and confirm the test fails"): a SEPARATE compute module, NOT
++// importing brdf.slang at all, computing the textbook separable
++// Smith-GGX visibility (G1(NoV)*G1(NoL)/(4*NoV*NoL)) at table point P3
++// (alpha=1.0, NoV=0.1, NoL=0.2 -- the table's own most grazing/roughest
++// point, where the two forms diverge by ~0.91, five orders of magnitude
++// past the parity tolerance) -- proving the harness actually distinguishes
++// the CORRELATED term, not just "some visibility function ran".
++//
++// TEST_CASE 4 is the computed-f90 discrimination case (table point P6,
++// f0=0.01 grazing VoH=0.02 -- see brdf.slang's own fresnelDefault() header
++// comment for why this LOW-f0 point, not a metal, is where the two Fresnel
++// forms actually diverge for this exact pinned formula): asserts
++// F_Schlick(f0,VoH) [implicit f90=1] and fresnelDefault(f0,VoH) [computed
++// f90] differ by far more than the parity tolerance at that same point,
++// using TEST_CASE 2's own dispatch output (no extra GPU work needed).
++#include <doctest/doctest.h>
++
++#include "brdf_gpu_fixture.h"
++#include "brdf_test_harness.h"
++
++#include <rx_shader/compiler.h>
++#include <rx_shader/reflection.h>
++#include <rx_rhi_vk/compute_pipeline.h>
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <filesystem>
++#include <optional>
++#include <string>
++#include <vector>
++
++using namespace rx::brdf_test;
++
++namespace {
++
++constexpr double kPiRef = 3.14159265358979323846;
++
++// --- Independent fp64 reference formulas [see this file's header comment]
++double refDGgx(double alpha, double NoH) {
++    double oneMinusNoHSq = 1.0 - NoH * NoH;
++    double a = NoH * alpha;
++    double k = alpha / (oneMinusNoHSq + a * a);
++    return k * k * (1.0 / kPiRef);
++}
++
++double refVSmithCorrelated(double alpha, double NoV, double NoL) {
++    double a2 = alpha * alpha;
++    double lambdaV = NoL * std::sqrt((NoV - a2 * NoV) * NoV + a2);
++    double lambdaL = NoV * std::sqrt((NoL - a2 * NoL) * NoL + a2);
++    return 0.5 / std::max(lambdaV + lambdaL, 1e-5);
++}
++
++double refFSchlickImplicit(double f0, double VoH) {
++    double f = std::pow(std::clamp(1.0 - VoH, 0.0, 1.0), 5.0);
++    return f + f0 * (1.0 - f);
++}
++
++double refFresnelComputed(double f0, double VoH) {
++    double f90 = std::clamp(49.5 * f0, 0.0, 1.0);  // dot((f0,f0,f0),(16.5,16.5,16.5)) = 49.5*f0.
++    double p5 = std::pow(std::clamp(1.0 - VoH, 0.0, 1.0), 5.0);
++    return f0 + (f90 - f0) * p5;
++}
++
++double refFdBurley(double alpha, double NoV, double NoL, double LoH) {
++    double f90 = 0.5 + 2.0 * alpha * LoH * LoH;
++    auto schlickScalar = [&](double VoX) {
++        double p5 = std::pow(std::clamp(1.0 - VoX, 0.0, 1.0), 5.0);
++        return 1.0 + (f90 - 1.0) * p5;
++    };
++    return schlickScalar(NoL) * schlickScalar(NoV) * (1.0 / kPiRef);
++}
++
++// Textbook SEPARABLE (un-height-correlated) Smith-GGX visibility -- the
++// deliberately WRONG formula TEST_CASE 3 dispatches, per the matrix's own
++// discrimination requirement. G1 is the standard Smith masking/shadowing
++// term for a single direction; the separable combination is simply
++// G1(NoV)*G1(NoL), UNLIKE V_SmithGGXCorrelated's height-correlated joint
++// term above.
++double refVSeparable(double alpha, double NoV, double NoL) {
++    double a2 = alpha * alpha;
++    auto g1 = [&](double NoX) { return 2.0 * NoX / (NoX + std::sqrt(a2 + (1.0 - a2) * NoX * NoX)); };
++    return (g1(NoV) * g1(NoL)) / (4.0 * NoV * NoL);
++}
++
++struct TestPointGpu {
++    float alpha;
++    float NoV;
++    float NoL;
++    float NoH;
++    float VoH;
++    float f0;
++};
++
++struct TestResultGpu {
++    float d;
++    float v;
++    float fSchlickImplicit;
++    float fresnelComputed;
++    float fdBurley;
++    float fdLambert;
++};
++
++// 7-point table -- see this file's header comment for P3 (index 3, Smith
++// discrimination) and P6 (index 6, f90 discrimination)'s special roles.
++// Values hand-verified via an independent Python transcription of these
++// same formulas during this task's own research (not committed -- the
++// C++ refXxx() functions above ARE the checked-in reference, computed
++// fresh at test-run time, not a hardcoded literal table).
++const std::vector<TestPointGpu>& testPoints() {
++    static const std::vector<TestPointGpu> kPoints = {
++        {0.01F, 0.9F, 0.8F, 0.95F, 0.85F, 0.04F},  // P0: near-mirror, moderate angles.
++        {0.09F, 0.6F, 0.5F, 0.7F, 0.5F, 0.5F},     // P1: light roughness, mid F0.
++        {0.36F, 0.3F, 0.7F, 0.4F, 0.3F, 0.9F},     // P2: mid roughness, high F0 (metal-like).
++        {1.00F, 0.1F, 0.2F, 0.15F, 0.1F, 0.02F},   // P3: max roughness, grazing, asymmetric NoV/NoL.
++        {0.16F, 1.0F, 1.0F, 1.0F, 1.0F, 0.04F},    // P4: normal incidence sanity (VoH=1 -> F==f0 exactly).
++        {0.25F, 0.5F, 0.5F, 0.99F, 0.05F, 0.08F},  // P5: near-grazing VoH, symmetric NoV/NoL.
++        {0.16F, 0.5F, 0.5F, 0.5F, 0.02F, 0.01F},   // P6: LOW f0, grazing VoH -- f90 discrimination.
++    };
++    return kPoints;
++}
++
++constexpr const char* kParityComputeSource = R"(
++import brdf;
++
++struct TestPointGpu { float alpha; float NoV; float NoL; float NoH; float VoH; float f0; };
++struct TestResultGpu { float d; float v; float fSchlickImplicit; float fresnelComputed; float fdBurley; float fdLambert; };
++
++[[vk::binding(0, 1)]]
++StructuredBuffer<TestPointGpu> gPoints;
++
++[[vk::binding(1, 1)]]
++RWStructuredBuffer<TestResultGpu> gResults;
++
++[shader("compute")]
++[numthreads(1, 1, 1)]
++void csMain(uint3 id : SV_DispatchThreadID) {
++    TestPointGpu p = gPoints[id.x];
++    float3 f0v = float3(p.f0, p.f0, p.f0);
++
++    TestResultGpu r;
++    r.d = D_GGX(p.alpha, p.NoH);
++    r.v = V_SmithGGXCorrelated(p.alpha, p.NoV, p.NoL);
++    r.fSchlickImplicit = F_Schlick(f0v, p.VoH).x;
++    r.fresnelComputed = fresnelDefault(f0v, p.VoH).x;
++    r.fdBurley = Fd_Burley(p.alpha, p.NoV, p.NoL, p.VoH);
++    r.fdLambert = Fd_Lambert();
++    gResults[id.x] = r;
++}
++)";
++
++// Deliberately WRONG shader for TEST_CASE 3 -- separable Smith, NOT
++// importing brdf.slang at all (this is the "swap in the wrong formula"
++// discrimination case, not a brdf.slang code path).
++constexpr const char* kSeparableSmithComputeSource = R"(
++struct TestPointGpu { float alpha; float NoV; float NoL; float NoH; float VoH; float f0; };
++struct TestResultGpu { float d; float v; float fSchlickImplicit; float fresnelComputed; float fdBurley; float fdLambert; };
++
++[[vk::binding(0, 1)]]
++StructuredBuffer<TestPointGpu> gPoints;
++
++[[vk::binding(1, 1)]]
++RWStructuredBuffer<TestResultGpu> gResults;
++
++float g1Separable(float NoX, float a2) {
++    return 2.0 * NoX / (NoX + sqrt(a2 + (1.0 - a2) * NoX * NoX));
++}
++
++[shader("compute")]
++[numthreads(1, 1, 1)]
++void csMain(uint3 id : SV_DispatchThreadID) {
++    TestPointGpu p = gPoints[id.x];
++    float a2 = p.alpha * p.alpha;
++    TestResultGpu r;
++    r.v = (g1Separable(p.NoV, a2) * g1Separable(p.NoL, a2)) / (4.0 * p.NoV * p.NoL);
++    r.d = 0.0;
++    r.fSchlickImplicit = 0.0;
++    r.fresnelComputed = 0.0;
++    r.fdBurley = 0.0;
++    r.fdLambert = 0.0;
++    gResults[id.x] = r;
++}
++)";
++
++std::optional<rx::rhi::ComputePipelineCache::Pipeline> buildPso(VkDevice device, rx::rhi::ComputePipelineCache& cache,
++                                                                  const rx::shader::CompileResult& compiled) {
++    if (!compiled.ok || compiled.entryPointCode.empty()) {
++        return std::nullopt;
++    }
++    auto layoutInfo = rx::shader::reflect(compiled);
++    if (!layoutInfo.has_value()) {
++        return std::nullopt;
++    }
++    return cache.getOrCreate(compiled.entryPointCode[0].code, *layoutInfo);
++}
++
++// Runs the parity dispatch (used by both TEST_CASE 2 and TEST_CASE 4, which
++// only needs its output) once per test process -- returns the raw
++// TestResultGpu vector, one entry per testPoints() index.
++std::optional<std::vector<TestResultGpu>> runParityDispatch(BrdfGpuFixture& fixture) {
++    auto session = createBrdfSession(RX_MATERIAL_SHADER_DIR);
++    if (!session.has_value()) {
++        return std::nullopt;
++    }
++    auto compiled = compileBrdfComputeModule(session->session.get(), "RxBrdfParity", kParityComputeSource, "csMain");
++    if (!compiled.ok) {
++        MESSAGE("brdf parity compute compile failed: ", compiled.diagnostics);
++        return std::nullopt;
++    }
++
++    auto cache = rx::rhi::ComputePipelineCache::create(fixture.device.device(),
++                                                         std::filesystem::temp_directory_path() / "rx_brdf_parity.cache");
++    if (!cache.has_value()) {
++        return std::nullopt;
++    }
++    auto pso = buildPso(fixture.device.device(), *cache, compiled);
++    if (!pso.has_value()) {
++        return std::nullopt;
++    }
++
++    const auto& points = testPoints();
++    std::vector<uint8_t> inputBytes(points.size() * sizeof(TestPointGpu));
++    std::memcpy(inputBytes.data(), points.data(), inputBytes.size());
++
++    auto outputBytes = dispatchOneInOneOut(fixture, *pso, inputBytes, points.size() * sizeof(TestResultGpu),
++                                            static_cast<uint32_t>(points.size()));
++
++    std::vector<TestResultGpu> results(points.size());
++    std::memcpy(results.data(), outputBytes.data(), outputBytes.size());
++
++    vkDeviceWaitIdle(fixture.device.device());
++    CHECK_FALSE(fixture.context.hasValidationErrors());
++    return results;
++}
++
++}  // namespace
++
++TEST_CASE("brdf.slang compiles standalone -- no material.slang import, zero entry points requested") {
++    auto compiler = rx::shader::Compiler::create();
++    REQUIRE(compiler.has_value());
++
++    std::string path = std::string(RX_MATERIAL_SHADER_DIR) + "/brdf.slang";
++    auto result = compiler->compileFromFile(path, {});
++    INFO(result.diagnostics);
++    CHECK(result.ok);
++}
++
++TEST_CASE("brdf.slang port-parity: D_GGX/V_SmithGGXCorrelated/F_Schlick/fresnelDefault/Fd_Burley/Fd_Lambert match "
++          "independent fp64 references at a 7-point table") {
++    auto fixture = makeBrdfGpuFixture("rx_brdf_parity");
++    if (!fixture.has_value()) {
++        return;
++    }
++    auto results = runParityDispatch(*fixture);
++    REQUIRE(results.has_value());
++
++    const auto& points = testPoints();
++    REQUIRE(results->size() == points.size());
++
++    constexpr double kEps = 1e-4;  // relative-ish tolerance, doctest::Approx's own semantics -- see this file's header.
++    for (size_t i = 0; i < points.size(); ++i) {
++        const auto& p = (*results)[i];
++        const auto& in = points[i];
++        CAPTURE(i);
++        CHECK(static_cast<double>(p.d) == doctest::Approx(refDGgx(in.alpha, in.NoH)).epsilon(kEps));
++        CHECK(static_cast<double>(p.v) == doctest::Approx(refVSmithCorrelated(in.alpha, in.NoV, in.NoL)).epsilon(kEps));
++        CHECK(static_cast<double>(p.fSchlickImplicit) == doctest::Approx(refFSchlickImplicit(in.f0, in.VoH)).epsilon(kEps));
++        CHECK(static_cast<double>(p.fresnelComputed) == doctest::Approx(refFresnelComputed(in.f0, in.VoH)).epsilon(kEps));
++        CHECK(static_cast<double>(p.fdBurley) == doctest::Approx(refFdBurley(in.alpha, in.NoV, in.NoL, in.VoH)).epsilon(kEps));
++        CHECK(static_cast<double>(p.fdLambert) == doctest::Approx(1.0 / kPiRef).epsilon(kEps));
++    }
++}
++
++TEST_CASE("brdf.slang V_SmithGGXCorrelated discrimination: the un-height-correlated (separable) Smith form "
++          "diverges measurably at P3 -- proves the harness distinguishes the correlated term") {
++    auto fixture = makeBrdfGpuFixture("rx_brdf_smith_discrimination");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    const auto& points = testPoints();
++    const TestPointGpu& p3 = points[3];  // alpha=1.0, NoV=0.1, NoL=0.2 -- most grazing/roughest point.
++
++    auto session = createBrdfSession(RX_MATERIAL_SHADER_DIR);
++    REQUIRE(session.has_value());
++    auto compiled = compileBrdfComputeModule(session->session.get(), "RxBrdfSeparableSmith",
++                                              kSeparableSmithComputeSource, "csMain");
++    REQUIRE(compiled.ok);
++
++    auto cache = rx::rhi::ComputePipelineCache::create(
++        fixture->device.device(), std::filesystem::temp_directory_path() / "rx_brdf_separable_smith.cache");
++    REQUIRE(cache.has_value());
++    auto pso = buildPso(fixture->device.device(), *cache, compiled);
++    REQUIRE(pso.has_value());
++
++    std::vector<uint8_t> inputBytes(sizeof(TestPointGpu));
++    std::memcpy(inputBytes.data(), &p3, sizeof(TestPointGpu));
++    auto outputBytes = dispatchOneInOneOut(*fixture, *pso, inputBytes, sizeof(TestResultGpu), 1);
++    TestResultGpu result{};
++    std::memcpy(&result, outputBytes.data(), sizeof(TestResultGpu));
++
++    double correlatedRef = refVSmithCorrelated(p3.alpha, p3.NoV, p3.NoL);
++    double separableGpu = static_cast<double>(result.v);
++    double separableRef = refVSeparable(p3.alpha, p3.NoV, p3.NoL);
++
++    // The wrong shader's own GPU output matches ITS OWN (also wrong)
++    // reference, confirming this is a real, sane computation, not a NaN/
++    // garbage artifact that would trivially "differ" from anything.
++    CHECK(separableGpu == doctest::Approx(separableRef).epsilon(1e-4));
++    // ...and diverges from the CORRELATED reference by far more than the
++    // parity tolerance above (5+ orders of magnitude here: ~0.91 vs 1e-4).
++    CHECK(std::abs(separableGpu - correlatedRef) > 0.05);
++
++    vkDeviceWaitIdle(fixture->device.device());
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
++TEST_CASE("brdf.slang fresnelDefault() (computed f90) discrimination: diverges measurably from the implicit-f90=1 "
++          "form at a low-f0, grazing-angle point (P6)") {
++    auto fixture = makeBrdfGpuFixture("rx_brdf_f90_discrimination");
++    if (!fixture.has_value()) {
++        return;
++    }
++    auto results = runParityDispatch(*fixture);
++    REQUIRE(results.has_value());
++
++    const auto& p6 = (*results)[6];
++    double implicitGpu = static_cast<double>(p6.fSchlickImplicit);
++    double computedGpu = static_cast<double>(p6.fresnelComputed);
++
++    // Both already independently matched their own fp64 references in
++    // TEST_CASE 2's own general parity loop -- this case's own job is
++    // proving they diverge from EACH OTHER by far more than that shared
++    // parity tolerance (1e-4): expected diff here is ~0.456.
++    CHECK(std::abs(implicitGpu - computedGpu) > 0.05);
++}
+diff --git a/src/rx_material/tests/test_brdf_spirv_link_composition_gpu.cpp b/src/rx_material/tests/test_brdf_spirv_link_composition_gpu.cpp
+new file mode 100644
+index 0000000..68373ef
+--- /dev/null
++++ b/src/rx_material/tests/test_brdf_spirv_link_composition_gpu.cpp
+@@ -0,0 +1,181 @@
++// src/rx_material/tests/test_brdf_spirv_link_composition_gpu.cpp -- Phase 5
++// Stage 1 Task 7 [#43, gate ruling T7]: proves the link-time-composition
++// mechanism GUARANTEES a feature's code is absent from SPIR-V when unused
++// -- verified AT THE SPIR-V LEVEL (spirv-dis), the codebase's own
++// established SPIR-V-verification precedent (material_system.cpp/
++// context.cpp/device.cpp's own header comments all cite direct spirv-dis
++// verification against this project's real compiled output; this is the
++// first time that verification is SCRIPTED into an automated test rather
++// than performed manually, closing the gate matrix's own "New gaps" entry:
++// "No SPIR-V-content inspection tooling ... exists in this repository
++// today").
++//
++// MECHANISM -- brdf.slang's own `IEnergyCompensationFeature` interface +
++// `EnergyCompensationOn`/`EnergyCompensationOff` conforming structs (see
++// that file's own "Link-time feature composition" header comment), linked
++// via forward_entry.slang's ALREADY-VERIFIED extern/export +
++// `ISession::createCompositeComponentType()`/`IComponentType::link()`
++// contract -- NOT a new technique, the same mechanism this codebase's
++// production material path already uses daily. Two SEPARATE composites are
++// built from the SAME entry-point module: one linked against
++// EnergyCompensationOn, one against EnergyCompensationOff -- producing two
++// INDEPENDENT SPIR-V modules.
++//
++// EVIDENCE -- EnergyCompensationOn::apply() computes `specular *
++// energyCompensation(f0, dfgY)`, which contains the ONLY division
++// (`1.0 / dfgY`) anywhere in this test's whole compute kernel;
++// EnergyCompensationOff::apply() returns `specular` unchanged and never
++// even reads `dfgY`. `spirv-dis`'s own disassembly is grepped for
++// `OpFDiv` -- the ON variant must contain at least one, the OFF variant
++// must contain ZERO. This is a genuinely PRESENT/ABSENT proof of compiled
++// code, not a coarser "file size differs" proxy (a size check is also
++// asserted, but only as a secondary sanity signal).
++//
++// DEVICE-FREE -- Slang compilation and `spirv-dis` are both host-side
++// processes; no VkDevice/window is created or needed anywhere in this
++// file.
++#include <doctest/doctest.h>
++
++#include "brdf_test_harness.h"
++
++#include <cstdint>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <sstream>
++#include <string>
++#include <vector>
++
++using namespace rx::brdf_test;
++
++namespace {
++
++// Shared shape for both link-time-composed variants' compute kernel: reads
++// one query (f0, dfgY, specular), applies the LINK-TIME-RESOLVED
++// `EnergyFeature`, writes the result's x channel. `EnergyFeature` itself is
++// `extern` here -- resolved to a concrete conforming struct only at LINK
++// time by whichever impl module this entry module is composed against
++// (see compileLinkedFeatureVariant()'s own header comment,
++// brdf_test_harness.h).
++constexpr const char* kEntrySource = R"(
++import brdf;
++
++extern struct EnergyFeature : IEnergyCompensationFeature;
++
++struct QueryGpu { float f0; float dfgY; float specular; };
++
++[[vk::binding(0, 1)]]
++StructuredBuffer<QueryGpu> gQuery;
++
++[[vk::binding(1, 1)]]
++RWStructuredBuffer<float> gOut;
++
++[shader("compute")]
++[numthreads(1, 1, 1)]
++void csMain(uint3 id : SV_DispatchThreadID) {
++    QueryGpu q = gQuery[0];
++    EnergyFeature feature;
++    float3 result = feature.apply(float3(q.specular, q.specular, q.specular), float3(q.f0, q.f0, q.f0), q.dfgY);
++    gOut[0] = result.x;
++}
++)";
++
++constexpr const char* kImplOnSource = R"(
++import brdf;
++export struct EnergyFeature : IEnergyCompensationFeature = EnergyCompensationOn;
++)";
++
++constexpr const char* kImplOffSource = R"(
++import brdf;
++export struct EnergyFeature : IEnergyCompensationFeature = EnergyCompensationOff;
++)";
++
++// Writes `spirv` to a temp .spv file, runs the CMake-located `spirv-dis`
++// binary (RX_SPIRV_DIS, found via find_program() at configure time -- see
++// src/rx_material/tests/CMakeLists.txt) against it, and returns the
++// disassembly text. REQUIREs a clean (0) exit -- a spirv-dis failure means
++// the emitted module is not even valid SPIR-V, which is itself a hard
++// failure for this test, not a skip.
++std::string disassemble(const std::vector<uint32_t>& spirv, const std::filesystem::path& tmpDir, const std::string& tag) {
++    auto spvPath = tmpDir / (tag + ".spv");
++    auto disPath = tmpDir / (tag + ".dis.txt");
++
++    {
++        std::ofstream out(spvPath, std::ios::binary);
++        REQUIRE(out.is_open());
++        out.write(reinterpret_cast<const char*>(spirv.data()), static_cast<std::streamsize>(spirv.size() * sizeof(uint32_t)));
++    }
++
++    std::string cmd = std::string("\"") + RX_SPIRV_DIS + "\" \"" + spvPath.string() + "\" -o \"" + disPath.string() + "\"";
++    int rc = std::system(cmd.c_str());
++    REQUIRE_MESSAGE(rc == 0, "spirv-dis invocation failed: ", cmd);
++
++    std::ifstream in(disPath);
++    REQUIRE(in.is_open());
++    std::ostringstream ss;
++    ss << in.rdbuf();
++    return ss.str();
++}
++
++size_t countOccurrences(const std::string& text, const std::string& needle) {
++    size_t count = 0;
++    size_t pos = 0;
++    while ((pos = text.find(needle, pos)) != std::string::npos) {
++        ++count;
++        pos += needle.size();
++    }
++    return count;
++}
++
++}  // namespace
++
++TEST_CASE("Slang link-time composition: EnergyCompensationOff's compiled SPIR-V contains ZERO OpFDiv instructions "
++          "-- EnergyCompensationOn's own division is never generated when the feature is linked out") {
++    auto session = createBrdfSession(RX_MATERIAL_SHADER_DIR);
++    REQUIRE(session.has_value());
++
++    auto onResult = compileLinkedFeatureVariant(session->session.get(), "RxEnergyFeatureEntryOn", kEntrySource,
++                                                 "csMain", "RxEnergyFeatureImplOn", kImplOnSource);
++    REQUIRE_MESSAGE(onResult.ok, onResult.diagnostics);
++    REQUIRE(onResult.entryPointCode.size() == 1);
++
++    auto offResult = compileLinkedFeatureVariant(session->session.get(), "RxEnergyFeatureEntryOff", kEntrySource,
++                                                  "csMain", "RxEnergyFeatureImplOff", kImplOffSource);
++    REQUIRE_MESSAGE(offResult.ok, offResult.diagnostics);
++    REQUIRE(offResult.entryPointCode.size() == 1);
++
++    const std::filesystem::path tmpDir = std::filesystem::temp_directory_path();
++    std::string onDis = disassemble(onResult.entryPointCode[0].code, tmpDir, "rx_brdf_energy_feature_on");
++    std::string offDis = disassemble(offResult.entryPointCode[0].code, tmpDir, "rx_brdf_energy_feature_off");
++
++    size_t onDivCount = countOccurrences(onDis, "OpFDiv");
++    size_t offDivCount = countOccurrences(offDis, "OpFDiv");
++
++    INFO("ON variant OpFDiv count: ", onDivCount);
++    INFO("OFF variant OpFDiv count: ", offDivCount);
++
++    // The ON variant's energyCompensation() computes `1.0 / dfgY` -- at
++    // least one OpFDiv MUST be present, or this test's own "positive
++    // control" is broken (a false pass would otherwise be indistinguishable
++    // from a real absence proof).
++    CHECK(onDivCount >= 1);
++    // The OFF variant's apply() never reads dfgY at all -- ZERO division
++    // instructions anywhere in its compiled SPIR-V. This is the load-
++    // bearing assertion: the feature's code is provably ABSENT, not merely
++    // unreached at runtime.
++    CHECK(offDivCount == 0);
++
++    // Secondary sanity signal: the featureless variant's own compiled word
++    // count is smaller (a coarser corroborating check, not the proof
++    // itself).
++    CHECK(offResult.entryPointCode[0].code.size() < onResult.entryPointCode[0].code.size());
++}
++
++// Revert-discrimination companion [standing project discipline]: if
++// EnergyFeature were resolved to EnergyCompensationOn for BOTH composites
++// (a plausible harness bug -- e.g. accidentally reusing the ON impl module
++// name/instance for the OFF composite), this test would show onDivCount ==
++// offDivCount >= 1 and FAIL its own `offDivCount == 0` assertion above --
++// see task-07-report.md for the recorded revert-proof command tail (this
++// mutation was run for real against the built test binary, not just
++// reasoned about here).
+diff --git a/src/rx_material/tests/test_brdf_white_furnace_gpu.cpp b/src/rx_material/tests/test_brdf_white_furnace_gpu.cpp
+new file mode 100644
+index 0000000..999da68
+--- /dev/null
++++ b/src/rx_material/tests/test_brdf_white_furnace_gpu.cpp
+@@ -0,0 +1,241 @@
++// src/rx_material/tests/test_brdf_white_furnace_gpu.cpp -- Phase 5 Stage 1
++// Task 7 [#43]: the white-furnace energy-conservation test the ticket's own
++// acceptance sketch names ("with energy compensation ON, integrated
++// response at F0=1 ~= 1 across roughness; without it, the deficit is
++// measurable").
++//
++// METHODOLOGY [gate matrix's own resolved calling contract, brdf.slang's
++// own energyCompensation() header comment] -- ported from google/filament
++// v1.75.0 (commit 0e58877c09afb1aacd09ff640f74d2adcd2a7e80, Apache-2.0)
++// libs/ibl/src/CubemapIBL.cpp's `DFV_Multiscatter()` (hammersley-distributed
++// importance sampling of the GGX visible-normal distribution, height-
++// correlated Smith visibility -- reusing brdf.slang's OWN
++// V_SmithGGXCorrelated(), already independently port-parity-verified by
++// test_brdf_module_gpu.cpp), NOT the production DFG LUT (Task 9 has not
++// built it yet -- see brdf.slang's own calling-contract comment). Under
++// `DFV_Multiscatter`'s own construction, the accumulated `.y` term IS
++// exactly `Ess(NoV, alpha)`, the F0=1 (white furnace) single-scattering
++// directional albedo -- CubemapIBL.cpp's own comment: "Er() = (1 - f0) *
++// DFV.x + f0 * DFV.y = mix(DFV.xxx, DFV.yyy, f0)", which reduces to
++// `Er(f0=1) = DFV.y` exactly.
++//
++// A HONEST NOTE ON WHAT THIS TEST CAN AND CANNOT PROVE -- read before
++// trusting the "compensated ~= 1" assertions below at face value:
++// `energyCompensation(f0=1, dfgY=Ess) = 1 + 1*(1/Ess - 1) = 1/Ess`, so
++// `Ess * energyCompensation(1, Ess) = Ess * (1/Ess) = 1` EXACTLY, by
++// algebraic construction, for ANY nonzero `Ess` -- this is NOT a
++// coincidence of this test's own setup; it is the whole point of the
++// Kulla-Conty/Fdez-Aguera derivation the formula comes from (brdf.slang's
++// own header comment cites it). A test that only checked "compensated ~=
++// 1" would therefore be TAUTOLOGICAL: it would pass even if the Monte-Carlo
++// `Ess` measurement itself were wrong (e.g. a broken importance sampler
++// that always returned NoL=1 regardless of roughness). This test's REAL
++// discriminating power comes from two INDEPENDENT, non-tautological checks
++// instead: (1) `Ess` itself must be near 1.0 at near-zero roughness and
++// MEASURABLY, MONOTONICALLY smaller as roughness grows (a real physical
++// expectation -- rough microfacet surfaces genuinely lose energy under a
++// single-scatter-only model -- that does not depend on the compensation
++// formula at all); (2) the compensated response must land at EXACTLY 1.0
++// to fp32-rounding-only precision (not a loose Monte-Carlo-noise
++// tolerance), which DOES catch a coding bug in energyCompensation() itself
++// (a sign flip or wrong operator would NOT cancel to 1). Together, (1)+(2)
++// give genuine ON-vs-OFF discrimination in substance, matching the
++// ticket's own acceptance line, even though the "restores to ~1" half is
++// influenced by exact algebraic cancellation rather than independent
++// measurement.
++#include <doctest/doctest.h>
++
++#include "brdf_gpu_fixture.h"
++#include "brdf_test_harness.h"
++
++#include <rx_rhi_vk/compute_pipeline.h>
++#include <rx_shader/reflection.h>
++
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <filesystem>
++#include <optional>
++#include <vector>
++
++using namespace rx::brdf_test;
++
++namespace {
++
++struct FurnaceQueryGpu {
++    float NoV;
++    float alpha;
++};
++
++struct FurnaceResultGpu {
++    float ess;           // DFV_Multiscatter(...).y -- the F0=1 single-scatter directional albedo.
++    float compensated;   // ess * energyCompensation(float3(1,1,1), ess).x.
++};
++
++// 16384 samples/point -- matches this task's own research-session Python
++// cross-check (see task-07-report.md's white-furnace numbers table), low
++// enough noise that Ess's own roughness trend is unambiguous well past any
++// plausible estimator-noise band.
++constexpr uint32_t kNumSamples = 16384;
++
++// Q0..Q3: NoV=1.0, alpha sweeping near-mirror -> max-rough (the ticket's
++// own "across roughness" wording). Q4: an off-normal view angle at high
++// roughness, proving the trend is not an NoV=1-only artifact.
++const std::vector<FurnaceQueryGpu>& furnaceQueries() {
++    static const std::vector<FurnaceQueryGpu> kQueries = {
++        {1.0F, 0.02F},  // Q0: near-mirror.
++        {1.0F, 0.30F},  // Q1.
++        {1.0F, 0.70F},  // Q2.
++        {1.0F, 1.00F},  // Q3: max roughness.
++        {0.3F, 0.70F},  // Q4: off-normal view, high roughness.
++    };
++    return kQueries;
++}
++
++}  // namespace
++
++TEST_CASE("brdf.slang white-furnace energy conservation: energyCompensation() restores F0=1 single-scatter "
++          "response to 1.0 across a roughness sweep; the uncompensated deficit is measurable and monotonic") {
++    auto fixture = makeBrdfGpuFixture("rx_brdf_white_furnace");
++    if (!fixture.has_value()) {
++        return;
++    }
++
++    auto session = createBrdfSession(RX_MATERIAL_SHADER_DIR);
++    REQUIRE(session.has_value());
++
++    // kNumSamples is spliced into the shader source textually below (Slang
++    // has no C-preprocessor #define this test would otherwise use for a
++    // single shared literal) -- see this file's own header comment for the
++    // Filament source (CubemapIBL.cpp's DFV_Multiscatter()) this kernel
++    // ports.
++    std::string source = R"(
++import brdf;
++
++struct FurnaceQueryGpu { float NoV; float alpha; };
++struct FurnaceResultGpu { float ess; float compensated; };
++
++[[vk::binding(0, 1)]]
++StructuredBuffer<FurnaceQueryGpu> gQueries;
++
++[[vk::binding(1, 1)]]
++RWStructuredBuffer<FurnaceResultGpu> gResults;
++
++float2 hammersley(uint i, float iN) {
++    uint bits = i;
++    bits = (bits << 16u) | (bits >> 16u);
++    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
++    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
++    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
++    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
++    return float2(float(i) * iN, float(bits) * (1.0 / 4294967296.0));
++}
++
++float3 hemisphereImportanceSampleDggx(float2 u, float a) {
++    float phi = 2.0 * kBrdfPi * u.x;
++    float cosTheta2 = (1.0 - u.y) / (1.0 + (a + 1.0) * ((a - 1.0) * u.y));
++    float cosTheta = sqrt(max(0.0, cosTheta2));
++    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta2));
++    return float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
++}
++
++float2 dfvMultiscatter(float NoV, float alpha, uint numSamples) {
++    float2 r = float2(0.0, 0.0);
++    float3 V = float3(sqrt(max(0.0, 1.0 - NoV * NoV)), 0.0, NoV);
++    float invN = 1.0 / float(numSamples);
++    for (uint i = 0; i < numSamples; i++) {
++        float2 u = hammersley(i, invN);
++        float3 H = hemisphereImportanceSampleDggx(u, alpha);
++        float dotVH = dot(V, H);
++        float3 L = 2.0 * dotVH * H - V;
++        float VoH = saturate(dotVH);
++        float NoL = saturate(L.z);
++        float NoH = saturate(H.z);
++        if (NoL > 0.0) {
++            float v = V_SmithGGXCorrelated(alpha, NoV, NoL) * NoL * (VoH / max(NoH, 1e-6));
++            float Fc = pow(clamp(1.0 - VoH, 0.0, 1.0), 5.0);
++            r.x += v * Fc;
++            r.y += v;
++        }
++    }
++    return r * (4.0 / float(numSamples));
++}
++
++[shader("compute")]
++[numthreads(1, 1, 1)]
++void csMain(uint3 id : SV_DispatchThreadID) {
++    FurnaceQueryGpu q = gQueries[id.x];
++    float2 dfv = dfvMultiscatter(q.NoV, q.alpha, )" +
++             std::to_string(kNumSamples) + R"(u);
++
++    float ess = dfv.y;
++    float3 comp = energyCompensation(float3(1.0, 1.0, 1.0), ess);
++
++    FurnaceResultGpu r;
++    r.ess = ess;
++    r.compensated = ess * comp.x;
++    gResults[id.x] = r;
++}
++)";
++
++    auto compiled = compileBrdfComputeModule(session->session.get(), "RxBrdfWhiteFurnace", source, "csMain");
++    REQUIRE_MESSAGE(compiled.ok, compiled.diagnostics);
++
++    auto layoutInfo = rx::shader::reflect(compiled);
++    REQUIRE(layoutInfo.has_value());
++
++    auto cache = rx::rhi::ComputePipelineCache::create(fixture->device.device(),
++                                                         std::filesystem::temp_directory_path() / "rx_brdf_white_furnace.cache");
++    REQUIRE(cache.has_value());
++    auto pso = cache->getOrCreate(compiled.entryPointCode[0].code, *layoutInfo);
++    REQUIRE(pso.has_value());
++
++    const auto& queries = furnaceQueries();
++    std::vector<uint8_t> inputBytes(queries.size() * sizeof(FurnaceQueryGpu));
++    std::memcpy(inputBytes.data(), queries.data(), inputBytes.size());
++
++    auto outputBytes = dispatchOneInOneOut(*fixture, *pso, inputBytes, queries.size() * sizeof(FurnaceResultGpu),
++                                            static_cast<uint32_t>(queries.size()));
++    std::vector<FurnaceResultGpu> results(queries.size());
++    std::memcpy(results.data(), outputBytes.data(), outputBytes.size());
++
++    REQUIRE(results.size() == 5);
++    const double essQ0 = results[0].ess;
++    const double essQ1 = results[1].ess;
++    const double essQ2 = results[2].ess;
++    const double essQ3 = results[3].ess;
++    const double essQ4 = results[4].ess;
++
++    // --- (1) Non-tautological physical checks on Ess itself ------------
++    // Near-mirror (alpha=0.02): minimal single-scatter energy loss.
++    CHECK(essQ0 == doctest::Approx(1.0).epsilon(0.01));
++    // Monotonically decreasing as roughness grows (NoV=1 sweep) -- the
++    // well-documented GGX/Smith single-scatter energy-loss trend.
++    CHECK(essQ0 > essQ1);
++    CHECK(essQ1 > essQ2);
++    CHECK(essQ2 > essQ3);
++    // Measurable deficit at max roughness (research-session cross-check:
++    // ~0.307 at NoV=1, alpha=1.0 -- see task-07-report.md).
++    CHECK(essQ3 < 0.5);
++    // Off-normal view (Q4) also shows a real, non-trivial deficit (not an
++    // NoV=1-only artifact).
++    CHECK(essQ4 < 0.9);
++
++    // --- (2) energyCompensation() itself is wired correctly -------------
++    // Algebraically exact (Ess * (1/Ess) == 1) up to fp32 rounding only --
++    // see this file's own header comment for why this is a real check on
++    // the FORMULA's implementation, not on Ess's own correctness.
++    for (const auto& r : results) {
++        CHECK(static_cast<double>(r.compensated) == doctest::Approx(1.0).epsilon(1e-3));
++    }
++
++    // --- ON-vs-OFF discrimination [ticket's own acceptance line] --------
++    // The uncompensated (OFF) response IS Ess itself; the compensated (ON)
++    // response is ~1.0 per the check above. At high roughness the gap is
++    // large; at near-mirror roughness it is small -- both asserted here.
++    CHECK(std::abs(static_cast<double>(results[3].compensated) - essQ3) > 0.1);  // Q3: large gap.
++    CHECK(std::abs(static_cast<double>(results[0].compensated) - essQ0) < 0.05); // Q0: small gap.
++
++    vkDeviceWaitIdle(fixture->device.device());
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
