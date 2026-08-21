@@ -49,7 +49,12 @@ add_executable(rx_material_gpu_tests
     # draws sample).
     test_standard_pbr_shadow_gpu.cpp
 )
-target_link_libraries(rx_material_gpu_tests PRIVATE rx_material rx_shadow rx_rhi_vk rx_platform doctest::doctest)
+# [Phase 5 Task 4/#40] rx_scene: test_standard_pbr_unlit.cpp's own
+# pre-exposure TEST_CASE constructs a real rx::scene::Camera and reads
+# camera.exposure()/rx::scene::exposure::exposure(ev100) to compute the
+# expected pre-multiplied lightColor it asserts against -- the ONE case in
+# this binary that needs Camera's exposure math linked in.
+target_link_libraries(rx_material_gpu_tests PRIVATE rx_material rx_shadow rx_scene rx_rhi_vk rx_platform doctest::doctest)
 rx_shader_deploy_runtime_libs(rx_material_gpu_tests)
 
 target_compile_definitions(rx_material_gpu_tests PRIVATE

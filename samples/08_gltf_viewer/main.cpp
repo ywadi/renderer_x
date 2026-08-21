@@ -41,12 +41,24 @@
 //
 // TONEMAP: reuses shaders/multipass/tonemap.{vert,frag}.slang VERBATIM
 // (this task's own binding constraint: "you may NOT touch
-// shaders/multipass/") -- `--exposure`'s pre-tonemap `2^exposure` multiply
-// happens INSIDE the material forward pass instead (forward_entry.slang's
-// own fragmentMain, material.slang's `RxMaterialGlobals::exposure`), so
-// the shared tonemap shaders' own SPIR-V is byte-for-byte unchanged by
-// this task -- see the exposure-neutral regression test this sample's own
-// headless gate runs.
+// shaders/multipass/") -- exposure never touches the tonemap pass at all.
+//
+// EXPOSURE [Phase 5 Task 4/#40, gate ruling rulings-2026-08-20.md T4,
+// superseding this comment's own former D22-era description]: `--exposure`
+// now feeds `App::exposureCamera` (a real `rx::scene::Camera`), a direct
+// EV100 override via `Camera::setExposure(float)` -- Filament-style
+// PRE-EXPOSURE, applied to `updateDrawDataPerPassFields()`'s own
+// lightColor/ambientColor BEFORE they are uploaded into RxDrawData, not a
+// push-constant scalar the forward pass reads (material.slang's
+// `RxMaterialGlobals` no longer has an `exposure` field at all -- see that
+// struct's own header comment). `--exposure`'s DEFAULT (0.0, matching its
+// pre-Task-4 "0 == neutral" contract) intentionally does NOT call
+// setExposure() at all -- `exposureCamera` stays at its own
+// default-constructed neutral (`exposure() == 1.0`) state, which is what
+// keeps this sample's D17 headless gate byte-identical without any
+// reference regeneration (see Args::exposure's own comment for the exact
+// mapping and why 0.0 is a genuinely different case from every other
+// value, not merely "the same formula evaluated at zero").
 //
 // D17 TOLERANCE GATE: headless mode captures TWO frames (a loading-state
 // frame, captured on frame 0 before the async import can possibly have
@@ -145,7 +157,21 @@ constexpr VkClearColorValue kLoadingClearColor{{0.06F, 0.10F, 0.22F, 1.0F}};
 // --- CLI arguments ------------------------------------------------------
 struct Args {
     std::string scenePath;  // empty == use the default (DamagedHelmet) resolution.
-    float exposure = 0.0F;  // pre-tonemap 2^exposure multiplier; 0 == neutral (2^0 == 1).
+    // [Phase 5 Task 4/#40] real EV100 units, fed directly into
+    // `App::exposureCamera.setExposure(float)` (Camera's direct-override
+    // path -- rx_scene/camera.h) -- HIGHER darkens (real camera
+    // convention: more EV100 means less exposure needed), unlike the
+    // Phase-4 `2^exposure` knob this superseded (where higher always
+    // brightened). 0.0F is a SENTINEL, not "ev100=0 fed through the
+    // formula" (which would resolve to a non-neutral ~0.833 multiplier,
+    // per rx::scene::exposure::exposure()'s own Filament-ported math): it
+    // means "no override requested at all", leaving `exposureCamera` at
+    // its own default-constructed neutral state (`exposure() == 1.0`
+    // exactly) -- the load-bearing D17 byte-identical-regression default,
+    // preserving this flag's pre-Task-4 "0 == neutral" contract exactly
+    // even though its non-zero semantics changed to real photographic
+    // units.
+    float exposure = 0.0F;
     rx::rhi::PresentMode vsyncMode = rx::rhi::PresentMode::VsyncOn;
     bool validate = false;
     bool present = false;
@@ -530,9 +556,12 @@ bool buildTonemapPipeline(VkDevice device, rx::shader::Compiler& compiler, VkDes
 // header comment: "a real D26.1 caller (StandardPBR/Unlit, samples/
 // 08_gltf_viewer) drives its OWN real per-draw buffer and pushes this same
 // push-constant range itself, never through this method") -- bindInstance()
-// always pushes MaterialSystem's own DEFAULT (identity) drawDataBufferIndex
-// and exposure=0.0, neither of which this sample can use (it has a REAL
-// per-submesh transform buatch and a real `--exposure`). recordForwardPass()
+// always pushes MaterialSystem's own DEFAULT (identity) drawDataBufferIndex,
+// which this sample cannot use (it has a REAL per-submesh transform batch,
+// addressed by its OWN real drawDataBufferIndex -- see App::exposureCamera's
+// own comment for where this sample's real `--exposure` now lives instead,
+// pre-baked into that buffer's own lightColor/ambientColor, not a push-
+// constant scalar). recordForwardPass()
 // below (this file) is this sample's own equivalent of bindInstance() --
 // pipeline bind, push-constant write, descriptor-set-1 bind -- built by hand
 // against this one small, always-identical (set 1, binding 0,
@@ -797,7 +826,15 @@ struct App {
 
     rx::asset::AABB sceneBoundsWorld;
     OrbitCamera camera;
-    float exposure = 0.0F;
+    // [Phase 5 Task 4/#40] Exposure ONLY -- OrbitCamera `camera` above
+    // remains this sample's own view/projection source (unchanged scope;
+    // computeViewProj() still builds its own throwaway `rx::scene::Camera`
+    // for cullingProj() alone, per that function's own comment). Default-
+    // constructed: exposure() == 1.0 (neutral) until makeApp()'s caller
+    // applies `args.exposure` via setExposure() -- see Args::exposure's own
+    // comment for why args.exposure==0.0F deliberately does NOT call
+    // setExposure() at all.
+    rx::scene::Camera exposureCamera;
 
     rx::asset::AsyncImportHandle importHandle;
     bool importStarted = false;
@@ -1480,11 +1517,25 @@ glm::mat4 computeViewProj(const OrbitCamera& camera, float aspect) {
 // alone, is what closes the I1 finding (a single shared buffer written
 // after the fence wait still races frame N-1's GPU reads of the OTHER
 // slot's turn).
+//
+// [Phase 5 Task 4/#40, gate ruling rulings-2026-08-20.md T4] PRE-EXPOSURE:
+// `app.exposureCamera.exposure()` scales `lightColor`/`ambientColor` HERE,
+// at their own source, before this row is ever uploaded -- this is the
+// exact "at its source" call site the gate matrix's row 5 names (this
+// sample's own FG1 flat-ambient/key-light term is the only lighting Phase
+// 4 shipped; there is no separate direct-light/IBL producer yet for this
+// ruling to also touch). NOT a push-constant post-multiply on the shaded
+// color anymore -- material.slang's `RxMaterialGlobals` has no `exposure`
+// field at all (see that struct's own header comment). A default-
+// constructed `exposureCamera` (no `--exposure` flag given) has
+// `exposure() == 1.0` exactly, so this multiply is a byte-identical no-op
+// for this sample's own D17 headless gate in that case.
 void updateDrawDataPerPassFields(App& app, const glm::mat4& viewProj, const glm::vec3& cameraPosWorld, uint32_t frameSlot) {
     app.currentFrameSlot = frameSlot;
     const glm::vec3 lightDirWorld = glm::normalize(glm::vec3(0.4F, 1.0F, 0.6F));
-    const glm::vec3 lightColor(5.0F, 5.0F, 5.0F);
-    const glm::vec3 ambientColor(0.18F, 0.18F, 0.18F);
+    const float preExposure = app.exposureCamera.exposure();
+    const glm::vec3 lightColor = glm::vec3(5.0F, 5.0F, 5.0F) * preExposure;
+    const glm::vec3 ambientColor = glm::vec3(0.18F, 0.18F, 0.18F) * preExposure;
 
     const glm::mat4 viewProjTransposed = glm::transpose(viewProj);  // [MATRIX LAYOUT] see draw_data.h.
     for (rx::material::DrawDataGpu& row : app.drawDataRows) {
@@ -1534,18 +1585,20 @@ void recordSceneDraws(VkCommandBuffer cmd, App& app) {
             VkPipelineLayout layout = app.materialSystem->pipelineLayout(material.handle);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
-            // [D26.1] The real per-scene draw-data buffer + this frame's
-            // real --exposure -- NEVER MaterialSystem::bindInstance()'s own
-            // default identity row (that method is the documented pre-
-            // D26.1 legacy path; material_system.cpp's own bindInstance()
-            // header comment names this sample as the real caller that
-            // drives its own buffer here instead -- see MaterialGpuBinding's
-            // own header comment).
+            // [D26.1] The real per-scene draw-data buffer -- NEVER
+            // MaterialSystem::bindInstance()'s own default identity row
+            // (that method is the documented pre-D26.1 legacy path;
+            // material_system.cpp's own bindInstance() header comment
+            // names this sample as the real caller that drives its own
+            // buffer here instead -- see MaterialGpuBinding's own header
+            // comment). [Phase 5 Task 4/#40] No `exposure` field here
+            // anymore -- pre-exposure is already baked into this row's own
+            // lightColor/ambientColor by updateDrawDataPerPassFields()
+            // (see that function's own comment).
             rx::material::MaterialGlobalsPush push;
             push.defaultSamplerIndex = app.defaultSamplerHandle.index();
             // [Phase 4 exit fix wave, I1] `app.currentFrameSlot`-th buffer.
             push.drawDataBufferIndex = app.drawDataBufferHandles[app.currentFrameSlot].index();
-            push.exposure = app.exposure;
             vkCmdPushConstants(cmd, layout, material.pushStages, material.pushOffset, material.pushSize, &push);
 
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, /*firstSet=*/1, 1,
@@ -1732,6 +1785,20 @@ bool isLavapipeDevice(VkPhysicalDevice physicalDevice) {
     return std::string_view(props.deviceName).find("llvmpipe") != std::string_view::npos;
 }
 
+// [Phase 5 Task 4/#40] Applies `args.exposure` to `app.exposureCamera` --
+// see Args::exposure's own comment for why 0.0F (the flag's default,
+// "not passed" and "passed as literal 0.0" both) is a SENTINEL meaning
+// "leave exposureCamera at its own default-constructed neutral state",
+// not "call setExposure(0.0F)" (which would resolve to a non-neutral
+// ~0.833 multiplier and break this sample's own D17 byte-identical
+// regression default). Shared by both entry points (runHeadless/
+// runPresent below) so the sentinel logic lives in exactly one place.
+void applyExposureArg(App& app, const Args& args) {
+    if (args.exposure != 0.0F) {
+        app.exposureCamera.setExposure(args.exposure);
+    }
+}
+
 // --- Headless mode --------------------------------------------------------
 // Imports the default (or --scene) glTF asset ASYNCHRONOUSLY, captures a
 // loading-state frame (before the import can possibly have completed) and a
@@ -1766,7 +1833,7 @@ int runHeadless(const Args& args) {
     if (app == nullptr) {
         return 1;
     }
-    app->exposure = args.exposure;
+    applyExposureArg(*app, args);
 
     const std::filesystem::path scenePath =
         args.scenePath.empty() ? resolveDefaultScenePath() : std::filesystem::path(args.scenePath);
@@ -2144,7 +2211,7 @@ int runPresent(const Args& args) {
     if (app == nullptr) {
         return 1;
     }
-    app->exposure = args.exposure;
+    applyExposureArg(*app, args);
 
     // --vsync off, applied before any per-swapchain-image resource is built
     // -- same ordering samples/05_multipass/06_materials/07_stress already

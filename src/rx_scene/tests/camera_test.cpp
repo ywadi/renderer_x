@@ -199,6 +199,131 @@ TEST_CASE("Camera::jitter is threaded through proj()'s translation terms and is 
     CHECK(cam.cullingProj() == unjitteredCam.cullingProj());
 }
 
+// --- Exposure [Phase 5 Task 4/#40; gate ruling rulings-2026-08-20.md T4,
+// matrix-p5t04-camera-exposure.md] --------------------------------------
+
+TEST_CASE(
+    "rx::scene::exposure::ev100()/exposure() match Filament's ported Exposure.cpp formulas at 5 aperture/shutter/ISO "
+    "triples [google/filament v1.75.0, commit 0e58877]") {
+    // Expected values independently computed (python3, double precision)
+    // straight from Filament's own formulas
+    // (ev100 = log2((N^2/t)*(100/S)), exposure = 1/(1.2*(N^2/t)*(100/S))),
+    // not derived from this file's own port -- see this TEST_CASE's own
+    // report for the derivation. Spans bright daylight (Filament's own
+    // Camera.h defaults) through a bright-sun narrow-aperture case.
+    struct Case {
+        const char* name;
+        float aperture;
+        float shutterSpeed;
+        float sensitivity;
+        float expectedEv100;
+        float expectedExposure;
+    };
+    const Case cases[] = {
+        {"daylight (Filament Camera.h default)", 16.0F, 1.0F / 125.0F, 100.0F, 14.965784F, 2.604166667e-05F},
+        {"low light", 1.4F, 1.0F / 15.0F, 3200.0F, -0.122256F, 0.9070294785F},
+        {"overcast", 8.0F, 1.0F / 250.0F, 400.0F, 11.965784F, 0.0002083333333F},
+        {"indoor", 2.8F, 1.0F / 60.0F, 800.0F, 5.877744F, 0.0141723356F},
+        {"bright sun, narrow aperture", 22.0F, 1.0F / 1000.0F, 400.0F, 16.884648F, 6.887052342e-06F},
+    };
+    for (const Case& c : cases) {
+        CAPTURE(c.name);
+        const float ev100 = rx::scene::exposure::ev100(c.aperture, c.shutterSpeed, c.sensitivity);
+        CHECK(ev100 == doctest::Approx(c.expectedEv100).epsilon(0.0001));
+        // Merged 3-argument form.
+        const float exposureMerged = rx::scene::exposure::exposure(c.aperture, c.shutterSpeed, c.sensitivity);
+        CHECK(exposureMerged == doctest::Approx(c.expectedExposure).epsilon(0.0001));
+        // 1-argument EV100 overload -- mathematically identical (Filament's
+        // own doc comment on the merged form makes this claim explicitly;
+        // asserted here, not just assumed).
+        const float exposureFromEv100 = rx::scene::exposure::exposure(ev100);
+        CHECK(exposureFromEv100 == doctest::Approx(c.expectedExposure).epsilon(0.0001));
+    }
+}
+
+TEST_CASE("Camera exposure: photographic-triple defaults match Filament's own Camera.h defaults verbatim "
+          "[details/Camera.h:211-213, v1.75.0]") {
+    rx::scene::Camera cam;
+    CHECK(cam.aperture == doctest::Approx(16.0F));
+    CHECK(cam.shutterSpeed == doctest::Approx(1.0F / 125.0F));
+    CHECK(cam.sensitivity == doctest::Approx(100.0F));
+    // Confirms these really are a real, non-degenerate daylight exposure
+    // (~14.97 EV100) -- NOT what exposure() itself resolves to by default,
+    // see the next TEST_CASE.
+    CHECK(cam.ev100() == doctest::Approx(14.965784F).epsilon(0.0001));
+}
+
+TEST_CASE("Camera exposure: default-constructed Camera resolves to a neutral (1.0) multiplier despite its "
+          "non-neutral photographic defaults [matrix-p5t04 row 4, Conflicts row 2 -- the D17 byte-identical "
+          "regression-guard default]") {
+    rx::scene::Camera cam;
+    CHECK(cam.exposure() == doctest::Approx(1.0F));
+    // ev100() still reflects the real triple, unaffected by the override.
+    CHECK(cam.ev100() == doctest::Approx(14.965784F).epsilon(0.0001));
+    // NOT what a literal `exposure::exposure(cam.ev100())` would give --
+    // proves the override, not a coincidence of the triple's own math,
+    // is what makes exposure() read 1.0.
+    CHECK(rx::scene::exposure::exposure(cam.ev100()) != doctest::Approx(1.0F));
+}
+
+TEST_CASE("Camera::setExposure(triple) clamps to Filament's exact ranges [details/Camera.cpp:45-50, v1.75.0] and "
+          "clears any direct override") {
+    rx::scene::Camera cam;
+    cam.setExposure(/*ev100Override=*/3.0F);
+    REQUIRE(cam.exposure() == doctest::Approx(rx::scene::exposure::exposure(3.0F)));
+
+    // Out-of-range triple -- every component clamped independently.
+    cam.setExposure(/*aperture=*/0.01F, /*shutterSpeed=*/1000.0F, /*sensitivity=*/1'000'000.0F);
+    CHECK(cam.aperture == doctest::Approx(0.5F));       // clamped up to MIN_APERTURE.
+    CHECK(cam.shutterSpeed == doctest::Approx(60.0F));  // clamped down to MAX_SHUTTER_SPEED.
+    CHECK(cam.sensitivity == doctest::Approx(204800.0F));  // clamped down to MAX_SENSITIVITY.
+
+    // The prior ev100Override is gone -- exposure() now derives from the
+    // (clamped) triple, not the stale override value.
+    const float expected = rx::scene::exposure::exposure(cam.aperture, cam.shutterSpeed, cam.sensitivity);
+    CHECK(cam.exposure() == doctest::Approx(expected));
+    CHECK(cam.exposure() != doctest::Approx(rx::scene::exposure::exposure(3.0F)));
+
+    // In-range triple: passes through unclamped.
+    cam.setExposure(/*aperture=*/4.0F, /*shutterSpeed=*/1.0F / 200.0F, /*sensitivity=*/400.0F);
+    CHECK(cam.aperture == doctest::Approx(4.0F));
+    CHECK(cam.shutterSpeed == doctest::Approx(1.0F / 200.0F));
+    CHECK(cam.sensitivity == doctest::Approx(400.0F));
+}
+
+TEST_CASE("Camera::setExposure(ev100Override) bypasses the photographic triple entirely, independent of "
+          "aperture/shutterSpeed/sensitivity") {
+    rx::scene::Camera cam;
+    cam.aperture = 4.0F;
+    cam.shutterSpeed = 1.0F / 200.0F;
+    cam.sensitivity = 400.0F;
+    const float triplePreOverride = cam.exposure();  // exposure::exposure(ev100()) -- no override engaged yet.
+
+    cam.setExposure(/*ev100Override=*/5.0F);
+    CHECK(cam.exposure() == doctest::Approx(rx::scene::exposure::exposure(5.0F)));
+    // The triple is untouched by the direct override.
+    CHECK(cam.aperture == doctest::Approx(4.0F));
+    CHECK(cam.shutterSpeed == doctest::Approx(1.0F / 200.0F));
+    CHECK(cam.sensitivity == doctest::Approx(400.0F));
+    // ev100() still reflects the triple, not the override value (5.0).
+    CHECK(cam.ev100() == doctest::Approx(rx::scene::exposure::ev100(4.0F, 1.0F / 200.0F, 400.0F)));
+    CHECK(cam.exposure() != doctest::Approx(triplePreOverride));
+}
+
+TEST_CASE("Camera::clearExposureOverride() restores the same neutral 1.0 default a freshly-constructed Camera has") {
+    rx::scene::Camera cam;
+    cam.setExposure(/*ev100Override=*/8.0F);
+    REQUIRE(cam.exposure() != doctest::Approx(1.0F));
+
+    cam.clearExposureOverride();
+    CHECK(cam.exposure() == doctest::Approx(1.0F));
+
+    // Symmetric with a triple-setting override-clear: after clamping to an
+    // in-range daylight-ish triple, exposure() derives from IT, not 1.0.
+    cam.setExposure(16.0F, 1.0F / 125.0F, 100.0F);
+    CHECK(cam.exposure() == doctest::Approx(2.604166667e-05F).epsilon(0.0001));
+}
+
 TEST_CASE("Camera::view() places the camera at its own local origin looking down its own forward axis") {
     rx::scene::Camera cam;
     cam.position = glm::vec3(3.0F, 4.0F, 5.0F);

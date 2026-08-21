@@ -317,14 +317,8 @@ public float rx_sampleShadowPCF(uint shadowMapTextureIndex, uint shadowCompareSa
 }
 
 // [Phase 4 Task 16] Gained `drawDataBufferIndex` (the D26.1 bindless
-// STORAGE BUFFER index -- see RxDrawData/gDrawData above) and `exposure`
-// (the sample 08 `--exposure` CLI flag's pre-tonemap `2^exposure`
-// multiplier, applied in forward_entry.slang's fragmentMain immediately
-// after a material's own evaluate() returns -- BEFORE the value ever
-// reaches the separate, UNTOUCHED shared tonemap pass; exposure=0.0 is the
-// neutral value, `2^0 == 1`, a byte-identical no-op regression guard for
-// every sample that does not care about exposure). Kept ALL-SCALAR
-// (uint/float only, no vector/matrix field) deliberately -- see
+// STORAGE BUFFER index -- see RxDrawData/gDrawData above). Kept ALL-SCALAR
+// (uint-only, no vector/matrix field) deliberately -- see
 // shaders/multipass/lit.vert.slang's own header comment for the
 // empirically-verified reason this project avoids vector/matrix fields
 // inside a push-constant block; every genuinely vector-shaped per-pass
@@ -332,16 +326,26 @@ public float rx_sampleShadowPCF(uint shadowMapTextureIndex, uint shadowCompareSa
 // reached indirectly via `drawDataBufferIndex`. Field layout mirrors
 // `rx::material::MaterialGlobalsPush` (draw_data.h) EXACTLY.
 //
-// `public` is now load-bearing here too (grew from module-internal under
-// the pre-Task-16 design): forward_entry.slang's vertexMain/fragmentMain
-// both read `gMaterialGlobals` BY NAME directly now (`drawDataBufferIndex`,
-// `exposure`), not just indirectly through this module's own
-// rx_sampleTexture() -- same access-control rule as RxDrawData/gDrawData
-// above.
+// [Phase 5 Task 4/#40, gate ruling rulings-2026-08-20.md T4] LOST
+// `exposure`: the Phase-4 `--exposure` CLI knob's pre-tonemap `2^exposure`
+// post-multiply on the ALREADY-SHADED final color (this struct's own
+// former field, applied in forward_entry.slang's fragmentMain) is
+// SUPERSEDED, not relocated -- Filament-style PRE-EXPOSURE now multiplies
+// light/IBL intensities BEFORE the lighting equation runs, at each
+// producer's own RxDrawData `lightColor`/`ambientColor` source (CPU-side,
+// via `rx::scene::Camera::exposure()` -- see camera.h), never as a
+// push-constant scalar read inside this shared entry point. See
+// forward_entry.slang's own fragmentMain for the deleted post-multiply
+// site.
+//
+// `public` is load-bearing here (grew from module-internal under the
+// pre-Task-16 design): forward_entry.slang's vertexMain/fragmentMain both
+// read `gMaterialGlobals` BY NAME directly (`drawDataBufferIndex`), not
+// just indirectly through this module's own rx_sampleTexture() -- same
+// access-control rule as RxDrawData/gDrawData above.
 public struct RxMaterialGlobals {
     public uint defaultSamplerIndex;
     public uint drawDataBufferIndex;
-    public float exposure;
 }
 
 [[vk::push_constant]]

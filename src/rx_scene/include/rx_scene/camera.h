@@ -38,13 +38,29 @@
 // cullingFrustumPlanes(); proj()/viewProj() remain what the render pass
 // itself binds.
 //
-// EXPOSURE: deliberately absent from this type. D22 places the manual
-// exposure parameter on the tonemap pass, not Camera (gate ruling: "stays
-// on the tonemap for Phase 4 -- D22 stands; a Camera exposure API becomes
-// meaningful with physical light units/IBL -- registry, techniques
-// phase"), even though Filament itself owns exposure on Camera -- see the
-// matrix's Conflict #2 for the full precedent-vs-spec discussion this
-// ruling resolves.
+// EXPOSURE [Phase 5 Task 4/#40, superseding D22 wholesale -- gate ruling
+// rulings-2026-08-20.md's T4 section: "Filament-style PRE-EXPOSURE
+// adopted... physical-units exposure API per the matrix's shape"; matrix
+// .superpowers/sdd/2026-08-20-phase5-techniques/gate/matrix-p5t04-camera-
+// exposure.md]: Camera now owns a Filament-precedented photographic
+// aperture/shutterSpeed/sensitivity triple, an EV100/exposure() pair
+// ported byte-for-byte from Filament's own `Exposure.cpp` (google/filament
+// v1.75.0, commit 0e58877c09afb1aacd09ff640f74d2adcd2a7e80, Apache-2.0 --
+// the `rx::scene::exposure` namespace below), and a direct EV100 override
+// (`setExposure(float)`, no literal Filament Camera-level precedent -- see
+// that overload's own comment). PRE-EXPOSURE, not a post-multiply on the
+// final shaded color: `exposure()` is the multiplier every light/IBL-
+// intensity producer this ruling binds (techniques-phase Stage 1 IBL,
+// Stage 2 physical lights) applies to its OWN values before the lighting
+// equation runs -- mirroring Filament's `View.cpp` (`prepareAmbientLight`/
+// `prepareDirectionalLight`, both fed a single per-frame `exposure` value
+// computed from `cameraInfo.ev100`), which this repo's own half-float HDR
+// scene-color choice (T3/#39, B10G11R11) shares the identical
+// precision-range motivation for. See exposureOverride's own comment for
+// why a freshly-constructed Camera's exposure() is a neutral 1.0 despite
+// its photographic triple defaulting to a real (non-neutral) daylight
+// exposure -- the load-bearing byte-identical regression guard for every
+// pre-Task-4 consumer.
 //
 // JITTER [preserve-later, TAA]: `jitter` is threaded through proj()'s
 // translation terms (see proj()'s own comment) but is `{0,0}` (inert) in
@@ -60,8 +76,44 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 
 namespace rx::scene {
+
+// Ported byte-for-byte from Filament's `namespace filament::Exposure`'s
+// free `ev100`/`exposure` overloads [google/filament v1.75.0,
+// filament/src/Exposure.cpp, commit 0e58877c09afb1aacd09ff640f74d2adcd2a7e80,
+// Apache-2.0 -- fetched and diffed against this exact tag/commit while
+// writing this file, not paraphrased from docs]. Pure functions (this
+// codebase's own established test pattern -- see e.g. this header's own
+// extractFrustumPlanes()) so camera_test.cpp can assert them directly
+// against hand-derived reference values, independent of Camera's own
+// exposureOverride mechanism (Camera::ev100()/exposure() below are thin
+// wrappers over these).
+namespace exposure {
+
+// EV100 from a photographic aperture (f-stop, N)/shutterSpeed (seconds,
+// t)/sensitivity (ISO, S) triple: `log2((N^2/t) * (100/S))` [Exposure.cpp
+// `ev100(float, float, float)`].
+[[nodiscard]] float ev100(float aperture, float shutterSpeed, float sensitivity);
+
+// The pre-exposure multiplier from the SAME triple -- Filament's own
+// merged, single-pow-call form (`1 / (1.2 * (N^2/t) * (100/S))`,
+// mathematically identical to `exposure(ev100(aperture, shutterSpeed,
+// sensitivity))` but without a redundant log2/pow round-trip) [Exposure.cpp
+// `exposure(float, float, float)`]. The `1.2f` constant is exact, not a
+// tunable: derived from the saturation-based-sensitivity method
+// (`S_sat = 78/H_sat`, lens/vignetting attenuation `q = 0.65`,
+// `78/(100*0.65) = 1.2`) -- Exposure.cpp's own `exposure(float ev100)`
+// doc comment carries the full derivation.
+[[nodiscard]] float exposure(float aperture, float shutterSpeed, float sensitivity);
+
+// The pre-exposure multiplier from an ALREADY-KNOWN EV100 value:
+// `1 / (1.2 * 2^ev100)` [Exposure.cpp `exposure(float ev100)`] -- the
+// formula Camera::setExposure(float)'s direct override below uses.
+[[nodiscard]] float exposure(float ev100);
+
+}  // namespace exposure
 
 // Six frustum planes, Filament's own `Frustum::getNormalizedPlane(s)`
 // ordering (Frustum.h:78-89: "left, right, bottom, top, far, near") --
@@ -140,6 +192,84 @@ struct Camera {
     // convention (matrix-issue07's own "all-ones defaults CONFIRMED as
     // deliberate" ruling).
     uint32_t cullMask = ~0u;
+
+    // --- Exposure [Phase 5 Task 4/#40; see this header's own top comment
+    // for the full ruling/citation] --------------------------------------
+
+    // Photographic exposure triple -- Filament's OWN real-camera defaults,
+    // verbatim [details/Camera.h:211-213, v1.75.0]: aperture is an f-stop
+    // (f/N), shutterSpeed is in seconds, sensitivity is ISO (100-relative).
+    // A freshly-constructed Camera therefore has a sane, non-degenerate
+    // real f/16-1/125s-ISO100 daylight exposure on hand (ev100() ~= 14.97)
+    // if a caller reads it -- but see exposureOverride below for why
+    // exposure() itself does NOT default to what this triple resolves to.
+    float aperture = 16.0F;
+    float shutterSpeed = 1.0F / 125.0F;
+    float sensitivity = 100.0F;
+
+    // Direct pre-exposure-multiplier override [RendererX addition -- no
+    // literal Filament Camera-level precedent: only Filament's free
+    // `Exposure::exposure(float ev100)` overload exists for "EV100 already
+    // known", never wired onto FCamera itself; matrix-p5t04's row 6].
+    // When engaged (`has_value()`), exposure() returns
+    // `exposure::exposure(*exposureOverride)` verbatim, bypassing
+    // aperture/shutterSpeed/sensitivity entirely; ev100() is UNAFFECTED
+    // either way (it always reflects the photographic triple above -- an
+    // override changes what multiplies onto light/IBL intensities, not
+    // what EV100 the triple represents).
+    //
+    // DEFAULTS ENGAGED, AT EXACTLY 1.0 -- the neutral, byte-identical-to-
+    // Phase-4 multiplier (matrix-p5t04 row 4's "Camera's default-
+    // constructed exposure state must resolve to a multiplier of exactly
+    // 1.0"), a DELIBERATELY different value from what the photographic
+    // triple's own Filament defaults resolve to (~2.6e-5, a real daylight
+    // exposure -- matrix Conflicts row 2: naively deriving the default
+    // from Filament's real-camera triple would silently break every
+    // pre-Task-4 consumer's byte-identical output). setExposure(aperture,
+    // shutterSpeed, sensitivity) clears this override (falls back to the
+    // triple); setExposure(ev100Override) re-engages it at a new, explicit
+    // value; clearExposureOverride() re-engages it back to this same
+    // neutral 1.0.
+    std::optional<float> exposureOverride = 1.0F;
+
+    // EV100 of the CURRENT photographic triple -- exposure::ev100() above,
+    // applied to this Camera's own aperture/shutterSpeed/sensitivity.
+    // Unaffected by exposureOverride (see that field's own comment).
+    [[nodiscard]] float ev100() const;
+
+    // The pre-exposure multiplier [Filament-style pre-exposure, gate
+    // ruling rulings-2026-08-20.md's T4 section] every light/IBL-intensity
+    // producer this ruling binds is required to multiply onto its OWN
+    // values before the lighting equation runs (NOT a post-multiply on
+    // the final shaded color -- see this header's own top comment).
+    // `*exposureOverride` if engaged, else `exposure::exposure(ev100())`.
+    [[nodiscard]] float exposure() const;
+
+    // Sets the photographic triple and clears any direct override --
+    // Filament `FCamera::setExposure(float, float, float)`, INCLUDING its
+    // exact clamp ranges [details/Camera.cpp:45-50,258-260, v1.75.0]:
+    // aperture clamped to [0.5, 64], shutterSpeed to [1/25000, 60]
+    // (seconds), sensitivity to [10, 204800] (ISO). Unlike Filament's
+    // FCamera (private fields, setter-only mutation), this type's fields
+    // stay PLAIN AND PUBLIC like every other Camera field above (nearPlane,
+    // aspectRatio, ...) -- a caller writing `camera.aperture` directly
+    // bypasses this clamp, matching this type's existing "no invariant
+    // enforcement on direct field writes" convention; only this named
+    // setter clamps.
+    void setExposure(float apertureIn, float shutterSpeedIn, float sensitivityIn);
+
+    // Direct EV100 override -- bypasses the photographic triple entirely
+    // (see exposureOverride's own comment above for why this has no
+    // literal Filament Camera-level precedent). exposure() returns
+    // `exposure::exposure(ev100Override)` verbatim from this call until
+    // clearExposureOverride() or the triple-setting overload above runs.
+    void setExposure(float ev100Override);
+
+    // Re-engages the neutral (1.0) override -- equivalent to a freshly-
+    // constructed Camera's own exposure() state, discarding any
+    // setExposure(ev100Override) call or a prior setExposure(triple)
+    // call's override-clearing effect.
+    void clearExposureOverride();
 
     [[nodiscard]] glm::vec3 forward() const { return orientation * glm::vec3(0.0F, 0.0F, -1.0F); }
     [[nodiscard]] glm::vec3 up() const { return orientation * glm::vec3(0.0F, 1.0F, 0.0F); }

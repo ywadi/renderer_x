@@ -737,7 +737,6 @@ std::optional<RenderResult> renderWithBias(Fixture& fixture, SceneRig& rig, floa
         rx::material::MaterialGlobalsPush push;
         push.defaultSamplerIndex = rig.samplerIndex;
         push.drawDataBufferIndex = rig.drawDataHandle.index();
-        push.exposure = 0.0F;
         vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 
         paramBuffer = fixture.allocator.createHostVisibleBuffer(rig.paramBlob.size(), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,

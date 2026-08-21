@@ -1997,6 +1997,16 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
 
     const glm::mat4 viewProjTransposed = glm::transpose(app.flyCamera.camera.viewProj());
     const glm::vec3 cameraPos = app.flyCamera.camera.position;
+    // [Phase 5 Task 4/#40, gate ruling rulings-2026-08-20.md T4] PRE-EXPOSURE
+    // -- this sample's own FlyCamera already owns a real rx::scene::Camera
+    // (fly_camera.h); this sample has no `--exposure` CLI control of its
+    // own (unlike sample 08), so `exposure()` is always the default
+    // neutral 1.0 today -- wired in anyway so this sample stays
+    // coherently migrated with sample 08's own convention (no
+    // half-migrated consumer of RxDrawData's lightColor/ambientColor
+    // fields) and so a future exposure control on THIS sample needs no
+    // further plumbing here.
+    const float preExposure = app.flyCamera.camera.exposure();
     const uint8_t lightChannels = app.hud.lightChannelHighlightOn ? 0xFFu : static_cast<uint8_t>(0xFFu & ~kHighlightChannelBit);
     if (app.scene->isLightAlive(app.lightHandle)) {
         app.scene->setLightChannels(app.lightHandle, lightChannels);
@@ -2013,8 +2023,8 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
         row.normalMatrix = glm::transpose(glm::mat4(normalMat3));
         row.viewProj = viewProjTransposed;
         row.lightDirWorld = glm::vec4(-glm::normalize(app.lightDirWorld), 0.0F);
-        row.lightColor = glm::vec4(5.0F, 5.0F, 5.0F, 0.0F);
-        row.ambientColor = glm::vec4(0.12F, 0.12F, 0.12F, 0.0F);
+        row.lightColor = glm::vec4(5.0F, 5.0F, 5.0F, 0.0F) * preExposure;
+        row.ambientColor = glm::vec4(0.12F, 0.12F, 0.12F, 0.0F) * preExposure;
         row.cameraPosWorld = glm::vec4(cameraPos, 0.0F);
         row.materialIndex = payload.materialIndex;
         // [Phase 4 exit fix wave, C1] Also requires `app.shadowMapHandle.
@@ -2255,9 +2265,12 @@ void recordForwardChunk(rx::graph::PassContext& ctx, App& app, uint32_t chunkInd
             const MaterialGpuBinding* mb = app.resolveMaterialIndexToBinding(materialIndex);
             if (mb != nullptr) {
                 // [Phase 4 exit fix wave, I1] `app.currentFrameSlot`-th
-                // buffer -- see that field's own comment.
+                // buffer -- see that field's own comment. [Phase 5 Task
+                // 4/#40] No third (`exposure`) field anymore -- pre-
+                // exposure is baked into this buffer's own rows by
+                // updateSceneFrame() (see that function's own comment).
                 rx::material::MaterialGlobalsPush push{app.defaultSamplerHandle.index(),
-                                                         app.drawDataBufferHandles[app.currentFrameSlot].index(), 0.0F};
+                                                         app.drawDataBufferHandles[app.currentFrameSlot].index()};
                 vkCmdPushConstants(cmd, anyLayout, mb->pushStages, mb->pushOffset, mb->pushSize, &push);
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, anyLayout, /*firstSet=*/1, 1, &mb->paramSet, 0,
                                          nullptr);

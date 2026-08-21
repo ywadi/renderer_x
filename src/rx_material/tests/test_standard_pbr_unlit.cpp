@@ -29,6 +29,7 @@
 #include <rx_rhi_vk/command.h>
 #include <rx_rhi_vk/context.h>
 #include <rx_rhi_vk/device.h>
+#include <rx_scene/camera.h>
 
 #include <rx_graph/executor.h>
 #include <rx_graph/render_graph.h>
@@ -310,7 +311,6 @@ struct DrawRequest {
     size_t paramBlobSize = 0;
     uint32_t pushSize = 0;  // record->layoutInfo.pushRanges[0].size, reflected (always sizeof(MaterialGlobalsPush) today).
     uint32_t drawDataRow = 0;
-    float exposure = 0.0F;
 };
 
 // Renders every entry in `draws` (in order -- later draws composite OVER
@@ -416,7 +416,6 @@ std::vector<uint8_t> renderQuadPixels(rx::rhi::Device& device, rx::rhi::Allocato
             rx::material::MaterialGlobalsPush push;
             push.defaultSamplerIndex = defaultSamplerBindlessIndex;
             push.drawDataBufferIndex = drawDataBufferHandle.index();
-            push.exposure = draw.exposure;
             REQUIRE(draw.pushSize == sizeof(push));
             vkCmdPushConstants(cmd, draw.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                 draw.pushSize, &push);
@@ -767,9 +766,9 @@ TEST_CASE("D26.1: two draws in one command buffer, the second at firstInstance>0
 
     std::vector<DrawRequest> draws;
     draws.push_back(DrawRequest{pipeline, system->pipelineLayout(unlit), realParamLayout, redBlob.data(),
-                                 redBlob.size(), pushSize, /*drawDataRow=*/0, 0.0F});
+                                 redBlob.size(), pushSize, /*drawDataRow=*/0});
     draws.push_back(DrawRequest{pipeline, system->pipelineLayout(unlit), realParamLayout, greenBlob.data(),
-                                 greenBlob.size(), pushSize, /*drawDataRow=*/1, 0.0F});
+                                 greenBlob.size(), pushSize, /*drawDataRow=*/1});
 
     // [Fix round, item 1] A 48x48 target (vs. the 8x8 every single-quad
     // test uses) and the widened orthoHalfExtent=3.0 frustum above give
@@ -986,7 +985,7 @@ rx::graph::PassSignature makeQuadPassSignature() {
 
 // Convenience for the common "one material, one draw, one row" case.
 Rgba8 renderOne(StandardPbrRig& rig, rx::material::MaterialHandle handle, const std::vector<uint8_t>& blob,
-                 rx::material::DrawDataGpu row = makeHeadOnRow(), float exposure = 0.0F) {
+                 rx::material::DrawDataGpu row = makeHeadOnRow()) {
     VkPipeline pipeline = rig.system->getPipeline({handle, makeQuadPassSignature(), 0});
     REQUIRE(pipeline != VK_NULL_HANDLE);
     std::vector<rx::material::DrawDataGpu> rows{row};
@@ -995,7 +994,7 @@ Rgba8 renderOne(StandardPbrRig& rig, rx::material::MaterialHandle handle, const 
 
     uint32_t pushSize = rig.system->layoutInfo(handle).pushRanges[0].size;
     std::vector<DrawRequest> draws{DrawRequest{pipeline, rig.system->pipelineLayout(handle), rig.paramSetLayout,
-                                                blob.data(), blob.size(), pushSize, /*drawDataRow=*/0, exposure}};
+                                                blob.data(), blob.size(), pushSize, /*drawDataRow=*/0}};
     return renderQuad(rig.fixture->device, rig.fixture->allocator, rig.fixture->bindless, drawDataBuffer->handle,
                        rig.defaultSamplerIndex, rig.mesh, draws);
 }
@@ -1511,9 +1510,9 @@ TEST_CASE("StandardPBR: alphaMode=MASK discards below cutoff, renders opaque abo
 
     std::vector<DrawRequest> draws{
         DrawRequest{backgroundPipeline, rig->system->pipelineLayout(backgroundHandle), rig->paramSetLayout,
-                    backgroundBlob.data(), backgroundBlob.size(), backgroundPush, /*drawDataRow=*/0, 0.0F},
+                    backgroundBlob.data(), backgroundBlob.size(), backgroundPush, /*drawDataRow=*/0},
         DrawRequest{maskPipeline, rig->system->pipelineLayout(handle), rig->paramSetLayout, belowBlob.data(),
-                    belowBlob.size(), maskPush, /*drawDataRow=*/1, 0.0F},
+                    belowBlob.size(), maskPush, /*drawDataRow=*/1},
     };
     Rgba8 belowResult = renderQuad(rig->fixture->device, rig->fixture->allocator, rig->fixture->bindless,
                                     drawDataBuffer->handle, rig->defaultSamplerIndex, rig->mesh, draws);
@@ -1533,9 +1532,9 @@ TEST_CASE("StandardPBR: alphaMode=MASK discards below cutoff, renders opaque abo
 
     std::vector<DrawRequest> aboveDraws{
         DrawRequest{backgroundPipeline, rig->system->pipelineLayout(backgroundHandle), rig->paramSetLayout,
-                    backgroundBlob.data(), backgroundBlob.size(), backgroundPush, /*drawDataRow=*/0, 0.0F},
+                    backgroundBlob.data(), backgroundBlob.size(), backgroundPush, /*drawDataRow=*/0},
         DrawRequest{maskPipeline, rig->system->pipelineLayout(handle), rig->paramSetLayout, aboveBlob.data(),
-                    aboveBlob.size(), maskPush, /*drawDataRow=*/1, 0.0F},
+                    aboveBlob.size(), maskPush, /*drawDataRow=*/1},
     };
     Rgba8 aboveResult = renderQuad(rig->fixture->device, rig->fixture->allocator, rig->fixture->bindless,
                                     drawDataBuffer->handle, rig->defaultSamplerIndex, rig->mesh, aboveDraws);
@@ -1613,9 +1612,9 @@ TEST_CASE("D28: alphaMode=BLEND composites over an opaque background and does no
 
     std::vector<DrawRequest> draws{
         DrawRequest{backgroundPipeline, rig->system->pipelineLayout(opaqueHandle), rig->paramSetLayout,
-                    backgroundBlob.data(), backgroundBlob.size(), backgroundPush, /*drawDataRow=*/0, 0.0F},
+                    backgroundBlob.data(), backgroundBlob.size(), backgroundPush, /*drawDataRow=*/0},
         DrawRequest{blendPipeline, rig->system->pipelineLayout(handle), rig->paramSetLayout, blendBlob.data(),
-                    blendBlob.size(), blendPush, /*drawDataRow=*/1, 0.0F},
+                    blendBlob.size(), blendPush, /*drawDataRow=*/1},
     };
     Rgba8 result = renderQuad(rig->fixture->device, rig->fixture->allocator, rig->fixture->bindless,
                                drawDataBuffer->handle, rig->defaultSamplerIndex, rig->mesh, draws);
@@ -1647,7 +1646,7 @@ TEST_CASE("D28: alphaMode=BLEND composites over an opaque background and does no
     std::vector<DrawRequest> withThird = draws;
     withThird.push_back(DrawRequest{backgroundPipeline, rig->system->pipelineLayout(opaqueHandle),
                                       rig->paramSetLayout, thirdBlob.data(), thirdBlob.size(), backgroundPush,
-                                      /*drawDataRow=*/2, 0.0F});
+                                      /*drawDataRow=*/2});
     Rgba8 thirdResult = renderQuad(rig->fixture->device, rig->fixture->allocator, rig->fixture->bindless,
                                     drawDataBuffer->handle, rig->defaultSamplerIndex, rig->mesh, withThird);
     CHECK(thirdResult.r > 200);
@@ -1922,9 +1921,22 @@ TEST_CASE("StandardPBR per-slot sampler wiring: baseColorSampler/emissiveSampler
     CHECK_FALSE(rig->fixture->context.hasValidationErrors());
 }
 
-TEST_CASE("--exposure: 2^exposure pre-tonemap multiply -- exposure=0 is a byte-identical no-op; exposure=1 "
-          "measurably brightens the same draw") {
-    auto rig = makeStandardPbrRig("standard_pbr_exposure");
+TEST_CASE("Camera pre-exposure: rx::scene::Camera::exposure() pre-multiplies the ambient term's own RxDrawData "
+          "source exactly [Phase 5 Task 4/#40, gate ruling rulings-2026-08-20.md T4 -- PRE-EXPOSURE, not a "
+          "post-tonemap multiply]") {
+    // [Phase 5 Task 4/#40] Supersedes the old "--exposure: 2^exposure
+    // pre-tonemap multiply" test: MaterialGlobalsPush no longer carries an
+    // `exposure` field at all (material.slang's own `RxMaterialGlobals`
+    // header comment), and forward_entry.slang's fragmentMain no longer
+    // post-multiplies the shaded color -- exposure is now baked into
+    // RxDrawData's own `lightColor`/`ambientColor` fields BEFORE upload,
+    // by whichever CPU-side code produces a draw-data row (samples/
+    // 08_gltf_viewer's own updateDrawDataPerPassFields(), for the real
+    // production case). This test simulates that same "at the source"
+    // pre-multiply directly: a real rx::scene::Camera computes
+    // exposure(), and THIS test scales ambientColor by it before
+    // building the row -- exactly what a real producer does.
+    auto rig = makeStandardPbrRig("standard_pbr_pre_exposure");
     if (!rig.has_value()) {
         return;
     }
@@ -1935,18 +1947,52 @@ TEST_CASE("--exposure: 2^exposure pre-tonemap multiply -- exposure=0 is a byte-i
     std::vector<uint8_t> blob = makeDefaultStandardPbrBlob(*rig, handle);
     setParam(blob, params, "metallicFactor", 0.0F);
     setParam(blob, params, "roughnessFactor", 1.0F);
-    setParam(blob, params, "baseColorFactor", std::array<float, 4>{0.3F, 0.3F, 0.3F, 1.0F});
+    setParam(blob, params, "baseColorFactor", std::array<float, 4>{0.5F, 0.5F, 0.5F, 1.0F});
 
-    Rgba8 neutralPixel = renderOne(*rig, handle, blob, makeHeadOnRow(), /*exposure=*/0.0F);
-    Rgba8 doubledPixel = renderOne(*rig, handle, blob, makeHeadOnRow(), /*exposure=*/1.0F);
+    // Isolate the ambient term entirely (zero direct light) so
+    // `color == ambientColor * occlusion(==1.0, default blob) *
+    // baseColor.rgb` exactly [standard_pbr.slang's own evaluate():
+    // `directLight = (diffuse+specular)*v.lightColor*NdotL` is the zero
+    // vector whenever `v.lightColor` is, regardless of NdotL/diffuse/
+    // specular; `ambient = v.ambientColor * occlusion * baseColor.rgb`] --
+    // an exact closed form to assert the pre-exposure SCALE against,
+    // rather than a loose ">" brightness inequality.
+    rx::scene::Camera neutralCamera;  // default-constructed: exposure() == 1.0 exactly [matrix row 4].
+    REQUIRE(neutralCamera.exposure() == doctest::Approx(1.0F));
 
-    // 2^0 == 1 -> byte-identical to the "no exposure field at all" case
-    // this file's own Lambertian test already computes independently
-    // (0.3/pi ~= 0.0955 -> ~24/255).
-    CHECK(near8(neutralPixel.r, 24, 6));
-    // 2^1 == 2 -> measurably brighter (not clamped to 255 at this base
-    // value, so the doubling is directly visible).
-    CHECK(doubledPixel.r > neutralPixel.r + 15);
+    rx::scene::Camera brighterCamera;
+    // exposure(ev100) == 1/(1.2*2^ev100) [Filament Exposure.cpp, ported
+    // verbatim -- camera.cpp]; at ev100=-1.0 this is exactly 1/(1.2*0.5)
+    // == 1/0.6 == 5/3, a clean, hand-checkable value.
+    brighterCamera.setExposure(/*ev100Override=*/-1.0F);
+    REQUIRE(brighterCamera.exposure() == doctest::Approx(5.0F / 3.0F).epsilon(0.0001));
+
+    auto makeRow = [](float exposureMultiplier) {
+        rx::material::DrawDataGpu row = makeHeadOnRow();
+        row.lightColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
+        row.ambientColor = glm::vec4(0.4F, 0.4F, 0.4F, 0.0F) * exposureMultiplier;
+        return row;
+    };
+
+    Rgba8 neutralPixel = renderOne(*rig, handle, blob, makeRow(neutralCamera.exposure()));
+    Rgba8 brighterPixel = renderOne(*rig, handle, blob, makeRow(brighterCamera.exposure()));
+
+    // Exact closed form: color.r == (0.4 * exposureMultiplier) * baseColor.r.
+    // Neutral: 0.4 * 1.0 * 0.5 == 0.2 -> 0.2*255 == 51.0 exactly.
+    CHECK(near8(neutralPixel.r, 51, 2));
+    // Brighter: 0.4 * (5/3) * 0.5 == 1/3 -> (1/3)*255 == 85.0 exactly.
+    CHECK(near8(brighterPixel.r, 85, 2));
+
+    // Genuinely LINEAR in the exposure multiplier (the value-asserted
+    // "EV100 input -> expected scaled radiance" end-to-end proof) -- the
+    // measured ratio matches exposure()'s own ratio, not merely "went
+    // up": a double-application bug (this exact multiplier applied
+    // twice, e.g. a stray leftover post-multiply site) would instead
+    // measure the SQUARE of this ratio, ((5/3)/1.0)^2 ~= 2.78, not 5/3
+    // ~= 1.667.
+    CHECK(static_cast<float>(brighterPixel.r) / static_cast<float>(neutralPixel.r) ==
+          doctest::Approx(brighterCamera.exposure() / neutralCamera.exposure()).epsilon(0.05));
+
     destroyRig(*rig);
     CHECK_FALSE(rig->fixture->context.hasValidationErrors());
 }

@@ -140,6 +140,14 @@ static_assert(sizeof(DrawDataGpu) == 352, "DrawDataGpu must stay exactly 352 byt
 // a StructuredBuffer gets); every genuinely vector-shaped per-pass value
 // (viewProj, light/ambient) lives in DrawDataGpu above instead, reached
 // indirectly via `drawDataBufferIndex`.
+//
+// [Phase 5 Task 4/#40, gate ruling rulings-2026-08-20.md T4] LOST its
+// former `exposure` field: Filament-style PRE-EXPOSURE moved exposure
+// application to each RxDrawData producer's own `lightColor`/
+// `ambientColor` source (multiplied there by `rx::scene::Camera::
+// exposure()`, CPU-side, before upload), not a push-constant scalar this
+// shared struct carries -- see material.slang's own `RxMaterialGlobals`
+// header comment for the full ruling.
 struct MaterialGlobalsPush {
     uint32_t defaultSamplerIndex = 0;  // bindless SAMPLER index -- material.slang's pre-D26.1 field, unchanged in
                                         // shape. [Fix round, sampler-wrap P0] StandardPbr/Unlit no longer sample
@@ -148,10 +156,9 @@ struct MaterialGlobalsPush {
                                         // rx_sampleTexture() overload's fallback; see material.slang's own header
                                         // comment.
     uint32_t drawDataBufferIndex = 0;  // bindless STORAGE BUFFER index of the DrawDataGpu[] this draw reads.
-    float exposure = 0.0F;             // pre-tonemap 2^exposure multiplier (0.0 = neutral, no-op: 2^0 == 1).
 };
-static_assert(sizeof(MaterialGlobalsPush) == 12,
-              "MaterialGlobalsPush must stay exactly 12 bytes (3 packed 4-byte scalars) -- mirrors material.slang's "
+static_assert(sizeof(MaterialGlobalsPush) == 8,
+              "MaterialGlobalsPush must stay exactly 8 bytes (2 packed 4-byte scalars) -- mirrors material.slang's "
               "RxMaterialGlobals, and bindInstance() (material_system.cpp) pushes exactly this many bytes for it");
 
 }  // namespace rx::material

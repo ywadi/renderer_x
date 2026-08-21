@@ -2,9 +2,49 @@
 
 #include <glm/gtc/matrix_transform.hpp>
 
+#include <algorithm>
 #include <cmath>
 
 namespace rx::scene {
+
+// --- Exposure [Phase 5 Task 4/#40; see camera.h's own top comment and the
+// `rx::scene::exposure` namespace's own comments for the full citation] ---
+namespace exposure {
+
+float ev100(float aperture, float shutterSpeed, float sensitivity) {
+    return std::log2((aperture * aperture) / shutterSpeed * 100.0F / sensitivity);
+}
+
+float exposure(float aperture, float shutterSpeed, float sensitivity) {
+    // Merged form -- one log2-free division chain, matching Filament's own
+    // `Exposure::exposure(float, float, float)` exactly (not composed from
+    // ev100()+exposure(float) above, which would round-trip through an
+    // extra log2/pow pair for the identical result).
+    const float e = (aperture * aperture) / shutterSpeed * 100.0F / sensitivity;
+    return 1.0F / (1.2F * e);
+}
+
+float exposure(float ev100Value) { return 1.0F / (1.2F * std::pow(2.0F, ev100Value)); }
+
+}  // namespace exposure
+
+float Camera::ev100() const { return exposure::ev100(aperture, shutterSpeed, sensitivity); }
+
+float Camera::exposure() const {
+    return exposureOverride.has_value() ? *exposureOverride : exposure::exposure(ev100());
+}
+
+void Camera::setExposure(float apertureIn, float shutterSpeedIn, float sensitivityIn) {
+    // Filament's exact clamp ranges [details/Camera.cpp:45-50, v1.75.0].
+    aperture = std::clamp(apertureIn, 0.5F, 64.0F);
+    shutterSpeed = std::clamp(shutterSpeedIn, 1.0F / 25000.0F, 60.0F);
+    sensitivity = std::clamp(sensitivityIn, 10.0F, 204800.0F);
+    exposureOverride.reset();
+}
+
+void Camera::setExposure(float ev100Override) { exposureOverride = exposure::exposure(ev100Override); }
+
+void Camera::clearExposureOverride() { exposureOverride = 1.0F; }
 
 glm::mat4 Camera::view() const {
     // inverse(T(position) * R(orientation)) = R(orientation)^-1 * T(-position)

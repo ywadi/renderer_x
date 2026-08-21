@@ -1744,14 +1744,15 @@ void MaterialSystem::bindInstance(VkCommandBuffer cmd, const rx::graph::PassCont
     // own simple test materials); a real D26.1 caller (StandardPBR/Unlit,
     // samples/08_gltf_viewer) drives its OWN real per-draw buffer and pushes
     // this same push-constant range itself, never through this method.
-    // `exposure` stays 0.0 (neutral, `2^0 == 1`) here for the identical
-    // reason -- bindInstance() callers never asked for exposure control.
+    // [Phase 5 Task 4/#40] `MaterialGlobalsPush` no longer carries an
+    // `exposure` field at all (pre-exposure moved to each RxDrawData
+    // producer's own lightColor/ambientColor source) -- this default
+    // (identity) row was never wired to `--exposure` control either way.
     if (!record->layoutInfo.pushRanges.empty()) {
         const rx::shader::ShaderLayoutInfo::PushRange& range = record->layoutInfo.pushRanges[0];
         MaterialGlobalsPush push;
         push.defaultSamplerIndex = impl.defaultSamplerHandle.index();
         push.drawDataBufferIndex = impl.defaultDrawDataBufferHandle.index();
-        push.exposure = 0.0F;
         vkCmdPushConstants(cmd, record->layoutBundle.layout, range.stages, range.offset, range.size, &push);
     }
 

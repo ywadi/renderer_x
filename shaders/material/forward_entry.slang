@@ -210,13 +210,16 @@ float4 fragmentMain(VertexStageOutput input) : SV_Target {
     MaterialImpl material;
     float4 color = material.evaluate(v);
 
-    // [Phase 4 Task 16] `--exposure` (samples/08_gltf_viewer): a pre-
-    // tonemap linear-HDR multiply, applied here (the forward material
-    // pass) rather than inside the SHARED, UNTOUCHED tonemap shaders
-    // (shaders/multipass/tonemap.frag.slang) -- see gMaterialGlobals' own
-    // header comment for why exposure=0.0 (2^0 == 1) is a byte-identical
-    // no-op regression guard. Alpha is left untouched (exposure is a
-    // radiometric HDR scale, not a coverage/blend value).
-    color.rgb *= exp2(gMaterialGlobals.exposure);
+    // [Phase 5 Task 4/#40, gate ruling rulings-2026-08-20.md T4] The
+    // Phase-4 `--exposure` post-multiply that used to sit here
+    // (`color.rgb *= exp2(gMaterialGlobals.exposure);`) is DELETED, not
+    // relocated: Filament-style PRE-EXPOSURE means exposure is already
+    // baked into `v.lightColor`/`v.ambientColor` above (pre-multiplied by
+    // `rx::scene::Camera::exposure()` at each RxDrawData producer's own
+    // CPU-side source, before this pass ever runs), so `material.evaluate()`
+    // above already returns a correctly-exposed color -- a second
+    // multiply here would double-apply exposure. See
+    // gMaterialGlobals' own header comment (material.slang) for the full
+    // ruling.
     return color;
 }
