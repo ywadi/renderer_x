@@ -102,6 +102,19 @@ add_subdirectory(src/rx_graph)
 # so it is add_subdirectory'd after all three.
 add_subdirectory(src/rx_material)
 
+# Phase 5 Stage 1 Task 9 -- rx_ibl: the compute IBL bake chain (ticket
+# #45). Depends on rx_graph (compute-class Pass API, Task 2), rx_rhi_vk
+# (ComputePipelineCache/Texture2D/StorageImage), rx_shader (Compiler/
+# reflect() -- the FULL target, not just rx_shader_layout_types, since
+# this library drives in-process Slang compilation itself, same shape as
+# rx_shadow's own dependency below), and rx_task (Executor's own
+# Scheduler parameter) -- added here, after rx_graph/rx_material, since it
+# needs the FULL rx_graph compute API Task 2 landed and has no dependency
+# on rx_material/rx_scene at all (see src/rx_ibl/include/rx_ibl/bake.h's
+# own "MODULE OWNERSHIP" comment for why this is a new, self-contained
+# library rather than folded into either).
+add_subdirectory(src/rx_ibl)
+
 # Phase 4 Stage 2 Task 22 -- rx_shadow: the scene shadow quality bridge
 # (spec D21; gate matrix-issue23-shadow-bridge.md as amended by gate/
 # rulings-2026-08-18.md's #23 + RC2/RC3). Depends on rx_rhi_vk (Device/
@@ -178,6 +191,9 @@ add_subdirectory(tools/toolchain_check)
 # Phase 4 Stage 1 Task 13: host-only fixture regenerator (assets/test/
 # cube_meshopt.*/cube_draco.*) -- see its own CMakeLists.txt comment.
 add_subdirectory(tools/gen_gltf_compression_fixtures)
+# Phase 5 Stage 1 Task 9 [#45]: standalone IBL bake-timing benchmark, NOT
+# ctest-registered -- see tools/rx_ibl_bench/main.cpp's own header comment.
+add_subdirectory(tools/rx_ibl_bench)
 add_subdirectory(samples/01_triangle)
 add_subdirectory(samples/02_hotreload)
 add_subdirectory(samples/03_bindless_mesh)

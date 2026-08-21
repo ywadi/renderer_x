@@ -672,8 +672,11 @@ jobs:
       # shells out to the HOST's own spirv-dis binary via std::system(),
       # which a cross-compiled Windows .exe running under Wine cannot
       # reliably do -- excluded as one whole binary rather than split, since
-      # 2 of its 3 files genuinely need a live GPU anyway], and every
-      # sample_*_headless gate are excluded: Wine in CI has no real Vulkan
+      # 2 of its 3 files genuinely need a live GPU anyway], rx_ibl_gpu_tests
+      # [Phase 5 Stage 1 Task 9, ticket #45 -- the compute IBL bake chain:
+      # every TEST_CASE builds a real windowed VkDevice and dispatches real
+      # compute passes through rx_graph's Executor, same GPU-backed reason],
+      # and every sample_*_headless gate are excluded: Wine in CI has no real Vulkan
       # device to hand them, and that is a real, documented environment
       # limitation -- not a silent pass. rx_core, rx_platform,
       # shader_spirv_test, AND rx_shader_tests all run for real under Wine
@@ -703,7 +706,7 @@ jobs:
       # (:77), not this one.
       - name: Test under wine (xvfb; GPU tests excluded -- no Vulkan under Wine)
         run: >-
-          ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_material_brdf_gpu|rx_debug_ui_gpu|rx_frame_loop_gpu|sample' --output-on-failure
+          ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_material_brdf_gpu|rx_debug_ui_gpu|rx_frame_loop_gpu|rx_ibl_gpu|sample' --output-on-failure
           --output-junit ${{ github.workspace }}/ctest-results-windows-cross-zig.xml
 
       - name: Build budget check
