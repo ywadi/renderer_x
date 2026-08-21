@@ -277,15 +277,44 @@ std::vector<PassBarriers> buildBarriers(const CompiledGraph& graph, PassBarriers
     // (never addStorageImageOutput()), so it is always single-mip/
     // single-layer -- every one of its accesses resolved to the same one
     // Subresource{0, 1, 0, 1} key throughout the walk above [Task 2, RC2].
+    //
+    // [Phase 5 Task 5 review round, CI runs 32463376885/32466037296]
+    // dstStage was VK_PIPELINE_STAGE_2_NONE/dstAccess VK_ACCESS_2_NONE
+    // until this round -- the textbook "nothing in THIS command buffer
+    // reads the backbuffer again, so there is nothing to chain to"
+    // pre-present pattern (also Khronos's own documented synchronization
+    // examples for exactly this transition). Real-world consequence,
+    // proven by direct comparison, not assumed: PresentLoop's own signal
+    // semaphore (present_loop.cpp, now sync2 VkSemaphoreSubmitInfo,
+    // stageMask=ALL_COMMANDS_BIT after this same round's earlier fix) has
+    // no real stage to chain FROM when the write it must cover used NONE
+    // -- SyncVal 1.3.275 flags this as SYNC-HAZARD-PRESENT-AFTER-WRITE
+    // (vkQueuePresentKHR not provably ordered-after this transition).
+    // present_loop_gpu_test.cpp's own no-RenderGraph test fixture proves
+    // the fix directly: its hand-rolled equivalent transition uses a REAL
+    // terminal stage (BOTTOM_OF_PIPE_BIT) instead of NONE and is clean
+    // under the identical 1.3.275 layer, both before and after this
+    // change -- the delta between the two paths IS this one field.
+    // VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT (not BOTTOM_OF_PIPE_BIT --
+    // sync2's own non-deprecated equivalent, matching the vocabulary
+    // present_loop.cpp's own submission already uses for the identical
+    // "give any downstream consumer a real stage to chain from" need)
+    // gives the signal semaphore's ALL_COMMANDS_BIT-stage coverage a real
+    // write to chain to. dstAccess stays VK_ACCESS_2_NONE -- presenting an
+    // image is not itself a memory-access type any VkAccessFlagBits2
+    // enumerant represents (confirmed by the same no-RenderGraph fixture,
+    // whose own barrier also leaves dstAccessMask at its zero-init
+    // default and is clean -- only the STAGE half of this pair is
+    // load-bearing for the hazard).
     for (uint32_t i = 0; i < resources.size(); ++i) {
         if (!resources[i].isBackbuffer) {
             continue;
         }
         const ResourceKey key{i, Subresource{0, 1, 0, 1}};
         const detail::ResourceBarrierState& s = stateFor(key);
-        outFinalBarriers.imageBarriers.push_back(ImageBarrier{i, s.lastWriteStages, s.pendingFlushAccess,
-                                                                VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE, s.currentLayout,
-                                                                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, key.subresource});
+        outFinalBarriers.imageBarriers.push_back(
+            ImageBarrier{i, s.lastWriteStages, s.pendingFlushAccess, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                         VK_ACCESS_2_NONE, s.currentLayout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, key.subresource});
         break;
     }
 

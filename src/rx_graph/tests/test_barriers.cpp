@@ -406,8 +406,13 @@ TEST_CASE("present-final") {
         const PassBarriers& final_ = compiled.finalBarriers();
         REQUIRE(final_.imageBarriers.size() == 1);
         CHECK(final_.bufferBarriers.empty());
+        // [Phase 5 Task 5 review round, CI runs 32463376885/32466037296]
+        // dstStage was VK_PIPELINE_STAGE_2_NONE until this round --
+        // barriers.cpp's own finalBarriers()-building comment has the full
+        // account (SYNC-HAZARD-PRESENT-AFTER-WRITE: a NONE dst gives
+        // PresentLoop's signal semaphore no real stage to chain from).
         checkImageBarrier(final_.imageBarriers[0], bb, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_NONE,
                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     }
 
@@ -427,9 +432,11 @@ TEST_CASE("present-final") {
         REQUIRE(final_.imageBarriers.size() == 1);
         CHECK(final_.bufferBarriers.empty());
         // Every field but newLayout is unaffected by this override -- same
-        // srcStage/srcAccess/oldLayout as the default subcase above.
+        // srcStage/srcAccess/oldLayout as the default subcase above
+        // (including the same VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT dstStage
+        // fix -- see that subcase's own comment).
         checkImageBarrier(final_.imageBarriers[0], bb, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_NONE,
                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     }
 }
