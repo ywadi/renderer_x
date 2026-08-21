@@ -13,6 +13,7 @@
 // test only ever called `beginFrame(0, ...)`).
 #include <doctest/doctest.h>
 #include <rx_material/instance.h>
+#include <rx_material/param_arena_factory.h>
 #include <rx_rhi_vk/buffer.h>
 #include <rx_rhi_vk/context.h>
 #include <VkBootstrap.h>
@@ -139,6 +140,53 @@ TEST_CASE("ParamArena: writes into different frame-in-flight slots are isolated,
         // block, before the device itself is destroyed below.
     }
 
+    vkDeviceWaitIdle(fixture.device);
+    vkb::destroy_device(fixture.vkbDevice);
+    CHECK_FALSE(fixture.context.hasValidationErrors());
+}
+
+// [Phase 5 Task 5, ticket #41 row 1] createDemandSizedMaterialParamArena():
+// the promoted samples/08_gltf_viewer + samples/09_scene
+// createMaterialParamArena() factory (both the set-layout construction and
+// the DescriptorArena sizing) now lives here, engine-side.
+TEST_CASE("createDemandSizedMaterialParamArena sizes the arena exactly for materialCount -- allocate() succeeds "
+          "materialCount times and fails on the next") {
+    HeadlessParamArenaFixture fixture = makeFixture();
+    {
+        constexpr uint32_t kMaterialCount = 3;
+        auto bundle = rx::material::createDemandSizedMaterialParamArena(fixture.device, kMaterialCount);
+        REQUIRE(bundle.has_value());
+        CHECK(bundle->setLayout != VK_NULL_HANDLE);
+        CHECK(bundle->arena.framesInFlight() == 1);
+
+        for (uint32_t i = 0; i < kMaterialCount; ++i) {
+            CHECK(bundle->arena.allocate(bundle->setLayout) != VK_NULL_HANDLE);
+        }
+        // Exactly `materialCount` sets fit -- the (materialCount + 1)-th
+        // allocate() must be refused (arena-enforced, per descriptor_arena.h's
+        // own BUDGETS ARE ARENA-ENFORCED contract), not merely likely to fail.
+        CHECK(bundle->arena.allocate(bundle->setLayout) == VK_NULL_HANDLE);
+
+        vkDestroyDescriptorSetLayout(fixture.device, bundle->setLayout, nullptr);
+    }
+    vkDeviceWaitIdle(fixture.device);
+    vkb::destroy_device(fixture.vkbDevice);
+    CHECK_FALSE(fixture.context.hasValidationErrors());
+}
+
+TEST_CASE("createDemandSizedMaterialParamArena clamps materialCount == 0 to a 1-set arena, never a zero-capacity "
+          "one DescriptorArena::create() would reject") {
+    HeadlessParamArenaFixture fixture = makeFixture();
+    {
+        auto bundle = rx::material::createDemandSizedMaterialParamArena(fixture.device, /*materialCount=*/0);
+        REQUIRE(bundle.has_value());
+        // Exactly one set fits; the second is refused -- proves the real
+        // clamp-to-1 capacity, not merely "some capacity > 0".
+        CHECK(bundle->arena.allocate(bundle->setLayout) != VK_NULL_HANDLE);
+        CHECK(bundle->arena.allocate(bundle->setLayout) == VK_NULL_HANDLE);
+
+        vkDestroyDescriptorSetLayout(fixture.device, bundle->setLayout, nullptr);
+    }
     vkDeviceWaitIdle(fixture.device);
     vkb::destroy_device(fixture.vkbDevice);
     CHECK_FALSE(fixture.context.hasValidationErrors());

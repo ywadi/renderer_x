@@ -25,6 +25,10 @@ add_library(rx_material STATIC
     material_system.cpp
     instance.cpp
     api_impl.cpp
+    # [Phase 5 Task 5, ticket #41 row 1] The promoted demand-sized
+    # material-param descriptor-set-LAYOUT + DescriptorArena factory --
+    # see param_arena_factory.h's own header comment.
+    param_arena_factory.cpp
 )
 target_include_directories(rx_material PUBLIC include)
 target_link_libraries(rx_material PUBLIC rx_core rx_graph rx_rhi_vk rx_shader_layout_types slang::slang)
