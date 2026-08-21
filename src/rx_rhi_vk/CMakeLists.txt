@@ -27,6 +27,10 @@ add_library(rx_rhi_vk STATIC
     src/compute_pipeline.cpp
     src/mesh_buffers.cpp
     src/descriptor_arena.cpp
+    # [Phase 5 Task 5, ticket #41 row 2] Per-FIF, bindless-registered
+    # host-visible storage buffer -- promoted from samples 08/09's own
+    # hand-rolled drawDataBuffers[]/drawDataBufferHandles[] pattern.
+    src/per_frame_storage_buffer.cpp
     src/tracy_gpu.cpp
     src/memory_report.cpp
     src/vma_impl.cpp
@@ -100,6 +104,9 @@ add_executable(rx_rhi_vk_tests
     tests/window_state_test.cpp
     tests/surface_loss_test.cpp
     tests/storage_image_test.cpp
+    # [Phase 5 Task 5, ticket #41 row 2] PerFrameStorageBuffer -- promoted
+    # from samples 08/09's own hand-rolled drawDataBuffers[] pattern.
+    tests/per_frame_storage_buffer_test.cpp
     # [Task 2 (#38), gate ruling RC2] compute_pipeline_test.cpp compiles a
     # real compute .slang module in-process (rx::shader::Compiler +
     # reflect()) to exercise rx::rhi::ComputePipelineCache end to end --
