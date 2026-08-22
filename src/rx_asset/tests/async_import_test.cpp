@@ -991,6 +991,52 @@ TEST_CASE("importGltfAsync: WALL-CLOCK GATE -- deliberately slow decode + a real
         return static_cast<int64_t>(ts.tv_sec) * 1000000 + ts.tv_nsec / 1000;
     };
 
+    // [Wine regression fix, follow-up to issue #76] CLOCK_THREAD_CPUTIME_ID's
+    // actual RESOLUTION is platform-dependent, measured here rather than
+    // assumed from a `_WIN32`/`#ifdef` guess -- `clock_getres()` is the
+    // POSIX-standard way to ask, and the two platforms this test binary
+    // actually runs on (native Linux; this same source cross-compiled to
+    // Windows and run under Wine, `rx_asset_gltf_gpu_tests` is NOT in the
+    // Wine CI job's GPU-exclusion filter) were measured directly, on this
+    // exact toolchain, to differ by more than SEVEN ORDERS OF MAGNITUDE:
+    // Linux reports 1ns (TSC-backed, effectively continuous); Windows/Wine
+    // reports 15,625,000ns (15.625ms -- the classic Windows system clock
+    // tick, 1/64 second; mingw-w64's clock_gettime() shim is backed by
+    // GetThreadTimes(), which is quantized to that same tick and is NOT a
+    // bug in this test's own code or a Wine emulation defect -- confirmed
+    // directly: `timeBeginPeriod(1)` [the standard Windows API for
+    // requesting finer scheduler-tick granularity] was tried against this
+    // exact toolchain under Wine and changed neither clock_getres()'s
+    // reported value nor the measured per-call granularity at all -- Windows
+    // per-thread CPU-time accounting is a genuinely separate mechanism from
+    // the periodic-timer resolution that API controls, with no user-space
+    // API to narrow it). 15.625ms is coarser than every single real
+    // operation this gate measures (single-digit milliseconds each, see the
+    // MULTIPLIER DERIVATION above) -- on that platform EVERY sample this
+    // TEST_CASE takes reads as either exactly 0 (no tick boundary crossed)
+    // or a spurious multiple of one whole tick (a boundary happened to be
+    // crossed), which is exactly the `0 us CPU` / `10000 us` pattern
+    // reproduced 1:1 between a local Wine run and CI run 32573745354 (both:
+    // `REQUIRE( 10000µs <  2000µs )`, calibration reading `0 us
+    // CPU` both samples) -- not noise, not corruption, a direct, exact
+    // consequence of dividing/comparing quantities the platform's own clock
+    // cannot resolve at the scale this gate needs. 1ms (1,000,000ns) is the
+    // cutover used below: seven orders of magnitude above Linux's measured
+    // 1ns (zero risk of a false "coarse" read there) and more than an order
+    // of magnitude below Windows/Wine's measured 15,625,000ns (zero risk of
+    // missing a genuinely coarse platform) -- picked with deliberate margin
+    // on both sides of the two ONLY values ever actually measured, not
+    // tuned to a borderline case.
+    const bool cpuTimeResolutionUsable = [] {
+        struct timespec res {};
+        if (clock_getres(CLOCK_THREAD_CPUTIME_ID, &res) != 0) {
+            return false;  // clock unsupported outright -- treat identically to "too coarse to trust"
+        }
+        constexpr int64_t kMaxUsableResolutionNs = 1'000'000;  // 1ms, see the derivation above
+        const int64_t resolutionNs = static_cast<int64_t>(res.tv_sec) * 1'000'000'000 + res.tv_nsec;
+        return resolutionNs > 0 && resolutionNs <= kMaxUsableResolutionNs;
+    }();
+
     TextureDecodeResult calibrationPayload;
     calibrationPayload.outcome = TextureDecodeResult::Outcome::Ready;
     calibrationPayload.format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -1218,7 +1264,34 @@ TEST_CASE("importGltfAsync: WALL-CLOCK GATE -- deliberately slow decode + a real
     // asserted once, hard, against the worst pumpMain() CPU cost observed
     // across the entire run -- see the [Issue #30] comment above the loop
     // for why this replaced a per-iteration REQUIRE.
-    REQUIRE(maxPumpCpuDuration < kCiStallDetector);
+    //
+    // [Wine regression fix] ...UNLESS `cpuTimeResolutionUsable` (measured
+    // above, see its own comment for the full derivation and CI-run
+    // citation) says this platform's CLOCK_THREAD_CPUTIME_ID cannot
+    // resolve anything at the scale this gate needs -- in which case the
+    // REQUIRE below would not be testing anything meaningful (every
+    // sample is 0 or a spurious whole clock-tick), so it is skipped, LOUDLY
+    // (a MESSAGE naming the measured resolution and explicitly stating
+    // that this is a deliberate accommodation, not a silent gap), rather
+    // than asserted against numbers that cannot possibly mean what they
+    // are being compared as if they meant. This costs ONLY this one
+    // secondary/redundant timing check on that platform -- the PRIMARY
+    // defect-class proof above (`maxTextureRegistrationsInOneTick <= 1`,
+    // fully timing-independent) is completely unaffected and runs
+    // identically, asserted, on every platform this binary ever runs on,
+    // so no actual defect coverage is lost, on any platform, by this
+    // accommodation.
+    if (cpuTimeResolutionUsable) {
+        REQUIRE(maxPumpCpuDuration < kCiStallDetector);
+    } else {
+        MESSAGE("wall-clock gate: CLOCK_THREAD_CPUTIME_ID resolution on this platform is too coarse to use as a "
+                "CI-blocking secondary safety net (measured via clock_getres(), see cpuTimeResolutionUsable's own "
+                "comment above for the full derivation) -- SKIPPING the REQUIRE(maxPumpCpuDuration < "
+                "kCiStallDetector) check on THIS run only; the PRIMARY defect-class proof "
+                "(maxTextureRegistrationsInOneTick <= 1, above) is unaffected and still asserted. maxPumpCpuDuration "
+                "this run was ", maxPumpCpuDuration.count(), " us against a ceiling of ", kCiStallDetector.count(),
+                " us -- reported for trend visibility only, deliberately not compared.");
+    }
 
     // Published number [D18/RC6]: the 2ms figure is a TREND metric,
     // explicitly "never CI-blocking" (D18's own wording, amended by RC6
