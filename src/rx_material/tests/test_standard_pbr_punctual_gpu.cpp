@@ -47,6 +47,8 @@
 #include <rx_scene/camera.h>
 #include <rx_scene/light_math.h>
 
+#include "ibl_environment_test_fixture.h"
+
 #include <rx_graph/executor.h>
 #include <rx_graph/render_graph.h>
 #include <rx_task/scheduler.h>
@@ -63,6 +65,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -113,7 +116,13 @@ std::optional<Fixture> makeFixture(const char* title) {
     // or cube image; both capacities exist purely so the pipeline LAYOUT
     // itself is well-formed).
     capacities.comparisonSamplers = 1;
-    capacities.cubeImages = 1;
+    // [Review fix round 1, LOW finding 3] Bumped 1 -> 4: the new
+    // env-vs-punctual coherence TEST_CASE registers a REAL synthetic
+    // environment (`ibl_environment_test_fixture.h`'s own
+    // `makeUniformTestEnvironment()`, 2 real cube registrations --
+    // irradiance + prefiltered) on top of this rig's own pre-existing
+    // headroom requirement.
+    capacities.cubeImages = 4;
     auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
     REQUIRE(bindless.has_value());
 
@@ -774,5 +783,109 @@ TEST_CASE("StandardPBR punctual: pre-exposure coherence -- a Point light's rende
     // if this failed here (measured close to expectedRatio^2 instead),
     // that would mean exposure is being applied twice somewhere.
     CHECK_FALSE(near(measuredRatio, expectedRatio * expectedRatio, 0.1F));
+    destroyRig(*rig);
+}
+
+TEST_CASE("StandardPBR: environment-lux and punctual-light-lux compose in ONE coherent photometric frame "
+          "[review fix round 1, LOW finding 3 -- Adjudication 1's own dimensional re-derivation "
+          "(task-13-review.md), turned into a value assertion]. A uniform environment of radiance L "
+          "(bake.h's own pre-divided-by-pi irradiance convention, isolated via dfg=(0,0) so "
+          "iblDiffuse==diffuseColor*L exactly and iblSpecular==0) is asserted to produce the SAME rendered "
+          "pixel as a directional light of colorLux C=L*envIntensity*PI -- the standard photometric "
+          "identity a uniform-radiance-L hemisphere integrates to under Lambert's cosine law (irradiance == "
+          "PI*L), the SAME identity test_standard_pbr_ibl_gpu.cpp's own Lambertian TEST_CASE already "
+          "documents. The directional side is isolated to pure Lambertian diffuse via ior=1.0 (forces "
+          "dielectric F0=(0,0,0) exactly, computeDielectricF0F90()); combined with this rig's own head-on "
+          "geometry (VdotH==1 exactly), F_Schlick(f0=0,f90,VoH=1)==f0==0 identically (brdf.slang: "
+          "`f0+(f90-f0)*pow(clamp(1-VoH,0,1),5)`, and `clamp(1-1,0,1)==0` so the whole p5 term vanishes) -- "
+          "the direct specular lobe is EXACTLY zero, not merely negligible, leaving directLight == "
+          "diffuseColor*Fd_Lambert()*C*NdotL == C/pi == L*envIntensity exactly. Verified at BOTH neutral "
+          "(exposure==1.0) and a non-neutral Camera exposure (both producers scaled by the IDENTICAL "
+          "CPU-side pre-exposure multiply, matching the single-application-point convention) -- this is "
+          "what makes the test discriminate a UNIT BREAK rather than merely reproducing a coincidental "
+          "match: a stray extra 4*PI anywhere in the candela/lux conversion path would make the two renders "
+          "diverge by roughly 12.6x, trivially visible at 8-bit precision (empirically reproduced via a "
+          "temporary sabotage-and-revert cycle, see task-13-report.md's own 'Fix round 1' section); a stray "
+          "SQUARED exposure on either producer would still pass at exposure==1.0 (where x==x^2) but would "
+          "visibly diverge at the non-neutral exposure used here.") {
+    auto rig = makeRig("env_punctual_coherence");
+    if (!rig) {
+        return;
+    }
+
+    constexpr float kRadiance = 0.4F;      // uniform environment radiance L.
+    constexpr float kEnvIntensity = 1.0F;  // matches EnvironmentDesc's own documented neutral default.
+    constexpr float kPi = 3.14159265358979F;
+    // Physical identity (Adjudication 1's own dimensional re-derivation,
+    // task-13-review.md): a uniform-radiance-L hemisphere produces
+    // irradiance == L*pi at a normally-incident surface -- the equivalent
+    // directional-light illuminance (lux) is therefore L*envIntensity*pi.
+    const float colorLux = kRadiance * kEnvIntensity * kPi;
+
+    auto env = rx::material_test::makeUniformTestEnvironment(
+        rig->fixture->device, rig->fixture->allocator, rig->fixture->bindless,
+        glm::vec4(kRadiance, kRadiance, kRadiance, 1.0F),
+        glm::vec2(0.0F, 0.0F));  // dfg=(0,0) -> E==0 -> iblSpecular==0, iblDiffuse==diffuseColor*L exactly.
+    REQUIRE(env.has_value());
+
+    // ior=1.0 override -- see this TEST_CASE's own header comment for why
+    // this makes the direct specular lobe EXACTLY zero at this rig's
+    // head-on geometry. makePunctualBlob()'s own default (1.5, the glTF
+    // spec default) is overwritten via a second setParam() call, matching
+    // this suite's own "build the neutral blob, override exactly the
+    // field(s) this TEST_CASE probes" idiom.
+    std::vector<uint8_t> blob =
+        makePunctualBlob(*rig->system, rig->material, rig->whiteTex, rig->flatNormalTex, rig->samplerIndex);
+    {
+        const auto params = rig->system->materialParams(rig->material);
+        setParam(blob, params, "ior", 1.0F);
+    }
+
+    auto renderPair = [&](float exposure) {
+        rx::material::DrawDataGpu envRow = makeBaseRow();
+        env->applyTo(envRow, kEnvIntensity * exposure);  // PRE-EXPOSED -- SAME single CPU-side multiply convention.
+        auto envBuf = createDrawDataBuffer(rig->fixture->allocator, rig->fixture->bindless, envRow);
+        REQUIRE(envBuf.has_value());
+        Rgba8 envPixel = renderQuad(rig->fixture->device, rig->fixture->allocator, rig->fixture->bindless,
+                                     envBuf->handle, rig->samplerIndex, *rig->mesh, *rig->system, rig->material, blob);
+
+        rx::material::DrawDataGpu dirRow = makeBaseRow();
+        dirRow.lightType = 0;  // Directional (unattenuated).
+        dirRow.lightDirWorld = glm::vec4(0.0F, 0.0F, 1.0F, 0.0F);  // head-on -- matches envRow's own implicit N==(0,0,1).
+        dirRow.lightColor = glm::vec4(glm::vec3(colorLux * exposure), 0.0F);  // SAME single pre-exposure multiply.
+        auto dirBuf = createDrawDataBuffer(rig->fixture->allocator, rig->fixture->bindless, dirRow);
+        REQUIRE(dirBuf.has_value());
+        Rgba8 dirPixel = renderQuad(rig->fixture->device, rig->fixture->allocator, rig->fixture->bindless,
+                                     dirBuf->handle, rig->samplerIndex, *rig->mesh, *rig->system, rig->material, blob);
+        return std::pair<Rgba8, Rgba8>{envPixel, dirPixel};
+    };
+
+    // Neutral exposure (1.0).
+    auto [envNeutral, dirNeutral] = renderPair(1.0F);
+    MESSAGE("env-vs-punctual coherence @ exposure=1.0: env=", static_cast<int>(envNeutral.r), " directional=",
+            static_cast<int>(dirNeutral.r), " (both should equal round(255*L*envIntensity)=",
+            static_cast<int>(std::lround(255.0 * kRadiance * kEnvIntensity)), ")");
+    REQUIRE(envNeutral.r > 0);
+    REQUIRE(dirNeutral.r > 0);
+    CHECK(near(static_cast<float>(dirNeutral.r), static_cast<float>(envNeutral.r), 0.06F));
+
+    // Non-neutral exposure -- rx::scene::Camera::setExposure(-1.0F) ->
+    // exposure()==5/3 exactly [task-4-report.md's own cited value, reused
+    // by the pre-exposure-coherence TEST_CASE above].
+    rx::scene::Camera brighterCamera;
+    brighterCamera.setExposure(-1.0F);
+    auto [envBright, dirBright] = renderPair(brighterCamera.exposure());
+    MESSAGE("env-vs-punctual coherence @ exposure=", brighterCamera.exposure(), ": env=",
+            static_cast<int>(envBright.r), " directional=", static_cast<int>(dirBright.r));
+    REQUIRE(envBright.r > 0);
+    REQUIRE(dirBright.r > 0);
+    CHECK(near(static_cast<float>(dirBright.r), static_cast<float>(envBright.r), 0.06F));
+    // Both sides must ALSO have genuinely brightened relative to neutral
+    // (proves the non-neutral case is a real, live exposure change, not
+    // an accidental no-op that would make the equality above vacuous).
+    CHECK(envBright.r > envNeutral.r);
+    CHECK(dirBright.r > dirNeutral.r);
+
+    env->destroySamplers(rig->fixture->device.device());
     destroyRig(*rig);
 }

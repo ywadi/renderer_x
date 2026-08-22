@@ -487,6 +487,27 @@ std::vector<LightHandle> instantiateImportedLights(Scene& scene, std::span<const
                 handles.push_back(scene.createSpotLight(desc));
                 break;
             }
+            default:
+                // [Review fix round 1, LOW] `asset::LightData::Type` is
+                // OUR OWN internal enum (not externally-sourced malformed
+                // data the way e.g. mapFastgltfError()'s own exhaustive
+                // switch handles a third-party enum) -- an unreachable
+                // case here means a NEW enumerator was added to
+                // LightData::Type without updating this switch, a real
+                // programming bug, not a recoverable malformed-input
+                // state. Loud failure (log + throw), matching this
+                // class's own established "a mutator/accessor hitting an
+                // unexpected state fails loudly" convention
+                // (requireLiveLight()/requireLiveRenderable() above) --
+                // silently skipping the light (this function's own header
+                // comment promises "one LightHandle per input light, in
+                // the SAME order") would violate that contract silently
+                // rather than surfacing the gap immediately.
+                RX_LOG_ERROR(
+                    "rx::scene::instantiateImportedLights: unknown asset::LightData::Type value {} -- a new "
+                    "enumerator was added without updating this switch",
+                    static_cast<int>(light.type));
+                throw std::logic_error("rx::scene::instantiateImportedLights: unhandled LightData::Type");
         }
     }
     return handles;
