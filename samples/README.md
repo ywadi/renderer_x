@@ -47,6 +47,10 @@ step involved:
   sample_08_gltf_viewer[.exe]      # + material_shaders/{material,
                                     #   forward_entry,standard_pbr,unlit}.slang,
                                     #   tonemap.{vert,frag}.slang,
+                                    #   ibl_shaders/{equirect_to_cubemap,
+                                    #   irradiance_convolve,prefilter_specular,
+                                    #   dfg_lut,skybox}.slang,
+                                    #   environments/gate_test_env.hdr,
                                     #   references/{loading_state,
                                     #   loaded_scene}.png, a pre-staged
                                     #   assets/DamagedHelmet/glTF/ (+ its own
@@ -719,29 +723,57 @@ unzipped to a directory outside the build tree entirely, passes its own
 headless gate unmodified on both `linux-native` and (via Wine)
 `windows-cross-zig`.
 
+**[Phase 5 Task 12, #48 fix]** `MaterialSystem::create()` has required
+`brdf.slang`/`energy_compensation_{off,on}.slang` (Task 7/8's BRDF module +
+its link-time permutation axis) in `sharedShaderDir` **unconditionally**
+since Task 8 landed — this sample's own `checker.slang`/`rim.slang` never
+reference them, but `create()` fails outright without them present
+regardless. `tools/package_samples.sh` never staged the three files, so
+every packaged zip built between Task 8 and this fix silently shipped a
+redistributed `06_materials` whose `MaterialSystem::create()` failed before
+ever rendering a frame — never caught because CI's own packaging step and
+ctest run both only ever exercise the *build tree* (where CMake's own
+deploy step already had them). Found and fixed by Task 12's own
+standalone-unzipped-copy verification (see `08_gltf_viewer`'s own
+Redistribution section below for the sibling gap that verification pass
+actually set out to check).
+
 ## 08_gltf_viewer
 
-`samples/08_gltf_viewer/main.cpp` — Phase 4 Stage 1's user-facing showcase
-sample: a real glTF asset (DamagedHelmet by default, `--scene <path>`
-override), imported **asynchronously** (Task 15's own async-import
-pipeline — this is the sample built specifically to demonstrate it, with a
-rendered loading state visible while the import runs) and rendered through
-D22's shipped material library (`shaders/material/standard_pbr.slang` /
-`unlit.slang`) driven entirely via D26.1's bindless per-draw addressing
-(`SV_VulkanInstanceID` indexing a real bindless `StructuredBuffer<RxDrawData>`
-this sample builds and uploads itself — never a per-draw push constant;
-`samples/07_stress`'s own `gPush.instanceIndex` is the named anti-pattern
-this does not repeat). A mouse-drag orbit camera (left-click-drag; reads SDL
-mouse state directly via `Window::sdlWindow()` — sample-local, not a new
-`rx_platform` input surface) and `--exposure` (a real EV100 value fed
-directly into `rx::scene::Camera::setExposure(float)` — higher EV100
-*darkens* the image, the physical-camera convention, e.g. `--exposure 5`
-is noticeably darker than the default; exposure now pre-multiplies the
-scene's own light/ambient intensities before shading runs, never a
-post-tonemap or post-shading multiplier — the shared
+`samples/08_gltf_viewer/main.cpp` — the **Phase 5 Stage 1 demonstrator**
+(originally Phase 4 Stage 1's async-import showcase; promoted at Stage 1's
+own exit, Task 12/#48, to also exercise every Stage 1 engine facility): a
+real glTF asset (DamagedHelmet by default, `--scene <path>` override),
+imported **asynchronously** (Task 15's own async-import pipeline — this is
+the sample built specifically to demonstrate it, with a rendered loading
+state visible while the import runs) and rendered through D22's shipped
+material library (`shaders/material/standard_pbr.slang` / `unlit.slang`,
+now built on Task 7/#43's ported Filament BRDF module and Task 8/#44's
+KHR_materials_ior/specular-consuming rework) driven entirely via D26.1's
+bindless per-draw addressing (`SV_VulkanInstanceID` indexing a real bindless
+`StructuredBuffer<RxDrawData>` this sample builds and uploads itself — never
+a per-draw push constant; `samples/07_stress`'s own `gPush.instanceIndex` is
+the named anti-pattern this does not repeat). An equirect environment is
+baked (Task 9/#45's compute IBL chain: equirect→cubemap, irradiance,
+prefiltered specular, multiscatter DFG LUT) and bound (Task 10/#46's
+`rx::scene::Scene::setEnvironment()`) by default, replacing the old
+Phase-4-era flat-ambient term with real image-based lighting plus a skybox
+background pass — `--no-env` reproduces the old zero-indirect-light render
+for comparison. A mouse-drag orbit camera (left-click-drag; reads SDL mouse
+state directly via `SDL_GetMouseState()` — sample-local, not a new
+`rx_platform` input surface), `--exposure` (a real EV100 value fed directly
+into `rx::scene::Camera::setExposure(float)`, Task 4/#40's physical-units
+API — higher EV100 *darkens* the image, the physical-camera convention,
+e.g. `--exposure 5` is noticeably darker than the default; exposure
+pre-multiplies the scene's own light/ambient/environment intensities before
+shading runs, never a post-tonemap or post-shading multiplier — the shared
 `shaders/multipass/tonemap.{vert,frag}.slang` shaders this sample reuses
-verbatim are byte-for-byte untouched either way) round out the
-interactive half.
+verbatim are byte-for-byte untouched either way), and an ImGui HUD (`--present`
+mode; Task 12/#48, built on the engine's own `rx_debug_ui::Overlay` facility
+— the same one `09_scene`'s HUD consumes, not a sample-local reimplementation)
+reporting the bound environment (path, physical intensity, prefiltered mip
+count) and the live exposure state (aperture/shutter/ISO, EV100, resulting
+pre-exposure multiplier) round out the interactive half.
 
 **D28**: each glTF material's `alphaMode`/`doubleSided` become
 `MaterialSystem`'s own fixed-function pipeline-state axis
@@ -798,6 +830,24 @@ PNGs.
   `--exposure 5` renders noticeably darker than the default. `0` — the
   default, and the only value that is a SENTINEL rather than a real
   EV100 — is neutral (no override applied at all, `exposure() == 1.0`).
+- **`--env <path.hdr|.exr>`** — bakes and binds an equirectangular
+  environment (Task 9's compute IBL chain + Task 10's runtime binding);
+  container format is detected by magic number, not this flag's own file
+  extension, so a Radiance `.hdr` or an OpenEXR `.exr` both work
+  unmodified. Empty (the default) resolves to the committed
+  `environments/gate_test_env.hdr` fixture.
+- **`--no-env`** — explicitly binds no environment at all (not even the
+  default fixture) — reproduces the pre-Task-10 zero-indirect-light render
+  for comparison.
+- **`--env-intensity <n>`** (default `1.0`) — a physical-units multiplier on
+  the bound environment's own intensity, applied before `--exposure`'s own
+  pre-exposure multiply.
+- **`--bench-frames <n>`** — headless-only: after the scene loads and the
+  environment bakes, times `n` repeated offscreen render+readback
+  iterations and logs a `sample08: perf frame_bench ...` line (average/min/
+  max wall-clock milliseconds per iteration — CPU-record + GPU-submit-and-
+  wait time, not vsync-paced present-mode timing). `0` (the default)
+  disables it entirely.
 - **`--vsync on|off`** (default `on`) — same present-mode control as
   01_triangle's `--vsync` section above.
 - **`--fullscreen`** — same borderless-desktop fullscreen toggle as
@@ -819,10 +869,12 @@ PNGs.
 loading screen (never pure black) while DamagedHelmet imports
 asynchronously, then transitions to the rendered helmet — a dark,
 gunmetal-plated combat helmet with a gold-tinted visor, lit by a single
-fixed key light plus a small flat ambient term (D22's own scope for this
-stage: full image-based lighting is a techniques-phase concern, not built
-here). Left-click-dragging orbits the camera around it. Closing the window
-exits with status 0 and logs:
+fixed key light plus real image-based lighting from the bound environment
+(a procedural sky/ground gradient by default) and its own skybox
+background. An ImGui HUD in the top-left reports the bound environment and
+current exposure state (see this section's own `--exposure`/`--env`
+descriptions above). Left-click-dragging orbits the camera around the
+helmet. Closing the window exits with status 0 and logs:
 
 ```
 [info] sample_08_gltf_viewer: window closed cleanly
@@ -835,9 +887,21 @@ establishes, extended with a second shared pair
 (`material_shaders/standard_pbr.slang` / `unlit.slang`, D22's shipped
 library) alongside the same `material.slang` / `forward_entry.slang`, plus
 the shared tonemap shaders (`tonemap.{vert,frag}.slang`, deployed flat next
-to the binary, same convention as 05_multipass/07_stress's own copies) and
-the two committed `references/` PNGs (so a redistributed binary's own
-`--validate` headless gate is self-contained too). **Unlike every other
+to the binary, same convention as 05_multipass/07_stress's own copies), the
+two committed `references/` PNGs (so a redistributed binary's own
+`--validate` headless gate is self-contained too), and — new at Task 12/#48,
+Stage 1's exit — `ibl_shaders/` (rx_ibl's five bake-chain/skybox compute
+and graphics shaders, `rx::ibl::bakeEnvironment()`'s own explicit
+`shaderDir` lookup) plus `environments/gate_test_env.hdr` (the committed
+default-environment fixture, `resolveDefaultEnvironmentPath()`'s own
+packaged-first lookup). Both were a real, closed packaging gap before Task
+12: without them, a redistributed zip's `--env` default resolution
+silently degraded to "no environment bound" even though the Slang libs and
+DamagedHelmet asset were both already staged correctly — verified fixed by
+unzipping a freshly packaged `.zip` outside the build tree and confirming
+`--validate` logs a real `sample08: perf ibl_bake ...` line (the bake
+actually running, not silently skipped) before the headless gate passes.
+**Unlike every other
 sample in this list**, this one genuinely redistributes third-party
 content: `tools/fetch_assets.sh`'s own DamagedHelmet download is pre-staged
 into `assets/DamagedHelmet/glTF/` next to the binary (this sample's own

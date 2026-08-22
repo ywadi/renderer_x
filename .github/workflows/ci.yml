@@ -406,8 +406,22 @@ jobs:
       # subdirectories plus a pre-staged DamagedHelmet asset + its own
       # dual-license attribution text / 09's material_shaders/+
       # shadow_shaders/+references/ subdirectories plus the same pre-staged
-      # DamagedHelmet asset). See tools/package_samples.sh for the full
-      # per-sample manifest and why each file is there.
+      # DamagedHelmet asset). Phase 5 Task 12 (#48, Stage 1 exit) closed
+      # THREE real pre-existing packaging gaps this task's own standalone-
+      # unzipped-copy verification found (none caught before because CI's
+      # own ctest run and this same packaging step both only ever exercise
+      # the BUILD tree, where CMake's own deploy steps already staged
+      # everything): (a) 06/08/09's material_shaders/ was missing
+      # brdf.slang/energy_compensation_{off,on}.slang -- required
+      # UNCONDITIONALLY by MaterialSystem::create() since Task 8, so a
+      # redistributed copy of any of the three failed outright before ever
+      # rendering a frame; (b) 08's own ibl_shaders/+environments/
+      # subdirectories were never staged at all, so a redistributed 08's
+      # `--env` default silently degraded to "no environment bound"; (c)
+      # 09's own ibl_shaders/+environments/ subdirectories were the same
+      # gap, silently shipping zero indirect lighting. See
+      # tools/package_samples.sh for the full per-sample manifest and why
+      # each file is there.
       - name: Package samples for redistribution
         run: tools/package_samples.sh linux-native linux-x86_64 rendererx-samples-linux-x86_64.zip
 

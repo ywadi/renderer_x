@@ -6,8 +6,11 @@ add_executable(sample_08_gltf_viewer main.cpp)
 # rx_frame_loop [Phase 5 Task 5, ticket #41]: shared present-loop helper.
 # rx_ibl [Phase 5 Task 10, #46, FG1 closure]: rx::ibl::bakeEnvironment(),
 # consumed by this sample's own `--env <path.hdr>` handling.
+# rx_debug_ui [Phase 5 Task 12, #48, Stage 1 exit]: rx::debug_ui::Overlay --
+# the environment/exposure HUD readout this ticket's own acceptance line
+# requires, consumed exactly like sample_09_scene's own identical link.
 target_link_libraries(sample_08_gltf_viewer PRIVATE
-    rx_graph rx_rhi_vk rx_platform rx_material rx_asset rx_scene rx_task rx_shader rx_frame_loop rx_ibl sample_common
+    rx_graph rx_rhi_vk rx_platform rx_material rx_asset rx_scene rx_task rx_shader rx_frame_loop rx_ibl rx_debug_ui sample_common
 )
 
 # RX_REPO_ROOT_DIR: the same "bake an absolute CMAKE_SOURCE_DIR-relative

@@ -84,7 +84,7 @@ For detailed build and run instructions per platform, including Steam Deck and m
 - **samples/05_multipass/** — Multipass render graph (shadow map, forward shading, tonemap) demonstrating declarative passes and automatic barrier derivation
 - **samples/06_materials/** — Material-system showcase using the public COM-lite API with hot-reload support and parameter overrides
 - **samples/07_stress/** — Parallel-recording stress benchmark: a large procedural instanced field driven through a chunked render-graph pass, single-thread vs. default-worker-count A/B
-- **samples/08_gltf_viewer/** — Real glTF asset import (async), StandardPBR/Unlit rendering via the material system, orbit camera
+- **samples/08_gltf_viewer/** — Real glTF asset import (async), StandardPBR/Unlit rendering via the material system, orbit camera; Phase 5 Stage 1 demonstrator: Filament-ported BRDF + IBL (`--env <path.hdr|.exr>`, baked skybox/irradiance/specular/DFG) and physical-units exposure (`--exposure`), both readable live via an ImGui HUD
 - **samples/09_scene/** — Phase 4 phase-exit sample: Registry → Scene → DrawListBuilder → render-graph fly-through, ImGui HUD (cull counters, layer/light-channel toggles, pool/memory stats), `--stress` scene-path A/B benchmark vs. 07_stress
 - **tools/** — Utilities: dependency cache, Slang prebuilt fetch, build-budget checker, test-asset fetch/reference-regeneration, sample packaging
 - **third_party/** — Vendored dependencies (volk, vk-bootstrap, VMA, SDL3, GLM, spdlog)
@@ -99,7 +99,7 @@ For detailed build and run instructions per platform, including Steam Deck and m
 
 **Phase 4 (complete):** Job system (`src/rx_task/`) and a zero-per-frame-allocation chunked executor for parallel command recording; asset pipeline (`src/rx_asset/`, glTF import via fastgltf/meshoptimizer/Draco/MikkTSpace, pooled geometry, KTX2 textures); scene submission (`src/rx_scene/`, no-ECS render proxies, reversed-Z camera, frustum + shadow-caster culling with GPU instancing collapse); shadow quality bridge (`src/rx_shadow/`); an ImGui debug overlay (`src/rx_debug_ui/`); expanded platform input (mouse capture, gamepad, keyboard); three new samples (07_stress, 08_gltf_viewer, 09_scene — the phase-exit fly-through + stress-v2 benchmark) with corresponding shader directories; expanded test coverage; CI + packaging for all nine samples.
 
-**Phase 5 and beyond:** Rendering techniques (shadows beyond the single-map baseline, post-processing, upscaling); LOD/meshlet geometry processing; public SDK/DLL surface; tooling (GPU markers, profiling, validation). See [`docs/superpowers/specs/`](docs/superpowers/specs/) for design documents.
+**Phase 5 (in progress) — Stage 1 complete:** Filament-ported Cook-Torrance/GGX BRDF module (`brdf.slang`, link-time energy-compensation permutations); StandardPBR rework consuming it plus `KHR_materials_ior`/`specular`; a compute IBL bake chain (equirect→cubemap, irradiance, prefiltered specular, multiscatter DFG LUT); runtime IBL + skybox (`rx::scene::Scene::setEnvironment()`, cubemap/EXR/.hdr environment input); a glTF PBR conformance harness against the Khronos Sample Viewer; `08_gltf_viewer` as the Stage 1 demonstrator (environment switching, physical exposure, ImGui HUD readout). Remaining stages: lights/shadows, screen-space effects, post-processing/upscaling. See [`docs/superpowers/specs/`](docs/superpowers/specs/) for design documents.
 
 ## Testing
 

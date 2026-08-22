@@ -44,7 +44,14 @@
 #                     src/rx_material/include/rx_material/material_system.h's
 #                     MaterialSystem::create() `sharedShaderDir` parameter
 #                     and samples/06_materials/main.cpp's
-#                     basePathDirectory()) + Slang runtime libs + LICENSE
+#                     basePathDirectory()) + material_shaders/brdf.slang +
+#                     material_shaders/energy_compensation_{off,on}.slang
+#                     ([Phase 5 Task 12, #48 fix] MaterialSystem::create()
+#                     requires these three UNCONDITIONALLY since Task 8
+#                     -- neither of this sample's own materials imports
+#                     them, but create() fails outright without them
+#                     present in sharedShaderDir regardless; missing here
+#                     until this fix) + Slang runtime libs + LICENSE
 #   07_stress         binary + shaders/stress/*.slang (4 files:
 #                     instanced.vert.slang/instanced.frag.slang/
 #                     tonemap.vert.slang/tonemap.frag.slang -- see
@@ -56,12 +63,34 @@
 #   08_gltf_viewer    binary + material_shaders/ (material.slang/
 #                     forward_entry.slang [rx_material's two shared files,
 #                     same convention as 06] + standard_pbr.slang/
-#                     unlit.slang [D22's shipped material library]) +
+#                     unlit.slang [D22's shipped material library] +
+#                     brdf.slang/energy_compensation_{off,on}.slang
+#                     [Task 7/8's BRDF module + its link-time permutation
+#                     axis -- MaterialSystem::create() requires these
+#                     UNCONDITIONALLY, same as 06's identical note above;
+#                     Phase 5 Task 12, #48 fix]) +
 #                     tonemap.vert.slang/tonemap.frag.slang (shared
 #                     shaders/multipass/ shaders, deployed flat, same
 #                     convention as 05/07's own copies -- see
 #                     samples/08_gltf_viewer/CMakeLists.txt's own POST_BUILD
-#                     deploy step) + references/ (loading_state.png/
+#                     deploy step) + ibl_shaders/ (equirect_to_cubemap.slang/
+#                     irradiance_convolve.slang/prefilter_specular.slang/
+#                     dfg_lut.slang/skybox.slang -- rx_ibl's own bake-chain
+#                     compute kernels + this sample's own skybox pass
+#                     shader, an EXPLICIT runtime path
+#                     [rx::ibl::bakeEnvironment()'s own `shaderDir`
+#                     parameter, rx_ibl/CMakeLists.txt's own comment on why
+#                     that library ships no compiled-in default] --
+#                     [Phase 5 Task 12, #48, Stage 1 exit -- REAL gap
+#                     closed: `--env`'s own default-environment resolution
+#                     silently degraded to "no environment bound" in every
+#                     REDISTRIBUTED copy before this task, since neither
+#                     this directory nor the next one was ever staged]) +
+#                     environments/ (gate_test_env.hdr, this sample's own
+#                     committed procedural default-environment fixture --
+#                     resolveDefaultEnvironmentPath()'s own packaged-first
+#                     lookup, [Phase 5 Task 12, #48] same closure as
+#                     ibl_shaders/ above) + references/ (loading_state.png/
 #                     loaded_scene.png, D17's committed lavapipe reference
 #                     PNGs -- shipped so a redistributed binary's own
 #                     `--validate` headless gate is self-contained too) +
@@ -78,11 +107,21 @@
 #                     finding; this script prints/writes the identical
 #                     attribution, not a fresh derivation of it).
 #   09_scene          binary + material_shaders/ (material.slang/
-#                     forward_entry.slang/standard_pbr.slang/unlit.slang,
-#                     same convention as 08) + shadow_shaders/
+#                     forward_entry.slang/standard_pbr.slang/unlit.slang/
+#                     brdf.slang/energy_compensation_{off,on}.slang,
+#                     same convention as 08 incl. its Task 12 fix) + shadow_shaders/
 #                     (shaders/shadow/shadow_caster.vert.slang -- this
 #                     sample's own first runtime-deployed consumer of
-#                     rx_shadow's shader) + tonemap.vert.slang/
+#                     rx_shadow's shader) + ibl_shaders/ (rx_ibl's four
+#                     bake-chain compute kernels -- no skybox.slang, this
+#                     sample renders no skybox pass) + environments/
+#                     gate_test_env.hdr (same committed default-environment
+#                     fixture 08 ships; [Phase 5 Task 12, #48 fix] a real
+#                     gap closed -- resolveEnvironmentPath()'s own
+#                     packaged-first lookup and this sample's own
+#                     CMakeLists.txt build-tree deploy step both existed
+#                     since Task 10, but this script never staged either
+#                     into the packaged zip) + tonemap.vert.slang/
 #                     tonemap.frag.slang (flat, same convention as 05/07/08)
 #                     + references/ (grid_scene.png, this sample's own D17
 #                     committed lavapipe reference) + Slang runtime libs +
@@ -265,9 +304,24 @@ mkdir -p "$STAGE_DIR/06_materials/materials" "$STAGE_DIR/06_materials/material_s
 copy_required "$STAGE_DIR/06_materials/materials" \
   "$SAMPLES_BUILD_DIR/06_materials/materials/checker.slang" \
   "$SAMPLES_BUILD_DIR/06_materials/materials/rim.slang"
+# [Phase 5 Task 12, #48, Stage 1 exit -- REAL pre-existing gap closed, same
+# root cause as 08_gltf_viewer's/09_scene's identical fix below:
+# MaterialSystem::create() has required brdf.slang/energy_compensation_
+# {off,on}.slang in sharedShaderDir UNCONDITIONALLY since Task 8 (#44) --
+# this sample's own CMakeLists.txt comment states it outright ("create()
+# itself still requires the files to exist... or it fails outright"; the
+# regression that broke this exact sample pre-Task-8-fix, per
+# task-08-report.md) -- but this script never staged them, so
+# MaterialSystem::create() failed immediately in a real standalone-unzipped
+# copy of this sample too, before even reaching an import. Found by this
+# task's own standalone-zip verification of 08_gltf_viewer; swept across
+# all three affected samples (06/08/09) rather than fixed narrowly.
 copy_required "$STAGE_DIR/06_materials/material_shaders" \
   "$SAMPLES_BUILD_DIR/06_materials/material_shaders/material.slang" \
-  "$SAMPLES_BUILD_DIR/06_materials/material_shaders/forward_entry.slang"
+  "$SAMPLES_BUILD_DIR/06_materials/material_shaders/forward_entry.slang" \
+  "$SAMPLES_BUILD_DIR/06_materials/material_shaders/brdf.slang" \
+  "$SAMPLES_BUILD_DIR/06_materials/material_shaders/energy_compensation_off.slang" \
+  "$SAMPLES_BUILD_DIR/06_materials/material_shaders/energy_compensation_on.slang"
 copy_required "$STAGE_DIR/07_stress" \
   "$SAMPLES_BUILD_DIR/07_stress/instanced.vert.slang" \
   "$SAMPLES_BUILD_DIR/07_stress/instanced.frag.slang" \
@@ -278,18 +332,57 @@ copy_required "$STAGE_DIR/07_stress" \
 # D22's StandardPBR/Unlit pair), the shared tonemap shaders (flat, same
 # convention as 05/07), and D17's committed reference PNGs -- see this
 # script's own header comment.
+#
+# [Phase 5 Task 12, #48, Stage 1 exit -- REAL pre-existing gap closed,
+# found by this task's own standalone-zip verification, inherited from
+# Task 7/8 (#43/#44): standard_pbr.slang now `import brdf;`s Task 7's BRDF
+# module and link-time-selects one of the two energy-compensation
+# variant-selector files (samples/08_gltf_viewer/CMakeLists.txt's own
+# RX_GLTF_VIEWER_MATERIAL_SHADERS already deploys all three into the BUILD
+# tree, and has since Task 8 landed) -- but this script's own
+# copy_required list was never updated to match, so every packaged zip
+# built between Task 8 and this fix has silently shipped an
+# `08_gltf_viewer` whose MaterialSystem::create() fails outright
+# (`could not read shared shader file '.../energy_compensation_off.slang'`)
+# the moment a redistributed copy is actually run standalone -- never
+# caught before because this script's own packaging step and the ctest
+# suite both run against the BUILD tree (where CMake's own deploy step
+# already staged these files), not a real unzipped-elsewhere copy.]
 mkdir -p "$STAGE_DIR/08_gltf_viewer/material_shaders" "$STAGE_DIR/08_gltf_viewer/references"
 copy_required "$STAGE_DIR/08_gltf_viewer/material_shaders" \
   "$SAMPLES_BUILD_DIR/08_gltf_viewer/material_shaders/material.slang" \
   "$SAMPLES_BUILD_DIR/08_gltf_viewer/material_shaders/forward_entry.slang" \
   "$SAMPLES_BUILD_DIR/08_gltf_viewer/material_shaders/standard_pbr.slang" \
-  "$SAMPLES_BUILD_DIR/08_gltf_viewer/material_shaders/unlit.slang"
+  "$SAMPLES_BUILD_DIR/08_gltf_viewer/material_shaders/unlit.slang" \
+  "$SAMPLES_BUILD_DIR/08_gltf_viewer/material_shaders/brdf.slang" \
+  "$SAMPLES_BUILD_DIR/08_gltf_viewer/material_shaders/energy_compensation_off.slang" \
+  "$SAMPLES_BUILD_DIR/08_gltf_viewer/material_shaders/energy_compensation_on.slang"
 copy_required "$STAGE_DIR/08_gltf_viewer" \
   "$SAMPLES_BUILD_DIR/08_gltf_viewer/tonemap.vert.slang" \
   "$SAMPLES_BUILD_DIR/08_gltf_viewer/tonemap.frag.slang"
 copy_required "$STAGE_DIR/08_gltf_viewer/references" \
   "$SAMPLES_BUILD_DIR/08_gltf_viewer/references/loading_state.png" \
   "$SAMPLES_BUILD_DIR/08_gltf_viewer/references/loaded_scene.png"
+
+# [Phase 5 Task 12, #48, Stage 1 exit] rx_ibl's own bake-chain compute
+# kernels + this sample's own skybox pass shader -- see this script's own
+# header comment for why staging these two directories (this one and
+# environments/ below) closes a real pre-existing packaging gap: without
+# them, a redistributed copy's `--env` default resolution silently fell
+# back to "no environment bound" (bakeEnvironment()'s own `shaderDir`
+# lookup failing) even though `assets/DamagedHelmet/` and the Slang runtime
+# libs were both already correctly staged -- the Stage 1 demonstrator's own
+# headline capability (IBL + skybox) was the one thing missing from the
+# packaged zip.
+mkdir -p "$STAGE_DIR/08_gltf_viewer/ibl_shaders" "$STAGE_DIR/08_gltf_viewer/environments"
+copy_required "$STAGE_DIR/08_gltf_viewer/ibl_shaders" \
+  "$SAMPLES_BUILD_DIR/08_gltf_viewer/ibl_shaders/equirect_to_cubemap.slang" \
+  "$SAMPLES_BUILD_DIR/08_gltf_viewer/ibl_shaders/irradiance_convolve.slang" \
+  "$SAMPLES_BUILD_DIR/08_gltf_viewer/ibl_shaders/prefilter_specular.slang" \
+  "$SAMPLES_BUILD_DIR/08_gltf_viewer/ibl_shaders/dfg_lut.slang" \
+  "$SAMPLES_BUILD_DIR/08_gltf_viewer/ibl_shaders/skybox.slang"
+copy_required "$STAGE_DIR/08_gltf_viewer/environments" \
+  "$SAMPLES_BUILD_DIR/08_gltf_viewer/environments/gate_test_env.hdr"
 
 # 08_gltf_viewer's own default `--scene` asset, PRE-STAGED (UNLIKE every
 # other sample here, which ships zero third-party content) so a
@@ -354,12 +447,22 @@ copy_required "$STAGE_DIR/08_gltf_viewer/assets/DamagedHelmet" \
 # StandardPBR/Unlit pair, same as 08) + shadow_shaders/ (rx_shadow's own
 # shadow_caster.vert.slang) + the shared tonemap shaders (flat) + this
 # sample's own D17 reference PNG -- see this script's own header comment.
+#
+# [Phase 5 Task 12, #48, Stage 1 exit] Same real gap as 08_gltf_viewer's
+# own identical block above (brdf.slang/energy_compensation_{off,on}.slang
+# were missing here too -- this sample's own CMakeLists.txt already
+# deploys all three into the build tree, confirmed directly) -- fixed
+# alongside it rather than deferred, since it is the exact same root cause
+# in the exact same file.
 mkdir -p "$STAGE_DIR/09_scene/material_shaders" "$STAGE_DIR/09_scene/shadow_shaders" "$STAGE_DIR/09_scene/references"
 copy_required "$STAGE_DIR/09_scene/material_shaders" \
   "$SAMPLES_BUILD_DIR/09_scene/material_shaders/material.slang" \
   "$SAMPLES_BUILD_DIR/09_scene/material_shaders/forward_entry.slang" \
   "$SAMPLES_BUILD_DIR/09_scene/material_shaders/standard_pbr.slang" \
-  "$SAMPLES_BUILD_DIR/09_scene/material_shaders/unlit.slang"
+  "$SAMPLES_BUILD_DIR/09_scene/material_shaders/unlit.slang" \
+  "$SAMPLES_BUILD_DIR/09_scene/material_shaders/brdf.slang" \
+  "$SAMPLES_BUILD_DIR/09_scene/material_shaders/energy_compensation_off.slang" \
+  "$SAMPLES_BUILD_DIR/09_scene/material_shaders/energy_compensation_on.slang"
 copy_required "$STAGE_DIR/09_scene/shadow_shaders" \
   "$SAMPLES_BUILD_DIR/09_scene/shadow_shaders/shadow_caster.vert.slang"
 copy_required "$STAGE_DIR/09_scene" \
@@ -367,6 +470,31 @@ copy_required "$STAGE_DIR/09_scene" \
   "$SAMPLES_BUILD_DIR/09_scene/tonemap.frag.slang"
 copy_required "$STAGE_DIR/09_scene/references" \
   "$SAMPLES_BUILD_DIR/09_scene/references/grid_scene.png"
+
+# [Phase 5 Task 12, #48, Stage 1 exit -- REAL pre-existing gap closed,
+# found by this task's own standalone-zip verification, inherited from
+# Task 10 (#46): sample_09_scene/main.cpp's own resolveEnvironmentPath()
+# has had a packaged-first lookup (`environments/gate_test_env.hdr` next
+# to the binary) since Task 10 landed, and this sample's own
+# CMakeLists.txt already deploys BOTH rx_ibl's bake-chain shaders
+# (`ibl_shaders/`) and the committed environment fixture
+# (`environments/gate_test_env.hdr`) into its own build-tree binary
+# directory -- but this script never staged either into the packaged zip,
+# so a standalone-unzipped copy's `rx::ibl::bakeEnvironment()` call failed
+# outright (`could not open shader file '.../ibl_shaders/
+# equirect_to_cubemap.slang'`) and setupEnvironment() fell through to its
+# own non-fatal WARN path, silently shipping a redistributed 09_scene with
+# zero indirect lighting -- exactly the "features must present" bug class
+# this whole ticket's own packaging row exists to close. Same fix shape as
+# 08_gltf_viewer's own ibl_shaders/+environments/ staging above.
+mkdir -p "$STAGE_DIR/09_scene/ibl_shaders" "$STAGE_DIR/09_scene/environments"
+copy_required "$STAGE_DIR/09_scene/ibl_shaders" \
+  "$SAMPLES_BUILD_DIR/09_scene/ibl_shaders/equirect_to_cubemap.slang" \
+  "$SAMPLES_BUILD_DIR/09_scene/ibl_shaders/irradiance_convolve.slang" \
+  "$SAMPLES_BUILD_DIR/09_scene/ibl_shaders/prefilter_specular.slang" \
+  "$SAMPLES_BUILD_DIR/09_scene/ibl_shaders/dfg_lut.slang"
+copy_required "$STAGE_DIR/09_scene/environments" \
+  "$SAMPLES_BUILD_DIR/09_scene/environments/gate_test_env.hdr"
 
 # 09_scene's own default scene asset -- the SAME pre-staged DamagedHelmet
 # copy 08 ships, staged again here (each packaged sample subdirectory is

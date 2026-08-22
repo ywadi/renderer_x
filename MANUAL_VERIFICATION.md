@@ -432,23 +432,34 @@ display.
 ## 08_gltf_viewer (`--present` mode)
 
 `sample_08_gltf_viewer` needs the Slang runtime libraries + its own
-`material_shaders/`/`references/` subdirectories + (for the default scene)
-a pre-staged `assets/DamagedHelmet/glTF/` deployed next to it — see
-`samples/README.md`'s own "Redistribution" section for the full manifest.
+`material_shaders/`/`ibl_shaders/`/`environments/`/`references/`
+subdirectories + (for the default scene) a pre-staged
+`assets/DamagedHelmet/glTF/` deployed next to it — see `samples/README.md`'s
+own "Redistribution" section for the full manifest.
 
 ### What "pass" means, every platform
 
 - The window opens showing a distinct dark-navy "loading" screen (never
   pure black) while the default DamagedHelmet asset imports
   asynchronously, then transitions to the rendered helmet once the import
-  completes (no stall, no frozen window during the load).
+  completes (no stall, no frozen window during the load) — lit by real
+  image-based lighting from the default baked environment plus its own
+  skybox background (not a flat ambient term).
 - Left-click-dragging orbits the camera around the helmet smoothly; no
   jump/snap on mouse-down, no drift after release.
 - `--scene <path/to/other.gltf>` loads a different glTF asset instead of
   DamagedHelmet; `--exposure <n>` feeds a real EV100 value into the
   camera's pre-exposure — positive (higher EV100) visibly *darkens* the
   rendered scene, negative *brightens* it (the physical-camera
-  convention; `0`, the default, is neutral).
+  convention; `0`, the default, is neutral); `--env <path.hdr|.exr>`
+  swaps the baked environment (skybox + IBL both change); `--no-env`
+  reproduces the old zero-indirect-light render for comparison.
+- [Phase 5 Task 12, #48] An ImGui HUD (top-left) reports the bound
+  environment (path, physical intensity, prefiltered mip count — or "none
+  bound" under `--no-env`) and the live exposure state (aperture/shutter/
+  ISO, EV100, resulting pre-exposure multiplier), updating live as
+  `--exposure`/`--env`/`--env-intensity` change what the run started
+  with.
 - Closing the window exits promptly, with no crash/hang, and logs
   `sample_08_gltf_viewer: window closed cleanly`.
 - On Linux, run with `--validate` and confirm no `[error]`-level validation
@@ -456,35 +467,59 @@ a pre-staged `assets/DamagedHelmet/glTF/` deployed next to it — see
 
 ### Linux (native, `linux-native` preset)
 
-- [ ] Build: `cmake --preset linux-native && cmake --build --preset linux-native`
-- [ ] Fetch the default asset once: `tools/fetch_assets.sh`
-- [ ] Run: `./build/linux-native/samples/08_gltf_viewer/sample_08_gltf_viewer --present --validate`
-- [ ] Loading screen shows briefly, then the helmet renders; mouse-drag
-      orbit feels smooth and centered on the helmet
-- [ ] `--scene`/`--exposure` both visibly change the render as described
-      above
-- [ ] Closes cleanly; headless mode (`--validate`, no `--present`) still
-      exits 0 with `headless gate PASSED`
+- [x] Build: `cmake --preset linux-native && cmake --build --preset linux-native`
+- [x] Fetch the default asset once: `tools/fetch_assets.sh`
+- [x] Run: `./build/linux-native/samples/08_gltf_viewer/sample_08_gltf_viewer --present --validate`
+- [x] Loading screen shows briefly, then the helmet renders under real IBL
+      + skybox (screenshot-confirmed, real display hardware)
+- [x] `--exposure`/`--env-intensity` visibly change the render AND the HUD
+      readout together, in the same run (screenshot-confirmed: default vs.
+      `--exposure 5 --env-intensity 2.0` side by side — see task-12-report.md)
+- [x] HUD reports environment/exposure state correctly, including
+      correctly DISTINGUISHING "neutral default" from "an explicit
+      `--exposure` override is engaged" (a real mislabeling bug this
+      round's own screenshot check caught: the HUD's first draft read
+      `Camera::exposureOverride.has_value()` directly, which is ALWAYS
+      true even at the default-constructed neutral state — fixed to track
+      whether `--exposure` was actually passed)
+- [x] Closes cleanly with zero unfiltered validation errors under
+      `--validate`; headless mode (no `--present`) still exits 0 with
+      `headless gate PASSED`
+- [ ] Mouse-drag orbit feel, `--scene <other.gltf>`, `--env <other-path>`,
+      and `--no-env` were NOT re-exercised in `--present` mode this round
+      (no synthetic mouse-drag input was sent to the nested display, and
+      only the default environment fixture was tried interactively) — all
+      four are covered functionally by the existing headless suite
+      (`sample_08_gltf_viewer_headless`'s own default-environment path,
+      `sample_08_gltf_viewer_exr_env_headless`'s `--env` routing proof,
+      and T10's own committed no-env-vs-env discrimination captures) but
+      not by a human/screenshot check in `--present` mode specifically.
 
-**Last run:** not yet performed as a real, human-observed run on real
-display hardware. Functionally verified during this task's own development
-via an offscreen X server (Xvfb) against lavapipe (forced via
-`VK_ICD_FILENAMES`, the same driver CI's own headless gate runs against):
-the loading-state clear renders, the async import completes and the
-helmet's own forward-shaded render replaces it, `--quit-during-load`
-cancels mid-import (after >=1 real texture upload had already landed) and
-tears down with zero unfiltered validation errors, and a real
-SDL-delivered quit (`SIGINT` under Xvfb, which SDL3 translates into a
-normal `SDL_EVENT_QUIT`) exits the present loop cleanly — logging
+**Last run:** 2026-08-22, Task 12 (#48) round — real display hardware
+(nested Xephyr, NVIDIA GeForce RTX 2080, driver 580.82.07), two runs,
+screenshot-verified: (1) default args — the render shows real IBL shading
++ a visible sky/ground gradient skybox (not the old flat-ambient look),
+HUD reports `environments/gate_test_env.hdr`, intensity 1.000, ev100
+14.966 "(neutral default)", multiplier 1.000000; (2)
+`--exposure 5 --env-intensity 2.0` — both the skybox and the helmet are
+visibly darker than run (1) (the physical-camera EV100 convention, correct
+direction), HUD reports intensity 2.000 and ev100 14.966 "(direct EV100
+override engaged, --exposure)" with the correspondingly smaller multiplier
+— exact numbers and both screenshots are in task-12-report.md. Both runs
+closed cleanly with zero unfiltered validation errors. This is a real,
+first display-hardware confirmation for this sample, narrower in scope
+than a full free-form interactive session (see the unchecked row above for
+exactly what it does not cover). Also functionally verified (as before,
+unaffected by this round) via an offscreen X server (Xvfb) against
+lavapipe (forced via `VK_ICD_FILENAMES`, the same driver CI's own headless
+gate runs against): the loading-state clear renders, the async import
+completes and the helmet's own forward-shaded render replaces it,
+`--quit-during-load` cancels mid-import (after >=1 real texture upload had
+already landed) and tears down with zero unfiltered validation errors, and
+a real SDL-delivered quit (`SIGINT` under Xvfb, which SDL3 translates into
+a normal `SDL_EVENT_QUIT`) exits the present loop cleanly — logging
 `sample_08_gltf_viewer: window closed cleanly` with zero
-`VUID-vkDestroyDevice-*` "child object not destroyed" errors (a real
-teardown-ordering bug this task's own development hit, root-caused, and
-fixed: `FrameSync`'s owned command pool/fences/semaphores were being torn
-down AFTER the `VkDevice` that owned them). This is real functional
-verification, not a placeholder — but it is not the human-observed-on-real-
-hardware, real-mouse-drag check this file otherwise tracks. Fill in the
-checkboxes and hardware/driver details above the first time `--present` is
-actually watched (and dragged) on a real display.
+`VUID-vkDestroyDevice-*` "child object not destroyed" errors.
 
 ## 09_scene (`--present` mode, the Phase 4 phase-exit sample)
 

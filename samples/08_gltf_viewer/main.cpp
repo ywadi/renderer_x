@@ -85,6 +85,7 @@
 #include <rx_asset/texture_decode.h>
 #include <rx_core/log.h>
 #include <rx_core/profile.h>
+#include <rx_debug_ui/overlay.h>
 #include <rx_graph/executor.h>
 #include <rx_graph/render_graph.h>
 #include <rx_graph/scene_color.h>
@@ -119,6 +120,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <SDL3/SDL.h>
+#include <imgui.h>
 #include <volk.h>
 
 #include <algorithm>
@@ -131,6 +133,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -223,6 +226,30 @@ struct Args {
     // comment, rx_scene/scene.h) -- default 1.0 (neutral), matching
     // EnvironmentDesc's own default.
     float envIntensity = 1.0F;
+
+    // [Phase 5 Task 12, #48, Stage 1 checkpoint] `--bench-frames <n>` --
+    // headless-only steady-state frame-time benchmark, run AFTER the
+    // scene has loaded and the environment has baked (runHeadless()'s own
+    // post-D17-gate tail): re-executes `graph` (the SAME forward+skybox+
+    // tonemap pass chain the D17-gated frames already ran) `n` times via
+    // the existing offscreen `captureFrame()`-style submit-and-wait path,
+    // timing each iteration's own wall-clock duration, and logs an
+    // aggregate `sample08: perf frame_bench ...` stats line -- this
+    // sample's own established greppable-stats-line convention (the
+    // "sample08: perf ibl_bake"/"sample08: perf scene=..." lines
+    // above/below both already establish it). 0 (the default) disables
+    // the benchmark entirely -- zero cost to the D17 gate's own two-frame
+    // capture, matching every other sample's own "additive, opt-in via a
+    // dedicated flag" benchmark convention (07_stress's own `--draws`,
+    // 09_scene's own `--stress`). OFFSCREEN, not vsync-gated present-mode
+    // timing -- same "prefer headless measurement" posture this whole
+    // phase's own verification conventions call for (gate ruling
+    // rulings-2026-08-20.md RC7); the number this produces is CPU-record +
+    // GPU-submit-and-wait wall time per iteration, not a real swapchain
+    // frame-pacing measurement -- task-12-report.md's own numbers section
+    // states this methodology explicitly rather than letting the term
+    // "frame time" imply vsync pacing that never happened.
+    uint32_t benchFrames = 0;
 };
 
 std::optional<Args> parseArgs(int argc, char** argv) {
@@ -271,6 +298,14 @@ std::optional<Args> parseArgs(int argc, char** argv) {
                 return std::nullopt;
             }
             args.envIntensity = parsed;
+        } else if (arg == "--bench-frames" && i + 1 < argc) {
+            const std::string_view value = argv[++i];
+            uint32_t parsed = 0;
+            if (std::from_chars(value.data(), value.data() + value.size(), parsed).ec != std::errc{}) {
+                RX_LOG_ERROR("sample_08_gltf_viewer: --bench-frames expects a non-negative integer, got '{}'", value);
+                return std::nullopt;
+            }
+            args.benchFrames = parsed;
         } else {
             RX_LOG_ERROR("sample_08_gltf_viewer: unrecognized argument '{}'", arg);
             return std::nullopt;
@@ -864,6 +899,17 @@ struct App {
     // comment for why args.exposure==0.0F deliberately does NOT call
     // setExposure() at all.
     rx::scene::Camera exposureCamera;
+    // [Phase 5 Task 12, #48] Display-only, for drawHud()'s own "direct
+    // EV100 override engaged" annotation -- `exposureCamera.
+    // exposureOverride.has_value()` is ALWAYS true at this Camera's own
+    // default-constructed state (Camera::exposureOverride's own header
+    // comment: "DEFAULTS ENGAGED, AT EXACTLY 1.0"), so that field ALONE
+    // cannot distinguish "the user passed --exposure" from "nobody did,
+    // this is just the neutral default" -- reading it directly for the
+    // HUD would mislabel every unmodified run as having an explicit
+    // override engaged. Set once by applyExposureArg() below, mirroring
+    // that function's own args.exposure!=0.0F condition exactly.
+    bool exposureOverrideFromCli = false;
 
     rx::asset::AsyncImportHandle importHandle;
     bool importStarted = false;
@@ -900,6 +946,24 @@ struct App {
     // `exposureCamera.exposure()` at upload time, the SAME single point
     // `lightColor`/(the retired) `ambientColor` already apply it at.
     float envIntensityPhysical = 1.0F;
+    // [Phase 5 Task 12, #48] The resolved path this run's environment was
+    // (or would have been, on a failed/absent lookup) loaded from --
+    // display-only, set once by applyEnvironmentArg()/setupEnvironment()'s
+    // caller, read by drawHud() below. Empty iff `--no-env` was passed
+    // (drawHud() reports that case from `environment.has_value()` alone,
+    // not from this string being empty, since an absent-fixture
+    // no-environment run also leaves this empty -- see
+    // applyEnvironmentArg()'s own comment).
+    std::string environmentPath;
+
+    // --- HUD [Phase 5 Task 12, #48; rx_debug_ui::Overlay, gate ruling #16]
+    // -- the ONLY seam through which ImGui content reaches this sample, per
+    // that class's own header comment; see drawHud() below for the
+    // environment/exposure readout content this ticket's own acceptance
+    // line requires. std::optional: Overlay has no default constructor
+    // (buildable only via its own static create()), same reasoning as
+    // window/context/device/... above.
+    std::optional<rx::debug_ui::Overlay> overlay;
 
     // Skybox pass (shaders/ibl/skybox.slang) -- built only once an
     // environment is actually loaded (buildSkyboxPipeline() needs the
@@ -1520,6 +1584,10 @@ void destroyApp(App& app) {
     if (app.device.has_value() && app.device->device() != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(app.device->device());
     }
+    // [Phase 5 Task 12, #48] Must precede bindless/device teardown -- owns
+    // its own descriptor pool/pipeline/font texture. Same ordering/
+    // rationale as sample_09_scene's own identical line.
+    app.overlay.reset();
     for (MaterialGpuBinding& binding : app.materialBindings) {
         binding.paramBuffer.reset();  // paramSet itself is freed implicitly by the arena's own pool teardown below.
     }
@@ -2312,7 +2380,73 @@ void declareGraph(rx::graph::RenderGraph& graph, App& app, VkFormat backbufferFo
         .addColorOutput("backbuffer", swapchainRelativeDesc(backbufferFormat))
         .setExecute([&app](rx::graph::PassContext& ctx) { recordTonemapDraw(ctx, app); });
 
+    if (app.overlay.has_value()) {
+        // [Phase 5 Task 12, #48; gate ruling #16] Declared AFTER "tonemap"
+        // -- LOAD, not CLEAR, so the HUD composites over the already-
+        // tonemapped scene (Overlay::addPass()'s own comment: the graph
+        // derives this automatically from write order). Both entry points
+        // below (runHeadless()/runPresent()) create `app.overlay` before
+        // calling this function; a caller that never does (there is none
+        // left in this sample) simply gets no HUD pass, matching this
+        // guard's own "optional" framing.
+        app.overlay->addPass(graph, "backbuffer");
+    }
+
     graph.setBackbufferSource("backbuffer");
+}
+
+// --- HUD [Phase 5 Task 12, #48 -- the ticket's own "environment/exposure
+// readout" acceptance line, built on rx_debug_ui::Overlay + ImGui, the SAME
+// engine-provided HUD facility sample_09_scene already consumes (gate
+// ruling #16) -- no sample-local text-rendering/HUD machinery of its own,
+// per the Task 5 "samples are pure consumers of engine facilities" rule
+// this ticket's own audit row cites directly]. Called between
+// `overlay->beginFrame()` and `executor->execute()`, mirroring
+// sample_09_scene's own drawHud()/call-site convention exactly. `lastFrameMs`
+// is 0.0 in headless mode (no real frame-to-frame cadence to report --
+// see the `presentMode` branch below). ------------------------------------
+void drawHud(App& app, bool presentMode, double lastFrameMs) {
+    ImGui::SetNextWindowSize(ImVec2(360.0F, 220.0F), ImGuiCond_FirstUseEver);
+    ImGui::Begin("sample_08_gltf_viewer");
+
+    if (presentMode) {
+        ImGui::Text("Frame: %.3f ms", lastFrameMs);
+        ImGui::Separator();
+    }
+
+    // --- Environment [Task 10 (#46) API, consumed read-only here] --------
+    ImGui::Text("Environment");
+    if (app.environment.has_value()) {
+        ImGui::TextWrapped("  bound: %s", app.environmentPath.c_str());
+        ImGui::Text("  intensity (physical, pre-exposure): %.3f", app.envIntensityPhysical);
+        ImGui::Text("  prefiltered mips: %u", app.environment->prefilteredMipCount);
+    } else {
+        ImGui::Text("  none bound (--no-env, or no fixture found -- see the startup log)");
+    }
+    ImGui::Separator();
+
+    // --- Exposure [Task 4 (#40) API, consumed read-only here] ------------
+    // `rx::scene::Camera::aperture`/`shutterSpeed`/`sensitivity`/`ev100()`/
+    // `exposure()` -- every value below is read STRAIGHT off `exposureCamera`,
+    // never recomputed locally (Task 5's own "no sample hand-rolls what the
+    // engine already computes" rule, applied to this ticket's new HUD
+    // surface exactly like the row above applies it to the environment
+    // readout). The "--exposure engaged" annotation reads
+    // `app.exposureOverrideFromCli`, NOT `exposureCamera.exposureOverride.
+    // has_value()` -- that optional is engaged (at a neutral 1.0) on a
+    // freshly-constructed Camera too (see that field's own header comment),
+    // so testing it directly would mislabel every unmodified run as having
+    // an explicit override (a real bug this ticket's own present-mode
+    // screenshot verification caught and fixed).
+    ImGui::Text("Exposure");
+    ImGui::Text("  aperture f/%.1f  shutter 1/%.0fs  ISO %.0f", static_cast<double>(app.exposureCamera.aperture),
+                static_cast<double>(1.0F / app.exposureCamera.shutterSpeed),
+                static_cast<double>(app.exposureCamera.sensitivity));
+    ImGui::Text("  ev100: %.3f%s", static_cast<double>(app.exposureCamera.ev100()),
+                app.exposureOverrideFromCli ? "  (direct EV100 override engaged, --exposure)" : "  (neutral default)");
+    ImGui::Text("  pre-exposure multiplier: %.6f", static_cast<double>(app.exposureCamera.exposure()));
+
+    ImGui::End();
 }
 
 // --- D17 reference-gate support ------------------------------------------
@@ -2386,6 +2520,7 @@ bool isLavapipeDevice(VkPhysicalDevice physicalDevice) {
 void applyExposureArg(App& app, const Args& args) {
     if (args.exposure != 0.0F) {
         app.exposureCamera.setExposure(args.exposure);
+        app.exposureOverrideFromCli = true;
     }
 }
 
@@ -2424,6 +2559,7 @@ bool applyEnvironmentArg(App& app, const Args& args) {
         RX_LOG_ERROR("sample_08_gltf_viewer: setupEnvironment('{}') failed", envPath.string());
         return false;
     }
+    app.environmentPath = envPath.string();
     RX_LOG_INFO("sample_08_gltf_viewer: environment '{}' baked and bound (intensity={:.3f})", envPath.string(),
                 args.envIntensity);
     return true;
@@ -2473,6 +2609,19 @@ int runHeadless(const Args& args) {
         args.scenePath.empty() ? resolveDefaultScenePath() : std::filesystem::path(args.scenePath);
     if (!std::filesystem::exists(scenePath)) {
         RX_LOG_ERROR("sample_08_gltf_viewer: scene file not found: '{}'", scenePath.string());
+        destroyApp(*app);
+        return 1;
+    }
+
+    // [Phase 5 Task 12, #48] Built BEFORE declareGraph() -- that function's
+    // own `app.overlay.has_value()` guard decides whether the HUD pass is
+    // even declared. Headless mode still gets a real (invisible, per
+    // makeApp()'s own `visible=false`) Window -- Overlay::create() needs
+    // one regardless of presentability, same as sample_09_scene's own
+    // headless overlay.
+    app->overlay = rx::debug_ui::Overlay::create(*app->device, *app->window, app->device->swapchainFormat());
+    if (!app->overlay.has_value()) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: Overlay::create failed");
         destroyApp(*app);
         return 1;
     }
@@ -2619,6 +2768,7 @@ int runHeadless(const Args& args) {
     // -- the scene is guaranteed not-yet-ready) -- exercises the graph's own
     // automatic clear + this sample's own D17 loading-color override.
     app->sceneReady = false;
+    app->overlay->beginFrame();  // no widgets this frame -- HUD pass renders empty draw data, D17 pixels untouched.
     std::vector<uint8_t> loadingPixels = captureFrame();
     bool gateOk = !loadingPixels.empty();
 
@@ -2730,6 +2880,7 @@ int runHeadless(const Args& args) {
         // submits and waits every call) -- no frames-in-flight GPU overlap
         // to race, so slot 0 always is correct and sufficient here.
         updateDrawDataPerPassFields(*app, viewProj, app->camera.eye(), /*frameSlot=*/0);
+        app->overlay->beginFrame();  // no widgets this frame either -- see the loading-state capture's own comment.
         loadedPixels = captureFrame();
         if (loadedPixels.empty()) {
             gateOk = false;
@@ -2755,6 +2906,68 @@ int runHeadless(const Args& args) {
         }
     } else {
         gateOk = false;
+    }
+
+    // --- HUD smoke-test frame [Phase 5 Task 12, #48] -- real widgets, NOT
+    // pixel-gated (mirrors sample_09_scene's own identical convention: the
+    // two D17-gated captures above stay byte-identical to their committed
+    // references by drawing NO widgets; this separate, discarded-pixels
+    // frame is what actually proves the new HUD pass renders real content
+    // when content IS drawn -- the dichotomy is this ticket's own
+    // discrimination proof for the added render-graph pass). Skipped
+    // entirely when the scene never became ready (nothing meaningful for
+    // drawHud()'s environment/exposure readout to report yet, and the run
+    // is already failing the gate).
+    if (app->sceneReady) {
+        app->overlay->beginFrame();
+        drawHud(*app, /*presentMode=*/false, /*lastFrameMs=*/0.0);
+        std::vector<uint8_t> hudFramePixels = captureFrame();
+        (void)hudFramePixels;
+        const ImDrawData* hudDrawData = ImGui::GetDrawData();
+        if (hudDrawData == nullptr || hudDrawData->CmdListsCount == 0 || hudDrawData->TotalVtxCount == 0) {
+            RX_LOG_ERROR(
+                "sample_08_gltf_viewer: HUD overlay pass produced no draw data (CmdListsCount={}, TotalVtxCount={})",
+                hudDrawData != nullptr ? hudDrawData->CmdListsCount : -1,
+                hudDrawData != nullptr ? hudDrawData->TotalVtxCount : -1);
+            gateOk = false;
+        }
+    }
+
+    // --- --bench-frames <n> [Phase 5 Task 12, #48, Stage 1 checkpoint] --
+    // see Args::benchFrames' own comment for the exact methodology this
+    // publishes. Runs AFTER the HUD smoke-test frame above (so the bench
+    // loop's own repeated `beginFrame()`+`captureFrame()` calls draw no
+    // widgets -- an empty HUD pass costs a fixed, tiny amount of recorded-
+    // but-empty command-buffer work per iteration, not a growing one,
+    // matching the D17-gated frames' own "no widgets" cost shape) and
+    // AFTER the "sample08: perf scene=..." cold-start line above, so a
+    // reader greps one process's own log top-to-bottom in the natural
+    // "cold start, then steady state" order. No-op (0 iterations logged)
+    // when the scene never became ready.
+    if (app->sceneReady && args.benchFrames > 0) {
+        std::vector<double> iterationMs;
+        iterationMs.reserve(args.benchFrames);
+        for (uint32_t i = 0; i < args.benchFrames; ++i) {
+            const auto iterStart = std::chrono::steady_clock::now();
+            app->overlay->beginFrame();  // no widgets -- steady-state cost only, matching the D17-gated frames.
+            std::vector<uint8_t> benchPixels = captureFrame();
+            iterationMs.push_back(
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - iterStart).count());
+            if (benchPixels.empty()) {
+                RX_LOG_ERROR("sample_08_gltf_viewer: --bench-frames iteration {} capture failed", i);
+                gateOk = false;
+                break;
+            }
+        }
+        if (!iterationMs.empty()) {
+            const double sum = std::accumulate(iterationMs.begin(), iterationMs.end(), 0.0);
+            const double avg = sum / static_cast<double>(iterationMs.size());
+            const auto [minIt, maxIt] = std::minmax_element(iterationMs.begin(), iterationMs.end());
+            RX_LOG_INFO(
+                "sample08: perf frame_bench scene='{}' env='{}' frames={} avg_ms={:.3f} min_ms={:.3f} max_ms={:.3f}",
+                scenePath.string(), app->environmentPath.empty() ? "none" : app->environmentPath,
+                iterationMs.size(), avg, *minIt, *maxIt);
+        }
     }
 
     // --- --write-references escape hatch [D17] -- see Args' own comment.
@@ -2896,6 +3109,15 @@ int runPresent(const Args& args) {
         return 1;
     }
 
+    // [Phase 5 Task 12, #48] Built BEFORE declareGraph() -- see
+    // runHeadless()'s own identical call site for the full rationale.
+    app->overlay = rx::debug_ui::Overlay::create(*app->device, *app->window, app->device->swapchainFormat());
+    if (!app->overlay.has_value()) {
+        RX_LOG_ERROR("sample_08_gltf_viewer: Overlay::create failed");
+        destroyApp(*app);
+        return 1;
+    }
+
     rx::graph::RenderGraph graph;
     declareGraph(graph, *app, app->device->swapchainFormat());
 
@@ -2944,9 +3166,25 @@ int runPresent(const Args& args) {
     float lastMouseY = 0.0F;
     SDL_GetMouseState(&lastMouseX, &lastMouseY);
 
+    // [Phase 5 Task 12, #48] Feeds drawHud()'s own "Frame: %.3f ms" line --
+    // wall-clock between successive loop iterations, the same measurement
+    // shape sample_09_scene's own `app.hud.pushFrameTime()` uses (a plain
+    // per-iteration delta, not a rolling average -- this sample has no
+    // existing HudState-style struct to extend, and one line does not
+    // justify introducing one).
+    auto lastFrameTime = std::chrono::steady_clock::now();
+
     while (running) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
+            // [gate ruling #16] ImGui sees every event first, exactly like
+            // sample_09_scene's own `Window::pumpEvents()`-routed
+            // `preDispatch` seam -- this sample polls SDL directly rather
+            // than through that seam (its own header comment: the orbit
+            // camera's SDL_GetMouseState() query is this sample's
+            // deliberately-kept escape hatch), so the call is made
+            // explicitly here instead.
+            app->overlay->processEvent(event);
             if (event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
                 running = false;
             }
@@ -2973,6 +3211,12 @@ int runPresent(const Args& args) {
         dragging = leftDown;
         lastMouseX = mouseX;
         lastMouseY = mouseY;
+
+        const auto frameNow = std::chrono::steady_clock::now();
+        const double lastFrameMs = std::chrono::duration<double, std::milli>(frameNow - lastFrameTime).count();
+        lastFrameTime = frameNow;
+        app->overlay->beginFrame();
+        drawHud(*app, /*presentMode=*/true, lastFrameMs);
 
         const auto result = loop->runFrame([&](const rx::frame_loop::FrameContext& ctx) {
             if (app->sceneReady) {
