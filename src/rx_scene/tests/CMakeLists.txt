@@ -16,6 +16,8 @@ add_executable(rx_scene_tests
     fly_camera_test.cpp
     # [Phase 5 Stage 2 Task 13, #49] KHR_lights_punctual attenuation math.
     light_math_test.cpp
+    # [Phase 5 Stage 2 Task 14, #50] camera-frustum froxel grid math.
+    froxel_grid_test.cpp
 )
 target_link_libraries(rx_scene_tests PRIVATE rx_scene doctest::doctest)
 add_test(NAME rx_scene_tests COMMAND rx_scene_tests)

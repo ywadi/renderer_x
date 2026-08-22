@@ -395,6 +395,16 @@ size_t Scene::lightCount() const {
     return lightGeneration_.size() - lightFreeList_.size();
 }
 
+std::span<const LightRecord> Scene::lightRecordsSpan() const {
+    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightRecordsSpan");
+    return lightRecords_;
+}
+
+std::span<const uint8_t> Scene::lightAliveSpan() const {
+    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightAliveSpan");
+    return lightAlive_;
+}
+
 // ---------------------------------------------------------------------
 // Environment [Phase 5 Task 10, #46]
 // ---------------------------------------------------------------------

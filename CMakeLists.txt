@@ -115,6 +115,18 @@ add_subdirectory(src/rx_material)
 # library rather than folded into either).
 add_subdirectory(src/rx_ibl)
 
+# Phase 5 Stage 2 Task 14 -- rx_cluster: the camera-frustum froxel grid +
+# GPU-compute clustered light assignment (ticket #50). Depends on rx_scene
+# (device-free froxel grid math, froxel_grid.h, + Scene's own light-span
+# accessors), rx_graph (compute-class Pass API), rx_rhi_vk
+# (ComputePipelineCache), and rx_shader (Compiler/reflect(), the full
+# target) -- added here, alongside rx_ibl, the other Task-2-compute-class
+# consumer library with the identical dependency shape (see
+# src/rx_cluster/include/rx_cluster/cluster_lighting.h's own "MODULE
+# OWNERSHIP" comment for why this is a new, self-contained library rather
+# than folded into rx_scene, which is explicitly, deliberately device-free).
+add_subdirectory(src/rx_cluster)
+
 # Phase 4 Stage 2 Task 22 -- rx_shadow: the scene shadow quality bridge
 # (spec D21; gate matrix-issue23-shadow-bridge.md as amended by gate/
 # rulings-2026-08-18.md's #23 + RC2/RC3). Depends on rx_rhi_vk (Device/
@@ -199,6 +211,10 @@ add_subdirectory(tools/gen_exr_env_fixtures)
 # Phase 5 Stage 1 Task 9 [#45]: standalone IBL bake-timing benchmark, NOT
 # ctest-registered -- see tools/rx_ibl_bench/main.cpp's own header comment.
 add_subdirectory(tools/rx_ibl_bench)
+# Phase 5 Stage 2 Task 14 [#50]: standalone synthetic-high-light-count
+# froxelization+assignment timing benchmark, NOT ctest-registered -- see
+# tools/rx_cluster_bench/main.cpp's own header comment.
+add_subdirectory(tools/rx_cluster_bench)
 add_subdirectory(samples/01_triangle)
 add_subdirectory(samples/02_hotreload)
 add_subdirectory(samples/03_bindless_mesh)

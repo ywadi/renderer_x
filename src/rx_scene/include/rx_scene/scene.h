@@ -564,6 +564,28 @@ public:
     [[nodiscard]] uint8_t lightChannels(LightHandle handle) const;
     [[nodiscard]] size_t lightCount() const;
 
+    // [Phase 5 Stage 2 Task 14, #50] Bulk, span-based light iteration --
+    // mirrors Task 19's own aliveSpan()/generationsSpan() addition to the
+    // RENDERABLE side of this class (necessary for the identical reason:
+    // "a consumer iterating the span columns directly only ever has a bare
+    // SLOT INDEX, with no way to... reconstruct a valid handle to call a
+    // per-handle accessor" -- aliveSpan()'s own comment above, word for
+    // word applicable here). Phase 4's own light-storage comment ("a scene
+    // has a handful of lights, not tens of thousands... this deliberately
+    // does NOT mirror the renderable columns above") no longer holds by
+    // Task 14's own charter target (hundreds-to-thousands of local lights,
+    // clustered) -- rx_cluster's per-frame froxel light-count/scatter
+    // compute passes need to enumerate every LIVE point/spot light ONCE
+    // per frame without per-light handle bookkeeping of its own (the exact
+    // "bulk SoA culling loop" need aliveSpan() closed for DrawListBuilder).
+    // Index i in both spans addresses the SAME underlying light slot (a
+    // dead slot's LightRecord holds whatever its last occupant left,
+    // exactly like the renderable columns' own documented convention -- a
+    // caller MUST consult lightAliveSpan()[i] before trusting
+    // lightRecordsSpan()[i]).
+    [[nodiscard]] std::span<const LightRecord> lightRecordsSpan() const;
+    [[nodiscard]] std::span<const uint8_t> lightAliveSpan() const;
+
     // --- Environment [Phase 5 Task 10, #46] -------------------------------
 
     // Sets/replaces this Scene's own single active environment -- see
@@ -632,7 +654,13 @@ private:
     // thousands), so this deliberately does not mirror the renderable
     // columns above.
     std::vector<uint32_t> lightGeneration_;
-    std::vector<bool> lightAlive_;
+    // [Phase 5 Stage 2 Task 14, #50] uint8_t, not vector<bool> -- was
+    // internal-bookkeeping-only (comment now stale, matching Task 19's own
+    // identical fix to Scene::alive_: lightAliveSpan() above spans it
+    // directly, so it needs the same contiguous-bool-as-uint8_t
+    // representation every other span-accessible boolean column already
+    // uses, per Scene::aliveSpan()'s own comment).
+    std::vector<uint8_t> lightAlive_;
     std::vector<uint32_t> lightFreeList_;
     std::vector<LightRecord> lightRecords_;
 

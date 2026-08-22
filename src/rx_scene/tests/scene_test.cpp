@@ -545,6 +545,41 @@ TEST_CASE("Directional/Point/Spot lights coexist in Scene's own light storage, i
     CHECK(scene.isLightAlive(spot));
 }
 
+TEST_CASE("Scene::lightRecordsSpan()/lightAliveSpan() [Phase 5 Stage 2 Task 14, #50] correctly "
+          "distinguish a live slot from a destroyLight()d hole, mirroring Task 19's own "
+          "aliveSpan()/generationsSpan() proof for renderables -- necessary now that rx_cluster's "
+          "per-frame froxel light-count/scatter passes enumerate every live point/spot light in "
+          "BULK, by slot index, rather than through per-light handles") {
+    rx::scene::Scene scene(&fallbackShapedBounds);
+    rx::scene::PointLightDesc desc;
+    desc.colorCandela = glm::vec3(11.0F, 22.0F, 33.0F);
+    rx::scene::LightHandle first = scene.createPointLight(desc);
+    desc.colorCandela = glm::vec3(44.0F, 55.0F, 66.0F);
+    rx::scene::LightHandle second = scene.createPointLight(desc);
+    desc.colorCandela = glm::vec3(77.0F, 88.0F, 99.0F);
+    rx::scene::LightHandle third = scene.createPointLight(desc);
+    (void)first;
+    (void)third;
+
+    REQUIRE(scene.lightRecordsSpan().size() == 3);
+    REQUIRE(scene.lightAliveSpan().size() == 3);
+    // Index i in both spans addresses the SAME slot -- exact value proof,
+    // not just size/liveness.
+    CHECK(scene.lightAliveSpan()[1] != 0);
+    CHECK(scene.lightRecordsSpan()[1].colorLux == glm::vec3(44.0F, 55.0F, 66.0F));
+
+    scene.destroyLight(second);
+    // The destroyed slot reads dead but its stale LightRecord content is
+    // NOT retroactively zeroed (same "holds whatever its last occupant
+    // left" convention aliveSpan()'s own comment documents for renderables)
+    // -- a caller MUST gate on lightAliveSpan()[i] before trusting
+    // lightRecordsSpan()[i], exactly what this assertion proves.
+    CHECK(scene.lightAliveSpan()[1] == 0);
+    CHECK(scene.lightRecordsSpan()[1].colorLux == glm::vec3(44.0F, 55.0F, 66.0F));
+    CHECK(scene.lightAliveSpan()[0] != 0);
+    CHECK(scene.lightAliveSpan()[2] != 0);
+}
+
 // ---------------------------------------------------------------------
 // instantiateImportedLights() [Phase 5 Stage 2 Task 13, #49] -- converts
 // asset::LightData (already parsed+preserved since Phase 4, per

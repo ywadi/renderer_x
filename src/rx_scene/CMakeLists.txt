@@ -29,6 +29,13 @@ add_library(rx_scene STATIC
     # Phase 5 Stage 2 Task 13 [#49] -- device-free KHR_lights_punctual
     # attenuation math (see light_math.h's own header comment).
     light_math.cpp
+    # Phase 5 Stage 2 Task 14 [#50] -- device-free camera-frustum froxel
+    # grid math (see froxel_grid.h's own header comment). rx_cluster (a
+    # separate, new library -- see its own CMakeLists.txt comment) is the
+    # GPU-compute orchestration consumer; this file stays here, alongside
+    # light_math.cpp, because it has the SAME device-free-math-shared-with-
+    # a-Slang-port shape that file established.
+    froxel_grid.cpp
 )
 target_include_directories(rx_scene PUBLIC include)
 target_link_libraries(rx_scene PUBLIC rx_core rx_asset rx_task)

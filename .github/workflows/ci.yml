@@ -727,7 +727,7 @@ jobs:
       # (:77), not this one.
       - name: Test under wine (xvfb; GPU tests excluded -- no Vulkan under Wine)
         run: >-
-          ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_material_brdf_gpu|rx_debug_ui_gpu|rx_frame_loop_gpu|rx_ibl_gpu|rx_conformance|sample' --output-on-failure
+          ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_material_brdf_gpu|rx_debug_ui_gpu|rx_frame_loop_gpu|rx_ibl_gpu|rx_cluster_gpu|rx_conformance|sample' --output-on-failure
           --output-junit ${{ github.workspace }}/ctest-results-windows-cross-zig.xml
 
       - name: Build budget check
