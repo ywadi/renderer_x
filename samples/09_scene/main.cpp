@@ -136,6 +136,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -220,6 +221,18 @@ struct Args {
     bool stress = false;
     uint32_t stressDraws = kDefaultStressDraws;
     uint32_t threads = 0;  // 0 == Scheduler default (hardware_concurrency() - 1).
+    // [Phase 5 Stage 2 Task 15, #51] Clustered Forward+ scaling-numbers
+    // benchmark -- see runHeadless()'s own "--stress-lights" block for the
+    // full methodology. 0 (default) == no synthetic Point lights added
+    // (byte-identical to pre-Task-15 --stress behavior).
+    uint32_t stressLights = 0;
+    // [Phase 5 Stage 2 Task 15, #51] Headless-only, mirrors samples/
+    // 08_gltf_viewer's own identically-named flag/methodology exactly
+    // (cpu_record_avg/min/p95/max_ms, timed around ONLY executor->
+    // execute() -- see that sample's own Args::benchFrames comment for the
+    // full metric definition this reuses verbatim for direct
+    // comparability). 0 (default) == no bench loop.
+    uint32_t benchFrames = 0;
     // [D17] Undocumented-to-users escape hatch -- see samples/08_gltf_viewer's
     // own identical field for the full rationale; the ONLY way
     // tools/regen_references.sh produces this sample's new reference PNG.
@@ -259,6 +272,22 @@ std::optional<Args> parseArgs(int argc, char** argv) {
                 return std::nullopt;
             }
             args.stressDraws = parsed;
+        } else if (arg == "--stress-lights" && i + 1 < argc) {
+            const std::string_view value = argv[++i];
+            uint32_t parsed = 0;
+            if (std::from_chars(value.data(), value.data() + value.size(), parsed).ec != std::errc{}) {
+                RX_LOG_ERROR("sample_09_scene: --stress-lights expects a non-negative integer, got '{}'", value);
+                return std::nullopt;
+            }
+            args.stressLights = parsed;
+        } else if (arg == "--bench-frames" && i + 1 < argc) {
+            const std::string_view value = argv[++i];
+            uint32_t parsed = 0;
+            if (std::from_chars(value.data(), value.data() + value.size(), parsed).ec != std::errc{}) {
+                RX_LOG_ERROR("sample_09_scene: --bench-frames expects a non-negative integer, got '{}'", value);
+                return std::nullopt;
+            }
+            args.benchFrames = parsed;
         } else if (arg == "--threads" && i + 1 < argc) {
             const std::string_view value = argv[++i];
             uint32_t parsed = 0;
@@ -2438,6 +2467,68 @@ bool buildStressField(App& app, uint32_t drawCount) {
     return true;
 }
 
+// [Phase 5 Stage 2 Task 15, #51] `--stress-lights N` scaling-benchmark
+// helper -- places `lightCount` synthetic Point lights (`Scene::
+// createPointLight()`, the SAME production entry point
+// `rx::asset::instantiateImportedLights()`/the default helmet-grid path
+// both go through) into `app.scene`, purely additive to
+// `buildStressField()`'s own geometry above (never touches the cube
+// field, never runs when `lightCount == 0` -- see Args::stressLights' own
+// header comment for the "byte-identical when absent" contract). Reuses
+// `stressGridPosition()`'s own [-halfExtent, halfExtent] XZ footprint --
+// keyed off `drawCount`, NOT `lightCount` -- so the light field's spatial
+// EXTENT always matches whatever the camera already frames (see
+// buildStressField()'s own "camera frames the WHOLE field" comment just
+// above), regardless of how many lights are requested. Once `lightCount`
+// exceeds the geometry grid's own cell count, positions wrap (`i %
+// cellCount`) with a small per-wrap jitter so repeated lights don't sit
+// exactly coincident -- this is a DELIBERATE dense-occupancy stress
+// regime (many lights packed into the same visible froxels as
+// `lightCount` grows past the cube count), the worst case clustered
+// shading exists to make cheap, and exactly what the acceptance matrix's
+// "scaling numbers... 100/1k/5k" row means to exercise.
+//
+// `range` is a small, finite, LOCAL footprint (a few neighboring grid
+// cells) rather than `PointLightDesc::range`'s own "0 == pure
+// inverse-square, unwindowed" default -- an unwindowed light would
+// (correctly) still get a FINITE cull radius from
+// `rx::scene::froxel::pointLightCullRadius()`'s own intensity-cutoff
+// fallback inside `buildClusterLightList()`, but an explicit, small
+// range keeps each light's real per-froxel footprint small and
+// predictable here, matching how a real local light (a lamp, not a sun)
+// is authored. `castsShadows = false`: this sample's shadow system is a
+// single DIRECTIONAL key light (D21/RC3), already unconditionally off in
+// `--stress` mode (`app.shadowEnabled = false` at this function's own
+// call site) -- these Point lights participate in clustered shading
+// only, never shadow casting, so the flag is inert either way but set
+// correctly regardless.
+void addStressLights(App& app, uint32_t lightCount, uint32_t drawCount) {
+    const uint32_t cellCount = std::max<uint32_t>(1, stressGridSize(drawCount) * stressGridSize(drawCount));
+    constexpr float kLightHeight = kStressInstanceScale + 1.0F;
+    constexpr float kLightRange = kStressInstanceSpacing * 3.0F;
+    constexpr float kJitterStep = kStressInstanceSpacing * 0.3F;
+    const glm::vec3 kColorCandela(40.0F, 37.0F, 32.0F);  // modest, warm-white local point light.
+    for (uint32_t i = 0; i < lightCount; ++i) {
+        const uint32_t cell = i % cellCount;
+        glm::vec3 pos = stressGridPosition(cell, drawCount);
+        pos.y = kLightHeight;
+        if (lightCount > cellCount) {
+            const uint32_t wrap = i / cellCount;
+            pos.x += static_cast<float>(wrap % 3) * kJitterStep;
+            pos.z += static_cast<float>((wrap / 3) % 3) * kJitterStep;
+        }
+        rx::scene::PointLightDesc desc;
+        desc.position = pos;
+        desc.colorCandela = kColorCandela;
+        desc.range = kLightRange;
+        desc.castsShadows = false;
+        const rx::scene::LightHandle handle = app.scene->createPointLight(desc);
+        (void)handle;  // fire-and-forget -- this sample never toggles/queries these lights individually afterward.
+    }
+    RX_LOG_INFO("sample_09_scene: --stress-lights: {} Point lights added ({} grid cells, footprint matches {} draws)",
+                lightCount, cellCount, drawCount);
+}
+
 // Pre-warms MaterialSystem's own pipeline cache for every participating
 // material (a D27 cache HIT at first real use in updateSceneFrame()'s own
 // resolvePipeline callback, never a mid-frame recompile) and caches the
@@ -3633,6 +3724,9 @@ int runHeadless(const Args& args) {
             destroyApp(*app);
             return 1;
         }
+        if (args.stressLights > 0) {
+            addStressLights(*app, args.stressLights, args.stressDraws);
+        }
         warmMaterialPipelines(*app, app->stressMaterialBindings);
         app->shadowEnabled = false;
         expectedTotalCandidates = args.stressDraws;
@@ -4053,6 +4147,79 @@ int runHeadless(const Args& args) {
                     gateOk = false;
                 }
             }
+        }
+    }
+
+    // [Phase 5 Stage 2 Task 15, #51] `--bench-frames <n>` -- mirrors
+    // samples/08_gltf_viewer's own identically-named/identically-shaped
+    // block VERBATIM (see Args::benchFrames' own header comment for the
+    // full metric definition and the "why cpu_record is the headline
+    // number, full is a secondary figure" rationale that comment already
+    // gives in full -- not re-derived here). Runs AFTER every D17/
+    // discrimination capture above (so those keep their own fixed,
+    // untouched-by-benchmarking-iterations pixel/log output) and BEFORE
+    // the "sample09: perf mode=..." cold-start line below, matching
+    // sample_08's own "cold start, then steady state" log ordering. This
+    // is this sample's own scaling-numbers publishing mechanism -- see
+    // the task's own gate matrix "scaling numbers... 100/1k/5k" row --
+    // invoked with `--stress --stress-draws <D> --stress-lights <L>
+    // --bench-frames <N>`. State going into the loop is whatever the LAST
+    // capture above left in place (the D27 guard block when
+    // --threads>1, else the HUD smoke-test frame just above) -- no
+    // additional updateSceneFrame()/uploadSceneFrameGpuBuffers() call
+    // inside the loop itself, deliberately: a static camera/scene means
+    // nothing would change frame to frame, and sample_08's own loop
+    // carries the identical omission for the identical reason (isolates
+    // `cpu_record_ms` to ONLY `executor->execute()`, never CPU-side scene
+    // repopulation cost).
+    if (app->sceneReady && args.benchFrames > 0) {
+        std::vector<double> recordMsSamples;
+        std::vector<double> fullMsSamples;
+        recordMsSamples.reserve(args.benchFrames);
+        fullMsSamples.reserve(args.benchFrames);
+        for (uint32_t i = 0; i < args.benchFrames; ++i) {
+            const auto iterStart = std::chrono::steady_clock::now();
+            app->overlay->beginFrame();  // no widgets -- steady-state cost only, matching the D17-gated frames.
+            double recordMs = 0.0;
+            std::vector<uint8_t> benchPixels = captureFrame(&recordMs);
+            const double fullMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - iterStart).count();
+            if (benchPixels.empty()) {
+                RX_LOG_ERROR("sample_09_scene: --bench-frames iteration {} capture failed", i);
+                gateOk = false;
+                break;
+            }
+            recordMsSamples.push_back(recordMs);
+            fullMsSamples.push_back(fullMs);
+        }
+        // p95: nearest-rank on a sorted copy -- SAME convention/formula as
+        // sample_08_gltf_viewer's own percentile95() lambda (never mutates
+        // the insertion-order vectors above).
+        auto percentile95 = [](std::vector<double> samples) -> double {
+            if (samples.empty()) {
+                return 0.0;
+            }
+            std::sort(samples.begin(), samples.end());
+            size_t rank = static_cast<size_t>(std::ceil(0.95 * static_cast<double>(samples.size())));
+            rank = std::clamp<size_t>(rank, 1, samples.size());
+            return samples[rank - 1];
+        };
+        if (!recordMsSamples.empty()) {
+            const double recordSum = std::accumulate(recordMsSamples.begin(), recordMsSamples.end(), 0.0);
+            const double recordAvg = recordSum / static_cast<double>(recordMsSamples.size());
+            const auto [recordMinIt, recordMaxIt] = std::minmax_element(recordMsSamples.begin(), recordMsSamples.end());
+            const double recordP95 = percentile95(recordMsSamples);
+
+            const double fullSum = std::accumulate(fullMsSamples.begin(), fullMsSamples.end(), 0.0);
+            const double fullAvg = fullSum / static_cast<double>(fullMsSamples.size());
+            const auto [fullMinIt, fullMaxIt] = std::minmax_element(fullMsSamples.begin(), fullMsSamples.end());
+            const double fullP95 = percentile95(fullMsSamples);
+
+            RX_LOG_INFO(
+                "sample09: perf frame_bench mode={} stressDraws={} stressLights={} frames={} "
+                "cpu_record_avg_ms={:.3f} cpu_record_min_ms={:.3f} cpu_record_p95_ms={:.3f} cpu_record_max_ms={:.3f} "
+                "full_avg_ms={:.3f} full_min_ms={:.3f} full_p95_ms={:.3f} full_max_ms={:.3f}",
+                args.stress ? "stress" : "grid", args.stressDraws, args.stressLights, recordMsSamples.size(), recordAvg,
+                *recordMinIt, recordP95, *recordMaxIt, fullAvg, *fullMinIt, fullP95, *fullMaxIt);
         }
     }
 
