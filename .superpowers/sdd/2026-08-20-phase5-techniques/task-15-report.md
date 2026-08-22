@@ -278,3 +278,91 @@ categories, both already-established false-positive classes, not new ones introd
   documentation artifact from before this task, not something this round introduced or was in scope to
   resolve — flagged for whoever next touches either matrix.
 - No Steam Deck numbers this round (RC8 honest-manual convention, hardware not yet in this task's own loop).
+
+## Fix round 1
+
+Independent review verdict: spec PASS, quality Approved, 1 Medium + 2 Low finding — full review at
+`.superpowers/sdd/2026-08-20-phase5-techniques/task-15-review.md`. The froxel-lookup design was fully
+upheld (shared-`FroxelGridParams`-object construction verified bit-exact against T14, and term-for-term
+against Filament's actual pinned-commit source). The pin-hash question raised in this report's own
+Concerns section was independently settled by the reviewer: the true `v1.75.0` tag commit is
+`0e58877c09afb1aacd09ff640f74d2adcd2a7e80` (confirmed via `git ls-remote`); `matrix-p5t07`/`matrix-p5t13`
+were corrected (doc-only, main checkout) — this task's own load-bearing citation (`froxel_common.slang`'s
+top comment) was already using the correct hash, so no code/citation change was needed here.
+
+All three findings closed in-round, no deferred fixes:
+
+### Finding 1 (Medium) — sabotage/restore crash-safety
+
+`test_cluster_shading_gpu.cpp:563-626`'s revert-discrimination proof wrote the sabotaged
+`cluster_lighting.slang` to disk and restored it only after `runProbe()` — a ~330-line function with over a
+dozen of its own `REQUIRE()` calls — with no protection against any of those failing mid-sabotage and
+unwinding past the restore. This is not hypothetical: this report's own "Bugs found and fixed" section
+already discloses this exact incident firing once (a bindless-capacity-exhaustion `REQUIRE()` failure left
+the production shader corrupted on disk until caught and fixed by hand).
+
+**Fix**: added `SourceFileRestoreGuard`, a small RAII type constructed with the path and the ORIGINAL file
+bytes (captured before any mutation) immediately before the sabotage-write. Its destructor unconditionally
+rewrites the original bytes to disk unless `dismiss()` was already called — `dismiss()` is called only
+after the sequence's own explicit restore-write AND its `REQUIRE()`-verified byte-identical readback both
+succeed, so the normal path performs the restore exactly once (the guard's own write, not a second one from
+the destructor) and ANY exit from the risk window (a `REQUIRE()` failure, an exception, an early return)
+now restores the file regardless of where in that window it happens. The destructor is deliberately
+best-effort (never throws) since it may run during unwinding from a fatal doctest assertion, where a second
+throw would call `std::terminate()`.
+
+**Verification (the review's own explicit ask — "verify by deliberately failing a probe assertion once and
+confirming the file is byte-identical afterward (md5)")**: temporarily inserted
+`REQUIRE((false && "TEMPORARY..."))` immediately after the sabotage-write (inside the guard's own risk
+window, before the pipeline rebuild). Recorded `md5sum shaders/material/cluster_lighting.slang` before
+running: `23b567f606b6bbc60f64db3cc3746379`. Ran the TEST_CASE — it failed at the deliberate `REQUIRE`
+exactly as expected (doctest `FATAL ERROR`, 1 case failed). Re-ran `md5sum` immediately after: **same hash,
+`23b567f606b6bbc60f64db3cc3746379`** — the file was restored to byte-identical content despite the fatal
+failure occurring inside the risk window. Removed the deliberate failure, rebuilt, and re-ran: normal
+100/100 assertions pass on both lavapipe and real NVIDIA, `git diff --stat` on the shader shows nothing.
+
+### Finding 2 (Low) — dedicated froxel Z-slice boundary test
+
+Added `TEST_CASE("...fragment/light pair placed exactly AT a computed froxel Z-slice boundary...")`.
+Construction: `rx::scene::froxel::buildFroxelGrid()` called directly with the SAME arguments
+`ClusterPipelines::addClusterPasses()` passes it internally (`cluster_lighting.cpp:284-286`) — an
+independent call to the same pure/deterministic function, not a duplicated grid. Boundary index
+`i = grid.countZ/2` (interior, avoiding the near/far degenerate edges); `boundaryDist =
+sliceZDistance(i, grid)`. A light sits `delta=1.0` unit closer to the camera than the boundary with a
+DELIBERATELY TIGHT `cullRadius=0.5` (unlike this file's other tests' deliberately generous radii — here the
+opposite is deliberate, to keep the light's own real build-side slice assignment unambiguously confined to
+slice `i-1` alone; a `REQUIRE()` on the neighboring slice's own width, not an assumption, backs this). A
+probe sits EXACTLY at the boundary distance. `rx::scene::froxel::findSliceZ(-boundaryDist, grid)` — "the
+build-side's own membership decision," queried rather than hand-assumed since `exp2`/`log2` need not
+round-trip to an exact integer — determines which slice the boundary itself resolves to; the assertion
+branches on that real verdict (closed-form nonzero if it resolves to the light's own slice, exactly zero
+otherwise), so either branch is a falsifiable prediction the real GPU shading path could in principle
+contradict, not a tautology.
+
+**Result**: on this grid (`countZ=16`, `zLightNear=5`, `zLightFar=100`), `boundaryIndex=8`,
+`boundaryDist≈20.236`, `lowerBound≈16.572` (slice width ≈3.66, comfortably clearing the `delta+cullRadius=
+1.5` geometric precondition). `findSliceZ()` resolves the boundary to slice 8 (the HIGHER slice, not the
+light's own slice 7) — the GPU probe's real diffuse contribution is exactly `0.0`, matching the CPU oracle's
+prediction exactly. No CPU/GPU divergence found at this boundary. 38/38 assertions pass on both drivers,
+zero unfiltered validation errors.
+
+### Finding 3 (Low) — stale comment / unused elevated capacity
+
+`test_standard_pbr_punctual_gpu.cpp`'s fixture comment claimed "this file's own cluster-shading TEST_CASEs
+(below) register REAL buffers" into `genericStorageBuffers`/`clusterLightBuffers` — false; this file
+contains only Directional/Point/Spot punctual tests, no cluster-shading scenario, and never registers a
+real buffer into either slot. Corrected the comment to state the real reason (pipeline LAYOUT well-formedness
+only, matching the `comparisonSamplers`/`cubeImages` precedent's own "never registers a real X" shape
+immediately above it) and reduced the capacities from `8`/`4` to the minimum nonzero value `1`/`1` that
+satisfies layout validity.
+
+### Re-verification (both drivers, this round)
+
+`rx_material_gpu_tests` (full binary, both fix files rebuilt): **78/78 test cases, 4,488/4,488 assertions —
+identical on lavapipe and real NVIDIA RTX 2080 (580.82.07)**. Full `ctest` suite: **44/44 passed on both
+drivers** (lavapipe ~38s, NVIDIA ~88s). Zero unfiltered Vulkan validation errors across every run this
+round (`--validate` re-runs of the touched binary and the full suite, both drivers).
+
+### Commit
+
+- `a37eca6` — review fix round 1: crash-safe sabotage restore, froxel boundary test, stale comment.

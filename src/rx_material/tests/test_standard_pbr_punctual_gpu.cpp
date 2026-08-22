@@ -123,14 +123,28 @@ std::optional<Fixture> makeFixture(const char* title) {
     // irradiance + prefiltered) on top of this rig's own pre-existing
     // headroom requirement.
     capacities.cubeImages = 4;
-    // [Phase 5 Stage 2 Task 15, #51] Same requirement as `cubeImages` above:
+    // [Phase 5 Stage 2 Task 15, #51; corrected Fix round 1, review Finding
+    // 3/Low -- the prior comment here wrongly claimed this file's own
+    // TEST_CASEs register real buffers into these two capacities] Same
+    // requirement/shape as `comparisonSamplers`/`cubeImages` above:
     // standard_pbr.slang now unconditionally declares `gClusterBuffers`/
-    // `gClusterLights` at bindings 5/6 via cluster_lighting.slang. This
-    // file's own cluster-shading TEST_CASEs (below) register REAL buffers
-    // into both -- generous headroom for several independent per-scenario
-    // registrations across one fixture's lifetime.
-    capacities.genericStorageBuffers = 8;
-    capacities.clusterLightBuffers = 4;
+    // `gClusterLights` at bindings 5/6 via cluster_lighting.slang, so
+    // EVERY BindlessTable feeding a MaterialSystem needs these two
+    // capacities nonzero or pipeline creation fails the same
+    // `VUID-VkGraphicsPipelineCreateInfo-layout-00756` validation the
+    // comment above already documents. This file contains only
+    // Directional/Point/Spot punctual `TEST_CASE`s (no cluster-shading
+    // scenario) and never registers a real generic-storage or
+    // cluster-light buffer into either slot -- both capacities exist
+    // purely so the pipeline LAYOUT itself is well-formed, matching
+    // `comparisonSamplers`'s own "never registers a real X" shape exactly
+    // (the real cluster-shading fixture, with its own correctly-sized,
+    // actually-used capacities, lives in the separate
+    // test_cluster_shading_gpu.cpp). `1` each is the minimum nonzero
+    // value that satisfies layout validity -- not headroom for anything
+    // this file itself allocates.
+    capacities.genericStorageBuffers = 1;
+    capacities.clusterLightBuffers = 1;
     auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
     REQUIRE(bindless.has_value());
 

@@ -471,6 +471,75 @@ ProbeResult runProbe(Fixture& fixture, rx::cluster::ClusterPipelines& pipelines,
 
 bool near(float actual, float expected, float absTolerance) { return std::fabs(actual - expected) <= absTolerance; }
 
+// [Fix round 1, task-15-review.md Finding 1/Medium] RAII guard for the
+// sabotage/restore sequence below: captures the ORIGINAL file bytes up
+// front (constructor argument, not re-read later) and unconditionally
+// rewrites them to `path` in the destructor UNLESS `dismiss()` was
+// already called. This makes the restore crash-safe against ANY exit
+// path from the risk window between the sabotage-write and the
+// explicit restore-write -- a `REQUIRE()` failure inside `runProbe()`
+// (over a dozen of them: scheduler/executor creation, buffer
+// allocation, bindless registration, descriptor pool/set allocation),
+// an unrelated exception, or an early return all unwind the C++ stack
+// through this guard's destructor exactly like any other RAII type.
+//
+// This closes a REAL, previously-triggered incident class, not a
+// hypothetical one: the implementer's own task-15-report.md ("Bugs
+// found and fixed") discloses that a bindless-capacity-exhaustion
+// `REQUIRE()` failure mid-`TEST_CASE` once left the PRODUCTION
+// `cluster_lighting.slang` sabotaged on disk until caught and fixed by
+// hand -- that specific trigger was fixed (releasing bindless handles
+// at the end of `runProbe()`), but the general structural risk (ANY
+// other `REQUIRE()` failure in the same window) was not, per the
+// review's own Finding 1. This guard closes the general class instead
+// of the one specific trigger.
+//
+// The destructor is intentionally best-effort (no exception thrown from
+// it, even on a write failure) -- it may run DURING stack unwinding from
+// a fatal doctest assertion; throwing again from a destructor already
+// unwinding from an exception calls `std::terminate()`, which would
+// destroy the test binary's own ability to report the original failure
+// AND skip every later TEST_CASE in the same binary. "Restore what we
+// can, never make the crash worse" is the correct destructor contract
+// here, matching this project's own "no deferred fixes" standing rule
+// applied to a destructor's own failure mode, not just the happy path.
+class SourceFileRestoreGuard {
+public:
+    SourceFileRestoreGuard(std::filesystem::path path, std::string originalContent)
+        : path_(std::move(path)), original_(std::move(originalContent)) {}
+
+    ~SourceFileRestoreGuard() {
+        if (dismissed_) {
+            return;
+        }
+        std::ofstream outFile(path_, std::ios::binary | std::ios::trunc);
+        if (outFile.is_open()) {
+            outFile << original_;
+        }
+        // No REQUIRE/CHECK/throw here -- see this class's own header
+        // comment on why a destructor must never throw while already
+        // unwinding.
+    }
+
+    // Called only after the sequence's own explicit restore-write AND
+    // its own REQUIRE()-verified byte-identical readback both succeed
+    // (see the TEST_CASE below) -- once dismissed, the destructor is a
+    // no-op, since the file is already provably correct on disk at that
+    // point and a second unconditional rewrite would be redundant, not
+    // unsafe, but pointless.
+    void dismiss() { dismissed_ = true; }
+
+    SourceFileRestoreGuard(const SourceFileRestoreGuard&) = delete;
+    SourceFileRestoreGuard& operator=(const SourceFileRestoreGuard&) = delete;
+    SourceFileRestoreGuard(SourceFileRestoreGuard&&) = delete;
+    SourceFileRestoreGuard& operator=(SourceFileRestoreGuard&&) = delete;
+
+private:
+    std::filesystem::path path_;
+    std::string original_;
+    bool dismissed_ = false;
+};
+
 }  // namespace
 
 TEST_CASE("Clustered shading: exact per-froxel membership from the SHADING side -- an in-froxel light "
@@ -583,6 +652,16 @@ TEST_CASE("Clustered shading: exact per-froxel membership from the SHADING side 
     REQUIRE(pos != std::string::npos);
     std::string sabotaged = original;
     sabotaged.replace(pos, needle.size(), sabotaged_needle);
+
+    // [Fix round 1, review Finding 1/Medium] Constructed BEFORE the
+    // sabotage-write below, capturing `original` (already read above) up
+    // front -- from this point until `dismiss()` is called (after the
+    // restore-write's own byte-identical verification succeeds, below),
+    // ANY exit from this scope (a REQUIRE() failure inside runProbe(),
+    // an exception, an early return) restores the production shader
+    // source in this guard's own destructor. See its class comment for
+    // the full incident this closes.
+    SourceFileRestoreGuard restoreGuard(clusterLightingPath, original);
     {
         std::ofstream outFile(clusterLightingPath, std::ios::binary | std::ios::trunc);
         REQUIRE(outFile.is_open());
@@ -617,6 +696,13 @@ TEST_CASE("Clustered shading: exact per-froxel membership from the SHADING side 
     std::ostringstream verifyStream;
     verifyStream << verifyFile.rdbuf();
     REQUIRE(verifyStream.str() == original);
+    // [Fix round 1, review Finding 1/Medium] The file is now provably
+    // correct on disk (the REQUIRE() immediately above just verified a
+    // byte-identical readback) -- dismiss the guard so its destructor
+    // becomes a no-op. Anything that fails AFTER this point (e.g. the
+    // restoredResult probe run below) no longer needs the guard's own
+    // safety net, since there is nothing left to restore.
+    restoreGuard.dismiss();
     probe = buildProbePipeline(fixture.device.device(), fixture.bindless);
 
     ProbeResult restoredResult =
@@ -785,5 +871,142 @@ TEST_CASE("Clustered shading: clustered path matches the PERMANENT brute-force r
             // probe that DOES have real contributors.
             CHECK(bruteForce.diffuse[0].r + bruteForce.diffuse[0].g + bruteForce.diffuse[0].b > 0.05F);
         }
+    }
+}
+
+// [Fix round 1, task-15-review.md Finding 2/Low] A dedicated GPU value-
+// asserted test placed EXACTLY at a real computed froxel Z-slice
+// boundary -- strengthens matrix row 3's own "shading-side lookup
+// agrees bit-exactly with the build side" conclusion (previously argued
+// by construction: identical formulas + a single shared
+// `FroxelGridParams` object flowing to both the culling compute kernels
+// AND the shading-side caller, `ClusterPipelines::addClusterPasses()`,
+// `cluster_lighting.cpp:279-298`) with a direct empirical check AT the
+// seam itself -- the classically bug-prone spot in any clustered-shading
+// implementation, since the CPU (build-side culling, this test's own
+// `findSliceZ()` C++ oracle call) and GPU (shading-side
+// `clusterFindSliceZ()`, compiled Slang) evaluate the SAME textual
+// formula on different hardware/compiler paths, and a value meant to
+// land EXACTLY on an integer slice boundary is exactly where CPU/GPU
+// floating-point evaluation could in principle diverge by a rounding
+// unit and flip which side of the `int()` truncation it lands on.
+//
+// Construction: `rx::scene::froxel::buildFroxelGrid()` is called
+// directly here with the SAME arguments (camera, viewport,
+// `ClusterParams`) `ClusterPipelines::addClusterPasses()` itself passes
+// to the SAME function internally (`cluster_lighting.cpp:284-286`) -- a
+// second, independent call to a pure, deterministic function with
+// identical inputs, not a duplicated/hand-derived grid, so this test's
+// own `grid` is provably the SAME grid the real GPU compute chain below
+// uses. `sliceZDistance(boundaryIndex, grid)` (the CPU oracle for a
+// slice boundary's own view-space distance) gives the boundary Z;
+// `findSliceZ(-boundaryDist, grid)` (the SAME CPU oracle `rx_cluster`'s
+// own build-side culling code already trusts) gives "the build-side's
+// own membership decision" for a point EXACTLY at that boundary --
+// QUERIED, not hand-assumed, since `exp2`/`log2` need not round-trip to
+// an exact integer.
+//
+// A light sits DELIBERATELY TIGHT (`cullRadius=0.5`, well under the
+// `delta=1.0` unit gap to the boundary -- unlike this file's other
+// tests' own DELIBERATELY GENEROUS radii, which exist to avoid
+// entangling culling-sphere geometry with the property under test; here
+// the opposite is deliberate: a small, explicit radius keeps the
+// light's own real build-side membership UNAMBIGUOUSLY confined to slice
+// `boundaryIndex-1` alone, verified below via a `REQUIRE()` on the
+// neighbouring slice's own width rather than assumed), so the light's
+// build-side slice is a sound deduction, not a guess. A probe sits
+// EXACTLY at the boundary distance. The assertion branches on the CPU
+// oracle's own real verdict: if the boundary resolves to slice
+// `boundaryIndex-1` (the SAME slice as the light), the probe MUST see
+// the light (closed-form nonzero value, the SAME NdotL==1/distSq==1
+// matched-pose shape the exact-membership TEST_CASE above establishes);
+// if it resolves to slice `boundaryIndex` (a different slice), the probe
+// MUST NOT (exactly zero) -- either branch is a genuine, falsifiable
+// prediction from the SAME formula the real GPU shading path runs, not a
+// tautology; a genuine CPU/GPU divergence at this boundary would flip
+// the GPU's real answer against this prediction and fail the assertion.
+TEST_CASE("Clustered shading: fragment/light pair placed exactly AT a computed froxel Z-slice boundary matches "
+          "the build-side's own real membership decision (rx::scene::froxel::findSliceZ oracle)") {
+    auto fixtureOpt = makeFixture("rx_cluster_shading_boundary");
+    if (!fixtureOpt.has_value()) {
+        return;
+    }
+    Fixture fixture = std::move(*fixtureOpt);
+
+    auto computeCache =
+        rx::rhi::ComputePipelineCache::create(fixture.device.device(), freshCachePath("boundary_chain"));
+    REQUIRE(computeCache.has_value());
+    auto compiler = rx::shader::Compiler::create();
+    REQUIRE(compiler.has_value());
+    auto pipelinesOpt = rx::cluster::ClusterPipelines::create(fixture.device.device(), *computeCache, *compiler,
+                                                                RX_CLUSTER_SHADER_DIR, /*framesInFlight=*/1);
+    REQUIRE(pipelinesOpt.has_value());
+    rx::cluster::ClusterPipelines pipelines = std::move(*pipelinesOpt);
+
+    auto probe = buildProbePipeline(fixture.device.device(), fixture.bindless);
+
+    rx::scene::Camera camera;  // default: position (0,0,0), looking down -Z, 60deg vfov.
+    camera.aspectRatio = 1.0F;
+    constexpr uint32_t kViewport = 256;
+    rx::cluster::ClusterParams params;  // defaults: kDefaultZLightNear=5, kDefaultZLightFar=100, sliceCountZ=16.
+
+    // Independent second call to the SAME pure/deterministic function
+    // `ClusterPipelines::addClusterPasses()` itself calls internally
+    // (`cluster_lighting.cpp:284-286`) with IDENTICAL arguments -- see
+    // this TEST_CASE's own header comment.
+    const rx::scene::froxel::FroxelGridParams grid =
+        rx::scene::froxel::buildFroxelGrid(kViewport, kViewport, camera.verticalFovRadians, camera.aspectRatio,
+                                             params.zLightNear, params.zLightFar, params.targetFroxelBudget,
+                                             params.sliceCountZ);
+    REQUIRE(grid.countZ >= 4);  // sanity -- the mid-slice index below needs real interior room on both sides.
+
+    const uint32_t boundaryIndex = grid.countZ / 2;
+    const float boundaryDist = rx::scene::froxel::sliceZDistance(boundaryIndex, grid);
+    const float lowerBound = rx::scene::froxel::sliceZDistance(boundaryIndex - 1, grid);
+    CAPTURE(boundaryIndex);
+    CAPTURE(boundaryDist);
+    CAPTURE(lowerBound);
+    constexpr float kDelta = 1.0F;       // light sits this far inside the boundary, camera-ward -- matched-pose NdotL==1.
+    constexpr float kCullRadius = 0.5F;  // deliberately tight -- see this TEST_CASE's own header comment.
+    // Geometric precondition for "the light's cull sphere cannot reach
+    // the neighbouring slice below" -- see this TEST_CASE's own header
+    // comment's "sound deduction, not a guess" claim.
+    REQUIRE(boundaryDist - lowerBound > kDelta + kCullRadius);
+
+    // "The build-side's own membership decision" [review's own words] --
+    // queried, not assumed: whichever slice `findSliceZ()` really
+    // resolves this exact boundary distance to.
+    const uint32_t probeSlice = rx::scene::froxel::findSliceZ(-boundaryDist, grid);
+    const uint32_t lightSlice = boundaryIndex - 1;
+    CAPTURE(probeSlice);
+    CAPTURE(lightSlice);
+    const bool expectContribution = (probeSlice == lightSlice);
+
+    const glm::vec3 probeWorldPos(0.0F, 0.0F, -boundaryDist);
+    const glm::vec3 lightWorldPos(0.0F, 0.0F, -(boundaryDist - kDelta));
+
+    rx::cluster::ClusterLightGpu light{};
+    light.viewPositionRadius = glm::vec4(glm::vec3(camera.view() * glm::vec4(lightWorldPos, 1.0F)), kCullRadius);
+    light.viewAxisSinInverse = glm::vec4(0.0F, 0.0F, -1.0F, 0.0F);
+    light.cosSquaredFlags = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
+    light.shadingTypeRangeAngle = glm::vec4(1.0F, 0.0F, 0.0F, 0.0F);  // Point, range=0 (unwindowed).
+    light.shadingPositionWorld = glm::vec4(lightWorldPos, 0.0F);
+    light.shadingColorCandela = glm::vec4(10.0F, 0.0F, 0.0F, 0.0F);  // RED-only, same convention as the membership TEST_CASE.
+    light.shadingSpotDirWorld = glm::vec4(0.0F, 0.0F, -1.0F, 0.0F);
+
+    const std::vector<rx::cluster::ClusterLightGpu> lights{light};
+    ProbeResult result =
+        runProbe(fixture, pipelines, *probe, lights, camera, kViewport, kViewport, params, probeWorldPos);
+
+    CAPTURE(result.diffuse[0].r);
+    CAPTURE(expectContribution);
+    if (expectContribution) {
+        // Closed form: Fd_Lambert()=1/pi, NdotL=1 (kDelta-unit matched
+        // pose), distSq=1, rangeWindow=1 -- SAME shape as the
+        // exact-membership TEST_CASE above.
+        const float expectedDiffuseR = 10.0F / static_cast<float>(M_PI);
+        CHECK(near(result.diffuse[0].r, expectedDiffuseR, 0.02F));
+    } else {
+        CHECK(result.diffuse[0].r == 0.0F);
     }
 }
