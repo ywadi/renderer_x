@@ -1,5 +1,17 @@
 # Completeness matrix — P5 T13 (issue #49): Physical light units + punctual lights (KHR_lights_punctual consumption)
 
+**Erratum (T15 review, 2026-08-22):** this matrix cites Filament commit
+`721ec800093de984cbee155e459298b6b2dbb855` (lines 29, 89) as the source for
+`LightManager.cpp`/`surface_light_punctual.fs` — that commit is `main`'s
+same-day HEAD from Stage 2's research survey, not the `v1.75.0` release tag.
+Per `rulings-2026-08-20.md` RC1 (the binding pin) and independently
+confirmed via `git ls-remote https://github.com/google/filament
+refs/tags/v1.75.0`, the TRUE `v1.75.0` tag commit is
+`0e58877c09afb1aacd09ff640f74d2adcd2a7e80`. The cited line ranges were not
+re-verified against that commit as part of this erratum; a future consumer
+of this matrix's Filament citations should re-diff `721ec80...0e58877c0`
+before relying on exact line numbers.
+
 **Plan task:** Task 13, Stage 2 (`docs/superpowers/plans/2026-08-20-phase5-techniques.md:465-486`).
 **Charter binding:** priority (3) "physical light units + clustered Forward+"
 (`docs/superpowers/specs/2026-08-09-toolchain-platform-rhi-design.md:414-421,452-454`):

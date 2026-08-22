@@ -1,5 +1,18 @@
 # Completeness matrix — ticket #43: [P5 T07] Filament BRDF module port (Slang)
 
+**Erratum (T15 review, 2026-08-22):** this matrix's file citations pin
+Filament commit `721ec800093de984cbee155e459298b6b2dbb855`, labeled `v1.75.0`
+in places below (e.g. line 102's table header) — that commit is `main`'s
+same-day HEAD (this matrix's own "release-vs-main" note further down already
+flagged the discrepancy and recommended the fix, but the body citations were
+never updated). Per `rulings-2026-08-20.md` RC1 (the binding pin) and
+independently confirmed via `git ls-remote https://github.com/google/filament
+refs/tags/v1.75.0`, the TRUE `v1.75.0` tag commit is
+`0e58877c09afb1aacd09ff640f74d2adcd2a7e80`. Treat every `721ec80...`
+citation in this file as referring to that commit's `main`-HEAD research
+snapshot, not the `v1.75.0` release; any future re-verification of this
+matrix's cited line ranges should re-diff against `0e58877c0...`.
+
 **Plan task:** Task 7, "Filament BRDF module port (Slang)"
 (`docs/superpowers/plans/2026-08-20-phase5-techniques.md:314-340`), Stage 1
 (Core PBR + IBL).
