@@ -857,6 +857,15 @@ bool createScene(Scene& scene, VkPhysicalDevice physicalDevice, rx::rhi::Device&
     // at binding 4 (this sample never binds a real environment either, but
     // the descriptor set layout still needs a matching binding).
     capacities.cubeImages = 1;
+    // [Phase 5 Stage 2 Task 15, #51] Same requirement as `comparisonSamplers`/
+    // `cubeImages` above: standard_pbr.slang now unconditionally imports
+    // shaders/material/cluster_lighting.slang, which unconditionally
+    // declares `gClusterBuffers`/`gClusterLights` at bindings 5/6 (this
+    // sample never builds a real cluster grid -- every draw's own
+    // `clusterEnabled` stays 0 -- but the descriptor set layout still needs
+    // matching bindings for the shader's static declaration).
+    capacities.genericStorageBuffers = 1;
+    capacities.clusterLightBuffers = 1;
     auto bindlessTable = rx::rhi::BindlessTable::create(physicalDevice, device.device(), capacities);
     if (!bindlessTable.has_value()) {
         RX_LOG_ERROR("sample_06_materials: BindlessTable::create failed");

@@ -198,10 +198,63 @@ struct DrawDataGpu {
     float lightAngleOffset = 0.0F; // Spot cone precomputed offset; Directional/Point unused.
     glm::vec4 lightPositionWorld{0.0F};        // Point/Spot world position, xyz (w unused). Directional: unused.
     glm::vec4 lightSpotDirWorld{0.0F, 0.0F, -1.0F, 0.0F};  // Spot's own facing/travel direction, world space, xyz (w unused). Directional/Point: unused.
+
+    // [Phase 5 Stage 2 Task 15, #51] Clustered Forward+ per-pixel lookup
+    // inputs -- matrix-p5t15's own row 2 ("extend RxDrawData, don't invent
+    // a new mechanism", following the IDENTICAL Task 13 struct-tail-append
+    // precedent immediately above). ADDITIVE alongside the single-slot
+    // Point/Spot term above (which is left completely UNTOUCHED -- see
+    // standard_pbr.slang's own header comment): `clusterEnabled==0` (the
+    // default) makes every field below dead, reproducing byte-identical
+    // pre-Task-15 behavior for any row that never sets them.
+    //
+    // Grid SHAPE constants -- the SAME `rx::scene::froxel::
+    // FroxelGridParams` a `rx::cluster::ClusterPipelines::
+    // addClusterPasses()` call already computed this frame (see that
+    // method's own header comment: "a caller needing to interpret froxel
+    // indices... uses this SAME value, never re-derives it") -- copied
+    // here so `shaders/material/cluster_lighting.slang`'s shading-side
+    // lookup maps a shaded fragment's own view-space position to the
+    // EXACT SAME froxel `rx::cluster`'s own compute passes used to build
+    // this buffer's [offset,count) ranges (a mismatched copy here would
+    // silently look up the WRONG froxel's light list, not merely a
+    // performance bug).
+    uint32_t clusterEnabled = 0;         // 0 == no cluster grid this row's own pass has bound; every field below is dead.
+    uint32_t clusterCountX = 0;
+    uint32_t clusterCountY = 0;
+    uint32_t clusterCountZ = 0;
+    float clusterTanHalfFovY = 0.0F;
+    float clusterAspectRatio = 0.0F;
+    float clusterZLightFar = 0.0F;
+    float clusterInvLinearizer = 0.0F;
+    // Bindless indices -- `clusterLightsBufferIndex` is a
+    // `kClusterLightBufferBinding`-slot index (rx::cluster::ClusterLightGpu[]);
+    // the other three are `kGenericStorageBufferBinding`-slot indices
+    // (plain uint[] arrays -- T14's own `clusterOffsets`/`clusterWriteCounts`/
+    // `clusterLightIndices` render-graph outputs, registered into that
+    // bindless slot by this row's own producer -- see BindlessTable's own
+    // header comment for why these need a DIFFERENT binding than
+    // `kStorageBufferBinding`, which this struct's own `gDrawData` array
+    // already occupies).
+    uint32_t clusterOffsetsBufferIndex = 0;
+    uint32_t clusterWriteCountsBufferIndex = 0;
+    uint32_t clusterLightIndicesBufferIndex = 0;
+    uint32_t clusterLightsBufferIndex = 0;
+    // World -> view. Per-pass, repeated per row -- same "simpler than a
+    // second bindless buffer" precedent every other per-pass matrix field
+    // in this struct already establishes. Needed ONLY for the clustered
+    // lookup's own view-space-position derivation (`viewProj` above stays
+    // the projection-included matrix every OTHER per-pass field already
+    // uses; this is the plain view-space transform the froxel grid's own
+    // math is defined against -- rx::cluster::buildClusterLightList()'s
+    // own `viewMatrix` parameter is the SAME matrix, transposed here per
+    // this header's own MATRIX LAYOUT convention).
+    glm::mat4 clusterView{1.0F};
 };
-static_assert(sizeof(DrawDataGpu) == 432, "DrawDataGpu must stay exactly 432 bytes (384 + 48 punctual-light bytes, "
-                                           "already a 16-byte multiple with no additional pad) -- mirrors "
-                                           "material.slang's RxDrawData");
+static_assert(sizeof(DrawDataGpu) == 544,
+              "DrawDataGpu must stay exactly 544 bytes (432 + 48 grid-shape/bindless-index bytes + 64 cluster-view "
+              "matrix bytes, Phase 5 Task 15 -- already a 16-byte multiple with no additional pad) -- mirrors "
+              "material.slang's RxDrawData");
 
 // Mirrors material.slang's `RxMaterialGlobals` push-constant struct
 // (`[[vk::push_constant]] ConstantBuffer<RxMaterialGlobals> gMaterialGlobals;`)

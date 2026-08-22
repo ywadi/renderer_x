@@ -129,6 +129,11 @@ std::optional<Fixture> makeFixture(const char* title) {
     // base/irradiance/prefiltered as up to 3 independent handles across a
     // TEST_CASE's own probes) -- 8 gives comfortable headroom.
     capacities.cubeImages = 8;
+    // [Phase 5 Stage 2 Task 15, #51] Same requirement as `cubeImages` above:
+    // standard_pbr.slang now unconditionally declares `gClusterBuffers`/
+    // `gClusterLights` at bindings 5/6 via cluster_lighting.slang.
+    capacities.genericStorageBuffers = 1;
+    capacities.clusterLightBuffers = 1;
     auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
     REQUIRE(bindless.has_value());
 

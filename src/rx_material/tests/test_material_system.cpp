@@ -101,6 +101,11 @@ std::optional<MaterialTestFixture> makeFixture(const char* title) {
     // `gTexturesCube` at binding 4 -- same requirement as
     // `comparisonSamplers` above.
     capacities.cubeImages = 1;
+    // [Phase 5 Stage 2 Task 15, #51] Same requirement as `cubeImages` above:
+    // standard_pbr.slang now unconditionally declares `gClusterBuffers`/
+    // `gClusterLights` at bindings 5/6 via cluster_lighting.slang.
+    capacities.genericStorageBuffers = 1;
+    capacities.clusterLightBuffers = 1;
     auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
     REQUIRE(bindless.has_value());
 

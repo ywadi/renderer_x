@@ -669,6 +669,11 @@ std::unique_ptr<App> makeApp(bool validate) {
     rx::rhi::BindlessTable::Capacities capacities{/*sampledImages=*/256, /*samplers=*/16, /*storageBuffers=*/8};
     capacities.comparisonSamplers = 1;
     capacities.cubeImages = 4;
+    // [Phase 5 Stage 2 Task 15, #51] Same requirement as `cubeImages` above:
+    // standard_pbr.slang now unconditionally declares `gClusterBuffers`/
+    // `gClusterLights` at bindings 5/6 via cluster_lighting.slang.
+    capacities.genericStorageBuffers = 1;
+    capacities.clusterLightBuffers = 1;
     auto bindless =
         rx::rhi::BindlessTable::create(app->device->physicalDevice(), app->device->device(), capacities);
     if (!bindless.has_value()) {

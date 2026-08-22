@@ -122,6 +122,11 @@ std::optional<Fixture> makeFixture(const char* title) {
     // real cube texture, but the pipeline LAYOUT still needs a matching
     // binding for the shader's static declaration).
     capacities.cubeImages = 4;
+    // [Phase 5 Stage 2 Task 15, #51] Same requirement as `cubeImages` above:
+    // standard_pbr.slang now unconditionally declares `gClusterBuffers`/
+    // `gClusterLights` at bindings 5/6 via cluster_lighting.slang.
+    capacities.genericStorageBuffers = 1;
+    capacities.clusterLightBuffers = 1;
     auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
     REQUIRE(bindless.has_value());
 

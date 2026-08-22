@@ -110,10 +110,46 @@ struct ClusterLightGpu {
     // read by the GPU as `> 0.5` -- shaders/cluster/froxel_common.slang's
     // own `lightIntersectsFroxel()`), z/w unused (zero).
     glm::vec4 cosSquaredFlags{0.0F};
+
+    // [Phase 5 Task 15, #51] SHADING-side fields, appended below the THREE
+    // CULLING fields above (untouched -- every compute kernel in
+    // shaders/cluster/*.slang keeps reading ONLY the first 48 bytes by
+    // field name, oblivious to this append, exactly like RxDrawData's own
+    // established "struct tail append, existing readers untouched"
+    // precedent -- draw_data.h's own top comment). ONE buffer, ONE index
+    // space: `clusterLightIndices[k]` (T14's own compute-produced index)
+    // addresses BOTH halves of the SAME row -- the culling math above and
+    // the shading lookup below never risk drifting out of order with each
+    // other, unlike a second, parallel array would. Mirrors
+    // rx::scene::LightRecord's own world-space/physical-unit fields
+    // (light_math.h) -- the SAME data `standard_pbr.slang`'s existing
+    // single-slot Point/Spot term already consumes via `RxDrawData::
+    // lightPositionWorld`/`lightColor`(candela)/`lightRange`/
+    // `lightAngleScale`/`lightAngleOffset`/`lightSpotDirWorld` -- this is
+    // that SAME per-light data, just addressed by a per-froxel light LIST
+    // instead of a single per-draw slot (matrix-p5t13's own "the math does
+    // not change, only the per-light data SOURCE does" framing).
+    //
+    // x = lightType [rx::scene::LightType: 1=Point, 2=Spot -- Directional
+    // never reaches this buffer, buildClusterLightList() skips it], y =
+    // lightRange (0.0 == infinite/no window), z = lightAngleScale (spot
+    // only), w = lightAngleOffset (spot only).
+    glm::vec4 shadingTypeRangeAngle{0.0F};
+    // World-space light position, xyz; w unused (padding, matching every
+    // other vec4 field in this struct).
+    glm::vec4 shadingPositionWorld{0.0F};
+    // rgb = color * intensity in CANDELA [KHR_lights_punctual, T13's own
+    // unit convention -- see rx_scene/scene.h's LightRecord::colorLux
+    // comment, "per-type-unit-dependent"]; w unused.
+    glm::vec4 shadingColorCandela{0.0F};
+    // World-space spot facing/travel direction, xyz (spot only, a finite
+    // unit vector even for a point light); w unused.
+    glm::vec4 shadingSpotDirWorld{0.0F, 0.0F, -1.0F, 0.0F};
 };
-static_assert(sizeof(ClusterLightGpu) == 48,
+static_assert(sizeof(ClusterLightGpu) == 112,
               "ClusterLightGpu must match shaders/cluster/froxel_common.slang's ClusterLightGpu layout exactly "
-              "(three consecutive float4s) -- a size drift here silently corrupts the GPU-side StructuredBuffer read");
+              "(seven consecutive float4s: three culling + four shading, Phase 5 Task 15) -- a size drift here "
+              "silently corrupts the GPU-side StructuredBuffer read");
 
 // Builds this frame's flat, tightly-packed light array from `scene`'s
 // currently-alive Point/Spot lights (Directional lights never participate
@@ -135,24 +171,66 @@ static_assert(sizeof(ClusterLightGpu) == 48,
                                                                     const glm::mat4& viewMatrix,
                                                                     float cullCutoffLux = 1.0F);
 
+// [Phase 5 Task 15, #51] Per-frame-MUTABLE inputs to the cluster compute
+// chain -- the CALLER (a LIVE per-frame consumer, e.g. samples/09_scene)
+// owns an instance of this struct as a PERSISTENT field, updating it once
+// per frame BEFORE `rx::graph::Executor::execute()` runs (mirroring this
+// codebase's own established "compile the render graph ONCE, execute()
+// many times, recorded pass callbacks read caller-owned mutable state BY
+// REFERENCE" idiom -- e.g. samples/09_scene's own `recordForwardChunk()`
+// reading `App::viewLists`/`App::currentFrameSlot` fresh every invocation,
+// updated earlier that same frame by `updateSceneFrame()`).
+// addClusterPasses() below is called EXACTLY ONCE, at graph-DECLARE time
+// (this render graph's own "declareGraph() once, executor->execute() every
+// frame" split) -- its recorded pass callbacks capture a REFERENCE to
+// THIS struct (never a copy of its contents), so mutating it between
+// frames is how per-frame-varying light data/count reaches the SAME,
+// already-declared compute passes without re-declaring the graph itself
+// every frame.
+struct ClusterFrameInputs {
+    // An EXTERNALLY-owned, already-populated storage buffer holding
+    // `lightCount` `ClusterLightGpu` entries (typically one frame-slot of
+    // an `rx::rhi::PerFrameStorageBuffer` this class does NOT own -- a
+    // caller's own per-frame light-upload responsibility, built from
+    // `buildClusterLightList()` above) -- read BY REFERENCE (through this
+    // struct) inside the recorded pass callbacks, never declared as a
+    // graph resource itself, exactly mirroring `rx::ibl::bakeEnvironment()`'s
+    // own `source` parameter convention (bake.h's own header comment: "an
+    // EXTERNALLY-owned, already-populated... resource this bake never
+    // writes -- bound DIRECTLY... not through a graph declaration").
+    VkBuffer lightsBuffer = VK_NULL_HANDLE;
+    uint32_t lightCount = 0;
+};
+
 // Owns the three compiled+cached compute PSOs (count/prefix-sum/scatter)
-// plus a small descriptor pool -- built ONCE (Slang compilation is real,
-// non-negligible cost; a per-frame caller must not pay it every frame,
-// this project's own performance-first standing rule) and reused across
-// every addClusterPasses() call for this object's lifetime.
+// plus PER-FRAME-IN-FLIGHT descriptor pools -- the PSOs are built ONCE
+// (Slang compilation is real, non-negligible cost; a per-frame caller must
+// not pay it every frame, this project's own performance-first standing
+// rule) and reused across every addClusterPasses() call for this object's
+// lifetime.
 //
-// DESCRIPTOR POOL / FRAMES-IN-FLIGHT SCOPE BOUNDARY [documented, not
-// silently shipped]: this object owns ONE descriptor pool, reset
-// (vkResetDescriptorPool) at the START of every addClusterPasses() call --
-// safe for this task's own GPU test suite (each call's own graph is
-// realized/executed/GPU-waited via CommandContext::runOnce() before the
-// NEXT addClusterPasses() call ever runs, so no descriptor set from a
-// prior call is still in flight when it is reset) and for any caller
-// following the SAME discipline. A LIVE per-frame consumer with N frames
-// in flight (Task 15's own integration) needs N such pools (or another
-// frames-in-flight-safe allocation strategy) if it calls this without an
-// intervening GPU wait every frame -- flagged here so that caller does not
-// inherit a hidden race.
+// FRAMES-IN-FLIGHT DESIGN [Phase 5 Task 15, #51 -- closes the scope
+// boundary T14's own header comment flagged: "a LIVE per-frame consumer
+// with N frames in flight needs its own multi-buffering strategy"]: this
+// object owns `framesInFlight` INDEPENDENT descriptor pools (one full set
+// of the six per-kernel descriptor sets each), selected by
+// addClusterPasses()'s own `frameSlot` argument. ONLY frame slot
+// `frameSlot`'s own pool is reset (vkResetDescriptorPool) + rewritten on a
+// given addClusterPasses() call -- a DIFFERENT frame slot's pool, and
+// therefore any descriptor set a still-in-flight GPU submission from a
+// PRIOR call against that OTHER slot might still be dynamically indexing,
+// is never touched. This is the same "N independent physical resources,
+// selected by frameSlot, so a fresh CPU-side write/reset never races a
+// still-in-flight GPU read/use of a DIFFERENT frame's own copy" discipline
+// `rx::rhi::PerFrameStorageBuffer`/`rx::material::MaterialSystem::
+// beginFrame()` already establish elsewhere in this codebase (see
+// per_frame_storage_buffer.h's own top comment) -- applied here to
+// descriptor SETS instead of a host-visible buffer's bytes.
+// `framesInFlight=1` (the default) reproduces this class's PRE-Task-15
+// one-shot/test-scoped behavior byte-for-byte (a single pool, always reset
+// on every call, `frameSlot` always resolving to that same one slot) --
+// every one of T14's own existing tests/bench, which never pass either new
+// parameter, is therefore unaffected.
 //
 // Main-thread-only (D5) -- builds real Vulkan pipeline objects, same
 // convention as every other rx_rhi_vk/rx_graph factory.
@@ -173,11 +251,14 @@ public:
     // unlike rx_ibl's bakeEnvironment() -- `cache` is a required parameter
     // here, not created internally, since this object is expected to
     // outlive many calls rather than being built fresh per invocation).
+    // `framesInFlight` -- see this class's own FRAMES-IN-FLIGHT DESIGN
+    // comment above; defaults to 1 (T14's own original one-shot shape).
     // Returns std::nullopt (logged) on any compile/reflect/pipeline-build
     // failure.
     static std::optional<ClusterPipelines> create(VkDevice device, rx::rhi::ComputePipelineCache& cache,
                                                    rx::shader::Compiler& compiler,
-                                                   const std::filesystem::path& shaderDir);
+                                                   const std::filesystem::path& shaderDir,
+                                                   uint32_t framesInFlight = 1);
 
     // Builds a `rx::scene::froxel::FroxelGridParams` for `camera`/
     // `viewportWidth`/`viewportHeight`/`params` (rx::scene::froxel::
@@ -202,27 +283,36 @@ public:
     // this IS that shape: a set of independently-addressable named
     // buffers, not a monolithic opaque-lighting-only descriptor set).
     //
-    // `lightsBuffer` is an EXTERNALLY-owned, already-populated storage
-    // buffer holding `lightCount` `ClusterLightGpu` entries (typically one
-    // frame-slot of an `rx::rhi::PerFrameStorageBuffer` this class does
-    // NOT own -- a caller's own per-frame light-upload responsibility,
-    // built from `buildClusterLightList()` above) -- captured BY
-    // REFERENCE inside the recorded pass callbacks, never declared as a
-    // graph resource itself, exactly mirroring `rx::ibl::bakeEnvironment()`'s
-    // own `source` parameter convention (bake.h's own header comment: "an
-    // EXTERNALLY-owned, already-populated... resource this bake never
-    // writes -- bound DIRECTLY... not through a graph declaration").
+    // [Phase 5 Task 15, #51] `frameInputs` is captured BY REFERENCE inside
+    // the recorded pass callbacks -- `frameInputs.lightsBuffer`/
+    // `.lightCount` are read FRESH on every `Executor::execute()` call
+    // (never frozen at THIS declare-time call), which is what makes
+    // per-frame-varying light data/count reach these once-declared passes
+    // correctly -- see ClusterFrameInputs' own header comment. `frameSlot`
+    // selects which of this object's own `framesInFlight` descriptor pools
+    // this call resets+rewrites (see this class's own FRAMES-IN-FLIGHT
+    // DESIGN comment); out-of-range values are clamped (modulo
+    // `framesInFlight`), logged.
     //
-    // Returns the FroxelGridParams this call computed (a caller needing to
-    // interpret froxel indices -- e.g. this task's own tests' CPU oracle,
-    // or a future T15 shading pass mapping a pixel to its froxel -- uses
-    // this SAME value, never re-derives it).
+    // The grid's own SHAPE (countX/Y/Z, tanHalfFovY, aspectRatio,
+    // zLightNear/Far, linearizer) is resolved ONCE, here, from `camera`/
+    // `viewportWidth`/`viewportHeight`/`params` at this declare-time call
+    // -- NOT re-derived per frame (this render graph's own pass topology
+    // is declared once; a viewport/FOV change mid-run is out of this
+    // task's own scope, matching T14's own declare-time-only grid-shape
+    // precedent). Returns the FroxelGridParams this call computed (a
+    // caller needing to interpret froxel indices -- e.g. this task's own
+    // tests' CPU oracle, or the shading-side lookup mapping a pixel to its
+    // froxel -- uses this SAME value, never re-derives it).
     [[nodiscard]] rx::scene::froxel::FroxelGridParams addClusterPasses(rx::graph::RenderGraph& graph,
-                                                                         VkBuffer lightsBuffer, uint32_t lightCount,
+                                                                         const ClusterFrameInputs& frameInputs,
                                                                          const rx::scene::Camera& camera,
                                                                          uint32_t viewportWidth,
                                                                          uint32_t viewportHeight,
-                                                                         const ClusterParams& params = {});
+                                                                         const ClusterParams& params = {},
+                                                                         uint32_t frameSlot = 0);
+
+    [[nodiscard]] uint32_t framesInFlight() const { return static_cast<uint32_t>(frameSlots_.size()); }
 
     struct Kernel {
         rx::rhi::ComputePipelineCache::Pipeline pso;
@@ -232,21 +322,27 @@ public:
 private:
     ClusterPipelines() = default;
 
+    // [Phase 5 Task 15, #51] One full set of the six per-kernel descriptor
+    // sets (set-0 empty placeholder + set-1 real bindings, per kernel),
+    // backed by ITS OWN VkDescriptorPool -- see this class's own
+    // FRAMES-IN-FLIGHT DESIGN comment. Reset+reallocated wholesale on every
+    // addClusterPasses() call THAT SELECTS this slot (never touched by a
+    // call selecting a different slot).
+    struct FrameSlot {
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        VkDescriptorSet countSet0 = VK_NULL_HANDLE;
+        VkDescriptorSet prefixSumSet0 = VK_NULL_HANDLE;
+        VkDescriptorSet scatterSet0 = VK_NULL_HANDLE;
+        VkDescriptorSet countSet1 = VK_NULL_HANDLE;
+        VkDescriptorSet prefixSumSet1 = VK_NULL_HANDLE;
+        VkDescriptorSet scatterSet1 = VK_NULL_HANDLE;
+    };
+
     VkDevice device_ = VK_NULL_HANDLE;
-    VkDescriptorPool pool_ = VK_NULL_HANDLE;
     std::optional<Kernel> countKernel_;
     std::optional<Kernel> prefixSumKernel_;
     std::optional<Kernel> scatterKernel_;
-
-    // set-0 (empty placeholder, allocated once at create() time) + set-1
-    // (this call's real bindings, reallocated every addClusterPasses()
-    // call after its own vkResetDescriptorPool()) per kernel.
-    VkDescriptorSet countSet0_ = VK_NULL_HANDLE;
-    VkDescriptorSet prefixSumSet0_ = VK_NULL_HANDLE;
-    VkDescriptorSet scatterSet0_ = VK_NULL_HANDLE;
-    VkDescriptorSet countSet1_ = VK_NULL_HANDLE;
-    VkDescriptorSet prefixSumSet1_ = VK_NULL_HANDLE;
-    VkDescriptorSet scatterSet1_ = VK_NULL_HANDLE;
+    std::vector<FrameSlot> frameSlots_;
 };
 
 }  // namespace rx::cluster

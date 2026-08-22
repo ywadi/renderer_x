@@ -78,6 +78,7 @@
 // behavior glTF's own factor defaults already specify.
 import material;
 import brdf;
+import cluster_lighting;
 
 // [Task 8] The energy-compensation permutation point -- see this file's
 // own header comment above and energy_compensation_{off,on}.slang for the
@@ -551,6 +552,26 @@ struct StandardPbr : IMaterialShader {
         // rgb * light.attenuation * NoL` composition (shaders/src/
         // surface_light_punctual.fs, google/filament v1.75.0).
         float3 directLight = (diffuse + specular) * v.lightColor * lightAttenuation * NdotL;
+
+        // [Phase 5 Stage 2 Task 15, #51] Clustered Forward+ Point/Spot --
+        // ADDITIVE alongside the single-slot punctual term immediately
+        // above (which stays byte-identical to its pre-Task-15 form; see
+        // this file's own header comment and cluster_lighting.slang's own
+        // top comment for the full "ADDITIVE, never replacing" rationale).
+        // `v.clusterEnabled == 0` (every pre-Task-15 producer's own
+        // default) skips this entirely -- a scene with only a directional
+        // light renders BYTE-IDENTICAL to the pre-Task-15 gates [matrix-
+        // p5t15's own row 1 acceptance criterion].
+        if (v.clusterEnabled != 0u) {
+            float3 clusteredDiffuse = float3(0.0, 0.0, 0.0);
+            float3 clusteredSpecular = float3(0.0, 0.0, 0.0);
+            rx_evaluateClusteredLights(v, N, viewDir, NdotV, F0, F90, diffuseColor, roughness, alpha,
+                                        clusteredDiffuse, clusteredSpecular);
+            // Energy compensation applied ONCE, to the accumulated total --
+            // see cluster_lighting.slang's own header comment for the
+            // linearity proof this relies on.
+            directLight += clusteredDiffuse + energyFeature.apply(clusteredSpecular, F0, dfgY);
+        }
 
         // [Phase 5 Task 10, #46, FG1 closure] Image-based lighting --
         // REPLACES the retired FG1 flat ambient/environment term (see

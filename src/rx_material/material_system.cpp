@@ -413,6 +413,9 @@ std::optional<MaterialReflection> reflectMaterialLayout(slang::ProgramLayout* la
     bool foundDrawDataArray = false;
     bool foundComparisonSamplerArray = false;
     bool foundCubeImageArray = false;
+    // [Phase 5 Stage 2 Task 15, #51]
+    bool foundGenericStorageBufferArray = false;
+    bool foundClusterLightBufferArray = false;
     bool foundMaterialGlobalsPushConstant = false;
 
     // [Task 4] Needed only by the DescriptorTableSlot branch below, for
@@ -603,6 +606,53 @@ std::optional<MaterialReflection> reflectMaterialLayout(slang::ProgramLayout* la
                 foundCubeImageArray = true;
                 continue;
             }
+            // [Phase 5 Stage 2 Task 15, #51] shaders/material/cluster_
+            // lighting.slang's own `gClusterBuffers` bindless generic
+            // `StructuredBuffer<uint>[]` array -- classifies as
+            // StorageBufferArray (Slang's own reflection does not
+            // distinguish `StructuredBuffer<uint>` from `StructuredBuffer<
+            // RxDrawData>` by element TYPE, only by resource SHAPE -- both
+            // are `SLANG_STRUCTURED_BUFFER`), so this case is keyed by
+            // BINDING NUMBER alone, same reasoning as
+            // kComparisonSamplerBinding's own comment above.
+            // standard_pbr.slang unconditionally imports cluster_lighting.
+            // slang, so every StandardPbr-family material pulls this in
+            // regardless of whether a given draw's own `clusterEnabled` is
+            // ever nonzero.
+            if (set == kBindlessTextureArraySet &&
+                bindingIndex == rx::rhi::BindlessTable::kGenericStorageBufferBinding &&
+                kind == BindlessArrayElementKind::StorageBufferArray && unbounded &&
+                !foundGenericStorageBufferArray) {
+                rx::shader::ShaderLayoutInfo::Binding binding;
+                binding.set = set;
+                binding.binding = bindingIndex;
+                binding.count = 0;
+                binding.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                binding.stages = kMaterialStageFlags;
+                binding.unboundedArray = true;
+                result.shaderLayout.bindings.push_back(binding);
+                foundGenericStorageBufferArray = true;
+                continue;
+            }
+            // [Phase 5 Stage 2 Task 15, #51] cluster_lighting.slang's own
+            // `gClusterLights` bindless `StructuredBuffer<ClusterLightGpu>[]`
+            // array -- same reasoning as `gClusterBuffers` immediately
+            // above.
+            if (set == kBindlessTextureArraySet &&
+                bindingIndex == rx::rhi::BindlessTable::kClusterLightBufferBinding &&
+                kind == BindlessArrayElementKind::StorageBufferArray && unbounded &&
+                !foundClusterLightBufferArray) {
+                rx::shader::ShaderLayoutInfo::Binding binding;
+                binding.set = set;
+                binding.binding = bindingIndex;
+                binding.count = 0;
+                binding.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                binding.stages = kMaterialStageFlags;
+                binding.unboundedArray = true;
+                result.shaderLayout.bindings.push_back(binding);
+                foundClusterLightBufferArray = true;
+                continue;
+            }
 
             error = "material module '" + moduleLabel + "' declares an unsupported bindless global '" + name +
                     "' at set " + std::to_string(set) + " binding " + std::to_string(bindingIndex) +
@@ -618,7 +668,13 @@ std::optional<MaterialReflection> reflectMaterialLayout(slang::ProgramLayout* la
                     std::to_string(kBindlessTextureArraySet) + ", binding " +
                     std::to_string(rx::rhi::BindlessTable::kComparisonSamplerBinding) +
                     "] / `gTexturesCube` [unbounded TextureCube[], set " + std::to_string(kBindlessTextureArraySet) +
-                    ", binding " + std::to_string(rx::rhi::BindlessTable::kCubeSampledImageBinding) + "] shape)";
+                    ", binding " + std::to_string(rx::rhi::BindlessTable::kCubeSampledImageBinding) +
+                    "] / `gClusterBuffers` [unbounded StructuredBuffer<uint>[], set " +
+                    std::to_string(kBindlessTextureArraySet) + ", binding " +
+                    std::to_string(rx::rhi::BindlessTable::kGenericStorageBufferBinding) +
+                    "] / `gClusterLights` [unbounded StructuredBuffer<ClusterLightGpu>[], set " +
+                    std::to_string(kBindlessTextureArraySet) + ", binding " +
+                    std::to_string(rx::rhi::BindlessTable::kClusterLightBufferBinding) + "] shape)";
             return std::nullopt;
         }
 

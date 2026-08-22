@@ -27,6 +27,29 @@ enum class BindlessResourceKind : uint8_t {
     // element types even though Vulkan's own VK_DESCRIPTOR_TYPE_SAMPLED_
     // IMAGE descriptor type is identical either way.
     CubeImage,
+    // [Phase 5 Task 15, #51] A generic `StructuredBuffer<uint>[]` array --
+    // see BindlessTable::kGenericStorageBufferBinding's own comment for why
+    // this needs its OWN binding distinct from kStorageBufferBinding: the
+    // material-side clustered-lighting lookup (shaders/material/
+    // cluster_lighting.slang) reads T14's own `clusterOffsets`/
+    // `clusterWriteCounts`/`clusterLightIndices` render-graph buffers
+    // (rx_cluster's own three named outputs, all uint-element-typed) from
+    // the SAME linked SPIR-V module that ALSO declares `gDrawData`
+    // (`StructuredBuffer<RxDrawData>[]`) at kStorageBufferBinding -- Slang/
+    // SPIR-V requires one binding per distinct declared element TYPE within
+    // one module (material.slang's own established rule, restated here),
+    // so a second, uint-typed StructuredBuffer array needs a binding number
+    // of its own.
+    GenericStorageBuffer,
+    // [Phase 5 Task 15, #51] A `StructuredBuffer<ClusterLightGpu>[]` array
+    // -- the shading-side read of T14's own per-light data (rx_cluster::
+    // ClusterLightGpu, extended this task with world-space shading fields
+    // alongside its existing view-space culling fields -- see
+    // cluster_lighting.h's own header comment). A THIRD new binding,
+    // distinct from GenericStorageBuffer above for the identical
+    // one-binding-per-element-type reason (ClusterLightGpu and uint are
+    // different Slang struct types).
+    ClusterLightBuffer,
 };
 
 namespace detail {
@@ -44,6 +67,9 @@ struct SamplerSlotTag {};
 struct StorageBufferSlotTag {};
 struct ComparisonSamplerSlotTag {};
 struct CubeImageSlotTag {};
+// [Phase 5 Task 15, #51]
+struct GenericStorageBufferSlotTag {};
+struct ClusterLightBufferSlotTag {};
 struct EmptyPayload {};
 
 }  // namespace detail
@@ -198,6 +224,21 @@ public:
         // with `cubeImages == 0` (the default) declares no
         // `kCubeSampledImageBinding` binding at all.
         uint32_t cubeImages = 0;
+
+        // [Phase 5 Task 15, #51] A generic `StructuredBuffer<uint>[]`
+        // bindless array -- SIXTH, OPTIONAL binding, same "0 == absent,
+        // byte-identical to every pre-existing caller" convention as
+        // `comparisonSamplers`/`cubeImages` above. Backs the clustered-
+        // shading lookup's read of T14's own `clusterOffsets`/
+        // `clusterWriteCounts`/`clusterLightIndices` render-graph buffers
+        // (see BindlessResourceKind::GenericStorageBuffer's own comment).
+        uint32_t genericStorageBuffers = 0;
+
+        // [Phase 5 Task 15, #51] A `StructuredBuffer<ClusterLightGpu>[]`
+        // bindless array -- SEVENTH, OPTIONAL binding, same convention.
+        // Backs the shading-side per-light data read (see
+        // BindlessResourceKind::ClusterLightBuffer's own comment).
+        uint32_t clusterLightBuffers = 0;
     };
 
     static constexpr uint32_t kSampledImageBinding = 0;
@@ -213,6 +254,12 @@ public:
     // satisfied across the four (comparisonSamplers x cubeImages)
     // present/absent combinations this now allows.
     static constexpr uint32_t kCubeSampledImageBinding = 4;
+    // [Phase 5 Task 15, #51] Fixed at 5/6 regardless of whether the OTHER
+    // optional bindings (kComparisonSamplerBinding/kCubeSampledImageBinding)
+    // are present in a given table -- same "binding numbers need not be
+    // contiguous" reasoning as kCubeSampledImageBinding's own comment.
+    static constexpr uint32_t kGenericStorageBufferBinding = 5;
+    static constexpr uint32_t kClusterLightBufferBinding = 6;
 
     BindlessTable(BindlessTable&&) noexcept;
     BindlessTable& operator=(BindlessTable&&) noexcept;
@@ -289,6 +336,25 @@ public:
     // at all -- see `Capacities::cubeImages`'s own comment).
     BindlessHandle registerCubeSampledImage(VkImageView view, VkImageLayout layout);
 
+    // [Phase 5 Task 15, #51] Registers `range` bytes of `buffer` starting at
+    // `offset` at a free index in binding `kGenericStorageBufferBinding`,
+    // written immediately -- the generic `StructuredBuffer<uint>[]` slot the
+    // clustered-shading lookup uses for T14's own `clusterOffsets`/
+    // `clusterWriteCounts`/`clusterLightIndices` buffers. Returns an invalid
+    // handle (and logs an error) if this table's genericStorageBuffers
+    // capacity is already fully occupied OR if this table was created with
+    // `capacities.genericStorageBuffers == 0`.
+    BindlessHandle registerGenericStorageBuffer(VkBuffer buffer, VkDeviceSize range, VkDeviceSize offset = 0);
+
+    // [Phase 5 Task 15, #51] Registers `range` bytes of `buffer` starting at
+    // `offset` at a free index in binding `kClusterLightBufferBinding`,
+    // written immediately -- the `StructuredBuffer<ClusterLightGpu>[]` slot
+    // the clustered-shading lookup uses for T14's own per-light data.
+    // Returns an invalid handle (and logs an error) if this table's
+    // clusterLightBuffers capacity is already fully occupied OR if this
+    // table was created with `capacities.clusterLightBuffers == 0`.
+    BindlessHandle registerClusterLightBuffer(VkBuffer buffer, VkDeviceSize range, VkDeviceSize offset = 0);
+
     // Returns `handle`'s slot to the relevant resource class's free list
     // for future reuse. See the RELEASE-SAFETY CONTRACT above -- this does
     // NOT touch the descriptor's current GPU-visible contents, and does
@@ -313,6 +379,9 @@ private:
     rx::core::HandlePool<detail::StorageBufferSlotTag, detail::EmptyPayload> storageBuffers_;
     rx::core::HandlePool<detail::ComparisonSamplerSlotTag, detail::EmptyPayload> comparisonSamplers_;
     rx::core::HandlePool<detail::CubeImageSlotTag, detail::EmptyPayload> cubeImages_;
+    // [Phase 5 Task 15, #51]
+    rx::core::HandlePool<detail::GenericStorageBufferSlotTag, detail::EmptyPayload> genericStorageBuffers_;
+    rx::core::HandlePool<detail::ClusterLightBufferSlotTag, detail::EmptyPayload> clusterLightBuffers_;
 };
 
 }  // namespace rx::rhi

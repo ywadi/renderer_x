@@ -1072,6 +1072,15 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
     // textures per loaded environment (base/irradiance/prefiltered --
     // rx::ibl::BakeResult, via `--env`) -- 4 gives one spare slot.
     capacities.cubeImages = 4;
+    // [Phase 5 Stage 2 Task 15, #51] Same requirement as `cubeImages`
+    // above: standard_pbr.slang now unconditionally imports
+    // shaders/material/cluster_lighting.slang, which unconditionally
+    // declares `gClusterBuffers`/`gClusterLights` at bindings 5/6 (this
+    // viewer never builds a real cluster grid -- every draw's own
+    // `clusterEnabled` stays 0 -- but the descriptor set layout still needs
+    // matching bindings for the shader's static declaration).
+    capacities.genericStorageBuffers = 1;
+    capacities.clusterLightBuffers = 1;
     auto bindless =
         rx::rhi::BindlessTable::create(app->device->physicalDevice(), app->device->device(), capacities);
     if (!bindless.has_value()) {

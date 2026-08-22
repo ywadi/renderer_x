@@ -123,6 +123,14 @@ std::optional<Fixture> makeFixture(const char* title) {
     // irradiance + prefiltered) on top of this rig's own pre-existing
     // headroom requirement.
     capacities.cubeImages = 4;
+    // [Phase 5 Stage 2 Task 15, #51] Same requirement as `cubeImages` above:
+    // standard_pbr.slang now unconditionally declares `gClusterBuffers`/
+    // `gClusterLights` at bindings 5/6 via cluster_lighting.slang. This
+    // file's own cluster-shading TEST_CASEs (below) register REAL buffers
+    // into both -- generous headroom for several independent per-scenario
+    // registrations across one fixture's lifetime.
+    capacities.genericStorageBuffers = 8;
+    capacities.clusterLightBuffers = 4;
     auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
     REQUIRE(bindless.has_value());
 

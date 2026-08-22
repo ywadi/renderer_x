@@ -96,10 +96,24 @@ public:
     // bindless registration fails (every slot successfully created before
     // the failure is torn down/released before returning, so a caller
     // checking `has_value()` never leaks one).
+    // [Phase 5 Task 15, #51] `kind` selects WHICH of BindlessTable's
+    // storage-buffer-typed resource classes each slot registers into --
+    // defaults to `BindlessResourceKind::StorageBuffer` (this parameter's
+    // absence pre-Task-15 always meant this, so every existing caller keeps
+    // compiling and behaving byte-identically). Only STORAGE-BUFFER-typed
+    // kinds are meaningful here (StorageBuffer / GenericStorageBuffer /
+    // ClusterLightBuffer -- passing a sampled-image/sampler kind is a
+    // caller error, rejected by whichever BindlessTable register method
+    // this class dispatches to internally). Exists so a second Slang
+    // element type reusing this SAME N-buffered-host-visible-storage-buffer
+    // pattern (rx_cluster's per-frame light list, `ClusterLightGpu`-typed --
+    // see cluster_lighting.h) does not need its own hand-rolled copy of this
+    // class merely to land in a different bindless binding.
     static std::optional<PerFrameStorageBuffer> create(Allocator& allocator, BindlessTable& bindless,
                                                           VkDeviceSize bytesPerSlot,
                                                           const void* initialData = nullptr,
-                                                          uint32_t framesInFlight = FrameSync::kFramesInFlight);
+                                                          uint32_t framesInFlight = FrameSync::kFramesInFlight,
+                                                          BindlessResourceKind kind = BindlessResourceKind::StorageBuffer);
 
     // Writes `bytes` (<= the `bytesPerSlot` passed to create()) into slot
     // `frameSlot`'s own physical buffer and flushes the whole buffer

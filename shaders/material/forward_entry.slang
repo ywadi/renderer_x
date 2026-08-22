@@ -244,6 +244,24 @@ float4 fragmentMain(VertexStageOutput input) : SV_Target {
     v.lightPositionWorld = draw.lightPositionWorld.xyz;
     v.lightSpotDirWorld = draw.lightSpotDirWorld.xyz;
 
+    // [Phase 5 Stage 2 Task 15, #51] Clustered Forward+ per-pixel lookup
+    // inputs -- read directly off the SAME `draw` row, same "nothing to
+    // gain from also widening VertexStageOutput for a per-pass-constant
+    // value" reasoning as the env*/punctual-light fields immediately above.
+    v.clusterEnabled = draw.clusterEnabled;
+    v.clusterCountX = draw.clusterCountX;
+    v.clusterCountY = draw.clusterCountY;
+    v.clusterCountZ = draw.clusterCountZ;
+    v.clusterTanHalfFovY = draw.clusterTanHalfFovY;
+    v.clusterAspectRatio = draw.clusterAspectRatio;
+    v.clusterZLightFar = draw.clusterZLightFar;
+    v.clusterInvLinearizer = draw.clusterInvLinearizer;
+    v.clusterOffsetsBufferIndex = draw.clusterOffsetsBufferIndex;
+    v.clusterWriteCountsBufferIndex = draw.clusterWriteCountsBufferIndex;
+    v.clusterLightIndicesBufferIndex = draw.clusterLightIndicesBufferIndex;
+    v.clusterLightsBufferIndex = draw.clusterLightsBufferIndex;
+    v.clusterView = draw.clusterView;
+
     // Default-constructed: every conforming material struct this engine
     // links against is data-free by convention (its bound parameters live
     // in its own module-scope `ParameterBlock<TParams> gParams`, per D8 --

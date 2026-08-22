@@ -53,6 +53,8 @@ BindlessTable& BindlessTable::operator=(BindlessTable&& other) noexcept {
         storageBuffers_ = std::move(other.storageBuffers_);
         comparisonSamplers_ = std::move(other.comparisonSamplers_);
         cubeImages_ = std::move(other.cubeImages_);
+        genericStorageBuffers_ = std::move(other.genericStorageBuffers_);
+        clusterLightBuffers_ = std::move(other.clusterLightBuffers_);
 
         other.device_ = VK_NULL_HANDLE;
         other.setLayout_ = VK_NULL_HANDLE;
@@ -141,9 +143,16 @@ std::optional<BindlessTable> BindlessTable::create(VkPhysicalDevice physicalDevi
     // binding numbers within one set).
     const bool hasComparisonSamplers = capacities.comparisonSamplers > 0;
     const bool hasCubeImages = capacities.cubeImages > 0;
+    // [Phase 5 Task 15, #51] Two more independently-optional bindings,
+    // appended to the SAME fixed priority order (after cubeImages) so
+    // whichever is actually present LAST still receives the
+    // VARIABLE_DESCRIPTOR_COUNT flag -- see this function's own comment
+    // above for the general rule this extends.
+    const bool hasGenericStorageBuffers = capacities.genericStorageBuffers > 0;
+    const bool hasClusterLightBuffers = capacities.clusterLightBuffers > 0;
 
     std::vector<VkDescriptorSetLayoutBinding> bindings;
-    bindings.reserve(5);
+    bindings.reserve(7);
 
     VkDescriptorSetLayoutBinding sampledImageBinding{};
     sampledImageBinding.binding = kSampledImageBinding;
@@ -182,18 +191,36 @@ std::optional<BindlessTable> BindlessTable::create(VkPhysicalDevice physicalDevi
         cubeImageBinding.stageFlags = VK_SHADER_STAGE_ALL;
         bindings.push_back(cubeImageBinding);
     }
+    if (hasGenericStorageBuffers) {
+        VkDescriptorSetLayoutBinding genericStorageBufferBinding{};
+        genericStorageBufferBinding.binding = kGenericStorageBufferBinding;
+        genericStorageBufferBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        genericStorageBufferBinding.descriptorCount = capacities.genericStorageBuffers;
+        genericStorageBufferBinding.stageFlags = VK_SHADER_STAGE_ALL;
+        bindings.push_back(genericStorageBufferBinding);
+    }
+    if (hasClusterLightBuffers) {
+        VkDescriptorSetLayoutBinding clusterLightBufferBinding{};
+        clusterLightBufferBinding.binding = kClusterLightBufferBinding;
+        clusterLightBufferBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        clusterLightBufferBinding.descriptorCount = capacities.clusterLightBuffers;
+        clusterLightBufferBinding.stageFlags = VK_SHADER_STAGE_ALL;
+        bindings.push_back(clusterLightBufferBinding);
+    }
 
     const uint32_t bindingCount = static_cast<uint32_t>(bindings.size());
     std::vector<VkDescriptorBindingFlags> bindingFlags(bindingCount, kCommonBindingFlags);
     // The variable-count slot is whichever capacity `bindings.back()`
     // actually is -- since `bindings` is built in the fixed priority order
-    // above, this is ALWAYS the last-present of (cubeImages,
-    // comparisonSamplers, storageBuffers), matching this function's own
-    // header comment.
+    // above, this is ALWAYS the last-present of (clusterLightBuffers,
+    // genericStorageBuffers, cubeImages, comparisonSamplers, storageBuffers),
+    // matching this function's own header comment.
     bindingFlags.back() |= VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
-    const uint32_t variableCount = hasCubeImages          ? capacities.cubeImages
-                                    : hasComparisonSamplers ? capacities.comparisonSamplers
-                                                             : capacities.storageBuffers;
+    const uint32_t variableCount = hasClusterLightBuffers    ? capacities.clusterLightBuffers
+                                    : hasGenericStorageBuffers ? capacities.genericStorageBuffers
+                                    : hasCubeImages             ? capacities.cubeImages
+                                    : hasComparisonSamplers     ? capacities.comparisonSamplers
+                                                                 : capacities.storageBuffers;
 
     VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo{};
     flagsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
@@ -239,6 +266,15 @@ std::optional<BindlessTable> BindlessTable::create(VkPhysicalDevice physicalDevi
         // VK_IMAGE_VIEW_TYPE differ) -- a SEPARATE pool-size entry, same
         // reasoning as comparisonSamplers above.
         poolSizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, capacities.cubeImages});
+    }
+    if (hasGenericStorageBuffers) {
+        // [Phase 5 Task 15, #51] Same descriptor TYPE as binding 2
+        // (VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) -- a separate pool-size entry,
+        // same reasoning as comparisonSamplers/cubeImages above.
+        poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, capacities.genericStorageBuffers});
+    }
+    if (hasClusterLightBuffers) {
+        poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, capacities.clusterLightBuffers});
     }
 
     VkDescriptorPoolCreateInfo poolInfo{};
@@ -457,6 +493,82 @@ BindlessHandle BindlessTable::registerCubeSampledImage(VkImageView view, VkImage
     return BindlessHandle(BindlessResourceKind::CubeImage, internal.index(), internal.generation());
 }
 
+BindlessHandle BindlessTable::registerGenericStorageBuffer(VkBuffer buffer, VkDeviceSize range, VkDeviceSize offset) {
+    RX_ASSERT_MAIN_THREAD("BindlessTable::registerGenericStorageBuffer");
+    if (capacities_.genericStorageBuffers == 0) {
+        RX_LOG_ERROR(
+            "rx::rhi::BindlessTable::registerGenericStorageBuffer: this table was created with "
+            "capacities.genericStorageBuffers == 0 -- binding {} does not exist; rejecting",
+            kGenericStorageBufferBinding);
+        return BindlessHandle{};
+    }
+    auto internal = genericStorageBuffers_.acquire(detail::EmptyPayload{});
+    if (internal.index() >= capacities_.genericStorageBuffers) {
+        RX_LOG_ERROR(
+            "rx::rhi::BindlessTable::registerGenericStorageBuffer: genericStorageBuffers capacity ({}) already "
+            "fully occupied; rejecting",
+            capacities_.genericStorageBuffers);
+        genericStorageBuffers_.release(internal);
+        return BindlessHandle{};
+    }
+
+    VkDescriptorBufferInfo bufferInfo{};
+    bufferInfo.buffer = buffer;
+    bufferInfo.offset = offset;
+    bufferInfo.range = range;
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = set_;
+    write.dstBinding = kGenericStorageBufferBinding;
+    write.dstArrayElement = internal.index();
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &bufferInfo;
+
+    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+
+    return BindlessHandle(BindlessResourceKind::GenericStorageBuffer, internal.index(), internal.generation());
+}
+
+BindlessHandle BindlessTable::registerClusterLightBuffer(VkBuffer buffer, VkDeviceSize range, VkDeviceSize offset) {
+    RX_ASSERT_MAIN_THREAD("BindlessTable::registerClusterLightBuffer");
+    if (capacities_.clusterLightBuffers == 0) {
+        RX_LOG_ERROR(
+            "rx::rhi::BindlessTable::registerClusterLightBuffer: this table was created with "
+            "capacities.clusterLightBuffers == 0 -- binding {} does not exist; rejecting",
+            kClusterLightBufferBinding);
+        return BindlessHandle{};
+    }
+    auto internal = clusterLightBuffers_.acquire(detail::EmptyPayload{});
+    if (internal.index() >= capacities_.clusterLightBuffers) {
+        RX_LOG_ERROR(
+            "rx::rhi::BindlessTable::registerClusterLightBuffer: clusterLightBuffers capacity ({}) already fully "
+            "occupied; rejecting",
+            capacities_.clusterLightBuffers);
+        clusterLightBuffers_.release(internal);
+        return BindlessHandle{};
+    }
+
+    VkDescriptorBufferInfo bufferInfo{};
+    bufferInfo.buffer = buffer;
+    bufferInfo.offset = offset;
+    bufferInfo.range = range;
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = set_;
+    write.dstBinding = kClusterLightBufferBinding;
+    write.dstArrayElement = internal.index();
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &bufferInfo;
+
+    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+
+    return BindlessHandle(BindlessResourceKind::ClusterLightBuffer, internal.index(), internal.generation());
+}
+
 void BindlessTable::release(BindlessHandle handle) {
     RX_ASSERT_MAIN_THREAD("BindlessTable::release");
     if (!handle.isValid()) {
@@ -479,6 +591,14 @@ void BindlessTable::release(BindlessHandle handle) {
             break;
         case BindlessResourceKind::CubeImage:
             cubeImages_.release(rx::core::Handle<detail::CubeImageSlotTag>(handle.index(), handle.generation()));
+            break;
+        case BindlessResourceKind::GenericStorageBuffer:
+            genericStorageBuffers_.release(
+                rx::core::Handle<detail::GenericStorageBufferSlotTag>(handle.index(), handle.generation()));
+            break;
+        case BindlessResourceKind::ClusterLightBuffer:
+            clusterLightBuffers_.release(
+                rx::core::Handle<detail::ClusterLightBufferSlotTag>(handle.index(), handle.generation()));
             break;
     }
 }

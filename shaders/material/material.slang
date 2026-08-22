@@ -95,6 +95,26 @@ public struct MaterialVertex {
     // lightDirWorld/lightColor/ambientColor above (see that struct's own
     // `cameraPosWorld` field) and carried through identically.
     public float3 cameraPosWorld;
+
+    // [Phase 5 Stage 2 Task 15, #51] Clustered Forward+ per-pixel lookup
+    // inputs -- forwarded verbatim from the SAME `RxDrawData` row, same
+    // "per-pass-constant, nothing to gain from interpolating it" reasoning
+    // as every other field above. See `RxDrawData::cluster*`'s own header
+    // comment for the full field-by-field account; consumed by
+    // `shaders/material/cluster_lighting.slang`'s `rx_evaluateClusteredLights()`.
+    public uint clusterEnabled;
+    public uint clusterCountX;
+    public uint clusterCountY;
+    public uint clusterCountZ;
+    public float clusterTanHalfFovY;
+    public float clusterAspectRatio;
+    public float clusterZLightFar;
+    public float clusterInvLinearizer;
+    public uint clusterOffsetsBufferIndex;
+    public uint clusterWriteCountsBufferIndex;
+    public uint clusterLightIndicesBufferIndex;
+    public uint clusterLightsBufferIndex;
+    public float4x4 clusterView;
 }
 
 // Every material module (e.g. a material's own .slang file, loaded via
@@ -423,6 +443,26 @@ public struct RxDrawData {
     public float lightAngleOffset; // Spot cone precomputed offset; Directional/Point unused.
     public float4 lightPositionWorld;  // Point/Spot world position, xyz (w unused). Directional: unused.
     public float4 lightSpotDirWorld;   // Spot's own facing/travel direction, world space, xyz (w unused). Directional/Point: unused.
+
+    // [Phase 5 Stage 2 Task 15, #51] Clustered Forward+ per-pixel lookup
+    // inputs -- mirrors `rx::material::DrawDataGpu`'s own tail-append
+    // EXACTLY (draw_data.h, same field order/types/rationale). ADDITIVE
+    // alongside the single-slot Point/Spot term above (untouched --
+    // standard_pbr.slang's own header comment); `clusterEnabled==0` (the
+    // default) makes every field below dead.
+    public uint clusterEnabled;
+    public uint clusterCountX;
+    public uint clusterCountY;
+    public uint clusterCountZ;
+    public float clusterTanHalfFovY;
+    public float clusterAspectRatio;
+    public float clusterZLightFar;
+    public float clusterInvLinearizer;
+    public uint clusterOffsetsBufferIndex;
+    public uint clusterWriteCountsBufferIndex;
+    public uint clusterLightIndicesBufferIndex;
+    public uint clusterLightsBufferIndex;
+    public float4x4 clusterView;  // world -> view (see draw_data.h's own comment on why this differs from viewProj above).
 }
 
 [[vk::binding(2, 0)]]

@@ -1021,6 +1021,21 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
     // 3 real registrations -- 4 gives one spare slot, matching
     // samples/08_gltf_viewer's own identical sizing.
     capacities.cubeImages = 4;
+    // [Phase 5 Stage 2 Task 15, #51] standard_pbr.slang now unconditionally
+    // imports shaders/material/cluster_lighting.slang, which unconditionally
+    // declares `gClusterBuffers`/`gClusterLights` at bindings 5/6 -- same
+    // "descriptor set layout needs a matching binding for the shader's
+    // static declaration" reasoning as `comparisonSamplers`/`cubeImages`
+    // above. This sample DOES build a real cluster grid: `genericStorageBuffers`
+    // covers T14's own three named uint[] buffers (clusterOffsets/
+    // clusterWriteCounts/clusterLightIndices), registered ONCE and reused
+    // every frame (the render graph's own transient pool keeps a
+    // fixed-size named resource's physical backing stable across frames --
+    // see setupClustering()'s own comment); `clusterLightBuffers` covers
+    // this sample's own PerFrameStorageBuffer of ClusterLightGpu rows, one
+    // per frame-in-flight slot.
+    capacities.genericStorageBuffers = 4;
+    capacities.clusterLightBuffers = rx::rhi::FrameSync::kFramesInFlight + 2;
     auto bindless = rx::rhi::BindlessTable::create(app->device->physicalDevice(), app->device->device(), capacities);
     if (!bindless.has_value()) {
         RX_LOG_ERROR("sample_09_scene: BindlessTable::create failed");

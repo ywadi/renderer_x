@@ -66,6 +66,9 @@ set(RX_GLTF_VIEWER_MATERIAL_SHADERS
   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/brdf.slang"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/energy_compensation_off.slang"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/energy_compensation_on.slang"
+  # [Phase 5 Stage 2 Task 15, #51] standard_pbr.slang now `import
+  # cluster_lighting;`s the clustered Forward+ shading-side lookup module.
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/cluster_lighting.slang"
 )
 add_custom_command(
   OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/material_shaders_deploy.stamp"

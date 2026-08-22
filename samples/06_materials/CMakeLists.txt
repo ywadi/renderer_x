@@ -77,6 +77,12 @@ set(RX_MATERIALS_SHARED_SHADERS
   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/brdf.slang"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/energy_compensation_off.slang"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/energy_compensation_on.slang"
+  # [Phase 5 Stage 2 Task 15, #51] standard_pbr.slang now `import
+  # cluster_lighting;`s the clustered Forward+ shading-side lookup module --
+  # deployed regardless of whether this sample's own checker.slang/rim.slang
+  # materials reference it, same "present is required, not merely used"
+  # posture as brdf.slang/energy_compensation_*.slang above.
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/material/cluster_lighting.slang"
 )
 add_custom_command(
   OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/materials_shared_shader_deploy.stamp"

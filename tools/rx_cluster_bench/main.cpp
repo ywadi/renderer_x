@@ -232,8 +232,12 @@ int main(int argc, char** argv) {
 
         VkBuffer capturedTotalUsed = VK_NULL_HANDLE;
         rx::graph::RenderGraph graph;
-        const rx::scene::froxel::FroxelGridParams grid = pipelines->addClusterPasses(
-            graph, lightsBuffer->handle(), static_cast<uint32_t>(lights.size()), camera, kViewportW, kViewportH, params);
+        // [Phase 5 Task 15, #51] Local, stays alive through this same
+        // iteration's own graph realize+execute+GPU-wait below (see
+        // ClusterFrameInputs' own header comment).
+        const rx::cluster::ClusterFrameInputs frameInputs{lightsBuffer->handle(), static_cast<uint32_t>(lights.size())};
+        const rx::scene::froxel::FroxelGridParams grid =
+            pipelines->addClusterPasses(graph, frameInputs, camera, kViewportW, kViewportH, params);
         graph.addPass("bench_capture", rx::graph::QueueClass::AsyncCompute)
             .addStorageBufferInput("clusterTotalUsed")
             .setSideEffect()

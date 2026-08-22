@@ -49,16 +49,25 @@ struct ExpectedBindlessSlot {
 // [Phase 5 Task 10, #46] Grew from 4 to 5 slots: binding 4
 // (kCubeSampledImageBinding) is BindlessTable's own OPTIONAL fifth slot
 // (Capacities::cubeImages -- see that field's own header comment).
-// Recognizing either is additive and backward-compatible: a shader that
-// never declares a set-0 binding 3 or 4 (every non-material/pre-Task-10
-// shader in this codebase) is unaffected, since this list is only ever
-// walked against bindings the shader's OWN reflection actually produced.
-constexpr std::array<ExpectedBindlessSlot, 5> kExpectedExternalSet0Shape{{
+// [Phase 5 Stage 2 Task 15, #51] Grew from 5 to 7 slots: binding 5
+// (kGenericStorageBufferBinding) and binding 6 (kClusterLightBufferBinding)
+// are BindlessTable's own OPTIONAL sixth/seventh slots
+// (Capacities::genericStorageBuffers/clusterLightBuffers -- see those
+// fields' own header comments), backing shaders/material/cluster_lighting.
+// slang's `gClusterBuffers`/`gClusterLights` globals.
+// Recognizing any of these is additive and backward-compatible: a shader
+// that never declares a set-0 binding 3/4/5/6 (every non-material/
+// pre-Task-10/pre-Task-15 shader in this codebase) is unaffected, since
+// this list is only ever walked against bindings the shader's OWN
+// reflection actually produced.
+constexpr std::array<ExpectedBindlessSlot, 7> kExpectedExternalSet0Shape{{
     {BindlessTable::kSampledImageBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE},
     {BindlessTable::kSamplerBinding, VK_DESCRIPTOR_TYPE_SAMPLER},
     {BindlessTable::kStorageBufferBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
     {BindlessTable::kComparisonSamplerBinding, VK_DESCRIPTOR_TYPE_SAMPLER},
     {BindlessTable::kCubeSampledImageBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE},
+    {BindlessTable::kGenericStorageBufferBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
+    {BindlessTable::kClusterLightBufferBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
 }};
 
 // See build()'s comment for exactly what "subset-compatible shape" means
@@ -78,10 +87,12 @@ bool validateExternalSet0Shape(const std::vector<const rx::shader::ShaderLayoutI
             RX_LOG_ERROR(
                 "rx_rhi_vk::PipelineLayoutBuilder::build: reflected set-0 binding {} has no counterpart in the "
                 "external bindless-table layout (known slots: {}=SAMPLED_IMAGE, {}=SAMPLER, {}=STORAGE_BUFFER, "
-                "{}=COMPARISON_SAMPLER, {}=CUBE_SAMPLED_IMAGE); rejecting",
+                "{}=COMPARISON_SAMPLER, {}=CUBE_SAMPLED_IMAGE, {}=GENERIC_STORAGE_BUFFER, "
+                "{}=CLUSTER_LIGHT_BUFFER); rejecting",
                 binding->binding, BindlessTable::kSampledImageBinding, BindlessTable::kSamplerBinding,
                 BindlessTable::kStorageBufferBinding, BindlessTable::kComparisonSamplerBinding,
-                BindlessTable::kCubeSampledImageBinding);
+                BindlessTable::kCubeSampledImageBinding, BindlessTable::kGenericStorageBufferBinding,
+                BindlessTable::kClusterLightBufferBinding);
             return false;
         }
         if (binding->type != expected->type) {

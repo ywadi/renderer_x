@@ -157,13 +157,14 @@ public bool spotIntersectsFroxel(float3 lightViewPos, float lightRadius, float3 
     return (e * e >= dd * coneCosSquared) && (e > 0.0);
 }
 
-// One point/spot light's view-space-transformed data for froxel
-// assignment -- GPU mirror of rx::cluster::ClusterLightGpu
-// (rx_cluster/cluster_lighting.h, kept manually in sync). Every field is a
-// float4 (never a bare float3) so std430-style StructuredBuffer packing
-// needs no implicit padding reasoning on either the Slang or the C++ side
-// -- both lay this struct out identically (three consecutive float4s, 48
-// bytes) by construction.
+// One point/spot light's view-space-transformed CULLING data, PLUS [Phase
+// 5 Task 15, #51] its world-space/physical-unit SHADING data -- GPU mirror
+// of rx::cluster::ClusterLightGpu (rx_cluster/cluster_lighting.h, kept
+// manually in sync). Every field is a float4 (never a bare float3) so
+// std430-style StructuredBuffer packing needs no implicit padding
+// reasoning on either the Slang or the C++ side -- both lay this struct
+// out identically (seven consecutive float4s, 112 bytes: three culling +
+// four shading) by construction.
 public struct ClusterLightGpu {
     // xyz = view-space position, w = cull radius.
     public float4 viewPositionRadius;
@@ -172,6 +173,17 @@ public struct ClusterLightGpu {
     public float4 viewAxisSinInverse;
     // x = coneCosSquared (spot only), y = isSpot (1.0 spot / 0.0 point), z/w unused.
     public float4 cosSquaredFlags;
+
+    // [Phase 5 Task 15, #51] SHADING-side fields -- mirrors
+    // rx::cluster::ClusterLightGpu's own tail-append EXACTLY (cluster_
+    // lighting.h, cited there in full). Untouched by every compute kernel
+    // in THIS directory (froxel_light_count/prefix_sum/light_scatter.slang
+    // only ever read the three CULLING fields above by name); consumed by
+    // shaders/material/cluster_lighting.slang's own shading-side lookup.
+    public float4 shadingTypeRangeAngle;   // x=lightType, y=lightRange, z=lightAngleScale, w=lightAngleOffset.
+    public float4 shadingPositionWorld;    // xyz = world-space position; w unused.
+    public float4 shadingColorCandela;     // rgb = color*intensity, candela; w unused.
+    public float4 shadingSpotDirWorld;     // xyz = world-space spot facing direction; w unused.
 };
 
 // The SAME test either count or scatter kernel needs, factored once so

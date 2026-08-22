@@ -236,8 +236,16 @@ inline std::optional<ClusterRunResult> runCluster(ClusterGpuFixture& fixture, Cl
     VkBuffer capturedLightIndices = VK_NULL_HANDLE;
 
     RenderGraph graph;
+    // [Phase 5 Task 15, #51] `frameInputs` is a LOCAL of this function --
+    // stays alive through this same function's own later graph-execution
+    // call below (the ClusterPipelines::addClusterPasses() lambdas capture
+    // it BY REFERENCE, per that method's own header comment), matching the
+    // ONE-SHOT "declare, then immediately realize+execute+GPU-wait before
+    // this local goes out of scope" usage every one of this fixture's own
+    // callers already follows.
+    const rx::cluster::ClusterFrameInputs frameInputs{lightsBuffer, lightCount};
     const rx::scene::froxel::FroxelGridParams grid =
-        pipelines.addClusterPasses(graph, lightsBuffer, lightCount, camera, viewportWidth, viewportHeight, params);
+        pipelines.addClusterPasses(graph, frameInputs, camera, viewportWidth, viewportHeight, params);
 
     graph.addPass("cluster_test_capture", QueueClass::AsyncCompute)
         .addStorageBufferInput("clusterTrueCounts")

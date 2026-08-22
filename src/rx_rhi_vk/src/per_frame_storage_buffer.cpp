@@ -7,10 +7,31 @@
 
 namespace rx::rhi {
 
+namespace {
+// [Phase 5 Task 15, #51] Dispatches to the ONE BindlessTable register
+// method matching `kind` -- see BindlessTable's own header comment for why
+// each storage-buffer-typed resource class needs its own named method
+// (one binding per distinct Slang element TYPE) rather than one generic
+// entry point.
+BindlessHandle registerByKind(BindlessTable& bindless, BindlessResourceKind kind, VkBuffer buffer,
+                               VkDeviceSize bytesPerSlot) {
+    switch (kind) {
+        case BindlessResourceKind::GenericStorageBuffer:
+            return bindless.registerGenericStorageBuffer(buffer, bytesPerSlot);
+        case BindlessResourceKind::ClusterLightBuffer:
+            return bindless.registerClusterLightBuffer(buffer, bytesPerSlot);
+        case BindlessResourceKind::StorageBuffer:
+        default:
+            return bindless.registerStorageBuffer(buffer, bytesPerSlot);
+    }
+}
+}  // namespace
+
 std::optional<PerFrameStorageBuffer> PerFrameStorageBuffer::create(Allocator& allocator, BindlessTable& bindless,
                                                                        VkDeviceSize bytesPerSlot,
                                                                        const void* initialData,
-                                                                       uint32_t framesInFlight) {
+                                                                       uint32_t framesInFlight,
+                                                                       BindlessResourceKind kind) {
     if (bytesPerSlot == 0) {
         RX_LOG_ERROR("rx::rhi::PerFrameStorageBuffer::create: bytesPerSlot must be > 0");
         return std::nullopt;
@@ -44,9 +65,10 @@ std::optional<PerFrameStorageBuffer> PerFrameStorageBuffer::create(Allocator& al
             buffer->flush();
         }
 
-        BindlessHandle handle = bindless.registerStorageBuffer(buffer->handle(), bytesPerSlot);
+        BindlessHandle handle = registerByKind(bindless, kind, buffer->handle(), bytesPerSlot);
         if (!handle.isValid()) {
-            RX_LOG_ERROR("rx::rhi::PerFrameStorageBuffer::create: registerStorageBuffer failed for slot {}", slot);
+            RX_LOG_ERROR("rx::rhi::PerFrameStorageBuffer::create: register (kind={}) failed for slot {}",
+                         static_cast<int>(kind), slot);
             result.release(bindless);
             return std::nullopt;
         }
